@@ -117,7 +117,7 @@ $(BUILD)/tccrt/runmain.c.o: ports/tcc/runmain.c
 	@$(CC) $(TCCRT_FLAGS) -c $< -o $@
 
 # headers and libraries for compiling inside Nocturne (an extra tree in the initrd)
-$(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(TCCRT_OBJ) scripts/mksysroot.sh                         $(shell find user/include ports/tcc/include third_party/bearssl/inc $(TCC_DIR)/include -name '*.h')                         common/abi.h common/gfx.h
+$(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(TCCRT_OBJ) scripts/mksysroot.sh                         $(shell find user/include ports/tcc/include third_party/bearssl/inc $(TCC_DIR)/include -name '*.h')                         common/abi.h common/gfx.h $(wildcard user/apps/*.c)
 	@echo "  SYSROOT"
 	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(LIBC_OBJ) $(BR_OBJ) -- $(TCCRT_OBJ)
 	@touch $@
@@ -146,10 +146,11 @@ $(BUILD)/data-blank.vhdx: scripts/mkdata.sh
 	@rm -f $(BUILD)/data-blank.img
 
 run: image
-	@qemu-system-x86_64 -M pc -m 512M -drive file=$(BUILD)/nocturne.img,format=raw,if=ide \
-		-serial stdio -vga std
+	@qemu-system-x86_64 -M pc -m 512M -drive file=$(BUILD)/nocturne.img,format=raw,if=ide,index=0 \
+		-drive file=$(BUILD)/data.img,format=raw,if=ide,index=1 -serial stdio -vga std
 
+# keeps build/data.img: it is the persistent /data disk (your files, and the agent's key)
 clean:
-	rm -rf $(BUILD)
+	find $(BUILD) -mindepth 1 -maxdepth 1 ! -name data.img -exec rm -rf {} +
 
 -include $(shell find $(BUILD) -name '*.d' 2>/dev/null)

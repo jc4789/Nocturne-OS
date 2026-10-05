@@ -4,6 +4,7 @@
 #   /usr/lib/tcc/include    TinyCC's own headers (stdarg.h, stddef.h, float.h, ...)
 #   /usr/lib/tcc            libtcc1.a (compiler runtime), runmain.o (for tcc -run)
 #   /usr/lib                crt1.o crti.o crtn.o libc.a (libc + gfx + BearSSL)
+#   /usr/src/apps           sources of the programs in /bin (API examples)
 # Objects are copied without debug info or unwind tables, which TinyCC has no use for.
 # usage: mksysroot.sh OUTDIR LIBC_OBJS... -- TCCRT_OBJS...
 set -e
@@ -20,6 +21,9 @@ cp common/abi.h common/gfx.h "$S/usr/include/"
 cp ports/tcc/include/*.h "$S/usr/include/"
 cp third_party/bearssl/inc/*.h "$S/usr/include/"
 cp $T/include/*.h "$S/usr/lib/tcc/include/"
+# the sources of the programs in /bin, as examples of the APIs
+mkdir -p "$S/usr/src/apps"
+cp user/apps/*.c "$S/usr/src/apps/"
 
 strip_obj() { objcopy --strip-debug -R .eh_frame -R .llvm_addrsig -R .comment "$1" "$2"; }
 

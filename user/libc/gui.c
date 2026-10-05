@@ -93,3 +93,14 @@ int clipboard_get(char *buf, size_t n) { return (int)__syscall(SYS_CLIPBOARD_GET
 int gui_launch(const char *path, const char *arg) {
     return (int)__syscall(SYS_GUI_LAUNCH, (long)path, (long)arg, 0, 0, 0);
 }
+
+int screen_grab(uint32_t *buf, size_t bytes, int *w, int *h) {
+    long r = __syscall(SYS_SCREEN_GRAB, (long)buf, (long)bytes, 0, 0, 0);
+    if (r < 0) {
+        errno = (int)-r;
+        return -1;
+    }
+    *w = (int)(r >> 16);
+    *h = (int)(r & 0xFFFF);
+    return 0;
+}

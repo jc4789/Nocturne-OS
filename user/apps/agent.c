@@ -23,6 +23,7 @@
 #include "nocturne.h"
 #include "http.h"
 #include "json.h"
+#include "png.h"
 
 #define CONF_PATH    "/data/etc/agent.conf"
 #define AGENT_DIR    "/data/agent"
@@ -50,7 +51,8 @@ static struct {
     int max_tokens;
     long context_limit;
     bool show_thinking;
-} cf = {"https://hyper.charm.land/v1", "glm-5.3-flash", "", "", 16384, 200000, false};
+    bool vision; /* the model accepts images: offer the screenshot tool */
+} cf = {"https://hyper.charm.land/v1", "glm-5.3-flash", "", "", 16384, 200000, false, true};
 
 /* ---------------------------------------------------------------- small helpers */
 
@@ -168,6 +170,7 @@ static void conf_load(const char *path) {
         else if (!strcmp(k, "max_tokens")) cf.max_tokens = atoi(v);
         else if (!strcmp(k, "context_limit")) cf.context_limit = atol(v);
         else if (!strcmp(k, "show_thinking")) cf.show_thinking = atoi(v) != 0;
+        else if (!strcmp(k, "vision")) cf.vision = atoi(v) != 0;
     }
     memset(text, 0, strlen(text));
     free(text);
@@ -180,8 +183,9 @@ static void conf_save(const char *path) {
     jb_init(&b);
     jb_printf(&b,
               "# Nocturne agent settings\n"
-              "endpoint=%s\nmodel=%s\napi_key=%s\nmax_tokens=%d\ncontext_limit=%ld\nshow_thinking=%d\n",
-              cf.endpoint, cf.model, cf.key, cf.max_tokens, cf.context_limit, cf.show_thinking ? 1 : 0);
+              "endpoint=%s\nmodel=%s\napi_key=%s\nmax_tokens=%d\ncontext_limit=%ld\nshow_thinking=%d\nvision=%d\n",
+              cf.endpoint, cf.model, cf.key, cf.max_tokens, cf.context_limit, cf.show_thinking ? 1 : 0,
+              cf.vision ? 1 : 0);
     if (cf.reasoning[0]) jb_printf(&b, "reasoning=%s\n", cf.reasoning);
     if (!b.oom && write_text(path, b.s, b.len) == 0) say(C_DIM "saved settings to %s" C_RESET "\n", path);
     else say(C_ERR "could not write %s: %s" C_RESET "\n", path, strerror(errno));
@@ -195,6 +199,7 @@ static void conf_save(const char *path) {
 struct msg {
     char *json;
     bool tool_result;
+    bool image; /* a user message carrying a screenshot */
 };
 static struct msg *msgs;
 static int nmsgs, cap_msgs;
@@ -207,6 +212,7 @@ static void add_msg(char *json, bool tool_result) {
     }
     msgs[nmsgs].json = json;
     msgs[nmsgs].tool_result = tool_result;
+    msgs[nmsgs].image = false;
     nmsgs++;
 }
 
@@ -283,6 +289,7 @@ static bool load_session(void) {
         jb_init(&b);
         json_write(&b, arr->items[i]);
         add_msg(jb_take(&b), json_getstr(arr->items[i], "role") && !strcmp(json_getstr(arr->items[i], "role"), "tool"));
+        msgs[nmsgs - 1].image = strstr(msgs[nmsgs - 1].json, "\"image_url\"") != NULL;
     }
     json_free(arr);
     return true;
@@ -353,8 +360,18 @@ static const char *TOOLS_JSON =
 
     "{\"type\":\"function\",\"function\":{\"name\":\"fetch_url\",\"description\":"
     "\"HTTP(S) GET a URL from the internet and return the status and (text) body, truncated to 24 KB.\","
-    "\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}}"
-    "]";
+    "\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}}";
+
+static const char *SCREENSHOT_TOOL_JSON =
+    ",{\"type\":\"function\",\"function\":{\"name\":\"screenshot\",\"description\":"
+    "\"Look at the screen: capture the desktop (windows, taskbar) and attach it to the conversation as an image. "
+    "Use it to check GUI programs you start (run them with '&' first, and give them a moment). Optionally crop to "
+    "a region (x, y, width, height in screen pixels) to see details. Only the latest screenshot stays in the "
+    "conversation.\","
+    "\"parameters\":{\"type\":\"object\",\"properties\":{"
+    "\"x\":{\"type\":\"integer\"},\"y\":{\"type\":\"integer\"},"
+    "\"width\":{\"type\":\"integer\"},\"height\":{\"type\":\"integer\"},"
+    "\"delay\":{\"type\":\"integer\",\"description\":\"seconds to wait first\"}}}}}";
 
 /* output collector: keeps the head and the tail of long output */
 struct outcap {
@@ -589,6 +606,49 @@ static void tool_fetch(struct json *args, struct jbuf *out) {
     http_resp_free(&rs);
 }
 
+/* the screenshot tool leaves a data: URL here; it is sent as an image in a user message */
+static char *pending_image;
+
+static void tool_screenshot(struct json *args, struct jbuf *out) {
+    int delay = (int)json_getnum(args, "delay", 0);
+    if (delay > 0) sleep((unsigned)MIN(delay, 30));
+    int w, h;
+    uint32_t *px = NULL;
+    if (screen_grab(NULL, 0, &w, &h) == 0) px = malloc((size_t)w * (size_t)h * 4);
+    if (!px || screen_grab(px, (size_t)w * (size_t)h * 4, &w, &h) < 0) {
+        jb_puts(out, "error: cannot read the screen (no desktop?)");
+        free(px);
+        return;
+    }
+    int x = (int)json_getnum(args, "x", 0), y = (int)json_getnum(args, "y", 0);
+    int cw = (int)json_getnum(args, "width", w), ch = (int)json_getnum(args, "height", h);
+    x = MAX(0, MIN(x, w - 1));
+    y = MAX(0, MIN(y, h - 1));
+    cw = MAX(1, MIN(cw, w - x));
+    ch = MAX(1, MIN(ch, h - y));
+    uint8_t *png;
+    size_t n;
+    int r = png_encode(px + (size_t)y * (size_t)w + (size_t)x, cw, ch, w, &png, &n);
+    free(px);
+    if (r < 0) {
+        jb_puts(out, "error: out of memory");
+        return;
+    }
+    char *b64 = base64_encode(png, n, NULL);
+    free(png);
+    if (!b64) {
+        jb_puts(out, "error: out of memory");
+        return;
+    }
+    free(pending_image);
+    size_t ul = strlen(b64) + 32;
+    pending_image = malloc(ul);
+    if (pending_image) snprintf(pending_image, ul, "data:image/png;base64,%s", b64);
+    free(b64);
+    jb_printf(out, "captured %dx%d pixels at (%d,%d) of the %dx%d screen; the image follows in the next message",
+              cw, ch, x, y, w, h);
+}
+
 /* a one-line description of a tool call for the screen */
 static void show_call(const char *name, struct json *args) {
     const char *arg = json_getstr(args, "command");
@@ -640,6 +700,7 @@ static char *run_tool(const char *name, const char *argtext) {
     else if (!strcmp(name, "edit_file")) tool_edit(args, &out);
     else if (!strcmp(name, "list_dir")) tool_list(args, &out);
     else if (!strcmp(name, "fetch_url")) tool_fetch(args, &out);
+    else if (!strcmp(name, "screenshot") && cf.vision) tool_screenshot(args, &out);
     else jb_printf(&out, "error: there is no tool called %s", name);
     json_free(args);
     char *s = jb_take(&out);
@@ -891,6 +952,8 @@ static int model_step(const char *system) {
     }
     jb_puts(&body, ",\"tools\":");
     jb_puts(&body, TOOLS_JSON);
+    if (cf.vision) jb_puts(&body, SCREENSHOT_TOOL_JSON);
+    jb_puts(&body, "]");
     jb_puts(&body, ",\"messages\":[{\"role\":\"system\",\"content\":");
     jb_str(&body, system);
     jb_puts(&body, "}");
@@ -1000,6 +1063,25 @@ static int model_step(const char *system) {
         jb_puts(&t, "}");
         add_msg(jb_take(&t), true);
         free(res);
+    }
+    if (pending_image) {
+        /* only the newest screenshot is kept: images are large and old ones are rarely useful */
+        for (int i = 0; i < nmsgs; i++)
+            if (msgs[i].image) {
+                free(msgs[i].json);
+                msgs[i].json = strdup("{\"role\":\"user\",\"content\":\"[an earlier screenshot was removed]\"}");
+                msgs[i].image = false;
+            }
+        struct jbuf t;
+        jb_init(&t);
+        jb_puts(&t, "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"(screenshot tool result)\"},"
+                    "{\"type\":\"image_url\",\"image_url\":{\"url\":");
+        jb_str(&t, pending_image);
+        jb_puts(&t, "}}]}");
+        add_msg(jb_take(&t), false);
+        msgs[nmsgs - 1].image = true;
+        free(pending_image);
+        pending_image = NULL;
     }
     stream_free(st);
     free(st);

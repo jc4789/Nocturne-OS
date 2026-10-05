@@ -1375,6 +1375,18 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
         uint64_t va = map_user(w, current_task);
         return va ? (int64_t)va : -ENOMEM;
     }
+    case SYS_SCREEN_GRAB: {
+        /* copy the composed screen (desktop, windows, taskbar) as 0xAARRGGBB pixels; returns
+           width << 16 | height. The buffer must hold width * height pixels (bytes = 0: size only). */
+        if (!running) return -ENOSYS;
+        uint32_t *dst = (uint32_t *)a;
+        size_t need = (size_t)sw * (size_t)sh * 4;
+        if (b == 0) return (int64_t)sw << 16 | sh; /* just the size */
+        if (b < need) return -E2BIG;
+        if (!user_ok(dst, need)) return -EFAULT;
+        for (int y = 0; y < sh; y++) memcpy(dst + (size_t)y * (size_t)sw, back.px + (size_t)y * (size_t)back.pitch, (size_t)sw * 4);
+        return (int64_t)sw << 16 | sh;
+    }
     case SYS_GUI_LAUNCH: {
         char path[PATH_MAX_LEN], arg[PATH_MAX_LEN];
         if (user_str(path, (const char *)a, sizeof path) < 0) return -EFAULT;

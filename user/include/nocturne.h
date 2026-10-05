@@ -116,6 +116,9 @@ int win_event(window_t *win, struct gui_event *e, int timeout_ms);
 int clipboard_set(const char *s, size_t n);
 int clipboard_get(char *buf, size_t n);
 int gui_launch(const char *path, const char *arg);
+/* copy the whole screen (taskbar included) into buf as 0xAARRGGBB pixels. bytes = 0 only reports
+   the size. 0 or -1 (E2BIG: buffer too small) */
+int screen_grab(uint32_t *buf, size_t bytes, int *w, int *h);
 
 /* ---- tiny UI kit (ui.c) ---- */
 #define UI_BG      RGB(30, 28, 52)
