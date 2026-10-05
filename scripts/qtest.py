@@ -139,6 +139,25 @@ def main():
                 dx, dy = val.split(",")
                 mon.cmd("mouse_move %s %s" % (dx, dy))
                 time.sleep(0.05)
+            elif kind == "goto":
+                # absolute move: slam into the top-left corner, then walk in unaccelerated steps
+                tx, ty = (int(v) for v in val.split(","))
+                for _ in range(12):
+                    mon.cmd("mouse_move -200 -200")
+                    time.sleep(0.02)
+                while tx > 0 or ty > 0:
+                    sx, sy = min(tx, 5), min(ty, 5)
+                    mon.cmd("mouse_move %d %d" % (sx, sy))
+                    time.sleep(0.02)
+                    tx -= sx
+                    ty -= sy
+                time.sleep(0.1)
+            elif kind == "dclick":
+                for _ in range(2):
+                    mon.cmd("mouse_button 1")
+                    time.sleep(0.05)
+                    mon.cmd("mouse_button 0")
+                    time.sleep(0.08)
             elif kind == "click":
                 btn = int(val) if val else 1
                 mon.cmd("mouse_button %d" % btn)

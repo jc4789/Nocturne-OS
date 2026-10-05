@@ -1,0 +1,22 @@
+Welcome to Nocturne!
+====================
+
+Nocturne is a small hobby operating system that was written in a single
+night. Everything you see is built from scratch: the kernel, the window
+manager, the C library, the shell and every app.
+
+Things to try
+-------------
+ * Double-click the icons on the desktop, or open the menu with the
+   moon button in the corner (or press the Windows key).
+ * Ctrl+Alt+T opens a terminal. Alt+Tab switches windows, Alt+F4
+   closes the focused one.
+ * Drag a window by its title bar; drag the bottom-right corner of a
+   resizable window to resize it; double-click a title to maximise.
+ * In the terminal: ls -l /bin, ps, free, neofetch, fortune | moonsay
+ * Open Files and double-click this file to edit it in the Text Editor.
+   Ctrl+S saves.
+
+Note: files live in memory, so changes are gone after a reboot.
+
+Good night, and have fun.

@@ -1,0 +1,3 @@
+todo:
+  - finish the operating system   [x]
+  - get some sleep                [ ]

@@ -1,0 +1,4 @@
+Ideas for the next night
+  * networking (the e1000 / tulip card is already detected on PCI)
+  * a persistent FAT32 disk
+  * more games
