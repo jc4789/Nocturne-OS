@@ -205,6 +205,20 @@ uint8_t gfx_glyph_for(uint32_t cp) {
         if (font8x16_umap[mid][0] < cp) lo = mid + 1;
         else hi = mid - 1;
     }
+    /* typographic punctuation (common in AI and web text) the font lacks: nearest ASCII */
+    switch (cp) {
+    case 0x2010: case 0x2011: case 0x2012: case 0x2013: case 0x2014: case 0x2015: case 0x2212:
+        return '-';
+    case 0x2018: case 0x2019: case 0x201A: case 0x2032: return '\'';
+    case 0x201C: case 0x201D: case 0x201E: case 0x2033: return '"';
+    case 0x2026: case 0x22EF: return '.';
+    case 0x2039: return '<';
+    case 0x203A: return '>';
+    case 0x2713: case 0x2714: case 0x2705: return 'v';
+    case 0x2717: case 0x2718: case 0x274C: return 'x';
+    case 0x2002: case 0x2003: case 0x2009: case 0x200A: case 0x202F: return ' ';
+    case 0x200B: case 0x200C: case 0x200D: case 0xFEFF: return ' ';
+    }
     return '?';
 }
 

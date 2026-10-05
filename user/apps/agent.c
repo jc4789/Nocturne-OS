@@ -657,6 +657,116 @@ static char *run_tool(const char *name, const char *argtext) {
 
 /* ---------------------------------------------------------------- streaming the reply */
 
+/* ---- streamed markdown: **bold**, `code`, ``` fences and # headings get colours instead of
+   showing their markup. Text arrives in arbitrary pieces, so this is a byte-at-a-time machine. */
+struct md {
+    bool sol;        /* at the start of a line */
+    int stars;       /* '*' seen but not yet decided */
+    int ticks;       /* '`' seen but not yet decided */
+    int hashes;      /* '#' at line start, not yet decided */
+    bool bold, code, fence, head;
+    bool skip_line;  /* rest of a ``` line (the language name) */
+};
+static struct md md;
+
+static void md_style(void) {
+    fputs(C_RESET, stdout);
+    if (md.fence) fputs("\x1b[33m", stdout);
+    else if (md.head) fputs("\x1b[1;95m", stdout);
+    else if (md.code) fputs("\x1b[36m", stdout);
+    else if (md.bold) fputs("\x1b[1;97m", stdout);
+}
+
+static void md_flush_pending(void) {
+    for (; md.hashes; md.hashes--) putchar('#');
+    if (md.ticks) {
+        if (md.ticks >= 3 && md.sol) {
+            md.fence = !md.fence;
+            md.skip_line = true;
+        } else if (!md.fence) {
+            md.code = !md.code;
+        } else {
+            for (int i = 0; i < md.ticks; i++) putchar('`');
+        }
+        md.ticks = 0;
+        md_style();
+    }
+    if (md.stars) {
+        if (md.stars == 2 && !md.fence && !md.code) {
+            md.bold = !md.bold;
+            md_style();
+        } else {
+            for (int i = 0; i < md.stars; i++) putchar('*');
+        }
+        md.stars = 0;
+    }
+}
+
+static void md_char(char c) {
+    if (md.skip_line) {
+        if (c != '\n') return;
+        md.skip_line = false;
+    }
+    if (c == '`') {
+        if (md.stars || md.hashes) md_flush_pending();
+        md.ticks++;
+        return;
+    }
+    if (md.ticks) md_flush_pending();
+    if (md.skip_line) {
+        if (c != '\n') return;
+        md.skip_line = false;
+    }
+    if (md.fence) {
+        putchar(c);
+        md.sol = c == '\n';
+        return;
+    }
+    if (c == '*' && !md.code && md.stars < 2) {
+        if (md.hashes) md_flush_pending();
+        md.stars++;
+        return;
+    }
+    if (c == '#' && md.sol && md.hashes < 6 && !md.stars) {
+        md.hashes++;
+        return;
+    }
+    if (md.hashes) {
+        if (c == ' ') {
+            md.hashes = 0;
+            md.head = true;
+            md_style();
+            return;
+        }
+        md_flush_pending();
+    }
+    if (md.stars) md_flush_pending();
+    if (c == '\n') {
+        if (md.head || md.code || md.bold) { /* styles never run past a line */
+            md.head = md.code = md.bold = false;
+            md_style();
+        }
+        putchar('\n');
+        md.sol = true;
+        return;
+    }
+    putchar(c);
+    md.sol = false;
+}
+
+static void md_put(const char *s) {
+    for (; *s; s++) md_char(*s);
+    fflush(stdout);
+}
+
+static void md_reset(void) {
+    md_flush_pending();
+    if (md.bold || md.code || md.fence || md.head) fputs(C_RESET, stdout);
+    memset(&md, 0, sizeof md);
+    md.sol = true;
+    fflush(stdout);
+}
+
 #define MAX_CALLS 16
 struct call {
     char id[128];
@@ -715,8 +825,7 @@ static void on_event(struct stream *st, const char *data) {
         if (st->said_thinking && !st->printed_text) say("\x1b[K");
         st->printed_text = true;
         jb_puts(&st->content, text);
-        fputs(text, stdout);
-        fflush(stdout);
+        md_put(text);
     }
     struct json *tcs = json_get(delta, "tool_calls");
     for (int i = 0; tcs && i < tcs->n; i++) {
@@ -821,7 +930,9 @@ static int model_step(const char *system) {
                               .on_body = on_body,
                               .ctx = st};
         struct http_resp rs;
+        md_reset();
         int r = http_request(&rq, &rs);
+        md_reset();
         if (st->in_thinking || st->printed_text) say(C_RESET "\n");
         else if (st->said_thinking) say("\x1b[K");
         if (r < 0) {

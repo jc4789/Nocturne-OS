@@ -46,8 +46,48 @@ int remove(const char *path) { return unlink(path); }
 int rename(const char *from, const char *to) { return (int)ret(SC2(SYS_RENAME, from, to)); }
 int chdir(const char *path) { return (int)ret(SC1(SYS_CHDIR, path)); }
 char *getcwd(char *buf, size_t n) { return ret(SC2(SYS_GETCWD, buf, n)) < 0 ? NULL : buf; }
+/* A text file that is not an ELF program is run as a script: by the interpreter named on a
+   "#!" first line, else by /bin/sh. Returns the interpreter path in buf, or NULL. */
+static const char *script_interp(const char *path, char *buf, size_t n) {
+    char head[256];
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return NULL;
+    ssize_t len = read(fd, head, sizeof head - 1);
+    close(fd);
+    if (len <= 0) return NULL;
+    head[len] = 0;
+    if ((size_t)len != strlen(head)) return NULL; /* binary data */
+    if (head[0] == '#' && head[1] == '!') {
+        char *p = head + 2;
+        while (*p == ' ') p++;
+        size_t k = strcspn(p, " \t\r\n");
+        if (k == 0 || k >= n) return NULL;
+        memcpy(buf, p, k);
+        buf[k] = 0;
+        return buf;
+    }
+    return "/bin/sh";
+}
+
 int spawn(const char *path, char *const argv[], const int fdmap[3], int flags) {
-    return (int)ret(SC4(SYS_SPAWN, path, argv, fdmap, flags));
+    long r = SC4(SYS_SPAWN, path, argv, fdmap, flags);
+    if (r == -ENOEXEC) {
+        char ibuf[128];
+        const char *interp = script_interp(path, ibuf, sizeof ibuf);
+        if (interp && strcmp(interp, path) != 0) {
+            int argc = 0;
+            while (argv && argv[argc]) argc++;
+            char **nargv = malloc(sizeof(char *) * (size_t)(argc + 2));
+            if (!nargv) return (int)ret(-ENOMEM);
+            nargv[0] = (char *)interp;
+            nargv[1] = (char *)path;
+            for (int i = 1; i < argc; i++) nargv[i + 1] = argv[i];
+            nargv[argc < 1 ? 2 : argc + 1] = NULL;
+            r = SC4(SYS_SPAWN, interp, nargv, fdmap, flags);
+            free(nargv);
+        }
+    }
+    return (int)ret(r);
 }
 int waitpid(int pid, int *status, int flags) { return (int)ret(SC3(SYS_WAITPID, pid, status, flags)); }
 int getpid(void) { return (int)SC0(SYS_GETPID); }

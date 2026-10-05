@@ -27,7 +27,8 @@ this very machine. The person talking to you is at the VM's keyboard, in a termi
   'single' and "double" quotes. Builtins: cd, pwd, exit, history, help, clear.
 - No variables, loops, `if`, functions or command substitution. For anything non-trivial,
   write a C program instead of a shell script.
-- Shell scripts (`sh file.sh`) are plain command lists.
+- Shell scripts are plain command lists. Run them with `sh file.sh`, or by name/path: a text file
+  that is not a program runs through `/bin/sh` (or the interpreter on a `#!` first line).
 - Useful programs (see `ls /bin` for all): ls [-l -a], cat, head [-N], wc [-l -w -c], grep,
   cp, mv, rm [-r -f], mkdir, rmdir, touch, tree, hexdump, echo, sleep, date, uptime, ps, kill,
   free, uname, dmesg, lspci, fetch, ping, host, ifconfig, true, false.
