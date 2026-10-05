@@ -123,7 +123,7 @@ static int64_t sys_fstat(int fd, struct kstat *st) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
     if (!user_ok(st, sizeof *st)) return -EFAULT;
-    st->type = f->vn->type;
+    st->type = f->vn->tty ? VT_CHAR : f->vn->type;
     st->size = f->vn->size;
     st->mtime = f->vn->mtime;
     st->mode = f->vn->mode;
@@ -361,6 +361,10 @@ static int64_t sys_fcntl(int fd, int cmd, int arg) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
     if (cmd == F_GETFL) return f->flags;
+    if (cmd == F_SETTTY) {
+        f->vn->tty = arg != 0;
+        return 0;
+    }
     if (cmd == F_SETFL) {
         f->flags = (f->flags & O_ACCMODE) | (arg & ~O_ACCMODE);
         return 0;

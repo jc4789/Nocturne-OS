@@ -93,8 +93,16 @@ $(BUILD)/initrd.tar: $(APP_BINS) $(shell find rootfs -type f) scripts/mkinitrd.p
 	@echo "  TAR  $@"
 	@$(PY) scripts/mkinitrd.py $@ rootfs $(BUILD)/root
 
-image: $(BUILD)/kernel.elf $(BUILD)/initrd.tar
+image: $(BUILD)/kernel.elf $(BUILD)/initrd.tar $(BUILD)/data-blank.vhdx
 	@bash scripts/mkimage.sh
+	@bash scripts/mkdata.sh
+
+# an empty 2 GiB data disk for Hyper-V (hyperv.ps1 copies it once; it is dynamic, so tiny on disk)
+$(BUILD)/data-blank.vhdx: scripts/mkdata.sh
+	@rm -f $(BUILD)/data-blank.img
+	@bash scripts/mkdata.sh $(BUILD)/data-blank.img 2048
+	@qemu-img convert -f raw -O vhdx -o subformat=dynamic $(BUILD)/data-blank.img $@
+	@rm -f $(BUILD)/data-blank.img
 
 run: image
 	@qemu-system-x86_64 -M pc -m 512M -drive file=$(BUILD)/nocturne.img,format=raw,if=ide \

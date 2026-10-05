@@ -94,7 +94,7 @@ int pcilist(struct n_pciinfo *out, int max) { return (int)ret(SC2(SYS_PCILIST, o
 int isatty(int fd) {
     struct n_stat st;
     if (fstat(fd, &st) < 0) return 0;
-    return st.type == N_FT_CHAR || st.type == N_FT_PIPE;
+    return st.type == N_FT_CHAR;
 }
 
 bool find_program(const char *name, char *out, size_t n) {
@@ -103,8 +103,13 @@ bool find_program(const char *name, char *out, size_t n) {
         strlcpy(out, name, n);
         return stat(out, &st) == 0 && st.type == N_FT_FILE;
     }
-    snprintf(out, n, "/bin/%s", name);
-    return stat(out, &st) == 0 && st.type == N_FT_FILE;
+    /* built-in programs first, then the ones built or installed on the persistent data disk */
+    static const char *const dirs[] = {"/bin", "/data/bin"};
+    for (size_t i = 0; i < sizeof dirs / sizeof *dirs; i++) {
+        snprintf(out, n, "%s/%s", dirs[i], name);
+        if (stat(out, &st) == 0 && st.type == N_FT_FILE) return true;
+    }
+    return false;
 }
 
 int run_wait(const char *path, char *const argv[]) {

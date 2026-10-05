@@ -99,8 +99,11 @@ def keyname(ch):
 
 def main():
     args = sys.argv[1:]
-    media = ["-drive", "file=" + os.path.join(ROOT, "build", "nocturne.img") + ",format=raw,if=ide"]
+    media = ["-drive", "file=" + os.path.join(ROOT, "build", "nocturne.img") + ",format=raw,if=ide,index=0"]
     extra = []
+    data = os.path.join(ROOT, "build", "data.img")
+    if os.path.exists(data):
+        extra += ["-drive", "file=" + data + ",format=raw,if=ide,index=1"]
     if args and args[0] == "--iso":
         media = ["-cdrom", os.path.join(ROOT, "build", "nocturne.iso")]
         args = args[1:]

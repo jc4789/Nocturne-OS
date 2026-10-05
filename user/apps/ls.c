@@ -4,7 +4,7 @@
 #include <errno.h>
 #include "nocturne.h"
 
-static bool opt_l, opt_a;
+static bool opt_l, opt_a, tty;
 
 static int cmp(const void *a, const void *b) {
     const struct n_dirent *x = a, *y = b;
@@ -19,6 +19,7 @@ static void human(uint64_t n, char *out) {
 }
 
 static const char *color(const struct n_dirent *d, const char *dir) {
+    if (!tty) return "";
     if (d->type == N_FT_DIR) return "\x1b[1;34m";
     if (d->type == N_FT_CHAR) return "\x1b[33m";
     if (!strcmp(dir, "/bin")) return "\x1b[1;32m";
@@ -58,9 +59,12 @@ static int list(const char *path, bool header) {
             char sz[16];
             human(ents[i].size, sz);
             const char *t = ents[i].type == N_FT_DIR ? "dir " : ents[i].type == N_FT_CHAR ? "dev " : "file";
-            printf("%s %8s  %s%s\x1b[0m%s\n", t, ents[i].type == N_FT_DIR ? "-" : sz, color(&ents[i], path),
-                   ents[i].name, ents[i].type == N_FT_DIR ? "/" : "");
+            printf("%s %8s  %s%s%s%s\n", t, ents[i].type == N_FT_DIR ? "-" : sz, color(&ents[i], path),
+                   ents[i].name, tty ? "\x1b[0m" : "", ents[i].type == N_FT_DIR ? "/" : "");
         }
+    } else if (!tty) {
+        /* piped or redirected: one name per line, so `ls | wc -l` and scripts work */
+        for (int i = 0; i < n; i++) printf("%s%s\n", ents[i].name, ents[i].type == N_FT_DIR ? "/" : "");
     } else {
         int width = 0;
         for (int i = 0; i < n; i++)
@@ -78,6 +82,7 @@ static int list(const char *path, bool header) {
 
 int main(int argc, char **argv) {
     int first = 1;
+    tty = isatty(1);
     for (; first < argc && argv[first][0] == '-'; first++) {
         for (char *p = argv[first] + 1; *p; p++) {
             if (*p == 'l') opt_l = true;

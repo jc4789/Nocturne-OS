@@ -77,6 +77,7 @@ struct n_pciinfo {
 /* fcntl */
 #define F_GETFL 3
 #define F_SETFL 4
+#define F_SETTTY 100 /* mark a pipe as a terminal (the terminal emulator does this), so isatty() is true */
 
 /* ---- GUI ---- */
 enum {

@@ -83,3 +83,7 @@ void time_to_parts(int64_t t, struct tm_parts *p) {
     p->mon = mp < 10 ? mp + 3 : mp - 9;
     p->year = (int)(y + (p->mon <= 2));
 }
+
+int64_t time_from_parts(const struct tm_parts *p) {
+    return days_from_civil(p->year, p->mon, p->mday) * 86400 + p->hour * 3600 + p->min * 60 + p->sec;
+}

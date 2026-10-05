@@ -6,6 +6,7 @@
 #include "dev/input.h"
 #include "dev/fbcon.h"
 #include "dev/pci.h"
+#include "dev/ata.h"
 #include "gui/wm.h"
 #include "sys/proc.h"
 #include "sys/sched.h"
@@ -14,6 +15,7 @@ extern volatile struct limine_module_request module_req;
 extern const char *kernel_cmdline;
 void acpi_init(void);
 void net_init(void);
+void fat_mount_data(void);
 
 /* text-mode keyboard: translate key events into terminal byte sequences */
 static void console_key_sink(const struct key_event *e) {
@@ -64,6 +66,8 @@ void kmain_late(void) {
     acpi_init();
     pci_init();
     net_init();
+    ata_init();
+    fat_mount_data();
 
     bool gui = !cmdline_has("nogui");
     if (gui) wm_init();

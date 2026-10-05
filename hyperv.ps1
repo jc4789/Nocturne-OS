@@ -10,6 +10,9 @@
       * creates a Gen1 VM with static memory, one CPU, no checkpoints and a *legacy* network adapter
         (an emulated DEC 21140, which Nocturne drives) on the "Default Switch" for NAT internet access,
       * attaches the disk to IDE 0:0 and makes IDE the first boot device,
+      * attaches a persistent 2 GiB data disk (.\hyperv\<Name>-data.vhdx, FAT32 "NOCTDATA") on IDE 0:1,
+        which Nocturne mounts at /data. It is created once and never replaced by -Update or -Remove,
+      * optionally writes an AI provider key into /data/etc/agent.conf (-ApiKeyFile, for the agent program),
       * routes COM1 to the named pipe \\.\pipe\nocturne-com1 (kernel log),
       * starts the VM and opens a VMConnect window.
 
@@ -21,6 +24,10 @@
     .\hyperv.ps1 -Remove         # delete the VM (and its copied disk)
 .EXAMPLE
     .\hyperv.ps1 -Iso            # boot from build\nocturne.iso on the virtual DVD drive instead of the VHD
+.EXAMPLE
+    .\hyperv.ps1 -Update -ApiKeyFile C:\keys\llm.txt   # also store an API key for `agent` on the data disk
+.EXAMPLE
+    .\hyperv.ps1 -Remove -DeleteData   # delete the VM, its disk *and* the data disk
 #>
 param(
     [string]$Name = "Nocturne",
@@ -30,7 +37,11 @@ param(
     [switch]$Iso,
     [switch]$NoStart,
     [switch]$NoNetwork,
-    [string]$Switch = "Default Switch"
+    [string]$Switch = "Default Switch",
+    [string]$ApiKeyFile,
+    [string]$Endpoint = "https://hyper.charm.land/v1",
+    [string]$Model = "glm-5.3-flash",
+    [switch]$DeleteData
 )
 
 $ErrorActionPreference = "Stop"
@@ -40,6 +51,8 @@ $SrcVhd = Join-Path $Root "build\nocturne.vhd"
 $SrcIso = Join-Path $Root "build\nocturne.iso"
 $Vhd = Join-Path $VmDir "$Name.vhd"
 $IsoCopy = Join-Path $VmDir "$Name.iso"
+$SrcData = Join-Path $Root "build\data-blank.vhdx"
+$DataVhd = Join-Path $VmDir "$Name-data.vhdx"
 
 function Say($msg) { Write-Host "[nocturne] $msg" -ForegroundColor Magenta }
 
@@ -63,6 +76,13 @@ if ($Remove) {
         Say "removed VM '$Name'"
     }
     foreach ($f in @($Vhd, $IsoCopy)) { if (Test-Path $f) { Remove-Item $f -Force } }
+    if ($DeleteData -and (Test-Path $DataVhd)) {
+        Remove-Item $DataVhd -Force
+        Say "deleted the data disk"
+    }
+    elseif (Test-Path $DataVhd) {
+        Say "kept the data disk $DataVhd (pass -DeleteData to delete it too)"
+    }
     return
 }
 
@@ -91,10 +111,50 @@ function Add-LegacyNic($vm) {
     Add-VMNetworkAdapter -VM $vm -IsLegacy $true -SwitchName $Switch
 }
 
+function Add-DataDisk($vmName) {
+    if (-not (Test-Path $DataVhd)) {
+        if (-not (Test-Path $SrcData)) { throw "build\data-blank.vhdx not found; rebuild first" }
+        Say "creating the persistent data disk -> $DataVhd"
+        Copy-Item $SrcData $DataVhd
+    }
+    $att = Get-VMHardDiskDrive -VMName $vmName -ControllerType IDE -ControllerNumber 0 -ControllerLocation 1
+    if (-not $att) {
+        Say "attaching the data disk on IDE 0:1"
+        Add-VMHardDiskDrive -VMName $vmName -ControllerType IDE -ControllerNumber 0 -ControllerLocation 1 -Path $DataVhd
+    }
+}
+
+# Write /etc/agent.conf onto the data disk (the VM must be off). The key is read from a text file that
+# either holds just the key or has a line like "api key: <key>"; it is never printed.
+function Set-AgentKey {
+    $text = Get-Content -Raw $ApiKeyFile
+    $key = $null
+    if ($text -match '(?im)^\s*api[ _-]?key\s*[:=]\s*(\S+)') { $key = $Matches[1] }
+    elseif ($text.Trim() -notmatch '\s') { $key = $text.Trim() }
+    if (-not $key) { throw "could not find the key in $ApiKeyFile (expected a line like 'api key: ...')" }
+    $disk = Mount-VHD -Path $DataVhd -Passthru | Get-Disk
+    try {
+        $part = Get-Partition -DiskNumber $disk.Number | Select-Object -First 1
+        if (-not $part.DriveLetter) {
+            $part | Add-PartitionAccessPath -AssignDriveLetter
+            $part = Get-Partition -DiskNumber $disk.Number | Select-Object -First 1
+        }
+        $etc = "$($part.DriveLetter):\etc"
+        New-Item -ItemType Directory -Force $etc | Out-Null
+        $conf = "# written by hyperv.ps1 -ApiKeyFile`nendpoint=$Endpoint`nmodel=$Model`napi_key=$key`n"
+        [System.IO.File]::WriteAllText("$etc\agent.conf", $conf)
+        Say "stored the API key in /data/etc/agent.conf (endpoint $Endpoint, model $Model)"
+    }
+    finally {
+        Dismount-VHD -Path $DataVhd
+    }
+}
+
 if ($existing -and $Update) {
     Stop-IfRunning $existing
     Add-LegacyNic $existing
     Copy-Media
+    Add-DataDisk $Name
     if ($Iso) { Set-VMDvdDrive -VMName $Name -ControllerNumber 1 -ControllerLocation 0 -Path $IsoCopy }
 }
 elseif ($existing) {
@@ -113,6 +173,7 @@ else {
     Set-VM -VM $vm -AutomaticStopAction TurnOff
     # kernel log on COM1 -> named pipe (read it with PuTTY or any pipe client)
     Set-VMComPort -VM $vm -Number 1 -Path "\\.\pipe\nocturne-com1"
+    Add-DataDisk $Name
     if ($Iso) {
         Set-VMDvdDrive -VMName $Name -ControllerNumber 1 -ControllerLocation 0 -Path $IsoCopy
         Set-VMBios -VM $vm -StartupOrder @("CD", "IDE", "LegacyNetworkAdapter", "Floppy")
@@ -121,6 +182,8 @@ else {
         Set-VMBios -VM $vm -StartupOrder @("IDE", "CD", "LegacyNetworkAdapter", "Floppy")
     }
 }
+
+if ($ApiKeyFile) { Set-AgentKey }
 
 if (-not $NoStart) {
     Say "starting '$Name'"

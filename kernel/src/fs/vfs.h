@@ -57,6 +57,7 @@ struct vnode {
     int64_t mtime;
     int refs;
     bool unlinked;
+    bool tty; /* a pipe that a terminal emulator reads/writes: reported as a character device */
     struct vnode_ops *ops;
     void *priv;
     struct vnode *mounted;  /* fs root mounted on top of this dir */

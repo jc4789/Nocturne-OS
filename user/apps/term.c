@@ -444,6 +444,8 @@ int main(int argc, char **argv) {
 
     int in_p[2], out_p[2];
     if (pipe(in_p) < 0 || pipe(out_p) < 0) return 1;
+    fcntl(in_p[0], F_SETTTY, 1);
+    fcntl(out_p[1], F_SETTTY, 1);
     int fdmap[3] = {in_p[0], out_p[1], out_p[1]};
     char *sargv[16] = {"sh", NULL};
     const char *prog = "/bin/sh";
