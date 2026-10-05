@@ -1,116 +1,65 @@
-/* fetch: download a URL over HTTP/1.0 */
+/* fetch: download a URL over HTTP or HTTPS */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
+#include "http.h"
 #include "nocturne.h"
 
 static void usage(void) {
-    fprintf(stderr, "usage: fetch [-i] [-o file] http://host[:port]/path\n"
+    fprintf(stderr, "usage: fetch [-i] [-o file] [-X method] [-H 'Name: value']... [-d data] url\n"
                     "  -i  also print the response headers\n"
-                    "  -o  save the body to a file instead of printing it\n");
+                    "  -o  save the body to a file instead of printing it\n"
+                    "  -d  send data as the request body (POST unless -X is given)\n");
     exit(2);
 }
 
+static int to_file(void *ctx, const char *data, size_t n) {
+    return fwrite(data, 1, n, (FILE *)ctx) == n ? 0 : -1;
+}
+
 int main(int argc, char **argv) {
-    const char *url = NULL, *out = NULL;
-    bool headers = false;
+    const char *url = NULL, *out = NULL, *method = NULL, *data = NULL;
+    bool show_headers = false;
+    static char headers[2048];
+    size_t hl = 0;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-i")) headers = true;
+        if (!strcmp(argv[i], "-i")) show_headers = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
-        else if (argv[i][0] == '-') usage();
+        else if (!strcmp(argv[i], "-X") && i + 1 < argc) method = argv[++i];
+        else if (!strcmp(argv[i], "-d") && i + 1 < argc) data = argv[++i];
+        else if (!strcmp(argv[i], "-H") && i + 1 < argc) {
+            int n = snprintf(headers + hl, sizeof headers - hl, "%s\r\n", argv[++i]);
+            if (n > 0 && hl + n < sizeof headers) hl += n;
+        } else if (argv[i][0] == '-') usage();
         else url = argv[i];
     }
     if (!url) usage();
-    if (!strncmp(url, "https://", 8)) {
-        fprintf(stderr, "fetch: https is not supported (no TLS in Nocturne yet), try http://\n");
-        return 1;
-    }
-    if (!strncmp(url, "http://", 7)) url += 7;
-
-    char host[128], path[512];
-    int port = 80;
-    size_t hl = strcspn(url, ":/");
-    if (hl == 0 || hl >= sizeof host) usage();
-    memcpy(host, url, hl);
-    host[hl] = 0;
-    const char *p = url + hl;
-    if (*p == ':') {
-        port = atoi(p + 1);
-        p += strcspn(p, "/");
-    }
-    snprintf(path, sizeof path, "%s", *p ? p : "/");
-
-    if (!net_wait_up(5000)) {
-        fprintf(stderr, "fetch: network is down\n");
-        return 1;
-    }
-    uint32_t ip;
-    if (net_resolve(host, &ip) < 0) {
-        fprintf(stderr, "fetch: %s: %s\n", host, strerror(errno));
-        return 1;
-    }
-    char ipbuf[16];
-    fprintf(stderr, "connecting to %s (%s) port %d...\n", host, ip_format(ip, ipbuf), port);
-    int s = tcp_connect(ip, (uint16_t)port, 10000);
-    if (s < 0) {
-        fprintf(stderr, "fetch: connect: %s\n", strerror(errno));
-        return 1;
-    }
-    char req[1024];
-    int n = snprintf(req, sizeof req,
-                     "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: fetch/1.0 (Nocturne OS)\r\nAccept: */*\r\n"
-                     "Connection: close\r\n\r\n",
-                     path, host);
-    if (tcp_send(s, req, (size_t)n) < 0) {
-        fprintf(stderr, "fetch: send: %s\n", strerror(errno));
-        return 1;
-    }
 
     FILE *f = stdout;
     if (out && !(f = fopen(out, "w"))) {
-        fprintf(stderr, "fetch: %s: %s\n", out, strerror(errno));
+        perror(out);
         return 1;
     }
-    /* read the header block first, then stream the body */
-    static char buf[8192];
-    size_t have = 0, total = 0;
-    bool in_body = false;
-    int status = 0;
+    struct http_req rq = {.method = method ? method : data ? "POST" : "GET",
+                          .url = url,
+                          .headers = hl ? headers : NULL,
+                          .body = data,
+                          .body_len = data ? strlen(data) : 0,
+                          .timeout_ms = 30000,
+                          .on_body = to_file,
+                          .ctx = f};
+    struct http_resp rs;
     uint64_t t0 = uptime_ms();
-    for (;;) {
-        long r = tcp_recv(s, buf + have, sizeof buf - have - 1, 15000);
-        if (r < 0) {
-            fprintf(stderr, "fetch: %s\n", errno == EAGAIN ? "timed out" : strerror(errno));
-            break;
-        }
-        if (r == 0) break;
-        if (in_body) {
-            fwrite(buf, 1, (size_t)r, f);
-            total += (size_t)r;
-            continue;
-        }
-        have += (size_t)r;
-        buf[have] = 0;
-        char *end = strstr(buf, "\r\n\r\n");
-        if (!end && have < sizeof buf - 1) continue;
-        size_t head_len = end ? (size_t)(end - buf) + 4 : have;
-        sscanf(buf, "HTTP/%*d.%*d %d", &status);
-        if (headers) fwrite(buf, 1, head_len, out ? stderr : stdout);
-        else if (status && status != 200) {
-            char *eol = strstr(buf, "\r\n");
-            if (eol) fprintf(stderr, "fetch: server says: %.*s\n", (int)(eol - buf), buf);
-        }
-        fwrite(buf + head_len, 1, have - head_len, f);
-        total += have - head_len;
-        in_body = true;
-    }
-    tcp_close(s);
+    int r = http_request(&rq, &rs);
     if (f != stdout) fclose(f);
     else fflush(stdout);
+    if (show_headers && rs.status) fprintf(stderr, "HTTP %d\n%s", rs.status, rs.headers);
+    if (r < 0) {
+        fprintf(stderr, "fetch: %s\n", rs.error);
+        return 1;
+    }
+    if (rs.status >= 400 && !show_headers) fprintf(stderr, "fetch: HTTP status %d\n", rs.status);
     uint64_t ms = uptime_ms() - t0;
-    if (out)
-        fprintf(stderr, "%zu bytes in %lu ms (%lu KB/s)\n", total, (unsigned long)ms,
-                (unsigned long)(ms ? total / ms : total / 1));
-    return status >= 200 && status < 400 ? 0 : 1;
+    if (out) fprintf(stderr, "%zu bytes in %lu ms\n", rs.body_len, (unsigned long)ms);
+    return rs.status >= 200 && rs.status < 400 ? 0 : 1;
 }

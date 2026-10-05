@@ -4,6 +4,7 @@
 #include "arch/cpu.h"
 #include "dev/fbcon.h"
 #include "dev/serial.h"
+#include "dev/entropy.h"
 
 /* ---- null / zero / random ---- */
 static int64_t null_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) { return 0; }
@@ -13,16 +14,8 @@ static int64_t zero_read(struct vnode *v, struct file *f, void *buf, uint64_t of
     return n;
 }
 
-static uint64_t rng_state = 0x9E3779B97F4A7C15ULL;
 static int64_t random_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
-    uint8_t *b = buf;
-    rng_state ^= rdtsc();
-    for (size_t i = 0; i < n; i++) {
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
-        b[i] = (uint8_t)rng_state;
-    }
+    entropy_get(buf, n);
     return n;
 }
 
@@ -119,6 +112,7 @@ void devfs_init(void) {
     add_dev(dev, "null", &null_ops);
     add_dev(dev, "zero", &zero_ops);
     add_dev(dev, "random", &random_ops);
+    add_dev(dev, "urandom", &random_ops);
     add_dev(dev, "console", &cons_ops);
     add_dev(dev, "kmsg", &kmsg_ops);
 }

@@ -1,5 +1,6 @@
 /* Late kernel initialisation: filesystems, devices, GUI and the first process. */
 #include "kernel.h"
+#include "dev/entropy.h"
 #include "limine.h"
 #include "fs/vfs.h"
 #include "dev/input.h"
@@ -48,6 +49,7 @@ bool cmdline_has(const char *word) {
 }
 
 void kmain_late(void) {
+    entropy_init();
     vfs_init();
     vfs_mkdir("/home");
     vfs_mkdir("/tmp");

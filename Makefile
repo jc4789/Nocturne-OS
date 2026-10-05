@@ -42,6 +42,24 @@ LIBC_C   := $(shell find user/libc -name '*.c') common/gfx.c
 LIBC_ASM := $(shell find user/libc -name '*.asm')
 LIBC_OBJ := $(patsubst %.c,$(BUILD)/u/%.o,$(LIBC_C)) $(patsubst %.asm,$(BUILD)/u/%.asm.o,$(LIBC_ASM))
 
+# BearSSL (TLS) is linked like libc: programs only pull in the parts they use
+BR_C     := $(shell find third_party/bearssl/src -name '*.c')
+BR_OBJ   := $(patsubst %.c,$(BUILD)/br/%.o,$(BR_C)) $(BUILD)/br/tls_roots.o
+BRFLAGS  := $(filter-out -W% -MMD -MP,$(UCFLAGS)) -w -Ithird_party/bearssl/inc -Ithird_party/bearssl/src \
+            -DBR_USE_URANDOM=1 -DBR_USE_GETENTROPY=0 -DBR_USE_WIN32_RAND=0 -DBR_USE_UNIX_TIME=1 -DBR_USE_WIN32_TIME=0
+UCFLAGS  += -Ithird_party/bearssl/inc
+
+$(BUILD)/br/%.o: %.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(BRFLAGS) -c $< -o $@
+
+$(BUILD)/br/tls_roots.c: third_party/ca/ca-bundle.crt scripts/mkroots.py
+	@mkdir -p $(dir $@)
+	@$(PY) scripts/mkroots.py $< $@
+
+$(BUILD)/br/tls_roots.o: $(BUILD)/br/tls_roots.c
+	@$(CC) $(BRFLAGS) -c $< -o $@
+
 APPS     := $(notdir $(basename $(wildcard user/apps/*.c)))
 APP_BINS := $(addprefix $(BUILD)/root/bin/,$(APPS))
 
@@ -56,9 +74,9 @@ $(BUILD)/u/%.asm.o: %.asm
 	@$(NASM) -f elf64 -g $< -o $@
 
 # no archiver in the toolchain: lld's --start-lib gives archive semantics to plain objects
-LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ))
+LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ)
 
-$(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) user/user.ld
+$(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
 	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib $(LIBC_LINK) --end-lib -o $@

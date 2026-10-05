@@ -3,6 +3,7 @@
 #include "sys/sched.h"
 #include "sys/syscall.h"
 #include "mm/vmm.h"
+#include "dev/entropy.h"
 
 struct idt_entry {
     uint16_t off_lo;
@@ -117,6 +118,7 @@ void isr_dispatch(struct regs *r) {
             outb(0x20, 0x20);
             return;
         }
+        entropy_add(rdtsc() ^ (uint64_t)irq << 56);
         pic_eoi(irq);
         if (irq_handlers[irq]) irq_handlers[irq](r);
     } else if (v == 0x80) {

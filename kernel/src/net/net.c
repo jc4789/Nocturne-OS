@@ -5,6 +5,7 @@
 #include "kernel.h"
 #include "abi.h"
 #include "net.h"
+#include "../dev/entropy.h"
 #include "../arch/cpu.h"
 #include "../mm/heap.h"
 #include "../sys/sched.h"
@@ -32,7 +33,8 @@ static const uint8_t bcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 static uint64_t rng_state;
 static uint32_t rnd(void) {
-    if (!rng_state) rng_state = rdtsc() | 1;
+    if (!rng_state) entropy_get(&rng_state, sizeof rng_state);
+    rng_state |= 1;
     rng_state ^= rng_state << 13;
     rng_state ^= rng_state >> 7;
     rng_state ^= rng_state << 17;
