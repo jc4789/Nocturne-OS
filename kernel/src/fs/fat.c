@@ -89,6 +89,16 @@ static uint8_t *fat_sector(struct fat_fs *fs, uint64_t lba) {
     return fcache[victim].data;
 }
 
+/* forget a volume's cached FAT sectors before its fat_fs is freed: a volume probed later could
+   be allocated at the same address and would otherwise see this one's FAT */
+static void fcache_forget(struct fat_fs *fs) {
+    for (int i = 0; i < FCACHE; i++)
+        if (fcache[i].fs == fs) {
+            fcache[i].fs = NULL;
+            fcache[i].used = 0;
+        }
+}
+
 static uint32_t fat_get(struct fat_fs *fs, uint32_t c) {
     uint64_t off = (uint64_t)c * 4;
     uint8_t *s = fat_sector(fs, fs->reserved + off / SECTOR);
@@ -868,6 +878,7 @@ void fat_mount_data(void) {
                 mount_fs(fs, "/data", label);
                 return;
             }
+            fcache_forget(fs);
             kfree(fs);
         }
     }
