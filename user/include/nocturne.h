@@ -65,6 +65,11 @@ int run_wait(const char *path, char *const argv[]);
 /* find a program: "ls" -> "/bin/ls"; returns false if not found */
 bool find_program(const char *name, char *out, size_t n);
 
+/* line editor for terminal programs (echo, editing keys, history). Returns the line length, or -1
+   at end of input (Ctrl+D). RL_SECRET echoes '*' and keeps the line out of the history. */
+#define RL_SECRET 1
+int readline(const char *prompt, char *buf, size_t size, int flags);
+
 /* ---- networking (net.c) ----
    IPv4 addresses are uint32_t in host order (10.0.2.15 is 0x0A00020F). Functions return -1 and
    set errno on failure. Timeouts are in milliseconds; -1 waits forever. */

@@ -37,8 +37,9 @@ def main():
         with open(tmp, "w", newline="\n") as f:
             f.write("# written by scripts/setkey.py\nendpoint=%s\nmodel=%s\napi_key=%s\n" % (a.endpoint, a.model, key))
         part = a.img + "@@1048576"
-        subprocess.run(["mmd", "-i", part, "::/etc"], capture_output=True)
-        subprocess.run(["mcopy", "-o", "-i", part, tmp, "::/etc/agent.conf"], check=True)
+        # -D s: skip on a name clash (mtools would otherwise ask interactively)
+        subprocess.run(["mmd", "-D", "s", "-i", part, "::/etc"], capture_output=True, stdin=subprocess.DEVNULL)
+        subprocess.run(["mcopy", "-D", "o", "-i", part, tmp, "::/etc/agent.conf"], check=True, stdin=subprocess.DEVNULL)
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
