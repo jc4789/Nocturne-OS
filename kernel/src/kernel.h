@@ -79,6 +79,8 @@ int ksnprintf(char *buf, size_t size, const char *fmt, ...) __attribute__((forma
 int kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 NORETURN void panic(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void klog_write(const char *s, size_t n);
+/* true if the kernel command line contains this exact word (init.c) */
+bool cmdline_has(const char *word);
 size_t klog_read(char *buf, size_t max);
 
 #define ASSERT(x) do { if (!(x)) panic("assertion failed: %s (%s:%d)", #x, __FILE__, __LINE__); } while (0)

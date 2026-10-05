@@ -38,7 +38,7 @@ static void console_key_sink(const struct key_event *e) {
     }
 }
 
-static bool cmdline_has(const char *word) {
+bool cmdline_has(const char *word) {
     size_t n = strlen(word);
     for (const char *p = kernel_cmdline; *p; p++) {
         if ((p == kernel_cmdline || p[-1] == ' ') && !strncmp(p, word, n) && (p[n] == 0 || p[n] == ' '))

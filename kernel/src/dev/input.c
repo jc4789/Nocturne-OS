@@ -96,15 +96,13 @@ static void kbd_irq(struct regs *r) {
 /* ---- mouse ---- */
 static uint8_t packet[4];
 static int pidx;
+static bool flip_y;
 
 static void mouse_irq(struct regs *r) {
     (void)r;
     uint8_t st = inb(0x64);
-    if (!(st & 1)) return;
+    if (!(st & 1) || !(st & 0x20)) return; /* nothing, or a keyboard byte: leave it for IRQ1 */
     uint8_t b = inb(0x60);
-    if (!(st & 0x20)) {
-        return; /* keyboard byte on the mouse IRQ: drop */
-    }
     if (pidx == 0 && !(b & 0x08)) return; /* resync */
     packet[pidx++] = b;
     int need = mouse_wheel ? 4 : 3;
@@ -114,6 +112,7 @@ static void mouse_irq(struct regs *r) {
     struct mouse_event e;
     e.dx = (int)packet[1] - ((packet[0] & 0x10) ? 256 : 0);
     e.dy = -((int)packet[2] - ((packet[0] & 0x20) ? 256 : 0));
+    if (flip_y) e.dy = -e.dy;
     e.buttons = packet[0] & 7;
     e.wheel = 0;
     if (mouse_wheel) {
@@ -147,6 +146,22 @@ static int mouse_cmd(uint8_t c) {
     outb(0x60, c);
     if (!wait_read()) return -1;
     return inb(0x60);
+}
+
+/* Hyper-V on Windows 11 hosts reports the emulated PS/2 mouse's Y axis upside down (a known
+   regression that also hits Windows XP and Haiku guests). Detect it from the hypervisor's CPUID
+   signature and host build; "mouse_y=normal" or "mouse_y=invert" on the command line overrides. */
+static bool detect_flip_y(void) {
+    if (cmdline_has("mouse_y=invert")) return true;
+    if (cmdline_has("mouse_y=normal")) return false;
+    uint32_t a, b, c, d;
+    cpuid(1, 0, &a, &b, &c, &d);
+    if (!(c & (1u << 31))) return false; /* no hypervisor */
+    cpuid(0x40000000, 0, &a, &b, &c, &d);
+    if (b != 0x7263694D || c != 0x666F736F || d != 0x76482074 || a < 0x40000002) return false; /* "Microsoft Hv" */
+    cpuid(0x40000002, 0, &a, &b, &c, &d);
+    kprintf("input: Hyper-V host build %u (%u.%u)\n", a, b >> 16, b & 0xFFFF);
+    return a >= 22000; /* Windows 11 and later */
 }
 
 static void flush(void) {
@@ -195,13 +210,14 @@ void input_init(void) {
         if (mouse_cmd(0xF4) == 0xFA) mouse_ok = true;
     }
     flush();
+    flip_y = mouse_ok && detect_flip_y();
     irq_register(1, kbd_irq);
     irq_register(12, mouse_irq);
     pic_unmask(1);
     pic_unmask(2);
     pic_unmask(12);
-    kprintf("input: PS/2 keyboard ready, mouse %s%s\n", mouse_ok ? "ready" : "not found",
-            mouse_wheel ? " (wheel)" : "");
+    kprintf("input: PS/2 keyboard ready, mouse %s%s%s\n", mouse_ok ? "ready" : "not found",
+            mouse_wheel ? " (wheel)" : "", flip_y ? ", Y axis flipped" : "");
 }
 
 void input_set_sinks(key_sink_t k, mouse_sink_t m) {
