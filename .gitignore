@@ -1,0 +1,6 @@
+tools/
+build/
+*.vhd
+*.vhdx
+*.iso
+__pycache__/
