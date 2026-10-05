@@ -1,4 +1,6 @@
 #include <time.h>
+#include <sys/time.h>
+#include "nocturne.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -94,4 +96,14 @@ size_t strftime(char *s, size_t max, const char *fmt, const struct tm *tm) {
     }
     s[n] = 0;
     return n;
+}
+
+/* the clock only has whole seconds, so the microseconds come from the uptime counter */
+int gettimeofday(struct timeval *tv, void *tz) {
+    (void)tz;
+    if (tv) {
+        tv->tv_sec = time(NULL);
+        tv->tv_usec = (long)(uptime_ms() % 1000) * 1000;
+    }
+    return 0;
 }

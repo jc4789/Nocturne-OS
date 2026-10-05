@@ -68,10 +68,23 @@ static int heap_init(void) {
 }
 
 static int grow(size_t need) {
-    size_t n = need < GROW_MIN ? GROW_MIN : (need + 4095) & ~(size_t)4095;
+    size_t n = need + 64 < GROW_MIN ? GROW_MIN : (need + 64 + 4095) & ~(size_t)4095;
     char *p = sbrk(n);
     if (p == (void *)-1) return -1;
-    if (p != (char *)sentinel + HDR) return -1; /* heap is not contiguous */
+    if (p != (char *)sentinel + HDR) {
+        /* someone else moved the break (another allocator, as with a program run by `tcc -run`):
+           start a new region. The old sentinel stays as the end marker of the previous one. */
+        uintptr_t base = (uintptr_t)p;
+        size_t pad = (16 - (base & 15)) & 15;
+        blk *b = (blk *)(base + pad);
+        b->prev = 0;
+        b->size = (n - pad - HDR) & ~(size_t)15; /* free */
+        sentinel = next_blk(b);
+        sentinel->size = USED;
+        sentinel->prev = bsize(b);
+        fl_push((fblk *)b);
+        return 0;
+    }
     blk *b = sentinel;
     b->size = n; /* free */
     sentinel = next_blk(b);

@@ -90,6 +90,26 @@ FILE *fopen(const char *path, const char *mode) {
     return f;
 }
 
+/* reopen keeps the FILE and its descriptor number (so freopen(..., stdin) stays fd 0) */
+FILE *freopen(const char *path, const char *mode, FILE *f) {
+    int fl = parse_mode(mode);
+    if (fl < 0 || !path) {
+        errno = EINVAL;
+        return NULL;
+    }
+    fflush(f);
+    int fd = open(path, fl);
+    if (fd < 0) return NULL;
+    if (fd != f->fd) {
+        dup2(fd, f->fd);
+        close(fd);
+    }
+    f->wlen = f->rpos = f->rlen = 0;
+    f->ungot = -1;
+    f->eof = f->err = false;
+    return f;
+}
+
 int fclose(FILE *f) {
     fflush(f);
     int r = close(f->fd);

@@ -162,15 +162,145 @@ int run_wait(const char *path, char *const argv[]) {
     return st;
 }
 
+char **environ = (char *[]){NULL};
+
+/* there is no exec: run the program as a child, wait, and exit with its status */
+int execvp(const char *file, char *const argv[]) {
+    char full[256];
+    if (!find_program(file, full, sizeof full)) {
+        errno = ENOENT;
+        return -1;
+    }
+    int pid = spawn(full, argv, NULL, 0);
+    if (pid < 0) return -1;
+    int st = 0;
+    waitpid(pid, &st, 0);
+    exit(st);
+}
+int execv(const char *path, char *const argv[]) { return execvp(path, argv); }
+
 int system(const char *cmd) {
     char *argv[] = {"sh", "-c", (char *)cmd, NULL};
     return run_wait("/bin/sh", argv);
 }
 
+/* Environment: there is no inherited environment, just these defaults plus whatever the program
+   sets for itself. */
+static char **env_names, **env_vals;
+static int env_n;
+
+static int env_find(const char *name) {
+    for (int i = 0; i < env_n; i++)
+        if (!strcmp(env_names[i], name)) return i;
+    return -1;
+}
+
 char *getenv(const char *name) {
+    int i = env_find(name);
+    if (i >= 0) return env_vals[i];
     if (!strcmp(name, "HOME")) return "/home";
-    if (!strcmp(name, "PATH")) return "/bin";
+    if (!strcmp(name, "PATH")) return "/bin:/data/bin";
     return NULL;
+}
+
+int setenv(const char *name, const char *value, int overwrite) {
+    if (!name || !*name || strchr(name, '=')) {
+        errno = EINVAL;
+        return -1;
+    }
+    int i = env_find(name);
+    if (i >= 0 && !overwrite) return 0;
+    char *v = strdup(value);
+    if (!v) return -1;
+    if (i >= 0) {
+        free(env_vals[i]);
+        env_vals[i] = v;
+        return 0;
+    }
+    char **nn = realloc(env_names, sizeof(char *) * (size_t)(env_n + 1));
+    if (nn) env_names = nn;
+    char **nv = realloc(env_vals, sizeof(char *) * (size_t)(env_n + 1));
+    if (nv) env_vals = nv;
+    char *n = strdup(name);
+    if (!nn || !nv || !n) {
+        free(v);
+        free(n);
+        return -1;
+    }
+    env_names[env_n] = n;
+    env_vals[env_n++] = v;
+    return 0;
+}
+
+int unsetenv(const char *name) {
+    int i = env_find(name);
+    if (i >= 0) {
+        free(env_names[i]);
+        free(env_vals[i]);
+        env_n--;
+        env_names[i] = env_names[env_n];
+        env_vals[i] = env_vals[env_n];
+    }
+    return 0;
+}
+
+/* make an absolute path with "." and ".." resolved (there are no symbolic links) */
+char *realpath(const char *path, char *resolved) {
+    char tmp[1024], *out = resolved ? resolved : malloc(1024);
+    if (!out) return NULL;
+    if (path[0] == '/') {
+        strlcpy(tmp, path, sizeof tmp);
+    } else {
+        if (!getcwd(tmp, sizeof tmp)) goto fail;
+        strlcat(tmp, "/", sizeof tmp);
+        strlcat(tmp, path, sizeof tmp);
+    }
+    size_t len = 0;
+    out[0] = 0;
+    for (char *save, *part = strtok_r(tmp, "/", &save); part; part = strtok_r(NULL, "/", &save)) {
+        if (!strcmp(part, ".")) continue;
+        if (!strcmp(part, "..")) {
+            while (len > 0 && out[len - 1] != '/') len--;
+            if (len > 0) len--;
+            out[len] = 0;
+            continue;
+        }
+        if (len + strlen(part) + 2 > 1024) {
+            errno = ENAMETOOLONG;
+            goto fail;
+        }
+        out[len++] = '/';
+        strcpy(out + len, part);
+        len += strlen(part);
+    }
+    if (!len) strcpy(out, "/");
+    struct n_stat st;
+    if (stat(out, &st) < 0) goto fail;
+    return out;
+fail:
+    if (!resolved) free(out);
+    return NULL;
+}
+
+int mkstemp(char *tmpl) {
+    size_t n = strlen(tmpl);
+    if (n < 6 || strcmp(tmpl + n - 6, "XXXXXX")) {
+        errno = EINVAL;
+        return -1;
+    }
+    static const char chars[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    unsigned long seed = uptime_ms() * 2654435761u + (unsigned long)getpid();
+    for (int tries = 0; tries < 100; tries++) {
+        for (int i = 0; i < 6; i++) {
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            tmpl[n - 6 + i] = chars[(seed >> 33) % 36];
+        }
+        struct n_stat st;
+        if (stat(tmpl, &st) == 0) continue;
+        return open(tmpl, O_RDWR | O_CREAT | O_TRUNC);
+    }
+    errno = EEXIST;
+    return -1;
 }
 
 /* ---- startup / exit ---- */
@@ -203,4 +333,31 @@ _Noreturn void abort(void) {
 void __libc_start(int argc, char **argv) {
     __stdio_init();
     exit(main(argc, argv));
+}
+
+/* ---- sys/mman.h: anonymous memory only, carved out of the heap ---- */
+#include <sys/mman.h>
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, long off) {
+    (void)addr, (void)prot, (void)off;
+    if (!(flags & MAP_ANONYMOUS) || fd != -1 || len == 0) {
+        errno = ENOSYS;
+        return MAP_FAILED;
+    }
+    char *raw = calloc(1, len + 4096 + sizeof(void *));
+    if (!raw) {
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+    char *p = (char *)(((uintptr_t)raw + sizeof(void *) + 4095) & ~(uintptr_t)4095);
+    ((void **)p)[-1] = raw;
+    return p;
+}
+int munmap(void *addr, size_t len) {
+    (void)len;
+    if (addr && addr != MAP_FAILED) free(((void **)addr)[-1]);
+    return 0;
+}
+int mprotect(void *addr, size_t len, int prot) {
+    (void)addr, (void)len, (void)prot;
+    return 0;
 }

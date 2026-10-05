@@ -58,6 +58,9 @@ int fcntl(int fd, int cmd, ...);
 int dmesg(char *buf, size_t n);
 int pcilist(struct n_pciinfo *out, int max);
 int isatty(int fd);
+extern char **environ;
+int execvp(const char *file, char *const argv[]); /* spawn, wait and exit */
+int execv(const char *path, char *const argv[]);
 long __syscall(long n, long a, long b, long c, long d, long e);
 
 /* run a program (searching /bin) and wait for it; returns exit status or negative error */

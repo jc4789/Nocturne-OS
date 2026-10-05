@@ -3,6 +3,8 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <math.h>
 
 int abs(int x) { return x < 0 ? -x : x; }
 long labs(long x) { return x < 0 ? -x : x; }
@@ -41,44 +43,140 @@ unsigned long strtoul(const char *s, char **end, int base) { return (unsigned lo
 int atoi(const char *s) { return (int)strtol(s, NULL, 10); }
 long atol(const char *s) { return strtol(s, NULL, 10); }
 
-double strtod(const char *s, char **end) {
+/* Decimal and hex floating point, plus inf/nan. Up to 19 significant digits are kept in an
+   integer and scaled once in 80-bit long double, so double results are (almost always) the
+   correctly rounded ones. */
+static long double pow10l_(int e) {
+    long double r = 1, b = 10;
+    bool neg = e < 0;
+    unsigned u = neg ? -(unsigned)e : (unsigned)e;
+    while (u) {
+        if (u & 1) r *= b;
+        b *= b;
+        u >>= 1;
+    }
+    return neg ? 1 / r : r;
+}
+
+static int ci_prefix(const char *p, const char *word) {
+    int n = 0;
+    while (word[n] && tolower((unsigned char)p[n]) == word[n]) n++;
+    return word[n] ? 0 : n;
+}
+
+long double strtold(const char *s, char **end) {
     const char *p = s;
     while (isspace((unsigned char)*p)) p++;
     bool neg = false;
     if (*p == '+' || *p == '-') neg = *p++ == '-';
-    const char *start = p;
-    double v = 0;
-    bool any = false;
-    while (isdigit((unsigned char)*p)) {
-        v = v * 10 + (*p++ - '0');
-        any = true;
+    int n;
+    if ((n = ci_prefix(p, "inf"))) {
+        p += n;
+        if ((n = ci_prefix(p, "inity"))) p += n;
+        if (end) *end = (char *)p;
+        return neg ? -__builtin_infl() : __builtin_infl();
     }
-    if (*p == '.') {
-        p++;
-        double scale = 0.1;
-        while (isdigit((unsigned char)*p)) {
-            v += (*p++ - '0') * scale;
-            scale *= 0.1;
+    if ((n = ci_prefix(p, "nan"))) {
+        p += n;
+        if (*p == '(') {
+            const char *q = p + 1;
+            while (isalnum((unsigned char)*q) || *q == '_') q++;
+            if (*q == ')') p = q + 1;
+        }
+        if (end) *end = (char *)p;
+        return neg ? -__builtin_nanl("") : __builtin_nanl("");
+    }
+    uint64_t mant = 0;
+    int digits = 0, exp = 0;
+    bool any = false;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X') &&
+        (isxdigit((unsigned char)p[2]) || (p[2] == '.' && isxdigit((unsigned char)p[3])))) {
+        p += 2;
+        bool dot = false;
+        for (;; p++) {
+            int d;
+            if (*p == '.' && !dot) {
+                dot = true;
+                continue;
+            }
+            if (*p >= '0' && *p <= '9') d = *p - '0';
+            else if (*p >= 'a' && *p <= 'f') d = *p - 'a' + 10;
+            else if (*p >= 'A' && *p <= 'F') d = *p - 'A' + 10;
+            else break;
             any = true;
+            if (mant >> 60) { /* no room: keep a sticky bit for rounding */
+                mant |= d != 0;
+                if (!dot) exp += 4;
+            } else {
+                mant = mant << 4 | (uint64_t)d;
+                if (dot) exp -= 4;
+            }
+        }
+        if (*p == 'p' || *p == 'P') {
+            const char *q = p + 1;
+            bool eneg = false;
+            if (*q == '+' || *q == '-') eneg = *q++ == '-';
+            if (isdigit((unsigned char)*q)) {
+                int e = 0;
+                while (isdigit((unsigned char)*q)) {
+                    if (e < 100000) e = e * 10 + (*q - '0');
+                    q++;
+                }
+                exp += eneg ? -e : e;
+                p = q;
+            }
+        }
+        if (end) *end = (char *)p;
+        long double v = ldexpl((long double)mant, exp);
+        return neg ? -v : v;
+    }
+    bool dot = false;
+    for (;; p++) {
+        if (*p == '.' && !dot) {
+            dot = true;
+            continue;
+        }
+        if (!isdigit((unsigned char)*p)) break;
+        any = true;
+        if (digits < 19) {
+            mant = mant * 10 + (uint64_t)(*p - '0');
+            if (mant) digits++;
+            if (dot) exp--;
+        } else if (!dot) {
+            exp++;
         }
     }
-    if (any && (*p == 'e' || *p == 'E')) {
+    if (!any) {
+        if (end) *end = (char *)s;
+        return 0;
+    }
+    if (*p == 'e' || *p == 'E') {
         const char *q = p + 1;
         bool eneg = false;
         if (*q == '+' || *q == '-') eneg = *q++ == '-';
         if (isdigit((unsigned char)*q)) {
             int e = 0;
-            while (isdigit((unsigned char)*q)) e = e * 10 + (*q++ - '0');
-            double m = 1;
-            while (e--) m *= 10;
-            v = eneg ? v / m : v * m;
+            while (isdigit((unsigned char)*q)) {
+                if (e < 100000) e = e * 10 + (*q - '0');
+                q++;
+            }
+            exp += eneg ? -e : e;
             p = q;
         }
     }
-    if (!any) p = start == s ? s : s;
-    if (end) *end = (char *)(any ? p : s);
+    if (end) *end = (char *)p;
+    long double v = (long double)mant;
+    if (mant && exp) {
+        if (exp < -4000) v = 0;
+        else if (exp > 4000) v = __builtin_infl();
+        else v *= pow10l_(exp);
+    }
+    if (v == __builtin_infl() || (mant && v == 0)) errno = ERANGE;
     return neg ? -v : v;
 }
+
+double strtod(const char *s, char **end) { return (double)strtold(s, end); }
+float strtof(const char *s, char **end) { return (float)strtold(s, end); }
 
 double atof(const char *s) { return strtod(s, NULL); }
 
@@ -124,4 +222,26 @@ static void qsort_rec(char *base, size_t n, size_t size, int (*cmp)(const void *
 
 void qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *)) {
     qsort_rec(base, n, size, cmp);
+}
+
+long long atoll(const char *s) { return strtoll(s, NULL, 10); }
+long long llabs(long long x) { return x < 0 ? -x : x; }
+div_t div(int a, int b) { return (div_t){a / b, a % b}; }
+ldiv_t ldiv(long a, long b) { return (ldiv_t){a / b, a % b}; }
+
+void *bsearch(const void *key, const void *base, size_t n, size_t size,
+              int (*cmp)(const void *, const void *)) {
+    const char *lo = base;
+    while (n) {
+        const char *mid = lo + (n / 2) * size;
+        int c = cmp(key, mid);
+        if (c == 0) return (void *)mid;
+        if (c > 0) {
+            lo = mid + size;
+            n -= n / 2 + 1;
+        } else {
+            n /= 2;
+        }
+    }
+    return NULL;
 }

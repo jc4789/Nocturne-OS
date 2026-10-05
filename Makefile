@@ -81,17 +81,58 @@ $(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) user/user.ld
 	@echo "  LD   $@"
 	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib $(LIBC_LINK) --end-lib -o $@
 
+# ---------------------------------------------------------------- TinyCC (the in-OS C compiler)
+TCC_DIR   := third_party/tinycc
+TCC_CFLAGS := $(filter-out -W% -MMD -MP -g,$(UCFLAGS)) -w -Iports/tcc -I$(BUILD)/tcc -I$(TCC_DIR)
+# runtime objects that TinyCC links into the programs it builds
+TCCRT_FLAGS := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie                -mno-red-zone -O2 -fno-addrsig -fno-asynchronous-unwind-tables -fno-unwind-tables -w                -I$(TCC_DIR)/include -Iuser/include
+TCCRT_SRC := $(TCC_DIR)/lib/libtcc1.c $(TCC_DIR)/lib/va_list.c $(TCC_DIR)/lib/alloca.S              $(TCC_DIR)/lib/stdatomic.c $(TCC_DIR)/lib/atomic.S $(TCC_DIR)/lib/builtin.c ports/tcc/runmain.c
+TCCRT_OBJ := $(patsubst %,$(BUILD)/tccrt/%.o,$(notdir $(TCCRT_SRC)))
+
+# c2str turns tccdefs.h into C strings compiled into tcc (it runs on the build machine)
+$(BUILD)/tcc/c2str.exe: $(TCC_DIR)/conftest.c
+	@mkdir -p $(dir $@)
+	@$(CC) -DC2STR $< -o $@
+
+$(BUILD)/tcc/tccdefs_.h: $(TCC_DIR)/include/tccdefs.h $(BUILD)/tcc/c2str.exe
+	@$(BUILD)/tcc/c2str.exe $< $@
+
+$(BUILD)/tcc/tcc.o: $(wildcard $(TCC_DIR)/*.c $(TCC_DIR)/*.h) ports/tcc/config.h $(BUILD)/tcc/tccdefs_.h
+	@echo "  CC   $(TCC_DIR)/tcc.c"
+	@$(CC) $(TCC_CFLAGS) -c $(TCC_DIR)/tcc.c -o $@
+
+$(BUILD)/root/bin/tcc: $(BUILD)/tcc/tcc.o $(LIBC_OBJ) user/user.ld
+	@mkdir -p $(dir $@)
+	@echo "  LD   $@"
+	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib $(LIBC_LINK) --end-lib -o $@
+
+$(BUILD)/tccrt/%.c.o: $(TCC_DIR)/lib/%.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(TCCRT_FLAGS) -c $< -o $@
+$(BUILD)/tccrt/%.S.o: $(TCC_DIR)/lib/%.S
+	@mkdir -p $(dir $@)
+	@$(CC) $(TCCRT_FLAGS) -c $< -o $@
+$(BUILD)/tccrt/runmain.c.o: ports/tcc/runmain.c
+	@mkdir -p $(dir $@)
+	@$(CC) $(TCCRT_FLAGS) -c $< -o $@
+
+# headers and libraries for compiling inside Nocturne (an extra tree in the initrd)
+$(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(TCCRT_OBJ) scripts/mksysroot.sh                         $(shell find user/include ports/tcc/include third_party/bearssl/inc $(TCC_DIR)/include -name '*.h')                         common/abi.h common/gfx.h
+	@echo "  SYSROOT"
+	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(LIBC_OBJ) $(BR_OBJ) -- $(TCCRT_OBJ)
+	@touch $@
+
 # ---------------------------------------------------------------- images
 .PHONY: all kernel user image run clean
 .SECONDARY:
 all: image
 
 kernel: $(BUILD)/kernel.elf
-user: $(APP_BINS)
+user: $(APP_BINS) $(BUILD)/root/bin/tcc
 
-$(BUILD)/initrd.tar: $(APP_BINS) $(shell find rootfs -type f) scripts/mkinitrd.py
+$(BUILD)/initrd.tar: $(APP_BINS) $(BUILD)/root/bin/tcc $(BUILD)/sysroot.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
 	@echo "  TAR  $@"
-	@$(PY) scripts/mkinitrd.py $@ rootfs $(BUILD)/root
+	@$(PY) scripts/mkinitrd.py $@ rootfs $(BUILD)/root $(BUILD)/sysroot
 
 image: $(BUILD)/kernel.elf $(BUILD)/initrd.tar $(BUILD)/data-blank.vhdx
 	@bash scripts/mkimage.sh

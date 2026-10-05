@@ -144,3 +144,85 @@ float sinf(float x) { return (float)sin(x); }
 float cosf(float x) { return (float)cos(x); }
 float fabsf(float x) { return (float)fabs(x); }
 float floorf(float x) { return (float)floor(x); }
+
+/* ---- exponent handling (needed by compilers and printf-style code) ---- */
+long double ldexpl(long double x, int e) {
+    while (e > 16000) {
+        x *= 0x1p16000L;
+        e -= 16000;
+    }
+    while (e < -16000) {
+        x *= 0x1p-16000L;
+        e += 16000;
+    }
+    if (e > 16383) { /* the factor itself must stay a normal number */
+        x *= 0x1p16000L;
+        e -= 16000;
+    } else if (e < -16382) {
+        x *= 0x1p-16000L;
+        e += 16000;
+    }
+    union {
+        long double ld;
+        struct {
+            uint64_t m;
+            uint16_t se;
+        } p;
+    } f = {0};
+    f.p.m = 1ULL << 63;
+    f.p.se = (uint16_t)(16383 + e);
+    return x * f.ld;
+}
+
+double ldexp(double x, int e) { return (double)ldexpl(x, e); }
+double scalbn(double x, int e) { return ldexp(x, e); }
+float ldexpf(float x, int e) { return (float)ldexpl(x, e); }
+
+double frexp(double x, int *e) {
+    union { double d; uint64_t u; } v = {x};
+    int ex = (int)(v.u >> 52 & 0x7FF);
+    if (ex == 0) { /* zero or subnormal */
+        if (x == 0) {
+            *e = 0;
+            return x;
+        }
+        x = frexp(x * 0x1p64, e);
+        *e -= 64;
+        return x;
+    }
+    if (ex == 0x7FF) {
+        *e = 0;
+        return x;
+    }
+    *e = ex - 1022;
+    v.u = (v.u & ~(0x7FFULL << 52)) | (1022ULL << 52);
+    return v.d;
+}
+
+double modf(double x, double *ip) {
+    double t = trunc(x);
+    *ip = t;
+    return isinf(x) ? 0.0 * x : x - t;
+}
+
+double copysign(double x, double y) {
+    union { double d; uint64_t u; } a = {x}, b = {y};
+    a.u = (a.u & ~(1ULL << 63)) | (b.u & (1ULL << 63));
+    return a.d;
+}
+
+double fmin(double a, double b) { return isnan(a) ? b : isnan(b) ? a : a < b ? a : b; }
+double fmax(double a, double b) { return isnan(a) ? b : isnan(b) ? a : a > b ? a : b; }
+long lround(double x) { return (long)round(x); }
+double exp2(double x) { return pow(2.0, x); }
+double cbrt(double x) { return x < 0 ? -pow(-x, 1.0 / 3) : pow(x, 1.0 / 3); }
+float ceilf(float x) { return (float)ceil(x); }
+float roundf(float x) { return (float)round(x); }
+float truncf(float x) { return (float)trunc(x); }
+float powf(float x, float y) { return (float)pow(x, y); }
+float expf(float x) { return (float)exp(x); }
+float logf(float x) { return (float)log(x); }
+float tanf(float x) { return (float)tan(x); }
+float atan2f(float y, float x) { return (float)atan2(y, x); }
+float fmodf(float x, float y) { return (float)fmod(x, y); }
+long double fabsl(long double x) { return x < 0 ? -x : x; }
