@@ -175,8 +175,13 @@ void input_init(void) {
     wait_read();
     inb(0x60);
 
-    /* mouse */
-    if (mouse_cmd(0xF6) == 0xFA) {
+    /* mouse (some emulated controllers need a moment after the port is enabled) */
+    int ack = -1;
+    for (int tries = 0; tries < 4 && ack != 0xFA; tries++) {
+        ack = mouse_cmd(0xF6);
+        if (ack != 0xFA) flush();
+    }
+    if (ack == 0xFA) {
         /* try IntelliMouse wheel mode: sample rates 200, 100, 80 */
         mouse_cmd(0xF3); mouse_cmd(200);
         mouse_cmd(0xF3); mouse_cmd(100);

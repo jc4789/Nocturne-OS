@@ -4,3 +4,4 @@ build/
 *.vhdx
 *.iso
 __pycache__/
+hyperv/

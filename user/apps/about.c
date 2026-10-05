@@ -21,7 +21,13 @@ static void draw(window_t *w, bool hot) {
         int x = (i * 7919) % W, y = (i * 104729) % 150;
         gfx_pixel(c, x, y, RGB(200, 200, 230));
     }
-    for (int r = 60; r > 34; r -= 2) gfx_fill_blend(c, 70 - r, 80 - r, r * 2, r * 2, ARGB(6, 200, 190, 255));
+    for (int y = -64; y <= 64; y++)
+        for (int x = -64; x <= 64; x++) {
+            int d2 = x * x + y * y;
+            if (d2 >= 64 * 64) continue;
+            int a = (64 * 64 - d2) * 70 / (64 * 64);
+            gfx_blend_pixel(c, 70 + x, 80 + y, ARGB(a * a / 70, 200, 190, 255));
+        }
     crescent(c, 70, 80, 34, RGB(246, 236, 196));
     gfx_text(c, 130, 46, "Nocturne", RGB(255, 255, 255), TRANSPARENT, FONT_LARGE);
     gfx_text(c, 132, 84, "version 0.9 \"Moonrise\"", UI_ACCENT2, TRANSPARENT, FONT_SMALL);
