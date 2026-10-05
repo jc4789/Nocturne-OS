@@ -242,6 +242,8 @@ static int zindex(struct window *w) {
     return -1;
 }
 
+static void damage_taskbar(void) { damage_rect(0, sh - TASKBAR_H, sw, TASKBAR_H); }
+
 static struct window *last_focus;
 
 static void update_focus(void) {
@@ -256,7 +258,7 @@ static void update_focus(void) {
         damage_window(f);
     }
     last_focus = f;
-    damage_rect(0, sh - TASKBAR_H, sw, TASKBAR_H);
+    damage_taskbar();
 }
 
 static void raise_window(struct window *w) {
@@ -266,6 +268,7 @@ static void raise_window(struct window *w) {
     zorder[nwin - 1] = w;
     w->minimized = false;
     damage_window(w);
+    damage_taskbar();
     update_focus();
 }
 
@@ -281,6 +284,7 @@ static void lower_to_bottom(struct window *w) {
 static void minimize_window(struct window *w) {
     w->minimized = true;
     damage_window(w);
+    damage_taskbar();
     update_focus();
 }
 
@@ -294,6 +298,7 @@ static void unmap_user(struct window *w) {
 static void win_destroy(struct window *w) {
     if (w->dead) return;
     if (w->shown) damage_window(w);
+    damage_taskbar(); /* its button goes away even when focus does not change */
     unmap_user(w);
     if (w->buf) vfree(w->buf, w->pages);
     w->buf = NULL;
