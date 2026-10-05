@@ -36,7 +36,7 @@ $(BUILD)/kernel.elf: $(KOBJ) kernel/linker.ld
 UCFLAGS := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
            -mno-red-zone -O2 -g -std=gnu11 -fno-strict-aliasing -msse2 \
            -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Iuser/include -Icommon -MMD -MP
-ULDFLAGS := -m elf_x86_64 -nostdlib -static -z max-page-size=0x1000 -T user/user.ld --no-dynamic-linker
+ULDFLAGS := -m elf_x86_64 -s -nostdlib -static -z max-page-size=0x1000 -T user/user.ld --no-dynamic-linker
 
 LIBC_C   := $(shell find user/libc -name '*.c') common/gfx.c
 LIBC_ASM := $(shell find user/libc -name '*.asm')
@@ -55,18 +55,17 @@ $(BUILD)/u/%.asm.o: %.asm
 	@echo "  NASM $<"
 	@$(NASM) -f elf64 -g $< -o $@
 
-$(BUILD)/libc.a: $(LIBC_OBJ)
-	@echo "  AR   $@"
-	@rm -f $@
-	@$(AR) rcs $@ $^
+# no archiver in the toolchain: lld's --start-lib gives archive semantics to plain objects
+LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ))
 
-$(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(BUILD)/libc.a user/user.ld
+$(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
-	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< $(BUILD)/libc.a -o $@
+	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib $(LIBC_LINK) --end-lib -o $@
 
 # ---------------------------------------------------------------- images
 .PHONY: all kernel user image run clean
+.SECONDARY:
 all: image
 
 kernel: $(BUILD)/kernel.elf

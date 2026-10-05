@@ -12,6 +12,7 @@
 #define ALIGN_DOWN(x, a) (((uint64_t)(x)) & ~((uint64_t)(a) - 1))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define ABS(a) ((a) < 0 ? -(a) : (a))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define PACKED   __attribute__((packed))
 #define NORETURN __attribute__((noreturn))
