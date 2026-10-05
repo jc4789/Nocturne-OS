@@ -215,7 +215,7 @@ uint8_t gfx_glyph_for(uint32_t cp) {
     case 0x2039: return '<';
     case 0x203A: return '>';
     case 0x2713: case 0x2714: case 0x2705: return 'v';
-    case 0x2717: case 0x2718: case 0x274C: return 'x';
+    case 0x2715: case 0x2716: case 0x2717: case 0x2718: case 0x274C: case 0x2A2F: case 0x1F5D9: return 'x';
     case 0x2002: case 0x2003: case 0x2009: case 0x200A: case 0x202F: return ' ';
     case 0x200B: case 0x200C: case 0x200D: case 0xFEFF: return ' ';
     }

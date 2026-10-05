@@ -117,7 +117,9 @@ $(BUILD)/tccrt/runmain.c.o: ports/tcc/runmain.c
 	@$(CC) $(TCCRT_FLAGS) -c $< -o $@
 
 # headers and libraries for compiling inside Nocturne (an extra tree in the initrd)
-$(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(TCCRT_OBJ) scripts/mksysroot.sh                         $(shell find user/include ports/tcc/include third_party/bearssl/inc $(TCC_DIR)/include -name '*.h')                         common/abi.h common/gfx.h $(wildcard user/apps/*.c)
+$(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(TCCRT_OBJ) scripts/mksysroot.sh \
+		$(shell find user/include ports/tcc/include third_party/bearssl/inc $(TCC_DIR)/include -name '*.h') \
+		common/abi.h common/gfx.h $(wildcard user/apps/*.c)
 	@echo "  SYSROOT"
 	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(LIBC_OBJ) $(BR_OBJ) -- $(TCCRT_OBJ)
 	@touch $@

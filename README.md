@@ -4,7 +4,14 @@
 
 Nocturne is a hobby x86-64 operating system written from scratch in one night: the kernel, a
 compositing window manager, a TCP/IP stack, a C library, a shell, a terminal emulator and 50 programs.
-Limine is the only borrowed piece of code: it loads the kernel and the initial ramdisk.
+Three borrowed pieces of code are included:
+- Limine loads the kernel and the initial ramdisk.
+- BearSSL provides TLS.
+- TinyCC is the C compiler that runs inside the OS.
+
+Nocturne also has an **AI agent**. `agent` connects to an LLM over HTTPS, and the model can then run
+commands, write C, compile it with `tcc`, start it and look at the screen to check the result.
+Everything it writes is kept on a persistent disk.
 
 ![Desktop and start menu](docs/desktop-menu.png)
 
@@ -21,6 +28,7 @@ Limine is the only borrowed piece of code: it loads the kernel and the initial r
 - Memory: physical page allocator, 4-level paging, kernel heap, and a separate address space for every process.
 - Processes: ring-3 user processes with ELF loading, preemptive scheduling (1 kHz PIT), `int 0x80` system calls, `spawn` and `waitpid`, process trees, and `kill`.
 - Files: a VFS with a RAM filesystem (populated from a tar initrd), `/dev` (console, null, zero, random), pipes, and `poll`.
+- Persistent storage: an ATA PIO disk driver and a FAT32 filesystem (read and write), which is mounted at `/data`.
 - Drivers: PS/2 keyboard and wheel mouse, framebuffer, serial, CMOS clock, PCI enumeration, and ACPI power-off and reboot.
 - Networking: drivers for the Intel e1000 (QEMU, VirtualBox, VMware) and the DEC 21140 "tulip" (Hyper-V's legacy network adapter), and a small TCP/IP stack: Ethernet, ARP, IPv4, ICMP, UDP, a DHCP client, a DNS resolver and a TCP client with retransmission and flow control.
 - Graphics: a compositing window manager that runs in the kernel.
@@ -30,13 +38,16 @@ Limine is the only borrowed piece of code: it loads the kernel and the initial r
   - The night-sky wallpaper is generated procedurally.
 
 **Userland** (`user/`)
-- libc: stdio with real `printf` (floats included), `malloc`, string, math and time functions, `qsort`, `strtod`, and more.
+- libc: stdio with real `printf` (floats included), `malloc`, string, math and time functions, `qsort`, `strtod`, `setjmp`, and more.
+  - It also includes an HTTP/1.1 client with HTTPS, a JSON parser and builder, and a PNG encoder.
 - Shell (`sh`):
   - Pipes, redirection (`< > >> 2>`), `&`, `;`, `&&` and `||`, quoting, globbing and `$?`.
   - History, tab completion and scripts.
 - Terminal: ANSI colours, UTF-8, scrollback, copy and paste, and resizing.
 - Command-line tools: `ls cat cp mv rm mkdir touch tree grep wc head hexdump echo ps kill free uptime date uname dmesg lspci sleep clear reboot poweroff neofetch fortune moonsay`
-- Network tools: `ifconfig`, `ping`, `host` (DNS lookup) and `fetch` (an HTTP/1.0 client, so `fetch http://example.com` works; there is no TLS, so no https).
+- Network tools: `ifconfig`, `ping`, `host` (DNS lookup) and `fetch` (an HTTP and HTTPS client).
+- Development: the `tcc` C compiler, with headers and a static libc in `/usr`. The source of every program in `/bin` is in `/usr/src/apps`.
+- `agent`: the AI agent (see below). `screenshot` saves the screen as a PNG.
 - Desktop apps: Files, Text Editor, Paint, Calculator, Clock and System Monitor.
 - Games and toys: Snake, Tetris, Minesweeper, Mandelbrot, 3D Shapes and Game of Life.
 
@@ -91,6 +102,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1 clean
 
 Outputs in `build\`:
 - `nocturne.img`: raw MBR disk, used by QEMU.
+- `data.img`: the persistent `/data` disk for QEMU.
 - `nocturne.vhd`: fixed VHD for Hyper-V.
 - `nocturne.vhdx`
 - `nocturne.iso`: hybrid BIOS/UEFI ISO.
@@ -115,7 +127,7 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
 | Shift+PgUp / PgDn, mouse wheel | Terminal scrollback |
 | Ctrl+C | Interrupt the running command |
 
-The filesystem lives in RAM, so files you create or edit are lost when you reboot. `/home` starts with a few sample files; try `sh hello.sh`.
+The root filesystem lives in RAM, so files you create there are lost when you reboot. Save anything you want to keep under `/data`. `/home` starts with a few sample files; try `sh hello.sh`.
 
 ## Networking
 
@@ -134,7 +146,72 @@ fetch -i http://example.com
 fetch -o /home/1mb.zip http://speedtest.tele2.net/1MB.zip
 ```
 
-Limits: client-side TCP only (no listening sockets), no IP fragmentation, no IPv6 and no TLS.
+`fetch https://...` uses TLS 1.2 through BearSSL. Certificates are checked against the Mozilla root store, which
+is compiled into libc. The CMOS clock supplies the time for the validity check.
+
+Limits: client-side TCP only (no listening sockets), no IP fragmentation and no IPv6.
+
+## Persistent storage: /data
+
+Everything outside `/data` lives in RAM and is reset on every boot. `/data` is a FAT32 partition
+labelled `NOCTDATA` on a second disk, so files saved there survive reboots and rebuilds.
+- **QEMU**: `build\data.img` (512 MB) is created on the first build and is never overwritten.
+  `build.ps1 clean` leaves it alone. Delete it by hand to start fresh.
+- **Hyper-V**: `hyperv.ps1` attaches `hyperv\<Name>-data.vhdx` (2 GB, dynamic) as the second IDE disk.
+  `-Update` replaces only the boot disk and keeps the data disk.
+
+`/data/bin` is on `PATH`, so programs installed there run by name.
+
+## Writing C inside Nocturne
+
+`tcc` is TinyCC 0.9.28, built for Nocturne:
+
+```
+tcc -run /usr/src/apps/mandel.c           # compile in memory and run
+tcc -o /data/bin/hello hello.c            # build a program; it now runs as `hello`
+```
+
+Programs are linked statically against Nocturne's libc. They can use:
+- `nocturne.h`: system calls, windows and widgets.
+- `gfx.h`: drawing.
+- `http.h`: HTTP and HTTPS.
+- `json.h` and `png.h`.
+- BearSSL.
+
+tcc can also compile itself: its own source rebuilds inside the OS into a working compiler.
+
+## The AI agent
+
+![agent](docs/agent.png)
+
+`agent` is a coding agent that runs inside the OS. It streams replies from any OpenAI-compatible
+chat completions endpoint (over HTTPS, from Nocturne's own TLS stack) and gives the model these tools:
+- `run_command`: runs a command in the shell.
+- `read_file`, `write_file`, `edit_file` and `list_dir`.
+- `fetch_url`.
+- `screenshot`: the model sees the desktop as an image, so it can check the GUI programs it writes.
+
+It writes C, compiles it with `tcc`, runs it and fixes what breaks.
+
+```
+agent                                   # interactive session (type /help)
+agent write a tetris clone in /data/projects/tetris and install it as /data/bin/tet
+agent -r                                # resume the previous session
+```
+
+The model's instructions are in `/etc/agent/system.md`. Sessions and the agent's notes are kept in
+`/data/agent`. Settings are in `/data/etc/agent.conf`:
+- `endpoint` and `model`.
+- `max_tokens` and `context_limit`.
+- `reasoning`, `show_thinking` and `vision`. Set `vision=0` for models that cannot take images.
+
+**API key.** The key is stored only on the data disk, never in the repository or the boot image:
+- QEMU: `python scripts\setkey.py KEYFILE [--endpoint URL] [--model NAME]`
+- Hyper-V: `hyperv.ps1 -Update -ApiKeyFile KEYFILE`
+- Or start `agent` and paste the key when it asks.
+
+`KEYFILE` holds just the key, or contains a line like `api key: ...`. The defaults are
+`https://hyper.charm.land/v1` and `glm-5.3-flash`. Keep key files outside this folder.
 
 ## Layout
 
@@ -144,7 +221,9 @@ common/      ABI shared by kernel and userland, 2D graphics library, fonts
 kernel/src/  arch/ (GDT, IDT, APIC), mm/, sys/ (processes, scheduler, syscalls), fs/, dev/, gui/, net/
 user/        libc/, include/, apps/ (one .c file per program)
 rootfs/      files copied into the initrd (/etc, /home)
-scripts/     image builder, initrd packer, QEMU test driver
+ports/tcc/   TinyCC configuration and runtime glue for Nocturne
+third_party/ BearSSL, TinyCC
+scripts/     image builder, initrd packer, sysroot builder, QEMU test driver, setkey.py, fatcheck.py
 hyperv.ps1   Hyper-V VM setup
 ```
 
@@ -152,4 +231,7 @@ hyperv.ps1   Hyper-V VM setup
 
 - [Limine](https://github.com/limine-bootloader/limine) bootloader (BSD-2-Clause)
 - [Spleen](https://github.com/fcambus/spleen) bitmap fonts (BSD-2-Clause, see `common/FONT-LICENSE-spleen.txt`)
+- [BearSSL](https://bearssl.org/) TLS library (MIT)
+- [TinyCC](https://bellard.org/tcc/) C compiler (LGPL-2.1, source in `third_party/tinycc`)
+- Mozilla's CA certificate bundle, via [curl](https://curl.se/docs/caextract.html) (MPL-2.0)
 - Everything else was written for Nocturne.
