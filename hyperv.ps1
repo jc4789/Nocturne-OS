@@ -7,7 +7,8 @@
     Nocturne talks to legacy PC hardware (PS/2 keyboard and mouse, IDE disk, VBE framebuffer),
     so it needs a *Generation 1* VM. This script:
       * copies build\nocturne.vhd into .\hyperv\ (so rebuilding never fights a locked disk),
-      * creates a Gen1 VM with static memory, one CPU, no checkpoints and no network adapter,
+      * creates a Gen1 VM with static memory, one CPU, no checkpoints and a *legacy* network adapter
+        (an emulated DEC 21140, which Nocturne drives) on the "Default Switch" for NAT internet access,
       * attaches the disk to IDE 0:0 and makes IDE the first boot device,
       * routes COM1 to the named pipe \\.\pipe\nocturne-com1 (kernel log),
       * starts the VM and opens a VMConnect window.
@@ -27,7 +28,9 @@ param(
     [switch]$Update,
     [switch]$Remove,
     [switch]$Iso,
-    [switch]$NoStart
+    [switch]$NoStart,
+    [switch]$NoNetwork,
+    [string]$Switch = "Default Switch"
 )
 
 $ErrorActionPreference = "Stop"
@@ -77,8 +80,20 @@ function Copy-Media {
     }
 }
 
+function Add-LegacyNic($vm) {
+    if ($NoNetwork) { return }
+    if (Get-VMNetworkAdapter -VM $vm | Where-Object { $_.IsLegacy }) { return }
+    if (-not (Get-VMSwitch -Name $Switch -ErrorAction SilentlyContinue)) {
+        Write-Warning "virtual switch '$Switch' not found; the VM gets no network. Pass -Switch <name> to use another one."
+        return
+    }
+    Say "adding a legacy network adapter on '$Switch'"
+    Add-VMNetworkAdapter -VM $vm -IsLegacy $true -SwitchName $Switch
+}
+
 if ($existing -and $Update) {
     Stop-IfRunning $existing
+    Add-LegacyNic $existing
     Copy-Media
     if ($Iso) { Set-VMDvdDrive -VMName $Name -ControllerNumber 1 -ControllerLocation 0 -Path $IsoCopy }
 }
@@ -91,8 +106,9 @@ else {
     $vm = New-VM -Name $Name -Generation 1 -MemoryStartupBytes ($MemoryMB * 1MB) -VHDPath $Vhd -Path $VmDir
     Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
     Set-VMProcessor -VM $vm -Count 1
-    # Nocturne has no Hyper-V (VMBus) drivers: drop the synthetic NIC, disable checkpoints and integration noise
+    # Nocturne has no Hyper-V (VMBus) drivers: swap the synthetic NIC for a legacy one, disable checkpoints
     Get-VMNetworkAdapter -VM $vm | Remove-VMNetworkAdapter
+    Add-LegacyNic $vm
     try { Set-VM -VM $vm -AutomaticCheckpointsEnabled $false -CheckpointType Disabled } catch { }
     Set-VM -VM $vm -AutomaticStopAction TurnOff
     # kernel log on COM1 -> named pipe (read it with PuTTY or any pipe client)

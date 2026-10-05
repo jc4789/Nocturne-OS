@@ -65,6 +65,24 @@ int run_wait(const char *path, char *const argv[]);
 /* find a program: "ls" -> "/bin/ls"; returns false if not found */
 bool find_program(const char *name, char *out, size_t n);
 
+/* ---- networking (net.c) ----
+   IPv4 addresses are uint32_t in host order (10.0.2.15 is 0x0A00020F). Functions return -1 and
+   set errno on failure. Timeouts are in milliseconds; -1 waits forever. */
+int net_info(struct n_netinfo *ni);
+int net_ping(uint32_t ip, int seq, int timeout_ms); /* round-trip time in ms */
+int net_resolve(const char *name, uint32_t *ip);    /* DNS lookup or dotted quad */
+bool ip_parse(const char *s, uint32_t *ip);
+char *ip_format(uint32_t ip, char *buf); /* buf: at least 16 bytes */
+int udp_socket(uint16_t port);           /* 0 picks an ephemeral port */
+int udp_sendto(int s, uint32_t ip, uint16_t port, const void *buf, size_t len);
+int udp_recvfrom(int s, void *buf, size_t len, int timeout_ms, struct n_sockaddr *from);
+int udp_close(int s);
+int tcp_connect(uint32_t ip, uint16_t port, int timeout_ms);
+long tcp_send(int s, const void *buf, size_t len);
+long tcp_recv(int s, void *buf, size_t len, int timeout_ms); /* 0 = connection closed */
+int tcp_close(int s);
+bool net_wait_up(int timeout_ms); /* wait for DHCP; false if no network */
+
 /* ---- GUI ---- */
 typedef struct window {
     int fd;

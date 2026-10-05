@@ -6,6 +6,7 @@
 #include "mm/vmm.h"
 #include "fs/vfs.h"
 #include "gui/wm.h"
+#include "net/net.h"
 
 struct task *current_task;
 struct task *task_list;
@@ -258,6 +259,7 @@ NORETURN void task_exit(int code) {
         }
     }
     wm_process_exit(t->pid);
+    net_process_exit(t->pid);
     cli();
     if (t->is_user && t->pml4 != kernel_pml4) {
         uint64_t old = t->pml4;

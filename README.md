@@ -3,7 +3,7 @@
 *A small operating system for quiet nights.*
 
 Nocturne is a hobby x86-64 operating system written from scratch in one night: the kernel, a
-compositing window manager, a C library, a shell, a terminal emulator and 46 programs.
+compositing window manager, a TCP/IP stack, a C library, a shell, a terminal emulator and 50 programs.
 Limine is the only borrowed piece of code: it loads the kernel and the initial ramdisk.
 
 ![Desktop and start menu](docs/desktop-menu.png)
@@ -16,12 +16,13 @@ Limine is the only borrowed piece of code: it loads the kernel and the initial r
 
 ## What's inside
 
-**Kernel** (`kernel/`, about 7,000 lines of C)
+**Kernel** (`kernel/`, about 8,000 lines of C)
 - Boots through Limine (BIOS or UEFI) into a higher-half x86-64 kernel.
 - Memory: physical page allocator, 4-level paging, kernel heap, and a separate address space for every process.
 - Processes: ring-3 user processes with ELF loading, preemptive scheduling (1 kHz PIT), `int 0x80` system calls, `spawn` and `waitpid`, process trees, and `kill`.
 - Files: a VFS with a RAM filesystem (populated from a tar initrd), `/dev` (console, null, zero, random), pipes, and `poll`.
 - Drivers: PS/2 keyboard and wheel mouse, framebuffer, serial, CMOS clock, PCI enumeration, and ACPI power-off and reboot.
+- Networking: drivers for the Intel e1000 (QEMU, VirtualBox, VMware) and the DEC 21140 "tulip" (Hyper-V's legacy network adapter), and a small TCP/IP stack: Ethernet, ARP, IPv4, ICMP, UDP, a DHCP client, a DNS resolver and a TCP client with retransmission and flow control.
 - Graphics: a compositing window manager that runs in the kernel.
   - Window buffers are shared memory and redraws are damage-tracked.
   - Windows have drop shadows and can be dragged, resized, maximized and minimized.
@@ -35,6 +36,7 @@ Limine is the only borrowed piece of code: it loads the kernel and the initial r
   - History, tab completion and scripts.
 - Terminal: ANSI colours, UTF-8, scrollback, copy and paste, and resizing.
 - Command-line tools: `ls cat cp mv rm mkdir touch tree grep wc head hexdump echo ps kill free uptime date uname dmesg lspci sleep clear reboot poweroff neofetch fortune moonsay`
+- Network tools: `ifconfig`, `ping`, `host` (DNS lookup) and `fetch` (an HTTP/1.0 client, so `fetch http://example.com` works; there is no TLS, so no https).
 - Desktop apps: Files, Text Editor, Paint, Calculator, Clock and System Monitor.
 - Games and toys: Snake, Tetris, Minesweeper, Mandelbrot, 3D Shapes and Game of Life.
 
@@ -49,7 +51,8 @@ powershell -ExecutionPolicy Bypass -File hyperv.ps1
 This creates a **Generation 1** VM called `Nocturne` with the following settings:
 - 512 MB of static memory and 1 CPU.
 - The disk on IDE.
-- No network adapter and no checkpoints.
+- A legacy network adapter on the **Default Switch**, so the VM gets an address by DHCP and can reach the internet.
+- No checkpoints.
 - COM1 connected to `\\.\pipe\nocturne-com1`.
 
 The script then starts the VM and opens a VMConnect window.
@@ -61,9 +64,11 @@ Other options:
 | `hyperv.ps1 -Update` | Copy a freshly built disk into the existing VM and restart it. |
 | `hyperv.ps1 -Iso` | Boot from `build\nocturne.iso` on the DVD drive instead of the VHD. |
 | `hyperv.ps1 -Remove` | Delete the VM. |
+| `hyperv.ps1 -NoNetwork` | Create the VM without a network adapter. |
+| `hyperv.ps1 -Switch "Name"` | Connect the network adapter to a different virtual switch. |
 | `hyperv.ps1 -Name Foo -MemoryMB 1024` | Use a different VM name and memory size. |
 
-To create the VM by hand instead, make a Generation 1 VM and attach `build\nocturne.vhd` (or `nocturne.vhdx`) as an IDE disk. Generation 2 will **not** work: it has no PS/2 or IDE hardware, only Hyper-V's VMBus devices, and Nocturne has no drivers for those.
+To create the VM by hand instead, make a Generation 1 VM and attach `build\nocturne.vhd` (or `nocturne.vhdx`) as an IDE disk. Generation 2 will **not** work: it has no PS/2 or IDE hardware, only Hyper-V's VMBus devices, and Nocturne has no drivers for those. For the same reason the network adapter must be a *legacy* one.
 
 **Tips for VMConnect**
 - Click inside the window to capture the mouse. **Ctrl+Alt+Left Arrow** releases it.
@@ -111,12 +116,31 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
 
 The filesystem lives in RAM, so files you create or edit are lost when you reboot. `/home` starts with a few sample files; try `sh hello.sh`.
 
+## Networking
+
+![Network tools](docs/network.png)
+
+The network comes up by itself: a DHCP client runs in the kernel at boot, so `ifconfig` normally
+shows an address a second or two after the desktop appears.
+
+- **QEMU**: the default e1000 card with user-mode networking works as-is (`build.ps1 run`). `-nic user,model=tulip` exercises the Hyper-V driver.
+- **Hyper-V**: `hyperv.ps1` adds a legacy network adapter on the Default Switch. A *synthetic* (VMBus) adapter will not be seen.
+
+```
+ping -c 3 example.com
+host example.com
+fetch -i http://example.com
+fetch -o /home/1mb.zip http://speedtest.tele2.net/1MB.zip
+```
+
+Limits: client-side TCP only (no listening sockets), no IP fragmentation, no IPv6 and no TLS.
+
 ## Layout
 
 ```
 boot/        limine.conf
 common/      ABI shared by kernel and userland, 2D graphics library, fonts
-kernel/src/  arch/ (GDT, IDT, APIC), mm/, sys/ (processes, scheduler, syscalls), fs/, dev/, gui/
+kernel/src/  arch/ (GDT, IDT, APIC), mm/, sys/ (processes, scheduler, syscalls), fs/, dev/, gui/, net/
 user/        libc/, include/, apps/ (one .c file per program)
 rootfs/      files copied into the initrd (/etc, /home)
 scripts/     image builder, initrd packer, QEMU test driver

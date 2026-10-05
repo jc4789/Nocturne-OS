@@ -344,7 +344,8 @@ static void cmd_help(void) {
         "Syntax: cmd args | cmd2 > file, >> append, < input, 2> errors, & background,\n"
         "        cmd1 ; cmd2, cmd1 && cmd2, cmd1 || cmd2, wildcards * and ?\n"
         "Keys:   Up/Down history, Tab completion, Ctrl+C cancel, Ctrl+L clear\n"
-        "Try:    ls /bin, neofetch, ps, free, cat /etc/motd, fortune, moonsay hi\n");
+        "Try:    ls /bin, neofetch, ps, free, fortune, moonsay hi,\n"
+        "        ifconfig, ping example.com, fetch http://example.com\n");
 }
 
 static bool builtin(int argc, char **argv, int *status) {

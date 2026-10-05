@@ -46,6 +46,13 @@
 #define ENAMETOOLONG 36
 #define ENOSYS  38
 #define ENOTEMPTY 39
+#define ECONNRESET 104
+#define EADDRINUSE 98
+#define ENETDOWN 100
+#define ENOTCONN 107
+#define ETIMEDOUT 110
+#define ECONNREFUSED 111
+#define EHOSTUNREACH 113
 
 /* lib/string.c */
 void *memcpy(void *dst, const void *src, size_t n);

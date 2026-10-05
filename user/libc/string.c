@@ -226,6 +226,13 @@ char *strerror(int e) {
     case 36: return "name too long";
     case 38: return "not implemented";
     case 39: return "directory not empty";
+    case 98: return "address in use";
+    case 100: return "network is down";
+    case 104: return "connection reset";
+    case 107: return "not connected";
+    case 110: return "timed out";
+    case 111: return "connection refused";
+    case 113: return "host unreachable";
     default: return "unknown error";
     }
 }

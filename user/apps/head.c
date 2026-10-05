@@ -6,6 +6,9 @@ int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "-n")) {
         lines = atoi(argv[2]);
         i = 3;
+    } else if (argc > 1 && argv[1][0] == '-' && argv[1][1] >= '0' && argv[1][1] <= '9') {
+        lines = atoi(argv[1] + 1);
+        i = 2;
     }
     FILE *f = i < argc ? fopen(argv[i], "r") : stdin;
     if (!f) {
