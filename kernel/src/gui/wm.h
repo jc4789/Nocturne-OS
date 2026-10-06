@@ -25,6 +25,7 @@ struct wm_rect {
 /* *w, *h: the size the viewer would like (0: keep the current one); returns the size it gets.
    The desktop goes back to the framebuffer's size when the last viewer detaches. */
 bool wm_remote_attach(int *w, int *h);
+void wm_remote_resize(int *w, int *h); /* the viewer's window changed size: same rules */
 void wm_remote_detach(void);
 int wm_remote_damage(struct wm_rect *out, int max); /* takes the areas redrawn since the last call */
 const uint32_t *wm_remote_frame(int *pitch);

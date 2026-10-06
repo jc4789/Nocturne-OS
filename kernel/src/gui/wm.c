@@ -1252,14 +1252,18 @@ static bool set_screen_size(int w, int h) {
     return true;
 }
 
-bool wm_remote_attach(int *w, int *h) {
-    if (!running) return false;
-    remote_users++;
+void wm_remote_resize(int *w, int *h) {
     if (*w > 0 && *h > 0) set_screen_size(MAX(640, MIN(*w, 3840)), MAX(480, MIN(*h, 2160)));
     *w = sw;
     *h = sh;
     damage_all(); /* repaint without the pointer */
     wake_compositor();
+}
+
+bool wm_remote_attach(int *w, int *h) {
+    if (!running) return false;
+    remote_users++;
+    wm_remote_resize(w, h);
     return true;
 }
 

@@ -86,7 +86,8 @@ The script then starts the VM and opens a VMConnect window.
 
 **Enhanced Session.** VMConnect asks for a display size once Nocturne is up. That is the Enhanced
 Session: VMConnect connects to the RDP server inside Nocturne, and the desktop takes the size you
-pick. Keyboard and mouse go through the same connection, with no mouse capture, and so does the
+pick. When a client resizes its window it sends the new size over the display control channel,
+and the desktop follows it. Keyboard and mouse go through the same connection, with no mouse capture, and so does the
 clipboard: text copied in Windows pastes in Nocturne (Ctrl+V in the Text Editor and the browser's
 address bar, Ctrl+Shift+V in the terminal), and text copied in Nocturne (Ctrl+C, or Ctrl+Shift+C
 for the terminal's screen) pastes in Windows. Choose
@@ -125,7 +126,7 @@ console only.
 |---|---|
 | `hv-boot.ps1 -Name VM -Build` | Build, refresh the VM's boot media, boot, record COM1 and take a console screenshot. |
 | `hv-esm.ps1 -Name VM` | Open an Enhanced Session in VMConnect and save a picture of the window. |
-| `python hv-rdp.py --vm VM --size 1280x720 "type:neofetch\n" dclick:53,130` | Test the Enhanced Session without VMConnect: a small RDP client types and clicks, and saves the desktop it receives as a PNG. `clip:TEXT` and `chord:1d,2a,2f` test the clipboard. |
+| `python hv-rdp.py --vm VM --size 1280x720 "type:neofetch\n" dclick:53,130` | Test the Enhanced Session without VMConnect: a small RDP client types and clicks, and saves the desktop it receives as a PNG. `clip:TEXT` and `chord:1d,2a,2f` test the clipboard, `resize:1600x900` a window resize. |
 | `hv-shot.ps1 -Name VM` | Screenshot the VM's console without VMConnect. |
 | `hv-sock.ps1 -Name VM -Port N` | Connect to a Hyper-V socket service in the guest from the host. |
 | `hv-serial.ps1 -Pipe P -Log F` | Copy a COM port pipe to a log file. |
@@ -322,7 +323,7 @@ What Nocturne does not have, so nobody is surprised:
 - **The window manager runs in the kernel.**
 - **Slow, simple disks.** The ATA driver uses PIO with polling (no DMA). FAT32 has no journal, so power loss during a write can leave the volume inconsistent. Names may be up to 255 characters.
 - **The networking limits are listed above.**
-- **A plain Enhanced Session.** It carries the picture, keyboard, mouse and text on the clipboard only: no images or files on the clipboard, no sound, drive or printer sharing, and no resizing while connected (reconnect to change the size). The RDP server uses no encryption; it is reachable only through a Hyper-V socket on the host, never over the network.
+- **A plain Enhanced Session.** It carries the picture, keyboard, mouse and text on the clipboard only: no images or files on the clipboard, no sound, drive or printer sharing. If VMConnect doesn't send a new size when you resize its window, reconnect to change the size. The RDP server uses no encryption; it is reachable only through a Hyper-V socket on the host, never over the network.
 - **The AI agent runs the model's commands without asking.** Anything it does stays inside the VM, but it can delete files on `/data`.
 - **A web browser without JavaScript or cookies.** See [its limits](#the-web-browser).
 - **Only checked in virtual machines.** It has been tested in QEMU and Hyper-V, never on real hardware.

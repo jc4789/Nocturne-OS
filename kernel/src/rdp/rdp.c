@@ -9,9 +9,10 @@
      - output as fast-path updates: uncompressed bitmaps in 64x64 tiles (only tiles that
        changed are sent) and the pointer shape;
      - input as fast-path or slow-path events: scancodes, Unicode characters, mouse and wheel.
-   Of the virtual channels only the clipboard's is used (text both ways); sound, drives and
-   printers are joined but ignored. The desktop takes the size the client asks for when it
-   connects, and goes back to its own when it leaves. */
+   Of the virtual channels the clipboard's is used (text both ways), and drdynvc for display
+   control; sound, drives and printers are joined but ignored. The desktop takes the size of the
+   client's window when it connects and whenever the window is resized, and goes back to its
+   own when the client leaves. */
 #include "kernel.h"
 #include "dev/input.h"
 #include "gui/wm.h"
@@ -173,9 +174,16 @@ struct rdp {
     bool clip_ready;       /* the client has sent its first format list */
     uint32_t clip_seq;     /* the local clipboard as the client last heard of it */
     uint32_t clip_wanted;  /* the format we asked the client for */
-    uint8_t *vc_buf;       /* a channel message being reassembled */
-    uint32_t vc_len, vc_total;
-    bool fastpath_output, attached, active, suppress;
+    /* the dynamic channels' channel, and on it the display control channel */
+    int dvc;               /* index into channel_ids, -1 without one */
+    bool disp_open;
+    int want_w, want_h;    /* the size the client's window has become (0: none pending) */
+    uint64_t resize_at;    /* when to take it: a window being dragged sends many */
+    struct {               /* a channel message being reassembled, per channel */
+        uint8_t *buf;
+        uint32_t len, total;
+    } vc[16];
+    bool fastpath_output, attached, started, active, suppress;
     uint32_t *shadow; /* the picture the client has, for spotting changed tiles */
     uint8_t *dirty;   /* tiles to look at */
     int tiles_x, tiles_y;
@@ -351,6 +359,7 @@ static void client_net(struct rdp *c, struct rbuf *b) {
         memcpy(c->channel_names[k], name, sizeof name);
         c->channel_opts[k] = opts;
         if (!strcmp(name, "cliprdr")) c->clip = k;
+        if (!strcmp(name, "drdynvc")) c->dvc = k;
     }
 }
 
@@ -556,6 +565,20 @@ static int send_demand_active(struct rdp *c) {
     put16(&w, caplen_at, (uint16_t)(w.n - caps_start));
     w32(&w, 0); /* session id */
     put16(&w, sc, (uint16_t)(w.n - sc));
+    sdi_end(&w, start);
+    return x224_end(c, &w);
+}
+
+/* The first half of a deactivation-reactivation: a demand active with the new size follows. */
+static int send_deactivate_all(struct rdp *c) {
+    struct wbuf w = x224_begin(c);
+    uint32_t start = sdi_begin(&w, IO_CHANNEL);
+    w16(&w, 13);
+    w16(&w, PDUTYPE_DEACTIVATEALL | 0x10);
+    w16(&w, SERVER_CHANNEL);
+    w32(&w, SHARE_ID);
+    w16(&w, 1); /* an empty source descriptor */
+    w8(&w, 0);
     sdi_end(&w, start);
     return x224_end(c, &w);
 }
@@ -1031,27 +1054,140 @@ static int clip_poll(struct rdp *c) {
     return clip_send(c, CB_FORMAT_LIST, 0, list, sizeof list);
 }
 
+/* ---- dynamic virtual channels (MS-RDPEDYC), for display control (MS-RDPEDISP) ----
+   drdynvc carries channels that the server opens by name. The one we open lets the client tell
+   us the new size of its window; we take it with a deactivation-reactivation, which hands the
+   client a new desktop size the way the connection sequence did. */
+
+enum { DVC_CREATE = 1, DVC_DATA_FIRST, DVC_DATA, DVC_CLOSE, DVC_CAPS };
+#define DISP_CHANNEL_ID 1 /* our id for the display control channel */
+#define DISP_MONITOR_LAYOUT 2
+#define DISP_CAPS 5
+
+static int dvc_start(struct rdp *c) {
+    if (c->dvc < 0) return 0;
+    static const uint8_t caps[] = {DVC_CAPS << 4, 0, 1, 0}; /* version 1 */
+    return vc_send(c, c->dvc, caps, sizeof caps);
+}
+
+static int dvc_open_display(struct rdp *c) {
+    static const char name[] = "Microsoft::Windows::RDS::DisplayControl";
+    uint8_t m[2 + sizeof name] = {DVC_CREATE << 4, DISP_CHANNEL_ID}; /* one-byte channel id */
+    memcpy(m + 2, name, sizeof name);
+    return vc_send(c, c->dvc, m, sizeof m);
+}
+
+static int disp_caps(struct rdp *c) {
+    uint8_t m[2 + 20] = {DVC_DATA << 4, DISP_CHANNEL_ID};
+    struct wbuf w = {m + 2, 0, 20};
+    w32(&w, DISP_CAPS);
+    w32(&w, 20);
+    w32(&w, 1);    /* monitors */
+    w32(&w, 3840); /* the largest area, as wm_remote_resize allows it */
+    w32(&w, 2160);
+    return vc_send(c, c->dvc, m, sizeof m);
+}
+
+/* the client's monitor layout: the primary monitor's size is the window's */
+static void disp_message(struct rdp *c, struct rbuf *r) {
+    uint32_t type = r32(r);
+    r32(r);
+    uint32_t size = r32(r), count = r32(r);
+    if (r->err || type != DISP_MONITOR_LAYOUT || size < 20) return;
+    for (uint32_t i = 0; i < count && i < 16; i++) {
+        uint32_t at = r->pos;
+        uint32_t flags = r32(r);
+        rskip(r, 8);
+        int w = (int)r32(r), h = (int)r32(r);
+        r->pos = at;
+        rskip(r, size);
+        if (r->err) return;
+        if (i == 0 || (flags & 1)) {
+            c->want_w = w;
+            c->want_h = h;
+        }
+    }
+    c->resize_at = uptime_ms() + 250;
+}
+
+static uint32_t dvc_field(struct rbuf *r, int size_code) {
+    return size_code == 0 ? r8(r) : size_code == 1 ? r16(r) : r32(r);
+}
+
+static int dvc_message(struct rdp *c, const uint8_t *m, uint32_t n) {
+    struct rbuf r = {m, n, 0, false};
+    uint8_t h = r8(&r);
+    int cmd = h >> 4, sp = (h >> 2) & 3, cb = h & 3;
+    if (cmd == DVC_CAPS) return dvc_open_display(c); /* the client's answer to ours */
+    uint32_t id = dvc_field(&r, cb);
+    if (r.err || id != DISP_CHANNEL_ID) return 0;
+    switch (cmd) {
+    case DVC_CREATE: /* the answer to our create request */
+        c->disp_open = (int32_t)r32(&r) >= 0 && !r.err;
+        return c->disp_open ? disp_caps(c) : 0;
+    case DVC_DATA_FIRST: { /* only whole messages: a monitor layout is far smaller than a chunk */
+        uint32_t total = dvc_field(&r, sp);
+        if (total == rleft(&r)) disp_message(c, &r);
+        return 0;
+    }
+    case DVC_DATA: disp_message(c, &r); return 0;
+    case DVC_CLOSE: c->disp_open = false; return 0;
+    default: return 0;
+    }
+}
+
+/* Take the size the client asked for, once its window has stopped changing for a moment. */
+static int apply_resize(struct rdp *c) {
+    if (!c->want_w || !c->active || uptime_ms() < c->resize_at) return 0;
+    int w = c->want_w & ~1, h = c->want_h, ow = c->width, oh = c->height;
+    c->want_w = c->want_h = 0;
+    wm_remote_resize(&w, &h);
+    if (w == ow && h == oh) return 0;
+    int tx = (w + TILE - 1) / TILE, ty = (h + TILE - 1) / TILE;
+    uint32_t *shadow = kmalloc((size_t)w * h * 4);
+    uint8_t *dirty = kzalloc((size_t)tx * ty);
+    if (!shadow || !dirty) {
+        kfree(shadow);
+        kfree(dirty);
+        wm_remote_resize(&ow, &oh); /* stay as we were */
+        return 0;
+    }
+    kfree(c->shadow);
+    kfree(c->dirty);
+    c->shadow = shadow;
+    c->dirty = dirty;
+    c->width = w;
+    c->height = h;
+    c->tiles_x = tx;
+    c->tiles_y = ty;
+    c->active = false; /* until the client has confirmed the new size; the font list says so */
+    int e = send_deactivate_all(c);
+    return e ? e : send_demand_active(c);
+}
+
 /* Data on a static virtual channel: reassemble each message, then hand it over. */
 static int vc_data(struct rdp *c, uint16_t channel, struct rbuf *r) {
-    if (c->clip < 0 || channel != c->channel_ids[c->clip]) return 0; /* the others carry nothing we do */
+    int k = 0;
+    while (k < c->nchannels && c->channel_ids[k] != channel) k++;
+    if (k == c->nchannels || (k != c->clip && k != c->dvc)) return 0; /* the others carry nothing we do */
     uint32_t total = r32(r), flags = r32(r);
     if (r->err) return 0;
     if (flags & CHANNEL_FLAG_FIRST) {
-        kfree(c->vc_buf);
-        c->vc_buf = NULL;
+        kfree(c->vc[k].buf);
+        c->vc[k].buf = NULL;
         if (total > 4 * WM_CLIPBOARD_MAX + 64) return 0;
-        c->vc_buf = kmalloc(MAX(total, 1u));
-        c->vc_total = total;
-        c->vc_len = 0;
+        c->vc[k].buf = kmalloc(MAX(total, 1u));
+        c->vc[k].total = total;
+        c->vc[k].len = 0;
     }
-    if (!c->vc_buf) return 0;
-    uint32_t n = MIN(rleft(r), c->vc_total - c->vc_len);
-    memcpy(c->vc_buf + c->vc_len, r->p + r->pos, n);
-    c->vc_len += n;
+    if (!c->vc[k].buf) return 0;
+    uint32_t n = MIN(rleft(r), c->vc[k].total - c->vc[k].len);
+    memcpy(c->vc[k].buf + c->vc[k].len, r->p + r->pos, n);
+    c->vc[k].len += n;
     if (!(flags & CHANNEL_FLAG_LAST)) return 0;
-    int e = clip_message(c, c->vc_buf, c->vc_len);
-    kfree(c->vc_buf);
-    c->vc_buf = NULL;
+    int e = k == c->clip ? clip_message(c, c->vc[k].buf, c->vc[k].len) : dvc_message(c, c->vc[k].buf, c->vc[k].len);
+    kfree(c->vc[k].buf);
+    c->vc[k].buf = NULL;
     return e;
 }
 
@@ -1080,11 +1216,14 @@ static int share_pdu(struct rdp *c, struct rbuf *r) {
         return 0;
     }
     case PDUTYPE2_FONTLIST: {
+        /* the end of the connection sequence, or of a reactivation after a resize */
         int e = send_data_pdu(c, PDUTYPE2_FONTMAP, fill_fontmap, NULL);
-        if (!c->active) {
+        if (!c->started) {
             kprintf("rdp: session with \"%s\" is up, %dx%d at %d bpp\n", c->client_name, c->width, c->height,
                     c->bpp);
+            c->started = true;
             if (!e) e = clip_start(c);
+            if (!e) e = dvc_start(c);
         }
         c->active = true;
         c->pointer_shape = -1;
@@ -1184,7 +1323,7 @@ static void session(void *arg) {
     struct hvsock *s = arg;
     if (!c) goto out;
     c->s = s;
-    c->clip = -1;
+    c->clip = c->dvc = -1;
     c->in = kmalloc(MAX_PDU);
     c->out = kmalloc(MAX_PDU);
     if (!c->in || !c->out) goto out;
@@ -1220,11 +1359,12 @@ static void session(void *arg) {
             if (c->in[0] == 3) err = mcs_pdu(c, len);
             else if ((c->in[0] & 3) == 0) fastpath_input(c, len);
         }
+        if (!err) err = apply_resize(c);
         if (!err) err = push_updates(c);
         if (!err) err = clip_poll(c);
     }
-    if (c->active && err != -EPIPE) kprintf("rdp: session with \"%s\" failed (%d)\n", c->client_name, err);
-    else if (c->active) kprintf("rdp: session with \"%s\" ended\n", c->client_name);
+    if (c->started && err != -EPIPE) kprintf("rdp: session with \"%s\" failed (%d)\n", c->client_name, err);
+    else if (c->started) kprintf("rdp: session with \"%s\" ended\n", c->client_name);
 out:
     if (c && c->attached) wm_remote_detach();
     if (c) {
@@ -1232,7 +1372,7 @@ out:
         kfree(c->out);
         kfree(c->shadow);
         kfree(c->dirty);
-        kfree(c->vc_buf);
+        for (int k = 0; k < (int)ARRAY_SIZE(c->vc); k++) kfree(c->vc[k].buf);
         kfree(c);
     }
     hvsock_close(s);

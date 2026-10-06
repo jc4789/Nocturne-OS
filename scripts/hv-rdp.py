@@ -13,7 +13,8 @@ Needs Windows, Python 3.12+ (socket.AF_HYPERV) and an elevated shell.
 Actions: type:TEXT (letters, digits, space and \\n), key:SCANCODE (hex), chord:SC,SC,... (held
 down in order, let go in reverse: chord:1d,2a,2f is Ctrl+Shift+V), move:X,Y, click:X,Y,
 dclick:X,Y, wheel:X,Y,N (N notches, positive is up), clip:TEXT (put TEXT on "Windows'"
-clipboard, as a copy on the host would), wait:SECONDS.
+clipboard, as a copy on the host would), resize:WxH (the client's window changed size; the
+picture saved at the end has the size the server settled on), wait:SECONDS.
 
 The client also joins the clipboard channel: whatever the guest copies is fetched and printed.
 """
@@ -28,6 +29,7 @@ import zlib
 
 SERVICE = "{:08x}-facb-11e6-bd58-64006a7986d3"
 CLIP_CHANNEL = 1004  # the server numbers channels from 1004 in the order we list them
+DVC_CHANNEL = 1005
 
 # set 1 scancodes for the characters `type:` knows
 SCANCODES = {c: s for s, row in ((0x10, "qwertyuiop"), (0x1E, "asdfghjkl"), (0x2C, "zxcvbnm"))
@@ -73,13 +75,15 @@ class Client:
         self.fb = bytearray(width * height * 3)
         self.updates = 0
         self.lock = threading.Lock()
-        self.up = threading.Event()
+        self.activated = threading.Event()  # set while the server shows us the desktop
         self.closed = False
-        self.send_lock = threading.Lock()  # the reader answers clipboard requests
+        self.send_lock = threading.Lock()  # the reader answers the server too
         self.clip_ready = threading.Event()  # the server's monitor-ready arrived
         self.clip_text = ""  # what our "Windows" clipboard holds
         self.clip_got = []  # texts the guest copied
-        self.vc = b""
+        self.vc = {}  # channel messages being reassembled
+        self.disp = None  # the display control channel's id, once the server has opened it
+        self.disp_ready = threading.Event()
 
     def send(self, b):
         with self.send_lock:
@@ -118,25 +122,85 @@ class Client:
                     channel = struct.unpack_from(">H", p, 10)[0]
                     o = 13
                     o += 2 if p[o] & 0x80 else 1
-                    if channel == CLIP_CHANNEL:
-                        self.channel_data(p[o:])
+                    if channel == 1003:
+                        self.io_data(p[o:])
+                    elif channel in (CLIP_CHANNEL, DVC_CHANNEL):
+                        self.channel_data(channel, p[o:])
         except (EOFError, OSError):
             self.closed = True
 
-    # ---- the clipboard channel ----
-    def channel_data(self, d):
+    # ---- activation: at the start, and again whenever the server changes the desktop size ----
+    def io_data(self, d):
+        if len(d) < 6 or struct.unpack_from("<H", d, 2)[0] & 0xFFF0 != 0x10:
+            return  # the licence PDU, which has a security header instead
+        ptype = d[2] & 0xF
+        if ptype == 6:  # deactivate all
+            self.activated.clear()
+        elif ptype == 1:  # demand active: the desktop size is in the bitmap capabilities
+            src_len = struct.unpack_from("<H", d, 10)[0]
+            o = 14 + src_len
+            n = struct.unpack_from("<H", d, o)[0]
+            o += 4
+            for _ in range(n):
+                t, ln = struct.unpack_from("<HH", d, o)
+                if t == 2:
+                    w, h = struct.unpack_from("<HH", d, o + 12)
+                    with self.lock:
+                        if (w, h) != (self.w, self.h):
+                            self.w, self.h = w, h
+                            self.fb = bytearray(w * h * 3)
+                o += ln
+            confirm = struct.pack("<IHHH", 0x000103EA, 0x03EA, 4, 4) + b"RDP\0" + struct.pack("<HH", 0, 0)
+            self.send_share(0x13, confirm)
+            self.send_data(0x1F, struct.pack("<HH", 1, 1002))
+            self.send_data(0x14, struct.pack("<HHI", 4, 0, 0))
+            self.send_data(0x14, struct.pack("<HHI", 1, 0, 0))
+            self.send_data(0x27, struct.pack("<HHHH", 0, 0, 3, 50))
+            self.activated.set()
+
+    # ---- static virtual channels ----
+    def channel_data(self, channel, d):
         total, flags = struct.unpack_from("<II", d)
         if flags & 1:
-            self.vc = b""
-        self.vc += d[8:]
+            self.vc[channel] = b""
+        self.vc[channel] = self.vc.get(channel, b"") + d[8:]
         if flags & 2:
-            self.clip_message(self.vc[:total])
+            m = self.vc.pop(channel)[:total]
+            (self.clip_message if channel == CLIP_CHANNEL else self.dvc_message)(m)
 
+    def vc_send(self, channel, m, flags):
+        pdu = struct.pack("<II", len(m), flags) + m
+        sdr = b"\x64" + struct.pack(">HH", self.user - 1001, channel) + b"\x70" + per_len(len(pdu)) + pdu
+        self.send(x224_data(sdr))
+
+    # ---- dynamic channels: only display control ----
+    def dvc_message(self, m):
+        cmd = m[0] >> 4
+        if cmd == 5:  # capabilities: we take version 1
+            self.vc_send(DVC_CHANNEL, bytes([0x50, 0, 1, 0]), 3)
+        elif cmd == 1:  # the server opens a channel
+            ok = m[2:].split(b"\0")[0] == b"Microsoft::Windows::RDS::DisplayControl"
+            self.vc_send(DVC_CHANNEL, bytes([0x10, m[1]]) + struct.pack("<i", 0 if ok else -1), 3)
+            if ok:
+                self.disp = m[1]
+        elif cmd == 3 and m[1] == self.disp and struct.unpack_from("<I", m, 2)[0] == 5:  # its capabilities
+            self.disp_ready.set()
+
+    def resize(self, w, h):
+        """Tell the server our window is now w x h, as a client does when its window is resized."""
+        if not self.disp_ready.wait(5):
+            sys.exit("the server never opened display control")
+        layout = struct.pack("<IIII", 2, 16 + 40, 40, 1) + struct.pack("<IiiIIIIIII", 1, 0, 0, w, h, 0, 0, 0, 100, 100)
+        self.activated.clear()
+        self.vc_send(DVC_CHANNEL, bytes([0x30, self.disp]) + layout, 3)
+        if not self.activated.wait(5):
+            print("the server kept its size")
+            self.activated.set()
+
+    # ---- the clipboard channel ----
     def clip_send(self, mtype, flags, data=b""):
         m = struct.pack("<HHI", mtype, flags, len(data)) + data
-        pdu = struct.pack("<II", len(m), 0x13) + m  # first, last, show protocol
-        sdr = b"\x64" + struct.pack(">HH", self.user - 1001, CLIP_CHANNEL) + b"\x70" + per_len(len(pdu)) + pdu
-        self.send(x224_data(sdr))
+        self.vc_send(CLIP_CHANNEL, m, 0x13)  # first, last, show protocol
 
     def clip_announce(self):
         self.clip_send(2, 0, struct.pack("<I", 13) + b"\0" * 32 if self.clip_text else b"")
@@ -223,7 +287,8 @@ class Client:
         core += struct.pack("<HHIHHH", 0xCA01, 1, 0, 32, 0x000F, 0x0002)
         blocks = struct.pack("<HH", 0xC001, 4 + len(core)) + core
         blocks += struct.pack("<HHII", 0xC002, 12, 0, 0)
-        blocks += struct.pack("<HHI", 0xC003, 20, 1) + b"cliprdr\0" + struct.pack("<I", 0xC0A00000)
+        blocks += struct.pack("<HHI", 0xC003, 32, 2) + b"cliprdr\0" + struct.pack("<I", 0xC0A00000)
+        blocks += b"drdynvc\0" + struct.pack("<I", 0xC0800000)
         gcc = b"\x00\x05\x00\x14\x7c\x00\x01"
         ccrq = b"\x00\x08\x00\x10\x00\x01\xc0\x00Duca" + per_len(len(blocks)) + blocks
         gcc += per_len(len(ccrq)) + ccrq
@@ -238,7 +303,7 @@ class Client:
         self.send(x224_data(b"\x28"))  # attach user
         ac = self.read_pdu()
         self.user = 1001 + struct.unpack_from(">H", ac, 9)[0]
-        for ch in (self.user, 1003, CLIP_CHANNEL):
+        for ch in (self.user, 1003, CLIP_CHANNEL, DVC_CHANNEL):
             self.send(x224_data(b"\x38" + struct.pack(">HH", self.user - 1001, ch)))
             self.read_pdu()
 
@@ -246,14 +311,8 @@ class Client:
         self.send_io(info)
         self.s.settimeout(None)  # from here on, a quiet desktop sends nothing for as long as it likes
         threading.Thread(target=self.reader, daemon=True).start()
-        time.sleep(0.5)  # licence and demand active arrive; nothing in them matters here
-
-        confirm = struct.pack("<IHHH", 0x000103EA, 0x03EA, 4, 4) + b"RDP\0" + struct.pack("<HH", 0, 0)
-        self.send_share(0x13, confirm)
-        self.send_data(0x1F, struct.pack("<HH", 1, 1002))
-        self.send_data(0x14, struct.pack("<HHI", 4, 0, 0))
-        self.send_data(0x14, struct.pack("<HHI", 1, 0, 0))
-        self.send_data(0x27, struct.pack("<HHHH", 0, 0, 3, 50))
+        if not self.activated.wait(10):  # the reader answers the licence and demand active
+            raise RuntimeError("no demand active")
 
     def send_io(self, data):
         sdr = b"\x64" + struct.pack(">HH", self.user - 1001, 1003) + b"\x70" + per_len(len(data)) + data
@@ -306,11 +365,12 @@ class Client:
 
     def save_png(self, path):
         with self.lock:
-            raw = b"".join(b"\0" + bytes(self.fb[y * self.w * 3:(y + 1) * self.w * 3]) for y in range(self.h))
+            w, h = self.w, self.h
+            raw = b"".join(b"\0" + bytes(self.fb[y * w * 3:(y + 1) * w * 3]) for y in range(h))
 
         def chunk(t, d):
             return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
-        png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", self.w, self.h, 8, 2, 0, 0, 0))
+        png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
         png += chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b"")
         with open(path, "wb") as f:
             f.write(png)
@@ -332,7 +392,7 @@ def main():
     c = Client(s, w, h)
     c.connect()
     time.sleep(2)
-    print(f"connected as {w}x{h}: {c.updates} bitmap updates so far")
+    print(f"connected as {c.w}x{c.h}: {c.updates} bitmap updates so far")
     for act in a.actions:
         verb, _, arg = act.partition(":")
         if verb == "type":
@@ -366,6 +426,10 @@ def main():
             for _ in range(abs(n)):
                 c.events([c.mouse_ev(flags, x, y)])
                 time.sleep(0.05)
+        elif verb == "resize":
+            c.resize(*(int(v) for v in arg.split("x")))
+            time.sleep(1)
+            print(f"resized: the desktop is {c.w}x{c.h}")
         elif verb == "wait":
             time.sleep(float(arg))
         else:
