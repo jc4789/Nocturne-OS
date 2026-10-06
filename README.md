@@ -2,9 +2,11 @@
 
 *A small operating system for quiet nights.*
 
-Nocturne is a hobby x86-64 operating system written from scratch in one night: the kernel, a
-compositing window manager, a TCP/IP stack, a C library, a shell, a terminal emulator and 50 programs.
-Three borrowed pieces of code are included:
+Nocturne is a hobby x86-64 operating system written from scratch: the kernel, a compositing window
+manager, a TCP/IP stack, a C library, a shell, a terminal emulator and about 50 programs. It was
+written with an AI coding assistant (Claude Code) over several long sessions, and is meant for
+virtual machines (QEMU and Hyper-V); it has not been tried on real hardware. It is a toy, not a
+general-purpose OS: see [Limits](#limits). Three borrowed pieces of code are included:
 - Limine loads the kernel and the initial ramdisk.
 - BearSSL provides TLS.
 - TinyCC is the C compiler that runs inside the OS.
@@ -23,25 +25,28 @@ Everything it writes is kept on a persistent disk.
 
 ## What's inside
 
-**Kernel** (`kernel/`, about 8,000 lines of C)
+**Kernel** (`kernel/`, about 9,000 lines of C)
 - Boots through Limine (BIOS or UEFI) into a higher-half x86-64 kernel.
 - Memory: physical page allocator, 4-level paging, kernel heap, and a separate address space for every process.
+  - W^X: no page is both writable and executable. ELF segments are mapped with their own permissions, the stack and heap are no-execute (NX), and the kernel's own code, read-only data and data are mapped separately. Write protection also applies in ring 0.
+  - `mmap`, `munmap` and `mprotect` are real, which is how `tcc -run` gets executable memory for the code it just compiled.
 - Processes: ring-3 user processes with ELF loading, preemptive scheduling (1 kHz PIT), `int 0x80` system calls, `spawn` and `waitpid`, process trees, and `kill`.
 - Files: a VFS with a RAM filesystem (populated from a tar initrd), `/dev` (console, null, zero, random), pipes, and `poll`.
 - Persistent storage: an ATA PIO disk driver and a FAT32 filesystem (read and write), which is mounted at `/data`.
 - Drivers: PS/2 keyboard and wheel mouse, framebuffer, serial, CMOS clock, PCI enumeration, and ACPI power-off and reboot.
-- Networking: drivers for the Intel e1000 (QEMU, VirtualBox, VMware) and the DEC 21140 "tulip" (Hyper-V's legacy network adapter), and a small TCP/IP stack: Ethernet, ARP, IPv4, ICMP, UDP, a DHCP client, a DNS resolver and a TCP client with retransmission and flow control.
-- Graphics: a compositing window manager that runs in the kernel.
+- Networking: drivers for the Intel e1000 (QEMU, VirtualBox, VMware) and the DEC 21140 "tulip" (Hyper-V's legacy network adapter), and a small TCP/IP stack: Ethernet, ARP, IPv4, ICMP, UDP, a DHCP client, a DNS resolver and a TCP client.
+  - TCP keeps out-of-order segments and reassembles them, and does NewReno congestion control (slow start, fast retransmit and fast recovery) with a retransmission timeout taken from the measured round-trip time.
+- Graphics: a compositing window manager. It runs in the kernel, which keeps it simple and fast, but a bug in it can bring the whole system down.
   - Window buffers are shared memory and redraws are damage-tracked.
   - Windows have drop shadows and can be dragged, resized, maximized and minimized.
   - The desktop has a taskbar, start menu, desktop icons, toast notifications and a clipboard.
   - The night-sky wallpaper is generated procedurally.
 
 **Userland** (`user/`)
-- libc: stdio with real `printf` (floats included), `malloc`, string, math and time functions, `qsort`, `strtod`, `setjmp`, and more.
+- libc: stdio, `printf` with correctly rounded floating point, `malloc`, string, math and time functions, `qsort`, `strtod`, `setjmp`, and more. It is a subset of C99/POSIX, not a complete one.
   - It also includes an HTTP/1.1 client with HTTPS, a JSON parser and builder, and a PNG encoder.
 - Shell (`sh`):
-  - Pipes, redirection (`< > >> 2>`), `&`, `;`, `&&` and `||`, quoting, globbing and `$?`.
+  - Pipes, redirection (`< > >> 2>`), `&`, `;`, `&&` and `||`, quoting, globbing, `$?` and script arguments (`$1`, `$#`, `$@`). There are no variables, `if` or loops.
   - History, tab completion and scripts.
 - Terminal: ANSI colours, UTF-8, scrollback, copy and paste, and resizing.
 - Command-line tools: `ls cat cp mv rm mkdir touch tree grep wc head hexdump echo ps kill free uptime date uname dmesg lspci sleep clear reboot poweroff neofetch fortune moonsay`
@@ -107,7 +112,31 @@ Outputs in `build\`:
 - `nocturne.vhdx`
 - `nocturne.iso`: hybrid BIOS/UEFI ISO.
 
-`scripts/qtest.py` boots the image headless in QEMU and drives it from a small script of keystrokes, mouse moves and screenshots, which is how the system was tested:
+## Tests
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build.ps1 test        # about 4 minutes
+powershell -ExecutionPolicy Bypass -File build.ps1 test-quick  # skips compiling every app
+powershell -ExecutionPolicy Bypass -File build.ps1 test-full   # adds tcc rebuilding itself inside the OS
+```
+
+`scripts/test.py` boots the image headless in QEMU with a scratch data disk holding `tests/`. Your own
+`data.img` is not touched. At boot, `init` runs the suite. The suite compiles its own runner with the
+in-OS `tcc` and runs 42 tests, checking each one's exit status and output. Results come back over the
+serial port, and afterwards the host checks the FAT32 volume the OS wrote to with `fatcheck.py`. The
+tests cover:
+- Shell and tools, and `malloc` stress.
+- W^X: writing code or read-only data and running the stack or heap must crash, and `mprotect` must work.
+- FAT32 and the RAM filesystem: many sizes, long names, 150-file directories, rename and nested directories.
+- `tcc`: printf and math, compiling every app, and self-hosting.
+- The GUI: a window appears in a screen grab and is gone after it closes.
+- Network: DHCP, ping, DNS, HTTP, HTTPS, and a rejected bad certificate.
+- TCP: 14 MiB to and from a host-side server, clean and with simulated loss and reordering, checking every byte.
+- The agent, offline: it never needs an API key.
+
+The network tests need internet access from the host. Use `python scripts/test.py --no-net` without it.
+
+`scripts/qtest.py` drives a running image by hand: keystrokes, mouse moves and screenshots.
 
 ```
 python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dclick shot:files
@@ -149,7 +178,7 @@ fetch -o /home/1mb.zip http://speedtest.tele2.net/1MB.zip
 `fetch https://...` uses TLS 1.2 through BearSSL. Certificates are checked against the Mozilla root store, which
 is compiled into libc. The CMOS clock supplies the time for the validity check.
 
-Limits: client-side TCP only (no listening sockets), no IP fragmentation and no IPv6.
+Network limits: TCP is client-side only (no listening sockets), with no window scaling or SACK, so a connection has at most 64 KiB in flight. There is no IP fragmentation and no IPv6.
 
 ## Persistent storage: /data
 
@@ -213,6 +242,18 @@ The model's instructions are in `/etc/agent/system.md`. Sessions and the agent's
 `KEYFILE` holds just the key, or contains a line like `api key: ...`. The defaults are
 `https://hyper.charm.land/v1` and `glm-5.3-flash`. Keep key files outside this folder.
 
+## Limits
+
+What Nocturne does not have, so nobody is surprised:
+- **One CPU.** There is no SMP; extra virtual CPUs are ignored.
+- **No users or permissions.** Every process is isolated in its own address space, but all of them can read and write every file.
+- **No `fork`/`exec`.** Processes are started with `spawn`. There are no signals beyond kill, no threads, no dynamic linking and no swap.
+- **The window manager runs in the kernel.**
+- **Slow, simple disks.** The ATA driver uses PIO with polling (no DMA). FAT32 has no journal, so power loss during a write can leave the volume inconsistent. Names may be up to 255 characters.
+- **The networking limits are listed above.**
+- **The AI agent runs the model's commands without asking.** Anything it does stays inside the VM, but it can delete files on `/data`.
+- **Only checked in virtual machines.** It has been tested in QEMU and Hyper-V, never on real hardware.
+
 ## Layout
 
 ```
@@ -223,7 +264,8 @@ user/        libc/, include/, apps/ (one .c file per program)
 rootfs/      files copied into the initrd (/etc, /home)
 ports/tcc/   TinyCC configuration and runtime glue for Nocturne
 third_party/ BearSSL, TinyCC
-scripts/     image builder, initrd packer, sysroot builder, QEMU test driver, setkey.py, fatcheck.py
+scripts/     image builder, initrd packer, sysroot builder, test.py, qtest.py, setkey.py, fatcheck.py
+tests/       the in-OS test suite (runtests.c and the C programs it compiles)
 hyperv.ps1   Hyper-V VM setup
 ```
 
