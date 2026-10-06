@@ -6,12 +6,14 @@ tests/runtests.c with the in-OS tcc and runs it, then powers off. Results come b
 serial port. Afterwards the host checks the data disk's FAT with fatcheck.py, since the OS just
 wrote to it. For the TCP tests the host also runs a small server the guest reaches at 10.0.2.2
 (QEMU's user networking maps it to the host's 127.0.0.1); its port is in /data/tests/tcpport.
+The VM has an AC'97 sound card, recorded to build/test-audio.wav by QEMU's wav backend; when the
+audio tests ran, the host looks for the tones tests/audiotest.c plays in the recording.
 
 usage: python scripts/test.py [--quick] [--full] [--no-net] [--timeout S] [group...]
   --quick   skip the slow tests (compile every app, tcc self-hosting)
   --full    also copy the TinyCC sources so tcc can rebuild itself inside the OS
   --no-net  skip the network tests (they need internet access from the host)
-  group     run only these groups: sh tools mem fs tcc gui tcp net agent
+  group     run only these groups: sh tools mem fs tcc gui audio web tcp net agent
 Exit status 0 when every test passed. Build first (build.ps1). Your own build/data.img is not
 touched: the tests use build/test-data.img.
 """
@@ -32,6 +34,7 @@ QEMU = os.path.join(BIN, "qemu-system-x86_64.exe")
 BUILD = os.path.join(ROOT, "build")
 IMG = os.path.join(BUILD, "test-data.img")
 SERIAL = os.path.join(BUILD, "test-serial.log")
+AUDIO = os.path.join(BUILD, "test-audio.wav")
 PART = IMG + "@@1048576"
 
 
@@ -120,6 +123,56 @@ def make_disk(a, tcp_port):
     os.remove(script)
 
 
+# what tests/audiotest.c plays, in order: (left Hz, right Hz, seconds); the last one is killed early
+AUDIO_TONES = [(1000, 1500, 1.0), (600, 600, 0.5), (700, 900, 0.5), (800, 800, 0.5), (500, 1100, 0.5),
+               (440, 440, 0.4), (300, 300, None)]
+
+
+def check_audio(path):
+    """find the test tones in the card's recording -> (ok, message)"""
+    if not os.path.exists(path):
+        return False, "no recording"
+    d = open(path, "rb").read()
+    at = d.find(b"data")
+    if d[:4] != b"RIFF" or at < 0:
+        return False, "the recording is not a WAV file"
+    rate = int.from_bytes(d[24:28], "little")
+    pcm = memoryview(d[at + 8:at + 8 + (len(d) - at - 8) // 4 * 4]).cast("h")
+    left, right = pcm[0::2], pcm[1::2]
+    # 10 ms blocks with sound in them, joined into runs across gaps under 60 ms
+    blk = rate // 100
+    loud = [max(map(abs, left[i:i + blk]), default=0) > 1000 or max(map(abs, right[i:i + blk]), default=0) > 1000
+            for i in range(0, len(left), blk)]
+    runs = []
+    for i, on in enumerate(loud):
+        if not on:
+            continue
+        if runs and i - runs[-1][1] <= 6:
+            runs[-1][1] = i + 1
+        else:
+            runs.append([i, i + 1])
+
+    def hz(ch, a, b):  # rising zero crossings per second over the middle of the run
+        a, b = a + (b - a) // 10, b - (b - a) // 10
+        x = ch[a:b]
+        n = sum(1 for i in range(1, len(x)) if x[i - 1] < 0 <= x[i])
+        return n * rate / max(1, len(x))
+
+    found = []
+    for r0, r1 in runs:
+        a, b = r0 * blk, r1 * blk
+        found.append((round(hz(left, a, b)), round(hz(right, a, b)), (b - a) / rate))
+    desc = ", ".join("%d/%d Hz %.2f s" % f for f in found)
+    if len(found) != len(AUDIO_TONES):
+        return False, "%d sounds instead of %d: %s" % (len(found), len(AUDIO_TONES), desc)
+    for (fl, fr, secs), (gl, gr, gs) in zip(AUDIO_TONES, found):
+        if abs(gl - fl) > fl * 0.02 or abs(gr - fr) > fr * 0.02:
+            return False, "expected %d/%d Hz, heard %d/%d Hz: %s" % (fl, fr, gl, gr, desc)
+        if secs and abs(gs - secs) > 0.08 or not secs and gs > 0.7:
+            return False, "a %d Hz tone lasted %.2f s: %s" % (fl, gs, desc)
+    return True, desc
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
@@ -138,9 +191,18 @@ def main():
     cmd = [QEMU, "-M", "pc", "-m", "512M", "-display", "none", "-vga", "std", "-no-reboot",
            "-serial", "file:" + SERIAL,
            "-drive", "file=%s,format=raw,if=ide,index=0,snapshot=on" % os.path.join(BUILD, "nocturne.img"),
-           "-drive", "file=%s,format=raw,if=ide,index=1" % IMG]
+           "-drive", "file=%s,format=raw,if=ide,index=1" % IMG,
+           "-audiodev", "wav,id=snd,path=%s,out.frequency=48000,out.buffer-length=20000,in.voices=0" % AUDIO, "-device", "AC97,audiodev=snd"]
+    if os.path.exists(AUDIO):
+        os.remove(AUDIO)
     t0 = time.time()
-    q = subprocess.Popen(cmd, cwd=ROOT)
+    q = subprocess.Popen(cmd, cwd=ROOT, stderr=subprocess.PIPE, text=True, errors="replace")
+
+    def qemu_stderr():  # the AC'97's recording inputs have nowhere to record from: not news
+        for line in q.stderr:
+            if "Can not open `ac97." not in line:
+                sys.stderr.write(line)
+    threading.Thread(target=qemu_stderr, daemon=True).start()
     seen = 0
     timed_out = False
     while True:
@@ -181,6 +243,12 @@ def main():
     print("%s fatcheck: %s" % ("PASS" if fc.returncode == 0 else "FAIL", fc_out[0] if fc_out else "?"))
     if fc.returncode:
         problems += ["fatcheck: " + l for l in fc_out]
+
+    if re.search(r"^PASS audio/streams-beep-play", log, re.M):
+        ok, msg = check_audio(AUDIO)
+        print("%s audio/recording: %s" % ("PASS" if ok else "FAIL", msg))
+        if not ok:
+            problems.append("audio recording: " + msg)
 
     fails = re.findall(r"^FAIL ", log, re.M)
     for p in problems:

@@ -46,8 +46,11 @@ void lapic_eoi(void) {
     if (lapic) lapic_write(LAPIC_EOI, 0);
 }
 
-/* Count LAPIC timer ticks (divide by 1) over 10 ms of PIT channel 2. Returns Hz, or 0 if the PIT
-   is missing. Channel 2 is polled through port 0x61, so no PIT interrupt is needed. */
+uint64_t tsc_hz;
+
+/* Count LAPIC timer ticks (divide by 1) over 10 ms of PIT channel 2, and the TSC's into tsc_hz.
+   Returns Hz, or 0 if the PIT is missing. Channel 2 is polled through port 0x61, so no PIT
+   interrupt is needed. */
 static uint64_t calibrate_with_pit(void) {
     uint8_t p61 = inb(0x61);
     if (p61 == 0xFF) return 0;                /* nothing decodes the port */
@@ -58,12 +61,14 @@ static uint64_t calibrate_with_pit(void) {
     outb(0x42, count >> 8);
     outb(0x61, inb(0x61) & ~0x01);            /* restart the count: gate low ... */
     lapic_write(LAPIC_TIMER_INIT, 0xFFFFFFFF);
+    uint64_t tsc0 = rdtsc();
     outb(0x61, inb(0x61) | 0x01);             /* ... and high */
     uint64_t spins = 0;
     while (!(inb(0x61) & 0x20)) {
         if (++spins > 50000000) return 0;
     }
     uint32_t elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CUR);
+    tsc_hz = (rdtsc() - tsc0) * 100;
     lapic_write(LAPIC_TIMER_INIT, 0);
     outb(0x61, p61);
     if (elapsed < 1000) return 0;             /* the output went high at once: no PIT */
@@ -77,6 +82,7 @@ bool lapic_timer_start(unsigned hz, int vector) {
     lapic_write(LAPIC_LVT_TIMER, 0x10000 | (uint32_t)vector);
     const char *src = "Hyper-V";
     uint64_t freq = hv_apic_hz();
+    if (freq) tsc_hz = hv_tsc_hz();
     if (!freq) {
         src = "PIT";
         freq = calibrate_with_pit();
@@ -88,6 +94,6 @@ bool lapic_timer_start(unsigned hz, int vector) {
     uint32_t init = (uint32_t)(freq / hz);
     lapic_write(LAPIC_LVT_TIMER, 0x20000 | (uint32_t)vector); /* periodic, unmasked */
     lapic_write(LAPIC_TIMER_INIT, init);
-    kprintf("apic: timer %lu kHz (from %s), %u Hz tick\n", freq / 1000, src, hz);
+    kprintf("apic: timer %lu kHz (from %s), %u Hz tick, TSC %lu kHz\n", freq / 1000, src, hz, tsc_hz / 1000);
     return true;
 }

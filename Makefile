@@ -152,7 +152,8 @@ $(BUILD)/data-blank.vhdx: scripts/mkdata.sh
 
 run: image
 	@qemu-system-x86_64 -M pc -m 512M -drive file=$(BUILD)/nocturne.img,format=raw,if=ide,index=0 \
-		-drive file=$(BUILD)/data.img,format=raw,if=ide,index=1 -serial stdio -vga std
+		-drive file=$(BUILD)/data.img,format=raw,if=ide,index=1 -serial stdio -vga std \
+		-audiodev dsound,id=snd -device AC97,audiodev=snd
 
 # the in-OS test suite on a scratch data disk (see scripts/test.py; your data.img is not touched)
 test: image

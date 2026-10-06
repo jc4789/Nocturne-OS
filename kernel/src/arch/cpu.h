@@ -77,6 +77,7 @@ void vector_register(int vec, irq_handler_t h);
 bool lapic_present(void);
 void lapic_eoi(void);
 bool lapic_timer_start(unsigned hz, int vector);
+extern uint64_t tsc_hz; /* measured by lapic_timer_start(); 0 if unknown */
 #define VEC_TIMER 0x30
 void pic_init(void);
 void pic_unmask(int irq);

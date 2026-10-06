@@ -35,13 +35,14 @@ layout) are parsed, laid out and painted by an engine written for Nocturne. It h
   - W^X: no page is both writable and executable. ELF segments are mapped with their own permissions, the stack and heap are no-execute (NX), and the kernel's own code, read-only data and data are mapped separately. Write protection also applies in ring 0.
   - `mmap`, `munmap` and `mprotect` are real, which is how `tcc -run` gets executable memory for the code it just compiled.
 - Processes: ring-3 user processes with ELF loading, preemptive scheduling (1 kHz local APIC timer, or the PIT), `int 0x80` system calls, `spawn` and `waitpid`, process trees, and `kill`.
-- Files: a VFS with a RAM filesystem (populated from a tar initrd), `/dev` (console, null, zero, random), pipes, and `poll`.
+- Files: a VFS with a RAM filesystem (populated from a tar initrd), `/dev` (console, null, zero, random, audio, volume), pipes, and `poll`.
 - Persistent storage: ATA PIO and Hyper-V SCSI disk drivers and a FAT32 filesystem (read and write), which is mounted at `/data`.
 - Drivers: PS/2 keyboard and wheel mouse, framebuffer, serial, CMOS clock, PCI enumeration, and ACPI power-off and reboot.
+- Sound: every open of `/dev/audio` is a stream of 48 kHz stereo samples. The kernel mixes the streams, applies the master volume (`/dev/volume`) and plays them on an Intel AC'97 card (QEMU, VirtualBox), or sends them to the Enhanced Session's client. See [Sound](#sound).
 - Hyper-V: VMBus and its synthetic devices, so Nocturne runs in a Generation 2 VM. See [Running it in Hyper-V](#running-it-in-hyper-v).
   - Keyboard, absolute mouse, SCSI disks and network adapter.
   - Heartbeat, graceful shutdown and restart from Hyper-V Manager, the host's clock (time sync), and the key-value exchange, so Hyper-V Manager shows the VM's IP address and OS.
-  - Hyper-V sockets, and an RDP server on them for VMConnect's **Enhanced Session**: the desktop takes the size of the VMConnect window, and text copied on either side pastes on the other.
+  - Hyper-V sockets, and an RDP server on them for VMConnect's **Enhanced Session**: the desktop takes the size of the VMConnect window, text copied on either side pastes on the other, and sound plays on the host.
 - Networking: drivers for the Intel e1000 (QEMU, VirtualBox, VMware), the DEC 21140 "tulip" (Hyper-V's legacy network adapter) and Hyper-V's synthetic adapter, and a small TCP/IP stack: Ethernet, ARP, IPv4, ICMP, UDP, a DHCP client, a DNS resolver and a TCP client.
   - TCP keeps out-of-order segments and reassembles them, and does NewReno congestion control (slow start, fast retransmit and fast recovery) with a retransmission timeout taken from the measured round-trip time.
 - Graphics: a compositing window manager. It runs in the kernel, which keeps it simple and fast, but a bug in it can bring the whole system down.
@@ -59,6 +60,7 @@ layout) are parsed, laid out and painted by an engine written for Nocturne. It h
   - History, tab completion and scripts.
 - Terminal: ANSI colours, UTF-8, scrollback, copy and paste, and resizing.
 - Command-line tools: `ls cat cp mv rm mkdir touch tree grep wc head hexdump echo ps kill free uptime date uname dmesg lspci sleep clear reboot poweroff neofetch fortune moonsay`
+- Sound: `beep` (tones and melodies), `play` (WAV files) and `volume`.
 - Network tools: `ifconfig`, `ping`, `host` (DNS lookup) and `fetch` (an HTTP and HTTPS client).
 - Development: the `tcc` C compiler, with headers and a static libc in `/usr`. The source of every program in `/bin` is in `/usr/src/apps`.
 - `agent`: the AI agent (see below). `screenshot` saves the screen as a PNG.
@@ -90,7 +92,8 @@ pick. When a client resizes its window it sends the new size over the display co
 and the desktop follows it. Keyboard and mouse go through the same connection, with no mouse capture, and so does the
 clipboard: text copied in Windows pastes in Nocturne (Ctrl+V in the Text Editor and the browser's
 address bar, Ctrl+Shift+V in the terminal), and text copied in Nocturne (Ctrl+C, or Ctrl+Shift+C
-for the terminal's screen) pastes in Windows. Choose
+for the terminal's screen) pastes in Windows. Sound plays through the host's speakers (VMConnect's
+**Local Resources > Remote audio** setting must be "Play on this computer", its default). Choose
 **View > Enhanced Session** to switch back to the basic console, which shows the desktop at the
 framebuffer's size. Nocturne returns to that size when the Enhanced Session ends.
 
@@ -126,7 +129,7 @@ console only.
 |---|---|
 | `hv-boot.ps1 -Name VM -Build` | Build, refresh the VM's boot media, boot, record COM1 and take a console screenshot. |
 | `hv-esm.ps1 -Name VM` | Open an Enhanced Session in VMConnect and save a picture of the window. |
-| `python hv-rdp.py --vm VM --size 1280x720 "type:neofetch\n" dclick:53,130` | Test the Enhanced Session without VMConnect: a small RDP client types and clicks, and saves the desktop it receives as a PNG. `clip:TEXT` and `chord:1d,2a,2f` test the clipboard, `resize:1600x900` a window resize. |
+| `python hv-rdp.py --vm VM --size 1280x720 "type:neofetch\n" dclick:53,130` | Test the Enhanced Session without VMConnect: a small RDP client types and clicks, and saves the desktop it receives as a PNG. `clip:TEXT` and `chord:1d,2a,2f` test the clipboard, `resize:1600x900` a window resize. The sound the server sends is saved as a WAV next to the PNG, with the tones in it listed. |
 | `hv-shot.ps1 -Name VM` | Screenshot the VM's console without VMConnect. |
 | `hv-sock.ps1 -Name VM -Port N` | Connect to a Hyper-V socket service in the guest from the host. |
 | `hv-serial.ps1 -Pipe P -Log F` | Copy a COM port pipe to a log file. |
@@ -160,7 +163,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1 test-full   # adds tcc rebuil
 
 `scripts/test.py` boots the image headless in QEMU with a scratch data disk holding `tests/`. Your own
 `data.img` is not touched. At boot, `init` runs the suite. The suite compiles its own runner with the
-in-OS `tcc` and runs 43 tests, checking each one's exit status and output. Results come back over the
+in-OS `tcc` and runs 45 tests, checking each one's exit status and output. Results come back over the
 serial port, and afterwards the host checks the FAT32 volume the OS wrote to with `fatcheck.py`. The
 tests cover:
 - Shell and tools, and `malloc` stress.
@@ -168,6 +171,7 @@ tests cover:
 - FAT32 and the RAM filesystem: many sizes, long names, 150-file directories, rename and nested directories.
 - `tcc`: printf and math, compiling every app, and self-hosting.
 - The GUI: a window appears in a screen grab and is gone after it closes.
+- Sound: streams, blocking and non-blocking writes, eight streams at once, the volume, `beep`, and `play` with 8-, 16-, 24-bit and float WAV files at several rates. QEMU records the AC'97 card's output to `build/test-audio.wav`, and the host checks that each tone came out with the right pitch on each channel and the right length.
 - The web engine, offline: about 80 checks of element positions (blocks, floats, flexbox, grid, tables, `@media`), painted pixels (borders, alpha, gradients, images), links, form submission, charsets and URL resolution. Deeply nested and malformed pages must not crash it.
 - Network: DHCP, ping, DNS, HTTP, HTTPS, and a rejected bad certificate.
 - TCP: 14 MiB to and from a host-side server, clean and with simulated loss and reordering, checking every byte.
@@ -196,6 +200,26 @@ python scripts/qtest.py sleep:6 "type:neofetch\n" shot:neofetch goto:51,125 dcli
 | Ctrl+C | Interrupt the running command |
 
 The root filesystem lives in RAM, so files you create there are lost when you reboot. Save anything you want to keep under `/data`. `/home` starts with a few sample files; try `sh hello.sh`.
+
+## Sound
+
+```
+beep                            # 440 Hz for 200 ms
+beep -f 880 -l 500 -w square    # sine, square, triangle or saw
+beep -l 150 C4 E4 G4 C5:400 R E5 # a melody: note names, :ms for a longer note, R for a rest
+play /data/song.wav             # PCM WAV of any rate (8/16/24/32-bit or float, mono or stereo)
+volume 60                       # the master volume, 0 to 100 (also +10 / -10)
+```
+
+Sound comes out of an Intel AC'97 card: `build.ps1 run` gives QEMU one, played through Windows'
+speakers, and VirtualBox emulates one (ICH AC97). In Hyper-V the Enhanced Session carries it to
+VMConnect; Hyper-V has no sound card, so outside an Enhanced Session sound plays into nothing (at
+the speed it would play, so programs still take as long as their sound does).
+
+A program plays sound by writing 16-bit little-endian stereo frames at 48 kHz to `/dev/audio`;
+writes block while about 170 ms are queued, and `close` waits for the rest to finish. Reading the
+stream (opened `O_RDWR`) returns a `uint32_t`: how many frames are queued, for keeping a picture
+in step with the sound. Up to eight programs can play at once.
 
 ## Networking
 
@@ -323,7 +347,8 @@ What Nocturne does not have, so nobody is surprised:
 - **The window manager runs in the kernel.**
 - **Slow, simple disks.** The ATA driver uses PIO with polling (no DMA). FAT32 has no journal, so power loss during a write can leave the volume inconsistent. Names may be up to 255 characters.
 - **The networking limits are listed above.**
-- **A plain Enhanced Session.** It carries the picture, keyboard, mouse and text on the clipboard only: no images or files on the clipboard, no sound, drive or printer sharing. If VMConnect doesn't send a new size when you resize its window, reconnect to change the size. The RDP server uses no encryption; it is reachable only through a Hyper-V socket on the host, never over the network.
+- **A plain Enhanced Session.** It carries the picture, keyboard, mouse, sound and text on the clipboard: no images or files on the clipboard, no microphone, drive or printer sharing. If VMConnect doesn't send a new size when you resize its window, reconnect to change the size. The RDP server uses no encryption; it is reachable only through a Hyper-V socket on the host, never over the network.
+- **Sound out only, on one kind of card.** AC'97 or the Enhanced Session: no Intel HD Audio, no recording, and uncompressed sound only (no MP3 or Ogg).
 - **The AI agent runs the model's commands without asking.** Anything it does stays inside the VM, but it can delete files on `/data`.
 - **A web browser without JavaScript or cookies.** See [its limits](#the-web-browser).
 - **Only checked in virtual machines.** It has been tested in QEMU and Hyper-V, never on real hardware.

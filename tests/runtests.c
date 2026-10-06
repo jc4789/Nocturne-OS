@@ -74,6 +74,11 @@ static const struct test tests[] = {
     /* desktop */
     {"gui", "window-and-screenshot", "tcc -o /home/guitest /data/tests/guitest.c && /home/guitest", 0, {"guitest: ok"}, NULL, 60},
 
+    /* sound (scripts/test.py records the AC'97 output and checks the tones in it) */
+    {"audio", "card", "dmesg | grep audio:", 0, {"AC'97"}},
+    {"audio", "streams-beep-play", "tcc -o /home/audiotest /data/tests/audiotest.c && /home/audiotest", 0,
+     {"audiotest: 0 failed"}, "FAIL", 60, false, true},
+
     /* the web engine, offline: layout, painting, forms, charsets, URLs, hostile input */
     {"web", "engine", "tcc -o /home/webtest /data/tests/webtest.c && /home/webtest", 0, {"webtest: ", ", 0 failed"}, "FAIL",
      120, false, true},

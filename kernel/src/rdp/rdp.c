@@ -9,11 +9,13 @@
      - output as fast-path updates: uncompressed bitmaps in 64x64 tiles (only tiles that
        changed are sent) and the pointer shape;
      - input as fast-path or slow-path events: scancodes, Unicode characters, mouse and wheel.
-   Of the virtual channels the clipboard's is used (text both ways), and drdynvc for display
-   control; sound, drives and printers are joined but ignored. The desktop takes the size of the
+   Of the virtual channels the clipboard's is used (text both ways), drdynvc for display
+   control, and rdpsnd for sound (with the little of rdpdr it needs: drives, printers and the
+   rest are turned down). The desktop takes the size of the
    client's window when it connects and whenever the window is resized, and goes back to its
    own when the client leaves. */
 #include "kernel.h"
+#include "dev/audio.h"
 #include "dev/input.h"
 #include "gui/wm.h"
 #include "hv/hvsock.h"
@@ -179,6 +181,16 @@ struct rdp {
     bool disp_open;
     int want_w, want_h;    /* the size the client's window has become (0: none pending) */
     uint64_t resize_at;    /* when to take it: a window being dragged sends many */
+    /* sound (rdpsnd), and the device redirection channel it waits for (rdpdr) */
+    int snd, rdpdr;        /* indexes into channel_ids, -1 without one */
+    int snd_state;         /* SND_* */
+    uint64_t snd_start_at; /* when to offer sound if rdpdr has not finished by then */
+    uint16_t snd_version;  /* the client's */
+    uint16_t snd_format;   /* our format's number in the client's list */
+    uint8_t snd_block;
+    uint64_t snd_until;    /* the sound sent covers up to this time */
+    uint32_t snd_blocks, snd_confirmed;
+    uint8_t *snd_buf;      /* one block, with room for its headers */
     struct {               /* a channel message being reassembled, per channel */
         uint8_t *buf;
         uint32_t len, total;
@@ -360,6 +372,8 @@ static void client_net(struct rdp *c, struct rbuf *b) {
         c->channel_opts[k] = opts;
         if (!strcmp(name, "cliprdr")) c->clip = k;
         if (!strcmp(name, "drdynvc")) c->dvc = k;
+        if (!strcmp(name, "rdpsnd")) c->snd = k;
+        if (!strcmp(name, "rdpdr")) c->rdpdr = k;
     }
 }
 
@@ -1165,11 +1179,236 @@ static int apply_resize(struct rdp *c) {
     return e ? e : send_demand_active(c);
 }
 
+/* ---- sound (MS-RDPEA) ----
+   We offer one format, the mixer's own (PCM, 48 kHz, 16-bit stereo). A client that takes it gets
+   a training round trip, then the mixed sound in 20 ms blocks, each sent a little before it is
+   due; while it takes the sound the card is silent (see audio.h). Windows' client starts sound
+   only once the device redirection channel has introduced itself, so that gets a minimal answer
+   too (MS-RDPEFS): every drive, printer or port it offers is turned down. */
+
+enum { SND_OFF, SND_WAIT, SND_FORMATS, SND_TRAINING, SND_PLAYING };
+enum { SNDC_CLOSE = 1, SNDC_WAVE, SNDC_SETVOLUME, SNDC_SETPITCH, SNDC_WAVECONFIRM, SNDC_TRAINING, SNDC_FORMATS,
+       SNDC_QUALITYMODE = 0x0C, SNDC_WAVE2 = 0x0D };
+#define TSSNDCAPS_ALIVE 1
+#define SND_VERSION 8
+#define SND_BLOCK_FRAMES 960 /* 20 ms */
+#define SND_BLOCK_MS 20
+#define SND_LEAD_MS 160      /* how far ahead of time the sound goes out */
+#define SND_BUF (16 + SND_BLOCK_FRAMES * AUDIO_FRAME)
+
+static void snd_header(struct wbuf *w, uint8_t type, uint16_t body) {
+    w8(w, type);
+    w8(w, 0);
+    w16(w, body);
+}
+
+static int snd_offer(struct rdp *c) {
+    uint8_t m[4 + 20 + 18];
+    struct wbuf w = {m, 0, sizeof m};
+    snd_header(&w, SNDC_FORMATS, sizeof m - 4);
+    w32(&w, 0); /* flags */
+    w32(&w, 0); /* volume */
+    w32(&w, 0); /* pitch */
+    w16(&w, 0); /* no UDP port */
+    w16(&w, 1); /* formats */
+    w8(&w, 0);  /* last block confirmed */
+    w16(&w, SND_VERSION);
+    w8(&w, 0);
+    w16(&w, 1); /* WAVE_FORMAT_PCM */
+    w16(&w, 2);
+    w32(&w, AUDIO_RATE);
+    w32(&w, AUDIO_RATE * AUDIO_FRAME);
+    w16(&w, AUDIO_FRAME);
+    w16(&w, 16);
+    w16(&w, 0);
+    c->snd_state = SND_FORMATS;
+    return vc_send(c, c->snd, m, w.n);
+}
+
+/* the formats the client can play, from ours: if ours is there, train */
+static int snd_client_formats(struct rdp *c, struct rbuf *r) {
+    uint32_t flags = r32(r);
+    rskip(r, 4 + 4 + 2);
+    int n = r16(r), found = -1;
+    r8(r);
+    c->snd_version = r16(r);
+    r8(r);
+    for (int i = 0; i < n && !r->err; i++) {
+        uint16_t tag = r16(r), ch = r16(r);
+        uint32_t rate = r32(r);
+        rskip(r, 4 + 2);
+        uint16_t bits = r16(r), extra = r16(r);
+        rskip(r, extra);
+        if (found < 0 && !r->err && tag == 1 && ch == 2 && rate == AUDIO_RATE && bits == 16) found = i;
+    }
+    if (r->err || !(flags & TSSNDCAPS_ALIVE) || found < 0) {
+        kprintf("rdp: \"%s\" plays no sound we can send\n", c->client_name);
+        c->snd_state = SND_OFF;
+        return 0;
+    }
+    c->snd_format = (uint16_t)found;
+    uint8_t m[8];
+    struct wbuf w = {m, 0, sizeof m};
+    snd_header(&w, SNDC_TRAINING, 4);
+    w16(&w, (uint16_t)uptime_ms());
+    w16(&w, 0); /* no pack: just the round trip */
+    c->snd_state = SND_TRAINING;
+    return vc_send(c, c->snd, m, w.n);
+}
+
+static int snd_message(struct rdp *c, const uint8_t *m, uint32_t n) {
+    struct rbuf r = {m, n, 0, false};
+    uint8_t type = r8(&r);
+    rskip(&r, 3);
+    if (r.err) return 0;
+    switch (type) {
+    case SNDC_FORMATS: return c->snd_state == SND_FORMATS ? snd_client_formats(c, &r) : 0;
+    case SNDC_TRAINING:
+        if (c->snd_state != SND_TRAINING) return 0;
+        c->snd_buf = kmalloc(SND_BUF);
+        if (!c->snd_buf) {
+            c->snd_state = SND_OFF;
+            return 0;
+        }
+        c->snd_state = SND_PLAYING;
+        c->snd_until = 0;
+        audio_remote_attach();
+        kprintf("rdp: sound goes to \"%s\" (version %u)\n", c->client_name, c->snd_version);
+        return 0;
+    case SNDC_WAVECONFIRM: c->snd_confirmed++; return 0;
+    default: return 0; /* quality mode */
+    }
+}
+
+/* One block of sound. buf has 16 bytes of room for headers before the samples. */
+static int snd_wave(struct rdp *c, uint8_t *buf, uint32_t len) {
+    uint8_t *d = buf + 16;
+    uint16_t ts = (uint16_t)c->snd_until;
+    c->snd_block++;
+    c->snd_blocks++;
+    if (c->snd_version >= 8) { /* one message */
+        struct wbuf w = {buf, 0, 16};
+        snd_header(&w, SNDC_WAVE2, (uint16_t)(12 + len));
+        w16(&w, ts);
+        w16(&w, c->snd_format);
+        w8(&w, c->snd_block);
+        wzero(&w, 3);
+        w32(&w, (uint32_t)c->snd_until);
+        return vc_send(c, c->snd, buf, 16 + len);
+    }
+    /* older clients: a wave info message with the first four bytes, then the rest in a wave
+       message whose first four bytes are padding */
+    uint8_t info[16];
+    struct wbuf w = {info, 0, sizeof info};
+    snd_header(&w, SNDC_WAVE, (uint16_t)(len + 8));
+    w16(&w, ts);
+    w16(&w, c->snd_format);
+    w8(&w, c->snd_block);
+    wzero(&w, 3);
+    wbytes(&w, d, 4);
+    int e = vc_send(c, c->snd, info, w.n);
+    if (e) return e;
+    memset(d, 0, 4);
+    return vc_send(c, c->snd, d, len);
+}
+
+/* Send the sound that is due within the lead time. When nothing is playing nothing is sent;
+   the next sound starts its timeline afresh. */
+static int snd_push(struct rdp *c) {
+    if (c->snd_state == SND_WAIT && uptime_ms() >= c->snd_start_at) return snd_offer(c);
+    if (c->snd_state != SND_PLAYING) return 0;
+    uint64_t now = uptime_ms();
+    if (c->snd_until < now) c->snd_until = now;
+    while (c->snd_until < now + SND_LEAD_MS && audio_pending()) {
+        audio_mix((int16_t *)(c->snd_buf + 16), SND_BLOCK_FRAMES);
+        int e = snd_wave(c, c->snd_buf, SND_BLOCK_FRAMES * AUDIO_FRAME);
+        if (e) return e;
+        c->snd_until += SND_BLOCK_MS;
+    }
+    return 0;
+}
+
+#define RDPDR_CTYP_CORE 0x4472
+#define PAKID_CORE_SERVER_ANNOUNCE   0x496E
+#define PAKID_CORE_CLIENTID_CONFIRM  0x4343
+#define PAKID_CORE_SERVER_CAPABILITY 0x5350
+#define PAKID_CORE_CLIENT_CAPABILITY 0x4350
+#define PAKID_CORE_DEVICELIST_ANNOUNCE 0x4441
+#define PAKID_CORE_DEVICE_REPLY      0x6472
+#define STATUS_NOT_SUPPORTED 0xC00000BB
+
+static int rdpdr_send(struct rdp *c, uint16_t packet, const uint8_t *body, uint32_t n) {
+    uint8_t m[64];
+    struct wbuf w = {m, 0, sizeof m};
+    w16(&w, RDPDR_CTYP_CORE);
+    w16(&w, packet);
+    wbytes(&w, body, n);
+    return vc_send(c, c->rdpdr, m, w.n);
+}
+
+/* the server's version and the client id: the start of the handshake */
+static int rdpdr_start(struct rdp *c) {
+    if (c->rdpdr < 0) return 0;
+    static const uint8_t announce[] = {1, 0, 0x0C, 0, 1, 0, 0, 0}; /* version 1.12, client id 1 */
+    return rdpdr_send(c, PAKID_CORE_SERVER_ANNOUNCE, announce, sizeof announce);
+}
+
+static int rdpdr_message(struct rdp *c, const uint8_t *m, uint32_t n) {
+    struct rbuf r = {m, n, 0, false};
+    uint16_t component = r16(&r), packet = r16(&r);
+    if (r.err || component != RDPDR_CTYP_CORE) return 0;
+    switch (packet) {
+    case PAKID_CORE_CLIENTID_CONFIRM: { /* the client's reply: our capabilities, its id confirmed */
+        uint8_t caps[4 + 44];
+        struct wbuf w = {caps, 0, sizeof caps};
+        w16(&w, 1); /* one set, the general one */
+        w16(&w, 0);
+        w16(&w, 1);
+        w16(&w, 44);
+        w32(&w, 2);      /* version */
+        w32(&w, 0);      /* os type */
+        w32(&w, 0);      /* os version */
+        w16(&w, 1);      /* protocol 1.12 */
+        w16(&w, 0x0C);
+        w32(&w, 0xFFFF); /* every I/O request type, should a device ever be taken */
+        w32(&w, 0);
+        w32(&w, 3);      /* device remove PDUs, display names */
+        w32(&w, 0);
+        w32(&w, 0);
+        w32(&w, 0);
+        int e = rdpdr_send(c, PAKID_CORE_SERVER_CAPABILITY, caps, w.n);
+        static const uint8_t confirm[] = {1, 0, 0x0C, 0, 1, 0, 0, 0};
+        return e ? e : rdpdr_send(c, PAKID_CORE_CLIENTID_CONFIRM, confirm, sizeof confirm);
+    }
+    case PAKID_CORE_CLIENT_CAPABILITY: /* the handshake is done: sound may start */
+        return c->snd_state == SND_WAIT ? snd_offer(c) : 0;
+    case PAKID_CORE_DEVICELIST_ANNOUNCE: {
+        uint32_t count = r32(&r);
+        for (uint32_t i = 0; i < count && i < 64 && !r.err; i++) {
+            r32(&r);
+            uint32_t id = r32(&r);
+            rskip(&r, 8);
+            rskip(&r, r32(&r));
+            if (r.err) break;
+            uint8_t reply[8];
+            struct wbuf w = {reply, 0, sizeof reply};
+            w32(&w, id);
+            w32(&w, STATUS_NOT_SUPPORTED);
+            int e = rdpdr_send(c, PAKID_CORE_DEVICE_REPLY, reply, w.n);
+            if (e) return e;
+        }
+        return 0;
+    }
+    default: return 0; /* the client's name, device removals */
+    }
+}
+
 /* Data on a static virtual channel: reassemble each message, then hand it over. */
 static int vc_data(struct rdp *c, uint16_t channel, struct rbuf *r) {
     int k = 0;
     while (k < c->nchannels && c->channel_ids[k] != channel) k++;
-    if (k == c->nchannels || (k != c->clip && k != c->dvc)) return 0; /* the others carry nothing we do */
+    if (k == c->nchannels || (k != c->clip && k != c->dvc && k != c->snd && k != c->rdpdr))
+        return 0; /* the others carry nothing we do */
     uint32_t total = r32(r), flags = r32(r);
     if (r->err) return 0;
     if (flags & CHANNEL_FLAG_FIRST) {
@@ -1185,7 +1424,10 @@ static int vc_data(struct rdp *c, uint16_t channel, struct rbuf *r) {
     memcpy(c->vc[k].buf + c->vc[k].len, r->p + r->pos, n);
     c->vc[k].len += n;
     if (!(flags & CHANNEL_FLAG_LAST)) return 0;
-    int e = k == c->clip ? clip_message(c, c->vc[k].buf, c->vc[k].len) : dvc_message(c, c->vc[k].buf, c->vc[k].len);
+    uint8_t *m = c->vc[k].buf;
+    uint32_t mlen = c->vc[k].len;
+    int e = k == c->clip ? clip_message(c, m, mlen) : k == c->dvc ? dvc_message(c, m, mlen)
+          : k == c->snd  ? snd_message(c, m, mlen)  : rdpdr_message(c, m, mlen);
     kfree(c->vc[k].buf);
     c->vc[k].buf = NULL;
     return e;
@@ -1224,6 +1466,11 @@ static int share_pdu(struct rdp *c, struct rbuf *r) {
             c->started = true;
             if (!e) e = clip_start(c);
             if (!e) e = dvc_start(c);
+            if (!e) e = rdpdr_start(c);
+            if (c->snd >= 0) {
+                c->snd_state = SND_WAIT;
+                c->snd_start_at = uptime_ms() + (c->rdpdr >= 0 ? 3000 : 0); /* should rdpdr stall */
+            }
         }
         c->active = true;
         c->pointer_shape = -1;
@@ -1323,7 +1570,7 @@ static void session(void *arg) {
     struct hvsock *s = arg;
     if (!c) goto out;
     c->s = s;
-    c->clip = c->dvc = -1;
+    c->clip = c->dvc = c->snd = c->rdpdr = -1;
     c->in = kmalloc(MAX_PDU);
     c->out = kmalloc(MAX_PDU);
     if (!c->in || !c->out) goto out;
@@ -1350,7 +1597,8 @@ static void session(void *arg) {
 
     int err = 0;
     while (!err) {
-        if (hvsock_wait(s, 30)) {
+        bool playing = c->snd_state == SND_PLAYING && audio_pending();
+        if (hvsock_wait(s, playing ? 10 : 30)) {
             len = read_pdu(c, 5000);
             if (len <= 0) {
                 err = len ? len : -EPIPE;
@@ -1362,16 +1610,20 @@ static void session(void *arg) {
         if (!err) err = apply_resize(c);
         if (!err) err = push_updates(c);
         if (!err) err = clip_poll(c);
+        if (!err) err = snd_push(c);
     }
     if (c->started && err != -EPIPE) kprintf("rdp: session with \"%s\" failed (%d)\n", c->client_name, err);
     else if (c->started) kprintf("rdp: session with \"%s\" ended\n", c->client_name);
+    if (c->snd_blocks) kprintf("rdp: %u blocks of sound sent, %u confirmed\n", c->snd_blocks, c->snd_confirmed);
 out:
     if (c && c->attached) wm_remote_detach();
+    if (c && c->snd_state == SND_PLAYING) audio_remote_detach();
     if (c) {
         kfree(c->in);
         kfree(c->out);
         kfree(c->shadow);
         kfree(c->dirty);
+        kfree(c->snd_buf);
         for (int k = 0; k < (int)ARRAY_SIZE(c->vc); k++) kfree(c->vc[k].buf);
         kfree(c);
     }

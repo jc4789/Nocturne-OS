@@ -7,6 +7,7 @@
 #include "dev/fbcon.h"
 #include "dev/pci.h"
 #include "dev/ata.h"
+#include "dev/audio.h"
 #include "gui/wm.h"
 #include "hv/vmbus.h"
 #include "sys/proc.h"
@@ -73,6 +74,7 @@ void kmain_late(void) {
     }
     pci_init();
     net_init();
+    audio_init();
     ata_init();
     storvsc_init();
     fat_mount_data();

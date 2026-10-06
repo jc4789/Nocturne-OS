@@ -30,3 +30,8 @@ uint64_t hv_apic_hz(void) {
     if (!hv.present || !(hv.features & HV_ACCESS_FREQUENCY_MSRS)) return 0;
     return rdmsr(HV_MSR_APIC_FREQUENCY);
 }
+
+uint64_t hv_tsc_hz(void) {
+    if (!hv.present || !(hv.features & HV_ACCESS_FREQUENCY_MSRS)) return 0;
+    return rdmsr(HV_MSR_TSC_FREQUENCY);
+}

@@ -33,3 +33,4 @@ extern struct hv_info hv;
 void hv_detect(void);
 /* APIC timer input frequency in Hz, or 0 if the hypervisor does not report it */
 uint64_t hv_apic_hz(void);
+uint64_t hv_tsc_hz(void); /* the TSC's, likewise */

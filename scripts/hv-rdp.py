@@ -17,6 +17,9 @@ clipboard, as a copy on the host would), resize:WxH (the client's window changed
 picture saved at the end has the size the server settled on), wait:SECONDS.
 
 The client also joins the clipboard channel: whatever the guest copies is fetched and printed.
+It joins the sound channel as well (with the device redirection handshake before it, offering a
+drive the server should turn down), and saves the sound it is sent as <out>-audio.wav, with a
+summary of the tones in it. --snd-version 5 makes it an older client (wave info + wave PDUs).
 """
 import argparse
 import socket
@@ -30,6 +33,8 @@ import zlib
 SERVICE = "{:08x}-facb-11e6-bd58-64006a7986d3"
 CLIP_CHANNEL = 1004  # the server numbers channels from 1004 in the order we list them
 DVC_CHANNEL = 1005
+RDPDR_CHANNEL = 1006
+SND_CHANNEL = 1007
 
 # set 1 scancodes for the characters `type:` knows
 SCANCODES = {c: s for s, row in ((0x10, "qwertyuiop"), (0x1E, "asdfghjkl"), (0x2C, "zxcvbnm"))
@@ -84,6 +89,14 @@ class Client:
         self.vc = {}  # channel messages being reassembled
         self.disp = None  # the display control channel's id, once the server has opened it
         self.disp_ready = threading.Event()
+        self.snd_version = 8
+        self.snd_formats = []  # the server's formats we took, in our numbering
+        self.pcm = bytearray()  # the sound received (48 kHz stereo, 16-bit)
+        self.snd_blocks = 0
+        self.snd_next = None  # the time stamp the next block would have if the sound went on
+        self.snd_overlaps = 0
+        self.wave_info = None  # a wave info PDU waiting for its wave PDU
+        self.drive_reply = None  # the server's answer to the drive we offered
 
     def send(self, b):
         with self.send_lock:
@@ -124,7 +137,7 @@ class Client:
                     o += 2 if p[o] & 0x80 else 1
                     if channel == 1003:
                         self.io_data(p[o:])
-                    elif channel in (CLIP_CHANNEL, DVC_CHANNEL):
+                    elif channel in (CLIP_CHANNEL, DVC_CHANNEL, RDPDR_CHANNEL, SND_CHANNEL):
                         self.channel_data(channel, p[o:])
         except (EOFError, OSError):
             self.closed = True
@@ -166,7 +179,8 @@ class Client:
         self.vc[channel] = self.vc.get(channel, b"") + d[8:]
         if flags & 2:
             m = self.vc.pop(channel)[:total]
-            (self.clip_message if channel == CLIP_CHANNEL else self.dvc_message)(m)
+            {CLIP_CHANNEL: self.clip_message, DVC_CHANNEL: self.dvc_message, RDPDR_CHANNEL: self.rdpdr_message,
+             SND_CHANNEL: self.snd_message}[channel](m)
 
     def vc_send(self, channel, m, flags):
         pdu = struct.pack("<II", len(m), flags) + m
@@ -196,6 +210,99 @@ class Client:
         if not self.activated.wait(5):
             print("the server kept its size")
             self.activated.set()
+
+    # ---- device redirection: just the handshake, and one drive for the server to turn down ----
+    def rdpdr_send(self, packet, body):
+        self.vc_send(RDPDR_CHANNEL, struct.pack("<HH", 0x4472, packet) + body, 3)
+
+    def rdpdr_message(self, m):
+        component, packet = struct.unpack_from("<HH", m)
+        if component != 0x4472:
+            return
+        if packet == 0x496E:  # server announce: our reply and our name
+            self.rdpdr_send(0x4343, m[4:12])
+            name = "HV-RDP".encode("utf-16-le") + b"\0\0"
+            self.rdpdr_send(0x434E, struct.pack("<III", 1, 0, len(name)) + name)
+        elif packet == 0x5350:  # server capabilities: ours, the general set only
+            general = struct.pack("<HHIIIHHIIIIII", 1, 44, 2, 2, 0, 1, 0x0C, 0xFFFF, 0, 3, 0, 0, 0)
+            self.rdpdr_send(0x4350, struct.pack("<HH", 1, 0) + general)
+        elif packet == 0x4343:  # the server confirmed our id: announce a drive
+            self.rdpdr_send(0x4441, struct.pack("<III", 1, 8, 7) + b"C:".ljust(8, b"\0") + struct.pack("<I", 0))
+        elif packet == 0x6472:
+            self.drive_reply = struct.unpack_from("<II", m, 4)
+
+    # ---- sound ----
+    def snd_send(self, mtype, body):
+        self.vc_send(SND_CHANNEL, struct.pack("<BBH", mtype, 0, len(body)) + body, 3)
+
+    def snd_message(self, m):
+        if self.wave_info:  # the rest of a wave: its first four bytes were in the wave info
+            ts, block, first = self.wave_info
+            self.wave_info = None
+            self.got_wave(ts, block, first + m[4:])
+            return
+        mtype, _, body = struct.unpack_from("<BBH", m)
+        if mtype == 7:  # the server's formats: take PCM 48 kHz stereo 16-bit
+            n = struct.unpack_from("<H", m, 18)[0]
+            o, ours = 24, b""
+            for i in range(n):
+                tag, ch, rate, _, _, bits, extra = struct.unpack_from("<HHIIHHH", m, o)
+                f = m[o:o + 18 + extra]
+                o += 18 + extra
+                if (tag, ch, rate, bits) == (1, 2, 48000, 16):
+                    self.snd_formats.append(i)
+                    ours += f
+            hdr = struct.pack("<IIIHHBHB", 3, 0xFFFFFFFF, 0, 0, len(self.snd_formats), 0, self.snd_version, 0)
+            self.snd_send(7, hdr + ours)
+            if self.snd_version >= 6:
+                self.snd_send(0x0C, struct.pack("<HH", 2, 0))  # quality mode: high
+        elif mtype == 6:  # training
+            self.snd_send(6, m[4:8])
+        elif mtype == 0x0D:  # wave2
+            ts, fmt, block = struct.unpack_from("<HHB", m, 4)
+            self.got_wave(ts, block, m[16:4 + body])
+        elif mtype == 2:  # wave info: the wave follows
+            ts, fmt, block = struct.unpack_from("<HHB", m, 4)
+            self.wave_info = (ts, block, m[12:16])
+
+    def got_wave(self, ts, block, data):
+        """place the block on the timeline by its time stamp (ms): a pause in the sound is a jump"""
+        if self.snd_next is not None:
+            gap = (ts - self.snd_next) & 0xFFFF
+            if gap < 0x8000:
+                self.pcm += bytes(gap * 192)
+            elif gap != 0:
+                self.snd_overlaps += 1  # a block before its time: the server's clock went back
+        self.snd_next = (ts + len(data) // 192) & 0xFFFF
+        self.pcm += data
+        self.snd_blocks += 1
+        self.snd_send(5, struct.pack("<HBB", ts, block, 0))
+
+    def save_wav(self, path):
+        d = bytes(self.pcm)
+        fmt = struct.pack("<IHHIIHH", 16, 1, 2, 48000, 192000, 4, 16)
+        with open(path, "wb") as f:
+            f.write(b"RIFF" + struct.pack("<I", 36 + len(d)) + b"WAVEfmt " + fmt + b"data" + struct.pack("<I", len(d)) + d)
+
+    def describe_sound(self):
+        """the sounds received: (left Hz, right Hz, seconds) for each run of sound"""
+        pcm = memoryview(bytes(self.pcm)[:len(self.pcm) // 4 * 4]).cast("h")
+        left, right = pcm[0::2], pcm[1::2]
+        blk, runs = 480, []
+        for i in range(0, len(left), blk):
+            if max(map(abs, left[i:i + blk])) > 1000 or max(map(abs, right[i:i + blk])) > 1000:
+                if runs and i - runs[-1][1] <= 6 * blk:
+                    runs[-1][1] = i + blk
+                else:
+                    runs.append([i, i + blk])
+
+        def hz(x):
+            return sum(1 for i in range(1, len(x)) if x[i - 1] < 0 <= x[i]) * 48000 / max(1, len(x))
+        out = []
+        for a, b in runs:
+            a2, b2 = a + (b - a) // 10, b - (b - a) // 10
+            out.append((round(hz(left[a2:b2])), round(hz(right[a2:b2])), (b - a) / 48000))
+        return out
 
     # ---- the clipboard channel ----
     def clip_send(self, mtype, flags, data=b""):
@@ -287,8 +394,9 @@ class Client:
         core += struct.pack("<HHIHHH", 0xCA01, 1, 0, 32, 0x000F, 0x0002)
         blocks = struct.pack("<HH", 0xC001, 4 + len(core)) + core
         blocks += struct.pack("<HHII", 0xC002, 12, 0, 0)
-        blocks += struct.pack("<HHI", 0xC003, 32, 2) + b"cliprdr\0" + struct.pack("<I", 0xC0A00000)
+        blocks += struct.pack("<HHI", 0xC003, 56, 4) + b"cliprdr\0" + struct.pack("<I", 0xC0A00000)
         blocks += b"drdynvc\0" + struct.pack("<I", 0xC0800000)
+        blocks += b"rdpdr\0\0\0" + struct.pack("<I", 0x80800000) + b"rdpsnd\0\0" + struct.pack("<I", 0xC0000000)
         gcc = b"\x00\x05\x00\x14\x7c\x00\x01"
         ccrq = b"\x00\x08\x00\x10\x00\x01\xc0\x00Duca" + per_len(len(blocks)) + blocks
         gcc += per_len(len(ccrq)) + ccrq
@@ -303,7 +411,7 @@ class Client:
         self.send(x224_data(b"\x28"))  # attach user
         ac = self.read_pdu()
         self.user = 1001 + struct.unpack_from(">H", ac, 9)[0]
-        for ch in (self.user, 1003, CLIP_CHANNEL, DVC_CHANNEL):
+        for ch in (self.user, 1003, CLIP_CHANNEL, DVC_CHANNEL, RDPDR_CHANNEL, SND_CHANNEL):
             self.send(x224_data(b"\x38" + struct.pack(">HH", self.user - 1001, ch)))
             self.read_pdu()
 
@@ -382,6 +490,7 @@ def main():
     ap.add_argument("--port", type=int, default=3389)
     ap.add_argument("--size", default="1024x768")
     ap.add_argument("--out", default="build/hv/rdp.png")
+    ap.add_argument("--snd-version", type=int, default=8)
     ap.add_argument("actions", nargs="*")
     a = ap.parse_args()
     w, h = (int(v) for v in a.size.split("x"))
@@ -390,6 +499,7 @@ def main():
     s.settimeout(15)
     s.connect((vm_id(a.vm), SERVICE.format(a.port)))
     c = Client(s, w, h)
+    c.snd_version = a.snd_version
     c.connect()
     time.sleep(2)
     print(f"connected as {c.w}x{c.h}: {c.updates} bitmap updates so far")
@@ -442,6 +552,16 @@ def main():
         with open(a.out.rsplit(".", 1)[0] + "-clip.txt", "w", encoding="utf-8") as f:
             f.write(c.clip_got[-1])
     print(f"{c.updates} bitmap updates; saved {a.out}" + ("" if c.clip_ready.is_set() else "; no clipboard"))
+    if c.drive_reply:
+        print("the server answered the drive with status %#x" % c.drive_reply[1])
+    if c.snd_formats:
+        tones = ", ".join("%d/%d Hz %.2f s" % t for t in c.describe_sound())
+        print(f"sound: {c.snd_blocks} blocks over {len(c.pcm) / 192000:.2f} s; {tones or 'silence'}" +
+              (f"; {c.snd_overlaps} blocks out of order" if c.snd_overlaps else ""))
+        if c.pcm:
+            c.save_wav(a.out.rsplit(".", 1)[0] + "-audio.wav")
+    else:
+        print("sound: the server offered none")
     s.close()
 
 
