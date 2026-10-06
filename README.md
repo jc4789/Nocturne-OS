@@ -64,8 +64,8 @@ layout) are parsed, laid out and painted by an engine written for Nocturne. It h
 - Network tools: `ifconfig`, `ping`, `host` (DNS lookup) and `fetch` (an HTTP and HTTPS client).
 - Development: the `tcc` C compiler, with headers and a static libc in `/usr`. The source of every program in `/bin` is in `/usr/src/apps`.
 - `agent`: the AI agent (see below). `screenshot` saves the screen as a PNG.
-- Desktop apps: Web Browser, Files, Text Editor, Paint, Calculator, Clock and System Monitor.
-- Games and toys: Snake, Tetris, Minesweeper, Mandelbrot, 3D Shapes and Game of Life.
+- Desktop apps: Web Browser, Files, Text Editor, Paint, Calculator, Clock, System Monitor and Piano.
+- Games and toys: Snake, Tetris, Minesweeper (all three with sound effects), Mandelbrot, 3D Shapes and Game of Life.
 
 ## Running it in Hyper-V
 
@@ -216,10 +216,15 @@ speakers, and VirtualBox emulates one (ICH AC97). In Hyper-V the Enhanced Sessio
 VMConnect; Hyper-V has no sound card, so outside an Enhanced Session sound plays into nothing (at
 the speed it would play, so programs still take as long as their sound does).
 
+**Piano** plays two octaves from the mouse or the keyboard (Z S X D C V G B H N J M for the lower
+octave, Q 2 W 3 E R 5 T 6 Y 7 U I for the upper), in three sounds (Tab), with Left and Right to
+change octave.
+
 A program plays sound by writing 16-bit little-endian stereo frames at 48 kHz to `/dev/audio`;
 writes block while about 170 ms are queued, and `close` waits for the rest to finish. Reading the
 stream (opened `O_RDWR`) returns a `uint32_t`: how many frames are queued, for keeping a picture
-in step with the sound. Up to eight programs can play at once.
+in step with the sound. Up to eight programs can play at once. For games, libc's
+`sound_effect(hz, hz2, ms, wave)` plays a short tone or noise without ever waiting (`nocturne.h`).
 
 ## Networking
 

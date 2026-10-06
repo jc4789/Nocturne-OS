@@ -54,6 +54,7 @@ static void reveal(int x, int y) {
     if (mine[y][x]) {
         lost = true;
         t_end = uptime_ms();
+        sound_effect(220, 30, 160, SND_NOISE);
         return;
     }
     if (count(x, y) == 0)
@@ -62,6 +63,9 @@ static void reveal(int x, int y) {
     if (nopen == GW * GH - MINES && !lost) {
         won = true;
         t_end = uptime_ms();
+        sound_effect(523, 523, 50, SND_TRIANGLE);
+        sound_effect(659, 659, 50, SND_TRIANGLE);
+        sound_effect(784, 1047, 60, SND_TRIANGLE);
     }
 }
 
@@ -155,10 +159,13 @@ int main(void) {
                             if (!open_[y][x]) {
                                 flag[y][x] = !flag[y][x];
                                 nflags += flag[y][x] ? 1 : -1;
+                                sound_effect(flag[y][x] ? 900 : 600, flag[y][x] ? 1200 : 450, 25, SND_TRIANGLE);
                             }
                         } else if (e.buttons & 1) {
                             if (!started) plant(x, y);
+                            bool was_open = open_[y][x] || flag[y][x];
                             reveal(x, y);
+                            if (!was_open && !lost && !won) sound_effect(1800, 1400, 12, SND_TRIANGLE); /* a click */
                         }
                     }
                 }

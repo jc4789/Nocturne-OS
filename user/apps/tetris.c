@@ -50,6 +50,7 @@ static void spawn_piece(void) {
     if (!fits(cur, rot, px, py)) {
         over = true;
         if (score > best) best = score;
+        sound_effect(330, 55, 160, SND_SAW);
     }
 }
 
@@ -77,6 +78,14 @@ static void lock_piece(void) {
             cleared++;
             y++;
         }
+    }
+    if (cleared == 4) { /* a rising fanfare */
+        sound_effect(523, 784, 60, SND_SQUARE);
+        sound_effect(784, 1568, 90, SND_SQUARE);
+    } else if (cleared) {
+        sound_effect(440 + 110 * cleared, 880 + 220 * cleared, 50 + 20 * cleared, SND_SQUARE);
+    } else {
+        sound_effect(140, 70, 30, SND_TRIANGLE); /* a thud */
     }
     static const int pts[] = {0, 100, 300, 500, 800};
     score += pts[cleared] * level;
@@ -170,6 +179,7 @@ int main(void) {
                         if (fits(cur, nr, px + dx, py)) {
                             rot = nr;
                             px += dx;
+                            sound_effect(1200, 1500, 15, SND_TRIANGLE);
                             break;
                         }
                     }

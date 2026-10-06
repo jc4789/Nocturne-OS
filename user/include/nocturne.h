@@ -138,3 +138,16 @@ bool ui_hit(int px, int py, int x, int y, int w, int h);
 void ui_textfield(canvas_t *c, int x, int y, int w, const char *text, bool focus);
 /* edit a line buffer with a key event; returns 1 on Enter, -1 on Escape, 0 otherwise */
 int ui_edit_key(char *buf, size_t cap, const struct gui_event *e);
+
+/* ---- sound (sound.c) ----
+   /dev/audio takes 48 kHz stereo frames: two int16_t, left first. Each open is a stream of its
+   own (up to 8 play at once); writes block while about 170 ms (SOUND_QUEUE frames) are queued,
+   and close waits for the rest to play. Reading a stream opened O_RDWR gives a uint32_t: the
+   frames still queued. /dev/volume holds the master volume, 0-100, as text. */
+#define SOUND_RATE  48000
+#define SOUND_QUEUE 8192
+enum { SND_SINE, SND_SQUARE, SND_TRIANGLE, SND_SAW, SND_NOISE };
+/* A sound effect that never makes the program wait: a tone gliding from hz to hz2 over ms
+   milliseconds. Effects play one after another; one that does not fit in the queue is dropped.
+   Returns false if it was not played (no sound, or no room). */
+bool sound_effect(int hz, int hz2, int ms, int wave);

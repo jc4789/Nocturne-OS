@@ -46,6 +46,7 @@ static void step(void) {
         if (sx[i] == nx && sy[i] == ny) {
             dead = true;
             if (score > best) best = score;
+            sound_effect(300, 60, 160, SND_SAW);
             return;
         }
     bool grow = nx == fx && ny == fy;
@@ -57,6 +58,7 @@ static void step(void) {
     if (grow) {
         score += 10;
         place_food();
+        sound_effect(660, 1320, 60, SND_SQUARE);
     }
 }
 

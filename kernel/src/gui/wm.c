@@ -474,6 +474,7 @@ static const struct app apps[] = {
     {"Calculator", "/bin/calc", ICON_CALC},
     {"Clock", "/bin/clock", ICON_CLOCK},
     {"System Monitor", "/bin/sysmon", ICON_MONITOR},
+    {"Piano", "/bin/piano", ICON_PIANO},
     {"Snake", "/bin/snake", ICON_SNAKE},
     {"Tetris", "/bin/tetris", ICON_TETRIS},
     {"Minesweeper", "/bin/mines", ICON_MINES},
@@ -486,7 +487,7 @@ static const struct app apps[] = {
 };
 #define NAPPS ((int)ARRAY_SIZE(apps))
 
-static const int desktop_apps[] = {0, 1, 2, 3, 4, 8, 11, 12, 14};
+static const int desktop_apps[] = {0, 1, 2, 3, 4, 8, 9, 12, 13, 15};
 #define NDESK ((int)ARRAY_SIZE(desktop_apps))
 #define ICON_CELL_W 88
 #define ICON_CELL_H 82

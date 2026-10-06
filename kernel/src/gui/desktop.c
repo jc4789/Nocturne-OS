@@ -247,6 +247,13 @@ void desktop_draw_icon(canvas_t *c, int x, int y, int icon) {
         gfx_circle(c, x + 16, y + 16, 10, RGB(120, 200, 250));
         gfx_triangle(c, x + 22, y + 2, x + 22, y + 12, x + 30, y + 7, RGB(120, 200, 250));
         break;
+    case ICON_PIANO:
+        gfx_fill_round(c, x + 1, y + 4, 30, 24, 4, RGB(40, 34, 70));
+        for (int i = 0; i < 5; i++) gfx_fill(c, x + 4 + i * 5, y + 7, 4, 19, RGB(246, 244, 236));
+        for (int i = 0; i < 4; i++)
+            if (i != 2) gfx_fill(c, x + 7 + i * 5, y + 7, 3, 11, RGB(24, 22, 36));
+        gfx_fill(c, x + 4, y + 7, 24, 2, RGB(130, 110, 240));
+        break;
     case ICON_TETRIS:
         gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(24, 24, 44));
         gfx_fill(c, x + 5, y + 19, 7, 7, RGB(240, 90, 110));
