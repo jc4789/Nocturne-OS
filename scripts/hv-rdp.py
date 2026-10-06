@@ -10,8 +10,12 @@ Needs Windows, Python 3.12+ (socket.AF_HYPERV) and an elevated shell.
     python scripts/hv-rdp.py --vm Nocturne-G2 --size 1280x720 --out build/hv/rdp.png \
         "type:neofetch\\n" wait:2 dclick:53,130 wait:2
 
-Actions: type:TEXT (letters, digits, space and \\n), key:SCANCODE (hex), move:X,Y, click:X,Y,
-dclick:X,Y, wheel:X,Y,N (N notches, positive is up), wait:SECONDS.
+Actions: type:TEXT (letters, digits, space and \\n), key:SCANCODE (hex), chord:SC,SC,... (held
+down in order, let go in reverse: chord:1d,2a,2f is Ctrl+Shift+V), move:X,Y, click:X,Y,
+dclick:X,Y, wheel:X,Y,N (N notches, positive is up), clip:TEXT (put TEXT on "Windows'"
+clipboard, as a copy on the host would), wait:SECONDS.
+
+The client also joins the clipboard channel: whatever the guest copies is fetched and printed.
 """
 import argparse
 import socket
@@ -23,6 +27,7 @@ import time
 import zlib
 
 SERVICE = "{:08x}-facb-11e6-bd58-64006a7986d3"
+CLIP_CHANNEL = 1004  # the server numbers channels from 1004 in the order we list them
 
 # set 1 scancodes for the characters `type:` knows
 SCANCODES = {c: s for s, row in ((0x10, "qwertyuiop"), (0x1E, "asdfghjkl"), (0x2C, "zxcvbnm"))
@@ -37,6 +42,11 @@ def vm_id(name):
     if not out:
         sys.exit(f"no VM called {name}")
     return out
+
+
+def unescape(s):
+    """Backslash escapes (\\n, \\u00e9) in an argument; characters already in it stay as they are."""
+    return s.encode("latin-1", "backslashreplace").decode("unicode_escape")
 
 
 def tpkt(payload):
@@ -65,6 +75,15 @@ class Client:
         self.lock = threading.Lock()
         self.up = threading.Event()
         self.closed = False
+        self.send_lock = threading.Lock()  # the reader answers clipboard requests
+        self.clip_ready = threading.Event()  # the server's monitor-ready arrived
+        self.clip_text = ""  # what our "Windows" clipboard holds
+        self.clip_got = []  # texts the guest copied
+        self.vc = b""
+
+    def send(self, b):
+        with self.send_lock:
+            self.s.sendall(b)
 
     # ---- reading ----
     def recv_exact(self, n):
@@ -95,8 +114,54 @@ class Client:
                 p = self.read_pdu()
                 if p[:2] == b"FP":
                     self.fastpath(p[2:])
+                elif len(p) > 12 and p[7] >> 2 == 26:  # MCS send data indication
+                    channel = struct.unpack_from(">H", p, 10)[0]
+                    o = 13
+                    o += 2 if p[o] & 0x80 else 1
+                    if channel == CLIP_CHANNEL:
+                        self.channel_data(p[o:])
         except (EOFError, OSError):
             self.closed = True
+
+    # ---- the clipboard channel ----
+    def channel_data(self, d):
+        total, flags = struct.unpack_from("<II", d)
+        if flags & 1:
+            self.vc = b""
+        self.vc += d[8:]
+        if flags & 2:
+            self.clip_message(self.vc[:total])
+
+    def clip_send(self, mtype, flags, data=b""):
+        m = struct.pack("<HHI", mtype, flags, len(data)) + data
+        pdu = struct.pack("<II", len(m), 0x13) + m  # first, last, show protocol
+        sdr = b"\x64" + struct.pack(">HH", self.user - 1001, CLIP_CHANNEL) + b"\x70" + per_len(len(pdu)) + pdu
+        self.send(x224_data(sdr))
+
+    def clip_announce(self):
+        self.clip_send(2, 0, struct.pack("<I", 13) + b"\0" * 32 if self.clip_text else b"")
+
+    def clip_message(self, m):
+        mtype, flags, n = struct.unpack_from("<HHI", m)
+        d = m[8:8 + n]
+        if mtype == 1:  # monitor ready: our capabilities (general, version 2, no flags), our formats
+            self.clip_send(7, 0, struct.pack("<HHHHII", 1, 0, 1, 12, 2, 0))
+            self.clip_announce()
+            self.clip_ready.set()
+        elif mtype == 2:  # the guest copied something: take the text
+            self.clip_send(3, 1)
+            if any(struct.unpack_from("<I", d, i)[0] == 13 for i in range(0, len(d) - 3, 36)):
+                self.clip_send(4, 0, struct.pack("<I", 13))
+        elif mtype == 4:  # the guest pastes our text
+            fmt = struct.unpack_from("<I", d)[0]
+            if fmt == 13 and self.clip_text:
+                self.clip_send(5, 1, self.clip_text.replace("\n", "\r\n").encode("utf-16-le") + b"\0\0")
+            else:
+                self.clip_send(5, 2)
+        elif mtype == 5 and flags & 1:
+            text = d.decode("utf-16-le", "replace").split("\0")[0].replace("\r\n", "\n")
+            self.clip_got.append(text)
+            print(f"guest clipboard ({len(text)} characters):\n{text}".encode("ascii", "backslashreplace").decode())
 
     def fastpath(self, d):
         i = 0
@@ -147,7 +212,7 @@ class Client:
         neg = struct.pack("<BBHI", 1, 0, 8, 0)  # RDP_NEG_REQ: standard RDP security
         cookie = b"Cookie: mstshash=hv-rdp\r\n"
         cr = bytes([6 + len(cookie) + len(neg), 0xE0, 0, 0, 0, 0, 0]) + cookie + neg
-        self.s.sendall(tpkt(cr))
+        self.send(tpkt(cr))
         cc = self.read_pdu()
         if cc[5] != 0xD0:
             raise RuntimeError("no X.224 connection confirm")
@@ -158,7 +223,7 @@ class Client:
         core += struct.pack("<HHIHHH", 0xCA01, 1, 0, 32, 0x000F, 0x0002)
         blocks = struct.pack("<HH", 0xC001, 4 + len(core)) + core
         blocks += struct.pack("<HHII", 0xC002, 12, 0, 0)
-        blocks += struct.pack("<HHI", 0xC003, 8, 0)
+        blocks += struct.pack("<HHI", 0xC003, 20, 1) + b"cliprdr\0" + struct.pack("<I", 0xC0A00000)
         gcc = b"\x00\x05\x00\x14\x7c\x00\x01"
         ccrq = b"\x00\x08\x00\x10\x00\x01\xc0\x00Duca" + per_len(len(blocks)) + blocks
         gcc += per_len(len(ccrq)) + ccrq
@@ -166,15 +231,15 @@ class Client:
         params = b"\x30" + ber_len(len(p)) + p
         body = b"\x04\x01\x01" + b"\x04\x01\x01" + b"\x01\x01\xff" + params * 3
         body += b"\x04" + ber_len(len(gcc)) + gcc
-        self.s.sendall(x224_data(b"\x7f\x65" + ber_len(len(body)) + body))
+        self.send(x224_data(b"\x7f\x65" + ber_len(len(body)) + body))
         self.read_pdu()  # connect response
 
-        self.s.sendall(x224_data(b"\x04\x01\x00\x01\x00"))  # erect domain
-        self.s.sendall(x224_data(b"\x28"))  # attach user
+        self.send(x224_data(b"\x04\x01\x00\x01\x00"))  # erect domain
+        self.send(x224_data(b"\x28"))  # attach user
         ac = self.read_pdu()
         self.user = 1001 + struct.unpack_from(">H", ac, 9)[0]
-        for ch in (self.user, 1003):
-            self.s.sendall(x224_data(b"\x38" + struct.pack(">HH", self.user - 1001, ch)))
+        for ch in (self.user, 1003, CLIP_CHANNEL):
+            self.send(x224_data(b"\x38" + struct.pack(">HH", self.user - 1001, ch)))
             self.read_pdu()
 
         info = struct.pack("<HH", 0x0040, 0) + struct.pack("<II5H", 0, 0x0033, 0, 0, 0, 0, 0) + b"\0" * 10
@@ -192,7 +257,7 @@ class Client:
 
     def send_io(self, data):
         sdr = b"\x64" + struct.pack(">HH", self.user - 1001, 1003) + b"\x70" + per_len(len(data)) + data
-        self.s.sendall(x224_data(sdr))
+        self.send(x224_data(sdr))
 
     def send_share(self, pdutype, body):
         self.send_io(struct.pack("<HHH", 6 + len(body), pdutype, self.user) + body)
@@ -211,7 +276,7 @@ class Client:
                 pdu = bytes([len(chunk) << 2, n]) + body
             else:
                 pdu = bytes([len(chunk) << 2]) + struct.pack(">H", 0x8000 | (n + 1)) + body
-            self.s.sendall(pdu)
+            self.send(pdu)
 
     @staticmethod
     def key_ev(code, release):
@@ -271,11 +336,24 @@ def main():
     for act in a.actions:
         verb, _, arg = act.partition(":")
         if verb == "type":
-            c.type(arg.encode().decode("unicode_escape"))
+            c.type(unescape(arg))
         elif verb == "key":
             code = int(arg, 16)
             c.events([c.key_ev(code, False)])
             c.events([c.key_ev(code, True)])
+        elif verb == "chord":
+            codes = [int(v, 16) for v in arg.split(",")]
+            for code in codes:
+                c.events([c.key_ev(code, False)])
+                time.sleep(0.03)
+            for code in reversed(codes):
+                c.events([c.key_ev(code, True)])
+                time.sleep(0.03)
+        elif verb == "clip":
+            if not c.clip_ready.wait(5):
+                sys.exit("the server never opened the clipboard")
+            c.clip_text = unescape(arg)
+            c.clip_announce()
         elif verb in ("move", "click", "dclick"):
             x, y = (int(v) for v in arg.split(","))
             if verb == "move":
@@ -296,7 +374,10 @@ def main():
     if c.closed:
         sys.exit("the server closed the connection")
     c.save_png(a.out)
-    print(f"{c.updates} bitmap updates; saved {a.out}")
+    if c.clip_got:  # the console's code page cannot be trusted with it
+        with open(a.out.rsplit(".", 1)[0] + "-clip.txt", "w", encoding="utf-8") as f:
+            f.write(c.clip_got[-1])
+    print(f"{c.updates} bitmap updates; saved {a.out}" + ("" if c.clip_ready.is_set() else "; no clipboard"))
     s.close()
 
 

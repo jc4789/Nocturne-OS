@@ -98,6 +98,7 @@ static int last_clock_min = -1;
 
 static char *clipboard;
 static size_t clipboard_len;
+static uint32_t clipboard_seq; /* bumped on every change, so a remote viewer can follow it */
 
 /* ---- damage tracking ---- */
 #define MAX_DAMAGE 32
@@ -1185,6 +1186,25 @@ void wm_screen_size(uint32_t *w, uint32_t *h) {
     *h = (uint32_t)sh;
 }
 
+bool wm_clipboard_set(const char *text, size_t n) {
+    if (n > WM_CLIPBOARD_MAX) return false;
+    char *nb = kmalloc(n + 1);
+    if (!nb) return false;
+    memcpy(nb, text, n);
+    nb[n] = 0;
+    if (clipboard) kfree(clipboard);
+    clipboard = nb;
+    clipboard_len = n;
+    clipboard_seq++;
+    return true;
+}
+
+const char *wm_clipboard(size_t *len, uint32_t *seq) {
+    *len = clipboard_len;
+    if (seq) *seq = clipboard_seq;
+    return clipboard ? clipboard : "";
+}
+
 /* ---- remote display ---- */
 
 /* Change the size of the desktop. The framebuffer keeps its own size (fb_present clips), so a
@@ -1440,16 +1460,9 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
     }
     case SYS_CLIPBOARD_SET: {
         size_t n = b;
-        if (n > 1 << 20) return -E2BIG;
+        if (n > WM_CLIPBOARD_MAX) return -E2BIG;
         if (!user_ok((void *)a, n)) return -EFAULT;
-        char *nb = kmalloc(n + 1);
-        if (!nb) return -ENOMEM;
-        memcpy(nb, (void *)a, n);
-        nb[n] = 0;
-        if (clipboard) kfree(clipboard);
-        clipboard = nb;
-        clipboard_len = n;
-        return 0;
+        return wm_clipboard_set((const char *)a, n) ? 0 : -ENOMEM;
     }
     case SYS_CLIPBOARD_GET: {
         size_t n = MIN(b, clipboard_len);

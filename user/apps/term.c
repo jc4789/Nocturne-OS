@@ -363,17 +363,32 @@ static void paste(void) {
 
 static void copy_screen(void) {
     char *buf = malloc(rows * (cols * 4 + 1) + 1);
-    int n = 0;
+    int n = 0, used = 0; /* used: the length up to the last line with text on it */
     for (int r = 0; r < rows; r++) {
         int end = cols;
         while (end > 0 && screen[r][end - 1].ch == ' ') end--;
-        for (int x = 0; x < end; x++) {
+        for (int x = 0; x < end; x++) { /* UTF-8 */
             uint32_t ch = screen[r][x].ch;
-            buf[n++] = ch < 128 ? (char)ch : '?';
+            if (ch < 0x80) {
+                buf[n++] = (char)ch;
+            } else if (ch < 0x800) {
+                buf[n++] = (char)(0xC0 | ch >> 6);
+                buf[n++] = (char)(0x80 | (ch & 0x3F));
+            } else if (ch < 0x10000) {
+                buf[n++] = (char)(0xE0 | ch >> 12);
+                buf[n++] = (char)(0x80 | (ch >> 6 & 0x3F));
+                buf[n++] = (char)(0x80 | (ch & 0x3F));
+            } else {
+                buf[n++] = (char)(0xF0 | ch >> 18);
+                buf[n++] = (char)(0x80 | (ch >> 12 & 0x3F));
+                buf[n++] = (char)(0x80 | (ch >> 6 & 0x3F));
+                buf[n++] = (char)(0x80 | (ch & 0x3F));
+            }
         }
         buf[n++] = '\n';
+        if (end) used = n;
     }
-    clipboard_set(buf, n);
+    clipboard_set(buf, used);
     free(buf);
 }
 

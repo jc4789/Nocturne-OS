@@ -25,8 +25,11 @@ public static class EsmWin {
 "@
 }
 $A = [System.Windows.Automation.AutomationElement]
-Get-Process vmconnect -ErrorAction SilentlyContinue | Stop-Process -Force
-$p = Start-Process vmconnect.exe -ArgumentList "localhost", $Name -PassThru
+# close an earlier window on this VM (only this one: others may be open on the user's own VMs)
+Get-CimInstance Win32_Process -Filter "Name = 'vmconnect.exe'" |
+    Where-Object { $_.CommandLine -match "(^|\s)`"?$([regex]::Escape($Name))`"?(\s|$)" } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+$p =Start-Process vmconnect.exe -ArgumentList "localhost", $Name -PassThru
 $cond = New-Object System.Windows.Automation.PropertyCondition($A::ProcessIdProperty, $p.Id)
 $win = $null
 for ($i = 0; $i -lt 40 -and -not $win; $i++) {

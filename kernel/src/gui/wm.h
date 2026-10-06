@@ -5,6 +5,12 @@
 void wm_init(void);           /* start the compositor thread */
 bool wm_running(void);
 void wm_screen_size(uint32_t *w, uint32_t *h); /* the desktop's size, which a remote viewer may have changed */
+
+/* The clipboard: UTF-8 text. wm_clipboard() returns it (valid until the next change, so use it
+   before blocking) and a number that changes whenever the text does. */
+#define WM_CLIPBOARD_MAX (1 << 20)
+bool wm_clipboard_set(const char *text, size_t n);
+const char *wm_clipboard(size_t *len, uint32_t *seq);
 void wm_process_exit(int pid);
 int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
 void wm_notify(const char *title, const char *text); /* desktop toast */

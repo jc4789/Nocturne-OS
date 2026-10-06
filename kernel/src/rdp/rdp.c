@@ -9,8 +9,9 @@
      - output as fast-path updates: uncompressed bitmaps in 64x64 tiles (only tiles that
        changed are sent) and the pointer shape;
      - input as fast-path or slow-path events: scancodes, Unicode characters, mouse and wheel.
-   Virtual channels (clipboard, sound, drives) are joined but ignored. The desktop takes the
-   size the client asks for when it connects, and goes back to its own when it leaves. */
+   Of the virtual channels only the clipboard's is used (text both ways); sound, drives and
+   printers are joined but ignored. The desktop takes the size the client asks for when it
+   connects, and goes back to its own when it leaves. */
 #include "kernel.h"
 #include "dev/input.h"
 #include "gui/wm.h"
@@ -164,7 +165,16 @@ struct rdp {
     int width, height, bpp;
     uint16_t user_id;
     uint16_t channel_ids[16];
+    char channel_names[16][9];
+    uint32_t channel_opts[16];
     int nchannels;
+    /* the clipboard channel */
+    int clip;              /* index into channel_ids, -1 without one */
+    bool clip_ready;       /* the client has sent its first format list */
+    uint32_t clip_seq;     /* the local clipboard as the client last heard of it */
+    uint32_t clip_wanted;  /* the format we asked the client for */
+    uint8_t *vc_buf;       /* a channel message being reassembled */
+    uint32_t vc_len, vc_total;
     bool fastpath_output, attached, active, suppress;
     uint32_t *shadow; /* the picture the client has, for spotting changed tiles */
     uint8_t *dirty;   /* tiles to look at */
@@ -332,8 +342,15 @@ static void client_core(struct rdp *c, struct rbuf *b) {
 static void client_net(struct rdp *c, struct rbuf *b) {
     uint32_t n = r32(b);
     for (uint32_t i = 0; i < n && !b->err; i++) {
-        rskip(b, 8 + 4); /* name and options: the channels are joined but carry nothing */
-        if (c->nchannels < (int)ARRAY_SIZE(c->channel_ids)) c->channel_ids[c->nchannels++] = (uint16_t)(1004 + i);
+        char name[9] = {0};
+        for (int j = 0; j < 8; j++) name[j] = (char)r8(b);
+        uint32_t opts = r32(b);
+        if (c->nchannels == (int)ARRAY_SIZE(c->channel_ids)) continue;
+        int k = c->nchannels++;
+        c->channel_ids[k] = (uint16_t)(1004 + i);
+        memcpy(c->channel_names[k], name, sizeof name);
+        c->channel_opts[k] = opts;
+        if (!strcmp(name, "cliprdr")) c->clip = k;
     }
 }
 
@@ -799,6 +816,245 @@ static void slowpath_input(struct rdp *c, struct rbuf *r) {
     }
 }
 
+/* ---- static virtual channels ---- */
+
+#define CHANNEL_FLAG_FIRST         0x01
+#define CHANNEL_FLAG_LAST          0x02
+#define CHANNEL_FLAG_SHOW_PROTOCOL 0x10
+#define CHANNEL_OPTION_SHOW_PROTOCOL 0x00200000
+#define CHANNEL_CHUNK 1600 /* what every client takes */
+
+/* Send one channel message, split into chunks. */
+static int vc_send(struct rdp *c, int k, const uint8_t *data, uint32_t len) {
+    uint32_t show = (c->channel_opts[k] & CHANNEL_OPTION_SHOW_PROTOCOL) ? CHANNEL_FLAG_SHOW_PROTOCOL : 0;
+    uint32_t off = 0;
+    do {
+        uint32_t n = MIN(CHANNEL_CHUNK, len - off);
+        struct wbuf w = x224_begin(c);
+        uint32_t start = sdi_begin(&w, c->channel_ids[k]);
+        w32(&w, len);
+        w32(&w, (off == 0 ? CHANNEL_FLAG_FIRST : 0) | (off + n == len ? CHANNEL_FLAG_LAST : 0) | show);
+        wbytes(&w, data + off, n);
+        sdi_end(&w, start);
+        int r = x224_end(c, &w);
+        if (r) return r;
+        off += n;
+    } while (off < len);
+    return 0;
+}
+
+/* ---- the clipboard (MS-RDPECLIP), text only ----
+   Whoever copies announces the formats it has (a format list); the other side asks for the one
+   it wants when it needs it. Windows' copy is fetched as soon as it is announced, so a paste in
+   Nocturne finds it in the clipboard; ours is announced whenever it changes. */
+
+enum { CB_MONITOR_READY = 1, CB_FORMAT_LIST, CB_FORMAT_LIST_RESPONSE, CB_FORMAT_DATA_REQUEST,
+       CB_FORMAT_DATA_RESPONSE, CB_TEMP_DIRECTORY, CB_CLIP_CAPS };
+#define CB_RESPONSE_OK   1
+#define CB_RESPONSE_FAIL 2
+#define CF_TEXT        1
+#define CF_UNICODETEXT 13
+
+static int clip_send(struct rdp *c, uint16_t type, uint16_t flags, const void *data, uint32_t len) {
+    uint8_t *m = kmalloc(8 + len);
+    if (!m) return 0; /* a lost clipboard message is not worth the session */
+    struct wbuf w = {m, 0, 8 + len};
+    w16(&w, type);
+    w16(&w, flags);
+    w32(&w, len);
+    if (len) wbytes(&w, data, len);
+    int r = vc_send(c, c->clip, m, w.n);
+    kfree(m);
+    return r;
+}
+
+static int clip_start(struct rdp *c) {
+    if (c->clip < 0) return 0;
+    wm_clipboard(&(size_t){0}, &c->clip_seq); /* what we have now is not news */
+    static const uint8_t caps[] = {1, 0, 0, 0, /* one set, the general one: */
+                                   1, 0, 12, 0, 2, 0, 0, 0, 0, 0, 0, 0}; /* version 2, short format names */
+    int r = clip_send(c, CB_CLIP_CAPS, 0, caps, sizeof caps);
+    return r ? r : clip_send(c, CB_MONITOR_READY, 0, NULL, 0);
+}
+
+/* UTF-8 (LF line ends) to UTF-16LE bytes (CRLF), with a terminating 0; out NULL just counts.
+   Returns the size in bytes. */
+static uint32_t to_utf16(const char *s, size_t n, uint8_t *out) {
+    uint32_t o = 0;
+#define PUT(u)                                                                                          \
+    do {                                                                                                \
+        if (out) {                                                                                      \
+            out[o] = (uint8_t)(u);                                                                      \
+            out[o + 1] = (uint8_t)((u) >> 8);                                                           \
+        }                                                                                               \
+        o += 2;                                                                                         \
+    } while (0)
+    for (size_t i = 0; i < n;) {
+        uint8_t b = (uint8_t)s[i];
+        uint32_t cp = 0xFFFD;
+        int len = 1;
+        if (b < 0x80) cp = b;
+        else if ((b & 0xE0) == 0xC0 && i + 1 < n) cp = (b & 0x1Fu) << 6 | (s[i + 1] & 0x3F), len = 2;
+        else if ((b & 0xF0) == 0xE0 && i + 2 < n)
+            cp = (b & 0x0Fu) << 12 | (s[i + 1] & 0x3Fu) << 6 | (s[i + 2] & 0x3F), len = 3;
+        else if ((b & 0xF8) == 0xF0 && i + 3 < n)
+            cp = (b & 0x07u) << 18 | (s[i + 1] & 0x3Fu) << 12 | (s[i + 2] & 0x3Fu) << 6 | (s[i + 3] & 0x3F), len = 4;
+        if (cp == '\n' && (i == 0 || s[i - 1] != '\r')) PUT('\r');
+        if (cp > 0xFFFF) {
+            cp -= 0x10000;
+            PUT(0xD800 | cp >> 10);
+            PUT(0xDC00 | (cp & 0x3FF));
+        } else {
+            PUT(cp);
+        }
+        i += (size_t)len;
+    }
+    PUT(0);
+#undef PUT
+    return o;
+}
+
+/* UTF-16LE bytes (up to a 0) to UTF-8 with LF line ends; out NULL just counts. */
+static size_t from_utf16(const uint8_t *p, uint32_t n, char *out) {
+    size_t o = 0;
+    for (uint32_t i = 0; i + 1 < n; i += 2) {
+        uint32_t u = p[i] | p[i + 1] << 8;
+        if (!u) break;
+        if (u == '\r' && i + 3 < n && p[i + 2] == '\n' && !p[i + 3]) continue;
+        if (u >= 0xD800 && u < 0xDC00 && i + 3 < n) {
+            uint32_t lo = p[i + 2] | p[i + 3] << 8;
+            if (lo >= 0xDC00 && lo < 0xE000) {
+                u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00);
+                i += 2;
+            }
+        }
+        char b[4];
+        int k;
+        if (u < 0x80) b[0] = (char)u, k = 1;
+        else if (u < 0x800) b[0] = (char)(0xC0 | u >> 6), b[1] = (char)(0x80 | (u & 0x3F)), k = 2;
+        else if (u < 0x10000)
+            b[0] = (char)(0xE0 | u >> 12), b[1] = (char)(0x80 | (u >> 6 & 0x3F)), b[2] = (char)(0x80 | (u & 0x3F)), k = 3;
+        else
+            b[0] = (char)(0xF0 | u >> 18), b[1] = (char)(0x80 | (u >> 12 & 0x3F)),
+            b[2] = (char)(0x80 | (u >> 6 & 0x3F)), b[3] = (char)(0x80 | (u & 0x3F)), k = 4;
+        if (out) memcpy(out + o, b, (size_t)k);
+        o += (size_t)k;
+    }
+    return o;
+}
+
+/* the client wants our text */
+static int clip_data_request(struct rdp *c, uint32_t format) {
+    size_t n;
+    const char *text = wm_clipboard(&n, NULL);
+    uint8_t *d = NULL;
+    uint32_t len = 0;
+    if (format == CF_UNICODETEXT) {
+        len = to_utf16(text, n, NULL);
+        if ((d = kmalloc(len))) to_utf16(text, n, d);
+    } else if (format == CF_TEXT) { /* ASCII only, CRLF */
+        if ((d = kmalloc(n * 2 + 1)))
+            for (size_t i = 0; i < n; i++) {
+                uint8_t b = (uint8_t)text[i];
+                if (b == '\n' && (i == 0 || text[i - 1] != '\r')) d[len++] = '\r';
+                if (b < 0x80) d[len++] = b;
+                else if ((b & 0xC0) != 0x80) d[len++] = '?';
+            }
+        if (d) d[len++] = 0;
+    }
+    int r = d ? clip_send(c, CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, d, len)
+              : clip_send(c, CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_FAIL, NULL, 0);
+    kfree(d);
+    return r;
+}
+
+/* the client's text arrived (the answer to the request clip_message sent) */
+static void clip_data(struct rdp *c, const uint8_t *p, uint32_t n, uint32_t format) {
+    char *t = NULL;
+    size_t len = 0;
+    if (format == CF_UNICODETEXT) {
+        len = from_utf16(p, n, NULL);
+        if (len > WM_CLIPBOARD_MAX || !(t = kmalloc(len + 1))) return;
+        from_utf16(p, n, t);
+    } else {
+        if (!(t = kmalloc(n + 1))) return;
+        for (uint32_t i = 0; i < n && p[i]; i++)
+            if (!(p[i] == '\r' && i + 1 < n && p[i + 1] == '\n')) t[len++] = p[i] < 0x80 ? (char)p[i] : '?';
+    }
+    wm_clipboard_set(t, len);
+    kfree(t);
+    wm_clipboard(&len, &c->clip_seq); /* do not announce it back */
+}
+
+static int clip_message(struct rdp *c, const uint8_t *m, uint32_t n) {
+    if (n < 8) return 0;
+    uint16_t type = (uint16_t)(m[0] | m[1] << 8), flags = (uint16_t)(m[2] | m[3] << 8);
+    uint32_t dlen = m[4] | m[5] << 8 | (uint32_t)m[6] << 16 | (uint32_t)m[7] << 24;
+    const uint8_t *d = m + 8;
+    dlen = MIN(dlen, n - 8);
+    switch (type) {
+    case CB_FORMAT_LIST: {
+        /* 36-byte entries, a format id and a short name: our capabilities leave out long names */
+        bool unicode = false, ansi = false;
+        for (uint32_t i = 0; i + 4 <= dlen; i += 36) {
+            uint32_t id = d[i] | d[i + 1] << 8 | (uint32_t)d[i + 2] << 16 | (uint32_t)d[i + 3] << 24;
+            unicode |= id == CF_UNICODETEXT;
+            ansi |= id == CF_TEXT;
+        }
+        c->clip_ready = true;
+        int r = clip_send(c, CB_FORMAT_LIST_RESPONSE, CB_RESPONSE_OK, NULL, 0);
+        if (r || (!unicode && !ansi)) return r;
+        c->clip_wanted = unicode ? CF_UNICODETEXT : CF_TEXT;
+        uint8_t req[4] = {(uint8_t)c->clip_wanted, 0, 0, 0};
+        return clip_send(c, CB_FORMAT_DATA_REQUEST, 0, req, 4);
+    }
+    case CB_FORMAT_DATA_REQUEST:
+        if (dlen < 4) return 0;
+        return clip_data_request(c, d[0] | d[1] << 8 | (uint32_t)d[2] << 16 | (uint32_t)d[3] << 24);
+    case CB_FORMAT_DATA_RESPONSE:
+        if (flags & CB_RESPONSE_OK) clip_data(c, d, dlen, c->clip_wanted);
+        return 0;
+    default: /* capabilities, temporary directory, list responses, locks */
+        return 0;
+    }
+}
+
+/* our clipboard changed: tell the client we have text */
+static int clip_poll(struct rdp *c) {
+    if (c->clip < 0 || !c->clip_ready) return 0;
+    size_t n;
+    uint32_t seq;
+    wm_clipboard(&n, &seq);
+    if (seq == c->clip_seq) return 0;
+    c->clip_seq = seq;
+    uint8_t list[36] = {CF_UNICODETEXT}; /* one short-name entry, no name */
+    return clip_send(c, CB_FORMAT_LIST, 0, list, sizeof list);
+}
+
+/* Data on a static virtual channel: reassemble each message, then hand it over. */
+static int vc_data(struct rdp *c, uint16_t channel, struct rbuf *r) {
+    if (c->clip < 0 || channel != c->channel_ids[c->clip]) return 0; /* the others carry nothing we do */
+    uint32_t total = r32(r), flags = r32(r);
+    if (r->err) return 0;
+    if (flags & CHANNEL_FLAG_FIRST) {
+        kfree(c->vc_buf);
+        c->vc_buf = NULL;
+        if (total > 4 * WM_CLIPBOARD_MAX + 64) return 0;
+        c->vc_buf = kmalloc(MAX(total, 1u));
+        c->vc_total = total;
+        c->vc_len = 0;
+    }
+    if (!c->vc_buf) return 0;
+    uint32_t n = MIN(rleft(r), c->vc_total - c->vc_len);
+    memcpy(c->vc_buf + c->vc_len, r->p + r->pos, n);
+    c->vc_len += n;
+    if (!(flags & CHANNEL_FLAG_LAST)) return 0;
+    int e = clip_message(c, c->vc_buf, c->vc_len);
+    kfree(c->vc_buf);
+    c->vc_buf = NULL;
+    return e;
+}
+
 /* ---- share control PDUs from the client ---- */
 
 static int share_pdu(struct rdp *c, struct rbuf *r) {
@@ -825,8 +1081,11 @@ static int share_pdu(struct rdp *c, struct rbuf *r) {
     }
     case PDUTYPE2_FONTLIST: {
         int e = send_data_pdu(c, PDUTYPE2_FONTMAP, fill_fontmap, NULL);
-        if (!c->active) kprintf("rdp: session with \"%s\" is up, %dx%d at %d bpp\n", c->client_name, c->width,
-                                c->height, c->bpp);
+        if (!c->active) {
+            kprintf("rdp: session with \"%s\" is up, %dx%d at %d bpp\n", c->client_name, c->width, c->height,
+                    c->bpp);
+            if (!e) e = clip_start(c);
+        }
         c->active = true;
         c->pointer_shape = -1;
         refresh_all(c);
@@ -914,7 +1173,7 @@ static int mcs_pdu(struct rdp *c, int len) {
         if (r.err || dlen > rleft(&r)) return 0;
         r.n = r.pos + dlen;
         if (channel == IO_CHANNEL) return io_data(c, &r);
-        return 0; /* virtual channel data: not supported */
+        return vc_data(c, channel, &r);
     }
     default: return 0;
     }
@@ -925,6 +1184,7 @@ static void session(void *arg) {
     struct hvsock *s = arg;
     if (!c) goto out;
     c->s = s;
+    c->clip = -1;
     c->in = kmalloc(MAX_PDU);
     c->out = kmalloc(MAX_PDU);
     if (!c->in || !c->out) goto out;
@@ -961,6 +1221,7 @@ static void session(void *arg) {
             else if ((c->in[0] & 3) == 0) fastpath_input(c, len);
         }
         if (!err) err = push_updates(c);
+        if (!err) err = clip_poll(c);
     }
     if (c->active && err != -EPIPE) kprintf("rdp: session with \"%s\" failed (%d)\n", c->client_name, err);
     else if (c->active) kprintf("rdp: session with \"%s\" ended\n", c->client_name);
@@ -971,6 +1232,7 @@ out:
         kfree(c->out);
         kfree(c->shadow);
         kfree(c->dirty);
+        kfree(c->vc_buf);
         kfree(c);
     }
     hvsock_close(s);
