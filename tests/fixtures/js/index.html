@@ -1,0 +1,92 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Nocturne JavaScript acceptance</title>
+<link rel="stylesheet" href="fixture.css">
+<script src="classic-defer.js" defer></script>
+<script src="classic-async.js" async></script>
+<script type="module" src="modules/main.mjs"></script>
+</head><body>
+<h1>Nocturne / QuickJS</h1>
+<p>This is an acceptance fixture, not a claim that it has been run.</p>
+<p>Open through the fixture server for fetch and cross-origin checks. Local opening also exercises same-directory scripts and modules.</p>
+<div id="status">JavaScript has not started.</div>
+<ol id="results"></ol>
+<script>
+globalThis.fixtureOrder = [];
+globalThis.record = function (name, ok, detail) {
+    const row = document.createElement('li');
+    row.textContent = (ok ? 'PASS: ' : 'FAIL: ') + name + (detail ? ' — ' + detail : '');
+    row.className = ok ? 'pass' : 'fail';
+    document.getElementById('results').appendChild(row);
+    console[ok ? 'log' : 'error'](row.textContent);
+};
+fixtureOrder.push('parser');
+record('parser pauses before later HTML', document.getElementById('future') === null);
+record('currentScript is the parser script', document.currentScript && document.currentScript.localName === 'script');
+document.write('<p id="written">Inserted by document.write at the parser position.</p>');
+document.write('<p id="written-second">Second write preserves order.</p>');
+</script>
+<p id="future">This element occurs after the parser-blocking script.</p>
+<div id="playground"></div>
+<button id="counter" type="button">Counter: 0</button>
+<form id="cancel-form" action="/must-not-submit" method="post">
+<input id="name" name="name" value="Nocturne"><button id="submit" type="submit">Submit (cancelled by JavaScript)</button>
+</form>
+<p><button id="fetch-button" type="button">Fetch JSON / POST</button> <span id="fetch-status">idle</span></p>
+<p><a href="network.html">Network and cancellation checks</a> · <a href="limits.html">Explicit execution / memory limit checks</a> · <a href="lifetime.html">Navigation / lifetime check</a></p>
+<script>
+fixtureOrder.push('body');
+const playground = document.getElementById('playground');
+const box = document.createElement('div'); box.id='dynamic'; box.classList.add('card','selected');
+box.dataset.source='native-dom'; box.textContent='This box is created in the existing native DOM.';
+box.style.backgroundColor='#d9cef6'; box.style.padding='12px'; playground.appendChild(box);
+record('wrapper identity', document.getElementById('dynamic') === box);
+record('existing selector engine', document.querySelector('#playground > .card.selected') === box);
+record('attribute cache / classList', box.matches('.selected') && box.dataset.source === 'native-dom');
+box.classList.remove('selected'); record('class mutation invalidates selectors', !box.matches('.selected'));
+const detached=box; box.remove(); record('detached node survives', !detached.isConnected && detached.textContent.length>0);
+playground.appendChild(detached); record('detached identity after reattach', document.getElementById('dynamic')===detached);
+const fragment=document.createDocumentFragment(); fragment.append('fragment ',document.createElement('strong'));
+fragment.lastChild.textContent='children'; playground.appendChild(fragment);
+record('DocumentFragment transfers children', fragment.childNodes.length===0 && playground.lastChild.textContent==='children');
+globalThis.inertExecuted=false;
+const inert=document.createElement('div'); inert.innerHTML='<span class="inner">fragment parse</span><script>inertExecuted=true;<\/script>';
+playground.appendChild(inert); record('innerHTML scripts remain inert', !inertExecuted && inert.querySelector('.inner').textContent==='fragment parse');
+const clone=box.cloneNode(true); clone.id='clone'; playground.appendChild(clone);
+record('deep clone is a different native node', clone!==box && clone.textContent===box.textContent);
+const r=box.getBoundingClientRect();record('layout is flushed before geometry',r.width>0&&r.height>0);
+const dynamicScript=document.createElement('script'); dynamicScript.text='globalThis.dynamicRan=true;'; document.body.appendChild(dynamicScript);
+record('dynamic inline script runs synchronously', globalThis.dynamicRan===true);
+let clicks=0; const counter=document.getElementById('counter');
+counter.addEventListener('click',()=>{clicks++;counter.textContent='Counter: '+clicks;});counter.click();
+record('click handler updates the native DOM', clicks===1 && counter.textContent==='Counter: 1');
+const order=[]; playground.addEventListener('probe',()=>order.push('capture'),true);
+box.addEventListener('probe',e=>{order.push('target');e.preventDefault();});
+playground.addEventListener('probe',()=>order.push('bubble'));
+const permitted=box.dispatchEvent(new Event('probe',{bubbles:true,cancelable:true}));
+record('capture / target / bubble / preventDefault',!permitted&&order.join(',')==='capture,target,bubble');
+const form=document.getElementById('cancel-form');let submissions=0;
+form.addEventListener('submit',e=>{e.preventDefault();submissions++;document.getElementById('status').textContent='Form submission cancelled.';});
+document.getElementById('submit').click();record('form default is cancelled',submissions===1);
+const microtasks=[];Promise.resolve().then(()=>microtasks.push('promise'));queueMicrotask(()=>microtasks.push('queueMicrotask'));
+setTimeout(()=>record('microtasks run before timers',microtasks.join(',')==='promise,queueMicrotask'),0);
+let timerTicks=0;const interval=setInterval(()=>{timerTicks++;if(timerTicks===3){clearInterval(interval);record('interval and cancellation',true);}},30);
+const cancelled=setTimeout(()=>record('cancelled timer MUST NOT fire',false),10);clearTimeout(cancelled);
+requestAnimationFrame(t=>record('animation frame receives monotonic time',Number.isFinite(t)&&t>=0));
+document.getElementById('fetch-button').addEventListener('click',async()=>{
+    const out=document.getElementById('fetch-status');out.textContent='loading';
+    try{
+        const a=await fetch('/api/json');const json=await a.json();
+        record('fetch JSON response',a.ok&&json.ok===true);
+        const b=await fetch('/api/echo?fixture=1',{method:'POST',headers:{'Content-Type':'text/plain'},body:'Nocturne'});
+        const text=await b.text();record('POST response body',b.ok&&text.includes('Nocturne'));out.textContent='done';
+    }catch(e){out.textContent='failed: '+e.message;record('fetch operation',false,e.message);}
+});
+document.addEventListener('DOMContentLoaded',()=>{
+    record('defer / module precede DOMContentLoaded',globalThis.deferRan===true&&globalThis.moduleRan===true);
+    record('written nodes exist',document.getElementById('written').nextSibling===document.getElementById('written-second'));
+    try{document.write('MUST NOT WRITE');record('late document.write rejected',false);}catch(e){record('late document.write rejected',true);}
+    document.getElementById('status').textContent='DOM ready. Click the counter and fetch buttons.';
+});
+window.addEventListener('load',()=>record('window load follows DOMContentLoaded',document.readyState==='complete'));
+</script>
+</body></html>

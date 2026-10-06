@@ -1,0 +1,6 @@
+body { font-family: sans-serif; padding: 24px; color: #24213b; background: #f6f2ff; }
+button { margin: 4px; padding: 8px; }
+.pass { color: #23672e; }
+.fail { color: #a92735; font-weight: bold; }
+.card { margin: 8px 0; border: 1px solid #7d5fbb; }
+#status { padding: 10px; background: #e6dff8; }

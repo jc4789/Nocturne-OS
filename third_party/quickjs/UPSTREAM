@@ -1,0 +1,3 @@
+QuickJS 2026-06-04
+commit 535a7c250ff4a577ec36c3e103daab6dadeea650
+Source: user-provided quickjs clone. Nocturne changes are guarded by CONFIG_NOCTURNE.

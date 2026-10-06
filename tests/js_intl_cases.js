@@ -1,0 +1,81 @@
+/* Common Intl contracts on the shipped English/Japanese CLDR data. These
+ * supplement real browser/site runs and never substitute for them. */
+async function runIntlCases() {
+    let checks=0;const eq=(a,b)=>{checks++;if(!Object.is(a,b))throw Error(String(a)+' != '+String(b));};
+    const nextTask=()=>new Promise(resolve=>setTimeout(resolve,0));
+    const ok=x=>eq(!!x,true);
+    const throws=(fn,name)=>{checks++;try{fn();}catch(e){if(e.name===name)return;throw e;}throw Error('Expected '+name);};
+    eq(Intl.getCanonicalLocales(['EN-us','ja-jp','en-US']).join(','),'en-US,ja-JP');
+    eq(Intl.getCanonicalLocales('iw').join(','),'he');eq(Intl.getCanonicalLocales().length,0);
+    throws(()=>Intl.getCanonicalLocales('en_US'),'RangeError');throws(()=>Intl.getCanonicalLocales([null]),'TypeError');
+    throws(()=>Intl.getCanonicalLocales('en-u-ca-gregory-ca-buddhist-!'),'RangeError');
+    const locale=new Intl.Locale('ja-jp-u-ca-gregory-nu-latn');
+    eq(locale.language,'ja');eq(locale.region,'JP');eq(locale.calendar,'gregory');eq(locale.numberingSystem,'latn');
+    eq(locale.baseName,'ja-JP');eq(new Intl.Locale('ja').maximize().toString(),'ja-Jpan-JP');
+    eq(new Intl.Locale('ja-Jpan-JP').minimize().toString(),'ja');eq(new Intl.Locale('zh-TW').maximize().toString(),'zh-Hant-TW');
+    throws(()=>new Intl.Locale('en_US'),'RangeError');throws(()=>Intl.Locale('en'),'TypeError');
+    for(const name of ['NumberFormat','DateTimeFormat','PluralRules','RelativeTimeFormat','ListFormat','DisplayNames']) {
+        const C=Intl[name];eq(typeof C,'function');
+        eq(C.supportedLocalesOf(['en-US','ja-JP','zz-ZZ']).join(','),'en-US,ja-JP');
+        eq(C.supportedLocalesOf('fr').length,0);
+        throws(()=>C.supportedLocalesOf('en_US'),'RangeError');
+        throws(()=>C.supportedLocalesOf('en',{localeMatcher:'invalid'}),'RangeError');
+    }
+    await nextTask();
+    const nf=new Intl.NumberFormat('en-US');eq(nf.format(1234.5),'1,234.5');eq(nf.format(-0),'-0');
+    eq(nf.format(NaN),'NaN');eq(nf.format(Infinity),'∞');eq(nf.format(12345678901234567890n),'12,345,678,901,234,567,890');
+    eq(nf.formatToParts(1234.5).map(x=>x.value).join(''),nf.format(1234.5));
+    eq(nf.format,nf.format);eq(nf.format.call(null,3),'3');
+    eq(new Intl.NumberFormat('en',{style:'percent'}).format(.42),'42%');
+    eq(new Intl.NumberFormat('en',{style:'currency',currency:'USD'}).format(12.5),'$12.50');
+    eq(new Intl.NumberFormat('ja',{style:'currency',currency:'JPY'}).format(1234.5),'￥1,235');
+    eq(new Intl.NumberFormat('en',{style:'unit',unit:'byte'}).format(12),'12 byte');
+    eq(new Intl.NumberFormat('en',{notation:'compact'}).format(1200),'1.2K');
+    eq(new Intl.NumberFormat('en',{minimumFractionDigits:2,maximumFractionDigits:2}).format(1.005),'1.01');
+    eq(new Intl.NumberFormat('en',{useGrouping:false}).format(12345),'12345');
+    ok(nf.formatRange(1,3).includes('1'));ok(nf.formatRangeToParts(1,3).some(x=>x.source==='endRange'));
+    throws(()=>new Intl.NumberFormat('en',{style:'currency'}),'TypeError');
+    throws(()=>new Intl.NumberFormat('en',{style:'currency',currency:'INVALID'}),'RangeError');
+    throws(()=>new Intl.NumberFormat('en',{style:'unit',unit:'invalid'}),'RangeError');
+    throws(()=>new Intl.NumberFormat('en',{minimumFractionDigits:4,maximumFractionDigits:2}),'RangeError');
+    throws(()=>nf.format(Symbol()),'TypeError');
+    await nextTask();
+    const en=new Intl.PluralRules('en'),ja=new Intl.PluralRules('ja');
+    eq(en.select(1),'one');eq(en.select(2),'other');eq(en.select(NaN),'other');eq(en.select(-1),'one');eq(ja.select(1),'other');
+    const ordinal=new Intl.PluralRules('en',{type:'ordinal'});
+    eq([1,2,3,4,11,21].map(x=>ordinal.select(x)).join(','),'one,two,few,other,other,one');
+    throws(()=>new Intl.PluralRules('en',{type:'invalid'}),'RangeError');
+    await nextTask();
+    const date=Date.UTC(2020,0,2,3,4,5),opts={timeZone:'UTC',year:'numeric',month:'2-digit',day:'2-digit'};
+    const df=new Intl.DateTimeFormat('en',opts),parts=df.formatToParts(date);
+    eq(df.format(date),'01/02/2020');eq(parts.map(x=>x.value).join(''),df.format(date));
+    eq(new Intl.DateTimeFormat('ja',opts).format(date),'2020/01/02');
+    await nextTask();
+    eq(df.resolvedOptions().timeZone,'UTC');eq(df.format,df.format);
+    eq(new Intl.DateTimeFormat('en',{timeZone:'Asia/Tokyo',hour:'2-digit',hourCycle:'h23'}).format(date),'12');
+    const ny=new Intl.DateTimeFormat('en',{timeZone:'America/New_York',hour:'2-digit',hourCycle:'h23'});
+    eq(ny.format(Date.UTC(2024,0,1,12)),'07');eq(ny.format(Date.UTC(2024,6,1,12)),'08');
+    eq(new Intl.DateTimeFormat('en',{timeZone:'+05:30',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(date),'08:34');
+    ok(df.formatRange(date,date+86400000).length>0);ok(df.formatRangeToParts(date,date+86400000).some(x=>x.source==='endRange'));
+    throws(()=>new Intl.DateTimeFormat('en',{timeZone:'Invalid/Zone'}),'RangeError');
+    throws(()=>df.format(NaN),'RangeError');throws(()=>df.format(1n),'TypeError');
+    // Current ECMA-402 PartitionDateTimeRangePattern accepts descending ranges;
+    // both instants collapse when the displayed fields are equal.
+    eq(df.formatRange(date,date-1),df.format(date));
+    throws(()=>df.formatRange(date,NaN),'RangeError');
+    await nextTask();
+    const relative=new Intl.RelativeTimeFormat('en',{numeric:'auto'});
+    eq(relative.format(-1,'day'),'yesterday');eq(new Intl.RelativeTimeFormat('ja',{numeric:'auto'}).format(-1,'day'),'昨日');
+    eq(new Intl.RelativeTimeFormat('en').format(2,'day'),'in 2 days');
+    eq(new Intl.RelativeTimeFormat('en').formatToParts(2,'day').map(x=>x.value).join(''),'in 2 days');
+    throws(()=>relative.format(1,'invalid'),'RangeError');throws(()=>relative.format(Infinity,'day'),'RangeError');
+    eq(new Intl.ListFormat('en').format(['A','B','C']),'A, B, and C');
+    eq(new Intl.ListFormat('ja').format(['A','B','C']),'A、B、C');
+    throws(()=>new Intl.ListFormat('en').format([1,2]),'TypeError');
+    eq(new Intl.DisplayNames('en',{type:'language'}).of('ja'),'Japanese');
+    eq(new Intl.DisplayNames('ja',{type:'region'}).of('US'),'アメリカ合衆国');
+    throws(()=>new Intl.DisplayNames('en',{type:'invalid'}),'RangeError');
+    eq((1234.5).toLocaleString('en'),'1,234.5');eq(new Date(date).toLocaleDateString('en',opts),'01/02/2020');
+    eq(new Intl.NumberFormat('zz').resolvedOptions().locale,'en');
+    return checks;
+}

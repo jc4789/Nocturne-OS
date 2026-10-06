@@ -15,6 +15,7 @@ struct font {
     float unit_scale;              /* pixels per font unit at 1 px/em */
     int16_t *adv;                  /* advance width per glyph in font units, INT16_MIN = not looked up */
     uint16_t lo_glyph[0x250];      /* glyph index for code points below 0x250, 0xFFFF = not looked up */
+    bool ui_fallback;             /* only the default family uses the bundled CN fallback */
 };
 
 static int next_font_id = 1;
@@ -43,9 +44,17 @@ font_t *font_open(const char *path) {
     stbtt_GetFontVMetrics(&f->info, &f->ascent, &f->descent, &f->line_gap);
     f->unit_scale = stbtt_ScaleForMappingEmToPixels(&f->info, 1.0f);
     f->adv = malloc(sizeof(int16_t) * (size_t)(f->info.numGlyphs > 0 ? f->info.numGlyphs : 1));
+    if (!f->adv) { free(f->data); free(f); return NULL; }
     for (int i = 0; i < f->info.numGlyphs; i++) f->adv[i] = INT16_MIN;
     memset(f->lo_glyph, 0xFF, sizeof f->lo_glyph);
     return f;
+}
+
+static font_t *open_bundled(const char *name) {
+    const char *dir = getenv("FONT_DIR");
+    char path[256];
+    snprintf(path, sizeof path, "%s/%s", dir && *dir ? dir : "/usr/share/fonts", name);
+    return font_open(path);
 }
 
 font_t *font_ui(int style) {
@@ -53,11 +62,10 @@ font_t *font_ui(int style) {
     static bool tried[4];
     style &= 3;
     if (!tried[style]) {
-        static const char *names[4] = {"Inter-Regular.ttf", "Inter-Bold.ttf", "Inter-Italic.ttf", "Inter-BoldItalic.ttf"};
-        const char *dir = getenv("FONT_DIR");
-        char path[256];
-        snprintf(path, sizeof path, "%s/%s", dir && *dir ? dir : "/usr/share/fonts", names[style]);
-        cache[style] = font_open(path);
+        static const char *names[4] = {"MapleMono-NF-Regular.ttf", "MapleMono-NF-Bold.ttf",
+                                      "MapleMono-NF-Italic.ttf", "MapleMono-NF-BoldItalic.ttf"};
+        cache[style] = open_bundled(names[style]);
+        if (cache[style]) cache[style]->ui_fallback = true;
         tried[style] = true;
         if (!cache[style] && style) cache[style] = font_ui(FONT_REGULAR); /* a missing style falls back */
     }
@@ -70,6 +78,23 @@ static int glyph_of(font_t *f, uint32_t cp) {
         return f->lo_glyph[cp];
     }
     return stbtt_FindGlyphIndex(&f->info, (int)cp);
+}
+
+/* Measurement and rasterization must resolve exactly the same face. Keep the
+   20 MB CN face shared and lazy instead of duplicating it for every style.
+   font_open() remains a single-face API; this is not downloaded webfont support. */
+static font_t *glyph_face(font_t *f, uint32_t cp, int *glyph) {
+    *glyph = glyph_of(f, cp);
+    if (!*glyph && f->ui_fallback && cp > ' ') {
+        static font_t *cn;
+        static bool tried;
+        if (!tried) { tried = true; cn = open_bundled("MapleMono-NF-CN-Regular.ttf"); }
+        if (cn) {
+            int g = glyph_of(cn, cp);
+            if (g) { *glyph = g; return cn; }
+        }
+    }
+    return f;
 }
 
 static int glyph_adv(font_t *f, int g) {
@@ -89,25 +114,25 @@ void font_metrics(font_t *f, float px, float *ascent, float *descent, float *lin
     if (line_gap) *line_gap = f->line_gap * s;
 }
 
-bool font_has(font_t *f, uint32_t cp) { return glyph_of(f, cp) != 0; }
+bool font_has(font_t *f, uint32_t cp) { int g; glyph_face(f, cp, &g); return g != 0; }
 
 /* the advance of a missing glyph: an empty box */
 static float tofu_adv(float px) { return px * 0.6f; }
 
 float font_advance(font_t *f, float px, uint32_t cp) {
-    int g = glyph_of(f, cp);
+    int g;
+    f = glyph_face(f, cp, &g);
     if (!g && cp > ' ') return tofu_adv(px);
     return glyph_adv(f, g) * f->unit_scale * px;
 }
 
 float font_width(font_t *f, float px, const char *s, size_t n) {
-    float w = 0, s1 = f->unit_scale * px;
+    float w = 0;
     const char *end = s + n;
     while (s < end) {
         uint32_t cp;
         s += gfx_utf8_decode(s, &cp);
-        int g = glyph_of(f, cp);
-        w += !g && cp > ' ' ? tofu_adv(px) : glyph_adv(f, g) * s1;
+        w += font_advance(f, px, cp);
     }
     return w;
 }
@@ -194,12 +219,12 @@ static void blit_glyph(canvas_t *c, const struct gent *e, int x, int y, uint32_t
 }
 
 float font_draw(canvas_t *c, font_t *f, float px, float x, int y, const char *s, size_t n, uint32_t color) {
-    float s1 = f->unit_scale * px;
     const char *end = s + n;
     while (s < end) {
         uint32_t cp;
         s += gfx_utf8_decode(s, &cp);
-        int g = glyph_of(f, cp);
+        int g;
+        font_t *face = glyph_face(f, cp, &g);
         if (!g) {
             if (cp > ' ') {
                 float a, d;
@@ -213,10 +238,41 @@ float font_draw(canvas_t *c, font_t *f, float px, float x, int y, const char *s,
         if (cp > ' ') {
             float fx = floorf(x);
             int phase = (int)((x - fx) * 4) & 3;
-            struct gent *e = gc_get(f, g, px, phase);
+            struct gent *e = gc_get(face, g, px, phase);
             if (e) blit_glyph(c, e, (int)fx, y, color);
         }
-        x += glyph_adv(f, g) * s1;
+        x += glyph_adv(face, g) * face->unit_scale * px;
     }
     return x;
+}
+
+/* Existing application chrome uses 8x16 / 16x32 cells. Preserve that geometry
+   and its ABI, but draw the default TrueType face rather than changing the OS.
+   Wide bundled glyphs occupy two cells. The kernel retains its bitmap renderer. */
+int font_cell_width(uint32_t cp, int size) {
+    font_t *f = font_ui(FONT_REGULAR);
+    if (!f) return -1;
+    float a = font_advance(f, 10, cp);
+    int cells = a <= 0 ? 0 : a > 9 ? 2 : 1;
+    return cells * (size == FONT_LARGE ? 16 : 8);
+}
+
+int font_cell_draw(canvas_t *c, int x, int y, uint32_t cp, uint32_t fg, uint32_t bg, int size) {
+    font_t *f = font_ui(FONT_REGULAR);
+    if (!f) return -1;
+    int scale = size == FONT_LARGE ? 2 : 1, w = font_cell_width(cp, size);
+    if (bg >> 24) gfx_fill(c, x, y, w, 16 * scale, bg);
+    char text[4]; int n;
+    if (cp < 0x80) { text[0] = (char)cp; n = 1; }
+    else if (cp < 0x800) { text[0] = (char)(0xc0 | cp >> 6); text[1] = (char)(0x80 | (cp & 63)); n = 2; }
+    else if (cp < 0x10000) {
+        text[0] = (char)(0xe0 | cp >> 12); text[1] = (char)(0x80 | (cp >> 6 & 63));
+        text[2] = (char)(0x80 | (cp & 63)); n = 3;
+    } else {
+        text[0] = (char)(0xf0 | cp >> 18); text[1] = (char)(0x80 | (cp >> 12 & 63));
+        text[2] = (char)(0x80 | (cp >> 6 & 63)); text[3] = (char)(0x80 | (cp & 63)); n = 4;
+    }
+    float px = 12.0f * scale, advance = font_advance(f, px, cp);
+    font_draw(c, f, px, x + (w - advance) * 0.5f, y + 12 * scale, text, (size_t)n, fg);
+    return w;
 }

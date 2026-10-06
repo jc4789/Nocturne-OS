@@ -1,0 +1,16 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Nocturne JavaScript</title>
+<style>body{background:#f5f1ff;color:#27213e;padding:28px;font-family:sans-serif}button{padding:10px;margin:6px}.card{padding:16px;background:#dfd5f5;border:1px solid #9a80c7;margin:12px 0}#log{font-family:monospace}</style>
+<script type="module" src="demo.mjs"></script>
+</head><body><h1>Nocturne + QuickJS</h1>
+<p>This page runs entirely inside Nocturne. No network connection is needed.</p>
+<div class="card"><button id="count">Counter: 0</button><button id="add">Create a DOM element</button><button id="color">Change style</button><p id="clock">Timer starting...</p><p id="module">Module loading...</p></div>
+<div id="garden"></div><p id="log">Waiting for JavaScript...</p>
+<script>
+let count=0,created=0,color=false;
+const button=document.getElementById('count');
+button.addEventListener('click',()=>{button.textContent='Counter: '+(++count);console.log('counter',count);});
+document.getElementById('add').addEventListener('click',()=>{const n=document.createElement('p');n.className='card';n.textContent='Native DOM node '+(++created)+' — click to remove';n.addEventListener('click',()=>n.remove());document.getElementById('garden').appendChild(n);});
+document.getElementById('color').addEventListener('click',()=>{color=!color;document.body.style.backgroundColor=color?'#ddd0f7':'#f5f1ff';});
+const start=performance.now();setInterval(()=>{document.getElementById('clock').textContent='Monotonic timer: '+((performance.now()-start)/1000).toFixed(1)+' s';},100);
+document.addEventListener('DOMContentLoaded',()=>{document.getElementById('log').textContent='DOM ready. Native events, timers and module imports are connected.';console.log('Nocturne JavaScript demo ready');});
+</script></body></html>

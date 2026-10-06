@@ -1,6 +1,5 @@
-/* Web browser: the web engine (libc/web, no JavaScript) with an address bar, history, forms and
-   find in page. Pages and stylesheets load before the first paint; images load afterwards, one at
-   a time while the window is idle, and the page is laid out again as they arrive. */
+/* Nocturne Web: native DOM, layout and painting, with a document-owned JavaScript runtime.
+   HTTP requests run in isolated Nocturne child processes, never on the GUI/JS task. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +8,7 @@
 #include "nocturne.h"
 #include "http.h"
 #include "web.h"
+#include "webnet.h"
 
 #define TB 40   /* toolbar */
 #define SB 24   /* status / find bar */
@@ -23,12 +23,42 @@ static web_doc *doc;
 static int scroll_y, doc_h;
 static char cur_url[2048], status[256], hover[512];
 static bool quit, loading;
+static bool debug_js;
+static webnet *network;
+static uint64_t generation = 1, next_generation = 1, navigation_generation, navigation_id;
+static int navigation_mode;
+static char navigation_url[2048];
+static bool native_wait, pending_navigation;
+static char pending_url[2048];
+static char *pending_post;
+static int pending_mode;
+static bool navigation_ready, sync_stopped;
+
+struct transfer {
+    struct transfer *next;
+    uint64_t network_id, resource_id, generation;
+};
+static struct transfer *transfers;
+static struct web_response navigation_response;
+
+#define CONSOLE_LINES 128
+#define CONSOLE_LINE 768
+static char console_lines[CONSOLE_LINES][CONSOLE_LINE];
+static int console_n, console_next;
+static bool console_open, console_dirty;
 
 static struct {
     char *url;
     int y;
+    uint64_t document, entry;
+    void *state;
+    size_t state_len;
+    bool manual;
 } hist[MAXHIST];
 static int nhist, hpos = -1;
+static uint64_t history_serial;
+static struct { int delta; uint64_t generation; } history_queue[64];
+static int history_queue_head, history_queue_count;
 
 enum { F_PAGE, F_ADDR, F_FIND };
 static int focus = F_PAGE;
@@ -41,16 +71,18 @@ static char find_buf[128];
 static int find_y = -1;
 
 static web_node *sel_node;
+static web_node *pressed_node, *hover_node;
+static char *focus_value;
 static const char *sel_labels[128];
 static int sel_n, sel_cur, sel_top, sel_x, sel_y, sel_w;
 #define SEL_H 20
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
-static int img_i;
-static bool img_dirty, need_layout;
-static uint64_t last_layout;
+static bool need_layout, need_paint;
 static char refresh_url[2048];
 static uint64_t refresh_at;
+static bool refresh_seen, initial_scroll_pending, initial_scroll_anchor;
+static int initial_scroll_y;
 
 static int hot_btn = -1;
 static bool drag_sb;
@@ -59,11 +91,17 @@ static int drag_off;
 /* events that arrived while an image was downloading and could not be handled there */
 static struct gui_event evq[64];
 static int evq_n;
+static bool scroll_event_pending;
 
 static int page_w(void) { return MAX(w->w - SCRW, 50); }
-static int page_h(void) { return MAX(w->h - TB - SB, 20); }
+static int console_h(void) { return console_open ? MIN(220, MAX(80, (w->h - TB - SB) / 3)) : 0; }
+static int page_h(void) { return MAX(w->h - TB - SB - console_h(), 20); }
 static int max_scroll(void) { return MAX(doc_h - page_h(), 0); }
-static void clamp_scroll(void) { scroll_y = MAX(0, MIN(scroll_y, max_scroll())); }
+static void clamp_scroll(void) {
+    int y = MAX(0, MIN(scroll_y, max_scroll()));
+    if (y != scroll_y) scroll_event_pending = true;
+    scroll_y = y;
+}
 
 /* ---------------------------------------------------------------- strings */
 struct sb {
@@ -193,11 +231,41 @@ static void draw(void) {
     draw_toolbar();
     draw_page();
     draw_status();
+    if (console_open) {
+        canvas_t *c = &w->c;
+        int top = TB + page_h(), h = console_h();
+        gfx_fill(c, 0, top, w->w, h, RGB(18, 16, 30));
+        gfx_hline(c, 0, top, w->w, UI_ACCENT);
+        gfx_text(c, 8, top + 4, "JavaScript console  [F12: close]  [Ctrl+K: clear]", UI_ACCENT2, TRANSPARENT, FONT_SMALL);
+        canvas_t clip = *c;
+        gfx_clip(&clip, 4, top + 24, w->w - 8, h - 24);
+        int visible = MAX(0, (h - 26) / 16), count = MIN(visible, console_n);
+        for (int i = 0; i < count; i++) {
+            int n = (console_next - count + i + CONSOLE_LINES) % CONSOLE_LINES;
+            gfx_text(&clip, 8, top + 25 + i * 16, console_lines[n], UI_FG, TRANSPARENT, FONT_SMALL);
+        }
+    }
+    console_dirty = false;
+}
+
+static void console_add(const char *level, const char *message) {
+    const char *p = message ? message : "";
+    do {
+        size_t n = strcspn(p, "\r\n");
+        snprintf(console_lines[console_next], CONSOLE_LINE, "[%s] %.*s", level ? level : "log",
+                 (int)MIN(n, CONSOLE_LINE - 32), p);
+        console_next = (console_next + 1) % CONSOLE_LINES;
+        if (console_n < CONSOLE_LINES) console_n++;
+        console_dirty = true;
+        p += n;
+        while (*p == '\r' || *p == '\n') p++;
+    } while (*p);
 }
 
 static void redraw(void) {
     draw();
     win_update(w);
+    need_paint = false;
 }
 
 static void redraw_status(void) {
@@ -216,6 +284,7 @@ static void scroll_to(int y) {
     scroll_y = y;
     clamp_scroll();
     if (old != scroll_y) {
+        scroll_event_pending = true;
         sel_node = NULL;
         hover[0] = 0;
     }
@@ -250,57 +319,6 @@ static bool try_scroll_event(const struct gui_event *e) {
 }
 
 /* ---------------------------------------------------------------- fetching */
-struct sink {
-    char *b;
-    size_t n, cap, max;
-    bool page, stopped;
-    uint64_t last;
-    const char *what;
-};
-
-static int on_body(void *ctx, const char *data, size_t n) {
-    struct sink *s = ctx;
-    if (s->n + n > s->max) return -1;
-    if (s->n + n + 1 > s->cap) {
-        while (s->n + n + 1 > s->cap) s->cap = s->cap ? s->cap * 2 : 65536;
-        char *nb = realloc(s->b, s->cap);
-        if (!nb) return -1;
-        s->b = nb;
-    }
-    memcpy(s->b + s->n, data, n);
-    s->n += n;
-    s->b[s->n] = 0;
-    /* keep the window alive: scroll if asked to, Esc stops a page load, closing quits */
-    struct gui_event e;
-    bool moved = false;
-    while (win_event(w, &e, 0) > 0) {
-        if (e.type == EV_CLOSE) {
-            quit = true;
-            return -1;
-        }
-        if (e.type == EV_RESIZE) {
-            need_layout = true;
-            moved = true;
-            continue;
-        }
-        if (s->page && e.type == EV_KEY && e.pressed && e.key == NKEY_ESC) {
-            s->stopped = true;
-            return -1;
-        }
-        if (try_scroll_event(&e)) moved = true;
-        else if (!s->page && evq_n < (int)ARRAY_SIZE(evq)) evq[evq_n++] = e;
-    }
-    if (moved) redraw();
-    uint64_t now = uptime_ms();
-    if (s->what && now - s->last > 150) {
-        s->last = now;
-        char m[300];
-        snprintf(m, sizeof m, "%s (%lu KB)", s->what, (unsigned long)(s->n / 1024));
-        set_status(m);
-    }
-    return 0;
-}
-
 struct fetched {
     int status;
     char *body;
@@ -387,8 +405,14 @@ static bool read_local(const char *url, struct fetched *f) {
         if (path[strlen(path) - 1] != '/' && strlen(f->url) + 1 < sizeof f->url) strcat(f->url, "/");
         return true;
     }
+    if (st.size > (16u << 20)) {
+        close(fd);
+        strlcpy(f->err, "file exceeds the 16 MiB limit", sizeof f->err);
+        return false;
+    }
     size_t n = (size_t)st.size;
     f->body = malloc(n + 1);
+    if (!f->body) { close(fd); strlcpy(f->err, "out of memory", sizeof f->err); return false; }
     size_t got = 0;
     long r;
     while (got < n && (r = read(fd, f->body + got, n - got)) > 0) got += (size_t)r;
@@ -397,68 +421,6 @@ static bool read_local(const char *url, struct fetched *f) {
     f->len = got;
     strlcpy(f->ctype, guess_type(path), sizeof f->ctype);
     return true;
-}
-
-/* GET (or POST when post is not NULL) a URL, following redirects. page: the main document (Esc
-   stops it; anything else is an image or a stylesheet). */
-static bool fetch(const char *url, const char *post, bool page, const char *what, struct fetched *f) {
-    memset(f, 0, sizeof *f);
-    strlcpy(f->url, url, sizeof f->url);
-    const char *hash = strchr(url, '#');
-    char frag[512] = "";
-    if (hash) strlcpy(frag, hash, sizeof frag);
-    for (int hop = 0; hop < 10; hop++) {
-        if (has_prefix(f->url, "file://")) return read_local(f->url, f);
-        if (!has_prefix(f->url, "http://") && !has_prefix(f->url, "https://")) {
-            snprintf(f->err, sizeof f->err, "this browser cannot open %.40s links", f->url);
-            return false;
-        }
-        char req_url[2048];
-        strlcpy(req_url, f->url, sizeof req_url);
-        char *h = strchr(req_url, '#');
-        if (h) *h = 0;
-        char hdrs[256];
-        snprintf(hdrs, sizeof hdrs, "%s%s",
-                 page ? "Accept: text/html,application/xhtml+xml,*/*;q=0.8\r\nAccept-Language: en\r\n"
-                      : "Accept: image/*,text/css,*/*;q=0.5\r\n",
-                 post ? "Content-Type: application/x-www-form-urlencoded\r\n" : "");
-        struct sink s = {.max = page ? 24u << 20 : 12u << 20, .page = page, .what = what};
-        struct http_req rq = {.method = post ? "POST" : "GET", .url = req_url, .headers = hdrs, .body = post,
-                              .body_len = post ? strlen(post) : 0, .timeout_ms = 20000, .on_body = on_body, .ctx = &s};
-        struct http_resp rs;
-        memset(&rs, 0, sizeof rs);
-        int r = http_request(&rq, &rs);
-        if (r < 0 || quit || s.stopped) {
-            f->stopped = s.stopped;
-            snprintf(f->err, sizeof f->err, "%s", s.stopped ? "stopped" : rs.error[0] ? rs.error : "the transfer failed");
-            free(s.b);
-            http_resp_free(&rs);
-            return false;
-        }
-        char loc[2048];
-        int st = rs.status;
-        if ((st == 301 || st == 302 || st == 303 || st == 307 || st == 308) && http_header(&rs, "Location", loc, sizeof loc)) {
-            char next[2048];
-            free(s.b);
-            http_resp_free(&rs);
-            if (!web_resolve_url(f->url, loc, next, sizeof next)) {
-                snprintf(f->err, sizeof f->err, "bad redirect to %.100s", loc);
-                return false;
-            }
-            if (frag[0] && !strchr(next, '#') && strlen(next) + strlen(frag) < sizeof next) strcat(next, frag);
-            strlcpy(f->url, next, sizeof f->url);
-            if (st == 303 || ((st == 301 || st == 302) && post)) post = NULL;
-            continue;
-        }
-        f->status = st;
-        f->body = s.b ? s.b : calloc(1, 1);
-        f->len = s.n;
-        if (!http_header(&rs, "Content-Type", f->ctype, sizeof f->ctype)) f->ctype[0] = 0;
-        http_resp_free(&rs);
-        return true;
-    }
-    snprintf(f->err, sizeof f->err, "too many redirects");
-    return false;
 }
 
 /* ---------------------------------------------------------------- built-in pages */
@@ -480,7 +442,7 @@ static const char home_page[] =
     "table{border-collapse:collapse;font-size:14px}td{padding:3px 18px 3px 0}"
     "kbd{font-family:monospace;background:#2a2748;border-radius:4px;padding:1px 6px;color:#f6c86e}"
     "</style></head><body><div class=wrap>"
-    "<h1>Nocturne Web</h1><p class=sub>HTML and CSS, laid out and painted by Nocturne itself. No JavaScript.</p>"
+    "<h1>Nocturne Web</h1><p class=sub>HTML, CSS and JavaScript, on Nocturne's own web engine.</p>"
     "<form action=\"https://lite.duckduckgo.com/lite/\"><input type=text name=q placeholder=\"Search DuckDuckGo\">"
     "<button type=submit>Search</button></form>"
     "<div class=grid>"
@@ -492,6 +454,7 @@ static const char home_page[] =
     "<a href=\"https://lobste.rs/\">Lobsters<span>lobste.rs</span></a>"
     "<a href=\"https://developer.mozilla.org/en-US/docs/Web/CSS\">MDN CSS<span>developer.mozilla.org</span></a>"
     "<a href=\"https://example.com/\">Example<span>example.com</span></a>"
+    "<a href=\"file:///home/JavaScript/index.html\">JavaScript demo<span>DOM, events, timers and modules</span></a>"
     "<a href=\"file:///home/\">Your files<span>file:///home/</span></a>"
     "</div>"
     "<h2>Keys</h2><table>"
@@ -500,6 +463,7 @@ static const char home_page[] =
     "<tr><td><kbd>Alt+Left</kbd> <kbd>Backspace</kbd><td>back"
     "<tr><td><kbd>Alt+Right</kbd><td>forward"
     "<tr><td><kbd>F5</kbd> <kbd>Ctrl+R</kbd><td>reload"
+    "<tr><td><kbd>F12</kbd><td>JavaScript console"
     "<tr><td><kbd>Space</kbd> <kbd>PgDn</kbd> <kbd>PgUp</kbd><td>scroll a page"
     "<tr><td><kbd>Esc</kbd><td>stop loading"
     "</table></div></body></html>";
@@ -546,7 +510,6 @@ static void relayout(void) {
     if (!doc) return;
     doc_h = web_layout(doc, page_w(), page_h());
     clamp_scroll();
-    last_layout = uptime_ms();
     need_layout = false;
 }
 
@@ -557,17 +520,53 @@ static void set_title(void) {
     win_set_title(w, t);
 }
 
-static void hist_push(const char *url) {
-    for (int i = hpos + 1; i < nhist; i++) free(hist[i].url);
+/* A finished JS task may have retired stylesheet/SVG arenas. No native hit-test,
+   control popup, or repaint may use the old boxes after that point. */
+static void flush_dom_layout(void) {
+    if (!doc || native_wait || web_script_running(doc)) return;
+    if (web_dirty(doc)) need_layout = true;
+    if (need_layout) {
+        relayout();
+        set_title();
+        need_paint = true;
+    }
+}
+
+/* Module loading can suspend an executing JS task after a DOM mutation has
+   retired its SVG snapshots. Rebuild native boxes before pumping any UI.
+   This deliberately bypasses web_script_running(), but never enters JS or
+   rescans script/resource work: web_layout and painting are native-only. */
+static void prepare_native_snapshot(bool force) {
+    if (!doc) return;
+    bool dirty = web_dirty(doc);
+    if (force || dirty || need_layout) {
+        relayout();
+        need_paint = true;
+    }
+}
+
+static void hist_discard(int index) {
+    free(hist[index].url); free(hist[index].state);
+    memset(&hist[index], 0, sizeof hist[index]);
+}
+static void hist_append(char *copy) {
+    for (int i = hpos + 1; i < nhist; i++) hist_discard(i);
     nhist = hpos + 1;
     if (nhist == MAXHIST) {
-        free(hist[0].url);
+        hist_discard(0);
         memmove(hist, hist + 1, sizeof hist[0] * (MAXHIST - 1));
         nhist--;
     }
-    hist[nhist].url = strdup(url);
-    hist[nhist].y = 0;
+    memset(&hist[nhist], 0, sizeof hist[nhist]);
+    hist[nhist].url = copy;
+    hist[nhist].document = generation;
+    hist[nhist].entry = ++history_serial;
     hpos = nhist++;
+}
+static void hist_push(const char *url) {
+    char *copy = strdup(url);
+    if (!copy) { console_add("error", "History allocation failed"); return; }
+    hist_append(copy);
 }
 
 static bool same_doc(const char *a, const char *b) {
@@ -588,135 +587,409 @@ static int anchor(const char *url) {
     return y;
 }
 
-enum { NAV_PUSH, NAV_RELOAD, NAV_HISTORY };
+enum { NAV_PUSH, NAV_RELOAD, NAV_HISTORY, NAV_REPLACE };
 
-static void navigate(const char *url_in, const char *post, int mode) {
-    char url[2048];
-    strlcpy(url, url_in, sizeof url);
-    if (hpos >= 0 && mode != NAV_HISTORY) hist[hpos].y = scroll_y;
-    sel_node = NULL;
-    hover[0] = 0;
-    refresh_at = 0;
-    if (focus == F_ADDR) focus = F_PAGE;
-    /* a link to another part of this page */
-    if (!post && doc && mode != NAV_RELOAD && strchr(url, '#') && same_doc(url, cur_url)) {
-        int y = anchor(url);
-        if (mode == NAV_PUSH) hist_push(url);
-        strlcpy(cur_url, url, sizeof cur_url);
-        if (y >= 0 && mode == NAV_PUSH) scroll_to(y);
-        else if (mode == NAV_HISTORY) scroll_to(hist[hpos].y);
-        redraw();
+/* Resource callbacks only queue results in the document; QuickJS runs in web_tick. */
+static enum webnet_kind network_kind(int kind) {
+    switch (kind) {
+    case WEB_RESOURCE_SCRIPT: return WEBNET_CLASSIC;
+    case WEB_RESOURCE_MODULE: return WEBNET_MODULE;
+    case WEB_RESOURCE_FETCH: return WEBNET_FETCH;
+    default: return WEBNET_RESOURCE;
+    }
+}
+
+static void response_copy(struct web_response *out, const struct webnet_response *in) {
+    memset(out, 0, sizeof *out);
+    out->status = in->status;
+    strlcpy(out->url, in->final_url ? in->final_url : "", sizeof out->url);
+    strlcpy(out->headers, in->headers ? in->headers : "", sizeof out->headers);
+    strlcpy(out->error, in->error ? in->error : "", sizeof out->error);
+    if (in->body_len > WEBNET_BODY_LIMIT) {
+        strlcpy(out->error, "response exceeds the 16 MiB limit", sizeof out->error);
         return;
     }
-    loading = true;
-    char what[300];
-    snprintf(what, sizeof what, "Loading %s", url);
-    set_status(what);
-    draw_toolbar();
-    win_update_rect(w, 0, 0, w->w, TB);
+    out->body = malloc(in->body_len + 1);
+    if (!out->body) {
+        strlcpy(out->error, "out of memory copying response", sizeof out->error);
+        return;
+    }
+    if (in->body_len) memcpy(out->body, in->body, in->body_len);
+    out->body[in->body_len] = 0;
+    out->body_len = in->body_len;
+}
 
-    struct fetched f;
-    char *html = NULL, *charset = NULL, cs[64];
-    const char *image = NULL;
-    size_t hlen = 0;
-    if (has_prefix(url, "about:")) {
-        memset(&f, 0, sizeof f);
-        strlcpy(f.url, url, sizeof f.url);
-        html = strdup(!strcasecmp(url, HOME) ? home_page : "<!doctype html><title>blank</title>");
-    } else if (!fetch(url, post, true, what, &f)) {
-        loading = false;
-        if (quit) return;
-        if (f.stopped) {
-            set_status("Stopped");
-            redraw();
+static void remove_transfer(struct transfer *t) {
+    struct transfer **p = &transfers;
+    while (*p && *p != t) p = &(*p)->next;
+    if (*p) *p = t->next;
+    free(t);
+}
+
+static void resource_completed(webnet *net, uint64_t id, uint64_t gen,
+                               const struct webnet_response *result, void *opaque) {
+    (void)net; (void)id;
+    struct transfer *t = opaque;
+    if (doc && gen == generation && t->generation == generation) {
+        struct web_response r;
+        response_copy(&r, result);
+        web_resource_loaded(doc, t->resource_id, &r);
+        free(r.body);
+    }
+    remove_transfer(t);
+}
+
+static bool host_request(void *opaque, const struct web_request *request) {
+    (void)opaque;
+    if (!doc || quit) return false;
+    struct transfer *t = calloc(1, sizeof *t);
+    if (!t) return false;
+    t->resource_id = request->id;
+    t->generation = generation;
+    struct webnet_request r = {
+        .kind = network_kind(request->kind), .generation = generation,
+        .url = request->url, .origin = web_url(doc), .method = request->method,
+        .headers = request->headers, .body = request->body, .body_len = request->body_len,
+        .credentials = request->credentials
+    };
+    t->network_id = webnet_submit(network, &r, resource_completed, t);
+    if (!t->network_id) { free(t); return false; }
+    t->next = transfers;
+    transfers = t;
+    return true;
+}
+
+static void host_cancel(void *opaque, uint64_t id) {
+    (void)opaque;
+    for (struct transfer *t = transfers; t; t = t->next) {
+        if (t->generation == generation && t->resource_id == id) {
+            webnet_cancel(network, t->network_id);
+            remove_transfer(t);
             return;
         }
-        html = error_page(url, f.err);
-    } else {
-        const char *ct = f.ctype;
-        bool sniff_html = !*ct && f.len && memchr(f.body, '<', f.len < 512 ? f.len : 512);
-        if (has_prefix(ct, "text/html") || has_prefix(ct, "application/xhtml") || sniff_html) {
-            html = f.body;
-            hlen = f.len;
-            f.body = NULL;
-            const char *c = strstr(ct, "charset=");
-            if (c) {
-                c += 8;
-                if (*c == '"') c++;
-                size_t k = strcspn(c, "\"; ");
-                snprintf(cs, sizeof cs, "%.*s", (int)MIN(k, sizeof cs - 1), c);
-                charset = cs;
-            }
-        } else if (has_prefix(ct, "image/")) {
-            html = image_page(f.url);
-            image = f.url;
-        } else if (has_prefix(ct, "text/") || !*ct || strstr(ct, "json") || strstr(ct, "javascript") ||
-                   strstr(ct, "xml")) {
-            html = text_page(f.url, f.body, f.len);
-        } else {
-            char m[300];
-            snprintf(m, sizeof m, "This is a %s file (%lu bytes), which the browser cannot show.", ct,
-                     (unsigned long)f.len);
-            html = error_page(f.url, m);
-        }
     }
-    if (!hlen) hlen = strlen(html);
-    web_doc *nd = web_parse(html, hlen, f.url, charset);
-    free(html);
+}
 
-    /* stylesheets, before anything is shown */
-    const char *u;
-    int nsheet = 0;
-    while (!quit && (u = web_pending_stylesheet(nd))) {
-        char su[2048];
-        strlcpy(su, u, sizeof su);
-        snprintf(what, sizeof what, "Loading stylesheet %d: %s", ++nsheet, su);
-        struct fetched cf;
-        if (fetch(su, NULL, false, what, &cf) && cf.status < 400) web_stylesheet_loaded(nd, cf.body, cf.len);
-        else web_stylesheet_loaded(nd, NULL, 0);
-        free(cf.body);
+static void cancel_document_requests(void) {
+    webnet_cancel_generation(network, generation);
+    while (transfers) {
+        struct transfer *t = transfers;
+        transfers = t->next;
+        free(t);
     }
-    if (quit) {
-        web_free(nd);
-        free(f.body);
+}
+
+static void queue_navigation(const char *url, const char *post, int mode) {
+    if (!url || !*url) return;
+    char *copy = post ? strdup(post) : NULL;
+    if (post && !copy) { console_add("error", "Navigation allocation failed"); return; }
+    strlcpy(pending_url, url, sizeof pending_url);
+    free(pending_post);
+    pending_post = copy;
+    pending_mode = mode;
+    pending_navigation = true;
+}
+
+static void host_navigate(void *opaque, const char *url, const char *post) {
+    (void)opaque;
+    if (doc && !has_prefix(web_url(doc), "file://") && !has_prefix(web_url(doc), "about:") &&
+        has_prefix(url, "file://")) {
+        console_add("error", "A remote document cannot navigate to a local file.");
         return;
     }
+    queue_navigation(url, post, NAV_PUSH);
+}
+static void host_navigate_mode(void *opaque, const char *url, int mode) {
+    host_navigate(opaque, url, NULL);
+    if (pending_navigation) pending_mode = mode == 2 ? NAV_REPLACE : mode == 1 ? NAV_RELOAD : NAV_PUSH;
+}
 
+static void host_console(void *opaque, int level, const char *message) {
+    (void)opaque;
+    console_add(level >= 2 ? "error" : level == 1 ? "warn" : "log", message);
+    if (debug_js) fprintf(stderr, "[web-js:%s] %s\n", level >= 2 ? "error" : level == 1 ? "warn" : "log", message);
+}
+
+static void host_scroll(void *opaque, int *x, int *y) {
+    (void)opaque;
+    *x = 0;
+    *y = scroll_y;
+}
+static void host_scroll_to(void *opaque, int x, int y) {
+    (void)opaque; (void)x;
+    if (need_layout) relayout();
+    scroll_to(y);
+    need_paint = true;
+}
+static char *host_cookie_get(void *opaque, const char *url) {
+    (void)opaque;
+    long n = webnet_cookie_get(network, url, NULL, 0);
+    if (n < 0) return NULL;
+    char *out = malloc((size_t)n + 1);
+    if (out && webnet_cookie_get(network, url, out, (size_t)n + 1) < 0) { free(out); out = NULL; }
+    return out;
+}
+static void host_cookie_set(void *opaque, const char *url, const char *value) {
+    (void)opaque;
+    if (webnet_cookie_set(network, url, value) < 0) console_add("error", "Cookie storage allocation failed");
+}
+static bool host_history(void *opaque, int operation, const char *url, const void *data,
+                         size_t len, int value, struct web_history *out) {
+    (void)opaque;
+    if (hpos < 0 || !doc) return false;
+    if (operation == WEB_HISTORY_PUSH || operation == WEB_HISTORY_REPLACE) {
+        if (!url || strlen(url) >= sizeof cur_url || len > 1024u * 1024u) return false;
+        char *copy = strdup(url); void *saved = len ? malloc(len) : NULL;
+        if (!copy || (len && !saved)) { free(copy); free(saved); return false; }
+        if (len) memcpy(saved, data, len);
+        if (!web_set_url(doc, url)) { free(copy); free(saved); return false; }
+        bool manual = hist[hpos].manual;
+        hist[hpos].y = scroll_y;
+        if (operation == WEB_HISTORY_PUSH) hist_append(copy);
+        else { free(hist[hpos].url); free(hist[hpos].state); hist[hpos].url = copy; hist[hpos].entry = ++history_serial; }
+        hist[hpos].state = saved; hist[hpos].state_len = len; hist[hpos].manual = manual;
+        hist[hpos].y = scroll_y;
+        strlcpy(cur_url, url, sizeof cur_url); strlcpy(addr, url, sizeof addr); acur = strlen(addr);
+        need_paint = true;
+    } else if (operation == WEB_HISTORY_GO) {
+        if (history_queue_count == 64) return false;
+        int at = (history_queue_head + history_queue_count++) % 64;
+        history_queue[at].delta = value; history_queue[at].generation = generation;
+    }
+    else if (operation == WEB_HISTORY_SCROLL) hist[hpos].manual = value != 0;
+    else if (operation != WEB_HISTORY_INFO) return false;
+    *out = (struct web_history){.entry=hist[hpos].entry, .length=nhist, .manual_scroll=hist[hpos].manual,
+        .state=hist[hpos].state, .state_len=hist[hpos].state_len};
+    return true;
+}
+
+static void handle_native_wait(const struct gui_event *e);
+struct synchronous_load { bool ready; struct web_response response; };
+static void synchronous_completed(webnet *net, uint64_t id, uint64_t gen,
+                                  const struct webnet_response *r, void *opaque) {
+    (void)net; (void)id;
+    struct synchronous_load *s = opaque;
+    if (gen == generation) response_copy(&s->response, r);
+    else { memset(&s->response, 0, sizeof s->response); strcpy(s->response.error, "document was replaced"); }
+    s->ready = true;
+}
+
+static bool host_sync_load(void *opaque, const char *url, int kind, struct web_response *response) {
+    (void)opaque;
+    struct synchronous_load s = {0};
+    struct webnet_request r = {
+        .kind = network_kind(kind), .generation = generation, .url = url,
+        .origin = doc ? web_url(doc) : "", .method = "GET",
+        .credentials = kind == WEB_RESOURCE_MODULE ? WEBNET_CREDENTIALS_SAME_ORIGIN : WEBNET_CREDENTIALS_INCLUDE
+    };
+    uint64_t id = webnet_submit(network, &r, synchronous_completed, &s);
+    memset(response, 0, sizeof *response);
+    if (!id) { strcpy(response->error, "module request could not be started"); return false; }
+    prepare_native_snapshot(false);
+    if (need_paint && !quit) redraw();
+    native_wait = true;
+    sync_stopped = false;
+    uint64_t started = uptime_ms();
+    while (!s.ready && !quit && !sync_stopped && !pending_navigation) {
+        uint64_t now = uptime_ms();
+        if (now - started >= WEBNET_TIMEOUT_MS) { sync_stopped = true; break; }
+        webnet_pump(network, now);
+        if (s.ready) break;
+        struct gui_event e;
+        int timeout = webnet_timeout(network, now);
+        int event = win_event(w, &e, timeout < 0 ? 10 : MIN(timeout, 10));
+        if (event < 0) { quit = true; break; }
+        if (event) handle_native_wait(&e);
+        if (console_dirty && console_open) redraw();
+    }
+    native_wait = false;
+    if (!s.ready) {
+        webnet_cancel(network, id);
+        strcpy(response->error, quit ? "window closed" : pending_navigation ? "navigation canceled module load" : "module load canceled");
+        return false;
+    }
+    *response = s.response;
+    return !response->error[0] && response->status >= 200 && response->status < 300;
+}
+
+static const struct web_host browser_host = {
+    .request = host_request, .cancel = host_cancel, .sync_load = host_sync_load,
+    .navigate = host_navigate, .console = host_console, .scroll = host_scroll,
+    .scroll_to = host_scroll_to, .history = host_history,
+    .cookie_get = host_cookie_get, .cookie_set = host_cookie_set
+    , .navigate_mode = host_navigate_mode
+};
+
+static void navigation_completed(webnet *net, uint64_t id, uint64_t gen,
+                                 const struct webnet_response *result, void *opaque) {
+    (void)net; (void)opaque;
+    if (id != navigation_id || gen != navigation_generation) return;
+    navigation_id = 0;
+    free(navigation_response.body);
+    response_copy(&navigation_response, result);
+    navigation_ready = true;
+}
+
+static void stop_navigation(void) {
+    if (navigation_id) webnet_cancel(network, navigation_id);
+    navigation_id = 0;
+    navigation_ready = false;
+    free(navigation_response.body);
+    memset(&navigation_response, 0, sizeof navigation_response);
+    loading = false;
+}
+
+static void finish_navigation(void) {
+    if (!navigation_ready || native_wait || quit) return;
+    navigation_ready = false;
+    struct web_response f = navigation_response;
+    memset(&navigation_response, 0, sizeof navigation_response);
+    char ctype[128] = "", charset_buf[64];
+    const char *charset = NULL, *image = NULL;
+    struct http_resp headers = {0};
+    strlcpy(headers.headers, f.headers, sizeof headers.headers);
+    http_header(&headers, "Content-Type", ctype, sizeof ctype);
+    char *html = NULL;
+    size_t hlen = 0;
+    if (f.error[0]) html = error_page(navigation_url, f.error);
+    else if (has_prefix(f.url, "about:"))
+        html = strdup(!strcasecmp(f.url, HOME) ? home_page : "<!doctype html><title>blank</title>");
+    else {
+        bool sniff_html = !ctype[0] && f.body_len && memchr(f.body, '<', MIN(f.body_len, 512));
+        if (has_prefix(ctype, "text/html") || has_prefix(ctype, "application/xhtml") || sniff_html) {
+            html = f.body; hlen = f.body_len; f.body = NULL;
+            const char *cs = strstr(ctype, "charset=");
+            if (cs) {
+                cs += 8; if (*cs == '"') cs++;
+                size_t n = MIN(strcspn(cs, "\"; "), sizeof charset_buf - 1);
+                memcpy(charset_buf, cs, n); charset_buf[n] = 0; charset = charset_buf;
+            }
+        } else if (has_prefix(ctype, "image/")) { html = image_page(f.url); image = f.url; }
+        else if (has_prefix(ctype, "text/") || !ctype[0] || strstr(ctype, "json") ||
+                 strstr(ctype, "javascript") || strstr(ctype, "xml")) html = text_page(f.url, f.body, f.body_len);
+        else {
+            char message[256];
+            snprintf(message, sizeof message, "Cannot display %s (%lu bytes).", ctype, (unsigned long)f.body_len);
+            html = error_page(f.url, message);
+        }
+    }
+    if (!html) { free(f.body); loading = false; set_status("Out of memory loading page"); return; }
+    if (!hlen) hlen = strlen(html);
+    const char *final_url = f.url[0] ? f.url : navigation_url;
+    web_doc *nd = web_live(html, hlen, final_url, charset, &browser_host);
+    free(html);
+    if (!nd) { free(f.body); loading = false; set_status("Out of memory creating document"); return; }
+
+    cancel_document_requests();
     if (doc) web_free(doc);
     doc = nd;
+    generation = navigation_generation;
     evq_n = 0;
     strlcpy(cur_url, web_url(doc), sizeof cur_url);
-    if (mode == NAV_PUSH) hist_push(cur_url);
+    if (navigation_mode == NAV_PUSH) hist_push(cur_url);
     else if (hpos >= 0) {
-        free(hist[hpos].url);
-        hist[hpos].url = strdup(cur_url);
+        char *copy = strdup(cur_url);
+        if (copy) { free(hist[hpos].url); hist[hpos].url = copy; }
+        if (navigation_mode == NAV_REPLACE) {
+            free(hist[hpos].state); hist[hpos].state = NULL; hist[hpos].state_len = 0;
+            hist[hpos].document = generation; hist[hpos].entry = ++history_serial; hist[hpos].y = 0;
+        } else {
+            uint64_t previous = hist[hpos].document;
+            for (int i = 0; i < nhist; i++) if (hist[i].document == previous) hist[i].document = generation;
+        }
     }
-    int keep = mode == NAV_PUSH ? 0 : hist[hpos].y;
-    scroll_y = 0;
+    int keep = navigation_mode == NAV_PUSH || hpos < 0 || hist[hpos].manual ? 0 : hist[hpos].y;
+    scroll_y = 0; scroll_event_pending = false;
+    find_y = -1; sel_node = pressed_node = hover_node = NULL; hover[0] = 0;
+    free(focus_value); focus_value = NULL;
+    refresh_at = 0; refresh_seen = false;
+    initial_scroll_pending = (hpos < 0 || !hist[hpos].manual) && (navigation_mode != NAV_PUSH || strchr(cur_url, '#') != NULL);
+    initial_scroll_anchor = navigation_mode == NAV_PUSH || navigation_mode == NAV_REPLACE;
+    initial_scroll_y = keep;
     relayout();
-    if (image)
+    if (image) {
         for (int i = 0; i < web_image_count(doc); i++)
-            if (!strcmp(web_image_url(doc, i), image)) {
-                web_image_loaded(doc, i, f.body, f.len);
-                relayout();
-            }
+            if (!strcmp(web_image_url(doc, i), image)) web_image_loaded(doc, i, f.body, f.body_len);
+        relayout();
+    }
     free(f.body);
     int ay = anchor(cur_url);
-    scroll_to(mode != NAV_PUSH ? keep : ay >= 0 ? ay : 0);
-    img_i = 0;
-    img_dirty = false;
-    find_y = -1;
-    int delay;
-    const char *r = web_refresh_url(doc, &delay);
-    if (r && delay <= 10 && strcmp(r, cur_url)) {
-        strlcpy(refresh_url, r, sizeof refresh_url);
-        refresh_at = uptime_ms() + (uint64_t)delay * 1000 + 1;
-    }
+    scroll_to(navigation_mode != NAV_PUSH ? keep : ay >= 0 ? ay : 0);
     loading = false;
-    set_title();
     status[0] = 0;
+    set_title();
+    if (navigation_mode == NAV_HISTORY) web_history_event(doc, cur_url, true);
     redraw();
 }
+
+static void navigate(const char *url_in, const char *post, int mode) {
+    if (native_wait || (doc && web_script_running(doc))) { queue_navigation(url_in, post, mode); return; }
+    char url[2048]; strlcpy(url, url_in, sizeof url);
+    if (hpos >= 0 && mode != NAV_HISTORY) hist[hpos].y = scroll_y;
+    sel_node = NULL; hover[0] = 0; refresh_at = 0;
+    if (focus == F_ADDR) focus = F_PAGE;
+    if (!post && doc && mode != NAV_RELOAD &&
+        ((mode == NAV_HISTORY && hpos >= 0 && hist[hpos].document == generation) ||
+         ((strchr(url, '#') || strchr(cur_url, '#')) && same_doc(url, cur_url)))) {
+        char old_url[sizeof cur_url]; strlcpy(old_url, cur_url, sizeof old_url);
+        if (!web_set_url(doc, url)) return;
+        int y = anchor(url);
+        if (mode == NAV_PUSH) hist_push(url);
+        else if (mode == NAV_REPLACE && hpos >= 0) {
+            char *copy = strdup(url);
+            if (copy) { free(hist[hpos].url); hist[hpos].url = copy; hist[hpos].entry = ++history_serial; }
+        }
+        strlcpy(cur_url, url, sizeof cur_url);
+        strlcpy(addr, url, sizeof addr); acur = strlen(addr);
+        if (mode == NAV_PUSH || mode == NAV_REPLACE) { if (y >= 0) scroll_to(y); else if (!strchr(url, '#') || !strchr(url, '#')[1]) scroll_to(0); }
+        else if (mode == NAV_HISTORY && hpos >= 0 && !hist[hpos].manual) scroll_to(hist[hpos].y);
+        web_history_event(doc, old_url, mode == NAV_HISTORY);
+        redraw(); return;
+    }
+    stop_navigation();
+    navigation_generation = ++next_generation;
+    navigation_mode = mode;
+    strlcpy(navigation_url, url, sizeof navigation_url);
+    loading = true;
+    char what[256]; snprintf(what, sizeof what, "Loading %.240s", url); set_status(what);
+    draw_toolbar(); win_update_rect(w, 0, 0, w->w, TB);
+    if (has_prefix(url, "about:") || has_prefix(url, "file://")) {
+        struct fetched local = {0}; strlcpy(local.url, url, sizeof local.url);
+        if (has_prefix(url, "file://") && !read_local(url, &local)) {
+            strlcpy(navigation_response.error, local.err, sizeof navigation_response.error);
+        } else {
+            navigation_response.status = local.status ? local.status : 200;
+            navigation_response.body = local.body;
+            navigation_response.body_len = local.len;
+            snprintf(navigation_response.headers, sizeof navigation_response.headers, "Content-Type: %s\r\n", local.ctype);
+        }
+        strlcpy(navigation_response.url, local.url, sizeof navigation_response.url);
+        navigation_ready = true; return;
+    }
+    struct webnet_request rq = {
+        .kind = WEBNET_NAVIGATION, .generation = navigation_generation, .url = url,
+        .origin = cur_url, .method = post ? "POST" : "GET",
+        .headers = post ? "Content-Type: application/x-www-form-urlencoded\r\n" : NULL,
+        .body = post, .body_len = post ? strlen(post) : 0, .user_navigation = true,
+        .credentials = WEBNET_CREDENTIALS_INCLUDE
+    };
+    navigation_id = webnet_submit(network, &rq, navigation_completed, NULL);
+    if (!navigation_id) {
+        strcpy(navigation_response.error, "request could not be started");
+        strlcpy(navigation_response.url, url, sizeof navigation_response.url);
+        navigation_ready = true;
+    }
+}
+
+static void apply_pending_navigation(void) {
+    if (!pending_navigation || native_wait || quit || (doc && web_script_running(doc))) return;
+    char url[2048]; strlcpy(url, pending_url, sizeof url);
+    char *post = pending_post; int mode = pending_mode;
+    pending_post = NULL; pending_navigation = false;
+    navigate(url, post, mode);
+    free(post);
+}
+
 
 static void go_addr(const char *text) {
     while (*text == ' ') text++;
@@ -743,59 +1016,129 @@ static void go_addr(const char *text) {
 }
 
 static void go_history(int d) {
-    int p = hpos + d;
+    int64_t p = (int64_t)hpos + d;
     if (p < 0 || p >= nhist) return;
     hist[hpos].y = scroll_y;
-    hpos = p;
+    hpos = (int)p;
     navigate(hist[hpos].url, NULL, NAV_HISTORY);
+}
+static void apply_pending_history(void) {
+    if (!history_queue_count || loading || native_wait || quit || (doc && web_script_running(doc))) return;
+    int at = history_queue_head; history_queue_head = (at + 1) % 64; history_queue_count--;
+    if (history_queue[at].generation != generation) return;
+    int delta = history_queue[at].delta;
+    if (!delta) navigate(cur_url, NULL, NAV_RELOAD);
+    else go_history(delta);
 }
 
 static void submit(web_node *n) {
+    web_node *form = web_form_owner(doc, n);
+    struct web_event event = {.type = "submit", .bubbles = true, .cancelable = true};
+    bool allowed = form && web_dispatch(doc, form, &event);
+    flush_dom_layout();
+    if (!allowed) return;
     char *url = NULL, *body = NULL;
     if (!web_submit(doc, n, &url, &body)) return;
-    navigate(url, body, NAV_PUSH);
+    queue_navigation(url, body, NAV_PUSH);
     free(url);
     free(body);
 }
 
-/* load one more image; false when there is nothing left to do */
-static bool load_image_step(void) {
-    if (!doc) return false;
-    int n = web_image_count(doc);
-    while (img_i < n && !web_image_wanted(doc, img_i)) img_i++;
-    if (img_i >= n) {
-        if (!img_dirty) return false;
-        img_dirty = false;
-        relayout();
-        if (!hover[0] && !find_open) status[0] = 0;
-        redraw();
-        return true; /* layout may have asked for more (CSS backgrounds) */
+/* ---------------------------------------------------------------- input */
+static const char *event_key(uint32_t key, char text[8]) {
+    switch (key) {
+    case NKEY_ENTER: return "Enter";
+    case NKEY_ESC: return "Escape";
+    case NKEY_BACKSPACE: return "Backspace";
+    case NKEY_TAB: return "Tab";
+    case NKEY_DELETE: return "Delete";
+    case NKEY_UP: return "ArrowUp";
+    case NKEY_DOWN: return "ArrowDown";
+    case NKEY_LEFT: return "ArrowLeft";
+    case NKEY_RIGHT: return "ArrowRight";
+    case NKEY_HOME: return "Home";
+    case NKEY_END: return "End";
+    case NKEY_PGUP: return "PageUp";
+    case NKEY_PGDN: return "PageDown";
+    default:
+        if (key >= NKEY_F1 && key <= NKEY_F12) { snprintf(text, 8, "F%u", key - NKEY_F1 + 1); return text; }
+        if (key < 32 || (key >= 0x100 && key < 0x200) || key > 0x10ffff ||
+            (key >= 0xd800 && key <= 0xdfff)) { text[0] = 0; return text; }
+        if (key < 0x80) { text[0] = (char)key; text[1] = 0; }
+        else if (key < 0x800) { text[0] = 0xc0 | (key >> 6); text[1] = 0x80 | (key & 63); text[2] = 0; }
+        else if (key < 0x10000) {
+            text[0] = 0xe0 | (key >> 12); text[1] = 0x80 | ((key >> 6) & 63);
+            text[2] = 0x80 | (key & 63); text[3] = 0;
+        } else {
+            text[0] = 0xf0 | (key >> 18); text[1] = 0x80 | ((key >> 12) & 63);
+            text[2] = 0x80 | ((key >> 6) & 63); text[3] = 0x80 | (key & 63); text[4] = 0;
+        }
+        return text;
     }
-    char u[2048], what[320];
-    strlcpy(u, web_image_url(doc, img_i), sizeof u);
-    int cnt = 0;
-    for (int i = img_i; i < n; i++) cnt += web_image_wanted(doc, i);
-    snprintf(what, sizeof what, "Loading images: %d left", cnt);
-    set_status(what);
-    struct fetched f;
-    bool ok = fetch(u, NULL, false, what, &f);
-    if (quit) {
-        free(f.body);
-        return false;
-    }
-    web_image_loaded(doc, img_i, ok && f.status < 400 ? f.body : NULL, ok ? f.len : 0);
-    free(f.body);
-    img_i++;
-    img_dirty = true;
-    if (uptime_ms() - last_layout > 700) {
-        relayout();
-        img_dirty = false;
-        redraw();
-    }
-    return true;
 }
 
-/* ---------------------------------------------------------------- input */
+static int event_key_code(uint32_t key) {
+    switch (key) {
+    case NKEY_ENTER: return 13;
+    case NKEY_DELETE: return 46;
+    case NKEY_INSERT: return 45;
+    case NKEY_UP: return 38;
+    case NKEY_DOWN: return 40;
+    case NKEY_LEFT: return 37;
+    case NKEY_RIGHT: return 39;
+    case NKEY_HOME: return 36;
+    case NKEY_END: return 35;
+    case NKEY_PGUP: return 33;
+    case NKEY_PGDN: return 34;
+    default:
+        if (key >= NKEY_F1 && key <= NKEY_F12) return 112 + key - NKEY_F1;
+        if (key >= 'a' && key <= 'z') return key - 'a' + 'A';
+        return (int)key;
+    }
+}
+
+static bool dispatch_native(const char *type, web_node *target, const struct gui_event *e, bool cancelable) {
+    if (!doc || native_wait) return true;
+    char key_text[8];
+    struct web_event event = {
+        .type = type, .bubbles = true, .cancelable = cancelable,
+        .x = e ? e->x : 0, .y = e ? e->y - TB : 0,
+        .button = e && (e->buttons & 2) ? 2 : 0,
+        .buttons = e ? e->buttons : 0,
+        .key = e ? event_key(e->key, key_text) : "",
+        .key_code = e ? event_key_code(e->key) : 0,
+        .ctrl = e && (e->mods & NMOD_CTRL), .shift = e && (e->mods & NMOD_SHIFT),
+        .alt = e && (e->mods & NMOD_ALT)
+    };
+    bool allowed = web_dispatch(doc, target, &event);
+    flush_dom_layout();
+    return allowed;
+}
+
+static void page_focus(web_node *node) {
+    if (!doc) return;
+    web_node *old = web_focused(doc);
+    if (old == node) return;
+    if (old) {
+        const char *value = web_control_value(old);
+        if (focus_value && value && strcmp(focus_value, value)) dispatch_native("change", old, NULL, false);
+        struct web_event blur = {.type = "blur"};
+        web_dispatch(doc, old, &blur);
+        flush_dom_layout();
+        dispatch_native("focusout", old, NULL, false);
+    }
+    web_focus(doc, node);
+    free(focus_value);
+    const char *value = node ? web_control_value(node) : NULL;
+    focus_value = value ? strdup(value) : NULL;
+    if (node) {
+        struct web_event event = {.type = "focus"};
+        web_dispatch(doc, node, &event);
+        flush_dom_layout();
+        dispatch_native("focusin", node, NULL, false);
+    }
+}
+
 static void open_select(web_node *n) {
     int sel = 0;
     sel_n = web_select_options(doc, n, sel_labels, (int)ARRAY_SIZE(sel_labels), &sel);
@@ -819,7 +1162,11 @@ static void open_select(web_node *n) {
 }
 
 static void choose_select(int i) {
-    if (sel_node && i >= 0 && i < sel_n) web_select_set(doc, sel_node, i);
+    if (sel_node && i >= 0 && i < sel_n) {
+        web_select_set(doc, sel_node, i);
+        dispatch_native("input", sel_node, NULL, false);
+        dispatch_native("change", sel_node, NULL, false);
+    }
     sel_node = NULL;
     relayout();
 }
@@ -922,6 +1269,21 @@ static void key(const struct gui_event *e) {
     bool ctrl = e->mods & NMOD_CTRL, alt = e->mods & NMOD_ALT;
     uint32_t k = e->key;
     if (k >= 'A' && k <= 'Z' && (ctrl || alt)) k += 32;
+    if (k == NKEY_F12) {
+        console_open = !console_open;
+        need_layout = true;
+        return;
+    }
+    if (console_open && ctrl && k == 'k') {
+        console_n = console_next = 0;
+        console_dirty = true;
+        return;
+    }
+    if (k == NKEY_ESC && loading) {
+        stop_navigation();
+        set_status("Stopped");
+        return;
+    }
     if (ctrl && k == 'l') {
         sel_node = NULL;
         addr_focus();
@@ -952,13 +1314,23 @@ static void key(const struct gui_event *e) {
     }
     if (focus == F_ADDR) return addr_key(e);
     if (focus == F_FIND) return find_key(e);
+    web_node *target = doc ? web_focused(doc) : NULL;
+    if (!dispatch_native("keydown", target, e, true)) return;
+    if ((e->key >= 32 && !(e->key >= 0x100 && e->key < 0x200)) || e->key == NKEY_ENTER)
+        if (!dispatch_native("keypress", target, e, true)) return;
     if (doc && web_focused(doc)) {
         if (k == NKEY_ESC) {
-            web_focus(doc, NULL);
+            page_focus(NULL);
             return;
         }
+        web_node *control = web_focused(doc);
+        const char *value = web_control_value(control);
+        char *old_value = strdup(value ? value : "");
         int r = web_key(doc, e);
         if (r == 2) submit(web_focused(doc));
+        value = web_control_value(control);
+        if (r == 1 && value && old_value && strcmp(old_value, value)) dispatch_native("input", control, e, false);
+        free(old_value);
         if (r) return;
         if (e->key >= 32 && e->key < 127) return; /* typed into a control that ignored it */
     }
@@ -971,33 +1343,42 @@ static void key(const struct gui_event *e) {
     scroll_key(e);
 }
 
-static void page_click(int x, int y) {
+static void page_click(web_node *target, int x, int y) {
     focus = F_PAGE;
     if (!doc) return;
-    struct web_hit hit;
-    web_hit_test(doc, x, y - TB + scroll_y, &hit);
+    struct gui_event native = {.x = x, .y = y, .buttons = 1};
+    if (!dispatch_native("click", target, &native, true)) return;
+    struct web_hit hit = {0};
+    if (!web_node_action(doc, target, &hit)) return;
     switch (hit.kind) {
     case WEB_HIT_LINK:
         if (hit.href) {
             char u[2048];
             strlcpy(u, hit.href, sizeof u);
-            web_focus(doc, NULL);
-            navigate(u, NULL, NAV_PUSH);
+            if (has_prefix(u, "file://") && !has_prefix(web_url(doc), "file://") &&
+                !has_prefix(web_url(doc), "about:")) {
+                set_status("A remote page cannot open a local file");
+                return;
+            }
+            page_focus(NULL);
+            queue_navigation(u, NULL, NAV_PUSH);
         }
         return;
     case WEB_HIT_TEXT_INPUT:
-    case WEB_HIT_TEXTAREA: web_focus(doc, hit.node); break;
+    case WEB_HIT_TEXTAREA: page_focus(hit.node); break;
     case WEB_HIT_CHECKBOX:
     case WEB_HIT_RADIO:
-        web_focus(doc, NULL);
+        page_focus(NULL);
         web_toggle(doc, hit.node);
+        dispatch_native("input", hit.node, &native, false);
+        dispatch_native("change", hit.node, &native, false);
         break;
     case WEB_HIT_SUBMIT: submit(hit.node); return;
     case WEB_HIT_SELECT:
-        web_focus(doc, NULL);
+        page_focus(NULL);
         open_select(hit.node);
         break;
-    default: web_focus(doc, NULL); break;
+    default: page_focus(NULL); break;
     }
 }
 
@@ -1013,6 +1394,7 @@ static void scrollbar_drag(int my) {
 static void mouse_down(const struct gui_event *e) {
     if (!(e->buttons & 1)) return;
     int x = e->x, y = e->y;
+    if (console_open && y >= TB + page_h() && y < w->h - SB) return;
     if (sel_node) {
         int vis = MIN(sel_n - sel_top, (w->h - SB - sel_y) / SEL_H);
         if (ui_hit(x, y, sel_x, sel_y, sel_w, vis * SEL_H)) choose_select(sel_top + (y - sel_y) / SEL_H);
@@ -1042,6 +1424,7 @@ static void mouse_down(const struct gui_event *e) {
             if (ui_hit(x, y, btn_x(i), 6, 28, 28)) {
                 if (i == BTN_BACK) go_history(-1);
                 else if (i == BTN_FWD) go_history(1);
+                else if (i == BTN_RELOAD && loading && !native_wait) stop_navigation();
                 else if (i == BTN_RELOAD && cur_url[0]) navigate(cur_url, NULL, NAV_RELOAD);
                 else if (i == BTN_HOME) navigate(HOME, NULL, NAV_PUSH);
                 return;
@@ -1066,7 +1449,10 @@ static void mouse_down(const struct gui_event *e) {
         return;
     }
     focus = F_PAGE;
-    page_click(x, y);
+    if (doc) {
+        pressed_node = web_node_at(doc, x, y - TB + scroll_y);
+        dispatch_native("mousedown", pressed_node, e, true);
+    }
 }
 
 /* the status bar shows the link under the mouse */
@@ -1086,9 +1472,21 @@ static void mouse_move(const struct gui_event *e) {
         win_update_rect(w, 0, 0, w->w, TB);
     }
     char h[sizeof hover] = "";
-    if (doc && !sel_node && e->y >= TB && e->y < w->h - SB && e->x < page_w()) {
+    web_node *node = NULL;
+    if (doc && !sel_node && e->y >= TB && e->y < TB + page_h() && e->x >= 0 && e->x < page_w()) {
         struct web_hit hit;
         if (web_hit_test(doc, e->x, e->y - TB + scroll_y, &hit) && hit.href) strlcpy(h, hit.href, sizeof h);
+        node = web_node_at(doc, e->x, e->y - TB + scroll_y);
+    }
+    if (doc && !native_wait && !web_script_running(doc)) {
+        struct web_event event = {
+            .x=e->x, .y=e->y-TB, .buttons=e->buttons,
+            .ctrl=(e->mods & NMOD_CTRL)!=0, .shift=(e->mods & NMOD_SHIFT)!=0,
+            .alt=(e->mods & NMOD_ALT)!=0
+        };
+        web_hover(doc, node, &event);
+        hover_node = node;
+        flush_dom_layout();
     }
     if (strcmp(h, hover)) {
         strlcpy(hover, h, sizeof hover);
@@ -1100,33 +1498,127 @@ static void handle(const struct gui_event *e) {
     switch (e->type) {
     case EV_CLOSE: quit = true; return;
     case EV_KEY:
-        if (!e->pressed) return;
+        if (!e->pressed) {
+            if (focus == F_PAGE) dispatch_native("keyup", doc ? web_focused(doc) : NULL, e, false);
+            flush_dom_layout();
+            if (need_paint && !quit) redraw();
+            return;
+        }
         key(e);
         break;
     case EV_MOUSE_DOWN: mouse_down(e); break;
     case EV_MOUSE_UP:
-        if (!drag_sb) return;
-        drag_sb = false;
+        if (drag_sb) { drag_sb = false; pressed_node = NULL; break; }
+        if (doc && e->y >= TB && e->y < TB + page_h() && e->x < page_w()) {
+            web_node *target = web_node_at(doc, e->x, e->y - TB + scroll_y);
+            dispatch_native("mouseup", target, e, false);
+            if (pressed_node && target == pressed_node) page_click(target, e->x, e->y);
+        }
+        pressed_node = NULL;
         break;
-    case EV_MOUSE_MOVE: mouse_move(e); return;
+    case EV_MOUSE_MOVE:
+        mouse_move(e);
+        flush_dom_layout();
+        if (need_paint && !quit) redraw();
+        return;
     case EV_WHEEL:
         if (sel_node) {
             int room = MAX((w->h - SB - sel_y) / SEL_H, 1);
             sel_top = MAX(0, MIN(sel_n - room, sel_top + e->wheel));
-        } else scroll_to(scroll_y + e->wheel * LINE);
+        } else {
+            web_node *target = doc && e->y >= TB && e->y < TB + page_h() ?
+                               web_node_at(doc, e->x, e->y - TB + scroll_y) : NULL;
+            if (dispatch_native("wheel", target, e, true)) {
+                scroll_to(scroll_y + e->wheel * LINE);
+            }
+        }
         break;
-    case EV_RESIZE: need_layout = true; break;
+    case EV_RESIZE:
+        need_layout = true;
+        flush_dom_layout();
+        dispatch_native("resize", NULL, e, false);
+        break;
     default: return;
     }
+    flush_dom_layout();
     if (need_layout) relayout();
     if (!quit) redraw();
 }
 
+/* This pump intentionally does not dispatch DOM events, run JS, or destroy a document.
+   QuickJS's synchronous module loader can be on the C stack while it is used. */
+static void handle_native_wait(const struct gui_event *e) {
+    bool moved = false;
+    if (e->type == EV_CLOSE) { quit = true; sync_stopped = true; return; }
+    if (e->type == EV_RESIZE) { prepare_native_snapshot(true); redraw(); return; }
+    if (e->type == EV_KEY && e->pressed) {
+        uint32_t k = e->key;
+        if (k >= 'A' && k <= 'Z') k += 32;
+        if (e->key == NKEY_ESC) { sync_stopped = true; return; }
+        if (e->key == NKEY_F12) { console_open = !console_open; prepare_native_snapshot(true); redraw(); return; }
+        if ((e->mods & NMOD_CTRL) && k == 'l') { addr_focus(); redraw(); return; }
+        if (focus == F_ADDR) { addr_key(e); redraw(); return; }
+        if (e->key == NKEY_F5 || ((e->mods & NMOD_CTRL) && k == 'r')) {
+            queue_navigation(cur_url, NULL, NAV_RELOAD); return;
+        }
+        if (e->mods & NMOD_ALT) {
+            if (e->key == NKEY_LEFT) { go_history(-1); return; }
+            if (e->key == NKEY_RIGHT) { go_history(1); return; }
+        }
+    }
+    if (e->type == EV_MOUSE_DOWN && (e->y < TB || e->x >= w->w - SCRW)) {
+        mouse_down(e); redraw(); return;
+    }
+    if (e->type == EV_MOUSE_MOVE && drag_sb) { scrollbar_drag(e->y); redraw(); return; }
+    if (e->type == EV_MOUSE_UP && drag_sb) { drag_sb = false; redraw(); return; }
+    if (try_scroll_event(e)) moved = true;
+    else if (evq_n < (int)ARRAY_SIZE(evq)) evq[evq_n++] = *e;
+    if (moved) redraw();
+}
+
+static void document_step(uint64_t now) {
+    if (!doc || quit) return;
+    if (scroll_event_pending && !native_wait && !web_script_running(doc)) {
+        scroll_event_pending = false;
+        web_document_scroll(doc);
+    }
+    web_tick(doc, now);
+    if (quit) return;
+    bool dirty = web_dirty(doc);
+    if (dirty || need_layout) {
+        relayout();
+        if (initial_scroll_pending) {
+            if (initial_scroll_anchor) {
+                int y = anchor(cur_url);
+                if (y >= 0) { scroll_to(y); initial_scroll_pending = false; }
+            } else if (max_scroll() >= initial_scroll_y) {
+                scroll_to(initial_scroll_y); initial_scroll_pending = false;
+            }
+        }
+        set_title();
+        redraw();
+    } else if (need_paint || (console_dirty && console_open)) redraw();
+    if (!refresh_seen && !loading) {
+        int delay;
+        const char *url = web_refresh_url(doc, &delay);
+        if (url) {
+            refresh_seen = true;
+            if (delay <= 10 && strcmp(url, cur_url)) {
+                strlcpy(refresh_url, url, sizeof refresh_url);
+                refresh_at = uptime_ms() + (uint64_t)MAX(delay, 0) * 1000 + 1;
+            }
+        }
+    }
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "--debug-js")) { debug_js = true; argc--; argv++; }
     int sw = 1024, sh = 768;
     screen_size(&sw, &sh);
     w = win_open(MIN(1100, sw - 40), MIN(800, sh - 70), "Web", WIN_RESIZABLE);
     if (!w) return 1;
+    network = webnet_create();
+    if (!network) { win_close(w); return 1; }
     redraw();
     if (argc > 1) {
         if (argv[1][0] == '/') {
@@ -1136,6 +1628,16 @@ int main(int argc, char **argv) {
         } else go_addr(argv[1]);
     } else navigate(HOME, NULL, NAV_PUSH);
     while (!quit) {
+        uint64_t now = uptime_ms();
+        webnet_pump(network, now);
+        apply_pending_history();
+        apply_pending_navigation();
+        finish_navigation();
+        document_step(now);
+        apply_pending_history();
+        apply_pending_navigation();
+        if (quit) break;
+        now = uptime_ms();
         struct gui_event e;
         if (evq_n) {
             e = evq[0];
@@ -1143,8 +1645,13 @@ int main(int argc, char **argv) {
             handle(&e);
             continue;
         }
-        bool busy = doc && (img_i < web_image_count(doc) || img_dirty);
-        int timeout = busy ? 0 : -1;
+        int timeout = webnet_timeout(network, now);
+        int64_t deadline = doc ? web_deadline(doc) : -1;
+        if (deadline >= 0) {
+            int due = deadline <= (int64_t)now ? 0 : (int)MIN(deadline - (int64_t)now, 0x7fffffff);
+            if (timeout < 0 || due < timeout) timeout = due;
+        }
+        if (navigation_ready || pending_navigation || scroll_event_pending || (history_queue_count && !loading)) timeout = 0;
         if (refresh_at) {
             uint64_t now = uptime_ms();
             if (now >= refresh_at) {
@@ -1154,7 +1661,8 @@ int main(int argc, char **argv) {
                 navigate(u, NULL, NAV_PUSH);
                 continue;
             }
-            if (!busy) timeout = (int)(refresh_at - now);
+            int due = (int)MIN(refresh_at - now, 0x7fffffff);
+            if (timeout < 0 || due < timeout) timeout = due;
         }
         int r = win_event(w, &e, timeout);
         if (r < 0) break;
@@ -1162,9 +1670,14 @@ int main(int argc, char **argv) {
             handle(&e);
             continue;
         }
-        if (busy) load_image_step();
     }
+    stop_navigation();
+    cancel_document_requests();
     if (doc) web_free(doc);
+    webnet_free(network);
+    free(pending_post);
+    free(focus_value);
+    for (int i = 0; i < nhist; i++) hist_discard(i);
     win_close(w);
     return 0;
 }

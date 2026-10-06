@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <setjmp.h>
 #include "gfx.h"
 #include "font.h"
 #include "image.h"
@@ -21,6 +22,8 @@
 /* ---------------------------------------------------------------- memory */
 typedef struct arena {
     struct achunk *head;
+    size_t allocated, limit;
+    jmp_buf *trap;
 } arena_t;
 
 void *ar_alloc(arena_t *a, size_t n); /* zeroed, 8-byte aligned */
@@ -80,7 +83,7 @@ extern const char *const tag_names[T_COUNT];
 
 enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_OTHER }; /* pseudo-elements */
 
-enum { N_DOC, N_ELEM, N_TEXT, N_COMMENT };
+enum { N_DOC, N_ELEM, N_TEXT, N_COMMENT, N_FRAGMENT };
 
 struct attr {
     const char *name;  /* lowercase */
@@ -113,9 +116,19 @@ typedef struct node {
     float anchor_dy;
     /* form controls */
     char *value; /* current value of input/textarea (malloc'd) */
+    size_t value_capacity;
     bool checked, selected_set;
+    bool value_dirty, checked_dirty;
     int selected; /* select: index of the selected option */
     int image;    /* <img>: index into the document's images, or -1 */
+    int image_request; /* latest selected resource; image may retain an available old request */
+    uint64_t image_generation;
+    bool image_initialized, image_invalidated, image_has_source;
+    struct node *owned_next; /* document-owned allocation list, including detached nodes */
+    bool control_ready, script_started;
+    uint64_t resource_revision;
+    const char *option_label;
+    uint64_t option_label_revision;
 } node_t;
 
 const char *node_attr(const node_t *n, const char *name); /* NULL if absent */
@@ -272,6 +285,8 @@ sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base
 const char *css_ua_sheet(void);
 /* compute every element's style for the viewport */
 void css_cascade(web_doc *d, int vw, int vh);
+/* Shared @media / matchMedia evaluator; optional serialization cap >= 9*n+16. */
+bool css_media_evaluate(const char *query, int vw, int vh, bool scripting, char *out, size_t cap);
 void css_styling_free(struct styling *st);
 /* parse a color; false if it is not one */
 bool css_color(const char *s, size_t n, uint32_t *out);
@@ -365,12 +380,14 @@ struct run {
     node_t *link;  /* the <a href> it belongs to */
     box_t *atomic; /* or an atomic inline box at (x, y = its top) */
     bool highlight;
+    node_t *node; /* original text/atomic node, for generic DOM event targeting */
 };
 
 struct deco {
     float x, y, w, h; /* border box */
     style_t *st;
     bool first, last; /* the inline box starts / ends on this line */
+    node_t *node;
 };
 
 void boxes_build(web_doc *d, arena_t *a);
@@ -406,6 +423,18 @@ struct web_doc {
     arena_t mem;    /* DOM, stylesheets */
     arena_t smem;   /* styles and boxes (rebuilt by the cascade) */
     arena_t lmem;   /* layout results */
+    arena_t cssmem; /* authored sheets: replaced on a DOM stylesheet mutation */
+    node_t *owned_nodes;
+    size_t control_bytes;
+    uint64_t dom_revision;
+    uint64_t layout_revision;
+    struct html_parser *parser;
+    struct web_js_state *js;
+    bool live, dirty, resources_dirty;
+    pvec css_cache;
+    int css_depth;
+    size_t css_bytes;
+    bool scan_title_seen;
     node_t *root;   /* the document node */
     node_t *html, *head, *body;
     char *url;      /* the document's own URL */
@@ -424,7 +453,7 @@ struct web_doc {
     pvec abs_boxes;   /* absolutely positioned boxes, painted last */
     int width, height, doc_h, doc_w;
     int styled_w, styled_h; /* viewport the cascade ran for */
-    bool need_style, need_boxes;
+    bool need_style, need_boxes, layout_valid;
     node_t *focus;
     int caret;
     node_t *find_node;
@@ -433,8 +462,42 @@ struct web_doc {
 };
 
 node_t *html_parse(web_doc *d, const char *html, size_t n, const char *charset);
-const char *doc_link_href(web_doc *d, node_t *a); /* absolute URL of an <a href>, arena-allocated */
+const char *doc_link_href(web_doc *d, node_t *a); /* absolute URL; valid until the next call */
 void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *base);
+
+/* Incremental parser: 1 script boundary, 0 complete, -1 allocation failure.
+   web_parse remains a scripting-disabled, fully parsed document. */
+struct html_parser *html_begin(web_doc *d, const char *html, size_t n, const char *charset, bool scripting);
+int html_resume(struct html_parser *p, node_t **script);
+bool html_write(struct html_parser *p, const char *text, size_t n);
+void html_finish(struct html_parser *p);
+node_t *html_fragment(web_doc *d, node_t *context, const char *html, size_t n);
+node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t n);
+bool doc_node_attr(web_doc *d, node_t *node, const char *name, const char *value);
+bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before);
+void doc_node_remove(web_doc *d, node_t *node);
+bool doc_node_text(web_doc *d, node_t *node, const char *text, size_t n);
+bool doc_node_html(web_doc *d, node_t *node, const char *html, size_t n);
+bool doc_node_value(web_doc *d, node_t *node, const char *text, size_t n);
+void doc_control_init(web_doc *d, node_t *node);
+void doc_control_checked(web_doc *d, node_t *node, bool checked);
+node_t *doc_select_option(node_t *select, int index);
+bool doc_option_selected(node_t *option);
+node_t *doc_node_clone(web_doc *d, node_t *node, bool deep);
+void doc_mutated(web_doc *d, node_t *node);
+void doc_rescan(web_doc *d);
+void doc_image_sync(web_doc *d, node_t *n);
+void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const char *css, size_t n);
+bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out);
+bool css_matches(node_t *node, const char *selector, bool *valid);
+void web_js_start(web_doc *d, const struct web_host *host);
+void web_js_tick(web_doc *d, uint64_t now);
+void web_js_free(web_doc *d);
+void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *r);
+int64_t web_js_deadline(web_doc *d);
+bool web_js_running(web_doc *d);
+bool web_js_enabled(web_doc *d);
+bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *e);
 
 /* URL helpers (util.c) */
 bool url_resolve(const char *base, const char *rel, char *out, size_t n);

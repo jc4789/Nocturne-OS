@@ -80,8 +80,26 @@ static const struct test tests[] = {
      {"audiotest: 0 failed"}, "FAIL", 60, false, true},
 
     /* the web engine, offline: layout, painting, forms, charsets, URLs, hostile input */
+    {"web", "fonts", "tcc -o /home/fonttest /data/tests/fonttest.c && /home/fonttest", 0,
+     {"fonttest: ", ", 0 failed"}, "FAIL", 120, false, true},
     {"web", "engine", "tcc -o /home/webtest /data/tests/webtest.c && /home/webtest", 0, {"webtest: ", ", 0 failed"}, "FAIL",
      120, false, true},
+    {"web", "javascript", "tcc -o /home/jstest /data/tests/jstest.c && /home/jstest", 0,
+     {"jstest: ", ", 0 failed"}, "FAIL", 180, false, true},
+    {"web", "http-transport", "tcc -o /home/httptest /data/tests/httptest.c && /home/httptest", 0,
+     {"httptest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"web", "cookies", "tcc -o /home/cookietest /data/tests/cookietest.c && /home/cookietest", 0,
+     {"cookietest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"web", "media-policy", "tcc -o /home/mediapolicytest /data/tests/mediapolicytest.c && /home/mediapolicytest", 0,
+     {"mediapolicytest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"web", "media-events", "tcc -o /home/mediatest /data/tests/mediatest.c && /home/mediatest", 0,
+     {"mediatest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"web", "mouse-boundaries", "tcc -o /home/hovertest /data/tests/hovertest.c && /home/hovertest /data/tests/js_hover_cases.js", 0,
+     {"hovertest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"web", "image-elements", "tcc -o /home/imagetest /data/tests/imagetest.c && /home/imagetest", 0,
+     {"imagetest: 0 failures, 0 unexpected errors"}, "FAIL", 120, false, true},
+    {"web", "worker-network", "tcc -o /home/webnettest /data/tests/webnettest.c && /home/webnettest", 0,
+     {"webnettest: 0 failed"}, "FAIL", 120, false, true},
 
     /* TCP against the host's test server (no internet needed), clean and with simulated loss */
     {"tcp", "bulk-and-loss", "tcc -o /home/tcptest /data/tests/tcptest.c && /home/tcptest", 0, {"tcptest: 0 failed"},
@@ -94,6 +112,8 @@ static const struct test tests[] = {
     {"net", "http", "fetch http://example.com", 0, {"Example Domain"}, NULL, 30},
     {"net", "https", "fetch https://example.com", 0, {"Example Domain"}, NULL, 30},
     {"net", "https-rejects-bad-cert", "fetch https://expired.badssl.com/", NONZERO, {"fetch:"}, NULL, 30},
+    {"net", "webfetch-tls", "tcc -o /home/webnettest /data/tests/webnettest.c && /home/webnettest --tls", 0,
+     {"webnettest: 0 failed"}, "FAIL", 90, false, true},
 
     /* the AI agent, offline: no key is ever needed for the tests */
     {"agent", "usage", "agent --help", ANY, {"usage: agent"}},
@@ -223,7 +243,7 @@ int main(int argc, char **argv) {
             continue;
         }
         static bool net_waited;
-        if (!net_waited && (!strcmp(t->group, "tcp") || !strcmp(t->group, "net"))) {
+        if (!net_waited && (!strcmp(t->group, "tcp") || !strcmp(t->group, "net") || !strcmp(t->name, "worker-network"))) {
             net_waited = true;
             if (!net_wait_up(20000)) printf("runtests: the network did not come up\n");
         }

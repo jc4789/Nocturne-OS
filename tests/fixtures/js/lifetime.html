@@ -1,0 +1,11 @@
+<!doctype html><meta charset="utf-8"><title>Nocturne document lifetime</title>
+<link rel="stylesheet" href="fixture.css"><h1>Document lifetime</h1>
+<p>Start a request, then follow the link while it is pending. Its completion must never modify the next document.</p>
+<button id="request">Start slow request</button><button id="replace">Replace document during an event task</button>
+<p id="status">idle</p><p><a href="index.html">Navigate while loading</a></p>
+<script>
+const status=document.getElementById('status');let ticks=0;
+setInterval(()=>{ticks++;status.textContent='old document ticks: '+ticks;},100);
+document.getElementById('request').addEventListener('click',()=>{status.textContent='waiting';fetch('/api/slow?ms=5000').then(r=>r.json()).then(()=>{status.textContent='old document response';console.log('old document response delivered');}).catch(e=>console.log(e.message));});
+document.getElementById('replace').addEventListener('click',()=>{location.href='index.html';const n=document.createElement('p');n.textContent='This mutation must finish on the old document before replacement.';document.body.appendChild(n);Promise.resolve().then(()=>console.log('old document microtask checkpoint'));});
+</script>

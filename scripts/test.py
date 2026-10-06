@@ -19,16 +19,20 @@ touched: the tests use build/test-data.img.
 """
 import argparse
 import glob
+import importlib.util
 import os
 import re
+import shutil
 import socketserver
 import subprocess
 import sys
 import threading
 import time
+from functools import partial
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "tools", "msys64", "ucrt64", "bin")
+USR_BIN = os.path.join(ROOT, "tools", "msys64", "usr", "bin")
 BASH = os.path.join(ROOT, "tools", "msys64", "usr", "bin", "bash.exe")
 QEMU = os.path.join(BIN, "qemu-system-x86_64.exe")
 BUILD = os.path.join(ROOT, "build")
@@ -39,8 +43,14 @@ PART = IMG + "@@1048576"
 
 
 def mtools(*args):
-    env = dict(os.environ, PATH=BIN + os.pathsep + os.environ.get("PATH", ""), MTOOLS_SKIP_CHECK="1")
-    r = subprocess.run(list(args), env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    env = dict(os.environ, PATH=BIN + os.pathsep + USR_BIN + os.pathsep + os.environ.get("PATH", ""), MTOOLS_SKIP_CHECK="1")
+    # On Windows the child's env PATH does not determine CreateProcess executable lookup.
+    # Resolve the bundled executable ourselves so an ordinary Python launch also works.
+    executable = shutil.which(args[0], path=env["PATH"])
+    if not executable:
+        sys.exit("test: cannot find bundled tool %s" % args[0])
+    r = subprocess.run([executable, *args[1:]], env=env, stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode:
         sys.exit("test: %s failed: %s" % (args[0], r.stderr.strip()))
 
@@ -94,14 +104,45 @@ def start_tcp_server():
     return srv
 
 
-def make_disk(a, tcp_port):
+def start_web_servers():
+    """Two ephemeral host origins for actual /bin/webfetch tests; no internet is required."""
+    fixture = os.path.join(ROOT, "tests", "fixtures", "js", "server.py")
+    spec = importlib.util.spec_from_file_location("nocturne_web_fixture", fixture)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    root = os.path.dirname(fixture)
+    class QuietHandler(module.Handler):
+        def log_message(self, format, *args):
+            pass
+    servers = []
+    try:
+        for _ in range(2):
+            server = module.ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=root))
+            server.daemon_threads = True
+            try:
+                threading.Thread(target=server.serve_forever, daemon=True).start()
+            except BaseException:
+                # shutdown() requires a serving thread; this one never started.
+                server.server_close()
+                raise
+            servers.append(server)
+        return servers
+    except BaseException:
+        for server in servers:
+            server.shutdown()
+            server.server_close()
+        raise
+
+
+def make_disk(a, tcp_port, web_ports):
     if os.path.exists(IMG):
         os.remove(IMG)
-    env = dict(os.environ, PATH=BIN + os.pathsep + os.environ.get("PATH", ""))
+    env = dict(os.environ, PATH=BIN + os.pathsep + USR_BIN + os.pathsep + os.environ.get("PATH", ""))
     subprocess.run([BASH, "scripts/mkdata.sh", "build/test-data.img", "256"], cwd=ROOT, env=env, check=True,
                    stdout=subprocess.DEVNULL)
     mtools("mmd", "-i", PART, "::/tests")
     srcs = sorted(glob.glob(os.path.join(ROOT, "tests", "*.c")))
+    srcs += sorted(glob.glob(os.path.join(ROOT, "tests", "js_*_cases.js")))
     mtools("mcopy", "-i", PART, *srcs, "::/tests/")
     if a.full:
         tcc = os.path.join(ROOT, "third_party", "tinycc")
@@ -115,6 +156,11 @@ def make_disk(a, tcp_port):
         f.write("%d\n" % tcp_port)
     mtools("mcopy", "-i", PART, port_file, "::/tests/tcpport")
     os.remove(port_file)
+    web_file = os.path.join(BUILD, "webports")
+    with open(web_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write("%d %d\n" % tuple(web_ports))
+    mtools("mcopy", "-i", PART, web_file, "::/tests/webports")
+    os.remove(web_file)
     args = (["-quick"] if a.quick else []) + (["-nonet"] if a.no_net else []) + a.groups
     script = os.path.join(BUILD, "autorun.sh")
     with open(script, "w", newline="\n") as f:
@@ -173,19 +219,8 @@ def check_audio(path):
     return True, desc
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--quick", action="store_true")
-    ap.add_argument("--full", action="store_true")
-    ap.add_argument("--no-net", action="store_true")
-    ap.add_argument("--timeout", type=int, default=1200)
-    ap.add_argument("groups", nargs="*")
-    a = ap.parse_args()
-    if not os.path.exists(os.path.join(BUILD, "nocturne.img")):
-        sys.exit("test: build first (powershell -ExecutionPolicy Bypass -File build.ps1)")
-
-    srv = start_tcp_server()
-    make_disk(a, srv.server_address[1])
+def run_vm(a, tcp_port, web_ports, processes):
+    make_disk(a, tcp_port, web_ports)
     if os.path.exists(SERIAL):
         os.remove(SERIAL)
     cmd = [QEMU, "-M", "pc", "-m", "512M", "-display", "none", "-vga", "std", "-no-reboot",
@@ -197,6 +232,7 @@ def main():
         os.remove(AUDIO)
     t0 = time.time()
     q = subprocess.Popen(cmd, cwd=ROOT, stderr=subprocess.PIPE, text=True, errors="replace")
+    processes.append(q)
 
     def qemu_stderr():  # the AC'97's recording inputs have nowhere to record from: not news
         for line in q.stderr:
@@ -256,6 +292,41 @@ def main():
     ok = not fails and not problems
     print("test: %s in %d s (serial log: build/test-serial.log)" % ("all passed" if ok else "FAILED", time.time() - t0))
     return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--full", action="store_true")
+    ap.add_argument("--no-net", action="store_true")
+    ap.add_argument("--timeout", type=int, default=1200)
+    ap.add_argument("groups", nargs="*")
+    a = ap.parse_args()
+    if not os.path.exists(os.path.join(BUILD, "nocturne.img")):
+        sys.exit("test: build first with the bundled toolchain")
+    servers, processes = [], []
+    try:
+        tcp = start_tcp_server()
+        servers.append(tcp)
+        web = start_web_servers()
+        servers.extend(web)
+        return run_vm(a, tcp.server_address[1], [s.server_address[1] for s in web], processes)
+    finally:
+        # Only processes and servers created by this test run are touched.
+        try:
+            for process in processes:
+                if process.poll() is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+        finally:
+            for server in servers:
+                try:
+                    server.shutdown()
+                finally:
+                    server.server_close()
 
 
 if __name__ == "__main__":

@@ -239,3 +239,56 @@ float asinf(float x) { return (float)asin(x); }
 float atanf(float x) { return (float)atan(x); }
 float fmodf(float x, float y) { return (float)fmod(x, y); }
 long double fabsl(long double x) { return x < 0 ? -x : x; }
+
+/* Cancellation-safe additions required by the ECMAScript Math intrinsics. */
+long lrint(double x) {
+    long r;
+    __asm__("cvtsd2si %1, %0" : "=r"(r) : "x"(x));
+    return r;
+}
+
+double expm1(double x) {
+    if (x == 0 || isnan(x)) return x;
+    if (x == -INFINITY) return -1;
+    if (fabs(x) <= 0.5) return (double)x87_f2xm1((long double)x * LOG2EL);
+    return exp(x) - 1;
+}
+
+double log1p(double x) {
+    if (x == 0 || isnan(x)) return x;
+    if (x == INFINITY) return x;
+    if (x == -1) return -INFINITY;
+    if (x < -1) return NAN;
+    if (fabs(x) < 0.25) {
+        long double r;
+        __asm__("fyl2xp1" : "=t"(r) : "0"((long double)x), "u"(LN2L) : "st(1)");
+        return (double)r;
+    }
+    double u = 1 + x;
+    return log(u) - ((u - 1) - x) / u;
+}
+
+double asinh(double x) {
+    if (x == 0 || !isfinite(x)) return x;
+    double a = fabs(x), r;
+    if (a > 0x1p28) r = log(a) + M_LN2;
+    else if (a < 0x1p-28) r = a;
+    else r = log1p(a + a * a / (1 + sqrt(1 + a * a)));
+    return copysign(r, x);
+}
+
+double acosh(double x) {
+    if (x < 1) return NAN;
+    if (x == 1) return 0;
+    if (!isfinite(x)) return x;
+    if (x > 0x1p28) return log(x) + M_LN2;
+    double t = x - 1;
+    return log1p(t + sqrt(t * (t + 2)));
+}
+
+double atanh(double x) {
+    if (x == 0 || isnan(x)) return x;
+    double a = fabs(x);
+    if (a > 1) return NAN;
+    return copysign(0.5 * log1p(2 * a / (1 - a)), x);
+}

@@ -1,0 +1,6 @@
+Nocturne browser Intl uses the FormatJS libraries under the MIT license,
+Unicode CLDR data under the Unicode Data Files and Software License,
+and the IANA timezone database. Package versions, source hashes, full licenses
+and the small lazy timezone adapter are in third_party/formatjs in the source.
+Upstream: https://github.com/formatjs/formatjs
+English and Japanese locale data are included; other languages use fallback.

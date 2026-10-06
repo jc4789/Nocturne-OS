@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><title>Nocturne explicit limits</title>
+<link rel="stylesheet" href="fixture.css"><h1>Explicit resource limits</h1>
+<p>Each button deliberately attacks one resource limit. Open a fresh page between checks. These checks are not run automatically.</p>
+<p>The browser must remain scrollable, closable and able to navigate after a task is stopped.</p>
+<button id="loop">Infinite JavaScript loop</button>
+<button id="microtasks">Infinite Promise chain</button>
+<button id="heap">Allocate beyond the JS heap limit</button>
+<button id="dom">Allocate beyond the native DOM limit</button>
+<button id="timers">Reach the timer limit</button>
+<p id="status">idle</p><p><a href="index.html">Navigate away</a></p>
+<script>
+const status=document.getElementById('status');
+document.getElementById('loop').addEventListener('click',()=>{status.textContent='loop';for(;;){}});
+document.getElementById('microtasks').addEventListener('click',()=>{status.textContent='microtasks';function again(){Promise.resolve().then(again);}again();});
+document.getElementById('heap').addEventListener('click',()=>{status.textContent='heap';try{const a=[];for(;;)a.push(new ArrayBuffer(1024*1024));}catch(e){status.textContent='heap rejected: '+e.message;}});
+document.getElementById('dom').addEventListener('click',()=>{status.textContent='DOM';try{const s='x'.repeat(512*1024);for(;;)document.createTextNode(s);}catch(e){status.textContent='DOM rejected: '+e.message;}});
+document.getElementById('timers').addEventListener('click',()=>{status.textContent='timers';try{for(let i=0;i<130;i++)setTimeout(()=>{},600000);}catch(e){status.textContent='timers rejected: '+e.message;}});
+console.log('No OS modules are exposed:',typeof std,typeof os,typeof Atomics,typeof SharedArrayBuffer);
+</script>

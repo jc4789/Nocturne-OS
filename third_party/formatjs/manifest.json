@@ -1,0 +1,138 @@
+{
+  "retrieved": "2026-10-06",
+  "repository": "https://github.com/formatjs/formatjs",
+  "esbuild": "0.28.2",
+  "locales": [
+    "en",
+    "ja"
+  ],
+  "timezoneSource": "@formatjs/intl-datetimeformat/add-all-tz.js",
+  "timezoneTableCount": 452,
+  "timezoneTransitionHorizon": 2100,
+  "packages": {
+    "@formatjs/intl-getcanonicallocales": {
+      "version": "3.2.12",
+      "resolved": "https://registry.npmjs.org/@formatjs/intl-getcanonicallocales/-/intl-getcanonicallocales-3.2.12.tgz",
+      "integrity": "sha512-THqQLTJUH2z2A7oE1guW8VzpGpsGFxwWZ+l8cI8Bk75xUU8DxtJoLfKl+5a6fYK26GeDWDWE0UbDhE5SwcLoFg==",
+      "license": "MIT"
+    },
+    "@formatjs/fast-memoize": {
+      "version": "3.1.7",
+      "resolved": "https://registry.npmjs.org/@formatjs/fast-memoize/-/fast-memoize-3.1.7.tgz",
+      "integrity": "sha512-zXfhLpvA6T7+efdt9JLbBwZ00tT7NsBMDVnDu8rpHeNNv8KfRZAMo2gkG0k9lK/Nzc//3kJ9pImsfuJxk3KhUA==",
+      "license": "MIT"
+    },
+    "@formatjs/intl-supportedvaluesof": {
+      "version": "2.3.11",
+      "resolved": "https://registry.npmjs.org/@formatjs/intl-supportedvaluesof/-/intl-supportedvaluesof-2.3.11.tgz",
+      "integrity": "sha512-oRzzAbJA08psr6AO0jgXAdx4HZ2vGNeja1fgaio2R2ne8DLtGPV+fa3gxI/t8J2dNPOndrwVAZVVfbH6GDFDwA==",
+      "license": "MIT"
+    },
+    "@formatjs/intl-locale": {
+      "version": "5.3.12",
+      "resolved": "https://registry.npmjs.org/@formatjs/intl-locale/-/intl-locale-5.3.12.tgz",
+      "integrity": "sha512-bI5CrvuC6A5PMOIiHX+6ETTHXzUofHw1U/fkI59sQJ+BFbkglxIVVncFPxHf4IHmAqAs/Rlp2bdzTEcLaq2tQw==",
+      "license": "MIT"
+    },
+    "@formatjs/intl-localematcher": {
+      "version": "0.9.0",
+      "resolved": "https://registry.npmjs.org/@formatjs/intl-localematcher/-/intl-localematcher-0.9.0.tgz",
+      "integrity": "sha512-Z7TD3ssNry1Av1dVDoq/mzpxGyxqWwU0ClWEo+BB3k0JQTeQvUGmeK9WZGYvlqStS0UqkaKXk3dfjsb6NaHAxw==",
+      "license": "MIT"
+    },
+    "@formatjs/bigdecimal": {
+      "version": "0.2.7",
+      "resolved": "https://registry.npmjs.org/@formatjs/bigdecimal/-/bigdecimal-0.2.7.tgz",
+      "integrity": "sha512-B4+XY/e4u5v261r3a37Kq2ax91gPZSKGyVpx8X5dygAggLlUz+6MeBpmAhaBFGB8WQ4JB1qD+QtKHk9aJkEb9Q==",
+      "license": "MIT"
+    },
+    "@formatjs/intl-pluralrules": {
+      "version": "6.3.15",
+      "resolved": "https://registry.npmjs.org/@formatjs/intl-pluralrules/-/intl-pluralrules-6.3.15.tgz",
+      "integrity": "sha512-/K6Up6SrvLcTP5mWVHp58A9Uk7I4jYbDYqtYdgKDeSY1HG0bhBMS4eVtqK2nFx8mWWdcHbt9ZqHBcCto573PNg==",
+      "license": "MIT"
+    },
+    "@formatjs/intl-numberformat": {
+      "version": "9.4.3",
+      "resolved": "https://registry.npmjs.org/@formatjs/intl-numberformat/-/intl-numberformat-9.4.3.tgz",
+      "integrity": "sha512-absVu2I7FlWl+Buictw2PL8Fl385uab3bEA3TCCTu+0DBHHFE+RTbmPmj0nUVO82U1b2Qw3/OA2I7KKLI48EpQ==",
+      "license": "MIT"
+    },
+    "@formatjs/intl-datetimeformat": {
+      "version": "7.8.1",
+      "resolved": "https://registry.npmjs.org/@formatjs/intl-datetimeformat/-/intl-datetimeformat-7.8.1.tgz",
+      "integrity": "sha512-tGVZ3KdbHQwmA8wBn7gEJeOE9zo0InoyrbJWsD4VYdHGJfXykflOpdNC69+QaZShxfEQ6dwUfXjDfNzxe4AO4A==",
+      "license": "MIT"
+    },
+    "@formatjs/intl-relativetimeformat": {
+      "version": "12.3.15",
+      "resolved": "https://registry.npmjs.org/@formatjs/intl-relativetimeformat/-/intl-relativetimeformat-12.3.15.tgz",
+      "integrity": "sha512-AUn+GJmU4z0098f4K8VYTxrOl0hfoTzXVeO0MmunJbn9fP5u0hSK2i8LntLQnediQ1oJDL8pyqZMWCBBSAhPDA==",
+      "license": "MIT"
+    },
+    "@formatjs/intl-listformat": {
+      "version": "8.3.15",
+      "resolved": "https://registry.npmjs.org/@formatjs/intl-listformat/-/intl-listformat-8.3.15.tgz",
+      "integrity": "sha512-dZEUYngBoAWLgYXvoBX3P6jIk5cg2rva7p5ZJTTn4lsCx/9abUKoPI2Wf59twxl5jgw1SDQMR1MBzJ7oiHwffw==",
+      "license": "MIT"
+    },
+    "@formatjs/intl-displaynames": {
+      "version": "7.3.15",
+      "resolved": "https://registry.npmjs.org/@formatjs/intl-displaynames/-/intl-displaynames-7.3.15.tgz",
+      "integrity": "sha512-U26iRwxxnD4aZY+aDiSEV5Ym/7Db5S9OxKQ4c3T+WFFIj+DPKEQLh+tC++dMH1SuEa8CSWvPJkpaADa+WHn3qA==",
+      "license": "MIT"
+    }
+  },
+  "upstreamFilesSha256": {
+    "source/@formatjs/intl-getcanonicallocales/polyfill-force.js": "13cfd8d27541e70ec46bf90c0fdd6a9078332d09f95ca50b0df5ff491dc91279",
+    "source/@formatjs/fast-memoize/index.js": "bc7aa788e52c49b3038e91d26c42121dca9635bdb4ed861701cdf01ab1f4c486",
+    "source/@formatjs/intl-supportedvaluesof/index.js": "43e5ec43b8360edf16e07233eee0328938f55f820af337f7397ed080a18ff49a",
+    "source/@formatjs/intl-getcanonicallocales/index.js": "2a43cd663c124d6de61a9f0c11779e69635a28986c5a072db1b2c9665ba8ad75",
+    "source/@formatjs/intl-locale/polyfill-force.js": "c82d1ab77425708579bf20e7bc146f096f7a93f255455ad4d0e03ac123a1d223",
+    "source/@formatjs/intl-localematcher/index.js": "8231e86893c5341360f06bf438791708f88d69f1a4cf0871ebf0d6f4cb9b56eb",
+    "source/@formatjs/bigdecimal/index.js": "3396c36ef24e38163f81c4e8004986182e047a0d0382ef301949d91a48a41e59",
+    "source/@formatjs/intl-pluralrules/polyfill-force.js": "6a025bbb48a6932a036134254f4f63c4b13cc83bc9640ebda1b834b88ffbd2a7",
+    "source/@formatjs/intl-pluralrules/locale-data/en.js": "42e195c0f29248de01a9b10f65763d9ccbe3f8b65128575e11a0cec041907468",
+    "source/@formatjs/intl-pluralrules/locale-data/ja.js": "186e8c241742a119f4f5ea504400b9d69838452bc9b1ebc1a7a2329f0029aad5",
+    "source/@formatjs/intl-numberformat/polyfill-force.js": "4e49a655f4b9c441649ba7052bcdd1ca8ae6a031fc87738662246c9ee652129a",
+    "source/@formatjs/intl-numberformat/locale-data/en.js": "0e8a783f810a4adcb9aeb81b9ccb747f0c6069efa3b85cb14f9bfc3637bf5cd5",
+    "source/@formatjs/intl-numberformat/locale-data/ja.js": "6d61f88002690fe6bd5ef801f87935117f6f29cf508b5c4e15de653412dcc07a",
+    "source/@formatjs/intl-datetimeformat/polyfill-force.js": "6b0cf18a501f61f6ef5c63de741ea1e0b41b006c39c2d86c2d68f697001ac34f",
+    "source/@formatjs/intl-datetimeformat/locale-data/en.js": "ae2440a6911c42179833ade1c4a10bfc87c8411b1569e0553386e7a61a196cd2",
+    "source/@formatjs/intl-datetimeformat/locale-data/ja.js": "ee23fdc7c9ed34e62135506964bcaae8dd0777022456d77768551be3d4861088",
+    "source/@formatjs/intl-datetimeformat/add-all-tz.js": "a7742ee85beefcdae55f60cafcab5caabf9d1101b6009d2c1415e06aece8ef2d",
+    "source/@formatjs/intl-relativetimeformat/polyfill-force.js": "0cdcaa44e4d2be66d2750e67f5ee8e94f52d4dac2facbe80b4121072c8be54d5",
+    "source/@formatjs/intl-relativetimeformat/locale-data/en.js": "930581812b5e7e811d29d12880fc000218b9121472224d12e075e61b0bc3e31d",
+    "source/@formatjs/intl-relativetimeformat/locale-data/ja.js": "2fac03274427f6a0cd60c8eebeea6359ccbf7d6d9827e10905f3ad9be75b4700",
+    "source/@formatjs/intl-listformat/polyfill-force.js": "ce908618d360a62394d083bc549eeb46908f5aed13338f2a8f2b443c686670e6",
+    "source/@formatjs/intl-listformat/locale-data/en.js": "96c9d7cf4354f4870a8f329e74d9dfedcda759a8a3baa4e21ca8e565615a763d",
+    "source/@formatjs/intl-listformat/locale-data/ja.js": "6ff7a26461801373f06f9eccaa36d329ae32b7b6c5e291eb62e882bbccbb989e",
+    "source/@formatjs/intl-displaynames/polyfill-force.js": "a3f8a769ead90632f82448e08807085173e7e126aebc655909a86b5b40e9562e",
+    "source/@formatjs/intl-displaynames/locale-data/en.js": "419da82eac3691663cc781200377ebf710be4ab28851b4acb04840b51e0e187b",
+    "source/@formatjs/intl-displaynames/locale-data/ja.js": "ab0772fbe57264df77aa594249da12d6bccad95fb6bf9e719cee35e9797ceb9f",
+    "source/@formatjs/intl-getcanonicallocales/package.json": "5855b65067bb814d8570498bae00f62b5576dbdc6bcbd8a5e805c2de31869286",
+    "source/@formatjs/intl-getcanonicallocales/LICENSE.md": "b1cc980e28e9e48f377db191578a9361494ca7117185b69dd66cabaf5b460fb7",
+    "source/@formatjs/fast-memoize/package.json": "3932b7f0608a5744ac241e047af721afee5321d7d63f6be0ec826c7ff6a40388",
+    "source/@formatjs/fast-memoize/LICENSE.md": "b1cc980e28e9e48f377db191578a9361494ca7117185b69dd66cabaf5b460fb7",
+    "source/@formatjs/intl-supportedvaluesof/package.json": "d976f83949a53c9f6e0af14771be03dfcf7f65f36cb3f9c5ac93dbe2225023c9",
+    "source/@formatjs/intl-supportedvaluesof/LICENSE.md": "1ada5450c84b70daee947209426e049242ffd6ab5badd4bd8908d36c218284ab",
+    "source/@formatjs/intl-locale/package.json": "e5fadce271207a0f84afb52dc4b155663850c437498fccd81b95e139f3fefb80",
+    "source/@formatjs/intl-locale/LICENSE.md": "b1cc980e28e9e48f377db191578a9361494ca7117185b69dd66cabaf5b460fb7",
+    "source/@formatjs/intl-localematcher/package.json": "1e8b9e78739fde63c8840048ce2bf393f3525442e409dd7d9b133a71c01ef833",
+    "source/@formatjs/intl-localematcher/LICENSE.md": "b1cc980e28e9e48f377db191578a9361494ca7117185b69dd66cabaf5b460fb7",
+    "source/@formatjs/bigdecimal/package.json": "62aabbd046fcddca1cf91f4c4ef92170c3484c5b28f47cd401f40c74c1974c29",
+    "source/@formatjs/bigdecimal/LICENSE.md": "bcd1a87864d1f6f854195f96a416ac33e8b7ba98e65f1e95d82cffa2e2f363d0",
+    "source/@formatjs/intl-pluralrules/package.json": "dea62c83ccaf4407b3b410802654086063319b71d5b998577071be2743aaf380",
+    "source/@formatjs/intl-pluralrules/LICENSE.md": "b1cc980e28e9e48f377db191578a9361494ca7117185b69dd66cabaf5b460fb7",
+    "source/@formatjs/intl-numberformat/package.json": "d185b24d9dad36f2d7d4e14f3904c2842b53d225072841e4a53f0c703cc235f8",
+    "source/@formatjs/intl-numberformat/LICENSE.md": "b1cc980e28e9e48f377db191578a9361494ca7117185b69dd66cabaf5b460fb7",
+    "source/@formatjs/intl-datetimeformat/package.json": "eeba1acb4bfabfce5672d5efa1f8058e0de4f33a9bd86302342fa15fe2640b15",
+    "source/@formatjs/intl-datetimeformat/LICENSE.md": "b1cc980e28e9e48f377db191578a9361494ca7117185b69dd66cabaf5b460fb7",
+    "source/@formatjs/intl-relativetimeformat/package.json": "2cdaaa3653c55946e9e13f713ec6691e128742257de363d7a9ff2486293f8251",
+    "source/@formatjs/intl-relativetimeformat/LICENSE.md": "b1cc980e28e9e48f377db191578a9361494ca7117185b69dd66cabaf5b460fb7",
+    "source/@formatjs/intl-listformat/package.json": "53a6e07e67548bcf1a24e2b5da02cae219c6af05edbd79f69aa6242d142900cd",
+    "source/@formatjs/intl-listformat/LICENSE.md": "b1cc980e28e9e48f377db191578a9361494ca7117185b69dd66cabaf5b460fb7",
+    "source/@formatjs/intl-displaynames/package.json": "ab732e2261c125dbb100432a899e8724a21211d8b9be2a3d9b78aeaba2dac2a8",
+    "source/@formatjs/intl-displaynames/LICENSE.md": "b1cc980e28e9e48f377db191578a9361494ca7117185b69dd66cabaf5b460fb7"
+  }
+}

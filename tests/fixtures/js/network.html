@@ -1,0 +1,25 @@
+<!doctype html><meta charset="utf-8"><title>Nocturne network acceptance</title>
+<link rel="stylesheet" href="fixture.css"><h1>Network / cancellation</h1>
+<p>Run the fixture server on the host and open this page through HTTP in Nocturne. The second port is a different origin.</p>
+<button id="run">Run network checks</button><button id="abort">Start then abort a slow request</button>
+<ol id="results"></ol><p><a href="index.html">Back</a></p>
+<script>
+function result(name,pass,extra){const n=document.createElement('li');n.className=pass?'pass':'fail';n.textContent=(pass?'PASS: ':'FAIL: ')+name+(extra?' — '+extra:'');document.getElementById('results').appendChild(n);console.log(n.textContent);}
+document.getElementById('run').addEventListener('click',async()=>{
+    const other=location.protocol+'//'+location.hostname+':8001';
+    try{const r=await fetch('/api/json');const b=await r.json();result('same-origin JSON',r.ok&&b.ok);}catch(e){result('same-origin JSON',false,e.message);}
+    try{const r=await fetch(other+'/api/cors',{method:'POST',headers:{'X-Fixture':'yes','Content-Type':'application/json'},body:'{"name":"Nocturne"}'});result('CORS preflight',r.ok);result('CORS exposed header',r.headers.get('x-exposed')==='visible');result('CORS private header hidden',r.headers.get('x-private')===null);}catch(e){result('CORS preflight',false,e.message);}
+    try{await fetch(other+'/api/no-cors');result('missing CORS permission rejected',false);}catch(e){result('missing CORS permission rejected',true);}
+    try{await fetch(other+'/api/cors',{mode:'same-origin'});result('same-origin mode rejects cross origin',false);}catch(e){result('same-origin mode rejects cross origin',true);}
+    try{const r=await fetch('/api/redirect?url=/api/json');result('redirect final URL',r.redirected&&r.url.includes('/api/json'));}catch(e){result('redirect',false,e.message);}
+    try{await fetch('/api/infinite-redirect');result('redirect loop rejected',false);}catch(e){result('redirect loop rejected',true);}
+    try{await fetch('/api/oversize');result('16 MiB response limit',false);}catch(e){result('16 MiB response limit',true);}
+    try{await fetch('file:///data/secret');result('remote page cannot read local file',false);}catch(e){result('remote page cannot read local file',true);}
+    try{await fetch('/api/json',{headers:{Host:'forbidden.example'}});result('forbidden request header rejected',false);}catch(e){result('forbidden request header rejected',true);}
+});
+document.getElementById('abort').addEventListener('click',async()=>{
+    const c=new AbortController();setTimeout(()=>c.abort(),100);
+    const start=performance.now();
+    try{await fetch('/api/slow?ms=5000',{signal:c.signal});result('abort slow request',false);}catch(e){result('abort slow request',e.name==='AbortError',e.name+' after '+Math.round(performance.now()-start)+' ms');}
+});
+</script>

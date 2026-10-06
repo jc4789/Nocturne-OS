@@ -241,7 +241,20 @@ int gfx_utf8_decode(const char *s, uint32_t *cp) {
     return 1;
 }
 
+#ifdef NOCTURNE_USER_FONT
+#include "font.h"
+#endif
+
 int gfx_char(canvas_t *c, int x, int y, uint8_t glyph, uint32_t fg, uint32_t bg, int font) {
+#ifdef NOCTURNE_USER_FONT
+    uint32_t cp = glyph;
+    if (glyph < 32 || (glyph >= 127 && glyph < 160)) {
+        for (int i = 0; i < FONT8X16_UMAP_COUNT; i++)
+            if (font8x16_umap[i][1] == glyph) { cp = font8x16_umap[i][0]; break; }
+    }
+    int advance = font_cell_draw(c, x, y, cp, fg, bg, font);
+    if (advance >= 0) return advance;
+#endif
     int fw = gfx_font_w(font), fh = gfx_font_h(font);
     if (x >= c->cx1 || y >= c->cy1 || x + fw <= c->cx0 || y + fh <= c->cy0) return fw;
     int bgop = (bg >> 24) != 0;
@@ -287,6 +300,10 @@ int gfx_text(canvas_t *c, int x, int y, const char *s, uint32_t fg, uint32_t bg,
             y += gfx_font_h(font);
             continue;
         }
+#ifdef NOCTURNE_USER_FONT
+        int advance = font_cell_draw(c, x, y, cp, fg, bg, font);
+        if (advance >= 0) { x += advance; continue; }
+#endif
         x += gfx_char(c, x, y, gfx_glyph_for(cp), fg, bg, font);
     }
     return x - x0;
@@ -297,7 +314,11 @@ int gfx_text_width(const char *s, int font) {
     while (*s) {
         uint32_t cp;
         s += gfx_utf8_decode(s, &cp);
-        n++;
+#ifdef NOCTURNE_USER_FONT
+        int advance = font_cell_width(cp, font);
+        if (advance >= 0) { n += advance; continue; }
+#endif
+        n += gfx_font_w(font);
     }
-    return n * gfx_font_w(font);
+    return n;
 }

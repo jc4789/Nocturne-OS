@@ -149,6 +149,92 @@ static void test_paint(void) {
     web_free(d);
 }
 
+/* Narrow regression coverage for the paint-order defect found on the live
+   DeepMind page; these pixel checks are not website acceptance tests. */
+static void test_item_z_order(void) {
+    const char *layouts[] = {"grid", "flex"};
+    for (int i = 0; i < 2; i++) {
+        char html[1024];
+        snprintf(html, sizeof html,
+                 "<body style=margin:0><div style='position:relative;display:%s;width:100px;height:50px'>"
+                 "<a href=/foreground style='display:block;width:100px;height:50px;background:red;z-index:1'></a>"
+                 "<div style='position:absolute;inset:0;background:blue;z-index:0'></div></div>", layouts[i]);
+        web_doc *d = load(html);
+        paint(d, 0);
+        color_is(i ? "flex-item-z-index" : "grid-item-z-index", 10, 10, 0xff0000, 0);
+        struct web_hit h;
+        total++;
+        if (!web_node_action(d, web_node_at(d, 10, 10), &h) || h.kind != WEB_HIT_LINK ||
+            !h.href || strcmp(h.href, "http://h.test/foreground"))
+            fail("item-z-index-hit", "foreground link missing (kind %d)", h.kind, 0);
+        web_free(d);
+    }
+    /* A positioned child belongs to the grid item's context, not the page. */
+    web_doc *d = load("<body style=margin:0><div style='position:relative;display:grid;width:100px;height:50px'>"
+        "<div style='height:50px;background:red;z-index:1'>"
+        "<a href=/nested style='position:relative;display:block;height:50px;background:lime'></a></div>"
+        "<div style='position:absolute;inset:0;background:blue;z-index:0'></div></div>");
+    paint(d, 0);
+    color_is("grid-context-auto-child", 10, 10, 0x00ff00, 0);
+    struct web_hit hit;
+    total++;
+    if (!web_node_action(d, web_node_at(d, 10, 10), &hit) || !hit.href || strcmp(hit.href, "http://h.test/nested"))
+        fail("grid-context-auto-hit", "nested link missing", 0, 0);
+    web_free(d);
+
+    d = load("<body style=margin:0><div style='position:relative;z-index:1;width:100px;height:50px'>"
+        "<div style='position:absolute;inset:0;background:red;z-index:99'></div></div>"
+        "<div style='position:absolute;top:0;left:0;width:100px;height:50px;background:blue;z-index:2'></div>");
+    paint(d, 0);
+    color_is("context-descendant-cannot-escape", 10, 10, 0x0000ff, 0);
+    web_free(d);
+
+    d = load("<body style=margin:0><div style='position:relative;z-index:1;width:100px;height:50px;background:lime'>"
+        "<div style='position:absolute;inset:0;background:red;z-index:-1'></div></div>");
+    paint(d, 0);
+    color_is("negative-after-context-background", 10, 10, 0xff0000, 0);
+    web_free(d);
+
+    d = load("<body style=margin:0><div style='position:relative;width:100px;height:50px'>"
+        "<div style='position:absolute;inset:0;background:red;z-index:3'></div></div>"
+        "<div style='position:absolute;top:0;left:0;width:100px;height:50px;background:blue;z-index:2'></div>");
+    paint(d, 0);
+    color_is("auto-does-not-isolate-z-index", 10, 10, 0xff0000, 0);
+    web_free(d);
+
+    /* A paint context is not necessarily the child's containing block. */
+    const char *clip_cases[] = {
+        "<div style='position:relative;z-index:1;overflow:hidden;width:20px;height:20px'>"
+        "<a href=/escape style='position:fixed;left:40px;top:0;width:20px;height:20px;background:red'></a></div>",
+        "<div style='position:relative;display:grid;width:100px;height:50px'>"
+        "<div style='z-index:1;overflow:hidden;width:20px;height:20px'>"
+        "<a href=/escape style='position:absolute;left:40px;top:0;width:20px;height:20px;background:red'></a></div></div>",
+        "<div style='position:relative;z-index:1;overflow:hidden;top:1000px;width:20px;height:20px'>"
+        "<div style='position:relative;z-index:2;overflow:hidden;width:10px;height:10px'>"
+        "<a href=/escape style='position:fixed;left:40px;top:0;width:20px;height:20px;background:red'></a></div></div>"
+    };
+    for (int i = 0; i < 3; i++) {
+        char html[1024];
+        snprintf(html, sizeof html, "<body style=margin:0>%s", clip_cases[i]);
+        d = load(html);
+        paint(d, 0);
+        color_is("context-overflow-escape", 45, 5, 0xff0000, 0);
+        total++;
+        if (!web_node_action(d, web_node_at(d, 45, 5), &hit) || !hit.href || strcmp(hit.href, "http://h.test/escape"))
+            fail("context-overflow-escape-hit", "case %d lost positioned link", i, 0);
+        web_free(d);
+    }
+    /* Conversely, overflow on the actual containing block must still apply. */
+    d = load("<body style=margin:0><div style='position:relative;z-index:1;overflow:hidden;width:20px;height:20px'>"
+        "<a href=/clipped style='position:absolute;left:40px;top:0;width:20px;height:20px;background:red'></a></div>");
+    paint(d, 0);
+    color_is("context-overflow-containing-block", 45, 5, 0xffffff, 0);
+    total++;
+    if (web_node_action(d, web_node_at(d, 45, 5), &hit))
+        fail("context-overflow-containing-block-hit", "clipped link is actionable", 0, 0);
+    web_free(d);
+}
+
 /* ---------------------------------------------------------------- links and forms */
 static web_node *node_at(web_doc *d, int x, int y, int kind, const char *name) {
     struct web_hit h;
@@ -349,6 +435,7 @@ static void test_hostile(void) {
 int main(void) {
     test_layout();
     test_paint();
+    test_item_z_order();
     test_forms();
     test_text();
     test_hostile();

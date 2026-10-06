@@ -1,4 +1,4 @@
-/* Nocturne's web engine (libc/web/): HTML parsing, CSS, layout and painting. No JavaScript.
+/* Nocturne's web engine: HTML, CSS, layout, painting and an optional QuickJS host.
 
    The embedder does the networking. A typical page load:
      web_doc *d = web_parse(html, len, final_url, charset);
@@ -17,9 +17,87 @@
 
 typedef struct web_doc web_doc;
 typedef struct node web_node; /* an element of the document */
+struct web_hit;
 
 /* charset: from the Content-Type header, or NULL (a <meta charset> or UTF-8 is used) */
 web_doc *web_parse(const char *html, size_t len, const char *url, const char *charset);
+
+/* Live documents. All callbacks run on the browser thread. request() must copy
+   its arguments before returning. Completion only queues work, never runs JS.
+   sync_load() is exclusively for the synchronous module loader: service native
+   UI/networking but NEVER enter JS or replace/free the document in that callback.
+   On success sync_load transfers malloc'd body to the caller. Other response
+   fields are inline. Resource ids belong to one document; the embedder must also
+   check its navigation generation before delivering a completion. */
+enum { WEB_RESOURCE_SCRIPT, WEB_RESOURCE_MODULE, WEB_RESOURCE_CSS,
+       WEB_RESOURCE_IMAGE, WEB_RESOURCE_FETCH };
+struct web_request {
+    uint64_t id;
+    int kind;
+    const char *url, *method, *headers;
+    const void *body;
+    size_t body_len;
+    int credentials; /* 0 omit, 1 same-origin, 2 include */
+};
+enum { WEB_HISTORY_INFO, WEB_HISTORY_PUSH, WEB_HISTORY_REPLACE, WEB_HISTORY_GO, WEB_HISTORY_SCROLL };
+struct web_history {
+    uint64_t entry;
+    int length;
+    bool manual_scroll;
+    const void *state; /* borrowed only until the host callback returns to JS binding */
+    size_t state_len;
+};
+struct web_response {
+    int status;
+    char url[2048], headers[4096], error[160];
+    char *body;
+    size_t body_len;
+};
+struct web_host {
+    void *opaque;
+    bool (*request)(void *opaque, const struct web_request *request);
+    void (*cancel)(void *opaque, uint64_t id);
+    bool (*sync_load)(void *opaque, const char *url, int kind, struct web_response *response);
+    void (*navigate)(void *opaque, const char *url, const char *post);
+    void (*console)(void *opaque, int level, const char *message);
+    void (*scroll)(void *opaque, int *x, int *y);
+    void (*scroll_to)(void *opaque, int x, int y);
+    bool (*history)(void *opaque, int operation, const char *url, const void *state,
+                    size_t state_len, int value, struct web_history *out);
+    /* The host owns the cookie jar; returned text is malloc'd, never HttpOnly. */
+    char *(*cookie_get)(void *opaque, const char *url);
+    void (*cookie_set)(void *opaque, const char *url, const char *value);
+    void (*navigate_mode)(void *opaque, const char *url, int mode); /* 0 assign, 1 reload, 2 replace */
+};
+bool web_set_url(web_doc *d, const char *url);
+/* Call between JS tasks, after the host history position and document URL change. */
+void web_history_event(web_doc *d, const char *old_url, bool popstate);
+web_doc *web_live(const char *html, size_t len, const char *url, const char *charset,
+                  const struct web_host *host);
+void web_tick(web_doc *d, uint64_t now_ms);
+/* -1: no deadline, otherwise an absolute uptime_ms() deadline. */
+int64_t web_deadline(web_doc *d);
+void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *response);
+bool web_dirty(web_doc *d); /* consumes the paint/layout dirty notification */
+bool web_script_running(web_doc *d);
+struct web_event {
+    const char *type, *key;
+    int x, y, button, key_code;
+    bool bubbles, cancelable, ctrl, shift, alt;
+    web_node *related_target;
+    int buttons;
+};
+/* NULL target means window. false means preventDefault() was called. */
+bool web_dispatch(web_doc *d, web_node *target, const struct web_event *event);
+/* Coalesced viewport scrolling targets Document and bubbles to Window. The host
+   calls this between JS tasks, not recursively from its scroll_to callback. */
+void web_document_scroll(web_doc *d);
+/* One native mouse movement, between JS tasks. target is the hit-tested element;
+   NULL means outside the document. Snapshots ancestry before any handlers run,
+   sends out/leave/over/enter as needed, then mousemove for a non-NULL target. */
+void web_hover(web_doc *d, web_node *target, const struct web_event *event);
+web_node *web_node_at(web_doc *d, int x, int y);
+bool web_node_action(web_doc *d, web_node *target, struct web_hit *hit);
 void web_free(web_doc *d);
 const char *web_title(web_doc *d); /* "" if none */
 const char *web_url(web_doc *d);
@@ -58,12 +136,14 @@ int web_anchor_y(web_doc *d, const char *fragment); /* y of the element with tha
 /* form controls */
 void web_focus(web_doc *d, web_node *n); /* NULL: nothing focused */
 web_node *web_focused(web_doc *d);
+const char *web_control_value(web_node *control);
 /* a key for the focused text control: 0 ignored, 1 changed (repaint), 2 Enter: submit its form */
 int web_key(web_doc *d, const struct gui_event *e);
 void web_toggle(web_doc *d, web_node *n); /* checkbox or radio click */
 /* the request a form submission makes: *url is malloc'd; *body is malloc'd for POST, NULL for GET.
    submitter is the clicked button, or any control of the form. */
 bool web_submit(web_doc *d, web_node *submitter, char **url, char **body);
+web_node *web_form_owner(web_doc *d, web_node *control);
 int web_select_options(web_doc *d, web_node *sel, const char **labels, int max, int *selected);
 void web_select_set(web_doc *d, web_node *sel, int index);
 /* document rectangle of an element (its first box), for placing popups */

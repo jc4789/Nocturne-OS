@@ -1,0 +1,23 @@
+globalThis.runDOMCompareCases = function() {
+    let count=0;
+    const assert=(v,n)=>{count++;check('node-compare-'+n,v);if(!v)throw new Error(n);};
+    const a=document.createElement('div'),b=document.createElement('DIV');
+    a.setAttribute('a','1');a.setAttribute('b','2');b.setAttribute('b','2');b.setAttribute('a','1');
+    assert(a.isEqualNode(b)&&b.isEqualNode(a),'attribute-order');
+    assert(!a.isSameNode(b)&&a.isSameNode(a),'identity');
+    assert(!a.isEqualNode()&&!a.isEqualNode(null)&&!a.isSameNode(),'null');
+    a.appendChild(document.createTextNode('ab'));b.appendChild(document.createTextNode('ab'));
+    assert(a.isEqualNode(b),'text-child');
+    b.firstChild.nodeValue='ac';assert(!a.isEqualNode(b),'text-different');
+    b.textContent='ab';b.appendChild(document.createComment('x'));assert(!a.isEqualNode(b),'child-count');
+    a.appendChild(document.createComment('x'));assert(a.isEqualNode(b),'comment-child');
+    assert(a.isEqualNode(a.cloneNode(true))&&!a.isEqualNode(a.cloneNode(false)),'clone');
+    b.setAttribute('a','3');assert(!a.isEqualNode(b),'attribute-value');
+    b.setAttribute('a','1');b.removeAttribute('b');assert(!a.isEqualNode(b),'attribute-count');
+    const f=document.createDocumentFragment();f.appendChild(a.cloneNode(true));
+    assert(f.isEqualNode(f.cloneNode(true)),'fragment');
+    const svg=document.createElementNS('http://www.w3.org/2000/svg','div');assert(!a.isEqualNode(svg),'namespace');
+    let threw=false;try{a.isEqualNode({});}catch(e){threw=e instanceof TypeError;}assert(threw,'other-brand');
+    threw=false;try{Node.prototype.isEqualNode.call({},a);}catch(e){threw=e instanceof TypeError;}assert(threw,'receiver-brand');
+    return count;
+};

@@ -10,12 +10,25 @@ struct achunk {
 };
 
 void *ar_alloc(arena_t *a, size_t n) {
+    if (n > SIZE_MAX - 7) {
+        if (a->trap) longjmp(*a->trap, 1);
+        abort();
+    }
     n = (n + 7) & ~(size_t)7;
     struct achunk *c = a->head;
     if (!c || c->used + n > c->cap) {
         size_t cap = n > 60000 ? n : 65536 - sizeof(struct achunk);
+        if ((a->limit && (cap > a->limit || a->allocated > a->limit - cap)) ||
+            cap > SIZE_MAX - sizeof(struct achunk)) {
+            if (a->trap) longjmp(*a->trap, 1);
+            abort();
+        }
         c = malloc(sizeof(struct achunk) + cap);
-        if (!c) abort();
+        if (!c) {
+            if (a->trap) longjmp(*a->trap, 1);
+            abort();
+        }
+        a->allocated += cap;
         c->used = 0;
         c->cap = cap;
         c->next = a->head;
@@ -42,6 +55,7 @@ void ar_free(arena_t *a) {
         free(c);
     }
     a->head = NULL;
+    a->allocated = 0;
 }
 
 /* ---------------------------------------------------------------- buffers */

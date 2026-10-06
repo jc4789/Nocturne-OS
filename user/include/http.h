@@ -26,6 +26,9 @@ bool url_parse(const char *s, struct url *u);
 /* ---- HTTP ---- */
 /* body callback: return a negative value to abort the transfer */
 typedef int (*http_body_cb)(void *ctx, const char *data, size_t n);
+/* Each complete header line, before the bounded public snapshot. Negative aborts.
+   The line has no CRLF and is not truncated. Never log secret field values. */
+typedef int (*http_header_cb)(void *ctx, const char *line, size_t n);
 
 struct http_req {
     const char *method;  /* "GET" if NULL */
@@ -36,6 +39,7 @@ struct http_req {
     int timeout_ms;      /* per read; 0 means 60 s */
     http_body_cb on_body; /* stream the body here; NULL collects it into resp.body */
     void *ctx;
+    http_header_cb on_header;
 };
 
 struct http_resp {

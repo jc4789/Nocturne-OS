@@ -188,9 +188,13 @@ enum { M_BEFORE_HEAD, M_IN_HEAD, M_AFTER_HEAD, M_IN_BODY };
 
 #define MAX_STACK 400
 
-struct parser {
+struct html_parser {
     web_doc *d;
     arena_t *a;
+    bool scripting, fragment, finished, failed;
+    node_t *yield;
+    size_t write_offset;
+    sbuf input, raw;
     const char *s;
     size_t n, i;
     node_t *stack[MAX_STACK];
@@ -208,7 +212,7 @@ struct parser {
     sbuf aval;
 };
 
-static node_t *cur(struct parser *p) { return p->stack[p->sp - 1]; }
+static node_t *cur(struct html_parser *p) { return p->stack[p->sp - 1]; }
 
 static void append(node_t *parent, node_t *c) {
     c->parent = parent;
@@ -227,8 +231,10 @@ static void append(node_t *parent, node_t *c) {
     }
 }
 
-static node_t *new_elem(struct parser *p, const char *name, size_t len, bool foreign) {
+static node_t *new_elem(struct html_parser *p, const char *name, size_t len, bool foreign) {
     node_t *e = ar_alloc(p->a, sizeof *e);
+    e->owned_next = p->d->owned_nodes;
+    p->d->owned_nodes = e;
     e->type = N_ELEM;
     char lname[64];
     size_t ln = len < sizeof lname - 1 ? len : sizeof lname - 1;
@@ -242,7 +248,7 @@ static node_t *new_elem(struct parser *p, const char *name, size_t len, bool for
 }
 
 /* give the element the attributes of the current token */
-static void set_attrs(struct parser *p, node_t *e) {
+static void set_attrs(struct html_parser *p, node_t *e) {
     if (!p->ntattrs) return;
     e->attrs = ar_alloc(p->a, sizeof(struct attr) * (size_t)p->ntattrs);
     e->nattrs = p->ntattrs;
@@ -271,17 +277,17 @@ static void set_attrs(struct parser *p, node_t *e) {
     }
 }
 
-static void flush_text(struct parser *p);
+static void flush_text(struct html_parser *p);
 
-static void push(struct parser *p, node_t *e) {
+static void push(struct html_parser *p, node_t *e) {
     if (p->sp < MAX_STACK) p->stack[p->sp++] = e;
 }
 
-static void pop(struct parser *p) {
+static void pop(struct html_parser *p) {
     if (p->sp > 1) p->sp--;
 }
 
-static void ensure_html(struct parser *p) {
+static void ensure_html(struct html_parser *p) {
     if (p->html) return;
     p->html = new_elem(p, "html", 4, false);
     append(p->doc, p->html);
@@ -289,14 +295,14 @@ static void ensure_html(struct parser *p) {
     push(p, p->html);
 }
 
-static void ensure_head(struct parser *p) {
+static void ensure_head(struct html_parser *p) {
     ensure_html(p);
     if (p->head) return;
     p->head = new_elem(p, "head", 4, false);
     append(p->html, p->head);
 }
 
-static void ensure_body(struct parser *p) {
+static void ensure_body(struct html_parser *p) {
     if (p->mode == M_IN_BODY) return;
     ensure_head(p);
     p->sp = 1; /* close head (and anything left open in it) */
@@ -308,7 +314,7 @@ static void ensure_body(struct parser *p) {
     p->mode = M_IN_BODY;
 }
 
-static void insert_text(struct parser *p, const char *s, size_t n) {
+static void insert_text(struct html_parser *p, const char *s, size_t n) {
     node_t *parent = cur(p);
     node_t *last = parent->last;
     if (last && last->type == N_TEXT) {
@@ -320,6 +326,8 @@ static void insert_text(struct parser *p, const char *s, size_t n) {
         return;
     }
     node_t *t = ar_alloc(p->a, sizeof *t);
+    t->owned_next = p->d->owned_nodes;
+    p->d->owned_nodes = t;
     t->type = N_TEXT;
     t->text = ar_strndup(p->a, s, n);
     t->textlen = n;
@@ -327,7 +335,7 @@ static void insert_text(struct parser *p, const char *s, size_t n) {
     append(parent, t);
 }
 
-static void flush_text(struct parser *p) {
+static void flush_text(struct html_parser *p) {
     if (!p->text.n) return;
     const char *s = p->text.p;
     size_t n = p->text.n;
@@ -362,7 +370,7 @@ static const int special_tags[] = {
 static const int scope_base[] = {T_applet, T_caption, T_html, T_table, T_td, T_th, T_marquee, T_object, T_template, 0};
 
 /* is an element with this tag open, within the given scope? returns its stack index or -1 */
-static int in_scope(struct parser *p, int tag, int kind /* 0 normal, 1 button, 2 list item, 3 table */) {
+static int in_scope(struct html_parser *p, int tag, int kind /* 0 normal, 1 button, 2 list item, 3 table */) {
     for (int i = p->sp - 1; i >= 0; i--) {
         node_t *e = p->stack[i];
         if (e->tag == tag && !e->foreign) return i;
@@ -378,18 +386,18 @@ static int in_scope(struct parser *p, int tag, int kind /* 0 normal, 1 button, 2
     return -1;
 }
 
-static void pop_to(struct parser *p, int idx) {
+static void pop_to(struct html_parser *p, int idx) {
     if (idx >= 1) p->sp = idx;
 }
 
-static void close_p(struct parser *p) {
+static void close_p(struct html_parser *p) {
     int i = in_scope(p, T_p, 1);
     if (i >= 0) pop_to(p, i);
 }
 
 static bool is_heading(int t) { return t >= T_h1 && t <= T_h6; }
 
-static node_t *insert_elem(struct parser *p, bool foreign) {
+static node_t *insert_elem(struct html_parser *p, bool foreign) {
     node_t *e = new_elem(p, p->tname, p->tlen, foreign);
     set_attrs(p, e);
     append(cur(p), e);
@@ -397,7 +405,7 @@ static node_t *insert_elem(struct parser *p, bool foreign) {
 }
 
 /* read raw text up to </tag>; RCDATA decodes character references */
-static void read_raw(struct parser *p, const char *tag, bool rcdata, sbuf *out) {
+static void read_raw(struct html_parser *p, const char *tag, bool rcdata, sbuf *out) {
     size_t tl = strlen(tag);
     while (p->i < p->n) {
         const char *s = p->s + p->i;
@@ -428,19 +436,26 @@ static void read_raw(struct parser *p, const char *tag, bool rcdata, sbuf *out) 
     }
 }
 
-static void raw_element(struct parser *p, node_t *e, bool rcdata) {
-    sbuf t = {0};
-    read_raw(p, e->name, rcdata, &t);
-    if (e->tag == T_textarea && t.n && t.p[0] == '\n') memmove(t.p, t.p + 1, --t.n);
-    if (t.n) {
+static void raw_element(struct html_parser *p, node_t *e, bool rcdata) {
+    sbuf *t = &p->raw;
+    t->n = 0;
+    read_raw(p, e->name, rcdata, t);
+    if (e->tag == T_textarea && t->n && t->p[0] == '\n') memmove(t->p, t->p + 1, --t->n);
+    if (t->n) {
         node_t *tn = ar_alloc(p->a, sizeof *tn);
+        tn->owned_next = p->d->owned_nodes;
+        p->d->owned_nodes = tn;
         tn->type = N_TEXT;
-        tn->text = ar_strndup(p->a, t.p, t.n);
-        tn->textlen = t.n;
+        tn->text = ar_strndup(p->a, t->p, t->n);
+        tn->textlen = t->n;
         tn->image = -1;
         append(e, tn);
     }
-    sb_free(&t);
+    t->n = 0;
+    if (e->tag == T_script) {
+        if (p->scripting && !node_ancestor(e, T_template)) p->yield = e;
+        else if (p->fragment || node_ancestor(e, T_template)) e->script_started = true;
+    }
 }
 
 static const int head_tags[] = {T_base, T_link, T_meta, T_style, T_script, T_title, T_noscript, T_template, 0};
@@ -458,7 +473,7 @@ static const int html_breakout[] = {T_b, T_big, T_blockquote, T_body, T_br, T_ce
 
 /* <!DOCTYPE ...>: standards mode for "html" without a legacy public identifier (a simplification
    of the HTML spec's quirks rules) */
-static void doctype(struct parser *p, const char *s, size_t n) {
+static void doctype(struct html_parser *p, const char *s, size_t n) {
     char buf[256];
     size_t k = n < sizeof buf - 1 ? n : sizeof buf - 1;
     for (size_t i = 0; i < k; i++) buf[i] = (char)lower((unsigned char)s[i]);
@@ -475,9 +490,19 @@ static void doctype(struct parser *p, const char *s, size_t n) {
     p->d->quirks = false;
 }
 
-static void start_tag(struct parser *p) {
+static void start_tag(struct html_parser *p) {
     int t = tag_lookup(p->tname, p->tlen);
     if (!p->sp) ensure_html(p);
+    /* Inert template contents must not reset the head stack or execute scripts. */
+    if (node_ancestor(cur(p), T_template)) {
+        flush_text(p);
+        node_t *e = insert_elem(p, cur(p)->foreign || t == T_svg || t == T_math);
+        if (tag_in(t, void_tags) || p->self_closing) return;
+        if (t == T_script || t == T_style) raw_element(p, e, false);
+        else if (t == T_title || t == T_textarea) raw_element(p, e, true);
+        else push(p, e);
+        return;
+    }
 
     /* inside SVG/MathML everything nests as written, until an HTML element breaks out */
     if (cur(p)->foreign) {
@@ -495,7 +520,7 @@ static void start_tag(struct parser *p) {
         if (!p->html->nattrs) set_attrs(p, p->html); /* <html lang=.. class=..> */
         return;
     }
-    if (p->mode != M_IN_BODY && tag_in(t, head_tags)) {
+    if (p->mode != M_IN_BODY && !node_ancestor(cur(p), T_template) && tag_in(t, head_tags)) {
         flush_text(p);
         ensure_head(p);
         p->sp = 1;
@@ -504,6 +529,7 @@ static void start_tag(struct parser *p) {
         node_t *e = insert_elem(p, false);
         if (t == T_title) raw_element(p, e, true);
         else if (t == T_style || t == T_script) raw_element(p, e, false);
+        else if (t == T_noscript && p->scripting) raw_element(p, e, false);
         else if (t == T_noscript || t == T_template) push(p, e);
         return;
     }
@@ -618,6 +644,10 @@ static void start_tag(struct parser *p) {
     if (tag_in(t, void_tags)) return;
     if (foreign && p->self_closing) return;
     switch (t) {
+    case T_noscript:
+        if (!p->scripting) break;
+        raw_element(p, e, false);
+        return;
     case T_script: case T_style: case T_xmp: case T_iframe: case T_noembed: case T_noframes:
         raw_element(p, e, false);
         return;
@@ -640,7 +670,7 @@ static void start_tag(struct parser *p) {
     push(p, e);
 }
 
-static void end_tag(struct parser *p) {
+static void end_tag(struct html_parser *p) {
     int t = tag_lookup(p->tname, p->tlen);
     flush_text(p);
     if (!p->sp) ensure_html(p);
@@ -712,7 +742,7 @@ static void end_tag(struct parser *p) {
 }
 
 /* ---------------------------------------------------------------- tokenizer */
-static void read_tag(struct parser *p, bool end) {
+static void read_tag(struct html_parser *p, bool end) {
     const char *s = p->s;
     size_t n = p->n;
     size_t st = p->i;
@@ -786,7 +816,7 @@ static void read_tag(struct parser *p, bool end) {
     }
 }
 
-static void skip_past(struct parser *p, const char *end) {
+static void skip_past(struct html_parser *p, const char *end) {
     const char *f = NULL;
     size_t el = strlen(end);
     for (size_t k = p->i; k + el <= p->n; k++)
@@ -797,7 +827,7 @@ static void skip_past(struct parser *p, const char *end) {
     p->i = f ? (size_t)(f - p->s) + el : p->n;
 }
 
-static void tokenize(struct parser *p) {
+static void tokenize(struct html_parser *p) {
     const char *s = p->s;
     size_t n = p->n;
     while (p->i < n) {
@@ -844,6 +874,7 @@ static void tokenize(struct parser *p) {
                 p->i++;
                 read_tag(p, false);
                 start_tag(p);
+                if (p->yield) return;
                 continue;
             }
         }
@@ -907,7 +938,7 @@ static void prescan_charset(const char *s, size_t n, char *out, size_t cap) {
     }
 }
 
-node_t *html_parse(web_doc *d, const char *src, size_t n, const char *charset) {
+struct html_parser *html_begin(web_doc *d, const char *src, size_t n, const char *charset, bool scripting) {
     /* to UTF-8, with CR LF and CR as LF and NUL as U+FFFD */
     char meta_cs[32];
     prescan_charset(src, n, meta_cs, sizeof meta_cs);
@@ -930,26 +961,144 @@ node_t *html_parse(web_doc *d, const char *src, size_t n, const char *charset) {
         else sb_putc(&in, (char)c);
     }
 
-    struct parser *p = calloc(1, sizeof *p);
+    struct html_parser *p = calloc(1, sizeof *p);
+    if (!p) { sb_free(&in); return NULL; }
     p->d = d;
     p->a = &d->mem;
+    p->scripting = scripting;
+    p->input = in;
     d->quirks = true; /* until a doctype says otherwise */
     p->s = in.p ? in.p : "";
     p->n = in.n;
+    jmp_buf trap;
+    jmp_buf *old = d->mem.trap;
+    d->mem.trap = &trap;
+    if (setjmp(trap)) {
+        d->mem.trap = old;
+        html_finish(p);
+        return NULL;
+    }
     p->doc = ar_alloc(p->a, sizeof(node_t));
     p->doc->type = N_DOC;
     p->doc->image = -1;
+    p->doc->owned_next = d->owned_nodes;
+    d->owned_nodes = p->doc;
+    d->root = p->doc;
+    d->mem.trap = old;
+    return p;
+}
+
+int html_resume(struct html_parser *p, node_t **script) {
+    if (script) *script = NULL;
+    if (!p || p->failed) return -1;
+    if (p->finished) return 0;
+    jmp_buf trap;
+    jmp_buf *old = p->a->trap;
+    p->a->trap = &trap;
+    if (setjmp(trap)) {
+        p->a->trap = old;
+        p->failed = true;
+        return -1;
+    }
+    p->yield = NULL;
+    p->write_offset = 0;
     tokenize(p);
-    ensure_body(p);
-    d->html = p->html;
-    d->head = p->head;
-    d->body = p->body;
-    node_t *doc = p->doc;
+    if (!p->yield) {
+        if (!p->fragment) ensure_body(p);
+        p->finished = true;
+    }
+    if (!p->fragment) {
+        p->d->html = p->html;
+        p->d->head = p->head;
+        p->d->body = p->body;
+        p->d->resources_dirty = true;
+        p->d->dirty = p->d->need_style = true;
+    }
+    p->a->trap = old;
+    if (script) *script = p->yield;
+    return p->yield ? 1 : 0;
+}
+
+bool html_write(struct html_parser *p, const char *text, size_t n) {
+    if (!p || p->finished || !p->yield || !p->scripting || n > (16u << 20) || p->n > (16u << 20) - n)
+        return false;
+    size_t at = p->i + p->write_offset;
+    char *next = realloc(p->input.p, p->n + n + 1);
+    if (!next) return false;
+    memmove(next + at + n, next + at, p->n - at);
+    memcpy(next + at, text, n);
+    p->n += n;
+    next[p->n] = 0;
+    p->input.p = next;
+    p->input.n = p->n;
+    p->input.cap = p->n + 1;
+    p->s = next;
+    p->write_offset += n;
+    return true;
+}
+
+void html_finish(struct html_parser *p) {
+    if (!p) return;
     sb_free(&p->text);
     sb_free(&p->aval);
+    sb_free(&p->input);
+    sb_free(&p->raw);
     free(p);
-    sb_free(&in);
-    return doc;
+}
+
+node_t *html_parse(web_doc *d, const char *src, size_t n, const char *charset) {
+    struct html_parser *p = html_begin(d, src, n, charset, false);
+    if (!p) return NULL;
+    node_t *script;
+    int r = html_resume(p, &script);
+    node_t *root = r < 0 ? NULL : d->root;
+    html_finish(p);
+    return root;
+}
+
+node_t *html_fragment(web_doc *d, node_t *context, const char *src, size_t n) {
+    node_t *saved_root = d->root;
+    bool quirks = d->quirks;
+    struct html_parser *p = html_begin(d, src, n, "utf-8", false);
+    d->root = saved_root;
+    d->quirks = quirks;
+    if (!p) return NULL;
+    p->fragment = true;
+    p->doc->type = N_FRAGMENT;
+    jmp_buf trap;
+    jmp_buf *old = d->mem.trap;
+    d->mem.trap = &trap;
+    if (setjmp(trap)) {
+        d->mem.trap = old;
+        html_finish(p);
+        return NULL;
+    }
+    p->html = new_elem(p, "html", 4, false);
+    p->body = new_elem(p, context && context->name ? context->name : "div",
+                       context && context->name ? strlen(context->name) : 3,
+                       context && context->foreign);
+    append(p->doc, p->html);
+    append(p->html, p->body);
+    p->stack[0] = p->html;
+    p->stack[1] = p->body;
+    p->sp = 2;
+    p->mode = M_IN_BODY;
+    if (context && (context->tag == T_textarea || context->tag == T_title ||
+                    context->tag == T_script || context->tag == T_style)) {
+        raw_element(p, p->body, context->tag == T_textarea || context->tag == T_title);
+        p->i = p->n;
+    }
+    d->mem.trap = old;
+    node_t *ignored;
+    if (html_resume(p, &ignored) < 0) { html_finish(p); return NULL; }
+    node_t *frag = p->doc;
+    node_t *first = p->body->first, *last = p->body->last;
+    p->body->first = p->body->last = NULL;
+    frag->first = first;
+    frag->last = last;
+    for (node_t *c = first; c; c = c->next) c->parent = frag;
+    html_finish(p);
+    return frag;
 }
 
 /* ---------------------------------------------------------------- node helpers */

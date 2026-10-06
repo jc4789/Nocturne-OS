@@ -1,0 +1,69 @@
+/* Native rasterizer/measurement regressions. Not a substitute for real-site tests. */
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "font.h"
+
+static int checks, failed;
+static uint32_t pixels[640 * 96];
+static canvas_t canvas;
+static void check(int ok, const char *why) {
+    checks++;
+    if (!ok) { failed++; printf("FAIL font: %s\n", why); }
+}
+static uint32_t raster(font_t *f, const char *text, float px) {
+    memset(pixels, 0, sizeof pixels);
+    float x = font_draw(&canvas, f, px, 4, 48, text, strlen(text), RGB(240,240,240));
+    check(fabsf(x - 4 - font_width(f, px, text, strlen(text))) < .01f, "draw and width agree");
+    uint32_t hash = 2166136261u; int ink = 0;
+    for (unsigned i = 0; i < sizeof pixels / sizeof *pixels; i++) {
+        hash = (hash ^ pixels[i]) * 16777619u;
+        if (pixels[i]) ink++;
+    }
+    check(ink > 0, "visible glyph pixels");
+    return hash;
+}
+int main(void) {
+    gfx_init(&canvas, pixels, 640, 96, 640);
+    font_t *cn = font_open("/usr/share/fonts/MapleMono-NF-CN-Regular.ttf");
+    font_t *raw = font_open("/usr/share/fonts/MapleMono-NF-Regular.ttf");
+    check(cn && raw, "bundled original fonts open");
+    if (!cn || !raw) return 1;
+    check(!font_has(raw, 0x65e5), "explicit Latin face does not pretend to contain CJK");
+    uint32_t regular = 0, bold = 0, italic = 0;
+    const char *mixed = "Maple 日本語 中文 あいう カタカナ";
+    for (int style = 0; style < 4; style++) {
+        font_t *f = font_ui(style);
+        check(f != NULL, "each default style opens");
+        if (!f) continue;
+        check(f == font_ui(style), "default face is cached");
+        check(font_has(f,0x65e5) && font_has(f,0x8a9e) && font_has(f,0x4e2d) &&
+              font_has(f,0x3042) && font_has(f,0x30ab), "shared Japanese/Chinese fallback");
+        check(!font_has(f,0xd55c), "absent Hangul is not reported as supported");
+        check(!font_has(f,0x10ffff), "unassigned glyph is absent");
+        check(fabsf(font_advance(f,20,'i')-font_advance(f,20,'W')) < .001f, "Maple monospaced Latin");
+        check(fabsf(font_advance(f,20,0x65e5)-2*font_advance(f,20,'A')) < .001f, "CJK is two Latin columns");
+        float sum = 0; const char *p = mixed;
+        while (*p) { uint32_t cp; p += gfx_utf8_decode(p,&cp); sum += font_advance(f,20,cp); }
+        check(fabsf(sum-font_width(f,20,mixed,strlen(mixed))) < .01f, "mixed measurement is glyph-consistent");
+        raster(f,mixed,20);
+        check(raster(f,"日本語",24) == raster(cn,"日本語",24), "fallback raster is the actual CN face");
+        uint32_t latin = raster(f,"Maple ABC ijk",24);
+        if (!style) regular = latin;
+        else if (style == 1) bold = latin;
+        else if (style == 2) italic = latin;
+        if (!style) check(latin == raster(raw,"Maple ABC ijk",24), "default is Maple not former Inter");
+    }
+    check(regular != bold && regular != italic && bold != italic, "real style outlines differ");
+    check(raster(cn,"日",24) != raster(cn,"本",24), "distinct CJK glyphs, not a shared tofu box");
+    check(gfx_text_width("ABC日本",FONT_SMALL) == 56, "chrome width uses two CJK cells");
+    check(gfx_text_width("ABC日本",FONT_LARGE) == 112, "large chrome width doubles");
+    check(gfx_text(&canvas,0,0,"ABC日本",RGB(255,255,255),0,FONT_SMALL) == 56, "chrome draw agrees with width");
+    uint32_t before[640 * 4];
+    memset(pixels,0x5a,sizeof pixels); memcpy(before,pixels,sizeof before);
+    gfx_clip(&canvas,10,10,70,40);
+    font_draw(&canvas,font_ui(0),24,-5,32,mixed,strlen(mixed),RGB(255,255,255));
+    check(memcmp(before,pixels,sizeof before) == 0, "text respects canvas clip");
+    printf("fonttest: %d checks, %d failed\n",checks,failed);
+    return failed != 0;
+}

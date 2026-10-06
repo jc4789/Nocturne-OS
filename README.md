@@ -17,7 +17,10 @@ commands, write C, compile it with `tcc`, start it and look at the screen to che
 Everything it writes is kept on a persistent disk.
 
 Nocturne has its own **web browser**. HTML and CSS (block, inline, float, table, flexbox and grid
-layout) are parsed, laid out and painted by an engine written for Nocturne. It has no JavaScript.
+layout) are parsed, laid out and painted by an engine written for Nocturne.
+QuickJS の実験的な統合がありますが、ブラウザー API は未完成です。
+**現時点で YouTube、DeepMind、通常版 DuckDuckGo、ChatGPT の正常動作は確認できていません。**
+実サイトの QEMU 検証結果と残課題は [検証記録](docs/browser-validation-2026-10-06.md) を参照してください。
 
 ![Desktop and start menu](docs/desktop-menu.png)
 
@@ -266,7 +269,12 @@ charsets), runs the CSS cascade (combinators, attribute selectors, `:nth-child()
 `:has()`, `@media`, `@supports`, `@layer`, custom properties, `calc()`), and lays out block, inline, float, table, flexbox and grid
 boxes, including positioned elements and `::before`/`::after`. Painting covers backgrounds, linear
 and radial gradients, borders with rounded corners, PNG/JPEG/GIF/WebP/SVG images and CSS masks.
-Text is drawn with the Inter font (`monospace` uses Spleen). Links, forms (text fields, checkboxes,
+本文と `monospace` の標準フォントは Maple Mono NF です。通常・太字・斜体・太字斜体を同梱し、
+欠けた文字は共通の Maple Mono NF CN Regular で補います。ひらがな・カタカナ・多くの漢字に対応しますが、
+この提供版にハングル音節はありません。アプリの共通UI描画もMaple Monoを使用します。
+起動コンソールとカーネルのウィンドウ装飾は従来のビットマップ描画のままです。
+端末の全角セル処理やエディターのUnicode編集は別の未対応部分です。
+Links, forms (text fields, checkboxes,
 radio buttons, selects, GET and POST) and find in page work.
 
 The browser loads the page and its stylesheets first, shows it, then fetches images one at a time
@@ -282,9 +290,12 @@ while you read, laying the page out again as they arrive. Redirects, `<meta http
 | Esc | Stop loading |
 | Space, PgUp/PgDn, arrows, wheel | Scroll |
 
-Browser limits: no JavaScript, so pages that build themselves with scripts show their fallback (or
-nothing). No cookies, so nothing that needs a login. Web fonts are not loaded, so icon fonts show
-as boxes. There is no CJK font. Flexbox and grid cover the common cases, not every corner of the
+ブラウザーの制約: QuickJS の JavaScript 実行と、現代のサイトが要求する Web API・描画の対応は別です。
+未実装 API による例外で実サイトの初期化が停止します。単体試験の成功は実サイトの動作保証ではありません。
+Cookie jarは実装されていますが、実サイトへのログイン動作は検証済みではありません。
+Webフォントの取得とOpenTypeの合字処理は未実装で、アイコンフォントは文字名や欠落字形になる場合があります。
+同梱Maple Monoの追加は、このWebフォント対応やJavaScriptの未実装部分を解決するものではありません。
+Flexbox and grid cover the common cases, not every corner of the
 specs, and there are no transforms, animations or `position: sticky`.
 
 ## Persistent storage: /data
@@ -361,7 +372,7 @@ What Nocturne does not have, so nobody is surprised:
 - **A plain Enhanced Session.** It carries the picture, keyboard, mouse, sound and text on the clipboard: no images or files on the clipboard, no microphone, drive or printer sharing. If VMConnect doesn't send a new size when you resize its window, reconnect to change the size. The RDP server uses no encryption; it is reachable only through a Hyper-V socket on the host, never over the network.
 - **Sound out only, on one kind of card.** AC'97 or the Enhanced Session: no Intel HD Audio, no recording, and uncompressed sound only (no MP3 or Ogg).
 - **The AI agent runs the model's commands without asking.** Anything it does stays inside the VM, but it can delete files on `/data`.
-- **A web browser without JavaScript or cookies.** See [its limits](#the-web-browser).
+- **実験的な JavaScript 統合で、ブラウザー API と Cookie は未完成。** [制約](#the-web-browser)と[実サイト検証](docs/browser-validation-2026-10-06.md)を参照。
 - **Only checked in virtual machines.** It has been tested in QEMU and Hyper-V, never on real hardware.
 
 ## Layout
@@ -387,7 +398,9 @@ hyperv.ps1   Hyper-V VM setup
 - [Spleen](https://github.com/fcambus/spleen) bitmap fonts (BSD-2-Clause, see `common/FONT-LICENSE-spleen.txt`)
 - [BearSSL](https://bearssl.org/) TLS library (MIT)
 - [TinyCC](https://bellard.org/tcc/) C compiler (LGPL-2.1, source in `third_party/tinycc`)
+- QuickJS JavaScript エンジン（MIT、ソースとライセンスは `third_party/quickjs`）
 - [Inter](https://rsms.me/inter/) typeface by Rasmus Andersson (SIL Open Font License 1.1, see `rootfs/usr/share/fonts/Inter-LICENSE.txt`)
+- Maple Mono（ユーザー提供の未改変TTF、SIL Open Font License 1.1）。ライセンス・各ファイルのSHA-256・収録文字の確認結果は `rootfs/usr/share/fonts/MapleMono-LICENSE.txt` と `MapleMono-manifest.json` に同梱。
 - [stb_truetype and stb_image](https://github.com/nothings/stb) by Sean Barrett (public domain)
 - [JebP](https://github.com/matanui159/jebp) WebP decoder (MIT No Attribution)
 - [NanoSVG](https://github.com/memononen/nanosvg) by Mikko Mononen (zlib license; one local change: the default `preserveAspectRatio`)

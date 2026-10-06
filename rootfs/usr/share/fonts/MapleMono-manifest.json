@@ -1,0 +1,277 @@
+{
+  "source": "User-provided MapleMono-NF-unhinted and MapleMono-NF-CN-unhinted directories",
+  "modification": "None. Original font bytes, no subsetting or conversion.",
+  "license": "MapleMono-LICENSE.txt",
+  "fonts": [
+    {
+      "file": "MapleMono-NF-Regular.ttf",
+      "bytes": 2299276,
+      "sha256": "de5c085ec43e7b292c62d8c6cd449225eb1c304d47fc21b5f67e80535a1a284a",
+      "units_per_em": 1000,
+      "vertical_metrics": [
+        1020,
+        -300,
+        0
+      ],
+      "glyphs": 12299,
+      "unicode_mappings": 11795,
+      "coverage": {
+        "hiragana": {
+          "present": 0,
+          "range_size": 86
+        },
+        "katakana": {
+          "present": 0,
+          "range_size": 90
+        },
+        "cjk_unified": {
+          "present": 0,
+          "range_size": 20992
+        },
+        "hangul_syllables": {
+          "present": 0,
+          "range_size": 11172
+        }
+      },
+      "sample_advances_em": {
+        "A": 0.6,
+        "B": 0.6,
+        "C": 0.6,
+        "日": null,
+        "本": null,
+        "語": null,
+        "中": null,
+        "文": null,
+        "汉": null,
+        "字": null,
+        "あ": null,
+        "い": null,
+        "う": null,
+        "カ": null,
+        "タ": null,
+        "ナ": null,
+        "한": null,
+        "글": null,
+        "": 0.6,
+        "": 0.6
+      },
+      "role": "default Regular"
+    },
+    {
+      "file": "MapleMono-NF-Bold.ttf",
+      "bytes": 2299788,
+      "sha256": "8ebea6f105afae3ac9daebd1ed24e2086d653c8cb8f60871a65d9843e51f7454",
+      "units_per_em": 1000,
+      "vertical_metrics": [
+        1020,
+        -300,
+        0
+      ],
+      "glyphs": 12299,
+      "unicode_mappings": 11795,
+      "coverage": {
+        "hiragana": {
+          "present": 0,
+          "range_size": 86
+        },
+        "katakana": {
+          "present": 0,
+          "range_size": 90
+        },
+        "cjk_unified": {
+          "present": 0,
+          "range_size": 20992
+        },
+        "hangul_syllables": {
+          "present": 0,
+          "range_size": 11172
+        }
+      },
+      "sample_advances_em": {
+        "A": 0.6,
+        "B": 0.6,
+        "C": 0.6,
+        "日": null,
+        "本": null,
+        "語": null,
+        "中": null,
+        "文": null,
+        "汉": null,
+        "字": null,
+        "あ": null,
+        "い": null,
+        "う": null,
+        "カ": null,
+        "タ": null,
+        "ナ": null,
+        "한": null,
+        "글": null,
+        "": 0.6,
+        "": 0.6
+      },
+      "role": "default Bold"
+    },
+    {
+      "file": "MapleMono-NF-Italic.ttf",
+      "bytes": 2325564,
+      "sha256": "92e8387f2a33e3a66901c5cd3cb0361c804b8820812378e0650c36e3811e98fe",
+      "units_per_em": 1000,
+      "vertical_metrics": [
+        1020,
+        -300,
+        0
+      ],
+      "glyphs": 12422,
+      "unicode_mappings": 11796,
+      "coverage": {
+        "hiragana": {
+          "present": 0,
+          "range_size": 86
+        },
+        "katakana": {
+          "present": 0,
+          "range_size": 90
+        },
+        "cjk_unified": {
+          "present": 0,
+          "range_size": 20992
+        },
+        "hangul_syllables": {
+          "present": 0,
+          "range_size": 11172
+        }
+      },
+      "sample_advances_em": {
+        "A": 0.6,
+        "B": 0.6,
+        "C": 0.6,
+        "日": null,
+        "本": null,
+        "語": null,
+        "中": null,
+        "文": null,
+        "汉": null,
+        "字": null,
+        "あ": null,
+        "い": null,
+        "う": null,
+        "カ": null,
+        "タ": null,
+        "ナ": null,
+        "한": null,
+        "글": null,
+        "": 0.6,
+        "": 0.6
+      },
+      "role": "default Italic"
+    },
+    {
+      "file": "MapleMono-NF-BoldItalic.ttf",
+      "bytes": 2325908,
+      "sha256": "37d2496e430d3b2534b530ee10e4a10f21980a944d151a3db7871abdfb10235a",
+      "units_per_em": 1000,
+      "vertical_metrics": [
+        1020,
+        -300,
+        0
+      ],
+      "glyphs": 12422,
+      "unicode_mappings": 11796,
+      "coverage": {
+        "hiragana": {
+          "present": 0,
+          "range_size": 86
+        },
+        "katakana": {
+          "present": 0,
+          "range_size": 90
+        },
+        "cjk_unified": {
+          "present": 0,
+          "range_size": 20992
+        },
+        "hangul_syllables": {
+          "present": 0,
+          "range_size": 11172
+        }
+      },
+      "sample_advances_em": {
+        "A": 0.6,
+        "B": 0.6,
+        "C": 0.6,
+        "日": null,
+        "本": null,
+        "語": null,
+        "中": null,
+        "文": null,
+        "汉": null,
+        "字": null,
+        "あ": null,
+        "い": null,
+        "う": null,
+        "カ": null,
+        "タ": null,
+        "ナ": null,
+        "한": null,
+        "글": null,
+        "": 0.6,
+        "": 0.6
+      },
+      "role": "default BoldItalic"
+    },
+    {
+      "file": "MapleMono-NF-CN-Regular.ttf",
+      "bytes": 20564436,
+      "sha256": "8b4f149beaead3eac78ffb84adf31513ebf06fe6dbc6e181ccd9debad3c70f1a",
+      "units_per_em": 1000,
+      "vertical_metrics": [
+        1020,
+        -300,
+        0
+      ],
+      "glyphs": 33637,
+      "unicode_mappings": 33091,
+      "coverage": {
+        "hiragana": {
+          "present": 86,
+          "range_size": 86
+        },
+        "katakana": {
+          "present": 90,
+          "range_size": 90
+        },
+        "cjk_unified": {
+          "present": 20976,
+          "range_size": 20992
+        },
+        "hangul_syllables": {
+          "present": 0,
+          "range_size": 11172
+        }
+      },
+      "sample_advances_em": {
+        "A": 0.6,
+        "B": 0.6,
+        "C": 0.6,
+        "日": 1.2,
+        "本": 1.2,
+        "語": 1.2,
+        "中": 1.2,
+        "文": 1.2,
+        "汉": 1.2,
+        "字": 1.2,
+        "あ": 1.2,
+        "い": 1.2,
+        "う": 1.2,
+        "カ": 1.2,
+        "タ": 1.2,
+        "ナ": 1.2,
+        "한": null,
+        "글": null,
+        "": 0.6,
+        "": 0.6
+      },
+      "role": "shared missing-glyph fallback for all four default styles"
+    }
+  ]
+}

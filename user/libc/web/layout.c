@@ -18,11 +18,9 @@ static uint32_t GEN;
 /* ---------------------------------------------------------------- fonts */
 wfont style_font(const style_t *st) {
     wfont f = {NULL, st->font_size, st->font_weight >= 600};
-    if (!st->monospace) {
-        int idx = (f.bold ? FONT_BOLD : 0) | (st->font_style ? FONT_ITALIC : 0);
-        f.ttf = font_ui(idx);
-        if (!f.ttf) f.ttf = font_ui(FONT_REGULAR);
-    }
+    int idx = (f.bold ? FONT_BOLD : 0) | (st->font_style ? FONT_ITALIC : 0);
+    f.ttf = font_ui(idx);
+    if (!f.ttf) f.ttf = font_ui(FONT_REGULAR);
     return f;
 }
 
@@ -72,11 +70,11 @@ static float line_height_px(const style_t *st) {
     case LK_LEN: lh = st->line_height.px; break;
     default:
         lh = st->font_size * 1.2f;
-        if (st->monospace) {
-            wfont f = style_font(st);
-            float h = (float)gfx_font_h(mono_font(&f));
-            if (h > lh) lh = h;
-        }
+        wfont f = style_font(st);
+        float asc, desc, gap = 0;
+        wf_metrics(&f, &asc, &desc);
+        if (f.ttf) font_metrics(f.ttf, f.px, NULL, NULL, &gap);
+        if (asc + desc + gap > lh) lh = asc + desc + gap;
     }
     return lh < 0 ? 0 : lh;
 }
@@ -627,6 +625,7 @@ static void add_deco(struct iline *L, box_t *ib, float x0, float x1, float basel
     d.st = (style_t *)st;
     d.first = first;
     d.last = last;
+    d.node = ib->node;
     sb_put(&L->decos, (const char *)&d, sizeof d);
 }
 
@@ -774,7 +773,8 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
                 w -= it->sw;
                 while (n > 0 && it->s[n - 1] == ' ') n--;
             }
-            struct run r = {x, baseline - it->shift, w, it->s, n, it->st, it->link, NULL, false};
+            struct run r = {x, baseline - it->shift, w, it->s, n, it->st, it->link, NULL, false,
+                            it->box ? it->box->node : NULL};
             if (n > 0) sb_put(&L->runs, (const char *)&r, sizeof r);
             x += w;
             if (it->space_end && i != last_text) x += extra_space;
@@ -792,7 +792,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
             c->cb = b;
             c->x = x + c->m[3] + c->b[3] + c->p[3];
             c->y = top + c->m[0] + c->b[0] + c->p[0];
-            struct run r = {x, top, it->w, NULL, 0, it->st, it->link, c, false};
+            struct run r = {x, top, it->w, NULL, 0, it->st, it->link, c, false, c->node};
             sb_put(&L->runs, (const char *)&r, sizeof r);
             x += it->w;
             break;

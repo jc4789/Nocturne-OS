@@ -1,0 +1,36 @@
+{
+  "name": "@formatjs/intl-datetimeformat",
+  "version": "7.8.1",
+  "description": "Intl.DateTimeFormat polyfill",
+  "keywords": [
+    "datetimeformat",
+    "formatjs",
+    "i18n",
+    "intl",
+    "polyfill"
+  ],
+  "homepage": "https://github.com/formatjs/formatjs#readme",
+  "bugs": "https://github.com/formatjs/formatjs/issues",
+  "license": "MIT",
+  "author": "Long Ho <holevietlong@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "formatjs/formatjs.git"
+  },
+  "type": "module",
+  "types": "index.d.ts",
+  "exports": {
+    ".": "./index.js",
+    "./add-all-tz.js": "./add-all-tz.js",
+    "./add-golden-tz.js": "./add-golden-tz.js",
+    "./locale-data": "./locale-data",
+    "./locale-data/*": "./locale-data/*",
+    "./polyfill-force.js": "./polyfill-force.js",
+    "./polyfill.js": "./polyfill.js",
+    "./should-polyfill.js": "./should-polyfill.js"
+  },
+  "dependencies": {
+    "@formatjs/bigdecimal": "0.2.7",
+    "@formatjs/intl-localematcher": "0.9.0"
+  }
+}

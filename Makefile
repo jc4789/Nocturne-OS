@@ -1,4 +1,5 @@
 # Nocturne OS build. Run inside the MSYS2 UCRT64 shell (see build.ps1).
+.DEFAULT_GOAL := all
 CC   := clang
 LD   := ld.lld
 AR   := llvm-ar
@@ -48,9 +49,24 @@ BR_OBJ   := $(patsubst %.c,$(BUILD)/br/%.o,$(BR_C)) $(BUILD)/br/tls_roots.o
 BRFLAGS  := $(filter-out -W% -MMD -MP,$(UCFLAGS)) -w -Ithird_party/bearssl/inc -Ithird_party/bearssl/src \
             -DBR_USE_URANDOM=1 -DBR_USE_GETENTROPY=0 -DBR_USE_WIN32_RAND=0 -DBR_USE_UNIX_TIME=1 -DBR_USE_WIN32_TIME=0
 UCFLAGS  += -Ithird_party/bearssl/inc -Ithird_party/img
+UCFLAGS  += -Ithird_party/quickjs
+
+# QuickJS core only. No OS helper library, CLI or native-module loader.
+QJS_C := $(addprefix third_party/quickjs/,quickjs.c dtoa.c libregexp.c libunicode.c cutils.c)
+QJS_OBJ := $(patsubst %.c,$(BUILD)/qjs/%.o,$(QJS_C))
+QJSFLAGS := $(filter-out -W%,$(UCFLAGS)) -w -fwrapv -funsigned-char -fno-addrsig \
+            -DCONFIG_NOCTURNE -DCONFIG_VERSION=\"2026-06-04\"
+$(BUILD)/qjs/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  QJS  $<"
+	@$(CC) $(QJSFLAGS) -c $< -o $@
 
 # stb_truetype, stb_image, jebp and nanosvg are compiled as they are, without warnings
 $(BUILD)/u/user/libc/third_party_%.o: UCFLAGS += -w
+
+# Application chrome uses the bundled font; the kernel compositor and early
+# console keep their allocation-free bitmap renderer and unchanged ABI.
+$(BUILD)/u/common/gfx.o: UCFLAGS += -DNOCTURNE_USER_FONT
 
 $(BUILD)/br/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -71,15 +87,20 @@ $(BUILD)/u/%.o: %.c
 	@echo "  CC   $<"
 	@$(CC) $(UCFLAGS) -c $< -o $@
 
+# The checked-in copy permits in-OS linking without Python; regenerate on host edits.
+user/libc/web/js_bootstrap.inc: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py
+	@$(PY) user/libc/web/js_embed.py
+$(BUILD)/u/user/libc/web/js.o: user/libc/web/js_bootstrap.inc
+
 $(BUILD)/u/%.asm.o: %.asm
 	@mkdir -p $(dir $@)
 	@echo "  NASM $<"
 	@$(NASM) -f elf64 -g $< -o $@
 
 # no archiver in the toolchain: lld's --start-lib gives archive semantics to plain objects
-LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ)
+LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ)
 
-$(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) user/user.ld
+$(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
 	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib $(LIBC_LINK) --end-lib -o $@
@@ -104,7 +125,7 @@ $(BUILD)/tcc/tcc.o: $(wildcard $(TCC_DIR)/*.c $(TCC_DIR)/*.h) ports/tcc/config.h
 	@echo "  CC   $(TCC_DIR)/tcc.c"
 	@$(CC) $(TCC_CFLAGS) -c $(TCC_DIR)/tcc.c -o $@
 
-$(BUILD)/root/bin/tcc: $(BUILD)/tcc/tcc.o $(LIBC_OBJ) user/user.ld
+$(BUILD)/root/bin/tcc: $(BUILD)/tcc/tcc.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
 	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib $(LIBC_LINK) --end-lib -o $@
@@ -120,11 +141,11 @@ $(BUILD)/tccrt/runmain.c.o: ports/tcc/runmain.c
 	@$(CC) $(TCCRT_FLAGS) -c $< -o $@
 
 # headers and libraries for compiling inside Nocturne (an extra tree in the initrd)
-$(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(TCCRT_OBJ) scripts/mksysroot.sh \
+$(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(TCCRT_OBJ) scripts/mksysroot.sh \
 		$(shell find user/include ports/tcc/include third_party/bearssl/inc $(TCC_DIR)/include -name '*.h') \
 		common/abi.h common/gfx.h $(wildcard user/apps/*.c)
 	@echo "  SYSROOT"
-	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(LIBC_OBJ) $(BR_OBJ) -- $(TCCRT_OBJ)
+	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) -- $(TCCRT_OBJ)
 	@touch $@
 
 # ---------------------------------------------------------------- images

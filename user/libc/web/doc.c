@@ -10,6 +10,26 @@ struct pending {
     char *media; /* the <link media> the sheet is wrapped in, or NULL */
 };
 
+struct cached_css {
+    char *url, *base, *body;
+    size_t n;
+    bool done;
+};
+
+static struct cached_css *cached_css(web_doc *d, const char *url) {
+    for (int i = 0; i < d->css_cache.n; i++) {
+        struct cached_css *c = d->css_cache.v[i];
+        if (!strcmp(c->url, url)) return c;
+    }
+    return NULL;
+}
+
+static bool css_queued(web_doc *d, const char *url) {
+    for (int i = 0; i < d->pending_css.n; i++)
+        if (!strcmp(((struct pending *)d->pending_css.v[i])->url, url)) return true;
+    return false;
+}
+
 /* ---------------------------------------------------------------- data: URLs */
 static int b64(int c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
@@ -93,6 +113,9 @@ static bool media_wanted(const char *m) {
 }
 
 static void add_sheet(web_doc *d, const char *css, size_t n, const char *base, double order, const char *media) {
+    if (d->css_depth >= 16) return;
+    d->css_depth++;
+    arena_t *arena = d->live ? &d->cssmem : &d->mem;
     pvec imports = {0};
     sheet_t *sh;
     if (media && *media) {
@@ -102,12 +125,29 @@ static void add_sheet(web_doc *d, const char *css, size_t n, const char *base, d
         sb_puts(&w, "{\n");
         sb_put(&w, css, n);
         sb_puts(&w, "\n}");
-        sh = css_parse_sheet(&d->mem, w.p, w.n, base, order, &imports);
+        sh = css_parse_sheet(arena, w.p, w.n, base, order, &imports);
         sb_free(&w);
-    } else sh = css_parse_sheet(&d->mem, css, n, base, order, &imports);
+    } else sh = css_parse_sheet(arena, css, n, base, order, &imports);
     pv_push(&d->sty.sheets, sh);
     for (int i = 0; i < imports.n; i++) {
         struct css_import *im = imports.v[i];
+        struct cached_css *cached = d->live ? cached_css(d, im->url) : NULL;
+        if (cached && cached->done) {
+            if (cached->body) add_sheet(d, cached->body, cached->n, cached->base, im->order, media);
+            free(im->url);
+            free(im);
+            continue;
+        }
+        if (d->live && css_queued(d, im->url)) {
+            free(im->url);
+            free(im);
+            continue;
+        }
+        if (d->live && d->css_cache.n >= 128) {
+            free(im->url);
+            free(im);
+            continue;
+        }
         if (d->pending_css.n < 64) {
             struct pending *p = calloc(1, sizeof *p);
             p->url = im->url;
@@ -119,25 +159,39 @@ static void add_sheet(web_doc *d, const char *css, size_t n, const char *base, d
     }
     pv_free(&imports);
     d->need_style = true;
+    d->css_depth--;
 }
 
 void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *base) {
     add_sheet(d, css, n, base, d->next_sheet_order++, NULL);
 }
 
-static int add_image(web_doc *d, const char *rel) {
+static int add_image_request(web_doc *d, const char *rel, bool retry_failed, int preferred) {
     char abs[2048];
     if (!rel || !*rel) return -1;
     while (is_space((unsigned char)*rel)) rel++;
     if (!url_resolve(d->base, rel, abs, sizeof abs)) return -1;
+    if (preferred >= 0 && preferred < d->images.n && !strcmp(((struct web_image *)d->images.v[preferred])->url, abs)) return preferred;
+    int failed_match = -1;
     for (int i = 0; i < d->images.n; i++) {
         struct web_image *im = d->images.v[i];
-        if (!strcmp(im->url, abs)) return i;
+        if (strcmp(im->url, abs)) continue;
+        if (!im->done || !im->failed) return i;
+        if (failed_match < 0) failed_match = i;
     }
+    if (failed_match >= 0 && !retry_failed) return failed_match;
     if (d->images.n >= 2000) return -1;
     struct web_image *im = calloc(1, sizeof *im);
+    if (!im) return -1;
     im->url = strdup(abs);
-    pv_push(&d->images, im);
+    if (!im->url) { free(im); return -1; }
+    if (d->images.n == d->images.cap) {
+        int cap = d->images.cap ? d->images.cap * 2 : 16;
+        void **items = realloc(d->images.v, sizeof(void *) * (size_t)cap);
+        if (!items) { free(im->url); free(im); return -1; }
+        d->images.v = items; d->images.cap = cap;
+    }
+    d->images.v[d->images.n++] = im;
     int idx = d->images.n - 1;
     if (!strncasecmp(abs, "data:", 5)) {
         size_t n;
@@ -147,6 +201,7 @@ static int add_image(web_doc *d, const char *rel) {
     }
     return idx;
 }
+static int add_image(web_doc *d, const char *rel) { return add_image_request(d, rel, false, -1); }
 
 /* the srcset candidate for a 1x display: an "1x" one, else the first */
 static char *srcset_pick(const char *ss) {
@@ -182,23 +237,57 @@ static bool placeholder_src(const char *s) {
     return !s || !*s || (!strncasecmp(s, "data:image/gif", 14) && strlen(s) < 200) || (!strncasecmp(s, "data:image/svg", 14) && strlen(s) < 200 && strstr(s, "%3C/svg") == NULL);
 }
 
-static void init_control(node_t *n) {
+/* Both connected and script-created detached HTML images have image requests.
+ * Preserve an available current image while its replacement is pending. */
+void doc_image_sync(web_doc *d, node_t *n) {
+    if (!d || !n || n->type != N_ELEM || n->foreign || n->tag != T_img) return;
+    const char *src = node_attr(n, "src"), *ss = node_attr(n, "srcset");
+    const char *lazy = node_attr(n, "data-src");
+    if (!lazy) lazy = node_attr(n, "data-lazy-src");
+    if (!lazy) lazy = node_attr(n, "data-original");
+    char *pick = NULL;
+    /* Retain the existing renderer's source-selection policy; responsive
+       density/sizes/picture selection is a separate, still-limited subsystem. */
+    if (placeholder_src(src) && lazy) src = lazy;
+    else if (placeholder_src(src) && ss) src = pick = srcset_pick(ss);
+    else if (placeholder_src(src) && node_attr(n, "data-srcset")) src = pick = srcset_pick(node_attr(n, "data-srcset"));
+    bool has_source = src != NULL || ss != NULL;
+    int requested = add_image_request(d, src, n->image_invalidated, n->image_initialized && !n->image_invalidated ? n->image_request : -1);
+    free(pick);
+    if (!n->image_initialized || n->image_invalidated || requested != n->image_request || has_source != n->image_has_source) {
+        n->image_initialized = true; n->image_invalidated = false;
+        n->image_request = requested; n->image_has_source = has_source;
+        n->image_generation++;
+        struct web_image *old = n->image >= 0 && n->image < d->images.n ? d->images.v[n->image] : NULL;
+        struct web_image *next = requested >= 0 ? d->images.v[requested] : NULL;
+        if (!next || next->done || !old || !old->img) n->image = requested;
+    }
+    if (n->image_request >= 0 && ((struct web_image *)d->images.v[n->image_request])->done)
+        n->image = n->image_request;
+}
+
+void doc_control_init(web_doc *d, node_t *n) {
+    if (n->control_ready) return;
+    n->control_ready = true;
     if (n->tag == T_input) {
         const char *v = node_attr(n, "value");
-        n->value = strdup(v ? v : "");
+        doc_node_value(d, n, v ? v : "", v ? strlen(v) : 0);
+        n->value_dirty = false;
         n->checked = node_attr(n, "checked") != NULL;
     } else if (n->tag == T_textarea) {
         sbuf b = {0};
         text_of(n, &b);
-        n->value = strdup(b.p ? sb_cstr(&b) : "");
+        doc_node_value(d, n, b.p ? b.p : "", b.n);
+        n->value_dirty = false;
         sb_free(&b);
     } else if (n->tag == T_select) {
         int idx = 0;
-        n->selected = 0;
+        n->selected = -1;
         for (node_t *o = n->first; o; o = o->next) {
             node_t *list = o->type == N_ELEM && o->tag == T_optgroup ? o->first : o;
             for (node_t *q = list; q; q = q->next) {
                 if (q->type == N_ELEM && q->tag == T_option) {
+                    if (n->selected < 0) n->selected = idx;
                     if (node_attr(q, "selected")) n->selected = idx;
                     idx++;
                 }
@@ -226,11 +315,12 @@ static void scan(web_doc *d, node_t *n) {
             break;
         }
         case T_title:
-            if (!d->title && !node_ancestor(c, T_svg)) {
+            if ((!d->live ? !d->title : !d->scan_title_seen) && !node_ancestor(c, T_svg)) {
+                d->scan_title_seen = true;
                 sbuf b = {0};
                 text_of(c, &b);
                 /* collapse white space */
-                char *t = ar_alloc(&d->mem, b.n + 1);
+                char *t = sb_cstr(&b);
                 size_t k = 0;
                 bool sp = true;
                 for (size_t i = 0; i < b.n; i++) {
@@ -241,7 +331,7 @@ static void scan(web_doc *d, node_t *n) {
                 }
                 while (k && t[k - 1] == ' ') k--;
                 t[k] = 0;
-                d->title = t;
+                if (!d->title || strcmp(d->title, t)) d->title = ar_strdup(&d->mem, t);
                 sb_free(&b);
             }
             break;
@@ -289,6 +379,13 @@ static void scan(web_doc *d, node_t *n) {
             if (!sheet || alt || !media_wanted(media)) break;
             char abs[2048];
             if (!url_resolve(d->base, href, abs, sizeof abs)) break;
+            struct cached_css *cached = d->live ? cached_css(d, abs) : NULL;
+            if (cached && cached->done) {
+                if (cached->body) add_sheet(d, cached->body, cached->n, cached->base, d->next_sheet_order++, media);
+                break;
+            }
+            if (d->live && css_queued(d, abs)) break;
+            if (d->live && d->css_cache.n >= 128) break;
             struct pending *pd = calloc(1, sizeof *pd);
             pd->url = strdup(abs);
             pd->order = d->next_sheet_order++;
@@ -318,26 +415,18 @@ static void scan(web_doc *d, node_t *n) {
             sb_free(&b);
             break;
         }
-        case T_img: {
-            const char *src = node_attr(c, "src"), *ss = node_attr(c, "srcset");
-            const char *lazy = node_attr(c, "data-src");
-            if (!lazy) lazy = node_attr(c, "data-lazy-src");
-            if (!lazy) lazy = node_attr(c, "data-original");
-            char *pick = NULL;
-            if (placeholder_src(src) && lazy) src = lazy;
-            else if (placeholder_src(src) && ss) src = pick = srcset_pick(ss);
-            else if (placeholder_src(src) && node_attr(c, "data-srcset")) src = pick = srcset_pick(node_attr(c, "data-srcset"));
-            c->image = add_image(d, src);
-            free(pick);
-            break;
-        }
+        case T_img: doc_image_sync(d, c); break;
         case T_input: {
             const char *t = node_attr(c, "type");
             if (t && str_ieq(t, "image")) c->image = add_image(d, node_attr(c, "src"));
-            init_control(c);
+            doc_control_init(d, c);
             break;
         }
-        case T_textarea: case T_select: init_control(c); break;
+        case T_textarea: doc_control_init(d, c); break;
+        case T_select:
+            if (!c->selected_set) c->control_ready = false;
+            doc_control_init(d, c);
+            break;
         }
         if (c->tag != T_template) scan(d, c);
     }
@@ -355,6 +444,120 @@ web_doc *web_parse(const char *html, size_t len, const char *url, const char *ch
     return d;
 }
 
+web_doc *web_live(const char *html, size_t len, const char *url, const char *charset,
+                  const struct web_host *host) {
+    if (len > (16u << 20)) return NULL;
+    web_doc *d = calloc(1, sizeof *d);
+    if (!d) return NULL;
+    d->live = true;
+    d->dirty = d->need_style = d->resources_dirty = true;
+    d->mem.limit = 32u << 20;
+    d->cssmem.limit = 8u << 20;
+    d->url = strdup(url && *url ? url : "about:blank");
+    if (!d->url) { free(d); return NULL; }
+    snprintf(d->base, sizeof d->base, "%s", d->url);
+    d->parser = html_begin(d, html ? html : "", html ? len : 0, charset, true);
+    if (!d->parser) { web_free(d); return NULL; }
+    web_js_start(d, host);
+    return d;
+}
+
+static void free_pending(web_doc *d) {
+    for (int i = 0; i < d->pending_css.n; i++) {
+        struct pending *p = d->pending_css.v[i];
+        free(p->url);
+        free(p->media);
+        free(p);
+    }
+    d->pending_css.n = 0;
+}
+
+void doc_rescan(web_doc *d) {
+    if (!d || !d->live || !d->resources_dirty) return;
+    d->resources_dirty = false;
+    css_styling_free(&d->sty);
+    ar_free(&d->cssmem);
+    free_pending(d);
+    d->next_sheet_order = 0;
+    d->css_depth = 0;
+    d->base_seen = false;
+    d->scan_title_seen = false;
+    d->refresh_url = NULL;
+    d->refresh_delay = 0;
+    snprintf(d->base, sizeof d->base, "%s", d->url);
+    d->html = d->head = d->body = NULL;
+    for (node_t *n = d->root ? d->root->first : NULL; n; n = n->next)
+        if (n->type == N_ELEM) { d->html = n; break; }
+    for (node_t *n = d->html ? d->html->first : NULL; n; n = n->next) {
+        if (!d->head && n->tag == T_head) d->head = n;
+        if (!d->body && (n->tag == T_body || n->tag == T_frameset)) d->body = n;
+    }
+    jmp_buf trap;
+    jmp_buf *old_mem = d->mem.trap, *old_css = d->cssmem.trap;
+    d->mem.trap = d->cssmem.trap = &trap;
+    if (!setjmp(trap)) {
+        if (d->root) scan(d, d->root);
+        for (node_t *n = d->owned_nodes; n; n = n->owned_next)
+            if (n->tag == T_img && !node_ancestor(n, T_template)) doc_image_sync(d, n);
+        if (!d->scan_title_seen) d->title = NULL;
+    } else {
+        /* Incomplete authored sheet snapshots must never outlive their arena. */
+        css_styling_free(&d->sty);
+        ar_free(&d->cssmem);
+        free_pending(d);
+    }
+    d->mem.trap = old_mem;
+    d->cssmem.trap = old_css;
+    d->dirty = d->need_style = true;
+}
+
+void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const char *css, size_t n) {
+    if (!d || !url) return;
+    struct cached_css *c = cached_css(d, url);
+    if (!c) {
+        if (d->css_cache.n >= 128) return;
+        c = calloc(1, sizeof *c);
+        if (!c) return;
+        c->url = strdup(url);
+        c->base = strdup(final_url && *final_url ? final_url : url);
+        if (!c->url || !c->base) { free(c->url); free(c->base); free(c); return; }
+        pv_push(&d->css_cache, c);
+    }
+    if (c->done) return;
+    c->done = true;
+    if (css && n <= (8u << 20) && d->css_bytes <= (8u << 20) - n) {
+        c->body = malloc(n + 1);
+        if (c->body) {
+            memcpy(c->body, css, n);
+            c->body[n] = 0;
+            c->n = n;
+            d->css_bytes += n;
+        }
+    }
+    d->resources_dirty = d->dirty = d->need_style = true;
+}
+
+void web_tick(web_doc *d, uint64_t now) {
+    if (!d || !d->live) return;
+    doc_rescan(d);
+    web_js_tick(d, now);
+    doc_rescan(d);
+}
+int64_t web_deadline(web_doc *d) { return d && d->live ? web_js_deadline(d) : -1; }
+void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *r) {
+    if (d && d->live) web_js_loaded(d, id, r);
+}
+bool web_dirty(web_doc *d) {
+    if (!d) return false;
+    bool dirty = d->dirty;
+    d->dirty = false;
+    return dirty;
+}
+bool web_script_running(web_doc *d) { return d && d->live && web_js_running(d); }
+bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
+    return !d || !d->live || web_js_dispatch(d, target, e);
+}
+
 static void free_values(node_t *n) {
     for (node_t *c = n->first; c; c = c->next) {
         if (c->type != N_ELEM) continue;
@@ -366,15 +569,23 @@ static void free_values(node_t *n) {
 
 void web_free(web_doc *d) {
     if (!d) return;
-    if (d->root) free_values(d->root);
+    web_js_free(d);
+    html_finish(d->parser);
+    d->parser = NULL;
+    if (d->owned_nodes) {
+        for (node_t *n = d->owned_nodes; n; n = n->owned_next) free(n->value);
+    } else if (d->root) free_values(d->root);
     css_styling_free(&d->sty);
-    for (int i = 0; i < d->pending_css.n; i++) {
-        struct pending *p = d->pending_css.v[i];
-        free(p->url);
-        free(p->media);
-        free(p);
-    }
+    free_pending(d);
     pv_free(&d->pending_css);
+    for (int i = 0; i < d->css_cache.n; i++) {
+        struct cached_css *c = d->css_cache.v[i];
+        free(c->url);
+        free(c->base);
+        free(c->body);
+        free(c);
+    }
+    pv_free(&d->css_cache);
     for (int i = 0; i < d->images.n; i++) {
         struct web_image *im = d->images.v[i];
         if (im->img) image_free(im->img);
@@ -395,12 +606,22 @@ void web_free(web_doc *d) {
     ar_free(&d->mem);
     ar_free(&d->smem);
     ar_free(&d->lmem);
+    ar_free(&d->cssmem);
     free(d->url);
     free(d);
 }
 
 const char *web_title(web_doc *d) { return d->title ? d->title : ""; }
 const char *web_url(web_doc *d) { return d->url; }
+bool web_set_url(web_doc *d, const char *url) {
+    if (!d || !url) return false;
+    char *copy = strdup(url);
+    if (!copy) return false;
+    free(d->url); d->url = copy;
+    if (!d->base_seen) snprintf(d->base, sizeof d->base, "%s", url);
+    return true;
+}
+const char *web_control_value(web_node *control) { return control ? control->value : NULL; }
 
 const char *web_refresh_url(web_doc *d, int *delay_s) {
     if (delay_s) *delay_s = d->refresh_delay;
@@ -441,6 +662,7 @@ bool web_image_wanted(web_doc *d, int i) {
 void web_image_loaded(web_doc *d, int i, const void *data, size_t n) {
     if (i < 0 || i >= d->images.n) return;
     struct web_image *im = d->images.v[i];
+    if (im->done) return;
     im->done = true;
     if (data && n) {
         if (image_is_svg(data, n)) {
@@ -453,6 +675,9 @@ void web_image_loaded(web_doc *d, int i, const void *data, size_t n) {
         else im->img = image_decode(data, n);
     }
     if (!im->img) im->failed = true;
+    d->layout_valid = false; d->dirty = true;
+    for (node_t *node = d->owned_nodes; node; node = node->owned_next)
+        if (node->tag == T_img && node->image_initialized && node->image_request == i) node->image = i;
 }
 
 /* CSS background images are known once styles are: add them to the document's images */
@@ -485,6 +710,11 @@ static void clear_intrinsic(box_t *b) {
 int web_layout(web_doc *d, int width, int height) {
     if (width < 1) width = 1;
     if (height < 1) height = 1;
+    if (d->resources_dirty) doc_rescan(d);
+    /* Geometry reads may flush layout repeatedly within one script. Reuse the
+       result until DOM/style, viewport, or image intrinsic dimensions change. */
+    if (d->layout_valid && !d->need_style && d->root_box &&
+        d->width == width && d->height == height) return d->doc_h;
     if (d->need_style || d->styled_w != width || d->styled_h != height || !d->root_box) {
         css_cascade(d, width, height);
         if (d->root) register_bg(d, d->root);
@@ -494,6 +724,8 @@ int web_layout(web_doc *d, int width, int height) {
     d->width = width;
     d->height = height;
     layout_doc(d, width, height);
+    d->layout_revision++;
+    d->layout_valid = true;
     if (d->find_text[0]) {
         char t[sizeof d->find_text];
         memcpy(t, d->find_text, sizeof t);
@@ -564,8 +796,12 @@ int web_anchor_y(web_doc *d, const char *fragment) {
 }
 
 bool web_node_rect(web_doc *d, web_node *n, int *x, int *y, int *w, int *h) {
-    (void)d;
     if (!n || !n->box) return false;
+    if (d && d->live) {
+        node_t *root = n;
+        while (root->parent) root = root->parent;
+        if (root != d->root) return false;
+    }
     box_t *b = n->box;
     *x = (int)(box_abs_x(b) - b->p[3] - b->b[3]);
     *y = (int)(box_abs_y(b) - b->p[0] - b->b[0]);
@@ -576,6 +812,7 @@ bool web_node_rect(web_doc *d, web_node *n, int *x, int *y, int *w, int *h) {
 
 /* ---------------------------------------------------------------- forms */
 void web_focus(web_doc *d, web_node *n) {
+    if (n) doc_control_init(d, n);
     d->focus = n;
     d->caret = n && n->value ? (int)strlen(n->value) : 0;
 }
@@ -587,7 +824,8 @@ static bool readonly(node_t *n) { return node_attr(n, "readonly") || node_attr(n
 int web_key(web_doc *d, const struct gui_event *e) {
     node_t *n = d->focus;
     if (!n || !(n->tag == T_input || n->tag == T_textarea)) return 0;
-    if (!n->value) n->value = strdup("");
+    doc_control_init(d, n);
+    if (!n->value && !doc_node_value(d, n, "", 0)) return 0;
     char *v = n->value;
     int len = (int)strlen(v);
     if (d->caret > len) d->caret = len;
@@ -630,7 +868,9 @@ int web_key(web_doc *d, const struct gui_event *e) {
         int s = c - 1;
         while (s > 0 && ((unsigned char)v[s] & 0xC0) == 0x80) s--;
         memmove(v + s, v + c, (size_t)(len - c + 1));
+        n->value_dirty = true;
         d->caret = s;
+        d->dirty = d->need_style = true;
         return 1;
     }
     case NKEY_DELETE: {
@@ -638,6 +878,8 @@ int web_key(web_doc *d, const struct gui_event *e) {
         int e2 = c + 1;
         while (e2 < len && ((unsigned char)v[e2] & 0xC0) == 0x80) e2++;
         memmove(v + c, v + e2, (size_t)(len - e2 + 1));
+        n->value_dirty = true;
+        d->dirty = d->need_style = true;
         return 1;
     }
     }
@@ -650,16 +892,19 @@ int web_key(web_doc *d, const struct gui_event *e) {
     char enc[4];
     int el = utf8_put(enc, k);
     char *nv = malloc((size_t)len + (size_t)el + 1);
+    if (!nv) return 0;
     memcpy(nv, v, (size_t)c);
     memcpy(nv + c, enc, (size_t)el);
     memcpy(nv + c + el, v + c, (size_t)(len - c + 1));
-    free(v);
-    n->value = nv;
+    bool changed = doc_node_value(d, n, nv, (size_t)len + (size_t)el);
+    free(nv);
+    if (!changed) return 0;
     d->caret = c + el;
     return 1;
 }
 
 static node_t *form_of(web_doc *d, node_t *n) {
+    if (!n) return NULL;
     const char *fid = node_attr(n, "form");
     if (fid && d->root) {
         node_t *f = find_anchor(d->root, fid);
@@ -667,6 +912,8 @@ static node_t *form_of(web_doc *d, node_t *n) {
     }
     return node_ancestor(n, T_form);
 }
+
+web_node *web_form_owner(web_doc *d, web_node *control) { return form_of(d, control); }
 
 static void uncheck_radios(node_t *scope, node_t *keep, const char *name) {
     for (node_t *c = scope->first; c; c = c->next) {
@@ -679,20 +926,31 @@ static void uncheck_radios(node_t *scope, node_t *keep, const char *name) {
     }
 }
 
-void web_toggle(web_doc *d, web_node *n) {
-    if (!n || n->tag != T_input || node_attr(n, "disabled")) return;
+void doc_control_checked(web_doc *d, node_t *n, bool checked) {
+    if (!d || !n || n->tag != T_input) return;
+    doc_control_init(d, n);
+    n->checked_dirty = true;
     const char *t = node_attr(n, "type");
-    if (t && str_ieq(t, "radio")) {
+    if (checked && t && str_ieq(t, "radio")) {
         const char *name = node_attr(n, "name");
         if (name && *name) {
             node_t *scope = form_of(d, n);
             uncheck_radios(scope ? scope : d->root, n, name);
         }
-        n->checked = true;
-    } else n->checked = !n->checked;
+    }
+    n->checked = checked;
+    d->dirty = d->need_style = true;
 }
 
-static node_t *option_at(node_t *sel, int index) {
+void web_toggle(web_doc *d, web_node *n) {
+    if (!n || n->tag != T_input || node_attr(n, "disabled")) return;
+    doc_control_init(d, n);
+    const char *t = node_attr(n, "type");
+    doc_control_checked(d, n, t && str_ieq(t, "radio") ? true : !n->checked);
+}
+
+node_t *doc_select_option(node_t *sel, int index) {
+    if (!sel || sel->tag != T_select || index < 0) return NULL;
     int idx = 0;
     for (node_t *o = sel->first; o; o = o->next) {
         node_t *list = o->type == N_ELEM && o->tag == T_optgroup ? o->first : o;
@@ -705,6 +963,23 @@ static node_t *option_at(node_t *sel, int index) {
         }
     }
     return NULL;
+}
+
+bool doc_option_selected(node_t *option) {
+    if (!option || option->tag != T_option) return false;
+    node_t *sel = option->parent;
+    if (sel && sel->tag == T_optgroup) sel = sel->parent;
+    if (!sel || sel->tag != T_select) return node_attr(option, "selected") != NULL;
+    int selected = sel->selected;
+    if (!sel->control_ready) {
+        selected = 0;
+        for (int i = 0; ; i++) {
+            node_t *n = doc_select_option(sel, i);
+            if (!n) break;
+            if (node_attr(n, "selected")) selected = i;
+        }
+    }
+    return doc_select_option(sel, selected) == option;
 }
 
 static void option_text(node_t *o, sbuf *b) {
@@ -740,6 +1015,7 @@ static void collect(web_doc *d, node_t *form, node_t *scope, node_t *submitter, 
         const char *name = node_attr(c, "name");
         bool mine = form_of(d, c) == form;
         if (mine && name && *name && !node_attr(c, "disabled")) {
+            doc_control_init(d, c);
             if (c->tag == T_input) {
                 const char *t = node_attr(c, "type");
                 if (!t) t = "text";
@@ -762,7 +1038,7 @@ static void collect(web_doc *d, node_t *form, node_t *scope, node_t *submitter, 
             } else if (c->tag == T_textarea) {
                 add_pair(q, name, c->value ? c->value : "");
             } else if (c->tag == T_select) {
-                node_t *o = option_at(c, c->selected);
+                node_t *o = doc_select_option(c, c->selected);
                 if (o) {
                     const char *v = node_attr(o, "value");
                     sbuf t = {0};
@@ -817,18 +1093,41 @@ bool web_submit(web_doc *d, web_node *submitter, char **url, char **body) {
 }
 
 int web_select_options(web_doc *d, web_node *sel, const char **labels, int max, int *selected) {
+    if (!d || !sel || sel->tag != T_select || !labels || max <= 0) return 0;
+    doc_control_init(d, sel);
     if (selected) *selected = sel->selected;
     int k = 0;
-    for (node_t *o; k < max && (o = option_at(sel, k)); k++) {
-        sbuf t = {0};
-        option_text(o, &t);
-        labels[k] = ar_strdup(&d->mem, t.p ? sb_cstr(&t) : "");
-        sb_free(&t);
+    for (node_t *o; k < max && (o = doc_select_option(sel, k)); k++) {
+        if (!o->option_label || o->option_label_revision != d->dom_revision) {
+            /* The heap buffer remains well-defined after an arena limit jump. */
+            sbuf *t = calloc(1, sizeof *t);
+            if (!t) return k;
+            option_text(o, t);
+            jmp_buf trap;
+            jmp_buf *old = d->mem.trap;
+            d->mem.trap = &trap;
+            if (setjmp(trap)) {
+                d->mem.trap = old;
+                sb_free(t);
+                free(t);
+                return k;
+            }
+            o->option_label = ar_strdup(&d->mem, t->p ? sb_cstr(t) : "");
+            o->option_label_revision = d->dom_revision;
+            d->mem.trap = old;
+            sb_free(t);
+            free(t);
+        }
+        labels[k] = o->option_label;
     }
     return k;
 }
 
 void web_select_set(web_doc *d, web_node *sel, int index) {
-    (void)d;
-    if (sel && option_at(sel, index)) sel->selected = index;
+    if (d && sel && sel->tag == T_select && (index == -1 || doc_select_option(sel, index))) {
+        doc_control_init(d, sel);
+        sel->selected = index;
+        sel->selected_set = true;
+        d->dirty = d->need_style = true;
+    }
 }

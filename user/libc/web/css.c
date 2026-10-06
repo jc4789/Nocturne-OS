@@ -557,7 +557,7 @@ static bool match_pc(const struct simple *x, node_t *e) {
     case PC_ALWAYS: return true;
     case PC_LINK: return (e->tag == T_a || e->tag == T_area) && node_attr(e, "href");
     case PC_CHECKED:
-        return (e->tag == T_input && e->checked) || (e->tag == T_option && node_attr(e, "selected"));
+        return (e->tag == T_input && e->checked) || doc_option_selected(e);
     case PC_DISABLED: return form_control(e) && node_attr(e, "disabled");
     case PC_ENABLED: return form_control(e) && !node_attr(e, "disabled");
     case PC_ROOT: return e->parent && e->parent->type == N_DOC;
@@ -636,6 +636,57 @@ static bool match_list(const struct sellist *l, node_t *e) {
     for (int i = 0; l && i < l->n; i++)
         if (!l->v[i]->pseudo && match_from(l->v[i]->right, e)) return true;
     return false;
+}
+
+/* DOM queries use exactly the cascade's parser and matcher, with a short-lived
+   bounded arena so repeated querySelector calls do not grow the document arena. */
+static void select_walk(node_t *scope, const struct sellist *sel, pvec *out) {
+    for (node_t *n = scope->first; n; n = n->next) {
+        if (n->type == N_ELEM && match_list(sel, n)) pv_push(out, n);
+        select_walk(n, sel, out);
+    }
+}
+
+bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out) {
+    (void)d;
+    if (!selector || !scope || strlen(selector) > 65536) return false;
+    size_t len = strlen(selector);
+    while (len && is_space((unsigned char)selector[len - 1])) len--;
+    if (!len || selector[len - 1] == ',') return false;
+    arena_t *arena = calloc(1, sizeof *arena);
+    if (!arena) return false;
+    arena->limit = 1u << 20;
+    jmp_buf trap;
+    arena->trap = &trap;
+    if (setjmp(trap)) { ar_free(arena); free(arena); return false; }
+    struct pctx p = {.a = arena};
+    struct sellist *sel = parse_sellist(&p, selector, selector + len, false);
+    if (sel) select_walk(scope, sel, out);
+    bool valid = sel != NULL;
+    ar_free(arena);
+    free(arena);
+    return valid;
+}
+
+bool css_matches(node_t *node, const char *selector, bool *valid) {
+    if (valid) *valid = false;
+    if (!node || node->type != N_ELEM || !selector || strlen(selector) > 65536) return false;
+    size_t len = strlen(selector);
+    while (len && is_space((unsigned char)selector[len - 1])) len--;
+    if (!len || selector[len - 1] == ',') return false;
+    arena_t *arena = calloc(1, sizeof *arena);
+    if (!arena) return false;
+    arena->limit = 1u << 20;
+    jmp_buf trap;
+    arena->trap = &trap;
+    if (setjmp(trap)) { ar_free(arena); free(arena); return false; }
+    struct pctx p = {.a = arena};
+    struct sellist *sel = parse_sellist(&p, selector, selector + len, false);
+    if (valid) *valid = sel != NULL;
+    bool matched = sel && match_list(sel, node);
+    ar_free(arena);
+    free(arena);
+    return matched;
 }
 
 /* ---------------------------------------------------------------- parsing stylesheets */
@@ -949,210 +1000,241 @@ sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base
 }
 
 /* ---------------------------------------------------------------- media queries */
-struct mq {
-    const char *s, *e;
-    int vw, vh;
-};
-
-static bool mq_cond(struct mq *m);
-
+/* CSS and matchMedia share this bounded parser and device model. Unknown
+   features use Kleene logic: negating an unsupported feature is not a match. */
+enum { MQ_UNKNOWN = -1, MQ_FALSE, MQ_TRUE };
+enum { MQ_LENGTH = 1, MQ_RATIO, MQ_RESOLUTION, MQ_INTEGER, MQ_NUMBER };
+struct mq { const char *s, *e; int vw, vh, depth; bool scripting, valid; };
+static int mq_cond(struct mq *m, bool allow_or);
+static int mq_not(int a) { return a < 0 ? a : !a; }
+static int mq_and(int a, int b) { return !a || !b ? 0 : a < 0 || b < 0 ? -1 : 1; }
+static int mq_or(int a, int b) { return a == 1 || b == 1 ? 1 : a < 0 || b < 0 ? -1 : 0; }
 static bool mq_word(struct mq *m, const char *w) {
-    m->s = skip_ws(m->s, m->e);
-    size_t n = strlen(w);
-    if ((size_t)(m->e - m->s) >= n && strn_ieq(m->s, w, n) && (m->s + n == m->e || !ident_char((unsigned char)m->s[n]))) {
-        m->s += n;
-        return true;
-    }
+    m->s = skip_ws(m->s, m->e); size_t n = strlen(w);
+    if ((size_t)(m->e-m->s) >= n && strn_ieq(m->s,w,n) &&
+        (m->s+n == m->e || (!ident_char((unsigned char)m->s[n]) && m->s[n]!='('))) { m->s += n; return true; }
     return false;
 }
-
-static bool mq_len(const char *s, const char *e, float *out) {
-    s = skip_ws(s, e);
-    trim_r(s, &e);
-    char buf[32];
-    size_t n = (size_t)(e - s) < sizeof buf - 1 ? (size_t)(e - s) : sizeof buf - 1;
-    memcpy(buf, s, n);
-    buf[n] = 0;
-    char *end;
-    float v = strtof(buf, &end);
-    if (end == buf) return false;
-    if (!*end || !strcasecmp(end, "px")) *out = v;
-    else if (!strcasecmp(end, "em") || !strcasecmp(end, "rem")) *out = v * 16;
-    else if (!strcasecmp(end, "pt")) *out = v * 4 / 3;
-    else if (!strcasecmp(end, "dppx") || !strcasecmp(end, "x")) *out = v;
-    else if (!strcasecmp(end, "dpi")) *out = v / 96;
-    else if (!strcasecmp(end, "dpcm")) *out = v * 2.54f / 96;
-    else if (strchr(end, '/')) { /* aspect ratios */
-        float d = strtof(end + 1, NULL);
-        *out = d ? v / d : 0;
-    } else return false;
+static bool mq_ident(const char *s, const char *e) {
+    if (s == e || !((*s >= 'a' && *s <= 'z') || *s == '_' || *s == '-')) return false;
+    for (; s < e; s++) if (!ident_char((unsigned char)*s)) return false;
     return true;
 }
-
-static bool mq_cmp(float a, const char *op, float b) {
-    if (!strcmp(op, "<")) return a < b;
-    if (!strcmp(op, "<=")) return a <= b;
-    if (!strcmp(op, ">")) return a > b;
-    if (!strcmp(op, ">=")) return a >= b;
-    return a == b;
-}
-
-/* the value of a media feature for our screen, or false if unknown */
-static bool mq_feature_value(const char *name, size_t n, struct mq *m, float *v) {
-    if (strn_ieq(name, "width", n)) *v = (float)m->vw;
-    else if (strn_ieq(name, "height", n)) *v = (float)m->vh;
-    else if (strn_ieq(name, "device-width", n)) *v = (float)m->vw;
-    else if (strn_ieq(name, "device-height", n)) *v = (float)m->vh;
-    else if (strn_ieq(name, "aspect-ratio", n)) *v = m->vh ? (float)m->vw / (float)m->vh : 1;
-    else if (strn_ieq(name, "resolution", n) || strn_ieq(name, "-webkit-device-pixel-ratio", n) ||
-             strn_ieq(name, "device-pixel-ratio", n))
-        *v = 1;
-    else if (strn_ieq(name, "color", n)) *v = 8;
-    else if (strn_ieq(name, "monochrome", n)) *v = 0;
-    else return false;
-    return true;
-}
-
-/* the inside of one (feature) */
-static bool mq_feature(const char *s, const char *e, struct mq *m) {
-    s = skip_ws(s, e);
-    trim_r(s, &e);
-    const char *colon = memchr(s, ':', (size_t)(e - s));
-    if (colon) {
-        const char *ne = colon;
-        trim_r(s, &ne);
-        const char *v = skip_ws(colon + 1, e);
-        size_t nl = (size_t)(ne - s), vl = (size_t)(e - v);
-        int mode = 0; /* 1 min-, 2 max- */
-        const char *name = s;
-        if (nl > 4 && strn_ieq(name, "min-", 4)) mode = 1, name += 4, nl -= 4;
-        else if (nl > 4 && strn_ieq(name, "max-", 4)) mode = 2, name += 4, nl -= 4;
-        if (nl > 12 && strn_ieq(name, "-webkit-min-", 12)) mode = 1, name += 12, nl -= 12;
-        else if (nl > 12 && strn_ieq(name, "-webkit-max-", 12)) mode = 2, name += 12, nl -= 12;
-        float have, want;
-        if (mq_feature_value(name, nl, m, &have)) {
-            if (!mq_len(v, e, &want)) return false;
-            return mode == 1 ? have >= want : mode == 2 ? have <= want : have == want;
-        }
-        if (strn_ieq(name, "orientation", nl)) return strn_ieq(v, m->vw > m->vh ? "landscape" : "portrait", vl);
-        if (strn_ieq(name, "prefers-color-scheme", nl)) return strn_ieq(v, "light", vl);
-        if (strn_ieq(name, "prefers-reduced-motion", nl) || strn_ieq(name, "prefers-contrast", nl) ||
-            strn_ieq(name, "prefers-reduced-transparency", nl) || strn_ieq(name, "prefers-reduced-data", nl))
-            return strn_ieq(v, "no-preference", vl);
-        if (strn_ieq(name, "hover", nl) || strn_ieq(name, "any-hover", nl)) return strn_ieq(v, "hover", vl);
-        if (strn_ieq(name, "pointer", nl) || strn_ieq(name, "any-pointer", nl)) return strn_ieq(v, "fine", vl);
-        if (strn_ieq(name, "scripting", nl)) return strn_ieq(v, "none", vl);
-        if (strn_ieq(name, "forced-colors", nl) || strn_ieq(name, "inverted-colors", nl)) return strn_ieq(v, "none", vl);
-        if (strn_ieq(name, "display-mode", nl)) return strn_ieq(v, "browser", vl);
-        if (strn_ieq(name, "update", nl)) return strn_ieq(v, "fast", vl);
-        if (strn_ieq(name, "color-gamut", nl)) return strn_ieq(v, "srgb", vl);
-        if (strn_ieq(name, "dynamic-range", nl)) return strn_ieq(v, "standard", vl);
-        return false;
+/* Unitless nonzero lengths, mixed dimensions, nonfinite values and unconsumed
+   suffixes are rejected; strtod is never used as a permissive prefix parser. */
+static bool mq_number(const char *s, const char *e, const char **end, double *out) {
+    const char *p=s; if (p<e && (*p=='+' || *p=='-')) p++;
+    const char *digits=p; while(p<e && *p>='0' && *p<='9') p++;
+    bool any=p>digits;
+    if(p<e && *p=='.'){ p++; digits=p; while(p<e && *p>='0' && *p<='9')p++; if(p==digits)return false; any=true; }
+    if(!any)return false;
+    if(p<e && (*p=='e'||*p=='E')) {
+        const char *exp=p+1; if(exp<e && (*exp=='+'||*exp=='-'))exp++;
+        if(exp<e && *exp>='0'&&*exp<='9'){p=exp+1;while(p<e&&*p>='0'&&*p<='9')p++;}
     }
-    /* range syntax: name op value, value op name, value op name op value */
-    const char *ops = s;
-    while (ops < e && !strchr("<>=", *ops)) ops++;
-    if (ops < e) {
-        const char *tok[3];
-        size_t tl[3];
-        char opv[2][3];
-        int k = 0, no = 0;
-        const char *p = s;
-        while (p < e && k < 3) {
-            const char *st = skip_ws(p, e);
-            const char *q = st;
-            while (q < e && !strchr("<>=", *q)) q++;
-            const char *te = q;
-            trim_r(st, &te);
-            tok[k] = st;
-            tl[k++] = (size_t)(te - st);
-            if (q >= e) break;
-            if (no < 2) {
-                int oi = 0;
-                while (q < e && strchr("<>=", *q) && oi < 2) opv[no][oi++] = *q++;
-                opv[no][oi] = 0;
-                no++;
+    size_t n=(size_t)(p-s); if(n>=64)return false; char b[64]; memcpy(b,s,n);b[n]=0;
+    double v=strtod(b,NULL); if(!(v>=-1e30 && v<=1e30))return false;
+    *out=v;*end=p;return true;
+}
+static bool mq_value(const char *s,const char *e,int kind,const struct mq *m,double *out) {
+    s=skip_ws(s,e);trim_r(s,&e);const char *p;double v;
+    if(!mq_number(s,e,&p,&v))return false;
+    if(kind==MQ_RATIO){
+        p=skip_ws(p,e);if(p<e&&*p=='/'){double den;p=skip_ws(p+1,e);if(!mq_number(p,e,&p,&den)||den<=0)return false;v/=den;}
+        if(skip_ws(p,e)!=e||v<0)return false;*out=v;return true;
+    }
+    size_t n=(size_t)(e-p);double scale=1;
+    if(kind==MQ_INTEGER||kind==MQ_NUMBER){
+        if(n || (kind==MQ_INTEGER && (v<0 || v>2147483647 || v!=(int)v)))return false;
+    }else if(kind==MQ_RESOLUTION){
+        if(strn_ieq(p,"dppx",n)||strn_ieq(p,"x",n))scale=1;
+        else if(strn_ieq(p,"dpi",n))scale=1.0/96;
+        else if(strn_ieq(p,"dpcm",n))scale=2.54/96;
+        else return false;if(v<=0)return false;
+    }else {
+        if(!n){if(v!=0)return false;}
+        else if(strn_ieq(p,"px",n))scale=1;
+        else if(strn_ieq(p,"em",n)||strn_ieq(p,"rem",n))scale=16;
+        else if(strn_ieq(p,"pt",n))scale=96.0/72;
+        else if(strn_ieq(p,"pc",n))scale=16;
+        else if(strn_ieq(p,"in",n))scale=96;
+        else if(strn_ieq(p,"cm",n))scale=96/2.54;
+        else if(strn_ieq(p,"mm",n))scale=96/25.4;
+        else if(strn_ieq(p,"q",n))scale=96/101.6;
+        else if(strn_ieq(p,"vw",n))scale=m->vw/100.0;
+        else if(strn_ieq(p,"vh",n))scale=m->vh/100.0;
+        else if(strn_ieq(p,"vmin",n))scale=(m->vw<m->vh?m->vw:m->vh)/100.0;
+        else if(strn_ieq(p,"vmax",n))scale=(m->vw>m->vh?m->vw:m->vh)/100.0;
+        else return false;
+    }
+    *out=v*scale;return true;
+}
+static int mq_numeric(const char *s,size_t n,const struct mq *m,double *v) {
+    /* Screen dimensions are not supplied by the embedder. Deprecated device-*
+       features stay unknown rather than falsely equating screen and window. */
+    if(strn_ieq(s,"width",n)){*v=m->vw;return MQ_LENGTH;}
+    if(strn_ieq(s,"height",n)){*v=m->vh;return MQ_LENGTH;}
+    if(strn_ieq(s,"aspect-ratio",n)){*v=m->vh?(double)m->vw/m->vh:0;return MQ_RATIO;}
+    if(strn_ieq(s,"resolution",n)){*v=1;return MQ_RESOLUTION;}
+    if(strn_ieq(s,"-webkit-device-pixel-ratio",n)||strn_ieq(s,"device-pixel-ratio",n)){*v=1;return MQ_NUMBER;}
+    if(strn_ieq(s,"color",n)){*v=8;return MQ_INTEGER;}
+    if(strn_ieq(s,"monochrome",n)||strn_ieq(s,"color-index",n)){*v=0;return MQ_INTEGER;}
+    return 0;
+}
+static const char *mq_discrete(const char *s,size_t n,const struct mq *m,const char **allowed) {
+#define FEATURE(name,value,choices) if(strn_ieq(s,name,n)){*allowed=choices;return value;}
+    FEATURE("orientation",m->vw>m->vh?"landscape":"portrait","portrait landscape")
+    FEATURE("prefers-color-scheme","light","light dark")
+    FEATURE("prefers-reduced-motion","no-preference","no-preference reduce")
+    FEATURE("prefers-reduced-transparency","no-preference","no-preference reduce")
+    FEATURE("prefers-reduced-data","no-preference","no-preference reduce")
+    FEATURE("prefers-contrast","no-preference","no-preference more less custom")
+    FEATURE("hover","hover","hover none") FEATURE("any-hover","hover","hover none")
+    FEATURE("pointer","fine","none coarse fine") FEATURE("any-pointer","fine","none coarse fine")
+    FEATURE("scripting",m->scripting?"enabled":"none","none initial-only enabled")
+    FEATURE("forced-colors","none","none active") FEATURE("inverted-colors","none","none inverted")
+    FEATURE("display-mode","browser","browser fullscreen standalone minimal-ui picture-in-picture window-controls-overlay")
+    FEATURE("update","fast","none slow fast") FEATURE("color-gamut","srgb","srgb p3 rec2020")
+    FEATURE("dynamic-range","standard","standard high")
+    FEATURE("overflow-block","scroll","none scroll paged") FEATURE("overflow-inline","scroll","none scroll")
+    FEATURE("grid","0","0 1")
+#undef FEATURE
+    return NULL;
+}
+static bool mq_choice(const char *s,size_t n,const char *choices) {
+    while(*choices){const char *e=strchr(choices,' ');if(!e)e=choices+strlen(choices);
+        if((size_t)(e-choices)==n&&!memcmp(s,choices,n))return true;choices=*e?e+1:e;}
+    return false;
+}
+static bool mq_compare(double a,const char *op,double b) {
+    if(!strcmp(op,"<"))return a<b;if(!strcmp(op,"<="))return a<=b;
+    if(!strcmp(op,">"))return a>b;if(!strcmp(op,">="))return a>=b;return a==b;
+}
+static int mq_feature(const char *s,const char *e,struct mq *m) {
+    s=skip_ws(s,e);trim_r(s,&e);if(s==e)return MQ_UNKNOWN;
+    const char *colon=memchr(s,':',(size_t)(e-s));
+    if(colon){
+        const char *ne=colon;trim_r(s,&ne);const char *v=skip_ws(colon+1,e);
+        if(!mq_ident(s,ne)||v==e)return MQ_UNKNOWN;
+        size_t n=(size_t)(ne-s);int mode=0;
+        if(n>4&&!memcmp(s,"min-",4)){mode=1;s+=4;n-=4;}
+        else if(n>4&&!memcmp(s,"max-",4)){mode=2;s+=4;n-=4;}
+        else if(n>12&&!memcmp(s,"-webkit-min-",12)){mode=1;s+=12;n-=12;}
+        else if(n>12&&!memcmp(s,"-webkit-max-",12)){mode=2;s+=12;n-=12;}
+        double have,want;int kind=mq_numeric(s,n,m,&have);
+        if(kind){if(!mq_value(v,e,kind,m,&want))return MQ_UNKNOWN;return mode==1?have>=want:mode==2?have<=want:have==want;}
+        if(mode)return MQ_UNKNOWN;
+        const char *allowed,*value=mq_discrete(s,n,m,&allowed);
+        if(!value||!mq_choice(v,(size_t)(e-v),allowed))return MQ_UNKNOWN;
+        return strn_ieq(v,value,(size_t)(e-v));
+    }
+    const char *op=s;while(op<e&&!strchr("<>=",*op))op++;
+    if(op<e){
+        const char *tokens[3],*ends[3];char ops[2][3];int count=0;const char *p=s;
+        while(count<3){
+            tokens[count]=skip_ws(p,e);while(p<e&&!strchr("<>=",*p))p++;ends[count]=p;trim_r(tokens[count],&ends[count]);count++;
+            if(p==e)break;if(count==3)return MQ_UNKNOWN;
+            char *o=ops[count-1];*o++=*p++;if(p<e&&*p=='=')*o++=*p++;*o=0;
+            if(!strcmp(ops[count-1],"==")||(p<e&&strchr("<>=",*p)))return MQ_UNKNOWN;
+        }
+        double a,b,c;int kind;
+        if(count==2){
+            if((kind=mq_numeric(tokens[0],(size_t)(ends[0]-tokens[0]),m,&a))&&mq_value(tokens[1],ends[1],kind,m,&b))return mq_compare(a,ops[0],b);
+            if((kind=mq_numeric(tokens[1],(size_t)(ends[1]-tokens[1]),m,&b))&&mq_value(tokens[0],ends[0],kind,m,&a))return mq_compare(a,ops[0],b);
+        }else if(count==3 && ops[0][0]!='=' && ops[0][0]==ops[1][0] &&
+                 (kind=mq_numeric(tokens[1],(size_t)(ends[1]-tokens[1]),m,&b)) &&
+                 mq_value(tokens[0],ends[0],kind,m,&a)&&mq_value(tokens[2],ends[2],kind,m,&c))
+            return mq_compare(a,ops[0],b)&&mq_compare(b,ops[1],c);
+        return MQ_UNKNOWN;
+    }
+    if(!mq_ident(s,e))return MQ_UNKNOWN;
+    double v;if(mq_numeric(s,(size_t)(e-s),m,&v))return v!=0;
+    const char *allowed,*value=mq_discrete(s,(size_t)(e-s),m,&allowed);
+    return value ? strcmp(value,"none")&&strcmp(value,"no-preference")&&strcmp(value,"0") : MQ_UNKNOWN;
+}
+static int mq_term(struct mq *m) {
+    m->s=skip_ws(m->s,m->e);if(m->depth>=64||m->s==m->e){m->valid=false;return MQ_UNKNOWN;}
+    /* General-enclosed functions are unknown, never guessed true. */
+    bool function=*m->s!='(';const char *open=m->s;
+    if(function){while(open<m->e&&ident_char((unsigned char)*open))open++;}
+    if(open==m->e||*open!='('){m->valid=false;return MQ_UNKNOWN;}
+    int level=1;const char *close=open+1;
+    for(;close<m->e;close++){if(*close=='(')level++;else if(*close==')'&&!--level)break;}
+    if(close==m->e){m->valid=false;return MQ_UNKNOWN;}
+    m->s=close+1;if(function)return MQ_UNKNOWN;
+    const char *in=skip_ws(open+1,close);struct mq sub={in,close,m->vw,m->vh,m->depth+1,m->scripting,true};
+    int r;
+    if(in<close&&(*in=='('||((size_t)(close-in)>=3&&strn_ieq(in,"not",3)&&
+       (in+3==close||!ident_char((unsigned char)in[3]))))) {
+        r=mq_cond(&sub,true);if(!sub.valid||skip_ws(sub.s,sub.e)!=sub.e)m->valid=false;
+    }else r=mq_feature(in,close,m);
+    return r;
+}
+static int mq_cond(struct mq *m,bool allow_or) {
+    if(mq_word(m,"not"))return mq_not(mq_term(m));
+    int r=mq_term(m),mode=0;
+    for(;;){
+        int next=mq_word(m,"and")?1:mq_word(m,"or")?2:0;if(!next)break;
+        if((mode&&mode!=next)||(next==2&&!allow_or)){m->valid=false;return MQ_UNKNOWN;}mode=next;
+        int rhs=mq_term(m);r=mode==1?mq_and(r,rhs):mq_or(r,rhs);
+    }return r;
+}
+static int mq_query(struct mq *m) {
+    m->s=skip_ws(m->s,m->e);const char *start=m->s;
+    if(start==m->e){m->valid=false;return MQ_UNKNOWN;}
+    bool neg=mq_word(m,"not"),only=!neg&&mq_word(m,"only");m->s=skip_ws(m->s,m->e);
+    const char *look=m->s;while(look<m->e&&ident_char((unsigned char)*look))look++;
+    if(m->s<m->e&&(*m->s=='('||(look<m->e&&*look=='('))){m->s=start;return mq_cond(m,true);}
+    const char *type=m->s;while(m->s<m->e&&ident_char((unsigned char)*m->s))m->s++;
+    size_t n=(size_t)(m->s-type);
+    if(!mq_ident(type,m->s)||strn_ieq(type,"not",n)||strn_ieq(type,"only",n)||strn_ieq(type,"and",n)||strn_ieq(type,"or",n)){
+        m->valid=false;return MQ_UNKNOWN;
+    }
+    (void)only;int r=strn_ieq(type,"screen",n)||strn_ieq(type,"all",n);
+    if(mq_word(m,"and"))r=mq_and(r,mq_cond(m,false));
+    return neg?mq_not(r):r;
+}
+static bool mq_append(char *out,size_t cap,size_t *used,const char *s,size_t n) {
+    if(!out)return true;if(n>=cap-*used)return false;memcpy(out+*used,s,n);*used+=n;out[*used]=0;return true;
+}
+/* Each empty comma-delimited query can expand to "not all, ". */
+bool css_media_evaluate(const char *query,int vw,int vh,bool scripting,char *out,size_t cap) {
+    if(out&&cap)out[0]=0;if(!query||(out&&!cap))return false;
+    size_t length=strlen(query);if(length>16384)return false;
+    char *text=malloc(length+1);if(!text)return false;size_t n=0;
+    for(size_t i=0;i<length;i++){
+        if(query[i]=='/'&&i+1<length&&query[i+1]=='*'){
+            i+=2;while(i+1<length&&!(query[i]=='*'&&query[i+1]=='/'))i++;if(i+1>=length)break;i++;text[n++]=' ';
+        }else text[n++]=(char)lower((unsigned char)query[i]);
+    }text[n]=0;
+    const char *s=text,*e=text+n;size_t used=0;bool any=false,first=true,ok=true;
+    if(skip_ws(s,e)==e){free(text);return true;}
+    for(;;){
+        const char *end=s;int depth=0;bool bad=false;
+        while(end<e){char c=*end;if(c=='(')depth++;else if(c==')'){if(!depth)bad=true;else depth--;}
+            if(!depth&&c==',')break;if((unsigned char)c<32&&!is_space(c))bad=true;
+            if(c=='\\'||c=='\''||c=='"'||c=='{'||c=='}'||c==';'||c=='['||c==']')bad=true;end++;}
+        struct mq m={s,end,vw,vh,0,scripting,!bad&&!depth};int r=mq_query(&m);
+        bool valid=m.valid&&skip_ws(m.s,m.e)==m.e;any|=valid&&r==MQ_TRUE;
+        if(!first)ok=ok&&mq_append(out,cap,&used,", ",2);first=false;
+        if(!valid||r==MQ_UNKNOWN)ok=ok&&mq_append(out,cap,&used,"not all",7);
+        else {
+            const char *p=skip_ws(s,end),*z=end;trim_r(p,&z);bool space=false;
+            for(;p<z;p++){
+                if(is_space((unsigned char)*p)){space=true;continue;}
+                char c=*p,prev=out&&used?out[used-1]:0;
+                bool before=c=='<'||c=='>'||c=='='||c=='/'||(space&&c!=')'&&c!=':'&&prev!='(');
+                if(out&&used&&prev!=' '&&before&&!(c=='='&&(prev=='<'||prev=='>')))ok=ok&&mq_append(out,cap,&used," ",1);
+                ok=ok&&mq_append(out,cap,&used,&c,1);space=false;
+                if(c==':'||c=='/'||c=='='||((c=='<'||c=='>')&&(p+1==z||p[1]!='=')))ok=ok&&mq_append(out,cap,&used," ",1);
             }
-            p = q;
         }
-        float a, b, c;
-        if (k == 2 && no == 1) {
-            if (mq_feature_value(tok[0], tl[0], m, &a) && mq_len(tok[1], tok[1] + tl[1], &b)) return mq_cmp(a, opv[0], b);
-            if (mq_len(tok[0], tok[0] + tl[0], &a) && mq_feature_value(tok[1], tl[1], m, &b)) return mq_cmp(a, opv[0], b);
-            return false;
-        }
-        if (k == 3 && no == 2) {
-            if (!mq_len(tok[0], tok[0] + tl[0], &a) || !mq_feature_value(tok[1], tl[1], m, &b) ||
-                !mq_len(tok[2], tok[2] + tl[2], &c))
-                return false;
-            return mq_cmp(a, opv[0], b) && mq_cmp(b, opv[1], c);
-        }
-        return false;
+        if(end==e)break;s=end+1;
     }
-    /* a bare feature: true if it is non-zero */
-    float v;
-    size_t nl = (size_t)(e - s);
-    if (mq_feature_value(s, nl, m, &v)) return v != 0;
-    if (strn_ieq(s, "hover", nl) || strn_ieq(s, "pointer", nl) || strn_ieq(s, "any-hover", nl) ||
-        strn_ieq(s, "any-pointer", nl))
-        return true;
-    return false;
+    free(text);if(!ok&&out&&cap)out[0]=0;return ok&&any;
 }
-
-static bool mq_term(struct mq *m) {
-    m->s = skip_ws(m->s, m->e);
-    if (m->s >= m->e || *m->s != '(') {
-        /* a media type */
-        const char *st = m->s;
-        while (m->s < m->e && ident_char((unsigned char)*m->s)) m->s++;
-        size_t n = (size_t)(m->s - st);
-        if (!n) {
-            m->s = m->e;
-            return false;
-        }
-        return strn_ieq(st, "screen", n) || strn_ieq(st, "all", n);
-    }
-    const char *close = scan_to(m->s + 1, m->e, ")");
-    const char *in = skip_ws(m->s + 1, close);
-    bool r;
-    if (in < close && (*in == '(' || (strn_ieq(in, "not", 3) && in + 3 < close && !ident_char((unsigned char)in[3])))) {
-        struct mq sub = {in, close, m->vw, m->vh};
-        r = mq_cond(&sub);
-    } else r = mq_feature(m->s + 1, close, m);
-    m->s = close < m->e ? close + 1 : m->e;
-    return r;
-}
-
-static bool mq_cond(struct mq *m) {
-    if (mq_word(m, "not")) return !mq_term(m);
-    mq_word(m, "only");
-    bool r = mq_term(m);
-    for (;;) {
-        if (mq_word(m, "and")) r = mq_term(m) && r;
-        else if (mq_word(m, "or")) r = mq_term(m) || r;
-        else break;
-    }
-    return r;
-}
-
-static bool media_ok(const char *q, int vw, int vh) {
-    const char *s = q, *e = q + strlen(q);
-    if (skip_ws(s, e) == e) return true;
-    while (s < e) {
-        const char *c = scan_to(s, e, ",");
-        struct mq m = {s, c, vw, vh};
-        bool neg = mq_word(&m, "not");
-        bool r = mq_cond(&m);
-        if (neg ? !r : r) return true;
-        s = c < e ? c + 1 : e;
-    }
-    return false;
-}
-
-static bool media_chain_ok(const struct mcond *m, int vw, int vh) {
-    for (; m; m = m->up)
-        if (!media_ok(m->q, vw, vh)) return false;
-    return true;
+static bool media_chain_ok(const struct mcond *m,int vw,int vh,bool scripting) {
+    for(;m;m=m->up)if(!css_media_evaluate(m->q,vw,vh,scripting,NULL,0))return false;return true;
 }
 
 /* ---------------------------------------------------------------- the rule index */
@@ -1257,7 +1339,7 @@ static struct css_ctx *build_index(web_doc *d, int vw, int vh) {
         sheet_t *s = i == -2 ? ua_sheet : i == -1 ? quirks_sheet : sh->v[i];
         if (i == -1 && !d->quirks) continue;
         for (struct rule *r = s->first; r; r = r->next, order++) {
-            if (!r->ndecls || !media_chain_ok(r->media, vw, vh)) continue;
+            if (!r->ndecls || !media_chain_ok(r->media, vw, vh, web_js_enabled(d))) continue;
             for (int k = 0; k < r->sel->n; k++) index_rule(x, r, r->sel->v[k], order, s->ua);
         }
     }

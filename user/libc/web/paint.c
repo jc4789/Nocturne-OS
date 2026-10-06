@@ -1,8 +1,8 @@
 /* Painting, hit testing and find in page.
 
-   Paint order (a simplification of CSS 2 appendix E): the canvas background; positioned boxes with
-   a negative z-index; the normal flow in tree order (each block's background and borders, then its
-   floats, then its inline content); then positioned boxes with z-index auto or >= 0 in z order.
+   Paint order (a simplification of CSS 2 appendix E): within each supported stacking context,
+   its background; negative z-index layers; normal flow; then nonnegative layers. Descendants
+   of an explicit z-index context must not escape into a global z-index sort.
    Hit testing walks the same order and keeps the last thing under the point. */
 #include <stdio.h>
 #include <math.h>
@@ -13,18 +13,27 @@ enum { M_PAINT, M_HIT };
 struct pctx {
     web_doc *d;
     canvas_t *c;
+    int vx0, vy0, vx1, vy1; /* viewport clip, before any element overflow */
     float ox, oy; /* canvas position of document (0, 0) */
     int mode;
     float hx, hy; /* hit testing: the point, in document coordinates */
     struct web_hit *hit;
     bool hit_any;
-    pvec layers; /* positioned boxes */
+    node_t *target;
     uint32_t canvas_bg_from; /* 1: html's background was used for the canvas, 2: body's */
 };
 
 static bool positioned(const box_t *b) {
-    return b->st && b->kind != B_INLINE && b->kind != B_TEXT && b->st->position != POS_STATIC &&
-           b->st->position != POS_STICKY;
+    if (!b->st || b->kind == B_INLINE || b->kind == B_TEXT) return false;
+    if (b->st->position != POS_STATIC) return b->st->position != POS_STICKY;
+    /* z-index also applies to in-flow flex/grid items. Their layout remains
+       static, but painting and hit testing must place them in the z order. */
+    return !b->st->z_auto && b->parent && !b->abspos &&
+           (b->parent->kind == B_FLEX || b->parent->kind == B_GRID);
+}
+
+static bool stacking_context(const box_t *b) {
+    return positioned(b) && !b->st->z_auto;
 }
 
 static float cy(const box_t *b) { return box_abs_y(b) + b->content_dy; }
@@ -771,7 +780,9 @@ static void paint_marker(struct pctx *P, box_t *b) {
 
 /* ---------------------------------------------------------------- hit testing helpers */
 static bool inside(struct pctx *P, float x, float y, float w, float h) {
-    return P->hx >= x && P->hx < x + w && P->hy >= y && P->hy < y + h;
+    return P->hx >= x && P->hx < x + w && P->hy >= y && P->hy < y + h &&
+           P->hx + P->ox >= P->c->cx0 && P->hx + P->ox < P->c->cx1 &&
+           P->hy + P->oy >= P->c->cy0 && P->hy + P->oy < P->c->cy1;
 }
 
 static int control_hit(box_t *b) {
@@ -798,6 +809,7 @@ static int control_hit(box_t *b) {
 }
 
 static void set_hit(struct pctx *P, int kind, node_t *n, node_t *link) {
+    if (n) P->target = n;
     P->hit_any = true;
     P->hit->kind = kind;
     P->hit->node = n;
@@ -813,12 +825,14 @@ static void set_hit(struct pctx *P, int kind, node_t *n, node_t *link) {
 
 /* ---------------------------------------------------------------- the tree walk */
 static void paint_box(struct pctx *P, box_t *b, bool layer_root);
+static void paint_stacked_layer(struct pctx *P, box_t *l);
+static int layer_z(const box_t *b) { return b->st->z_auto ? 0 : b->st->z_index; }
 
-static void collect_layers(struct pctx *P, box_t *b) {
+static void collect_layers(pvec *layers, box_t *b) {
     for (box_t *c = b->first; c; c = c->next) {
         if (c->st && c->st->display == D_NONE) continue;
-        if (positioned(c)) pv_push(&P->layers, c);
-        collect_layers(P, c);
+        if (positioned(c)) pv_push(layers, c);
+        if (!stacking_context(c)) collect_layers(layers, c);
     }
 }
 
@@ -838,10 +852,14 @@ static void inline_children(struct pctx *P, box_t *b, bool floats) {
 static void paint_runs(struct pctx *P, box_t *b) {
     float bx = box_abs_x(b), by = cy(b);
     /* inline box backgrounds */
-    for (int i = 0; i < b->ndecos && P->mode == M_PAINT; i++) {
+    for (int i = 0; i < b->ndecos; i++) {
         struct deco *d = &b->decos[i];
         const style_t *st = d->st;
         if (st->visibility) continue;
+        if (P->mode == M_HIT) {
+            if (d->node && inside(P, bx + d->x, by + d->y, d->w, d->h)) P->target = d->node;
+            continue;
+        }
         float l = d->first ? 0 : 0;
         (void)l;
         float bw[4] = {st->border_width[0], st->border_width[1], st->border_width[2], st->border_width[3]};
@@ -866,7 +884,10 @@ static void paint_runs(struct pctx *P, box_t *b) {
             wfont f = style_font(r->st);
             float asc, desc;
             wf_metrics(&f, &asc, &desc);
-            if (r->link && inside(P, bx + r->x, by + r->y - asc, r->w, asc + desc)) set_hit(P, WEB_HIT_NONE, NULL, r->link);
+            if (inside(P, bx + r->x, by + r->y - asc, r->w, asc + desc)) {
+                if (r->node) P->target = r->node->type == N_ELEM ? r->node : r->node->parent;
+                if (r->link) set_hit(P, WEB_HIT_NONE, NULL, r->link);
+            }
             continue;
         }
         paint_run_text(P, r, bx, by);
@@ -878,13 +899,26 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (positioned(b) && !layer_root) return; /* painted with the layers */
     const style_t *st = b->st;
     if (st->opacity <= 0.001f) return;
+    pvec layers = {0};
+    if (b == P->d->root_box || stacking_context(b)) {
+        collect_layers(&layers, b);
+        /* Stable ordering preserves tree order for equal z-index values. */
+        for (int i = 1; i < layers.n; i++)
+            for (int j = i; j > 0 && layer_z(layers.v[j - 1]) > layer_z(layers.v[j]); j--) {
+                void *t = layers.v[j]; layers.v[j] = layers.v[j - 1]; layers.v[j - 1] = t;
+            }
+    }
     canvas_t *c = P->c;
     float x = box_abs_x(b), y = box_abs_y(b);
     float bx = x - b->p[3] - b->b[3], by = y - b->p[0] - b->b[0];
     float bw = b->w + b->p[1] + b->p[3] + b->b[1] + b->b[3];
     float bh = b->h + b->p[0] + b->p[2] + b->b[0] + b->b[2];
+    if (P->mode == M_HIT && !st->visibility && b->node &&
+        b->kind != B_TEXT && inside(P, bx, by, bw, bh))
+        P->target = b->node->type == N_ELEM ? b->node : b->node->parent;
     bool clip = st->overflow != OV_VISIBLE && b->kind != B_INLINE && b->parent;
-    if (clip && (P->oy + by > c->cy1 || P->oy + by + bh < c->cy0)) return;
+    /* Off-screen contexts can still contain viewport-fixed descendants. */
+    if (clip && !layers.n && (P->oy + by > c->cy1 || P->oy + by + bh < c->cy0)) { pv_free(&layers); return; }
     /* group opacity: paint, then blend the result with what was there */
     uint32_t *saved = NULL;
     int gx = 0, gy = 0, gw = 0, gh = 0;
@@ -922,26 +956,31 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         if (P->mode == M_PAINT) paint_marker(P, b);
     }
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+    bool contents = true;
     if (clip) {
         float px = P->ox + bx + b->b[3], py = P->oy + by + b->b[0];
         gfx_clip(c, (int)floorf(px), (int)floorf(py), (int)ceilf(bw - b->b[1] - b->b[3]), (int)ceilf(bh - b->b[0] - b->b[2]));
         if (P->mode == M_HIT && !inside(P, bx + b->b[3], by + b->b[0], bw - b->b[1] - b->b[3], bh - b->b[0] - b->b[2])) {
-            c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
-            goto done;
+            contents = false;
         }
     }
-    if (b->inline_ctx) {
+    int layer = 0;
+    for (; layer < layers.n && layer_z(layers.v[layer]) < 0; layer++)
+        paint_stacked_layer(P, layers.v[layer]);
+    if (contents && b->inline_ctx) {
         inline_children(P, b, true);
         paint_runs(P, b);
         inline_children(P, b, false);
-    } else {
+    } else if (contents) {
         for (box_t *ch = b->first; ch; ch = ch->next)
             if (ch->floated == false) paint_box(P, ch, false);
         for (box_t *ch = b->first; ch; ch = ch->next)
             if (ch->floated) paint_box(P, ch, false);
     }
+    for (; layer < layers.n; layer++) paint_stacked_layer(P, layers.v[layer]);
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
 done:
+    pv_free(&layers);
     if (saved) {
         int a = (int)(st->opacity * 255 + 0.5f);
         for (int j = 0; j < gh; j++) {
@@ -952,45 +991,32 @@ done:
     }
 }
 
-static int layer_z(const box_t *b) { return b->st->z_auto ? 0 : b->st->z_index; }
+static void paint_stacked_layer(struct pctx *P, box_t *l) {
+    /* Stacking order and containing-block clipping are independent. Rebuild
+       this layer's clip from the viewport, not its paint context's clip:
+       fixed children escape overflow, and absolute children skip overflow
+       below their containing block. This also works across nested contexts. */
+    canvas_t *c = P->c;
+    int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+    c->cx0 = P->vx0, c->cy0 = P->vy0, c->cx1 = P->vx1, c->cy1 = P->vy1;
+    bool skip = false, reached = l->st->position != POS_ABSOLUTE;
+    for (box_t *a = l->parent; a && a->parent; a = a->parent) {
+        if (a->st && a->st->display == D_NONE) skip = true;
+        if (a->st && a->kind != B_INLINE && a->st->position != POS_STATIC) reached = true;
+        if (a->st && a->st->overflow != OV_VISIBLE && a->kind != B_INLINE && reached &&
+            l->st->position != POS_FIXED) {
+            float ax = box_abs_x(a) - a->p[3], ay = box_abs_y(a) - a->p[0];
+            gfx_clip(c, (int)(P->ox + ax), (int)(P->oy + ay), (int)(a->w + a->p[1] + a->p[3]), (int)(a->h + a->p[0] + a->p[2]));
+        }
+    }
+    if (!skip) paint_box(P, l, true);
+    c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
+}
 
 static void walk(struct pctx *P) {
-    web_doc *d = P->d;
-    box_t *root = d->root_box;
-    if (!root) return;
-    P->layers.n = 0;
-    collect_layers(P, root);
-    /* stable sort by z-index */
-    for (int i = 1; i < P->layers.n; i++)
-        for (int j = i; j > 0 && layer_z(P->layers.v[j - 1]) > layer_z(P->layers.v[j]); j--) {
-            void *t = P->layers.v[j];
-            P->layers.v[j] = P->layers.v[j - 1];
-            P->layers.v[j - 1] = t;
-        }
-    int i = 0;
-    for (; i < P->layers.n && layer_z(P->layers.v[i]) < 0; i++) paint_box(P, P->layers.v[i], true);
-    paint_box(P, root, true);
-    for (; i < P->layers.n; i++) {
-        box_t *l = P->layers.v[i];
-        /* a positioned box is clipped by the overflow of the ancestors on its containing block
-           chain: all of them for relative and sticky, those from the nearest positioned one up for
-           absolute, none for fixed */
-        canvas_t *c = P->c;
-        int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
-        bool skip = false, reached = l->st->position != POS_ABSOLUTE;
-        for (box_t *a = l->parent; a && a->parent; a = a->parent) {
-            if (a->st && a->st->display == D_NONE) skip = true;
-            if (a->st && a->kind != B_INLINE && a->st->position != POS_STATIC) reached = true;
-            if (a->st && a->st->overflow != OV_VISIBLE && a->kind != B_INLINE && reached &&
-                l->st->position != POS_FIXED) {
-                float ax = box_abs_x(a) - a->p[3], ay = box_abs_y(a) - a->p[0];
-                gfx_clip(c, (int)(P->ox + ax), (int)(P->oy + ay), (int)(a->w + a->p[1] + a->p[3]), (int)(a->h + a->p[0] + a->p[2]));
-            }
-        }
-        if (!skip) paint_box(P, l, true);
-        c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
-    }
-    pv_free(&P->layers);
+    P->vx0 = P->c->cx0, P->vy0 = P->c->cy0;
+    P->vx1 = P->c->cx1, P->vy1 = P->c->cy1;
+    if (P->d->root_box) paint_box(P, P->d->root_box, true);
 }
 
 uint32_t doc_canvas_bg(web_doc *d, int *from);
@@ -1041,6 +1067,50 @@ bool web_hit_test(web_doc *d, int x, int y, struct web_hit *hit) {
     walk(&P);
     if (!P.hit_any) return false;
     return hit->kind != WEB_HIT_NONE;
+}
+
+web_node *web_node_at(web_doc *d, int x, int y) {
+    if (!d || !d->root_box) return NULL;
+    struct pctx P = {0};
+    struct web_hit hit = {0};
+    canvas_t dummy = {0};
+    dummy.cx0 = dummy.cy0 = -1000000000;
+    dummy.cx1 = dummy.cy1 = 1000000000;
+    P.d = d;
+    P.c = &dummy;
+    P.mode = M_HIT;
+    P.hx = (float)x;
+    P.hy = (float)y;
+    P.hit = &hit;
+    walk(&P);
+    return P.target;
+}
+
+bool web_node_action(web_doc *d, web_node *target, struct web_hit *hit) {
+    memset(hit, 0, sizeof *hit);
+    if (!d || !target) return false;
+    node_t *root = target;
+    while (root->parent) root = root->parent;
+    if (root != d->root) return false;
+    for (node_t *n = target; n; n = n->parent) {
+        if (n->type != N_ELEM) continue;
+        if (n->box) {
+            int kind = control_hit(n->box);
+            if (kind != WEB_HIT_NONE) {
+                if (node_attr(n, "disabled")) return false;
+                hit->kind = kind;
+                hit->node = n;
+                return true;
+            }
+        }
+        if (n->tag == T_a && node_attr(n, "href")) {
+            hit->kind = WEB_HIT_LINK;
+            hit->node = n;
+            hit->href = doc_link_href(d, n);
+            return hit->href != NULL;
+        }
+    }
+    return false;
 }
 
 /* ---------------------------------------------------------------- find in page */
