@@ -51,3 +51,4 @@ void vmm_switch(uint64_t pml4);
 
 void *vmalloc(size_t pages);
 void vfree(void *p, size_t pages);
+void *vmalloc_map_phys(uint64_t pa, size_t pages, uint64_t flags);

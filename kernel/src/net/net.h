@@ -16,6 +16,7 @@ void net_rx(const void *frame, size_t len);
 
 bool e1000_probe(void);
 bool tulip_probe(void);
+bool netvsc_probe(void); /* hv/netvsc.c: Hyper-V synthetic network adapter */
 
 /* busy-wait helper usable before the scheduler can block us */
 void net_delay_ms(uint64_t ms);

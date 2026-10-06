@@ -39,7 +39,10 @@ static void kbd_irq(struct regs *r) {
     if (st & 0x20) { /* mouse data arrived on the keyboard IRQ: let IRQ12 path handle it */
         return;
     }
-    uint8_t sc = inb(0x60);
+    input_scancode(inb(0x60));
+}
+
+void input_scancode(uint8_t sc) {
     if (sc == 0xE0) { e0 = true; return; }
     if (sc == 0xE1) return;
     bool pressed = !(sc & 0x80);
@@ -109,8 +112,8 @@ static void mouse_irq(struct regs *r) {
     if (pidx < need) return;
     pidx = 0;
     if (packet[0] & 0xC0) return; /* overflow */
-    struct mouse_event e;
-    e.dx = (int)packet[1] - ((packet[0] & 0x10) ? 256 : 0);
+    struct mouse_event e = {0};
+    e.dx =(int)packet[1] - ((packet[0] & 0x10) ? 256 : 0);
     e.dy = -((int)packet[2] - ((packet[0] & 0x20) ? 256 : 0));
     if (flip_y) e.dy = -e.dy;
     e.buttons = packet[0] & 7;
@@ -169,6 +172,10 @@ static void flush(void) {
 }
 
 void input_init(void) {
+    if (inb(0x64) == 0xFF) { /* nothing decodes the port: no i8042 (Hyper-V Generation 2) */
+        kprintf("input: no PS/2 controller\n");
+        return;
+    }
     ctl_cmd(0xAD); /* disable keyboard port */
     ctl_cmd(0xA7); /* disable aux port */
     flush();
@@ -228,3 +235,15 @@ void input_set_sinks(key_sink_t k, mouse_sink_t m) {
 }
 
 bool input_mouse_present(void) { return mouse_ok; }
+
+void input_unicode(uint16_t c, bool pressed) {
+    if (c == '\r') c = '\n';
+    if (c >= 0x80) c = KEY_UNKNOWN; /* the key codes have no room for other characters yet */
+    emit_key(c, pressed);
+}
+
+void input_mouse(const struct mouse_event *e) {
+    if (mouse_sink) mouse_sink(e);
+}
+
+void input_mouse_attach(void) { mouse_ok = true; }

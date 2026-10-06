@@ -2,8 +2,10 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include "dev/blk.h"
 
 struct ata_disk {
+    struct blkdev blk;
     int index;
     uint16_t io, ctl;
     bool slave, lba48;

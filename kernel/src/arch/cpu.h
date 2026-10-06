@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include <stdint.h>
 
 static inline void outb(uint16_t port, uint8_t v) { __asm__ volatile("outb %0, %1" : : "a"(v), "Nd"(port)); }
@@ -72,6 +73,11 @@ void tss_set_rsp0(uint64_t rsp0);
 void idt_init(void);
 typedef void (*irq_handler_t)(struct regs *r);
 void irq_register(int irq, irq_handler_t h);
+void vector_register(int vec, irq_handler_t h);
+bool lapic_present(void);
+void lapic_eoi(void);
+bool lapic_timer_start(unsigned hz, int vector);
+#define VEC_TIMER 0x30
 void pic_init(void);
 void pic_unmask(int irq);
 void pic_mask(int irq);

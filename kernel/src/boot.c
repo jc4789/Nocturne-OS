@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include "limine.h"
 #include "arch/cpu.h"
+#include "arch/hyperv.h"
 #include "dev/serial.h"
 #include "dev/fb.h"
 #include "dev/fbcon.h"
@@ -79,6 +80,7 @@ void kmain(void) {
         fbcon_init();
     }
     kprintf("cpu: %s\n", cpu_brand);
+    hv_detect();
     kprintf("video: %ux%u, %u bpp, pitch %u\n", fb.width, fb.height, fb.bpp, fb.pitch);
     for (uint64_t i = 0; i < mm->entry_count; i++) {
         struct limine_memmap_entry *e = mm->entries[i];

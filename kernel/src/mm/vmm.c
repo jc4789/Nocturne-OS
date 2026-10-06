@@ -330,6 +330,16 @@ void *vmalloc(size_t pages) {
     return (void *)va;
 }
 
+/* Map existing frames at fresh kernel addresses with the given flags (e.g. read+execute only). */
+void *vmalloc_map_phys(uint64_t pa, size_t pages, uint64_t flags) {
+    uint64_t f = irq_save();
+    uint64_t va = vmalloc_next;
+    vmalloc_next += (pages + 1) * PAGE_SIZE;
+    irq_restore(f);
+    for (size_t i = 0; i < pages; i++) vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, pa + i * PAGE_SIZE, flags);
+    return (void *)va;
+}
+
 void vfree(void *ptr, size_t pages) {
     uint64_t va = (uint64_t)ptr;
     for (size_t i = 0; i < pages; i++) {

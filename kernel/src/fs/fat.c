@@ -1,4 +1,4 @@
-/* FAT32 filesystem (read/write, long file names) on an ATA disk.
+/* FAT32 filesystem (read/write, long file names) on a block device (ATA or Hyper-V SCSI disk).
    At boot every disk is scanned (MBR partitions, or a whole-disk "superfloppy" volume) and the
    volume labelled NOCTDATA is mounted at /data. Writes go straight to the disk, so nothing is lost
    when the VM is switched off.
@@ -8,7 +8,7 @@
    same file shares one vnode and one size. Only the FAT sectors are cached (write-through). */
 #include "fs/vfs.h"
 #include "mm/heap.h"
-#include "dev/ata.h"
+#include "dev/blk.h"
 #include "dev/timer.h"
 
 #define SECTOR 512
@@ -22,7 +22,7 @@
 #define ATTR_LFN    0x0F
 
 struct fat_fs {
-    struct ata_disk *disk;
+    struct blkdev *disk;
     uint64_t lba0; /* volume start */
     uint32_t spc, reserved, nfats, fat_sectors, root_clus, nclus, cbytes;
     uint64_t data_lba;
@@ -59,9 +59,9 @@ static struct vnode_ops fat_ops;
 
 /* ---------------------------------------------------------------- sectors, clusters, FAT */
 
-static int disk_read(struct fat_fs *fs, uint64_t lba, uint32_t n, void *buf) { return ata_read(fs->disk, fs->lba0 + lba, n, buf); }
+static int disk_read(struct fat_fs *fs, uint64_t lba, uint32_t n, void *buf) { return blk_read(fs->disk, fs->lba0 + lba, n, buf); }
 static int disk_write(struct fat_fs *fs, uint64_t lba, uint32_t n, const void *buf) {
-    return ata_write(fs->disk, fs->lba0 + lba, n, buf);
+    return blk_write(fs->disk, fs->lba0 + lba, n, buf);
 }
 
 #define FCACHE 64
@@ -797,10 +797,10 @@ static bool volume_label(struct fat_fs *fs, const uint8_t *bpb, char *out) {
     return true;
 }
 
-static struct fat_fs *try_volume(struct ata_disk *disk, uint64_t lba, char *label) {
+static struct fat_fs *try_volume(struct blkdev *disk, uint64_t lba, char *label) {
     uint8_t bs[SECTOR];
-    if (ata_read(disk, lba, 1, bs) < 0) {
-        kprintf("fat: disk %d: read error at sector %lu\n", disk->index, lba);
+    if (blk_read(disk, lba, 1, bs) < 0) {
+        kprintf("fat: %s: read error at sector %lu\n", disk->name, lba);
         return NULL;
     }
     if (bs[510] != 0x55 || bs[511] != 0xAA) return NULL;
@@ -854,11 +854,11 @@ static void mount_fs(struct fat_fs *fs, const char *path, const char *label) {
 }
 
 void fat_mount_data(void) {
-    for (int i = 0; i < ata_count(); i++) {
-        struct ata_disk *d = ata_get(i);
+    for (int i = 0; i < blk_count(); i++) {
+        struct blkdev *d = blk_get(i);
         uint8_t mbr[SECTOR];
-        if (ata_read(d, 0, 1, mbr) < 0) {
-            kprintf("fat: disk %d: cannot read the partition table\n", i);
+        if (blk_read(d, 0, 1, mbr) < 0) {
+            kprintf("fat: %s: cannot read the partition table\n", d->name);
             continue;
         }
         uint64_t starts[5];

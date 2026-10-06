@@ -22,9 +22,13 @@ struct key_event {
     bool pressed;
 };
 
+#define MOUSE_ABS_MAX 32767
+
 struct mouse_event {
     int dx, dy, wheel;
     uint8_t buttons; /* bit0 left, bit1 right, bit2 middle */
+    bool absolute;   /* x, y are a position in 0..MOUSE_ABS_MAX instead of dx, dy */
+    int x, y;
 };
 
 typedef void (*key_sink_t)(const struct key_event *e);
@@ -33,3 +37,8 @@ typedef void (*mouse_sink_t)(const struct mouse_event *e);
 void input_init(void);
 void input_set_sinks(key_sink_t k, mouse_sink_t m);
 bool input_mouse_present(void);
+/* for other keyboard and mouse drivers (Hyper-V synthetic devices) */
+void input_scancode(uint8_t sc); /* one byte of scancode set 1, including 0xE0 prefixes */
+void input_unicode(uint16_t c, bool pressed); /* a typed character, independent of layout */
+void input_mouse(const struct mouse_event *e);
+void input_mouse_attach(void);

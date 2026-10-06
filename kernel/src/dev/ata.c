@@ -83,11 +83,26 @@ static void probe(uint16_t io, uint16_t ctl, bool slave) {
             d.model, d.sectors / 2048, d.lba48 ? ", LBA48" : "");
 }
 
+static int blk_ata_read(struct blkdev *b, uint64_t lba, uint32_t n, void *buf) { return ata_read(b->priv, lba, n, buf); }
+static int blk_ata_write(struct blkdev *b, uint64_t lba, uint32_t n, const void *buf) {
+    return ata_write(b->priv, lba, n, buf);
+}
+
 void ata_init(void) {
     probe(0x1F0, 0x3F6, false);
     probe(0x1F0, 0x3F6, true);
     probe(0x170, 0x376, false);
     probe(0x170, 0x376, true);
+    for (int i = 0; i < ndisks; i++) {
+        struct blkdev *b = &disks[i].blk;
+        ksnprintf(b->name, sizeof b->name, "ata%d", i);
+        strlcpy(b->model, disks[i].model, sizeof b->model);
+        b->sectors = disks[i].sectors;
+        b->read = blk_ata_read;
+        b->write = blk_ata_write;
+        b->priv = &disks[i];
+        blk_register(b);
+    }
 }
 
 int ata_count(void) { return ndisks; }

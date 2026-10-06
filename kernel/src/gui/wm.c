@@ -68,6 +68,12 @@ static int nwin;
 static int next_win_id = 1;
 
 static int mx, my, mbuttons;
+
+/* remote display (RDP): what changed since the remote side last looked */
+#define MAX_RDAMAGE 16
+static int remote_users;
+static struct rect rdamage[MAX_RDAMAGE];
+static int nrdamage;
 static int cursor_shape = CURSOR_ARROW;
 
 enum { DRAG_NONE, DRAG_MOVE, DRAG_RESIZE, DRAG_CLIENT, DRAG_BUTTON };
@@ -773,8 +779,18 @@ static void composite_rect(struct rect r) {
     if (r.y + r.h > sh - TASKBAR_H) draw_taskbar(c);
     if (menu_open) draw_menu(c);
     if (toast_until) draw_toast(c);
-    desktop_draw_cursor(c, mx, my, cursor_shape);
+    /* a remote viewer draws the pointer itself; keep it out of the picture it is sent */
+    if (!remote_users) desktop_draw_cursor(c, mx, my, cursor_shape);
     fb_present(back.px, back.pitch, r.x, r.y, r.w, r.h);
+    if (remote_users) {
+        if (nrdamage == MAX_RDAMAGE) {
+            for (int i = 1; i < nrdamage; i++) rdamage[0] = rect_union(rdamage[0], rdamage[i]);
+            nrdamage = 1;
+            rdamage[0] = rect_union(rdamage[0], r);
+        } else {
+            rdamage[nrdamage++] = r;
+        }
+    }
 }
 
 static void composite(void) {
@@ -1047,9 +1063,15 @@ static void left_release(void) {
 
 static void handle_mouse(const struct mouse_event *m) {
     int dx = m->dx, dy = m->dy;
-    /* mild acceleration */
-    if (ABS(dx) > 5) dx *= 2;
-    if (ABS(dy) > 5) dy *= 2;
+    if (m->absolute) {
+        /* a tablet-style pointer (Hyper-V's synthetic mouse): go exactly where the host cursor is */
+        dx = (int)((int64_t)m->x * (sw - 1) / MOUSE_ABS_MAX) - mx;
+        dy = (int)((int64_t)m->y * (sh - 1) / MOUSE_ABS_MAX) - my;
+    } else {
+        /* mild acceleration */
+        if (ABS(dx) > 5) dx *= 2;
+        if (ABS(dy) > 5) dy *= 2;
+    }
     int ox = mx, oy = my;
     if (dx || dy) {
         damage_cursor();
@@ -1157,6 +1179,92 @@ static void wm_thread(void *arg) {
 }
 
 bool wm_running(void) { return running; }
+
+void wm_screen_size(uint32_t *w, uint32_t *h) {
+    *w = (uint32_t)sw;
+    *h = (uint32_t)sh;
+}
+
+/* ---- remote display ---- */
+
+/* Change the size of the desktop. The framebuffer keeps its own size (fb_present clips), so a
+   remote viewer can have a desktop of the size its window has. Only call this from a kernel
+   thread: the compositor must not be in the middle of a frame. */
+static bool set_screen_size(int w, int h) {
+    if (w == sw && h == sh) return true;
+    size_t pages = ALIGN_UP((uint64_t)w * h * 4, PAGE_SIZE) / PAGE_SIZE;
+    size_t old = ALIGN_UP((uint64_t)sw * sh * 4, PAGE_SIZE) / PAGE_SIZE;
+    uint32_t *bb = vmalloc(pages), *wp = vmalloc(pages);
+    if (!bb || !wp) {
+        if (bb) vfree(bb, pages);
+        if (wp) vfree(wp, pages);
+        return false;
+    }
+    vfree(back.px, old);
+    vfree(wall.px, old);
+    sw = w;
+    sh = h;
+    gfx_init(&back, bb, sw, sh, sw);
+    gfx_init(&wall, wp, sw, sh, sw);
+    desktop_draw_wallpaper(&wall);
+    draw_desktop_icons(&wall);
+    mx = MIN(mx, sw - 1);
+    my = MIN(my, sh - 1);
+    drag_mode = DRAG_NONE;
+    resize_visible = false;
+    for (int i = 0; i < nwin; i++) {
+        struct window *win = zorder[i];
+        if (win->maximized) {
+            struct gui_event e = {0};
+            e.type = EV_RESIZE;
+            e.x = sw - 2 * BORDER;
+            e.y = sh - TASKBAR_H - TITLE_H - BORDER;
+            push_event(win, &e);
+            continue;
+        }
+        if (win->x + frame_w(win) > sw) win->x = MAX(0, sw - frame_w(win));
+        if (win->y + frame_h(win) > sh - TASKBAR_H) win->y = MAX(0, sh - TASKBAR_H - frame_h(win));
+    }
+    ndamage = 0;
+    nrdamage = 0;
+    damage_all();
+    kprintf("wm: desktop is now %dx%d\n", sw, sh);
+    return true;
+}
+
+bool wm_remote_attach(int *w, int *h) {
+    if (!running) return false;
+    remote_users++;
+    if (*w > 0 && *h > 0) set_screen_size(MAX(640, MIN(*w, 3840)), MAX(480, MIN(*h, 2160)));
+    *w = sw;
+    *h = sh;
+    damage_all(); /* repaint without the pointer */
+    wake_compositor();
+    return true;
+}
+
+void wm_remote_detach(void) {
+    if (remote_users > 0) remote_users--;
+    if (!remote_users) set_screen_size((int)fb.width, (int)fb.height);
+    damage_all();
+    wake_compositor();
+}
+
+int wm_remote_damage(struct wm_rect *out, int max) {
+    uint64_t f = irq_save();
+    int n = MIN(nrdamage, max);
+    for (int i = 0; i < n; i++) out[i] = (struct wm_rect){rdamage[i].x, rdamage[i].y, rdamage[i].w, rdamage[i].h};
+    nrdamage = 0;
+    irq_restore(f);
+    return n;
+}
+
+const uint32_t *wm_remote_frame(int *pitch) {
+    *pitch = back.pitch;
+    return back.px;
+}
+
+int wm_cursor_shape(void) { return cursor_shape; }
 
 void wm_init(void) {
     sw = fb.width;

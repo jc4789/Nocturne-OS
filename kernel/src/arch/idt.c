@@ -18,6 +18,7 @@ struct idt_entry {
 static struct idt_entry idt[256];
 extern uint64_t isr_stub_table[256];
 static irq_handler_t irq_handlers[16];
+static irq_handler_t vec_handlers[256]; /* LAPIC-delivered vectors (0x30 and up) */
 
 static void idt_set(int vec, uint64_t handler, uint8_t type, uint8_t ist) {
     idt[vec].off_lo = handler & 0xFFFF;
@@ -41,6 +42,7 @@ void idt_init(void) {
 }
 
 void irq_register(int irq, irq_handler_t h) { irq_handlers[irq] = h; }
+void vector_register(int vec, irq_handler_t h) { vec_handlers[vec] = h; }
 
 /* ---- 8259 PIC ---- */
 void pic_init(void) {
@@ -123,6 +125,10 @@ void isr_dispatch(struct regs *r) {
         if (irq_handlers[irq]) irq_handlers[irq](r);
     } else if (v == 0x80) {
         syscall_dispatch(r);
+    } else if (v < 0xFF) {
+        entropy_add(rdtsc() ^ v << 56);
+        lapic_eoi();
+        if (vec_handlers[v]) vec_handlers[v](r);
     }
     if ((r->cs & 3) == 3) sched_user_return(r);
 }

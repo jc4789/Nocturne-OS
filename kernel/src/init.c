@@ -8,6 +8,7 @@
 #include "dev/pci.h"
 #include "dev/ata.h"
 #include "gui/wm.h"
+#include "hv/vmbus.h"
 #include "sys/proc.h"
 #include "sys/sched.h"
 
@@ -16,6 +17,7 @@ extern const char *kernel_cmdline;
 void acpi_init(void);
 void net_init(void);
 void fat_mount_data(void);
+void rdp_init(void);
 
 /* text-mode keyboard: translate key events into terminal byte sequences */
 static void console_key_sink(const struct key_event *e) {
@@ -64,13 +66,20 @@ void kmain_late(void) {
         kprintf("initrd: none found!\n");
     }
     acpi_init();
+    if (vmbus_init()) {
+        hv_input_init();
+        hv_util_init();
+        hvsock_init();
+    }
     pci_init();
     net_init();
     ata_init();
+    storvsc_init();
     fat_mount_data();
 
     bool gui = !cmdline_has("nogui");
     if (gui) wm_init();
+    rdp_init();
     if (!gui || !wm_running()) input_set_sinks(console_key_sink, NULL);
 
     struct file *con = NULL;

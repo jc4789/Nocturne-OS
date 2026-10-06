@@ -52,16 +52,22 @@ int64_t rtc_read_unix(void) {
 }
 
 void timer_init(void) {
-    uint16_t div = 1193182 / 1000;
-    outb(0x43, 0x36);
-    outb(0x40, div & 0xFF);
-    outb(0x40, div >> 8);
-    irq_register(0, timer_irq);
-    pic_unmask(0);
+    /* The LAPIC timer works everywhere, including Hyper-V Generation 2, which has no PIT. */
+    vector_register(VEC_TIMER, timer_irq);
+    if (!lapic_timer_start(1000, VEC_TIMER)) {
+        uint16_t div = 1193182 / 1000;
+        outb(0x43, 0x36);
+        outb(0x40, div & 0xFF);
+        outb(0x40, div >> 8);
+        irq_register(0, timer_irq);
+        pic_unmask(0);
+        kprintf("timer: PIT at 1000 Hz\n");
+    }
     boot_unix_time = rtc_read_unix();
 }
 
 int64_t time_now(void) { return boot_unix_time + (int64_t)(timer_ticks / 1000); }
+void time_set(int64_t t) { boot_unix_time = t - (int64_t)(timer_ticks / 1000); }
 
 void time_to_parts(int64_t t, struct tm_parts *p) {
     int64_t days = t / 86400;

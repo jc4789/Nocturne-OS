@@ -29,16 +29,20 @@ layout) are parsed, laid out and painted by an engine written for Nocturne. It h
 
 ## What's inside
 
-**Kernel** (`kernel/`, about 9,000 lines of C)
+**Kernel** (`kernel/`, about 13,500 lines of C)
 - Boots through Limine (BIOS or UEFI) into a higher-half x86-64 kernel.
 - Memory: physical page allocator, 4-level paging, kernel heap, and a separate address space for every process.
   - W^X: no page is both writable and executable. ELF segments are mapped with their own permissions, the stack and heap are no-execute (NX), and the kernel's own code, read-only data and data are mapped separately. Write protection also applies in ring 0.
   - `mmap`, `munmap` and `mprotect` are real, which is how `tcc -run` gets executable memory for the code it just compiled.
-- Processes: ring-3 user processes with ELF loading, preemptive scheduling (1 kHz PIT), `int 0x80` system calls, `spawn` and `waitpid`, process trees, and `kill`.
+- Processes: ring-3 user processes with ELF loading, preemptive scheduling (1 kHz local APIC timer, or the PIT), `int 0x80` system calls, `spawn` and `waitpid`, process trees, and `kill`.
 - Files: a VFS with a RAM filesystem (populated from a tar initrd), `/dev` (console, null, zero, random), pipes, and `poll`.
-- Persistent storage: an ATA PIO disk driver and a FAT32 filesystem (read and write), which is mounted at `/data`.
+- Persistent storage: ATA PIO and Hyper-V SCSI disk drivers and a FAT32 filesystem (read and write), which is mounted at `/data`.
 - Drivers: PS/2 keyboard and wheel mouse, framebuffer, serial, CMOS clock, PCI enumeration, and ACPI power-off and reboot.
-- Networking: drivers for the Intel e1000 (QEMU, VirtualBox, VMware) and the DEC 21140 "tulip" (Hyper-V's legacy network adapter), and a small TCP/IP stack: Ethernet, ARP, IPv4, ICMP, UDP, a DHCP client, a DNS resolver and a TCP client.
+- Hyper-V: VMBus and its synthetic devices, so Nocturne runs in a Generation 2 VM. See [Running it in Hyper-V](#running-it-in-hyper-v).
+  - Keyboard, absolute mouse, SCSI disks and network adapter.
+  - Heartbeat, graceful shutdown and restart from Hyper-V Manager, and the host's clock (time sync).
+  - Hyper-V sockets, and an RDP server on them for VMConnect's **Enhanced Session**: the desktop takes the size of the VMConnect window.
+- Networking: drivers for the Intel e1000 (QEMU, VirtualBox, VMware), the DEC 21140 "tulip" (Hyper-V's legacy network adapter) and Hyper-V's synthetic adapter, and a small TCP/IP stack: Ethernet, ARP, IPv4, ICMP, UDP, a DHCP client, a DNS resolver and a TCP client.
   - TCP keeps out-of-order segments and reassembles them, and does NewReno congestion control (slow start, fast retransmit and fast recovery) with a retransmission timeout taken from the measured round-trip time.
 - Graphics: a compositing window manager. It runs in the kernel, which keeps it simple and fast, but a bug in it can bring the whole system down.
   - Window buffers are shared memory and redraws are damage-tracked.
@@ -69,34 +73,59 @@ You need Windows with Hyper-V enabled. Run this once from an **elevated** (admin
 powershell -ExecutionPolicy Bypass -File hyperv.ps1
 ```
 
-This creates a **Generation 1** VM called `Nocturne` with the following settings:
+This creates a **Generation 2** VM called `Nocturne` with the following settings:
 - 512 MB of static memory and 1 CPU.
-- The disk on IDE.
-- A legacy network adapter on the **Default Switch**, so the VM gets an address by DHCP and can reach the internet.
+- Secure Boot off (the boot loader is not signed).
+- The boot disk (`hyperv\Nocturne-boot.vhdx`) on SCSI 0:0 and the [data disk](#persistent-storage-data) on SCSI 0:1.
+- A network adapter on the **Default Switch**, so the VM gets an address by DHCP and can reach the internet.
+- The Enhanced Session over Hyper-V sockets. If the host has Enhanced Session Mode turned off, the script turns it on.
 - No checkpoints.
 - COM1 connected to `\\.\pipe\nocturne-com1`.
 
 The script then starts the VM and opens a VMConnect window.
 
+**Enhanced Session.** VMConnect asks for a display size once Nocturne is up. That is the Enhanced
+Session: VMConnect connects to the RDP server inside Nocturne, and the desktop takes the size you
+pick. Keyboard and mouse go through the same connection, with no mouse capture. Choose
+**View > Enhanced Session** to switch back to the basic console, which shows the desktop at the
+framebuffer's size. Nocturne returns to that size when the Enhanced Session ends.
+
 Other options:
 
 | Command | What it does |
 |---|---|
-| `hyperv.ps1 -Update` | Copy a freshly built disk into the existing VM and restart it. |
-| `hyperv.ps1 -Iso` | Boot from `build\nocturne.iso` on the DVD drive instead of the VHD. |
+| `hyperv.ps1 -Update` | Copy a freshly built disk into the existing VM and restart it. The VM keeps its generation. |
+| `hyperv.ps1 -Generation 1` | Create a Generation 1 VM instead (see below). |
+| `hyperv.ps1 -Iso` | Boot from `build\nocturne.iso` on the DVD drive instead of the disk. |
 | `hyperv.ps1 -Remove` | Delete the VM. |
 | `hyperv.ps1 -NoNetwork` | Create the VM without a network adapter. |
 | `hyperv.ps1 -Switch "Name"` | Connect the network adapter to a different virtual switch. |
 | `hyperv.ps1 -Name Foo -MemoryMB 1024` | Use a different VM name and memory size. |
 
-To create the VM by hand instead, make a Generation 1 VM and attach `build\nocturne.vhd` (or `nocturne.vhdx`) as an IDE disk. Generation 2 will **not** work: it has no PS/2 or IDE hardware, only Hyper-V's VMBus devices, and Nocturne has no drivers for those. For the same reason the network adapter must be a *legacy* one.
+To create a Gen 2 VM by hand instead, turn Secure Boot off and attach `build\nocturne.vhdx` as a SCSI
+disk. Set `Set-VM -EnhancedSessionTransportType HvSocket` for the Enhanced Session.
+
+**Generation 1** emulates a legacy PC. Nocturne drives it too: `build\nocturne.vhd` on IDE, the data
+disk on IDE 0:1 and a *legacy* network adapter (an emulated DEC 21140). VMConnect shows the basic
+console only.
 
 **Tips for VMConnect**
-- Click inside the window to capture the mouse. **Ctrl+Alt+Left Arrow** releases it.
+- In the basic console, click inside the window to capture the mouse. **Ctrl+Alt+Left Arrow** releases it.
 - The Windows key only reaches the VM in full-screen mode. Use **Ctrl+Esc** to open the start menu instead.
 - The boot menu has a **1024x768** entry and a **text console only** entry, in case the default 1280x800 mode isn't available.
-- Kernel log: connect any named-pipe client, such as PuTTY (Serial, `\\.\pipe\nocturne-com1`), to COM1.
-- **Mouse moving up when you move down?** Hyper-V on Windows 11 hosts reports the emulated PS/2 mouse's vertical axis backwards. Nocturne detects Hyper-V (and the host build) and flips the axis itself. If it guesses wrong on your host, press **E** on the boot menu entry and add `cmdline: mouse_y=normal` (or `mouse_y=invert`).
+- Kernel log: connect any named-pipe client, such as PuTTY (Serial, `\\.\pipe\nocturne-com1`), to COM1. `scripts\hv-serial.ps1` copies it to a file.
+- **Mouse moving up when you move down?** On Gen 1, Hyper-V on Windows 11 hosts reports the emulated PS/2 mouse's vertical axis backwards. Nocturne detects Hyper-V (and the host build) and flips the axis itself. If it guesses wrong on your host, press **E** on the boot menu entry and add `cmdline: mouse_y=normal` (or `mouse_y=invert`).
+
+**Development scripts** (`scripts\`, elevated):
+
+| Script | What it does |
+|---|---|
+| `hv-boot.ps1 -Name VM -Build` | Build, refresh the VM's boot media, boot, record COM1 and take a console screenshot. |
+| `hv-esm.ps1 -Name VM` | Open an Enhanced Session in VMConnect and save a picture of the window. |
+| `python hv-rdp.py --vm VM --size 1280x720 "type:neofetch\n" dclick:53,130` | Test the Enhanced Session without VMConnect: a small RDP client types and clicks, and saves the desktop it receives as a PNG. |
+| `hv-shot.ps1 -Name VM` | Screenshot the VM's console without VMConnect. |
+| `hv-sock.ps1 -Name VM -Port N` | Connect to a Hyper-V socket service in the guest from the host. |
+| `hv-serial.ps1 -Pipe P -Log F` | Copy a COM port pipe to a log file. |
 
 ## Building
 
@@ -113,8 +142,8 @@ powershell -ExecutionPolicy Bypass -File build.ps1 clean
 Outputs in `build\`:
 - `nocturne.img`: raw MBR disk, used by QEMU.
 - `data.img`: the persistent `/data` disk for QEMU.
-- `nocturne.vhd`: fixed VHD for Hyper-V.
-- `nocturne.vhdx`
+- `nocturne.vhd`: fixed VHD for Hyper-V Generation 1.
+- `nocturne.vhdx`: dynamic VHDX for Hyper-V Generation 2.
 - `nocturne.iso`: hybrid BIOS/UEFI ISO.
 
 ## Tests
@@ -172,7 +201,7 @@ The network comes up by itself: a DHCP client runs in the kernel at boot, so `if
 shows an address a second or two after the desktop appears.
 
 - **QEMU**: the default e1000 card with user-mode networking works as-is (`build.ps1 run`). `-nic user,model=tulip` exercises the Hyper-V driver.
-- **Hyper-V**: `hyperv.ps1` adds a legacy network adapter on the Default Switch. A *synthetic* (VMBus) adapter will not be seen.
+- **Hyper-V**: `hyperv.ps1` adds a network adapter on the Default Switch: the synthetic (VMBus) adapter on Gen 2, a legacy one on Gen 1.
 
 ```
 ping -c 3 example.com
@@ -225,7 +254,7 @@ Everything outside `/data` lives in RAM and is reset on every boot. `/data` is a
 labelled `NOCTDATA` on a second disk, so files saved there survive reboots and rebuilds.
 - **QEMU**: `build\data.img` (512 MB) is created on the first build and is never overwritten.
   `build.ps1 clean` leaves it alone. Delete it by hand to start fresh.
-- **Hyper-V**: `hyperv.ps1` attaches `hyperv\<Name>-data.vhdx` (2 GB, dynamic) as the second IDE disk.
+- **Hyper-V**: `hyperv.ps1` attaches `hyperv\<Name>-data.vhdx` (2 GB, dynamic) as the second disk (SCSI on Gen 2, IDE on Gen 1).
   `-Update` replaces only the boot disk and keeps the data disk.
 
 `/data/bin` is on `PATH`, so programs installed there run by name.
@@ -290,6 +319,7 @@ What Nocturne does not have, so nobody is surprised:
 - **The window manager runs in the kernel.**
 - **Slow, simple disks.** The ATA driver uses PIO with polling (no DMA). FAT32 has no journal, so power loss during a write can leave the volume inconsistent. Names may be up to 255 characters.
 - **The networking limits are listed above.**
+- **A bare Enhanced Session.** It carries the picture, keyboard and mouse only: no clipboard, sound, drive or printer sharing, and no resizing while connected (reconnect to change the size). Hyper-V Manager shows no IP address, because the key-value exchange service is not implemented. The RDP server uses no encryption; it is reachable only through a Hyper-V socket on the host, never over the network.
 - **The AI agent runs the model's commands without asking.** Anything it does stays inside the VM, but it can delete files on `/data`.
 - **A web browser without JavaScript or cookies.** See [its limits](#the-web-browser).
 - **Only checked in virtual machines.** It has been tested in QEMU and Hyper-V, never on real hardware.
@@ -299,12 +329,14 @@ What Nocturne does not have, so nobody is surprised:
 ```
 boot/        limine.conf
 common/      ABI shared by kernel and userland, 2D graphics library, fonts
-kernel/src/  arch/ (GDT, IDT, APIC), mm/, sys/ (processes, scheduler, syscalls), fs/, dev/, gui/, net/
+kernel/src/  arch/ (GDT, IDT, APIC), mm/, sys/ (processes, scheduler, syscalls), fs/, dev/, gui/, net/,
+             hv/ (VMBus and Hyper-V devices), rdp/ (the Enhanced Session's RDP server)
 user/        libc/ (web/ is the browser engine), include/, apps/ (one .c file per program)
 rootfs/      files copied into the initrd (/etc, /home, /usr/share/fonts)
 ports/tcc/   TinyCC configuration and runtime glue for Nocturne
 third_party/ BearSSL, TinyCC, img/ (stb_truetype, stb_image, JebP, NanoSVG)
-scripts/     image builder, initrd packer, sysroot builder, test.py, qtest.py, setkey.py, fatcheck.py
+scripts/     image builder, initrd packer, sysroot builder, test.py, qtest.py, setkey.py, fatcheck.py,
+             hv-*.ps1 (Hyper-V development loop)
 tests/       the in-OS test suite (runtests.c and the C programs it compiles)
 hyperv.ps1   Hyper-V VM setup
 ```

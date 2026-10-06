@@ -359,6 +359,7 @@ static int64_t sys_sysinfo(struct n_sysinfo *si) {
     si->ntasks = n;
     si->fb_w = fb.width;
     si->fb_h = fb.height;
+    if (wm_running()) wm_screen_size(&si->fb_w, &si->fb_h); /* the desktop may be a remote viewer's size */
     strlcpy(si->cpu, cpu_brand, sizeof si->cpu);
     strlcpy(si->os, OS_NAME " " OS_VERSION, sizeof si->os);
     return 0;

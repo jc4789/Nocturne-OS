@@ -1330,7 +1330,7 @@ void net_register(struct netif *n) {
 }
 
 void net_init(void) {
-    if (!e1000_probe() && !tulip_probe()) {
+    if (!netvsc_probe() && !e1000_probe() && !tulip_probe()) {
         kprintf("net: no supported network card\n");
         return;
     }

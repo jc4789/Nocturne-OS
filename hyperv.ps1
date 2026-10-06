@@ -4,26 +4,37 @@
     Creates (or refreshes) a Hyper-V virtual machine that boots Nocturne OS.
 
 .DESCRIPTION
-    Nocturne talks to legacy PC hardware (PS/2 keyboard and mouse, IDE disk, VBE framebuffer),
-    so it needs a *Generation 1* VM. This script:
-      * copies build\nocturne.vhd into .\hyperv\ (so rebuilding never fights a locked disk),
-      * creates a Gen1 VM with static memory, one CPU, no checkpoints and a *legacy* network adapter
-        (an emulated DEC 21140, which Nocturne drives) on the "Default Switch" for NAT internet access,
-      * attaches the disk to IDE 0:0 and makes IDE the first boot device,
-      * attaches a persistent 2 GiB data disk (.\hyperv\<Name>-data.vhdx, FAT32 "NOCTDATA") on IDE 0:1,
+    Generation 2 (the default for a new VM) is the native Hyper-V machine: UEFI, VMBus and only
+    synthetic devices, which Nocturne drives (keyboard, mouse, SCSI disks, network, heartbeat,
+    shutdown, time sync) - plus the Enhanced Session: VMConnect talks RDP to Nocturne over a
+    Hyper-V socket, so the desktop takes the size of the window. For a Gen 2 VM this script:
+      * copies build\nocturne.vhdx to .\hyperv\<Name>-boot.vhdx (so rebuilding never fights a locked disk),
+      * creates the VM with static memory, one CPU, no checkpoints, Secure Boot off (the boot loader
+        is not signed) and a synthetic network adapter on the "Default Switch" for NAT internet access,
+      * attaches the boot disk on SCSI 0:0 and makes it the first boot device,
+      * attaches a persistent 2 GiB data disk (.\hyperv\<Name>-data.vhdx, FAT32 "NOCTDATA") on SCSI 0:1,
         which Nocturne mounts at /data. It is created once and never replaced by -Update or -Remove,
+      * selects the Hyper-V socket transport for the Enhanced Session and turns Enhanced Session Mode
+        on for the host if it is off,
       * optionally writes an AI provider key into /data/etc/agent.conf (-ApiKeyFile, for the agent program),
-      * routes COM1 to the named pipe \\.\pipe\nocturne-com1 (kernel log),
+      * routes COM1 to the named pipe \\.\pipe\<name>-com1 (kernel log),
       * starts the VM and opens a VMConnect window.
 
+    Generation 1 (-Generation 1) emulates a legacy PC: build\nocturne.vhd on IDE 0:0, the data disk
+    on IDE 0:1 and a legacy network adapter (an emulated DEC 21140).
+
+    -Update keeps the generation of the existing VM.
+
 .EXAMPLE
-    .\hyperv.ps1                 # create and start the VM "Nocturne"
+    .\hyperv.ps1                 # create and start the Gen 2 VM "Nocturne"
+.EXAMPLE
+    .\hyperv.ps1 -Name Nocturne-G1 -Generation 1   # a Gen 1 VM instead
 .EXAMPLE
     .\hyperv.ps1 -Update         # after rebuilding: turn the VM off, copy the new disk, start it again
 .EXAMPLE
     .\hyperv.ps1 -Remove         # delete the VM (and its copied disk)
 .EXAMPLE
-    .\hyperv.ps1 -Iso            # boot from build\nocturne.iso on the virtual DVD drive instead of the VHD
+    .\hyperv.ps1 -Iso            # boot from build\nocturne.iso on the virtual DVD drive instead of the disk
 .EXAMPLE
     .\hyperv.ps1 -Update -ApiKeyFile C:\keys\llm.txt   # also store an API key for `agent` on the data disk
 .EXAMPLE
@@ -31,6 +42,7 @@
 #>
 param(
     [string]$Name = "Nocturne",
+    [ValidateSet(1, 2)][int]$Generation = 2,
     [int]$MemoryMB = 512,
     [switch]$Update,
     [switch]$Remove,
@@ -47,12 +59,11 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
 $VmDir = Join-Path $Root "hyperv"
-$SrcVhd = Join-Path $Root "build\nocturne.vhd"
 $SrcIso = Join-Path $Root "build\nocturne.iso"
-$Vhd = Join-Path $VmDir "$Name.vhd"
 $IsoCopy = Join-Path $VmDir "$Name.iso"
 $SrcData = Join-Path $Root "build\data-blank.vhdx"
 $DataVhd = Join-Path $VmDir "$Name-data.vhdx"
+$Pipe = "\\.\pipe\$($Name.ToLower())-com1"
 
 function Say($msg) { Write-Host "[nocturne] $msg" -ForegroundColor Magenta }
 
@@ -68,6 +79,19 @@ function Stop-IfRunning($vm) {
 }
 
 $existing = Get-VM -Name $Name -ErrorAction SilentlyContinue
+if ($existing) { $Generation = $existing.Generation }
+
+# Gen 1 boots the fixed-size VHD on IDE; Gen 2 boots the VHDX on SCSI
+if ($Generation -eq 1) {
+    $SrcDisk = Join-Path $Root "build\nocturne.vhd"
+    $Disk = Join-Path $VmDir "$Name.vhd"
+    $Bus = "IDE"
+}
+else {
+    $SrcDisk = Join-Path $Root "build\nocturne.vhdx"
+    $Disk = Join-Path $VmDir "$Name-boot.vhdx"
+    $Bus = "SCSI"
+}
 
 if ($Remove) {
     if ($existing) {
@@ -75,7 +99,10 @@ if ($Remove) {
         Remove-VM -VM $existing -Force
         Say "removed VM '$Name'"
     }
-    foreach ($f in @($Vhd, $IsoCopy)) { if (Test-Path $f) { Remove-Item $f -Force } }
+    # the configuration folder New-VM made, once Hyper-V has emptied it
+    $cfg = Join-Path $VmDir $Name
+    if ((Test-Path $cfg) -and -not (Get-ChildItem $cfg -Recurse -File)) { Remove-Item $cfg -Recurse -Force }
+    foreach ($f in @($Disk, $IsoCopy)) { if (Test-Path $f) { Remove-Item $f -Force } }
     if ($DeleteData -and (Test-Path $DataVhd)) {
         Remove-Item $DataVhd -Force
         Say "deleted the data disk"
@@ -86,29 +113,40 @@ if ($Remove) {
     return
 }
 
-if (-not (Test-Path $SrcVhd)) {
-    throw "build\nocturne.vhd not found. Build first:  powershell -ExecutionPolicy Bypass -File build.ps1"
+if (-not (Test-Path $SrcDisk)) {
+    throw "$SrcDisk not found. Build first:  powershell -ExecutionPolicy Bypass -File build.ps1"
 }
 New-Item -ItemType Directory -Force $VmDir | Out-Null
 
 function Copy-Media {
-    Say "copying disk image -> $Vhd"
-    Copy-Item $SrcVhd $Vhd -Force
+    Say "copying disk image -> $Disk"
+    Copy-Item $SrcDisk $Disk -Force
     if ($Iso) {
         if (-not (Test-Path $SrcIso)) { throw "build\nocturne.iso not found" }
         Copy-Item $SrcIso $IsoCopy -Force
     }
 }
 
-function Add-LegacyNic($vm) {
+function Test-Switch {
+    if (Get-VMSwitch -Name $Switch -ErrorAction SilentlyContinue) { return $true }
+    Write-Warning "virtual switch '$Switch' not found; the VM gets no network. Pass -Switch <name> to use another one."
+    return $false
+}
+
+function Add-Nic($vm) {
     if ($NoNetwork) { return }
-    if (Get-VMNetworkAdapter -VM $vm | Where-Object { $_.IsLegacy }) { return }
-    if (-not (Get-VMSwitch -Name $Switch -ErrorAction SilentlyContinue)) {
-        Write-Warning "virtual switch '$Switch' not found; the VM gets no network. Pass -Switch <name> to use another one."
-        return
+    if ($Generation -eq 1) {
+        if (Get-VMNetworkAdapter -VM $vm | Where-Object { $_.IsLegacy }) { return }
+        if (-not (Test-Switch)) { return }
+        Say "adding a legacy network adapter on '$Switch'"
+        Add-VMNetworkAdapter -VM $vm -IsLegacy $true -SwitchName $Switch
     }
-    Say "adding a legacy network adapter on '$Switch'"
-    Add-VMNetworkAdapter -VM $vm -IsLegacy $true -SwitchName $Switch
+    else {
+        if (Get-VMNetworkAdapter -VM $vm) { return }
+        if (-not (Test-Switch)) { return }
+        Say "adding a network adapter on '$Switch'"
+        Add-VMNetworkAdapter -VM $vm -SwitchName $Switch
+    }
 }
 
 function Add-DataDisk($vmName) {
@@ -117,10 +155,9 @@ function Add-DataDisk($vmName) {
         Say "creating the persistent data disk -> $DataVhd"
         Copy-Item $SrcData $DataVhd
     }
-    $att = Get-VMHardDiskDrive -VMName $vmName -ControllerType IDE -ControllerNumber 0 -ControllerLocation 1
-    if (-not $att) {
-        Say "attaching the data disk on IDE 0:1"
-        Add-VMHardDiskDrive -VMName $vmName -ControllerType IDE -ControllerNumber 0 -ControllerLocation 1 -Path $DataVhd
+    if (-not (Get-VMHardDiskDrive -VMName $vmName | Where-Object { $_.Path -eq $DataVhd })) {
+        Say "attaching the data disk on $Bus 0:1"
+        Add-VMHardDiskDrive -VMName $vmName -ControllerType $Bus -ControllerNumber 0 -ControllerLocation 1 -Path $DataVhd
     }
 }
 
@@ -150,37 +187,62 @@ function Set-AgentKey {
     }
 }
 
+# Gen 2: the DVD drive (for -Iso) and the boot order
+function Set-Gen2Boot($vm) {
+    $first = Get-VMHardDiskDrive -VM $vm | Where-Object { $_.Path -eq $Disk }
+    if ($Iso) {
+        $dvd = Get-VMDvdDrive -VM $vm | Select-Object -First 1
+        if (-not $dvd) { $dvd = Add-VMDvdDrive -VM $vm -Path $IsoCopy -Passthru }
+        else { Set-VMDvdDrive -VMDvdDrive $dvd -Path $IsoCopy }
+        $first = $dvd
+    }
+    Set-VMFirmware -VM $vm -FirstBootDevice $first
+}
+
 if ($existing -and $Update) {
     Stop-IfRunning $existing
-    Add-LegacyNic $existing
+    Add-Nic $existing
     Copy-Media
     Add-DataDisk $Name
-    if ($Iso) { Set-VMDvdDrive -VMName $Name -ControllerNumber 1 -ControllerLocation 0 -Path $IsoCopy }
+    if ($Iso -and $Generation -eq 1) { Set-VMDvdDrive -VMName $Name -ControllerNumber 1 -ControllerLocation 0 -Path $IsoCopy }
+    if ($Generation -eq 2) { Set-Gen2Boot $existing }
 }
 elseif ($existing) {
     throw "A VM called '$Name' already exists. Use -Update to refresh its disk, or -Remove to delete it."
 }
 else {
     Copy-Media
-    Say "creating Generation 1 VM '$Name' ($MemoryMB MB)"
-    $vm = New-VM -Name $Name -Generation 1 -MemoryStartupBytes ($MemoryMB * 1MB) -VHDPath $Vhd -Path $VmDir
+    Say "creating Generation $Generation VM '$Name' ($MemoryMB MB)"
+    $vm = New-VM -Name $Name -Generation $Generation -MemoryStartupBytes ($MemoryMB * 1MB) -VHDPath $Disk -Path $VmDir
     Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
     Set-VMProcessor -VM $vm -Count 1
-    # Nocturne has no Hyper-V (VMBus) drivers: swap the synthetic NIC for a legacy one, disable checkpoints
     Get-VMNetworkAdapter -VM $vm | Remove-VMNetworkAdapter
-    Add-LegacyNic $vm
+    Add-Nic $vm
     try { Set-VM -VM $vm -AutomaticCheckpointsEnabled $false -CheckpointType Disabled } catch { }
     Set-VM -VM $vm -AutomaticStopAction TurnOff
-    # kernel log on COM1 -> named pipe (read it with PuTTY or any pipe client)
-    Set-VMComPort -VM $vm -Number 1 -Path "\\.\pipe\nocturne-com1"
+    # kernel log on COM1 -> named pipe (read it with scripts\hv-serial.ps1, PuTTY or any pipe client)
+    Set-VMComPort -VM $vm -Number 1 -Path $Pipe
     Add-DataDisk $Name
-    if ($Iso) {
-        Set-VMDvdDrive -VMName $Name -ControllerNumber 1 -ControllerLocation 0 -Path $IsoCopy
-        Set-VMBios -VM $vm -StartupOrder @("CD", "IDE", "LegacyNetworkAdapter", "Floppy")
+    if ($Generation -eq 1) {
+        if ($Iso) {
+            Set-VMDvdDrive -VMName $Name -ControllerNumber 1 -ControllerLocation 0 -Path $IsoCopy
+            Set-VMBios -VM $vm -StartupOrder @("CD", "IDE", "LegacyNetworkAdapter", "Floppy")
+        }
+        else {
+            Set-VMBios -VM $vm -StartupOrder @("IDE", "CD", "LegacyNetworkAdapter", "Floppy")
+        }
     }
     else {
-        Set-VMBios -VM $vm -StartupOrder @("IDE", "CD", "LegacyNetworkAdapter", "Floppy")
+        Set-VMFirmware -VM $vm -EnableSecureBoot Off
+        Set-Gen2Boot $vm
+        # VMConnect's Enhanced Session: RDP to Nocturne over a Hyper-V socket
+        Set-VM -VM $vm -EnhancedSessionTransportType HvSocket
     }
+}
+
+if ($Generation -eq 2 -and -not (Get-VMHost).EnableEnhancedSessionMode) {
+    Say "turning on Enhanced Session Mode for this Hyper-V host"
+    Set-VMHost -EnableEnhancedSessionMode $true
 }
 
 if ($ApiKeyFile) { Set-AgentKey }
@@ -189,5 +251,10 @@ if (-not $NoStart) {
     Say "starting '$Name'"
     Start-VM -Name $Name
     Start-Process vmconnect.exe -ArgumentList "localhost", "`"$Name`""
-    Say "click inside the VM window to capture the mouse; Ctrl+Alt+Left releases it."
+    if ($Generation -eq 2) {
+        Say "VMConnect asks for a display size: that is the Enhanced Session, the desktop takes that size."
+    }
+    else {
+        Say "click inside the VM window to capture the mouse; Ctrl+Alt+Left releases it."
+    }
 }

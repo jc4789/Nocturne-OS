@@ -37,7 +37,12 @@ struct fadt {
     uint8_t reset_value;
     uint8_t reserved3[3];
     uint64_t x_firmware_ctrl, x_dsdt;
+    struct gas x_pm1a_evt, x_pm1b_evt, x_pm1a_cnt, x_pm1b_cnt, x_pm2_cnt, x_pm_tmr, x_gpe0, x_gpe1;
+    struct gas sleep_control, sleep_status; /* ACPI 5: hardware-reduced platforms */
 } PACKED;
+
+#define FADT_RESET_REG_SUP (1u << 10)
+#define FADT_HW_REDUCED    (1u << 20)
 
 static struct fadt *fadt;
 static uint16_t slp_typa, slp_typb;
@@ -77,7 +82,52 @@ static void *find_table(const char *sig) {
     return NULL;
 }
 
+/* Write a Generic Address Structure register (system memory or I/O space). */
+static void gas_write(const struct gas *g, uint64_t v) {
+    if (g->space == 0) {
+        void *p = vmm_map_mmio(g->address & ~0xFFFULL, 4096);
+        p = (uint8_t *)p + (g->address & 0xFFF);
+        switch (g->bit_width) {
+        case 16: *(volatile uint16_t *)p = (uint16_t)v; break;
+        case 32: *(volatile uint32_t *)p = (uint32_t)v; break;
+        case 64: *(volatile uint64_t *)p = v; break;
+        default: *(volatile uint8_t *)p = (uint8_t)v; break;
+        }
+    } else if (g->space == 1) {
+        switch (g->bit_width) {
+        case 16: outw((uint16_t)g->address, (uint16_t)v); break;
+        case 32: outl((uint16_t)g->address, (uint32_t)v); break;
+        default: outb((uint16_t)g->address, (uint8_t)v); break;
+        }
+    }
+}
+
+static bool fadt_has(size_t end) { return fadt && fadt->h.length >= end; }
+
+static void list_tables(void) {
+    if (!rsdp_req.response) return;
+    uint8_t *rsdp = (uint8_t *)rsdp_req.response->address;
+    if ((uint64_t)rsdp < hhdm_offset) rsdp = phys_to_virt((uint64_t)rsdp);
+    uint64_t xsdt = rsdp[15] >= 2 ? *(uint64_t *)(rsdp + 24) : 0;
+    char line[160];
+    size_t n = 0;
+    if (xsdt) {
+        struct sdt_header *x = acpi_ptr(xsdt);
+        int cnt = (x->length - sizeof *x) / 8;
+        uint64_t *e = (uint64_t *)(x + 1);
+        for (int i = 0; i < cnt && n + 6 < sizeof line; i++) {
+            struct sdt_header *t = acpi_ptr(e[i]);
+            memcpy(line + n, t->sig, 4);
+            line[n + 4] = ' ';
+            n += 5;
+        }
+    }
+    line[n] = 0;
+    kprintf("acpi: tables %s\n", line);
+}
+
 void acpi_init(void) {
+    list_tables();
     fadt = find_table("FACP");
     if (!fadt) {
         kprintf("acpi: no FADT found\n");
@@ -101,14 +151,23 @@ void acpi_init(void) {
         s5_ok = true;
         break;
     }
-    kprintf("acpi: FADT ok, PM1a_CNT=%x, S5 %s (SLP_TYP %u/%u)\n", fadt->pm1a_cnt, s5_ok ? "found" : "missing",
-            slp_typa, slp_typb);
+    kprintf("acpi: FADT rev %u flags %x%s, PM1a_CNT=%x, S5 %s (SLP_TYP %u/%u)\n", fadt->h.revision,
+            fadt->flags, (fadt->flags & FADT_HW_REDUCED) ? " (hardware-reduced)" : "", fadt->pm1a_cnt,
+            s5_ok ? "found" : "missing", slp_typa, slp_typb);
+    if (fadt_has(268))
+        kprintf("acpi: sleep control %u:%lx, reset %u:%lx=%x\n", fadt->sleep_control.space,
+                fadt->sleep_control.address, fadt->reset_reg.space, fadt->reset_reg.address, fadt->reset_value);
 }
 
 void power_off(void) {
     cli();
     kprintf("power: shutting down\n");
-    if (fadt && s5_ok) {
+    if (fadt && s5_ok && fadt_has(268) && fadt->sleep_control.address) {
+        /* hardware-reduced ACPI: SLP_TYPx in bits 2-4, SLP_EN is bit 5 */
+        gas_write(&fadt->sleep_control, ((slp_typa & 7) << 2) | (1 << 5));
+        for (int i = 0; i < 1000000; i++) io_wait();
+    }
+    if (fadt && s5_ok && fadt->pm1a_cnt) {
         if (fadt->smi_cmd && fadt->acpi_enable && !(inw(fadt->pm1a_cnt) & 1)) {
             outb(fadt->smi_cmd, fadt->acpi_enable);
             for (int i = 0; i < 100000 && !(inw(fadt->pm1a_cnt) & 1); i++) io_wait();
@@ -126,8 +185,9 @@ void power_off(void) {
 void power_reboot(void) {
     cli();
     kprintf("power: rebooting\n");
-    if (fadt && fadt->h.length >= 129 && (fadt->flags & (1 << 10)) && fadt->reset_reg.space == 1) {
-        outb((uint16_t)fadt->reset_reg.address, fadt->reset_value);
+    if (fadt_has(129) && (fadt->flags & FADT_RESET_REG_SUP) && fadt->reset_reg.address) {
+        gas_write(&fadt->reset_reg, fadt->reset_value);
+        for (int i = 0; i < 100000; i++) io_wait();
     }
     for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) io_wait();
     outb(0x64, 0xFE);
