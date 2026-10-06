@@ -1,0 +1,1144 @@
+/* Painting, hit testing and find in page.
+
+   Paint order (a simplification of CSS 2 appendix E): the canvas background; positioned boxes with
+   a negative z-index; the normal flow in tree order (each block's background and borders, then its
+   floats, then its inline content); then positioned boxes with z-index auto or >= 0 in z order.
+   Hit testing walks the same order and keeps the last thing under the point. */
+#include <stdio.h>
+#include <math.h>
+#include "webi.h"
+
+enum { M_PAINT, M_HIT };
+
+struct pctx {
+    web_doc *d;
+    canvas_t *c;
+    float ox, oy; /* canvas position of document (0, 0) */
+    int mode;
+    float hx, hy; /* hit testing: the point, in document coordinates */
+    struct web_hit *hit;
+    bool hit_any;
+    pvec layers; /* positioned boxes */
+    uint32_t canvas_bg_from; /* 1: html's background was used for the canvas, 2: body's */
+};
+
+static bool positioned(const box_t *b) {
+    return b->st && b->kind != B_INLINE && b->kind != B_TEXT && b->st->position != POS_STATIC &&
+           b->st->position != POS_STICKY;
+}
+
+static float cy(const box_t *b) { return box_abs_y(b) + b->content_dy; }
+
+static image_t *scaled_image(struct web_image *im, int w, int h);
+
+/* ---------------------------------------------------------------- rounded rectangles */
+static float sdf_rrect(float px, float py, float x, float y, float w, float h, float r) {
+    float cx = x + w / 2, cyy = y + h / 2;
+    float qx = fabsf(px - cx) - (w / 2 - r), qy = fabsf(py - cyy) - (h / 2 - r);
+    float mx = qx > 0 ? qx : 0, my = qy > 0 ? qy : 0;
+    float in = qx > qy ? qx : qy;
+    if (in > 0) in = 0;
+    return sqrtf(mx * mx + my * my) + in - r;
+}
+
+static float coverage(float d) {
+    float c = 0.5f - d;
+    return c < 0 ? 0 : c > 1 ? 1 : c;
+}
+
+static uint32_t with_alpha(uint32_t col, float a) {
+    int al = (int)((float)(col >> 24) * a + 0.5f);
+    if (al <= 0) return 0;
+    return ((uint32_t)al << 24) | (col & 0xFFFFFF);
+}
+
+static uint32_t lerp_col(uint32_t a, uint32_t b, float t) {
+    uint32_t r = 0;
+    for (int s = 0; s < 32; s += 8) {
+        float x = (float)((a >> s) & 255), y = (float)((b >> s) & 255);
+        r |= (uint32_t)(x + (y - x) * t + 0.5f) << s;
+    }
+    return r;
+}
+
+/* fill a rectangle with rounded corners (radius r) with a vertical gradient top..bot */
+static void fill_rrect(canvas_t *c, float x, float y, float w, float h, float r, uint32_t top, uint32_t bot) {
+    if (w <= 0 || h <= 0) return;
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    int X0 = (int)floorf(x), Y0 = (int)floorf(y), X1 = (int)ceilf(x + w), Y1 = (int)ceilf(y + h);
+    if (Y0 < c->cy0) Y0 = c->cy0;
+    if (Y1 > c->cy1) Y1 = c->cy1;
+    if (X0 < c->cx0) X0 = c->cx0;
+    if (X1 > c->cx1) X1 = c->cx1;
+    if (X0 >= X1 || Y0 >= Y1) return;
+    bool grad = top != bot;
+    if (r < 0.5f && !grad) {
+        gfx_fill_blend(c, (int)roundf(x), (int)roundf(y), (int)roundf(x + w) - (int)roundf(x),
+                       (int)roundf(y + h) - (int)roundf(y), top);
+        return;
+    }
+    for (int py = Y0; py < Y1; py++) {
+        float fy = (float)py + 0.5f;
+        uint32_t col = grad ? lerp_col(top, bot, (fy - y) / h) : top;
+        bool corner = fy < y + r || fy > y + h - r;
+        if (!corner) {
+            int a = (int)roundf(x), b = (int)roundf(x + w);
+            gfx_fill_blend(c, a, py, b - a, 1, col);
+            continue;
+        }
+        for (int px = X0; px < X1; px++) {
+            float fx = (float)px + 0.5f;
+            if (fx > x + r && fx < x + w - r) {
+                gfx_blend_pixel(c, px, py, col);
+                continue;
+            }
+            float cov = coverage(sdf_rrect(fx, fy, x, y, w, h, r));
+            if (cov > 0) gfx_blend_pixel(c, px, py, with_alpha(col, cov));
+        }
+    }
+}
+
+/* a border ring with rounded corners: everything between the outer and the inner rounded rect */
+static void ring_rrect(canvas_t *c, float x, float y, float w, float h, float r, const float *bw, const uint32_t *col) {
+    float ix = x + bw[3], iy = y + bw[0], iw = w - bw[1] - bw[3], ih = h - bw[0] - bw[2];
+    float maxb = fmaxf(fmaxf(bw[0], bw[1]), fmaxf(bw[2], bw[3]));
+    float ir = r - maxb;
+    if (ir < 0) ir = 0;
+    int X0 = (int)floorf(x), Y0 = (int)floorf(y), X1 = (int)ceilf(x + w), Y1 = (int)ceilf(y + h);
+    if (Y0 < c->cy0) Y0 = c->cy0;
+    if (Y1 > c->cy1) Y1 = c->cy1;
+    if (X0 < c->cx0) X0 = c->cx0;
+    if (X1 > c->cx1) X1 = c->cx1;
+    float k = fmaxf(r, maxb);
+    for (int py = Y0; py < Y1; py++) {
+        float fy = (float)py + 0.5f;
+        bool band = fy < y + k || fy > y + h - k;
+        uint32_t rowcol = fy < y + h / 2 ? col[0] : col[2];
+        for (int px = X0; px < X1; px++) {
+            float fx = (float)px + 0.5f;
+            if (!band && fx > x + k && fx < x + w - k) {
+                int skip = (int)(x + w - k) - 1;
+                if (skip > px) px = skip;
+                continue;
+            }
+            float co = coverage(sdf_rrect(fx, fy, x, y, w, h, r));
+            if (co <= 0) continue;
+            float ci = iw > 0 && ih > 0 ? coverage(sdf_rrect(fx, fy, ix, iy, iw, ih, ir)) : 0;
+            float a = co * (1 - ci);
+            if (a <= 0) continue;
+            uint32_t cc = band ? rowcol : fx < x + w / 2 ? col[3] : col[1];
+            gfx_blend_pixel(c, px, py, with_alpha(cc, a));
+        }
+    }
+}
+
+static uint32_t shade(uint32_t c, float f) {
+    uint32_t r = c & 0xFF000000u;
+    for (int s = 0; s < 24; s += 8) {
+        float v = (float)((c >> s) & 255) * f;
+        if (v > 255) v = 255;
+        r |= (uint32_t)v << s;
+    }
+    return r;
+}
+
+static void edge(canvas_t *c, int style, int side, float x, float y, float w, float h, uint32_t col) {
+    int X = (int)roundf(x), Y = (int)roundf(y);
+    int W = (int)roundf(x + w) - X, H = (int)roundf(y + h) - Y;
+    if (W <= 0 || H <= 0) return;
+    bool horiz = side == 0 || side == 2;
+    int t = horiz ? H : W;
+    switch (style) {
+    case BS_DASHED: case BS_DOTTED: {
+        int len = horiz ? W : H;
+        int dash = style == BS_DOTTED ? t : t * 3, gap = style == BS_DOTTED ? t : t * 2;
+        if (dash < 1) dash = 1;
+        if (gap < 1) gap = 1;
+        for (int p = 0; p < len; p += dash + gap) {
+            int n = p + dash > len ? len - p : dash;
+            if (style == BS_DOTTED && t >= 3) {
+                int rr = t / 2;
+                if (horiz) gfx_fill_circle(c, X + p + rr, Y + rr, rr, col);
+                else gfx_fill_circle(c, X + rr, Y + p + rr, rr, col);
+            } else if (horiz) gfx_fill_blend(c, X + p, Y, n, H, col);
+            else gfx_fill_blend(c, X, Y + p, W, n, col);
+        }
+        return;
+    }
+    case BS_DOUBLE:
+        if (t >= 3) {
+            int a = (t + 1) / 3;
+            if (horiz) {
+                gfx_fill_blend(c, X, Y, W, a, col);
+                gfx_fill_blend(c, X, Y + H - a, W, a, col);
+            } else {
+                gfx_fill_blend(c, X, Y, a, H, col);
+                gfx_fill_blend(c, X + W - a, Y, a, H, col);
+            }
+            return;
+        }
+        break;
+    case BS_GROOVE: case BS_RIDGE: {
+        bool first_dark = (style == BS_GROOVE) == (side == 0 || side == 3);
+        uint32_t a = first_dark ? shade(col, 0.6f) : shade(col, 1.3f), b = first_dark ? shade(col, 1.3f) : shade(col, 0.6f);
+        bool outer_first = side == 0 || side == 3;
+        if (t < 2) {
+            gfx_fill_blend(c, X, Y, W, H, a);
+            return;
+        }
+        uint32_t c1 = outer_first ? a : b, c2 = outer_first ? b : a;
+        if (horiz) {
+            gfx_fill_blend(c, X, Y, W, H / 2, c1);
+            gfx_fill_blend(c, X, Y + H / 2, W, H - H / 2, c2);
+        } else {
+            gfx_fill_blend(c, X, Y, W / 2, H, c1);
+            gfx_fill_blend(c, X + W / 2, Y, W - W / 2, H, c2);
+        }
+        return;
+    }
+    case BS_INSET: col = side == 0 || side == 3 ? shade(col, 0.6f) : shade(col, 1.25f); break;
+    case BS_OUTSET: col = side == 0 || side == 3 ? shade(col, 1.25f) : shade(col, 0.6f); break;
+    }
+    gfx_fill_blend(c, X, Y, W, H, col);
+}
+
+static float used_radius(const style_t *st, float w, float h) {
+    float r = st->border_radius;
+    if (r < 0) r = -r / 100 * fminf(w, h); /* percentages are stored negated */
+    return r;
+}
+
+/* draw img at (x, y) as a mask: col with the image's alpha */
+static void mask_draw(canvas_t *c, const image_t *img, int x, int y, uint32_t col) {
+    int x0 = x > c->cx0 ? x : c->cx0, y0 = y > c->cy0 ? y : c->cy0;
+    int x1 = x + img->w < c->cx1 ? x + img->w : c->cx1, y1 = y + img->h < c->cy1 ? y + img->h : c->cy1;
+    uint32_t ca = col >> 24, rgb = col & 0xFFFFFFu;
+    for (int py = y0; py < y1; py++)
+        for (int px = x0; px < x1; px++) {
+            uint32_t a = (img->px[(size_t)(py - y) * img->w + (px - x)] >> 24) * ca / 255;
+            if (a) gfx_blend_pixel(c, px, py, a << 24 | rgb);
+        }
+}
+
+/* an image layer (background-image, or mask-image tinted with col) over the padding box, clipped
+   to the border box */
+static void paint_layer(struct pctx *P, int img_idx, uint8_t size_kind, const len_t *size, const len_t *pos,
+                        uint8_t repeat, uint32_t col, float x, float y, float w, float h, const float *bw) {
+    web_doc *d = P->d;
+    int idx = img_idx - 1;
+    if (idx < 0 || idx >= d->images.n) return;
+    struct web_image *im = d->images.v[idx];
+    if (!im->img || im->img->w < 1 || im->img->h < 1) return;
+    float iw = (float)im->img->w, ih = (float)im->img->h;
+    float ax = x + bw[3], ay = y + bw[0], aw = w - bw[1] - bw[3], ah = h - bw[0] - bw[2];
+    if (aw <= 0 || ah <= 0) return;
+    float tw = iw, th = ih;
+    switch (size_kind) {
+    case BSZ_COVER: case BSZ_CONTAIN: {
+        float sx = aw / iw, sy = ah / ih;
+        float s = size_kind == BSZ_COVER ? fmaxf(sx, sy) : fminf(sx, sy);
+        tw = iw * s;
+        th = ih * s;
+        break;
+    }
+    case BSZ_LEN: {
+        bool wa = len_auto(&size[0]), ha = len_auto(&size[1]);
+        if (!wa) tw = len_resolve(&size[0], aw);
+        if (!ha) th = len_resolve(&size[1], ah);
+        if (wa && !ha) tw = th * iw / ih;
+        else if (ha && !wa) th = tw * ih / iw;
+        break;
+    }
+    }
+    int TW = (int)roundf(tw), TH = (int)roundf(th);
+    if (TW < 1 || TH < 1) return;
+    float px = ax + len_resolve(&pos[0], aw - (float)TW), py = ay + len_resolve(&pos[1], ah - (float)TH);
+    image_t *img = scaled_image(im, TW, TH);
+    if (!img) return;
+    canvas_t *c = P->c;
+    int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+    /* rounded edges, so a box at a fractional position shows no sliver of a neighbouring tile */
+    int X0 = (int)roundf(x), Y0 = (int)roundf(y);
+    gfx_clip(c, X0, Y0, (int)roundf(x + w) - X0, (int)roundf(y + h) - Y0);
+    bool rx = repeat == BR_REPEAT || repeat == BR_REPEAT_X;
+    bool ry = repeat == BR_REPEAT || repeat == BR_REPEAT_Y;
+    int x0 = (int)roundf(px), y0 = (int)roundf(py);
+    int x1 = x0 + TW, y1 = y0 + TH;
+    if (rx) {
+        while (x0 > c->cx0) x0 -= TW;
+        x1 = c->cx1;
+    }
+    if (ry) {
+        while (y0 > c->cy0) y0 -= TH;
+        y1 = c->cy1;
+    }
+    /* skip tiles above the clip */
+    if (ry && y0 + TH <= c->cy0) y0 += (c->cy0 - y0) / TH * TH;
+    if (rx && x0 + TW <= c->cx0) x0 += (c->cx0 - x0) / TW * TW;
+    for (int ty = y0; ty < y1 && ty < c->cy1; ty += TH)
+        for (int tx = x0; tx < x1 && tx < c->cx1; tx += TW) {
+            if (col) mask_draw(c, img, tx, ty, col);
+            else image_draw(c, img, tx, ty);
+        }
+    c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
+}
+
+/* background and borders of a border box */
+/* ---------------------------------------------------------------- gradients */
+#define NOPOS (-1e30f)
+struct gstops {
+    int n;
+    bool rep;
+    uint32_t col[GRAD_MAX];
+    float pos[GRAD_MAX]; /* fractions of the gradient's length */
+};
+
+/* interpolate with premultiplied alpha, as CSS does: a fade to transparent keeps its colour */
+static uint32_t premul_lerp(uint32_t a, uint32_t b, float t) {
+    float aa = (float)(a >> 24) / 255, ba = (float)(b >> 24) / 255, oa = aa + (ba - aa) * t;
+    if (oa <= 0) return 0;
+    uint32_t r = (uint32_t)(oa * 255 + 0.5f) << 24;
+    for (int s = 0; s < 24; s += 8) {
+        float x = (float)((a >> s) & 255) * aa, y = (float)((b >> s) & 255) * ba, v = (x + (y - x) * t) / oa;
+        r |= (uint32_t)(v > 255 ? 255 : v + 0.5f) << s;
+    }
+    return r;
+}
+
+static void resolve_stops(const struct gradient *g, uint32_t cur, float len, struct gstops *o) {
+    o->n = g->n;
+    o->rep = g->repeating;
+    for (int i = 0; i < g->n; i++) {
+        o->col[i] = g->col[i] == COLOR_CURRENT ? cur : g->col[i];
+        o->pos[i] = g->pos[i].kind == LK_AUTO ? NOPOS : len > 0 ? len_resolve(&g->pos[i], len) / len : 0;
+    }
+    if (o->pos[0] == NOPOS) o->pos[0] = 0;
+    if (o->pos[o->n - 1] == NOPOS) o->pos[o->n - 1] = 1;
+    float mx = o->pos[0];
+    for (int i = 1; i < o->n; i++) /* stops never go backwards */
+        if (o->pos[i] != NOPOS) {
+            if (o->pos[i] < mx) o->pos[i] = mx;
+            mx = o->pos[i];
+        }
+    for (int i = 1; i < o->n; i++) /* stops without a position share the gap between their neighbours */
+        if (o->pos[i] == NOPOS) {
+            int j = i;
+            while (o->pos[j] == NOPOS) j++;
+            for (int k = i; k < j; k++) o->pos[k] = o->pos[i - 1] + (o->pos[j] - o->pos[i - 1]) * (float)(k - i + 1) / (float)(j - i + 1);
+        }
+}
+
+static uint32_t stops_at(const struct gstops *s, float t) {
+    if (s->rep) {
+        float a = s->pos[0], span = s->pos[s->n - 1] - a;
+        if (span > 1e-4f) {
+            t = a + fmodf(t - a, span);
+            if (t < a) t += span;
+        }
+    }
+    if (t <= s->pos[0]) return s->col[0];
+    for (int i = 1; i < s->n; i++)
+        if (t <= s->pos[i]) {
+            float d = s->pos[i] - s->pos[i - 1];
+            return d <= 1e-6f ? s->col[i] : premul_lerp(s->col[i - 1], s->col[i], (t - s->pos[i - 1]) / d);
+        }
+    return s->col[s->n - 1];
+}
+
+static void fill_gradient(canvas_t *c, float x, float y, float w, float h, float r, const struct gradient *g, uint32_t cur) {
+    if (w <= 0 || h <= 0) return;
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    bool round = r >= 0.5f;
+    int X0 = round ? (int)floorf(x) : (int)roundf(x), Y0 = round ? (int)floorf(y) : (int)roundf(y);
+    int X1 = round ? (int)ceilf(x + w) : (int)roundf(x + w), Y1 = round ? (int)ceilf(y + h) : (int)roundf(y + h);
+    if (Y0 < c->cy0) Y0 = c->cy0;
+    if (Y1 > c->cy1) Y1 = c->cy1;
+    if (X0 < c->cx0) X0 = c->cx0;
+    if (X1 > c->cx1) X1 = c->cx1;
+    if (X0 >= X1 || Y0 >= Y1) return;
+    float cx = x + w / 2, cy = y + h / 2, dx = 0, dy = 0, len, rx = 1, ry = 1;
+    if (!g->radial) {
+        if (g->to_x || g->to_y) { /* to a corner: the 50% line joins the other two corners */
+            dx = (float)g->to_x * h;
+            dy = (float)g->to_y * w;
+        } else {
+            float a = g->angle * (float)M_PI / 180;
+            dx = sinf(a);
+            dy = -cosf(a);
+        }
+        float m = sqrtf(dx * dx + dy * dy);
+        dx /= m;
+        dy /= m;
+        len = fabsf(w * dx) + fabsf(h * dy);
+        if (len < 1e-3f) len = 1e-3f;
+    } else {
+        cx = x + len_resolve(&g->at[0], w);
+        cy = y + len_resolve(&g->at[1], h);
+        float l = fabsf(cx - x), rt = fabsf(x + w - cx), t = fabsf(cy - y), b = fabsf(y + h - cy);
+        float sxn = fminf(l, rt), sxf = fmaxf(l, rt), syn = fminf(t, b), syf = fmaxf(t, b);
+        bool far = g->rsize == RG_FARTHEST_SIDE || g->rsize == RG_FARTHEST_CORNER;
+        float sx = far ? sxf : sxn, sy = far ? syf : syn;
+        if (g->rsize == RG_CLOSEST_SIDE || g->rsize == RG_FARTHEST_SIDE) {
+            rx = sx;
+            ry = sy;
+            if (g->circle) rx = ry = far ? fmaxf(sx, sy) : fminf(sx, sy);
+        } else if (g->circle) rx = ry = sqrtf(sx * sx + sy * sy);
+        else { /* the ellipse through the corner with the sides' aspect ratio */
+            rx = sx * 1.41421356f;
+            ry = sy * 1.41421356f;
+        }
+        if (rx < 1e-3f) rx = 1e-3f;
+        if (ry < 1e-3f) ry = 1e-3f;
+        len = rx;
+    }
+    struct gstops S;
+    resolve_stops(g, cur, len, &S);
+    for (int py = Y0; py < Y1; py++) {
+        float fy = (float)py + 0.5f;
+        bool corner_row = round && (fy < y + r || fy > y + h - r);
+        if (!g->radial && fabsf(dx) < 1e-6f && !corner_row) { /* vertical: one colour per row */
+            uint32_t col = stops_at(&S, ((fy - cy) * dy) / len + 0.5f);
+            gfx_fill_blend(c, X0, py, X1 - X0, 1, col);
+            continue;
+        }
+        for (int px = X0; px < X1; px++) {
+            float fx = (float)px + 0.5f, t;
+            if (!g->radial) t = ((fx - cx) * dx + (fy - cy) * dy) / len + 0.5f;
+            else {
+                float ex = (fx - cx) / rx, ey = (fy - cy) / ry;
+                t = sqrtf(ex * ex + ey * ey);
+            }
+            uint32_t col = stops_at(&S, t);
+            if (corner_row && (fx < x + r || fx > x + w - r)) {
+                float cov = coverage(sdf_rrect(fx, fy, x, y, w, h, r));
+                if (cov <= 0) continue;
+                col = with_alpha(col, cov);
+            }
+            gfx_blend_pixel(c, px, py, col);
+        }
+    }
+}
+
+static void paint_bg_border(struct pctx *P, const style_t *st, float x, float y, float w, float h, const float *bw,
+                            bool skip_bg, bool open_l, bool open_r) {
+    canvas_t *c = P->c;
+    float r = used_radius(st, w, h);
+    if (st->mask_img) { /* an icon: the background colour through the mask, nothing else */
+        uint32_t col = st->has_grad ? st->grad[0] : st->bg_color;
+        if (!skip_bg && (col >> 24))
+            paint_layer(P, st->mask_img, st->mask_size_kind, st->mask_size, st->mask_pos, st->mask_repeat, col, x, y, w,
+                        h, bw);
+        return;
+    }
+    if (!skip_bg) {
+        if (st->bg_color >> 24) fill_rrect(c, x, y, w, h, r, st->bg_color, st->bg_color);
+        if (st->has_grad && st->gradient) fill_gradient(c, x, y, w, h, r, st->gradient, st->color);
+    }
+    if (st->bg_img)
+        paint_layer(P, st->bg_img, st->bg_size_kind, st->bg_size, st->bg_pos, st->bg_repeat, 0, x, y, w, h, bw);
+    const uint32_t *bc = st->border_color;
+    bool any = false;
+    for (int i = 0; i < 4; i++)
+        if (bw[i] > 0 && (bc[i] >> 24) && st->border_style[i] > BS_HIDDEN) any = true;
+    if (!any) return;
+    if (r >= 1) {
+        float bws[4];
+        uint32_t cols[4];
+        for (int i = 0; i < 4; i++) {
+            bws[i] = st->border_style[i] > BS_HIDDEN ? bw[i] : 0;
+            cols[i] = bc[i];
+        }
+        ring_rrect(c, x, y, w, h, r, bws, cols);
+        return;
+    }
+    for (int i = 0; i < 4; i++) {
+        if (bw[i] <= 0 || !(bc[i] >> 24) || st->border_style[i] <= BS_HIDDEN) continue;
+        if ((i == 3 && open_l) || (i == 1 && open_r)) continue;
+        switch (i) {
+        case 0: edge(c, st->border_style[0], 0, x, y, w, bw[0], bc[0]); break;
+        case 2: edge(c, st->border_style[2], 2, x, y + h - bw[2], w, bw[2], bc[2]); break;
+        case 3: edge(c, st->border_style[3], 3, x, y + bw[0], bw[3], h - bw[0] - bw[2], bc[3]); break;
+        case 1: edge(c, st->border_style[1], 1, x + w - bw[1], y + bw[0], bw[1], h - bw[0] - bw[2], bc[1]); break;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- text */
+static void draw_text(struct pctx *P, const style_t *st, float x, float baseline, const char *s, int n, uint32_t color) {
+    wfont f = style_font(st);
+    canvas_t *c = P->c;
+    int bl = (int)roundf(baseline);
+    if (st->letter_spacing == 0 && st->word_spacing == 0) {
+        wf_draw(c, &f, x, bl, s, (size_t)n, color);
+        return;
+    }
+    for (int i = 0; i < n;) {
+        int cl = 1;
+        while (i + cl < n && ((unsigned char)s[i + cl] & 0xC0) == 0x80) cl++;
+        x = wf_draw(c, &f, x, bl, s + i, (size_t)cl, color) + st->letter_spacing;
+        if (s[i] == ' ') x += st->word_spacing;
+        i += cl;
+    }
+}
+
+static void paint_run_text(struct pctx *P, const struct run *r, float bx, float by) {
+    const style_t *st = r->st;
+    if (st->visibility) return;
+    float x = P->ox + bx + r->x, base = P->oy + by + r->y;
+    wfont f = style_font(st);
+    float asc, desc;
+    wf_metrics(&f, &asc, &desc);
+    if (base - asc > P->c->cy1 || base + desc < P->c->cy0) return;
+    if (r->highlight) gfx_fill_blend(P->c, (int)x, (int)(base - asc), (int)ceilf(r->w), (int)ceilf(asc + desc), RGB(255, 213, 0));
+    uint32_t col = st->color;
+    draw_text(P, st, x, base, r->s, r->n, col);
+    if (st->text_decoration) {
+        float th = st->font_size / 14;
+        if (th < 1) th = 1;
+        int t = (int)roundf(th);
+        int w = (int)ceilf(r->w);
+        /* trailing spaces are not decorated at the end of a line, but between words they are */
+        if (st->text_decoration & TD_UNDERLINE) gfx_fill_blend(P->c, (int)x, (int)roundf(base + desc * 0.45f), w, t, col);
+        if (st->text_decoration & TD_OVERLINE) gfx_fill_blend(P->c, (int)x, (int)roundf(base - asc), w, t, col);
+        if (st->text_decoration & TD_LINE_THROUGH)
+            gfx_fill_blend(P->c, (int)x, (int)roundf(base - asc * 0.32f), w, t, col);
+    }
+}
+
+/* ---------------------------------------------------------------- replaced elements and controls */
+static image_t *scaled_image(struct web_image *im, int w, int h) {
+    if (w <= 0 || h <= 0 || !im->img) return NULL;
+    if (im->img->w == w && im->img->h == h) return im->img;
+    if (im->scaled && im->scaled->w == w && im->scaled->h == h) return im->scaled;
+    if ((long)w * h > IMAGE_MAX_PIXELS) return NULL;
+    if (im->scaled) image_free(im->scaled);
+    im->scaled = im->svg ? image_decode_svg(im->svg, im->svg_n, w, h) : image_scale(im->img, w, h);
+    return im->scaled;
+}
+
+static void text_in(struct pctx *P, const style_t *st, float x, float y, float h, const char *s, uint32_t col) {
+    wfont f = style_font(st);
+    float asc, desc;
+    wf_metrics(&f, &asc, &desc);
+    draw_text(P, st, x, y + (h - (asc + desc)) / 2 + asc, s, (int)strlen(s), col);
+}
+
+static void paint_control(struct pctx *P, box_t *b, float x, float y) {
+    /* x, y: content box on the canvas */
+    canvas_t *c = P->c;
+    node_t *n = b->node;
+    const style_t *st = b->st;
+    float w = b->w, h = b->h;
+    wfont f = style_font(st);
+    bool focused = P->d->focus == n;
+    switch (b->atomic) {
+    case AT_INPUT: case AT_TEXTAREA: {
+        const char *v = n->value ? n->value : "";
+        bool placeholder = !*v;
+        if (placeholder) v = node_attr(n, "placeholder");
+        if (!v) v = "";
+        int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+        /* like browsers, clip to the padding box: descenders may hang below a short content box */
+        gfx_clip(c, (int)(x - b->p[3]), (int)(y - b->p[0]), (int)ceilf(w + b->p[1] + b->p[3]) + 1, (int)ceilf(h + b->p[0] + b->p[2]) + 1);
+        const char *t = node_attr(n, "type");
+        bool pw = t && str_ieq(t, "password") && !placeholder;
+        uint32_t col = placeholder ? RGB(117, 117, 117) : st->color;
+        float caret_x = x;
+        if (b->atomic == AT_INPUT) {
+            sbuf s = {0};
+            if (pw)
+                for (const char *p = v; *p; p++) {
+                    if (((unsigned char)*p & 0xC0) != 0x80) sb_puts(&s, "\xe2\x80\xa2");
+                }
+            else sb_puts(&s, v);
+            const char *txt = s.p ? sb_cstr(&s) : "";
+            /* keep the caret in view */
+            float caret_w = 0;
+            if (focused && !placeholder) {
+                int cb = P->d->caret;
+                if (pw) {
+                    int k = 0;
+                    for (int i = 0; i < cb && v[i]; i++)
+                        if (((unsigned char)v[i] & 0xC0) != 0x80) k++;
+                    cb = k * 3;
+                }
+                caret_w = wf_width(&f, txt, (size_t)cb);
+            }
+            float scroll = caret_w > w - 2 ? caret_w - w + 2 : 0;
+            text_in(P, st, x - scroll, y, h, txt, col);
+            caret_x = x - scroll + caret_w;
+            sb_free(&s);
+        } else {
+            wfont ff = f;
+            float asc, desc;
+            wf_metrics(&ff, &asc, &desc);
+            float lh = st->font_size * 1.2f;
+            float ly = y;
+            const char *p = v;
+            int caret = focused ? P->d->caret : -1;
+            float cx_ = x, cy_ = y;
+            while (*p || p == v) {
+                const char *e = strchr(p, '\n');
+                size_t len = e ? (size_t)(e - p) : strlen(p);
+                draw_text(P, st, x, ly + (lh - asc - desc) / 2 + asc, p, (int)len, col);
+                if (caret >= p - v && caret <= (int)(p - v + (long)len)) {
+                    cx_ = x + wf_width(&ff, p, (size_t)(caret - (p - v)));
+                    cy_ = ly;
+                }
+                ly += lh;
+                if (!e) break;
+                p = e + 1;
+            }
+            if (focused) gfx_fill(c, (int)cx_, (int)cy_ + 2, 1, (int)lh - 4, st->color);
+        }
+        if (focused && b->atomic == AT_INPUT) gfx_fill(c, (int)caret_x, (int)y + 1, 1, (int)h - 2, st->color);
+        c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
+        break;
+    }
+    case AT_BUTTON_INPUT: {
+        const char *l = web_button_label(n);
+        float tw = wf_width(&f, l, strlen(l));
+        text_in(P, st, x + (w - tw) / 2, y, h, l, st->color);
+        break;
+    }
+    case AT_CHECKBOX: {
+        int X = (int)roundf(x), Y = (int)roundf(y), S = (int)roundf(w);
+        if (n->checked) {
+            gfx_fill_round(c, X, Y, S, S, 2, RGB(0, 117, 255));
+            int s = S;
+            /* a check mark */
+            for (int k = -1; k <= 0; k++) {
+                gfx_line(c, X + s * 22 / 100, Y + s / 2 + k, X + s * 42 / 100, Y + s * 70 / 100 + k, RGB(255, 255, 255));
+                gfx_line(c, X + s * 42 / 100, Y + s * 70 / 100 + k, X + s * 78 / 100, Y + s * 30 / 100 + k, RGB(255, 255, 255));
+            }
+        } else {
+            gfx_fill_round(c, X, Y, S, S, 2, RGB(118, 118, 118));
+            gfx_fill_round(c, X + 1, Y + 1, S - 2, S - 2, 1, RGB(255, 255, 255));
+        }
+        break;
+    }
+    case AT_RADIO: {
+        int r = (int)(w / 2), cx_ = (int)roundf(x + w / 2), cy_ = (int)roundf(y + h / 2);
+        if (n->checked) {
+            gfx_fill_circle(c, cx_, cy_, r, RGB(0, 117, 255));
+            gfx_fill_circle(c, cx_, cy_, r - 1, RGB(255, 255, 255));
+            gfx_fill_circle(c, cx_, cy_, r - 3, RGB(0, 117, 255));
+        } else {
+            gfx_fill_circle(c, cx_, cy_, r, RGB(118, 118, 118));
+            gfx_fill_circle(c, cx_, cy_, r - 1, RGB(255, 255, 255));
+        }
+        break;
+    }
+    case AT_SELECT: {
+        const char *labels[1];
+        int sel = 0;
+        sbuf s = {0};
+        /* the selected option's label */
+        int idx = 0;
+        node_t *found = NULL;
+        for (node_t *o = n->first; o && !found; o = o->next) {
+            node_t *list = o->type == N_ELEM && o->tag == T_optgroup ? o->first : o;
+            for (node_t *q = list; q; q = q->next) {
+                if (q->type == N_ELEM && q->tag == T_option) {
+                    if (idx == n->selected) found = q;
+                    idx++;
+                }
+                if (list == o) break;
+            }
+        }
+        if (found) {
+            const char *lab = node_attr(found, "label");
+            if (lab) sb_puts(&s, lab);
+            else node_text_content(found, &s);
+        }
+        (void)labels;
+        (void)sel;
+        const char *txt = s.p ? sb_cstr(&s) : "";
+        while (*txt == ' ' || *txt == '\n') txt++;
+        int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+        gfx_clip(c, (int)x, (int)y, (int)w - 12, (int)ceilf(h) + 1);
+        text_in(P, st, x, y, h, txt, st->color);
+        c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
+        int ax = (int)(x + w - 9), ay = (int)(y + h / 2 - 2);
+        gfx_triangle(c, ax, ay, ax + 8, ay, ax + 4, ay + 5, st->color);
+        sb_free(&s);
+        break;
+    }
+    case AT_PLACEHOLDER: {
+        int X = (int)roundf(x), Y = (int)roundf(y), W = (int)roundf(w), H = (int)roundf(h);
+        if (n->tag == T_meter || n->tag == T_progress) {
+            const char *vs = node_attr(n, "value"), *ms = node_attr(n, "max"), *mins = node_attr(n, "min");
+            float v = vs ? (float)atof(vs) : 0, mx = ms ? (float)atof(ms) : 1, mn = mins ? (float)atof(mins) : 0;
+            if (mx <= mn) mx = mn + 1;
+            float t = (v - mn) / (mx - mn);
+            t = t < 0 ? 0 : t > 1 ? 1 : t;
+            gfx_fill_round(c, X, Y + H / 4, W, H / 2, H / 4, RGB(220, 220, 220));
+            if (vs) gfx_fill_round(c, X, Y + H / 4, (int)(W * t), H / 2, H / 4, n->tag == T_meter ? RGB(16, 160, 64) : RGB(0, 117, 255));
+            break;
+        }
+        if (str_ieq(n->name, "input")) { /* range */
+            gfx_fill_round(c, X, Y + H / 2 - 2, W, 4, 2, RGB(180, 180, 180));
+            gfx_fill_circle(c, X + W / 2, Y + H / 2, 7, RGB(0, 117, 255));
+            break;
+        }
+        gfx_fill_blend(c, X, Y, W, H, RGB(232, 232, 236));
+        gfx_rect(c, X, Y, W, H, RGB(190, 190, 196));
+        const char *label = n->tag == T_video ? "video" : n->tag == T_audio ? "audio" : n->tag == T_iframe ? "frame" :
+                            n->tag == T_canvas ? "canvas" : "embedded content";
+        char buf[160];
+        const char *src = node_attr(n, "src");
+        if (n->tag == T_iframe && src) snprintf(buf, sizeof buf, "[frame: %.120s]", src);
+        else snprintf(buf, sizeof buf, "[%s]", label);
+        wfont lf = f;
+        float tw = wf_width(&lf, buf, strlen(buf));
+        int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+        gfx_clip(c, X, Y, W, H);
+        text_in(P, st, x + fmaxf(4, (w - tw) / 2), y, h, buf, RGB(90, 90, 100));
+        c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
+        break;
+    }
+    }
+}
+
+static void paint_replaced(struct pctx *P, box_t *b) {
+    float x = P->ox + box_abs_x(b), y = P->oy + cy(b);
+    int X = (int)roundf(x), Y = (int)roundf(y), W = (int)roundf(b->w), H = (int)roundf(b->h);
+    canvas_t *c = P->c;
+    if (Y > c->cy1 || Y + H < c->cy0) return;
+    if (b->atomic == AT_IMG) {
+        node_t *n = b->node;
+        struct web_image *im = n->image >= 0 && n->image < P->d->images.n ? P->d->images.v[n->image] : NULL;
+        image_t *s = im ? scaled_image(im, W, H) : NULL;
+        if (s) {
+            image_draw(c, s, X, Y);
+            return;
+        }
+        if (im && !im->failed && !im->done) return; /* still loading */
+        const char *alt = node_attr(n, "alt");
+        if (alt && *alt) {
+            int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+            gfx_clip(c, X, Y, W, H);
+            if (W > 16 && H > 16) gfx_rect(c, X, Y, W, H, RGB(192, 192, 192));
+            text_in(P, b->st, x + 2, y, fminf(b->h, b->st->font_size * 1.3f), alt, b->st->color);
+            c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
+        } else if (W > 2 && H > 2) gfx_rect(c, X, Y, W, H, RGB(200, 200, 200));
+        return;
+    }
+    if (b->atomic == AT_SVG && b->svg) {
+        struct svg_cache *sc = b->svg;
+        if (!sc->img || sc->w != W || sc->h != H) {
+            if (sc->img) image_free(sc->img);
+            sc->img = W > 0 && H > 0 && (long)W * H <= IMAGE_MAX_PIXELS ? image_decode_svg(sc->src, sc->n, W, H) : NULL;
+            sc->w = W;
+            sc->h = H;
+        }
+        if (sc->img) image_draw(c, sc->img, X, Y);
+        return;
+    }
+    paint_control(P, b, x, y);
+}
+
+/* ---------------------------------------------------------------- list markers */
+static void paint_marker(struct pctx *P, box_t *b) {
+    const style_t *st = b->st;
+    if (st->visibility || (!b->marker && !b->marker_shape)) return;
+    float x = P->ox + box_abs_x(b), y = P->oy + cy(b);
+    wfont f = style_font(st);
+    float asc, desc;
+    wf_metrics(&f, &asc, &desc);
+    float bl = b->baseline >= 0 ? b->baseline : (style_line_height(st) - asc - desc) / 2 + asc;
+    float base = y + bl;
+    float fs = st->font_size;
+    if (b->marker_shape) {
+        float r = fs * 0.18f;
+        if (r < 2) r = 2;
+        float mx = x - fs * 0.85f, my = base - fs * 0.32f;
+        if (b->marker_shape == 1) {
+            fill_rrect(P->c, mx - r, my - r, 2 * r, 2 * r, r, st->color, st->color);
+        } else if (b->marker_shape == 2) {
+            float bw[4] = {1.2f, 1.2f, 1.2f, 1.2f};
+            uint32_t cols[4] = {st->color, st->color, st->color, st->color};
+            ring_rrect(P->c, mx - r, my - r, 2 * r, 2 * r, r, bw, cols);
+        } else gfx_fill_blend(P->c, (int)roundf(mx - r), (int)roundf(my - r), (int)roundf(2 * r), (int)roundf(2 * r), st->color);
+        return;
+    }
+    const char *m = b->marker;
+    float w = wf_width(&f, m, strlen(m));
+    draw_text(P, st, x - w, base, m, (int)strlen(m), st->color);
+}
+
+/* ---------------------------------------------------------------- hit testing helpers */
+static bool inside(struct pctx *P, float x, float y, float w, float h) {
+    return P->hx >= x && P->hx < x + w && P->hy >= y && P->hy < y + h;
+}
+
+static int control_hit(box_t *b) {
+    switch (b->atomic) {
+    case AT_INPUT: return WEB_HIT_TEXT_INPUT;
+    case AT_TEXTAREA: return WEB_HIT_TEXTAREA;
+    case AT_CHECKBOX: return WEB_HIT_CHECKBOX;
+    case AT_RADIO: return WEB_HIT_RADIO;
+    case AT_SELECT: return WEB_HIT_SELECT;
+    case AT_BUTTON_INPUT: {
+        const char *t = node_attr(b->node, "type");
+        return t && str_ieq(t, "submit") ? WEB_HIT_SUBMIT : WEB_HIT_BUTTON;
+    }
+    case AT_IMG:
+        if (b->node && b->node->tag == T_input) return WEB_HIT_SUBMIT; /* <input type=image> */
+        return WEB_HIT_NONE;
+    case AT_INLINE_BLOCK:
+        if (b->node && b->node->tag == T_button) {
+            const char *t = node_attr(b->node, "type");
+            return !t || str_ieq(t, "submit") ? WEB_HIT_SUBMIT : WEB_HIT_BUTTON;
+        }
+    }
+    return WEB_HIT_NONE;
+}
+
+static void set_hit(struct pctx *P, int kind, node_t *n, node_t *link) {
+    P->hit_any = true;
+    P->hit->kind = kind;
+    P->hit->node = n;
+    P->hit->href = NULL;
+    if (link) {
+        P->hit->href = doc_link_href(P->d, link);
+        if (kind == WEB_HIT_NONE) {
+            P->hit->kind = WEB_HIT_LINK;
+            P->hit->node = link;
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- the tree walk */
+static void paint_box(struct pctx *P, box_t *b, bool layer_root);
+
+static void collect_layers(struct pctx *P, box_t *b) {
+    for (box_t *c = b->first; c; c = c->next) {
+        if (c->st && c->st->display == D_NONE) continue;
+        if (positioned(c)) pv_push(&P->layers, c);
+        collect_layers(P, c);
+    }
+}
+
+/* the atomic inlines and floats inside an inline formatting context, in tree order */
+static void inline_children(struct pctx *P, box_t *b, bool floats) {
+    for (box_t *c = b->first; c; c = c->next) {
+        if (positioned(c)) continue;
+        if (c->kind == B_INLINE) {
+            inline_children(P, c, floats);
+            continue;
+        }
+        if (c->kind == B_TEXT || c->kind == B_BR) continue;
+        if (c->floated == floats) paint_box(P, c, false);
+    }
+}
+
+static void paint_runs(struct pctx *P, box_t *b) {
+    float bx = box_abs_x(b), by = cy(b);
+    /* inline box backgrounds */
+    for (int i = 0; i < b->ndecos && P->mode == M_PAINT; i++) {
+        struct deco *d = &b->decos[i];
+        const style_t *st = d->st;
+        if (st->visibility) continue;
+        float l = d->first ? 0 : 0;
+        (void)l;
+        float bw[4] = {st->border_width[0], st->border_width[1], st->border_width[2], st->border_width[3]};
+        if (!d->first) bw[3] = 0;
+        if (!d->last) bw[1] = 0;
+        float x = P->ox + bx + d->x, y = P->oy + by + d->y;
+        if (y > P->c->cy1 || y + d->h < P->c->cy0) continue;
+        paint_bg_border(P, st, x, y, d->w, d->h, bw, false, !d->first, !d->last);
+    }
+    for (int i = 0; i < b->nruns; i++) {
+        struct run *r = &b->runs[i];
+        if (r->atomic) {
+            if (P->mode == M_HIT) {
+                box_t *a = r->atomic;
+                float ax = box_abs_x(a) - a->p[3] - a->b[3], ay = cy(a) - a->p[0] - a->b[0];
+                if (inside(P, ax, ay, a->w + a->p[1] + a->p[3] + a->b[1] + a->b[3], a->h + a->p[0] + a->p[2] + a->b[0] + a->b[2]))
+                    set_hit(P, control_hit(a), a->node, r->link);
+            }
+            continue;
+        }
+        if (P->mode == M_HIT) {
+            wfont f = style_font(r->st);
+            float asc, desc;
+            wf_metrics(&f, &asc, &desc);
+            if (r->link && inside(P, bx + r->x, by + r->y - asc, r->w, asc + desc)) set_hit(P, WEB_HIT_NONE, NULL, r->link);
+            continue;
+        }
+        paint_run_text(P, r, bx, by);
+    }
+}
+
+static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
+    if (!b->st || b->st->display == D_NONE) return;
+    if (positioned(b) && !layer_root) return; /* painted with the layers */
+    const style_t *st = b->st;
+    if (st->opacity <= 0.001f) return;
+    canvas_t *c = P->c;
+    float x = box_abs_x(b), y = box_abs_y(b);
+    float bx = x - b->p[3] - b->b[3], by = y - b->p[0] - b->b[0];
+    float bw = b->w + b->p[1] + b->p[3] + b->b[1] + b->b[3];
+    float bh = b->h + b->p[0] + b->p[2] + b->b[0] + b->b[2];
+    bool clip = st->overflow != OV_VISIBLE && b->kind != B_INLINE && b->parent;
+    if (clip && (P->oy + by > c->cy1 || P->oy + by + bh < c->cy0)) return;
+    /* group opacity: paint, then blend the result with what was there */
+    uint32_t *saved = NULL;
+    int gx = 0, gy = 0, gw = 0, gh = 0;
+    if (P->mode == M_PAINT && st->opacity < 0.999f && b->kind != B_TEXT) {
+        gx = (int)floorf(P->ox + bx);
+        gy = (int)floorf(P->oy + by);
+        gw = (int)ceilf(bw) + 1;
+        gh = (int)ceilf(bh) + 1;
+        if (gx < c->cx0) gw -= c->cx0 - gx, gx = c->cx0;
+        if (gy < c->cy0) gh -= c->cy0 - gy, gy = c->cy0;
+        if (gx + gw > c->cx1) gw = c->cx1 - gx;
+        if (gy + gh > c->cy1) gh = c->cy1 - gy;
+        if (gw > 0 && gh > 0 && (saved = malloc(sizeof(uint32_t) * (size_t)gw * (size_t)gh)))
+            for (int j = 0; j < gh; j++) memcpy(saved + (size_t)j * gw, c->px + (size_t)(gy + j) * c->pitch + gx, sizeof(uint32_t) * (size_t)gw);
+    }
+    bool visible = !st->visibility;
+    if (b->kind != B_INLINE && b->kind != B_TEXT && b->kind != B_BR && b->kind != B_ROW && b->kind != B_ROW_GROUP) {
+        if (P->mode == M_PAINT && visible) {
+            bool skip_bg = (P->canvas_bg_from == 1 && b->node == P->d->html && b->node) ||
+                           (P->canvas_bg_from == 2 && b->node == P->d->body && b->node);
+            paint_bg_border(P, st, P->ox + bx, P->oy + by, bw, bh, b->b, skip_bg, false, false);
+        } else if (P->mode == M_HIT && b->kind == B_ATOMIC && inside(P, bx, by, bw, bh)) {
+            int k = control_hit(b);
+            if (k != WEB_HIT_NONE) set_hit(P, k, b->node, NULL);
+        }
+    } else if ((b->kind == B_ROW || b->kind == B_ROW_GROUP) && P->mode == M_PAINT && visible && (st->bg_color >> 24)) {
+        float z[4] = {0, 0, 0, 0};
+        paint_bg_border(P, st, P->ox + x, P->oy + y, b->w, b->h, z, false, false, false);
+    }
+    if (b->kind == B_ATOMIC && b->atomic != AT_INLINE_BLOCK) {
+        if (P->mode == M_PAINT && visible) paint_replaced(P, b);
+        goto done;
+    }
+    if (b->marker || b->marker_shape) {
+        if (P->mode == M_PAINT) paint_marker(P, b);
+    }
+    int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+    if (clip) {
+        float px = P->ox + bx + b->b[3], py = P->oy + by + b->b[0];
+        gfx_clip(c, (int)floorf(px), (int)floorf(py), (int)ceilf(bw - b->b[1] - b->b[3]), (int)ceilf(bh - b->b[0] - b->b[2]));
+        if (P->mode == M_HIT && !inside(P, bx + b->b[3], by + b->b[0], bw - b->b[1] - b->b[3], bh - b->b[0] - b->b[2])) {
+            c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
+            goto done;
+        }
+    }
+    if (b->inline_ctx) {
+        inline_children(P, b, true);
+        paint_runs(P, b);
+        inline_children(P, b, false);
+    } else {
+        for (box_t *ch = b->first; ch; ch = ch->next)
+            if (ch->floated == false) paint_box(P, ch, false);
+        for (box_t *ch = b->first; ch; ch = ch->next)
+            if (ch->floated) paint_box(P, ch, false);
+    }
+    c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
+done:
+    if (saved) {
+        int a = (int)(st->opacity * 255 + 0.5f);
+        for (int j = 0; j < gh; j++) {
+            uint32_t *row = c->px + (size_t)(gy + j) * c->pitch + gx, *old = saved + (size_t)j * gw;
+            for (int i = 0; i < gw; i++) row[i] = gfx_mix(old[i], row[i], a);
+        }
+        free(saved);
+    }
+}
+
+static int layer_z(const box_t *b) { return b->st->z_auto ? 0 : b->st->z_index; }
+
+static void walk(struct pctx *P) {
+    web_doc *d = P->d;
+    box_t *root = d->root_box;
+    if (!root) return;
+    P->layers.n = 0;
+    collect_layers(P, root);
+    /* stable sort by z-index */
+    for (int i = 1; i < P->layers.n; i++)
+        for (int j = i; j > 0 && layer_z(P->layers.v[j - 1]) > layer_z(P->layers.v[j]); j--) {
+            void *t = P->layers.v[j];
+            P->layers.v[j] = P->layers.v[j - 1];
+            P->layers.v[j - 1] = t;
+        }
+    int i = 0;
+    for (; i < P->layers.n && layer_z(P->layers.v[i]) < 0; i++) paint_box(P, P->layers.v[i], true);
+    paint_box(P, root, true);
+    for (; i < P->layers.n; i++) {
+        box_t *l = P->layers.v[i];
+        /* a positioned box is clipped by the overflow of the ancestors on its containing block
+           chain: all of them for relative and sticky, those from the nearest positioned one up for
+           absolute, none for fixed */
+        canvas_t *c = P->c;
+        int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+        bool skip = false, reached = l->st->position != POS_ABSOLUTE;
+        for (box_t *a = l->parent; a && a->parent; a = a->parent) {
+            if (a->st && a->st->display == D_NONE) skip = true;
+            if (a->st && a->kind != B_INLINE && a->st->position != POS_STATIC) reached = true;
+            if (a->st && a->st->overflow != OV_VISIBLE && a->kind != B_INLINE && reached &&
+                l->st->position != POS_FIXED) {
+                float ax = box_abs_x(a) - a->p[3], ay = box_abs_y(a) - a->p[0];
+                gfx_clip(c, (int)(P->ox + ax), (int)(P->oy + ay), (int)(a->w + a->p[1] + a->p[3]), (int)(a->h + a->p[0] + a->p[2]));
+            }
+        }
+        if (!skip) paint_box(P, l, true);
+        c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
+    }
+    pv_free(&P->layers);
+}
+
+uint32_t doc_canvas_bg(web_doc *d, int *from);
+uint32_t doc_canvas_bg(web_doc *d, int *from) {
+    *from = 0;
+    if (d->html && d->html->style && (d->html->style->bg_color >> 24 || d->html->style->has_grad)) {
+        *from = 1;
+        return d->html->style->has_grad ? d->html->style->grad[0] : d->html->style->bg_color;
+    }
+    if (d->body && d->body->style && (d->body->style->bg_color >> 24 || d->body->style->has_grad)) {
+        *from = 2;
+        return d->body->style->has_grad ? d->body->style->grad[0] : d->body->style->bg_color;
+    }
+    return RGB(255, 255, 255);
+}
+
+void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y) {
+    int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+    gfx_clip(c, x, y, w, h);
+    struct pctx P = {0};
+    P.d = d;
+    P.c = c;
+    P.ox = (float)(x - doc_x);
+    P.oy = (float)(y - doc_y);
+    P.mode = M_PAINT;
+    int from;
+    uint32_t bg = doc_canvas_bg(d, &from);
+    /* a translucent canvas background is drawn over white */
+    gfx_fill(c, x, y, w, h, RGB(255, 255, 255));
+    gfx_fill_blend(c, x, y, w, h, bg);
+    P.canvas_bg_from = (uint32_t)from;
+    walk(&P);
+    c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
+}
+
+bool web_hit_test(web_doc *d, int x, int y, struct web_hit *hit) {
+    memset(hit, 0, sizeof *hit);
+    struct pctx P = {0};
+    canvas_t dummy = {0};
+    dummy.cx0 = dummy.cy0 = -1000000000;
+    dummy.cx1 = dummy.cy1 = 1000000000;
+    P.d = d;
+    P.c = &dummy;
+    P.mode = M_HIT;
+    P.hx = (float)x;
+    P.hy = (float)y;
+    P.hit = hit;
+    walk(&P);
+    if (!P.hit_any) return false;
+    return hit->kind != WEB_HIT_NONE;
+}
+
+/* ---------------------------------------------------------------- find in page */
+struct fmatch {
+    web_doc *d;
+    const char *q;
+    size_t qn;
+    int from_y;
+    float best_y, first_y;
+    box_t *best_b, *first_b;
+    int best_r, first_r, best_off, first_off;
+};
+
+static bool ieq_at(const char *s, size_t n, const char *q, size_t qn) {
+    if (qn > n) return false;
+    for (size_t i = 0; i < qn; i++)
+        if (lower((unsigned char)s[i]) != lower((unsigned char)q[i])) return false;
+    return true;
+}
+
+static void find_in(struct fmatch *F, box_t *b) {
+    if (!b->st || b->st->display == D_NONE) return;
+    if (b->nruns) {
+        /* the block's text, with the run each byte came from */
+        sbuf t = {0};
+        int *owner = NULL;
+        size_t cap = 0;
+        float prev_y = -1e30f;
+        for (int i = 0; i < b->nruns; i++) {
+            struct run *r = &b->runs[i];
+            if (r->atomic || !r->n) continue;
+            if (t.n && r->y != prev_y && t.p[t.n - 1] != ' ') sb_putc(&t, ' ');
+            sb_put(&t, r->s, (size_t)r->n);
+            prev_y = r->y;
+            if (t.n > cap) {
+                size_t old = cap;
+                cap = t.n * 2;
+                owner = realloc(owner, sizeof(int) * cap);
+                for (size_t k = old; k < cap; k++) owner[k] = -1;
+            }
+            for (size_t k = t.n - (size_t)r->n; k < t.n; k++) owner[k] = i;
+        }
+        for (size_t k = 0; k + F->qn <= t.n; k++) {
+            if (!ieq_at(t.p + k, t.n - k, F->q, F->qn)) continue;
+            size_t j = k;
+            while (j < t.n && owner[j] < 0) j++;
+            if (j >= t.n) break;
+            int ri = owner[j];
+            float y = cy(b) + b->runs[ri].y;
+            if (!F->first_b) F->first_b = b, F->first_r = ri, F->first_y = y, F->first_off = (int)k;
+            if (y >= (float)F->from_y && !F->best_b) F->best_b = b, F->best_r = ri, F->best_y = y, F->best_off = (int)k;
+        }
+        free(owner);
+        sb_free(&t);
+    }
+    for (box_t *c = b->first; c; c = c->next) find_in(F, c);
+}
+
+static void clear_highlight(box_t *b) {
+    for (int i = 0; i < b->nruns; i++) b->runs[i].highlight = false;
+    for (box_t *c = b->first; c; c = c->next) clear_highlight(c);
+}
+
+/* highlight the runs that make up the match starting at byte off of b's text */
+static void highlight(box_t *b, int off, size_t qn) {
+    size_t pos = 0;
+    float prev_y = -1e30f;
+    bool last_space = false;
+    for (int i = 0; i < b->nruns; i++) {
+        struct run *r = &b->runs[i];
+        if (r->atomic || !r->n) continue;
+        if (pos && r->y != prev_y && !last_space) pos++;
+        size_t s = pos, e = pos + (size_t)r->n;
+        if (e > (size_t)off && s < (size_t)off + qn) r->highlight = true;
+        pos = e;
+        prev_y = r->y;
+        last_space = r->s[r->n - 1] == ' ';
+    }
+}
+
+int web_find(web_doc *d, const char *text, int from_y) {
+    if (!d->root_box) return -1;
+    clear_highlight(d->root_box);
+    snprintf(d->find_text, sizeof d->find_text, "%s", text ? text : "");
+    if (!text || !*text) return -1;
+    struct fmatch F = {0};
+    F.d = d;
+    F.q = text;
+    F.qn = strlen(text);
+    F.from_y = from_y;
+    find_in(&F, d->root_box);
+    box_t *b = F.best_b ? F.best_b : F.first_b;
+    if (!b) return -1;
+    int off = F.best_b ? F.best_off : F.first_off;
+    float y = F.best_b ? F.best_y : F.first_y;
+    highlight(b, off, F.qn);
+    wfont f = style_font(b->runs[F.best_b ? F.best_r : F.first_r].st);
+    float asc, desc;
+    wf_metrics(&f, &asc, &desc);
+    return (int)(y - asc);
+}

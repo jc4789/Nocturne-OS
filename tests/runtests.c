@@ -74,6 +74,10 @@ static const struct test tests[] = {
     /* desktop */
     {"gui", "window-and-screenshot", "tcc -o /home/guitest /data/tests/guitest.c && /home/guitest", 0, {"guitest: ok"}, NULL, 60},
 
+    /* the web engine, offline: layout, painting, forms, charsets, URLs, hostile input */
+    {"web", "engine", "tcc -o /home/webtest /data/tests/webtest.c && /home/webtest", 0, {"webtest: ", ", 0 failed"}, "FAIL",
+     120, false, true},
+
     /* TCP against the host's test server (no internet needed), clean and with simulated loss */
     {"tcp", "bulk-and-loss", "tcc -o /home/tcptest /data/tests/tcptest.c && /home/tcptest", 0, {"tcptest: 0 failed"},
      "FAIL", 300, false, true},

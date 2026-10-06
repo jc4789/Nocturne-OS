@@ -3,17 +3,21 @@
 *A small operating system for quiet nights.*
 
 Nocturne is a hobby x86-64 operating system written from scratch: the kernel, a compositing window
-manager, a TCP/IP stack, a C library, a shell, a terminal emulator and about 50 programs. It was
+manager, a TCP/IP stack, a C library, a web browser engine, a shell, a terminal emulator and about 50 programs. It was
 written with an AI coding assistant (Claude Code) over several long sessions, and is meant for
 virtual machines (QEMU and Hyper-V); it has not been tried on real hardware. It is a toy, not a
-general-purpose OS: see [Limits](#limits). Three borrowed pieces of code are included:
+general-purpose OS: see [Limits](#limits). A few borrowed pieces of code are included:
 - Limine loads the kernel and the initial ramdisk.
 - BearSSL provides TLS.
 - TinyCC is the C compiler that runs inside the OS.
+- stb_truetype, stb_image, JebP and NanoSVG read fonts and images for the web browser, which draws text in Inter.
 
 Nocturne also has an **AI agent**. `agent` connects to an LLM over HTTPS, and the model can then run
 commands, write C, compile it with `tcc`, start it and look at the screen to check the result.
 Everything it writes is kept on a persistent disk.
+
+Nocturne has its own **web browser**. HTML and CSS (block, inline, float, table, flexbox and grid
+layout) are parsed, laid out and painted by an engine written for Nocturne. It has no JavaScript.
 
 ![Desktop and start menu](docs/desktop-menu.png)
 
@@ -45,6 +49,7 @@ Everything it writes is kept on a persistent disk.
 **Userland** (`user/`)
 - libc: stdio, `printf` with correctly rounded floating point, `malloc`, string, math and time functions, `qsort`, `strtod`, `setjmp`, and more. It is a subset of C99/POSIX, not a complete one.
   - It also includes an HTTP/1.1 client with HTTPS, a JSON parser and builder, and a PNG encoder.
+  - The web engine (`user/libc/web/`, about 11,000 lines): an HTML parser, CSS cascade and layout, and painting with anti-aliased TrueType text, images and gradients. See [The web browser](#the-web-browser).
 - Shell (`sh`):
   - Pipes, redirection (`< > >> 2>`), `&`, `;`, `&&` and `||`, quoting, globbing, `$?` and script arguments (`$1`, `$#`, `$@`). There are no variables, `if` or loops.
   - History, tab completion and scripts.
@@ -53,7 +58,7 @@ Everything it writes is kept on a persistent disk.
 - Network tools: `ifconfig`, `ping`, `host` (DNS lookup) and `fetch` (an HTTP and HTTPS client).
 - Development: the `tcc` C compiler, with headers and a static libc in `/usr`. The source of every program in `/bin` is in `/usr/src/apps`.
 - `agent`: the AI agent (see below). `screenshot` saves the screen as a PNG.
-- Desktop apps: Files, Text Editor, Paint, Calculator, Clock and System Monitor.
+- Desktop apps: Web Browser, Files, Text Editor, Paint, Calculator, Clock and System Monitor.
 - Games and toys: Snake, Tetris, Minesweeper, Mandelbrot, 3D Shapes and Game of Life.
 
 ## Running it in Hyper-V
@@ -122,7 +127,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1 test-full   # adds tcc rebuil
 
 `scripts/test.py` boots the image headless in QEMU with a scratch data disk holding `tests/`. Your own
 `data.img` is not touched. At boot, `init` runs the suite. The suite compiles its own runner with the
-in-OS `tcc` and runs 42 tests, checking each one's exit status and output. Results come back over the
+in-OS `tcc` and runs 43 tests, checking each one's exit status and output. Results come back over the
 serial port, and afterwards the host checks the FAT32 volume the OS wrote to with `fatcheck.py`. The
 tests cover:
 - Shell and tools, and `malloc` stress.
@@ -130,6 +135,7 @@ tests cover:
 - FAT32 and the RAM filesystem: many sizes, long names, 150-file directories, rename and nested directories.
 - `tcc`: printf and math, compiling every app, and self-hosting.
 - The GUI: a window appears in a screen grab and is gone after it closes.
+- The web engine, offline: about 80 checks of element positions (blocks, floats, flexbox, grid, tables, `@media`), painted pixels (borders, alpha, gradients, images), links, form submission, charsets and URL resolution. Deeply nested and malformed pages must not crash it.
 - Network: DHCP, ping, DNS, HTTP, HTTPS, and a rejected bad certificate.
 - TCP: 14 MiB to and from a host-side server, clean and with simulated loss and reordering, checking every byte.
 - The agent, offline: it never needs an API key.
@@ -179,6 +185,39 @@ fetch -o /home/1mb.zip http://speedtest.tele2.net/1MB.zip
 is compiled into libc. The CMOS clock supplies the time for the validity check.
 
 Network limits: TCP is client-side only (no listening sockets), with no window scaling or SACK, so a connection has at most 64 KiB in flight. There is no IP fragmentation and no IPv6.
+
+## The web browser
+
+![The web browser showing Wikipedia](docs/browser.png)
+
+Open **Web Browser** from the desktop or the start menu, or run `browser URL` (or `browser /path/file.html`).
+Files opens `.html` files in it. It starts on a page of links and a search box.
+
+The engine is a library in libc (`web.h`). It parses HTML (with entities, implied tags and legacy
+charsets), runs the CSS cascade (combinators, attribute selectors, `:nth-child()`, `:is()`, `:not()`,
+`:has()`, `@media`, `@supports`, `@layer`, custom properties, `calc()`), and lays out block, inline, float, table, flexbox and grid
+boxes, including positioned elements and `::before`/`::after`. Painting covers backgrounds, linear
+and radial gradients, borders with rounded corners, PNG/JPEG/GIF/WebP/SVG images and CSS masks.
+Text is drawn with the Inter font (`monospace` uses Spleen). Links, forms (text fields, checkboxes,
+radio buttons, selects, GET and POST) and find in page work.
+
+The browser loads the page and its stylesheets first, shows it, then fetches images one at a time
+while you read, laying the page out again as they arrive. Redirects, `<meta http-equiv=refresh>`,
+`file://` (with folder listings) and plain-text and image URLs work.
+
+| Keys | Action |
+|---|---|
+| Ctrl+L | Address bar (words without a dot search DuckDuckGo Lite) |
+| Ctrl+F | Find in page (Enter for the next match) |
+| Alt+Left / Backspace, Alt+Right | Back, forward |
+| F5 or Ctrl+R | Reload |
+| Esc | Stop loading |
+| Space, PgUp/PgDn, arrows, wheel | Scroll |
+
+Browser limits: no JavaScript, so pages that build themselves with scripts show their fallback (or
+nothing). No cookies, so nothing that needs a login. Web fonts are not loaded, so icon fonts show
+as boxes. There is no CJK font. Flexbox and grid cover the common cases, not every corner of the
+specs, and there are no transforms, animations or `position: sticky`.
 
 ## Persistent storage: /data
 
@@ -252,6 +291,7 @@ What Nocturne does not have, so nobody is surprised:
 - **Slow, simple disks.** The ATA driver uses PIO with polling (no DMA). FAT32 has no journal, so power loss during a write can leave the volume inconsistent. Names may be up to 255 characters.
 - **The networking limits are listed above.**
 - **The AI agent runs the model's commands without asking.** Anything it does stays inside the VM, but it can delete files on `/data`.
+- **A web browser without JavaScript or cookies.** See [its limits](#the-web-browser).
 - **Only checked in virtual machines.** It has been tested in QEMU and Hyper-V, never on real hardware.
 
 ## Layout
@@ -260,10 +300,10 @@ What Nocturne does not have, so nobody is surprised:
 boot/        limine.conf
 common/      ABI shared by kernel and userland, 2D graphics library, fonts
 kernel/src/  arch/ (GDT, IDT, APIC), mm/, sys/ (processes, scheduler, syscalls), fs/, dev/, gui/, net/
-user/        libc/, include/, apps/ (one .c file per program)
-rootfs/      files copied into the initrd (/etc, /home)
+user/        libc/ (web/ is the browser engine), include/, apps/ (one .c file per program)
+rootfs/      files copied into the initrd (/etc, /home, /usr/share/fonts)
 ports/tcc/   TinyCC configuration and runtime glue for Nocturne
-third_party/ BearSSL, TinyCC
+third_party/ BearSSL, TinyCC, img/ (stb_truetype, stb_image, JebP, NanoSVG)
 scripts/     image builder, initrd packer, sysroot builder, test.py, qtest.py, setkey.py, fatcheck.py
 tests/       the in-OS test suite (runtests.c and the C programs it compiles)
 hyperv.ps1   Hyper-V VM setup
@@ -275,5 +315,9 @@ hyperv.ps1   Hyper-V VM setup
 - [Spleen](https://github.com/fcambus/spleen) bitmap fonts (BSD-2-Clause, see `common/FONT-LICENSE-spleen.txt`)
 - [BearSSL](https://bearssl.org/) TLS library (MIT)
 - [TinyCC](https://bellard.org/tcc/) C compiler (LGPL-2.1, source in `third_party/tinycc`)
+- [Inter](https://rsms.me/inter/) typeface by Rasmus Andersson (SIL Open Font License 1.1, see `rootfs/usr/share/fonts/Inter-LICENSE.txt`)
+- [stb_truetype and stb_image](https://github.com/nothings/stb) by Sean Barrett (public domain)
+- [JebP](https://github.com/matanui159/jebp) WebP decoder (MIT No Attribution)
+- [NanoSVG](https://github.com/memononen/nanosvg) by Mikko Mononen (zlib license; one local change: the default `preserveAspectRatio`)
 - Mozilla's CA certificate bundle, via [curl](https://curl.se/docs/caextract.html) (MPL-2.0)
 - Everything else was written for Nocturne.

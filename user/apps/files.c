@@ -84,6 +84,7 @@ static const char *type_name(const struct entry *e) {
     if (!strcmp(cwd, "/bin")) return "Program";
     if (dot && !strcasecmp(dot, ".txt")) return "Text";
     if (dot && !strcasecmp(dot, ".ppm")) return "Picture";
+    if (dot && (!strcasecmp(dot, ".html") || !strcasecmp(dot, ".htm"))) return "Web page";
     if (dot && !strcasecmp(dot, ".sh")) return "Script";
     return "File";
 }
@@ -178,6 +179,7 @@ static void open_entry(int i) {
     int r;
     if (!strcmp(t, "Program")) r = gui_launch(path, NULL);
     else if (!strcmp(t, "Picture")) r = gui_launch("/bin/paint", path);
+    else if (!strcmp(t, "Web page")) r = gui_launch("/bin/browser", path);
     else r = gui_launch("/bin/notepad", path);
     snprintf(status, sizeof status, r < 0 ? "could not open %s" : "opened %s", ents[i].name);
 }

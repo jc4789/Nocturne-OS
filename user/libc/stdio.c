@@ -733,15 +733,24 @@ int sscanf(const char *s, const char *fmt, ...) {
         if (*f != 'c') while (isspace((unsigned char)*p)) p++;
         if (!*p) break;
         char *end;
+        /* a field width limits how much a number may consume: parse a copy of that many chars */
+        char field[64];
+        const char *src = p;
+        if (width && strchr("diuxfge", *f)) {
+            int k = 0;
+            while (k < width && k < (int)sizeof field - 1 && p[k]) field[k] = p[k], k++;
+            field[k] = 0;
+            src = field;
+        }
         switch (*f) {
         case 'd':
         case 'i':
         case 'u':
         case 'x': {
             int base = *f == 'x' ? 16 : *f == 'i' ? 0 : 10;
-            long long v = (*f == 'u' || *f == 'x') ? (long long)strtoull(p, &end, base) : strtoll(p, &end, base);
-            if (end == p) goto done;
-            p = end;
+            long long v = (*f == 'u' || *f == 'x') ? (long long)strtoull(src, &end, base) : strtoll(src, &end, base);
+            if (end == src) goto done;
+            p += end - src;
             if (!skip) {
                 if (lng) *va_arg(ap, long *) = (long)v;
                 else *va_arg(ap, int *) = (int)v;
@@ -752,9 +761,9 @@ int sscanf(const char *s, const char *fmt, ...) {
         case 'f':
         case 'g':
         case 'e': {
-            double v = strtod(p, &end);
-            if (end == p) goto done;
-            p = end;
+            double v = strtod(src, &end);
+            if (end == src) goto done;
+            p += end - src;
             if (!skip) {
                 if (lng) *va_arg(ap, double *) = v;
                 else *va_arg(ap, float *) = (float)v;

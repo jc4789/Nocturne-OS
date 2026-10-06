@@ -221,6 +221,8 @@ double copysign(double x, double y) {
 
 double fmin(double a, double b) { return isnan(a) ? b : isnan(b) ? a : a < b ? a : b; }
 double fmax(double a, double b) { return isnan(a) ? b : isnan(b) ? a : a > b ? a : b; }
+float fminf(float a, float b) { return (float)fmin(a, b); }
+float fmaxf(float a, float b) { return (float)fmax(a, b); }
 long lround(double x) { return (long)round(x); }
 double exp2(double x) { return (double)exp2l_(x); }
 double cbrt(double x) { return x < 0 ? -pow(-x, 1.0 / 3) : pow(x, 1.0 / 3); }
@@ -232,5 +234,8 @@ float expf(float x) { return (float)exp(x); }
 float logf(float x) { return (float)log(x); }
 float tanf(float x) { return (float)tan(x); }
 float atan2f(float y, float x) { return (float)atan2(y, x); }
+float acosf(float x) { return (float)acos(x); }
+float asinf(float x) { return (float)asin(x); }
+float atanf(float x) { return (float)atan(x); }
 float fmodf(float x, float y) { return (float)fmod(x, y); }
 long double fabsl(long double x) { return x < 0 ? -x : x; }

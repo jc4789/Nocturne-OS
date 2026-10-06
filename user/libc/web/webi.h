@@ -1,0 +1,441 @@
+/* Internals of the web engine (see web.h). Files:
+     util.c    arenas, string buffers, URLs
+     html.c    HTML tokenizer and tree builder, character references
+     css.c     CSS parser, selectors, the cascade and computed values
+     cssprop.c CSS properties, values, shorthands and the UA stylesheet
+     box.c     box tree generation
+     layout.c  block, inline, float, table and positioned layout
+     paint.c   painting, hit testing, find
+     doc.c     the public API: documents, resources, forms */
+#pragma once
+#include <stddef.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
+#include "gfx.h"
+#include "font.h"
+#include "image.h"
+#include "web.h"
+
+/* ---------------------------------------------------------------- memory */
+typedef struct arena {
+    struct achunk *head;
+} arena_t;
+
+void *ar_alloc(arena_t *a, size_t n); /* zeroed, 8-byte aligned */
+char *ar_strndup(arena_t *a, const char *s, size_t n);
+char *ar_strdup(arena_t *a, const char *s);
+void ar_free(arena_t *a);
+
+typedef struct sbuf {
+    char *p;
+    size_t n, cap;
+} sbuf;
+void sb_put(sbuf *b, const char *s, size_t n);
+void sb_puts(sbuf *b, const char *s);
+void sb_putc(sbuf *b, char c);
+void sb_utf8(sbuf *b, uint32_t cp);
+char *sb_cstr(sbuf *b); /* NUL-terminates; the buffer stays owned by b */
+void sb_free(sbuf *b);
+
+/* growable array of pointers */
+typedef struct pvec {
+    void **v;
+    int n, cap;
+} pvec;
+void pv_push(pvec *p, void *x);
+void pv_free(pvec *p);
+
+static inline bool is_space(int c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f'; }
+static inline int lower(int c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
+bool str_ieq(const char *a, const char *b);
+bool strn_ieq(const char *a, const char *b, size_t n); /* a has length n, b is NUL-terminated */
+int utf8_put(char *out, uint32_t cp);                 /* returns bytes written (1..4) */
+
+/* ---------------------------------------------------------------- DOM */
+#define WEB_TAGS(X)                                                                                     \
+    X(a) X(abbr) X(address) X(applet) X(area) X(article) X(aside) X(audio) X(b) X(base) X(bdi) X(bdo)   \
+    X(big) X(blockquote) X(body) X(br) X(button) X(canvas) X(caption) X(center) X(cite) X(code) X(col)  \
+    X(colgroup) X(data) X(datalist) X(dd) X(del) X(details) X(dfn) X(dialog) X(dir) X(div) X(dl) X(dt)  \
+    X(em) X(embed) X(fieldset) X(figcaption) X(figure) X(font) X(footer) X(form) X(frame) X(frameset)   \
+    X(h1) X(h2) X(h3) X(h4) X(h5) X(h6) X(head) X(header) X(hgroup) X(hr) X(html) X(i) X(iframe)        \
+    X(image) X(img) X(input) X(ins) X(kbd) X(keygen) X(label) X(legend) X(li) X(link) X(listing)        \
+    X(main) X(map) X(mark) X(marquee) X(math) X(menu) X(meta) X(meter) X(nav) X(nobr) X(noembed)        \
+    X(noframes) X(noscript) X(object) X(ol) X(optgroup) X(option) X(output) X(p) X(param) X(picture)    \
+    X(plaintext) X(pre) X(progress) X(q) X(rp) X(rt) X(ruby) X(s) X(samp) X(script) X(search)           \
+    X(section) X(select) X(slot) X(small) X(source) X(span) X(strike) X(strong) X(style) X(sub)         \
+    X(summary) X(sup) X(svg) X(table) X(tbody) X(td) X(template) X(textarea) X(tfoot) X(th) X(thead)    \
+    X(time) X(title) X(tr) X(track) X(tt) X(u) X(ul) X(var) X(video) X(wbr) X(xmp)
+
+enum {
+    T_UNKNOWN,
+#define X(n) T_##n,
+    WEB_TAGS(X)
+#undef X
+    T_COUNT
+};
+int tag_lookup(const char *name, size_t n);
+extern const char *const tag_names[T_COUNT];
+
+enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_OTHER }; /* pseudo-elements */
+
+enum { N_DOC, N_ELEM, N_TEXT, N_COMMENT };
+
+struct attr {
+    const char *name;  /* lowercase */
+    const char *raw;   /* as written (SVG is case sensitive) */
+    const char *value;
+};
+
+struct style;
+struct box;
+
+typedef struct node {
+    uint8_t type;
+    uint16_t tag;
+    bool foreign;     /* inside <svg> or <math> */
+    const char *name; /* lowercase tag name */
+    const char *raw_name;
+    struct attr *attrs;
+    int nattrs;
+    char *text; /* text and comment nodes */
+    size_t textlen;
+    struct node *parent, *first, *last, *next, *prev;
+    const char *id;
+    const char **classes;
+    int nclasses;
+    int elem_index; /* 1-based position among element siblings */
+    /* cascade and layout */
+    struct style *style;
+    struct box *box;          /* the element's first box */
+    struct box *anchor_block; /* inline elements: the block holding its first line */
+    float anchor_dy;
+    /* form controls */
+    char *value; /* current value of input/textarea (malloc'd) */
+    bool checked, selected_set;
+    int selected; /* select: index of the selected option */
+    int image;    /* <img>: index into the document's images, or -1 */
+} node_t;
+
+const char *node_attr(const node_t *n, const char *name); /* NULL if absent */
+bool node_has_class(const node_t *n, const char *cls);
+node_t *node_ancestor(node_t *n, int tag); /* the nearest ancestor (or n) with this tag */
+void node_text_content(const node_t *n, sbuf *out);
+
+/* ---------------------------------------------------------------- CSS values */
+/* a length or percentage, possibly calc(): resolved at layout time against a base */
+enum { LK_AUTO, LK_LEN, LK_NONE, LK_EXPR, LK_NORMAL, LK_NUMBER };
+struct cexpr;
+typedef struct len {
+    uint8_t kind;
+    float px, pct; /* LK_LEN: px + pct% of the base; LK_NUMBER: px is the number */
+    struct cexpr *expr;
+} len_t;
+float len_resolve(const len_t *l, float base); /* LK_AUTO/LK_NONE resolve to 0 */
+static inline bool len_auto(const len_t *l) { return l->kind == LK_AUTO; }
+static inline bool len_none(const len_t *l) { return l->kind == LK_NONE; }
+static inline bool len_has_pct(const len_t *l) { return l->kind == LK_EXPR || (l->kind == LK_LEN && l->pct != 0); }
+
+enum { D_NONE, D_INLINE, D_BLOCK, D_LIST_ITEM, D_INLINE_BLOCK, D_TABLE, D_INLINE_TABLE, D_TABLE_ROW_GROUP,
+       D_TABLE_HEADER_GROUP, D_TABLE_FOOTER_GROUP, D_TABLE_ROW, D_TABLE_CELL, D_TABLE_COLUMN,
+       D_TABLE_COLUMN_GROUP, D_TABLE_CAPTION, D_FLEX, D_INLINE_FLEX, D_GRID, D_INLINE_GRID, D_CONTENTS, D_FLOW_ROOT };
+enum { POS_STATIC, POS_RELATIVE, POS_ABSOLUTE, POS_FIXED, POS_STICKY };
+enum { FL_NONE, FL_LEFT, FL_RIGHT };
+enum { CL_NONE = 0, CL_LEFT = 1, CL_RIGHT = 2, CL_BOTH = 3 };
+enum { WS_NORMAL, WS_PRE, WS_NOWRAP, WS_PRE_WRAP, WS_PRE_LINE, WS_BREAK_SPACES };
+enum { TA_LEFT, TA_RIGHT, TA_CENTER, TA_JUSTIFY, TA_WCENTER /* -webkit-center: also centers blocks */ };
+enum { VA_BASELINE, VA_SUB, VA_SUPER, VA_TOP, VA_MIDDLE, VA_BOTTOM, VA_TEXT_TOP, VA_TEXT_BOTTOM, VA_LEN };
+enum { LS_DISC, LS_CIRCLE, LS_SQUARE, LS_DECIMAL, LS_DECIMAL_LZ, LS_LOWER_ALPHA, LS_UPPER_ALPHA,
+       LS_LOWER_ROMAN, LS_UPPER_ROMAN, LS_LOWER_GREEK, LS_NONE, LS_STRING };
+enum { BS_NONE, BS_HIDDEN, BS_SOLID, BS_DASHED, BS_DOTTED, BS_DOUBLE, BS_GROOVE, BS_RIDGE, BS_INSET, BS_OUTSET };
+enum { TT_NONE, TT_UPPER, TT_LOWER, TT_CAPITALIZE };
+enum { TD_UNDERLINE = 1, TD_OVERLINE = 2, TD_LINE_THROUGH = 4 };
+enum { OV_VISIBLE, OV_HIDDEN, OV_SCROLL, OV_AUTO, OV_CLIP };
+enum { FD_ROW, FD_ROW_REVERSE, FD_COLUMN, FD_COLUMN_REVERSE };
+enum { JC_START, JC_END, JC_CENTER, JC_BETWEEN, JC_AROUND, JC_EVENLY };
+enum { AI_STRETCH, AI_START, AI_END, AI_CENTER, AI_BASELINE };
+enum { BR_REPEAT, BR_REPEAT_X, BR_REPEAT_Y, BR_NO_REPEAT };
+enum { BSZ_AUTO, BSZ_COVER, BSZ_CONTAIN, BSZ_LEN };
+
+/* grid track sizes: GT_LEN (len), GT_FR (max only; max.px is the factor), GT_AUTO, GT_MIN (min-content),
+   GT_MAX (max-content), GT_FIT (max only: fit-content(max)) */
+enum { GT_LEN, GT_FR, GT_AUTO, GT_MIN, GT_MAX, GT_FIT };
+struct gtrack {
+    uint8_t min_kind, max_kind;
+    len_t min, max;
+};
+struct gtemplate {
+    int n;
+    struct gtrack *t;
+    int rep_at, rep_n; /* repeat(auto-fill|auto-fit, ...): tracks [rep_at, rep_at + rep_n), rep_n 0 if none */
+    bool rep_fit;      /* auto-fit: repeated tracks without items collapse */
+};
+struct gareas {
+    int rows, cols;
+    const char **cell; /* rows * cols area names, NULL for '.' */
+};
+/* a grid line: GL_LINE n (negative counts from the end), GL_SPAN n, GL_NAME (an area's edge) */
+enum { GL_AUTO, GL_LINE, GL_SPAN, GL_NAME };
+struct gline {
+    uint8_t kind;
+    int16_t n;
+    const char *name;
+};
+
+#define COLOR_CURRENT 0x00FFFFFEu /* placeholder for currentColor while computing */
+
+struct custom_prop {
+    const char *name, *value;
+    struct custom_prop *next;
+};
+
+/* linear-gradient() and radial-gradient(): colour stops along a line, or out from a centre */
+#define GRAD_MAX 8
+enum { RG_FARTHEST_CORNER, RG_FARTHEST_SIDE, RG_CLOSEST_CORNER, RG_CLOSEST_SIDE };
+struct gradient {
+    bool radial, repeating, circle;
+    int8_t to_x, to_y;   /* linear "to <side or corner>": -1, 0 or 1 each; both 0: use angle */
+    uint8_t rsize;       /* RG_* */
+    float angle;         /* linear: degrees clockwise from "to top" */
+    len_t at[2];         /* radial: the centre, like background-position */
+    int n;
+    uint32_t col[GRAD_MAX]; /* may be COLOR_CURRENT */
+    len_t pos[GRAD_MAX];    /* LK_AUTO: spread between its neighbours */
+};
+
+typedef struct style {
+    uint8_t display, position, float_, clear, white_space, text_align, vertical_align, list_style,
+        list_style_inside, font_style, text_transform, text_decoration, overflow, box_sizing, visibility,
+        border_collapse, flex_direction, flex_wrap, justify_content, align_items, align_self, table_layout;
+    uint8_t border_style[4];
+    uint16_t font_weight;
+    bool monospace;
+    float font_size;
+    len_t line_height;
+    float vertical_align_px;
+    uint32_t color, bg_color;
+    uint32_t border_color[4];
+    float border_width[4];
+    float border_radius;
+    len_t margin[4], padding[4], inset[4]; /* top right bottom left */
+    len_t width, height, min_width, max_width, min_height, max_height;
+    len_t text_indent, flex_basis;
+    float flex_grow, flex_shrink;
+    float gap_row, gap_col;
+    float letter_spacing, word_spacing;
+    float border_spacing;
+    float opacity;
+    int z_index, order;
+    const char *content; /* ::before / ::after text, NULL = none */
+    const char *list_style_string;
+    const char *bg_image; /* url() of background-image (absolute, or relative to the document) */
+    int bg_img;           /* its index in the document's images + 1, or 0 (set after the cascade) */
+    uint8_t bg_repeat;    /* BR_* */
+    uint8_t bg_size_kind; /* BSZ_* */
+    len_t bg_pos[2];      /* x, y: px + pct% of (area - image) */
+    len_t bg_size[2];     /* BSZ_LEN: width, height (LK_AUTO: from the other and the ratio) */
+    const char *mask_image; /* mask-image: the background colour shows through this image's alpha */
+    int mask_img;
+    uint8_t mask_repeat, mask_size_kind;
+    len_t mask_pos[2], mask_size[2];
+    uint32_t grad[2];     /* a gradient's first and last colour stops (for things that want one colour) */
+    bool has_grad;
+    const struct gradient *gradient; /* the gradient itself, when has_grad */
+    const struct gtemplate *grid_cols, *grid_rows, *grid_auto_cols, *grid_auto_rows; /* NULL: none / auto */
+    const struct gareas *grid_areas;
+    struct gline grid_place[4]; /* row-start, column-start, row-end, column-end */
+    uint8_t grid_flow_col, justify_items, justify_self;
+    uint8_t caption_bottom;
+    bool z_auto;
+    struct custom_prop *vars;
+    struct style *before, *after;
+} style_t;
+
+/* ---------------------------------------------------------------- stylesheets */
+typedef struct sheet sheet_t;
+typedef struct css_ctx css_ctx;
+
+/* the document's styling state */
+struct styling {
+    pvec sheets;   /* sheet_t*, in cascade order */
+    css_ctx *ctx;  /* rule index for the current viewport */
+    int index_w, index_h;
+};
+
+/* imports: receives struct css_import* for each @import, to be fetched and added with their order */
+struct css_import {
+    char *url;
+    double order;
+};
+sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports);
+const char *css_ua_sheet(void);
+/* compute every element's style for the viewport */
+void css_cascade(web_doc *d, int vw, int vh);
+void css_styling_free(struct styling *st);
+/* parse a color; false if it is not one */
+bool css_color(const char *s, size_t n, uint32_t *out);
+
+/* properties (cssprop.c), used by the cascade in css.c */
+struct propdef;
+const struct propdef *css_prop_lookup(const char *name, size_t n); /* NULL: not supported */
+int css_prop_count(void);
+int css_prop_index(const struct propdef *p);
+bool css_prop_is_font(const struct propdef *p); /* font-size or the font shorthand */
+/* the values a declaration is resolved against */
+struct cx {
+    style_t *s;
+    const style_t *parent;
+    node_t *node;
+    float em, rem, vw, vh; /* em: the element's font size (its parent's while computing font-size) */
+    arena_t *a;            /* for computed values that need memory */
+    uint8_t *set;          /* per property: already given a value by a more important declaration */
+    bool font_pass;        /* only font-size is being computed */
+};
+/* apply a declaration (var() already substituted) unless its properties are all set; false if invalid */
+bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx);
+/* start a style: inherited properties from the parent, the others initial */
+void css_style_init(style_t *s, const style_t *parent);
+/* computed-value fixups after all declarations: currentColor, blockification, border widths */
+void css_style_finish(style_t *s, const style_t *parent, bool root);
+/* unescape a CSS string or identifier body (backslash escapes) */
+void css_unescape(sbuf *out, const char *s, size_t n);
+
+/* ---------------------------------------------------------------- boxes */
+enum { B_BLOCK, B_INLINE, B_TEXT, B_ATOMIC, B_TABLE, B_ROW_GROUP, B_ROW, B_CELL, B_CAPTION, B_BR, B_FLEX, B_GRID };
+enum { AT_NONE, AT_IMG, AT_INLINE_BLOCK, AT_INPUT, AT_CHECKBOX, AT_RADIO, AT_BUTTON_INPUT, AT_SELECT,
+       AT_TEXTAREA, AT_SVG, AT_PLACEHOLDER };
+
+struct run;  /* a positioned piece of text */
+struct deco; /* a background/border span of an inline box on one line */
+
+typedef struct box {
+    uint8_t kind, atomic;
+    bool anon, inline_ctx, is_bfc, abspos, floated, is_marker;
+    node_t *node; /* NULL for anonymous boxes */
+    style_t *st;
+    struct box *parent, *first, *last, *next;
+    /* text boxes: the white-space-processed text */
+    const char *text;
+    size_t len;
+    /* geometry: content box, relative to the containing block's content box */
+    float x, y, w, h;
+    float m[4], p[4], b[4]; /* used margin, padding, border widths */
+    float content_dy;       /* table cells: vertical-align shift of the content */
+    float rel_dx, rel_dy;   /* position: relative */
+    float baseline;         /* first baseline, relative to the content box top (-1: none) */
+    float last_baseline;    /* last baseline (inline-blocks align by it) */
+    /* absolutely positioned boxes: where they would have been (relative to static_cb) */
+    float static_x, static_y;
+    struct box *static_cb;
+    uint32_t gen;           /* layout pass that listed it */
+    struct box *cb;         /* the block box these coordinates are relative to */
+    /* inline formatting results (block containers with inline content) */
+    struct run *runs;
+    int nruns;
+    struct deco *decos;
+    int ndecos;
+    /* intrinsic widths cache */
+    float min_cw, max_cw;
+    bool intrinsic_done;
+    /* tables */
+    int colspan, rowspan, col, row;
+    /* list items: marker text, or a shape (1 disc, 2 circle, 3 square) */
+    const char *marker;
+    uint8_t marker_shape;
+    /* inline <svg>: its entry in the document's cache */
+    struct svg_cache *svg;
+} box_t;
+
+struct svg_cache {
+    node_t *node;
+    char *src; /* serialized, with currentColor replaced */
+    size_t n;
+    image_t *img;
+    int w, h; /* size it was drawn at */
+};
+struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color);
+bool box_block_level(const box_t *b);
+
+struct run {
+    float x, y, w; /* y is the baseline */
+    const char *s;
+    int n;
+    style_t *st;
+    node_t *link;  /* the <a href> it belongs to */
+    box_t *atomic; /* or an atomic inline box at (x, y = its top) */
+    bool highlight;
+};
+
+struct deco {
+    float x, y, w, h; /* border box */
+    style_t *st;
+    bool first, last; /* the inline box starts / ends on this line */
+};
+
+void boxes_build(web_doc *d, arena_t *a);
+void layout_doc(web_doc *d, int width, int height);
+float box_abs_x(const box_t *b);
+float box_abs_y(const box_t *b);
+
+/* fonts as the engine uses them: Inter, or Spleen bitmaps for monospace */
+typedef struct wfont {
+    font_t *ttf; /* NULL: monospace bitmap */
+    float px;
+    bool bold;
+} wfont;
+wfont style_font(const style_t *st);
+float wf_width(const wfont *f, const char *s, size_t n);
+void wf_metrics(const wfont *f, float *ascent, float *descent);
+float wf_draw(canvas_t *c, const wfont *f, float x, int baseline, const char *s, size_t n, uint32_t color);
+float style_line_height(const style_t *st); /* used line-height in px */
+const char *web_button_label(node_t *n);   /* the text on an <input> button */
+uint32_t doc_canvas_bg(web_doc *d, int *from); /* 1: from <html>, 2: from <body>, 0: white */
+
+/* ---------------------------------------------------------------- the document */
+struct web_image {
+    char *url;
+    image_t *img;
+    image_t *scaled; /* cache of the last drawn size */
+    char *svg;       /* SVG source, rasterized again at the size it is drawn at */
+    size_t svg_n;
+    bool done, failed;
+};
+
+struct web_doc {
+    arena_t mem;    /* DOM, stylesheets */
+    arena_t smem;   /* styles and boxes (rebuilt by the cascade) */
+    arena_t lmem;   /* layout results */
+    node_t *root;   /* the document node */
+    node_t *html, *head, *body;
+    char *url;      /* the document's own URL */
+    char base[1024];
+    bool base_seen;
+    bool quirks; /* no (or a legacy) doctype */
+    char *title;
+    char *refresh_url;
+    int refresh_delay;
+    struct styling sty;
+    pvec pending_css; /* char* URLs still to fetch */
+    double next_sheet_order;
+    pvec images;      /* struct web_image* */
+    pvec svgs;        /* struct svg_cache* */
+    box_t *root_box;
+    pvec abs_boxes;   /* absolutely positioned boxes, painted last */
+    int width, height, doc_h, doc_w;
+    int styled_w, styled_h; /* viewport the cascade ran for */
+    bool need_style, need_boxes;
+    node_t *focus;
+    int caret;
+    node_t *find_node;
+    struct run *find_run;
+    char find_text[128];
+};
+
+node_t *html_parse(web_doc *d, const char *html, size_t n, const char *charset);
+const char *doc_link_href(web_doc *d, node_t *a); /* absolute URL of an <a href>, arena-allocated */
+void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *base);
+
+/* URL helpers (util.c) */
+bool url_resolve(const char *base, const char *rel, char *out, size_t n);
+void url_encode_form(sbuf *b, const char *s); /* application/x-www-form-urlencoded */

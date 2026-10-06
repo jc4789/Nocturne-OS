@@ -47,7 +47,10 @@ BR_C     := $(shell find third_party/bearssl/src -name '*.c')
 BR_OBJ   := $(patsubst %.c,$(BUILD)/br/%.o,$(BR_C)) $(BUILD)/br/tls_roots.o
 BRFLAGS  := $(filter-out -W% -MMD -MP,$(UCFLAGS)) -w -Ithird_party/bearssl/inc -Ithird_party/bearssl/src \
             -DBR_USE_URANDOM=1 -DBR_USE_GETENTROPY=0 -DBR_USE_WIN32_RAND=0 -DBR_USE_UNIX_TIME=1 -DBR_USE_WIN32_TIME=0
-UCFLAGS  += -Ithird_party/bearssl/inc
+UCFLAGS  += -Ithird_party/bearssl/inc -Ithird_party/img
+
+# stb_truetype, stb_image, jebp and nanosvg are compiled as they are, without warnings
+$(BUILD)/u/user/libc/third_party_%.o: UCFLAGS += -w
 
 $(BUILD)/br/%.o: %.c
 	@mkdir -p $(dir $@)
