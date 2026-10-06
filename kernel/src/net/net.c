@@ -1036,7 +1036,7 @@ static int64_t sys_tcp_send(int h, const uint8_t *buf, size_t len) {
 static int64_t sys_tcp_recv(int h, uint8_t *buf, size_t len, int timeout_ms) {
     struct tcb *t = user_tcb(h);
     if (!t) return -EBADF;
-    if (!user_ok(buf, len)) return -EFAULT;
+    if (!user_ok_w(buf, len)) return -EFAULT;
     uint64_t until = uptime_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0);
     while (t->rx_len == 0) {
         if (t->rx_fin) return 0;
@@ -1133,7 +1133,7 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
     switch (num) {
     case SYS_NET_INFO: {
         struct n_netinfo *ni = (struct n_netinfo *)a;
-        if (!user_ok(ni, sizeof *ni)) return -EFAULT;
+        if (!user_ok_w(ni, sizeof *ni)) return -EFAULT;
         memset(ni, 0, sizeof *ni);
         if (!nif) return 0;
         ni->present = 1;
@@ -1155,7 +1155,7 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
         char name[128];
         int r = user_str(name, (const char *)a, sizeof name);
         if (r < 0) return r;
-        if (!user_ok((void *)b, 4)) return -EFAULT;
+        if (!user_ok_w((void *)b, 4)) return -EFAULT;
         uint32_t ip = 0;
         int64_t ret = dns_query(name, &ip);
         if (ret == 0) *(uint32_t *)b = ip;
@@ -1180,9 +1180,9 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
     case SYS_UDP_RECV: {
         struct udp_sock *s = user_udp((int)a);
         if (!s) return -EBADF;
-        if (!user_ok((void *)b, c)) return -EFAULT;
+        if (!user_ok_w((void *)b, c)) return -EFAULT;
         struct n_sockaddr *from = (struct n_sockaddr *)e;
-        if (from && !user_ok(from, sizeof *from)) return -EFAULT;
+        if (from && !user_ok_w(from, sizeof *from)) return -EFAULT;
         int err = 0;
         struct udp_dgram *dg = udp_wait((int)a, (int)d, &err);
         if (!dg) return err;

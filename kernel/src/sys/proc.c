@@ -23,6 +23,8 @@ struct elf64_phdr {
 } PACKED;
 
 #define PT_LOAD 1
+#define PF_X    1
+#define PF_W    2
 
 extern void user_trampoline(void);
 
@@ -60,15 +62,21 @@ int proc_spawn(const char *path, int argc, char **argv, struct file *fds[3], con
         if (ph[i].type != PT_LOAD || ph[i].memsz == 0) continue;
         if (ph[i].vaddr >= USER_TOP || ph[i].vaddr + ph[i].memsz > USER_MMAP_BASE || ph[i].offset + ph[i].filesz > size)
             goto fail;
-        if (vmm_user_alloc(t->pml4, ph[i].vaddr, ph[i].memsz, true) < 0) goto fail;
+        int prot = (ph[i].flags & PF_W ? VM_W : 0) | (ph[i].flags & PF_X ? VM_X : 0);
+        if (vmm_user_alloc(t->pml4, ph[i].vaddr, ph[i].memsz, prot) < 0) goto fail;
         if (vmm_copy_to_space(t->pml4, ph[i].vaddr, img + ph[i].offset, ph[i].filesz) < 0) goto fail;
         if (ph[i].vaddr + ph[i].memsz > top) top = ph[i].vaddr + ph[i].memsz;
+    }
+    /* programs built by tcc before crt0's _start section was marked executable */
+    if (vmm_get_pte(t->pml4, eh->entry) & PTE_NX) {
+        kprintf("exec: %s: entry point is not executable (old tcc build?); allowing it\n", path);
+        vmm_user_alloc(t->pml4, eh->entry, 1, VM_X);
     }
     t->brk_base = t->brk = ALIGN_UP(top, PAGE_SIZE);
     t->mmap_next = USER_MMAP_BASE;
 
     /* user stack: pre-fault the top 64 KiB, the rest grows on demand */
-    if (vmm_user_alloc(t->pml4, USER_STACK_TOP - 65536, 65536, true) < 0) goto fail;
+    if (vmm_user_alloc(t->pml4, USER_STACK_TOP - 65536, 65536, VM_W) < 0) goto fail;
     uint64_t sp = USER_STACK_TOP;
     uint64_t uargv[64];
     if (argc > 63) argc = 63;

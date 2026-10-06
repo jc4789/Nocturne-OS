@@ -7,8 +7,9 @@
 #include "limine.h"
 
 uint64_t kernel_pml4;
+uint64_t pte_nx;
 
-extern char __kernel_start[], __kernel_end[];
+extern char __kernel_start[], __kernel_end[], __text_start[], __rodata_start[], __data_start[];
 
 static inline uint64_t *tbl(uint64_t phys) { return (uint64_t *)phys_to_virt(phys & PTE_ADDR); }
 
@@ -19,7 +20,7 @@ static void split_huge(uint64_t *entry, int level) {
     uint64_t newt = pmm_alloc_zeroed();
     if (!newt) panic("vmm: out of memory splitting page");
     uint64_t *t = tbl(newt);
-    uint64_t flags = e & 0xFFF & ~PTE_PS;
+    uint64_t flags = e & (0xFFF | PTE_NX) & ~PTE_PS;
     bool pat = e & PTE_PAT2M;
     for (int i = 0; i < 512; i++) {
         if (level == 2) {
@@ -143,6 +144,19 @@ void vmm_switch(uint64_t pml4) {
 }
 
 void vmm_init(struct limine_memmap_response *mm, struct limine_executable_address_response *ka) {
+    /* no-execute pages, if the CPU has them (EFER.NXE must be on before any PTE uses bit 63) */
+    uint32_t a, b, c, d;
+    cpuid(0x80000000, 0, &a, &b, &c, &d);
+    if (a >= 0x80000001) {
+        cpuid(0x80000001, 0, &a, &b, &c, &d);
+        if (d & (1u << 20)) {
+            wrmsr(0xC0000080, rdmsr(0xC0000080) | (1ULL << 11));
+            pte_nx = PTE_NX;
+        }
+    }
+    /* write-protect also applies to the kernel, so read-only pages really are read-only */
+    write_cr0(read_cr0() | (1ULL << 16));
+
     kernel_pml4 = pmm_alloc_zeroed();
     uint64_t *l4 = tbl(kernel_pml4);
     /* pre-create every upper-half PDPT so all address spaces share kernel mappings */
@@ -155,19 +169,24 @@ void vmm_init(struct limine_memmap_response *mm, struct limine_executable_addres
         uint64_t end = ALIGN_UP(e->base + e->length, PAGE_SIZE);
         if (e->type == LIMINE_MEMMAP_FRAMEBUFFER) {
             /* write-combining: PAT index 5 */
-            map_range(hhdm_offset + base, base, end - base, PTE_W | PTE_PWT | PTE_PAT4K, PTE_W | PTE_PWT | PTE_PAT2M);
+            map_range(hhdm_offset + base, base, end - base, PTE_W | PTE_PWT | PTE_PAT4K | pte_nx,
+                      PTE_W | PTE_PWT | PTE_PAT2M | pte_nx);
         } else if (e->type == LIMINE_MEMMAP_BAD_MEMORY) {
             continue;
         } else {
-            map_range(hhdm_offset + base, base, end - base, PTE_W, PTE_W);
+            map_range(hhdm_offset + base, base, end - base, PTE_W | pte_nx, PTE_W | pte_nx);
         }
     }
 
-    /* the kernel image */
+    /* the kernel image: code read-only + executable, rodata read-only, everything else writable;
+       only code is executable */
     uint64_t kstart = ALIGN_DOWN((uint64_t)__kernel_start, PAGE_SIZE);
     uint64_t kend = ALIGN_UP((uint64_t)__kernel_end, PAGE_SIZE);
     for (uint64_t va = kstart; va < kend; va += PAGE_SIZE) {
-        vmm_map_page(kernel_pml4, va, va - ka->virtual_base + ka->physical_base, PTE_W | PTE_G);
+        uint64_t f = PTE_G | PTE_W | pte_nx;
+        if (va >= (uint64_t)__text_start && va < (uint64_t)__rodata_start) f = PTE_G;
+        else if (va >= (uint64_t)__rodata_start && va < (uint64_t)__data_start) f = PTE_G | pte_nx;
+        vmm_map_page(kernel_pml4, va, va - ka->virtual_base + ka->physical_base, f);
     }
     write_cr3(kernel_pml4);
 }
@@ -176,7 +195,7 @@ void *vmm_map_mmio(uint64_t phys, uint64_t size) {
     uint64_t base = ALIGN_DOWN(phys, PAGE_SIZE);
     uint64_t end = ALIGN_UP(phys + size, PAGE_SIZE);
     for (uint64_t p = base; p < end; p += PAGE_SIZE) {
-        vmm_map_page(kernel_pml4, hhdm_offset + p, p, PTE_W | PTE_PCD | PTE_PWT);
+        vmm_map_page(kernel_pml4, hhdm_offset + p, p, PTE_W | PTE_PCD | PTE_PWT | pte_nx);
     }
     return phys_to_virt(phys);
 }
@@ -213,16 +232,47 @@ void vmm_free_space(uint64_t pml4) {
     pmm_free(pml4);
 }
 
-int vmm_user_alloc(uint64_t pml4, uint64_t va, uint64_t size, bool writable) {
+static uint64_t prot_flags(int prot) {
+    return PTE_U | (prot & VM_W ? PTE_W : 0) | (prot & VM_X ? 0 : pte_nx);
+}
+
+/* Map fresh zeroed pages. Pages that are already mapped keep their contents and gain the
+   requested permissions (two ELF segments can share a page). */
+int vmm_user_alloc(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
     uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + size, PAGE_SIZE);
     for (uint64_t a = start; a < end; a += PAGE_SIZE) {
-        if (vmm_get_pte(pml4, a)) continue;
+        bool huge = false;
+        uint64_t *pte = walk(pml4, a, &huge);
+        if (pte && (*pte & PTE_P)) {
+            if (huge) return -EINVAL;
+            if (prot & VM_W) *pte |= PTE_W;
+            if (prot & VM_X) *pte &= ~PTE_NX;
+            invlpg(a);
+            continue;
+        }
         uint64_t p = pmm_alloc_zeroed();
         if (!p) return -ENOMEM;
-        if (!vmm_map_page(pml4, a, p, PTE_U | (writable ? PTE_W : 0))) {
+        if (!vmm_map_page(pml4, a, p, prot_flags(prot))) {
             pmm_free(p);
             return -ENOMEM;
         }
+    }
+    return 0;
+}
+
+/* mprotect: set exactly these permissions on already-mapped user pages */
+int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
+    uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + size, PAGE_SIZE);
+    for (uint64_t a = start; a < end; a += PAGE_SIZE) {
+        bool huge = false;
+        uint64_t *pte = walk(pml4, a, &huge);
+        if (!pte || !(*pte & PTE_P) || huge || !(*pte & PTE_U)) return -ENOMEM;
+    }
+    for (uint64_t a = start; a < end; a += PAGE_SIZE) {
+        bool huge = false;
+        uint64_t *pte = walk(pml4, a, &huge);
+        *pte = (*pte & ~(PTE_W | PTE_NX)) | (prot_flags(prot) & (PTE_W | PTE_NX));
+        invlpg(a);
     }
     return 0;
 }
@@ -256,7 +306,7 @@ bool vmm_handle_user_fault(uint64_t addr, uint64_t err) {
     if (!t || !t->pml4 || t->pml4 == kernel_pml4) return false;
     if (err & 1) return false; /* protection violation, not a missing page */
     if (addr >= USER_STACK_TOP - USER_STACK_MAX && addr < USER_STACK_TOP) {
-        return vmm_user_alloc(t->pml4, ALIGN_DOWN(addr, PAGE_SIZE), PAGE_SIZE, true) == 0;
+        return vmm_user_alloc(t->pml4, ALIGN_DOWN(addr, PAGE_SIZE), PAGE_SIZE, VM_W) == 0;
     }
     return false;
 }
@@ -275,7 +325,7 @@ void *vmalloc(size_t pages) {
             vfree((void *)va, i);
             return NULL;
         }
-        vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, p, PTE_W);
+        vmm_map_page(kernel_pml4, va + i * PAGE_SIZE, p, PTE_W | pte_nx);
     }
     return (void *)va;
 }

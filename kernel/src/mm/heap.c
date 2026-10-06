@@ -23,7 +23,7 @@ static bool grow(uint64_t bytes) {
     for (uint64_t off = 0; off < bytes; off += PAGE_SIZE) {
         uint64_t p = pmm_alloc();
         if (!p) return false;
-        vmm_map_page(kernel_pml4, heap_end, p, PTE_W);
+        vmm_map_page(kernel_pml4, heap_end, p, PTE_W | pte_nx);
         heap_end += PAGE_SIZE;
     }
     return true;

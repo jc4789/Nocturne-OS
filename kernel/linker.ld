@@ -21,16 +21,19 @@ SECTIONS
     } :limine_requests
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __text_start = .;
     .text : {
         *(.text .text.*)
     } :text
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __rodata_start = .;
     .rodata : {
         *(.rodata .rodata.*)
     } :rodata
 
     . = ALIGN(CONSTANT(MAXPAGESIZE));
+    __data_start = .;
     .data : {
         *(.data .data.*)
     } :data

@@ -1,7 +1,8 @@
 #pragma once
 #include <stddef.h>
-/* Nocturne has no virtual memory API: all user memory is readable, writable and executable, so
-   mprotect succeeds without doing anything and mmap only offers anonymous memory. */
+/* Anonymous mappings only (no files). Memory is always readable, so PROT_NONE means read-only.
+   Pages are never writable and executable unless asked for: code is read-only, data and the
+   stack are non-executable (W^X). mprotect works on any page of the process. */
 #define PROT_NONE 0
 #define PROT_READ 1
 #define PROT_WRITE 2

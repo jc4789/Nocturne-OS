@@ -12,3 +12,4 @@
 #define CONFIG_TCC_CRTPREFIX "/usr/lib"
 #define CONFIG_TCC_ELFINTERP "-"
 #define CONFIG_TCC_SWITCHES "-static"
+#define CONFIG_RUNMEM_RO 1       /* tcc -run: code read+execute, data read+write (W^X) */

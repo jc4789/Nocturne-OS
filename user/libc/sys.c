@@ -335,29 +335,19 @@ void __libc_start(int argc, char **argv) {
     exit(main(argc, argv));
 }
 
-/* ---- sys/mman.h: anonymous memory only, carved out of the heap ---- */
+/* ---- sys/mman.h: anonymous memory only ---- */
 #include <sys/mman.h>
+static int mprot(int prot) { return (prot & PROT_WRITE ? N_PROT_WRITE : 0) | (prot & PROT_EXEC ? N_PROT_EXEC : 0); }
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, long off) {
-    (void)addr, (void)prot, (void)off;
+    (void)addr, (void)off;
     if (!(flags & MAP_ANONYMOUS) || fd != -1 || len == 0) {
         errno = ENOSYS;
         return MAP_FAILED;
     }
-    char *raw = calloc(1, len + 4096 + sizeof(void *));
-    if (!raw) {
-        errno = ENOMEM;
-        return MAP_FAILED;
-    }
-    char *p = (char *)(((uintptr_t)raw + sizeof(void *) + 4095) & ~(uintptr_t)4095);
-    ((void **)p)[-1] = raw;
-    return p;
+    long r = ret(__syscall(SYS_MMAP, (long)len, mprot(prot), 0, 0, 0));
+    return r < 0 ? MAP_FAILED : (void *)r;
 }
-int munmap(void *addr, size_t len) {
-    (void)len;
-    if (addr && addr != MAP_FAILED) free(((void **)addr)[-1]);
-    return 0;
-}
+int munmap(void *addr, size_t len) { return (int)ret(__syscall(SYS_MUNMAP, (long)addr, (long)len, 0, 0, 0)); }
 int mprotect(void *addr, size_t len, int prot) {
-    (void)addr, (void)len, (void)prot;
-    return 0;
+    return (int)ret(__syscall(SYS_MPROTECT, (long)addr, (long)len, mprot(prot), 0, 0));
 }

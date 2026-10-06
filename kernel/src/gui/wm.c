@@ -386,7 +386,7 @@ static uint64_t map_user(struct window *w, struct task *t) {
     uint64_t va = t->mmap_next;
     for (size_t i = 0; i < w->pages; i++) {
         uint64_t pa = vmm_translate(kernel_pml4, (uint64_t)w->buf + i * PAGE_SIZE);
-        if (!vmm_map_page(t->pml4, va + i * PAGE_SIZE, pa, PTE_P | PTE_W | PTE_U | PTE_SHARED)) return 0;
+        if (!vmm_map_page(t->pml4, va + i * PAGE_SIZE, pa, PTE_P | PTE_W | PTE_U | PTE_SHARED | pte_nx)) return 0;
     }
     t->mmap_next = va + (w->pages + 1) * PAGE_SIZE;
     w->uaddr = va;
@@ -1314,7 +1314,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
     }
     case SYS_SCREEN_INFO: {
         struct screen_info *si = (struct screen_info *)a;
-        if (!user_ok(si, sizeof *si)) return -EFAULT;
+        if (!user_ok_w(si, sizeof *si)) return -EFAULT;
         si->width = running ? sw : fb.width;
         si->height = running ? sh - TASKBAR_H : fb.height;
         return running ? 0 : -ENOSYS;
@@ -1344,7 +1344,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
     }
     case SYS_CLIPBOARD_GET: {
         size_t n = MIN(b, clipboard_len);
-        if (!user_ok((void *)a, n)) return -EFAULT;
+        if (!user_ok_w((void *)a, n)) return -EFAULT;
         if (n) memcpy((void *)a, clipboard, n);
         return (int64_t)clipboard_len;
     }
@@ -1383,7 +1383,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
         size_t need = (size_t)sw * (size_t)sh * 4;
         if (b == 0) return (int64_t)sw << 16 | sh; /* just the size */
         if (b < need) return -E2BIG;
-        if (!user_ok(dst, need)) return -EFAULT;
+        if (!user_ok_w(dst, need)) return -EFAULT;
         for (int y = 0; y < sh; y++) memcpy(dst + (size_t)y * (size_t)sw, back.px + (size_t)y * (size_t)back.pitch, (size_t)sw * 4);
         return (int64_t)sw << 16 | sh;
     }

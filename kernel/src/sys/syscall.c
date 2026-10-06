@@ -24,7 +24,10 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
 
 /* ---- user memory access ---- */
 
-bool user_ok(const void *p, size_t n) {
+/* Is [p, p+n) user memory the process may read (or, with write, also write)? Missing stack
+   pages are faulted in. The kernel must not write to a read-only user page itself: CR0.WP is on,
+   so that would be a kernel page fault. */
+static bool user_access(const void *p, size_t n, bool write) {
     uint64_t a = (uint64_t)p;
     if (n == 0) return true;
     if (a >= USER_TOP || a + n > USER_TOP || a + n < a) return false;
@@ -33,15 +36,19 @@ bool user_ok(const void *p, size_t n) {
         uint64_t pte = vmm_get_pte(t->pml4, pg);
         if (!(pte & PTE_P)) {
             if (pg >= USER_STACK_TOP - USER_STACK_MAX && pg < USER_STACK_TOP) {
-                if (vmm_user_alloc(t->pml4, pg, PAGE_SIZE, true) < 0) return false;
+                if (vmm_user_alloc(t->pml4, pg, PAGE_SIZE, VM_W) < 0) return false;
                 continue;
             }
             return false;
         }
         if (!(pte & PTE_U)) return false;
+        if (write && !(pte & PTE_W)) return false;
     }
     return true;
 }
+
+bool user_ok(const void *p, size_t n) { return user_access(p, n, false); }
+bool user_ok_w(void *p, size_t n) { return user_access(p, n, true); }
 
 int user_str(char *dst, const char *src, size_t max) {
     for (size_t i = 0; i < max; i++) {
@@ -80,7 +87,7 @@ static int allocfd(struct file *f) {
 static int64_t sys_read(int fd, void *buf, size_t n) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
-    if (!user_ok(buf, n)) return -EFAULT;
+    if (!user_ok_w(buf, n)) return -EFAULT;
     return vfs_read(f, buf, n);
 }
 
@@ -115,14 +122,14 @@ static int64_t sys_stat(const char *upath, struct kstat *st) {
     char path[PATH_MAX_LEN];
     int r = user_path(upath, path);
     if (r < 0) return r;
-    if (!user_ok(st, sizeof *st)) return -EFAULT;
+    if (!user_ok_w(st, sizeof *st)) return -EFAULT;
     return vfs_stat(path, st);
 }
 
 static int64_t sys_fstat(int fd, struct kstat *st) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
-    if (!user_ok(st, sizeof *st)) return -EFAULT;
+    if (!user_ok_w(st, sizeof *st)) return -EFAULT;
     st->type = f->vn->tty ? VT_CHAR : f->vn->type;
     st->size = f->vn->size;
     st->mtime = f->vn->mtime;
@@ -133,7 +140,7 @@ static int64_t sys_fstat(int fd, struct kstat *st) {
 static int64_t sys_readdir(int fd, uint64_t idx, struct dirent *d) {
     struct file *f = getfd(fd);
     if (!f) return -EBADF;
-    if (!user_ok(d, sizeof *d)) return -EFAULT;
+    if (!user_ok_w(d, sizeof *d)) return -EFAULT;
     return vfs_readdir(f, idx, d);
 }
 
@@ -182,7 +189,7 @@ static int64_t sys_chdir(const char *upath) {
 static int64_t sys_getcwd(char *buf, size_t n) {
     size_t l = strlen(current_task->cwd) + 1;
     if (n < l) return -ERANGE;
-    if (!user_ok(buf, l)) return -EFAULT;
+    if (!user_ok_w(buf, l)) return -EFAULT;
     memcpy(buf, current_task->cwd, l);
     return l;
 }
@@ -222,7 +229,7 @@ out:
 }
 
 static int64_t sys_waitpid(int pid, int *ustatus, int flags) {
-    if (ustatus && !user_ok(ustatus, 4)) return -EFAULT;
+    if (ustatus && !user_ok_w(ustatus, 4)) return -EFAULT;
     int st = 0;
     int r = task_wait(pid, &st, flags & 1);
     if (r > 0 && ustatus) *ustatus = st;
@@ -236,7 +243,7 @@ static int64_t sys_sbrk(int64_t inc) {
     uint64_t nb = t->brk + inc;
     if (nb < t->brk_base || nb >= USER_MMAP_BASE) return -ENOMEM;
     if (inc > 0) {
-        if (vmm_user_alloc(t->pml4, ALIGN_UP(old, PAGE_SIZE), ALIGN_UP(nb, PAGE_SIZE) - ALIGN_UP(old, PAGE_SIZE), true) < 0)
+        if (vmm_user_alloc(t->pml4, ALIGN_UP(old, PAGE_SIZE), ALIGN_UP(nb, PAGE_SIZE) - ALIGN_UP(old, PAGE_SIZE), VM_W) < 0)
             return -ENOMEM;
     } else {
         vmm_user_free(t->pml4, ALIGN_UP(nb, PAGE_SIZE), ALIGN_UP(old, PAGE_SIZE) - ALIGN_UP(nb, PAGE_SIZE));
@@ -246,7 +253,7 @@ static int64_t sys_sbrk(int64_t inc) {
 }
 
 static int64_t sys_pipe(int *ufds) {
-    if (!user_ok(ufds, 8)) return -EFAULT;
+    if (!user_ok_w(ufds, 8)) return -EFAULT;
     struct file *r, *w;
     int e = pipe_create(&r, &w);
     if (e < 0) return e;
@@ -287,7 +294,7 @@ static int64_t sys_dup(int oldfd) {
 
 static int64_t sys_poll(struct n_pollfd *ufds, int n, int timeout) {
     if (n < 0 || n > 64) return -EINVAL;
-    if (!user_ok(ufds, n * sizeof(struct n_pollfd))) return -EFAULT;
+    if (!user_ok_w(ufds, n * sizeof(struct n_pollfd))) return -EFAULT;
     uint64_t deadline = timeout >= 0 ? uptime_ms() + timeout : 0;
     for (;;) {
         uint64_t fl = irq_save();
@@ -323,7 +330,7 @@ static int64_t sys_poll(struct n_pollfd *ufds, int n, int timeout) {
 }
 
 static int64_t sys_proclist(struct n_procinfo *out, int max) {
-    if (max < 0 || !user_ok(out, (size_t)max * sizeof *out)) return -EFAULT;
+    if (max < 0 || !user_ok_w(out, (size_t)max * sizeof *out)) return -EFAULT;
     int n = 0;
     for (struct task *t = task_list; t && n < max; t = t->all_next) {
         struct n_procinfo *p = &out[n++];
@@ -341,7 +348,7 @@ static int64_t sys_proclist(struct n_procinfo *out, int max) {
 }
 
 static int64_t sys_sysinfo(struct n_sysinfo *si) {
-    if (!user_ok(si, sizeof *si)) return -EFAULT;
+    if (!user_ok_w(si, sizeof *si)) return -EFAULT;
     memset(si, 0, sizeof *si);
     si->total_mem = pmm_total_pages() * PAGE_SIZE;
     si->free_mem = pmm_free_pages() * PAGE_SIZE;
@@ -395,8 +402,38 @@ static int64_t sys_killtree(int pid, int include_self) {
     return killed;
 }
 
+/* anonymous memory in its own region above the heap (window buffers live there too) */
+static int64_t sys_mmap(size_t len, int prot) {
+    struct task *t = current_task;
+    if (len == 0 || len > (1ULL << 32)) return -EINVAL;
+    len = ALIGN_UP(len, PAGE_SIZE);
+    uint64_t va = t->mmap_next;
+    int vp = (prot & N_PROT_WRITE ? VM_W : 0) | (prot & N_PROT_EXEC ? VM_X : 0);
+    if (vmm_user_alloc(t->pml4, va, len, vp) < 0) {
+        vmm_user_free(t->pml4, va, len);
+        return -ENOMEM;
+    }
+    t->mmap_next = va + len + PAGE_SIZE; /* leave a guard page */
+    return (int64_t)va;
+}
+
+static int64_t sys_munmap(uint64_t va, size_t len) {
+    struct task *t = current_task;
+    if (va & (PAGE_SIZE - 1) || va < USER_MMAP_BASE || va + len > t->mmap_next || va + len < va) return -EINVAL;
+    for (uint64_t a = va; a < va + len; a += PAGE_SIZE)
+        if (vmm_get_pte(t->pml4, a) & PTE_SHARED) return -EINVAL; /* a window buffer */
+    vmm_user_free(t->pml4, va, len);
+    return 0;
+}
+
+static int64_t sys_mprotect(uint64_t va, size_t len, int prot) {
+    if (va & (PAGE_SIZE - 1) || va >= USER_TOP || va + len > USER_TOP || va + len < va) return -EINVAL;
+    int vp = (prot & N_PROT_WRITE ? VM_W : 0) | (prot & N_PROT_EXEC ? VM_X : 0);
+    return vmm_user_protect(current_task->pml4, va, len, vp);
+}
+
 static int64_t sys_dmesg(char *buf, size_t n) {
-    if (!user_ok(buf, n)) return -EFAULT;
+    if (!user_ok_w(buf, n)) return -EFAULT;
     return klog_read(buf, n);
 }
 
@@ -447,8 +484,11 @@ void syscall_dispatch(struct regs *r) {
         break;
     case SYS_FCNTL: ret = sys_fcntl((int)a, (int)b, (int)c); break;
     case SYS_DMESG: ret = sys_dmesg((char *)a, b); break;
+    case SYS_MMAP: ret = sys_mmap(a, (int)b); break;
+    case SYS_MUNMAP: ret = sys_munmap(a, b); break;
+    case SYS_MPROTECT: ret = sys_mprotect(a, b, (int)c); break;
     case SYS_PCILIST:
-        if (!user_ok((void *)a, b * sizeof(struct n_pciinfo))) ret = -EFAULT;
+        if (!user_ok_w((void *)a, b * sizeof(struct n_pciinfo))) ret = -EFAULT;
         else ret = pci_list((struct n_pciinfo *)a, (int)b);
         break;
     default:
