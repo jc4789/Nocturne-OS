@@ -21,6 +21,7 @@ layout) are parsed, laid out and painted by an engine written for Nocturne.
 QuickJS の実験的な統合がありますが、ブラウザー API は未完成です。
 **現時点で YouTube、DeepMind、通常版 DuckDuckGo、ChatGPT の正常動作は確認できていません。**
 実サイトの QEMU 検証結果と残課題は [検証記録](docs/browser-validation-2026-10-06.md) を参照してください。
+その後の JavaScript・Shift_JIS 修正と実サイト再検証は [追補](docs/browser-js-progress-2026-10-06.md) に記録しています。指定4サイトの全面動作は未達成です。
 
 ![Desktop and start menu](docs/desktop-menu.png)
 

@@ -916,10 +916,99 @@
       "tools": 1,
       "view": "890fac52e99ddb3a96902353b8b87a1ad6d04ff55eb23e6167ff6615d512af3a"
     },
+    "performance_fresh": {
+      "broadcast": true,
+      "depth": 1,
+      "last_pulse": 1791302655.2340138,
+      "owns": [
+        "user/libc/web/js_performance.js",
+        "tests/js_performance_cases.js"
+      ],
+      "parent": "root",
+      "reads": {
+        "SKILL.md": {
+          "sha256": "2ccbcd13cafb5ce3e2669fd21480b917f662dca2cb38a6fa01806407a68e6c16",
+          "time": 1791302655.2369058
+        },
+        "modules/broadcast.md": {
+          "sha256": "5c106a5dd4348ce92706ac05a761cf87fe2e8eed89f8c6b2e4436d5698e6773f",
+          "time": 1791302655.2379394
+        },
+        "modules/capacity.md": {
+          "sha256": "1b98cd009e56895d5a03d9a789fc3a974ecc3939ce5ee0f3c8d388ac7d506065",
+          "time": 1791302655.2374427
+        },
+        "modules/orchestration.md": {
+          "sha256": "e087983c020dc9bb8a33ac989716e07f0b3aa0330fc5ffeb87de1ed37c02867a",
+          "time": 1791302655.2389219
+        },
+        "modules/repository.md": {
+          "sha256": "bcf89e9d8abbc23d0ac6011dd86b3520f4ff603360587c015e79083086858ec5",
+          "time": 1791302655.2384093
+        }
+      },
+      "reports": [
+        {
+          "completion": null,
+          "contract_sha256": "93f414a2517e28831d2268fdf2472dad96fc5ef5fe488541a7422b58ddaf1e6e",
+          "evidence": {
+            "path": "build/nocturne-audit/performance-fresh-round1.md",
+            "sha256": "b9b33bd5fb6e12e8e4956bc0712ce62e2a1bfbbb84c2d861bfcf0c70ebc6401c"
+          },
+          "goal": "Nocturneの設計と既存ABIを変えずブラウザーWeb APIの実装を進め、実YouTube、DeepMind、通常DuckDuckGo、ChatGPTをQEMUで検証する。ダミー機能禁止、Hyper-Vはユーザー担当",
+          "next": "第2再入とmetadata負例の結果を提出",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "user/libc/web/js_performance.js",
+              "sha256": "418c518076ac2e93e1aa5e26c518606838f1c0e245815777eee82b7a299ccda8"
+            },
+            {
+              "path": "tests/js_performance_cases.js",
+              "sha256": "c328247ca8d4157bceadeb89c292336c10c92f08311fdb40bd3344196b6c8a7a"
+            }
+          ],
+          "summary": "第1実装: mark/measure実バッファ、実native時計、metadata構造複製、Observer主回帰160成功。正式gateは未合格、実サイトは親担当",
+          "time": 1791303280.748495
+        },
+        {
+          "completion": null,
+          "contract_sha256": "93f414a2517e28831d2268fdf2472dad96fc5ef5fe488541a7422b58ddaf1e6e",
+          "evidence": {
+            "path": "build/nocturne-audit/performance-fresh-report.md",
+            "sha256": "c71f7bd245b837708d16bb7f9082929d48a7f9317484adcab98bb16b67cee149"
+          },
+          "goal": "Nocturneの設計と既存ABIを変えずブラウザーWeb APIの実装を進め、実YouTube、DeepMind、通常DuckDuckGo、ChatGPTをQEMUで検証する。ダミー機能禁止、Hyper-Vはユーザー担当",
+          "next": "親build10 QEMUで実DDGと統合clone回帰を確認",
+          "review": null,
+          "round": 2,
+          "sources": [
+            {
+              "path": "user/libc/web/js_performance.js",
+              "sha256": "418c518076ac2e93e1aa5e26c518606838f1c0e245815777eee82b7a299ccda8"
+            },
+            {
+              "path": "user/libc/web/js_clone.js",
+              "sha256": "c1b3b541fbe72ab163b12f38ee72a6d8dacbb4c176139ddd43b0301c377d11bf"
+            },
+            {
+              "path": "tests/js_performance_cases.js",
+              "sha256": "c328247ca8d4157bceadeb89c292336c10c92f08311fdb40bd3344196b6c8a7a"
+            }
+          ],
+          "summary": "第2検証: 再入75/callback負系2/既存clone36成功、非Serializable Performance metadata負例をprivate slot拒否で修正。timer128共有限界は未解消",
+          "time": 1791303280.8719351
+        }
+      ],
+      "task": "本物のUser Timing処理と補助試験を実装し、実サイトの検証は親に渡す",
+      "tools": 0,
+      "view": null
+    },
     "root": {
       "broadcast": false,
       "depth": 0,
-      "last_pulse": 1791301215.2167766,
+      "last_pulse": 1791303893.908464,
       "owns": [
         "."
       ],
@@ -927,29 +1016,468 @@
       "reads": {
         "SKILL.md": {
           "sha256": "2ccbcd13cafb5ce3e2669fd21480b917f662dca2cb38a6fa01806407a68e6c16",
-          "time": 1791301215.217349
+          "time": 1791303893.9114447
         },
         "modules/broadcast.md": {
           "sha256": "5c106a5dd4348ce92706ac05a761cf87fe2e8eed89f8c6b2e4436d5698e6773f",
-          "time": 1791301215.2183738
+          "time": 1791303893.9128263
         },
         "modules/capacity.md": {
           "sha256": "1b98cd009e56895d5a03d9a789fc3a974ecc3939ce5ee0f3c8d388ac7d506065",
-          "time": 1791301215.2178853
+          "time": 1791303893.9121106
         },
         "modules/orchestration.md": {
           "sha256": "e087983c020dc9bb8a33ac989716e07f0b3aa0330fc5ffeb87de1ed37c02867a",
-          "time": 1791301215.2193491
+          "time": 1791303893.9141042
         },
         "modules/repository.md": {
           "sha256": "bcf89e9d8abbc23d0ac6011dd86b3520f4ff603360587c015e79083086858ec5",
-          "time": 1791301215.2188778
+          "time": 1791303893.913585
         }
       },
-      "reports": [],
+      "reports": [
+        {
+          "completion": null,
+          "contract_sha256": "93f414a2517e28831d2268fdf2472dad96fc5ef5fe488541a7422b58ddaf1e6e",
+          "evidence": {
+            "path": "build/nocturne-audit/parent-integration-review-13.md",
+            "sha256": "2f0e8f2213fa6a94da301c63d56f1c1e2c3fbe3ce30a7e5269c77b3eafd8a4bb"
+          },
+          "goal": "Nocturneの設計と既存ABIを変えずブラウザーWeb APIの実装を進め、実YouTube、DeepMind、通常DuckDuckGo、ChatGPTをQEMUで検証する。ダミー機能禁止、Hyper-Vはユーザー担当",
+          "next": "DDG moduleのquota/実行予算到達を追跡。未対応APIと再帰保持を分離",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "bac5a9f342df54e4638da0f82f12b6c67db5864ee044b6991adbbed863ad29a8"
+            },
+            {
+              "path": "third_party/quickjs/quickjs.c",
+              "sha256": "f9241cc53cb5bc4e8e85edf1d7206810f879cf59a119e97fb58f8ef625414d46"
+            }
+          ],
+          "summary": "build13統合と実サイトの部分修正。5ch Shift_JIS、DDG入力候補と例外生成UAF修正を確認。4サイト全面動作は未達",
+          "time": 1791305653.851868
+        }
+      ],
       "task": "Nocturne固有の設計と既存変更を保ち、QuickJS統合とHyper-V第2世代ビルドの原因を再現し、最小修正と検証範囲を提示する",
       "tools": 0,
       "view": "890fac52e99ddb3a96902353b8b87a1ad6d04ff55eb23e6167ff6615d512af3a"
+    },
+    "selection_fresh": {
+      "broadcast": false,
+      "depth": 1,
+      "last_pulse": 1791305639.2609024,
+      "owns": [
+        "user/libc/web/js_selection.js",
+        "tests/js_selection_cases.js",
+        "user/libc/web/js.c",
+        "user/libc/web/doc.c",
+        "user/libc/web/dom.c",
+        "user/libc/web/paint.c",
+        "user/libc/web/webi.h"
+      ],
+      "parent": "root",
+      "reads": {
+        "SKILL.md": {
+          "sha256": "2ccbcd13cafb5ce3e2669fd21480b917f662dca2cb38a6fa01806407a68e6c16",
+          "time": 1791305639.263853
+        },
+        "modules/broadcast.md": {
+          "sha256": "5c106a5dd4348ce92706ac05a761cf87fe2e8eed89f8c6b2e4436d5698e6773f",
+          "time": 1791305639.2648041
+        },
+        "modules/capacity.md": {
+          "sha256": "1b98cd009e56895d5a03d9a789fc3a974ecc3939ce5ee0f3c8d388ac7d506065",
+          "time": 1791305639.2643256
+        },
+        "modules/orchestration.md": {
+          "sha256": "e087983c020dc9bb8a33ac989716e07f0b3aa0330fc5ffeb87de1ed37c02867a",
+          "time": 1791305639.265735
+        },
+        "modules/repository.md": {
+          "sha256": "bcf89e9d8abbc23d0ac6011dd86b3520f4ff603360587c015e79083086858ec5",
+          "time": 1791305639.2652795
+        }
+      },
+      "reports": [
+        {
+          "completion": null,
+          "contract_sha256": "93f414a2517e28831d2268fdf2472dad96fc5ef5fe488541a7422b58ddaf1e6e",
+          "evidence": {
+            "path": "build/nocturne-audit/selection-fresh-report.md",
+            "sha256": "5403df33fb74761844122f0ec96a52b60946657736afaf4056d4bea013588bd9"
+          },
+          "goal": "Nocturneの設計と既存ABIを変えずブラウザーWeb APIの実装を進め、実YouTube、DeepMind、通常DuckDuckGo、ChatGPTをQEMUで検証する。ダミー機能禁止、Hyper-Vはユーザー担当",
+          "next": "弱境界と負例の第二検討を提出し親がQEMU実回帰と実DDGを確認",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "user/libc/web/webi.h",
+              "sha256": "6d2e43224ea11c953bc02f7b80bb334f8ce83b441a6510eb64dc1885c15c74f3"
+            },
+            {
+              "path": "user/libc/web/doc.c",
+              "sha256": "c6097328f35db60e3a22cc98f4a733bf0346ba93c11472b8ad30d7881903f818"
+            },
+            {
+              "path": "user/libc/web/dom.c",
+              "sha256": "dc0de7d70e5ccad67a17e41e359cbcd2d318d882c09a847146433661e13dd554"
+            },
+            {
+              "path": "user/libc/web/paint.c",
+              "sha256": "b9296e109a41b5fc2d19e3ed628273ec2e50e2a98f028be0164e059a95eccc98"
+            },
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "059574ea8dcf1ab77e6137c5e6d74199c1d0a03778ccbb0fd97aae11c6463c8b"
+            },
+            {
+              "path": "user/libc/web/js_selection.js",
+              "sha256": "9d4618ad770437489de0e04fddb1efd28f8aefe40993619e80820417bd192baa"
+            },
+            {
+              "path": "tests/js_selection_cases.js",
+              "sha256": "5de80e3566c5e91e25c942f2992be82bf3b3b2eb5b2dceae4434fd0cc24a16ed"
+            }
+          ],
+          "summary": "native入力選択を実装。C構文exit0、本番関数抽出79検査成功。QEMUで発見されたfocus回帰修正は親build10検証待ち",
+          "time": 1791303017.1806939
+        },
+        {
+          "completion": null,
+          "contract_sha256": "93f414a2517e28831d2268fdf2472dad96fc5ef5fe488541a7422b58ddaf1e6e",
+          "evidence": {
+            "path": "build/nocturne-audit/selection-fresh-second-review.md",
+            "sha256": "e744af1d012dcca4f263cdd479d1d9bc0facd45db08da84b6d36962cd0b5e2c4"
+          },
+          "goal": "Nocturneの設計と既存ABIを変えずブラウザーWeb APIの実装を進め、実YouTube、DeepMind、通常DuckDuckGo、ChatGPTをQEMUで検証する。ダミー機能禁止、Hyper-Vはユーザー担当",
+          "next": "親がbuild10実QEMU回帰と通常DDG操作を独立検証する",
+          "review": null,
+          "round": 2,
+          "sources": [
+            {
+              "path": "user/libc/web/webi.h",
+              "sha256": "6d2e43224ea11c953bc02f7b80bb334f8ce83b441a6510eb64dc1885c15c74f3"
+            },
+            {
+              "path": "user/libc/web/doc.c",
+              "sha256": "c6097328f35db60e3a22cc98f4a733bf0346ba93c11472b8ad30d7881903f818"
+            },
+            {
+              "path": "user/libc/web/dom.c",
+              "sha256": "dc0de7d70e5ccad67a17e41e359cbcd2d318d882c09a847146433661e13dd554"
+            },
+            {
+              "path": "user/libc/web/paint.c",
+              "sha256": "b9296e109a41b5fc2d19e3ed628273ec2e50e2a98f028be0164e059a95eccc98"
+            },
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "059574ea8dcf1ab77e6137c5e6d74199c1d0a03778ccbb0fd97aae11c6463c8b"
+            },
+            {
+              "path": "user/libc/web/js_selection.js",
+              "sha256": "9d4618ad770437489de0e04fddb1efd28f8aefe40993619e80820417bd192baa"
+            },
+            {
+              "path": "tests/js_selection_cases.js",
+              "sha256": "5de80e3566c5e91e25c942f2992be82bf3b3b2eb5b2dceae4434fd0cc24a16ed"
+            }
+          ],
+          "summary": "第二検討: nativefocus回帰、collapsed半surrogate、readonly/disabledを追加検査。79成功/負例3拒否/C構文exit0。C所有返却、実QEMUと実DDGは親待ち",
+          "time": 1791303044.692984
+        },
+        {
+          "completion": null,
+          "contract_sha256": "93f414a2517e28831d2268fdf2472dad96fc5ef5fe488541a7422b58ddaf1e6e",
+          "evidence": {
+            "path": "build/nocturne-audit/compile-mime-review.md",
+            "sha256": "84c3a4e6bd61b645840ca74782002bd59bbdf91ff2633fb5773e54dbad89b757"
+          },
+          "goal": "Nocturneの設計と既存ABIを変えずブラウザーWeb APIの実装を進め、実YouTube、DeepMind、通常DuckDuckGo、ChatGPTをQEMUで検証する。ダミー機能禁止、Hyper-Vはユーザー担当",
+          "next": "親の最新MIME splitterとcompile_wait_ms修正に同じ反例・追加境界を当てる",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "build/nocturne-audit/compile-mime-probe.c",
+              "sha256": "1f8714073fd3707682c009a16e6660ed57d7895dc6de6de7eafbe3b1046d820f"
+            },
+            {
+              "path": "build/nocturne-audit/compile-mime-probe.py",
+              "sha256": "9417ec3b91bd8a2ee82772393775e5b67a2c28634d006a219203852a31591273"
+            },
+            {
+              "path": "user/libc/web/util.c",
+              "sha256": "326e567882e5e00be7673e243598792af20b25fc88c6bf9fc0806976328d3f24"
+            },
+            {
+              "path": "third_party/quickjs/quickjs.c",
+              "sha256": "00662dac3e4c6c25e0f51488bffedc2a9713d85bc998412761c836c4c16076a0"
+            },
+            {
+              "path": "user/apps/browser.c",
+              "sha256": "dfe25304a4a19e082c0a03d33319fb6134f3a92993c950a1c97fe4bbd5ec3b4a"
+            }
+          ],
+          "summary": "読み取り専用の初回compile/MIMEレビュー。旧本番関数抽出92検査でcomma MIME誤受理と再帰待ち時間混入を確認。親がその後修正したため次は最新版再検査",
+          "time": 1791304645.8339758
+        },
+        {
+          "completion": null,
+          "contract_sha256": "93f414a2517e28831d2268fdf2472dad96fc5ef5fe488541a7422b58ddaf1e6e",
+          "evidence": {
+            "path": "build/nocturne-audit/compile-mime-second-review.md",
+            "sha256": "bc27750914957f48aa13c4e395439db157b4f2da042211a3bdb081dec8830a03"
+          },
+          "goal": "Nocturneの設計と既存ABIを変えずブラウザーWeb APIの実装を進め、実YouTube、DeepMind、通常DuckDuckGo、ChatGPTをQEMUで検証する。ダミー機能禁止、Hyper-Vはユーザー担当",
+          "next": "親が修正後imageで実QuickJS/QEMUと実YouTube/DDGを検証し独立受入",
+          "review": null,
+          "round": 2,
+          "sources": [
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "bac5a9f342df54e4638da0f82f12b6c67db5864ee044b6991adbbed863ad29a8"
+            },
+            {
+              "path": "user/libc/web/util.c",
+              "sha256": "326e567882e5e00be7673e243598792af20b25fc88c6bf9fc0806976328d3f24"
+            },
+            {
+              "path": "third_party/quickjs/quickjs.c",
+              "sha256": "00662dac3e4c6c25e0f51488bffedc2a9713d85bc998412761c836c4c16076a0"
+            },
+            {
+              "path": "user/apps/browser.c",
+              "sha256": "dfe25304a4a19e082c0a03d33319fb6134f3a92993c950a1c97fe4bbd5ec3b4a"
+            },
+            {
+              "path": "tests/jstest.c",
+              "sha256": "fe56464ed93589d9ff57851cbc7af7ea5b1221114b11c3aa27a3f9e503e80086"
+            },
+            {
+              "path": "build/nocturne-audit/compile-mime-probe.py",
+              "sha256": "9417ec3b91bd8a2ee82772393775e5b67a2c28634d006a219203852a31591273"
+            },
+            {
+              "path": "build/nocturne-audit/compile-mime-probe-v2.py",
+              "sha256": "af42f13f98b28af9c89bd416bf81a390f5e3d4dc11b3b8e6e42858b67585824c"
+            },
+            {
+              "path": "build/nocturne-audit/compile-mime-negative.py",
+              "sha256": "2876e82da58971b0207adb275e5240505d384a579199d2b3693dd9e79f130d79"
+            }
+          ],
+          "summary": "第2検討: 親修正後MIMEリスト/quote/無効値とnative待ち差分に109限定検査、失敗0。元反例解消、生成コピー4故意欠陥を全拒否。実QuickJS/QEMUサイト合格は別検証",
+          "time": 1791304863.914263
+        },
+        {
+          "completion": null,
+          "contract_sha256": "93f414a2517e28831d2268fdf2472dad96fc5ef5fe488541a7422b58ddaf1e6e",
+          "evidence": {
+            "path": "build/nocturne-audit/qjs-backtrace-independent-review.md",
+            "sha256": "28ddedf453e8a61f7a8f6bb8e78160dbb08ec52027786db59882d3f2edbc6a87"
+          },
+          "goal": "Nocturneの設計と既存ABIを変えずブラウザーWeb APIの実装を進め、実YouTube、DeepMind、通常DuckDuckGo、ChatGPTをQEMUで検証する。ダミー機能禁止、Hyper-Vはユーザー担当",
+          "next": "親がbuild13実QEMU証拠と限定レビューを統合、DDG全面未合格と正式gate未合格を維持",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "third_party/quickjs/quickjs.c",
+              "sha256": "f9241cc53cb5bc4e8e85edf1d7206810f879cf59a119e97fb58f8ef625414d46"
+            },
+            {
+              "path": "third_party/quickjs/quickjs.h",
+              "sha256": "524f64cbdd72366d879574eab7fd5dd049bb58d340164b9964b43c7d370cfb5e"
+            },
+            {
+              "path": "tests/qjs_oomtest.c",
+              "sha256": "ffb2006d0c44cebfdc13bd8ea4709623261717d56c2db1741e6f9759f94b1aba"
+            },
+            {
+              "path": "third_party/quickjs/dtoa.c",
+              "sha256": "af5abd68fa9806d1a19bdd5f2daef00d5fd0990ae56311382dfed4700343f074"
+            },
+            {
+              "path": "third_party/quickjs/libregexp.c",
+              "sha256": "b588a514fb2717cc088d44f5fafbb874c9a4eb52aeca9b82bee851173bb77a28"
+            },
+            {
+              "path": "third_party/quickjs/libunicode.c",
+              "sha256": "26203ae888c0582e7d0e2113f13db0c9b39dc7b0b3836d68fa308c54f7a0898c"
+            },
+            {
+              "path": "third_party/quickjs/cutils.c",
+              "sha256": "b73a403a59da30726257ddbdf5e399298941c1def997782ee0d4d33f796a80a2"
+            },
+            {
+              "path": "build/nocturne-audit/qjs-backtrace-independent-probe.py",
+              "sha256": "bd23dd7b1c41255e98688663e0ccc02d9258b2aa62a5c44e90879e2dc0e37775"
+            }
+          ],
+          "summary": "独立backtraceレビュー: 保持/owner移動/消費API/cleanupに具体欠陥なし。実QuickJS初回207+252=459成功。追加actual interruptは動作確認したがbackend故障点0で補助仮定1失敗、追加OOM合格は主張せず停止",
+          "time": 1791305828.7155051
+        },
+        {
+          "completion": null,
+          "contract_sha256": "93f414a2517e28831d2268fdf2472dad96fc5ef5fe488541a7422b58ddaf1e6e",
+          "evidence": {
+            "path": "build/nocturne-audit/qjs-backtrace-independent-second-review.md",
+            "sha256": "a33c49f61699d0e866660026b031163bebde26f22820f496c4074672564b9b81"
+          },
+          "goal": "Nocturneの設計と既存ABIを変えずブラウザーWeb APIの実装を進め、実YouTube、DeepMind、通常DuckDuckGo、ChatGPTをQEMUで検証する。ダミー機能禁止、Hyper-Vはユーザー担当",
+          "next": "親へ限定レビューを引き渡し、実DDG検索と正式gateの未合格を維持して追加作業終了",
+          "review": null,
+          "round": 2,
+          "sources": [
+            {
+              "path": "third_party/quickjs/quickjs.c",
+              "sha256": "f9241cc53cb5bc4e8e85edf1d7206810f879cf59a119e97fb58f8ef625414d46"
+            },
+            {
+              "path": "third_party/quickjs/quickjs.h",
+              "sha256": "524f64cbdd72366d879574eab7fd5dd049bb58d340164b9964b43c7d370cfb5e"
+            },
+            {
+              "path": "tests/qjs_oomtest.c",
+              "sha256": "ffb2006d0c44cebfdc13bd8ea4709623261717d56c2db1741e6f9759f94b1aba"
+            },
+            {
+              "path": "third_party/quickjs/dtoa.c",
+              "sha256": "af5abd68fa9806d1a19bdd5f2daef00d5fd0990ae56311382dfed4700343f074"
+            },
+            {
+              "path": "third_party/quickjs/libregexp.c",
+              "sha256": "b588a514fb2717cc088d44f5fafbb874c9a4eb52aeca9b82bee851173bb77a28"
+            },
+            {
+              "path": "third_party/quickjs/libunicode.c",
+              "sha256": "26203ae888c0582e7d0e2113f13db0c9b39dc7b0b3836d68fa308c54f7a0898c"
+            },
+            {
+              "path": "third_party/quickjs/cutils.c",
+              "sha256": "b73a403a59da30726257ddbdf5e399298941c1def997782ee0d4d33f796a80a2"
+            },
+            {
+              "path": "build/nocturne-audit/qjs-backtrace-independent-probe.py",
+              "sha256": "bd23dd7b1c41255e98688663e0ccc02d9258b2aa62a5c44e90879e2dc0e37775"
+            }
+          ],
+          "summary": "第2検討: backend故障と内部slot故障を区別し、追加interrupt候補の故障点0は検査不足と保持。NULL/未保留/異なるowner境界を再評価し限定受入を維持、追加実行なし",
+          "time": 1791305873.8496804
+        }
+      ],
+      "task": "実テキスト選択APIとnative編集接続",
+      "tools": 0,
+      "view": null
+    },
+    "site_probe_fresh": {
+      "broadcast": true,
+      "depth": 1,
+      "last_pulse": 0,
+      "owns": [
+        "build/nocturne-audit/site-probe-fresh-report.md"
+      ],
+      "parent": "root",
+      "reads": {
+        "SKILL.md": {
+          "sha256": "2ccbcd13cafb5ce3e2669fd21480b917f662dca2cb38a6fa01806407a68e6c16",
+          "time": 1791302851.0003695
+        },
+        "modules/broadcast.md": {
+          "sha256": "5c106a5dd4348ce92706ac05a761cf87fe2e8eed89f8c6b2e4436d5698e6773f",
+          "time": 1791302851.001566
+        },
+        "modules/capacity.md": {
+          "sha256": "1b98cd009e56895d5a03d9a789fc3a974ecc3939ce5ee0f3c8d388ac7d506065",
+          "time": 1791302851.0009234
+        },
+        "modules/orchestration.md": {
+          "sha256": "e087983c020dc9bb8a33ac989716e07f0b3aa0330fc5ffeb87de1ed37c02867a",
+          "time": 1791302851.0028617
+        },
+        "modules/repository.md": {
+          "sha256": "bcf89e9d8abbc23d0ac6011dd86b3520f4ff603360587c015e79083086858ec5",
+          "time": 1791302851.0022452
+        }
+      },
+      "reports": [
+        {
+          "completion": null,
+          "contract_sha256": "93f414a2517e28831d2268fdf2472dad96fc5ef5fe488541a7422b58ddaf1e6e",
+          "evidence": {
+            "path": "build/nocturne-audit/site-probe-fresh-report.md",
+            "sha256": "5c2cdbfcb91b2ecb014ecaa2e74702c59b4cd8112d714d6263942c4432a240e6"
+          },
+          "goal": "Nocturneの設計と既存ABIを変えずブラウザーWeb APIの実装を進め、実YouTube、DeepMind、通常DuckDuckGo、ChatGPTをQEMUで検証する。ダミー機能禁止、Hyper-Vはユーザー担当",
+          "next": "親が共通API統合と次媒体の実サイトを検証する",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "build/nocturne-audit/site-probe-fresh-youtube-build8/qa-serial.log",
+              "sha256": "07a07ae691e8f0828e3e9c77aa373b51a20992ae56eac04c7b51385d9a9197fd"
+            },
+            {
+              "path": "build/nocturne-audit/site-probe-fresh-chatgpt-build8/qa-serial.log",
+              "sha256": "8298b1f86f63343988225d61c8c54127ca246d595d67aa326924503f4c8c7af7"
+            },
+            {
+              "path": "build/nocturne-audit/site-probe-fresh-youtube-memory-build8/qa-serial.log",
+              "sha256": "9de43be846af898884f6cb8d9f1c3404462f9d26cb15e45797e9c45411c6bd0e"
+            },
+            {
+              "path": "build/nocturne-audit/site-probe-fresh-sources/5ch-page-metadata.json",
+              "sha256": "52a77120dea3dbf12276191d4e8a3cc3c441169688d0fdff822a8ac6afa9c541"
+            }
+          ],
+          "summary": "build8実YouTube/ChatGPTは未合格。legacy Event/canvas/timingと大規模JSのOOMを実測、失敗後physical free245228K。5chのShift_JIS誤Latin変換をsourceと実HTTPで特定",
+          "time": 1791303452.185546
+        },
+        {
+          "completion": null,
+          "contract_sha256": "93f414a2517e28831d2268fdf2472dad96fc5ef5fe488541a7422b58ddaf1e6e",
+          "evidence": {
+            "path": "build/nocturne-audit/site-probe-fresh-sjis-report.md",
+            "sha256": "48b03e79c26c99f135980e473b68da9e014b9505f9b4f776a2b012e6b0c02625"
+          },
+          "goal": "Nocturneの設計と既存ABIを変えずブラウザーWeb APIの実装を進め、実YouTube、DeepMind、通常DuckDuckGo、ChatGPTをQEMUで検証する。ダミー機能禁止、Hyper-Vはユーザー担当",
+          "next": "親がNocturne26件補助と実5ch本文表示を独立検証する",
+          "review": null,
+          "round": 2,
+          "sources": [
+            {
+              "path": "user/libc/web/html.c",
+              "sha256": "62f4af1bce70d69f65bca08786aac9b890c73f1d46cc48b7594b231f85d056b6"
+            },
+            {
+              "path": "user/libc/web/web_encoding.c",
+              "sha256": "76ee6461fbaf57567b31827745fbd130d55a538714ec06548a6a74c48ade99e0"
+            },
+            {
+              "path": "user/libc/web/web_encoding.h",
+              "sha256": "56bd3aa75ed99c2cbc3f08e21dc6b958589c4b9c575cc906c0ecd7a5eafeeb14"
+            },
+            {
+              "path": "user/libc/web/encoding/jis0208.inc",
+              "sha256": "3b33e03fb2b55faa4d49ceafbf1ca0056e4a9d04719094143055c0eb054badf9"
+            },
+            {
+              "path": "tests/shiftjistest.c",
+              "sha256": "a76e1caf7cba111945ccc59e784be713ec1796a7ba961571566b35eabc88fcdf"
+            }
+          ],
+          "summary": "公式WHATWG固定JIS0208でallocation-free Shift_JIS decoderとHTML統合を実装。native公式66816/stream65536失敗0、実5ch全文cp932一致、freestanding3files exit0。Node2648差は公式との不一致として保持。QEMU/JS TextDecoderは未確認",
+          "time": 1791303452.2978115
+        }
+      ],
+      "task": "実YouTubeとChatGPTのQEMU JS検証",
+      "tools": 0,
+      "view": null
     }
   },
   "checkpoints": [
@@ -993,6 +1521,16 @@
         "sha256": "43d1653853be7bb41f78b3bb67488bafaf330d784d09769ebdaf00399b3a2638"
       },
       "id": 4
+    },
+    {
+      "active": true,
+      "by": "専用QEMU内のNocturne tccで各検査をコンパイル実行しシリアルログを確認",
+      "claim": "build12 QEMU: font83/ShiftJIS26/web99/JS722/mediaPolicy106/media12/hover447、全失敗0。実4サイト全面合格の代わりにはしない",
+      "evidence": {
+        "path": "build/nocturne-audit/js-contracts-12/qa-serial.log",
+        "sha256": "5bdef15f5754ea69fbc7129a91a901b975bdb708c50d5d1b02855fd0528e3b48"
+      },
+      "id": 5
     }
   ],
   "config": {
@@ -1005,7 +1543,7 @@
   },
   "core": [],
   "findings": {},
-  "generation": 85,
+  "generation": 111,
   "goal": "Nocturneの設計と既存ABIを変えずブラウザーWeb APIの実装を進め、実YouTube、DeepMind、通常DuckDuckGo、ChatGPTをQEMUで検証する。ダミー機能禁止、Hyper-Vはユーザー担当",
   "level": "high",
   "modules": [
@@ -1014,7 +1552,7 @@
     "modules/repository.md",
     "modules/orchestration.md"
   ],
-  "next": "JavaScriptのみ: 共通イベントIDL修正とQEMU実DeepMind時間切れ境界を実測・修正して実DDG/DeepMindを操作確認",
+  "next": "実DDGのMIME誤拒否後に到達したQuickJSクラッシュを同一バイナリのスタックで診断",
   "questions": {},
   "repo": {
     "branch": "28d25bf82af4c0e2b72f50959b2beb859e3e60b9630a5e8c603dad4ddb2b6e80",
@@ -2495,6 +3033,6 @@
     }
   },
   "schema": 1,
-  "solo_reason": "委譲3エージェントは使用量制限で終了。以後はrootが逐次検証し独立レビューとは呼ばない",
-  "spent": 24
+  "solo_reason": "以前の制限は解消。新たに承認されたsol3エージェントを稼働中",
+  "spent": 38
 }

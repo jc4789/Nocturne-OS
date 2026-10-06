@@ -32,6 +32,8 @@ static const struct asset assets[] = {
     {"/dir/a.mjs", "import {b} from './b.mjs';export function a(){return 'A';}export function cycle(){return a()+b();}", 0},
     {"/dir/b.mjs", "import {a} from './a.mjs';export function b(){return a()==='A'?'B':'?';}", 0},
     {"/dir/dynamic.mjs", "globalThis.dynamicEvaluations=(globalThis.dynamicEvaluations||0)+1;export const answer=42;", 0},
+    {"/dir/mime.mjs", "import {value} from './mimedep.mjs';check('mime-import',value===42);mark('mime-module');", 0},
+    {"/dir/mimedep.mjs", "export const value=42;", 0},
     {"/dir/order-one.js", "globalThis.dynamicOrder.push(1);", 15},
     {"/dir/order-two.js", "globalThis.dynamicOrder.push(2);", 0},
     {"/dir/api/json", "{\"ok\":true,\"value\":42}", 0},
@@ -54,6 +56,7 @@ struct fixture {
     int outside_running, navigations;
     int scroll_x, scroll_y;
     bool expected_errors;
+    const char *module_mime_headers;
     struct { char *url; void *data; size_t len; uint64_t entry; bool manual; } history[16];
     int history_pos, history_length, history_delta;
     uint64_t history_serial;
@@ -130,7 +133,7 @@ static bool sync_load(void *opaque, const char *url, int kind, struct web_respon
     const struct asset *a = lookup(url);
     memset(r, 0, sizeof *r);
     snprintf(r->url, sizeof r->url, "%s", url);
-    snprintf(r->headers, sizeof r->headers, "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\n\r\n");
+    snprintf(r->headers, sizeof r->headers, "HTTP/1.1 200 OK\r\n%s\r\n", f->module_mime_headers ? f->module_mime_headers : "Content-Type: text/javascript\r\n");
     r->status = a ? 200 : 404;
     r->body = strdup(a ? a->body : "not found");
     r->body_len = strlen(r->body ? r->body : "");
@@ -179,6 +182,8 @@ static void deliver(struct fixture *f) {
         const char *mime = q.kind == WEB_RESOURCE_MODULE || q.kind == WEB_RESOURCE_SCRIPT ? "text/javascript" :
                            q.kind == WEB_RESOURCE_CSS ? "text/css" : "application/json";
         snprintf(r.headers, sizeof r.headers, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nX-Fixture: yes\r\n\r\n", mime);
+        if (q.kind == WEB_RESOURCE_MODULE && f->module_mime_headers)
+            snprintf(r.headers, sizeof r.headers, "HTTP/1.1 200 OK\r\n%s\r\n", f->module_mime_headers);
         r.body = strdup(a ? a->body : "not found"); r.body_len = strlen(r.body ? r.body : "");
         if (!strcmp(q.url, "http://fixture.test/dir/api/post") &&
             (strcmp(q.method, "POST") || strcmp(q.body, "Nocturne request body") || q.body_len != 21 || !strstr(q.headers, "x-fixture: yes"))) {
@@ -281,6 +286,11 @@ static void test_platform(void) {
     external_case("js_dom_compare_cases.js", ";check('node-compare-count',runDOMCompareCases()===14);mark('api-done');", BASE);
     external_case("js_event_handler_cases.js", ";check('event-handler-count',runEventHandlerCases()===18);mark('api-done');", BASE);
     external_case("js_observer_cases.js", ";runObserverCases().then(n=>{check('observer-count',n>=40);mark('api-done');},e=>{console.log('FAIL observer '+e);mark('api-done');});", BASE);
+    external_case("js_dom_runtime_cases.js", ";runDOMRuntimeCases().then(n=>{check('dom-runtime-count',n>=40);mark('api-done');},e=>{console.log('FAIL dom-runtime '+e);mark('api-done');});", BASE);
+    external_case("js_selection_cases.js", ";runSelectionCases().then(n=>{check('selection-count',n>300);mark('api-done');},e=>{console.log('FAIL selection '+e);mark('api-done');});", BASE);
+    external_case("js_performance_cases.js", ";runPerformanceCases().then(n=>{check('performance-count',n>=160);mark('api-done');},e=>{console.log('FAIL performance '+e);mark('api-done');});", BASE);
+    external_case("js_performance_cases.js", ";runPerformanceBoundaryCases().then(n=>{check('performance-boundary-count',n>=75);mark('api-done');},e=>{console.log('FAIL performance-boundary '+e);mark('api-done');});", BASE);
+    external_case_expected("js_performance_cases.js", ";runPerformanceObserverExceptionCases().then(n=>{check('performance-exception-count',n>=2);mark('api-done');},e=>{console.log('FAIL performance-exception '+e);mark('api-done');});", BASE,1);
     external_case("js_custom_elements_cases.js", ";check('global-events',runGlobalEventTargetCases()===9);check('iframe-types',runHTMLIFrameElementCases()===19);runCustomElementCases().then(n=>{check('custom-elements-count',n>30);mark('api-done');},e=>{console.log('FAIL custom-elements '+e);mark('api-done');});", BASE);
     external_case_expected("js_custom_elements_cases.js", ";check('custom-elements-failures-count',runCustomElementFailureCases()===9);mark('api-done');", BASE, 4);
 }
@@ -311,6 +321,62 @@ static void test_language(void) {
         close_case();
     }
     free(page);
+}
+
+static void test_script_mime(void) {
+    static const char *const valid[] = {
+        "application/ecmascript", "application/javascript", "application/x-ecmascript", "application/x-javascript",
+        "text/ecmascript", "text/javascript", "text/javascript1.0", "text/javascript1.1", "text/javascript1.2",
+        "text/javascript1.3", "text/javascript1.4", "text/javascript1.5", "text/jscript", "text/livescript",
+        "text/x-ecmascript", "text/x-javascript", " TeXT/JavaScript "
+    };
+    for (unsigned i=0;i<sizeof valid/sizeof *valid;i++) {
+        char page[1024],headers[256];
+        snprintf(page,sizeof page,START "<script type='%s'>mark('mime-classic');</script>"
+            "<script type=module src=mime.mjs></script></head><body>native</body>",valid[i]);
+        snprintf(headers,sizeof headers,"Content-Type: %s; charset=UTF-8\r\n",valid[i]);
+        if (open_case(page,false)) {
+            fixture.module_mime_headers=headers;
+            test_check("mime-module-accepted",pump("mime-module",4000));
+            require_marks((const char *const[]){"mime-classic","mime-import","mime-module"},3);
+            test_check("mime-import-loader",fixture.sync_loads==1);
+            test_check("mime-no-errors",fixture.errors==0);
+            close_case();
+        }
+    }
+    static const char *const extra_valid[] = {
+        "Content-Type: text/plain, application/x-javascript\r\n",
+        "Content-Type: text/javascript; charset=\"UTF-8,x\"\r\n",
+        "Content-Type: text/javascript\r\nContent-Type: not a type\r\n",
+        "Content-Type: text/javascript, */*\r\n"
+    };
+    for (unsigned i=0;i<sizeof extra_valid/sizeof *extra_valid;i++) {
+        if (open_case(START "<script type=module src=mime.mjs></script></head><body>native</body>",false)) {
+            fixture.module_mime_headers=extra_valid[i];
+            test_check("mime-list-accepted",pump("mime-module",4000));
+            require_marks((const char *const[]){"mime-import","mime-module"},2);
+            test_check("mime-list-no-errors",fixture.errors==0);
+            close_case();
+        }
+    }
+    static const char *const invalid[] = {
+        "", "Content-Type: text/plain\r\n", "Content-Type: text/html\r\n",
+        "Content-Type: application/json\r\n", "Content-Type: text/java\r\n",
+        "Content-Type: text/javascriptXYZ\r\n", "Content-Type: text/javascript extra\r\n",
+        "Content-Type: text/javascript, text/html\r\n",
+        "Content-Type: text/javascript; charset=utf-8, text/html\r\n",
+        "Content-Type: text/javascript\r\nContent-Type: text/plain\r\n"
+    };
+    for (unsigned i=0;i<sizeof invalid/sizeof *invalid;i++) {
+        if (open_case(START "<script type=module src=mime.mjs onerror=\"mark('mime-blocked')\"></script>"
+                          "<script type='text/javascript; charset=utf-8'>mark('mime-wrong-type');</script></head><body>native</body>",true)) {
+            fixture.module_mime_headers=invalid[i];
+            test_check("mime-module-rejected",pump("mime-blocked",4000));
+            test_check("mime-wrong-not-executed",!has_mark(&fixture,"mime-module")&&!has_mark(&fixture,"mime-wrong-type"));
+            test_check("mime-rejection-reported",fixture.errors==1&&fixture.sync_loads==0);
+            close_case();
+        }
+    }
 }
 
 static void test_dom_and_scripts(void) {
@@ -558,9 +624,9 @@ static void test_limits(void) {
     test_execution_budget("microtask-budget", "mark('microtask-start');function forever(){Promise.resolve().then(forever);}forever();");
     /* Split allocations into browser tasks: a time-limit failure cannot stand in
        for enforcing either allocation quota. No private allocator APIs are used. */
-    test_allocation_limit("heap-64m-limit",
+    test_allocation_limit("heap-128m-limit",
         "let buffers=[],allocated=0;function consume(){try{for(let i=0;i<4;i++){buffers.push(new ArrayBuffer(1048576));allocated++;}setTimeout(consume,0);}"
-        "catch(e){buffers.length=0;check('heap-bound',allocated>32&&allocated<64);mark('heap-limit');}}consume();", "heap-limit");
+        "catch(e){buffers.length=0;check('heap-bound',allocated>96&&allocated<128);mark('heap-limit');}}consume();", "heap-limit");
     require_marks((const char *const[]){"heap-bound"}, 1);
     test_allocation_limit("dom-32m-limit",
         "const payload='x'.repeat(262144);let nodes=0;function consume(){try{for(let i=0;i<4;i++){document.createTextNode(payload);nodes++;}setTimeout(consume,0);}"
@@ -584,6 +650,47 @@ static void test_limits(void) {
         }
         test_check("runaway-event-budget-reported", fixture.errors > 0 && strstr(fixture.last_error,"5 second") != NULL);
         test_check("runaway-event-not-running", !web_script_running(fixture.doc));
+        close_case();
+    }
+    free(page);
+}
+
+static void test_native_selection(void) {
+    const char *source =
+        "const input=document.createElement('input');input.style.cssText='position:absolute;left:0;top:0;width:200px;height:30px';"
+        "document.body.appendChild(input);input.value='abcdef';input.setSelectionRange(1,4);input.focus();let stage=0;"
+        "input.addEventListener('selection-probe',()=>{"
+        "if(stage===0){check('native-range-replacement',input.value==='aZef'&&input.selectionStart===2&&input.selectionEnd===2);input.value='a\\ud83d\\ude00b';input.setSelectionRange(3,3);}"
+        "if(stage===1)check('native-left-scalar',input.selectionStart===1&&input.selectionEnd===1);"
+        "if(stage===2)check('native-shift-selection',input.selectionStart===1&&input.selectionEnd===3&&input.selectionDirection==='forward');"
+        "if(stage===3){check('native-delete-selection',input.value==='ab'&&input.selectionStart===1);input.setSelectionRange(1,1);}"
+        "if(stage===4)check('native-backspace',input.value==='b'&&input.selectionStart===0);"
+        "if(stage===5)check('native-home-shift',input.selectionStart===0&&input.selectionEnd===0);"
+        "if(stage===6){check('native-end-shift',input.selectionStart===0&&input.selectionEnd===1);input.value='abcd';input.setSelectionRange(1,3);input.setAttribute('maxlength','4');}"
+        "if(stage===7){check('native-maxlength-replacement',input.value==='aXd'&&input.selectionStart===2);input.value='abcd';input.setSelectionRange(2,2);}"
+        "if(stage===8)check('native-maxlength-reject',input.value==='abcd'&&input.selectionStart===2);"
+        "stage++;mark('native-selection-step-'+stage);});mark('native-selection-ready');";
+    char *page=script_page(source);
+    test_check("native-selection-page",page!=NULL);
+    if(page && open_case(page,false)) {
+        test_check("native-selection-ready",pump("native-selection-ready",5000));
+        web_node *input=web_focused(fixture.doc);
+        test_check("native-selection-focus",input!=NULL);
+        step(&fixture);
+        int selected_pixels=0;for(int i=0;i<VW*VH;i++)if((pixels[i]&0xffffff)==0x0075ff)selected_pixels++;
+        test_check("native-selection-painted",selected_pixels>20);
+        static const uint32_t keys[]={'Z',NKEY_LEFT,NKEY_RIGHT,NKEY_DELETE,NKEY_BACKSPACE,NKEY_HOME,NKEY_END,'X','Y'};
+        for(unsigned i=0;input && i<sizeof keys/sizeof *keys;i++) {
+            struct gui_event key={.key=keys[i],.mods=(i==2||i==5||i==6)?NMOD_SHIFT:0};
+            int result=web_key(fixture.doc,&key);
+            test_check("native-selection-key-handled",result==(i==8?0:1));
+            struct web_event probe={.type="selection-probe"};web_dispatch(fixture.doc,input,&probe);
+            char mark[48];snprintf(mark,sizeof mark,"native-selection-step-%u",i+1);
+            test_check("native-selection-step",has_mark(&fixture,mark));
+        }
+        static const char *const names[]={"native-range-replacement","native-left-scalar","native-shift-selection","native-delete-selection","native-backspace","native-home-shift","native-end-shift","native-maxlength-replacement","native-maxlength-reject"};
+        require_marks(names,sizeof names/sizeof *names);
+        test_check("native-selection-no-errors",fixture.errors==0);
         close_case();
     }
     free(page);
@@ -626,7 +733,9 @@ int main(int argc, char **argv) {
     RUN("language", test_language);
     RUN("platform", test_platform);
     RUN("dom", test_dom_and_scripts);
+    RUN("mime", test_script_mime);
     RUN("events", test_events_and_forms);
+    RUN("selection-native", test_native_selection);
     RUN("timers", test_timers_and_promises);
     RUN("fetch", test_fetch_and_cancel);
     RUN("limits", test_limits);

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <ctype.h>
 #include "webi.h"
+#include "web_encoding.h"
 
 const char *const tag_names[T_COUNT] = {
     "",
@@ -938,6 +939,18 @@ static void prescan_charset(const char *s, size_t n, char *out, size_t cap) {
     }
 }
 
+struct decoded_html { sbuf *out; bool after_cr; };
+static bool emit_decoded_html(void *opaque, uint32_t cp, bool malformed) {
+    struct decoded_html *text = opaque;
+    if (cp == '\r') {
+        sb_putc(text->out, '\n'); text->after_cr = true;
+    } else {
+        if (cp != '\n' || !text->after_cr) sb_utf8(text->out, cp ? cp : 0xfffd);
+        text->after_cr = false;
+    }
+    return true;
+}
+
 struct html_parser *html_begin(web_doc *d, const char *src, size_t n, const char *charset, bool scripting) {
     /* to UTF-8, with CR LF and CR as LF and NUL as U+FFFD */
     char meta_cs[32];
@@ -948,17 +961,23 @@ struct html_parser *html_begin(web_doc *d, const char *src, size_t n, const char
         n -= 3;
         cs = "utf-8";
     }
-    bool latin = is_latin(cs) || (!cs && !valid_utf8((const unsigned char *)src, n));
-    if (cs && !latin && !valid_utf8((const unsigned char *)src, n) && !str_ieq(cs, "utf-8")) latin = true;
     sbuf in = {0};
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)src[i];
-        if (c == '\r') {
-            sb_putc(&in, '\n');
-            if (i + 1 < n && src[i + 1] == '\n') i++;
-        } else if (c == 0) sb_utf8(&in, 0xFFFD);
-        else if (latin && c >= 0x80) sb_utf8(&in, c < 0xA0 ? win1252[c - 0x80] : c);
-        else sb_putc(&in, (char)c);
+    if (web_shift_jis_label(cs)) {
+        web_shift_jis_decoder decoder = {0};
+        struct decoded_html text = {&in, false};
+        web_shift_jis_decode(&decoder, (const uint8_t *)src, n, true, emit_decoded_html, &text);
+    } else {
+        bool latin = is_latin(cs) || (!cs && !valid_utf8((const unsigned char *)src, n));
+        if (cs && !latin && !valid_utf8((const unsigned char *)src, n) && !str_ieq(cs, "utf-8")) latin = true;
+        for (size_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)src[i];
+            if (c == '\r') {
+                sb_putc(&in, '\n');
+                if (i + 1 < n && src[i + 1] == '\n') i++;
+            } else if (c == 0) sb_utf8(&in, 0xFFFD);
+            else if (latin && c >= 0x80) sb_utf8(&in, c < 0xA0 ? win1252[c - 0x80] : c);
+            else sb_putc(&in, (char)c);
+        }
     }
 
     struct html_parser *p = calloc(1, sizeof *p);

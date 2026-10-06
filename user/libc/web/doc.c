@@ -811,10 +811,114 @@ bool web_node_rect(web_doc *d, web_node *n, int *x, int *y, int *w, int *h) {
 }
 
 /* ---------------------------------------------------------------- forms */
+bool doc_control_selection_supported(const node_t *n) {
+    if (!n || n->type != N_ELEM || n->foreign) return false;
+    if (n->tag == T_textarea) return true;
+    if (n->tag != T_input) return false;
+    const char *type = node_attr(n, "type");
+    if (!type || !*type || str_ieq(type, "text") || str_ieq(type, "search") ||
+        str_ieq(type, "url") || str_ieq(type, "tel") || str_ieq(type, "password")) return true;
+    /* Unknown type keywords use the Text missing/invalid-value default. */
+    static const char *other[] = {"hidden", "email", "date", "month", "week", "time", "datetime-local",
+        "number", "range", "color", "checkbox", "radio", "file", "submit", "image", "reset", "button"};
+    for (size_t i = 0; i < sizeof other / sizeof *other; i++) if (str_ieq(type, other[i])) return false;
+    return true;
+}
+
+/* Control strings use UTF-8, with WTF-8 for isolated JS UTF-16 surrogates.
+   Count a scalar outside the BMP as two code units; never count bytes as units. */
+static uint32_t control_decode(const char *text, size_t *byte) {
+    const unsigned char *p = (const unsigned char *)text + *byte;
+    uint32_t cp = *p; size_t n = 1;
+    if (cp >= 0xc2 && cp <= 0xf4) {
+        size_t want = cp < 0xe0 ? 2 : cp < 0xf0 ? 3 : 4;
+        uint32_t out = cp & (want == 2 ? 31 : want == 3 ? 15 : 7);
+        size_t j = 1;
+        while (j < want && p[j] && (p[j] & 0xc0) == 0x80) { out = (out << 6) | (p[j] & 63); j++; }
+        if (j == want && out <= 0x10ffff && out >= (want == 2 ? 0x80u : want == 3 ? 0x800u : 0x10000u)) { cp = out; n = want; }
+    }
+    *byte += n; return cp;
+}
+uint32_t doc_utf16_length(const char *text) {
+    uint32_t length = 0; size_t byte = 0;
+    if (text) while (text[byte]) length += control_decode(text, &byte) > 0xffff ? 2 : 1;
+    return length;
+}
+uint32_t doc_byte_to_utf16(const char *text, size_t byte) {
+    uint32_t length = 0; size_t at = 0;
+    if (text) while (text[at] && at < byte) length += control_decode(text, &at) > 0xffff ? 2 : 1;
+    return length;
+}
+size_t doc_utf16_to_byte(const char *text, uint32_t offset, bool round_up) {
+    size_t byte = 0; uint32_t at = 0;
+    if (text) while (text[byte] && at < offset) {
+        size_t before = byte; uint32_t count = control_decode(text, &byte) > 0xffff ? 2 : 1;
+        if (offset - at < count) return round_up ? byte : before;
+        at += count;
+    }
+    return byte;
+}
+void doc_control_caret(web_doc *d, node_t *n) {
+    if (d->focus == n) d->caret = (int)doc_utf16_to_byte(n->value,
+        n->selection_direction == 2 ? n->selection_start : n->selection_end, false);
+}
+void doc_control_selection(web_doc *d, node_t *n, uint32_t start, uint32_t end, uint8_t direction) {
+    uint32_t length = doc_utf16_length(n->value);
+    if (start > length) start = length;
+    if (end > length) end = length;
+    if (end <= start) start = end;
+    if (direction > 2) direction = 0;
+    bool changed = n->selection_start != start || n->selection_end != end || n->selection_direction != direction;
+    n->selection_start = start; n->selection_end = end; n->selection_direction = direction;
+    n->selection_set = true;
+    doc_control_caret(d, n);
+    if (changed) { d->dirty = true; web_js_selection_changed(d, n); }
+}
+static void control_surrogate(sbuf *b, uint32_t cp) {
+    char enc[] = {(char)(0xe0 | (cp >> 12)), (char)(0x80 | ((cp >> 6) & 63)), (char)(0x80 | (cp & 63))};
+    sb_put(b, enc, 3);
+}
+static void control_slice(sbuf *out, const char *text, uint32_t start, uint32_t end) {
+    size_t byte = 0; uint32_t at = 0;
+    while (text[byte] && at < end) {
+        size_t before = byte; uint32_t cp = control_decode(text, &byte), count = cp > 0xffff ? 2 : 1;
+        if (start <= at && at + count <= end) sb_put(out, text + before, byte - before);
+        else if (count == 2) {
+            if (start <= at && at < end) control_surrogate(out, 0xd800 + ((cp - 0x10000) >> 10));
+            if (start <= at + 1 && at + 1 < end) control_surrogate(out, 0xdc00 + ((cp - 0x10000) & 1023));
+        }
+        at += count;
+    }
+}
+bool doc_control_replace(web_doc *d, node_t *n, uint32_t start, uint32_t end, const char *text) {
+    const char *value = n->value ? n->value : ""; uint32_t length = doc_utf16_length(value);
+    if (start > length) start = length;
+    if (end > length) end = length;
+    if (start > end) return false;
+    size_t bytes = strlen(value), replacement = strlen(text);
+    if (replacement > (16u << 20) || bytes > (16u << 20) || bytes + replacement > (16u << 20) + 6u) return false;
+    /* Reserve enough for both split-surrogate boundaries. Do not let sbuf's
+       abort-on-OOM grow path turn a failed edit into a browser process crash. */
+    sbuf b = {0}; b.cap = bytes + replacement + 7; b.p = malloc(b.cap);
+    if (!b.p) return false;
+    control_slice(&b, value, 0, start); sb_puts(&b, text); control_slice(&b, value, end, length);
+    bool ok = doc_node_value(d, n, b.p ? b.p : "", b.n); sb_free(&b); return ok;
+}
+
 void web_focus(web_doc *d, web_node *n) {
+    if (n && node_attr(n, "disabled")) return;
     if (n) doc_control_init(d, n);
+    /* Keep Nocturne's existing first native focus at the end of a pristine
+       control. An explicit JS range (including 0,0), value setter, or remembered
+       user range takes priority; the unfocused initial DOM cursor is still 0. */
+    if (n && (n->tag == T_input || n->tag == T_textarea) && !n->selection_set) {
+        n->selection_start = n->selection_end = doc_utf16_length(n->value);
+        n->selection_direction = 0; n->selection_set = true;
+    }
     d->focus = n;
-    d->caret = n && n->value ? (int)strlen(n->value) : 0;
+    d->caret = 0;
+    if (n) doc_control_caret(d, n);
+    d->dirty = true;
 }
 
 web_node *web_focused(web_doc *d) { return d->focus; }
@@ -823,83 +927,107 @@ static bool readonly(node_t *n) { return node_attr(n, "readonly") || node_attr(n
 
 int web_key(web_doc *d, const struct gui_event *e) {
     node_t *n = d->focus;
-    if (!n || !(n->tag == T_input || n->tag == T_textarea)) return 0;
+    if (!n || !(n->tag == T_input || n->tag == T_textarea) || node_attr(n, "disabled")) return 0;
     doc_control_init(d, n);
     if (!n->value && !doc_node_value(d, n, "", 0)) return 0;
     char *v = n->value;
     int len = (int)strlen(v);
-    if (d->caret > len) d->caret = len;
+    doc_control_caret(d, n);
     int c = d->caret;
+    uint32_t start = n->selection_start, end = n->selection_end;
+    bool split_cursor = start == end && doc_utf16_to_byte(v, start, false) != doc_utf16_to_byte(v, start, true);
+    bool shift = (e->mods & NMOD_SHIFT) != 0;
     uint32_t k = e->key;
     bool multi = n->tag == T_textarea;
+    if ((e->mods & NMOD_CTRL) && (k == 'a' || k == 'A')) {
+        doc_control_selection(d, n, 0, doc_utf16_length(v), 1); return 1;
+    }
     switch (k) {
     case NKEY_LEFT:
+        if (split_cursor) break; /* already rounded to this scalar's start */
+        if (!shift && start != end) { c = (int)doc_utf16_to_byte(v, start, false); break; }
         if (c > 0) {
             c--;
             while (c > 0 && ((unsigned char)v[c] & 0xC0) == 0x80) c--;
         }
-        d->caret = c;
-        return 1;
+        break;
     case NKEY_RIGHT:
+        if (split_cursor) { c = (int)doc_utf16_to_byte(v, end, true); break; }
+        if (!shift && start != end) { c = (int)doc_utf16_to_byte(v, end, true); break; }
         if (c < len) {
             c++;
             while (c < len && ((unsigned char)v[c] & 0xC0) == 0x80) c++;
         }
-        d->caret = c;
-        return 1;
+        break;
     case NKEY_HOME:
-        if (multi)
+        if (multi && !(e->mods & NMOD_CTRL))
             while (c > 0 && v[c - 1] != '\n') c--;
         else c = 0;
-        d->caret = c;
-        return 1;
+        break;
     case NKEY_END:
-        if (multi)
+        if (multi && !(e->mods & NMOD_CTRL))
             while (c < len && v[c] != '\n') c++;
         else c = len;
-        d->caret = c;
-        return 1;
+        break;
+    case NKEY_UP: case NKEY_DOWN: {
+        if (!multi) return 0;
+        int line = c; while (line > 0 && v[line - 1] != '\n') line--;
+        uint32_t column = doc_byte_to_utf16(v + line, (size_t)(c - line));
+        int target;
+        if (k == NKEY_UP) {
+            if (!line) { c = 0; break; }
+            target = line - 1; while (target > 0 && v[target - 1] != '\n') target--;
+        } else {
+            target = c; while (target < len && v[target] != '\n') target++;
+            if (target == len) { c = len; break; } target++;
+        }
+        int limit = target; while (limit < len && v[limit] != '\n') limit++;
+        c = target + (int)doc_utf16_to_byte(v + target, column, false);
+        if (c > limit) c = limit;
+        break;
+    }
     case NKEY_ENTER:
         if (!multi) return 2;
         k = '\n';
         break;
     case NKEY_BACKSPACE: {
-        if (readonly(n) || c == 0) return 0;
-        int s = c - 1;
-        while (s > 0 && ((unsigned char)v[s] & 0xC0) == 0x80) s--;
-        memmove(v + s, v + c, (size_t)(len - c + 1));
-        n->value_dirty = true;
-        d->caret = s;
-        d->dirty = d->need_style = true;
+        if (readonly(n) || (start == end && !split_cursor && c == 0)) return 0;
+        if (split_cursor) start--;
+        else if (start == end) { int s = c - 1; while (s > 0 && ((unsigned char)v[s] & 0xc0) == 0x80) s--; start = doc_byte_to_utf16(v, (size_t)s); }
+        if (!doc_control_replace(d, n, start, end, "")) return 0;
+        doc_control_selection(d, n, start, start, 0);
         return 1;
     }
     case NKEY_DELETE: {
-        if (readonly(n) || c >= len) return 0;
-        int e2 = c + 1;
-        while (e2 < len && ((unsigned char)v[e2] & 0xC0) == 0x80) e2++;
-        memmove(v + c, v + e2, (size_t)(len - e2 + 1));
-        n->value_dirty = true;
-        d->dirty = d->need_style = true;
+        if (readonly(n) || (start == end && c >= len)) return 0;
+        if (split_cursor) end++;
+        else if (start == end) { int e2 = c + 1; while (e2 < len && ((unsigned char)v[e2] & 0xc0) == 0x80) e2++; end = doc_byte_to_utf16(v, (size_t)e2); }
+        if (!doc_control_replace(d, n, start, end, "")) return 0;
+        doc_control_selection(d, n, start, start, 0);
         return 1;
     }
+    }
+    if (k == NKEY_LEFT || k == NKEY_RIGHT || k == NKEY_HOME || k == NKEY_END || k == NKEY_UP || k == NKEY_DOWN) {
+        uint32_t to = doc_byte_to_utf16(v, (size_t)c);
+        if (shift) {
+            uint32_t anchor = n->selection_direction == 2 ? end : start;
+            doc_control_selection(d, n, to < anchor ? to : anchor, to < anchor ? anchor : to, to < anchor ? 2 : 1);
+        } else doc_control_selection(d, n, to, to, 0);
+        return 1;
     }
     if (e->mods & (NMOD_CTRL | NMOD_ALT)) return 0;
     if (k < 32 && k != '\n') return 0;
     if (k >= 0x100 && k < 0x200) return 0; /* other special keys */
-    if (k > 0x10FFFF || readonly(n)) return 0;
+    if (k > 0x10FFFF || (k >= 0xd800 && k <= 0xdfff) || readonly(n)) return 0;
     const char *ml = node_attr(n, "maxlength");
-    if (ml && atoi(ml) > 0 && len >= atoi(ml)) return 0;
-    char enc[4];
+    uint32_t units = k > 0xffff ? 2 : 1;
+    if (ml && *ml >= '0' && *ml <= '9' && doc_utf16_length(v) - (end - start) + units > (uint32_t)atoi(ml)) return 0;
+    char enc[5];
     int el = utf8_put(enc, k);
-    char *nv = malloc((size_t)len + (size_t)el + 1);
-    if (!nv) return 0;
-    memcpy(nv, v, (size_t)c);
-    memcpy(nv + c, enc, (size_t)el);
-    memcpy(nv + c + el, v + c, (size_t)(len - c + 1));
-    bool changed = doc_node_value(d, n, nv, (size_t)len + (size_t)el);
-    free(nv);
+    enc[el] = 0;
+    bool changed = doc_control_replace(d, n, start, end, enc);
     if (!changed) return 0;
-    d->caret = c + el;
+    doc_control_selection(d, n, start + units, start + units, 0);
     return 1;
 }
 

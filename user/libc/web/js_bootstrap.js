@@ -14,13 +14,11 @@
     const eventSlice = Array.prototype.slice, mouseAssign = Object.assign;
     const listenerMap = new WeakMap(), inlineMap = new WeakMap();
     const handlerMap = new WeakMap();
-    const globalHandlerTypes = new Set(('abort blur change click dblclick error focus focusin focusout input keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll submit wheel').split(' '));
+    const globalHandlerTypes = new Set(('abort blur change click dblclick error focus focusin focusout input keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select submit wheel').split(' '));
     const windowHandlerTypes = new Set(['hashchange','popstate']);
     const state = new WeakMap();
-    function list(a) {
-        Object.defineProperty(a, 'item', {value(i) { return this[i] || null; }});
-        return a;
-    }
+    /* @include js_collections.js */
+    function list(a) { return collectionBridge.list(a); }
     function options(o) { return typeof o === 'boolean' ? {capture:o} : (o || {}); }
     function report(e) { host.log(2, String(e) + (e && e.stack ? '\n' + e.stack : '')); }
     class Event {
@@ -30,7 +28,13 @@
             this.target = null; this.currentTarget = null; this.eventPhase = 0;
             this.defaultPrevented = false; this.isTrusted = false;
             this.timeStamp = host.now(); this._stop = false; this._immediate = false;
-            this._passive = false; this._dispatching = false; this._path = [];
+            this._passive = false; this._dispatching = false; this._path = []; this._initialized = true;
+        }
+        initEvent(type,bubbles=false,cancelable=false) {
+            if(!arguments.length)throw new TypeError('initEvent requires type');
+            if(this._dispatching)return;
+            this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;
+            this._stop=this._immediate=this.defaultPrevented=false;this.isTrusted=false;this.target=null;this._initialized=true;
         }
         preventDefault() { if (this.cancelable && !this._passive) this.defaultPrevented = true; }
         stopPropagation() { this._stop = true; }
@@ -45,12 +49,35 @@
     Object.assign(Event.prototype, {NONE:0, CAPTURING_PHASE:1, AT_TARGET:2, BUBBLING_PHASE:3});
     class CustomEvent extends Event {
         constructor(t, o = {}) { super(t,o); this.detail = o.detail === undefined ? null : o.detail; }
+        initCustomEvent(type,bubbles=false,cancelable=false,detail=null) {
+            if(!arguments.length)throw new TypeError('initCustomEvent requires type');
+            if(this._dispatching)return;
+            this.initEvent(type,bubbles,cancelable);this.detail=detail;
+        }
     }
-    class MouseEvent extends Event {
+    class UIEvent extends Event {
+        constructor(t,o={}){super(t,o);this.view=o.view??null;this.detail=(+(o.detail??0))>>0;}
+        initUIEvent(type,bubbles=false,cancelable=false,view=null,detail=0){
+            if(!arguments.length)throw new TypeError('initUIEvent requires type');
+            if(this._dispatching)return;
+            Event.prototype.initEvent.call(this,type,bubbles,cancelable);this.view=view;this.detail=(+detail)>>0;
+        }
+    }
+    class MouseEvent extends UIEvent {
         constructor(t, o = {}) { super(t,o); mouseAssign(this, {clientX:0, clientY:0, pageX:0, pageY:0,
-            button:0, buttons:0, relatedTarget:null, ctrlKey:false, shiftKey:false, altKey:false, metaKey:false}, o); }
+            screenX:0,screenY:0,button:0, buttons:0, relatedTarget:null, ctrlKey:false, shiftKey:false, altKey:false, metaKey:false}, o); }
+        initMouseEvent(type,bubbles=false,cancelable=false,view=null,detail=0,screenX=0,screenY=0,clientX=0,clientY=0,ctrlKey=false,altKey=false,shiftKey=false,metaKey=false,button=0,relatedTarget=null){
+            if(!arguments.length)throw new TypeError('initMouseEvent requires type');
+            if(this._dispatching)return;
+            if(relatedTarget!==null && !(relatedTarget instanceof EventTarget) && relatedTarget!==globalThis)throw new TypeError('Expected an EventTarget');
+            UIEvent.prototype.initUIEvent.call(this,type,bubbles,cancelable,view,detail);
+            mouseAssign(this,{screenX:(+screenX)>>0,screenY:(+screenY)>>0,clientX:(+clientX)>>0,clientY:(+clientY)>>0,
+                ctrlKey:!!ctrlKey,altKey:!!altKey,shiftKey:!!shiftKey,metaKey:!!metaKey,button:((+button)<<16)>>16,relatedTarget});
+            this.pageX=this.clientX+host.scroll(0);this.pageY=this.clientY+host.scroll(1);
+        }
+        getModifierState(key){return ({Control:this.ctrlKey,Alt:this.altKey,Shift:this.shiftKey,Meta:this.metaKey})[String(key)]||false;}
     }
-    class KeyboardEvent extends Event {
+    class KeyboardEvent extends UIEvent {
         constructor(t, o = {}) { super(t,o); Object.assign(this, {key:'', code:'', keyCode:0, which:0,
             ctrlKey:false, shiftKey:false, altKey:false, metaKey:false, repeat:false}, o); }
     }
@@ -90,7 +117,9 @@
             }
         }
         dispatchEvent(event) {
-            if (!(event instanceof Event) || !event.type || event._dispatching) throw new TypeError('Invalid event');
+            if (!(event instanceof Event)) throw new TypeError('Invalid event');
+            if (!event._initialized || event._dispatching) throw new DOMException('Uninitialized or dispatching event','InvalidStateError');
+            event.isTrusted=false;
             return dispatch(this, event);
         }
     }
@@ -181,7 +210,9 @@
         const path = snapshot || [target];
         if (!snapshot && target instanceof Node) {
             for (let n = target.parentNode; n; n = n.parentNode) path.push(n);
-            if (path[path.length-1] === document) path.push(globalThis);
+            // Document's event parent is null for load. Resource load capture
+            // must not reach Window and masquerade as document completion.
+            if (path[path.length-1] === document && event.type !== 'load') path.push(globalThis);
         }
         event._path = apply(eventSlice,path,[]);
         for (let i = path.length-1; i > 0 && !event._stop; --i) {
@@ -209,7 +240,7 @@
         get lastChild() { return dom('get',this,'lastChild'); }
         get nextSibling() { return dom('get',this,'nextSibling'); }
         get previousSibling() { return dom('get',this,'previousSibling'); }
-        get childNodes() { return list(dom('get',this,'childNodes')); }
+        get childNodes() { return collectionBridge.children(this,false); }
         get ownerDocument() { return this === document ? null : document; }
         get baseURI() { return dom('get',this,'baseURI'); }
         get isConnected() { let n=this; while(n.parentNode) n=n.parentNode; return n===document; }
@@ -227,7 +258,7 @@
         getRootNode() { let n=this; while(n.parentNode) n=n.parentNode; return n; }
     }
     class Element extends Node {
-        get children() { return list(this.childNodes.filter(n => n.nodeType === 1)); }
+        get children() { return collectionBridge.children(this,true); }
         get firstElementChild() { return this.children[0] || null; }
         get lastElementChild() { const a = this.children; return a[a.length-1] || null; }
         get nextElementSibling() { let n = this.nextSibling; while (n && n.nodeType !== 1) n=n.nextSibling; return n; }
@@ -260,8 +291,8 @@
         querySelectorAll(selector) { return list(dom('query',this,String(selector),false)); }
         matches(selector) { return dom('matches',this,String(selector)); }
         closest(selector) { for(let n=this;n&&n.nodeType===1;n=n.parentElement) if(n.matches(selector))return n; return null; }
-        getElementsByTagName(name) { return this.querySelectorAll(name==='*'?'*':String(name)); }
-        getElementsByClassName(names) { return this.querySelectorAll(String(names).trim().split(/\s+/).map(x=>'.'+CSS.escape(x)).join('')); }
+        getElementsByTagName(name) { const query=String(name)==='*'?'*':CSS.escape(String(name));return collectionBridge.html(()=>dom('query',this,query,false)); }
+        getElementsByClassName(names) { const query=String(names).trim().split(/\s+/).filter(Boolean).map(x=>'.'+CSS.escape(x)).join('');return collectionBridge.html(()=>query?dom('query',this,query,false):[]); }
         getBoundingClientRect() { return dom('rect',this); }
         get clientWidth() { return dom('geometry',this,'clientWidth'); }
         get clientHeight() { return dom('geometry',this,'clientHeight'); }
@@ -395,7 +426,7 @@
         defaultView:{value:globalThis}, currentScript:{get(){return host.current();}}
     });
     document.getElementById=id=>dom('id',document,String(id));
-    document.getElementsByName=name=>document.querySelectorAll('[name="'+CSS.escape(String(name))+'"]');
+    document.getElementsByName=name=>{const query='[name="'+CSS.escape(String(name))+'"]';return collectionBridge.live(()=>dom('query',document,query,false));};
     document.createElement=(name,options)=>customElementsBridge.create(name,options);
     document.createElementNS=(ns,name,options)=>{if(ns==='http://www.w3.org/1999/xhtml')return customElementsBridge.create(name,options,true);if(ns!=='http://www.w3.org/2000/svg')throw new DOMException('Unsupported namespace','NotSupportedError');return dom('create',null,1,String(name),'',true);};
     document.createTextNode=text=>dom('create',null,3,'#text',String(text));
@@ -404,7 +435,17 @@
     document.importNode=(node,deep)=>node.cloneNode(!!deep);
     document.write=(...s)=>host.write(s.join(''));
     document.writeln=(...s)=>host.write(s.join('')+'\n');
-    document.createEvent=()=>new Event('');
+    document.createEvent=function(name){
+        if(!arguments.length)throw new TypeError('createEvent requires interface');
+        const type=String(name).toLowerCase();let e;
+        if(['event','events','htmlevents','svgevents'].includes(type))e=new Event('');
+        else if(type==='customevent')e=new CustomEvent('');
+        else if(['mouseevent','mouseevents'].includes(type))e=new MouseEvent('');
+        else if(['uievent','uievents'].includes(type))e=new UIEvent('');
+        else if(['keyboardevent','keyevents'].includes(type))e=new KeyboardEvent('');
+        else throw new DOMException('Unsupported event interface','NotSupportedError');
+        e._initialized=false;return e;
+    };
     class DOMTokenList {
         constructor(node){this.node=node;}
         _tokens(){return (this.node.className.match(/\S+/g)||[]).filter((x,i,a)=>a.indexOf(x)===i);}
@@ -495,7 +536,7 @@
     Object.assign(globalThis,{document,console,navigator,Node,Element,HTMLElement,HTMLIFrameElement,HTMLImageElement,Image,
         HTMLInputElement,HTMLButtonElement,HTMLSelectElement,HTMLTextAreaElement,HTMLFieldSetElement,HTMLObjectElement,HTMLOutputElement,HTMLOptionElement,
         Document,CharacterData,Text,Comment,DocumentFragment,
-        Event,CustomEvent,MouseEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Response,DOMException,AbortController,AbortSignal,
+        Event,CustomEvent,UIEvent,MouseEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Response,DOMException,AbortController,AbortSignal,
         fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,
         performance:{now:()=>host.now()},getComputedStyle:n=>new Proxy({getPropertyValue:k=>dom('computed',n,String(k))},{get(t,k){return k in t?t[k]:t.getPropertyValue(cssName(k));}})});
     Object.defineProperty(globalThis,'location',{configurable:true,get(){return location;},set(v){host.navigate(String(v));}});
@@ -528,10 +569,13 @@
     /* @include js_intl.js */
     /* @include js_crypto.js */
     /* @include js_clone.js */
+    /* @include js_performance.js */
     /* @include js_history.js */
     /* @include js_custom_elements.js */
     /* @include js_media.js */
     /* @include js_observers.js */
+    /* @include js_mutations.js */
+    /* @include js_selection.js */
     customElementsReady = true;
     /* Private native-input state, never reachable from page JS. C supplies the
        hit target's complete ancestry BEFORE any event handler can change it.
@@ -577,8 +621,8 @@
         eventHandlerAttribute:handlerAttribute,
         imageError(){return new DOMException('The image request changed or could not be decoded','EncodingError');},
         hover,
-        customElementBefore(...args){return customElementsBridge.before(...args);},
-        customElementAfter(token,result){customElementsBridge.after(token,result);},
+        customElementBefore(...args){const ce=customElementsBridge.before(...args),mutation=mutationBridge.before(...args);return ce||mutation?{ce,mutation}:null;},
+        customElementAfter(token,result){mutationBridge.after(token.mutation);customElementsBridge.after(token.ce,result);},
         customElementScan(){customElementsBridge.upgradeTree(document);},
         historyEvent(oldURL,popstate){historyEvent(oldURL,popstate);},
         mediaChanged(){mediaBridge.changed();},

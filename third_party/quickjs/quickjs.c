@@ -7575,19 +7575,32 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
     const char *func_name_str;
     const char *str1;
     JSObject *p;
+    JSRuntime *rt = ctx->rt;
+    JSValue retained_error, saved_exception;
+    BOOL saved_uncatchable;
 
     if (!JS_IsObject(error_obj))
         return; /* protection in the out of memory case */
-    
+
+    /* Backtrace formatting is best effort. Its allocations may throw and
+       replace current_exception, which can be error_obj's only owner. Keep
+       the target alive and restore the original pending exception (including
+       its interrupt flag), rather than exposing a formatting OOM or putting
+       JS_EXCEPTION into an ordinary property. */
+    retained_error = JS_DupValue(ctx, error_obj);
+    saved_uncatchable = rt->current_exception_is_uncatchable;
+    saved_exception = JS_GetException(ctx);
     js_dbuf_init(ctx, &dbuf);
     if (filename) {
         dbuf_printf(&dbuf, "    at %s", filename);
         if (line_num != -1)
             dbuf_printf(&dbuf, ":%d:%d", line_num, col_num);
         dbuf_putc(&dbuf, '\n');
+        if (dbuf_error(&dbuf))
+            goto done;
         str = JS_NewString(ctx, filename);
         if (JS_IsException(str))
-            return;
+            goto done;
         /* Note: SpiderMonkey does that, could update once there is a standard */
         if (JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_fileName, str,
                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0 ||
@@ -7595,7 +7608,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0 ||
             JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_columnNumber, JS_NewInt32(ctx, col_num),
                                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0) {
-            return;
+            goto done;
         }
     }
     for(sf = ctx->rt->current_stack_frame; sf != NULL; sf = sf->prev_frame) {
@@ -7606,12 +7619,16 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
             continue;
         }
         func_name_str = get_prop_string(ctx, sf->cur_func, JS_ATOM_name);
+        if (JS_HasException(ctx))
+            goto done;
         if (!func_name_str || func_name_str[0] == '\0')
             str1 = "<anonymous>";
         else
             str1 = func_name_str;
         dbuf_printf(&dbuf, "    at %s", str1);
         JS_FreeCString(ctx, func_name_str);
+        if (dbuf_error(&dbuf))
+            goto done;
 
         p = JS_VALUE_GET_OBJ(sf->cur_func);
         if (js_class_has_bytecode(p->class_id)) {
@@ -7624,6 +7641,8 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
                 line_num1 = find_line_num(ctx, b,
                                           sf->cur_pc - b->byte_code_buf - 1, &col_num1);
                 atom_str = JS_AtomToCString(ctx, b->debug.filename);
+                if (!atom_str)
+                    goto done;
                 dbuf_printf(&dbuf, " (%s",
                             atom_str ? atom_str : "<null>");
                 JS_FreeCString(ctx, atom_str);
@@ -7635,15 +7654,23 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_obj,
             dbuf_printf(&dbuf, " (native)");
         }
         dbuf_putc(&dbuf, '\n');
+        if (dbuf_error(&dbuf))
+            goto done;
     }
     dbuf_putc(&dbuf, '\0');
     if (dbuf_error(&dbuf))
-        str = JS_NULL;
-    else
-        str = JS_NewString(ctx, (char *)dbuf.buf);
-    dbuf_free(&dbuf);
+        goto done;
+    str = JS_NewString(ctx, (char *)dbuf.buf);
+    if (JS_IsException(str))
+        goto done;
     JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, str,
                            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+ done:
+    dbuf_free(&dbuf);
+    JS_FreeValue(ctx, JS_GetException(ctx));
+    rt->current_exception = saved_exception;
+    rt->current_exception_is_uncatchable = saved_uncatchable;
+    JS_FreeValue(ctx, retained_error);
 }
 
 /* Note: it is important that no exception is returned by this function */

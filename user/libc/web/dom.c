@@ -95,6 +95,7 @@ bool doc_node_attr(web_doc *d, node_t *n, const char *name, const char *value) {
     size_t l = strlen(name);
     for (size_t i = 0; i < l; i++) low[i] = (char)lower((unsigned char)name[i]);
     low[l] = 0;
+    bool previously_selectable = doc_control_selection_supported(n);
     int found = -1;
     for (int i = 0; i < n->nattrs; i++) if (!strcmp(n->attrs[i].name, low)) { found = i; break; }
     if (found < 0 && !value) return true;
@@ -132,6 +133,11 @@ bool doc_node_attr(web_doc *d, node_t *n, const char *name, const char *value) {
     n->classes = temp.classes;
     n->nclasses = temp.nclasses;
     d->mem.trap = old;
+    if (n->tag == T_input && !strcmp(low, "type") && !previously_selectable && doc_control_selection_supported(n)) {
+        n->selection_start = n->selection_end = 0; n->selection_direction = 0;
+        n->selection_set = true;
+        doc_control_caret(d, n);
+    }
     if (n->control_ready && n->tag == T_input) {
         if (!strcmp(low, "value") && !n->value_dirty) {
             const char *v = value ? value : "";
@@ -254,12 +260,24 @@ bool doc_node_value(web_doc *d, node_t *n, const char *text, size_t len) {
                     d->mem.allocated > (32u << 20) - next - len - 1)) return false;
     char *value = malloc(len + 1);
     if (!value) return false;
-    if (len) memcpy(value, text, len);
-    value[len] = 0;
+    size_t used = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (n->tag == T_textarea && text[i] == '\r') {
+            value[used++] = '\n'; if (i + 1 < len && text[i + 1] == '\n') i++;
+        } else if (n->tag == T_input && (text[i] == '\r' || text[i] == '\n') &&
+                   (doc_control_selection_supported(n) || str_ieq(node_attr(n, "type") ? node_attr(n, "type") : "", "email"))) {
+            /* Single-line text input value sanitization. */
+        } else value[used++] = text[i];
+    }
+    value[used] = 0;
     free(n->value);
     n->value = value;
     n->value_capacity = len + 1;
     n->value_dirty = true;
+    uint32_t units = doc_utf16_length(value);
+    if (n->selection_start > units) n->selection_start = units;
+    if (n->selection_end > units) n->selection_end = units;
+    doc_control_caret(d, n);
     d->control_bytes = next + len + 1;
     if (d->live) d->mem.limit = (32u << 20) - d->control_bytes;
     d->dirty = d->need_style = true;

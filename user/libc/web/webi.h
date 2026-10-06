@@ -119,6 +119,11 @@ typedef struct node {
     size_t value_capacity;
     bool checked, selected_set;
     bool value_dirty, checked_dirty;
+    /* DOM endpoints are UTF-16 code units, not renderer UTF-8 byte offsets.
+       Keep even half-surrogate endpoints exact until native editing/rendering. */
+    uint32_t selection_start, selection_end;
+    uint8_t selection_direction; /* 0 none, 1 forward, 2 backward */
+    bool selection_set; /* explicit API/user range, or a previously focused control */
     int selected; /* select: index of the selected option */
     int image;    /* <img>: index into the document's images, or -1 */
     int image_request; /* latest selected resource; image may retain an available old request */
@@ -479,6 +484,13 @@ void doc_node_remove(web_doc *d, node_t *node);
 bool doc_node_text(web_doc *d, node_t *node, const char *text, size_t n);
 bool doc_node_html(web_doc *d, node_t *node, const char *html, size_t n);
 bool doc_node_value(web_doc *d, node_t *node, const char *text, size_t n);
+bool doc_control_selection_supported(const node_t *node);
+uint32_t doc_utf16_length(const char *text);
+uint32_t doc_byte_to_utf16(const char *text, size_t byte);
+size_t doc_utf16_to_byte(const char *text, uint32_t offset, bool round_up);
+void doc_control_caret(web_doc *d, node_t *node);
+void doc_control_selection(web_doc *d, node_t *node, uint32_t start, uint32_t end, uint8_t direction);
+bool doc_control_replace(web_doc *d, node_t *node, uint32_t start, uint32_t end, const char *text);
 void doc_control_init(web_doc *d, node_t *node);
 void doc_control_checked(web_doc *d, node_t *node, bool checked);
 node_t *doc_select_option(node_t *select, int index);
@@ -498,6 +510,7 @@ int64_t web_js_deadline(web_doc *d);
 bool web_js_running(web_doc *d);
 bool web_js_enabled(web_doc *d);
 bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *e);
+void web_js_selection_changed(web_doc *d, node_t *node);
 
 /* URL helpers (util.c) */
 bool url_resolve(const char *base, const char *rel, char *out, size_t n);

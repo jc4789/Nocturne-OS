@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/whatwg/encoding",
+  "commit": "a985b62a9b45c17da3e17a9f0a0b4e30c34c4a8a",
+  "files": [
+    {
+      "path": "index-jis0208.txt",
+      "url": "https://raw.githubusercontent.com/whatwg/encoding/a985b62a9b45c17da3e17a9f0a0b4e30c34c4a8a/index-jis0208.txt",
+      "bytes": 275768,
+      "sha256": "341dcde7e8b984e9c7bbf5ed75c8da7c6087d47083a1a2b3ed558bfd5bef9468"
+    },
+    {
+      "path": "LICENSE-WHATWG.txt",
+      "url": "https://raw.githubusercontent.com/whatwg/encoding/a985b62a9b45c17da3e17a9f0a0b4e30c34c4a8a/LICENSE",
+      "bytes": 16315,
+      "sha256": "85dc6f5ccb57a6fe8c33d158f9fc8fc7ee5655a5d3db2cdd131c6a3d0f48a864"
+    }
+  ]
+}

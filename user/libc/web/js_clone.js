@@ -10,7 +10,7 @@ const cloneData = (() => {
     const push=A.prototype.push,byteSet=U8.prototype.set;
     const has=(map,key)=>apply(mHas,map,[key]),get=(map,key)=>apply(mGet,map,[key]);
     const put=(map,key,value)=>apply(mSet,map,[key,value]),add=(array,value)=>apply(push,array,[value]);
-    const kinds=new M(),constructors=new M(),classID=host.classID,detach=host.detach;
+    const kinds=new M(),constructors=new M(),classID=host.classID,detach=host.detach,uncloneable=[];
     const register=(name,sample,ctor)=>{put(kinds,classID(sample),name);if(ctor)put(constructors,name,ctor);};
     register('Object',{});register('Array',[]);register('Date',new DateType());
     register('RegExp',/a/);register('Map',new M());register('Set',new S());
@@ -51,6 +51,10 @@ const cloneData = (() => {
         function visit(value) {
             if(typeof value==='symbol'||typeof value==='function')return fail();
             if(value===null||typeof value!=='object')return [0,value];
+            // JS-backed Web IDL objects share QuickJS's ordinary Object class
+            // ID. Their private brands reject them here, during this same walk,
+            // before ordinary properties/getters are read (no second traversal).
+            for(let i=0;i<uncloneable.length;i++)if(apply(uncloneable[i],undefined,[value]))return fail();
             if(has(seen,value))return [1,get(seen,value)];
             const kind=get(kinds,classID(value));if(!kind)return fail();
             const id=records.length,record=[kind];add(records,record);put(seen,value,id);
@@ -142,5 +146,8 @@ const cloneData = (() => {
         }
         return deserialize(serialize(value,transfers));
     };
-    return {serialize,deserialize};
+    return {serialize,deserialize,registerUncloneable(test){
+        if(typeof test!=='function')throw new TypeErr('Expected a private brand predicate');
+        add(uncloneable,test);
+    }};
 })();

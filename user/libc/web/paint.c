@@ -533,6 +533,11 @@ static void text_in(struct pctx *P, const style_t *st, float x, float y, float h
     wf_metrics(&f, &asc, &desc);
     draw_text(P, st, x, y + (h - (asc + desc)) / 2 + asc, s, (int)strlen(s), col);
 }
+static size_t password_offset(const char *text, size_t byte) {
+    size_t bullets = 0;
+    for (size_t i = 0; i < byte && text[i]; i++) if (((unsigned char)text[i] & 0xc0) != 0x80) bullets++;
+    return bullets * 3;
+}
 
 static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     /* x, y: content box on the canvas */
@@ -554,6 +559,9 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
         const char *t = node_attr(n, "type");
         bool pw = t && str_ieq(t, "password") && !placeholder;
         uint32_t col = placeholder ? RGB(117, 117, 117) : st->color;
+        size_t selection_start = !placeholder ? doc_utf16_to_byte(v, n->selection_start, false) : 0;
+        size_t selection_end = !placeholder ? doc_utf16_to_byte(v, n->selection_end, true) : 0;
+        bool selected = focused && !placeholder && n->selection_start != n->selection_end;
         float caret_x = x;
         if (b->atomic == AT_INPUT) {
             sbuf s = {0};
@@ -567,16 +575,25 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
             float caret_w = 0;
             if (focused && !placeholder) {
                 int cb = P->d->caret;
-                if (pw) {
-                    int k = 0;
-                    for (int i = 0; i < cb && v[i]; i++)
-                        if (((unsigned char)v[i] & 0xC0) != 0x80) k++;
-                    cb = k * 3;
-                }
+                if (pw) cb = (int)password_offset(v, (size_t)cb);
                 caret_w = wf_width(&f, txt, (size_t)cb);
             }
             float scroll = caret_w > w - 2 ? caret_w - w + 2 : 0;
+            float left = 0, right = 0;
+            if (selected) {
+                size_t start = pw ? password_offset(v, selection_start) : selection_start;
+                size_t end = pw ? password_offset(v, selection_end) : selection_end;
+                left = x - scroll + wf_width(&f, txt, start);
+                right = x - scroll + wf_width(&f, txt, end);
+                gfx_fill(c, (int)floorf(left), (int)y, (int)ceilf(right - left), (int)ceilf(h), RGB(0, 117, 255));
+            }
             text_in(P, st, x - scroll, y, h, txt, col);
+            if (selected) {
+                int cx0 = c->cx0, cy0 = c->cy0, cx1 = c->cx1, cy1 = c->cy1;
+                gfx_clip(c, (int)floorf(left), (int)y, (int)ceilf(right - left), (int)ceilf(h));
+                text_in(P, st, x - scroll, y, h, txt, RGB(255, 255, 255));
+                c->cx0 = cx0; c->cy0 = cy0; c->cx1 = cx1; c->cy1 = cy1;
+            }
             caret_x = x - scroll + caret_w;
             sb_free(&s);
         } else {
@@ -588,10 +605,24 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
             const char *p = v;
             int caret = focused ? P->d->caret : -1;
             float cx_ = x, cy_ = y;
-            while (*p || p == v) {
+            for (;;) {
                 const char *e = strchr(p, '\n');
                 size_t len = e ? (size_t)(e - p) : strlen(p);
+                size_t offset = (size_t)(p - v), start = selection_start > offset ? selection_start - offset : 0;
+                size_t end = selection_end > offset ? selection_end - offset : 0;
+                if (start > len) start = len;
+                if (end > len) end = len;
+                float left = x + wf_width(&ff, p, start), right = x + wf_width(&ff, p, end);
+                bool line_selected = selected && selection_start <= offset + len && selection_end > offset;
+                if (line_selected && e && selection_end > offset + len) right += wf_width(&ff, " ", 1);
+                if (line_selected) gfx_fill(c, (int)floorf(left), (int)ly, (int)ceilf(right - left), (int)ceilf(lh), RGB(0, 117, 255));
                 draw_text(P, st, x, ly + (lh - asc - desc) / 2 + asc, p, (int)len, col);
+                if (line_selected) {
+                    int cx0 = c->cx0, cy0 = c->cy0, cx1 = c->cx1, cy1 = c->cy1;
+                    gfx_clip(c, (int)floorf(left), (int)ly, (int)ceilf(right - left), (int)ceilf(lh));
+                    draw_text(P, st, x, ly + (lh - asc - desc) / 2 + asc, p, (int)len, RGB(255, 255, 255));
+                    c->cx0 = cx0; c->cy0 = cy0; c->cx1 = cx1; c->cy1 = cy1;
+                }
                 if (caret >= p - v && caret <= (int)(p - v + (long)len)) {
                     cx_ = x + wf_width(&ff, p, (size_t)(caret - (p - v)));
                     cy_ = ly;
@@ -600,9 +631,9 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
                 if (!e) break;
                 p = e + 1;
             }
-            if (focused) gfx_fill(c, (int)cx_, (int)cy_ + 2, 1, (int)lh - 4, st->color);
+            if (focused && !selected) gfx_fill(c, (int)cx_, (int)cy_ + 2, 1, (int)lh - 4, st->color);
         }
-        if (focused && b->atomic == AT_INPUT) gfx_fill(c, (int)caret_x, (int)y + 1, 1, (int)h - 2, st->color);
+        if (focused && !selected && b->atomic == AT_INPUT) gfx_fill(c, (int)caret_x, (int)y + 1, 1, (int)h - 2, st->color);
         c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
         break;
     }
