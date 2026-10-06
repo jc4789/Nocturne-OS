@@ -1,5 +1,6 @@
 /* Hyper-V integration services: heartbeat (so the host sees the guest is alive), shutdown (the
-   Shut Down / Restart buttons in Hyper-V Manager and Stop-VM) and time synchronisation. Each is a
+   Shut Down / Restart buttons in Hyper-V Manager and Stop-VM), time synchronisation and the
+   key-value pair exchange (how the host learns the guest's name, OS and IP address). Each is a
    VMBus channel speaking the "IC" message format: the host sends a request, the guest fills in
    the answer and sends the same message back. The first request on every channel negotiates the
    framework and message versions. */
@@ -7,15 +8,17 @@
 #include "arch/cpu.h"
 #include "dev/timer.h"
 #include "hv/vmbus.h"
+#include "net/net.h"
 #include "sys/sched.h"
 
 void power_off(void);
 void power_reboot(void);
 
-enum { IC_NEGOTIATE = 0, IC_HEARTBEAT = 1, IC_SHUTDOWN = 3, IC_TIMESYNC = 4 };
+enum { IC_NEGOTIATE = 0, IC_HEARTBEAT = 1, IC_KVP = 2, IC_SHUTDOWN = 3, IC_TIMESYNC = 4 };
 #define IC_FLAG_TRANSACTION 1
 #define IC_FLAG_RESPONSE    4
 #define IC_E_FAIL 0x80004005u
+#define IC_S_CONT 0x80070103u /* KVP: no more items in this pool */
 
 struct ic_version {
     uint16_t major, minor;
@@ -122,6 +125,132 @@ static void timesync(struct service *s, struct ic_header *h, uint8_t *body, uint
     }
 }
 
+/* ---- key-value pair exchange ----
+   The host keeps pools of string pairs. It reads the "auto" pool by enumerating it item by item
+   (what Hyper-V Manager shows on the Networking tab and Get-VM's details come from there), writes
+   its own pairs into the others, and asks for each adapter's addresses with GET_IP_INFO. Keys and
+   values travel as UTF-16. */
+enum { KVP_GET, KVP_SET, KVP_DELETE, KVP_ENUMERATE, KVP_GET_IP_INFO, KVP_SET_IP_INFO };
+enum { KVP_POOL_AUTO = 2 };
+#define KVP_REG_SZ 1
+
+struct kvp_value {
+    uint32_t type, key_size, value_size; /* sizes in bytes, with the terminating 0 */
+    uint16_t key[256];
+    uint16_t value[1024];
+} PACKED;
+
+struct kvp_ip {
+    uint8_t op, pool; /* no padding in this one */
+    uint16_t adapter_id[128];
+    uint8_t family, dhcp;
+    uint16_t ip[1024], mask[1024], gateway[512], dns[1024];
+} PACKED;
+
+/* ASCII into a UTF-16 field of n units; returns the size in bytes, with the 0 */
+static uint32_t to_utf16(uint16_t *out, size_t n, const char *s) {
+    size_t i = 0;
+    for (; s[i] && i + 1 < n; i++) out[i] = (uint8_t)s[i];
+    out[i] = 0;
+    return (uint32_t)(i + 1) * 2;
+}
+
+static void ipstr(char *buf, size_t n, uint32_t ip) {
+    ksnprintf(buf, n, "%u.%u.%u.%u", ip >> 24, ip >> 16 & 0xFF, ip >> 8 & 0xFF, ip & 0xFF);
+}
+
+/* the auto pool, in the order Linux guests report it */
+static bool auto_item(uint32_t index, const char **key, char *value, size_t n) {
+    static const char *const keys[] = {"FullyQualifiedDomainName", "IntegrationServicesVersion",
+                                       "NetworkAddressIPv4", "NetworkAddressIPv6", "OSBuildNumber", "OSName",
+                                       "OSMajorVersion", "OSMinorVersion", "OSVersion", "ProcessorArchitecture"};
+    if (index >= ARRAY_SIZE(keys)) return false;
+    *key = keys[index];
+    uint8_t mac[6];
+    uint32_t ip, mask, gw, dns;
+    value[0] = 0;
+    switch (index) {
+    case 0: strlcpy(value, "nocturne", n); break;
+    case 1: strlcpy(value, "3.1", n); break;
+    case 2:
+        if (net_config(mac, &ip, &mask, &gw, &dns)) ipstr(value, n, ip);
+        break;
+    case 3: break;
+    case 4: strlcpy(value, OS_VERSION, n); break;
+    case 5: strlcpy(value, OS_NAME, n); break;
+    case 6: strlcpy(value, "0", n); break;
+    case 7: strlcpy(value, "9", n); break;
+    case 8: strlcpy(value, "0.9", n); break;
+    case 9: strlcpy(value, "x86_64", n); break;
+    }
+    return true;
+}
+
+/* the host names an adapter by its MAC address; compare the hex digits only */
+static bool same_mac(const uint16_t *id, const uint8_t mac[6]) {
+    static const char hex[] = "0123456789abcdef";
+    int k = 0;
+    for (int i = 0; i < 128 && id[i] && k < 12; i++) {
+        uint16_t c = id[i];
+        if (c >= 'A' && c <= 'F') c += 'a' - 'A';
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) continue;
+        if (c != (uint8_t)hex[k & 1 ? mac[k / 2] & 0xF : mac[k / 2] >> 4]) return false;
+        k++;
+    }
+    return k == 12;
+}
+
+static void get_ip_info(struct ic_header *h, struct kvp_ip *m) {
+    uint8_t mac[6];
+    uint32_t ip, mask, gw, dns;
+    if (!net_config(mac, &ip, &mask, &gw, &dns) || !same_mac(m->adapter_id, mac)) {
+        h->status = IC_E_FAIL;
+        return;
+    }
+    char s[16];
+    m->family = 1; /* IPv4 */
+    m->dhcp = 1;
+    ipstr(s, sizeof s, ip);
+    to_utf16(m->ip, ARRAY_SIZE(m->ip), s);
+    ipstr(s, sizeof s, mask);
+    to_utf16(m->mask, ARRAY_SIZE(m->mask), s);
+    ipstr(s, sizeof s, gw);
+    to_utf16(m->gateway, ARRAY_SIZE(m->gateway), s);
+    ipstr(s, sizeof s, dns);
+    to_utf16(m->dns, ARRAY_SIZE(m->dns), s);
+}
+
+static void kvp(struct service *s, struct ic_header *h, uint8_t *body, uint32_t len) {
+    (void)s;
+    if (h->type != IC_KVP || len < 4) return;
+    uint8_t op = body[0], pool = body[1];
+    if (op == KVP_GET_IP_INFO) {
+        if (len < sizeof(struct kvp_ip)) h->status = IC_E_FAIL;
+        else get_ip_info(h, (struct kvp_ip *)body);
+        return;
+    }
+    if (op == KVP_ENUMERATE) {
+        if (len < 4 + 4 + sizeof(struct kvp_value)) {
+            h->status = IC_E_FAIL;
+            return;
+        }
+        uint32_t index = *(uint32_t *)(body + 4);
+        struct kvp_value *v = (struct kvp_value *)(body + 8);
+        const char *key;
+        char value[64];
+        if (pool != KVP_POOL_AUTO || !auto_item(index, &key, value, sizeof value)) {
+            h->status = IC_S_CONT; /* the end of the pool */
+            return;
+        }
+        v->type = KVP_REG_SZ;
+        v->key_size = to_utf16(v->key, ARRAY_SIZE(v->key), key);
+        v->value_size = to_utf16(v->value, ARRAY_SIZE(v->value), value);
+        return;
+    }
+    if (op == KVP_GET) h->status = IC_E_FAIL; /* we keep none of the host's pairs */
+    /* SET, DELETE, SET_IP_INFO: accepted and forgotten */
+}
+
 static struct service services[] = {
     {.type = GUID_INIT(0x57164f39, 0x9115, 0x4e78, 0xab, 0x55, 0x38, 0x2f, 0x3b, 0xd5, 0x42, 0x2d),
      .name = "heartbeat", .versions = {0x30000, 0x10000}, .handle = heartbeat},
@@ -129,6 +258,8 @@ static struct service services[] = {
      .name = "shutdown", .versions = {0x30001, 0x30000, 0x10000}, .handle = shutdown},
     {.type = GUID_INIT(0x9527e630, 0xd0ae, 0x497b, 0xad, 0xce, 0xe8, 0x0a, 0xb0, 0x17, 0x5c, 0xaf),
      .name = "time sync", .versions = {0x40000, 0x30000, 0x10000}, .handle = timesync},
+    {.type = GUID_INIT(0xa9a0f4e7, 0x5a45, 0x4d96, 0xb8, 0x27, 0x8a, 0x84, 0x1e, 0x8c, 0x03, 0xe6),
+     .name = "key-value exchange", .versions = {0x40000, 0x30000, 0x10000}, .handle = kvp},
 };
 
 static bool pick(const struct ic_version *offered, int n, const uint32_t *ours, int nours, struct ic_version *out) {
@@ -161,7 +292,7 @@ static void negotiate(struct service *s, struct ic_header *h, uint8_t *body, uin
 }
 
 static void util_callback(struct vmbus_channel *ch) {
-    static uint8_t pkt[4096]; /* interrupt context: callbacks do not nest */
+    static uint8_t pkt[16384]; /* interrupt context: callbacks do not nest. KVP needs ~7.5 KiB */
     struct service *s = ch->priv;
     int n;
     while ((n = vmbus_recv(ch, pkt, sizeof pkt)) != 0) {
@@ -184,10 +315,10 @@ static void util_callback(struct vmbus_channel *ch) {
 
 void hv_util_init(void) {
     if (!vmbus_ready()) return;
-    char names[64] = "";
+    char names[96] = "";
     for (size_t i = 0; i < ARRAY_SIZE(services); i++) {
         struct vmbus_channel *ch = vmbus_find(&services[i].type, 0);
-        if (!ch || vmbus_open(ch, 16 * 1024, 16 * 1024, util_callback, &services[i])) continue;
+        if (!ch || vmbus_open(ch, 32 * 1024, 32 * 1024, util_callback, &services[i])) continue;
         if (names[0]) strlcat(names, ", ", sizeof names);
         strlcat(names, services[i].name, sizeof names);
     }

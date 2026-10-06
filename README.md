@@ -40,7 +40,7 @@ layout) are parsed, laid out and painted by an engine written for Nocturne. It h
 - Drivers: PS/2 keyboard and wheel mouse, framebuffer, serial, CMOS clock, PCI enumeration, and ACPI power-off and reboot.
 - Hyper-V: VMBus and its synthetic devices, so Nocturne runs in a Generation 2 VM. See [Running it in Hyper-V](#running-it-in-hyper-v).
   - Keyboard, absolute mouse, SCSI disks and network adapter.
-  - Heartbeat, graceful shutdown and restart from Hyper-V Manager, and the host's clock (time sync).
+  - Heartbeat, graceful shutdown and restart from Hyper-V Manager, the host's clock (time sync), and the key-value exchange, so Hyper-V Manager shows the VM's IP address and OS.
   - Hyper-V sockets, and an RDP server on them for VMConnect's **Enhanced Session**: the desktop takes the size of the VMConnect window.
 - Networking: drivers for the Intel e1000 (QEMU, VirtualBox, VMware), the DEC 21140 "tulip" (Hyper-V's legacy network adapter) and Hyper-V's synthetic adapter, and a small TCP/IP stack: Ethernet, ARP, IPv4, ICMP, UDP, a DHCP client, a DNS resolver and a TCP client.
   - TCP keeps out-of-order segments and reassembles them, and does NewReno congestion control (slow start, fast retransmit and fast recovery) with a retransmission timeout taken from the measured round-trip time.
@@ -319,7 +319,7 @@ What Nocturne does not have, so nobody is surprised:
 - **The window manager runs in the kernel.**
 - **Slow, simple disks.** The ATA driver uses PIO with polling (no DMA). FAT32 has no journal, so power loss during a write can leave the volume inconsistent. Names may be up to 255 characters.
 - **The networking limits are listed above.**
-- **A bare Enhanced Session.** It carries the picture, keyboard and mouse only: no clipboard, sound, drive or printer sharing, and no resizing while connected (reconnect to change the size). Hyper-V Manager shows no IP address, because the key-value exchange service is not implemented. The RDP server uses no encryption; it is reachable only through a Hyper-V socket on the host, never over the network.
+- **A bare Enhanced Session.** It carries the picture, keyboard and mouse only: no clipboard, sound, drive or printer sharing, and no resizing while connected (reconnect to change the size). The RDP server uses no encryption; it is reachable only through a Hyper-V socket on the host, never over the network.
 - **The AI agent runs the model's commands without asking.** Anything it does stays inside the VM, but it can delete files on `/data`.
 - **A web browser without JavaScript or cookies.** See [its limits](#the-web-browser).
 - **Only checked in virtual machines.** It has been tested in QEMU and Hyper-V, never on real hardware.

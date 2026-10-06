@@ -1346,6 +1346,16 @@ void net_process_exit(int pid) {
         if (tcbs[i].state != T_FREE && tcbs[i].user_open && tcbs[i].pid == pid) tcp_close(&tcbs[i]);
 }
 
+bool net_config(uint8_t mac[6], uint32_t *ip, uint32_t *mask, uint32_t *gw, uint32_t *dns) {
+    if (!nif) return false;
+    memcpy(mac, nif->mac, 6);
+    *ip = my_ip;
+    *mask = my_mask;
+    *gw = my_gw;
+    *dns = my_dns;
+    return configured;
+}
+
 int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
     switch (num) {
     case SYS_NET_INFO: {
