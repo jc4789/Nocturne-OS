@@ -73,7 +73,8 @@ net_stream *ns_open(const char *host, uint16_t port, bool tls, int timeout_ms, c
         snprintf(err, errlen, "%s: %s", host, errno == ENOENT ? "host not found" : strerror(errno));
         return NULL;
     }
-    int sock = tcp_connect(ip, port, timeout_ms > 0 ? timeout_ms : 15000);
+    /* the timeout is for reads (an LLM may think for minutes); connecting should be quick */
+    int sock = tcp_connect(ip, port, timeout_ms > 0 && timeout_ms < 20000 ? timeout_ms : 20000);
     if (sock < 0) {
         snprintf(err, errlen, "connect to %s:%d: %s", host, port, strerror(errno));
         return NULL;

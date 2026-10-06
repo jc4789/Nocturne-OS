@@ -11,13 +11,13 @@
 #define MAXE 512
 
 struct entry {
-    char name[64];
+    char name[256];
     uint32_t type;
     uint64_t size;
 };
 
 static window_t *w;
-static char cwd[256] = "/home";
+static char cwd[512] = "/home";
 static struct entry ents[MAXE];
 static int nent, sel = -1, scroll, hot_btn = -1;
 static char status[128];
@@ -168,7 +168,7 @@ static void draw(void) {
 
 static void open_entry(int i) {
     if (i < 0 || i >= nent) return;
-    char path[320];
+    char path[800];
     join(path, sizeof path, cwd, ents[i].name);
     if (ents[i].type == N_FT_DIR) {
         go(path);
@@ -183,7 +183,7 @@ static void open_entry(int i) {
 }
 
 static void make_new(bool dir) {
-    char path[320], name[64];
+    char path[800], name[256];
     for (int n = 1; n < 100; n++) {
         if (n == 1) snprintf(name, sizeof name, dir ? "New folder" : "untitled.txt");
         else snprintf(name, sizeof name, dir ? "New folder %d" : "untitled%d.txt", n);
@@ -205,7 +205,7 @@ static void make_new(bool dir) {
 
 static void delete_sel(void) {
     if (sel < 0) return;
-    char path[320], name[64];
+    char path[800], name[256];
     strlcpy(name, ents[sel].name, sizeof name);
     join(path, sizeof path, cwd, name);
     int r = ents[sel].type == N_FT_DIR ? rmdir(path) : unlink(path);

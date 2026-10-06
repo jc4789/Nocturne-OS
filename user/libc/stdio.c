@@ -333,76 +333,121 @@ static int fmt_uint(char *buf, unsigned long long v, int base, bool upper) {
     return n;
 }
 
-/* fixed-point formatting of a double with `prec` decimals; returns length */
-static int fmt_fixed(char *buf, int cap, double v, int prec) {
+/* ---- exact double -> decimal conversion ----
+   A double is m * 2^e with integer m, so its decimal expansion is finite. We compute all of its
+   digits with base-1e9 big integers (as musl does) and round them half-to-even, which gives the
+   same output as glibc: printf("%.0f", 2.5) is "2", and "%.20f" prints the true digits. */
+#define DEC_MAX 800 /* 2^-1074 has 751 significant digits; 2^1024 has 309 */
+
+struct dec {
+    char d[DEC_MAX]; /* digits, d[0] != '0' unless the value is zero */
+    int n;           /* number of digits (0 = zero) */
+    int pt;          /* value = 0.d[0]d[1]... * 10^pt */
+};
+
+static void dec_from_double(double v, struct dec *x) {
+    union { double d; uint64_t u; } bits = {v};
+    int be = (int)(bits.u >> 52 & 0x7FF);
+    uint64_t m = bits.u & ((1ULL << 52) - 1);
+    int e;
+    if (be) m |= 1ULL << 52, e = be - 1075;
+    else e = -1074;
+    x->n = 0;
+    x->pt = 0;
+    if (!m) return;
+    uint32_t big[96]; /* little-endian base 1e9 */
+    int nl = 0;
+    while (m) big[nl++] = (uint32_t)(m % 1000000000), m /= 1000000000;
+    /* multiply by 2^e, or for e < 0 by 5^-e and move the decimal point -e places left */
+    int k = e > 0 ? e : -e;
+    while (k > 0) {
+        int step = e > 0 ? (k < 29 ? k : 29) : (k < 13 ? k : 13);
+        uint64_t f = 1;
+        for (int i = 0; i < step; i++) f *= e > 0 ? 2 : 5;
+        uint64_t carry = 0;
+        for (int i = 0; i < nl; i++) {
+            uint64_t t = big[i] * f + carry;
+            big[i] = (uint32_t)(t % 1000000000);
+            carry = t / 1000000000;
+        }
+        while (carry) big[nl++] = (uint32_t)(carry % 1000000000), carry /= 1000000000;
+        k -= step;
+    }
     int n = 0;
-    if (prec > 17) prec = 17;
-    double scale = 1;
-    for (int i = 0; i < prec; i++) scale *= 10;
-    if (v >= 1e18) {
-        /* huge: print digits with exponent-free approximation */
-        int e = 0;
-        while (v >= 1e18) {
-            v /= 10;
-            e++;
+    char tmp[12];
+    int tl = 0;
+    for (uint32_t t = big[nl - 1]; t; t /= 10) tmp[tl++] = (char)('0' + t % 10);
+    while (tl) x->d[n++] = tmp[--tl];
+    for (int i = nl - 2; i >= 0; i--) {
+        for (int j = 8; j >= 0; j--) {
+            uint32_t t = big[i];
+            for (int q = 0; q < j; q++) t /= 10;
+            x->d[n++] = (char)('0' + t % 10);
         }
-        unsigned long long ip = (unsigned long long)v;
-        n = fmt_uint(buf, ip, 10, false);
-        while (e-- && n < cap - 1) buf[n++] = '0';
-        if (prec) {
-            buf[n++] = '.';
-            for (int i = 0; i < prec && n < cap - 1; i++) buf[n++] = '0';
+    }
+    x->pt = e < 0 ? n + e : n;
+    while (n > 0 && x->d[n - 1] == '0') n--;
+    x->n = n;
+}
+
+/* keep the first `keep` digits (keep may be <= 0 or >= n), rounding half to even */
+static void dec_round(struct dec *x, int keep) {
+    if (keep >= x->n) return;
+    if (keep < 0) {
+        x->n = 0;
+        return;
+    }
+    int first = x->d[keep] - '0';
+    bool up;
+    if (first != 5) up = first > 5;
+    else if (keep + 1 < x->n) up = true; /* more nonzero digits follow (trailing zeros are stripped) */
+    else up = keep > 0 && (x->d[keep - 1] - '0') % 2; /* exactly half: to even */
+    x->n = keep;
+    if (up) {
+        int i = keep - 1;
+        while (i >= 0 && x->d[i] == '9') i--;
+        if (i < 0) {
+            x->d[0] = '1';
+            x->n = 1;
+            x->pt++;
+        } else {
+            x->d[i]++;
+            x->n = i + 1;
         }
-        return n;
     }
-    unsigned long long ip = (unsigned long long)v;
-    double frac = v - (double)ip;
-    unsigned long long fp = (unsigned long long)(frac * scale + 0.5);
-    if (prec == 0 && frac >= 0.5) {
-        ip++;
-        fp = 0;
-    }
-    if ((double)fp >= scale && prec > 0) {
-        ip++;
-        fp -= (unsigned long long)scale;
-    }
-    n = fmt_uint(buf, ip, 10, false);
+    while (x->n > 0 && x->d[x->n - 1] == '0') x->n--;
+}
+
+static char dec_digit(const struct dec *x, int i) { return i >= 0 && i < x->n ? x->d[i] : '0'; }
+
+/* %f: `prec` decimals; returns length */
+static int fmt_fixed(char *buf, struct dec *x, int prec) {
+    dec_round(x, x->pt + prec);
+    int n = 0;
+    if (x->n == 0 || x->pt <= 0) buf[n++] = '0';
+    else
+        for (int i = 0; i < x->pt; i++) buf[n++] = dec_digit(x, i);
     if (prec) {
         buf[n++] = '.';
-        char tmp[24];
-        int fl = fmt_uint(tmp, fp, 10, false);
-        for (int i = fl; i < prec; i++) buf[n++] = '0';
-        memcpy(buf + n, tmp, fl);
-        n += fl;
+        for (int i = 0; i < prec; i++) buf[n++] = x->n ? dec_digit(x, x->pt + i) : '0';
     }
     return n;
 }
 
-static int fmt_exp(char *buf, int cap, double v, int prec, bool upper) {
-    int e = 0;
-    if (v != 0) {
-        while (v >= 10) {
-            v /= 10;
-            e++;
-        }
-        while (v < 1) {
-            v *= 10;
-            e--;
-        }
+/* %e: one digit, `prec` decimals, exponent */
+static int fmt_exp(char *buf, struct dec *x, int prec, bool upper) {
+    dec_round(x, prec + 1);
+    int e = x->n ? x->pt - 1 : 0, n = 0;
+    buf[n++] = dec_digit(x, 0);
+    if (prec) {
+        buf[n++] = '.';
+        for (int i = 1; i <= prec; i++) buf[n++] = dec_digit(x, i);
     }
-    /* rounding may push us to 10.0 */
-    double r = 0.5;
-    for (int i = 0; i < prec; i++) r /= 10;
-    if (v + r >= 10) {
-        v /= 10;
-        e++;
-    }
-    int n = fmt_fixed(buf, cap, v, prec);
     buf[n++] = upper ? 'E' : 'e';
     buf[n++] = e < 0 ? '-' : '+';
     if (e < 0) e = -e;
     if (e < 10) buf[n++] = '0';
-    n += fmt_uint(buf + n, e, 10, false);
+    n += fmt_uint(buf + n, (unsigned)e, 10, false);
     return n;
 }
 
@@ -452,7 +497,7 @@ static int core(out_t *o, const char *fmt, va_list ap) {
             else if (*p == 'h') {}
             else break;
         }
-        char buf[352];
+        char buf[720]; /* %f of 1e308 with 340 decimals */
         char prefix[4] = {0};
         int n = 0;
         switch (*p) {
@@ -538,25 +583,15 @@ static int core(out_t *o, const char *fmt, va_list ap) {
                 break;
             }
             char c = *p;
+            if (prec > 340) prec = 340;
+            struct dec x;
+            dec_from_double(v, &x);
             if (c == 'g' || c == 'G') {
                 if (prec == 0) prec = 1;
-                int e = 0;
-                double t = v;
-                if (t != 0) {
-                    while (t >= 10) {
-                        t /= 10;
-                        e++;
-                    }
-                    while (t < 1) {
-                        t *= 10;
-                        e--;
-                    }
-                }
-                if (e < -4 || e >= prec) {
-                    n = fmt_exp(buf, sizeof buf, v, prec - 1, c == 'G');
-                } else {
-                    n = fmt_fixed(buf, sizeof buf, v, prec - 1 - e);
-                }
+                dec_round(&x, prec); /* P significant digits decide the style */
+                int e = x.n ? x.pt - 1 : 0;
+                if (e < -4 || e >= prec) n = fmt_exp(buf, &x, prec - 1, c == 'G');
+                else n = fmt_fixed(buf, &x, prec - 1 - e);
                 if (!alt) {
                     /* strip trailing zeros in the fraction */
                     char *dot = memchr(buf, '.', n);
@@ -571,9 +606,9 @@ static int core(out_t *o, const char *fmt, va_list ap) {
                     }
                 }
             } else if (c == 'e' || c == 'E') {
-                n = fmt_exp(buf, sizeof buf, v, prec, c == 'E');
+                n = fmt_exp(buf, &x, prec, c == 'E');
             } else {
-                n = fmt_fixed(buf, sizeof buf, v, prec);
+                n = fmt_fixed(buf, &x, prec);
             }
             emit_field(o, prefix, buf, n, width, left, zero);
             break;

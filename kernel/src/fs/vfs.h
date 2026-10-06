@@ -14,8 +14,8 @@ enum { VT_FILE = 1, VT_DIR = 2, VT_CHAR = 3, VT_PIPE = 4, VT_WINDOW = 5 };
 #define O_NONBLOCK  0x800
 #define O_DIRECTORY 0x10000
 
-#define NAME_MAX_LEN 64
-#define PATH_MAX_LEN 256
+#define NAME_MAX_LEN 256 /* FAT32 long names go up to 255 */
+#define PATH_MAX_LEN 512
 
 struct dirent {
     char name[NAME_MAX_LEN];

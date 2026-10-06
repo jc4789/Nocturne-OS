@@ -43,37 +43,44 @@ double atan(double x) { return atan2(x, 1.0); }
 double asin(double x) { return atan2(x, sqrt((1 - x) * (1 + x))); }
 double acos(double x) { return atan2(sqrt((1 - x) * (1 + x)), x); }
 
-double log2(double x) {
-    double r;
-    __asm__("fld1; fxch; fyl2x" : "=t"(r) : "0"(x));
+/* log, exp and pow use the x87 unit in 80-bit precision, one instruction per helper (multi-
+   instruction x87 asm is easy to get wrong: AT&T syntax swaps the operands of fsub/fdiv). */
+static long double x87_log2(long double x) {
+    long double r;
+    __asm__("fld1; fxch; fyl2x" : "=t"(r) : "0"(x)); /* 1 * log2(x) */
+    return r;
+}
+static long double x87_rint(long double x) {
+    long double r;
+    __asm__("frndint" : "=t"(r) : "0"(x));
+    return r;
+}
+static long double x87_f2xm1(long double x) { /* 2^x - 1 for |x| <= 1 */
+    long double r;
+    __asm__("f2xm1" : "=t"(r) : "0"(x));
+    return r;
+}
+static long double x87_scale(long double x, long double n) { /* x * 2^n */
+    long double r;
+    __asm__("fscale" : "=t"(r) : "0"(x), "u"(n));
     return r;
 }
 
-double log(double x) { return log2(x) * 0.69314718055994530942; }
-double log10(double x) { return log2(x) * 0.30102999566398119521; }
-
-static double exp2_(double x) {
-    /* 2^x = 2^int * 2^frac */
-    double r;
-    __asm__("fld %%st(0)\n\t"
-            "frndint\n\t"
-            "fsub %%st(0), %%st(1)\n\t"
-            "fxch\n\t"
-            "f2xm1\n\t"
-            "fld1\n\t"
-            "faddp\n\t"
-            "fscale\n\t"
-            "fstp %%st(1)"
-            : "=t"(r)
-            : "0"(x));
-    return r;
+static long double exp2l_(long double t) {
+    if (t != t) return t;
+    if (t > 20000) return INFINITY;
+    if (t < -20000) return 0;
+    long double n = x87_rint(t);
+    return x87_scale(x87_f2xm1(t - n) + 1, n);
 }
 
-double exp(double x) {
-    if (x > 709) return INFINITY;
-    if (x < -745) return 0;
-    return exp2_(x * 1.44269504088896340736);
-}
+#define LN2L  0.693147180559945309417232121458176568L
+#define LOG2EL 1.442695040888963407359924681001892137L
+
+double log2(double x) { return (double)x87_log2(x); }
+double log(double x) { return (double)(x87_log2(x) * LN2L); }
+double log10(double x) { return (double)(x87_log2(x) * 0.301029995663981195213738894724493027L); }
+double exp(double x) { return (double)exp2l_((long double)x * LOG2EL); }
 
 double floor(double x) {
     if (!(fabs(x) < 4503599627370496.0)) return x;
@@ -109,12 +116,13 @@ double pow(double x, double y) {
         }
         return neg ? 1 / r : r;
     }
+    if (x == 1 || y != y || x != x) return x == 1 ? 1 : NAN;
     if (x < 0) {
         if (y != floor(y)) return NAN;
-        double r = exp2_(y * log2(-x));
-        return ((int64_t)y & 1) ? -r : r;
+        double r = (double)exp2l_((long double)y * x87_log2(-x));
+        return fmod(y, 2) != 0 ? -r : r; /* odd integer power of a negative number */
     }
-    return exp2_(y * log2(x));
+    return (double)exp2l_((long double)y * x87_log2(x));
 }
 
 double fmod(double x, double y) {
@@ -214,7 +222,7 @@ double copysign(double x, double y) {
 double fmin(double a, double b) { return isnan(a) ? b : isnan(b) ? a : a < b ? a : b; }
 double fmax(double a, double b) { return isnan(a) ? b : isnan(b) ? a : a > b ? a : b; }
 long lround(double x) { return (long)round(x); }
-double exp2(double x) { return pow(2.0, x); }
+double exp2(double x) { return (double)exp2l_(x); }
 double cbrt(double x) { return x < 0 ? -pow(-x, 1.0 / 3) : pow(x, 1.0 / 3); }
 float ceilf(float x) { return (float)ceil(x); }
 float roundf(float x) { return (float)round(x); }

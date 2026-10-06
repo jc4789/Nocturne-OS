@@ -58,7 +58,7 @@ static void complete(char *buf, int *len, int *cur) {
     }
     int fd = open(dir, O_RDONLY | O_DIRECTORY);
     if (fd < 0) return;
-    char match[64] = {0};
+    char match[256] = {0};
     int nmatch = 0;
     bool match_dir = false;
     char list[1024] = {0};
@@ -327,7 +327,7 @@ static int expand_glob(const char *pat, char **argv, int argc, int max) {
         for (int i = 0; readdir(fd, i, &d) > 0 && argc < max; i++) {
             if (d.name[0] == '.' && file[0] != '.') continue;
             if (!match(file, d.name)) continue;
-            char full[320];
+            char full[768];
             snprintf(full, sizeof full, "%s%s", prefix, d.name);
             argv[argc++] = strdup(full);
         }
@@ -480,8 +480,47 @@ static void free_cmds(struct cmd *cmds, int n) {
         for (int j = 0; j < cmds[i].argc; j++) free(cmds[i].argv[j]);
 }
 
-static int execute(const char *line) {
+/* positional parameters of a script or "sh -c": $0..$9, $#, $@ and $* */
+static int pargc = 1;
+static char **pargv = (char *[]){"sh", NULL};
+
+/* Substitute positional parameters before tokenizing (not inside single quotes; \$ stays $).
+   Unquoted values are split into words by the tokenizer, as in POSIX sh. */
+static const char *expand_params(const char *line, char *out, size_t n) {
+    if (!strchr(line, '$')) return line;
+    size_t o = 0;
+    bool sq = false, dq = false;
+    for (const char *s = line; *s && o + 1 < n; s++) {
+        if (*s == '\\' && !sq && s[1]) {
+            out[o++] = *s++;
+            if (o + 1 < n) out[o++] = *s;
+            continue;
+        }
+        if (*s == '\'' && !dq) sq = !sq;
+        else if (*s == '"' && !sq) dq = !dq;
+        if (*s != '$' || sq || !(isdigit((unsigned char)s[1]) || s[1] == '#' || s[1] == '@' || s[1] == '*')) {
+            out[o++] = *s;
+            continue;
+        }
+        s++;
+        if (isdigit((unsigned char)*s)) {
+            int k = *s - '0';
+            if (k < pargc) o += (size_t)snprintf(out + o, n - o, "%s", pargv[k]);
+        } else if (*s == '#') {
+            o += (size_t)snprintf(out + o, n - o, "%d", pargc - 1);
+        } else {
+            for (int k = 1; k < pargc; k++) o += (size_t)snprintf(out + o, n - o, "%s%s", k > 1 ? " " : "", pargv[k]);
+        }
+        if (o >= n) o = n - 1;
+    }
+    out[o] = 0;
+    return out;
+}
+
+static int execute(const char *raw) {
     static struct token toks[256];
+    static char expanded[MAX_LINE];
+    const char *line = expand_params(raw, expanded, sizeof expanded);
     int nt = tokenize(line, toks, 256);
     int pos = 0;
     int status = last_status;
@@ -565,8 +604,15 @@ static int run_script(const char *path) {
 }
 
 int main(int argc, char **argv) {
-    if (argc > 2 && !strcmp(argv[1], "-c")) return execute(argv[2]);
-    if (argc > 1) return run_script(argv[1]);
+    if (argc > 2 && !strcmp(argv[1], "-c")) {
+        /* sh -c CMD [NAME [ARGS...]]: NAME becomes $0 */
+        if (argc > 3) pargc = argc - 3, pargv = argv + 3;
+        return execute(argv[2]);
+    }
+    if (argc > 1) {
+        pargc = argc - 1, pargv = argv + 1;
+        return run_script(argv[1]);
+    }
     interactive = true;
     setvbuf(stdout, NULL, _IONBF, 0);
     struct n_stat st;

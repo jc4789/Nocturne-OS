@@ -3,6 +3,21 @@
 #include <string.h>
 #include "nocturne.h"
 
+/* Test disks (scripts/test.py) carry /data/tests/autorun.sh: run it with its output on the serial
+   port, then power off. Ordinary data disks don't have it. */
+static void autorun(void) {
+    struct n_stat st;
+    if (stat("/data/tests/autorun.sh", &st) < 0) return;
+    int nul = open("/dev/null", O_RDONLY), log = open("/dev/kmsg", O_WRONLY);
+    int fdmap[3] = {nul, log, log};
+    char *argv[] = {"sh", "/data/tests/autorun.sh", NULL};
+    int pid = spawn("/bin/sh", argv, fdmap, 0);
+    close(nul);
+    close(log);
+    if (pid >= 0) waitpid(pid, NULL, 0);
+    poweroff();
+}
+
 int main(int argc, char **argv) {
     printf("\n\x1b[1;35m*\x1b[0m Welcome to \x1b[1mNocturne " "\x1b[0m- a small operating system for quiet nights.\n");
     if (gui_available()) {
@@ -12,8 +27,10 @@ int main(int argc, char **argv) {
         char *targv[] = {"term", NULL};
         spawn("/bin/term", targv, fdmap, SPAWN_DETACH);
         close(nul);
+        autorun();
         for (;;) msleep(60000);
     }
+    autorun();
     /* text session: keep a shell alive on the console */
     for (;;) {
         char *sargv[] = {"sh", NULL};

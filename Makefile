@@ -125,7 +125,7 @@ $(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(TCCRT_OBJ) scripts/mksysroot.sh 
 	@touch $@
 
 # ---------------------------------------------------------------- images
-.PHONY: all kernel user image run clean
+.PHONY: all kernel user image run clean test test-quick test-full
 .SECONDARY:
 all: image
 
@@ -150,6 +150,14 @@ $(BUILD)/data-blank.vhdx: scripts/mkdata.sh
 run: image
 	@qemu-system-x86_64 -M pc -m 512M -drive file=$(BUILD)/nocturne.img,format=raw,if=ide,index=0 \
 		-drive file=$(BUILD)/data.img,format=raw,if=ide,index=1 -serial stdio -vga std
+
+# the in-OS test suite on a scratch data disk (see scripts/test.py; your data.img is not touched)
+test: image
+	@$(PY) scripts/test.py
+test-quick: image
+	@$(PY) scripts/test.py --quick
+test-full: image
+	@$(PY) scripts/test.py --full
 
 # keeps build/data.img: it is the persistent /data disk (your files, and the agent's key)
 clean:

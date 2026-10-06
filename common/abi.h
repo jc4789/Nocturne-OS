@@ -28,7 +28,7 @@ enum {
 #define N_FT_WINDOW 5
 
 struct n_dirent {
-    char name[64];
+    char name[256];
     uint32_t type;
     uint32_t reserved;
     uint64_t size;
