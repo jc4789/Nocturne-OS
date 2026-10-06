@@ -1,4 +1,4 @@
-/* audiotest: /dev/audio and /dev/volume, beep and play. Prints "audiotest: N failed".
+/* audiotest: /dev/audio and /dev/volume, beep, play and the Sound Player. Prints "audiotest: N failed".
    The sound goes to the card; scripts/test.py records it (QEMU's wav backend) and checks that
    these tones came out, in this order, with silence between them:
      1 s    1000 Hz left, 1500 Hz right   (written here, straight to /dev/audio)
@@ -7,6 +7,7 @@
      0.5 s  800 Hz        24-bit mono, 96000 Hz          (play)
      0.5 s  500/1100 Hz   32-bit float stereo, 48000 Hz, WAVE_FORMAT_EXTENSIBLE (play)
      0.4 s  440 Hz        beep -l 400
+     0.6 s  1200/750 Hz   16-bit stereo, 32000 Hz: the Sound Player, started as Files starts it
    and then a beep that is killed early. Everything else written here is silence. */
 #include <stdio.h>
 #include <stdlib.h>
@@ -212,6 +213,19 @@ int main(void) {
     CHECK(took >= 380 && took <= 800, "beep -l 400 took %lu ms", (unsigned long)took);
     char *nargs[] = {"/bin/beep", "H9", NULL};
     CHECK(run_quiet(nargs) == 2, "beep H9 should be refused");
+    msleep(300);
+
+    /* the Sound Player plays the file it is opened with (alone in its folder, so nothing follows) */
+    mkdir("/home/ptest");
+    make_wav("/home/ptest/tone.wav", 1, 16, 2, 32000, 1200, 750, 0.6, false);
+    int ppid = gui_launch("/bin/player", "/home/ptest/tone.wav");
+    CHECK(ppid > 0, "the Sound Player did not start (%d)", ppid);
+    msleep(1300);
+    if (ppid > 0) {
+        CHECK(kill(ppid) == 0, "the Sound Player quit by itself");
+        int pst;
+        waitpid(ppid, &pst, 0);
+    }
     msleep(300);
     int nul = open("/dev/null", O_RDWR);
     int fdmap[3] = {nul, nul, nul};

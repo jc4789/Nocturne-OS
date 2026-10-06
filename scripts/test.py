@@ -125,7 +125,7 @@ def make_disk(a, tcp_port):
 
 # what tests/audiotest.c plays, in order: (left Hz, right Hz, seconds); the last one is killed early
 AUDIO_TONES = [(1000, 1500, 1.0), (600, 600, 0.5), (700, 900, 0.5), (800, 800, 0.5), (500, 1100, 0.5),
-               (440, 440, 0.4), (300, 300, None)]
+               (440, 440, 0.4), (1200, 750, 0.6), (300, 300, None)]
 
 
 def check_audio(path):

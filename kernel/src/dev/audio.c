@@ -17,9 +17,11 @@ struct stream {
     volatile uint32_t head, tail;
 };
 
-static struct stream *streams[MAX_STREAMS];
+/* the last slot is the system's own stream, which no file owns */
+static struct stream *streams[MAX_STREAMS + 1];
 static struct wait_queue audio_wq; /* writers waiting for room, closers waiting to drain */
 static int volume = 80;            /* percent */
+static bool muted;
 static int32_t gain = 80 * 80 * 65536 / 10000; /* volume squared, 16.16: loudness feels linear */
 static const char *card_name;
 static void (*card_fill)(void);
@@ -29,7 +31,7 @@ bool audio_mix(int16_t *out, int frames) {
     uint64_t f = irq_save();
     bool any = false;
     if (out) memset(out, 0, (size_t)frames * AUDIO_FRAME);
-    for (int i = 0; i < MAX_STREAMS; i++) {
+    for (int i = 0; i <= MAX_STREAMS; i++) {
         struct stream *s = streams[i];
         if (!s) continue;
         uint32_t have = (s->head - s->tail) / AUDIO_FRAME;
@@ -56,7 +58,7 @@ bool audio_mix(int16_t *out, int frames) {
 }
 
 bool audio_pending(void) {
-    for (int i = 0; i < MAX_STREAMS; i++)
+    for (int i = 0; i <= MAX_STREAMS; i++)
         if (streams[i] && streams[i]->head - streams[i]->tail >= AUDIO_FRAME) return true;
     return false;
 }
@@ -87,6 +89,41 @@ void audio_remote_detach(void) {
     uint64_t f = irq_save();
     if (remote_users > 0) remote_users--;
     irq_restore(f);
+}
+bool audio_remote(void) { return remote_users > 0; }
+
+static void set_gain(void) { gain = muted ? 0 : volume * volume * 65536 / 10000; }
+int audio_volume(void) { return volume; }
+bool audio_muted(void) { return muted; }
+void audio_set_volume(int percent) {
+    volume = MAX(0, MIN(100, percent));
+    muted = false;
+    set_gain();
+}
+void audio_set_muted(bool m) {
+    muted = m;
+    set_gain();
+}
+
+static uint8_t system_ring[RING_BYTES];
+static struct stream system_stream = {.ring = system_ring};
+
+/* a triangle wave (no floating point in the kernel) that fades out, with a 2 ms start */
+void audio_system_tone(int hz, int ms) {
+    struct stream *s = &system_stream;
+    streams[MAX_STREAMS] = s;
+    if (hz <= 0 || s->head - s->tail >= AUDIO_FRAME) return;
+    int frames = MIN(ms * (AUDIO_RATE / 1000), (int)(RING_BYTES / AUDIO_FRAME)), period = AUDIO_RATE / hz;
+    for (int k = 0; k < frames; k++) {
+        int ph = k % period, tri = ph < period / 2 ? 4 * ph - period : 3 * period - 4 * ph; /* -period..period */
+        int amp = 7000 * (frames - k) / frames;
+        if (k < 96) amp = amp * k / 96;
+        int16_t v = (int16_t)(tri * amp / period);
+        int16_t *at = (int16_t *)(s->ring + (s->head + (uint32_t)k * AUDIO_FRAME) % RING_BYTES);
+        at[0] = at[1] = v;
+    }
+    __sync_synchronize();
+    s->head += (uint32_t)frames * AUDIO_FRAME;
 }
 
 /* ---- /dev/audio ---- */
@@ -206,8 +243,7 @@ static int64_t volume_write(struct vnode *v, struct file *f, const void *buf, ui
     int val = 0, digits = 0;
     for (size_t i = 0; i < n && p[i] >= '0' && p[i] <= '9' && digits < 4; i++, digits++) val = val * 10 + (p[i] - '0');
     if (!digits) return -EINVAL;
-    volume = MIN(val, 100);
-    gain = volume * volume * 65536 / 10000;
+    audio_set_volume(val);
     return (int64_t)n;
 }
 

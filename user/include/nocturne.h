@@ -151,3 +151,23 @@ enum { SND_SINE, SND_SQUARE, SND_TRIANGLE, SND_SAW, SND_NOISE };
    milliseconds. Effects play one after another; one that does not fit in the queue is dropped.
    Returns false if it was not played (no sound, or no room). */
 bool sound_effect(int hz, int hz2, int ms, int wave);
+
+/* A WAV file read as SOUND_RATE stereo frames: integer PCM of 8, 16, 24 or 32 bits or 32-bit
+   float, any number of channels (mono goes to both sides; past two, the first two are used) and
+   any rate (resampled). */
+struct wav {
+    int fd, tag, channels, bits, block;
+    uint32_t rate, frames;           /* the file's own rate and length */
+    uint32_t data_off, data_len, pos; /* pos: the next frame to read from the file */
+    uint32_t src;                     /* the source frame playing now */
+    uint64_t step, frac;
+    int32_t al, ar, bl, br;
+    bool eof;
+    size_t len, at;
+    uint8_t buf[8192];
+};
+const char *wav_open(struct wav *w, const char *path); /* NULL, or what is wrong */
+void wav_close(struct wav *w);
+void wav_seek(struct wav *w, uint32_t frame); /* in the file's frames */
+int wav_read(struct wav *w, int16_t *out, int frames); /* fewer than asked at the end */
+uint32_t wav_ms(const struct wav *w, uint32_t frame);

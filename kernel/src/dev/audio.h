@@ -26,5 +26,16 @@ const char *audio_card(void); /* NULL without one */
    client's session calls audio_mix() at its own pace. */
 void audio_remote_attach(void);
 void audio_remote_detach(void);
+bool audio_remote(void); /* a remote client is playing the sound */
+
+/* The master volume, 0-100 (setting it also unmutes), and mute. */
+int audio_volume(void);
+void audio_set_volume(int percent);
+bool audio_muted(void);
+void audio_set_muted(bool muted);
+
+/* A short tone from the system itself (the volume control's tick), mixed in like a stream. It is
+   dropped while the last one still sounds. */
+void audio_system_tone(int hz, int ms);
 
 void ac97_init(void);

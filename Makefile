@@ -135,9 +135,16 @@ all: image
 kernel: $(BUILD)/kernel.elf
 user: $(APP_BINS) $(BUILD)/root/bin/tcc
 
-$(BUILD)/initrd.tar: $(APP_BINS) $(BUILD)/root/bin/tcc $(BUILD)/sysroot.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
+$(BUILD)/initrd.tar: $(APP_BINS) $(BUILD)/root/bin/tcc $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
 	@echo "  TAR  $@"
-	@$(PY) scripts/mkinitrd.py $@ rootfs $(BUILD)/root $(BUILD)/sysroot
+	@$(PY) scripts/mkinitrd.py $@ rootfs $(BUILD)/sounds $(BUILD)/root $(BUILD)/sysroot
+
+# the music in /home/Music, made by a script
+$(BUILD)/sounds.stamp: scripts/mksounds.py
+	@echo "  GEN  sounds"
+	@rm -rf $(BUILD)/sounds
+	@$(PY) scripts/mksounds.py $(BUILD)/sounds
+	@touch $@
 
 image: $(BUILD)/kernel.elf $(BUILD)/initrd.tar $(BUILD)/data-blank.vhdx
 	@bash scripts/mkimage.sh

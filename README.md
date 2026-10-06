@@ -60,11 +60,11 @@ layout) are parsed, laid out and painted by an engine written for Nocturne. It h
   - History, tab completion and scripts.
 - Terminal: ANSI colours, UTF-8, scrollback, copy and paste, and resizing.
 - Command-line tools: `ls cat cp mv rm mkdir touch tree grep wc head hexdump echo ps kill free uptime date uname dmesg lspci sleep clear reboot poweroff neofetch fortune moonsay`
-- Sound: `beep` (tones and melodies), `play` (WAV files) and `volume`.
+- Sound: `beep` (tones and melodies), `play` (WAV files) and `volume`, for scripts; everything they do can be done from the desktop.
 - Network tools: `ifconfig`, `ping`, `host` (DNS lookup) and `fetch` (an HTTP and HTTPS client).
 - Development: the `tcc` C compiler, with headers and a static libc in `/usr`. The source of every program in `/bin` is in `/usr/src/apps`.
 - `agent`: the AI agent (see below). `screenshot` saves the screen as a PNG.
-- Desktop apps: Web Browser, Files, Text Editor, Paint, Calculator, Clock, System Monitor and Piano.
+- Desktop apps: Web Browser, Files, Text Editor, Paint, Calculator, Clock, System Monitor, Piano and Sound Player. The taskbar's speaker sets the volume.
 - Games and toys: Snake, Tetris, Minesweeper (all three with sound effects), Mandelbrot, 3D Shapes and Game of Life.
 
 ## Running it in Hyper-V
@@ -171,7 +171,7 @@ tests cover:
 - FAT32 and the RAM filesystem: many sizes, long names, 150-file directories, rename and nested directories.
 - `tcc`: printf and math, compiling every app, and self-hosting.
 - The GUI: a window appears in a screen grab and is gone after it closes.
-- Sound: streams, blocking and non-blocking writes, eight streams at once, the volume, `beep`, and `play` with 8-, 16-, 24-bit and float WAV files at several rates. QEMU records the AC'97 card's output to `build/test-audio.wav`, and the host checks that each tone came out with the right pitch on each channel and the right length.
+- Sound: streams, blocking and non-blocking writes, eight streams at once, the volume, `beep`, `play` with 8-, 16-, 24-bit and float WAV files at several rates, and the Sound Player started the way Files starts it. QEMU records the AC'97 card's output to `build/test-audio.wav`, and the host checks that each tone came out with the right pitch on each channel and the right length.
 - The web engine, offline: about 80 checks of element positions (blocks, floats, flexbox, grid, tables, `@media`), painted pixels (borders, alpha, gradients, images), links, form submission, charsets and URL resolution. Deeply nested and malformed pages must not crash it.
 - Network: DHCP, ping, DNS, HTTP, HTTPS, and a rejected bad certificate.
 - TCP: 14 MiB to and from a host-side server, clean and with simulated loss and reordering, checking every byte.
@@ -203,28 +203,34 @@ The root filesystem lives in RAM, so files you create there are lost when you re
 
 ## Sound
 
-```
-beep                            # 440 Hz for 200 ms
-beep -f 880 -l 500 -w square    # sine, square, triangle or saw
-beep -l 150 C4 E4 G4 C5:400 R E5 # a melody: note names, :ms for a longer note, R for a rest
-play /data/song.wav             # PCM WAV of any rate (8/16/24/32-bit or float, mono or stereo)
-volume 60                       # the master volume, 0 to 100 (also +10 / -10)
-```
+- **Volume:** click the speaker on the taskbar, next to the clock. Drag the slider to change it
+  (a short tick plays at the new level), or click the speaker inside the panel to mute. Scrolling over the taskbar's
+  speaker changes the volume without opening anything. The panel also says where the sound goes
+  (the sound card, or Remote desktop in an Enhanced Session).
+- **Sound Player:** double-click a `.wav` file in Files, or open Sound Player from the desktop or
+  the start menu. It lists the other sounds in the same folder and plays on through them. It has
+  play/pause, stop, previous and next, and a bar you can click or drag to jump. Keys: Space plays
+  or pauses, Left and Right jump 5 seconds, Up and Down change sound. It reads PCM WAV of any rate
+  (8/16/24/32-bit or float, mono to multichannel).
+- **Music:** `/home/Music` has three short pieces made for Nocturne (synthesised at build time by
+  `scripts/mksounds.py`).
+- **Piano** plays two octaves from the mouse or the keyboard (Z S X D C V G B H N J M for the
+  lower octave, Q 2 W 3 E R 5 T 6 Y 7 U I for the upper), in three sounds (Tab), with Left and
+  Right to change octave.
+- Snake, Tetris and Minesweeper have sound effects.
 
 Sound comes out of an Intel AC'97 card: `build.ps1 run` gives QEMU one, played through Windows'
 speakers, and VirtualBox emulates one (ICH AC97). In Hyper-V the Enhanced Session carries it to
 VMConnect; Hyper-V has no sound card, so outside an Enhanced Session sound plays into nothing (at
 the speed it would play, so programs still take as long as their sound does).
 
-**Piano** plays two octaves from the mouse or the keyboard (Z S X D C V G B H N J M for the lower
-octave, Q 2 W 3 E R 5 T 6 Y 7 U I for the upper), in three sounds (Tab), with Left and Right to
-change octave.
-
-A program plays sound by writing 16-bit little-endian stereo frames at 48 kHz to `/dev/audio`;
+For programs: a program plays sound by writing 16-bit little-endian stereo frames at 48 kHz to `/dev/audio`;
 writes block while about 170 ms are queued, and `close` waits for the rest to finish. Reading the
 stream (opened `O_RDWR`) returns a `uint32_t`: how many frames are queued, for keeping a picture
 in step with the sound. Up to eight programs can play at once. For games, libc's
-`sound_effect(hz, hz2, ms, wave)` plays a short tone or noise without ever waiting (`nocturne.h`).
+`sound_effect(hz, hz2, ms, wave)` plays a short tone or noise without ever waiting, and
+`wav_open`/`wav_read`/`wav_seek` read any WAV file as 48 kHz stereo (`nocturne.h`). Scripts can use
+`beep`, `play` and `volume`.
 
 ## Networking
 

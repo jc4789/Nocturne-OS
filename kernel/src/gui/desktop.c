@@ -254,6 +254,14 @@ void desktop_draw_icon(canvas_t *c, int x, int y, int icon) {
             if (i != 2) gfx_fill(c, x + 7 + i * 5, y + 7, 3, 11, RGB(24, 22, 36));
         gfx_fill(c, x + 4, y + 7, 24, 2, RGB(130, 110, 240));
         break;
+    case ICON_SOUND: /* two quavers joined by a beam */
+        gfx_fill_round(c, x + 1, y + 1, 30, 30, 8, RGB(64, 44, 130));
+        gfx_fill_circle(c, x + 10, y + 23, 4, RGB(246, 236, 196));
+        gfx_fill_circle(c, x + 22, y + 20, 4, RGB(246, 236, 196));
+        gfx_fill(c, x + 13, y + 9, 2, 14, RGB(246, 236, 196));
+        gfx_fill(c, x + 25, y + 6, 2, 14, RGB(246, 236, 196));
+        for (int t = 0; t < 4; t++) gfx_line(c, x + 13, y + 9 + t, x + 26, y + 6 + t, RGB(246, 236, 196));
+        break;
     case ICON_TETRIS:
         gfx_fill_round(c, x + 1, y + 1, 30, 30, 5, RGB(24, 24, 44));
         gfx_fill(c, x + 5, y + 19, 7, 7, RGB(240, 90, 110));

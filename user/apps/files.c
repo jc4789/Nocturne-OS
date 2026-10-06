@@ -84,6 +84,7 @@ static const char *type_name(const struct entry *e) {
     if (!strcmp(cwd, "/bin")) return "Program";
     if (dot && !strcasecmp(dot, ".txt")) return "Text";
     if (dot && !strcasecmp(dot, ".ppm")) return "Picture";
+    if (dot && !strcasecmp(dot, ".wav")) return "Sound";
     if (dot && (!strcasecmp(dot, ".html") || !strcasecmp(dot, ".htm"))) return "Web page";
     if (dot && !strcasecmp(dot, ".sh")) return "Script";
     return "File";
@@ -97,6 +98,11 @@ static void icon(canvas_t *c, int x, int y, const struct entry *e) {
     } else if (e->type == N_FT_CHAR) {
         gfx_fill_round(c, x + 1, y + 2, 14, 14, 3, RGB(100, 110, 140));
         gfx_fill(c, x + 4, y + 6, 8, 6, RGB(40, 46, 60));
+    } else if (!strcmp(type_name(e), "Sound")) { /* a quaver */
+        gfx_fill_round(c, x, y + 1, 16, 16, 3, RGB(64, 44, 130));
+        gfx_fill_circle(c, x + 6, y + 12, 3, RGB(246, 236, 196));
+        gfx_fill(c, x + 8, y + 3, 2, 9, RGB(246, 236, 196));
+        gfx_line(c, x + 9, y + 3, x + 13, y + 7, RGB(246, 236, 196));
     } else if (!strcmp(type_name(e), "Program")) {
         gfx_fill_round(c, x, y + 1, 16, 15, 2, RGB(70, 66, 120));
         gfx_fill(c, x + 1, y + 4, 14, 11, RGB(20, 18, 34));
@@ -179,6 +185,7 @@ static void open_entry(int i) {
     int r;
     if (!strcmp(t, "Program")) r = gui_launch(path, NULL);
     else if (!strcmp(t, "Picture")) r = gui_launch("/bin/paint", path);
+    else if (!strcmp(t, "Sound")) r = gui_launch("/bin/player", path);
     else if (!strcmp(t, "Web page")) r = gui_launch("/bin/browser", path);
     else r = gui_launch("/bin/notepad", path);
     snprintf(status, sizeof status, r < 0 ? "could not open %s" : "opened %s", ents[i].name);

@@ -13,6 +13,7 @@
 #include "gui/wm.h"
 #include "dev/fb.h"
 #include "dev/fbcon.h"
+#include "dev/audio.h"
 #include "dev/input.h"
 #include "dev/timer.h"
 #include "fs/vfs.h"
@@ -76,7 +77,7 @@ static struct rect rdamage[MAX_RDAMAGE];
 static int nrdamage;
 static int cursor_shape = CURSOR_ARROW;
 
-enum { DRAG_NONE, DRAG_MOVE, DRAG_RESIZE, DRAG_CLIENT, DRAG_BUTTON };
+enum { DRAG_NONE, DRAG_MOVE, DRAG_RESIZE, DRAG_CLIENT, DRAG_BUTTON, DRAG_VOLUME };
 static int drag_mode;
 static struct window *drag_win;
 static int drag_dx, drag_dy, drag_btn;
@@ -88,6 +89,10 @@ static int hover_btn; /* 0 none, 1 close, 2 max, 3 min */
 
 static bool menu_open;
 static int menu_sel = -1;
+static bool vol_open;         /* the volume panel above the taskbar's speaker */
+static int shown_volume = -1; /* what the speaker was last drawn showing */
+static bool shown_muted;
+static void set_volume_panel(bool open);
 static int sel_icon = -1;
 static uint64_t last_click_ms;
 static int last_click_x, last_click_y;
@@ -475,6 +480,7 @@ static const struct app apps[] = {
     {"Clock", "/bin/clock", ICON_CLOCK},
     {"System Monitor", "/bin/sysmon", ICON_MONITOR},
     {"Piano", "/bin/piano", ICON_PIANO},
+    {"Sound Player", "/bin/player", ICON_SOUND},
     {"Snake", "/bin/snake", ICON_SNAKE},
     {"Tetris", "/bin/tetris", ICON_TETRIS},
     {"Minesweeper", "/bin/mines", ICON_MINES},
@@ -487,7 +493,7 @@ static const struct app apps[] = {
 };
 #define NAPPS ((int)ARRAY_SIZE(apps))
 
-static const int desktop_apps[] = {0, 1, 2, 3, 4, 8, 9, 12, 13, 15};
+static const int desktop_apps[] = {0, 1, 2, 3, 4, 8, 9, 10, 13, 14, 16};
 #define NDESK ((int)ARRAY_SIZE(desktop_apps))
 #define ICON_CELL_W 88
 #define ICON_CELL_H 82
@@ -551,18 +557,35 @@ static int launch(const char *path, const char *arg) {
 #define MENU_HEAD   58
 #define MENU_ITEM_H 36
 
+/* items run down a column, and on into a second one when the screen is too short for one */
+static int menu_rows(void) {
+    int fit = (sh - TASKBAR_H - 8 - MENU_HEAD - 10) / MENU_ITEM_H;
+    int cols = fit < 1 ? NAPPS : (NAPPS + fit - 1) / fit;
+    return (NAPPS + cols - 1) / cols;
+}
+
 static struct rect menu_rect(void) {
-    int h = MENU_HEAD + NAPPS * MENU_ITEM_H + 10;
-    return (struct rect){4, sh - TASKBAR_H - h - 4, MENU_W, h};
+    int rows = menu_rows(), cols = (NAPPS + rows - 1) / rows;
+    int h = MENU_HEAD + rows * MENU_ITEM_H + 10;
+    return (struct rect){4, MAX(0, sh - TASKBAR_H - h - 4), MENU_W * cols, h};
+}
+
+static void menu_item_pos(int i, int *x, int *y) {
+    struct rect m = menu_rect();
+    *x = m.x + i / menu_rows() * MENU_W;
+    *y = m.y + MENU_HEAD + i % menu_rows() * MENU_ITEM_H;
 }
 
 static int menu_item_at(int x, int y) {
     struct rect m = menu_rect();
-    if (!in_rect(x, y, m.x, m.y + MENU_HEAD, m.w, NAPPS * MENU_ITEM_H)) return -1;
-    return (y - m.y - MENU_HEAD) / MENU_ITEM_H;
+    int rows = menu_rows();
+    if (!in_rect(x, y, m.x, m.y + MENU_HEAD, m.w, rows * MENU_ITEM_H)) return -1;
+    int i = (x - m.x) / MENU_W * rows + (y - m.y - MENU_HEAD) / MENU_ITEM_H;
+    return i < NAPPS ? i : -1;
 }
 
 static void set_menu(bool open) {
+    if (open) set_volume_panel(false);
     if (menu_open == open) return;
     menu_open = open;
     menu_sel = -1;
@@ -592,13 +615,117 @@ static void draw_menu(canvas_t *c) {
     draw_crescent(c, m.x + 30, m.y + 26, 13, RGB(246, 236, 196));
     gfx_text(c, m.x + 54, m.y + 10, OS_NAME, RGB(255, 255, 255), TRANSPARENT, FONT_LARGE);
     for (int i = 0; i < NAPPS; i++) {
-        int iy = m.y + MENU_HEAD + i * MENU_ITEM_H;
-        if (i == NAPPS - 2) gfx_hline(c, m.x + 12, iy - 1, m.w - 24, RGB(60, 56, 100));
-        if (i == menu_sel) gfx_fill_round(c, m.x + 6, iy + 1, m.w - 12, MENU_ITEM_H - 2, 6, RGB(76, 64, 150));
-        /* icons are 32x32; draw at 28-ish by offset */
-        desktop_draw_icon(c, m.x + 12, iy + 2, apps[i].icon);
-        gfx_text(c, m.x + 54, iy + 10, apps[i].name, RGB(230, 230, 245), TRANSPARENT, FONT_SMALL);
+        int ix, iy;
+        menu_item_pos(i, &ix, &iy);
+        if (i == NAPPS - 2 && iy > m.y + MENU_HEAD) gfx_hline(c, ix + 12, iy - 1, MENU_W - 24, RGB(60, 56, 100));
+        if (i == menu_sel) gfx_fill_round(c, ix + 6, iy + 1, MENU_W - 12, MENU_ITEM_H - 2, 6, RGB(76, 64, 150));
+        desktop_draw_icon(c, ix + 12, iy + 2, apps[i].icon);
+        gfx_text(c, ix + 54, iy + 10, apps[i].name, RGB(230, 230, 245), TRANSPARENT, FONT_SMALL);
     }
+}
+
+/* ---- volume: a speaker on the taskbar, and a panel with a slider and mute ---- */
+#define TB_START_W 128
+#define TB_CLOCK_W 100
+#define TB_VOL_W   40
+#define VOL_W      300
+#define VOL_H      96
+
+static struct rect vol_button_rect(void) {
+    return (struct rect){sw - TB_CLOCK_W - TB_VOL_W, sh - TASKBAR_H + 5, TB_VOL_W - 4, TASKBAR_H - 10};
+}
+static struct rect vol_rect(void) { return (struct rect){sw - VOL_W - 8, sh - TASKBAR_H - VOL_H - 6, VOL_W, VOL_H}; }
+static struct rect vol_mute_rect(void) {
+    struct rect v = vol_rect();
+    return (struct rect){v.x + 12, v.y + 42, 40, 40};
+}
+static struct rect vol_slider_rect(void) { /* the track; clicks a little either side still count */
+    struct rect v = vol_rect();
+    return (struct rect){v.x + 70, v.y + 60, VOL_W - 70 - 56, 4};
+}
+
+static void damage_volume(void) {
+    struct rect b = vol_button_rect(), v = vol_rect();
+    damage_rect(b.x, b.y, b.w, b.h);
+    if (vol_open) damage_rect(v.x - SHADOW, v.y - SHADOW, v.w + 2 * SHADOW, v.h + 2 * SHADOW);
+}
+
+static void set_volume_panel(bool open) {
+    if (vol_open == open) return;
+    if (!open) damage_volume();
+    vol_open = open;
+    damage_volume();
+}
+
+/* a loudspeaker centred on (cx, cy), with one to three waves for the volume, or a cross when
+   muted */
+static void draw_speaker(canvas_t *c, int cx, int cy, int volume, bool muted, uint32_t col) {
+    gfx_fill(c, cx - 9, cy - 3, 4, 7, col);
+    for (int i = 0; i < 6; i++) gfx_vline(c, cx - 5 + i, cy - 3 - i, 7 + 2 * i, col);
+    if (muted) {
+        uint32_t x = RGB(240, 110, 120);
+        for (int d = 0; d < 2; d++) {
+            gfx_line(c, cx + 3 + d, cy - 4, cx + 10 + d, cy + 3, x);
+            gfx_line(c, cx + 3 + d, cy + 3, cx + 10 + d, cy - 4, x);
+        }
+        return;
+    }
+    int waves = volume == 0 ? 0 : volume < 34 ? 1 : volume < 67 ? 2 : 3;
+    for (int w = 0; w < waves; w++) {
+        int r = 4 + w * 4;
+        for (int dy = -r * 7 / 10; dy <= r * 7 / 10; dy++) {
+            int dx = 0;
+            while ((dx + 1) * (dx + 1) + dy * dy <= r * r) dx++;
+            gfx_pixel(c, cx + 1 + dx, cy + dy, col);
+            gfx_pixel(c, cx + 2 + dx, cy + dy, col);
+        }
+    }
+}
+
+static void draw_volume_button(canvas_t *c, int y) {
+    struct rect b = vol_button_rect();
+    shown_volume = audio_volume();
+    shown_muted = audio_muted();
+    if (vol_open || (in_rect(mx, my, b.x, b.y, b.w, b.h) && drag_mode == DRAG_NONE))
+        gfx_fill_round(c, b.x, b.y, b.w, b.h, 6, vol_open ? RGB(70, 62, 140) : RGB(40, 36, 78));
+    draw_speaker(c, b.x + b.w / 2 - 1, y + TASKBAR_H / 2, shown_volume, shown_muted, RGB(235, 235, 250));
+}
+
+static void draw_volume_panel(canvas_t *c) {
+    struct rect v = vol_rect(), m = vol_mute_rect(), s = vol_slider_rect();
+    int vol = audio_volume();
+    bool mute = audio_muted();
+    draw_shadow(c, v.x, v.y, v.w, v.h);
+    gfx_fill_round(c, v.x, v.y, v.w, v.h, 10, RGB(70, 60, 120));
+    gfx_fill_round(c, v.x + 1, v.y + 1, v.w - 2, v.h - 2, 9, RGB(22, 20, 44));
+    gfx_text(c, v.x + 16, v.y + 12, "Volume", RGB(245, 245, 255), TRANSPARENT, FONT_SMALL);
+    const char *dev = audio_remote() ? "Remote desktop" : audio_card() ? audio_card() : "No sound device";
+    gfx_text(c, v.x + v.w - 16 - gfx_text_width(dev, FONT_SMALL), v.y + 12, dev, RGB(150, 150, 190), TRANSPARENT,
+             FONT_SMALL);
+    gfx_fill_round(c, m.x, m.y, m.w, m.h, 8, mute ? RGB(90, 40, 60) : RGB(44, 38, 90));
+    draw_speaker(c, m.x + m.w / 2 - 1, m.y + m.h / 2, vol, mute, RGB(235, 235, 250));
+    int fillw = s.w * vol / 100, kx = s.x + fillw;
+    gfx_fill_round(c, s.x, s.y, s.w, s.h, 2, RGB(60, 56, 100));
+    gfx_fill_round(c, s.x, s.y, MAX(fillw, 4), s.h, 2, mute ? RGB(110, 100, 140) : RGB(150, 130, 255));
+    gfx_fill_circle(c, kx, s.y + 2, 8, mute ? RGB(150, 146, 170) : RGB(235, 230, 255));
+    char num[8];
+    ksnprintf(num, sizeof num, "%d", vol);
+    gfx_text(c, v.x + v.w - 20 - gfx_text_width(num, FONT_SMALL), s.y - 6, num, RGB(235, 235, 250), TRANSPARENT,
+             FONT_SMALL);
+}
+
+static void volume_tick(void) { audio_system_tone(880, 70); }
+
+static void volume_from_mouse(void) {
+    struct rect s = vol_slider_rect();
+    int v = (mx - s.x) * 100 / s.w;
+    if (v != audio_volume() || audio_muted()) audio_set_volume(v);
+    damage_volume();
+}
+
+static bool over_volume(int x, int y) {
+    struct rect b = vol_button_rect(), v = vol_rect();
+    return in_rect(x, y, b.x, b.y, b.w, b.h) || (vol_open && in_rect(x, y, v.x, v.y, v.w, v.h));
 }
 
 /* ---- taskbar ---- */
@@ -619,11 +746,8 @@ static int taskbar_buttons(struct window **list, int max) {
     return n;
 }
 
-#define TB_START_W 128
-#define TB_CLOCK_W 100
-
 static void taskbar_button_geom(int n, int i, int *x, int *w) {
-    int avail = sw - TB_START_W - TB_CLOCK_W - 16;
+    int avail = sw - TB_START_W - TB_CLOCK_W - TB_VOL_W - 16;
     int bw = n ? avail / n : 0;
     if (bw > 190) bw = 190;
     *x = TB_START_W + 8 + i * bw;
@@ -652,6 +776,8 @@ static void draw_taskbar(canvas_t *c) {
         text_trunc(c, bx + 10, y + 12, list[i]->title, bw - 20,
                    list[i]->minimized ? RGB(140, 140, 170) : RGB(235, 235, 250));
     }
+
+    draw_volume_button(c, y);
 
     /* clock */
     struct tm_parts tp;
@@ -780,6 +906,7 @@ static void composite_rect(struct rect r) {
     }
     if (r.y + r.h > sh - TASKBAR_H) draw_taskbar(c);
     if (menu_open) draw_menu(c);
+    if (vol_open) draw_volume_panel(c);
     if (toast_until) draw_toast(c);
     /* a remote viewer draws the pointer itself; keep it out of the picture it is sent */
     if (!remote_users) desktop_draw_cursor(c, mx, my, cursor_shape);
@@ -895,6 +1022,10 @@ static void handle_key(const struct key_event *k) {
             launch("/bin/term", NULL);
             return;
         }
+        if (vol_open && k->key == KEY_ESC) {
+            set_volume_panel(false);
+            return;
+        }
         if (menu_open) {
             if (k->key == KEY_ESC) set_menu(false);
             else if (k->key == KEY_UP || k->key == KEY_DOWN) {
@@ -948,6 +1079,22 @@ static void left_press(void) {
     last_click_x = mx;
     last_click_y = my;
 
+    if (vol_open) {
+        struct rect v = vol_rect(), mr = vol_mute_rect(), s = vol_slider_rect(), b = vol_button_rect();
+        if (in_rect(mx, my, v.x, v.y, v.w, v.h)) {
+            if (in_rect(mx, my, mr.x, mr.y, mr.w, mr.h)) {
+                audio_set_muted(!audio_muted());
+                damage_volume();
+                volume_tick();
+            } else if (in_rect(mx, my, s.x - 10, s.y - 14, s.w + 20, s.h + 28)) {
+                drag_mode = DRAG_VOLUME;
+                volume_from_mouse();
+            }
+            return;
+        }
+        set_volume_panel(false);
+        if (in_rect(mx, my, b.x, b.y, b.w, b.h)) return; /* clicking the speaker again closes */
+    }
     if (menu_open) {
         struct rect m = menu_rect();
         if (in_rect(mx, my, m.x, m.y, m.w, m.h)) {
@@ -964,6 +1111,11 @@ static void left_press(void) {
     if (my >= sh - TASKBAR_H) {
         if (mx < TB_START_W) {
             set_menu(true);
+            return;
+        }
+        struct rect vb = vol_button_rect();
+        if (in_rect(mx, my, vb.x, vb.y, vb.w, vb.h)) {
+            set_volume_panel(true);
             return;
         }
         struct window *w;
@@ -1039,6 +1191,7 @@ static void left_release(void) {
     int mode = drag_mode;
     drag_mode = DRAG_NONE;
     drag_win = NULL;
+    if (mode == DRAG_VOLUME) volume_tick(); /* let the new level be heard */
     if (!w) return;
     switch (mode) {
     case DRAG_BUTTON:
@@ -1107,7 +1260,12 @@ static void handle_mouse(const struct mouse_event *m) {
             damage_rect(resize_rect.x, resize_rect.y, resize_rect.w, resize_rect.h);
         } else if (drag_mode == DRAG_CLIENT && drag_win) {
             send_mouse(drag_win, EV_MOUSE_MOVE, mbuttons);
+        } else if (drag_mode == DRAG_VOLUME) {
+            volume_from_mouse();
         } else if (drag_mode == DRAG_NONE) {
+            struct rect vb = vol_button_rect();
+            if (in_rect(mx, my, vb.x, vb.y, vb.w, vb.h) != in_rect(ox, oy, vb.x, vb.y, vb.w, vb.h))
+                damage_rect(vb.x, vb.y, vb.w, vb.h); /* hover highlight */
             struct window *w = window_at(mx, my);
             if (w && in_rect(mx, my, client_x(w), client_y(w), w->cw, w->ch)) send_mouse(w, EV_MOUSE_MOVE, mbuttons);
             if (menu_open) {
@@ -1136,7 +1294,11 @@ static void handle_mouse(const struct mouse_event *m) {
             send_mouse(w, (mbuttons & changed & 6) ? EV_MOUSE_DOWN : EV_MOUSE_UP, mbuttons);
         }
     }
-    if (m->wheel) {
+    if (m->wheel && over_volume(mx, my)) { /* scrolling over the speaker or its panel */
+        audio_set_volume(audio_volume() - m->wheel * 5);
+        damage_volume();
+        volume_tick();
+    } else if (m->wheel) {
         struct window *w = window_at(mx, my);
         if (!w) w = focused();
         if (w) {
@@ -1171,6 +1333,7 @@ static void wm_thread(void *arg) {
             last_clock_min = tp.min;
             damage_rect(sw - TB_CLOCK_W, sh - TASKBAR_H, TB_CLOCK_W, TASKBAR_H);
         }
+        if (audio_volume() != shown_volume || audio_muted() != shown_muted) damage_volume();
         if (toast_until && uptime_ms() > toast_until) {
             toast_until = 0;
             struct rect t = toast_rect();
