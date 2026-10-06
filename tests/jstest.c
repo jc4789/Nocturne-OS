@@ -94,6 +94,8 @@ static void receive_log(void *opaque, int level, const char *message) {
         if (f->nmarks < MARKS) snprintf(f->marks[f->nmarks++], sizeof f->marks[0], "%s", message + 3);
     } else if (!strncmp(message, "FAIL ", 5)) {
         printf("%s\n", message); fflush(stdout); f->js_failures++; failed++; total++;
+    } else if (!strncmp(message, "XHR checks ", 11) || !strncmp(message, "Document checks ", 16) || !strncmp(message, "Document limit mode ", 20)) {
+        printf("%s\n", message);
     } else if (level == 2) {
         f->errors++;
         snprintf(f->last_error, sizeof f->last_error, "%s", message);
@@ -185,6 +187,13 @@ static void deliver(struct fixture *f) {
         if (q.kind == WEB_RESOURCE_MODULE && f->module_mime_headers)
             snprintf(r.headers, sizeof r.headers, "HTTP/1.1 200 OK\r\n%s\r\n", f->module_mime_headers);
         r.body = strdup(a ? a->body : "not found"); r.body_len = strlen(r.body ? r.body : "");
+        if (!strcmp(q.url, "http://fixture.test/dir/api/echo")) {
+            free(r.body); r.body = malloc(q.body_len + 1); r.body_len = q.body_len; r.status = 200;
+            if (r.body) { memcpy(r.body, q.body, q.body_len); r.body[q.body_len] = 0; }
+        }
+        if (!strcmp(q.url, "http://fixture.test/dir/api/headers")) {
+            free(r.body); r.body = strdup(q.headers); r.body_len = strlen(q.headers); r.status = 200;
+        }
         if (!strcmp(q.url, "http://fixture.test/dir/api/post") &&
             (strcmp(q.method, "POST") || strcmp(q.body, "Nocturne request body") || q.body_len != 21 || !strstr(q.headers, "x-fixture: yes"))) {
             snprintf(r.error, sizeof r.error, "Invalid POST request in the fixture");
@@ -282,6 +291,7 @@ static void test_platform(void) {
     external_case("js_encoding_cases.js", ";check('encoding-count',runEncodingCases()>170);mark('api-done');", BASE);
     external_case("js_intl_cases.js", ";runIntlCases().then(n=>{check('intl-count',n===106);mark('api-done');},e=>{console.log('FAIL intl '+e);mark('api-done');});", BASE);
     external_case("js_history_cases.js", ";runHistoryCases().then(()=>mark('api-done'),e=>{console.log('FAIL history '+e);mark('api-done');});", BASE);
+    test_check("location-reentrant-native-navigation",!strcmp(fixture.navigation,"http://fixture.test/dir/index.html?cache=5#outside"));
     external_case("js_geometry_cases.js", ";check('geometry-count',runGeometryCases()===15);mark('api-done');", BASE);
     external_case("js_dom_compare_cases.js", ";check('node-compare-count',runDOMCompareCases()===14);mark('api-done');", BASE);
     external_case("js_event_handler_cases.js", ";check('event-handler-count',runEventHandlerCases()===18);mark('api-done');", BASE);
@@ -293,6 +303,20 @@ static void test_platform(void) {
     external_case_expected("js_performance_cases.js", ";runPerformanceObserverExceptionCases().then(n=>{check('performance-exception-count',n>=2);mark('api-done');},e=>{console.log('FAIL performance-exception '+e);mark('api-done');});", BASE,1);
     external_case("js_custom_elements_cases.js", ";check('global-events',runGlobalEventTargetCases()===9);check('iframe-types',runHTMLIFrameElementCases()===19);runCustomElementCases().then(n=>{check('custom-elements-count',n>30);mark('api-done');},e=>{console.log('FAIL custom-elements '+e);mark('api-done');});", BASE);
     external_case_expected("js_custom_elements_cases.js", ";check('custom-elements-failures-count',runCustomElementFailureCases()===9);mark('api-done');", BASE, 4);
+}
+
+static void test_xhr(void) {
+    external_case("js_xhr_cases.js", ";runXHRCases().then(n=>{console.log('XHR checks '+n);check('xhr-count',n>=60);mark('api-done');},e=>{console.log('FAIL xhr '+e);mark('api-done');});", BASE);
+    test_check("xhr-native-cancel-reached",fixture.cancellations>=3);
+    test_check("xhr-native-request-reached",fixture.requests>=10);
+    test_check("xhr-not-during-native-completion",fixture.outside_running==0);
+}
+static void test_documents(void) {
+    external_case("js_document_cases.js", ";try{const n=runDocumentCases();console.log('Document checks '+n);check('document-count',n>=80);}catch(e){console.log('FAIL documents '+e+' '+e.stack);}mark('api-done');", BASE);
+    test_check("inert-document-no-network",fixture.requests==0);
+    test_check("inert-document-no-navigation",fixture.navigations==0);
+    external_case("js_document_cases.js", ";try{check('document-count-limit',runDocumentLimitCases('count')>=10);}catch(e){console.log('FAIL document count limit '+e+' '+e.stack);}mark('api-done');", BASE);
+    external_case("js_document_cases.js", ";try{check('document-arena-limit',runDocumentLimitCases('arena')>=10);}catch(e){console.log('FAIL document arena limit '+e+' '+e.stack);}mark('api-done');", BASE);
 }
 
 static void test_language(void) {
@@ -395,7 +419,7 @@ static void test_dom_and_scripts(void) {
         "const target=document.getElementById('target');target.style.height='37px';target.className='one two';"
         "check('dom-node-identity',document.querySelector('#target')===target);"
         "check('dom-prototype-hierarchy',Object.getPrototypeOf(target)===HTMLElement.prototype&&Object.getPrototypeOf(HTMLElement.prototype)===Element.prototype&&Object.getPrototypeOf(Element.prototype)===Node.prototype&&target instanceof HTMLElement&&target instanceof Element&&target instanceof Node);"
-        "check('dom-document-interface',Object.getPrototypeOf(document)===Document.prototype&&document instanceof Document&&document instanceof Node&&!(document instanceof Element)&&document.className===undefined&&document.getAttribute===undefined&&document.matches===undefined&&document.href===undefined);"
+        "check('dom-document-interface',Object.getPrototypeOf(document)===HTMLDocument.prototype&&Object.getPrototypeOf(HTMLDocument.prototype)===Document.prototype&&document instanceof Document&&document instanceof Node&&!(document instanceof Element)&&document.className===undefined&&document.getAttribute===undefined&&document.matches===undefined&&document.href===undefined);"
         "check('dom-element-prototype-method',typeof Element.prototype.matches==='function'&&Element.prototype.matches.call(target,'#target')&&Node.prototype.matches===undefined);"
         "class DerivedElement extends Element{};check('dom-no-fake-instanceof',!(target instanceof DerivedElement));"
         "check('dom-selector',target.matches('.one.two')&&document.querySelector('body > #target')===target);"
@@ -547,6 +571,52 @@ static void test_timers_and_promises(void) {
     free(page);
 }
 
+static void test_host_microtasks(void) {
+    const char *source =
+        "const P=Promise,resolve=P.resolve,then=P.prototype.then,catcher=P.prototype.catch;let calls=0,ran=false,order=[];"
+        "globalThis.Promise={resolve(){calls++;throw Error('page Promise must not be used');}};"
+        "try{check('microtask-return',queueMicrotask(()=>{ran=true;})===undefined);}catch(e){check('microtask-return',false);}"
+        "globalThis.Promise=P;P.resolve=P.prototype.then=P.prototype.catch=function(){calls++;throw Error('page Promise methods must not be used');};"
+        "try{queueMicrotask(function(){'use strict';check('microtask-callback',this===undefined&&arguments.length===0);});}catch(e){check('microtask-callback',false);}"
+        "P.resolve=resolve;P.prototype.then=then;P.prototype.catch=catcher;"
+        "check('microtask-async',!ran);check('microtask-no-page-promise',calls===0);"
+        "for(const bad of [undefined,null,42,{},'callback']){let threw=false;try{queueMicrotask(bad);}catch(e){threw=e instanceof TypeError;}check('microtask-invalid-'+String(bad),threw);}"
+        "queueMicrotask(()=>{order.push('q1');queueMicrotask(()=>order.push('nested'));});"
+        "Promise.resolve().then(()=>order.push('p'));queueMicrotask(()=>order.push('q2'));"
+        "let assimilated=false;queueMicrotask(()=>({get then(){assimilated=true;throw Error('return ignored');}}));"
+        "setTimeout(()=>{check('microtask-ran',ran);check('microtask-fifo',order.join(',')==='q1,p,q2,nested');check('microtask-return-ignored',!assimilated);mark('host-microtasks-done');},0);";
+    char *page=script_page(source);
+    test_check("host-microtask-page",page!=NULL);
+    if(page && open_case(page,false)) {
+        test_check("host-microtasks-finished",pump("host-microtasks-done",5000));
+        static const char *const names[]={"microtask-return","microtask-callback","microtask-async","microtask-no-page-promise",
+            "microtask-invalid-undefined","microtask-invalid-null","microtask-invalid-42","microtask-invalid-[object Object]","microtask-invalid-callback",
+            "microtask-ran","microtask-fifo","microtask-return-ignored"};
+        require_marks(names,sizeof names/sizeof *names);
+        test_check("host-microtasks-no-errors",fixture.errors==0);close_case();
+    }
+    free(page);
+    page=script_page("let done=false;queueMicrotask(()=>{throw Error('host-microtask-failure');});queueMicrotask(()=>done=true);"
+                     "setTimeout(()=>{check('microtasks-drain-after-error',done);mark('microtask-error-done');},0);");
+    test_check("microtask-error-page",page!=NULL);
+    if(page && open_case(page,true)) {
+        test_check("microtask-error-finished",pump("microtask-error-done",5000));
+        test_check("microtask-error-drained",has_mark(&fixture,"microtasks-drain-after-error"));
+        test_check("microtask-error-reported",fixture.errors==1&&strstr(fixture.last_error,"host-microtask-failure")!=NULL);
+        test_check("microtask-error-not-rejection",strstr(fixture.last_error,"Unhandled promise rejection")==NULL);
+        close_case();
+    }
+    free(page);
+    page=script_page("Promise.reject(new Error('module-diagnostic'));setTimeout(()=>mark('rejection-done'),0);");
+    test_check("rejection-stack-page",page!=NULL);
+    if(page && open_case(page,true)) {
+        test_check("rejection-stack-finished",pump("rejection-done",5000));
+        test_check("rejection-stack-reported",fixture.errors==1&&strstr(fixture.last_error,"Unhandled promise rejection: Error: module-diagnostic")&&strstr(fixture.last_error,BASE));
+        close_case();
+    }
+    free(page);
+}
+
 static void test_fetch_and_cancel(void) {
     const char *source =
         "async function exercise(){"
@@ -622,6 +692,7 @@ static void test_allocation_limit(const char *kind, const char *source, const ch
 static void test_limits(void) {
     test_execution_budget("loop-budget", "mark('loop-start');for(;;){}");
     test_execution_budget("microtask-budget", "mark('microtask-start');function forever(){Promise.resolve().then(forever);}forever();");
+    test_execution_budget("host-microtask-budget", "mark('microtask-start');function forever(){queueMicrotask(forever);}forever();");
     /* Split allocations into browser tasks: a time-limit failure cannot stand in
        for enforcing either allocation quota. No private allocator APIs are used. */
     test_allocation_limit("heap-128m-limit",
@@ -653,6 +724,30 @@ static void test_limits(void) {
         close_case();
     }
     free(page);
+}
+
+static void test_scripting_presentation(void) {
+    const char *page="<!doctype html><style>body{margin:0}noscript{display:block!important;height:40px}"
+        "#mode{height:10px}@media(scripting:enabled){#mode{height:20px}}</style><body>"
+        "<noscript style='display:block!important'><b id=fallback>fallback</b></noscript><div id=mode></div><div id=sentinel></div><script>"
+        PRELUDE "check('noscript-rawtext',document.getElementById('fallback')===null);"
+        "check('noscript-hidden',getComputedStyle(document.querySelector('noscript')).display==='none');"
+        "mark('scripting-ready');for(;;){}</script>";
+    web_doc *static_doc=web_parse(page,strlen(page),BASE,"utf-8");
+    test_check("scripting-disabled-document",static_doc!=NULL);
+    if(static_doc){web_layout(static_doc,VW,VH);test_check("noscript-disabled-fallback",web_anchor_y(static_doc,"sentinel")==50);web_free(static_doc);}
+    if(open_case(page,true)) {
+        /* Like the browser's navigation path, establish the viewport before
+           the first script runs; this page has no blocking external resource. */
+        web_layout(fixture.doc,VW,VH);
+        test_check("scripting-document-executed",pump("scripting-ready",12000));
+        test_check("noscript-live-rawtext",has_mark(&fixture,"noscript-rawtext"));
+        test_check("noscript-ua-hides",has_mark(&fixture,"noscript-hidden"));
+        test_check("scripting-watchdog-fired",strstr(fixture.last_error,"5 second")!=NULL);
+        web_layout(fixture.doc,VW+1,VH);
+        test_check("noscript-remains-hidden-after-watchdog",web_anchor_y(fixture.doc,"sentinel")==20);
+        close_case();
+    }
 }
 
 static void test_native_selection(void) {
@@ -732,13 +827,17 @@ int main(int argc, char **argv) {
 #define RUN(name, fn) do { if (argc == 1 || !strcmp(argv[1], name)) { printf("jstest: %s\n", name); fflush(stdout); fn(); } } while (0)
     RUN("language", test_language);
     RUN("platform", test_platform);
+    RUN("xhr", test_xhr);
+    RUN("documents", test_documents);
     RUN("dom", test_dom_and_scripts);
     RUN("mime", test_script_mime);
     RUN("events", test_events_and_forms);
     RUN("selection-native", test_native_selection);
     RUN("timers", test_timers_and_promises);
+    RUN("microtasks", test_host_microtasks);
     RUN("fetch", test_fetch_and_cancel);
     RUN("limits", test_limits);
+    RUN("scripting", test_scripting_presentation);
     RUN("lifetime", test_lifetime);
 #undef RUN
     test_check("at-least-one-case", total != 0);

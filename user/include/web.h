@@ -38,6 +38,7 @@ struct web_request {
     const void *body;
     size_t body_len;
     int credentials; /* 0 omit, 1 same-origin, 2 include */
+    bool force_preflight; /* XHR upload listeners require CORS preflight even with safe headers. */
 };
 enum { WEB_HISTORY_INFO, WEB_HISTORY_PUSH, WEB_HISTORY_REPLACE, WEB_HISTORY_GO, WEB_HISTORY_SCROLL };
 struct web_history {

@@ -2457,5 +2457,5 @@ const char *css_ua_sheet(void) {
            "marquee { display: inline-block; }\n"
            "math { display: inline; }\n"
            "svg:not(:root) { overflow: hidden; }\n"
-           "noscript { display: block; }\n";
+           "@media (scripting:enabled) { noscript { display: none !important; } }\n";
 }

@@ -23,6 +23,7 @@ struct webnet_request {
     size_t body_len;
     bool user_navigation; /* only this permits a file: top-level request */
     enum webnet_credentials credentials;
+    bool force_preflight; /* Fetch use-CORS-preflight flag, not an author request header. */
 };
 struct webnet_response {
     int status;

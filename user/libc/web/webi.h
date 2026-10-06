@@ -83,7 +83,7 @@ extern const char *const tag_names[T_COUNT];
 
 enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_OTHER }; /* pseudo-elements */
 
-enum { N_DOC, N_ELEM, N_TEXT, N_COMMENT, N_FRAGMENT };
+enum { N_DOC, N_ELEM, N_TEXT, N_COMMENT, N_FRAGMENT, N_DOCTYPE };
 
 struct attr {
     const char *name;  /* lowercase */
@@ -95,11 +95,16 @@ struct style;
 struct box;
 
 typedef struct node {
+    web_doc *owner;          /* logical ownerDocument; changes on adoption */
+    web_doc *allocation_doc; /* arena/value lifetime owner; never changes */
+    struct node *template_content; /* separate inert tree, not element children */
+    struct node *template_host; /* host-inclusive cycle validation only */
     uint8_t type;
     uint16_t tag;
     bool foreign;     /* inside <svg> or <math> */
     const char *name; /* lowercase tag name */
     const char *raw_name;
+    const char *public_id, *system_id;
     struct attr *attrs;
     int nattrs;
     char *text; /* text and comment nodes */
@@ -425,6 +430,10 @@ struct web_image {
 };
 
 struct web_doc {
+    web_doc *dom_family, *dom_docs, *dom_next;
+    bool inert; /* independent DOM only: no window, loader, style/resource scan */
+    bool template_owner;
+    web_doc *template_doc;
     arena_t mem;    /* DOM, stylesheets */
     arena_t smem;   /* styles and boxes (rebuilt by the cascade) */
     arena_t lmem;   /* layout results */
@@ -467,6 +476,12 @@ struct web_doc {
 };
 
 node_t *html_parse(web_doc *d, const char *html, size_t n, const char *charset);
+web_doc *doc_inert(web_doc *family, const char *html, size_t n, const char *url);
+size_t doc_dom_remaining(web_doc *d);
+void doc_dom_budget(web_doc *d);
+bool doc_node_adopt(web_doc *d, node_t *node);
+node_t *doc_template_content(web_doc *d, node_t *node);
+bool doc_templates_finish(web_doc *d, node_t *root);
 const char *doc_link_href(web_doc *d, node_t *a); /* absolute URL; valid until the next call */
 void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *base);
 

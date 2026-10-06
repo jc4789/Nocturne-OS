@@ -235,6 +235,7 @@ static void append(node_t *parent, node_t *c) {
 static node_t *new_elem(struct html_parser *p, const char *name, size_t len, bool foreign) {
     node_t *e = ar_alloc(p->a, sizeof *e);
     e->owned_next = p->d->owned_nodes;
+    e->owner = e->allocation_doc = p->d;
     p->d->owned_nodes = e;
     e->type = N_ELEM;
     char lname[64];
@@ -328,6 +329,7 @@ static void insert_text(struct html_parser *p, const char *s, size_t n) {
     }
     node_t *t = ar_alloc(p->a, sizeof *t);
     t->owned_next = p->d->owned_nodes;
+    t->owner = t->allocation_doc = p->d;
     p->d->owned_nodes = t;
     t->type = N_TEXT;
     t->text = ar_strndup(p->a, s, n);
@@ -445,6 +447,7 @@ static void raw_element(struct html_parser *p, node_t *e, bool rcdata) {
     if (t->n) {
         node_t *tn = ar_alloc(p->a, sizeof *tn);
         tn->owned_next = p->d->owned_nodes;
+        tn->owner = tn->allocation_doc = p->d;
         p->d->owned_nodes = tn;
         tn->type = N_TEXT;
         tn->text = ar_strndup(p->a, t->p, t->n);
@@ -455,7 +458,7 @@ static void raw_element(struct html_parser *p, node_t *e, bool rcdata) {
     t->n = 0;
     if (e->tag == T_script) {
         if (p->scripting && !node_ancestor(e, T_template)) p->yield = e;
-        else if (p->fragment || node_ancestor(e, T_template)) e->script_started = true;
+        else if (p->fragment || p->d->inert || node_ancestor(e, T_template)) e->script_started = true;
     }
 }
 
@@ -475,6 +478,32 @@ static const int html_breakout[] = {T_b, T_big, T_blockquote, T_body, T_br, T_ce
 /* <!DOCTYPE ...>: standards mode for "html" without a legacy public identifier (a simplification
    of the HTML spec's quirks rules) */
 static void doctype(struct html_parser *p, const char *s, size_t n) {
+    /* Preserve the native DocumentType as well as the existing quirks policy. */
+    const char *end = s + n, *cursor = s;
+    while (cursor < end && is_space((unsigned char)*cursor)) cursor++;
+    const char *name = cursor;
+    while (cursor < end && !is_space((unsigned char)*cursor) && *cursor != '>') cursor++;
+    if (cursor > name && !p->fragment) {
+        node_t *node = ar_alloc(p->a, sizeof *node);
+        node->type = N_DOCTYPE; node->owner = node->allocation_doc = p->d; node->image = -1;
+        node->name = ar_strndup(p->a, name, (size_t)(cursor - name));
+        for (char *q = (char *)node->name; *q; q++) *q = (char)lower((unsigned char)*q);
+        while (cursor < end && is_space((unsigned char)*cursor)) cursor++;
+        bool public = end - cursor >= 6 && !strncasecmp(cursor, "public", 6);
+        bool system = end - cursor >= 6 && !strncasecmp(cursor, "system", 6);
+        if (public || system) cursor += 6;
+        for (unsigned i = 0; i < (public ? 2u : system ? 1u : 0u); i++) {
+            while (cursor < end && is_space((unsigned char)*cursor)) cursor++;
+            if (cursor >= end || (*cursor != '\'' && *cursor != '"')) break;
+            char quote = *cursor++; const char *value = cursor;
+            while (cursor < end && *cursor != quote) cursor++;
+            const char *id = ar_strndup(p->a, value, (size_t)(cursor - value));
+            if (public && !i) node->public_id = id; else node->system_id = id;
+            if (cursor < end) cursor++;
+        }
+        node->owned_next = p->d->owned_nodes; p->d->owned_nodes = node;
+        append(p->doc, node);
+    }
     char buf[256];
     size_t k = n < sizeof buf - 1 ? n : sizeof buf - 1;
     for (size_t i = 0; i < k; i++) buf[i] = (char)lower((unsigned char)s[i]);
@@ -837,10 +866,17 @@ static void tokenize(struct html_parser *p) {
             char c1 = s[p->i + 1];
             if (c1 == '!') {
                 if (p->i + 3 < n && s[p->i + 2] == '-' && s[p->i + 3] == '-') {
+                    flush_text(p);
                     p->i += 4;
+                    size_t start = p->i, stop = start;
                     if (p->i < n && s[p->i] == '>') p->i++;
                     else if (p->i + 1 < n && s[p->i] == '-' && s[p->i + 1] == '>') p->i += 2;
-                    else skip_past(p, "-->");
+                    else { skip_past(p, "-->"); stop = p->i >= start + 3 && !memcmp(s + p->i - 3, "-->", 3) ? p->i - 3 : p->i; }
+                    node_t *comment = ar_alloc(p->a, sizeof *comment);
+                    comment->type = N_COMMENT; comment->owner = comment->allocation_doc = p->d; comment->image = -1;
+                    comment->text = ar_strndup(p->a, s + start, stop - start); comment->textlen = stop - start;
+                    comment->owned_next = p->d->owned_nodes; p->d->owned_nodes = comment;
+                    append(p->sp ? cur(p) : p->doc, comment);
                 } else if (p->i + 9 <= n && !memcmp(s + p->i, "<![CDATA[", 9) && p->sp && cur(p)->foreign) {
                     p->i += 9;
                     size_t st = p->i;
@@ -1001,6 +1037,7 @@ struct html_parser *html_begin(web_doc *d, const char *src, size_t n, const char
     p->doc->type = N_DOC;
     p->doc->image = -1;
     p->doc->owned_next = d->owned_nodes;
+    p->doc->owner = p->doc->allocation_doc = d;
     d->owned_nodes = p->doc;
     d->root = p->doc;
     d->mem.trap = old;
@@ -1010,6 +1047,7 @@ struct html_parser *html_begin(web_doc *d, const char *src, size_t n, const char
 int html_resume(struct html_parser *p, node_t **script) {
     if (script) *script = NULL;
     if (!p || p->failed) return -1;
+    doc_dom_budget(p->d);
     if (p->finished) return 0;
     jmp_buf trap;
     jmp_buf *old = p->a->trap;
@@ -1034,6 +1072,7 @@ int html_resume(struct html_parser *p, node_t **script) {
         p->d->dirty = p->d->need_style = true;
     }
     p->a->trap = old;
+    if (!p->fragment && !doc_templates_finish(p->d, p->doc)) { p->failed = true; return -1; }
     if (script) *script = p->yield;
     return p->yield ? 1 : 0;
 }
@@ -1117,6 +1156,7 @@ node_t *html_fragment(web_doc *d, node_t *context, const char *src, size_t n) {
     frag->last = last;
     for (node_t *c = first; c; c = c->next) c->parent = frag;
     html_finish(p);
+    if (!doc_templates_finish(d, frag)) return NULL;
     return frag;
 }
 

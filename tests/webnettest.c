@@ -52,12 +52,18 @@ static int children(void) {
     for (int i = 0; i < n; i++) if (p[i].ppid == getpid() && strstr(p[i].name, "webfetch")) count++;
     return count;
 }
+static uint64_t request_flags(struct result *r, int port, const char *path, enum webnet_kind kind,
+                        const char *method, const char *headers, const void *body, size_t length,
+                        uint64_t generation, bool force_preflight) {
+    char url[WEBNET_URL_MAX]; snprintf(url, sizeof url, "http://10.0.2.2:%d%s", ports[port], path);
+    struct webnet_request q = {kind, generation, url, document, method, headers, body, length, false, WEBNET_CREDENTIALS_OMIT};
+    q.force_preflight = force_preflight;
+    return webnet_submit(net, &q, completed, r);
+}
 static uint64_t request(struct result *r, int port, const char *path, enum webnet_kind kind,
                         const char *method, const char *headers, const void *body, size_t length,
                         uint64_t generation) {
-    char url[WEBNET_URL_MAX]; snprintf(url, sizeof url, "http://10.0.2.2:%d%s", ports[port], path);
-    struct webnet_request q = {kind, generation, url, document, method, headers, body, length, false, WEBNET_CREDENTIALS_OMIT};
-    return webnet_submit(net, &q, completed, r);
+    return request_flags(r, port, path, kind, method, headers, body, length, generation, false);
 }
 static bool success(const struct result *r) { return r->calls == 1 && r->status == 200 && !r->error[0]; }
 static void expect_request(int port, const char *path, enum webnet_kind kind, const char *headers,
@@ -129,6 +135,35 @@ static void cors_tests(void) {
     uint64_t id = request(&r, 1, "/api/cors", WEBNET_FETCH, "GET", NULL, NULL, 0, 30);
     check(id && wait_result(&r, 40000) && success(&r) && strstr(r.headers, "X-Exposed: visible") &&
           !strstr(r.headers, "X-Private"), "cross-origin CORS and response-header exposure");
+    release(&r);
+    id = request_flags(&r, 1, "/api/cors?force=post&allow_methods=omit&allow_headers=omit", WEBNET_FETCH,
+                       "POST", "Content-Type: text/plain\r\n", "upload", 6, 33, true);
+    check(id && wait_result(&r, 40000) && success(&r) && strstr(r.body, "\"preflight_count\": 1") &&
+          strstr(r.body, "\"body\": \"upload\""), "upload listener forces simple POST OPTIONS without allow-methods/headers");
+    release(&r);
+    id = request_flags(&r, 1, "/api/cors?force=get", WEBNET_FETCH, "GET", NULL, NULL, 0, 34, true);
+    check(id && wait_result(&r, 40000) && success(&r) && strstr(r.body, "\"preflight_count\": 1"),
+          "upload listener forces cross-origin GET preflight even without a request body");
+    release(&r);
+    id = request_flags(&r, 0, "/api/cors?force=same-origin", WEBNET_FETCH, "POST",
+                       "Content-Type: text/plain\r\n", "upload", 6, 35, true);
+    check(id && wait_result(&r, 40000) && success(&r) && strstr(r.body, "\"preflight_count\": 0"),
+          "forced preflight does not create same-origin OPTIONS");
+    release(&r);
+    id = request(&r, 1, "/api/cors?force=none", WEBNET_FETCH, "POST",
+                 "Content-Type: text/plain\r\n", "upload", 6, 36);
+    check(id && wait_result(&r, 40000) && success(&r) && strstr(r.body, "\"preflight_count\": 0"),
+          "simple cross-origin POST without upload listener does not preflight");
+    release(&r);
+    id = request_flags(&r, 1, "/api/no-cors?force=denied", WEBNET_FETCH, "POST",
+                       "Content-Type: text/plain\r\n", "upload", 6, 37, true);
+    check(id && wait_result(&r, 40000) && r.status == 0 && strstr(r.error, "preflight failed"),
+          "forced preflight rejection stops the actual request");
+    release(&r);
+    id = request_flags(&r, 1, "/api/cors?force=unsafe&allow_headers=omit", WEBNET_FETCH, "POST",
+                       "X-Fixture: nocturne\r\n", "upload", 6, 38, true);
+    check(id && wait_result(&r, 40000) && r.status == 0 && strstr(r.error, "allow method or headers"),
+          "forced preflight still requires explicit permission for unsafe headers");
     release(&r);
     id = request(&r, 1, "/api/cors?preflight=network", WEBNET_FETCH, "POST",
                  "Content-Type: application/json\r\nX-Fixture: nocturne\r\n", "{}", 2, 31);

@@ -55,7 +55,9 @@ class Handler(SimpleHTTPRequestHandler):
             pass  # An abort is an expected browser fixture outcome.
 
     def do_OPTIONS(self):
-        path = urlsplit(self.path).path
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
         with self.preflight_lock:
             self.preflights[self.path] = self.preflights.get(self.path, 0) + 1
             self.preflight_cookies[self.path] = self.headers.get("Cookie", "")
@@ -63,9 +65,11 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         if path != "/api/no-cors":
             self.cors(credentials=path.startswith("/api/cookie"))
-            self.send_header("Access-Control-Allow-Methods", "GET, POST")
+            if query.get("allow_methods") != ["omit"]:
+                self.send_header("Access-Control-Allow-Methods", "GET, POST")
             allowed = "*" if path == "/api/cors-wildcard" else self.headers.get("Access-Control-Request-Headers", "")
-            self.send_header("Access-Control-Allow-Headers", allowed)
+            if query.get("allow_headers") != ["omit"]:
+                self.send_header("Access-Control-Allow-Headers", allowed)
         self.end_headers()
 
     def api(self):

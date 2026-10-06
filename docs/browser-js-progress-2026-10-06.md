@@ -1,5 +1,7 @@
 # JavaScript統合と文字コードの実サイト検証・追補
 
+以下はbuild13までの記録です。その後の実サイトmicrotask再帰とNocturneのheap失敗処理の修正は[続報](browser-native-progress-2026-10-06.md)を参照してください。
+
 ## 判定
 
 **部分修正。指定4サイトの全面動作は未達成。** この文書は同日の

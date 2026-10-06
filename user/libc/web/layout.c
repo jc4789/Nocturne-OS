@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <math.h>
 #include "webi.h"
+#include "svg_geometry.h"
 
 static web_doc *D;
 static float VW, VH;
@@ -290,22 +291,24 @@ static void replaced_natural(box_t *c, float *iw, float *ih, float *ratio) {
         break;
     }
     case AT_SVG: {
-        const char *w = node_attr(n, "width"), *h = node_attr(n, "height"), *vb = node_attr(n, "viewBox");
-        if (!vb) vb = node_attr(n, "viewbox");
-        float vw = 0, vh = 0;
-        if (vb) {
-            float a, b2;
-            if (sscanf(vb, "%f%*[ ,]%f%*[ ,]%f%*[ ,]%f", &a, &b2, &vw, &vh) != 4) vw = vh = 0;
-        }
-        if (w && !strchr(w, '%')) *iw = (float)atof(w);
-        if (h && !strchr(h, '%')) *ih = (float)atof(h);
-        if (vw > 0 && vh > 0) *ratio = vw / vh;
-        else if (*iw > 0 && *ih > 0) *ratio = *iw / *ih;
-        if (*iw <= 0 && *ih <= 0) {
-            *iw = vw > 0 ? 300 : 300;
-            *ih = *ratio > 0 ? *iw / *ratio : 150;
-        } else if (*iw <= 0) *iw = *ratio > 0 ? *ih * *ratio : 300;
-        else if (*ih <= 0) *ih = *ratio > 0 ? *iw / *ratio : 150;
+        float vb[4];
+        int view = svg_viewbox(node_attr(n, "viewbox"), vb);
+        /* Presentation attributes and author CSS have already cascaded. Only
+           absolute computed lengths are intrinsic dimensions (not %/auto). */
+        *iw = spec_w(c, &c->st->width, -1);
+        *ih = spec_h(c, &c->st->height, -1);
+        if (*iw > 0 && *ih > 0) *ratio = *iw / *ih;
+        else if (view == 1) *ratio = vb[2] / vb[3];
+        if (*iw < 0 && *ih < 0) {
+            /* No intrinsic dimensions: contain the ratio in the default
+               300x150 object rectangle; viewBox is not a pixel size. */
+            *iw = 300; *ih = 150;
+            if (*ratio > 0) {
+                if (*ratio > 2) *ih = *iw / *ratio;
+                else *iw = *ih * *ratio;
+            }
+        } else if (*iw < 0) *iw = *ratio > 0 ? *ih * *ratio : 300;
+        else if (*ih < 0) *ih = *ratio > 0 ? *iw / *ratio : 150;
         break;
     }
     case AT_PLACEHOLDER:
@@ -321,17 +324,24 @@ static void size_replaced(box_t *c, float cbw, float cbh) {
     float iw, ih, ratio;
     replaced_natural(c, &iw, &ih, &ratio);
     float w = spec_w(c, &c->st->width, cbw), h = spec_h(c, &c->st->height, cbh);
+    if (c->atomic == AT_SVG) {
+        /* Outermost inline SVG auto acts as 100% where the containing axis is
+           definite. Intrinsic passes use -1; do not invent a percentage base. */
+        if (len_auto(&c->st->width) && cbw >= 0) w = cbw;
+        if (len_auto(&c->st->height) && cbh >= 0) h = cbh;
+    }
+    bool derive_w = w < 0, derive_h = h < 0;
     if (w < 0 && h < 0) w = iw, h = ih;
     else if (w < 0) w = ratio > 0 ? h * ratio : iw;
     else if (h < 0) h = ratio > 0 ? w / ratio : ih;
     float mx = spec_w(c, &c->st->max_width, cbw);
     if (mx >= 0 && w > mx) {
-        if (ratio > 0 && spec_h(c, &c->st->height, cbh) < 0) h = mx / ratio;
+        if (ratio > 0 && derive_h) h = mx / ratio;
         w = mx;
     }
     float mxh = spec_h(c, &c->st->max_height, cbh);
     if (mxh >= 0 && h > mxh) {
-        if (ratio > 0 && spec_w(c, &c->st->width, cbw) < 0) w = mxh * ratio;
+        if (ratio > 0 && derive_w) w = mxh * ratio;
         h = mxh;
     }
     w = clamp_w(c, w, cbw);
@@ -858,7 +868,7 @@ static int split_word(struct iline *L, int i, float avail) {
     return 1;
 }
 
-static void layout_inline(box_t *b, struct bfc *f, float ox, float oy) {
+static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh) {
     struct ivec iv = {0};
     struct ibuild bs = {&iv, true, NULL, 0};
     if (b->node && b->node->tag == T_a && node_attr(b->node, "href")) bs.link = b->node;
@@ -880,7 +890,7 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy) {
         else if (it->kind == IT_CLOSE) it->w = inline_edge(it->box, false, b->w);
         else if (it->kind == IT_ATOMIC) {
             box_t *c = it->box;
-            size_atomic(c, b->w, -1);
+            size_atomic(c, b->w, c->atomic == AT_SVG ? cbh : -1);
             it->w = c->w + hext(c) + c->m[1] + c->m[3];
         }
     }
@@ -2471,7 +2481,7 @@ static void layout_inner(box_t *b, struct bfc *f, float ox, float oy, float cbh)
     case B_FLEX: layout_flex(b, cbh); break;
     case B_GRID: layout_grid(b, cbh); break;
     default:
-        if (b->inline_ctx) layout_inline(b, f, ox, oy);
+        if (b->inline_ctx) layout_inline(b, f, ox, oy, child_cbh);
         else layout_blocks(b, f, ox, oy, child_cbh);
     }
     if (root && f->n) { /* a new formatting context contains its floats */

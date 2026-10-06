@@ -158,7 +158,7 @@ static bool load_file(struct job *j) {
     char path[WEBNET_URL_MAX], document_path[WEBNET_URL_MAX];
     if (!file_path(j->url, path, sizeof path)) return fail(j, "Invalid local URL");
     if (j->wire.kind == WEBNET_NAVIGATION) {
-        if (!j->wire.user_navigation) return fail(j, "Only a user navigation may open a local file");
+        if (!(j->wire.user_navigation & WEBNET_WIRE_USER_NAVIGATION)) return fail(j, "Only a user navigation may open a local file");
     } else {
         if (!file_path(j->document, document_path, sizeof document_path)) return fail(j, "Remote pages cannot open local files");
         char *slash = strrchr(document_path, '/');
@@ -384,8 +384,11 @@ static bool preflight(struct job *j, const char *url, const char *method, const 
     if (r.status < 200 || r.status >= 300) { http_resp_free(&r); return fail(j, "CORS preflight failed"); }
     if (!cors_allowed(j, &r)) { http_resp_free(&r); return false; }
     char methods[1024], allowed[4096];
-    bool ok = field(r.headers, "Access-Control-Allow-Methods", methods, sizeof methods) &&
-              (list_has(methods, method, false) || (j->wire.credentials != WEBNET_CREDENTIALS_INCLUDE && list_has(methods, "*", false)));
+    /* Safelisted methods do not need an Allow-Methods entry. XHR upload
+       listeners can force OPTIONS even for a simple GET/POST request. */
+    bool ok = !strcmp(method, "GET") || !strcmp(method, "POST") ||
+              (field(r.headers, "Access-Control-Allow-Methods", methods, sizeof methods) &&
+               (list_has(methods, method, false) || (j->wire.credentials != WEBNET_CREDENTIALS_INCLUDE && list_has(methods, "*", false))));
     if (*names) {
         ok = ok && field(r.headers, "Access-Control-Allow-Headers", allowed, sizeof allowed);
         for (const char *p = names; ok && *p;) {
@@ -454,7 +457,7 @@ static bool run_http(struct job *j) {
         const char *method = drop_body ? "GET" : j->method;
         /* Redirects can remove authorization/body fields; rederive the preflight names. */
         if (!validate_headers(j, names, sizeof names)) return false;
-        if (cors_kind(j) && cross && *names && !preflight(j, current, method, names)) return false;
+        if (cors_kind(j) && cross && (*names || (j->wire.user_navigation & WEBNET_WIRE_FORCE_PREFLIGHT)) && !preflight(j, current, method, names)) return false;
         char headers[WEBNET_HEADERS_MAX + WEBNET_URL_MAX + WEBCOOKIE_OUTPUT_MAX + 64];
         int hn;
         if (cors_kind(j)) hn = snprintf(headers, sizeof headers, "%sOrigin: %s\r\n", j->headers, j->origin);
@@ -526,7 +529,7 @@ int main(void) {
     if (!read_all(0, w, sizeof *w) || w->magic != WEBNET_MAGIC || w->kind > WEBNET_FETCH ||
         !w->url_len || w->url_len >= WEBNET_URL_MAX || w->origin_len >= WEBNET_URL_MAX ||
         !w->method_len || w->method_len >= 8 || w->headers_len >= WEBNET_HEADERS_MAX || w->body_len > WEBNET_BODY_LIMIT ||
-        w->credentials>WEBNET_CREDENTIALS_INCLUDE || w->cookie_len>WEBCOOKIE_SNAPSHOT_MAX ||
+        w->credentials>WEBNET_CREDENTIALS_INCLUDE || (w->user_navigation & ~WEBNET_WIRE_REQUEST_FLAGS) || w->cookie_len>WEBCOOKIE_SNAPSHOT_MAX ||
         (w->credentials==WEBNET_CREDENTIALS_OMIT && w->cookie_len)) { free(j); return 1; }
     j->url = read_string(w->url_len, false); j->document = read_string(w->origin_len, false);
     j->method = read_string(w->method_len, false); j->headers = read_string(w->headers_len, false);

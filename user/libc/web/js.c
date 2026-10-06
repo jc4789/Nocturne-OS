@@ -47,7 +47,7 @@ struct js_pending {
     struct js_script *script;
     JSValue resolve, reject;
     char *url;
-    bool done, aborted;
+    bool done, aborted, force_preflight;
     struct web_response response;
     struct js_pending *next;
 };
@@ -57,7 +57,7 @@ struct js_resource_event { node_t *node; bool failed, image, selection; uint64_t
 struct js_image_decode { node_t *node; uint64_t generation; JSValue resolve, reject; struct js_image_decode *next; };
 /* Order is shared with the bootstrap's private nodeProtos array. */
 enum { NP_NODE, NP_DOCUMENT, NP_ELEMENT, NP_HTML, NP_TEXT, NP_COMMENT, NP_FRAGMENT, NP_IFRAME, NP_IMAGE,
-       NP_INPUT, NP_BUTTON, NP_SELECT, NP_TEXTAREA, NP_FIELDSET, NP_OBJECT, NP_OUTPUT, NP_OPTION, NP_COUNT };
+       NP_INPUT, NP_BUTTON, NP_SELECT, NP_TEXTAREA, NP_FIELDSET, NP_OBJECT, NP_OUTPUT, NP_OPTION, NP_TEMPLATE, NP_DOCTYPE, NP_COUNT };
 struct js_alloc_diagnostics { size_t peak, requested, used, limit; unsigned failures, reported; bool quota; };
 struct web_js_state {
     struct js_alloc_diagnostics allocation;
@@ -159,6 +159,11 @@ static void report_allocation_failure(struct web_js_state *s) {
         snprintf(message,sizeof message,"JavaScript allocation failure: %s; requested %lu, charged %lu, limit %lu, peak %lu bytes",
             d->quota?"runtime quota":"Nocturne allocator",(unsigned long)d->requested,(unsigned long)d->used,(unsigned long)d->limit,(unsigned long)d->peak);
         s->allocation.reported=d->failures;log_text(s,0,message);
+        JSMemoryUsage usage; JS_ComputeMemoryUsage(s->rt, &usage);
+        snprintf(message,sizeof message,"JavaScript heap: %ld allocations; %ld objects, %ld properties; strings %ld, functions %ld, bytecode %ld bytes",
+            (long)usage.malloc_count,(long)usage.obj_count,(long)usage.prop_count,
+            (long)usage.str_size,(long)usage.js_func_size,(long)usage.js_func_code_size);
+        log_text(s,0,message);
     }
 }
 static void exception(struct web_js_state *s) {
@@ -196,7 +201,7 @@ static void end_task(struct web_js_state *s) {
             if (interrupt(s->rt, s)) break;
             int r = JS_ExecutePendingJob(s->rt, &ctx);
             if (r < 0) exception(s);
-            if (r <= 0) break;
+            if (r == 0) break;
         }
     }
     if (s->running == 1) {
@@ -205,7 +210,25 @@ static void end_task(struct web_js_state *s) {
         report_allocation_failure(s);
         for (int i = 0; i < 32; i++) if (s->rejections[i].used) {
             const char *p = JS_ToCString(s->ctx, s->rejections[i].reason);
-            if (p) { sbuf b = {0}; sb_puts(&b, "Unhandled promise rejection: "); sb_puts(&b, p); log_text(s, 2, sb_cstr(&b)); sb_free(&b); }
+            sbuf b = {0}; sb_puts(&b, "Unhandled promise rejection: ");
+            sb_puts(&b, p ? p : "JavaScript exception");
+            /* Module failures are rejected promises. Preserve their engine
+               backtrace too, without invoking a page-defined stack getter or
+               a Proxy trap while diagnosing an interrupted task. */
+            if (JS_IsError(s->ctx, s->rejections[i].reason)) {
+                JSAtom atom = JS_NewAtom(s->ctx, "stack");
+                JSPropertyDescriptor desc;
+                if (atom && JS_GetOwnProperty(s->ctx, &desc, s->rejections[i].reason, atom) > 0) {
+                    if (JS_IsString(desc.value)) {
+                        const char *stack = JS_ToCString(s->ctx, desc.value);
+                        if (stack && *stack) { sb_putc(&b, '\n'); sb_puts(&b, stack); }
+                        JS_FreeCString(s->ctx, stack);
+                    }
+                    JS_FreeValue(s->ctx, desc.value); JS_FreeValue(s->ctx, desc.getter); JS_FreeValue(s->ctx, desc.setter);
+                }
+                JS_FreeAtom(s->ctx, atom);
+            }
+            log_text(s, 2, sb_cstr(&b)); sb_free(&b);
             JS_FreeCString(s->ctx, p);
             JS_FreeValue(s->ctx, s->rejections[i].promise); JS_FreeValue(s->ctx, s->rejections[i].reason);
             s->rejections[i].used = false;
@@ -239,7 +262,7 @@ static node_t *unwrap(JSContext *ctx, JSValueConst v) {
 static JSValueConst node_prototype(struct web_js_state *s, const node_t *n) {
     int kind = n->type == N_DOC ? NP_DOCUMENT : n->type == N_ELEM ?
                (n->foreign ? NP_ELEMENT : n->tag == T_iframe ? NP_IFRAME : NP_HTML) :
-               n->type == N_TEXT ? NP_TEXT : n->type == N_COMMENT ? NP_COMMENT : NP_FRAGMENT;
+               n->type == N_TEXT ? NP_TEXT : n->type == N_COMMENT ? NP_COMMENT : n->type == N_DOCTYPE ? NP_DOCTYPE : NP_FRAGMENT;
     if (n->type == N_ELEM && !n->foreign) switch (n->tag) {
         case T_img: kind = NP_IMAGE; break;
         case T_input: kind = NP_INPUT; break;
@@ -250,6 +273,7 @@ static JSValueConst node_prototype(struct web_js_state *s, const node_t *n) {
         case T_object: kind = NP_OBJECT; break;
         case T_output: kind = NP_OUTPUT; break;
         case T_option: kind = NP_OPTION; break;
+        case T_template: kind = NP_TEMPLATE; break;
     }
     return s->node_protos[kind];
 }
@@ -299,6 +323,9 @@ static bool equal_nodes(const node_t *a, const node_t *b) {
                     !strcmp(a->attrs[i].value, b->attrs[j].value)) { found = true; break; }
             if (!found) return false;
         }
+    } else if (a->type == N_DOCTYPE) {
+        if (strcmp(a->name, b->name) || strcmp(a->public_id ? a->public_id : "", b->public_id ? b->public_id : "") ||
+            strcmp(a->system_id ? a->system_id : "", b->system_id ? b->system_id : "")) return false;
     } else if (a->type == N_TEXT || a->type == N_COMMENT) {
         if (a->textlen != b->textlen || (a->textlen && memcmp(a->text, b->text, a->textlen))) return false;
     }
@@ -351,6 +378,12 @@ static void serialize(node_t *n, sbuf *b) {
         if (n->parent && (n->parent->tag == T_script || n->parent->tag == T_style)) sb_put(b, n->text, n->textlen);
         else escape_html(b, n->text ? n->text : "", n->textlen, false);
     } else if (n->type == N_COMMENT) { sb_puts(b, "<!--"); sb_put(b, n->text ? n->text : "", n->textlen); sb_puts(b, "-->"); }
+    else if (n->type == N_DOCTYPE) {
+        sb_puts(b, "<!DOCTYPE "); sb_puts(b, n->name);
+        if (n->public_id && *n->public_id) { sb_puts(b, " PUBLIC \""); sb_puts(b, n->public_id); sb_putc(b, '"'); }
+        if (n->system_id && *n->system_id) { sb_puts(b, n->public_id && *n->public_id ? " \"" : " SYSTEM \""); sb_puts(b, n->system_id); sb_putc(b, '"'); }
+        sb_putc(b, '>');
+    }
     else {
         if (n->type == N_ELEM) {
             sb_putc(b, '<'); sb_puts(b, n->raw_name ? n->raw_name : n->name);
@@ -360,7 +393,8 @@ static void serialize(node_t *n, sbuf *b) {
             }
             sb_putc(b, '>');
         }
-        for (node_t *c = n->first; c; c = c->next) serialize(c, b);
+        node_t *parent = n->template_content ? n->template_content : n;
+        for (node_t *c = parent->first; c; c = c->next) serialize(c, b);
         if (n->type == N_ELEM && !void_tag(n->tag)) { sb_puts(b, "</"); sb_puts(b, n->raw_name ? n->raw_name : n->name); sb_putc(b, '>'); }
     }
 }
@@ -380,7 +414,7 @@ static JSValue option_value(JSContext *ctx, node_t *option) {
 }
 static bool html_image(const node_t *n) { return n && n->type == N_ELEM && !n->foreign && n->tag == T_img; }
 static JSValue get_image(struct web_js_state *s, node_t *n, const char *p) {
-    JSContext *ctx = s->ctx; web_doc *d = s->doc;
+    JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
     if (!html_image(n)) return JS_ThrowTypeError(ctx, "HTMLImageElement receiver required");
     if (!strcmp(p, "imageBrand")) return JS_UNDEFINED;
     if (d->resources_dirty) doc_rescan(d);
@@ -414,6 +448,7 @@ static JSValue get_image(struct web_js_state *s, node_t *n, const char *p) {
 }
 static JSValue image_decode_promise(struct web_js_state *s, node_t *n) {
     if (!html_image(n)) return JS_ThrowTypeError(s->ctx, "HTMLImageElement receiver required");
+    if (n->owner && n->owner->inert) return JS_ThrowTypeError(s->ctx, "Image decoding requires an active document");
     if (s->doc->resources_dirty) doc_rescan(s->doc);
     doc_image_sync(s->doc, n);
     JSValue functions[2] = {JS_UNDEFINED, JS_UNDEFINED};
@@ -428,7 +463,23 @@ static JSValue image_decode_promise(struct web_js_state *s, node_t *n) {
     return promise;
 }
 static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
-    JSContext *ctx = s->ctx; web_doc *d = s->doc;
+    JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
+    if (!strcmp(p, "ownerDocument")) return n->type == N_DOC ? JS_NULL : wrap(s, d->root);
+    if (!strcmp(p, "scripting")) return JS_NewBool(ctx, d == s->doc);
+    if (!strcmp(p, "templateContent")) {
+        if (n->type != N_ELEM || n->foreign || n->tag != T_template) return JS_ThrowTypeError(ctx, "HTMLTemplateElement receiver required");
+        node_t *content = doc_template_content(d, n);
+        return content ? wrap(s, content) : oom(ctx);
+    }
+    if (!strcmp(p, "URL") || !strcmp(p, "documentURI")) return JS_NewString(ctx, d->url);
+    if (!strcmp(p, "contentType")) return JS_NewString(ctx, "text/html");
+    if (!strcmp(p, "characterSet")) return JS_NewString(ctx, "UTF-8");
+    if (!strcmp(p, "compatMode")) return JS_NewString(ctx, d->quirks ? "BackCompat" : "CSS1Compat");
+    if (!strcmp(p, "doctype")) { for (node_t *c = d->root->first; c; c = c->next) if (c->type == N_DOCTYPE) return wrap(s, c); return JS_NULL; }
+    if (!strcmp(p, "doctypeName") || !strcmp(p, "publicId") || !strcmp(p, "systemId")) {
+        if (n->type != N_DOCTYPE) return JS_ThrowTypeError(ctx, "DocumentType receiver required");
+        return JS_NewString(ctx, !strcmp(p, "doctypeName") ? n->name : !strcmp(p, "publicId") ? (n->public_id ? n->public_id : "") : (n->system_id ? n->system_id : ""));
+    }
     if (!strncmp(p, "image", 5)) return get_image(s, n, p);
     if (!strncmp(p, "form:", 5)) {
         if (n->type != N_ELEM || n->foreign || strcmp(n->name, p + 5)) return JS_ThrowTypeError(ctx, "Form control interface receiver required");
@@ -443,9 +494,9 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     }
     if (d->resources_dirty && (!strcmp(p, "documentElement") || !strcmp(p, "head") || !strcmp(p, "body") || !strcmp(p, "baseURI") || !strcmp(p, "activeElement"))) doc_rescan(d);
     if (!strcmp(p, "value") || !strcmp(p, "checked") || !strcmp(p, "selectedIndex") || !strcmp(p, "selected")) doc_control_init(d, n);
-    if (!strcmp(p, "nodeType")) return JS_NewInt32(ctx, n->type == N_DOC ? 9 : n->type == N_ELEM ? 1 : n->type == N_TEXT ? 3 : n->type == N_COMMENT ? 8 : 11);
+    if (!strcmp(p, "nodeType")) return JS_NewInt32(ctx, n->type == N_DOC ? 9 : n->type == N_ELEM ? 1 : n->type == N_TEXT ? 3 : n->type == N_COMMENT ? 8 : n->type == N_DOCTYPE ? 10 : 11);
     if (!strcmp(p, "nodeName")) {
-        if (n->type != N_ELEM) return JS_NewString(ctx, n->type == N_DOC ? "#document" : n->type == N_TEXT ? "#text" : n->type == N_COMMENT ? "#comment" : "#document-fragment");
+        if (n->type != N_ELEM) return JS_NewString(ctx, n->type == N_DOC ? "#document" : n->type == N_TEXT ? "#text" : n->type == N_COMMENT ? "#comment" : n->type == N_DOCTYPE ? n->name : "#document-fragment");
         char name[256]; snprintf(name, sizeof name, "%s", n->foreign ? n->raw_name : n->name);
         if (!n->foreign) for (char *q = name; *q; ++q) *q = (char)toupper((unsigned char)*q);
         return JS_NewString(ctx, name);
@@ -454,21 +505,21 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     if (!strcmp(p, "namespaceURI")) return n->type != N_ELEM ? JS_NULL : JS_NewString(ctx, n->foreign ? (node_ancestor(n, T_math) ? "http://www.w3.org/1998/Math/MathML" : "http://www.w3.org/2000/svg") : "http://www.w3.org/1999/xhtml");
     if (!strcmp(p, "nodeValue")) return n->type == N_TEXT || n->type == N_COMMENT ? JS_NewStringLen(ctx, n->text ? n->text : "", n->textlen) : JS_NULL;
     if (!strcmp(p, "parentNode")) return wrap(s, n->parent);
-    if (!strcmp(p, "isConnected")) return JS_NewBool(ctx, connected(s, n));
+    if (!strcmp(p, "isConnected")) { node_t *root = n; while (root->parent) root = root->parent; return JS_NewBool(ctx, root->type == N_DOC); }
     if (!strcmp(p, "firstChild")) return wrap(s, n->first);
     if (!strcmp(p, "lastChild")) return wrap(s, n->last);
     if (!strcmp(p, "nextSibling")) return wrap(s, n->next);
     if (!strcmp(p, "previousSibling")) return wrap(s, n->prev);
     if (!strcmp(p, "childNodes")) return children(s, n);
     if (!strcmp(p, "textContent")) {
-        if (n->type == N_DOC) return JS_NULL;
+        if (n->type == N_DOC || n->type == N_DOCTYPE) return JS_NULL;
         if (n->type == N_TEXT || n->type == N_COMMENT) return JS_NewStringLen(ctx, n->text ? n->text : "", n->textlen);
         sbuf b = {0}; node_text_content(n, &b); JSValue v = JS_NewStringLen(ctx, b.p ? b.p : "", b.n); sb_free(&b); return v;
     }
     if (!strcmp(p, "innerHTML") || !strcmp(p, "outerHTML")) {
         sbuf b = {0};
         if (!strcmp(p, "outerHTML")) serialize(n, &b);
-        else for (node_t *c = n->first; c; c = c->next) serialize(c, &b);
+        else for (node_t *c = n->template_content ? n->template_content->first : n->first; c; c = c->next) serialize(c, &b);
         JSValue v = JS_NewStringLen(ctx, b.p ? b.p : "", b.n); sb_free(&b); return v;
     }
     if (!strcmp(p, "attributeNames")) {
@@ -481,7 +532,16 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     if (!strcmp(p, "body")) return wrap(s, d->body);
     if (!strcmp(p, "activeElement")) return wrap(s, d->focus && connected(s, d->focus) ? d->focus : d->body);
     if (!strcmp(p, "baseURI")) return JS_NewString(ctx, d->base);
-    if (!strcmp(p, "title")) { if (d->resources_dirty) doc_rescan(d); return JS_NewString(ctx, d->title ? d->title : ""); }
+    if (!strcmp(p, "title")) {
+        if (d->resources_dirty) doc_rescan(d);
+        if (d->inert) {
+            sbuf text = {0};
+            for (node_t *c = d->head ? d->head->first : NULL; c; c = c->next)
+                if (c->tag == T_title) { node_text_content(c, &text); break; }
+            JSValue result = JS_NewStringLen(ctx, text.p ? text.p : "", text.n); sb_free(&text); return result;
+        }
+        return JS_NewString(ctx, d->title ? d->title : "");
+    }
     if (!strcmp(p, "value")) {
         if (n->tag == T_select) { node_t *option = option_at_js(n, n->selected); return option ? option_value(ctx, option) : JS_NewString(ctx, ""); }
         if (n->tag == T_option) return option_value(ctx, n);
@@ -496,7 +556,8 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
 }
 
 static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValueConst value) {
-    JSContext *ctx = s->ctx; web_doc *d = s->doc;
+    JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
+    if (d->resources_dirty && !strcmp(p, "title")) doc_rescan(d);
     if (!strcmp(p, "imageWidth") || !strcmp(p, "imageHeight")) {
         if (!html_image(n)) return JS_ThrowTypeError(ctx, "HTMLImageElement receiver required");
         uint32_t number; if (JS_ToUint32(ctx, &number, value) < 0) return JS_EXCEPTION;
@@ -603,7 +664,7 @@ static JSValue style_access(struct web_js_state *s, node_t *n, const char *prope
         sb_puts(&b, property); sb_putc(&b, ':'); sb_puts(&b, v);
         if (prio && *prio) sb_puts(&b, " !important"); sb_putc(&b, ';');
     }
-    bool ok = doc_node_attr(s->doc, n, "style", sb_cstr(&b));
+    bool ok = doc_node_attr(n->owner ? n->owner : s->doc, n, "style", sb_cstr(&b));
     JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b);
     return ok ? JS_UNDEFINED : oom(ctx);
 }
@@ -752,7 +813,7 @@ static JSValue custom_element_hook(struct web_js_state *s, const char *name, int
     return result;
 }
 static JSValue control_selection_dom(struct web_js_state *s, node_t *n, int argc, JSValueConst *argv) {
-    JSContext *ctx = s->ctx; web_doc *d = s->doc;
+    JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
     if (argc < 4) return JS_ThrowTypeError(ctx, "Selection operation requires an interface and operation");
     const char *brand = JS_ToCString(ctx, argv[2]), *op = JS_ToCString(ctx, argv[3]);
     if (!brand || !op) { JS_FreeCString(ctx, brand); JS_FreeCString(ctx, op); return JS_EXCEPTION; }
@@ -789,13 +850,21 @@ static JSValue native_dom(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     const char *op = JS_ToCString(ctx, argv[0]); if (!op) return JS_EXCEPTION;
     node_t *n = unwrap(ctx, argv[1]);
     if (!n && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) { JS_FreeCString(ctx, op); return JS_EXCEPTION; }
-    bool mutation = !strcmp(op, "insert") || !strcmp(op, "remove") || !strcmp(op, "clone") || !strcmp(op, "set") ||
+    if (n && n->owner) d = n->owner;
+    doc_dom_budget(d);
+    bool mutation = !strcmp(op, "insert") || !strcmp(op, "remove") || !strcmp(op, "adopt") || !strcmp(op, "clone") || !strcmp(op, "set") ||
                     ((!strcmp(op, "attr") || !strcmp(op, "style")) && argc > 3);
     JSValue ce_token = mutation ? custom_element_hook(s, "customElementBefore", argc, argv) : JS_NULL;
     if (JS_IsException(ce_token)) { JS_FreeCString(ctx, op); return ce_token; }
     JSValue result = JS_UNDEFINED;
     const char *p = NULL;
-    if (!strcmp(op, "create")) {
+    if (!strcmp(op, "parseDocument")) {
+        size_t len; const char *html = argc > 2 ? JS_ToCStringLen(ctx, &len, argv[2]) : NULL;
+        bool blank = argc > 3 && JS_ToBool(ctx, argv[3]) > 0;
+        web_doc *made = html ? doc_inert(s->doc, html, len, blank ? "about:blank" : s->doc->url) : NULL;
+        result = !html ? JS_EXCEPTION : made ? wrap(s, made->root) : oom(ctx);
+        JS_FreeCString(ctx, html);
+    } else if (!strcmp(op, "create")) {
         int32_t type; if (argc < 5 || JS_ToInt32(ctx, &type, argv[2])) result = JS_EXCEPTION;
         else {
             const char *name = JS_ToCString(ctx, argv[3]); size_t len; const char *text = JS_ToCStringLen(ctx, &len, argv[4]);
@@ -805,6 +874,9 @@ static JSValue native_dom(JSContext *ctx, JSValueConst this_val, int argc, JSVal
                 int native_type = type == 1 ? N_ELEM : type == 3 ? N_TEXT : type == 8 ? N_COMMENT : N_FRAGMENT;
                 node_t *made = doc_node_create(d, native_type, native_type == N_ELEM ? name : NULL, text, len);
                 if (made && argc > 5 && JS_ToBool(ctx, argv[5]) > 0) made->foreign = true;
+                /* The namespace must be known before establishing HTML-only
+                   template contents. SVG <template> has ordinary children. */
+                if (made && made->type == N_ELEM && !made->foreign && made->tag == T_template && !doc_template_content(d, made)) made = NULL;
                 result = made ? wrap(s, made) : oom(ctx);
                 if (made && made->tag == T_script) for (struct js_node_ref *r = s->nodes; r; r = r->next) if (r->node == made) { r->async_set = true; r->async = true; break; }
             }
@@ -813,7 +885,7 @@ static JSValue native_dom(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     } else if (!strcmp(op, "viewport")) { int32_t axis = 0; if (argc > 2) JS_ToInt32(ctx, &axis, argv[2]); result = JS_NewInt32(ctx, axis ? d->height : d->width); }
     else if (!strcmp(op, "focus")) {
         node_t *old = d->focus;
-        if (old != n && (!n || !node_attr(n, "disabled"))) {
+        if (!d->inert && old != n && (!n || !node_attr(n, "disabled"))) {
             if (old) { struct web_event e = {.type="blur"}; web_js_dispatch(d, old, &e); e.type="focusout"; e.bubbles=true; web_js_dispatch(d, old, &e); }
             web_focus(d, n);
             if (n) { struct web_event e = {.type="focus"}; web_js_dispatch(d, n, &e); e.type="focusin"; e.bubbles=true; web_js_dispatch(d, n, &e); }
@@ -828,10 +900,10 @@ static JSValue native_dom(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     else if (!strcmp(op, "imageDecode")) result = image_decode_promise(s, n);
     else if (!strcmp(op, "insert")) {
         node_t *child = argc > 2 ? unwrap(ctx, argv[2]) : NULL, *before = argc > 3 ? unwrap(ctx, argv[3]) : NULL;
-        if (!child || child == d->root || (n->type != N_ELEM && n->type != N_DOC && n->type != N_FRAGMENT)) result = JS_ThrowTypeError(ctx, "HierarchyRequestError");
+        if (!child || child->type == N_DOC || (n->type != N_ELEM && n->type != N_DOC && n->type != N_FRAGMENT)) result = JS_ThrowTypeError(ctx, "HierarchyRequestError");
         else if (before && before->parent != n) result = JS_ThrowTypeError(ctx, "NotFoundError");
         else {
-            bool cycle = false; for (node_t *a = n; a; a = a->parent) if (a == child) cycle = true;
+            bool cycle = false; for (node_t *a = n; a; a = a->parent ? a->parent : a->template_host) if (a == child) cycle = true;
             result = cycle ? JS_ThrowTypeError(ctx, "HierarchyRequestError") : doc_node_move(d, n, child, before) ? JS_UNDEFINED : oom(ctx);
         }
     } else if (!strcmp(op, "remove")) doc_node_remove(d, n);
@@ -840,7 +912,28 @@ static JSValue native_dom(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         if (argc > 2 && !JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2]) && !other) result = JS_EXCEPTION;
         else result = JS_NewBool(ctx, !strcmp(op, "equal") ? equal_nodes(n, other) : n == other);
     }
-    else if (!strcmp(op, "clone")) { int deep = argc > 2 ? JS_ToBool(ctx, argv[2]) : 0; node_t *copy = doc_node_clone(d, n, deep > 0); result = copy ? wrap(s, copy) : oom(ctx); }
+    else if (!strcmp(op, "adopt") || !strcmp(op, "import")) {
+        node_t *child = argc > 2 ? unwrap(ctx, argv[2]) : NULL;
+        if (n->type != N_DOC || !child || child->type == N_DOC) result = JS_ThrowTypeError(ctx, "Invalid document node transfer");
+        else if (!strcmp(op, "adopt")) result = doc_node_adopt(d, child) ? wrap(s, child) : oom(ctx);
+        else { node_t *copy = doc_node_clone(d, child, argc > 3 && JS_ToBool(ctx, argv[3]) > 0); result = copy ? wrap(s, copy) : oom(ctx); }
+    }
+    else if (!strcmp(op, "clone")) {
+        bool deep = argc > 2 && JS_ToBool(ctx, argv[2]) > 0;
+        if (n->type == N_DOC) {
+            web_doc *made = doc_inert(s->doc, "", 0, d->url);
+            if (!made) result = oom(ctx);
+            else {
+                while (made->root->first) doc_node_remove(made, made->root->first);
+                bool ok = true; made->quirks = d->quirks;
+                for (node_t *c = deep ? n->first : NULL; c && ok; c = c->next) {
+                    node_t *copy = doc_node_clone(made, c, true);
+                    ok = copy && doc_node_move(made, made->root, copy, NULL);
+                }
+                result = ok ? wrap(s, made->root) : oom(ctx);
+            }
+        } else { node_t *copy = doc_node_clone(d, n, deep); result = copy ? wrap(s, copy) : oom(ctx); }
+    }
     else if (!strcmp(op, "customCandidates")) {
         if (argc > 2 && !JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2])) p = JS_ToCString(ctx, argv[2]);
         result = argc > 2 && !JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2]) && !p ? JS_EXCEPTION : custom_candidates(s, n, p);
@@ -860,7 +953,7 @@ static JSValue native_dom(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         JS_SetPropertyStr(ctx, result, "width", JS_NewInt32(ctx, w)); JS_SetPropertyStr(ctx, result, "height", JS_NewInt32(ctx, h));
     } else if (!strcmp(op, "submit")) {
         char *url = NULL, *body = NULL;
-        if (web_submit(d, n, &url, &body)) { if (s->host.navigate) s->host.navigate(s->host.opaque, url, body); free(url); free(body); }
+        if (!d->inert && web_submit(d, n, &url, &body)) { if (s->host.navigate) s->host.navigate(s->host.opaque, url, body); free(url); free(body); }
     } else if (argc < 3 || !(p = JS_ToCString(ctx, argv[2]))) result = JS_EXCEPTION;
     else if (!strcmp(op, "get")) result = get_dom(s, n, p);
     else if (!strcmp(op, "set")) result = argc > 3 ? set_dom(s, n, p, argv[3]) : JS_ThrowTypeError(ctx, "Missing DOM value");
@@ -964,6 +1057,20 @@ static JSValue native_log(JSContext *ctx, JSValueConst this_val, int argc, JSVal
 static JSValue native_now(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     return JS_NewFloat64(ctx, (double)(uptime_ms() - state(ctx)->now));
 }
+static JSValue native_screen(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct n_sysinfo info;
+    if (sysinfo(&info) < 0) return JS_ThrowInternalError(ctx, "Could not read desktop dimensions");
+    int available_w = (int)info.fb_w, available_h = (int)info.fb_h;
+    if (screen_size(&available_w, &available_h) < 0) { available_w = (int)info.fb_w; available_h = (int)info.fb_h; }
+    JSValue result = JS_NewArray(ctx);
+    if (JS_IsException(result)) return result;
+    uint32_t dimensions[] = {info.fb_w, info.fb_h, available_w > 0 ? (uint32_t)available_w : 0,
+                             available_h > 0 ? (uint32_t)available_h : 0};
+    for (uint32_t i = 0; i < 4; i++) if (JS_SetPropertyUint32(ctx, result, i, JS_NewUint32(ctx, dimensions[i])) < 0) {
+        JS_FreeValue(ctx, result); return JS_EXCEPTION;
+    }
+    return result;
+}
 static JSValue native_url(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) { return JS_NewString(ctx, state(ctx)->doc->url); }
 static JSValue native_origin(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     char out[256]; make_origin(state(ctx)->doc->url, out, sizeof out); return JS_NewString(ctx, out);
@@ -1018,7 +1125,7 @@ static JSValue native_media(JSContext *ctx, JSValueConst this_val, int argc, JSV
     struct web_js_state *s = state(ctx); bool serialize = argc > 1 && JS_ToBool(ctx, argv[1]);
     size_t cap = len * 9 + 16; char *text = serialize ? js_malloc(ctx, cap) : NULL;
     if (serialize && !text) { JS_FreeCString(ctx, query); return JS_EXCEPTION; }
-    bool matches = css_media_evaluate(query, s->doc->width, s->doc->height, !s->disabled, text, cap);
+    bool matches = css_media_evaluate(query, s->doc->width, s->doc->height, web_js_enabled(s->doc), text, cap);
     JS_FreeCString(ctx, query);
     if (!serialize) return JS_NewBool(ctx, matches);
     JSValue result = JS_NewObject(ctx);
@@ -1103,6 +1210,11 @@ static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, 
 static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); node_t *n = argc ? unwrap(ctx, argv[0]) : NULL;
     if (!n) return JS_EXCEPTION;
+    if (n->owner && n->owner->inert) {
+        JSValue args[] = {argv[0], JS_NewString(ctx, "click")};
+        JSValue value = custom_element_hook(s, "inertClick", 2, args);
+        JS_FreeValue(ctx, args[1]); return value;
+    }
     if (node_attr(n, "disabled")) return JS_UNDEFINED;
     struct web_event e = {.type="click", .bubbles=true, .cancelable=true};
     if (!web_js_dispatch(s->doc, n, &e)) return JS_UNDEFINED;
@@ -1147,6 +1259,18 @@ static JSValue native_clear(JSContext *ctx, JSValueConst this_val, int argc, JSV
     for (int i = 0; i < JS_TIMERS; i++) if (s->timers[i].id == id && id) { JS_FreeValue(ctx, s->timers[i].fn); JS_FreeValue(ctx, s->timers[i].args); memset(&s->timers[i], 0, sizeof s->timers[i]); break; }
     return JS_UNDEFINED;
 }
+static JSValue microtask_job(JSContext *ctx, int argc, JSValueConst *argv) {
+    return JS_Call(ctx, argv[0], JS_UNDEFINED, 0, NULL);
+}
+static JSValue native_microtask(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (!argc || !JS_IsFunction(ctx, argv[0])) return JS_ThrowTypeError(ctx, "Expected callback");
+    /* A browser microtask is a host job, not a call through the page's mutable
+       Promise constructor. Promise polyfills themselves use queueMicrotask;
+       implementing it with Promise.resolve causes recursive scheduling. The
+       engine retains the callback until execution or runtime destruction. */
+    if (JS_EnqueueJob(ctx, microtask_job, 1, argv) < 0) return JS_EXCEPTION;
+    return JS_UNDEFINED;
+}
 static struct js_pending *pending_new(struct web_js_state *s, int kind, const char *url) {
     if (s->pending_count >= JS_REQUESTS) return NULL;
     struct js_pending *p = js_mallocz(s->ctx, sizeof *p); if (!p) return NULL;
@@ -1160,7 +1284,8 @@ static void pending_error(struct js_pending *p, const char *error) { p->done = t
 static bool send_request(struct web_js_state *s, struct js_pending *p, int kind, const char *method,
                          const char *headers, const void *body, size_t len) {
     struct web_request r = {.id=p->id, .kind=kind, .url=p->url, .method=method, .headers=headers, .body=body, .body_len=len,
-        .credentials=kind == WEB_RESOURCE_FETCH ? p->credentials : kind == WEB_RESOURCE_MODULE ? 1 : 2};
+        .credentials=kind == WEB_RESOURCE_FETCH ? p->credentials : kind == WEB_RESOURCE_MODULE ? 1 : 2,
+        .force_preflight=p->force_preflight};
     bool ok = s->host.request && s->host.request(s->host.opaque, &r);
     if (!ok) pending_error(p, "The browser rejected the resource request");
     return ok;
@@ -1184,6 +1309,7 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
         pending_error(p, "Invalid credentials mode"); result = JS_ThrowTypeError(ctx, "Invalid credentials mode"); goto out;
     }
     p->credentials = credentials;
+    p->force_preflight = argc > 6 && JS_ToBool(ctx, argv[6]) > 0;
     JSValue funcs[2]; JSValue promise = JS_NewPromiseCapability(ctx, funcs);
     if (JS_IsException(promise)) { pending_error(p, "Out of memory"); goto out; }
     p->resolve = funcs[0]; p->reject = funcs[1];
@@ -1848,7 +1974,10 @@ int64_t web_js_deadline(web_doc *d) {
     return deadline == UINT64_MAX ? -1 : (int64_t)deadline;
 }
 bool web_js_running(web_doc *d) { return d && d->js && d->js->running; }
-bool web_js_enabled(web_doc *d) { return d && d->js && !d->js->disabled; }
+/* This is the document's parsing/presentation policy, not whether the watchdog
+   currently permits execution. Stopping a runaway task cannot reinterpret
+   noscript raw text as fallback HTML or change scripting media queries. */
+bool web_js_enabled(web_doc *d) { return d && d->live; }
 void web_history_event(web_doc *d, const char *old_url, bool popstate) {
     struct web_js_state *s = d ? d->js : NULL;
     if (!s || s->disabled || s->running) return;
@@ -1910,6 +2039,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     static const JSCFunctionListEntry functions[] = {
         JS_CFUNC_DEF("dom", 2, native_dom), JS_CFUNC_DEF("log", 1, native_log),
         JS_CFUNC_DEF("now", 0, native_now), JS_CFUNC_DEF("url", 0, native_url), JS_CFUNC_DEF("origin", 0, native_origin),
+        JS_CFUNC_DEF("screen", 0, native_screen),
         JS_CFUNC_DEF("pack", 1, native_pack), JS_CFUNC_DEF("unpack", 1, native_unpack),
         JS_CFUNC_DEF("classID", 1, native_class_id), JS_CFUNC_DEF("detach", 1, native_detach),
         JS_CFUNC_DEF("history", 4, native_history), JS_CFUNC_DEF("cookie", 1, native_cookie), JS_CFUNC_DEF("scroll", 2, native_scroll),
@@ -1919,6 +2049,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("write", 1, native_write), JS_CFUNC_DEF("encode", 1, native_encode), JS_CFUNC_DEF("navigate", 1, native_navigate),
         JS_CFUNC_DEF("inline", 1, native_inline),
         JS_CFUNC_DEF("click", 1, native_click), JS_CFUNC_DEF("timer", 4, native_timer), JS_CFUNC_DEF("clear", 1, native_clear),
+        JS_CFUNC_DEF("microtask", 1, native_microtask),
         JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("cancel", 1, native_cancel)
     };
     JS_SetPropertyFunctionList(s->ctx, api, functions, sizeof functions / sizeof *functions);

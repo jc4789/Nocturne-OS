@@ -3,8 +3,13 @@
 #include "webnet.h"
 #include "webcookie.h"
 #define WEBNET_MAGIC 0x574e4554u
+/* Preserve the 64-byte request layout used by persisted statically-linked apps.
+   Legacy user_navigation 0/1 remains valid; new flags use reserved bits. */
+#define WEBNET_WIRE_USER_NAVIGATION 1u
+#define WEBNET_WIRE_FORCE_PREFLIGHT 2u
+#define WEBNET_WIRE_REQUEST_FLAGS (WEBNET_WIRE_USER_NAVIGATION | WEBNET_WIRE_FORCE_PREFLIGHT)
 struct webnet_wire_request {
-    uint32_t magic, kind, user_navigation, credentials;
+    uint32_t magic, kind, user_navigation, credentials; /* user_navigation is a flags word. */
     uint64_t id, generation, deadline;
     uint32_t url_len, origin_len, method_len, headers_len, body_len, cookie_len;
 };

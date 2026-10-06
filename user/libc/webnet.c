@@ -118,7 +118,9 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
                   (q->kind == WEBNET_CLASSIC || q->kind == WEBNET_MODULE) ? 1 :
                   q->kind == WEBNET_FETCH ? 2 : 3;
     struct webnet_wire_request h = {0};
-    h.magic = WEBNET_MAGIC; h.kind = q->kind; h.user_navigation = q->user_navigation;
+    h.magic = WEBNET_MAGIC; h.kind = q->kind;
+    h.user_navigation = (q->user_navigation ? WEBNET_WIRE_USER_NAVIGATION : 0) |
+                        (q->force_preflight ? WEBNET_WIRE_FORCE_PREFLIGHT : 0);
     h.credentials = q->credentials; h.cookie_len = (uint32_t)cookie_len;
     h.id = r->id; h.generation = r->generation; h.deadline = r->deadline;
     h.url_len = ul; h.origin_len = ol; h.method_len = ml; h.headers_len = hl; h.body_len = q->body_len;

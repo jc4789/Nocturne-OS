@@ -4,6 +4,7 @@
    form controls, inline SVG) become atomic boxes. */
 #include <stdio.h>
 #include "webi.h"
+#include "svg_geometry.h"
 
 struct bctx {
     web_doc *d;
@@ -262,6 +263,27 @@ static void xml_escape(sbuf *b, const char *s, size_t n, bool attr) {
     }
 }
 
+/* HTML's adjust-SVG-attributes seam, kept local to serialization until the
+   parser/DOM name adjustment is unified. Do not pass raw HTML spelling to the
+   case-sensitive XML codec. WHATWG HTML parsing, adjust SVG attributes. */
+static const char *svg_attribute_name(const char *name, const char *raw) {
+    static const char *const adjusted[] = {
+        "attributeName", "attributeType", "baseFrequency", "baseProfile", "calcMode", "clipPathUnits",
+        "diffuseConstant", "edgeMode", "filterUnits", "glyphRef", "gradientTransform", "gradientUnits",
+        "kernelMatrix", "kernelUnitLength", "keyPoints", "keySplines", "keyTimes", "lengthAdjust",
+        "limitingConeAngle", "markerHeight", "markerUnits", "markerWidth", "maskContentUnits", "maskUnits",
+        "numOctaves", "pathLength", "patternContentUnits", "patternTransform", "patternUnits", "pointsAtX",
+        "pointsAtY", "pointsAtZ", "preserveAlpha", "preserveAspectRatio", "primitiveUnits", "refX", "refY",
+        "repeatCount", "repeatDur", "requiredExtensions", "requiredFeatures", "specularConstant",
+        "specularExponent", "spreadMethod", "startOffset", "stdDeviation", "stitchTiles", "surfaceScale",
+        "systemLanguage", "tableValues", "targetX", "targetY", "textLength", "viewBox", "viewTarget",
+        "xChannelSelector", "yChannelSelector", "zoomAndPan"
+    };
+    for (size_t i = 0; i < sizeof adjusted / sizeof *adjusted; i++)
+        if (str_ieq(name, adjusted[i])) return adjusted[i];
+    return raw;
+}
+
 static void svg_ser(web_doc *d, sbuf *b, node_t *n, const char *color, int depth) {
     if (depth > 64) return;
     if (n->type == N_TEXT) {
@@ -269,6 +291,9 @@ static void svg_ser(web_doc *d, sbuf *b, node_t *n, const char *color, int depth
         return;
     }
     if (n->type != N_ELEM) return;
+    float viewbox[4];
+    int view = n->tag == T_svg ? svg_viewbox(node_attr(n, "viewbox"), viewbox) : 0;
+    if (view == 2) return; /* valid zero viewport suppresses its contents */
     if (!strcmp(n->name, "use")) { /* inline what it refers to: nanosvg has no <use> */
         const char *h = node_attr(n, "href");
         if (!h) h = node_attr(n, "xlink:href");
@@ -299,10 +324,11 @@ static void svg_ser(web_doc *d, sbuf *b, node_t *n, const char *color, int depth
     sb_puts(b, n->raw_name);
     bool xmlns = false;
     for (int i = 0; i < n->nattrs; i++) {
+        if (!strcmp(n->attrs[i].name, "viewbox") && view == 0 && n->tag == T_svg) continue;
         const char *v = n->attrs[i].value;
         if (!strcmp(n->attrs[i].name, "xmlns")) xmlns = true;
         sb_putc(b, ' ');
-        sb_puts(b, n->attrs[i].raw);
+        sb_puts(b, svg_attribute_name(n->attrs[i].name, n->attrs[i].raw));
         sb_puts(b, "=\"");
         /* currentColor is resolved here; nanosvg does not know it */
         for (const char *p = v; *p;) {

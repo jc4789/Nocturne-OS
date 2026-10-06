@@ -240,6 +240,7 @@ static bool placeholder_src(const char *s) {
 /* Both connected and script-created detached HTML images have image requests.
  * Preserve an available current image while its replacement is pending. */
 void doc_image_sync(web_doc *d, node_t *n) {
+    if (!d || d->inert) return;
     if (!d || !n || n->type != N_ELEM || n->foreign || n->tag != T_img) return;
     const char *src = node_attr(n, "src"), *ss = node_attr(n, "srcset");
     const char *lazy = node_attr(n, "data-src");
@@ -433,6 +434,51 @@ static void scan(web_doc *d, node_t *n) {
 }
 
 /* ---------------------------------------------------------------- documents */
+size_t doc_dom_remaining(web_doc *d) {
+    web_doc *family = d->dom_family ? d->dom_family : d;
+    size_t used = family->mem.allocated + family->control_bytes;
+    for (web_doc *p = family->dom_docs; p; p = p->dom_next) {
+        if (p->mem.allocated > (32u << 20) || p->control_bytes > (32u << 20) ||
+            used > (32u << 20) - p->mem.allocated || used + p->mem.allocated > (32u << 20) - p->control_bytes) return 0;
+        used += p->mem.allocated + p->control_bytes;
+    }
+    return used >= (32u << 20) ? 0 : (32u << 20) - used;
+}
+void doc_dom_budget(web_doc *d) {
+    if (!d || (!d->live && !d->dom_family && !d->inert)) return;
+    size_t left = doc_dom_remaining(d);
+    d->mem.limit = d->mem.allocated + left;
+    if (!d->mem.limit) d->mem.limit = 1; /* arena zero means unbounded */
+}
+web_doc *doc_inert(web_doc *family, const char *html, size_t n, const char *url) {
+    if (!family || n > (16u << 20)) return NULL;
+    family = family->dom_family ? family->dom_family : family;
+    unsigned count = 0;
+    for (web_doc *p = family->dom_docs; p; p = p->dom_next) count++;
+    if (count >= 64 || doc_dom_remaining(family) < 65536) return NULL;
+    web_doc *d = calloc(1, sizeof *d);
+    if (!d) return NULL;
+    d->inert = true; d->dom_family = family;
+    d->url = strdup(url && *url ? url : "about:blank");
+    if (!d->url) { free(d); return NULL; }
+    snprintf(d->base, sizeof d->base, "%s", d->url);
+    family->dom_family = family;
+    d->dom_next = family->dom_docs; family->dom_docs = d;
+    doc_dom_budget(d);
+    web_doc *previous = d->dom_next;
+    d->root = html_parse(d, html ? html : "", n, "utf-8");
+    if (!d->root) {
+        /* No wrappers have escaped: discard every nested template document too. */
+        while (family->dom_docs != previous) {
+            web_doc *bad = family->dom_docs;
+            family->dom_docs = bad->dom_next; bad->dom_next = NULL;
+            web_free(bad);
+        }
+        return NULL;
+    }
+    d->resources_dirty = true;
+    return d;
+}
 web_doc *web_parse(const char *html, size_t len, const char *url, const char *charset) {
     web_doc *d = calloc(1, sizeof *d);
     if (!d) return NULL;
@@ -473,6 +519,23 @@ static void free_pending(web_doc *d) {
 }
 
 void doc_rescan(web_doc *d) {
+    if (d && d->inert && d->resources_dirty) {
+        d->resources_dirty = false; d->html = d->head = d->body = NULL;
+        snprintf(d->base, sizeof d->base, "%s", d->url);
+        for (node_t *n = d->root ? d->root->first : NULL; n; n = n->next)
+            if (n->type == N_ELEM) { d->html = n; break; }
+        for (node_t *n = d->html ? d->html->first : NULL; n; n = n->next) {
+            if (!d->head && n->tag == T_head) d->head = n;
+            if (!d->body && (n->tag == T_body || n->tag == T_frameset)) d->body = n;
+        }
+        for (node_t *n = d->head ? d->head->first : NULL; n; n = n->next)
+            if (n->tag == T_base && node_attr(n, "href")) {
+                char url[1024];
+                if (url_resolve(d->url, node_attr(n, "href"), url, sizeof url)) snprintf(d->base, sizeof d->base, "%s", url);
+                break;
+            }
+        return; /* no authored CSS, image/meta fetch or live resource scan */
+    }
     if (!d || !d->live || !d->resources_dirty) return;
     d->resources_dirty = false;
     css_styling_free(&d->sty);
@@ -570,6 +633,11 @@ static void free_values(node_t *n) {
 void web_free(web_doc *d) {
     if (!d) return;
     web_js_free(d);
+    while (d->dom_docs) {
+        web_doc *child = d->dom_docs;
+        d->dom_docs = child->dom_next; child->dom_next = NULL;
+        web_free(child);
+    }
     html_finish(d->parser);
     d->parser = NULL;
     if (d->owned_nodes) {

@@ -1443,7 +1443,12 @@ static void pres_hints(node_t *e, struct hints *h) {
     bool sized = t == T_table || t == T_td || t == T_th || t == T_img || t == T_iframe || t == T_embed ||
                  t == T_object || t == T_video || t == T_canvas || t == T_col || t == T_hr || t == T_svg ||
                  (t == T_input && (v = node_attr(e, "type")) && str_ieq(v, "image"));
-    if (sized) {
+    if (t == T_svg) {
+        /* SVG geometry attributes are CSS presentation attributes: preserve
+           units, explicit zero and the normal author/inline cascade. */
+        if ((v = node_attr(e, "width"))) hint(h, "width", "%s", v);
+        if ((v = node_attr(e, "height"))) hint(h, "height", "%s", v);
+    } else if (sized) {
         if (html_len(node_attr(e, "width"), b, sizeof b) && strcmp(b, "0px")) hint(h, "width", "%s", b);
         if (t != T_hr && t != T_col && html_len(node_attr(e, "height"), b, sizeof b) && strcmp(b, "0px"))
             hint(h, "height", "%s", b);
@@ -1519,7 +1524,9 @@ static void add_dent(const struct decl *d, uint64_t key, uint8_t pseudo) {
         dents = realloc(dents, sizeof *dents * (size_t)capdents);
     }
     dents[ndents].d = d;
-    dents[ndents].key = key | (d->important ? 1ull << 63 : 0);
+    /* Important origins reverse the normal order: UA rules such as scripting
+       noscript suppression outrank even an author's important inline style. */
+    dents[ndents].key = d->important ? (key ^ (1ull << 62)) | (1ull << 63) : key;
     dents[ndents].pseudo = pseudo;
     ndents++;
 }

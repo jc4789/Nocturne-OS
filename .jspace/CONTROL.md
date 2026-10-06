@@ -3,13 +3,13 @@
 Generated from control.json; use the CLI to update.
 
 ## Goal
-> Nocturneの設計と既存ABIを変えずブラウザーWeb APIの実装を進め、実YouTube、DeepMind、通常DuckDuckGo、ChatGPTをQEMUで検証する。ダミー機能禁止、Hyper-Vはユーザー担当
+> NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない
 
 ## Next
-> 実DDGのMIME誤拒否後に到達したQuickJSクラッシュを同一バイナリのスタックで診断
+> 共通APIの独立レビュー反例を修正し、SVG汎用修正と統合build19でnative検査・実4サイト再検証へ進む
 
 Level: high
-Shared credits: 38 / 100
+Shared credits: 53 / 100
 
 Solo limitation:
 > 以前の制限は解消。新たに承認されたsol3エージェントを稼働中
@@ -70,11 +70,27 @@ Solo limitation:
       "sha256": "5bdef15f5754ea69fbc7129a91a901b975bdb708c50d5d1b02855fd0528e3b48"
     },
     "id": 5
+  },
+  {
+    "active": true,
+    "by": "実Nocturne/QEMUの公開サイト画面・stack、native補助、raw/VHDX内容比較。全tree gateとHyper-V実起動を含まない",
+    "claim": "build17の実DDG同期再帰を解消、JS791とOS6検査成功。実4サイトは未完成",
+    "evidence": {
+      "path": "docs/browser-native-progress-2026-10-06.md",
+      "sha256": "ba0a0cb40b757ef311f10796e9cce183a0f5dbdafd3190b97f03bf83d9f7c24b"
+    },
+    "id": 6
   }
 ]
 
 ## Questions
-{}
+{
+  "Q1": {
+    "closed": false,
+    "question": "現controllerは除外集合固定で稼働中Hyper-V媒体を含めるため正式全tree gate不可",
+    "settled_by": "controllerが適切な明示除外を扱えること。現作業はsourceと実行証拠に限定し正式gate未達を明示する。"
+  }
+}
 
 ## Agents
 
@@ -305,6 +321,38 @@ Next:
 Sources: [{"path": "user/libc/web/js_performance.js", "sha256": "418c518076ac2e93e1aa5e26c518606838f1c0e245815777eee82b7a299ccda8"}, {"path": "user/libc/web/js_clone.js", "sha256": "c1b3b541fbe72ab163b12f38ee72a6d8dacbb4c176139ddd43b0301c377d11bf"}, {"path": "tests/js_performance_cases.js", "sha256": "c328247ca8d4157bceadeb89c292336c10c92f08311fdb40bd3344196b6c8a7a"}]
 Completion: null
 Review: null
+Round 1:
+> Location初回: private primitive cacheと初期URL accessor捕捉。既存QuickJS補助31成功、旧source再解析負例を拒否。実DDG全5秒根因は未断定
+Evidence: {"path": "build/nocturne-audit/location-cache/report-round1.md", "sha256": "a70717ae511db0d2b91d85177caa1a09c034dbdbfc5918b8ae8205614f3bb301"}
+Next:
+> 第2境界: setter conversion再入、native無イベントURL変更、失敗原子性を検査
+Sources: [{"path": "user/libc/web/js_history.js", "sha256": "8cc7c45ab6c08fe00dae4cbc9a1fc53c894bbf77ef8d69b5ddbb54a66cc853ce"}, {"path": "tests/js_history_cases.js", "sha256": "67477b3e3fc8bc00712f6976a9a0d9901232f1aea041a6a385cf43892ac85c0b"}]
+Completion: null
+Review: null
+Round 2:
+> Location第2: private primitive cache・captured URL accessors、再入setter順序/Symbolの8故障を前後差で修正。境界52と製品34成功。native/QEMU実証は親統合、全tree gate BLOCK維持
+Evidence: {"path": "build/nocturne-audit/location-cache/report-round2.md", "sha256": "5b9e4f5f40c935e0a0e73a9c64c4aebe4175ac40aef71343c88cfd477525698c"}
+Next:
+> 親がinc再生成/build17と実DDG・Nocturne native契約検査で独立確認
+Sources: [{"path": "user/libc/web/js_history.js", "sha256": "539cfaa7da2c2da9727e14f4965dfdafc8404c7d35a2a88d08ab9d82bc74d67f"}, {"path": "tests/js_history_cases.js", "sha256": "15528d9558c3808b8ba35c38b139511d2076e2d68d06cd5c0d0eb6d8f023f2c1"}]
+Completion: null
+Review: null
+Round 1:
+> 独立HTML Document初回: native owner/allocation分離、inert parserとtemplate別treeを実装。構文のみ確認、native実行は未確認。
+Evidence: {"path": "build/nocturne-audit/documents18/report-round1.md", "sha256": "8553e969dd8905efed929a93ce6c7fdf795437e34e9423f4a0ad9b66bff35fba"}
+Next:
+> 親の弱境界を製品ケースへ追加し、上限失敗時の文書保全とadoption lifetimeを第2確認
+Sources: [{"path": "user/libc/web/js.c", "sha256": "cbcdd195e69257a01bd9001119dfa59ad555e37896fc734917724173edac019d"}, {"path": "user/libc/web/js_bootstrap.js", "sha256": "3d2d1f1001c7b9b202c2c49cc0ad6aede476fa848b51fd80719234a614d9c902"}, {"path": "user/libc/web/js_document.js", "sha256": "b638ce6dd5b5d2499103702b8f933285697ae1d7ee679605d843b3371ba1c5ec"}, {"path": "user/libc/web/doc.c", "sha256": "10c75976f60a2b1fe70b8bbf2d6a6a6c6855336b32b8c792cdd0de808cb6d0f7"}, {"path": "user/libc/web/dom.c", "sha256": "9b42f668f88c94606b80bf97963832c42a3384633f1f8ce8d927824ed2ec7057"}, {"path": "user/libc/web/html.c", "sha256": "b85ffde6b5c9e61fe19e9e36d9f8e59a79fc03829c02c8c23ac383ccbaeca56f"}, {"path": "user/libc/web/webi.h", "sha256": "982ae4fb9db55010f776e7b0f412ac28a2a5200141777941e05c378d27fb2ef1"}, {"path": "tests/js_document_cases.js", "sha256": "d13bd8a6f9a215bb7fa00fa0165091b876d3fbac39486cdf1dd9efd57289af99"}]
+Completion: null
+Review: null
+Round 2:
+> 独立Document第2: allocation_doc寿命を実読、template context/cycleとborrowed受け手を修理、native limit保全ケース追加。最新構文4file/JS成功、native実行は親へ。
+Evidence: {"path": "build/nocturne-audit/documents18/report-round2.md", "sha256": "74122ee9ba53f698b6f0ce683c40bdaec10358c59360699a2ebf4716408799a1"}
+Next:
+> 親が最新inc生成/ビルドしfresh native fixturesでdocument通常/count/arenaとteardownを検証
+Sources: [{"path": "user/libc/web/js.c", "sha256": "e438634a641e1e2659a2c1cb0f7a888b9bdbcb91bb9846eb4158adff8b3f9202"}, {"path": "user/libc/web/js_bootstrap.js", "sha256": "b92c31414f911342e4ad2e5c36c2837340ba1128e5311a014504ba76b239753f"}, {"path": "user/libc/web/js_document.js", "sha256": "f936f6ea691296081f18eb4c74e55b12ad611629f8a23290aa13024543dc966e"}, {"path": "user/libc/web/doc.c", "sha256": "10c75976f60a2b1fe70b8bbf2d6a6a6c6855336b32b8c792cdd0de808cb6d0f7"}, {"path": "user/libc/web/dom.c", "sha256": "9b42f668f88c94606b80bf97963832c42a3384633f1f8ce8d927824ed2ec7057"}, {"path": "user/libc/web/html.c", "sha256": "b85ffde6b5c9e61fe19e9e36d9f8e59a79fc03829c02c8c23ac383ccbaeca56f"}, {"path": "user/libc/web/webi.h", "sha256": "982ae4fb9db55010f776e7b0f412ac28a2a5200141777941e05c378d27fb2ef1"}, {"path": "tests/js_document_cases.js", "sha256": "b68d6e62b5007ffc28938eac09df5c4d4638eda2d5a1ae0d3082b9751fd79722"}]
+Completion: null
+Review: null
 
 ### Agent
 > root
@@ -323,6 +371,14 @@ Next:
 > DDG moduleのquota/実行予算到達を追跡。未対応APIと再帰保持を分離
 Sources: [{"path": "user/libc/web/js.c", "sha256": "bac5a9f342df54e4638da0f82f12b6c67db5864ee044b6991adbbed863ad29a8"}, {"path": "third_party/quickjs/quickjs.c", "sha256": "f9241cc53cb5bc4e8e85edf1d7206810f879cf59a119e97fb58f8ef625414d46"}]
 Completion: null
+Review: null
+Round 1:
+> build17部分修正: 実DDG microtask再帰・native heap rollbackを修正、JS791/OS6成功、実4サイト全面動作未達
+Evidence: {"path": "build/nocturne-audit/root-review17.md", "sha256": "7a8786fb28cfeabf1ac2f5cc08c83f62326faa72581b5b4e80fb330e32311782"}
+Next:
+> DOMParser/template所有権と残る実サイト停止を調査
+Sources: [{"path": "user/libc/web/js.c", "sha256": "1db9d42729c84296230bf6d6941d8600c3d4cc0079a21a203fc6775efff46977"}, {"path": "user/libc/web/js_bootstrap.js", "sha256": "031895a9f2e59360dc8b22a815101b19d5018e73bc303d96c26b8a61523e3f99"}, {"path": "user/libc/web/js_bootstrap.inc", "sha256": "6b3d71fdb29d20f5bc38085405c41bf6bff7aff1ebda212a5d094dc862d8fe6d"}, {"path": "user/libc/web/js_history.js", "sha256": "539cfaa7da2c2da9727e14f4965dfdafc8404c7d35a2a88d08ab9d82bc74d67f"}, {"path": "user/libc/web/css.c", "sha256": "941c7267a825fe7e2823e42534b2fae322a1dc9108da1bab63dc174606235525"}, {"path": "user/libc/web/cssprop.c", "sha256": "cda187add4f6a5cd370f81c33314e9ca0d8560eb35194b46e766ce69e8727bcf"}, {"path": "kernel/src/sys/syscall.c", "sha256": "ec3065dc9883b0c3e8847aa696ec5f708e498b1ffb096b3db9e5f406a9152187"}, {"path": "tests/jstest.c", "sha256": "3c1edab6db2a7ff9824a66aa299464b04f0f4688c170944d0e3e82e3e636c2bb"}, {"path": "tests/sbrktest.c", "sha256": "7ff9360a86f7742d37cf59e96f7d3e5b42b5085db2725b6dbf31719adf9f01d6"}, {"path": "tests/js_history_cases.js", "sha256": "15528d9558c3808b8ba35c38b139511d2076e2d68d06cd5c0d0eb6d8f023f2c1"}, {"path": "tests/runtests.c", "sha256": "134636ae234587ff368216a055c37bb0a58a069d423dc9d1c0d721759a7a21a6"}]
+Completion: {"path": "build/nocturne-audit/completion17.md", "sha256": "ebd929b4fb7202b62a9de6df275a39665adeb57784ba1f984268b18d9de748cf"}
 Review: null
 
 ### Agent
@@ -383,6 +439,38 @@ Next:
 Sources: [{"path": "third_party/quickjs/quickjs.c", "sha256": "f9241cc53cb5bc4e8e85edf1d7206810f879cf59a119e97fb58f8ef625414d46"}, {"path": "third_party/quickjs/quickjs.h", "sha256": "524f64cbdd72366d879574eab7fd5dd049bb58d340164b9964b43c7d370cfb5e"}, {"path": "tests/qjs_oomtest.c", "sha256": "ffb2006d0c44cebfdc13bd8ea4709623261717d56c2db1741e6f9759f94b1aba"}, {"path": "third_party/quickjs/dtoa.c", "sha256": "af5abd68fa9806d1a19bdd5f2daef00d5fd0990ae56311382dfed4700343f074"}, {"path": "third_party/quickjs/libregexp.c", "sha256": "b588a514fb2717cc088d44f5fafbb874c9a4eb52aeca9b82bee851173bb77a28"}, {"path": "third_party/quickjs/libunicode.c", "sha256": "26203ae888c0582e7d0e2113f13db0c9b39dc7b0b3836d68fa308c54f7a0898c"}, {"path": "third_party/quickjs/cutils.c", "sha256": "b73a403a59da30726257ddbdf5e399298941c1def997782ee0d4d33f796a80a2"}, {"path": "build/nocturne-audit/qjs-backtrace-independent-probe.py", "sha256": "bd23dd7b1c41255e98688663e0ccc02d9258b2aa62a5c44e90879e2dc0e37775"}]
 Completion: null
 Review: null
+Round 1:
+> DDG独立初回: live collection全再生成とwrapper強保持の2候補を限定、補助counter30失敗0。親のPromise/queueMicrotask再帰stackを受けて第2確認へ
+Evidence: {"path": "build/nocturne-audit/ddg-independent/round1-report.md", "sha256": "2981b9daa102761a2bab5c77a399fa4a9bfd4a8afcd55da06748362d7cf10232"}
+Next:
+> 親の実QEMU再帰stackとQuickJS host job実装を独立照合し第2報告を作成
+Sources: [{"path": "build/nocturne-audit/ddg-independent/round1-source/js.c", "sha256": "135c91de7c8898f0e36d02614ded7134f2760096bf2223246b3a979ec28c6eab"}, {"path": "build/nocturne-audit/ddg-independent/round1-source/js_bootstrap.js", "sha256": "cc60da7939cfe1821296530df2e867bafbdb2f1f61aa90c5b83b28c2cdb6f54c"}, {"path": "build/nocturne-audit/ddg-independent/round1-source/js_collections.js", "sha256": "5ffd0f5ab1d26986e4ee84940450a98f5b7555a97ada2f863461d78684a9d345"}, {"path": "build/nocturne-audit/ddg-independent/round1-source/js_mutations.js", "sha256": "87982701c468a29590439313e342e607abcefa1549a713b4f3b17456f7335811"}, {"path": "build/nocturne-audit/ddg-independent/round1-source/js_custom_elements.js", "sha256": "ccd1ba2fb12ca9641b7cf73d0f5b1cfb332872f25a42f0f46d59f618519f2c58"}, {"path": "build/nocturne-audit/ddg-independent/round1-source/dom.c", "sha256": "dc0de7d70e5ccad67a17e41e359cbcd2d318d882c09a847146433661e13dd554"}, {"path": "build/nocturne-audit/ddg-independent/collections-count-probe.cjs", "sha256": "f96e1d8bdcdc9ea63ab094b847055e23a6e1ca91644c3b9babe2768dcc251c4a"}, {"path": "build/nocturne-audit/ddg-independent/collections-count-result.json", "sha256": "8433f437dd65009bf03aec00c339b749dbc677b9ac92406c499e81d1f8aaa3d3"}, {"path": "build/nocturne-audit/ddg-independent/source-manifest.json", "sha256": "9d28897b20047a10622e4ec9d46ce23f1f40fe1337c298076ad46f11a670c4e7"}]
+Completion: null
+Review: null
+Round 2:
+> 第2独立確認: 実DDG stackとvendor91955/10436が公開Promise↔queueMicrotask同期再帰に一致。親native job修正の所有権/FIFO/例外/差替え耐性/共有5秒に具体欠陥なし、任意throw object報告経路を弱境界として限定
+Evidence: {"path": "build/nocturne-audit/ddg-independent/round2-report.md", "sha256": "e06da004582e08a2293fe3e36c7590be2f58348d071f613aef5d2049fa6dd3d4"}
+Next:
+> 親が修正後imageの実DDG検索とQEMU回帰を独立検証、任意throw object報告弱境界は別課題として保持
+Sources: [{"path": "build/nocturne-audit/ddg-independent/round2-source/js.c", "sha256": "c928e4d95d6ba97ecdf2995993e7a389aed951adfcc24780ff4750005a224583"}, {"path": "build/nocturne-audit/ddg-independent/round2-source/js_bootstrap.js", "sha256": "031895a9f2e59360dc8b22a815101b19d5018e73bc303d96c26b8a61523e3f99"}, {"path": "build/nocturne-audit/ddg-independent/round2-source/quickjs.c", "sha256": "f9241cc53cb5bc4e8e85edf1d7206810f879cf59a119e97fb58f8ef625414d46"}, {"path": "build/nocturne-audit/ddg-independent/round2-source/quickjs.h", "sha256": "524f64cbdd72366d879574eab7fd5dd049bb58d340164b9964b43c7d370cfb5e"}, {"path": "build/nocturne-audit/ddg-independent/round2-source/jstest.c", "sha256": "27151bedb13911130fad344a11b2f8a9af3b65bca99679ce80496ea0394e5be8"}, {"path": "build/nocturne-audit/ddg-independent/round2-source/qa-serial.log", "sha256": "bc6ea7b20e49c0fd66964ef1ae453148faa4d9937a9de0100207217128349470"}, {"path": "build/nocturne-audit/ddg-independent/wpmv.2057f5ac0b82d54ddb6f.js", "sha256": "a9e5483c7423a83a92dfebe7c5ddc6d346385ea1ce9b1fa36b12bd0ffba94ec9"}, {"path": "build/nocturne-audit/ddg-independent/round1-source/js_bootstrap.js", "sha256": "cc60da7939cfe1821296530df2e867bafbdb2f1f61aa90c5b83b28c2cdb6f54c"}]
+Completion: null
+Review: null
+Round 1:
+> 新2サイト実build17: GitHub native GET検索/結果リンクは部分成功、menu/検索JSは未合格。HTML5test score無し、screen直接停止とサイト旧script HTML応答を分離。所有QEMU2台の終了を確認
+Evidence: {"path": "build/nocturne-audit/compat18-github/round1-report.md", "sha256": "80d106348d5750d5c1336d3731a7c6ed26dfb8bcf0f824479893cc7761be799b"}
+Next:
+> 親の新規XHR実装を所有権・再入・イベント順序・bytes境界で独立レビューし第2報告を作成
+Sources: [{"path": "build/nocturne-audit/compat18-github/run_compat.py", "sha256": "3cc2b4734a3eb65409b51085407142bbbf9d39c06b9a2fb086129fc80ae6b46e"}, {"path": "build/nocturne-audit/compat18-github/boot-identity.json", "sha256": "c7d7a35352032e022fdfaa29d804c081dc1d757be85dec376c74e6075c5ad275"}, {"path": "build/nocturne-audit/compat18-github/github-baseline/qa-serial.log", "sha256": "c5774bd5d9e1048473e8091fd7ebe0557a13b5850726f25df7086998ea8a9b7a"}, {"path": "build/nocturne-audit/compat18-github/html5test-baseline/qa-serial.log", "sha256": "334db7af79d54a77d1066f0a039862093c262445f7ef8f04d113c0ab4b880f20"}, {"path": "build/nocturne-audit/compat18-github/owned-stop.json", "sha256": "787e3cca64fd13f23ce87a9887ff16b3405080474fd55494f57e432568b4d4da"}, {"path": "build/nocturne-audit/compat18-github/public-source/manifest.json", "sha256": "661fc1acaa7e38fd80fde097bb6b35ff053003ae3875b7de270ef033a1ff8400"}, {"path": "build/nocturne-audit/compat18-github/public-source/html5-engine.js", "sha256": "f094e77da7234bc2fbfaeb12a012fc193a1dcf8aa21de262254fb99a409e8a51"}]
+Completion: null
+Review: null
+Round 2:
+> 第2検討: XHRのspecies/孤立surrogate/MIMEquote/資源失敗を反証・再確認。force-preflightは親指摘で旧wire64byteを維持し31限定検査失敗0。実サイト再試験はbuild19待ち
+Evidence: {"path": "build/nocturne-audit/compat18-github/round2-report.md", "sha256": "70f4d66d73a4d1d32d32ded7d691ad6e8303baec157b7cd4f121178f88ffa41d"}
+Next:
+> 親build19専用コピーでGitHub/HTML5test再試験
+Sources: [{"path": "build/nocturne-audit/compat18-github/xhr-probe-revised/manifest.json", "sha256": "bb21401f31edf96cf5e12cdd64e95860c3dda5cc9dcf1d33545333b4d4d1cb63"}, {"path": "build/nocturne-audit/compat18-github/xhr-probe-revised/results.json", "sha256": "c0c63b1f378c2e31dc4d52c3da7ebbb3d80d0ea63595e2d885d49dce68c65e83"}, {"path": "build/nocturne-audit/compat18-github/preflight-probe-wire-compatible/manifest.json", "sha256": "2c697391f8112798fe7c648c70708fff59365e876c3e4eb67e6115095cab11c7"}, {"path": "build/nocturne-audit/compat18-github/preflight-probe-wire-compatible/preflight.log", "sha256": "d0b3f7881107e82fddb3cc53b2d80a2917b69a23a983f02e6aa4db93c979da60"}]
+Completion: null
+Review: null
 
 ### Agent
 > site_probe_fresh
@@ -408,6 +496,57 @@ Evidence: {"path": "build/nocturne-audit/site-probe-fresh-sjis-report.md", "sha2
 Next:
 > 親がNocturne26件補助と実5ch本文表示を独立検証する
 Sources: [{"path": "user/libc/web/html.c", "sha256": "62f4af1bce70d69f65bca08786aac9b890c73f1d46cc48b7594b231f85d056b6"}, {"path": "user/libc/web/web_encoding.c", "sha256": "76ee6461fbaf57567b31827745fbd130d55a538714ec06548a6a74c48ade99e0"}, {"path": "user/libc/web/web_encoding.h", "sha256": "56bd3aa75ed99c2cbc3f08e21dc6b958589c4b9c575cc906c0ecd7a5eafeeb14"}, {"path": "user/libc/web/encoding/jis0208.inc", "sha256": "3b33e03fb2b55faa4d49ceafbf1ca0056e4a9d04719094143055c0eb054badf9"}, {"path": "tests/shiftjistest.c", "sha256": "a76e1caf7cba111945ccc59e784be713ec1796a7ba961571566b35eabc88fcdf"}]
+Completion: null
+Review: null
+Round 1:
+> 実Google GUI検索は認証へ遷移、XHR/MessageChannel停止。指定百度は白画面でACS API未特定。専用QEMU証拠、全面成功未成立
+Evidence: {"path": "build/nocturne-audit/compat18-google/report-round1.md", "sha256": "a165ff5fba964c15cf26128520f99b265ca2d87300554e847432c4007104a960"}
+Next:
+> ACS停止境界を補助解析し、実百度再読込と所有QEMU終了を確認
+Sources: [{"path": "build/nocturne-audit/compat18-google/probe.py", "sha256": "8fade2951539465b503396ee2b10699f96a748d84992acffa73eb87a4eb3fb64"}, {"path": "build/nocturne-audit/compat18-google/baseline-google/qa-serial.log", "sha256": "f4c1516f9c920c1e63c8a10f5133063f7e274f180aae4a2a0e4360e2fa78dd87"}, {"path": "build/nocturne-audit/compat18-google/baike-round1-serial.log", "sha256": "5dde6f6f857ee3145b303ad8cb2861ca13374c1f64b595243f676b15f69ad967"}, {"path": "build/nocturne-audit/compat18-google/sources/google-og.js", "sha256": "9e82b57f4cf64149259cb2cbdb77422c73d9d791b7642361c6ea866861c2d533"}, {"path": "build/nocturne-audit/compat18-google/sources/google-recaptcha.js", "sha256": "c179033168f7b2b948eb1eb42b149e93ce638499680f360413102471e38c765e"}, {"path": "build/nocturne-audit/compat18-google/sources/baike-acs.js", "sha256": "82bd3f8e2e8f74456a9b9c8d401532e84c39557024096012a35f5cf812f89e8f"}, {"path": "build/nocturne-audit/compat18-google/sources/baike-paris.js", "sha256": "577b8e41871941666535ca2a4b5ca3b768fcf47ba00ce16d34b06d43d0752b9c"}, {"path": "build/nocturne-audit/compat18-google/sources/baike-metadata.json", "sha256": "71b256ee6330bf8ede229c900006dc018bce165135afcdf0b744c9a32d1f6347"}]
+Completion: null
+Review: null
+Round 2:
+> 第2検討: 実百度reloadでも白画面/同stack再現。ACS補助環境は別停止なのでAPI断定棄却。Google外部認証/MessageChannel/iframe境界を分離し担当全QEMU停止
+Evidence: {"path": "build/nocturne-audit/compat18-google/report-round2.md", "sha256": "dbf87566eec6e1d108bc031841f0a02b40d43fe139761f5350026d14ea507396"}
+Next:
+> 親統合imageで同実URLのXHR後続stackと描画境界を再確認
+Sources: [{"path": "build/nocturne-audit/compat18-google/probe.py", "sha256": "8fade2951539465b503396ee2b10699f96a748d84992acffa73eb87a4eb3fb64"}, {"path": "build/nocturne-audit/compat18-google/baseline-google/qa-serial.log", "sha256": "f4c1516f9c920c1e63c8a10f5133063f7e274f180aae4a2a0e4360e2fa78dd87"}, {"path": "build/nocturne-audit/compat18-google/baseline-google/qa-stopped.json", "sha256": "650d7f367875e38290116f3ad7ecb235b3870f17023f3204af4f47e96aadee70"}, {"path": "build/nocturne-audit/compat18-google/baseline-baike-interactive/qa-serial.log", "sha256": "19572d0a47ca818ae8072a9a51e32dcbad47624b949af6d0d63fdea715b2707c"}, {"path": "build/nocturne-audit/compat18-google/baseline-baike-interactive/qa-stopped.json", "sha256": "4758ad53a5db560ba797f0e3fd7ea7e4edb1216c51fc471a429a4f3d903f4dc9"}, {"path": "build/nocturne-audit/compat18-google/sources/google-og.js", "sha256": "9e82b57f4cf64149259cb2cbdb77422c73d9d791b7642361c6ea866861c2d533"}, {"path": "build/nocturne-audit/compat18-google/sources/google-recaptcha.js", "sha256": "c179033168f7b2b948eb1eb42b149e93ce638499680f360413102471e38c765e"}, {"path": "build/nocturne-audit/compat18-google/sources/baike-acs.js", "sha256": "82bd3f8e2e8f74456a9b9c8d401532e84c39557024096012a35f5cf812f89e8f"}, {"path": "build/nocturne-audit/compat18-google/sources/baike-paris.js", "sha256": "577b8e41871941666535ca2a4b5ca3b768fcf47ba00ce16d34b06d43d0752b9c"}, {"path": "build/nocturne-audit/compat18-google/acs_probe.py", "sha256": "6abd2a3c944103164b036146332467a3613e331faa0725e6be5b16d5846f9d94"}, {"path": "build/nocturne-audit/compat18-google/acs-host-diagnostic.log", "sha256": "351a4cafe39e2d191c3d62185ad80177c97bdbad368846bcd060945e17b6d143"}, {"path": "build/nocturne-audit/compat18-google/acs-host-diagnostic-with-console.log", "sha256": "d6463070e58f72a66fccff331edc95b6581fa5358a505214e46462b27a4a393b"}, {"path": "build/nocturne-audit/compat18-google/acs-host-diagnostic-with-timers.log", "sha256": "c27e719fdba672e564bd6db7c1d89f338cc1f0d4697191f7c1b3040c59dc833d"}]
+Completion: null
+Review: null
+Round 1:
+> Google巨大SVGのscanf scanset/case/auto-CB三境界を実画素とnative sourceで再現。汎用SVGだけ修正凍結、構文4files/native parser21成功、QEMU前後は親build19後
+Evidence: {"path": "build/nocturne-audit/compat18-google/svg-report-round1.md", "sha256": "eabfd8c7fb677f3ffdf90523a035233cc57af76975e58e9f4ea09fbcd4d517df"}
+Next:
+> 親build19のnative SVG回帰と実Google/Baiduを待つ
+Sources: [{"path": "user/libc/web/layout.c", "sha256": "0bd9281d426fc54a2599ad2a38c01bd111e509e932446aa6fa14ec95534678f9"}, {"path": "user/libc/web/box.c", "sha256": "ed35c3333151512fb411c1cc1015f43793979d3c97713d5f6a8d58c31e8a9e4d"}, {"path": "user/libc/web/css.c", "sha256": "e2ea7ed89500a9e8a6c83a0a6c4c52920a13cef1ee14b46704cca782ec082321"}, {"path": "user/libc/web/svg_geometry.h", "sha256": "cfd717350521a65621db699f37135d73e60c783bced6d6f15d60d6571411e13d"}, {"path": "tests/svgtest.c", "sha256": "64db868fa906e945078c6fd23bcf221bb96afa517adcf91b982e373a2ba60274"}, {"path": "build/nocturne-audit/compat18-google/svg-verify.log", "sha256": "3b142bb31f4048cebaff68091d3f869e7df76d248f2137186623cbadafa21e5c"}, {"path": "build/nocturne-audit/compat18-google/svg-readonly-probe.log", "sha256": "bd5b6bb5102aaca122e7e3746f046d5b84da89620525dcec19ca123384761dde"}, {"path": "build/nocturne-audit/compat18-google/google-apps-measured-pixels.json", "sha256": "6642f50a9562498a3963131076b9672f4e476ac12cc53783de584bb7154835d7"}, {"path": "build/nocturne-audit/compat18-google/svg-source-freeze.json", "sha256": "f596c6e05c4c0c39543294413af7de20201fb7d032687f9257015b973faebb53"}, {"path": "build/nocturne-audit/compat18-google/sources/google-home.html", "sha256": "2a05f66fa80ae111558e0d392bd95cb36e3d36b9d342e80279ecc12e13fd1ce8"}]
+Completion: null
+Review: null
+Round 2:
+> 第2検討: SVG pixel6はHTML fill=red/ fixtureと反証。引用付きQEMU26成功、実Google apps正常化・検索はMessageChannel認証停止。百度中国語本文進行、Axios anchor.pathname未実装を配信stackから特定。所有QEMU全停止
+Evidence: {"path": "build/nocturne-audit/compat18-google/svg-report-round2.md", "sha256": "615dbeabdf7d624d6b71875019cdf18f2016f12522251f57d9c116ab8d734ff4"}
+Next:
+> build19は凍結収束。anchor URL reflection等は次の共通API課題として親へ引継ぎ
+Sources: [{"path": "tests/svgtest.c", "sha256": "02b473650ce000666d03c62a6028afad51c04311e1751b16160e1c0ca9bb9208"}, {"path": "build/nocturne-audit/compat18-google/svg-fixture-native.log", "sha256": "17028fe4b93482b18fee5fcd24c7d0ef8338bb5deea6a4c400709a698762ca87"}, {"path": "build/nocturne-audit/compat18-google/build19-google/qa-serial.log", "sha256": "dadb0f77ef28836d2c452baeca589e88f0b8e9899c68dddd0afff7bee8bf3f17"}, {"path": "build/nocturne-audit/compat18-google/build19-google/google-loaded.png", "sha256": "1d5028adfd501e15a663234eb006edee563f9ea65a4dc2d1e13ba63c793578cb"}, {"path": "build/nocturne-audit/compat18-google/build19-google/google-apps-measured-pixels.json", "sha256": "2a2b56e96df8c031a50cf7559295742685f30d059cb813418d46e48d2771587d"}, {"path": "build/nocturne-audit/compat18-google/build19-google/qa-stopped.json", "sha256": "2616782fb7bc2a4474d63a28a34eb71200275fe74b1fcaa84260d949de0c356b"}, {"path": "build/nocturne-audit/compat18-google/build19-baike/qa-serial.log", "sha256": "ad7e176f59bcac24411a1bb899222a33a641de61bb22cc9c1e86ae9a8005b7cb"}, {"path": "build/nocturne-audit/compat18-google/build19-baike/baike-loaded.png", "sha256": "b83b27f3b3ea11a09f88894e1e5466d86ad5fc1d3bd726f6fff5898f7f081b8c"}, {"path": "build/nocturne-audit/compat18-google/build19-baike/qa-stopped.json", "sha256": "a6dfdf461b0a4b534a23571a7d7e848097dd0cec4afe276b3702def00f1a802e"}, {"path": "build/nocturne-audit/compat18-google/sources/baike-build19-context.txt", "sha256": "1a6f51641676ee4d9224817c5f9f6a9269456ebcb1c4824c976b80ac0c94d58c"}]
+Completion: null
+Review: null
+
+### Agent
+> webfetch_native
+Parent:
+> root
+Task:
+> 実DeepMind通信ワーカーpagefaultの原因確認とNocturneネイティブ修正
+Owns:
+> user/apps/webfetch.c,user/libc/webnet.c,kernel/src/mm/vmm.c,kernel/src/sys/proc.c,build/nocturne-audit/webfetch-native
+Active: False
+Retirement: {"handoff_to": "root", "owns": ["user/apps/webfetch.c,user/libc/webnet.c,kernel/src/mm/vmm.c,kernel/src/sys/proc.c,build/nocturne-audit/webfetch-native"], "reason": "担当モデルのエラーで終了。初回sourceとQEMU証拠を保持し、rollback範囲の独立レビュー・修正・最終統合と所有QEMU終了確認はrootが引き継ぐ。", "task": "実DeepMind通信ワーカーpagefaultの原因確認とNocturneネイティブ修正", "time": 1791308577.921497}
+Round 1:
+> 同一webfetch PT_LOADでstack frame越境位置を特定。Nocturne QEMUでsbrk ENOMEMの375357440bytes残留を実再現。実DeepMind終了faultは初回系列では未再現。
+Evidence: {"path": "build/nocturne-audit/webfetch-native/report-round1.md", "sha256": "3684c79bff92155de89f11ef24cd14e999f4e9e524746a44159381f72b14ae95"}
+Next:
+> sbrk rollbackの旧新kernel A/BとDDG reload後のnative fault状態採取
+Sources: [{"path": "user/apps/webfetch.c", "sha256": "ce2a94dc141c8d9937e1d872665afd00525dee0c670743a9e20a845339f7ee77"}, {"path": "kernel/src/mm/vmm.c", "sha256": "15d30bed6012b261ec777ee3ee0342d00ed4256988d6e509dffba2909ed1652a"}, {"path": "kernel/src/sys/syscall.c", "sha256": "03f368f987a01002bf69142ad98e36fb6a9e382a3f68091ef8c9663dd74f9a49"}, {"path": "build/nocturne-audit/webfetch-native/sbrk-baseline14/qa-serial.log", "sha256": "d3d705f5404a3c1c49b8889e8b1c990f3044305ea95f11ef1beebb68749fa6c8"}]
 Completion: null
 Review: null
 

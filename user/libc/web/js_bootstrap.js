@@ -6,7 +6,7 @@
     let customElementsReady = false;
     function dom(...args) {
         const op = args[0];
-        const mutation = op === 'insert' || op === 'remove' || op === 'clone' || op === 'set' ||
+        const mutation = op === 'insert' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'set' ||
             ((op === 'attr' || op === 'style') && args.length > 3);
         return mutation && customElementsReady ? customElementsBridge.reactions(() => rawDom(...args)) : rawDom(...args);
     }
@@ -14,6 +14,7 @@
     const eventSlice = Array.prototype.slice, mouseAssign = Object.assign;
     const listenerMap = new WeakMap(), inlineMap = new WeakMap();
     const handlerMap = new WeakMap();
+    let xhrHandlerTarget = () => false;
     const globalHandlerTypes = new Set(('abort blur change click dblclick error focus focusin focusout input keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select submit wheel').split(' '));
     const windowHandlerTypes = new Set(['hashchange','popstate']);
     const state = new WeakMap();
@@ -125,7 +126,7 @@
     }
     function handlerTarget(target,type) {
         return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document)) ||
-            (windowHandlerTypes.has(type) && target===globalThis);
+            (windowHandlerTypes.has(type) && target===globalThis) || xhrHandlerTarget(target,type);
     }
     function activateHandler(target,type,r) {
         if(r.entry)return;
@@ -148,6 +149,7 @@
     function handlerValue(target,type) {
         const r=handlerRecord(target,type);if(!r)throw new TypeError('Illegal event handler receiver');
         if(!r.compiled) {
+            if(target instanceof Node && !rawDom('get',target,'scripting'))return null;
             r.compiled=true;
             try{r.value=host.inline(r.text);}catch(e){r.value=null;report(e);}
         }
@@ -188,7 +190,7 @@
             let fn = target['on' + event.type];
             if (fn === undefined && target instanceof Node && target.nodeType === 1) {
                 const text = target.getAttribute('on' + event.type);
-                if (text !== null) {
+                if (text !== null && rawDom('get',target,'scripting')) {
                     let cache = inlineMap.get(target);
                     if (!cache) inlineMap.set(target, cache = new Map());
                     let x = cache.get(event.type);
@@ -241,9 +243,9 @@
         get nextSibling() { return dom('get',this,'nextSibling'); }
         get previousSibling() { return dom('get',this,'previousSibling'); }
         get childNodes() { return collectionBridge.children(this,false); }
-        get ownerDocument() { return this === document ? null : document; }
+        get ownerDocument() { return dom('get',this,'ownerDocument'); }
         get baseURI() { return dom('get',this,'baseURI'); }
-        get isConnected() { let n=this; while(n.parentNode) n=n.parentNode; return n===document; }
+        get isConnected() { return dom('get',this,'isConnected'); }
         get textContent() { return dom('get',this,'textContent'); }
         set textContent(v) { dom('set',this,'textContent',v == null ? '' : String(v)); }
         appendChild(child) { dom('insert',this,child,null); return child; }
@@ -265,11 +267,11 @@
         get previousElementSibling() { let n=this.previousSibling; while(n && n.nodeType !== 1) n=n.previousSibling; return n; }
         get childElementCount() { return this.children.length; }
         remove() { if (this.parentNode) this.parentNode.removeChild(this); }
-        append(...nodes) { for (const n of nodes) this.appendChild(n instanceof Node ? n : document.createTextNode(String(n))); }
-        prepend(...nodes) { const before=this.firstChild; for (const n of nodes) this.insertBefore(n instanceof Node ? n : document.createTextNode(String(n)),before); }
+        append(...nodes) { for (const n of nodes) this.appendChild(n instanceof Node ? n : (this.ownerDocument||this).createTextNode(String(n))); }
+        prepend(...nodes) { const before=this.firstChild; for (const n of nodes) this.insertBefore(n instanceof Node ? n : (this.ownerDocument||this).createTextNode(String(n)),before); }
         replaceChildren(...nodes) { this.textContent=''; this.append(...nodes); }
-        before(...nodes) { if(this.parentNode) for(const n of nodes) this.parentNode.insertBefore(n instanceof Node?n:document.createTextNode(String(n)),this); }
-        after(...nodes) { if(this.parentNode) { const next=this.nextSibling; for(const n of nodes) this.parentNode.insertBefore(n instanceof Node?n:document.createTextNode(String(n)),next); } }
+        before(...nodes) { if(this.parentNode) for(const n of nodes) this.parentNode.insertBefore(n instanceof Node?n:this.ownerDocument.createTextNode(String(n)),this); }
+        after(...nodes) { if(this.parentNode) { const next=this.nextSibling; for(const n of nodes) this.parentNode.insertBefore(n instanceof Node?n:this.ownerDocument.createTextNode(String(n)),next); } }
         get tagName() { return this.nodeType === 1 ? this.nodeName : undefined; }
         get localName() { return dom('get',this,'localName'); }
         get namespaceURI() { return dom('get',this,'namespaceURI'); }
@@ -325,7 +327,7 @@
         get disabled() { return this.hasAttribute('disabled'); }
         set disabled(v) { this.toggleAttribute('disabled',!!v); }
         focus() { dom('focus',this); }
-        blur() { dom('focus',null); }
+        blur() { if(rawDom('get',this,'scripting'))dom('focus',null); }
         click() { host.click(this); }
         submit() { dom('submit',this); }
         requestSubmit(submitter) { const e=new Event('submit',{bubbles:true,cancelable:true});e.submitter=submitter||null;if(this.dispatchEvent(e))dom('submit',submitter||this); }
@@ -335,6 +337,10 @@
     // Nested browsing contexts/navigation are not implemented by this class.
     class HTMLIFrameElement extends HTMLElement {
         constructor() { throw new TypeError('Illegal HTMLIFrameElement constructor'); }
+    }
+    class HTMLTemplateElement extends HTMLElement {
+        constructor(){throw new TypeError('Illegal HTMLTemplateElement constructor');}
+        get content(){return dom('get',this,'templateContent');}
     }
     class HTMLImageElement extends HTMLElement {
         constructor() { throw new TypeError('Illegal HTMLImageElement constructor'); }
@@ -348,7 +354,7 @@
         get currentSrc() { return dom('get',this,'imageCurrentSrc'); }
         get src() {
             dom('get',this,'imageBrand'); const value=dom('attr',this,'src');
-            if(value===null)return '';try{return new URL(value,document.baseURI).href;}catch(_){return value;}
+            if(value===null)return '';try{return new URL(value,this.baseURI).href;}catch(_){return value;}
         }
         set src(v) { dom('get',this,'imageBrand');dom('attr',this,'src',String(v)); }
         get alt() { dom('get',this,'imageBrand');return dom('attr',this,'alt')||''; }
@@ -398,13 +404,19 @@
         constructor(){throw new TypeError('Illegal HTMLOptionElement constructor');}
         get form(){return dom('get',this,'form:option');}
     }
-    Object.assign(Node, {ELEMENT_NODE:1,TEXT_NODE:3,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_FRAGMENT_NODE:11});
-    Object.assign(Node.prototype, {ELEMENT_NODE:1,TEXT_NODE:3,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_FRAGMENT_NODE:11});
+    Object.assign(Node, {ELEMENT_NODE:1,TEXT_NODE:3,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
+    Object.assign(Node.prototype, {ELEMENT_NODE:1,TEXT_NODE:3,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
     class Document extends Node {}
+    class HTMLDocument extends Document {}
     class CharacterData extends Node {}
     class Text extends CharacterData {}
     class Comment extends CharacterData {}
     class DocumentFragment extends Node {}
+    class DocumentType extends Node {
+        get name(){return dom('get',this,'doctypeName');}
+        get publicId(){return dom('get',this,'publicId');}
+        get systemId(){return dom('get',this,'systemId');}
+    }
     function copyElementMembers(proto, names) {
         for (const name of names) Object.defineProperty(proto, name, Object.getOwnPropertyDescriptor(Element.prototype, name));
     }
@@ -415,7 +427,7 @@
     copyElementMembers(DocumentFragment.prototype, parentMembers);
     copyElementMembers(CharacterData.prototype, ['nextElementSibling','previousElementSibling','remove','before','after']);
     const document=host.document;
-    Object.setPrototypeOf(document,Document.prototype);
+    Object.setPrototypeOf(document,HTMLDocument.prototype);
     Object.defineProperties(document, {
         documentElement:{get(){return dom('get',document,'documentElement');}},
         head:{get(){return dom('get',document,'head');}}, body:{get(){return dom('get',document,'body');}},
@@ -432,7 +444,6 @@
     document.createTextNode=text=>dom('create',null,3,'#text',String(text));
     document.createComment=text=>dom('create',null,8,'#comment',String(text));
     document.createDocumentFragment=()=>dom('create',null,11,'#document-fragment','');
-    document.importNode=(node,deep)=>node.cloneNode(!!deep);
     document.write=(...s)=>host.write(s.join(''));
     document.writeln=(...s)=>host.write(s.join('')+'\n');
     document.createEvent=function(name){
@@ -472,7 +483,7 @@
         item(i){const a=this.cssText.split(';').filter(x=>x.includes(':'));return a[i]?a[i].split(':')[0].trim():'';}
     }
     for(const name of ['name','type','src','href','rel','action','method','placeholder','lang','dir','title'])
-        Object.defineProperty(HTMLElement.prototype,name,{configurable:true,get(){const s=this.getAttribute(name)||'';return ['src','href','action'].includes(name)&&s?host.resolve(s):s;},set(v){this.setAttribute(name,v);}});
+        Object.defineProperty(HTMLElement.prototype,name,{configurable:true,get(){const s=this.getAttribute(name)||'';if(['src','href','action'].includes(name)&&s){try{return new URL(s,this.baseURI).href;}catch(_){return s;}}return s;},set(v){this.setAttribute(name,v);}});
     const CSS={escape(s){return Array.from(String(s)).map((c,i)=>/[a-zA-Z_\-]/.test(c)||(/[0-9]/.test(c)&&i>0)?c:'\\'+c.codePointAt(0).toString(16)+' ').join('');}};
     class Headers {
         constructor(init){this._h=new Map();if(init instanceof Headers)for(const [k,v]of init)this.append(k,v);else if(Array.isArray(init))for(const [k,v]of init)this.append(k,v);else if(init)for(const k of Object.keys(init))this.append(k,init[k]);}
@@ -531,11 +542,11 @@
     function clearTimeout(id){host.clear(Number(id));}function clearInterval(id){host.clear(Number(id));}
     function requestAnimationFrame(fn){if(typeof fn!=='function')throw new TypeError('Expected callback');return timer(2,fn,16,[]);}
     function cancelAnimationFrame(id){host.clear(Number(id));}
-    function queueMicrotask(fn){if(typeof fn!=='function')throw new TypeError('Expected callback');Promise.resolve().then(fn).catch(report);}
+    function queueMicrotask(fn){return host.microtask(fn);}
     const navigator={userAgent:'Nocturne/1.0 QuickJS',platform:'Nocturne',language:'en-US',languages:['en-US'],onLine:true};
     Object.assign(globalThis,{document,console,navigator,Node,Element,HTMLElement,HTMLIFrameElement,HTMLImageElement,Image,
         HTMLInputElement,HTMLButtonElement,HTMLSelectElement,HTMLTextAreaElement,HTMLFieldSetElement,HTMLObjectElement,HTMLOutputElement,HTMLOptionElement,
-        Document,CharacterData,Text,Comment,DocumentFragment,
+        Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,Comment,DocumentFragment,
         Event,CustomEvent,UIEvent,MouseEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Response,DOMException,AbortController,AbortSignal,
         fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,
         performance:{now:()=>host.now()},getComputedStyle:n=>new Proxy({getPropertyValue:k=>dom('computed',n,String(k))},{get(t,k){return k in t?t[k]:t.getPropertyValue(cssName(k));}})});
@@ -550,7 +561,7 @@
     installHandlers(globalThis,globalHandlerTypes);
     installHandlers(globalThis,windowHandlerTypes);
     Object.defineProperties(globalThis,{innerWidth:{get(){return dom('viewport',null,0);}},innerHeight:{get(){return dom('viewport',null,1);}}});
-    Object.defineProperty(Document.prototype,'cookie',{get(){return host.cookie();},set(v){host.cookie(String(v));}});
+    Object.defineProperty(Document.prototype,'cookie',{get(){return this===document?host.cookie():'';},set(v){v=String(v);if(this===document)host.cookie(v);}});
     Object.defineProperties(globalThis,{
         scrollX:{get(){return host.scroll(0);}},pageXOffset:{get(){return host.scroll(0);}},
         scrollY:{get(){return host.scroll(1);}},pageYOffset:{get(){return host.scroll(1);}}
@@ -566,6 +577,8 @@
     let historyEvent;
     /* @include js_encoding.js */
     /* @include js_url.js */
+    /* @include js_xhr.js */
+    /* @include js_screen.js */
     /* @include js_intl.js */
     /* @include js_crypto.js */
     /* @include js_clone.js */
@@ -576,6 +589,7 @@
     /* @include js_observers.js */
     /* @include js_mutations.js */
     /* @include js_selection.js */
+    /* @include js_document.js */
     customElementsReady = true;
     /* Private native-input state, never reachable from page JS. C supplies the
        hit target's complete ancestry BEFORE any event handler can change it.
@@ -621,15 +635,24 @@
         eventHandlerAttribute:handlerAttribute,
         imageError(){return new DOMException('The image request changed or could not be decoded','EncodingError');},
         hover,
-        customElementBefore(...args){const ce=customElementsBridge.before(...args),mutation=mutationBridge.before(...args);return ce||mutation?{ce,mutation}:null;},
-        customElementAfter(token,result){mutationBridge.after(token.mutation);customElementsBridge.after(token.ce,result);},
+        customElementBefore(...args){
+            const reactionArgs=args[0]==='adopt' && args[2]?['remove',args[2]]:args;
+            const ce=reactionArgs[1] && rawDom('get',reactionArgs[1],'scripting')?customElementsBridge.before(...reactionArgs):null;
+            let mutationArgs=reactionArgs;
+            if(args[0]==='set' && args[2]==='innerHTML' && args[1] instanceof HTMLTemplateElement)
+                mutationArgs=['set',rawDom('get',args[1],'templateContent'),'innerHTML',args[3]];
+            const mutation=mutationBridge.before(...mutationArgs);
+            return ce||mutation?{ce,mutation,op:args[0]}:null;
+        },
+        customElementAfter(token,result){mutationBridge.after(token.mutation);if(token.op!=='clone' || !result || rawDom('get',result,'scripting'))customElementsBridge.after(token.ce,result);},
         customElementScan(){customElementsBridge.upgradeTree(document);},
         historyEvent(oldURL,popstate){historyEvent(oldURL,popstate);},
         mediaChanged(){mediaBridge.changed();},
-        nodeProtos:[Node.prototype,Document.prototype,Element.prototype,HTMLElement.prototype,
+        inertClick(target){return dispatch(target,new MouseEvent('click',{bubbles:true,cancelable:true}));},
+        nodeProtos:[Node.prototype,HTMLDocument.prototype,Element.prototype,HTMLElement.prototype,
             Text.prototype,Comment.prototype,DocumentFragment.prototype,HTMLIFrameElement.prototype,HTMLImageElement.prototype,
             HTMLInputElement.prototype,HTMLButtonElement.prototype,HTMLSelectElement.prototype,HTMLTextAreaElement.prototype,
-            HTMLFieldSetElement.prototype,HTMLObjectElement.prototype,HTMLOutputElement.prototype,HTMLOptionElement.prototype],
+            HTMLFieldSetElement.prototype,HTMLObjectElement.prototype,HTMLOutputElement.prototype,HTMLOptionElement.prototype,HTMLTemplateElement.prototype,DocumentType.prototype],
         dispatch(target,type,init){const C=/^(key)/.test(type)?KeyboardEvent:/^(mouse|click|dblclick)/.test(type)?MouseEvent:Event;const e=new C(type,init);Object.assign(e,init);e.isTrusted=true;return dispatch(target===null?globalThis:target,e);},
         response(status,url,raw,text,bytes,redirected){const headers=new Headers();for(const line of raw.split(/\r?\n/)){const i=line.indexOf(':');if(i>0){const k=line.slice(0,i);if(!/^set-cookie2?$/i.test(k))headers.append(k,line.slice(i+1));}}return new Response(text,{status,url,headers,bytes,redirected});},
         reject(message,abort){return abort?new DOMException(message,'AbortError'):new TypeError(message);}

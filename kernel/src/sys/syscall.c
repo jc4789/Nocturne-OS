@@ -243,8 +243,17 @@ static int64_t sys_sbrk(int64_t inc) {
     uint64_t nb = t->brk + inc;
     if (nb < t->brk_base || nb >= USER_MMAP_BASE) return -ENOMEM;
     if (inc > 0) {
-        if (vmm_user_alloc(t->pml4, ALIGN_UP(old, PAGE_SIZE), ALIGN_UP(nb, PAGE_SIZE) - ALIGN_UP(old, PAGE_SIZE), VM_W) < 0)
-            return -ENOMEM;
+        uint64_t start = ALIGN_UP(old, PAGE_SIZE);
+        uint64_t end = ALIGN_UP(nb, PAGE_SIZE);
+        for (uint64_t page = start; page < end; page += PAGE_SIZE) {
+            if (vmm_user_alloc(t->pml4, page, PAGE_SIZE, VM_W) < 0) {
+                /* Only this attempt's completed prefix belongs to the rollback.
+                   Preserve the old partial page, and do not scan the unallocated
+                   tail of a request that can be much larger than physical RAM. */
+                vmm_user_free(t->pml4, start, page - start);
+                return -ENOMEM;
+            }
+        }
     } else {
         vmm_user_free(t->pml4, ALIGN_UP(nb, PAGE_SIZE), ALIGN_UP(old, PAGE_SIZE) - ALIGN_UP(nb, PAGE_SIZE));
     }

@@ -650,7 +650,7 @@ static bool host_request(void *opaque, const struct web_request *request) {
         .kind = network_kind(request->kind), .generation = generation,
         .url = request->url, .origin = web_url(doc), .method = request->method,
         .headers = request->headers, .body = request->body, .body_len = request->body_len,
-        .credentials = request->credentials
+        .credentials = request->credentials, .force_preflight = request->force_preflight
     };
     t->network_id = webnet_submit(network, &r, resource_completed, t);
     if (!t->network_id) { free(t); return false; }

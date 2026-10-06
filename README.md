@@ -22,6 +22,8 @@ QuickJS の実験的な統合がありますが、ブラウザー API は未完�
 **現時点で YouTube、DeepMind、通常版 DuckDuckGo、ChatGPT の正常動作は確認できていません。**
 実サイトの QEMU 検証結果と残課題は [検証記録](docs/browser-validation-2026-10-06.md) を参照してください。
 その後の JavaScript・Shift_JIS 修正と実サイト再検証は [追補](docs/browser-js-progress-2026-10-06.md) に記録しています。指定4サイトの全面動作は未達成です。
+実サイトで判明した microtask 再帰と Nocturne のメモリ不足時処理の修正は [続報](docs/browser-native-progress-2026-10-06.md) に記録しています。
+Google・GitHub・HTML5test・百度百科を加えた実機検証と、XHR・独立Document・SVGの修正は [互換性の拡大検証](docs/browser-web-compatibility-2026-10-06.md) を参照してください。表示の部分成功と、サイト操作の未達を区別しています。
 
 ![Desktop and start menu](docs/desktop-menu.png)
 

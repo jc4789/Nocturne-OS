@@ -36,14 +36,16 @@ static void changed(web_doc *d, node_t *n, bool resources) {
 void doc_mutated(web_doc *d, node_t *n) { changed(d, n, true); }
 
 node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t len) {
-    if (!d || type < N_DOC || type > N_FRAGMENT || len > (16u << 20)) return NULL;
+    if (!d || type < N_DOC || type > N_DOCTYPE || len > (16u << 20)) return NULL;
     if (type == N_ELEM && (!name || !*name || strlen(name) >= 64)) return NULL;
+    doc_dom_budget(d);
     jmp_buf trap;
     jmp_buf *old = d->mem.trap;
     d->mem.trap = &trap;
     if (setjmp(trap)) { d->mem.trap = old; return NULL; }
     node_t *n = ar_alloc(&d->mem, sizeof *n);
     n->type = (uint8_t)type;
+    n->owner = n->allocation_doc = d;
     n->image = -1;
     n->owned_next = d->owned_nodes;
     d->owned_nodes = n;
@@ -55,6 +57,8 @@ node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text
         n->tag = (uint16_t)tag_lookup(lower_name, l);
         n->name = n->tag ? tag_names[n->tag] : ar_strndup(&d->mem, lower_name, l);
         n->raw_name = ar_strdup(&d->mem, name);
+    } else if (type == N_DOCTYPE) {
+        n->name = ar_strdup(&d->mem, name ? name : "html");
     } else if (type == N_TEXT || type == N_COMMENT) {
         n->text = ar_strndup(&d->mem, text ? text : "", text ? len : 0);
         n->textlen = text ? len : 0;
@@ -106,6 +110,7 @@ bool doc_node_attr(web_doc *d, node_t *n, const char *name, const char *value) {
     if (!resources && found >= 0 && value && !strcmp(n->attrs[found].value, value)) return true;
     int count = n->nattrs + (found < 0 ? 1 : value ? 0 : -1);
     if (count > 1024) return false;
+    doc_dom_budget(d);
     jmp_buf trap;
     jmp_buf *old = d->mem.trap;
     d->mem.trap = &trap;
@@ -178,6 +183,7 @@ static int tree_depth(node_t *n, int depth) {
 static bool may_insert(node_t *p, node_t *c) {
     if (!p || !c || p == c || under(p, c) || c->type == N_DOC ||
         (p->type != N_DOC && p->type != N_ELEM && p->type != N_FRAGMENT)) return false;
+    for (node_t *n = p; n; n = n->parent ? n->parent : n->template_host) if (n == c) return false;
     int depth = 0;
     for (node_t *n = p; n; n = n->parent) depth++;
     if (tree_depth(c, depth) > DOM_MAX_DEPTH) return false;
@@ -185,7 +191,9 @@ static bool may_insert(node_t *p, node_t *c) {
         if (c->type == N_TEXT) return false;
         if (c->type == N_ELEM) for (node_t *n = p->first; n; n = n->next)
             if (n != c && n->type == N_ELEM) return false;
-    }
+        if (c->type == N_DOCTYPE) for (node_t *n = p->first; n; n = n->next)
+            if (n != c && n->type == N_DOCTYPE) return false;
+    } else if (c->type == N_DOCTYPE) return false;
     return true;
 }
 
@@ -203,6 +211,7 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
         return true;
     }
     if (!may_insert(p, c)) return false;
+    if (c->owner != d && !doc_node_adopt(d, c)) return false;
     detach(c);
     c->parent = p;
     c->next = before;
@@ -222,9 +231,74 @@ void doc_node_remove(web_doc *d, node_t *n) {
     doc_mutated(d, p);
 }
 
+static void adopt_subtree(web_doc *d, node_t *n) {
+    n->owner = d;
+    n->style = NULL; n->box = n->anchor_block = NULL;
+    n->image = -1; n->image_request = -1; n->image_initialized = false;
+    n->image_generation++;
+    for (node_t *c = n->first; c; c = c->next) adopt_subtree(d, c);
+    if (n->template_content) {
+        web_doc *owner = d->template_owner ? d : d->template_doc;
+        if (!owner) {
+            owner = doc_inert(d, "", 0, "about:blank");
+            if (owner) {
+                while (owner->root->first) doc_node_remove(owner, owner->root->first);
+                owner->template_owner = true; d->template_doc = owner;
+            }
+        }
+        if (owner) adopt_subtree(owner, n->template_content);
+    }
+}
+static bool has_template(node_t *n) {
+    if (n->template_content) return true;
+    for (node_t *c = n->first; c; c = c->next) if (has_template(c)) return true;
+    return false;
+}
+bool doc_node_adopt(web_doc *d, node_t *n) {
+    if (!d || !n || n->type == N_DOC) return false;
+    /* Reserve the destination's template owner before detaching anything. */
+    if (has_template(n) && !d->template_owner && !d->template_doc) {
+        web_doc *owner = doc_inert(d, "", 0, "about:blank");
+        if (!owner) return false;
+        while (owner->root->first) doc_node_remove(owner, owner->root->first);
+        owner->template_owner = true; d->template_doc = owner;
+    }
+    if (n->parent) doc_node_remove(n->owner ? n->owner : d, n);
+    adopt_subtree(d, n);
+    return true;
+}
+
+node_t *doc_template_content(web_doc *d, node_t *n) {
+    if (!d || !n || n->type != N_ELEM || n->foreign || n->tag != T_template) return NULL;
+    if (n->template_content) return n->template_content;
+    web_doc *owner = d->template_owner ? d : d->template_doc;
+    if (!owner) {
+        owner = doc_inert(d, "", 0, "about:blank");
+        if (!owner) return NULL;
+        while (owner->root->first) doc_node_remove(owner, owner->root->first);
+        owner->template_owner = true; d->template_doc = owner;
+    }
+    n->template_content = doc_node_create(owner, N_FRAGMENT, NULL, "", 0);
+    if (n->template_content) n->template_content->template_host = n;
+    return n->template_content;
+}
+
+bool doc_templates_finish(web_doc *d, node_t *root) {
+    for (node_t *n = root; n; n = n->next) {
+        if (n->type == N_ELEM && !n->foreign && n->tag == T_template) {
+            node_t *content = doc_template_content(n->owner ? n->owner : d, n);
+            if (!content) return false;
+            while (n->first) if (!doc_node_move(content->owner, content, n->first, NULL)) return false;
+            if (!doc_templates_finish(content->owner, content->first)) return false;
+        } else if (n->first && !doc_templates_finish(d, n->first)) return false;
+    }
+    return true;
+}
+
 bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
     if (!d || !n || len > (16u << 20)) return false;
-    if (n->type == N_DOC) return true;
+    if (n->type == N_DOC || n->type == N_DOCTYPE) return true;
+    doc_dom_budget(d);
     if (n->type == N_TEXT || n->type == N_COMMENT) {
         jmp_buf trap;
         jmp_buf *old = d->mem.trap;
@@ -246,7 +320,14 @@ bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
 
 bool doc_node_html(web_doc *d, node_t *n, const char *html, size_t len) {
     if (!d || !n || (n->type != N_ELEM && n->type != N_FRAGMENT) || len > (16u << 20)) return false;
-    node_t *fragment = html_fragment(d, n, html, len);
+    node_t *context = n;
+    if (n->type == N_ELEM && !n->foreign && n->tag == T_template) {
+        n = doc_template_content(d, n);
+        if (!n) return false;
+        d = n->owner;
+    }
+    doc_dom_budget(d);
+    node_t *fragment = html_fragment(d, context, html, len);
     if (!fragment) return false;
     for (node_t *c = fragment->first; c; c = c->next) if (!may_insert(n, c)) return false;
     while (n->first) doc_node_remove(d, n->first);
@@ -255,8 +336,10 @@ bool doc_node_html(web_doc *d, node_t *n, const char *html, size_t len) {
 
 bool doc_node_value(web_doc *d, node_t *n, const char *text, size_t len) {
     if (!d || !n || len > (16u << 20) || (len && !text)) return false;
-    size_t next = d->control_bytes - n->value_capacity;
-    if (d->live && (len + 1 > (32u << 20) || next > (32u << 20) - len - 1 ||
+    web_doc *allocation = n->allocation_doc ? n->allocation_doc : d;
+    if (d->dom_family && len + 1 > doc_dom_remaining(d) + n->value_capacity) return false;
+    size_t next = allocation->control_bytes - n->value_capacity;
+    if (!d->dom_family && d->live && (len + 1 > (32u << 20) || next > (32u << 20) - len - 1 ||
                     d->mem.allocated > (32u << 20) - next - len - 1)) return false;
     char *value = malloc(len + 1);
     if (!value) return false;
@@ -278,8 +361,9 @@ bool doc_node_value(web_doc *d, node_t *n, const char *text, size_t len) {
     if (n->selection_start > units) n->selection_start = units;
     if (n->selection_end > units) n->selection_end = units;
     doc_control_caret(d, n);
-    d->control_bytes = next + len + 1;
-    if (d->live) d->mem.limit = (32u << 20) - d->control_bytes;
+    allocation->control_bytes = next + len + 1;
+    if (d->dom_family) doc_dom_budget(d);
+    else if (d->live) d->mem.limit = (32u << 20) - d->control_bytes;
     d->dirty = d->need_style = true;
     return true;
 }
@@ -289,6 +373,14 @@ node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
     node_t *c = doc_node_create(d, n->type, n->raw_name ? n->raw_name : n->name, n->text, n->textlen);
     if (!c) return NULL;
     c->foreign = n->foreign;
+    if (n->type == N_DOCTYPE) {
+        /* Doctype strings are arena-owned like ordinary attributes. */
+        jmp_buf trap; jmp_buf *old = d->mem.trap; d->mem.trap = &trap;
+        if (setjmp(trap)) { d->mem.trap = old; return NULL; }
+        c->public_id = ar_strdup(&d->mem, n->public_id ? n->public_id : "");
+        c->system_id = ar_strdup(&d->mem, n->system_id ? n->system_id : "");
+        d->mem.trap = old;
+    }
     for (int i = 0; i < n->nattrs; i++)
         if (!doc_node_attr(d, c, n->attrs[i].raw, n->attrs[i].value)) return NULL;
     c->checked = n->checked;
@@ -299,6 +391,14 @@ node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
     c->value_dirty = n->value_dirty;
     c->checked_dirty = n->checked_dirty;
     c->script_started = n->tag == T_script;
+    if (n->tag == T_template && !n->foreign) {
+        node_t *content = doc_template_content(d, c);
+        if (!content) return NULL;
+        if (deep) for (node_t *ch = n->template_content ? n->template_content->first : NULL; ch; ch = ch->next) {
+            node_t *copy = doc_node_clone(content->owner, ch, true);
+            if (!copy || !doc_node_move(content->owner, content, copy, NULL)) return NULL;
+        }
+    }
     if (deep) for (node_t *ch = n->first; ch; ch = ch->next) {
         node_t *copy = doc_node_clone(d, ch, true);
         if (!copy || !doc_node_move(d, c, copy, NULL)) return NULL;

@@ -57,6 +57,8 @@ static const struct test tests[] = {
 
     /* memory and protection */
     {"mem", "malloc-stress", "tcc -o /home/memtest /data/tests/memtest.c && /home/memtest", 0, {"memtest: ok"}, NULL, 120},
+    {"mem", "heap-failure-atomicity", "tcc -o /home/sbrktest /data/tests/sbrktest.c && /home/sbrktest", 0,
+     {"sbrktest: ", ", 0 failed"}, "FAIL", 60, false, true},
     {"mem", "w^x", "tcc -o /home/wxtest /data/tests/wxtest.c && /home/wxtest", 0, {"wxtest: 0 failed"}, "FAIL", 60, true},
 
     /* filesystems */
