@@ -12,7 +12,7 @@ enum {
     SYS_WIN_MOVE, SYS_CLIPBOARD_SET, SYS_CLIPBOARD_GET, SYS_WIN_RESIZE, SYS_GUI_LAUNCH,
     SYS_SCREEN_GRAB,
     SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
-    SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE,
+    SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
     SYS_MAX = 128
 };
 
@@ -129,6 +129,15 @@ struct n_netinfo {
     uint8_t ip[4], mask[4], gateway[4], dns[4];
     uint64_t rx_packets, tx_packets;
     char driver[32];
+};
+/* SYS_NET_TEST: simulated loss and reordering on the calling process's TCP connections (for tests),
+   in per mille of the segments that carry data; all zero turns it off. */
+struct n_netfault {
+    uint16_t rx_drop, rx_reorder, tx_drop;
+};
+struct n_tcpstats { /* since boot, all connections */
+    uint64_t segs_out, segs_in, retransmits, fast_retransmits, timeouts, dupacks_in, ooo_in;
+    uint64_t faults_dropped, faults_reordered;
 };
 struct n_sockaddr {
     uint32_t ip; /* host byte order: a.b.c.d is a<<24 | b<<16 | c<<8 | d */

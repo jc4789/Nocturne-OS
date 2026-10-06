@@ -22,6 +22,7 @@ struct test {
     const char *bad;     /* a substring it must not contain */
     int timeout_s;
     bool may_crash; /* child processes crash on purpose */
+    bool show;      /* log the output even when the test passes (measurements) */
 };
 
 static const struct test tests[] = {
@@ -73,6 +74,10 @@ static const struct test tests[] = {
     /* desktop */
     {"gui", "window-and-screenshot", "tcc -o /home/guitest /data/tests/guitest.c && /home/guitest", 0, {"guitest: ok"}, NULL, 60},
 
+    /* TCP against the host's test server (no internet needed), clean and with simulated loss */
+    {"tcp", "bulk-and-loss", "tcc -o /home/tcptest /data/tests/tcptest.c && /home/tcptest", 0, {"tcptest: 0 failed"},
+     "FAIL", 300, false, true},
+
     /* network (QEMU user networking: gateway 10.0.2.2, DNS 10.0.2.3) */
     {"net", "dhcp", "ifconfig", 0, {"10.0.2.15"}},
     {"net", "ping-gateway", "ping -c 2 10.0.2.2", 0, {"2 received"}, NULL, 20},
@@ -119,6 +124,7 @@ static void snippet(const char *out, char *dst, size_t n) {
 }
 
 static void run(const struct test *t) {
+    int nfail_before = nfail;
     int fd = open(OUT, O_WRONLY | O_CREAT | O_TRUNC);
     int nul = open("/dev/null", O_RDONLY);
     int fdmap[3] = {nul, fd, fd};
@@ -167,6 +173,14 @@ static void run(const struct test *t) {
         result("PASS", t, why);
         npass++;
     }
+    if (nfail != nfail_before || t->show) {
+        /* the whole output, indented, for the serial log */
+        for (char *line = out, *nl; *line; line = nl ? nl + 1 : line + strlen(line)) {
+            nl = strchr(line, '\n');
+            printf("  | %.*s\n", nl ? (int)(nl - line) : (int)strlen(line), line);
+        }
+        fflush(stdout);
+    }
     free(out);
 }
 
@@ -198,6 +212,11 @@ int main(int argc, char **argv) {
             result("SKIP", t, skip);
             nskip++;
             continue;
+        }
+        static bool net_waited;
+        if (!net_waited && (!strcmp(t->group, "tcp") || !strcmp(t->group, "net"))) {
+            net_waited = true;
+            if (!net_wait_up(20000)) printf("runtests: the network did not come up\n");
         }
         run(t);
     }

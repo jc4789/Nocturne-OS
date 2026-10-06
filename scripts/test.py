@@ -4,13 +4,14 @@
 The disk carries tests/ and an autorun.sh. init runs that script at boot. It compiles
 tests/runtests.c with the in-OS tcc and runs it, then powers off. Results come back over the
 serial port. Afterwards the host checks the data disk's FAT with fatcheck.py, since the OS just
-wrote to it.
+wrote to it. For the TCP tests the host also runs a small server the guest reaches at 10.0.2.2
+(QEMU's user networking maps it to the host's 127.0.0.1); its port is in /data/tests/tcpport.
 
 usage: python scripts/test.py [--quick] [--full] [--no-net] [--timeout S] [group...]
   --quick   skip the slow tests (compile every app, tcc self-hosting)
   --full    also copy the TinyCC sources so tcc can rebuild itself inside the OS
   --no-net  skip the network tests (they need internet access from the host)
-  group     run only these groups: sh tools mem fs tcc gui net agent
+  group     run only these groups: sh tools mem fs tcc gui tcp net agent
 Exit status 0 when every test passed. Build first (build.ps1). Your own build/data.img is not
 touched: the tests use build/test-data.img.
 """
@@ -18,8 +19,10 @@ import argparse
 import glob
 import os
 import re
+import socketserver
 import subprocess
 import sys
+import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -39,7 +42,56 @@ def mtools(*args):
         sys.exit("test: %s failed: %s" % (args[0], r.stderr.strip()))
 
 
-def make_disk(a):
+PATTERNS = {}  # (n, seed) -> bytes, precomputed for tests/tcptest.c's transfers while the VM boots
+TCPTEST_TRANSFERS = [(4 << 20, 1), (4 << 20, 2), (2 << 20, 3), (2 << 20, 4), (1 << 20, 5), (1 << 20, 6)]
+
+
+def pattern(n, seed):
+    """the byte stream tests/tcptest.c expects: an LCG's bits 16..23"""
+    if (n, seed) in PATTERNS:
+        return PATTERNS[(n, seed)]
+    out = bytearray(n)
+    x = seed
+    for i in range(n):
+        x = (x * 1103515245 + 12345) & 0xFFFFFFFF
+        out[i] = (x >> 16) & 255
+    return out
+
+
+class TcpTestHandler(socketserver.StreamRequestHandler):
+    """GET n seed -> n pattern bytes; PUT n seed + n bytes -> OK n / BAD offset"""
+
+    def handle(self):
+        try:
+            op, n, seed = self.rfile.readline().decode().split()
+            n, seed = int(n), int(seed)
+            want = pattern(n, seed)
+            if op == "GET":
+                self.wfile.write(want)
+            elif op == "PUT":
+                got = self.rfile.read(n)
+                if got == want:
+                    self.wfile.write(b"OK %d\n" % n)
+                else:
+                    bad = next((i for i in range(min(len(got), n)) if got[i] != want[i]), len(got))
+                    self.wfile.write(b"BAD %d\n" % bad)
+        except (OSError, ValueError):
+            pass
+
+
+def start_tcp_server():
+    socketserver.ThreadingTCPServer.daemon_threads = True
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), TcpTestHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    def precompute():
+        for n, seed in TCPTEST_TRANSFERS:
+            PATTERNS[(n, seed)] = pattern(n, seed)
+    threading.Thread(target=precompute, daemon=True).start()
+    return srv
+
+
+def make_disk(a, tcp_port):
     if os.path.exists(IMG):
         os.remove(IMG)
     env = dict(os.environ, PATH=BIN + os.pathsep + os.environ.get("PATH", ""))
@@ -55,6 +107,11 @@ def make_disk(a):
         files += [os.path.join(ROOT, "ports", "tcc", "config.h"), os.path.join(BUILD, "tcc", "tccdefs_.h")]
         mtools("mmd", "-i", PART, "::/tests/tcc")
         mtools("mcopy", "-i", PART, *files, "::/tests/tcc/")
+    port_file = os.path.join(BUILD, "tcpport")
+    with open(port_file, "w", newline="\n") as f:
+        f.write("%d\n" % tcp_port)
+    mtools("mcopy", "-i", PART, port_file, "::/tests/tcpport")
+    os.remove(port_file)
     args = (["-quick"] if a.quick else []) + (["-nonet"] if a.no_net else []) + a.groups
     script = os.path.join(BUILD, "autorun.sh")
     with open(script, "w", newline="\n") as f:
@@ -74,7 +131,8 @@ def main():
     if not os.path.exists(os.path.join(BUILD, "nocturne.img")):
         sys.exit("test: build first (powershell -ExecutionPolicy Bypass -File build.ps1)")
 
-    make_disk(a)
+    srv = start_tcp_server()
+    make_disk(a, srv.server_address[1])
     if os.path.exists(SERIAL):
         os.remove(SERIAL)
     cmd = [QEMU, "-M", "pc", "-m", "512M", "-display", "none", "-vga", "std", "-no-reboot",

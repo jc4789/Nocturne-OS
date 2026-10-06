@@ -701,19 +701,50 @@ static int64_t dns_query(const char *name, uint32_t *out) {
 enum { T_FREE, T_SYN_SENT, T_ESTABLISHED, T_FIN_WAIT1, T_FIN_WAIT2, T_CLOSE_WAIT, T_CLOSING, T_LAST_ACK,
        T_TIME_WAIT, T_CLOSED };
 
+#define TCP_OOO   8    /* out-of-order ranges remembered per connection */
+#define RTO_MIN   200  /* ms */
+#define RTO_MAX   16000
+#define CWND_MAX  (1u << 20)
+
 static struct tcb {
     int state, err, pid;
     bool user_open, fin_pending, fin_sent, rx_fin;
     uint32_t rip;
     uint16_t lport, rport, mss;
     uint8_t mac[6];
-    uint32_t iss, snd_una, snd_nxt, snd_wnd, fin_seq;
+    /* send side. tx[0] is the byte at snd_una; snd_nxt is the next byte to (re)send, snd_max the
+       highest ever sent (they differ after a timeout, when we go back to snd_una) */
+    uint32_t iss, snd_una, snd_nxt, snd_max, snd_wnd, fin_seq;
+    /* congestion control: NewReno (RFC 5681 / 6582) */
+    uint32_t cwnd, ssthresh, recover;
+    int dupacks;
+    bool in_recovery;
+    /* RTT estimate (RFC 6298, ms); one segment is timed at a time, never a retransmitted one */
+    int srtt, rttvar;
+    uint32_t rtt_seq;
+    uint64_t rtt_at;
+    /* receive side. rx is a ring: rx_len bytes are in order and readable; segments that arrive
+       ahead of rcv_nxt are stored at their place behind them, and ooo[] remembers which ranges */
     uint32_t rcv_nxt, adv_wnd;
+    struct { uint32_t start, end; } ooo[TCP_OOO];
+    int nooo;
     uint8_t *rx, *tx;
     uint32_t rx_head, rx_len, tx_len;
     uint64_t rto_at, linger_until;
     int rto, retries;
 } tcbs[TCP_N];
+
+static struct n_tcpstats tcp_stats;
+
+/* fault injection for tests (SYS_NET_TEST): applies only to fault_pid's connections */
+static struct n_netfault fault;
+static int fault_pid;
+static uint8_t fault_held[1600];
+static size_t fault_held_len;
+static uint32_t fault_held_src;
+static uint64_t fault_held_at;
+
+static bool fault_hit(uint16_t per_mille) { return per_mille && rnd() % 1000 < per_mille; }
 
 #define SEQ_LT(a, b)  ((int32_t)((a) - (b)) < 0)
 #define SEQ_LEQ(a, b) ((int32_t)((a) - (b)) <= 0)
@@ -727,6 +758,11 @@ static void tcp_free(struct tcb *t) {
 static uint32_t tcp_window(struct tcb *t) { return MIN(TCP_RXBUF - t->rx_len, 65535u); }
 
 static void tcp_output(struct tcb *t, uint8_t flags, uint32_t seq, const uint8_t *data, size_t len) {
+    tcp_stats.segs_out++;
+    if (len && t->pid == fault_pid && fault_hit(fault.tx_drop)) {
+        tcp_stats.faults_dropped++;
+        return; /* "lost" on the wire */
+    }
     struct tcp_hdr *h = (struct tcp_hdr *)L4;
     size_t hl = (flags & F_SYN) ? 24 : 20;
     h->sport = htons(t->lport);
@@ -754,32 +790,110 @@ static void tcp_arm(struct tcb *t) {
     if (!t->rto_at) t->rto_at = uptime_ms() + (uint64_t)t->rto;
 }
 
-/* send whatever new data (and FIN) the window allows; force sends one byte into a zero window */
+static void tcp_sent(struct tcb *t, uint32_t n) {
+    if (!t->rtt_at && t->snd_nxt == t->snd_max) { /* time new data only (Karn) */
+        t->rtt_at = uptime_ms();
+        t->rtt_seq = t->snd_nxt + n;
+    }
+    t->snd_nxt += n;
+    if (SEQ_LT(t->snd_max, t->snd_nxt)) t->snd_max = t->snd_nxt;
+    tcp_arm(t);
+}
+
+/* send whatever data (and FIN) the send and congestion windows allow, from snd_nxt on;
+   force sends one byte into a zero window (a window probe) */
 static void tcp_push(struct tcb *t, bool force) {
     if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT && t->state != T_FIN_WAIT1 &&
         t->state != T_LAST_ACK && t->state != T_CLOSING)
         return;
-    uint32_t inflight = t->snd_nxt - t->snd_una;
-    uint32_t data_inflight = inflight - (t->fin_sent ? 1 : 0);
-    if (!t->fin_sent) {
-        uint32_t wnd = t->snd_wnd;
-        if (force && wnd == 0) wnd = 1;
-        while (data_inflight < t->tx_len && inflight < wnd) {
-            uint32_t n = MIN(t->tx_len - data_inflight, MIN((uint32_t)t->mss, wnd - inflight));
-            tcp_output(t, F_ACK | F_PSH, t->snd_nxt, t->tx + data_inflight, n);
-            t->snd_nxt += n;
-            inflight += n;
-            data_inflight += n;
-            tcp_arm(t);
+    uint32_t wnd = MIN(t->snd_wnd, t->cwnd);
+    if (force && wnd == 0) wnd = 1;
+    for (;;) {
+        uint32_t off = t->snd_nxt - t->snd_una; /* = bytes in flight, and the offset into tx */
+        if (off < t->tx_len) {
+            if (off >= wnd) break;
+            uint32_t n = MIN(t->tx_len - off, MIN((uint32_t)t->mss, wnd - off));
+            tcp_output(t, F_ACK | F_PSH, t->snd_nxt, t->tx + off, n);
+            tcp_sent(t, n);
+            continue;
         }
-        if (t->fin_pending && data_inflight == t->tx_len) {
-            t->fin_seq = t->snd_nxt;
+        if (t->fin_pending && off == t->tx_len && (!t->fin_sent || t->snd_nxt == t->fin_seq)) {
+            if (!t->fin_sent) {
+                t->fin_sent = true;
+                t->fin_seq = t->snd_nxt;
+                if (t->state == T_ESTABLISHED) t->state = T_FIN_WAIT1;
+                else if (t->state == T_CLOSE_WAIT) t->state = T_LAST_ACK;
+            }
             tcp_output(t, F_FIN | F_ACK, t->snd_nxt, NULL, 0);
-            t->snd_nxt++;
-            t->fin_sent = true;
-            if (t->state == T_ESTABLISHED) t->state = T_FIN_WAIT1;
-            else if (t->state == T_CLOSE_WAIT) t->state = T_LAST_ACK;
-            tcp_arm(t);
+            tcp_sent(t, 1);
+        }
+        break;
+    }
+    /* data waiting behind a zero window: probe it from the retransmit timer */
+    if (t->tx_len && t->snd_una == t->snd_max && t->snd_wnd == 0) tcp_arm(t);
+}
+
+/* retransmit the oldest unacknowledged segment */
+static void tcp_resend_first(struct tcb *t) {
+    uint32_t n = MIN(t->tx_len, (uint32_t)t->mss);
+    if (n) tcp_output(t, F_ACK | F_PSH, t->snd_una, t->tx, n);
+    else if (t->fin_sent && t->snd_una == t->fin_seq) tcp_output(t, F_FIN | F_ACK, t->fin_seq, NULL, 0);
+    t->rtt_at = 0;
+    tcp_stats.retransmits++;
+}
+
+static void tcp_rtt_sample(struct tcb *t, int r) {
+    if (r < 1) r = 1;
+    if (!t->srtt) {
+        t->srtt = r;
+        t->rttvar = r / 2;
+    } else {
+        int d = t->srtt > r ? t->srtt - r : r - t->srtt;
+        t->rttvar = (3 * t->rttvar + d) / 4;
+        t->srtt = (7 * t->srtt + r) / 8;
+    }
+    t->rto = MIN(MAX(t->srtt + MAX(4 * t->rttvar, 50), RTO_MIN), RTO_MAX);
+}
+
+/* the congestion window starts at RFC 3390's initial window */
+static void tcp_cc_init(struct tcb *t) {
+    t->cwnd = MIN(4u * t->mss, MAX(2u * t->mss, 4380u));
+    t->ssthresh = 65535;
+    t->recover = t->snd_una;
+}
+
+/* merge [s, e) into the out-of-order list; if it is full, the data is simply not remembered
+   (the sender will retransmit it) */
+static void tcp_ooo_add(struct tcb *t, uint32_t s, uint32_t e) {
+    for (int i = 0; i < t->nooo;) {
+        if (SEQ_LEQ(t->ooo[i].start, e) && SEQ_LEQ(s, t->ooo[i].end)) { /* overlaps or touches */
+            if (SEQ_LT(t->ooo[i].start, s)) s = t->ooo[i].start;
+            if (SEQ_LT(e, t->ooo[i].end)) e = t->ooo[i].end;
+            t->ooo[i] = t->ooo[--t->nooo];
+            i = 0;
+        } else {
+            i++;
+        }
+    }
+    if (t->nooo < TCP_OOO) {
+        t->ooo[t->nooo].start = s;
+        t->ooo[t->nooo].end = e;
+        t->nooo++;
+    }
+}
+
+/* after rcv_nxt moved: take in every stored range that now continues the in-order data */
+static void tcp_ooo_pull(struct tcb *t) {
+    for (int i = 0; i < t->nooo;) {
+        if (SEQ_LEQ(t->ooo[i].start, t->rcv_nxt)) {
+            if (SEQ_LT(t->rcv_nxt, t->ooo[i].end)) {
+                t->rx_len += t->ooo[i].end - t->rcv_nxt;
+                t->rcv_nxt = t->ooo[i].end;
+            }
+            t->ooo[i] = t->ooo[--t->nooo];
+            i = 0;
+        } else {
+            i++;
         }
     }
 }
@@ -793,6 +907,9 @@ static void tcp_reset(struct tcb *t, int err) {
     wq_wake_all(&net_wq);
 }
 
+static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len);
+static void tcp_input_held(size_t n);
+
 static void tcp_input(uint32_t src, const uint8_t *p, size_t len) {
     if (len < 20 || l4_csum(src, my_ip, 6, p, len) != 0) return;
     const struct tcp_hdr *h = (const struct tcp_hdr *)p;
@@ -804,6 +921,33 @@ static void tcp_input(uint32_t src, const uint8_t *p, size_t len) {
         if (tcbs[i].state != T_FREE && tcbs[i].rip == src && tcbs[i].rport == sport && tcbs[i].lport == dport)
             t = &tcbs[i];
     if (!t || t->state == T_CLOSED) return;
+    tcp_stats.segs_in++;
+    if (t->pid == fault_pid && len > hl && t->state != T_SYN_SENT) {
+        if (fault_hit(fault.rx_drop)) {
+            tcp_stats.faults_dropped++;
+            return;
+        }
+        if (!fault_held_len && len <= sizeof fault_held && fault_hit(fault.rx_reorder)) {
+            /* hold this segment back and deliver it after the next one */
+            memcpy(fault_held, p, len);
+            fault_held_len = len;
+            fault_held_src = src;
+            fault_held_at = uptime_ms();
+            tcp_stats.faults_reordered++;
+            return;
+        }
+    }
+    tcp_segment(t, p, len);
+    if (fault_held_len && src == fault_held_src) {
+        size_t n = fault_held_len;
+        fault_held_len = 0;
+        tcp_input_held(n);
+    }
+}
+
+static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
+    const struct tcp_hdr *h = (const struct tcp_hdr *)p;
+    size_t hl = (size_t)(h->off >> 4) * 4;
     uint8_t fl = h->flags;
     uint32_t seq = ntohl(h->seq), ack = ntohl(h->ack);
     const uint8_t *data = p + hl;
@@ -846,6 +990,8 @@ static void tcp_input(uint32_t src, const uint8_t *p, size_t len) {
         t->rto_at = 0;
         t->retries = 0;
         t->rto = 1000;
+        t->snd_max = t->snd_nxt;
+        tcp_cc_init(t);
         tcp_output(t, F_ACK, t->snd_nxt, NULL, 0);
         wq_wake_all(&net_wq);
         tcp_push(t, false);
@@ -854,7 +1000,7 @@ static void tcp_input(uint32_t src, const uint8_t *p, size_t len) {
 
     bool need_ack = false;
     if (fl & F_ACK) {
-        if (SEQ_LT(t->snd_una, ack) && SEQ_LEQ(ack, t->snd_nxt)) {
+        if (SEQ_LT(t->snd_una, ack) && SEQ_LEQ(ack, t->snd_max)) {
             uint32_t acked = ack - t->snd_una;
             bool fin_acked = t->fin_sent && ack == t->fin_seq + 1;
             uint32_t data_acked = acked - (fin_acked ? 1 : 0);
@@ -862,10 +1008,30 @@ static void tcp_input(uint32_t src, const uint8_t *p, size_t len) {
             memmove(t->tx, t->tx + data_acked, t->tx_len - data_acked);
             t->tx_len -= data_acked;
             t->snd_una = ack;
+            if (SEQ_LT(t->snd_nxt, ack)) t->snd_nxt = ack; /* the peer had kept what we were resending */
+            if (t->rtt_at && SEQ_LEQ(t->rtt_seq, ack)) {
+                tcp_rtt_sample(t, (int)(uptime_ms() - t->rtt_at));
+                t->rtt_at = 0;
+            }
             t->retries = 0;
-            t->rto = 1000;
             t->rto_at = 0;
-            if (t->snd_una != t->snd_nxt) tcp_arm(t);
+            /* congestion control */
+            if (t->in_recovery) {
+                if (SEQ_LEQ(t->recover, ack)) { /* everything sent before the loss is acked */
+                    t->in_recovery = false;
+                    t->cwnd = t->ssthresh;
+                } else { /* partial ack: the next hole was lost too */
+                    tcp_resend_first(t);
+                    t->cwnd = (t->cwnd > acked ? t->cwnd - acked : 0) + t->mss;
+                }
+            } else if (t->cwnd < t->ssthresh) {
+                t->cwnd += MIN(acked, (uint32_t)t->mss); /* slow start */
+            } else {
+                t->cwnd += MAX((uint32_t)t->mss * t->mss / t->cwnd, 1u); /* congestion avoidance */
+            }
+            t->cwnd = MIN(t->cwnd, CWND_MAX);
+            t->dupacks = 0;
+            if (t->snd_una != t->snd_max) tcp_arm(t);
             if (fin_acked) {
                 if (t->state == T_FIN_WAIT1) t->state = T_FIN_WAIT2;
                 else if (t->state == T_CLOSING) {
@@ -874,33 +1040,59 @@ static void tcp_input(uint32_t src, const uint8_t *p, size_t len) {
                 } else if (t->state == T_LAST_ACK) t->state = T_CLOSED;
             }
             wq_wake_all(&net_wq);
+        } else if (ack == t->snd_una && t->snd_una != t->snd_max && dlen == 0 && !(fl & (F_SYN | F_FIN)) &&
+                   ntohs(h->win) == t->snd_wnd) {
+            /* duplicate ack: a segment after snd_una arrived, so (probably) snd_una's was lost */
+            tcp_stats.dupacks_in++;
+            if (++t->dupacks == 3 && !t->in_recovery && SEQ_LT(t->recover, ack)) {
+                t->ssthresh = MAX((t->snd_max - t->snd_una) / 2, 2u * t->mss);
+                t->recover = t->snd_max;
+                tcp_resend_first(t);
+                tcp_stats.fast_retransmits++;
+                t->cwnd = t->ssthresh + 3u * t->mss;
+                t->in_recovery = true;
+            } else if (t->in_recovery) {
+                t->cwnd = MIN(t->cwnd + t->mss, CWND_MAX); /* each dup ack means one segment left the network */
+            }
         }
         if (SEQ_LEQ(t->snd_una, ack)) t->snd_wnd = ntohs(h->win);
     }
 
-    /* in-order data only; trim anything we already have */
+    /* data: trim what we already have, store the rest at its place in the ring (it may be ahead of
+       rcv_nxt, after a lost or reordered segment), then move rcv_nxt over everything contiguous */
     if (dlen) {
-        int32_t off = (int32_t)(t->rcv_nxt - seq);
-        if (off > 0 && (uint32_t)off < dlen) {
-            data += off;
-            dlen -= (uint32_t)off;
-            seq += (uint32_t)off;
+        need_ack = true; /* an out-of-order segment gets an immediate duplicate ack */
+        if (SEQ_LT(seq, t->rcv_nxt)) {
+            uint32_t old = t->rcv_nxt - seq;
+            if (old >= dlen) old = dlen;
+            data += old;
+            dlen -= old;
+            seq += old;
         }
-        if (seq == t->rcv_nxt && !t->rx_fin && (t->state == T_ESTABLISHED || t->state == T_FIN_WAIT1 ||
-                                                  t->state == T_FIN_WAIT2)) {
-            uint32_t n = MIN(dlen, TCP_RXBUF - t->rx_len);
-            for (uint32_t i = 0; i < n; i++) t->rx[(t->rx_head + t->rx_len + i) % TCP_RXBUF] = data[i];
-            t->rx_len += n;
-            t->rcv_nxt += n;
-            dlen = n;
-            if (n) {
-                wq_wake_all(&net_wq);
-                poll_notify();
+    }
+    bool in_order = seq == t->rcv_nxt;
+    if (dlen) {
+        if (!t->rx_fin && (t->state == T_ESTABLISHED || t->state == T_FIN_WAIT1 || t->state == T_FIN_WAIT2)) {
+            uint32_t space = TCP_RXBUF - t->rx_len, off = seq - t->rcv_nxt;
+            if (off < space) {
+                uint32_t n = MIN(dlen, space - off), at = t->rx_head + t->rx_len + off;
+                for (uint32_t i = 0; i < n; i++) t->rx[(at + i) % TCP_RXBUF] = data[i];
+                dlen = n;
+                if (off == 0) {
+                    t->rx_len += n;
+                    t->rcv_nxt += n;
+                    tcp_ooo_pull(t);
+                    in_order = true;
+                    wq_wake_all(&net_wq);
+                    poll_notify();
+                } else {
+                    tcp_ooo_add(t, seq, seq + n);
+                    tcp_stats.ooo_in++;
+                }
             }
         }
-        need_ack = true;
     }
-    if ((fl & F_FIN) && seq + dlen == t->rcv_nxt && !t->rx_fin) {
+    if ((fl & F_FIN) && in_order && seq + dlen == t->rcv_nxt && !t->rx_fin) {
         t->rcv_nxt++;
         t->rx_fin = true;
         need_ack = true;
@@ -930,28 +1122,52 @@ static void tcp_tick(void) {
         }
         if (t->rto_at && now >= t->rto_at) {
             t->rto_at = 0;
-            if (++t->retries > (t->state == T_SYN_SENT ? 5 : 8)) {
+            bool probe = t->state != T_SYN_SENT && t->snd_wnd == 0; /* persist: the peer is just not reading */
+            if (!probe && ++t->retries > (t->state == T_SYN_SENT ? 5 : 8)) {
                 tcp_reset(t, -ETIMEDOUT);
                 continue;
             }
-            t->rto = MIN(t->rto * 2, 16000);
+            t->rto = MIN(t->rto * 2, RTO_MAX);
             if (t->state == T_SYN_SENT) {
                 tcp_output(t, F_SYN, t->iss, NULL, 0);
                 tcp_arm(t);
             } else {
+                if (!probe) {
+                    /* a timeout is a strong congestion signal: back to one segment (RFC 5681) */
+                    t->ssthresh = MAX((t->snd_max - t->snd_una) / 2, 2u * t->mss);
+                    t->cwnd = t->mss;
+                    t->in_recovery = false;
+                    t->dupacks = 0;
+                    t->recover = t->snd_max;
+                    t->rtt_at = 0;
+                    tcp_stats.retransmits++;
+                    tcp_stats.timeouts++;
+                }
                 /* go back to the oldest unacknowledged byte */
                 t->snd_nxt = t->snd_una;
-                if (t->fin_sent && SEQ_LEQ(t->snd_una, t->fin_seq)) {
-                    t->fin_sent = false;
-                    if (t->state == T_FIN_WAIT1) t->state = T_ESTABLISHED;
-                    else if (t->state == T_LAST_ACK) t->state = T_CLOSE_WAIT;
-                    else if (t->state == T_CLOSING) t->state = T_CLOSE_WAIT;
-                }
                 tcp_push(t, true);
-                if (t->snd_nxt != t->snd_una) tcp_arm(t);
+                if (t->snd_una != t->snd_max) tcp_arm(t);
             }
         }
     }
+    /* a held-back (reordered) segment whose successor never came */
+    if (fault_held_len && now - fault_held_at > 200) {
+        size_t n = fault_held_len;
+        fault_held_len = 0;
+        tcp_input_held(n);
+    }
+}
+
+static void tcp_input_held(size_t n) {
+    static uint8_t seg[sizeof fault_held];
+    memcpy(seg, fault_held, n);
+    const struct tcp_hdr *h = (const struct tcp_hdr *)seg;
+    for (int i = 0; i < TCP_N; i++)
+        if (tcbs[i].state != T_FREE && tcbs[i].state != T_CLOSED && tcbs[i].rip == fault_held_src &&
+            tcbs[i].rport == ntohs(h->sport) && tcbs[i].lport == ntohs(h->dport)) {
+            tcp_segment(&tcbs[i], seg, n);
+            return;
+        }
 }
 
 static struct tcb *user_tcb(int h) {
@@ -987,7 +1203,7 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     memcpy(t->mac, mac, 6);
     t->iss = rnd();
     t->snd_una = t->iss;
-    t->snd_nxt = t->iss + 1;
+    t->snd_nxt = t->snd_max = t->iss + 1;
     t->mss = 536;
     t->rto = 1000;
     t->state = T_SYN_SENT;
@@ -1123,6 +1339,7 @@ void net_init(void) {
 }
 
 void net_process_exit(int pid) {
+    if (pid == fault_pid) fault_pid = 0;
     for (int i = 0; i < UDP_N; i++)
         if (udp_socks[i].used && udp_socks[i].pid == pid) udp_socks[i].used = false;
     for (int i = 0; i < TCP_N; i++)
@@ -1205,6 +1422,19 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
         return sys_tcp_connect((uint32_t)a, (uint16_t)b, (int)c);
     case SYS_TCP_SEND: return sys_tcp_send((int)a, (const uint8_t *)b, c);
     case SYS_TCP_RECV: return sys_tcp_recv((int)a, (uint8_t *)b, c, (int)d);
+    case SYS_NET_TEST: {
+        /* a: fault settings for this process's TCP connections (or NULL); b: counters out (or NULL) */
+        if (a) {
+            if (!user_ok((void *)a, sizeof(struct n_netfault))) return -EFAULT;
+            fault = *(const struct n_netfault *)a;
+            fault_pid = fault.rx_drop || fault.rx_reorder || fault.tx_drop ? current_task->pid : 0;
+        }
+        if (b) {
+            if (!user_ok_w((void *)b, sizeof(struct n_tcpstats))) return -EFAULT;
+            *(struct n_tcpstats *)b = tcp_stats;
+        }
+        return 0;
+    }
     case SYS_TCP_CLOSE: {
         struct tcb *t = user_tcb((int)a);
         if (!t) return -EBADF;

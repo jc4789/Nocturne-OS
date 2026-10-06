@@ -89,6 +89,8 @@ int tcp_connect(uint32_t ip, uint16_t port, int timeout_ms);
 long tcp_send(int s, const void *buf, size_t len);
 long tcp_recv(int s, void *buf, size_t len, int timeout_ms); /* 0 = connection closed */
 int tcp_close(int s);
+/* simulated packet loss/reordering on this process's TCP connections, and TCP counters (either may be NULL) */
+int net_test(const struct n_netfault *set, struct n_tcpstats *stats);
 bool net_wait_up(int timeout_ms); /* wait for DHCP; false if no network */
 
 /* ---- GUI ---- */
