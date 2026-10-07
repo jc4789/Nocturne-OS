@@ -5,23 +5,24 @@
  * they do not pass through the script-facing DOM operation boundary. */
 const mutationBridge = (() => {
     const registrations=new WeakMap(), observers=new WeakMap(), records=new WeakMap();
-    const pending=new Set();let scheduled=false,active=0;
+    const pending=new Set(),signalSlots=new Set();let scheduled=false,active=0;
     const get=(n,k)=>rawDom('get',n,k), parent=n=>get(n,'parentNode'), children=n=>get(n,'childNodes');
-    const attr=(n,k)=>rawDom('attr',n,k);
+    const attr=(n,k)=>reflectedAttr(n,k);
     function data(o){const d=observers.get(o);if(!d)throw new TypeError('Illegal MutationObserver receiver');return d;}
     function ancestorRegistrations(n){const a=[];for(;n;n=parent(n)){const r=registrations.get(n);if(r)a.push(...r);}return a;}
     function notify(){
-        scheduled=false;const deliver=Array.from(pending);pending.clear();
+        scheduled=false;const deliver=Array.from(pending),slots=Array.from(signalSlots);pending.clear();signalSlots.clear();
         for(const o of deliver){const d=data(o),q=d.queue;d.queue=[];
             for(const r of Array.from(d.regs))if(r.source){registrations.get(r.node).delete(r);d.regs.delete(r);}
             if(q.length)try{apply(d.callback,o,[q,o]);}catch(e){report(e);}
         }
+        for(const slot of slots){const event=new Event('slotchange',{bubbles:true});event.isTrusted=true;dispatch(slot,event);}
     }
     function enqueue(type,target,fields={}){
         const interested=new Map();
         for(let n=target;n;n=parent(n))for(const r of registrations.get(n)||[]){const opt=r.options;
             if(n!==target && !opt.subtree || !opt[type])continue;
-            if(type==='attributes' && opt.attributeFilter && !opt.attributeFilter.includes(fields.attributeName))continue;
+            if(type==='attributes' && opt.attributeFilter && (fields.attributeNamespace!==null || !opt.attributeFilter.includes(fields.attributeName)))continue;
             const old=(type==='attributes' && opt.attributeOldValue)||(type==='characterData' && opt.characterDataOldValue);
             interested.set(r.observer,interested.get(r.observer)||old);
         }
@@ -43,6 +44,9 @@ const mutationBridge = (() => {
     function removed(r){if(!r)return;transient(r.node,r.regs);enqueue('childList',r.parent,{removedNodes:[r.node],previousSibling:r.previousSibling,nextSibling:r.nextSibling});}
     function before(op,node,key,value){
         if(!active || !node)return null;
+        const attribute=attributeBridge.mutation(op,node,key,value);
+        if(attribute)return {op:'attributes',...attribute};
+        if(op==='attrSetNode' || op==='attrRemoveNode' || op==='attrNS' || op==='set' && get(node,'nodeType')===2)return null;
         if(op==='insert'){
             if(!key || key===value)return null;
             const fragment=get(key,'nodeType')===11,nodes=fragment?children(key):[key];
@@ -59,14 +63,14 @@ const mutationBridge = (() => {
         else if(op==='style')name='style';
         else if(op==='set' && ['async','selected','imageWidth','imageHeight'].includes(key))name=key==='imageWidth'?'width':key==='imageHeight'?'height':key;
         else if(op==='set' && key==='value' && get(node,'localName')==='option')name='value';
-        if(name!==undefined)return {op:'attributes',node,name,oldValue:attr(node,name),style:op==='style'};
+        if(name!==undefined)return {op:'attributes',node,name,namespace:null,oldValue:attr(node,name),style:op==='style'};
         return null;
     }
     function after(t){
         if(!t)return;
         if(t.op==='attributes'){
-            const now=attr(t.node,t.name);
-            if((now!==null || t.oldValue!==null) && (!t.style || now!==t.oldValue))enqueue('attributes',t.node,{attributeName:t.name,oldValue:t.oldValue});
+            const now=rawDom('attrNS',t.node,t.namespace,t.name);
+            if((now!==null || t.oldValue!==null) && (!t.style || now!==t.oldValue))enqueue('attributes',t.node,{attributeName:t.name,attributeNamespace:t.namespace,oldValue:t.oldValue});
         }else if(t.op==='characterData')enqueue('characterData',t.node,{oldValue:t.oldValue});
         else if(t.op==='children'){
             const added=children(t.node);for(const n of t.old)transient(n,t.regs);
@@ -101,5 +105,9 @@ const mutationBridge = (() => {
     class MutationRecord {constructor(){throw new TypeError('Illegal MutationRecord constructor');}}
     for(const k of ['type','target','addedNodes','removedNodes','previousSibling','nextSibling','attributeName','attributeNamespace','oldValue'])Object.defineProperty(MutationRecord.prototype,k,{enumerable:true,configurable:true,get(){const r=records.get(this);if(!r)throw new TypeError('Illegal MutationRecord receiver');return r[k];}});
     for(const C of [MutationObserver,MutationRecord])Object.defineProperty(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
-    Object.assign(globalThis,{MutationObserver,MutationRecord});return {before,after};
+    function collectSlots(){
+        for(const slot of rawDom('slotChanges',null))signalSlots.add(slot);
+        if(signalSlots.size && !scheduled){scheduled=true;queueMicrotask(notify);}
+    }
+    Object.assign(globalThis,{MutationObserver,MutationRecord});return {before,after,signalSlots:collectSlots};
 })();

@@ -1,6 +1,6 @@
 /* Autonomous custom elements on Nocturne's existing native DOM wrappers.
  * Algorithms: https://html.spec.whatwg.org/multipage/custom-elements.html
- * This does not implement Shadow DOM, scoped registries, customized built-ins,
+ * Native shadow trees participate in upgrade/connection/adoption. Scoped registries, customized built-ins,
  * ElementInternals or form-associated custom elements. Unsupported extensions
  * are rejected, not represented by inert successful registrations.
  * Embedded in js_bootstrap.js; rawDom/document/HTMLElement/report are private. */
@@ -13,11 +13,12 @@ const customElementsBridge = (() => {
     const reserved = new Set(['annotation-xml','color-profile','font-face','font-face-src',
         'font-face-uri','font-face-format','font-face-name','missing-glyph']);
     let defining = false, backupScheduled = false;
-    const string = value => { if (typeof value === 'symbol') throw new TypeError('Cannot convert Symbol to DOMString'); return String(value); };
+    const StringImpl = String;
+    const string = value => { if (typeof value === 'symbol') throw new TypeError('Cannot convert Symbol to DOMString'); return StringImpl(value); };
     const lower = name => name.replace(/[A-Z]/g, c => c.toLowerCase());
     const get = (node, key) => rawDom('get', node, key);
     const children = node => get(node, 'childNodes');
-    const attr = (node, key) => rawDom('attr', node, key);
+    const attr = (node, key) => reflectedAttr(node, key);
     const fail = (message, name='NotSupportedError') => new DOMException(message, name);
     // Current HTML uses DOM's valid element local name, not the retired PCENChar
     // grammar: https://html.spec.whatwg.org/multipage/custom-elements.html#valid-custom-element-name
@@ -93,10 +94,12 @@ const customElementsBridge = (() => {
         const s = stateFor(element);
         if (s.state !== 'undefined') return;
         s.definition = d; s.state = 'failed';
-        for (const name of get(element, 'attributeNames')) callback(element, 'attributeChangedCallback', [name,null,attr(element,name),null]);
+        for (const attribute of rawDom('attrList',element)) callback(element, 'attributeChangedCallback',
+            [get(attribute,'localName'),null,get(attribute,'attrValue'),get(attribute,'namespaceURI')]);
         if (connected(element)) callback(element, 'connectedCallback');
         d.stack.push(element);
         try {
+            if(d.disableShadow && get(element,'shadowRoot'))throw fail('This custom element disables shadow roots');
             s.state = 'precustomized';
             if (Reflect.construct(d.constructor, []) !== element) throw new TypeError('Custom element constructor returned a different object');
             s.state = 'custom';
@@ -168,12 +171,16 @@ const customElementsBridge = (() => {
     }
     // Snapshot native values only. Page overrides of getters/prototypes cannot
     // make internal tree algorithms operate on a different, invented DOM.
-    function before(op, node, key, value) {
+    function before(op, node, key, value, extra) {
         if (!definitions.size || !node) return null;
+        if(op==='adopt' && key && get(key,'nodeType')!==2)
+            return {op,node:key,was:connected(key),parent:get(key,'parentNode'),elements:elements(key),oldDocument:get(key,'ownerDocument')};
+        const change=attributeBridge.mutation(op,node,key,value,extra);
+        if(change)return {op:'attribute',node:change.node,forced:change.name,namespace:change.namespace,old:change.oldValue};
         if (op === 'insert') {
             if (!key || key === value) return null;
             const nodes = get(key,'nodeType') === 11 ? children(key) : [key];
-            return {op,nodes,was:nodes.map(connected)};
+            return {op,nodes,was:nodes.map(connected),adopted:nodes.map(node=>({elements:elements(node),oldDocument:get(node,'ownerDocument')}))};
         }
         if (op === 'remove') return {op,node,was:connected(node),parent:get(node,'parentNode')};
         if (op === 'clone') return {op};
@@ -190,8 +197,14 @@ const customElementsBridge = (() => {
     }
     function after(token, result) {
         if (!token) return;
+        function adopted(record){for(const element of record.elements){
+            const old=record.oldDocument,now=get(element,'ownerDocument'),s=states.get(element);
+            if(old!==now && s && s.state==='custom')callback(element,'adoptedCallback',[old,now]);
+        }}
         if (token.op === 'insert') {
-            token.nodes.forEach((node,i) => { removed(node,token.was[i]); inserted(node); });
+            token.nodes.forEach((node,i) => { removed(node,token.was[i]);adopted(token.adopted[i]);inserted(node); });
+        } else if(token.op==='adopt'){
+            removed(token.node,token.was);adopted(token);
         } else if (token.op === 'remove') {
             if (token.parent && get(token.node,'parentNode') !== token.parent) removed(token.node,token.was);
         } else if (token.op === 'clone') upgradeTree(result);
@@ -199,8 +212,8 @@ const customElementsBridge = (() => {
             for (const node of token.nodes) removed(node,token.was);
             for (const node of children(token.node)) { upgradeTree(node); inserted(node); }
         } else if (token.op === 'attribute') {
-            const current = attr(token.node,token.forced);
-            if (token.old !== null || current !== null) attributeChanged(token.node,token.forced,token.old,current);
+            const current = rawDom('attrNS',token.node,token.namespace??null,token.forced);
+            if (token.old !== null || current !== null) attributeChanged(token.node,token.forced,token.old,current,token.namespace??null);
         }
     }
     class CustomElementRegistry {
@@ -232,9 +245,9 @@ const customElementsBridge = (() => {
                         if (value !== undefined) observed = sequence(value);
                     }
                     const disabled = constructor.disabledFeatures;
-                    if (disabled !== undefined) sequence(disabled);
+                    const disabledFeatures=disabled===undefined?[]:sequence(disabled);
                     if (constructor.formAssociated) throw fail('Form-associated custom elements are not implemented');
-                    d = {name,constructor,callbacks,observed,stack:[]};
+                    d = {name,constructor,callbacks,observed,stack:[],disableShadow:disabledFeatures.includes('shadow')};
                 } finally { defining = false; }
                 definitions.set(name,d); constructors.set(constructor,d);
                 for (const element of elements(document,name)) tryUpgrade(element);
@@ -273,5 +286,6 @@ const customElementsBridge = (() => {
     Object.defineProperty(CustomElementRegistry.prototype, Symbol.toStringTag, {value:'CustomElementRegistry',configurable:true});
     Object.defineProperty(globalThis, 'customElements', {get() { return registry; },enumerable:true,configurable:true});
     Object.defineProperty(globalThis, 'CustomElementRegistry', {value:CustomElementRegistry,writable:true,configurable:true});
-    return {construct,create,reactions,inserted,removed,attributeChanged,upgradeTree,before,after};
+    function allowShadow(element){const d=definitions.get(get(element,'localName'));return !d || !d.disableShadow;}
+    return {construct,create,reactions,inserted,removed,attributeChanged,upgradeTree,before,after,allowShadow};
 })();

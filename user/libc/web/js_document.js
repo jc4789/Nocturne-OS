@@ -2,12 +2,14 @@
     const documentBridge = (() => {
         const parserBrands=new WeakSet(), implementations=new WeakMap(), implementationBrands=new WeakMap();
         const nodeTypeGetter=Object.getOwnPropertyDescriptor(Node.prototype,'nodeType').get;
-        function string(value){if(typeof value==='symbol')throw new TypeError('Cannot convert Symbol to DOMString');return String(value);}
+        const StringImpl=String;
+        function string(value){if(typeof value==='symbol')throw new TypeError('Cannot convert Symbol to DOMString');return StringImpl(value);}
         function brand(value){if(apply(nodeTypeGetter,value,[])!==9)throw new TypeError('Document receiver required');return value;}
         function transfer(receiver,node,deep,adopt){
             brand(receiver);
             const kind=apply(nodeTypeGetter,node,[]);
             if(kind===9)throw new DOMException('A Document cannot be transferred','NotSupportedError');
+            if(rawDom('get',node,'shadowHost'))throw new DOMException('A shadow root cannot be transferred directly',adopt?'HierarchyRequestError':'NotSupportedError');
             return dom(adopt?'adopt':'import',receiver,node,!!deep);
         }
         class DOMParser {

@@ -14,7 +14,8 @@ struct job {
     struct webnet_wire_request wire;
     char *url, *document, *method, *headers, *request_body;
     char origin[WEBNET_URL_MAX], final_url[WEBNET_URL_MAX], error[160];
-    char response_headers[WEBNET_HEADERS_MAX];
+    char *response_headers;
+    size_t response_headers_len;
     char *body;
     size_t body_len, body_cap;
     int status;
@@ -22,6 +23,7 @@ struct job {
     unsigned char *cookie_events;
     size_t cookie_len, cookie_cap;
     bool hop_cookies, redirect_cross_site;
+    bool cors_tainted, origin_tainted, redirected;
 };
 static bool read_all(int fd, void *p, size_t n) {
     while (n) {
@@ -187,6 +189,9 @@ static bool load_file(struct job *j) {
     return true;
 }
 static bool cors_kind(const struct job *j) { return j->wire.kind == WEBNET_FETCH || j->wire.kind == WEBNET_MODULE; }
+/* Redirect-taint changes the serialized Origin, not the document origin used
+   for same-origin mode and mixed-content checks. It can never be cleared. */
+static const char *request_origin(const struct job *j) { return j->origin_tainted ? "null" : j->origin; }
 static bool forbidden_header(const char *name) {
     static const char *const forbidden[] = {"host", "origin", "referer", "cookie", "cookie2",
         "proxy-authorization", "connection", "content-length", "transfer-encoding", "accept-encoding", "te", "trailer",
@@ -220,14 +225,28 @@ static bool safelisted(const char *name, const char *value) {
     }
     return false;
 }
-static bool list_has(const char *list, const char *token, bool insensitive) {
-    size_t tl = strlen(token);
-    for (const char *p = list; *p;) {
-        while (*p == ' ' || *p == '\t' || *p == ',') p++;
-        const char *e = strchr(p, ','); if (!e) e = p + strlen(p);
+static bool list_has_slice(const char *list, const char *limit, const char *token, size_t tl, bool insensitive) {
+    for (const char *p = list; p < limit;) {
+        while (p < limit && (*p == ' ' || *p == '\t' || *p == ',')) p++;
+        const char *e = memchr(p, ',', (size_t)(limit - p)); if (!e) e = limit;
         const char *trim = e; while (trim > p && (trim[-1] == ' ' || trim[-1] == '\t')) trim--;
         if ((size_t)(trim - p) == tl && (insensitive ? !strncasecmp(p, token, tl) : !strncmp(p, token, tl))) return true;
-        p = *e ? e + 1 : e;
+        p = e < limit ? e + 1 : e;
+    }
+    return false;
+}
+static bool list_has(const char *list, const char *token, bool insensitive) {
+    return list_has_slice(list, list + strlen(list), token, strlen(token), insensitive);
+}
+static bool field_name_is(const char *name, size_t len, const char *expected) {
+    return len == strlen(expected) && !strncasecmp(name, expected, len);
+}
+static bool field_exists(const char *headers, const char *name) {
+    for (const char *p = headers; *p;) {
+        const char *end = strstr(p, "\r\n"); if (!end) end = p + strlen(p);
+        const char *colon = memchr(p, ':', (size_t)(end - p));
+        if (colon && field_name_is(p, (size_t)(colon - p), name)) return true;
+        p = *end ? end + 2 : end;
     }
     return false;
 }
@@ -250,14 +269,14 @@ static bool field(const char *headers, const char *name, char *out, size_t cap) 
 }
 static bool validate_headers(struct job *j, char *non_simple, size_t cap) {
     non_simple[0] = 0; size_t used = 0;
-    char seen[WEBNET_HEADERS_MAX] = ""; size_t seen_len = 0;
+    char seen[WEBNET_REQUEST_HEADERS_MAX] = ""; size_t seen_len = 0;
     const char *p = j->headers;
     while (*p) {
         const char *end = strstr(p, "\r\n");
         if (!end) return fail(j, "Request headers must end in CRLF");
         const char *colon = memchr(p, ':', (size_t)(end - p));
         if (!colon || colon == p || (size_t)(colon - p) >= 128) return fail(j, "Invalid request header name");
-        char name[128], value[WEBNET_HEADERS_MAX];
+        char name[128], value[WEBNET_REQUEST_HEADERS_MAX];
         size_t nl = colon - p;
         for (size_t i = 0; i < nl; i++) {
             if (!token_char((unsigned char)p[i])) return fail(j, "Invalid request header name");
@@ -283,6 +302,28 @@ static bool validate_headers(struct job *j, char *non_simple, size_t cap) {
     }
     return true;
 }
+/* Fetch HTTP-network-or-cache steps 16-18 (WHATWG, consulted 2026-10-07).
+   This transport has no HTTP response cache: default/force-cache/no-cache
+   have genuine cache-miss network semantics, reload/no-store bypass storage,
+   and only-if-cached fails before network/preflight. Generate these fields
+   after classifying AUTHOR headers for CORS, independently on every hop. */
+static bool cache_headers(struct job *j, char *headers, size_t cap, int *used) {
+    unsigned mode = WEBNET_WIRE_CACHE_MODE(j->wire.user_navigation);
+    if (mode == WEBNET_CACHE_DEFAULT &&
+        (field_exists(j->headers, "If-Modified-Since") || field_exists(j->headers, "If-None-Match") ||
+         field_exists(j->headers, "If-Unmodified-Since") || field_exists(j->headers, "If-Match") ||
+         field_exists(j->headers, "If-Range"))) mode = WEBNET_CACHE_NO_STORE;
+    const char *pragma = "", *control = "";
+    if (mode == WEBNET_CACHE_NO_STORE || mode == WEBNET_CACHE_RELOAD) {
+        if (!field_exists(j->headers, "Pragma")) pragma = "Pragma: no-cache\r\n";
+        if (!field_exists(j->headers, "Cache-Control")) control = "Cache-Control: no-cache\r\n";
+    } else if (mode == WEBNET_CACHE_NO_CACHE && !field_exists(j->headers, "Cache-Control"))
+        control = "Cache-Control: max-age=0\r\n";
+    int n = snprintf(headers + *used, cap - (size_t)*used, "%s%s", pragma, control);
+    if (n < 0 || (size_t)n >= cap - (size_t)*used) return fail(j, "Cache request headers exceed limit");
+    *used += n;
+    return true;
+}
 /* Headers have already been validated. Rewrites can only shorten the owned buffer. */
 static void remove_request_header(char *headers, const char *name) {
     size_t nl = strlen(name);
@@ -305,11 +346,12 @@ static void remove_body_headers(char *headers) {
 }
 static bool cors_allowed(struct job *j, const struct http_resp *r) {
     char allow[WEBNET_URL_MAX];
-    if (!field(r->headers, "Access-Control-Allow-Origin", allow, sizeof allow) ||
-        (strcmp(allow, "*") && strcmp(allow, j->origin))) return fail(j, "Cross-origin response is not allowed");
+    const char *headers = http_response_headers(r);
+    if (!field(headers, "Access-Control-Allow-Origin", allow, sizeof allow) ||
+        (strcmp(allow, "*") && strcmp(allow, request_origin(j)))) return fail(j, "Cross-origin response is not allowed");
     if (j->wire.credentials == WEBNET_CREDENTIALS_INCLUDE) {
         char credentials[16];
-        if (!strcmp(allow,"*") || !field(r->headers,"Access-Control-Allow-Credentials",credentials,sizeof credentials) ||
+        if (!strcmp(allow,"*") || !field(headers,"Access-Control-Allow-Credentials",credentials,sizeof credentials) ||
             strcmp(credentials,"true")) return fail(j,"Credentialed CORS requires exact origin and credentials permission");
     }
     return true;
@@ -370,8 +412,8 @@ static int discard_cb(void *opaque, const char *data, size_t n) {
     j->body_len += n; return 0;
 }
 static bool preflight(struct job *j, const char *url, const char *method, const char *names) {
-    char head[WEBNET_HEADERS_MAX];
-    int n = snprintf(head, sizeof head, "Origin: %s\r\nAccess-Control-Request-Method: %s\r\n", j->origin, method);
+    char head[WEBNET_REQUEST_HEADERS_MAX];
+    int n = snprintf(head, sizeof head, "Origin: %s\r\nAccess-Control-Request-Method: %s\r\n", request_origin(j), method);
     if (*names) n += snprintf(head + n, sizeof head - (size_t)n, "Access-Control-Request-Headers: %s\r\n", names);
     if (n < 0 || (size_t)n >= sizeof head) return fail(j, "Preflight headers too large");
     int left = remaining(j); if (!left) return false;
@@ -386,11 +428,11 @@ static bool preflight(struct job *j, const char *url, const char *method, const 
     char methods[1024], allowed[4096];
     /* Safelisted methods do not need an Allow-Methods entry. XHR upload
        listeners can force OPTIONS even for a simple GET/POST request. */
-    bool ok = !strcmp(method, "GET") || !strcmp(method, "POST") ||
-              (field(r.headers, "Access-Control-Allow-Methods", methods, sizeof methods) &&
+    bool ok = !strcmp(method, "GET") || !strcmp(method, "HEAD") || !strcmp(method, "POST") ||
+              (field(http_response_headers(&r), "Access-Control-Allow-Methods", methods, sizeof methods) &&
                (list_has(methods, method, false) || (j->wire.credentials != WEBNET_CREDENTIALS_INCLUDE && list_has(methods, "*", false))));
     if (*names) {
-        ok = ok && field(r.headers, "Access-Control-Allow-Headers", allowed, sizeof allowed);
+        ok = ok && field(http_response_headers(&r), "Access-Control-Allow-Headers", allowed, sizeof allowed);
         for (const char *p = names; ok && *p;) {
             while (*p == ' ' || *p == ',') p++;
             const char *e = strchr(p, ','); if (!e) e = p + strlen(p);
@@ -415,38 +457,88 @@ static bool js_mime(const char *headers) {
            !strcasecmp(mime, "text/ecmascript") || !strcasecmp(mime, "application/ecmascript") ||
            !strcasecmp(mime, "application/x-javascript");
 }
-static void response_headers(struct job *j, const struct http_resp *r, bool cross) {
-    bool filter=j->wire.kind==WEBNET_FETCH;
-    char exposed[4096] = "";
-    if (filter && cross) field(r->headers, "Access-Control-Expose-Headers", exposed, sizeof exposed);
-    size_t used = 0;
-    for (const char *p = r->headers; *p;) {
+/* List-valued exposure fields may repeat. Scan every complete value without
+   copying it into a smaller temporary array or dropping long field names. */
+static bool exposed_header(const char *headers, const char *name, size_t len, bool wildcard) {
+    for (const char *p = headers; *p;) {
         const char *end = strstr(p, "\r\n"); if (!end) end = p + strlen(p);
         const char *colon = memchr(p, ':', (size_t)(end - p));
-        bool include = false;
-        if (colon && colon > p && (size_t)(colon - p) < 128) {
-            char name[128]; size_t l = colon - p; memcpy(name, p, l); name[l] = 0;
-            bool secret = !strcasecmp(name, "set-cookie") || !strcasecmp(name, "set-cookie2");
-            bool safe = list_has("cache-control,content-language,content-length,content-type,expires,last-modified,pragma", name, true);
-            include = !secret && (!filter || !cross || safe || list_has(exposed, name, true) ||
-                (j->wire.credentials != WEBNET_CREDENTIALS_INCLUDE && list_has(exposed, "*", false)));
-        }
-        size_t l = end - p;
-        if (include && used + l + 2 < sizeof j->response_headers) {
-            memcpy(j->response_headers + used, p, l); used += l;
-            memcpy(j->response_headers + used, "\r\n", 2); used += 2;
+        if (colon && field_name_is(p, (size_t)(colon - p), "Access-Control-Expose-Headers") &&
+            (list_has_slice(colon + 1, end, name, len, true) ||
+             (wildcard && list_has_slice(colon + 1, end, "*", 1, false)))) return true;
+        p = *end ? end + 2 : end;
+    }
+    return false;
+}
+static bool include_response_field(const struct job *j, const char *headers, const char *p, const char *end, bool cross) {
+    const char *colon = memchr(p, ':', (size_t)(end - p));
+    if (!colon || colon == p) return false;
+    size_t len = (size_t)(colon - p);
+    if (field_name_is(p, len, "set-cookie") || field_name_is(p, len, "set-cookie2")) return false;
+    if (j->wire.kind != WEBNET_FETCH || !cross) return true;
+    const char *safe = "cache-control,content-language,content-length,content-type,expires,last-modified,pragma";
+    return list_has_slice(safe, safe + strlen(safe), p, len, true) ||
+        exposed_header(headers, p, len, j->wire.credentials != WEBNET_CREDENTIALS_INCLUDE);
+}
+static bool response_headers(struct job *j, const struct http_resp *r, bool cross) {
+    const char *headers = http_response_headers(r);
+    char prefix[512] = "";
+    size_t prefix_len = 0;
+    /* Negotiated private metadata; old clients retain the header-only format.
+       The metadata line has no colon and cannot pass the server-field filter
+       below. The genuine status phrase cannot inject lines (http.c validates
+       CR/LF before storing it). Keep this prefix ahead of all server fields. */
+    if (j->wire.user_navigation & WEBNET_WIRE_STATUS_LINE) {
+        int n = snprintf(prefix, sizeof prefix,
+                               "HTTP/1.1 %d %s\r\nHTTP/Nocturne-Meta cors=%d redirected=%d\r\n",
+                               r->status, r->status_text, j->cors_tainted, j->redirected);
+        if (n < 0 || (size_t)n >= sizeof prefix) return fail(j, "Response metadata exceeds limit");
+        prefix_len = (size_t)n;
+    }
+    size_t limit = (j->wire.user_navigation & WEBNET_WIRE_LARGE_HEADERS) ?
+        WEBNET_RESPONSE_HEADERS_MAX : WEBNET_REQUEST_HEADERS_MAX;
+    size_t required = prefix_len;
+    /* Measure the complete filtered output first; capacity is never a reason
+       to turn an included field into an omitted field. */
+    for (const char *p = headers; *p;) {
+        const char *end = strstr(p, "\r\n"); if (!end) end = p + strlen(p);
+        if (include_response_field(j, headers, p, end, cross)) {
+            size_t l = (size_t)(end - p) + 2;
+            if (required >= limit || l >= limit - required) return fail(j, "Response headers exceed negotiated limit");
+            required += l;
         }
         p = *end ? end + 2 : end;
     }
-    j->response_headers[used] = 0;
+    if (required >= limit) return fail(j, "Response headers exceed negotiated limit");
+    char *out = malloc(required + 1);
+    if (!out) return fail(j, "Out of memory filtering response headers");
+    memcpy(out, prefix, prefix_len);
+    size_t used = prefix_len;
+    for (const char *p = headers; *p;) {
+        const char *end = strstr(p, "\r\n"); if (!end) end = p + strlen(p);
+        if (include_response_field(j, headers, p, end, cross)) {
+            size_t l = (size_t)(end - p);
+            memcpy(out + used, p, l); used += l;
+            memcpy(out + used, "\r\n", 2); used += 2;
+        }
+        p = *end ? end + 2 : end;
+    }
+    out[used] = 0;
+    free(j->response_headers); j->response_headers = out; j->response_headers_len = used;
+    return true;
 }
 static bool run_http(struct job *j) {
     char current[WEBNET_URL_MAX], target_origin[WEBNET_URL_MAX], document_url[WEBNET_URL_MAX];
     if (!http_url(j->url, current, sizeof current, target_origin, sizeof target_origin)) return fail(j, "Invalid HTTP(S) URL");
     bool document_http = http_url(j->document, document_url, sizeof document_url, j->origin, sizeof j->origin);
     if (!document_http) snprintf(j->origin, sizeof j->origin, "null");
-    char names[WEBNET_HEADERS_MAX];
+    char names[WEBNET_REQUEST_HEADERS_MAX];
     if (!validate_headers(j, names, sizeof names)) return false;
+    if (WEBNET_WIRE_CACHE_MODE(j->wire.user_navigation) == WEBNET_CACHE_ONLY_IF_CACHED) {
+        if (!(j->wire.user_navigation & WEBNET_WIRE_SAME_ORIGIN))
+            return fail(j, "only-if-cached requires same-origin mode");
+        return fail(j, "No cached response is available");
+    }
     bool drop_body = false;
     for (unsigned hop = 0; hop <= 10; hop++) {
         if (hop == 10) return fail(j, "Too many redirects");
@@ -454,17 +546,24 @@ static bool run_http(struct job *j) {
         snprintf(current, sizeof current, "%s", j->final_url);
         if (j->wire.kind != WEBNET_NAVIGATION && document_http && !strncmp(j->origin, "https://", 8) && !strncmp(current, "http://", 7)) return fail(j, "HTTPS page cannot load insecure content");
         bool cross = strcmp(j->origin, target_origin) != 0;
+        if (cross && (j->wire.user_navigation & WEBNET_WIRE_SAME_ORIGIN))
+            return fail(j, "Cross-origin fetch is forbidden by same-origin mode");
+        /* Main fetch never changes cors response taint back to basic, even
+           when a redirect returns to the original document's origin. */
+        if (cors_kind(j) && cross) j->cors_tainted = true;
         const char *method = drop_body ? "GET" : j->method;
         /* Redirects can remove authorization/body fields; rederive the preflight names. */
         if (!validate_headers(j, names, sizeof names)) return false;
-        if (cors_kind(j) && cross && (*names || (j->wire.user_navigation & WEBNET_WIRE_FORCE_PREFLIGHT)) && !preflight(j, current, method, names)) return false;
-        char headers[WEBNET_HEADERS_MAX + WEBNET_URL_MAX + WEBCOOKIE_OUTPUT_MAX + 64];
+        bool simple_method = !strcmp(method, "GET") || !strcmp(method, "HEAD") || !strcmp(method, "POST");
+        if (j->cors_tainted && (!simple_method || *names || (j->wire.user_navigation & WEBNET_WIRE_FORCE_PREFLIGHT)) && !preflight(j, current, method, names)) return false;
+        char headers[WEBNET_REQUEST_HEADERS_MAX + WEBNET_URL_MAX + WEBCOOKIE_OUTPUT_MAX + 128];
         int hn;
-        if (cors_kind(j)) hn = snprintf(headers, sizeof headers, "%sOrigin: %s\r\n", j->headers, j->origin);
+        if (cors_kind(j)) hn = snprintf(headers, sizeof headers, "%sOrigin: %s\r\n", j->headers, request_origin(j));
         else hn = snprintf(headers, sizeof headers, "%s", j->headers);
         if (hn < 0 || (size_t)hn >= sizeof headers) return fail(j, "Request headers too large");
+        if (!cache_headers(j, headers, sizeof headers, &hn)) return false;
         j->hop_cookies=j->wire.credentials==WEBNET_CREDENTIALS_INCLUDE ||
-            (j->wire.credentials==WEBNET_CREDENTIALS_SAME_ORIGIN && !cross);
+            (j->wire.credentials==WEBNET_CREDENTIALS_SAME_ORIGIN && !cross && !j->cors_tainted);
         if(j->hop_cookies){
             struct webcookie_context c={current,*j->document?j->document:j->wire.kind==WEBNET_NAVIGATION?NULL:"",method,
                 j->wire.kind==WEBNET_NAVIGATION,true,j->redirect_cross_site};
@@ -487,36 +586,51 @@ static bool run_http(struct job *j) {
         int result = http_request(&q, &r);
         if (result < 0) { j->cookie_len=cookie_start; if (!j->error[0]) fail(j, r.error); http_resp_free(&r); return false; }
         if (!apply_cookie_events(j,cookie_start,method)) { http_resp_free(&r); return false; }
-        if (cors_kind(j) && cross && !cors_allowed(j, &r)) { http_resp_free(&r); return false; }
+        if (j->cors_tainted && !cors_allowed(j, &r)) { http_resp_free(&r); return false; }
         bool redirect = r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308;
         if (redirect) {
+            if (j->wire.user_navigation & WEBNET_WIRE_REDIRECT_ERROR) {
+                http_resp_free(&r); return fail(j, "Redirect forbidden by redirect mode");
+            }
             char location[WEBNET_URL_MAX], resolved[WEBNET_URL_MAX];
             char previous_origin[WEBNET_URL_MAX];
             snprintf(previous_origin, sizeof previous_origin, "%s", target_origin);
-            if (!field(r.headers, "Location", location, sizeof location) ||
+            if (!field(http_response_headers(&r), "Location", location, sizeof location) ||
                 !web_resolve_url(current, location, resolved, sizeof resolved) ||
                 !http_url(resolved, current, sizeof current, target_origin, sizeof target_origin)) {
                 http_resp_free(&r); return fail(j, "Invalid or prohibited redirect target");
             }
             if (!webcookie_same_site(j->cookies,j->final_url,current)) j->redirect_cross_site=true;
-            if (strcmp(previous_origin, target_origin)) remove_request_header(j->headers, "Authorization");
-            if (!strcmp(method, "POST") && (r.status == 301 || r.status == 302 || r.status == 303)) {
+            if (strcmp(previous_origin, target_origin)) {
+                remove_request_header(j->headers, "Authorization");
+                /* Fetch redirect-taint: an origin-changing redirect from a
+                   URL already outside the request origin serializes to null. */
+                if (strcmp(previous_origin, j->origin)) j->origin_tainted = true;
+            }
+            j->redirected = true;
+            if ((!strcmp(method, "POST") && (r.status == 301 || r.status == 302)) ||
+                (r.status == 303 && strcmp(method, "GET") && strcmp(method, "HEAD"))) {
                 drop_body = true;
                 remove_body_headers(j->headers);
             }
             http_resp_free(&r); continue;
         }
-        if (j->wire.kind == WEBNET_MODULE && (r.status < 200 || r.status >= 300 || !js_mime(r.headers))) {
+        if (j->wire.kind == WEBNET_MODULE && (r.status < 200 || r.status >= 300 || !js_mime(http_response_headers(&r)))) {
             http_resp_free(&r); return fail(j, "Module response must be successful JavaScript");
         }
         if (j->wire.kind == WEBNET_CLASSIC) {
             char nosniff[64];
+            const char *headers = http_response_headers(&r);
+            bool have_nosniff = field_exists(headers, "X-Content-Type-Options");
             if (r.status < 200 || r.status >= 300 ||
-                (field(r.headers, "X-Content-Type-Options", nosniff, sizeof nosniff) && !strcasecmp(nosniff, "nosniff") && !js_mime(r.headers))) {
+                (have_nosniff && (!field(headers, "X-Content-Type-Options", nosniff, sizeof nosniff) ||
+                    (!strcasecmp(nosniff, "nosniff") && !js_mime(headers))))) {
                 http_resp_free(&r); return fail(j, "Script response is not executable");
             }
         }
-        j->status = r.status; response_headers(j, &r, cross); http_resp_free(&r);
+        j->status = r.status;
+        bool headers_ok = response_headers(j, &r, j->cors_tainted); http_resp_free(&r);
+        if (!headers_ok) return false;
         if (!j->body) { j->body = calloc(1, 1); if (!j->body) return fail(j, "Out of memory"); }
         return true;
     }
@@ -528,9 +642,11 @@ int main(void) {
     struct webnet_wire_request *w = &j->wire;
     if (!read_all(0, w, sizeof *w) || w->magic != WEBNET_MAGIC || w->kind > WEBNET_FETCH ||
         !w->url_len || w->url_len >= WEBNET_URL_MAX || w->origin_len >= WEBNET_URL_MAX ||
-        !w->method_len || w->method_len >= 8 || w->headers_len >= WEBNET_HEADERS_MAX || w->body_len > WEBNET_BODY_LIMIT ||
+        !w->method_len || w->method_len >= WEBNET_METHOD_MAX || w->headers_len >= WEBNET_REQUEST_HEADERS_MAX || w->body_len > WEBNET_BODY_LIMIT ||
         w->credentials>WEBNET_CREDENTIALS_INCLUDE || (w->user_navigation & ~WEBNET_WIRE_REQUEST_FLAGS) || w->cookie_len>WEBCOOKIE_SNAPSHOT_MAX ||
-        (w->credentials==WEBNET_CREDENTIALS_OMIT && w->cookie_len)) { free(j); return 1; }
+        (w->credentials==WEBNET_CREDENTIALS_OMIT && w->cookie_len) ||
+        WEBNET_WIRE_CACHE_MODE(w->user_navigation) > WEBNET_CACHE_ONLY_IF_CACHED ||
+        (w->kind != WEBNET_FETCH && WEBNET_WIRE_CACHE_MODE(w->user_navigation) != WEBNET_CACHE_DEFAULT)) { free(j); return 1; }
     j->url = read_string(w->url_len, false); j->document = read_string(w->origin_len, false);
     j->method = read_string(w->method_len, false); j->headers = read_string(w->headers_len, false);
     j->request_body = read_string(w->body_len, true);
@@ -566,20 +682,23 @@ int main(void) {
     }
     free(cookie_snapshot);
     if (!j->url || !j->document || !j->method || !j->headers || !j->request_body) fail(j, "Invalid request or out of memory");
-    else if ((strcmp(j->method, "GET") && strcmp(j->method, "POST")) || (!strcmp(j->method, "GET") && w->body_len)) fail(j, "Only GET and POST are supported");
+    else if (!webnet_method_valid(j->method) || ((!strcmp(j->method, "GET") || !strcmp(j->method, "HEAD")) && w->body_len)) fail(j, "Invalid HTTP method or body");
     else if (!j->error[0] && remaining(j)) {
         if (!strncmp(j->url, "file:", 5)) load_file(j);
         else run_http(j);
     }
-    if (j->error[0]) { free(j->body); j->body = NULL; j->body_len = 0; j->status = 0; j->response_headers[0] = 0; }
+    if (j->error[0]) {
+        free(j->body); j->body = NULL; j->body_len = 0; j->status = 0;
+        free(j->response_headers); j->response_headers = NULL; j->response_headers_len = 0;
+    }
     struct webnet_wire_response out = {0};
     out.magic = WEBNET_MAGIC; out.id = w->id; out.generation = w->generation; out.status = j->status;
-    out.url_len = strlen(j->final_url); out.headers_len = strlen(j->response_headers);
+    out.url_len = strlen(j->final_url); out.headers_len = j->response_headers_len;
     out.body_len = j->body_len; out.error_len = strlen(j->error);
     out.cookie_len=(uint32_t)j->cookie_len;
     bool ok = write_all(1, &out, sizeof out) && write_all(1, j->final_url, out.url_len) &&
               write_all(1, j->response_headers, out.headers_len) && write_all(1, j->body, out.body_len) && write_all(1, j->error, out.error_len) &&
               write_all(1,j->cookie_events,out.cookie_len);
-    free(j->url); free(j->document); free(j->method); free(j->headers); free(j->request_body); free(j->body); free(j->cookie_events); webcookie_free(j->cookies); free(j);
+    free(j->url); free(j->document); free(j->method); free(j->headers); free(j->request_body); free(j->body); free(j->response_headers); free(j->cookie_events); webcookie_free(j->cookies); free(j);
     return ok ? 0 : 1;
 }

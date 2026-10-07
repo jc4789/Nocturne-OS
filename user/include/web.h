@@ -27,8 +27,10 @@ web_doc *web_parse(const char *html, size_t len, const char *url, const char *ch
    its arguments before returning. Completion only queues work, never runs JS.
    sync_load() is exclusively for the synchronous module loader: service native
    UI/networking but NEVER enter JS or replace/free the document in that callback.
-   On success sync_load transfers malloc'd body to the caller. Other response
-   fields are inline. Resource ids belong to one document; the embedder must also
+   sync_load transfers malloc'd body and optional headers_full to the caller,
+   including error responses; release them with web_response_free. Completion
+   callbacks borrow these pointers only until they return. Resource ids belong
+   to one document; the embedder must also
    check its navigation generation before delivering a completion. */
 enum { WEB_RESOURCE_SCRIPT, WEB_RESOURCE_MODULE, WEB_RESOURCE_CSS,
        WEB_RESOURCE_IMAGE, WEB_RESOURCE_FETCH };
@@ -40,6 +42,8 @@ struct web_request {
     size_t body_len;
     int credentials; /* 0 omit, 1 same-origin, 2 include */
     bool force_preflight; /* XHR upload listeners require CORS preflight even with safe headers. */
+    bool redirect_error, same_origin;
+    int cache_mode; /* Fetch: 0 default, 1 no-store, 2 reload, 3 no-cache, 4 force-cache, 5 only-if-cached. */
 };
 enum { WEB_HISTORY_INFO, WEB_HISTORY_PUSH, WEB_HISTORY_REPLACE, WEB_HISTORY_GO, WEB_HISTORY_SCROLL };
 struct web_history {
@@ -54,7 +58,14 @@ struct web_response {
     char url[2048], headers[4096], error[160];
     char *body;
     size_t body_len;
+    char *headers_full; /* Complete block when too large for inline headers; never a truncated tail. */
 };
+/* Includes the native HTTP status/private metadata prefix. */
+#define WEB_RESPONSE_HEADERS_MAX (64u * 1024u + 512u + 1u)
+static inline const char *web_response_headers(const struct web_response *r) {
+    return r->headers_full ? r->headers_full : r->headers;
+}
+void web_response_free(struct web_response *response);
 struct web_host {
     void *opaque;
     bool (*request)(void *opaque, const struct web_request *request);
@@ -91,6 +102,7 @@ struct web_event {
     int x, y, button, key_code;
     bool bubbles, cancelable, ctrl, shift, alt;
     web_node *related_target;
+    web_node *submitter; /* SubmitEvent only; NULL for implicit/no-button submit */
     int buttons;
 };
 /* NULL target means window. false means preventDefault() was called. */
@@ -100,7 +112,8 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *event);
 void web_document_scroll(web_doc *d);
 /* One native mouse movement, between JS tasks. target is the hit-tested element;
    NULL means outside the document. Snapshots ancestry before any handlers run,
-   sends out/leave/over/enter as needed, then mousemove for a non-NULL target. */
+   sends out/leave/over/enter as needed, then mousemove for a non-NULL target.
+   event is pointer state: its type may be NULL, since the hook chooses types. */
 void web_hover(web_doc *d, web_node *target, const struct web_event *event);
 web_node *web_node_at(web_doc *d, int x, int y);
 bool web_node_action(web_doc *d, web_node *target, struct web_hit *hit);
@@ -130,7 +143,7 @@ void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, i
 
 /* ---- interaction ---- */
 enum { WEB_HIT_NONE, WEB_HIT_LINK, WEB_HIT_TEXT_INPUT, WEB_HIT_CHECKBOX, WEB_HIT_RADIO, WEB_HIT_SUBMIT,
-       WEB_HIT_BUTTON, WEB_HIT_SELECT, WEB_HIT_TEXTAREA };
+       WEB_HIT_BUTTON, WEB_HIT_SELECT, WEB_HIT_TEXTAREA, WEB_HIT_DETAILS };
 struct web_hit {
     int kind;
     const char *href; /* absolute URL of the link under the point, or NULL */
@@ -146,10 +159,15 @@ const char *web_control_value(web_node *control);
 /* a key for the focused text control: 0 ignored, 1 changed (repaint), 2 Enter: submit its form */
 int web_key(web_doc *d, const struct gui_event *e);
 void web_toggle(web_doc *d, web_node *n); /* checkbox or radio click */
+web_node *web_disclosure_focus(web_node *details); /* first summary, or the native default legend host */
+bool web_reset(web_doc *d, web_node *control); /* reset button default action, with cancellable event */
 /* the request a form submission makes: *url is malloc'd; *body is malloc'd for POST, NULL for GET.
    submitter is the clicked button, or any control of the form. */
 bool web_submit(web_doc *d, web_node *submitter, char **url, char **body);
 web_node *web_form_owner(web_doc *d, web_node *control);
+bool web_control_disabled(const web_node *control);
+bool web_form_submission_validate(web_doc *d, web_node *submitter);
+bool web_take_validation_report(web_doc *d, web_node **control, const char **message, size_t *length);
 int web_select_options(web_doc *d, web_node *sel, const char **labels, int max, int *selected);
 void web_select_set(web_doc *d, web_node *sel, int index);
 /* document rectangle of an element (its first box), for placing popups */

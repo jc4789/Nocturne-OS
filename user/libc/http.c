@@ -132,10 +132,14 @@ static bool copy_body(struct rd *r, struct sink *k, size_t n) {
     return true;
 }
 
+const char *http_response_headers(const struct http_resp *resp) {
+    return resp->headers_full ? resp->headers_full : resp->headers;
+}
+
 char *http_header(const struct http_resp *resp, const char *name, char *out, size_t n) {
     if (!n) return NULL;
     size_t nl = strlen(name);
-    const char *p = resp->headers;
+    const char *p = http_response_headers(resp);
     while (*p) {
         const char *eol = strstr(p, "\r\n");
         if (!eol) eol = p + strlen(p);
@@ -153,7 +157,17 @@ char *http_header(const struct http_resp *resp, const char *name, char *out, siz
     return NULL;
 }
 
-/* Framing must not depend on the bounded public header snapshot. */
+/* Framing is parsed from each complete line, independently of storage. */
+static bool valid_header_line(const char *line) {
+    const char *colon = strchr(line, ':');
+    if (!colon || colon == line) return false;
+    for (const char *p = line; p < colon; p++) {
+        unsigned char c = (unsigned char)*p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) continue;
+        if (!strchr("!#$%&'*+-.^_`|~", c)) return false;
+    }
+    return true;
+}
 static char *header_value(char *line, const char *name) {
     size_t n = strlen(name);
     if (strncasecmp(line, name, n) || line[n] != ':') return NULL;
@@ -301,7 +315,7 @@ int http_request(const struct http_req *rq, struct http_resp *rs) {
         return -1;
     }
     r->s = s;
-    char line[16384]; /* Complete cookie fields may exceed the public snapshot. */
+    char line[HTTP_RESPONSE_HEADER_LINE_MAX];
     int status = 0;
     /* status line, skipping any 100 Continue */
     do {
@@ -311,12 +325,40 @@ int http_request(const struct http_req *rq, struct http_resp *rs) {
             ns_close(s);
             return -1;
         }
-        if (status == 100)
-            while (rd_line(r, line, sizeof line) && line[0]) {
+        if (status == 100) {
+            size_t interim_len = 0;
+            for (;;) {
+                if (!rd_line(r, line, sizeof line) || r->line_invalid || r->line_truncated) {
+                    snprintf(rs->error, sizeof rs->error, "invalid interim response headers");
+                    free(r); ns_close(s); return -1;
+                }
+                if (!line[0]) break;
+                if (!valid_header_line(line)) {
+                    snprintf(rs->error, sizeof rs->error, "invalid interim response header field");
+                    free(r); ns_close(s); return -1;
+                }
+                size_t l = strlen(line);
+                if (l + 2 > HTTP_RESPONSE_HEADERS_LIMIT - interim_len) {
+                    snprintf(rs->error, sizeof rs->error, "response headers exceed 64 KiB limit");
+                    free(r); ns_close(s); return -1;
+                }
+                interim_len += l + 2;
             }
+        }
     } while (status == 100);
     rs->status = status;
-    size_t hl = 0, length = 0;
+    const char *reason = strchr(line, ' ');
+    if (reason) {
+        while (*reason == ' ') reason++;
+        while (*reason >= '0' && *reason <= '9') reason++;
+        if (*reason == ' ') reason++;
+        if (strlen(reason) >= sizeof rs->status_text) {
+            snprintf(rs->error, sizeof rs->error, "HTTP reason phrase exceeds limit");
+            free(r); ns_close(s); return -1;
+        }
+        memcpy(rs->status_text, reason, strlen(reason) + 1);
+    }
+    size_t hl = 0, headers_cap = sizeof rs->headers, length = 0;
     bool chunked = false, have_length = false, gzip = false, have_encoding = false;
     const char *header_error = NULL;
     for (;;) {
@@ -324,13 +366,31 @@ int http_request(const struct http_req *rq, struct http_resp *rs) {
         if (r->line_invalid) { header_error = "invalid response header characters"; break; }
         if (!line[0]) break;
         if (r->line_truncated) { header_error = "response header exceeds 16 KiB"; break; }
+        if (!valid_header_line(line)) { header_error = "invalid response header field"; break; }
         size_t l = strlen(line);
-        if (rq->on_header && rq->on_header(rq->ctx, line, l) < 0) { header_error = "response header callback aborted"; break; }
-        if (hl + l + 3 < sizeof rs->headers) {
-            memcpy(rs->headers + hl, line, l);
-            memcpy(rs->headers + hl + l, "\r\n", 3);
-            hl += l + 2;
+        /* Store every field or reject the response. Late security fields must
+           never disappear behind the old inline capacity. */
+        if (l + 2 > HTTP_RESPONSE_HEADERS_LIMIT - hl) {
+            header_error = "response headers exceed 64 KiB limit"; break;
         }
+        size_t need = hl + l + 3;
+        if (need > headers_cap) {
+            size_t cap = headers_cap;
+            while (cap < need) {
+                cap = cap > (HTTP_RESPONSE_HEADERS_LIMIT + 1u) / 2u ?
+                    HTTP_RESPONSE_HEADERS_LIMIT + 1u : cap * 2u;
+            }
+            bool had_full = rs->headers_full != NULL;
+            char *larger = realloc(rs->headers_full, cap);
+            if (!larger) { header_error = "out of memory receiving response headers"; break; }
+            if (!had_full) memcpy(larger, rs->headers, hl + 1);
+            rs->headers_full = larger; headers_cap = cap;
+        }
+        char *stored = rs->headers_full ? rs->headers_full : rs->headers;
+        memcpy(stored + hl, line, l);
+        memcpy(stored + hl + l, "\r\n", 3);
+        hl += l + 2;
+        if (rq->on_header && rq->on_header(rq->ctx, line, l) < 0) { header_error = "response header callback aborted"; break; }
         char *v;
         if ((v = header_value(line, "Transfer-Encoding"))) {
             if (r->line_truncated || chunked || strcasecmp(v, "chunked"))
@@ -352,8 +412,11 @@ int http_request(const struct http_req *rq, struct http_resp *rs) {
     }
     if (header_error) {
         snprintf(rs->error, sizeof rs->error, "%s", header_error);
+        free(rs->headers_full); rs->headers_full = NULL; rs->headers[0] = 0;
         free(r); ns_close(s); return -1;
     }
+    rs->headers_len = hl;
+    if (rs->headers_full) rs->headers[0] = 0;
 
     struct http_req buffered = *rq;
     buffered.on_body = NULL;
@@ -406,10 +469,19 @@ int http_request(const struct http_req *rq, struct http_resp *rs) {
     }
     free(r);
     ns_close(s);
+    if (ret < 0) {
+        free(rs->headers_full); rs->headers_full = NULL;
+        rs->headers[0] = 0; rs->headers_len = 0;
+    }
     return ret;
 }
 
 void http_resp_free(struct http_resp *resp) {
+    free(resp->headers_full);
+    resp->headers_full = NULL;
+    resp->headers[0] = 0;
+    resp->headers_len = 0;
     free(resp->body);
     resp->body = NULL;
+    resp->body_len = 0;
 }

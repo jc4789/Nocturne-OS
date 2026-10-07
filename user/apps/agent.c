@@ -995,6 +995,8 @@ static int model_step(const char *system) {
         struct http_resp rs;
         md_reset();
         int r = http_request(&rq, &rs);
+        /* Streaming owns its body separately; release any complete header block. */
+        http_resp_free(&rs);
         md_reset();
         if (st->in_thinking || st->printed_text) say(C_RESET "\n");
         else if (st->said_thinking) say("\x1b[K");

@@ -1,0 +1,52 @@
+{
+  "icu": [
+    78,
+    1,
+    0,
+    0
+  ],
+  "unicode": [
+    17,
+    0,
+    0,
+    0
+  ],
+  "cldr": "48",
+  "upstream": "https://github.com/unicode-org/icu/tree/release-78.1",
+  "librarySha256": {
+    "icuuc78.dll": "555ea91e7f66491f5c67679c9fbebc3ee2808a80bb64f4ac40794a7d5d453bfb",
+    "icuin78.dll": "53bc2017ac775aa34c153029cea4f7b99bb47686c1836c90bbe0fca3ee065827",
+    "icudt78.dll": "6d5f1ea9e8d29ce330e838e68ae7158b2d69ce3c2a6c93508bc1f65ca123ed1e"
+  },
+  "dataSha256": "4eedaa9bfec86bd0adf8d64e09d42af0b94abb36e09ceb9dc0332df40aa5b857",
+  "tables": {
+    "en": {
+      "ranges": 91268,
+      "pool": 14554,
+      "contexts": 1135,
+      "reorderRanges": 1
+    },
+    "en@collation=search": {
+      "ranges": 11109,
+      "pool": 11322,
+      "contexts": 265,
+      "reorderRanges": 1
+    },
+    "ja": {
+      "ranges": 5181,
+      "pool": 1483,
+      "contexts": 1873,
+      "reorderRanges": 6
+    },
+    "ja@collation=search": {
+      "ranges": 11109,
+      "pool": 11322,
+      "contexts": 265,
+      "reorderRanges": 1
+    }
+  },
+  "locales": [
+    "en",
+    "ja"
+  ]
+}

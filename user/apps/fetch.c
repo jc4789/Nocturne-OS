@@ -53,7 +53,7 @@ int main(int argc, char **argv) {
     int r = http_request(&rq, &rs);
     if (f != stdout) fclose(f);
     else fflush(stdout);
-    if (show_headers && rs.status) fprintf(stderr, "HTTP %d\n%s", rs.status, rs.headers);
+    if (show_headers && rs.status) fprintf(stderr, "HTTP %d\n%s", rs.status, http_response_headers(&rs));
     if (r < 0) {
         fprintf(stderr, "fetch: %s\n", rs.error);
         return 1;

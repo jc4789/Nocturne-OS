@@ -5,9 +5,14 @@
 #include <math.h>
 #include <nocturne.h>
 #include <http.h>
+#include <webnet.h>
 #include <quickjs.h>
 #include "webi.h"
+#include "form_value.h"
+#include "form_validation.h"
+#include "elements.h"
 #include "js_crypto.h"
+#include "js_collator_native.h"
 #include "js_bootstrap.inc"
 
 /* Live YouTube's 10.8 MB program was rejected while compiling at exactly the
@@ -43,12 +48,12 @@ struct js_script {
 enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE };
 struct js_pending {
     uint64_t id, deadline;
-    int kind, credentials;
+    int kind, credentials, cache_mode;
     int image;
     struct js_script *script;
     JSValue resolve, reject;
     char *url;
-    bool done, aborted, force_preflight;
+    bool done, aborted, force_preflight, redirect_error, same_origin;
     struct web_response response;
     struct js_pending *next;
 };
@@ -59,7 +64,9 @@ struct js_image_decode { node_t *node; uint64_t generation; JSValue resolve, rej
 /* Order is shared with the bootstrap's private nodeProtos array. */
 enum { NP_NODE, NP_DOCUMENT, NP_ELEMENT, NP_HTML, NP_TEXT, NP_COMMENT, NP_FRAGMENT, NP_IFRAME, NP_IMAGE,
        NP_INPUT, NP_BUTTON, NP_SELECT, NP_TEXTAREA, NP_FIELDSET, NP_OBJECT, NP_OUTPUT, NP_OPTION, NP_TEMPLATE, NP_DOCTYPE,
-       NP_SCRIPT, NP_FORM, NP_ANCHOR, NP_AREA, NP_SVG, NP_SVGSVG, NP_PI, NP_COUNT };
+       NP_SCRIPT, NP_FORM, NP_ANCHOR, NP_AREA, NP_SVG, NP_SVGSVG, NP_PI, NP_ATTR,
+       NP_META, NP_LINK, NP_STYLE, NP_BASE, NP_TITLE, NP_HEAD, NP_SHADOW, NP_SLOT,
+       NP_TIME, NP_DATA, NP_DETAILS, NP_OL, NP_LI, NP_UNKNOWN, NP_COUNT };
 struct js_alloc_diagnostics { size_t peak, requested, used, limit; unsigned failures, reported; bool quota; };
 struct web_js_state {
     struct js_alloc_diagnostics allocation;
@@ -108,6 +115,15 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
 static void dynamic_scripts(struct web_js_state *s, node_t *n);
 static void run_script(struct web_js_state *s, struct js_script *script);
 static struct js_resource_event *script_event(struct web_js_state *s, node_t *n, bool failed);
+static JSValue custom_element_hook(struct web_js_state *s, const char *name, int argc, JSValueConst *argv);
+static void exception(struct web_js_state *s);
+static void signal_slots(struct web_js_state *s) {
+    web_doc *family = s->doc->dom_family ? s->doc->dom_family : s->doc;
+    if (!s->disabled && family->shadow_slots_pending) {
+        JSValue value = custom_element_hook(s, "slotChanges", 0, NULL);
+        if (JS_IsException(value)) exception(s); else JS_FreeValue(s->ctx, value);
+    }
+}
 
 /* Alignment and accounting include the allocation header, not an invented
    malloc_usable_size. This also handles realloc failure without losing state. */
@@ -162,6 +178,10 @@ static struct web_js_state *state(JSContext *ctx) { return JS_GetContextOpaque(c
 static void log_text(struct web_js_state *s, int level, const char *msg) {
     if (s->host.console) s->host.console(s->host.opaque, level, msg ? msg : "JavaScript error");
 }
+void web_js_console(web_doc *d, int level, const char *message) {
+    /* Native resource/layout failures remain observable after scripting stops. */
+    if (d && d->js) log_text(d->js, level, message);
+}
 static void report_allocation_failure(struct web_js_state *s) {
     if(s->allocation.failures!=s->allocation.reported) {
         const struct js_alloc_diagnostics *d=&s->allocation;char message[256];
@@ -206,6 +226,7 @@ static void begin_task(struct web_js_state *s) {
 }
 static void end_task(struct web_js_state *s) {
     if (s->running == 1 && !s->disabled) {
+        signal_slots(s);
         JSContext *ctx;
         uint64_t microtask_start = uptime_ms();
         while (JS_IsJobPending(s->rt)) {
@@ -271,11 +292,28 @@ static node_t *unwrap(JSContext *ctx, JSValueConst v) {
     if (JS_IsNull(v) || JS_IsUndefined(v)) return NULL;
     return JS_GetOpaque2(ctx, v, node_class);
 }
+static bool unknown_html_interface(const node_t *n) {
+    const char *name = n->name;
+    static const char *obsolete[] = {"applet","bgsound","blink","isindex","keygen","multicol","nextid","spacer"};
+    for (size_t i=0;i<sizeof obsolete/sizeof *obsolete;i++) if (!strcmp(name,obsolete[i])) return true;
+    if (n->tag && n->tag != T_image && n->tag != T_math && n->tag != T_svg) return false;
+    static const char *generic[] = {"acronym","basefont","rb","rtc"};
+    for (size_t i=0;i<sizeof generic/sizeof *generic;i++) if (!strcmp(name,generic[i])) return false;
+    /* Keep potential autonomous custom elements on HTMLElement. This matches
+       the current valid-local-name rule used by js_custom_elements.js. */
+    if (name[0] < 'a' || name[0] > 'z' || !strchr(name,'-')) return true;
+    static const char *reserved[] = {"annotation-xml","color-profile","font-face","font-face-src",
+        "font-face-uri","font-face-format","font-face-name","missing-glyph"};
+    for (size_t i=0;i<sizeof reserved/sizeof *reserved;i++) if (!strcmp(name,reserved[i])) return true;
+    for (const unsigned char *p=(const unsigned char *)name;*p;p++)
+        if (is_space(*p) || *p=='/' || *p=='>' || (*p>='A' && *p<='Z')) return true;
+    return false;
+}
 static JSValueConst node_prototype(struct web_js_state *s, const node_t *n) {
     int kind = n->type == N_DOC ? NP_DOCUMENT : n->type == N_ELEM ?
                (n->namespace_id == NS_SVG ? (!strcmp(n->raw_name, "svg") ? NP_SVGSVG : NP_SVG) :
                 n->foreign ? NP_ELEMENT : n->tag == T_iframe ? NP_IFRAME : NP_HTML) :
-               n->type == N_TEXT ? NP_TEXT : n->type == N_COMMENT ? NP_COMMENT : n->type == N_DOCTYPE ? NP_DOCTYPE : n->type == N_PI ? NP_PI : NP_FRAGMENT;
+               n->type == N_TEXT ? NP_TEXT : n->type == N_COMMENT ? NP_COMMENT : n->type == N_DOCTYPE ? NP_DOCTYPE : n->type == N_PI ? NP_PI : n->type == N_ATTR ? NP_ATTR : n->shadow_host ? NP_SHADOW : NP_FRAGMENT;
     if (n->type == N_ELEM && !n->foreign) switch (n->tag) {
         case T_img: kind = NP_IMAGE; break;
         case T_input: kind = NP_INPUT; break;
@@ -291,7 +329,20 @@ static JSValueConst node_prototype(struct web_js_state *s, const node_t *n) {
         case T_form: kind = NP_FORM; break;
         case T_a: kind = NP_ANCHOR; break;
         case T_area: kind = NP_AREA; break;
+        case T_meta: kind = NP_META; break;
+        case T_link: kind = NP_LINK; break;
+        case T_style: kind = NP_STYLE; break;
+        case T_base: kind = NP_BASE; break;
+        case T_title: kind = NP_TITLE; break;
+        case T_head: kind = NP_HEAD; break;
+        case T_slot: kind = NP_SLOT; break;
+        case T_time: kind = NP_TIME; break;
+        case T_data: kind = NP_DATA; break;
+        case T_details: kind = NP_DETAILS; break;
+        case T_ol: kind = NP_OL; break;
+        case T_li: kind = NP_LI; break;
     }
+    if (kind == NP_HTML && unknown_html_interface(n)) kind = NP_UNKNOWN;
     return s->node_protos[kind];
 }
 static unsigned node_bucket(const node_t *n) {
@@ -322,22 +373,25 @@ static JSValue wrap(struct web_js_state *s, node_t *n) {
 static JSValue oom(JSContext *ctx) { return JS_ThrowOutOfMemory(ctx); }
 static JSValue str_or_null(JSContext *ctx, const char *p) { return p ? JS_NewString(ctx, p) : JS_NULL; }
 static bool connected(struct web_js_state *s, node_t *n) {
-    if (!n) return false;
-    while (n->parent) n = n->parent;
-    return n == s->doc->root;
+    return n && doc_node_root(n, true) == s->doc->root;
 }
 static bool equal_nodes(const node_t *a, const node_t *b) {
     if (a == b) return true;
     if (!a || !b || a->type != b->type) return false;
-    if (a->type == N_ELEM) {
+    if (a->type == N_ATTR) {
+        const struct attr *aa = a->attribute, *ba = b->attribute;
+        if (strcmp(aa->namespace_uri ? aa->namespace_uri : "", ba->namespace_uri ? ba->namespace_uri : "") ||
+            strcmp(aa->local ? aa->local : aa->raw, ba->local ? ba->local : ba->raw) || strcmp(aa->value, ba->value)) return false;
+    } else if (a->type == N_ELEM) {
         if (a->foreign != b->foreign || a->namespace_id != b->namespace_id || a->nattrs != b->nattrs ||
             strcmp(a->foreign ? a->raw_name : a->name, b->foreign ? b->raw_name : b->name)) return false;
         for (int i = 0; i < a->nattrs; i++) {
-            const char *name = a->foreign ? a->attrs[i].raw : a->attrs[i].name;
+            const struct attr *aa = &a->attrs[i];
             bool found = false;
             for (int j = 0; j < b->nattrs; j++)
-                if (!strcmp(name, b->foreign ? b->attrs[j].raw : b->attrs[j].name) &&
-                    !strcmp(a->attrs[i].value, b->attrs[j].value)) { found = true; break; }
+                if (!strcmp(aa->namespace_uri ? aa->namespace_uri : "", b->attrs[j].namespace_uri ? b->attrs[j].namespace_uri : "") &&
+                    !strcmp(aa->local ? aa->local : aa->raw, b->attrs[j].local ? b->attrs[j].local : b->attrs[j].raw) &&
+                    !strcmp(aa->value, b->attrs[j].value)) { found = true; break; }
             if (!found) return false;
         }
     } else if (a->type == N_DOCTYPE) {
@@ -354,23 +408,22 @@ static bool equal_nodes(const node_t *a, const node_t *b) {
 static bool custom_candidate(const node_t *n) {
     return n && n->type == N_ELEM && !n->foreign && n->name && strchr(n->name, '-');
 }
+static bool custom_candidates_walk(struct web_js_state *s, node_t *n, const char *name, JSValue result, uint32_t *index) {
+    if (custom_candidate(n) && (!name || !strcmp(n->name, name))) {
+        JSValue object = wrap(s, n);
+        if (JS_IsException(object) || JS_SetPropertyUint32(s->ctx, result, (*index)++, object) < 0) return false;
+    }
+    /* Shadow-including tree order, not the flattened tree: unassigned light
+       children still receive CE lifecycle reactions; template content is inert. */
+    if (n->shadow_root && !custom_candidates_walk(s, n->shadow_root, name, result, index)) return false;
+    for (node_t *c = n->first; c; c = c->next)
+        if (!custom_candidates_walk(s, c, name, result, index)) return false;
+    return true;
+}
 static JSValue custom_candidates(struct web_js_state *s, node_t *root, const char *name) {
-    JSValue result = JS_NewArray(s->ctx);
-    if (JS_IsException(result)) return result;
-    uint32_t index = 0;
-    for (node_t *n = root; n;) {
-        if (custom_candidate(n) && (!name || !strcmp(n->name, name))) {
-            JSValue object = wrap(s, n);
-            if (JS_IsException(object)) { JS_FreeValue(s->ctx, result); return object; }
-            if (JS_SetPropertyUint32(s->ctx, result, index++, object) < 0) {
-                JS_FreeValue(s->ctx, result); return JS_EXCEPTION;
-            }
-        }
-        if (n->first) n = n->first;
-        else {
-            while (n != root && !n->next) n = n->parent;
-            n = n == root ? NULL : n->next;
-        }
+    JSValue result = JS_NewArray(s->ctx); uint32_t index = 0;
+    if (!JS_IsException(result) && !custom_candidates_walk(s, root, name, result, &index)) {
+        JS_FreeValue(s->ctx, result); return JS_EXCEPTION;
     }
     return result;
 }
@@ -430,8 +483,8 @@ static JSValue children(struct web_js_state *s, node_t *n) {
 }
 static node_t *option_at_js(node_t *select, int wanted) { return doc_select_option(select, wanted); }
 static JSValue option_value(JSContext *ctx, node_t *option) {
-    const char *attr = node_attr(option, "value"); if (attr) return JS_NewString(ctx, attr);
-    sbuf b = {0}; node_text_content(option, &b); JSValue result = JS_NewStringLen(ctx, b.p ? b.p : "", b.n); sb_free(&b); return result;
+    sbuf b = {0}; web_option_value(option, &b);
+    JSValue result = JS_NewStringLen(ctx, b.p ? b.p : "", b.n); sb_free(&b); return result;
 }
 static bool html_image(const node_t *n) { return n && n->type == N_ELEM && !n->foreign && n->tag == T_img; }
 static JSValue get_image(struct web_js_state *s, node_t *n, const char *p) {
@@ -485,6 +538,20 @@ static JSValue image_decode_promise(struct web_js_state *s, node_t *n) {
 }
 static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
+    if (!strcmp(p, "shadowRoot")) return wrap(s, n->shadow_root);
+    if (!strcmp(p, "shadowHost")) return wrap(s, n->shadow_host);
+    if (!strcmp(p, "shadowHostValid")) return JS_NewBool(ctx, doc_shadow_host_valid(n));
+    if (!strcmp(p, "assignedSlot")) return wrap(s, doc_assigned_slot(n, false));
+    if (!strcmp(p, "assignedSlotOpen")) return wrap(s, doc_assigned_slot(n, true));
+    if (!strcmp(p, "slotBrand")) return n->type == N_ELEM && !n->foreign && n->tag == T_slot ? JS_TRUE : JS_ThrowTypeError(ctx, "HTMLSlotElement receiver required");
+    if (!strcmp(p, "shadowMode") || !strcmp(p, "shadowDelegatesFocus") || !strcmp(p, "shadowClonable") ||
+        !strcmp(p, "shadowSerializable") || !strcmp(p, "shadowSlotAssignment")) {
+        if (!n->shadow_host) return JS_ThrowTypeError(ctx, "ShadowRoot receiver required");
+        if (!strcmp(p, "shadowMode")) return JS_NewString(ctx, n->shadow_closed ? "closed" : "open");
+        if (!strcmp(p, "shadowSlotAssignment")) return JS_NewString(ctx, n->shadow_manual ? "manual" : "named");
+        return JS_NewBool(ctx, !strcmp(p, "shadowDelegatesFocus") ? n->shadow_delegates_focus :
+            !strcmp(p, "shadowClonable") ? n->shadow_clonable : n->shadow_serializable);
+    }
     if (!strncmp(p, "svg", 3)) {
         if (n->type != N_ELEM || n->namespace_id != NS_SVG)
             return JS_ThrowTypeError(ctx, "SVGElement receiver required");
@@ -522,17 +589,22 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
         if (n->type != N_ELEM || n->foreign || strcmp(n->name, p + 5)) return JS_ThrowTypeError(ctx, "Form control interface receiver required");
         node_t *control = n->tag == T_option ? node_ancestor(n, T_select) : n;
         if (!control) return JS_NULL;
-        const char *id = node_attr(control, "form");
-        if (id) {
-            node_t *root = control; while (root->parent) root = root->parent;
-            node_t *form = root == d->root ? find_id(d->root, id) : NULL;
-            return wrap(s, form && form->tag == T_form ? form : NULL);
-        }
-        return wrap(s, node_ancestor(control, T_form));
+        return wrap(s, web_form_owner(d, control));
     }
     if (d->resources_dirty && (!strcmp(p, "documentElement") || !strcmp(p, "head") || !strcmp(p, "body") || !strcmp(p, "baseURI") || !strcmp(p, "activeElement"))) doc_sync_tree(d);
     if (!strcmp(p, "value") || !strcmp(p, "checked") || !strcmp(p, "selectedIndex") || !strcmp(p, "selected")) doc_control_init(d, n);
-    if (!strcmp(p, "nodeType")) return JS_NewInt32(ctx, n->type == N_DOC ? 9 : n->type == N_ELEM ? 1 : n->type == N_TEXT ? 3 : n->type == N_COMMENT ? 8 : n->type == N_DOCTYPE ? 10 : n->type == N_PI ? 7 : 11);
+    if (!strcmp(p, "attrBrand")) return n->type == N_ATTR ? JS_TRUE : JS_ThrowTypeError(ctx, "Attr receiver required");
+    if (!strcmp(p, "elementBrand")) return n->type == N_ELEM ? JS_TRUE : JS_ThrowTypeError(ctx, "Element receiver required");
+    if (n->type == N_ATTR) {
+        struct attr *a = n->attribute;
+        if (!strcmp(p, "attrName") || !strcmp(p, "nodeName")) return JS_NewString(ctx, a->raw);
+        if (!strcmp(p, "localName")) return JS_NewString(ctx, a->local ? a->local : a->raw);
+        if (!strcmp(p, "namespaceURI")) return str_or_null(ctx, a->namespace_uri);
+        if (!strcmp(p, "prefix")) return str_or_null(ctx, a->prefix);
+        if (!strcmp(p, "attrValue") || !strcmp(p, "nodeValue") || !strcmp(p, "textContent")) return JS_NewString(ctx, a->value);
+        if (!strcmp(p, "attrOwner")) return wrap(s, n->attr_owner);
+    }
+    if (!strcmp(p, "nodeType")) return JS_NewInt32(ctx, n->type == N_DOC ? 9 : n->type == N_ELEM ? 1 : n->type == N_TEXT ? 3 : n->type == N_COMMENT ? 8 : n->type == N_DOCTYPE ? 10 : n->type == N_PI ? 7 : n->type == N_ATTR ? 2 : 11);
     if (!strcmp(p, "nodeName")) {
         if (n->type != N_ELEM) return JS_NewString(ctx, n->type == N_DOC ? "#document" : n->type == N_TEXT ? "#text" : n->type == N_COMMENT ? "#comment" : n->type == N_DOCTYPE || n->type == N_PI ? n->name : "#document-fragment");
         char name[256]; snprintf(name, sizeof name, "%s", n->foreign ? n->raw_name : n->name);
@@ -546,7 +618,7 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     if (!strcmp(p, "piTarget")) return n->type == N_PI ? JS_NewString(ctx, n->name) : JS_ThrowTypeError(ctx, "ProcessingInstruction receiver required");
     if (!strcmp(p, "nodeValue")) return n->type == N_TEXT || n->type == N_COMMENT || n->type == N_PI ? JS_NewStringLen(ctx, n->text ? n->text : "", n->textlen) : JS_NULL;
     if (!strcmp(p, "parentNode")) return wrap(s, n->parent);
-    if (!strcmp(p, "isConnected")) { node_t *root = n; while (root->parent) root = root->parent; return JS_NewBool(ctx, root->type == N_DOC); }
+    if (!strcmp(p, "isConnected")) return JS_NewBool(ctx, doc_node_connected(n));
     if (!strcmp(p, "firstChild")) return wrap(s, n->first);
     if (!strcmp(p, "lastChild")) return wrap(s, n->last);
     if (!strcmp(p, "nextSibling")) return wrap(s, n->next);
@@ -565,13 +637,22 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     }
     if (!strcmp(p, "attributeNames")) {
         JSValue a = JS_NewArray(ctx);
-        for (int i = 0; i < n->nattrs; ++i) JS_SetPropertyUint32(ctx, a, i, JS_NewString(ctx, n->foreign && n->attrs[i].raw ? n->attrs[i].raw : n->attrs[i].name));
+        for (int i = 0; i < n->nattrs; ++i) JS_SetPropertyUint32(ctx, a, i, JS_NewString(ctx, n->attrs[i].raw));
         return a;
     }
     if (!strcmp(p, "documentElement")) return wrap(s, d->html);
     if (!strcmp(p, "head")) return wrap(s, d->head);
     if (!strcmp(p, "body")) return wrap(s, d->body);
-    if (!strcmp(p, "activeElement")) return wrap(s, d->focus && connected(s, d->focus) ? d->focus : d->body);
+    if (!strcmp(p, "activeElement")) {
+        node_t *focus = d->focus && connected(s, d->focus) ? d->focus : NULL;
+        node_t *scope = n->shadow_host ? n : d->root;
+        while (focus) {
+            node_t *root = doc_node_root(focus, false);
+            if (root == scope) return wrap(s, focus);
+            focus = root->shadow_host;
+        }
+        return wrap(s, n->shadow_host ? NULL : d->body ? d->body : d->html);
+    }
     if (!strcmp(p, "baseURI")) return JS_NewString(ctx, d->base);
     if (!strcmp(p, "title")) {
         if (d->resources_dirty) doc_rescan(d);
@@ -590,7 +671,28 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     }
     if (!strcmp(p, "checked")) return JS_NewBool(ctx, n->checked);
     if (!strcmp(p, "selectedIndex")) return JS_NewInt32(ctx, n->selected);
-    if (!strcmp(p, "selected")) { node_t *select = node_ancestor(n, T_select); if (select) doc_control_init(d, select); return JS_NewBool(ctx, doc_option_selected(n)); }
+    if (!strcmp(p, "selected")) return JS_NewBool(ctx, doc_option_selected(n));
+    if (!strcmp(p, "selectOptions")) {
+        if (n->type != N_ELEM || n->foreign || n->tag != T_select) return JS_ThrowTypeError(ctx, "HTMLSelectElement receiver required");
+        doc_control_init(d, n); JSValue values = JS_NewArray(ctx); uint32_t i = 0;
+        if (JS_IsException(values)) return values;
+        for (node_t *o = web_select_next_option(n, NULL); o; o = web_select_next_option(n, o)) {
+            JSValue option = wrap(s, o);
+            if (JS_IsException(option)) { JS_FreeValue(ctx, values); return option; }
+            if (JS_SetPropertyUint32(ctx, values, i++, option) < 0) { JS_FreeValue(ctx, values); return JS_EXCEPTION; }
+        }
+        return values;
+    }
+    if (!strcmp(p, "optionIndex")) {
+        if (n->type != N_ELEM || n->foreign || n->tag != T_option) return JS_ThrowTypeError(ctx, "HTMLOptionElement receiver required");
+        node_t *select = web_option_select(n); int i = 0;
+        if (select) for (node_t *o = web_select_next_option(select, NULL); o; o = web_select_next_option(select, o), i++) if (o == n) return JS_NewInt32(ctx, i);
+        return JS_NewInt32(ctx, 0);
+    }
+    if (!strcmp(p, "optionText")) {
+        if (n->type != N_ELEM || n->foreign || n->tag != T_option) return JS_ThrowTypeError(ctx, "HTMLOptionElement receiver required");
+        sbuf b = {0}; web_option_text(n, &b); JSValue result = JS_NewStringLen(ctx, b.p ? b.p : "", b.n); sb_free(&b); return result;
+    }
     if (!strcmp(p, "form")) return wrap(s, web_form_owner(d, n));
     if (!strcmp(p, "async")) {
         if (n->tag != T_script) return JS_UNDEFINED;
@@ -607,7 +709,7 @@ static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValue
         if (!html_image(n)) return JS_ThrowTypeError(ctx, "HTMLImageElement receiver required");
         uint32_t number; if (JS_ToUint32(ctx, &number, value) < 0) return JS_EXCEPTION;
         char text[16]; snprintf(text, sizeof text, "%u", number);
-        return doc_node_attr(d, n, !strcmp(p, "imageWidth") ? "width" : "height", text) ? JS_UNDEFINED : oom(ctx);
+        return doc_attr_set_ns(d, n, NULL, NULL, !strcmp(p, "imageWidth") ? "width" : "height", text) ? JS_UNDEFINED : oom(ctx);
     }
     if (!strcmp(p, "value") || !strcmp(p, "checked") || !strcmp(p, "selectedIndex") || !strcmp(p, "selected")) doc_control_init(d, n);
     if (!strcmp(p, "checked")) { int b = JS_ToBool(ctx, value); if (b < 0) return JS_EXCEPTION; doc_control_checked(d, n, b); doc_mutated(d, n); return JS_UNDEFINED; }
@@ -617,31 +719,38 @@ static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValue
         struct js_node_ref *r = node_ref(s, n);
         /* The IDL value reflects the attribute; it is not the force-async flag. */
         if (r) { r->force_async_set = true; r->force_async = false; }
-        return doc_node_attr(d, n, "async", b ? "" : NULL) ? JS_UNDEFINED : oom(ctx);
+        return doc_attr_set_ns(d, n, NULL, NULL, "async", b ? "" : NULL) ? JS_UNDEFINED : oom(ctx);
     }
-    if (!strcmp(p, "selectedIndex")) { int32_t i; if (JS_ToInt32(ctx, &i, value)) return JS_EXCEPTION; n->selected = option_at_js(n, i) ? i : -1; n->selected_set = true; doc_mutated(d, n); return JS_UNDEFINED; }
-    if (!strcmp(p, "selected")) {
+    if (!strcmp(p, "selectedIndex")) { int32_t i; if (JS_ToInt32(ctx, &i, value)) return JS_EXCEPTION; web_select_set_index(d, n, i); doc_mutated(d, n); return JS_UNDEFINED; }
+    if (!strcmp(p, "selected") || !strcmp(p, "optionFactorySelected")) {
+        if (n->type != N_ELEM || n->foreign || n->tag != T_option) return JS_ThrowTypeError(ctx, "HTMLOptionElement receiver required");
         int b = JS_ToBool(ctx, value); if (b < 0) return JS_EXCEPTION;
-        node_t *select = node_ancestor(n, T_select);
-        if (select) { doc_control_init(d, select); int index = 0; node_t *o; while ((o = option_at_js(select, index)) && o != n) index++; if (o == n) { if (b) select->selected = index; else if (select->selected == index) select->selected = -1; select->selected_set = true; } }
-        n->selected_set = true; n->selected = b;
-        if (!doc_node_attr(d, n, "selected", b ? "" : NULL)) return oom(ctx);
+        node_t *select = web_option_select(n);
+        web_option_set_selected(d, n, b, strcmp(p, "optionFactorySelected") != 0);
         doc_mutated(d, select ? select : n); return JS_UNDEFINED;
     }
     size_t len; const char *text = JS_ToCStringLen(ctx, &len, value);
     if (!text) return JS_EXCEPTION;
+    if (n->type == N_ATTR && strlen(text) != len) { JS_FreeCString(ctx, text); return JS_ThrowTypeError(ctx, "NUL in native attribute values is not implemented"); }
     bool ok = true;
-    if (!strcmp(p, "nodeValue")) { if (n->type == N_TEXT || n->type == N_COMMENT || n->type == N_PI) ok = doc_node_text(d, n, text, len); }
+    if (!strcmp(p, "attrValue") && n->type == N_ATTR) ok = doc_attr_value(d, n, text);
+    else if (!strcmp(p, "nodeValue")) { if (n->type == N_TEXT || n->type == N_COMMENT || n->type == N_PI || n->type == N_ATTR) ok = doc_node_text(d, n, text, len); }
     else if (!strcmp(p, "textContent")) { if (n->type != N_DOC) ok = doc_node_text(d, n, text, len); }
     else if (!strcmp(p, "innerHTML")) {
         if (n->type != N_ELEM && n->type != N_FRAGMENT) { JS_FreeCString(ctx, text); return JS_ThrowTypeError(ctx, "innerHTML requires an element"); }
         ok = doc_node_html(d, n, text, len);
     } else if (!strcmp(p, "value")) {
         if (n->tag == T_select) {
-            n->selected = -1; n->selected_set = true;
-            for (int i = 0;; i++) { node_t *option = option_at_js(n, i); if (!option) break; JSValue v = option_value(ctx, option); const char *p = JS_ToCString(ctx, v); bool matches = p && !strcmp(p, text); JS_FreeCString(ctx, p); JS_FreeValue(ctx, v); if (matches) { n->selected = i; break; } }
+            int found = -1, i = 0;
+            for (node_t *option = web_select_next_option(n, NULL); option; option = web_select_next_option(n, option), i++) {
+                JSValue v = option_value(ctx, option); const char *p = JS_ToCString(ctx, v);
+                if (!p) { JS_FreeValue(ctx, v); JS_FreeCString(ctx, text); return JS_EXCEPTION; }
+                bool matches = !strcmp(p, text); JS_FreeCString(ctx, p); JS_FreeValue(ctx, v);
+                if (matches) { found = i; break; }
+            }
+            web_select_set_index(d, n, found);
             doc_mutated(d, n);
-        } else if (n->tag == T_option) ok = doc_node_attr(d, n, "value", text);
+        } else if (n->tag == T_option) ok = doc_attr_set_ns(d, n, NULL, NULL, "value", text);
         else {
             bool control = n->tag == T_input || n->tag == T_textarea;
             char *before = control ? strdup(n->value ? n->value : "") : NULL;
@@ -712,7 +821,7 @@ static JSValue style_access(struct web_js_state *s, node_t *n, const char *prope
         sb_puts(&b, property); sb_putc(&b, ':'); sb_puts(&b, v);
         if (prio && *prio) sb_puts(&b, " !important"); sb_putc(&b, ';');
     }
-    bool ok = doc_node_attr(n->owner ? n->owner : s->doc, n, "style", sb_cstr(&b));
+    bool ok = doc_attr_set_ns(n->owner ? n->owner : s->doc, n, NULL, NULL, "style", sb_cstr(&b));
     JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b);
     return ok ? JS_UNDEFINED : oom(ctx);
 }
@@ -860,6 +969,73 @@ static JSValue custom_element_hook(struct web_js_state *s, const char *name, int
     JS_FreeValue(s->ctx, fn);
     return result;
 }
+static JSValue attribute_native_changed(struct web_js_state *s, node_t *n, const char *name, bool old_present) {
+    JSContext *ctx = s->ctx;
+    const char *value = node_attr(n, name);
+    if (n->tag == T_script && !n->foreign && !strcmp(name, "async") && value && !old_present) {
+        struct js_node_ref *r = node_ref(s, n);
+        if (r) { r->force_async_set = true; r->force_async = false; }
+    }
+    if (!strncmp(name, "on", 2) && (value || old_present)) {
+        JSValue args[] = {wrap(s, n), JS_NewString(ctx, name), str_or_null(ctx, value)};
+        JSValue notified = custom_element_hook(s, "eventHandlerAttribute", 3, args);
+        for (int i = 0; i < 3; i++) JS_FreeValue(ctx, args[i]);
+        if (JS_IsException(notified)) return notified;
+        JS_FreeValue(ctx, notified);
+    }
+    if (html_image(n) && (!strcmp(name, "src") || !strcmp(name, "srcset") || !strcmp(name, "sizes") ||
+        !strcmp(name, "data-src") || !strcmp(name, "data-lazy-src") || !strcmp(name, "data-original") || !strcmp(name, "data-srcset"))) n->image_invalidated = true;
+    if (n->tag == T_input && !strcmp(name, "src")) {
+        struct js_node_ref *r = node_ref(s, n); if (r) r->image_notified = false;
+    }
+    return JS_UNDEFINED;
+}
+static JSValue form_value_dom(struct web_js_state *s, node_t *n, int argc, JSValueConst *argv) {
+    JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
+    if (n->type != N_ELEM || n->foreign || n->tag != T_input || argc < 3)
+        return JS_ThrowTypeError(ctx, "HTMLInputElement receiver required");
+    const char *op = JS_ToCString(ctx, argv[2]); if (!op) return JS_EXCEPTION;
+    JSValue result;
+    if (!strcmp(op,"type")) result = JS_NewString(ctx,web_input_type_name(web_input_type(n)));
+    else if (!strcmp(op,"number")) result = JS_NewFloat64(ctx,web_input_value_number(d,n));
+    else if (!strcmp(op,"date")) result = JS_NewFloat64(ctx,web_input_value_date(d,n));
+    else if (!strcmp(op,"setNumber") || !strcmp(op,"setDate")) {
+        double value;
+        result = argc < 4 || JS_ToFloat64(ctx,&value,argv[3]) < 0 ? JS_EXCEPTION :
+            JS_NewInt32(ctx,web_input_set_number(d,n,value,!strcmp(op,"setDate")));
+    } else if (!strcmp(op,"stepUp") || !strcmp(op,"stepDown")) {
+        int32_t count;
+        result = argc < 4 || JS_ToInt32(ctx,&count,argv[3]) < 0 ? JS_EXCEPTION :
+            JS_NewInt32(ctx,web_input_step(d,n,count,!strcmp(op,"stepDown")));
+    } else result = JS_ThrowTypeError(ctx,"Unknown input value operation");
+    JS_FreeCString(ctx,op); return result;
+}
+static JSValue validation_dom(struct web_js_state *s, node_t *n, int argc, JSValueConst *argv) {
+    JSContext *ctx=s->ctx; web_doc *d=n->owner?n->owner:s->doc;
+    if (argc < 3) return JS_ThrowTypeError(ctx,"Validation operation required");
+    const char *op=JS_ToCString(ctx,argv[2]); if(!op) return JS_EXCEPTION;
+    bool form=n->type==N_ELEM && !n->foreign && n->tag==T_form;
+    bool form_op=!strcmp(op,"formCheck") || !strcmp(op,"formReport");
+    JSValue result=JS_UNDEFINED;
+    if (!strcmp(op,"submitButton")) result=JS_NewBool(ctx,web_control_submit_button(n));
+    else if (form_op) result=form?JS_NewBool(ctx,web_form_check_validity(d,n,!strcmp(op,"formReport"))):JS_ThrowTypeError(ctx,"HTMLFormElement receiver required");
+    else if (!strcmp(op,"submission")) result=JS_NewBool(ctx,web_form_submission_validate(d,n));
+    else if (!web_control_validation_interface(n)) result=JS_ThrowTypeError(ctx,"Constraint validation interface receiver required");
+    else if (!strcmp(op,"state")) result=JS_NewUint32(ctx,web_control_validity(d,n));
+    else if (!strcmp(op,"will")) result=JS_NewBool(ctx,web_control_will_validate(n));
+    else if (!strcmp(op,"message")) {
+        const char *message=web_control_validation_message(d,n);
+        size_t length=web_control_will_validate(n)&&n->custom_validity_length?n->custom_validity_length:strlen(message);
+        result=JS_NewStringLen(ctx,message,length);
+    }
+    else if (!strcmp(op,"check") || !strcmp(op,"report")) result=JS_NewBool(ctx,web_control_check_validity(d,n,!strcmp(op,"report")));
+    else if (!strcmp(op,"custom")) {
+        size_t length=0; const char *text=argc>3?JS_ToCStringLen(ctx,&length,argv[3]):NULL;
+        if(!text) result=JS_EXCEPTION;
+        else { if(!web_control_set_custom_validity(d,n,text,length)) result=oom(ctx); JS_FreeCString(ctx,text); }
+    } else result=JS_ThrowTypeError(ctx,"Unknown validation operation");
+    JS_FreeCString(ctx,op); return result;
+}
 static JSValue control_selection_dom(struct web_js_state *s, node_t *n, int argc, JSValueConst *argv) {
     JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
     if (argc < 4) return JS_ThrowTypeError(ctx, "Selection operation requires an interface and operation");
@@ -900,13 +1076,44 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     if (!n && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) { JS_FreeCString(ctx, op); return JS_EXCEPTION; }
     if (n && n->owner) d = n->owner;
     doc_dom_budget(d);
-    bool mutation = !strcmp(op, "insert") || !strcmp(op, "remove") || !strcmp(op, "adopt") || !strcmp(op, "clone") || !strcmp(op, "set") ||
-                    ((!strcmp(op, "attr") || !strcmp(op, "style")) && argc > 3);
+    bool mutation = !strcmp(op, "shadowAttach") || !strcmp(op, "slotAssign") || !strcmp(op, "insert") || !strcmp(op, "remove") || !strcmp(op, "adopt") || !strcmp(op, "clone") || !strcmp(op, "set") ||
+                    !strcmp(op, "attrSetNode") || !strcmp(op, "attrRemoveNode") ||
+                    ((!strcmp(op, "attr") || !strcmp(op, "style")) && argc > 3) || (!strcmp(op, "attrNS") && argc > 4);
     JSValue ce_token = mutation ? custom_element_hook(s, "customElementBefore", argc, argv) : JS_NULL;
     if (JS_IsException(ce_token)) { JS_FreeCString(ctx, op); return ce_token; }
     JSValue result = JS_UNDEFINED;
     const char *p = NULL;
-    if (!strcmp(op, "parseDocument")) {
+    node_t *attribute_target = NULL;
+    const char *attribute_name = NULL;
+    bool old_attribute_present = false;
+    char created_attribute_name[128];
+    if (mutation && n && n->type == N_ATTR && !strcmp(op, "set") && n->attr_owner && !n->attribute->namespace_uri) {
+        attribute_target = n->attr_owner; attribute_name = n->attribute->local ? n->attribute->local : n->attribute->raw;
+        old_attribute_present = true;
+    }
+    if (!strcmp(op, "adopt") && argc > 2) {
+        node_t *a = unwrap(ctx, argv[2]);
+        if (a && a->type == N_ATTR && a->attr_owner && !a->attribute->namespace_uri) {
+            attribute_target = a->attr_owner; attribute_name = a->attribute->local ? a->attribute->local : a->attribute->raw;
+            old_attribute_present = true;
+        }
+    }
+    if (!strcmp(op, "isNode")) {
+        result = JS_NewBool(ctx, argc > 2 && JS_GetOpaque(argv[2], node_class) != NULL);
+    } else if (!strcmp(op, "slotChanges")) {
+        web_doc *family = s->doc->dom_family ? s->doc->dom_family : s->doc;
+        result = JS_NewArray(ctx); uint32_t index = 0;
+        while (!JS_IsException(result) && family->shadow_slots_first) {
+            node_t *slot = family->shadow_slots_first;
+            JSValue object = wrap(s, slot);
+            if (JS_IsException(object) || JS_SetPropertyUint32(ctx, result, index++, object) < 0) {
+                JS_FreeValue(ctx, result); result = JS_EXCEPTION; break;
+            }
+            family->shadow_slots_first = slot->slot_change_next;
+            slot->slot_change_pending = false; slot->slot_change_next = NULL;
+        }
+        if (!family->shadow_slots_first) { family->shadow_slots_last = NULL; family->shadow_slots_pending = false; }
+    } else if (!strcmp(op, "parseDocument")) {
         size_t len; const char *html = argc > 2 ? JS_ToCStringLen(ctx, &len, argv[2]) : NULL;
         bool blank = argc > 3 && JS_ToBool(ctx, argv[3]) > 0;
         web_doc *made = html ? doc_inert(s->doc, html, len, blank ? "about:blank" : s->doc->url) : NULL;
@@ -939,16 +1146,123 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             JS_FreeCString(ctx, name); JS_FreeCString(ctx, text);
         }
     } else if (!strcmp(op, "viewport")) { int32_t axis = 0; if (argc > 2) JS_ToInt32(ctx, &axis, argv[2]); result = JS_NewInt32(ctx, axis ? d->height : d->width); }
-    else if (!strcmp(op, "focus")) {
+    else if (!strcmp(op, "focus") || !strcmp(op, "blur")) {
         node_t *old = d->focus;
-        if (!d->inert && old != n && (!n || !node_attr(n, "disabled"))) {
-            if (old) { struct web_event e = {.type="blur"}; web_js_dispatch(d, old, &e); e.type="focusout"; e.bubbles=true; web_js_dispatch(d, old, &e); }
-            web_focus(d, n);
-            if (n) { struct web_event e = {.type="focus"}; web_js_dispatch(d, n, &e); e.type="focusin"; e.bubbles=true; web_js_dispatch(d, n, &e); }
+        bool permitted = true;
+        if (!strcmp(op, "blur")) {
+            permitted = n && old == n;
+            if (n && n->shadow_root && n->shadow_root->shadow_delegates_focus) {
+                for (node_t *target = old; target; target = doc_shadow_parent(target))
+                    if (target == n->shadow_root) { permitted = true; break; }
+            }
+            n = NULL;
         }
+        if (permitted) web_js_focus_control(d,n);
         d->dirty = true;
     } else if (!n) result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");
+    else if (!strcmp(op, "root")) result = wrap(s, doc_node_root(n, argc > 2 && JS_ToBool(ctx, argv[2]) > 0));
+    else if (!strcmp(op, "shadowAttach")) {
+        if (argc < 7 || !doc_shadow_host_valid(n) || n->shadow_root) result = JS_ThrowTypeError(ctx, "Invalid shadow host");
+        else {
+            node_t *root = doc_shadow_attach(d, n, JS_ToBool(ctx, argv[2]) > 0, JS_ToBool(ctx, argv[3]) > 0,
+                JS_ToBool(ctx, argv[4]) > 0, JS_ToBool(ctx, argv[5]) > 0, JS_ToBool(ctx, argv[6]) > 0);
+            result = root ? wrap(s, root) : oom(ctx);
+        }
+    }
+    else if (!strcmp(op, "slotNodes")) {
+        if (n->type != N_ELEM || n->foreign || n->tag != T_slot) result = JS_ThrowTypeError(ctx, "HTMLSlotElement receiver required");
+        else {
+            pvec nodes = {0}; doc_slot_nodes(n, argc > 2 && JS_ToBool(ctx, argv[2]) > 0, &nodes);
+            result = JS_NewArray(ctx);
+            for (int i = 0; !JS_IsException(result) && i < nodes.n; i++) {
+                JSValue object = wrap(s, nodes.v[i]);
+                if (JS_IsException(object) || JS_SetPropertyUint32(ctx, result, i, object) < 0) { JS_FreeValue(ctx, result); result = JS_EXCEPTION; }
+            }
+            pv_free(&nodes);
+        }
+    }
+    else if (!strcmp(op, "slotAssign")) {
+        int count = argc - 2; node_t **nodes = count ? js_malloc(ctx, (size_t)count * sizeof *nodes) : NULL;
+        bool valid = n->type == N_ELEM && !n->foreign && n->tag == T_slot;
+        if (count && !nodes) result = JS_EXCEPTION;
+        else {
+            for (int i = 0; i < count; i++) {
+                nodes[i] = JS_GetOpaque(argv[i + 2], node_class);
+                if (!nodes[i] || (nodes[i]->type != N_ELEM && nodes[i]->type != N_TEXT)) valid = false;
+            }
+            result = !valid ? JS_ThrowTypeError(ctx, "Slot assignment requires Elements or Text") :
+                doc_slot_assign(n, nodes, count) ? JS_UNDEFINED : oom(ctx);
+        }
+        js_free(ctx, nodes);
+    }
+    else if (!strcmp(op, "attrCreate")) {
+        const char *ns = argc > 2 && !JS_IsNull(argv[2]) ? JS_ToCString(ctx, argv[2]) : NULL;
+        const char *prefix = argc > 3 && !JS_IsNull(argv[3]) ? JS_ToCString(ctx, argv[3]) : NULL;
+        const char *local = argc > 4 ? JS_ToCString(ctx, argv[4]) : NULL;
+        if (n->type != N_DOC) result = JS_ThrowTypeError(ctx, "Document receiver required");
+        else if (!local || (argc > 2 && !JS_IsNull(argv[2]) && !ns) || (argc > 3 && !JS_IsNull(argv[3]) && !prefix)) result = JS_EXCEPTION;
+        else { node_t *made = doc_attr_create(d, ns, prefix, local, ""); result = made ? wrap(s, made) : oom(ctx); }
+        JS_FreeCString(ctx, ns); JS_FreeCString(ctx, prefix); JS_FreeCString(ctx, local);
+    }
+    else if (!strcmp(op, "attrList")) {
+        if (n->type != N_ELEM) result = JS_ThrowTypeError(ctx, "Element receiver required");
+        else {
+            result = JS_NewArray(ctx);
+            for (int i = 0; !JS_IsException(result) && i < n->nattrs; i++) {
+                node_t *a = doc_attr_node(d, n, i);
+                if (!a || JS_SetPropertyUint32(ctx, result, (uint32_t)i, wrap(s, a)) < 0) {
+                    JS_FreeValue(ctx, result); result = a ? JS_EXCEPTION : oom(ctx); break;
+                }
+            }
+        }
+    }
+    else if (!strcmp(op, "attrNode") || !strcmp(op, "attrNodeNS") || !strcmp(op, "attrNS")) {
+        bool namespaced = strcmp(op, "attrNode") != 0;
+        const char *ns = namespaced && argc > 2 && !JS_IsNull(argv[2]) ? JS_ToCString(ctx, argv[2]) : NULL;
+        const char *name = argc > (namespaced ? 3 : 2) ? JS_ToCString(ctx, argv[namespaced ? 3 : 2]) : NULL;
+        if (n->type != N_ELEM) result = JS_ThrowTypeError(ctx, "Element receiver required");
+        else if (!name || (namespaced && argc > 2 && !JS_IsNull(argv[2]) && !ns)) result = JS_EXCEPTION;
+        else {
+            int i = doc_attr_index(n, ns, name, namespaced);
+            if (!strcmp(op, "attrNS") && argc > 4) {
+                if (!ns || !*ns) {
+                    attribute_target = n; old_attribute_present = i >= 0;
+                    if (i >= 0) attribute_name = n->attrs[i].local ? n->attrs[i].local : n->attrs[i].raw;
+                    else { snprintf(created_attribute_name, sizeof created_attribute_name, "%s", name); attribute_name = created_attribute_name; }
+                }
+                const char *value = JS_IsNull(argv[4]) ? NULL : JS_ToCString(ctx, argv[4]);
+                const char *prefix = argc > 5 && !JS_IsNull(argv[5]) ? JS_ToCString(ctx, argv[5]) : NULL;
+                result = (!JS_IsNull(argv[4]) && !value) || (argc > 5 && !JS_IsNull(argv[5]) && !prefix) ? JS_EXCEPTION :
+                    (value ? doc_attr_set_ns(d, n, ns, prefix, name, value) : doc_attr_remove(d, n, i)) ? JS_UNDEFINED : oom(ctx);
+                JS_FreeCString(ctx, value); JS_FreeCString(ctx, prefix);
+            } else if (!strcmp(op, "attrNS")) result = str_or_null(ctx, i >= 0 ? n->attrs[i].value : NULL);
+            else { node_t *a = i >= 0 ? doc_attr_node(d, n, i) : NULL; result = i >= 0 && !a ? oom(ctx) : wrap(s, a); }
+        }
+        JS_FreeCString(ctx, ns); JS_FreeCString(ctx, name);
+    }
+    else if (!strcmp(op, "attrSetNode") || !strcmp(op, "attrRemoveNode")) {
+        node_t *a = argc > 2 ? unwrap(ctx, argv[2]) : NULL;
+        if (!a || a->type != N_ATTR || n->type != N_ELEM) result = JS_ThrowTypeError(ctx, "Element and Attr required");
+        else if (!strcmp(op, "attrRemoveNode")) {
+            int i = a->attr_owner == n ? (int)(a->attribute - n->attrs) : -1;
+            if (i >= 0 && !a->attribute->namespace_uri) {
+                attribute_target = n; attribute_name = a->attribute->local ? a->attribute->local : a->attribute->raw; old_attribute_present = true;
+            }
+            result = i < 0 ? JS_ThrowTypeError(ctx, "Attribute is not owned by this element") :
+                doc_attr_remove(d, n, i) ? wrap(s, a) : oom(ctx);
+        } else {
+            struct attr *data = a->attribute;
+            int i = doc_attr_index(n, data->namespace_uri, data->local ? data->local : data->raw, true);
+            node_t *old = i >= 0 ? doc_attr_node(d, n, i) : NULL;
+            if (old != a && !data->namespace_uri) {
+                attribute_target = n; attribute_name = data->local ? data->local : data->raw; old_attribute_present = old != NULL;
+            }
+            result = i >= 0 && !old ? oom(ctx) : doc_attr_set_node(d, n, a) ? wrap(s, old) : oom(ctx);
+        }
+    }
     else if (!strcmp(op, "selection")) result = control_selection_dom(s, n, argc, argv);
+    else if (!strcmp(op, "formValue")) result = form_value_dom(s, n, argc, argv);
+    else if (!strcmp(op, "validation")) result = validation_dom(s, n, argc, argv);
     else if (!strcmp(op,"observerGeometry")) {
         node_t *root=argc>2 && !JS_IsNull(argv[2])?unwrap(ctx,argv[2]):NULL;
         result=argc>2 && !JS_IsNull(argv[2]) && !root?JS_EXCEPTION:observer_geometry(s,n,root);
@@ -959,7 +1273,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         if (!child || child->type == N_DOC || (n->type != N_ELEM && n->type != N_DOC && n->type != N_FRAGMENT)) result = JS_ThrowTypeError(ctx, "HierarchyRequestError");
         else if (before && before->parent != n) result = JS_ThrowTypeError(ctx, "NotFoundError");
         else {
-            bool cycle = false; for (node_t *a = n; a; a = a->parent ? a->parent : a->template_host) if (a == child) cycle = true;
+            bool cycle = false; for (node_t *a = n; a; a = a->parent ? a->parent : a->shadow_host ? a->shadow_host : a->template_host) if (a == child) cycle = true;
             result = cycle ? JS_ThrowTypeError(ctx, "HierarchyRequestError") : doc_node_move(d, n, child, before) ? JS_UNDEFINED : oom(ctx);
         }
     } else if (!strcmp(op, "remove")) doc_node_remove(d, n);
@@ -1020,30 +1334,23 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         if (n->type != N_ELEM) result = JS_ThrowTypeError(ctx, "Attributes require an element");
         else if (argc == 3) {
             const char *value = NULL;
-            for (int i = 0; i < n->nattrs; i++) if (n->foreign ? !strcmp(n->attrs[i].raw ? n->attrs[i].raw : n->attrs[i].name, p) : str_ieq(n->attrs[i].name, p)) { value = n->attrs[i].value; break; }
+            int index = doc_attr_index(n, NULL, p, false);
+            if (index >= 0) value = n->attrs[index].value;
             result = str_or_null(ctx, value);
         }
         else {
-            bool old_attribute = node_attr(n, p) != NULL;
+            int index = doc_attr_index(n, NULL, p, false);
+            if (index >= 0 && !n->attrs[index].namespace_uri) {
+                attribute_target = n; attribute_name = n->attrs[index].local ? n->attrs[index].local : n->attrs[index].raw;
+                old_attribute_present = true;
+            } else if (index < 0) {
+                snprintf(created_attribute_name, sizeof created_attribute_name, "%s", p);
+                if (!n->foreign) for (char *q = created_attribute_name; *q; q++) *q = (char)lower((unsigned char)*q);
+                attribute_target = n; attribute_name = created_attribute_name;
+            }
             const char *v = JS_IsNull(argv[3]) ? NULL : JS_ToCString(ctx, argv[3]);
             result = !JS_IsNull(argv[3]) && !v ? JS_EXCEPTION : doc_node_attr(d, n, p, v) ? JS_UNDEFINED : oom(ctx);
-            if (!JS_IsException(result) && n->tag == T_script && !n->foreign && !strcasecmp(p, "async") && v && !old_attribute) {
-                struct js_node_ref *r = node_ref(s, n);
-                if (r) { r->force_async_set = true; r->force_async = false; }
-            }
-            if (!JS_IsException(result) && !strncasecmp(p, "on", 2) && (v || old_attribute)) {
-                JSValue args[] = {argv[1], argv[2], v ? JS_NewString(ctx, v) : JS_NULL};
-                JSValue notified = custom_element_hook(s, "eventHandlerAttribute", 3, args);
-                JS_FreeValue(ctx, args[2]);
-                if (JS_IsException(notified)) result = notified; else JS_FreeValue(ctx, notified);
-            }
             JS_FreeCString(ctx, v);
-            if (!JS_IsException(result) && html_image(n) &&
-                (!strcasecmp(p, "src") || !strcasecmp(p, "srcset") || !strcasecmp(p, "sizes") || !strcasecmp(p, "data-src") ||
-                 !strcasecmp(p, "data-lazy-src") || !strcasecmp(p, "data-original") || !strcasecmp(p, "data-srcset"))) n->image_invalidated = true;
-            if (!JS_IsException(result) && n->tag == T_input && !strcasecmp(p, "src")) {
-                struct js_node_ref *r = node_ref(s, n); if (r) r->image_notified = false;
-            }
         }
     } else if (!strcmp(op, "id")) result = wrap(s, find_id(n, p));
     else if (!strcmp(op, "query")) {
@@ -1057,6 +1364,10 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     else if (!strcmp(op, "computed")) result = computed(s, n, p);
     else if (!strcmp(op, "geometry")) result = geometry(s, n, p);
     else result = JS_ThrowTypeError(ctx, "Unknown DOM operation");
+    if (!JS_IsException(result) && attribute_target && attribute_name) {
+        JSValue notified = attribute_native_changed(s, attribute_target, attribute_name, old_attribute_present);
+        if (JS_IsException(notified)) { JS_FreeValue(ctx, result); result = notified; } else JS_FreeValue(ctx, notified);
+    }
     if (!JS_IsException(result) && !JS_IsNull(ce_token)) {
         JSValue args[] = {ce_token, result};
         JSValue notified = custom_element_hook(s, "customElementAfter", 2, args);
@@ -1064,6 +1375,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         else JS_FreeValue(ctx, notified);
     }
     JS_FreeValue(ctx, ce_token);
+    if (!JS_IsException(result) && mutation) signal_slots(s);
     if (!JS_IsException(result) && n && !strcmp(op, "insert") && connected(s, n)) {
         dynamic_scripts(s, n);
         for (struct js_script *script = s->scripts; script; script = script->next)
@@ -1072,6 +1384,10 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     if (!JS_IsException(result) && n && n->tag == T_script && !n->script_started && connected(s, n) && (!strcmp(op, "attr") || !strcmp(op, "set"))) {
         struct js_script *script = queue_script(s, n, true);
         if (script && script->ready && !script->module && !node_attr(n, "src")) run_script(s, script);
+    }
+    if (!JS_IsException(result) && attribute_target && attribute_target->tag == T_script && !attribute_target->script_started && connected(s, attribute_target)) {
+        struct js_script *script = queue_script(s, attribute_target, true);
+        if (script && script->ready && !script->module && !node_attr(attribute_target, "src")) run_script(s, script);
     }
     JS_FreeCString(ctx, p); JS_FreeCString(ctx, op); return result;
 }
@@ -1346,11 +1662,13 @@ static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSV
         JSValue value = custom_element_hook(s, "inertClick", 2, args);
         JS_FreeValue(ctx, args[1]); return value;
     }
-    if (node_attr(n, "disabled")) return JS_UNDEFINED;
+    if (web_control_disabled(n)) return JS_UNDEFINED;
     struct web_event e = {.type="click", .bubbles=true, .cancelable=true};
     if (!web_js_dispatch(s->doc, n, &e)) return JS_UNDEFINED;
     if (s->doc->resources_dirty) doc_rescan(s->doc);
-    if (n->tag == T_a) {
+    node_t *disclosure=doc_details_activation(n);
+    if (disclosure) doc_details_toggle(s->doc,disclosure);
+    else if (n->tag == T_a) {
         const char *href = doc_link_href(s->doc, n);
         if (href && permitted_url(s, href, false) && s->host.navigate) s->host.navigate(s->host.opaque, href, NULL);
     } else if (n->tag == T_input) {
@@ -1359,13 +1677,15 @@ static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSV
             web_toggle(s->doc, n); e.type = "input"; e.cancelable = false; web_js_dispatch(s->doc, n, &e); e.type = "change"; web_js_dispatch(s->doc, n, &e); s->doc->dirty = true;
         } else if (type && (str_ieq(type, "submit") || str_ieq(type, "image"))) {
             node_t *form = web_form_owner(s->doc, n); e.type = "submit";
-            if (form && web_js_dispatch(s->doc, form, &e)) {
+            e.submitter=n;
+            if (form && web_form_submission_validate(s->doc,n) && web_js_dispatch(s->doc, form, &e)) {
                 char *url = NULL, *body = NULL; if (web_submit(s->doc, n, &url, &body)) { if (s->host.navigate) s->host.navigate(s->host.opaque, url, body); free(url); free(body); }
             }
-        }
+        } else if (type && str_ieq(type,"reset")) web_reset(s->doc,n);
     } else if (n->tag == T_button) {
         const char *type = node_attr(n, "type"); node_t *form = web_form_owner(s->doc, n);
-        if (form && (!type || str_ieq(type, "submit"))) { e.type = "submit"; if (web_js_dispatch(s->doc, form, &e)) { char *url = NULL, *body = NULL; if (web_submit(s->doc, n, &url, &body)) { if (s->host.navigate) s->host.navigate(s->host.opaque, url, body); free(url); free(body); } } }
+        if (type && str_ieq(type,"reset")) web_reset(s->doc,n);
+        else if (form && web_control_submit_button(n)) { e.type = "submit"; e.submitter=n; if (web_form_submission_validate(s->doc,n) && web_js_dispatch(s->doc, form, &e)) { char *url = NULL, *body = NULL; if (web_submit(s->doc, n, &url, &body)) { if (s->host.navigate) s->host.navigate(s->host.opaque, url, body); free(url); free(body); } } }
     }
     return JS_UNDEFINED;
 }
@@ -1453,7 +1773,8 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
                          const char *headers, const void *body, size_t len) {
     struct web_request r = {.id=p->id, .kind=kind, .url=p->url, .method=method, .headers=headers, .body=body, .body_len=len,
         .credentials=kind == WEB_RESOURCE_FETCH ? p->credentials : kind == WEB_RESOURCE_MODULE ? 1 : 2,
-        .force_preflight=p->force_preflight};
+        .force_preflight=p->force_preflight, .redirect_error=p->redirect_error, .same_origin=p->same_origin,
+        .cache_mode=p->cache_mode};
     bool ok = s->host.request && s->host.request(s->host.opaque, &r);
     if (!ok) pending_error(p, "The browser rejected the resource request");
     return ok;
@@ -1462,21 +1783,34 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     struct web_js_state *s = state(ctx);
     if (argc < 4) return JS_ThrowTypeError(ctx, "Invalid fetch request");
     const char *rel = JS_ToCString(ctx, argv[0]), *method = JS_ToCString(ctx, argv[1]), *headers = JS_ToCString(ctx, argv[2]);
-    size_t n; const char *body = JS_ToCStringLen(ctx, &n, argv[3]); char url[2048];
+    size_t n = 0; const char *body_string = NULL;
+    const void *body;
+    if (JS_IsString(argv[3])) body = body_string = JS_ToCStringLen(ctx, &n, argv[3]);
+    else body = JS_GetArrayBuffer(ctx, &n, argv[3]);
+    char url[2048];
     JSValue result = JS_EXCEPTION;
-    if (!rel || !method || !headers || !body) goto out;
+    if (!rel || !method || !headers || (!body && JS_HasException(ctx))) goto out;
     if (s->doc->resources_dirty) doc_sync_tree(s->doc);
     if (!url_resolve(s->doc->base, rel, url, sizeof url) || !permitted_url(s, url, true)) { result = JS_ThrowTypeError(ctx, "fetch supports HTTP(S) resources only"); goto out; }
-    if (strcmp(method, "GET") && strcmp(method, "POST")) { result = JS_ThrowTypeError(ctx, "Only GET and POST are supported"); goto out; }
+    if (!webnet_method_valid(method) || ((!strcmp(method, "GET") || !strcmp(method, "HEAD")) && n)) { result = JS_ThrowTypeError(ctx, "Invalid HTTP method or body"); goto out; }
     if (n > JS_BODY_LIMIT || strlen(headers) > 8192) { result = JS_ThrowRangeError(ctx, "Request exceeds the browser's size limit"); goto out; }
-    if (argc > 4 && JS_ToBool(ctx, argv[4]) > 0) { char a[256], b[256]; make_origin(s->doc->url, a, sizeof a); make_origin(url, b, sizeof b); if (strcmp(a, b)) { result = JS_ThrowTypeError(ctx, "Cross-origin fetch is forbidden by same-origin mode"); goto out; } }
+    bool same_origin = argc > 4 && JS_ToBool(ctx, argv[4]) > 0;
+    if (same_origin) { char a[256], b[256]; make_origin(s->doc->url, a, sizeof a); make_origin(url, b, sizeof b); if (strcmp(a, b)) { result = JS_ThrowTypeError(ctx, "Cross-origin fetch is forbidden by same-origin mode"); goto out; } }
+    int32_t credentials = 1, redirect = 0, cache_mode = WEBNET_CACHE_DEFAULT;
+    if ((argc > 5 && (JS_ToInt32(ctx, &credentials, argv[5]) || credentials < 0 || credentials > 2)) ||
+        (argc > 7 && (JS_ToInt32(ctx, &redirect, argv[7]) || redirect < 0 || redirect > 1)) ||
+        (argc > 8 && (JS_ToInt32(ctx, &cache_mode, argv[8]) || cache_mode < WEBNET_CACHE_DEFAULT || cache_mode > WEBNET_CACHE_ONLY_IF_CACHED))) {
+        result = JS_ThrowTypeError(ctx, "Invalid fetch policy"); goto out;
+    }
+    /* No HTTP response cache is present. Never turn a cache-only miss into I/O,
+       even if a caller bypasses the bootstrap's early rejection. */
+    if (cache_mode == WEBNET_CACHE_ONLY_IF_CACHED) { result = JS_ThrowTypeError(ctx, "No cached response is available"); goto out; }
     struct js_pending *p = pending_new(s, P_FETCH, url);
     if (!p) { result = oom(ctx); goto out; }
-    int32_t credentials = 1;
-    if (argc > 5 && (JS_ToInt32(ctx, &credentials, argv[5]) || credentials < 0 || credentials > 2)) {
-        pending_error(p, "Invalid credentials mode"); result = JS_ThrowTypeError(ctx, "Invalid credentials mode"); goto out;
-    }
     p->credentials = credentials;
+    p->cache_mode = cache_mode;
+    p->same_origin = same_origin;
+    p->redirect_error = redirect == 1;
     p->force_preflight = argc > 6 && JS_ToBool(ctx, argv[6]) > 0;
     JSValue funcs[2]; JSValue promise = JS_NewPromiseCapability(ctx, funcs);
     if (JS_IsException(promise)) { pending_error(p, "Out of memory"); goto out; }
@@ -1487,7 +1821,7 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     JS_SetPropertyStr(ctx, result, "promise", promise);
     send_request(s, p, WEB_RESOURCE_FETCH, method, headers, body, n);
 out:
-    JS_FreeCString(ctx, rel); JS_FreeCString(ctx, method); JS_FreeCString(ctx, headers); JS_FreeCString(ctx, body); return result;
+    JS_FreeCString(ctx, rel); JS_FreeCString(ctx, method); JS_FreeCString(ctx, headers); JS_FreeCString(ctx, body_string); return result;
 }
 static JSValue native_cancel(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     int64_t id; if (!argc || JS_ToInt64(ctx, &id, argv[0])) return JS_EXCEPTION;
@@ -1643,13 +1977,15 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
         if (s->running) s->task_deadline += waited;
         if (s->compiling) s->compile_wait_ms += waited;
         bool local = !strncasecmp(url, "file://", 7);
-        if (!ok || r.error[0] || r.status < 200 || r.status >= 300 || r.body_len > JS_BODY_LIMIT || (!local && !javascript_mime(r.headers)) || (r.url[0] && !permitted_url(s, r.url, false))) {
-            JS_ThrowReferenceError(ctx, "Cannot load JavaScript module %s: %s", url, r.error[0] ? r.error : "invalid response or JavaScript MIME type"); free(r.body); return NULL;
+        if (!ok || r.error[0] || r.status < 200 || r.status >= 300 || r.body_len > JS_BODY_LIMIT ||
+            strlen(web_response_headers(&r)) >= WEB_RESPONSE_HEADERS_MAX ||
+            (!local && !javascript_mime(web_response_headers(&r))) || (r.url[0] && !permitted_url(s, r.url, false))) {
+            JS_ThrowReferenceError(ctx, "Cannot load JavaScript module %s: %s", url, r.error[0] ? r.error : "invalid response or JavaScript MIME type"); web_response_free(&r); return NULL;
         }
         char *final = r.url[0] ? module_url(s, "moduleURL", r.url, url) : js_strdup(ctx, url);
         m = final ? cache_module(s, url, r.body, r.body_len, final) : NULL;
         js_free(ctx, final);
-        free(r.body); if (!m) return NULL;
+        web_response_free(&r); if (!m) return NULL;
     }
     if (!JS_IsUndefined(m->error)) { JS_Throw(ctx, JS_DupValue(ctx, m->error)); return NULL; }
     if (JS_IsUndefined(m->compiled)) {
@@ -1758,6 +2094,7 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
     return script;
 }
 static void dynamic_scripts_walk(struct web_js_state *s, node_t *n) {
+    if (n->shadow_root) dynamic_scripts_walk(s, n->shadow_root);
     for (node_t *c = n->first; c; c = c->next) {
         s->doc->profile.script_visits++;
         if (c->type != N_ELEM || c->tag == T_template) continue;
@@ -1830,13 +2167,26 @@ static void run_script(struct web_js_state *s, struct js_script *script) {
 }
 static void pending_free(struct web_js_state *s, struct js_pending *p) {
     JS_FreeValue(s->ctx, p->resolve); JS_FreeValue(s->ctx, p->reject);
-    js_free(s->ctx, p->url); js_free(s->ctx, p->response.body); js_free(s->ctx, p); s->pending_count--;
+    js_free(s->ctx, p->url); js_free(s->ctx, p->response.body); js_free(s->ctx, p->response.headers_full);
+    js_free(s->ctx, p); s->pending_count--;
 }
 void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *response) {
     struct web_js_state *s = d ? d->js : NULL;
     if (!s || !response) return;
     for (struct js_pending *p = s->pending; p; p = p->next) if (p->id == id && !p->done) {
-        p->response = *response; p->response.body = NULL;
+        p->response = *response; p->response.body = NULL; p->response.headers_full = NULL;
+        const char *headers = web_response_headers(response);
+        size_t hn = strlen(headers);
+        if (hn >= WEB_RESPONSE_HEADERS_MAX) { pending_error(p, "Resource response headers exceed the native limit"); return; }
+        if (hn < sizeof p->response.headers) memcpy(p->response.headers, headers, hn + 1);
+        else {
+            p->response.headers[0] = 0;
+            p->response.headers_full = js_strndup(s->ctx, headers, hn);
+            if (!p->response.headers_full) {
+                JSValue e = JS_GetException(s->ctx); JS_FreeValue(s->ctx, e);
+                pending_error(p, "Resource headers exceeded the JavaScript heap limit"); return;
+            }
+        }
         if (response->body_len > JS_BODY_LIMIT || (response->body_len && !response->body)) pending_error(p, "Resource exceeds the 16 MiB limit or has an invalid body");
         else {
             p->response.body = js_malloc(s->ctx, response->body_len + 1);
@@ -1861,7 +2211,7 @@ static bool process_pending(struct web_js_state *s) {
             struct js_script *script = p->script;
             if (script) {
                 bool local = !strncasecmp(p->url, "file://", 7);
-                if (script->module && !local && !javascript_mime(p->response.headers)) ok = false;
+                if (script->module && !local && !javascript_mime(web_response_headers(&p->response))) ok = false;
                 script->ready = true; script->failed = !ok;
                 if (ok) {
                     script->source = p->response.body; p->response.body = NULL; script->len = p->response.body_len;
@@ -1879,7 +2229,7 @@ static bool process_pending(struct web_js_state *s) {
                 } else {
                     char message[2304];
                     snprintf(message,sizeof message,"Script failed: HTTP %d, %s: %s",p->response.status,
-                        p->response.error[0]?p->response.error:script->module && !javascript_mime(p->response.headers)?"invalid module MIME type":"unsuccessful response",p->url);
+                        p->response.error[0]?p->response.error:script->module && !javascript_mime(web_response_headers(&p->response))?"invalid module MIME type":"unsuccessful response",p->url);
                     log_text(s,2,message);
                 }
                 prepare_module_script(s, script);
@@ -1895,7 +2245,7 @@ static bool process_pending(struct web_js_state *s) {
             bool success = !p->response.error[0];
             if (success) {
                 JSValue bytes = JS_NewArrayBufferCopy(s->ctx, (const uint8_t *)(p->response.body ? p->response.body : ""), p->response.body_len);
-                JSValue args[] = {JS_NewInt32(s->ctx, p->response.status), JS_NewString(s->ctx, p->response.url[0] ? p->response.url : p->url), JS_NewString(s->ctx, p->response.headers), JS_NewStringLen(s->ctx, p->response.body ? p->response.body : "", p->response.body_len), bytes, JS_NewBool(s->ctx, p->response.url[0] && strcmp(p->url, p->response.url))};
+                JSValue args[] = {JS_NewInt32(s->ctx, p->response.status), JS_NewString(s->ctx, p->response.url[0] ? p->response.url : p->url), JS_NewString(s->ctx, web_response_headers(&p->response)), JS_NewStringLen(s->ctx, p->response.body ? p->response.body : "", p->response.body_len), bytes, JS_NewBool(s->ctx, p->response.url[0] && strcmp(p->url, p->response.url))};
                 value = JS_Call(s->ctx, s->response, JS_UNDEFINED, 6, args);
                 for (int i = 0; i < 6; ++i) JS_FreeValue(s->ctx, args[i]);
                 if (JS_IsException(value)) { exception(s); success = false; value = JS_NewString(s->ctx, "Could not construct fetch response"); }
@@ -2107,6 +2457,9 @@ static JSValue event_init(struct web_js_state *s, const struct web_event *event)
     SET_I("button", event->button); SET_I("buttons", event->buttons);
     SET_I("keyCode", event->key_code); SET_I("which", event->key_code);
     SET("relatedTarget", wrap(s, event->related_target));
+    /* web_hover supplies pointer state only; its individual event types are
+       generated by the hover hook after this shared dictionary is created. */
+    if (event->type && !strcmp(event->type,"submit")) SET("submitter", wrap(s, event->submitter));
     SET("key", JS_NewString(s->ctx, event->key ? event->key : ""));
 #undef SET_B
 #undef SET_I
@@ -2114,6 +2467,21 @@ static JSValue event_init(struct web_js_state *s, const struct web_event *event)
     return init;
 failed:
     JS_FreeValue(s->ctx, init); return JS_EXCEPTION;
+}
+void web_js_focus_control(web_doc *d, node_t *n) {
+    if (!d || d->inert || (n && web_control_disabled(n))) return;
+    node_t *old=d->focus;
+    web_focus(d,n);
+    node_t *actual=d->focus;
+    if(old==actual)return;
+    if(old) {
+        struct web_event e={.type="blur",.related_target=actual};
+        web_js_dispatch(d,old,&e); e.type="focusout"; e.bubbles=true; web_js_dispatch(d,old,&e);
+    }
+    if(actual && d->focus==actual) {
+        struct web_event e={.type="focus",.related_target=old}; web_js_dispatch(d,actual,&e);
+        if(d->focus==actual) {e.type="focusin";e.bubbles=true;web_js_dispatch(d,actual,&e);}
+    }
 }
 bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *event) {
     struct web_js_state *s = d ? d->js : NULL;
@@ -2138,7 +2506,7 @@ void web_hover(web_doc *d, web_node *target, const struct web_event *event) {
     JSValue path = JS_NewArray(s->ctx), init = JS_UNDEFINED, fn = JS_UNDEFINED, next = JS_UNDEFINED;
     if (JS_IsException(path)) goto failed;
     uint32_t index = 0;
-    for (node_t *n = target; n; n = n->parent) {
+    for (node_t *n = target; n; n = n->assigned_slot ? n->assigned_slot : doc_shadow_parent(n)) {
         JSValue value = wrap(s, n);
         if (JS_IsException(value)) goto failed;
         if (JS_DefinePropertyValueUint32(s->ctx, path, index++, value, JS_PROP_C_W_E) < 0) goto failed;
@@ -2224,6 +2592,17 @@ static bool run_document_event(struct web_js_state *s) {
     }
     return false;
 }
+static bool run_details_toggle(struct web_js_state *s) {
+    bool old_open,new_open;
+    node_t *node=doc_details_take_toggle(s->doc,&old_open,&new_open);
+    if(!node)return false;
+    begin_task(s);
+    JSValue args[]={wrap(s,node),JS_NewBool(s->ctx,old_open),JS_NewBool(s->ctx,new_open)};
+    JSValue result=JS_IsException(args[0])?JS_EXCEPTION:custom_element_hook(s,"detailsToggle",3,args);
+    if(JS_IsException(result))exception(s);else JS_FreeValue(s->ctx,result);
+    for(int i=0;i<3;i++)JS_FreeValue(s->ctx,args[i]);
+    end_task(s);return true;
+}
 void web_js_tick(web_doc *d, uint64_t now) {
     struct web_js_state *s = d ? d->js : NULL;
     if (!s || s->running) return;
@@ -2261,6 +2640,12 @@ void web_js_tick(web_doc *d, uint64_t now) {
         }
     }
     if (s->parsing_done && !s->disabled) dynamic_scripts(s, d->root);
+    web_doc *family = d->dom_family ? d->dom_family : d;
+    if (!s->disabled && !ran && family->shadow_slots_pending) {
+        /* Native/parser assignment changes also queue the mutation checkpoint,
+           even when there is no timer or script task to drive it. */
+        begin_task(s); end_task(s); ran = true;
+    }
     image_events(s);
     /* Completion notification is queued before lifecycle/task selection. A
        perpetually active task source cannot starve a module's load/error, and
@@ -2285,6 +2670,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
         else if (dispatch_image_decode(s)) ran = true;
         else if (ready_script(s, &script)) { run_script(s, script); ran = true; }
         else if (run_document_event(s)) ran = true;
+        else if (run_details_toggle(s)) ran = true;
         else if (run_observers(s, now)) ran = true;
         else if (s->posted_turn && run_posted_task(s)) { s->posted_turn = false; ran = true; }
         else if (run_timer(s, now)) { s->posted_turn = true; ran = true; }
@@ -2304,6 +2690,8 @@ int64_t web_js_deadline(web_doc *d) {
         if (p->deadline < deadline) deadline = p->deadline;
     }
     if (!s->disabled) {
+        if ((d->dom_family ? d->dom_family : d)->shadow_slots_pending) return (int64_t)now;
+        if ((d->dom_family ? d->dom_family : d)->details_toggle_first) return (int64_t)now;
         if (s->media_width != d->width || s->media_height != d->height) return (int64_t)now;
         if (s->events || s->posted) return (int64_t)now;
         for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) return (int64_t)now;
@@ -2400,6 +2788,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     };
     JS_SetPropertyFunctionList(s->ctx, api, functions, sizeof functions / sizeof *functions);
     web_js_crypto_init(s->ctx, api);
+    web_js_collator_init(s->ctx, api);
     JS_SetPropertyStr(s->ctx, api, "document", wrap(s, d->root));
     JSValue global = JS_GetGlobalObject(s->ctx);
     JS_SetPropertyStr(s->ctx, global, "__nocturne_host", api); JS_FreeValue(s->ctx, global);

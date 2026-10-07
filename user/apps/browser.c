@@ -39,9 +39,11 @@ static bool navigation_ready, sync_stopped;
 struct transfer {
     struct transfer *next;
     uint64_t network_id, resource_id, generation;
+    int kind;
 };
 static struct transfer *transfers;
 static struct web_response navigation_response;
+_Static_assert(WEB_RESPONSE_HEADERS_MAX >= WEBNET_RESPONSE_HEADERS_MAX, "Browser must retain complete native response headers");
 
 #define CONSOLE_LINES 128
 #define CONSOLE_LINE 768
@@ -532,6 +534,18 @@ static void flush_dom_layout(void) {
         set_title();
         need_paint = true;
     }
+    web_node *invalid=NULL; const char *message=NULL; size_t length=0;
+    if (web_take_validation_report(doc,&invalid,&message,&length)) {
+        focus=F_PAGE;
+        free(focus_value); focus_value=strdup(web_control_value(invalid));
+        char visible[sizeof status]; size_t n=MIN(length,sizeof visible-1);
+        for(size_t i=0;i<n;i++) visible[i]=message[i]?message[i]:' ';
+        visible[n]=0; hover[0]=0; set_status(visible);
+        int x,y,width,height;
+        if(web_node_rect(doc,invalid,&x,&y,&width,&height) &&
+           (y<scroll_y || y+height>scroll_y+page_h())) scroll_to(MAX(y-16,0));
+        need_paint=true;
+    }
 }
 
 /* Module loading can suspend an executing JS task after a DOM mutation has
@@ -605,8 +619,22 @@ static void response_copy(struct web_response *out, const struct webnet_response
     memset(out, 0, sizeof *out);
     out->status = in->status;
     strlcpy(out->url, in->final_url ? in->final_url : "", sizeof out->url);
-    strlcpy(out->headers, in->headers ? in->headers : "", sizeof out->headers);
     strlcpy(out->error, in->error ? in->error : "", sizeof out->error);
+    const char *headers = in->headers ? in->headers : "";
+    size_t hn = strlen(headers);
+    if (hn >= WEB_RESPONSE_HEADERS_MAX) {
+        strlcpy(out->error, "response header block exceeds browser limit", sizeof out->error);
+        return;
+    }
+    if (hn < sizeof out->headers) memcpy(out->headers, headers, hn + 1);
+    else {
+        out->headers_full = malloc(hn + 1);
+        if (!out->headers_full) {
+            strlcpy(out->error, "out of memory copying response headers", sizeof out->error);
+            return;
+        }
+        memcpy(out->headers_full, headers, hn + 1);
+    }
     if (in->body_len > WEBNET_BODY_LIMIT) {
         strlcpy(out->error, "response exceeds the 16 MiB limit", sizeof out->error);
         return;
@@ -633,10 +661,14 @@ static void resource_completed(webnet *net, uint64_t id, uint64_t gen,
     (void)net; (void)id;
     struct transfer *t = opaque;
     if (doc && gen == generation && t->generation == generation) {
+        if (debug_js && t->kind == WEB_RESOURCE_CSS)
+            printf("[web-net:css] status=%d bytes=%lu error=%s url=%s\n", result->status,
+                   (unsigned long)result->body_len, result->error ? result->error : "",
+                   result->final_url ? result->final_url : "");
         struct web_response r;
         response_copy(&r, result);
         web_resource_loaded(doc, t->resource_id, &r);
-        free(r.body);
+        web_response_free(&r);
     }
     remove_transfer(t);
 }
@@ -648,11 +680,14 @@ static bool host_request(void *opaque, const struct web_request *request) {
     if (!t) return false;
     t->resource_id = request->id;
     t->generation = generation;
+    t->kind = request->kind;
     struct webnet_request r = {
         .kind = network_kind(request->kind), .generation = generation,
         .url = request->url, .origin = web_url(doc), .method = request->method,
         .headers = request->headers, .body = request->body, .body_len = request->body_len,
-        .credentials = request->credentials, .force_preflight = request->force_preflight
+        .credentials = request->credentials, .force_preflight = request->force_preflight,
+        .redirect_error = request->redirect_error, .same_origin = request->same_origin,
+        .cache_mode = request->cache_mode
     };
     t->network_id = webnet_submit(network, &r, resource_completed, t);
     if (!t->network_id) { free(t); return false; }
@@ -833,7 +868,7 @@ static void navigation_completed(webnet *net, uint64_t id, uint64_t gen,
     (void)net; (void)opaque;
     if (id != navigation_id || gen != navigation_generation) return;
     navigation_id = 0;
-    free(navigation_response.body);
+    web_response_free(&navigation_response);
     response_copy(&navigation_response, result);
     navigation_ready = true;
 }
@@ -842,7 +877,7 @@ static void stop_navigation(void) {
     if (navigation_id) webnet_cancel(network, navigation_id);
     navigation_id = 0;
     navigation_ready = false;
-    free(navigation_response.body);
+    web_response_free(&navigation_response);
     memset(&navigation_response, 0, sizeof navigation_response);
     loading = false;
 }
@@ -855,7 +890,8 @@ static void finish_navigation(void) {
     char ctype[128] = "", charset_buf[64];
     const char *charset = NULL, *image = NULL;
     struct http_resp headers = {0};
-    strlcpy(headers.headers, f.headers, sizeof headers.headers);
+    /* Borrow the complete block solely for lookup; do not free this view. */
+    headers.headers_full = (char *)web_response_headers(&f);
     http_header(&headers, "Content-Type", ctype, sizeof ctype);
     char *html = NULL;
     size_t hlen = 0;
@@ -881,12 +917,12 @@ static void finish_navigation(void) {
             html = error_page(f.url, message);
         }
     }
-    if (!html) { free(f.body); loading = false; set_status("Out of memory loading page"); return; }
+    if (!html) { web_response_free(&f); loading = false; set_status("Out of memory loading page"); return; }
     if (!hlen) hlen = strlen(html);
     const char *final_url = f.url[0] ? f.url : navigation_url;
     web_doc *nd = web_live(html, hlen, final_url, charset, &browser_host);
     free(html);
-    if (!nd) { free(f.body); loading = false; set_status("Out of memory creating document"); return; }
+    if (!nd) { web_response_free(&f); loading = false; set_status("Out of memory creating document"); return; }
 
     cancel_document_requests();
     if (doc) web_free(doc);
@@ -920,7 +956,7 @@ static void finish_navigation(void) {
             if (!strcmp(web_image_url(doc, i), image)) web_image_loaded(doc, i, f.body, f.body_len);
         relayout();
     }
-    free(f.body);
+    web_response_free(&f);
     int ay = anchor(cur_url);
     scroll_to(navigation_mode != NAV_PUSH ? keep : ay >= 0 ? ay : 0);
     loading = false;
@@ -1041,7 +1077,10 @@ static void apply_pending_history(void) {
 
 static void submit(web_node *n) {
     web_node *form = web_form_owner(doc, n);
+    if(!form || !web_form_submission_validate(doc,n)) {flush_dom_layout();return;}
     struct web_event event = {.type = "submit", .bubbles = true, .cancelable = true};
+    struct web_hit action={0};
+    if(web_node_action(doc,n,&action) && action.kind==WEB_HIT_SUBMIT)event.submitter=n;
     bool allowed = form && web_dispatch(doc, form, &event);
     flush_dom_layout();
     if (!allowed) return;
@@ -1053,6 +1092,7 @@ static void submit(web_node *n) {
 }
 
 /* ---------------------------------------------------------------- input */
+static void page_click(web_node *target, int x, int y, bool keyboard);
 static const char *event_key(uint32_t key, char text[8]) {
     switch (key) {
     case NKEY_ENTER: return "Enter";
@@ -1126,6 +1166,8 @@ static bool dispatch_native(const char *type, web_node *target, const struct gui
 static void page_focus(web_node *node) {
     if (!doc) return;
     web_node *old = web_focused(doc);
+    web_focus(doc,node);
+    node=web_focused(doc);
     if (old == node) return;
     if (old) {
         const char *value = web_control_value(old);
@@ -1135,7 +1177,7 @@ static void page_focus(web_node *node) {
         flush_dom_layout();
         dispatch_native("focusout", old, NULL, false);
     }
-    web_focus(doc, node);
+    if (web_focused(doc)!=node) return; /* a blur/focusout listener chose another control */
     free(focus_value);
     const char *value = node ? web_control_value(node) : NULL;
     focus_value = value ? strdup(value) : NULL;
@@ -1326,6 +1368,13 @@ static void key(const struct gui_event *e) {
     if (!dispatch_native("keydown", target, e, true)) return;
     if ((e->key >= 32 && !(e->key >= 0x100 && e->key < 0x200)) || e->key == NKEY_ENTER)
         if (!dispatch_native("keypress", target, e, true)) return;
+    if(target && (k==NKEY_ENTER || k==' ') && !ctrl && !alt) {
+        struct web_hit action={0};
+        if(web_node_action(doc,target,&action) &&
+           (action.kind==WEB_HIT_DETAILS || action.kind==WEB_HIT_BUTTON || action.kind==WEB_HIT_SUBMIT ||
+            action.kind==WEB_HIT_CHECKBOX || action.kind==WEB_HIT_RADIO ||
+            (k==NKEY_ENTER && action.kind==WEB_HIT_LINK))) {page_click(target,0,0,true);return;}
+    }
     if (doc && web_focused(doc)) {
         if (k == NKEY_ESC) {
             page_focus(NULL);
@@ -1351,13 +1400,18 @@ static void key(const struct gui_event *e) {
     scroll_key(e);
 }
 
-static void page_click(web_node *target, int x, int y) {
+static void page_click(web_node *target, int x, int y, bool keyboard) {
     focus = F_PAGE;
     if (!doc) return;
+    if(web_control_disabled(target))return;
     struct gui_event native = {.x = x, .y = y, .buttons = 1};
     if (!dispatch_native("click", target, &native, true)) return;
     struct web_hit hit = {0};
     if (!web_node_action(doc, target, &hit)) return;
+    if (!keyboard && hit.kind==WEB_HIT_DETAILS) {
+        struct web_hit pointer={0};
+        if (!web_hit_test(doc,x,y-TB+scroll_y,&pointer) || pointer.kind!=WEB_HIT_DETAILS || pointer.node!=hit.node) return;
+    }
     switch (hit.kind) {
     case WEB_HIT_LINK:
         if (hit.href) {
@@ -1376,12 +1430,15 @@ static void page_click(web_node *target, int x, int y) {
     case WEB_HIT_TEXTAREA: page_focus(hit.node); break;
     case WEB_HIT_CHECKBOX:
     case WEB_HIT_RADIO:
-        page_focus(NULL);
+        if (!keyboard) page_focus(NULL);
         web_toggle(doc, hit.node);
         dispatch_native("input", hit.node, &native, false);
         dispatch_native("change", hit.node, &native, false);
         break;
     case WEB_HIT_SUBMIT: submit(hit.node); return;
+    case WEB_HIT_BUTTON: web_reset(doc,hit.node); flush_dom_layout(); break;
+    case WEB_HIT_DETAILS:
+        page_focus(web_disclosure_focus(hit.node)); web_toggle(doc,hit.node); flush_dom_layout(); break;
     case WEB_HIT_SELECT:
         page_focus(NULL);
         open_select(hit.node);
@@ -1520,7 +1577,7 @@ static void handle(const struct gui_event *e) {
         if (doc && e->y >= TB && e->y < TB + page_h() && e->x < page_w()) {
             web_node *target = web_node_at(doc, e->x, e->y - TB + scroll_y);
             dispatch_native("mouseup", target, e, false);
-            if (pressed_node && target == pressed_node) page_click(target, e->x, e->y);
+            if (pressed_node && target == pressed_node) page_click(target, e->x, e->y,false);
         }
         pressed_node = NULL;
         break;
@@ -1606,6 +1663,7 @@ static void document_step(uint64_t now) {
         set_title();
         redraw();
     } else if (need_paint || (console_dirty && console_open)) redraw();
+    flush_dom_layout();
     if (!refresh_seen && !loading) {
         int delay;
         const char *url = web_refresh_url(doc, &delay);

@@ -34,7 +34,7 @@ globalThis.runLexborCases = function () {
         try { actual = snapshot(); } catch (e) { actual = {snapshotError: String(e)}; }
         const category = diagnostic === 'unsupported-api' ? 'unsupported-api' : diagnostic ? 'legacy' : 'current';
         console.log('Lexbor ' + category + ' ' + name + ' ' +
-            (passed ? 'PASS' : 'FAIL') + ' input=' + JSON.stringify(html) +
+            (passed ? 'PASS' : diagnostic ? 'MISMATCH' : 'FAIL') + ' input=' + JSON.stringify(html) +
             ' actual=' + JSON.stringify(actual) + (error ? ' error=' + error : ''));
         if (category === 'unsupported-api') {
             unsupportedAPITotal++;
@@ -94,16 +94,12 @@ globalThis.runLexborCases = function () {
     probe('style-comment-double-end', '<style><!--</style>--></style>', n => n && n.firstChild && n.firstChild.nodeValue === '<!--');
     probe('style-comment-single-end', '<style><!--</style>-->', n => n && n.firstChild && n.firstChild.nodeValue === '<!--');
 
-    /* The original conditions require Element.attributes / NamedNodeMap,
-       which is not implemented. Preserve their failures as independent API
-       diagnostics, not tokenizer assertions or a claim of site compatibility. */
-    console.log('Lexbor unsupported-api reason=Element.attributes/NamedNodeMap is not implemented; ' +
-        'original HTML5test attributes[0] conditions are diagnostic only, excluded from tokenizer assertions; ' +
-        'this does not establish real-site compatibility.');
+    /* These original HTML5test probes now exercise real native Attr wrappers.
+       Passing them does not establish real-site compatibility. */
     probe('html5test-attributes-index-less-than', "<div foo<bar=''>", n => n && n.attributes && n.attributes[0] &&
-        (n.attributes[0].nodeName === 'foo<bar' || n.attributes[0].name === 'foo<bar'), 'unsupported-api');
+        (n.attributes[0].nodeName === 'foo<bar' || n.attributes[0].name === 'foo<bar'));
     probe('html5test-attributes-index-quote-in-name', "<div \"foo=''>", n => n && n.attributes && n.attributes[0] &&
-        (n.attributes[0].nodeName === '"foo' || n.attributes[0].name === '"foo'), 'unsupported-api');
+        (n.attributes[0].nodeName === '"foo' || n.attributes[0].name === '"foo'));
 
     /* Preserve the old site's expectation as evidence, not as a requirement
        that would regress Lexbor's current-spec tokenizer into a bogus comment. */

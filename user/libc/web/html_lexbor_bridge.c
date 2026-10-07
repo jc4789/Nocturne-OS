@@ -3,6 +3,7 @@
    than relying on mutation callbacks: foster parenting/adoption/text merging
    in Lexbor deliberately bypass some of those callbacks. */
 #include "html_lexbor.h"
+#include "elements.h"
 #include <lexbor/dom/interfaces/character_data.h>
 #include <lexbor/dom/interfaces/document_type.h>
 #include <lexbor/dom/interfaces/document_fragment.h>
@@ -134,6 +135,39 @@ static struct binding *import_node(struct html_parser *p, lxb_dom_node_t *lex, w
     return n ? bind_node(p, lex, n) : NULL;
 }
 
+/* Lexbor's HTML namespace/attribute helpers case-fold arbitrary namespace URIs
+   and local names. The bridge uses its raw hashes for DOM-created metadata. */
+LXB_API lxb_dom_attr_data_t *lxb_dom_attr_qualified_name_append(lexbor_hash_t *, const lxb_char_t *, size_t);
+static bool lex_attr_context_namespace(lxb_ns_id_t ns) {
+    return ns == LXB_NS_HTML || ns == LXB_NS_SVG || ns == LXB_NS_MATH;
+}
+static const char *lex_attr_namespace(lxb_dom_attr_t *a, size_t *len) {
+    *len = 0;
+    /* tree_append_attributes uses the element namespace as a lookup context,
+       not as the DOM attribute namespace. XML/XLINK/XMLNS adjustments are real
+       namespaces. Export uses dynamic IDs for explicit HTML/SVG/MathML URIs. */
+    if (a->node.ns == LXB_NS__UNDEF || lex_attr_context_namespace(a->node.ns)) return NULL;
+    return (const char *)lxb_ns_by_id(a->node.owner_document->ns, a->node.ns, len);
+}
+static const char *lex_attr_local_name(lxb_dom_attr_t *a, size_t *len) {
+    const char *name = (const char *)lxb_dom_attr_qualified_name(a, len);
+    size_t ns_len = 0;
+    /* Qualified names preserve adjusted SVG case. The parser's formatting
+       reconstruction copies qualified/local names and ns, but drops prefix. */
+    if (lex_attr_namespace(a, &ns_len)) {
+        const char *colon = memchr(name, ':', *len);
+        if (colon) { *len -= (size_t)(colon + 1 - name); return colon + 1; }
+    }
+    return name;
+}
+static bool attr_metadata_equal(const struct attr *native, lxb_dom_attr_t *lex) {
+    size_t nl = 0, ll = 0;
+    const char *ns = lex_attr_namespace(lex, &nl);
+    const char *local = lex_attr_local_name(lex, &ll);
+    const char *expected = native->local ? native->local : native->raw;
+    return (native->namespace_uri ? ns && strlen(native->namespace_uri) == nl && !memcmp(native->namespace_uri, ns, nl) : !ns || !nl) &&
+        strlen(expected) == ll && !memcmp(expected, local, ll);
+}
 static bool attrs_equal(node_t *n, lxb_dom_element_t *el) {
     int i = 0;
     for (lxb_dom_attr_t *a = el->first_attr; a; a = a->next, i++) {
@@ -141,7 +175,7 @@ static bool attrs_equal(node_t *n, lxb_dom_element_t *el) {
         size_t nl = 0, vl = 0;
         const char *name = (const char *)lxb_dom_attr_qualified_name(a, &nl);
         const char *value = (const char *)lxb_dom_attr_value(a, &vl);
-        if (strlen(n->attrs[i].raw) != nl || memcmp(n->attrs[i].raw, name, nl) ||
+        if (!attr_metadata_equal(&n->attrs[i], a) || strlen(n->attrs[i].raw) != nl || memcmp(n->attrs[i].raw, name, nl) ||
             strlen(n->attrs[i].value) != vl || (vl && memcmp(n->attrs[i].value, value, vl))) return false;
     }
     return i == n->nattrs;
@@ -151,7 +185,8 @@ static void attr_cache(web_doc *d, node_t *n) {
     n->id = NULL; n->classes = NULL; n->nclasses = 0;
     const char *classes = NULL;
     for (int i = 0; i < n->nattrs; i++) {
-        const char *name = n->foreign ? n->attrs[i].raw : n->attrs[i].name;
+        if (n->attrs[i].namespace_uri) continue;
+        const char *name = n->attrs[i].raw;
         if (!strcmp(name, "id") && *n->attrs[i].value) n->id = n->attrs[i].value;
         if (!strcmp(name, "class")) classes = n->attrs[i].value;
     }
@@ -186,6 +221,7 @@ static bool import_fields(struct binding *b) {
     if (n->type == N_ELEM) {
         lxb_dom_element_t *el = lxb_dom_interface_element(b->lex);
         if (!attrs_equal(n, el)) {
+            bool was_open=node_attr(n,"open")!=NULL;
             size_t count = 0;
             for (lxb_dom_attr_t *a = el->first_attr; a; a = a->next) count++;
             struct attr *attrs = count ? ar_alloc(&d->mem, count * sizeof *attrs) : NULL;
@@ -197,12 +233,28 @@ static bool import_fields(struct binding *b) {
                 attrs[i].name = native_lower(&d->mem, name, nl);
                 attrs[i].raw = ar_strndup(&d->mem, (const char *)name, nl);
                 attrs[i].value = ar_strndup(&d->mem, value ? (const char *)value : "", vl);
+                size_t nsl = 0, ll = 0;
+                const char *ns = lex_attr_namespace(a, &nsl);
+                const char *local = lex_attr_local_name(a, &ll);
+                attrs[i].namespace_uri = ns && nsl ? ar_strndup(&d->mem, ns, nsl) : NULL;
+                if (ns && nsl) {
+                    const char *colon = memchr(name, ':', nl);
+                    if (colon) {
+                        attrs[i].prefix = ar_strndup(&d->mem, (const char *)name, (size_t)(colon - (const char *)name));
+                    }
+                }
+                attrs[i].local = ar_strndup(&d->mem, local, ll);
+                /* Value/order changes must not replace a materialized Attr. */
+                for (int j = 0; j < n->nattrs; j++) if (attr_metadata_equal(&n->attrs[j], a)) {
+                    attrs[i].node = n->attrs[j].node; break;
+                }
             }
             node_t temp = *n;
             temp.attrs = attrs; temp.nattrs = (int)count;
             attr_cache(d, &temp);
-            n->attrs = attrs; n->nattrs = (int)count;
+            doc_attrs_publish(n, attrs, (int)count);
             n->id = temp.id; n->classes = temp.classes; n->nclasses = temp.nclasses;
+            doc_details_parser_attribute_changed(n,was_open);
         }
     } else if (n->type == N_TEXT || n->type == N_COMMENT || n->type == N_PI) {
         lexbor_str_t *s = &lxb_dom_interface_character_data(b->lex)->data;
@@ -301,10 +353,13 @@ bool html_bridge_import(struct html_parser *p) {
         size_t j = 0;
         while (j < ndocs && changed_docs[j] != d) j++;
         if (j == ndocs) {
-            doc_mutated(d, NULL);
             if (ndocs < sizeof changed_docs / sizeof *changed_docs) changed_docs[ndocs++] = d;
         }
     }
+    /* Publish mutation/slot snapshots only after every native link is coherent.
+       A root's children can occur later than its host in this binding forest. */
+    doc_details_parser_finish(p->native_root);
+    for (size_t i = 0; i < ndocs; i++) doc_mutated(changed_docs[i], NULL);
     if (!p->fragment) {
         p->d->root = p->native_root;
         p->d->quirks = p->document->dom_document.compat_mode == LXB_DOM_DOCUMENT_CMODE_QUIRKS;
@@ -366,43 +421,68 @@ static struct binding *export_node(struct html_parser *p, node_t *n) {
     return lex ? bind_node(p, lex, n) : NULL;
 }
 
+static lxb_dom_attr_t *export_attr(lxb_dom_document_t *d, lxb_ns_id_t element_ns, const struct attr *a) {
+    lxb_dom_attr_t *made = lxb_dom_attr_interface_create(d);
+    if (!made) return NULL;
+    const char *local = a->local ? a->local : a->raw;
+    lxb_dom_attr_data_t *ld = lxb_dom_attr_qualified_name_append(d->attrs, (const lxb_char_t *)local, strlen(local));
+    lxb_dom_attr_data_t *qd = lxb_dom_attr_qualified_name_append(d->attrs, (const lxb_char_t *)a->raw, strlen(a->raw));
+    if (!ld || !qd) goto failed;
+    const lxb_dom_attr_data_t *known_local = !a->namespace_uri && !a->prefix ?
+        lxb_dom_attr_data_by_qualified_name(d->attrs, (const lxb_char_t *)local, strlen(local)) : NULL;
+    const lxb_dom_attr_data_t *known_qualified = lxb_dom_attr_data_by_qualified_name(d->attrs, (const lxb_char_t *)a->raw, strlen(a->raw));
+    made->node.local_name = known_local ? known_local->attr_id : ld->attr_id;
+    made->qualified_name = known_qualified ? known_qualified->attr_id : qd->attr_id;
+    if (a->namespace_uri) {
+        /* raw insertion avoids lxb_ns_append's ASCII case folding. */
+        const lxb_ns_data_t *known = lxb_ns_data_by_link(d->ns, (const lxb_char_t *)a->namespace_uri, strlen(a->namespace_uri));
+        size_t len = 0; const lxb_char_t *uri = known ? lxb_ns_by_id(d->ns, known->ns_id, &len) : NULL;
+        if (uri && !lex_attr_context_namespace(known->ns_id) &&
+            len == strlen(a->namespace_uri) && !memcmp(uri, a->namespace_uri, len)) made->node.ns = known->ns_id;
+        else {
+            /* A DOM-authored attribute may explicitly use the same URI as its
+               element. Keep its real namespace distinguishable from the HTML
+               tree builder's static context IDs, including after clone/rebuild. */
+            lxb_ns_data_t *ns = lexbor_hash_insert(d->ns, lexbor_hash_insert_raw, (const lxb_char_t *)a->namespace_uri, strlen(a->namespace_uri));
+            if (!ns) goto failed;
+            ns->ns_id = (lxb_ns_id_t)ns; made->node.ns = ns->ns_id;
+        }
+    } else made->node.ns = element_ns;
+    if (a->prefix) {
+        lxb_ns_prefix_data_t *prefix = lexbor_hash_insert(d->prefix, lexbor_hash_insert_raw, (const lxb_char_t *)a->prefix, strlen(a->prefix));
+        if (!prefix) goto failed;
+        prefix->prefix_id = (lxb_ns_prefix_id_t)prefix; made->node.prefix = prefix->prefix_id;
+    }
+    if (lxb_dom_attr_set_value(made, (const lxb_char_t *)a->value, strlen(a->value)) != LXB_STATUS_OK) goto failed;
+    return made;
+failed:
+    lxb_dom_attr_interface_destroy(made); return NULL;
+}
+
 static bool export_fields(struct html_parser *p, struct binding *b) {
     node_t *n = b->native;
     if (n->type == N_ELEM) {
         lxb_dom_element_t *el = lxb_dom_interface_element(b->lex);
         if (attrs_equal(n, el)) return true;
+        /* Qualified names may be duplicated across namespaces. by_name/set_attr
+           would collapse those records, so construct an ordered full snapshot. */
+        lxb_dom_attr_t **attrs = n->nattrs ? calloc((size_t)n->nattrs, sizeof *attrs) : NULL;
+        if (n->nattrs && !attrs) return false;
+        for (int i = 0; i < n->nattrs; i++) {
+            attrs[i] = export_attr(el->node.owner_document, el->node.ns, &n->attrs[i]);
+            if (!attrs[i]) {
+                for (int j = 0; j < i; j++) lxb_dom_attr_interface_destroy(attrs[j]);
+                free(attrs); return false;
+            }
+        }
         for (lxb_dom_attr_t *a = el->first_attr, *next; a; a = next) {
-            next = a->next;
-            size_t len = 0;
-            const char *name = (const char *)lxb_dom_attr_qualified_name(a, &len);
-            bool found = false;
-            for (int i = 0; i < n->nattrs; i++) if (strlen(n->attrs[i].raw) == len && !memcmp(name, n->attrs[i].raw, len)) {
-                const char *value = n->attrs[i].value;
-                size_t vl = 0;
-                const char *old = (const char *)lxb_dom_attr_value(a, &vl);
-                if ((strlen(value) != vl || (vl && memcmp(value, old, vl))) &&
-                    lxb_dom_attr_set_existing_value(a, (const lxb_char_t *)value, strlen(value)) != LXB_STATUS_OK) return false;
-                found = true; break;
-            }
-            if (!found) { lxb_dom_attr_remove(a); lxb_dom_attr_interface_destroy(a); }
+            next = a->next; lxb_dom_attr_remove(a); lxb_dom_attr_interface_destroy(a);
         }
-        for (int i = 0; i < n->nattrs; i++) {
-            const char *name = n->attrs[i].raw;
-            if (!lxb_dom_element_attr_by_name(el, (const lxb_char_t *)name, strlen(name))) {
-                lxb_dom_attr_t *a = lxb_dom_element_set_attribute(el, (const lxb_char_t *)name, strlen(name),
-                    (const lxb_char_t *)n->attrs[i].value, strlen(n->attrs[i].value));
-                if (!a || (n->foreign && lxb_html_tree_adjust_foreign_attributes(p->lex->tree, a, NULL) != LXB_STATUS_OK)) return false;
-            }
+        for (int i = 0; i < n->nattrs; i++) if (lxb_dom_element_attr_append(el, attrs[i]) != LXB_STATUS_OK) {
+            for (int j = i; j < n->nattrs; j++) lxb_dom_attr_interface_destroy(attrs[j]);
+            free(attrs); return false;
         }
-        /* Removing then re-adding an attribute changes its DOM order even if
-           its value is unchanged. Preserve the native order on round-trip. */
-        for (int i = 0; i < n->nattrs; i++) {
-            const char *name = n->attrs[i].raw;
-            lxb_dom_attr_t *a = lxb_dom_element_attr_by_name(el, (const lxb_char_t *)name, strlen(name));
-            if (!a) return false;
-            lxb_dom_attr_remove(a);
-            if (lxb_dom_element_attr_append(el, a) != LXB_STATUS_OK) return false;
-        }
+        free(attrs);
     } else if (n->type == N_TEXT || n->type == N_COMMENT || n->type == N_PI) {
         lxb_dom_character_data_t *cd = lxb_dom_interface_character_data(b->lex);
         if (cd->data.length != n->textlen || (n->textlen && memcmp(cd->data.data, n->text, n->textlen)))

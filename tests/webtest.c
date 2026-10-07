@@ -5,6 +5,7 @@
 #include <string.h>
 #include "nocturne.h"
 #include "web.h"
+#include "web_form_validation_cases.h"
 
 #define BASE "http://h.test/dir/page.html"
 #define VW 800
@@ -437,6 +438,7 @@ int main(void) {
     test_paint();
     test_item_z_order();
     test_forms();
+    run_native_form_validation_cases(&total,&failed);
     test_text();
     test_hostile();
     printf("webtest: %d checks, %d failed\n", total, failed);

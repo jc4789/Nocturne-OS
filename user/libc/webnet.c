@@ -90,13 +90,15 @@ int webnet_cookie_set(webnet *n, const char *url, const char *value) {
 uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callback cb, void *opaque) {
     if (!n || !q || !q->url || !cb || n->count >= REQUEST_MAX || q->kind > WEBNET_FETCH ||
         q->kind < WEBNET_NAVIGATION || q->body_len > WEBNET_BODY_LIMIT || (q->body_len && !q->body) ||
-        q->credentials < WEBNET_CREDENTIALS_OMIT || q->credentials > WEBNET_CREDENTIALS_INCLUDE) return 0;
+        q->credentials < WEBNET_CREDENTIALS_OMIT || q->credentials > WEBNET_CREDENTIALS_INCLUDE ||
+        q->cache_mode < WEBNET_CACHE_DEFAULT || q->cache_mode > WEBNET_CACHE_ONLY_IF_CACHED ||
+        (q->kind != WEBNET_FETCH && q->cache_mode != WEBNET_CACHE_DEFAULT)) return 0;
     const char *origin = q->origin ? q->origin : "";
     const char *method = q->method ? q->method : "GET";
     const char *headers = q->headers ? q->headers : "";
     size_t ul = strlen(q->url), ol = strlen(origin), ml = strlen(method), hl = strlen(headers);
-    if (!ul || ul >= WEBNET_URL_MAX || ol >= WEBNET_URL_MAX || ml >= 8 || hl >= WEBNET_HEADERS_MAX ||
-        (strcmp(method, "GET") && strcmp(method, "POST")) || (!strcmp(method, "GET") && q->body_len)) return 0;
+    if (!ul || ul >= WEBNET_URL_MAX || ol >= WEBNET_URL_MAX || !webnet_method_valid(method) || hl >= WEBNET_REQUEST_HEADERS_MAX ||
+        ((!strcmp(method, "GET") || !strcmp(method, "HEAD")) && q->body_len)) return 0;
     int64_t cookie_now=time(NULL);
     long cookie_len = q->credentials == WEBNET_CREDENTIALS_OMIT ? 0 : webcookie_export(n->cookies, NULL, 0, cookie_now);
     if (cookie_len < 0) return 0;
@@ -120,7 +122,10 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     struct webnet_wire_request h = {0};
     h.magic = WEBNET_MAGIC; h.kind = q->kind;
     h.user_navigation = (q->user_navigation ? WEBNET_WIRE_USER_NAVIGATION : 0) |
-                        (q->force_preflight ? WEBNET_WIRE_FORCE_PREFLIGHT : 0);
+                        (q->force_preflight ? WEBNET_WIRE_FORCE_PREFLIGHT : 0) |
+                        (q->redirect_error ? WEBNET_WIRE_REDIRECT_ERROR : 0) |
+                        (q->same_origin ? WEBNET_WIRE_SAME_ORIGIN : 0) | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS |
+                        ((uint32_t)q->cache_mode << WEBNET_WIRE_CACHE_SHIFT);
     h.credentials = q->credentials; h.cookie_len = (uint32_t)cookie_len;
     h.id = r->id; h.generation = r->generation; h.deadline = r->deadline;
     h.url_len = ul; h.origin_len = ol; h.method_len = ml; h.headers_len = hl; h.body_len = q->body_len;
@@ -282,7 +287,7 @@ void webnet_pump(webnet *n, uint64_t now) {
                     if (r->head_pos == sizeof r->head) {
                         struct webnet_wire_response *h = &r->head;
                         if (h->magic != WEBNET_MAGIC || h->id != r->id || h->generation != r->generation ||
-                            h->url_len >= WEBNET_URL_MAX || h->headers_len >= WEBNET_HEADERS_MAX ||
+                            h->url_len >= WEBNET_URL_MAX || h->headers_len >= WEBNET_RESPONSE_HEADERS_MAX ||
                             h->body_len > WEBNET_BODY_LIMIT || h->error_len >= sizeof r->error || h->status > 999 ||
                             h->cookie_len > WEBNET_COOKIE_EVENTS_MAX) {
                             slot_stop(s, "Invalid worker response"); break;

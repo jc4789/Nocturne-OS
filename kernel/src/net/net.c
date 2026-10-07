@@ -220,8 +220,9 @@ static void arp_input(const uint8_t *p, size_t len) {
 
 static uint32_t next_hop(uint32_t dst) { return ((dst ^ my_ip) & my_mask) == 0 ? dst : my_gw; }
 
-/* resolve the link address for dst (system call context: may block) */
-static int arp_resolve(uint32_t dst, uint8_t mac[6]) {
+/* Resolve the link address (system call context: may block). A nonzero
+   deadline shares TCP's connect budget; zero preserves ordinary ARP retries. */
+static int arp_resolve_until(uint32_t dst, uint8_t mac[6], uint64_t deadline) {
     if (!nif) return -ENETDOWN;
     if (dst == 0xFFFFFFFF || dst == (my_ip | ~my_mask)) {
         memcpy(mac, bcast_mac, 6);
@@ -231,17 +232,25 @@ static int arp_resolve(uint32_t dst, uint8_t mac[6]) {
     uint32_t hop = next_hop(dst);
     if (!hop) return -EHOSTUNREACH;
     for (int tries = 0; tries < 3; tries++) {
+        if (current_task->killed) return -EINTR;
+        uint64_t now = uptime_ms();
+        if (deadline && now >= deadline) return -ETIMEDOUT;
         if (arp_lookup(hop, mac)) return 0;
         arp_send(1, (const uint8_t *)"\0\0\0\0\0\0", hop, bcast_mac);
-        uint64_t until = uptime_ms() + 1000;
-        while (uptime_ms() < until) {
-            if (arp_lookup(hop, mac)) return 0;
+        uint64_t until = now + 1000;
+        if (deadline && deadline < until) until = deadline;
+        for (;;) {
             if (current_task->killed) return -EINTR;
-            wq_wait_timeout(&net_wq, until - uptime_ms());
+            now = uptime_ms();
+            if (deadline && now >= deadline) return -ETIMEDOUT;
+            if (arp_lookup(hop, mac)) return 0;
+            if (now >= until) break;
+            wq_wait_timeout(&net_wq, until - now);
         }
     }
     return -EHOSTUNREACH;
 }
+static int arp_resolve(uint32_t dst, uint8_t mac[6]) { return arp_resolve_until(dst, mac, 0); }
 
 /* ---------------------------------------------------------------- ICMP */
 
@@ -753,6 +762,9 @@ static void tcp_free(struct tcb *t) {
     kfree(t->rx);
     kfree(t->tx);
     memset(t, 0, sizeof *t);
+    /* A closing/TIME_WAIT connection holds a global TCB, not a file descriptor.
+       Wake cooperative connect waiters only after the entire slot is reusable. */
+    wq_wake_all(&net_wq);
 }
 
 static uint32_t tcp_window(struct tcb *t) { return MIN(TCP_RXBUF - t->rx_len, 65535u); }
@@ -1177,16 +1189,28 @@ static struct tcb *user_tcb(int h) {
 }
 
 static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
+    uint64_t until = uptime_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 15000);
     uint8_t mac[6];
-    int r = arp_resolve(ip, mac);
+    int r = arp_resolve_until(ip, mac, until);
     if (r < 0) return r;
     int h = -1;
-    for (int i = 0; i < TCP_N; i++)
-        if (tcbs[i].state == T_FREE) {
-            h = i;
-            break;
+    while (h < 0) {
+        if (current_task->killed) return -EINTR;
+        uint64_t now = uptime_ms();
+        if (now >= until) return -ETIMEDOUT;
+        for (int i = 0; i < TCP_N; i++)
+            if (tcbs[i].state == T_FREE) {
+                h = i;
+                break;
+            }
+        if (h < 0) {
+            /* Ordinary HTTP completion can leave a FIN/TIME_WAIT control block
+               occupied after the worker exits. Do not turn that transient global
+               pressure into a permanent module/resource failure, or steal a live
+               TCP tuple. Allocation and handshake share the original deadline. */
+            wq_wait_timeout(&net_wq, until - now);
         }
-    if (h < 0) return -EMFILE;
+    }
     struct tcb *t = &tcbs[h];
     memset(t, 0, sizeof *t);
     t->rx = kmalloc(TCP_RXBUF);
@@ -1209,14 +1233,14 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     t->state = T_SYN_SENT;
     tcp_output(t, F_SYN, t->iss, NULL, 0);
     tcp_arm(t);
-    uint64_t until = uptime_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 15000);
     while (t->state == T_SYN_SENT) {
-        if (current_task->killed || uptime_ms() >= until) {
+        uint64_t now = uptime_ms();
+        if (current_task->killed || now >= until) {
             t->state = T_CLOSED;
             t->err = current_task->killed ? -EINTR : -ETIMEDOUT;
             break;
         }
-        wq_wait_timeout(&net_wq, until - uptime_ms());
+        wq_wait_timeout(&net_wq, until - now);
     }
     if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT) {
         int err = t->err ? t->err : -ECONNREFUSED;

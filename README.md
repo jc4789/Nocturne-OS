@@ -26,6 +26,9 @@ QuickJS の実験的な統合がありますが、ブラウザー API は未完�
 実サイトで判明した microtask 再帰と Nocturne のメモリ不足時処理の修正は [続報](docs/browser-native-progress-2026-10-06.md) に記録しています。
 Google・GitHub・HTML5test・百度百科を加えた実機検証と、XHR・独立Document・SVGの修正は [互換性の拡大検証](docs/browser-web-compatibility-2026-10-06.md) を参照してください。表示の部分成功と、サイト操作の未達を区別しています。
 HTML tokenizer／tree builder は Lexbor へ移行しました。Nocturne の DOM・描画・OS API を維持した統合範囲と、実サイトで残る失敗は [Lexbor 統合記録](docs/browser-lexbor-2026-10-06.md) に記載しています。ブラウザー全体の互換性が完成したわけではありません。
+その後の属性ノード・DOMTokenList・HTML要素・Fetch/Abortとnative通信の一括拡張は [API拡張記録](docs/browser-api-batch-2026-10-06.md) を参照してください。未実装のstream/CSSOM等を対応済みとはしていません。
+Shadow DOM・Intl.Collator・TCP接続枠の拡張と2 GiB QEMUでの検証は [次の拡張記録](docs/browser-shadow-intl-network-2026-10-06.md) に記載します。実装範囲と未達項目を区別しています。
+HTML要素・日時/数値入力・フォーム検証・複数選択・detailsの追加は [要素とフォームの拡張記録](docs/browser-elements-forms-2026-10-07.md) に記載します。HTML5testの検出結果と、実際のGUI・サイト動作は別に確認します。
 
 ![Desktop and start menu](docs/desktop-menu.png)
 
@@ -161,17 +164,20 @@ Outputs in `build\`:
 - `nocturne.vhdx`: dynamic VHDX for Hyper-V Generation 2.
 - `nocturne.iso`: hybrid BIOS/UEFI ISO.
 
+QEMU の通常起動・試験用 RAM は既定 2 GiB です。通常起動は `make run QEMU_MEMORY=2048M`、
+試験は `python scripts/test.py --memory 2048` で明示指定できます。Hyper-V の既存 VM 設定は変更しません。
+
 ## Tests
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1 test        # about 4 minutes
+powershell -ExecutionPolicy Bypass -File build.ps1 test        # 全体試験（所要時間は環境による）
 powershell -ExecutionPolicy Bypass -File build.ps1 test-quick  # skips compiling every app
 powershell -ExecutionPolicy Bypass -File build.ps1 test-full   # adds tcc rebuilding itself inside the OS
 ```
 
 `scripts/test.py` boots the image headless in QEMU with a scratch data disk holding `tests/`. Your own
 `data.img` is not touched. At boot, `init` runs the suite. The suite compiles its own runner with the
-in-OS `tcc` and runs 45 tests, checking each one's exit status and output. Results come back over the
+in-OS `tcc` and runs the test cases, checking each one's exit status and output. Results come back over the
 serial port, and afterwards the host checks the FAT32 volume the OS wrote to with `fatcheck.py`. The
 tests cover:
 - Shell and tools, and `malloc` stress.

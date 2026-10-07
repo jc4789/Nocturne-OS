@@ -1,4 +1,4 @@
-/* Browser bindings for Nocturne's native DOM. This never constructs a shadow DOM. */
+/* Browser bindings for Nocturne's sole native DOM, including native shadow trees. */
 (function (host) {
     'use strict';
     delete globalThis.__nocturne_host;
@@ -6,18 +6,27 @@
     let customElementsReady = false;
     function dom(...args) {
         const op = args[0];
-        const mutation = op === 'insert' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'set' ||
+        const mutation = op === 'shadowAttach' || op === 'slotAssign' || op === 'insert' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'set' || op === 'attrSetNode' || op === 'attrRemoveNode' ||
+            (op === 'attrNS' && args.length > 4) ||
             ((op === 'attr' || op === 'style') && args.length > 3);
         return mutation && customElementsReady ? customElementsBridge.reactions(() => rawDom(...args)) : rawDom(...args);
+    }
+    // IDL reflection always addresses the null namespace; getAttribute remains
+    // a qualified-name lookup and may find an explicitly namespaced attribute.
+    function reflectedAttr(node,name,...value) {
+        return value.length?dom('attrNS',node,null,name,value[0]):rawDom('attrNS',node,null,name);
     }
     const apply = Reflect.apply;
     const eventSlice = Array.prototype.slice, mouseAssign = Object.assign;
     const listenerMap = new WeakMap(), inlineMap = new WeakMap();
     const handlerMap = new WeakMap();
+    const eventPaths = new WeakMap();
     let xhrHandlerTarget = () => false;
     let messageHandlerTarget = () => false;
     let svgHandlerTarget = () => false;
-    const globalHandlerTypes = new Set(('abort blur change click dblclick error focus focusin focusout input keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select submit wheel').split(' '));
+    let abortHandlerTarget = () => false;
+    let shadowHandlerTarget = () => false;
+    const globalHandlerTypes = new Set(('abort blur change click dblclick error focus focusin focusout input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
     const windowHandlerTypes = new Set(['hashchange','popstate','message','messageerror']);
     const state = new WeakMap();
     /* @include js_collections.js */
@@ -31,7 +40,7 @@
             this.target = null; this.currentTarget = null; this.eventPhase = 0;
             this.defaultPrevented = false; this.isTrusted = false;
             this.timeStamp = host.now(); this._stop = false; this._immediate = false;
-            this._passive = false; this._dispatching = false; this._path = []; this._initialized = true;
+            this._passive = false; this._dispatching = false; this._initialized = true;
         }
         initEvent(type,bubbles=false,cancelable=false) {
             if(!arguments.length)throw new TypeError('initEvent requires type');
@@ -42,7 +51,7 @@
         preventDefault() { if (this.cancelable && !this._passive) this.defaultPrevented = true; }
         stopPropagation() { this._stop = true; }
         stopImmediatePropagation() { this._stop = this._immediate = true; }
-        composedPath() { return this._path.slice(); }
+        composedPath() { return apply(eventSlice,eventPaths.get(this)||[],[]); }
         get cancelBubble() { return this._stop; }
         set cancelBubble(v) { if (v) this.stopPropagation(); }
         get returnValue() { return !this.defaultPrevented; }
@@ -128,7 +137,7 @@
     }
     function handlerTarget(target,type) {
         return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document || svgHandlerTarget(target))) ||
-            (windowHandlerTypes.has(type) && target===globalThis) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type);
+            (windowHandlerTypes.has(type) && target===globalThis) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type);
     }
     function activateHandler(target,type,r) {
         if(r.entry)return;
@@ -142,7 +151,7 @@
         let map=handlerMap.get(target);if(!map)handlerMap.set(target,map=new Map());
         let r=map.get(type);
         if(!r) {
-            const text=(target instanceof HTMLElement || svgHandlerTarget(target))?rawDom('attr',target,'on'+type):null;
+            const text=(target instanceof HTMLElement || svgHandlerTarget(target))?reflectedAttr(target,'on'+type):null;
             r={value:null,text,compiled:text===null,entry:null};map.set(type,r);
             if(text!==null)activateHandler(target,type,r);
         }
@@ -191,7 +200,7 @@
         if (!capture && !event._immediate && !handlerTarget(target,event.type)) {
             let fn = target['on' + event.type];
             if (fn === undefined && target instanceof Node && target.nodeType === 1) {
-                const text = target.getAttribute('on' + event.type);
+                const text = reflectedAttr(target,'on' + event.type);
                 if (text !== null && rawDom('get',target,'scripting')) {
                     let cache = inlineMap.get(target);
                     if (!cache) inlineMap.set(target, cache = new Map());
@@ -211,24 +220,23 @@
     }
     function dispatch(target, event, snapshot) {
         event._dispatching = true; event.target = target; event._stop = event._immediate = false;
-        const path = snapshot || [target];
-        if (!snapshot && target instanceof Node) {
-            for (let n = target.parentNode; n; n = n.parentNode) path.push(n);
-            // Document's event parent is null for load. Resource load capture
-            // must not reach Window and masquerade as document completion.
-            if (path[path.length-1] === document && event.type !== 'load') path.push(globalThis);
+        const plan=snapshot && snapshot.entries?snapshot:shadowBridge.path(target,event,snapshot),entries=plan.entries;
+        const hasRelated='relatedTarget' in event;
+        function visit(entry,capture,phase){
+            event.target=entry.target;if(hasRelated)event.relatedTarget=entry.related;
+            eventPaths.set(event,entry.visible);event.eventPhase=phase;invoke(entry.node,event,capture);
         }
-        event._path = apply(eventSlice,path,[]);
-        for (let i = path.length-1; i > 0 && !event._stop; --i) {
-            event.eventPhase = 1; invoke(path[i],event,true);
+        for(let i=entries.length-1;i>0 && !event._stop;i--)visit(entries[i],true,entries[i].atTarget?2:1);
+        if(entries.length && !event._stop){
+            /* Capture and noncapture at AT_TARGET are distinct invocations.
+               stopPropagation keeps this capture listener list running, but
+               prevents the following noncapture invocation. */
+            visit(entries[0],true,2);if(!event._stop)visit(entries[0],false,2);
         }
-        if (!event._stop) {
-            event.eventPhase = 2; invoke(target,event,true);
-            if (!event._immediate) invoke(target,event,false);
-        }
-        if (event.bubbles) for (let i = 1; i < path.length && !event._stop; ++i) {
-            event.eventPhase = 3; invoke(path[i],event,false);
-        }
+        for(let i=1;i<entries.length && !event._stop;i++)
+            if(event.bubbles || entries[i].atTarget)visit(entries[i],false,entries[i].atTarget?2:3);
+        event.target=plan.finalTarget;if(hasRelated)event.relatedTarget=plan.finalRelated;
+        eventPaths.delete(event);
         event.currentTarget = null; event.eventPhase = 0; event._dispatching = false; event._passive = false;
         return !event.defaultPrevented;
     }
@@ -254,12 +262,12 @@
         insertBefore(child,before) { dom('insert',this,child,before); return child; }
         removeChild(child) { if (child.parentNode !== this) throw new Error('NotFoundError'); dom('remove',child); return child; }
         replaceChild(child,old) { if(child!==old){this.insertBefore(child,old);this.removeChild(old);}return old; }
-        cloneNode(deep = false) { return dom('clone',this,!!deep); }
+        cloneNode(deep = false) { if(rawDom('get',this,'shadowHost'))throw new DOMException('Shadow roots cannot be cloned directly','NotSupportedError');return dom('clone',this,!!deep); }
         isEqualNode(other = null) { return dom('equal',this,other); }
         isSameNode(other = null) { return dom('same',this,other); }
         contains(other) { for(let n=other;n;n=n.parentNode) if(n===this) return true; return false; }
         hasChildNodes() { return this.firstChild !== null; }
-        getRootNode() { let n=this; while(n.parentNode) n=n.parentNode; return n; }
+        getRootNode(options={}) { return rawDom('root',this,!!shadowBridge.dictionary(options).composed); }
     }
     class Element extends Node {
         get children() { return collectionBridge.children(this,true); }
@@ -277,11 +285,12 @@
         get tagName() { return this.nodeType === 1 ? this.nodeName : undefined; }
         get localName() { return dom('get',this,'localName'); }
         get namespaceURI() { return dom('get',this,'namespaceURI'); }
-        get id() { return this.getAttribute('id') || ''; }
-        set id(v) { this.setAttribute('id',v); }
-        get className() { return this.getAttribute('class') || ''; }
-        set className(v) { this.setAttribute('class',v); }
-        get classList() { return new DOMTokenList(this); }
+        get id() { return reflectedAttr(this,'id') || ''; }
+        set id(v) { reflectedAttr(this,'id',String(v)); }
+        get className() { return reflectedAttr(this,'class') || ''; }
+        set className(v) { reflectedAttr(this,'class',String(v)); }
+        get classList() { return tokenListBridge.for(this,'class'); }
+        set classList(value) { tokenListBridge.for(this,'class').value=value; }
         getAttribute(name) { return dom('attr',this,String(name)); }
         setAttribute(name,value) { dom('attr',this,String(name),String(value)); }
         removeAttribute(name) { dom('attr',this,String(name),null); }
@@ -303,7 +312,7 @@
         get clientLeft() { return dom('geometry',this,'clientLeft'); }
         get clientTop() { return dom('geometry',this,'clientTop'); }
         get style() { let s=state.get(this);if(!s)state.set(this,s={});return s.style||(s.style=new StyleDeclaration(this)); }
-        get dataset() { const n=this;return new Proxy({}, {get(_,k){return n.getAttribute('data-'+String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase()));},set(_,k,v){n.setAttribute('data-'+String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase()),v);return true;}}); }
+        get dataset() { const n=this;return new Proxy({}, {get(_,k){return reflectedAttr(n,'data-'+String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase()));},set(_,k,v){reflectedAttr(n,'data-'+String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase()),v);return true;}}); }
     }
     class HTMLElement extends Element {
         constructor() { return customElementsBridge.construct(new.target); }
@@ -322,10 +331,10 @@
         set selectedIndex(v) { dom('set',this,'selectedIndex',Number(v)); }
         get selected() { return dom('get',this,'selected'); }
         set selected(v) { dom('set',this,'selected',!!v); }
-        get disabled() { return this.hasAttribute('disabled'); }
-        set disabled(v) { this.toggleAttribute('disabled',!!v); }
+        get disabled() { return reflectedAttr(this,'disabled')!==null; }
+        set disabled(v) { reflectedAttr(this,'disabled',v?'':null); }
         focus() { dom('focus',this); }
-        blur() { if(rawDom('get',this,'scripting'))dom('focus',null); }
+        blur() { dom('blur',this); }
         click() { host.click(this); }
     }
     // A distinct native interface, not an alias or an instanceof override.
@@ -333,6 +342,10 @@
     class HTMLIFrameElement extends HTMLElement {
         constructor() { throw new TypeError('Illegal HTMLIFrameElement constructor'); }
     }
+    class HTMLUnknownElement extends HTMLElement {
+        constructor(){throw new TypeError('Illegal HTMLUnknownElement constructor');}
+    }
+    Object.defineProperty(HTMLUnknownElement.prototype,Symbol.toStringTag,{value:'HTMLUnknownElement',configurable:true});
     class HTMLTemplateElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLTemplateElement constructor');}
         get content(){return dom('get',this,'templateContent');}
@@ -348,16 +361,16 @@
         get complete() { return dom('get',this,'imageComplete'); }
         get currentSrc() { return dom('get',this,'imageCurrentSrc'); }
         get src() {
-            dom('get',this,'imageBrand'); const value=dom('attr',this,'src');
+            dom('get',this,'imageBrand'); const value=reflectedAttr(this,'src');
             if(value===null)return '';try{return new URL(value,this.baseURI).href;}catch(_){return value;}
         }
-        set src(v) { dom('get',this,'imageBrand');dom('attr',this,'src',String(v)); }
-        get alt() { dom('get',this,'imageBrand');return dom('attr',this,'alt')||''; }
-        set alt(v) { dom('get',this,'imageBrand');dom('attr',this,'alt',String(v)); }
-        get srcset() { dom('get',this,'imageBrand');return dom('attr',this,'srcset')||''; }
-        set srcset(v) { dom('get',this,'imageBrand');dom('attr',this,'srcset',String(v)); }
-        get sizes() { dom('get',this,'imageBrand');return dom('attr',this,'sizes')||''; }
-        set sizes(v) { dom('get',this,'imageBrand');dom('attr',this,'sizes',String(v)); }
+        set src(v) { dom('get',this,'imageBrand');reflectedAttr(this,'src',String(v)); }
+        get alt() { dom('get',this,'imageBrand');return reflectedAttr(this,'alt')||''; }
+        set alt(v) { dom('get',this,'imageBrand');reflectedAttr(this,'alt',String(v)); }
+        get srcset() { dom('get',this,'imageBrand');return reflectedAttr(this,'srcset')||''; }
+        set srcset(v) { dom('get',this,'imageBrand');reflectedAttr(this,'srcset',String(v)); }
+        get sizes() { dom('get',this,'imageBrand');return reflectedAttr(this,'sizes')||''; }
+        set sizes(v) { dom('get',this,'imageBrand');reflectedAttr(this,'sizes',String(v)); }
         decode() { return Promise.resolve().then(()=>dom('imageDecode',this)); }
     }
     function Image() {
@@ -370,10 +383,10 @@
     class HTMLInputElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLInputElement constructor');}
         get form(){return dom('get',this,'form:input');}
-        get defaultValue(){return this.getAttribute('value')||'';}
-        set defaultValue(v){this.setAttribute('value',v);}
-        get defaultChecked(){return this.hasAttribute('checked');}
-        set defaultChecked(v){this.toggleAttribute('checked',!!v);}
+        get defaultValue(){return reflectedAttr(this,'value')||'';}
+        set defaultValue(v){reflectedAttr(this,'value',String(v));}
+        get defaultChecked(){return reflectedAttr(this,'checked')!==null;}
+        set defaultChecked(v){reflectedAttr(this,'checked',v?'':null);}
     }
     class HTMLButtonElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLButtonElement constructor');}
@@ -404,8 +417,8 @@
     class HTMLOptionElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLOptionElement constructor');}
         get form(){return dom('get',this,'form:option');}
-        get defaultSelected(){return this.hasAttribute('selected');}
-        set defaultSelected(v){this.toggleAttribute('selected',!!v);}
+        get defaultSelected(){return reflectedAttr(this,'selected')!==null;}
+        set defaultSelected(v){reflectedAttr(this,'selected',v?'':null);}
     }
     function htmlElementBrand(node,tag){
         if(rawDom('get',node,'nodeType')!==1 || rawDom('get',node,'namespaceURI')!=='http://www.w3.org/1999/xhtml' ||
@@ -424,7 +437,7 @@
                 return rawDom('query',root,'button,fieldset,input,object,output,select,textarea',false).filter(el=>{
                     if(rawDom('get',el,'namespaceURI')!=='http://www.w3.org/1999/xhtml')return false;
                     const tag=rawDom('get',el,'localName');
-                    return !(tag==='input' && (rawDom('attr',el,'type')||'').toLowerCase()==='image') &&
+                    return !(tag==='input' && (reflectedAttr(el,'type')||'').toLowerCase()==='image') &&
                         rawDom('get',el,'form:'+tag)===form;
                 });
             });
@@ -440,48 +453,48 @@
         }
         get async(){htmlElementBrand(this,'script');return !!dom('get',this,'async');}
         set async(v){htmlElementBrand(this,'script');dom('set',this,'async',!!v);}
-        get defer(){htmlElementBrand(this,'script');return rawDom('attr',this,'defer')!==null;}
-        set defer(v){htmlElementBrand(this,'script');dom('attr',this,'defer',v?'':null);}
+        get defer(){htmlElementBrand(this,'script');return reflectedAttr(this,'defer')!==null;}
+        set defer(v){htmlElementBrand(this,'script');reflectedAttr(this,'defer',v?'':null);}
         get src(){return elementURL.attribute(this,'script','src',false);}
-        set src(v){htmlElementBrand(this,'script');dom('attr',this,'src',elementURL.scalar(v));}
-        get type(){htmlElementBrand(this,'script');return rawDom('attr',this,'type')||'';}
-        set type(v){htmlElementBrand(this,'script');dom('attr',this,'type',elementURL.string(v));}
-        get noModule(){htmlElementBrand(this,'script');return rawDom('attr',this,'nomodule')!==null;}
-        set noModule(v){htmlElementBrand(this,'script');dom('attr',this,'nomodule',v?'':null);}
+        set src(v){htmlElementBrand(this,'script');reflectedAttr(this,'src',elementURL.scalar(v));}
+        get type(){htmlElementBrand(this,'script');return reflectedAttr(this,'type')||'';}
+        set type(v){htmlElementBrand(this,'script');reflectedAttr(this,'type',elementURL.string(v));}
+        get noModule(){htmlElementBrand(this,'script');return reflectedAttr(this,'nomodule')!==null;}
+        set noModule(v){htmlElementBrand(this,'script');reflectedAttr(this,'nomodule',v?'':null);}
         get text(){htmlElementBrand(this,'script');return rawDom('get',this,'textContent');}
         set text(v){htmlElementBrand(this,'script');dom('set',this,'textContent',v===null?'':elementURL.string(v));}
         get crossOrigin(){
-            htmlElementBrand(this,'script');const v=rawDom('attr',this,'crossorigin');
+            htmlElementBrand(this,'script');const v=reflectedAttr(this,'crossorigin');
             if(v===null)return null;
             return v.toLowerCase()==='use-credentials'?'use-credentials':'anonymous';
         }
-        set crossOrigin(v){htmlElementBrand(this,'script');dom('attr',this,'crossorigin',v==null?null:elementURL.string(v));}
+        set crossOrigin(v){htmlElementBrand(this,'script');reflectedAttr(this,'crossorigin',v==null?null:elementURL.string(v));}
     }
     class HTMLFormElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLFormElement constructor');}
         get elements(){return formControls(this);}
         get length(){return formControls(this).length;}
         get action(){return elementURL.attribute(this,'form','action',true);}
-        set action(v){htmlElementBrand(this,'form');dom('attr',this,'action',elementURL.scalar(v));}
+        set action(v){htmlElementBrand(this,'form');reflectedAttr(this,'action',elementURL.scalar(v));}
         get method(){
-            htmlElementBrand(this,'form');const m=(rawDom('attr',this,'method')||'get').toLowerCase();
+            htmlElementBrand(this,'form');const m=(reflectedAttr(this,'method')||'get').toLowerCase();
             return m==='post'||m==='dialog'?m:'get';
         }
-        set method(v){htmlElementBrand(this,'form');dom('attr',this,'method',elementURL.string(v));}
-        get name(){htmlElementBrand(this,'form');return rawDom('attr',this,'name')||'';}
-        set name(v){htmlElementBrand(this,'form');dom('attr',this,'name',elementURL.string(v));}
-        get target(){htmlElementBrand(this,'form');return rawDom('attr',this,'target')||'';}
-        set target(v){htmlElementBrand(this,'form');dom('attr',this,'target',elementURL.string(v));}
+        set method(v){htmlElementBrand(this,'form');reflectedAttr(this,'method',elementURL.string(v));}
+        get name(){htmlElementBrand(this,'form');return reflectedAttr(this,'name')||'';}
+        set name(v){htmlElementBrand(this,'form');reflectedAttr(this,'name',elementURL.string(v));}
+        get target(){htmlElementBrand(this,'form');return reflectedAttr(this,'target')||'';}
+        set target(v){htmlElementBrand(this,'form');reflectedAttr(this,'target',elementURL.string(v));}
         get enctype(){
-            htmlElementBrand(this,'form');const e=(rawDom('attr',this,'enctype')||'').toLowerCase();
+            htmlElementBrand(this,'form');const e=(reflectedAttr(this,'enctype')||'').toLowerCase();
             if(e==='multipart/form-data'||e==='text/plain')return e;
             return 'application/x-www-form-urlencoded';
         }
-        set enctype(v){htmlElementBrand(this,'form');dom('attr',this,'enctype',elementURL.string(v));}
-        get encoding(){htmlElementBrand(this,'form');const e=(rawDom('attr',this,'enctype')||'').toLowerCase();return e==='multipart/form-data'||e==='text/plain'?e:'application/x-www-form-urlencoded';}
-        set encoding(v){htmlElementBrand(this,'form');dom('attr',this,'enctype',elementURL.string(v));}
-        get noValidate(){htmlElementBrand(this,'form');return rawDom('attr',this,'novalidate')!==null;}
-        set noValidate(v){htmlElementBrand(this,'form');dom('attr',this,'novalidate',v?'':null);}
+        set enctype(v){htmlElementBrand(this,'form');reflectedAttr(this,'enctype',elementURL.string(v));}
+        get encoding(){htmlElementBrand(this,'form');const e=(reflectedAttr(this,'enctype')||'').toLowerCase();return e==='multipart/form-data'||e==='text/plain'?e:'application/x-www-form-urlencoded';}
+        set encoding(v){htmlElementBrand(this,'form');reflectedAttr(this,'enctype',elementURL.string(v));}
+        get noValidate(){htmlElementBrand(this,'form');return reflectedAttr(this,'novalidate')!==null;}
+        set noValidate(v){htmlElementBrand(this,'form');reflectedAttr(this,'novalidate',v?'':null);}
         submit(){htmlElementBrand(this,'form');dom('submit',this);}
         reset(){
             htmlElementBrand(this,'form');if(formResetting.has(this))return;
@@ -492,7 +505,7 @@
         requestSubmit(submitter){
             htmlElementBrand(this,'form');
             if(submitter!=null){
-                const tag=rawDom('get',submitter,'localName'),type=(rawDom('attr',submitter,'type')||'').toLowerCase();
+                const tag=rawDom('get',submitter,'localName'),type=(reflectedAttr(submitter,'type')||'').toLowerCase();
                 if(rawDom('get',submitter,'namespaceURI')!=='http://www.w3.org/1999/xhtml' ||
                    !(tag==='input' && (type==='submit'||type==='image') || tag==='button' && type!=='reset' && type!=='button'))
                     throw new TypeError('submitter must be a submit button');
@@ -618,74 +631,10 @@
         else throw new DOMException('Unsupported event interface','NotSupportedError');
         e._initialized=false;return e;
     };
-    class DOMTokenList {
-        #node;
-        static #string=String;
-        constructor(node){
-            if(rawDom('get',node,'nodeType')!==1)throw new TypeError('DOMTokenList requires an element');
-            this.#node=node;
-        }
-        #text(value){
-            if(typeof value==='symbol')throw new TypeError('Cannot convert Symbol to DOMString');
-            return DOMTokenList.#string(value);
-        }
-        #validate(token){
-            if(!token)throw new DOMException('The token is empty','SyntaxError');
-            if(/[\t\n\f\r ]/.test(token))throw new DOMException('The token contains ASCII whitespace','InvalidCharacterError');
-        }
-        #tokens(){return ((rawDom('attr',this.#node,'class')||'').match(/[^\t\n\f\r ]+/g)||[]).filter((x,i,a)=>a.indexOf(x)===i);}
-        #update(tokens){
-            if(tokens.length || rawDom('attr',this.#node,'class')!==null)dom('attr',this.#node,'class',tokens.join(' '));
-        }
-        get length(){return this.#tokens().length;}
-        item(index){
-            this.#node;if(!arguments.length)throw new TypeError('Missing token index');
-            index=index>>>0;return this.#tokens()[index]??null;
-        }
-        contains(token){
-            this.#node;if(!arguments.length)throw new TypeError('Missing token');
-            token=this.#text(token);return this.#tokens().includes(token);
-        }
-        add(...tokens){
-            this.#node;tokens=tokens.map(t=>this.#text(t));for(const token of tokens)this.#validate(token);
-            const current=this.#tokens();for(const token of tokens)if(!current.includes(token))current.push(token);
-            this.#update(current);
-        }
-        remove(...tokens){
-            this.#node;tokens=tokens.map(t=>this.#text(t));for(const token of tokens)this.#validate(token);
-            this.#update(this.#tokens().filter(t=>!tokens.includes(t)));
-        }
-        toggle(token,force){
-            this.#node;if(!arguments.length)throw new TypeError('Missing token');
-            token=this.#text(token);this.#validate(token);const current=this.#tokens(),has=current.includes(token);
-            if(has){if(force===undefined || !force){this.#update(current.filter(t=>t!==token));return false;}return true;}
-            if(force===undefined || !!force){current.push(token);this.#update(current);return true;}return false;
-        }
-        replace(token,replacement){
-            this.#node;if(arguments.length<2)throw new TypeError('Missing token/replacement');
-            token=this.#text(token);replacement=this.#text(replacement);
-            if(!token || !replacement)throw new DOMException('The token is empty','SyntaxError');
-            this.#validate(token);this.#validate(replacement);
-            const current=this.#tokens();if(!current.includes(token))return false;
-            const result=[];let replaced=false;
-            for(const item of current){
-                if(item===token || item===replacement){if(!replaced){result.push(replacement);replaced=true;}}
-                else result.push(item);
-            }
-            this.#update(result);return true;
-        }
-        supports(token){
-            this.#node;if(!arguments.length)throw new TypeError('Missing token');this.#text(token);
-            throw new TypeError('The class attribute has no supported-token vocabulary');
-        }
-        get value(){return rawDom('attr',this.#node,'class')||'';}
-        set value(v){this.#node;v=this.#text(v);dom('attr',this.#node,'class',v);}
-        [Symbol.iterator](){return this.#tokens()[Symbol.iterator]();}toString(){return rawDom('attr',this.#node,'class')||'';}
-    }
     function cssName(k){return String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase());}
     class StyleDeclaration {
         constructor(node){this.node=node;return new Proxy(this,{get(t,k){if(k in t||typeof k==='symbol')return Reflect.get(t,k);return t.getPropertyValue(cssName(k));},set(t,k,v){if(k in t)return Reflect.set(t,k,v);t.setProperty(cssName(k),v);return true;}});}
-        get cssText(){return this.node.getAttribute('style')||'';}set cssText(v){this.node.setAttribute('style',String(v));}
+        get cssText(){return reflectedAttr(this.node,'style')||'';}set cssText(v){reflectedAttr(this.node,'style',String(v));}
         getPropertyValue(name){return dom('style',this.node,String(name));}
         getPropertyPriority(name){return /!important\s*$/i.test(this.getPropertyValue(name))?'important':'';}
         setProperty(name,value,priority=''){dom('style',this.node,String(name),String(value),String(priority));}
@@ -694,55 +643,13 @@
         item(i){const a=this.cssText.split(';').filter(x=>x.includes(':'));return a[i]?a[i].split(':')[0].trim():'';}
     }
     for(const name of ['name','type','src','href','rel','action','method','placeholder','lang','dir','title'])
-        Object.defineProperty(HTMLElement.prototype,name,{configurable:true,get(){const s=this.getAttribute(name)||'';if(['src','href','action'].includes(name)&&s){try{return new URL(s,this.baseURI).href;}catch(_){return s;}}return s;},set(v){this.setAttribute(name,v);}});
+        Object.defineProperty(HTMLElement.prototype,name,{configurable:true,get(){const s=reflectedAttr(this,name)||'';if(['src','href','action'].includes(name)&&s){try{return new URL(s,this.baseURI).href;}catch(_){return s;}}return s;},set(v){reflectedAttr(this,name,String(v));}});
     const CSS={escape(s){return Array.from(String(s)).map((c,i)=>/[a-zA-Z_\-]/.test(c)||(/[0-9]/.test(c)&&i>0)?c:'\\'+c.codePointAt(0).toString(16)+' ').join('');}};
-    class Headers {
-        constructor(init){this._h=new Map();if(init instanceof Headers)for(const [k,v]of init)this.append(k,v);else if(Array.isArray(init))for(const [k,v]of init)this.append(k,v);else if(init)for(const k of Object.keys(init))this.append(k,init[k]);}
-        _name(k){k=String(k).toLowerCase();if(!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(k))throw new TypeError('Invalid header name');return k;}
-        _value(v){v=String(v).trim();if(/[\r\n\0]/.test(v))throw new TypeError('Invalid header value');return v;}
-        append(k,v){k=this._name(k);v=this._value(v);this._h.set(k,this._h.has(k)?this._h.get(k)+', '+v:v);}
-        set(k,v){this._h.set(this._name(k),this._value(v));}
-        get(k){return this._h.get(this._name(k))??null;}
-        has(k){return this._h.has(this._name(k));}delete(k){this._h.delete(this._name(k));}
-        entries(){return this._h.entries();}keys(){return this._h.keys();}values(){return this._h.values();}
-        forEach(fn,thisArg){for(const [k,v]of this)fn.call(thisArg,v,k,this);}[Symbol.iterator](){return this.entries();}
-    }
-    class Response {
-        constructor(body='',init={}){this.status=init.status??200;this.statusText=init.statusText||'';this.url=init.url||'';this.redirected=!!init.redirected;this.ok=this.status>=200&&this.status<300;this.headers=new Headers(init.headers);this.bodyUsed=false;this._text=String(body);this._bytes=init.bytes||host.encode(this._text);this.type='basic';}
-        _use(){if(this.bodyUsed)throw new TypeError('Body already consumed');this.bodyUsed=true;}
-        text(){return Promise.resolve().then(()=>{this._use();return this._text;});}
-        json(){return this.text().then(t=>JSON.parse(t));}
-        arrayBuffer(){return Promise.resolve().then(()=>{this._use();return this._bytes.slice(0);});}
-        clone(){if(this.bodyUsed)throw new TypeError('Body already consumed');return new Response(this._text,{status:this.status,statusText:this.statusText,url:this.url,headers:this.headers,bytes:this._bytes.slice(0),redirected:this.redirected});}
-    }
-    class DOMException extends Error {constructor(message='',name='Error'){super(message);this.name=String(name);}}
-    class AbortSignal extends EventTarget {
-        constructor(){super();this.aborted=false;this.reason=undefined;}
-        throwIfAborted(){if(this.aborted)throw this.reason;}
-        static abort(reason){const c=new AbortController();c.abort(reason);return c.signal;}
-        static timeout(ms){const c=new AbortController();setTimeout(()=>c.abort(new DOMException('Timed out','TimeoutError')),ms);return c.signal;}
-    }
-    class AbortController {
-        constructor(){this.signal=new AbortSignal();}
-        abort(reason=new DOMException('The operation was aborted','AbortError')){if(this.signal.aborted)return;this.signal.aborted=true;this.signal.reason=reason;this.signal.dispatchEvent(new Event('abort'));}
-    }
-    function fetch(input,init={}) {
-        const url=typeof input==='string'?input:String(input.url??input),method=String(init.method||'GET').toUpperCase();
-        const headers=new Headers(init.headers),signal=init.signal;
-        if(signal&&signal.aborted)return Promise.reject(signal.reason);
-        const credentials=init.credentials===undefined?'same-origin':String(init.credentials);
-        if(!['omit','same-origin','include'].includes(credentials))return Promise.reject(new TypeError('Invalid credentials mode'));
-        if(init.mode && !['cors','same-origin'].includes(init.mode))return Promise.reject(new TypeError('Unsupported fetch mode'));
-        if(!['GET','POST'].includes(method))return Promise.reject(new TypeError('Only GET and POST are supported'));
-        let body=init.body==null?'':String(init.body);
-        if(method==='GET'&&body)return Promise.reject(new TypeError('GET cannot have a body'));
-        if(method==='POST'&&init.body!=null&&!headers.has('content-type'))headers.set('content-type','text/plain;charset=UTF-8');
-        let raw='';for(const [k,v]of headers)raw+=k+': '+v+'\r\n';
-        let pair;try{pair=host.fetch(url,method,raw,body,init.mode==='same-origin',['omit','same-origin','include'].indexOf(credentials));}catch(e){return Promise.reject(e);}
-        let abort;
-        if(signal){abort=()=>host.cancel(pair.id);signal.addEventListener('abort',abort,{once:true});}
-        return pair.promise.finally(()=>{if(signal)signal.removeEventListener('abort',abort);});
-    }
+    const exceptionString=String;
+    class DOMException extends Error {constructor(message='',name='Error'){super(message);this.name=exceptionString(name);}}
+    /* @include js_tokens.js */
+    const DOMTokenList=tokenListBridge.DOMTokenList;
+    /* @include js_fetch.js */
     const location={assign(url){host.navigate(String(url),0);},replace(url){host.navigate(String(url),2);},reload(){host.navigate(host.url(),1);},toString(){return this.href;}};
     Object.defineProperties(location,{href:{get(){return host.url();},set(v){host.navigate(String(v));}}});
     document.location=location;
@@ -755,11 +662,11 @@
     function cancelAnimationFrame(id){host.clear(Number(id));}
     function queueMicrotask(fn){return host.microtask(fn);}
     const navigator={userAgent:'Nocturne/1.0 QuickJS',platform:'Nocturne',language:'en-US',languages:['en-US'],onLine:true};
-    Object.assign(globalThis,{document,console,navigator,Node,Element,HTMLElement,HTMLIFrameElement,HTMLImageElement,Image,
+    Object.assign(globalThis,{document,console,navigator,Node,Element,HTMLElement,HTMLUnknownElement,HTMLIFrameElement,HTMLImageElement,Image,
         HTMLInputElement,HTMLButtonElement,HTMLSelectElement,HTMLTextAreaElement,HTMLFieldSetElement,HTMLObjectElement,HTMLOutputElement,HTMLOptionElement,
         HTMLScriptElement,HTMLFormElement,HTMLAnchorElement,HTMLAreaElement,
         Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,Comment,ProcessingInstruction,DocumentFragment,
-        Event,CustomEvent,UIEvent,MouseEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Response,DOMException,AbortController,AbortSignal,
+        Event,CustomEvent,UIEvent,MouseEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,AbortController,AbortSignal,
         fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,
         performance:{now:()=>host.now()},getComputedStyle:n=>new Proxy({getPropertyValue:k=>dom('computed',n,String(k))},{get(t,k){return k in t?t[k]:t.getPropertyValue(cssName(k));}})});
     Object.defineProperty(globalThis,'location',{configurable:true,get(){return location;},set(v){host.navigate(String(v));}});
@@ -789,11 +696,14 @@
     let historyEvent;
     /* @include js_encoding.js */
     /* @include js_url.js */
+    fetchBridge.initialize();
     /* @include js_importmaps.js */
     /* @include js_hyperlink.js */
+    /* @include js_html_elements.js */
     /* @include js_xhr.js */
     /* @include js_screen.js */
     /* @include js_intl.js */
+    /* @include js_collator.js */
     /* @include js_crypto.js */
     /* @include js_clone.js */
     /* @include js_storage.js */
@@ -808,14 +718,22 @@
     /* @include js_selection.js */
     /* @include js_document.js */
     /* @include js_svg.js */
+    /* @include js_attributes.js */
+    /* @include js_shadow.js */
+    /* @include js_web_legacy.js */
+    /* @include js_form_controls.js */
+    /* @include js_form_validation.js */
+    /* @include js_semantic_elements.js */
     customElementsReady = true;
     /* Private native-input state, never reachable from page JS. C supplies the
        hit target's complete ancestry BEFORE any event handler can change it.
        Keep the previous snapshot, including ancestors of now-detached nodes. */
     let hoverPath = [];
+    let hoverSnapshot = shadowBridge.capture([]);
     function hover(path, init) {
         if (path.length && path[path.length-1] === document) path[path.length] = globalThis;
         const previous = hoverPath, from = previous[0] || null, to = path[0] || null;
+        const previousSnapshot=hoverSnapshot,currentSnapshot=shadowBridge.capture(path);
         const tasks = [];
         function contains(a,n) { for (let i=0;i<a.length;i++) if(a[i]===n) return true; return false; }
         function queue(type, ancestry, index, related, boundary) {
@@ -823,7 +741,9 @@
                 relatedTarget:related,bubbles:!boundary,cancelable:!boundary,composed:!boundary
             }));
             e.isTrusted = true;
-            tasks[tasks.length] = {event:e,path:apply(eventSlice,ancestry,[index])};
+            const own=ancestry===previous?previousSnapshot:currentSnapshot,other=ancestry===previous?currentSnapshot:previousSnapshot;
+            const part={nodes:apply(eventSlice,ancestry,[index]),info:own.info};
+            tasks[tasks.length] = {event:e,target:part.nodes[0],plan:shadowBridge.path(part.nodes[0],e,part,other)};
         }
         if (from !== to && from) queue('mouseout',previous,0,to,false);
         for (let i=0;i<previous.length;i++) {
@@ -839,12 +759,13 @@
         }
         if (to) queue('mousemove',path,0,null,false);
         hoverPath = path;
+        hoverSnapshot = currentSnapshot;
         let i=0;
         /* Return to native code between events: each native dispatch needs its
            microtask checkpoint, without rebuilding the snapshotted paths. */
         return function nextHoverEvent() {
             if(i===tasks.length) return false;
-            const task=tasks[i++]; dispatch(task.path[0],task.event,task.path);
+            const task=tasks[i++]; dispatch(task.target,task.event,task.plan);
             return true;
         };
     }
@@ -858,8 +779,10 @@
         imageError(){return new DOMException('The image request changed or could not be decoded','EncodingError');},
         hover,
         customElementBefore(...args){
-            const reactionArgs=args[0]==='adopt' && args[2]?['remove',args[2]]:args;
-            const ce=reactionArgs[1] && rawDom('get',reactionArgs[1],'scripting')?customElementsBridge.before(...reactionArgs):null;
+            const reactionArgs=args[0]==='adopt' && args[2] && rawDom('get',args[2],'nodeType')!==2?['remove',args[2]]:args;
+            const reactionNode=args[0]==='adopt' && args[2] && rawDom('get',args[2],'nodeType')===2?rawDom('get',args[2],'attrOwner'):reactionArgs[1];
+            const ceActive=reactionNode && rawDom('get',reactionNode,'scripting') || args[0]==='adopt' && rawDom('get',args[1],'scripting');
+            const ce=ceActive?customElementsBridge.before(...args):null;
             let mutationArgs=reactionArgs;
             if(args[0]==='set' && args[2]==='innerHTML' && args[1] instanceof HTMLTemplateElement)
                 mutationArgs=['set',rawDom('get',args[1],'templateContent'),'innerHTML',args[3]];
@@ -868,16 +791,18 @@
         },
         customElementAfter(token,result){mutationBridge.after(token.mutation);if(token.op!=='clone' || !result || rawDom('get',result,'scripting'))customElementsBridge.after(token.ce,result);},
         customElementScan(){customElementsBridge.upgradeTree(document);},
+        slotChanges(){mutationBridge.signalSlots();},
+        detailsToggle(target,oldOpen,newOpen){semanticElementsBridge.toggle(target,oldOpen,newOpen);},
         historyEvent(oldURL,popstate){historyEvent(oldURL,popstate);},
         mediaChanged(){mediaBridge.changed();},
-        inertClick(target){return dispatch(target,new MouseEvent('click',{bubbles:true,cancelable:true}));},
+        inertClick(target){return dispatch(target,new MouseEvent('click',{bubbles:true,cancelable:true,composed:true}));},
         nodeProtos:[Node.prototype,HTMLDocument.prototype,Element.prototype,HTMLElement.prototype,
             Text.prototype,Comment.prototype,DocumentFragment.prototype,HTMLIFrameElement.prototype,HTMLImageElement.prototype,
             HTMLInputElement.prototype,HTMLButtonElement.prototype,HTMLSelectElement.prototype,HTMLTextAreaElement.prototype,
             HTMLFieldSetElement.prototype,HTMLObjectElement.prototype,HTMLOutputElement.prototype,HTMLOptionElement.prototype,HTMLTemplateElement.prototype,DocumentType.prototype,
-            HTMLScriptElement.prototype,HTMLFormElement.prototype,HTMLAnchorElement.prototype,HTMLAreaElement.prototype,...svgBridge.nodeProtos,ProcessingInstruction.prototype],
-        dispatch(target,type,init){const C=/^(key)/.test(type)?KeyboardEvent:/^(mouse|click|dblclick)/.test(type)?MouseEvent:Event;const e=new C(type,init);Object.assign(e,init);e.isTrusted=true;return dispatch(target===null?globalThis:target,e);},
-        response(status,url,raw,text,bytes,redirected){const headers=new Headers();for(const line of raw.split(/\r?\n/)){const i=line.indexOf(':');if(i>0){const k=line.slice(0,i);if(!/^set-cookie2?$/i.test(k))headers.append(k,line.slice(i+1));}}return new Response(text,{status,url,headers,bytes,redirected});},
+            HTMLScriptElement.prototype,HTMLFormElement.prototype,HTMLAnchorElement.prototype,HTMLAreaElement.prototype,...svgBridge.nodeProtos,ProcessingInstruction.prototype,attributeBridge.nodeProto,...htmlElementsBridge.nodeProtos,shadowBridge.ShadowRoot.prototype,shadowBridge.HTMLSlotElement.prototype,...semanticElementsBridge.nodeProtos,HTMLUnknownElement.prototype],
+        dispatch(target,type,init){const C=type==='submit'?formValidationBridge.SubmitEvent:/^(key)/.test(type)?KeyboardEvent:/^(mouse|click|dblclick)/.test(type)?MouseEvent:Event;const e=new C(type,init);for(const k of Object.keys(init))if(k!=='submitter')e[k]=init[k];e.composed=/^(?:keydown|keyup|keypress|click|dblclick|mousedown|mouseup|mouseout|mousemove|mouseover|wheel|focus|blur|focusin|focusout|input)$/.test(type);e.isTrusted=true;return dispatch(target===null?globalThis:target,e);},
+        response(...args){return fetchBridge.response(...args);},
         reject(message,abort){return abort?new DOMException(message,'AbortError'):new TypeError(message);}
     };
 })(__nocturne_host);

@@ -1536,7 +1536,8 @@ static bool parse_content(const char *s, size_t n, struct cx *cx) {
             node_t *e = cx->node;
             if (e)
                 for (int j = 0; j < e->nattrs; j++)
-                    if (strn_ieq(an, e->attrs[j].name, anl)) sb_puts(&b, e->attrs[j].value);
+                    if (!e->attrs[j].namespace_uri && strlen(e->attrs[j].raw) == anl &&
+                        !memcmp(an, e->attrs[j].raw, anl)) sb_puts(&b, e->attrs[j].value);
         } else if (vn > 8 && (strn_ieq(v, "counter(", 8) || strn_ieq(v, "counters(", 9))) {
             if (cx->supports_probe) { sb_free(&b); return false; }
         } else if (vn > 4 && (strn_ieq(v, "url(", 4) || strn_ieq(v, "image-set(", 10) ||
@@ -2551,7 +2552,9 @@ void css_style_finish(style_t *s, const style_t *parent, bool root) {
 
 /* ---------------------------------------------------------------- the user agent stylesheet */
 const char *css_ua_sheet(void) {
-    return "html, address, blockquote, body, center, dialog, div, figure, figcaption, footer, form, header, hr, "
+    /* Slots remain real DOM nodes but have no wrapper box by default. */
+    return "slot { display: contents; }\n"
+           "html, address, blockquote, body, center, dialog, div, figure, figcaption, footer, form, header, hr, "
            "legend, listing, main, p, plaintext, pre, search, xmp, article, aside, h1, h2, h3, h4, h5, h6, hgroup, "
            "nav, section, dir, dd, dl, dt, menu, ol, ul, details, summary, fieldset, optgroup { display: block; }\n"
            "head, script, style, title, meta, link, base, template, datalist, param, noembed, noframes, area, map, "
@@ -2617,9 +2620,9 @@ const char *css_ua_sheet(void) {
            "input[type=image] { border: none; padding: 0; }\n"
            "select { padding-right: 18px; }\n"
            "option, optgroup { display: none; }\n"
-           "summary { display: list-item; list-style: disclosure-closed inside; }\n"
-           "details[open] > summary { list-style-type: disclosure-open; }\n"
-           "details:not([open]) > :not(summary) { display: none; }\n"
+           "summary { display: block; }\n"
+           "details > summary:first-of-type { display: list-item; list-style: disclosure-closed inside; }\n"
+           "details[open] > summary:first-of-type { list-style-type: disclosure-open; }\n"
            "ruby { display: ruby; } rt { font-size: 50%; }\n"
            "nobr { white-space: nowrap; }\n"
            "wbr { display: inline; }\n"

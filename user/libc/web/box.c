@@ -4,6 +4,7 @@
    form controls, inline SVG) become atomic boxes. */
 #include <stdio.h>
 #include "webi.h"
+#include "elements.h"
 #include "svg_geometry.h"
 
 struct bctx {
@@ -166,45 +167,76 @@ static void alpha(char *out, int v, bool upper) {
     out[n] = 0;
 }
 
-static bool is_li(node_t *n) { return n->type == N_ELEM && n->style && n->style->display == D_LIST_ITEM; }
+static bool is_li(node_t *n) {
+    if (n->type != N_ELEM || !n->style || n->style->display != D_LIST_ITEM) return false;
+    for (node_t *c = n, *p; c; c = p) {
+        if (c->style && c->style->display == D_NONE) return false;
+        p = doc_flat_parent(c);
+        if (p && !p->foreign && p->tag == T_details && !node_attr(p, "open") && doc_details_summary(p) != c)
+            return false;
+    }
+    return true;
+}
 
-/* the number of a list item, honouring <ol start reversed> and <li value> */
+/* Unlike atoi, HTML integer parsing distinguishes invalid/missing values from
+   a real zero and never overflows on author-provided attribute strings. */
+static bool list_integer(const char *s, int *out) {
+    if (!s) return false;
+    while (is_space((unsigned char)*s)) s++;
+    bool negative = *s == '-';
+    if (*s == '-' || *s == '+') s++;
+    if (*s < '0' || *s > '9') return false;
+    uint64_t value = 0, limit = negative ? 2147483648ull : 2147483647ull;
+    while (*s >= '0' && *s <= '9') {
+        unsigned digit = (unsigned)(*s++ - '0');
+        if (value > (limit - digit) / 10) return false;
+        value = value * 10 + digit;
+    }
+    *out = negative ? (int)(-(int64_t)value) : (int)value;
+    return true;
+}
+
+static node_t *list_owner(node_t *item) {
+    node_t *ancestor = item->parent;
+    for (node_t *p = item->parent; p; p = p->parent)
+        if (!p->foreign && (p->tag == T_ol || p->tag == T_ul || p->tag == T_menu)) { ancestor = p; break; }
+    for (; ancestor; ancestor = ancestor->parent)
+        if (ancestor->style && ancestor->style->display != D_NONE && ancestor->style->display != D_CONTENTS)
+            return ancestor;
+    return NULL;
+}
+
+static int owned_count(node_t *subtree, node_t *owner) {
+    int count = is_li(subtree) && list_owner(subtree) == owner ? 1 : 0;
+    for (node_t *n = subtree->first; n; n = n->next) count += owned_count(n, owner);
+    return count;
+}
+
+static bool owned_ordinal(node_t *subtree, node_t *owner, node_t *item, int step, int64_t *number) {
+    if (is_li(subtree) && list_owner(subtree) == owner) {
+        int explicit_value;
+        if (!subtree->foreign && subtree->tag == T_li && list_integer(node_attr(subtree, "value"), &explicit_value))
+            *number = explicit_value;
+        if (subtree == item) return true;
+        *number += step;
+    }
+    for (node_t *n = subtree->first; n; n = n->next)
+        if (owned_ordinal(n, owner, item, step, number)) return true;
+    return false;
+}
+
+/* The owning list, not merely siblings, supplies reversed/start/value order.
+   Nested lists are independent; display:none items never affect numbering. */
 static int list_ordinal(node_t *li) {
-    node_t *list = li->parent;
-    bool reversed = list && list->tag == T_ol && node_attr(list, "reversed");
-    int step = reversed ? -1 : 1;
-    int n = 0;
-    node_t *from = NULL;
-    for (node_t *s = li; s; s = s->prev) {
-        if (!is_li(s)) continue;
-        const char *v = node_attr(s, "value");
-        if (v && s->tag == T_li) {
-            from = s;
-            n = atoi(v);
-            break;
-        }
-    }
-    if (!from) {
-        int start;
-        const char *st = list && list->tag == T_ol ? node_attr(list, "start") : NULL;
-        if (st) start = atoi(st);
-        else if (reversed) {
-            start = 0;
-            for (node_t *s = list->first; s; s = s->next)
-                if (is_li(s)) start++;
-        } else start = 1;
-        n = start - step;
-        for (node_t *s = list ? list->first : li; s; s = s->next) {
-            if (is_li(s)) n += step;
-            if (s == li) break;
-        }
-        return n;
-    }
-    for (node_t *s = from->next; s; s = s->next) {
-        if (s == li) break;
-        if (is_li(s)) n += step;
-    }
-    return from == li ? n : n + step;
+    node_t *owner = list_owner(li);
+    if (!owner) return 1;
+    bool ordered = !owner->foreign && owner->tag == T_ol;
+    bool reversed = ordered && node_attr(owner, "reversed");
+    int start;
+    if (!ordered || !list_integer(node_attr(owner, "start"), &start)) start = reversed ? owned_count(owner, owner) : 1;
+    int64_t number = start;
+    owned_ordinal(owner, owner, li, reversed ? -1 : 1, &number);
+    return number < -2147483648ll ? -2147483647 - 1 : number > 2147483647ll ? 2147483647 : (int)number;
 }
 
 static void make_marker(struct bctx *b, box_t *x, node_t *n, style_t *st) {
@@ -263,27 +295,6 @@ static void xml_escape(sbuf *b, const char *s, size_t n, bool attr) {
     }
 }
 
-/* HTML's adjust-SVG-attributes seam, kept local to serialization until the
-   parser/DOM name adjustment is unified. Do not pass raw HTML spelling to the
-   case-sensitive XML codec. WHATWG HTML parsing, adjust SVG attributes. */
-static const char *svg_attribute_name(const char *name, const char *raw) {
-    static const char *const adjusted[] = {
-        "attributeName", "attributeType", "baseFrequency", "baseProfile", "calcMode", "clipPathUnits",
-        "diffuseConstant", "edgeMode", "filterUnits", "glyphRef", "gradientTransform", "gradientUnits",
-        "kernelMatrix", "kernelUnitLength", "keyPoints", "keySplines", "keyTimes", "lengthAdjust",
-        "limitingConeAngle", "markerHeight", "markerUnits", "markerWidth", "maskContentUnits", "maskUnits",
-        "numOctaves", "pathLength", "patternContentUnits", "patternTransform", "patternUnits", "pointsAtX",
-        "pointsAtY", "pointsAtZ", "preserveAlpha", "preserveAspectRatio", "primitiveUnits", "refX", "refY",
-        "repeatCount", "repeatDur", "requiredExtensions", "requiredFeatures", "specularConstant",
-        "specularExponent", "spreadMethod", "startOffset", "stdDeviation", "stitchTiles", "surfaceScale",
-        "systemLanguage", "tableValues", "targetX", "targetY", "textLength", "viewBox", "viewTarget",
-        "xChannelSelector", "yChannelSelector", "zoomAndPan"
-    };
-    for (size_t i = 0; i < sizeof adjusted / sizeof *adjusted; i++)
-        if (str_ieq(name, adjusted[i])) return adjusted[i];
-    return raw;
-}
-
 static void svg_ser(web_doc *d, sbuf *b, node_t *n, const char *color, int depth) {
     if (depth > 64) return;
     if (n->type == N_TEXT) {
@@ -292,12 +303,16 @@ static void svg_ser(web_doc *d, sbuf *b, node_t *n, const char *color, int depth
     }
     if (n->type != N_ELEM) return;
     float viewbox[4];
-    int view = n->tag == T_svg ? svg_viewbox(node_attr(n, "viewbox"), viewbox) : 0;
+    int view = n->tag == T_svg ? svg_viewbox(node_attr(n, "viewBox"), viewbox) : 0;
     if (view == 2) return; /* valid zero viewport suppresses its contents */
     if (!strcmp(n->name, "use")) { /* inline what it refers to: nanosvg has no <use> */
         const char *h = node_attr(n, "href");
-        if (!h) h = node_attr(n, "xlink:href");
-        node_t *t = h && h[0] == '#' && d->root ? find_id(d->root, h + 1) : NULL;
+        if (!h) {
+            int index = doc_attr_index(n, "http://www.w3.org/1999/xlink", "href", true);
+            if (index >= 0) h = n->attrs[index].value;
+        }
+        node_t *scope = doc_node_root(n, false);
+        node_t *t = h && h[0] == '#' && scope ? find_id(scope, h + 1) : NULL;
         if (t && depth < 32) {
             sb_puts(b, "<g");
             const char *x = node_attr(n, "x"), *y = node_attr(n, "y");
@@ -324,11 +339,24 @@ static void svg_ser(web_doc *d, sbuf *b, node_t *n, const char *color, int depth
     sb_puts(b, n->raw_name);
     bool xmlns = false;
     for (int i = 0; i < n->nattrs; i++) {
+        const char *attribute_name = n->attrs[i].raw;
+        const char *ns = n->attrs[i].namespace_uri, *local = n->attrs[i].local;
+        /* The codec recognizes literal prefixes, not DOM namespaces. A colon
+           in an ordinary DOM attribute must not fabricate an XML/XLink one. */
+        if (!ns && strchr(attribute_name, ':')) continue;
+        /* Lexbor already adjusted parsed SVG names. Preserve DOM spelling and
+           never serialize arbitrary namespaced fill/viewBox as ordinary SVG. */
+        if (ns) {
+            if (!strcmp(ns, "http://www.w3.org/1999/xlink") && local && !strcmp(local, "href")) attribute_name = "xlink:href";
+            else if (!strcmp(ns, "http://www.w3.org/XML/1998/namespace") && local && !strcmp(local, "lang")) attribute_name = "xml:lang";
+            else if (!strcmp(ns, "http://www.w3.org/XML/1998/namespace") && local && !strcmp(local, "space")) attribute_name = "xml:space";
+            else if (strcmp(ns, "http://www.w3.org/2000/xmlns/")) continue;
+        }
         if (!strcmp(n->attrs[i].name, "viewbox") && view == 0 && n->tag == T_svg) continue;
         const char *v = n->attrs[i].value;
         if (!strcmp(n->attrs[i].name, "xmlns")) xmlns = true;
         sb_putc(b, ' ');
-        sb_puts(b, svg_attribute_name(n->attrs[i].name, n->attrs[i].raw));
+        sb_puts(b, attribute_name);
         sb_puts(b, "=\"");
         /* currentColor is resolved here; nanosvg does not know it */
         for (const char *p = v; *p;) {
@@ -436,7 +464,33 @@ static void pseudo_box(struct bctx *b, box_t *pb, node_t *e, style_t *ps) {
 
 static void children(struct bctx *b, box_t *pb, node_t *e, style_t *st) {
     if (st->before) pseudo_box(b, pb, e, st->before);
-    for (node_t *c = e->first; c; c = c->next) gen(b, pb, c, st);
+    pvec list = {0};
+    doc_flat_children(e, &list);
+    bool details = !e->foreign && e->tag == T_details;
+    node_t *summary = details ? doc_details_summary(e) : NULL;
+    if (details && !summary) {
+        /* The default legend is a renderer-owned box, never an invented DOM
+           child. Hit testing associates this box with the native details. */
+        style_t *legend = anon_style(b, st, D_LIST_ITEM);
+        legend->list_style = LS_STRING;
+        legend->list_style_string = node_attr(e, "open") ? "\xe2\x96\xbe " : "\xe2\x96\xb8 ";
+        legend->list_style_inside = true;
+        box_t *x = nbox(b, B_BLOCK, e, legend);
+        x->anon = true;
+        make_marker(b, x, e, legend);
+        if (x->marker) text_box(b, x, e, x->marker, strlen(x->marker), legend);
+        x->marker = NULL;
+        text_box(b, x, e, "Details", 7, legend);
+        fixup(b, x);
+        append(pb, x);
+    }
+    if (details && summary) gen(b, pb, summary, st);
+    for (int i = 0; i < list.n; i++) {
+        node_t *child = list.v[i];
+        if (details && (child == summary || !node_attr(e, "open"))) continue;
+        gen(b, pb, child, st);
+    }
+    pv_free(&list);
     if (st->after) pseudo_box(b, pb, e, st->after);
 }
 
@@ -489,7 +543,7 @@ static void gen(struct bctx *b, box_t *pb, node_t *n, style_t *pst) {
         children(b, pb, n, st);
         return;
     }
-    if (n->tag == T_br) {
+    if (n->tag == T_br || n->tag == T_wbr) {
         append(pb, nbox(b, B_BR, n, st));
         return;
     }
@@ -718,6 +772,7 @@ static void fixup(struct bctx *b, box_t *x) {
 }
 
 static void clear_boxes(node_t *n) {
+    if (n->shadow_root) clear_boxes(n->shadow_root);
     for (node_t *c = n->first; c; c = c->next) {
         c->box = NULL;
         c->anchor_block = NULL;

@@ -86,12 +86,26 @@ static const struct test tests[] = {
     /* the web engine, offline: layout, painting, forms, charsets, URLs, hostile input */
     {"web", "fonts", "tcc -o /home/fonttest /data/tests/fonttest.c && /home/fonttest", 0,
      {"fonttest: ", ", 0 failed"}, "FAIL", 120, false, true},
-    {"web", "engine", "tcc -o /home/webtest /data/tests/webtest.c && /home/webtest", 0, {"webtest: ", ", 0 failed"}, "FAIL",
+    {"web", "engine", "tcc -I/data/tests -o /home/webtest /data/tests/webtest.c && /home/webtest", 0, {"webtest: ", ", 0 failed"}, "FAIL",
      120, false, true},
     {"web", "javascript", "tcc -o /home/jstest /data/tests/jstest.c && /home/jstest", 0,
-     {"jstest: ", ", 0 failed"}, "FAIL", 180, false, true},
+     /* Whole-suite QEMU wall time includes repeated fresh browser contexts and
+        7,000+ collation comparisons; the page's 5s JS watchdog is unchanged. */
+     {"jstest: ", ", 0 failed"}, "FAIL", 900, false, true},
     {"web", "html-tree-builder", "tcc -I/data/tests -o /home/lexbortest /data/tests/lexbortest.c && /home/lexbortest", 0,
      {"lexbortest: ", ", 0 failures"}, "FAIL", 120, false, true},
+    {"web", "attribute-nodes", "tcc -I/data/tests -o /home/js_attributes_native /data/tests/js_attributes_native.c && /home/js_attributes_native", 0,
+     {"js_attributes_native: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"web", "shadow-dom-native", "tcc -I/data/tests -o /home/shadownativetest /data/tests/shadownativetest.c && /home/shadownativetest", 0,
+     {"shadownativetest: ", ", 0 failures"}, "FAIL", 120, false, true},
+    {"web", "semantic-elements", "tcc -I/data/tests -o /home/semanticstest /data/tests/semanticstest.c && /home/semanticstest", 0,
+     {"semanticstest: ", ", 0 failures"}, "FAIL", 120, false, true},
+    {"web", "form-control-values", "tcc -I/data/tests -o /home/js_form_controls_native /data/tests/js_form_controls_native.c && /home/js_form_controls_native", 0,
+     {"js_form_controls_native: ", ", 0 failed"}, "FAIL", 180, false, true},
+    {"web", "shadow-dom-render", "tcc -I/data/tests -o /home/shadowtest /data/tests/shadowtest.c && /home/shadowtest", 0,
+     {"shadowtest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"web", "collation-decoder", "tcc -I/data/tests -o /home/js_collator_native /data/tests/js_collator_native.c && /home/js_collator_native", 0,
+     {"js_collator_native: ", ", 0 failed"}, "FAIL", 120, false, true},
     {"web", "http-transport", "tcc -o /home/httptest /data/tests/httptest.c && /home/httptest", 0,
      {"httptest: ", ", 0 failed"}, "FAIL", 120, false, true},
     {"web", "cookies", "tcc -o /home/cookietest /data/tests/cookietest.c && /home/cookietest", 0,
@@ -118,6 +132,8 @@ static const struct test tests[] = {
      {"storagetest: ", ", 0 failed"}, "FAIL", 180, false, true},
     {"web", "worker-network", "tcc -o /home/webnettest /data/tests/webnettest.c && /home/webnettest", 0,
      {"webnettest: 0 failed"}, "FAIL", 120, false, true},
+    {"web", "tcp-capacity-recovery", "tcc -o /home/tcpcapacitytest /data/tests/tcpcapacitytest.c && /home/tcpcapacitytest", 0,
+     {"tcpcapacitytest: ", ", 0 failed"}, "FAIL", 180, false, true},
 
     /* TCP against the host's test server (no internet needed), clean and with simulated loss */
     {"tcp", "bulk-and-loss", "tcc -o /home/tcptest /data/tests/tcptest.c && /home/tcptest", 0, {"tcptest: 0 failed"},

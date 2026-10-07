@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <math.h>
 #include "webi.h"
+#include "elements.h"
+#include "form_value.h"
+#include "form_validation.h"
 
 enum { M_PAINT, M_HIT };
 
@@ -549,7 +552,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     bool focused = P->d->focus == n;
     switch (b->atomic) {
     case AT_INPUT: case AT_TEXTAREA: {
-        const char *v = n->value ? n->value : "";
+        const char *v = web_input_edit_text(n);
         bool placeholder = !*v;
         if (placeholder) v = node_attr(n, "placeholder");
         if (!v) v = "";
@@ -824,16 +827,14 @@ static int control_hit(box_t *b) {
     case AT_RADIO: return WEB_HIT_RADIO;
     case AT_SELECT: return WEB_HIT_SELECT;
     case AT_BUTTON_INPUT: {
-        const char *t = node_attr(b->node, "type");
-        return t && str_ieq(t, "submit") ? WEB_HIT_SUBMIT : WEB_HIT_BUTTON;
+        return web_control_submit_button(b->node) ? WEB_HIT_SUBMIT : WEB_HIT_BUTTON;
     }
     case AT_IMG:
         if (b->node && b->node->tag == T_input) return WEB_HIT_SUBMIT; /* <input type=image> */
         return WEB_HIT_NONE;
     case AT_INLINE_BLOCK:
         if (b->node && b->node->tag == T_button) {
-            const char *t = node_attr(b->node, "type");
-            return !t || str_ieq(t, "submit") ? WEB_HIT_SUBMIT : WEB_HIT_BUTTON;
+            return web_control_submit_button(b->node) ? WEB_HIT_SUBMIT : WEB_HIT_BUTTON;
         }
     }
     return WEB_HIT_NONE;
@@ -851,6 +852,27 @@ static void set_hit(struct pctx *P, int kind, node_t *n, node_t *link) {
             P->hit->kind = WEB_HIT_LINK;
             P->hit->node = link;
         }
+    }
+}
+
+static void set_disclosure_hit(struct pctx *P, node_t *details) {
+    /* The action belongs to details, but the event target stays the summary
+       (or its actual child), not a renderer-invented summary DOM node. */
+    node_t *target = P->target;
+    set_hit(P, WEB_HIT_DETAILS, details, NULL);
+    P->target = target;
+}
+
+static void finish_disclosure_hit(struct pctx *P) {
+    if (P->hit->kind != WEB_HIT_NONE && P->hit->kind != WEB_HIT_DETAILS) return;
+    node_t *details = doc_details_activation(P->target);
+    if (details) set_disclosure_hit(P, details);
+    else if (P->hit->kind == WEB_HIT_DETAILS && P->target != P->hit->node) {
+        /* A disabled control, label or other interactive descendant does not
+           accidentally inherit its summary's activation. */
+        P->hit->kind = WEB_HIT_NONE;
+        P->hit->node = NULL;
+        P->hit_any = false;
     }
 }
 
@@ -916,7 +938,7 @@ static void paint_runs(struct pctx *P, box_t *b) {
             float asc, desc;
             wf_metrics(&f, &asc, &desc);
             if (inside(P, bx + r->x, by + r->y - asc, r->w, asc + desc)) {
-                if (r->node) P->target = r->node->type == N_ELEM ? r->node : r->node->parent;
+                if (r->node) P->target = r->node->type == N_ELEM ? r->node : doc_flat_parent(r->node);
                 if (r->link) set_hit(P, WEB_HIT_NONE, NULL, r->link);
             }
             continue;
@@ -946,7 +968,17 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     float bh = b->h + b->p[0] + b->p[2] + b->b[0] + b->b[2];
     if (P->mode == M_HIT && !st->visibility && b->node &&
         b->kind != B_TEXT && inside(P, bx, by, bw, bh))
-        P->target = b->node->type == N_ELEM ? b->node : b->node->parent;
+        P->target = b->node->type == N_ELEM ? b->node : doc_flat_parent(b->node);
+    if (P->mode == M_HIT && !st->visibility && b->node && !b->node->foreign &&
+        b->kind != B_TEXT && (inside(P, bx, by, bw, bh) ||
+        ((b->marker || b->marker_shape) && inside(P, bx - st->font_size * 2, by, st->font_size * 2, bh)))) {
+        node_t *details = b->node->tag == T_summary ? doc_details_activation(b->node) :
+                          b->anon && b->node->tag == T_details && !doc_details_summary(b->node) ? b->node : NULL;
+        if (details) {
+            P->target = b->node;
+            set_disclosure_hit(P, details);
+        }
+    }
     bool clip = st->overflow != OV_VISIBLE && b->kind != B_INLINE && b->parent;
     /* Off-screen contexts can still contain viewport-fixed descendants. */
     if (clip && !layers.n && (P->oy + by > c->cy1 || P->oy + by + bh < c->cy0)) { pv_free(&layers); return; }
@@ -1096,6 +1128,7 @@ bool web_hit_test(web_doc *d, int x, int y, struct web_hit *hit) {
     P.hy = (float)y;
     P.hit = hit;
     walk(&P);
+    finish_disclosure_hit(&P);
     if (!P.hit_any) return false;
     return hit->kind != WEB_HIT_NONE;
 }
@@ -1120,10 +1153,9 @@ web_node *web_node_at(web_doc *d, int x, int y) {
 bool web_node_action(web_doc *d, web_node *target, struct web_hit *hit) {
     memset(hit, 0, sizeof *hit);
     if (!d || !target) return false;
-    node_t *root = target;
-    while (root->parent) root = root->parent;
+    node_t *root = doc_node_root(target, true);
     if (root != d->root) return false;
-    for (node_t *n = target; n; n = n->parent) {
+    for (node_t *n = target; n; n = doc_flat_parent(n)) {
         if (n->type != N_ELEM) continue;
         if (n->box) {
             int kind = control_hit(n->box);
@@ -1139,6 +1171,19 @@ bool web_node_action(web_doc *d, web_node *target, struct web_hit *hit) {
             hit->node = n;
             hit->href = doc_link_href(d, n);
             return hit->href != NULL;
+        }
+        if (n->tag == T_summary) {
+            node_t *details = doc_details_activation(target);
+            if (details) { hit->kind = WEB_HIT_DETAILS; hit->node = details; return true; }
+            return false;
+        }
+        /* A renderer-owned default legend is focused through its details
+           host. Mouse actions must still use the anonymous legend's hit box,
+           not turn all of an open details body's whitespace into a toggle. */
+        if (n == target && n->tag == T_details && !n->foreign && !doc_details_summary(n)) {
+            hit->kind = WEB_HIT_DETAILS;
+            hit->node = n;
+            return true;
         }
     }
     return false;

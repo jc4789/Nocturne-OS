@@ -4,14 +4,19 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include "webi.h"
+#include "form_validation.h"
+#include "form_value.h"
 
 /* ---------------------------------------------------------------- data structures */
-enum { SK_TAG, SK_ID, SK_CLASS, SK_ATTR, SK_PC };
+enum { SK_TAG, SK_ID, SK_CLASS, SK_ATTR, SK_PC, SK_SLOTTED };
+/* Internal selector marker, never a generated pseudo box. */
+#define PE_SLOTTED 4
 enum { AO_EXISTS, AO_EQ, AO_INCL, AO_DASH, AO_PREFIX, AO_SUFFIX, AO_SUBSTR };
 enum { PC_FIRST_CHILD, PC_LAST_CHILD, PC_ONLY_CHILD, PC_NTH_CHILD, PC_NTH_LAST_CHILD, PC_FIRST_OF_TYPE,
        PC_LAST_OF_TYPE, PC_ONLY_OF_TYPE, PC_NTH_OF_TYPE, PC_NTH_LAST_OF_TYPE, PC_NOT, PC_IS, PC_NEVER,
        PC_ALWAYS, PC_LINK, PC_CHECKED, PC_DISABLED, PC_ENABLED, PC_ROOT, PC_EMPTY, PC_REQUIRED, PC_OPTIONAL,
-       PC_LANG, PC_PLACEHOLDER_SHOWN, PC_READ_WRITE, PC_READ_ONLY, PC_OPEN };
+       PC_LANG, PC_PLACEHOLDER_SHOWN, PC_READ_WRITE, PC_READ_ONLY, PC_OPEN, PC_HOST, PC_FOCUS, PC_FOCUS_WITHIN,
+       PC_VALID, PC_INVALID, PC_IN_RANGE, PC_OUT_OF_RANGE };
 
 struct sellist;
 struct simple {
@@ -26,6 +31,7 @@ struct compound {
     struct simple *s;
     int n;
     char comb; /* how it relates to the compound on its left: ' ', '>', '+', '~' */
+    bool universal; /* share the existing padding before the pointer */
     struct compound *left;
 };
 struct selector {
@@ -62,6 +68,7 @@ struct sheet {
     struct rule *first, *last;
     double order;
     bool ua;
+    node_t *scope; /* NULL: document author sheet; otherwise its shadow root */
 };
 
 struct pctx {
@@ -238,14 +245,14 @@ static const struct {
     {"enabled", PC_ENABLED}, {"root", PC_ROOT}, {"scope", PC_ROOT}, {"empty", PC_EMPTY},
     {"required", PC_REQUIRED}, {"optional", PC_OPTIONAL}, {"placeholder-shown", PC_PLACEHOLDER_SHOWN},
     {"read-write", PC_READ_WRITE}, {"read-only", PC_READ_ONLY}, {"open", PC_OPEN}, {"defined", PC_ALWAYS},
-    {"visited", PC_NEVER}, {"hover", PC_NEVER}, {"active", PC_NEVER}, {"focus", PC_NEVER},
-    {"focus-within", PC_NEVER}, {"focus-visible", PC_NEVER}, {"target", PC_NEVER}, {"target-within", PC_NEVER},
-    {"indeterminate", PC_NEVER}, {"invalid", PC_NEVER}, {"valid", PC_ALWAYS}, {"user-invalid", PC_NEVER},
+    {"visited", PC_NEVER}, {"hover", PC_NEVER}, {"active", PC_NEVER}, {"focus", PC_FOCUS},
+    {"focus-within", PC_FOCUS_WITHIN}, {"focus-visible", PC_NEVER}, {"target", PC_NEVER}, {"target-within", PC_NEVER},
+    {"indeterminate", PC_NEVER}, {"invalid", PC_INVALID}, {"valid", PC_VALID}, {"user-invalid", PC_NEVER},
     {"user-valid", PC_NEVER}, {"default", PC_NEVER}, {"fullscreen", PC_NEVER}, {"modal", PC_NEVER},
-    {"popover-open", PC_NEVER}, {"autofill", PC_NEVER}, {"in-range", PC_ALWAYS}, {"out-of-range", PC_NEVER},
+    {"popover-open", PC_NEVER}, {"autofill", PC_NEVER}, {"in-range", PC_IN_RANGE}, {"out-of-range", PC_OUT_OF_RANGE},
     {"playing", PC_NEVER}, {"paused", PC_NEVER}, {"current", PC_NEVER}, {"past", PC_NEVER}, {"future", PC_NEVER},
     {"first", PC_NEVER}, {"left", PC_NEVER}, {"right", PC_NEVER}, {"blank", PC_NEVER}, {"local-link", PC_NEVER},
-    {"host", PC_NEVER}, {"state", PC_NEVER}, {"picture-in-picture", PC_NEVER}, {"-webkit-autofill", PC_NEVER},
+    {"host", PC_HOST}, {"state", PC_NEVER}, {"picture-in-picture", PC_NEVER}, {"-webkit-autofill", PC_NEVER},
     {"-moz-focusring", PC_NEVER}, {"-moz-ui-invalid", PC_NEVER},
 };
 
@@ -254,7 +261,7 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
     struct simple tmp[32];
     int n = 0;
     const char *s = *ps;
-    bool type_seen = false;
+    bool type_seen = false, universal = false;
     while (s < e && n < 32) {
         char c = *s;
         struct simple *x = &tmp[n];
@@ -263,6 +270,7 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
         if (c == '*') {
             if (pc->supports_probe && (type_seen || n)) return NULL;
             type_seen = true;
+            universal = true;
             s++;
             if (s < e && *s == '|') return NULL;
             continue;
@@ -358,6 +366,15 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
             if (elem || (!args && (!strcmp(name, "before") || !strcmp(name, "after") ||
                                    !strcmp(name, "first-line") || !strcmp(name, "first-letter")))) {
                 if (*pseudo) return NULL;
+                if (!strcmp(name, "slotted") && args) {
+                    x->args = parse_sellist(pc, args, args_end, false);
+                    if (!x->args || x->args->n != 1 || x->args->v[0]->pseudo || x->args->v[0]->right->left) return NULL;
+                    x->kind = SK_SLOTTED;
+                    *pseudo = PE_SLOTTED;
+                    *spec = spec_add(*spec, spec_add(SPEC_C, sellist_max_spec(x->args)));
+                    n++;
+                    continue;
+                }
                 if (!strcmp(name, "before")) *pseudo = PE_BEFORE;
                 else if (!strcmp(name, "after")) *pseudo = PE_AFTER;
                 else if (!strncmp(name, "-webkit-", 8) || !strncmp(name, "-moz-", 5) || !strncmp(name, "-ms-", 4))
@@ -410,7 +427,12 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
                     const char *p = skip_ws(args, args_end);
                     x->pc = strn_ieq(p, "ltr", 3) ? PC_ALWAYS : PC_NEVER;
                     *spec = spec_add(*spec, SPEC_B);
-                } else if (!strcmp(name, "host") || !strcmp(name, "host-context") || !strcmp(name, "state") ||
+                } else if (!strcmp(name, "host")) {
+                    x->args = parse_sellist(pc, args, args_end, false);
+                    if (!x->args || x->args->n != 1 || x->args->v[0]->pseudo || x->args->v[0]->right->left) return NULL;
+                    x->pc = PC_HOST;
+                    *spec = spec_add(*spec, spec_add(SPEC_B, sellist_max_spec(x->args)));
+                } else if (!strcmp(name, "host-context") || !strcmp(name, "state") ||
                            !strcmp(name, "active-view-transition-type")) {
                     if (pc->supports_probe) return NULL;
                     x->pc = PC_NEVER;
@@ -433,6 +455,7 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
     *ps = s;
     struct compound *cp = ar_alloc(pc->a, sizeof *cp);
     cp->n = n;
+    cp->universal = universal;
     cp->s = ar_alloc(pc->a, sizeof(struct simple) * (size_t)(n ? n : 1));
     memcpy(cp->s, tmp, sizeof(struct simple) * (size_t)n);
     return cp;
@@ -495,7 +518,15 @@ static struct sellist *parse_sellist(struct pctx *pc, const char *s, const char 
 }
 
 /* ---------------------------------------------------------------- matching */
-static bool match_list(const struct sellist *l, node_t *e);
+static bool match_list(const struct sellist *l, node_t *e, node_t *scope);
+
+/* Selector ancestry stays in the DOM tree. Only a stylesheet's own shadow
+   host replaces its root, and that host is featureless outside :host(). */
+static node_t *selector_parent(node_t *e, node_t *scope) {
+    if (scope && e == scope->shadow_host) return NULL;
+    node_t *p = e->parent;
+    return scope && p == scope ? scope->shadow_host : p;
+}
 
 static node_t *prev_elem(node_t *e) {
     for (e = e->prev; e; e = e->prev)
@@ -516,8 +547,19 @@ static bool nth(int a, int b, int idx) {
 }
 
 static bool form_control(const node_t *e) {
-    return e->tag == T_input || e->tag == T_button || e->tag == T_select || e->tag == T_textarea ||
-           e->tag == T_option || e->tag == T_optgroup || e->tag == T_fieldset;
+    return !e->foreign && (e->tag == T_input || e->tag == T_button || e->tag == T_select || e->tag == T_textarea ||
+           e->tag == T_option || e->tag == T_optgroup || e->tag == T_fieldset);
+}
+
+static bool read_write(const node_t *e) {
+    if (e->tag == T_input || e->tag == T_textarea) return web_control_read_write(e);
+    for (const node_t *n = e; n; n = n->parent) {
+        const char *editable = node_attr(n, "contenteditable");
+        if (!editable) continue;
+        if (!*editable || str_ieq(editable, "true") || str_ieq(editable, "plaintext-only")) return true;
+        if (str_ieq(editable, "false")) return false;
+    }
+    return false;
 }
 
 static bool icase_eq(const char *a, const char *b, bool icase) { return icase ? str_ieq(a, b) : !strcmp(a, b); }
@@ -553,7 +595,7 @@ static bool match_attr(const struct simple *x, const node_t *e) {
     return false;
 }
 
-static bool match_pc(const struct simple *x, node_t *e) {
+static bool match_pc(const struct simple *x, node_t *e, node_t *scope) {
     switch (x->pc) {
     case PC_FIRST_CHILD: return !prev_elem(e);
     case PC_LAST_CHILD: return !next_elem(e);
@@ -579,24 +621,51 @@ static bool match_pc(const struct simple *x, node_t *e) {
         default: return nth(x->a, x->b, after);
         }
     }
-    case PC_NOT: return !match_list(x->args, e);
-    case PC_IS: return match_list(x->args, e);
+    case PC_NOT: return !match_list(x->args, e, scope);
+    case PC_IS: return match_list(x->args, e, scope);
+    case PC_HOST: return scope && scope->shadow_host == e && (!x->args || match_list(x->args, e, NULL));
+    case PC_FOCUS:
+        if (!e->owner) return false;
+        for (node_t *f = e->owner->focus; f;) {
+            if (f == e) return true;
+            node_t *r = doc_node_root(f, false);
+            f = r ? r->shadow_host : NULL;
+        }
+        return false;
+    case PC_FOCUS_WITHIN:
+        for (node_t *f = e->owner ? e->owner->focus : NULL; f; f = doc_flat_parent(f))
+            if (f == e) return true;
+        return false;
     case PC_NEVER: return false;
     case PC_ALWAYS: return true;
     case PC_LINK: return (e->tag == T_a || e->tag == T_area) && node_attr(e, "href");
     case PC_CHECKED:
         return (e->tag == T_input && e->checked) || doc_option_selected(e);
-    case PC_DISABLED: return form_control(e) && node_attr(e, "disabled");
-    case PC_ENABLED: return form_control(e) && !node_attr(e, "disabled");
+    case PC_DISABLED: return form_control(e) && web_control_disabled(e);
+    case PC_ENABLED: return form_control(e) && !web_control_disabled(e);
     case PC_ROOT: return e->parent && e->parent->type == N_DOC;
     case PC_EMPTY:
         for (node_t *c = e->first; c; c = c->next)
             if (c->type == N_ELEM || (c->type == N_TEXT && c->textlen)) return false;
         return true;
-    case PC_REQUIRED: return form_control(e) && node_attr(e, "required");
-    case PC_OPTIONAL: return form_control(e) && !node_attr(e, "required");
+    case PC_REQUIRED: return web_control_required(e);
+    case PC_OPTIONAL: return web_control_required_applicable(e) && !web_control_required(e);
+    case PC_VALID: case PC_INVALID: {
+        if (!e->foreign && (e->tag == T_form || e->tag == T_fieldset)) {
+            bool valid = web_form_constraints_valid(e->owner, e);
+            return x->pc == PC_VALID ? valid : !valid;
+        }
+        if (!web_control_will_validate(e)) return false;
+        bool valid = web_control_validity(e->owner, e) == 0;
+        return x->pc == PC_VALID ? valid : !valid;
+    }
+    case PC_IN_RANGE: case PC_OUT_OF_RANGE: {
+        int range = web_control_in_range(e->owner, e);
+        return range >= 0 && (x->pc == PC_IN_RANGE ? range == 1 : range == 0);
+    }
     case PC_LANG:
-        for (node_t *p = e; p && p->type == N_ELEM; p = p->parent) {
+        for (node_t *p = e; p; p = doc_shadow_parent(p)) {
+            if (p->type != N_ELEM) continue;
             const char *l = node_attr(p, "lang");
             if (l) {
                 size_t k = strlen(x->value);
@@ -605,17 +674,21 @@ static bool match_pc(const struct simple *x, node_t *e) {
         }
         return false;
     case PC_PLACEHOLDER_SHOWN:
-        return (e->tag == T_input || e->tag == T_textarea) && node_attr(e, "placeholder") && (!e->value || !*e->value);
-    case PC_READ_WRITE:
-        return (e->tag == T_input || e->tag == T_textarea) && !node_attr(e, "readonly") && !node_attr(e, "disabled");
-    case PC_READ_ONLY:
-        return !((e->tag == T_input || e->tag == T_textarea) && !node_attr(e, "readonly") && !node_attr(e, "disabled"));
+        return !e->foreign && (e->tag == T_input || e->tag == T_textarea) &&
+               node_attr(e, "placeholder") && !*web_input_edit_text(e);
+    case PC_READ_WRITE: return read_write(e);
+    case PC_READ_ONLY: return !read_write(e);
     case PC_OPEN: return (e->tag == T_details || e->tag == T_dialog) && node_attr(e, "open");
     }
     return false;
 }
 
-static bool match_compound(const struct compound *c, node_t *e) {
+static bool match_compound(const struct compound *c, node_t *e, node_t *scope) {
+    if (scope && e == scope->shadow_host) {
+        if (!c->n || c->universal) return false; /* '*' cannot select a featureless host */
+        for (int i = 0; i < c->n; i++)
+            if (c->s[i].kind != SK_PC || c->s[i].pc != PC_HOST) return false;
+    }
     for (int i = 0; i < c->n; i++) {
         const struct simple *x = &c->s[i];
         switch (x->kind) {
@@ -632,37 +705,52 @@ static bool match_compound(const struct compound *c, node_t *e) {
             if (!match_attr(x, e)) return false;
             break;
         case SK_PC:
-            if (!match_pc(x, e)) return false;
+            if (!match_pc(x, e, scope)) return false;
             break;
+        case SK_SLOTTED: break; /* matched against its originating slot below */
         }
     }
     return true;
 }
 
-static bool match_from(const struct compound *c, node_t *e) {
-    if (!match_compound(c, e)) return false;
+static bool match_from(const struct compound *c, node_t *e, node_t *scope) {
+    for (int i = 0; i < c->n; i++) if (c->s[i].kind == SK_SLOTTED) {
+        if (!scope || !match_list(c->s[i].args, e, NULL)) return false;
+        node_t *slot = doc_assigned_slot(e, false);
+        /* A slot assigned into another slot can expose the same flattened
+           element. Follow assignment links without changing DOM parents. */
+        for (; slot; slot = doc_assigned_slot(slot, false))
+            if (doc_node_root(slot, false) == scope && match_compound(c, slot, scope)) break;
+        if (!slot) return false;
+        e = slot;
+        break;
+    }
+    if (!match_compound(c, e, scope)) return false;
     if (!c->left) return true;
     switch (c->comb) {
-    case '>': return e->parent && e->parent->type == N_ELEM && match_from(c->left, e->parent);
+    case '>': {
+        node_t *p = selector_parent(e, scope);
+        return p && p->type == N_ELEM && match_from(c->left, p, scope);
+    }
     case ' ':
-        for (node_t *p = e->parent; p && p->type == N_ELEM; p = p->parent)
-            if (match_from(c->left, p)) return true;
+        for (node_t *p = selector_parent(e, scope); p && p->type == N_ELEM; p = selector_parent(p, scope))
+            if (match_from(c->left, p, scope)) return true;
         return false;
     case '+': {
         node_t *p = prev_elem(e);
-        return p && match_from(c->left, p);
+        return p && match_from(c->left, p, scope);
     }
     case '~':
         for (node_t *p = prev_elem(e); p; p = prev_elem(p))
-            if (match_from(c->left, p)) return true;
+            if (match_from(c->left, p, scope)) return true;
         return false;
     }
     return false;
 }
 
-static bool match_list(const struct sellist *l, node_t *e) {
+static bool match_list(const struct sellist *l, node_t *e, node_t *scope) {
     for (int i = 0; l && i < l->n; i++)
-        if (!l->v[i]->pseudo && match_from(l->v[i]->right, e)) return true;
+        if (!l->v[i]->pseudo && match_from(l->v[i]->right, e, scope)) return true;
     return false;
 }
 
@@ -670,7 +758,7 @@ static bool match_list(const struct sellist *l, node_t *e) {
    bounded arena so repeated querySelector calls do not grow the document arena. */
 static void select_walk(node_t *scope, const struct sellist *sel, pvec *out) {
     for (node_t *n = scope->first; n; n = n->next) {
-        if (n->type == N_ELEM && match_list(sel, n)) pv_push(out, n);
+        if (n->type == N_ELEM && match_list(sel, n, NULL)) pv_push(out, n);
         select_walk(n, sel, out);
     }
 }
@@ -711,7 +799,7 @@ bool css_matches(node_t *node, const char *selector, bool *valid) {
     struct pctx p = {.a = arena};
     struct sellist *sel = parse_sellist(&p, selector, selector + len, false);
     if (valid) *valid = sel != NULL;
-    bool matched = sel && match_list(sel, node);
+    bool matched = sel && match_list(sel, node, NULL);
     ar_free(arena);
     free(arena);
     return matched;
@@ -1311,6 +1399,8 @@ static char *strip_comments(arena_t *a, const char *css, size_t n, size_t *out_n
     return o;
 }
 
+void css_sheet_scope(sheet_t *sheet, node_t *shadow_root) { if (sheet) sheet->scope = shadow_root; }
+
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
     struct pctx pc = {a, NULL, base_url, imports, 0, false};
     pc.sh = ar_alloc(a, sizeof(sheet_t));
@@ -1565,6 +1655,7 @@ struct ient {
     const struct rule *r;
     uint32_t order;
     bool ua;
+    node_t *scope;
     struct ient *next;
 };
 
@@ -1608,16 +1699,17 @@ static struct ient **ht_slot(arena_t *a, struct htab *t, const char *key, bool c
     return &b->list;
 }
 
-static void index_rule(struct css_ctx *x, const struct rule *r, const struct selector *s, uint32_t order, bool ua) {
+static void index_rule(struct css_ctx *x, const struct rule *r, const struct selector *s, uint32_t order, bool ua, node_t *scope) {
     if (s->pseudo == PE_OTHER) return;
     struct ient *ie = ar_alloc(&x->a, sizeof *ie);
     ie->sel = s;
     ie->r = r;
     ie->order = order;
     ie->ua = ua;
+    ie->scope = scope;
     const struct compound *c = s->right;
     const char *id = NULL, *cls = NULL, *tag = NULL;
-    for (int i = 0; i < c->n; i++) {
+    for (int i = 0; s->pseudo != PE_SLOTTED && i < c->n; i++) {
         if (c->s[i].kind == SK_ID && !id) id = c->s[i].name;
         else if (c->s[i].kind == SK_CLASS && !cls) cls = c->s[i].name;
         else if (c->s[i].kind == SK_TAG) tag = c->s[i].name;
@@ -1662,7 +1754,7 @@ static struct css_ctx *build_index(web_doc *d, int vw, int vh) {
         if (i == -1 && !d->quirks) continue;
         for (struct rule *r = s->first; r; r = r->next, order++) {
             if (!r->ndecls || !media_chain_ok(r->media, vw, vh, web_js_enabled(d))) continue;
-            for (int k = 0; k < r->sel->n; k++) index_rule(x, r, r->sel->v[k], order, s->ua);
+            for (int k = 0; k < r->sel->n; k++) index_rule(x, r, r->sel->v[k], order, s->ua, s->scope);
         }
     }
     return x;
@@ -1834,13 +1926,20 @@ struct dent {
     const struct decl *d;
     uint64_t key;
     uint8_t pseudo;
+    int scope_depth;
 };
 
 static struct dent *dents;
 static int ndents, capdents;
 static uint8_t *setbits;
 
-static void add_dent(const struct decl *d, uint64_t key, uint8_t pseudo) {
+static int scope_depth(node_t *root) {
+    int depth = 0;
+    for (; root && root->shadow_host; root = doc_node_root(root->shadow_host, false)) depth++;
+    return depth;
+}
+
+static void add_dent(const struct decl *d, uint64_t key, uint8_t pseudo, int depth) {
     if (ndents == capdents) {
         capdents = capdents ? capdents * 2 : 256;
         dents = realloc(dents, sizeof *dents * (size_t)capdents);
@@ -1850,24 +1949,40 @@ static void add_dent(const struct decl *d, uint64_t key, uint8_t pseudo) {
        noscript suppression outrank even an author's important inline style. */
     dents[ndents].key = d->important ? (key ^ (1ull << 62)) | (1ull << 63) : key;
     dents[ndents].pseudo = pseudo;
+    dents[ndents].scope_depth = depth;
     ndents++;
 }
 
-static void add_rule_decls(const struct rule *r, uint32_t spec, uint32_t order, bool author, uint8_t pseudo) {
+static void add_rule_decls(const struct rule *r, uint32_t spec, uint32_t order, bool author, uint8_t pseudo, int depth) {
     for (int i = 0; i < r->ndecls; i++) {
         uint64_t key = (author ? 1ull << 62 : 0) | (uint64_t)(spec & 0x3FFFFFFF) << 32 |
                        (uint64_t)(order & 0xFFFFFF) << 8 | (uint64_t)(i < 255 ? i : 255);
-        add_dent(&r->decls[i], key, pseudo);
+        add_dent(&r->decls[i], key, pseudo, depth);
     }
 }
 
 static void collect(const struct ient *l, node_t *e) {
-    for (; l; l = l->next)
-        if (match_from(l->sel->right, e)) add_rule_decls(l->r, l->sel->spec, l->order, !l->ua, l->sel->pseudo);
+    node_t *root = doc_node_root(e, false);
+    for (; l; l = l->next) {
+        if (!l->ua) {
+            if (!l->scope && root && root->shadow_host) continue;
+            if (l->scope && l->sel->pseudo != PE_SLOTTED && root != l->scope && e != l->scope->shadow_host) continue;
+        }
+        if (match_from(l->sel->right, e, l->scope))
+            add_rule_decls(l->r, l->sel->spec, l->order, !l->ua,
+                           l->sel->pseudo == PE_SLOTTED ? PE_NONE : l->sel->pseudo, scope_depth(l->scope));
+    }
 }
 
 static int cmp_dent(const void *a, const void *b) {
-    uint64_t x = ((const struct dent *)a)->key, y = ((const struct dent *)b)->key;
+    const struct dent *da = a, *db = b;
+    uint64_t x = da->key, y = db->key;
+    /* Encapsulation context precedes specificity: outer normal declarations
+       win; inner !important declarations win, including over inline styles. */
+    if ((x >> 62) == (y >> 62) && da->scope_depth != db->scope_depth) {
+        bool inner_wins = (x & (1ull << 63)) != 0;
+        return (da->scope_depth > db->scope_depth) == inner_wins ? -1 : 1;
+    }
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
@@ -1978,10 +2093,22 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     for (int i = 0; i < ndents; i++)
         if (dents[i].pseudo == pseudo && dents[i].d->p) apply_decl(c, &cx, dents[i].d);
     css_style_finish(s, parent, e == d->html && !pseudo);
+    if (parent && parent->display == D_CONTENTS) {
+        /* Inheritance uses the slot, while flex/grid blockification uses the
+           nearest box-generating flat ancestor. A contents slot is not an
+           anonymous flex item and cannot prevent its assigned items from
+           becoming the host's flex/grid items. */
+        node_t *p = pseudo ? e : doc_flat_parent(e);
+        while (p && p->style && p->style->display == D_CONTENTS) p = doc_flat_parent(p);
+        if (p && p->style && (p->style->display == D_FLEX || p->style->display == D_INLINE_FLEX ||
+                             p->style->display == D_GRID || p->style->display == D_INLINE_GRID))
+            css_style_finish(s, p->style, false);
+    }
     return s;
 }
 
 static void clear_styles(node_t *n) {
+    if (n->shadow_root) clear_styles(n->shadow_root);
     for (node_t *c = n->first; c; c = c->next) {
         c->style = NULL;
         clear_styles(c);
@@ -2010,14 +2137,15 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     /* presentational hints and the style attribute */
     struct hints h = {.n = 0, .a = &d->smem};
     if (!e->foreign || e->tag == T_svg) pres_hints(e, &h);
-    for (int i = 0; i < h.n; i++) add_dent(&h.d[i], 1ull << 62, PE_NONE);
+    int depth = scope_depth(doc_node_root(e, false));
+    for (int i = 0; i < h.n; i++) add_dent(&h.d[i], 1ull << 62, PE_NONE, depth);
     const char *sa = node_attr(e, "style");
     if (sa && *sa) {
         struct pctx pc = {&d->smem, NULL, d->base, NULL, 0, false};
         struct decl *ds;
         int nd;
         parse_body(&pc, sa, sa + strlen(sa), NULL, NULL, &ds, &nd);
-        for (int i = 0; i < nd; i++) add_dent(&ds[i], 1ull << 62 | (uint64_t)0x3FFFFFFF << 32 | (uint64_t)(i < 255 ? i : 255), PE_NONE);
+        for (int i = 0; i < nd; i++) add_dent(&ds[i], 1ull << 62 | (uint64_t)0x3FFFFFFF << 32 | (uint64_t)(i < 255 ? i : 255), PE_NONE, depth);
     }
     qsort(dents, (size_t)ndents, sizeof *dents, cmp_dent);
     bool has_before = false, has_after = false;
@@ -2042,10 +2170,14 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
         clear_styles(e);
         return;
     }
-    for (node_t *ch = e->first; ch; ch = ch->next) {
+    pvec children = {0};
+    doc_flat_children(e, &children);
+    for (int i = 0; i < children.n; i++) {
+        node_t *ch = children.v[i];
         if (ch->type == N_ELEM) cascade_node(c, ch, s);
         else ch->style = NULL;
     }
+    pv_free(&children);
 }
 
 void css_cascade(web_doc *d, int vw, int vh) {
@@ -2058,6 +2190,7 @@ void css_cascade(web_doc *d, int vw, int vh) {
     d->sty.index_h = vh;
     if (!setbits) setbits = malloc((size_t)css_prop_count());
     ar_free(&d->smem);
+    if (d->root) clear_styles(d->root);
     struct cascade c = {d, 16, vw, vh, {0}};
     if (d->html) cascade_node(&c, d->html, NULL);
     sb_free(&c.vbuf);

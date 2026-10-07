@@ -46,6 +46,8 @@ int main(int argc,char **argv) {
         web_layout(doc,800,600);
         web_node *target=outside?NULL:web_node_at(doc,x+5,y+7);
         if(!outside&&!target){printf("hovertest: no native hit %d,%d\n",x,y);errors++;break;}
+        /* Match browser.c exactly: this is pointer state, not a typed event.
+           The shared SubmitEvent initializer must not strcmp a NULL type. */
         struct web_event e={.x=x,.y=y,.buttons=5,.ctrl=true,.shift=true};
         web_hover(doc,target,&e);
         if(web_script_running(doc)){errors++;break;}

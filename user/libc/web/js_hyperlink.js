@@ -29,10 +29,10 @@
         try { return new URLImpl(attribute,rawDom('get',el,'baseURI')); }
         catch(error){if(error instanceof TypeErrorImpl)return null;throw error;}
     }
-    function parsedHref(el){const value=rawDom('attr',el,'href');return value===null?null:parse(el,value);}
+    function parsedHref(el){const value=reflectedAttr(el,'href');return value===null?null:parse(el,value);}
     function attribute(el,tag,name,emptyDocument){
         htmlElementBrand(el,tag);
-        const value=rawDom('attr',el,name);
+        const value=reflectedAttr(el,name);
         if(emptyDocument && (value===null || value===''))return rawDom('get',rawDom('get',el,'ownerDocument'),'URL');
         if(value===null)return '';
         const url=parse(el,value);return url?call(urlGet.href,url,[]):scalar(value);
@@ -42,7 +42,7 @@
     for(const [C,tag] of [[HTMLAnchorElement,'a'],[HTMLAreaElement,'area']]){
         define(C.prototype,'href',{configurable:true,enumerable:true,
             get(){return attribute(this,tag,'href',false);},
-            set(value){htmlElementBrand(this,tag);dom('attr',this,'href',scalar(value));}});
+            set(value){htmlElementBrand(this,tag);reflectedAttr(this,'href',scalar(value));}});
         for(const key of keys.slice(1)){
             const descriptor={configurable:true,enumerable:true,get(){
                 htmlElementBrand(this,tag);const url=parsedHref(this);return url?call(urlGet[key],url,[]):empty[key];
@@ -51,13 +51,13 @@
                 htmlElementBrand(this,tag);
                 // IDL conversion may reenter and change href. Parse only after it finishes.
                 value=scalar(value);const url=parsedHref(this);if(!url)return;
-                call(urlSet[key],url,[value]);dom('attr',this,'href',call(urlGet.href,url,[]));
+                call(urlSet[key],url,[value]);reflectedAttr(this,'href',call(urlGet.href,url,[]));
             };
             define(C.prototype,key,descriptor);
         }
         for(const name of ['rel','target','download'])define(C.prototype,name,{configurable:true,enumerable:true,
-            get(){htmlElementBrand(this,tag);return rawDom('attr',this,name)||'';},
-            set(value){htmlElementBrand(this,tag);dom('attr',this,name,string(value));}});
+            get(){htmlElementBrand(this,tag);return reflectedAttr(this,name)||'';},
+            set(value){htmlElementBrand(this,tag);reflectedAttr(this,name,string(value));}});
         define(C.prototype,'toString',{configurable:true,writable:true,value(){return attribute(this,tag,'href',false);}});
     }
     define(HTMLAnchorElement.prototype,'text',{configurable:true,enumerable:true,

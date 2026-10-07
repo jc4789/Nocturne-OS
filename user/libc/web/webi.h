@@ -83,13 +83,15 @@ extern const char *const tag_names[T_COUNT];
 
 enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_OTHER }; /* pseudo-elements */
 
-enum { N_DOC, N_ELEM, N_TEXT, N_COMMENT, N_FRAGMENT, N_DOCTYPE, N_PI };
+enum { N_DOC, N_ELEM, N_TEXT, N_COMMENT, N_FRAGMENT, N_DOCTYPE, N_PI, N_ATTR };
 enum { NS_HTML, NS_SVG, NS_MATHML };
 
 struct attr {
     const char *name;  /* lowercase */
     const char *raw;   /* as written (SVG is case sensitive) */
     const char *value;
+    const char *namespace_uri, *prefix, *local; /* NULL namespace/prefix are significant */
+    struct node *node; /* Lazily materialized, stable Attr identity. */
 };
 
 struct style;
@@ -100,6 +102,19 @@ typedef struct node {
     web_doc *allocation_doc; /* arena/value lifetime owner; never changes */
     struct node *template_content; /* separate inert tree, not element children */
     struct node *template_host; /* host-inclusive cycle validation only */
+    /* Shadow trees share the native node arena but never the DOM parent links.
+       Only an N_FRAGMENT root has shadow_host; only an element has shadow_root. */
+    struct node *shadow_root, *shadow_host;
+    bool shadow_closed, shadow_delegates_focus, shadow_clonable, shadow_serializable;
+    bool shadow_manual, shadow_declarative;
+    /* Native assignment snapshots/lists: these are not child/parent links. */
+    struct node *assigned_slot, *assigned_next;
+    struct node *slot_assigned_first, *slot_assigned_last;
+    struct node *manual_slot, *manual_next, *slot_manual_first, *slot_manual_last;
+    bool slot_change_pending;
+    struct node *slot_change_next; /* family-owned FIFO, deduplicated while pending */
+    bool details_toggle_pending, details_toggle_old_open, details_toggle_new_open;
+    struct node *details_toggle_next;
     uint8_t type;
     uint8_t namespace_id; /* stable across detach/clone/adopt; not ancestor-derived */
     uint16_t tag;
@@ -109,6 +124,8 @@ typedef struct node {
     const char *public_id, *system_id;
     struct attr *attrs;
     int nattrs;
+    struct attr *attribute; /* N_ATTR: the canonical current record, attached or detached. */
+    struct node *attr_owner; /* Not a DOM parent. */
     char *text; /* Text, Comment and ProcessingInstruction data */
     size_t textlen;
     struct node *parent, *first, *last, *next, *prev;
@@ -124,6 +141,13 @@ typedef struct node {
     /* form controls */
     char *value; /* current value of input/textarea (malloc'd) */
     size_t value_capacity;
+    /* Native editing may temporarily contain an incomplete number/date while
+       the script-visible value remains sanitized. Both buffers are budgeted. */
+    char *input_edit;
+    size_t input_edit_capacity;
+    bool input_bad_input, control_user_edited;
+    const char *custom_validity; /* allocation-document arena; initially empty */
+    size_t custom_validity_length;
     bool checked, selected_set;
     bool value_dirty, checked_dirty;
     /* DOM endpoints are UTF-16 code units, not renderer UTF-8 byte offsets.
@@ -294,6 +318,7 @@ struct css_import {
     double order;
 };
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports);
+void css_sheet_scope(sheet_t *sheet, node_t *shadow_root);
 const char *css_ua_sheet(void);
 /* compute every element's style for the viewport */
 void css_cascade(web_doc *d, int vw, int vh);
@@ -441,6 +466,7 @@ struct web_image {
    or DOM semantics depend on these values. Times can overlap (inclusive). */
 struct web_profile {
     uint64_t inserts, index_visits, index_ms, rescans, rescan_ms;
+    uint64_t shadow_reassigns;
     uint64_t script_scans, script_visits, script_ms, native_calls, native_ms;
     uint64_t metadata_syncs, metadata_visits, metadata_ms;
 };
@@ -449,6 +475,10 @@ struct web_doc {
     web_doc *dom_family, *dom_docs, *dom_next;
     bool inert; /* independent DOM only: no window, loader, style/resource scan */
     bool template_owner;
+    bool has_shadow; /* family-wide fast path: stays set after a shadow root exists */
+    bool shadow_slots_pending;
+    node_t *shadow_slots_first, *shadow_slots_last;
+    node_t *details_toggle_first, *details_toggle_last;
     web_doc *template_doc;
     arena_t mem;    /* DOM, stylesheets */
     arena_t smem;   /* styles and boxes (rebuilt by the cascade) */
@@ -485,6 +515,11 @@ struct web_doc {
     int styled_w, styled_h; /* viewport the cascade ran for */
     bool need_style, need_boxes, layout_valid;
     node_t *focus;
+    node_t *validation_target;
+    bool validation_report_pending;
+    const char *validation_message;
+    size_t validation_message_length;
+    void *form_validation_state; /* bounded native regular-expression cache */
     int caret;
     node_t *find_node;
     struct run *find_run;
@@ -509,8 +544,31 @@ bool html_write(struct html_parser *p, const char *text, size_t n);
 void html_finish(struct html_parser *p);
 node_t *html_fragment(web_doc *d, node_t *context, const char *html, size_t n);
 node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t n);
+node_t *doc_node_root(node_t *node, bool composed);
+node_t *doc_shadow_parent(node_t *node); /* parent, or a shadow root's host */
+bool doc_node_connected(node_t *node);
+bool doc_shadow_host_valid(const node_t *host);
+node_t *doc_shadow_attach(web_doc *d, node_t *host, bool closed, bool delegates_focus,
+                        bool clonable, bool serializable, bool manual);
+node_t *doc_assigned_slot(node_t *node, bool open_only);
+void doc_shadow_reassign(web_doc *d);
+void doc_slot_signal(node_t *slot);
+void doc_slot_nodes(node_t *slot, bool flatten, pvec *out);
+bool doc_slot_assign(node_t *slot, node_t **nodes, int count);
+/* Appends immediate rendered children. Slots remain nodes (display:contents).
+   This never mutates native parent/first/next and never crosses template trees. */
+void doc_flat_children(node_t *node, pvec *out);
+node_t *doc_flat_parent(node_t *node);
 bool doc_pi_target_valid(const char *target, size_t len);
 bool doc_node_attr(web_doc *d, node_t *node, const char *name, const char *value);
+int doc_attr_index(node_t *node, const char *namespace_uri, const char *name, bool namespaced);
+node_t *doc_attr_node(web_doc *d, node_t *element, int index);
+node_t *doc_attr_create(web_doc *d, const char *namespace_uri, const char *prefix, const char *local, const char *value);
+bool doc_attr_set_ns(web_doc *d, node_t *element, const char *namespace_uri, const char *prefix, const char *local, const char *value);
+bool doc_attr_set_node(web_doc *d, node_t *element, node_t *attribute);
+bool doc_attr_remove(web_doc *d, node_t *element, int index);
+bool doc_attr_value(web_doc *d, node_t *attribute, const char *value);
+void doc_attrs_publish(node_t *element, struct attr *attrs, int count);
 bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before);
 void doc_node_remove(web_doc *d, node_t *node);
 bool doc_node_text(web_doc *d, node_t *node, const char *text, size_t n);
@@ -538,6 +596,8 @@ void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const ch
 bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out);
 bool css_matches(node_t *node, const char *selector, bool *valid);
 void web_js_start(web_doc *d, const struct web_host *host);
+void web_js_console(web_doc *d, int level, const char *message);
+void web_js_focus_control(web_doc *d, node_t *control);
 void web_js_tick(web_doc *d, uint64_t now);
 void web_js_free(web_doc *d);
 void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *r);

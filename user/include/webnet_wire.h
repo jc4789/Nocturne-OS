@@ -7,7 +7,21 @@
    Legacy user_navigation 0/1 remains valid; new flags use reserved bits. */
 #define WEBNET_WIRE_USER_NAVIGATION 1u
 #define WEBNET_WIRE_FORCE_PREFLIGHT 2u
-#define WEBNET_WIRE_REQUEST_FLAGS (WEBNET_WIRE_USER_NAVIGATION | WEBNET_WIRE_FORCE_PREFLIGHT)
+#define WEBNET_WIRE_REDIRECT_ERROR 4u
+#define WEBNET_WIRE_SAME_ORIGIN 8u
+/* New clients request the genuine HTTP status line as a header-block prefix.
+   Old persisted clients keep the same response framing and header-only block. */
+#define WEBNET_WIRE_STATUS_LINE 16u
+/* Opt in to the larger response bound without changing either wire layout.
+   Without this bit, a worker must reject output >= the legacy 8192-byte bound
+   rather than silently shorten fields or surprise an old persisted client. */
+#define WEBNET_WIRE_LARGE_HEADERS 32u
+/* Cache policy is metadata, not an author header: generated cache headers must
+   not change CORS preflight classification. Zero keeps legacy default policy. */
+#define WEBNET_WIRE_CACHE_SHIFT 6u
+#define WEBNET_WIRE_CACHE_MASK (7u << WEBNET_WIRE_CACHE_SHIFT)
+#define WEBNET_WIRE_CACHE_MODE(flags) (((flags) & WEBNET_WIRE_CACHE_MASK) >> WEBNET_WIRE_CACHE_SHIFT)
+#define WEBNET_WIRE_REQUEST_FLAGS (WEBNET_WIRE_USER_NAVIGATION | WEBNET_WIRE_FORCE_PREFLIGHT | WEBNET_WIRE_REDIRECT_ERROR | WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_CACHE_MASK)
 struct webnet_wire_request {
     uint32_t magic, kind, user_navigation, credentials; /* user_navigation is a flags word. */
     uint64_t id, generation, deadline;

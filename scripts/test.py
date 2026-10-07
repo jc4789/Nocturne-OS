@@ -145,6 +145,10 @@ def make_disk(a, tcp_port, web_ports):
     srcs += sorted(glob.glob(os.path.join(ROOT, "tests", "js_*_cases.js")))
     # Internal metadata regression reads diagnostic counters from the real DOM.
     srcs.append(os.path.join(ROOT, "user", "libc", "web", "webi.h"))
+    srcs.append(os.path.join(ROOT, "third_party", "quickjs", "quickjs.h"))
+    srcs += [os.path.join(ROOT, "user", "libc", "web", name) for name in
+             ("form_value.h", "form_validation.h", "elements.h")]
+    srcs.append(os.path.join(ROOT, "tests", "web_form_validation_cases.h"))
     mtools("mcopy", "-i", PART, *srcs, "::/tests/")
     if a.full:
         tcc = os.path.join(ROOT, "third_party", "tinycc")
@@ -225,7 +229,7 @@ def run_vm(a, tcp_port, web_ports, processes):
     make_disk(a, tcp_port, web_ports)
     if os.path.exists(SERIAL):
         os.remove(SERIAL)
-    cmd = [QEMU, "-M", "pc", "-m", "512M", "-display", "none", "-vga", "std", "-no-reboot",
+    cmd = [QEMU, "-M", "pc", "-m", str(a.memory) + "M", "-display", "none", "-vga", "std", "-no-reboot",
            "-serial", "file:" + SERIAL,
            "-drive", "file=%s,format=raw,if=ide,index=0,snapshot=on" % os.path.join(BUILD, "nocturne.img"),
            "-drive", "file=%s,format=raw,if=ide,index=1" % IMG,
@@ -302,8 +306,11 @@ def main():
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--no-net", action="store_true")
     ap.add_argument("--timeout", type=int, default=1200)
+    ap.add_argument("--memory", type=int, default=2048, help="QEMU RAM in MiB (default: 2048)")
     ap.add_argument("groups", nargs="*")
     a = ap.parse_args()
+    if a.memory < 256:
+        ap.error("--memory must be at least 256 MiB")
     if not os.path.exists(os.path.join(BUILD, "nocturne.img")):
         sys.exit("test: build first with the bundled toolchain")
     servers, processes = [], []

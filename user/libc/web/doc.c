@@ -4,11 +4,20 @@
 #include <ctype.h>
 #include "nocturne.h"
 #include "webi.h"
+#include "form_value.h"
+#include "form_validation.h"
+#include "elements.h"
+
+/* Cached source and its expanded selector/declaration AST have separate,
+   finite live-document budgets. All document and shadow sheets share cssmem. */
+#define CSS_SOURCE_LIMIT (8u << 20)
+#define CSS_AST_LIMIT (32u << 20)
 
 struct pending {
     char *url;
     double order;
     char *media; /* the <link media> the sheet is wrapped in, or NULL */
+    node_t *scope; /* stylesheet owner shadow root, NULL for document */
 };
 
 struct cached_css {
@@ -113,7 +122,7 @@ static bool media_wanted(const char *m) {
     return false;
 }
 
-static void add_sheet(web_doc *d, const char *css, size_t n, const char *base, double order, const char *media) {
+static void add_sheet(web_doc *d, const char *css, size_t n, const char *base, double order, const char *media, node_t *scope) {
     if (d->css_depth >= 16) return;
     d->css_depth++;
     arena_t *arena = d->live ? &d->cssmem : &d->mem;
@@ -129,12 +138,13 @@ static void add_sheet(web_doc *d, const char *css, size_t n, const char *base, d
         sh = css_parse_sheet(arena, w.p, w.n, base, order, &imports);
         sb_free(&w);
     } else sh = css_parse_sheet(arena, css, n, base, order, &imports);
+    css_sheet_scope(sh, scope);
     pv_push(&d->sty.sheets, sh);
     for (int i = 0; i < imports.n; i++) {
         struct css_import *im = imports.v[i];
         struct cached_css *cached = d->live ? cached_css(d, im->url) : NULL;
         if (cached && cached->done) {
-            if (cached->body) add_sheet(d, cached->body, cached->n, cached->base, im->order, media);
+            if (cached->body) add_sheet(d, cached->body, cached->n, cached->base, im->order, media, scope);
             free(im->url);
             free(im);
             continue;
@@ -154,6 +164,7 @@ static void add_sheet(web_doc *d, const char *css, size_t n, const char *base, d
             p->url = im->url;
             p->order = im->order;
             p->media = media && *media ? strdup(media) : NULL;
+            p->scope = scope;
             pv_push(&d->pending_css, p);
         } else free(im->url);
         free(im);
@@ -164,7 +175,7 @@ static void add_sheet(web_doc *d, const char *css, size_t n, const char *base, d
 }
 
 void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *base) {
-    add_sheet(d, css, n, base, d->next_sheet_order++, NULL);
+    add_sheet(d, css, n, base, d->next_sheet_order++, NULL, NULL);
 }
 
 static int add_image_request(web_doc *d, const char *rel, bool retry_failed, int preferred) {
@@ -291,6 +302,7 @@ void doc_image_sync(web_doc *d, node_t *n) {
 }
 
 void doc_control_init(web_doc *d, node_t *n) {
+    if (n->tag == T_select) { web_select_sync(d, n, !n->control_ready); return; }
     if (n->control_ready) return;
     n->control_ready = true;
     if (n->tag == T_input) {
@@ -304,32 +316,20 @@ void doc_control_init(web_doc *d, node_t *n) {
         doc_node_value(d, n, b.p ? b.p : "", b.n);
         n->value_dirty = false;
         sb_free(&b);
-    } else if (n->tag == T_select) {
-        int idx = 0;
-        n->selected = -1;
-        for (node_t *o = n->first; o; o = o->next) {
-            node_t *list = o->type == N_ELEM && o->tag == T_optgroup ? o->first : o;
-            for (node_t *q = list; q; q = q->next) {
-                if (q->type == N_ELEM && q->tag == T_option) {
-                    if (n->selected < 0) n->selected = idx;
-                    if (node_attr(q, "selected")) n->selected = idx;
-                    idx++;
-                }
-                if (list == o) break;
-            }
-        }
     }
 }
 
-static void scan(web_doc *d, node_t *n) {
+static void scan(web_doc *d, node_t *n, node_t *scope) {
     for (node_t *c = n->first; c; c = c->next) {
         if (c->type != N_ELEM) continue;
         if (c->foreign) {
-            scan(d, c);
+            scan(d, c, scope);
+            if (c->shadow_root) scan(d, c->shadow_root, c->shadow_root);
             continue;
         }
         switch (c->tag) {
         case T_base: {
+            if (scope) break;
             const char *h = node_attr(c, "href");
             if (h && !d->base_seen) { /* only the first <base> counts */
                 char abs[1024];
@@ -339,7 +339,7 @@ static void scan(web_doc *d, node_t *n) {
             break;
         }
         case T_title:
-            if ((!d->live ? !d->title : !d->scan_title_seen) && !node_ancestor(c, T_svg)) {
+            if (!scope && (!d->live ? !d->title : !d->scan_title_seen) && !node_ancestor(c, T_svg)) {
                 d->scan_title_seen = true;
                 sbuf b = {0};
                 text_of(c, &b);
@@ -360,6 +360,7 @@ static void scan(web_doc *d, node_t *n) {
             }
             break;
         case T_meta: {
+            if (scope) break;
             const char *he = node_attr(c, "http-equiv"), *ct = node_attr(c, "content");
             if (he && ct && str_ieq(he, "refresh") && !d->refresh_url) {
                 d->refresh_delay = atoi(ct);
@@ -400,12 +401,12 @@ static void scan(web_doc *d, node_t *n) {
                 p = e;
             }
             const char *media = node_attr(c, "media");
-            if (!sheet || alt || !media_wanted(media)) break;
+            if (!sheet || alt || node_attr(c, "disabled") || !media_wanted(media)) break;
             char abs[2048];
             if (!url_resolve(d->base, href, abs, sizeof abs)) break;
             struct cached_css *cached = d->live ? cached_css(d, abs) : NULL;
             if (cached && cached->done) {
-                if (cached->body) add_sheet(d, cached->body, cached->n, cached->base, d->next_sheet_order++, media);
+                if (cached->body) add_sheet(d, cached->body, cached->n, cached->base, d->next_sheet_order++, media, scope);
                 break;
             }
             if (d->live && css_queued(d, abs)) break;
@@ -414,10 +415,11 @@ static void scan(web_doc *d, node_t *n) {
             pd->url = strdup(abs);
             pd->order = d->next_sheet_order++;
             pd->media = media && *media ? strdup(media) : NULL;
+            pd->scope = scope;
             if (!strncasecmp(abs, "data:", 5)) {
                 size_t dn;
                 char *css = data_url(abs, &dn);
-                if (css) add_sheet(d, css, dn, d->base, pd->order, pd->media);
+                if (css) add_sheet(d, css, dn, d->base, pd->order, pd->media, scope);
                 free(css);
                 free(pd->url);
                 free(pd->media);
@@ -435,7 +437,7 @@ static void scan(web_doc *d, node_t *n) {
             if (!media_wanted(media) || node_ancestor(c, T_template)) break;
             sbuf b = {0};
             text_of(c, &b);
-            add_sheet(d, b.p ? b.p : "", b.n, d->base, d->next_sheet_order++, media);
+            add_sheet(d, b.p ? b.p : "", b.n, d->base, d->next_sheet_order++, media, scope);
             sb_free(&b);
             break;
         }
@@ -452,7 +454,10 @@ static void scan(web_doc *d, node_t *n) {
             doc_control_init(d, c);
             break;
         }
-        if (c->tag != T_template) scan(d, c);
+        if (c->tag != T_template) {
+            scan(d, c, scope);
+            if (c->shadow_root) scan(d, c->shadow_root, c->shadow_root);
+        }
     }
 }
 
@@ -509,7 +514,7 @@ web_doc *web_parse(const char *html, size_t len, const char *url, const char *ch
     snprintf(d->base, sizeof d->base, "%s", d->url);
     d->root = html_parse(d, html ? html : "", html ? len : 0, charset);
     d->need_style = true;
-    if (d->root) scan(d, d->root);
+    if (d->root) scan(d, d->root, NULL);
     return d;
 }
 
@@ -521,7 +526,7 @@ web_doc *web_live(const char *html, size_t len, const char *url, const char *cha
     d->live = true;
     d->dirty = d->need_style = d->resources_dirty = true;
     d->mem.limit = 32u << 20;
-    d->cssmem.limit = 8u << 20;
+    d->cssmem.limit = CSS_AST_LIMIT;
     d->url = strdup(url && *url ? url : "about:blank");
     if (!d->url) { free(d); return NULL; }
     snprintf(d->base, sizeof d->base, "%s", d->url);
@@ -620,11 +625,14 @@ void doc_rescan(web_doc *d) {
         if (!d->head && n->tag == T_head) d->head = n;
         if (!d->body && (n->tag == T_body || n->tag == T_frameset)) d->body = n;
     }
-    jmp_buf trap;
+    jmp_buf mem_trap, css_trap;
     jmp_buf *old_mem = d->mem.trap, *old_css = d->cssmem.trap;
-    d->mem.trap = d->cssmem.trap = &trap;
-    if (!setjmp(trap)) {
-        if (d->root) scan(d, d->root);
+    d->mem.trap = &mem_trap; d->cssmem.trap = &css_trap;
+    int failed_arena;
+    if (setjmp(mem_trap)) failed_arena = 1;
+    else if (setjmp(css_trap)) failed_arena = 2;
+    else {
+        if (d->root) scan(d, d->root, NULL);
         for (node_t *n = doc_image_node_next(d, NULL); n; n = doc_image_node_next(d, n)) {
             bool in_template = false;
             for (node_t *p = n; p; p = p->parent ? p->parent : p->template_host) {
@@ -633,7 +641,19 @@ void doc_rescan(web_doc *d) {
             if (n->tag == T_img && !in_template) doc_image_sync(d, n);
         }
         if (!d->scan_title_seen) d->title = NULL;
-    } else {
+        failed_arena = 0;
+    }
+    if (failed_arena) {
+        /* Distinguish the arenas: title/control/resource allocations can fail
+           in the same transaction as authored CSS. Capture actual accounting
+           before discarding the incomplete snapshot, even if JS is stopped. */
+        char message[320];
+        snprintf(message, sizeof message,
+            "%s arena allocation failed during stylesheet/resource scan; CSS arena allocated=%zu limit=%zu; "
+            "DOM arena allocated=%zu limit=%zu; authored sheets discarded=%d; CSS source bytes=%zu",
+            failed_arena == 2 ? "CSS" : "DOM", d->cssmem.allocated, d->cssmem.limit,
+            d->mem.allocated, d->mem.limit, d->sty.sheets.n, d->css_bytes);
+        web_js_console(d, 2, message);
         /* Incomplete authored sheet snapshots must never outlive their arena. */
         css_styling_free(&d->sty);
         ar_free(&d->cssmem);
@@ -659,7 +679,7 @@ void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const ch
     }
     if (c->done) return;
     c->done = true;
-    if (css && n <= (8u << 20) && d->css_bytes <= (8u << 20) - n) {
+    if (css && n <= CSS_SOURCE_LIMIT && d->css_bytes <= CSS_SOURCE_LIMIT - n) {
         c->body = malloc(n + 1);
         if (c->body) {
             memcpy(c->body, css, n);
@@ -681,6 +701,11 @@ int64_t web_deadline(web_doc *d) { return d && d->live ? web_js_deadline(d) : -1
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *r) {
     if (d && d->live) web_js_loaded(d, id, r);
 }
+void web_response_free(struct web_response *r) {
+    if (!r) return;
+    free(r->body); free(r->headers_full);
+    r->body = r->headers_full = NULL; r->body_len = 0;
+}
 bool web_dirty(web_doc *d) {
     if (!d) return false;
     bool dirty = d->dirty;
@@ -693,10 +718,13 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
 }
 
 static void free_values(node_t *n) {
+    if (n->shadow_root) free_values(n->shadow_root);
     for (node_t *c = n->first; c; c = c->next) {
         if (c->type != N_ELEM) continue;
         free(c->value);
         c->value = NULL;
+        free(c->input_edit);
+        c->input_edit = NULL;
         free_values(c);
     }
 }
@@ -704,6 +732,7 @@ static void free_values(node_t *n) {
 void web_free(web_doc *d) {
     if (!d) return;
     web_js_free(d);
+    web_form_validation_free(d);
     while (d->dom_docs) {
         web_doc *child = d->dom_docs;
         d->dom_docs = child->dom_next; child->dom_next = NULL;
@@ -712,7 +741,10 @@ void web_free(web_doc *d) {
     html_finish(d->parser);
     d->parser = NULL;
     if (d->owned_nodes) {
-        for (node_t *n = d->owned_nodes; n; n = n->owned_next) free(n->value);
+        for (node_t *n = d->owned_nodes; n; n = n->owned_next) {
+            free(n->value);
+            free(n->input_edit);
+        }
     } else if (d->root) free_values(d->root);
     css_styling_free(&d->sty);
     free_pending(d);
@@ -760,7 +792,7 @@ bool web_set_url(web_doc *d, const char *url) {
     if (!d->base_seen) snprintf(d->base, sizeof d->base, "%s", url);
     return true;
 }
-const char *web_control_value(web_node *control) { return control ? control->value : NULL; }
+const char *web_control_value(web_node *control) { return control ? web_input_edit_text(control) : NULL; }
 
 const char *web_refresh_url(web_doc *d, int *delay_s) {
     if (delay_s) *delay_s = d->refresh_delay;
@@ -779,7 +811,7 @@ void web_stylesheet_loaded(web_doc *d, const char *css, size_t n) {
     if (css) {
         /* skip a UTF-8 byte order mark */
         if (n >= 3 && !memcmp(css, "\xEF\xBB\xBF", 3)) css += 3, n -= 3;
-        add_sheet(d, css, n, p->url, p->order, p->media);
+        add_sheet(d, css, n, p->url, p->order, p->media, p->scope);
     }
     free(p->url);
     free(p->media);
@@ -845,6 +877,7 @@ static void register_bg(web_doc *d, node_t *n) {
         bg_images(d, c->style->before);
         bg_images(d, c->style->after);
         register_bg(d, c);
+        if (c->shadow_root) register_bg(d, c->shadow_root);
     }
 }
 
@@ -944,8 +977,7 @@ int web_anchor_y(web_doc *d, const char *fragment) {
 bool web_node_rect(web_doc *d, web_node *n, int *x, int *y, int *w, int *h) {
     if (!n || !n->box) return false;
     if (d && d->live) {
-        node_t *root = n;
-        while (root->parent) root = root->parent;
+        node_t *root = doc_node_root(n, true);
         if (root != d->root) return false;
     }
     box_t *b = n->box;
@@ -1005,11 +1037,11 @@ size_t doc_utf16_to_byte(const char *text, uint32_t offset, bool round_up) {
     return byte;
 }
 void doc_control_caret(web_doc *d, node_t *n) {
-    if (d->focus == n) d->caret = (int)doc_utf16_to_byte(n->value,
+    if (d->focus == n) d->caret = (int)doc_utf16_to_byte(web_input_edit_text(n),
         n->selection_direction == 2 ? n->selection_start : n->selection_end, false);
 }
 void doc_control_selection(web_doc *d, node_t *n, uint32_t start, uint32_t end, uint8_t direction) {
-    uint32_t length = doc_utf16_length(n->value);
+    uint32_t length = doc_utf16_length(web_input_edit_text(n));
     if (start > length) start = length;
     if (end > length) end = length;
     if (end <= start) start = end;
@@ -1036,8 +1068,10 @@ static void control_slice(sbuf *out, const char *text, uint32_t start, uint32_t 
         at += count;
     }
 }
-bool doc_control_replace(web_doc *d, node_t *n, uint32_t start, uint32_t end, const char *text) {
-    const char *value = n->value ? n->value : ""; uint32_t length = doc_utf16_length(value);
+static bool control_replace(web_doc *d, node_t *n, uint32_t start, uint32_t end, const char *text, bool user) {
+    const char *value = user ? web_input_edit_text(n) : n->value;
+    if (!value) value = "";
+    uint32_t length = doc_utf16_length(value);
     if (start > length) start = length;
     if (end > length) end = length;
     if (start > end) return false;
@@ -1048,35 +1082,98 @@ bool doc_control_replace(web_doc *d, node_t *n, uint32_t start, uint32_t end, co
     sbuf b = {0}; b.cap = bytes + replacement + 7; b.p = malloc(b.cap);
     if (!b.p) return false;
     control_slice(&b, value, 0, start); sb_puts(&b, text); control_slice(&b, value, end, length);
-    bool ok = doc_node_value(d, n, b.p ? b.p : "", b.n); sb_free(&b); return ok;
+    bool ok = user ? web_input_user_value(d, n, b.p ? b.p : "", b.n) : doc_node_value(d, n, b.p ? b.p : "", b.n);
+    sb_free(&b); return ok;
+}
+bool doc_control_replace(web_doc *d, node_t *n, uint32_t start, uint32_t end, const char *text) {
+    return control_replace(d, n, start, end, text, false);
+}
+
+static bool focus_under(node_t *n, node_t *ancestor) {
+    for (; n; n = doc_shadow_parent(n)) if (n == ancestor) return true;
+    return false;
+}
+static node_t *focus_delegate(web_doc *d, node_t *parent);
+static node_t *focus_area(web_doc *d, node_t *n) {
+    if (!n || n->type != N_ELEM || !n->style || n->style->display == D_NONE ||
+        (!n->box && !n->anchor_block) ||
+        node_attr(n, "inert")) return NULL;
+    if (n->shadow_root && n->shadow_root->shadow_delegates_focus) {
+        if (d->focus && focus_under(d->focus, n)) return d->focus;
+        return focus_delegate(d, n->shadow_root);
+    }
+    if (n->style->visibility || web_control_disabled(n)) return NULL;
+    const char *type = node_attr(n, "type");
+    bool control = n->tag == T_button || n->tag == T_select || n->tag == T_textarea ||
+                   (n->tag == T_input && (!type || !str_ieq(type, "hidden")));
+    const char *editable = node_attr(n, "contenteditable");
+    bool focusable = control || ((n->tag == T_a || n->tag == T_area) && node_attr(n, "href")) ||
+                     (n->tag == T_summary && doc_details_summary(n->parent)==n) ||
+                     (n->tag == T_details && !doc_details_summary(n)) ||
+                     node_attr(n, "tabindex") || (editable && !str_ieq(editable, "false"));
+    return focusable ? n : NULL;
+}
+static node_t *focus_descendants(web_doc *d, node_t *parent, bool autofocus) {
+    for (node_t *n = parent->first; n; n = n->next) {
+        if (n->type != N_ELEM || !n->style || n->style->display == D_NONE || node_attr(n, "inert")) continue;
+        node_t *target = (!autofocus || node_attr(n, "autofocus")) ? focus_area(d, n) : NULL;
+        if (!target) target = focus_descendants(d, n, autofocus);
+        if (target) return target;
+    }
+    return NULL;
+}
+static node_t *focus_delegate(web_doc *d, node_t *parent) {
+    /* HTML's focus delegate uses DOM descendants, not assigned/flattened
+       descendants. Shadow boundaries are entered only by focus_area above
+       for a host that itself delegates focus. */
+    node_t *target = focus_descendants(d, parent, true);
+    return target ? target : focus_descendants(d, parent, false);
 }
 
 void web_focus(web_doc *d, web_node *n) {
-    if (n && node_attr(n, "disabled")) return;
+    if (!d) return;
+    if (n) {
+        if (!doc_node_connected(n) || n->owner!=d) return;
+        web_layout(d, d->width > 0 ? d->width : 800, d->height > 0 ? d->height : 600);
+        n=focus_area(d,n);
+        if(!n)return;
+    }
+    if (n && web_control_disabled(n)) return;
     if (n) doc_control_init(d, n);
     /* Keep Nocturne's existing first native focus at the end of a pristine
        control. An explicit JS range (including 0,0), value setter, or remembered
        user range takes priority; the unfocused initial DOM cursor is still 0. */
     if (n && (n->tag == T_input || n->tag == T_textarea) && !n->selection_set) {
-        n->selection_start = n->selection_end = doc_utf16_length(n->value);
+        n->selection_start = n->selection_end = doc_utf16_length(web_input_edit_text(n));
         n->selection_direction = 0; n->selection_set = true;
     }
     d->focus = n;
     d->caret = 0;
     if (n) doc_control_caret(d, n);
-    d->dirty = true;
+    d->dirty = d->need_style = true;
 }
 
 web_node *web_focused(web_doc *d) { return d->focus; }
+web_node *web_disclosure_focus(web_node *details) {
+    if (!details || details->foreign || details->tag!=T_details) return NULL;
+    node_t *summary=doc_details_summary(details);
+    return summary?summary:details;
+}
 
-static bool readonly(node_t *n) { return node_attr(n, "readonly") || node_attr(n, "disabled"); }
+static bool readonly(node_t *n) {
+    if (web_control_disabled(n)) return true;
+    if (!node_attr(n,"readonly")) return false;
+    if (n->tag==T_textarea) return true;
+    enum web_input_kind type=web_input_type(n);
+    return type<=WEB_INPUT_PASSWORD || (type>=WEB_INPUT_DATE && type<=WEB_INPUT_NUMBER);
+}
 
 int web_key(web_doc *d, const struct gui_event *e) {
     node_t *n = d->focus;
-    if (!n || !(n->tag == T_input || n->tag == T_textarea) || node_attr(n, "disabled")) return 0;
+    if (!n || !(n->tag == T_input || n->tag == T_textarea) || web_control_disabled(n)) return 0;
     doc_control_init(d, n);
     if (!n->value && !doc_node_value(d, n, "", 0)) return 0;
-    char *v = n->value;
+    const char *v = web_input_edit_text(n);
     int len = (int)strlen(v);
     doc_control_caret(d, n);
     int c = d->caret;
@@ -1116,7 +1213,14 @@ int web_key(web_doc *d, const struct gui_event *e) {
         else c = len;
         break;
     case NKEY_UP: case NKEY_DOWN: {
-        if (!multi) return 0;
+        if (!multi) {
+            if (readonly(n) || !web_input_numeric(web_input_type(n)) || (e->mods & (NMOD_CTRL|NMOD_ALT))) return 0;
+            if (web_input_step(d,n,1,k==NKEY_DOWN)!=WEB_INPUT_OK) return 0;
+            n->control_user_edited=true;
+            uint32_t last=doc_utf16_length(web_input_edit_text(n));
+            doc_control_selection(d,n,last,last,0);
+            return 1;
+        }
         int line = c; while (line > 0 && v[line - 1] != '\n') line--;
         uint32_t column = doc_byte_to_utf16(v + line, (size_t)(c - line));
         int target;
@@ -1140,7 +1244,7 @@ int web_key(web_doc *d, const struct gui_event *e) {
         if (readonly(n) || (start == end && !split_cursor && c == 0)) return 0;
         if (split_cursor) start--;
         else if (start == end) { int s = c - 1; while (s > 0 && ((unsigned char)v[s] & 0xc0) == 0x80) s--; start = doc_byte_to_utf16(v, (size_t)s); }
-        if (!doc_control_replace(d, n, start, end, "")) return 0;
+        if (!control_replace(d, n, start, end, "", true)) return 0;
         doc_control_selection(d, n, start, start, 0);
         return 1;
     }
@@ -1148,7 +1252,7 @@ int web_key(web_doc *d, const struct gui_event *e) {
         if (readonly(n) || (start == end && c >= len)) return 0;
         if (split_cursor) end++;
         else if (start == end) { int e2 = c + 1; while (e2 < len && ((unsigned char)v[e2] & 0xc0) == 0x80) e2++; end = doc_byte_to_utf16(v, (size_t)e2); }
-        if (!doc_control_replace(d, n, start, end, "")) return 0;
+        if (!control_replace(d, n, start, end, "", true)) return 0;
         doc_control_selection(d, n, start, start, 0);
         return 1;
     }
@@ -1165,29 +1269,49 @@ int web_key(web_doc *d, const struct gui_event *e) {
     if (k < 32 && k != '\n') return 0;
     if (k >= 0x100 && k < 0x200) return 0; /* other special keys */
     if (k > 0x10FFFF || (k >= 0xd800 && k <= 0xdfff) || readonly(n)) return 0;
-    const char *ml = node_attr(n, "maxlength");
+    const char *ml = (multi || web_input_type(n)<=WEB_INPUT_PASSWORD) ? node_attr(n, "maxlength") : NULL;
     uint32_t units = k > 0xffff ? 2 : 1;
     if (ml && *ml >= '0' && *ml <= '9' && doc_utf16_length(v) - (end - start) + units > (uint32_t)atoi(ml)) return 0;
     char enc[5];
     int el = utf8_put(enc, k);
     enc[el] = 0;
-    bool changed = doc_control_replace(d, n, start, end, enc);
+    bool changed = control_replace(d, n, start, end, enc, true);
     if (!changed) return 0;
     doc_control_selection(d, n, start + units, start + units, 0);
     return 1;
 }
 
+static node_t *form_id(node_t *n, const char *id) {
+    if (n->type == N_ELEM && n->id && !strcmp(n->id,id)) return n;
+    for (node_t *c=n->first;c;c=c->next) { node_t *found=form_id(c,id); if(found)return found; }
+    return NULL;
+}
 static node_t *form_of(web_doc *d, node_t *n) {
+    (void)d;
     if (!n) return NULL;
+    if (n->tag == T_form && !n->foreign) return n;
     const char *fid = node_attr(n, "form");
-    if (fid && d->root) {
-        node_t *f = find_anchor(d->root, fid);
-        if (f && f->tag == T_form) return f;
+    if (fid) {
+        node_t *f = *fid && doc_node_connected(n) ? form_id(doc_node_root(n,false),fid) : NULL;
+        return f && f->type==N_ELEM && !f->foreign && f->tag==T_form ? f : NULL;
     }
     return node_ancestor(n, T_form);
 }
 
 web_node *web_form_owner(web_doc *d, web_node *control) { return form_of(d, control); }
+bool web_take_validation_report(web_doc *d, web_node **control, const char **message, size_t *length) {
+    if (!d || !d->validation_report_pending) return false;
+    d->validation_report_pending=false;
+    node_t *n=d->validation_target;
+    if (!n || n->owner!=d || !doc_node_connected(n) || !web_control_will_validate(n)) return false;
+    const char *current=web_control_validation_message(d,n);
+    size_t size=n->custom_validity_length?n->custom_validity_length:strlen(current);
+    if (!size) return false;
+    if (control) *control=n;
+    if (message) *message=current;
+    if (length) *length=size;
+    return true;
+}
 
 /* Reset current control state without writing default attributes or making it dirty. */
 static node_t *reset_form_id(node_t *n, const char *id) {
@@ -1211,7 +1335,7 @@ static bool reset_form_text(node_t *n, char *out, size_t *len) {
 static bool reset_form_controls(web_doc *d, node_t *root, node_t *form, node_t *n) {
     if (n->type == N_ELEM && !n->foreign && (n->tag == T_input || n->tag == T_textarea || n->tag == T_select)) {
         const char *fid = node_attr(n, "form");
-        node_t *owner = fid ? (root == d->root ? reset_form_id(root, fid) : NULL) : node_ancestor(n, T_form);
+        node_t *owner = fid ? (doc_node_connected(n) ? reset_form_id(root, fid) : NULL) : node_ancestor(n, T_form);
         if (owner == form) {
             if (n->tag == T_input) {
                 const char *v = node_attr(n, "value");
@@ -1234,7 +1358,7 @@ static bool reset_form_controls(web_doc *d, node_t *root, node_t *form, node_t *
                 n->selected_set = false; n->control_ready = false;
                 for (int i = 0; ; i++) {
                     node_t *option = doc_select_option(n, i); if (!option) break;
-                    option->selected_set = false;
+                    option->selected_set = option->checked_dirty = false;
                 }
                 doc_control_init(d, n);
             }
@@ -1281,43 +1405,35 @@ void doc_control_checked(web_doc *d, node_t *n, bool checked) {
 }
 
 void web_toggle(web_doc *d, web_node *n) {
-    if (!n || n->tag != T_input || node_attr(n, "disabled")) return;
+    if (n && n->tag==T_details && !n->foreign) { doc_details_toggle(d,n); return; }
+    if (!n || n->tag != T_input || web_control_disabled(n)) return;
     doc_control_init(d, n);
     const char *t = node_attr(n, "type");
     doc_control_checked(d, n, t && str_ieq(t, "radio") ? true : !n->checked);
 }
+bool web_reset(web_doc *d, web_node *n) {
+    if(!d || !n || n->foreign || (n->tag!=T_input && n->tag!=T_button) || web_control_disabled(n)) return false;
+    const char *type=node_attr(n,"type");
+    if(!type || !str_ieq(type,"reset"))return false;
+    node_t *form=web_form_owner(d,n);
+    if(!form)return false;
+    struct web_event e={.type="reset",.bubbles=true,.cancelable=true};
+    if(web_dispatch(d,form,&e))doc_form_reset(d,form);
+    return true;
+}
 
 node_t *doc_select_option(node_t *sel, int index) {
-    if (!sel || sel->tag != T_select || index < 0) return NULL;
-    int idx = 0;
-    for (node_t *o = sel->first; o; o = o->next) {
-        node_t *list = o->type == N_ELEM && o->tag == T_optgroup ? o->first : o;
-        for (node_t *q = list; q; q = q->next) {
-            if (q->type == N_ELEM && q->tag == T_option) {
-                if (idx == index) return q;
-                idx++;
-            }
-            if (list == o) break;
-        }
-    }
+    if (index < 0) return NULL;
+    for (node_t *o = web_select_next_option(sel, NULL); o; o = web_select_next_option(sel, o)) if (!index--) return o;
     return NULL;
 }
 
 bool doc_option_selected(node_t *option) {
     if (!option || option->tag != T_option) return false;
-    node_t *sel = option->parent;
-    if (sel && sel->tag == T_optgroup) sel = sel->parent;
-    if (!sel || sel->tag != T_select) return node_attr(option, "selected") != NULL;
-    int selected = sel->selected;
-    if (!sel->control_ready) {
-        selected = 0;
-        for (int i = 0; ; i++) {
-            node_t *n = doc_select_option(sel, i);
-            if (!n) break;
-            if (node_attr(n, "selected")) selected = i;
-        }
-    }
-    return doc_select_option(sel, selected) == option;
+    node_t *sel = web_option_select(option);
+    if (sel) doc_control_init(sel->owner, sel);
+    else if (!option->checked_dirty) { option->checked = node_attr(option, "selected") != NULL; option->checked_dirty = true; }
+    return option->checked;
 }
 
 static void option_text(node_t *o, sbuf *b) {
@@ -1352,7 +1468,7 @@ static void collect(web_doc *d, node_t *form, node_t *scope, node_t *submitter, 
         if (c->tag == T_template) continue;
         const char *name = node_attr(c, "name");
         bool mine = form_of(d, c) == form;
-        if (mine && name && *name && !node_attr(c, "disabled")) {
+        if (mine && name && *name && !web_control_disabled(c)) {
             doc_control_init(d, c);
             if (c->tag == T_input) {
                 const char *t = node_attr(c, "type");
@@ -1376,15 +1492,11 @@ static void collect(web_doc *d, node_t *form, node_t *scope, node_t *submitter, 
             } else if (c->tag == T_textarea) {
                 add_pair(q, name, c->value ? c->value : "");
             } else if (c->tag == T_select) {
-                node_t *o = doc_select_option(c, c->selected);
-                if (o) {
-                    const char *v = node_attr(o, "value");
+                for (node_t *o = web_select_next_option(c, NULL); o; o = web_select_next_option(c, o)) {
+                    if (!o->checked || web_option_disabled(o)) continue;
                     sbuf t = {0};
-                    if (!v) {
-                        option_text(o, &t);
-                        v = t.p ? sb_cstr(&t) : "";
-                    }
-                    add_pair(q, name, v);
+                    web_option_value(o, &t);
+                    add_pair(q, name, t.p ? sb_cstr(&t) : "");
                     sb_free(&t);
                 }
             } else if (c->tag == T_button && c == submitter) {
@@ -1463,9 +1575,9 @@ int web_select_options(web_doc *d, web_node *sel, const char **labels, int max, 
 
 void web_select_set(web_doc *d, web_node *sel, int index) {
     if (d && sel && sel->tag == T_select && (index == -1 || doc_select_option(sel, index))) {
-        doc_control_init(d, sel);
-        sel->selected = index;
-        sel->selected_set = true;
-        d->dirty = d->need_style = true;
+        node_t *option = doc_select_option(sel, index);
+        if (option && web_option_disabled(option)) return;
+        if (option && node_attr(sel, "multiple")) web_option_set_selected(d, option, !doc_option_selected(option), true);
+        else web_select_set_index(d, sel, index);
     }
 }

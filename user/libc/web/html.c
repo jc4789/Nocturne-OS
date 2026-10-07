@@ -40,7 +40,7 @@ int tag_lookup(const char *name, size_t n) {
 /* ---------------------------------------------------------------- node helpers */
 const char *node_attr(const node_t *n, const char *name) {
     for (int i = 0; i < n->nattrs; i++)
-        if (!strcmp(n->attrs[i].name, name)) return n->attrs[i].value;
+        if (!n->attrs[i].namespace_uri && !strcmp(n->attrs[i].raw, name)) return n->attrs[i].value;
     return NULL;
 }
 

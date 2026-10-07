@@ -292,7 +292,7 @@ static void replaced_natural(box_t *c, float *iw, float *ih, float *ratio) {
     }
     case AT_SVG: {
         float vb[4];
-        int view = svg_viewbox(node_attr(n, "viewbox"), vb);
+        int view = svg_viewbox(node_attr(n, "viewBox"), vb);
         /* Presentation attributes and author CSS have already cascaded. Only
            absolute computed lengths are intrinsic dimensions (not %/auto). */
         *iw = spec_w(c, &c->st->width, -1);
@@ -427,7 +427,7 @@ static void size_atomic(box_t *c, float cbw, float cbh) {
 }
 
 /* ---------------------------------------------------------------- inline items */
-enum { IT_TEXT, IT_ATOMIC, IT_BR, IT_OPEN, IT_CLOSE, IT_FLOAT, IT_ABS };
+enum { IT_TEXT, IT_ATOMIC, IT_BR, IT_OPEN, IT_CLOSE, IT_FLOAT, IT_ABS, IT_WBR };
 
 struct item {
     uint8_t kind;
@@ -527,10 +527,12 @@ static void build_items(box_t *parent, struct ibuild *s) {
         switch (c->kind) {
         case B_TEXT: text_items(c, s); break;
         case B_BR: {
-            struct item *it = ipush(s->v, IT_BR);
+            bool soft = c->node && c->node->tag == T_wbr;
+            struct item *it = ipush(s->v, soft ? IT_WBR : IT_BR);
             it->box = c;
             it->st = c->st;
-            s->last_space = true;
+            if (soft) it->brk = c->st->white_space != WS_NOWRAP && c->st->white_space != WS_PRE;
+            else s->last_space = true;
             break;
         }
         case B_INLINE: {
@@ -710,7 +712,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
     float tall = 0; /* vertical-align top/bottom items */
     for (int i = ls; i < le; i++) {
         struct item *it = &v[i];
-        if (it->kind == IT_FLOAT || it->kind == IT_ABS || it->kind == IT_CLOSE) continue;
+        if (it->kind == IT_FLOAT || it->kind == IT_ABS || it->kind == IT_CLOSE || it->kind == IT_WBR) continue;
         if (it->kind == IT_OPEN) continue;
         float a, d;
         item_vext(it, &a, &d);
@@ -872,12 +874,12 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
     struct ivec iv = {0};
     struct ibuild bs = {&iv, true, NULL, 0};
     if (b->node && b->node->tag == T_a && node_attr(b->node, "href")) bs.link = b->node;
-    for (node_t *n = b->node; n && !bs.link; n = n->parent)
+    for (node_t *n = b->node; n && !bs.link; n = doc_flat_parent(n))
         if (n->type == N_ELEM && n->tag == T_a && node_attr(n, "href")) bs.link = n;
     if (!bs.link)
         for (box_t *p = b->parent; p && !bs.link; p = p->parent)
             if (p->node)
-                for (node_t *n = p->node; n; n = n->parent)
+                for (node_t *n = p->node; n; n = doc_flat_parent(n))
                     if (n->type == N_ELEM && n->tag == T_a && node_attr(n, "href")) {
                         bs.link = n;
                         break;
@@ -2365,6 +2367,12 @@ static void inline_intrinsic(box_t *b, float *mn, float *mx) {
             *mx = fmaxf_(*mx, line);
             *mn = fmaxf_(*mn, chunk);
             line = chunk = 0;
+            break;
+        case IT_WBR:
+            if (it->brk) {
+                *mn = fmaxf_(*mn, chunk);
+                chunk = 0;
+            }
             break;
         }
     }

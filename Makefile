@@ -7,6 +7,7 @@ NASM := nasm
 PY   := python
 
 BUILD := build
+QEMU_MEMORY ?= 2048M
 
 # ---------------------------------------------------------------- kernel
 KCFLAGS := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector -fno-stack-check \
@@ -100,9 +101,10 @@ $(BUILD)/u/%.o: %.c
 	@$(CC) $(UCFLAGS) -c $< -o $@
 
 # The checked-in copy permits in-OS linking without Python; regenerate on host edits.
-user/libc/web/js_bootstrap.inc: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py
+user/libc/web/js_bootstrap.inc user/libc/web/js_form_url.inc &: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py
 	@$(PY) user/libc/web/js_embed.py
 $(BUILD)/u/user/libc/web/js.o: user/libc/web/js_bootstrap.inc
+$(BUILD)/u/user/libc/web/form_validation.o: user/libc/web/js_form_url.inc
 
 $(BUILD)/u/%.asm.o: %.asm
 	@mkdir -p $(dir $@)
@@ -194,7 +196,7 @@ $(BUILD)/data-blank.vhdx: scripts/mkdata.sh
 	@rm -f $(BUILD)/data-blank.img
 
 run: image
-	@qemu-system-x86_64 -M pc -m 512M -drive file=$(BUILD)/nocturne.img,format=raw,if=ide,index=0 \
+	@qemu-system-x86_64 -M pc -m $(QEMU_MEMORY) -drive file=$(BUILD)/nocturne.img,format=raw,if=ide,index=0 \
 		-drive file=$(BUILD)/data.img,format=raw,if=ide,index=1 -serial stdio -vga std \
 		-audiodev dsound,id=snd -device AC97,audiodev=snd
 

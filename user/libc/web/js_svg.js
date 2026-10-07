@@ -16,9 +16,9 @@ const svgBridge = (() => {
     }
     class SVGAnimatedString {
         constructor(){throw new TypeErrorImpl('Illegal SVGAnimatedString constructor');}
-        get baseVal(){const r=record(this);return rawDom('attr',r.node,r.attribute)||'';}
-        set baseVal(value){const r=record(this);value=string(value);dom('attr',r.node,r.attribute,value);}
-        get animVal(){const r=record(this);return rawDom('attr',r.node,r.attribute)||'';}
+        get baseVal(){const r=record(this);return reflectedAttr(r.node,r.attribute)||'';}
+        set baseVal(value){const r=record(this);value=string(value);reflectedAttr(r.node,r.attribute,value);}
+        get animVal(){const r=record(this);return reflectedAttr(r.node,r.attribute)||'';}
     }
     const animatedProto=SVGAnimatedString.prototype;
     class SVGElement extends Element {

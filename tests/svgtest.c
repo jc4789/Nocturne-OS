@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <nocturne.h>
 #include "web.h"
 
 static int total, failed;
@@ -33,6 +34,40 @@ static void paint(web_doc *d) {
     web_paint(d, &canvas, 0, 0, 320, 240, 0, 0);
 }
 static int rgb(int x, int y) { return pixels[y * 320 + x] & 0xFFFFFF; }
+static int svg_dom_ready, svg_dom_errors;
+static void svg_dom_console(void *opaque, int level, const char *message) {
+    (void)opaque;
+    if (!strcmp(message, "SVG_DOM_READY")) svg_dom_ready = 1;
+    else if (level == 2) { svg_dom_errors++; printf("SVG DOM error: %s\n", message); }
+}
+static void gradient_namespace(void) {
+    /* Go through real DOM setters. Parsing xlink:href directly in SVG would
+       correctly produce an XLink attribute and could not expose this seam. */
+    const char *html = "<!doctype html><body style='margin:0;font-size:0;line-height:0'>"
+        "<svg width=48 height=24 viewBox='0 0 48 24'><defs>"
+        "<linearGradient id='base'><stop offset=0 stop-color='red'/><stop offset=1 stop-color='red'/></linearGradient>"
+        "<linearGradient id='plain'></linearGradient><linearGradient id='real'></linearGradient>"
+        "</defs><rect width=20 height=20 fill='url(#plain)'/><rect x=24 width=20 height=20 fill='url(#real)'/></svg>"
+        "<script>const p=document.getElementById('plain'),r=document.getElementById('real');"
+        "p.setAttribute('xlink:href','#base');r.setAttributeNS('http://www.w3.org/1999/xlink','Alias:href','#base');"
+        "const a=p.getAttributeNode('xlink:href'),b=r.getAttributeNodeNS('http://www.w3.org/1999/xlink','href');"
+        "if(a.namespaceURI!==null||a.prefix!==null||a.localName!=='xlink:href'||b.prefix!=='Alias'||b.localName!=='href')throw new Error('gradient attribute metadata');"
+        "console.log('SVG_DOM_READY');</script></body>";
+    svg_dom_ready = svg_dom_errors = 0;
+    struct web_host host = {.console = svg_dom_console};
+    web_doc *d = web_live(html, strlen(html), "https://svg.test/", "utf-8", &host);
+    if (d) {
+        for (int i=0;i<200 && !svg_dom_ready && !svg_dom_errors;i++) web_tick(d, uptime_ms());
+        web_tick(d, uptime_ms()); /* Finish the incremental parser after the setter task. */
+    }
+    check(d && svg_dom_ready && !svg_dom_errors, "gradient namespace real DOM setters");
+    if (d && svg_dom_ready && !svg_dom_errors) {
+        web_layout(d, 320, 240);paint(d);
+        check(rgb(6,6)!=0xFF0000, "null namespace xlink spelling cannot inherit gradient");
+        check(rgb(30,6)==0xFF0000, "true XLink arbitrary prefix inherits gradient");
+    }
+    web_free(d);
+}
 int main(void) {
     size("explicit dimensions", "<svg width=120 height=60><rect width=120 height='60'/></svg>", 1,1,120,60);
     size("author cascade", "<style>svg{width:40px;height:20px}</style><svg width=120 height=60></svg>",1,1,40,20);
@@ -66,6 +101,9 @@ int main(void) {
     check(rgb(2,2)!=0xFF0000,"lowercase viewBox preserves padding");
     check(rgb(6,6)==0xFF0000,"lowercase viewBox inner paint");
     web_free(d);
+    d=load("<svg width=24 height=24><defs><rect id='symbol' width=20 height=20 fill='red'/></defs><use xlink:href='#symbol'/></svg>");
+    paint(d);check(rgb(6,6)==0xFF0000,"namespaced xlink use remains renderable");web_free(d);
+    gradient_namespace();
     const char *invalid[]={"0 0 -20 20","0 0 20 -20","0 0 NaN 20","0 0 20 20 trailing","0,,0,20,20"};
     for(int i=0;i<5;i++){
         char text[256];snprintf(text,sizeof text,"<svg width=24 height=24 viewbox='%s'><rect x=4 y=4 width=16 height=16 fill='red'/></svg>",invalid[i]);

@@ -11,7 +11,7 @@
 #define VW 800
 #define VH 600
 #define SLOTS 32
-#define MARKS 192
+#define MARKS 512 /* The combined API cases emit more than 192 assertion markers. */
 #define PRELUDE "function check(n,v){console.log((v?'OK ':'FAIL ')+n);}" \
                 "function mark(n){console.log('OK '+n);}"
 #define START "<!doctype html><html><head><script>" PRELUDE "</script>"
@@ -37,6 +37,8 @@ static const struct asset assets[] = {
     {"/dir/order-one.js", "globalThis.dynamicOrder.push(1);", 15},
     {"/dir/order-two.js", "globalThis.dynamicOrder.push(2);", 0},
     {"/dir/api/json", "{\"ok\":true,\"value\":42}", 0},
+    {"/dir/api/long-headers", "complete headers", 0},
+    {"/dir/long-headers.mjs", "export const completeHeaders = 42;", 0},
     {"/dir/api/post", "Nocturne request body", 0},
     {"/dir/api/slow", "{\"late\":true}", 60000},
 };
@@ -47,12 +49,14 @@ struct queued {
     int kind;
     char url[2048], method[16], headers[1024], body[256];
     size_t body_len;
+    int cache_mode;
 };
 struct fixture {
     web_doc *doc;
     struct queued queue[SLOTS];
     char marks[MARKS][96];
     int nmarks, js_failures, errors, requests, cancellations, completions, sync_loads;
+    int fetch_requests;
     int outside_running, navigations;
     int scroll_x, scroll_y;
     bool expected_errors;
@@ -94,7 +98,7 @@ static void receive_log(void *opaque, int level, const char *message) {
         if (f->nmarks < MARKS) snprintf(f->marks[f->nmarks++], sizeof f->marks[0], "%s", message + 3);
     } else if (!strncmp(message, "FAIL ", 5)) {
         printf("%s\n", message); fflush(stdout); f->js_failures++; failed++; total++;
-    } else if (!strncmp(message, "XHR checks ", 11) || !strncmp(message, "Document checks ", 16) || !strncmp(message, "Document limit mode ", 20) || !strncmp(message, "Lexbor ", 7)) {
+    } else if (!strncmp(message, "XHR checks ", 11) || !strncmp(message, "Document checks ", 16) || !strncmp(message, "Document limit mode ", 20) || !strncmp(message, "Lexbor ", 7) || strstr(message, " API checks ")) {
         printf("%s\n", message);
     } else if (level == 2) {
         f->errors++;
@@ -112,6 +116,8 @@ static bool request(void *opaque, const struct web_request *r) {
         snprintf(q->method, sizeof q->method, "%s", r->method ? r->method : "GET");
         snprintf(q->headers, sizeof q->headers, "%s", r->headers ? r->headers : "");
         q->body_len = r->body_len;
+        q->cache_mode = r->cache_mode;
+        if (r->kind == WEB_RESOURCE_FETCH) f->fetch_requests++;
         size_t n = r->body_len < sizeof q->body - 1 ? r->body_len : sizeof q->body - 1;
         if (n) memcpy(q->body, r->body, n);
         q->body[n] = 0;
@@ -128,6 +134,14 @@ static void cancel(void *opaque, uint64_t id) {
         f->queue[i].used = false; f->cancellations++; break;
     }
 }
+static void long_headers(struct web_response *r, const char *mime) {
+    r->headers[0] = 0;
+    r->headers_full = malloc(8192);
+    if (!r->headers_full) { strcpy(r->error, "fixture header allocation failed"); return; }
+    size_t n = (size_t)sprintf(r->headers_full, "HTTP/1.1 200 OK\r\nX-Long: ");
+    memset(r->headers_full + n, 'L', 6000); n += 6000;
+    sprintf(r->headers_full + n, "\r\nContent-Type: %s\r\nX-Tail: complete\r\n\r\n", mime);
+}
 static bool sync_load(void *opaque, const char *url, int kind, struct web_response *r) {
     struct fixture *f = opaque;
     f->sync_loads++;
@@ -139,6 +153,7 @@ static bool sync_load(void *opaque, const char *url, int kind, struct web_respon
     r->status = a ? 200 : 404;
     r->body = strdup(a ? a->body : "not found");
     r->body_len = strlen(r->body ? r->body : "");
+    if (strstr(url, "/long-headers.mjs")) long_headers(r, "text/javascript");
     return r->body != NULL;
 }
 static void navigate(void *opaque, const char *url, const char *post) {
@@ -187,12 +202,26 @@ static void deliver(struct fixture *f) {
         if (q.kind == WEB_RESOURCE_MODULE && f->module_mime_headers)
             snprintf(r.headers, sizeof r.headers, "HTTP/1.1 200 OK\r\n%s\r\n", f->module_mime_headers);
         r.body = strdup(a ? a->body : "not found"); r.body_len = strlen(r.body ? r.body : "");
+        if (strstr(q.url, "/api/long-headers")) long_headers(&r, "text/plain");
+        if (strstr(q.url, "/api/oversized-headers")) {
+            r.headers_full = malloc(WEB_RESPONSE_HEADERS_MAX + 1);
+            if (r.headers_full) { memset(r.headers_full, 'X', WEB_RESPONSE_HEADERS_MAX); r.headers_full[WEB_RESPONSE_HEADERS_MAX] = 0; }
+            else strcpy(r.error, "fixture header allocation failed");
+        }
         if (!strcmp(q.url, "http://fixture.test/dir/api/echo")) {
             free(r.body); r.body = malloc(q.body_len + 1); r.body_len = q.body_len; r.status = 200;
             if (r.body) { memcpy(r.body, q.body, q.body_len); r.body[q.body_len] = 0; }
         }
         if (!strcmp(q.url, "http://fixture.test/dir/api/headers")) {
             free(r.body); r.body = strdup(q.headers); r.body_len = strlen(q.headers); r.status = 200;
+        }
+        if (!strcmp(q.url, "http://fixture.test/dir/api/cache-policy")) {
+            char metadata[160];
+            snprintf(metadata, sizeof metadata,
+                "{\"cache_mode\":%d,\"fetch_requests\":%d,\"has_cache_control\":%s,\"has_pragma\":%s}",
+                q.cache_mode, f->fetch_requests, strstr(q.headers, "cache-control:") ? "true" : "false",
+                strstr(q.headers, "pragma:") ? "true" : "false");
+            free(r.body); r.body = strdup(metadata); r.body_len = strlen(metadata); r.status = 200;
         }
         if (!strcmp(q.url, "http://fixture.test/dir/api/post") &&
             (strcmp(q.method, "POST") || strcmp(q.body, "Nocturne request body") || q.body_len != 21 || !strstr(q.headers, "x-fixture: yes"))) {
@@ -202,9 +231,10 @@ static void deliver(struct fixture *f) {
         if (web_script_running(f->doc)) f->outside_running++;
         web_resource_loaded(f->doc, q.id, &r);
         if (f->nmarks != marks || web_script_running(f->doc)) f->outside_running++;
-        /* Completion has to copy: its borrowed body is destroyed immediately. */
+        /* Completion has to copy: borrowed body and full headers die immediately. */
         if (r.body) memset(r.body, '!', r.body_len);
-        free(r.body); f->completions++;
+        if (r.headers_full) memset(r.headers_full, '!', strlen(r.headers_full));
+        web_response_free(&r); f->completions++;
     }
 }
 static web_doc *open_case_url(const char *html, bool expected_errors, const char *url) {
@@ -264,6 +294,7 @@ static char *script_page(const char *source) {
 
 /* Isolated API regressions supplement, never replace, public-site GUI checks. */
 static void external_case_expected(const char *file, const char *tail, const char *url, int expected_errors) {
+    printf("jstest: API batch %s\n", file); fflush(stdout);
     char path[160]; snprintf(path, sizeof path, "/data/tests/%s", file);
     FILE *f = fopen(path, "rb"); test_check(file, f != NULL); if (!f) return;
     if (fseek(f, 0, SEEK_END)) { fclose(f); test_check("api-seek", false); return; }
@@ -276,18 +307,30 @@ static void external_case_expected(const char *file, const char *tail, const cha
     char *page = script_page(source); free(source);
     test_check("api-page-allocation", page != NULL); if (!page) return;
     if (open_case_url(page, expected_errors != 0, url)) {
-        test_check(file, pump("api-done", 15000));
+        /* The collation oracle covers thousands of comparisons and yields
+           between batches. This is a harness deadline, not the page watchdog. */
+        test_check(file, pump("api-done", !strcmp(file,"js_collator_cases.js") ? 120000 : 15000));
         test_check("api-expected-exceptions", fixture.errors == expected_errors && fixture.js_failures == 0);
+        if (!strcmp(file,"js_form_validation_cases.js")) test_check("form-direct-submit-navigation",fixture.navigations==1);
         close_case();
     }
     free(page);
 }
 static void external_case(const char *file, const char *tail, const char *url) { external_case_expected(file,tail,url,0); }
 static void test_lexbor(void) {
-    external_case("js_lexbor_cases.js", ";const r=runLexborCases();check('lexbor-probe-count',r.checks===60&&r.legacyTotal===1&&r.unsupportedAPITotal===2);mark('api-done');", BASE);
+    external_case("js_lexbor_cases.js", ";const r=runLexborCases();check('lexbor-probe-count',r.checks===62&&r.legacyTotal===1&&r.unsupportedAPITotal===0);mark('api-done');", BASE);
 }
 static void test_platform(void) {
     test_lexbor();
+    external_case("js_attributes_cases.js", ";runAttributeCases().then(n=>{console.log('Attribute API checks '+n);check('attributes-count',n>70);mark('api-done');},e=>{console.log('FAIL attributes '+e+' '+e.stack);mark('api-done');});", BASE);
+    external_case("js_tokens_cases.js", ";runTokenListCases().then(n=>{console.log('Token API checks '+n);check('tokens-count',n>100);mark('api-done');},e=>{console.log('FAIL tokens '+e+' '+e.stack);mark('api-done');});", BASE);
+    external_case("js_shadow_cases.js", ";runShadowCases().then(n=>{console.log('Shadow API checks '+n);check('shadow-count',n>120);mark('api-done');},e=>{console.log('FAIL shadow '+e+' '+e.stack);mark('api-done');});", BASE);
+    external_case("js_web_legacy_cases.js", ";Promise.resolve().then(()=>runWebLegacyCases()).then(n=>{console.log('Web legacy API checks '+n);check('web-legacy-count',n>30);mark('api-done');},e=>{console.log('FAIL web-legacy '+e+' '+e.stack);mark('api-done');});", BASE);
+    external_case("js_html_elements_cases.js", ";runHTMLElementCases().then(n=>{console.log('HTML element API checks '+n);check('html-elements-count',n>100);mark('api-done');},e=>{console.log('FAIL html-elements '+e+' '+e.stack);mark('api-done');});", BASE);
+    external_case("js_form_controls_cases.js", ";Promise.resolve().then(()=>runFormControlCases()).then(n=>{console.log('Form control API checks '+n);check('form-controls-count',n>250);mark('api-done');},e=>{console.log('FAIL form-controls '+e+' '+e.stack);mark('api-done');});", BASE);
+    external_case("js_form_validation_cases.js", ";Promise.resolve().then(()=>runFormValidationCases()).then(n=>{console.log('Form validation API checks '+n);check('form-validation-count',n>150);mark('api-done');},e=>{console.log('FAIL form-validation '+e+' '+e.stack);mark('api-done');});", BASE);
+    external_case("js_semantic_elements_cases.js", ";Promise.resolve().then(()=>runSemanticElementCases()).then(n=>{console.log('Semantic element API checks '+n);check('semantic-elements-count',n>200);mark('api-done');},e=>{console.log('FAIL semantic-elements '+e+' '+e.stack);mark('api-done');});", BASE);
+    external_case("js_fetch_cases.js", ";runFetchCases().then(n=>{console.log('Fetch API checks '+n);check('fetch-api-count',n>100);mark('api-done');},e=>{console.log('FAIL fetch-api '+e+' '+e.stack);mark('api-done');});", BASE);
     external_case("js_css_supports_cases.js", ";mark('api-done');", BASE);
     external_case("js_svg_dom_cases.js", ";check('svg-dom-count',runSVGDOMCases()>=30);mark('api-done');", BASE);
     external_case("js_url_cases.js", ";for(const f of __urlTestResults.failures)console.log('FAIL url '+f.name+' '+f.error);check('url-count',__urlTestResults.total===32);mark('api-done');", BASE);
@@ -296,6 +339,7 @@ static void test_platform(void) {
     external_case("js_clone_cases.js", ";mark('api-done');", BASE);
     external_case("js_encoding_cases.js", ";check('encoding-count',runEncodingCases()>170);mark('api-done');", BASE);
     external_case("js_intl_cases.js", ";runIntlCases().then(n=>{check('intl-count',n===106);mark('api-done');},e=>{console.log('FAIL intl '+e);mark('api-done');});", BASE);
+    external_case("js_collator_cases.js", ";runCollatorCases().then(n=>{console.log('Collator API checks '+n);check('collator-count',n>7000);mark('api-done');},e=>{console.log('FAIL collator '+e+' '+e.stack);mark('api-done');});", BASE);
     external_case("js_history_cases.js", ";runHistoryCases().then(()=>mark('api-done'),e=>{console.log('FAIL history '+e);mark('api-done');});", BASE);
     test_check("location-reentrant-native-navigation",!strcmp(fixture.navigation,"http://fixture.test/dir/index.html?cache=5#outside"));
     external_case("js_geometry_cases.js", ";check('geometry-count',runGeometryCases()===15);mark('api-done');", BASE);
@@ -657,7 +701,7 @@ static void test_fetch_and_cancel(void) {
         "const controller=new AbortController(),promise=fetch('api/slow',{signal:controller.signal});controller.abort();"
         "try{await promise;check('fetch-aborted',false);}catch(e){check('fetch-aborted',e.name==='AbortError');}"
         "try{await fetch('file:///data/secret');check('fetch-local-rejected',false);}catch(e){check('fetch-local-rejected',e instanceof TypeError);}"
-        "try{await fetch('api/json',{method:'PUT'});check('fetch-method-rejected',false);}catch(e){check('fetch-method-rejected',true);}"
+        "try{await fetch('api/json',{method:'TRACE'});check('fetch-method-rejected',false);}catch(e){check('fetch-method-rejected',e instanceof TypeError);}"
         "try{await fetch('api/json',{body:'not allowed'});check('fetch-get-body-rejected',false);}catch(e){check('fetch-get-body-rejected',true);}"
         "document.getElementById('target').textContent='received '+json.value;document.title='Fetched 42';mark('fetch-done');}exercise();";
     char *page = script_page(source);

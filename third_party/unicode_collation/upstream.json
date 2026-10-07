@@ -1,0 +1,8 @@
+{
+  "archive": "https://github.com/unicode-org/icu/releases/download/release-78.1/icu4c-78.1-Win64-MSVC2022.zip",
+  "bytes": 29430470,
+  "sha256": "7cdb80d49dddc74371788dcbd55907ae4ac2353db38bca74f10c0560f1bb8538",
+  "sha512": "e98a7635a1be8f1c49ca5f6dedfc9dda3f6411053becba628f226be4135983ac9b02795c31308a04f739dcec911f629dd0cc7a82c49e75d7cab45242c6e82892",
+  "checksumSource": "https://github.com/unicode-org/icu/releases/download/release-78.1/SHASUM512.txt",
+  "licenseSource": "https://raw.githubusercontent.com/unicode-org/icu/release-78.1/LICENSE"
+}
