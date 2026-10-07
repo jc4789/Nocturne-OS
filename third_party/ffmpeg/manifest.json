@@ -1,7 +1,7 @@
 {
   "release": "9.0.2",
   "license": "LGPL-2.1-or-later",
-  "compiled_sources": 280,
+  "compiled_sources": 333,
   "files": [
     {
       "path": "compat/va_copy.h",
@@ -10,12 +10,12 @@
     },
     {
       "path": "config.h",
-      "sha256": "352d8f6f88bf65a193fa81ad20e08d37f33bee984039e655e9991221a52008a8",
+      "sha256": "3a890c6a8708244c6af10f2a1451b787f6151aecb11e0a0326db05b009b3244d",
       "origin": "configure-generated"
     },
     {
       "path": "config_components.h",
-      "sha256": "eedcf9783ea199eb7364b9045be9287d2725df0e5c5c0c82435bf0d1a2558794",
+      "sha256": "c3b7871de6db4e366fd48519e792390769f413d7d87dad131d1c3b207a97a194",
       "origin": "configure-generated"
     },
     {
@@ -359,13 +359,18 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavcodec/bsf/vp9_superframe_split.c",
+      "sha256": "e7a9553be73118c1eec5710034f26464603b6e25eb9a415bf49e80036d302d73",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavcodec/bsf_internal.h",
       "sha256": "f21092a67c07cd8edbbdd4431341242842074a6e69ee97010cfe25e0ec17f2b4",
       "origin": "upstream-unmodified"
     },
     {
       "path": "libavcodec/bsf_list.c",
-      "sha256": "bdd8790c519c97b62a52edba0b6d0b2241695e08d3c03bf026984c5e21a3e8a7",
+      "sha256": "f5077d1e0e4535c8ee8faf8957423f740a5bbf7c713cd31f90a1f49436c0d156",
       "origin": "configure-generated"
     },
     {
@@ -419,6 +424,46 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavcodec/cbs.c",
+      "sha256": "6620eaae288a3fcf3e90139f669bf85befd037755887797fb60364e57a1f7889",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/cbs.h",
+      "sha256": "e163e11e38af04ecb61ecc848ce8ba96f8b9e8cf474cbf54f8ccf61340ed54c0",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/cbs_bsf.c",
+      "sha256": "b5fd2c2565d49cdab7df92af1fb9a304648ca810a733b44ceed096ff38ddbfbe",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/cbs_bsf.h",
+      "sha256": "a31f99d827faa6cb3728dab0bf82303a93352f461115589a5fb904f5cc97d2a9",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/cbs_internal.h",
+      "sha256": "26038999c50e98a5c7c3866ce06db42c65d2923168a9b641b42fa6804b6cb7ac",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/cbs_vp9.c",
+      "sha256": "5f81f4c302d4612081e09a35bd1ce80a1e2e512f108da71655481d98020806f3",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/cbs_vp9.h",
+      "sha256": "d3b5716a3429c20d6d19c03c2f8e33707052d96b52334245833075d498e01c91",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/cbs_vp9_syntax_template.c",
+      "sha256": "dea7c49909c29cc70e582cfe77b5d8bab526512cc0354c44045205b66f8f93de",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavcodec/codec.h",
       "sha256": "ad4550b3f8ff7c7dd1c79a373721ba43273c4d1f156c683e11e27f9b5d89be1a",
       "origin": "upstream-unmodified"
@@ -445,7 +490,7 @@
     },
     {
       "path": "libavcodec/codec_list.c",
-      "sha256": "02df2f39a5b0c6fae38f0eb4660867fd818fb1ca61013c8d32f1a6a728c14dd4",
+      "sha256": "fa03831b2034c4fb6769d5ecbc18ceeb07e7b3177873b242f2ad53f67ff3012b",
       "origin": "configure-generated"
     },
     {
@@ -1344,6 +1389,101 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavcodec/opus/celt.c",
+      "sha256": "99763387fef5cef3d9218a14a00366b8b4de0799a932e310ff6b33a90a5b1b8b",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/celt.h",
+      "sha256": "1401ef1b437f1f79e62c36057d0ebfc5ad5914a0522ace5fcee25445ec9c7bc1",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/dec.c",
+      "sha256": "646a70e8c33308c3b3260fb24ac60848c95446dd0f74fd58cc272060102fe36d",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/dec_celt.c",
+      "sha256": "6e26e1b8eaffc7b5687276e7b887a34118ec9d63e1a0bb00dc4fe9a977643710",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/dsp.c",
+      "sha256": "fa0892e7562e3aa4d89f4ebab4ef2136a312e261c364eb8bd0c74d5bc7383096",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/dsp.h",
+      "sha256": "2dda4c0d028fec78a3e08ca00fc7c86859e2e3199a078b1e7b10e2345fa3f45a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/frame_duration_tab.c",
+      "sha256": "ca67419c6c9eadc9bcbc908a0ffa6531d61d0180e55ad782ccced95d3f52ebfb",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/opus.h",
+      "sha256": "9ac51eff325a4fb74502c81fe03de55c6d8ed23b5ab6af320a2d3403222dd5cc",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/parse.c",
+      "sha256": "1880972db14efb2c91bec3aa0738a2c61b6cfc7feb2258265a44e8406cb038a9",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/parse.h",
+      "sha256": "cfc26ed3dd57f34983757697a4e252ffb8fa6a960627aaddd359347a9bbcc44d",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/parser.c",
+      "sha256": "0073378a6ae1703297e926cde66e6dac99096d4d12fe3361fb63a65fac737a43",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/pvq.c",
+      "sha256": "4e327eea78ac43b5e0f68479d477d5127e8f2053eb68ab08dbd498c42cf3ab0d",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/pvq.h",
+      "sha256": "3eb2ca0cab072c9ec33c498e9b393d959e50281d35b62cf936a57301c84f6a2f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/rc.c",
+      "sha256": "123fbb418dadc55072c7fc740d9b6ebbc601009eafa26cded28112dae9e2c9ee",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/rc.h",
+      "sha256": "8e46ac3cbe5900848c0ddd82eeb258569e7f27906868d73ad8da8936c1ed8cb2",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/silk.c",
+      "sha256": "b0156f3a0f5ccfb0458a5cf8c52787006cd3819aa18a3c8a1dc1db31b8988ede",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/silk.h",
+      "sha256": "e9133a7200a5bbbb2ad62a58130cdf27c0e8ccd5c62b2ccf827067c4d0ab04a8",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/tab.c",
+      "sha256": "ba15ac1c06c73086a63e8a5ae9543760764f64b84c6b6d8ae0c694f602f2fbaf",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/opus/tab.h",
+      "sha256": "0c85d5a33bf2fd85a5794fe305ed450c2012f7fad956859b1e0043e1e7e5e053",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavcodec/packet.c",
       "sha256": "1a55f83c84cc007eff5dd6857e1b55dda2d7984fc0fd534f45b9c3fa600b5f6e",
       "origin": "upstream-unmodified"
@@ -1375,7 +1515,7 @@
     },
     {
       "path": "libavcodec/parser_list.c",
-      "sha256": "3b0bd9a8945b3aab94fc07d1f155f3bf21579ad13164e136b6fd9f224b9b9e57",
+      "sha256": "8b8d0c83f285c461250293ef9d57b2a0b243db62059eba2d44893cd44bb33344",
       "origin": "configure-generated"
     },
     {
@@ -1644,6 +1784,26 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavcodec/vorbis.c",
+      "sha256": "c3fda10300e23b09932ed0b8c89af02be46821e37ca9740c305d7a79e5216a10",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vorbis.h",
+      "sha256": "08c05e80eee1cb4ffba15a211d4f37231cfe93bb1193207b9eabc84ef4e8e5dd",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vorbis_data.c",
+      "sha256": "404e2fdbf9bcf7fd39207d9b96095aba8e45127e68da598bb77f5d80c4a86f0a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vorbis_data.h",
+      "sha256": "2229493faaee6a562a91c8352e04844f7a1b2633c9d58d9552814c5754d0f1ca",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavcodec/vorbis_parser.c",
       "sha256": "1d7cbe604252b475b7a67427a025d01d0d155724a6f52ee4ef2b0eeda993053a",
       "origin": "upstream-unmodified"
@@ -1656,6 +1816,131 @@
     {
       "path": "libavcodec/vorbis_parser_internal.h",
       "sha256": "60773d5c33c5d726f77073ae2d02e502cef00c082d4adb54494b62d6b72d0752",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vorbisdec.c",
+      "sha256": "efc7a76f512123a43686ffa7c9b87d8d2718cbf40fbe22799d9fb564b07eabbb",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vorbisdsp.c",
+      "sha256": "dfcdf80fe9e9ae28031235b36bc3a9b4f9da71acaaa3feab53fc4aa12256ef81",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vorbisdsp.h",
+      "sha256": "0de1e29a4af5678b55047204bdef68891d1072c38c8388c228b15b745eb2fa81",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp89_rac.h",
+      "sha256": "dfe3789f1decfc6f7c5a2582f54b7dcec256d1313749bd6ff58a044b32616ee7",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9.c",
+      "sha256": "17dd31ad592ef6649a2cb27b479f7a0bf214b6e816fde112495ff257453e3614",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9.h",
+      "sha256": "e72d8eaa14f4444701c0052a7ccbd6a5a01c64cdb94ab9c9955e8d200ae9689f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9_mc_template.c",
+      "sha256": "28c4b1a0acd0af176bf8977371d132f2fa3547429d9b762536dad838bd6796c2",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9_parser.c",
+      "sha256": "48afa73f687a5371e4adf0c83f81d5cbc2270085a094b7e0d3e94b6dd7e67e57",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9block.c",
+      "sha256": "b2553618b9ff22a6faef3194403050b9c2b7235070ed3de25046f8c17668e1b4",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9data.c",
+      "sha256": "c664b3e88c1610ec4ece41af781eb3b994fa29ec3370ca94d41ea48a4e265f8c",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9data.h",
+      "sha256": "d77f6efab2f3bc88dc111d02cee98544c41eeae55e9b51b6fe3dcbe72f909d89",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9dec.h",
+      "sha256": "cc23a9da2a27d964a532ee624aa34cbe53b9b6e16d7bf91b7b0eec209fe935ec",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9dsp.c",
+      "sha256": "409d240d71904d1bd054fd97f2c30e951b70f9d80bb9d2450f942bb55503419c",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9dsp.h",
+      "sha256": "08774eb28b5cd4f5dcb68b020455dc3b1da3e3ffe9e214f3e1c0941aa4e2b2c1",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9dsp_10bpp.c",
+      "sha256": "cad7904873f827162ce6a849e02486b92cf3fe8a3db7b8bcf0b6895fd03a77c7",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9dsp_12bpp.c",
+      "sha256": "3dbef0a594496b95a283e81a03be6ee07584efbb3cc145005ff781ac2dd55143",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9dsp_8bpp.c",
+      "sha256": "749f5ed057d438d3fa43be4fe6aa0a52edc78bf3434852deacc8e4f2db620391",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9dsp_template.c",
+      "sha256": "41b21f667a6c497b620aa1637d8269badc45d1ac7e621d694441c5bf39356e4f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9lpf.c",
+      "sha256": "e2c5c54eb23e471160266b235a746b011365e9c7e923291e2c35f85f81aa5002",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9mvs.c",
+      "sha256": "021b6f982d89423438a24ddabb2af6add90e3284e9a4ae12be9cea9cc2dd3a96",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9prob.c",
+      "sha256": "37e935f41737e15c272ce5f3aca86d15866def5ce7c28a58de8d98a1a335330f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9recon.c",
+      "sha256": "6ceaa0daeaca88b1ea309ec37f26b1a6bcbc789dad3327420c5962edb7b7fb3a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp9shared.h",
+      "sha256": "4b96b7e50ba34ae642f214ce2a8706978762d782376fee76f78068bdfc28a15c",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vpx_rac.c",
+      "sha256": "ef3fa1bd133701109eb721217ef692d12248e684c7829616bf36509ea454408f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vpx_rac.h",
+      "sha256": "c0a3fbdf5c9afd719be4df6507b1aa531ff2f361609d092467033ad7ab4d69ef",
       "origin": "upstream-unmodified"
     },
     {
@@ -1780,7 +2065,7 @@
     },
     {
       "path": "libavformat/demuxer_list.c",
-      "sha256": "df1d00e851f36299c73e339fb0b7574f3dc81172822790e3a9f89e3a25151da4",
+      "sha256": "06c23fb853c29cbe2b97c0d0e6f5e82bcaac5df4067e7adecad801c9d08c7ad7",
       "origin": "configure-generated"
     },
     {
@@ -1934,6 +2219,21 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavformat/matroska.c",
+      "sha256": "40eaeb64621cdc7cec3e42627fe81ad336ae8bf030bd5918e2b0c742972b7a34",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/matroska.h",
+      "sha256": "f6822e901ba324b9c90b0ef1068e53566484c442a16430b3cf3fa653fc14d45f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/matroskadec.c",
+      "sha256": "0c88b1ca79de4501fade5864304443493fbbfa26cd21bf95013ee89f186bcfd8",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavformat/metadata.c",
       "sha256": "b0583a992fcd28fcad34f3bc2f73cb394fd2d9e32227616fe38950b45a9cdb0b",
       "origin": "upstream-unmodified"
@@ -1999,13 +2299,58 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavformat/oggdec.c",
+      "sha256": "43d988cc30a355832e50a1873db80663741706ed4e7b50760cbdab8e10446c9f",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavformat/oggdec.h",
       "sha256": "16dfa6e5ebdab3f1da352886f72debf92fbe3f3dfc2dbf240063cc7b56f3b11e",
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavformat/oggparsedirac.c",
+      "sha256": "51315fc6adf346af95e85adb40e9197d85bbb810a61455c3b0d8d34f66dd57d4",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/oggparseflac.c",
+      "sha256": "f41f8e7b3d2d56db905ffcfeb42d35f19a3ebdbf66654aac7ab1c1e3d9e380dd",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/oggparseogm.c",
+      "sha256": "6be3f01f0427a5fed2a441274b9aee80757550122479bc4e2beaba0c4e38e2b6",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/oggparseopus.c",
+      "sha256": "a5656472273e5c328775b3f0dd2a28f1dbfc8da6f1d2b8233692fc94f74bfd04",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/oggparseskeleton.c",
+      "sha256": "f44afa4c1ee70226cd9f1631f699a348688f4f7391d5ffb70d7d34a0e87d93d2",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/oggparsespeex.c",
+      "sha256": "d3aa27c5ba93e98944fa300c42ac6ed875b3eabf58cd483a154bc176f57f63c8",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/oggparsetheora.c",
+      "sha256": "0c27d0bcc6efb96a85e6551fe87db07e61c71eaaf36613c7154ae51841d7a354",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavformat/oggparsevorbis.c",
       "sha256": "a11ec3562e733f21565c491ab56b7f1d4a6865fc1ddbdc372ed9cb29b13ca7fb",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/oggparsevp8.c",
+      "sha256": "9c865221124c5c926cce0522594d21524b738629c1ced1dfd764a8c5871e1066",
       "origin": "upstream-unmodified"
     },
     {
@@ -2101,6 +2446,16 @@
     {
       "path": "libavformat/riffdec.c",
       "sha256": "3983e144b7040b3a9405014f7697414372e0157047437a425418d9e64d514837",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/rmsipr.c",
+      "sha256": "39b92853cee2f7f2461f90b3c11ad16bc24d835d461b4e27a40f83d54fae4730",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/rmsipr.h",
+      "sha256": "668485eadaa4482179b796edc97fae7aaa90929017ae07fca3f0c157c273e311",
       "origin": "upstream-unmodified"
     },
     {
@@ -3264,6 +3619,101 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libswresample/audioconvert.c",
+      "sha256": "7f7246765fe5c841e0c65556c502735834630e20910e3edc3e9e0717b373333b",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/audioconvert.h",
+      "sha256": "07a63145b5954cd29fddcce565f9e8699553758e8b613be94f715f7daee585ff",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/dither.c",
+      "sha256": "7a20c05e0337693b2cfe815853d918c3cd15b096318dae3a0ac6715984edc44f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/dither_template.c",
+      "sha256": "364810e7d1ff1fab041cb97a83eb36c3cb2505ab3922dbcf5c189137d8890103",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/noise_shaping_data.c",
+      "sha256": "7013f8349bdc5a37b47da7b3a61ef6ed952d31be560de35622d00329e6bb2359",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/options.c",
+      "sha256": "82b3a882ff3b812517153ab3a1b9e991fcd4903043baad1f038493d958de6c7f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/rematrix.c",
+      "sha256": "7bf9eb216ed30ad66a9620746733c1115d2ad1ae508ff34a277a83ffe7515a7f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/rematrix_template.c",
+      "sha256": "b6a3280b0352c752ff47d03d7d13ad91d5f47c40921dfdd6ff1509876c39863b",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/resample.c",
+      "sha256": "35625e023415fdeee2219932126bdd7e5bfd94496c1c5c00c98261cbef695b6b",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/resample.h",
+      "sha256": "0000d8e4eb1fc63e389f5351d2c33c723f2427e8aeb5d9485704be7ce0c8e375",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/resample_dsp.c",
+      "sha256": "67e8a78145cf4ddac068d54b58ae3dd2e74a212562f8c2977b438373674def99",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/resample_template.c",
+      "sha256": "938ac72b954320a35bb15d0ad76ee94a780117b5ffcb8e8abb85e9f65a5b7470",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/swresample.c",
+      "sha256": "1ed883c6eb8303337cc5d2b779af1115533be72c3b25d5d66325e54d1c1f3bf1",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/swresample.h",
+      "sha256": "b23e625ab295d57a3d1ae0142c937b485dc386a36e4ed63f4b99ed886dc905e1",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/swresample_frame.c",
+      "sha256": "a753e04fbfecedab18ed3e45ca740ba15b647703391e9007129180cf41199141",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/swresample_internal.h",
+      "sha256": "b45fc1c98b35a58108d0edcaa238d7dd7a2990c80ca6be3f3545eb38f0ae5d89",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/version.c",
+      "sha256": "c923da35b2928807ca496c299b15bf44ceb28f19bd2b9466f6d37c2d3de3db64",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/version.h",
+      "sha256": "82e6be19053e0007658d30c18bb463fdde69f9f1e957314908cae73ae3e38b68",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/version_major.h",
+      "sha256": "c730cced7041664f716e82872850329b59fa965f1c93044ce37593bd14a59c40",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "RELEASE",
       "sha256": "cb59c54a0c419202b393c39beebcdbef094e480bdea5c82290050c265a1f7508",
       "origin": "upstream-unmodified"
@@ -3305,25 +3755,49 @@
     "HAVE_FCNTL": 0,
     "HAVE_MKSTEMP": 0
   },
+  "libraries": [
+    "libavutil",
+    "libavcodec",
+    "libavformat",
+    "libswresample"
+  ],
   "decoders": [
     "aac",
     "flac",
     "h264",
     "mjpeg",
     "mp3",
-    "rawvideo",
+    "opus",
     "pcm_f32le",
     "pcm_s16le",
     "pcm_s24le",
     "pcm_s32le",
-    "pcm_u8"
+    "pcm_u8",
+    "rawvideo",
+    "vorbis",
+    "vp9"
   ],
   "demuxers": [
     "aac",
     "avi",
     "flac",
+    "matroska",
     "mov",
     "mp3",
+    "ogg",
     "wav"
+  ],
+  "parsers": [
+    "aac",
+    "flac",
+    "h264",
+    "mjpeg",
+    "mpegaudio",
+    "opus",
+    "vorbis",
+    "vp9"
+  ],
+  "bitstream_filters": [
+    "vp9_superframe_split"
   ]
 }

@@ -6,6 +6,66 @@
 
 **日常利用OSの完成ではない。** 一般プロセスのSMP、WebGL、現代の配信サイト全般への対応は未達である。検出、ビルド、自己試験、実サイトの表示、実際の操作を区別する。
 
+## 第2段階の現在の到達点
+
+以下の第1段階の記録を削除せず、最新の統合結果をここに区別して示す。旧媒体の「VP9/Opus/Vorbis未対応」「GPU能力非公開」「40成功」は、この第2段階の現在値ではない。
+
+最新payloadは kernel `238aac650cdf8015e7d6b33082bf2ce7f5af100d7f1cd8d894fd5ca0ec79ba78`、initrd `06d72dc677077e3826fbc2139c90d02b52668ce43dc6cf4593889d9b845fe7b7`。各実行の内部payloadと専用scratchを照合し、旧候補・失敗・修理後の証拠を混ぜない。
+
+### CPU：実GUIのRAM合成へ接続
+
+- 不変のgeometry/title/focus等のsnapshotと借用client RAMを、限定APの非重複行cellで合成する。私有clip、同期join、batch間IRQ復帰を維持し、AP内で割当・I/O・scheduleをしない。overlayとVRAM転送はBSPのまま。
+- 行数を幅・layer密度の仕事量へ正規化し、5/6/9行のceil分割がAP APIの逐次fallbackへ落ちた反例を、比例cell境界だけで修理した。強制4/5/6/9行と実GUIでmask/仕事数/画素/guardを確認した。
+- 同じ仕事の合成fixtureの多層4/16/64ではdirect比約1.77/1.97/1.99倍。担当の実16窓操作では約1.73～2.00倍。ただし**RAM合成部分の測定**であり、全frame・入力latency・音声同時負荷・browser全体の高速化ではない。一窓の利益は揺れる。
+- 実28→16→0窓、move/title、resize/free、42client画素、UP/nosmp、実callback fault/context保持を検査した。MAX_WIN64だけを見て63窓を期待した親/担当の判断は、MAX_FDS32による29窓上限で反証された。試験だけ28へ限定し、kernel/ABI容量を増やしていない。合成64layerと実63窓を混同しない。
+- **既定は逐次のまま**。`wmparallel`はopt-in、`wmverify`/`wmbench`は比較検査。担当run最大batch1.337/1.341ms、親の独立28窓run最大1.763ms、後にも1ms超が残る。仕事量縮小はheuristicで、hard1msや無欠落を保証しない。一般scheduler SMP・user thread・AVX・一般TLB shootdownは未達。将来kernel preemption/SMPを広げるなら借用bufferのpin/refcountが必要。
+
+### 描画：実3Dの期限内動作、速度改善は未達
+
+- QEMUを介さないvirgl/ANGLE対照でも255～256pollの空tail fenceを再現した。追加glFlushやMT指定だけでは解決しない。同梱ANGLEの固定commitはflags無しをD3D11のDONOTFLUSHへ写す。正規`GL_SYNC_FLUSH_COMMANDS_BIT`の一行修理で、ダミー描画や期限延長なしに解決した。256の内部定数の所在は断定しない。
+- `ports/virgl`の追跡builderは固定revision `2cb2065b6a0515c5accfa3e44bcb7ce57d2f9983`/1.1.0をworkspace内だけに構築する。親が空の新stageから未修正/修理版を全再構築し、元QEMUの全対象hash不変を確認した。旧新DLLの差はPE timestamp/checksum領域だけだが、byte-identical再現とは呼ばない。
+- 最新OS＋親fresh修理runtimeでは全25transaction、通常期限の画素検査、**GPU19 checks/0失敗、Canvas22/0・実paint・GPU submissions2**。全体最大30.070ms、通常/validation最大16.923ms。未修理対照は通常2秒期限でcap0/DMA保持へ撤回し、CPU fallbackの画素を維持した。
+- 同入力hash・400×400三角形3回のupload/syscall/readback/copy込みは **GPU47ms、CPU5ms（GPUが9.4倍遅い）**。したがって実3D機能は成立したが実用加速は未達。旧同媒体対照の47/6msは別記録として保持する。shader/512²/同期readback/Canvas opaque clearの限定は変えず、WebGL・全Canvas・Hyper-V GPUは未対応/未検証。修理runtimeと`gpu-enable`を明示しない既定起動はCPU描画。
+
+### メディア：WebM/OggとVP9/Opus/Vorbis
+
+- FFmpeg 9.0.2閉包を**333C・749 manifest file・9,463,614bytes**へ拡張した。原文とlicenseは元木の全hash一致、生成構成だけLF等を正規化。Opus SILK内部のgeneric swresample9Cを追加し、thread/assembler/外部codec/network/FFmpeg CLIは導入しない。
+- VP9 profile0・8bit YUV420・SDR、Opus CELT/SILK、Vorbis、WebM/Matroska・Oggを実decoderへ追加した。高bitdepth/HDR・VP8/AV1等の存在しない出力能力を宣言せず、圧縮負例と`canPlayType`文字列を検査した。
+- 最初のnative試験は全Opusが9600ではなく9312framesとなり失敗した。`pkt_timebase`欠落と非active seek sentinel/負PTSによる二重trimをadapter2箇所だけで修理。元decoder・圧縮fixture・9600期待を変えず、先頭PTS0とseekを確認した。
+- 最新全体回帰の旧codec73982/0・旧browser36/0、新codec148113/0・新browser51/0。file/所有memory、VP9画素、Opus9600、Vorbis、EOF後seek、doc lifetime、pause/seek/flush・拒否を通過。
+- 最新の実HTTP `/bin/browser`は自作HTML＋VP9/Opus WebM＋Vorbis Oggの3GETを取得し、各bytes/SHAを照合。96×64の最終frame/controls、ENDED0.4/0.4と0.2/0.2、DONE、JSエラー無しを画面とconsoleで確認。AC97録音は左右444/656Hz・0.20秒を**2回**、厳密解析で確認した。短い自作clipの正例であり、人間の聴感・実サイト配信・長時間品質ではない。
+- BSP software decode、簡易resample/先頭2ch、4decoder/文書、64MiB入力/文書、32MiB/所有memory入力、既存fetch実効16MiB、総decoder heap予算未保証を維持する。MSE/DRM/HLS/DASH/Range/live、HEVC/AV1等と長時間高解像度品質は未達。
+
+### 最新全体回帰と再現
+
+WHPX4/2GiB、`scripts/test.py --quick --no-net`全groupを**69成功・0失敗・9省略**で完走。FAT118files整合、strict8音録音、QEMU終了0。`jstest`927 checks/0失敗を含むnative web経路も検査した。省略はquickのOS内全アプリ再compile/tcc self-host2件と、明示除外した外部network7件。ローカルTCP/worker/容量回復は実行済み。bootはsnapshot、回帰dataは新規専用の書込可能scratch（FAT検査用）で、既存dataではない。他のplatform QAはboot/scratch両snapshot。証拠は`build/nocturne-platform/stage2-release-regression`、`root-proportional-independent.json`、`root-stage2-current-acceptance.json`。
+
+親の最新単CPU/512MiB `stage2-root-up512`でもCPU情報detected=online=scheduler=1、jobs=0、旧新codec73982/148113・旧新browser36/51・Canvas22の全失敗0、実paint、QEMU終了0を確認した。4CPU/2GiBの全groupと音声8音検査を512MiBでも全部実行した意味ではない。
+
+```text
+python -X utf8 scripts/build.py all
+python -X utf8 scripts/test.py --quick --no-net --accel whpx --cpus 4 --memory 2048
+python -X utf8 ports/ffmpeg/check-vendor.py --source "D:/Programes/cloned repos/ffmpeg-9.0.2"
+python -X utf8 ports/ffmpeg/prepare.py --profile webm --stage build/media-reproduce-new --source "D:/Programes/cloned repos/ffmpeg-9.0.2"
+python -X utf8 scripts/platform_qa.py --label own-ram --accel whpx --cpus 4 --cmdline wmverify --command "tcc -o /home/wmramtest /data/tests/wmramtest.c && /home/wmramtest --many" --command "sleep 10" --seconds 180
+```
+
+stageとlabelは新規名にする。host修理の再構築/依存/BIOS読み取り専用指定は`ports/virgl/README.md`に記録した。自動installerや元配置へのDLL上書きはしない。最終Hyper-V実機・Enhanced Session・日常OS完成は引き続き未検証/未達である。
+
+### 最新の指定実サイト（各75秒、実HTTPS・Nocturne自身）
+
+`stage2-latest-{baike,amazon,openai}`は全て上記238aac/06d72を起動し、QEMU終了0と画面を親が確認した。期待markerを指定しないサイトharnessの受理は**サイト互換成功ではない**。
+
+| 指定URL | 実画面・通信/JSの観察 | 未達 |
+|---|---|---|
+| `https://baike.baidu.com` | 4,117,334bytesのscriptを実行、検索欄・中国語本文/画像card表示 | 未処理promiseとAxios API404が継続、検索/全記事操作の受入れ未 |
+| `https://amazon.com` | `www.amazon.com`へredirect、header・検索欄・広告/商品画像を部分表示、native MP4経路も呼ばれる | 左cardの緑の画像崩れ、not-a-function、未実装crypto等。購入/loginは実行せず、全面操作成功ではない |
+| `https://openai.com/ja-JP/index/gpt-6-astra/` | exact URL、OpenAI logoとCloudflare待機画面 | document参照例外、本文未到達。challenge迂回はしない |
+
+Amazon画像候補4件はhostとNocturne decoderの寸法/ARGB hashおよび実HTTP入力が一致したが、緑cardの実assetとの対応は特定できていない。これをAmazon画像修理と呼ばない。API404/DOM/CSS/crypto/iframe/実画像の境界は、CPUやcodecの追加だけでは閉じなかった。次は採取した実サイト失敗を狭いnative負例へ落として原因を証明する。一般SMPや配信機能を同時に際限なく追加しない。
+
+## 第1段階の記録（以下は旧媒体の履歴）
+
 ## CPU
 
 - Limine MPでCPUを検出し、BSPを含め最大16 CPUまでAPを同期型の純計算workerとして利用する。APごとのGDT/TSS/例外stack、SSE2、kernel CR3、HLT/IPI待機を用意した。

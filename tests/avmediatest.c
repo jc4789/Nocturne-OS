@@ -6,6 +6,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef AVMEDIA_CASES_SCRIPT
+#define AVMEDIA_CASES_SCRIPT "/data/tests/js_avmedia_cases.js"
+#define AVMEDIA_FRAME_FIXTURE "h264.mp4"
+#define AVMEDIA_TEST_NAME "avmediatest"
+#endif
 static int failed,checks,done,paint_ready,cancels,requested,completed;
 static web_doc *doc;
 static struct {bool used;uint64_t id,due;char url[256];} queue[8];
@@ -57,7 +62,7 @@ static void step(void){
     msleep(2);
 }
 static void first_picture(void){
-    char error[160];nmedia *m=nmedia_open("/data/tests/media-fixtures/h264.mp4",error,sizeof error);CHECK(m!=NULL);if(!m)return;
+    char error[160];nmedia *m=nmedia_open("/data/tests/media-fixtures/" AVMEDIA_FRAME_FIXTURE,error,sizeof error);CHECK(m!=NULL);if(!m)return;
     struct nmedia_output out;int r=NMEDIA_AGAIN;for(int i=0;i<100&&r==NMEDIA_AGAIN;i++)r=nmedia_step(m,&out);
     CHECK(r==NMEDIA_VIDEO&&out.pts_ms==0);
     canvas_t c;gfx_init(&c,first_frame,96,32,96);gfx_fill(&c,0,0,96,32,RGB(0,0,0));
@@ -65,7 +70,7 @@ static void first_picture(void){
 }
 int main(void){
     int slots=audio_slots();first_picture();
-    FILE *f=fopen("/data/tests/js_avmedia_cases.js","rb");CHECK(f!=NULL);if(!f)return 1;
+    FILE *f=fopen(AVMEDIA_CASES_SCRIPT,"rb");CHECK(f!=NULL);if(!f)return 1;
     char *script=malloc(32768);CHECK(script!=NULL);if(!script){fclose(f);return 1;}
     size_t n=fread(script,1,32767,f);script[n]=0;fclose(f);
     const char *prefix="<!doctype html><style>body{margin:0;background:white}video{display:block;width:96px;height:64px}</style><body><video id=visible controls></video><script>";
@@ -80,9 +85,9 @@ int main(void){
     CHECK(colored);web_free(doc);doc=NULL;CHECK(audio_slots()==slots);
     /* Free while fetch is pending: cancellation, then never deliver to dead doc. */
     memset(queue,0,sizeof queue);requested=0;
-    const char *pending="<script>var a=document.createElement('video');a.preload='none';a.src='h264.mp4';a.play().catch(()=>{});</script>";
+    const char *pending="<script>var a=document.createElement('video');a.preload='none';a.src='" AVMEDIA_FRAME_FIXTURE "';a.play().catch(()=>{});</script>";
     doc=web_live(pending,strlen(pending),"https://avmedia.test/","utf-8",&host);CHECK(doc!=NULL);
     if(doc){deadline=uptime_ms()+3000;while(!requested&&uptime_ms()<deadline){web_tick(doc,uptime_ms());msleep(1);}CHECK(requested==1);int before=cancels;web_free(doc);doc=NULL;CHECK(cancels==before+1);}
     CHECK(audio_slots()==slots);
-    printf("avmediatest: %d checks, %d failed; audio_slots=%d\n",checks,failed,slots);return failed!=0;
+    printf(AVMEDIA_TEST_NAME ": %d checks, %d failed; audio_slots=%d\n",checks,failed,slots);return failed!=0;
 }

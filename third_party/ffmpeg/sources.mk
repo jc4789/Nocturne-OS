@@ -26,10 +26,14 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavcodec/bitstream_filters.c \
     third_party/ffmpeg/libavcodec/blockdsp.c \
     third_party/ffmpeg/libavcodec/bsf.c \
+    third_party/ffmpeg/libavcodec/bsf/vp9_superframe_split.c \
     third_party/ffmpeg/libavcodec/bswapdsp.c \
     third_party/ffmpeg/libavcodec/cabac.c \
     third_party/ffmpeg/libavcodec/cbrt_data.c \
     third_party/ffmpeg/libavcodec/cbrt_tablegen_common.c \
+    third_party/ffmpeg/libavcodec/cbs.c \
+    third_party/ffmpeg/libavcodec/cbs_bsf.c \
+    third_party/ffmpeg/libavcodec/cbs_vp9.c \
     third_party/ffmpeg/libavcodec/codec_desc.c \
     third_party/ffmpeg/libavcodec/codec_par.c \
     third_party/ffmpeg/libavcodec/d3d11va.c \
@@ -109,6 +113,17 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavcodec/mpegaudiodsp_float.c \
     third_party/ffmpeg/libavcodec/mpegaudiotabs.c \
     third_party/ffmpeg/libavcodec/options.c \
+    third_party/ffmpeg/libavcodec/opus/celt.c \
+    third_party/ffmpeg/libavcodec/opus/dec.c \
+    third_party/ffmpeg/libavcodec/opus/dec_celt.c \
+    third_party/ffmpeg/libavcodec/opus/dsp.c \
+    third_party/ffmpeg/libavcodec/opus/frame_duration_tab.c \
+    third_party/ffmpeg/libavcodec/opus/parse.c \
+    third_party/ffmpeg/libavcodec/opus/parser.c \
+    third_party/ffmpeg/libavcodec/opus/pvq.c \
+    third_party/ffmpeg/libavcodec/opus/rc.c \
+    third_party/ffmpeg/libavcodec/opus/silk.c \
+    third_party/ffmpeg/libavcodec/opus/tab.c \
     third_party/ffmpeg/libavcodec/packet.c \
     third_party/ffmpeg/libavcodec/parser.c \
     third_party/ffmpeg/libavcodec/parsers.c \
@@ -128,7 +143,24 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavcodec/version.c \
     third_party/ffmpeg/libavcodec/videodsp.c \
     third_party/ffmpeg/libavcodec/vlc.c \
+    third_party/ffmpeg/libavcodec/vorbis.c \
+    third_party/ffmpeg/libavcodec/vorbis_data.c \
     third_party/ffmpeg/libavcodec/vorbis_parser.c \
+    third_party/ffmpeg/libavcodec/vorbisdec.c \
+    third_party/ffmpeg/libavcodec/vorbisdsp.c \
+    third_party/ffmpeg/libavcodec/vp9.c \
+    third_party/ffmpeg/libavcodec/vp9_parser.c \
+    third_party/ffmpeg/libavcodec/vp9block.c \
+    third_party/ffmpeg/libavcodec/vp9data.c \
+    third_party/ffmpeg/libavcodec/vp9dsp.c \
+    third_party/ffmpeg/libavcodec/vp9dsp_10bpp.c \
+    third_party/ffmpeg/libavcodec/vp9dsp_12bpp.c \
+    third_party/ffmpeg/libavcodec/vp9dsp_8bpp.c \
+    third_party/ffmpeg/libavcodec/vp9lpf.c \
+    third_party/ffmpeg/libavcodec/vp9mvs.c \
+    third_party/ffmpeg/libavcodec/vp9prob.c \
+    third_party/ffmpeg/libavcodec/vp9recon.c \
+    third_party/ffmpeg/libavcodec/vpx_rac.c \
     third_party/ffmpeg/libavcodec/xiph.c \
     third_party/ffmpeg/libavformat/aacdec.c \
     third_party/ffmpeg/libavformat/allformats.c \
@@ -157,6 +189,8 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavformat/isom.c \
     third_party/ffmpeg/libavformat/isom_tags.c \
     third_party/ffmpeg/libavformat/lcevc.c \
+    third_party/ffmpeg/libavformat/matroska.c \
+    third_party/ffmpeg/libavformat/matroskadec.c \
     third_party/ffmpeg/libavformat/metadata.c \
     third_party/ffmpeg/libavformat/mov.c \
     third_party/ffmpeg/libavformat/mov_chan.c \
@@ -165,7 +199,16 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavformat/mux.c \
     third_party/ffmpeg/libavformat/mux_utils.c \
     third_party/ffmpeg/libavformat/nal.c \
+    third_party/ffmpeg/libavformat/oggdec.c \
+    third_party/ffmpeg/libavformat/oggparsedirac.c \
+    third_party/ffmpeg/libavformat/oggparseflac.c \
+    third_party/ffmpeg/libavformat/oggparseogm.c \
+    third_party/ffmpeg/libavformat/oggparseopus.c \
+    third_party/ffmpeg/libavformat/oggparseskeleton.c \
+    third_party/ffmpeg/libavformat/oggparsespeex.c \
+    third_party/ffmpeg/libavformat/oggparsetheora.c \
     third_party/ffmpeg/libavformat/oggparsevorbis.c \
+    third_party/ffmpeg/libavformat/oggparsevp8.c \
     third_party/ffmpeg/libavformat/options.c \
     third_party/ffmpeg/libavformat/os_support.c \
     third_party/ffmpeg/libavformat/packet_list.c \
@@ -176,6 +219,7 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavformat/replaygain.c \
     third_party/ffmpeg/libavformat/riff.c \
     third_party/ffmpeg/libavformat/riffdec.c \
+    third_party/ffmpeg/libavformat/rmsipr.c \
     third_party/ffmpeg/libavformat/sdp.c \
     third_party/ffmpeg/libavformat/seek.c \
     third_party/ffmpeg/libavformat/url.c \
@@ -278,4 +322,13 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavutil/video_enc_params.c \
     third_party/ffmpeg/libavutil/video_hint.c \
     third_party/ffmpeg/libavutil/xga_font_data.c \
-    third_party/ffmpeg/libavutil/xtea.c
+    third_party/ffmpeg/libavutil/xtea.c \
+    third_party/ffmpeg/libswresample/audioconvert.c \
+    third_party/ffmpeg/libswresample/dither.c \
+    third_party/ffmpeg/libswresample/options.c \
+    third_party/ffmpeg/libswresample/rematrix.c \
+    third_party/ffmpeg/libswresample/resample.c \
+    third_party/ffmpeg/libswresample/resample_dsp.c \
+    third_party/ffmpeg/libswresample/swresample.c \
+    third_party/ffmpeg/libswresample/swresample_frame.c \
+    third_party/ffmpeg/libswresample/version.c

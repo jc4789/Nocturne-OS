@@ -1,0 +1,23 @@
+<!doctype html><meta charset="utf-8"><title>Nocturne WebM / Ogg 実再生</title>
+<style>body{font-family:sans-serif;background:#edf0f5;color:#162438;margin:24px}video{display:block;width:384px;height:256px;background:black}audio{display:block;margin-top:16px}pre{white-space:pre-wrap}</style>
+<h1>WebM / Ogg の実 decoder 経路</h1>
+<p>自作の短い圧縮素材。外部 player、MSE、DRM を使いません。</p>
+<video id="video" controls preload="none"></video><audio id="audio" controls preload="none"></audio>
+<pre id="status">読み込み中</pre>
+<script>
+(async()=>{
+    const video=document.getElementById('video'),audio=document.getElementById('audio'),status=document.getElementById('status');
+    const log=text=>{console.log(text);status.textContent+='\n'+text;};
+    async function play(node,name){
+        node.src=name;
+        const ended=new Promise((resolve,reject)=>{node.onended=resolve;node.onerror=()=>reject(new Error('decode '+name));});
+        await node.play();log('WEBM_HTTP_READY '+name+' '+(node.videoWidth||0)+'x'+(node.videoHeight||0)+' duration='+node.duration);
+        await ended;log('WEBM_HTTP_ENDED '+name+' current='+node.currentTime+' duration='+node.duration);
+    }
+    if(video.canPlayType('video/webm; codecs="vp9, opus"')!=='probably'||audio.canPlayType('audio/ogg; codecs=vorbis')!=='probably')throw new Error('capability mismatch');
+    await play(video,'vp9-opus.webm');
+    await new Promise(resolve=>setTimeout(resolve,250));
+    await play(audio,'stereo.ogg');audio.removeAttribute('src');audio.load();
+    log('WEBM_HTTP_DONE');
+})().catch(e=>console.error('WEBM_HTTP_FAIL '+e+' '+e.stack));
+</script>

@@ -44,3 +44,11 @@ void audio_set_muted(bool muted);
 void audio_system_tone(int hz, int ms);
 
 void ac97_init(void);
+
+/* Opt-in WM diagnostic only. BSP-owned, finite counters, no I/O in the
+   measured interval. Queue shortages are raw observations, not EOF-aware
+   underrun verdicts. This is an internal kernel interface, not a user ABI. */
+extern bool audio_trace_active;
+void audio_trace_begin(void);
+void audio_trace_end(void);
+void audio_trace_ac97(uint16_t before, uint16_t after, unsigned filled, bool restarted);

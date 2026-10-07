@@ -84,7 +84,7 @@ static void capabilities(void){
     CHECK(!strcmp(nmedia_can_play_type("video/mp4; codecs=\"avc1.42e01e, mp4a.40.2\""),"probably"));
     CHECK(!strcmp(nmedia_can_play_type("audio/flac; codecs=flac"),"probably"));
     CHECK(!*nmedia_can_play_type("video/mp4; codecs=\"avc1.6e001e\""));
-    CHECK(!*nmedia_can_play_type("video/webm; codecs=vp9"));
+    CHECK(!strcmp(nmedia_can_play_type("video/webm; codecs=vp9"),"probably"));
     CHECK(!*nmedia_can_play_type("application/vnd.apple.mpegurl"));
     CHECK(!*nmedia_can_play_type("video/mp4; codecs=\"avc1.42e01e,\""));
     CHECK(!*nmedia_can_play_type("audio/mp4; codecs=avc1.42e01e"));

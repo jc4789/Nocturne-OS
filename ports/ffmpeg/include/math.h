@@ -6,3 +6,4 @@
 #define FP_SUBNORMAL 3
 #define FP_NORMAL 4
 #define fpclassify(x) __builtin_fpclassify(FP_NAN,FP_INFINITE,FP_NORMAL,FP_SUBNORMAL,FP_ZERO,(x))
+#define isnormal(x) __builtin_isnormal(x)

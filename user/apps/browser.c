@@ -656,11 +656,28 @@ static void remove_transfer(struct transfer *t) {
     free(t);
 }
 
+/* Debug-only identity of native image bytes. Never print URLs, headers or body
+   text: authenticated paths and even an image URL's basename can contain secrets. */
+static void debug_image_result(const struct transfer *t, const struct webnet_response *r) {
+    if (!debug_js || t->kind != WEB_RESOURCE_IMAGE) return;
+    const unsigned char *bytes = r->body;
+    uint32_t hash = 2166136261u;
+    char magic[17] = {0};
+    if (bytes) {
+        for (size_t i = 0; i < r->body_len; i++) hash = (hash ^ bytes[i]) * 16777619u;
+        size_t n = MIN(r->body_len, 8);
+        for (size_t i = 0; i < n; i++) snprintf(magic + 2*i, 3, "%02x", bytes[i]);
+    }
+    printf("[web-net:image] id=%lu status=%d bytes=%lu fnv=%08x magic=%s\n",
+           (unsigned long)t->resource_id, r->status, (unsigned long)r->body_len, hash, magic);
+}
+
 static void resource_completed(webnet *net, uint64_t id, uint64_t gen,
                                const struct webnet_response *result, void *opaque) {
     (void)net; (void)id;
     struct transfer *t = opaque;
     if (doc && gen == generation && t->generation == generation) {
+        debug_image_result(t, result);
         if (debug_js && t->kind == WEB_RESOURCE_CSS)
             printf("[web-net:css] status=%d bytes=%lu error=%s url=%s\n", result->status,
                    (unsigned long)result->body_len, result->error ? result->error : "",

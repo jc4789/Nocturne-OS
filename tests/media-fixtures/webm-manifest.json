@@ -1,0 +1,394 @@
+{
+  "generator": "ffmpeg version 8.1.1-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers",
+  "authorship": "new self-authored synthetic tone/pattern; legacy manifest and inputs preserved",
+  "fixtures": [
+    {
+      "path": "stereo.opus",
+      "bytes": 4250,
+      "sha256": "f1b5dd87b738146a3285c384b76b0419f2cade865eaeea4ca451b9e2cf3fb98b",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:a",
+        "libopus",
+        "-application",
+        "audio",
+        "-b:a",
+        "96k"
+      ],
+      "streams": [
+        {
+          "codec_name": "opus",
+          "profile": null,
+          "codec_type": "audio",
+          "sample_rate": "48000",
+          "channels": 2,
+          "width": null,
+          "height": null,
+          "pix_fmt": null
+        }
+      ],
+      "host_reference_frames": 9600
+    },
+    {
+      "path": "stereo-silk.opus",
+      "bytes": 786,
+      "sha256": "5140f6db770fe23d934c73a4c3be60d127e0799f143d4629a858025ba4c2d684",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:a",
+        "libopus",
+        "-application",
+        "voip",
+        "-ar",
+        "16000",
+        "-b:a",
+        "24k"
+      ],
+      "streams": [
+        {
+          "codec_name": "opus",
+          "profile": null,
+          "codec_type": "audio",
+          "sample_rate": "48000",
+          "channels": 2,
+          "width": null,
+          "height": null,
+          "pix_fmt": null
+        }
+      ],
+      "host_reference_frames": 9600
+    },
+    {
+      "path": "stereo.ogg",
+      "bytes": 5368,
+      "sha256": "a76f047961fd506d05eb72f711f4f53122b3bd2acc5884937778611002c1ad97",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:a",
+        "libvorbis",
+        "-q:a",
+        "4"
+      ],
+      "streams": [
+        {
+          "codec_name": "vorbis",
+          "profile": null,
+          "codec_type": "audio",
+          "sample_rate": "48000",
+          "channels": 2,
+          "width": null,
+          "height": null,
+          "pix_fmt": null
+        }
+      ],
+      "host_reference_frames": 9472
+    },
+    {
+      "path": "opus.webm",
+      "bytes": 4685,
+      "sha256": "cfeefa5d5d8def472d9e31c38889382157f33ec7966439051176300fc429a2c2",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:a",
+        "libopus",
+        "-application",
+        "audio",
+        "-b:a",
+        "96k"
+      ],
+      "streams": [
+        {
+          "codec_name": "opus",
+          "profile": null,
+          "codec_type": "audio",
+          "sample_rate": "48000",
+          "channels": 2,
+          "width": null,
+          "height": null,
+          "pix_fmt": null
+        }
+      ],
+      "host_reference_frames": 9600
+    },
+    {
+      "path": "vorbis.webm",
+      "bytes": 5877,
+      "sha256": "2f204d304550d01c17b935bb6d167de676260605c957d0ac90e12dba341556c7",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:a",
+        "libvorbis",
+        "-q:a",
+        "4"
+      ],
+      "streams": [
+        {
+          "codec_name": "vorbis",
+          "profile": null,
+          "codec_type": "audio",
+          "sample_rate": "48000",
+          "channels": 2,
+          "width": null,
+          "height": null,
+          "pix_fmt": null
+        }
+      ],
+      "host_reference_frames": 9600
+    },
+    {
+      "path": "vp9.webm",
+      "bytes": 3878,
+      "sha256": "505f26369e1d30dd2f786e2e9342116469cad71fe2007909b886e3f65456373e",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=96x64:rate=10:duration=0.4",
+        "-an",
+        "-c:v",
+        "libvpx-vp9",
+        "-profile:v",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+        "-threads",
+        "1",
+        "-row-mt",
+        "0",
+        "-tile-columns",
+        "0",
+        "-g",
+        "10",
+        "-deadline",
+        "good",
+        "-cpu-used",
+        "4",
+        "-b:v",
+        "80k"
+      ],
+      "streams": [
+        {
+          "codec_name": "vp9",
+          "profile": "Profile 0",
+          "codec_type": "video",
+          "sample_rate": null,
+          "channels": null,
+          "width": 96,
+          "height": 64,
+          "pix_fmt": "yuv420p"
+        }
+      ]
+    },
+    {
+      "path": "vp9-opus.webm",
+      "bytes": 8225,
+      "sha256": "a98228deab4ff9a2ec27ec88b28758ec9ea91989282013c0cb6f4356ba99b221",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=96x64:rate=10:duration=0.4",
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:v",
+        "libvpx-vp9",
+        "-profile:v",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+        "-threads",
+        "1",
+        "-row-mt",
+        "0",
+        "-tile-columns",
+        "0",
+        "-g",
+        "10",
+        "-deadline",
+        "good",
+        "-cpu-used",
+        "4",
+        "-b:v",
+        "80k",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "96k"
+      ],
+      "streams": [
+        {
+          "codec_name": "vp9",
+          "profile": "Profile 0",
+          "codec_type": "video",
+          "sample_rate": null,
+          "channels": null,
+          "width": 96,
+          "height": 64,
+          "pix_fmt": "yuv420p"
+        },
+        {
+          "codec_name": "opus",
+          "profile": null,
+          "codec_type": "audio",
+          "sample_rate": "48000",
+          "channels": 2,
+          "width": null,
+          "height": null,
+          "pix_fmt": null
+        }
+      ],
+      "host_reference_frames": 9600
+    },
+    {
+      "path": "vp9-vorbis.webm",
+      "bytes": 9414,
+      "sha256": "5a65b7578c00e7be4388c10494fce9d001a123951faa5be79acf51b62618405d",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=96x64:rate=10:duration=0.4",
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:v",
+        "libvpx-vp9",
+        "-profile:v",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+        "-threads",
+        "1",
+        "-row-mt",
+        "0",
+        "-tile-columns",
+        "0",
+        "-g",
+        "10",
+        "-deadline",
+        "good",
+        "-cpu-used",
+        "4",
+        "-b:v",
+        "80k",
+        "-c:a",
+        "libvorbis",
+        "-q:a",
+        "4"
+      ],
+      "streams": [
+        {
+          "codec_name": "vp9",
+          "profile": "Profile 0",
+          "codec_type": "video",
+          "sample_rate": null,
+          "channels": null,
+          "width": 96,
+          "height": 64,
+          "pix_fmt": "yuv420p"
+        },
+        {
+          "codec_name": "vorbis",
+          "profile": null,
+          "codec_type": "audio",
+          "sample_rate": "48000",
+          "channels": 2,
+          "width": null,
+          "height": null,
+          "pix_fmt": null
+        }
+      ],
+      "host_reference_frames": 9600
+    },
+    {
+      "path": "vp9-high10.webm",
+      "bytes": 3816,
+      "sha256": "cd4baa39351685bbe41f69b2a2a4fbb7d11f56f5366e5b0e358699e7afa496dd",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=96x64:rate=10:duration=0.4",
+        "-an",
+        "-c:v",
+        "libvpx-vp9",
+        "-profile:v",
+        "2",
+        "-pix_fmt",
+        "yuv420p10le",
+        "-threads",
+        "1",
+        "-deadline",
+        "good",
+        "-cpu-used",
+        "4",
+        "-b:v",
+        "80k"
+      ],
+      "streams": [
+        {
+          "codec_name": "vp9",
+          "profile": "Profile 2",
+          "codec_type": "video",
+          "sample_rate": null,
+          "channels": null,
+          "width": 96,
+          "height": 64,
+          "pix_fmt": "yuv420p10le"
+        }
+      ]
+    },
+    {
+      "path": "unsupported-av1.webm",
+      "bytes": 2053,
+      "sha256": "473acac23fe448a011e035d2e4b4dec65b8f7995b2de4f57848d92062163ba3c",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=96x64:rate=10:duration=0.4",
+        "-an",
+        "-c:v",
+        "libaom-av1",
+        "-pix_fmt",
+        "yuv420p",
+        "-threads",
+        "1",
+        "-cpu-used",
+        "8",
+        "-crf",
+        "40"
+      ],
+      "streams": [
+        {
+          "codec_name": "av1",
+          "profile": "Main",
+          "codec_type": "video",
+          "sample_rate": null,
+          "channels": null,
+          "width": 96,
+          "height": 64,
+          "pix_fmt": "yuv420p"
+        }
+      ]
+    }
+  ]
+}

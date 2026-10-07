@@ -48,14 +48,19 @@ static void spin_ms(uint64_t ms) { /* early in boot: no sleeping yet */
 }
 
 static void ac97_fill(void) {
+    uint16_t before = audio_trace_active ? inw(nabm + PO_SR) : 0;
+    unsigned filled = 0;
     int civ = inb(nabm + PO_CIV) & (NBUF - 1);
     while (((lvi - civ) & (NBUF - 1)) < AHEAD) {
         int next = (lvi + 1) & (NBUF - 1);
         audio_mix(bufs + next * BUF_FRAMES * 2, BUF_FRAMES);
         lvi = next;
+        filled++;
         outb(nabm + PO_LVI, (uint8_t)lvi); /* also restarts an engine that ran dry */
     }
-    if (inw(nabm + PO_SR) & SR_HALTED) outb(nabm + PO_CR, CR_RUN);
+    uint16_t after = inw(nabm + PO_SR);
+    if (after & SR_HALTED) outb(nabm + PO_CR, CR_RUN);
+    if (audio_trace_active) audio_trace_ac97(before, after, filled, (after & SR_HALTED) != 0);
     outw(nabm + PO_SR, SR_CLEAR);
 }
 

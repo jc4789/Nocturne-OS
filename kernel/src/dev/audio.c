@@ -27,6 +27,81 @@ static const char *card_name;
 static void (*card_fill)(void);
 static int remote_users;
 
+#define TRACE_SECONDS 22
+bool audio_trace_active;
+static struct {
+    uint64_t start, last_tick, max_tick_gap, ticks, card_calls, restarts, filled;
+    uint64_t sr_before[32], sr_after[32];
+    struct {
+        uint64_t frames, writes, last, max_gap, shortage, mix_calls;
+        uint32_t min_queue, max_queue, pid, owner_changes, closes, flushes;
+        uint64_t by_second[TRACE_SECONDS];
+    } stream[MAX_STREAMS];
+} trace;
+
+static uint64_t trace_us(uint64_t ticks) {
+    return tsc_hz ? ticks * 1000000 / tsc_hz : 0;
+}
+void audio_trace_begin(void) {
+    /* WM invokes this before arming its timed interval. No reset under a
+       long IRQ-disabled region; IRQ writers still see active=false. */
+    audio_trace_active = false;
+    memset(&trace, 0, sizeof trace);
+    for (int i = 0; i < MAX_STREAMS; i++) trace.stream[i].min_queue = RING_BYTES / AUDIO_FRAME;
+    uint64_t f = irq_save();
+    trace.start = rdtsc(); trace.last_tick = trace.start;
+    audio_trace_active = true;
+    irq_restore(f);
+}
+void audio_trace_end(void) {
+    uint64_t f = irq_save(), end = rdtsc();
+    audio_trace_active = false;
+    irq_restore(f);
+    kprintf("audiotrace: elapsed_us=%lu service_calls=%lu max_service_gap_us=%lu card=%s remote=%d muted=%d\n",
+            trace_us(end-trace.start), trace.ticks, trace_us(trace.max_tick_gap),
+            card_name ? card_name : "none", remote_users, muted);
+    kprintf("audiotrace: ac97_calls=%lu filled=%lu restart_actions=%lu raw_sr_low5_before_after\n",
+            trace.card_calls, trace.filled, trace.restarts);
+    for (int i = 0; i < 32; i++) if (trace.sr_before[i] || trace.sr_after[i])
+        kprintf("audiotrace: sr=%x before=%lu after=%lu\n", i, trace.sr_before[i], trace.sr_after[i]);
+    for (int i = 0; i < MAX_STREAMS; i++) {
+        if (!trace.stream[i].mix_calls && !trace.stream[i].writes && !trace.stream[i].closes) continue;
+        uint64_t last = trace.stream[i].last ? trace.stream[i].last : trace.start;
+        kprintf("audiotrace: slot=%d writer_pid=%u owner_changes=%u committed_frames=%lu writes=%lu max_commit_gap_us=%lu final_commit_age_us=%lu queue_min=%u queue_max=%u raw_shortage_frames=%lu mix_calls=%lu closes=%u flushes=%u\n",
+                i, trace.stream[i].pid, trace.stream[i].owner_changes, trace.stream[i].frames,
+                trace.stream[i].writes, trace_us(trace.stream[i].max_gap), trace_us(end-last),
+                trace.stream[i].min_queue, trace.stream[i].max_queue, trace.stream[i].shortage,
+                trace.stream[i].mix_calls, trace.stream[i].closes, trace.stream[i].flushes);
+        for (int j = 0; j < TRACE_SECONDS; j++)
+            kprintf("audiotrace: slot=%d second=%d committed_frames=%lu\n", i, j, trace.stream[i].by_second[j]);
+    }
+}
+void audio_trace_ac97(uint16_t before, uint16_t after, unsigned filled, bool restarted) {
+    if (!audio_trace_active) return;
+    trace.card_calls++; trace.filled += filled; trace.restarts += restarted;
+    trace.sr_before[before & 31]++; trace.sr_after[after & 31]++;
+}
+static void trace_commit(struct stream *s, uint32_t bytes) {
+    if (!audio_trace_active) return;
+    uint64_t f = irq_save(), now = rdtsc();
+    for (int i = 0; i < MAX_STREAMS; i++) if (streams[i] == s) {
+        uint64_t last = trace.stream[i].last ? trace.stream[i].last : trace.start;
+        trace.stream[i].max_gap = MAX(trace.stream[i].max_gap, now-last);
+        trace.stream[i].last = now; trace.stream[i].writes++;
+        trace.stream[i].frames += bytes / AUDIO_FRAME;
+        uint32_t pid = (uint32_t)current_task->pid;
+        if (trace.stream[i].pid && trace.stream[i].pid != pid) trace.stream[i].owner_changes++;
+        trace.stream[i].pid = pid;
+        uint32_t queue = (s->head-s->tail) / AUDIO_FRAME;
+        trace.stream[i].max_queue = MAX(trace.stream[i].max_queue, queue);
+        unsigned second = (unsigned)((now-trace.start) / (tsc_hz ? tsc_hz : 1));
+        if (second >= TRACE_SECONDS) second = TRACE_SECONDS-1;
+        trace.stream[i].by_second[second] += bytes / AUDIO_FRAME;
+        break;
+    }
+    irq_restore(f);
+}
+
 bool audio_mix(int16_t *out, int frames) {
     uint64_t f = irq_save();
     bool any = false;
@@ -36,6 +111,11 @@ bool audio_mix(int16_t *out, int frames) {
         if (!s) continue;
         uint32_t have = (s->head - s->tail) / AUDIO_FRAME;
         int n = (int)MIN((uint32_t)frames, have);
+        if (audio_trace_active && i < MAX_STREAMS) {
+            trace.stream[i].min_queue = MIN(trace.stream[i].min_queue, have);
+            trace.stream[i].shortage += (uint32_t)frames - (uint32_t)n;
+            trace.stream[i].mix_calls++;
+        }
         if (!n) continue;
         any = true;
         if (out) {
@@ -69,6 +149,11 @@ void audio_tick(void) {
     if (now - last < TICK_MS) return;
     uint64_t elapsed = MIN(now - last, 100);
     last = now;
+    if (audio_trace_active) {
+        uint64_t at = rdtsc();
+        trace.max_tick_gap = MAX(trace.max_tick_gap, at-trace.last_tick);
+        trace.last_tick = at; trace.ticks++;
+    }
     if (remote_users) return; /* the client pulls the sound itself */
     if (card_fill) card_fill();
     else audio_mix(NULL, (int)(elapsed * AUDIO_RATE / 1000)); /* no card: play into nothing */
@@ -181,6 +266,7 @@ static int64_t audio_write(struct vnode *v, struct file *f, const void *buf, uin
         memcpy(s->ring, p + done + first, c - first);
         __sync_synchronize();
         s->head += c;
+        trace_commit(s, c);
         done += c;
     }
     return (int64_t)done;
@@ -217,7 +303,10 @@ static void audio_close(struct vnode *v, struct file *f) {
     }
     uint64_t fl = irq_save();
     for (int i = 0; i < MAX_STREAMS; i++)
-        if (streams[i] == s) streams[i] = NULL;
+        if (streams[i] == s) {
+            if (audio_trace_active) trace.stream[i].closes++;
+            streams[i] = NULL;
+        }
     irq_restore(fl);
     kfree(s->ring);
     kfree(s);
@@ -233,6 +322,8 @@ int audio_flush_file(struct file *f) {
     if (!s) return (int)err;
     uint64_t fl = irq_save();
     s->tail = s->head;
+    if (audio_trace_active) for (int i = 0; i < MAX_STREAMS; i++)
+        if (streams[i] == s) trace.stream[i].flushes++;
     wq_wake_all(&audio_wq);
     poll_notify();
     irq_restore(fl);

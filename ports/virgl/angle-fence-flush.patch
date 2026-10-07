@@ -1,0 +1,13 @@
+diff --git a/src/vrend_renderer.c b/src/vrend_renderer.c
+index f4e8f58..e0fa0a5 100644
+--- a/src/vrend_renderer.c
++++ b/src/vrend_renderer.c
+@@ -7310,7 +7310,7 @@ static bool do_wait(struct vrend_fence *fence, bool can_block)
+    bool done = false;
+    int timeout = can_block ? 1000000000 : 0;
+    do {
+-      GLenum glret = glClientWaitSync(fence->glsyncobj, 0, timeout);
++      GLenum glret = glClientWaitSync(fence->glsyncobj, GL_SYNC_FLUSH_COMMANDS_BIT, timeout);
+       if (glret == GL_WAIT_FAILED) {
+          virgl_warn("Wait sync failed: illegal fence object %p\n", (void*) fence->glsyncobj);
+       }

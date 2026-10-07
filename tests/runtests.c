@@ -89,6 +89,10 @@ static const struct test tests[] = {
      {"media_codectest: ", ", 0 failed"}, "FAIL", 120, false, true},
     {"media", "browser-native-lifetime", "tcc -run /data/tests/avmediatest.c", 0,
      {"avmediatest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"media", "webm-ogg-pcm-frame-seek", "tcc -run /data/tests/media_webmtest.c", 0,
+     {"media_webmtest: ", ", 0 failed"}, "FAIL", 180, false, true},
+    {"media", "browser-webm-ogg-lifetime", "tcc -run /data/tests/avmediawebmtest.c", 0,
+     {"avmediawebmtest: ", ", 0 failed"}, "FAIL", 120, false, true},
 
     /* sound (scripts/test.py records the AC'97 output and checks the tones in it) */
     {"audio", "card", "dmesg | grep audio:", 0, {"AC'97"}},

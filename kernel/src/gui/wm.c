@@ -10,6 +10,7 @@
  */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/smp.h"
 #include "gui/wm.h"
 #include "dev/fb.h"
 #include "dev/gpu.h"
@@ -811,10 +812,41 @@ static int taskbar_window_at(int x, int y, struct window **out) {
 }
 
 /* ---- window drawing ---- */
-static void draw_window(canvas_t *c, struct window *w, bool focus) {
-    int fx = w->x, fy = w->y, fw = frame_w(w), fh = frame_h(w);
+/* BSP captures only drawing data, never event queues or live window ownership.
+   All borrowed pixel aliases are high kernel mappings. The current scheduler
+   never preempts kernel execution; each AP batch also disables BSP IRQs until
+   synchronous join. General scheduler SMP would require explicit buffer pins. */
+struct draw_layer {
+    int x, y, cw, ch, fw, fh, cx, cy, flags, hover;
+    bool focus, maximized;
+    const uint32_t *pixels;
+    char title[64];
+    struct rect bounds;
+};
+
+static bool capture_layer(struct draw_layer *l, struct window *w, bool focus) {
+    int fw = frame_w(w), fh = frame_h(w);
+    /* SYS_WIN_MOVE accepts arbitrary int coordinates. Cull in wide arithmetic
+       before any drawing helper can add a shadow/title offset to them. */
+    int64_t x0 = (int64_t)w->x - SHADOW, y0 = (int64_t)w->y - SHADOW;
+    int64_t x1 = (int64_t)w->x + fw + SHADOW, y1 = (int64_t)w->y + fh + SHADOW;
+    if (x1 <= 0 || y1 <= 0 || x0 >= sw || y0 >= sh || !w->buf) return false;
+    *l = (struct draw_layer){.x=w->x, .y=w->y, .cw=w->cw, .ch=w->ch,
+        .fw=fw, .fh=fh, .cx=client_x(w), .cy=client_y(w), .flags=w->flags,
+        .hover=hover_win==w ? hover_btn : 0, .focus=focus,
+        .maximized=w->maximized, .pixels=w->buf,
+        .bounds={MAX(0,x0),MAX(0,y0),MIN(sw,x1)-MAX(0,x0),MIN(sh,y1)-MAX(0,y0)}};
+    memcpy(l->title, w->title, sizeof l->title);
+    l->title[sizeof l->title - 1] = 0;
+    return true;
+}
+
+/* Pure RAM-only helper: canvas clip is caller-private; layer is immutable. */
+static void draw_layer(canvas_t *c, const struct draw_layer *w) {
+    int fx = w->x, fy = w->y, fw = w->fw, fh = w->fh;
+    bool focus = w->focus;
     draw_shadow(c, fx, fy, fw, fh);
-    if (decorated(w)) {
+    if (!(w->flags & WIN_NO_DECOR)) {
         uint32_t edge = focus ? RGB(110, 96, 200) : RGB(60, 60, 84);
         uint32_t top = focus ? RGB(66, 52, 140) : RGB(44, 44, 62);
         uint32_t bot = focus ? RGB(38, 32, 88) : RGB(34, 34, 48);
@@ -837,7 +869,9 @@ static void draw_window(canvas_t *c, struct window *w, bool focus) {
         text_trunc(c, fx + 12, fy + 6, w->title, fw - 24 - nb * 24, focus ? RGB(250, 250, 255) : RGB(160, 160, 180));
         /* buttons */
         for (int b = 1; b <= 3; b++) {
-            int bx = button_cx(w, b);
+            int bx = fx + fw - (b == 1 ? 18 : b == 2 ? 42 :
+                     (w->flags & WIN_RESIZABLE) ? 66 : 42);
+            if (b == 2 && !(w->flags & WIN_RESIZABLE)) continue;
             if (bx < -500) continue;
             int by = fy + TITLE_H / 2;
             uint32_t col = !focus ? RGB(84, 84, 108)
@@ -845,7 +879,7 @@ static void draw_window(canvas_t *c, struct window *w, bool focus) {
                          : b == 2 ? RGB(96, 200, 130)
                                   : RGB(240, 190, 80);
             gfx_fill_circle(c, bx, by, 7, col);
-            if (hover_win == w && hover_btn == b) {
+            if (w->hover == b) {
                 uint32_t g = RGB(40, 20, 30);
                 if (b == 1) {
                     gfx_line(c, bx - 3, by - 3, bx + 3, by + 3, g);
@@ -859,8 +893,8 @@ static void draw_window(canvas_t *c, struct window *w, bool focus) {
         }
     }
     canvas_t wc;
-    gfx_init(&wc, w->buf, w->cw, w->ch, w->cw);
-    gfx_blit(c, client_x(w), client_y(w), &wc, 0, 0, w->cw, w->ch);
+    gfx_init(&wc, (uint32_t *)w->pixels, w->cw, w->ch, w->cw);
+    gfx_blit(c, w->cx, w->cy, &wc, 0, 0, w->cw, w->ch);
     if (w->flags & WIN_RESIZABLE && !w->maximized) {
         /* little grip dots */
         int gx = w->x + fw - 4, gy = w->y + fh - 4;
@@ -882,24 +916,292 @@ static void draw_toast(canvas_t *c) {
 static struct rect toast_rect(void) { return (struct rect){sw - 336 - SHADOW, 0, 336 + 2 * SHADOW, 96}; }
 
 /* ---- compositing ---- */
+struct draw_scene {
+    canvas_t dst, wallpaper;
+    struct draw_layer layers[MAX_WIN];
+    unsigned count;
+    struct rect selection;
+    bool selected, fault_test;
+};
+
+struct scene_job {
+    const struct draw_scene *scene;
+    struct rect batch;
+    unsigned cell_count;
+    unsigned cpu[CPU_MAX_COUNT]; /* one independent cell per tile */
+};
+
+static bool wm_parallel, wm_verify, wm_yield;
+static bool wm_trace, trace_done, trace_chord;
+static volatile bool trace_active;
+static canvas_t verify_back;
+/* Keep width*layers*rows work budgets, not stale row ceilings. This preserves
+   useful tiles even after a 64-layer scene returns to 17 or a single layer. */
+static uint64_t wm_work_budget[4] = {512ULL*1280,512ULL*1280,512ULL*1280,512ULL*1280};
+static uint64_t scene_frames, scene_jobs, scene_max_ticks;
+
+static uint64_t scene_tick(void) {
+    __asm__ volatile("lfence" : : : "memory");
+    return rdtsc();
+}
+
+static uint64_t scene_us(uint64_t ticks) {
+    return tsc_hz >= 1000000 ? ticks / (tsc_hz / 1000000) : 0;
+}
+
+static unsigned scene_density(unsigned layers) {
+    return layers<=1 ? 0 : layers<=4 ? 1 : layers<=16 ? 2 : 3;
+}
+
+static unsigned scene_rows(unsigned layers, unsigned width) {
+    unsigned cpus=cpu_online_count();
+    uint64_t row_cost=(uint64_t)width*MAX(layers,4u); /* clipped positive screen width */
+    unsigned cost_rows=wm_work_budget[scene_density(layers)]/row_cost;
+    return MAX(cpus,MIN(128u,MAX(cpus,cost_rows)));
+}
+
+static void scene_shrink(unsigned layers,unsigned width,unsigned rows,uint64_t maximum) {
+    if (scene_us(maximum)>1000 && rows>cpu_online_count())
+        wm_work_budget[scene_density(layers)]=MIN(wm_work_budget[scene_density(layers)],
+            (uint64_t)MAX(cpu_online_count(),rows/2)*width*MAX(layers,4u));
+}
+
+static void capture_scene(struct draw_scene *s, canvas_t dst) {
+    cpu_require_bsp();
+    s->dst = dst;
+    s->wallpaper = wall;
+    s->count = 0;
+    s->selected = sel_icon >= 0;
+    s->fault_test = false;
+    if (s->selected) {
+        int x, y;
+        icon_cell(sel_icon, &x, &y);
+        s->selection = (struct rect){x,y,ICON_CELL_W-8,ICON_CELL_H-6};
+    }
+    struct window *f = focused();
+    for (int i = 0; i < nwin; i++)
+        if (visible(zorder[i]) && capture_layer(&s->layers[s->count], zorder[i], zorder[i]==f)) s->count++;
+}
+
+static void scene_tile(size_t index, void *arg) {
+    struct scene_job *job = arg;
+    const struct draw_scene *s = job->scene;
+    /* Explicit negative test only: fault after a live RAM descriptor is published. */
+    if (s->fault_test && cpu_is_worker()) cpu_require_bsp();
+    struct rect r = job->batch;
+    /* Proportional boundaries cover every row once, including 5/6/9-row
+       batches which ceil-sized cells previously reduced below online CPUs. */
+    unsigned begin=(uint64_t)index*(unsigned)r.h/job->cell_count;
+    unsigned end=(uint64_t)(index+1)*(unsigned)r.h/job->cell_count;
+    r.y += (int)begin;
+    r.h = (int)(end-begin);
+    if (r.h <= 0) return;
+    canvas_t c = s->dst; /* AP never modifies the global back clip */
+    gfx_noclip(&c);
+    gfx_clip(&c, r.x, r.y, r.w, r.h);
+    gfx_blit(&c, r.x, r.y, &s->wallpaper, r.x, r.y, r.w, r.h);
+    if (s->selected) {
+        struct rect a = s->selection;
+        gfx_fill_blend(&c, a.x, a.y, a.w, a.h, ARGB(70,150,140,255));
+    }
+    for (unsigned i = 0; i < s->count; i++)
+        if (rect_overlap(&s->layers[i].bounds, &r)) draw_layer(&c, &s->layers[i]);
+    job->cpu[index] = cpu_current_index();
+}
+
+/* Equal callback, tiles, snapshot and row limits for both benchmark modes.
+   IRQs may run between joins, but current kernel execution cannot schedule another
+   process there; only input queues/audio IRQ work changes, not window ownership. */
+static uint64_t render_scene(const struct draw_scene *s, struct rect r, bool parallel,
+                             unsigned batch_rows, uint64_t *cpu_mask, uint64_t *maximum) {
+    uint64_t ticks = 0;
+    unsigned cpus = cpu_online_count();
+    for (int y = r.y; y < r.y+r.h; y += (int)batch_rows) {
+        struct scene_job job = {.scene=s, .batch={r.x,y,r.w,MIN((int)batch_rows,r.y+r.h-y)}};
+        size_t count = job.cell_count = MIN(cpus,(unsigned)job.batch.h);
+        uint64_t start = scene_tick();
+        if (parallel) cpu_parallel_for(count, scene_tile, &job);
+        else for (size_t i = 0; i < count; i++) scene_tile(i, &job);
+        uint64_t elapsed = scene_tick()-start;
+        ticks += elapsed;
+        if (maximum) *maximum = MAX(*maximum, elapsed);
+        if (cpu_mask) for (size_t i=0;i<count;i++) *cpu_mask |= 1ULL << job.cpu[i];
+    }
+    return ticks;
+}
+
+static void render_scene_direct(const struct draw_scene *s, struct rect r) {
+    struct scene_job job={.scene=s,.batch=r,.cell_count=1};
+    scene_tile(0,&job);
+}
+
+static void measure_reference(struct draw_scene *s,struct rect r,unsigned rows,
+                              uint64_t *direct,uint64_t *serial) {
+    canvas_t original=s->dst;
+    s->dst=verify_back;
+    uint64_t start=scene_tick();
+    render_scene_direct(s,r);
+    *direct=scene_tick()-start;
+    *serial=render_scene(s,r,false,rows,NULL,NULL);
+    s->dst=original;
+}
+
+static void scene_benchmark(void) {
+    if (!cmdline_has("wmbench")) return;
+    size_t pixels=(size_t)sw*sh, pages=ALIGN_UP((pixels+32)*4,PAGE_SIZE)/PAGE_SIZE;
+    uint32_t *ref=vmalloc(pages), *out=vmalloc(pages);
+    if (!ref || !out) {
+        if (ref) vfree(ref,pages);
+        if (out) vfree(out,pages);
+        panic("wmbench: cannot allocate comparison buffers");
+    }
+    struct draw_scene s;
+    capture_scene(&s,back);
+    struct window fixture={.cw=16,.ch=16,.buf=wall.px};
+    int extrema[]={INT32_MIN,INT32_MAX};
+    for (unsigned i=0;i<ARRAY_SIZE(extrema);i++) {
+        fixture.x=extrema[i];fixture.y=0;
+        if (capture_layer(&s.layers[0],&fixture,false)) panic("wmbench: extreme x was not culled");
+        fixture.x=0;fixture.y=extrema[i];
+        if (capture_layer(&s.layers[0],&fixture,false)) panic("wmbench: extreme y was not culled");
+    }
+    s.selected=true;
+    s.selection=(struct rect){17,19,73,91};
+    static const unsigned layers[]={0,1,4,16,64,17,1};
+    for (unsigned test=0;test<ARRAY_SIZE(layers);test++) {
+        s.count=0;
+        for (unsigned i=0;i<layers[test];i++) {
+            fixture=(struct window){.x=(int)(i%5)*101-73,.y=(int)(i%7)*59-29,
+                .cw=MIN(sw,820),.ch=MIN(sh,530),.buf=wall.px,
+                .flags=(i%3==0 ? WIN_NO_DECOR : WIN_RESIZABLE),.maximized=i%4==0};
+            strcpy(fixture.title,"RAM scene / alpha / title / clipped tile");
+            if (capture_layer(&s.layers[s.count],&fixture,i==layers[test]-1)) s.count++;
+        }
+        unsigned rows=scene_rows(s.count,(unsigned)sw);
+        struct rect r={0,0,sw,sh};
+        uint64_t serial=0,parallel=0,direct=0,mask=0,maximum=0,begin_jobs=cpu_parallel_jobs();
+        for (unsigned round=0;round<6;round++) {
+            for (size_t p=0;p<pixels+32;p++) ref[p]=out[p]=0x5a5aa5a5;
+            s.dst=(canvas_t){.px=ref+16,.w=sw,.h=sh,.pitch=sw};
+            uint64_t start=scene_tick();
+            render_scene_direct(&s,r);
+            direct+=scene_tick()-start;
+            s.dst.px=out+16;
+            render_scene(&s,r,false,rows,NULL,NULL);
+            if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: direct/tiled mismatch layers=%u",s.count);
+            /* Alternate destination/order to avoid always timing a cold serial buffer. */
+            if (round&1) {
+                s.dst.px=ref+16;
+                parallel+=render_scene(&s,r,true,rows,&mask,&maximum);
+                s.dst.px=out+16;
+                serial+=render_scene(&s,r,false,rows,NULL,NULL);
+            } else {
+                s.dst.px=ref+16;
+                serial+=render_scene(&s,r,false,rows,NULL,NULL);
+                s.dst.px=out+16;
+                parallel+=render_scene(&s,r,true,rows,&mask,&maximum);
+            }
+            if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: parallel pixels/guards differ layers=%u",s.count);
+            /* Off-origin, odd width/height, last row, and tiny jobs must not write
+               outside their damage region or disagree at a tile boundary. */
+            struct rect clips[]={{1,3,MIN(sw-1,97),MIN(sh-3,131)},
+                                 {sw-33,sh-19,33,19},{7,9,1,1}};
+            for (unsigned k=0;k<ARRAY_SIZE(clips);k++) {
+                for (size_t p=0;p<pixels+32;p++) ref[p]=out[p]=0x5a5aa5a5;
+                s.dst.px=ref+16;render_scene_direct(&s,clips[k]);
+                s.dst.px=out+16;render_scene(&s,clips[k],true,rows,&mask,&maximum);
+                if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: clipped pixels/guards differ case=%u",k);
+            }
+        }
+        if (s.count==17) {
+            const unsigned uneven[]={4,5,6,9};
+            struct rect clip={1,3,MIN(sw-1,97),MIN(sh-3,35)};
+            uint64_t jobs=cpu_parallel_jobs(),uneven_mask=0;
+            for (unsigned k=0;k<ARRAY_SIZE(uneven);k++) {
+                for (size_t p=0;p<pixels+32;p++) ref[p]=out[p]=0x5a5aa5a5;
+                s.dst.px=ref+16;render_scene_direct(&s,clip);
+                uint64_t before=cpu_parallel_jobs();
+                s.dst.px=out+16;render_scene(&s,clip,true,uneven[k],&uneven_mask,NULL);
+                if (memcmp(ref,out,(pixels+32)*4) ||
+                    (cpu_online_count()>1 && uneven[k]>=cpu_online_count() &&
+                     cpu_parallel_jobs()==before)) panic("wmbench: uneven batch failed rows=%u",uneven[k]);
+            }
+            kprintf("wmbench: uneven-batches PASS rows=4,5,6,9 mask=%lx jobs=%lu pixels=PASS guards=PASS\n",
+                    uneven_mask,cpu_parallel_jobs()-jobs);
+        }
+        /* RDP can choose an odd pitch: adjacent non-overlapping rows may share
+           a cache line, but neither clip nor guard pixels may be changed. */
+        for (size_t p=0;p<pixels+32;p++) ref[p]=out[p]=0x5a5aa5a5;
+        s.dst=(canvas_t){.px=ref+16,.w=sw-1,.h=sh,.pitch=sw-1};
+        struct rect odd={1,1,sw-2,sh-2};
+        render_scene_direct(&s,odd);
+        s.dst.px=out+16;
+        render_scene(&s,odd,true,rows,&mask,&maximum);
+        if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: odd-pitch pixels/guards differ");
+        kprintf("wmbench: %dx%d layers=%u rounds=6 CPUs=%u mask=%lx direct_ticks=%lu serial_ticks=%lu parallel_ticks=%lu jobs=%lu batch_rows=%u max_join_us=%lu pixels=PASS guards=PASS\n",
+                sw,sh,s.count,cpu_online_count(),mask,direct,serial,parallel,
+                cpu_parallel_jobs()-begin_jobs,rows,scene_us(maximum));
+        scene_shrink(s.count,(unsigned)sw,rows,maximum);
+    }
+    vfree(ref,pages);vfree(out,pages);
+    kprintf("wmbench: PASS full/clipped/tiny/odd-pitch/extrema/guards; scheduler remains BSP-only\n");
+}
+
+static void composite_ram(struct rect r) {
+    struct draw_scene scene;
+    capture_scene(&scene, back);
+    unsigned relevant=0;
+    for (unsigned i=0;i<scene.count;i++) if (rect_overlap(&scene.layers[i].bounds,&r))
+        scene.layers[relevant++]=scene.layers[i];
+    scene.count=relevant;
+    bool verify=wm_verify && verify_back.w==back.w && verify_back.h==back.h;
+    bool parallel = wm_parallel && cpu_online_count()>1 && r.h>=(int)cpu_online_count() &&
+                    (uint64_t)r.w*r.h>=65536 && scene.count>0;
+    if (!parallel) {
+        render_scene_direct(&scene,r);
+        if (verify && scene.count) {
+            scene.dst=verify_back;
+            render_scene_direct(&scene,r);
+            for (int y=r.y;y<r.y+r.h;y++)
+                if (memcmp(back.px+(size_t)y*back.pitch+r.x,
+                           verify_back.px+(size_t)y*verify_back.pitch+r.x,(size_t)r.w*4))
+                    panic("wmverify: serial fallback pixels differ row=%d",y);
+            kprintf("wmram: fallback CPUs=%u layers=%u rect=%dx%d pixels=PASS\n",
+                    cpu_online_count(),scene.count,r.w,r.h);
+        }
+        return;
+    }
+    /* Many overlapping alpha shadows need shorter joins, not a fixed giant job. */
+    unsigned rows=scene_rows(scene.count,(unsigned)r.w);
+    uint64_t start_jobs=cpu_parallel_jobs(), maximum=0, mask=0;
+    uint64_t direct=0,serial=0;
+    bool parallel_first=verify && (scene_frames&1);
+    if (verify && !parallel_first) measure_reference(&scene,r,rows,&direct,&serial);
+    scene.fault_test=cmdline_has("wm-test-ap-fault");
+    uint64_t ticks=render_scene(&scene,r,true,rows,&mask,&maximum);
+    if (parallel_first) measure_reference(&scene,r,rows,&direct,&serial);
+    if (verify) {
+        for (int y=r.y;y<r.y+r.h;y++)
+            if (memcmp(back.px+(size_t)y*back.pitch+r.x,
+                       verify_back.px+(size_t)y*verify_back.pitch+r.x,(size_t)r.w*4))
+                panic("wmverify: live snapshot pixels differ row=%d",y);
+    }
+    scene_frames++;
+    scene_jobs+=cpu_parallel_jobs()-start_jobs;
+    scene_max_ticks=MAX(scene_max_ticks,maximum);
+    scene_shrink(scene.count,(unsigned)r.w,rows,maximum);
+    if (!trace_active && (verify || scene_frames==1 || !(scene_frames%64)))
+        kprintf("wmram: frame=%lu rect=%dx%d layers=%u CPUs=%u mask=%lx direct_ticks=%lu serial_ticks=%lu parallel_ticks=%lu jobs=%lu density=%u batch_rows=%u join_us=%lu max_join_us=%lu pixels=%s\n",
+                scene_frames,r.w,r.h,scene.count,cpu_online_count(),mask,direct,serial,ticks,
+                scene_jobs,scene_density(scene.count),rows,scene_us(maximum),scene_us(scene_max_ticks),verify?"PASS":"unchecked");
+}
+
 static void composite_rect(struct rect r) {
+    cpu_require_bsp();
+    composite_ram(r);
     canvas_t *c = &back;
     gfx_noclip(c);
     gfx_clip(c, r.x, r.y, r.w, r.h);
-    gfx_blit(c, r.x, r.y, &wall, r.x, r.y, r.w, r.h);
-    if (sel_icon >= 0) {
-        int x, y;
-        icon_cell(sel_icon, &x, &y);
-        gfx_fill_blend(c, x, y, ICON_CELL_W - 8, ICON_CELL_H - 6, ARGB(70, 150, 140, 255));
-    }
-    struct window *f = focused();
-    for (int i = 0; i < nwin; i++) {
-        struct window *w = zorder[i];
-        if (!visible(w)) continue;
-        struct rect b = win_bounds(w);
-        if (!rect_overlap(&b, &r)) continue;
-        draw_window(c, w, w == f);
-    }
     if (resize_visible) {
         struct rect o = resize_rect;
         gfx_rect(c, o.x, o.y, o.w, o.h, RGB(180, 160, 255));
@@ -940,24 +1242,96 @@ struct in_ev {
     bool is_key;
     struct key_event k;
     struct mouse_event m;
+    uint64_t stamp, seq; /* 診断専用。client ABIへは出さない。 */
 };
 static struct in_ev inq[INQ];
 static volatile int in_head, in_tail;
 
+#define TRACE_FRAMES 256
+struct trace_frame {
+    uint64_t begin, end, oldest, seq, jobs, area;
+    uint32_t rects, inputs, waited, reserved;
+};
+static struct trace_frame trace_frames[TRACE_FRAMES];
+static struct {
+    uint64_t start, deadline, frames, empty, waits, wait_ticks, max_wait;
+    uint64_t nowait, streak, max_streak, streak_start, max_run, max_frame, max_proxy, max_dequeue;
+    uint64_t dequeue_hist[16], frame_hist[16], raw_lost, yield_calls;
+    volatile uint64_t received, dropped, skipped;
+    volatile unsigned depth;
+    unsigned records;
+} wt;
+_Static_assert(sizeof(trace_frames)+sizeof(wt)+INQ*16 <= 24*1024,"WM診断RAM上限");
+
+static void trace_hist(uint64_t *bins, uint64_t ticks) {
+    uint64_t us=scene_us(ticks); unsigned b=0;
+    while (us>1 && b<15) { us>>=1; b++; }
+    bins[b]++;
+}
+static void trace_stamp(struct in_ev *ev) {
+    ev->stamp=ev->seq=0;
+    if (!trace_active) return;
+    if (ev->is_key && (ev->k.key==KEY_F10 || ev->k.key==KEY_LCTRL || ev->k.key==KEY_RCTRL ||
+                      ev->k.key==KEY_LALT || ev->k.key==KEY_RALT)) { wt.skipped++; return; }
+    ev->stamp=rdtsc(); ev->seq=++wt.received;
+    wt.depth=MAX(wt.depth,(unsigned)((in_head-in_tail+INQ)%INQ+1));
+}
+static void trace_begin(void) {
+    if (trace_done || trace_active) return;
+    if (wm_verify || !tsc_hz || tsc_hz>UINT64_MAX/20) {
+        trace_done=true; kprintf("wmtrace: REJECT wmverify or unavailable TSC\n"); return;
+    }
+    memset(&wt,0,sizeof wt);
+    kprintf("wmtrace: START seconds=20 CPUs=%u parallel=%u yield=%u proxy=WM-loop-not-app-paint\n",cpu_online_count(),(unsigned)wm_parallel,(unsigned)wm_yield);
+    audio_trace_begin();
+    uint64_t f=irq_save(); wt.start=rdtsc(); wt.deadline=wt.start+20*tsc_hz;
+    trace_active=true; irq_restore(f);
+}
+static void trace_finish(uint64_t end) {
+    uint64_t f=irq_save(); trace_active=false; trace_done=true; irq_restore(f);
+    audio_trace_end();
+    kprintf("wmtrace: DONE elapsed_us=%lu overshoot_us=%lu received=%lu dropped=%lu excluded=%lu depth=%u frames=%lu empty=%lu waits=%lu wait_us=%lu max_wait_us=%lu nowait=%lu max_streak=%lu max_run_us=%lu max_frame_us=%lu max_dequeue_us=%lu max_proxy_us=%lu records=%u raw_lost=%lu yield_calls=%lu run_proxy=loop-no-wait-including-yield\n",
+            scene_us(end-wt.start),scene_us(end-wt.deadline),wt.received,wt.dropped,wt.skipped,wt.depth,
+            wt.frames,wt.empty,wt.waits,scene_us(wt.wait_ticks),scene_us(wt.max_wait),wt.nowait,wt.max_streak,
+            scene_us(wt.max_run),scene_us(wt.max_frame),scene_us(wt.max_dequeue),scene_us(wt.max_proxy),wt.records,wt.raw_lost,wt.yield_calls);
+    for (unsigned b=0;b<16;b++) kprintf("wmtrace: hist bin=%u dequeue=%lu frame=%lu unit=log2-us-last-saturated\n",b,wt.dequeue_hist[b],wt.frame_hist[b]);
+    for (unsigned i=0;i<wt.records;i++) {
+        struct trace_frame *r=&trace_frames[i];
+        kprintf("wmtrace: raw frame=%u begin_ticks=%lu end_ticks=%lu oldest_ticks=%lu seq=%lu inputs=%u rects=%u area=%lu waited=%u jobs=%lu\n",
+                i,r->begin-wt.start,r->end-wt.start,r->oldest?r->oldest-wt.start:0,r->seq,r->inputs,r->rects,r->area,r->waited,r->jobs);
+    }
+}
+static void trace_frame_end(struct trace_frame *r) {
+    if (!trace_active) return;
+    if (!r->begin) r->begin=wt.start; /* 開始chordを消費した最初のloop。 */
+    r->end=rdtsc(); r->jobs=cpu_parallel_jobs()-r->jobs;
+    if (r->waited) { wt.streak=0; wt.streak_start=0; }
+    else { wt.nowait++; if (!wt.streak) wt.streak_start=r->begin; wt.streak++;
+        wt.max_streak=MAX(wt.max_streak,wt.streak); wt.max_run=MAX(wt.max_run,r->end-wt.streak_start); }
+    if (r->rects) {
+        wt.frames++; wt.max_frame=MAX(wt.max_frame,r->end-r->begin); trace_hist(wt.frame_hist,r->end-r->begin);
+        if (r->oldest) wt.max_proxy=MAX(wt.max_proxy,r->end-r->oldest);
+        if (wt.records<TRACE_FRAMES) trace_frames[wt.records++]=*r; else wt.raw_lost++;
+    } else wt.empty++;
+    if (r->end>=wt.deadline) trace_finish(r->end);
+}
+
 static void key_sink(const struct key_event *e) {
     int nh = (in_head + 1) % INQ;
-    if (nh == in_tail) return;
+    if (nh == in_tail) { if (trace_active) wt.dropped++; return; }
     inq[in_head].is_key = true;
     inq[in_head].k = *e;
+    trace_stamp(&inq[in_head]);
     in_head = nh;
     wake_compositor();
 }
 
 static void mouse_sink(const struct mouse_event *e) {
     int nh = (in_head + 1) % INQ;
-    if (nh == in_tail) return;
+    if (nh == in_tail) { if (trace_active) wt.dropped++; return; }
     inq[in_head].is_key = false;
     inq[in_head].m = *e;
+    trace_stamp(&inq[in_head]);
     in_head = nh;
     wake_compositor();
 }
@@ -1004,6 +1378,11 @@ static void cycle_windows(void) {
 }
 
 static void handle_key(const struct key_event *k) {
+    if (wm_trace && k->key==KEY_F10 && ((k->pressed && (k->mods&(MOD_CTRL|MOD_ALT))==(MOD_CTRL|MOD_ALT)) || trace_chord)) {
+        trace_chord=k->pressed;
+        if (trace_chord) trace_begin();
+        return;
+    }
     struct window *f = focused();
     if (k->pressed) {
         bool ctrl = k->mods & MOD_CTRL, alt = k->mods & MOD_ALT;
@@ -1317,13 +1696,24 @@ static void handle_mouse(const struct mouse_event *m) {
 static void wm_thread(void *arg) {
     damage_all();
     for (;;) {
+        bool waited=false; uint64_t waiting=0;
         uint64_t fl = irq_save();
-        if (in_head == in_tail && ndamage == 0) wq_wait_timeout(&wm_wq, 250);
+        if (in_head == in_tail && ndamage == 0) {
+            if (trace_active) { waited=true; waiting=rdtsc(); wt.waits++; }
+            wq_wait_timeout(&wm_wq, 250);
+            if (waiting) { uint64_t ticks=rdtsc()-waiting; wt.wait_ticks+=ticks; wt.max_wait=MAX(wt.max_wait,ticks); }
+        }
         irq_restore(fl);
+        struct trace_frame frame={.begin=trace_active?rdtsc():0,.waited=waited};
 
         while (in_tail != in_head) {
             struct in_ev ev = inq[in_tail];
             in_tail = (in_tail + 1) % INQ;
+            if (trace_active && ev.stamp>=wt.start && ev.seq) {
+                uint64_t delay=rdtsc()-ev.stamp; wt.max_dequeue=MAX(wt.max_dequeue,delay); trace_hist(wt.dequeue_hist,delay);
+                if (!frame.oldest) frame.oldest=ev.stamp;
+                frame.seq=ev.seq; frame.inputs++;
+            }
             if (ev.is_key) handle_key(&ev.k);
             else handle_mouse(&ev.m);
         }
@@ -1340,7 +1730,17 @@ static void wm_thread(void *arg) {
             struct rect t = toast_rect();
             damage_rect(t.x, t.y, t.w, t.h);
         }
+        if (trace_active) {
+            frame.rects=ndamage; frame.jobs=cpu_parallel_jobs();
+            for (int i=0;i<ndamage;i++) frame.area+=(uint64_t)damage[i].w*damage[i].h;
+        }
         composite();
+        trace_frame_end(&frame);
+        /* 全join/presentと借用終了後だけ譲る。合成中のkernel preemptionではない。 */
+        if (wm_yield) {
+            if (trace_active) wt.yield_calls++; /* switch数ではなく実呼出数。 */
+            sched_yield();
+        }
     }
 }
 
@@ -1376,21 +1776,26 @@ const char *wm_clipboard(size_t *len, uint32_t *seq) {
    remote viewer can have a desktop of the size its window has. Only call this from a kernel
    thread: the compositor must not be in the middle of a frame. */
 static bool set_screen_size(int w, int h) {
+    cpu_require_bsp();
     if (w == sw && h == sh) return true;
     size_t pages = ALIGN_UP((uint64_t)w * h * 4, PAGE_SIZE) / PAGE_SIZE;
     size_t old = ALIGN_UP((uint64_t)sw * sh * 4, PAGE_SIZE) / PAGE_SIZE;
     uint32_t *bb = vmalloc(pages), *wp = vmalloc(pages);
-    if (!bb || !wp) {
+    uint32_t *reference = wm_verify ? vmalloc(pages) : NULL;
+    if (!bb || !wp || (wm_verify && !reference)) {
         if (bb) vfree(bb, pages);
         if (wp) vfree(wp, pages);
+        if (reference) vfree(reference,pages);
         return false;
     }
     vfree(back.px, old);
     vfree(wall.px, old);
+    if (wm_verify) vfree(verify_back.px,old);
     sw = w;
     sh = h;
     gfx_init(&back, bb, sw, sh, sw);
     gfx_init(&wall, wp, sw, sh, sw);
+    if (wm_verify) gfx_init(&verify_back,reference,sw,sh,sw);
     desktop_draw_wallpaper(&wall);
     draw_desktop_icons(&wall);
     mx = MIN(mx, sw - 1);
@@ -1472,6 +1877,17 @@ void wm_init(void) {
     desktop_draw_wallpaper(&wall);
     draw_desktop_icons(&wall);
     fb_benchmark(wall.px,wall.pitch);
+    /* Experimental RAM work is independent of the opt-in VRAM copy path. */
+    wm_verify=cmdline_has("wmverify");
+    wm_trace=cmdline_has("wmtrace");
+    wm_yield=cmdline_has("wmyield");
+    wm_parallel=cmdline_has("wmparallel") || wm_verify || cmdline_has("wm-test-ap-fault");
+    if (wm_verify) {
+        uint32_t *reference=vmalloc(pages);
+        if (!reference) panic("wmverify: cannot allocate reference RAM");
+        gfx_init(&verify_back,reference,sw,sh,sw);
+    }
+    scene_benchmark();
     mx = sw / 2;
     my = sh / 2;
     running = true;

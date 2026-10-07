@@ -70,7 +70,11 @@ static AVCodecContext *open_decoder(nmedia *m, int stream) {
     if (!c) { fail(m, "decoder allocation", AVERROR(ENOMEM)); return NULL; }
     c->thread_count = 1; c->thread_type = 0;
     c->max_pixels = NMEDIA_MAX_PIXELS;
+    /* Decoder-side pre-skip/discard adjusts frame PTS in packet time units. */
+    c->pkt_timebase = s->time_base;
     int r = avcodec_parameters_to_context(c, s->codecpar);
+    if (r >= 0 && c->codec_id == AV_CODEC_ID_VP9 && c->profile != AV_PROFILE_UNKNOWN && c->profile != 0)
+        r = AVERROR(ENOSYS);
     if (r >= 0) r = avcodec_open2(c, codec, NULL);
     if (r < 0) { fail(m, "open decoder", r); avcodec_free_context(&c); return NULL; }
     return c;
@@ -211,6 +215,15 @@ static int video_output(nmedia *m, struct nmedia_output *o) {
         m->pixels = p; m->pixel_capacity = count;
     }
     enum AVPixelFormat format = (enum AVPixelFormat)f->format;
+    /* Upstream also compiles 10/12-bit VP9 DSP, but that is not a promise
+     * that our native ARGB output can render those profiles or HDR. */
+    if (m->video->codec_id == AV_CODEC_ID_VP9 &&
+        (m->video->profile != 0 || format != AV_PIX_FMT_YUV420P ||
+         (f->colorspace != AVCOL_SPC_UNSPECIFIED && f->colorspace != AVCOL_SPC_BT709 &&
+          f->colorspace != AVCOL_SPC_BT470BG && f->colorspace != AVCOL_SPC_SMPTE170M) ||
+         (f->color_trc != AVCOL_TRC_UNSPECIFIED && f->color_trc != AVCOL_TRC_BT709 &&
+          f->color_trc != AVCOL_TRC_GAMMA22 && f->color_trc != AVCOL_TRC_GAMMA28 && f->color_trc != AVCOL_TRC_SMPTE170M)))
+        return fail(m, "unsupported VP9 output profile/color", AVERROR(ENOSYS));
     bool yuv = format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P || format == AV_PIX_FMT_YUV422P || format == AV_PIX_FMT_YUVJ422P || format == AV_PIX_FMT_YUV444P || format == AV_PIX_FMT_YUVJ444P;
     bool rgb = format == AV_PIX_FMT_RGB24 || format == AV_PIX_FMT_BGR24 || format == AV_PIX_FMT_BGRA || format == AV_PIX_FMT_RGBA || format == AV_PIX_FMT_BGR0 || format == AV_PIX_FMT_RGB0;
     if (!yuv && !rgb && format != AV_PIX_FMT_GRAY8) return fail(m, "unsupported decoded pixel format", AVERROR(ENOSYS));
@@ -271,7 +284,9 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
                 if (m->source_rate != f->sample_rate) m->phase = 0;
                 m->source_rate = f->sample_rate; m->step = ((uint64_t)f->sample_rate << 32) / SOUND_RATE;
                 if (m->audio_seek_ms >= 0 && m->audio_clock <= m->audio_seek_ms) { av_frame_unref(f); continue; }
-                if (m->audio_seek_ms > m->audio_pts) m->phase = (uint64_t)(m->audio_seek_ms - m->audio_pts) * f->sample_rate / 1000 << 32;
+                /* -1 means no seek. Negative pre-roll PTS must not turn that
+                 * sentinel into a second trim (Opus -7ms -> lost 288 frames). */
+                if (m->audio_seek_ms >= 0 && m->audio_seek_ms > m->audio_pts) m->phase = (uint64_t)(m->audio_seek_ms - m->audio_pts) * f->sample_rate / 1000 << 32;
                 m->audio_seek_ms = -1; m->frame_audio = 1;
                 return audio_output(m, o);
             }

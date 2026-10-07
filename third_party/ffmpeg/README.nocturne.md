@@ -6,13 +6,14 @@
 
 ## 構成
 
-- `libavcodec`, `libavformat`, `libavutil` の静的 C 構成。
-- デコーダー: MP3, FLAC, AAC, H.264, MJPEG, rawvideo、および WAV 向け PCM。
-- コンテナー: WAV, MP3, FLAC, ADTS AAC, AVI, MOV/MP4。
+- `libavcodec`, `libavformat`, `libavutil`, `libswresample` の静的 C 構成。実コンパイル閉包は333 C / 749 manifest files。`libswresample` の generic C は native Opus の SILK 経路にも必要で、外部の libopus/libvorbis/libvpx は入らない。
+- デコーダー: MP3, FLAC, AAC, H.264, MJPEG, VP9, Opus, Vorbis, rawvideo、および WAV 向け PCM。
+- コンテナー: WAV, MP3, FLAC, ADTS AAC, AVI, MOV/MP4, Matroska/WebM, Ogg。
 - network、URL protocol、device、filter、encoder、外部 library、pthread/Windows thread、assembler/GPL 最適化を無効にする。
 - native `media.c` の custom AVIO が Nocturne の `read/lseek/fstat` または所有メモリーに接続する。codec handle は単一所有・単一実行コンテキスト専用。FFmpeg の無 thread ビルドを勝手にマルチスレッドで使用してはならない。
 - PCM 出力は 48 kHz stereo。mono は両側、複数チャンネルは先頭の２つを用いる（surround downmix ではない）。リサンプルは線形補間で、各フレーム末尾は最後のサンプルを保持する簡易処理。
-- 動画出力は 8-bit YUV420/422/444、RGB/BGR、gray から opaque ARGB へ。10-bit H.264、VP9/AV1、Opus/Vorbis、HEVC、WebM は再生機能として宣言しない。
+- 動画出力は 8-bit YUV420/422/444、RGB/BGR、gray から opaque ARGB へ。VP9 は profile 0 / 8-bit YUV420 / SDR に限定し、10/12-bit の上流 DSP がコンパイルされても高bitdepthやHDRを再生能力に含めない。10-bit H.264、VP8/AV1、HEVC は再生機能として宣言しない。
+- Ogg demuxer に必要な Dirac/Theora/Speex/VP8 の header parser が含まれても、それらの decoder は無効。コンテナーの parser が存在することを codec 再生対応と混同しない。
 - browser は既存 fetch/CORS を用いる上限付き全体取得。MSE、DRM、HLS/DASH/live、HTTP Range streaming、autoplay、1x 以外の速度、字幕は未対応。これは Web 全面互換を達成したものではない。
 
 ## 再生成
@@ -20,14 +21,16 @@
 先に Nocturne の `build/sysroot/usr/lib/libc.a` を作る。その後:
 
 ```
-python ports/ffmpeg/prepare.py --source "D:/Programes/cloned repos/ffmpeg-9.0.2" --import-vendor
+python ports/ffmpeg/prepare.py --source "D:/Programes/cloned repos/ffmpeg-9.0.2" --profile webm --stage build/media-stage2/fresh-reproduction --import-vendor
 ```
 
-空白を含む upstream パスの configure 制限を避けるため、`build/nocturne-platform/media/reproduce-stage` に複製して in-tree 生成する。元ソースは読み取りのみ。native mmap/fcntl/mkstemp を POSIX file helper と誤検出した３項目は専用構成で明示的に無効化する。`ports/ffmpeg/include` の scoped C header glue は OS グローバル ABI を変更しない。
+空白を含む upstream パスの configure 制限を避けるため、`build/` 内の新しい stage に複製して in-tree 生成する。既存 stage は拒否し、前段階の `build/nocturne-platform/media/reproduce-stage` と証拠は上書きしない。`--profile legacy` は旧7経路の構成を再現する選択肢として残す（その場合も新しい `--stage` を選ぶ）。相対 include/link path は stage の深さから生成する。元ソースは読み取りのみ。native mmap/fcntl/mkstemp を POSIX file helper と誤検出した３項目は専用構成で明示的に無効化する。`ports/ffmpeg/include` の scoped C header glue は OS グローバル ABI を変更しない。
 
 上流の library 規則と同じく内部 C は `-DHAVE_AV_CONFIG_H -D_ISOC11_SOURCE -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE` 付きでコンパイルする。公開 API の利用者には `HAVE_AV_CONFIG_H` は不要。`media.o` にも専用 `errno.h` を先頭 include に用いること（`EDOM > 0` による `AVERROR` の符号判定を維持するため）。
 
 `ports/ffmpeg/make-fixtures.py` は host FFmpeg 8.1.1 で自作 tone/pattern の実圧縮回帰入力を生成する。host バイナリーは OS の dependency ではない。生成 clip は実サイトの受け入れ試験の代用品ではない。
+
+追加 WebM/Ogg 入力は `ports/ffmpeg/make-webm-fixtures.py` で生成し、専用 `tests/media-fixtures/webm-manifest.json` に引数・codec/profile・hash・host参照PCM数を残す。旧 fixture と旧 manifest は変更しない。能力宣言は `user/libc/media_types.c` の限定 allow-list と実 native/browser 試験を照合する。`vp09` の profile/bitdepth/color suffix は [WebM公式の定義](https://www.webmproject.org/vp9/mp4/) に従い、未対応 profile/HDR は拒否する。旧 `vp9`/`vp9.0` と WebM の Opus/Vorbis 記法は [公式 container guideline](https://www.webmproject.org/docs/container/) を参照する。
 
 ## ライセンス
 
