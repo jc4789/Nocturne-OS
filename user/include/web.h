@@ -14,6 +14,7 @@
 #include <stdbool.h>
 #include "gfx.h"
 #include "abi.h"
+#include "webstorage.h"
 
 typedef struct web_doc web_doc;
 typedef struct node web_node; /* an element of the document */
@@ -69,6 +70,10 @@ struct web_host {
     char *(*cookie_get)(void *opaque, const char *url);
     void (*cookie_set)(void *opaque, const char *url, const char *value);
     void (*navigate_mode)(void *opaque, const char *url, int mode); /* 0 assign, 1 reload, 2 replace */
+    /* origin is derived from the native document URL by the private URL parser,
+       never a page-selected directory. Output text transfers malloc ownership. */
+    int (*storage)(void *opaque, const char *origin, const struct web_storage_request *request,
+                   struct web_storage_result *out);
 };
 bool web_set_url(web_doc *d, const char *url);
 /* Call between JS tasks, after the host history position and document URL change. */

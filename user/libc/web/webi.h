@@ -83,7 +83,8 @@ extern const char *const tag_names[T_COUNT];
 
 enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_OTHER }; /* pseudo-elements */
 
-enum { N_DOC, N_ELEM, N_TEXT, N_COMMENT, N_FRAGMENT, N_DOCTYPE };
+enum { N_DOC, N_ELEM, N_TEXT, N_COMMENT, N_FRAGMENT, N_DOCTYPE, N_PI };
+enum { NS_HTML, NS_SVG, NS_MATHML };
 
 struct attr {
     const char *name;  /* lowercase */
@@ -100,14 +101,15 @@ typedef struct node {
     struct node *template_content; /* separate inert tree, not element children */
     struct node *template_host; /* host-inclusive cycle validation only */
     uint8_t type;
+    uint8_t namespace_id; /* stable across detach/clone/adopt; not ancestor-derived */
     uint16_t tag;
-    bool foreign;     /* inside <svg> or <math> */
-    const char *name; /* lowercase tag name */
+    bool foreign;     /* namespace_id != NS_HTML, retained for renderer/parser */
+    const char *name; /* lowercase tag name; case-preserving PI target */
     const char *raw_name;
     const char *public_id, *system_id;
     struct attr *attrs;
     int nattrs;
-    char *text; /* text and comment nodes */
+    char *text; /* Text, Comment and ProcessingInstruction data */
     size_t textlen;
     struct node *parent, *first, *last, *next, *prev;
     const char *id;
@@ -316,9 +318,15 @@ struct cx {
     arena_t *a;            /* for computed values that need memory */
     uint8_t *set;          /* per property: already given a value by a more important declaration */
     bool font_pass;        /* only font-size is being computed */
+    bool supports_probe, invalid; /* scratch validation: never touch a document */
+    unsigned supports_nodes; /* bound arithmetic AST traversal, not just parentheses */
 };
 /* apply a declaration (var() already substituted) unless its properties are all set; false if invalid */
 bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx);
+bool css_value_supported(const struct propdef *p, const char *value, size_t n);
+const char *css_value_canonical(arena_t *a, const char *value, size_t n, size_t *out_n);
+bool css_supports_declaration(const char *property, size_t pn, const char *value, size_t vn);
+bool css_supports_condition(const char *condition, size_t n, bool implied_parens);
 /* start a style: inherited properties from the parent, the others initial */
 void css_style_init(style_t *s, const style_t *parent);
 /* computed-value fixups after all declarations: currentColor, blockification, border widths */
@@ -429,7 +437,15 @@ struct web_image {
     bool done, failed;
 };
 
+/* Monotonic diagnostic counters, sampled at task boundaries. No timing limit
+   or DOM semantics depend on these values. Times can overlap (inclusive). */
+struct web_profile {
+    uint64_t inserts, index_visits, index_ms, rescans, rescan_ms;
+    uint64_t script_scans, script_visits, script_ms, native_calls, native_ms;
+    uint64_t metadata_syncs, metadata_visits, metadata_ms;
+};
 struct web_doc {
+    struct web_profile profile;
     web_doc *dom_family, *dom_docs, *dom_next;
     bool inert; /* independent DOM only: no window, loader, style/resource scan */
     bool template_owner;
@@ -493,6 +509,7 @@ bool html_write(struct html_parser *p, const char *text, size_t n);
 void html_finish(struct html_parser *p);
 node_t *html_fragment(web_doc *d, node_t *context, const char *html, size_t n);
 node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t n);
+bool doc_pi_target_valid(const char *target, size_t len);
 bool doc_node_attr(web_doc *d, node_t *node, const char *name, const char *value);
 bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before);
 void doc_node_remove(web_doc *d, node_t *node);
@@ -508,11 +525,14 @@ void doc_control_selection(web_doc *d, node_t *node, uint32_t start, uint32_t en
 bool doc_control_replace(web_doc *d, node_t *node, uint32_t start, uint32_t end, const char *text);
 void doc_control_init(web_doc *d, node_t *node);
 void doc_control_checked(web_doc *d, node_t *node, bool checked);
+bool doc_form_reset(web_doc *d, node_t *form);
 node_t *doc_select_option(node_t *select, int index);
 bool doc_option_selected(node_t *option);
 node_t *doc_node_clone(web_doc *d, node_t *node, bool deep);
 void doc_mutated(web_doc *d, node_t *node);
 void doc_rescan(web_doc *d);
+void doc_sync_tree(web_doc *d);
+node_t *doc_image_node_next(web_doc *d, node_t *previous);
 void doc_image_sync(web_doc *d, node_t *n);
 void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const char *css, size_t n);
 bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out);

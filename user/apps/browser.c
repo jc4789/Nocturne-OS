@@ -9,6 +9,7 @@
 #include "http.h"
 #include "web.h"
 #include "webnet.h"
+#include "webstorage.h"
 
 #define TB 40   /* toolbar */
 #define SB 24   /* status / find bar */
@@ -25,6 +26,7 @@ static char cur_url[2048], status[256], hover[512];
 static bool quit, loading;
 static bool debug_js;
 static webnet *network;
+static webstorage *storage; /* browser-window lifetime, not document lifetime */
 static uint64_t generation = 1, next_generation = 1, navigation_generation, navigation_id;
 static int navigation_mode;
 static char navigation_url[2048];
@@ -733,6 +735,11 @@ static void host_cookie_set(void *opaque, const char *url, const char *value) {
     (void)opaque;
     if (webnet_cookie_set(network, url, value) < 0) console_add("error", "Cookie storage allocation failed");
 }
+static int host_storage(void *opaque, const char *origin, const struct web_storage_request *request,
+                        struct web_storage_result *out) {
+    (void)opaque;
+    return webstorage_access(storage, origin, request, out);
+}
 static bool host_history(void *opaque, int operation, const char *url, const void *data,
                          size_t len, int value, struct web_history *out) {
     (void)opaque;
@@ -818,6 +825,7 @@ static const struct web_host browser_host = {
     .scroll_to = host_scroll_to, .history = host_history,
     .cookie_get = host_cookie_get, .cookie_set = host_cookie_set
     , .navigate_mode = host_navigate_mode
+    , .storage = host_storage
 };
 
 static void navigation_completed(webnet *net, uint64_t id, uint64_t gen,
@@ -1619,6 +1627,7 @@ int main(int argc, char **argv) {
     if (!w) return 1;
     network = webnet_create();
     if (!network) { win_close(w); return 1; }
+    storage = webstorage_create(); /* lazily touches local disk only on storage access */
     redraw();
     if (argc > 1) {
         if (argv[1][0] == '/') {
@@ -1675,6 +1684,7 @@ int main(int argc, char **argv) {
     cancel_document_requests();
     if (doc) web_free(doc);
     webnet_free(network);
+    webstorage_free(storage);
     free(pending_post);
     free(focus_value);
     for (int i = 0; i < nhist; i++) hist_discard(i);

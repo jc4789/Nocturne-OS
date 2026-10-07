@@ -15,8 +15,10 @@
     const listenerMap = new WeakMap(), inlineMap = new WeakMap();
     const handlerMap = new WeakMap();
     let xhrHandlerTarget = () => false;
+    let messageHandlerTarget = () => false;
+    let svgHandlerTarget = () => false;
     const globalHandlerTypes = new Set(('abort blur change click dblclick error focus focusin focusout input keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select submit wheel').split(' '));
-    const windowHandlerTypes = new Set(['hashchange','popstate']);
+    const windowHandlerTypes = new Set(['hashchange','popstate','message','messageerror']);
     const state = new WeakMap();
     /* @include js_collections.js */
     function list(a) { return collectionBridge.list(a); }
@@ -125,8 +127,8 @@
         }
     }
     function handlerTarget(target,type) {
-        return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document)) ||
-            (windowHandlerTypes.has(type) && target===globalThis) || xhrHandlerTarget(target,type);
+        return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document || svgHandlerTarget(target))) ||
+            (windowHandlerTypes.has(type) && target===globalThis) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type);
     }
     function activateHandler(target,type,r) {
         if(r.entry)return;
@@ -140,7 +142,7 @@
         let map=handlerMap.get(target);if(!map)handlerMap.set(target,map=new Map());
         let r=map.get(type);
         if(!r) {
-            const text=target instanceof HTMLElement?target.getAttribute('on'+type):null;
+            const text=(target instanceof HTMLElement || svgHandlerTarget(target))?rawDom('attr',target,'on'+type):null;
             r={value:null,text,compiled:text===null,entry:null};map.set(type,r);
             if(text!==null)activateHandler(target,type,r);
         }
@@ -312,10 +314,6 @@
         get offsetHeight() { return dom('geometry',this,'offsetHeight'); }
         get text() { return this.textContent; }
         set text(v) { this.textContent=v; }
-        get async() { return dom('get',this,'async'); }
-        set async(v) { dom('set',this,'async',!!v); }
-        get defer() { return this.hasAttribute('defer'); }
-        set defer(v) { this.toggleAttribute('defer',!!v); }
         get value() { return dom('get',this,'value'); }
         set value(v) { dom('set',this,'value',String(v)); }
         get checked() { return dom('get',this,'checked'); }
@@ -329,9 +327,6 @@
         focus() { dom('focus',this); }
         blur() { if(rawDom('get',this,'scripting'))dom('focus',null); }
         click() { host.click(this); }
-        submit() { dom('submit',this); }
-        requestSubmit(submitter) { const e=new Event('submit',{bubbles:true,cancelable:true});e.submitter=submitter||null;if(this.dispatchEvent(e))dom('submit',submitter||this); }
-        get elements() { return list(Array.from(this.querySelectorAll('input,select,textarea,button'))); }
     }
     // A distinct native interface, not an alias or an instanceof override.
     // Nested browsing contexts/navigation are not implemented by this class.
@@ -375,6 +370,10 @@
     class HTMLInputElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLInputElement constructor');}
         get form(){return dom('get',this,'form:input');}
+        get defaultValue(){return this.getAttribute('value')||'';}
+        set defaultValue(v){this.setAttribute('value',v);}
+        get defaultChecked(){return this.hasAttribute('checked');}
+        set defaultChecked(v){this.toggleAttribute('checked',!!v);}
     }
     class HTMLButtonElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLButtonElement constructor');}
@@ -387,6 +386,8 @@
     class HTMLTextAreaElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLTextAreaElement constructor');}
         get form(){return dom('get',this,'form:textarea');}
+        get defaultValue(){return this.textContent||'';}
+        set defaultValue(v){this.textContent=v==null?'':String(v);}
     }
     class HTMLFieldSetElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLFieldSetElement constructor');}
@@ -403,14 +404,174 @@
     class HTMLOptionElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLOptionElement constructor');}
         get form(){return dom('get',this,'form:option');}
+        get defaultSelected(){return this.hasAttribute('selected');}
+        set defaultSelected(v){this.toggleAttribute('selected',!!v);}
     }
-    Object.assign(Node, {ELEMENT_NODE:1,TEXT_NODE:3,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
-    Object.assign(Node.prototype, {ELEMENT_NODE:1,TEXT_NODE:3,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
+    function htmlElementBrand(node,tag){
+        if(rawDom('get',node,'nodeType')!==1 || rawDom('get',node,'namespaceURI')!=='http://www.w3.org/1999/xhtml' ||
+           rawDom('get',node,'localName')!==tag)throw new TypeError('Illegal '+tag+' receiver');
+    }
+    let elementURL; // Initialized by js_hyperlink after the private URL implementation.
+    const formCollections=new WeakMap(), formResetting=new WeakSet();
+    function formControls(form){
+        htmlElementBrand(form,'form');
+        let collection=formCollections.get(form);
+        if(!collection){
+            // SameObject/live collection; RadioNodeList and the dedicated collection type remain unsupported.
+            collection=collectionBridge.html(()=>{
+                let root=form,parent;
+                while((parent=rawDom('get',root,'parentNode')))root=parent;
+                return rawDom('query',root,'button,fieldset,input,object,output,select,textarea',false).filter(el=>{
+                    if(rawDom('get',el,'namespaceURI')!=='http://www.w3.org/1999/xhtml')return false;
+                    const tag=rawDom('get',el,'localName');
+                    return !(tag==='input' && (rawDom('attr',el,'type')||'').toLowerCase()==='image') &&
+                        rawDom('get',el,'form:'+tag)===form;
+                });
+            });
+            formCollections.set(form,collection);
+        }
+        return collection;
+    }
+    class HTMLScriptElement extends HTMLElement {
+        constructor(){throw new TypeError('Illegal HTMLScriptElement constructor');}
+        static supports(type){
+            if(!arguments.length)throw new TypeError('Script type required');
+            type=elementURL.string(type);return type==='classic'||type==='module'||type==='importmap';
+        }
+        get async(){htmlElementBrand(this,'script');return !!dom('get',this,'async');}
+        set async(v){htmlElementBrand(this,'script');dom('set',this,'async',!!v);}
+        get defer(){htmlElementBrand(this,'script');return rawDom('attr',this,'defer')!==null;}
+        set defer(v){htmlElementBrand(this,'script');dom('attr',this,'defer',v?'':null);}
+        get src(){return elementURL.attribute(this,'script','src',false);}
+        set src(v){htmlElementBrand(this,'script');dom('attr',this,'src',elementURL.scalar(v));}
+        get type(){htmlElementBrand(this,'script');return rawDom('attr',this,'type')||'';}
+        set type(v){htmlElementBrand(this,'script');dom('attr',this,'type',elementURL.string(v));}
+        get noModule(){htmlElementBrand(this,'script');return rawDom('attr',this,'nomodule')!==null;}
+        set noModule(v){htmlElementBrand(this,'script');dom('attr',this,'nomodule',v?'':null);}
+        get text(){htmlElementBrand(this,'script');return rawDom('get',this,'textContent');}
+        set text(v){htmlElementBrand(this,'script');dom('set',this,'textContent',v===null?'':elementURL.string(v));}
+        get crossOrigin(){
+            htmlElementBrand(this,'script');const v=rawDom('attr',this,'crossorigin');
+            if(v===null)return null;
+            return v.toLowerCase()==='use-credentials'?'use-credentials':'anonymous';
+        }
+        set crossOrigin(v){htmlElementBrand(this,'script');dom('attr',this,'crossorigin',v==null?null:elementURL.string(v));}
+    }
+    class HTMLFormElement extends HTMLElement {
+        constructor(){throw new TypeError('Illegal HTMLFormElement constructor');}
+        get elements(){return formControls(this);}
+        get length(){return formControls(this).length;}
+        get action(){return elementURL.attribute(this,'form','action',true);}
+        set action(v){htmlElementBrand(this,'form');dom('attr',this,'action',elementURL.scalar(v));}
+        get method(){
+            htmlElementBrand(this,'form');const m=(rawDom('attr',this,'method')||'get').toLowerCase();
+            return m==='post'||m==='dialog'?m:'get';
+        }
+        set method(v){htmlElementBrand(this,'form');dom('attr',this,'method',elementURL.string(v));}
+        get name(){htmlElementBrand(this,'form');return rawDom('attr',this,'name')||'';}
+        set name(v){htmlElementBrand(this,'form');dom('attr',this,'name',elementURL.string(v));}
+        get target(){htmlElementBrand(this,'form');return rawDom('attr',this,'target')||'';}
+        set target(v){htmlElementBrand(this,'form');dom('attr',this,'target',elementURL.string(v));}
+        get enctype(){
+            htmlElementBrand(this,'form');const e=(rawDom('attr',this,'enctype')||'').toLowerCase();
+            if(e==='multipart/form-data'||e==='text/plain')return e;
+            return 'application/x-www-form-urlencoded';
+        }
+        set enctype(v){htmlElementBrand(this,'form');dom('attr',this,'enctype',elementURL.string(v));}
+        get encoding(){htmlElementBrand(this,'form');const e=(rawDom('attr',this,'enctype')||'').toLowerCase();return e==='multipart/form-data'||e==='text/plain'?e:'application/x-www-form-urlencoded';}
+        set encoding(v){htmlElementBrand(this,'form');dom('attr',this,'enctype',elementURL.string(v));}
+        get noValidate(){htmlElementBrand(this,'form');return rawDom('attr',this,'novalidate')!==null;}
+        set noValidate(v){htmlElementBrand(this,'form');dom('attr',this,'novalidate',v?'':null);}
+        submit(){htmlElementBrand(this,'form');dom('submit',this);}
+        reset(){
+            htmlElementBrand(this,'form');if(formResetting.has(this))return;
+            formResetting.add(this);
+            try { if(dispatch(this,new Event('reset',{bubbles:true,cancelable:true})))dom('reset',this); }
+            finally { formResetting.delete(this); }
+        }
+        requestSubmit(submitter){
+            htmlElementBrand(this,'form');
+            if(submitter!=null){
+                const tag=rawDom('get',submitter,'localName'),type=(rawDom('attr',submitter,'type')||'').toLowerCase();
+                if(rawDom('get',submitter,'namespaceURI')!=='http://www.w3.org/1999/xhtml' ||
+                   !(tag==='input' && (type==='submit'||type==='image') || tag==='button' && type!=='reset' && type!=='button'))
+                    throw new TypeError('submitter must be a submit button');
+                if(rawDom('get',submitter,'form:'+tag)!==this)throw new DOMException('submitter belongs to another form','NotFoundError');
+            }
+            const e=new Event('submit',{bubbles:true,cancelable:true});
+            e.submitter=submitter||null;
+            if(dispatch(this,e))dom('submit',submitter||this);
+        }
+    }
+    class HTMLAnchorElement extends HTMLElement {
+        constructor(){throw new TypeError('Illegal HTMLAnchorElement constructor');}
+    }
+    class HTMLAreaElement extends HTMLElement {
+        constructor(){throw new TypeError('Illegal HTMLAreaElement constructor');}
+    }
+    Object.assign(Node, {ELEMENT_NODE:1,TEXT_NODE:3,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
+    Object.assign(Node.prototype, {ELEMENT_NODE:1,TEXT_NODE:3,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
     class Document extends Node {}
     class HTMLDocument extends Document {}
-    class CharacterData extends Node {}
+    function characterDataBrand(node){
+        const type=rawDom('get',node,'nodeType');if(type!==3 && type!==7 && type!==8)throw new TypeError('Illegal CharacterData receiver');
+    }
+    class CharacterData extends Node {
+        get data(){characterDataBrand(this);return rawDom('get',this,'nodeValue');}
+        set data(v){characterDataBrand(this);dom('set',this,'nodeValue',v===null?'':elementURL.string(v));}
+        get length(){characterDataBrand(this);return rawDom('get',this,'nodeValue').length;}
+        substringData(offset,count){
+            characterDataBrand(this);if(arguments.length<2)throw new TypeError('Two arguments required');
+            offset=offset>>>0;count=count>>>0;const data=rawDom('get',this,'nodeValue');
+            if(offset>data.length)throw new DOMException('Offset exceeds data length','IndexSizeError');
+            return data.slice(offset,offset+count);
+        }
+        appendData(data){
+            characterDataBrand(this);if(!arguments.length)throw new TypeError('Data required');
+            data=elementURL.string(data);dom('set',this,'nodeValue',rawDom('get',this,'nodeValue')+data);
+        }
+        insertData(offset,data){
+            characterDataBrand(this);if(arguments.length<2)throw new TypeError('Two arguments required');
+            offset=offset>>>0;data=elementURL.string(data);const old=rawDom('get',this,'nodeValue');
+            if(offset>old.length)throw new DOMException('Offset exceeds data length','IndexSizeError');
+            dom('set',this,'nodeValue',old.slice(0,offset)+data+old.slice(offset));
+        }
+        deleteData(offset,count){
+            characterDataBrand(this);if(arguments.length<2)throw new TypeError('Two arguments required');
+            offset=offset>>>0;count=count>>>0;const old=rawDom('get',this,'nodeValue');
+            if(offset>old.length)throw new DOMException('Offset exceeds data length','IndexSizeError');
+            dom('set',this,'nodeValue',old.slice(0,offset)+old.slice(offset+count));
+        }
+        replaceData(offset,count,data){
+            characterDataBrand(this);if(arguments.length<3)throw new TypeError('Three arguments required');
+            offset=offset>>>0;count=count>>>0;data=elementURL.string(data);const old=rawDom('get',this,'nodeValue');
+            if(offset>old.length)throw new DOMException('Offset exceeds data length','IndexSizeError');
+            dom('set',this,'nodeValue',old.slice(0,offset)+data+old.slice(offset+count));
+        }
+    }
     class Text extends CharacterData {}
     class Comment extends CharacterData {}
+    function processingInstructionCreate(receiver,target,data){
+        if(rawDom('get',receiver,'nodeType')!==9)throw new TypeError('Document receiver required');
+        target=elementURL.string(target);data=elementURL.string(data);
+        // XML 1.0 Name; this is distinct from HTML's PI token target syntax.
+        if(!/^[:A-Z_a-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u02FF\u0370-\u037D\u037F-\u1FFF\u200C-\u200D\u2070-\u218F\u2C00-\u2FEF\u3001-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD\u{10000}-\u{EFFFF}][:A-Z_a-z0-9.\-\u00B7\u0300-\u036F\u203F-\u2040\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u02FF\u0370-\u037D\u037F-\u1FFF\u200C-\u200D\u2070-\u218F\u2C00-\u2FEF\u3001-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD\u{10000}-\u{EFFFF}]*(?![\s\S])/u.test(target) || data.includes('?>'))
+            throw new DOMException('Invalid processing instruction target or data','InvalidCharacterError');
+        return dom('create',receiver,7,target,data);
+    }
+    class ProcessingInstruction extends CharacterData {
+        constructor(target,data=''){
+            if(!arguments.length)throw new TypeError('ProcessingInstruction target required');
+            const node=processingInstructionCreate(document,target,data),proto=new.target.prototype;
+            if(proto!==null && (typeof proto==='object'||typeof proto==='function'))Object.setPrototypeOf(node,proto);
+            return node;
+        }
+        get target(){return rawDom('get',this,'piTarget');}
+    }
+    Document.prototype.createProcessingInstruction=function(target,data){
+        if(arguments.length<2)throw new TypeError('Target and data required');
+        return processingInstructionCreate(this,target,data);
+    };
     class DocumentFragment extends Node {}
     class DocumentType extends Node {
         get name(){return dom('get',this,'doctypeName');}
@@ -458,18 +619,68 @@
         e._initialized=false;return e;
     };
     class DOMTokenList {
-        constructor(node){this.node=node;}
-        _tokens(){return (this.node.className.match(/\S+/g)||[]).filter((x,i,a)=>a.indexOf(x)===i);}
-        _check(t){t=String(t);if(!t||/\s/.test(t))throw new Error('InvalidCharacterError');return t;}
-        get length(){return this._tokens().length;}
-        item(i){return this._tokens()[i]||null;}
-        contains(t){return this._tokens().includes(this._check(t));}
-        add(...ts){const a=this._tokens();for(let t of ts){t=this._check(t);if(!a.includes(t))a.push(t);}this.node.className=a.join(' ');}
-        remove(...ts){ts=ts.map(t=>this._check(t));this.node.className=this._tokens().filter(t=>!ts.includes(t)).join(' ');}
-        toggle(t,force){t=this._check(t);const on=force===undefined?!this.contains(t):!!force;if(on)this.add(t);else this.remove(t);return on;}
-        replace(a,b){a=this._check(a);b=this._check(b);if(!this.contains(a))return false;this.remove(a);this.add(b);return true;}
-        get value(){return this.node.className;}set value(v){this.node.className=v;}
-        [Symbol.iterator](){return this._tokens()[Symbol.iterator]();}toString(){return this.value;}
+        #node;
+        static #string=String;
+        constructor(node){
+            if(rawDom('get',node,'nodeType')!==1)throw new TypeError('DOMTokenList requires an element');
+            this.#node=node;
+        }
+        #text(value){
+            if(typeof value==='symbol')throw new TypeError('Cannot convert Symbol to DOMString');
+            return DOMTokenList.#string(value);
+        }
+        #validate(token){
+            if(!token)throw new DOMException('The token is empty','SyntaxError');
+            if(/[\t\n\f\r ]/.test(token))throw new DOMException('The token contains ASCII whitespace','InvalidCharacterError');
+        }
+        #tokens(){return ((rawDom('attr',this.#node,'class')||'').match(/[^\t\n\f\r ]+/g)||[]).filter((x,i,a)=>a.indexOf(x)===i);}
+        #update(tokens){
+            if(tokens.length || rawDom('attr',this.#node,'class')!==null)dom('attr',this.#node,'class',tokens.join(' '));
+        }
+        get length(){return this.#tokens().length;}
+        item(index){
+            this.#node;if(!arguments.length)throw new TypeError('Missing token index');
+            index=index>>>0;return this.#tokens()[index]??null;
+        }
+        contains(token){
+            this.#node;if(!arguments.length)throw new TypeError('Missing token');
+            token=this.#text(token);return this.#tokens().includes(token);
+        }
+        add(...tokens){
+            this.#node;tokens=tokens.map(t=>this.#text(t));for(const token of tokens)this.#validate(token);
+            const current=this.#tokens();for(const token of tokens)if(!current.includes(token))current.push(token);
+            this.#update(current);
+        }
+        remove(...tokens){
+            this.#node;tokens=tokens.map(t=>this.#text(t));for(const token of tokens)this.#validate(token);
+            this.#update(this.#tokens().filter(t=>!tokens.includes(t)));
+        }
+        toggle(token,force){
+            this.#node;if(!arguments.length)throw new TypeError('Missing token');
+            token=this.#text(token);this.#validate(token);const current=this.#tokens(),has=current.includes(token);
+            if(has){if(force===undefined || !force){this.#update(current.filter(t=>t!==token));return false;}return true;}
+            if(force===undefined || !!force){current.push(token);this.#update(current);return true;}return false;
+        }
+        replace(token,replacement){
+            this.#node;if(arguments.length<2)throw new TypeError('Missing token/replacement');
+            token=this.#text(token);replacement=this.#text(replacement);
+            if(!token || !replacement)throw new DOMException('The token is empty','SyntaxError');
+            this.#validate(token);this.#validate(replacement);
+            const current=this.#tokens();if(!current.includes(token))return false;
+            const result=[];let replaced=false;
+            for(const item of current){
+                if(item===token || item===replacement){if(!replaced){result.push(replacement);replaced=true;}}
+                else result.push(item);
+            }
+            this.#update(result);return true;
+        }
+        supports(token){
+            this.#node;if(!arguments.length)throw new TypeError('Missing token');this.#text(token);
+            throw new TypeError('The class attribute has no supported-token vocabulary');
+        }
+        get value(){return rawDom('attr',this.#node,'class')||'';}
+        set value(v){this.#node;v=this.#text(v);dom('attr',this.#node,'class',v);}
+        [Symbol.iterator](){return this.#tokens()[Symbol.iterator]();}toString(){return rawDom('attr',this.#node,'class')||'';}
     }
     function cssName(k){return String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase());}
     class StyleDeclaration {
@@ -546,7 +757,8 @@
     const navigator={userAgent:'Nocturne/1.0 QuickJS',platform:'Nocturne',language:'en-US',languages:['en-US'],onLine:true};
     Object.assign(globalThis,{document,console,navigator,Node,Element,HTMLElement,HTMLIFrameElement,HTMLImageElement,Image,
         HTMLInputElement,HTMLButtonElement,HTMLSelectElement,HTMLTextAreaElement,HTMLFieldSetElement,HTMLObjectElement,HTMLOutputElement,HTMLOptionElement,
-        Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,Comment,DocumentFragment,
+        HTMLScriptElement,HTMLFormElement,HTMLAnchorElement,HTMLAreaElement,
+        Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,Comment,ProcessingInstruction,DocumentFragment,
         Event,CustomEvent,UIEvent,MouseEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Response,DOMException,AbortController,AbortSignal,
         fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,
         performance:{now:()=>host.now()},getComputedStyle:n=>new Proxy({getPropertyValue:k=>dom('computed',n,String(k))},{get(t,k){return k in t?t[k]:t.getPropertyValue(cssName(k));}})});
@@ -577,11 +789,16 @@
     let historyEvent;
     /* @include js_encoding.js */
     /* @include js_url.js */
+    /* @include js_importmaps.js */
+    /* @include js_hyperlink.js */
     /* @include js_xhr.js */
     /* @include js_screen.js */
     /* @include js_intl.js */
     /* @include js_crypto.js */
     /* @include js_clone.js */
+    /* @include js_storage.js */
+    /* @include js_messaging.js */
+    /* @include js_css_supports.js */
     /* @include js_performance.js */
     /* @include js_history.js */
     /* @include js_custom_elements.js */
@@ -590,6 +807,7 @@
     /* @include js_mutations.js */
     /* @include js_selection.js */
     /* @include js_document.js */
+    /* @include js_svg.js */
     customElementsReady = true;
     /* Private native-input state, never reachable from page JS. C supplies the
        hit target's complete ancestry BEFORE any event handler can change it.
@@ -631,6 +849,10 @@
         };
     }
     return {
+        storageOrigin:storageBridge.origin,
+        registerImportMap:importMapsBridge.register,
+        resolveModule:importMapsBridge.resolve,
+        moduleURL:importMapsBridge.url,
         observerFrame(){observerBridge.frame();},
         eventHandlerAttribute:handlerAttribute,
         imageError(){return new DOMException('The image request changed or could not be decoded','EncodingError');},
@@ -652,7 +874,8 @@
         nodeProtos:[Node.prototype,HTMLDocument.prototype,Element.prototype,HTMLElement.prototype,
             Text.prototype,Comment.prototype,DocumentFragment.prototype,HTMLIFrameElement.prototype,HTMLImageElement.prototype,
             HTMLInputElement.prototype,HTMLButtonElement.prototype,HTMLSelectElement.prototype,HTMLTextAreaElement.prototype,
-            HTMLFieldSetElement.prototype,HTMLObjectElement.prototype,HTMLOutputElement.prototype,HTMLOptionElement.prototype,HTMLTemplateElement.prototype,DocumentType.prototype],
+            HTMLFieldSetElement.prototype,HTMLObjectElement.prototype,HTMLOutputElement.prototype,HTMLOptionElement.prototype,HTMLTemplateElement.prototype,DocumentType.prototype,
+            HTMLScriptElement.prototype,HTMLFormElement.prototype,HTMLAnchorElement.prototype,HTMLAreaElement.prototype,...svgBridge.nodeProtos,ProcessingInstruction.prototype],
         dispatch(target,type,init){const C=/^(key)/.test(type)?KeyboardEvent:/^(mouse|click|dblclick)/.test(type)?MouseEvent:Event;const e=new C(type,init);Object.assign(e,init);e.isTrusted=true;return dispatch(target===null?globalThis:target,e);},
         response(status,url,raw,text,bytes,redirected){const headers=new Headers();for(const line of raw.split(/\r?\n/)){const i=line.indexOf(':');if(i>0){const k=line.slice(0,i);if(!/^set-cookie2?$/i.test(k))headers.append(k,line.slice(i+1));}}return new Response(text,{status,url,headers,bytes,redirected});},
         reject(message,abort){return abort?new DOMException(message,'AbortError'):new TypeError(message);}

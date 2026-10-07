@@ -2,12 +2,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <errno.h>
 #include "nocturne.h"
 
 #define HDR      16
 #define USED     1
 #define MIN_BLK  32
 #define GROW_MIN (256 * 1024)
+#define TRIM_KEEP GROW_MIN
+#define TRIM_MIN  GROW_MIN
 
 typedef struct blk {
     size_t size; /* including header; bit0 = used */
@@ -55,6 +58,25 @@ static blk *coalesce(blk *b) {
     }
     next_blk(b)->prev = bsize(b);
     return b;
+}
+
+static void trim_top(blk *b) {
+    size_t size = bsize(b);
+    /* Keep one normal growth quantum warm. Interior/small frees make no syscall;
+       a live tail or a different allocator's break must never be reclaimed. */
+    if (size < TRIM_KEEP + TRIM_MIN || next_blk(b) != sentinel) return;
+    size_t release = (size - TRIM_KEEP) & ~(size_t)4095;
+    char *end = (char *)sentinel + HDR;
+    int saved_errno = errno;
+    if (sbrk(0) == end && sbrk(-(long)release) == end) {
+        /* Do not touch the old sentinel after its page may have been returned.
+           Publish new tags only after the atomic native shrink succeeds. */
+        b->size = size - release;
+        sentinel = next_blk(b);
+        sentinel->size = USED;
+        sentinel->prev = bsize(b);
+    }
+    errno = saved_errno;
 }
 
 static int heap_init(void) {
@@ -127,6 +149,7 @@ void free(void *p) {
     blk *b = (blk *)((char *)p - HDR);
     b->size &= ~(size_t)USED;
     b = coalesce(b);
+    trim_top(b);
     fl_push((fblk *)b);
 }
 
@@ -150,9 +173,20 @@ void *realloc(void *p, size_t n) {
     blk *nx = next_blk(b);
     size_t need = (n + HDR + 15) & ~(size_t)15;
     if (!(nx->size & USED) && bsize(b) + bsize(nx) >= need) {
+        size_t total = bsize(b) + bsize(nx), rest = total - need;
         fl_remove((fblk *)nx);
-        b->size = (bsize(b) + bsize(nx)) | USED;
-        next_blk(b)->prev = bsize(b);
+        /* Growing a small buffer must not pin its entire adjacent free hole. */
+        if (rest >= MIN_BLK) {
+            b->size = need | USED;
+            blk *r = next_blk(b);
+            r->size = rest;
+            r->prev = need;
+            next_blk(r)->prev = rest;
+            fl_push((fblk *)r);
+        } else {
+            b->size = total | USED;
+            next_blk(b)->prev = total;
+        }
         return p;
     }
     void *q = malloc(n);

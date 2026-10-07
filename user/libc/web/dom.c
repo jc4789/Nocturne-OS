@@ -1,19 +1,31 @@
 /* Mutable nodes belong to the document, not to the layout or to a JS wrapper.
    Detached nodes stay valid until web_free; all mutation allocations are bounded. */
 #include <stdio.h>
+#include "nocturne.h"
 #include "webi.h"
 
 #define DOM_MAX_DEPTH 400
 
 static void indices(node_t *p) {
+    web_doc *d = p->owner;
+    if (d && d->dom_family) d = d->dom_family;
+    uint64_t start = uptime_ms(), visited = 0;
     int i = 0;
-    for (node_t *c = p->first; c; c = c->next)
+    for (node_t *c = p->first; c; c = c->next) {
+        visited++;
         if (c->type == N_ELEM) c->elem_index = ++i;
+    }
+    if (d) { d->profile.index_visits += visited; d->profile.index_ms += uptime_ms() - start; }
 }
 
 static bool under(node_t *n, node_t *ancestor) {
     for (; n; n = n->parent) if (n == ancestor) return true;
     return false;
+}
+
+static void textarea_changed(node_t *n) {
+    for (; n; n = n->parent)
+        if (n->type == N_ELEM && !n->foreign && n->tag == T_textarea && !n->value_dirty) n->control_ready = false;
 }
 
 static void changed(web_doc *d, node_t *n, bool resources) {
@@ -24,6 +36,7 @@ static void changed(web_doc *d, node_t *n, bool resources) {
     d->find_node = NULL;
     d->find_run = NULL;
     if (n) n->resource_revision++;
+    textarea_changed(n);
     /* SVG cache source and the box tree are snapshots, not a second DOM. */
     for (int i = 0; i < d->svgs.n; i++) {
         struct svg_cache *s = d->svgs.v[i];
@@ -35,9 +48,46 @@ static void changed(web_doc *d, node_t *n, bool resources) {
 }
 void doc_mutated(web_doc *d, node_t *n) { changed(d, n, true); }
 
+/* XML 1.0 Name, required by the DOM PI creation APIs. HTML tokenization has
+   its own narrower target rules; never normalize a DOM-created PI target. */
+static bool xml_name_start(uint32_t c) {
+    return c == ':' || c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= 0xc0 && c <= 0xd6) || (c >= 0xd8 && c <= 0xf6) || (c >= 0xf8 && c <= 0x2ff) ||
+        (c >= 0x370 && c <= 0x37d) || (c >= 0x37f && c <= 0x1fff) || (c >= 0x200c && c <= 0x200d) ||
+        (c >= 0x2070 && c <= 0x218f) || (c >= 0x2c00 && c <= 0x2fef) || (c >= 0x3001 && c <= 0xd7ff) ||
+        (c >= 0xf900 && c <= 0xfdcf) || (c >= 0xfdf0 && c <= 0xfffd) || (c >= 0x10000 && c <= 0xeffff);
+}
+bool doc_pi_target_valid(const char *target, size_t len) {
+    if (!target || !len) return false;
+    size_t i = 0;
+    bool first = true;
+    while (i < len) {
+        uint32_t c = (unsigned char)target[i++], min = 0;
+        unsigned extra = 0;
+        if (c >= 0xc2 && c <= 0xdf) { c &= 0x1f; extra = 1; min = 0x80; }
+        else if (c >= 0xe0 && c <= 0xef) { c &= 0x0f; extra = 2; min = 0x800; }
+        else if (c >= 0xf0 && c <= 0xf4) { c &= 7; extra = 3; min = 0x10000; }
+        else if (c >= 0x80) return false;
+        if (extra > len - i) return false;
+        while (extra--) {
+            unsigned char tail = (unsigned char)target[i++];
+            if ((tail & 0xc0) != 0x80) return false;
+            c = (c << 6) | (tail & 0x3f);
+        }
+        if (c < min || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff)) return false;
+        bool valid = xml_name_start(c);
+        if (!first) valid = valid || c == '-' || c == '.' || (c >= '0' && c <= '9') || c == 0xb7 ||
+            (c >= 0x300 && c <= 0x36f) || (c >= 0x203f && c <= 0x2040);
+        if (!valid) return false;
+        first = false;
+    }
+    return true;
+}
+
 node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t len) {
-    if (!d || type < N_DOC || type > N_DOCTYPE || len > (16u << 20)) return NULL;
+    if (!d || type < N_DOC || type > N_PI || len > (16u << 20)) return NULL;
     if (type == N_ELEM && (!name || !*name || strlen(name) >= 64)) return NULL;
+    if (type == N_PI && (!name || !doc_pi_target_valid(name, strlen(name)))) return NULL;
     doc_dom_budget(d);
     jmp_buf trap;
     jmp_buf *old = d->mem.trap;
@@ -59,7 +109,8 @@ node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text
         n->raw_name = ar_strdup(&d->mem, name);
     } else if (type == N_DOCTYPE) {
         n->name = ar_strdup(&d->mem, name ? name : "html");
-    } else if (type == N_TEXT || type == N_COMMENT) {
+    } else if (type == N_TEXT || type == N_COMMENT || type == N_PI) {
+        if (type == N_PI) n->name = ar_strdup(&d->mem, name);
         n->text = ar_strndup(&d->mem, text ? text : "", text ? len : 0);
         n->textlen = text ? len : 0;
     }
@@ -72,6 +123,13 @@ static void attribute_cache(web_doc *d, node_t *n) {
     n->classes = NULL;
     n->nclasses = 0;
     const char *id = node_attr(n, "id"), *classes = node_attr(n, "class");
+    if (n->foreign) {
+        id = classes = NULL;
+        for (int i = 0; i < n->nattrs; i++) {
+            if (!strcmp(n->attrs[i].raw, "id")) id = n->attrs[i].value;
+            if (!strcmp(n->attrs[i].raw, "class")) classes = n->attrs[i].value;
+        }
+    }
     if (id && *id) n->id = id;
     if (!classes) return;
     int count = 0;
@@ -101,7 +159,8 @@ bool doc_node_attr(web_doc *d, node_t *n, const char *name, const char *value) {
     low[l] = 0;
     bool previously_selectable = doc_control_selection_supported(n);
     int found = -1;
-    for (int i = 0; i < n->nattrs; i++) if (!strcmp(n->attrs[i].name, low)) { found = i; break; }
+    for (int i = 0; i < n->nattrs; i++)
+        if (n->foreign ? !strcmp(n->attrs[i].raw, name) : !strcmp(n->attrs[i].name, low)) { found = i; break; }
     if (found < 0 && !value) return true;
     bool resources = n->tag == T_base || n->tag == T_link || n->tag == T_style ||
                      n->tag == T_img || n->tag == T_input || n->tag == T_meta;
@@ -167,6 +226,7 @@ static void detach(node_t *n) {
     if (n->next) n->next->prev = n->prev; else p->last = n->prev;
     n->parent = n->prev = n->next = NULL;
     indices(p);
+    textarea_changed(p);
 }
 
 static int tree_depth(node_t *n, int depth) {
@@ -199,6 +259,7 @@ static bool may_insert(node_t *p, node_t *c) {
 
 bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
     if (!d || !p || !c || (before && before->parent != p)) return false;
+    (d->dom_family ? d->dom_family : d)->profile.inserts++;
     if (before == c) return true;
     if (c->type == N_FRAGMENT) {
         int elements = 0;
@@ -236,6 +297,10 @@ static void adopt_subtree(web_doc *d, node_t *n) {
     n->style = NULL; n->box = n->anchor_block = NULL;
     n->image = -1; n->image_request = -1; n->image_initialized = false;
     n->image_generation++;
+    /* Adoption is an image-data mutation even without a later insertion or
+       getter. Keep allocation ownership untouched; schedule the live scan. */
+    if (!d->inert && n->type == N_ELEM && !n->foreign && n->tag == T_img)
+        d->resources_dirty = d->dirty = d->need_style = true;
     for (node_t *c = n->first; c; c = c->next) adopt_subtree(d, c);
     if (n->template_content) {
         web_doc *owner = d->template_owner ? d : d->template_doc;
@@ -299,7 +364,7 @@ bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
     if (!d || !n || len > (16u << 20)) return false;
     if (n->type == N_DOC || n->type == N_DOCTYPE) return true;
     doc_dom_budget(d);
-    if (n->type == N_TEXT || n->type == N_COMMENT) {
+    if (n->type == N_TEXT || n->type == N_COMMENT || n->type == N_PI) {
         jmp_buf trap;
         jmp_buf *old = d->mem.trap;
         d->mem.trap = &trap;
@@ -373,6 +438,7 @@ node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
     node_t *c = doc_node_create(d, n->type, n->raw_name ? n->raw_name : n->name, n->text, n->textlen);
     if (!c) return NULL;
     c->foreign = n->foreign;
+    c->namespace_id = n->namespace_id;
     if (n->type == N_DOCTYPE) {
         /* Doctype strings are arena-owned like ordinary attributes. */
         jmp_buf trap; jmp_buf *old = d->mem.trap; d->mem.trap = &trap;

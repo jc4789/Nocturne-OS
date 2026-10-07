@@ -70,6 +70,7 @@ struct pctx {
     const char *base;
     pvec *imports;
     int nimports;
+    bool supports_probe; /* reject accepted-but-unimplemented selector fallbacks */
 };
 
 /* ---------------------------------------------------------------- scanning */
@@ -142,10 +143,12 @@ static const char *read_ident(arena_t *a, const char **ps, const char *e, bool l
     const char *s = *ps;
     char buf[256];
     size_t n = 0;
+    bool truncated = false;
     while (s < e) {
         unsigned char c = (unsigned char)*s;
         if (ident_char(c)) {
             if (n < sizeof buf - 1) buf[n++] = lowercase ? (char)lower(c) : (char)c;
+            else truncated = true;
             s++;
         } else if (c == '\\' && s + 1 < e && s[1] != '\n') {
             s++;
@@ -158,16 +161,20 @@ static const char *read_ident(arena_t *a, const char **ps, const char *e, bool l
                     s++, k++;
                 }
                 if (s < e && is_space((unsigned char)*s)) s++;
+                if (!cp || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = 0xfffd;
+                if (lowercase && cp < 128) cp = (uint32_t)lower((int)cp);
                 char u[4];
                 int ul = utf8_put(u, cp ? cp : 0xFFFD);
-                if (n + (size_t)ul < sizeof buf - 1) memcpy(buf + n, u, (size_t)ul), n += (size_t)ul;
+                if (n + (size_t)ul < sizeof buf) memcpy(buf + n, u, (size_t)ul), n += (size_t)ul;
+                else truncated = true;
             } else {
-                if (n < sizeof buf - 1) buf[n++] = *s;
+                if (n < sizeof buf - 1) buf[n++] = lowercase ? (char)lower((unsigned char)*s) : *s;
+                else truncated = true;
                 s++;
             }
         } else break;
     }
-    if (!n) return NULL;
+    if (!n || truncated) return NULL;
     *ps = s;
     return ar_strndup(a, buf, n);
 }
@@ -247,17 +254,23 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
     struct simple tmp[32];
     int n = 0;
     const char *s = *ps;
+    bool type_seen = false;
     while (s < e && n < 32) {
         char c = *s;
         struct simple *x = &tmp[n];
         memset(x, 0, sizeof *x);
         if (*pseudo && c != ':') return NULL; /* nothing may follow a pseudo-element but pseudo-classes */
         if (c == '*') {
+            if (pc->supports_probe && (type_seen || n)) return NULL;
+            type_seen = true;
             s++;
             if (s < e && *s == '|') return NULL;
             continue;
         }
         if (ident_char((unsigned char)c) || c == '\\') {
+            if (pc->supports_probe && (type_seen || isdigit((unsigned char)c) ||
+                (c == '-' && s + 1 < e && isdigit((unsigned char)s[1])))) return NULL;
+            type_seen = true;
             if (n) return NULL;
             const char *name = read_ident(pc->a, &s, e, true);
             if (!name || (s < e && *s == '|')) return NULL;
@@ -270,6 +283,8 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
         }
         if (c == '#' || c == '.') {
             s++;
+            if (pc->supports_probe && s < e && (isdigit((unsigned char)*s) ||
+                (*s == '-' && s + 1 < e && isdigit((unsigned char)s[1])))) return NULL;
             const char *name = read_ident(pc->a, &s, e, false);
             if (!name) return NULL;
             x->kind = c == '#' ? SK_ID : SK_CLASS;
@@ -347,6 +362,7 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
                 else if (!strcmp(name, "after")) *pseudo = PE_AFTER;
                 else if (!strncmp(name, "-webkit-", 8) || !strncmp(name, "-moz-", 5) || !strncmp(name, "-ms-", 4))
                     return NULL;
+                else if (pc->supports_probe) return NULL;
                 else *pseudo = PE_OTHER;
                 *spec = spec_add(*spec, SPEC_C);
                 continue;
@@ -356,14 +372,16 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
                 if (!strcmp(name, "not") || !strcmp(name, "is") || !strcmp(name, "where") ||
                     !strcmp(name, "matches") || !strcmp(name, "-webkit-any") || !strcmp(name, "-moz-any") ||
                     !strcmp(name, "any")) {
-                    bool forgiving = strcmp(name, "not") != 0;
+                    bool forgiving = !pc->supports_probe && strcmp(name, "not") != 0;
                     x->args = parse_sellist(pc, args, args_end, forgiving);
                     if (!x->args) return NULL;
                     x->pc = !strcmp(name, "not") ? PC_NOT : PC_IS;
                     if (strcmp(name, "where")) *spec = spec_add(*spec, sellist_max_spec(x->args));
                 } else if (!strcmp(name, "has")) {
+                    if (pc->supports_probe) return NULL;
                     x->pc = PC_NEVER;
                 } else if (!strncmp(name, "nth-", 4)) {
+                    if (pc->supports_probe && args_end - args >= 64) return NULL;
                     static const char *const nth[] = {"nth-child", "nth-last-child", "nth-of-type", "nth-last-of-type"};
                     static const uint8_t nthpc[] = {PC_NTH_CHILD, PC_NTH_LAST_CHILD, PC_NTH_OF_TYPE, PC_NTH_LAST_OF_TYPE};
                     int k = 0;
@@ -373,6 +391,7 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
                     const char *ae = args_end;
                     for (const char *q = args; q + 3 < ae; q++) /* "An+B of S": the S is ignored */
                         if (is_space((unsigned char)q[0]) && strn_ieq(q + 1, "of", 2) && is_space((unsigned char)q[3])) {
+                            if (pc->supports_probe) return NULL;
                             ae = q;
                             break;
                         }
@@ -387,11 +406,13 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
                     x->value = ar_strndup(pc->a, p, (size_t)(ve > p ? ve - p : 0));
                     *spec = spec_add(*spec, SPEC_B);
                 } else if (!strcmp(name, "dir")) {
+                    if (pc->supports_probe) return NULL;
                     const char *p = skip_ws(args, args_end);
                     x->pc = strn_ieq(p, "ltr", 3) ? PC_ALWAYS : PC_NEVER;
                     *spec = spec_add(*spec, SPEC_B);
                 } else if (!strcmp(name, "host") || !strcmp(name, "host-context") || !strcmp(name, "state") ||
                            !strcmp(name, "active-view-transition-type")) {
+                    if (pc->supports_probe) return NULL;
                     x->pc = PC_NEVER;
                 } else return NULL;
                 n++;
@@ -401,6 +422,7 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
             while (k < sizeof simple_pcs / sizeof *simple_pcs && strcmp(simple_pcs[k].name, name)) k++;
             if (k == sizeof simple_pcs / sizeof *simple_pcs) return NULL;
             x->pc = simple_pcs[k].pc;
+            if (pc->supports_probe && (x->pc == PC_NEVER || x->pc == PC_ALWAYS || !strcmp(name, "scope"))) return NULL;
             *spec = spec_add(*spec, SPEC_B);
             n++;
             continue;
@@ -434,7 +456,7 @@ static struct selector *parse_complex(struct pctx *pc, const char *s, const char
             pending = *s++;
             continue;
         }
-        if (sel->pseudo) return NULL;
+        if (sel->pseudo || (pc->supports_probe && cur && !pending)) return NULL;
         struct compound *c = parse_compound(pc, &s, e, &sel->spec, &sel->pseudo);
         if (!c) return NULL;
         c->left = cur;
@@ -448,6 +470,11 @@ static struct selector *parse_complex(struct pctx *pc, const char *s, const char
 }
 
 static struct sellist *parse_sellist(struct pctx *pc, const char *s, const char *e, bool forgiving) {
+    if (pc->supports_probe) {
+        const char *last = e;
+        trim_r(s, &last);
+        if (last == s || last[-1] == ',') return NULL;
+    }
     struct selector *tmp[64];
     int n = 0;
     while (s < e) {
@@ -455,6 +482,7 @@ static struct sellist *parse_sellist(struct pctx *pc, const char *s, const char 
         struct selector *x = parse_complex(pc, s, c);
         if (x) {
             if (n < 64) tmp[n++] = x;
+            else if (pc->supports_probe) return NULL;
         } else if (!forgiving) return NULL;
         s = c < e ? c + 1 : e;
     }
@@ -689,6 +717,289 @@ bool css_matches(node_t *node, const char *selector, bool *valid) {
     return matched;
 }
 
+/* ---------------------------------------------------------------- feature queries
+   The same evaluator serves CSS.supports and @supports. Invalid syntax is kept
+   separate from unsupported features, so `not` cannot turn a parse error true.
+   Scratch arenas and bounded input/depth make queries independent of the DOM. */
+#define SUPPORTS_MAX 65536u
+#define SUPPORTS_DEPTH 32
+struct supports_result { bool valid, value; };
+
+/* Validate component values, remove comments, and preserve strings/escapes.
+   Unlike the stylesheet recovery parser, a query must consume the whole input. */
+static char *supports_clean(arena_t *a, const char *s, size_t n, size_t *out) {
+    if (!s || n > SUPPORTS_MAX) return NULL;
+    char stack[SUPPORTS_DEPTH], quote = 0;
+    int depth = 0;
+    char *b = ar_alloc(a, n + 1);
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (!c || c == 0x7f || (c < 32 && !is_space(c))) return NULL;
+        if (c == '\\') {
+            if (i + 1 == n) return NULL;
+            if (!s[i + 1] || (unsigned char)s[i + 1] == 0x7f ||
+                ((unsigned char)s[i + 1] < 32 && !is_space((unsigned char)s[i + 1]))) return NULL;
+            if (!quote && (s[i + 1] == '\n' || s[i + 1] == '\r' || s[i + 1] == '\f')) return NULL;
+            b[k++] = (char)c;
+            b[k++] = s[++i];
+            continue;
+        }
+        if (quote) {
+            if (c == '\n' || c == '\r' || c == '\f') return NULL;
+            if (c == (unsigned char)quote) quote = 0;
+        } else if (c == '"' || c == '\'') quote = (char)c;
+        else if (c == '/' && i + 1 < n && s[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < n && !(s[i] == '*' && s[i + 1] == '/')) i++;
+            if (i + 1 >= n) return NULL;
+            i++;
+            b[k++] = ' ';
+            continue;
+        } else if (c == '(' || c == '[' || c == '{') {
+            if (depth == SUPPORTS_DEPTH) return NULL;
+            stack[depth++] = c == '(' ? ')' : c == '[' ? ']' : '}';
+        } else if (c == ')' || c == ']' || c == '}') {
+            if (!depth || c != (unsigned char)stack[--depth]) return NULL;
+        }
+        b[k++] = (char)c;
+    }
+    if (depth || quote) return NULL;
+    b[k] = 0;
+    *out = k;
+    return b;
+}
+
+/* Find a top-level delimiter; input was already balanced by supports_clean. */
+static const char *supports_delim(const char *s, const char *e, const char *delims) {
+    int depth = 0;
+    char q = 0;
+    for (; s < e; s++) {
+        char c = *s;
+        if (c == '\\') { if (s + 1 < e) s++; continue; }
+        if (q) { if (c == q) q = 0; continue; }
+        if (c == '"' || c == '\'') { q = c; continue; }
+        if (!depth && strchr(delims, c)) return s;
+        if (c == '(' || c == '[' || c == '{') depth++;
+        else if (c == ')' || c == ']' || c == '}') depth--;
+    }
+    return e;
+}
+
+static bool supports_custom_name(const char *s, size_t n) {
+    if (n <= 2 || s[0] != '-' || s[1] != '-') return false;
+    for (size_t i = 2; i < n; i++) if (!ident_char((unsigned char)s[i])) return false;
+    return true;
+}
+
+/* A var() declaration is deferred by the existing substitution engine, not
+   parsed as its fallback alone. Invalid variable references must still fail.
+   Strings are not scanned as functions. env() is not advertised: its current
+   substitution fallback is not an environment-variable implementation. */
+static bool supports_vars(arena_t *a, const char *s, const char *e, bool *has, int depth) {
+    if (depth > SUPPORTS_DEPTH) return false;
+    while (s < e) {
+        /* Hash/at-keyword tokens consume their name: #var( and @var( are not
+           var() function tokens. An actual function inside a later block is
+           still visited by the normal component-value scan. */
+        if ((*s == '#' || *s == '@') && s + 1 < e &&
+            (ident_char((unsigned char)s[1]) || s[1] == '\\')) {
+            s++;
+            if (!read_ident(a, &s, e, false)) return false;
+            continue;
+        }
+        if (*s == '"' || *s == '\'') {
+            char q = *s++;
+            while (s < e && *s != q) { if (*s == '\\') s++; s++; }
+            if (s < e) s++;
+            continue;
+        }
+        if (ident_char((unsigned char)*s) || *s == '\\') {
+            const char *st = s;
+            const char *name = read_ident(a, &s, e, true);
+            if (!name || s == st) return false;
+            if (s < e && *s == '(') {
+                const char *end = supports_delim(s + 1, e, ")");
+                if (end == e) return false;
+                if (!strcmp(name, "url")) {
+                    const char *q = skip_ws(s + 1, end);
+                    if (q < end && (*q == '"' || *q == '\'')) {
+                        char quote = *q++;
+                        while (q < end && *q != quote) { if (*q == '\\' && q + 1 < end) q++; q++; }
+                        if (q == end || skip_ws(q + 1, end) != end) return false;
+                    } else {
+                        for (; q < end; q++) {
+                            if (*q == '\\') { if (++q == end) return false; continue; }
+                            if (is_space((unsigned char)*q)) { if (skip_ws(q, end) != end) return false; break; }
+                            if (*q == '(' || *q == '"' || *q == '\'') return false;
+                        }
+                    }
+                    /* An unquoted URL is one URL token, not nested functions;
+                       a quoted URL is a literal string, not a var reference. */
+                    s = end + 1;
+                    continue;
+                }
+                if (!strcmp(name, "env")) return false;
+                if (!strcmp(name, "var")) {
+                    const char *comma = supports_delim(s + 1, end, ",");
+                    const char *p = skip_ws(s + 1, comma), *pe = comma;
+                    trim_r(p, &pe);
+                    const char *id = read_ident(a, &p, pe, false);
+                    if (p != pe || !id || !supports_custom_name(id, strlen(id))) return false;
+                    *has = true;
+                    if (comma < end && !supports_vars(a, comma + 1, end, has, depth + 1)) return false;
+                } else if (!supports_vars(a, s + 1, end, has, depth + 1)) return false;
+                s = end + 1;
+            }
+        } else s++;
+    }
+    return true;
+}
+
+static bool supports_decl(arena_t *a, const char *property, size_t pn, const char *v, size_t vn) {
+    if (!property || !pn || pn > 255 || memchr(property, 0, pn)) return false;
+    bool custom = supports_custom_name(property, pn);
+    const struct propdef *p = custom ? NULL : css_prop_lookup(property, pn);
+    if (!custom && !p) return false;
+    v = css_value_canonical(a, v, vn, &vn);
+    while (vn && is_space((unsigned char)*v)) v++, vn--;
+    while (vn && is_space((unsigned char)v[vn - 1])) vn--;
+    if (supports_delim(v, v + vn, ";!") != v + vn) return false;
+    if (!custom && supports_delim(v, v + vn, "{}") != v + vn) return false;
+    bool has = false;
+    if (!supports_vars(a, v, v + vn, &has, 0)) return false;
+    if (custom) return true;
+    if (!vn) return false;
+    return has || css_value_supported(p, v, vn);
+}
+
+bool css_supports_declaration(const char *property, size_t pn, const char *value, size_t vn) {
+    if (!property || !value || pn > SUPPORTS_MAX || vn > SUPPORTS_MAX) return false;
+    arena_t *a = calloc(1, sizeof *a);
+    if (!a) return false;
+    a->limit = 1u << 20;
+    jmp_buf trap;
+    a->trap = &trap;
+    if (setjmp(trap)) { ar_free(a); free(a); return false; }
+    size_t n;
+    char *v = supports_clean(a, value, vn, &n);
+    bool result = v && supports_decl(a, property, pn, v, n);
+    ar_free(a);
+    free(a);
+    return result;
+}
+
+static struct supports_result supports_expr(arena_t *a, const char *s, const char *e, int depth);
+static struct supports_result supports_paren(arena_t *a, const char **ps, const char *e, int depth) {
+    struct supports_result bad = {false, false};
+    const char *s = skip_ws(*ps, e);
+    if (s == e || depth > SUPPORTS_DEPTH) return bad;
+    if (*s != '(') {
+        const char *name = read_ident(a, &s, e, true);
+        if (!name || s == e || *s != '(') return bad;
+        const char *end = supports_delim(s + 1, e, ")");
+        if (end == e) return bad;
+        *ps = end + 1;
+        if (!strcmp(name, "selector")) {
+            struct pctx pc = {.a = a, .supports_probe = true};
+            /* selector() is one complex selector, not a selector list. */
+            bool yes = supports_delim(s + 1, end, ",") == end && parse_complex(&pc, s + 1, end) != NULL;
+            return (struct supports_result){true, yes};
+        }
+        return (struct supports_result){true, false}; /* general-enclosed function */
+    }
+    const char *end = supports_delim(s + 1, e, ")");
+    if (end == e) return bad;
+    *ps = end + 1;
+    const char *p = skip_ws(s + 1, end), *pe = end;
+    trim_r(p, &pe);
+    if (p == pe) return bad;
+    const char *colon = supports_delim(p, pe, ":");
+    if (colon < pe) {
+        const char *ne = colon;
+        trim_r(p, &ne);
+        const char *name = read_ident(a, &p, ne, false);
+        if (!name || p != ne) return bad;
+        const char *v = skip_ws(colon + 1, pe);
+        if (supports_delim(v, pe, ";") != pe) return bad;
+        const char *bang = supports_delim(v, pe, "!");
+        if (bang < pe) {
+            const char *q = skip_ws(bang + 1, pe);
+            const char *important = read_ident(a, &q, pe, true);
+            if (!important || strcmp(important, "important") || skip_ws(q, pe) != pe) return bad;
+            pe = bang;
+        }
+        return (struct supports_result){true, supports_decl(a, name, strlen(name), v, (size_t)(pe - v))};
+    }
+    struct supports_result nested = supports_expr(a, p, pe, depth + 1);
+    if (nested.valid) return nested;
+    /* Reserved logical syntax is malformed, not an unknown feature whose
+       negation could accidentally become true. Other component values are
+       general-enclosed and evaluate false. */
+    const char *q = p;
+    const char *name = read_ident(a, &q, pe, true);
+    if (*p == '(' || (name && (!strcmp(name, "not") || !strcmp(name, "and") || !strcmp(name, "or")))) return bad;
+    return (struct supports_result){true, false};
+}
+
+static struct supports_result supports_expr(arena_t *a, const char *s, const char *e, int depth) {
+    struct supports_result bad = {false, false};
+    if (depth > SUPPORTS_DEPTH) return bad;
+    s = skip_ws(s, e);
+    trim_r(s, &e);
+    const char *p = s;
+    const char *word = read_ident(a, &p, e, true);
+    if (word && !strcmp(word, "not")) {
+        if (p == e || !is_space((unsigned char)*p)) return bad;
+        struct supports_result r = supports_paren(a, &p, e, depth + 1);
+        if (!r.valid || skip_ws(p, e) != e) return bad;
+        r.value = !r.value;
+        return r;
+    }
+    p = s;
+    struct supports_result r = supports_paren(a, &p, e, depth + 1);
+    if (!r.valid) return bad;
+    int op = 0;
+    while ((p = skip_ws(p, e)) < e) {
+        word = read_ident(a, &p, e, true);
+        int next = word && !strcmp(word, "and") ? 1 : word && !strcmp(word, "or") ? 2 : 0;
+        if (!next || (op && op != next) || p == e || !is_space((unsigned char)*p)) return bad;
+        op = next;
+        struct supports_result term = supports_paren(a, &p, e, depth + 1);
+        if (!term.valid) return bad; /* no boolean short-circuit of validation */
+        r.value = op == 1 ? r.value && term.value : r.value || term.value;
+    }
+    return r;
+}
+
+bool css_supports_condition(const char *condition, size_t n, bool implied_parens) {
+    if (!condition || n > SUPPORTS_MAX) return false;
+    arena_t *a = calloc(1, sizeof *a);
+    if (!a) return false;
+    a->limit = 1u << 20;
+    jmp_buf trap;
+    a->trap = &trap;
+    if (setjmp(trap)) { ar_free(a); free(a); return false; }
+    size_t len;
+    char *s = supports_clean(a, condition, n, &len);
+    bool result = false;
+    if (s) {
+        struct supports_result r = supports_expr(a, s, s + len, 0);
+        result = r.valid && r.value;
+        if (!result && implied_parens) {
+            char *wrapped = ar_alloc(a, len + 3);
+            wrapped[0] = '(';
+            memcpy(wrapped + 1, s, len);
+            wrapped[len + 1] = ')'; wrapped[len + 2] = 0;
+            r = supports_expr(a, wrapped, wrapped + len + 2, 0);
+            result = r.valid && r.value;
+        }
+    }
+    ar_free(a);
+    free(a);
+    return result;
+}
+
 /* ---------------------------------------------------------------- parsing stylesheets */
 /* a declaration value with its url()s made absolute against the stylesheet's URL */
 static char *absolute_urls(struct pctx *pc, const char *v, const char *ve) {
@@ -738,6 +1049,14 @@ static struct decl *parse_decl(struct pctx *pc, const char *s, const char *e, st
     const char *ne = colon;
     trim_r(s, &ne);
     if (ne <= s) return NULL;
+    const char *name = s;
+    size_t namelen = (size_t)(ne - s);
+    if (memchr(s, '\\', namelen)) {
+        const char *p = s;
+        name = read_ident(pc->a, &p, ne, false);
+        if (!name || p != ne) return NULL;
+        namelen = strlen(name);
+    }
     const char *v = skip_ws(colon + 1, e);
     const char *ve = e;
     memset(d, 0, sizeof *d);
@@ -752,12 +1071,15 @@ static struct decl *parse_decl(struct pctx *pc, const char *s, const char *e, st
             trim_r(v, &ve);
         }
     }
-    if (ne - s > 2 && s[0] == '-' && s[1] == '-') {
-        d->name = ar_strndup(pc->a, s, (size_t)(ne - s));
-        d->value = ar_strndup(pc->a, v, (size_t)(ve - v));
+    size_t vn = (size_t)(ve - v);
+    v = css_value_canonical(pc->a, v, vn, &vn);
+    ve = v + vn;
+    if (namelen > 2 && name[0] == '-' && name[1] == '-') {
+        d->name = ar_strndup(pc->a, name, namelen);
+        d->value = ar_strndup(pc->a, v, vn);
         return d;
     }
-    d->p = css_prop_lookup(s, (size_t)(ne - s));
+    d->p = css_prop_lookup(name, namelen);
     if (!d->p || ve <= v) return NULL;
     d->value = absolute_urls(pc, v, ve);
     return d;
@@ -826,7 +1148,7 @@ static void parse_body(struct pctx *pc, const char *s, const char *e, const char
                         mc->up = media;
                         m = mc;
                     }
-                    if (strcmp(name, "supports") || !strn_ieq(qs, "not", 3)) {
+                    if (strcmp(name, "supports") || css_supports_condition(qs, (size_t)(p - qs), false)) {
                         static const char amp[] = "&";
                         parse_style_rule(pc, amp, amp + 1, p + 1, be, m, sel);
                     }
@@ -927,7 +1249,7 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
                     mc->up = media;
                     parse_rules(pc, p + 1, be, mc);
                 } else if (!strcmp(name, "supports")) {
-                    if (!strn_ieq(qs, "not", 3)) parse_rules(pc, p + 1, be, media);
+                    if (css_supports_condition(qs, (size_t)(p - qs), false)) parse_rules(pc, p + 1, be, media);
                 } else if (!strcmp(name, "layer") || !strcmp(name, "container") || !strcmp(name, "scope") ||
                            !strcmp(name, "document") || !strcmp(name, "-moz-document")) {
                     parse_rules(pc, p + 1, be, media);
@@ -990,7 +1312,7 @@ static char *strip_comments(arena_t *a, const char *css, size_t n, size_t *out_n
 }
 
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
-    struct pctx pc = {a, NULL, base_url, imports, 0};
+    struct pctx pc = {a, NULL, base_url, imports, 0, false};
     pc.sh = ar_alloc(a, sizeof(sheet_t));
     pc.sh->order = order;
     size_t cn;
@@ -1560,6 +1882,14 @@ static bool subst(const char *s, size_t n, const struct custom_prop *vars, sbuf 
     if (depth > 16) return false;
     size_t i = 0;
     while (i < n) {
+        if (s[i] == '"' || s[i] == '\'') {
+            size_t start = i;
+            char quote = s[i++];
+            while (i < n && s[i] != quote) { if (s[i] == '\\' && i + 1 < n) i++; i++; }
+            if (i < n) i++;
+            sb_put(out, s + start, i - start);
+            continue;
+        }
         bool is_var = i + 4 <= n && strn_ieq(s + i, "var(", 4) && (i == 0 || !ident_char((unsigned char)s[i - 1]));
         bool is_env = !is_var && i + 4 <= n && strn_ieq(s + i, "env(", 4) && (i == 0 || !ident_char((unsigned char)s[i - 1]));
         if (!is_var && !is_env) {
@@ -1640,7 +1970,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     }
     memset(setbits, 0, (size_t)css_prop_count());
     struct cx cx = {s, parent, e, parent ? parent->font_size : 16, c->rem, (float)c->vw, (float)c->vh,
-                    &d->smem, setbits, true};
+                    &d->smem, setbits, true, false, false, 0};
     for (int i = 0; i < ndents; i++)
         if (dents[i].pseudo == pseudo && dents[i].d->p && css_prop_is_font(dents[i].d->p)) apply_decl(c, &cx, dents[i].d);
     cx.font_pass = false;
@@ -1683,7 +2013,7 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     for (int i = 0; i < h.n; i++) add_dent(&h.d[i], 1ull << 62, PE_NONE);
     const char *sa = node_attr(e, "style");
     if (sa && *sa) {
-        struct pctx pc = {&d->smem, NULL, d->base, NULL, 0};
+        struct pctx pc = {&d->smem, NULL, d->base, NULL, 0, false};
         struct decl *ds;
         int nd;
         parse_body(&pc, sa, sa + strlen(sa), NULL, NULL, &ds, &nd);

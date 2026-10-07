@@ -50,6 +50,18 @@ BRFLAGS  := $(filter-out -W% -MMD -MP,$(UCFLAGS)) -w -Ithird_party/bearssl/inc -
             -DBR_USE_URANDOM=1 -DBR_USE_GETENTROPY=0 -DBR_USE_WIN32_RAND=0 -DBR_USE_UNIX_TIME=1 -DBR_USE_WIN32_TIME=0
 UCFLAGS  += -Ithird_party/bearssl/inc -Ithird_party/img
 UCFLAGS  += -Ithird_party/quickjs
+UCFLAGS  += -Ithird_party/lexbor/source -Iports/lexbor/include
+
+# Lexbor's parsing/DOM modules use only native libc. Do not build upstream
+# POSIX/Windows filesystem or performance ports, CLI, or unfinished layout.
+include third_party/lexbor/sources.mk
+LXB_C := $(LXB_VENDOR_C) ports/lexbor/memory.c
+LXB_OBJ := $(patsubst %.c,$(BUILD)/lexbor/%.o,$(LXB_C))
+LXBFLAGS := $(filter-out -W%,$(UCFLAGS)) -w -fno-addrsig -DLEXBOR_STATIC
+$(BUILD)/lexbor/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  LXB  $<"
+	@$(CC) $(LXBFLAGS) -c $< -o $@
 
 # QuickJS core only. No OS helper library, CLI or native-module loader.
 QJS_C := $(addprefix third_party/quickjs/,quickjs.c dtoa.c libregexp.c libunicode.c cutils.c)
@@ -98,9 +110,9 @@ $(BUILD)/u/%.asm.o: %.asm
 	@$(NASM) -f elf64 -g $< -o $@
 
 # no archiver in the toolchain: lld's --start-lib gives archive semantics to plain objects
-LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ)
+LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ)
 
-$(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) user/user.ld
+$(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
 	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib $(LIBC_LINK) --end-lib -o $@
@@ -125,7 +137,7 @@ $(BUILD)/tcc/tcc.o: $(wildcard $(TCC_DIR)/*.c $(TCC_DIR)/*.h) ports/tcc/config.h
 	@echo "  CC   $(TCC_DIR)/tcc.c"
 	@$(CC) $(TCC_CFLAGS) -c $(TCC_DIR)/tcc.c -o $@
 
-$(BUILD)/root/bin/tcc: $(BUILD)/tcc/tcc.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) user/user.ld
+$(BUILD)/root/bin/tcc: $(BUILD)/tcc/tcc.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
 	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib $(LIBC_LINK) --end-lib -o $@
@@ -141,20 +153,23 @@ $(BUILD)/tccrt/runmain.c.o: ports/tcc/runmain.c
 	@$(CC) $(TCCRT_FLAGS) -c $< -o $@
 
 # headers and libraries for compiling inside Nocturne (an extra tree in the initrd)
-$(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(TCCRT_OBJ) scripts/mksysroot.sh \
+$(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(TCCRT_OBJ) scripts/mksysroot.sh \
 		$(shell find user/include ports/tcc/include third_party/bearssl/inc $(TCC_DIR)/include -name '*.h') \
+		$(LXB_HEADERS) ports/lexbor/include/memory.h third_party/lexbor/headers.list \
+		third_party/lexbor/LICENSE third_party/lexbor/NOTICE third_party/lexbor/UPSTREAM.json \
 		common/abi.h common/gfx.h $(wildcard user/apps/*.c)
 	@echo "  SYSROOT"
-	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) -- $(TCCRT_OBJ)
+	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) -- $(TCCRT_OBJ)
 	@touch $@
 
 # ---------------------------------------------------------------- images
-.PHONY: all kernel user image run clean test test-quick test-full
+.PHONY: all kernel user lexbor image run clean test test-quick test-full
 .SECONDARY:
 all: image
 
 kernel: $(BUILD)/kernel.elf
 user: $(APP_BINS) $(BUILD)/root/bin/tcc
+lexbor: $(LXB_OBJ)
 
 $(BUILD)/initrd.tar: $(APP_BINS) $(BUILD)/root/bin/tcc $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
 	@echo "  TAR  $@"

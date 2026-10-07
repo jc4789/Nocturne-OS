@@ -51,7 +51,7 @@ const mutationBridge = (() => {
         if(op==='remove')return {op,removal:removal(node)};
         if(op==='set' && ['innerHTML','textContent','nodeValue'].includes(key)){
             const type=get(node,'nodeType');
-            if((key==='nodeValue' || key==='textContent') && (type===3 || type===8))return {op:'characterData',node,oldValue:get(node,'nodeValue')};
+            if((key==='nodeValue' || key==='textContent') && (type===3 || type===7 || type===8))return {op:'characterData',node,oldValue:get(node,'nodeValue')};
             if(key!=='nodeValue' && (type===1 || type===11))return {op:'children',node,old:children(node),regs:ancestorRegistrations(node)};
         }
         let name;

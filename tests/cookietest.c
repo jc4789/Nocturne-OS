@@ -102,6 +102,52 @@ int main(int argc,char **argv) {
     other=jar();CHECK(!webcookie_import(other,snapshot,(size_t)n-1,now));get(other,"https://example.com/",true,"");
     ((unsigned char*)snapshot)[0]^=1;CHECK(!webcookie_import(other,snapshot,(size_t)n,now));free(snapshot);webcookie_free(other);webcookie_free(j);
 
+    /* A navigation keeps the browser jar: unrelated Domain cookies must also
+       survive its next worker snapshot. All fields here are synthetic. */
+    j=jar();
+    CHECK(set(j,"https://www.example.com/","host=1; Secure; HttpOnly",true)==1);
+    CHECK(set(j,"https://www.example.com/","shared=2; Domain=example.com; Path=/; Secure",true)==1);
+    CHECK(set(j,"https://www.other.org/","foreign=3; Domain=other.org; Path=/",true)==1);
+    CHECK(set(j,"https://x.a.github.io/","private=4; Domain=a.github.io; Secure; SameSite=None",true)==1);
+    CHECK(set(j,"https://x.www.ck/","exception=5; Domain=www.ck",true)==1);
+    CHECK(set(j,"https://opaque.example.com/","opaque-token; Path=/",true)==1);
+    CHECK(set(j,"https://binary.example.com/","bytes=\x80\xff; Path=/",true)==1);
+    n=webcookie_export(j,NULL,0,now);snapshot=malloc((size_t)n);CHECK(snapshot!=NULL);
+    if(snapshot){
+        CHECK(webcookie_export(j,snapshot,(size_t)n,now)==n);
+        other=jar();CHECK(webcookie_import(other,snapshot,(size_t)n,now));
+        get(other,"https://www.example.com/",true,"host=1; shared=2");
+        get(other,"https://www.example.com/",false,"shared=2");
+        get(other,"https://sub.example.com/",true,"shared=2");
+        get(other,"https://sub.other.org/",true,"foreign=3");
+        get(other,"https://y.a.github.io/",true,"private=4");
+        get(other,"https://y.www.ck/",true,"exception=5");
+        get(other,"https://opaque.example.com/",true,"shared=2; opaque-token");
+        get(other,"https://binary.example.com/",true,"shared=2; bytes=\x80\xff");
+        get(other,"https://unrelated.net/",true,"");webcookie_free(other);
+        /* Missing policy must not widen any imported Domain cookie. A failure
+           is atomic even after an earlier host-only record was parsed. */
+        other=webcookie_create();CHECK(other!=NULL);
+        CHECK(!webcookie_import(other,snapshot,(size_t)n,now));
+        get(other,"https://www.example.com/",true,"");
+        CHECK(webcookie_psl_load(other,psl,sizeof psl-1));
+        CHECK(webcookie_import(other,snapshot,(size_t)n,now));
+        get(other,"https://sub.other.org/",true,"foreign=3");webcookie_free(other);
+        free(snapshot);
+    }
+    webcookie_free(j);
+    /* Host-only snapshots remain usable with the documented no-PSL fallback. */
+    j=jar();CHECK(set(j,"https://single.example.com/","only=1",true)==1);
+    n=webcookie_export(j,NULL,0,now);snapshot=malloc((size_t)n);CHECK(snapshot!=NULL);
+    if(snapshot){
+        CHECK(webcookie_export(j,snapshot,(size_t)n,now)==n);
+        other=webcookie_create();CHECK(other!=NULL);CHECK(webcookie_import(other,snapshot,(size_t)n,now));
+        get(other,"https://single.example.com/",true,"only=1");
+        get(other,"https://sub.single.example.com/",true,"");
+        webcookie_free(other);free(snapshot);
+    }
+    webcookie_free(j);
+
     j=webcookie_create();CHECK(set(j,"https://a.example.com/","no=1; Domain=example.com",true)==0);
     CHECK(set(j,"https://a.example.com/","yes=1; Domain=a.example.com",true)==1);
     get(j,"https://b.a.example.com/",true,"");CHECK(!webcookie_same_site(j,"https://a.example.com/","https://b.example.com/"));
@@ -111,6 +157,23 @@ int main(int argc,char **argv) {
     c=context("https://example.com/",true);CHECK(webcookie_get(j,&c,out,sizeof out,now)>0&&!strstr(out,"c0=")&&strstr(out,"c69="));
     char huge[WEBCOOKIE_FIELD_MAX+2];memset(huge,'a',sizeof huge);huge[1]='=';huge[sizeof huge-1]=0;
     CHECK(webcookie_set(j,&c,huge,sizeof huge-1,now)==-1);webcookie_free(j);
+    /* Snapshot quota eviction must preserve export/import validity, not leave
+       stale count/byte bookkeeping. Exercise a payload near the transport cap. */
+    j=jar();char dense[4097];memset(dense,'a',sizeof dense-1);dense[0]='q';dense[1]='=';dense[sizeof dense-1]=0;
+    for(int i=0;i<70;i++){
+        char url[64];snprintf(url,sizeof url,"https://h%d.example.com/",i);
+        CHECK(set(j,url,dense,true)==1);
+    }
+    n=webcookie_export(j,NULL,0,now);CHECK(n>0&&(size_t)n<=WEBCOOKIE_SNAPSHOT_MAX);
+    snapshot=malloc((size_t)n);CHECK(snapshot!=NULL);
+    if(snapshot){
+        CHECK(webcookie_export(j,snapshot,(size_t)n,now)==n);
+        other=jar();CHECK(webcookie_import(other,snapshot,(size_t)n,now));
+        get(other,"https://h69.example.com/",true,dense);
+        get(other,"https://h0.example.com/",true,"");
+        webcookie_free(other);free(snapshot);
+    }
+    webcookie_free(j);
     /* The deployed complete PSL, not merely the small policy-unit table. */
     FILE *f=fopen(argc>1?argv[1]:"/usr/share/browser/public_suffix_list.dat","r");
     CHECK(f!=NULL);
@@ -126,6 +189,15 @@ int main(int argc,char **argv) {
             CHECK(!webcookie_same_site(j,"https://a.blogspot.com/","https://b.blogspot.com/"));
             CHECK(webcookie_same_site(j,"https://www.city.kawasaki.jp/","https://city.kawasaki.jp/"));
             CHECK(!webcookie_same_site(j,"https://a.kawasaki.jp/","https://b.kawasaki.jp/"));
+            n=webcookie_export(j,NULL,0,now);snapshot=malloc((size_t)n);CHECK(snapshot!=NULL);
+            if(snapshot){
+                CHECK(webcookie_export(j,snapshot,(size_t)n,now)==n);
+                other=webcookie_create();CHECK(other!=NULL);CHECK(webcookie_psl_load(other,text,length));
+                CHECK(webcookie_import(other,snapshot,(size_t)n,now));
+                get(other,"https://accounts.youtube.com/",true,"good=1");
+                get(other,"https://html5test.com/",true,"");
+                webcookie_free(other);free(snapshot);
+            }
             webcookie_free(j);free(text);
         }fclose(f);
     }

@@ -9,6 +9,7 @@ virtual machines (QEMU and Hyper-V); it has not been tried on real hardware. It 
 general-purpose OS: see [Limits](#limits). A few borrowed pieces of code are included:
 - Limine loads the kernel and the initial ramdisk.
 - BearSSL provides TLS.
+- Lexbor が HTML の字句解析・木構築を、QuickJS が JavaScript 言語の実行を担当します。ブラウザー API と描画は Nocturne 側の実装です。
 - TinyCC is the C compiler that runs inside the OS.
 - stb_truetype, stb_image, JebP and NanoSVG read fonts and images for the web browser, which draws text in Inter.
 
@@ -24,6 +25,7 @@ QuickJS の実験的な統合がありますが、ブラウザー API は未完�
 その後の JavaScript・Shift_JIS 修正と実サイト再検証は [追補](docs/browser-js-progress-2026-10-06.md) に記録しています。指定4サイトの全面動作は未達成です。
 実サイトで判明した microtask 再帰と Nocturne のメモリ不足時処理の修正は [続報](docs/browser-native-progress-2026-10-06.md) に記録しています。
 Google・GitHub・HTML5test・百度百科を加えた実機検証と、XHR・独立Document・SVGの修正は [互換性の拡大検証](docs/browser-web-compatibility-2026-10-06.md) を参照してください。表示の部分成功と、サイト操作の未達を区別しています。
+HTML tokenizer／tree builder は Lexbor へ移行しました。Nocturne の DOM・描画・OS API を維持した統合範囲と、実サイトで残る失敗は [Lexbor 統合記録](docs/browser-lexbor-2026-10-06.md) に記載しています。ブラウザー全体の互換性が完成したわけではありません。
 
 ![Desktop and start menu](docs/desktop-menu.png)
 

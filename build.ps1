@@ -7,7 +7,7 @@ $env:MSYSTEM = "UCRT64"
 $env:CHERE_INVOKING = "1"
 # Keep paths and the requested target out of shell syntax. The caller's working
 # directory must not decide which project gets built.
-$env:NOCTURNE_BUILD_ROOT = $PSScriptRoot
+$env:NOCTURNE_BUILD_ROOT = $PSScriptRoot -replace '\\', '/'
 $env:NOCTURNE_BUILD_TARGET = $Target
 & "$PSScriptRoot\tools\msys64\usr\bin\bash.exe" -lc 'cd "$NOCTURNE_BUILD_ROOT" && make -j8 "$NOCTURNE_BUILD_TARGET"'
 exit $LASTEXITCODE

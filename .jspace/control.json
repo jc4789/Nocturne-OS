@@ -917,9 +917,9 @@
       "view": "890fac52e99ddb3a96902353b8b87a1ad6d04ff55eb23e6167ff6615d512af3a"
     },
     "performance_fresh": {
-      "broadcast": false,
+      "broadcast": true,
       "depth": 1,
-      "last_pulse": 1791312428.9518657,
+      "last_pulse": 1791313252.0640604,
       "owns": [
         "user/libc/web/js_performance.js",
         "tests/js_performance_cases.js"
@@ -928,23 +928,23 @@
       "reads": {
         "SKILL.md": {
           "sha256": "2ccbcd13cafb5ce3e2669fd21480b917f662dca2cb38a6fa01806407a68e6c16",
-          "time": 1791312956.282476
+          "time": 1791313252.0669181
         },
         "modules/broadcast.md": {
           "sha256": "5c106a5dd4348ce92706ac05a761cf87fe2e8eed89f8c6b2e4436d5698e6773f",
-          "time": 1791312956.2835588
+          "time": 1791313252.0680149
         },
         "modules/capacity.md": {
           "sha256": "1b98cd009e56895d5a03d9a789fc3a974ecc3939ce5ee0f3c8d388ac7d506065",
-          "time": 1791312956.2830577
+          "time": 1791313252.0675452
         },
         "modules/orchestration.md": {
           "sha256": "e087983c020dc9bb8a33ac989716e07f0b3aa0330fc5ffeb87de1ed37c02867a",
-          "time": 1791312956.2844956
+          "time": 1791313252.0689473
         },
         "modules/repository.md": {
           "sha256": "bcf89e9d8abbc23d0ac6011dd86b3520f4ff603360587c015e79083086858ec5",
-          "time": 1791312956.2840288
+          "time": 1791313252.0684857
         }
       },
       "reports": [
@@ -1143,6 +1143,222 @@
           ],
           "summary": "独立Document第2: allocation_doc寿命を実読、template context/cycleとborrowed受け手を修理、native limit保全ケース追加。最新構文4file/JS成功、native実行は親へ。",
           "time": 1791311713.9052327
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/ddg-commit19/report-round1.md",
+            "sha256": "deb27bd8101f315861a2a71d2656cfd7fe52a55d4db4b3243f6c9020ce2731d8"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "timer task境界とfinite/cycle負例、native再計算候補を再確認",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "89b73d9d75459f7a258dfcb18b2b3367a4c5008443a5307c6f044052f550a925"
+            },
+            {
+              "path": "user/libc/web/js_bootstrap.js",
+              "sha256": "b92c31414f911342e4ad2e5c36c2837340ba1128e5311a014504ba76b239753f"
+            },
+            {
+              "path": "user/libc/web/js_bootstrap.inc",
+              "sha256": "4293351b9ec00163543c6c87687e3492679045856fc9189ad07975c2de84da9d"
+            },
+            {
+              "path": "user/libc/web/js_document.js",
+              "sha256": "f936f6ea691296081f18eb4c74e55b12ad611629f8a23290aa13024543dc966e"
+            },
+            {
+              "path": "user/libc/web/doc.c",
+              "sha256": "10c75976f60a2b1fe70b8bbf2d6a6a6c6855336b32b8c792cdd0de808cb6d0f7"
+            },
+            {
+              "path": "user/libc/web/dom.c",
+              "sha256": "ec88ab330eaef4c65867ebbbc7863405989cb27bc2e21689d28b0d963becb0ba"
+            },
+            {
+              "path": "user/libc/web/html.c",
+              "sha256": "b85ffde6b5c9e61fe19e9e36d9f8e59a79fc03829c02c8c23ac383ccbaeca56f"
+            },
+            {
+              "path": "user/libc/web/webi.h",
+              "sha256": "982ae4fb9db55010f776e7b0f412ac28a2a5200141777941e05c378d27fb2ef1"
+            },
+            {
+              "path": "tests/js_document_cases.js",
+              "sha256": "c3b263cf95c5a71b7886463534e7ff7ed4e963b91a766a62b71d0fd6b4794363"
+            },
+            {
+              "path": "tests/jstest.c",
+              "sha256": "9863db1de5e1d63da7b63cba4c70d4454112f55721b39586d07a1f8ff9fe9db7"
+            },
+            {
+              "path": "third_party/quickjs/quickjs.c",
+              "sha256": "f9241cc53cb5bc4e8e85edf1d7206810f879cf59a119e97fb58f8ef625414d46"
+            },
+            {
+              "path": "build/nocturne-audit/final19-identity.json",
+              "sha256": "4dd0fc1ae48bd2057a200a28f1be0d9bef7dd53b89e729848eff3b632c4b7188"
+            },
+            {
+              "path": "build/nocturne-audit/js-live-19/qa-serial.log",
+              "sha256": "bdf59e0e7cff38aa5643627e1b424f7670dae99af0a197ea3d42f65f32dcbd26"
+            },
+            {
+              "path": "build/nocturne-audit/js-contracts-19/qa-serial.log",
+              "sha256": "d2cd938ed62b543171ced6a5e52c95b379aa4403c42579601432b7de9c439da1"
+            },
+            {
+              "path": "build/nocturne-audit/js-contracts-19b/qa-serial.log",
+              "sha256": "96883dc240be1382b5badf48fab964bedc0d0d28839e91b48a8cf73e443cda6b"
+            },
+            {
+              "path": "build/nocturne-audit/ddg-commit19/source.json",
+              "sha256": "a794155dc54b70d13014c762a543dc4fa59a06a57429dbaa114a02786749a9a7"
+            },
+            {
+              "path": "build/nocturne-audit/ddg-commit19/wpmv.6e4a2974b97069286559.js",
+              "sha256": "669663ba6880f67bab4824fd5e3ea264548928935292f9256c1792ccc3770b7c"
+            },
+            {
+              "path": "build/nocturne-audit/ddg-commit19/ReactFiberCommitWork.new.js",
+              "sha256": "553a84f06ed0f12e6b74a04ca55255a18a41a1e66a0b43423fdc061c169a34aa"
+            },
+            {
+              "path": "build/nocturne-audit/ddg-commit19/columns-final.txt",
+              "sha256": "c169827aff3144ba80017961378314e7c21250d0b69586a77788766f66a2e25c"
+            },
+            {
+              "path": "build/nocturne-audit/ddg-commit19/frozen-snapshot.json",
+              "sha256": "794ae8c7003a76efe2a6216ecca28f3e56395a73d191006f1d27e89cd3819dc7"
+            }
+          ],
+          "summary": "凍結build19新第1: namespace追補と親native820/内部Document150成功を限定確認。実DDGのcommit source列を対応、timer profile未観測・main template画像未証明を区別",
+          "time": 1791313210.305158
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/ddg-commit19/report-round2.md",
+            "sha256": "87c57676032bc0adbb244b6fb94a8f646ff27cb033871e4165aa2f9c00a6014a"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "親の独立reviewへ引渡し。実timer計測と初期main template画像fixtureは後続課題、製品凍結維持",
+          "review": {
+            "agent": "root",
+            "evidence": {
+              "path": "build/nocturne-audit/integration19-review.md",
+              "sha256": "2a05080c3d9435b7aef01cb1a5af639dfb9facf182464d85c8ca4d7205bbd08a"
+            },
+            "report_sha256": "fab59363c9905d7cd314ceface7cc3e0e44b6861753286bdff6e4ce3dd030619",
+            "verdict": "accepted"
+          },
+          "round": 2,
+          "sources": [
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "89b73d9d75459f7a258dfcb18b2b3367a4c5008443a5307c6f044052f550a925"
+            },
+            {
+              "path": "user/libc/web/js_bootstrap.js",
+              "sha256": "b92c31414f911342e4ad2e5c36c2837340ba1128e5311a014504ba76b239753f"
+            },
+            {
+              "path": "user/libc/web/js_bootstrap.inc",
+              "sha256": "4293351b9ec00163543c6c87687e3492679045856fc9189ad07975c2de84da9d"
+            },
+            {
+              "path": "user/libc/web/js_custom_elements.js",
+              "sha256": "ccd1ba2fb12ca9641b7cf73d0f5b1cfb332872f25a42f0f46d59f618519f2c58"
+            },
+            {
+              "path": "user/libc/web/js_mutations.js",
+              "sha256": "87982701c468a29590439313e342e607abcefa1549a713b4f3b17456f7335811"
+            },
+            {
+              "path": "user/libc/web/js_document.js",
+              "sha256": "f936f6ea691296081f18eb4c74e55b12ad611629f8a23290aa13024543dc966e"
+            },
+            {
+              "path": "user/libc/web/doc.c",
+              "sha256": "10c75976f60a2b1fe70b8bbf2d6a6a6c6855336b32b8c792cdd0de808cb6d0f7"
+            },
+            {
+              "path": "user/libc/web/dom.c",
+              "sha256": "ec88ab330eaef4c65867ebbbc7863405989cb27bc2e21689d28b0d963becb0ba"
+            },
+            {
+              "path": "user/libc/web/html.c",
+              "sha256": "b85ffde6b5c9e61fe19e9e36d9f8e59a79fc03829c02c8c23ac383ccbaeca56f"
+            },
+            {
+              "path": "user/libc/web/webi.h",
+              "sha256": "982ae4fb9db55010f776e7b0f412ac28a2a5200141777941e05c378d27fb2ef1"
+            },
+            {
+              "path": "tests/js_document_cases.js",
+              "sha256": "c3b263cf95c5a71b7886463534e7ff7ed4e963b91a766a62b71d0fd6b4794363"
+            },
+            {
+              "path": "tests/jstest.c",
+              "sha256": "9863db1de5e1d63da7b63cba4c70d4454112f55721b39586d07a1f8ff9fe9db7"
+            },
+            {
+              "path": "third_party/quickjs/quickjs.c",
+              "sha256": "f9241cc53cb5bc4e8e85edf1d7206810f879cf59a119e97fb58f8ef625414d46"
+            },
+            {
+              "path": "build/nocturne-audit/final19-identity.json",
+              "sha256": "4dd0fc1ae48bd2057a200a28f1be0d9bef7dd53b89e729848eff3b632c4b7188"
+            },
+            {
+              "path": "build/nocturne-audit/js-live-19/qa-serial.log",
+              "sha256": "bdf59e0e7cff38aa5643627e1b424f7670dae99af0a197ea3d42f65f32dcbd26"
+            },
+            {
+              "path": "build/nocturne-audit/js-contracts-19b/qa-serial.log",
+              "sha256": "96883dc240be1382b5badf48fab964bedc0d0d28839e91b48a8cf73e443cda6b"
+            },
+            {
+              "path": "build/nocturne-audit/ddg-commit19/source.json",
+              "sha256": "a794155dc54b70d13014c762a543dc4fa59a06a57429dbaa114a02786749a9a7"
+            },
+            {
+              "path": "build/nocturne-audit/ddg-commit19/wpmv.6e4a2974b97069286559.js",
+              "sha256": "669663ba6880f67bab4824fd5e3ea264548928935292f9256c1792ccc3770b7c"
+            },
+            {
+              "path": "build/nocturne-audit/ddg-commit19/ReactFiberCommitWork.new.js",
+              "sha256": "553a84f06ed0f12e6b74a04ca55255a18a41a1e66a0b43423fdc061c169a34aa"
+            },
+            {
+              "path": "build/nocturne-audit/ddg-commit19/columns-final.txt",
+              "sha256": "c169827aff3144ba80017961378314e7c21250d0b69586a77788766f66a2e25c"
+            },
+            {
+              "path": "build/nocturne-audit/ddg-commit19/traversal-probe.py",
+              "sha256": "1c81045ca7397f29c28c7664d0c6439a1deb486b0c1baf8d41d1e5f158fde634"
+            },
+            {
+              "path": "build/nocturne-audit/ddg-commit19/traversal-probe.js",
+              "sha256": "33ef277dff22e7277892840e0019c5745bc921e86ac73ae33b1c6fe57905bcbd"
+            },
+            {
+              "path": "build/nocturne-audit/ddg-commit19/traversal-probe.log",
+              "sha256": "ad5e7ebcabb5a30c7dc56e5ff673266d35215c7969d749aafe3fbc87347753bc"
+            },
+            {
+              "path": "build/nocturne-audit/ddg-commit19/frozen-snapshot.json",
+              "sha256": "794ae8c7003a76efe2a6216ecca28f3e56395a73d191006f1d27e89cd3819dc7"
+            }
+          ],
+          "summary": "凍結build19新第2: 失敗timerのprofile未観測を明示訂正。実bundle有限Fiber46/3280とcycle負例で交互frame即循環説を反証。insert親全走査/indicesを未計測候補、main template IMG logical owner境界を未解決と限定",
+          "time": 1791313235.0191352
         }
       ],
       "task": "本物のUser Timing処理と補助試験を実装し、実サイトの検証は親に渡す",
@@ -1152,7 +1368,7 @@
     "root": {
       "broadcast": false,
       "depth": 0,
-      "last_pulse": 1791312834.505986,
+      "last_pulse": 1791329853.4463987,
       "owns": [
         "."
       ],
@@ -1160,23 +1376,23 @@
       "reads": {
         "SKILL.md": {
           "sha256": "2ccbcd13cafb5ce3e2669fd21480b917f662dca2cb38a6fa01806407a68e6c16",
-          "time": 1791312834.5089471
+          "time": 1791329853.4493208
         },
         "modules/broadcast.md": {
           "sha256": "5c106a5dd4348ce92706ac05a761cf87fe2e8eed89f8c6b2e4436d5698e6773f",
-          "time": 1791312834.5100296
+          "time": 1791329853.450296
         },
         "modules/capacity.md": {
           "sha256": "1b98cd009e56895d5a03d9a789fc3a974ecc3939ce5ee0f3c8d388ac7d506065",
-          "time": 1791312834.5095599
+          "time": 1791329853.449818
         },
         "modules/orchestration.md": {
           "sha256": "e087983c020dc9bb8a33ac989716e07f0b3aa0330fc5ffeb87de1ed37c02867a",
-          "time": 1791312834.511014
+          "time": 1791329853.4512274
         },
         "modules/repository.md": {
           "sha256": "bcf89e9d8abbc23d0ac6011dd86b3520f4ff603360587c015e79083086858ec5",
-          "time": 1791312834.5105321
+          "time": 1791329853.4507542
         }
       },
       "reports": [
@@ -1266,6 +1482,137 @@
           ],
           "summary": "build17部分修正: 実DDG microtask再帰・native heap rollbackを修正、JS791/OS6成功、実4サイト全面動作未達",
           "time": 1791309628.8666892
+        },
+        {
+          "completion": {
+            "path": "build/nocturne-audit/completion19.md",
+            "sha256": "8581922004cabdf5ac0262a80aa7f74fcaf48ae172ef530aea7ac921b5d1e326"
+          },
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/integration19-review.md",
+            "sha256": "2a05080c3d9435b7aef01cb1a5af639dfb9facf182464d85c8ca4d7205bbd08a"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "限定成果を報告し、未対応共通API・main template画像候補・DDGtimer実負荷を次の対象にする",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "89b73d9d75459f7a258dfcb18b2b3367a4c5008443a5307c6f044052f550a925"
+            },
+            {
+              "path": "user/libc/web/js_bootstrap.js",
+              "sha256": "b92c31414f911342e4ad2e5c36c2837340ba1128e5311a014504ba76b239753f"
+            },
+            {
+              "path": "user/libc/web/js_bootstrap.inc",
+              "sha256": "4293351b9ec00163543c6c87687e3492679045856fc9189ad07975c2de84da9d"
+            },
+            {
+              "path": "user/libc/web/js_xhr.js",
+              "sha256": "0ecef1c0ccb181bcd5e58803fb1b233832f0ccc6791f3d87b12b1598881f5b78"
+            },
+            {
+              "path": "user/libc/web/js_document.js",
+              "sha256": "f936f6ea691296081f18eb4c74e55b12ad611629f8a23290aa13024543dc966e"
+            },
+            {
+              "path": "user/libc/web/js_screen.js",
+              "sha256": "16fb3a9e4ffadb44f71623f77ac52d5306d669ab33dc552455b8ca6ff3fee550"
+            },
+            {
+              "path": "user/libc/web/doc.c",
+              "sha256": "10c75976f60a2b1fe70b8bbf2d6a6a6c6855336b32b8c792cdd0de808cb6d0f7"
+            },
+            {
+              "path": "user/libc/web/dom.c",
+              "sha256": "ec88ab330eaef4c65867ebbbc7863405989cb27bc2e21689d28b0d963becb0ba"
+            },
+            {
+              "path": "user/libc/web/html.c",
+              "sha256": "b85ffde6b5c9e61fe19e9e36d9f8e59a79fc03829c02c8c23ac383ccbaeca56f"
+            },
+            {
+              "path": "user/libc/web/webi.h",
+              "sha256": "982ae4fb9db55010f776e7b0f412ac28a2a5200141777941e05c378d27fb2ef1"
+            },
+            {
+              "path": "user/libc/web/layout.c",
+              "sha256": "0bd9281d426fc54a2599ad2a38c01bd111e509e932446aa6fa14ec95534678f9"
+            },
+            {
+              "path": "user/libc/web/box.c",
+              "sha256": "ed35c3333151512fb411c1cc1015f43793979d3c97713d5f6a8d58c31e8a9e4d"
+            },
+            {
+              "path": "user/libc/web/css.c",
+              "sha256": "e2ea7ed89500a9e8a6c83a0a6c4c52920a13cef1ee14b46704cca782ec082321"
+            },
+            {
+              "path": "user/libc/web/svg_geometry.h",
+              "sha256": "cfd717350521a65621db699f37135d73e60c783bced6d6f15d60d6571411e13d"
+            },
+            {
+              "path": "user/include/web.h",
+              "sha256": "8e296057a9c267a0fbf0af9d24607bd61e4280613abe498db4213a9666869f35"
+            },
+            {
+              "path": "user/include/webnet.h",
+              "sha256": "501d00b345671c265098450b830ceec80e02e0f4bafb5fe48ee2932382624563"
+            },
+            {
+              "path": "user/include/webnet_wire.h",
+              "sha256": "0b3bcf36f5324c693de4da300a3494190dd5edbf37beecf86332d83ea2e738bd"
+            },
+            {
+              "path": "user/libc/webnet.c",
+              "sha256": "6d0d19a136b73f80e3e6a1ec26244e967196f7630a8c02bfca6b93a3af035d66"
+            },
+            {
+              "path": "user/apps/browser.c",
+              "sha256": "16b00fdeeec6cb486d7bb951ef04983edc81bfdc7a030015e4df2d8e6ad97744"
+            },
+            {
+              "path": "user/apps/webfetch.c",
+              "sha256": "f51f5b0db49695361672f2a3fc55bc318035c45fadb1d1658c4e9032c9a5eafe"
+            },
+            {
+              "path": "tests/jstest.c",
+              "sha256": "9863db1de5e1d63da7b63cba4c70d4454112f55721b39586d07a1f8ff9fe9db7"
+            },
+            {
+              "path": "tests/svgtest.c",
+              "sha256": "02b473650ce000666d03c62a6028afad51c04311e1751b16160e1c0ca9bb9208"
+            },
+            {
+              "path": "tests/js_document_cases.js",
+              "sha256": "c3b263cf95c5a71b7886463534e7ff7ed4e963b91a766a62b71d0fd6b4794363"
+            },
+            {
+              "path": "tests/js_xhr_cases.js",
+              "sha256": "8ca58cbc7bbe3cad0fa4e2c1d6bfe78a701652a302d79244a69f7b7f755ee7f3"
+            },
+            {
+              "path": "tests/webnettest.c",
+              "sha256": "6462c7c8f8d0b1ea2aa49b15bb8f48e7313812249cb8dd8af929f8318958e491"
+            },
+            {
+              "path": "tests/fixtures/js/server.py",
+              "sha256": "c80533786389c427e81556f7a260e764c6a3e325d04b028cf11fee88c04aa163"
+            },
+            {
+              "path": "docs/browser-web-compatibility-2026-10-06.md",
+              "sha256": "7c08cdbba27cbe4873931ef02581445fa0775c40bd744d05a58e528499cb9c05"
+            },
+            {
+              "path": "build/nocturne-audit/final19-identity.json",
+              "sha256": "4dd0fc1ae48bd2057a200a28f1be0d9bef7dd53b89e729848eff3b632c4b7188"
+            }
+          ],
+          "summary": "build19部分成果: 共通XHR/独立Document/template/screen/SVGを統合、実8サイトとnative820/通信55を検査。全面Web互換・Hyper-V起動・全tree gateは未達",
+          "time": 1791313199.1886656
         }
       ],
       "task": "Nocturne固有の設計と既存変更を保ち、QuickJS統合とHyper-V第2世代ビルドの原因を再現し、最小修正と検証範囲を提示する",
@@ -1273,9 +1620,9 @@
       "view": "890fac52e99ddb3a96902353b8b87a1ad6d04ff55eb23e6167ff6615d512af3a"
     },
     "selection_fresh": {
-      "broadcast": true,
+      "broadcast": false,
       "depth": 1,
-      "last_pulse": 1791312797.7238126,
+      "last_pulse": 1791333549.2591212,
       "owns": [
         "user/libc/web/js_selection.js",
         "tests/js_selection_cases.js",
@@ -1289,23 +1636,23 @@
       "reads": {
         "SKILL.md": {
           "sha256": "2ccbcd13cafb5ce3e2669fd21480b917f662dca2cb38a6fa01806407a68e6c16",
-          "time": 1791312797.727548
+          "time": 1791333549.262154
         },
         "modules/broadcast.md": {
           "sha256": "5c106a5dd4348ce92706ac05a761cf87fe2e8eed89f8c6b2e4436d5698e6773f",
-          "time": 1791312797.728896
+          "time": 1791333549.2631824
         },
         "modules/capacity.md": {
           "sha256": "1b98cd009e56895d5a03d9a789fc3a974ecc3939ce5ee0f3c8d388ac7d506065",
-          "time": 1791312797.7282107
+          "time": 1791333549.2627125
         },
         "modules/orchestration.md": {
           "sha256": "e087983c020dc9bb8a33ac989716e07f0b3aa0330fc5ffeb87de1ed37c02867a",
-          "time": 1791312797.7301962
+          "time": 1791333549.264127
         },
         "modules/repository.md": {
           "sha256": "bcf89e9d8abbc23d0ac6011dd86b3520f4ff603360587c015e79083086858ec5",
-          "time": 1791312797.729548
+          "time": 1791333549.2636569
         }
       },
       "reports": [
@@ -1752,6 +2099,342 @@
           ],
           "summary": "第2検討: XHRのspecies/孤立surrogate/MIMEquote/資源失敗を反証・再確認。force-preflightは親指摘で旧wire64byteを維持し31限定検査失敗0。実サイト再試験はbuild19待ち",
           "time": 1791312035.0702684
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/compat18-github/round3-report.md",
+            "sha256": "c5d3bc555ab1f40b5a45fbc6268a9bcbaef4b1b07ce110c2816dfe8f75390cc4"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "親が限定実サイト証拠を独立レビューし、未達を含めてbuild19を収束する",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "89b73d9d75459f7a258dfcb18b2b3367a4c5008443a5307c6f044052f550a925"
+            },
+            {
+              "path": "user/libc/web/js_bootstrap.js",
+              "sha256": "b92c31414f911342e4ad2e5c36c2837340ba1128e5311a014504ba76b239753f"
+            },
+            {
+              "path": "user/libc/web/js_document.js",
+              "sha256": "f936f6ea691296081f18eb4c74e55b12ad611629f8a23290aa13024543dc966e"
+            },
+            {
+              "path": "user/libc/web/js_screen.js",
+              "sha256": "16fb3a9e4ffadb44f71623f77ac52d5306d669ab33dc552455b8ca6ff3fee550"
+            }
+          ],
+          "summary": "build19再検証: 実HTML5test104/555を2回表示、GitHub検索SSRとrepoリンク遷移のみ部分成功。attachShadow/importmap/HTMLFormElementとJS menu未達を記録、担当QEMU2台は正常終了・PID消失確認。正式gate未合格",
+          "time": 1791313109.742399
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/compat18-github/round4-final-boundaries.md",
+            "sha256": "fb5d9d10d7b4b2772797382d39cf95ec4b6b5e8d99dd5d7786c60b69413d4f16"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "親が限定実サイト証拠と最終境界を受領レビューする",
+          "review": {
+            "agent": "root",
+            "evidence": {
+              "path": "build/nocturne-audit/integration19-review.md",
+              "sha256": "2a05080c3d9435b7aef01cb1a5af639dfb9facf182464d85c8ca4d7205bbd08a"
+            },
+            "report_sha256": "77c4cf48948dbfe7fbcfbce8a8f5e07324a02333e4fd62fe34a7599905d8cbd3",
+            "verdict": "accepted"
+          },
+          "round": 2,
+          "sources": [
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "89b73d9d75459f7a258dfcb18b2b3367a4c5008443a5307c6f044052f550a925"
+            },
+            {
+              "path": "user/libc/web/js_bootstrap.js",
+              "sha256": "b92c31414f911342e4ad2e5c36c2837340ba1128e5311a014504ba76b239753f"
+            },
+            {
+              "path": "user/libc/web/js_document.js",
+              "sha256": "f936f6ea691296081f18eb4c74e55b12ad611629f8a23290aa13024543dc966e"
+            },
+            {
+              "path": "user/libc/web/js_screen.js",
+              "sha256": "16fb3a9e4ffadb44f71623f77ac52d5306d669ab33dc552455b8ca6ff3fee550"
+            }
+          ],
+          "summary": "最終第2検討: HTML5test104は画面表示のみ、GitHubのnative GET/linkとJS search/menu未達を区別。production raw・専用raw・5sourceのidentity一致を再計算し、停止記録/serial不変を再読。製品編集/新QEMUなし、正式gate未合格を維持",
+          "time": 1791313220.7100601
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/gemini-repair/api-audit.md",
+            "sha256": "6b0f4a9828134e39e3c44a35ae44c41378b28c02ea029b44ed860cf3bc09e734"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "親の指定範囲で最小API修理を行い、別artifactで負例再検証と実サイト境界を第2検討する",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "user/libc/web/js_bootstrap.js",
+              "sha256": "f13a296b75001527ebf9e0cfa17ec9ceeb2d0bd6ad3ec8766e6b1d93d035c52b"
+            },
+            {
+              "path": "user/libc/web/js_hyperlink.js",
+              "sha256": "ccd624ba93684c9376ae9ab55473a7f587590b3a0868851af609686f24b32730"
+            },
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "f57a2cb270244cf38bd3a1b2763ea0542400bf29cb5aab62cf008741efd13018"
+            },
+            {
+              "path": "user/libc/web/dom.c",
+              "sha256": "19b70acca862cb46bd3205f2014026a4b7caecbffcfe588b9d2904d821165d09"
+            },
+            {
+              "path": "user/libc/web/doc.c",
+              "sha256": "ede9ba4139921539bb3ea37dde2d82af2da683652ed01374622e261d55a82f45"
+            },
+            {
+              "path": "user/libc/web/js_history.js",
+              "sha256": "539cfaa7da2c2da9727e14f4965dfdafc8404c7d35a2a88d08ab9d82bc74d67f"
+            },
+            {
+              "path": "user/libc/web/js_collections.js",
+              "sha256": "5ffd0f5ab1d26986e4ee84940450a98f5b7555a97ada2f863461d78684a9d345"
+            },
+            {
+              "path": "user/libc/web/js_url.js",
+              "sha256": "40926eda82bee50302598749f622417b83c508a59c3e7b470a6db2b6c5e428d4"
+            },
+            {
+              "path": "user/libc/web/js_encoding.js",
+              "sha256": "7c1712c3e94cd4e0f2b669210485de147e1f2a7d2a9800e2293a2165773b471c"
+            },
+            {
+              "path": "tests/jstest.c",
+              "sha256": "6e9cb6162d1c40512cd7aad7803c7a2aca45cadfff119af393cc5e534180f00d"
+            }
+          ],
+          "summary": "Gemini API独立第1報: 型順序とasync分離は正しいが、公開URL差替え/変換例外/reset再入/dirty/submitter/collection/action負例を16観測で記録。nativeは読取と明示モデル、実サイト停止根因とは未確定。",
+          "time": 1791329889.5140717
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/gemini-repair/api-repair-review.md",
+            "sha256": "e43c4e3cca5b6e84da94aaec614e2a404a73445589d67c13067fbd7662949bc1"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "現API段階を返し、ユーザー新方針のCSS.supportsと@supports共通評価器へ進む",
+          "review": null,
+          "round": 2,
+          "sources": [
+            {
+              "path": "user/libc/web/js_bootstrap.js",
+              "sha256": "875f4c4ec1cd3ae4c8f1a68c4f4631be068d17d1ba1556a15fa0ac195bfe92a7"
+            },
+            {
+              "path": "user/libc/web/js_hyperlink.js",
+              "sha256": "3fc35b47be65bbae6e937a13c40e4b066a147411fb65cd920bc10ddfd5b162d7"
+            },
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "eb18c8a71b83cb197afc63dc5294d18d8e528aadce41f261f8a30f58da0d0e57"
+            },
+            {
+              "path": "user/libc/web/dom.c",
+              "sha256": "fb251fd69d71bb9b807322487750d70eb29bc3c15b5acb5f532f503984668f7b"
+            },
+            {
+              "path": "user/libc/web/doc.c",
+              "sha256": "f722354541c71fd36408db44fefb951c60cab23fdc87a2ccf2170f8aed5ce441"
+            },
+            {
+              "path": "user/libc/web/webi.h",
+              "sha256": "bb1617aeb43fa8ab092aef31893d5ba5c8f50d23c101380e3133c65cab6dca29"
+            },
+            {
+              "path": "user/libc/web/js_collections.js",
+              "sha256": "5ffd0f5ab1d26986e4ee84940450a98f5b7555a97ada2f863461d78684a9d345"
+            },
+            {
+              "path": "user/libc/web/js_url.js",
+              "sha256": "40926eda82bee50302598749f622417b83c508a59c3e7b470a6db2b6c5e428d4"
+            },
+            {
+              "path": "user/libc/web/js_encoding.js",
+              "sha256": "7c1712c3e94cd4e0f2b669210485de147e1f2a7d2a9800e2293a2165773b471c"
+            },
+            {
+              "path": "tests/jstest.c",
+              "sha256": "c1d9f8b03b77b2177e833b24fa695fba0774cfc4d1645b8eff0d812acf8a2cae"
+            },
+            {
+              "path": "tests/js_image_cases.js",
+              "sha256": "1c5db8c9f8ad9c1f0d9605f853dfb15dcc1ac742858c899f7753a5ac92031ea3"
+            }
+          ],
+          "summary": "API修理第2検討: native初回失敗で空CharacterData/data未接続を分離し、native nodeValueへ最小修理。URL/brand/変換/SameObject/action/submitter/reset/textarea/radio回帰を保存。QuickJS29観測と構文0、実OS最終一括検証は親、既知未対応は保持。",
+          "time": 1791331009.9917638
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/gemini-repair/css-supports-report.md",
+            "sha256": "c37e05c5c40c557f5b78ccc17ff96605c7ee918912005dcaa399ba3f6730dd53"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "親の一括build/QEMUとnamespace/共有評価器最終境界の第2検討",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "user/libc/web/css.c",
+              "sha256": "fe98fd999d8af8b4a4e77f5ad72109304ee76ae072b4a33e114f6a461e1bd7f9"
+            },
+            {
+              "path": "user/libc/web/cssprop.c",
+              "sha256": "2ab4df6d0b4a1bae84df2e09592d239f73a0449f54d1c07335d78ec9dad8047c"
+            },
+            {
+              "path": "user/libc/web/js_css_supports.js",
+              "sha256": "ed2d6318b748c5050afc84184f3e8cdb95fc5f748e1aa21a72ab08630dbe3303"
+            },
+            {
+              "path": "tests/csssupportstest.c",
+              "sha256": "5dbdaf95765b10b778f4ffc7b2b10fa9ce2450bfb85e33f63e0ce98fbd710de3"
+            },
+            {
+              "path": "tests/js_css_supports_cases.js",
+              "sha256": "a10c1f3eee6966aef8c5d66b97e5fd3d6f9ac4115395738a194aa5f7ee99abc9"
+            }
+          ],
+          "summary": "CSS第1報: 実css_apply/selector parserへ共通CSS.supports/@supportsを接続。var/custom/論理/コメント/escape/制限と未実装拒否を保存・製品凍結。抽出C126/0・実QuickJS橋JS38/0・構文0、実OS/cascade/サイト一括検証は親。全tree gate未合格保持。",
+          "time": 1791332175.1838033
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/gemini-repair/css-supports-second-review.md",
+            "sha256": "f57b0a7851ee57d2a10e75eb511026be720e7db27e4fcbff89f1abcbcecdf761"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "親の一括実OS結果と実サイト受入を待つ。製品の追加境界拡張なし。",
+          "review": null,
+          "round": 2,
+          "sources": [
+            {
+              "path": "user/libc/web/css.c",
+              "sha256": "485b4f7a080284bddb32171cbc122cc75674bc66d92e48d0480f749328f0a4c9"
+            },
+            {
+              "path": "user/libc/web/cssprop.c",
+              "sha256": "2ab4df6d0b4a1bae84df2e09592d239f73a0449f54d1c07335d78ec9dad8047c"
+            },
+            {
+              "path": "user/libc/web/js_css_supports.js",
+              "sha256": "ed2d6318b748c5050afc84184f3e8cdb95fc5f748e1aa21a72ab08630dbe3303"
+            },
+            {
+              "path": "tests/csssupportstest.c",
+              "sha256": "1ccb9332e818bfad435a576b8230b79bb9697e3cbb3da70ccd5d83738cead09d"
+            },
+            {
+              "path": "tests/js_css_supports_cases.js",
+              "sha256": "ec1d4c47652c287192895822c10c83fa62a0d9e7cb7827e1a8d98f2bbf8b6b59"
+            }
+          ],
+          "summary": "CSS第2検討: 親のnamespace/escape独立指摘を修理。凍結後hash/URL token負例をsourceで発見し承認された小修理のみ追加・再凍結。C133/0と実QuickJS/native橋/CSS41/0・構文0。143の実OS/cascade/実サイト一括受入は親、未対応/全tree gate未合格維持。",
+          "time": 1791332356.0388818
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/gemini-repair/selection-ddg-native-round1.md",
+            "sha256": "f4679cc869d320fde2ab68d362f8e4274680a77d05ac446e224b89db86be3243"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "親の実DDG metadata包摂時間で仮説を反証する第2検討",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "da162aa8a14ae1f351a3742b3666c2cbc867e6f1ee87674084a8c48f8f0428cb"
+            },
+            {
+              "path": "user/libc/web/doc.c",
+              "sha256": "bafe29ed293eda8fdf868fda72a0f0065d64fe443928c672f8c514380a2bdf90"
+            },
+            {
+              "path": "user/libc/web/webi.h",
+              "sha256": "de9323caff7d4753baac84bdcf4fe86a4e39f94e90f8c06e30e9211700a86274"
+            },
+            {
+              "path": "user/libc/web/js_collections.js",
+              "sha256": "5ffd0f5ab1d26986e4ee84940450a98f5b7555a97ada2f863461d78684a9d345"
+            },
+            {
+              "path": "user/libc/web/js_storage.js",
+              "sha256": "3bf83b4eb8459f9fe40600014d8ac1720f67bca6335e75d1a6ece027223a1b10"
+            },
+            {
+              "path": "user/libc/webstorage.c",
+              "sha256": "d5d47256520b9d6198d8b18819e529f235bebfacb7ed7ce770446a52f4e15d47"
+            }
+          ],
+          "summary": "DDG native第1報: DOM専用counterとstorageを分離。停止settings直接bodyはRAM参照。metadata全木再同期とlive collection全snapshot反復の2候補、後者QJS操作数6件0。親許可のmetadata3counter/ログのみ追加し構文0で再凍結、cache/watchdog無変更、実寄与は未確定。",
+          "time": 1791333094.2068417
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/gemini-repair/selection-ddg-native-round2.md",
+            "sha256": "1f3cd02e03c606f5a2b46fef03a82ebc4b3012f6c7f5f21c4c11d1203d145d63"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "親が最終batch受入を完了し本限定報告を独立レビューする",
+          "review": null,
+          "round": 2,
+          "sources": [
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "da162aa8a14ae1f351a3742b3666c2cbc867e6f1ee87674084a8c48f8f0428cb"
+            },
+            {
+              "path": "user/libc/web/doc.c",
+              "sha256": "bafe29ed293eda8fdf868fda72a0f0065d64fe443928c672f8c514380a2bdf90"
+            },
+            {
+              "path": "user/libc/web/webi.h",
+              "sha256": "de9323caff7d4753baac84bdcf4fe86a4e39f94e90f8c06e30e9211700a86274"
+            },
+            {
+              "path": "user/libc/web/js_collections.js",
+              "sha256": "5ffd0f5ab1d26986e4ee84940450a98f5b7555a97ada2f863461d78684a9d345"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/batch-verified-live/qa-serial.log",
+              "sha256": "060352de5ca15a687454580935b59812f829e9af6a6b43f22b70665c436a32e2"
+            }
+          ],
+          "summary": "DDG native第2: 新実ログ5183ms/DOM10785calls2416msを再読。metadata130sync82974visit5msなので今回のmetadata主因説を棄却、cache/予算変更なし。collection増幅は到達未計測のまま。次はop別DOM・layout・JS hook/例外・collection内訳。診断凍結返却、実DDG未合格、全treegate未合格。",
+          "time": 1791333616.2549853
         }
       ],
       "task": "実テキスト選択APIとnative編集接続",
@@ -1761,7 +2444,7 @@
     "site_probe_fresh": {
       "broadcast": false,
       "depth": 1,
-      "last_pulse": 1791312842.765749,
+      "last_pulse": 1791332832.3418937,
       "owns": [
         "build/nocturne-audit/site-probe-fresh-report.md"
       ],
@@ -1769,23 +2452,23 @@
       "reads": {
         "SKILL.md": {
           "sha256": "2ccbcd13cafb5ce3e2669fd21480b917f662dca2cb38a6fa01806407a68e6c16",
-          "time": 1791312842.7685807
+          "time": 1791333174.6169655
         },
         "modules/broadcast.md": {
           "sha256": "5c106a5dd4348ce92706ac05a761cf87fe2e8eed89f8c6b2e4436d5698e6773f",
-          "time": 1791312842.7696464
+          "time": 1791333174.617992
         },
         "modules/capacity.md": {
           "sha256": "1b98cd009e56895d5a03d9a789fc3a974ecc3939ce5ee0f3c8d388ac7d506065",
-          "time": 1791312842.769155
+          "time": 1791333174.617494
         },
         "modules/orchestration.md": {
           "sha256": "e087983c020dc9bb8a33ac989716e07f0b3aa0330fc5ffeb87de1ed37c02867a",
-          "time": 1791312842.7706754
+          "time": 1791333174.6189709
         },
         "modules/repository.md": {
           "sha256": "bcf89e9d8abbc23d0ac6011dd86b3520f4ff603360587c015e79083086858ec5",
-          "time": 1791312842.7701106
+          "time": 1791333174.6185052
         }
       },
       "reports": [
@@ -2038,7 +2721,15 @@
           },
           "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
           "next": "build19は凍結収束。anchor URL reflection等は次の共通API課題として親へ引継ぎ",
-          "review": null,
+          "review": {
+            "agent": "root",
+            "evidence": {
+              "path": "build/nocturne-audit/integration19-review.md",
+              "sha256": "2a05080c3d9435b7aef01cb1a5af639dfb9facf182464d85c8ca4d7205bbd08a"
+            },
+            "report_sha256": "4eeef27a8def27a560a175a6d7f03100726809bdefb06293d9338754316d8b1c",
+            "verdict": "accepted"
+          },
           "round": 2,
           "sources": [
             {
@@ -2084,10 +2775,366 @@
           ],
           "summary": "第2検討: SVG pixel6はHTML fill=red/ fixtureと反証。引用付きQEMU26成功、実Google apps正常化・検索はMessageChannel認証停止。百度中国語本文進行、Axios anchor.pathname未実装を配信stackから特定。所有QEMU全停止",
           "time": 1791312854.101686
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/gemini-repair/image-audit.md",
+            "sha256": "d84f8df41fe9e75e1ce39fedf2ab6ccb49ed2ebfab306631ba1b4c5eeca17882"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "allocation寿命を保つlogical-owner iteratorと専用native回帰を実装して凍結",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "build/nocturne-audit/gemini-repair/image-audit-native.c",
+              "sha256": "1916ab95a53b17870e39a27c5121d63604cbbe72abe0ff0d93e783ac4edd3d09"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/image-audit-native.log",
+              "sha256": "31d6013dbb1c2680ff21ac7c7556d38db9287bb400a8c016eb51098841c02c7b"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/image-audit-native-manifest.json",
+              "sha256": "16a843db8f0186f8059b8c22eb5d39f32e00a1897f5b3eb21b268144c26d85b3"
+            }
+          ],
+          "summary": "Gemini画像owner監査: allocation listとlogical ownerの逆方向adopt欠落を実C抽出で再現。load欠落/置換current残留/切離しadopt無要求の3境界。新inert即時試験は非同期と移動を未検査。親許可の共通iterator修正へ",
+          "time": 1791329921.233377
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/gemini-repair/image-audit-repair.md",
+            "sha256": "e4493b2bdd430d025b52587e3c87f08969d1d80a623477054f7d29ccf299e9d4"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "親が独立diff確認し同媒体で専用native/既存画像JS回帰を実行、実サイト改善は別検証",
+          "review": null,
+          "round": 2,
+          "sources": [
+            {
+              "path": "user/libc/web/doc.c",
+              "sha256": "152682dce6ec5a1a19c4966019976a00a2d37c29dc317c09511ee57801925118"
+            },
+            {
+              "path": "user/libc/web/dom.c",
+              "sha256": "595db3dda8ec1e0abc33ffaaf4fa0c7be57232e397e3870b108a2692cc09d776"
+            },
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "33ccd2b87bb3d531da8748e758b02ffe41e1f292d6ac2e9b2aff5602ced99aae"
+            },
+            {
+              "path": "user/libc/web/webi.h",
+              "sha256": "bb1617aeb43fa8ab092aef31893d5ba5c8f50d23c101380e3133c65cab6dca29"
+            },
+            {
+              "path": "tests/imageownershiptest.c",
+              "sha256": "905e444a3978490fffe5f05b13da22654bcf0121c390863ed55be2bc7344a6af"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/image-audit-after-native.c",
+              "sha256": "65a18de1ac84567b121ce0668f63c0de1b522c8a7153c4c7adbc69763287d042"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/image-audit-after-native.log",
+              "sha256": "9ebbd31edd0609a9073367a3719e558a96c61fb89de77b03584e71387d8876c1"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/image-audit-after-native-manifest.json",
+              "sha256": "e9d0a77eeabef7cb3a71e1a25479e05d58c4e8d124767b60445a1344dc0a2739"
+            }
+          ],
+          "summary": "画像第2検討: logical-owner family iteratorとdetached adopt scanを最小修理。allocation list不変、抽出native36/0・freestanding構文0。専用nativeは非同期/clone/7応答/getter前paintを追加、親QEMU待ち。全tree gate未合格",
+          "time": 1791330341.76129
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/gemini-repair/svg-dom-report-round1.md",
+            "sha256": "decafe518baa62c38aede8f31f322364be1f4af53ffd347b051b4b5e36cd8257"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "親bootstrap統合と一括検証を待ち、native origin固定storageを実装",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "user/libc/web/js_svg.js",
+              "sha256": "d8d0d52f12fa012cf5ff30f7027f49f796c3d445d3b7a36ea75064de60678671"
+            },
+            {
+              "path": "tests/js_svg_dom_cases.js",
+              "sha256": "0c09abc828a31b81b402c83d77c80823c10fafa3f491bd1c263403e5655bf4d3"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/svg-dom-final-source.json",
+              "sha256": "c9433fe3a11a126c21baf30ad0ecf79fc10edefefa5b4491001c2d7fccfc5022"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/svg-dom-syntax.log",
+              "sha256": "df2aa383b8761e128fee7c183541774346c20a8876ff197e000f8482621169b6"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/svg-dom-source/html.c",
+              "sha256": "9137aa82c596ba7068b3d115aa26309a80afb71dcd0af549e4b3a0286c272aa4"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/svg-dom-source/dom.c",
+              "sha256": "f5661b5f413cb9eaa9666cfd10c524a4f2a4faf863f8360e18adfa1d58f908be"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/svg-dom-source/js.c",
+              "sha256": "b9131de17c94f0b7b13ad9c76af08314baeb0308e118620a2d67869eaf005daa"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/svg-dom-source/webi.h",
+              "sha256": "3c6fbc9dae52e5d098029ead480c812373d2a6d6aa4255c3d6d01875e6d179dd"
+            }
+          ],
+          "summary": "SVGバッチ第1報: native namespace/prototype23/24、SVGAnimatedString/class反映・owner/viewport・integrationを実装し凍結。新JS/testはQuickJS構文0、C構文0。bootstrap統合/geometry等の未実装/親一括QEMU待ちを明示、次storage",
+          "time": 1791331544.7713835
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/gemini-repair/storage-report-round1.md",
+            "sha256": "c66ab464d799eea0bc019d6111295ca2fc7250cd79aacdab79e6a230910db90c"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "親一括QEMUで製品storage専用回帰/実サイトを独立検証",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "user/libc/webstorage.c",
+              "sha256": "d5d47256520b9d6198d8b18819e529f235bebfacb7ed7ce770446a52f4e15d47"
+            },
+            {
+              "path": "user/include/webstorage.h",
+              "sha256": "c1d22647be31fc56e74edf0e0c4c862dc4937fd382c81581591d5fbdd12a4b38"
+            },
+            {
+              "path": "user/libc/web/js_storage.js",
+              "sha256": "3bf83b4eb8459f9fe40600014d8ac1720f67bca6335e75d1a6ece027223a1b10"
+            },
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "25cd75fa36dbed6234d0e2b984fb43d9fa6394464fcdfb640910c67c24b0b6e5"
+            },
+            {
+              "path": "user/include/web.h",
+              "sha256": "4b35d534a34f45813cd7037505b1ee9f81274517d826ff4290c5d56436bae7f1"
+            },
+            {
+              "path": "user/apps/browser.c",
+              "sha256": "d9da51adbbc3d093bd3bbcf3fe3172e55c16eee9770875c919ab7a6174ab530d"
+            },
+            {
+              "path": "user/libc/web/js_bootstrap.js",
+              "sha256": "9d27a4abe12a592a7f1a1c7a67cb9f84ea8850ed49451a31d0028094766f1bac"
+            },
+            {
+              "path": "tests/storagetest.c",
+              "sha256": "8b4c2b07f89be1cf58035588186367fc514a445435ca012b558e4f24891bc3a4"
+            },
+            {
+              "path": "tests/js_storage_cases.js",
+              "sha256": "c4faf02f4b5a9f81d725df72f056cdff49ceba28bd8fdf7147fc660351d975c8"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/storage-binding-probe.py",
+              "sha256": "fb6e5894cd0c0c17b9083d722e34a2e4cac46c97d36662ec593bbead60576576"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/storage-binding-probe.log",
+              "sha256": "4305cf5934749004fd309dc7b7c18ebd8094522f5545f973202e9d4403ba8429"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/storage-freeze.json",
+              "sha256": "553e66df54e75649572503bfffa38e731d42904887bb2da7b4296790b1231f77"
+            }
+          ],
+          "summary": "storage第1報: fixed native area/UTF16 quota/二重checksum snapshot/window session寿命/private origin/Storage named propsを実装凍結。C構文0、実JS binding＋URL/model host55/0。native storagetest/実サイトは親一括QEMU待ち、events/coherence/powerfail/Proxy制限を明示",
+          "time": 1791332503.4508147
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/gemini-repair/storage-report-round2.md",
+            "sha256": "23b4aa9caa8ee2079e9ac7d4a402d340e1afca2b1f3e81fd1db2548282b831ac"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "親の実Nocturne専用回帰と実サイト証拠で不足を切分け",
+          "review": null,
+          "round": 2,
+          "sources": [
+            {
+              "path": "user/libc/webstorage.c",
+              "sha256": "d5d47256520b9d6198d8b18819e529f235bebfacb7ed7ce770446a52f4e15d47"
+            },
+            {
+              "path": "user/include/webstorage.h",
+              "sha256": "c1d22647be31fc56e74edf0e0c4c862dc4937fd382c81581591d5fbdd12a4b38"
+            },
+            {
+              "path": "user/libc/web/js_storage.js",
+              "sha256": "3bf83b4eb8459f9fe40600014d8ac1720f67bca6335e75d1a6ece027223a1b10"
+            },
+            {
+              "path": "user/libc/web/js.c",
+              "sha256": "25cd75fa36dbed6234d0e2b984fb43d9fa6394464fcdfb640910c67c24b0b6e5"
+            },
+            {
+              "path": "user/include/web.h",
+              "sha256": "4b35d534a34f45813cd7037505b1ee9f81274517d826ff4290c5d56436bae7f1"
+            },
+            {
+              "path": "user/apps/browser.c",
+              "sha256": "d9da51adbbc3d093bd3bbcf3fe3172e55c16eee9770875c919ab7a6174ab530d"
+            },
+            {
+              "path": "user/libc/web/js_bootstrap.js",
+              "sha256": "9d27a4abe12a592a7f1a1c7a67cb9f84ea8850ed49451a31d0028094766f1bac"
+            },
+            {
+              "path": "tests/storagetest.c",
+              "sha256": "8b4c2b07f89be1cf58035588186367fc514a445435ca012b558e4f24891bc3a4"
+            },
+            {
+              "path": "tests/js_storage_cases.js",
+              "sha256": "c4faf02f4b5a9f81d725df72f056cdff49ceba28bd8fdf7147fc660351d975c8"
+            },
+            {
+              "path": "user/libc/web/js_encoding.js",
+              "sha256": "7c1712c3e94cd4e0f2b669210485de147e1f2a7d2a9800e2293a2165773b471c"
+            },
+            {
+              "path": "user/libc/web/js_url.js",
+              "sha256": "40926eda82bee50302598749f622417b83c508a59c3e7b470a6db2b6c5e428d4"
+            },
+            {
+              "path": "third_party/quickjs/quickjs.c",
+              "sha256": "f9241cc53cb5bc4e8e85edf1d7206810f879cf59a119e97fb58f8ef625414d46"
+            },
+            {
+              "path": "third_party/quickjs/cutils.c",
+              "sha256": "b73a403a59da30726257ddbdf5e399298941c1def997782ee0d4d33f796a80a2"
+            },
+            {
+              "path": "kernel/src/sys/syscall.c",
+              "sha256": "ec3065dc9883b0c3e8847aa696ec5f708e498b1ffb096b3db9e5f406a9152187"
+            },
+            {
+              "path": "kernel/src/fs/vfs.c",
+              "sha256": "dc03d2cb18aac513dcb9fc32f79773d18e3b2ab883f2b997233f55778547c9d4"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/storage-binding-probe.py",
+              "sha256": "fb6e5894cd0c0c17b9083d722e34a2e4cac46c97d36662ec593bbead60576576"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/storage-binding-probe.log",
+              "sha256": "4305cf5934749004fd309dc7b7c18ebd8094522f5545f973202e9d4403ba8429"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/storage-freeze.json",
+              "sha256": "553e66df54e75649572503bfffa38e731d42904887bb2da7b4296790b1231f77"
+            }
+          ],
+          "summary": "storage第2検討: short-read/hash順・同generation誤認・publication後readback失敗を再点検し最終凍結版の全payload照合/inactive破棄/不確定area fail-closedを記録。55 binding/model host境界0、native CESU往復・永続/OSは親待ち、atomic保証や全tree合格は主張しない",
+          "time": 1791332503.577966
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/gemini-repair/svg-tokenlist-report-round1.md",
+            "sha256": "383004c52c30198da01d7b694a8dca15c087faf71260eef0cc3e3dff0b713899"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "既存操作の引数・順序・no-op の弱境界を再考する",
+          "review": null,
+          "round": 1,
+          "sources": [
+            {
+              "path": "user/libc/web/js_bootstrap.js",
+              "sha256": "842cb63381bdff03436eb9d9533aa4803cff02d4a9779ae00dc9f08fb34d4556"
+            },
+            {
+              "path": "user/libc/web/js_svg.js",
+              "sha256": "d8d0d52f12fa012cf5ff30f7027f49f796c3d445d3b7a36ea75064de60678671"
+            },
+            {
+              "path": "tests/js_svg_dom_cases.js",
+              "sha256": "0a520deb58be7e7eb8f7db984b46cd95ad80a68d1233bcf4d890628e743bb308"
+            },
+            {
+              "path": "tests/jstest.c",
+              "sha256": "0f63a166175cbc0db38595d8895341f7c04331ffe43ab59945983b18b40beb39"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/svg-tokenlist-freeze.json",
+              "sha256": "ccc6a469f9ee050ec7a1320b30f99f90fae98ba439c7ff9b121857c9106fe538"
+            }
+          ],
+          "summary": "DOMTokenList の SVGAnimatedString 誤扱いと初回 replace 負例を根拠に共通属性境界を修理。最終 native 後検証は親媒体待ち",
+          "time": 1791333358.2451684
+        },
+        {
+          "completion": null,
+          "contract_sha256": "9039609d5a4a9f1347ef3d2b166eaceb7e7ad6114e4c31c9755247928de55ad2",
+          "evidence": {
+            "path": "build/nocturne-audit/gemini-repair/svg-tokenlist-report-round2.md",
+            "sha256": "d79828101792af26c82adb17be58dd20e32b63be5b17fa672d1518b27b960f96"
+          },
+          "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
+          "next": "親の次媒体で native SVG / jstest を独立再検証する。自分は製品を書き込まない",
+          "review": null,
+          "round": 2,
+          "sources": [
+            {
+              "path": "user/libc/web/js_bootstrap.js",
+              "sha256": "842cb63381bdff03436eb9d9533aa4803cff02d4a9779ae00dc9f08fb34d4556"
+            },
+            {
+              "path": "user/libc/web/js_svg.js",
+              "sha256": "d8d0d52f12fa012cf5ff30f7027f49f796c3d445d3b7a36ea75064de60678671"
+            },
+            {
+              "path": "tests/js_svg_dom_cases.js",
+              "sha256": "0a520deb58be7e7eb8f7db984b46cd95ad80a68d1233bcf4d890628e743bb308"
+            },
+            {
+              "path": "tests/jstest.c",
+              "sha256": "0f63a166175cbc0db38595d8895341f7c04331ffe43ab59945983b18b40beb39"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/svg-tokenlist-freeze.json",
+              "sha256": "ccc6a469f9ee050ec7a1320b30f99f90fae98ba439c7ff9b121857c9106fe538"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/svg-tokenlist-manifest.json",
+              "sha256": "8ece0ce996c5eb63323d6217251b971bf02440553fc6168b1636451a7756fe2e"
+            },
+            {
+              "path": "build/nocturne-audit/gemini-repair/batch-final-contracts/qa-serial.log",
+              "sha256": "1c2a39de8565d146efa716e353d988b7632b4a7595aa9ff38446825688162c05"
+            }
+          ],
+          "summary": "DOMTokenList 内で ordered set、変換検証順序、ASCII 空白、no-op、brand を再検討。model 160/0・構文0、native最終後未確認と未実装を明記し製品凍結",
+          "time": 1791333358.3665497
         }
       ],
       "task": "実YouTubeとChatGPTのQEMU JS検証",
-      "tools": 0,
+      "tools": 1,
       "view": null
     },
     "webfetch_native": {
@@ -2230,6 +3277,16 @@
         "sha256": "ba0a0cb40b757ef311f10796e9cce183a0f5dbdafd3190b97f03bf83d9f7c24b"
       },
       "id": 6
+    },
+    {
+      "active": true,
+      "by": "親による実QEMU画面とserial確認、補助回帰、生成JSとraw/VHDX一致照合。全tree gateとHyper-V実起動を含まない",
+      "claim": "build19: 実Google描画・百度中国語本文・HTML5test104/555まで前進。native JS820と通信55は失敗0だが全面Web互換は未達",
+      "evidence": {
+        "path": "docs/browser-web-compatibility-2026-10-06.md",
+        "sha256": "7c08cdbba27cbe4873931ef02581445fa0775c40bd744d05a58e528499cb9c05"
+      },
+      "id": 7
     }
   ],
   "config": {
@@ -2242,7 +3299,7 @@
   },
   "core": [],
   "findings": {},
-  "generation": 158,
+  "generation": 206,
   "goal": "NocturneのGUI優先・RAM実行・data永続とPATHを保ち、Unix/POSIX化やfork追加をせず、共通Web APIと描画を改善する。実Google/GitHub/HTML5test/指定百度百科もQEMUで検証し、以前の4サイトだけで評価しない。Hyper-Vと既存dataは操作しない",
   "level": "high",
   "modules": [
@@ -2251,7 +3308,7 @@
     "modules/repository.md",
     "modules/orchestration.md"
   ],
-  "next": "共通APIの独立レビュー反例を修正し、SVG汎用修正と統合build19でnative検査・実4サイト再検証へ進む",
+  "next": "build19の実サイト部分成功と未達を引き渡す。次回はanchor URL反映・要素型境界・停止timer計測を実サイト基準で進める",
   "questions": {
     "Q1": {
       "closed": false,
@@ -3739,5 +4796,5 @@
   },
   "schema": 1,
   "solo_reason": "以前の制限は解消。新たに承認されたsol3エージェントを稼働中",
-  "spent": 53
+  "spent": 74
 }

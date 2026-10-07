@@ -94,7 +94,7 @@ static void receive_log(void *opaque, int level, const char *message) {
         if (f->nmarks < MARKS) snprintf(f->marks[f->nmarks++], sizeof f->marks[0], "%s", message + 3);
     } else if (!strncmp(message, "FAIL ", 5)) {
         printf("%s\n", message); fflush(stdout); f->js_failures++; failed++; total++;
-    } else if (!strncmp(message, "XHR checks ", 11) || !strncmp(message, "Document checks ", 16) || !strncmp(message, "Document limit mode ", 20)) {
+    } else if (!strncmp(message, "XHR checks ", 11) || !strncmp(message, "Document checks ", 16) || !strncmp(message, "Document limit mode ", 20) || !strncmp(message, "Lexbor ", 7)) {
         printf("%s\n", message);
     } else if (level == 2) {
         f->errors++;
@@ -283,7 +283,13 @@ static void external_case_expected(const char *file, const char *tail, const cha
     free(page);
 }
 static void external_case(const char *file, const char *tail, const char *url) { external_case_expected(file,tail,url,0); }
+static void test_lexbor(void) {
+    external_case("js_lexbor_cases.js", ";const r=runLexborCases();check('lexbor-probe-count',r.checks===60&&r.legacyTotal===1&&r.unsupportedAPITotal===2);mark('api-done');", BASE);
+}
 static void test_platform(void) {
+    test_lexbor();
+    external_case("js_css_supports_cases.js", ";mark('api-done');", BASE);
+    external_case("js_svg_dom_cases.js", ";check('svg-dom-count',runSVGDOMCases()>=30);mark('api-done');", BASE);
     external_case("js_url_cases.js", ";for(const f of __urlTestResults.failures)console.log('FAIL url '+f.name+' '+f.error);check('url-count',__urlTestResults.total===32);mark('api-done');", BASE);
     external_case("js_crypto_cases.js", ";runCryptoCases().then(n=>{check('crypto-count',n>100);mark('api-done');},e=>{console.log('FAIL crypto '+e);mark('api-done');});", "https://fixture.test/dir/index.html");
     external_case("js_crypto_cases.js", ";runCryptoCases().then(n=>{check('insecure-crypto-count',n>30);mark('api-done');},e=>{console.log('FAIL crypto '+e);mark('api-done');});", BASE);
@@ -434,7 +440,7 @@ static void test_dom_and_scripts(void) {
         "check('dom-fragment-interface',Object.getPrototypeOf(fragment)===DocumentFragment.prototype&&fragment instanceof Node&&!(fragment instanceof Element)&&fragment.className===undefined&&typeof fragment.querySelector==='function');"
         "const textNode=document.createTextNode('text'),commentNode=document.createComment('comment');"
         "check('dom-character-interfaces',Object.getPrototypeOf(textNode)===Text.prototype&&textNode instanceof CharacterData&&textNode instanceof Node&&commentNode instanceof Comment&&commentNode instanceof CharacterData&&textNode.className===undefined&&textNode.getAttribute===undefined);"
-        "const foreign=document.createElementNS('http://www.w3.org/2000/svg','svg');check('dom-foreign-interface',foreign instanceof Element&&!(foreign instanceof HTMLElement)&&Object.getPrototypeOf(foreign)===Element.prototype);"
+        "const foreign=document.createElementNS('http://www.w3.org/2000/svg','svg'),foreignGroup=document.createElementNS('http://www.w3.org/2000/svg','g');check('dom-foreign-interface',foreign instanceof SVGSVGElement&&foreign instanceof SVGElement&&foreign instanceof Element&&foreign instanceof Node&&!(foreign instanceof HTMLElement)&&Object.getPrototypeOf(foreign)===SVGSVGElement.prototype&&foreignGroup instanceof SVGElement&&foreignGroup instanceof Element&&!(foreignGroup instanceof SVGSVGElement)&&!(foreignGroup instanceof HTMLElement)&&Object.getPrototypeOf(foreignGroup)===SVGElement.prototype);"
         "const clone=child.cloneNode(true);check('dom-clone',clone!==child&&clone.textContent===child.textContent);"
         "check('dom-clone-interface',Object.getPrototypeOf(clone)===HTMLElement.prototype&&clone.firstChild instanceof Text);"
         "const inert=document.createElement('div');globalThis.inertRan=false;inert.innerHTML='<span class=inner>parsed</span><script>inertRan=true;<\\/script>';target.appendChild(inert);"
@@ -450,11 +456,26 @@ static void test_dom_and_scripts(void) {
         "globalThis.dynamicOrder=[];const one=document.createElement('script'),two=document.createElement('script');one.async=two.async=false;one.src='order-one.js';two.src='order-two.js';"
         "two.onload=()=>check('dynamic-external-order',dynamicOrder.join(',')==='1,2');document.body.append(one,two);"
         "import('./dynamic.mjs').then(()=>import('./dynamic.mjs')).then(()=>check('module-cache',dynamicEvaluations===1));"
+        "const fakePolymer=Object.create(HTMLElement.prototype);fakePolymer.async=function(){return 42;};"
+        "check('polymer-async-isolation',fakePolymer.async()===42&&Object.getOwnPropertyDescriptor(HTMLElement.prototype,'async')===undefined);"
+        "const testLink=document.createElement('a');testLink.setAttribute('href','/dir/test?foo=bar#target');"
+        "check('anchor-url-reflection',testLink instanceof HTMLAnchorElement&&testLink.pathname==='/dir/test'&&testLink.search==='?foo=bar'&&testLink.hash==='#target'&&testLink.origin==='http://fixture.test'&&testLink.host==='fixture.test'&&testLink.toString()===testLink.href);"
+        "testLink.pathname='/dir/modified';check('anchor-pathname-setter',testLink.pathname==='/dir/modified'&&testLink.getAttribute('href')==='http://fixture.test/dir/modified?foo=bar#target');"
+        "const testForm=document.createElement('form');const fInput=document.createElement('input');fInput.name='field';testForm.appendChild(fInput);"
+        "check('form-interface-properties',testForm instanceof HTMLFormElement&&testForm.elements.length===1&&testForm.elements['field']===fInput&&testForm.length===1);"
+        "testForm.method='INVALID';check('form-method-default',testForm.method==='get');"
+        "check('form-elements-sameobject',testForm.elements===testForm.elements);check('form-action-document-url',testForm.action===document.URL);testForm.action='';check('form-action-empty-document-url',testForm.action===document.URL);"
+        "const publicURL=URL,urlPath=Object.getOwnPropertyDescriptor(URL.prototype,'pathname');try{globalThis.URL=function(){throw Error('public URL');};Object.defineProperty(publicURL.prototype,'pathname',{configurable:true,get(){return 'poison';},set(){throw Error('public URL prototype');}});testLink.pathname='/private';check('anchor-private-url',testLink.pathname==='/private'&&testLink.href==='http://fixture.test/private?foo=bar#target');}finally{globalThis.URL=publicURL;Object.defineProperty(publicURL.prototype,'pathname',urlPath);}"
+        "const conversionError=Error('conversion');let conversionThrew=false;try{testLink.pathname={toString(){throw conversionError;}};}catch(e){conversionThrew=e===conversionError;}check('anchor-conversion-error',conversionThrew);"
+        "let anchorBrand=false;try{Object.getOwnPropertyDescriptor(HTMLAnchorElement.prototype,'pathname').get.call(document.createElement('div'));}catch(e){anchorBrand=e instanceof TypeError;}check('anchor-native-brand',anchorBrand);testLink.href='x\\ud800';check('anchor-usvstring',testLink.getAttribute('href')==='x\\ufffd');"
+        "const apiText=document.createTextNode('x\\ud83d\\ude00'),apiComment=document.createComment('comment');check('characterdata-utf16',apiText.data==='x\\ud83d\\ude00'&&apiText.length===3);apiComment.data='updated';check('characterdata-comment',apiComment.nodeValue==='updated'&&apiComment.length===7);apiText.data=null;let badData=false;try{apiText.data=Symbol();}catch(e){badData=e instanceof TypeError;}check('characterdata-conversion',apiText.data===''&&apiText.length===0&&badData);let dataBrand=false;try{Object.getOwnPropertyDescriptor(CharacterData.prototype,'data').get.call(testForm);}catch(e){dataBrand=e instanceof TypeError;}check('characterdata-brand',dataBrand);"
+        "const tmpl=document.createElement('template');tmpl.innerHTML='<img id=inert-tmpl-img src=\"classic.js\">';document.body.appendChild(tmpl);"
+        "check('template-inert-image',tmpl.content.querySelector('#inert-tmpl-img').ownerDocument!==document);"
         "mark('dom-script-done');</script></body></html>";
     if (!open_case(html, false)) return;
     test_check("dom-script-finished", pump("page-loaded", 8000));
     test_check("dom-jobs-drained", pump(NULL, 4000));
-    static const char *const names[] = {"parser-boundary","classic-current-script","external-classic","blocking-css","defer-after-parser","async-loaded","module-cycle","module-current-script","module-import-meta","dynamic-import","module-top-level-await","dom-content-order","document-write-order","late-write-rejected","window-load-order","dom-node-identity","dom-selector","dom-class-cache","dom-attribute-case","dom-detached","dom-reattach","dom-fragment","dom-clone","inner-html-inert","dynamic-inline","dynamic-empty-then-text","cloned-script-inert","dom-geometry","dynamic-external-order","module-cache"};
+    static const char *const names[] = {"parser-boundary","classic-current-script","external-classic","blocking-css","defer-after-parser","async-loaded","module-cycle","module-current-script","module-import-meta","dynamic-import","module-top-level-await","dom-content-order","document-write-order","late-write-rejected","window-load-order","dom-node-identity","dom-selector","dom-class-cache","dom-attribute-case","dom-detached","dom-reattach","dom-fragment","dom-clone","inner-html-inert","dynamic-inline","dynamic-empty-then-text","cloned-script-inert","dom-geometry","dynamic-external-order","module-cache","polymer-async-isolation","anchor-url-reflection","anchor-pathname-setter","form-interface-properties","form-method-default","form-elements-sameobject","form-action-document-url","form-action-empty-document-url","anchor-private-url","anchor-conversion-error","anchor-native-brand","anchor-usvstring","characterdata-utf16","characterdata-comment","characterdata-conversion","characterdata-brand","template-inert-image"};
     require_marks(names, sizeof names / sizeof *names);
     static const char *const interfaces[] = {"dom-prototype-hierarchy","dom-document-interface","dom-element-prototype-method","dom-no-fake-instanceof","dom-created-interface","dom-fragment-interface","dom-character-interfaces","dom-foreign-interface","dom-clone-interface"};
     require_marks(interfaces, sizeof interfaces / sizeof *interfaces);
@@ -507,6 +528,14 @@ static void test_events_and_forms(void) {
         "document.getElementById('submitter').click();form.requestSubmit();document.getElementById('outsidebutton').click();"
         "check('form-submit-canceled',submits===3);"
         "check('form-external-owner',document.getElementById('outside').form===form&&document.getElementById('outsidebutton').form===form);"
+        "check('form-interface-brand',form instanceof HTMLFormElement&&Object.getPrototypeOf(form)===HTMLFormElement.prototype);"
+        "const resetForm=document.createElement('form'),resetInput=document.createElement('input'),resetCheck=document.createElement('input'),resetArea=document.createElement('textarea');document.body.appendChild(resetForm);resetCheck.type='checkbox';resetForm.append(resetInput,resetCheck,resetArea);"
+        "resetInput.defaultValue='default';resetInput.value='edited';resetCheck.defaultChecked=true;resetCheck.checked=false;resetArea.defaultValue='area-default';resetArea.value='area-edit';let resetEvents=0;const reenterReset=()=>{if(++resetEvents===1)resetForm.reset();};resetForm.addEventListener('reset',reenterReset);resetForm.reset();resetForm.removeEventListener('reset',reenterReset);check('form-reset-reentry',resetEvents===1);"
+        "check('form-reset-native-values',resetInput.value==='default'&&resetCheck.checked&&resetArea.value==='area-default');resetInput.defaultValue='next';resetCheck.defaultChecked=false;resetArea.defaultValue='area-next';check('form-reset-pristine',resetInput.value==='next'&&!resetCheck.checked&&resetArea.value==='area-next');"
+        "resetArea.firstChild.data='child-next';check('textarea-pristine-child-data',resetArea.value==='child-next');resetArea.replaceChildren(document.createTextNode('replaced'));check('textarea-pristine-replace',resetArea.value==='replaced');resetArea.value='keep';resetArea.firstChild.data='new-default';check('textarea-dirty-child-preserved',resetArea.value==='keep');"
+        "const resetRadioOne=document.createElement('input'),resetRadioTwo=document.createElement('input');for(const r of [resetRadioOne,resetRadioTwo]){r.type='radio';r.name='reset-group';r.defaultChecked=true;resetForm.appendChild(r);}resetForm.reset();check('form-reset-radio-group',!resetRadioOne.checked&&resetRadioTwo.checked&&resetRadioOne.defaultChecked&&resetRadioTwo.defaultChecked);"
+        "let badSubmit=false,foreignSubmit=false;try{resetForm.requestSubmit(resetInput);}catch(e){badSubmit=e instanceof TypeError;}try{resetForm.requestSubmit(document.createElement('button'));}catch(e){foreignSubmit=e instanceof DOMException&&e.name==='NotFoundError';}check('requestsubmit-invalid-controls',badSubmit&&foreignSubmit);resetForm.remove();"
+        "const formDoc=document.implementation.createHTMLDocument('form-owner'),ownedForm=formDoc.createElement('form'),ownedControl=formDoc.createElement('input');ownedForm.id='external-form';ownedControl.setAttribute('form','external-form');formDoc.body.append(ownedForm,ownedControl);check('form-independent-document-owner',ownedControl.form===ownedForm&&ownedForm.elements[0]===ownedControl&&ownedForm.action===formDoc.URL);ownedControl.defaultValue='owned';ownedControl.value='edited';ownedForm.reset();check('form-independent-document-reset',ownedControl.value==='owned');"
         "document.getElementById('link').click();check('inline-handler-canceled',globalThis.inlineEvent===true);"
         "const input=document.getElementById('value');input.setAttribute('value','attribute');check('control-pristine-value',input.value==='attribute');"
         "input.value='current';input.setAttribute('value','default');check('control-dirty-value',input.value==='current');"
@@ -535,7 +564,7 @@ static void test_events_and_forms(void) {
     test_check("native-scroll-document", has_mark(&fixture, "native-scroll-document"));
     test_check("native-scroll-window", has_mark(&fixture, "native-scroll-window"));
     test_check("native-scroll-checkpoint", has_mark(&fixture, "native-scroll-microtask"));
-    static const char *const names[] = {"event-capture-bubble-cancel","event-once-remove","event-stop-immediate","event-passive","event-custom","native-event-fields","native-event-microtask","native-key-fields","native-key-done","form-submit-canceled","form-external-owner","inline-handler-canceled","control-pristine-value","control-dirty-value","control-focus","control-blur","control-checkbox-click","control-dirty-checked","control-radio-exclusion","control-select-optgroup","control-select-none","control-option-selected"};
+    static const char *const names[] = {"event-capture-bubble-cancel","event-once-remove","event-stop-immediate","event-passive","event-custom","native-event-fields","native-event-microtask","native-key-fields","native-key-done","form-submit-canceled","form-external-owner","form-interface-brand","form-reset-reentry","form-reset-native-values","form-reset-pristine","textarea-pristine-child-data","textarea-pristine-replace","textarea-dirty-child-preserved","form-reset-radio-group","requestsubmit-invalid-controls","form-independent-document-owner","form-independent-document-reset","inline-handler-canceled","control-pristine-value","control-dirty-value","control-focus","control-blur","control-checkbox-click","control-dirty-checked","control-radio-exclusion","control-select-optgroup","control-select-none","control-option-selected"};
     require_marks(names, sizeof names / sizeof *names);
     static const char *const lifecycle[] = {"event-remove-readd","event-once-readd","event-old-signal-isolated","event-once-signal-isolated","event-active-signal-removes","event-mutation-snapshot"};
     require_marks(lifecycle, sizeof lifecycle / sizeof *lifecycle);
@@ -827,6 +856,8 @@ int main(int argc, char **argv) {
 #define RUN(name, fn) do { if (argc == 1 || !strcmp(argv[1], name)) { printf("jstest: %s\n", name); fflush(stdout); fn(); } } while (0)
     RUN("language", test_language);
     RUN("platform", test_platform);
+    /* Already included in platform above; selecting lexbor runs only its probes. */
+    if (argc > 1 && !strcmp(argv[1], "lexbor")) { printf("jstest: lexbor\n"); fflush(stdout); test_lexbor(); }
     RUN("xhr", test_xhr);
     RUN("documents", test_documents);
     RUN("dom", test_dom_and_scripts);

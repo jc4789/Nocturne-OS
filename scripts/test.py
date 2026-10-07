@@ -143,6 +143,8 @@ def make_disk(a, tcp_port, web_ports):
     mtools("mmd", "-i", PART, "::/tests")
     srcs = sorted(glob.glob(os.path.join(ROOT, "tests", "*.c")))
     srcs += sorted(glob.glob(os.path.join(ROOT, "tests", "js_*_cases.js")))
+    # Internal metadata regression reads diagnostic counters from the real DOM.
+    srcs.append(os.path.join(ROOT, "user", "libc", "web", "webi.h"))
     mtools("mcopy", "-i", PART, *srcs, "::/tests/")
     if a.full:
         tcc = os.path.join(ROOT, "third_party", "tinycc")

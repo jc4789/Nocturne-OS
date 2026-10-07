@@ -10,7 +10,7 @@ const cloneData = (() => {
     const push=A.prototype.push,byteSet=U8.prototype.set;
     const has=(map,key)=>apply(mHas,map,[key]),get=(map,key)=>apply(mGet,map,[key]);
     const put=(map,key,value)=>apply(mSet,map,[key,value]),add=(array,value)=>apply(push,array,[value]);
-    const kinds=new M(),constructors=new M(),classID=host.classID,detach=host.detach,uncloneable=[];
+    const kinds=new M(),constructors=new M(),classID=host.classID,detach=host.detach,uncloneable=[],transferTypes=[];
     const register=(name,sample,ctor)=>{put(kinds,classID(sample),name);if(ctor)put(constructors,name,ctor);};
     register('Object',{});register('Array',[]);register('Date',new DateType());
     register('RegExp',/a/);register('Map',new M());register('Set',new S());
@@ -43,10 +43,16 @@ const cloneData = (() => {
         apply(byteSet,new U8(output),[input]);return output;
     }
     function serialize(input,transfers) {
-        const seen=new M(),records=[];
+        const seen=new M(),records=[],handlers=[],prepared=[];
         // Register placeholders first; capture transferred bytes after user getters.
         if(transfers)for(let i=0;i<transfers.length;i++){
-            put(seen,transfers[i],records.length);add(records,['ArrayBuffer',null]);
+            const item=transfers[i];if(has(seen,item))fail();
+            let handler=null;
+            if(classID(item)!==arrayBufferID){
+                for(let j=0;j<transferTypes.length;j++)if(transferTypes[j].brand(item)){handler=transferTypes[j];break;}
+                if(!handler)fail();handler.validate(item);
+            }else {try{new U8(item,0,0);}catch(_){fail();}}
+            add(handlers,handler);put(seen,item,records.length);add(records,[handler?'Transferred':'ArrayBuffer',null]);
         }
         function visit(value) {
             if(typeof value==='symbol'||typeof value==='function')return fail();
@@ -54,8 +60,8 @@ const cloneData = (() => {
             // JS-backed Web IDL objects share QuickJS's ordinary Object class
             // ID. Their private brands reject them here, during this same walk,
             // before ordinary properties/getters are read (no second traversal).
-            for(let i=0;i<uncloneable.length;i++)if(apply(uncloneable[i],undefined,[value]))return fail();
             if(has(seen,value))return [1,get(seen,value)];
+            for(let i=0;i<uncloneable.length;i++)if(apply(uncloneable[i],undefined,[value]))return fail();
             const kind=get(kinds,classID(value));if(!kind)return fail();
             const id=records.length,record=[kind];add(records,record);put(seen,value,id);
             if(kind==='Object'||kind==='Array'){
@@ -98,8 +104,19 @@ const cloneData = (() => {
             return [1,id];
         }
         const root=visit(input);
-        if(transfers)for(let i=0;i<transfers.length;i++){
-            records[get(seen,transfers[i])][1]=copyBuffer(transfers[i]);detach(transfers[i]);
+        // Complete every fallible allocation/validation before detaching any
+        // source. A getter may itself have transferred an earlier list member.
+        if(transfers){
+            for(let i=0;i<transfers.length;i++){
+                const handler=handlers[i];
+                if(handler){handler.validate(transfers[i]);add(prepared,handler.prepare(transfers[i]));}
+                else add(prepared,copyBuffer(transfers[i]));
+            }
+            for(let i=0;i<transfers.length;i++){
+                const handler=handlers[i];
+                records[get(seen,transfers[i])][1]=prepared[i];
+                if(handler)handler.commit(transfers[i],prepared[i]);else detach(transfers[i]);
+            }
         }
         return [root,records];
     }
@@ -111,6 +128,7 @@ const cloneData = (() => {
             if(kind==='Object')value={};else if(kind==='Array')value=new A(r[1]);
             else if(kind==='Map')value=new M();else if(kind==='Set')value=new S();
             else if(kind==='ArrayBuffer')value=r[1];
+            else if(kind==='Transferred')value=r[1].value;
             else if(has(constructors,kind))value=new(get(constructors,kind))(read(r[1]),r[2],r[3]);
             else if(kind==='Date')value=new DateType(r[1]);else if(kind==='RegExp')value=new RegExpType(r[1],r[2]);
             else if(kind==='Error')value=new errors[r[1]](r[2]);else value=Obj(r[1]);
@@ -127,11 +145,8 @@ const cloneData = (() => {
         }
         return read(root);
     }
-    globalThis.structuredClone=function(value,options={}){
-        if(!arguments.length)throw new TypeErr('Value required');
-        if(options==null)options={};
-        if(typeof options!=='object'&&typeof options!=='function')throw new TypeErr('Expected a dictionary');
-        const list=options.transfer,transfers=[],unique=new M();
+    function transferList(list){
+        const transfers=[];
         if(list!==undefined){
             if(list===null||(typeof list!=='object'&&typeof list!=='function'))throw new TypeErr('Expected an iterable sequence');
             const method=list[iteratorSymbol];if(typeof method!=='function')throw new TypeErr('Expected an iterable sequence');
@@ -141,12 +156,18 @@ const cloneData = (() => {
                 add(transfers,item);
             }
         }
-        for(let i=0;i<transfers.length;i++){
-            const item=transfers[i];if(classID(item)!==arrayBufferID||has(unique,item))fail();put(unique,item,true);
-        }
+        return transfers;
+    }
+    globalThis.structuredClone=function(value,options={}){
+        if(!arguments.length)throw new TypeErr('Value required');
+        if(options==null)options={};
+        if(typeof options!=='object'&&typeof options!=='function')throw new TypeErr('Expected a dictionary');
+        const transfers=transferList(options.transfer);
         return deserialize(serialize(value,transfers));
     };
-    return {serialize,deserialize,registerUncloneable(test){
+    return {serialize,deserialize,transferList,registerTransfer(handler){
+        add(transferTypes,handler);add(uncloneable,handler.brand);
+    },registerUncloneable(test){
         if(typeof test!=='function')throw new TypeErr('Expected a private brand predicate');
         add(uncloneable,test);
     }};

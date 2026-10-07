@@ -534,13 +534,36 @@ int main(void) {
     j->url = read_string(w->url_len, false); j->document = read_string(w->origin_len, false);
     j->method = read_string(w->method_len, false); j->headers = read_string(w->headers_len, false);
     j->request_body = read_string(w->body_len, true);
-    char *cookie_snapshot=read_string(w->cookie_len,true);
+    /* Private transport diagnostics contain no cookie fields or metadata. */
+    const char *cookie_snapshot_error=NULL;
+    char *cookie_snapshot=malloc((size_t)w->cookie_len+1);
+    if(!cookie_snapshot)cookie_snapshot_error="Cookie snapshot allocation failed";
+    else if(!read_all(0,cookie_snapshot,w->cookie_len))cookie_snapshot_error="Cookie snapshot read failed";
+    else cookie_snapshot[w->cookie_len]=0;
     j->cookies=webcookie_create();
+    const char *cookie_psl_error="PSL open failed";
     if(j->cookies){
         FILE *f=fopen("/usr/share/browser/public_suffix_list.dat","r");
-        if(f){char *text=malloc(WEBCOOKIE_PSL_MAX+1);if(text){size_t n=fread(text,1,WEBCOOKIE_PSL_MAX+1,f);if(n<=WEBCOOKIE_PSL_MAX)webcookie_psl_load(j->cookies,text,n);free(text);}fclose(f);}
+        if(f){
+            char *text=malloc(WEBCOOKIE_PSL_MAX+1);
+            if(!text)cookie_psl_error="PSL buffer allocation failed";
+            else{
+                size_t n=fread(text,1,WEBCOOKIE_PSL_MAX+1,f);
+                if(ferror(f))cookie_psl_error="PSL read failed";
+                else if(n>WEBCOOKIE_PSL_MAX)cookie_psl_error="PSL size limit exceeded";
+                else if(!webcookie_psl_load(j->cookies,text,n))cookie_psl_error="PSL parse or policy allocation failed";
+                else cookie_psl_error=NULL;
+                free(text);
+            }
+            fclose(f);
+        }
     }
-    if(!j->cookies || !cookie_snapshot || (w->cookie_len&&!webcookie_import(j->cookies,cookie_snapshot,w->cookie_len,time(NULL)))) fail(j,"Invalid cookie snapshot or out of memory");
+    if(!j->cookies)fail(j,"Cookie jar allocation failed");
+    else if(cookie_snapshot_error)fail(j,cookie_snapshot_error);
+    else if(w->cookie_len&&!webcookie_import(j->cookies,cookie_snapshot,w->cookie_len,time(NULL))){
+        /* import's bool result deliberately does not claim parse rather than OOM. */
+        snprintf(j->error,sizeof j->error,"Cookie snapshot rejected or allocation failed (%s)",cookie_psl_error?cookie_psl_error:"PSL ready");
+    }
     free(cookie_snapshot);
     if (!j->url || !j->document || !j->method || !j->headers || !j->request_body) fail(j, "Invalid request or out of memory");
     else if ((strcmp(j->method, "GET") && strcmp(j->method, "POST")) || (!strcmp(j->method, "GET") && w->body_len)) fail(j, "Only GET and POST are supported");

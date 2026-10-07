@@ -47,6 +47,78 @@ static int split(const char *s, size_t n, const char **tok, size_t *tl, int max,
     return cnt;
 }
 
+/* Rendering retains its existing recovery behavior; feature queries must not
+   report success after a parser silently drops extra tokens. */
+static int split_checked(const char *s, size_t n, const char **tok, size_t *tl, int max, char sep, struct cx *cx) {
+    int k = split(s, n, tok, tl, max, sep);
+    if (cx->supports_probe && k) {
+        const char *end = tok[k - 1] + tl[k - 1];
+        while (end < s + n && is_space((unsigned char)*end)) end++;
+        if (end != s + n) cx->invalid = true;
+        for (int i = 0; i < k; i++) if (!tl[i]) cx->invalid = true;
+    }
+    return k;
+}
+
+/* Resolve name-character escapes without turning escaped punctuation into CSS
+   syntax. Used by both the cascade and queries. Quoted strings remain encoded
+   for the existing string parser. Canonical var() spelling also makes the
+   cascade's substitution dispatch case-insensitive. */
+const char *css_value_canonical(arena_t *a, const char *s, size_t n, size_t *out_n) {
+    *out_n = n;
+    bool needed = memchr(s, '\\', n) != NULL;
+    for (size_t i = 0; !needed && i + 4 <= n; i++)
+        if (strn_ieq(s + i, "var(", 4) && (s[i] != 'v' || s[i + 1] != 'a' || s[i + 2] != 'r')) needed = true;
+    if (!needed) return s;
+    char *out = ar_alloc(a, n * 3 + 1);
+    size_t k = 0;
+    char quote = 0;
+    for (size_t i = 0; i < n;) {
+        char c = s[i];
+        if (quote) {
+            out[k++] = s[i++];
+            if (c == '\\' && i < n) out[k++] = s[i++];
+            else if (c == quote) quote = 0;
+            continue;
+        }
+        if (c == '"' || c == '\'') { quote = c; out[k++] = s[i++]; continue; }
+        if (c == '\\' && i + 1 < n) {
+            size_t start = i++;
+            uint32_t cp = 0;
+            int digits = 0;
+            while (i < n && digits < 6 && isxdigit((unsigned char)s[i])) {
+                int d = s[i] | 32;
+                cp = cp * 16 + (uint32_t)(d <= '9' ? d - '0' : d - 'a' + 10);
+                i++; digits++;
+            }
+            if (!digits) cp = (unsigned char)s[i++];
+            else if (i < n && is_space((unsigned char)s[i])) {
+                if (s[i++] == '\r' && i < n && s[i] == '\n') i++;
+            }
+            if (!cp || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) cp = 0xfffd;
+            if (cp >= 128 || isalnum((unsigned char)cp) || cp == '-' || cp == '_') {
+                char u[4]; int len = utf8_put(u, cp);
+                memcpy(out + k, u, (size_t)len); k += (size_t)len;
+            } else { memcpy(out + k, s + start, i - start); k += i - start; }
+            continue;
+        }
+        out[k++] = s[i++];
+    }
+    out[k] = 0;
+    /* At a function-token boundary only; names such as myVAR() are unchanged. */
+    for (size_t i = 0; i + 4 <= k;) {
+        char c = out[i];
+        if (c == '"' || c == '\'') {
+            i++; while (i < k && out[i] != c) { if (out[i] == '\\') i++; i++; } i++;
+        } else if (strn_ieq(out + i, "var(", 4) && (!i || !(isalnum((unsigned char)out[i - 1]) ||
+                     out[i - 1] == '-' || out[i - 1] == '_' || (unsigned char)out[i - 1] >= 128))) {
+            memcpy(out + i, "var", 3); i += 4;
+        } else i++;
+    }
+    *out_n = k;
+    return out;
+}
+
 void css_unescape(sbuf *out, const char *s, size_t n) {
     for (size_t i = 0; i < n; i++) {
         if (s[i] != '\\') {
@@ -163,6 +235,7 @@ static void cskip(const char **s, const char *e) {
 }
 
 static struct cexpr *cnode(struct cx *cx, char op, struct cexpr *a, struct cexpr *b) {
+    if (cx->supports_probe && ++cx->supports_nodes > 512) cx->invalid = true;
     struct cexpr *x = ar_alloc(cx->a, sizeof *x);
     x->op = op;
     x->a = a;
@@ -375,6 +448,7 @@ static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int fl
             if (ident_is(s, n, "min-content") || ident_is(s, n, "max-content") || ident_is(s, n, "fit-content") ||
                 ident_is(s, n, "-webkit-fill-available") || ident_is(s, n, "-moz-available") ||
                 ident_is(s, n, "stretch") || ident_is(s, n, "-webkit-fit-content") || ident_is(s, n, "-moz-fit-content")) {
+                if (cx->supports_probe) return false; /* intrinsic sizing is currently an auto/none fallback */
                 if (flags & LF_AUTO) out->kind = LK_AUTO;
                 else if (flags & LF_NONE) out->kind = LK_NONE;
                 else return false;
@@ -383,6 +457,7 @@ static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int fl
             return false;
         }
         if (ident_is(s, k, "fit-content")) {
+            if (cx->supports_probe) return false;
             if (!(flags & LF_AUTO)) return false;
             out->kind = LK_AUTO;
             return true;
@@ -390,7 +465,7 @@ static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int fl
         const char *p = s;
         struct cexpr *x = calc_value(&p, s + n, cx);
         cskip(&p, s + n);
-        if (!x || p != s + n) return false;
+        if (!x || p != s + n || (cx->supports_probe && cx->invalid)) return false;
         bool num;
         float px, pct;
         if (cfold(x, &num, &px, &pct)) {
@@ -508,7 +583,8 @@ static float srgb_gamma(float x) {
     return 1.055f * (float)pow(x, 1 / 2.4) - 0.055f;
 }
 
-bool css_color(const char *s, size_t n, uint32_t *out) {
+static bool css_color_impl(const char *s, size_t n, uint32_t *out, bool strict, int depth) {
+    if (depth > 32) return false;
     trim(&s, &n);
     if (!n) return false;
     if (s[0] == '#') {
@@ -535,15 +611,21 @@ bool css_color(const char *s, size_t n, uint32_t *out) {
         const char *args = s + fl + 1;
         size_t an = n - fl - 2;
         if (ident_is(s, fl, "light-dark")) {
+            if (strict) return false; /* current engine always picks the light branch */
             const char *t[2];
             size_t tl[2];
             if (split(args, an, t, tl, 2, ',') < 1) return false;
-            return css_color(t[0], tl[0], out);
+            return css_color_impl(t[0], tl[0], out, strict, depth + 1);
         }
         if (ident_is(s, fl, "color-mix")) {
             const char *t[3];
             size_t tl[3];
             if (split(args, an, t, tl, 3, ',') != 3) return false;
+            if (strict) {
+                const char *end = t[2] + tl[2];
+                while (end < args + an && is_space((unsigned char)*end)) end++;
+                if (end != args + an || !ident_is(t[0],tl[0],"in srgb")) return false;
+            }
             uint32_t c[2];
             float p[2] = {-1, -1};
             for (int i = 0; i < 2; i++) {
@@ -552,7 +634,7 @@ bool css_color(const char *s, size_t n, uint32_t *out) {
                 int k = split(t[i + 1], tl[i + 1], u, ul, 2, ' ');
                 int ci = 0;
                 if (k == 2 && u[0][ul[0] - 1] == '%') ci = 1;
-                if (!k || !css_color(u[ci], ul[ci], &c[i])) return false;
+                if (!k || !css_color_impl(u[ci], ul[ci], &c[i], strict, depth + 1)) return false;
                 if (k == 2) {
                     const char *q = u[1 - ci];
                     if (!parse_number(&q, u[1 - ci] + ul[1 - ci], &p[i])) return false;
@@ -581,6 +663,22 @@ bool css_color(const char *s, size_t n, uint32_t *out) {
         size_t tl[4];
         int k = split(buf, an, t, tl, 4, ' ');
         if (k < 3) return false;
+        if (strict) {
+            const char *end = t[k - 1] + tl[k - 1];
+            while (end < buf + an && is_space((unsigned char)*end)) end++;
+            if (end != buf + an) return false;
+            bool commas = memchr(args, ',', an) != NULL;
+            const char *slash = memchr(args, '/', an);
+            if (commas && slash) return false;
+            if (!commas && k == 4 && !slash) return false;
+            if (slash && memchr(slash + 1, '/', (size_t)(args + an - slash - 1))) return false;
+            if (commas) {
+                const char *parts[5]; size_t lengths[5];
+                int count = split(args,an,parts,lengths,5,',');
+                if (count != k) return false;
+                for (int i=0;i<count;i++) if (!lengths[i]) return false;
+            }
+        }
         float alpha = 1;
         if (k == 4 && !comp(t[3], tl[3], 1, &alpha)) return false;
         float c0, c1, c2;
@@ -644,6 +742,11 @@ bool css_color(const char *s, size_t n, uint32_t *out) {
         else lo = mid + 1;
     }
     return false;
+}
+
+bool css_color(const char *s, size_t n, uint32_t *out) { return css_color_impl(s,n,out,false,0); }
+static bool css_color_checked(const char *s, size_t n, uint32_t *out, struct cx *cx) {
+    return css_color_impl(s,n,out,cx->supports_probe,0);
 }
 
 /* ---------------------------------------------------------------- the property table */
@@ -983,11 +1086,14 @@ static bool kw_find(const struct kw *k, const char *s, size_t n, uint8_t *out) {
     return false;
 }
 
-static bool parse_display(const char *s, size_t n, uint8_t *out) {
+static bool parse_display(const char *s, size_t n, uint8_t *out, struct cx *cx) {
     const char *t[3];
     size_t tl[3];
-    int k = split(s, n, t, tl, 3, ' ');
+    int k = split_checked(s, n, t, tl, 3, ' ', cx);
     if (k == 1) {
+        if (cx->supports_probe && (ident_is(s,n,"run-in") || ident_is(s,n,"ruby") ||
+            ident_is(s,n,"ruby-base") || ident_is(s,n,"ruby-text") || ident_is(s,n,"-webkit-box") ||
+            ident_is(s,n,"-moz-box") || ident_is(s,n,"-webkit-inline-box"))) return false;
         static const struct kw kd[] = {
             {"none", D_NONE}, {"inline", D_INLINE}, {"block", D_BLOCK}, {"list-item", D_LIST_ITEM},
             {"inline-block", D_INLINE_BLOCK}, {"table", D_TABLE}, {"inline-table", D_INLINE_TABLE},
@@ -1005,9 +1111,11 @@ static bool parse_display(const char *s, size_t n, uint8_t *out) {
     bool inl = false, block = false, li = false;
     int inner = -1;
     for (int i = 0; i < k; i++) {
-        if (ident_is(t[i], tl[i], "inline")) inl = true;
-        else if (ident_is(t[i], tl[i], "block")) block = true;
-        else if (ident_is(t[i], tl[i], "list-item")) li = true;
+        if (cx->supports_probe && inner >= 0 && (ident_is(t[i],tl[i],"flow") || ident_is(t[i],tl[i],"flow-root") ||
+            ident_is(t[i],tl[i],"flex") || ident_is(t[i],tl[i],"grid") || ident_is(t[i],tl[i],"table"))) return false;
+        if (ident_is(t[i], tl[i], "inline")) { if (cx->supports_probe && (inl || block)) return false; inl = true; }
+        else if (ident_is(t[i], tl[i], "block")) { if (cx->supports_probe && (inl || block)) return false; block = true; }
+        else if (ident_is(t[i], tl[i], "list-item")) { if (cx->supports_probe && li) return false; li = true; }
         else if (ident_is(t[i], tl[i], "flow")) inner = 0;
         else if (ident_is(t[i], tl[i], "flow-root")) inner = 1;
         else if (ident_is(t[i], tl[i], "flex")) inner = 2;
@@ -1016,6 +1124,7 @@ static bool parse_display(const char *s, size_t n, uint8_t *out) {
         else return false;
     }
     if (inl && block) return false;
+    if (cx->supports_probe && li && inner > 1) return false;
     if (li) *out = D_LIST_ITEM;
     else if (inner == 2) *out = inl ? D_INLINE_FLEX : D_FLEX;
     else if (inner == 3) *out = inl ? D_INLINE_GRID : D_GRID;
@@ -1070,10 +1179,26 @@ static bool parse_font_weight(const char *s, size_t n, struct cx *cx, uint16_t *
     return true;
 }
 
-static bool mono_family(const char *s, size_t n, bool *out) {
+static bool mono_family(const char *s, size_t n, bool *out, struct cx *cx) {
     const char *t[16];
     size_t tl[16];
-    int k = split(s, n, t, tl, 16, ',');
+    int k = split_checked(s, n, t, tl, 16, ',', cx);
+    if (cx->supports_probe) {
+        for (int i=0;i<k;i++) {
+            const char *f=t[i];size_t len=tl[i];
+            if (!len) return false;
+            if (f[0]=='"' || f[0]=='\'') { if (len<2 || f[len-1]!=f[0]) return false; continue; }
+            for (size_t j=0;j<len;) {
+                while (j<len && is_space((unsigned char)f[j])) j++;
+                size_t start=j;
+                if (j<len && (isdigit((unsigned char)f[j]) || (f[j]=='-' && j+1<len && isdigit((unsigned char)f[j+1])))) return false;
+                while (j<len && (isalnum((unsigned char)f[j]) || f[j]=='-' || f[j]=='_' || (unsigned char)f[j]>=128)) j++;
+                if (j==start || (j<len && !is_space((unsigned char)f[j]))) return false;
+                if (ident_is(f+start,j-start,"inherit") || ident_is(f+start,j-start,"initial") ||
+                    ident_is(f+start,j-start,"unset") || ident_is(f+start,j-start,"revert") || ident_is(f+start,j-start,"revert-layer")) return false;
+            }
+        }
+    }
     static const char *const mono[] = {"monospace", "ui-monospace", "courier", "courier new", "consolas",
                                        "menlo", "monaco", "sfmono-regular", "sf mono", "fira code", "fira mono",
                                        "source code pro", "dejavu sans mono", "liberation mono", "roboto mono",
@@ -1157,10 +1282,11 @@ static const char *parse_url(const char *s, size_t n, arena_t *a) {
 static bool parse_bg_pos(const char *s, size_t n, struct cx *cx, len_t *out) {
     const char *layer[8];
     size_t ll[8];
-    if (split(s, n, layer, ll, 8, ',') < 1) return false;
+    int layers = split_checked(s, n, layer, ll, 8, ',', cx);
+    if (layers < 1 || (cx->supports_probe && layers != 1)) return false;
     const char *t[4];
     size_t tl[4];
-    int k = split(layer[0], ll[0], t, tl, 4, ' ');
+    int k = split_checked(layer[0], ll[0], t, tl, 4, ' ', cx);
     if (k < 1 || k > 4) return false;
     len_t v[2];
     memset(v, 0, sizeof v);
@@ -1211,7 +1337,8 @@ static bool parse_bg_pos(const char *s, size_t n, struct cx *cx, len_t *out) {
 static bool parse_bg_size(const char *s, size_t n, struct cx *cx, len_t *size, uint8_t *kind) {
     const char *layer[8];
     size_t ll[8];
-    if (split(s, n, layer, ll, 8, ',') < 1) return false;
+    int layers = split_checked(s, n, layer, ll, 8, ',', cx);
+    if (layers < 1 || (cx->supports_probe && layers != 1)) return false;
     s = layer[0];
     n = ll[0];
     memset(size, 0, 2 * sizeof *size);
@@ -1220,7 +1347,7 @@ static bool parse_bg_size(const char *s, size_t n, struct cx *cx, len_t *size, u
     else {
         const char *t[2];
         size_t tl[2];
-        int k = split(s, n, t, tl, 2, ' ');
+        int k = split_checked(s, n, t, tl, 2, ' ', cx);
         if (k < 1) return false;
         for (int i = 0; i < k; i++)
             if (!parse_len(t[i], tl[i], cx, &size[i], LF_AUTO)) return false;
@@ -1236,7 +1363,8 @@ static bool parse_mask_image(const char *s, size_t n, struct cx *cx) {
     }
     const char *t[8];
     size_t tl[8];
-    int k = split(s, n, t, tl, 8, ',');
+    int k = split_checked(s, n, t, tl, 8, ',', cx);
+    if (cx->supports_probe && (k != 1 || !strn_ieq(s, "url(", 4))) return false;
     for (int i = 0; i < k; i++) {
         const char *u = parse_url(t[i], tl[i], cx->a);
         if (u) {
@@ -1269,25 +1397,29 @@ static const struct gradient *parse_gradient(const char *s, size_t n, struct cx 
     g.at[0].pct = g.at[1].pct = 50;
     const char *a[GRAD_MAX + 2];
     size_t al[GRAD_MAX + 2];
-    int m = split(s + fl + 1, n - fl - 2, a, al, GRAD_MAX + 2, ',');
+    int m = split_checked(s + fl + 1, n - fl - 2, a, al, GRAD_MAX + 2, ',', cx);
     for (int j = 0; j < m; j++) {
         const char *c[8];
         size_t cl[8];
-        int q = split(a[j], al[j], c, cl, 8, ' ');
+        int q = split_checked(a[j], al[j], c, cl, 8, ' ', cx);
         uint32_t col;
-        if (q >= 1 && css_color(c[0], cl[0], &col)) { /* a colour stop: colour [pos [pos]] */
+        if (q >= 1 && css_color_checked(c[0], cl[0], &col, cx)) { /* a colour stop: colour [pos [pos]] */
+            if (cx->supports_probe && q > 3) return NULL;
             for (int z = 0; z < 2 && g.n < GRAD_MAX; z++) {
                 if (z == 1 && q < 3) break;
                 g.col[g.n] = col;
                 g.pos[g.n].kind = LK_AUTO;
-                if (q > 1 + z && !parse_len(c[1 + z], cl[1 + z], cx, &g.pos[g.n], 0)) g.pos[g.n].kind = LK_AUTO;
+                if (q > 1 + z && !parse_len(c[1 + z], cl[1 + z], cx, &g.pos[g.n], 0)) {
+                    if (cx->supports_probe) return NULL;
+                    g.pos[g.n].kind = LK_AUTO;
+                }
                 g.n++;
             }
             continue;
         }
         if (q == 1 && g.n && j < m - 1) { /* a colour hint: ignored */
             len_t hint;
-            if (parse_len(c[0], cl[0], cx, &hint, 0)) continue;
+            if (parse_len(c[0], cl[0], cx, &hint, 0)) { if (cx->supports_probe) return NULL; continue; }
         }
         if (j) return NULL;
         /* the first argument: direction or shape */
@@ -1322,11 +1454,12 @@ static const struct gradient *parse_gradient(const char *s, size_t n, struct cx 
                 break;
             } else {
                 len_t l; /* an explicit size: approximated by the default */
+                if (cx->supports_probe) return NULL;
                 if (!parse_len(c[z], cl[z], cx, &l, 0)) return NULL;
             }
         }
     }
-    if (g.n < 1) return NULL;
+    if (g.n < 1 || (cx->supports_probe && g.n < 2)) return NULL;
     if (g.n == 1) { /* one stop: a solid colour */
         g.col[1] = g.col[0];
         g.pos[1].kind = LK_AUTO;
@@ -1348,7 +1481,8 @@ static bool parse_bg_image(const char *s, size_t n, struct cx *cx) {
     /* several layers: the first one that we can use */
     const char *t[8];
     size_t tl[8];
-    int k = split(s, n, t, tl, 8, ',');
+    int k = split_checked(s, n, t, tl, 8, ',', cx);
+    if (cx->supports_probe && k != 1) return false; /* no layered painting */
     for (int i = 0; i < k; i++) {
         const char *u = parse_url(t[i], tl[i], cx->a);
         if (u) {
@@ -1364,7 +1498,7 @@ static bool parse_bg_image(const char *s, size_t n, struct cx *cx) {
             return true;
         }
     }
-    return k > 0;
+    return !cx->supports_probe && k > 0;
 }
 
 static bool parse_content(const char *s, size_t n, struct cx *cx) {
@@ -1379,13 +1513,14 @@ static bool parse_content(const char *s, size_t n, struct cx *cx) {
             else if (s[i] == (char)q) q = 0;
         } else if (s[i] == '"' || s[i] == '\'') q = (unsigned char)s[i];
         else if (s[i] == '/') {
+            if (cx->supports_probe) return false;
             n = i;
             break;
         }
     }
     const char *t[32];
     size_t tl[32];
-    int k = split(s, n, t, tl, 32, ' ');
+    int k = split_checked(s, n, t, tl, 32, ' ', cx);
     sbuf b = {0};
     for (int i = 0; i < k; i++) {
         const char *v = t[i];
@@ -1403,8 +1538,10 @@ static bool parse_content(const char *s, size_t n, struct cx *cx) {
                 for (int j = 0; j < e->nattrs; j++)
                     if (strn_ieq(an, e->attrs[j].name, anl)) sb_puts(&b, e->attrs[j].value);
         } else if (vn > 8 && (strn_ieq(v, "counter(", 8) || strn_ieq(v, "counters(", 9))) {
+            if (cx->supports_probe) { sb_free(&b); return false; }
         } else if (vn > 4 && (strn_ieq(v, "url(", 4) || strn_ieq(v, "image-set(", 10) ||
                               strstr(v, "gradient("))) {
+            if (cx->supports_probe) { sb_free(&b); return false; }
         } else {
             sb_free(&b);
             return false;
@@ -1445,7 +1582,7 @@ static bool parse_track(const char *s, size_t n, struct cx *cx, struct gtrack *t
     if (k < n && s[n - 1] == ')' && (ident_is(s, k, "minmax") || ident_is(s, k, "fit-content"))) {
         const char *a[2];
         size_t al[2];
-        int m = split(s + k + 1, n - k - 2, a, al, 2, ',');
+        int m = split_checked(s + k + 1, n - k - 2, a, al, 2, ',', cx);
         if (ident_is(s, k, "fit-content")) {
             if (m != 1 || !parse_len(a[0], al[0], cx, &t->max, 0)) return false;
             t->min_kind = GT_AUTO;
@@ -1471,7 +1608,7 @@ static int parse_track_list(const char *s, size_t n, struct cx *cx, struct gtrac
                             int *rep_n, bool *fit) {
     const char *t[64];
     size_t tl[64];
-    int k = split(s, n, t, tl, 64, ' '), cnt = 0;
+    int k = split_checked(s, n, t, tl, 64, ' ', cx), cnt = 0;
     bool in_names = false;
     for (int i = 0; i < k; i++) {
         if (in_names || t[i][0] == '[') {
@@ -1483,7 +1620,7 @@ static int parse_track_list(const char *s, size_t n, struct cx *cx, struct gtrac
         if (f < tl[i] && ident_is(t[i], f, "repeat") && t[i][tl[i] - 1] == ')') {
             const char *a[2];
             size_t al[2];
-            if (split(t[i] + f + 1, tl[i] - f - 2, a, al, 2, ',') != 2) return -1;
+            if (split_checked(t[i] + f + 1, tl[i] - f - 2, a, al, 2, ',', cx) != 2) return -1;
             struct gtrack inner[32];
             int m = rep_at ? parse_track_list(a[1], al[1], cx, inner, 32, NULL, NULL, NULL) : -1;
             if (m <= 0) return -1;
@@ -1539,7 +1676,7 @@ static bool parse_gareas(const char *s, size_t n, struct cx *cx, const struct ga
     }
     const char *t[64];
     size_t tl[64];
-    int rows = split(s, n, t, tl, 64, ' ');
+    int rows = split_checked(s, n, t, tl, 64, ' ', cx);
     if (rows < 1) return false;
     const char *names[64][32];
     int cols = 0;
@@ -1586,7 +1723,7 @@ static bool parse_gline(const char *s, size_t n, struct cx *cx, struct gline *g)
     if (ident_is(s, n, "auto")) return true;
     const char *t[3];
     size_t tl[3];
-    int k = split(s, n, t, tl, 3, ' ');
+    int k = split_checked(s, n, t, tl, 3, ' ', cx);
     bool span = false;
     int num = 0;
     const char *name = NULL;
@@ -1656,6 +1793,8 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     switch (p->type) {
     case PT_KW: {
         uint8_t k;
+        if (cx->supports_probe && ((p->kws == kw_textwrap && !ident_is(v,n,"wrap") && !ident_is(v,n,"nowrap")) ||
+            (p->kws == kw_ttrans && ident_is(v,n,"full-width")))) return false;
         if (!kw_find(p->kws, v, n, &k)) return false;
         *(uint8_t *)field = k;
         return true;
@@ -1666,7 +1805,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         if (k != OV_VISIBLE) *(uint8_t *)field = k;
         return true;
     }
-    case PT_DISPLAY: return parse_display(v, n, (uint8_t *)field);
+    case PT_DISPLAY: return parse_display(v, n, (uint8_t *)field, cx);
     case PT_LEN: {
         len_t l;
         if (!parse_len(v, n, cx, &l, p->flags)) return false;
@@ -1681,7 +1820,8 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         }
         const char *t[2];
         size_t tl[2];
-        if (split(v, n, t, tl, 2, ' ') < 1) return false; /* border-spacing: the first value */
+        int count = split_checked(v, n, t, tl, 2, ' ', cx);
+        if (count < 1 || (cx->supports_probe && count != 1)) return false; /* only one stored axis */
         len_t l;
         if (!parse_len(t[0], tl[0], cx, &l, p->flags)) return false;
         *(float *)field = len_resolve(&l, 0);
@@ -1692,10 +1832,12 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         size_t tl[4];
         char buf[128];
         size_t bn = n < sizeof buf - 1 ? n : sizeof buf - 1;
+        if (cx->supports_probe && (bn != n || memchr(v, '/', n))) return false;
         memcpy(buf, v, bn);
         for (size_t i = 0; i < bn; i++)
             if (buf[i] == '/') buf[i] = ' ';
-        if (split(buf, bn, t, tl, 4, ' ') < 1) return false;
+        int count = split_checked(buf, bn, t, tl, 4, ' ', cx);
+        if (count < 1 || (cx->supports_probe && count != 1)) return false; /* elliptical radii are not stored */
         len_t l;
         if (!parse_len(t[0], tl[0], cx, &l, 0)) return false;
         /* a percentage is stored negated and resolved against the box at paint time */
@@ -1704,7 +1846,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     }
     case PT_COLOR: {
         uint32_t c;
-        if (!css_color(v, n, &c)) return false;
+        if (!css_color_checked(v, n, &c, cx)) return false;
         if (c == COLOR_CURRENT && p->off == offsetof(style_t, color)) c = par->color;
         *(uint32_t *)field = c;
         return true;
@@ -1734,13 +1876,14 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         const char *q = v;
         float x;
         if (!parse_number(&q, v + n, &x) || q != v + n) return false;
+        if (cx->supports_probe && (x != floorf(x) || x > 2147483520.0f || x < -2147483648.0f)) return false;
         *(int *)field = (int)x;
         if (p->type == PT_ZINDEX) s->z_auto = false;
         return true;
     }
     case PT_FONT_SIZE: return parse_font_size(v, n, cx, &s->font_size);
     case PT_FONT_WEIGHT: return parse_font_weight(v, n, cx, &s->font_weight);
-    case PT_FONT_FAMILY: return mono_family(v, n, &s->monospace);
+    case PT_FONT_FAMILY: return mono_family(v, n, &s->monospace, cx);
     case PT_LINE_HEIGHT: {
         len_t l;
         if (ident_is(v, n, "normal")) {
@@ -1787,7 +1930,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     case PT_TEXT_DECO: {
         const char *t[4];
         size_t tl[4];
-        int k = split(v, n, t, tl, 4, ' ');
+        int k = split_checked(v, n, t, tl, 4, ' ', cx);
         uint8_t d = 0;
         for (int i = 0; i < k; i++) {
             if (ident_is(t[i], tl[i], "underline")) d |= TD_UNDERLINE;
@@ -1806,11 +1949,11 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
 /* ---------------------------------------------------------------- shorthands */
 static bool set_long(const char *name, const char *v, size_t n, struct cx *cx) {
     const struct propdef *p = find_prop(name, strlen(name));
-    if (!p) return false;
+    if (!p) { if (cx->supports_probe) cx->invalid = true; return false; }
     int i = css_prop_index(p);
     if (cx->set[i]) return true;
     if (cx->font_pass && p->type != PT_FONT_SIZE) return true;
-    if (!apply_long(p, v, n, cx)) return false;
+    if (!apply_long(p, v, n, cx)) { if (cx->supports_probe) cx->invalid = true; return false; }
     cx->set[i] = 1;
     return true;
 }
@@ -1821,8 +1964,8 @@ static const char *const side_names[4] = {"top", "right", "bottom", "left"};
 static bool set_box(const char *fmt, const char *v, size_t n, struct cx *cx, const int *sides, int nsides) {
     const char *t[4];
     size_t tl[4];
-    int k = split(v, n, t, tl, 4, ' ');
-    if (k < 1) return false;
+    int k = split_checked(v, n, t, tl, 4, ' ', cx);
+    if (k < 1 || (cx->supports_probe && nsides == 2 && k > 2)) return false;
     char name[64];
     if (nsides == 4) {
         static const int pick[5][4] = {{0}, {0, 0, 0, 0}, {0, 1, 0, 1}, {0, 1, 2, 1}, {0, 1, 2, 3}};
@@ -1853,16 +1996,20 @@ static bool is_bwidth(const char *s, size_t n, struct cx *cx) {
 static bool set_border(const char *v, size_t n, struct cx *cx, const int *sides, int nsides) {
     const char *t[3];
     size_t tl[3];
-    int k = split(v, n, t, tl, 3, ' ');
+    int k = split_checked(v, n, t, tl, 3, ' ', cx);
     const char *w = "medium", *st = "none", *c = "currentcolor";
     size_t wl = 6, sl = 4, cl = 12;
     uint8_t dummy;
     uint32_t col;
+    unsigned seen = 0;
     for (int i = 0; i < k; i++) {
-        if (kw_find(kw_bstyle, t[i], tl[i], &dummy)) st = t[i], sl = tl[i];
-        else if (is_bwidth(t[i], tl[i], cx)) w = t[i], wl = tl[i];
-        else if (css_color(t[i], tl[i], &col)) c = t[i], cl = tl[i];
+        unsigned bit;
+        if (kw_find(kw_bstyle, t[i], tl[i], &dummy)) { bit = 1; st = t[i]; sl = tl[i]; }
+        else if (is_bwidth(t[i], tl[i], cx)) { bit = 2; w = t[i]; wl = tl[i]; }
+        else if (css_color_checked(t[i], tl[i], &col, cx)) { bit = 4; c = t[i]; cl = tl[i]; }
         else return false;
+        if (cx->supports_probe && (seen & bit)) return false;
+        seen |= bit;
     }
     char name[64];
     for (int i = 0; i < nsides; i++) {
@@ -1880,7 +2027,7 @@ static bool set_border(const char *v, size_t n, struct cx *cx, const int *sides,
 static bool set_font(const char *v, size_t n, struct cx *cx) {
     const char *t[16];
     size_t tl[16];
-    int k = split(v, n, t, tl, 16, ' ');
+    int k = split_checked(v, n, t, tl, 16, ' ', cx);
     static const char *const sys[] = {"caption", "icon", "menu", "message-box", "small-caption", "status-bar",
                                       "-webkit-small-control", "-apple-system-body", NULL};
     if (k == 1)
@@ -1940,22 +2087,22 @@ static bool set_font(const char *v, size_t n, struct cx *cx) {
 static bool set_background(const char *v, size_t n, struct cx *cx) {
     const char *layers[8];
     size_t ll[8];
-    int k = split(v, n, layers, ll, 8, ',');
-    if (k < 1) return false;
+    int k = split_checked(v, n, layers, ll, 8, ',', cx);
+    if (k < 1 || (cx->supports_probe && k != 1)) return false;
     /* the colour may only be in the last layer */
     const char *t[12];
     size_t tl[12];
-    int m = split(layers[k - 1], ll[k - 1], t, tl, 12, ' ');
+    int m = split_checked(layers[k - 1], ll[k - 1], t, tl, 12, ' ', cx);
     const char *col = "transparent";
     size_t cl = 11;
     uint32_t c;
     for (int i = 0; i < m; i++)
-        if (css_color(t[i], tl[i], &c)) col = t[i], cl = tl[i];
+        if (css_color_checked(t[i], tl[i], &c, cx)) col = t[i], cl = tl[i];
     set_long("background-color", col, cl, cx);
     /* images: any url() or gradient in any layer */
     bool img = false;
     for (int L = 0; L < k && !img; L++) {
-        m = split(layers[L], ll[L], t, tl, 12, ' ');
+        m = split_checked(layers[L], ll[L], t, tl, 12, ' ', cx);
         for (int i = 0; i < m; i++)
             if (strn_ieq(t[i], "url(", 4) || memchr(t[i], '(', tl[i])) {
                 if (strn_ieq(t[i], "url(", 4) || strstr(t[i], "gradient(")) {
@@ -1970,7 +2117,7 @@ static bool set_background(const char *v, size_t n, struct cx *cx) {
     }
     if (!img) set_long("background-image", "none", 4, cx);
     /* repeat, position and size of the first layer */
-    m = split(layers[0], ll[0], t, tl, 12, ' ');
+    m = split_checked(layers[0], ll[0], t, tl, 12, ' ', cx);
     const char *rep = "repeat";
     size_t rl = 6;
     char pos[256], size[128];
@@ -1984,7 +2131,8 @@ static bool set_background(const char *v, size_t n, struct cx *cx) {
         }
         const char *tok = t[i];
         size_t tn = tl[i];
-        if (strn_ieq(tok, "url(", 4) || memchr(tok, '(', tn) || css_color(tok, tn, &c)) continue;
+        if (strn_ieq(tok, "url(", 4) || strstr(tok, "gradient(") ||
+            (!cx->supports_probe && memchr(tok, '(', tn)) || css_color_checked(tok, tn, &c, cx)) continue;
         if (ident_is(tok, tn, "fixed") || ident_is(tok, tn, "scroll") || ident_is(tok, tn, "local") ||
             ident_is(tok, tn, "border-box") || ident_is(tok, tn, "padding-box") || ident_is(tok, tn, "content-box") ||
             ident_is(tok, tn, "text") || ident_is(tok, tn, "none"))
@@ -2014,7 +2162,7 @@ static bool set_background(const char *v, size_t n, struct cx *cx) {
 static bool set_flex(const char *v, size_t n, struct cx *cx) {
     const char *t[3];
     size_t tl[3];
-    int k = split(v, n, t, tl, 3, ' ');
+    int k = split_checked(v, n, t, tl, 3, ' ', cx);
     if (k == 1 && ident_is(t[0], tl[0], "none"))
         return set_long("flex-grow", "0", 1, cx), set_long("flex-shrink", "0", 1, cx),
                set_long("flex-basis", "auto", 4, cx);
@@ -2024,6 +2172,7 @@ static bool set_flex(const char *v, size_t n, struct cx *cx) {
     const char *g = "1", *sh = "1", *b = "0%";
     size_t gl = 1, shl = 1, bl = 2;
     int nums = 0;
+    bool basis = false;
     for (int i = 0; i < k; i++) {
         const char *q = t[i];
         float x;
@@ -2032,7 +2181,7 @@ static bool set_flex(const char *v, size_t n, struct cx *cx) {
             else if (nums == 1) sh = t[i], shl = tl[i];
             else return false;
             nums++;
-        } else b = t[i], bl = tl[i];
+        } else { if (cx->supports_probe && basis) return false; basis = true; b = t[i]; bl = tl[i]; }
     }
     if (!nums) g = "1", gl = 1;
     set_long("flex-grow", g, gl, cx);
@@ -2052,7 +2201,7 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         static const char *const nm[4] = {"top", "right", "bottom", "left"};
         const char *t[4];
         size_t tl[4];
-        int k = split(v, n, t, tl, 4, ' ');
+        int k = split_checked(v, n, t, tl, 4, ' ', cx);
         if (k < 1) return false;
         static const int pick[5][4] = {{0}, {0, 0, 0, 0}, {0, 1, 0, 1}, {0, 1, 2, 1}, {0, 1, 2, 3}};
         for (int i = 0; i < 4; i++) set_long(nm[i], t[pick[k][i]], tl[pick[k][i]], cx);
@@ -2065,7 +2214,7 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     case SH_INSET_INLINE: case SH_INSET_BLOCK: {
         const char *t[2];
         size_t tl[2];
-        int k = split(v, n, t, tl, 2, ' ');
+        int k = split_checked(v, n, t, tl, 2, ' ', cx);
         if (k < 1) return false;
         const char *a = p->sh == SH_INSET_INLINE ? "left" : "top", *b = p->sh == SH_INSET_INLINE ? "right" : "bottom";
         set_long(a, t[0], tl[0], cx);
@@ -2101,7 +2250,7 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         }
         const char *t[3];
         size_t tl[3];
-        int k = split(v, n, t, tl, 3, ' ');
+        int k = split_checked(v, n, t, tl, 3, ' ', cx);
         const char *type = "disc", *pos = "outside";
         size_t typel = 4, posl = 7;
         bool none = false;
@@ -2158,7 +2307,7 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     case SH_FLEX_FLOW: {
         const char *t[2];
         size_t tl[2];
-        int k = split(v, n, t, tl, 2, ' ');
+        int k = split_checked(v, n, t, tl, 2, ' ', cx);
         for (int i = 0; i < k; i++) {
             uint8_t d;
             if (kw_find(kw_fdir, t[i], tl[i], &d)) set_long("flex-direction", t[i], tl[i], cx);
@@ -2171,7 +2320,7 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     case SH_GAP: {
         const char *t[2];
         size_t tl[2];
-        int k = split(v, n, t, tl, 2, ' ');
+        int k = split_checked(v, n, t, tl, 2, ' ', cx);
         if (k < 1) return false;
         set_long("row-gap", t[0], tl[0], cx);
         set_long("column-gap", t[k - 1], tl[k - 1], cx);
@@ -2180,7 +2329,7 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     case SH_OVERFLOW: {
         const char *t[2];
         size_t tl[2];
-        int k = split(v, n, t, tl, 2, ' ');
+        int k = split_checked(v, n, t, tl, 2, ' ', cx);
         if (k < 1) return false;
         set_long("overflow-x", t[0], tl[0], cx);
         set_long("overflow-y", t[k - 1], tl[k - 1], cx);
@@ -2190,7 +2339,7 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         if (global) return set_long("text-decoration-line", v, n, cx);
         const char *t[6];
         size_t tl[6];
-        int k = split(v, n, t, tl, 6, ' ');
+        int k = split_checked(v, n, t, tl, 6, ' ', cx);
         char line[64] = "none";
         size_t ln = 4;
         for (int i = 0; i < k; i++)
@@ -2203,13 +2352,13 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
                     ln += tl[i];
                     line[ln] = 0;
                 }
-            }
+            } else if (cx->supports_probe && !ident_is(t[i],tl[i],"none")) return false; /* other decoration fields aren't painted */
         return set_long("text-decoration-line", line, ln, cx);
     }
     case SH_PLACE_SELF: case SH_PLACE_CONTENT: {
         const char *t[2];
         size_t tl[2];
-        int k = split(v, n, t, tl, 2, ' ');
+        int k = split_checked(v, n, t, tl, 2, ' ', cx);
         if (k < 1) return false;
         if (p->sh == SH_PLACE_CONTENT) return set_long("justify-content", t[k - 1], tl[k - 1], cx);
         set_long("align-self", t[0], tl[0], cx);
@@ -2224,7 +2373,7 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         int want = p->sh == SH_GRID_AREA ? 4 : 2;
         const char *t[4];
         size_t tl[4];
-        int k = split(v, n, t, tl, 4, '/');
+        int k = split_checked(v, n, t, tl, 4, '/', cx);
         if (k < 1 || k > want) return false;
         const char *s[4];
         size_t sl[4];
@@ -2250,13 +2399,13 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         }
         const char *t[2];
         size_t tl[2];
-        if (split(v, n, t, tl, 2, '/') != 2) return false;
+        if (split_checked(v, n, t, tl, 2, '/', cx) != 2) return false;
         /* grid: auto-flow forms */
         if (p->sh == SH_GRID) {
             for (int side = 0; side < 2; side++) {
                 const char *w[4];
                 size_t wl[4];
-                int k = split(t[side], tl[side], w, wl, 4, ' ');
+                int k = split_checked(t[side], tl[side], w, wl, 4, ' ', cx);
                 int a = -1;
                 for (int i = 0; i < k; i++)
                     if (ident_is(w[i], wl[i], "auto-flow")) a = i;
@@ -2285,7 +2434,7 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         size_t an = 0, rn = 0;
         const char *w[64];
         size_t wl[64];
-        int k = split(t[0], tl[0], w, wl, 64, ' ');
+        int k = split_checked(t[0], tl[0], w, wl, 64, ' ', cx);
         bool pending = false; /* a string without its size yet */
         for (int i = 0; i < k; i++) {
             if (w[i][0] == '[') continue;
@@ -2315,7 +2464,7 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     case SH_PLACE_ITEMS: {
         const char *t[2];
         size_t tl[2];
-        int k = split(v, n, t, tl, 2, ' ');
+        int k = split_checked(v, n, t, tl, 2, ' ', cx);
         if (k < 1) return false;
         set_long("justify-items", t[k - 1], tl[k - 1], cx);
         return set_long("align-items", t[0], tl[0], cx);
@@ -2334,6 +2483,26 @@ bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx) 
     if (!apply_long(p, v, n, cx)) return false;
     cx->set[i] = 1;
     return true;
+}
+
+bool css_value_supported(const struct propdef *p, const char *v, size_t n) {
+    if (!p || !v || n > 65536) return false;
+    arena_t *a = calloc(1, sizeof *a);
+    if (!a) return false;
+    a->limit = 1u << 20;
+    jmp_buf trap;
+    a->trap = &trap;
+    if (setjmp(trap)) { ar_free(a); free(a); return false; }
+    style_t style, parent;
+    css_style_init(&parent, NULL);
+    css_style_init(&style, &parent);
+    uint8_t *set = ar_alloc(a, (size_t)css_prop_count());
+    struct cx cx = {.s=&style, .parent=&parent, .em=16, .rem=16, .vw=800, .vh=600,
+                    .a=a, .set=set, .supports_probe=true};
+    bool result = css_apply(p, v, n, &cx) && !cx.invalid;
+    ar_free(a);
+    free(a);
+    return result;
 }
 
 void css_style_init(style_t *s, const style_t *parent) {

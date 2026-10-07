@@ -2,6 +2,7 @@
    style/box/layout pipeline, and forms. */
 #include <stdio.h>
 #include <ctype.h>
+#include "nocturne.h"
 #include "webi.h"
 
 struct pending {
@@ -237,11 +238,33 @@ static bool placeholder_src(const char *s) {
     return !s || !*s || (!strncasecmp(s, "data:image/gif", 14) && strlen(s) < 200) || (!strncasecmp(s, "data:image/svg", 14) && strlen(s) < 200 && strstr(s, "%3C/svg") == NULL);
 }
 
+/* Allocation lists keep their lifetime owner even after DOM adoption. The
+ * family contains at most 64 auxiliary documents (doc_inert's existing cap).
+ * Resource users must enumerate logical owners, not only d's own arena.
+ * previous must be NULL or a node returned by this iterator. */
+node_t *doc_image_node_next(web_doc *d, node_t *previous) {
+    if (!d || d->inert) return NULL;
+    web_doc *family = d->dom_family ? d->dom_family : d;
+    web_doc *allocation = previous ? previous->allocation_doc : family;
+    node_t *n = previous ? previous->owned_next : allocation->owned_nodes;
+    while (allocation) {
+        for (; n; n = n->owned_next)
+            if (n->owner == d && n->type == N_ELEM && !n->foreign &&
+                (n->tag == T_img || n->tag == T_input)) return n;
+        allocation = allocation == family ? family->dom_docs : allocation->dom_next;
+        n = allocation ? allocation->owned_nodes : NULL;
+    }
+    return NULL;
+}
+
 /* Both connected and script-created detached HTML images have image requests.
  * Preserve an available current image while its replacement is pending. */
 void doc_image_sync(web_doc *d, node_t *n) {
     if (!d || d->inert) return;
-    if (!d || !n || n->type != N_ELEM || n->foreign || n->tag != T_img) return;
+    if (!d || !n || n->type != N_ELEM || n->foreign || n->tag != T_img || n->owner != d) return;
+    for (node_t *p = n; p; p = p->parent ? p->parent : p->template_host) {
+        if (p->tag == T_template || p->template_host) return;
+    }
     const char *src = node_attr(n, "src"), *ss = node_attr(n, "srcset");
     const char *lazy = node_attr(n, "data-src");
     if (!lazy) lazy = node_attr(n, "data-lazy-src");
@@ -277,7 +300,7 @@ void doc_control_init(web_doc *d, node_t *n) {
         n->checked = node_attr(n, "checked") != NULL;
     } else if (n->tag == T_textarea) {
         sbuf b = {0};
-        text_of(n, &b);
+        node_text_content(n, &b);
         doc_node_value(d, n, b.p ? b.p : "", b.n);
         n->value_dirty = false;
         sb_free(&b);
@@ -518,6 +541,46 @@ static void free_pending(web_doc *d) {
     d->pending_css.n = 0;
 }
 
+static node_t *first_base(node_t *n, uint64_t *visits) {
+    for (node_t *c = n ? n->first : NULL; c; c = c->next) {
+        (*visits)++;
+        if (c->type != N_ELEM) continue;
+        if (!c->foreign && c->tag == T_template) continue;
+        if (!c->foreign && c->tag == T_base && node_attr(c, "href")) return c;
+        node_t *found = first_base(c, visits);
+        if (found) return found;
+    }
+    return NULL;
+}
+
+/* Synchronous DOM/URL reads need the current tree, not a new CSS snapshot.
+   Leave resources_dirty set: task completion or a layout read still scans
+   resources, applies stylesheet changes, and initializes pending controls. */
+void doc_sync_tree(web_doc *d) {
+    if (!d) return;
+    struct web_profile *profile = &(d->dom_family ? d->dom_family : d)->profile;
+    uint64_t start = uptime_ms();
+    profile->metadata_syncs++;
+    d->html = d->head = d->body = NULL;
+    for (node_t *n = d->root ? d->root->first : NULL; n; n = n->next) {
+        profile->metadata_visits++;
+        if (n->type == N_ELEM) { d->html = n; break; }
+    }
+    for (node_t *n = d->html ? d->html->first : NULL; n; n = n->next) {
+        profile->metadata_visits++;
+        if (!d->head && !n->foreign && n->tag == T_head) d->head = n;
+        if (!d->body && !n->foreign && (n->tag == T_body || n->tag == T_frameset)) d->body = n;
+    }
+    snprintf(d->base, sizeof d->base, "%s", d->url);
+    node_t *base = first_base(d->root, &profile->metadata_visits);
+    if (base) {
+        char url[1024];
+        if (url_resolve(d->url, node_attr(base, "href"), url, sizeof url))
+            snprintf(d->base, sizeof d->base, "%s", url);
+    }
+    profile->metadata_ms += uptime_ms() - start;
+}
+
 void doc_rescan(web_doc *d) {
     if (d && d->inert && d->resources_dirty) {
         d->resources_dirty = false; d->html = d->head = d->body = NULL;
@@ -537,6 +600,8 @@ void doc_rescan(web_doc *d) {
         return; /* no authored CSS, image/meta fetch or live resource scan */
     }
     if (!d || !d->live || !d->resources_dirty) return;
+    uint64_t profile_start = uptime_ms();
+    d->profile.rescans++;
     d->resources_dirty = false;
     css_styling_free(&d->sty);
     ar_free(&d->cssmem);
@@ -560,8 +625,13 @@ void doc_rescan(web_doc *d) {
     d->mem.trap = d->cssmem.trap = &trap;
     if (!setjmp(trap)) {
         if (d->root) scan(d, d->root);
-        for (node_t *n = d->owned_nodes; n; n = n->owned_next)
-            if (n->tag == T_img && !node_ancestor(n, T_template)) doc_image_sync(d, n);
+        for (node_t *n = doc_image_node_next(d, NULL); n; n = doc_image_node_next(d, n)) {
+            bool in_template = false;
+            for (node_t *p = n; p; p = p->parent ? p->parent : p->template_host) {
+                if (p->tag == T_template || p->template_host) { in_template = true; break; }
+            }
+            if (n->tag == T_img && !in_template) doc_image_sync(d, n);
+        }
         if (!d->scan_title_seen) d->title = NULL;
     } else {
         /* Incomplete authored sheet snapshots must never outlive their arena. */
@@ -572,6 +642,7 @@ void doc_rescan(web_doc *d) {
     d->mem.trap = old_mem;
     d->cssmem.trap = old_css;
     d->dirty = d->need_style = true;
+    d->profile.rescan_ms += uptime_ms() - profile_start;
 }
 
 void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const char *css, size_t n) {
@@ -744,8 +815,15 @@ void web_image_loaded(web_doc *d, int i, const void *data, size_t n) {
     }
     if (!im->img) im->failed = true;
     d->layout_valid = false; d->dirty = true;
-    for (node_t *node = d->owned_nodes; node; node = node->owned_next)
-        if (node->tag == T_img && node->image_initialized && node->image_request == i) node->image = i;
+    for (node_t *node = doc_image_node_next(d, NULL); node; node = doc_image_node_next(d, node)) {
+        if (node->tag == T_img && node->image_initialized && node->image_request == i) {
+            bool in_template = false;
+            for (node_t *p = node; p; p = p->parent ? p->parent : p->template_host) {
+                if (p->tag == T_template || p->template_host) { in_template = true; break; }
+            }
+            if (!in_template) node->image = i;
+        }
+    }
 }
 
 /* CSS background images are known once styles are: add them to the document's images */
@@ -1110,6 +1188,70 @@ static node_t *form_of(web_doc *d, node_t *n) {
 }
 
 web_node *web_form_owner(web_doc *d, web_node *control) { return form_of(d, control); }
+
+/* Reset current control state without writing default attributes or making it dirty. */
+static node_t *reset_form_id(node_t *n, const char *id) {
+    if (n->type == N_ELEM && n->id && !strcmp(n->id, id)) return n;
+    for (node_t *c = n->first; c; c = c->next) {
+        node_t *found = reset_form_id(c, id); if (found) return found;
+    }
+    return NULL;
+}
+
+static bool reset_form_text(node_t *n, char *out, size_t *len) {
+    if (n->type == N_TEXT) {
+        if (n->textlen > (16u << 20) - *len) return false;
+        if (out && n->textlen) memcpy(out + *len, n->text, n->textlen);
+        *len += n->textlen;
+    } else for (node_t *c = n->first; c; c = c->next)
+        if (!reset_form_text(c, out, len)) return false;
+    return true;
+}
+
+static bool reset_form_controls(web_doc *d, node_t *root, node_t *form, node_t *n) {
+    if (n->type == N_ELEM && !n->foreign && (n->tag == T_input || n->tag == T_textarea || n->tag == T_select)) {
+        const char *fid = node_attr(n, "form");
+        node_t *owner = fid ? (root == d->root ? reset_form_id(root, fid) : NULL) : node_ancestor(n, T_form);
+        if (owner == form) {
+            if (n->tag == T_input) {
+                const char *v = node_attr(n, "value");
+                if (!doc_node_value(d, n, v ? v : "", v ? strlen(v) : 0)) return false;
+                n->value_dirty = n->checked_dirty = false;
+                n->checked = node_attr(n, "checked") != NULL;
+                n->control_ready = true;
+                const char *type = node_attr(n, "type");
+                if (n->checked && type && str_ieq(type, "radio")) {
+                    doc_control_checked(d, n, true); n->checked_dirty = false;
+                }
+            } else if (n->tag == T_textarea) {
+                size_t len = 0, used = 0;
+                if (!reset_form_text(n, NULL, &len)) return false;
+                char *text = malloc(len + 1); if (!text) return false;
+                bool ok = reset_form_text(n, text, &used) && doc_node_value(d, n, text, used);
+                free(text); if (!ok) return false;
+                n->value_dirty = false; n->control_ready = true;
+            } else {
+                n->selected_set = false; n->control_ready = false;
+                for (int i = 0; ; i++) {
+                    node_t *option = doc_select_option(n, i); if (!option) break;
+                    option->selected_set = false;
+                }
+                doc_control_init(d, n);
+            }
+        }
+    }
+    for (node_t *c = n->first; c; c = c->next)
+        if (!reset_form_controls(d, root, form, c)) return false;
+    return true;
+}
+
+bool doc_form_reset(web_doc *d, node_t *form) {
+    if (!d || !form || form->type != N_ELEM || form->foreign || form->tag != T_form) return false;
+    node_t *root = form; while (root->parent) root = root->parent;
+    bool ok = reset_form_controls(d, root, form, root);
+    d->dirty = d->need_style = true;
+    return ok;
+}
 
 static void uncheck_radios(node_t *scope, node_t *keep, const char *name) {
     for (node_t *c = scope->first; c; c = c->next) {
