@@ -11,6 +11,7 @@ general-purpose OS: see [Limits](#limits). A few borrowed pieces of code are inc
 - BearSSL provides TLS.
 - Lexbor が HTML の字句解析・木構築を、QuickJS が JavaScript 言語の実行を担当します。ブラウザー API と描画は Nocturne 側の実装です。
 - TinyCC is the C compiler that runs inside the OS.
+- 限定したFFmpeg 9.0.2のC decoderを、Nocturne固有のIO・音声・動画表示に移植しています。
 - stb_truetype, stb_image, JebP and NanoSVG read fonts and images for the web browser, which draws text in Inter.
 
 Nocturne also has an **AI agent**. `agent` connects to an LLM over HTTPS, and the model can then run
@@ -29,6 +30,7 @@ HTML tokenizer／tree builder は Lexbor へ移行しました。Nocturne の DO
 その後の属性ノード・DOMTokenList・HTML要素・Fetch/Abortとnative通信の一括拡張は [API拡張記録](docs/browser-api-batch-2026-10-06.md) を参照してください。未実装のstream/CSSOM等を対応済みとはしていません。
 Shadow DOM・Intl.Collator・TCP接続枠の拡張と2 GiB QEMUでの検証は [次の拡張記録](docs/browser-shadow-intl-network-2026-10-06.md) に記載します。実装範囲と未達項目を区別しています。
 HTML要素・日時/数値入力・フォーム検証・複数選択・detailsの追加は [要素とフォームの拡張記録](docs/browser-elements-forms-2026-10-07.md) に記載します。HTML5testの検出結果と、実際のGUI・サイト動作は別に確認します。
+CPU/AP worker、実Canvas、限定virgl、FFmpegとGUI/browser再生の追加は [CPU・描画・メディア統合記録](docs/platform-progress-2026-10-07.md) を参照してください。全面SMP・WebGL・配信サイト全般・日常利用OSの完成とは区別しています。
 
 ![Desktop and start menu](docs/desktop-menu.png)
 
@@ -374,7 +376,7 @@ The model's instructions are in `/etc/agent/system.md`. Sessions and the agent's
 ## Limits
 
 What Nocturne does not have, so nobody is surprised:
-- **One CPU.** There is no SMP; extra virtual CPUs are ignored.
+- **CPUの並列化は限定的です。** APは同期型の純計算workerとして実仕事を行いますが、通常のtask scheduler・IRQ・QuickJS・FFmpegはBSP専用です。一般プロセスSMPやAVXは未対応です。
 - **No users or permissions.** Every process is isolated in its own address space, but all of them can read and write every file.
 - **No `fork`/`exec`.** Processes are started with `spawn`. There are no signals beyond kill, no threads, no dynamic linking and no swap.
 - **The window manager runs in the kernel.**

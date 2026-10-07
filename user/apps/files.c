@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
+#include "media.h"
 
 #define TB 40     /* toolbar height */
 #define HDR 22    /* column header */
@@ -85,6 +86,8 @@ static const char *type_name(const struct entry *e) {
     if (dot && !strcasecmp(dot, ".txt")) return "Text";
     if (dot && !strcasecmp(dot, ".ppm")) return "Picture";
     if (dot && !strcasecmp(dot, ".wav")) return "Sound";
+    if (dot && (nmedia_audio_extension(e->name) || !strcasecmp(dot, ".mp4") ||
+                !strcasecmp(dot, ".avi") || !strcasecmp(dot, ".mov"))) return "Media";
     if (dot && (!strcasecmp(dot, ".html") || !strcasecmp(dot, ".htm"))) return "Web page";
     if (dot && !strcasecmp(dot, ".sh")) return "Script";
     return "File";
@@ -186,6 +189,7 @@ static void open_entry(int i) {
     if (!strcmp(t, "Program")) r = gui_launch(path, NULL);
     else if (!strcmp(t, "Picture")) r = gui_launch("/bin/paint", path);
     else if (!strcmp(t, "Sound")) r = gui_launch("/bin/player", path);
+    else if (!strcmp(t, "Media")) r = gui_launch("/bin/mediaplayer", path);
     else if (!strcmp(t, "Web page")) r = gui_launch("/bin/browser", path);
     else r = gui_launch("/bin/notepad", path);
     snprintf(status, sizeof status, r < 0 ? "could not open %s" : "opened %s", ents[i].name);

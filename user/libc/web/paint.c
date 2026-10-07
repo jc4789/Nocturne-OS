@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <math.h>
 #include "webi.h"
+#include "js_canvas.h"
+#include "avmedia.h"
 #include "elements.h"
 #include "form_value.h"
 #include "form_validation.h"
@@ -711,6 +713,13 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     }
     case AT_PLACEHOLDER: {
         int X = (int)roundf(x), Y = (int)roundf(y), W = (int)roundf(w), H = (int)roundf(h);
+        if (n->tag == T_canvas) {
+            web_canvas_paint(n,c,X,Y,W,H);
+            break;
+        }
+        if (n->tag == T_audio || n->tag == T_video) {
+            if(web_avmedia_paint(P->d,n,c,X,Y,W,H))break;
+        }
         if (n->tag == T_meter || n->tag == T_progress) {
             const char *vs = node_attr(n, "value"), *ms = node_attr(n, "max"), *mins = node_attr(n, "min");
             float v = vs ? (float)atof(vs) : 0, mx = ms ? (float)atof(ms) : 1, mn = mins ? (float)atof(mins) : 0;

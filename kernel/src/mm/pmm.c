@@ -1,6 +1,7 @@
 /* Physical memory manager: a simple bitmap of 4 KiB frames. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/smp.h"
 #include "mm/pmm.h"
 #include "limine.h"
 
@@ -63,6 +64,7 @@ void pmm_init(struct limine_memmap_response *mm) {
 }
 
 uint64_t pmm_alloc(void) {
+    cpu_require_bsp();
     uint64_t f = irq_save();
     uint64_t words = (total_pages + 63) / 64;
     for (uint64_t n = 0; n < words; n++) {
@@ -88,6 +90,7 @@ uint64_t pmm_alloc_zeroed(void) {
 }
 
 uint64_t pmm_alloc_contig(uint64_t count) {
+    cpu_require_bsp();
     uint64_t f = irq_save();
     uint64_t run = 0;
     for (uint64_t p = 256; p < total_pages; p++) {
@@ -105,6 +108,7 @@ uint64_t pmm_alloc_contig(uint64_t count) {
 }
 
 void pmm_free(uint64_t phys) {
+    cpu_require_bsp();
     uint64_t p = phys / PAGE_SIZE;
     if (p >= total_pages) return;
     uint64_t f = irq_save();

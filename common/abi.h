@@ -8,6 +8,7 @@ enum {
     SYS_GETPID, SYS_KILL, SYS_SBRK, SYS_SLEEP, SYS_UPTIME, SYS_TIME, SYS_PIPE, SYS_DUP2,
     SYS_DUP, SYS_POLL, SYS_PROCLIST, SYS_SYSINFO, SYS_YIELD, SYS_POWER, SYS_FCNTL, SYS_GETPPID,
     SYS_KILLTREE, SYS_DMESG, SYS_PCILIST, SYS_MMAP, SYS_MUNMAP, SYS_MPROTECT,
+    SYS_CPU_INFO, SYS_GPU_INFO, SYS_GPU_RENDER, SYS_AUDIO_FLUSH,
     SYS_WIN_CREATE = 64, SYS_WIN_MAP, SYS_WIN_PRESENT, SYS_WIN_SET_TITLE, SYS_SCREEN_INFO,
     SYS_WIN_MOVE, SYS_CLIPBOARD_SET, SYS_CLIPBOARD_GET, SYS_WIN_RESIZE, SYS_GUI_LAUNCH,
     SYS_SCREEN_GRAB,
@@ -58,6 +59,16 @@ struct n_sysinfo {
     char cpu[64];
     char os[64];
 };
+
+/* Separate versioned extension: the existing n_sysinfo layout is unchanged.
+   APs run bounded kernel jobs, not arbitrary user processes or JS workers. */
+struct n_cpuinfo {
+    uint32_t version, detected_cpus, online_cpus, worker_cpus, scheduler_cpus, flags;
+    uint64_t parallel_jobs, worker_chunks;
+};
+#define N_CPU_AP_WORKERS 1u
+#define N_CPU_SSE2 2u
+#define N_CPU_AVX 4u
 
 struct n_pollfd {
     int fd;

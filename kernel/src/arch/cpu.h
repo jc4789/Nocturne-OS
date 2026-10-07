@@ -69,12 +69,17 @@ struct regs {
 #define TSS_SEL   0x28
 
 void gdt_init(void);
+void gdt_init_cpu(unsigned index);
 void tss_set_rsp0(uint64_t rsp0);
 void idt_init(void);
+void idt_load(void);
 typedef void (*irq_handler_t)(struct regs *r);
 void irq_register(int irq, irq_handler_t h);
 void vector_register(int vec, irq_handler_t h);
 bool lapic_present(void);
+uint32_t lapic_current_id(void);
+bool lapic_worker_init(void);
+bool lapic_send_ipi(uint32_t apic_id, uint8_t vector);
 void lapic_eoi(void);
 bool lapic_timer_start(unsigned hz, int vector);
 extern uint64_t tsc_hz; /* measured by lapic_timer_start(); 0 if unknown */

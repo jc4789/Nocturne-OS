@@ -8,6 +8,8 @@
 #include <webnet.h>
 #include <quickjs.h>
 #include "webi.h"
+#include "js_canvas.h"
+#include "avmedia.h"
 #include "form_value.h"
 #include "form_validation.h"
 #include "elements.h"
@@ -66,7 +68,8 @@ enum { NP_NODE, NP_DOCUMENT, NP_ELEMENT, NP_HTML, NP_TEXT, NP_COMMENT, NP_FRAGME
        NP_INPUT, NP_BUTTON, NP_SELECT, NP_TEXTAREA, NP_FIELDSET, NP_OBJECT, NP_OUTPUT, NP_OPTION, NP_TEMPLATE, NP_DOCTYPE,
        NP_SCRIPT, NP_FORM, NP_ANCHOR, NP_AREA, NP_SVG, NP_SVGSVG, NP_PI, NP_ATTR,
        NP_META, NP_LINK, NP_STYLE, NP_BASE, NP_TITLE, NP_HEAD, NP_SHADOW, NP_SLOT,
-       NP_TIME, NP_DATA, NP_DETAILS, NP_OL, NP_LI, NP_UNKNOWN, NP_COUNT };
+       NP_TIME, NP_DATA, NP_DETAILS, NP_OL, NP_LI, NP_UNKNOWN, NP_CANVAS,
+       NP_AVMEDIA, NP_AUDIO, NP_VIDEO, NP_COUNT };
 struct js_alloc_diagnostics { size_t peak, requested, used, limit; unsigned failures, reported; bool quota; };
 struct web_js_state {
     struct js_alloc_diagnostics allocation;
@@ -341,6 +344,9 @@ static JSValueConst node_prototype(struct web_js_state *s, const node_t *n) {
         case T_details: kind = NP_DETAILS; break;
         case T_ol: kind = NP_OL; break;
         case T_li: kind = NP_LI; break;
+        case T_canvas: kind = NP_CANVAS; break;
+        case T_audio: kind = NP_AUDIO; break;
+        case T_video: kind = NP_VIDEO; break;
     }
     if (kind == NP_HTML && unknown_html_interface(n)) kind = NP_UNKNOWN;
     return s->node_protos[kind];
@@ -576,6 +582,9 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
         return content ? wrap(s, content) : oom(ctx);
     }
     if (!strcmp(p, "URL") || !strcmp(p, "documentURI")) return JS_NewString(ctx, d->url);
+    /* Nocturne currently sends no navigation referrer. Expose the standard
+       empty DOMString, not undefined (and never invent a previous URL). */
+    if (!strcmp(p, "referrer")) return JS_NewString(ctx, "");
     if (!strcmp(p, "contentType")) return JS_NewString(ctx, "text/html");
     if (!strcmp(p, "characterSet")) return JS_NewString(ctx, "UTF-8");
     if (!strcmp(p, "compatMode")) return JS_NewString(ctx, d->quirks ? "BackCompat" : "CSS1Compat");
@@ -1507,6 +1516,27 @@ static JSValue native_history(JSContext *ctx, JSValueConst this_val, int argc, J
     JS_SetPropertyStr(ctx, out, "data", op == WEB_HISTORY_INFO && value && result.state_len ? JS_NewArrayBufferCopy(ctx, result.state, result.state_len) : JS_NULL);
     return out;
 }
+static JSValue native_canvas(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 2) return JS_ThrowTypeError(ctx, "Canvas node and operation required");
+    node_t *node = unwrap(ctx, argv[0]);
+    if (!node) return JS_ThrowTypeError(ctx, "Native Canvas receiver required");
+    return web_canvas_native(ctx, node, argc - 1, argv + 1);
+}
+
+static JSValue native_avmedia(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (argc < 2) return JS_ThrowTypeError(ctx, "Media operation and receiver required");
+    const char *op = JS_ToCString(ctx, argv[0]);
+    if (!op) return JS_EXCEPTION;
+    node_t *node = !strcmp(op, "type") ? NULL : unwrap(ctx, argv[1]);
+    if (!node && strcmp(op, "type")) {
+        JS_FreeCString(ctx, op);
+        return JS_ThrowTypeError(ctx, "Native media receiver required");
+    }
+    JSValue result = web_avmedia_call(ctx, state(ctx)->doc, node, op, argc - 2, argv + 2);
+    JS_FreeCString(ctx, op);
+    return result;
+}
+
 static JSValue native_media(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if (!argc) return JS_ThrowTypeError(ctx, "Media query is required");
     size_t len; const char *query = JS_ToCStringLen(ctx, &len, argv[0]);
@@ -1668,6 +1698,7 @@ static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSV
     if (s->doc->resources_dirty) doc_rescan(s->doc);
     node_t *disclosure=doc_details_activation(n);
     if (disclosure) doc_details_toggle(s->doc,disclosure);
+    else if (n->tag == T_audio || n->tag == T_video) web_media_activate(s->doc, n);
     else if (n->tag == T_a) {
         const char *href = doc_link_href(s->doc, n);
         if (href && permitted_url(s, href, false) && s->host.navigate) s->host.navigate(s->host.opaque, href, NULL);
@@ -2497,6 +2528,20 @@ bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *event) 
     for (int i = 0; i < 3; ++i) JS_FreeValue(s->ctx, args[i]);
     end_task(s); return allowed;
 }
+bool web_media_activate(web_doc *d, web_node *target) {
+    struct web_js_state *s = d ? d->js : NULL;
+    if (!s || s->disabled || !target || target->type != N_ELEM || target->foreign ||
+        (target->tag != T_audio && target->tag != T_video) || !node_attr(target, "controls")) return false;
+    begin_task(s);
+    JSValue argument = wrap(s, target);
+    JSValue result = JS_IsException(argument) ? JS_EXCEPTION : custom_element_hook(s, "avmediaActivate", 1, &argument);
+    bool activated = false;
+    if (JS_IsException(result)) exception(s);
+    else { activated = JS_ToBool(s->ctx, result) > 0; JS_FreeValue(s->ctx, result); }
+    JS_FreeValue(s->ctx, argument);
+    end_task(s);
+    return activated;
+}
 void web_hover(web_doc *d, web_node *target, const struct web_event *event) {
     struct web_js_state *s = d && d->live ? d->js : NULL;
     if (!s || s->disabled || s->running || !event) return;
@@ -2775,6 +2820,8 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("classID", 1, native_class_id), JS_CFUNC_DEF("detach", 1, native_detach),
         JS_CFUNC_DEF("history", 4, native_history), JS_CFUNC_DEF("cookie", 1, native_cookie), JS_CFUNC_DEF("scroll", 2, native_scroll),
         JS_CFUNC_DEF("media", 1, native_media),
+        JS_CFUNC_DEF("canvas", 2, native_canvas),
+        JS_CFUNC_DEF("avmedia", 4, native_avmedia),
         JS_CFUNC_DEF("observers", 1, native_observers),
         JS_CFUNC_DEF("resolve", 1, native_resolve), JS_CFUNC_DEF("ready", 0, native_ready), JS_CFUNC_DEF("current", 0, native_current),
         JS_CFUNC_DEF("write", 1, native_write), JS_CFUNC_DEF("encode", 1, native_encode), JS_CFUNC_DEF("navigate", 1, native_navigate),

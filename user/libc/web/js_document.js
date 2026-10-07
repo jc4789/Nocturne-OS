@@ -41,7 +41,7 @@
             if(!implementation){implementation=Object.create(DOMImplementation.prototype);implementationBrands.set(implementation,this);implementations.set(this,implementation);}
             return implementation;
         }});
-        for(const key of ['documentElement','head','body','doctype','activeElement','title','URL','documentURI','baseURI','contentType','characterSet','compatMode']){
+        for(const key of ['documentElement','head','body','doctype','activeElement','title','URL','documentURI','referrer','baseURI','contentType','characterSet','compatMode']){
             const descriptor={configurable:true,enumerable:true,get(){brand(this);return dom('get',this,key);}};
             if(key==='title')descriptor.set=function(value){brand(this);dom('set',this,key,string(value));};
             Object.defineProperty(Document.prototype,key,descriptor);

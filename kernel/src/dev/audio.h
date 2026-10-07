@@ -13,6 +13,11 @@
 void audio_init(void);
 void audio_tick(void); /* from the timer interrupt, every millisecond */
 
+struct file;
+/* Drop only this stream's not-yet-mixed PCM. Already submitted card/remote
+ * sink buffers are outside this queue; ordinary close still drains. */
+int audio_flush_file(struct file *file);
+
 /* Mix `frames` frames from every stream into out (NULL: just consume them). Returns false, with
    silence in out, when no stream had anything to play. */
 bool audio_mix(int16_t *out, int frames);

@@ -1,0 +1,141 @@
+{
+  "generator": "ffmpeg version 8.1.1-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers",
+  "authorship": "synthetic lavfi tone/pattern generated for Nocturne regression",
+  "fixtures": [
+    {
+      "path": "stereo.wav",
+      "bytes": 38478,
+      "sha256": "5af201bf448e29ad09dd7c5f2e5ebee0aef6fdb426b537db9ad7f2b111f71eeb",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:a",
+        "pcm_s16le"
+      ]
+    },
+    {
+      "path": "stereo.flac",
+      "bytes": 33087,
+      "sha256": "f02d8b50d55fbf639deb281e31efafa9137f409fe775779b24003b0563b05a5d",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:a",
+        "flac"
+      ]
+    },
+    {
+      "path": "stereo.mp3",
+      "bytes": 4269,
+      "sha256": "7e1d8edda04f593c19d75b31c1fb97a0904c5b41f425353ea13627c8e52393e5",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "128k"
+      ]
+    },
+    {
+      "path": "stereo.aac",
+      "bytes": 3117,
+      "sha256": "15279a84fe51b9f3c0fcbc82334397af1ef55201851545837d6a9a006b8d72e8",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k"
+      ]
+    },
+    {
+      "path": "mjpeg.avi",
+      "bytes": 15796,
+      "sha256": "3c13ee3510e3d5419cea312957dd3d86d0531bfc114fb574b6ccff86649138b3",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=96x64:rate=10:duration=0.4",
+        "-an",
+        "-c:v",
+        "mjpeg",
+        "-q:v",
+        "3",
+        "-pix_fmt",
+        "yuvj420p"
+      ]
+    },
+    {
+      "path": "h264.mp4",
+      "bytes": 4368,
+      "sha256": "f35dc0e11156eb7b191b763f80ebb85374abf475325031e04a8e14630c73a853",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=96x64:rate=10:duration=0.4",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "baseline",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart"
+      ]
+    },
+    {
+      "path": "av.mp4",
+      "bytes": 8061,
+      "sha256": "89a1df038b38700bfabea7db692113c679276141725e78505a90fa94671d03b7",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=96x64:rate=10:duration=0.4",
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:v",
+        "libx264",
+        "-profile:v",
+        "baseline",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart"
+      ]
+    },
+    {
+      "path": "unsupported.webm",
+      "bytes": 5017,
+      "sha256": "10445571be2c8f16b8574f66c74c510e5e7de906d14e6c741be716b279ba6fe2",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=96x64:rate=10:duration=0.4",
+        "-an",
+        "-c:v",
+        "libvpx",
+        "-b:v",
+        "80k"
+      ]
+    }
+  ]
+}

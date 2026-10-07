@@ -57,6 +57,8 @@ static const struct test tests[] = {
 
     /* memory and protection */
     {"mem", "malloc-stress", "tcc -o /home/memtest /data/tests/memtest.c && /home/memtest", 0, {"memtest: ok"}, NULL, 120},
+    {"mem", "cpu-capabilities", "tcc -o /home/cpuinfotest /data/tests/cpuinfotest.c && /home/cpuinfotest", 0,
+     {"cpuinfotest: ", "; ok"}, "invalid", 60},
     {"mem", "heap-page-reclamation", "tcc -o /home/malloctrimtest /data/tests/malloctrimtest.c && /home/malloctrimtest", 0,
      {"malloctrimtest: ", ", 0 failed"}, "FAIL", 60},
     {"mem", "heap-failure-atomicity", "tcc -o /home/sbrktest /data/tests/sbrktest.c && /home/sbrktest", 0,
@@ -77,6 +79,16 @@ static const struct test tests[] = {
 
     /* desktop */
     {"gui", "window-and-screenshot", "tcc -o /home/guitest /data/tests/guitest.c && /home/guitest", 0, {"guitest: ok"}, NULL, 60},
+    {"gui", "gpu-or-explicit-fallback", "tcc -run /data/tests/gputest.c", 0,
+     {"gputest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"web", "canvas-native-pixels", "tcc -run /data/tests/canvastest.c", 0,
+     {"canvastest: ", ", 0 failed", "painted=1"}, "FAIL", 120, false, true},
+
+    /* 実圧縮入力からNocturne PCM/画素、媒体要素の寿命までを検査。実サイト試験とは別。 */
+    {"media", "codec-pcm-frame-seek", "tcc -run /data/tests/media_codectest.c", 0,
+     {"media_codectest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"media", "browser-native-lifetime", "tcc -run /data/tests/avmediatest.c", 0,
+     {"avmediatest: ", ", 0 failed"}, "FAIL", 120, false, true},
 
     /* sound (scripts/test.py records the AC'97 output and checks the tones in it) */
     {"audio", "card", "dmesg | grep audio:", 0, {"AC'97"}},

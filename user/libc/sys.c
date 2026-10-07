@@ -35,6 +35,7 @@ ssize_t read(int fd, void *buf, size_t n) { return ret(SC3(SYS_READ, fd, buf, n)
 ssize_t write(int fd, const void *buf, size_t n) { return ret(SC3(SYS_WRITE, fd, buf, n)); }
 int open(const char *path, int flags, ...) { return (int)ret(SC2(SYS_OPEN, path, flags)); }
 int close(int fd) { return (int)ret(SC1(SYS_CLOSE, fd)); }
+int audio_flush(int fd) { return (int)ret(SC1(SYS_AUDIO_FLUSH, fd)); }
 long lseek(int fd, long off, int whence) { return ret(SC3(SYS_LSEEK, fd, off, whence)); }
 int stat(const char *path, struct n_stat *st) { return (int)ret(SC2(SYS_STAT, path, st)); }
 int fstat(int fd, struct n_stat *st) { return (int)ret(SC2(SYS_FSTAT, fd, st)); }
@@ -119,6 +120,7 @@ int dup2(int fd, int newfd) { return (int)ret(SC2(SYS_DUP2, fd, newfd)); }
 int poll(struct n_pollfd *fds, int n, int timeout) { return (int)ret(SC3(SYS_POLL, fds, n, timeout)); }
 int proclist(struct n_procinfo *out, int max) { return (int)ret(SC2(SYS_PROCLIST, out, max)); }
 int sysinfo(struct n_sysinfo *si) { return (int)ret(SC1(SYS_SYSINFO, si)); }
+int cpu_info(struct n_cpuinfo *info) { return (int)ret(SC1(SYS_CPU_INFO, info)); }
 void yield(void) { SC0(SYS_YIELD); }
 int poweroff(void) { return (int)ret(SC1(SYS_POWER, POWER_OFF)); }
 int reboot(void) { return (int)ret(SC1(SYS_POWER, POWER_REBOOT)); }

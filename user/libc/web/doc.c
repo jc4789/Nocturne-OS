@@ -7,6 +7,8 @@
 #include "form_value.h"
 #include "form_validation.h"
 #include "elements.h"
+#include "js_canvas.h"
+#include "avmedia.h"
 
 /* Cached source and its expanded selector/declaration AST have separate,
    finite live-document budgets. All document and shadow sheets share cssmem. */
@@ -694,10 +696,15 @@ void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const ch
 void web_tick(web_doc *d, uint64_t now) {
     if (!d || !d->live) return;
     doc_rescan(d);
+    web_avmedia_tick(d, now);
     web_js_tick(d, now);
     doc_rescan(d);
 }
-int64_t web_deadline(web_doc *d) { return d && d->live ? web_js_deadline(d) : -1; }
+int64_t web_deadline(web_doc *d) {
+    if (!d || !d->live) return -1;
+    int64_t js = web_js_deadline(d), media = web_avmedia_deadline(d, uptime_ms());
+    return js < 0 ? media : media < 0 ? js : MIN(js, media);
+}
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *r) {
     if (d && d->live) web_js_loaded(d, id, r);
 }
@@ -718,6 +725,7 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
 }
 
 static void free_values(node_t *n) {
+    web_canvas_free(n);
     if (n->shadow_root) free_values(n->shadow_root);
     for (node_t *c = n->first; c; c = c->next) {
         if (c->type != N_ELEM) continue;
@@ -731,6 +739,7 @@ static void free_values(node_t *n) {
 
 void web_free(web_doc *d) {
     if (!d) return;
+    web_avmedia_free(d);
     web_js_free(d);
     web_form_validation_free(d);
     while (d->dom_docs) {
@@ -742,6 +751,7 @@ void web_free(web_doc *d) {
     d->parser = NULL;
     if (d->owned_nodes) {
         for (node_t *n = d->owned_nodes; n; n = n->owned_next) {
+            web_canvas_free(n);
             free(n->value);
             free(n->input_edit);
         }
@@ -1108,6 +1118,7 @@ static node_t *focus_area(web_doc *d, node_t *n) {
                    (n->tag == T_input && (!type || !str_ieq(type, "hidden")));
     const char *editable = node_attr(n, "contenteditable");
     bool focusable = control || ((n->tag == T_a || n->tag == T_area) && node_attr(n, "href")) ||
+                     ((n->tag == T_audio || n->tag == T_video) && node_attr(n, "controls")) ||
                      (n->tag == T_summary && doc_details_summary(n->parent)==n) ||
                      (n->tag == T_details && !doc_details_summary(n)) ||
                      node_attr(n, "tabindex") || (editable && !str_ieq(editable, "false"));

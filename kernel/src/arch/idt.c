@@ -1,5 +1,6 @@
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/smp.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
 #include "mm/vmm.h"
@@ -34,6 +35,10 @@ void idt_init(void) {
     for (int i = 0; i < 256; i++) idt_set(i, isr_stub_table[i], 0x8E, 0);
     idt_set(8, isr_stub_table[8], 0x8E, 1);      /* double fault on IST1 */
     idt_set(0x80, isr_stub_table[0x80], 0xEE, 0); /* syscall gate, DPL 3 */
+    idt_load();
+}
+
+void idt_load(void) {
     struct {
         uint16_t limit;
         uint64_t base;
@@ -111,6 +116,12 @@ static void exception(struct regs *r) {
 
 void isr_dispatch(struct regs *r) {
     uint64_t v = r->vector;
+    /* AP は BSP の task/entropy/IRQ handler を実行しない。 */
+    if (cpu_is_worker()) {
+        if (v < 32) cpu_worker_fault(r);
+        if (v != 0xFF) lapic_eoi();
+        return;
+    }
     if (v < 32) {
         exception(r);
     } else if (v < 48) {

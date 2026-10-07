@@ -1,6 +1,7 @@
 /* Kernel heap: address-ordered block list with first-fit and coalescing. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/smp.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
@@ -45,6 +46,7 @@ static void split(struct block *b, size_t size) {
 }
 
 void *kmalloc(size_t size) {
+    cpu_require_bsp();
     if (size == 0) size = 1;
     size = ALIGN_UP(size, 16);
     uint64_t f = irq_save();
@@ -91,6 +93,7 @@ void *kzalloc(size_t size) {
 }
 
 void kfree(void *p) {
+    cpu_require_bsp();
     if (!p) return;
     struct block *b = (struct block *)p - 1;
     if (b->magic != HEAP_MAGIC || b->free) {

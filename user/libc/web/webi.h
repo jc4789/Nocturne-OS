@@ -159,6 +159,7 @@ typedef struct node {
     int image;    /* <img>: index into the document's images, or -1 */
     int image_request; /* latest selected resource; image may retain an available old request */
     uint64_t image_generation;
+    struct web_canvas *canvas; /* independent bounded bitmap; allocation_doc owns it */
     bool image_initialized, image_invalidated, image_has_source;
     struct node *owned_next; /* document-owned allocation list, including detached nodes */
     bool control_ready, script_started;
@@ -486,6 +487,7 @@ struct web_doc {
     arena_t cssmem; /* authored sheets: replaced on a DOM stylesheet mutation */
     node_t *owned_nodes;
     size_t control_bytes;
+    size_t canvas_bytes;
     uint64_t dom_revision;
     uint64_t layout_revision;
     struct html_parser *parser;

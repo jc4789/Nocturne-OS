@@ -107,6 +107,8 @@ struct web_event {
 };
 /* NULL target means window. false means preventDefault() was called. */
 bool web_dispatch(web_doc *d, web_node *target, const struct web_event *event);
+/* controls付きの実mediaだけを操作。JS clickのpreventDefault後は呼ばない。 */
+bool web_media_activate(web_doc *d, web_node *target);
 /* Coalesced viewport scrolling targets Document and bubbles to Window. The host
    calls this between JS tasks, not recursively from its scroll_to callback. */
 void web_document_scroll(web_doc *d);

@@ -4,10 +4,14 @@ globalThis.runDocumentCases=function(){
     function eq(actual,expected,label){count++;if(actual!==expected)throw Error('document: '+label+' '+String(actual)+' != '+String(expected));}
     function raises(fn,name,label){let error;try{fn();}catch(e){error=e;}eq(error&&error.name,name,label);}
     const parser=new DOMParser(),url=document.URL;
+    eq(document.referrer,'','navigation without referrer');
+    const referrerGet=Object.getOwnPropertyDescriptor(Document.prototype,'referrer').get;
+    raises(()=>referrerGet.call({}),'TypeError','referrer receiver brand');
     globalThis.__documentScriptProbe=0;
     const a=parser.parseFromString('<!doctype html><!--before--><title>独立</title><body><p id="own">A &amp; B</p><script>__documentScriptProbe++<\/script><img src="never-fetch.png"><button onclick="__documentScriptProbe++">button</button>','text/html');
     eq(a===document,false,'independent identity');eq(a instanceof Document,true,'Document interface');eq(a instanceof HTMLDocument,true,'HTMLDocument interface');
     eq(a.ownerDocument,null,'document has no owner');eq(a.defaultView,null,'no window');eq(a.location,null,'no location');eq(a.currentScript,null,'no current script');
+    eq(a.referrer,'','inactive document has no referrer');
     eq(a.URL,url,'inherited URL');eq(a.documentURI,url,'inherited documentURI');eq(a.contentType,'text/html','MIME');eq(a.characterSet,'UTF-8','encoding');eq(a.compatMode,'CSS1Compat','doctype mode');
     eq(a.title,'独立','title');eq(a.doctype instanceof DocumentType,true,'DocumentType interface');eq(a.doctype.name,'html','doctype name');eq(a.firstChild,a.doctype,'doctype tree position');eq(a.childNodes[1].nodeType,8,'comment retained');
     const p=a.getElementById('own');eq(p,a.querySelector('#own'),'wrapper identity');eq(p.ownerDocument,a,'element owner');eq(p.firstChild.ownerDocument,a,'text owner');eq(p.isConnected,true,'inert document connectivity');

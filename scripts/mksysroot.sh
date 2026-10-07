@@ -12,12 +12,20 @@ S=$1
 shift
 T=third_party/tinycc
 W=$S.tmp
+build_root=$(realpath -e -- build)
+for target in "$S" "$W"; do
+    absolute=$(realpath -m -- "$target")
+    case "$absolute" in
+        "$build_root"/*) ;;
+        *) printf 'sysrootの削除対象がworkspaceのbuild外です: %s\n' "$absolute" >&2; exit 1 ;;
+    esac
+done
 rm -rf "$S" "$W"
 mkdir -p "$S/usr/include/sys" "$S/usr/lib/tcc/include" "$W/libc" "$W/rt"
 
 cp user/include/*.h "$S/usr/include/"
 cp user/include/sys/*.h "$S/usr/include/sys/"
-cp common/abi.h common/gfx.h "$S/usr/include/"
+cp common/abi.h common/gfx.h common/gpu_abi.h "$S/usr/include/"
 cp ports/tcc/include/*.h "$S/usr/include/"
 cp third_party/bearssl/inc/*.h "$S/usr/include/"
 cp ports/lexbor/include/*.h "$S/usr/include/"
@@ -29,6 +37,8 @@ while IFS= read -r h; do
 done < third_party/lexbor/headers.list
 mkdir -p "$S/usr/share/licenses/lexbor"
 cp third_party/lexbor/LICENSE third_party/lexbor/NOTICE third_party/lexbor/UPSTREAM.json "$S/usr/share/licenses/lexbor/"
+mkdir -p "$S/usr/share/licenses/ffmpeg"
+cp third_party/ffmpeg/LICENSE.md third_party/ffmpeg/COPYING.LGPLv2.1 third_party/ffmpeg/manifest.json third_party/ffmpeg/README.nocturne.md "$S/usr/share/licenses/ffmpeg/"
 cp $T/include/*.h "$S/usr/lib/tcc/include/"
 # the sources of the programs in /bin, as examples of the APIs
 mkdir -p "$S/usr/src/apps"
@@ -39,7 +49,16 @@ strip_obj() { objcopy --strip-debug -R .eh_frame -R .llvm_addrsig -R .comment "$
 dest=libc
 crt0=
 i=0
-for o in "$@"; do
+objects=()
+for argument in "$@"; do
+    if [[ "$argument" == @* ]]; then
+        read -r -a batch < "${argument#@}"
+        objects+=("${batch[@]}")
+    else
+        objects+=("$argument")
+    fi
+done
+for o in "${objects[@]}"; do
     if [ "$o" = "--" ]; then dest=rt; continue; fi
     case "$o" in
         *crt0.asm.o) crt0=$o; continue ;;

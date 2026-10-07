@@ -24,6 +24,8 @@ ssize_t read(int fd, void *buf, size_t n);
 ssize_t write(int fd, const void *buf, size_t n);
 int open(const char *path, int flags, ...);
 int close(int fd);
+/* 呼出し元のaudio streamだけの未mix PCMを破棄。通常closeのdrain契約は維持。 */
+int audio_flush(int fd);
 long lseek(int fd, long off, int whence);
 int stat(const char *path, struct n_stat *st);
 int fstat(int fd, struct n_stat *st);
@@ -51,6 +53,7 @@ int dup2(int fd, int newfd);
 int poll(struct n_pollfd *fds, int n, int timeout_ms);
 int proclist(struct n_procinfo *out, int max);
 int sysinfo(struct n_sysinfo *si);
+int cpu_info(struct n_cpuinfo *info);
 void yield(void);
 int poweroff(void);
 int reboot(void);

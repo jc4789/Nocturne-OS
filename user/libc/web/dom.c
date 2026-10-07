@@ -5,6 +5,7 @@
 #include "webi.h"
 #include "form_value.h"
 #include "elements.h"
+#include "js_canvas.h"
 
 #define DOM_MAX_DEPTH 400
 
@@ -446,7 +447,15 @@ static bool attribute_change(web_doc *d, node_t *n, int found, const char *name,
                      n->tag == T_img || n->tag == T_input || n->tag == T_meta;
     /* Keep JS attribute/CE reactions in native_dom, but an identical ordinary
        attribute has no new style to cascade and needs no arena allocation. */
-    if (!resources && !identity && found >= 0 && value && !strcmp(n->attrs[found].value, value)) return true;
+    if (!resources && !identity && found >= 0 && value && !strcmp(n->attrs[found].value, value)) {
+        /* Canvasの寸法設定は同値でもbitmap/contextをresetする。arena再割当は不要。 */
+        if (!ns && !n->foreign && n->tag == T_canvas && !strcmp(name, low) &&
+            (!strcmp(low, "width") || !strcmp(low, "height"))) {
+            web_canvas_attr_changed(n, local);
+            d->dirty = true;
+        }
+        return true;
+    }
     int count = n->nattrs + (found < 0 ? 1 : value ? 0 : -1);
     if (count > 1024) return false;
     doc_dom_budget(d);
@@ -531,6 +540,7 @@ static bool attribute_change(web_doc *d, node_t *n, int found, const char *name,
         doc_shadow_reassign(d);
     if (!ns) doc_details_attribute_changed(d, n, local, found >= 0);
     if (ordinary) web_select_attribute_changed(d, n, local, value != NULL);
+    if (ordinary) web_canvas_attr_changed(n, local);
     return true;
 }
 

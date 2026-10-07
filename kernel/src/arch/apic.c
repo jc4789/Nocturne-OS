@@ -42,6 +42,46 @@ void apic_init(void) {
 
 bool lapic_present(void) { return lapic != NULL; }
 
+uint32_t lapic_current_id(void) { return lapic ? lapic_read(0x20) >> 24 : 0; }
+
+bool lapic_worker_init(void) {
+    if (!lapic) return false;
+    uint64_t base = rdmsr(0x1B);
+    if (!(base & (1ULL << 11)) || (base & (1ULL << 10))) return false;
+    lapic_write(0x80, 0);
+    lapic_write(0xF0, (lapic_read(0xF0) & ~0xFFu) | 0x1FF);
+    lapic_write(LAPIC_LVT_TIMER, 0x10000);
+    lapic_write(0x350, 0x10000); /* PIC は BSP 専用 */
+    lapic_write(0x360, 0x10000);
+    lapic_write(0x370, 0x10000 | 0xFE);
+    uint32_t max_lvt = (lapic_read(0x30) >> 16) & 0xFF;
+    if (max_lvt >= 4) lapic_write(0x340, 0x10000); /* performance counter */
+    if (max_lvt >= 5) lapic_write(0x330, 0x10000); /* thermal sensor */
+    if (max_lvt >= 6) lapic_write(0x2F0, 0x10000); /* corrected machine check */
+    return true;
+}
+
+static bool ipi_ready(void) {
+    for (unsigned i = 0; i < 1000000; i++) {
+        if (!(lapic_read(0x300) & (1u << 12))) return true;
+        pause();
+    }
+    return false;
+}
+
+bool lapic_send_ipi(uint32_t apic_id, uint8_t vector) {
+    if (!lapic || apic_id > 255 || vector < 32) return false;
+    uint64_t flags = irq_save();
+    bool ok = ipi_ready();
+    if (ok) {
+        lapic_write(0x310, apic_id << 24);
+        lapic_write(0x300, vector); /* fixed, physical, edge-triggered */
+        ok = ipi_ready();
+    }
+    irq_restore(flags);
+    return ok;
+}
+
 void lapic_eoi(void) {
     if (lapic) lapic_write(LAPIC_EOI, 0);
 }

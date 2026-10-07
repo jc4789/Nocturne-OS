@@ -1,6 +1,7 @@
 /* Round-robin preemptive (for user mode) scheduler. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/smp.h"
 #include "sys/sched.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
@@ -25,7 +26,7 @@ extern void kthread_trampoline(void);
 #define SLICE_MS 10
 
 void sched_init(void) {
-    __asm__ volatile("fxsave %0" : "=m"(fpu_template));
+    __asm__ volatile("fxsave64 %0" : "=m"(fpu_template));
     idle_task = kzalloc(sizeof(struct task));
     idle_task->pid = next_pid++;
     strlcpy(idle_task->name, "idle", sizeof idle_task->name);
@@ -129,6 +130,8 @@ static void reap_dead(void) {
 }
 
 void schedule(void) {
+    cpu_require_bsp();
+    ASSERT(!cpu_jobs_active());
     uint64_t f = irq_save();
     struct task *prev = current_task;
     if (prev->state == TASK_RUNNING && prev != idle_task) {
@@ -152,8 +155,8 @@ void schedule(void) {
     current_task = next;
     tss_set_rsp0((uint64_t)next->kstack + KSTACK_PAGES * PAGE_SIZE);
     vmm_switch(next->pml4);
-    __asm__ volatile("fxsave %0" : "=m"(prev->fpu));
-    __asm__ volatile("fxrstor %0" : : "m"(next->fpu));
+    __asm__ volatile("fxsave64 %0" : "=m"(prev->fpu));
+    __asm__ volatile("fxrstor64 %0" : : "m"(next->fpu));
     context_switch(&prev->ksp, next->ksp);
     /* we are back in prev's context */
     reap_dead();

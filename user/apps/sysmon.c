@@ -79,7 +79,8 @@ static int list_rows(void) { return (H - LIST_Y - 24 - 50) / ROW; }
 static void draw(void) {
     canvas_t *c = &w->c;
     gfx_fill(c, 0, 0, W, H, RGB(26, 24, 44));
-    graph(c, 12, 12, (W - 36) / 2, 140, cpu_hist, RGB(130, 200, 255), "CPU");
+    /* 通常taskの会計はBSPのみ。AP計算workerを総CPU使用率と混同しない。 */
+    graph(c, 12, 12, (W - 36) / 2, 140, cpu_hist, RGB(130, 200, 255), "CPU (BSP)");
     graph(c, 24 + (W - 36) / 2, 12, (W - 36) / 2, 140, mem_hist, RGB(250, 170, 110), "Memory");
     struct n_sysinfo si;
     sysinfo(&si);
@@ -89,6 +90,12 @@ static void draw(void) {
              (unsigned long)((si.total_mem - si.free_mem) >> 20), (unsigned long)(si.total_mem >> 20),
              (unsigned long)(si.heap_used >> 10), up / 3600, up / 60 % 60, up % 60);
     gfx_text(c, 14, 164, b, UI_DIM, TRANSPARENT, FONT_SMALL);
+    struct n_cpuinfo ci;
+    if (cpu_info(&ci) == 0) {
+        snprintf(b, sizeof b, "CPU %u / %u   task CPU %u   AP workers %u   jobs %lu", ci.online_cpus,
+                 ci.detected_cpus, ci.scheduler_cpus, ci.worker_cpus, (unsigned long)ci.parallel_jobs);
+        gfx_text(c, 14, 181, b, UI_DIM, TRANSPARENT, FONT_SMALL);
+    }
     int y = LIST_Y;
     gfx_fill(c, 0, y, W, 22, RGB(36, 34, 60));
     const char *hdr[] = {"PID", "Name", "State", "CPU", "Memory", "Kind"};

@@ -8,6 +8,8 @@
 #include <stdio.h>
 #include <math.h>
 #include "webi.h"
+#include "js_canvas.h"
+#include "avmedia.h"
 #include "svg_geometry.h"
 
 static web_doc *D;
@@ -312,10 +314,15 @@ static void replaced_natural(box_t *c, float *iw, float *ih, float *ratio) {
         break;
     }
     case AT_PLACEHOLDER:
-        if (n->tag == T_meter || n->tag == T_progress) *iw = 80, *ih = 16;
+        if (n->tag == T_canvas) {
+            *iw=(float)web_canvas_dimension(n,"width");
+            *ih=(float)web_canvas_dimension(n,"height");
+        } else if(n->tag==T_audio)*iw=300,*ih=node_attr(n,"controls")?32:0;
+        else if(n->tag==T_video){int vw=300,vh=150;web_avmedia_size(n,&vw,&vh);*iw=(float)vw;*ih=(float)vh;}
+        else if (n->tag == T_meter || n->tag == T_progress) *iw = 80, *ih = 16;
         else if (str_ieq(n->name, "input")) *iw = 129, *ih = 16; /* range */
         else *iw = 300, *ih = 150;
-        *ratio = *iw / *ih;
+        *ratio = *ih>0 ? *iw / *ih : 0;
         break;
     }
 }

@@ -1369,6 +1369,7 @@ static void key(const struct gui_event *e) {
     if ((e->key >= 32 && !(e->key >= 0x100 && e->key < 0x200)) || e->key == NKEY_ENTER)
         if (!dispatch_native("keypress", target, e, true)) return;
     if(target && (k==NKEY_ENTER || k==' ') && !ctrl && !alt) {
+        if (k==' ' && web_media_activate(doc,target)) { flush_dom_layout(); return; }
         struct web_hit action={0};
         if(web_node_action(doc,target,&action) &&
            (action.kind==WEB_HIT_DETAILS || action.kind==WEB_HIT_BUTTON || action.kind==WEB_HIT_SUBMIT ||
@@ -1406,6 +1407,7 @@ static void page_click(web_node *target, int x, int y, bool keyboard) {
     if(web_control_disabled(target))return;
     struct gui_event native = {.x = x, .y = y, .buttons = 1};
     if (!dispatch_native("click", target, &native, true)) return;
+    if (web_media_activate(doc,target)) { page_focus(target); flush_dom_layout(); return; }
     struct web_hit hit = {0};
     if (!web_node_action(doc, target, &hit)) return;
     if (!keyboard && hit.kind==WEB_HIT_DETAILS) {

@@ -13,13 +13,15 @@ usage: python scripts/test.py [--quick] [--full] [--no-net] [--timeout S] [group
   --quick   skip the slow tests (compile every app, tcc self-hosting)
   --full    also copy the TinyCC sources so tcc can rebuild itself inside the OS
   --no-net  skip the network tests (they need internet access from the host)
-  group     run only these groups: sh tools mem fs tcc gui audio web tcp net agent
+  group     run only these groups: sh tools mem fs tcc gui audio media web tcp net agent
 Exit status 0 when every test passed. Build first (build.ps1). Your own build/data.img is not
 touched: the tests use build/test-data.img.
 """
 import argparse
 import glob
+import hashlib
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -34,7 +36,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "tools", "msys64", "ucrt64", "bin")
 USR_BIN = os.path.join(ROOT, "tools", "msys64", "usr", "bin")
 BASH = os.path.join(ROOT, "tools", "msys64", "usr", "bin", "bash.exe")
-QEMU = os.path.join(BIN, "qemu-system-x86_64.exe")
+QEMU = os.path.join("C:/Program Files/qemu", "qemu-system-x86_64.exe")
+if not os.path.isfile(QEMU):
+    QEMU = os.path.join(BIN, "qemu-system-x86_64.exe")
 BUILD = os.path.join(ROOT, "build")
 IMG = os.path.join(BUILD, "test-data.img")
 SERIAL = os.path.join(BUILD, "test-serial.log")
@@ -150,6 +154,7 @@ def make_disk(a, tcp_port, web_ports):
              ("form_value.h", "form_validation.h", "elements.h")]
     srcs.append(os.path.join(ROOT, "tests", "web_form_validation_cases.h"))
     mtools("mcopy", "-i", PART, *srcs, "::/tests/")
+    mtools("mcopy", "-i", PART, "-s", os.path.join(ROOT, "tests", "media-fixtures"), "::/tests/")
     if a.full:
         tcc = os.path.join(ROOT, "third_party", "tinycc")
         files = sorted(glob.glob(os.path.join(tcc, "*.c")) + glob.glob(os.path.join(tcc, "*.h")) +
@@ -227,18 +232,33 @@ def check_audio(path):
 
 def run_vm(a, tcp_port, web_ports, processes):
     make_disk(a, tcp_port, web_ports)
+    # 起動媒体も専用コピー。検証中の次ビルドと元imageを共有しない。
+    boot = os.path.join(BUILD, "test-boot.img")
+    shutil.copyfile(os.path.join(BUILD, "nocturne.img"), boot)
+    image_hash = hashlib.sha256()
+    with open(boot, "rb") as image:
+        for block in iter(lambda: image.read(1024 * 1024), b""):
+            image_hash.update(block)
     if os.path.exists(SERIAL):
         os.remove(SERIAL)
-    cmd = [QEMU, "-M", "pc", "-m", str(a.memory) + "M", "-display", "none", "-vga", "std", "-no-reboot",
+    cmd = [a.qemu, "-M", "pc", "-m", str(a.memory) + "M", "-smp", str(a.cpus), "-accel", a.accel,
+           "-display", "egl-headless" if a.gpu == "virgl" else "none", "-vga", "std", "-no-reboot",
            "-serial", "file:" + SERIAL,
-           "-drive", "file=%s,format=raw,if=ide,index=0,snapshot=on" % os.path.join(BUILD, "nocturne.img"),
+           "-drive", "file=%s,format=raw,if=ide,index=0,snapshot=on" % boot,
            "-drive", "file=%s,format=raw,if=ide,index=1" % IMG,
            "-audiodev", "wav,id=snd,path=%s,out.frequency=48000,out.buffer-length=20000,in.voices=0" % AUDIO, "-device", "AC97,audiodev=snd"]
+    if a.gpu == "virgl":
+        cmd += ["-device", "virtio-gpu-gl-pci"]
     if os.path.exists(AUDIO):
         os.remove(AUDIO)
     t0 = time.time()
-    q = subprocess.Popen(cmd, cwd=ROOT, stderr=subprocess.PIPE, text=True, errors="replace")
+    q = subprocess.Popen(cmd, cwd=ROOT, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     processes.append(q)
+    metadata = {"pid": q.pid, "arguments": cmd, "boot_sha256": image_hash.hexdigest(), "user_data_attached": False}
+    metadata_path = os.path.join(BUILD, "test-metadata.json")
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     def qemu_stderr():  # the AC'97's recording inputs have nowhere to record from: not news
         for line in q.stderr:
@@ -267,10 +287,15 @@ def run_vm(a, tcp_port, web_ports, processes):
             break
         time.sleep(0.5)
 
-    log = open(SERIAL, "rb").read().decode("utf-8", "replace")
+    log = open(SERIAL, "rb").read().decode("utf-8", "replace") if os.path.exists(SERIAL) else ""
+    metadata.update(exit_code=q.returncode, timed_out=timed_out, elapsed_seconds=time.time()-t0, process_stopped=True)
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
     problems = []
     if timed_out:
         problems.append("timed out after %d s (the VM did not power off)" % a.timeout)
+    if q.returncode != 0:
+        problems.append("QEMU exit status %s" % q.returncode)
     if "TESTS DONE" not in log:
         problems.append("the in-OS runner did not finish (did tcc fail to build it?)")
     for m in re.finditer(r"(?im)^.*(panic|kernel fault|double fault).*$", log):
@@ -307,10 +332,18 @@ def main():
     ap.add_argument("--no-net", action="store_true")
     ap.add_argument("--timeout", type=int, default=1200)
     ap.add_argument("--memory", type=int, default=2048, help="QEMU RAM in MiB (default: 2048)")
+    ap.add_argument("--cpus", type=int, default=4, help="QEMU CPU count (default: 4)")
+    ap.add_argument("--accel", choices=("tcg", "whpx"), default="tcg", help="No silent accelerator fallback")
+    ap.add_argument("--qemu", default=QEMU, help="QEMU executable (prefer the installed QEMU)")
+    ap.add_argument("--gpu", choices=("none", "virgl"), default="none", help="Optional secondary virgl GPU; requires host GL")
     ap.add_argument("groups", nargs="*")
     a = ap.parse_args()
     if a.memory < 256:
         ap.error("--memory must be at least 256 MiB")
+    if not 1 <= a.cpus <= 32:
+        ap.error("--cpus must be between 1 and 32")
+    if not os.path.isfile(a.qemu):
+        ap.error("--qemu executable does not exist")
     if not os.path.exists(os.path.join(BUILD, "nocturne.img")):
         sys.exit("test: build first with the bundled toolchain")
     servers, processes = [], []

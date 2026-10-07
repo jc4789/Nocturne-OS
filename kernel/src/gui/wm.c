@@ -12,6 +12,7 @@
 #include "arch/cpu.h"
 #include "gui/wm.h"
 #include "dev/fb.h"
+#include "dev/gpu.h"
 #include "dev/fbcon.h"
 #include "dev/audio.h"
 #include "dev/input.h"
@@ -1455,6 +1456,9 @@ const uint32_t *wm_remote_frame(int *pitch) {
 int wm_cursor_shape(void) { return cursor_shape; }
 
 void wm_init(void) {
+    /* PCI has been enumerated. Optional offscreen GPU never changes the display
+       or the RAM frame used by Enhanced Session/RDP. */
+    gpu_init();
     sw = fb.width;
     sh = fb.height;
     size_t pages = ALIGN_UP((uint64_t)sw * sh * 4, PAGE_SIZE) / PAGE_SIZE;
@@ -1467,6 +1471,7 @@ void wm_init(void) {
     gfx_init(&wall, wp, sw, sh, sw);
     desktop_draw_wallpaper(&wall);
     draw_desktop_icons(&wall);
+    fb_benchmark(wall.px,wall.pitch);
     mx = sw / 2;
     my = sh / 2;
     running = true;

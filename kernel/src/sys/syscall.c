@@ -1,6 +1,7 @@
 /* System call dispatch (int 0x80). */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/smp.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
 #include "sys/proc.h"
@@ -10,6 +11,8 @@
 #include "mm/heap.h"
 #include "dev/timer.h"
 #include "dev/fb.h"
+#include "dev/gpu.h"
+#include "dev/audio.h"
 #include "gui/wm.h"
 #include "abi.h"
 
@@ -457,6 +460,11 @@ void syscall_dispatch(struct regs *r) {
     case SYS_WRITE: ret = sys_write((int)a, (const void *)b, c); break;
     case SYS_OPEN: ret = sys_open((const char *)a, (int)b); break;
     case SYS_CLOSE: ret = sys_close((int)a); break;
+    case SYS_AUDIO_FLUSH: {
+        struct file *f = getfd((int)a);
+        ret = f ? audio_flush_file(f) : -EBADF;
+        break;
+    }
     case SYS_LSEEK: {
         struct file *f = getfd((int)a);
         ret = f ? vfs_seek(f, (int64_t)b, (int)c) : -EBADF;
@@ -486,6 +494,31 @@ void syscall_dispatch(struct regs *r) {
     case SYS_POLL: ret = sys_poll((struct n_pollfd *)a, (int)b, (int)c); break;
     case SYS_PROCLIST: ret = sys_proclist((struct n_procinfo *)a, (int)b); break;
     case SYS_SYSINFO: ret = sys_sysinfo((struct n_sysinfo *)a); break;
+    case SYS_CPU_INFO: {
+        struct n_cpuinfo info;
+        if (!user_ok_w((void *)a, sizeof info)) ret = -EFAULT;
+        else { smp_get_info(&info); memcpy((void *)a, &info, sizeof info); ret = 0; }
+        break;
+    }
+    case SYS_GPU_INFO: {
+        struct n_gpu_info info;
+        if (!user_ok_w((void *)a, sizeof info)) ret = -EFAULT;
+        else { gpu_get_info(&info); memcpy((void *)a, &info, sizeof info); ret = 0; }
+        break;
+    }
+    case SYS_GPU_RENDER: {
+        struct n_gpu_render request;
+        if (!user_ok((void *)a, sizeof request)) { ret = -EFAULT; break; }
+        memcpy(&request, (void *)a, sizeof request);
+        if (!request.width || !request.height || request.width > N_GPU_MAX_SIDE || request.height > N_GPU_MAX_SIDE) {
+            ret = -EINVAL; break;
+        }
+        size_t bytes = (size_t)request.width * request.height * sizeof(uint32_t);
+        if (c < bytes) { ret = -EINVAL; break; }
+        if (!user_ok_w((void *)b, bytes)) { ret = -EFAULT; break; }
+        ret = gpu_render(&request, (uint32_t *)b, bytes);
+        break;
+    }
     case SYS_YIELD: schedule(); ret = 0; break;
     case SYS_POWER:
         if (a == POWER_REBOOT) power_reboot();

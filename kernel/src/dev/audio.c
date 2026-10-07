@@ -226,6 +226,19 @@ static void audio_close(struct vnode *v, struct file *f) {
 static struct vnode_ops audio_ops = {.open = audio_open, .close = audio_close, .write = audio_write,
                                      .read = audio_read, .can_write = audio_can_write};
 
+int audio_flush_file(struct file *f) {
+    if (!f || !f->vn || f->vn->ops != &audio_ops) return -EINVAL;
+    int64_t err = 0;
+    struct stream *s = stream_of(f, &err);
+    if (!s) return (int)err;
+    uint64_t fl = irq_save();
+    s->tail = s->head;
+    wq_wake_all(&audio_wq);
+    poll_notify();
+    irq_restore(fl);
+    return 0;
+}
+
 /* ---- /dev/volume: the master volume as text, 0 to 100 ---- */
 
 static int64_t volume_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {

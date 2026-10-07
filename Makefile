@@ -8,6 +8,12 @@ PY   := python
 
 BUILD := build
 QEMU_MEMORY ?= 2048M
+QEMU_CPUS ?= 4
+QEMU_ACCEL ?= tcg
+QEMU_GPU ?= none
+QEMU ?= qemu-system-x86_64
+comma := ,
+QEMU_GRAPHICS := $(if $(filter virgl,$(QEMU_GPU)),-device virtio-gpu-gl-pci -display sdl$(comma)gl=on,)
 
 # ---------------------------------------------------------------- kernel
 KCFLAGS := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector -fno-stack-check \
@@ -64,6 +70,18 @@ $(BUILD)/lexbor/%.o: %.c
 	@echo "  LXB  $<"
 	@$(CC) $(LXBFLAGS) -c $< -o $@
 
+# Nocturne IOを用いる限定decoder。FFmpegのCLI・OS・network層は取り込まない。
+include third_party/ffmpeg/sources.mk
+FF_OBJ := $(patsubst %.c,$(BUILD)/ffmpeg/%.o,$(FFMPEG_C))
+FFFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg -Ithird_party/ffmpeg/compat/stdbit \
+           $(filter-out -W%,$(UCFLAGS)) -w -DHAVE_AV_CONFIG_H -D_ISOC11_SOURCE -D_FILE_OFFSET_BITS=64 \
+           -D_LARGEFILE_SOURCE -std=c17 -Oz -fno-math-errno -fno-signed-zeros -mstack-alignment=16
+$(BUILD)/ffmpeg/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  FF   $<"
+	@$(CC) $(FFFLAGS) -c $< -o $@
+$(BUILD)/u/user/libc/media.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
+
 # QuickJS core only. No OS helper library, CLI or native-module loader.
 QJS_C := $(addprefix third_party/quickjs/,quickjs.c dtoa.c libregexp.c libunicode.c cutils.c)
 QJS_OBJ := $(patsubst %.c,$(BUILD)/qjs/%.o,$(QJS_C))
@@ -112,12 +130,17 @@ $(BUILD)/u/%.asm.o: %.asm
 	@$(NASM) -f elf64 -g $< -o $@
 
 # no archiver in the toolchain: lld's --start-lib gives archive semantics to plain objects
-LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ)
+LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ)
+LIBC_RSP := $(BUILD)/libc-objects.list
 
-$(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) user/user.ld
+# Windowsのコマンド長上限を超えないよう、lldとsysrootに同じobject一覧を渡す。
+$(LIBC_RSP): $(LIBC_LINK) Makefile
+	@$(file >$@,$(LIBC_LINK))
+
+$(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
-	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib $(LIBC_LINK) --end-lib -o $@
+	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
 
 # ---------------------------------------------------------------- TinyCC (the in-OS C compiler)
 TCC_DIR   := third_party/tinycc
@@ -139,10 +162,10 @@ $(BUILD)/tcc/tcc.o: $(wildcard $(TCC_DIR)/*.c $(TCC_DIR)/*.h) ports/tcc/config.h
 	@echo "  CC   $(TCC_DIR)/tcc.c"
 	@$(CC) $(TCC_CFLAGS) -c $(TCC_DIR)/tcc.c -o $@
 
-$(BUILD)/root/bin/tcc: $(BUILD)/tcc/tcc.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) user/user.ld
+$(BUILD)/root/bin/tcc: $(BUILD)/tcc/tcc.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
-	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib $(LIBC_LINK) --end-lib -o $@
+	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
 
 $(BUILD)/tccrt/%.c.o: $(TCC_DIR)/lib/%.c
 	@mkdir -p $(dir $@)
@@ -155,13 +178,14 @@ $(BUILD)/tccrt/runmain.c.o: ports/tcc/runmain.c
 	@$(CC) $(TCCRT_FLAGS) -c $< -o $@
 
 # headers and libraries for compiling inside Nocturne (an extra tree in the initrd)
-$(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(TCCRT_OBJ) scripts/mksysroot.sh \
+$(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) $(TCCRT_OBJ) scripts/mksysroot.sh \
 		$(shell find user/include ports/tcc/include third_party/bearssl/inc $(TCC_DIR)/include -name '*.h') \
 		$(LXB_HEADERS) ports/lexbor/include/memory.h third_party/lexbor/headers.list \
 		third_party/lexbor/LICENSE third_party/lexbor/NOTICE third_party/lexbor/UPSTREAM.json \
-		common/abi.h common/gfx.h $(wildcard user/apps/*.c)
+		third_party/ffmpeg/LICENSE.md third_party/ffmpeg/COPYING.LGPLv2.1 third_party/ffmpeg/manifest.json third_party/ffmpeg/README.nocturne.md \
+		common/abi.h common/gfx.h common/gpu_abi.h $(wildcard user/apps/*.c)
 	@echo "  SYSROOT"
-	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) -- $(TCCRT_OBJ)
+	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ)
 	@touch $@
 
 # ---------------------------------------------------------------- images
@@ -196,7 +220,7 @@ $(BUILD)/data-blank.vhdx: scripts/mkdata.sh
 	@rm -f $(BUILD)/data-blank.img
 
 run: image
-	@qemu-system-x86_64 -M pc -m $(QEMU_MEMORY) -drive file=$(BUILD)/nocturne.img,format=raw,if=ide,index=0 \
+	@$(QEMU) -M pc -m $(QEMU_MEMORY) -smp $(QEMU_CPUS) -accel $(QEMU_ACCEL) $(QEMU_GRAPHICS) -drive file=$(BUILD)/nocturne.img,format=raw,if=ide,index=0 \
 		-drive file=$(BUILD)/data.img,format=raw,if=ide,index=1 -serial stdio -vga std \
 		-audiodev dsound,id=snd -device AC97,audiodev=snd
 

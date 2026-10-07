@@ -88,9 +88,10 @@ int main(int argc, char **argv) {
     if (!net) { puts("FAIL tcp capacity worker allocation"); return 1; }
     int held[CAPACITY]; bool filled = true;
     for (int i = 0; i < CAPACITY; i++) held[i] = -1;
-    /* No request line: the fixture deliberately waits until each client closes. */
+    /* 先行worker試験のFIN待ちは既存kernelの20秒の生存期間を持つ。
+       準備段階だけその解放を待つ。満杯後の150ms期限の検査は変えない。 */
     for (int i = 0; i < CAPACITY; i++) {
-        held[i] = tcp_connect(HOST, (uint16_t)tcp_port, 5000);
+        held[i] = tcp_connect(HOST, (uint16_t)tcp_port, 25000);
         if (held[i] < 0) { filled = false; break; }
     }
     check(filled, "all finite active slots held without file descriptors");
