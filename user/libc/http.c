@@ -25,9 +25,10 @@ bool url_parse(const char *s, struct url *u) {
         if (p <= 0 || p > 65535) return false;
         u->port = (uint16_t)p;
     }
-    if (*s == '?') snprintf(u->path, sizeof u->path, "/%s", s);
-    else snprintf(u->path, sizeof u->path, "%s", *s ? s : "/");
-    return true;
+    int n = *s == '?' ? snprintf(u->path, sizeof u->path, "/%s", s)
+                      : snprintf(u->path, sizeof u->path, "%s", *s ? s : "/");
+    /* A prefix would request a different resource, not the original URL. */
+    return n >= 0 && (size_t)n < sizeof u->path;
 }
 
 /* buffered reader on top of a stream */
@@ -288,14 +289,19 @@ int http_request(const struct http_req *rq, struct http_resp *rs) {
 
     const char *method = rq->method ? rq->method : "GET";
     bool std_port = u.port == (u.tls ? 443 : 80);
-    char hostport[140], head[2048];
+    char hostport[140], head[HTTP_URL_PATH_MAX + 512u];
     if (std_port) snprintf(hostport, sizeof hostport, "%s", u.host);
     else snprintf(hostport, sizeof hostport, "%s:%d", u.host, u.port);
     int hn = snprintf(head, sizeof head, "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Nocturne/1.0\r\nConnection: close\r\n",
                       method, u.path, hostport);
+    if (hn < 0 || hn >= (int)sizeof head - 2) {
+        snprintf(rs->error, sizeof rs->error, "request too large");
+        ns_close(s);
+        return -1;
+    }
     if (rq->body || strcmp(method, "GET"))
         hn += snprintf(head + hn, sizeof head - hn, "Content-Length: %zu\r\n", rq->body_len);
-    if (hn >= (int)sizeof head - 2) {
+    if (hn < 0 || hn >= (int)sizeof head - 2) {
         snprintf(rs->error, sizeof rs->error, "request too large");
         ns_close(s);
         return -1;

@@ -23,7 +23,7 @@ static uint32_t GEN;
 wfont style_font(const style_t *st) {
     wfont f = {NULL, st->font_size, st->font_weight >= 600};
     int idx = (f.bold ? FONT_BOLD : 0) | (st->font_style ? FONT_ITALIC : 0);
-    f.ttf = font_ui(idx);
+    f.ttf = font_family(st->font_family, idx);
     if (!f.ttf) f.ttf = font_ui(FONT_REGULAR);
     return f;
 }
@@ -2489,7 +2489,12 @@ static void layout_inner(box_t *b, struct bfc *f, float ox, float oy, float cbh)
         ox = oy = 0;
     }
     float sh = spec_h(b, &b->st->height, cbh);
-    float child_cbh = sh >= 0 ? sh : -1;
+    /* The anonymous initial containing block supplies the viewport height,
+       even though its own auto height follows document content. Otherwise
+       html/body height:100% lose their definite reference at the first box.
+       A definite height's min/max constraints also apply to descendants;
+       auto heights (including min-height-only boxes) remain indefinite. */
+    float child_cbh = b == D->root_box ? VH : sh >= 0 ? clamp_h(b, sh, cbh) : -1;
     b->baseline = b->last_baseline = -1;
     b->nruns = b->ndecos = 0;
     switch (b->kind) {

@@ -1,0 +1,72 @@
+{
+  "distribution": "notofonts.github.io-noto-monthly-release-2026.10.01",
+  "unmodified": true,
+  "files": [
+    {
+      "file": "NotoSansLiving-Regular.ttf",
+      "source": "D:\\Fonts\\notofonts.github.io-noto-monthly-release-2026.10.01\\megamerge\\NotoSansLiving-Regular.ttf",
+      "size": 6026792,
+      "sha256": "6885fcb5172d738cd6a5c0cd4cb43892587884295e74707799b33c66fd381d94",
+      "copyright": [
+        "Copyright 2022 The Noto Project Authors (https://github.com/notofonts/latin-greek-cyrillic)"
+      ],
+      "license": [
+        "This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: https://scripts.sil.org/OFL"
+      ],
+      "license_url": [
+        "https://scripts.sil.org/OFL"
+      ],
+      "unicode_cmap_count": 17233
+    },
+    {
+      "file": "NotoSansHistorical-Regular.ttf",
+      "source": "D:\\Fonts\\notofonts.github.io-noto-monthly-release-2026.10.01\\megamerge\\NotoSansHistorical-Regular.ttf",
+      "size": 4330956,
+      "sha256": "8523d7c3ec92c82573e3db3065225349b187fc871c21c228584a46b0f86113f3",
+      "copyright": [
+        "Copyright 2022 The Noto Project Authors (https://github.com/notofonts/latin-greek-cyrillic)"
+      ],
+      "license": [
+        "This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: https://scripts.sil.org/OFL"
+      ],
+      "license_url": [
+        "https://scripts.sil.org/OFL"
+      ],
+      "unicode_cmap_count": 10099
+    },
+    {
+      "file": "NotoSerifLiving-Regular.ttf",
+      "source": "D:\\Fonts\\notofonts.github.io-noto-monthly-release-2026.10.01\\megamerge\\NotoSerifLiving-Regular.ttf",
+      "size": 3464808,
+      "sha256": "a17c0a7e8776739363fc39decd76b06fcf494cce817cddbe8e7fd5632b194077",
+      "copyright": [
+        "Copyright 2022 The Noto Project Authors (https://github.com/notofonts/latin-greek-cyrillic)"
+      ],
+      "license": [
+        "This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: https://scripts.sil.org/OFL"
+      ],
+      "license_url": [
+        "https://scripts.sil.org/OFL"
+      ],
+      "unicode_cmap_count": 6074
+    },
+    {
+      "file": "NotoSerifHistorical-Regular.ttf",
+      "source": "D:\\Fonts\\notofonts.github.io-noto-monthly-release-2026.10.01\\megamerge\\NotoSerifHistorical-Regular.ttf",
+      "size": 5106512,
+      "sha256": "a6cbee4e3497c1daf8453cf409fda8a66fcfba0863f3071e174d48186b249cc5",
+      "copyright": [
+        "Copyright 2022 The Noto Project Authors (https://github.com/notofonts/latin-greek-cyrillic)"
+      ],
+      "license": [
+        "This Font Software is licensed under the SIL Open Font License, Version 1.1. This license is available with a FAQ at: https://scripts.sil.org/OFL"
+      ],
+      "license_url": [
+        "https://scripts.sil.org/OFL"
+      ],
+      "unicode_cmap_count": 10942
+    }
+  ],
+  "license_file": "Noto-LICENSE.txt",
+  "license_sha256": "f2095b08bed08b23a6fe26112fcd679a2bee3f002eef077eb05d215ed1051bd8"
+}

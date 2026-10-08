@@ -2,7 +2,7 @@
    https://fetch.spec.whatwg.org/#fetch-api (consulted 2026-10-06).
    Body bytes are real snapshots, not String(BufferSource). Response and Blob
    bodies expose real Streams; the host network transport is still buffered.
-   Stream uploads, FormData, opaque responses and background keepalive fail
+   Stream uploads, opaque responses and background keepalive fail
    explicitly rather than pretending to perform unsupported transport work.
    Request cache modes use the cacheless native host's genuine network path;
    only-if-cached always misses and never sends a network request. No Cache
@@ -46,7 +46,7 @@ const fetchBridge = (() => {
     const nullStatuses=new Set([101,103,204,205,304]);
     const cacheModes=['default','no-store','reload','no-cache','force-cache','only-if-cached'];
     let NativeURL, Params, paramsString, Encoder, encode, Decoder, decode;
-    let blobAPI,objectURLAPI,streams;
+    let blobAPI,formDataAPI,objectURLAPI,streams;
     const str=v=>{if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol to string');return String(v);};
     const usv=v=>apply(wellFormed,str(v),[]);
     const byteString=v=>{const t=str(v);if(/[^\x00-\xff]/.test(t))throw new TypeError('Expected ByteString');return t;};
@@ -156,13 +156,10 @@ const fetchBridge = (() => {
         if(value==null)return {bytes:null,type:null};
         if(isBuffer(value))return {bytes:copyBytes(value),type:null};
         if(blobAPI&&blobAPI.brand(value))return {bytes:blobAPI.bytes(value),type:blobAPI.type(value)||null};
+        if(formDataAPI&&formDataAPI.brand(value))return formDataAPI.multipart(value);
         if(streams&&streams.brand(value)) {
             if(streams.locked(value)||streams.disturbed(value))throw new TypeError('Body stream is locked or disturbed');
             return {bytes:null,type:null,stream:value};
-        }
-        for(const name of ['FormData']) {
-            const C=globalThis[name];
-            if(typeof C==='function'&&value instanceof C)throw notSupported(name+' bodies are not supported');
         }
         if(Params&&value instanceof Params)return {bytes:apply(taBuffer,apply(encode,new Encoder(),[apply(paramsString,value,[])]),[]),type:'application/x-www-form-urlencoded;charset=UTF-8'};
         return {bytes:apply(taBuffer,apply(encode,new Encoder(),[usv(value)]),[]),type:'text/plain;charset=UTF-8'};
@@ -416,9 +413,10 @@ const fetchBridge = (() => {
         Headers,Request,Response,AbortSignal,AbortController,fetch,
         initialize(){NativeURL=globalThis.URL;Params=globalThis.URLSearchParams;paramsString=Params.prototype.toString;Encoder=globalThis.TextEncoder;encode=Encoder.prototype.encode;Decoder=globalThis.TextDecoder;decode=Decoder.prototype.decode;},
         initializeBlobs(api){blobAPI=api;},
+        initializeFormData(api){formDataAPI=api;},
         initializeStreams(api){streams=api;},
         initializeObjectURLs(api){objectURLAPI=api;},
-        xhrBody(value){const binary=isBuffer(value)||!!(blobAPI&&blobAPI.brand(value)),body=extractBody(value);if(body.stream)throw notSupported('XHR stream uploads are unsupported');return {...body,binary};},
+        xhrBody(value){const binary=isBuffer(value)||!!(blobAPI&&blobAPI.brand(value))||!!(formDataAPI&&formDataAPI.brand(value)),body=extractBody(value);if(body.stream)throw notSupported('XHR stream uploads are unsupported');return {...body,binary};},
         xhrResponse(response) {
             // Only the private XHR completion path calls this. Do not invoke
             // page-mutable Response getters or publish a backing-buffer API.

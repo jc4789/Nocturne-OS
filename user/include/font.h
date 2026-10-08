@@ -1,6 +1,6 @@
 /* TrueType text (libc/font.c, using stb_truetype): antialiased, any size, with a glyph cache.
    Sizes are in pixels per em, as CSS font-size. font_ui() uses bundled Maple Mono NF
-   (regular, bold, italic, bold italic) with a shared regular CN missing-glyph fallback. */
+   (regular, bold, italic, bold italic). Bundled families share lazy missing-glyph fallbacks. */
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -10,9 +10,18 @@
 typedef struct font font_t;
 
 enum { FONT_REGULAR = 0, FONT_BOLD = 1, FONT_ITALIC = 2, FONT_BOLD_ITALIC = 3 };
+enum { FONT_FAMILY_SANS = 0, FONT_FAMILY_SERIF = 1, FONT_FAMILY_MONO = 2 };
 
 font_t *font_open(const char *path); /* NULL if the file is missing or not a TrueType font */
 font_t *font_ui(int style);          /* Maple Mono; loaded once. NULL if the files are missing */
+/* Inter / Noto Serif Living Regular / Maple Mono。統合 Noto は四ファイルだけで
+   各 Regular face を共有し、実 bold/italic は持たない。Sans は Inter の指定
+   style/Regular、欠落時は Sans Living。未知 family は Sans、全欠落は NULL。
+   同梱統合 Noto の行箱は Inter Regular の metrics（欠落時は既定値）を使う。
+   欠落 CJK は本文 family 用の日本語 Regular OTF、CN、Plangothic の順。
+   UI/Mono はその OTF を使わず、Maple の主書体/CN 優先順を保つ。
+   font_open は単一 face のまま。この API は Web font / shaping を追加しない。 */
+font_t *font_family(int family, int style);
 
 /* line metrics in pixels for size px: ascent above the baseline, descent below it (positive),
    and the recommended gap between lines */

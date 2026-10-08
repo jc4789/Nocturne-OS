@@ -18,6 +18,7 @@
 #include "form_file.h"
 #include "elements.h"
 #include "js_crypto.h"
+#include "js_encoding.h"
 #include "js_collator_native.h"
 #include "js_bootstrap.inc"
 
@@ -27,12 +28,14 @@
 #define JS_HEAP_LIMIT (128u * 1024u * 1024u)
 #define JS_STACK_LIMIT (512u * 1024u)
 #define JS_BODY_LIMIT (16u * 1024u * 1024u)
+/* Executable data URLs carry source, not an HTTP request target. Keep them
+   within the source/heap bounds without truncating their module identity. */
+#define JS_DATA_URL_LIMIT (JS_BODY_LIMIT + 256u)
 /* Execution, microtasks and synchronous DOM/layout share one watchdog. Source
    preparation through COMPILE_ONLY has a separate, cumulative task allowance:
    live YouTube's finite 10.8 MB compilation takes over 10 seconds under QEMU.
    Neither nested callbacks nor repeated compilations reset either allowance.
    JavaScript eval()/Function() remain inside the execution budget. */
-#define JS_TASK_MS 5000u
 #define JS_COMPILE_MS 30000u
 #define JS_STARTUP_MS 10000u /* trusted, built-in platform initialization only */
 #define JS_TIMERS 128
@@ -102,6 +105,7 @@ struct web_js_state {
     struct js_resource_event *events, *last_event;
     struct js_image_decode *image_decodes, *last_image_decode;
     uint64_t next_request, task_deadline, now;
+    uint32_t task_budget_ms;
     uint64_t timing[JS_TIMING_COUNT];
     uint32_t timing_valid; /* Recorded uptime 0 is distinct from unavailable. */
     uint64_t task_layout_ms, task_compile_ms, compile_wait_ms, task_microtask_ms;
@@ -232,7 +236,7 @@ static void report_allocation_failure(struct web_js_state *s) {
 static void exception(struct web_js_state *s) {
     report_allocation_failure(s);
     bool temporary = !s->running;
-    if (temporary) { JS_UpdateStackTop(s->rt); s->task_deadline = uptime_ms() + JS_TASK_MS; s->running = 1; }
+    if (temporary) { JS_UpdateStackTop(s->rt); s->task_deadline = uptime_ms() + s->task_budget_ms; s->running = 1; }
     JSValue e = JS_GetException(s->ctx);
     JSValue stack = JS_IsObject(e) ? JS_GetPropertyStr(s->ctx, e, "stack") : JS_UNDEFINED;
     const char *a = JS_ToCString(s->ctx, e), *b = JS_IsUndefined(stack) ? NULL : JS_ToCString(s->ctx, stack);
@@ -251,7 +255,7 @@ static int interrupt(JSRuntime *rt, void *opaque) {
 }
 static void begin_task(struct web_js_state *s) {
     if (!s->running) {
-        JS_UpdateStackTop(s->rt); s->task_deadline = uptime_ms() + JS_TASK_MS;
+        JS_UpdateStackTop(s->rt); s->task_deadline = uptime_ms() + s->task_budget_ms;
         s->task_layout_ms = 0; s->task_layout_flushes = 0;
         s->task_compile_ms = 0; s->compile_timed_out = false;
         s->task_microtask_ms = 0; s->task_timed_out = false;
@@ -301,9 +305,13 @@ static void end_task(struct web_js_state *s) {
             s->rejections[i].used = false;
         }
         if (s->timed_out) {
+            char message[128];
+            if (s->task_budget_ms % 1000u)
+                snprintf(message,sizeof message,"JavaScript stopped: the task exceeded its %u ms execution budget.",s->task_budget_ms);
+            else
+                snprintf(message,sizeof message,"JavaScript stopped: the task exceeded its %u second execution budget.",s->task_budget_ms/1000u);
             log_text(s, 2, s->compile_timed_out ? "JavaScript stopped: source preparation exceeded its 30 second task budget." :
-                     s->starting ? "Browser API initialization exceeded its 10 second startup budget." :
-                     "JavaScript stopped: the task exceeded its 5 second execution budget.");
+                     s->starting ? "Browser API initialization exceeded its 10 second startup budget." : message);
             s->timed_out = false;
         }
         if (s->doc->resources_dirty) doc_rescan(s->doc);
@@ -547,6 +555,13 @@ static JSValue image_decode_promise(struct web_js_state *s, node_t *n) {
 }
 static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
+    if (!strcmp(p, "styleSheetAvailable")) {
+        if (n->type != N_ELEM || n->foreign || n->tag != T_style)
+            return JS_ThrowTypeError(ctx, "HTMLStyleElement receiver required");
+        const char *type = node_attr(n, "type");
+        return JS_NewBool(ctx, d->live && doc_node_root(n, true) == d->root &&
+            !node_ancestor(n, T_template) && (!type || !*type || str_ieq(type, "text/css")));
+    }
     if (!strcmp(p, "shadowRoot")) return wrap(s, n->shadow_root);
     if (!strcmp(p, "shadowHost")) return wrap(s, n->shadow_host);
     if (!strcmp(p, "shadowHostValid")) return JS_NewBool(ctx, doc_shadow_host_valid(n));
@@ -1059,6 +1074,11 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property)
     uint32_t color = 0; bool is_color = false; float px = 0; bool is_px = false;
     if (!strcmp(property, "color")) { color = st->color; is_color = true; }
     else if (!strcmp(property, "background-color")) { color = st->bg_color; is_color = true; }
+    /* The layout engine currently resolves logical sides in horizontal LTR.
+       Report that effective initial direction rather than an empty value:
+       anchor controllers otherwise mistake the surface for RTL. This does
+       not advertise RTL/bidi layout, which is not implemented yet. */
+    else if (!strcmp(property, "direction")) snprintf(out, sizeof out, "ltr");
     else if (!strcmp(property, "font-size")) { px = st->font_size; is_px = true; }
     else if (!strcmp(property, "font-weight")) snprintf(out, sizeof out, "%u", st->font_weight);
     else if (!strcmp(property, "opacity")) snprintf(out, sizeof out, "%g", (double)st->opacity);
@@ -1082,6 +1102,119 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property)
     if (is_color) snprintf(out, sizeof out, "rgba(%u, %u, %u, %g)", (color >> 16) & 255, (color >> 8) & 255, color & 255, (double)((color >> 24) & 255) / 255);
     if (is_px) snprintf(out, sizeof out, "%gpx", (double)px);
     return JS_NewString(ctx, out);
+}
+/* Private samples live in the animation cascade origin, never inline style.
+   The numeric/color subset renders through the existing native CSS engine. */
+static bool animated_property(const char *p) {
+    static const char *const names[] = {"top", "right", "bottom", "left", "width", "height",
+        "min-width", "max-width", "min-height", "max-height", "opacity", "color", "background-color",
+        "border-radius", "font-size", "letter-spacing", "word-spacing",
+        "margin-top", "margin-right", "margin-bottom", "margin-left",
+        "padding-top", "padding-right", "padding-bottom", "padding-left",
+        "border-top-width", "border-right-width", "border-bottom-width", "border-left-width",
+        "border-top-color", "border-right-color", "border-bottom-color", "border-left-color"};
+    for (unsigned i = 0; i < sizeof names / sizeof *names; i++) if (!strcmp(p, names[i])) return true;
+    return false;
+}
+static JSValue animation_dom(struct web_js_state *s, node_t *n, bool read, int argc, JSValueConst *argv) {
+    JSContext *ctx = s->ctx;
+    if (!n || n->type != N_ELEM || argc < (read ? 4 : 5)) return JS_ThrowTypeError(ctx, "Animation Element receiver required");
+    const char *pseudo = JS_ToCString(ctx, argv[2]);
+    if (!pseudo) return JS_EXCEPTION;
+    int pe = !*pseudo ? PE_NONE : !strcmp(pseudo, "::before") ? PE_BEFORE : !strcmp(pseudo, "::after") ? PE_AFTER : -1;
+    JS_FreeCString(ctx, pseudo);
+    if (pe < 0) return JS_ThrowSyntaxError(ctx, "Unsupported animation pseudo-element");
+    if (read) {
+        /* Detached nodes may retain an old smem pointer after a cascade. Do
+           not dereference it; reconnection will produce fresh style values. */
+        if (!connected(s, n)) return JS_NewString(ctx, "");
+        const char *p = JS_ToCString(ctx, argv[3]);
+        if (!p) return JS_EXCEPTION;
+        if (s->doc->resources_dirty) doc_rescan(s->doc);
+        flush_layout(s);
+        style_t *st = n->animation_base_style ? n->animation_base_style : n->style;
+        if (st && pe == PE_BEFORE) st = st->before;
+        else if (st && pe == PE_AFTER) st = st->after;
+        char out[128] = "";
+        if (st) {
+            const len_t *length = NULL; float px = 0; bool numeric = false, is_color = false;
+            uint32_t color = 0;
+            if (!strcmp(p, "opacity")) snprintf(out, sizeof out, "%g", (double)st->opacity);
+            else if (!strcmp(p, "transform")) snprintf(out, sizeof out, "none"); /* not rendered yet */
+            else if (!strcmp(p, "color")) { color = st->color; is_color = true; }
+            else if (!strcmp(p, "background-color")) { color = st->bg_color; is_color = true; }
+            else if (!strcmp(p, "border-radius")) { px = st->border_radius; numeric = true; }
+            else if (!strcmp(p, "font-size")) { px = st->font_size; numeric = true; }
+            else if (!strcmp(p, "letter-spacing")) { px = st->letter_spacing; numeric = true; }
+            else if (!strcmp(p, "word-spacing")) { px = st->word_spacing; numeric = true; }
+            else if (!strcmp(p, "width")) length = &st->width;
+            else if (!strcmp(p, "height")) length = &st->height;
+            else if (!strcmp(p, "min-width")) length = &st->min_width;
+            else if (!strcmp(p, "max-width")) length = &st->max_width;
+            else if (!strcmp(p, "min-height")) length = &st->min_height;
+            else if (!strcmp(p, "max-height")) length = &st->max_height;
+            else {
+                static const char *const sides[] = {"top", "right", "bottom", "left"};
+                for (int i = 0; i < 4; i++) {
+                    char key[32];
+                    if (!strcmp(p, sides[i])) length = &st->inset[i];
+                    snprintf(key, sizeof key, "margin-%s", sides[i]); if (!strcmp(p, key)) length = &st->margin[i];
+                    snprintf(key, sizeof key, "padding-%s", sides[i]); if (!strcmp(p, key)) length = &st->padding[i];
+                    snprintf(key, sizeof key, "border-%s-width", sides[i]); if (!strcmp(p, key)) { px = st->border_width[i]; numeric = true; }
+                    snprintf(key, sizeof key, "border-%s-color", sides[i]); if (!strcmp(p, key)) { color = st->border_color[i]; is_color = true; }
+                }
+            }
+            if (length) {
+                if (length->kind == LK_AUTO || length->kind == LK_NONE || length->kind == LK_NORMAL)
+                    snprintf(out, sizeof out, "%s", length->kind == LK_AUTO ? "auto" : length->kind == LK_NONE ? "none" : "normal");
+                else {
+                    /* Resolve from the underlying declaration, not animated box
+                       geometry: omitted keyframes cannot feed samples back. */
+                    node_t *parent = pe ? n : doc_flat_parent(n);
+                    float base = parent && parent->box ? (strstr(p, "height") || !strcmp(p,"top") || !strcmp(p,"bottom") ? parent->box->h : parent->box->w) : 0;
+                    px = len_resolve(length, base); numeric = true;
+                }
+            }
+            if (is_color) snprintf(out, sizeof out, "rgba(%u, %u, %u, %g)", (color >> 16) & 255, (color >> 8) & 255, color & 255, (double)(color >> 24) / 255);
+            if (numeric) snprintf(out, sizeof out, "%gpx", (double)px);
+        }
+        JS_FreeCString(ctx, p); return JS_NewString(ctx, out);
+    }
+    uint32_t id;
+    if (JS_ToUint32(ctx, &id, argv[3]) < 0) return JS_EXCEPTION;
+    if (!id) return JS_ThrowRangeError(ctx, "Invalid animation id");
+    sbuf text = {0}; JSValue result = JS_UNDEFINED;
+    if (!JS_IsNull(argv[4])) {
+        JSValue length = JS_GetPropertyStr(ctx, argv[4], "length"); uint32_t count = 0;
+        int converted = JS_ToUint32(ctx, &count, length); JS_FreeValue(ctx, length);
+        if (converted < 0) return JS_EXCEPTION;
+        if (count > 128 || count % 2) return JS_ThrowRangeError(ctx, "Animation sample exceeds property limit");
+        for (uint32_t i = 0; i < count; i += 2) {
+            JSValue key = JS_GetPropertyUint32(ctx, argv[4], i), val = JS_GetPropertyUint32(ctx, argv[4], i + 1);
+            size_t kn = 0, vn = 0;
+            const char *k = JS_ToCStringLen(ctx, &kn, key), *v = JS_ToCStringLen(ctx, &vn, val);
+            JS_FreeValue(ctx, key); JS_FreeValue(ctx, val);
+            if (!k || !v) result = JS_EXCEPTION;
+            else if (kn > 32 || vn > 512 || strlen(k) != kn || strlen(v) != vn || strpbrk(v, ";{}!\r\n"))
+                result = JS_ThrowRangeError(ctx, "Invalid animation property value");
+            else if (animated_property(k)) {
+                if (text.n + kn + vn + 2 > 4096) result = JS_ThrowRangeError(ctx, "Animation sample exceeds byte limit");
+                else { sb_puts(&text, k); sb_putc(&text, ':'); sb_puts(&text, v); sb_putc(&text, ';'); }
+            }
+            JS_FreeCString(ctx, k); JS_FreeCString(ctx, v);
+            if (JS_IsException(result)) break;
+        }
+    }
+    if (!JS_IsException(result)) {
+        int changed = css_animation_set(n, (uint8_t)pe, id, text.n ? sb_cstr(&text) : NULL);
+        if (changed == -1) result = oom(ctx);
+        else if (changed == -2) result = JS_ThrowRangeError(ctx, "Native animation effect limit exceeded");
+        else if (changed) {
+            web_doc *d = n->owner ? n->owner : s->doc;
+            d->need_style = d->dirty = true;
+        }
+    }
+    sb_free(&text); return result;
 }
 /* Private CE hooks retain native wrapper identity. They only enqueue reactions;
    JavaScript's CEReactions scope invokes callbacks after the DOM operation. */
@@ -1297,6 +1430,20 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     }
     if (!strcmp(op, "isNode")) {
         result = JS_NewBool(ctx, argc > 2 && JS_GetOpaque(argv[2], node_class) != NULL);
+    } else if (!strcmp(op, "animationStyle") || !strcmp(op, "animationComputed")) {
+        result = animation_dom(s, n, !strcmp(op, "animationComputed"), argc, argv);
+    } else if (!strcmp(op, "styleDisabled")) {
+        if (!n || n->type != N_ELEM || n->foreign || n->tag != T_style)
+            result = JS_ThrowTypeError(ctx, "HTMLStyleElement receiver required");
+        else if (argc > 2) {
+            bool disabled = JS_ToBool(ctx, argv[2]) > 0;
+            if (disabled != n->style_disabled) {
+                n->style_disabled = disabled;
+                /* This changes the native cascade, not DOM attributes or text:
+                   no fabricated MutationObserver/CE reaction is generated. */
+                d->resources_dirty = d->dirty = d->need_style = true;
+            }
+        } else result = JS_NewBool(ctx, n->style_disabled);
     } else if (!strcmp(op, "slotChanges")) {
         web_doc *family = s->doc->dom_family ? s->doc->dom_family : s->doc;
         result = JS_NewArray(ctx); uint32_t index = 0;
@@ -1636,12 +1783,17 @@ static bool permitted_url(struct web_js_state *s, const char *url, bool fetch) {
     const char *slash = strrchr(base, '/');
     return slash && !strncmp(u, base, (size_t)(slash + 1 - base));
 }
-/* data: is executable only through the script/module resource boundary. Do
- * not grant fetch, navigation, images or local-file access this allowance. */
+/* Opaque executable URLs stay in the script/module boundary. Blob contents
+ * must also pass the document-private, revocable object-URL registry below;
+ * this does not grant a native fetch, navigation or local-file allowance. */
 static bool permitted_script_url(struct web_js_state *s,const char *url) {
-    return strlen(url)<2048 && (!strncasecmp(url,"data:",5) || permitted_url(s,url,false));
+    size_t length=strlen(url);
+    if (!strncasecmp(url,"data:",5)) return length<=JS_DATA_URL_LIMIT;
+    if (!strncasecmp(url,"blob:",5)) return length<WEBNET_URL_MAX;
+    return length<WEBNET_URL_MAX && permitted_url(s,url,false);
 }
 static char *script_data_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]);
+static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]);
 static JSValue native_log(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); int32_t level = 0;
     if (argc) JS_ToInt32(ctx, &level, argv[0]);
@@ -2079,15 +2231,19 @@ static struct js_pending *pending_new(struct web_js_state *s, int kind, const ch
 static void pending_error(struct js_pending *p, const char *error) { p->done = true; snprintf(p->response.error, sizeof p->response.error, "%s", error); }
 static bool send_request(struct web_js_state *s, struct js_pending *p, int kind, const char *method,
                          const char *headers, const void *body, size_t len) {
-    if (p->kind==P_SCRIPT && !strncasecmp(p->url,"data:",5)) {
+    if (p->kind==P_SCRIPT && (!strncasecmp(p->url,"data:",5) || !strncasecmp(p->url,"blob:",5))) {
         char mime[128];
-        p->response.body=script_data_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime);
+        p->response.body=!strncasecmp(p->url,"data:",5)
+            ? script_data_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime)
+            : script_blob_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime);
         if (!p->response.body) {
             if (JS_HasException(s->ctx)) exception(s);
-            pending_error(p,"Invalid data script URL or JavaScript MIME type"); return false;
+            pending_error(p,"Unavailable local script URL or invalid JavaScript MIME type"); return false;
         }
         p->response.status=200;
-        snprintf(p->response.url,sizeof p->response.url,"%s",p->url);
+        /* No redirect occurred. The complete URL already belongs to the
+           pending/script record; an HTTP-sized field would truncate source. */
+        p->response.url[0]=0;
         snprintf(p->response.headers,sizeof p->response.headers,"Content-Type: %s\r\n",mime);
         p->done=true; return true;
     }
@@ -2168,7 +2324,7 @@ static char *module_url(struct web_js_state *s, const char *hook, const char *na
     if (JS_IsException(value)) return NULL;
     size_t len; const char *url = JS_ToCStringLen(s->ctx, &len, value);
     char *result = NULL;
-    if (url && len < 2048 && len == strlen(url) && permitted_script_url(s, url)) result = js_strdup(s->ctx, url);
+    if (url && len == strlen(url) && permitted_script_url(s, url)) result = js_strdup(s->ctx, url);
     else if (url) JS_ThrowTypeError(s->ctx, "Module URL is not permitted or exceeds the URL limit: %s", name);
     JS_FreeCString(s->ctx, url); JS_FreeValue(s->ctx, value); return result;
 }
@@ -2181,7 +2337,7 @@ static char *normalize_module(JSContext *ctx, const char *base, const char *name
     }
     const char *resolve_base = base && *base ? base : s->doc->base;
     for (struct js_module *m = s->modules; m; m = m->next) if (!strcmp(m->url, resolve_base)) { resolve_base = m->base; break; }
-    if (!strncasecmp(resolve_base,"data:",5) &&
+    if ((!strncasecmp(resolve_base,"data:",5) || !strncasecmp(resolve_base,"blob:",5)) &&
         (name[0]=='/' || !strncmp(name,"./",2) || !strncmp(name,"../",3))) {
         JS_ThrowTypeError(ctx,"Relative module imports require a hierarchical base URL"); return NULL;
     }
@@ -2318,6 +2474,40 @@ static char *script_data_source(struct web_js_state *s,const char *url,bool modu
 malformed:
     js_free(s->ctx,bytes); JS_ThrowTypeError(s->ctx,"Invalid forgiving-base64 data script body"); return NULL;
 }
+/* The private hook returns only real Blob bytes from this document's live
+ * registry, never an author-visible URL property or an OS path. Root its result
+ * while allocating the tracked source copy; MIME and byte limits remain native. */
+static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]) {
+    JSContext *ctx=s->ctx;
+    JSValue value=module_bridge_call(s,"blobScript",url,strlen(url),s->doc->base);
+    if (JS_IsException(value)) return NULL;
+    JSValue buffer=JS_GetPropertyUint32(ctx,value,0),type=JS_UNDEFINED;
+    const char *content_type=NULL; char *source=NULL; size_t n=0,tn=0;
+    if (JS_IsException(buffer)) goto out;
+    const uint8_t *bytes=JS_GetArrayBuffer(ctx,&n,buffer);
+    if (!bytes && JS_HasException(ctx)) goto out;
+    if (n>JS_BODY_LIMIT) { JS_ThrowRangeError(ctx,"Blob script exceeds the 16 MiB source limit"); goto out; }
+    type=JS_GetPropertyUint32(ctx,value,1);
+    if (JS_IsException(type)) goto out;
+    content_type=JS_ToCStringLen(ctx,&tn,type);
+    if (!content_type) goto out;
+    const char *first=content_type,*end=memchr(first,';',tn);
+    if (!end) end=first+tn;
+    while (first<end && mime_space((unsigned char)*first)) first++;
+    while (end>first && mime_space((unsigned char)end[-1])) end--;
+    size_t mn=(size_t)(end-first);
+    bool valid=valid_mime_essence(first,end) && mn<128;
+    if (module && (!valid || !javascript_essence(first,mn))) {
+        JS_ThrowTypeError(ctx,"Blob module requires a JavaScript MIME type"); goto out;
+    }
+    if (valid) { memcpy(mime,first,mn); mime[mn]=0; } else strcpy(mime,"text/plain");
+    web_js_prepare_bytes(ctx,n+1);
+    source=js_malloc(ctx,n+1);
+    if (source) { if (n) memcpy(source,bytes,n); source[n]=0; *length=n; }
+out:
+    JS_FreeCString(ctx,content_type); JS_FreeValue(ctx,type);
+    JS_FreeValue(ctx,buffer); JS_FreeValue(ctx,value); return source;
+}
 /* Only the host's explicit source-preparation boundary gets this allowance.
    COMPILE_ONLY does not run page code. Recursive module preparation is counted
    once, and the sum is retained until the outer task (including jobs) ends.
@@ -2365,9 +2555,11 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
     if (!permitted_script_url(s, url)) { JS_ThrowReferenceError(ctx, "Module URL is not permitted"); return NULL; }
     struct js_module *m = NULL;
     for (m = s->modules; m; m = m->next) if (!strcmp(m->url, url)) break;
-    if (!m && !strncasecmp(url,"data:",5)) {
+    if (!m && (!strncasecmp(url,"data:",5) || !strncasecmp(url,"blob:",5))) {
         size_t length; char mime[128];
-        char *source=script_data_source(s,url,true,&length,mime);
+        char *source=!strncasecmp(url,"data:",5)
+            ? script_data_source(s,url,true,&length,mime)
+            : script_blob_source(s,url,true,&length,mime);
         if (!source) return NULL;
         m=cache_module(s,url,source,length,url); js_free(ctx,source);
         if (!m) return NULL;
@@ -2459,17 +2651,15 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
             begin_task(s); script->url = module_url(s, "moduleURL", src, s->doc->base);
             if (!script->url) { script->ready = script->failed = true; exception(s); }
             end_task(s);
-            if (script->url) snprintf(url, sizeof url, "%s", script->url);
         } else {
             /* The generic native resolver rewrites backslashes even for opaque
              * URLs and may truncate. Use the script-private WHATWG URL binding. */
             begin_task(s); script->url=module_url(s,"moduleURL",src,s->doc->base);
             if (!script->url) { script->ready=script->failed=true; exception(s); }
             end_task(s);
-            if (script->url) snprintf(url,sizeof url,"%s",script->url);
         }
         if (!script->failed) {
-            struct js_pending *p = pending_new(s, P_SCRIPT, url);
+            struct js_pending *p = pending_new(s, P_SCRIPT, script->url);
             if (!p) script->ready = script->failed = true;
             else { p->script = script; script->request = p->id; send_request(s, p, module ? WEB_RESOURCE_MODULE : WEB_RESOURCE_SCRIPT, "GET", NULL, NULL, 0); }
         }
@@ -3227,6 +3417,8 @@ static JSValue load_browser_bindings(JSContext *ctx) {
 void web_js_start(web_doc *d, const struct web_host *host) {
     struct web_js_state *s = calloc(1, sizeof *s); if (!s) return;
     d->js = s; s->doc = d; if (host) s->host = *host;
+    uint32_t budget = s->host.js_task_budget_ms;
+    s->task_budget_ms = budget >= WEB_JS_TASK_MIN_MS && budget <= WEB_JS_TASK_MAX_MS ? budget : WEB_JS_TASK_DEFAULT_MS;
     s->media_width = d->width; s->media_height = d->height;
     uint64_t initialized = uptime_ms();
     const struct web_navigation_timing *navigation = &s->host.navigation_timing;
@@ -3277,6 +3469,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     };
     JS_SetPropertyFunctionList(s->ctx, api, functions, sizeof functions / sizeof *functions);
     web_js_crypto_init(s->ctx, api);
+    web_js_encoding_init(s->ctx, api);
     web_js_collator_init(s->ctx, api);
     JS_SetPropertyStr(s->ctx, api, "document", wrap(s, d->root));
     JSValue global = JS_GetGlobalObject(s->ctx);

@@ -1406,6 +1406,15 @@ static char *strip_comments(arena_t *a, const char *css, size_t n, size_t *out_n
 
 void css_sheet_scope(sheet_t *sheet, node_t *shadow_root) { if (sheet) sheet->scope = shadow_root; }
 
+/* Rules/selectors/declarations are immutable after parsing. Each adoption in
+   the native cascade still needs its OWN scope and source-order identity. */
+sheet_t *css_sheet_instance(arena_t *a, const sheet_t *source, double order, node_t *scope) {
+    sheet_t *sheet = ar_alloc(a, sizeof *sheet);
+    *sheet = *source;
+    sheet->order = order; sheet->scope = scope;
+    return sheet;
+}
+
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
     struct pctx pc = {a, NULL, base_url, imports, 0, false};
     pc.sh = ar_alloc(a, sizeof(sheet_t));
@@ -1927,11 +1936,47 @@ static void pres_hints(node_t *e, struct hints *h) {
 }
 
 /* ---------------------------------------------------------------- the cascade */
+struct css_animation {
+    struct css_animation *next;
+    uint32_t id;
+    uint8_t pseudo;
+    char *text;
+};
+static unsigned animation_count;
+int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text) {
+    struct css_animation **slot = &n->animations;
+    unsigned count = 0;
+    while (*slot && ((*slot)->id != id || (*slot)->pseudo != pseudo)) {
+        count++; slot = &(*slot)->next;
+    }
+    struct css_animation *old = *slot;
+    if (!text || !*text) {
+        if (!old) return 0;
+        *slot = old->next; free(old->text); free(old); animation_count--; return 1;
+    }
+    if (old && !strcmp(old->text, text)) return 0;
+    if (!old && (animation_count >= 128 || count >= 32)) return -2;
+    char *copy = strdup(text);
+    if (!copy) return -1;
+    if (old) { free(old->text); old->text = copy; return 1; }
+    struct css_animation *a = malloc(sizeof *a);
+    if (!a) { free(copy); return -1; }
+    *a = (struct css_animation){NULL, id, pseudo, copy};
+    *slot = a; animation_count++; return 1;
+}
+void css_animation_free(node_t *n) {
+    while (n->animations) {
+        struct css_animation *a = n->animations;
+        n->animations = a->next;
+        free(a->text); free(a); animation_count--;
+    }
+}
 struct dent {
     const struct decl *d;
     uint64_t key;
     uint8_t pseudo;
     int scope_depth;
+    bool animation;
 };
 
 static struct dent *dents;
@@ -1955,6 +2000,7 @@ static void add_dent(const struct decl *d, uint64_t key, uint8_t pseudo, int dep
     dents[ndents].key = d->important ? (key ^ (1ull << 62)) | (1ull << 63) : key;
     dents[ndents].pseudo = pseudo;
     dents[ndents].scope_depth = depth;
+    dents[ndents].animation = false;
     ndents++;
 }
 
@@ -1981,6 +2027,14 @@ static void collect(const struct ient *l, node_t *e) {
 
 static int cmp_dent(const void *a, const void *b) {
     const struct dent *da = a, *db = b;
+    /* Animation origin beats normal styles, never !important. It must not
+       acquire author inline specificity or the shadow encapsulation order. */
+    if (da->animation != db->animation) {
+        const struct dent *normal = da->animation ? db : da;
+        bool animated_first = !normal->d->important;
+        return da->animation == animated_first ? -1 : 1;
+    }
+    if (da->animation) return da->key < db->key ? 1 : da->key > db->key ? -1 : 0;
     uint64_t x = da->key, y = db->key;
     /* Encapsulation context precedes specificity: outer normal declarations
        win; inner !important declarations win, including over inline styles. */
@@ -2054,7 +2108,7 @@ static void apply_decl(struct cascade *c, struct cx *cx, const struct decl *d) {
     css_apply(d->p, v, n, cx);
 }
 
-static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uint8_t pseudo) {
+static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uint8_t pseudo, bool underlying) {
     web_doc *d = c->d;
     style_t *s = ar_alloc(&d->smem, sizeof *s);
     css_style_init(s, parent);
@@ -2063,7 +2117,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     struct custom_prop *mine = NULL;
     for (int i = 0; i < ndents; i++) {
         const struct decl *x = dents[i].d;
-        if (dents[i].pseudo != pseudo || x->p) continue;
+        if (dents[i].pseudo != pseudo || x->p || (underlying && dents[i].animation)) continue;
         bool dup = false;
         for (struct custom_prop *m = mine; m; m = m->next)
             if (!strcmp(m->name, x->name)) dup = true;
@@ -2092,11 +2146,11 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     struct cx cx = {s, parent, e, parent ? parent->font_size : 16, c->rem, (float)c->vw, (float)c->vh,
                     &d->smem, setbits, true, false, false, 0};
     for (int i = 0; i < ndents; i++)
-        if (dents[i].pseudo == pseudo && dents[i].d->p && css_prop_is_font(dents[i].d->p)) apply_decl(c, &cx, dents[i].d);
+        if ((!underlying || !dents[i].animation) && dents[i].pseudo == pseudo && dents[i].d->p && css_prop_is_font(dents[i].d->p)) apply_decl(c, &cx, dents[i].d);
     cx.font_pass = false;
     cx.em = s->font_size;
     for (int i = 0; i < ndents; i++)
-        if (dents[i].pseudo == pseudo && dents[i].d->p) apply_decl(c, &cx, dents[i].d);
+        if ((!underlying || !dents[i].animation) && dents[i].pseudo == pseudo && dents[i].d->p) apply_decl(c, &cx, dents[i].d);
     if (!pseudo) web_dialog_style(d,e,s);
     if(pseudo==PE_BACKDROP) {
         if(s->position!=POS_FIXED && s->position!=POS_ABSOLUTE)s->position=POS_ABSOLUTE;
@@ -2118,6 +2172,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
 }
 
 static void clear_styles(node_t *n) {
+    n->animation_base_style = NULL;
     if (n->shadow_root) clear_styles(n->shadow_root);
     for (node_t *c = n->first; c; c = c->next) {
         c->style = NULL;
@@ -2157,23 +2212,40 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
         parse_body(&pc, sa, sa + strlen(sa), NULL, NULL, &ds, &nd);
         for (int i = 0; i < nd; i++) add_dent(&ds[i], 1ull << 62 | (uint64_t)0x3FFFFFFF << 32 | (uint64_t)(i < 255 ? i : 255), PE_NONE, depth);
     }
+    for (struct css_animation *a = e->animations; a; a = a->next) {
+        struct pctx pc = {&d->smem, NULL, d->base, NULL, 0, false};
+        struct decl *ds; int nd;
+        parse_body(&pc, a->text, a->text + strlen(a->text), NULL, NULL, &ds, &nd);
+        for (int i = 0; i < nd; i++) {
+            if (!ds[i].p || ds[i].important) continue;
+            add_dent(&ds[i], a->id, a->pseudo, 0);
+            dents[ndents - 1].animation = true;
+        }
+    }
     qsort(dents, (size_t)ndents, sizeof *dents, cmp_dent);
     bool has_before = false, has_after = false;
     for (int i = 0; i < ndents; i++) {
         if (dents[i].pseudo == PE_BEFORE) has_before = true;
         if (dents[i].pseudo == PE_AFTER) has_after = true;
     }
-    style_t *s = compute(c, e, parent, PE_NONE);
+    style_t *s = compute(c, e, parent, PE_NONE, false);
     e->style = s;
-    if (web_dialog_is_modal(d,e)) s->backdrop = compute(c,e,NULL,PE_BACKDROP);
+    e->animation_base_style = NULL;
+    if (e->animations) {
+        style_t *base = compute(c, e, parent, PE_NONE, true);
+        if (has_before) base->before = compute(c, e, s, PE_BEFORE, true);
+        if (has_after) base->after = compute(c, e, s, PE_AFTER, true);
+        e->animation_base_style = base;
+    }
+    if (web_dialog_is_modal(d,e)) s->backdrop = compute(c,e,NULL,PE_BACKDROP,false);
     if (e == d->html) c->rem = s->font_size;
     if (s->display != D_NONE && !(e->tag == T_img || e->tag == T_input || e->tag == T_br || e->tag == T_hr)) {
         if (has_before) {
-            style_t *b = compute(c, e, s, PE_BEFORE);
+            style_t *b = compute(c, e, s, PE_BEFORE, false);
             if (b->content && b->display != D_NONE) s->before = b;
         }
         if (has_after) {
-            style_t *a = compute(c, e, s, PE_AFTER);
+            style_t *a = compute(c, e, s, PE_AFTER, false);
             if (a->content && a->display != D_NONE) s->after = a;
         }
     }

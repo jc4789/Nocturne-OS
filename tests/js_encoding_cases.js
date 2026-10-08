@@ -85,5 +85,17 @@ globalThis.runEncodingCases = function runEncodingCases() {
         throws(() => encoder.encodeInto('a',v), 'TypeError', 'detached encodeInto');
     }
     // SharedArrayBuffer is intentionally excluded: Nocturne does not expose it.
+    // Large conversion regression: a bounded implementation must not create a
+    // multi-million-element array of one-character strings. Not a website test.
+    const big=new Uint8Array(2*1024*1024);big.fill(97);big[big.length-1]=98;
+    const large=decoder.decode(big);
+    assert(large.length===big.length&&large[0]==='a'&&large[large.length-1]==='b','large native decode');
+    const chunked=new TextDecoder();
+    const middle=chunked.decode(big,{stream:true});
+    assert(middle===large&&chunked.decode()==='','large bounded streaming decode');
+    assert(decoder.decode(new DataView(Uint8Array.of(42,0xe4,0xb8,0xad,42).buffer,1,3))==='\u4e2d','native DataView offset');
+    const badTail=new Uint8Array(4097);badTail.fill(97);badTail[4096]=0xe2;
+    assert(decoder.decode(badTail).endsWith('\ufffd'),'native incomplete tail');
+    throws(()=>new TextDecoder('utf-8',{fatal:true}).decode(badTail),'TypeError','native fatal incomplete tail');
     return checks;
 };

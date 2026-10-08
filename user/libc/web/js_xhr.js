@@ -125,7 +125,14 @@
         if(!current(s,epoch))return;
         s.text=text;
         const loaded=nativeApply(bufferLength,s.bytes,[]);
-        if(loaded){s.ready=3;fire(x,'readystatechange');if(!current(s,epoch))return;}
+        if(loaded){
+            s.ready=3;
+            // Text/JSON have their decoded representation now. Keep the wire
+            // buffer only for binary response types; do not double-retain a
+            // large response for the lifetime of Google's cached XHR objects.
+            if(s.type===''||s.type==='text'||s.type==='json')s.bytes=null;
+            fire(x,'readystatechange');if(!current(s,epoch))return;
+        }
         const header=nativeApply(headerGet,s.responseHeaders,['content-length']);
         const total=header!==null && /^\d+$/.test(header)?NativeNumber(header):0;
         if(!current(s,epoch))return;
@@ -230,11 +237,12 @@
         get responseXML(){const s=state(this);if(s.type!=='' && s.type!=='document')fail('InvalidStateError','Response is not a document');return null;}
         get response(){
             const s=state(this);if(s.type==='' || s.type==='text')return s.ready<3?'':s.text;
-            if(s.ready!==4 || !s.bytes)return null;
+            if(s.ready!==4)return null;
+            if((s.type==='arraybuffer'||s.type==='blob')&&!s.bytes)return null;
             if(!s.objectSet){
                 if(s.type==='arraybuffer')s.object=s.bytes;
                 else if(s.type==='blob')s.object=blobBridge.fromBytes(s.bytes,s.mime||nativeApply(headerGet,s.responseHeaders,['content-type'])||'');
-                else if(s.type==='json'){try{s.object=parseJSON(s.text);}catch(_){s.object=null;}}
+                else if(s.type==='json'){try{s.object=parseJSON(s.text);}catch(_){s.object=null;}s.text='';}
                 s.objectSet=true;
             }
             return s.object;

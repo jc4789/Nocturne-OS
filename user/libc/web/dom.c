@@ -706,7 +706,7 @@ void doc_node_remove(web_doc *d, node_t *n) {
 static void adopt_subtree(web_doc *d, node_t *n) {
     n->owner = d;
     for (int i = 0; i < n->nattrs; i++) if (n->attrs[i].node) n->attrs[i].node->owner = d;
-    n->style = NULL; n->box = n->anchor_block = NULL;
+    n->style = n->animation_base_style = NULL; n->box = n->anchor_block = NULL;
     n->image = -1; n->image_request = -1; n->image_initialized = false;
     n->image_generation++;
     /* Adoption is an image-data mutation even without a later insertion or

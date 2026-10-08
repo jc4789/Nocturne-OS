@@ -31,6 +31,16 @@ struct cached_css {
     bool done;
 };
 
+/* Repeated shadow <style> blocks need separate scope/order wrappers, not a
+   fresh expanded AST per component. This memo is local to one arena snapshot.
+   Imported sheets are excluded: their request order is not interchangeable. */
+struct css_sheet_reuse {
+    struct css_sheet_reuse *next;
+    const char *css, *base, *media;
+    size_t n;
+    sheet_t *sheet;
+};
+
 static struct cached_css *cached_css(web_doc *d, const char *url) {
     for (int i = 0; i < d->css_cache.n; i++) {
         struct cached_css *c = d->css_cache.v[i];
@@ -131,6 +141,13 @@ static void add_sheet(web_doc *d, const char *css, size_t n, const char *base, d
     if (d->css_depth >= 16) return;
     d->css_depth++;
     arena_t *arena = d->live ? &d->cssmem : &d->mem;
+    const char *source = css ? css : "", *source_base = base ? base : "", *source_media = media ? media : "";
+    for (struct css_sheet_reuse *c = d->css_reuse; c; c = c->next) {
+        if (n != c->n || strcmp(source_base, c->base) || strcmp(source_media, c->media) || memcmp(source, c->css, n)) continue;
+        pv_push(&d->sty.sheets, css_sheet_instance(arena, c->sheet, order, scope));
+        d->need_style = true; d->css_depth--;
+        return;
+    }
     pvec imports = {0};
     sheet_t *sh;
     if (media && *media) {
@@ -145,6 +162,13 @@ static void add_sheet(web_doc *d, const char *css, size_t n, const char *base, d
     } else sh = css_parse_sheet(arena, css, n, base, order, &imports);
     css_sheet_scope(sh, scope);
     pv_push(&d->sty.sheets, sh);
+    if (!imports.n && d->css_reuse_count < 128 && n <= CSS_SOURCE_LIMIT && d->css_reuse_bytes <= CSS_SOURCE_LIMIT - n) {
+        struct css_sheet_reuse *c = ar_alloc(arena, sizeof *c);
+        c->css = ar_strndup(arena, source, n); c->n = n;
+        c->base = ar_strdup(arena, source_base); c->media = ar_strdup(arena, source_media);
+        c->sheet = sh; c->next = d->css_reuse; d->css_reuse = c;
+        d->css_reuse_count++; d->css_reuse_bytes += n;
+    }
     for (int i = 0; i < imports.n; i++) {
         struct css_import *im = imports.v[i];
         struct cached_css *cached = d->live ? cached_css(d, im->url) : NULL;
@@ -437,8 +461,10 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             break;
         }
         case T_style: {
+            const char *type = node_attr(c, "type");
             const char *media = node_attr(c, "media");
-            if (!media_wanted(media) || node_ancestor(c, T_template)) break;
+            if (c->style_disabled || (type && *type && !str_ieq(type, "text/css")) ||
+                !media_wanted(media) || node_ancestor(c, T_template)) break;
             sbuf b = {0};
             text_of(c, &b);
             add_sheet(d, b.p ? b.p : "", b.n, d->base, d->next_sheet_order++, media, scope);
@@ -614,6 +640,7 @@ void doc_rescan(web_doc *d) {
     d->resources_dirty = false;
     css_styling_free(&d->sty);
     ar_free(&d->cssmem);
+    d->css_reuse = NULL; d->css_reuse_count = 0; d->css_reuse_bytes = 0;
     free_pending(d);
     d->next_sheet_order = 0;
     d->css_depth = 0;
@@ -661,6 +688,7 @@ void doc_rescan(web_doc *d) {
         /* Incomplete authored sheet snapshots must never outlive their arena. */
         css_styling_free(&d->sty);
         ar_free(&d->cssmem);
+        d->css_reuse = NULL; d->css_reuse_count = 0; d->css_reuse_bytes = 0;
         free_pending(d);
     }
     d->mem.trap = old_mem;
@@ -737,6 +765,7 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
 }
 
 static void free_values(node_t *n) {
+    css_animation_free(n);
     web_canvas_free(n);
     web_input_files_release(n);
     if (n->shadow_root) free_values(n->shadow_root);
@@ -765,6 +794,7 @@ void web_free(web_doc *d) {
     d->parser = NULL;
     if (d->owned_nodes) {
         for (node_t *n = d->owned_nodes; n; n = n->owned_next) {
+            css_animation_free(n);
             web_canvas_free(n);
             web_input_files_release(n);
             free(n->value);

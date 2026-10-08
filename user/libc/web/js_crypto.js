@@ -1,5 +1,5 @@
 /* Embedded inside js_bootstrap.js after DOMException and the URL bindings. */
-(function installCrypto(host) {
+const cryptoSecureContext = (function installCrypto(host) {
   'use strict';
   const apply = Reflect.apply, define = Object.defineProperty;
   const U8 = Uint8Array, AB = ArrayBuffer, P = Promise, TypeErr = TypeError;
@@ -160,4 +160,5 @@
   define(globalThis, 'Crypto', { value: Crypto, writable: true, configurable: true });
   define(globalThis, 'crypto', { get: () => crypto, enumerable: true, configurable: true });
   define(globalThis, 'isSecureContext', { get: () => secure, enumerable: true, configurable: true });
+  return secure; // Private bootstrap value, not the page-writable global property.
 })(host);

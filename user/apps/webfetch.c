@@ -102,7 +102,7 @@ static bool http_url(const char *raw, char *canonical, size_t cap, char *origin,
     if (n < 0 || (size_t)n >= sizeof normalized_origin) return false;
     const char *path = authority + al;
     size_t pl = strcspn(path, "#");
-    if (pl >= 1024 || (pl && *path != '/' && *path != '?')) return false;
+    if (pl >= HTTP_URL_PATH_MAX || (pl && *path != '/' && *path != '?')) return false;
     size_t ol = strlen(normalized_origin);
     size_t extra = !pl || *path == '?' ? 1 : 0;
     if (ol + extra + pl >= cap || ol >= origin_cap) return false;

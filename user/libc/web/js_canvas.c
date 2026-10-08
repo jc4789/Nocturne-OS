@@ -426,11 +426,11 @@ static void text_free(node_t *n,struct canvas_text *t) {
     if (d && d->canvas_bytes>=t->bytes) d->canvas_bytes-=t->bytes;
     t->pixels=NULL; t->bytes=0;
 }
-static int text_raster(JSContext *ctx,node_t *n,const char *text,size_t length,double px,unsigned style,struct canvas_text *t) {
-    if (length>16384 || !isfinite(px) || px<0 || px>512 || style>3) {
+static int text_raster(JSContext *ctx,node_t *n,const char *text,size_t length,double px,unsigned style,unsigned family,struct canvas_text *t) {
+    if (length>16384 || !isfinite(px) || px<0 || px>512 || style>3 || family>FONT_FAMILY_MONO) {
         JS_ThrowRangeError(ctx,"Canvas text limit"); return -1;
     }
-    wfont f={.ttf=font_ui(style),.px=(float)px,.bold=(style&FONT_BOLD)!=0};
+    wfont f={.ttf=font_family(family,style),.px=(float)px,.bold=(style&FONT_BOLD)!=0};
     float ascent,descent;
     t->width=wf_width(&f,text,length); wf_metrics(&f,&ascent,&descent);
     t->ascent=ascent; t->descent=descent;
@@ -503,15 +503,16 @@ static void text_draw(struct web_canvas *c,const struct canvas_text *t,const dou
     }
 }
 static JSValue text_native(JSContext *ctx,node_t *n,struct web_canvas *c,const char *op,int argc,JSValueConst *argv) {
-    if (argc<6) return JS_ThrowTypeError(ctx,"Invalid Canvas text packet");
+    if (argc<7) return JS_ThrowTypeError(ctx,"Invalid Canvas text packet");
     size_t length; const char *text=JS_ToCStringLen(ctx,&length,argv[1]);
     if (!text) return JS_EXCEPTION;
-    double size,align; unsigned style,baseline; JSValue out=JS_UNDEFINED;
+    double size,align; unsigned style,baseline,family; JSValue out=JS_UNDEFINED;
     if (JS_ToFloat64(ctx,&size,argv[2])<0 || JS_ToUint32(ctx,&style,argv[3])<0 ||
-        JS_ToFloat64(ctx,&align,argv[4])<0 || JS_ToUint32(ctx,&baseline,argv[5])<0) { out=JS_EXCEPTION; goto done; }
+        JS_ToFloat64(ctx,&align,argv[4])<0 || JS_ToUint32(ctx,&baseline,argv[5])<0 ||
+        JS_ToUint32(ctx,&family,argv[6])<0) { out=JS_EXCEPTION; goto done; }
     if (!isfinite(align) || align<0 || align>1 || baseline>5) { out=JS_ThrowTypeError(ctx,"Invalid Canvas text state"); goto done; }
     struct canvas_text t={0};
-    if (text_raster(ctx,n,text,length,size,style,&t)<0) { out=JS_EXCEPTION; goto done; }
+    if (text_raster(ctx,n,text,length,size,style,family,&t)<0) { out=JS_EXCEPTION; goto done; }
     if (!strcmp(op,"measureText")) {
         double shift=baseline_offset(&t,baseline);
         double metrics[7]={t.width,t.left+align*t.width,t.right-align*t.width,t.top-shift,t.bottom+shift,t.ascent-shift,t.descent+shift};
@@ -520,10 +521,10 @@ static JSValue text_native(JSContext *ctx,node_t *n,struct web_canvas *c,const c
         if (!JS_IsException(out)) for (unsigned i=0;i<7;i++)
             if (JS_SetPropertyUint32(ctx,out,i,JS_NewFloat64(ctx,metrics[i]))<0) { JS_FreeValue(ctx,out); out=JS_EXCEPTION; break; }
     } else {
-        size_t bytes=0; uint8_t *data=argc>6?JS_GetArrayBuffer(ctx,&bytes,argv[6]):NULL;
+        size_t bytes=0; uint8_t *data=argc>7?JS_GetArrayBuffer(ctx,&bytes,argv[7]):NULL;
         uint32_t color;
-        if (!data || bytes!=9*sizeof(double) || argc<8) out=JS_ThrowTypeError(ctx,"Invalid Canvas text transform");
-        else if (JS_ToUint32(ctx,&color,argv[7])<0) out=JS_EXCEPTION;
+        if (!data || bytes!=9*sizeof(double) || argc<9) out=JS_ThrowTypeError(ctx,"Invalid Canvas text transform");
+        else if (JS_ToUint32(ctx,&color,argv[8])<0) out=JS_EXCEPTION;
         else {
             double values[9]; memcpy(values,data,sizeof values);
             bool valid=true; for (unsigned i=0;i<9;i++) if (i!=2 && !isfinite(values[i])) valid=false;
@@ -563,7 +564,8 @@ static JSValue canvas_font(JSContext *ctx,node_t *n,JSValueConst value) {
                     if (!JS_IsException(out)) {
                         unsigned style=(st.font_weight>=600?FONT_BOLD:0)|(st.font_style?FONT_ITALIC:0);
                         if (JS_SetPropertyUint32(ctx,out,0,JS_NewFloat64(ctx,st.font_size))<0 ||
-                            JS_SetPropertyUint32(ctx,out,1,JS_NewUint32(ctx,style))<0) { JS_FreeValue(ctx,out); out=JS_EXCEPTION; }
+                            JS_SetPropertyUint32(ctx,out,1,JS_NewUint32(ctx,style))<0 ||
+                            JS_SetPropertyUint32(ctx,out,2,JS_NewUint32(ctx,st.font_family))<0) { JS_FreeValue(ctx,out); out=JS_EXCEPTION; }
                     }
                 }
             }

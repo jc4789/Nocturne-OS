@@ -1,0 +1,34 @@
+{
+  "distribution": "Plangothic-Super-V2.9.5795",
+  "unmodified": true,
+  "files": [
+    {
+      "file": "PlangothicP1-Regular.ttf",
+      "source": "D:\\Fonts\\Plangothic-Super-V2.9.5795\\static\\PlangothicP1-Regular.ttf",
+      "size": 20410664,
+      "sha256": "550b5d0775b15405946b18f4843df439a51e69508d7e6778d94c1f7a53dc5ad6",
+      "copyright": [
+        "Copyright (c) 2024 by Fitzgerald P. Köeingsegg. All rights reserved."
+      ],
+      "license": [
+        "This Font Software is licensed under the SIL Open Font License, Version 1.1. This Font Software is distributed on an \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the SIL Open Font License for the specific language, permissions and limitations governing your use of this Font Software."
+      ],
+      "unicode_cmap_count": 65440
+    },
+    {
+      "file": "PlangothicP2-Regular.ttf",
+      "source": "D:\\Fonts\\Plangothic-Super-V2.9.5795\\static\\PlangothicP2-Regular.ttf",
+      "size": 12459248,
+      "sha256": "681933370adfe0fc7253f77735275a82fea09fe4f8adba907bdeb46c110daf8f",
+      "copyright": [
+        "Copyright (c) 2024 by Fitzgerald P. Köeingsegg. All rights reserved."
+      ],
+      "license": [
+        "This Font Software is licensed under the SIL Open Font License, Version 1.1. This Font Software is distributed on an \"AS IS\" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the SIL Open Font License for the specific language, permissions and limitations governing your use of this Font Software."
+      ],
+      "unicode_cmap_count": 42152
+    }
+  ],
+  "license_file": "Plangothic-LICENSE.txt",
+  "official_license_reference": "https://github.com/Fitzgerald-Porthmouth-Koenigsegg/Plangothic_Project/blob/main/LICENSE-OFL.txt"
+}

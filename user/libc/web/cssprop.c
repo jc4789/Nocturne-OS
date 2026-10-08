@@ -893,7 +893,7 @@ static struct propdef props[] = {
     {"flex-wrap", PT_KW, 0, false, O(flex_wrap), kw_fwrap, 0},
     {"float", PT_KW, 0, false, O(float_), kw_float, 0},
     SH("font", SH_FONT),
-    {"font-family", PT_FONT_FAMILY, 0, true, O(monospace), NULL, 0},
+    {"font-family", PT_FONT_FAMILY, 0, true, O(font_family), NULL, 0},
     {"font-size", PT_FONT_SIZE, 0, true, O(font_size), NULL, 0},
     {"font-style", PT_KW, 0, true, O(font_style), kw_fstyle, 0},
     {"font-weight", PT_FONT_WEIGHT, 0, true, O(font_weight), NULL, 0},
@@ -1018,6 +1018,7 @@ static void init_initial(void) {
     }
     s->font_size = 16;
     s->font_weight = 400;
+    s->font_family = FONT_FAMILY_SERIF;
     s->line_height.kind = LK_NORMAL;
     s->width.kind = s->height.kind = LK_AUTO;
     s->min_width.kind = s->min_height.kind = LK_AUTO;
@@ -1179,7 +1180,7 @@ static bool parse_font_weight(const char *s, size_t n, struct cx *cx, uint16_t *
     return true;
 }
 
-static bool mono_family(const char *s, size_t n, bool *out, struct cx *cx) {
+static bool choose_family(const char *s, size_t n, uint8_t *out, struct cx *cx) {
     const char *t[16];
     size_t tl[16];
     int k = split_checked(s, n, t, tl, 16, ',', cx);
@@ -1204,11 +1205,15 @@ static bool mono_family(const char *s, size_t n, bool *out, struct cx *cx) {
                                        "source code pro", "dejavu sans mono", "liberation mono", "roboto mono",
                                        "jetbrains mono", "lucida console", "andale mono", "ubuntu mono",
                                        "cascadia code", "cascadia mono", "ibm plex mono", "noto sans mono",
-                                       "inconsolata", "hack", "go mono", "lucida sans typewriter", NULL};
-    static const char *const prop[] = {"sans-serif", "serif", "system-ui", "-apple-system", "blinkmacsystemfont",
-                                       "ui-sans-serif", "ui-serif", "arial", "helvetica", "helvetica neue",
-                                       "inter", "roboto", "segoe ui", "verdana", "georgia", "times",
-                                       "times new roman", "tahoma", "cursive", "fantasy", "noto sans", "open sans",
+                                       "inconsolata", "hack", "go mono", "lucida sans typewriter",
+                                       "maple mono", "maple mono nf", "maple mono nf cn", NULL};
+    /* Named families in these lists use the bundled class substitute; this is
+       not a claim that Arial/Times or downloaded webfonts are installed. */
+    static const char *const serif[] = {"serif", "ui-serif", "georgia", "times", "times new roman", "noto serif", NULL};
+    static const char *const sans[] = {"sans-serif", "system-ui", "-apple-system", "blinkmacsystemfont",
+                                       "ui-sans-serif", "arial", "helvetica", "helvetica neue",
+                                       "inter", "roboto", "segoe ui", "verdana",
+                                       "tahoma", "cursive", "fantasy", "noto sans", "open sans",
                                        "ubuntu", "cantarell", "lato", NULL};
     for (int i = 0; i < k; i++) {
         const char *f = t[i];
@@ -1216,16 +1221,21 @@ static bool mono_family(const char *s, size_t n, bool *out, struct cx *cx) {
         if (fl >= 2 && (f[0] == '"' || f[0] == '\'')) f++, fl -= 2;
         for (int j = 0; mono[j]; j++)
             if (ident_is(f, fl, mono[j])) {
-                *out = true;
+                *out = FONT_FAMILY_MONO;
                 return true;
             }
-        for (int j = 0; prop[j]; j++)
-            if (ident_is(f, fl, prop[j])) {
-                *out = false;
+        for (int j = 0; serif[j]; j++)
+            if (ident_is(f, fl, serif[j])) {
+                *out = FONT_FAMILY_SERIF;
+                return true;
+            }
+        for (int j = 0; sans[j]; j++)
+            if (ident_is(f, fl, sans[j])) {
+                *out = FONT_FAMILY_SANS;
                 return true;
             }
     }
-    *out = false;
+    *out = FONT_FAMILY_SERIF;
     return k > 0;
 }
 
@@ -1884,7 +1894,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     }
     case PT_FONT_SIZE: return parse_font_size(v, n, cx, &s->font_size);
     case PT_FONT_WEIGHT: return parse_font_weight(v, n, cx, &s->font_weight);
-    case PT_FONT_FAMILY: return mono_family(v, n, &s->monospace, cx);
+    case PT_FONT_FAMILY: return choose_family(v, n, &s->font_family, cx);
     case PT_LINE_HEIGHT: {
         len_t l;
         if (ident_is(v, n, "normal")) {

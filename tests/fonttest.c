@@ -39,7 +39,7 @@ int main(void) {
         check(f == font_ui(style), "default face is cached");
         check(font_has(f,0x65e5) && font_has(f,0x8a9e) && font_has(f,0x4e2d) &&
               font_has(f,0x3042) && font_has(f,0x30ab), "shared Japanese/Chinese fallback");
-        check(!font_has(f,0xd55c), "absent Hangul is not reported as supported");
+        check(font_has(f,0xd55c) && !font_has(cn,0xd55c), "Hangul uses actual extra fallback, not CN");
         check(!font_has(f,0x10ffff), "unassigned glyph is absent");
         check(fabsf(font_advance(f,20,'i')-font_advance(f,20,'W')) < .001f, "Maple monospaced Latin");
         check(fabsf(font_advance(f,20,0x65e5)-2*font_advance(f,20,'A')) < .001f, "CJK is two Latin columns");
@@ -59,6 +59,37 @@ int main(void) {
     check(gfx_text_width("ABC日本",FONT_SMALL) == 56, "chrome width uses two CJK cells");
     check(gfx_text_width("ABC日本",FONT_LARGE) == 112, "large chrome width doubles");
     check(gfx_text(&canvas,0,0,"ABC日本",RGB(255,255,255),0,FONT_SMALL) == 56, "chrome draw agrees with width");
+    font_t *symbols = font_open("/usr/share/fonts/PlangothicP2-Regular.ttf");
+    check(symbols && font_has(symbols,0x1f0a1), "bundled Plangothic has actual supplementary outline");
+    check(!font_has(raw,0x1f0a1), "single Maple face still has no added fallback");
+    font_t *cjk[2] = {font_open("/usr/share/fonts/NotoSansCJKjp-Regular.otf"),
+                     font_open("/usr/share/fonts/NotoSerifCJKjp-Regular.otf")};
+    check(cjk[0] && cjk[1], "both actual CFF CJK faces open");
+    uint32_t family_hash[3] = {0};
+    for (int family = 0; family < 3; family++) {
+        uint32_t outline[4] = {0};
+        for (int style = 0; style < 4; style++) {
+            font_t *f = font_family(family,style);
+            check(f != NULL, "bundled generic family/style opens");
+            if (!f) continue;
+            check(f == font_family(family,style), "family/style is cached");
+            float delta = fabsf(font_advance(f,20,'i')-font_advance(f,20,'W'));
+            check(family == FONT_FAMILY_MONO ? delta < .001f : delta > 1, "generic family uses real width class");
+            check(font_has(f,0x4e2d) && font_has(f,0x1e6c) && font_has(f,0x1f0a1) &&
+                  font_has(f,0x0db0) && font_has(f,0x10300) && font_has(f,0x20bb7), "living/historical/CJK glyphs resolve");
+            check(!font_has(f,0x10ffff), "unassigned glyph is not invented");
+            outline[style] = raster(f,"Noto Maple Wi",24);
+            if (symbols) check(raster(f,"\xf0\x9f\x82\xa1",24) == raster(symbols,"\xf0\x9f\x82\xa1",24), "fallback is actual Plangothic raster");
+        }
+        family_hash[family] = outline[0];
+        if (family < 2 && cjk[family])
+            check(raster(font_family(family,0),"日本語",24) == raster(cjk[family],"日本語",24), "CJK generic uses its actual Sans/Serif CFF face");
+        if (family == FONT_FAMILY_SERIF)
+            check(outline[0] == outline[1] && outline[0] == outline[2] && outline[0] == outline[3], "merged Serif provides only real Regular");
+        else check(outline[0] != outline[1] && outline[0] != outline[2] && outline[2] != outline[3], "Sans/Mono styles have real outlines");
+    }
+    check(family_hash[0] != family_hash[1] && family_hash[0] != family_hash[2] && family_hash[1] != family_hash[2], "generic families have distinct rasters");
+    check(font_family(FONT_FAMILY_MONO,FONT_REGULAR) == font_ui(FONT_REGULAR), "mono preserves UI face identity");
     uint32_t before[640 * 4];
     memset(pixels,0x5a,sizeof pixels); memcpy(before,pixels,sizeof before);
     gfx_clip(&canvas,10,10,70,40);

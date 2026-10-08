@@ -135,6 +135,8 @@ typedef struct node {
     int elem_index; /* 1-based position among element siblings */
     /* cascade and layout */
     struct style *style;
+    struct style *animation_base_style; /* cascade without this node's effects */
+    struct css_animation *animations; /* bounded malloc storage, not DOM attributes */
     struct box *box;          /* the element's first box */
     struct box *anchor_block; /* inline elements: the block holding its first line */
     float anchor_dy;
@@ -167,6 +169,7 @@ typedef struct node {
     bool image_initialized, image_invalidated, image_has_source;
     struct node *owned_next; /* document-owned allocation list, including detached nodes */
     bool control_ready, script_started;
+    bool style_disabled; /* stylesheet state, not the HTML disabled attribute */
     uint64_t resource_revision;
     const char *option_label;
     uint64_t option_label_revision;
@@ -264,7 +267,7 @@ typedef struct style {
         border_collapse, flex_direction, flex_wrap, justify_content, align_items, align_self, table_layout;
     uint8_t border_style[4];
     uint16_t font_weight;
-    bool monospace;
+    uint8_t font_family; /* FONT_FAMILY_*; inherited as one byte */
     float font_size;
     len_t line_height;
     float vertical_align_px;
@@ -324,9 +327,12 @@ struct css_import {
 };
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports);
 void css_sheet_scope(sheet_t *sheet, node_t *shadow_root);
+sheet_t *css_sheet_instance(arena_t *a, const sheet_t *source, double order, node_t *scope);
 const char *css_ua_sheet(void);
 /* compute every element's style for the viewport */
 void css_cascade(web_doc *d, int vw, int vh);
+int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text);
+void css_animation_free(node_t *n);
 /* Shared @media / matchMedia evaluator; optional serialization cap >= 9*n+16. */
 bool css_media_evaluate(const char *query, int vw, int vh, bool scripting, char *out, size_t cap);
 void css_styling_free(struct styling *st);
@@ -443,7 +449,7 @@ void layout_doc(web_doc *d, int width, int height);
 float box_abs_x(const box_t *b);
 float box_abs_y(const box_t *b);
 
-/* fonts as the engine uses them: Inter, or Spleen bitmaps for monospace */
+/* Inter / Noto Serif / Maple Mono, with family-aware missing-glyph fallback. */
 typedef struct wfont {
     font_t *ttf; /* NULL: monospace bitmap */
     float px;
@@ -498,6 +504,9 @@ struct web_doc {
     struct web_js_state *js;
     bool live, dirty, resources_dirty;
     pvec css_cache;
+    struct css_sheet_reuse *css_reuse; /* current CSS arena only, no DOM ownership */
+    size_t css_reuse_bytes;
+    unsigned css_reuse_count;
     int css_depth;
     size_t css_bytes;
     bool scan_title_seen;

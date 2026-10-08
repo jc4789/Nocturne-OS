@@ -25,6 +25,9 @@ static int scroll_y, doc_h;
 static char cur_url[2048], status[256], hover[512];
 static bool quit, loading;
 static bool debug_js;
+/* Browser pages need more time than small custom web_live hosts. The native
+   command line can select a finite limit, never an unlimited watchdog. */
+static uint32_t js_task_budget_ms = 15000u;
 static webnet *network;
 static webstorage *storage; /* browser-window lifetime, not document lifetime */
 static uint64_t generation = 1, next_generation = 1, navigation_generation, navigation_id;
@@ -993,6 +996,7 @@ static void finish_navigation(void) {
     const char *final_url = f.url[0] ? f.url : navigation_url;
     struct web_host document_host = browser_host;
     document_host.navigation_timing = navigation_timing;
+    document_host.js_task_budget_ms = js_task_budget_ms;
     web_doc *nd = web_live(html, hlen, final_url, charset, &document_host);
     free(html);
     if (!nd) { web_response_free(&f); loading = false; set_status("Out of memory creating document"); return; }
@@ -1837,13 +1841,27 @@ static void document_step(uint64_t now) {
 }
 
 int main(int argc, char **argv) {
-    if (argc > 1 && !strcmp(argv[1], "--debug-js")) { debug_js = true; argc--; argv++; }
-    if(argc>2&&!strcmp(argv[1],"--console-file")){
-        FILE *file=fopen(argv[2],"rb");size_t length=file?fread(console_startup,1,sizeof console_startup,file):0;
-        if(file)fclose(file);
-        if(!file||!length||length>=sizeof console_startup){console_startup[0]=0;console_add("error","Console source file is missing, empty or exceeds 16 KiB.");}
-        else {console_startup[length]=0;console_due=uptime_ms()+3000;}
-        argc-=2;argv+=2;
+    while (argc > 1 && argv[1][0] == '-' && argv[1][1] == '-') {
+        if (!strcmp(argv[1], "--debug-js")) { debug_js = true; argc--; argv++; }
+        else if (!strcmp(argv[1], "--js-budget-ms")) {
+            const char *value = argc > 2 ? argv[2] : "";
+            if (!*value || strlen(value) > 5 || strspn(value,"0123456789") != strlen(value)) {
+                fprintf(stderr,"browser: --js-budget-ms requires 1000..30000 milliseconds\n");return 2;
+            }
+            unsigned long budget = strtoul(value,NULL,10);
+            if (budget < WEB_JS_TASK_MIN_MS || budget > WEB_JS_TASK_MAX_MS) {
+                fprintf(stderr,"browser: --js-budget-ms requires 1000..30000 milliseconds\n");return 2;
+            }
+            js_task_budget_ms=(uint32_t)budget;argc-=2;argv+=2;
+        } else if (!strcmp(argv[1], "--console-file") && argc > 2) {
+            FILE *file=fopen(argv[2],"rb");size_t length=file?fread(console_startup,1,sizeof console_startup,file):0;
+            if(file)fclose(file);
+            if(!file||!length||length>=sizeof console_startup){console_startup[0]=0;console_add("error","Console source file is missing, empty or exceeds 16 KiB.");}
+            else {console_startup[length]=0;console_due=uptime_ms()+3000;}
+            argc-=2;argv+=2;
+        } else {
+            fprintf(stderr,"browser: unknown or incomplete option: %s\n",argv[1]);return 2;
+        }
     }
     int sw = 1024, sh = 768;
     screen_size(&sw, &sh);

@@ -5,12 +5,24 @@ cd "$(dirname "$0")/.."
 B=build
 LIMINE=tools/limine
 IMG=$B/nocturne.img
-SIZE_MB=128
+# Leave room for FAT metadata and optional diskfiles as the RAM-root grows.
+# The old fixed 128 MiB image cannot hold the bundled multilingual fonts.
+SIZE_MB=$(python - <<'EOF'
+from pathlib import Path
+payload = [Path(p) for p in (
+    "build/kernel.elf", "build/initrd.tar", "boot/limine.conf",
+    "tools/limine/limine-bios.sys", "tools/limine/BOOTX64.EFI")]
+payload += [p for p in Path("diskfiles").rglob("*") if p.is_file()]
+mib = 1024 * 1024
+needed = sum(p.stat().st_size for p in payload) + 32 * mib
+print(max(128, ((needed + 64 * mib - 1) // (64 * mib)) * 64))
+EOF
+)
 PART_START=2048
 TOTAL=$((SIZE_MB * 2048))
 PART_SECTORS=$((TOTAL - PART_START))
 
-echo "  IMG  $IMG"
+echo "  IMG  $IMG ($SIZE_MB MiB)"
 rm -f $IMG
 python - "$IMG" $TOTAL $PART_START $PART_SECTORS <<'EOF'
 import sys, struct

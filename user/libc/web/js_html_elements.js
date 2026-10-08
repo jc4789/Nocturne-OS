@@ -1,6 +1,6 @@
 /* Metadata interfaces backed by native DOM nodes, not instanceof overrides.
  * Include after js_hyperlink.js and js_tokens.js. Prototype order is shared
- * with NP_META..NP_HEAD in js.c. CSSStyleSheet/CSSOM are not implemented here.
+ * with NP_META..NP_HEAD in js.c. Native sheet metadata is in js_stylesheets.js.
  * https://html.spec.whatwg.org/multipage/semantics.html */
 const htmlElementsBridge = (() => {
     'use strict';
@@ -227,8 +227,7 @@ const htmlElementsBridge = (() => {
     for(const [C,tag] of [[HTMLAnchorElement,'a'],[HTMLAreaElement,'area']])tokenAttribute(C,tag,'relList','rel',[]);
     reflect(HTMLStyleElement,'style','media');reflect(HTMLStyleElement,'style','type');
     tokenAttribute(HTMLStyleElement,'style','blocking','blocking',[]);
-    // disabled needs native stylesheet state, not a fabricated CSSStyleSheet or
-    // the generic HTMLElement disabled-attribute getter. No sheet object is added.
+    // Native stylesheet disabled state is installed by js_stylesheets.js.
     reflect(HTMLBaseElement,'base','target');
     define(HTMLBaseElement.prototype,'href',{configurable:true,enumerable:true,get(){
         htmlElementBrand(this,'base');const value=reflectedAttr(this,'href')||'';

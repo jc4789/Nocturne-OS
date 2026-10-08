@@ -43,7 +43,11 @@ struct task {
     uint64_t mmap_next;
     uint64_t cpu_ms;
     uint64_t start_ms;
-    int slice;
+    unsigned sched_level;     /* 0=interactive, 3=CPU-bound; ready/wait policy is BSP-owned */
+    uint32_t sched_used_us;   /* cumulative allotment: yield/short sleep does not refund it */
+    uint32_t slice_us;        /* remaining quantum, preserved across early yield/block */
+    uint16_t cpu_subms_us;
+    uint64_t sched_epoch;     /* lazy boost for blocked and AP-owned tasks */
 };
 
 struct task **sched_current_slot(void);

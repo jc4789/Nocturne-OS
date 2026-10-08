@@ -273,6 +273,40 @@
         hasChildNodes() { return this.firstChild !== null; }
         getRootNode(options={}) { return rawDom('root',this,!!shadowBridge.dictionary(options).composed); }
     }
+    function replaceChildNode(receiver,nodes) {
+        const kind=rawDom('get',receiver,'nodeType');
+        if(kind!==1 && kind!==3 && kind!==7 && kind!==8 && kind!==10)throw new TypeError('ChildNode receiver required');
+        // Convert the union before reading the parent: author string conversion
+        // can move the receiver. Native branding does not depend on prototypes.
+        const values=[];
+        for(let i=0;i<nodes.length;i++)values[i]=rawDom('isNode',null,nodes[i])?nodes[i]:elementURL.string(nodes[i]);
+        const parent=rawDom('get',receiver,'parentNode');
+        if(!parent)return;
+        if(values.length===1 && values[0]===receiver)return;
+        // Native insert/remove cannot atomically replace Document's sole root.
+        // Refuse before moving anything rather than delete the old root first.
+        if(rawDom('get',parent,'nodeType')===9)throw new DOMException('Atomic Document replacement is not implemented','NotSupportedError');
+        let next=rawDom('get',receiver,'nextSibling');
+        while(next){let used=false;for(let i=0;i<values.length;i++)if(values[i]===next){used=true;break;}
+            if(!used)break;next=rawDom('get',next,'nextSibling');}
+        const replace=()=>{
+            const owner=rawDom('get',receiver,'ownerDocument');
+            const make=value=>typeof value==='string'?rawDom('create',owner,3,'#text',value):value;
+            let replacement;
+            if(values.length===1)replacement=make(values[0]);
+            else {
+                replacement=rawDom('create',owner,11,'#document-fragment','');
+                for(let i=0;i<values.length;i++)rawDom('insert',replacement,make(values[i]),null);
+            }
+            if(rawDom('get',receiver,'parentNode')===parent){
+                rawDom('insert',parent,replacement,receiver);
+                rawDom('remove',receiver);
+            }else rawDom('insert',parent,replacement,next);
+        };
+        // rawDom still invokes native CE/MO hooks. One outer reaction scope
+        // prevents author CE callbacks observing a half-finished replacement.
+        if(customElementsReady)customElementsBridge.reactions(replace);else replace();
+    }
     class Element extends Node {
         get children() { return collectionBridge.children(this,true); }
         get firstElementChild() { return this.children[0] || null; }
@@ -286,6 +320,7 @@
         replaceChildren(...nodes) { this.textContent=''; this.append(...nodes); }
         before(...nodes) { if(this.parentNode) for(const n of nodes) this.parentNode.insertBefore(n instanceof Node?n:this.ownerDocument.createTextNode(String(n)),this); }
         after(...nodes) { if(this.parentNode) { const next=this.nextSibling; for(const n of nodes) this.parentNode.insertBefore(n instanceof Node?n:this.ownerDocument.createTextNode(String(n)),next); } }
+        replaceWith(...nodes) { replaceChildNode(this,nodes); }
         get tagName() { return this.nodeType === 1 ? this.nodeName : undefined; }
         get localName() { return dom('get',this,'localName'); }
         get namespaceURI() { return dom('get',this,'namespaceURI'); }
@@ -603,7 +638,12 @@
         'append','prepend','replaceChildren','querySelector','querySelectorAll'];
     copyElementMembers(Document.prototype, parentMembers.concat(['getElementsByTagName','getElementsByClassName']));
     copyElementMembers(DocumentFragment.prototype, parentMembers);
-    copyElementMembers(CharacterData.prototype, ['nextElementSibling','previousElementSibling','remove','before','after']);
+    copyElementMembers(CharacterData.prototype, ['nextElementSibling','previousElementSibling','remove','before','after','replaceWith']);
+    copyElementMembers(DocumentType.prototype, ['replaceWith']);
+    for(const proto of [Element.prototype,CharacterData.prototype,DocumentType.prototype]){
+        const unscopables=Object.create(null);unscopables.replaceWith=true;
+        Object.defineProperty(proto,Symbol.unscopables,{configurable:true,value:unscopables});
+    }
     const document=host.document;
     Object.setPrototypeOf(document,HTMLDocument.prototype);
     Object.defineProperties(document, {
@@ -651,6 +691,7 @@
     const CSS={escape(s){return Array.from(String(s)).map((c,i)=>/[a-zA-Z_\-]/.test(c)||(/[0-9]/.test(c)&&i>0)?c:'\\'+c.codePointAt(0).toString(16)+' ').join('');}};
     const exceptionString=String;
     class DOMException extends Error {constructor(message='',name='Error'){super(message);this.name=exceptionString(name);}}
+    /* @include js_pointer_events.js */
     /* @include js_tokens.js */
     const DOMTokenList=tokenListBridge.DOMTokenList;
     /* @include js_fetch.js */
@@ -670,7 +711,7 @@
         HTMLInputElement,HTMLButtonElement,HTMLSelectElement,HTMLTextAreaElement,HTMLFieldSetElement,HTMLObjectElement,HTMLOutputElement,HTMLOptionElement,
         HTMLScriptElement,HTMLFormElement,HTMLAnchorElement,HTMLAreaElement,
         Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,Comment,ProcessingInstruction,DocumentFragment,
-        Event,CustomEvent,UIEvent,MouseEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,AbortController,AbortSignal,
+        Event,CustomEvent,UIEvent,MouseEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,AbortController,AbortSignal,
         fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,
         performance:{now:()=>host.now()},getComputedStyle:n=>new Proxy({getPropertyValue:k=>dom('computed',n,String(k))},{get(t,k){return k in t?t[k]:t.getPropertyValue(cssName(k));}})});
     Object.defineProperty(globalThis,'location',{configurable:true,get(){return location;},set(v){host.navigate(String(v));}});
@@ -713,6 +754,9 @@
     /* @include js_intl.js */
     /* @include js_collator.js */
     /* @include js_crypto.js */
+    /* @include js_formdata.js */
+    fetchBridge.initializeFormData(formDataBridge);
+    /* @include js_credentials.js */
     /* @include js_object_url.js */
     fetchBridge.initializeObjectURLs(objectURLBridge);
     /* @include js_clone.js */
@@ -731,6 +775,8 @@
     /* @include js_svg.js */
     /* @include js_attributes.js */
     /* @include js_shadow.js */
+    /* @include js_stylesheets.js */
+    /* @include js_animations.js */
     /* @include js_web_legacy.js */
     /* @include js_form_controls.js */
     /* @include js_form_validation.js */
@@ -754,13 +800,18 @@
         const tasks = [];
         function contains(a,n) { for (let i=0;i<a.length;i++) if(a[i]===n) return true; return false; }
         function queue(type, ancestry, index, related, boundary) {
-            const e = new MouseEvent(type, mouseAssign({},init,{
+            const values=mouseAssign({},init,{
                 relatedTarget:related,bubbles:!boundary,cancelable:!boundary,composed:!boundary
-            }));
-            e.isTrusted = true;
+            });
             const own=ancestry===previous?previousSnapshot:currentSnapshot,other=ancestry===previous?currentSnapshot:previousSnapshot;
             const part={nodes:apply(eventSlice,ancestry,[index]),info:own.info};
-            tasks[tasks.length] = {event:e,target:part.nodes[0],plan:shadowBridge.path(part.nodes[0],e,part,other)};
+            const pointer=new PointerEvent(type.replace('mouse','pointer'),mousePointerInit(mouseAssign({},values,{button:-1})));
+            pointer.isTrusted=true;
+            tasks[tasks.length]={event:pointer,target:part.nodes[0],plan:shadowBridge.path(part.nodes[0],pointer,part,other)};
+            if(type!=='mousemove'||!suppressCompatibilityMouse){
+                const e=new MouseEvent(type,values);e.isTrusted=true;
+                tasks[tasks.length]={event:e,target:part.nodes[0],plan:shadowBridge.path(part.nodes[0],e,part,other)};
+            }
         }
         if (from !== to && from) queue('mouseout',previous,0,to,false);
         for (let i=0;i<previous.length;i++) {
@@ -791,6 +842,11 @@
         registerImportMap:importMapsBridge.register,
         resolveModule:importMapsBridge.resolve,
         moduleURL:importMapsBridge.url,
+        blobScript(url){
+            const blob=objectURLBridge.blob(url);
+            if(!blob)throw new TypeError('Blob script URL is revoked or unavailable in this document');
+            return [blobBridge.bytes(blob),blobBridge.type(blob)];
+        },
         observerFrame(){observerBridge.frame();},
         eventHandlerAttribute:handlerAttribute,
         imageError(){return new DOMException('The image request changed or could not be decoded','EncodingError');},
@@ -821,7 +877,7 @@
             HTMLInputElement.prototype,HTMLButtonElement.prototype,HTMLSelectElement.prototype,HTMLTextAreaElement.prototype,
             HTMLFieldSetElement.prototype,HTMLObjectElement.prototype,HTMLOutputElement.prototype,HTMLOptionElement.prototype,HTMLTemplateElement.prototype,DocumentType.prototype,
             HTMLScriptElement.prototype,HTMLFormElement.prototype,HTMLAnchorElement.prototype,HTMLAreaElement.prototype,...svgBridge.nodeProtos,ProcessingInstruction.prototype,attributeBridge.nodeProto,...htmlElementsBridge.nodeProtos,shadowBridge.ShadowRoot.prototype,shadowBridge.HTMLSlotElement.prototype,...semanticElementsBridge.nodeProtos,HTMLUnknownElement.prototype,...canvasBridge.nodeProtos,HTMLMediaElement.prototype,HTMLAudioElement.prototype,HTMLVideoElement.prototype,...formControlBridge.nodeProtos,...htmlElementsBridge.extraNodeProtos,...textTrackBridge.nodeProtos],
-        dispatch(target,type,init){const C=type==='submit'?formValidationBridge.SubmitEvent:/^(key)/.test(type)?KeyboardEvent:/^(mouse|click|dblclick)/.test(type)?MouseEvent:Event;const e=new C(type,init);for(const k of Object.keys(init))if(k!=='submitter')e[k]=init[k];e.composed=/^(?:keydown|keyup|keypress|click|dblclick|mousedown|mouseup|mouseout|mousemove|mouseover|wheel|focus|blur|focusin|focusout|input)$/.test(type);e.isTrusted=init.isTrusted!==false;return dispatch(target===null?globalThis:target,e);},
+        dispatch:nativeDispatch,
         response(...args){return fetchBridge.response(...args);},
         reject(message,abort){return abort?new DOMException(message,'AbortError'):new TypeError(message);}
     };

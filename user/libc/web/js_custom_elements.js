@@ -1,8 +1,9 @@
 /* Autonomous custom elements on Nocturne's existing native DOM wrappers.
  * Algorithms: https://html.spec.whatwg.org/multipage/custom-elements.html
- * Native shadow trees participate in upgrade/connection/adoption. Scoped registries, customized built-ins,
- * ElementInternals or form-associated custom elements. Unsupported extensions
- * are rejected, not represented by inert successful registrations.
+ * Native shadow trees participate in upgrade/connection/adoption. Form-associated
+ * definition metadata is retained so a site's own internals polyfill can run;
+ * native ElementInternals and form linkage are NOT advertised. Scoped registries
+ * and customized built-ins remain explicitly unsupported.
  * Embedded in js_bootstrap.js; rawDom/document/HTMLElement/report are private. */
 const customElementsBridge = (() => {
     'use strict';
@@ -246,8 +247,19 @@ const customElementsBridge = (() => {
                     }
                     const disabled = constructor.disabledFeatures;
                     const disabledFeatures=disabled===undefined?[]:sequence(disabled);
-                    if (constructor.formAssociated) throw fail('Form-associated custom elements are not implemented');
-                    d = {name,constructor,callbacks,observed,stack:[],disableShadow:disabledFeatures.includes('shadow')};
+                    const formAssociated = !!constructor.formAssociated;
+                    if (formAssociated) for (const key of ['formAssociatedCallback','formResetCallback','formDisabledCallback','formStateRestoreCallback']) {
+                        const value = prototype[key];
+                        if (value !== undefined && typeof value !== 'function') throw new TypeError(key+' must be callable');
+                        callbacks[key] = value || null;
+                    }
+                    // Definition is not use of ElementInternals. Record the
+                    // declared metadata instead of rejecting the whole bundle
+                    // before its own feature-detected polyfill can be evaluated.
+                    // Native form linkage, values and lifecycle delivery remain
+                    // unavailable; no attachInternals capability is fabricated.
+                    d = {name,constructor,callbacks,observed,stack:[],formAssociated,
+                        disableInternals:disabledFeatures.includes('internals'),disableShadow:disabledFeatures.includes('shadow')};
                 } finally { defining = false; }
                 definitions.set(name,d); constructors.set(constructor,d);
                 for (const element of elements(document,name)) tryUpgrade(element);

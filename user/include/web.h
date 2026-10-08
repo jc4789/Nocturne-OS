@@ -73,6 +73,11 @@ struct web_navigation_timing {
     bool valid, fetch_valid, response_end_valid;
     uint64_t navigation_start_ms, fetch_start_ms, response_end_ms;
 };
+/* Only the native embedder chooses this limit; page code cannot change it.
+   Zero preserves the conservative default for custom hosts. */
+#define WEB_JS_TASK_DEFAULT_MS 5000u
+#define WEB_JS_TASK_MIN_MS 1000u
+#define WEB_JS_TASK_MAX_MS 30000u
 struct web_host {
     void *opaque;
     bool (*request)(void *opaque, const struct web_request *request);
@@ -101,6 +106,9 @@ struct web_host {
     bool media_range;
     /* Zero-initialized custom hosts keep the explicit document-init epoch. */
     struct web_navigation_timing navigation_timing;
+    /* Native embedder-selected outer-task limit; 0 keeps the 5-second default.
+       Page code cannot reset it. Values outside 1000..30000 use the default. */
+    uint32_t js_task_budget_ms;
 };
 bool web_set_url(web_doc *d, const char *url);
 /* Call between JS tasks, after the host history position and document URL change. */

@@ -12,6 +12,30 @@
     const hostnameGet = Object.getOwnPropertyDescriptor(URLImpl.prototype, 'hostname').get;
     const documentBrand = documentBridge.brand;
     const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    // The sole native browsing-context global is an actual Window/EventTarget,
+    // not a duck-typed stand-in. Preserve its own native properties and event
+    // wrappers, while making the inherited interface available to libraries
+    // which distinguish Window from Document targets (for example loaders).
+    // No WindowProxy, child browsing context, or cross-origin access is added.
+    class Window extends EventTarget {
+        constructor() { throw new TypeErrorImpl('Illegal Window constructor'); }
+    }
+    define(Window.prototype, Symbol.toStringTag, { value: 'Window', configurable: true });
+    Object.setPrototypeOf(global, Window.prototype);
+    define(global, 'Window', { value: Window, configurable: true, writable: true });
+    // Do not leave Window's own captured-method wrappers bypassing later
+    // EventTarget prototype instrumentation. Preserve bare global calls and
+    // captured original functions, but let ordinary member lookups inherit.
+    for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
+        const descriptor = Object.getOwnPropertyDescriptor(EventTarget.prototype, name);
+        const method = descriptor.value;
+        const wrapped = { [name](...args) {
+            return call(method, this == null ? global : this, args);
+        }}[name];
+        define(wrapped, 'length', { value: method.length, configurable: true });
+        define(EventTarget.prototype, name, { ...descriptor, value: wrapped });
+        delete global[name];
+    }
     function string(value) {
         if (typeof value === 'symbol') throw new TypeErrorImpl('Cannot convert Symbol to DOMString');
         return StringImpl(value);

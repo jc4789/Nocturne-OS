@@ -6,6 +6,7 @@
     const wsHas = WeakSet.prototype.has, wsAdd = WeakSet.prototype.add;
     const str = String, charCodeAt = String.prototype.charCodeAt, fromCP = String.fromCodePoint;
     const push = Array.prototype.push, join = Array.prototype.join;
+    const nativeDecode = host.decodeUTF8;
     const assign = Object.assign, regexTest = RegExp.prototype.test;
     const utf8Label = /^[\t\n\f\r ]*(?:utf-8|utf8|unicode-1-1-utf-8|unicode11utf8|unicode20utf8|x-unicode20utf8)[\t\n\f\r ]*$/i;
     const getter = (proto, name) => Object.getOwnPropertyDescriptor(proto, name).get;
@@ -95,13 +96,19 @@
         get ignoreBOM() { const s=state(this); if(!s) throw new TypeError('Illegal invocation'); return s.ignoreBOM; }
         decode(input, options = {}) {
             const s = state(this); if (!s) throw new TypeError('Illegal invocation');
-            const a = bytes(input), out = [];
+            const a = bytes(input), out = [], chunks = [];
             const stream = !!dictionary(options).stream;
-            if (!s.streaming) assign(s, {bom:false, needed:0, seen:0, cp:0, lower:0x80, upper:0xbf});
+            const fresh = !s.streaming;
+            if (fresh) assign(s, {bom:false, needed:0, seen:0, cp:0, lower:0x80, upper:0xbf});
             s.streaming = stream;
+            if (fresh && !stream)
+                return nativeDecode(apply(taBuffer,a,[]),apply(taOffset,a,[]),apply(taLength,a,[]),s.fatal,s.ignoreBOM);
             function emit(cp) {
                 if (!s.bom) { s.bom = true; if (!s.ignoreBOM && cp === 0xfeff) return; }
                 apply(push, out, [fromCP(cp)]);
+                // Streaming retains only a small work array, not one JSValue
+                // per scalar across a multi-megabyte XHR/Fetch body.
+                if(out.length===512){apply(push,chunks,[apply(join,out,[''])]);out.length=0;}
             }
             function error() {
                 if (s.fatal) { s.streaming = false; throw new TypeError('Invalid UTF-8'); }
@@ -130,7 +137,8 @@
                 }
             }
             if (!s.streaming && s.needed) { s.needed = s.seen = s.cp = 0; error(); }
-            return apply(join, out, ['']);
+            if(out.length)apply(push,chunks,[apply(join,out,[''])]);
+            return apply(join, chunks, ['']);
         }
     }
     for (const [Type, name] of [[TextEncoder, 'TextEncoder'], [TextDecoder, 'TextDecoder']]) {

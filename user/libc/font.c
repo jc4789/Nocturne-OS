@@ -7,6 +7,8 @@
 #include "font.h"
 #include "stb_truetype.h"
 
+enum { FALLBACK_NONE, FALLBACK_UI, FALLBACK_SANS, FALLBACK_SERIF };
+
 struct font {
     stbtt_fontinfo info;
     unsigned char *data;
@@ -15,7 +17,8 @@ struct font {
     float unit_scale;              /* pixels per font unit at 1 px/em */
     int16_t *adv;                  /* advance width per glyph in font units, INT16_MIN = not looked up */
     uint16_t lo_glyph[0x250];      /* glyph index for code points below 0x250, 0xFFFF = not looked up */
-    bool ui_fallback;             /* only the default family uses the bundled CN fallback */
+    uint8_t fallback;             /* font_open は単一 face、同梱 family だけを拡張する */
+    bool merged_metrics;         /* 統合版の巨大な全字形 hhea を通常本文の行箱に使わない */
 };
 
 static int next_font_id = 1;
@@ -65,11 +68,54 @@ font_t *font_ui(int style) {
         static const char *names[4] = {"MapleMono-NF-Regular.ttf", "MapleMono-NF-Bold.ttf",
                                       "MapleMono-NF-Italic.ttf", "MapleMono-NF-BoldItalic.ttf"};
         cache[style] = open_bundled(names[style]);
-        if (cache[style]) cache[style]->ui_fallback = true;
+        if (cache[style]) cache[style]->fallback = FALLBACK_UI;
         tried[style] = true;
         if (!cache[style] && style) cache[style] = font_ui(FONT_REGULAR); /* a missing style falls back */
     }
     return cache[style];
+}
+
+/* 指定された実験的統合版の Regular 四ファイルだけ。style ごとの再読込や
+   合成 bold/italic はしない。Historical も必要な字形に出会うまで開かない。 */
+static font_t *noto_face(int which) {
+    static font_t *cache[4];
+    static bool tried[4];
+    static const char *names[4] = {
+        "NotoSansLiving-Regular.ttf", "NotoSansHistorical-Regular.ttf",
+        "NotoSerifLiving-Regular.ttf", "NotoSerifHistorical-Regular.ttf"
+    };
+    if (!tried[which]) {
+        tried[which] = true;
+        cache[which] = open_bundled(names[which]);
+        if (cache[which]) {
+            cache[which]->fallback = which < 2 ? FALLBACK_SANS : FALLBACK_SERIF;
+            cache[which]->merged_metrics = true;
+        }
+    }
+    return cache[which];
+}
+
+/* Sans の主書体と、欠落ファイル時の既存 backup。 */
+static font_t *inter_backup(int style) {
+    static font_t *cache[4];
+    static bool tried[4];
+    static const char *names[4] = {"Inter-Regular.ttf", "Inter-Bold.ttf", "Inter-Italic.ttf", "Inter-BoldItalic.ttf"};
+    style &= 3;
+    if (!tried[style]) {
+        tried[style] = true;
+        cache[style] = open_bundled(names[style]);
+        if (cache[style]) cache[style]->fallback = FALLBACK_SANS;
+        else if (style) cache[style] = inter_backup(FONT_REGULAR);
+    }
+    return cache[style];
+}
+
+font_t *font_family(int family, int style) {
+    if (family == FONT_FAMILY_MONO) return font_ui(style);
+    if (family != FONT_FAMILY_SERIF) family = FONT_FAMILY_SANS;
+    font_t *f = family == FONT_FAMILY_SERIF ? noto_face(2) : inter_backup(style);
+    if (!f) f = family == FONT_FAMILY_SERIF ? inter_backup(style) : noto_face(0);
+    return f ? f : font_ui(style);
 }
 
 static int glyph_of(font_t *f, uint32_t cp) {
@@ -80,21 +126,101 @@ static int glyph_of(font_t *f, uint32_t cp) {
     return stbtt_FindGlyphIndex(&f->info, (int)cp);
 }
 
-/* Measurement and rasterization must resolve exactly the same face. Keep the
-   20 MB CN face shared and lazy instead of duplicating it for every style.
-   font_open() remains a single-face API; this is not downloaded webfont support. */
-static font_t *glyph_face(font_t *f, uint32_t cp, int *glyph) {
+static font_t *shared_cjk(int which) {
+    static font_t *cache[3];
+    static bool tried[3];
+    static const char *names[3] = {
+        "MapleMono-NF-CN-Regular.ttf", "PlangothicP2-Regular.ttf", "PlangothicP1-Regular.ttf"
+    };
+    if (!tried[which]) {
+        tried[which] = true;
+        cache[which] = open_bundled(names[which]);
+    }
+    return cache[which];
+}
+
+/* 本文用の日本語 Regular 二つだけ。UI/mono はこの候補を呼ばない。
+   CFF OTF を元の bytes のまま一度だけ読み、各 style で共有する。 */
+static font_t *family_cjk(bool serif) {
+    static font_t *cache[2];
+    static bool tried[2];
+    static const char *names[2] = {"NotoSansCJKjp-Regular.otf", "NotoSerifCJKjp-Regular.otf"};
+    int which = serif ? 1 : 0;
+    if (!tried[which]) {
+        tried[which] = true;
+        cache[which] = open_bundled(names[which]);
+    }
+    return cache[which];
+}
+
+static font_t *try_glyph(font_t *f, uint32_t cp, int *glyph) {
+    int g = f ? glyph_of(f, cp) : 0;
+    if (!g) return NULL;
+    *glyph = g;
+    return f;
+}
+
+/* 仮名・漢字・ハングルの代表的ブロックでは CJK 候補を先に試す。
+   優先順だけの判定であり、この外の文字を拒否する収録範囲の制限ではない。 */
+static bool cjk_codepoint(uint32_t cp) {
+    return (cp >= 0x2e80 && cp <= 0x9fff) || (cp >= 0x1100 && cp <= 0x11ff) ||
+           (cp >= 0xa960 && cp <= 0xa97f) || (cp >= 0xac00 && cp <= 0xd7ff) ||
+           (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xff66 && cp <= 0xffdc) ||
+           (cp >= 0x1aff0 && cp <= 0x1b2ff) || (cp >= 0x20000 && cp <= 0x3ffff);
+}
+
+/* 収録判定・測定・描画は必ず同じ実 face を選ぶ。候補は有限で、必要時だけ
+   読み込み、候補の glyph_face へ再帰しない。既存 UI/CN の優先順は維持する。 */
+static font_t *glyph_face_uncached(font_t *f, uint32_t cp, int *glyph) {
     *glyph = glyph_of(f, cp);
-    if (!*glyph && f->ui_fallback && cp > ' ') {
-        static font_t *cn;
-        static bool tried;
-        if (!tried) { tried = true; cn = open_bundled("MapleMono-NF-CN-Regular.ttf"); }
-        if (cn) {
-            int g = glyph_of(cn, cp);
-            if (g) { *glyph = g; return cn; }
+    if (!*glyph && f->fallback != FALLBACK_NONE && cp > ' ') {
+        font_t *face;
+        bool cjk_first = f->fallback == FALLBACK_UI || cjk_codepoint(cp);
+        if (cjk_first) {
+            if (f->fallback != FALLBACK_UI &&
+                (face = try_glyph(family_cjk(f->fallback == FALLBACK_SERIF), cp, glyph))) return face;
+            for (int i = 0; i < 3; i++)
+                if ((face = try_glyph(shared_cjk(i), cp, glyph))) return face;
         }
+        int first = f->fallback == FALLBACK_SERIF ? 2 : 0;
+        for (int i = 0; i < 4; i++) {
+            font_t *candidate = noto_face((first + i) & 3);
+            if (candidate != f && (face = try_glyph(candidate, cp, glyph))) return face;
+        }
+        if (!cjk_first)
+            for (int i = 0; i < 3; i++)
+                if ((face = try_glyph(shared_cjk(i), cp, glyph))) return face;
     }
     return f;
+}
+
+/* 同じ文字の測定・収録判定・描画で高 Unicode の cmap と fallback 群を
+   毎回たどらない。face と候補順は不変で、欠落結果も記憶する。
+   サイズ／位置には依存しない。固定 4096 件、4-way の局所置換で全消去しない。
+   font は現在プロセス寿命まで保持され、id は再利用されない。 */
+enum { FACE_CACHE_SETS = 1024, FACE_CACHE_WAYS = 4 };
+struct face_entry { int font; uint32_t cp; font_t *face; int glyph; };
+static struct face_entry face_cache[FACE_CACHE_SETS][FACE_CACHE_WAYS];
+static uint8_t face_victim[FACE_CACHE_SETS];
+
+static font_t *glyph_face(font_t *f, uint32_t cp, int *glyph) {
+    /* 主 face にある Latin は既存の小さな cmap 配列だけで済ませる。 */
+    if (cp < 0x250) {
+        *glyph = glyph_of(f, cp);
+        if (*glyph || f->fallback == FALLBACK_NONE || cp <= ' ') return f;
+    }
+    uint32_t h = (uint32_t)f->id * 2654435761u ^ cp * 40503u;
+    unsigned set = (h ^ (h >> 16)) & (FACE_CACHE_SETS - 1);
+    struct face_entry *slot = NULL;
+    for (unsigned i = 0; i < FACE_CACHE_WAYS; i++) {
+        struct face_entry *e = &face_cache[set][i];
+        if (e->font == f->id && e->cp == cp) { *glyph = e->glyph; return e->face; }
+        if (!e->font && !slot) slot = e;
+    }
+    font_t *face = glyph_face_uncached(f, cp, glyph);
+    if (!slot) slot = &face_cache[set][face_victim[set]++ & (FACE_CACHE_WAYS - 1)];
+    slot->font = f->id; slot->cp = cp; slot->face = face; slot->glyph = *glyph;
+    return face;
 }
 
 static int glyph_adv(font_t *f, int g) {
@@ -108,6 +234,19 @@ static int glyph_adv(font_t *f, int g) {
 }
 
 void font_metrics(font_t *f, float px, float *ascent, float *descent, float *line_gap) {
+    /* 統合版の約 2.7 em hhea で通常行高を広げない。行箱だけを既存 Inter
+       Regular に合わせ、glyph の em scale / advance / raster と原版 bytes は保つ。
+       特殊な tall glyph の縦 extent を完全に行箱へ統合する shaping ではない。 */
+    if (f->merged_metrics) {
+        font_t *base = inter_backup(FONT_REGULAR);
+        if (base) f = base;
+        else {
+            if (ascent) *ascent = px * 0.95f;
+            if (descent) *descent = px * 0.25f;
+            if (line_gap) *line_gap = 0;
+            return;
+        }
+    }
     float s = f->unit_scale * px;
     if (ascent) *ascent = f->ascent * s;
     if (descent) *descent = -f->descent * s;

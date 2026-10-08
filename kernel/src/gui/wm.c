@@ -955,7 +955,7 @@ struct draw_scene {
     struct draw_layer layers[MAX_WIN];
     unsigned count;
     struct rect selection;
-    bool selected, fault_test, shadow_strip;
+    bool selected, fault_test, shadow_strip, occlusion;
 };
 
 struct scene_job {
@@ -965,7 +965,7 @@ struct scene_job {
     unsigned cpu[CPU_MAX_COUNT]; /* one independent cell per tile */
 };
 
-static bool wm_parallel, wm_parallel_force, wm_verify, wm_yield, wm_shadow_strip;
+static bool wm_parallel, wm_parallel_force, wm_verify, wm_yield, wm_shadow_strip, wm_occlusion;
 static bool wm_trace, trace_done, trace_chord;
 static volatile bool trace_active;
 static canvas_t verify_back;
@@ -1003,6 +1003,25 @@ static void scene_shrink(unsigned layers,unsigned width,unsigned rows,uint64_t m
             (uint64_t)MAX(scene_cpu_count(),rows/2)*width*MAX(layers,4u));
 }
 
+/* A client is raw-replaced by gfx_blit, even when its stored alpha is zero.
+ * Only complete coverage of this exact clip can hide all lower drawing.
+ * A partial rectangle, frame, rounded title or shadow is never an occluder.
+ * This operates on the immutable BSP snapshot, not live window ownership. */
+static unsigned scene_first_layer(const struct draw_scene *s, struct rect r, bool *covered) {
+    *covered=false;
+    if (!s->occlusion) return 0;
+    int64_t right=(int64_t)r.x+r.w, bottom=(int64_t)r.y+r.h;
+    for (unsigned at=s->count; at; at--) {
+        const struct draw_layer *l=&s->layers[at-1];
+        if (l->client_raw_overwrite && r.x>=l->cx && r.y>=l->cy &&
+            right<=(int64_t)l->cx+l->cw && bottom<=(int64_t)l->cy+l->ch) {
+            *covered=true;
+            return at-1;
+        }
+    }
+    return 0;
+}
+
 static void capture_scene(struct draw_scene *s, canvas_t dst) {
     cpu_require_bsp();
     s->dst = dst;
@@ -1011,6 +1030,7 @@ static void capture_scene(struct draw_scene *s, canvas_t dst) {
     s->selected = sel_icon >= 0;
     s->fault_test = false;
     s->shadow_strip = wm_shadow_strip; /* BSPが発行前に選択、join中は不変。 */
+    s->occlusion = wm_occlusion;
     if (s->selected) {
         int x, y;
         icon_cell(sel_icon, &x, &y);
@@ -1037,12 +1057,14 @@ static void scene_tile(size_t index, void *arg) {
     canvas_t c = s->dst; /* AP never modifies the global back clip */
     gfx_noclip(&c);
     gfx_clip(&c, r.x, r.y, r.w, r.h);
-    gfx_blit(&c, r.x, r.y, &s->wallpaper, r.x, r.y, r.w, r.h);
-    if (s->selected) {
+    bool covered=false;
+    unsigned first=scene_first_layer(s,r,&covered);
+    if (!covered) gfx_blit(&c, r.x, r.y, &s->wallpaper, r.x, r.y, r.w, r.h);
+    if (s->selected && !covered) {
         struct rect a = s->selection;
         gfx_fill_blend(&c, a.x, a.y, a.w, a.h, ARGB(70,150,140,255));
     }
-    for (unsigned i = 0; i < s->count; i++)
+    for (unsigned i = first; i < s->count; i++)
         if (rect_overlap(&s->layers[i].bounds, &r)) draw_layer(&c, &s->layers[i], s->shadow_strip);
     job->cpu[index] = cpu_current_index();
 }
@@ -1076,17 +1098,20 @@ static void render_scene_direct(const struct draw_scene *s, struct rect r) {
 /* 元generic shadow専用oracle。BSPの同期render前後だけ選択を保存／復元する。 */
 static void render_scene_original(struct draw_scene *s, struct rect r) {
     cpu_require_bsp();
-    bool saved=s->shadow_strip;
+    bool saved=s->shadow_strip, saved_occlusion=s->occlusion;
     s->shadow_strip=false;
+    s->occlusion=false;
     render_scene_direct(s,r);
     s->shadow_strip=saved;
+    s->occlusion=saved_occlusion;
 }
 
 static void measure_reference(struct draw_scene *s,struct rect r,unsigned rows,
                               uint64_t *direct,uint64_t *serial) {
     canvas_t original=s->dst;
-    bool saved=s->shadow_strip;
+    bool saved=s->shadow_strip, saved_occlusion=s->occlusion;
     s->shadow_strip=false;
+    s->occlusion=false;
     s->dst=verify_back;
     uint64_t start=scene_tick();
     render_scene_direct(s,r);
@@ -1094,6 +1119,7 @@ static void measure_reference(struct draw_scene *s,struct rect r,unsigned rows,
     *serial=render_scene(s,r,false,rows,NULL,NULL);
     s->dst=original;
     s->shadow_strip=saved;
+    s->occlusion=saved_occlusion;
 }
 
 static void scene_benchmark(void) {
@@ -1209,11 +1235,13 @@ static void composite_ram(struct rect r) {
     for (unsigned i=0;i<scene.count;i++) if (rect_overlap(&scene.layers[i].bounds,&r))
         scene.layers[relevant++]=scene.layers[i];
     scene.count=relevant;
+    bool covered=false;
+    unsigned active_layers=scene.count-scene_first_layer(&scene,r,&covered);
     bool verify=wm_verify && verify_back.w==back.w && verify_back.h==back.h;
     /* 自動利用は多層・大damageだけ。明示onでも既存の安全条件を保つ。 */
     bool parallel = wm_parallel && scene_cpu_count()>1 && r.h>=2 &&
                     (uint64_t)r.w*r.h>=65536 && scene.count>0 &&
-                    (wm_parallel_force || (scene.count>=16 && (uint64_t)r.w*r.h>=262144));
+                    (wm_parallel_force || (active_layers>=16 && (uint64_t)r.w*r.h>=262144));
     if (!parallel) {
         render_scene_direct(&scene,r);
         if (verify && scene.count) {
@@ -1229,7 +1257,7 @@ static void composite_ram(struct rect r) {
         return;
     }
     /* Many overlapping alpha shadows need shorter joins, not a fixed giant job. */
-    unsigned rows=scene_rows(scene.count,(unsigned)r.w);
+    unsigned rows=scene_rows(active_layers,(unsigned)r.w);
     uint64_t start_jobs=cpu_parallel_jobs(), maximum=0, mask=0;
     uint64_t direct=0,serial=0;
     bool parallel_first=verify && (scene_frames&1);
@@ -1246,7 +1274,7 @@ static void composite_ram(struct rect r) {
     scene_frames++;
     scene_jobs+=cpu_parallel_jobs()-start_jobs;
     scene_max_ticks=MAX(scene_max_ticks,maximum);
-    scene_shrink(scene.count,(unsigned)r.w,rows,maximum);
+    scene_shrink(active_layers,(unsigned)r.w,rows,maximum);
     if (!trace_active && (verify || scene_frames==1 || !(scene_frames%64)))
         kprintf("wmram: frame=%lu rect=%dx%d layers=%u CPUs=%u mask=%lx direct_ticks=%lu serial_ticks=%lu parallel_ticks=%lu jobs=%lu density=%u batch_rows=%u join_us=%lu max_join_us=%lu pixels=%s reference_timed=%u direct_shadow=original serial_shadow=original parallel_shadow=%s\n",
                 scene_frames,r.w,r.h,scene.count,scene_cpu_count(),mask,direct,serial,ticks,
@@ -1939,6 +1967,7 @@ void wm_init(void) {
     wm_trace=cmdline_has("wmtrace");
     wm_yield=cmdline_has("wmyield");
     wm_shadow_strip=!cmdline_has("wmshadowstrip=off"); /* default on; legacy shadow path is opt-out */
+    wm_occlusion=!cmdline_has("wmocclusion=off"); /* diagnostic original layer traversal */
     wm_parallel_force=cmdline_has("wmparallel") || wm_verify || cmdline_has("wm-test-ap-fault");
     wm_parallel=!cmdline_has("wmparallel=off"); /* 明示offは診断のforceより優先。 */
     if (wm_verify) {

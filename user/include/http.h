@@ -15,11 +15,12 @@ const char *ns_error(net_stream *s);                     /* last error, "" if no
 void ns_close(net_stream *s);
 
 /* ---- URLs ---- */
+#define HTTP_URL_PATH_MAX 2048u /* storage includes the terminating NUL */
 struct url {
     bool tls;
     char host[128];
     uint16_t port;
-    char path[1024]; /* includes the query string; "/" if empty */
+    char path[HTTP_URL_PATH_MAX]; /* includes the query string; "/" if empty */
 };
 bool url_parse(const char *s, struct url *u);
 
