@@ -66,6 +66,13 @@ static inline const char *web_response_headers(const struct web_response *r) {
     return r->headers_full ? r->headers_full : r->headers;
 }
 void web_response_free(struct web_response *response);
+/* Navigation observations are copied into the document, not retained as a
+   pointer to a mutable browser request. All values use uptime_ms(), not wall
+   clock time. Unobserved DNS/TLS/first-byte milestones are deliberately absent. */
+struct web_navigation_timing {
+    bool valid, fetch_valid, response_end_valid;
+    uint64_t navigation_start_ms, fetch_start_ms, response_end_ms;
+};
 struct web_host {
     void *opaque;
     bool (*request)(void *opaque, const struct web_request *request);
@@ -88,6 +95,8 @@ struct web_host {
     /* Opt in only for the native browser embedder. Custom/fixture hosts keep
        their request() transport; this flag does not grant origin/CORS access. */
     bool media_range;
+    /* Zero-initialized custom hosts keep the explicit document-init epoch. */
+    struct web_navigation_timing navigation_timing;
 };
 bool web_set_url(web_doc *d, const char *url);
 /* Call between JS tasks, after the host history position and document URL change. */

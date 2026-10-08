@@ -1,7 +1,7 @@
 /* Buffered Fetch API over the native, CORS-checked browser transport.
    https://fetch.spec.whatwg.org/#fetch-api (consulted 2026-10-06).
    Body bytes are real snapshots, not String(BufferSource). ReadableStream,
-   Blob, FormData, opaque responses and background keepalive are unsupported
+   FormData, opaque responses and background keepalive are unsupported
    and explicitly fail; no successful-looking stream or multipart stubs.
    Request cache modes use the cacheless native host's genuine network path;
    only-if-cached always misses and never sends a network request. No Cache
@@ -29,6 +29,7 @@ const fetchBridge = (() => {
     const nullStatuses=new Set([101,103,204,205,304]);
     const cacheModes=['default','no-store','reload','no-cache','force-cache','only-if-cached'];
     let NativeURL, Params, paramsString, Encoder, encode, Decoder, decode;
+    let blobAPI,objectURLAPI;
     const str=v=>{if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol to string');return String(v);};
     const usv=v=>apply(wellFormed,str(v),[]);
     const byteString=v=>{const t=str(v);if(/[^\x00-\xff]/.test(t))throw new TypeError('Expected ByteString');return t;};
@@ -137,7 +138,8 @@ const fetchBridge = (() => {
     function extractBody(value) {
         if(value==null)return {bytes:null,type:null};
         if(isBuffer(value))return {bytes:copyBytes(value),type:null};
-        for(const name of ['Blob','FormData','ReadableStream']) {
+        if(blobAPI&&blobAPI.brand(value))return {bytes:blobAPI.bytes(value),type:blobAPI.type(value)||null};
+        for(const name of ['FormData','ReadableStream']) {
             const C=globalThis[name];
             if(typeof C==='function'&&value instanceof C)throw notSupported(name+' bodies are not supported');
         }
@@ -146,6 +148,7 @@ const fetchBridge = (() => {
     }
     function consume(object,kind) {
         let b;try{b=slot(bodySlots,object,'Body');}catch(e){return reject(e);}
+        if(kind==='blob'&&!blobAPI)return reject(notSupported('Blob is not initialized'));
         if(b.used)return reject(new TypeError('Body already consumed'));
         if(b.bytes!==null&&b.abort&&slot(signalSlots,b.abort,'AbortSignal').aborted)return reject(slot(signalSlots,b.abort,'AbortSignal').reason);
         if(b.bytes!==null)b.used=true;
@@ -154,6 +157,10 @@ const fetchBridge = (() => {
                 const bytes=b.bytes===null?new AB(0):copyBytes(b.bytes);
                 if(kind==='arrayBuffer')resolve(bytes);
                 else if(kind==='bytes')resolve(new U8(bytes));
+                else if(kind==='blob'){
+                    const s=requestSlots.get(object)||responseSlots.get(object);
+                    resolve(blobAPI.fromBytes(bytes,headerValue(headerSlots.get(s.headers),'content-type')||''));
+                }
                 else {const text=apply(decode,new Decoder(),[bytes]);resolve(kind==='json'?parse(text):text);}
             }catch(e){reject(e);}
         });
@@ -161,8 +168,8 @@ const fetchBridge = (() => {
     function installBody(proto) {
         define(proto,'bodyUsed',{configurable:true,enumerable:true,get(){return slot(bodySlots,this,'Body').used;}});
         define(proto,'body',{configurable:true,enumerable:true,get(){if(slot(bodySlots,this,'Body').bytes===null)return null;throw notSupported('ReadableStream bodies are not supported; use text(), json(), arrayBuffer() or bytes()');}});
-        for(const name of ['text','json','arrayBuffer','bytes'])define(proto,name,{configurable:true,enumerable:true,writable:true,value:function(){return consume(this,name);}});
-        for(const name of ['blob','formData'])define(proto,name,{configurable:true,enumerable:true,writable:true,value:function(){try{slot(bodySlots,this,'Body');}catch(e){return reject(e);}return reject(notSupported(name+' is not supported'));}});
+        for(const name of ['text','json','arrayBuffer','bytes','blob'])define(proto,name,{configurable:true,enumerable:true,writable:true,value:function(){return consume(this,name);}});
+        define(proto,'formData',{configurable:true,enumerable:true,writable:true,value:function(){try{slot(bodySlots,this,'Body');}catch(e){return reject(e);}return reject(notSupported('formData is not supported'));}});
     }
     const signalToken={};
     function newSignal(){return new AbortSignal(signalToken);}
@@ -333,6 +340,10 @@ const fetchBridge = (() => {
             // Fetch network error (TypeError), not a synthetic HTTP 504, and
             // cannot reach host.fetch even for a cross-origin target URL.
             if(s.cache==='only-if-cached')throw new TypeError('No cached response is available');
+            if(objectURLAPI&&s.url.startsWith('blob:')){
+                const local=objectURLAPI.fetch(s.url,s.method,headerValue(headerSlots.get(s.headers),'range')),fields={'content-type':local.type,'content-length':String(local.size)};if(local.range)fields['content-range']=local.range;const headers=makeHeaders(fields,'immutable');
+                return new NativePromise(resolve=>resolve(responseObject({status:local.status,statusText:local.status===206?'Partial Content':'OK',url:s.url.split('#')[0],headers,redirected:false,type:'basic'},{bytes:local.bytes,used:false,abort:s.signal})));
+            }
             let raw='';for(const [name,value]of sortedHeaders(headerSlots.get(s.headers)))raw+=name+': '+value+'\r\n';
             const pair=host.fetch(s.url,s.method,raw,b.bytes===null?'':b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),false,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache));
             if(b.bytes!==null)b.used=true;
@@ -363,6 +374,9 @@ const fetchBridge = (() => {
     return {
         Headers,Request,Response,AbortSignal,AbortController,fetch,
         initialize(){NativeURL=globalThis.URL;Params=globalThis.URLSearchParams;paramsString=Params.prototype.toString;Encoder=globalThis.TextEncoder;encode=Encoder.prototype.encode;Decoder=globalThis.TextDecoder;decode=Decoder.prototype.decode;},
+        initializeBlobs(api){blobAPI=api;},
+        initializeObjectURLs(api){objectURLAPI=api;},
+        xhrBody(value){const binary=isBuffer(value)||!!(blobAPI&&blobAPI.brand(value));return {...extractBody(value),binary};},
         response(status,url,raw,text,bytes,redirected,statusText,type) {
             const headers=makeHeaders(undefined,'response');
             for(const line of raw.split(/\r?\n/)){const i=line.indexOf(':');if(i>0&&!line.startsWith('HTTP/'))appendHeader(headerSlots.get(headers),normalizeName(line.slice(0,i)),normalizeValue(line.slice(i+1)));}

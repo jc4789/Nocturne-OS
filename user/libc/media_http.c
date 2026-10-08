@@ -273,22 +273,23 @@ static bool preflight(nmedia_http *r) {
     char headers[512];
     int n=snprintf(headers,sizeof headers,"Origin: %s\r\nAccess-Control-Request-Method: GET\r\n"
         "Access-Control-Request-Headers: %s\r\nAccept-Encoding: identity\r\n",
-        r->origin,r->etag[0]?"range, if-range":"range");
+        r->origin,"if-range");
     if(n<0||(size_t)n>=sizeof headers)return false;
     struct http_req request={.method="OPTIONS",.url=r->url,.headers=headers,
         .timeout_ms=MEDIA_HTTP_TIMEOUT_MS,.on_header=header,.on_body=discard_body,.ctx=&t};
     int result=http_request(&request,&response);
     bool ok=(result==0||t.discard)&&!t.error[0]&&response.status>=200&&response.status<300&&
-        cors(&t)==0&&token_list(t.allow_methods,"GET",false)&&token_list(t.allow_headers,"range",true)&&
-        (!r->etag[0]||token_list(t.allow_headers,"if-range",true));
+        cors(&t)==0&&token_list(t.allow_headers,"if-range",true);
     if(!ok)snprintf(r->error,sizeof r->error,"media CORS Range preflight denied");
     http_resp_free(&response);return ok;
 }
 static bool refill(nmedia_http *r, int64_t at) {
     r->cache_len = 0;
-    /* Matches the current browser worker's conservative non-safelisted Range
-     * policy. No cached permission or page-controlled Origin is trusted. */
-    if(r->cross&&!preflight(r))return false;
+    /* Fetch safelists this single bytes=start-end Range and the GET method.
+     * If-Range is not safelisted, so representation-validation refills still
+     * need permission for that header. Every response must pass cors() before
+     * any bytes enter the cache; this does not waive origin validation. */
+    if(r->cross&&r->etag[0]&&!preflight(r))return false;
     for (unsigned redirects = 0; redirects <= 5; redirects++) {
         struct http_resp response;
         struct transfer t = { .reader = r, .response = &response, .first = at,

@@ -148,6 +148,10 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavcodec/vorbis_parser.c \
     third_party/ffmpeg/libavcodec/vorbisdec.c \
     third_party/ffmpeg/libavcodec/vorbisdsp.c \
+    third_party/ffmpeg/libavcodec/vp8.c \
+    third_party/ffmpeg/libavcodec/vp8_parser.c \
+    third_party/ffmpeg/libavcodec/vp8data.c \
+    third_party/ffmpeg/libavcodec/vp8dsp.c \
     third_party/ffmpeg/libavcodec/vp9.c \
     third_party/ffmpeg/libavcodec/vp9_parser.c \
     third_party/ffmpeg/libavcodec/vp9block.c \

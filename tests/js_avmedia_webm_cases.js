@@ -8,9 +8,9 @@ async function runAvmediaCases() {
     check(video.canPlayType('video/webm; codecs="vp9, opus"')==='probably','VP9 Opus declaration');
     check(video.canPlayType('audio/ogg; codecs=vorbis')==='probably','Vorbis declaration');
     check(video.canPlayType('video/webm; codecs=vp09.02.10.10')==='','no high-bit-depth declaration');
-    check(video.canPlayType('video/webm; codecs=vp8')==='','VP8 remains unsupported');
+    check(video.canPlayType('video/webm; codecs=vp8')==='probably','VP8 declaration');
     check(video.canPlayType('video/webm; codecs=av01.0.04M.08')==='','AV1 remains unsupported');
-    check(!('MediaSource' in globalThis)&&!('requestMediaKeySystemAccess' in navigator),'no fake MSE DRM');
+    check(typeof MediaSource==='function'&&typeof MediaSource.isTypeSupported==='function'&&!('requestMediaKeySystemAccess' in navigator),'native MSE, no DRM');
 
     video.src=fixture('vp9.webm');await video.play();
     check(video.videoWidth===96&&video.videoHeight===64&&!video.paused,'VP9 native metadata/frame');
@@ -35,7 +35,7 @@ async function runAvmediaCases() {
             await delay(500);check(video.ended&&video.paused,'combined EOF '+name);release(video);
         }
     }
-    for(const name of ['unsupported.webm','vp9-high10.webm','unsupported-av1.webm']){
+    for(const name of ['vp9-high10.webm','unsupported-av1.webm']){
         video.src=fixture(name);let rejected=false;try{await video.play();}catch(e){rejected=true;}
         check(rejected&&video.paused,'actual unsupported fixture '+name);release(video);
     }

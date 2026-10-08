@@ -85,7 +85,8 @@ const char *nmedia_can_play_type(const char *type) {
         else if (container == AAC) ok = !strcmp(codec,"mp4a.40.2");
         else if (container == MP4) ok = !strcmp(codec,"mp4a.40.2") || (strncmp(mime,"audio/",6) && avc8(codec));
         else if (container == AVI) ok = !strcmp(codec,"mjpeg") || !strcmp(codec,"mp3") || !strcmp(codec,"pcm");
-        else if (container == WEBM) ok = !strcmp(codec,"opus") || !strcmp(codec,"vorbis") || (strncmp(mime,"audio/",6) && vp9_8(codec));
+        else if (container == WEBM) ok = !strcmp(codec,"opus") || !strcmp(codec,"vorbis") ||
+            (strncmp(mime,"audio/",6) && (!strcmp(codec,"vp8") || !strcmp(codec,"vp8.0") || vp9_8(codec)));
         else if (container == OGG) ok = !strcmp(codec,"opus") || !strcmp(codec,"vorbis");
         if (!ok || (next && !*next)) return "";
         p = next;

@@ -7,11 +7,12 @@
 #include <limits.h>
 static int checks,failed;
 #define CHECK(x) do{checks++;if(!(x)){failed++;printf("FAIL media_webmtest:%d %s\n",__LINE__,#x);}}while(0)
-static const struct fixture {const char *name,*audio_codec;bool video;int frames;} fixtures[]={
+static const struct fixture {const char *name,*audio_codec;bool video;int frames;const char *video_codec;} fixtures[]={
     {"stereo.opus","opus",false,9600},{"stereo-silk.opus","opus",false,9600},
     {"stereo.ogg","vorbis",false,9472},{"opus.webm","opus",false,9600},
     {"vorbis.webm","vorbis",false,9600},{"vp9.webm",NULL,true,0},
     {"vp9-opus.webm","opus",true,9600},{"vp9-vorbis.webm","vorbis",true,9600},
+    {"unsupported.webm",NULL,true,0,"vp8"}, /* Original VP8 fixture bytes retained. */
 };
 static uint8_t *read_fixture(const char *name,size_t *size){
     char path[256];snprintf(path,sizeof path,"/data/tests/media-fixtures/%s",name);
@@ -32,7 +33,7 @@ static void decode(const struct fixture *fixture,bool memory){
     const struct nmedia_info *info=nmedia_get_info(m);
     CHECK(info&&info->audio==(fixture->audio_codec!=NULL)&&info->video==fixture->video);
     if(fixture->audio_codec)CHECK(!strcmp(info->audio_codec,fixture->audio_codec));
-    if(fixture->video)CHECK(!strcmp(info->video_codec,"vp9")&&info->width==96&&info->height==64);
+    if(fixture->video)CHECK(!strcmp(info->video_codec,fixture->video_codec?fixture->video_codec:"vp9")&&info->width==96&&info->height==64);
     int frames=0,pictures=0,r=NMEDIA_AGAIN;int64_t energy[2]={0},lasta=INT64_MIN,lastv=INT64_MIN;
     struct nmedia_output out;
     for(int budget=0;budget<1000;budget++){
@@ -75,10 +76,11 @@ static void reject(const char *name){
 }
 static void capabilities(void){
     const char *positive[]={"video/webm; codecs=vp9","video/webm; codecs=vp9.0",
+        "video/webm; codecs=vp8","video/webm; codecs=vp8.0","video/webm; codecs=\"vp8, vorbis\"",
         "video/webm; codecs=\"vp09.00.10.08, opus\"","video/webm; codecs=\"vp9, vorbis\"",
         "video/webm; codecs=vp09.00.41.08.01.01.01.01.00",
         "audio/webm; codecs=opus","audio/webm; codecs=vorbis","audio/ogg; codecs=opus","audio/ogg; codecs=vorbis"};
-    const char *negative[]={"video/webm; codecs=vp8","video/webm; codecs=av01.0.04M.08",
+    const char *negative[]={"audio/webm; codecs=vp8","video/webm; codecs=vp8.1","video/webm; codecs=av01.0.04M.08",
         "video/webm; codecs=vp09.02.10.10","video/webm; codecs=vp09.01.10.08",
         "video/webm; codecs=vp09.00.99.08","video/webm; codecs=vp09.00.10.08.01",
         "video/webm; codecs=vp09.00.10.08.01.09.16.09.01","video/webm; codecs=vp09.00.10.08junk",
@@ -92,7 +94,7 @@ static void capabilities(void){
 }
 int main(void){
     for(size_t i=0;i<sizeof fixtures/sizeof *fixtures;i++){decode(&fixtures[i],false);decode(&fixtures[i],true);}
-    reject("unsupported.webm");reject("vp9-high10.webm");reject("unsupported-av1.webm");
+    reject("vp9-high10.webm");reject("unsupported-av1.webm");
     size_t n=0;uint8_t *p=read_fixture("vp9-opus.webm",&n);if(p){char error[160];CHECK(nmedia_open_memory(p,16,error,sizeof error)==NULL);free(p);}
     capabilities();printf("media_webmtest: %d checks, %d failed\n",checks,failed);return failed!=0;
 }

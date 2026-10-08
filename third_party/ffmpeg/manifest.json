@@ -1,7 +1,7 @@
 {
   "release": "9.0.2",
   "license": "LGPL-2.1-or-later",
-  "compiled_sources": 333,
+  "compiled_sources": 337,
   "files": [
     {
       "path": "compat/va_copy.h",
@@ -10,12 +10,12 @@
     },
     {
       "path": "config.h",
-      "sha256": "3a890c6a8708244c6af10f2a1451b787f6151aecb11e0a0326db05b009b3244d",
+      "sha256": "758900f376f875266de93dbfdad0e4ad4905645488fd16d3098b7791f6200660",
       "origin": "configure-generated"
     },
     {
       "path": "config_components.h",
-      "sha256": "c3b7871de6db4e366fd48519e792390769f413d7d87dad131d1c3b207a97a194",
+      "sha256": "8fcfdf5c8806ca0bec1ce75bd54e4488f03cd81cb110a3fda34fa130d9a15474",
       "origin": "configure-generated"
     },
     {
@@ -490,7 +490,7 @@
     },
     {
       "path": "libavcodec/codec_list.c",
-      "sha256": "fa03831b2034c4fb6769d5ecbc18ceeb07e7b3177873b242f2ad53f67ff3012b",
+      "sha256": "939ff69ed79abb54da9844ecb16342c33f0879a4dd95c3b01e21825acebf5b7a",
       "origin": "configure-generated"
     },
     {
@@ -1515,7 +1515,7 @@
     },
     {
       "path": "libavcodec/parser_list.c",
-      "sha256": "8b8d0c83f285c461250293ef9d57b2a0b243db62059eba2d44893cd44bb33344",
+      "sha256": "55b85aca41ca80d64f394b1e7cb26626742670b427a65c635b280ff8fb4e93e5",
       "origin": "configure-generated"
     },
     {
@@ -1834,8 +1834,43 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavcodec/vp8.c",
+      "sha256": "013ff4a7626ee08a80fb2bcdb9f65d0fc2324594b11aea8537d9bebc250a09b0",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp8.h",
+      "sha256": "474cb57f689373cd00d2e091ebba17c6e7fffa3ce045927fbd7c63ed6e4c6332",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavcodec/vp89_rac.h",
       "sha256": "dfe3789f1decfc6f7c5a2582f54b7dcec256d1313749bd6ff58a044b32616ee7",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp8_parser.c",
+      "sha256": "f544002fe86898ab0b502ab8a5c3ad85c1f03b7cbc2da538855ad018f5399b4a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp8data.c",
+      "sha256": "931f2eca4b93657b9b20e27c4b8a3930d7750747401afa793b7691cf4151a0e9",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp8data.h",
+      "sha256": "c3c38596a203f58708279140a4e81c6df9df2ef93607599e1c3378f16a7f8ed0",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp8dsp.c",
+      "sha256": "f294104c5c0164a68bc17febaf84b02208a75441d661180ad4aad800f42e7d0b",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/vp8dsp.h",
+      "sha256": "7ac00f2065f311952e2f98326479333541fe44b7902887b84c29cbec096541a6",
       "origin": "upstream-unmodified"
     },
     {
@@ -3775,6 +3810,7 @@
     "pcm_u8",
     "rawvideo",
     "vorbis",
+    "vp8",
     "vp9"
   ],
   "demuxers": [
@@ -3795,6 +3831,7 @@
     "mpegaudio",
     "opus",
     "vorbis",
+    "vp8",
     "vp9"
   ],
   "bitstream_filters": [

@@ -1,6 +1,6 @@
 /* Buffered asynchronous XHR over Nocturne's existing, CORS-checked transport.
    No page-replaceable fetch/Promise methods are used to schedule host work.
-   Streaming, synchronous requests, binary upload, Blob and XML documents are
+   Streaming, synchronous requests and XML documents are
    not implemented; unsupported operations must not pretend to succeed. */
 {
     const states = new WeakMap(), uploadStates = new WeakMap(), progressStates = new WeakMap();
@@ -111,7 +111,7 @@
         // This Response is private to this request, never passed to page code.
         // Retain its native copy instead of invoking ArrayBuffer@@species.
         s.bytes=response._bytes;
-        s.text=s.type==='arraybuffer'?'':textResponse(s);
+        s.text=s.type==='arraybuffer'||s.type==='blob'?'':textResponse(s);
         if(s.bytes.byteLength){s.ready=3;fire(x,'readystatechange');if(!current(s,epoch))return;}
         const loaded=s.bytes.byteLength,header=nativeApply(headerGet,s.responseHeaders,['content-length']);
         const total=header!==null && /^\d+$/.test(header)?Number(header):0;
@@ -156,26 +156,23 @@
         }
         send(body=null) {
             const s=state(this);if(s.ready!==1 || s.sent)fail('InvalidStateError','The request is not open');
-            let contentType='text/plain;charset=UTF-8';
-            if(body!==null && (body instanceof ArrayBuffer || ArrayBuffer.isView(body) || body instanceof Document))
-                fail('NotSupportedError','Binary and Document uploads are not supported');
-            if(body!==null && typeof globalThis.URLSearchParams==='function' && body instanceof globalThis.URLSearchParams)
-                contentType='application/x-www-form-urlencoded;charset=UTF-8';
-            if(body!==null)body=nativeApply(wellFormed,string(body),[]);
+            if(body!==null && body instanceof Document)fail('NotSupportedError','Document uploads are not supported');
+            const extracted=fetchBridge.xhrBody(body),contentType=extracted.type;
+            body=extracted.bytes;
             // Body conversion may have called open()/send()/abort() itself.
             if(s.ready!==1 || s.sent)fail('InvalidStateError','Request state changed during body conversion');
             if(s.method==='GET' || s.method==='HEAD')body=null;
-            if(body!==null && !s.headers.has('content-type'))s.headers.set('content-type',contentType);
-            else if(body!==null)s.headers.set('content-type',utf8ContentType(s.headers.get('content-type')));
+            if(body!==null && contentType!==null && !s.headers.has('content-type'))s.headers.set('content-type',contentType);
+            else if(body!==null && !extracted.binary && s.headers.has('content-type'))s.headers.set('content-type',utf8ContentType(s.headers.get('content-type')));
             let raw='';for(const [key,value]of s.headers)raw+=key+': '+value+'\r\n';
-            const uploadSize=body===null?0:host.encode(body).byteLength;
+            const uploadSize=body===null?0:body.byteLength;
             const epoch=++s.epoch;s.sent=true;s.started=host.now();s.uploadDone=body===null;s.uploadSize=uploadSize;
             s.uploadListener=!!(listenerMap.get(s.upload)||[]).some(entry=>!entry.removed);
             fire(this,'loadstart');if(!current(s,epoch))return;
             if(!s.uploadDone && s.uploadListener){fire(s.upload,'loadstart');if(!current(s,epoch))return;}
             try{armTimer(this,s,epoch);}catch(e){cancel(s);s.sent=false;s.epoch++;throw e;}
             let pair;
-            try{pair=host.fetch(s.url,s.method,raw,body??'',false,s.credentials?2:1,s.uploadListener);}
+            try{pair=s.url.startsWith('blob:')?{id:0,promise:fetchBridge.fetch(s.url,{method:s.method,headers:Object.fromEntries(s.headers),body})}:host.fetch(s.url,s.method,raw,body??'',false,s.credentials?2:1,s.uploadListener);}
             catch(_){queue(this,s,epoch,()=>error(this,s,epoch,'error'));return;}
             s.id=pair.id;
             // Native promises settle at the host checkpoint. XHR notifications
@@ -210,7 +207,7 @@
             const s=state(this);v=string(v);
             if(!['','text','json','arraybuffer','blob','document'].includes(v))return;
             if(s.ready===3 || s.ready===4)fail('InvalidStateError','Response already loading');
-            if(v==='blob' || v==='document')fail('NotSupportedError','Blob and Document responses are not supported');
+            if(v==='document')fail('NotSupportedError','Document responses are not supported');
             s.type=v;
         }
         get responseText(){const s=state(this);if(s.type!=='' && s.type!=='text')fail('InvalidStateError','Response is not text');return s.ready<3?'':s.text;}
@@ -218,7 +215,12 @@
         get response(){
             const s=state(this);if(s.type==='' || s.type==='text')return s.ready<3?'':s.text;
             if(s.ready!==4 || !s.bytes)return null;
-            if(!s.objectSet){s.objectSet=true;if(s.type==='arraybuffer')s.object=s.bytes;else if(s.type==='json'){try{s.object=parseJSON(s.text);}catch(_){s.object=null;}}}
+            if(!s.objectSet){
+                if(s.type==='arraybuffer')s.object=s.bytes;
+                else if(s.type==='blob')s.object=blobBridge.fromBytes(s.bytes,s.mime||nativeApply(headerGet,s.responseHeaders,['content-type'])||'');
+                else if(s.type==='json'){try{s.object=parseJSON(s.text);}catch(_){s.object=null;}}
+                s.objectSet=true;
+            }
             return s.object;
         }
         overrideMimeType(mime){const s=state(this);if(!arguments.length)throw new TypeError('overrideMimeType requires a MIME type');mime=string(mime);if(s.ready===3 || s.ready===4)fail('InvalidStateError','Response already loading');s.mime=mime;}

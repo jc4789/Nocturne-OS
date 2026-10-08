@@ -74,7 +74,6 @@ static void memory_cases(void){
     CHECK(nmedia_open_memory(tiny,0,error,sizeof error)==NULL);
     CHECK(nmedia_open_memory(tiny,sizeof tiny,error,sizeof error)==NULL);
     CHECK(nmedia_open("/data/tests/media-fixtures/invalid.mp4",error,sizeof error)==NULL);
-    CHECK(nmedia_open("/data/tests/media-fixtures/unsupported.webm",error,sizeof error)==NULL);
     CHECK(nmedia_open("/data/tests/media-fixtures/not-found",error,sizeof error)==NULL);
     nmedia_close(NULL);CHECK(nmedia_get_info(NULL)==NULL);
 }
@@ -90,6 +89,41 @@ static void capabilities(void){
     CHECK(!*nmedia_can_play_type("audio/mp4; codecs=avc1.42e01e"));
     CHECK(!*nmedia_can_play_type("audio/wav; codecs=99"));
     CHECK(nmedia_audio_extension("SONG.FLAC")&&!nmedia_audio_extension("movie.webm"));
+}
+static void le16(uint8_t *p,unsigned v){p[0]=(uint8_t)v;p[1]=(uint8_t)(v>>8);}
+static void le32(uint8_t *p,unsigned v){le16(p,v);le16(p+2,v>>16);}
+static void downmix_cases(void){
+    /* Decoder-only PCM, never a synthetic webpage or real-site acceptance.
+     * 5.1 speaker mask: FL, FR, FC, LFE, BL, BR; isolate each input channel. */
+    uint8_t wav[68+16*6*2]={0};char error[160];
+    memcpy(wav,"RIFF",4);le32(wav+4,sizeof wav-8);memcpy(wav+8,"WAVEfmt ",8);
+    le32(wav+16,40);le16(wav+20,0xfffe);le16(wav+22,6);le32(wav+24,48000);
+    le32(wav+28,48000*12);le16(wav+32,12);le16(wav+34,16);le16(wav+36,22);
+    le16(wav+38,16);le32(wav+40,0x3f);
+    const uint8_t pcm_guid[16]={1,0,0,0,0,0,0x10,0,0x80,0,0,0xaa,0,0x38,0x9b,0x71};
+    memcpy(wav+44,pcm_guid,16);memcpy(wav+60,"data",4);le32(wav+64,sizeof wav-68);
+    for(int channel=0;channel<6;channel++){
+        memset(wav+68,0,sizeof wav-68);
+        for(int frame=0;frame<16;frame++)le16(wav+68+(frame*6+channel)*2,12000);
+        nmedia *m=nmedia_open_memory(wav,sizeof wav,error,sizeof error);CHECK(m!=NULL);if(!m)continue;
+        struct nmedia_output out;int r=NMEDIA_AGAIN,total=0;int64_t energy[2]={0};
+        for(int budget=0;budget<50;budget++){
+            r=nmedia_step(m,&out);if(r==NMEDIA_END||r==NMEDIA_ERROR)break;
+            if(r==NMEDIA_AUDIO){total+=(int)out.frames;for(size_t i=0;i<out.frames;i++)for(int c=0;c<2;c++)energy[c]+=abs(out.samples[i*2+c]);}
+        }
+        CHECK(r==NMEDIA_END&&total==16);
+        CHECK(channel==0||channel==4 ? energy[0]>0&&energy[1]==0 :
+              channel==1||channel==5 ? energy[0]==0&&energy[1]>0 : energy[0]>0&&energy[0]==energy[1]);
+        printf("MEDIA_DOWNMIX channel=%d energy=%lld/%lld\n",channel,(long long)energy[0],(long long)energy[1]);
+        nmedia_close(m);
+    }
+    /* Top-back speakers have no stereo coefficients in this bounded adapter.
+     * Preserve rejection rather than successful audio missing two channels. */
+    le32(wav+40,0x2800f);
+    nmedia *m=nmedia_open_memory(wav,sizeof wav,error,sizeof error);
+    bool rejected=!m;
+    if(m){struct nmedia_output out;int r=NMEDIA_AGAIN;for(int i=0;i<50&&r==NMEDIA_AGAIN;i++)r=nmedia_step(m,&out);rejected=r==NMEDIA_ERROR;nmedia_close(m);}
+    CHECK(rejected);
 }
 static void drawing(void){
     uint32_t guard[40], src[4]={0xff112233,0xff223344,0xff334455,0xff445566};
@@ -123,6 +157,7 @@ int main(void){
     decode("stereo.wav",true,false,9600,9600);decode("stereo.flac",true,false,9600,9600);
     decode("stereo.mp3",true,false,9600,12000);decode("stereo.aac",true,false,9600,13000);
     decode("mjpeg.avi",false,true,0,0);decode("h264.mp4",false,true,0,0);decode("av.mp4",true,true,9600,13000);
-    memory_cases();capabilities();drawing();audio_flush_cases();
+    decode("unsupported.webm",false,true,0,0); /* Kept legacy filename: actual VP8. */
+    memory_cases();capabilities();downmix_cases();drawing();audio_flush_cases();
     printf("media_codectest: %d checks, %d failed\n",checks,failed);return failed!=0;
 }

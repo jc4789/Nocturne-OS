@@ -86,6 +86,7 @@ typedef void (*irq_handler_t)(struct regs *r);
 void irq_register(int irq, irq_handler_t h);
 void vector_register(int vec, irq_handler_t h);
 bool lapic_present(void);
+bool lapic_x2apic(void); /* Limineが選んだBSP/AP共通mode。起動後の切替は禁止。 */
 uint32_t lapic_current_id(void);
 bool lapic_worker_init(void);
 bool lapic_send_ipi(uint32_t apic_id, uint8_t vector);

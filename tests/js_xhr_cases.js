@@ -43,7 +43,7 @@ async function runXHRCases() {
     throws(()=>x.setRequestHeader('x','bad\nvalue'),'SyntaxError','header injection');
     x.setRequestHeader('Host','attacker.invalid');x.setRequestHeader('Cookie','secret');
     x.responseType='unknown';assert(x.responseType==='','unknown response type ignored');
-    throws(()=>{x.responseType='blob';},'NotSupportedError','blob explicitly unsupported');
+    x.responseType='blob';assert(x.responseType==='blob','binary Blob response type');x.responseType='';
     const first=settle(x);x.send();
     throws(()=>x.send(),'InvalidStateError','duplicate send');
     throws(()=>{x.withCredentials=true;},'InvalidStateError','credentials after send');
@@ -142,7 +142,7 @@ async function runXHRCases() {
     const invalid=new XMLHttpRequest();invalid.open('GET','file:///home/not-a-network-url');let networkError=false;invalid.onerror=()=>networkError=true;
     const ip=settle(invalid);invalid.send();assert(!networkError,'unsupported network error asynchronous');await ip;
     assert(networkError && invalid.status===0,'transport rejects non HTTP');
-    const binary=new XMLHttpRequest();binary.open('POST','api/json');throws(()=>binary.send(new Uint8Array([1,0,2])),'NotSupportedError','binary upload not stringified');
+    const binary=new XMLHttpRequest();binary.open('POST','api/json');binary.send(new Uint8Array([1,0,2]));binary.abort();assert(binary.readyState===0,'binary upload can be cancelled');
     const screenCopy=screen;
     assert(screenCopy===screen && screen instanceof Screen && screen instanceof EventTarget,'screen identity');
     assert(screen.width>0 && screen.height>0 && screen.availWidth<=screen.width && screen.availHeight<=screen.height,'native screen dimensions');

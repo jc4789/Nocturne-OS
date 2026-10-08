@@ -32,8 +32,9 @@ nmedia *nmedia_open(const char *path, char *error, size_t error_size);
  * 256 KiB. No credentials/cookies, browser origin bypass, or async guarantee. */
 nmedia *nmedia_open_url(const char *url, char *error, size_t error_size);
 /* Browser-only anonymous policy: document_url must be the native initiating
- * document, never an origin supplied by page JS. Every cross-origin range is
- * preflighted/CORS-checked. Redirects and HTTPS mixed content are rejected.
+ * document, never an origin supplied by page JS. Every cross-origin response is
+ * CORS-checked; nonsafelisted If-Range refills are preflighted. Redirects and
+ * HTTPS mixed content are rejected.
  * Synchronous input, no cookies/authentication or async cancellation promise. */
 nmedia *nmedia_open_url_cors(const char *url, const char *document_url,
                            char *error, size_t error_size);

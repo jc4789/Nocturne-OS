@@ -29,6 +29,7 @@ static webnet *network;
 static webstorage *storage; /* browser-window lifetime, not document lifetime */
 static uint64_t generation = 1, next_generation = 1, navigation_generation, navigation_id;
 static int navigation_mode;
+static struct web_navigation_timing navigation_timing;
 static char navigation_url[2048];
 static bool native_wait, pending_navigation;
 static char pending_url[2048];
@@ -886,6 +887,12 @@ static void navigation_completed(webnet *net, uint64_t id, uint64_t gen,
     (void)net; (void)opaque;
     if (id != navigation_id || gen != navigation_generation) return;
     navigation_id = 0;
+    /* This callback observes the complete response, never its first byte.
+       Generation/id checks above prevent a canceled request changing timing. */
+    if (!result->error[0] && result->status > 0) {
+        navigation_timing.response_end_ms = uptime_ms();
+        navigation_timing.response_end_valid = true;
+    }
     web_response_free(&navigation_response);
     response_copy(&navigation_response, result);
     navigation_ready = true;
@@ -897,6 +904,7 @@ static void stop_navigation(void) {
     navigation_ready = false;
     web_response_free(&navigation_response);
     memset(&navigation_response, 0, sizeof navigation_response);
+    memset(&navigation_timing, 0, sizeof navigation_timing);
     loading = false;
 }
 
@@ -938,7 +946,9 @@ static void finish_navigation(void) {
     if (!html) { web_response_free(&f); loading = false; set_status("Out of memory loading page"); return; }
     if (!hlen) hlen = strlen(html);
     const char *final_url = f.url[0] ? f.url : navigation_url;
-    web_doc *nd = web_live(html, hlen, final_url, charset, &browser_host);
+    struct web_host document_host = browser_host;
+    document_host.navigation_timing = navigation_timing;
+    web_doc *nd = web_live(html, hlen, final_url, charset, &document_host);
     free(html);
     if (!nd) { web_response_free(&f); loading = false; set_status("Out of memory creating document"); return; }
 
@@ -1010,12 +1020,16 @@ static void navigate(const char *url_in, const char *post, int mode) {
     }
     stop_navigation();
     navigation_generation = ++next_generation;
+    navigation_timing.valid = true;
+    navigation_timing.navigation_start_ms = uptime_ms();
     navigation_mode = mode;
     strlcpy(navigation_url, url, sizeof navigation_url);
     loading = true;
     char what[256]; snprintf(what, sizeof what, "Loading %.240s", url); set_status(what);
     draw_toolbar(); win_update_rect(w, 0, 0, w->w, TB);
     if (has_prefix(url, "about:") || has_prefix(url, "file://")) {
+        navigation_timing.fetch_start_ms = uptime_ms();
+        navigation_timing.fetch_valid = true;
         struct fetched local = {0}; strlcpy(local.url, url, sizeof local.url);
         if (has_prefix(url, "file://") && !read_local(url, &local)) {
             strlcpy(navigation_response.error, local.err, sizeof navigation_response.error);
@@ -1024,6 +1038,10 @@ static void navigate(const char *url_in, const char *post, int mode) {
             navigation_response.body = local.body;
             navigation_response.body_len = local.len;
             snprintf(navigation_response.headers, sizeof navigation_response.headers, "Content-Type: %s\r\n", local.ctype);
+        }
+        if (!navigation_response.error[0]) {
+            navigation_timing.response_end_ms = uptime_ms();
+            navigation_timing.response_end_valid = true;
         }
         strlcpy(navigation_response.url, local.url, sizeof navigation_response.url);
         navigation_ready = true; return;
@@ -1035,6 +1053,8 @@ static void navigate(const char *url_in, const char *post, int mode) {
         .body = post, .body_len = post ? strlen(post) : 0, .user_navigation = true,
         .credentials = WEBNET_CREDENTIALS_INCLUDE
     };
+    navigation_timing.fetch_start_ms = uptime_ms();
+    navigation_timing.fetch_valid = true;
     navigation_id = webnet_submit(network, &rq, navigation_completed, NULL);
     if (!navigation_id) {
         strcpy(navigation_response.error, "request could not be started");

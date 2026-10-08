@@ -42,7 +42,7 @@ __attribute__((used, section(".limine_requests")))
 static volatile struct limine_executable_cmdline_request cmdline_req = {.id = LIMINE_EXECUTABLE_CMDLINE_REQUEST_ID, .revision = 0};
 
 __attribute__((used, section(".limine_requests")))
-static volatile struct limine_mp_request mp_req = {.id = LIMINE_MP_REQUEST_ID, .revision = 0, .flags = 0};
+static volatile struct limine_mp_request mp_req = {.id = LIMINE_MP_REQUEST_ID, .revision = 0, .flags = LIMINE_MP_REQUEST_X86_64_X2APIC};
 
 __attribute__((used, section(".limine_requests_end")))
 static volatile uint64_t requests_end[] = LIMINE_REQUESTS_END_MARKER;

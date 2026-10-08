@@ -2,11 +2,12 @@
  * and credentialed/opaque sources. Native anonymous Range derives document
  * origin in C and checks every response/preflight; it never follows redirects.
  * No page can pass a local path or an origin grant to the decoder.
- * MSE, DRM, live manifests, autoplay and non-1x playback are not advertised. */
+ * MSE uses the private packet-buffer bridge. DRM, native live manifest loading,
+ * autoplay and non-1x playback are not advertised. */
 const avmediaBridge = (() => {
     const native = host.avmedia, states = new WeakMap(), active = new Set();
     let timer = 0;
-    const mediaEvents = ['loadstart','loadedmetadata','loadeddata','canplay','canplaythrough','play','playing','pause','timeupdate','ended','error','emptied','seeking','seeked','volumechange','durationchange','abort'];
+    const mediaEvents = ['loadstart','loadedmetadata','loadeddata','canplay','canplaythrough','play','playing','pause','timeupdate','ended','error','emptied','seeking','seeked','volumechange','durationchange','abort','waiting','stalled','progress'];
     function event(node,type) { const e=new Event(type);e.isTrusted=true;dispatch(node,e); }
     function brand(node) {
         if (!node || (node.localName !== 'audio' && node.localName !== 'video') || node.namespaceURI !== 'http://www.w3.org/1999/xhtml') throw new TypeError('HTMLMediaElement receiver required');
@@ -51,7 +52,9 @@ const avmediaBridge = (() => {
                 let now;
                 try{now=native('state',node);}catch(e){active.delete(node);continue;}
                 if(s.currentSrc&&source(node)!==s.currentSrc){const resume=!now.paused;const p=load(node),intent=s.intent;if(resume)p.then(()=>{if(s.intent===intent)return node.play();}).catch(()=>{});else p.catch(()=>{});continue;}
-                if(now.error&&!s.error){s.error=new MediaError(3,now.error);event(node,'error');}
+                if(now.error&&!now.mseQuotaError&&!s.error){s.error=new MediaError(3,now.error);event(node,'error');}
+                if(s.generation!==generation)continue;
+                if(s.last&&s.last.waiting!==now.waiting){if(now.waiting)event(node,'waiting');else if(!now.paused)event(node,'playing');}
                 if(s.generation!==generation)continue;
                 if(s.last&&!s.last.ended&&now.ended){
                     const intent=s.intent;
@@ -75,6 +78,7 @@ const avmediaBridge = (() => {
         },40);
     }
     function reset(node,s){
+        mseBridge.detach(node);
         if(s.controller)s.controller.abort();
         s.controller=null;s.generation=(s.generation+1)>>>0;s.intent++;s.seekIntent++;s.promise=null;s.error=null;s.network=0;s.currentSrc='';s.last=null;
         native('reset',node,s.generation);active.delete(node);
@@ -89,7 +93,18 @@ const avmediaBridge = (() => {
                 /* Install the load Promise before submitting a native child. */
                 await Promise.resolve();
                 if(!current(node,s,generation,url)||controller.signal.aborted)throw abortError();
-                if(native('range',node,url)) {
+                const mediaSource=objectURLBridge.mediaSource(url),blob=objectURLBridge.blob(url);
+                if(mediaSource) {
+                    mseBridge.attach(mediaSource,node,generation);
+                    for(;;){
+                        if(!current(node,s,generation,url)||controller.signal.aborted)throw abortError();
+                        const now=native('state',node);if(now.error&&!now.mseQuotaError)throw new Error(now.error);
+                        if(now.readyState>=2)break;
+                        await new Promise(resolve=>setTimeout(resolve,20));
+                    }
+                } else if(blob) {
+                    if(!native('load',node,blobBridge.bytes(blob),generation))throw new Error(native('state',node).error||'Unsupported Blob media');
+                } else if(native('range',node,url)) {
                     if(!native('loadURL',node,url,generation))throw new Error(native('state',node).error||'Unsupported Range media input');
                     const deadline=host.now()+30000;
                     for(;;) {
@@ -139,7 +154,11 @@ const avmediaBridge = (() => {
         get networkState(){return get(this).network;}
         get readyState(){return snapshot(this).readyState;}
         get error(){return get(this).error;}
-        get duration(){return snapshot(this).duration;}
+        get duration(){return mseBridge.attached(this)?mseBridge.duration(this):snapshot(this).duration;}
+        get buffered(){get(this);return mseBridge.attached(this)?mseBridge.nodeRanges(this,false):mseBridge.timeRanges();}
+        get seekable(){get(this);return mseBridge.attached(this)?mseBridge.nodeRanges(this,true):mseBridge.timeRanges();}
+        get audioTracks(){get(this);return mseBridge.nodeTracks(this,'audio');}
+        get videoTracks(){get(this);return mseBridge.nodeTracks(this,'video');}
         get paused(){return snapshot(this).paused;}
         get ended(){return snapshot(this).ended;}
         get seeking(){return snapshot(this).seeking;}

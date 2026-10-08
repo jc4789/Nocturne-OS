@@ -73,6 +73,7 @@ $(BUILD)/lexbor/%.o: %.c
 # Nocturne IOを用いる限定decoder。FFmpegのCLI・OS・network層は取り込まない。
 include third_party/ffmpeg/sources.mk
 FF_OBJ := $(patsubst %.c,$(BUILD)/ffmpeg/%.o,$(FFMPEG_C))
+$(FF_OBJ): third_party/ffmpeg/config.h third_party/ffmpeg/config_components.h third_party/ffmpeg/libavutil/avconfig.h
 FFFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg -Ithird_party/ffmpeg/compat/stdbit \
            $(filter-out -W%,$(UCFLAGS)) -w -DHAVE_AV_CONFIG_H -D_ISOC11_SOURCE -D_FILE_OFFSET_BITS=64 \
            -D_LARGEFILE_SOURCE -std=c17 -Oz -fno-math-errno -fno-signed-zeros -mstack-alignment=16
@@ -81,6 +82,7 @@ $(BUILD)/ffmpeg/%.o: %.c
 	@echo "  FF   $<"
 	@$(CC) $(FFFLAGS) -c $< -o $@
 $(BUILD)/u/user/libc/media.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
+$(BUILD)/u/user/libc/media_mse.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
 
 # プロセス単位の生存メディア割当。全heap/RSSの上限ではない。
 # FF原文は維持し、allocator/entropyの3接点だけをprivate familyへ接続。

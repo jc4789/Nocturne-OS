@@ -1,32 +1,34 @@
 /* User Timing: real document-relative timestamps, stored entries, and queued
  * observer delivery. Include AFTER js_clone.js; metadata uses its private
- * structured serializer, not a replaceable page function. Resource/navigation/
- * paint/event timing are not implemented or advertised by this module. */
+ * structured serializer, not a replaceable page function. Legacy navigation
+ * timing exposes recorded host/parser/event milestones. Unobserved transport
+ * milestones stay 0; navigation entries/resource/paint/event are not advertised. */
 const performanceBridge = (() => {
     const call=Reflect.apply,define=Object.defineProperty,create=Object.create;
     const StringType=String,TypeErr=TypeError,DomError=DOMException;
-    const finite=Number.isFinite,now=host.now,dateNow=Date.now;
+    const finite=Number.isFinite,floor=Math.floor,now=host.now,navigationTime=host.timing,dateNow=Date.now;
     const serialize=cloneData.serialize,deserialize=cloneData.deserialize;
-    const entries=new WeakMap(),observers=new WeakMap(),lists=new WeakMap(),performances=new WeakMap();
+    const entries=new WeakMap(),observers=new WeakMap(),lists=new WeakMap(),performances=new WeakMap(),timings=new WeakMap();
     const getWeak=WeakMap.prototype.get,setWeak=WeakMap.prototype.set;
     const get=(map,value)=>call(getWeak,map,[value]),put=(map,key,value)=>call(setWeak,map,[key,value]);
     // These interfaces have no [Serializable] annotation. Private slots, not
     // mutable prototypes or instanceof hooks, identify even nested metadata.
     cloneData.registerUncloneable(value=>get(entries,value)!==undefined||get(observers,value)!==undefined||
-        get(lists,value)!==undefined||get(performances,value)!==undefined);
+        get(lists,value)!==undefined||get(performances,value)!==undefined||get(timings,value)!==undefined);
     const push=Array.prototype.push,slice=Array.prototype.slice,sort=Array.prototype.sort;
     const append=(a,x)=>call(push,a,[x]),copy=a=>call(slice,a,[]);
     const active=new Set(),setAdd=Set.prototype.add,setDelete=Set.prototype.delete;
     const eachSet=Set.prototype.forEach;
     const activeList=()=>{const a=[];call(eachSet,active,[x=>append(a,x)]);return a;};
     const token={},supported=Object.freeze(['mark','measure']);
-    const reserved=new Set(('navigationStart unloadEventStart unloadEventEnd redirectStart redirectEnd '+
+    const timingNames=('navigationStart unloadEventStart unloadEventEnd redirectStart redirectEnd '+
         'fetchStart domainLookupStart domainLookupEnd connectStart connectEnd secureConnectionStart '+
         'requestStart responseStart responseEnd domLoading domInteractive domContentLoadedEventStart '+
-        'domContentLoadedEventEnd domComplete loadEventStart loadEventEnd').split(' '));
+        'domContentLoadedEventEnd domComplete loadEventStart loadEventEnd').split(' ');
+    const reserved=new Set(timingNames);
     const setHas=Set.prototype.has;
     let buffer=[],sequence=0,notificationPending=false;
-    // The native monotonic epoch is document initialization, not Unix epoch.
+    // Native monotonic epoch is host navigation start, or explicit document init.
     // Pair it once with the real OS wall clock; never rebase it after wall jumps.
     const before=now(),wall=dateNow(),after=now();
     const origin=wall-(before+after)/2;
@@ -65,10 +67,10 @@ const performanceBridge = (() => {
     function timestamp(mark){
         if(typeof mark==='number'){if(mark<0)throw new TypeErr('A timestamp cannot be negative');return mark;}
         if(call(setHas,reserved,[mark])){
-            if(mark==='navigationStart')return 0;
-            // No native navigation milestones have been recorded. Do not turn
-            // these unavailable measurements into successful zero timestamps.
-            throw new DomError('Navigation timestamp has not been recorded','InvalidAccessError');
+            const measured=navigationTime(mark);
+            // Null, not a timestamp of 0, means native code never observed it.
+            if(measured===null)throw new DomError('Navigation timestamp has not been recorded','InvalidAccessError');
+            return measured;
         }
         for(let i=buffer.length-1;i>=0;i--){const s=get(entries,buffer[i]);if(s.entryType==='mark'&&s.name===mark)return s.startTime;}
         throw new DomError('The named performance mark does not exist','SyntaxError');
@@ -115,10 +117,30 @@ const performanceBridge = (() => {
         for(let i=0;i<buffer.length;i++){const e=buffer[i],s=get(entries,e);if(s.entryType!==type||name!==undefined&&s.name!==name)append(retained,e);}
         buffer=retained;
     }
+    class PerformanceTiming {
+        constructor(){throw new TypeErr('Illegal constructor');}
+        toJSON(){
+            slot(timings,this);const result={};
+            for(let i=0;i<timingNames.length;i++){
+                const name=timingNames[i],measured=navigationTime(name);
+                result[name]=measured===null?0:floor(origin+measured);
+            }
+            return result;
+        }
+    }
+    for(let i=0;i<timingNames.length;i++){
+        const name=timingNames[i];
+        define(PerformanceTiming.prototype,name,{enumerable:true,configurable:true,get(){
+            slot(timings,this);const measured=navigationTime(name);
+            return measured===null?0:floor(origin+measured);
+        }});
+    }
+    const legacyTiming=create(PerformanceTiming.prototype);put(timings,legacyTiming,true);
     class Performance extends EventTarget {
         constructor(key){super();if(key!==token)throw new TypeErr('Illegal constructor');put(performances,this,true);}
         now(){slot(performances,this);return now();}
         get timeOrigin(){slot(performances,this);return origin;}
+        get timing(){slot(performances,this);return legacyTiming;}
         toJSON(){slot(performances,this);return {timeOrigin:origin};}
         mark(name,options={}){
             slot(performances,this);if(!arguments.length)throw new TypeErr('A mark name is required');
@@ -208,7 +230,7 @@ const performanceBridge = (() => {
             try{call(s.callback,observer,[list,observer,options]);}catch(e){report(e);}
         }
     }
-    for(const ctor of [Performance,PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceObserver,PerformanceObserverEntryList]){
+    for(const ctor of [Performance,PerformanceTiming,PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceObserver,PerformanceObserverEntryList]){
         define(ctor.prototype,Symbol.toStringTag,{value:ctor.name,configurable:true});
         for(const key of Object.getOwnPropertyNames(ctor.prototype))if(key!=='constructor'){
             const d=Object.getOwnPropertyDescriptor(ctor.prototype,key);d.enumerable=true;define(ctor.prototype,key,d);
@@ -220,6 +242,6 @@ const performanceBridge = (() => {
     define(PerformanceObserverEntryList.prototype.getEntriesByName,'length',{value:1,configurable:true});
     const supportedDescriptor=Object.getOwnPropertyDescriptor(PerformanceObserver,'supportedEntryTypes');
     supportedDescriptor.enumerable=true;define(PerformanceObserver,'supportedEntryTypes',supportedDescriptor);
-    Object.assign(globalThis,{Performance,PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceObserver,PerformanceObserverEntryList,performance:new Performance(token)});
+    Object.assign(globalThis,{Performance,PerformanceTiming,PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceObserver,PerformanceObserverEntryList,performance:new Performance(token)});
     return {};
 })();

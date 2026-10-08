@@ -9,8 +9,8 @@ async function runAvmediaCases() {
     check(v instanceof HTMLVideoElement&&v instanceof HTMLMediaElement,'prototype');
     check(new Audio() instanceof HTMLAudioElement,'Audio constructor');
     check(v.canPlayType('video/mp4; codecs="avc1.42e01e, mp4a.40.2"')==='probably','real codecs');
-    check(v.canPlayType('video/webm; codecs=vp8')==='','unsupported codec');
-    check(!('MediaSource' in globalThis)&&!('requestMediaKeySystemAccess' in navigator),'no fake MSE DRM');
+    check(v.canPlayType('video/webm; codecs=vp8')==='probably','native VP8 codec');
+    check(typeof MediaSource==='function'&&typeof MediaSource.isTypeSupported==='function'&&!('requestMediaKeySystemAccess' in navigator),'native MSE, no DRM');
     let throws=false;try{HTMLMediaElement.prototype.canPlayType.call({localName:'video',namespaceURI:'http://www.w3.org/1999/xhtml'},'video/mp4');}catch(e){throws=true;}
     check(throws,'native brand');
     const pending=v.play();v.pause();

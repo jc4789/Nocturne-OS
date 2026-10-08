@@ -132,7 +132,7 @@ static NORETURN void worker_main(void *argument) {
         for (;;) hlt();
     }
     write_cr3(kernel_pml4);
-    if (!lapic_worker_init()) {
+    if (!lapic_worker_init() || lapic_current_id() != w->apic_id) {
         __atomic_store_n(&w->failed, 1, __ATOMIC_RELEASE);
         for (;;) hlt();
     }
@@ -186,8 +186,8 @@ void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context) {
     struct fpu_state saved_fpu;
     fpu_save(&saved_fpu);
     fpu_reset();
-    unsigned participants = cpu_worker_count() + 1;
-    if (participants == 1 || nested || count < participants ||
+    unsigned participants = (unsigned)MIN(count, (size_t)cpu_worker_count() + 1);
+    if (participants == 1 || nested ||
         (uint64_t)fn < 0xFFFF800000000000ULL ||
         (context && (uint64_t)context < 0xFFFF800000000000ULL)) {
         for (size_t i = 0; i < count; i++) fn(i, context);
@@ -202,7 +202,7 @@ void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context) {
     uint64_t epoch = ++next_epoch;
     unsigned rank = 1;
     /* BSP のみが descriptor を変更し、前 job 全員の join 後にだけ再利用する。 */
-    for (unsigned i = 1; i < slots; i++) {
+    for (unsigned i = 1; i < slots && rank < participants; i++) {
         struct cpu_worker *w = &workers[i];
         if (!w->enabled) continue;
         w->fn = fn;
@@ -220,7 +220,8 @@ void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context) {
     uint64_t since = rdtsc(), spins = 0;
     for (unsigned i = 1; i < slots; i++) {
         struct cpu_worker *w = &workers[i];
-        if (!w->enabled) continue;
+        /* 少量jobでは未投入APがある。旧epochを新jobのjoinに混ぜない。 */
+        if (!w->enabled || __atomic_load_n(&w->epoch, __ATOMIC_ACQUIRE) != epoch) continue;
         while (__atomic_load_n(&w->done, __ATOMIC_ACQUIRE) != epoch) {
             if (__atomic_load_n(&w->failed, __ATOMIC_ACQUIRE))
                 panic("smp: worker %u fault %lu rip=%p addr=%p err=%lx; context retained", i,
@@ -320,6 +321,10 @@ static void selftest(void) {
                 for (size_t i = counts[c]; i < ARRAY_SIZE(p.value); i++)
                     if (p.value[i] || p.sse[i][0] || p.sse[i][1] || p.avx_ok[i])
                         panic("smp: job wrote outside count=%lu", counts[c]);
+                uint64_t used = 0;
+                for (size_t i = 0; i < counts[c]; i++) used |= 1ULL << p.cpu[i];
+                if ((unsigned)__builtin_popcountll(used) != MIN(counts[c], (size_t)cpu_worker_count() + 1))
+                    panic("smp: partial job CPU count mismatch count=%lu mask=%lx", counts[c], used);
             }
         }
         kprintf("smp: stress PASS rounds=32 boundary-counts=7 jobs=%lu max_job_us=%lu\n", jobs, cpu_max_job_us());
@@ -334,8 +339,9 @@ static void selftest(void) {
 void smp_init(struct limine_mp_response *response) {
     if (response && response->cpu_count) detected = (unsigned)MIN(response->cpu_count, 0xFFFFFFFFULL);
     if (!response || cmdline_has("nosmp") || !lapic_present() ||
-        (response->flags & LIMINE_MP_RESPONSE_X86_64_X2APIC)) {
-        kprintf("smp: single CPU fallback (%s)\n", cmdline_has("nosmp") ? "nosmp" : "MP/xAPIC unavailable");
+        ((response->flags & LIMINE_MP_RESPONSE_X86_64_X2APIC) != 0) != lapic_x2apic() ||
+        response->bsp_lapic_id != lapic_current_id()) {
+        kprintf("smp: single CPU fallback (%s)\n", cmdline_has("nosmp") ? "nosmp" : "MP/APIC unavailable or mode/ID mismatch");
         selftest();
         return;
     }
@@ -349,7 +355,11 @@ void smp_init(struct limine_mp_response *response) {
     if (have_pat) bsp_pat = rdmsr(0x277);
     for (uint64_t i = 0; i < response->cpu_count && slots < CPU_MAX_COUNT; i++) {
         struct limine_mp_info *info = response->cpus[i];
-        if (!info || info->lapic_id == bsp_apic_id || info->lapic_id > 255) continue;
+        if (!info || info->lapic_id == bsp_apic_id || info->lapic_id == UINT32_MAX ||
+            (!lapic_x2apic() && info->lapic_id >= 255)) continue;
+        bool duplicate = false;
+        for (unsigned j = 1; j < slots; j++) if (workers[j].apic_id == info->lapic_id) duplicate = true;
+        if (duplicate) continue;
         struct cpu_worker *w = &workers[slots];
         w->index = slots++;
         w->apic_id = info->lapic_id;

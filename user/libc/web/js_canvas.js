@@ -3,23 +3,112 @@
 const canvasBridge = (() => {
     'use strict';
     const define=Object.defineProperty, create=Object.create, number=Number, string=elementURL.string;
-    const contexts=new WeakMap(), states=new WeakMap(), images=new WeakMap();
+    const contexts=new WeakMap(), states=new WeakMap(), images=new WeakMap(), metrics=new WeakMap(), paths=new WeakMap();
     const Float64=Float64Array, Bytes=Uint8ClampedArray, finite=Number.isFinite;
     const abs=Math.abs,ceil=Math.ceil,floor=Math.floor,cos=Math.cos,sin=Math.sin,atan2=Math.atan2;
-    const native=host.canvas;
+    const native=host.canvas, defer=setTimeout, apply=Reflect.apply, blobFrom=blobBridge.fromBytes;
     class HTMLCanvasElement extends HTMLElement {constructor(){throw new TypeError('Illegal HTMLCanvasElement constructor');}}
     class CanvasRenderingContext2D {constructor(){throw new TypeError('Illegal CanvasRenderingContext2D constructor');}}
-    function defaults(s){s.fill='#000000';s.stroke='#000000';s.fillColor=0xff000000;s.strokeColor=0xff000000;s.alpha=1;s.lineWidth=1;s.smoothing=true;s.matrix=[1,0,0,1,0,0];s.path=[];s.first=null;s.last=null;s.stack=[];}
+    class TextMetrics {constructor(){throw new TypeError('Illegal TextMetrics constructor');}}
+    function defaults(s){s.fill='#000000';s.stroke='#000000';s.fillColor=0xff000000;s.strokeColor=0xff000000;s.alpha=1;s.lineWidth=1;s.smoothing=true;s.font='10px sans-serif';s.fontSize=10;s.fontStyle=0;s.align='start';s.baseline='alphabetic';s.direction='inherit';s.matrix=[1,0,0,1,0,0];s.path=[];s.first=null;s.last=null;s.subpathCount=0;s.stack=[];}
     function state(ctx){const s=states.get(ctx);if(!s)throw new TypeError('Illegal CanvasRenderingContext2D receiver');const v=native(s.canvas,'version');if(v!==s.version){defaults(s);s.version=v;}return s;}
+    function pathState(value){const s=paths.get(value);return s||state(value);}
+    function emptyPath(){return {matrix:[1,0,0,1,0,0],path:[],first:null,last:null,subpathCount:0};}
+    function copyPath(s){return {matrix:[1,0,0,1,0,0],path:s.path.slice(),first:s.first&&s.first.slice(),last:s.last&&s.last.slice(),subpathCount:s.subpathCount};}
     function namedError(name,message){return new DOMException(message,name);}
     function args(values,count){if(values.length<count)throw new TypeError('Missing Canvas arguments');return values.slice(0,count).map(number);}
     function valid(values){return values.every(finite);}
     function point(s,x,y){const m=s.matrix;return [m[0]*x+m[2]*y+m[4],m[1]*x+m[3]*y+m[5]];}
     function color(s,stroke=false){const v=stroke?s.strokeColor:s.fillColor;return ((v&0xffffff)|((floor((v>>>24)*s.alpha+0.5)&255)<<24))>>>0;}
     function pathBuffer(points){if(points.length>512)throw new RangeError('Canvas path limit');return new Float64(points).buffer;}
-    function append(s,p,move=false){if(s.path.length+(move&&s.path.length?4:2)>512)throw new RangeError('Canvas path limit');if(move&&s.path.length)s.path.push(NaN,NaN);s.path.push(p[0],p[1]);s.last=p;if(move||!s.first)s.first=p;}
-    function resetPath(s){s.path=[];s.first=null;s.last=null;}
+    function append(s,p,move=false){if(s.path.length+(move&&s.path.length?4:2)>512)throw new RangeError('Canvas path limit');if(move&&s.path.length)s.path.push(NaN,NaN);s.path.push(p[0],p[1]);s.last=p;if(move||!s.first){s.first=p;s.subpathCount=1;}else s.subpathCount++;}
+    function resetPath(s){s.path=[];s.first=null;s.last=null;s.subpathCount=0;}
+    function capacity(s,points){if(s.path.length+points*2>512)throw new RangeError('Canvas path limit');}
+    function matrixDictionary(value){
+        if(value==null)return [1,0,0,1,0,0];
+        if(typeof value!=='object'&&typeof value!=='function')throw new TypeError('Expected matrix dictionary');
+        const out=[];
+        for(const [short,long,fallback] of [['a','m11',1],['b','m12',0],['c','m21',0],['d','m22',1],['e','m41',0],['f','m42',0]]){
+            const a=value[short],b=value[long],x=a===undefined?undefined:number(a),y=b===undefined?undefined:number(b);
+            if(x!==undefined&&y!==undefined&&x!==y&&!(Number.isNaN(x)&&Number.isNaN(y)))throw new TypeError('Conflicting matrix aliases');
+            out.push(x===undefined?(y===undefined?fallback:y):x);
+        }
+        return out;
+    }
+    function transformedPath(s,path){const p=paths.get(path);if(!p)throw new TypeError('Expected Path2D');const out=[];for(let i=0;i<p.path.length;i+=2)out.push(...point(s,p.path[i],p.path[i+1]));return out;}
+    function ellipsePath(s,x,y,rx,ry,rotation,start,end,ccw){
+        const tau=Math.PI*2;let delta=end-start;
+        if(!ccw){if(delta>=tau)delta=tau;else delta=((delta%tau)+tau)%tau;}
+        else{if(-delta>=tau)delta=-tau;else delta=-(((-delta%tau)+tau)%tau);}
+        const steps=Math.max(1,ceil(abs(delta)/tau*48));capacity(s,steps+1);
+        const cr=cos(rotation),sr=sin(rotation);
+        for(let i=0;i<=steps;i++){const a=start+delta*i/steps,xx=rx*cos(a),yy=ry*sin(a);append(s,point(s,x+cr*xx-sr*yy,y+sr*xx+cr*yy),!s.last);}
+    }
+    const pathMethods={
+        moveTo(...v){pathState(this);v=args(v,2);const s=pathState(this);if(valid(v))append(s,point(s,...v),true);},
+        lineTo(...v){pathState(this);v=args(v,2);const s=pathState(this);if(valid(v))append(s,point(s,...v),!s.last);},
+        closePath(){const s=pathState(this);if(s.first&&s.last&&s.subpathCount>1){capacity(s,3);append(s,s.first);/* A following line begins at the closed subpath's first point. */append(s,s.first,true);}},
+        rect(...v){pathState(this);v=args(v,4);const s=pathState(this);if(!valid(v))return;capacity(s,8);const [x,y,w,h]=v;append(s,point(s,x,y),true);append(s,point(s,x+w,y));append(s,point(s,x+w,y+h));append(s,point(s,x,y+h));append(s,point(s,x,y));append(s,point(s,x,y),true);},
+        quadraticCurveTo(...v){pathState(this);v=args(v,4);const s=pathState(this);if(!valid(v))return;capacity(s,18);const c=point(s,v[0],v[1]),b=point(s,v[2],v[3]);if(!s.last)append(s,c,true);const a=s.last;for(let i=1;i<=16;i++){const t=i/16,u=1-t;append(s,[u*u*a[0]+2*u*t*c[0]+t*t*b[0],u*u*a[1]+2*u*t*c[1]+t*t*b[1]]);}},
+        bezierCurveTo(...v){pathState(this);v=args(v,6);const s=pathState(this);if(!valid(v))return;capacity(s,26);const b=point(s,v[0],v[1]),c=point(s,v[2],v[3]),d=point(s,v[4],v[5]);if(!s.last)append(s,b,true);const a=s.last;for(let i=1;i<=24;i++){const t=i/24,u=1-t;append(s,[u*u*u*a[0]+3*u*u*t*b[0]+3*u*t*t*c[0]+t*t*t*d[0],u*u*u*a[1]+3*u*u*t*b[1]+3*u*t*t*c[1]+t*t*t*d[1]]);}},
+        arc(...values){pathState(this);const v=args(values,5),s=pathState(this);if(!valid(v))return;if(v[2]<0)throw namedError('IndexSizeError','Negative arc radius');ellipsePath(s,v[0],v[1],v[2],v[2],0,v[3],v[4],!!values[5]);},
+        ellipse(...values){pathState(this);const v=args(values,7),s=pathState(this);if(!valid(v))return;if(v[2]<0||v[3]<0)throw namedError('IndexSizeError','Negative ellipse radius');ellipsePath(s,...v,!!values[7]);},
+        arcTo(...values){
+            pathState(this);const v=args(values,5),s=pathState(this);if(!valid(v))return;const [x1,y1,x2,y2,r]=v;if(r<0)throw namedError('IndexSizeError','Negative arc radius');
+            const p1=point(s,x1,y1);if(!s.last){append(s,p1,true);return;}
+            const m=s.matrix,det=m[0]*m[3]-m[1]*m[2];if(!det||!finite(det)){append(s,p1);return;}
+            const dx=s.last[0]-m[4],dy=s.last[1]-m[5],x0=(dx*m[3]-dy*m[2])/det,y0=(dy*m[0]-dx*m[1])/det;
+            let ax=x0-x1,ay=y0-y1,bx=x2-x1,by=y2-y1;const la=Math.hypot(ax,ay),lb=Math.hypot(bx,by),cross=ax*by-ay*bx;
+            if(!r||!la||!lb||!cross||!valid([la,lb,cross])){append(s,p1);return;}
+            ax/=la;ay/=la;bx/=lb;by/=lb;const dot=Math.max(-1,Math.min(1,ax*bx+ay*by)),angle=Math.acos(dot),distance=r/Math.tan(angle/2),mid=Math.hypot(ax+bx,ay+by);
+            const cx=x1+(ax+bx)/mid*r/Math.sin(angle/2),cy=y1+(ay+by)/mid*r/Math.sin(angle/2),tx=x1+ax*distance,ty=y1+ay*distance,ux=x1+bx*distance,uy=y1+by*distance;
+            if(!valid([cx,cy,tx,ty,ux,uy])){append(s,p1);return;}capacity(s,51);append(s,point(s,tx,ty));ellipsePath(s,cx,cy,r,r,0,atan2(ty-cy,tx-cx),atan2(uy-cy,ux-cx),cross>0);
+        }
+    };
+    /* SVG endpoint-arc conversion uses the SVG radii correction before
+       generating the same real points as ellipse(). */
+    function svgArc(s,rx,ry,degrees,large,sweep,x,y){
+        const a=s.last;if(!a){append(s,[x,y],true);return;}rx=abs(rx);ry=abs(ry);
+        if(!rx||!ry){append(s,[x,y]);return;}if(a[0]===x&&a[1]===y)return;
+        const rotation=degrees*Math.PI/180,c=cos(rotation),t=sin(rotation),dx=(a[0]-x)/2,dy=(a[1]-y)/2,xp=c*dx+t*dy,yp=-t*dx+c*dy;
+        const scale=xp*xp/(rx*rx)+yp*yp/(ry*ry);if(scale>1){const f=Math.sqrt(scale);rx*=f;ry*=f;}
+        const numerator=rx*rx*ry*ry-rx*rx*yp*yp-ry*ry*xp*xp,denominator=rx*rx*yp*yp+ry*ry*xp*xp;
+        const f=(large===sweep?-1:1)*Math.sqrt(Math.max(0,numerator/denominator)),cxp=f*rx*yp/ry,cyp=-f*ry*xp/rx,cx=c*cxp-t*cyp+(a[0]+x)/2,cy=t*cxp+c*cyp+(a[1]+y)/2;
+        const start=atan2((yp-cyp)/ry,(xp-cxp)/rx),end=atan2((-yp-cyp)/ry,(-xp-cxp)/rx);
+        if(valid([rx,ry,cx,cy,start,end])){ellipsePath(s,cx,cy,rx,ry,rotation,start,end,!sweep);s.path[s.path.length-2]=x;s.path[s.path.length-1]=y;s.last=[x,y];}
+    }
+    function svgPath(receiver,text){
+        if(text.length>16384)throw new RangeError('SVG path source limit');const s=paths.get(receiver);let at=0,command='',previous='',cx=0,cy=0,first=null,control=null;
+        const skip=()=>{while(at<text.length&&/[\t\n\f\r ,]/.test(text[at]))at++;};
+        const take=(flag=false)=>{skip();const m=(flag?/^[01]/:/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/).exec(text.slice(at));if(!m)return null;at+=m[0].length;const n=number(m[0]);return finite(n)?n:null;};
+        while(at<text.length){skip();if(at===text.length)break;if(/[A-Za-z]/.test(text[at]))command=text[at++];
+            const upper=command.toUpperCase(),relative=command!==upper,arity={M:2,L:2,H:1,V:1,C:6,S:4,Q:4,T:2,A:7,Z:0}[upper];
+            if(arity===undefined||(!first&&upper!=='M'))break;
+            if(upper==='Z'){apply(pathMethods.closePath,receiver,[]);cx=first[0];cy=first[1];control=null;previous=upper;command='';continue;}
+            const values=[];for(let i=0;i<arity;i++){const n=take(upper==='A'&&(i===3||i===4));if(n===null)break;values.push(n);}if(values.length!==arity)break;
+            const baseX=relative?cx:0,baseY=relative?cy:0,xy=(i)=>[values[i]+baseX,values[i+1]+baseY];let nextControl=null;
+            if(upper==='M'||upper==='L'){[cx,cy]=xy(0);apply(pathMethods[upper==='M'?'moveTo':'lineTo'],receiver,[cx,cy]);if(upper==='M'){first=[cx,cy];command=relative?'l':'L';}}
+            else if(upper==='H'){cx=values[0]+baseX;apply(pathMethods.lineTo,receiver,[cx,cy]);}
+            else if(upper==='V'){cy=values[0]+baseY;apply(pathMethods.lineTo,receiver,[cx,cy]);}
+            else if(upper==='C'){const b=xy(0),c=xy(2),d=xy(4);apply(pathMethods.bezierCurveTo,receiver,[...b,...c,...d]);[cx,cy]=d;nextControl=c;}
+            else if(upper==='S'){const b=control&&(previous==='C'||previous==='S')?[2*cx-control[0],2*cy-control[1]]:[cx,cy],c=xy(0),d=xy(2);apply(pathMethods.bezierCurveTo,receiver,[...b,...c,...d]);[cx,cy]=d;nextControl=c;}
+            else if(upper==='Q'){const b=xy(0),d=xy(2);apply(pathMethods.quadraticCurveTo,receiver,[...b,...d]);[cx,cy]=d;nextControl=b;}
+            else if(upper==='T'){const b=control&&(previous==='Q'||previous==='T')?[2*cx-control[0],2*cy-control[1]]:[cx,cy],d=xy(0);apply(pathMethods.quadraticCurveTo,receiver,[...b,...d]);[cx,cy]=d;nextControl=b;}
+            else if(upper==='A'){const d=xy(5);svgArc(s,...values.slice(0,5),...d);[cx,cy]=d;}
+            previous=upper;control=nextControl;
+        }
+        if(s.last)append(s,s.last,true);
+    }
+    class Path2D {
+        constructor(value){const source=paths.get(value);paths.set(this,source?copyPath(source):emptyPath());if(value!==undefined&&!source)svgPath(this,string(value));}
+        addPath(path,transform){const s=paths.get(this),source=paths.get(path);if(!s||!source)throw new TypeError('Expected Path2D receiver and path');const matrix=matrixDictionary(transform);if(!valid(matrix)||!source.path.length)return;
+            const copy=transformedPath({matrix},path);capacity(s,copy.length/2+(s.path.length?1:0)+2);if(s.path.length)s.path.push(NaN,NaN);s.path.push(...copy);
+            if(source.first)s.first=point({matrix},...source.first);if(source.last){s.last=point({matrix},...source.last);append(s,s.last,true);}}
+    }
     function multiply(s,m){const a=s.matrix;s.matrix=[a[0]*m[0]+a[2]*m[1],a[1]*m[0]+a[3]*m[1],a[0]*m[2]+a[2]*m[3],a[1]*m[2]+a[3]*m[3],a[0]*m[4]+a[2]*m[5]+a[4],a[1]*m[4]+a[3]*m[5]+a[5]];}
+    function alignment(s){if(s.align==='center')return 0.5;if(s.align==='right')return 1;if(s.align==='left')return 0;const rtl=s.direction==='rtl'||(s.direction==='inherit'&&native(s.canvas,'rtl'));return s.align==='start'?(rtl?1:0):(rtl?0:1);}
+    const baselines=['alphabetic','top','hanging','middle','ideographic','bottom'];
+    function textValue(value){return string(value).replace(/[\t\n\f\r]/g,' ');}
     function rect(ctx,op,v){const s=state(ctx);v=args(v,4);if(!valid(v)||!v[2]||!v[3])return;const m=s.matrix;
         if(m[0]===1&&m[1]===0&&m[2]===0&&m[3]===1)native(s.canvas,op,v[0]+m[4],v[1]+m[5],v[2],v[3],color(s));
         else {const p=[point(s,v[0],v[1]),point(s,v[0]+v[2],v[1]),point(s,v[0]+v[2],v[1]+v[3]),point(s,v[0],v[1]+v[3])];native(s.canvas,'poly',pathBuffer(p.flat()),color(s),false,op==='clear');}}
@@ -32,37 +121,38 @@ const canvasBridge = (() => {
         if(!native(this,'context'))return null;
         ctx=create(CanvasRenderingContext2D.prototype);const s={canvas:this,version:native(this,'version')};defaults(s);states.set(ctx,s);contexts.set(this,ctx);return ctx;
     }});
+    define(HTMLCanvasElement.prototype,'toDataURL',{configurable:true,writable:true,value:function(type='image/png',quality){htmlElementBrand(this,'canvas');string(type);const result=native(this,'dataURL');if(result===false)throw namedError('SecurityError','Canvas is not origin-clean');return result;}});
+    define(HTMLCanvasElement.prototype,'toBlob',{configurable:true,writable:true,value:function(callback,type='image/png',quality){htmlElementBrand(this,'canvas');if(typeof callback!=='function')throw new TypeError('toBlob requires a callback');string(type);const bytes=native(this,'png');if(bytes===false)throw namedError('SecurityError','Canvas is not origin-clean');defer(()=>{let blob=null;if(bytes!==null){try{blob=blobFrom(bytes,'image/png');}catch(e){/* A failed serialization/Blob allocation reports null, never a fake Blob. */}}apply(callback,undefined,[blob]);},0);}});
     define(CanvasRenderingContext2D.prototype,'canvas',{enumerable:true,configurable:true,get(){return state(this).canvas;}});
     for(const [property,key,colorkey] of [['fillStyle','fill','fillColor'],['strokeStyle','stroke','strokeColor']])define(CanvasRenderingContext2D.prototype,property,{enumerable:true,configurable:true,
         get(){return state(this)[key];},set(value){const s=state(this),text=string(value),c=native(s.canvas,'color',text);if(c!==null){s[key]=text;s[colorkey]=c>>>0;}}});
     define(CanvasRenderingContext2D.prototype,'globalAlpha',{enumerable:true,configurable:true,get(){return state(this).alpha;},set(value){const s=state(this),v=number(value);if(finite(v)&&v>=0&&v<=1)s.alpha=v;}});
     define(CanvasRenderingContext2D.prototype,'lineWidth',{enumerable:true,configurable:true,get(){return state(this).lineWidth;},set(value){const s=state(this),v=number(value);if(finite(v)&&v>0)s.lineWidth=v;}});
     define(CanvasRenderingContext2D.prototype,'imageSmoothingEnabled',{enumerable:true,configurable:true,get(){return state(this).smoothing;},set(value){state(this).smoothing=!!value;}});
+    define(CanvasRenderingContext2D.prototype,'font',{enumerable:true,configurable:true,get(){return state(this).font;},set(value){state(this);const text=string(value),s=state(this),parsed=native(s.canvas,'font',text);if(parsed!==null){s.font=text;s.fontSize=parsed[0];s.fontStyle=parsed[1];}}});
+    for(const [property,key,allowed] of [['textAlign','align',['start','end','left','right','center']],['textBaseline','baseline',baselines],['direction','direction',['inherit','ltr','rtl']]])define(CanvasRenderingContext2D.prototype,property,{enumerable:true,configurable:true,get(){return state(this)[key];},set(value){state(this);const text=string(value),s=state(this);if(allowed.includes(text))s[key]=text;}});
     /* This subset implements source-over only; never reflect an unsupported
        compositing operator as though it changed the actual native drawing. */
     define(CanvasRenderingContext2D.prototype,'globalCompositeOperation',{enumerable:true,configurable:true,get(){state(this);return 'source-over';},set(value){state(this);string(value);}});
     const methods={
+        ...pathMethods,
         fillRect(...v){rect(this,'rect',v);},clearRect(...v){rect(this,'clear',v);},
         strokeRect(...v){const s=state(this);v=args(v,4);if(!valid(v))return;const [x,y,w,h]=v,p=[point(s,x,y),point(s,x+w,y),point(s,x+w,y+h),point(s,x,y+h),point(s,x,y)];native(s.canvas,'stroke',pathBuffer(p.flat()),color(s,true),s.lineWidth);},
-        save(){const s=state(this);if(s.stack.length===64)throw new RangeError('Canvas save stack limit');s.stack.push({fill:s.fill,stroke:s.stroke,fillColor:s.fillColor,strokeColor:s.strokeColor,alpha:s.alpha,lineWidth:s.lineWidth,smoothing:s.smoothing,matrix:s.matrix.slice()});},
-        restore(){const s=state(this),saved=s.stack.pop();if(saved)Object.assign(s,saved);},
+        save(){const s=state(this);if(s.stack.length===64)throw new RangeError('Canvas save stack limit');const saved={fill:s.fill,stroke:s.stroke,fillColor:s.fillColor,strokeColor:s.strokeColor,alpha:s.alpha,lineWidth:s.lineWidth,smoothing:s.smoothing,font:s.font,fontSize:s.fontSize,fontStyle:s.fontStyle,align:s.align,baseline:s.baseline,direction:s.direction,matrix:s.matrix.slice()};s.stack.push(saved);try{native(s.canvas,'save');}catch(e){s.stack.pop();throw e;}},
+        restore(){const s=state(this),saved=s.stack[s.stack.length-1];if(saved){native(s.canvas,'restore');s.stack.pop();Object.assign(s,saved);}},
         reset(){const s=state(this);native(s.canvas,'reset');s.version=native(s.canvas,'version');defaults(s);},
         beginPath(){resetPath(state(this));},
-        moveTo(...v){const s=state(this);v=args(v,2);if(valid(v))append(s,point(s,...v),true);},
-        lineTo(...v){const s=state(this);v=args(v,2);if(valid(v))append(s,point(s,...v),!s.last);},
-        closePath(){const s=state(this);if(s.first&&s.last)append(s,s.first);},
-        rect(...v){const s=state(this);v=args(v,4);if(!valid(v))return;const [x,y,w,h]=v;append(s,point(s,x,y),true);append(s,point(s,x+w,y));append(s,point(s,x+w,y+h));append(s,point(s,x,y+h));append(s,point(s,x,y));},
-        fill(rule='nonzero'){const s=state(this);rule=string(rule);if(rule!=='nonzero'&&rule!=='evenodd')throw new TypeError('Invalid fill rule');if(s.path.length)native(s.canvas,'poly',pathBuffer(s.path),color(s),rule==='evenodd',false);},
-        stroke(){const s=state(this);if(s.path.length)native(s.canvas,'stroke',pathBuffer(s.path),color(s,true),s.lineWidth);},
+        fill(pathOrRule='nonzero',rule='nonzero'){state(this);const external=paths.has(pathOrRule);rule=string(external?rule:pathOrRule);if(rule!=='nonzero'&&rule!=='evenodd')throw new TypeError('Invalid fill rule');const s=state(this),path=external?transformedPath(s,pathOrRule):s.path;if(path.length)native(s.canvas,'poly',pathBuffer(path),color(s),rule==='evenodd',false);},
+        clip(pathOrRule='nonzero',rule='nonzero'){state(this);const external=paths.has(pathOrRule);rule=string(external?rule:pathOrRule);if(rule!=='nonzero'&&rule!=='evenodd')throw new TypeError('Invalid fill rule');const s=state(this),path=external?transformedPath(s,pathOrRule):s.path;native(s.canvas,'clip',pathBuffer(path),0,rule==='evenodd');},
+        stroke(path){const s=state(this),points=path===undefined?s.path:transformedPath(s,path);if(points.length)native(s.canvas,'stroke',pathBuffer(points),color(s,true),s.lineWidth);},
+        measureText(value){state(this);if(!arguments.length)throw new TypeError('measureText requires text');const text=textValue(value),s=state(this),result=native(s.canvas,'measureText',text,s.fontSize,s.fontStyle,alignment(s),baselines.indexOf(s.baseline));const out=create(TextMetrics.prototype);metrics.set(out,result);return out;},
+        fillText(value,x,y,maxWidth){state(this);if(arguments.length<3)throw new TypeError('fillText requires text and coordinates');const text=textValue(value),v=[number(x),number(y)],width=arguments.length>3?number(maxWidth):Infinity;if(!valid(v)||!(width>0))return;const s=state(this);native(s.canvas,'fillText',text,s.fontSize,s.fontStyle,alignment(s),baselines.indexOf(s.baseline),new Float64([...v,width,...s.matrix]).buffer,color(s));},
         transform(...v){const s=state(this);v=args(v,6);if(valid(v))multiply(s,v);},
         setTransform(...v){const s=state(this);if(v.length===0){s.matrix=[1,0,0,1,0,0];return;}if(v.length===1&&typeof v[0]==='object'){const m=v[0];v=[m.a??1,m.b??0,m.c??0,m.d??1,m.e??0,m.f??0];}v=args(v,6);if(valid(v))s.matrix=v;},
         resetTransform(){state(this).matrix=[1,0,0,1,0,0];},
         translate(...v){const s=state(this);v=args(v,2);if(valid(v))multiply(s,[1,0,0,1,v[0],v[1]]);},
         scale(...v){const s=state(this);v=args(v,2);if(valid(v))multiply(s,[v[0],0,0,v[1],0,0]);},
         rotate(value){const s=state(this),v=number(value);if(finite(v)){const c=cos(v),t=sin(v);multiply(s,[c,t,-t,c,0,0]);}},
-        quadraticCurveTo(...v){const s=state(this);v=args(v,4);if(!valid(v))return;const c=point(s,v[0],v[1]),b=point(s,v[2],v[3]);if(!s.last)append(s,c,true);const a=s.last;for(let i=1;i<=16;i++){const t=i/16,u=1-t;append(s,[u*u*a[0]+2*u*t*c[0]+t*t*b[0],u*u*a[1]+2*u*t*c[1]+t*t*b[1]]);}},
-        bezierCurveTo(...v){const s=state(this);v=args(v,6);if(!valid(v))return;const b=point(s,v[0],v[1]),c=point(s,v[2],v[3]),d=point(s,v[4],v[5]);if(!s.last)append(s,b,true);const a=s.last;for(let i=1;i<=24;i++){const t=i/24,u=1-t;append(s,[u*u*u*a[0]+3*u*u*t*b[0]+3*u*t*t*c[0]+t*t*t*d[0],u*u*u*a[1]+3*u*u*t*b[1]+3*u*t*t*c[1]+t*t*t*d[1]]);}},
-        arc(x,y,r,start,end,counterclockwise=false){const s=state(this),v=args([x,y,r,start,end],5);if(!valid(v))return;[x,y,r,start,end]=v;if(r<0)throw namedError('IndexSizeError','Negative arc radius');const tau=Math.PI*2;let delta=end-start;if(!counterclockwise){if(delta>=tau)delta=tau;else delta=((delta%tau)+tau)%tau;}else{if(-delta>=tau)delta=-tau;else delta=-(((-delta%tau)+tau)%tau);}const steps=Math.max(1,ceil(abs(delta)/tau*48));for(let i=0;i<=steps;i++){const a=start+delta*i/steps;append(s,point(s,x+r*cos(a),y+r*sin(a)),!s.last);}},
         createImageData(a,b){state(this);const image=images.get(a);if(image)return new ImageData(image.w,image.h);return new ImageData(a,b);},
         drawImage(image,dx,dy,...rest){state(this);const count=arguments.length-1;if(count!==2&&count!==4&&count<8)throw new TypeError('drawImage requires 3, 5 or 9 arguments');
             const v=args([dx,dy,...rest],count>=8?8:count),s=state(this);
@@ -76,7 +166,8 @@ const canvasBridge = (() => {
             native(s.canvas,'put',dx,dy,w,h,data.buffer.slice(data.byteOffset,data.byteOffset+data.byteLength));},
         getContextAttributes(){state(this);return {alpha:true,colorSpace:'srgb',desynchronized:false,willReadFrequently:false};}
     };
-    for(const [name,value] of Object.entries(methods))define(CanvasRenderingContext2D.prototype,name,{value,writable:true,configurable:true});
+    for(const [name,value] of Object.entries(methods))define(CanvasRenderingContext2D.prototype,name,{value:pathMethods[name]?function(...args){state(this);return apply(value,this,args);}:value,writable:true,configurable:true});
+    for(const [name,value] of Object.entries(pathMethods))define(Path2D.prototype,name,{value:function(...args){if(!paths.has(this))throw new TypeError('Illegal Path2D receiver');return apply(value,this,args);},writable:true,configurable:true});
     class ImageData {
         constructor(a,b,c){let data,w,h;if(a instanceof Bytes){data=a;w=number(b)>>>0;h=c===undefined?data.length/4/w:number(c)>>>0;if(!w||!finite(h)||h!==floor(h)||h<1||data.length!==w*h*4)throw namedError('IndexSizeError','Invalid ImageData dimensions');}
             else{w=abs(Math.trunc(number(a)));h=abs(Math.trunc(number(b)));if(!finite(w)||!finite(h)||!w||!h)throw namedError('IndexSizeError','Invalid ImageData dimensions');if(w*h>1048576)throw new RangeError('ImageData memory limit');data=new Bytes(w*h*4);}
@@ -86,7 +177,8 @@ const canvasBridge = (() => {
         get data(){const s=images.get(this);if(!s)throw new TypeError('Illegal ImageData receiver');return s.data;}
         get colorSpace(){if(!images.has(this))throw new TypeError('Illegal ImageData receiver');return 'srgb';}
     }
-    for(const C of [HTMLCanvasElement,CanvasRenderingContext2D,ImageData])define(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
-    Object.assign(globalThis,{HTMLCanvasElement,CanvasRenderingContext2D,ImageData});
+    for(const [i,name] of ['width','actualBoundingBoxLeft','actualBoundingBoxRight','actualBoundingBoxAscent','actualBoundingBoxDescent','fontBoundingBoxAscent','fontBoundingBoxDescent'].entries())define(TextMetrics.prototype,name,{enumerable:true,configurable:true,get(){const values=metrics.get(this);if(!values)throw new TypeError('Illegal TextMetrics receiver');return values[i];}});
+    for(const C of [HTMLCanvasElement,CanvasRenderingContext2D,ImageData,TextMetrics,Path2D])define(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
+    Object.assign(globalThis,{HTMLCanvasElement,CanvasRenderingContext2D,ImageData,TextMetrics,Path2D});
     return {nodeProtos:[HTMLCanvasElement.prototype]};
 })();

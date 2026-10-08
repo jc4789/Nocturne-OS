@@ -215,6 +215,64 @@ int png_encode(const uint32_t *px, int w, int h, int stride, uint8_t **out, size
     return 0;
 }
 
+size_t png_encode_rgba_bound(int w, int h) {
+    if (w <= 0 || h <= 0 || (size_t)w > (SIZE_MAX-1)/4) return 0;
+    size_t row = (size_t)w*4+1;
+    if ((size_t)h > SIZE_MAX/row) return 0;
+    size_t raw = row*(size_t)h;
+    /* The IDAT length is a 32-bit field. This also bounds the arithmetic. */
+    if (raw > UINT32_MAX-6 || (raw+65534)/65535 > (UINT32_MAX-raw-6)/5) return 0;
+    size_t z = raw + ((raw+65534)/65535)*5 + 6;
+    return z > SIZE_MAX-78 ? 0 : z+78;
+}
+static void fixed_be32(uint8_t *b, uint32_t v) {
+    b[0]=(uint8_t)(v>>24); b[1]=(uint8_t)(v>>16); b[2]=(uint8_t)(v>>8); b[3]=(uint8_t)v;
+}
+static uint8_t *fixed_chunk(uint8_t *at, const char *type, const uint8_t *data, size_t n) {
+    fixed_be32(at,(uint32_t)n); memcpy(at+4,type,4);
+    if (n) memcpy(at+8,data,n);
+    fixed_be32(at+8+n,crc32_update(0,at+4,n+4)); return at+12+n;
+}
+int png_encode_rgba(const uint32_t *px, int w, int h, int stride, uint8_t **out, size_t *outlen) {
+    if (!out || !outlen) return -1;
+    *out=NULL; *outlen=0;
+    size_t bound=png_encode_rgba_bound(w,h);
+    if (!bound || !px || stride < w || (size_t)(h-1) > (SIZE_MAX/4-(size_t)w)/(size_t)stride) return -1;
+    uint8_t *png=malloc(bound); if (!png) return -1;
+    memcpy(png,"\x89PNG\r\n\x1a\n",8);
+    uint8_t ihdr[13]={0}; fixed_be32(ihdr,(uint32_t)w); fixed_be32(ihdr+4,(uint32_t)h);
+    ihdr[8]=8; ihdr[9]=6; /* 8-bit RGBA, not premultiplied */
+    uint8_t *at=fixed_chunk(png+8,"IHDR",ihdr,13);
+    uint8_t phys[9]; fixed_be32(phys,3780); fixed_be32(phys+4,3780); phys[8]=1;
+    at=fixed_chunk(at,"pHYs",phys,9);
+    size_t row=(size_t)w*4+1,raw=row*(size_t)h,zlen=bound-78;
+    fixed_be32(at,(uint32_t)zlen); memcpy(at+4,"IDAT",4);
+    uint8_t *z=at+8; *z++=0x78; *z++=0x01;
+    uint32_t a=1,b=0; size_t done=0;
+    while (done < raw) {
+        size_t length=raw-done; if (length>65535) length=65535;
+        *z++=(uint8_t)(done+length == raw); /* BFINAL, BTYPE=stored */
+        *z++=(uint8_t)length; *z++=(uint8_t)(length>>8);
+        *z++=(uint8_t)~length; *z++=(uint8_t)(~length>>8);
+        for (size_t i=0;i<length;i++,done++) {
+            size_t column=done%row; uint8_t byte=0; /* filter None */
+            if (column) {
+                size_t pixel=(column-1)/4,channel=(column-1)%4;
+                uint32_t value=px[(done/row)*(size_t)stride+pixel];
+                unsigned shift=channel==3?24:(unsigned)(2-channel)*8;
+                byte=(uint8_t)(value>>shift);
+            }
+            *z++=byte; a+=byte; if (a>=65521) a-=65521;
+            b+=a; if (b>=65521) b-=65521;
+        }
+    }
+    fixed_be32(z,(b<<16)|a); z+=4;
+    fixed_be32(z,crc32_update(0,at+4,zlen+4)); z+=4;
+    z=fixed_chunk(z,"IEND",NULL,0);
+    if ((size_t)(z-png)!=bound) { free(png); return -1; }
+    *out=png; *outlen=bound; return 0;
+}
+
 /* box-filter downscale by an integer factor (2 = half size) */
 uint32_t *img_shrink(const uint32_t *px, int w, int h, int stride, int f, int *nw, int *nh) {
     if (f < 1) f = 1;

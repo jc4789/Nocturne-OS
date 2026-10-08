@@ -11,13 +11,26 @@
 #define LAPIC_TIMER_INIT 0x380
 #define LAPIC_TIMER_CUR 0x390
 #define LAPIC_TIMER_DIV 0x3E0
+#define IA32_APIC_BASE 0x1B
+#define APIC_BASE_ENABLE (1ULL << 11)
+#define APIC_BASE_X2 (1ULL << 10)
+#define X2APIC_MSR_BASE 0x800
+#define X2APIC_ICR 0x830
 
 static volatile uint32_t *lapic;
+static bool available, x2_mode;
 static uint32_t timer_reload;
 static int timer_vector;
 
-static void lapic_write(uint32_t reg, uint32_t v) { lapic[reg / 4] = v; }
-static uint32_t lapic_read(uint32_t reg) { return lapic[reg / 4]; }
+/* x2APICではMMIO pageを読むこと自体が無効。通常32bit registerは
+   offset/16 + 0x800 のMSR、64bit ICRだけは送信側で別扱いする。 */
+static void lapic_write(uint32_t reg, uint32_t v) {
+    if (x2_mode) wrmsr(X2APIC_MSR_BASE + (reg >> 4), v);
+    else lapic[reg / 4] = v;
+}
+static uint32_t lapic_read(uint32_t reg) {
+    return x2_mode ? (uint32_t)rdmsr(X2APIC_MSR_BASE + (reg >> 4)) : lapic[reg / 4];
+}
 
 void apic_init(void) {
     uint32_t a, b, c, d;
@@ -26,30 +39,46 @@ void apic_init(void) {
         kprintf("apic: no local APIC, using plain PIC\n");
         return;
     }
-    uint64_t base = rdmsr(0x1B);
-    if (!(base & (1 << 11))) {
+    uint64_t base = rdmsr(IA32_APIC_BASE);
+    if (!(base & APIC_BASE_ENABLE)) {
         kprintf("apic: local APIC globally disabled, using plain PIC\n");
         return;
     }
+    x2_mode = (base & APIC_BASE_X2) != 0;
+    if (x2_mode && !(c & (1u << 21))) panic("apic: x2APIC enabled without CPU support");
     uint64_t phys = base & 0xFFFFFF000ULL;
-    lapic = vmm_map_mmio(phys, 4096);
+    if (!x2_mode) {
+        lapic = vmm_map_mmio(phys, 4096);
+        if (!lapic) panic("apic: cannot map local APIC");
+    }
+    available = true;
     lapic_write(0x80, 0);                                 /* TPR: accept everything */
     lapic_write(0xF0, (lapic_read(0xF0) & ~0xFFu) | 0x1FF); /* enable, spurious vector 0xFF */
     lapic_write(LAPIC_LVT_TIMER, 0x10000);                /* timer masked */
     lapic_write(0x350, 0x700);                            /* LINT0: ExtINT (the PIC) */
     lapic_write(0x360, 0x400);                            /* LINT1: NMI */
     lapic_write(0x370, 0x10000 | 0xFE);                   /* error: masked */
-    kprintf("apic: LAPIC at %p id %u, PIC in virtual wire mode\n", (void *)phys, lapic_read(0x20) >> 24);
+    if (x2_mode) kprintf("apic: x2APIC MSR id %u, PIC in virtual wire mode\n", lapic_current_id());
+    else kprintf("apic: xAPIC at %p id %u, PIC in virtual wire mode\n", (void *)phys, lapic_current_id());
 }
 
-bool lapic_present(void) { return lapic != NULL; }
+bool lapic_present(void) { return available; }
+bool lapic_x2apic(void) { return available && x2_mode; }
 
-uint32_t lapic_current_id(void) { return lapic ? lapic_read(0x20) >> 24 : 0; }
+uint32_t lapic_current_id(void) {
+    if (!available) return 0;
+    uint32_t id = lapic_read(0x20);
+    return x2_mode ? id : id >> 24;
+}
 
 bool lapic_worker_init(void) {
-    if (!lapic) return false;
-    uint64_t base = rdmsr(0x1B);
-    if (!(base & (1ULL << 11)) || (base & (1ULL << 10))) return false;
+    if (!available) return false;
+    uint32_t a, b, c, d;
+    cpuid(1, 0, &a, &b, &c, &d);
+    if (!(d & (1u << 9)) || (x2_mode && !(c & (1u << 21)))) return false;
+    uint64_t base = rdmsr(IA32_APIC_BASE);
+    /* Limineの全CPU modeを採用する。APだけを切り替えてBSPと混在させない。 */
+    if (!(base & APIC_BASE_ENABLE) || ((base & APIC_BASE_X2) != 0) != x2_mode) return false;
     lapic_write(0x80, 0);
     lapic_write(0xF0, (lapic_read(0xF0) & ~0xFFu) | 0x1FF);
     lapic_write(LAPIC_LVT_TIMER, 0x10000);
@@ -63,29 +92,41 @@ bool lapic_worker_init(void) {
     return true;
 }
 
-static bool ipi_ready(void) {
+static bool xapic_ipi_ready(void) {
     for (unsigned i = 0; i < 1000000; i++) {
-        if (!(lapic_read(0x300) & (1u << 12))) return true;
+        if (!(lapic[0x300 / 4] & (1u << 12))) return true;
         pause();
     }
     return false;
 }
 
 bool lapic_send_ipi(uint32_t apic_id, uint8_t vector) {
-    if (!lapic || apic_id > 255 || vector < 32) return false;
+    /* physical broadcast宛先とspurious vectorをmailbox wakeに使わない。 */
+    if (!available || vector < 32 || vector == 0xFF || apic_id == UINT32_MAX ||
+        (!x2_mode && apic_id >= 255)) return false;
     uint64_t flags = irq_save();
-    bool ok = ipi_ready();
-    if (ok) {
-        lapic_write(0x310, apic_id << 24);
-        lapic_write(0x300, vector); /* fixed, physical, edge-triggered */
-        ok = ipi_ready();
+    bool ok = true;
+    if (x2_mode) {
+        /* x2APIC WRMSRはserializingではない。mailboxのrelease storeが
+           相手CPUへ見える前にIPIだけが到着することを防ぐ。 */
+        __asm__ volatile("mfence; lfence" : : : "memory");
+        wrmsr(X2APIC_ICR, ((uint64_t)apic_id << 32) | vector);
+        /* x2APIC ICRにはdelivery-status bitが無く、busy pollは禁止。 */
+    } else {
+        ok = xapic_ipi_ready();
+        if (ok) {
+            /* ICR highはxAPIC専用。汎用MSR helperへ0x310を渡さない。 */
+            lapic[0x310 / 4] = apic_id << 24;
+            lapic[0x300 / 4] = vector; /* fixed, physical, edge-triggered */
+            ok = xapic_ipi_ready();
+        }
     }
     irq_restore(flags);
     return ok;
 }
 
 void lapic_eoi(void) {
-    if (lapic) lapic_write(LAPIC_EOI, 0);
+    if (available) lapic_write(LAPIC_EOI, 0);
 }
 
 uint64_t tsc_hz;
@@ -106,20 +147,19 @@ static uint64_t calibrate_with_pit(void) {
     uint64_t tsc0 = rdtsc();
     outb(0x61, inb(0x61) | 0x01);             /* ... and high */
     uint64_t spins = 0;
-    while (!(inb(0x61) & 0x20)) {
-        if (++spins > 50000000) return 0;
-    }
+    while (!(inb(0x61) & 0x20) && ++spins <= 50000000) pause();
     uint32_t elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CUR);
-    tsc_hz = (rdtsc() - tsc0) * 100;
+    uint64_t tsc_ticks = rdtsc() - tsc0;
     lapic_write(LAPIC_TIMER_INIT, 0);
     outb(0x61, p61);
-    if (elapsed < 1000) return 0;             /* the output went high at once: no PIT */
+    if (spins > 50000000 || elapsed < 1000) return 0; /* PITなしでもtimer/portを復旧 */
+    tsc_hz = tsc_ticks * 100;
     return (uint64_t)elapsed * 100;
 }
 
 /* Start the LAPIC timer as a periodic interrupt on `vector`. Returns false if that is impossible. */
 bool lapic_timer_start(unsigned hz, int vector) {
-    if (!lapic) return false;
+    if (!available || !hz || vector < 32 || vector >= 0xFF) return false;
     lapic_write(LAPIC_TIMER_DIV, 0xB);        /* divide by 1 */
     lapic_write(LAPIC_LVT_TIMER, 0x10000 | (uint32_t)vector);
     const char *src = "Hyper-V";
@@ -133,7 +173,9 @@ bool lapic_timer_start(unsigned hz, int vector) {
         kprintf("apic: cannot measure the LAPIC timer frequency\n");
         return false;
     }
-    uint32_t init = (uint32_t)(freq / hz);
+    uint64_t reload = freq / hz;
+    if (!reload || reload > UINT32_MAX) return false;
+    uint32_t init = (uint32_t)reload;
     timer_reload = init;
     timer_vector = vector;
     lapic_write(LAPIC_LVT_TIMER, 0x20000 | (uint32_t)vector); /* periodic, unmasked */
@@ -143,7 +185,7 @@ bool lapic_timer_start(unsigned hz, int vector) {
 }
 
 bool lapic_runner_timer_start(void) {
-    if (!lapic || !timer_reload) return false;
+    if (!available || !timer_reload) return false;
     lapic_write(LAPIC_TIMER_DIV, 0xB);
     lapic_write(LAPIC_LVT_TIMER, 0x20000 | (uint32_t)timer_vector);
     lapic_write(LAPIC_TIMER_INIT, timer_reload);

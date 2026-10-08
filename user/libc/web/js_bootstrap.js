@@ -27,6 +27,8 @@
     let abortHandlerTarget = () => false;
     let shadowHandlerTarget = () => false;
     let avmediaHandlerTarget = () => false;
+    let blobHandlerTarget = () => false;
+    let mseHandlerTarget = () => false;
     const globalHandlerTypes = new Set(('abort blur change click dblclick error focus focusin focusout input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
     const windowHandlerTypes = new Set(['hashchange','popstate','message','messageerror']);
     const state = new WeakMap();
@@ -138,7 +140,7 @@
     }
     function handlerTarget(target,type) {
         return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document || svgHandlerTarget(target))) ||
-            (windowHandlerTypes.has(type) && target===globalThis) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type);
+            (windowHandlerTypes.has(type) && target===globalThis) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type);
     }
     function activateHandler(target,type,r) {
         if(r.entry)return;
@@ -702,10 +704,14 @@
     /* @include js_hyperlink.js */
     /* @include js_html_elements.js */
     /* @include js_xhr.js */
+    /* @include js_blob.js */
+    fetchBridge.initializeBlobs(blobBridge);
     /* @include js_screen.js */
     /* @include js_intl.js */
     /* @include js_collator.js */
     /* @include js_crypto.js */
+    /* @include js_object_url.js */
+    fetchBridge.initializeObjectURLs(objectURLBridge);
     /* @include js_clone.js */
     /* @include js_storage.js */
     /* @include js_messaging.js */
@@ -718,6 +724,7 @@
     /* @include js_mutations.js */
     /* @include js_selection.js */
     /* @include js_document.js */
+    /* @include js_traversal.js */
     /* @include js_svg.js */
     /* @include js_attributes.js */
     /* @include js_shadow.js */
@@ -726,6 +733,7 @@
     /* @include js_form_validation.js */
     /* @include js_semantic_elements.js */
     /* @include js_canvas.js */
+    /* @include js_mse.js */
     /* @include js_avmedia.js */
     customElementsReady = true;
     /* Private native-input state, never reachable from page JS. C supplies the

@@ -1,6 +1,7 @@
 #include "media.h"
 #include "media_alloc_private.h"
 #include "media_http_private.h"
+#include "media_feed_private.h"
 #include "nocturne.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,6 +16,7 @@
 #include "libavutil/samplefmt.h"
 #include "libavutil/pixfmt.h"
 #include "libavutil/dict.h"
+#include "libswresample/swresample.h"
 
 struct nmedia {
     AVFormatContext *format;
@@ -33,6 +35,12 @@ struct nmedia {
     int16_t samples[4096 * 2];
     uint64_t phase, step;
     int frame_audio, source_rate;
+    AVChannelLayout mix_layout;
+    int32_t mix[2][8]; /* Q15, including unity (32768). */
+    bool mix_valid;
+    nmedia_packet_reader packet_reader;
+    nmedia_packet_seeker packet_seeker;
+    void *packet_owner;
     int64_t audio_pts, audio_clock, video_clock, audio_seek_ms, video_seek_ms;
 };
 
@@ -198,6 +206,53 @@ nmedia *nmedia_open_url_cors(const char *url, const char *document_url, char *er
 }
 const struct nmedia_info *nmedia_get_info(const nmedia *m) { return m ? &m->info : NULL; }
 const char *nmedia_error(const nmedia *m) { return m ? m->error : "no media"; }
+nmedia *nmedia_open_packets(const AVFormatContext *source, nmedia_packet_reader reader,
+                           nmedia_packet_seeker seeker, void *owner, char *error, size_t size) {
+    nmedia *m = nmedia_ff_mallocz(sizeof *m);
+    if (!m) { if(error&&size)strlcpy(error,"packet decoder allocation",size);return NULL; }
+    m->fd=-1;m->audio_index=m->video_index=-1;m->audio_seek_ms=m->video_seek_ms=-1;
+    m->packet_reader=reader;m->packet_seeker=seeker;m->packet_owner=owner;
+    m->format=avformat_alloc_context();
+    if(!m->format||!source||!reader||source->nb_streams>8)goto bad;
+    for(unsigned i=0;i<source->nb_streams;i++){
+        AVStream *s=avformat_new_stream(m->format,NULL);
+        if(!s||avcodec_parameters_copy(s->codecpar,source->streams[i]->codecpar)<0)goto bad;
+        s->time_base=source->streams[i]->time_base;s->avg_frame_rate=source->streams[i]->avg_frame_rate;
+        AVCodecParameters *p=s->codecpar;
+        if(s->time_base.num<=0||s->time_base.den<=0||p->width<0||p->height<0||
+           (uint64_t)p->width*p->height>NMEDIA_MAX_PIXELS||p->sample_rate>384000||p->ch_layout.nb_channels>8)goto bad;
+        if(p->codec_type==AVMEDIA_TYPE_AUDIO&&m->audio_index<0)m->audio_index=(int)i;
+        if(p->codec_type==AVMEDIA_TYPE_VIDEO&&m->video_index<0)m->video_index=(int)i;
+    }
+    if(m->audio_index>=0){m->audio=open_decoder(m,m->audio_index);if(!m->audio)goto bad;
+        m->info.audio=true;m->info.sample_rate=m->audio->sample_rate;m->info.channels=m->audio->ch_layout.nb_channels;
+        strlcpy(m->info.audio_codec,avcodec_get_name(m->audio->codec_id),32);}
+    if(m->video_index>=0){m->video=open_decoder(m,m->video_index);if(!m->video)goto bad;
+        m->info.video=true;m->info.width=m->video->width;m->info.height=m->video->height;
+        strlcpy(m->info.video_codec,avcodec_get_name(m->video->codec_id),32);}
+    if(!m->audio&&!m->video)goto bad;
+    m->info.duration_ms=source->duration>0&&source->duration!=AV_NOPTS_VALUE?source->duration/1000:-1;if(source->iformat)strlcpy(m->info.container,source->iformat->name,32);
+    m->packet=av_packet_alloc();m->frame=av_frame_alloc();if(!m->packet||!m->frame)goto bad;
+    if(error&&size)*error=0;return m;
+bad:
+    if(error&&size)strlcpy(error,m->error[0]?m->error:"invalid MSE packet decoder metadata",size);
+    nmedia_close(m);return NULL;
+}
+bool nmedia_packets_resume(nmedia *m){
+    if(!m||!m->packet_reader)return false;bool flushed=m->eof!=0;
+    if(flushed){if(m->audio)avcodec_flush_buffers(m->audio);if(m->video)avcodec_flush_buffers(m->video);m->pending=NULL;m->frame_audio=0;av_frame_unref(m->frame);}
+    m->eof=m->flush=0;return flushed;
+}
+bool nmedia_packets_compatible(const nmedia *m,const AVFormatContext *source){
+    if(!m||!source||source->nb_streams!=m->format->nb_streams)return false;
+    for(unsigned i=0;i<source->nb_streams;i++){
+        const AVStream *a=m->format->streams[i],*b=source->streams[i];
+        const AVCodecParameters *p=a->codecpar,*q=b->codecpar;
+        if(a->time_base.num!=b->time_base.num||a->time_base.den!=b->time_base.den||p->codec_id!=q->codec_id||p->codec_type!=q->codec_type||
+           p->extradata_size!=q->extradata_size||p->sample_rate!=q->sample_rate||av_channel_layout_compare(&p->ch_layout,&q->ch_layout)||
+           (p->extradata_size&&memcmp(p->extradata,q->extradata,(size_t)p->extradata_size)))return false;
+    }return true;
+}
 static int32_t audio_sample(AVFrame *f, int index, int channel) {
     enum AVSampleFormat fmt = (enum AVSampleFormat)f->format;
     bool planar = av_sample_fmt_is_planar(fmt);
@@ -217,18 +272,66 @@ static int32_t audio_sample(AVFrame *f, int index, int channel) {
     if (!isfinite(dbl)) return 0;
     return (int32_t)(fmax(-1, fmin(1, dbl)) * 32767);
 }
+/* Retain the bounded native resampler, but use FFmpeg's channel-layout matrix
+ * rather than silently discarding every channel after the first two. */
+static int audio_mix(nmedia *m, const AVChannelLayout *layout) {
+    if (m->mix_valid && !av_channel_layout_compare(&m->mix_layout, layout)) return 0;
+    AVChannelLayout simple = {0};
+    const AVChannelLayout *input = layout;
+    if (layout->order == AV_CHANNEL_ORDER_UNSPEC && layout->nb_channels <= 2) {
+        /* Mono/stereo PCM often has no speaker mask. Never guess a surround
+         * order from the channel count alone. */
+        av_channel_layout_default(&simple, layout->nb_channels); input = &simple;
+    }
+    if (!av_channel_layout_check(input) || input->order == AV_CHANNEL_ORDER_UNSPEC ||
+        input->order == AV_CHANNEL_ORDER_AMBISONIC)
+        return fail(m, "unsupported audio channel layout", AVERROR(ENOSYS));
+    if (input->nb_channels == 1) {
+        if (av_channel_layout_channel_from_index(input, 0) != AV_CHAN_FRONT_CENTER)
+            return fail(m, "unsupported mono speaker layout", AVERROR(ENOSYS));
+        memset(m->mix, 0, sizeof m->mix); m->mix[0][0] = m->mix[1][0] = 32768;
+    } else {
+        /* FFmpeg 9.0.2's public matrix utility normalizes a full 64x64 region,
+         * not just the active two rows. Allocate its complete bounded span on
+         * the heap; a 2x8 caller array would be overwritten. */
+        double *matrix = nmedia_ff_mallocz(64 * 64 * sizeof *matrix);
+        if (!matrix) return fail(m, "audio mixing matrix allocation", AVERROR(ENOMEM));
+        const AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+        int r = swr_build_matrix2(input, &stereo, 0.7071067811865476, 0.7071067811865476,
+                                 0.5, 1.0, 1.0, matrix, 64, AV_MATRIX_ENCODING_NONE, NULL);
+        if (r >= 0) for (int ch = 0; ch < input->nb_channels; ch++) {
+            /* The matrix utility may leave an unsupported named speaker
+             * unmixed. Do not report successful playback with missing audio. */
+            if (!isfinite(matrix[ch]) || !isfinite(matrix[64+ch]) ||
+                (matrix[ch] == 0 && matrix[64+ch] == 0)) { r = AVERROR(ENOSYS); break; }
+        }
+        if (r >= 0) for (int side = 0; side < 2; side++) for (int ch = 0; ch < 8; ch++)
+            m->mix[side][ch] = (int32_t)(matrix[64*side+ch] * 32768);
+        nmedia_ff_free(matrix);
+        if (r < 0) return fail(m, "unsupported audio mixing layout", r);
+    }
+    av_channel_layout_uninit(&m->mix_layout); m->mix_valid = false;
+    int r = av_channel_layout_copy(&m->mix_layout, layout);
+    if (r < 0) return fail(m, "audio channel layout allocation", r);
+    m->mix_valid = true; return 0;
+}
 static int audio_output(nmedia *m, struct nmedia_output *o) {
     AVFrame *f = m->frame;
-    int n = 0, right = f->ch_layout.nb_channels > 1 ? 1 : 0;
+    int n = 0;
     uint64_t end = (uint64_t)f->nb_samples << 32;
     uint64_t start = m->phase;
     while (n < 4096 && m->phase < end) {
         int i = (int)(m->phase >> 32), j = MIN(i + 1, f->nb_samples - 1);
         int64_t frac = (int64_t)((m->phase & UINT32_MAX) >> 16);
-        for (int c = 0; c < 2; c++) {
-            int ch = c ? right : 0;
+        int64_t mixed[2] = {0};
+        for (int ch = 0; ch < f->ch_layout.nb_channels; ch++) {
             int32_t a = audio_sample(f, i, ch), b = audio_sample(f, j, ch);
-            m->samples[2 * n + c] = (int16_t)(a + (((int64_t)b - a) * frac >> 16));
+            int32_t value = (int32_t)(a + (((int64_t)b - a) * frac >> 16));
+            for (int side = 0; side < 2; side++) mixed[side] += (int64_t)value * m->mix[side][ch];
+        }
+        for (int side = 0; side < 2; side++) {
+            int64_t value = mixed[side] >> 15;
+            m->samples[2*n+side] = (int16_t)MAX(-32768, MIN(32767, value));
         }
         n++; m->phase += m->step;
     }
@@ -310,6 +413,7 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
                 AVFrame *f = m->frame;
                 if (f->sample_rate < 1000 || f->sample_rate > 384000 || f->ch_layout.nb_channels < 1 || f->ch_layout.nb_channels > 8 || f->nb_samples <= 0 || f->nb_samples > 65536 || av_get_bytes_per_sample((enum AVSampleFormat)f->format) <= 0)
                     return fail(m, "audio frame limits", AVERROR(EINVAL));
+                if (audio_mix(m, &f->ch_layout) < 0) return NMEDIA_ERROR;
                 AVStream *s = m->format->streams[m->audio_index];
                 int64_t stamp = f->best_effort_timestamp;
                 m->audio_pts = stamp == AV_NOPTS_VALUE ? m->audio_clock : av_rescale_q(stamp, s->time_base, (AVRational){1,1000});
@@ -333,7 +437,8 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
             if (c) { int r = avcodec_send_packet(c, NULL); if (r < 0 && r != AVERROR_EOF) return fail(m, "flush", r); m->pending = c; }
             continue;
         }
-        int r = av_read_frame(m->format, m->packet);
+        int r = m->packet_reader ? m->packet_reader(m->packet_owner,m->packet) : av_read_frame(m->format, m->packet);
+        if(r==AVERROR(EAGAIN))return NMEDIA_AGAIN;
         if (r == AVERROR_EOF) { m->eof = 1; continue; }
         if (r < 0) return fail(m, "read packet", r);
         if (m->packet->size > 16 * 1024 * 1024) { av_packet_unref(m->packet); return fail(m,"packet resource limit",AVERROR(EINVAL)); }
@@ -345,9 +450,11 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
     return NMEDIA_AGAIN;
 }
 static void close_decoder(nmedia *m) {
+    av_channel_layout_uninit(&m->mix_layout); m->mix_valid = false;
     av_frame_free(&m->frame); av_packet_free(&m->packet);
     avcodec_free_context(&m->audio); avcodec_free_context(&m->video);
-    avformat_close_input(&m->format);
+    if(m->packet_reader){avformat_free_context(m->format);m->format=NULL;}
+    else avformat_close_input(&m->format);
     if (m->io) { av_freep(&m->io->buffer); avio_context_free(&m->io); }
     m->pending = NULL;
 }
@@ -367,7 +474,8 @@ static bool restart_flac(nmedia *m) {
 }
 bool nmedia_seek(nmedia *m, int64_t ms) {
     if (!m || !m->format || ms < 0 || ms > INT64_MAX / 1000) return false;
-    int r = avformat_seek_file(m->format, -1, INT64_MIN, ms * 1000, ms * 1000, 0);
+    int r = m->packet_reader ? (m->packet_seeker&&m->packet_seeker(m->packet_owner,ms)?0:AVERROR(EINVAL)) :
+        avformat_seek_file(m->format, -1, INT64_MIN, ms * 1000, ms * 1000, 0);
     if (r < 0) {
         if (strcmp(m->info.container,"flac") || !restart_flac(m)) return false;
         /* Fallback begins at zero; preserve zero clocks for missing PTS. */

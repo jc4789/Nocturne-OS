@@ -115,7 +115,7 @@ async function runFetchCases() {
     throws(()=>Response.prototype.clone.call({}),'TypeError','response receiver');
     await rejects(Response.prototype.text.call({}),'TypeError','Body promise receiver');
     throws(()=>new Response('bytes').body,'NotSupportedError','stream body explicitly unsupported');
-    const unsupported=new Response('keep');await rejects(unsupported.blob(),'NotSupportedError','Blob explicitly unsupported');await rejects(unsupported.formData(),'NotSupportedError','FormData explicitly unsupported');
+    const unsupported=new Response('keep');assert((await new Response('keep').blob()).size===4,'Blob contains real body bytes');await rejects(unsupported.formData(),'NotSupportedError','FormData explicitly unsupported');
     assert(!unsupported.bodyUsed&&await unsupported.text()==='keep','unsupported reader does not falsely consume');
 
     const controller=new AbortController(),signal=controller.signal;

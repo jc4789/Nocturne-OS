@@ -38,7 +38,11 @@ static void sample(void) {
         proc_cpu[i] = 100.0f * d / dt;
         if (procs[i].pid != 0) busy += d;
     }
-    float cpu = 100.0f * busy / dt;
+    struct n_cpuinfo ci;
+    unsigned task_cpus = cpu_info(&ci) == 0 && ci.scheduler_cpus ? ci.scheduler_cpus : 1;
+    /* task cpu_msにはAP runnerの時間も含む。1CPU当たりのprocess %は維持し、
+       全taskグラフだけを実scheduler容量で正規化する。純計算AP jobは含まない。 */
+    float cpu = 100.0f * busy / dt / task_cpus;
     if (cpu > 100) cpu = 100;
     struct n_sysinfo si;
     sysinfo(&si);
@@ -79,8 +83,8 @@ static int list_rows(void) { return (H - LIST_Y - 24 - 50) / ROW; }
 static void draw(void) {
     canvas_t *c = &w->c;
     gfx_fill(c, 0, 0, W, H, RGB(26, 24, 44));
-    /* 通常taskの会計はBSPのみ。AP計算workerを総CPU使用率と混同しない。 */
-    graph(c, 12, 12, (W - 36) / 2, 140, cpu_hist, RGB(130, 200, 255), "CPU (BSP)");
+    /* AP計算workerをtask実行CPUの使用率と混同しない。 */
+    graph(c, 12, 12, (W - 36) / 2, 140, cpu_hist, RGB(130, 200, 255), "Task CPUs");
     graph(c, 24 + (W - 36) / 2, 12, (W - 36) / 2, 140, mem_hist, RGB(250, 170, 110), "Memory");
     struct n_sysinfo si;
     sysinfo(&si);

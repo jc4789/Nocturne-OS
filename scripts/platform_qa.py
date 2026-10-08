@@ -100,6 +100,7 @@ def main():
     ap.add_argument('--seconds', type=float, default=60)
     ap.add_argument('--memory', type=int, default=2048)
     ap.add_argument('--cpus', type=int, default=4)
+    ap.add_argument('--cpu-model', help='この専用QEMUだけに渡すCPUモデルと機能指定')
     ap.add_argument('--accel', choices=['tcg', 'whpx'], default='tcg')
     ap.add_argument('--vga', choices=['std', 'vmware', 'virtio'], default='std')
     ap.add_argument('--gl', action='store_true')
@@ -107,7 +108,9 @@ def main():
     ap.add_argument('--virgl-disable-mt', action='store_true', help='このQEMU子プロセスだけでvirglのthread同期を無効化して比較')
     ap.add_argument('--audio', action='store_true')
     ap.add_argument('--qemu', default='C:/Program Files/qemu/qemu-system-x86_64.exe')
+    ap.add_argument('--qemu-data-dir', help='専用QEMUコピーが読み込むBIOSデータのディレクトリ')
     ap.add_argument('--key', action='append', default=[])
+    ap.add_argument('--scroll-pages', type=int, default=0, help='実ページをクリックしてから結果一覧を順に下へ送り画面を保存')
     ap.add_argument('--expect', action='append', default=[], help='serialに必要な文字列（複数可）')
     ap.add_argument('--reject', action='append', default=[], help='serialに出てはいけない文字列（複数可）')
     ap.add_argument('--allow-panic', action='store_true', help='期待panicの負例検証だけで使用')
@@ -119,6 +122,10 @@ def main():
         ap.error('不正な実行時間またはboot引数です')
     if any(not re.fullmatch('[a-zA-Z0-9_-]+', x) for x in a.key):
         ap.error('不正なQEMUキー名です')
+    if not 0 <= a.scroll_pages <= 40:
+        ap.error('スクロール回数は0から40です')
+    if a.cpu_model is not None and not re.fullmatch('[a-zA-Z0-9_.,=+_-]+', a.cpu_model):
+        ap.error('不正なQEMU CPUモデルです')
     if a.url and any(x in a.url for x in '\n\r\0 |&;`$'):
         ap.error('この検証URLにshell構文は使用できません')
     if a.stop_when_expected and not a.expect:
@@ -169,6 +176,10 @@ def main():
             '-netdev', 'user,id=qa', '-device', 'e1000,netdev=qa']
     if a.gl:
         args += ['-device', 'virtio-gpu-gl-pci']
+    if a.cpu_model:
+        args += ['-cpu', a.cpu_model]
+    if a.qemu_data_dir:
+        args += ['-L', a.qemu_data_dir]
     if a.trace_gpu:
         args += ['-trace', f'enable=virtio_gpu*,file={here / "gpu-trace.log"}', '-d', 'guest_errors']
     if a.audio:
@@ -198,7 +209,7 @@ def main():
     try:
         mon = Monitor(p, port)
         print('隔離QEMU 起動:', p.pid, here, flush=True)
-        next_shot, index = 15, 0
+        next_shot, index, scroll_at, scroll_count = 15, 0, 45, 0
         while time.monotonic()-start < a.seconds and p.poll() is None:
             elapsed = time.monotonic()-start
             if elapsed >= next_shot:
@@ -206,8 +217,21 @@ def main():
                 index += 1
                 next_shot += 30
                 if index == 1:
+                    if a.key or a.scroll_pages:
+                        mon.cmd('mouse_button 1')
+                        mon.cmd('mouse_button 0')
                     for key in a.key:
                         mon.cmd('sendkey '+key)
+            if a.scroll_pages and elapsed >= scroll_at and scroll_count < a.scroll_pages:
+                if scroll_count == 0:
+                    # The first 15s frame may still be Limine loading the
+                    # larger rootfs. Focus the actual page at scrolling time.
+                    mon.cmd('mouse_button 1')
+                    mon.cmd('mouse_button 0')
+                shot(mon, 'page-'+str(scroll_count))
+                mon.cmd('sendkey pgdn')
+                scroll_count += 1
+                scroll_at += 6
             if a.stop_when_expected and serial.exists():
                 log = serial.read_text(encoding='utf-8', errors='replace')
                 if all(x in log for x in a.expect):
@@ -222,6 +246,19 @@ def main():
                 pass
     except Exception as e:
         failure = str(e)
+        # autorun may power off immediately after its final marker, racing a
+        # screendump/register/quit command. Accept only a confirmed clean
+        # guest shutdown with every requested marker; other monitor errors
+        # remain errors. Keep the observation visible in metadata.
+        if isinstance(e, (ConnectionResetError, BrokenPipeError)):
+            try:
+                code = p.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                code = None
+            log = serial.read_text(encoding='utf-8', errors='replace') if serial.exists() else ''
+            if code == 0 and a.expect and all(x in log for x in a.expect) and 'power: shutting down' in log:
+                metadata['clean_shutdown_monitor_race'] = str(e)
+                failure = None
     finally:
         if p.poll() is None:
             try:

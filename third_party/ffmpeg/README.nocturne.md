@@ -6,15 +6,15 @@
 
 ## 構成
 
-- `libavcodec`, `libavformat`, `libavutil`, `libswresample` の静的 C 構成。実コンパイル閉包は333 C / 749 manifest files。`libswresample` の generic C は native Opus の SILK 経路にも必要で、外部の libopus/libvorbis/libvpx は入らない。
-- デコーダー: MP3, FLAC, AAC, H.264, MJPEG, VP9, Opus, Vorbis, rawvideo、および WAV 向け PCM。
+- `libavcodec`, `libavformat`, `libavutil`, `libswresample` の静的 C 構成。実コンパイル閉包は337 C / 756 manifest files。`libswresample` の generic C は native Opus の SILK 経路とステレオ混合行列にも必要で、外部の libopus/libvorbis/libvpx は入らない。
+- デコーダー: MP3, FLAC, AAC, H.264, MJPEG, VP8, VP9, Opus, Vorbis, rawvideo、および WAV 向け PCM。
 - コンテナー: WAV, MP3, FLAC, ADTS AAC, AVI, MOV/MP4, Matroska/WebM, Ogg。
 - network、URL protocol、device、filter、encoder、外部 library、pthread/Windows thread、assembler/GPL 最適化を無効にする。
 - native `media.c` の custom AVIO が Nocturne の `read/lseek/fstat` または所有メモリーに接続する。codec handle は単一所有・単一実行コンテキスト専用。FFmpeg の無 thread ビルドを勝手にマルチスレッドで使用してはならない。
-- PCM 出力は 48 kHz stereo。mono は両側、複数チャンネルは先頭の２つを用いる（surround downmix ではない）。リサンプルは線形補間で、各フレーム末尾は最後のサンプルを保持する簡易処理。
-- 動画出力は 8-bit YUV420/422/444、RGB/BGR、gray から opaque ARGB へ。VP9 は profile 0 / 8-bit YUV420 / SDR に限定し、10/12-bit の上流 DSP がコンパイルされても高bitdepthやHDRを再生能力に含めない。10-bit H.264、VP8/AV1、HEVC は再生機能として宣言しない。
-- Ogg demuxer に必要な Dirac/Theora/Speex/VP8 の header parser が含まれても、それらの decoder は無効。コンテナーの parser が存在することを codec 再生対応と混同しない。
-- browser は既存 fetch/CORS を用いる上限付き全体取得。MSE、DRM、HLS/DASH/live、HTTP Range streaming、autoplay、1x 以外の速度、字幕は未対応。これは Web 全面互換を達成したものではない。
+- PCM 出力は 48 kHz stereo。mono は両側、最大8チャンネルの既知 speaker layout は `swr_build_matrix2` による正規化行列でステレオへ混合する。center/surround を約 -3 dB、LFE を弱く混合し、S16 の飽和処理を行う。並びの不明な複数チャンネル、行列が混合できず欠落する speaker は明示拒否する。mask のない1/2チャンネルだけは標準 mono/stereo と解釈する。リサンプルは従来の線形補間で、各フレーム末尾は最後のサンプルを保持する簡易処理。
+- 動画出力は 8-bit YUV420/422/444、RGB/BGR、gray から opaque ARGB へ。VP8 は native 8-bit YUV420、VP9 は profile 0 / 8-bit YUV420 / SDR に限定し、10/12-bit の上流 DSP がコンパイルされても高bitdepthやHDRを再生能力に含めない。10-bit H.264、AV1、HEVC は再生機能として宣言しない。
+- Ogg demuxer に必要な Dirac/Theora/Speex の header parser が含まれても、それらの decoder は無効。VP8 の decoder/parser は明示有効化した。コンテナーの header parser が存在することだけを codec 再生対応と混同しない。
+- browser は既存 fetch/CORS の上限付き全体取得、または native worker の匿名 HTTP Range 入力を使う。Range の各応答の CORS、強い ETag、cache/resource 上限、同期読取の制約は native input に従う。MSE、DRM、HLS/DASH/live、autoplay、1x 以外の速度、字幕は未対応。これは Web 全面互換を達成したものではない。
 
 ## 再生成
 

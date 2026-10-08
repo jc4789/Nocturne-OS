@@ -17,7 +17,8 @@ typedef void (*cpu_job_fn)(size_t index, void *context);
    context と参照先は共有された高位 kernel mapping で、join まで有効であること。
    callback は非重複領域だけを更新し、割当・I/O・syscall・待機・schedule・再入は禁止。
    SSE2 は使用可能。AVX はN_CPU_AVX公開時だけ。BSPの全許可XSTATEを保存復元する。
-   同期 join が終わるまで戻らない。起動失敗/単CPU/nosmp は逐次実行する。
+   countに必要なAPだけを投入し、同期 join が終わるまで戻らない。
+   起動失敗/単CPU/nosmp は逐次実行する。専用user runnerは計算jobへ投入しない。
    投入後の AP 故障は context を早期解放せず panic する。 */
 void smp_init(struct limine_mp_response *response);
 void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context);

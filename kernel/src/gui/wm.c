@@ -987,17 +987,20 @@ static unsigned scene_density(unsigned layers) {
     return layers<=1 ? 0 : layers<=4 ? 1 : layers<=16 ? 2 : 3;
 }
 
+/* onlineにはring3専用runnerも含む。描画に参加できるCPUだけを数える。 */
+static unsigned scene_cpu_count(void) { return cpu_worker_count() + 1; }
+
 static unsigned scene_rows(unsigned layers, unsigned width) {
-    unsigned cpus=cpu_online_count();
+    unsigned cpus=scene_cpu_count();
     uint64_t row_cost=(uint64_t)width*MAX(layers,4u); /* clipped positive screen width */
     unsigned cost_rows=wm_work_budget[scene_density(layers)]/row_cost;
     return MAX(cpus,MIN(128u,MAX(cpus,cost_rows)));
 }
 
 static void scene_shrink(unsigned layers,unsigned width,unsigned rows,uint64_t maximum) {
-    if (scene_us(maximum)>1000 && rows>cpu_online_count())
+    if (scene_us(maximum)>1000 && rows>scene_cpu_count())
         wm_work_budget[scene_density(layers)]=MIN(wm_work_budget[scene_density(layers)],
-            (uint64_t)MAX(cpu_online_count(),rows/2)*width*MAX(layers,4u));
+            (uint64_t)MAX(scene_cpu_count(),rows/2)*width*MAX(layers,4u));
 }
 
 static void capture_scene(struct draw_scene *s, canvas_t dst) {
@@ -1050,7 +1053,7 @@ static void scene_tile(size_t index, void *arg) {
 static uint64_t render_scene(const struct draw_scene *s, struct rect r, bool parallel,
                              unsigned batch_rows, uint64_t *cpu_mask, uint64_t *maximum) {
     uint64_t ticks = 0;
-    unsigned cpus = cpu_online_count();
+    unsigned cpus = scene_cpu_count();
     for (int y = r.y; y < r.y+r.h; y += (int)batch_rows) {
         struct scene_job job = {.scene=s, .batch={r.x,y,r.w,MIN((int)batch_rows,r.y+r.h-y)}};
         size_t count = job.cell_count = MIN(cpus,(unsigned)job.batch.h);
@@ -1174,7 +1177,7 @@ static void scene_benchmark(void) {
                 uint64_t before=cpu_parallel_jobs();
                 s.dst.px=out+16;render_scene(&s,clip,true,uneven[k],&uneven_mask,NULL);
                 if (memcmp(ref,out,(pixels+32)*4) ||
-                    (cpu_online_count()>1 && uneven[k]>=cpu_online_count() &&
+                    (scene_cpu_count()>1 && uneven[k]>=2 &&
                      cpu_parallel_jobs()==before)) panic("wmbench: uneven batch failed rows=%u",uneven[k]);
             }
             kprintf("wmbench: uneven-batches PASS rows=4,5,6,9 mask=%lx jobs=%lu pixels=PASS guards=PASS\n",
@@ -1190,13 +1193,13 @@ static void scene_benchmark(void) {
         render_scene(&s,odd,true,rows,&mask,&maximum);
         if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: odd-pitch pixels/guards differ");
         kprintf("wmbench: %dx%d layers=%u rounds=6 CPUs=%u mask=%lx direct_ticks=%lu serial_ticks=%lu parallel_ticks=%lu jobs=%lu batch_rows=%u max_join_us=%lu pixels=PASS guards=PASS direct_shadow=original serial_shadow=%s parallel_shadow=%s oracle_shadow=original\n",
-                sw,sh,s.count,cpu_online_count(),mask,direct,serial,parallel,
+                sw,sh,s.count,scene_cpu_count(),mask,direct,serial,parallel,
                 cpu_parallel_jobs()-begin_jobs,rows,scene_us(maximum),
                 s.shadow_strip?"strip":"original",s.shadow_strip?"strip":"original");
         scene_shrink(s.count,(unsigned)sw,rows,maximum);
     }
     vfree(ref,pages);vfree(out,pages);
-    kprintf("wmbench: PASS full/clipped/tiny/odd-pitch/extrema/guards; scheduler remains BSP-only\n");
+    kprintf("wmbench: PASS full/clipped/tiny/odd-pitch/extrema/guards; kernel/GUI BSP-owned, user runner excluded\n");
 }
 
 static void composite_ram(struct rect r) {
@@ -1208,7 +1211,7 @@ static void composite_ram(struct rect r) {
     scene.count=relevant;
     bool verify=wm_verify && verify_back.w==back.w && verify_back.h==back.h;
     /* 自動利用は多層・大damageだけ。明示onでも既存の安全条件を保つ。 */
-    bool parallel = wm_parallel && cpu_online_count()>1 && r.h>=(int)cpu_online_count() &&
+    bool parallel = wm_parallel && scene_cpu_count()>1 && r.h>=2 &&
                     (uint64_t)r.w*r.h>=65536 && scene.count>0 &&
                     (wm_parallel_force || (scene.count>=16 && (uint64_t)r.w*r.h>=262144));
     if (!parallel) {
@@ -1221,7 +1224,7 @@ static void composite_ram(struct rect r) {
                            verify_back.px+(size_t)y*verify_back.pitch+r.x,(size_t)r.w*4))
                     panic("wmverify: serial fallback pixels differ row=%d",y);
             kprintf("wmram: fallback CPUs=%u layers=%u rect=%dx%d pixels=PASS shadow=%s oracle_shadow=original\n",
-                    cpu_online_count(),scene.count,r.w,r.h,scene.shadow_strip?"strip":"original");
+                    scene_cpu_count(),scene.count,r.w,r.h,scene.shadow_strip?"strip":"original");
         }
         return;
     }
@@ -1246,7 +1249,7 @@ static void composite_ram(struct rect r) {
     scene_shrink(scene.count,(unsigned)r.w,rows,maximum);
     if (!trace_active && (verify || scene_frames==1 || !(scene_frames%64)))
         kprintf("wmram: frame=%lu rect=%dx%d layers=%u CPUs=%u mask=%lx direct_ticks=%lu serial_ticks=%lu parallel_ticks=%lu jobs=%lu density=%u batch_rows=%u join_us=%lu max_join_us=%lu pixels=%s reference_timed=%u direct_shadow=original serial_shadow=original parallel_shadow=%s\n",
-                scene_frames,r.w,r.h,scene.count,cpu_online_count(),mask,direct,serial,ticks,
+                scene_frames,r.w,r.h,scene.count,scene_cpu_count(),mask,direct,serial,ticks,
                 scene_jobs,scene_density(scene.count),rows,scene_us(maximum),scene_us(scene_max_ticks),verify?"PASS":"unchecked",(unsigned)verify,scene.shadow_strip?"strip":"original");
 }
 
@@ -1336,7 +1339,7 @@ static void trace_begin(void) {
         trace_done=true; kprintf("wmtrace: REJECT wmverify or unavailable TSC\n"); return;
     }
     memset(&wt,0,sizeof wt);
-    kprintf("wmtrace: START seconds=20 CPUs=%u parallel=%u yield=%u proxy=WM-loop-not-app-paint\n",cpu_online_count(),(unsigned)wm_parallel,(unsigned)wm_yield);
+    kprintf("wmtrace: START seconds=20 CPUs=%u parallel=%u yield=%u proxy=WM-loop-not-app-paint\n",scene_cpu_count(),(unsigned)wm_parallel,(unsigned)wm_yield);
     audio_trace_begin();
     uint64_t f=irq_save(); wt.start=rdtsc(); wt.deadline=wt.start+20*tsc_hz;
     trace_active=true; irq_restore(f);
