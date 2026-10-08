@@ -94,17 +94,15 @@ static const char *exc_names[32] = {
 
 void panic_regs(const char *what, struct regs *r);
 
-static void exception(struct regs *r) {
+static void exception(struct regs *r, uint64_t cr2, unsigned source_cpu) {
     const char *name = exc_names[r->vector];
     if (r->vector == 14) {
-        uint64_t cr2 = read_cr2();
         if (vmm_handle_user_fault(cr2, r->error)) return;
     }
     if ((r->cs & 3) == 3) {
         struct task *t = current_task;
-        uint64_t cr2 = read_cr2();
-        kprintf("[%s] pid %d (%s): %s at rip=%p", r->vector == 14 ? "segfault" : "crash",
-                t->pid, t->name, name, (void *)r->rip);
+        kprintf("[%s] pid %d (%s) cpu%u: %s at rip=%p", r->vector == 14 ? "segfault" : "crash",
+                t->pid, t->name, source_cpu, name, (void *)r->rip);
         if (r->vector == 14) kprintf(" addr=%p err=%lx", (void *)cr2, r->error);
         kprintf("\n");
         task_printf_stderr(t, "\n\x1b[31m*** %s (%s) at %p, addr %p ***\x1b[0m\n", name, t->name,
@@ -116,14 +114,18 @@ static void exception(struct regs *r) {
 
 void isr_dispatch(struct regs *r) {
     uint64_t v = r->vector;
-    /* AP は BSP の task/entropy/IRQ handler を実行しない。 */
+    if (cpu_is_runner()) {
+        sched_ap_interrupt(r);
+        return;
+    }
+    /* pure workerはBSPのtask/entropy/IRQ handlerを実行しない。 */
     if (cpu_is_worker()) {
         if (v < 32) cpu_worker_fault(r);
         if (v != 0xFF) lapic_eoi();
         return;
     }
     if (v < 32) {
-        exception(r);
+        exception(r, r->vector == 14 ? read_cr2() : 0, 0);
     } else if (v < 48) {
         int irq = (int)v - 32;
         if (irq == 7 && !(pic_isr(0x20) & 0x80)) return;
@@ -142,4 +144,13 @@ void isr_dispatch(struct regs *r) {
         if (vec_handlers[v]) vec_handlers[v](r);
     }
     if ((r->cs & 3) == 3) sched_user_return(r);
+}
+
+void isr_dispatch_remote(struct regs *r, uint64_t cr2) {
+    cpu_require_bsp();
+    ASSERT((r->cs & 3) == 3);
+    if (r->vector < 32) exception(r, cr2, cpu_runner_index());
+    else if (r->vector == 0x80) syscall_dispatch(r);
+    else panic("smp: invalid remote user trap %lu", r->vector);
+    sched_user_return(r);
 }

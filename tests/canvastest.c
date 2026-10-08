@@ -8,6 +8,8 @@
 static int checks,failures,errors; static bool done;
 static uint32_t pixels[128*128];
 static uint64_t image_request;
+static bool require_blit,blit_measured;
+static struct n_gpu_info blit_before;
 /* Finite transport fixture, decoded by the actual image codec. No fake pixels
    or external network/site acceptance: completion only queues native work. */
 static const char svg[]="<svg xmlns='http://www.w3.org/2000/svg' width='2' height='1'><rect width='1' height='1' fill='#ff0000'/><rect x='1' width='1' height='1' fill='#0000ff'/></svg>";
@@ -17,7 +19,15 @@ static bool request_image(void *unused,const struct web_request *r) {
     return true;
 }
 static void log_line(void *unused,int level,const char *text) {
-    if (!strncmp(text,"OK canvas ",10)) checks++;
+    if (!strcmp(text,"CANVAS-BLIT-BEGIN")) gpu_info(&blit_before);
+    else if (!strcmp(text,"CANVAS-BLIT-END")) {
+        struct n_gpu_info after={0};gpu_info(&after); checks++;
+        bool available=(blit_before.capabilities&N_GPU_CAP_BLIT)!=0;
+        blit_measured=available && after.submissions==blit_before.submissions+1 && after.failures==blit_before.failures;
+        if ((available && !blit_measured) || (require_blit && !blit_measured)) {
+            printf("FAIL canvas drawImage-native-blit\n"); failures++;
+        }
+    } else if (!strncmp(text,"OK canvas ",10)) checks++;
     else if (!strncmp(text,"FAIL canvas ",12)) { checks++;failures++;printf("%s\n",text); }
     else if (!strcmp(text,"CANVAS-DONE")) done=true;
     else if (level==2) { errors++;printf("Canvas JS error: %s\n",text); }
@@ -48,11 +58,12 @@ static const char page[]="<!doctype html><style>body{margin:0}</style><canvas id
     "let caught=false;try{CanvasRenderingContext2D.prototype.fillRect.call({},0,0,1,1)}catch(e){caught=e instanceof TypeError}ck('native-brand',caught);"
     "const s=document.createElement('canvas');s.width=4;s.height=1;const sx=s.getContext('2d'),source=new ImageData(new Uint8ClampedArray([255,0,0,255,0,255,0,255,0,0,255,255,255,255,255,255]),4,1);sx.putImageData(source,0,0);"
     "const q=document.createElement('canvas');q.width=4;q.height=2;const qx=q.getContext('2d');qx.imageSmoothingEnabled=false;"
-    "qx.drawImage(s,0,0);p=qx.getImageData(2,0,1,1).data;ck('draw-three',p[2]===255&&p[3]===255);"
+    "console.log('CANVAS-BLIT-BEGIN');qx.drawImage(s,0,0);console.log('CANVAS-BLIT-END');p=qx.getImageData(2,0,1,1).data;ck('draw-three',p[2]===255&&p[3]===255);"
     "qx.clearRect(0,0,4,2);qx.drawImage(s,0,0,2,1);p=qx.getImageData(0,0,2,1).data;ck('draw-five',p[1]===255&&p[4]===255&&p[5]===255&&p[6]===255);"
     "qx.clearRect(0,0,4,2);qx.drawImage(s,-1,0,4,1,0,0,4,1);p=qx.getImageData(0,0,4,1).data;ck('draw-crop-proportional',p[3]===0&&p[4]===255&&p[9]===255&&p[14]===255);"
     "qx.clearRect(0,0,4,2);qx.drawImage(s,3,0,-3,1,3,0,-3,1);p=qx.getImageData(0,0,3,1).data;ck('draw-negative-no-flip',p[0]===255&&p[5]===255&&p[10]===255);"
     "sx.imageSmoothingEnabled=false;sx.drawImage(s,0,0,3,1,1,0,3,1);p=sx.getImageData(0,0,4,1).data;ck('draw-self-snapshot',p[0]===255&&p[4]===255&&p[9]===255&&p[14]===255);sx.putImageData(source,0,0);"
+    "q.height=4;qx.imageSmoothingEnabled=false;qx.setTransform(2,0,0,2,0,0);qx.drawImage(s,1,0,2,1,0,1,2,1);p=qx.getImageData(0,2,4,2).data;ck('draw-nearest-axis-scale',p[1]===255&&p[5]===255&&p[10]===255&&p[14]===255&&p[17]===255&&p[30]===255&&qx.getImageData(0,1,1,1).data[3]===0);q.height=2;"
     "qx.fillStyle='#ffffff';qx.fillRect(0,0,4,2);qx.setTransform(-1,0,0,1,4,1);qx.globalAlpha=0.5;qx.drawImage(s,0,0);p=qx.getImageData(1,1,1,1).data;ck('draw-transform-alpha',p[0]>=126&&p[0]<=128&&p[1]>=126&&p[1]<=128&&p[2]===255&&p[3]===255&&qx.globalCompositeOperation==='source-over');qx.reset();"
     "const edge=document.createElement('canvas');edge.width=2;edge.height=1;edge.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray([255,0,0,255,0,0,255,0]),2,1),0,0);qx.drawImage(edge,0,0,4,1);p=qx.getImageData(1,0,1,1).data;ck('draw-premultiplied-smoothing',p[0]===255&&p[2]===0&&p[3]>=190&&p[3]<=192);"
     "const dataimg=new Image();dataimg.src='data:image/svg+xml,'+encodeURIComponent(\"<svg xmlns='http://www.w3.org/2000/svg' width='2' height='1'><rect width='2' height='1' fill='#00ff00'/></svg>\");qx.reset();qx.drawImage(dataimg,0,0);p=qx.getImageData(0,0,1,1).data;ck('draw-decoded-image',dataimg.naturalWidth===2&&p[1]===255&&p[3]===255);"
@@ -66,7 +77,8 @@ static const char page[]="<!doctype html><style>body{margin:0}</style><canvas id
     "const taintcopy=document.createElement('canvas'),tx=taintcopy.getContext('2d');tx.drawImage(q,0,0);caught=false;try{tx.getImageData(0,0,1,1)}catch(e){caught=e instanceof DOMException&&e.name==='SecurityError'}ck('draw-taint-propagation',caught);"
     "qx.clearRect(0,0,4,2);qx.putImageData(new ImageData(1,1),0,0);caught=false;try{qx.getImageData(0,0,1,1)}catch(e){caught=e.name==='SecurityError'}ck('draw-clear-does-not-untaint',caught);"
     "q.width=q.width;ck('draw-size-reset-untaints',qx.getImageData(0,0,1,1).data.every(x=>x===0));tx.reset();ck('draw-reset-untaints',tx.getImageData(0,0,1,1).data.every(x=>x===0));finish()};httpimg.onerror=()=>{ck('draw-http-fixture',false);finish()};httpimg.src='https://canvas.test/fixture.svg';</script>";
-int main(void) {
+int main(int argc,char **argv) {
+    for (int i=1;i<argc;i++) if (!strcmp(argv[i],"--require-blit")) require_blit=true;
     struct n_gpu_info before={0},after={0}; gpu_info(&before);
     struct web_host host={.console=log_line,.request=request_image};
     web_doc *doc=web_live(page,strlen(page),"https://canvas.test/","utf-8",&host);
@@ -88,7 +100,8 @@ int main(void) {
     gpu_info(&after);
     if ((before.capabilities&N_GPU_CAP_CLEAR) && after.submissions<=before.submissions) { printf("FAIL canvas GPU-not-used\n");failures++; }
     web_free(doc);
-    if (!done || checks<41 || errors) failures++;
+    if (!done || checks<43 || errors) failures++;
     printf("canvastest: %d checks, %d failed, %d errors, painted=%d GPU submissions=%lu\n",checks,failures,errors,painted,(unsigned long)(after.submissions-before.submissions));
+    printf("Canvas drawImage native blit=%u required=%u\n",(unsigned)blit_measured,(unsigned)require_blit);
     return failures!=0;
 }

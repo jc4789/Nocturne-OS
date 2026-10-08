@@ -178,15 +178,23 @@ nmedia *nmedia_open_memory(const void *bytes, size_t size, char *error, size_t e
     if (!open_input(m, error, error_size)) { nmedia_close(m); return NULL; }
     return m;
 }
-nmedia *nmedia_open_url(const char *url, char *error, size_t error_size) {
+static nmedia *open_url(const char *url, const char *document_url, char *error, size_t error_size) {
     nmedia *m = nmedia_ff_mallocz(sizeof *m);
     if (!m) { if(error&&error_size)strlcpy(error,"media allocation",error_size);return NULL; }
     m->fd = -1;
-    m->http = nmedia_http_open(url,error,error_size);
+    m->http = document_url ? nmedia_http_open_cors(url,document_url,error,error_size) :
+                            nmedia_http_open(url,error,error_size);
     if (!m->http) { nmedia_close(m);return NULL; }
     m->size = (size_t)nmedia_http_size(m->http);
     if (!open_input(m,error,error_size)) { nmedia_close(m);return NULL; }
     return m;
+}
+nmedia *nmedia_open_url(const char *url, char *error, size_t error_size) {
+    return open_url(url,NULL,error,error_size);
+}
+nmedia *nmedia_open_url_cors(const char *url, const char *document_url, char *error, size_t error_size) {
+    if (!document_url) { if(error&&error_size)strlcpy(error,"native document origin required",error_size);return NULL; }
+    return open_url(url,document_url,error,error_size);
 }
 const struct nmedia_info *nmedia_get_info(const nmedia *m) { return m ? &m->info : NULL; }
 const char *nmedia_error(const nmedia *m) { return m ? m->error : "no media"; }

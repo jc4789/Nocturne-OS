@@ -50,6 +50,9 @@ static uint64_t *next_level(uint64_t *table, int idx, bool create, bool user, in
 }
 
 bool vmm_map_page(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags) {
+    sched_quiesce_space(va >= USER_TOP ? 0 : pml4);
+    if ((flags & (PTE_U | PTE_W | PTE_SHARED)) == (PTE_U | PTE_W | PTE_SHARED))
+        sched_pin_space(pml4);
     bool user = flags & PTE_U;
     uint64_t *l4 = tbl(pml4);
     uint64_t *l3 = next_level(l4, (va >> 39) & 511, true, user, 4);
@@ -115,6 +118,7 @@ uint64_t vmm_translate(uint64_t pml4, uint64_t va) {
 }
 
 uint64_t vmm_unmap_page(uint64_t pml4, uint64_t va) {
+    sched_quiesce_space(va >= USER_TOP ? 0 : pml4);
     bool huge = false;
     uint64_t *p = walk(pml4, va, &huge);
     if (!p || !(*p & PTE_P) || huge) return 0;
@@ -141,6 +145,13 @@ static void map_range(uint64_t va, uint64_t pa, uint64_t size, uint64_t flags4k,
 
 void vmm_switch(uint64_t pml4) {
     if (read_cr3() != pml4) write_cr3(pml4);
+}
+
+void vmm_flush_all(void) {
+    uint64_t cr4 = read_cr4();
+    if (cr4 & (1ULL << 7)) write_cr4(cr4 & ~(1ULL << 7)); /* PGE */
+    write_cr3(read_cr3());
+    if (cr4 & (1ULL << 7)) write_cr4(cr4);
 }
 
 void vmm_init(struct limine_memmap_response *mm, struct limine_executable_address_response *ka) {
@@ -225,6 +236,7 @@ static void free_level(uint64_t phys, int level) {
 }
 
 void vmm_free_space(uint64_t pml4) {
+    sched_quiesce_space(pml4);
     uint64_t *t = tbl(pml4);
     for (int i = 0; i < 256; i++) {
         if (t[i] & PTE_P) free_level(t[i] & PTE_ADDR, 3);
@@ -239,6 +251,7 @@ static uint64_t prot_flags(int prot) {
 /* Map fresh zeroed pages. Pages that are already mapped keep their contents and gain the
    requested permissions (two ELF segments can share a page). */
 int vmm_user_alloc(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
+    sched_quiesce_space(pml4);
     uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + size, PAGE_SIZE);
     for (uint64_t a = start; a < end; a += PAGE_SIZE) {
         bool huge = false;
@@ -262,6 +275,7 @@ int vmm_user_alloc(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
 
 /* mprotect: set exactly these permissions on already-mapped user pages */
 int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
+    sched_quiesce_space(pml4);
     uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + size, PAGE_SIZE);
     for (uint64_t a = start; a < end; a += PAGE_SIZE) {
         bool huge = false;
@@ -286,6 +300,7 @@ void vmm_user_free(uint64_t pml4, uint64_t va, uint64_t size) {
 }
 
 int vmm_copy_to_space(uint64_t pml4, uint64_t va, const void *src, size_t n) {
+    sched_quiesce_space(pml4);
     const uint8_t *s = src;
     while (n) {
         uint64_t pa = vmm_translate(pml4, va);

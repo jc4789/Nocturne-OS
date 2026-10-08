@@ -13,6 +13,13 @@ int gpu_info(struct n_gpu_info *out) {
 int gpu_render(const struct n_gpu_render *r, uint32_t *pixels, size_t bytes) {
     return result(__syscall(SYS_GPU_RENDER,(long)r,(long)pixels,(long)bytes,0,0));
 }
+int gpu_render_batch(const struct n_gpu_batch *r, uint32_t *pixels, size_t bytes) {
+    return result(__syscall(SYS_GPU_RENDER_BATCH,(long)r,(long)pixels,(long)bytes,0,0));
+}
+int gpu_blit(const struct n_gpu_blit *r,const uint32_t *source,size_t source_bytes,
+             uint32_t *pixels,size_t bytes) {
+    return result(__syscall(SYS_GPU_BLIT,(long)r,(long)source,(long)source_bytes,(long)pixels,(long)bytes));
+}
 struct vertex { double p[4], c[4]; };
 static double plane(const struct vertex *v, unsigned p) {
     return v->p[3]+((p&1)?-v->p[p/2]:v->p[p/2]);
@@ -52,38 +59,22 @@ static void raster(canvas_t *dst,const struct vertex *a,const struct vertex *b,c
         dst->px[(size_t)yy*dst->pitch+xx]=(col[3]<<24)|(col[0]<<16)|(col[1]<<8)|col[2];
     }
 }
-static bool valid(const struct n_gpu_render *r) {
-    if (!r || !r->width || !r->height || r->width>N_GPU_MAX_SIDE || r->height>N_GPU_MAX_SIDE ||
-        (r->operation!=N_GPU_CLEAR && r->operation!=N_GPU_TRIANGLE)) return false;
-    if (r->operation==N_GPU_TRIANGLE) for (unsigned i=0;i<3;i++) {
-        const struct n_gpu_vertex *v=&r->vertex[i];
-        if (v->w<256 || v->w>16*65536 || v->x<-16*65536 || v->x>16*65536 ||
-            v->y<-16*65536 || v->y>16*65536 || v->z<-16*65536 || v->z>16*65536) return false;
+static bool valid_vertices(const struct n_gpu_vertex *v,unsigned count) {
+    for (unsigned i=0;i<count;i++) {
+        if (v[i].w<256 || v[i].w>16*65536 || v[i].x<-16*65536 || v[i].x>16*65536 ||
+            v[i].y<-16*65536 || v[i].y>16*65536 || v[i].z<-16*65536 || v[i].z>16*65536) return false;
     }
     return true;
 }
-int gfx_render3d(canvas_t *dst,const struct n_gpu_render *r) {
-    if (!dst || !dst->px || !valid(r) || dst->w<(int)r->width || dst->h<(int)r->height || dst->pitch<dst->w) {
-        errno=EINVAL; return -1;
-    }
-    /* Other gfx calls trust the canvas. This public bounded entry also clips
-       malformed/outside clip coordinates back to its advertised dimensions. */
-    canvas_t safe=*dst;
-    safe.cx0=MAX(0,MIN(safe.cx0,safe.w)); safe.cx1=MAX(safe.cx0,MIN(safe.cx1,safe.w));
-    safe.cy0=MAX(0,MIN(safe.cy0,safe.h)); safe.cy1=MAX(safe.cy0,MIN(safe.cy1,safe.h));
-    dst=&safe;
-    size_t bytes=(size_t)r->width*r->height*4;
-    uint32_t *pixels=malloc(bytes);
-    if (pixels && gpu_render(r,pixels,bytes)==0) {
-        canvas_t src; gfx_init(&src,pixels,r->width,r->height,r->width);
-        gfx_blit(dst,0,0,&src,0,0,r->width,r->height); free(pixels); return N_GPU_BACKEND_VIRGL;
-    }
-    free(pixels);
-    gfx_fill(dst,0,0,r->width,r->height,r->clear_argb);
-    if (r->operation==N_GPU_CLEAR) return N_GPU_BACKEND_CPU;
+static bool valid(const struct n_gpu_render *r) {
+    if (!r || !r->width || !r->height || r->width>N_GPU_MAX_SIDE || r->height>N_GPU_MAX_SIDE ||
+        (r->operation!=N_GPU_CLEAR && r->operation!=N_GPU_TRIANGLE)) return false;
+    return r->operation!=N_GPU_TRIANGLE || valid_vertices(r->vertex,3);
+}
+static void draw_triangle(canvas_t *dst,const struct n_gpu_vertex *source,unsigned width,unsigned height) {
     struct vertex v[16], next[16]; unsigned n=3;
     for (unsigned i=0;i<3;i++) {
-        const struct n_gpu_vertex *a=&r->vertex[i];
+        const struct n_gpu_vertex *a=&source[i];
         v[i].p[0]=a->x/65536.0; v[i].p[1]=a->y/65536.0; v[i].p[2]=a->z/65536.0; v[i].p[3]=a->w/65536.0;
         v[i].c[0]=(a->argb>>16)&255; v[i].c[1]=(a->argb>>8)&255; v[i].c[2]=a->argb&255; v[i].c[3]=a->argb>>24;
     }
@@ -97,6 +88,56 @@ int gfx_render3d(canvas_t *dst,const struct n_gpu_render *r) {
         }
         n=count; memcpy(v,next,n*sizeof *v);
     }
-    for (unsigned i=1;i+1<n;i++) raster(dst,&v[0],&v[i],&v[i+1],r->width,r->height);
+    for (unsigned i=1;i+1<n;i++) raster(dst,&v[0],&v[i],&v[i+1],width,height);
+}
+static canvas_t clipped(canvas_t *dst) {
+    /* Normalize untrusted clip coordinates before either backend is selected. */
+    canvas_t safe=*dst;
+    safe.cx0=MAX(0,MIN(safe.cx0,safe.w)); safe.cx1=MAX(safe.cx0,MIN(safe.cx1,safe.w));
+    safe.cy0=MAX(0,MIN(safe.cy0,safe.h)); safe.cy1=MAX(safe.cy0,MIN(safe.cy1,safe.h));
+    return safe;
+}
+int gfx_render3d(canvas_t *dst,const struct n_gpu_render *r) {
+    if (!dst || !dst->px || !valid(r) || dst->w<(int)r->width || dst->h<(int)r->height || dst->pitch<dst->w) {
+        errno=EINVAL; return -1;
+    }
+    canvas_t safe=clipped(dst); dst=&safe;
+    size_t bytes=(size_t)r->width*r->height*4;
+    uint32_t *pixels=malloc(bytes);
+    if (pixels && gpu_render(r,pixels,bytes)==0) {
+        canvas_t src; gfx_init(&src,pixels,r->width,r->height,r->width);
+        gfx_blit(dst,0,0,&src,0,0,r->width,r->height); free(pixels); return N_GPU_BACKEND_VIRGL;
+    }
+    free(pixels);
+    gfx_fill(dst,0,0,r->width,r->height,r->clear_argb);
+    if (r->operation==N_GPU_TRIANGLE) draw_triangle(dst,r->vertex,r->width,r->height);
+    return N_GPU_BACKEND_CPU;
+}
+int gfx_render3d_batch(canvas_t *dst,const struct n_gpu_batch *request) {
+    if (!request) { errno=EINVAL; return -1; }
+    /* Keep input stable even when its storage aliases the output canvas. */
+    struct n_gpu_batch r=*request;
+    if (!dst || !dst->px || !r.width || !r.height || r.width>N_GPU_MAX_SIDE || r.height>N_GPU_MAX_SIDE ||
+        r.triangle_count>N_GPU_MAX_TRIANGLES || !valid_vertices(r.vertex,r.triangle_count*3) ||
+        dst->w<(int)r.width || dst->h<(int)r.height || dst->pitch<dst->w) {
+        errno=EINVAL; return -1;
+    }
+    canvas_t safe=clipped(dst); dst=&safe;
+    size_t bytes=(size_t)r.width*r.height*4;
+    bool direct=dst->w==(int)r.width && dst->h==(int)r.height && dst->pitch==(int)r.width &&
+        dst->cx0==0 && dst->cy0==0 && dst->cx1==(int)r.width && dst->cy1==(int)r.height;
+    uint32_t *pixels=direct?dst->px:malloc(bytes);
+    if (pixels && gpu_render_batch(&r,pixels,bytes)==0) {
+        if (!direct) {
+            canvas_t src; gfx_init(&src,pixels,r.width,r.height,r.width);
+            gfx_blit(dst,0,0,&src,0,0,r.width,r.height); free(pixels);
+        }
+        return N_GPU_BACKEND_VIRGL;
+    }
+    if (!direct) free(pixels);
+    /* Device timeout never consumes pixels: the kernel copies only after the
+     * joined fence. CPU fallback clears once, then draws the identical list. */
+    gfx_fill(dst,0,0,r.width,r.height,r.clear_argb);
+    for (unsigned i=0;i<r.triangle_count;i++) draw_triangle(dst,&r.vertex[i*3],r.width,r.height);
     return N_GPU_BACKEND_CPU;
 }

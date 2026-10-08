@@ -632,12 +632,12 @@
         else throw new DOMException('Unsupported event interface','NotSupportedError');
         e._initialized=false;return e;
     };
-    function cssName(k){return String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase());}
+    function cssName(k){return k==='cssFloat'?'float':String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase());}
     class StyleDeclaration {
         constructor(node){this.node=node;return new Proxy(this,{get(t,k){if(k in t||typeof k==='symbol')return Reflect.get(t,k);return t.getPropertyValue(cssName(k));},set(t,k,v){if(k in t)return Reflect.set(t,k,v);t.setProperty(cssName(k),v);return true;}});}
         get cssText(){return reflectedAttr(this.node,'style')||'';}set cssText(v){reflectedAttr(this.node,'style',String(v));}
         getPropertyValue(name){return dom('style',this.node,String(name));}
-        getPropertyPriority(name){return /!important\s*$/i.test(this.getPropertyValue(name))?'important':'';}
+        getPropertyPriority(name){return dom('stylePriority',this.node,String(name));}
         setProperty(name,value,priority=''){dom('style',this.node,String(name),String(value),String(priority));}
         removeProperty(name){const old=this.getPropertyValue(name);this.setProperty(name,'');return old;}
         get length(){return this.cssText.split(';').filter(x=>x.includes(':')).length;}

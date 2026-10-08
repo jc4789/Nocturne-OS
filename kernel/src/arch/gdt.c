@@ -21,7 +21,7 @@ struct gdtr {
     uint64_t base;
 } PACKED;
 
-void tss_set_rsp0(uint64_t rsp0) { cpu_tss[0].rsp0 = rsp0; }
+void tss_set_rsp0(uint64_t rsp0) { cpu_tss[cpu_current_index()].rsp0 = rsp0; }
 
 void gdt_init(void) { gdt_init_cpu(0); }
 
@@ -61,27 +61,6 @@ void gdt_init_cpu(unsigned index) {
         "movw $0x28, %%ax\n"
         "ltr %%ax\n"
         : : "m"(g) : "rax", "memory");
-}
-
-/* ---- FPU / SSE ---- */
-void fpu_init(void) {
-    uint32_t a, b, c, d;
-    cpuid(1, 0, &a, &b, &c, &d);
-    if ((d & ((1u << 24) | (1u << 26))) != ((1u << 24) | (1u << 26)))
-        panic("cpu: FXSR/SSE2 required by Nocturne");
-    uint64_t cr0 = read_cr0();
-    cr0 &= ~(1ULL << 2); /* EM */
-    cr0 |= (1ULL << 1);  /* MP */
-    cr0 &= ~(1ULL << 3); /* TS */
-    write_cr0(cr0);
-    uint64_t cr4 = read_cr4();
-    /* task の保存形式は FXSAVE64。AVX 等を誤って有効化しない。 */
-    cr4 &= ~(1ULL << 18); /* OSXSAVE */
-    cr4 |= (1ULL << 9) | (1ULL << 10); /* OSFXSR, OSXMMEXCPT */
-    write_cr4(cr4);
-    __asm__ volatile("fninit");
-    uint32_t mxcsr = 0x1F80;
-    __asm__ volatile("ldmxcsr %0" : : "m"(mxcsr));
 }
 
 void cpu_get_brand(char *out) {

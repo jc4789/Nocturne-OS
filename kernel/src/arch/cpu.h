@@ -53,6 +53,15 @@ static inline uint64_t rdtsc(void) {
 static inline void cpuid(uint32_t leaf, uint32_t sub, uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d) {
     __asm__ volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(sub));
 }
+/* XSAVE対応/CR4.OSXSAVEの検査後だけ使用。XCR0はfpu.cの起動policy専用。 */
+static inline uint64_t xgetbv0(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0u));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline void xsetbv0(uint64_t value) {
+    __asm__ volatile("xsetbv" : : "a"((uint32_t)value), "d"((uint32_t)(value >> 32)), "c"(0u) : "memory");
+}
 
 /* interrupt frame pushed by isr.asm */
 struct regs {
@@ -82,6 +91,8 @@ bool lapic_worker_init(void);
 bool lapic_send_ipi(uint32_t apic_id, uint8_t vector);
 void lapic_eoi(void);
 bool lapic_timer_start(unsigned hz, int vector);
+bool lapic_runner_timer_start(void); /* BSPで較正済みのperiodic tickだけをAPで再使用 */
+void isr_dispatch_remote(struct regs *r, uint64_t cr2);
 extern uint64_t tsc_hz; /* measured by lapic_timer_start(); 0 if unknown */
 #define VEC_TIMER 0x30
 void pic_init(void);

@@ -13,6 +13,8 @@
 #define LAPIC_TIMER_DIV 0x3E0
 
 static volatile uint32_t *lapic;
+static uint32_t timer_reload;
+static int timer_vector;
 
 static void lapic_write(uint32_t reg, uint32_t v) { lapic[reg / 4] = v; }
 static uint32_t lapic_read(uint32_t reg) { return lapic[reg / 4]; }
@@ -132,8 +134,18 @@ bool lapic_timer_start(unsigned hz, int vector) {
         return false;
     }
     uint32_t init = (uint32_t)(freq / hz);
+    timer_reload = init;
+    timer_vector = vector;
     lapic_write(LAPIC_LVT_TIMER, 0x20000 | (uint32_t)vector); /* periodic, unmasked */
     lapic_write(LAPIC_TIMER_INIT, init);
     kprintf("apic: timer %lu kHz (from %s), %u Hz tick, TSC %lu kHz\n", freq / 1000, src, hz, tsc_hz / 1000);
+    return true;
+}
+
+bool lapic_runner_timer_start(void) {
+    if (!lapic || !timer_reload) return false;
+    lapic_write(LAPIC_TIMER_DIV, 0xB);
+    lapic_write(LAPIC_LVT_TIMER, 0x20000 | (uint32_t)timer_vector);
+    lapic_write(LAPIC_TIMER_INIT, timer_reload);
     return true;
 }

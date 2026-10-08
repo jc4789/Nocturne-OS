@@ -1,5 +1,6 @@
 #pragma once
 #include "kernel.h"
+#include "arch/fpu.h"
 
 struct regs;
 struct file;
@@ -15,13 +16,15 @@ struct wait_queue {
 };
 
 struct task {
-    uint8_t fpu[512] __attribute__((aligned(16)));
+    struct fpu_state fpu;
     int pid;
     char name[32];
     enum task_state state;
     bool is_user;
     bool killed;
     bool on_rq;
+    unsigned owner_cpu;       /* 0=BSP。AP retire ACK前はqueue/free禁止 */
+    bool bsp_only;            /* writable GUI/shared mappingを持つtaskはsticky pin */
     uint64_t ksp;
     uint8_t *kstack;
     uint64_t pml4;
@@ -43,9 +46,11 @@ struct task {
     int slice;
 };
 
-extern struct task *current_task;
+struct task **sched_current_slot(void);
+volatile bool *sched_resched_slot(void);
+#define current_task (*sched_current_slot())
+#define need_resched (*sched_resched_slot())
 extern struct task *task_list;
-extern volatile bool need_resched;
 
 void sched_init(void);
 struct task *task_alloc(const char *name);
@@ -55,6 +60,11 @@ void schedule(void);
 void sched_yield(void);
 void sched_tick(void);
 void sched_user_return(struct regs *r);
+void sched_post_switch(void); /* context_switch: 旧taskstackを離れた後だけpublication */
+NORETURN void sched_ap_loop(void);
+void sched_ap_interrupt(struct regs *r);
+void sched_quiesce_space(uint64_t pml4); /* 0=shared kernel変更、他は該当user space */
+void sched_pin_space(uint64_t pml4);
 NORETURN void task_exit(int code);
 struct task *task_find(int pid);
 int task_kill(int pid);

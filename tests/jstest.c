@@ -320,7 +320,11 @@ static void external_case(const char *file, const char *tail, const char *url) {
 static void test_lexbor(void) {
     external_case("js_lexbor_cases.js", ";const r=runLexborCases();check('lexbor-probe-count',r.checks===62&&r.legacyTotal===1&&r.unsupportedAPITotal===0);mark('api-done');", BASE);
 }
+static void test_cssom(void) {
+    external_case("js_cssom_cases.js", ";check('cssom-count',runCSSOMCases()===28);mark('api-done');", BASE);
+}
 static void test_platform(void) {
+    test_cssom();
     test_lexbor();
     external_case("js_attributes_cases.js", ";runAttributeCases().then(n=>{console.log('Attribute API checks '+n);check('attributes-count',n>70);mark('api-done');},e=>{console.log('FAIL attributes '+e+' '+e.stack);mark('api-done');});", BASE);
     external_case("js_tokens_cases.js", ";runTokenListCases().then(n=>{console.log('Token API checks '+n);check('tokens-count',n>100);mark('api-done');},e=>{console.log('FAIL tokens '+e+' '+e.stack);mark('api-done');});", BASE);
@@ -900,6 +904,7 @@ int main(int argc, char **argv) {
 #define RUN(name, fn) do { if (argc == 1 || !strcmp(argv[1], name)) { printf("jstest: %s\n", name); fflush(stdout); fn(); } } while (0)
     RUN("language", test_language);
     RUN("platform", test_platform);
+    RUN("cssom", test_cssom);
     /* Already included in platform above; selecting lexbor runs only its probes. */
     if (argc > 1 && !strcmp(argv[1], "lexbor")) { printf("jstest: lexbor\n"); fflush(stdout); test_lexbor(); }
     RUN("xhr", test_xhr);

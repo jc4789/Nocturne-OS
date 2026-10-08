@@ -878,6 +878,7 @@ static const struct web_host browser_host = {
     .cookie_get = host_cookie_get, .cookie_set = host_cookie_set
     , .navigate_mode = host_navigate_mode
     , .storage = host_storage
+    , .media_range = true
 };
 
 static void navigation_completed(webnet *net, uint64_t id, uint64_t gen,
@@ -1661,7 +1662,7 @@ static void handle_native_wait(const struct gui_event *e) {
 }
 
 static void document_step(uint64_t now) {
-    if (!doc || quit) return;
+    if (!doc || quit) { web_media_background(now); return; }
     if (scroll_event_pending && !native_wait && !web_script_running(doc)) {
         scroll_event_pending = false;
         web_document_scroll(doc);
@@ -1732,7 +1733,7 @@ int main(int argc, char **argv) {
             continue;
         }
         int timeout = webnet_timeout(network, now);
-        int64_t deadline = doc ? web_deadline(doc) : -1;
+        int64_t deadline = web_deadline(doc); /* retired media children also wake a document-less window */
         if (deadline >= 0) {
             int due = deadline <= (int64_t)now ? 0 : (int)MIN(deadline - (int64_t)now, 0x7fffffff);
             if (timeout < 0 || due < timeout) timeout = due;
@@ -1760,6 +1761,7 @@ int main(int argc, char **argv) {
     stop_navigation();
     cancel_document_requests();
     if (doc) web_free(doc);
+    web_media_background(uptime_ms()); /* cancel already killed children; never block the closing GUI */
     webnet_free(network);
     webstorage_free(storage);
     free(pending_post);

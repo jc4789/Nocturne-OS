@@ -111,6 +111,35 @@ static bool image_clip_axis(double *s,double *span,double *d,double *length,unsi
     *d+=*length*offset; *length*=fraction; *s=lo; *span=hi-lo;
     return isfinite(*d) && isfinite(*length) && *length>0;
 }
+static bool image_gpu_blit(struct web_canvas *c,web_doc *allocation,const uint32_t *pixels,
+                           unsigned w,unsigned h,double sx,double sy,double sw,double sh,
+                           double ox,double oy,double dw,double dh) {
+    /* A bounded replace/nearest subset of drawImage. Source-over is identical
+     * only when every sampled source texel is opaque. The existing RAM path
+     * handles alpha, smoothing, rotation, reflection, fractional and clipped
+     * draws; GPU failure must never corrupt that authoritative bitmap. */
+    if (w>N_GPU_MAX_SIDE || h>N_GPU_MAX_SIDE || dw<1 || dh<1 || dw>N_GPU_MAX_SIDE || dh>N_GPU_MAX_SIDE ||
+        ox<0 || oy<0 || ox+dw>c->w || oy+dh>c->h ||
+        sx!=floor(sx) || sy!=floor(sy) || sw!=floor(sw) || sh!=floor(sh) ||
+        ox!=floor(ox) || oy!=floor(oy) || dw!=floor(dw) || dh!=floor(dh)) return false;
+    struct n_gpu_info info;
+    if (gpu_info(&info)<0 || !(info.capabilities&N_GPU_CAP_BLIT)) return false;
+    unsigned x0=(unsigned)sx,y0=(unsigned)sy,cw=(unsigned)sw,ch=(unsigned)sh;
+    for (unsigned y=y0;y<y0+ch;y++) for (unsigned x=x0;x<x0+cw;x++)
+        if (pixels[(size_t)y*w+x]>>24!=255) return false;
+    size_t bytes=(size_t)(unsigned)dw*(unsigned)dh*4;
+    if (!allocation || allocation->canvas_bytes>CANVAS_BUDGET || bytes>CANVAS_BUDGET-allocation->canvas_bytes) return false;
+    uint32_t *output=malloc(bytes);
+    if (!output) return false;
+    allocation->canvas_bytes+=bytes;
+    struct n_gpu_blit r={.source_width=w,.source_height=h,.source_x=x0,.source_y=y0,.source_w=cw,.source_h=ch,
+        .width=(unsigned)dw,.height=(unsigned)dh};
+    bool ok=gpu_blit(&r,pixels,(size_t)w*h*4,output,bytes)==0;
+    if (ok) for (unsigned y=0;y<r.height;y++)
+        memcpy(c->pixels+(size_t)((unsigned)oy+y)*c->w+(unsigned)ox,output+(size_t)y*r.width,r.width*4);
+    free(output); allocation->canvas_bytes-=bytes;
+    return ok;
+}
 JSValue web_canvas_draw_image(JSContext *ctx,node_t *n,node_t *source,int argc,JSValueConst *argv) {
     if (!n || n->type!=N_ELEM || n->foreign || n->tag!=T_canvas)
         return JS_ThrowTypeError(ctx,"Illegal Canvas receiver");
@@ -161,6 +190,7 @@ JSValue web_canvas_draw_image(JSContext *ctx,node_t *n,node_t *source,int argc,J
     if (!sw || !sh) return JS_UNDEFINED;
     if (sw<0) { sx+=sw; sw=-sw; } if (sh<0) { sy+=sh; sh=-sh; }
     if (dw<0) { dx+=dw; dw=-dw; } if (dh<0) { dy+=dh; dh=-dh; }
+    bool crop_inside=sx>=0 && sy>=0 && sx+sw<=w && sy+sh<=h;
     struct web_canvas *c=ensure(n);
     if (!c) return JS_ThrowRangeError(ctx,"Canvas bitmap memory limit");
     /* Clearing/putImageData never untaints; only resetting bitmap dimensions
@@ -192,6 +222,13 @@ JSValue web_canvas_draw_image(JSContext *ctx,node_t *n,node_t *source,int argc,J
         snapshot=malloc(bytes);
         if (!snapshot) return JS_ThrowOutOfMemory(ctx);
         allocation->canvas_bytes+=bytes; memcpy(snapshot,pixels,bytes); pixels=snapshot;
+    }
+    /* Origin and self-copy snapshot semantics above are common to BOTH paths.
+     * The native source never escapes this synchronous call. */
+    if (!smooth && alpha==1 && crop_inside && m[1]==0 && m[2]==0 && m[0]>0 && m[3]>0 &&
+        image_gpu_blit(c,allocation,pixels,w,h,sx,sy,sw,sh,ox,oy,ux,vy)) {
+        free(snapshot); if (bytes) allocation->canvas_bytes-=bytes;
+        changed(n); return JS_UNDEFINED;
     }
     /* Work is bounded by the destination bitmap (at most 1M pixels), not
        author dimensions. Only finite, clamped source positions become indices. */

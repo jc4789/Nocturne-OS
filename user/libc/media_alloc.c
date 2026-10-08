@@ -25,6 +25,7 @@ struct allocation {
     size_t requested, charge;
 };
 static struct nmedia_alloc_stats totals = { .limit = NMEDIA_ALLOC_LIMIT_BYTES };
+static bool worker_restricted;
 static void increment(size_t *counter) {
     if (*counter != SIZE_MAX) ++*counter;
 }
@@ -41,10 +42,25 @@ size_t nmedia_alloc_charge(size_t requested) {
 void nmedia_alloc_snapshot(struct nmedia_alloc_stats *out) {
     if (out) *out = totals;
 }
+bool nmedia_alloc_reserve_worker(void) {
+    if(totals.reserved || NMEDIA_WORKER_BYTES > totals.limit-totals.current) {
+        rejected(NMEDIA_ALLOC_LIMIT);return false;
+    }
+    totals.reserved=NMEDIA_WORKER_BYTES;
+    if(totals.peak<totals.current+totals.reserved)totals.peak=totals.current+totals.reserved;
+    return true;
+}
+void nmedia_alloc_release_worker(void) { totals.reserved=0; }
+bool nmedia_alloc_restrict_worker(void) {
+    if(worker_restricted||totals.current||totals.blocks||totals.reserved||totals.peak)return false;
+    if(totals.limit>NMEDIA_WORKER_BYTES)totals.limit=NMEDIA_WORKER_BYTES;
+    worker_restricted=true;
+    return true;
+}
 void *nmedia_ff_malloc(size_t size) {
     size_t charge = nmedia_alloc_charge(size);
     if (!charge) { rejected(NMEDIA_ALLOC_OVERFLOW); return NULL; }
-    if (charge > totals.limit - totals.current) {
+    if (charge > totals.limit - totals.current - totals.reserved) {
         rejected(NMEDIA_ALLOC_LIMIT);
         return NULL;
     }
@@ -62,7 +78,7 @@ void *nmedia_ff_malloc(size_t size) {
     a->charge = charge;
     totals.current += charge;
     ++totals.blocks;
-    if (totals.peak < totals.current) totals.peak = totals.current;
+    if (totals.peak < totals.current+totals.reserved) totals.peak = totals.current+totals.reserved;
     return (void *)aligned;
 }
 void nmedia_ff_free(void *pointer) {

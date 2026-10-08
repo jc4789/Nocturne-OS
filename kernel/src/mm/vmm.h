@@ -48,6 +48,7 @@ void vmm_user_free(uint64_t pml4, uint64_t va, uint64_t size);
 int vmm_copy_to_space(uint64_t pml4, uint64_t va, const void *src, size_t n);
 bool vmm_handle_user_fault(uint64_t addr, uint64_t err);
 void vmm_switch(uint64_t pml4);
+void vmm_flush_all(void); /* PGEのglobal entryも含めてローカルTLBを破棄 */
 
 void *vmalloc(size_t pages);
 void vfree(void *p, size_t pages);

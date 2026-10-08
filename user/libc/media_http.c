@@ -13,9 +13,10 @@
 #define MEDIA_HTTP_TIMEOUT_MS 5000
 struct nmedia_http {
     char url[NMEDIA_HTTP_URL_BYTES], etag[160], error[160];
+    char origin[160];
     int64_t size, position, cache_start;
     size_t cache_len;
-    bool initialized;
+    bool initialized, browser, cross;
     unsigned char cache[NMEDIA_HTTP_CACHE_BYTES];
 };
 struct transfer {
@@ -25,6 +26,8 @@ struct transfer {
     size_t got, expected;
     bool have_range, have_length, have_encoding, have_type, have_etag;
     bool checked, discard;
+    bool have_origin, have_methods, have_headers;
+    char allow_origin[160], allow_methods[160], allow_headers[256];
     char etag[160], location[NMEDIA_HTTP_URL_BYTES], error[160];
 };
 static int rejected(struct transfer *t, const char *message) {
@@ -82,6 +85,48 @@ static bool valid_url(const char *s, struct url *parsed) {
     }
     size_t path_size = *end == '?' ? strlen(end) + 1 : *end ? strlen(end) : 1;
     return path_size < sizeof parsed->path && url_parse(s, parsed);
+}
+/* Serialize a native HTTP document's origin. Fragment/path never grant a new
+ * origin; userinfo/opaque URLs fail closed. Host case/default ports normalize. */
+static bool origin(const char *url, char out[160], bool *tls) {
+    if(!url || strlen(url)>=NMEDIA_HTTP_URL_BYTES)return false;
+    for(const unsigned char *p=(const unsigned char *)url;*p;p++)
+        if(*p<=32||*p>=127||*p=='\\')return false;
+    const char *a=!strncasecmp(url,"https://",8)?url+8:!strncasecmp(url,"http://",7)?url+7:NULL;
+    if(!a)return false;
+    char raw[160];size_t n=(size_t)(a+strcspn(a,"/?#")-url);
+    if(n+2>=sizeof raw)return false;
+    memcpy(raw,url,n);raw[n]='/';raw[n+1]=0;
+    memcpy(raw,!strncasecmp(url,"https://",8)?"https://":"http://",(size_t)(a-url));
+    struct url parsed;if(!valid_url(raw,&parsed))return false;
+    for(char *p=parsed.host;*p;p++)if(*p>='A'&&*p<='Z')*p=(char)(*p+'a'-'A');
+    int got=parsed.port==(parsed.tls?443:80)?snprintf(out,160,"%s://%s",parsed.tls?"https":"http",parsed.host):
+        snprintf(out,160,"%s://%s:%u",parsed.tls?"https":"http",parsed.host,parsed.port);
+    if(tls)*tls=parsed.tls;
+    return got>0&&got<160;
+}
+bool nmedia_http_browser_url(const char *url,const char *document_url) {
+    struct url parsed;char site[160],target[160];bool tls;
+    return valid_url(url,&parsed)&&origin(document_url,site,&tls)&&
+        origin(url,target,NULL)&&(!tls||parsed.tls);
+}
+static int cors(struct transfer *t) {
+    if(t->reader->cross&&(!t->have_origin||
+       (strcmp(t->allow_origin,"*")&&strcmp(t->allow_origin,t->reader->origin))))
+        return rejected(t,"anonymous media CORS response denied");
+    return 0;
+}
+static bool token_list(const char *list,const char *name,bool insensitive) {
+    for(const char *p=list;*p;) {
+        while(*p==' '||*p=='\t'||*p==',')p++;
+        const char *end=p+strcspn(p,","),*trim=end;
+        while(trim>p&&(trim[-1]==' '||trim[-1]=='\t'))trim--;
+        size_t n=(size_t)(trim-p);
+        if((n==1&&*p=='*')||(n==strlen(name)&&
+            (insensitive?!strncasecmp(p,name,n):!strncmp(p,name,n))))return true;
+        p=*end?end+1:end;
+    }
+    return false;
 }
 /* RFC 3986 dot-segment removal, without browser whitespace repair or path
  * truncation. Only the path is normalized; the query remains byte-for-byte. */
@@ -149,6 +194,15 @@ static int header(void *opaque, const char *line, size_t size) {
         if (t->have_encoding || n != 8 || strncasecmp(value, "identity", n))
             return rejected(t, "media requires identity Content-Encoding");
         t->have_encoding = true;
+    } else if (t->reader->browser && FIELD("Access-Control-Allow-Origin")) {
+        if(t->have_origin||!n||n>=sizeof t->allow_origin)return rejected(t,"ambiguous media CORS origin");
+        memcpy(t->allow_origin,value,n);t->allow_origin[n]=0;t->have_origin=true;
+    } else if (t->reader->browser && FIELD("Access-Control-Allow-Methods")) {
+        if(t->have_methods||n>=sizeof t->allow_methods)return rejected(t,"ambiguous media CORS methods");
+        memcpy(t->allow_methods,value,n);t->allow_methods[n]=0;t->have_methods=true;
+    } else if (t->reader->browser && FIELD("Access-Control-Allow-Headers")) {
+        if(t->have_headers||n>=sizeof t->allow_headers)return rejected(t,"ambiguous media CORS headers");
+        memcpy(t->allow_headers,value,n);t->allow_headers[n]=0;t->have_headers=true;
     } else if (FIELD("Content-Type")) {
         if (t->have_type || (n >= 10 && !strncasecmp(value, "multipart/", 10)))
             return rejected(t, "multipart/ambiguous media response rejected");
@@ -180,6 +234,7 @@ static bool redirect_status(int status) {
 }
 static int check_response(struct transfer *t) {
     nmedia_http *r = t->reader;
+    if(cors(t)<0)return -1; /* before any bytes enter the decoder's cache */
     if (t->response->status == 206) {
         if (!t->have_range || t->range_first != t->first || t->range_last > t->last ||
             t->range_last != (t->total-1 < t->last ? t->total-1 : t->last))
@@ -208,14 +263,39 @@ static int body(void *opaque, const char *bytes, size_t size) {
     memcpy(t->reader->cache + t->got, bytes, size); t->got += size;
     return 0;
 }
+static int discard_body(void *opaque,const char *bytes,size_t size) {
+    (void)bytes;(void)size;
+    ((struct transfer *)opaque)->discard=true;return -1;
+}
+static bool preflight(nmedia_http *r) {
+    struct http_resp response;
+    struct transfer t={.reader=r,.response=&response};
+    char headers[512];
+    int n=snprintf(headers,sizeof headers,"Origin: %s\r\nAccess-Control-Request-Method: GET\r\n"
+        "Access-Control-Request-Headers: %s\r\nAccept-Encoding: identity\r\n",
+        r->origin,r->etag[0]?"range, if-range":"range");
+    if(n<0||(size_t)n>=sizeof headers)return false;
+    struct http_req request={.method="OPTIONS",.url=r->url,.headers=headers,
+        .timeout_ms=MEDIA_HTTP_TIMEOUT_MS,.on_header=header,.on_body=discard_body,.ctx=&t};
+    int result=http_request(&request,&response);
+    bool ok=(result==0||t.discard)&&!t.error[0]&&response.status>=200&&response.status<300&&
+        cors(&t)==0&&token_list(t.allow_methods,"GET",false)&&token_list(t.allow_headers,"range",true)&&
+        (!r->etag[0]||token_list(t.allow_headers,"if-range",true));
+    if(!ok)snprintf(r->error,sizeof r->error,"media CORS Range preflight denied");
+    http_resp_free(&response);return ok;
+}
 static bool refill(nmedia_http *r, int64_t at) {
     r->cache_len = 0;
+    /* Matches the current browser worker's conservative non-safelisted Range
+     * policy. No cached permission or page-controlled Origin is trusted. */
+    if(r->cross&&!preflight(r))return false;
     for (unsigned redirects = 0; redirects <= 5; redirects++) {
         struct http_resp response;
         struct transfer t = { .reader = r, .response = &response, .first = at,
             .last = at > INT64_MAX - NMEDIA_HTTP_CACHE_BYTES ? INT64_MAX : at + NMEDIA_HTTP_CACHE_BYTES - 1 };
-        char headers[512];
-        int n = snprintf(headers, sizeof headers, "Range: bytes=%lld-%lld\r\nAccept-Encoding: identity\r\n%s%s%s",
+        char headers[768];
+        int n = snprintf(headers, sizeof headers, "%s%s%sRange: bytes=%lld-%lld\r\nAccept-Encoding: identity\r\n%s%s%s",
+            r->browser?"Origin: ":"",r->browser?r->origin:"",r->browser?"\r\n":"",
             (long long)t.first, (long long)t.last, r->etag[0] ? "If-Range: " : "", r->etag,
             r->etag[0] ? "\r\n" : "");
         if (n < 0 || (size_t)n >= sizeof headers) { snprintf(r->error,sizeof r->error,"media request limit"); return false; }
@@ -224,7 +304,7 @@ static bool refill(nmedia_http *r, int64_t at) {
         int result = http_request(&request, &response);
         if (redirect_status(response.status) && (result == 0 || t.discard) && !t.error[0]) {
             char next[NMEDIA_HTTP_URL_BYTES];
-            bool ok = !r->initialized && redirects < 5 && redirect_url(r->url,t.location,next,sizeof next);
+            bool ok = !r->browser && !r->initialized && redirects < 5 && redirect_url(r->url,t.location,next,sizeof next);
             http_resp_free(&response);
             if (!ok) { snprintf(r->error,sizeof r->error,"unsafe, changed or excessive media redirect"); return false; }
             memcpy(r->url,next,strlen(next)+1); continue;
@@ -240,15 +320,32 @@ static bool refill(nmedia_http *r, int64_t at) {
     }
     return false;
 }
-nmedia_http *nmedia_http_open(const char *url, char *error, size_t error_size) {
+static nmedia_http *open_reader(const char *url,const char *document_url,char *error,size_t error_size) {
     struct url parsed;
-    if (!valid_url(url,&parsed)) { if(error&&error_size)snprintf(error,error_size,"invalid anonymous media HTTP(S) URL");return NULL; }
+    if (!valid_url(url,&parsed)||(document_url&&!nmedia_http_browser_url(url,document_url))) {
+        if(error&&error_size)snprintf(error,error_size,"invalid, opaque or mixed-content media URL");return NULL;
+    }
     nmedia_http *r = nmedia_ff_mallocz(sizeof *r);
     if (!r) { if(error&&error_size)snprintf(error,error_size,"media HTTP cache allocation");return NULL; }
     memcpy(r->url,url,strlen(url)+1);
+    if(document_url) {
+        char target[160];r->browser=true;
+        if(!origin(document_url,r->origin,NULL)||!origin(url,target,NULL)) {
+            if(error&&error_size)snprintf(error,error_size,"invalid native media origin");
+            nmedia_http_close(r);return NULL;
+        }
+        r->cross=strcmp(r->origin,target)!=0;
+    }
     if (!refill(r,0)) { if(error&&error_size)snprintf(error,error_size,"%s",r->error);nmedia_http_close(r);return NULL; }
     if(error&&error_size)*error=0;
     return r;
+}
+nmedia_http *nmedia_http_open(const char *url,char *error,size_t error_size) {
+    return open_reader(url,NULL,error,error_size);
+}
+nmedia_http *nmedia_http_open_cors(const char *url,const char *document_url,char *error,size_t error_size) {
+    if(!document_url){if(error&&error_size)snprintf(error,error_size,"native document origin required");return NULL;}
+    return open_reader(url,document_url,error,error_size);
 }
 int nmedia_http_read(nmedia_http *r, void *out, int count) {
     if (!r || !out || count <= 0 || r->error[0]) return -1;

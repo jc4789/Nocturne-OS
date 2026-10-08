@@ -805,26 +805,104 @@ static bool css_property_equal(const char *begin, const char *end, const char *p
     size_t n = (size_t)(end - begin);
     return strlen(property) == n && (!strncmp(property, "--", 2) ? !strncmp(begin, property, n) : !strncasecmp(begin, property, n));
 }
+static const char *css_style_ws(const char *p, const char *end) {
+    for (;;) {
+        while (p < end && is_space((unsigned char)*p)) p++;
+        if (end - p < 2 || p[0] != '/' || p[1] != '*') return p;
+        p += 2;
+        while (end - p >= 2 && !(p[0] == '*' && p[1] == '/')) p++;
+        if (end - p < 2) return end;
+        p += 2;
+    }
+}
+/* Priority is not part of the CSSOM value. Do not split quoted strings,
+   functions or custom-property token streams at a nested exclamation mark. */
+static bool css_style_priority(const char *begin, const char **end) {
+    const char *bang = css_separator(begin, *end, '!');
+    if (bang == *end) return false;
+    const char *p = css_style_ws(bang + 1, *end);
+    if (*end - p < 9 || strncasecmp(p, "important", 9) ||
+        css_style_ws(p + 9, *end) != *end) return false;
+    *end = bang;
+    while (*end > begin && is_space((unsigned char)(*end)[-1])) (*end)--;
+    return true;
+}
+static JSValue css_style_value(JSContext *ctx, const char *property,
+                               const char *begin, const char *end) {
+    /* Normalize supported numeric opacity, not arbitrary/custom values.
+       Preserve var()/calc() token streams unchanged. */
+    if (!strcasecmp(property, "opacity") && end - begin > 0 && end - begin < 64) {
+        const char *p = begin, *number_end = end;
+        bool percent = end[-1] == '%';
+        if (percent) number_end--;
+        if (p < number_end && (*p == '+' || *p == '-')) p++;
+        const char *digits = p;
+        while (p < number_end && *p >= '0' && *p <= '9') p++;
+        bool any = p > digits;
+        if (p < number_end && *p == '.') {
+            p++; digits = p;
+            while (p < number_end && *p >= '0' && *p <= '9') p++;
+            any = p > digits;
+        }
+        if (any && p < number_end && (*p == 'e' || *p == 'E')) {
+            p++; if (p < number_end && (*p == '+' || *p == '-')) p++;
+            digits = p;
+            while (p < number_end && *p >= '0' && *p <= '9') p++;
+            any = p > digits;
+        }
+        if (any && p == number_end) {
+            char number[64], result[64];
+            memcpy(number, begin, (size_t)(number_end - begin));
+            number[number_end - begin] = 0;
+            double value = strtod(number, NULL);
+            if (isfinite(value) && fabs(value) < 1e12) {
+                if (fabs(value) < .0000005) value = 0;
+                int len = snprintf(result, sizeof result, "%.6f", value);
+                if (len > 0 && (size_t)len < sizeof result) {
+                    while (len && result[len-1] == '0') len--;
+                    if (len && result[len-1] == '.') len--;
+                    if (percent) result[len++] = '%';
+                    return JS_NewStringLen(ctx, result, (size_t)len);
+                }
+            }
+        }
+    }
+    return JS_NewStringLen(ctx, begin, (size_t)(end - begin));
+}
 static JSValue style_access(struct web_js_state *s, node_t *n, const char *property,
-                            bool set, JSValueConst value, JSValueConst priority) {
+                            bool set, JSValueConst value, JSValueConst priority, bool priority_only) {
     JSContext *ctx = s->ctx;
     const char *css = node_attr(n, "style"); if (!css) css = "";
     sbuf b = {0}; const char *found = NULL, *found_end = NULL;
+    bool found_important = false;
     const char *end = css + strlen(css);
     for (const char *p = css; p < end;) {
         const char *e = css_separator(p, end, ';'), *colon = css_separator(p, e, ':');
         if (colon < e && css_property_equal(p, colon, property)) {
-            found = colon + 1; found_end = e;
-            while (found < found_end && is_space((unsigned char)*found)) found++;
-            while (found_end > found && is_space((unsigned char)found_end[-1])) found_end--;
+            const char *v = colon + 1, *ve = e;
+            while (v < ve && is_space((unsigned char)*v)) v++;
+            while (ve > v && is_space((unsigned char)ve[-1])) ve--;
+            bool important = css_style_priority(v, &ve);
+            if (!found || important || !found_important) {
+                found = v; found_end = ve; found_important = important;
+            }
         } else if (set) { sb_put(&b, p, (size_t)(e - p)); if (e < end) sb_putc(&b, ';'); }
         p = e < end ? e + 1 : end;
     }
-    if (!set) { sb_free(&b); return JS_NewStringLen(ctx, found ? found : "", found ? (size_t)(found_end - found) : 0); }
+    if (!set) {
+        sb_free(&b);
+        if (priority_only) return JS_NewString(ctx, found_important ? "important" : "");
+        return found ? css_style_value(ctx, property, found, found_end) : JS_NewString(ctx, "");
+    }
     const char *v = JS_ToCString(ctx, value), *prio = JS_IsUndefined(priority) ? NULL : JS_ToCString(ctx, priority);
     if (!v || (!JS_IsUndefined(priority) && !prio)) { JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b); return JS_EXCEPTION; }
     if (strchr(property, ':') || strchr(property, ';') || strchr(property, '{') || strchr(property, '}')) { JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b); return JS_ThrowTypeError(ctx, "Invalid CSS property name"); }
-    if (prio && *prio && strcasecmp(prio, "important")) { JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b); return JS_UNDEFINED; }
+    const char *value_end = v + strlen(v);
+    if (*v && ((prio && *prio && strcasecmp(prio, "important")) ||
+               css_separator(v, value_end, '!') != value_end ||
+               css_separator(v, value_end, ';') != value_end)) {
+        JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b); return JS_UNDEFINED;
+    }
     if (*v) {
         if (b.n && b.p[b.n - 1] != ';') sb_putc(&b, ';');
         sb_puts(&b, property); sb_putc(&b, ':'); sb_puts(&b, v);
@@ -1369,7 +1447,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         else { result = JS_NewArray(ctx); for (int i = 0; i < found.n; ++i) if (JS_SetPropertyUint32(ctx, result, i, wrap(s, found.v[i])) < 0) { JS_FreeValue(ctx, result); result = JS_EXCEPTION; break; } }
         pv_free(&found);
     } else if (!strcmp(op, "matches")) { bool valid; bool matches = css_matches(n, p, &valid); result = valid ? JS_NewBool(ctx, matches) : JS_ThrowSyntaxError(ctx, "Invalid CSS selector"); }
-    else if (!strcmp(op, "style")) result = style_access(s, n, p, argc > 3, argc > 3 ? argv[3] : JS_UNDEFINED, argc > 4 ? argv[4] : JS_UNDEFINED);
+    else if (!strcmp(op, "style") || !strcmp(op, "stylePriority")) result = style_access(s, n, p, argc > 3, argc > 3 ? argv[3] : JS_UNDEFINED, argc > 4 ? argv[4] : JS_UNDEFINED, !strcmp(op, "stylePriority"));
     else if (!strcmp(op, "computed")) result = computed(s, n, p);
     else if (!strcmp(op, "geometry")) result = geometry(s, n, p);
     else result = JS_ThrowTypeError(ctx, "Unknown DOM operation");
@@ -1541,6 +1619,13 @@ static JSValue native_avmedia(JSContext *ctx, JSValueConst this_val, int argc, J
     if (!node && strcmp(op, "type")) {
         JS_FreeCString(ctx, op);
         return JS_ThrowTypeError(ctx, "Native media receiver required");
+    }
+    /* Direct native media IO is not appropriate for arbitrary embedders.
+       Both capability discovery and loading must obey the same host opt-in;
+       the media implementation separately validates owner/origin/CORS. */
+    if ((!strcmp(op, "range") || !strcmp(op, "loadURL")) && !state(ctx)->host.media_range) {
+        JS_FreeCString(ctx, op);
+        return JS_FALSE;
     }
     JSValue result = web_avmedia_call(ctx, state(ctx)->doc, node, op, argc - 2, argv + 2);
     JS_FreeCString(ctx, op);

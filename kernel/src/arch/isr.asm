@@ -79,6 +79,7 @@ section .text
 
 ; void context_switch(uint64_t *old_rsp, uint64_t new_rsp)
 global context_switch
+extern sched_post_switch
 context_switch:
     push rbp
     push rbx
@@ -88,6 +89,12 @@ context_switch:
     push r15
     mov [rdi], rsp
     mov rsp, rsi
+    ; 旧stackを離れ、callee-save contextの保存完了後にだけ所有移譲をACKする。
+    ; 新stackの保存レジスタはまだpopしていない。rbxはC ABI callee-save。
+    mov rbx, rsp
+    and rsp, -16
+    call sched_post_switch
+    mov rsp, rbx
     pop r15
     pop r14
     pop r13
@@ -107,5 +114,8 @@ kthread_trampoline:
 
 ; First code run by a brand new user task: the stack holds a struct regs
 global user_trampoline
+extern sched_user_return
 user_trampoline:
+    mov rdi, rsp
+    call sched_user_return
     jmp isr_exit

@@ -18,6 +18,7 @@
 
 _Static_assert(sizeof(struct n_dirent) == sizeof(struct dirent), "dirent ABI");
 _Static_assert(sizeof(struct n_stat) == sizeof(struct kstat), "stat ABI");
+_Static_assert(sizeof(struct n_gpu_blit) == 32, "GPU blit ABI");
 
 extern char cpu_brand[64];
 void power_off(void);
@@ -517,6 +518,50 @@ void syscall_dispatch(struct regs *r) {
         if (c < bytes) { ret = -EINVAL; break; }
         if (!user_ok_w((void *)b, bytes)) { ret = -EFAULT; break; }
         ret = gpu_render(&request, (uint32_t *)b, bytes);
+        break;
+    }
+    case SYS_GPU_RENDER_BATCH: {
+        /* Snapshot the complete finite request before the driver uses it.
+           A caller changing its user buffer cannot grow a validated batch. */
+        struct n_gpu_batch request;
+        if (!user_ok((void *)a, sizeof request)) { ret = -EFAULT; break; }
+        memcpy(&request, (void *)a, sizeof request);
+        if (!request.width || !request.height ||
+            request.width > N_GPU_MAX_SIDE || request.height > N_GPU_MAX_SIDE ||
+            request.triangle_count > N_GPU_MAX_TRIANGLES) {
+            ret = -EINVAL; break;
+        }
+        size_t bytes = (size_t)request.width * request.height * sizeof(uint32_t);
+        if (c < bytes) { ret = -EINVAL; break; }
+        if (!user_ok_w((void *)b, bytes)) { ret = -EFAULT; break; }
+        ret = gpu_render_batch(&request, (uint32_t *)b, bytes);
+        break;
+    }
+    case SYS_GPU_BLIT: {
+        struct n_gpu_blit request;
+        if (!user_ok((void *)a, sizeof request)) { ret = -EFAULT; break; }
+        memcpy(&request, (void *)a, sizeof request);
+        if (!request.width || !request.height ||
+            !request.source_width || !request.source_height ||
+            request.width > N_GPU_MAX_SIDE || request.height > N_GPU_MAX_SIDE ||
+            request.source_width > N_GPU_MAX_SIDE || request.source_height > N_GPU_MAX_SIDE ||
+            !request.source_w || !request.source_h ||
+            request.source_x > request.source_width || request.source_y > request.source_height ||
+            request.source_w > request.source_width - request.source_x ||
+            request.source_h > request.source_height - request.source_y) {
+            ret = -EINVAL; break;
+        }
+        size_t source_bytes = (size_t)request.source_width * request.source_height * sizeof(uint32_t);
+        size_t output_bytes = (size_t)request.width * request.height * sizeof(uint32_t);
+        if (c < source_bytes || e < output_bytes) { ret = -EINVAL; break; }
+        if (!user_ok((void *)b, source_bytes) || !user_ok_w((void *)d, output_bytes)) {
+            ret = -EFAULT; break;
+        }
+        /* The BSP-owned driver snapshots all source pixels before using the
+           device or touching output. No extra megabyte allocation per call;
+           input/output/request aliases are safe after the copies complete. */
+        ret = gpu_blit(&request, (const uint32_t *)b, source_bytes,
+                       (uint32_t *)d, output_bytes);
         break;
     }
     case SYS_YIELD: schedule(); ret = 0; break;

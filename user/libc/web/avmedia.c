@@ -1,8 +1,10 @@
-/* Private native HTML media bridge. It never opens a page-selected filesystem
- * path: bytes arrive through the browser's existing fetch/CORS path. */
+/* Private native HTML media bridge. No page-selected filesystem paths.
+ * Buffered fetch or anonymous per-response CORS-checked bounded Range input. */
 #include "avmedia.h"
 #include "media.h"
 #include "media_alloc_private.h"
+#include "media_worker_private.h"
+#include "../media_http_private.h"
 #include "nocturne.h"
 #include <errno.h>
 #include <stdio.h>
@@ -18,12 +20,13 @@ struct web_avmedia {
     node_t *node;
     uint32_t generation;
     nmedia *decoder;
+    nmedia_worker *worker;
     size_t input_size, audio_at;
     struct nmedia_output pending;
     uint32_t *pixels;
     size_t pixel_capacity;
     int width, height, fd;
-    bool playing, ended, muted;
+    bool playing, ended, muted, url_input;
     int ready;
     double volume;
     int64_t base_ms;
@@ -32,6 +35,9 @@ struct web_avmedia {
     int16_t scaled[4096 * 2];
 };
 static struct web_avmedia *streams;
+static const struct nmedia_info *information(struct web_avmedia *s) {
+    return s->worker?nmedia_worker_info(s->worker):nmedia_get_info(s->decoder);
+}
 static bool media_node(node_t *n) { return n && n->type == N_ELEM && !n->foreign && (n->tag == T_audio || n->tag == T_video); }
 static struct web_avmedia *find(web_doc *d, node_t *n, bool create) {
     unsigned count = 0;
@@ -47,18 +53,20 @@ static struct web_avmedia *find(web_doc *d, node_t *n, bool create) {
 static void close_audio(struct web_avmedia *s) { if (s->fd >= 0) { audio_flush(s->fd); close(s->fd); } s->fd = -1; }
 static void unload(struct web_avmedia *s) {
     close_audio(s); nmedia_close(s->decoder); s->decoder = NULL;
+    nmedia_worker_close(s->worker);s->worker=NULL;
     nmedia_ff_free(s->pixels); s->pixels = NULL; s->pixel_capacity = 0;
     s->width = s->height = 0; s->playing = s->ended = false;
+    s->url_input = false;
     s->base_ms = 0; s->input_size = 0; s->audio_at = 0; s->pending.kind = 0; s->ready = 0; s->error[0] = 0;
 }
 static int64_t current(struct web_avmedia *s, uint64_t now) {
-    int64_t ms = s->base_ms + (s->playing && now >= s->started ? (int64_t)(now - s->started) : 0);
-    const struct nmedia_info *info = nmedia_get_info(s->decoder);
+    int64_t ms = s->base_ms + (s->playing && !nmedia_worker_seeking(s->worker) && now >= s->started ? (int64_t)(now - s->started) : 0);
+    const struct nmedia_info *info = information(s);
     if (info && info->duration_ms >= 0 && ms > info->duration_ms) ms = info->duration_ms;
     return ms;
 }
 static bool audio_open(struct web_avmedia *s) {
-    const struct nmedia_info *info = nmedia_get_info(s->decoder);
+    const struct nmedia_info *info = information(s);
     if (!info || !info->audio) return true;
     s->fd = open("/dev/audio", O_RDWR | O_NONBLOCK);
     uint32_t queued=0;
@@ -66,6 +74,11 @@ static bool audio_open(struct web_avmedia *s) {
     s->error[0]=0;return true;
 }
 static bool seek(struct web_avmedia *s, int64_t ms, uint64_t now) {
+    if(s->worker) {
+        if(!nmedia_worker_seek(s->worker,ms))return false;
+        close_audio(s);s->base_ms=ms;s->started=now;s->pending.kind=0;s->audio_at=0;s->ended=false;s->ready=1;
+        return true;
+    }
     if (!s->decoder || !nmedia_seek(s->decoder,ms)) return false;
     close_audio(s); s->base_ms=ms; s->started=now; s->pending.kind=0; s->audio_at=0;s->ended=false;
     if(s->playing&&!audio_open(s)){s->playing=false;return false;}
@@ -82,7 +95,7 @@ static bool present(struct web_avmedia *s) {
 }
 static JSValue state(JSContext *ctx, struct web_avmedia *s) {
     JSValue o=JS_NewObject(ctx);
-    const struct nmedia_info *info=s?nmedia_get_info(s->decoder):NULL;
+    const struct nmedia_info *info=s?information(s):NULL;
     JS_SetPropertyStr(ctx,o,"readyState",JS_NewInt32(ctx,s?s->ready:0));
     JS_SetPropertyStr(ctx,o,"duration",JS_NewFloat64(ctx,info&&info->duration_ms>=0?info->duration_ms/1000.0:NAN));
     JS_SetPropertyStr(ctx,o,"currentTime",JS_NewFloat64(ctx,s?current(s,uptime_ms())/1000.0:0));
@@ -91,7 +104,16 @@ static JSValue state(JSContext *ctx, struct web_avmedia *s) {
     JS_SetPropertyStr(ctx,o,"videoWidth",JS_NewInt32(ctx,info?info->width:0));
     JS_SetPropertyStr(ctx,o,"videoHeight",JS_NewInt32(ctx,info?info->height:0));
     JS_SetPropertyStr(ctx,o,"error",s&&s->error[0]?JS_NewString(ctx,s->error):JS_NULL);
+    JS_SetPropertyStr(ctx,o,"loading",JS_NewBool(ctx,s&&nmedia_worker_loading(s->worker)));
+    JS_SetPropertyStr(ctx,o,"seeking",JS_NewBool(ctx,s&&nmedia_worker_seeking(s->worker)));
     return o;
+}
+static bool range_node(web_doc *d,node_t *n,const char *url) {
+    const char *credentials=node_attr(n,"crossorigin");
+    /* Inert/adopted family nodes cannot borrow the caller's document origin.
+     * Browser host permission is independently checked by native_avmedia. */
+    return n->owner==d&&!d->inert&&(!credentials||strcasecmp(credentials,"use-credentials"))&&
+        nmedia_http_browser_url(url,d->url);
 }
 JSValue web_avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *op, int argc, JSValueConst *argv) {
     if (!strcmp(op,"type")) {
@@ -101,6 +123,12 @@ JSValue web_avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *op, 
     }
     if(!media_node(n)||!d)return JS_ThrowTypeError(ctx,"HTMLMediaElement receiver required");
     if(n->owner!=d && (!n->owner || n->owner->dom_family!=d))return JS_ThrowTypeError(ctx,"foreign document media receiver");
+    if(!strcmp(op,"range")) {
+        if(!argc)return JS_FALSE;
+        size_t length;const char *url=JS_ToCStringLen(ctx,&length,argv[0]);if(!url)return JS_EXCEPTION;
+        bool allowed=length==strlen(url)&&range_node(d,n,url);JS_FreeCString(ctx,url);
+        return JS_NewBool(ctx,allowed);
+    }
     struct web_avmedia *s=find(d,n,strcmp(op,"state")!=0);
     if(!s)return !strcmp(op,"state")?state(ctx,NULL):JS_ThrowRangeError(ctx,"document media limit");
     uint64_t now=uptime_ms();
@@ -109,32 +137,43 @@ JSValue web_avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *op, 
         uint32_t generation;if(!argc||JS_ToUint32(ctx,&generation,argv[0])<0)return JS_EXCEPTION;
         unload(s);s->generation=generation;d->dirty=true;return JS_UNDEFINED;
     }
-    if(!strcmp(op,"load")){
+    if(!strcmp(op,"load")||!strcmp(op,"loadURL")){
         uint32_t generation;size_t size=0;
         if(argc<2||JS_ToUint32(ctx,&generation,argv[1])<0)return JS_EXCEPTION;
         if(s->generation!=generation)return JS_FALSE;
-        uint8_t *bytes=JS_GetArrayBuffer(ctx,&size,argv[0]);if(!bytes)return JS_EXCEPTION;
-        size_t total=0;unsigned decoders=0;for(struct web_avmedia *p=streams;p;p=p->next)if(p->doc==d&&p!=s){total+=p->input_size;if(p->decoder)decoders++;}
-        if(size>NMEDIA_MAX_BYTES||total>DOCUMENT_MEDIA_BYTES-size||decoders>=DOCUMENT_DECODER_LIMIT)return JS_ThrowRangeError(ctx,"document media resource limit");
+        bool url_input=!strcmp(op,"loadURL");
+        const char *url=NULL;uint8_t *bytes=NULL;
+        if(url_input) {
+            size_t length;url=JS_ToCStringLen(ctx,&length,argv[0]);if(!url)return JS_EXCEPTION;
+            if(length!=strlen(url)||!range_node(d,n,url)){JS_FreeCString(ctx,url);return JS_ThrowTypeError(ctx,"native media Range policy denied");}
+            size=NMEDIA_HTTP_CACHE_BYTES;
+        } else {bytes=JS_GetArrayBuffer(ctx,&size,argv[0]);if(!bytes)return JS_EXCEPTION;}
+        size_t total=0;unsigned decoders=0;for(struct web_avmedia *p=streams;p;p=p->next)if(p->doc==d&&p!=s){total+=p->input_size;if(p->decoder||p->worker)decoders++;}
+        if(size>NMEDIA_MAX_BYTES||total>DOCUMENT_MEDIA_BYTES-size||decoders>=DOCUMENT_DECODER_LIMIT){JS_FreeCString(ctx,url);return JS_ThrowRangeError(ctx,"document media resource limit");}
         unload(s);s->generation=generation;
-        s->decoder=nmedia_open_memory(bytes,size,s->error,sizeof s->error);
+        if(url_input)s->worker=nmedia_worker_open(url,d->url,generation,s->error,sizeof s->error);
+        else s->decoder=nmedia_open_memory(bytes,size,s->error,sizeof s->error);
+        JS_FreeCString(ctx,url);s->url_input=url_input;
+        if(s->worker)s->input_size=size; /* Metadata arrives only after worker OPEN. */
         if(s->decoder){
             s->input_size=size;s->ready=1;
             int result=NMEDIA_AGAIN;
             for(int i=0;i<4&&result==NMEDIA_AGAIN;i++)result=nmedia_step(s->decoder,&s->pending);
             if(result==NMEDIA_ERROR){strlcpy(s->error,nmedia_error(s->decoder),sizeof s->error);nmedia_close(s->decoder);s->decoder=NULL;s->input_size=0;s->ready=0;}
             else if(result==NMEDIA_AUDIO||result==NMEDIA_VIDEO){
-                s->ready=4;
+                s->ready=url_input?2:4; /* A single window does not promise canplaythrough. */
                 if(result==NMEDIA_VIDEO&&!present(s)){nmedia_close(s->decoder);s->decoder=NULL;s->input_size=0;s->ready=0;}
             }
         }
-        d->dirty=true;return JS_NewBool(ctx,s->decoder!=NULL);
+        d->dirty=true;return JS_NewBool(ctx,s->decoder!=NULL||s->worker!=NULL);
     }
     if(!strcmp(op,"play")){
-        if(!s->decoder)return JS_FALSE;
+        if((!s->decoder&&!s->worker)||!s->ready||nmedia_worker_seeking(s->worker))return JS_FALSE;
         if(s->playing)return JS_TRUE;
         if(s->ended&&!seek(s,0,now))return JS_FALSE;
-        if(!audio_open(s))return JS_FALSE;
+        /* An ended worker restarts through a real asynchronous seek. Do not
+         * open (and then overwrite) an audio FD before that seek's ACK. */
+        if(!nmedia_worker_seeking(s->worker)&&!audio_open(s))return JS_FALSE;
         s->playing=true;s->started=now;s->ended=false;return JS_TRUE;
     }
     if(!strcmp(op,"pause")){
@@ -155,12 +194,28 @@ JSValue web_avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *op, 
     return JS_ThrowTypeError(ctx,"unknown native media operation");
 }
 static void pump(struct web_avmedia *s,uint64_t now){
-    if(!s->decoder||!s->playing)return;
+    if(s->worker) {
+        bool was_seeking=nmedia_worker_seeking(s->worker);
+        nmedia_worker_pump(s->worker,now);
+        const char *error=nmedia_worker_error(s->worker);
+        if(*error){strlcpy(s->error,error,sizeof s->error);s->playing=false;s->ready=0;close_audio(s);s->doc->dirty=true;return;}
+        if(nmedia_worker_loading(s->worker)||nmedia_worker_seeking(s->worker))return;
+        if(was_seeking){s->started=now;if(s->playing&&!audio_open(s)){s->playing=false;return;}}
+        if(!s->ready)s->ready=1;
+        if(!s->pending.kind) {
+            int r=nmedia_worker_take(s->worker,&s->pending);s->audio_at=0;
+            if(r==NMEDIA_AGAIN){if(s->playing||s->ready<2)nmedia_worker_step(s->worker);return;}
+            if(r==NMEDIA_END&&s->ready<2){strlcpy(s->error,"native worker input has no decoded data",sizeof s->error);s->ready=0;nmedia_worker_close(s->worker);s->worker=NULL;s->input_size=0;s->doc->dirty=true;return;}
+            if(r==NMEDIA_AUDIO||r==NMEDIA_VIDEO){s->ready=2;if(r==NMEDIA_VIDEO&&!s->playing){if(!present(s))return;s->pending.kind=0;s->doc->dirty=true;}}
+        }
+    }
+    if((!s->decoder&&!s->worker)||!s->playing)return;
     for(int budget=0;budget<8;budget++){
-        if(!s->pending.kind){int r=nmedia_step(s->decoder,&s->pending);s->audio_at=0;
+        if(!s->pending.kind){int r=s->worker?nmedia_worker_take(s->worker,&s->pending):nmedia_step(s->decoder,&s->pending);s->audio_at=0;
+            if(s->worker&&r==NMEDIA_AGAIN){nmedia_worker_step(s->worker);return;}
             if(r==NMEDIA_AGAIN)return;
             if(r==NMEDIA_ERROR){strlcpy(s->error,nmedia_error(s->decoder),sizeof s->error);s->base_ms=current(s,now);s->playing=false;close_audio(s);s->doc->dirty=true;return;}
-            if(r==NMEDIA_AUDIO||r==NMEDIA_VIDEO)s->ready=4;
+            if(r==NMEDIA_AUDIO||r==NMEDIA_VIDEO)s->ready=s->url_input?2:4;
         }
         if(s->pending.kind==NMEDIA_VIDEO){
             if(s->pending.pts_ms>current(s,now)+5)return;
@@ -183,7 +238,7 @@ static void pump(struct web_avmedia *s,uint64_t now){
             /* EOF is not the end of the last displayed frame. Honor a known
              * duration only for a bounded <=1s tail; corrupt/unknown duration
              * must not hold an already-drained decoder forever. */
-            const struct nmedia_info *info=nmedia_get_info(s->decoder);
+            const struct nmedia_info *info=information(s);
             int64_t at=current(s,now);
             if(info&&info->video&&info->duration_ms>at&&info->duration_ms-at<=1000)return;
             s->base_ms=current(s,now);s->playing=false;s->ended=true;close_audio(s);s->doc->dirty=true;return;
@@ -191,11 +246,14 @@ static void pump(struct web_avmedia *s,uint64_t now){
     }
 }
 void web_avmedia_tick(web_doc *d,uint64_t now){
+    nmedia_worker_background(now);
     for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d){
         if(s->node->owner!=d&&(!s->node->owner||s->node->owner->dom_family!=d))unload(s);
         else pump(s,now);
     }
 }
+void web_avmedia_background(uint64_t now){nmedia_worker_background(now);}
+int64_t web_avmedia_background_deadline(uint64_t now){return nmedia_worker_deadline(now);}
 int64_t web_avmedia_deadline(web_doc *d,uint64_t now){
     for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d&&s->playing)return (int64_t)now+10;
     return -1;
@@ -227,9 +285,9 @@ bool web_avmedia_paint(web_doc *d,node_t *n,canvas_t *c,int x,int y,int w,int h)
     c->cx0=ox0;c->cy0=oy0;c->cx1=ox1;c->cy1=oy1;return true;
 }
 bool web_avmedia_size(node_t *n,int *w,int *h){
-    for(struct web_avmedia *s=streams;s;s=s->next)if(s->node==n&&s->decoder){
-        const struct nmedia_info *info=nmedia_get_info(s->decoder);
-        if(info->video&&info->width>0&&info->height>0){*w=info->width;*h=info->height;return true;}
+    for(struct web_avmedia *s=streams;s;s=s->next)if(s->node==n&&(s->decoder||s->worker)){
+        const struct nmedia_info *info=information(s);
+        if(info&&info->video&&info->width>0&&info->height>0){*w=info->width;*h=info->height;return true;}
     }
     return false;
 }

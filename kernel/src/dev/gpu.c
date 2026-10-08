@@ -27,7 +27,12 @@
 #define CTX_ID 1u
 #define TARGET_ID 1u
 #define VERTEX_ID 2u
+#define SOURCE_ID 3u
+#define VERTEX_BYTES (N_GPU_MAX_TRIANGLES * 3u * 32u)
 #define CMD(c,o,n) ((uint32_t)(c) | ((uint32_t)(o) << 8) | ((uint32_t)(n) << 16))
+_Static_assert(VERTEX_BYTES <= PAGE_SIZE, "bounded vertex DMA page");
+_Static_assert(sizeof(struct n_gpu_batch) == 1936, "fixed batch ABI");
+_Static_assert(sizeof(struct n_gpu_blit) == 32, "fixed texture blit ABI");
 
 struct virtio_common {
     volatile uint32_t device_feature_select, device_feature;
@@ -49,9 +54,9 @@ static volatile uint16_t *notify;
 static struct descriptor *desc;
 static struct avail *avail;
 static struct used *used;
-static uint64_t packets_phys, target_phys, vertex_phys;
+static uint64_t packets_phys, target_phys, vertex_phys, source_phys;
 static uint8_t *packets;
-static uint32_t *target, *vertices;
+static uint32_t *target, *vertices, *source_pixels;
 static uint16_t seen_used;
 static uint32_t reply_bytes, capset_count;
 static uint64_t next_fence = 1;
@@ -243,8 +248,11 @@ static bool resource(uint32_t id, uint32_t target_kind, uint32_t format, uint32_
     struct { struct header h; uint32_t id, pad; } PACKED ctx = {.h=hdr(CMD_CTX_ATTACH,true), .id=id};
     return exchange(&ctx, sizeof ctx, OK_NODATA);
 }
-struct stream { uint32_t data[768]; unsigned n; };
-static void emit(struct stream *s, uint32_t word) { if (s->n < ARRAY_SIZE(s->data)) s->data[s->n++] = word; }
+struct stream { uint32_t data[768]; unsigned n; bool overflow; };
+static void emit(struct stream *s, uint32_t word) {
+    if (s->n < ARRAY_SIZE(s->data)) s->data[s->n++] = word;
+    else s->overflow=true;
+}
 static void command(struct stream *s, unsigned op, unsigned object, const uint32_t *p, unsigned n) {
     emit(s,CMD(op,object,n)); for (unsigned i=0;i<n;i++) emit(s,p[i]);
 }
@@ -269,6 +277,7 @@ static void shader(struct stream *s, uint32_t handle, uint32_t type, const char 
     }
 }
 static bool submit(struct stream *s) {
+    if (s->overflow || s->n > ARRAY_SIZE(s->data)) return false;
     struct { struct header h; uint32_t size,pad; uint32_t data[768]; } PACKED p;
     p.h=hdr(CMD_SUBMIT,true); p.size=s->n*4; p.pad=0;
     memcpy(p.data,s->data,p.size);
@@ -285,7 +294,7 @@ static bool pipeline_init(void) {
     memset(target,0xA5,SIDE*SIDE*4);
     /* PIPE_TEXTURE_2D=2, RENDER_TARGET|SAMPLER_VIEW; PIPE_BUFFER=0. */
     if (!resource(TARGET_ID,2,FORMAT_BGRA,2|8,SIDE,SIDE,target_phys,SIDE*SIDE*4) ||
-        !resource(VERTEX_ID,0,64,16,96,1,vertex_phys,PAGE_SIZE)) return false;
+        !resource(VERTEX_ID,0,64,16,VERTEX_BYTES,1,vertex_phys,PAGE_SIZE)) return false;
     struct stream s={0};
     command(&s,1,8,(uint32_t[]){1,TARGET_ID,FORMAT_BGRA,0,0},5);
     command(&s,5,0,(uint32_t[]){1,0,1},3);
@@ -303,6 +312,53 @@ static bool pipeline_init(void) {
     command(&s,2,3,(uint32_t[]){7},1);
     command(&s,6,0,(uint32_t[]){32,0,VERTEX_ID},3);
     return submit(&s);
+}
+static bool blit_pipeline_init(void) {
+    /* Separate from the target even for source/output aliases. This fixed
+     * private texture/backing persists; timeout never frees in-flight DMA. */
+    source_phys=pmm_alloc_contig((SIDE*SIDE*4)/PAGE_SIZE);
+    if (!source_phys) return false; /* Memory pressure need not revoke legacy. */
+    source_pixels=phys_to_virt(source_phys);
+    memset(source_pixels,0,SIDE*SIDE*4);
+    return resource(SOURCE_ID,2,FORMAT_BGRA,2|8,SIDE,SIDE,source_phys,SIDE*SIDE*4);
+}
+static bool valid_blit(const struct n_gpu_blit *r) {
+    return r && r->source_width && r->source_height && r->width && r->height &&
+        r->source_width<=SIDE && r->source_height<=SIDE && r->width<=SIDE && r->height<=SIDE &&
+        r->source_w && r->source_h && r->source_x<=r->source_width && r->source_y<=r->source_height &&
+        r->source_w<=r->source_width-r->source_x && r->source_h<=r->source_height-r->source_y;
+}
+static bool blit_internal(const struct n_gpu_blit *r,const uint32_t *pixels) {
+    /* Caller holds busy. Copy ALL packed input before touching the host or
+     * the output, so an aliased copyout cannot destroy subsequent input rows. */
+    for (unsigned y=0;y<r->source_height;y++)
+        memcpy(source_pixels+(size_t)y*SIDE,pixels+(size_t)y*r->source_width,r->source_width*4);
+    struct stream s={0};
+    stream_transfer(&s,SOURCE_ID,r->source_width,r->source_height,SIDE*4,1);
+    /* VIRGL_CCMD_BLIT=16, 21 words. Fixed RGBA mask/nearest/no blend/no
+     * scissor, mip0 and depth1. Both resources use Y_0_TOP; vrend's blit
+     * converts these top-origin boxes to GL coordinates independently. */
+    command(&s,16,0,(uint32_t[]){15,0,0,TARGET_ID,0,FORMAT_BGRA,0,0,0,r->width,r->height,1,
+        SOURCE_ID,0,FORMAT_BGRA,r->source_x,r->source_y,0,r->source_w,r->source_h,1},21);
+    stream_transfer(&s,TARGET_ID,r->width,r->height,SIDE*4,2);
+    return submit(&s); /* One fence covers input upload, GPU blit and readback. */
+}
+static bool blit_pixel_test(void) {
+    /* Asymmetric ARGB rows/crop, then scale. No CPU-filled fake output. */
+    const uint32_t input[12]={0xff010203,0xff102030,0xff405060,0xff708090,
+        0xffa1b2c3,0x7f112233,0x80224466,0xffabcdef,
+        0xff998877,0x20345678,0x4056789a,0xff987654};
+    struct n_gpu_blit r={.source_width=4,.source_height=3,.source_x=1,.source_y=1,
+        .source_w=2,.source_h=2,.width=4,.height=4};
+    if (!blit_internal(&r,input)) return false;
+    for (unsigned y=0;y<r.height;y++) for (unsigned x=0;x<r.width;x++) {
+        uint32_t expected=input[(1+y/2)*4+1+x/2];
+        if (target[y*SIDE+x]!=expected) {
+            kprintf("gpu: blit pixel mismatch x=%u y=%u got=%x expected=%x\n",x,y,target[y*SIDE+x],expected);
+            return false;
+        }
+    }
+    return true;
 }
 
 /* Integer-only conversion, including round-to-nearest-even. The kernel never
@@ -322,40 +378,66 @@ static uint32_t fixed_float(int32_t q) {
     return sign|((top+127-16)<<23)|(sig&0x7fffff);
 }
 static uint32_t color_float(unsigned c) { return fixed_float((int32_t)((c*65536u+127)/255)); }
-static bool render_internal(const struct n_gpu_render *r) {
-    struct stream s={0}; uint32_t color=r->clear_argb;
-    command(&s,4,0,(uint32_t[]){0,fixed_float((int32_t)r->width*32768),
-        fixed_float((int32_t)r->height*32768),0x3f000000,
-        fixed_float((int32_t)r->width*32768),fixed_float(SIDE*65536-(int32_t)r->height*32768),0x3f000000},7);
+static bool render_frame(unsigned width, unsigned height, uint32_t color,
+                         const struct n_gpu_vertex *v, unsigned triangle_count) {
+    struct stream s={0};
+    command(&s,4,0,(uint32_t[]){0,fixed_float((int32_t)width*32768),
+        fixed_float((int32_t)height*32768),0x3f000000,
+        fixed_float((int32_t)width*32768),fixed_float(SIDE*65536-(int32_t)height*32768),0x3f000000},7);
     /* glViewport is bottom-origin; Y_0_TOP readback starts at the opposite
      * edge of the fixed SIDE-high resource. Place the requested viewport at
      * GL y=SIDE-height, so partial-size readback contains the actual draw. */
     command(&s,7,0,(uint32_t[]){4,color_float((color>>16)&255),color_float((color>>8)&255),
         color_float(color&255),color_float(color>>24),0,0x3ff00000,0},8);
-    if (r->operation==N_GPU_TRIANGLE) {
-        for (unsigned i=0;i<3;i++) {
-            const struct n_gpu_vertex *v=&r->vertex[i];
-            vertices[i*8]=fixed_float(v->x); vertices[i*8+1]=fixed_float(v->y);
-            vertices[i*8+2]=fixed_float(v->z); vertices[i*8+3]=fixed_float(v->w);
-            vertices[i*8+4]=color_float((v->argb>>16)&255); vertices[i*8+5]=color_float((v->argb>>8)&255);
-            vertices[i*8+6]=color_float(v->argb&255); vertices[i*8+7]=color_float(v->argb>>24);
+    if (triangle_count) {
+        unsigned count=triangle_count*3;
+        for (unsigned i=0;i<count;i++) {
+            vertices[i*8]=fixed_float(v[i].x); vertices[i*8+1]=fixed_float(v[i].y);
+            vertices[i*8+2]=fixed_float(v[i].z); vertices[i*8+3]=fixed_float(v[i].w);
+            vertices[i*8+4]=color_float((v[i].argb>>16)&255); vertices[i*8+5]=color_float((v[i].argb>>8)&255);
+            vertices[i*8+6]=color_float(v[i].argb&255); vertices[i*8+7]=color_float(v[i].argb>>24);
         }
-        stream_transfer(&s,VERTEX_ID,96,1,0,1);
-        command(&s,8,0,(uint32_t[]){0,3,4,0,1,0,0,0,0,0,2,0},12); /* TRIANGLES */
+        /* One contiguous upload, one triangle-list draw, no per-primitive
+         * fence or CPU readback. The pipeline objects persist across frames. */
+        stream_transfer(&s,VERTEX_ID,count*32,1,0,1);
+        command(&s,8,0,(uint32_t[]){0,count,4,0,1,0,0,0,0,0,count-1,0},12);
     }
-    stream_transfer(&s,TARGET_ID,r->width,r->height,SIDE*4,2);
+    stream_transfer(&s,TARGET_ID,width,height,SIDE*4,2);
     /* The fence covers upload, draw, and readback before CPU consumption. */
     return submit(&s);
+}
+static bool render_internal(const struct n_gpu_render *r) {
+    return render_frame(r->width,r->height,r->clear_argb,r->vertex,r->operation==N_GPU_TRIANGLE?1:0);
+}
+static bool valid_vertices(const struct n_gpu_vertex *v, unsigned count) {
+    for (unsigned i=0;i<count;i++) {
+        if (v[i].w<256 || v[i].w>16*65536 || v[i].x<-16*65536 || v[i].x>16*65536 ||
+            v[i].y<-16*65536 || v[i].y>16*65536 || v[i].z<-16*65536 || v[i].z>16*65536) return false;
+    }
+    return true;
 }
 static bool valid(const struct n_gpu_render *r) {
     if (!r || !r->width || !r->height || r->width>SIDE || r->height>SIDE ||
         (r->operation!=N_GPU_CLEAR && r->operation!=N_GPU_TRIANGLE)) return false;
-    if (r->operation==N_GPU_TRIANGLE) for (unsigned i=0;i<3;i++) {
-        const struct n_gpu_vertex *v=&r->vertex[i];
-        if (v->w<256 || v->w>16*65536 || v->x<-16*65536 || v->x>16*65536 ||
-            v->y<-16*65536 || v->y>16*65536 || v->z<-16*65536 || v->z>16*65536) return false;
-    }
-    return true;
+    return r->operation!=N_GPU_TRIANGLE || valid_vertices(r->vertex,3);
+}
+static bool batch_pixel_test(void) {
+    /* Exercise the last vertex of the largest upload as well as its first.
+     * Intermediate primitives lie outside the homogeneous clipping volume. */
+    struct n_gpu_batch r={.width=32,.height=32,.clear_argb=0xff284c78,.triangle_count=N_GPU_MAX_TRIANGLES};
+    for (unsigned i=0;i<N_GPU_MAX_TRIANGLES*3;i++)
+        r.vertex[i]=(struct n_gpu_vertex){131072,0,0,65536,0xff00ff00};
+    r.vertex[0]=(struct n_gpu_vertex){-58982,-49152,0,65536,0xffff0000};
+    r.vertex[1]=(struct n_gpu_vertex){-6554,-49152,0,65536,0xffff0000};
+    r.vertex[2]=(struct n_gpu_vertex){-32768,49152,0,65536,0xffff0000};
+    unsigned last=(N_GPU_MAX_TRIANGLES-1)*3;
+    r.vertex[last]=(struct n_gpu_vertex){6554,-49152,0,65536,0xff0000ff};
+    r.vertex[last+1]=(struct n_gpu_vertex){58982,-49152,0,65536,0xff0000ff};
+    r.vertex[last+2]=(struct n_gpu_vertex){32768,49152,0,65536,0xff0000ff};
+    if (!render_frame(r.width,r.height,r.clear_argb,r.vertex,r.triangle_count)) return false;
+    bool ok=target[0]==r.clear_argb && target[16*SIDE+8]==0xffff0000 && target[16*SIDE+24]==0xff0000ff;
+    if (!ok) kprintf("gpu: batch pixels corner=%x first=%x last=%x\n",target[0],target[16*SIDE+8],target[16*SIDE+24]);
+    return ok;
 }
 static bool pixel_test(void) {
     struct n_gpu_render r={.width=32,.height=32,.operation=N_GPU_CLEAR,.clear_argb=0xff284c78};
@@ -427,13 +509,35 @@ void gpu_init(void) {
         kprintf("gpu: virgl pixel self-test failed; no 3D capabilities advertised\n");
         return;
     }
+    bool cold_batch_ok=batch_pixel_test();
+    if (broken) return; /* Failed DMA/fence retires the entire device. */
+    bool cold_blit_ok=blit_pipeline_init() && blit_pixel_test();
+    if (broken) return;
     /* A cold ten-second pixel pass is not proof that the production two-second
      * deadline is usable. Verify clear AND triangle under the actual runtime
      * budget before publishing any capability, even in a slow diagnostic boot.
      * The device can be real yet too slow; fallback is the correct outcome. */
     kprintf("gpu: cold pixel self-test passed; validating two-second runtime budget\n");
     validating_runtime=true;
-    bool runtime_ok=pixel_test();
+    /* A batch pixel mismatch is not evidence that legacy rendering failed.
+     * Validate legacy AFTER a cold mismatch. If only the runtime batch has
+     * wrong pixels, revalidate legacy after it before retaining those bits. */
+    bool runtime_ok=pixel_test(), batch_ok=false, blit_ok=false;
+    if (runtime_ok && cold_batch_ok) {
+        batch_ok=batch_pixel_test();
+        if (!batch_ok && !broken) runtime_ok=pixel_test();
+    }
+    if (runtime_ok && cold_blit_ok) {
+        blit_ok=blit_pixel_test();
+        /* BLIT changes host FBO state. Check legacy AFTER it even on success;
+         * a new pixel mismatch alone drops only the new capability. */
+        runtime_ok=!broken && pixel_test();
+        if (runtime_ok && batch_ok) {
+            batch_ok=batch_pixel_test();
+            if (!batch_ok && !broken) runtime_ok=pixel_test();
+        }
+    }
+    runtime_ok=runtime_ok && !broken;
     validating_runtime=false;
     if (!runtime_ok) {
         ready=false;statistics.backend=N_GPU_BACKEND_NONE;statistics.capabilities=0;
@@ -443,9 +547,12 @@ void gpu_init(void) {
     }
     ready=true;
     statistics.backend=N_GPU_BACKEND_VIRGL;
-    statistics.capabilities=N_GPU_CAP_CLEAR|N_GPU_CAP_TRIANGLE;
+    statistics.capabilities=N_GPU_CAP_CLEAR|N_GPU_CAP_TRIANGLE|(batch_ok?N_GPU_CAP_BATCH:0)|(blit_ok?N_GPU_CAP_BLIT:0);
     strlcpy(statistics.name,"virtio-gpu virgl: verified clear/triangle",sizeof statistics.name);
     kprintf("gpu: virgl clear/triangle/readback pixel self-test passed\n");
+    kprintf("gpu: batch capability=%u (cold=%u runtime=%u; legacy independently revalidated)\n",
+        batch_ok,cold_batch_ok,batch_ok);
+    kprintf("gpu: blit capability=%u (cold=%u runtime=%u; nearest texture pixels)\n",blit_ok,cold_blit_ok,blit_ok);
     if (cmdline_has("gpu-slow-test")) {
         /* Same public kernel entry, but before a user task/CR3 is involved.
            This distinguishes post-initialization/repeated fences from the
@@ -474,6 +581,30 @@ int gpu_render(const struct n_gpu_render *r, uint32_t *out, size_t bytes) {
     if (__atomic_exchange_n(&busy,1,__ATOMIC_ACQUIRE)) return -EBUSY;
     int result=0;
     if (!render_internal(r)) result=-EIO;
+    else for (unsigned y=0;y<r->height;y++) memcpy(out+(size_t)y*r->width,target+(size_t)y*SIDE,r->width*4);
+    __atomic_store_n(&busy,0,__ATOMIC_RELEASE);
+    return result;
+}
+int gpu_render_batch(const struct n_gpu_batch *r, uint32_t *out, size_t bytes) {
+    if (!r || !r->width || !r->height || r->width>SIDE || r->height>SIDE ||
+        r->triangle_count>N_GPU_MAX_TRIANGLES || !valid_vertices(r->vertex,r->triangle_count*3)) return -EINVAL;
+    size_t need=(size_t)r->width*r->height*4;
+    if (!out || bytes<need) return -EINVAL;
+    if (!ready || broken || !(statistics.capabilities&N_GPU_CAP_BATCH)) return -ENOSYS;
+    if (__atomic_exchange_n(&busy,1,__ATOMIC_ACQUIRE)) return -EBUSY;
+    int result=0;
+    if (!render_frame(r->width,r->height,r->clear_argb,r->vertex,r->triangle_count)) result=-EIO;
+    else for (unsigned y=0;y<r->height;y++) memcpy(out+(size_t)y*r->width,target+(size_t)y*SIDE,r->width*4);
+    __atomic_store_n(&busy,0,__ATOMIC_RELEASE);
+    return result;
+}
+int gpu_blit(const struct n_gpu_blit *r,const uint32_t *pixels,size_t source_bytes,uint32_t *out,size_t bytes) {
+    if (!valid_blit(r) || !pixels || !out || source_bytes<(size_t)r->source_width*r->source_height*4 ||
+        bytes<(size_t)r->width*r->height*4) return -EINVAL;
+    if (!ready || broken || !(statistics.capabilities&N_GPU_CAP_BLIT)) return -ENOSYS;
+    if (__atomic_exchange_n(&busy,1,__ATOMIC_ACQUIRE)) return -EBUSY;
+    int result=0;
+    if (!blit_internal(r,pixels)) result=-EIO;
     else for (unsigned y=0;y<r->height;y++) memcpy(out+(size_t)y*r->width,target+(size_t)y*SIDE,r->width*4);
     __atomic_store_n(&busy,0,__ATOMIC_RELEASE);
     return result;

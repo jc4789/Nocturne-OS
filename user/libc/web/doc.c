@@ -693,7 +693,14 @@ void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const ch
     d->resources_dirty = d->dirty = d->need_style = true;
 }
 
+void web_media_background(uint64_t now) {
+    web_avmedia_background(now);
+}
+int64_t web_media_background_deadline(uint64_t now) {
+    return web_avmedia_background_deadline(now);
+}
 void web_tick(web_doc *d, uint64_t now) {
+    web_media_background(now);
     if (!d || !d->live) return;
     doc_rescan(d);
     web_avmedia_tick(d, now);
@@ -701,9 +708,12 @@ void web_tick(web_doc *d, uint64_t now) {
     doc_rescan(d);
 }
 int64_t web_deadline(web_doc *d) {
-    if (!d || !d->live) return -1;
-    int64_t js = web_js_deadline(d), media = web_avmedia_deadline(d, uptime_ms());
-    return js < 0 ? media : media < 0 ? js : MIN(js, media);
+    uint64_t now = uptime_ms();
+    int64_t background = web_media_background_deadline(now);
+    if (!d || !d->live) return background;
+    int64_t js = web_js_deadline(d), media = web_avmedia_deadline(d, now);
+    int64_t deadline = js < 0 ? media : media < 0 ? js : MIN(js, media);
+    return deadline < 0 ? background : background < 0 ? deadline : MIN(deadline, background);
 }
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *r) {
     if (d && d->live) web_js_loaded(d, id, r);

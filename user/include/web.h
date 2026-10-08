@@ -85,6 +85,9 @@ struct web_host {
        never a page-selected directory. Output text transfers malloc ownership. */
     int (*storage)(void *opaque, const char *origin, const struct web_storage_request *request,
                    struct web_storage_result *out);
+    /* Opt in only for the native browser embedder. Custom/fixture hosts keep
+       their request() transport; this flag does not grant origin/CORS access. */
+    bool media_range;
 };
 bool web_set_url(web_doc *d, const char *url);
 /* Call between JS tasks, after the host history position and document URL change. */
@@ -92,6 +95,10 @@ void web_history_event(web_doc *d, const char *old_url, bool popstate);
 web_doc *web_live(const char *html, size_t len, const char *url, const char *charset,
                   const struct web_host *host);
 void web_tick(web_doc *d, uint64_t now_ms);
+/* Private media children outlive a retired document until nonblocking reap.
+ * No document/node callback is retained by this process-lifetime cleanup. */
+void web_media_background(uint64_t now_ms);
+int64_t web_media_background_deadline(uint64_t now_ms);
 /* -1: no deadline, otherwise an absolute uptime_ms() deadline. */
 int64_t web_deadline(web_doc *d);
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *response);

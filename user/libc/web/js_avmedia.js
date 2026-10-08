@@ -1,5 +1,7 @@
-/* Real bounded native playback. The existing fetch path owns URL resolution,
- * redirects, credentials and CORS; no page can pass a local path to the decoder.
+/* Real bounded native playback. Buffered fetch remains for unsupported hosts
+ * and credentialed/opaque sources. Native anonymous Range derives document
+ * origin in C and checks every response/preflight; it never follows redirects.
+ * No page can pass a local path or an origin grant to the decoder.
  * MSE, DRM, live manifests, autoplay and non-1x playback are not advertised. */
 const avmediaBridge = (() => {
     const native = host.avmedia, states = new WeakMap(), active = new Set();
@@ -13,7 +15,7 @@ const avmediaBridge = (() => {
     function get(node) {
         brand(node);
         let s=states.get(node);
-        if(!s){s={generation:0,intent:0,currentSrc:'',controller:null,promise:null,network:0,error:null,volume:1,muted:false,last:null,lastTime:0};states.set(node,s);}
+        if(!s){s={generation:0,intent:0,seekIntent:0,currentSrc:'',controller:null,promise:null,network:0,error:null,volume:1,muted:false,last:null,lastTime:0};states.set(node,s);}
         return s;
     }
     function snapshot(node) { get(node);return native('state',node); }
@@ -28,6 +30,18 @@ const avmediaBridge = (() => {
     function abortError() { return new DOMException('Media source changed','AbortError'); }
     function current(node,s,generation,url) { return s.generation===generation&&s.currentSrc===url&&source(node)===url; }
     function notify(node,s,generation,url,type) { if(!current(node,s,generation,url))throw abortError();event(node,type);if(!current(node,s,generation,url))throw abortError(); }
+    async function resumeLoop(node,s,generation,url,intent) {
+        /* The seek is a child command, not an immediate restart. Every wait
+         * may admit pause(), source replacement or loop=false. */
+        for(;;) {
+            if(!current(node,s,generation,url)||s.intent!==intent||!node.loop)throw abortError();
+            const now=native('state',node);
+            if(now.error)throw new Error(now.error);
+            if(!now.seeking)break;
+            await new Promise(resolve=>setTimeout(resolve,10));
+        }
+        await node.play();
+    }
     function monitor() {
         if(timer||!active.size)return;
         timer=setTimeout(()=>{
@@ -43,8 +57,12 @@ const avmediaBridge = (() => {
                     const intent=s.intent;
                     event(node,'timeupdate');
                     if(s.generation!==generation)continue;
-                    if(s.intent===intent&&node.loop&&native('seek',node,0)&&native('play',node)){now=native('state',node);}
-                    else event(node,'ended');
+                    const url=s.currentSrc;
+                    if(s.intent===intent&&node.loop&&current(node,s,generation,url)&&native('seek',node,0)){
+                        resumeLoop(node,s,generation,url,intent).catch(e=>{
+                            if(current(node,s,generation,url)&&s.intent===intent&&e.name!=='AbortError'&&!s.error){s.error=new MediaError(3,String(e));event(node,'error');}
+                        });now=native('state',node);
+                    } else event(node,'ended');
                 }
                 if(s.generation!==generation)continue;
                 if(!now.paused&&host.now()-s.lastTime>=250){s.lastTime=host.now();event(node,'timeupdate');}
@@ -58,7 +76,7 @@ const avmediaBridge = (() => {
     }
     function reset(node,s){
         if(s.controller)s.controller.abort();
-        s.controller=null;s.generation=(s.generation+1)>>>0;s.intent++;s.promise=null;s.error=null;s.network=0;s.currentSrc='';s.last=null;
+        s.controller=null;s.generation=(s.generation+1)>>>0;s.intent++;s.seekIntent++;s.promise=null;s.error=null;s.network=0;s.currentSrc='';s.last=null;
         native('reset',node,s.generation);active.delete(node);
     }
     async function load(node) {
@@ -68,24 +86,42 @@ const avmediaBridge = (() => {
         const controller=new AbortController();s.currentSrc=url;s.network=2;s.controller=controller;active.add(node);monitor();notify(node,s,generation,url,'loadstart');
         const promise=(async()=>{
             try{
-                const response=await fetch(url,{signal:controller.signal,credentials:node.crossOrigin==='use-credentials'?'include':'same-origin'});
-                if(s.generation!==generation)throw abortError();
-                if(!response.ok)throw new Error('Media HTTP status '+response.status);
-                const declared=Number(response.headers.get('content-length'));
-                if(Number.isFinite(declared)&&declared>33554432)throw new RangeError('Media input exceeds 32 MiB');
-                const bytes=await response.arrayBuffer();
-                if(s.generation!==generation||source(node)!==url)throw abortError();
-                if(bytes.byteLength>33554432)throw new RangeError('Media input exceeds 32 MiB');
-                if(!native('load',node,bytes,generation))throw new Error(native('state',node).error||'Unsupported media input');
+                /* Install the load Promise before submitting a native child. */
+                await Promise.resolve();
+                if(!current(node,s,generation,url)||controller.signal.aborted)throw abortError();
+                if(native('range',node,url)) {
+                    if(!native('loadURL',node,url,generation))throw new Error(native('state',node).error||'Unsupported Range media input');
+                    const deadline=host.now()+30000;
+                    for(;;) {
+                        if(!current(node,s,generation,url)||controller.signal.aborted)throw abortError();
+                        const now=native('state',node);
+                        if(now.error)throw new Error(now.error);
+                        if(now.readyState>=2&&!now.loading)break;
+                        if(host.now()>=deadline){native('reset',node,generation);throw new Error('Native media metadata deadline exceeded');}
+                        await new Promise(resolve=>setTimeout(resolve,10));
+                    }
+                } else {
+                    const response=await fetch(url,{signal:controller.signal,credentials:node.crossOrigin==='use-credentials'?'include':'same-origin'});
+                    if(!current(node,s,generation,url))throw abortError();
+                    if(!response.ok)throw new Error('Media HTTP status '+response.status);
+                    const declared=Number(response.headers.get('content-length'));
+                    if(Number.isFinite(declared)&&declared>33554432)throw new RangeError('Media input exceeds 32 MiB');
+                    const bytes=await response.arrayBuffer();
+                    if(!current(node,s,generation,url))throw abortError();
+                    if(bytes.byteLength>33554432)throw new RangeError('Media input exceeds 32 MiB');
+                    if(!native('load',node,bytes,generation))throw new Error(native('state',node).error||'Unsupported media input');
+                }
+                if(!current(node,s,generation,url)||controller.signal.aborted)throw abortError();
                 native('volume',node,s.volume,s.muted);
                 s.network=1;s.controller=null;s.last=native('state',node);
                 notify(node,s,generation,url,'durationchange');notify(node,s,generation,url,'loadedmetadata');
-                if(s.last.readyState>=2){notify(node,s,generation,url,'loadeddata');notify(node,s,generation,url,'canplay');notify(node,s,generation,url,'canplaythrough');}
+                if(s.last.readyState>=2){notify(node,s,generation,url,'loadeddata');notify(node,s,generation,url,'canplay');}
+                if(s.last.readyState>=4)notify(node,s,generation,url,'canplaythrough');
                 return node;
             }catch(e){
                 if(s.generation!==generation)throw abortError();
-                s.network=3;s.controller=null;s.error=new MediaError(e&&e.name==='AbortError'?1:4,String(e));
-                if(s.error.code!==1)event(node,'error');throw e;
+                s.network=3;s.controller=null;const previous=s.error;s.error=s.error||new MediaError(e&&e.name==='AbortError'?1:4,String(e));
+                if(s.error.code!==1&&!previous)event(node,'error');throw e;
             }finally{if(s.generation===generation)s.promise=null;}
         })();
         s.promise=promise;return promise;
@@ -106,9 +142,24 @@ const avmediaBridge = (() => {
         get duration(){return snapshot(this).duration;}
         get paused(){return snapshot(this).paused;}
         get ended(){return snapshot(this).ended;}
-        get seeking(){brand(this);return false;}
+        get seeking(){return snapshot(this).seeking;}
         get currentTime(){return snapshot(this).currentTime;}
-        set currentTime(value){const s=get(this),time=Number(value),generation=s.generation,url=s.currentSrc;if(!Number.isFinite(time)||time<0)throw new TypeError('Invalid media time');notify(this,s,generation,url,'seeking');if(!native('seek',this,time))throw new DOMException('Input cannot seek','NotSupportedError');s.last=native('state',this);notify(this,s,generation,url,'timeupdate');notify(this,s,generation,url,'seeked');}
+        set currentTime(value){
+            const s=get(this),time=Number(value),generation=s.generation,url=s.currentSrc;
+            if(!Number.isFinite(time)||time<0)throw new TypeError('Invalid media time');
+            const seekIntent=++s.seekIntent;notify(this,s,generation,url,'seeking');
+            if(!native('seek',this,time))throw new DOMException('Input cannot seek','NotSupportedError');
+            const finish=async()=>{
+                while(native('state',this).seeking){
+                    await new Promise(resolve=>setTimeout(resolve,10));
+                    if(!current(this,s,generation,url)||seekIntent!==s.seekIntent)throw abortError();
+                }
+                if(!current(this,s,generation,url)||seekIntent!==s.seekIntent)throw abortError();
+                s.last=native('state',this);if(s.last.error)throw new Error(s.last.error);
+                notify(this,s,generation,url,'timeupdate');notify(this,s,generation,url,'seeked');
+            };
+            finish().catch(e=>{if(current(this,s,generation,url)&&seekIntent===s.seekIntent&&e.name!=='AbortError'&&!s.error){s.error=new MediaError(3,String(e));event(this,'error');}});
+        }
         get volume(){return get(this).volume;}
         set volume(value){const s=get(this),v=Number(value);if(!Number.isFinite(v)||v<0||v>1)throw new DOMException('Invalid volume','IndexSizeError');s.volume=v;native('volume',this,v,s.muted);event(this,'volumechange');}
         get muted(){return get(this).muted;}
@@ -133,6 +184,13 @@ const avmediaBridge = (() => {
                 else {intent=s.intent+1;pending=load(this);} /* Only load's own reset; a loadstart handler may cancel. */
             }
             if(pending)await pending;
+            if(s.intent!==intent||source(this)!==s.currentSrc)throw abortError();
+            if(snapshot(this).ended&&!native('seek',this,0))throw new DOMException('Input cannot restart','NotSupportedError');
+            while(snapshot(this).seeking){
+                await new Promise(resolve=>setTimeout(resolve,10));
+                if(s.intent!==intent||source(this)!==s.currentSrc)throw abortError();
+                if(snapshot(this).error)throw new Error(snapshot(this).error);
+            }
             if(s.intent!==intent)throw new DOMException('Pending play was cancelled','AbortError');
             if(source(this)!==s.currentSrc)throw abortError();
             const wasPaused=snapshot(this).paused;
