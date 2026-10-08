@@ -7,6 +7,15 @@
     const NativeURL = globalThis.URL, Decoder = globalThis.TextDecoder;
     const nativeThen = Promise.prototype.then, nativeApply = Reflect.apply;
     const defineProperty=Object.defineProperty, promiseConstructor=Object.freeze({[Symbol.species]:Promise});
+    const create=Object.create, assign=Object.assign, NativeNumber=Number;
+    const bufferLength=Object.getOwnPropertyDescriptor(ArrayBuffer.prototype,'byteLength').get;
+    const decode=Decoder.prototype.decode, split=String.prototype.split;
+    const weakGet=WeakMap.prototype.get, weakSet=WeakMap.prototype.set, weakHas=WeakMap.prototype.has;
+    for(const map of [states,uploadStates,progressStates]) {
+        defineProperty(map,'get',{value:key=>nativeApply(weakGet,map,[key])});
+        defineProperty(map,'set',{value:(key,value)=>nativeApply(weakSet,map,[key,value])});
+        defineProperty(map,'has',{value:key=>nativeApply(weakHas,map,[key])});
+    }
     const parseJSON = JSON.parse, wellFormed=String.prototype.toWellFormed;
     const headerEntries = Headers.prototype.entries, headerGet = Headers.prototype.get;
     const eventTypes = new Set(['loadstart','progress','abort','error','load','timeout','loadend']);
@@ -97,7 +106,7 @@
         const encoding=charset(s.mime)??charset(s.responseHeaders?nativeApply(headerGet,s.responseHeaders,['content-type'])||'':'')??'utf-8';
         let decoder;
         try{decoder=new Decoder(s.type==='json'?'utf-8':encoding);}catch(_){decoder=new Decoder('utf-8');}
-        return decoder.decode(s.bytes);
+        return nativeApply(decode,decoder,[s.bytes]);
     }
     function completed(x,s,epoch,response) {
         if(!current(s,epoch))return;
@@ -106,15 +115,20 @@
             s.uploadDone=true;
             if(s.uploadListener)for(const type of ['progress','load','loadend']){fire(s.upload,type,s.uploadSize,s.uploadSize,true);if(!current(s,epoch))return;}
         }
-        s.status=response.status;s.statusText=response.statusText;s.responseURL=response.url.split('#')[0];s.responseHeaders=response.headers;
+        const result=fetchBridge.xhrResponse(response);
+        s.status=result.status;s.statusText=result.statusText;s.responseURL=nativeApply(split,result.url,['#'])[0];s.responseHeaders=result.headers;
         s.ready=2;fire(x,'readystatechange');if(!current(s,epoch))return;
-        // This Response is private to this request, never passed to page code.
-        // Retain its native copy instead of invoking ArrayBuffer@@species.
-        s.bytes=response._bytes;
-        s.text=s.type==='arraybuffer'||s.type==='blob'?'':textResponse(s);
-        if(s.bytes.byteLength){s.ready=3;fire(x,'readystatechange');if(!current(s,epoch))return;}
-        const loaded=s.bytes.byteLength,header=nativeApply(headerGet,s.responseHeaders,['content-length']);
-        const total=header!==null && /^\d+$/.test(header)?Number(header):0;
+        // Transfer the private Response's sole buffer, without an extra
+        // fragment-sized copy or page-defined getters/@@species.
+        s.bytes=result.bytes;
+        const text=s.type==='arraybuffer'||s.type==='blob'?'':textResponse(s);
+        if(!current(s,epoch))return;
+        s.text=text;
+        const loaded=nativeApply(bufferLength,s.bytes,[]);
+        if(loaded){s.ready=3;fire(x,'readystatechange');if(!current(s,epoch))return;}
+        const header=nativeApply(headerGet,s.responseHeaders,['content-length']);
+        const total=header!==null && /^\d+$/.test(header)?NativeNumber(header):0;
+        if(!current(s,epoch))return;
         const computable=header!==null && total===loaded;
         fire(x,'progress',loaded,computable?total:0,computable);if(!current(s,epoch))return;
         stopTimer(s);s.sent=false;s.ready=4;
@@ -125,8 +139,10 @@
     class XMLHttpRequest extends XMLHttpRequestEventTarget {
         constructor() {
             super();const upload=new XMLHttpRequestUpload(uploadToken);
-            const s={ready:0,sent:false,epoch:0,id:0,timer:0,started:0,timeout:0,credentials:false,type:'',mime:'',
-                method:'',url:'',headers:new Map(),upload,uploadDone:true,uploadSize:0,uploadListener:false};
+            // The private state later owns the transport ArrayBuffer; inherited
+            // setters must not get this record while clearResponse initializes it.
+            const s=assign(create(null),{ready:0,sent:false,epoch:0,id:0,timer:0,started:0,timeout:0,credentials:false,type:'',mime:'',
+                method:'',url:'',headers:new Map(),upload,uploadDone:true,uploadSize:0,uploadListener:false});
             clearResponse(s);states.set(this,s);uploadStates.set(upload,s);
         }
         open(method,url,async,username=null,password=null) {

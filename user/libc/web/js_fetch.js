@@ -1,8 +1,9 @@
 /* Buffered Fetch API over the native, CORS-checked browser transport.
    https://fetch.spec.whatwg.org/#fetch-api (consulted 2026-10-06).
-   Body bytes are real snapshots, not String(BufferSource). ReadableStream,
-   FormData, opaque responses and background keepalive are unsupported
-   and explicitly fail; no successful-looking stream or multipart stubs.
+   Body bytes are real snapshots, not String(BufferSource). Response and Blob
+   bodies expose real Streams; the host network transport is still buffered.
+   Stream uploads, FormData, opaque responses and background keepalive fail
+   explicitly rather than pretending to perform unsupported transport work.
    Request cache modes use the cacheless native host's genuine network path;
    only-if-cached always misses and never sends a network request. No Cache
    API or stored responses are fabricated. HTTP-generated cache headers belong
@@ -15,7 +16,23 @@ const fetchBridge = (() => {
     const NativePromise=Promise, then=Promise.prototype.then, apply=Reflect.apply;
     const NativeWeakRef=WeakRef, deref=WeakRef.prototype.deref;
     const dependentFinalizer=new FinalizationRegistry(cleanups=>{for(const [s,fn]of cleanups)s.algorithms.delete(fn);});
-    const define=Object.defineProperty, create=Object.create, keys=Object.keys;
+    const define=Object.defineProperty, create=Object.create, keys=Object.keys, setPrototype=Object.setPrototypeOf;
+    const weakGet=WeakMap.prototype.get, weakSet=WeakMap.prototype.set, weakHas=WeakMap.prototype.has;
+    // These maps contain the exclusive native transport buffer. Page changes
+    // to WeakMap.prototype must not expose private records through callbacks.
+    for(const map of [headerSlots,requestSlots,responseSlots,bodySlots,signalSlots,controllerSlots]) {
+        define(map,'get',{value:key=>apply(weakGet,map,[key])});
+        define(map,'set',{value:(key,value)=>apply(weakSet,map,[key,value])});
+        define(map,'has',{value:key=>apply(weakHas,map,[key])});
+    }
+    function storeBody(object,body) {
+        // Missing stream/releaseBytes fields must not invoke an author accessor
+        // on Object.prototype with the private Body as its receiver.
+        setPrototype(body,null);
+        if(!('stream' in body))body.stream=null;
+        if(!('releaseBytes' in body))body.releaseBytes=false;
+        bodySlots.set(object,body);
+    }
     const promiseConstructor=Object.freeze({[Symbol.species]:NativePromise});
     const U8=Uint8Array, AB=ArrayBuffer, isView=ArrayBuffer.isView;
     const getter=(proto,key)=>Object.getOwnPropertyDescriptor(proto,key).get;
@@ -29,7 +46,7 @@ const fetchBridge = (() => {
     const nullStatuses=new Set([101,103,204,205,304]);
     const cacheModes=['default','no-store','reload','no-cache','force-cache','only-if-cached'];
     let NativeURL, Params, paramsString, Encoder, encode, Decoder, decode;
-    let blobAPI,objectURLAPI;
+    let blobAPI,objectURLAPI,streams;
     const str=v=>{if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol to string');return String(v);};
     const usv=v=>apply(wellFormed,str(v),[]);
     const byteString=v=>{const t=str(v);if(/[^\x00-\xff]/.test(t))throw new TypeError('Expected ByteString');return t;};
@@ -139,22 +156,38 @@ const fetchBridge = (() => {
         if(value==null)return {bytes:null,type:null};
         if(isBuffer(value))return {bytes:copyBytes(value),type:null};
         if(blobAPI&&blobAPI.brand(value))return {bytes:blobAPI.bytes(value),type:blobAPI.type(value)||null};
-        for(const name of ['FormData','ReadableStream']) {
+        if(streams&&streams.brand(value)) {
+            if(streams.locked(value)||streams.disturbed(value))throw new TypeError('Body stream is locked or disturbed');
+            return {bytes:null,type:null,stream:value};
+        }
+        for(const name of ['FormData']) {
             const C=globalThis[name];
             if(typeof C==='function'&&value instanceof C)throw notSupported(name+' bodies are not supported');
         }
         if(Params&&value instanceof Params)return {bytes:apply(taBuffer,apply(encode,new Encoder(),[apply(paramsString,value,[])]),[]),type:'application/x-www-form-urlencoded;charset=UTF-8'};
         return {bytes:apply(taBuffer,apply(encode,new Encoder(),[usv(value)]),[]),type:'text/plain;charset=UTF-8'};
     }
+    function bodyStream(b) {
+        if(b.stream)return b.stream;
+        if(b.bytes===null)return null;
+        b.stream=streams.fromBytes(b.bytes,()=>{
+            if(b.abort){const signal=slot(signalSlots,b.abort,'AbortSignal');if(signal.aborted)throw signal.reason;}
+        });
+        /* A Response has no upload consumer. Once its stream owns the bytes,
+         * the Body slot must not retain another backing-buffer root. */
+        if(b.releaseBytes)b.bytes=null;
+        return b.stream;
+    }
+    function unusable(b){return b.used||!!(b.stream&&(streams.locked(b.stream)||streams.disturbed(b.stream)));}
     function consume(object,kind) {
         let b;try{b=slot(bodySlots,object,'Body');}catch(e){return reject(e);}
         if(kind==='blob'&&!blobAPI)return reject(notSupported('Blob is not initialized'));
-        if(b.used)return reject(new TypeError('Body already consumed'));
-        if(b.bytes!==null&&b.abort&&slot(signalSlots,b.abort,'AbortSignal').aborted)return reject(slot(signalSlots,b.abort,'AbortSignal').reason);
-        if(b.bytes!==null)b.used=true;
+        if(unusable(b))return reject(new TypeError('Body already consumed or locked'));
+        if((b.bytes!==null||b.stream)&&b.abort&&slot(signalSlots,b.abort,'AbortSignal').aborted)return reject(slot(signalSlots,b.abort,'AbortSignal').reason);
+        const stream=streams?bodyStream(b):null;
+        if(b.bytes!==null||stream)b.used=true;
         return new NativePromise((resolve,reject)=>{
-            try {
-                const bytes=b.bytes===null?new AB(0):copyBytes(b.bytes);
+            const finish=bytes=>{try {
                 if(kind==='arrayBuffer')resolve(bytes);
                 else if(kind==='bytes')resolve(new U8(bytes));
                 else if(kind==='blob'){
@@ -162,12 +195,19 @@ const fetchBridge = (() => {
                     resolve(blobAPI.fromBytes(bytes,headerValue(headerSlots.get(s.headers),'content-type')||''));
                 }
                 else {const text=apply(decode,new Decoder(),[bytes]);resolve(kind==='json'?parse(text):text);}
-            }catch(e){reject(e);}
+            }catch(e){reject(e);}};
+            if(stream){
+                /* The stream already owns the immutable transport bytes. Do
+                 * not retain a second backing-buffer root on a consumed Body. */
+                b.bytes=null;
+                try{const pending=streams.collect(stream);define(pending,'constructor',{value:promiseConstructor});apply(then,pending,[finish,reject]);}catch(e){reject(e);}
+            }
+            else finish(b.bytes===null?new AB(0):copyBytes(b.bytes));
         });
     }
     function installBody(proto) {
-        define(proto,'bodyUsed',{configurable:true,enumerable:true,get(){return slot(bodySlots,this,'Body').used;}});
-        define(proto,'body',{configurable:true,enumerable:true,get(){if(slot(bodySlots,this,'Body').bytes===null)return null;throw notSupported('ReadableStream bodies are not supported; use text(), json(), arrayBuffer() or bytes()');}});
+        define(proto,'bodyUsed',{configurable:true,enumerable:true,get(){const b=slot(bodySlots,this,'Body');return b.used||!!(b.stream&&streams.disturbed(b.stream));}});
+        define(proto,'body',{configurable:true,enumerable:true,get(){return bodyStream(slot(bodySlots,this,'Body'));}});
         for(const name of ['text','json','arrayBuffer','bytes','blob'])define(proto,name,{configurable:true,enumerable:true,writable:true,value:function(){return consume(this,name);}});
         define(proto,'formData',{configurable:true,enumerable:true,writable:true,value:function(){try{slot(bodySlots,this,'Body');}catch(e){return reject(e);}return reject(notSupported('formData is not supported'));}});
     }
@@ -235,10 +275,12 @@ const fetchBridge = (() => {
     function enumValue(v,allowed,label){v=str(v);if(!allowed.includes(v))throw new TypeError('Invalid '+label);return v;}
     function makeURL(value){return new NativeURL(usv(value),rawDom('get',document,'baseURI'));}
     function methodValue(value){const method=byteString(value),upper=method.toUpperCase();if(!token.test(method)||['CONNECT','TRACE','TRACK'].includes(upper))throw new TypeError('Invalid or forbidden HTTP method');return ['DELETE','GET','HEAD','OPTIONS','POST','PUT'].includes(upper)?upper:method;}
-    function cloneBody(b){if(b.used)throw new TypeError('Body already consumed');return {bytes:b.bytes===null?null:copyBytes(b.bytes),used:false,abort:b.abort};}
+    function cloneBody(b){if(unusable(b))throw new TypeError('Body already consumed or locked');let stream;
+        if(b.stream){const branches=streams.tee(b.stream);b.stream=branches[0];stream=branches[1];}
+        return {bytes:b.bytes===null?null:copyBytes(b.bytes),stream,used:false,abort:b.abort};}
     function requestCopy(s,b) {
         const object=create(Request.prototype),copy={...s,headers:makeHeaders(s.headers,headerSlots.get(s.headers).guard),signal:dependentSignal([s.signal])};
-        requestSlots.set(object,copy);bodySlots.set(object,b);return object;
+        requestSlots.set(object,copy);storeBody(object,b);return object;
     }
     class Request {
         constructor(input,init={}) {
@@ -269,17 +311,19 @@ const fetchBridge = (() => {
             if(signal!==null)slot(signalSlots,signal,'AbortSignal');
             s.headers=makeHeaders(i.headers!==undefined?i.headers:old?old.headers:undefined,s.mode==='no-cors'?'request-no-cors':'request');
             const previous=old?bodySlots.get(input):null,override=i.body!==undefined&&i.body!==null;
-            if((override||previous&&previous.bytes!==null)&&['GET','HEAD'].includes(s.method))throw new TypeError('GET and HEAD cannot have a body');
+            const previousBody=previous&&(previous.bytes!==null||previous.stream);
+            if((override||previousBody)&&['GET','HEAD'].includes(s.method))throw new TypeError('GET and HEAD cannot have a body');
             let body;
             if(override) {
-                const extracted=extractBody(i.body);body={bytes:extracted.bytes,used:false,abort:null};
+                const extracted=extractBody(i.body);if(extracted.stream)throw notSupported('ReadableStream uploads require incremental native transport');
+                body={bytes:extracted.bytes,used:false,abort:null};
                 if(extracted.type!==null&&headerValue(headerSlots.get(s.headers),'content-type')===null)appendHeader(headerSlots.get(s.headers),'content-type',extracted.type);
-            } else if(previous&&previous.bytes!==null)body=cloneBody(previous);
+            } else if(previousBody)body=cloneBody(previous);
             else body={bytes:null,used:false,abort:null};
             s.signal=dependentSignal(signal===null?[]:[signal]);
             // Transferring a Request body consumes the input, unlike clone().
-            if(!override&&previous&&previous.bytes!==null)previous.used=true;
-            requestSlots.set(this,s);bodySlots.set(this,body);
+            if(!override&&previousBody)previous.used=true;
+            requestSlots.set(this,s);storeBody(this,body);
         }
         clone(){const s=slot(requestSlots,this,'Request');return requestCopy(s,cloneBody(slot(bodySlots,this,'Body')));}
         get destination(){slot(requestSlots,this,'Request');return '';}
@@ -289,7 +333,7 @@ const fetchBridge = (() => {
     }
     for(const name of ['url','method','headers','credentials','mode','redirect','signal','cache','referrer','referrerPolicy','integrity','keepalive'])
         define(Request.prototype,name,{configurable:true,enumerable:true,get(){return slot(requestSlots,this,'Request')[name];}});
-    function responseObject(s,body) {const object=create(Response.prototype);responseSlots.set(object,s);bodySlots.set(object,body);return object;}
+    function responseObject(s,body) {const object=create(Response.prototype);storeBody(object,body);body.releaseBytes=true;responseSlots.set(object,s);return object;}
     function responseInit(value) {
         const init=dictionary(value),headers=init.headers,status=init.status,statusText=init.statusText;
         let n=status===undefined?200:+status;n=Number.isFinite(n)?((Math.trunc(n)%65536)+65536)%65536:0;
@@ -299,15 +343,12 @@ const fetchBridge = (() => {
     }
     class Response {
         constructor(body=null,init={}) {
-            const s=responseInit(init),b=extractBody(body);if(b.bytes!==null&&nullStatuses.has(s.status))throw new TypeError('This status cannot have a body');
+            const s=responseInit(init),b=extractBody(body);if((b.bytes!==null||b.stream)&&nullStatuses.has(s.status))throw new TypeError('This status cannot have a body');
             if(b.type!==null&&headerValue(headerSlots.get(s.headers),'content-type')===null)appendHeader(headerSlots.get(s.headers),'content-type',b.type);
-            responseSlots.set(this,s);bodySlots.set(this,{bytes:b.bytes,used:false,abort:null});
+            responseSlots.set(this,s);storeBody(this,{bytes:b.bytes,stream:b.stream,used:false,abort:null,releaseBytes:true});
         }
         get ok(){const n=slot(responseSlots,this,'Response').status;return n>=200&&n<300;}
         clone(){const s=slot(responseSlots,this,'Response'),b=cloneBody(slot(bodySlots,this,'Body'));return responseObject({...s,headers:makeHeaders(s.headers,headerSlots.get(s.headers).guard)},b);}
-        // Existing XHR consumes this host-private compatibility copy. It must
-        // not expose the body's backing bytes to page mutation or @@species.
-        get _bytes(){const b=slot(bodySlots,this,'Body');return b.bytes===null?new AB(0):copyBytes(b.bytes);}
         static error(){return responseObject({status:0,statusText:'',headers:makeHeaders(undefined,'immutable'),url:'',redirected:false,type:'error'},{bytes:null,used:false,abort:null});}
         static redirect(url,status=302) {
             if(!arguments.length)throw new TypeError('redirect requires URL');const parsed=makeURL(url);
@@ -369,14 +410,23 @@ const fetchBridge = (() => {
     }
     for(const [C,name]of [[Headers,'Headers'],[Request,'Request'],[Response,'Response'],[AbortSignal,'AbortSignal'],[AbortController,'AbortController']]) {
         define(C.prototype,Symbol.toStringTag,{value:name,configurable:true});
-        for(const key of Object.getOwnPropertyNames(C.prototype)){if(key==='constructor'||key==='_bytes')continue;const d=Object.getOwnPropertyDescriptor(C.prototype,key);d.enumerable=true;define(C.prototype,key,d);}
+        for(const key of Object.getOwnPropertyNames(C.prototype)){if(key==='constructor')continue;const d=Object.getOwnPropertyDescriptor(C.prototype,key);d.enumerable=true;define(C.prototype,key,d);}
     }
     return {
         Headers,Request,Response,AbortSignal,AbortController,fetch,
         initialize(){NativeURL=globalThis.URL;Params=globalThis.URLSearchParams;paramsString=Params.prototype.toString;Encoder=globalThis.TextEncoder;encode=Encoder.prototype.encode;Decoder=globalThis.TextDecoder;decode=Decoder.prototype.decode;},
         initializeBlobs(api){blobAPI=api;},
+        initializeStreams(api){streams=api;},
         initializeObjectURLs(api){objectURLAPI=api;},
-        xhrBody(value){const binary=isBuffer(value)||!!(blobAPI&&blobAPI.brand(value));return {...extractBody(value),binary};},
+        xhrBody(value){const binary=isBuffer(value)||!!(blobAPI&&blobAPI.brand(value)),body=extractBody(value);if(body.stream)throw notSupported('XHR stream uploads are unsupported');return {...body,binary};},
+        xhrResponse(response) {
+            // Only the private XHR completion path calls this. Do not invoke
+            // page-mutable Response getters or publish a backing-buffer API.
+            const s=slot(responseSlots,response,'Response'),b=slot(bodySlots,response,'Body');
+            if(unusable(b)||b.stream)throw new TypeError('XHR body is not an exclusive buffered response');
+            const bytes=b.bytes===null?new AB(0):b.bytes;b.bytes=null;b.used=true;
+            return {status:s.status,statusText:s.statusText,url:s.url,headers:s.headers,bytes};
+        },
         response(status,url,raw,text,bytes,redirected,statusText,type) {
             const headers=makeHeaders(undefined,'response');
             for(const line of raw.split(/\r?\n/)){const i=line.indexOf(':');if(i>0&&!line.startsWith('HTTP/'))appendHeader(headerSlots.get(headers),normalizeName(line.slice(0,i)),normalizeValue(line.slice(i+1)));}
@@ -388,7 +438,9 @@ const fetchBridge = (() => {
             if(transport){type=transport[1]==='1'?'cors':'basic';redirected=transport[2]==='1';}
             if(type===undefined)type=new NativeURL(url).origin===new NativeURL(host.url()).origin?'basic':'cors';
             return responseObject({status,statusText,url:usv(url).split('#')[0],headers,redirected:!!redirected,type},
-                {bytes:nullStatuses.has(status)?null:copyBytes(bytes),used:false,abort:null});
+                // The native hook transfers an exclusive runtime-charged
+                // snapshot. Author constructors and clone still copy/tee.
+                {bytes:nullStatuses.has(status)?null:bytes,used:false,abort:null});
         }
     };
 })();

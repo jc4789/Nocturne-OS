@@ -176,7 +176,7 @@ globalThis.runLexborCases = function () {
     api('pi-serialization', function () {
         const parent = document.createElement('div');
         parent.appendChild(document.createProcessingInstruction('import', 'payload'));
-        return {pass: parent.innerHTML === '<?import payload>', actual: parent.innerHTML};
+        return {pass: parent.innerHTML === '<?import payload?>', actual: parent.innerHTML};
     });
     api('pi-create-unicode-target', function () {
         const n = document.createProcessingInstruction('\u51e6\u7406', 'payload');

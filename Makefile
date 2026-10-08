@@ -82,12 +82,13 @@ $(BUILD)/ffmpeg/%.o: %.c
 	@echo "  FF   $<"
 	@$(CC) $(FFFLAGS) -c $< -o $@
 $(BUILD)/u/user/libc/media.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
+$(BUILD)/u/user/libc/media_adaptive.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
 $(BUILD)/u/user/libc/media_mse.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
 
 # プロセス単位の生存メディア割当。全heap/RSSの上限ではない。
 # FF原文は維持し、allocator/entropyの3接点だけをprivate familyへ接続。
 # native decoderと表示frameも同じ予算を使う。
-MEDIA_QUOTA_BYTES ?= 67108864
+MEDIA_QUOTA_BYTES ?= 100663296
 .PHONY: media-quota-config
 $(BUILD)/media-quota.cfg: media-quota-config
 	@mkdir -p $(dir $@)
@@ -136,7 +137,7 @@ $(BUILD)/u/%.o: %.c
 	@$(CC) $(UCFLAGS) -c $< -o $@
 
 # The checked-in copy permits in-OS linking without Python; regenerate on host edits.
-user/libc/web/js_bootstrap.inc user/libc/web/js_form_url.inc &: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py
+user/libc/web/js_bootstrap.inc user/libc/web/js_form_url.inc &: $(wildcard user/libc/web/js_*.js) user/libc/web/js_embed.py third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json
 	@$(PY) user/libc/web/js_embed.py
 $(BUILD)/u/user/libc/web/js.o: user/libc/web/js_bootstrap.inc
 $(BUILD)/u/user/libc/web/form_validation.o: user/libc/web/js_form_url.inc

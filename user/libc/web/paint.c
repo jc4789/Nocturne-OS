@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <math.h>
 #include "webi.h"
+#include "web_dialog.h"
 #include "js_canvas.h"
 #include "avmedia.h"
 #include "elements.h"
@@ -25,6 +26,7 @@ struct pctx {
     struct web_hit *hit;
     bool hit_any;
     node_t *target;
+    box_t *top_root;
     uint32_t canvas_bg_from; /* 1: html's background was used for the canvas, 2: body's */
 };
 
@@ -650,7 +652,10 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     }
     case AT_CHECKBOX: {
         int X = (int)roundf(x), Y = (int)roundf(y), S = (int)roundf(w);
-        if (n->checked) {
+        if (n->indeterminate) {
+            gfx_fill_round(c, X, Y, S, S, 2, RGB(0, 117, 255));
+            gfx_fill(c, X + S / 4, Y + S / 2 - 1, S / 2, 2, RGB(255, 255, 255));
+        } else if (n->checked) {
             gfx_fill_round(c, X, Y, S, S, 2, RGB(0, 117, 255));
             int s = S;
             /* a check mark */
@@ -721,13 +726,16 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
             if(web_avmedia_paint(P->d,n,c,X,Y,W,H))break;
         }
         if (n->tag == T_meter || n->tag == T_progress) {
-            const char *vs = node_attr(n, "value"), *ms = node_attr(n, "max"), *mins = node_attr(n, "min");
-            float v = vs ? (float)atof(vs) : 0, mx = ms ? (float)atof(ms) : 1, mn = mins ? (float)atof(mins) : 0;
-            if (mx <= mn) mx = mn + 1;
-            float t = (v - mn) / (mx - mn);
-            t = t < 0 ? 0 : t > 1 ? 1 : t;
+            double value = web_gauge_value(n, "value"), max = web_gauge_value(n, "max"), min = web_gauge_value(n, "min");
+            double fraction = max > min ? (value - min) / (max - min) : 0;
             gfx_fill_round(c, X, Y + H / 4, W, H / 2, H / 4, RGB(220, 220, 220));
-            if (vs) gfx_fill_round(c, X, Y + H / 4, (int)(W * t), H / 2, H / 4, n->tag == T_meter ? RGB(16, 160, 64) : RGB(0, 117, 255));
+            if (n->tag == T_progress && web_gauge_value(n, "position") < 0) {
+                gfx_fill_round(c, X + W / 3, Y + H / 4, W / 3, H / 2, H / 4, RGB(0, 117, 255));
+            } else {
+                int quality = n->tag == T_meter ? web_meter_quality(n) : 0;
+                uint32_t color = n->tag == T_progress ? RGB(0, 117, 255) : quality == 0 ? RGB(16, 160, 64) : quality == 1 ? RGB(220, 160, 0) : RGB(210, 50, 45);
+                gfx_fill_round(c, X, Y + H / 4, (int)(W * fraction), H / 2, H / 4, color);
+            }
             break;
         }
         if (str_ieq(n->name, "input")) { /* range */
@@ -830,7 +838,7 @@ static bool inside(struct pctx *P, float x, float y, float w, float h) {
 
 static int control_hit(box_t *b) {
     switch (b->atomic) {
-    case AT_INPUT: return WEB_HIT_TEXT_INPUT;
+    case AT_INPUT: return web_input_type(b->node) == WEB_INPUT_FILE ? WEB_HIT_FILE : WEB_HIT_TEXT_INPUT;
     case AT_TEXTAREA: return WEB_HIT_TEXTAREA;
     case AT_CHECKBOX: return WEB_HIT_CHECKBOX;
     case AT_RADIO: return WEB_HIT_RADIO;
@@ -890,11 +898,11 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root);
 static void paint_stacked_layer(struct pctx *P, box_t *l);
 static int layer_z(const box_t *b) { return b->st->z_auto ? 0 : b->st->z_index; }
 
-static void collect_layers(pvec *layers, box_t *b) {
+static void collect_layers(web_doc *d, pvec *layers, box_t *b) {
     for (box_t *c = b->first; c; c = c->next) {
-        if (c->st && c->st->display == D_NONE) continue;
+        if ((c->st && c->st->display == D_NONE) || web_dialog_layer_box(d,c)) continue;
         if (positioned(c)) pv_push(layers, c);
-        if (!stacking_context(c)) collect_layers(layers, c);
+        if (!stacking_context(c)) collect_layers(d, layers, c);
     }
 }
 
@@ -958,12 +966,14 @@ static void paint_runs(struct pctx *P, box_t *b) {
 
 static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (!b->st || b->st->display == D_NONE) return;
+    if (web_dialog_layer_box(P->d,b) && b != P->top_root) return;
+    if (P->mode == M_HIT && b->node && web_dialog_inert(P->d,b->node)) return;
     if (positioned(b) && !layer_root) return; /* painted with the layers */
     const style_t *st = b->st;
     if (st->opacity <= 0.001f) return;
     pvec layers = {0};
-    if (b == P->d->root_box || stacking_context(b)) {
-        collect_layers(&layers, b);
+    if (b == P->d->root_box || b == P->top_root || stacking_context(b)) {
+        collect_layers(P->d, &layers, b);
         /* Stable ordering preserves tree order for equal z-index values. */
         for (int i = 1; i < layers.n; i++)
             for (int j = i; j > 0 && layer_z(layers.v[j - 1]) > layer_z(layers.v[j]); j--) {
@@ -1089,6 +1099,23 @@ static void walk(struct pctx *P) {
     P->vx0 = P->c->cx0, P->vy0 = P->c->cy0;
     P->vx1 = P->c->cx1, P->vy1 = P->c->cy1;
     if (P->d->root_box) paint_box(P, P->d->root_box, true);
+    float ox=P->ox,oy=P->oy,hx=P->hx,hy=P->hy;
+    for(int i=0;i<web_dialog_count(P->d);i++) {
+        node_t *n=web_dialog_at(P->d,i); if(!n || !n->box)continue;
+        if(P->mode==M_HIT) {
+            if(n!=web_dialog_top(P->d))continue;
+            memset(P->hit,0,sizeof *P->hit); P->hit_any=false; P->target=n;
+        }
+        box_t *layers[2]={web_dialog_backdrop(P->d,n),n->box};
+        for(int j=0;j<2;j++) {
+            box_t *b=layers[j]; if(!b)continue;
+            bool fixed=b->st->position==POS_FIXED;
+            P->ox=ox+(fixed?P->d->view_x:0); P->oy=oy+(fixed?P->d->view_y:0);
+            P->hx=hx-(fixed?P->d->view_x:0); P->hy=hy-(fixed?P->d->view_y:0);
+            P->top_root=b; paint_box(P,b,true);
+        }
+    }
+    P->top_root=NULL; P->ox=ox; P->oy=oy; P->hx=hx; P->hy=hy;
 }
 
 uint32_t doc_canvas_bg(web_doc *d, int *from);
@@ -1106,6 +1133,7 @@ uint32_t doc_canvas_bg(web_doc *d, int *from) {
 }
 
 void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y) {
+    d->view_x=doc_x; d->view_y=doc_y;
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
     gfx_clip(c, x, y, w, h);
     struct pctx P = {0};
@@ -1156,12 +1184,12 @@ web_node *web_node_at(web_doc *d, int x, int y) {
     P.hy = (float)y;
     P.hit = &hit;
     walk(&P);
-    return P.target;
+    return P.target && !web_dialog_inert(d,P.target) ? P.target : NULL;
 }
 
 bool web_node_action(web_doc *d, web_node *target, struct web_hit *hit) {
     memset(hit, 0, sizeof *hit);
-    if (!d || !target) return false;
+    if (!d || !target || web_dialog_inert(d,target)) return false;
     node_t *root = doc_node_root(target, true);
     if (root != d->root) return false;
     for (node_t *n = target; n; n = doc_flat_parent(n)) {
@@ -1217,7 +1245,7 @@ static bool ieq_at(const char *s, size_t n, const char *q, size_t qn) {
 }
 
 static void find_in(struct fmatch *F, box_t *b) {
-    if (!b->st || b->st->display == D_NONE) return;
+    if (!b->st || b->st->display == D_NONE || (b->node && web_dialog_inert(F->d,b->node))) return;
     if (b->nruns) {
         /* the block's text, with the run each byte came from */
         sbuf t = {0};

@@ -3,7 +3,9 @@
 #include <stdio.h>
 #include "nocturne.h"
 #include "webi.h"
+#include "web_dialog.h"
 #include "form_value.h"
+#include "form_file.h"
 #include "elements.h"
 #include "js_canvas.h"
 
@@ -247,6 +249,7 @@ static void changed(web_doc *d, node_t *n, bool resources) {
     d->find_node = NULL;
     d->find_run = NULL;
     if (n) n->resource_revision++;
+    web_dialog_sync(d);
     textarea_changed(n);
     /* SVG cache source and the box tree are snapshots, not a second DOM. */
     for (int i = 0; i < d->svgs.n; i++) {
@@ -492,6 +495,7 @@ static bool attribute_change(web_doc *d, node_t *n, int found, const char *name,
     d->mem.trap = old;
     bool ordinary = !ns && !n->foreign && !strcmp(name, low);
     if (input_type_change && previous_type != web_input_type(n)) {
+        if (previous_type == WEB_INPUT_FILE) web_input_files_clear(d, n);
         enum web_input_mode before = web_input_value_mode(previous_type);
         enum web_input_mode after = web_input_value_mode(web_input_type(n));
         bool dirty = n->value_dirty;
@@ -664,6 +668,7 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
     bool assignment_changed = assignment_structure(old_parent, c) || assignment_structure(p, c);
     if (is_slot(old_parent) && !old_parent->slot_assigned_first && doc_node_root(old_parent, false)->shadow_host)
         doc_slot_signal(old_parent);
+    if(old_parent)web_dialog_removed(d,c);
     detach(c);
     c->parent = p;
     c->next = before;
@@ -830,6 +835,7 @@ bool doc_node_value(web_doc *d, node_t *n, const char *text, size_t len) {
                     d->mem.allocated > (32u << 20) - next - capacity)) return false;
     char *value = malloc(capacity);
     if (!value) return false;
+    if (input && web_input_type(n) == WEB_INPUT_FILE) { size_t files_bytes = n->files ? n->files->allocation : 0; web_input_files_clear(d, n); next -= files_bytes; }
     size_t used = 0;
     if (input) used = web_input_sanitize(n, text ? text : "", len, value);
     else for (size_t i = 0; i < len; i++) {
@@ -877,10 +883,12 @@ node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
         if (!doc_attr_set_ns(d, c, a->namespace_uri, a->prefix, a->local ? a->local : a->raw, a->value)) return NULL;
     }
     c->checked = n->checked;
+    c->indeterminate = n->indeterminate;
     c->selected = n->selected;
     c->selected_set = n->selected_set;
     c->control_ready = n->control_ready;
     if (n->value && !doc_node_value(d, c, n->value, strlen(n->value))) return NULL;
+    if (!web_input_files_clone(d, c, n)) return NULL;
     c->value_dirty = n->value_dirty;
     c->checked_dirty = n->checked_dirty;
     c->script_started = n->tag == T_script;

@@ -2515,7 +2515,7 @@ void css_style_init(style_t *s, const style_t *parent) {
     *s = *parent;
     for (int i = 0; i < NPROPS; i++)
         if (props[i].type != PT_SHORT && !props[i].inherited) copy_prop(&props[i], s, &initial);
-    s->before = s->after = NULL;
+    s->before = s->after = s->backdrop = NULL;
 }
 
 void css_style_finish(style_t *s, const style_t *parent, bool root) {
@@ -2554,11 +2554,16 @@ void css_style_finish(style_t *s, const style_t *parent, bool root) {
 const char *css_ua_sheet(void) {
     /* Slots remain real DOM nodes but have no wrapper box by default. */
     return "slot { display: contents; }\n"
+           "dialog { position: absolute; left: 0; right: 0; width: auto; height: auto; margin: auto; "
+           "border: 3px solid black; padding: 1em; background-color: white; color: black; }\n"
+           "dialog:modal { position: fixed; inset: 0; max-width: calc(100% - 2em - 6px); "
+           "max-height: calc(100% - 2em - 6px); overflow: auto; }\n"
+           "dialog::backdrop { display: block; position: fixed; inset: 0; background-color: rgba(0,0,0,0.1); }\n"
            "html, address, blockquote, body, center, dialog, div, figure, figcaption, footer, form, header, hr, "
            "legend, listing, main, p, plaintext, pre, search, xmp, article, aside, h1, h2, h3, h4, h5, h6, hgroup, "
            "nav, section, dir, dd, dl, dt, menu, ol, ul, details, summary, fieldset, optgroup { display: block; }\n"
            "head, script, style, title, meta, link, base, template, datalist, param, noembed, noframes, area, map, "
-           "track, source, rp, [hidden]:not([hidden=until-found]), input[type=hidden], dialog:not([open]) "
+           "track, source, rp, [hidden], input[type=hidden], dialog:not([open]) "
            "{ display: none; }\n"
            "li { display: list-item; }\n"
            "table { display: table; border-spacing: 2px; border-collapse: separate; box-sizing: border-box; "

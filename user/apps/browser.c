@@ -34,6 +34,8 @@ static char navigation_url[2048];
 static bool native_wait, pending_navigation;
 static char pending_url[2048];
 static char *pending_post;
+static size_t pending_post_len;
+static char pending_content_type[160];
 static int pending_mode;
 static bool navigation_ready, sync_stopped;
 
@@ -51,6 +53,10 @@ _Static_assert(WEB_RESPONSE_HEADERS_MAX >= WEBNET_RESPONSE_HEADERS_MAX, "Browser
 static char console_lines[CONSOLE_LINES][CONSOLE_LINE];
 static int console_n, console_next;
 static bool console_open, console_dirty;
+static char console_input[4096], console_startup[16385];
+static size_t console_cursor;
+static bool console_selected;
+static uint64_t console_due;
 
 static struct {
     char *url;
@@ -65,7 +71,7 @@ static uint64_t history_serial;
 static struct { int delta; uint64_t generation; } history_queue[64];
 static int history_queue_head, history_queue_count;
 
-enum { F_PAGE, F_ADDR, F_FIND };
+enum { F_PAGE, F_ADDR, F_FIND, F_CONSOLE };
 static int focus = F_PAGE;
 static char addr[2048];
 static int acur;
@@ -76,6 +82,7 @@ static char find_buf[128];
 static int find_y = -1;
 
 static web_node *sel_node;
+static bool sel_datalist, sel_autocomplete;
 static web_node *pressed_node, *hover_node;
 static char *focus_value;
 static const char *sel_labels[128];
@@ -150,7 +157,7 @@ static void field(canvas_t *c, int x, int y, int fw, int h, const char *text, bo
     if (foc && !all) gfx_fill(&cl, tx + cpx, ty, 2, 16, UI_ACCENT2);
 }
 
-enum { BTN_BACK, BTN_FWD, BTN_RELOAD, BTN_HOME, NBTN };
+enum { BTN_BACK, BTN_FWD, BTN_RELOAD, BTN_HOME, BTN_HISTORY, NBTN };
 static int btn_x(int i) { return 6 + i * 32; }
 #define ADDR_X (btn_x(NBTN) + 6)
 
@@ -176,10 +183,12 @@ static void draw_toolbar(void) {
                 gfx_fill(c, cx + 1, cy - 8, 8, 8, UI_BTN);
                 gfx_triangle(c, cx + 1, cy - 11, cx + 1, cy - 1, cx + 7, cy - 6, col);
             }
-        } else {
+        } else if (i == BTN_HOME) {
             gfx_triangle(c, cx - 8, cy - 1, cx, cy - 8, cx + 8, cy - 1, col);
             gfx_fill(c, cx - 5, cy - 1, 10, 8, col);
             gfx_fill(c, cx - 1, cy + 3, 3, 4, UI_BTN);
+        } else {
+            gfx_text(c, cx - 4, cy - 7, "H", col, TRANSPARENT, FONT_SMALL);
         }
     }
     field(c, ADDR_X, 8, W - ADDR_X - 8, 24, focus == F_ADDR ? addr : cur_url, focus == F_ADDR,
@@ -243,12 +252,21 @@ static void draw(void) {
         gfx_hline(c, 0, top, w->w, UI_ACCENT);
         gfx_text(c, 8, top + 4, "JavaScript console  [F12: close]  [Ctrl+K: clear]", UI_ACCENT2, TRANSPARENT, FONT_SMALL);
         canvas_t clip = *c;
-        gfx_clip(&clip, 4, top + 24, w->w - 8, h - 24);
-        int visible = MAX(0, (h - 26) / 16), count = MIN(visible, console_n);
+        gfx_clip(&clip, 4, top + 24, w->w - 8, h - 46);
+        int visible = MAX(0, (h - 48) / 16), count = MIN(visible, console_n);
         for (int i = 0; i < count; i++) {
             int n = (console_next - count + i + CONSOLE_LINES) % CONSOLE_LINES;
             gfx_text(&clip, 8, top + 25 + i * 16, console_lines[n], UI_FG, TRANSPARENT, FONT_SMALL);
         }
+        gfx_hline(c, 4, top+h-23, w->w-8, UI_DIM);
+        canvas_t input=*c;gfx_clip(&input,8,top+h-20,w->w-16,20);
+        gfx_text(&input,8,top+h-19,focus==F_CONSOLE?"> ":"  ",UI_ACCENT2,TRANSPARENT,FONT_SMALL);
+        size_t first=console_cursor>(size_t)MAX((w->w-48)/8,1)?console_cursor-(size_t)MAX((w->w-48)/8,1):0;
+        while(first&&((unsigned char)console_input[first]&0xc0)==0x80)first++;
+        gfx_text(&input,24,top+h-19,console_input+first,UI_FG,TRANSPARENT,FONT_SMALL);
+        if(focus==F_CONSOLE){char saved=console_input[console_cursor];console_input[console_cursor]=0;
+            int x=24+gfx_text_width(console_input+first,FONT_SMALL);console_input[console_cursor]=saved;
+            gfx_vline(&input,x,top+h-19,15,UI_ACCENT2);}
     }
     console_dirty = false;
 }
@@ -529,6 +547,7 @@ static void set_title(void) {
    control popup, or repaint may use the old boxes after that point. */
 static void flush_dom_layout(void) {
     if (!doc || native_wait || web_script_running(doc)) return;
+    if(sel_node && web_node_inert(doc,sel_node))sel_node=NULL;
     if (web_dirty(doc)) need_layout = true;
     if (need_layout) {
         relayout();
@@ -734,15 +753,25 @@ static void cancel_document_requests(void) {
     }
 }
 
-static void queue_navigation(const char *url, const char *post, int mode) {
+static void queue_navigation_body(const char *url, const void *post, size_t length, const char *content_type, int mode) {
     if (!url || !*url) return;
-    char *copy = post ? strdup(post) : NULL;
+    if (strlen(url) >= sizeof pending_url || length > WEBNET_BODY_LIMIT ||
+        (post && (!content_type || strlen(content_type) >= sizeof pending_content_type || strpbrk(content_type,"\r\n")))) {
+        console_add("error", "Form navigation exceeds the native request bounds"); return;
+    }
+    char *copy = post ? malloc(length + 1) : NULL;
     if (post && !copy) { console_add("error", "Navigation allocation failed"); return; }
+    if (copy) { if(length)memcpy(copy,post,length);copy[length]=0; }
     strlcpy(pending_url, url, sizeof pending_url);
     free(pending_post);
     pending_post = copy;
+    pending_post_len = post ? length : 0;
+    strlcpy(pending_content_type, post ? content_type : "", sizeof pending_content_type);
     pending_mode = mode;
     pending_navigation = true;
+}
+static void queue_navigation(const char *url, const char *post, int mode) {
+    queue_navigation_body(url,post,post?strlen(post):0,"application/x-www-form-urlencoded",mode);
 }
 
 static void host_navigate(void *opaque, const char *url, const char *post) {
@@ -757,6 +786,21 @@ static void host_navigate(void *opaque, const char *url, const char *post) {
 static void host_navigate_mode(void *opaque, const char *url, int mode) {
     host_navigate(opaque, url, NULL);
     if (pending_navigation) pending_mode = mode == 2 ? NAV_REPLACE : mode == 1 ? NAV_RELOAD : NAV_PUSH;
+}
+static void host_navigate_form(void *opaque, const char *url, const void *body, size_t length, const char *content_type, const char *target) {
+    (void)opaque;
+    if (!url || (!has_prefix(url,"https://") && !has_prefix(url,"http://"))) {
+        console_add("error","Form navigation requires an HTTP(S) destination"); return;
+    }
+    if (!target || !*target || !strcasecmp(target,"_self") || !strcasecmp(target,"_top") || !strcasecmp(target,"_parent")) {
+        queue_navigation_body(url,body,length,content_type,NAV_PUSH); return;
+    }
+    if (!strcasecmp(target,"_blank") && !body) {
+        char *args[]={"browser",(char *)url,NULL};int fds[]={0,1,2};
+        if (spawn("/bin/browser",args,fds,0)<0)console_add("error","Unable to open the form destination window");
+        return;
+    }
+    console_add("error","Named form destinations and POST into a new window are not yet supported");
 }
 
 static void host_console(void *opaque, int level, const char *message) {
@@ -875,6 +919,7 @@ static bool host_sync_load(void *opaque, const char *url, int kind, struct web_r
 static const struct web_host browser_host = {
     .request = host_request, .cancel = host_cancel, .sync_load = host_sync_load,
     .navigate = host_navigate, .console = host_console, .scroll = host_scroll,
+    .navigate_form = host_navigate_form,
     .scroll_to = host_scroll_to, .history = host_history,
     .cookie_get = host_cookie_get, .cookie_set = host_cookie_set
     , .navigate_mode = host_navigate_mode
@@ -994,8 +1039,8 @@ static void finish_navigation(void) {
     redraw();
 }
 
-static void navigate(const char *url_in, const char *post, int mode) {
-    if (native_wait || (doc && web_script_running(doc))) { queue_navigation(url_in, post, mode); return; }
+static void navigate_body(const char *url_in, const void *post, size_t length, const char *content_type, int mode) {
+    if (native_wait || (doc && web_script_running(doc))) { queue_navigation_body(url_in,post,length,content_type,mode); return; }
     char url[2048]; strlcpy(url, url_in, sizeof url);
     if (hpos >= 0 && mode != NAV_HISTORY) hist[hpos].y = scroll_y;
     sel_node = NULL; hover[0] = 0; refresh_at = 0;
@@ -1046,11 +1091,13 @@ static void navigate(const char *url_in, const char *post, int mode) {
         strlcpy(navigation_response.url, local.url, sizeof navigation_response.url);
         navigation_ready = true; return;
     }
+    char headers[192];
+    if(post)snprintf(headers,sizeof headers,"Content-Type: %s\r\n",content_type);
     struct webnet_request rq = {
         .kind = WEBNET_NAVIGATION, .generation = navigation_generation, .url = url,
         .origin = cur_url, .method = post ? "POST" : "GET",
-        .headers = post ? "Content-Type: application/x-www-form-urlencoded\r\n" : NULL,
-        .body = post, .body_len = post ? strlen(post) : 0, .user_navigation = true,
+        .headers = post ? headers : NULL,
+        .body = post, .body_len = post ? length : 0, .user_navigation = true,
         .credentials = WEBNET_CREDENTIALS_INCLUDE
     };
     navigation_timing.fetch_start_ms = uptime_ms();
@@ -1062,13 +1109,17 @@ static void navigate(const char *url_in, const char *post, int mode) {
         navigation_ready = true;
     }
 }
+static void navigate(const char *url_in, const char *post, int mode) {
+    navigate_body(url_in,post,post?strlen(post):0,"application/x-www-form-urlencoded",mode);
+}
 
 static void apply_pending_navigation(void) {
     if (!pending_navigation || native_wait || quit || (doc && web_script_running(doc))) return;
     char url[2048]; strlcpy(url, pending_url, sizeof url);
-    char *post = pending_post; int mode = pending_mode;
+    char *post = pending_post; int mode = pending_mode; size_t length=pending_post_len;
+    char content_type[sizeof pending_content_type];strlcpy(content_type,pending_content_type,sizeof content_type);
     pending_post = NULL; pending_navigation = false;
-    navigate(url, post, mode);
+    navigate_body(url, post, length, content_type, mode);
     free(post);
 }
 
@@ -1122,11 +1173,12 @@ static void submit(web_node *n) {
     bool allowed = form && web_dispatch(doc, form, &event);
     flush_dom_layout();
     if (!allowed) return;
-    char *url = NULL, *body = NULL;
-    if (!web_submit(doc, n, &url, &body)) return;
-    queue_navigation(url, body, NAV_PUSH);
-    free(url);
-    free(body);
+    if (web_js_dialog_submit(doc,n) != 0) {flush_dom_layout();return;}
+    struct web_form_request request;
+    if (!web_submit_request(doc,n,&request)) return;
+    web_autocomplete_record(doc,n,request.url);
+    host_navigate_form(NULL,request.url,request.body,request.body_len,request.content_type,request.target);
+    web_submit_request_free(&request);
 }
 
 /* ---------------------------------------------------------------- input */
@@ -1229,7 +1281,13 @@ static void page_focus(web_node *node) {
 
 static void open_select(web_node *n) {
     int sel = 0;
+    sel_datalist = sel_autocomplete = false;
     sel_n = web_select_options(doc, n, sel_labels, (int)ARRAY_SIZE(sel_labels), &sel);
+    if (!sel_n) { sel_n = web_datalist_options(doc, n, sel_labels, (int)ARRAY_SIZE(sel_labels)); sel_datalist = sel_n > 0; }
+    if (!sel_n) {
+        sel_n = web_autocomplete_options(doc, n, sel_labels, (int)ARRAY_SIZE(sel_labels));
+        sel_autocomplete = sel_datalist = sel_n > 0;
+    }
     if (sel_n <= 0) return;
     int x, y, ww, h;
     if (!web_node_rect(doc, n, &x, &y, &ww, &h)) return;
@@ -1251,9 +1309,11 @@ static void open_select(web_node *n) {
 
 static void choose_select(int i) {
     if (sel_node && i >= 0 && i < sel_n) {
-        web_select_set(doc, sel_node, i);
-        dispatch_native("input", sel_node, NULL, false);
-        dispatch_native("change", sel_node, NULL, false);
+        if (!sel_datalist || (sel_autocomplete ? web_autocomplete_choose(doc, sel_node, i) : web_datalist_choose(doc, sel_node, i))) {
+            if (!sel_datalist) web_select_set(doc, sel_node, i);
+            dispatch_native("input", sel_node, NULL, false);
+            if (!sel_datalist) dispatch_native("change", sel_node, NULL, false);
+        }
     }
     sel_node = NULL;
     relayout();
@@ -1353,12 +1413,55 @@ static void find_key(const struct gui_event *e) {
     find_next(find_y >= 0 ? find_y : scroll_y);
 }
 
+static void console_insert(const char *text) {
+    if(console_selected){console_input[0]=0;console_cursor=0;console_selected=false;}
+    size_t n=strlen(text),length=strlen(console_input);
+    if(n>sizeof console_input-length-1)return;
+    memmove(console_input+console_cursor+n,console_input+console_cursor,length-console_cursor+1);
+    memcpy(console_input+console_cursor,text,n);console_cursor+=n;console_dirty=true;
+}
+static void console_key(const struct gui_event *e) {
+    uint32_t k=e->key;bool ctrl=e->mods&NMOD_CTRL;
+    if(ctrl&&k>='A'&&k<='Z')k+=32;
+    size_t length=strlen(console_input);
+    if(k==NKEY_ENTER){if(length){
+        console_add("input",console_input);
+        if(!web_console_eval(doc,console_input,length))console_add("error","Console execution failed or the page runtime is unavailable.");
+        console_input[0]=0;console_cursor=0;console_selected=false;
+        need_layout=true;
+    }}else if(k==NKEY_ESC){focus=F_PAGE;}
+    else if(ctrl&&k=='a')console_selected=true;
+    else if(ctrl&&k=='c')clipboard_set(console_input,length);
+    else if(ctrl&&k=='v'){char text[4096];int n=clipboard_get(text,sizeof text);
+        if(n>0){text[MIN(n,(int)sizeof text-1)]=0;for(char *p=text;*p;p++)if(*p=='\r'||*p=='\n')*p=' ';console_insert(text);}}
+    else if(k==NKEY_LEFT||k==NKEY_HOME){
+        if(k==NKEY_HOME||console_selected)console_cursor=0;
+        else if(console_cursor){console_cursor--;while(console_cursor&&((unsigned char)console_input[console_cursor]&0xc0)==0x80)console_cursor--;}
+        console_selected=false;
+    }else if(k==NKEY_RIGHT||k==NKEY_END){
+        if(k==NKEY_END||console_selected)console_cursor=length;
+        else if(console_cursor<length){console_cursor++;while(console_cursor<length&&((unsigned char)console_input[console_cursor]&0xc0)==0x80)console_cursor++;}
+        console_selected=false;
+    }else if(k==NKEY_BACKSPACE||k==NKEY_DELETE){
+        if(console_selected){console_input[0]=0;console_cursor=0;console_selected=false;}
+        else {size_t start=console_cursor,end=console_cursor;
+            if(k==NKEY_BACKSPACE&&start){start--;while(start&&((unsigned char)console_input[start]&0xc0)==0x80)start--;}
+            if(k==NKEY_DELETE&&end<length){end++;while(end<length&&((unsigned char)console_input[end]&0xc0)==0x80)end++;}
+            memmove(console_input+start,console_input+end,length-end+1);console_cursor=start;}
+    }else if(!ctrl&&!(e->mods&NMOD_ALT)&&!(k>=NKEY_F1&&k<=NKEY_F12)){char text[8];const char *p=event_key(k,text);if(p==text&&*p)console_insert(p);}
+    console_dirty=true;
+}
+
 static void key(const struct gui_event *e) {
     bool ctrl = e->mods & NMOD_CTRL, alt = e->mods & NMOD_ALT;
     uint32_t k = e->key;
     if (k >= 'A' && k <= 'Z' && (ctrl || alt)) k += 32;
+    if (ctrl && (e->mods & NMOD_SHIFT) && k == 'h') {
+        sel_node = NULL; web_autocomplete_settings(); need_paint = true; return;
+    }
     if (k == NKEY_F12) {
         console_open = !console_open;
+        if(console_open)focus=F_CONSOLE;else if(focus==F_CONSOLE)focus=F_PAGE;
         need_layout = true;
         return;
     }
@@ -1367,7 +1470,7 @@ static void key(const struct gui_event *e) {
         console_dirty = true;
         return;
     }
-    if (k == NKEY_ESC && loading) {
+    if (k == NKEY_ESC && loading && !web_modal_active(doc)) {
         stop_navigation();
         set_status("Stopped");
         return;
@@ -1383,6 +1486,7 @@ static void key(const struct gui_event *e) {
         sel_node = NULL;
         return;
     }
+    if(console_open&&focus==F_CONSOLE)return console_key(e);
     if (k == NKEY_F5 || (ctrl && k == 'r')) {
         if (cur_url[0]) navigate(cur_url, NULL, NAV_RELOAD);
         return;
@@ -1406,12 +1510,13 @@ static void key(const struct gui_event *e) {
     if (!dispatch_native("keydown", target, e, true)) return;
     if ((e->key >= 32 && !(e->key >= 0x100 && e->key < 0x200)) || e->key == NKEY_ENTER)
         if (!dispatch_native("keypress", target, e, true)) return;
+    if (target && k == NKEY_DOWN && !ctrl && !alt) { open_select(target); if (sel_node) return; }
     if(target && (k==NKEY_ENTER || k==' ') && !ctrl && !alt) {
         if (k==' ' && web_media_activate(doc,target)) { flush_dom_layout(); return; }
         struct web_hit action={0};
         if(web_node_action(doc,target,&action) &&
            (action.kind==WEB_HIT_DETAILS || action.kind==WEB_HIT_BUTTON || action.kind==WEB_HIT_SUBMIT ||
-            action.kind==WEB_HIT_CHECKBOX || action.kind==WEB_HIT_RADIO ||
+            action.kind==WEB_HIT_CHECKBOX || action.kind==WEB_HIT_RADIO || action.kind==WEB_HIT_FILE ||
             (k==NKEY_ENTER && action.kind==WEB_HIT_LINK))) {page_click(target,0,0,true);return;}
     }
     if (doc && web_focused(doc)) {
@@ -1444,8 +1549,14 @@ static void page_click(web_node *target, int x, int y, bool keyboard) {
     if (!doc) return;
     if(web_control_disabled(target))return;
     struct gui_event native = {.x = x, .y = y, .buttons = 1};
-    if (!dispatch_native("click", target, &native, true)) return;
+    struct web_control_activation activation;
+    web_control_activation_begin(doc, target, &activation);
+    bool allowed = dispatch_native("click", target, &native, true);
+    bool input_events = web_control_activation_end(doc, &activation, allowed);
+    if (!allowed) { flush_dom_layout(); return; }
     if (web_media_activate(doc,target)) { page_focus(target); flush_dom_layout(); return; }
+    web_node *label_control = web_label_activation(target);
+    if (label_control) { page_focus(label_control); page_click(label_control, x, y, keyboard); return; }
     struct web_hit hit = {0};
     if (!web_node_action(doc, target, &hit)) return;
     if (!keyboard && hit.kind==WEB_HIT_DETAILS) {
@@ -1468,12 +1579,19 @@ static void page_click(web_node *target, int x, int y, bool keyboard) {
         return;
     case WEB_HIT_TEXT_INPUT:
     case WEB_HIT_TEXTAREA: page_focus(hit.node); break;
+    case WEB_HIT_FILE:
+        page_focus(hit.node);
+        if (web_input_choose_files(doc, hit.node)) {
+            dispatch_native("input", hit.node, &native, false);
+            dispatch_native("change", hit.node, &native, false);
+            if (web_focused(doc) == hit.node) { free(focus_value); focus_value = strdup(web_control_value(hit.node)); }
+            flush_dom_layout();
+        }
+        break;
     case WEB_HIT_CHECKBOX:
     case WEB_HIT_RADIO:
-        if (!keyboard) page_focus(NULL);
-        web_toggle(doc, hit.node);
-        dispatch_native("input", hit.node, &native, false);
-        dispatch_native("change", hit.node, &native, false);
+        if (!keyboard) page_focus(hit.node);
+        if (input_events) { dispatch_native("input", hit.node, &native, false); dispatch_native("change", hit.node, &native, false); }
         break;
     case WEB_HIT_SUBMIT: submit(hit.node); return;
     case WEB_HIT_BUTTON: web_reset(doc,hit.node); flush_dom_layout(); break;
@@ -1499,7 +1617,7 @@ static void scrollbar_drag(int my) {
 static void mouse_down(const struct gui_event *e) {
     if (!(e->buttons & 1)) return;
     int x = e->x, y = e->y;
-    if (console_open && y >= TB + page_h() && y < w->h - SB) return;
+    if (console_open && y >= TB + page_h() && y < w->h - SB) {focus=F_CONSOLE;console_dirty=true;return;}
     if (sel_node) {
         int vis = MIN(sel_n - sel_top, (w->h - SB - sel_y) / SEL_H);
         if (ui_hit(x, y, sel_x, sel_y, sel_w, vis * SEL_H)) choose_select(sel_top + (y - sel_y) / SEL_H);
@@ -1532,6 +1650,7 @@ static void mouse_down(const struct gui_event *e) {
                 else if (i == BTN_RELOAD && loading && !native_wait) stop_navigation();
                 else if (i == BTN_RELOAD && cur_url[0]) navigate(cur_url, NULL, NAV_RELOAD);
                 else if (i == BTN_HOME) navigate(HOME, NULL, NAV_PUSH);
+                else if (i == BTN_HISTORY) { sel_node = NULL; web_autocomplete_settings(); need_paint = true; }
                 return;
             }
         return;
@@ -1719,6 +1838,13 @@ static void document_step(uint64_t now) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--debug-js")) { debug_js = true; argc--; argv++; }
+    if(argc>2&&!strcmp(argv[1],"--console-file")){
+        FILE *file=fopen(argv[2],"rb");size_t length=file?fread(console_startup,1,sizeof console_startup,file):0;
+        if(file)fclose(file);
+        if(!file||!length||length>=sizeof console_startup){console_startup[0]=0;console_add("error","Console source file is missing, empty or exceeds 16 KiB.");}
+        else {console_startup[length]=0;console_due=uptime_ms()+3000;}
+        argc-=2;argv+=2;
+    }
     int sw = 1024, sh = 768;
     screen_size(&sw, &sh);
     w = win_open(MIN(1100, sw - 40), MIN(800, sh - 70), "Web", WIN_RESIZABLE);
@@ -1741,6 +1867,11 @@ int main(int argc, char **argv) {
         apply_pending_navigation();
         finish_navigation();
         document_step(now);
+        if(console_startup[0]&&doc&&!loading&&!native_wait&&now>=console_due&&!web_script_running(doc)){
+            console_open=true;focus=F_CONSOLE;
+            if(!web_console_eval(doc,console_startup,strlen(console_startup)))console_add("error","Startup console command failed.");
+            console_startup[0]=0;need_layout=true;redraw();
+        }
         apply_pending_history();
         apply_pending_navigation();
         if (quit) break;
@@ -1759,6 +1890,8 @@ int main(int argc, char **argv) {
             if (timeout < 0 || due < timeout) timeout = due;
         }
         if (navigation_ready || pending_navigation || scroll_event_pending || (history_queue_count && !loading)) timeout = 0;
+        if(console_startup[0]&&doc&&!loading){int due=now>=console_due?0:(int)MIN(console_due-now,0x7fffffff);
+            if(timeout<0||due<timeout)timeout=due;}
         if (refresh_at) {
             uint64_t now = uptime_ms();
             if (now >= refresh_at) {

@@ -139,7 +139,10 @@ void nmedia_worker_pump(nmedia_worker *w,uint64_t now) {
             if(w->head_pos==sizeof w->response) {
                 if(!valid_response(w)){stop(w,"invalid native media worker response");return;}
                 if(w->response.payload_bytes>w->capacity) {
-                    unsigned char *b=nmedia_ff_realloc(w->payload,w->response.payload_bytes);
+                    /* A new response invalidates the old borrowed output.
+                     * No bytes survive: avoid realloc's old+new copy peak. */
+                    nmedia_ff_free(w->payload);w->payload=NULL;w->capacity=0;
+                    unsigned char *b=nmedia_ff_malloc(w->response.payload_bytes);
                     if(!b){stop(w,"native media worker frame aggregate limit");return;}
                     w->payload=b;w->capacity=w->response.payload_bytes;
                 }

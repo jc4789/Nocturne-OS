@@ -4,19 +4,20 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include "webi.h"
+#include "web_dialog.h"
 #include "form_validation.h"
 #include "form_value.h"
 
 /* ---------------------------------------------------------------- data structures */
 enum { SK_TAG, SK_ID, SK_CLASS, SK_ATTR, SK_PC, SK_SLOTTED };
 /* Internal selector marker, never a generated pseudo box. */
-#define PE_SLOTTED 4
+#define PE_SLOTTED 5
 enum { AO_EXISTS, AO_EQ, AO_INCL, AO_DASH, AO_PREFIX, AO_SUFFIX, AO_SUBSTR };
 enum { PC_FIRST_CHILD, PC_LAST_CHILD, PC_ONLY_CHILD, PC_NTH_CHILD, PC_NTH_LAST_CHILD, PC_FIRST_OF_TYPE,
        PC_LAST_OF_TYPE, PC_ONLY_OF_TYPE, PC_NTH_OF_TYPE, PC_NTH_LAST_OF_TYPE, PC_NOT, PC_IS, PC_NEVER,
        PC_ALWAYS, PC_LINK, PC_CHECKED, PC_DISABLED, PC_ENABLED, PC_ROOT, PC_EMPTY, PC_REQUIRED, PC_OPTIONAL,
        PC_LANG, PC_PLACEHOLDER_SHOWN, PC_READ_WRITE, PC_READ_ONLY, PC_OPEN, PC_HOST, PC_FOCUS, PC_FOCUS_WITHIN,
-       PC_VALID, PC_INVALID, PC_IN_RANGE, PC_OUT_OF_RANGE };
+       PC_VALID, PC_INVALID, PC_IN_RANGE, PC_OUT_OF_RANGE, PC_INDETERMINATE, PC_MODAL };
 
 struct sellist;
 struct simple {
@@ -247,8 +248,8 @@ static const struct {
     {"read-write", PC_READ_WRITE}, {"read-only", PC_READ_ONLY}, {"open", PC_OPEN}, {"defined", PC_ALWAYS},
     {"visited", PC_NEVER}, {"hover", PC_NEVER}, {"active", PC_NEVER}, {"focus", PC_FOCUS},
     {"focus-within", PC_FOCUS_WITHIN}, {"focus-visible", PC_NEVER}, {"target", PC_NEVER}, {"target-within", PC_NEVER},
-    {"indeterminate", PC_NEVER}, {"invalid", PC_INVALID}, {"valid", PC_VALID}, {"user-invalid", PC_NEVER},
-    {"user-valid", PC_NEVER}, {"default", PC_NEVER}, {"fullscreen", PC_NEVER}, {"modal", PC_NEVER},
+    {"indeterminate", PC_INDETERMINATE}, {"invalid", PC_INVALID}, {"valid", PC_VALID}, {"user-invalid", PC_NEVER},
+    {"user-valid", PC_NEVER}, {"default", PC_NEVER}, {"fullscreen", PC_NEVER}, {"modal", PC_MODAL},
     {"popover-open", PC_NEVER}, {"autofill", PC_NEVER}, {"in-range", PC_IN_RANGE}, {"out-of-range", PC_OUT_OF_RANGE},
     {"playing", PC_NEVER}, {"paused", PC_NEVER}, {"current", PC_NEVER}, {"past", PC_NEVER}, {"future", PC_NEVER},
     {"first", PC_NEVER}, {"left", PC_NEVER}, {"right", PC_NEVER}, {"blank", PC_NEVER}, {"local-link", PC_NEVER},
@@ -377,6 +378,7 @@ static struct compound *parse_compound(struct pctx *pc, const char **ps, const c
                 }
                 if (!strcmp(name, "before")) *pseudo = PE_BEFORE;
                 else if (!strcmp(name, "after")) *pseudo = PE_AFTER;
+                else if (!strcmp(name, "backdrop")) *pseudo = PE_BACKDROP;
                 else if (!strncmp(name, "-webkit-", 8) || !strncmp(name, "-moz-", 5) || !strncmp(name, "-ms-", 4))
                     return NULL;
                 else if (pc->supports_probe) return NULL;
@@ -639,6 +641,8 @@ static bool match_pc(const struct simple *x, node_t *e, node_t *scope) {
     case PC_NEVER: return false;
     case PC_ALWAYS: return true;
     case PC_LINK: return (e->tag == T_a || e->tag == T_area) && node_attr(e, "href");
+    case PC_INDETERMINATE:
+        return !e->foreign && ((e->tag == T_input && web_input_type(e) == WEB_INPUT_CHECKBOX && e->indeterminate) || (e->tag == T_progress && !node_attr(e, "value")));
     case PC_CHECKED:
         return (e->tag == T_input && e->checked) || doc_option_selected(e);
     case PC_DISABLED: return form_control(e) && web_control_disabled(e);
@@ -678,6 +682,7 @@ static bool match_pc(const struct simple *x, node_t *e, node_t *scope) {
                node_attr(e, "placeholder") && !*web_input_edit_text(e);
     case PC_READ_WRITE: return read_write(e);
     case PC_READ_ONLY: return !read_write(e);
+    case PC_MODAL: return web_dialog_is_modal(e->owner,e);
     case PC_OPEN: return (e->tag == T_details || e->tag == T_dialog) && node_attr(e, "open");
     }
     return false;
@@ -2092,6 +2097,11 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     cx.em = s->font_size;
     for (int i = 0; i < ndents; i++)
         if (dents[i].pseudo == pseudo && dents[i].d->p) apply_decl(c, &cx, dents[i].d);
+    if (!pseudo) web_dialog_style(d,e,s);
+    if(pseudo==PE_BACKDROP) {
+        if(s->position!=POS_FIXED && s->position!=POS_ABSOLUTE)s->position=POS_ABSOLUTE;
+        if(s->display==D_CONTENTS)s->display=D_BLOCK; s->float_=FL_NONE;
+    }
     css_style_finish(s, parent, e == d->html && !pseudo);
     if (parent && parent->display == D_CONTENTS) {
         /* Inheritance uses the slot, while flex/grid blockification uses the
@@ -2155,6 +2165,7 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     }
     style_t *s = compute(c, e, parent, PE_NONE);
     e->style = s;
+    if (web_dialog_is_modal(d,e)) s->backdrop = compute(c,e,NULL,PE_BACKDROP);
     if (e == d->html) c->rem = s->font_size;
     if (s->display != D_NONE && !(e->tag == T_img || e->tag == T_input || e->tag == T_br || e->tag == T_hr)) {
         if (has_before) {

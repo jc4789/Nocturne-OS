@@ -77,13 +77,13 @@ static bool emit_decoded_html(void *opaque, uint32_t cp, bool malformed) {
     return decoded_bytes(text, utf8, (size_t)utf8_put(utf8, cp ? cp : 0xfffd));
 }
 
-static char *decode_input(const char *src, size_t n, const char *charset, size_t *length) {
+static char *decode_input(const char *src, size_t n, const char *charset, bool byte_input, size_t *length) {
     if ((!src && n) || n > HTML_INPUT_LIMIT) return NULL;
     if (!src) src = "";
     char meta_cs[32];
     prescan_charset(src, n, meta_cs, sizeof meta_cs);
     const char *cs = charset && *charset ? charset : meta_cs[0] ? meta_cs : NULL;
-    if (n >= 3 && (unsigned char)src[0] == 0xef && (unsigned char)src[1] == 0xbb && (unsigned char)src[2] == 0xbf) {
+    if (byte_input && n >= 3 && (unsigned char)src[0] == 0xef && (unsigned char)src[1] == 0xbb && (unsigned char)src[2] == 0xbf) {
         src += 3; n -= 3; cs = "utf-8";
     }
     size_t capacity = n * 3;
@@ -178,7 +178,7 @@ static struct html_parser *parser_create(web_doc *d, bool scripting) {
 
 struct html_parser *html_begin(web_doc *d, const char *src, size_t n, const char *charset, bool scripting) {
     size_t length = 0;
-    char *input = decode_input(src, n, charset, &length);
+    char *input = decode_input(src, n, charset, true, &length);
     if (!input) return NULL;
     struct html_parser *p = parser_create(d, scripting);
     if (!p) { free(input); return NULL; }
@@ -328,7 +328,9 @@ static bool fragment_context(struct html_parser *p, node_t *context) {
 
 node_t *html_fragment(web_doc *d, node_t *context, const char *src, size_t n) {
     size_t length = 0;
-    char *input = decode_input(src, n, "utf-8", &length);
+    /* Fragment markup is a DOMString, not transport bytes. U+FEFF at its
+       beginning is text, while CR preprocessing and input bounds still apply. */
+    char *input = decode_input(src, n, "utf-8", false, &length);
     if (!input) return NULL;
     struct html_parser *p = parser_create(d, d && d->live && !d->inert);
     if (!p) { free(input); return NULL; }

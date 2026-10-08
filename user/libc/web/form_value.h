@@ -50,3 +50,16 @@ void web_select_attribute_changed(web_doc *d, node_t *node, const char *name, bo
 void web_select_inserted(web_doc *d, node_t *subtree, node_t *old_parent);
 void web_option_value(node_t *option, sbuf *out);
 void web_option_text(node_t *option, sbuf *out);
+
+bool web_control_labelable(const node_t *n);
+node_t *web_label_control(node_t *label);
+node_t *web_label_activation(node_t *target);
+node_t *web_input_datalist(node_t *input);
+node_t *web_datalist_option(node_t *input, int index);
+int web_datalist_options(web_doc *d, web_node *input, const char **labels, int capacity);
+bool web_datalist_choose(web_doc *d, web_node *input, int index);
+double web_gauge_value(const node_t *n, const char *property);
+int web_meter_quality(const node_t *n);
+bool web_textarea_submission(node_t *n, sbuf *out);
+const char *web_control_direction(node_t *control);
+bool web_radio_same_group(web_doc *d, node_t *a, node_t *b);

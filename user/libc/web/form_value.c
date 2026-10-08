@@ -1,6 +1,10 @@
 #include <math.h>
 #include <stdio.h>
+#include "nocturne.h"
 #include "form_value.h"
+#include "form_validation.h"
+#include "form_direction.h"
+#include "form_file.h"
 
 #define DAY_MS 86400000.0
 #define WEEK_MS 604800000.0
@@ -431,7 +435,10 @@ enum web_input_result web_input_step(web_doc *d, node_t *n, int32_t count, bool 
     return web_input_set_number(d, n, value, false);
 }
 
-const char *web_input_edit_text(const node_t *n) { return n->input_edit ? n->input_edit : n->value ? n->value : ""; }
+const char *web_input_edit_text(const node_t *n) {
+    if (n->tag == T_input && !n->foreign && web_input_type(n) == WEB_INPUT_FILE) return n->files && n->files->count ? n->files->files[0].name : "Choose file...";
+    return n->input_edit ? n->input_edit : n->value ? n->value : "";
+}
 void web_input_clear_edit(web_doc *d, node_t *n) {
     if (n->input_edit) {
         web_doc *allocation = n->allocation_doc ? n->allocation_doc : d;
@@ -648,3 +655,475 @@ void web_option_value(node_t *option, sbuf *out) {
     else web_option_text(option, out);
 }
 void web_option_text(node_t *option, sbuf *out) { bool pending = false; option_content(option, out, &pending); }
+
+/* Form association, native suggestions and gauges share the real DOM. */
+bool web_control_labelable(const node_t *n) {
+    if (!n || n->type != N_ELEM || n->foreign) return false;
+    return n->tag == T_button || n->tag == T_select || n->tag == T_textarea || n->tag == T_output ||
+        n->tag == T_progress || n->tag == T_meter || (n->tag == T_input && web_input_type(n) != WEB_INPUT_HIDDEN);
+}
+static node_t *control_first_id(node_t *root, const char *id) {
+    if (root->type == N_ELEM && root->id && !strcmp(root->id, id)) return root;
+    for (node_t *child = root->first; child; child = child->next) {
+        node_t *found = control_first_id(child, id); if (found) return found;
+    }
+    return NULL;
+}
+static node_t *label_descendant(node_t *label) {
+    for (node_t *child = label->first; child; child = child->next) {
+        if (web_control_labelable(child)) return child;
+        node_t *found = label_descendant(child); if (found) return found;
+    }
+    return NULL;
+}
+node_t *web_label_control(node_t *label) {
+    if (!html_tag(label, T_label)) return NULL;
+    const char *id = node_attr(label, "for");
+    if (!id) return label_descendant(label);
+    node_t *control = *id ? control_first_id(doc_node_root(label, false), id) : NULL;
+    return web_control_labelable(control) ? control : NULL;
+}
+node_t *web_label_activation(node_t *target) {
+    if (!target) return NULL;
+    for (node_t *n = target; n; n = n->parent) {
+        if (html_tag(n, T_label)) {
+            node_t *control = web_label_control(n);
+            return control == target ? NULL : control;
+        }
+        if (n->type != N_ELEM || n->foreign) continue;
+        if (web_control_labelable(n) || n->tag == T_summary || n->tag == T_iframe || n->tag == T_embed ||
+            (n->tag == T_a && node_attr(n, "href")) ||
+            ((n->tag == T_audio || n->tag == T_video) && node_attr(n, "controls"))) return NULL;
+    }
+    return NULL;
+}
+node_t *web_input_datalist(node_t *input) {
+    if (!html_tag(input, T_input)) return NULL;
+    enum web_input_kind kind = web_input_type(input);
+    if (!(kind <= WEB_INPUT_EMAIL || (kind >= WEB_INPUT_DATE && kind <= WEB_INPUT_COLOR))) return NULL;
+    const char *id = node_attr(input, "list");
+    node_t *list = id && *id ? control_first_id(doc_node_root(input, false), id) : NULL;
+    return html_tag(list, T_datalist) ? list : NULL;
+}
+/* The caller does not retain author-controlled string pointers across mutation:
+   an option number is resolved again at selection, never a cached filename. */
+node_t *web_datalist_option(node_t *input, int index) {
+    node_t *list = web_input_datalist(input);
+    if (!list || index < 0) return NULL;
+    node_t *n = list;
+    for (;;) {
+        if (n->first && !html_tag(n, T_template)) n = n->first;
+        else {
+            while (n != list && !n->next) n = n->parent;
+            if (n == list) return NULL;
+            n = n->next;
+        }
+        if (html_tag(n, T_option) && !web_option_disabled(n)) {
+            sbuf value = {0}; web_option_value(n, &value);
+            bool available = value.n != 0; sb_free(&value);
+            if (available && !index--) return n;
+        }
+    }
+}
+int web_datalist_options(web_doc *d, web_node *input, const char **labels, int capacity) {
+    if (!d || !input || input->owner != d || !labels || capacity <= 0) return 0;
+    int count = 0;
+    for (node_t *option; count < capacity && (option = web_datalist_option(input, count)); count++) {
+        if (!option->option_label || option->option_label_revision != d->dom_revision) {
+            sbuf *label = calloc(1, sizeof *label); if (!label) return count;
+            const char *attribute = node_attr(option, "label");
+            if (attribute && *attribute) sb_puts(label, attribute); else web_option_text(option, label);
+            if (!label->n) web_option_value(option, label);
+            jmp_buf trap; jmp_buf *old = d->mem.trap; d->mem.trap = &trap;
+            if (setjmp(trap)) { d->mem.trap = old; sb_free(label); free(label); return count; }
+            option->option_label = ar_strdup(&d->mem, label->p ? sb_cstr(label) : "");
+            d->mem.trap = old; sb_free(label); free(label); option->option_label_revision = d->dom_revision;
+        }
+        labels[count] = option->option_label;
+    }
+    return count;
+}
+bool web_datalist_choose(web_doc *d, web_node *input, int index) {
+    if (!d || !input || input->owner != d || web_control_disabled(input) || node_attr(input, "readonly")) return false;
+    node_t *option = web_datalist_option(input, index); if (!option) return false;
+    sbuf value = {0}; web_option_value(option, &value);
+    bool result = web_input_user_value(d, input, value.p ? sb_cstr(&value) : "", value.n);
+    sb_free(&value);
+    if (result) doc_control_selection(d, input, doc_utf16_length(input->value), doc_utf16_length(input->value), 0);
+    return result;
+}
+static double gauge_attribute(const node_t *n, const char *name, double fallback) {
+    double value;
+    return floating_decimal(node_attr(n, name), false, &value, NULL) ? value : fallback;
+}
+static double gauge_clamp(double value, double min, double max) { return value < min ? min : value > max ? max : value; }
+double web_gauge_value(const node_t *n, const char *property) {
+    if (!html_tag(n, T_progress) && !html_tag(n, T_meter)) return 0;
+    bool meter = n->tag == T_meter;
+    double min = meter ? gauge_attribute(n, "min", 0) : 0;
+    double max = gauge_attribute(n, "max", 1);
+    if (meter) { if (max < min) max = min; } else if (max <= 0) max = 1;
+    double value = gauge_clamp(gauge_attribute(n, "value", 0), min, max);
+    if (!strcmp(property, "min")) return min;
+    if (!strcmp(property, "max")) return max;
+    if (!strcmp(property, "value")) return value;
+    if (!strcmp(property, "position")) return !node_attr(n, "value") ? -1 : value / max;
+    double low = gauge_clamp(gauge_attribute(n, "low", min), min, max);
+    double high = gauge_clamp(gauge_attribute(n, "high", max), low, max);
+    if (!strcmp(property, "low")) return low;
+    if (!strcmp(property, "high")) return high;
+    return gauge_clamp(gauge_attribute(n, "optimum", min / 2 + max / 2), min, max);
+}
+int web_meter_quality(const node_t *n) {
+    double value = web_gauge_value(n, "value"), low = web_gauge_value(n, "low"),
+        high = web_gauge_value(n, "high"), optimum = web_gauge_value(n, "optimum");
+    if (optimum < low) return value <= low ? 0 : value <= high ? 1 : 2;
+    if (optimum > high) return value >= high ? 0 : value >= low ? 1 : 2;
+    return value >= low && value <= high ? 0 : 1;
+}
+/* API values remain LF-only. Submission normalization and hard wrapping do
+   not make the control dirty or alter selection/validation lengths. */
+static bool submission_capacity(sbuf *out, size_t length) {
+    if (length > WEB_FILE_BYTES) return false;
+    if (length < out->cap) return true;
+    size_t capacity = out->cap ? out->cap : 64;
+    while (capacity <= length && capacity < WEB_FILE_BYTES) capacity *= 2;
+    if (capacity <= length) capacity = WEB_FILE_BYTES + 1;
+    char *bytes = realloc(out->p, capacity);
+    if (!bytes) return false;
+    out->p = bytes; out->cap = capacity; return true;
+}
+bool web_textarea_submission(node_t *n, sbuf *out) {
+    const char *value = n->value ? n->value : "", *wrap = node_attr(n, "wrap");
+    unsigned columns = 20, column = 0;
+    const char *cols = node_attr(n, "cols");
+    if (cols) {
+        while (space((unsigned char)*cols)) cols++;
+        if (*cols == '+') cols++;
+        if (digit(*cols)) { unsigned count = 0; while (digit(*cols) && count < 100000) count = count * 10 + (unsigned)(*cols++ - '0'); if (count && count < 100000) columns = count; }
+    }
+    bool hard = wrap && str_ieq(wrap, "hard");
+    for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+        size_t extra = *p == '\r' || *p == '\n' ? 2 :
+            1 + (hard && (*p & 0xc0) != 0x80 && column == columns ? 2 : 0);
+        if (!submission_capacity(out, out->n + extra)) return false;
+        if (*p == '\r' || *p == '\n') { if (*p == '\r' && p[1] == '\n') p++; sb_puts(out, "\r\n"); column = 0; }
+        else {
+            if ((*p & 0xc0) != 0x80) { if (hard && column == columns) { sb_puts(out, "\r\n"); column = 0; } column++; }
+            sb_putc(out, (char)*p);
+        }
+    }
+    return true;
+}
+static int form_first_strong(const char *text) {
+    const unsigned char *p = (const unsigned char *)(text ? text : "");
+    while (*p) {
+        uint32_t c = *p++, minimum = 0; unsigned remaining = 0;
+        if (c >= 0xc2 && c < 0xe0) { c &= 0x1f; remaining = 1; minimum = 0x80; }
+        else if (c >= 0xe0 && c < 0xf0) { c &= 0x0f; remaining = 2; minimum = 0x800; }
+        else if (c >= 0xf0 && c < 0xf5) { c &= 7; remaining = 3; minimum = 0x10000; }
+        else if (c >= 0x80) continue;
+        bool valid = true;
+        while (remaining--) { if ((*p & 0xc0) != 0x80) { valid = false; break; } c = (c << 6) | (*p++ & 0x3f); }
+        if (!valid || c < minimum || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff)) continue;
+        size_t low = 0, high = sizeof form_bidi_ranges / sizeof *form_bidi_ranges;
+        while (low < high) {
+            size_t mid = low + (high - low) / 2;
+            if (c < form_bidi_ranges[mid].first) high = mid;
+            else if (c > form_bidi_ranges[mid].last) low = mid + 1;
+            else return form_bidi_ranges[mid].direction;
+        }
+    }
+    return 0;
+}
+static int form_first_strong_tree(node_t *root) {
+    for (node_t *n = root->first; n; n = n->next) {
+        if (n->type == N_TEXT) { int strong = form_first_strong(n->text); if (strong) return strong; }
+        else if (n->type == N_ELEM) {
+            const char *dir = node_attr(n, "dir");
+            if (n->tag == T_bdi || n->tag == T_script || n->tag == T_style || n->tag == T_textarea ||
+                (dir && (str_ieq(dir, "ltr") || str_ieq(dir, "rtl") || str_ieq(dir, "auto")))) continue;
+            int strong = form_first_strong_tree(n); if (strong) return strong;
+        }
+    }
+    return 0;
+}
+const char *web_control_direction(node_t *control) {
+    for (node_t *n = control; n; n = n->parent ? n->parent : n->shadow_host) {
+        if (n->type != N_ELEM || n->foreign) continue;
+        const char *direction = node_attr(n, "dir");
+        if (direction && str_ieq(direction, "rtl")) return "rtl";
+        if (direction && str_ieq(direction, "ltr")) return "ltr";
+        if ((direction && str_ieq(direction, "auto")) || n->tag == T_bdi) {
+            int strong;
+            if (n == control && (html_tag(n, T_input) || html_tag(n, T_textarea))) strong = form_first_strong(n->value);
+            else strong = form_first_strong_tree(n);
+            return strong == 2 ? "rtl" : "ltr";
+        }
+        if (n == control && html_tag(n, T_input) && web_input_type(n) == WEB_INPUT_TEL) return "ltr";
+    }
+    return "ltr";
+}
+
+/* This request owns every exported byte until free. Native transport receives
+   body_len and content_type, not a guessed strlen or a form-data placeholder. */
+struct form_encoding { sbuf body; const char *kind; char boundary[96]; bool collision, failed; };
+static bool submission_contains(const void *bytes, size_t length, const char *needle) {
+    size_t count = strlen(needle); const unsigned char *data = bytes;
+    if (count > length) return false;
+    for (size_t i = 0; i <= length - count; i++) if (!memcmp(data + i, needle, count)) return true;
+    return false;
+}
+static bool submission_newlines(sbuf *out, const char *text) {
+    size_t length = 0;
+    for (const char *p = text ? text : ""; *p; p++) {
+        length += *p == '\r' || *p == '\n' ? 2 : 1;
+        if (*p == '\r' && p[1] == '\n') p++;
+        if (length > WEB_FILE_BYTES) return false;
+    }
+    if (!submission_capacity(out, out->n + length)) return false;
+    for (const char *p = text ? text : ""; *p; p++) {
+        if (*p == '\r' || *p == '\n') { if (*p == '\r' && p[1] == '\n') p++; sb_puts(out, "\r\n"); }
+        else sb_putc(out, *p);
+    }
+    return true;
+}
+static size_t multipart_name_length(const char *name) {
+    size_t length = 0;
+    for (const char *p = name; *p; p++) length += *p == '"' || *p == '\r' || *p == '\n' ? 3 : 1;
+    return length;
+}
+static size_t submission_url_length(const char *text) {
+    size_t length = 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++)
+        length += ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '*' || *p == '-' || *p == '.' || *p == '_' || *p == ' ') ? 1 : 3;
+    return length;
+}
+static void multipart_name(sbuf *out, const char *name) {
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        if (*p == '"') sb_puts(out, "%22"); else if (*p == '\r') sb_puts(out, "%0D"); else if (*p == '\n') sb_puts(out, "%0A"); else sb_putc(out, (char)*p);
+    }
+}
+static void submission_pair(struct form_encoding *encoding, const char *name, const char *text) {
+    if (encoding->failed) return;
+    size_t name_len = strlen(name), text_len = strlen(text ? text : "");
+    if (name_len > (16u << 20) || text_len > (16u << 20) || encoding->body.n > (16u << 20) - name_len || text_len > (16u << 20) - name_len - encoding->body.n) { encoding->failed = true; return; }
+    sbuf normalized_name = {0}, normalized_value = {0};
+    if (!submission_newlines(&normalized_name, name) || !submission_newlines(&normalized_value, text)) {
+        encoding->failed = true; sb_free(&normalized_name); sb_free(&normalized_value); return;
+    }
+    name = normalized_name.p ? sb_cstr(&normalized_name) : "";
+    text = normalized_value.p ? sb_cstr(&normalized_value) : "";
+    sbuf *body = &encoding->body;
+    size_t extra = !strcmp(encoding->kind, "text/plain") ? normalized_name.n + normalized_value.n + 3 :
+        !strcmp(encoding->kind, "multipart/form-data") ? 2 + strlen(encoding->boundary) + strlen("\r\nContent-Disposition: form-data; name=\"") + multipart_name_length(name) + 5 + normalized_value.n + 2 :
+        (body->n ? 1 : 0) + submission_url_length(name) + 1 + submission_url_length(text);
+    if (!submission_capacity(body, body->n + extra)) { encoding->failed = true; sb_free(&normalized_name); sb_free(&normalized_value); return; }
+    if (!strcmp(encoding->kind, "text/plain")) {
+        sb_puts(body, name); sb_putc(body, '='); sb_puts(body, text); sb_puts(body, "\r\n");
+    } else if (!strcmp(encoding->kind, "multipart/form-data")) {
+        if (strstr(name, encoding->boundary) || strstr(text, encoding->boundary)) encoding->collision = true;
+        sb_puts(body, "--"); sb_puts(body, encoding->boundary);
+        sb_puts(body, "\r\nContent-Disposition: form-data; name=\""); multipart_name(body, name);
+        sb_puts(body, "\"\r\n\r\n"); sb_puts(body, text); sb_puts(body, "\r\n");
+    } else {
+        if (body->n) sb_putc(body, '&');
+        url_encode_form(body, name); sb_putc(body, '='); url_encode_form(body, text);
+    }
+    if (body->n > (16u << 20)) encoding->failed = true;
+    sb_free(&normalized_name); sb_free(&normalized_value);
+}
+static bool dirname_applicable(node_t *n) {
+    return html_tag(n, T_textarea) || (html_tag(n, T_input) && (web_input_type(n) <= WEB_INPUT_URL || web_input_type(n) == WEB_INPUT_EMAIL));
+}
+static void submission_collect(web_doc *d, node_t *form, node_t *scope, node_t *submitter, struct form_encoding *encoding) {
+    if (encoding->failed) return;
+    for (node_t *n = scope->first; n; n = n->next) {
+        if (n->type != N_ELEM || n->foreign || n->tag == T_template || n->tag == T_datalist) continue;
+        const char *name = node_attr(n, "name");
+        if (web_form_owner(d, n) == form && !web_control_disabled(n)) {
+            doc_control_init(d, n);
+            if (n->tag == T_input && web_input_type(n) == WEB_INPUT_IMAGE && n == submitter) {
+                sbuf coord = {0};
+                if (!submission_capacity(&coord, (name ? strlen(name) : 0) + 2)) { encoding->failed = true; return; }
+                if (name && *name) { sb_puts(&coord, name); sb_putc(&coord, '.'); } sb_putc(&coord, 'x');
+                submission_pair(encoding, sb_cstr(&coord), "0"); coord.n--; sb_putc(&coord, 'y'); submission_pair(encoding, sb_cstr(&coord), "0"); sb_free(&coord);
+            } else if (name && *name) {
+                if (n->tag == T_input) {
+                    enum web_input_kind kind = web_input_type(n);
+                    if (kind == WEB_INPUT_CHECKBOX || kind == WEB_INPUT_RADIO) {
+                        if (n->checked) { const char *value = node_attr(n, "value"); submission_pair(encoding, name, value ? value : "on"); }
+                    } else if (kind == WEB_INPUT_SUBMIT) { if (n == submitter) { const char *value = node_attr(n, "value"); submission_pair(encoding, name, value ? value : "Submit"); } }
+                    else if (kind == WEB_INPUT_FILE) {
+                        unsigned count = n->files ? n->files->count : 0;
+                        for (unsigned index = 0; index < (count ? count : 1); index++) {
+                            const struct web_form_file *file = count ? &n->files->files[index] : NULL;
+                            const char *filename = file ? file->name : "";
+                            if (strcmp(encoding->kind, "multipart/form-data")) submission_pair(encoding, name, filename);
+                            else {
+                                sbuf *body = &encoding->body;
+                                if (encoding->failed || body->n > WEB_FILE_BYTES || (file && file->size > WEB_FILE_BYTES - body->n)) { encoding->failed = true; break; }
+                                sbuf part_name = {0}, part_filename = {0};
+                                if (!submission_newlines(&part_name, name) || !submission_newlines(&part_filename, filename)) {
+                                    encoding->failed = true; sb_free(&part_name); sb_free(&part_filename); break;
+                                }
+                                const char *field_name = sb_cstr(&part_name), *field_filename = sb_cstr(&part_filename), *mime = file && *file->type ? file->type : "application/octet-stream";
+                                size_t extra = 2 + strlen(encoding->boundary) + strlen("\r\nContent-Disposition: form-data; name=\"") + multipart_name_length(field_name) +
+                                    strlen("\"; filename=\"") + multipart_name_length(field_filename) + strlen("\"\r\nContent-Type: ") + strlen(mime) + 4 + (file ? file->size : 0) + 2;
+                                if (!submission_capacity(body, body->n + extra)) { encoding->failed = true; sb_free(&part_name); sb_free(&part_filename); break; }
+                                if ((file && file->size && submission_contains(file->bytes, file->size, encoding->boundary)) || strstr(filename, encoding->boundary) || strstr(name, encoding->boundary)) encoding->collision = true;
+                                sb_puts(body, "--"); sb_puts(body, encoding->boundary);
+                                sb_puts(body, "\r\nContent-Disposition: form-data; name=\""); multipart_name(body, field_name);
+                                sb_puts(body, "\"; filename=\""); multipart_name(body, field_filename);
+                                sb_puts(body, "\"\r\nContent-Type: "); sb_puts(body, mime);
+                                sb_puts(body, "\r\n\r\n"); if (file && file->size) sb_put(body, (const char *)file->bytes, file->size); sb_puts(body, "\r\n");
+                                sb_free(&part_name); sb_free(&part_filename);
+                                if (body->n > WEB_FILE_BYTES) encoding->failed = true;
+                            }
+                        }
+                    } else if (kind < WEB_INPUT_SUBMIT) submission_pair(encoding, name, n->value ? n->value : "");
+                } else if (n->tag == T_textarea) {
+                    sbuf wrapped = {0};
+                    if (web_textarea_submission(n, &wrapped)) submission_pair(encoding, name, wrapped.p ? sb_cstr(&wrapped) : "");
+                    else encoding->failed = true;
+                    sb_free(&wrapped);
+                } else if (n->tag == T_select) {
+                    for (node_t *option = web_select_next_option(n, NULL); option; option = web_select_next_option(n, option)) {
+                        if (!option->checked || web_option_disabled(option)) continue;
+                        sbuf value = {0};
+                        const char *attribute = node_attr(option, "value"); size_t capacity = attribute ? strlen(attribute) : 0;
+                        if (!attribute) for (node_t *p = option; p; ) {
+                            if (p->type == N_TEXT) capacity += p->textlen;
+                            if (capacity > WEB_FILE_BYTES) break;
+                            if (p->first && !html_tag(p, T_script)) p = p->first;
+                            else { while (p != option && !p->next) p = p->parent; if (p == option) break; p = p->next; }
+                        }
+                        if (!submission_capacity(&value, capacity)) { encoding->failed = true; break; }
+                        web_option_value(option, &value);
+                        submission_pair(encoding, name, value.p ? sb_cstr(&value) : ""); sb_free(&value);
+                    }
+                } else if (n->tag == T_button && n == submitter && web_control_submit_button(n)) {
+                    const char *value = node_attr(n, "value"); submission_pair(encoding, name, value ? value : "");
+                }
+                const char *dirname = node_attr(n, "dirname");
+                if (dirname && *dirname && dirname_applicable(n)) submission_pair(encoding, dirname, web_control_direction(n));
+            }
+        }
+        if (encoding->failed) return;
+        submission_collect(d, form, n, submitter, encoding);
+    }
+}
+void web_submit_request_free(struct web_form_request *request) {
+    if (!request) return;
+    free(request->url); free(request->body); free(request->content_type); free(request->target);
+    memset(request, 0, sizeof *request);
+}
+static const char *submit_attribute(node_t *form, node_t *submitter, const char *override, const char *attribute) {
+    const char *value = web_control_submit_button(submitter) ? node_attr(submitter, override) : NULL;
+    return value ? value : node_attr(form, attribute);
+}
+bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request *request) {
+    if (!request) return false;
+    memset(request, 0, sizeof *request);
+    if (!d || !submitter || submitter->owner != d || submitter->type != N_ELEM || submitter->foreign) return false;
+    node_t *form = html_tag(submitter, T_form) ? submitter : web_form_owner(d, submitter);
+    if (!html_tag(form, T_form)) return false;
+    const char *action = submit_attribute(form, submitter, "formaction", "action");
+    const char *method = submit_attribute(form, submitter, "formmethod", "method");
+    if (method && str_ieq(method, "dialog")) return false; // handled by the native dialog owner, never GET
+    bool post = method && str_ieq(method, "post");
+    const char *kind = submit_attribute(form, submitter, "formenctype", "enctype");
+    kind = post && kind && str_ieq(kind, "text/plain") ? "text/plain" : post && kind && str_ieq(kind, "multipart/form-data") ? "multipart/form-data" : "application/x-www-form-urlencoded";
+    const char *target = submit_attribute(form, submitter, "formtarget", "target");
+    if (!target) {
+        for (node_t *n = d->root; n; ) {
+            if (html_tag(n, T_base) && node_attr(n, "target")) { target = node_attr(n, "target"); break; }
+            if (n->first && !html_tag(n, T_template)) n = n->first;
+            else { while (n != d->root && !n->next) n = n->parent; if (n == d->root) break; n = n->next; }
+        }
+    }
+    if (!target || !*target) target = "_self";
+    if (strchr(target, '\t') || strchr(target, '\n') || strchr(target, '<')) target = "_blank";
+    char absolute[2048];
+    if (!url_resolve(d->base, action && *action ? action : d->url, absolute, sizeof absolute) || !strncasecmp(absolute, "javascript:", 11)) return false;
+    struct form_encoding encoding = {.kind = kind};
+    uint64_t stamp = uptime_ms();
+    for (unsigned retry = 0; retry < 64; retry++) {
+        encoding.body.n = 0; encoding.collision = false;
+        snprintf(encoding.boundary, sizeof encoding.boundary, "----NocturneForm%llx%llx%u", (unsigned long long)stamp, (unsigned long long)d->dom_revision, retry);
+        submission_collect(d, form, doc_node_root(form, false), submitter, &encoding);
+        if (encoding.failed || !encoding.collision) break;
+    }
+    if (encoding.failed || encoding.collision) { sb_free(&encoding.body); return false; }
+    if (!strcmp(kind, "multipart/form-data")) {
+        if (!submission_capacity(&encoding.body, encoding.body.n + strlen(encoding.boundary) + 6)) { sb_free(&encoding.body); return false; }
+        sb_puts(&encoding.body, "--"); sb_puts(&encoding.body, encoding.boundary); sb_puts(&encoding.body, "--\r\n");
+    }
+    request->target = strdup(target);
+    if (post) {
+        request->url = strdup(absolute); request->body_len = encoding.body.n;
+        request->body = malloc(request->body_len + 1);
+        if (request->body) { if (request->body_len) memcpy(request->body, encoding.body.p, request->body_len); request->body[request->body_len] = 0; }
+        sbuf content = {0};
+        if (!submission_capacity(&content, strlen(kind) + strlen(encoding.boundary) + 11)) { sb_free(&encoding.body); web_submit_request_free(request); return false; }
+        sb_puts(&content, kind);
+        if (!strcmp(kind, "multipart/form-data")) { sb_puts(&content, "; boundary="); sb_puts(&content, encoding.boundary); }
+        request->content_type = strdup(sb_cstr(&content)); sb_free(&content);
+    } else {
+        char fragment_text[2048] = {0};
+        char *fragment = strchr(absolute, '#'); if (fragment) { strcpy(fragment_text, fragment); *fragment = 0; }
+        char *query = strchr(absolute, '?'); if (query) *query = 0;
+        size_t length = strlen(absolute) + encoding.body.n + strlen(fragment_text) + 2;
+        request->url = malloc(length);
+        if (request->url) snprintf(request->url, length, "%s?%s%s", absolute, encoding.body.p ? sb_cstr(&encoding.body) : "", fragment_text);
+    }
+    sb_free(&encoding.body);
+    if (!request->url || !request->target || (post && (!request->body || !request->content_type))) { web_submit_request_free(request); return false; }
+    return true;
+}
+
+bool web_radio_same_group(web_doc *d, node_t *a, node_t *b) {
+    if (!html_tag(a, T_input) || !html_tag(b, T_input) ||
+        web_input_type(a) != WEB_INPUT_RADIO || web_input_type(b) != WEB_INPUT_RADIO) return false;
+    const char *name = node_attr(a, "name"), *other = node_attr(b, "name");
+    return name && *name && other && !strcmp(name, other) &&
+        doc_node_root(a, false) == doc_node_root(b, false) && web_form_owner(d, a) == web_form_owner(d, b);
+}
+/* Checkedness is visible during click dispatch; canceled activation restores
+   the captured native state rather than trying to undo a second toggle. */
+void web_control_activation_begin(web_doc *d, web_node *n, struct web_control_activation *activation) {
+    memset(activation, 0, sizeof *activation);
+    if (!d || !html_tag(n, T_input) || web_control_disabled(n)) return;
+    enum web_input_kind kind = web_input_type(n);
+    if (kind != WEB_INPUT_CHECKBOX && kind != WEB_INPUT_RADIO) return;
+    doc_control_init(d, n);
+    activation->control = n; activation->checked = n->checked; activation->indeterminate = n->indeterminate;
+    activation->radio = kind == WEB_INPUT_RADIO;
+    if (activation->radio) {
+        node_t *root = doc_node_root(n, false);
+        for (node_t *p = root; p; ) {
+            if (p == n || web_radio_same_group(d, n, p)) {
+                doc_control_init(d, p); if (p->checked) activation->previous = p;
+            }
+            if (p->first) p = p->first;
+            else { while (p != root && !p->next) p = p->parent; if (p == root) break; p = p->next; }
+        }
+    } else n->indeterminate = false;
+    doc_control_checked(d, n, activation->radio ? true : !activation->checked);
+}
+bool web_control_activation_end(web_doc *d, struct web_control_activation *activation, bool allowed) {
+    node_t *n = activation->control;
+    if (!n || !d || n->owner != d) return false;
+    enum web_input_kind kind = web_input_type(n);
+    if (!allowed) {
+        if (kind == WEB_INPUT_CHECKBOX) {
+            n->indeterminate = activation->indeterminate; doc_control_checked(d, n, activation->checked);
+        } else if (kind == WEB_INPUT_RADIO) {
+            node_t *previous = activation->previous;
+            if (previous && (previous == n || web_radio_same_group(d, n, previous))) doc_control_checked(d, previous, true);
+            else doc_control_checked(d, n, false);
+        }
+        return false;
+    }
+    return doc_node_connected(n) && !web_control_disabled(n) && (kind == WEB_INPUT_CHECKBOX || kind == WEB_INPUT_RADIO);
+}

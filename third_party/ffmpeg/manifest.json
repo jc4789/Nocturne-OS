@@ -1,7 +1,7 @@
 {
   "release": "9.0.2",
   "license": "LGPL-2.1-or-later",
-  "compiled_sources": 337,
+  "compiled_sources": 338,
   "files": [
     {
       "path": "compat/va_copy.h",
@@ -10,12 +10,12 @@
     },
     {
       "path": "config.h",
-      "sha256": "758900f376f875266de93dbfdad0e4ad4905645488fd16d3098b7791f6200660",
+      "sha256": "7208217dd1e2cbf1358897fd622a55e30071680d1801233eb50c0bd22fe8ef95",
       "origin": "configure-generated"
     },
     {
       "path": "config_components.h",
-      "sha256": "8fcfdf5c8806ca0bec1ce75bd54e4488f03cd81cb110a3fda34fa130d9a15474",
+      "sha256": "e5272f921e50cdb1295ecc032aac5decbf4ba638849d7f2957a366d5fa3c4e26",
       "origin": "configure-generated"
     },
     {
@@ -2100,7 +2100,7 @@
     },
     {
       "path": "libavformat/demuxer_list.c",
-      "sha256": "06c23fb853c29cbe2b97c0d0e6f5e82bcaac5df4067e7adecad801c9d08c7ad7",
+      "sha256": "3d720fc5e9c64a01dfc0a92ccb4ca2d5da80fc41afd5a4fe056c642e499f4532",
       "origin": "configure-generated"
     },
     {
@@ -2301,6 +2301,21 @@
     {
       "path": "libavformat/mp3dec.c",
       "sha256": "0f56e19ca0694798b2dcd40f6a06e412784b2557945958f4c0b2371dcc0718af",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/mpeg.h",
+      "sha256": "2deede529969410e15e01775f5f0d78ce33746169d598aa80f7fd66e12c0237f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/mpegts.c",
+      "sha256": "7d2870eb01c67cc20b7c6f642348785ee0472a010bb011c98c4532b11743c35b",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavformat/mpegts.h",
+      "sha256": "abb63625c3eb35b226b17e369d5941fa9be278309a3805cbcfba58df69d9173a",
       "origin": "upstream-unmodified"
     },
     {
@@ -3820,6 +3835,7 @@
     "matroska",
     "mov",
     "mp3",
+    "mpegts",
     "ogg",
     "wav"
   ],

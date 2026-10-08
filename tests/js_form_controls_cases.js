@@ -293,5 +293,34 @@ function runFormControlCases() {
         throws('TypeError', () => descriptor.set.call({}, property === 'valueAsDate' ? null : '1'));
     }
     throws('TypeError', () => HTMLInputElement.prototype.stepUp.call({}));
+    const label = document.createElement('label'), checkbox = input('checkbox');
+    document.body.append(label); label.append(checkbox);
+    equal(label instanceof HTMLLabelElement, true); equal(label.control, checkbox);
+    const labels = checkbox.labels; equal(labels instanceof NodeList, true); equal(labels.length, 1);
+    equal(checkbox.labels, labels); checkbox.indeterminate = true; checkbox.checked = false;
+    label.click(); equal(checkbox.checked, true); equal(checkbox.indeterminate, false);
+    checkbox.indeterminate = true;
+    checkbox.onclick = event => { equal(checkbox.checked, false); equal(checkbox.indeterminate, false); equal(event.isTrusted, false); event.preventDefault(); };
+    checkbox.click(); equal(checkbox.checked, true); equal(checkbox.indeterminate, true); checkbox.onclick = null;
+    checkbox.type = 'hidden'; equal(label.control, null); equal(checkbox.labels, null); equal(labels.length, 0);
+    checkbox.type = 'checkbox'; equal(labels.length, 1); label.remove();
+    const field = document.createElement('fieldset'), fields = field.elements;
+    field.append(checkbox); equal(fields.length, 1); equal(field.elements, fields);
+    checkbox.remove(); equal(fields.length, 0);
+    const list = document.createElement('datalist'), suggestion = new Option('日本語', 'ja');
+    list.id = 'form-regression-list'; list.append(suggestion); document.body.append(list);
+    const listInput = input('text'); document.body.append(listInput); listInput.setAttribute('list', list.id);
+    equal(list instanceof HTMLDataListElement, true); equal(list.options[0], suggestion); equal(listInput.list, list);
+    list.id = 'form-regression-moved'; equal(listInput.list, null); list.remove(); listInput.remove();
+    const progress = document.createElement('progress'), meter = document.createElement('meter');
+    equal(progress instanceof HTMLProgressElement, true); equal(progress.position, -1); progress.max = 4; progress.value = 2;
+    equal(progress.position, 0.5); progress.value = 9; equal(progress.value, 4);
+    equal(meter instanceof HTMLMeterElement, true); meter.min = 2; meter.max = 8; meter.low = -4; meter.high = 20;
+    equal(meter.low, 2); equal(meter.high, 8); equal(meter.optimum, 5);
+    const upload = input('file'), selected = upload.files;
+    equal(selected instanceof FileList, true); equal(selected.length, 0); equal(selected.item(0), null); equal(upload.files, selected);
+    equal(upload.value, ''); upload.files = selected; equal(upload.files.length, 0);
+    throws('TypeError', () => { upload.files = [new File(['x'], 'x.txt')]; });
+    upload.type = 'text'; equal(upload.files, null);
     return count;
 }

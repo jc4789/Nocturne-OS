@@ -4,12 +4,14 @@
    form controls, inline SVG) become atomic boxes. */
 #include <stdio.h>
 #include "webi.h"
+#include "web_dialog.h"
 #include "elements.h"
 #include "svg_geometry.h"
 
 struct bctx {
     web_doc *d;
     arena_t *a;
+    node_t *top;
 };
 
 static box_t *nbox(struct bctx *b, int kind, node_t *n, style_t *st) {
@@ -533,6 +535,7 @@ static void gen(struct bctx *b, box_t *pb, node_t *n, style_t *pst) {
         return;
     }
     if (n->type != N_ELEM) return;
+    if (web_dialog_is_modal(b->d,n) && b->top != n) return;
     style_t *st = n->style;
     if (!st || st->display == D_NONE) return;
     if (n->tag == T_input) { /* a hidden input is never rendered, whatever its display */
@@ -781,7 +784,7 @@ static void clear_boxes(node_t *n) {
 }
 
 void boxes_build(web_doc *d, arena_t *a) {
-    struct bctx b = {d, a};
+    struct bctx b = {.d=d, .a=a};
     if (d->root) clear_boxes(d->root);
     box_t *root = nbox(&b, B_BLOCK, NULL, anon_style(&b, NULL, D_BLOCK));
     root->anon = true;
@@ -789,4 +792,17 @@ void boxes_build(web_doc *d, arena_t *a) {
     if (d->html) gen(&b, root, d->html, NULL);
     fixup(&b, root);
     d->root_box = root;
+    for (int i=0;i<web_dialog_count(d);i++) {
+        node_t *n=web_dialog_at(d,i); if(!n)continue;
+        web_dialog_set_backdrop(d,n,NULL);
+        if(!web_dialog_rendered(n))continue;
+        /* Unlike ::before/::after, a top-layer ::backdrop does not depend on
+           the content property generating a box. */
+        if(n->style->backdrop && n->style->backdrop->display!=D_NONE) {
+            box_t *back=nbox(&b,B_BLOCK,n,n->style->backdrop);
+            back->abspos=true; back->anon=true; append(root,back);
+            web_dialog_set_backdrop(d,n,back);
+        }
+        b.top=n; gen(&b,root,n,NULL); b.top=NULL;
+    }
 }

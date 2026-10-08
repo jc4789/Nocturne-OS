@@ -200,6 +200,7 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavformat/mov_chan.c \
     third_party/ffmpeg/libavformat/mov_esds.c \
     third_party/ffmpeg/libavformat/mp3dec.c \
+    third_party/ffmpeg/libavformat/mpegts.c \
     third_party/ffmpeg/libavformat/mux.c \
     third_party/ffmpeg/libavformat/mux_utils.c \
     third_party/ffmpeg/libavformat/nal.c \

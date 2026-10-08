@@ -13,7 +13,10 @@ struct nmedia_alloc_stats {
     enum nmedia_alloc_failure last_failure;
     size_t reserved; /* trusted live child budget; not allocated parent RAM */
 };
-#define NMEDIA_WORKER_BYTES (32u * 1024u * 1024u)
+#define NMEDIA_WORKER_BYTES (64u * 1024u * 1024u)
+/* A live native child reserves 64 MiB; the parent retains 32 MiB locally.
+ * Logical SourceBuffer/wire caps remain separate from charged allocation. */
+#define NMEDIA_ALLOC_DEFAULT_BYTES (96u * 1024u * 1024u)
 /* Native single-owner only. Reservation is retained until the child is reaped.
  * Worker restriction only lowers its empty allocator, before opening FFmpeg. */
 bool nmedia_alloc_reserve_worker(void);

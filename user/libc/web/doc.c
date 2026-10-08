@@ -4,10 +4,13 @@
 #include <ctype.h>
 #include "nocturne.h"
 #include "webi.h"
+#include "web_dialog.h"
 #include "form_value.h"
+#include "form_file.h"
 #include "form_validation.h"
 #include "elements.h"
 #include "js_canvas.h"
+#include "image_source.h"
 #include "avmedia.h"
 
 /* Cached source and its expanded selector/declaration AST have separate,
@@ -283,10 +286,9 @@ void doc_image_sync(web_doc *d, node_t *n) {
     if (!lazy) lazy = node_attr(n, "data-lazy-src");
     if (!lazy) lazy = node_attr(n, "data-original");
     char *pick = NULL;
-    /* Retain the existing renderer's source-selection policy; responsive
-       density/sizes/picture selection is a separate, still-limited subsystem. */
-    if (placeholder_src(src) && lazy) src = lazy;
-    else if (placeholder_src(src) && ss) src = pick = srcset_pick(ss);
+    pick=web_image_source_pick(d,n,placeholder_src(src)?NULL:src);
+    if(pick)src=pick;
+    else if (placeholder_src(src) && lazy) src = lazy;
     else if (placeholder_src(src) && node_attr(n, "data-srcset")) src = pick = srcset_pick(node_attr(n, "data-srcset"));
     bool has_source = src != NULL || ss != NULL;
     int requested = add_image_request(d, src, n->image_invalidated, n->image_initialized && !n->image_invalidated ? n->image_request : -1);
@@ -736,6 +738,7 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
 
 static void free_values(node_t *n) {
     web_canvas_free(n);
+    web_input_files_release(n);
     if (n->shadow_root) free_values(n->shadow_root);
     for (node_t *c = n->first; c; c = c->next) {
         if (c->type != N_ELEM) continue;
@@ -749,6 +752,7 @@ static void free_values(node_t *n) {
 
 void web_free(web_doc *d) {
     if (!d) return;
+    web_dialog_free(d);
     web_avmedia_free(d);
     web_js_free(d);
     web_form_validation_free(d);
@@ -762,6 +766,7 @@ void web_free(web_doc *d) {
     if (d->owned_nodes) {
         for (node_t *n = d->owned_nodes; n; n = n->owned_next) {
             web_canvas_free(n);
+            web_input_files_release(n);
             free(n->value);
             free(n->input_edit);
         }
@@ -909,11 +914,16 @@ static void clear_intrinsic(box_t *b) {
 int web_layout(web_doc *d, int width, int height) {
     if (width < 1) width = 1;
     if (height < 1) height = 1;
+    web_dialog_sync(d);
     if (d->resources_dirty) doc_rescan(d);
     /* Geometry reads may flush layout repeatedly within one script. Reuse the
        result until DOM/style, viewport, or image intrinsic dimensions change. */
     if (d->layout_valid && !d->need_style && d->root_box &&
         d->width == width && d->height == height) return d->doc_h;
+    if(d->width!=width||d->height!=height){
+        d->width=width;d->height=height;
+        for(node_t *image=doc_image_node_next(d,NULL);image;image=doc_image_node_next(d,image))doc_image_sync(d,image);
+    }
     if (d->need_style || d->styled_w != width || d->styled_h != height || !d->root_box) {
         css_cascade(d, width, height);
         if (d->root) register_bg(d, d->root);
@@ -1003,6 +1013,7 @@ bool web_node_rect(web_doc *d, web_node *n, int *x, int *y, int *w, int *h) {
     box_t *b = n->box;
     *x = (int)(box_abs_x(b) - b->p[3] - b->b[3]);
     *y = (int)(box_abs_y(b) - b->p[0] - b->b[0]);
+    web_dialog_scroll_offset(d, n, x, y);
     *w = (int)(b->w + b->p[1] + b->p[3] + b->b[1] + b->b[3]);
     *h = (int)(b->h + b->p[0] + b->p[2] + b->b[0] + b->b[2]);
     return true;
@@ -1117,7 +1128,7 @@ static node_t *focus_delegate(web_doc *d, node_t *parent);
 static node_t *focus_area(web_doc *d, node_t *n) {
     if (!n || n->type != N_ELEM || !n->style || n->style->display == D_NONE ||
         (!n->box && !n->anchor_block) ||
-        node_attr(n, "inert")) return NULL;
+        web_dialog_inert(d, n)) return NULL;
     if (n->shadow_root && n->shadow_root->shadow_delegates_focus) {
         if (d->focus && focus_under(d->focus, n)) return d->focus;
         return focus_delegate(d, n->shadow_root);
@@ -1127,13 +1138,14 @@ static node_t *focus_area(web_doc *d, node_t *n) {
     bool control = n->tag == T_button || n->tag == T_select || n->tag == T_textarea ||
                    (n->tag == T_input && (!type || !str_ieq(type, "hidden")));
     const char *editable = node_attr(n, "contenteditable");
-    bool focusable = control || ((n->tag == T_a || n->tag == T_area) && node_attr(n, "href")) ||
+    bool focusable = (n->tag == T_dialog && !n->foreign && node_attr(n,"open")) || control || ((n->tag == T_a || n->tag == T_area) && node_attr(n, "href")) ||
                      ((n->tag == T_audio || n->tag == T_video) && node_attr(n, "controls")) ||
                      (n->tag == T_summary && doc_details_summary(n->parent)==n) ||
                      (n->tag == T_details && !doc_details_summary(n)) ||
                      node_attr(n, "tabindex") || (editable && !str_ieq(editable, "false"));
     return focusable ? n : NULL;
 }
+node_t *web_focus_candidate(web_doc *d, node_t *n) { return focus_area(d,n); }
 static node_t *focus_descendants(web_doc *d, node_t *parent, bool autofocus) {
     for (node_t *n = parent->first; n; n = n->next) {
         if (n->type != N_ELEM || !n->style || n->style->display == D_NONE || node_attr(n, "inert")) continue;
@@ -1142,6 +1154,11 @@ static node_t *focus_descendants(web_doc *d, node_t *parent, bool autofocus) {
         if (target) return target;
     }
     return NULL;
+}
+node_t *web_autofocus_candidate(web_doc *d) {
+    if (!d || d->inert || d->focus || (d->url && strchr(d->url, '#'))) return NULL;
+    web_layout(d, d->width > 0 ? d->width : 800, d->height > 0 ? d->height : 600);
+    return focus_descendants(d, d->root, true);
 }
 static node_t *focus_delegate(web_doc *d, node_t *parent) {
     /* HTML's focus delegate uses DOM descendants, not assigned/flattened
@@ -1174,7 +1191,7 @@ void web_focus(web_doc *d, web_node *n) {
     d->dirty = d->need_style = true;
 }
 
-web_node *web_focused(web_doc *d) { return d->focus; }
+web_node *web_focused(web_doc *d) { return d && !web_dialog_inert(d,d->focus) ? d->focus : NULL; }
 web_node *web_disclosure_focus(web_node *details) {
     if (!details || details->foreign || details->tag!=T_details) return NULL;
     node_t *summary=doc_details_summary(details);
@@ -1191,7 +1208,7 @@ static bool readonly(node_t *n) {
 
 int web_key(web_doc *d, const struct gui_event *e) {
     node_t *n = d->focus;
-    if (!n || !(n->tag == T_input || n->tag == T_textarea) || web_control_disabled(n)) return 0;
+    if (!n || !(n->tag == T_input || n->tag == T_textarea) || web_control_disabled(n) || web_input_is_file(n)) return 0;
     doc_control_init(d, n);
     if (!n->value && !doc_node_value(d, n, "", 0)) return 0;
     const char *v = web_input_edit_text(n);
@@ -1398,15 +1415,9 @@ bool doc_form_reset(web_doc *d, node_t *form) {
     return ok;
 }
 
-static void uncheck_radios(node_t *scope, node_t *keep, const char *name) {
-    for (node_t *c = scope->first; c; c = c->next) {
-        if (c->type != N_ELEM) continue;
-        if (c != keep && c->tag == T_input) {
-            const char *t = node_attr(c, "type"), *nm = node_attr(c, "name");
-            if (t && str_ieq(t, "radio") && nm && !strcmp(nm, name)) c->checked = false;
-        }
-        uncheck_radios(c, keep, name);
-    }
+static void uncheck_radios(web_doc *d, node_t *scope, node_t *keep) {
+    if (scope != keep && web_radio_same_group(d, scope, keep)) { doc_control_init(d, scope); scope->checked = false; }
+    for (node_t *c = scope->first; c; c = c->next) uncheck_radios(d, c, keep);
 }
 
 void doc_control_checked(web_doc *d, node_t *n, bool checked) {
@@ -1417,8 +1428,7 @@ void doc_control_checked(web_doc *d, node_t *n, bool checked) {
     if (checked && t && str_ieq(t, "radio")) {
         const char *name = node_attr(n, "name");
         if (name && *name) {
-            node_t *scope = form_of(d, n);
-            uncheck_radios(scope ? scope : d->root, n, name);
+            uncheck_radios(d, doc_node_root(n, false), n);
         }
     }
     n->checked = checked;
@@ -1430,6 +1440,7 @@ void web_toggle(web_doc *d, web_node *n) {
     if (!n || n->tag != T_input || web_control_disabled(n)) return;
     doc_control_init(d, n);
     const char *t = node_attr(n, "type");
+    if (web_input_type(n) == WEB_INPUT_CHECKBOX) n->indeterminate = false;
     doc_control_checked(d, n, t && str_ieq(t, "radio") ? true : !n->checked);
 }
 bool web_reset(web_doc *d, web_node *n) {
@@ -1476,91 +1487,12 @@ static void option_text(node_t *o, sbuf *b) {
     sb_free(&t);
 }
 
-static void add_pair(sbuf *q, const char *name, const char *value) {
-    if (q->n) sb_putc(q, '&');
-    url_encode_form(q, name);
-    sb_putc(q, '=');
-    url_encode_form(q, value);
-}
-
-static void collect(web_doc *d, node_t *form, node_t *scope, node_t *submitter, sbuf *q) {
-    for (node_t *c = scope->first; c; c = c->next) {
-        if (c->type != N_ELEM) continue;
-        if (c->tag == T_template) continue;
-        const char *name = node_attr(c, "name");
-        bool mine = form_of(d, c) == form;
-        if (mine && name && *name && !web_control_disabled(c)) {
-            doc_control_init(d, c);
-            if (c->tag == T_input) {
-                const char *t = node_attr(c, "type");
-                if (!t) t = "text";
-                if (str_ieq(t, "checkbox") || str_ieq(t, "radio")) {
-                    if (c->checked) {
-                        const char *v = node_attr(c, "value");
-                        add_pair(q, name, v ? v : "on");
-                    }
-                } else if (str_ieq(t, "submit") || str_ieq(t, "button") || str_ieq(t, "reset")) {
-                    if (c == submitter && str_ieq(t, "submit")) add_pair(q, name, web_button_label(c));
-                } else if (str_ieq(t, "image")) {
-                    if (c == submitter) {
-                        char nm[300];
-                        snprintf(nm, sizeof nm, "%s.x", name);
-                        add_pair(q, nm, "0");
-                        snprintf(nm, sizeof nm, "%s.y", name);
-                        add_pair(q, nm, "0");
-                    }
-                } else if (!str_ieq(t, "file")) add_pair(q, name, c->value ? c->value : "");
-            } else if (c->tag == T_textarea) {
-                add_pair(q, name, c->value ? c->value : "");
-            } else if (c->tag == T_select) {
-                for (node_t *o = web_select_next_option(c, NULL); o; o = web_select_next_option(c, o)) {
-                    if (!o->checked || web_option_disabled(o)) continue;
-                    sbuf t = {0};
-                    web_option_value(o, &t);
-                    add_pair(q, name, t.p ? sb_cstr(&t) : "");
-                    sb_free(&t);
-                }
-            } else if (c->tag == T_button && c == submitter) {
-                const char *v = node_attr(c, "value");
-                add_pair(q, name, v ? v : "");
-            }
-        }
-        collect(d, form, c, submitter, q);
-    }
-}
-
 bool web_submit(web_doc *d, web_node *submitter, char **url, char **body) {
-    *url = NULL;
-    *body = NULL;
-    if (!submitter) return false;
-    node_t *form = submitter->tag == T_form ? submitter : form_of(d, submitter);
-    if (!form) return false;
-    const char *action = node_attr(submitter, "formaction");
-    if (!action) action = node_attr(form, "action");
-    const char *method = node_attr(submitter, "formmethod");
-    if (!method) method = node_attr(form, "method");
-    bool post = method && str_ieq(method, "post");
-    char abs[2048];
-    if (!url_resolve(d->base, action && *action ? action : d->url, abs, sizeof abs)) return false;
-    if (!strncasecmp(abs, "javascript:", 11)) return false;
-    sbuf q = {0};
-    collect(d, form, d->root, submitter, &q);
-    const char *qs = q.p ? sb_cstr(&q) : "";
-    if (post) {
-        *url = strdup(abs);
-        *body = strdup(qs);
-    } else {
-        /* replace the query; drop the fragment */
-        char *hash = strchr(abs, '#');
-        if (hash) *hash = 0;
-        char *qm = strchr(abs, '?');
-        if (qm) *qm = 0;
-        size_t n = strlen(abs) + strlen(qs) + 2;
-        *url = malloc(n);
-        snprintf(*url, n, "%s?%s", abs, qs);
-    }
-    sb_free(&q);
-    return true;
+    *url = NULL; *body = NULL;
+    struct web_form_request request;
+    if (!web_submit_request(d, submitter, &request)) return false;
+    *url = request.url; *body = request.body;
+    request.url = request.body = NULL; web_submit_request_free(&request); return true;
 }
 
 int web_select_options(web_doc *d, web_node *sel, const char **labels, int max, int *selected) {

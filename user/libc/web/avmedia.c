@@ -44,6 +44,8 @@ struct web_avmedia {
     int64_t base_ms;
     uint64_t started;
     char error[160];
+    /* Private, bounded plain-text caption surface; owned with this media node. */
+    char caption[2049];
     int16_t scaled[4096 * 2];
 };
 static struct web_avmedia *streams;
@@ -79,7 +81,7 @@ static void unload(struct web_avmedia *s) {
     s->width = s->height = 0; s->playing = s->ended = false;
     s->url_input = false;
     s->audio_enabled=s->video_enabled=true;
-    s->base_ms = 0; s->input_size = 0; s->audio_at = 0; s->pending.kind = 0; s->ready = 0; s->error[0] = 0;
+    s->base_ms = 0; s->input_size = 0; s->audio_at = 0; s->pending.kind = 0; s->ready = 0; s->error[0] = 0; s->caption[0] = 0;
 }
 static int64_t current(struct web_avmedia *s, uint64_t now) {
     int64_t ms = s->base_ms + (s->playing && !s->starved && !nmedia_worker_seeking(s->worker) && now >= s->started ? (int64_t)(now - s->started) : 0);
@@ -261,6 +263,13 @@ JSValue web_avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *op, 
     if(!s)return !strcmp(op,"state")?state(ctx,NULL):JS_ThrowRangeError(ctx,"document media limit");
     uint64_t now=uptime_ms();
     if(!strcmp(op,"state"))return state(ctx,s);
+    if(!strcmp(op,"captionText")){
+        if(!argc)return JS_ThrowTypeError(ctx,"caption text required");
+        size_t length;const char *text=JS_ToCStringLen(ctx,&length,argv[0]);if(!text)return JS_EXCEPTION;
+        if(length>sizeof(s->caption)-1||memchr(text,0,length)){JS_FreeCString(ctx,text);return JS_ThrowRangeError(ctx,"caption text exceeds bounded plain-text surface");}
+        if(strlen(s->caption)!=length||memcmp(s->caption,text,length)){memcpy(s->caption,text,length);s->caption[length]=0;d->dirty=true;}
+        JS_FreeCString(ctx,text);return JS_UNDEFINED;
+    }
     if(!strncmp(op,"mse",3))return mse_call(ctx,s,op,argc,argv,now);
     if(!strcmp(op,"reset")){
         uint32_t generation;if(!argc||JS_ToUint32(ctx,&generation,argv[0])<0)return JS_EXCEPTION;
@@ -425,6 +434,36 @@ void web_avmedia_free(web_doc *d){
     struct web_avmedia **link=&streams;
     while(*link){struct web_avmedia *s=*link;if(s->doc!=d){link=&s->next;continue;}*link=s->next;unload(s);nmedia_ff_free(s);}
 }
+/* Finite plain-text WebVTT surface, not the WebVTT region/style layout engine.
+ * Wrap on complete UTF-8 scalars and clip to the real media rectangle. */
+static void paint_caption(struct web_avmedia *s,canvas_t *c,int x,int y,int w,int h){
+    if(!s||!s->caption[0]||w<=16||h<=0)return;
+    const char *at=s->caption,*starts[4];size_t lengths[4];int widths[4],count=0;
+    int line_height=gfx_font_h(FONT_SMALL)+4,limit=MIN(4,h/line_height);
+    while(*at&&count<limit){
+        starts[count]=at;int width=0;
+        while(*at&&*at!='\n'){
+            uint32_t cp;int bytes=gfx_utf8_decode(at,&cp);char scalar[5];
+            memcpy(scalar,at,(size_t)bytes);scalar[bytes]=0;int advance=gfx_text_width(scalar,FONT_SMALL);
+            if(width&&width+advance>w-16)break;
+            width+=advance;at+=bytes;
+        }
+        lengths[count]=(size_t)(at-starts[count]);widths[count++]=width;
+        if(*at=='\n')at++;
+    }
+    if(!count)return;
+    int64_t top=(int64_t)y+h-count*line_height;
+    int64_t left=MAX((int64_t)x,c->cx0),right=MIN((int64_t)x+w,c->cx1),bottom=MIN((int64_t)y+h,c->cy1);
+    int64_t visible_top=MAX(top,c->cy0);
+    if(left>=right||visible_top>=bottom)return;
+    gfx_fill(c,(int)left,(int)visible_top,(int)(right-left),(int)(bottom-visible_top),RGB(20,20,24));
+    char line[2049];
+    for(int i=0;i<count;i++){
+        memcpy(line,starts[i],lengths[i]);line[lengths[i]]=0;
+        int64_t tx=(int64_t)x+MAX(8,(w-widths[i])/2),ty=top+i*line_height+2;
+        if(tx>=INT_MIN&&tx<=INT_MAX&&ty>=INT_MIN&&ty<=INT_MAX)gfx_text(c,(int)tx,(int)ty,line,RGB(255,255,255),TRANSPARENT,FONT_SMALL);
+    }
+}
 bool web_avmedia_paint(web_doc *d,node_t *n,canvas_t *c,int x,int y,int w,int h){
     struct web_avmedia *s=find(d,n,false);
     if(!media_node(n)||w<=0||h<=0)return false;
@@ -437,6 +476,7 @@ bool web_avmedia_paint(web_doc *d,node_t *n,canvas_t *c,int x,int y,int w,int h)
     bool controls=node_attr(n,"controls")!=NULL;
     int strip=controls?MIN(h,32):0;
     if(s&&s->pixels&&n->tag==T_video)nmedia_draw(c,s->pixels,s->width,s->height,x,y,w,h-strip);
+    if(n->tag==T_video)paint_caption(s,c,x,y,w,h-strip);
     if(controls){
         int64_t top=MAX((int64_t)y+h-strip,y0);
         if(top<y1){

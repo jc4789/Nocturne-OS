@@ -14,13 +14,13 @@ def main():
     p=argparse.ArgumentParser()
     p.add_argument('--source',required=True)
     p.add_argument('--import-vendor',action='store_true')
-    p.add_argument('--profile',choices=['legacy','webm'],default='legacy')
+    p.add_argument('--profile',choices=['legacy','webm','adaptive'],default='legacy')
     p.add_argument('--stage',help='Fresh directory below repository build/; existing stages are never overwritten')
     a=p.parse_args()
     root=pathlib.Path(__file__).resolve().parents[2]
     src=pathlib.Path(a.source).resolve()
     if (src/'RELEASE').read_text(encoding='utf-8').strip()!='9.0.2':raise SystemExit('expected release 9.0.2')
-    default='build/media-stage2/reproduce-stage' if a.profile=='webm' else 'build/nocturne-platform/media/reproduce-stage'
+    default='build/media-adaptive/reproduce-stage' if a.profile=='adaptive' else 'build/media-stage2/reproduce-stage' if a.profile=='webm' else 'build/nocturne-platform/media/reproduce-stage'
     out=(root/(a.stage or default)).resolve()
     out.relative_to((root/'build').resolve())
     if out.exists():raise SystemExit('stage already exists; choose a fresh --stage (old evidence is preserved): '+str(out))
@@ -39,12 +39,12 @@ def main():
         '--enable-cross-compile','--target-os=none','--arch=x86_64','--cc=clang','--ld=ld.lld','--ar=ar','--nm=nm',
         '--disable-autodetect','--disable-everything','--disable-programs','--disable-doc','--disable-network','--disable-protocols',
         '--disable-avdevice','--disable-avfilter','--disable-swscale',
-        '--enable-swresample' if a.profile=='webm' else '--disable-swresample','--disable-pthreads','--disable-w32threads',
+        '--enable-swresample' if a.profile in ['webm','adaptive'] else '--disable-swresample','--disable-pthreads','--disable-w32threads',
         '--disable-os2threads','--disable-asm','--disable-inline-asm','--disable-x86asm','--disable-runtime-cpudetect','--disable-debug',
         '--enable-small','--enable-static','--disable-shared','--enable-avcodec','--enable-avformat','--enable-avutil',
-        '--enable-decoder='+LEGACY_DECODERS+(',vp8,vp9,opus,vorbis' if a.profile=='webm' else ''),
-        '--enable-demuxer='+LEGACY_DEMUXERS+(',matroska,ogg' if a.profile=='webm' else ''),
-        '--enable-parser='+LEGACY_PARSERS+(',vp8,vp9,opus,vorbis' if a.profile=='webm' else ''),
+        '--enable-decoder='+LEGACY_DECODERS+(',vp8,vp9,opus,vorbis' if a.profile in ['webm','adaptive'] else ''),
+        '--enable-demuxer='+LEGACY_DEMUXERS+(',matroska,ogg' if a.profile in ['webm','adaptive'] else '')+(',mpegts' if a.profile=='adaptive' else ''),
+        '--enable-parser='+LEGACY_PARSERS+(',vp8,vp9,opus,vorbis' if a.profile in ['webm','adaptive'] else ''),
         '--extra-cflags=--target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie -mno-red-zone -msse2 -I'+prefix+'/ports/ffmpeg/include -I'+prefix+'/user/include -I'+prefix+'/common',
         '--extra-ldflags=-m elf_x86_64 --entry=main','--extra-libs='+prefix+'/build/sysroot/usr/lib/libc.a']
     (out/'nocturne-prepare.json').write_text(json.dumps({'profile':a.profile,'source':str(src),'release_sha256':hashlib.sha256((src/'RELEASE').read_bytes()).hexdigest(),'configure_arguments':args},indent=2)+'\n',encoding='utf-8',newline='\n')
@@ -59,7 +59,7 @@ def main():
     config.write_text(text,encoding='utf-8',newline='\n')
     with(out/'build-output.log').open('w',encoding='utf-8')as log:
         libraries=['libavcodec/libavcodec.a','libavformat/libavformat.a','libavutil/libavutil.a']
-        if a.profile=='webm':libraries+=['libswresample/libswresample.a']
+        if a.profile in ['webm','adaptive']:libraries+=['libswresample/libswresample.a']
         subprocess.run([str(root/'tools/msys64/usr/bin/make.exe'),'-j8']+libraries,cwd=out,env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
     if a.import_vendor:subprocess.run([str(root/'tools/msys64/ucrt64/bin/python.exe'),str(root/'ports/ffmpeg/vendor.py'),'--source',str(src),'--stage',str(out)],check=True)
     print('reproduced Nocturne FFmpeg 9.0.2; logs:',out)

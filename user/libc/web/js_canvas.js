@@ -7,10 +7,12 @@ const canvasBridge = (() => {
     const Float64=Float64Array, Bytes=Uint8ClampedArray, finite=Number.isFinite;
     const abs=Math.abs,ceil=Math.ceil,floor=Math.floor,cos=Math.cos,sin=Math.sin,atan2=Math.atan2;
     const native=host.canvas, defer=setTimeout, apply=Reflect.apply, blobFrom=blobBridge.fromBytes;
+    const PATH_VALUES=8192*2;
+    const byteProto=Object.getPrototypeOf(Bytes.prototype), byteBuffer=Object.getOwnPropertyDescriptor(byteProto,'buffer').get, byteOffset=Object.getOwnPropertyDescriptor(byteProto,'byteOffset').get;
     class HTMLCanvasElement extends HTMLElement {constructor(){throw new TypeError('Illegal HTMLCanvasElement constructor');}}
     class CanvasRenderingContext2D {constructor(){throw new TypeError('Illegal CanvasRenderingContext2D constructor');}}
     class TextMetrics {constructor(){throw new TypeError('Illegal TextMetrics constructor');}}
-    function defaults(s){s.fill='#000000';s.stroke='#000000';s.fillColor=0xff000000;s.strokeColor=0xff000000;s.alpha=1;s.lineWidth=1;s.smoothing=true;s.font='10px sans-serif';s.fontSize=10;s.fontStyle=0;s.align='start';s.baseline='alphabetic';s.direction='inherit';s.matrix=[1,0,0,1,0,0];s.path=[];s.first=null;s.last=null;s.subpathCount=0;s.stack=[];}
+    function defaults(s){s.fill='#000000';s.stroke='#000000';s.fillColor=0xff000000;s.strokeColor=0xff000000;s.alpha=1;s.lineWidth=1;s.dash=[];s.dashOffset=0;s.smoothing=true;s.font='10px sans-serif';s.fontSize=10;s.fontStyle=0;s.align='start';s.baseline='alphabetic';s.direction='inherit';s.matrix=[1,0,0,1,0,0];s.path=[];s.first=null;s.last=null;s.subpathCount=0;s.stack=[];}
     function state(ctx){const s=states.get(ctx);if(!s)throw new TypeError('Illegal CanvasRenderingContext2D receiver');const v=native(s.canvas,'version');if(v!==s.version){defaults(s);s.version=v;}return s;}
     function pathState(value){const s=paths.get(value);return s||state(value);}
     function emptyPath(){return {matrix:[1,0,0,1,0,0],path:[],first:null,last:null,subpathCount:0};}
@@ -20,10 +22,10 @@ const canvasBridge = (() => {
     function valid(values){return values.every(finite);}
     function point(s,x,y){const m=s.matrix;return [m[0]*x+m[2]*y+m[4],m[1]*x+m[3]*y+m[5]];}
     function color(s,stroke=false){const v=stroke?s.strokeColor:s.fillColor;return ((v&0xffffff)|((floor((v>>>24)*s.alpha+0.5)&255)<<24))>>>0;}
-    function pathBuffer(points){if(points.length>512)throw new RangeError('Canvas path limit');return new Float64(points).buffer;}
-    function append(s,p,move=false){if(s.path.length+(move&&s.path.length?4:2)>512)throw new RangeError('Canvas path limit');if(move&&s.path.length)s.path.push(NaN,NaN);s.path.push(p[0],p[1]);s.last=p;if(move||!s.first){s.first=p;s.subpathCount=1;}else s.subpathCount++;}
+    function pathBuffer(points){if(points.length>PATH_VALUES)throw new RangeError('Canvas path limit');return new Float64(points).buffer;}
+    function append(s,p,move=false){if(s.path.length+(move&&s.path.length?4:2)>PATH_VALUES)throw new RangeError('Canvas path limit');if(move&&s.path.length)s.path.push(NaN,NaN);s.path.push(p[0],p[1]);s.last=p;if(move||!s.first){s.first=p;s.subpathCount=1;}else s.subpathCount++;}
     function resetPath(s){s.path=[];s.first=null;s.last=null;s.subpathCount=0;}
-    function capacity(s,points){if(s.path.length+points*2>512)throw new RangeError('Canvas path limit');}
+    function capacity(s,points){if(s.path.length+points*2>PATH_VALUES)throw new RangeError('Canvas path limit');}
     function matrixDictionary(value){
         if(value==null)return [1,0,0,1,0,0];
         if(typeof value!=='object'&&typeof value!=='function')throw new TypeError('Expected matrix dictionary');
@@ -102,9 +104,10 @@ const canvasBridge = (() => {
     class Path2D {
         constructor(value){const source=paths.get(value);paths.set(this,source?copyPath(source):emptyPath());if(value!==undefined&&!source)svgPath(this,string(value));}
         addPath(path,transform){const s=paths.get(this),source=paths.get(path);if(!s||!source)throw new TypeError('Expected Path2D receiver and path');const matrix=matrixDictionary(transform);if(!valid(matrix)||!source.path.length)return;
-            const copy=transformedPath({matrix},path);capacity(s,copy.length/2+(s.path.length?1:0)+2);if(s.path.length)s.path.push(NaN,NaN);s.path.push(...copy);
+            const copy=transformedPath({matrix},path);capacity(s,copy.length/2+(s.path.length?1:0)+2);if(s.path.length)s.path.push(NaN,NaN);for(let i=0;i<copy.length;i++)s.path.push(copy[i]);
             if(source.first)s.first=point({matrix},...source.first);if(source.last){s.last=point({matrix},...source.last);append(s,s.last,true);}}
     }
+    function strokePath(s,points){if(!points.length)return;const stroke=canvasDash.prepare(s,points);if(stroke.points.length)native(s.canvas,'stroke',pathBuffer(stroke.points),color(s,true),stroke.width);}
     function multiply(s,m){const a=s.matrix;s.matrix=[a[0]*m[0]+a[2]*m[1],a[1]*m[0]+a[3]*m[1],a[0]*m[2]+a[2]*m[3],a[1]*m[2]+a[3]*m[3],a[0]*m[4]+a[2]*m[5]+a[4],a[1]*m[4]+a[3]*m[5]+a[5]];}
     function alignment(s){if(s.align==='center')return 0.5;if(s.align==='right')return 1;if(s.align==='left')return 0;const rtl=s.direction==='rtl'||(s.direction==='inherit'&&native(s.canvas,'rtl'));return s.align==='start'?(rtl?1:0):(rtl?0:1);}
     const baselines=['alphabetic','top','hanging','middle','ideographic','bottom'];
@@ -128,6 +131,7 @@ const canvasBridge = (() => {
         get(){return state(this)[key];},set(value){const s=state(this),text=string(value),c=native(s.canvas,'color',text);if(c!==null){s[key]=text;s[colorkey]=c>>>0;}}});
     define(CanvasRenderingContext2D.prototype,'globalAlpha',{enumerable:true,configurable:true,get(){return state(this).alpha;},set(value){const s=state(this),v=number(value);if(finite(v)&&v>=0&&v<=1)s.alpha=v;}});
     define(CanvasRenderingContext2D.prototype,'lineWidth',{enumerable:true,configurable:true,get(){return state(this).lineWidth;},set(value){const s=state(this),v=number(value);if(finite(v)&&v>0)s.lineWidth=v;}});
+    define(CanvasRenderingContext2D.prototype,'lineDashOffset',{enumerable:true,configurable:true,get(){return state(this).dashOffset;},set(value){state(this);const v=+value,s=state(this);if(finite(v))s.dashOffset=v;}});
     define(CanvasRenderingContext2D.prototype,'imageSmoothingEnabled',{enumerable:true,configurable:true,get(){return state(this).smoothing;},set(value){state(this).smoothing=!!value;}});
     define(CanvasRenderingContext2D.prototype,'font',{enumerable:true,configurable:true,get(){return state(this).font;},set(value){state(this);const text=string(value),s=state(this),parsed=native(s.canvas,'font',text);if(parsed!==null){s.font=text;s.fontSize=parsed[0];s.fontStyle=parsed[1];}}});
     for(const [property,key,allowed] of [['textAlign','align',['start','end','left','right','center']],['textBaseline','baseline',baselines],['direction','direction',['inherit','ltr','rtl']]])define(CanvasRenderingContext2D.prototype,property,{enumerable:true,configurable:true,get(){return state(this)[key];},set(value){state(this);const text=string(value),s=state(this);if(allowed.includes(text))s[key]=text;}});
@@ -136,15 +140,17 @@ const canvasBridge = (() => {
     define(CanvasRenderingContext2D.prototype,'globalCompositeOperation',{enumerable:true,configurable:true,get(){state(this);return 'source-over';},set(value){state(this);string(value);}});
     const methods={
         ...pathMethods,
+        setLineDash(segments){state(this);if(!arguments.length)throw new TypeError('setLineDash requires segments');const dash=canvasDash.convert(segments),s=state(this);if(dash!==null)s.dash=dash;},
+        getLineDash(){return canvasDash.copy(state(this).dash);},
         fillRect(...v){rect(this,'rect',v);},clearRect(...v){rect(this,'clear',v);},
-        strokeRect(...v){const s=state(this);v=args(v,4);if(!valid(v))return;const [x,y,w,h]=v,p=[point(s,x,y),point(s,x+w,y),point(s,x+w,y+h),point(s,x,y+h),point(s,x,y)];native(s.canvas,'stroke',pathBuffer(p.flat()),color(s,true),s.lineWidth);},
-        save(){const s=state(this);if(s.stack.length===64)throw new RangeError('Canvas save stack limit');const saved={fill:s.fill,stroke:s.stroke,fillColor:s.fillColor,strokeColor:s.strokeColor,alpha:s.alpha,lineWidth:s.lineWidth,smoothing:s.smoothing,font:s.font,fontSize:s.fontSize,fontStyle:s.fontStyle,align:s.align,baseline:s.baseline,direction:s.direction,matrix:s.matrix.slice()};s.stack.push(saved);try{native(s.canvas,'save');}catch(e){s.stack.pop();throw e;}},
+        strokeRect(...v){state(this);v=args(v,4);const s=state(this);if(!valid(v))return;const [x,y,w,h]=v,p=[point(s,x,y),point(s,x+w,y),point(s,x+w,y+h),point(s,x,y+h),point(s,x,y)];strokePath(s,p.flat());},
+        save(){const s=state(this);if(s.stack.length===64)throw new RangeError('Canvas save stack limit');const saved={fill:s.fill,stroke:s.stroke,fillColor:s.fillColor,strokeColor:s.strokeColor,alpha:s.alpha,lineWidth:s.lineWidth,dash:canvasDash.copy(s.dash),dashOffset:s.dashOffset,smoothing:s.smoothing,font:s.font,fontSize:s.fontSize,fontStyle:s.fontStyle,align:s.align,baseline:s.baseline,direction:s.direction,matrix:s.matrix.slice()};s.stack.push(saved);try{native(s.canvas,'save');}catch(e){s.stack.pop();throw e;}},
         restore(){const s=state(this),saved=s.stack[s.stack.length-1];if(saved){native(s.canvas,'restore');s.stack.pop();Object.assign(s,saved);}},
         reset(){const s=state(this);native(s.canvas,'reset');s.version=native(s.canvas,'version');defaults(s);},
         beginPath(){resetPath(state(this));},
         fill(pathOrRule='nonzero',rule='nonzero'){state(this);const external=paths.has(pathOrRule);rule=string(external?rule:pathOrRule);if(rule!=='nonzero'&&rule!=='evenodd')throw new TypeError('Invalid fill rule');const s=state(this),path=external?transformedPath(s,pathOrRule):s.path;if(path.length)native(s.canvas,'poly',pathBuffer(path),color(s),rule==='evenodd',false);},
         clip(pathOrRule='nonzero',rule='nonzero'){state(this);const external=paths.has(pathOrRule);rule=string(external?rule:pathOrRule);if(rule!=='nonzero'&&rule!=='evenodd')throw new TypeError('Invalid fill rule');const s=state(this),path=external?transformedPath(s,pathOrRule):s.path;native(s.canvas,'clip',pathBuffer(path),0,rule==='evenodd');},
-        stroke(path){const s=state(this),points=path===undefined?s.path:transformedPath(s,path);if(points.length)native(s.canvas,'stroke',pathBuffer(points),color(s,true),s.lineWidth);},
+        stroke(path){const s=state(this),points=path===undefined?s.path:transformedPath(s,path);strokePath(s,points);},
         measureText(value){state(this);if(!arguments.length)throw new TypeError('measureText requires text');const text=textValue(value),s=state(this),result=native(s.canvas,'measureText',text,s.fontSize,s.fontStyle,alignment(s),baselines.indexOf(s.baseline));const out=create(TextMetrics.prototype);metrics.set(out,result);return out;},
         fillText(value,x,y,maxWidth){state(this);if(arguments.length<3)throw new TypeError('fillText requires text and coordinates');const text=textValue(value),v=[number(x),number(y)],width=arguments.length>3?number(maxWidth):Infinity;if(!valid(v)||!(width>0))return;const s=state(this);native(s.canvas,'fillText',text,s.fontSize,s.fontStyle,alignment(s),baselines.indexOf(s.baseline),new Float64([...v,width,...s.matrix]).buffer,color(s));},
         transform(...v){const s=state(this);v=args(v,6);if(valid(v))multiply(s,v);},
@@ -163,7 +169,7 @@ const canvasBridge = (() => {
         getImageData(...v){const s=state(this);v=args(v,4);if(!valid(v))throw new TypeError('Nonfinite ImageData coordinates');let [x,y,w,h]=v.map(Math.trunc);if(!w||!h)throw namedError('IndexSizeError','Empty ImageData rectangle');if(w<0){x+=w;w=-w;}if(h<0){y+=h;h=-h;}const data=native(s.canvas,'read',x,y,w,h);if(data===null)throw namedError('SecurityError','Canvas contains an image with unverified origin');return new ImageData(new Bytes(data),w,h);},
         putImageData(image,dx,dy,...dirty){const s=state(this),im=images.get(image);if(!im)throw new TypeError('Expected ImageData');dx=Math.trunc(number(dx));dy=Math.trunc(number(dy));if(!finite(dx)||!finite(dy))throw new TypeError('Nonfinite ImageData coordinates');
             let data=im.data,w=im.w,h=im.h;if(dirty.length){if(dirty.length<4)throw new TypeError('Missing dirty rectangle');let [x,y,dw,dh]=dirty.map(number).map(Math.trunc);if(!valid([x,y,dw,dh]))throw new TypeError('Nonfinite dirty rectangle');if(dw<0){x+=dw;dw=-dw;}if(dh<0){y+=dh;dh=-dh;}const x0=Math.max(0,x),y0=Math.max(0,y),x1=Math.min(w,x+dw),y1=Math.min(h,y+dh);if(x1<=x0||y1<=y0)return;const copy=new Bytes((x1-x0)*(y1-y0)*4);for(let j=y0;j<y1;j++)copy.set(data.subarray((j*w+x0)*4,(j*w+x1)*4),(j-y0)*(x1-x0)*4);data=copy;w=x1-x0;h=y1-y0;dx+=x0;dy+=y0;}
-            native(s.canvas,'put',dx,dy,w,h,data.buffer.slice(data.byteOffset,data.byteOffset+data.byteLength));},
+            native(s.canvas,'put',dx,dy,w,h,apply(byteBuffer,data,[]),apply(byteOffset,data,[]));},
         getContextAttributes(){state(this);return {alpha:true,colorSpace:'srgb',desynchronized:false,willReadFrequently:false};}
     };
     for(const [name,value] of Object.entries(methods))define(CanvasRenderingContext2D.prototype,name,{value:pathMethods[name]?function(...args){state(this);return apply(value,this,args);}:value,writable:true,configurable:true});

@@ -81,7 +81,7 @@ const avmediaBridge = (() => {
         mseBridge.detach(node);
         if(s.controller)s.controller.abort();
         s.controller=null;s.generation=(s.generation+1)>>>0;s.intent++;s.seekIntent++;s.promise=null;s.error=null;s.network=0;s.currentSrc='';s.last=null;
-        native('reset',node,s.generation);active.delete(node);
+        native('reset',node,s.generation);textTrackBridge.reset(node);active.delete(node);
     }
     async function load(node) {
         const s=get(node);reset(node,s);const generation=s.generation;
@@ -159,6 +159,8 @@ const avmediaBridge = (() => {
         get seekable(){get(this);return mseBridge.attached(this)?mseBridge.nodeRanges(this,true):mseBridge.timeRanges();}
         get audioTracks(){get(this);return mseBridge.nodeTracks(this,'audio');}
         get videoTracks(){get(this);return mseBridge.nodeTracks(this,'video');}
+        get textTracks(){get(this);return textTrackBridge.manage(this);}
+        addTextTrack(kind,label='',language=''){get(this);if(!arguments.length)throw new TypeError('TextTrack kind required');return textTrackBridge.addTextTrack(this,kind,label,language);}
         get paused(){return snapshot(this).paused;}
         get ended(){return snapshot(this).ended;}
         get seeking(){return snapshot(this).seeking;}
@@ -240,5 +242,5 @@ const avmediaBridge = (() => {
     Audio.prototype=HTMLAudioElement.prototype;
     Object.assign(globalThis,{HTMLMediaElement,HTMLAudioElement,HTMLVideoElement,MediaError,Audio});
     for(const cls of [HTMLMediaElement,HTMLAudioElement,HTMLVideoElement,MediaError])Object.defineProperty(cls.prototype,Symbol.toStringTag,{value:cls.name,configurable:true});
-    return {HTMLMediaElement,HTMLAudioElement,HTMLVideoElement,activate(node){if(!node||!node.controls)return false;if(node.paused)node.play().catch(report);else node.pause();return true;}};
+    return {HTMLMediaElement,HTMLAudioElement,HTMLVideoElement,brand,state:snapshot,generation(node){return get(node).generation;},privateFetch:fetch,activate(node){if(!node||!node.controls)return false;if(node.paused)node.play().catch(report);else node.pause();return true;}};
 })();

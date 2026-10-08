@@ -6,22 +6,23 @@
 
 ## 構成
 
-- `libavcodec`, `libavformat`, `libavutil`, `libswresample` の静的 C 構成。実コンパイル閉包は337 C / 756 manifest files。`libswresample` の generic C は native Opus の SILK 経路とステレオ混合行列にも必要で、外部の libopus/libvorbis/libvpx は入らない。
+- `libavcodec`, `libavformat`, `libavutil`, `libswresample` の静的 C 構成。実コンパイル閉包は338 C / 759 manifest files。`libswresample` の generic C は native Opus の SILK 経路とステレオ混合行列にも必要で、外部の libopus/libvorbis/libvpx は入らない。
 - デコーダー: MP3, FLAC, AAC, H.264, MJPEG, VP8, VP9, Opus, Vorbis, rawvideo、および WAV 向け PCM。
-- コンテナー: WAV, MP3, FLAC, ADTS AAC, AVI, MOV/MP4, Matroska/WebM, Ogg。
+- コンテナー: WAV, MP3, FLAC, ADTS AAC, AVI, MOV/MP4, Matroska/WebM, Ogg, MPEG-TS。
 - network、URL protocol、device、filter、encoder、外部 library、pthread/Windows thread、assembler/GPL 最適化を無効にする。
 - native `media.c` の custom AVIO が Nocturne の `read/lseek/fstat` または所有メモリーに接続する。codec handle は単一所有・単一実行コンテキスト専用。FFmpeg の無 thread ビルドを勝手にマルチスレッドで使用してはならない。
 - PCM 出力は 48 kHz stereo。mono は両側、最大8チャンネルの既知 speaker layout は `swr_build_matrix2` による正規化行列でステレオへ混合する。center/surround を約 -3 dB、LFE を弱く混合し、S16 の飽和処理を行う。並びの不明な複数チャンネル、行列が混合できず欠落する speaker は明示拒否する。mask のない1/2チャンネルだけは標準 mono/stereo と解釈する。リサンプルは従来の線形補間で、各フレーム末尾は最後のサンプルを保持する簡易処理。
 - 動画出力は 8-bit YUV420/422/444、RGB/BGR、gray から opaque ARGB へ。VP8 は native 8-bit YUV420、VP9 は profile 0 / 8-bit YUV420 / SDR に限定し、10/12-bit の上流 DSP がコンパイルされても高bitdepthやHDRを再生能力に含めない。10-bit H.264、AV1、HEVC は再生機能として宣言しない。
 - Ogg demuxer に必要な Dirac/Theora/Speex の header parser が含まれても、それらの decoder は無効。VP8 の decoder/parser は明示有効化した。コンテナーの header parser が存在することだけを codec 再生対応と混同しない。
-- browser は既存 fetch/CORS の上限付き全体取得、または native worker の匿名 HTTP Range 入力を使う。Range の各応答の CORS、強い ETag、cache/resource 上限、同期読取の制約は native input に従う。MSE、DRM、HLS/DASH/live、autoplay、1x 以外の速度、字幕は未対応。これは Web 全面互換を達成したものではない。
+- browser は既存 fetch/CORS、native worker の匿名 HTTP Range 入力、または有界単一GETのmanifest/segment入力を使う。native MSEは既存packet buffer/別workerを維持する。HLS/DASH入力はNocturne側の `media_adaptive.c` がclear VOD manifestを解析し、各segmentをcustom AVIOでdemuxしてpersistent decoderへ供給する。FFmpegのHLS/DASH demuxer・network protocolは有効化しない。
+- adaptiveの対象はmuxed HLS TS/fMP4 VOD、およびstatic単Period DASHの有限SegmentTemplate/SegmentTimeline（分離AV最大2track）。manifest256KiB、segment8MiB、init1MiB、2048segment/track、最小対応bandwidthの固定選択。DRM/暗号化、live/LL-HLS、alternate HLS rendition、DASH dynamic/複数Period/SegmentBase/SegmentList、未知control extensionを明示拒否する。全サイト対応やABR切替を宣言しない。実Nocturne再生の検証範囲はrootの受け入れ記録に従い、対象compileだけを映像/可聴音声の証明としない。
 
 ## 再生成
 
 先に Nocturne の `build/sysroot/usr/lib/libc.a` を作る。その後:
 
 ```
-python ports/ffmpeg/prepare.py --source "D:/Programes/cloned repos/ffmpeg-9.0.2" --profile webm --stage build/media-stage2/fresh-reproduction --import-vendor
+python ports/ffmpeg/prepare.py --source "D:/Programes/cloned repos/ffmpeg-9.0.2" --profile adaptive --stage build/media-adaptive/fresh-reproduction --import-vendor
 ```
 
 空白を含む upstream パスの configure 制限を避けるため、`build/` 内の新しい stage に複製して in-tree 生成する。既存 stage は拒否し、前段階の `build/nocturne-platform/media/reproduce-stage` と証拠は上書きしない。`--profile legacy` は旧7経路の構成を再現する選択肢として残す（その場合も新しい `--stage` を選ぶ）。相対 include/link path は stage の深さから生成する。元ソースは読み取りのみ。native mmap/fcntl/mkstemp を POSIX file helper と誤検出した３項目は専用構成で明示的に無効化する。`ports/ffmpeg/include` の scoped C header glue は OS グローバル ABI を変更しない。

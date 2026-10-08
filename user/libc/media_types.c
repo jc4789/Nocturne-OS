@@ -23,6 +23,12 @@ static bool avc8(const char *s) {
     unsigned profile = (unsigned)strtoul(s+5,NULL,16) >> 16;
     return profile == 66 || profile == 77 || profile == 88 || profile == 100;
 }
+static bool aac_lc_he(const char *s) {
+    /* The configured floating-point AAC decoder includes SBR and Parametric
+     * Stereo, parses explicit AOT 5/29 in MP4 AudioSpecificConfig, and emits
+     * FLTP consumed by the native PCM converter. Do not accept all mp4a AOTs. */
+    return !strcmp(s,"mp4a.40.2") || !strcmp(s,"mp4a.40.5") || !strcmp(s,"mp4a.40.29");
+}
 static bool vp9_8(const char *s) {
     if (!strcmp(s,"vp9") || !strcmp(s,"vp9.0")) return true;
     /* WebM legacy spelling, or the standardized all-or-none color suffix.
@@ -50,7 +56,7 @@ const char *nmedia_can_play_type(const char *type) {
     for (size_t i = 0; i <= n; i++) text[i] = (char)tolower((unsigned char)type[i]);
     char *semi = strchr(text,';'); if (semi) *semi++ = 0;
     char *mime = trim(text);
-    enum { NONE, MP3, FLAC, WAV, AAC, MP4, AVI, WEBM, OGG } container = NONE;
+    enum { NONE, MP3, FLAC, WAV, AAC, MP4, AVI, WEBM, OGG, TS, HLS, DASH } container = NONE;
     if (!strcmp(mime,"audio/mpeg") || !strcmp(mime,"audio/mp3")) container = MP3;
     else if (!strcmp(mime,"audio/flac") || !strcmp(mime,"audio/x-flac")) container = FLAC;
     else if (!strcmp(mime,"audio/wav") || !strcmp(mime,"audio/x-wav") || !strcmp(mime,"audio/wave")) container = WAV;
@@ -59,6 +65,12 @@ const char *nmedia_can_play_type(const char *type) {
     else if (!strcmp(mime,"video/x-msvideo") || !strcmp(mime,"video/avi")) container = AVI;
     else if (!strcmp(mime,"video/webm") || !strcmp(mime,"audio/webm")) container = WEBM;
     else if (!strcmp(mime,"audio/ogg") || !strcmp(mime,"application/ogg")) container = OGG;
+    else if (!strcmp(mime,"video/mp2t")) container = TS;
+    /* These types have native manifest -> HTTP segments -> packet decoder
+     * implementations. They are bounded clear VOD, not DRM/live/ABR claims. */
+    else if (!strcmp(mime,"application/vnd.apple.mpegurl") || !strcmp(mime,"application/x-mpegurl") ||
+             !strcmp(mime,"audio/mpegurl") || !strcmp(mime,"audio/x-mpegurl")) container = HLS;
+    else if (!strcmp(mime,"application/dash+xml")) container = DASH;
     if (container == NONE) return "";
     char *codecs = NULL;
     while (semi && *semi) {
@@ -82,12 +94,14 @@ const char *nmedia_can_play_type(const char *type) {
         if (container == MP3) ok = !strcmp(codec,"mp3");
         else if (container == FLAC) ok = !strcmp(codec,"flac");
         else if (container == WAV) ok = !strcmp(codec,"1") || !strcmp(codec,"3") || !strcmp(codec,"pcm");
-        else if (container == AAC) ok = !strcmp(codec,"mp4a.40.2");
-        else if (container == MP4) ok = !strcmp(codec,"mp4a.40.2") || (strncmp(mime,"audio/",6) && avc8(codec));
+        else if (container == AAC) ok = aac_lc_he(codec);
+        else if (container == MP4) ok = aac_lc_he(codec) || (strncmp(mime,"audio/",6) && avc8(codec));
         else if (container == AVI) ok = !strcmp(codec,"mjpeg") || !strcmp(codec,"mp3") || !strcmp(codec,"pcm");
         else if (container == WEBM) ok = !strcmp(codec,"opus") || !strcmp(codec,"vorbis") ||
             (strncmp(mime,"audio/",6) && (!strcmp(codec,"vp8") || !strcmp(codec,"vp8.0") || vp9_8(codec)));
         else if (container == OGG) ok = !strcmp(codec,"opus") || !strcmp(codec,"vorbis");
+        else if (container == TS || container == HLS || container == DASH)
+            ok = aac_lc_he(codec) || avc8(codec);
         if (!ok || (next && !*next)) return "";
         p = next;
     }

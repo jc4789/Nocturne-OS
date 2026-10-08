@@ -265,7 +265,7 @@ static int mp4_boundary(struct parser *p, bool have_init, bool eos, size_t *init
          * inherited from trex. Do not wait for that next fragment's payload. */
         if (moof && mdat && p->n-at >= 8) {
             uint32_t type = be32(p->b+at+4), size = be32(p->b+at);
-            if ((type == TAG('m','o','o','f') || type == TAG('s','t','y','p') || type == TAG('s','i','d','x')) &&
+            if ((type == TAG('m','o','o','f') || type == TAG('s','t','y','p') || type == TAG('s','i','d','x') || type == TAG('f','t','y','p')) &&
                 (size != 1 || p->n-at >= 16)) {
                 for (unsigned i = 0; i < f.count; ++i)
                     if (f.runs[i].known && !f.runs[i].covered) return fail(p, "Track run exceeds media data");
@@ -280,6 +280,13 @@ static int mp4_boundary(struct parser *p, bool have_init, bool eos, size_t *init
         }
         if (encrypted_box(b.type) || b.type == TAG('u','u','i','d'))
             return fail(p, "Encrypted or unsupported MP4 extension");
+        /* A subsequent ftyp/moov is another initialization, not media bytes.
+         * Publish it separately; the track buffer validates identity and owns
+         * the corresponding codec configuration for every retained sample. */
+        if (initialized && b.type == TAG('f','t','y','p')) {
+            if (moof) return fail(p, "Initialization interrupts movie fragment");
+            initialized = false; ftyp = false;
+        }
         if (!initialized) {
             if (b.type == TAG('f','t','y','p')) {
                 if (ftyp || b.end-b.body < 8 || (b.end-b.body)%4)
@@ -288,7 +295,7 @@ static int mp4_boundary(struct parser *p, bool have_init, bool eos, size_t *init
             } else if (b.type == TAG('m','o','o','v')) {
                 if (!ftyp) return fail(p, "Missing MP4 file type box");
                 r = validate_init(p, &b); if (r < 0) return r;
-                *init_end = b.end; initialized = true; media_start = b.end;
+                *init_end = b.end; return 1;
             } else if (b.type != TAG('f','r','e','e') && b.type != TAG('s','k','i','p') &&
                        b.type != TAG('p','d','i','n') && b.type != TAG('s','i','d','x'))
                 return fail(p, "Missing MP4 initialization segment");

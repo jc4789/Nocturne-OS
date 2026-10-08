@@ -83,7 +83,7 @@ const blobBridge = (() => {
         arrayBuffer(){return read(this,'arrayBuffer');}
         bytes(){return read(this,'bytes');}
         text(){return read(this,'text');}
-        stream(){state(this);throw new DOMException('ReadableStream is not implemented','NotSupportedError');}
+        stream(){return streamBridge.fromBytes(apply(buffer,copy(state(this).bytes),[]));}
     }
     class File extends Blob {
         constructor(fileBits,fileName,opts={}){
@@ -101,7 +101,7 @@ const blobBridge = (() => {
         }
         get name(){const s=apply(get,files,[this]);if(!s)throw new TypeError('Illegal File receiver');return s.name;}
         get lastModified(){const s=apply(get,files,[this]);if(!s)throw new TypeError('Illegal File receiver');return s.lastModified;}
-        get webkitRelativePath(){if(!apply(get,files,[this]))throw new TypeError('Illegal File receiver');return '';}
+        get webkitRelativePath(){const s=apply(get,files,[this]);if(!s)throw new TypeError('Illegal File receiver');return s.relativePath||'';}
     }
     const readerState=v=>{const s=apply(get,readers,[v]);if(!s)throw new TypeError('Illegal FileReader receiver');return s;};
     function fire(reader,type,total=0){const event=new ProgressEventType(type,{lengthComputable:true,loaded:type==='loadstart'?0:total,total});event.isTrusted=true;dispatch(reader,event);}
@@ -156,6 +156,7 @@ const blobBridge = (() => {
     return {brand:value=>apply(get,slots,[value])!==undefined,readerBrand:value=>apply(get,readers,[value])!==undefined,
         bytes:value=>apply(buffer,copy(state(value).bytes),[]),type:value=>state(value).type,
         fromBytes:(bytes,type)=>make(view(bytes),mime(type)),
-        snapshot(value){const s=state(value),f=apply(get,files,[value]);return [apply(buffer,copy(s.bytes),[]),s.type,f?f.name:null,f?f.lastModified:0];},
-        restore(data){return data[2]===null?make(view(data[0]),data[1]):new File([data[0]],data[2],{type:data[1],lastModified:data[3]});}};
+        nativeFile(data){const file=new File([data[0]],data[2],{type:data[1],lastModified:data[3]});apply(get,files,[file]).relativePath=data[4]||'';return file;},
+        snapshot(value){const s=state(value),f=apply(get,files,[value]);return [apply(buffer,copy(s.bytes),[]),s.type,f?f.name:null,f?f.lastModified:0,f?f.relativePath||'':''];},
+        restore(data){if(data[2]===null)return make(view(data[0]),data[1]);const file=new File([data[0]],data[2],{type:data[1],lastModified:data[3]});apply(get,files,[file]).relativePath=data[4]||'';return file;}};
 })();

@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <math.h>
 #include "webi.h"
+#include "web_dialog.h"
 #include "js_canvas.h"
 #include "avmedia.h"
 #include "svg_geometry.h"
@@ -2528,7 +2529,7 @@ static void relative_offsets(box_t *b) {
 
 /* ---------------------------------------------------------------- absolute positioning */
 static box_t *abs_containing_block(box_t *a) {
-    if (a->st->position == POS_FIXED) return D->root_box;
+    if (a->st->position == POS_FIXED || web_dialog_layer_box(D,a)) return D->root_box;
     for (box_t *p = a->parent; p; p = p->parent)
         if (p->st && p->st->position != POS_STATIC && p->kind != B_INLINE && p->kind != B_TEXT) return p;
     return D->root_box;
@@ -2551,7 +2552,7 @@ static void layout_abs(box_t *a) {
     else {
         float w = spec_w(a, &a->st->width, cbw);
         if (w < 0) {
-            if (!la && !ra) w = cbw - l - r - ext - a->m[1] - a->m[3];
+            if (!la && !ra && !(a->node && a->node->box==a && web_dialog_is_modal(D,a->node))) w = cbw - l - r - ext - a->m[1] - a->m[3];
             else w = stf_width(a, cbw - l - r);
         }
         if (a->kind == B_TABLE) {
@@ -2560,7 +2561,7 @@ static void layout_abs(box_t *a) {
         }
         a->w = clamp_w(a, w, cbw);
         float sh = spec_h(a, &a->st->height, cbh);
-        if (sh < 0 && !ta && !ba) sh = clamp_h(a, cbh - t - bo - vext(a) - a->m[0] - a->m[2], cbh);
+        if (sh < 0 && !ta && !ba && !(a->node && a->node->box==a && web_dialog_is_modal(D,a->node))) sh = clamp_h(a, cbh - t - bo - vext(a) - a->m[0] - a->m[2], cbh);
         layout_inner(a, NULL, 0, 0, cbh);
         if (sh >= 0 && a->kind != B_TABLE) a->h = clamp_h(a, sh, cbh);
     }
@@ -2582,6 +2583,8 @@ static void layout_abs(box_t *a) {
     if (!ta) y = -pt + t + a->m[0];
     else if (!ba) y = -pt + cbh - bo - mh + a->m[0];
     else y = sy + a->m[0];
+    if (!ta && !ba && len_auto(&a->st->margin[0]) && len_auto(&a->st->margin[2]))
+        y = -pt + t + (cbh - t - bo - (a->h + vext(a))) / 2;
     a->x = x + a->b[3] + a->p[3];
     a->y = y + a->b[0] + a->p[0];
 }

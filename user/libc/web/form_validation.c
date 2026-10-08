@@ -3,6 +3,7 @@
    https://html.spec.whatwg.org/multipage/form-control-infrastructure.html
    https://html.spec.whatwg.org/multipage/input.html */
 #include "form_validation.h"
+#include "form_file.h"
 #include "form_value.h"
 #include "nocturne.h"
 #include "quickjs.h"
@@ -443,7 +444,7 @@ uint32_t web_control_validity(web_doc *d, node_t *n) {
         } else if (type == WEB_INPUT_CHECKBOX) {
             if (web_control_required(n) && !n->checked) flags |= WEB_VALIDITY_VALUE_MISSING;
         } else if (type == WEB_INPUT_FILE) {
-            if (web_control_required(n) && !*value) flags |= WEB_VALIDITY_VALUE_MISSING;
+            if (web_control_required(n) && (!n->files || !n->files->count)) flags |= WEB_VALIDITY_VALUE_MISSING;
         } else if (web_control_required(n) && mutable && !*value) flags |= WEB_VALIDITY_VALUE_MISSING;
         if (*value && type == WEB_INPUT_EMAIL && !email_list_valid(value, node_attr(n, "multiple") != NULL)) flags |= WEB_VALIDITY_TYPE_MISMATCH;
         if (*value && type == WEB_INPUT_URL && !absolute_url_valid(d, value)) flags |= WEB_VALIDITY_TYPE_MISMATCH;

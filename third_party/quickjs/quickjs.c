@@ -1788,8 +1788,15 @@ static void js_trigger_gc(JSRuntime *rt, size_t size)
 #ifdef FORCE_GC_AT_MALLOC
     force_gc = TRUE;
 #else
-    force_gc = ((rt->malloc_ctx.malloc_state.malloc_size + size) >
-                rt->malloc_gc_threshold);
+    /* Nocturne: a large backing allocation must get a collection opportunity
+       before the finite runtime limit, even when the adaptive GC threshold
+       (1.5 * live size) has grown beyond that limit. Avoid size_t overflow. */
+    size_t used = rt->malloc_ctx.malloc_state.malloc_size;
+    size_t limit = rt->malloc_ctx.malloc_state.malloc_limit;
+    force_gc = rt->malloc_gc_threshold != SIZE_MAX &&
+               (used > limit || size > limit - used ||
+                used > rt->malloc_gc_threshold ||
+                size > rt->malloc_gc_threshold - used);
 #endif
     if (force_gc) {
 #ifdef DUMP_GC
@@ -57090,6 +57097,9 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
             memset(abuf->data, 0, sab_alloc_len);
         } else {
             /* the allocation must be done after the object creation */
+            /* The object check charges sizeof(JSObject), not its potentially
+               fragment-sized backing memory. obj is rooted while GC runs. */
+            js_trigger_gc(rt, max_int(len, 1));
             abuf->data = js_mallocz(ctx, max_int(len, 1));
             if (!abuf->data)
                 goto fail;

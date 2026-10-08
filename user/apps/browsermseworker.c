@@ -4,6 +4,7 @@
 #include "nocturne.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <limits.h>
 #include <errno.h>
 static bool exact(int fd,void *bytes,size_t size,bool writing){
@@ -24,7 +25,11 @@ int main(void){
         bool ok=true;unsigned slot=c.slot;nmedia_mse *m=buffers[slot];struct nmedia_output output={0};
         uint8_t *bytes=NULL;if(c.bytes){bytes=nmedia_ff_malloc((size_t)c.bytes+1);if(!bytes){
                 uint8_t drain[4096];size_t left=c.bytes;while(left){size_t n=MIN(left,sizeof drain);if(!exact(0,drain,n,false))goto shutdown;left-=n;}
-                r.kind=NMEDIA_ERROR;r.quota_error=1;strlcpy(r.error,"MSE child append allocation quota",sizeof r.error);goto response;
+                struct nmedia_alloc_stats stats;nmedia_alloc_snapshot(&stats);
+                r.kind=NMEDIA_ERROR;r.quota_error=1;
+                snprintf(r.error,sizeof r.error,"MSE child append %s: request %zu charged %zu limit %zu",
+                    stats.last_failure==NMEDIA_ALLOC_BACKEND_OOM?"backend OOM":"allocation quota",
+                    (size_t)c.bytes+1,stats.current,stats.limit);goto response;
             }
             if(!exact(0,bytes,c.bytes,false)){nmedia_ff_free(bytes);break;}bytes[c.bytes]=0;}
         if(c.op==NMSW_ADD||c.op==NMSW_CHANGE){
@@ -33,7 +38,7 @@ int main(void){
             else if(c.op==NMSW_ADD){if(m)ok=false;else buffers[slot]=m=nmedia_mse_create((char *)bytes,r.error,sizeof r.error);ok=m!=NULL;}
             else ok=m&&nmedia_mse_change_type(m,(char *)bytes);
             if(revision!=nmedia_mse_revision(m))pending[slot].kind=0;
-        }else if(c.op==NMSW_APPEND){uint64_t revision=nmedia_mse_revision(m);ok=m&&nmedia_mse_append(m,bytes,c.bytes,c.offset,c.start,c.end,c.flags);if(revision!=nmedia_mse_revision(m)){nmedia_mse_seek(m,c.current);pending[slot].kind=0;}}
+        }else if(c.op==NMSW_APPEND){uint64_t revision=nmedia_mse_revision(m);ok=nmedia_mse_append_take(m,bytes,c.bytes,c.offset,c.start,c.end,c.flags);bytes=NULL;if(revision!=nmedia_mse_revision(m)){nmedia_mse_seek(m,c.current);pending[slot].kind=0;}}
         else if(c.op==NMSW_REMOVE){uint64_t revision=nmedia_mse_revision(m);ok=m&&nmedia_mse_remove(m,c.start,c.end);if(revision!=nmedia_mse_revision(m)){nmedia_mse_seek(m,c.current);pending[slot].kind=0;}}
         else if(c.op==NMSW_ABORT){if(m){nmedia_mse_abort(m);if(nmedia_mse_info(m))nmedia_mse_seek(m,c.current);}pending[slot].kind=0;}
         else if(c.op==NMSW_DROP){nmedia_mse_close(m);buffers[slot]=m=NULL;pending[slot].kind=0;}
@@ -45,15 +50,15 @@ int main(void){
             for(int i=0;i<2;i++)if(buffers[i]){
                 const struct nmedia_info *info=nmedia_mse_info(buffers[i]);bool needed=(!enabled[0]&&!enabled[1])||!info||(info->audio&&enabled[0])||(info->video&&enabled[1]);if(needed)active++;
                 for(int budget=0;budget<16;budget++){
-                    if(!pending[i].kind){int result=nmedia_mse_step(buffers[i],&pending[i]);if(result==NMEDIA_ERROR){m=buffers[i];ok=false;break;}if(result==NMEDIA_AGAIN){if(needed)waiting=true;break;}}
+                    if(!pending[i].kind){int result=nmedia_mse_step(buffers[i],&pending[i]);if(result==NMEDIA_ERROR){m=buffers[i];ok=false;break;}if(result==NMEDIA_AGAIN){if(needed){if(nmedia_mse_waiting_for_input(buffers[i]))waiting=true;else busy=true;}break;}}
                     if((pending[i].kind==NMEDIA_AUDIO&&!enabled[0])||(pending[i].kind==NMEDIA_VIDEO&&!enabled[1])){
                         if(!enabled[0]&&!enabled[1]){int64_t end=pending[i].pts_ms+(pending[i].kind==NMEDIA_AUDIO?(int64_t)pending[i].frames*1000/SOUND_RATE:40);memset(&pending[i],0,sizeof pending[i]);pending[i].kind=NMSW_CLOCK;pending[i].pts_ms=end;break;}
-                        pending[i].kind=0;if(budget==15)busy=true;continue;}break;
+                        pending[i].kind=0;if(budget==15&&needed)busy=true;continue;}break;
                 }
                 if(!ok)break;if(!needed)continue;
                 if(pending[i].kind==NMEDIA_END){ended++;continue;}if(!pending[i].kind)continue;if(selected<0||pending[i].pts_ms<pending[selected].pts_ms)selected=i;
             }
-            if(ok&&!waiting&&selected>=0){r.slot=selected;output=pending[selected];pending[selected].kind=0;r.kind=output.kind;r.pts=output.pts_ms;r.frames=(uint32_t)output.frames;r.width=output.width;r.height=output.height;
+            if(ok&&!waiting&&!busy&&selected>=0){r.slot=selected;output=pending[selected];pending[selected].kind=0;r.kind=output.kind;r.pts=output.pts_ms;r.frames=(uint32_t)output.frames;r.width=output.width;r.height=output.height;
                 r.payload_bytes=output.kind==NMEDIA_AUDIO?(uint32_t)output.frames*4:output.kind==NMEDIA_VIDEO?(uint32_t)output.width*output.height*4:0;}
             else if(ok&&active&&ended==active){r.kind=NMEDIA_END;}
             else if(ok&&busy&&!waiting)r.kind=NMSW_BUSY;

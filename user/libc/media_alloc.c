@@ -8,7 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #ifndef NMEDIA_ALLOC_LIMIT_BYTES
-#define NMEDIA_ALLOC_LIMIT_BYTES (64u * 1024u * 1024u)
+#define NMEDIA_ALLOC_LIMIT_BYTES NMEDIA_ALLOC_DEFAULT_BYTES
 #endif
 #if NMEDIA_ALLOC_LIMIT_BYTES <= 0
 #error "メディア予算は正のbyte数を指定する"

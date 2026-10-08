@@ -19,11 +19,15 @@ const mseBridge = (() => {
     const finite=v=>{const n=+v;if(!Number.isFinite(n))throw new TypeError('Expected finite number');return n;};
     function fire(target,type){const e=new EventType(type);e.isTrusted=true;dispatch(target,e);}
     function queue(target,type){schedule(()=>fire(target,type));}
-    function bytes(value){
+    function bytes(value,quota){
         let b=value,o=0,n;
         if(isView(value)){const typed=apply(taTag,value,[])!==undefined;b=apply(typed?taBuffer:dvBuffer,value,[]);o=apply(typed?taOffset:dvOffset,value,[]);n=apply(typed?taLength:dvLength,value,[]);}
         const size=apply(abLength,b,[]),input=new U8(b,o,n===undefined?size:n);n=apply(taLength,input,[]);
         if(n>MAX)throw error('QuotaExceededError','Append exceeds 32 MiB');
+        // Reject a full native buffer before allocating a fragment snapshot.
+        // The snapshot remains required: author mutations after append cannot
+        // change the asynchronously parsed bytes.
+        if(n>quota)throw error('QuotaExceededError','Native media buffer quota exceeded');
         const out=new U8(n);apply(set,out,[input]);return apply(taBuffer,out,[]);
     }
     class TimeRanges {
@@ -144,9 +148,9 @@ const mseBridge = (() => {
         get appendWindowEnd(){return buffer(this).end;}
         set appendWindowEnd(value){const s=buffer(this),n=+value;mutable(s);if(Number.isNaN(n)||n<=s.start)throw new TypeError('Invalid append window end');s.end=n;}
         appendBuffer(value){
-            if(!arguments.length)throw new TypeError('BufferSource required');const s=buffer(this),p=mutable(s),data=bytes(value),n=apply(abLength,data,[]);
-            const free=native('mseQuota',p.node,s.id);if(n>free)throw error('QuotaExceededError','Native media buffer quota exceeded');
+            if(!arguments.length)throw new TypeError('BufferSource required');const s=buffer(this),p=mutable(s);
             if(native('state',p.node).error)throw error('InvalidStateError','Media element has an error');
+            const data=bytes(value,native('mseQuota',p.node,s.id));
             operation(this,s,parent=>native('mseAppend',parent.node,s.id,data,s.offset,s.start,s.end,s.mode==='sequence'));
         }
         abort(){const s=buffer(this),p=live(s);if(p.state!=='open')throw error('InvalidStateError','MediaSource is not open');

@@ -9,6 +9,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import time
 import zlib
 
@@ -92,10 +93,14 @@ def png_from_ppm(ppm, png):
 
 
 def main():
+    # Serial is UTF-8; never pass Japanese/Chinese evidence through CP932.
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--label', required=True)
     ap.add_argument('--url')
     ap.add_argument('--command', action='append', default=[])
+    ap.add_argument('--guest-file', action='append', default=[], help='明示したconsole入力を隔離dataの/testsへコピー（サイトfixture用ではない）')
     ap.add_argument('--cmdline', default='')
     ap.add_argument('--seconds', type=float, default=60)
     ap.add_argument('--memory', type=int, default=2048)
@@ -110,7 +115,9 @@ def main():
     ap.add_argument('--qemu', default='C:/Program Files/qemu/qemu-system-x86_64.exe')
     ap.add_argument('--qemu-data-dir', help='専用QEMUコピーが読み込むBIOSデータのディレクトリ')
     ap.add_argument('--key', action='append', default=[])
+    ap.add_argument('--timed-key', action='append', default=[], help='秒:QEMUキー。実ページの準備後にconsole等を操作する')
     ap.add_argument('--scroll-pages', type=int, default=0, help='実ページをクリックしてから結果一覧を順に下へ送り画面を保存')
+    ap.add_argument('--no-focus-click', action='store_true', help='既にactiveなbrowserへPgDnだけ送る。ページ中央のselect等を誤操作しない')
     ap.add_argument('--expect', action='append', default=[], help='serialに必要な文字列（複数可）')
     ap.add_argument('--reject', action='append', default=[], help='serialに出てはいけない文字列（複数可）')
     ap.add_argument('--allow-panic', action='store_true', help='期待panicの負例検証だけで使用')
@@ -122,6 +129,13 @@ def main():
         ap.error('不正な実行時間またはboot引数です')
     if any(not re.fullmatch('[a-zA-Z0-9_-]+', x) for x in a.key):
         ap.error('不正なQEMUキー名です')
+    timed_keys = []
+    for item in a.timed_key:
+        match = re.fullmatch(r'([0-9]+):([a-zA-Z0-9_-]+)', item)
+        if not match or not 0 <= int(match[1]) < a.seconds:
+            ap.error('時刻付きキーは実行期間内の秒:キー名です')
+        timed_keys.append((int(match[1]), match[2]))
+    timed_keys.sort()
     if not 0 <= a.scroll_pages <= 40:
         ap.error('スクロール回数は0から40です')
     if a.cpu_model is not None and not re.fullmatch('[a-zA-Z0-9_.,=+_-]+', a.cpu_model):
@@ -158,6 +172,13 @@ def main():
     run(USR / 'bash.exe', 'scripts/mkdata.sh', disk.relative_to(ROOT).as_posix(), '128')
     part = disk.relative_to(ROOT).as_posix()+'@@1048576'
     run(BIN / 'mcopy.exe', '-i', part, '-s', 'tests', '::/')
+    guest_hashes = {}
+    for source in a.guest_file:
+        local = Path(source).resolve(strict=True)
+        if not local.is_file() or local.stat().st_size > 16384 or not re.fullmatch('[a-zA-Z0-9_.-]+',local.name):
+            ap.error('console入力は16KiB以内の通常ファイルです')
+        run(BIN / 'mcopy.exe','-o','-i',part,local,'::/tests/'+local.name)
+        guest_hashes[local.name] = digest(local)
     commands = ['free', 'ps', *a.command]
     if a.url:
         commands += ['browser --debug-js '+a.url]
@@ -186,7 +207,8 @@ def main():
         args += ['-audiodev', f'wav,id=snd,path={here / "audio.wav"}', '-device', 'AC97,audiodev=snd']
     metadata = {'arguments': args, 'boot_payload_sha256': hashes, 'user_data_attached': False,
                 'boot_snapshot': True, 'scratch_snapshot': True, 'requested_seconds': a.seconds,
-                'expected_serial': a.expect, 'rejected_serial': a.reject}
+                'expected_serial': a.expect, 'rejected_serial': a.reject,
+                'guest_console_sha256': guest_hashes, 'guest_autorun_sha256': digest(script)}
     err = (here / 'qemu-stderr.log').open('wb')
     child_env = dict(ENV)
     if a.virgl_disable_mt:
@@ -212,18 +234,21 @@ def main():
         next_shot, index, scroll_at, scroll_count = 15, 0, 45, 0
         while time.monotonic()-start < a.seconds and p.poll() is None:
             elapsed = time.monotonic()-start
+            while timed_keys and elapsed >= timed_keys[0][0]:
+                _, key = timed_keys.pop(0)
+                mon.cmd('sendkey '+key)
             if elapsed >= next_shot:
                 shot(mon, 'screen-'+str(index))
                 index += 1
                 next_shot += 30
                 if index == 1:
-                    if a.key or a.scroll_pages:
+                    if (a.key or a.scroll_pages) and not a.no_focus_click:
                         mon.cmd('mouse_button 1')
                         mon.cmd('mouse_button 0')
                     for key in a.key:
                         mon.cmd('sendkey '+key)
             if a.scroll_pages and elapsed >= scroll_at and scroll_count < a.scroll_pages:
-                if scroll_count == 0:
+                if scroll_count == 0 and not a.no_focus_click:
                     # The first 15s frame may still be Limine loading the
                     # larger rootfs. Focus the actual page at scrolling time.
                     mon.cmd('mouse_button 1')

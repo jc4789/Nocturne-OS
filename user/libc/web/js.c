@@ -8,10 +8,14 @@
 #include <webnet.h>
 #include <quickjs.h>
 #include "webi.h"
+#include "web_dialog.h"
+#include "html_serialize.h"
 #include "js_canvas.h"
+#include "js_memory.h"
 #include "avmedia.h"
 #include "form_value.h"
 #include "form_validation.h"
+#include "form_file.h"
 #include "elements.h"
 #include "js_crypto.h"
 #include "js_collator_native.h"
@@ -69,8 +73,8 @@ enum { NP_NODE, NP_DOCUMENT, NP_ELEMENT, NP_HTML, NP_TEXT, NP_COMMENT, NP_FRAGME
        NP_SCRIPT, NP_FORM, NP_ANCHOR, NP_AREA, NP_SVG, NP_SVGSVG, NP_PI, NP_ATTR,
        NP_META, NP_LINK, NP_STYLE, NP_BASE, NP_TITLE, NP_HEAD, NP_SHADOW, NP_SLOT,
        NP_TIME, NP_DATA, NP_DETAILS, NP_OL, NP_LI, NP_UNKNOWN, NP_CANVAS,
-       NP_AVMEDIA, NP_AUDIO, NP_VIDEO, NP_COUNT };
-struct js_alloc_diagnostics { size_t peak, requested, used, limit; unsigned failures, reported; bool quota; };
+       NP_AVMEDIA, NP_AUDIO, NP_VIDEO, NP_LABEL, NP_DATALIST, NP_PROGRESS, NP_METER, NP_HEADING, NP_PICTURE, NP_SOURCE, NP_MENU, NP_DIALOG, NP_TRACK, NP_COUNT };
+struct js_alloc_diagnostics { size_t current, peak, requested, used, limit; unsigned failures, reported; bool quota; };
 enum { JS_NAV_START, JS_UNLOAD_START, JS_UNLOAD_END, JS_REDIRECT_START, JS_REDIRECT_END,
        JS_FETCH_START, JS_DNS_START, JS_DNS_END, JS_CONNECT_START, JS_CONNECT_END,
        JS_SECURE_START, JS_REQUEST_START, JS_RESPONSE_START, JS_RESPONSE_END,
@@ -143,7 +147,8 @@ static void allocation_failed(JSMallocState *s, size_t requested, bool quota) {
     d->requested=requested;d->used=s->malloc_size;d->limit=s->malloc_limit;d->quota=quota;d->failures++;
 }
 static void allocation_peak(JSMallocState *s) {
-    struct js_alloc_diagnostics *d=s->opaque;if(d && s->malloc_size>d->peak)d->peak=s->malloc_size;
+    struct js_alloc_diagnostics *d=s->opaque;
+    if(d){d->current=s->malloc_size;if(s->malloc_size>d->peak)d->peak=s->malloc_size;}
 }
 static void *qmalloc(JSMallocState *s, size_t n) {
     if (!n || n > SIZE_MAX - sizeof(union alloc_header)) return NULL;
@@ -159,6 +164,7 @@ static void qfree(JSMallocState *s, void *p) {
     if (!p) return;
     union alloc_header *h = (union alloc_header *)p - 1;
     s->malloc_count--; s->malloc_size -= h->size + sizeof *h; free(h);
+    struct js_alloc_diagnostics *d=s->opaque;if(d)d->current=s->malloc_size;
 }
 static void *qrealloc(JSMallocState *s, void *p, size_t n) {
     if (!p) return qmalloc(s, n);
@@ -187,6 +193,24 @@ static const JSMallocFunctions allocator = {qmalloc, qfree, qrealloc, qusable};
 static struct web_js_state *state(JSContext *ctx) { return JS_GetContextOpaque(ctx); }
 static void log_text(struct web_js_state *s, int level, const char *msg) {
     if (s->host.console) s->host.console(s->host.opaque, level, msg ? msg : "JavaScript error");
+}
+void web_js_prepare_bytes(JSContext *ctx, size_t bytes) {
+    struct web_js_state *s=state(ctx);
+    if(!s||!s->rt||bytes>JS_HEAP_LIMIT-2048)return;
+    size_t before=s->allocation.current,need=bytes+2048;
+    if(before<=JS_HEAP_LIMIT&&need<=JS_HEAP_LIMIT-before)return;
+    /* QuickJS triggers its automatic cycle GC on object creation, not this
+     * js_malloc payload. Its adaptive threshold can exceed our finite limit.
+     * The caller's JSValues are still rooted here; queued finalization jobs
+     * run only at the normal microtask checkpoint, not during allocation. */
+    JS_RunGC(s->rt);
+    size_t after=s->allocation.current;
+    if(after<before&&before-after>=1024u*1024u){
+        char message[160];snprintf(message,sizeof message,
+            "JavaScript pressure GC: reclaimed %lu bytes before %lu-byte host allocation",
+            (unsigned long)(before-after),(unsigned long)bytes);
+        log_text(s,0,message);
+    }
 }
 void web_js_console(web_doc *d, int level, const char *message) {
     /* Native resource/layout failures remain observable after scripting stops. */
@@ -326,7 +350,12 @@ static JSValueConst node_prototype(struct web_js_state *s, const node_t *n) {
                n->type == N_TEXT ? NP_TEXT : n->type == N_COMMENT ? NP_COMMENT : n->type == N_DOCTYPE ? NP_DOCTYPE : n->type == N_PI ? NP_PI : n->type == N_ATTR ? NP_ATTR : n->shadow_host ? NP_SHADOW : NP_FRAGMENT;
     if (n->type == N_ELEM && !n->foreign) switch (n->tag) {
         case T_img: kind = NP_IMAGE; break;
+        case T_track: kind = NP_TRACK; break;
         case T_input: kind = NP_INPUT; break;
+        case T_label: kind = NP_LABEL; break;
+        case T_datalist: kind = NP_DATALIST; break;
+        case T_progress: kind = NP_PROGRESS; break;
+        case T_meter: kind = NP_METER; break;
         case T_button: kind = NP_BUTTON; break;
         case T_select: kind = NP_SELECT; break;
         case T_textarea: kind = NP_TEXTAREA; break;
@@ -354,6 +383,11 @@ static JSValueConst node_prototype(struct web_js_state *s, const node_t *n) {
         case T_canvas: kind = NP_CANVAS; break;
         case T_audio: kind = NP_AUDIO; break;
         case T_video: kind = NP_VIDEO; break;
+        case T_h1: case T_h2: case T_h3: case T_h4: case T_h5: case T_h6: kind = NP_HEADING; break;
+        case T_picture: kind = NP_PICTURE; break;
+        case T_source: kind = NP_SOURCE; break;
+        case T_menu: kind = NP_MENU; break;
+        case T_dialog: kind = NP_DIALOG; break;
     }
     if (kind == NP_HTML && unknown_html_interface(n)) kind = NP_UNKNOWN;
     return s->node_protos[kind];
@@ -446,44 +480,6 @@ static node_t *find_id(node_t *p, const char *id) {
         node_t *r = find_id(n, id); if (r) return r;
     }
     return NULL;
-}
-static void escape_html(sbuf *b, const char *p, size_t n, bool attribute) {
-    for (size_t i = 0; i < n; ++i) {
-        if (p[i] == '&') sb_puts(b, "&amp;");
-        else if (p[i] == '<') sb_puts(b, "&lt;");
-        else if (p[i] == '>') sb_puts(b, "&gt;");
-        else if (attribute && p[i] == '"') sb_puts(b, "&quot;");
-        else sb_putc(b, p[i]);
-    }
-}
-static bool void_tag(int t) { return t == T_area || t == T_base || t == T_br || t == T_col || t == T_embed || t == T_hr || t == T_img || t == T_input || t == T_link || t == T_meta || t == T_param || t == T_source || t == T_track || t == T_wbr; }
-static void serialize(node_t *n, sbuf *b) {
-    if (n->type == N_TEXT) {
-        if (n->parent && (n->parent->tag == T_script || n->parent->tag == T_style)) sb_put(b, n->text, n->textlen);
-        else escape_html(b, n->text ? n->text : "", n->textlen, false);
-    } else if (n->type == N_COMMENT) { sb_puts(b, "<!--"); sb_put(b, n->text ? n->text : "", n->textlen); sb_puts(b, "-->"); }
-    else if (n->type == N_PI) {
-        sb_puts(b, "<?"); sb_puts(b, n->name); sb_putc(b, ' ');
-        sb_put(b, n->text ? n->text : "", n->textlen); sb_putc(b, '>');
-    } else if (n->type == N_DOCTYPE) {
-        sb_puts(b, "<!DOCTYPE "); sb_puts(b, n->name);
-        if (n->public_id && *n->public_id) { sb_puts(b, " PUBLIC \""); sb_puts(b, n->public_id); sb_putc(b, '"'); }
-        if (n->system_id && *n->system_id) { sb_puts(b, n->public_id && *n->public_id ? " \"" : " SYSTEM \""); sb_puts(b, n->system_id); sb_putc(b, '"'); }
-        sb_putc(b, '>');
-    }
-    else {
-        if (n->type == N_ELEM) {
-            sb_putc(b, '<'); sb_puts(b, n->raw_name ? n->raw_name : n->name);
-            for (int i = 0; i < n->nattrs; ++i) {
-                sb_putc(b, ' '); sb_puts(b, n->attrs[i].raw ? n->attrs[i].raw : n->attrs[i].name); sb_puts(b, "=\"");
-                escape_html(b, n->attrs[i].value, strlen(n->attrs[i].value), true); sb_putc(b, '"');
-            }
-            sb_putc(b, '>');
-        }
-        node_t *parent = n->template_content ? n->template_content : n;
-        for (node_t *c = parent->first; c; c = c->next) serialize(c, b);
-        if (n->type == N_ELEM && !void_tag(n->tag)) { sb_puts(b, "</"); sb_puts(b, n->raw_name ? n->raw_name : n->name); sb_putc(b, '>'); }
-    }
 }
 static JSValue children(struct web_js_state *s, node_t *n) {
     JSValue a = JS_NewArray(s->ctx); uint32_t i = 0;
@@ -603,8 +599,9 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     if (!strncmp(p, "image", 5)) return get_image(s, n, p);
     if (!strncmp(p, "form:", 5)) {
         if (n->type != N_ELEM || n->foreign || strcmp(n->name, p + 5)) return JS_ThrowTypeError(ctx, "Form control interface receiver required");
-        node_t *control = n->tag == T_option ? node_ancestor(n, T_select) : n;
+        node_t *control = n->tag == T_option ? node_ancestor(n, T_select) : n->tag == T_label ? web_label_control(n) : n;
         if (!control) return JS_NULL;
+        if (n->tag == T_label && (control->tag == T_progress || control->tag == T_meter)) return JS_NULL;
         return wrap(s, web_form_owner(d, control));
     }
     if (d->resources_dirty && (!strcmp(p, "documentElement") || !strcmp(p, "head") || !strcmp(p, "body") || !strcmp(p, "baseURI") || !strcmp(p, "activeElement"))) doc_sync_tree(d);
@@ -647,8 +644,8 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     }
     if (!strcmp(p, "innerHTML") || !strcmp(p, "outerHTML")) {
         sbuf b = {0};
-        if (!strcmp(p, "outerHTML")) serialize(n, &b);
-        else for (node_t *c = n->template_content ? n->template_content->first : n->first; c; c = c->next) serialize(c, &b);
+        if (!strcmp(p, "outerHTML")) html_serialize_node(n, &b);
+        else html_serialize_children(n, &b);
         JSValue v = JS_NewStringLen(ctx, b.p ? b.p : "", b.n); sb_free(&b); return v;
     }
     if (!strcmp(p, "attributeNames")) {
@@ -660,7 +657,7 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     if (!strcmp(p, "head")) return wrap(s, d->head);
     if (!strcmp(p, "body")) return wrap(s, d->body);
     if (!strcmp(p, "activeElement")) {
-        node_t *focus = d->focus && connected(s, d->focus) ? d->focus : NULL;
+        node_t *focus = d->focus && connected(s, d->focus) && !web_dialog_inert(d,d->focus) ? d->focus : NULL;
         node_t *scope = n->shadow_host ? n : d->root;
         while (focus) {
             node_t *root = doc_node_root(focus, false);
@@ -686,6 +683,39 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
         const char *v = n->value ? n->value : node_attr(n, "value"); return JS_NewString(ctx, v ? v : "");
     }
     if (!strcmp(p, "checked")) return JS_NewBool(ctx, n->checked);
+    if (!strcmp(p, "filesRevision")) return JS_NewFloat64(ctx, (double)n->file_revision);
+    if (!strcmp(p, "fileValue")) {
+        if (!n->files || !n->files->count) return JS_NewString(ctx, "");
+        char name[280]; snprintf(name, sizeof name, "C:\\fakepath\\%s", n->files->files[0].name); return JS_NewString(ctx, name);
+    }
+    if (!strcmp(p, "filesSnapshot")) {
+        JSValue list = JS_NewArray(ctx); unsigned count = n->files ? n->files->count : 0;
+        for (unsigned index = 0; index < count; index++) {
+            const struct web_form_file *file = &n->files->files[index]; JSValue snapshot = JS_NewArray(ctx);
+            JS_SetPropertyUint32(ctx, snapshot, 0, JS_NewArrayBufferCopy(ctx, file->bytes, file->size));
+            JS_SetPropertyUint32(ctx, snapshot, 1, JS_NewString(ctx, file->type));
+            JS_SetPropertyUint32(ctx, snapshot, 2, JS_NewString(ctx, file->name));
+            JS_SetPropertyUint32(ctx, snapshot, 3, JS_NewFloat64(ctx, (double)file->last_modified));
+            JS_SetPropertyUint32(ctx, snapshot, 4, JS_NewString(ctx, file->relative_path));
+            if (JS_SetPropertyUint32(ctx, list, index, snapshot) < 0) { JS_FreeValue(ctx, list); return JS_EXCEPTION; }
+        }
+        return list;
+    }
+    if (!strcmp(p, "indeterminate")) return JS_NewBool(ctx, n->indeterminate);
+    if (!strcmp(p, "labelControl")) return wrap(s, web_label_control(n));
+    if (!strcmp(p, "inputList")) return wrap(s, web_input_datalist(n));
+    if (!strncmp(p, "gauge:", 6)) return JS_NewFloat64(ctx, web_gauge_value(n, p + 6));
+    if (!strcmp(p, "inputWidth") || !strcmp(p, "inputHeight")) {
+        bool width = !strcmp(p, "inputWidth");
+        if (web_input_type(n) == WEB_INPUT_IMAGE && connected(s, n) && d->width > 0) {
+            web_layout(d, d->width, d->height);
+            if (n->box) { double pixels = width ? n->box->w : n->box->h; return JS_NewUint32(ctx, !(pixels > 0) ? 0 : pixels >= UINT32_MAX ? UINT32_MAX : (uint32_t)pixels); }
+        }
+        const char *attribute = node_attr(n, width ? "width" : "height"); uint64_t number = 0;
+        if (attribute) { while (is_space((unsigned char)*attribute)) attribute++; if (*attribute == '+') attribute++;
+            while (*attribute >= '0' && *attribute <= '9') { number = number * 10 + (unsigned)(*attribute++ - '0'); if (number > UINT32_MAX) return JS_NewUint32(ctx, 0); } }
+        return JS_NewUint32(ctx, (uint32_t)number);
+    }
     if (!strcmp(p, "selectedIndex")) return JS_NewInt32(ctx, n->selected);
     if (!strcmp(p, "selected")) return JS_NewBool(ctx, doc_option_selected(n));
     if (!strcmp(p, "selectOptions")) {
@@ -728,6 +758,7 @@ static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValue
         return doc_attr_set_ns(d, n, NULL, NULL, !strcmp(p, "imageWidth") ? "width" : "height", text) ? JS_UNDEFINED : oom(ctx);
     }
     if (!strcmp(p, "value") || !strcmp(p, "checked") || !strcmp(p, "selectedIndex") || !strcmp(p, "selected")) doc_control_init(d, n);
+    if (!strcmp(p, "indeterminate")) { int b = JS_ToBool(ctx, value); if (b < 0) return JS_EXCEPTION; n->indeterminate = b; doc_mutated(d, n); return JS_UNDEFINED; }
     if (!strcmp(p, "checked")) { int b = JS_ToBool(ctx, value); if (b < 0) return JS_EXCEPTION; doc_control_checked(d, n, b); doc_mutated(d, n); return JS_UNDEFINED; }
     if (!strcmp(p, "async")) {
         if (n->tag != T_script) return JS_UNDEFINED;
@@ -1104,6 +1135,37 @@ static JSValue form_value_dom(struct web_js_state *s, node_t *n, int argc, JSVal
     } else result = JS_ThrowTypeError(ctx,"Unknown input value operation");
     JS_FreeCString(ctx,op); return result;
 }
+static JSValue files_dom(struct web_js_state *s, node_t *n, int argc, JSValueConst *argv) {
+    JSContext *ctx = s->ctx; web_doc *d = n && n->owner ? n->owner : s->doc;
+    if (!web_input_is_file(n) || argc < 3) return JS_ThrowTypeError(ctx, "File input and data required");
+    JSValue length = JS_GetPropertyStr(ctx, argv[2], "length"); uint32_t count = 0;
+    int status = JS_ToUint32(ctx, &count, length); JS_FreeValue(ctx, length);
+    if (status < 0) return JS_EXCEPTION;
+    if (count > WEB_FILE_COUNT) return JS_ThrowRangeError(ctx, "At most 64 selected files are allowed");
+    struct web_form_files *files = web_input_files_create(); if (!files) return oom(ctx);
+    bool ok = true;
+    for (uint32_t index = 0; index < count && ok; index++) {
+        JSValue snapshot = JS_GetPropertyUint32(ctx, argv[2], index);
+        JSValue buffer = JS_GetPropertyUint32(ctx, snapshot, 0);
+        size_t size = 0; uint8_t *bytes = JS_GetArrayBuffer(ctx, &size, buffer);
+        struct web_form_file *file = &files->files[index];
+        if ((!bytes && size) || size > WEB_FILE_BYTES + sizeof *files - files->allocation) ok = false;
+        JSValue name_value = JS_GetPropertyUint32(ctx, snapshot, 2), type_value = JS_GetPropertyUint32(ctx, snapshot, 1), relative_value = JS_GetPropertyUint32(ctx, snapshot, 4);
+        const char *name = JS_ToCString(ctx, name_value), *type = JS_ToCString(ctx, type_value), *relative = JS_ToCString(ctx, relative_value);
+        if (!name || !type || !relative || strlen(name) >= sizeof file->name || strlen(type) >= sizeof file->type || strlen(relative) >= sizeof file->relative_path || strchr(name,'/') || strchr(name,'\\')) ok = false;
+        if (ok) {
+            file->bytes = malloc(size ? size : 1); if (!file->bytes) ok = false;
+            else { if (size) memcpy(file->bytes, bytes, size); file->size = size; strcpy(file->name,name); strcpy(file->type,type); strcpy(file->relative_path,relative); files->allocation += size; files->count++; }
+            JSValue modified = JS_GetPropertyUint32(ctx, snapshot, 3); if (JS_ToInt64(ctx,&file->last_modified,modified) < 0) ok = false; JS_FreeValue(ctx,modified);
+        }
+        JS_FreeCString(ctx,name); JS_FreeCString(ctx,type); JS_FreeCString(ctx,relative);
+        JS_FreeValue(ctx,name_value); JS_FreeValue(ctx,type_value); JS_FreeValue(ctx,relative_value); JS_FreeValue(ctx,buffer); JS_FreeValue(ctx,snapshot);
+    }
+    if (ok) ok = web_input_files_replace(d,n,files);
+    web_input_files_dispose(files);
+    return ok ? JS_UNDEFINED : JS_ThrowRangeError(ctx,"File selection exceeds the native byte quota or metadata bounds");
+}
+
 static JSValue validation_dom(struct web_js_state *s, node_t *n, int argc, JSValueConst *argv) {
     JSContext *ctx=s->ctx; web_doc *d=n->owner?n->owner:s->doc;
     if (argc < 3) return JS_ThrowTypeError(ctx,"Validation operation required");
@@ -1162,6 +1224,47 @@ static JSValue control_selection_dom(struct web_js_state *s, node_t *n, int argc
     }
     JS_FreeCString(ctx, op); return result;
 }
+/* This final branch does not revalidate or fire submit: its callers already
+   did so, except HTMLFormElement.submit(), which deliberately bypasses both.
+   A recognized dialog method never falls back to navigation, even on failure. */
+int web_js_dialog_submit(web_doc *d, web_node *submitter) {
+    node_t *dialog; const char *result;
+    int branch = web_dialog_submission(d, submitter, &dialog, &result);
+    if (branch != 1) return branch;
+    struct web_js_state *s = d->js;
+    if (!s || s->disabled || s->doc != d || !JS_IsObject(s->hooks)) return -1;
+    bool outer = !s->running;
+    if (outer) begin_task(s);
+    JSContext *ctx = s->ctx;
+    JSValue fn = JS_GetPropertyStr(ctx, s->hooks, "dialogSubmit");
+    JSValue args[] = {wrap(s, dialog), str_or_null(ctx, result)};
+    JSValue closed = JS_UNDEFINED;
+    int status = -1;
+    if (JS_IsException(fn) || JS_IsException(args[0]) || JS_IsException(args[1])) exception(s);
+    else if (JS_IsFunction(ctx, fn)) {
+        closed = JS_Call(ctx, fn, s->hooks, 2, args);
+        if (JS_IsException(closed)) exception(s);
+        else if (JS_ToBool(ctx, closed) > 0) status = 1;
+    }
+    JS_FreeValue(ctx, closed); JS_FreeValue(ctx, fn);
+    JS_FreeValue(ctx, args[0]); JS_FreeValue(ctx, args[1]);
+    if (outer) end_task(s);
+    return status;
+}
+static void navigate_form_request(struct web_js_state *s, node_t *submitter) {
+    if (web_js_dialog_submit(s->doc,submitter) != 0) return;
+    struct web_form_request request;
+    if (!web_submit_request(s->doc,submitter,&request)) return;
+    web_autocomplete_record(s->doc,submitter,request.url);
+    if (s->host.navigate_form) s->host.navigate_form(s->host.opaque,request.url,request.body,
+        request.body_len,request.content_type,request.target);
+    else if (s->host.navigate && (!request.body ||
+        (request.content_type && !strcmp(request.content_type,"application/x-www-form-urlencoded"))) &&
+        (!strcasecmp(request.target,"_self") || !strcasecmp(request.target,"_top") || !strcasecmp(request.target,"_parent")))
+        s->host.navigate(s->host.opaque,request.url,request.body);
+    else web_js_console(s->doc,2,"The embedder cannot preserve this form encoding or destination");
+    web_submit_request_free(&request);
+}
 static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); web_doc *d = s->doc;
     if (argc < 2) return JS_ThrowTypeError(ctx, "DOM operation requires a receiver");
@@ -1213,6 +1316,12 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         web_doc *made = html ? doc_inert(s->doc, html, len, blank ? "about:blank" : s->doc->url) : NULL;
         result = !html ? JS_EXCEPTION : made ? wrap(s, made->root) : oom(ctx);
         JS_FreeCString(ctx, html);
+    } else if (!strcmp(op, "parseFragment")) {
+        size_t len = 0; const char *html = argc > 2 ? JS_ToCStringLen(ctx, &len, argv[2]) : NULL;
+        if (!n || n->type != N_ELEM) result = JS_ThrowTypeError(ctx, "Element context required");
+        else if (!html) result = JS_EXCEPTION;
+        else { node_t *made = html_fragment(d, n, html, len); result = made ? wrap(s, made) : oom(ctx); }
+        JS_FreeCString(ctx, html);
     } else if (!strcmp(op, "create")) {
         int32_t type; if (argc < 5 || JS_ToInt32(ctx, &type, argv[2])) result = JS_EXCEPTION;
         else {
@@ -1254,6 +1363,15 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         if (permitted) web_js_focus_control(d,n);
         d->dirty = true;
     } else if (!n) result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");
+    else if (!strncmp(op,"dialog",6)) {
+        if(n->type!=N_ELEM || n->foreign || n->tag!=T_dialog) result=JS_ThrowTypeError(ctx,"HTMLDialogElement receiver required");
+        else if(!strcmp(op,"dialogPrepare")) result=JS_NewInt32(ctx,d==s->doc?web_dialog_prepare(d,n):WEB_DIALOG_INACTIVE);
+        else if(!strcmp(op,"dialogEnter")) result=JS_NewBool(ctx,d==s->doc && web_dialog_enter(d,n));
+        else if(!strcmp(op,"dialogModal")) result=JS_NewBool(ctx,web_dialog_is_modal(d,n));
+        else if(!strcmp(op,"dialogLeave")) result=wrap(s,web_dialog_leave(d,n));
+        else if(!strcmp(op,"dialogFocus")) result=wrap(s,d==s->doc?web_dialog_focus_target(d,n):NULL);
+        else result=JS_ThrowTypeError(ctx,"Unknown dialog operation");
+    }
     else if (!strcmp(op, "root")) result = wrap(s, doc_node_root(n, argc > 2 && JS_ToBool(ctx, argv[2]) > 0));
     else if (!strcmp(op, "shadowAttach")) {
         if (argc < 7 || !doc_shadow_host_valid(n) || n->shadow_root) result = JS_ThrowTypeError(ctx, "Invalid shadow host");
@@ -1355,6 +1473,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
     }
     else if (!strcmp(op, "selection")) result = control_selection_dom(s, n, argc, argv);
+    else if (!strcmp(op, "filesSet")) result = files_dom(s, n, argc, argv);
     else if (!strcmp(op, "formValue")) result = form_value_dom(s, n, argc, argv);
     else if (!strcmp(op, "validation")) result = validation_dom(s, n, argc, argv);
     else if (!strcmp(op,"observerGeometry")) {
@@ -1409,6 +1528,8 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         if (visible) web_node_rect(d, n, &x, &y, &w, &h);
         int sx = 0, sy = 0;
         if (s->host.scroll) s->host.scroll(s->host.opaque, &sx, &sy);
+        d->view_x=sx; d->view_y=sy;
+        if(visible) { x=0;y=0;web_node_rect(d,n,&x,&y,&w,&h); }
         if (visible) { x -= sx; y -= sy; }
         result = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, result, "x", JS_NewInt32(ctx, x)); JS_SetPropertyStr(ctx, result, "y", JS_NewInt32(ctx, y));
@@ -1416,8 +1537,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         JS_SetPropertyStr(ctx, result, "right", JS_NewInt32(ctx, x + w)); JS_SetPropertyStr(ctx, result, "bottom", JS_NewInt32(ctx, y + h));
         JS_SetPropertyStr(ctx, result, "width", JS_NewInt32(ctx, w)); JS_SetPropertyStr(ctx, result, "height", JS_NewInt32(ctx, h));
     } else if (!strcmp(op, "submit")) {
-        char *url = NULL, *body = NULL;
-        if (!d->inert && web_submit(d, n, &url, &body)) { if (s->host.navigate) s->host.navigate(s->host.opaque, url, body); free(url); free(body); }
+        if (!d->inert) navigate_form_request(s,n);
     } else if (!strcmp(op, "reset")) {
         if (n->type != N_ELEM || n->foreign || n->tag != T_form) result = JS_ThrowTypeError(ctx, "HTMLFormElement receiver required");
         else result = doc_form_reset(d, n) ? JS_UNDEFINED : oom(ctx);
@@ -1819,7 +1939,8 @@ static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, 
     else if (s->host.navigate) s->host.navigate(s->host.opaque, url, NULL);
     return JS_UNDEFINED;
 }
-static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
+static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); node_t *n = argc ? unwrap(ctx, argv[0]) : NULL;
     if (!n) return JS_EXCEPTION;
     if (n->owner && n->owner->inert) {
@@ -1828,9 +1949,21 @@ static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSV
         JS_FreeValue(ctx, args[1]); return value;
     }
     if (web_control_disabled(n)) return JS_UNDEFINED;
-    struct web_event e = {.type="click", .bubbles=true, .cancelable=true};
-    if (!web_js_dispatch(s->doc, n, &e)) return JS_UNDEFINED;
+    struct web_event e = {.type="click", .bubbles=true, .cancelable=true, .synthetic=true};
+    struct web_control_activation activation;
+    web_control_activation_begin(s->doc, n, &activation);
+    bool allowed = web_js_dispatch(s->doc, n, &e);
+    bool input_events = web_control_activation_end(s->doc, &activation, allowed);
+    if (!allowed) return JS_UNDEFINED;
+    e.synthetic = false; /* default-action input/change/submit events are UA generated */
     if (s->doc->resources_dirty) doc_rescan(s->doc);
+    node_t *label_control = web_label_activation(n);
+    if (label_control && !web_control_disabled(label_control)) {
+        web_js_focus_control(s->doc, label_control);
+        JSValue argument = wrap(s, label_control);
+        JSValue result = JS_IsException(argument) ? argument : native_click(ctx, this_val, 1, &argument);
+        JS_FreeValue(ctx, argument); return result;
+    }
     node_t *disclosure=doc_details_activation(n);
     if (disclosure) doc_details_toggle(s->doc,disclosure);
     else if (n->tag == T_audio || n->tag == T_video) web_media_activate(s->doc, n);
@@ -1840,20 +1973,29 @@ static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSV
     } else if (n->tag == T_input) {
         const char *type = node_attr(n, "type");
         if (type && (str_ieq(type, "checkbox") || str_ieq(type, "radio"))) {
-            web_toggle(s->doc, n); e.type = "input"; e.cancelable = false; web_js_dispatch(s->doc, n, &e); e.type = "change"; web_js_dispatch(s->doc, n, &e); s->doc->dirty = true;
+            if (input_events) { e.type = "input"; e.cancelable = false;  web_js_dispatch(s->doc, n, &e); e.type = "change";  web_js_dispatch(s->doc, n, &e); } s->doc->dirty = true;
         } else if (type && (str_ieq(type, "submit") || str_ieq(type, "image"))) {
             node_t *form = web_form_owner(s->doc, n); e.type = "submit";
             e.submitter=n;
             if (form && web_form_submission_validate(s->doc,n) && web_js_dispatch(s->doc, form, &e)) {
-                char *url = NULL, *body = NULL; if (web_submit(s->doc, n, &url, &body)) { if (s->host.navigate) s->host.navigate(s->host.opaque, url, body); free(url); free(body); }
+                navigate_form_request(s,n);
             }
         } else if (type && str_ieq(type,"reset")) web_reset(s->doc,n);
     } else if (n->tag == T_button) {
         const char *type = node_attr(n, "type"); node_t *form = web_form_owner(s->doc, n);
         if (type && str_ieq(type,"reset")) web_reset(s->doc,n);
-        else if (form && web_control_submit_button(n)) { e.type = "submit"; e.submitter=n; if (web_form_submission_validate(s->doc,n) && web_js_dispatch(s->doc, form, &e)) { char *url = NULL, *body = NULL; if (web_submit(s->doc, n, &url, &body)) { if (s->host.navigate) s->host.navigate(s->host.opaque, url, body); free(url); free(body); } } }
+        else if (form && web_control_submit_button(n)) { e.type = "submit"; e.submitter=n; if (web_form_submission_validate(s->doc,n) && web_js_dispatch(s->doc, form, &e)) navigate_form_request(s,n); }
     }
     return JS_UNDEFINED;
+}
+static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    node_t *n = argc ? unwrap(ctx, argv[0]) : NULL;
+    if (!n) return JS_EXCEPTION;
+    if (n->click_in_progress) return JS_UNDEFINED;
+    n->click_in_progress = true;
+    JSValue result = native_click_impl(ctx, this_val, argc, argv);
+    n->click_in_progress = false;
+    return result;
 }
 static JSValue native_timer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); int32_t kind = 0; double delay = 0;
@@ -2454,12 +2596,17 @@ void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *response)
         }
         if (response->body_len > JS_BODY_LIMIT || (response->body_len && !response->body)) pending_error(p, "Resource exceeds the 16 MiB limit or has an invalid body");
         else {
+            web_js_prepare_bytes(s->ctx,response->body_len+1);
             p->response.body = js_malloc(s->ctx, response->body_len + 1);
             if (!p->response.body) { JSValue e = JS_GetException(s->ctx); JS_FreeValue(s->ctx, e); pending_error(p, "Resource buffering exceeded the JavaScript heap limit"); }
             else { if (response->body_len) memcpy(p->response.body, response->body, response->body_len); p->response.body[response->body_len] = 0; p->done = true; }
         }
         return;
     }
+}
+static void fetch_body_free(JSRuntime *rt, void *opaque, void *bytes) {
+    (void)opaque;
+    js_free_rt(rt, bytes);
 }
 static bool process_pending(struct web_js_state *s) {
     struct js_pending **link = &s->pending;
@@ -2509,9 +2656,19 @@ static bool process_pending(struct web_js_state *s) {
             JSValue value;
             bool success = !p->response.error[0];
             if (success) {
-                JSValue bytes = JS_NewArrayBufferCopy(s->ctx, (const uint8_t *)(p->response.body ? p->response.body : ""), p->response.body_len);
-                JSValue args[] = {JS_NewInt32(s->ctx, p->response.status), JS_NewString(s->ctx, p->response.url[0] ? p->response.url : p->url), JS_NewString(s->ctx, web_response_headers(&p->response)), JS_NewStringLen(s->ctx, p->response.body ? p->response.body : "", p->response.body_len), bytes, JS_NewBool(s->ctx, p->response.url[0] && strcmp(p->url, p->response.url))};
-                value = JS_Call(s->ctx, s->response, JS_UNDEFINED, 6, args);
+                /* Transfer the already runtime-charged native snapshot. The
+                   current QuickJS adopts external data only on success;
+                   construction failure leaves pending_free as its owner. */
+                JSValue bytes = JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body,
+                    p->response.body_len, fetch_body_free, NULL, false);
+                if (!JS_IsException(bytes)) p->response.body = NULL;
+                /* Response decodes bytes only when its consumer asks for text.
+                   The old fourth argument was unused and eagerly expanded
+                   every binary media fragment into a large JS string. */
+                JSValue args[] = {JS_NewInt32(s->ctx, p->response.status), JS_NewString(s->ctx, p->response.url[0] ? p->response.url : p->url), JS_NewString(s->ctx, web_response_headers(&p->response)), JS_UNDEFINED, bytes, JS_NewBool(s->ctx, p->response.url[0] && strcmp(p->url, p->response.url))};
+                bool valid_args = true;
+                for (int i = 0; i < 6; ++i) if (JS_IsException(args[i])) valid_args = false;
+                value = valid_args ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 6, args) : JS_EXCEPTION;
                 for (int i = 0; i < 6; ++i) JS_FreeValue(s->ctx, args[i]);
                 if (JS_IsException(value)) { exception(s); success = false; value = JS_NewString(s->ctx, "Could not construct fetch response"); }
             } else { JSValue args[] = {JS_NewString(s->ctx, p->response.error), JS_NewBool(s->ctx, p->aborted)}; value = JS_Call(s->ctx, s->reject, JS_UNDEFINED, 2, args); JS_FreeValue(s->ctx, args[0]); JS_FreeValue(s->ctx, args[1]); }
@@ -2716,7 +2873,7 @@ static JSValue event_init(struct web_js_state *s, const struct web_event *event)
     JS_SetPropertyStr(s->ctx, init, k, value_) < 0) goto failed; } while (0)
 #define SET_B(k,v) SET(k, JS_NewBool(s->ctx, v))
 #define SET_I(k,v) SET(k, JS_NewInt32(s->ctx, v))
-    SET_B("bubbles", event->bubbles); SET_B("cancelable", event->cancelable);
+    SET_B("bubbles", event->bubbles); SET_B("cancelable", event->cancelable); SET_B("isTrusted", !event->synthetic);
     SET_B("ctrlKey", event->ctrl); SET_B("shiftKey", event->shift); SET_B("altKey", event->alt);
     SET_I("clientX", event->x); SET_I("clientY", event->y); SET_I("pageX", event->x + sx); SET_I("pageY", event->y + sy);
     SET_I("button", event->button); SET_I("buttons", event->buttons);
@@ -2751,6 +2908,9 @@ void web_js_focus_control(web_doc *d, node_t *n) {
 bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *event) {
     struct web_js_state *s = d ? d->js : NULL;
     if (!s || s->disabled || !event || !event->type || JS_IsUndefined(s->dispatch)) return true;
+    if(!event->synthetic && target && web_dialog_inert(d,target) &&
+       (!strncmp(event->type,"key",3) || !strncmp(event->type,"mouse",5) || !strcmp(event->type,"click") || !strcmp(event->type,"dblclick"))) return false;
+    if(!target && !event->synthetic && !strncmp(event->type,"key",3) && web_dialog_top(d)) target=web_dialog_top(d);
     begin_task(s);
     JSValue init = event_init(s, event);
     JSValue args[] = {wrap(s, target), JS_NewString(s->ctx, event->type), init};
@@ -2760,6 +2920,19 @@ bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *event) 
     bool allowed = true;
     if (JS_IsException(result)) { exception(s); allowed = false; } else { int r = JS_ToBool(s->ctx, result); allowed = r != 0; JS_FreeValue(s->ctx, result); }
     for (int i = 0; i < 3; ++i) JS_FreeValue(s->ctx, args[i]);
+    if(allowed && !event->synthetic && !strcmp(event->type,"keydown") && !event->ctrl && !event->alt && web_dialog_top(d)) {
+        if(event->key && !strcmp(event->key,"Escape")) {
+            node_t *top=web_dialog_top(d); const char *by=node_attr(top,"closedby");
+            if(!by || !str_ieq(by,"none")) {
+                JSValue arg=wrap(s,top),r=JS_IsException(arg)?JS_EXCEPTION:custom_element_hook(s,"dialogRequestClose",1,&arg);
+                if(JS_IsException(r))exception(s);else JS_FreeValue(s->ctx,r);
+                JS_FreeValue(s->ctx,arg);
+            }
+            allowed=false;
+        } else if(event->key && !strcmp(event->key,"Tab")) {
+            web_js_focus_control(d,web_dialog_tab_target(d,event->shift)); allowed=false;
+        }
+    }
     end_task(s); return allowed;
 }
 bool web_media_activate(web_doc *d, web_node *target) {
@@ -2779,6 +2952,7 @@ bool web_media_activate(web_doc *d, web_node *target) {
 void web_hover(web_doc *d, web_node *target, const struct web_event *event) {
     struct web_js_state *s = d && d->live ? d->js : NULL;
     if (!s || s->disabled || s->running || !event) return;
+    if(target && web_dialog_inert(d,target))target=NULL;
     /* Native parents cannot be spoofed by page properties. Detached nodes and
        wrappers remain document-owned, so the previous JS snapshot stays valid. */
     begin_task(s);
@@ -2871,6 +3045,7 @@ static bool run_document_event(struct web_js_state *s) {
         for (int i = 0; i < web_image_count(d); i++) if (web_image_wanted(d, i)) return false;
         timing_record(s, JS_DOM_COMPLETE, uptime_ms());
         s->load_sent = true; struct web_event e = {.type="load"};
+        node_t *autofocus = web_autofocus_candidate(d); if (autofocus) web_js_focus_control(d, autofocus);
         timing_record(s, JS_LOAD_START, uptime_ms());
         web_js_dispatch(d, NULL, &e);
         timing_record(s, JS_LOAD_END, uptime_ms()); return true;
@@ -2992,6 +3167,19 @@ int64_t web_js_deadline(web_doc *d) {
     return deadline == UINT64_MAX ? -1 : (int64_t)deadline;
 }
 bool web_js_running(web_doc *d) { return d && d->js && d->js->running; }
+bool web_console_eval(web_doc *d,const char *source,size_t length) {
+    struct web_js_state *s=d?d->js:NULL;
+    if(!s||!source||!length||length>16384||s->running||s->starting||s->disabled)return false;
+    begin_task(s);
+    JSValue result=JS_Eval(s->ctx,source,length,"nocturne:developer-console",JS_EVAL_TYPE_GLOBAL);
+    bool ok=!JS_IsException(result);
+    if(!ok)exception(s);
+    else if(!JS_IsUndefined(result)){
+        const char *text=JS_ToCString(s->ctx,result);
+        if(text){log_text(s,0,text);JS_FreeCString(s->ctx,text);}else {exception(s);ok=false;}
+    }
+    JS_FreeValue(s->ctx,result);end_task(s);d->dirty=true;return ok;
+}
 /* This is the document's parsing/presentation policy, not whether the watchdog
    currently permits execution. Stopping a runaway task cannot reinterpret
    noscript raw text as fallback HTML or change scripting media queries. */

@@ -81,7 +81,7 @@ enum {
 int tag_lookup(const char *name, size_t n);
 extern const char *const tag_names[T_COUNT];
 
-enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_OTHER }; /* pseudo-elements */
+enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_OTHER, PE_BACKDROP }; /* pseudo-elements */
 
 enum { N_DOC, N_ELEM, N_TEXT, N_COMMENT, N_FRAGMENT, N_DOCTYPE, N_PI, N_ATTR };
 enum { NS_HTML, NS_SVG, NS_MATHML };
@@ -149,6 +149,10 @@ typedef struct node {
     const char *custom_validity; /* allocation-document arena; initially empty */
     size_t custom_validity_length;
     bool checked, selected_set;
+    bool click_in_progress;
+    bool indeterminate; /* native checkbox display state, independent of checkedness */
+    struct web_form_files *files;
+    uint64_t file_revision;
     bool value_dirty, checked_dirty;
     /* DOM endpoints are UTF-16 code units, not renderer UTF-8 byte offsets.
        Keep even half-surrogate endpoints exact until native editing/rendering. */
@@ -299,7 +303,7 @@ typedef struct style {
     uint8_t caption_bottom;
     bool z_auto;
     struct custom_prop *vars;
-    struct style *before, *after;
+    struct style *before, *after, *backdrop;
 } style_t;
 
 /* ---------------------------------------------------------------- stylesheets */
@@ -517,6 +521,8 @@ struct web_doc {
     int styled_w, styled_h; /* viewport the cascade ran for */
     bool need_style, need_boxes, layout_valid;
     node_t *focus;
+    struct web_dialog_state *dialogs; /* native modal/top-layer ownership */
+    int view_x, view_y; /* last native viewport scroll; fixed top-layer coordinates */
     node_t *validation_target;
     bool validation_report_pending;
     const char *validation_message;
@@ -600,6 +606,7 @@ bool css_matches(node_t *node, const char *selector, bool *valid);
 void web_js_start(web_doc *d, const struct web_host *host);
 void web_js_console(web_doc *d, int level, const char *message);
 void web_js_focus_control(web_doc *d, node_t *control);
+node_t *web_autofocus_candidate(web_doc *d);
 void web_js_tick(web_doc *d, uint64_t now);
 void web_js_free(web_doc *d);
 void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *r);

@@ -1,0 +1,16 @@
+{
+  "name": "web-streams-polyfill",
+  "version": "4.2.0",
+  "gitHead": "46d22ccb22bd9f6a10f488694cd89b3ca0d2bc9b",
+  "license": "MIT",
+  "repository": {
+    "url": "git+https://github.com/MattiasBuelens/web-streams-polyfill.git",
+    "type": "git"
+  },
+  "tarball": "https://registry.npmjs.org/web-streams-polyfill/-/web-streams-polyfill-4.2.0.tgz",
+  "integrity": "sha512-0rYDzGOh9EZpig92umN5g5D/9A1Kff7k0/mzPSSCY8jEQeYkgRMoY7LhbXtUCWzLCMX0TUE9aoHkjFNB7D9pfA==",
+  "files": {
+    "ponyfill.mjs": "5c36bb87ddfddc29a25420608770e9f26b54bb9233f5b59d56771854bb1bbcf8",
+    "LICENSE": "94d0444de8345fb1370316fbe4918a0fe73190f32dcde0e474d3423cf275a95c"
+  }
+}

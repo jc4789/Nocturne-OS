@@ -36,7 +36,7 @@ const formControlBridge = (() => {
                     const value = reflect(this, 'value');
                     return value === null ? mode === 2 ? 'on' : '' : value;
                 }
-                return rawDom('get', this, 'value');
+                return rawDom('get', this, mode === 3 ? 'fileValue' : 'value');
             },
             set(value) {
                 const mode = valueMode(type(this));
@@ -215,5 +215,165 @@ const formControlBridge = (() => {
     }
     Object.defineProperty(Option, 'prototype', {value:HTMLOptionElement.prototype, writable:false});
     globalThis.Option = Option;
-    return {type};
+    /* These collections read native association on every access. No cached
+       form owner, labels, selected value, or gauge state belongs to script. */
+    const define = Object.defineProperty, fieldsetCollections = new WeakMap(),
+        labelCollections = new WeakMap(), datalistCollections = new WeakMap();
+    class HTMLLabelElement extends HTMLElement { constructor() { throw new TypeError('Illegal HTMLLabelElement constructor'); } }
+    class HTMLDataListElement extends HTMLElement { constructor() { throw new TypeError('Illegal HTMLDataListElement constructor'); } }
+    class HTMLProgressElement extends HTMLElement { constructor() { throw new TypeError('Illegal HTMLProgressElement constructor'); } }
+    class HTMLMeterElement extends HTMLElement { constructor() { throw new TypeError('Illegal HTMLMeterElement constructor'); } }
+    function readonly(C, tag, name, get) {
+        define(C.prototype, name, {configurable:true, enumerable:true, get() { htmlElementBrand(this, tag); return get(this); }});
+    }
+    function reflectedString(C, tag, name, attribute = name) {
+        define(C.prototype, name, {configurable:true, enumerable:true,
+            get() { htmlElementBrand(this, tag); return reflect(this, attribute) || ''; },
+            set(value) { htmlElementBrand(this, tag); reflect(this, attribute, text(value)); }});
+    }
+    function enumeration(C, tag, name, attribute, values, fallback, invalid = fallback) {
+        define(C.prototype, name, {configurable:true, enumerable:true,
+            get() { htmlElementBrand(this, tag); const attributeValue = reflect(this, attribute); if (attributeValue === null) return fallback; const value = attributeValue.toLowerCase(); return values.includes(value) ? value : invalid; },
+            set(value) { htmlElementBrand(this, tag); reflect(this, attribute, text(value)); }});
+    }
+    function root(node) { let parent; while ((parent = rawDom('get', node, 'parentNode'))) node = parent; return node; }
+    function descendants(node, selector) { return rawDom('query', node, selector, false).filter(n => rawDom('get', n, 'namespaceURI') === 'http://www.w3.org/1999/xhtml'); }
+    reflectedString(HTMLLabelElement, 'label', 'htmlFor', 'for');
+    readonly(HTMLLabelElement, 'label', 'control', node => rawDom('get', node, 'labelControl'));
+    readonly(HTMLLabelElement, 'label', 'form', node => rawDom('get', node, 'form:label'));
+    for (const [C, tag] of [[HTMLInputElement,'input'],[HTMLButtonElement,'button'],[HTMLSelectElement,'select'],
+        [HTMLTextAreaElement,'textarea'],[HTMLOutputElement,'output'],[HTMLProgressElement,'progress'],[HTMLMeterElement,'meter']]) {
+        readonly(C, tag, 'labels', node => {
+            if (tag === 'input' && type(node) === 'hidden') return null;
+            let collection = labelCollections.get(node);
+            if (!collection) {
+                collection = collectionBridge.live(() => {
+                    const tree = root(node), labels = descendants(tree, 'label');
+                    if (rawDom('get', tree, 'nodeType') === 1 && rawDom('get', tree, 'namespaceURI') === 'http://www.w3.org/1999/xhtml' && rawDom('get', tree, 'localName') === 'label') labels.unshift(tree);
+                    return labels.filter(label => rawDom('get', label, 'labelControl') === node);
+                });
+                labelCollections.set(node, collection);
+            }
+            return collection;
+        });
+    }
+    readonly(HTMLFieldSetElement, 'fieldset', 'elements', node => {
+        let collection = fieldsetCollections.get(node);
+        if (!collection) {
+            collection = collectionBridge.html(() => descendants(node, 'button,fieldset,input,object,output,select,textarea'));
+            fieldsetCollections.set(node, collection);
+        }
+        return collection;
+    });
+    readonly(HTMLDataListElement, 'datalist', 'options', node => {
+        let collection = datalistCollections.get(node);
+        if (!collection) { collection = collectionBridge.html(() => descendants(node, 'option')); datalistCollections.set(node, collection); }
+        return collection;
+    });
+    readonly(HTMLInputElement, 'input', 'list', node => rawDom('get', node, 'inputList'));
+    define(HTMLInputElement.prototype, 'indeterminate', {configurable:true, enumerable:true,
+        get() { brand(this); return rawDom('get', this, 'indeterminate'); },
+        set(value) { brand(this); dom('set', this, 'indeterminate', !!value); }});
+    for (const dimension of ['width','height']) define(HTMLInputElement.prototype, dimension, {configurable:true, enumerable:true,
+        get() { brand(this); return rawDom('get', this, dimension === 'width' ? 'inputWidth' : 'inputHeight'); },
+        set(value) { brand(this); reflect(this, dimension, '' + (numeric(value) >>> 0)); }});
+    enumeration(HTMLTextAreaElement, 'textarea', 'wrap', 'wrap', ['soft','hard'], 'soft');
+    // WHATWG autofill processing: IDL exposes valid, ASCII-normalized tokens,
+    // not arbitrary attribute text. Native search history separately enforces
+    // its opt-in/privacy policy; reflecting a credential token never saves it.
+    const autofillNormal = ('name honorific-prefix given-name additional-name family-name honorific-suffix nickname ' +
+        'organization-title username new-password current-password one-time-code organization street-address ' +
+        'address-line1 address-line2 address-line3 address-level4 address-level3 address-level2 address-level1 ' +
+        'country country-name postal-code cc-name cc-given-name cc-additional-name cc-family-name cc-number ' +
+        'cc-exp cc-exp-month cc-exp-year cc-csc cc-type transaction-currency transaction-amount language ' +
+        'bday bday-day bday-month bday-year sex url photo').split(' ');
+    const autofillContact = 'tel tel-country-code tel-national tel-area-code tel-local tel-local-prefix tel-local-suffix tel-extension email impp'.split(' ');
+    function autocompleteValue(node, tag) {
+        const attribute = reflect(node, 'autocomplete');
+        if (attribute === null) return '';
+        const tokens = attribute.split(/[\t\n\f\r ]+/).filter(token => token !== '').map(token =>
+            token.replace(/[A-Z]/g, letter => string.fromCharCode(letter.charCodeAt(0) + 32)));
+        let index = tokens.length - 1;
+        if (index < 0) return '';
+        const field = tokens[index];
+        if (field === 'on' || field === 'off') return index === 0 && !(tag === 'input' && type(node) === 'hidden') ? field : '';
+        let category;
+        if (field === 'webauthn') {
+            if (index === 0) return field;
+            --index;
+        }
+        if (autofillNormal.includes(tokens[index])) category = 'normal';
+        else if (autofillContact.includes(tokens[index])) category = 'contact';
+        else return '';
+        --index;
+        if (category === 'contact' && index >= 0 && ['home','work','mobile','fax','pager'].includes(tokens[index])) --index;
+        if (index >= 0 && ['shipping','billing'].includes(tokens[index])) --index;
+        if (index >= 0 && !(index === 0 && tokens[index].startsWith('section-'))) return '';
+        return tokens.join(' ');
+    }
+    for (const [C, tag] of [[HTMLInputElement,'input'],[HTMLSelectElement,'select'],[HTMLTextAreaElement,'textarea']])
+        define(C.prototype, 'autocomplete', {configurable:true, enumerable:true,
+            get() { htmlElementBrand(this, tag); return autocompleteValue(this, tag); },
+            set(value) { htmlElementBrand(this, tag); reflect(this, 'autocomplete', text(value)); }});
+    enumeration(HTMLFormElement, 'form', 'autocomplete', 'autocomplete', ['on','off'], 'on');
+    for (const [C, tag] of [[HTMLInputElement,'input'],[HTMLTextAreaElement,'textarea']]) reflectedString(C, tag, 'dirName', 'dirname');
+    // Native focus candidates consume this attribute at the load boundary.
+    define(HTMLElement.prototype, 'autofocus', {configurable:true, enumerable:true,
+        get() { rawDom('get', this, 'elementBrand'); return reflect(this, 'autofocus') !== null; },
+        set(value) { rawDom('get', this, 'elementBrand'); reflect(this, 'autofocus', value ? '' : null); }});
+    for (const [C, tag] of [[HTMLInputElement,'input'],[HTMLButtonElement,'button']]) {
+        define(C.prototype, 'formAction', {configurable:true, enumerable:true,
+            get() { return elementURL.attribute(this, tag, 'formaction', true); },
+            set(value) { htmlElementBrand(this, tag); reflect(this, 'formaction', elementURL.scalar(value)); }});
+        enumeration(C, tag, 'formMethod', 'formmethod', ['get','post','dialog'], '', 'get');
+        enumeration(C, tag, 'formEnctype', 'formenctype', ['application/x-www-form-urlencoded','multipart/form-data','text/plain'], '', 'application/x-www-form-urlencoded');
+        reflectedString(C, tag, 'formTarget', 'formtarget');
+    }
+    for (const [C, tag, names] of [[HTMLProgressElement,'progress',['value','max']],
+        [HTMLMeterElement,'meter',['value','min','max','low','high','optimum']]]) {
+        for (const name of names) define(C.prototype, name, {configurable:true, enumerable:true,
+            get() { htmlElementBrand(this, tag); return rawDom('get', this, 'gauge:' + name); },
+            set(value) { htmlElementBrand(this, tag); value = numeric(value); if (!finite(value)) throw new TypeError('Gauge values must be finite'); reflect(this, name, '' + value); }});
+    }
+    readonly(HTMLProgressElement, 'progress', 'position', node => rawDom('get', node, 'gauge:position'));
+    const extraInterfaces = [HTMLLabelElement,HTMLDataListElement,HTMLProgressElement,HTMLMeterElement];
+    for (const C of extraInterfaces) { define(C.prototype, Symbol.toStringTag, {value:C.name, configurable:true}); globalThis[C.name] = C; }
+
+    const fileLists = new WeakMap(), fileListSlots = new WeakMap();
+    class FileList {
+        constructor() { throw new TypeError('Illegal FileList constructor'); }
+        get length() { const files = fileListSlots.get(this); if (!files) throw new TypeError('Illegal FileList receiver'); return files.length; }
+        item(index) { const files = fileListSlots.get(this); if (!files) throw new TypeError('Illegal FileList receiver'); if (!arguments.length) throw new TypeError('Index required'); return files[numeric(index) >>> 0] || null; }
+        *[Symbol.iterator]() { const files = fileListSlots.get(this); if (!files) throw new TypeError('Illegal FileList receiver'); yield* files; }
+    }
+    function fileList(files) {
+        const object = Object.create(FileList.prototype);
+        for (let index = 0; index < files.length; index++) define(object, '' + index, {value:files[index], enumerable:true});
+        fileListSlots.set(object, files); return object;
+    }
+    define(FileList.prototype, Symbol.toStringTag, {value:'FileList', configurable:true});
+    globalThis.FileList = FileList;
+    define(HTMLInputElement.prototype, 'files', {configurable:true, enumerable:true,
+        get() {
+            brand(this); if (type(this) !== 'file') return null;
+            const revision = rawDom('get', this, 'filesRevision');
+            let stored = fileLists.get(this);
+            if (!stored || stored.revision !== revision) {
+                const files = rawDom('get', this, 'filesSnapshot').map(snapshot => blobBridge.nativeFile(snapshot));
+                stored = {revision, list:fileList(files)}; fileLists.set(this, stored);
+            }
+            return stored.list;
+        },
+        set(value) {
+            brand(this); if (value === null) return;
+            const files = fileListSlots.get(value); if (!files) throw new TypeError('FileList required');
+            if (type(this) !== 'file') return;
+            dom('filesSet', this, files.map(file => blobBridge.snapshot(file)));
+        }});
+    reflectedString(HTMLInputElement, 'input', 'accept');
+    define(HTMLInputElement.prototype, 'webkitdirectory', {configurable:true, enumerable:true,
+        get() { brand(this); return reflect(this, 'webkitdirectory') !== null; },
+        set(value) { brand(this); reflect(this, 'webkitdirectory', value ? '' : null); }});
+
+    return {type,nodeProtos:extraInterfaces.map(C=>C.prototype)};
 })();

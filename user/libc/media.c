@@ -2,6 +2,7 @@
 #include "media_alloc_private.h"
 #include "media_http_private.h"
 #include "media_feed_private.h"
+#include "media_adaptive_private.h"
 #include "nocturne.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,12 +42,18 @@ struct nmedia {
     nmedia_packet_reader packet_reader;
     nmedia_packet_seeker packet_seeker;
     void *packet_owner;
+    void (*packet_release)(void *);
+    const char *(*packet_error)(void *);
     int64_t audio_pts, audio_clock, video_clock, audio_seek_ms, video_seek_ms;
 };
 
 static int fail(nmedia *m, const char *what, int code) {
     if (m->http && nmedia_http_error(m->http)[0]) {
         snprintf(m->error, sizeof m->error, "HTTP input: %s", nmedia_http_error(m->http));
+        return NMEDIA_ERROR;
+    }
+    if (m->packet_error && m->packet_error(m->packet_owner)[0]) {
+        snprintf(m->error, sizeof m->error, "%s", m->packet_error(m->packet_owner));
         return NMEDIA_ERROR;
     }
     char detail[80];
@@ -187,6 +194,11 @@ nmedia *nmedia_open_memory(const void *bytes, size_t size, char *error, size_t e
     return m;
 }
 static nmedia *open_url(const char *url, const char *document_url, char *error, size_t error_size) {
+    /* Native Media Player uses the same decoder, with the manifest URL as
+       its anonymous policy origin. Redirects remain rejected so relative
+       segment URLs can never be resolved against a stale manifest base. */
+    if (nmedia_adaptive_url(url))
+        return nmedia_adaptive_open_cors(url,document_url?document_url:url,error,error_size);
     nmedia *m = nmedia_ff_mallocz(sizeof *m);
     if (!m) { if(error&&error_size)strlcpy(error,"media allocation",error_size);return NULL; }
     m->fd = -1;
@@ -237,6 +249,10 @@ nmedia *nmedia_open_packets(const AVFormatContext *source, nmedia_packet_reader 
 bad:
     if(error&&size)strlcpy(error,m->error[0]?m->error:"invalid MSE packet decoder metadata",size);
     nmedia_close(m);return NULL;
+}
+void nmedia_packets_set_lifecycle(nmedia *m, void (*release)(void *), const char *(*error)(void *)) {
+    if (!m || !m->packet_reader) return;
+    m->packet_release=release; m->packet_error=error;
 }
 bool nmedia_packets_resume(nmedia *m){
     if(!m||!m->packet_reader)return false;bool flushed=m->eof!=0;
@@ -489,9 +505,35 @@ bool nmedia_seek(nmedia *m, int64_t ms) {
     m->phase = 0; m->audio_seek_ms = m->video_seek_ms = ms; m->error[0] = 0;
     return true;
 }
+/* Eviction already invalidates output and seeks to a retained keyframe.
+ * FFmpeg flush returns DPB frames to a high-water pool; it does not free that
+ * pool. Close/reopen only codecs, preserving the packet provider, metadata,
+ * selected cursor and seek trim. No original input/lifecycle is released. */
+bool nmedia_packets_reclaim(nmedia *m) {
+    if (!m || !m->packet_reader) return false;
+    m->pending = NULL; m->frame_audio = 0;
+    av_frame_unref(m->frame); av_packet_unref(m->packet);
+    avcodec_free_context(&m->audio); avcodec_free_context(&m->video);
+    av_channel_layout_uninit(&m->mix_layout); m->mix_valid = false;
+    nmedia_ff_free(m->pixels); m->pixels = NULL; m->pixel_capacity = 0;
+    m->eof = m->flush = m->source_rate = 0; m->phase = m->step = 0;
+    if (m->audio_index >= 0) {
+        m->audio = open_decoder(m, m->audio_index);
+        if (!m->audio) goto bad;
+    }
+    if (m->video_index >= 0) {
+        m->video = open_decoder(m, m->video_index);
+        if (!m->video) goto bad;
+    }
+    return true;
+bad:
+    avcodec_free_context(&m->audio); avcodec_free_context(&m->video);
+    return false; /* Reopen failure is explicit; no stale decoder can run. */
+}
 void nmedia_close(nmedia *m) {
     if (!m) return;
     close_decoder(m);
+    if (m->packet_release) m->packet_release(m->packet_owner);
     if (m->fd >= 0) close(m->fd);
     nmedia_http_close(m->http);
     nmedia_ff_free(m->bytes); nmedia_ff_free(m->pixels); nmedia_ff_free(m);

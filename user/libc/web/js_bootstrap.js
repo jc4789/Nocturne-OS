@@ -29,7 +29,8 @@
     let avmediaHandlerTarget = () => false;
     let blobHandlerTarget = () => false;
     let mseHandlerTarget = () => false;
-    const globalHandlerTypes = new Set(('abort blur change click dblclick error focus focusin focusout input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
+    let textTrackHandlerTarget = () => false;
+    const globalHandlerTypes = new Set(('abort beforetoggle blur cancel change click close dblclick error focus focusin focusout input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
     const windowHandlerTypes = new Set(['hashchange','popstate','message','messageerror']);
     const state = new WeakMap();
     /* @include js_collections.js */
@@ -140,7 +141,7 @@
     }
     function handlerTarget(target,type) {
         return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document || svgHandlerTarget(target))) ||
-            (windowHandlerTypes.has(type) && target===globalThis) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type);
+            (windowHandlerTypes.has(type) && target===globalThis) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || textTrackHandlerTarget(target,type);
     }
     function activateHandler(target,type,r) {
         if(r.entry)return;
@@ -700,6 +701,8 @@
     /* @include js_encoding.js */
     /* @include js_url.js */
     fetchBridge.initialize();
+    /* @include js_streams.js */
+    fetchBridge.initializeStreams(streamBridge);
     /* @include js_importmaps.js */
     /* @include js_hyperlink.js */
     /* @include js_html_elements.js */
@@ -732,9 +735,12 @@
     /* @include js_form_controls.js */
     /* @include js_form_validation.js */
     /* @include js_semantic_elements.js */
+    htmlElementsBridge.initializeDialogs(ToggleEvent);
+    /* @include js_canvas_dash.js */
     /* @include js_canvas.js */
     /* @include js_mse.js */
     /* @include js_avmedia.js */
+    /* @include js_texttracks.js */
     customElementsReady = true;
     /* Private native-input state, never reachable from page JS. C supplies the
        hit target's complete ancestry BEFORE any event handler can change it.
@@ -803,6 +809,8 @@
         customElementAfter(token,result){mutationBridge.after(token.mutation);if(token.op!=='clone' || !result || rawDom('get',result,'scripting'))customElementsBridge.after(token.ce,result);},
         customElementScan(){customElementsBridge.upgradeTree(document);},
         slotChanges(){mutationBridge.signalSlots();},
+        dialogRequestClose(node){htmlElementsBridge.requestClose(node);},
+        dialogSubmit(node,result){return htmlElementsBridge.submit(node,result);},
         detailsToggle(target,oldOpen,newOpen){semanticElementsBridge.toggle(target,oldOpen,newOpen);},
         historyEvent(oldURL,popstate){historyEvent(oldURL,popstate);},
         mediaChanged(){mediaBridge.changed();},
@@ -812,8 +820,8 @@
             Text.prototype,Comment.prototype,DocumentFragment.prototype,HTMLIFrameElement.prototype,HTMLImageElement.prototype,
             HTMLInputElement.prototype,HTMLButtonElement.prototype,HTMLSelectElement.prototype,HTMLTextAreaElement.prototype,
             HTMLFieldSetElement.prototype,HTMLObjectElement.prototype,HTMLOutputElement.prototype,HTMLOptionElement.prototype,HTMLTemplateElement.prototype,DocumentType.prototype,
-            HTMLScriptElement.prototype,HTMLFormElement.prototype,HTMLAnchorElement.prototype,HTMLAreaElement.prototype,...svgBridge.nodeProtos,ProcessingInstruction.prototype,attributeBridge.nodeProto,...htmlElementsBridge.nodeProtos,shadowBridge.ShadowRoot.prototype,shadowBridge.HTMLSlotElement.prototype,...semanticElementsBridge.nodeProtos,HTMLUnknownElement.prototype,...canvasBridge.nodeProtos,HTMLMediaElement.prototype,HTMLAudioElement.prototype,HTMLVideoElement.prototype],
-        dispatch(target,type,init){const C=type==='submit'?formValidationBridge.SubmitEvent:/^(key)/.test(type)?KeyboardEvent:/^(mouse|click|dblclick)/.test(type)?MouseEvent:Event;const e=new C(type,init);for(const k of Object.keys(init))if(k!=='submitter')e[k]=init[k];e.composed=/^(?:keydown|keyup|keypress|click|dblclick|mousedown|mouseup|mouseout|mousemove|mouseover|wheel|focus|blur|focusin|focusout|input)$/.test(type);e.isTrusted=true;return dispatch(target===null?globalThis:target,e);},
+            HTMLScriptElement.prototype,HTMLFormElement.prototype,HTMLAnchorElement.prototype,HTMLAreaElement.prototype,...svgBridge.nodeProtos,ProcessingInstruction.prototype,attributeBridge.nodeProto,...htmlElementsBridge.nodeProtos,shadowBridge.ShadowRoot.prototype,shadowBridge.HTMLSlotElement.prototype,...semanticElementsBridge.nodeProtos,HTMLUnknownElement.prototype,...canvasBridge.nodeProtos,HTMLMediaElement.prototype,HTMLAudioElement.prototype,HTMLVideoElement.prototype,...formControlBridge.nodeProtos,...htmlElementsBridge.extraNodeProtos,...textTrackBridge.nodeProtos],
+        dispatch(target,type,init){const C=type==='submit'?formValidationBridge.SubmitEvent:/^(key)/.test(type)?KeyboardEvent:/^(mouse|click|dblclick)/.test(type)?MouseEvent:Event;const e=new C(type,init);for(const k of Object.keys(init))if(k!=='submitter')e[k]=init[k];e.composed=/^(?:keydown|keyup|keypress|click|dblclick|mousedown|mouseup|mouseout|mousemove|mouseover|wheel|focus|blur|focusin|focusout|input)$/.test(type);e.isTrusted=init.isTrusted!==false;return dispatch(target===null?globalThis:target,e);},
         response(...args){return fetchBridge.response(...args);},
         reject(message,abort){return abort?new DOMException(message,'AbortError'):new TypeError(message);}
     };

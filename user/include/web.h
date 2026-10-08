@@ -79,6 +79,10 @@ struct web_host {
     void (*cancel)(void *opaque, uint64_t id);
     bool (*sync_load)(void *opaque, const char *url, int kind, struct web_response *response);
     void (*navigate)(void *opaque, const char *url, const char *post);
+    /* Native form bytes are not a NUL-terminated urlencoded substitute.
+       The host must copy transient data before returning to the JS task. */
+    void (*navigate_form)(void *opaque, const char *url, const void *body,
+                          size_t length, const char *content_type, const char *target);
     void (*console)(void *opaque, int level, const char *message);
     void (*scroll)(void *opaque, int *x, int *y);
     void (*scroll_to)(void *opaque, int x, int y);
@@ -113,6 +117,9 @@ int64_t web_deadline(web_doc *d);
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *response);
 bool web_dirty(web_doc *d); /* consumes the paint/layout dirty notification */
 bool web_script_running(web_doc *d);
+/* Explicit developer-console input only. It runs in the active page realm,
+ * under the ordinary JS watchdog, and grants no native module/file access. */
+bool web_console_eval(web_doc *d, const char *source, size_t length);
 struct web_event {
     const char *type, *key;
     int x, y, button, key_code;
@@ -120,6 +127,7 @@ struct web_event {
     web_node *related_target;
     web_node *submitter; /* SubmitEvent only; NULL for implicit/no-button submit */
     int buttons;
+    bool synthetic; /* DOM .click() is not a trusted user click */
 };
 /* NULL target means window. false means preventDefault() was called. */
 bool web_dispatch(web_doc *d, web_node *target, const struct web_event *event);
@@ -161,7 +169,7 @@ void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, i
 
 /* ---- interaction ---- */
 enum { WEB_HIT_NONE, WEB_HIT_LINK, WEB_HIT_TEXT_INPUT, WEB_HIT_CHECKBOX, WEB_HIT_RADIO, WEB_HIT_SUBMIT,
-       WEB_HIT_BUTTON, WEB_HIT_SELECT, WEB_HIT_TEXTAREA, WEB_HIT_DETAILS };
+       WEB_HIT_BUTTON, WEB_HIT_SELECT, WEB_HIT_TEXTAREA, WEB_HIT_DETAILS, WEB_HIT_FILE };
 struct web_hit {
     int kind;
     const char *href; /* absolute URL of the link under the point, or NULL */
@@ -173,21 +181,43 @@ int web_anchor_y(web_doc *d, const char *fragment); /* y of the element with tha
 /* form controls */
 void web_focus(web_doc *d, web_node *n); /* NULL: nothing focused */
 web_node *web_focused(web_doc *d);
+bool web_node_inert(web_doc *d, web_node *n); /* native author/modal flat-tree inertness */
+bool web_modal_active(web_doc *d);
 const char *web_control_value(web_node *control);
 /* a key for the focused text control: 0 ignored, 1 changed (repaint), 2 Enter: submit its form */
 int web_key(web_doc *d, const struct gui_event *e);
+struct web_control_activation { web_node *control, *previous; bool checked, indeterminate, radio; };
+void web_control_activation_begin(web_doc *d, web_node *control, struct web_control_activation *activation);
+bool web_control_activation_end(web_doc *d, struct web_control_activation *activation, bool allowed);
 void web_toggle(web_doc *d, web_node *n); /* checkbox or radio click */
 web_node *web_disclosure_focus(web_node *details); /* first summary, or the native default legend host */
 bool web_reset(web_doc *d, web_node *control); /* reset button default action, with cancellable event */
 /* the request a form submission makes: *url is malloc'd; *body is malloc'd for POST, NULL for GET.
    submitter is the clicked button, or any control of the form. */
+struct web_form_request { char *url, *body, *content_type, *target; size_t body_len; };
+/* Final method=dialog branch: 0 ordinary method, 1 actually closed,
+   -1 dialog method without closure (no target, image coordinates, or no JS state).
+   Call after validation/submit cancellation; never navigate on a nonzero result. */
+int web_js_dialog_submit(web_doc *d, web_node *submitter);
+bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request *request);
+void web_submit_request_free(struct web_form_request *request);
 bool web_submit(web_doc *d, web_node *submitter, char **url, char **body);
+bool web_input_is_file(web_node *input);
+bool web_input_choose_files(web_doc *d, web_node *input);
 web_node *web_form_owner(web_doc *d, web_node *control);
 bool web_control_disabled(const web_node *control);
 bool web_form_submission_validate(web_doc *d, web_node *submitter);
 bool web_take_validation_report(web_doc *d, web_node **control, const char **message, size_t *length);
 int web_select_options(web_doc *d, web_node *sel, const char **labels, int max, int *selected);
 void web_select_set(web_doc *d, web_node *sel, int index);
+int web_datalist_options(web_doc *d, web_node *input, const char **labels, int capacity);
+bool web_datalist_choose(web_doc *d, web_node *input, int index);
+/* Native opt-in search completion; never exposed as a script history API. */
+int web_autocomplete_options(web_doc *d, web_node *input, const char **labels, int capacity);
+bool web_autocomplete_choose(web_doc *d, web_node *input, int index);
+void web_autocomplete_record(web_doc *d, web_node *submitter, const char *destination);
+void web_autocomplete_settings(void);
+web_node *web_label_activation(web_node *target);
 /* document rectangle of an element (its first box), for placing popups */
 bool web_node_rect(web_doc *d, web_node *n, int *x, int *y, int *w, int *h);
 
