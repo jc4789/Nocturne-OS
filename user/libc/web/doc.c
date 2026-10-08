@@ -1,3 +1,4 @@
+#include "form_face.h"
 /* The public API (web.h): documents and their resources (stylesheets, images, data: URLs), the
    style/box/layout pipeline, and forms. */
 #include <stdio.h>
@@ -768,6 +769,7 @@ static void free_values(node_t *n) {
     css_animation_free(n);
     web_canvas_free(n);
     web_input_files_release(n);
+    web_face_release(n);
     if (n->shadow_root) free_values(n->shadow_root);
     for (node_t *c = n->first; c; c = c->next) {
         if (c->type != N_ELEM) continue;
@@ -797,6 +799,7 @@ void web_free(web_doc *d) {
             css_animation_free(n);
             web_canvas_free(n);
             web_input_files_release(n);
+            web_face_release(n);
             free(n->value);
             free(n->input_edit);
         }
@@ -1373,9 +1376,9 @@ bool web_take_validation_report(web_doc *d, web_node **control, const char **mes
     node_t *n=d->validation_target;
     if (!n || n->owner!=d || !doc_node_connected(n) || !web_control_will_validate(n)) return false;
     const char *current=web_control_validation_message(d,n);
-    size_t size=n->custom_validity_length?n->custom_validity_length:strlen(current);
+    size_t size=web_control_validation_message_length(d,n);
     if (!size) return false;
-    if (control) *control=n;
+    if (control) *control=web_face_validation_anchor(n);
     if (message) *message=current;
     if (length) *length=size;
     return true;
@@ -1441,6 +1444,7 @@ bool doc_form_reset(web_doc *d, node_t *form) {
     if (!d || !form || form->type != N_ELEM || form->foreign || form->tag != T_form) return false;
     node_t *root = form; while (root->parent) root = root->parent;
     bool ok = reset_form_controls(d, root, form, root);
+    if (ok) web_js_face_reset(d, form);
     d->dirty = d->need_style = true;
     return ok;
 }

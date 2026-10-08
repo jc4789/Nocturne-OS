@@ -42,6 +42,7 @@ uint64_t vmm_get_pte(uint64_t pml4, uint64_t va);
 void *vmm_map_mmio(uint64_t phys, uint64_t size);
 uint64_t vmm_new_space(void);
 void vmm_free_space(uint64_t pml4);
+uint64_t vmm_user_pages(uint64_t pml4); /* present, non-shared lower-half 4K leaves */
 int vmm_user_alloc(uint64_t pml4, uint64_t va, uint64_t size, int prot);
 int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot);
 void vmm_user_free(uint64_t pml4, uint64_t va, uint64_t size);

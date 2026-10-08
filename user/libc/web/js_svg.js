@@ -1,4 +1,4 @@
-/* Common SVG DOM identity/reflection over native nodes. Not a geometry shim.
+/* Common SVG DOM identity/reflection and detached rectangle factory over native nodes.
  * Native wrappers use these private prototypes, never public constructors. */
 const svgBridge = (() => {
     const classes = new WeakMap(), animated = new WeakMap();
@@ -35,6 +35,10 @@ const svgBridge = (() => {
     }
     class SVGSVGElement extends SVGElement {
         constructor(){throw new TypeErrorImpl('Illegal SVGSVGElement constructor');}
+        createSVGRect(){
+            rawDom('get',this,'svgRootBrand');
+            return observerBridge.createSVGRect();
+        }
         getElementById(id){
             rawDom('get',this,'svgRootBrand');
             if(!arguments.length)throw new TypeErrorImpl('Missing elementId');

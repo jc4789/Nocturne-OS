@@ -147,6 +147,8 @@ typedef struct node {
        the script-visible value remains sanitized. Both buffers are budgeted. */
     char *input_edit;
     size_t input_edit_capacity;
+    bool face_associated; /* Only the private CE definition bridge sets this. */
+    struct web_face_state *internals;
     bool input_bad_input, control_user_edited;
     const char *custom_validity; /* allocation-document arena; initially empty */
     size_t custom_validity_length;
@@ -263,7 +265,7 @@ struct gradient {
 
 typedef struct style {
     uint8_t display, position, float_, clear, white_space, text_align, vertical_align, list_style,
-        list_style_inside, font_style, text_transform, text_decoration, overflow, box_sizing, visibility,
+        list_style_inside, font_style, text_transform, text_decoration, overflow, box_sizing, visibility, pointer_events,
         border_collapse, flex_direction, flex_wrap, justify_content, align_items, align_self, table_layout;
     uint8_t border_style[4];
     uint16_t font_weight;
@@ -615,6 +617,7 @@ bool css_matches(node_t *node, const char *selector, bool *valid);
 void web_js_start(web_doc *d, const struct web_host *host);
 void web_js_console(web_doc *d, int level, const char *message);
 void web_js_focus_control(web_doc *d, node_t *control);
+void web_js_face_reset(web_doc *d, node_t *form);
 node_t *web_autofocus_candidate(web_doc *d);
 void web_js_tick(web_doc *d, uint64_t now);
 void web_js_free(web_doc *d);

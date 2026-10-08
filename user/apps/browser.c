@@ -1040,6 +1040,8 @@ static void finish_navigation(void) {
     status[0] = 0;
     set_title();
     if (navigation_mode == NAV_HISTORY) web_history_event(doc, cur_url, true);
+    /* A history listener can retire SVG snapshots even after relayout. */
+    prepare_native_snapshot(false);
     redraw();
 }
 
@@ -1065,6 +1067,8 @@ static void navigate_body(const char *url_in, const void *post, size_t length, c
         if (mode == NAV_PUSH || mode == NAV_REPLACE) { if (y >= 0) scroll_to(y); else if (!strchr(url, '#') || !strchr(url, '#')[1]) scroll_to(0); }
         else if (mode == NAV_HISTORY && hpos >= 0 && !hist[hpos].manual) scroll_to(hist[hpos].y);
         web_history_event(doc, old_url, mode == NAV_HISTORY);
+        /* popstate/hashchange run author code: never paint its retired boxes. */
+        prepare_native_snapshot(false);
         redraw(); return;
     }
     stop_navigation();
@@ -1552,6 +1556,11 @@ static void page_click(web_node *target, int x, int y, bool keyboard) {
     focus = F_PAGE;
     if (!doc) return;
     if(web_control_disabled(target))return;
+    /* Author click listeners may reparent the target. Capture its first
+       native link activation now, without changing the event target. */
+    struct web_hit initial_action = {0};
+    web_node *anchor = web_node_action(doc,target,&initial_action) &&
+                       initial_action.kind==WEB_HIT_LINK ? initial_action.node : NULL;
     struct gui_event native = {.x = x, .y = y, .buttons = 1};
     struct web_control_activation activation;
     web_control_activation_begin(doc, target, &activation);
@@ -1562,7 +1571,11 @@ static void page_click(web_node *target, int x, int y, bool keyboard) {
     web_node *label_control = web_label_activation(target);
     if (label_control) { page_focus(label_control); page_click(label_control, x, y, keyboard); return; }
     struct web_hit hit = {0};
-    if (!web_node_action(doc, target, &hit)) return;
+    if (anchor) {
+        /* Read this same anchor's latest href after dispatch. Removal of
+           href or reparenting must not select another ancestor anchor. */
+        if (!web_node_action(doc,anchor,&hit) || hit.kind!=WEB_HIT_LINK || hit.node!=anchor) return;
+    } else if (!web_node_action(doc,target,&hit) || hit.kind==WEB_HIT_LINK) return;
     if (!keyboard && hit.kind==WEB_HIT_DETAILS) {
         struct web_hit pointer={0};
         if (!web_hit_test(doc,x,y-TB+scroll_y,&pointer) || pointer.kind!=WEB_HIT_DETAILS || pointer.node!=hit.node) return;
@@ -1888,7 +1901,7 @@ int main(int argc, char **argv) {
         if(console_startup[0]&&doc&&!loading&&!native_wait&&now>=console_due&&!web_script_running(doc)){
             console_open=true;focus=F_CONSOLE;
             if(!web_console_eval(doc,console_startup,strlen(console_startup)))console_add("error","Startup console command failed.");
-            console_startup[0]=0;need_layout=true;redraw();
+            console_startup[0]=0;need_layout=true;prepare_native_snapshot(false);redraw();
         }
         apply_pending_history();
         apply_pending_navigation();

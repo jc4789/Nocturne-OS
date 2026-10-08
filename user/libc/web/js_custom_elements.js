@@ -1,15 +1,15 @@
 /* Autonomous custom elements on Nocturne's existing native DOM wrappers.
  * Algorithms: https://html.spec.whatwg.org/multipage/custom-elements.html
  * Native shadow trees participate in upgrade/connection/adoption. Form-associated
- * definition metadata is retained so a site's own internals polyfill can run;
- * native ElementInternals and form linkage are NOT advertised. Scoped registries
+ * definition metadata connects ElementInternals to actual native ownership,
+ * validation, submission and CE form callbacks. Scoped registries
  * and customized built-ins remain explicitly unsupported.
  * Embedded in js_bootstrap.js; rawDom/document/HTMLElement/report are private. */
 const customElementsBridge = (() => {
     'use strict';
     const HTML = 'http://www.w3.org/1999/xhtml';
     const definitions = new Map(), constructors = new Map(), pending = new Map();
-    const states = new WeakMap(), scopes = [], backup = [];
+    const states = new WeakMap(), scopes = [], backup = [], faceElements=new Set();
     const constructed = Symbol('already constructed'), registryKey = {};
     const reserved = new Set(['annotation-xml','color-profile','font-face','font-face-src',
         'font-face-uri','font-face-format','font-face-name','missing-glyph']);
@@ -102,9 +102,13 @@ const customElementsBridge = (() => {
         try {
             if(d.disableShadow && get(element,'shadowRoot'))throw fail('This custom element disables shadow roots');
             s.state = 'precustomized';
+            rawDom('face',element,'metadata',d.formAssociated);
             if (Reflect.construct(d.constructor, []) !== element) throw new TypeError('Custom element constructor returned a different object');
             s.state = 'custom';
+            if(d.formAssociated){faceElements.add(element);refreshFormElement(element);}
         } catch (e) {
+            rawDom('face',element,'metadata',false);
+            faceElements.delete(element);
             s.state = 'failed'; s.definition = null; s.reactions.length = 0;
             throw e;
         } finally { d.stack.pop(); }
@@ -122,8 +126,10 @@ const customElementsBridge = (() => {
             return element;
         }
         const element = rawDom('create', null, 1, d.name, '');
+        rawDom('face',element,'metadata',d.formAssociated);
         Object.setPrototypeOf(element, prototype);
         states.set(element, {state:'custom', definition:d, reactions:[]});
+        if(d.formAssociated)faceElements.add(element);
         return element;
     }
     function create(name, options, preserveCase=false) {
@@ -216,6 +222,33 @@ const customElementsBridge = (() => {
             const current = rawDom('attrNS',token.node,token.namespace??null,token.forced);
             if (token.old !== null || current !== null) attributeChanged(token.node,token.forced,token.old,current,token.namespace??null);
         }
+        // Cloning creates a separate native tree: existing FACE ownership is
+        // unchanged. Each clone upgrade refreshes just its new FACE; any author
+        // constructor DOM mutation still takes the normal synchronous path.
+        if(token.op!=='clone'&&(token.op!=='attribute'||(!token.namespace&&['form','id','disabled'].includes(token.forced))))formRefresh();
+    }
+
+    function internalsInfo(element){
+        const s=states.get(element);
+        return s && (s.state==='custom'||s.state==='precustomized') ? s.definition : null;
+    }
+    function refreshFormElement(element){
+        const s=states.get(element);if(!s||s.state!=='custom'||!s.definition.formAssociated)return;
+        const form=rawDom('face',element,'form'),disabled=rawDom('face',element,'disabled');
+        const oldForm=s.formOwner??null,oldDisabled=s.formDisabled??false;
+        s.formOwner=form;s.formDisabled=disabled;
+        if(form!==oldForm)callback(element,'formAssociatedCallback',[form]);
+        if(disabled!==oldDisabled)callback(element,'formDisabledCallback',[disabled]);
+    }
+    function formRefresh(){
+        for(const element of faceElements)refreshFormElement(element);
+    }
+    function formReset(form){
+        reactions(()=>{
+            // The private native collector snapshots successful FACE ownership.
+            for(const element of rawDom('faceControls',form))
+                if(rawDom('face',element,'form')===form)callback(element,'formResetCallback');
+        });
     }
     class CustomElementRegistry {
         constructor(key) { if (key !== registryKey) throw new TypeError('Scoped custom element registries are not implemented'); }
@@ -299,5 +332,5 @@ const customElementsBridge = (() => {
     Object.defineProperty(globalThis, 'customElements', {get() { return registry; },enumerable:true,configurable:true});
     Object.defineProperty(globalThis, 'CustomElementRegistry', {value:CustomElementRegistry,writable:true,configurable:true});
     function allowShadow(element){const d=definitions.get(get(element,'localName'));return !d || !d.disableShadow;}
-    return {construct,create,reactions,inserted,removed,attributeChanged,upgradeTree,before,after,allowShadow};
+    return {construct,create,reactions,inserted,removed,attributeChanged,upgradeTree,before,after,allowShadow,internalsInfo,formRefresh,formReset};
 })();

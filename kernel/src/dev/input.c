@@ -2,6 +2,9 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "dev/input.h"
+#include "limine.h"
+
+extern volatile struct limine_rsdp_request rsdp_req;
 
 static key_sink_t key_sink;
 static mouse_sink_t mouse_sink;
@@ -151,12 +154,28 @@ static int mouse_cmd(uint8_t c) {
     return inb(0x60);
 }
 
+/* WHPX can expose Microsoft Hv CPUID while QEMU still owns the i8042.
+   Identify its firmware before applying an actual Hyper-V device quirk.
+   Limine has already supplied this mapped response before input_init. */
+static bool qemu_ps2_firmware(void) {
+    if (!rsdp_req.response || !rsdp_req.response->address) return false;
+    const uint8_t *rsdp = rsdp_req.response->address;
+    if ((uint64_t)rsdp < hhdm_offset) rsdp = phys_to_virt((uint64_t)rsdp);
+    if (memcmp(rsdp, "RSD PTR ", 8)) return false;
+    uint8_t sum = 0;
+    for (unsigned i = 0; i < 20; i++) sum += rsdp[i];
+    if (sum || memcmp(rsdp + 9, "BOCHS ", 6)) return false;
+    kprintf("input: QEMU/Bochs PS/2 firmware; normal Y axis\n");
+    return true;
+}
+
 /* Hyper-V on Windows 11 hosts reports the emulated PS/2 mouse's Y axis upside down (a known
    regression that also hits Windows XP and Haiku guests). Detect it from the hypervisor's CPUID
    signature and host build; "mouse_y=normal" or "mouse_y=invert" on the command line overrides. */
 static bool detect_flip_y(void) {
     if (cmdline_has("mouse_y=invert")) return true;
     if (cmdline_has("mouse_y=normal")) return false;
+    if (qemu_ps2_firmware()) return false;
     uint32_t a, b, c, d;
     cpuid(1, 0, &a, &b, &c, &d);
     if (!(c & (1u << 31))) return false; /* no hypervisor */

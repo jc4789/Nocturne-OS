@@ -95,5 +95,5 @@ const formValidationBridge=(() => {
         }finally{submitting.delete(this);}
     });
     Object.assign(globalThis,{ValidityState,SubmitEvent});
-    return {ValidityState,SubmitEvent};
+    return {ValidityState,SubmitEvent,validity};
 })();

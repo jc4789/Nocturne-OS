@@ -802,6 +802,8 @@ static const struct kw kw_boxsizing[] = {{"content-box", 0}, {"border-box", 1}, 
 static const struct kw kw_bg_repeat[] = {{"repeat", BR_REPEAT}, {"repeat-x", BR_REPEAT_X}, {"repeat-y", BR_REPEAT_Y},
                                          {"no-repeat", BR_NO_REPEAT}, {"space", BR_REPEAT}, {"round", BR_REPEAT},
                                          {0}};
+/* HTML hit testing supports auto/none; SVG painted/geometry keywords remain unsupported. */
+static const struct kw kw_pointer_events[] = {{"auto", 0}, {"none", 1}, {0}};
 static const struct kw kw_visibility[] = {{"visible", 0}, {"hidden", 1}, {"collapse", 1}, {0}};
 static const struct kw kw_bcollapse[] = {{"separate", 0}, {"collapse", 1}, {0}};
 static const struct kw kw_fdir[] = {{"row", FD_ROW}, {"row-reverse", FD_ROW_REVERSE}, {"column", FD_COLUMN},
@@ -956,6 +958,7 @@ static struct propdef props[] = {
     SH("place-content", SH_PLACE_CONTENT),
     SH("place-items", SH_PLACE_ITEMS),
     SH("place-self", SH_PLACE_SELF),
+    {"pointer-events", PT_KW, 0, true, O(pointer_events), kw_pointer_events, 0},
     {"position", PT_KW, 0, false, O(position), kw_position, 0},
     {"right", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[1]), NULL, 0},
     {"row-gap", PT_PX, LF_NOPCT, false, O(gap_row), kw_normal0, 0},

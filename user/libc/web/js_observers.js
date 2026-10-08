@@ -2,16 +2,49 @@
    there is no always-visible result and no synthetic periodic resize event. */
 const observerBridge=(()=>{
     const roSlots=new WeakMap(),ioSlots=new WeakMap(),resize=new Set(),intersections=new Set();
-    const rectSlots=new WeakMap();
-    class DOMRectReadOnly {
-        constructor(x=0,y=0,width=0,height=0){rectSlots.set(this,[Number(x),Number(y),Number(width),Number(height)]);}
-        static fromRect(r={}){return new DOMRectReadOnly(r.x,r.y,r.width,r.height);}
-        get x(){return rectSlots.get(this)[0];}get y(){return rectSlots.get(this)[1];}
-        get width(){return rectSlots.get(this)[2];}get height(){return rectSlots.get(this)[3];}
-        get top(){return Math.min(this.y,this.y+this.height);}get bottom(){return Math.max(this.y,this.y+this.height);}
-        get left(){return Math.min(this.x,this.x+this.width);}get right(){return Math.max(this.x,this.x+this.width);}
-        toJSON(){return {x:this.x,y:this.y,width:this.width,height:this.height,top:this.top,right:this.right,bottom:this.bottom,left:this.left};}
+    const rectSlots=new WeakMap(),mutableRects=new WeakSet();
+    const rectGet=WeakMap.prototype.get, rectSet=WeakMap.prototype.set, rectApply=Reflect.apply;
+    const rectHas=WeakSet.prototype.has,rectAdd=WeakSet.prototype.add;
+    const rectTypeError=TypeError, rectDefine=Object.defineProperty, rectMin=Math.min, rectMax=Math.max;
+    function rectRecord(value){
+        const r=rectApply(rectGet,rectSlots,[value]);
+        if(!r)throw new rectTypeError('Illegal DOMRect receiver');
+        return r;
     }
+    function mutableRect(value){
+        if(!rectApply(rectHas,mutableRects,[value]))throw new rectTypeError('Illegal mutable DOMRect receiver');
+        return rectRecord(value);
+    }
+    function rectDictionary(value){
+        if(value===undefined || value===null)value={};
+        if(typeof value!=='object' && typeof value!=='function')throw new rectTypeError('Expected DOMRectInit dictionary');
+        const member=key=>{const v=value[key];return v===undefined?0:+v;};
+        // Web IDL dictionary members are converted in lexicographic order.
+        const height=member('height'),width=member('width'),x=member('x'),y=member('y');
+        return [x,y,width,height];
+    }
+    class DOMRectReadOnly {
+        constructor(x=0,y=0,width=0,height=0){rectApply(rectSet,rectSlots,[this,[+x,+y,+width,+height]]);}
+        static fromRect(r={}){return new DOMRectReadOnly(...rectDictionary(r));}
+        get x(){return rectRecord(this)[0];}get y(){return rectRecord(this)[1];}
+        get width(){return rectRecord(this)[2];}get height(){return rectRecord(this)[3];}
+        get top(){const r=rectRecord(this);return rectMin(r[1],r[1]+r[3]);}
+        get bottom(){const r=rectRecord(this);return rectMax(r[1],r[1]+r[3]);}
+        get left(){const r=rectRecord(this);return rectMin(r[0],r[0]+r[2]);}
+        get right(){const r=rectRecord(this);return rectMax(r[0],r[0]+r[2]);}
+        toJSON(){const [x,y,width,height]=rectRecord(this);return {x,y,width,height,
+            top:rectMin(y,y+height),right:rectMax(x,x+width),bottom:rectMax(y,y+height),left:rectMin(x,x+width)};}
+    }
+    class DOMRect extends DOMRectReadOnly {
+        constructor(x=0,y=0,width=0,height=0){super(x,y,width,height);rectApply(rectAdd,mutableRects,[this]);}
+        static fromRect(r={}){return new DOMRect(...rectDictionary(r));}
+        get x(){return mutableRect(this)[0];}set x(value){mutableRect(this)[0]=+value;}
+        get y(){return mutableRect(this)[1];}set y(value){mutableRect(this)[1]=+value;}
+        get width(){return mutableRect(this)[2];}set width(value){mutableRect(this)[2]=+value;}
+        get height(){return mutableRect(this)[3];}set height(value){mutableRect(this)[3]=+value;}
+    }
+    for(const [C,name] of [[DOMRectReadOnly,'DOMRectReadOnly'],[DOMRect,'DOMRect']])
+        rectDefine(C.prototype,Symbol.toStringTag,{configurable:true,value:name});
     const rect=a=>new DOMRectReadOnly(...a);
     function readonly(object,values){for(const key of Object.keys(values))Object.defineProperty(object,key,{enumerable:true,value:values[key]});return object;}
     function slot(map,value){const s=map.get(value);if(!s)throw new TypeError('Illegal observer receiver');return s;}
@@ -113,6 +146,6 @@ const observerBridge=(()=>{
             },0);}
         }
     }
-    Object.assign(globalThis,{DOMRectReadOnly,ResizeObserver,ResizeObserverEntry,ResizeObserverSize,IntersectionObserver,IntersectionObserverEntry});
-    return {frame(){resizeFrame();intersectionFrame();}};
+    Object.assign(globalThis,{DOMRectReadOnly,DOMRect,SVGRect:DOMRect,ResizeObserver,ResizeObserverEntry,ResizeObserverSize,IntersectionObserver,IntersectionObserverEntry});
+    return {createSVGRect(){return new DOMRect();},frame(){resizeFrame();intersectionFrame();}};
 })();

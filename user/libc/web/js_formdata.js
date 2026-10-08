@@ -166,5 +166,21 @@ const formDataBridge = (() => {
         if(offset!==total)throw new TypeErr('Multipart byte count mismatch');
         return {bytes:apply(buffer,bytes,[]),type:'multipart/form-data; boundary='+boundary};
     }
-    return {brand:value=>apply(get,slots,[value])!==undefined,multipart};
+
+    function faceValue(value){
+        if(value===null)return null;
+        const source=apply(get,slots,[value]),single=source===undefined,out=list();
+        function add(name,v){
+            const p=list();p[0]=name;
+            let filename,modified,file=false;
+            if(blobBrand(v))try{filename=apply(fileName,v,[]);modified=apply(fileModified,v,[]);file=true;}catch(_){}
+            if(file){
+                p[1]=blobBytes(v);p[2]=filename;p[3]=blobType(v);p[4]=modified;
+            }else{p[1]=scalar(v);p[2]=null;p[3]='';p[4]=0;}
+            out[out.length]=p;
+        }
+        if(single)add('',value);else for(let i=0;i<source.length;i++)add(source[i].name,source[i].value);
+        const packet=list();packet[0]=single;packet[1]=out;return packet;
+    }
+    return {brand:value=>apply(get,slots,[value])!==undefined,multipart,faceValue};
 })();

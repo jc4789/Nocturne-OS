@@ -167,12 +167,29 @@ image_t *image_scale(const image_t *s, int w, int h) {
 }
 
 void image_draw(canvas_t *c, const image_t *img, int x, int y) {
-    int y0 = y < c->cy0 ? c->cy0 : y, y1 = y + img->h > c->cy1 ? c->cy1 : y + img->h;
-    int x0 = x < c->cx0 ? c->cx0 : x, x1 = x + img->w > c->cx1 ? c->cx1 : x + img->w;
-    for (int py = y0; py < y1; py++) {
-        const uint32_t *src = img->px + (size_t)(py - y) * img->w - x;
-        uint32_t *dst = c->px + (size_t)py * c->pitch;
-        for (int px = x0; px < x1; px++) {
+    if (!c || !img || !c->px || !img->px || c->w <= 0 || c->h <= 0 || c->pitch < c->w ||
+        img->w <= 0 || img->h <= 0 || (uint64_t)img->w * img->h > IMAGE_MAX_PIXELS ||
+        (uint64_t)c->h * c->pitch > SIZE_MAX / sizeof *c->px) return;
+
+    /* Clip in wide coordinates before forming any pointer. The row starts at
+       the first visible source pixel, never at an out-of-object -x bias. */
+    int64_t x0 = x, y0 = y, x1 = (int64_t)x + img->w, y1 = (int64_t)y + img->h;
+    if (x0 < c->cx0) x0 = c->cx0;
+    if (y0 < c->cy0) y0 = c->cy0;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > c->cx1) x1 = c->cx1;
+    if (y1 > c->cy1) y1 = c->cy1;
+    if (x1 > c->w) x1 = c->w;
+    if (y1 > c->h) y1 = c->h;
+    if (x1 <= x0 || y1 <= y0) return;
+
+    int width = (int)(x1 - x0);
+    size_t sx = (size_t)(x0 - (int64_t)x);
+    for (int py = (int)y0; py < (int)y1; py++) {
+        const uint32_t *src = img->px + (size_t)((int64_t)py - y) * img->w + sx;
+        uint32_t *dst = c->px + (size_t)py * c->pitch + (size_t)x0;
+        for (int px = 0; px < width; px++) {
             uint32_t p = src[px], a = p >> 24;
             if (a == 255) dst[px] = p;
             else if (a) dst[px] = gfx_mix(dst[px], p, (int)a);

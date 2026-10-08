@@ -1,3 +1,4 @@
+#include "form_face.h"
 /* QuickJS browser host. Nocturne DOM nodes are the only native objects exposed
    to scripts; there is deliberately no filesystem, process or native module API. */
 #include <stdio.h>
@@ -1227,6 +1228,16 @@ static JSValue custom_element_hook(struct web_js_state *s, const char *name, int
     JS_FreeValue(s->ctx, fn);
     return result;
 }
+
+void web_js_face_reset(web_doc *d, node_t *form) {
+    web_doc *live=d->dom_family?d->dom_family:d;
+    struct web_js_state *s=live?live->js:NULL;
+    if(!s||s->disabled)return;
+    begin_task(s);JSValue arg=wrap(s,form),result=custom_element_hook(s,"customFormReset",1,&arg);
+    if(JS_IsException(result))exception(s);else JS_FreeValue(s->ctx,result);
+    JS_FreeValue(s->ctx,arg);end_task(s);
+}
+
 static JSValue attribute_native_changed(struct web_js_state *s, node_t *n, const char *name, bool old_present) {
     JSContext *ctx = s->ctx;
     const char *value = node_attr(n, name);
@@ -1299,6 +1310,124 @@ static JSValue files_dom(struct web_js_state *s, node_t *n, int argc, JSValueCon
     return ok ? JS_UNDEFINED : JS_ThrowRangeError(ctx,"File selection exceeds the native byte quota or metadata bounds");
 }
 
+/* Packets come only from the private FormData/Blob brands; all exported
+   bytes are copied into native node ownership before the JS call returns. */
+static bool face_copy_string(JSContext *ctx, JSValueConst value, char **copy,
+                             size_t *length, struct web_face_value *v) {
+    size_t size=0; const char *text=JS_ToCStringLen(ctx,&size,value);
+    if(!text)return false;
+    if(v->allocation>=WEB_FACE_BYTES || size>=WEB_FACE_BYTES-v->allocation){
+        JS_FreeCString(ctx,text);JS_ThrowRangeError(ctx,"FACE value exceeds native byte quota");return false;
+    }
+    char *bytes=malloc(size+1);
+    if(!bytes){JS_FreeCString(ctx,text);oom(ctx);return false;}
+    memcpy(bytes,text,size);bytes[size]=0;JS_FreeCString(ctx,text);
+    *copy=bytes;if(length)*length=size;v->allocation+=size+1;return true;
+}
+static bool face_packet(JSContext *ctx, JSValueConst packet, struct web_face_value **out) {
+    *out=NULL;if(JS_IsNull(packet))return true;
+    JSValue single=JS_GetPropertyUint32(ctx,packet,0),entries=JS_GetPropertyUint32(ctx,packet,1);
+    int boolean=JS_IsException(single)?-1:JS_ToBool(ctx,single);
+    JSValue length=JS_GetPropertyStr(ctx,entries,"length");uint32_t count=0;
+    bool ok=boolean>=0&&!JS_IsException(entries)&&!JS_IsException(length)&&JS_ToUint32(ctx,&count,length)>=0;
+    JS_FreeValue(ctx,single);JS_FreeValue(ctx,length);
+    if(ok&&(count>WEB_FACE_ENTRIES||(boolean&&count!=1))){JS_ThrowRangeError(ctx,"FACE entry limit exceeded");ok=false;}
+    struct web_face_value *v=ok?web_face_value_create(boolean!=0):NULL;
+    if(ok&&!v){oom(ctx);ok=false;}
+    for(uint32_t i=0;ok&&i<count;i++){
+        JSValue entry=JS_GetPropertyUint32(ctx,entries,i),fields[5];
+        for(unsigned j=0;j<5;j++)fields[j]=JS_GetPropertyUint32(ctx,entry,j);
+        struct web_face_entry *e=&v->entries[i];v->count=i+1;
+        for(unsigned j=0;j<5;j++)if(JS_IsException(fields[j]))ok=false;
+        if(ok)ok=face_copy_string(ctx,fields[0],&e->name,&e->name_length,v);
+        e->file=!JS_IsNull(fields[2]);
+        if(ok&&e->file){
+            size_t size=0;unsigned char *bytes=JS_GetArrayBuffer(ctx,&size,fields[1]);
+            if(!bytes&&size){ok=false;}
+            else if(size>WEB_FACE_BYTES-v->allocation){JS_ThrowRangeError(ctx,"FACE file exceeds native byte quota");ok=false;}
+            else {
+                e->bytes=malloc(size?size:1);
+                if(!e->bytes){oom(ctx);ok=false;}
+                else {if(size)memcpy(e->bytes,bytes,size);e->size=size;v->allocation+=size?size:1;}
+            }
+            if(ok)ok=face_copy_string(ctx,fields[2],&e->filename,&e->filename_length,v);
+            if(ok)ok=face_copy_string(ctx,fields[3],&e->mime,NULL,v);
+            if(ok)ok=JS_ToInt64(ctx,&e->last_modified,fields[4])>=0;
+        }else if(ok){
+            char *text=NULL;ok=face_copy_string(ctx,fields[1],&text,&e->size,v);e->bytes=(unsigned char*)text;
+        }
+        for(unsigned j=0;j<5;j++)JS_FreeValue(ctx,fields[j]);JS_FreeValue(ctx,entry);
+    }
+    JS_FreeValue(ctx,entries);
+    if(!ok){web_face_value_free(v);return false;}*out=v;return true;
+}
+static node_t *face_tree_next(node_t *root,node_t *n){
+    if(n->first&&!(n->type==N_ELEM&&!n->foreign&&n->tag==T_template))return n->first;
+    while(n!=root&&!n->next)n=n->parent;
+    return n==root?NULL:n->next;
+}
+static JSValue face_controls_dom(struct web_js_state *s,node_t *root,int argc,JSValueConst *argv,bool listed){
+    JSContext *ctx=s->ctx;node_t *form=listed&&argc>2?unwrap(ctx,argv[2]):NULL;
+    if(!root||(listed&&(!form||form->type!=N_ELEM||form->foreign||form->tag!=T_form)))return JS_ThrowTypeError(ctx,"Native form receiver required");
+    if(!listed&&root->type==N_ELEM&&!root->foreign&&root->tag==T_form)root=doc_node_root(root,false);
+    JSValue array=JS_NewArray(ctx);uint32_t index=0;
+    for(node_t *p=root;!JS_IsException(array)&&p;p=face_tree_next(root,p)){
+        if(p->type!=N_ELEM||p->foreign)continue;
+        bool include=p->face_associated;
+        if(listed)include=include||p->tag==T_button||p->tag==T_fieldset||p->tag==T_object||p->tag==T_output||p->tag==T_select||p->tag==T_textarea||
+            (p->tag==T_input&&web_input_type(p)!=WEB_INPUT_IMAGE);
+        if(include&&(!listed||web_form_owner(form->owner, p)==form)&&JS_SetPropertyUint32(ctx,array,index++,wrap(s,p))<0){JS_FreeValue(ctx,array);array=JS_EXCEPTION;}
+    }
+    return array;
+}
+static JSValue face_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst *argv){
+    JSContext *ctx=s->ctx;web_doc *d=n&&n->owner?n->owner:s->doc;
+    if(!n||n->type!=N_ELEM||n->foreign||argc<3)return JS_ThrowTypeError(ctx,"Native HTMLElement receiver required");
+    const char *op=JS_ToCString(ctx,argv[2]);if(!op)return JS_EXCEPTION;
+    JSValue result=JS_UNDEFINED;
+    if(!strcmp(op,"metadata")){
+        int associated=argc>3?JS_ToBool(ctx,argv[3]):-1;
+        if(associated<0)result=JS_EXCEPTION;
+        else if(!web_face_prepare(d,n,associated!=0))result=JS_ThrowRangeError(ctx,"Native internals quota exceeded");
+    }else if(!strcmp(op,"associated"))result=JS_NewBool(ctx,n->face_associated);
+    else if(!n->internals)result=JS_ThrowTypeError(ctx,"Custom element definition metadata required");
+    else if(!strcmp(op,"attach")){
+        if(n->internals->attached)result=JS_ThrowTypeError(ctx,"Internals already attached");else n->internals->attached=true;
+    }else if(!n->face_associated)result=JS_ThrowTypeError(ctx,"Form-associated custom element required");
+    else if(!strcmp(op,"form"))result=wrap(s,web_form_owner(d,n));
+    else if(!strcmp(op,"message"))result=JS_NewStringLen(ctx,n->internals->message?n->internals->message:"",n->internals->message_length);
+    else if(!strcmp(op,"disabled"))result=JS_NewBool(ctx,web_control_disabled(n));
+    else if(!strcmp(op,"labels")){
+        result=JS_NewArray(ctx);uint32_t index=0;node_t *root=doc_node_root(n,false);
+        for(node_t *p=root;!JS_IsException(result)&&p;p=face_tree_next(root,p))
+            if(web_label_control(p)==n&&JS_SetPropertyUint32(ctx,result,index++,wrap(s,p))<0){JS_FreeValue(ctx,result);result=JS_EXCEPTION;}
+    }else if(!strcmp(op,"validity")){
+        uint32_t bits=0;size_t length=0;const char *message=NULL;
+        node_t *anchor=argc>5&&!JS_IsUndefined(argv[5])?unwrap(ctx,argv[5]):n;
+        /* WebIDL HTMLElement conversion precedes the method body. In contrast,
+           HTML setValidity steps 6-8 commit flags/message before step 10's
+           NotFoundError; do not invent atomic rollback for a real HTMLElement. */
+        if(!anchor||anchor->type!=N_ELEM||anchor->foreign)result=JS_ThrowTypeError(ctx,"HTMLElement validation anchor required");
+        else if(argc<5||JS_ToUint32(ctx,&bits,argv[3])<0)result=JS_EXCEPTION;
+        else if(!(message=JS_ToCStringLen(ctx,&length,argv[4])))result=JS_EXCEPTION;
+        else if((bits&1023u)&&!length)result=JS_ThrowTypeError(ctx,"Invalid flags require a nonempty message");
+        else if(!web_face_set_validity(d,n,bits,message,length))result=JS_ThrowRangeError(ctx,"Native validity quota exceeded");
+        else {
+            node_t *p=anchor;while(p&&p!=n)p=p->parent?p->parent:p->shadow_host;
+            if(p!=n)result=JS_NewInt32(ctx,2);else n->internals->anchor=anchor;
+        }
+        JS_FreeCString(ctx,message);
+    }else if(!strcmp(op,"value")){
+        struct web_face_value *value=NULL,*state=NULL;bool shared=argc<5;
+        bool ok=argc>3&&face_packet(ctx,argv[3],&value);
+        if(ok){if(shared)state=value;else ok=face_packet(ctx,argv[4],&state);}
+        if(!ok)result=JS_EXCEPTION;
+        else if(!web_face_set_value(d,n,value,state))result=JS_ThrowRangeError(ctx,"Native form value quota exceeded");
+        web_face_value_free(value);if(!shared)web_face_value_free(state);
+    }else result=JS_ThrowTypeError(ctx,"Unknown native internals operation");
+    JS_FreeCString(ctx,op);return result;
+}
+
 static JSValue validation_dom(struct web_js_state *s, node_t *n, int argc, JSValueConst *argv) {
     JSContext *ctx=s->ctx; web_doc *d=n->owner?n->owner:s->doc;
     if (argc < 3) return JS_ThrowTypeError(ctx,"Validation operation required");
@@ -1314,7 +1443,7 @@ static JSValue validation_dom(struct web_js_state *s, node_t *n, int argc, JSVal
     else if (!strcmp(op,"will")) result=JS_NewBool(ctx,web_control_will_validate(n));
     else if (!strcmp(op,"message")) {
         const char *message=web_control_validation_message(d,n);
-        size_t length=web_control_will_validate(n)&&n->custom_validity_length?n->custom_validity_length:strlen(message);
+        size_t length=web_control_validation_message_length(d,n);
         result=JS_NewStringLen(ctx,message,length);
     }
     else if (!strcmp(op,"check") || !strcmp(op,"report")) result=JS_NewBool(ctx,web_control_check_validity(d,n,!strcmp(op,"report")));
@@ -1495,6 +1624,34 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             }
             JS_FreeCString(ctx, name); JS_FreeCString(ctx, text);
         }
+    } else if (!strcmp(op, "elementFromPoint")) {
+        double x, y;
+        if (!n || (n->type != N_DOC && !(n->type == N_FRAGMENT && n->shadow_host)))
+            result = JS_ThrowTypeError(ctx, "Document or ShadowRoot receiver required");
+        else if (argc < 4) result = JS_ThrowTypeError(ctx, "Two coordinates required");
+        else if (JS_ToFloat64(ctx, &x, argv[2]) || JS_ToFloat64(ctx, &y, argv[3]))
+            result = JS_EXCEPTION;
+        else if (d != s->doc || d->inert || !isfinite(x) || !isfinite(y) ||
+                 x < 0 || y < 0 || x >= d->width || y >= d->height) result = JS_NULL;
+        else {
+            flush_layout(s);
+            int64_t px = (int64_t)x + d->view_x, py = (int64_t)y + d->view_y;
+            node_t *hit = px < INT32_MIN || px > INT32_MAX || py < INT32_MIN || py > INT32_MAX ? NULL :
+                          web_node_at(d, (int)px, (int)py);
+            if (hit && hit->type != N_ELEM) hit = hit->parent;
+            /* Return the host at each shadow boundary outside this scope,
+               never expose a closed root through a Document query. */
+            while (hit) {
+                node_t *scope = doc_node_root(hit, false);
+                if (!scope || !scope->shadow_host) break; /* slotted light DOM */
+                bool within = false;
+                for (node_t *ancestor = n; ancestor; ancestor = doc_shadow_parent(ancestor))
+                    if (ancestor == scope) { within = true; break; }
+                if (within) break;
+                hit = scope->shadow_host;
+            }
+            result = wrap(s, hit);
+        }
     } else if (!strcmp(op, "viewport")) { int32_t axis = 0; if (argc > 2) JS_ToInt32(ctx, &axis, argv[2]); result = JS_NewInt32(ctx, axis ? d->height : d->width); }
     else if (!strcmp(op, "focus") || !strcmp(op, "blur")) {
         node_t *old = d->focus;
@@ -1622,6 +1779,8 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     else if (!strcmp(op, "selection")) result = control_selection_dom(s, n, argc, argv);
     else if (!strcmp(op, "filesSet")) result = files_dom(s, n, argc, argv);
     else if (!strcmp(op, "formValue")) result = form_value_dom(s, n, argc, argv);
+    else if (!strcmp(op, "face")) result = face_dom(s, n, argc, argv);
+    else if (!strcmp(op, "faceControls") || !strcmp(op, "formControls")) result = face_controls_dom(s,n,argc,argv,!strcmp(op,"formControls"));
     else if (!strcmp(op, "validation")) result = validation_dom(s, n, argc, argv);
     else if (!strcmp(op,"observerGeometry")) {
         node_t *root=argc>2 && !JS_IsNull(argv[2])?unwrap(ctx,argv[2]):NULL;
@@ -2091,6 +2250,26 @@ static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, 
     else if (s->host.navigate) s->host.navigate(s->host.opaque, url, NULL);
     return JS_UNDEFINED;
 }
+/* Capture the native activation path before author listeners can reparent
+   the clicked descendant. The event target itself remains the clicked node. */
+static node_t *native_click_anchor(web_doc *d, node_t *target) {
+    /* Preserve direct A.click(), including its existing detached-node path. */
+    if (target->tag == T_a) return target;
+    struct web_hit action = {0};
+    if (!web_node_action(d, target, &action) || action.kind != WEB_HIT_LINK) return NULL;
+    for (node_t *n = target; n; n = doc_flat_parent(n)) {
+        if (n == action.node) return n;
+        if (n->type != N_ELEM || n->foreign) continue;
+        /* A hidden/unlaid-out control has no hit box, but must not let a
+           descendant's synthetic activation escape into an outer anchor. */
+        if (n->tag == T_input || n->tag == T_button || n->tag == T_select ||
+            n->tag == T_textarea || n->tag == T_label || n->tag == T_summary ||
+            n->tag == T_iframe || n->tag == T_embed ||
+            ((n->tag == T_audio || n->tag == T_video) && node_attr(n, "controls")) ||
+            ((n->tag == T_img || n->tag == T_object) && node_attr(n, "usemap"))) return NULL;
+    }
+    return NULL;
+}
 static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); node_t *n = argc ? unwrap(ctx, argv[0]) : NULL;
@@ -2101,6 +2280,7 @@ static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc
         JS_FreeValue(ctx, args[1]); return value;
     }
     if (web_control_disabled(n)) return JS_UNDEFINED;
+    node_t *anchor = native_click_anchor(s->doc, n);
     struct web_event e = {.type="click", .bubbles=true, .cancelable=true, .synthetic=true};
     struct web_control_activation activation;
     web_control_activation_begin(s->doc, n, &activation);
@@ -2119,8 +2299,8 @@ static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc
     node_t *disclosure=doc_details_activation(n);
     if (disclosure) doc_details_toggle(s->doc,disclosure);
     else if (n->tag == T_audio || n->tag == T_video) web_media_activate(s->doc, n);
-    else if (n->tag == T_a) {
-        const char *href = doc_link_href(s->doc, n);
+    else if (anchor) {
+        const char *href = doc_link_href(s->doc, anchor);
         if (href && permitted_url(s, href, false) && s->host.navigate) s->host.navigate(s->host.opaque, href, NULL);
     } else if (n->tag == T_input) {
         const char *type = node_attr(n, "type");

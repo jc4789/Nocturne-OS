@@ -148,21 +148,5 @@ int proc_spawn_simple(const char *path, const char *arg1, struct task *parent) {
 
 uint64_t proc_user_pages(struct task *t) {
     if (!t->is_user || t->pml4 == kernel_pml4) return 0;
-    uint64_t n = 0;
-    uint64_t *l4 = phys_to_virt(t->pml4);
-    for (int a = 0; a < 256; a++) {
-        if (!(l4[a] & PTE_P)) continue;
-        uint64_t *l3 = phys_to_virt(l4[a] & PTE_ADDR);
-        for (int b = 0; b < 512; b++) {
-            if (!(l3[b] & PTE_P)) continue;
-            uint64_t *l2 = phys_to_virt(l3[b] & PTE_ADDR);
-            for (int c = 0; c < 512; c++) {
-                if (!(l2[c] & PTE_P)) continue;
-                uint64_t *l1 = phys_to_virt(l2[c] & PTE_ADDR);
-                for (int d = 0; d < 512; d++)
-                    if ((l1[d] & PTE_P) && !(l1[d] & PTE_SHARED)) n++;
-            }
-        }
-    }
-    return n;
+    return vmm_user_pages(t->pml4);
 }

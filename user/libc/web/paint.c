@@ -857,6 +857,12 @@ static int control_hit(box_t *b) {
     return WEB_HIT_NONE;
 }
 
+/* Test each painted box/run, never prune a none subtree: descendants may
+   explicitly restore auto, including inside flattened slots and pseudos. */
+static bool hit_style(const style_t *st) {
+    return st && !st->visibility && !st->pointer_events;
+}
+
 static void set_hit(struct pctx *P, int kind, node_t *n, node_t *link) {
     if (n) P->target = n;
     P->hit_any = true;
@@ -927,7 +933,7 @@ static void paint_runs(struct pctx *P, box_t *b) {
         const style_t *st = d->st;
         if (st->visibility) continue;
         if (P->mode == M_HIT) {
-            if (d->node && inside(P, bx + d->x, by + d->y, d->w, d->h)) P->target = d->node;
+            if (hit_style(st) && d->node && inside(P, bx + d->x, by + d->y, d->w, d->h)) P->target = d->node;
             continue;
         }
         float l = d->first ? 0 : 0;
@@ -944,6 +950,7 @@ static void paint_runs(struct pctx *P, box_t *b) {
         if (r->atomic) {
             if (P->mode == M_HIT) {
                 box_t *a = r->atomic;
+                if (!hit_style(a->st)) continue;
                 float ax = box_abs_x(a) - a->p[3] - a->b[3], ay = cy(a) - a->p[0] - a->b[0];
                 if (inside(P, ax, ay, a->w + a->p[1] + a->p[3] + a->b[1] + a->b[3], a->h + a->p[0] + a->p[2] + a->b[0] + a->b[2]))
                     set_hit(P, control_hit(a), a->node, r->link);
@@ -951,6 +958,7 @@ static void paint_runs(struct pctx *P, box_t *b) {
             continue;
         }
         if (P->mode == M_HIT) {
+            if (!hit_style(r->st)) continue;
             wfont f = style_font(r->st);
             float asc, desc;
             wf_metrics(&f, &asc, &desc);
@@ -970,7 +978,8 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (P->mode == M_HIT && b->node && web_dialog_inert(P->d,b->node)) return;
     if (positioned(b) && !layer_root) return; /* painted with the layers */
     const style_t *st = b->st;
-    if (st->opacity <= 0.001f) return;
+    /* Transparent auto boxes still participate in hit testing. */
+    if (P->mode == M_PAINT && st->opacity <= 0.001f) return;
     pvec layers = {0};
     if (b == P->d->root_box || b == P->top_root || stacking_context(b)) {
         collect_layers(P->d, &layers, b);
@@ -985,10 +994,10 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     float bx = x - b->p[3] - b->b[3], by = y - b->p[0] - b->b[0];
     float bw = b->w + b->p[1] + b->p[3] + b->b[1] + b->b[3];
     float bh = b->h + b->p[0] + b->p[2] + b->b[0] + b->b[2];
-    if (P->mode == M_HIT && !st->visibility && b->node &&
+    if (P->mode == M_HIT && hit_style(st) && b->node &&
         b->kind != B_TEXT && inside(P, bx, by, bw, bh))
         P->target = b->node->type == N_ELEM ? b->node : doc_flat_parent(b->node);
-    if (P->mode == M_HIT && !st->visibility && b->node && !b->node->foreign &&
+    if (P->mode == M_HIT && hit_style(st) && b->node && !b->node->foreign &&
         b->kind != B_TEXT && (inside(P, bx, by, bw, bh) ||
         ((b->marker || b->marker_shape) && inside(P, bx - st->font_size * 2, by, st->font_size * 2, bh)))) {
         node_t *details = b->node->tag == T_summary ? doc_details_activation(b->node) :
@@ -1022,7 +1031,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             bool skip_bg = (P->canvas_bg_from == 1 && b->node == P->d->html && b->node) ||
                            (P->canvas_bg_from == 2 && b->node == P->d->body && b->node);
             paint_bg_border(P, st, P->ox + bx, P->oy + by, bw, bh, b->b, skip_bg, false, false);
-        } else if (P->mode == M_HIT && b->kind == B_ATOMIC && inside(P, bx, by, bw, bh)) {
+        } else if (P->mode == M_HIT && hit_style(st) && b->kind == B_ATOMIC && inside(P, bx, by, bw, bh)) {
             int k = control_hit(b);
             if (k != WEB_HIT_NONE) set_hit(P, k, b->node, NULL);
         }
@@ -1104,7 +1113,8 @@ static void walk(struct pctx *P) {
         node_t *n=web_dialog_at(P->d,i); if(!n || !n->box)continue;
         if(P->mode==M_HIT) {
             if(n!=web_dialog_top(P->d))continue;
-            memset(P->hit,0,sizeof *P->hit); P->hit_any=false; P->target=n;
+            memset(P->hit,0,sizeof *P->hit); P->hit_any=false;
+            P->target=hit_style(n->style)?n:NULL;
         }
         box_t *layers[2]={web_dialog_backdrop(P->d,n),n->box};
         for(int j=0;j<2;j++) {

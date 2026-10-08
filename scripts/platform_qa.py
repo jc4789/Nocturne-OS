@@ -116,6 +116,9 @@ def main():
     ap.add_argument('--qemu-data-dir', help='専用QEMUコピーが読み込むBIOSデータのディレクトリ')
     ap.add_argument('--key', action='append', default=[])
     ap.add_argument('--timed-key', action='append', default=[], help='秒:QEMUキー。実ページの準備後にconsole等を操作する')
+    ap.add_argument('--mouse-marker', help='serialの「接頭辞 識別番号 x y」に応じて隔離PS/2で実クリック')
+    ap.add_argument('--mouse-origin', default='0:0', help='marker座標に足す画面内原点 x:y')
+    ap.add_argument('--mouse-position-marker', help='native mousemove の「接頭辞 x y」で加速・coalescingのずれを補正')
     ap.add_argument('--scroll-pages', type=int, default=0, help='実ページをクリックしてから結果一覧を順に下へ送り画面を保存')
     ap.add_argument('--no-focus-click', action='store_true', help='既にactiveなbrowserへPgDnだけ送る。ページ中央のselect等を誤操作しない')
     ap.add_argument('--expect', action='append', default=[], help='serialに必要な文字列（複数可）')
@@ -136,6 +139,15 @@ def main():
             ap.error('時刻付きキーは実行期間内の秒:キー名です')
         timed_keys.append((int(match[1]), match[2]))
     timed_keys.sort()
+    if a.mouse_marker and not re.fullmatch('[a-zA-Z0-9_]+', a.mouse_marker):
+        ap.error('不正なマウスmarkerです')
+    if a.mouse_position_marker and not re.fullmatch('[a-zA-Z0-9_]+', a.mouse_position_marker):
+        ap.error('不正なマウス位置markerです')
+    origin = re.fullmatch(r'([0-9]{1,5}):([0-9]{1,5})', a.mouse_origin)
+    if not origin:
+        ap.error('マウス原点は x:y です')
+    mouse_origin = tuple(map(int, origin.groups()))
+    mouse_seen, mouse_actions = set(), []
     if not 0 <= a.scroll_pages <= 40:
         ap.error('スクロール回数は0から40です')
     if a.cpu_model is not None and not re.fullmatch('[a-zA-Z0-9_.,=+_-]+', a.cpu_model):
@@ -237,6 +249,58 @@ def main():
             while timed_keys and elapsed >= timed_keys[0][0]:
                 _, key = timed_keys.pop(0)
                 mon.cmd('sendkey '+key)
+            if a.mouse_marker and serial.exists():
+                log = serial.read_text(encoding='utf-8', errors='replace')
+                matches = re.findall(re.escape(a.mouse_marker)+r' ([0-9]+) ([0-9]+) ([0-9]+)', log)
+                for ident, x, y in matches:
+                    if ident in mouse_seen:
+                        continue
+                    mouse_seen.add(ident)
+                    sx, sy = int(x)+mouse_origin[0], int(y)+mouse_origin[1]
+                    if not 0 <= sx < 16384 or not 0 <= sy < 16384:
+                        raise ValueError('実マウスの画面座標が範囲外です')
+                    # Clamp at the corner, then use <=5 deltas to avoid the
+                    # compositor's relative-pointer acceleration. One monitor
+                    # owns all input and screenshots; no second HMP connection.
+                    for _ in range(82):
+                        mon.cmd('mouse_move -100 -100')
+                        time.sleep(.02)
+                    xx = yy = 0
+                    while xx < sx or yy < sy:
+                        dx, dy = min(5, sx-xx), min(5, sy-yy)
+                        mon.cmd(f'mouse_move {dx} {dy}')
+                        xx += dx; yy += dy
+                        time.sleep(.02)
+                    time.sleep(.3)
+                    if a.mouse_position_marker:
+                        pattern = re.escape(a.mouse_position_marker)+r' (-?[0-9]+) (-?[0-9]+)'
+                        for correction in range(40):
+                            positions = re.findall(pattern, serial.read_text(encoding='utf-8', errors='replace'))
+                            if not positions:
+                                raise RuntimeError('native mousemove の座標を受信できません')
+                            px, py = map(int, positions[-1])
+                            dx, dy = int(x)-px, int(y)-py
+                            if abs(dx) <= 1 and abs(dy) <= 1:
+                                break
+                            dx, dy = max(-5, min(5, dx)), max(-5, min(5, dy))
+                            mon.cmd(f'mouse_move {dx} {dy}')
+                            end = min(start+a.seconds, time.monotonic()+2)
+                            while time.monotonic() < end:
+                                time.sleep(.05)
+                                after = re.findall(pattern, serial.read_text(encoding='utf-8', errors='replace'))
+                                if len(after) > len(positions):
+                                    break
+                            else:
+                                raise RuntimeError('native mousemove の応答がありません')
+                        else:
+                            raise RuntimeError('native mousemove の有限補正が一致しません')
+                    shot(mon, 'mouse-'+ident)
+                    mon.cmd('mouse_button 1')
+                    time.sleep(.1)
+                    mon.cmd('mouse_button 0')
+                    mouse_actions.append({'id':ident, 'screen':[sx, sy], 'marker':[int(x), int(y)]})
+                    (here/'mouse-actions.json').write_text(json.dumps(mouse_actions, indent=2), encoding='utf-8')
+                    print('隔離PS/2クリック:', ident, sx, sy, flush=True)
             if elapsed >= next_shot:
                 shot(mon, 'screen-'+str(index))
                 index += 1

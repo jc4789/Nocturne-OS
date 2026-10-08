@@ -473,12 +473,7 @@
             collection=collectionBridge.html(()=>{
                 let root=form,parent;
                 while((parent=rawDom('get',root,'parentNode')))root=parent;
-                return rawDom('query',root,'button,fieldset,input,object,output,select,textarea',false).filter(el=>{
-                    if(rawDom('get',el,'namespaceURI')!=='http://www.w3.org/1999/xhtml')return false;
-                    const tag=rawDom('get',el,'localName');
-                    return !(tag==='input' && (reflectedAttr(el,'type')||'').toLowerCase()==='image') &&
-                        rawDom('get',el,'form:'+tag)===form;
-                });
+                return rawDom('formControls',root,form);
             });
             formCollections.set(form,collection);
         }
@@ -780,6 +775,7 @@
     /* @include js_web_legacy.js */
     /* @include js_form_controls.js */
     /* @include js_form_validation.js */
+    /* @include js_element_internals.js */
     /* @include js_semantic_elements.js */
     htmlElementsBridge.initializeDialogs(ToggleEvent);
     /* @include js_canvas_dash.js */
@@ -863,7 +859,8 @@
             return ce||mutation?{ce,mutation,op:args[0]}:null;
         },
         customElementAfter(token,result){mutationBridge.after(token.mutation);if(token.op!=='clone' || !result || rawDom('get',result,'scripting'))customElementsBridge.after(token.ce,result);},
-        customElementScan(){customElementsBridge.upgradeTree(document);},
+        customElementScan(){customElementsBridge.upgradeTree(document);customElementsBridge.formRefresh();},
+        customFormReset(form){customElementsBridge.formReset(form);},
         slotChanges(){mutationBridge.signalSlots();},
         dialogRequestClose(node){htmlElementsBridge.requestClose(node);},
         dialogSubmit(node,result){return htmlElementsBridge.submit(node,result);},

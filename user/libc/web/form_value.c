@@ -1,3 +1,4 @@
+#include "form_face.h"
 #include <math.h>
 #include <stdio.h>
 #include "nocturne.h"
@@ -659,7 +660,7 @@ void web_option_text(node_t *option, sbuf *out) { bool pending = false; option_c
 /* Form association, native suggestions and gauges share the real DOM. */
 bool web_control_labelable(const node_t *n) {
     if (!n || n->type != N_ELEM || n->foreign) return false;
-    return n->tag == T_button || n->tag == T_select || n->tag == T_textarea || n->tag == T_output ||
+    return n->face_associated || n->tag == T_button || n->tag == T_select || n->tag == T_textarea || n->tag == T_output ||
         n->tag == T_progress || n->tag == T_meter || (n->tag == T_input && web_input_type(n) != WEB_INPUT_HIDDEN);
 }
 static node_t *control_first_id(node_t *root, const char *id) {
@@ -933,6 +934,73 @@ static void submission_pair(struct form_encoding *encoding, const char *name, co
     if (body->n > (16u << 20)) encoding->failed = true;
     sb_free(&normalized_name); sb_free(&normalized_value);
 }
+/* FACE FormData entries retain lengths, including embedded NUL and file
+   bytes. No strlen is used to truncate author form values or file names. */
+static bool face_newlines(sbuf *out,const void *data,size_t length){
+    const unsigned char *bytes=data;size_t size=0;
+    for(size_t i=0;i<length;i++){
+        size+=bytes[i]=='\r'||bytes[i]=='\n'?2:1;
+        if(bytes[i]=='\r'&&i+1<length&&bytes[i+1]=='\n')i++;
+        if(size>WEB_FILE_BYTES)return false;
+    }
+    if(!submission_capacity(out,size))return false;
+    for(size_t i=0;i<length;i++){
+        if(bytes[i]=='\r'||bytes[i]=='\n'){if(bytes[i]=='\r'&&i+1<length&&bytes[i+1]=='\n')i++;sb_puts(out,"\r\n");}
+        else sb_putc(out,(char)bytes[i]);
+    }return true;
+}
+static bool face_url_safe(unsigned char c){return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='*'||c=='-'||c=='.'||c=='_'||c==' ';}
+static size_t face_encoded_size(const sbuf *text,bool name){
+    size_t size=0;for(size_t i=0;i<text->n;i++){unsigned char c=(unsigned char)text->p[i];
+        size+=name?(c=='"'||c=='\r'||c=='\n'?3:1):(face_url_safe(c)?1:3);
+    }return size;
+}
+static void face_encoded(sbuf *out,const sbuf *text,bool name){
+    static const char hex[]="0123456789ABCDEF";
+    for(size_t i=0;i<text->n;i++){unsigned char c=(unsigned char)text->p[i];
+        if(name?(c=='"'||c=='\r'||c=='\n'):!face_url_safe(c)){sb_putc(out,'%');sb_putc(out,hex[c>>4]);sb_putc(out,hex[c&15]);}
+        else sb_putc(out,!name&&c==' '?'+':(char)c);
+    }
+}
+static void submission_face(struct form_encoding *encoding,const struct web_face_entry *entry,const char *single_name){
+    if(encoding->failed)return;
+    const char *name=single_name?single_name:entry->name;size_t name_length=single_name?strlen(single_name):entry->name_length;
+    bool multipart=!strcmp(encoding->kind,"multipart/form-data"),plain=!strcmp(encoding->kind,"text/plain");
+    sbuf normal_name={0},normal_value={0};
+    const void *value=entry->file?(const void*)entry->filename:(const void*)entry->bytes;
+    size_t value_length=entry->file?entry->filename_length:entry->size;
+    if(!face_newlines(&normal_name,name,name_length)||!face_newlines(&normal_value,value,value_length))encoding->failed=true;
+    sbuf *body=&encoding->body;
+    const char *mime=entry->mime&&*entry->mime?entry->mime:"application/octet-stream";
+    size_t extra=0;
+    if(!encoding->failed){
+        if(plain)extra=normal_name.n+normal_value.n+3;
+        else if(multipart){
+            extra=2+strlen(encoding->boundary)+strlen("\r\nContent-Disposition: form-data; name=\"")+face_encoded_size(&normal_name,true)+5+2;
+            if(entry->file)extra+=strlen("; filename=\"")+face_encoded_size(&normal_value,true)+1+strlen("\r\nContent-Type: ")+strlen(mime)+entry->size;
+            else extra+=normal_value.n;
+        }else extra=(body->n?1:0)+face_encoded_size(&normal_name,false)+1+face_encoded_size(&normal_value,false);
+        if(body->n>WEB_FILE_BYTES||extra>WEB_FILE_BYTES-body->n||!submission_capacity(body,body->n+extra))encoding->failed=true;
+    }
+    if(!encoding->failed){
+        if(plain){sb_put(body,normal_name.p,normal_name.n);sb_putc(body,'=');sb_put(body,normal_value.p,normal_value.n);sb_puts(body,"\r\n");}
+        else if(multipart){
+            if(submission_contains(normal_name.p,normal_name.n,encoding->boundary)||
+                submission_contains(normal_value.p,normal_value.n,encoding->boundary)||
+                (entry->file&&submission_contains(entry->bytes,entry->size,encoding->boundary)))encoding->collision=true;
+            sb_puts(body,"--");sb_puts(body,encoding->boundary);sb_puts(body,"\r\nContent-Disposition: form-data; name=\"");face_encoded(body,&normal_name,true);
+            if(entry->file){sb_puts(body,"\"; filename=\"");face_encoded(body,&normal_value,true);sb_puts(body,"\"\r\nContent-Type: ");sb_puts(body,mime);}
+            else sb_putc(body,'"');
+            sb_puts(body,"\r\n\r\n");
+            if(entry->file)sb_put(body,(const char*)entry->bytes,entry->size);else sb_put(body,normal_value.p,normal_value.n);
+            sb_puts(body,"\r\n");
+        }else{
+            if(body->n)sb_putc(body,'&');face_encoded(body,&normal_name,false);sb_putc(body,'=');face_encoded(body,&normal_value,false);
+        }
+    }
+    sb_free(&normal_name);sb_free(&normal_value);
+}
+
 static bool dirname_applicable(node_t *n) {
     return html_tag(n, T_textarea) || (html_tag(n, T_input) && (web_input_type(n) <= WEB_INPUT_URL || web_input_type(n) == WEB_INPUT_EMAIL));
 }
@@ -943,7 +1011,11 @@ static void submission_collect(web_doc *d, node_t *form, node_t *scope, node_t *
         const char *name = node_attr(n, "name");
         if (web_form_owner(d, n) == form && !web_control_disabled(n)) {
             doc_control_init(d, n);
-            if (n->tag == T_input && web_input_type(n) == WEB_INPUT_IMAGE && n == submitter) {
+            if(n->face_associated){
+                struct web_face_value *v=n->internals?n->internals->value:NULL;
+                if(v && (!v->single || (name && *name)))for(unsigned i=0;i<v->count;i++)
+                    submission_face(encoding,&v->entries[i],v->single?name:NULL);
+            } else if (n->tag == T_input && web_input_type(n) == WEB_INPUT_IMAGE && n == submitter) {
                 sbuf coord = {0};
                 if (!submission_capacity(&coord, (name ? strlen(name) : 0) + 2)) { encoding->failed = true; return; }
                 if (name && *name) { sb_puts(&coord, name); sb_putc(&coord, '.'); } sb_putc(&coord, 'x');

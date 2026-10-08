@@ -1,3 +1,4 @@
+#include "form_face.h"
 /* HTML constraint validation. Native control state is the single source of
    truth, including GUI edits and scripting-disabled documents.
    https://html.spec.whatwg.org/multipage/form-control-infrastructure.html
@@ -60,7 +61,7 @@ static bool text_constraints(const node_t *n) {
 }
 bool web_control_validation_interface(const node_t *n) {
     if (!html_element(n)) return false;
-    return n->tag == T_input || n->tag == T_button || n->tag == T_select ||
+    return n->face_associated || n->tag == T_input || n->tag == T_button || n->tag == T_select ||
            n->tag == T_textarea || n->tag == T_fieldset || n->tag == T_object || n->tag == T_output;
 }
 bool web_control_submit_button(const node_t *n) {
@@ -81,7 +82,7 @@ bool web_control_disabled(const node_t *n) {
         return node_attr(n, "disabled") || (n->parent && n->parent->tag == T_optgroup && node_attr(n->parent, "disabled"));
     }
     if (n->tag == T_optgroup) return node_attr(n, "disabled") != NULL;
-    if (!(n->tag == T_input || n->tag == T_button || n->tag == T_select || n->tag == T_textarea || n->tag == T_fieldset)) return false;
+    if (!(n->face_associated || n->tag == T_input || n->tag == T_button || n->tag == T_select || n->tag == T_textarea || n->tag == T_fieldset)) return false;
     if (node_attr(n, "disabled")) return true;
     for (const node_t *p = n->parent; p; p = p->parent) {
         if (!html_element(p) || p->tag != T_fieldset || !node_attr(p, "disabled")) continue;
@@ -109,7 +110,7 @@ bool web_control_read_write(const node_t *n) {
 bool web_control_will_validate(const node_t *n) {
     if (!web_control_validation_interface(n) || web_control_disabled(n)) return false;
     if (n->tag == T_fieldset || n->tag == T_output || n->tag == T_object) return false;
-    if (readonly_applies(n) && node_attr(n, "readonly")) return false;
+    if ((n->face_associated || readonly_applies(n)) && node_attr(n, "readonly")) return false;
     if (n->tag == T_input) {
         enum web_input_kind type = web_input_type(n);
         if (type == WEB_INPUT_HIDDEN || type == WEB_INPUT_RESET || type == WEB_INPUT_BUTTON) return false;
@@ -426,6 +427,7 @@ static bool select_missing(web_doc *d, node_t *n) {
 }
 uint32_t web_control_validity(web_doc *d, node_t *n) {
     if (!d || !web_control_validation_interface(n)) return 0;
+    if (n->face_associated) return n->internals ? n->internals->flags : 0;
     uint32_t flags = n->custom_validity_length ? WEB_VALIDITY_CUSTOM_ERROR : 0;
     if (n->tag == T_button || n->tag == T_fieldset || n->tag == T_object || n->tag == T_output) return flags;
     doc_control_init(d, n);
@@ -491,6 +493,7 @@ bool web_control_set_custom_validity(web_doc *d, node_t *n, const char *text, si
 }
 const char *web_control_validation_message(web_doc *d, node_t *n) {
     if (!web_control_will_validate(n)) return "";
+    if (n->face_associated) return n->internals && n->internals->flags && n->internals->message ? n->internals->message : "";
     uint32_t flags = web_control_validity(d, n);
     if (flags & WEB_VALIDITY_CUSTOM_ERROR) return n->custom_validity;
     if (flags & WEB_VALIDITY_VALUE_MISSING) return "この項目を入力または選択してください。";
@@ -506,13 +509,15 @@ const char *web_control_validation_message(web_doc *d, node_t *n) {
 }
 size_t web_control_validation_message_length(web_doc *d, node_t *n) {
     const char *message = web_control_validation_message(d, n);
+    if (n->face_associated) return web_control_will_validate(n) && n->internals && n->internals->flags ? n->internals->message_length : 0;
     if (web_control_will_validate(n) && n->custom_validity_length) return n->custom_validity_length;
     return strlen(message);
 }
 static bool report_control(web_doc *d, node_t *n) {
     if (!n || d->inert || n->owner != d || !doc_node_connected(n) || !web_control_will_validate(n)) return false;
     if (!web_control_validity(d, n)) return false;
-    web_js_focus_control(d, n);
+    node_t *anchor=web_face_validation_anchor(n);
+    if (anchor->owner==d && doc_node_connected(anchor)) web_js_focus_control(d, anchor);
     /* Focus listeners can remove/adopt/disable/fix the candidate too. Nodes
        keep their allocation arena, but stale owner/UI metadata must not be
        published. A form pass may then report its next unhandled candidate. */

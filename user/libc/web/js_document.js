@@ -65,6 +65,10 @@
             return collection;
         }});
         Document.prototype.getElementById=function(id){brand(this);if(!arguments.length)throw new TypeError('Missing id');return dom('id',this,string(id));};
+        Document.prototype.elementFromPoint=function(x,y){
+            brand(this);if(arguments.length<2)throw new TypeError('Two coordinates required');
+            return rawDom('elementFromPoint',this,x,y);
+        };
         Document.prototype.getElementsByName=function(name){brand(this);if(!arguments.length)throw new TypeError('Missing name');const query='[name="'+CSS.escape(string(name))+'"]';return collectionBridge.live(()=>dom('query',this,query,false));};
         function create(receiver,name,options,foreign){
             brand(receiver);name=string(name);

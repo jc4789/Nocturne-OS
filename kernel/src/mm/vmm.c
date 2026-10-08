@@ -11,6 +11,42 @@ uint64_t pte_nx;
 
 extern char __kernel_start[], __kernel_end[], __text_start[], __rodata_start[], __data_start[];
 
+/* Fixed storage, shared by pml4 rather than copied into each task. The BSP
+ * owns all page-table mutations after sched_quiesce_space's retire ACK.
+ * Saturation is not an approximate value: untracked spaces use the old walk. */
+#define USER_PAGE_COUNTS 128
+struct user_page_count { uint64_t pml4, owned; };
+static struct user_page_count user_page_counts[USER_PAGE_COUNTS];
+
+static struct user_page_count *user_page_count_find(uint64_t pml4) {
+    for (unsigned i=0;i<USER_PAGE_COUNTS;i++)
+        if (user_page_counts[i].pml4==pml4) return &user_page_counts[i];
+    return NULL;
+}
+
+static void user_page_count_register(uint64_t pml4) {
+    for (unsigned i=0;i<USER_PAGE_COUNTS;i++) if (!user_page_counts[i].pml4) {
+        user_page_counts[i]=(struct user_page_count){pml4,0};
+        return;
+    }
+}
+
+static void user_page_count_forget(uint64_t pml4) {
+    struct user_page_count *c=user_page_count_find(pml4);
+    if (c) *c=(struct user_page_count){0};
+}
+
+static void user_page_count_change(uint64_t pml4,uint64_t va,uint64_t old,uint64_t now) {
+    if (va>=USER_TOP || pml4==kernel_pml4) return;
+    bool before=(old&PTE_P) && !(old&PTE_SHARED);
+    bool after=(now&PTE_P) && !(now&PTE_SHARED);
+    if (before==after) return;
+    struct user_page_count *c=user_page_count_find(pml4);
+    if (!c) return;
+    if (after) c->owned++;
+    else { ASSERT(c->owned); c->owned--; }
+}
+
 static inline uint64_t *tbl(uint64_t phys) { return (uint64_t *)phys_to_virt(phys & PTE_ADDR); }
 
 /* Split a 2 MiB / 1 GiB mapping into the next level down. */
@@ -61,12 +97,17 @@ bool vmm_map_page(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags) {
     if (!l2) return false;
     uint64_t *l1 = next_level(l2, (va >> 21) & 511, true, user, 2);
     if (!l1) return false;
-    l1[(va >> 12) & 511] = (pa & PTE_ADDR) | flags | PTE_P;
+    uint64_t *leaf=&l1[(va >> 12) & 511], old=*leaf;
+    *leaf = (pa & PTE_ADDR) | flags | PTE_P;
+    user_page_count_change(pml4,va,old,*leaf);
     invlpg(va);
     return true;
 }
 
 static bool map_2m(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags) {
+    /* Currently boot-only kernel mappings. A future user huge-map path must
+     * not leave a four-KiB-leaf counter active without huge-page accounting. */
+    if (va<USER_TOP) user_page_count_forget(pml4);
     uint64_t *l4 = tbl(pml4);
     uint64_t *l3 = next_level(l4, (va >> 39) & 511, true, false, 4);
     if (!l3) return false;
@@ -124,6 +165,7 @@ uint64_t vmm_unmap_page(uint64_t pml4, uint64_t va) {
     if (!p || !(*p & PTE_P) || huge) return 0;
     uint64_t old = *p;
     *p = 0;
+    user_page_count_change(pml4,va,old,0);
     invlpg(va);
     return old;
 }
@@ -218,6 +260,7 @@ uint64_t vmm_new_space(void) {
     if (!p) return 0;
     uint64_t *n = tbl(p), *k = tbl(kernel_pml4);
     for (int i = 256; i < 512; i++) n[i] = k[i];
+    user_page_count_register(p); /* fresh lower half is empty */
     return p;
 }
 
@@ -237,11 +280,37 @@ static void free_level(uint64_t phys, int level) {
 
 void vmm_free_space(uint64_t pml4) {
     sched_quiesce_space(pml4);
+    user_page_count_forget(pml4); /* ACK precedes invalidation and physical reuse */
     uint64_t *t = tbl(pml4);
     for (int i = 0; i < 256; i++) {
         if (t[i] & PTE_P) free_level(t[i] & PTE_ADDR, 3);
     }
     pmm_free(pml4);
+}
+
+/* Identical present/non-shared leaf count to proc_user_pages' former walk.
+ * No task-local TTL, guessed quota, allocation, or per-sample full scan. */
+uint64_t vmm_user_pages(uint64_t pml4) {
+    if (!pml4 || pml4==kernel_pml4) return 0;
+    struct user_page_count *c=user_page_count_find(pml4);
+    if (c) return c->owned;
+    uint64_t n = 0;
+    uint64_t *l4 = tbl(pml4);
+    for (int a = 0; a < 256; a++) {
+        if (!(l4[a] & PTE_P)) continue;
+        uint64_t *l3 = phys_to_virt(l4[a] & PTE_ADDR);
+        for (int b = 0; b < 512; b++) {
+            if (!(l3[b] & PTE_P)) continue;
+            uint64_t *l2 = phys_to_virt(l3[b] & PTE_ADDR);
+            for (int c = 0; c < 512; c++) {
+                if (!(l2[c] & PTE_P)) continue;
+                uint64_t *l1 = phys_to_virt(l2[c] & PTE_ADDR);
+                for (int d = 0; d < 512; d++)
+                    if ((l1[d] & PTE_P) && !(l1[d] & PTE_SHARED)) n++;
+            }
+        }
+    }
+    return n;
 }
 
 static uint64_t prot_flags(int prot) {

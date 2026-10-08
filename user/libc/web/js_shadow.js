@@ -24,6 +24,10 @@ const shadowBridge = (() => {
         get innerHTML(){return get(shadow(this),'innerHTML');}
         set innerHTML(value){shadow(this);dom('set',this,'innerHTML',value===null?'':string(value));}
         get activeElement(){return get(shadow(this),'activeElement');}
+        elementFromPoint(x,y){
+            shadow(this);if(arguments.length<2)throw new TypeError('Two coordinates required');
+            return rawDom('elementFromPoint',this,x,y);
+        }
     }
     class HTMLSlotElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLSlotElement constructor');}
