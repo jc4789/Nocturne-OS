@@ -15,6 +15,7 @@ struct web_canvas {
     unsigned w,h,generation;
     uint32_t *pixels;
     size_t bytes;
+    bool tainted;
 };
 unsigned web_canvas_dimension(const node_t *n,const char *name) {
     unsigned fallback=!strcmp(name,"width")?300:150;
@@ -42,6 +43,7 @@ void web_canvas_free(node_t *n) { if (n) { release(n); free(n->canvas); n->canva
 void web_canvas_attr_changed(node_t *n,const char *name) {
     if (n && n->canvas && (!strcmp(name,"width") || !strcmp(name,"height"))) {
         release(n); n->canvas->generation++;
+        n->canvas->tainted=false;
         n->canvas->w=web_canvas_dimension(n,"width"); n->canvas->h=web_canvas_dimension(n,"height");
     }
 }
@@ -49,7 +51,7 @@ static struct web_canvas *ensure(node_t *n) {
     if (!n->canvas) { n->canvas=calloc(1,sizeof *n->canvas); if (!n->canvas) return NULL; }
     struct web_canvas *c=n->canvas;
     unsigned w=web_canvas_dimension(n,"width"),h=web_canvas_dimension(n,"height");
-    if (c->w!=w || c->h!=h) { release(n); c->w=w; c->h=h; c->generation++; }
+    if (c->w!=w || c->h!=h) { release(n); c->w=w; c->h=h; c->generation++; c->tainted=false; }
     if (!w || !h) return c;
     if (c->pixels) return c;
     if ((uint64_t)w*h>CANVAS_MAX_PIXELS) return NULL;
@@ -82,6 +84,128 @@ static int numeric(JSContext *ctx,int argc,JSValueConst *argv,int start,double *
     return 1;
 }
 static void changed(node_t *n) { if (n->owner) n->owner->dirty=true; }
+/* Bilinear in premultiplied space, then return straight ARGB for over().
+ * Sampling clamps to the image edge, not to an internal sprite crop edge. */
+static uint32_t image_sample(const uint32_t *px,unsigned w,unsigned h,double x,double y,bool smooth) {
+    if (!smooth) {
+        unsigned ix=(unsigned)fmax(0,fmin(w-1,floor(x))),iy=(unsigned)fmax(0,fmin(h-1,floor(y)));
+        return px[(size_t)iy*w+ix];
+    }
+    x=fmax(0,fmin(w-1,x-0.5)); y=fmax(0,fmin(h-1,y-0.5));
+    unsigned ix=(unsigned)x,iy=(unsigned)y,jx=ix+1<w?ix+1:ix,jy=iy+1<h?iy+1:iy;
+    double tx=x-ix,ty=y-iy,weights[4]={(1-tx)*(1-ty),tx*(1-ty),(1-tx)*ty,tx*ty};
+    uint32_t p[4]={px[(size_t)iy*w+ix],px[(size_t)iy*w+jx],px[(size_t)jy*w+ix],px[(size_t)jy*w+jx]};
+    double a=0,r=0,g=0,b=0;
+    for (unsigned i=0;i<4;i++) {
+        double v=(p[i]>>24)*weights[i]; a+=v;
+        r+=((p[i]>>16)&255)*v; g+=((p[i]>>8)&255)*v; b+=(p[i]&255)*v;
+    }
+    unsigned alpha=(unsigned)fmin(255,a+0.5);
+    if (!alpha) return 0;
+    return (alpha<<24)|((unsigned)fmin(255,r/a+0.5)<<16)|((unsigned)fmin(255,g/a+0.5)<<8)|(unsigned)fmin(255,b/a+0.5);
+}
+static bool image_clip_axis(double *s,double *span,double *d,double *length,unsigned extent) {
+    double lo=fmax(0,*s),hi=fmin(extent,*s+*span);
+    if (!(hi>lo)) return false;
+    double offset=(lo-*s)/ *span,fraction=(hi-lo)/ *span;
+    *d+=*length*offset; *length*=fraction; *s=lo; *span=hi-lo;
+    return isfinite(*d) && isfinite(*length) && *length>0;
+}
+JSValue web_canvas_draw_image(JSContext *ctx,node_t *n,node_t *source,int argc,JSValueConst *argv) {
+    if (!n || n->type!=N_ELEM || n->foreign || n->tag!=T_canvas)
+        return JS_ThrowTypeError(ctx,"Illegal Canvas receiver");
+    if (!source || source->type!=N_ELEM || source->foreign || (source->tag!=T_canvas && source->tag!=T_img))
+        return JS_ThrowTypeError(ctx,"Expected HTMLCanvasElement or HTMLImageElement");
+    if (argc!=4) return JS_ThrowTypeError(ctx,"Invalid drawImage packet");
+    size_t coord_bytes=0,matrix_bytes=0;
+    uint8_t *coords=JS_GetArrayBuffer(ctx,&coord_bytes,argv[0]);
+    if (!coords) return JS_EXCEPTION;
+    uint8_t *matrix=JS_GetArrayBuffer(ctx,&matrix_bytes,argv[1]);
+    if (!matrix) return JS_EXCEPTION;
+    if ((coord_bytes!=16 && coord_bytes!=32 && coord_bytes!=64) || matrix_bytes!=48)
+        return JS_ThrowTypeError(ctx,"Invalid drawImage buffer length");
+    double v[8]={0},m[6],alpha;
+    memcpy(v,coords,coord_bytes); memcpy(m,matrix,sizeof m);
+    if (JS_ToFloat64(ctx,&alpha,argv[2])<0) return JS_EXCEPTION;
+    bool smooth=JS_ToBool(ctx,argv[3])>0;
+    for (unsigned i=0;i<coord_bytes/8;i++) if (!isfinite(v[i])) return JS_UNDEFINED;
+    for (unsigned i=0;i<6;i++) if (!isfinite(m[i])) return JS_UNDEFINED;
+    if (!isfinite(alpha) || alpha<0 || alpha>1) return JS_UNDEFINED;
+
+    /* No author callback runs after acquiring these borrowed pixels. Images
+       belong to their owner document and are freed only with that document. */
+    const uint32_t *pixels; unsigned w,h; bool tainted;
+    if (source->tag==T_canvas) {
+        if (!web_canvas_dimension(source,"width") || !web_canvas_dimension(source,"height")) return JS_NewInt32(ctx,1);
+        struct web_canvas *src=ensure(source);
+        if (!src) return JS_ThrowRangeError(ctx,"Canvas bitmap memory limit");
+        pixels=src->pixels; w=src->w; h=src->h; tainted=src->tainted;
+    } else {
+        web_doc *d=source->owner;
+        if (!d) return JS_NewInt32(ctx,1);
+        if (d->resources_dirty) doc_sync_tree(d);
+        doc_image_sync(d,source);
+        struct web_image *im=source->image>=0 && source->image<d->images.n?d->images.v[source->image]:NULL;
+        if (!im || !im->done) return JS_UNDEFINED;
+        if (im->failed || !im->img || !im->img->px || im->img->w<=0 || im->img->h<=0) return JS_NewInt32(ctx,1);
+        w=(unsigned)im->img->w; h=(unsigned)im->img->h;
+        if ((uint64_t)w*h>IMAGE_MAX_PIXELS) return JS_ThrowRangeError(ctx,"Image bitmap limit");
+        pixels=im->img->px;
+        /* The current cache lacks redirect/CORS provenance. Conservatively
+           taint ALL network/unknown-origin images, even same-origin HTTP. */
+        tainted=!im->url || strncasecmp(im->url,"data:",5)!=0;
+    }
+    double sx=0,sy=0,sw=w,sh=h,dx=v[0],dy=v[1],dw=w,dh=h;
+    if (coord_bytes==32) { dw=v[2]; dh=v[3]; }
+    else if (coord_bytes==64) { sx=v[0]; sy=v[1]; sw=v[2]; sh=v[3]; dx=v[4]; dy=v[5]; dw=v[6]; dh=v[7]; }
+    if (!sw || !sh) return JS_UNDEFINED;
+    if (sw<0) { sx+=sw; sw=-sw; } if (sh<0) { sy+=sh; sh=-sh; }
+    if (dw<0) { dx+=dw; dw=-dw; } if (dh<0) { dy+=dh; dh=-dh; }
+    struct web_canvas *c=ensure(n);
+    if (!c) return JS_ThrowRangeError(ctx,"Canvas bitmap memory limit");
+    /* Clearing/putImageData never untaints; only resetting bitmap dimensions
+       does. A fully clipped or zero-alpha draw still carries the origin. */
+    if (tainted) c->tainted=true;
+    if (!c->pixels || !dw || !dh || !isfinite(sx) || !isfinite(sy) || !isfinite(dx) || !isfinite(dy) ||
+        !image_clip_axis(&sx,&sw,&dx,&dw,w) || !image_clip_axis(&sy,&sh,&dy,&dh,h)) return JS_UNDEFINED;
+    double ox=m[0]*dx+m[2]*dy+m[4],oy=m[1]*dx+m[3]*dy+m[5];
+    double ux=m[0]*dw,uy=m[1]*dw,vx=m[2]*dh,vy=m[3]*dh;
+    double xs[4]={ox,ox+ux,ox+vx,ox+ux+vx},ys[4]={oy,oy+uy,oy+vy,oy+uy+vy};
+    double minx=xs[0],maxx=xs[0],miny=ys[0],maxy=ys[0];
+    for (unsigned i=0;i<4;i++) {
+        if (!isfinite(xs[i]) || !isfinite(ys[i])) return JS_UNDEFINED;
+        minx=fmin(minx,xs[i]); maxx=fmax(maxx,xs[i]); miny=fmin(miny,ys[i]); maxy=fmax(maxy,ys[i]);
+    }
+    double scale=fmax(fmax(fabs(ux),fabs(uy)),fmax(fabs(vx),fabs(vy)));
+    if (!(scale>0) || !isfinite(scale)) return JS_UNDEFINED;
+    double a=ux/scale,b=uy/scale,e=vx/scale,f=vy/scale,det=a*f-b*e;
+    if (!det || !isfinite(det)) return JS_UNDEFINED;
+    int x0=(int)floor(fmax(0,fmin(c->w,minx))),x1=(int)ceil(fmax(0,fmin(c->w,maxx)));
+    int y0=(int)floor(fmax(0,fmin(c->h,miny))),y1=(int)ceil(fmax(0,fmin(c->h,maxy)));
+    if (x0>=x1 || y0>=y1) return JS_UNDEFINED;
+    uint32_t *snapshot=NULL; size_t bytes=0;
+    web_doc *allocation=n->allocation_doc?n->allocation_doc:n->owner;
+    if (source==n) {
+        bytes=(size_t)w*h*4;
+        if (!allocation || allocation->canvas_bytes>CANVAS_BUDGET || bytes>CANVAS_BUDGET-allocation->canvas_bytes)
+            return JS_ThrowRangeError(ctx,"Canvas snapshot memory limit");
+        snapshot=malloc(bytes);
+        if (!snapshot) return JS_ThrowOutOfMemory(ctx);
+        allocation->canvas_bytes+=bytes; memcpy(snapshot,pixels,bytes); pixels=snapshot;
+    }
+    /* Work is bounded by the destination bitmap (at most 1M pixels), not
+       author dimensions. Only finite, clamped source positions become indices. */
+    for (int y=y0;y<y1;y++) for (int x=x0;x<x1;x++) {
+        double px=(x+0.5)/scale-ox/scale,py=(y+0.5)/scale-oy/scale;
+        double u=(px*f-py*e)/det,t=(py*a-px*b)/det;
+        if (!isfinite(u) || !isfinite(t) || u<0 || u>=1 || t<0 || t>=1) continue;
+        uint32_t p=image_sample(pixels,w,h,sx+u*sw,sy+t*sh,smooth);
+        p=(p&0xffffff)|((unsigned)((p>>24)*alpha+0.5)<<24);
+        uint32_t *dst=&c->pixels[(size_t)y*c->w+x]; *dst=over(*dst,p);
+    }
+    free(snapshot); if (bytes) allocation->canvas_bytes-=bytes;
+    changed(n); return JS_UNDEFINED;
+}
 static void rectangle(struct web_canvas *c,double *v,uint32_t color,bool clear) {
     if (!c->pixels) return;
     double ax=v[0],ay=v[1],bx=ax+v[2],by=ay+v[3];
@@ -216,6 +340,7 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
             if (!numbers || v[2]<1 || v[3]<1 || v[2]>4096 || v[3]>4096 || v[2]*v[3]>CANVAS_MAX_PIXELS || fabs(v[0])>1e9 || fabs(v[1])>1e9) {
                 out=JS_ThrowRangeError(ctx,"Invalid ImageData size"); goto done;
             }
+            if (c->tainted) { out=JS_NULL; goto done; }
             int x=(int)v[0],y=(int)v[1]; unsigned w=(unsigned)v[2],h=(unsigned)v[3]; size_t bytes=(size_t)w*h*4;
             uint8_t *data=calloc(1,bytes);
             if (!data) { out=JS_ThrowOutOfMemory(ctx); goto done; }

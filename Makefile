@@ -82,6 +82,21 @@ $(BUILD)/ffmpeg/%.o: %.c
 	@$(CC) $(FFFLAGS) -c $< -o $@
 $(BUILD)/u/user/libc/media.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
 
+# プロセス単位の生存メディア割当。全heap/RSSの上限ではない。
+# FF原文は維持し、allocator/entropyの3接点だけをprivate familyへ接続。
+# native decoderと表示frameも同じ予算を使う。
+MEDIA_QUOTA_BYTES ?= 67108864
+.PHONY: media-quota-config
+$(BUILD)/media-quota.cfg: media-quota-config
+	@mkdir -p $(dir $@)
+	@if [ ! -f "$@" ] || [ "$$(cat "$@")" != '$(MEDIA_QUOTA_BYTES)' ]; then printf '%s\n' '$(MEDIA_QUOTA_BYTES)' > "$@"; fi
+$(BUILD)/u/user/libc/media_alloc.o: UCFLAGS += -DNMEDIA_ALLOC_LIMIT_BYTES=$(MEDIA_QUOTA_BYTES)
+$(BUILD)/u/user/libc/media_alloc.o: $(BUILD)/media-quota.cfg Makefile
+$(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/mem.o: FFFLAGS += -DMALLOC_PREFIX=nmedia_ff_
+$(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/file_open.o: FFFLAGS += -Dfdopen=nmedia_ff_fdopen
+$(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/random_seed.o: FFFLAGS += -Dsetvbuf=nmedia_ff_setvbuf -Dfread=nmedia_ff_fread -Dfclose=nmedia_ff_fclose
+$(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/mem.o $(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/file_open.o $(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/random_seed.o: Makefile user/include/media_alloc_private.h user/include/media_stdio_private.h
+
 # QuickJS core only. No OS helper library, CLI or native-module loader.
 QJS_C := $(addprefix third_party/quickjs/,quickjs.c dtoa.c libregexp.c libunicode.c cutils.c)
 QJS_OBJ := $(patsubst %.c,$(BUILD)/qjs/%.o,$(QJS_C))

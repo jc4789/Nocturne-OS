@@ -9,7 +9,7 @@ const canvasBridge = (() => {
     const native=host.canvas;
     class HTMLCanvasElement extends HTMLElement {constructor(){throw new TypeError('Illegal HTMLCanvasElement constructor');}}
     class CanvasRenderingContext2D {constructor(){throw new TypeError('Illegal CanvasRenderingContext2D constructor');}}
-    function defaults(s){s.fill='#000000';s.stroke='#000000';s.fillColor=0xff000000;s.strokeColor=0xff000000;s.alpha=1;s.lineWidth=1;s.matrix=[1,0,0,1,0,0];s.path=[];s.first=null;s.last=null;s.stack=[];}
+    function defaults(s){s.fill='#000000';s.stroke='#000000';s.fillColor=0xff000000;s.strokeColor=0xff000000;s.alpha=1;s.lineWidth=1;s.smoothing=true;s.matrix=[1,0,0,1,0,0];s.path=[];s.first=null;s.last=null;s.stack=[];}
     function state(ctx){const s=states.get(ctx);if(!s)throw new TypeError('Illegal CanvasRenderingContext2D receiver');const v=native(s.canvas,'version');if(v!==s.version){defaults(s);s.version=v;}return s;}
     function namedError(name,message){return new DOMException(message,name);}
     function args(values,count){if(values.length<count)throw new TypeError('Missing Canvas arguments');return values.slice(0,count).map(number);}
@@ -37,10 +37,14 @@ const canvasBridge = (() => {
         get(){return state(this)[key];},set(value){const s=state(this),text=string(value),c=native(s.canvas,'color',text);if(c!==null){s[key]=text;s[colorkey]=c>>>0;}}});
     define(CanvasRenderingContext2D.prototype,'globalAlpha',{enumerable:true,configurable:true,get(){return state(this).alpha;},set(value){const s=state(this),v=number(value);if(finite(v)&&v>=0&&v<=1)s.alpha=v;}});
     define(CanvasRenderingContext2D.prototype,'lineWidth',{enumerable:true,configurable:true,get(){return state(this).lineWidth;},set(value){const s=state(this),v=number(value);if(finite(v)&&v>0)s.lineWidth=v;}});
+    define(CanvasRenderingContext2D.prototype,'imageSmoothingEnabled',{enumerable:true,configurable:true,get(){return state(this).smoothing;},set(value){state(this).smoothing=!!value;}});
+    /* This subset implements source-over only; never reflect an unsupported
+       compositing operator as though it changed the actual native drawing. */
+    define(CanvasRenderingContext2D.prototype,'globalCompositeOperation',{enumerable:true,configurable:true,get(){state(this);return 'source-over';},set(value){state(this);string(value);}});
     const methods={
         fillRect(...v){rect(this,'rect',v);},clearRect(...v){rect(this,'clear',v);},
         strokeRect(...v){const s=state(this);v=args(v,4);if(!valid(v))return;const [x,y,w,h]=v,p=[point(s,x,y),point(s,x+w,y),point(s,x+w,y+h),point(s,x,y+h),point(s,x,y)];native(s.canvas,'stroke',pathBuffer(p.flat()),color(s,true),s.lineWidth);},
-        save(){const s=state(this);if(s.stack.length===64)throw new RangeError('Canvas save stack limit');s.stack.push({fill:s.fill,stroke:s.stroke,fillColor:s.fillColor,strokeColor:s.strokeColor,alpha:s.alpha,lineWidth:s.lineWidth,matrix:s.matrix.slice()});},
+        save(){const s=state(this);if(s.stack.length===64)throw new RangeError('Canvas save stack limit');s.stack.push({fill:s.fill,stroke:s.stroke,fillColor:s.fillColor,strokeColor:s.strokeColor,alpha:s.alpha,lineWidth:s.lineWidth,smoothing:s.smoothing,matrix:s.matrix.slice()});},
         restore(){const s=state(this),saved=s.stack.pop();if(saved)Object.assign(s,saved);},
         reset(){const s=state(this);native(s.canvas,'reset');s.version=native(s.canvas,'version');defaults(s);},
         beginPath(){resetPath(state(this));},
@@ -60,7 +64,13 @@ const canvasBridge = (() => {
         bezierCurveTo(...v){const s=state(this);v=args(v,6);if(!valid(v))return;const b=point(s,v[0],v[1]),c=point(s,v[2],v[3]),d=point(s,v[4],v[5]);if(!s.last)append(s,b,true);const a=s.last;for(let i=1;i<=24;i++){const t=i/24,u=1-t;append(s,[u*u*u*a[0]+3*u*u*t*b[0]+3*u*t*t*c[0]+t*t*t*d[0],u*u*u*a[1]+3*u*u*t*b[1]+3*u*t*t*c[1]+t*t*t*d[1]]);}},
         arc(x,y,r,start,end,counterclockwise=false){const s=state(this),v=args([x,y,r,start,end],5);if(!valid(v))return;[x,y,r,start,end]=v;if(r<0)throw namedError('IndexSizeError','Negative arc radius');const tau=Math.PI*2;let delta=end-start;if(!counterclockwise){if(delta>=tau)delta=tau;else delta=((delta%tau)+tau)%tau;}else{if(-delta>=tau)delta=-tau;else delta=-(((-delta%tau)+tau)%tau);}const steps=Math.max(1,ceil(abs(delta)/tau*48));for(let i=0;i<=steps;i++){const a=start+delta*i/steps;append(s,point(s,x+r*cos(a),y+r*sin(a)),!s.last);}},
         createImageData(a,b){state(this);const image=images.get(a);if(image)return new ImageData(image.w,image.h);return new ImageData(a,b);},
-        getImageData(...v){const s=state(this);v=args(v,4);if(!valid(v))throw new TypeError('Nonfinite ImageData coordinates');let [x,y,w,h]=v.map(Math.trunc);if(!w||!h)throw namedError('IndexSizeError','Empty ImageData rectangle');if(w<0){x+=w;w=-w;}if(h<0){y+=h;h=-h;}return new ImageData(new Bytes(native(s.canvas,'read',x,y,w,h)),w,h);},
+        drawImage(image,dx,dy,...rest){state(this);const count=arguments.length-1;if(count!==2&&count!==4&&count<8)throw new TypeError('drawImage requires 3, 5 or 9 arguments');
+            const v=args([dx,dy,...rest],count>=8?8:count),s=state(this);
+            /* All author conversions precede borrowing the native bitmap. A
+               conversion can resize/reset the canvas, so refresh state again. */
+            const result=native(s.canvas,'drawImage',image,new Float64(v).buffer,new Float64(s.matrix).buffer,s.alpha,s.smoothing);
+            if(result===1)throw namedError('InvalidStateError','The source image has no usable bitmap');},
+        getImageData(...v){const s=state(this);v=args(v,4);if(!valid(v))throw new TypeError('Nonfinite ImageData coordinates');let [x,y,w,h]=v.map(Math.trunc);if(!w||!h)throw namedError('IndexSizeError','Empty ImageData rectangle');if(w<0){x+=w;w=-w;}if(h<0){y+=h;h=-h;}const data=native(s.canvas,'read',x,y,w,h);if(data===null)throw namedError('SecurityError','Canvas contains an image with unverified origin');return new ImageData(new Bytes(data),w,h);},
         putImageData(image,dx,dy,...dirty){const s=state(this),im=images.get(image);if(!im)throw new TypeError('Expected ImageData');dx=Math.trunc(number(dx));dy=Math.trunc(number(dy));if(!finite(dx)||!finite(dy))throw new TypeError('Nonfinite ImageData coordinates');
             let data=im.data,w=im.w,h=im.h;if(dirty.length){if(dirty.length<4)throw new TypeError('Missing dirty rectangle');let [x,y,dw,dh]=dirty.map(number).map(Math.trunc);if(!valid([x,y,dw,dh]))throw new TypeError('Nonfinite dirty rectangle');if(dw<0){x+=dw;dw=-dw;}if(dh<0){y+=dh;dh=-dh;}const x0=Math.max(0,x),y0=Math.max(0,y),x1=Math.min(w,x+dw),y1=Math.min(h,y+dh);if(x1<=x0||y1<=y0)return;const copy=new Bytes((x1-x0)*(y1-y0)*4);for(let j=y0;j<y1;j++)copy.set(data.subarray((j*w+x0)*4,(j*w+x1)*4),(j-y0)*(x1-x0)*4);data=copy;w=x1-x0;h=y1-y0;dx+=x0;dy+=y0;}
             native(s.canvas,'put',dx,dy,w,h,data.buffer.slice(data.byteOffset,data.byteOffset+data.byteLength));},

@@ -2,6 +2,7 @@
  * path: bytes arrive through the browser's existing fetch/CORS path. */
 #include "avmedia.h"
 #include "media.h"
+#include "media_alloc_private.h"
 #include "nocturne.h"
 #include <errno.h>
 #include <stdio.h>
@@ -38,7 +39,7 @@ static struct web_avmedia *find(web_doc *d, node_t *n, bool create) {
         if (s->doc == d) { count++; if (s->node == n) return s; }
     }
     if (!create || count >= DOCUMENT_MEDIA_LIMIT) return NULL;
-    struct web_avmedia *s = calloc(1, sizeof *s);
+    struct web_avmedia *s = nmedia_ff_mallocz(sizeof *s);
     if (!s) return NULL;
     s->doc = d; s->node = n; s->fd = -1; s->volume = 1; s->next = streams; streams = s;
     return s;
@@ -46,7 +47,7 @@ static struct web_avmedia *find(web_doc *d, node_t *n, bool create) {
 static void close_audio(struct web_avmedia *s) { if (s->fd >= 0) { audio_flush(s->fd); close(s->fd); } s->fd = -1; }
 static void unload(struct web_avmedia *s) {
     close_audio(s); nmedia_close(s->decoder); s->decoder = NULL;
-    free(s->pixels); s->pixels = NULL; s->pixel_capacity = 0;
+    nmedia_ff_free(s->pixels); s->pixels = NULL; s->pixel_capacity = 0;
     s->width = s->height = 0; s->playing = s->ended = false;
     s->base_ms = 0; s->input_size = 0; s->audio_at = 0; s->pending.kind = 0; s->ready = 0; s->error[0] = 0;
 }
@@ -76,7 +77,7 @@ static bool present(struct web_avmedia *s) {
     struct nmedia_output *o=&s->pending;
     if(!o->pixels||o->width<=0||o->height<=0||(uint64_t)o->width*o->height>NMEDIA_MAX_PIXELS){strlcpy(s->error,"invalid native video span",sizeof s->error);return false;}
     size_t count=(size_t)o->width*o->height;
-    if(count>s->pixel_capacity){uint32_t *p=realloc(s->pixels,count*4);if(!p){strlcpy(s->error,"video presentation allocation",sizeof s->error);return false;}s->pixels=p;s->pixel_capacity=count;}
+    if(count>s->pixel_capacity){uint32_t *p=nmedia_ff_realloc(s->pixels,count*4);if(!p){strlcpy(s->error,"video presentation allocation",sizeof s->error);return false;}s->pixels=p;s->pixel_capacity=count;}
     memcpy(s->pixels,o->pixels,count*4);s->width=o->width;s->height=o->height;return true;
 }
 static JSValue state(JSContext *ctx, struct web_avmedia *s) {
@@ -201,7 +202,7 @@ int64_t web_avmedia_deadline(web_doc *d,uint64_t now){
 }
 void web_avmedia_free(web_doc *d){
     struct web_avmedia **link=&streams;
-    while(*link){struct web_avmedia *s=*link;if(s->doc!=d){link=&s->next;continue;}*link=s->next;unload(s);free(s);}
+    while(*link){struct web_avmedia *s=*link;if(s->doc!=d){link=&s->next;continue;}*link=s->next;unload(s);nmedia_ff_free(s);}
 }
 bool web_avmedia_paint(web_doc *d,node_t *n,canvas_t *c,int x,int y,int w,int h){
     struct web_avmedia *s=find(d,n,false);

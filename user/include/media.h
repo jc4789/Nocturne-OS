@@ -5,7 +5,7 @@
 #include "gfx.h"
 
 /* Nocturne native input -> FFmpeg decoder -> 48 kHz stereo / GUI pixels.
- * No subprocess, URL protocol, file-system emulation, or FFmpeg CLI is used.
+ * No subprocess, FFmpeg URL protocol, file-system emulation, or FFmpeg CLI is used.
  * A handle is single-owner; do not call it concurrently from several CPUs. */
 typedef struct nmedia nmedia;
 enum { NMEDIA_AGAIN = 0, NMEDIA_AUDIO = 1, NMEDIA_VIDEO = 2, NMEDIA_END = 3, NMEDIA_ERROR = -1 };
@@ -26,6 +26,10 @@ struct nmedia_output {
     int width, height;
 };
 nmedia *nmedia_open(const char *path, char *error, size_t error_size);
+/* Anonymous HTTP(S), bounded synchronous Range cache. Large resources require
+ * a strong ETag; ignored Range is accepted only when the whole object fits in
+ * 256 KiB. No credentials/cookies, browser origin bypass, or async guarantee. */
+nmedia *nmedia_open_url(const char *url, char *error, size_t error_size);
 /* The input bytes are copied; the caller can release its buffer immediately. */
 nmedia *nmedia_open_memory(const void *bytes, size_t size, char *error, size_t error_size);
 const struct nmedia_info *nmedia_get_info(const nmedia *media);

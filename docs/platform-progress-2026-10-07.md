@@ -6,7 +6,24 @@
 
 **日常利用OSの完成ではない。** 一般プロセスのSMP、WebGL、現代の配信サイト全般への対応は未達である。検出、ビルド、自己試験、実サイトの表示、実際の操作を区別する。
 
-## 第2段階の現在の到達点
+## 第3段階：候補を製品コードへ統合
+
+- 自身のclientで後に上書きされる影の描画を省略する経路を、通常起動の既定にした。`wmshadowstrip=off`で元の影描画へ戻せる。AP合成は下記の限定自動選択へ進め、協調yieldは明示opt-inを維持する。一般scheduler SMPには広げていない。影削減の採用根拠は同じ描画候補ONでの69成功/0失敗/9省略と固定6反復のPCM供給回復。短い音切れと終了直後の画面残留1例は未解決として保持する。
+- FFmpegのallocator/entropyの3TUだけをprivate familyへ接続し、nativeの所有入力・復号frame・browser表示frame・MediaPlayer表示frameの割当/解放も揃えた。合算上限はプロセスごと既定64MiB、構築時`MEDIA_QUOTA_BYTES`で変更でき、値変更時はallocatorを再構築する。通常malloc/FILE、JS/HTTP/kernelの割当は変更せず、全heap/RSS上限とは呼ばない。
+- allocatorと限定stdioは既に実Nocturneで単独正負例を通過し、FFprefix/native候補は16MiBで実構築・symbol接続を確認した。**製品64MiBの実codec拒否・解放後再decode回復は未確認**であり、旧媒体の回帰結果を新製品の合格へ流用しない。
+- 新しい公開poll比較はbaselineのclear/triangle各4096回を完了したが、context破棄で失敗したため打ち切った。candidateを実行・採用せず、既存の限定3D opt-inとCPU fallbackを維持する。GPU47ms対CPU5msという加速未達を隠さない。
+
+ユーザーの要請に従い、追加の実験設計を止めて上記のコード統合を優先した。通常の製品全体構築は66.45秒・終了0で、kernel/全アプリ/sysroot/initrdとIMG/VHD/ISOを再生成した。元payloadは`build/site-compat-stage3/product-integration-01/previous-*`へ保存した。初回stampに同梱されていない`cmp`を使ったため、標準shellの`cat`比較へ修理した。新製品のVM実行はまだ行っていない。Hyper-V VM・媒体と元FFmpeg木は非変更。
+
+### 追加の製品実装（追加VM試験なし）
+
+- **CPU**：通常起動で、damageに交差する16層以上かつ262,144画素以上のRAM合成だけAPを自動選択する。`wmparallel`は強制許可、`wmparallel=off`は診断より優先する明示無効化。小領域・低密度・UP/nosmpの逐次経路、同期join、影削減と旧oracleは維持。既存tiled比較は閾値の参考であり、現在のstrip/directに対する普遍的な高速化は未確認。
+- **Canvas2D**：`drawImage`の3/5/9引数、crop/scale/affine、globalAlpha/source-over、nearest/bilinearを本物のbitmapへ実装。Canvas自己コピーは16MiBの文書budget内で一時snapshotを所有し、HTMLImageElementは現在のdecode画像をcall中だけ借用する。HTTP画像はredirect/CORS provenanceが未記録のため同originを含め保守的にtaintし、`getImageData`を`SecurityError`で拒否する。data画像とclean Canvasは読取可能。WebGL・GPU高速化の完成とは呼ばない。
+- **媒体入力**：`nmedia_open_url`とMediaPlayerのOpen欄を、既存Nocturne HTTP/TLSとcustom AVIOへ接続。256KiB単窓cacheはmedia合算quota内に所有し、206のrange/total/長さ、identity encoding、固定最終URL・強ETagを検査する。200は初回の全体が256KiB以内の場合だけ許可し、巨大全download、曖昧なrange、表現変更、HTTPS降格を拒否する。同期refillのためGUIや音声がネット待機で止まる制限は残る。ブラウザfetch/CORSは変更せず、MSE/DRM/HLS/DASH/liveの実装とは呼ばない。
+
+追加差分を通常allへ統合し、**65.30秒・終了0**でkernel・全アプリ・sysroot・initrd・IMG/VHD/ISOを再生成した。生成JSを含む13sourceの前後hashは一致。媒体readerの少数host検査は、親が現在sourceから再コンパイルして158条件・失敗0を確認した（実HTTP parser、TCP/TLSのみ模擬）。記録は`build/site-compat-stage3/product-features-01/`。この追加差分の実行時画素・実ネット媒体decode・サイト互換性・速度は未検証。以前の実VM回帰を新差分の合格へ流用しない。
+
+## 第2段階の到達点（以下は統合前媒体の記録）
 
 以下の第1段階の記録を削除せず、最新の統合結果をここに区別して示す。旧媒体の「VP9/Opus/Vorbis未対応」「GPU能力非公開」「40成功」は、この第2段階の現在値ではない。
 

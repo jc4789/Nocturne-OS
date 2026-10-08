@@ -1,4 +1,6 @@
 #include "media.h"
+#include "media_alloc_private.h"
+#include "media_http_private.h"
 #include "nocturne.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +23,7 @@ struct nmedia {
     AVPacket *packet;
     AVFrame *frame;
     int fd, audio_index, video_index, flush, eof;
+    nmedia_http *http;
     uint8_t *bytes;
     size_t size, position;
     struct nmedia_info info;
@@ -34,6 +37,10 @@ struct nmedia {
 };
 
 static int fail(nmedia *m, const char *what, int code) {
+    if (m->http && nmedia_http_error(m->http)[0]) {
+        snprintf(m->error, sizeof m->error, "HTTP input: %s", nmedia_http_error(m->http));
+        return NMEDIA_ERROR;
+    }
     char detail[80];
     av_strerror(code, detail, sizeof detail);
     snprintf(m->error, sizeof m->error, "%s: %s", what, detail);
@@ -42,6 +49,10 @@ static int fail(nmedia *m, const char *what, int code) {
 static int input_read(void *opaque, uint8_t *out, int count) {
     nmedia *m = opaque;
     if(count<=0)return AVERROR(EINVAL);
+    if (m->http) {
+        int n = nmedia_http_read(m->http, out, count);
+        return n > 0 ? n : n == 0 ? AVERROR_EOF : AVERROR(EIO);
+    }
     if (m->bytes) {
         size_t n = MIN((size_t)count, m->size - m->position);
         if (!n) return AVERROR_EOF;
@@ -55,6 +66,10 @@ static int64_t input_seek(void *opaque, int64_t offset, int whence) {
     nmedia *m = opaque;
     if (whence & AVSEEK_SIZE) return (int64_t)m->size;
     whence &= ~AVSEEK_FORCE;
+    if (m->http) {
+        int64_t at = nmedia_http_seek(m->http, offset, whence);
+        return at < 0 ? AVERROR(EIO) : at;
+    }
     int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ?
         (m->bytes ? (int64_t)m->position : lseek(m->fd, 0, SEEK_CUR)) : whence == SEEK_END ? (int64_t)m->size : -1;
     if (base < 0 || offset < -base || offset > (int64_t)m->size - base) return AVERROR(EINVAL);
@@ -139,7 +154,7 @@ bad:
     return NULL; /* caller retains input ownership, including seek restart */
 }
 nmedia *nmedia_open(const char *path, char *error, size_t error_size) {
-    nmedia *m = calloc(1, sizeof *m);
+    nmedia *m = nmedia_ff_mallocz(sizeof *m);
     if (!m) { if (error && error_size) strlcpy(error, "media allocation", error_size); return NULL; }
     m->fd = open(path, O_RDONLY);
     struct n_stat st;
@@ -155,12 +170,22 @@ nmedia *nmedia_open_memory(const void *bytes, size_t size, char *error, size_t e
     if (!bytes || !size || size > NMEDIA_MAX_BYTES) {
         if (error && error_size) strlcpy(error, "empty or oversized media input", error_size); return NULL;
     }
-    nmedia *m = calloc(1, sizeof *m);
+    nmedia *m = nmedia_ff_mallocz(sizeof *m);
     if (!m) { if (error && error_size) strlcpy(error, "media allocation", error_size); return NULL; }
-    m->fd = -1; m->bytes = malloc(size);
+    m->fd = -1; m->bytes = nmedia_ff_malloc(size);
     if (!m->bytes) { if (error && error_size) strlcpy(error, "media input allocation", error_size); nmedia_close(m); return NULL; }
     memcpy(m->bytes, bytes, size); m->size = size;
     if (!open_input(m, error, error_size)) { nmedia_close(m); return NULL; }
+    return m;
+}
+nmedia *nmedia_open_url(const char *url, char *error, size_t error_size) {
+    nmedia *m = nmedia_ff_mallocz(sizeof *m);
+    if (!m) { if(error&&error_size)strlcpy(error,"media allocation",error_size);return NULL; }
+    m->fd = -1;
+    m->http = nmedia_http_open(url,error,error_size);
+    if (!m->http) { nmedia_close(m);return NULL; }
+    m->size = (size_t)nmedia_http_size(m->http);
+    if (!open_input(m,error,error_size)) { nmedia_close(m);return NULL; }
     return m;
 }
 const struct nmedia_info *nmedia_get_info(const nmedia *m) { return m ? &m->info : NULL; }
@@ -210,7 +235,7 @@ static int video_output(nmedia *m, struct nmedia_output *o) {
     if (w <= 0 || h <= 0 || (uint64_t)w * h > NMEDIA_MAX_PIXELS) return fail(m, "video dimensions", AVERROR(EINVAL));
     size_t count = (size_t)w * h;
     if (count > m->pixel_capacity) {
-        uint32_t *p = realloc(m->pixels, count * 4);
+        uint32_t *p = nmedia_ff_realloc(m->pixels, count * 4);
         if (!p) return fail(m, "video output allocation", AVERROR(ENOMEM));
         m->pixels = p; m->pixel_capacity = count;
     }
@@ -352,5 +377,6 @@ void nmedia_close(nmedia *m) {
     if (!m) return;
     close_decoder(m);
     if (m->fd >= 0) close(m->fd);
-    free(m->bytes); free(m->pixels); free(m);
+    nmedia_http_close(m->http);
+    nmedia_ff_free(m->bytes); nmedia_ff_free(m->pixels); nmedia_ff_free(m);
 }

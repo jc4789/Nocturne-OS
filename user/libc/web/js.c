@@ -1520,6 +1520,16 @@ static JSValue native_canvas(JSContext *ctx, JSValueConst this_val, int argc, JS
     if (argc < 2) return JS_ThrowTypeError(ctx, "Canvas node and operation required");
     node_t *node = unwrap(ctx, argv[0]);
     if (!node) return JS_ThrowTypeError(ctx, "Native Canvas receiver required");
+    const char *op = JS_ToCString(ctx, argv[1]);
+    if (!op) return JS_EXCEPTION;
+    bool draw_image = !strcmp(op, "drawImage");
+    JS_FreeCString(ctx, op);
+    if (draw_image) {
+        if (argc < 3) return JS_ThrowTypeError(ctx, "Canvas image source required");
+        node_t *source = unwrap(ctx, argv[2]);
+        if (!source) return JS_ThrowTypeError(ctx, "Native Canvas image source required");
+        return web_canvas_draw_image(ctx, node, source, argc - 3, argv + 3);
+    }
     return web_canvas_native(ctx, node, argc - 1, argv + 1);
 }
 

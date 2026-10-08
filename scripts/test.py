@@ -10,6 +10,8 @@ The VM has an AC'97 sound card, recorded to build/test-audio.wav by QEMU's wav b
 audio tests ran, the host looks for the tones tests/audiotest.c plays in the recording.
 
 usage: python scripts/test.py [--quick] [--full] [--no-net] [--timeout S] [group...]
+  --boot-image IMG  verify and boot a separate image with current kernel/initrd
+  --output-dir DIR  save into a new directory strictly under build/
   --quick   skip the slow tests (compile every app, tcc self-hosting)
   --full    also copy the TinyCC sources so tcc can rebuild itself inside the OS
   --no-net  skip the network tests (they need internet access from the host)
@@ -40,10 +42,19 @@ QEMU = os.path.join("C:/Program Files/qemu", "qemu-system-x86_64.exe")
 if not os.path.isfile(QEMU):
     QEMU = os.path.join(BIN, "qemu-system-x86_64.exe")
 BUILD = os.path.join(ROOT, "build")
+CORE_BUILD = BUILD  # Generated toolchain inputs stay here when outputs are isolated.
 IMG = os.path.join(BUILD, "test-data.img")
 SERIAL = os.path.join(BUILD, "test-serial.log")
 AUDIO = os.path.join(BUILD, "test-audio.wav")
 PART = IMG + "@@1048576"
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def mtools(*args):
@@ -53,7 +64,7 @@ def mtools(*args):
     executable = shutil.which(args[0], path=env["PATH"])
     if not executable:
         sys.exit("test: cannot find bundled tool %s" % args[0])
-    r = subprocess.run([executable, *args[1:]], env=env, stdin=subprocess.DEVNULL,
+    r = subprocess.run([executable, *args[1:]], cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode:
         sys.exit("test: %s failed: %s" % (args[0], r.stderr.strip()))
@@ -142,7 +153,7 @@ def make_disk(a, tcp_port, web_ports):
     if os.path.exists(IMG):
         os.remove(IMG)
     env = dict(os.environ, PATH=BIN + os.pathsep + USR_BIN + os.pathsep + os.environ.get("PATH", ""))
-    subprocess.run([BASH, "scripts/mkdata.sh", "build/test-data.img", "256"], cwd=ROOT, env=env, check=True,
+    subprocess.run([BASH, "scripts/mkdata.sh", os.path.relpath(IMG, ROOT).replace("\\", "/"), "256"], cwd=ROOT, env=env, check=True,
                    stdout=subprocess.DEVNULL)
     mtools("mmd", "-i", PART, "::/tests")
     srcs = sorted(glob.glob(os.path.join(ROOT, "tests", "*.c")))
@@ -159,7 +170,7 @@ def make_disk(a, tcp_port, web_ports):
         tcc = os.path.join(ROOT, "third_party", "tinycc")
         files = sorted(glob.glob(os.path.join(tcc, "*.c")) + glob.glob(os.path.join(tcc, "*.h")) +
                        glob.glob(os.path.join(tcc, "*.def")))
-        files += [os.path.join(ROOT, "ports", "tcc", "config.h"), os.path.join(BUILD, "tcc", "tccdefs_.h")]
+        files += [os.path.join(ROOT, "ports", "tcc", "config.h"), os.path.join(CORE_BUILD, "tcc", "tccdefs_.h")]
         mtools("mmd", "-i", PART, "::/tests/tcc")
         mtools("mcopy", "-i", PART, *files, "::/tests/tcc/")
     port_file = os.path.join(BUILD, "tcpport")
@@ -231,14 +242,21 @@ def check_audio(path):
 
 
 def run_vm(a, tcp_port, web_ports, processes):
-    make_disk(a, tcp_port, web_ports)
     # 起動媒体も専用コピー。検証中の次ビルドと元imageを共有しない。
     boot = os.path.join(BUILD, "test-boot.img")
-    shutil.copyfile(os.path.join(BUILD, "nocturne.img"), boot)
-    image_hash = hashlib.sha256()
-    with open(boot, "rb") as image:
-        for block in iter(lambda: image.read(1024 * 1024), b""):
-            image_hash.update(block)
+    shutil.copyfile(a.boot_image, boot)
+    payload = {}
+    for name in ("kernel.elf", "initrd.tar"):
+        extracted = os.path.join(BUILD, "test-" + name)
+        mtools("mcopy", "-o", "-i", os.path.relpath(boot, ROOT).replace("\\", "/") + "@@1048576",
+               "::/boot/" + name, os.path.relpath(extracted, ROOT).replace("\\", "/"))
+        actual = file_sha256(extracted)
+        expected = file_sha256(os.path.join(CORE_BUILD, name))
+        if actual != expected:
+            sys.exit("test: boot payload differs from current build: " + name)
+        payload[name] = actual
+    make_disk(a, tcp_port, web_ports)
+    image_hash = file_sha256(boot)
     if os.path.exists(SERIAL):
         os.remove(SERIAL)
     cmd = [a.qemu, "-M", "pc", "-m", str(a.memory) + "M", "-smp", str(a.cpus), "-accel", a.accel,
@@ -255,7 +273,8 @@ def run_vm(a, tcp_port, web_ports, processes):
     q = subprocess.Popen(cmd, cwd=ROOT, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     processes.append(q)
-    metadata = {"pid": q.pid, "arguments": cmd, "boot_sha256": image_hash.hexdigest(), "user_data_attached": False}
+    metadata = {"pid": q.pid, "arguments": cmd, "boot_sha256": image_hash,
+                "boot_source": a.boot_image, "boot_payload_sha256": payload, "user_data_attached": False}
     metadata_path = os.path.join(BUILD, "test-metadata.json")
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
@@ -321,11 +340,12 @@ def run_vm(a, tcp_port, web_ports, processes):
     for p in problems:
         print("PROBLEM", p)
     ok = not fails and not problems
-    print("test: %s in %d s (serial log: build/test-serial.log)" % ("all passed" if ok else "FAILED", time.time() - t0))
+    print("test: %s in %d s (serial log: %s)" % ("all passed" if ok else "FAILED", time.time() - t0, SERIAL))
     return 0 if ok else 1
 
 
 def main():
+    global BUILD, IMG, SERIAL, AUDIO, PART
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--full", action="store_true")
@@ -336,6 +356,8 @@ def main():
     ap.add_argument("--accel", choices=("tcg", "whpx"), default="tcg", help="No silent accelerator fallback")
     ap.add_argument("--qemu", default=QEMU, help="QEMU executable (prefer the installed QEMU)")
     ap.add_argument("--gpu", choices=("none", "virgl"), default="none", help="Optional secondary virgl GPU; requires host GL")
+    ap.add_argument("--boot-image", default=os.path.join(CORE_BUILD, "nocturne.img"), help="Boot input; internal payload must match current build")
+    ap.add_argument("--output-dir", help="New, unused directory under build/; preserve earlier test evidence")
     ap.add_argument("groups", nargs="*")
     a = ap.parse_args()
     if a.memory < 256:
@@ -344,8 +366,27 @@ def main():
         ap.error("--cpus must be between 1 and 32")
     if not os.path.isfile(a.qemu):
         ap.error("--qemu executable does not exist")
-    if not os.path.exists(os.path.join(BUILD, "nocturne.img")):
+    a.boot_image = os.path.abspath(a.boot_image)
+    if not os.path.isfile(a.boot_image):
         sys.exit("test: build first with the bundled toolchain")
+    if a.output_dir:
+        output = os.path.realpath(a.output_dir)
+        core = os.path.realpath(CORE_BUILD)
+        try:
+            inside = os.path.normcase(os.path.commonpath((core, output))) == os.path.normcase(core)
+        except ValueError:
+            inside = False
+        if not inside or os.path.normcase(output) == os.path.normcase(core) or os.path.exists(output):
+            ap.error("--output-dir must be a new directory strictly under build/")
+        os.makedirs(output, exist_ok=False)
+        BUILD = output
+        IMG, SERIAL, AUDIO = [os.path.join(BUILD, name) for name in
+                              ("test-data.img", "test-serial.log", "test-audio.wav")]
+        PART = IMG + "@@1048576"
+    overwritten = (IMG, SERIAL, AUDIO, *(os.path.join(BUILD, name) for name in
+                   ("test-boot.img", "test-kernel.elf", "test-initrd.tar", "test-metadata.json", "tcpport", "webports", "autorun.sh")))
+    if os.path.normcase(os.path.realpath(a.boot_image)) in {os.path.normcase(os.path.realpath(p)) for p in overwritten}:
+        ap.error("--boot-image must not be a test output path")
     servers, processes = [], []
     try:
         tcp = start_tcp_server()

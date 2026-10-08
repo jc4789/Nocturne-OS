@@ -3,6 +3,10 @@
 #include "quickjs.h"
 /* Called with a brand-checked native DOM node; argv begins with operation. */
 JSValue web_canvas_native(JSContext *ctx, node_t *node, int argc, JSValueConst *argv);
+/* Brand-checked source node, then coords (2/4/8 doubles), matrix (6 doubles),
+ * global alpha, smoothing. Returns 1 for unusable/broken source, otherwise
+ * undefined; the private JS bridge constructs the InvalidStateError. */
+JSValue web_canvas_draw_image(JSContext *ctx, node_t *dst, node_t *src, int argc, JSValueConst *argv);
 void web_canvas_free(node_t *node);
 void web_canvas_attr_changed(node_t *node, const char *name);
 unsigned web_canvas_dimension(const node_t *node, const char *name);

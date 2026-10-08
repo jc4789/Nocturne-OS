@@ -819,6 +819,7 @@ static int taskbar_window_at(int x, int y, struct window **out) {
 struct draw_layer {
     int x, y, cw, ch, fw, fh, cx, cy, flags, hover;
     bool focus, maximized;
+    bool client_raw_overwrite; /* renderer契約。snapshot中は不変。 */
     const uint32_t *pixels;
     char title[64];
     struct rect bounds;
@@ -834,18 +835,51 @@ static bool capture_layer(struct draw_layer *l, struct window *w, bool focus) {
     *l = (struct draw_layer){.x=w->x, .y=w->y, .cw=w->cw, .ch=w->ch,
         .fw=fw, .fh=fh, .cx=client_x(w), .cy=client_y(w), .flags=w->flags,
         .hover=hover_win==w ? hover_btn : 0, .focus=focus,
-        .maximized=w->maximized, .pixels=w->buf,
+        .maximized=w->maximized, .pixels=w->buf, .client_raw_overwrite=true,
         .bounds={MAX(0,x0),MAX(0,y0),MIN(sw,x1)-MAX(0,x0),MIN(sh,y1)-MAX(0,y0)}};
     memcpy(l->title, w->title, sizeof l->title);
     l->title[sizeof l->title - 1] = 0;
     return true;
 }
 
+/* 自身clientを後でraw上書きするlayerだけ。generic shadowは無変更。 */
+static void draw_layer_shadow_candidate(canvas_t *c, const struct draw_layer *w) {
+    if (!w->client_raw_overwrite) {
+        draw_shadow(c, w->x, w->y, w->fw, w->fh);
+        return;
+    }
+    int64_t hx0 = w->cx, hy0 = w->cy;
+    int64_t hx1 = hx0 + w->cw, hy1 = hy0 + w->ch;
+    for (int i = SHADOW; i > 0; i -= 2) {
+        int64_t x0 = MAX((int64_t)w->x - i + 2, (int64_t)c->cx0);
+        int64_t y0 = MAX((int64_t)w->y - i + 4, (int64_t)c->cy0);
+        int64_t x1 = MIN((int64_t)w->x + w->fw + i - 2, (int64_t)c->cx1);
+        int64_t y1 = MIN((int64_t)w->y + w->fh + i, (int64_t)c->cy1);
+        if (x1 <= x0 || y1 <= y0) continue;
+        int64_t ix0 = MAX(x0, hx0), iy0 = MAX(y0, hy0);
+        int64_t ix1 = MIN(x1, hx1), iy1 = MIN(y1, hy1);
+        uint32_t col = ARGB(6 + (SHADOW - i) * 3, 0, 0, 10);
+        if (ix1 <= ix0 || iy1 <= iy0) {
+            gfx_fill_blend(c, (int)x0, (int)y0, (int)(x1-x0), (int)(y1-y0), col);
+            continue;
+        }
+        if (iy0 > y0)
+            gfx_fill_blend(c, (int)x0, (int)y0, (int)(x1-x0), (int)(iy0-y0), col);
+        if (y1 > iy1)
+            gfx_fill_blend(c, (int)x0, (int)iy1, (int)(x1-x0), (int)(y1-iy1), col);
+        if (ix0 > x0)
+            gfx_fill_blend(c, (int)x0, (int)iy0, (int)(ix0-x0), (int)(iy1-iy0), col);
+        if (x1 > ix1)
+            gfx_fill_blend(c, (int)ix1, (int)iy0, (int)(x1-ix1), (int)(iy1-iy0), col);
+    }
+}
+
 /* Pure RAM-only helper: canvas clip is caller-private; layer is immutable. */
-static void draw_layer(canvas_t *c, const struct draw_layer *w) {
+static void draw_layer(canvas_t *c, const struct draw_layer *w, bool shadow_strip) {
     int fx = w->x, fy = w->y, fw = w->fw, fh = w->fh;
     bool focus = w->focus;
-    draw_shadow(c, fx, fy, fw, fh);
+    if (shadow_strip) draw_layer_shadow_candidate(c, w);
+    else draw_shadow(c, fx, fy, fw, fh);
     if (!(w->flags & WIN_NO_DECOR)) {
         uint32_t edge = focus ? RGB(110, 96, 200) : RGB(60, 60, 84);
         uint32_t top = focus ? RGB(66, 52, 140) : RGB(44, 44, 62);
@@ -921,7 +955,7 @@ struct draw_scene {
     struct draw_layer layers[MAX_WIN];
     unsigned count;
     struct rect selection;
-    bool selected, fault_test;
+    bool selected, fault_test, shadow_strip;
 };
 
 struct scene_job {
@@ -931,7 +965,7 @@ struct scene_job {
     unsigned cpu[CPU_MAX_COUNT]; /* one independent cell per tile */
 };
 
-static bool wm_parallel, wm_verify, wm_yield;
+static bool wm_parallel, wm_parallel_force, wm_verify, wm_yield, wm_shadow_strip;
 static bool wm_trace, trace_done, trace_chord;
 static volatile bool trace_active;
 static canvas_t verify_back;
@@ -973,6 +1007,7 @@ static void capture_scene(struct draw_scene *s, canvas_t dst) {
     s->count = 0;
     s->selected = sel_icon >= 0;
     s->fault_test = false;
+    s->shadow_strip = wm_shadow_strip; /* BSPが発行前に選択、join中は不変。 */
     if (s->selected) {
         int x, y;
         icon_cell(sel_icon, &x, &y);
@@ -1005,7 +1040,7 @@ static void scene_tile(size_t index, void *arg) {
         gfx_fill_blend(&c, a.x, a.y, a.w, a.h, ARGB(70,150,140,255));
     }
     for (unsigned i = 0; i < s->count; i++)
-        if (rect_overlap(&s->layers[i].bounds, &r)) draw_layer(&c, &s->layers[i]);
+        if (rect_overlap(&s->layers[i].bounds, &r)) draw_layer(&c, &s->layers[i], s->shadow_strip);
     job->cpu[index] = cpu_current_index();
 }
 
@@ -1035,15 +1070,27 @@ static void render_scene_direct(const struct draw_scene *s, struct rect r) {
     scene_tile(0,&job);
 }
 
+/* 元generic shadow専用oracle。BSPの同期render前後だけ選択を保存／復元する。 */
+static void render_scene_original(struct draw_scene *s, struct rect r) {
+    cpu_require_bsp();
+    bool saved=s->shadow_strip;
+    s->shadow_strip=false;
+    render_scene_direct(s,r);
+    s->shadow_strip=saved;
+}
+
 static void measure_reference(struct draw_scene *s,struct rect r,unsigned rows,
                               uint64_t *direct,uint64_t *serial) {
     canvas_t original=s->dst;
+    bool saved=s->shadow_strip;
+    s->shadow_strip=false;
     s->dst=verify_back;
     uint64_t start=scene_tick();
     render_scene_direct(s,r);
     *direct=scene_tick()-start;
     *serial=render_scene(s,r,false,rows,NULL,NULL);
     s->dst=original;
+    s->shadow_strip=saved;
 }
 
 static void scene_benchmark(void) {
@@ -1084,7 +1131,7 @@ static void scene_benchmark(void) {
             for (size_t p=0;p<pixels+32;p++) ref[p]=out[p]=0x5a5aa5a5;
             s.dst=(canvas_t){.px=ref+16,.w=sw,.h=sh,.pitch=sw};
             uint64_t start=scene_tick();
-            render_scene_direct(&s,r);
+            render_scene_original(&s,r);
             direct+=scene_tick()-start;
             s.dst.px=out+16;
             render_scene(&s,r,false,rows,NULL,NULL);
@@ -1102,13 +1149,17 @@ static void scene_benchmark(void) {
                 parallel+=render_scene(&s,r,true,rows,&mask,&maximum);
             }
             if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: parallel pixels/guards differ layers=%u",s.count);
+            /* 測定外。APと反対側を元shadowで再描画し共通shortcut誤りを避ける。 */
+            s.dst.px=(round&1)?out+16:ref+16;
+            render_scene_original(&s,r);
+            if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: original/AP pixels differ layers=%u",s.count);
             /* Off-origin, odd width/height, last row, and tiny jobs must not write
                outside their damage region or disagree at a tile boundary. */
             struct rect clips[]={{1,3,MIN(sw-1,97),MIN(sh-3,131)},
                                  {sw-33,sh-19,33,19},{7,9,1,1}};
             for (unsigned k=0;k<ARRAY_SIZE(clips);k++) {
                 for (size_t p=0;p<pixels+32;p++) ref[p]=out[p]=0x5a5aa5a5;
-                s.dst.px=ref+16;render_scene_direct(&s,clips[k]);
+                s.dst.px=ref+16;render_scene_original(&s,clips[k]);
                 s.dst.px=out+16;render_scene(&s,clips[k],true,rows,&mask,&maximum);
                 if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: clipped pixels/guards differ case=%u",k);
             }
@@ -1119,7 +1170,7 @@ static void scene_benchmark(void) {
             uint64_t jobs=cpu_parallel_jobs(),uneven_mask=0;
             for (unsigned k=0;k<ARRAY_SIZE(uneven);k++) {
                 for (size_t p=0;p<pixels+32;p++) ref[p]=out[p]=0x5a5aa5a5;
-                s.dst.px=ref+16;render_scene_direct(&s,clip);
+                s.dst.px=ref+16;render_scene_original(&s,clip);
                 uint64_t before=cpu_parallel_jobs();
                 s.dst.px=out+16;render_scene(&s,clip,true,uneven[k],&uneven_mask,NULL);
                 if (memcmp(ref,out,(pixels+32)*4) ||
@@ -1134,13 +1185,14 @@ static void scene_benchmark(void) {
         for (size_t p=0;p<pixels+32;p++) ref[p]=out[p]=0x5a5aa5a5;
         s.dst=(canvas_t){.px=ref+16,.w=sw-1,.h=sh,.pitch=sw-1};
         struct rect odd={1,1,sw-2,sh-2};
-        render_scene_direct(&s,odd);
+        render_scene_original(&s,odd);
         s.dst.px=out+16;
         render_scene(&s,odd,true,rows,&mask,&maximum);
         if (memcmp(ref,out,(pixels+32)*4)) panic("wmbench: odd-pitch pixels/guards differ");
-        kprintf("wmbench: %dx%d layers=%u rounds=6 CPUs=%u mask=%lx direct_ticks=%lu serial_ticks=%lu parallel_ticks=%lu jobs=%lu batch_rows=%u max_join_us=%lu pixels=PASS guards=PASS\n",
+        kprintf("wmbench: %dx%d layers=%u rounds=6 CPUs=%u mask=%lx direct_ticks=%lu serial_ticks=%lu parallel_ticks=%lu jobs=%lu batch_rows=%u max_join_us=%lu pixels=PASS guards=PASS direct_shadow=original serial_shadow=%s parallel_shadow=%s oracle_shadow=original\n",
                 sw,sh,s.count,cpu_online_count(),mask,direct,serial,parallel,
-                cpu_parallel_jobs()-begin_jobs,rows,scene_us(maximum));
+                cpu_parallel_jobs()-begin_jobs,rows,scene_us(maximum),
+                s.shadow_strip?"strip":"original",s.shadow_strip?"strip":"original");
         scene_shrink(s.count,(unsigned)sw,rows,maximum);
     }
     vfree(ref,pages);vfree(out,pages);
@@ -1155,19 +1207,21 @@ static void composite_ram(struct rect r) {
         scene.layers[relevant++]=scene.layers[i];
     scene.count=relevant;
     bool verify=wm_verify && verify_back.w==back.w && verify_back.h==back.h;
+    /* 自動利用は多層・大damageだけ。明示onでも既存の安全条件を保つ。 */
     bool parallel = wm_parallel && cpu_online_count()>1 && r.h>=(int)cpu_online_count() &&
-                    (uint64_t)r.w*r.h>=65536 && scene.count>0;
+                    (uint64_t)r.w*r.h>=65536 && scene.count>0 &&
+                    (wm_parallel_force || (scene.count>=16 && (uint64_t)r.w*r.h>=262144));
     if (!parallel) {
         render_scene_direct(&scene,r);
         if (verify && scene.count) {
             scene.dst=verify_back;
-            render_scene_direct(&scene,r);
+            render_scene_original(&scene,r);
             for (int y=r.y;y<r.y+r.h;y++)
                 if (memcmp(back.px+(size_t)y*back.pitch+r.x,
                            verify_back.px+(size_t)y*verify_back.pitch+r.x,(size_t)r.w*4))
                     panic("wmverify: serial fallback pixels differ row=%d",y);
-            kprintf("wmram: fallback CPUs=%u layers=%u rect=%dx%d pixels=PASS\n",
-                    cpu_online_count(),scene.count,r.w,r.h);
+            kprintf("wmram: fallback CPUs=%u layers=%u rect=%dx%d pixels=PASS shadow=%s oracle_shadow=original\n",
+                    cpu_online_count(),scene.count,r.w,r.h,scene.shadow_strip?"strip":"original");
         }
         return;
     }
@@ -1191,9 +1245,9 @@ static void composite_ram(struct rect r) {
     scene_max_ticks=MAX(scene_max_ticks,maximum);
     scene_shrink(scene.count,(unsigned)r.w,rows,maximum);
     if (!trace_active && (verify || scene_frames==1 || !(scene_frames%64)))
-        kprintf("wmram: frame=%lu rect=%dx%d layers=%u CPUs=%u mask=%lx direct_ticks=%lu serial_ticks=%lu parallel_ticks=%lu jobs=%lu density=%u batch_rows=%u join_us=%lu max_join_us=%lu pixels=%s\n",
+        kprintf("wmram: frame=%lu rect=%dx%d layers=%u CPUs=%u mask=%lx direct_ticks=%lu serial_ticks=%lu parallel_ticks=%lu jobs=%lu density=%u batch_rows=%u join_us=%lu max_join_us=%lu pixels=%s reference_timed=%u direct_shadow=original serial_shadow=original parallel_shadow=%s\n",
                 scene_frames,r.w,r.h,scene.count,cpu_online_count(),mask,direct,serial,ticks,
-                scene_jobs,scene_density(scene.count),rows,scene_us(maximum),scene_us(scene_max_ticks),verify?"PASS":"unchecked");
+                scene_jobs,scene_density(scene.count),rows,scene_us(maximum),scene_us(scene_max_ticks),verify?"PASS":"unchecked",(unsigned)verify,scene.shadow_strip?"strip":"original");
 }
 
 static void composite_rect(struct rect r) {
@@ -1881,7 +1935,9 @@ void wm_init(void) {
     wm_verify=cmdline_has("wmverify");
     wm_trace=cmdline_has("wmtrace");
     wm_yield=cmdline_has("wmyield");
-    wm_parallel=cmdline_has("wmparallel") || wm_verify || cmdline_has("wm-test-ap-fault");
+    wm_shadow_strip=!cmdline_has("wmshadowstrip=off"); /* default on; legacy shadow path is opt-out */
+    wm_parallel_force=cmdline_has("wmparallel") || wm_verify || cmdline_has("wm-test-ap-fault");
+    wm_parallel=!cmdline_has("wmparallel=off"); /* 明示offは診断のforceより優先。 */
     if (wm_verify) {
         uint32_t *reference=vmalloc(pages);
         if (!reference) panic("wmverify: cannot allocate reference RAM");
