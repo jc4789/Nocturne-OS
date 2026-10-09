@@ -190,7 +190,7 @@ const customElementsBridge = (() => {
             return {op,nodes,was:nodes.map(connected),adopted:nodes.map(node=>({elements:elements(node),oldDocument:get(node,'ownerDocument')}))};
         }
         if (op === 'remove') return {op,node,was:connected(node),parent:get(node,'parentNode')};
-        if (op === 'clone') return {op};
+        if (op === 'clone' || op === 'import') return {op};
         if (op === 'set' && (key === 'innerHTML' || key === 'textContent') && [1,11].includes(get(node,'nodeType')))
             return {op:'children',node,nodes:children(node),was:connected(node)};
         const state = states.get(node);
@@ -214,7 +214,7 @@ const customElementsBridge = (() => {
             removed(token.node,token.was);adopted(token);
         } else if (token.op === 'remove') {
             if (token.parent && get(token.node,'parentNode') !== token.parent) removed(token.node,token.was);
-        } else if (token.op === 'clone') upgradeTree(result);
+        } else if (token.op === 'clone' || token.op === 'import') upgradeTree(result);
         else if (token.op === 'children') {
             for (const node of token.nodes) removed(node,token.was);
             for (const node of children(token.node)) { upgradeTree(node); inserted(node); }
@@ -225,7 +225,7 @@ const customElementsBridge = (() => {
         // Cloning creates a separate native tree: existing FACE ownership is
         // unchanged. Each clone upgrade refreshes just its new FACE; any author
         // constructor DOM mutation still takes the normal synchronous path.
-        if(token.op!=='clone'&&(token.op!=='attribute'||(!token.namespace&&['form','id','disabled'].includes(token.forced))))formRefresh();
+        if(token.op!=='clone' && token.op!=='import' && (token.op!=='attribute'||(!token.namespace&&['form','id','disabled'].includes(token.forced))))formRefresh();
     }
 
     function internalsInfo(element){

@@ -25,7 +25,10 @@ struct html_parser {
     size_t input_spans;
     lxb_html_tokenizer_token_f original_callback;
     void *original_callback_context;
-    bool scripting, fragment, finished, failed, yielded;
+    /* Contextual fragments may run eligible scripts only after insertion;
+       ordinary innerHTML fragments remain inert. Neither mode yields scripts
+       during parsing, and scripting-disabled documents cannot enable it. */
+    bool scripting, fragment, contextual_fragment, finished, failed, yielded;
 };
 
 bool html_bridge_init(struct html_parser *p);

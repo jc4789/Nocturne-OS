@@ -2093,6 +2093,12 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
         uint64_t va = map_user(w, current_task);
         return va ? (int64_t)va : -ENOMEM;
     }
+    case SYS_WIN_STATE: {
+        struct window *w=fd_window((int)a);
+        if(!w)return -EBADF;
+        if(w->pml4!=current_task->pml4)return -EPERM;
+        return (visible(w)?WIN_STATE_VISIBLE:0) | (focused()==w?WIN_STATE_FOCUSED:0);
+    }
     case SYS_WIN_PRESENT: {
         struct window *w = fd_window((int)a);
         if (!w) return -EBADF;

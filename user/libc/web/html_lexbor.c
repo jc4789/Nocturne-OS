@@ -326,7 +326,7 @@ static bool fragment_context(struct html_parser *p, node_t *context) {
     return true;
 }
 
-node_t *html_fragment(web_doc *d, node_t *context, const char *src, size_t n) {
+static node_t *html_fragment_mode(web_doc *d, node_t *context, const char *src, size_t n, bool contextual) {
     size_t length = 0;
     /* Fragment markup is a DOMString, not transport bytes. U+FEFF at its
        beginning is text, while CR preprocessing and input bounds still apply. */
@@ -335,6 +335,7 @@ node_t *html_fragment(web_doc *d, node_t *context, const char *src, size_t n) {
     struct html_parser *p = parser_create(d, d && d->live && !d->inert);
     if (!p) { free(input); return NULL; }
     p->fragment = true;
+    p->contextual_fragment = contextual && p->scripting;
     if (!add_input(p, input, length, false)) { html_finish(p); return NULL; }
     p->document = lxb_html_document_create();
     if (!p->document) { html_finish(p); return NULL; }
@@ -353,4 +354,14 @@ node_t *html_fragment(web_doc *d, node_t *context, const char *src, size_t n) {
     node_t *root = result < 0 ? NULL : p->native_root;
     html_finish(p);
     return root;
+}
+
+node_t *html_fragment(web_doc *d, node_t *context, const char *src, size_t n) {
+    return html_fragment_mode(d, context, src, n, false);
+}
+
+node_t *html_contextual_fragment(web_doc *d, node_t *context, const char *src, size_t n) {
+    /* Do not re-enable scripts after parsing: the EOF handling in html_resume
+       must keep an unclosed script's already-started state intact. */
+    return html_fragment_mode(d, context, src, n, true);
 }

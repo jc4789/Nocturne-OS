@@ -87,9 +87,18 @@
         };
         for(const [method,kind,label] of [['createTextNode',3,'#text'],['createComment',8,'#comment']])Document.prototype[method]=function(value){brand(this);if(!arguments.length)throw new TypeError('Missing data');return dom('create',this,kind,label,string(value));};
         Document.prototype.createDocumentFragment=function(){brand(this);return dom('create',this,11,'#document-fragment','');};
+        Document.prototype.createCDATASection=function(data){
+            brand(this);if(!arguments.length)throw new TypeError('Missing data');string(data);
+            throw new DOMException('CDATA sections cannot be created in an HTML document','NotSupportedError');
+        };
         Document.prototype.importNode=function(node,deep=false){if(!arguments.length)throw new TypeError('Missing node');return transfer(this,node,deep,false);};
         Document.prototype.adoptNode=function(node){if(!arguments.length)throw new TypeError('Missing node');return transfer(this,node,false,true);};
         const createEvent=document.createEvent;
+        Document.prototype.hasFocus=function(){brand(this);return this===document && !!(host.windowState()&2);};
+        Object.defineProperties(Document.prototype,{
+            hidden:{configurable:true,enumerable:true,get(){brand(this);return this!==document || !(host.windowState()&1);}},
+            visibilityState:{configurable:true,enumerable:true,get(){brand(this);return this!==document || !(host.windowState()&1)?'hidden':'visible';}}
+        });
         Document.prototype.createEvent=function(...args){brand(this);return apply(createEvent,this,args);};
         for(const method of ['write','writeln'])Document.prototype[method]=function(){brand(this);throw new DOMException('Writing to an inactive document is not implemented','NotSupportedError');};
         Object.assign(globalThis,{DOMParser,DOMImplementation});

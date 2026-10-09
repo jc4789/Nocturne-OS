@@ -115,6 +115,7 @@ void win_update(window_t *win);
 void win_update_rect(window_t *win, int x, int y, int w, int h);
 void win_set_title(window_t *win, const char *title);
 void win_move(window_t *win, int x, int y);
+int win_state(window_t *win); /* WIN_STATE_* bitmask, negative on failure */
 /* wait up to timeout_ms (-1 = forever) for an event; returns 1 if *e was filled, 0 on timeout,
    -1 if the window is gone. EV_RESIZE is handled (buffer reallocated) before being returned. */
 int win_event(window_t *win, struct gui_event *e, int timeout_ms);

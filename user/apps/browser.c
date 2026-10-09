@@ -24,6 +24,8 @@ static web_doc *doc;
 static int scroll_y, doc_h;
 static char cur_url[2048], status[256], hover[512];
 static bool quit, loading;
+static bool window_state_known;
+static unsigned window_previous_state;
 static bool debug_js;
 /* Browser pages need more time than small custom web_live hosts. The native
    command line can select a finite limit, never an unlimited watchdog. */
@@ -51,15 +53,36 @@ static struct transfer *transfers;
 static struct web_response navigation_response;
 _Static_assert(WEB_RESPONSE_HEADERS_MAX >= WEBNET_RESPONSE_HEADERS_MAX, "Browser must retain complete native response headers");
 
-#define CONSOLE_LINES 128
-#define CONSOLE_LINE 768
+#define CONSOLE_LINES 256
+#define CONSOLE_LINE 1024
 static char console_lines[CONSOLE_LINES][CONSOLE_LINE];
-static int console_n, console_next;
+static int console_n, console_next, console_skip;
+static unsigned long console_sequence;
 static bool console_open, console_dirty;
 static char console_input[4096], console_startup[16385];
 static size_t console_cursor;
 static bool console_selected;
 static uint64_t console_due;
+
+static int console_h(void);
+static int console_visible(void) { return MAX(1, (console_h() - 48) / 16); }
+static void console_scroll(int delta) {
+    console_skip = MAX(0, MIN(console_skip + delta, MAX(console_n - console_visible(), 0)));
+    console_dirty = true;
+}
+static bool console_copy_log(void) {
+    size_t capacity = (size_t)CONSOLE_LINES * (CONSOLE_LINE + 1), used = 0;
+    char *text = malloc(capacity);
+    if (!text) return false;
+    for (int i = 0; i < console_n; i++) {
+        int index = (console_next - console_n + i + CONSOLE_LINES) % CONSOLE_LINES;
+        size_t n = strlen(console_lines[index]);
+        memcpy(text + used, console_lines[index], n); used += n;
+        text[used++] = '\n';
+    }
+    int result=clipboard_set(text, used); free(text);
+    return result>=0;
+}
 
 static struct {
     char *url;
@@ -253,12 +276,16 @@ static void draw(void) {
         int top = TB + page_h(), h = console_h();
         gfx_fill(c, 0, top, w->w, h, RGB(18, 16, 30));
         gfx_hline(c, 0, top, w->w, UI_ACCENT);
-        gfx_text(c, 8, top + 4, "JavaScript console  [F12: close]  [Ctrl+K: clear]", UI_ACCENT2, TRANSPARENT, FONT_SMALL);
+        char heading[192];
+        snprintf(heading, sizeof heading, "JavaScript console  [PgUp/PgDn: history] [Ctrl+Shift+C: copy log] [Ctrl+K: clear]  %d/%d%s",
+                 console_n - console_skip, console_n, console_skip ? " (paused)" : "");
+        gfx_text(c, 8, top + 4, heading, UI_ACCENT2, TRANSPARENT, FONT_SMALL);
         canvas_t clip = *c;
         gfx_clip(&clip, 4, top + 24, w->w - 8, h - 46);
-        int visible = MAX(0, (h - 48) / 16), count = MIN(visible, console_n);
+        console_skip = MIN(console_skip, MAX(console_n - console_visible(), 0));
+        int visible = MAX(0, (h - 48) / 16), count = MIN(visible, console_n - console_skip);
         for (int i = 0; i < count; i++) {
-            int n = (console_next - count + i + CONSOLE_LINES) % CONSOLE_LINES;
+            int n = (console_next - console_skip - count + i + CONSOLE_LINES) % CONSOLE_LINES;
             gfx_text(&clip, 8, top + 25 + i * 16, console_lines[n], UI_FG, TRANSPARENT, FONT_SMALL);
         }
         gfx_hline(c, 4, top+h-23, w->w-8, UI_DIM);
@@ -276,12 +303,27 @@ static void draw(void) {
 
 static void console_add(const char *level, const char *message) {
     const char *p = message ? message : "";
+    uint64_t now = uptime_ms();
+    unsigned long sequence = ++console_sequence;
+    int glyph = w ? MAX(gfx_text_width("M", FONT_SMALL), 1) : 8;
+    size_t wrap = (size_t)MAX(16, MIN(CONSOLE_LINE - 64, (w ? w->w : 1024) / glyph - 48));
     do {
         size_t n = strcspn(p, "\r\n");
-        snprintf(console_lines[console_next], CONSOLE_LINE, "[%s] %.*s", level ? level : "log",
-                 (int)MIN(n, CONSOLE_LINE - 32), p);
-        console_next = (console_next + 1) % CONSOLE_LINES;
-        if (console_n < CONSOLE_LINES) console_n++;
+        size_t offset = 0;
+        do {
+            size_t part = MIN(n - offset, wrap);
+            /* Do not split a UTF-8 scalar at a console continuation boundary. */
+            if (offset + part < n)
+                while (part && ((unsigned char)p[offset + part] & 0xc0) == 0x80) part--;
+            if (!part && offset < n) part = MIN(n - offset, 4);
+            snprintf(console_lines[console_next], CONSOLE_LINE, "[%s] #%lu @%lu.%03lu%s %.*s",
+                     level ? level : "log", sequence, (unsigned long)(now / 1000),
+                     (unsigned long)(now % 1000), offset ? " +" : "", (int)part, p + offset);
+            console_next = (console_next + 1) % CONSOLE_LINES;
+            if (console_n < CONSOLE_LINES) console_n++;
+            if (console_skip) console_skip = MIN(console_skip + 1, MAX(console_n - console_visible(), 0));
+            offset += part;
+        } while (offset < n);
         console_dirty = true;
         p += n;
         while (*p == '\r' || *p == '\n') p++;
@@ -823,6 +865,12 @@ static void host_scroll_to(void *opaque, int x, int y) {
     scroll_to(y);
     need_paint = true;
 }
+static unsigned host_window_state(void *opaque) {
+    (void)opaque;int state=win_state(w);
+    if(state<0)return 0;
+    return ((state&WIN_STATE_VISIBLE)?WEB_WINDOW_VISIBLE:0) |
+           ((state&WIN_STATE_FOCUSED) && focus==F_PAGE?WEB_WINDOW_FOCUSED:0);
+}
 static char *host_cookie_get(void *opaque, const char *url) {
     (void)opaque;
     long n = webnet_cookie_get(network, url, NULL, 0);
@@ -924,6 +972,7 @@ static const struct web_host browser_host = {
     .navigate = host_navigate, .console = host_console, .scroll = host_scroll,
     .navigate_form = host_navigate_form,
     .scroll_to = host_scroll_to, .history = host_history,
+    .window_state=host_window_state,
     .cookie_get = host_cookie_get, .cookie_set = host_cookie_set
     , .navigate_mode = host_navigate_mode
     , .storage = host_storage
@@ -1251,6 +1300,7 @@ static bool dispatch_native(const char *type, web_node *target, const struct gui
         .x = e ? e->x : 0, .y = e ? e->y - TB : 0,
         .button = e && (e->buttons & 2) ? 2 : 0,
         .buttons = e ? e->buttons : 0,
+        .delta_y = e && !strcmp(type,"wheel") ? e->wheel * LINE : 0,
         .key = e ? event_key(e->key, key_text) : "",
         .key_code = e ? event_key_code(e->key) : 0,
         .ctrl = e && (e->mods & NMOD_CTRL), .shift = e && (e->mods & NMOD_SHIFT),
@@ -1270,20 +1320,20 @@ static void page_focus(web_node *node) {
     if (old) {
         const char *value = web_control_value(old);
         if (focus_value && value && strcmp(focus_value, value)) dispatch_native("change", old, NULL, false);
-        struct web_event blur = {.type = "blur"};
+        struct web_event blur = {.type = "blur", .related_target=node};
         web_dispatch(doc, old, &blur);
         flush_dom_layout();
-        dispatch_native("focusout", old, NULL, false);
+        blur.type="focusout";blur.bubbles=true;web_dispatch(doc,old,&blur);flush_dom_layout();
     }
     if (web_focused(doc)!=node) return; /* a blur/focusout listener chose another control */
     free(focus_value);
     const char *value = node ? web_control_value(node) : NULL;
     focus_value = value ? strdup(value) : NULL;
     if (node) {
-        struct web_event event = {.type = "focus"};
+        struct web_event event = {.type = "focus", .related_target=old};
         web_dispatch(doc, node, &event);
         flush_dom_layout();
-        dispatch_native("focusin", node, NULL, false);
+        if(web_focused(doc)==node){event.type="focusin";event.bubbles=true;web_dispatch(doc,node,&event);flush_dom_layout();}
     }
 }
 
@@ -1432,7 +1482,16 @@ static void console_key(const struct gui_event *e) {
     uint32_t k=e->key;bool ctrl=e->mods&NMOD_CTRL;
     if(ctrl&&k>='A'&&k<='Z')k+=32;
     size_t length=strlen(console_input);
+    if(k==NKEY_PGUP){console_scroll(console_visible());return;}
+    if(k==NKEY_PGDN){console_scroll(-console_visible());return;}
+    if(ctrl&&k==NKEY_HOME){console_scroll(CONSOLE_LINES);return;}
+    if(ctrl&&k==NKEY_END){console_scroll(-CONSOLE_LINES);return;}
+    if(ctrl&&k=='c'&&(e->mods&NMOD_SHIFT)){
+        bool copied=console_copy_log();console_skip=0;
+        console_add(copied?"log":"error",copied?"Retained console log copied to Nocturne clipboard.":"Console log copy failed.");return;
+    }
     if(k==NKEY_ENTER){if(length){
+        console_skip=0;
         console_add("input",console_input);
         if(!web_console_eval(doc,console_input,length))console_add("error","Console execution failed or the page runtime is unavailable.");
         console_input[0]=0;console_cursor=0;console_selected=false;
@@ -1474,7 +1533,7 @@ static void key(const struct gui_event *e) {
         return;
     }
     if (console_open && ctrl && k == 'k') {
-        console_n = console_next = 0;
+        console_n = console_next = console_skip = 0;
         console_dirty = true;
         return;
     }
@@ -1763,7 +1822,9 @@ static void handle(const struct gui_event *e) {
         if (need_paint && !quit) redraw();
         return;
     case EV_WHEEL:
-        if (sel_node) {
+        if (console_open && e->y >= TB + page_h() && e->y < w->h - SB) {
+            console_scroll(-e->wheel * 3);
+        } else if (sel_node) {
             int room = MAX((w->h - SB - sel_y) / SEL_H, 1);
             sel_top = MAX(0, MIN(sel_n - room, sel_top + e->wheel));
         } else {
@@ -1897,6 +1958,20 @@ int main(int argc, char **argv) {
         apply_pending_history();
         apply_pending_navigation();
         finish_navigation();
+        /* Native window state is sampled only between script tasks. Queries
+           remain live during scripts, but visibility/focus callbacks cannot
+           re-enter a module loader or a page callback on the C stack. */
+        if(!native_wait && !web_script_running(doc)) {
+            unsigned state=host_window_state(NULL),changed=state^window_previous_state;
+            if(window_state_known && doc) {
+                if(changed&WEB_WINDOW_VISIBLE)web_visibility_event(doc);
+                if(changed&WEB_WINDOW_FOCUSED) {
+                    struct web_event event={.type=(state&WEB_WINDOW_FOCUSED)?"focus":"blur"};
+                    web_dispatch(doc,NULL,&event);flush_dom_layout();
+                }
+            }
+            window_previous_state=state;window_state_known=true;
+        }
         document_step(now);
         if(console_startup[0]&&doc&&!loading&&!native_wait&&now>=console_due&&!web_script_running(doc)){
             console_open=true;focus=F_CONSOLE;

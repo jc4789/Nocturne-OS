@@ -799,6 +799,8 @@ static const struct kw kw_overflow[] = {{"visible", OV_VISIBLE}, {"hidden", OV_H
                                         {"auto", OV_AUTO}, {"clip", OV_CLIP}, {"overlay", OV_AUTO},
                                         {"-moz-hidden-unscrollable", OV_HIDDEN}, {0}};
 static const struct kw kw_boxsizing[] = {{"content-box", 0}, {"border-box", 1}, {0}};
+static const struct kw kw_object_fit[] = {{"fill", OF_FILL}, {"contain", OF_CONTAIN}, {"cover", OF_COVER},
+                                         {"none", OF_NONE}, {"scale-down", OF_SCALE_DOWN}, {0}};
 static const struct kw kw_bg_repeat[] = {{"repeat", BR_REPEAT}, {"repeat-x", BR_REPEAT_X}, {"repeat-y", BR_REPEAT_Y},
                                          {"no-repeat", BR_NO_REPEAT}, {"space", BR_REPEAT}, {"round", BR_REPEAT},
                                          {0}};
@@ -937,6 +939,8 @@ static struct propdef props[] = {
     {"margin-top", PT_LEN, LF_AUTO | LF_NEG, false, O(margin[0]), NULL, 0},
     {"mask-image", PT_MASK_IMAGE, 0, false, O(mask_image), NULL, 0},
     {"mask-position", PT_BG_POS, 0, false, O(mask_pos), NULL, 0},
+    {"object-fit", PT_KW, 0, false, O(object_fit), kw_object_fit, 0},
+    {"object-position", PT_BG_POS, 0, true, O(object_pos), NULL, 0},
     {"mask-repeat", PT_KW, 0, false, O(mask_repeat), kw_bg_repeat, 0},
     {"mask-size", PT_MASK_SIZE, 0, false, O(mask_size), NULL, 0},
     {"max-height", PT_LEN, LF_NONE, false, O(max_height), NULL, 0},
@@ -1030,6 +1034,8 @@ static void init_initial(void) {
     s->flex_basis.kind = LK_AUTO;
     s->flex_shrink = 1;
     s->opacity = 1;
+    s->object_pos[0].kind=s->object_pos[1].kind=LK_LEN;
+    s->object_pos[0].pct=s->object_pos[1].pct=50;
     s->align_self = 255;
     s->justify_self = 255;
     s->z_auto = true;
@@ -1816,7 +1822,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     case PT_OVERFLOW: {
         uint8_t k;
         if (!kw_find(p->kws, v, n, &k)) return false;
-        if (k != OV_VISIBLE) *(uint8_t *)field = k;
+        *(uint8_t *)field = k;
         return true;
     }
     case PT_DISPLAY: return parse_display(v, n, (uint8_t *)field, cx);

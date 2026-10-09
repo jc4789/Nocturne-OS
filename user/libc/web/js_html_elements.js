@@ -18,6 +18,8 @@ const htmlElementsBridge = (() => {
     class HTMLPictureElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLPictureElement constructor');}}
     class HTMLSourceElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLSourceElement constructor');}}
     class HTMLMenuElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLMenuElement constructor');}}
+    class HTMLDivElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLDivElement constructor');}}
+    reflect(HTMLDivElement,'div','align');
     function headingBrand(node){
         const tag=rawDom('get',node,'localName');
         if(!/^h[1-6]$/.test(tag))throw new TypeErrorImpl('Illegal heading receiver');
@@ -243,7 +245,7 @@ const htmlElementsBridge = (() => {
     // The modern head interface has no additional IDL members. Its inherited
     // tree APIs operate on the native head, including parser-created nodes.
     const exports={HTMLMetaElement,HTMLLinkElement,HTMLStyleElement,HTMLBaseElement,HTMLTitleElement,HTMLHeadElement};
-    const extraExports={HTMLHeadingElement,HTMLPictureElement,HTMLSourceElement,HTMLMenuElement,HTMLDialogElement};
+    const extraExports={HTMLHeadingElement,HTMLPictureElement,HTMLSourceElement,HTMLMenuElement,HTMLDialogElement,HTMLDivElement};
     for(const C of [...Object.values(exports),...Object.values(extraExports)])define(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
     Object.assign(globalThis,exports,extraExports);
     return {nodeProtos:Object.values(exports).map(C=>C.prototype),extraNodeProtos:Object.values(extraExports).map(C=>C.prototype),exports:{...exports,...extraExports},

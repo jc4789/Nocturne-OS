@@ -243,6 +243,7 @@ struct gline {
 };
 
 #define COLOR_CURRENT 0x00FFFFFEu /* placeholder for currentColor while computing */
+enum { OF_FILL, OF_CONTAIN, OF_COVER, OF_NONE, OF_SCALE_DOWN };
 
 struct custom_prop {
     const char *name, *value;
@@ -270,6 +271,8 @@ typedef struct style {
     uint8_t border_style[4];
     uint16_t font_weight;
     uint8_t font_family; /* FONT_FAMILY_*; inherited as one byte */
+    uint8_t object_fit;
+    len_t object_pos[2]; /* position within (content box - fitted image) */
     float font_size;
     len_t line_height;
     float vertical_align_px;
@@ -562,6 +565,10 @@ int html_resume(struct html_parser *p, node_t **script);
 bool html_write(struct html_parser *p, const char *text, size_t n);
 void html_finish(struct html_parser *p);
 node_t *html_fragment(web_doc *d, node_t *context, const char *html, size_t n);
+node_t *html_contextual_fragment(web_doc *d, node_t *context, const char *html, size_t n);
+/* CSS overflow propagated from html/body belongs to the viewport, not a
+   scrolled element-sized clipping rectangle. Computed styles stay intact. */
+bool doc_viewport_overflow_box(const web_doc *d, const box_t *b);
 node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t n);
 node_t *doc_node_root(node_t *node, bool composed);
 node_t *doc_shadow_parent(node_t *node); /* parent, or a shadow root's host */

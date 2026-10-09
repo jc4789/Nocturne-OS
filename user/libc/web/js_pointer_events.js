@@ -1,6 +1,28 @@
 /* The native desktop currently has one hover-capable mouse, not touch/pen
    devices. Pointer events share its real coordinates/buttons and DOM paths. */
 const pointerData=new WeakMap();
+const wheelData=new WeakMap();
+const wheelFields=new Set(['deltaX','deltaY','deltaZ','deltaMode','momentum']);
+class WheelEvent extends MouseEvent {
+    constructor(type,init={}) {
+        if(!arguments.length)throw new TypeError('WheelEvent requires type');
+        init=init==null?{}:Object(init);
+        const mouse={};for(const key of Object.keys(init))if(!wheelFields.has(key))mouse[key]=init[key];
+        super(type,mouse);
+        const data={};
+        for(const key of ['deltaX','deltaY','deltaZ']){
+            const value=init[key]===undefined?0:+init[key];
+            if(!Number.isFinite(value))throw new TypeError('Invalid '+key);
+            data[key]=value;
+        }
+        data.deltaMode=init.deltaMode===undefined?0:(+init.deltaMode)>>>0;
+        data.momentum=!!init.momentum;wheelData.set(this,data);
+    }
+}
+for(const key of wheelFields)Object.defineProperty(WheelEvent.prototype,key,{configurable:true,enumerable:true,get(){const data=wheelData.get(this);if(!data)throw new TypeError('Illegal WheelEvent receiver');return data[key];}});
+for(const [key,value] of Object.entries({DOM_DELTA_PIXEL:0,DOM_DELTA_LINE:1,DOM_DELTA_PAGE:2}))
+    for(const target of [WheelEvent,WheelEvent.prototype])Object.defineProperty(target,key,{enumerable:true,value});
+Object.defineProperty(WheelEvent.prototype,Symbol.toStringTag,{configurable:true,value:'WheelEvent'});
 const pointerFields=new Set(['pointerId','width','height','pressure','tangentialPressure','tiltX','tiltY','twist','pointerType','isPrimary']);
 class PointerEvent extends MouseEvent {
     constructor(type,init={}) {
@@ -33,9 +55,10 @@ function nativeDispatch(target,type,init) {
         if(type==='mousedown')suppressCompatibilityMouse=!allowed;
         if(suppressCompatibilityMouse){if(type==='mouseup')suppressCompatibilityMouse=false;return true;}
     }
-    const C=type==='submit'?formValidationBridge.SubmitEvent:/^(key)/.test(type)?KeyboardEvent:/^pointer/.test(type)?PointerEvent:/^(mouse|click|dblclick)/.test(type)?MouseEvent:Event;
-    const e=new C(type,init);
-    for(const key of Object.keys(init))if(key!=='submitter'&&!pointerData.has(e))e[key]=init[key];
+    const focus=/^(?:focus|blur|focusin|focusout)$/.test(type);
+    const C=type==='submit'?formValidationBridge.SubmitEvent:focus?FocusEvent:type==='wheel'?WheelEvent:/^(key)/.test(type)?KeyboardEvent:/^pointer/.test(type)?PointerEvent:/^(mouse|click|dblclick)/.test(type)?MouseEvent:Event;
+    const e=new C(type,focus?mouseAssign({},init,{view:globalThis}):init);
+    for(const key of Object.keys(init))if(key!=='submitter'&&!(focus&&key==='relatedTarget')&&!(wheelData.has(e)&&wheelFields.has(key))&&!pointerData.has(e))e[key]=init[key];
     e.composed=/^(?:keydown|keyup|keypress|click|dblclick|mousedown|mouseup|mouseout|mousemove|mouseover|pointerdown|pointerup|pointermove|pointerout|pointerover|pointercancel|wheel|focus|blur|focusin|focusout|input)$/.test(type);
     e.isTrusted=init.isTrusted!==false;
     return dispatch(target,e);

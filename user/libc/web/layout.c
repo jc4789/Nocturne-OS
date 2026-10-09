@@ -165,7 +165,8 @@ static bool is_flex_item(const box_t *b) {
 
 static bool is_bfc_root(const box_t *b) {
     return !b->parent || b->floated || b->abspos || b->kind == B_ATOMIC || b->kind == B_CELL ||
-           b->kind == B_CAPTION || b->kind == B_TABLE || b->kind == B_FLEX || b->kind == B_GRID || b->st->overflow != OV_VISIBLE ||
+           b->kind == B_CAPTION || b->kind == B_TABLE || b->kind == B_FLEX || b->kind == B_GRID ||
+           (b->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(D,b)) ||
            b->st->display == D_FLOW_ROOT || is_flex_item(b) || b->is_bfc;
 }
 
@@ -482,6 +483,56 @@ static float va_shift(const style_t *st) {
     return 0;
 }
 
+/* Common East Asian soft-wrap opportunities. These supplement whitespace
+   breaks, not break-all: Latin words stay intact, and Japanese opening/
+   closing punctuation, small kana and combining marks stay with their base.
+   This is not the full Unicode line-breaking algorithm (Thai dictionary and
+   grapheme/emoji tailoring remain separate work). Both layout and intrinsic
+   measurement use these same items, including text inside inline elements. */
+static bool east_asian_letter(uint32_t c) {
+    return (c>=0x3041 && c<=0x3096) || (c>=0x30a1 && c<=0x30fa) ||
+           (c>=0x31f0 && c<=0x31ff) || (c>=0x3400 && c<=0x9fff) ||
+           (c>=0xac00 && c<=0xd7a3) || (c>=0xf900 && c<=0xfaff) ||
+           (c>=0xff66 && c<=0xff9d) || (c>=0x20000 && c<=0x3ffff);
+}
+static bool no_break_after(uint32_t c) {
+    switch(c) {
+    case '(': case '[': case '{': case 0x2018: case 0x201c:
+    case 0x3008: case 0x300a: case 0x300c: case 0x300e: case 0x3010:
+    case 0x3014: case 0x3016: case 0x3018: case 0x301a:
+    case 0xff08: case 0xff3b: case 0xff5b: case 0xff5f: case 0xff62:
+        return true;
+    }
+    return c==0x00a0 || c==0x202f || c==0x2060 || c==0xfeff || c==0x200d;
+}
+static bool no_break_before(uint32_t c) {
+    switch(c) {
+    case ')': case ']': case '}': case ',': case '.': case ':': case ';': case '!': case '?':
+    case 0x2019: case 0x201d: case 0x3001: case 0x3002: case 0x3005:
+    case 0x3009: case 0x300b: case 0x300d: case 0x300f: case 0x3011:
+    case 0x3015: case 0x3017: case 0x3019: case 0x301b: case 0x303b:
+    case 0x3041: case 0x3043: case 0x3045: case 0x3047: case 0x3049:
+    case 0x3063: case 0x3083: case 0x3085: case 0x3087: case 0x308e:
+    case 0x3095: case 0x3096: case 0x309d: case 0x309e:
+    case 0x30a1: case 0x30a3: case 0x30a5: case 0x30a7: case 0x30a9:
+    case 0x30c3: case 0x30e3: case 0x30e5: case 0x30e7: case 0x30ee:
+    case 0x30f5: case 0x30f6: case 0x30fc: case 0x30fd: case 0x30fe:
+    case 0xff01: case 0xff09: case 0xff0c: case 0xff0e: case 0xff1a:
+    case 0xff1b: case 0xff1f: case 0xff3d: case 0xff5d: case 0xff60:
+    case 0xff61: case 0xff63: case 0xff64: case 0xff9e: case 0xff9f:
+        return true;
+    }
+    return (c>=0x0300 && c<=0x036f) || (c>=0x1ab0 && c<=0x1aff) ||
+           (c>=0x1dc0 && c<=0x1dff) || (c>=0x20d0 && c<=0x20ff) ||
+           (c>=0xfe00 && c<=0xfe0f) || (c>=0xfe20 && c<=0xfe2f) ||
+           (c>=0xe0100 && c<=0xe01ef) || c==0x3099 || c==0x309a ||
+           c==0x00a0 || c==0x202f || c==0x2060 || c==0xfeff || c==0x200d;
+}
+static bool east_asian_break(uint32_t left,uint32_t right) {
+    return (east_asian_letter(left) || east_asian_letter(right)) &&
+           !no_break_after(left) && !no_break_before(right);
+}
+
 static void text_items(box_t *t, struct ibuild *s) {
     style_t *st = t->st;
     wfont f = style_font(st);
@@ -503,7 +554,19 @@ static void text_items(box_t *t, struct ibuild *s) {
             continue;
         }
         const char *we = p;
-        while (we < e && *we != ' ' && *we != '\n') we++;
+        bool soft=false;
+        while (we < e && *we != ' ' && *we != '\n') {
+            uint32_t left,right;
+            int bytes=gfx_utf8_decode(we,&left);
+            if(bytes<1)bytes=1;
+            if(bytes>e-we)bytes=(int)(e-we);
+            const char *next=we+bytes;
+            if(wrap && next<e && *next!=' ' && *next!='\n') {
+                gfx_utf8_decode(next,&right);
+                if(east_asian_break(left,right)){we=next;soft=true;break;}
+            }
+            we=next;
+        }
         const char *se = we;
         while (se < e && *se == ' ') se++;
         struct item *it = ipush(s->v, IT_TEXT);
@@ -514,7 +577,7 @@ static void text_items(box_t *t, struct ibuild *s) {
         it->sw = se > we ? text_width(st, &f, we, (size_t)(se - we)) : 0;
         it->w = text_width(st, &f, p, (size_t)(we - p)) + it->sw;
         it->space_end = se > we;
-        it->brk = wrap && se > we;
+        it->brk = wrap && (se > we || soft);
         it->link = s->link;
         it->shift = s->shift;
         s->last_space = se > we;
@@ -900,7 +963,11 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
         else if (it->kind == IT_CLOSE) it->w = inline_edge(it->box, false, b->w);
         else if (it->kind == IT_ATOMIC) {
             box_t *c = it->box;
-            size_atomic(c, b->w, c->atomic == AT_SVG ? cbh : -1);
+            /* Inline replaced elements share the containing block's definite
+               height. An img inside inline picture must resolve height:100%
+               against its figure, not discard it and crop a natural-height
+               image at the figure's bottom. Intrinsic passes still use -1. */
+            size_atomic(c, b->w, cbh);
             it->w = c->w + hext(c) + c->m[1] + c->m[3];
         }
     }
@@ -1658,8 +1725,12 @@ static void layout_flex(box_t *b, float cbh) {
         float auto_min = c->st->overflow == OV_VISIBLE ? mn : 0;
         float sw = spec_w(c, &c->st->width, cw);
         if (sw >= 0 && sw < auto_min) auto_min = sw;
-        it[i].mn = smin >= 0 ? smin : auto_min;
+        /* The content-based automatic minimum is also capped by a definite
+           maximum. Otherwise an unspaced Japanese paragraph can make a
+           max-width:720px article wider than its flex container. */
         float smax = spec_w(c, &c->st->max_width, cw);
+        if (smax >= 0 && smax < auto_min) auto_min = smax;
+        it[i].mn = smin >= 0 ? smin : auto_min;
         it[i].mx = smax >= 0 ? smax : INF;
         if (it[i].mx < it[i].mn) it[i].mx = it[i].mn;
         it[i].base = base;
@@ -2598,7 +2669,7 @@ static void layout_abs(box_t *a) {
 static float max_bottom(box_t *b, float base) {
     float y = base + b->y + b->rel_dy;
     float bottom = y + b->h + b->p[2] + b->b[2];
-    if (b->st && b->st->overflow != OV_VISIBLE && b->kind != B_TEXT) return bottom;
+    if (b->st && b->st->overflow != OV_VISIBLE && b->kind != B_TEXT && !doc_viewport_overflow_box(D,b)) return bottom;
     for (box_t *c = b->first; c; c = c->next) {
         if (c->abspos || c->kind == B_TEXT || c->kind == B_INLINE || c->kind == B_BR) continue;
         if (c->cb != b) continue;

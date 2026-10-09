@@ -6,7 +6,7 @@
     let customElementsReady = false;
     function dom(...args) {
         const op = args[0];
-        const mutation = op === 'shadowAttach' || op === 'slotAssign' || op === 'insert' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'set' || op === 'attrSetNode' || op === 'attrRemoveNode' ||
+        const mutation = op === 'shadowAttach' || op === 'slotAssign' || op === 'insert' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'import' || op === 'set' || op === 'attrSetNode' || op === 'attrRemoveNode' ||
             (op === 'attrNS' && args.length > 4) ||
             ((op === 'attr' || op === 'style') && args.length > 3);
         return mutation && customElementsReady ? customElementsBridge.reactions(() => rawDom(...args)) : rawDom(...args);
@@ -36,7 +36,9 @@
     /* @include js_collections.js */
     function list(a) { return collectionBridge.list(a); }
     function options(o) { return typeof o === 'boolean' ? {capture:o} : (o || {}); }
-    function report(e) { host.log(2, String(e) + (e && e.stack ? '\n' + e.stack : '')); }
+    // Preserve Error identity for native task context/source diagnostics. The
+    // native logger reads only an own stack data property, never a stack getter.
+    function report(e) { host.log(2, e); }
     class Event {
         constructor(type, init = {}) {
             this.type = String(type); this.bubbles = !!init.bubbles;
@@ -79,6 +81,20 @@
             Event.prototype.initEvent.call(this,type,bubbles,cancelable);this.view=view;this.detail=(+detail)>>0;
         }
     }
+    const focusData=new WeakMap();
+    class FocusEvent extends UIEvent {
+        constructor(type,init={}) {
+            if(!arguments.length)throw new TypeError('FocusEvent requires type');
+            init=init==null?{}:Object(init);super(type,init);
+            const target=init.relatedTarget??null;
+            if(target!==null && !(target instanceof EventTarget) && target!==globalThis)
+                throw new TypeError('Expected an EventTarget');
+            focusData.set(this,target);
+        }
+        get relatedTarget(){if(!focusData.has(this))throw new TypeError('Illegal FocusEvent receiver');return focusData.get(this);}
+    }
+    Object.defineProperty(FocusEvent.prototype,Symbol.toStringTag,{configurable:true,value:'FocusEvent'});
+    Object.defineProperty(FocusEvent.prototype,'relatedTarget',Object.assign({},Object.getOwnPropertyDescriptor(FocusEvent.prototype,'relatedTarget'),{enumerable:true}));
     class MouseEvent extends UIEvent {
         constructor(t, o = {}) { super(t,o); mouseAssign(this, {clientX:0, clientY:0, pageX:0, pageY:0,
             screenX:0,screenY:0,button:0, buttons:0, relatedTarget:null, ctrlKey:false, shiftKey:false, altKey:false, metaKey:false}, o); }
@@ -226,8 +242,11 @@
         event._dispatching = true; event.target = target; event._stop = event._immediate = false;
         const plan=snapshot && snapshot.entries?snapshot:shadowBridge.path(target,event,snapshot),entries=plan.entries;
         const hasRelated='relatedTarget' in event;
+        // Retarget the private FocusEvent slot, not its read-only IDL getter.
+        // Mouse events still use their existing internal writable field.
+        function related(value){if(focusData.has(event))focusData.set(event,value);else event.relatedTarget=value;}
         function visit(entry,capture,phase){
-            event.target=entry.target;if(hasRelated)event.relatedTarget=entry.related;
+            event.target=entry.target;if(hasRelated)related(entry.related);
             eventPaths.set(event,entry.visible);event.eventPhase=phase;invoke(entry.node,event,capture);
         }
         for(let i=entries.length-1;i>0 && !event._stop;i--)visit(entries[i],true,entries[i].atTarget?2:1);
@@ -239,7 +258,7 @@
         }
         for(let i=1;i<entries.length && !event._stop;i++)
             if(event.bubbles || entries[i].atTarget)visit(entries[i],false,entries[i].atTarget?2:3);
-        event.target=plan.finalTarget;if(hasRelated)event.relatedTarget=plan.finalRelated;
+        event.target=plan.finalTarget;if(hasRelated)related(plan.finalRelated);
         eventPaths.delete(event);
         event.currentTarget = null; event.eventPhase = 0; event._dispatching = false; event._passive = false;
         return !event.defaultPrevented;
@@ -350,7 +369,10 @@
         get clientHeight() { return dom('geometry',this,'clientHeight'); }
         get clientLeft() { return dom('geometry',this,'clientLeft'); }
         get clientTop() { return dom('geometry',this,'clientTop'); }
-        get style() { let s=state.get(this);if(!s)state.set(this,s={});return s.style||(s.style=new StyleDeclaration(this)); }
+        get style() { return inlineStyle(this); }
+        // CSSOM [PutForwards=cssText]: assignment updates the native inline
+        // declaration without replacing its SameObject style wrapper.
+        set style(value) { inlineStyle(this).cssText=value; }
         get dataset() { const n=this;return new Proxy({}, {get(_,k){return reflectedAttr(n,'data-'+String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase()));},set(_,k,v){reflectedAttr(n,'data-'+String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase()),v);return true;}}); }
     }
     class HTMLElement extends Element {
@@ -360,8 +382,6 @@
         get offsetTop() { return dom('geometry',this,'offsetTop'); }
         get offsetWidth() { return dom('geometry',this,'offsetWidth'); }
         get offsetHeight() { return dom('geometry',this,'offsetHeight'); }
-        get text() { return this.textContent; }
-        set text(v) { this.textContent=v; }
         get value() { return dom('get',this,'value'); }
         set value(v) { dom('set',this,'value',String(v)); }
         get checked() { return dom('get',this,'checked'); }
@@ -469,8 +489,7 @@
         htmlElementBrand(form,'form');
         let collection=formCollections.get(form);
         if(!collection){
-            // SameObject/live collection; RadioNodeList and the dedicated collection type remain unsupported.
-            collection=collectionBridge.html(()=>{
+            collection=formNameBridge.collection(()=>{
                 let root=form,parent;
                 while((parent=rawDom('get',root,'parentNode')))root=parent;
                 return rawDom('formControls',root,form);
@@ -550,14 +569,15 @@
             if(dispatch(this,e))dom('submit',submitter||this);
         }
     }
+    /* @include js_form_named.js */
     class HTMLAnchorElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLAnchorElement constructor');}
     }
     class HTMLAreaElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLAreaElement constructor');}
     }
-    Object.assign(Node, {ELEMENT_NODE:1,TEXT_NODE:3,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
-    Object.assign(Node.prototype, {ELEMENT_NODE:1,TEXT_NODE:3,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
+    Object.assign(Node, {ELEMENT_NODE:1,TEXT_NODE:3,CDATA_SECTION_NODE:4,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
+    Object.assign(Node.prototype, {ELEMENT_NODE:1,TEXT_NODE:3,CDATA_SECTION_NODE:4,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
     class Document extends Node {}
     class HTMLDocument extends Document {}
     function characterDataBrand(node){
@@ -597,6 +617,13 @@
         }
     }
     class Text extends CharacterData {}
+    // CDATASection is an exposed Text-derived interface even in an HTML realm.
+    // HTML documents cannot create CDATA nodes; do not alias it to Text or
+    // advertise an XML parser that the native document model does not have.
+    class CDATASection extends Text {
+        constructor(){throw new TypeError('Illegal CDATASection constructor');}
+    }
+    Object.defineProperty(CDATASection.prototype,Symbol.toStringTag,{value:'CDATASection',configurable:true});
     class Comment extends CharacterData {}
     function processingInstructionCreate(receiver,target,data){
         if(rawDom('get',receiver,'nodeType')!==9)throw new TypeError('Document receiver required');
@@ -666,11 +693,16 @@
         else if(type==='customevent')e=new CustomEvent('');
         else if(['mouseevent','mouseevents'].includes(type))e=new MouseEvent('');
         else if(['uievent','uievents'].includes(type))e=new UIEvent('');
+        else if(type==='focusevent')e=new FocusEvent('');
         else if(['keyboardevent','keyevents'].includes(type))e=new KeyboardEvent('');
         else throw new DOMException('Unsupported event interface','NotSupportedError');
         e._initialized=false;return e;
     };
     function cssName(k){return k==='cssFloat'?'float':String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase());}
+    function inlineStyle(node){
+        if(!rawDom('isNode',null,node)||rawDom('get',node,'nodeType')!==1)throw new TypeError('Expected an Element');
+        let s=state.get(node);if(!s)state.set(node,s={});return s.style||(s.style=new StyleDeclaration(node));
+    }
     class StyleDeclaration {
         constructor(node){this.node=node;return new Proxy(this,{get(t,k){if(k in t||typeof k==='symbol')return Reflect.get(t,k);return t.getPropertyValue(cssName(k));},set(t,k,v){if(k in t)return Reflect.set(t,k,v);t.setProperty(cssName(k),v);return true;}});}
         get cssText(){return reflectedAttr(this.node,'style')||'';}set cssText(v){reflectedAttr(this.node,'style',String(v));}
@@ -705,8 +737,8 @@
     Object.assign(globalThis,{document,console,navigator,Node,Element,HTMLElement,HTMLUnknownElement,HTMLIFrameElement,HTMLImageElement,Image,
         HTMLInputElement,HTMLButtonElement,HTMLSelectElement,HTMLTextAreaElement,HTMLFieldSetElement,HTMLObjectElement,HTMLOutputElement,HTMLOptionElement,
         HTMLScriptElement,HTMLFormElement,HTMLAnchorElement,HTMLAreaElement,
-        Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,Comment,ProcessingInstruction,DocumentFragment,
-        Event,CustomEvent,UIEvent,MouseEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,AbortController,AbortSignal,
+        Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,CDATASection,Comment,ProcessingInstruction,DocumentFragment,
+        Event,CustomEvent,UIEvent,FocusEvent,MouseEvent,WheelEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,AbortController,AbortSignal,
         fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,
         performance:{now:()=>host.now()},getComputedStyle:n=>new Proxy({getPropertyValue:k=>dom('computed',n,String(k))},{get(t,k){return k in t?t[k]:t.getPropertyValue(cssName(k));}})});
     Object.defineProperty(globalThis,'location',{configurable:true,get(){return location;},set(v){host.navigate(String(v));}});
@@ -747,11 +779,13 @@
     fetchBridge.initializeBlobs(blobBridge);
     /* @include js_screen.js */
     /* @include js_intl.js */
+    /* @include js_segmenter.js */
     /* @include js_collator.js */
     /* @include js_crypto.js */
     /* @include js_formdata.js */
     fetchBridge.initializeFormData(formDataBridge);
     /* @include js_credentials.js */
+    /* @include js_navigator_plugins.js */
     /* @include js_object_url.js */
     fetchBridge.initializeObjectURLs(objectURLBridge);
     /* @include js_clone.js */
@@ -766,6 +800,7 @@
     /* @include js_mutations.js */
     /* @include js_selection.js */
     /* @include js_document.js */
+    /* @include js_range.js */
     /* @include js_traversal.js */
     /* @include js_svg.js */
     /* @include js_attributes.js */
@@ -835,6 +870,8 @@
     }
     return {
         storageOrigin:storageBridge.origin,
+        formNamedProperty:formNameBridge.property,
+        formNamedKeys:formNameBridge.keys,
         registerImportMap:importMapsBridge.register,
         resolveModule:importMapsBridge.resolve,
         moduleURL:importMapsBridge.url,
@@ -856,9 +893,10 @@
             if(args[0]==='set' && args[2]==='innerHTML' && args[1] instanceof HTMLTemplateElement)
                 mutationArgs=['set',rawDom('get',args[1],'templateContent'),'innerHTML',args[3]];
             const mutation=mutationBridge.before(...mutationArgs);
-            return ce||mutation?{ce,mutation,op:args[0]}:null;
+            const range=rangeBridge.before(...mutationArgs);
+            return ce||mutation||range?{ce,mutation,range,op:args[0]}:null;
         },
-        customElementAfter(token,result){mutationBridge.after(token.mutation);if(token.op!=='clone' || !result || rawDom('get',result,'scripting'))customElementsBridge.after(token.ce,result);},
+        customElementAfter(token,result){rangeBridge.after(token.range);mutationBridge.after(token.mutation);if(!['clone','import'].includes(token.op) || !result || rawDom('get',result,'scripting'))customElementsBridge.after(token.ce,result);},
         customElementScan(){customElementsBridge.upgradeTree(document);customElementsBridge.formRefresh();},
         customFormReset(form){customElementsBridge.formReset(form);},
         slotChanges(){mutationBridge.signalSlots();},

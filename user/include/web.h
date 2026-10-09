@@ -78,6 +78,8 @@ struct web_navigation_timing {
 #define WEB_JS_TASK_DEFAULT_MS 5000u
 #define WEB_JS_TASK_MIN_MS 1000u
 #define WEB_JS_TASK_MAX_MS 30000u
+#define WEB_WINDOW_VISIBLE 1u
+#define WEB_WINDOW_FOCUSED 2u
 struct web_host {
     void *opaque;
     bool (*request)(void *opaque, const struct web_request *request);
@@ -91,6 +93,7 @@ struct web_host {
     void (*console)(void *opaque, int level, const char *message);
     void (*scroll)(void *opaque, int *x, int *y);
     void (*scroll_to)(void *opaque, int x, int y);
+    unsigned (*window_state)(void *opaque); /* actual host visibility/page focus; optional */
     bool (*history)(void *opaque, int operation, const char *url, const void *state,
                     size_t state_len, int value, struct web_history *out);
     /* The host owns the cookie jar; returned text is malloc'd, never HttpOnly. */
@@ -113,6 +116,7 @@ struct web_host {
 bool web_set_url(web_doc *d, const char *url);
 /* Call between JS tasks, after the host history position and document URL change. */
 void web_history_event(web_doc *d, const char *old_url, bool popstate);
+void web_visibility_event(web_doc *d);
 web_doc *web_live(const char *html, size_t len, const char *url, const char *charset,
                   const struct web_host *host);
 void web_tick(web_doc *d, uint64_t now_ms);
@@ -135,6 +139,8 @@ struct web_event {
     web_node *related_target;
     web_node *submitter; /* SubmitEvent only; NULL for implicit/no-button submit */
     int buttons;
+    double delta_x, delta_y, delta_z;
+    unsigned delta_mode; /* 0=pixels, 1=lines, 2=pages */
     bool synthetic; /* DOM .click() is not a trusted user click */
 };
 /* NULL target means window. false means preventDefault() was called. */

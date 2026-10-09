@@ -53,6 +53,7 @@ void win_update_rect(window_t *win, int x, int y, int w, int h) {
 
 void win_set_title(window_t *win, const char *title) { __syscall(SYS_WIN_SET_TITLE, win->fd, (long)title, 0, 0, 0); }
 void win_move(window_t *win, int x, int y) { __syscall(SYS_WIN_MOVE, win->fd, x, y, 0, 0); }
+int win_state(window_t *win) { return win && !win->closed ? (int)__syscall(SYS_WIN_STATE,win->fd,0,0,0,0) : -EBADF; }
 
 static int fetch(window_t *win, int timeout) {
     if (win->closed) return -1;

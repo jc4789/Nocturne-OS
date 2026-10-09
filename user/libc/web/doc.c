@@ -19,6 +19,20 @@
 #define CSS_SOURCE_LIMIT (8u << 20)
 #define CSS_AST_LIMIT (32u << 20)
 
+bool doc_viewport_overflow_box(const web_doc *d,const box_t *b) {
+    if(!d || !b || !b->node || !d->html || !d->html->style || d->html->style->display==D_NONE)return false;
+    node_t *source=d->html;
+    /* d->html denotes the document element, and d->body may be a frameset.
+       Only an HTML html element propagates from its first displayed HTML body
+       child; a foreign lookalike or frameset must not lose its own clipping. */
+    if(d->html->type==N_ELEM && !d->html->foreign && d->html->tag==T_html &&
+       d->html->style->overflow==OV_VISIBLE)
+        for(node_t *child=d->html->first;child;child=child->next)
+            if(child->type==N_ELEM && !child->foreign && child->tag==T_body &&
+               child->style && child->style->display!=D_NONE){source=child;break;}
+    return b->node==source && b==source->box;
+}
+
 struct pending {
     char *url;
     double order;

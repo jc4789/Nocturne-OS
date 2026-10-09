@@ -102,7 +102,12 @@ static node_t *new_native(struct html_parser *p, lxb_dom_node_t *lex, web_doc *o
         n->tag = (uint16_t)tag_lookup(n->name, len);
         n->namespace_id = lex->ns == LXB_NS_SVG ? NS_SVG : lex->ns == LXB_NS_MATH ? NS_MATHML : NS_HTML;
         n->foreign = n->namespace_id != NS_HTML;
-        n->script_started = n->tag == T_script && (p->fragment || d->inert);
+        /* Contextual Fragment mode is distinct from innerHTML's Inert mode.
+           A detached eligible HTML script is not already started, but parsing
+           never executes it. Preserve inert template owners/foreign scripts;
+           html_resume independently marks EOF-truncated scripts as started. */
+        n->script_started = n->tag == T_script && (d->inert ||
+            (p->fragment && (!p->contextual_fragment || !p->scripting || n->foreign)));
         break;
     case LXB_DOM_NODE_TYPE_DOCUMENT: n->type = N_DOC; break;
     case LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT: n->type = N_FRAGMENT; break;

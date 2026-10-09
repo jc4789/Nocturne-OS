@@ -15,7 +15,8 @@ The bundle provides getCanonicalLocales, Locale, PluralRules, NumberFormat,
 DateTimeFormat, RelativeTimeFormat, ListFormat and DisplayNames, with English and
 Japanese data. Other locale requests use the upstream specified fallback;
 supportedLocalesOf does not advertise unshipped language data. Collator,
-Segmenter and DurationFormat are not implemented. Locale.getCollations depends
+Segmenter is provided separately by `../formatjs-segmenter/`. DurationFormat
+is not implemented. Locale.getCollations depends
 on the unimplemented Collator and is consequently not a complete supported path.
 DateTimeFormat inherits upstream Gregorian/ISO calendar support and a timezone
 transition table extending through 2100. The default zone is UTC; Nocturne has

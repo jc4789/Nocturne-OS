@@ -770,9 +770,27 @@ static void paint_replaced(struct pctx *P, box_t *b) {
     if (b->atomic == AT_IMG) {
         node_t *n = b->node;
         struct web_image *im = n->image >= 0 && n->image < P->d->images.n ? P->d->images.v[n->image] : NULL;
-        image_t *s = im ? scaled_image(im, W, H) : NULL;
+        int fitted_w=W,fitted_h=H;
+        if(im && im->img && W>0 && H>0 && im->img->w>0 && im->img->h>0 && b->st->object_fit!=OF_FILL){
+            float iw=(float)im->img->w,ih=(float)im->img->h;
+            float factor=b->st->object_fit==OF_COVER?fmaxf((float)W/iw,(float)H/ih):fminf((float)W/iw,(float)H/ih);
+            if(b->st->object_fit==OF_NONE)factor=1;
+            else if(b->st->object_fit==OF_SCALE_DOWN)factor=fminf(factor,1);
+            /* The native decoder's finite pixel budget also caps fitted
+               copies, including extreme aspect ratios in cover mode. */
+            float fw=iw*factor,fh=ih*factor;
+            if(fw>IMAGE_MAX_PIXELS || fh>IMAGE_MAX_PIXELS || fw*fh>IMAGE_MAX_PIXELS)return;
+            fitted_w=(int)roundf(fw);fitted_h=(int)roundf(fh);
+        }
+        image_t *s = im ? scaled_image(im, fitted_w, fitted_h) : NULL;
         if (s) {
-            image_draw(c, s, X, Y);
+            float dx=len_resolve(&b->st->object_pos[0],(float)(W-fitted_w));
+            float dy=len_resolve(&b->st->object_pos[1],(float)(H-fitted_h));
+            if(!isfinite(dx) || !isfinite(dy) || fabsf(dx)>10000000 || fabsf(dy)>10000000)return;
+            int sx0=c->cx0,sy0=c->cy0,sx1=c->cx1,sy1=c->cy1;
+            gfx_clip(c,X,Y,W,H);
+            image_draw(c, s, X+(int)roundf(dx), Y+(int)roundf(dy));
+            c->cx0=sx0;c->cy0=sy0;c->cx1=sx1;c->cy1=sy1;
             return;
         }
         if (im && !im->failed && !im->done) return; /* still loading */
@@ -1007,7 +1025,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             set_disclosure_hit(P, details);
         }
     }
-    bool clip = st->overflow != OV_VISIBLE && b->kind != B_INLINE && b->parent;
+    bool clip = st->overflow != OV_VISIBLE && b->kind != B_INLINE && b->parent && !doc_viewport_overflow_box(P->d,b);
     /* Off-screen contexts can still contain viewport-fixed descendants. */
     if (clip && !layers.n && (P->oy + by > c->cy1 || P->oy + by + bh < c->cy0)) { pv_free(&layers); return; }
     /* group opacity: paint, then blend the result with what was there */
@@ -1094,7 +1112,7 @@ static void paint_stacked_layer(struct pctx *P, box_t *l) {
     for (box_t *a = l->parent; a && a->parent; a = a->parent) {
         if (a->st && a->st->display == D_NONE) skip = true;
         if (a->st && a->kind != B_INLINE && a->st->position != POS_STATIC) reached = true;
-        if (a->st && a->st->overflow != OV_VISIBLE && a->kind != B_INLINE && reached &&
+        if (a->st && a->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(P->d,a) && a->kind != B_INLINE && reached &&
             l->st->position != POS_FIXED) {
             float ax = box_abs_x(a) - a->p[3], ay = box_abs_y(a) - a->p[0];
             gfx_clip(c, (int)(P->ox + ax), (int)(P->oy + ay), (int)(a->w + a->p[1] + a->p[3]), (int)(a->h + a->p[0] + a->p[2]));

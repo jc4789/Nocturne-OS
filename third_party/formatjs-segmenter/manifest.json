@@ -1,0 +1,45 @@
+{
+  "packages": {
+    "@formatjs/intl-segmenter": "12.2.15",
+    "@formatjs/intl-localematcher": "0.9.0"
+  },
+  "reused_dependency": "../formatjs/source/@formatjs/fast-memoize 3.1.7",
+  "upstream": "https://github.com/formatjs/formatjs",
+  "files": [
+    {
+      "path": "source/@formatjs/intl-segmenter/index.js",
+      "sha256": "9e919a3aed9da2532ec5d7e8daca09f472549e70ed68cc91fd2c8138ce903bad"
+    },
+    {
+      "path": "source/@formatjs/intl-segmenter/package.json",
+      "sha256": "367ef58158dc739d37e10628866e324753506c9a5f3bf6b4253850a714f5a908"
+    },
+    {
+      "path": "source/@formatjs/intl-segmenter/LICENSE.md",
+      "sha256": "1ada5450c84b70daee947209426e049242ffd6ab5badd4bd8908d36c218284ab"
+    },
+    {
+      "path": "source/@formatjs/intl-localematcher/index.js",
+      "sha256": "8231e86893c5341360f06bf438791708f88d69f1a4cf0871ebf0d6f4cb9b56eb"
+    },
+    {
+      "path": "source/@formatjs/intl-localematcher/package.json",
+      "sha256": "1e8b9e78739fde63c8840048ce2bf393f3525442e409dd7d9b133a71c01ef833"
+    },
+    {
+      "path": "source/@formatjs/intl-localematcher/LICENSE.md",
+      "sha256": "b1cc980e28e9e48f377db191578a9361494ca7117185b69dd66cabaf5b460fb7"
+    }
+  ],
+  "tarballs": [
+    {
+      "url": "https://registry.npmjs.org/@formatjs/intl-segmenter/-/intl-segmenter-12.2.15.tgz",
+      "sha256": "967e50c4273ea84232bad44a8559cfd7e7f835dc65c5a4b83835c0aeae88c9a3"
+    },
+    {
+      "url": "https://registry.npmjs.org/@formatjs/intl-localematcher/-/intl-localematcher-0.9.0.tgz",
+      "sha256": "aaa33590bf76b92f00d94b7e78b09452bd30b56b1a296c71e1de043629e69248"
+    }
+  ],
+  "generated_sha256": "efc6e774edbbdafb682a240eed914dd79eec2bade21cce71cf2b41289ba13115"
+}
