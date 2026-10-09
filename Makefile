@@ -23,7 +23,7 @@ KCFLAGS := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector 
 KLDFLAGS := -m elf_x86_64 -nostdlib -static -z max-page-size=0x1000 -T kernel/linker.ld --no-dynamic-linker
 
 KSRC_C   := $(shell find kernel/src -name '*.c') common/gfx.c
-KSRC_ASM := $(shell find kernel/src -name '*.asm')
+KSRC_ASM := $(shell find kernel/src -name '*.asm') common/unifont.asm
 KOBJ     := $(patsubst %.c,$(BUILD)/k/%.o,$(KSRC_C)) $(patsubst %.asm,$(BUILD)/k/%.asm.o,$(KSRC_ASM))
 
 $(BUILD)/k/%.o: %.c
@@ -47,7 +47,7 @@ UCFLAGS := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector 
 ULDFLAGS := -m elf_x86_64 -s -nostdlib -static -z max-page-size=0x1000 -T user/user.ld --no-dynamic-linker
 
 LIBC_C   := $(shell find user/libc -name '*.c') common/gfx.c
-LIBC_ASM := $(shell find user/libc -name '*.asm')
+LIBC_ASM := $(shell find user/libc -name '*.asm') common/unifont.asm
 LIBC_OBJ := $(patsubst %.c,$(BUILD)/u/%.o,$(LIBC_C)) $(patsubst %.asm,$(BUILD)/u/%.asm.o,$(LIBC_ASM))
 
 # BearSSL (TLS) is linked like libc: programs only pull in the parts they use
@@ -116,6 +116,13 @@ $(BUILD)/u/user/libc/third_party_%.o: UCFLAGS += -w
 # Application chrome uses the bundled font; the kernel compositor and early
 # console keep their allocation-free bitmap renderer and unchanged ABI.
 $(BUILD)/u/common/gfx.o: UCFLAGS += -DNOCTURNE_USER_FONT
+
+# Checked-in full Unifont bitmap data can be regenerated without external paths.
+.PHONY: bitmap-fonts
+bitmap-fonts:
+	@$(PY) scripts/unifont2bin.py third_party/unifont/unifont_jp-18.0.01.bdf.gz common/unifont.bin
+
+$(BUILD)/k/common/unifont.asm.o $(BUILD)/u/common/unifont.asm.o: common/unifont.bin
 
 $(BUILD)/br/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -204,6 +211,7 @@ $(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(
 		$(LXB_HEADERS) ports/lexbor/include/memory.h third_party/lexbor/headers.list \
 		third_party/lexbor/LICENSE third_party/lexbor/NOTICE third_party/lexbor/UPSTREAM.json \
 		third_party/ffmpeg/LICENSE.md third_party/ffmpeg/COPYING.LGPLv2.1 third_party/ffmpeg/manifest.json third_party/ffmpeg/README.nocturne.md \
+		third_party/unifont/OFL-1.1.txt third_party/unifont/NOTICE.txt third_party/unifont/manifest.json \
 		common/abi.h common/gfx.h common/gpu_abi.h $(wildcard user/apps/*.c)
 	@echo "  SYSROOT"
 	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ)

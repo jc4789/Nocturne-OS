@@ -4,12 +4,15 @@
 #include "dev/fb.h"
 #include "dev/fbcon.h"
 #include "mm/pmm.h"
+#include "mm/heap.h"
 
 #define BANNER_H 72
 
 static canvas_t cv;
 static bool ready, enabled;
 static int cols, rows, cx, cy, top;
+/* 0 empty, 1 narrow, 2 wide lead, 3 wide continuation. */
+static uint8_t *cell_spans;
 static uint32_t fg, bg;
 static bool bold;
 static int dirty_y0 = 1 << 30, dirty_y1 = -1;
@@ -56,6 +59,8 @@ void fbcon_init(void) {
     top = BANNER_H + 4;
     cols = fb.width / 8;
     rows = (fb.height - top) / 16;
+    if (cols < 2 || rows < 1) return;
+    cell_spans = kzalloc((size_t)cols * rows);
     fg = DEF_FG;
     bg = DEF_BG;
     gfx_fill(&cv, 0, 0, cv.w, cv.h, DEF_BG);
@@ -72,6 +77,7 @@ void fbcon_clear(void) {
     if (!ready) return;
     gfx_fill(&cv, 0, top, cv.w, cv.h - top, DEF_BG);
     cx = cy = 0;
+    if (cell_spans) memset(cell_spans, 0, (size_t)cols * rows);
     mark(top, cv.h);
     flush();
 }
@@ -80,6 +86,10 @@ static void scroll(void) {
     int line = 16 * cv.pitch;
     memmove(&cv.px[top * cv.pitch], &cv.px[top * cv.pitch + line], (size_t)(rows - 1) * line * 4);
     gfx_fill(&cv, 0, top + (rows - 1) * 16, cv.w, 16, DEF_BG);
+    if (cell_spans) {
+        memmove(cell_spans, cell_spans + cols, (size_t)(rows - 1) * cols);
+        memset(cell_spans + (rows - 1) * cols, 0, cols);
+    }
     mark(top, top + rows * 16);
     cy = rows - 1;
 }
@@ -108,15 +118,32 @@ static void sgr(int n) {
     else if (n >= 100 && n <= 107) bg = palette[n - 100 + 8];
 }
 
-static void putglyph(uint8_t g) {
-    if (cx >= cols) newline();
+static void erase_cell(int x) {
+    if (!cell_spans || x >= cols) return;
+    uint8_t *line = cell_spans + cy * cols;
+    if (line[x] == 3 && x > 0) x--;
+    int n = line[x] == 2 ? 2 : 1;
+    gfx_fill(&cv, x * 8, top + cy * 16, n * 8, 16, bg);
+    memset(line + x, 0, n);
+}
+
+static void putglyph(uint32_t g) {
+    int cells = gfx_codepoint_width(g, FONT_SMALL) / 8;
+    if (cx + cells > cols) newline();
+    erase_cell(cx);
+    if (cells == 2) erase_cell(cx + 1);
     int px = cx * 8, py = top + cy * 16;
     gfx_char(&cv, px, py, g, fg, bg, FONT_SMALL);
+    if (cell_spans) {
+        cell_spans[cy * cols + cx] = cells == 2 ? 2 : 1;
+        if (cells == 2) cell_spans[cy * cols + cx + 1] = 3;
+    }
     mark(py, py + 16);
-    cx++;
+    cx += cells;
 }
 
 static uint32_t utf8_cp;
+static uint32_t utf8_min;
 static int utf8_need;
 
 static void putc_raw(char ch) {
@@ -149,6 +176,10 @@ static void putc_raw(char ch) {
             if (a0 == 2) fbcon_clear();
             break;
         case 'K':
+            if (cell_spans && cx < cols) {
+                erase_cell(cx);
+                memset(cell_spans + cy * cols + cx, 0, cols - cx);
+            }
             gfx_fill(&cv, cx * 8, top + cy * 16, cv.w - cx * 8, 16, bg);
             mark(top + cy * 16, top + cy * 16 + 16);
             break;
@@ -169,25 +200,41 @@ static void putc_raw(char ch) {
     if (utf8_need) {
         if ((c & 0xC0) == 0x80) {
             utf8_cp = (utf8_cp << 6) | (c & 0x3F);
-            if (--utf8_need == 0) putglyph(gfx_glyph_for(utf8_cp));
+            if (--utf8_need == 0) {
+                bool valid = utf8_cp >= utf8_min && utf8_cp <= 0x10FFFF &&
+                             !(utf8_cp >= 0xD800 && utf8_cp <= 0xDFFF);
+                putglyph(valid ? utf8_cp : 0xFFFD);
+            }
             return;
         }
         utf8_need = 0;
+        putglyph(0xFFFD);
     }
     switch (c) {
     case 0x1B: esc_state = 1; return;
     case '\n': newline(); return;
     case '\r': cx = 0; return;
-    case '\b': if (cx > 0) cx--; return;
-    case '\t': do putglyph(' '); while (cx % 8); return;
+    case '\b':
+        if (cx > 0) {
+            cx--;
+            if (cell_spans && cell_spans[cy * cols + cx] == 3 && cx > 0) cx--;
+        }
+        return;
+    case '\t': {
+        int spaces = 8 - cx % 8;
+        while (spaces--) putglyph(' ');
+        return;
+    }
     case 7: return;
     }
-    if (c >= 0xC0) {
+    if (c >= 0xC2 && c <= 0xF4) {
         utf8_need = c >= 0xF0 ? 3 : (c >= 0xE0 ? 2 : 1);
+        utf8_min = utf8_need == 3 ? 0x10000 : utf8_need == 2 ? 0x800 : 0x80;
         utf8_cp = c & (0x3F >> utf8_need);
         return;
     }
     if (c < 32) return;
+    if (c >= 0x80) { putglyph(0xFFFD); return; }
     putglyph(c);
 }
 

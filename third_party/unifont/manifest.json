@@ -1,0 +1,13 @@
+{
+  "font": "Unifont Japanese 18.0.01",
+  "source_filename": "unifont_jp-18.0.01.bdf",
+  "source_sha256": "aa12991a14ddd06986832a57d37c25ffd46e3658ac04d56e253bc737448e8ada",
+  "compressed_filename": "unifont_jp-18.0.01.bdf.gz",
+  "compressed_sha256": "3404778b4cfb8beaf0fa14c7d1a0314e34cd781a0936390625fa11d316f01908",
+  "license": "OFL-1.1",
+  "license_url": "https://unifoundry.com/OFL-1.1.txt",
+  "license_sha256": "869692af094c57fb7258c57fe26820c759319603321d0ffeb278de3651763ded",
+  "kernel_unicode_coverage": "All original BDF glyphs; missing BMP and non-BMP use U+FFFD",
+  "glyph_count": 57086,
+  "index_slots": 65536
+}

@@ -285,7 +285,10 @@ and radial gradients, borders with rounded corners, PNG/JPEG/GIF/WebP/SVG images
 本文と `monospace` の標準フォントは Maple Mono NF です。通常・太字・斜体・太字斜体を同梱し、
 欠けた文字は共通の Maple Mono NF CN Regular で補います。ひらがな・カタカナ・多くの漢字に対応しますが、
 この提供版にハングル音節はありません。アプリの共通UI描画もMaple Monoを使用します。
-起動コンソールとカーネルのウィンドウ装飾は従来のビットマップ描画のままです。
+起動コンソールとカーネルのウィンドウ装飾は Unifont Japanese 18.0.01 由来のビットマップを使用します。
+提供BDFの全57,086字形を収録し、半角8×16・全角16×16を無変形で描画します。
+大フォントは2倍拡大、カーネルのコンソールとウィンドウタイトルもUnicode・全角幅を扱います。
+提供BDFに含まれない文字（BMP外を含む）は置換文字になります。
 端末の全角セル処理やエディターのUnicode編集は別の未対応部分です。
 Links, forms (text fields, checkboxes,
 radio buttons, selects, GET and POST) and find in page work.
@@ -408,7 +411,7 @@ hyperv.ps1   Hyper-V VM setup
 ## Credits
 
 - [Limine](https://github.com/limine-bootloader/limine) bootloader (BSD-2-Clause)
-- [Spleen](https://github.com/fcambus/spleen) bitmap fonts (BSD-2-Clause, see `common/FONT-LICENSE-spleen.txt`)
+- [GNU Unifont Japanese](https://unifoundry.com/unifont/index.html) のカーネル用ビットマップ（18.0.01、SIL Open Font License 1.1）。提供BDF原本・許諾・変換内容は `third_party/unifont/`、起動イメージ内の許諾は `/usr/share/licenses/unifont/`。`python -X utf8 scripts/build.py bitmap-fonts` で再生成できます。
 - [BearSSL](https://bearssl.org/) TLS library (MIT)
 - [TinyCC](https://bellard.org/tcc/) C compiler (LGPL-2.1, source in `third_party/tinycc`)
 - QuickJS JavaScript エンジン（MIT、ソースとライセンスは `third_party/quickjs`）

@@ -443,23 +443,34 @@ static void draw_crescent(canvas_t *c, int cx, int cy, int r, uint32_t col) {
 
 static void text_trunc(canvas_t *c, int x, int y, const char *s, int maxw, uint32_t col) {
     char tmp[96];
-    int maxc = maxw / gfx_font_w(FONT_SMALL);
-    if (maxc <= 0) return;
-    int i = 0, chars = 0;
-    while (s[i] && i < (int)sizeof tmp - 4) {
+    if (maxw <= 0) return;
+    int i = 0, width = 0;
+    while (s[i]) {
         uint32_t cp;
         int n = gfx_utf8_decode(s + i, &cp);
-        if (chars == maxc) break;
+        int w = gfx_codepoint_width(cp, FONT_SMALL);
+        if (i + n >= (int)sizeof tmp || width + w > maxw) break;
         i += n;
-        chars++;
+        width += w;
+    }
+    bool truncated = s[i] != 0;
+    if (truncated) {
+        int ellipsis = gfx_codepoint_width(0x2026, FONT_SMALL);
+        if (ellipsis > maxw) return;
+        int end = i;
+        i = width = 0;
+        while (i < end) {
+            uint32_t cp;
+            int n = gfx_utf8_decode(s + i, &cp);
+            int w = gfx_codepoint_width(cp, FONT_SMALL);
+            if (width + w + ellipsis > maxw || i + n + 3 >= (int)sizeof tmp) break;
+            i += n;
+            width += w;
+        }
     }
     memcpy(tmp, s, i);
+    if (truncated) { memcpy(tmp + i, "\xE2\x80\xA6", 3); i += 3; }
     tmp[i] = 0;
-    if (s[i] && i >= 2) {
-        /* replace the last char with an ellipsis-ish ".." */
-        tmp[i - 1] = '.';
-        tmp[i - 2] = '.';
-    }
     gfx_text(c, x, y, tmp, col, TRANSPARENT, FONT_SMALL);
 }
 

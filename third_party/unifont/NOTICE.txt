@@ -1,0 +1,14 @@
+Nocturne bitmap cell font
+
+Source: user-provided unifont_jp-18.0.01.bdf (GNU Unifont Japanese 18.0.01)
+Upstream: https://unifoundry.com/unifont/index.html
+
+Copyright (C) 1998-2026 Roman Czyborra, Paul Hardy, Qianqian Fang, Andrew Miller, Johnnie Weaver, David Corbett, Ælla Chiana Moskopp, Rebecca Bettencourt, Minseo Lee, Ho-Seok Ee, et al. License: SIL Open Font License version 1.1 and GPLv2+: GNU GPL version 2 or later <http://gnu.org/licenses/gpl.html> with the GNU Font Embedding Exception.
+
+This bitmap adaptation is distributed under SIL Open Font License 1.1.
+The original BDF is preserved byte-for-byte inside the .bdf.gz file.
+Adaptation: all 57,086 original BDF glyphs are retained without alteration.
+8x16 and 16x16 widths are preserved in a direct BMP bitmap table.
+Large glyphs use exact 2x nearest-neighbor enlargement at draw time.
+Missing source glyphs use U+FFFD; no upper-plane glyphs exist in the BDF.
+Regenerate: python -X utf8 scripts/build.py bitmap-fonts

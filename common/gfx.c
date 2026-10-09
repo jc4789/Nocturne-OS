@@ -1,8 +1,7 @@
 /* Nocturne shared 2D graphics library. Freestanding: only needs memcpy. */
 #include "gfx.h"
 #include <stddef.h>
-#include "font8x16.h"
-#include "font16x32.h"
+#include "unifont.h"
 
 void *memcpy(void *d, const void *s, size_t n);
 
@@ -193,47 +192,27 @@ void gfx_triangle(canvas_t *c, int x0, int y0, int x1, int y1, int x2, int y2, u
 
 /* ---- text ---- */
 
-int gfx_font_w(int font) { return font == FONT_LARGE ? FONT16X32_W : FONT8X16_W; }
-int gfx_font_h(int font) { return font == FONT_LARGE ? FONT16X32_H : FONT8X16_H; }
+int gfx_font_w(int font) { return font == FONT_LARGE ? 16 : 8; }
+int gfx_font_h(int font) { return font == FONT_LARGE ? 32 : UNIFONT_HEIGHT; }
 
-uint8_t gfx_glyph_for(uint32_t cp) {
-    if (cp < 256 && !(cp < 32 || (cp >= 127 && cp < 160))) return (uint8_t)cp;
-    int lo = 0, hi = FONT8X16_UMAP_COUNT - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        if (font8x16_umap[mid][0] == cp) return (uint8_t)font8x16_umap[mid][1];
-        if (font8x16_umap[mid][0] < cp) lo = mid + 1;
-        else hi = mid - 1;
-    }
-    /* typographic punctuation (common in AI and web text) the font lacks: nearest ASCII */
-    switch (cp) {
-    case 0x2010: case 0x2011: case 0x2012: case 0x2013: case 0x2014: case 0x2015: case 0x2212:
-        return '-';
-    case 0x2018: case 0x2019: case 0x201A: case 0x2032: return '\'';
-    case 0x201C: case 0x201D: case 0x201E: case 0x2033: return '"';
-    case 0x2026: case 0x22EF: return '.';
-    case 0x2039: return '<';
-    case 0x203A: return '>';
-    case 0x2713: case 0x2714: case 0x2705: return 'v';
-    case 0x2715: case 0x2716: case 0x2717: case 0x2718: case 0x274C: case 0x2A2F: case 0x1F5D9: return 'x';
-    case 0x2002: case 0x2003: case 0x2009: case 0x200A: case 0x202F: return ' ';
-    case 0x200B: case 0x200C: case 0x200D: case 0xFEFF: return ' ';
-    }
-    return '?';
+uint32_t gfx_glyph_for(uint32_t cp) {
+    return cp < UNIFONT_CODEPOINTS && unifont_widths[cp] ? cp : 0xFFFD;
 }
 
 int gfx_utf8_decode(const char *s, uint32_t *cp) {
     const uint8_t *u = (const uint8_t *)s;
     if (u[0] < 0x80) { *cp = u[0]; return 1; }
-    if ((u[0] & 0xE0) == 0xC0 && (u[1] & 0xC0) == 0x80) {
+    if (u[0] >= 0xC2 && u[0] <= 0xDF && (u[1] & 0xC0) == 0x80) {
         *cp = ((u[0] & 0x1F) << 6) | (u[1] & 0x3F);
         return 2;
     }
-    if ((u[0] & 0xF0) == 0xE0 && (u[1] & 0xC0) == 0x80 && (u[2] & 0xC0) == 0x80) {
+    if ((u[0] & 0xF0) == 0xE0 && (u[1] & 0xC0) == 0x80 && (u[2] & 0xC0) == 0x80 &&
+        (u[0] != 0xE0 || u[1] >= 0xA0) && (u[0] != 0xED || u[1] < 0xA0)) {
         *cp = ((u[0] & 0x0F) << 12) | ((u[1] & 0x3F) << 6) | (u[2] & 0x3F);
         return 3;
     }
-    if ((u[0] & 0xF8) == 0xF0 && (u[1] & 0xC0) == 0x80 && (u[2] & 0xC0) == 0x80 && (u[3] & 0xC0) == 0x80) {
+    if (u[0] >= 0xF0 && u[0] <= 0xF4 && (u[1] & 0xC0) == 0x80 && (u[2] & 0xC0) == 0x80 && (u[3] & 0xC0) == 0x80 &&
+        (u[0] != 0xF0 || u[1] >= 0x90) && (u[0] != 0xF4 || u[1] <= 0x8F)) {
         *cp = ((u[0] & 0x07) << 18) | ((u[1] & 0x3F) << 12) | ((u[2] & 0x3F) << 6) | (u[3] & 0x3F);
         return 4;
     }
@@ -245,46 +224,36 @@ int gfx_utf8_decode(const char *s, uint32_t *cp) {
 #include "font.h"
 #endif
 
-int gfx_char(canvas_t *c, int x, int y, uint8_t glyph, uint32_t fg, uint32_t bg, int font) {
+int gfx_codepoint_width(uint32_t cp, int font) {
 #ifdef NOCTURNE_USER_FONT
-    uint32_t cp = glyph;
-    if (glyph < 32 || (glyph >= 127 && glyph < 160)) {
-        for (int i = 0; i < FONT8X16_UMAP_COUNT; i++)
-            if (font8x16_umap[i][1] == glyph) { cp = font8x16_umap[i][0]; break; }
-    }
+    int advance = font_cell_width(cp, font);
+    if (advance >= 0) return advance;
+#endif
+    return unifont_widths[gfx_glyph_for(cp)] * (font == FONT_LARGE ? 2 : 1);
+}
+
+int gfx_char(canvas_t *c, int x, int y, uint32_t cp, uint32_t fg, uint32_t bg, int font) {
+#ifdef NOCTURNE_USER_FONT
     int advance = font_cell_draw(c, x, y, cp, fg, bg, font);
     if (advance >= 0) return advance;
 #endif
-    int fw = gfx_font_w(font), fh = gfx_font_h(font);
+    cp = gfx_glyph_for(cp);
+    int scale = font == FONT_LARGE ? 2 : 1;
+    int fw = unifont_widths[cp] * scale, fh = UNIFONT_HEIGHT * scale;
     if (x >= c->cx1 || y >= c->cy1 || x + fw <= c->cx0 || y + fh <= c->cy0) return fw;
     int bgop = (bg >> 24) != 0;
-    if (font == FONT_LARGE) {
-        const uint8_t *g = font16x32_data[glyph];
-        for (int j = 0; j < fh; j++) {
-            int yy = y + j;
-            if (yy < c->cy0 || yy >= c->cy1) continue;
-            uint16_t bits = (uint16_t)((g[j * 2] << 8) | g[j * 2 + 1]);
-            uint32_t *row = &c->px[yy * c->pitch];
-            for (int i = 0; i < fw; i++) {
-                int xx = x + i;
-                if (xx < c->cx0 || xx >= c->cx1) continue;
-                if (bits & (0x8000 >> i)) row[xx] = fg;
-                else if (bgop) row[xx] = bg;
-            }
-        }
-    } else {
-        const uint8_t *g = font8x16_data[glyph];
-        for (int j = 0; j < fh; j++) {
-            int yy = y + j;
-            if (yy < c->cy0 || yy >= c->cy1) continue;
-            uint8_t bits = g[j];
-            uint32_t *row = &c->px[yy * c->pitch];
-            for (int i = 0; i < fw; i++) {
-                int xx = x + i;
-                if (xx < c->cx0 || xx >= c->cx1) continue;
-                if (bits & (0x80 >> i)) row[xx] = fg;
-                else if (bgop) row[xx] = bg;
-            }
+    const uint8_t *g = unifont_rows[cp];
+    for (int j = 0; j < fh; j++) {
+        int yy = y + j;
+        if (yy < c->cy0 || yy >= c->cy1) continue;
+        int source_row = (j / scale) * 2;
+        uint16_t bits = (uint16_t)((g[source_row] << 8) | g[source_row + 1]);
+        uint32_t *row = &c->px[yy * c->pitch];
+        for (int i = 0; i < fw; i++) {
+            int xx = x + i;
+            if (xx < c->cx0 || xx >= c->cx1) continue;
+            if (bits & (0x8000u >> (i / scale))) row[xx] = fg;
+            else if (bgop) row[xx] = bg;
         }
     }
     return fw;
@@ -300,25 +269,20 @@ int gfx_text(canvas_t *c, int x, int y, const char *s, uint32_t fg, uint32_t bg,
             y += gfx_font_h(font);
             continue;
         }
-#ifdef NOCTURNE_USER_FONT
-        int advance = font_cell_draw(c, x, y, cp, fg, bg, font);
-        if (advance >= 0) { x += advance; continue; }
-#endif
-        x += gfx_char(c, x, y, gfx_glyph_for(cp), fg, bg, font);
+        x += gfx_char(c, x, y, cp, fg, bg, font);
     }
     return x - x0;
 }
 
 int gfx_text_width(const char *s, int font) {
-    int n = 0;
+    int n = 0, widest = 0;
     while (*s) {
         uint32_t cp;
         s += gfx_utf8_decode(s, &cp);
-#ifdef NOCTURNE_USER_FONT
-        int advance = font_cell_width(cp, font);
-        if (advance >= 0) { n += advance; continue; }
-#endif
-        n += gfx_font_w(font);
+        if (cp == '\n') {
+            if (n > widest) widest = n;
+            n = 0;
+        } else n += gfx_codepoint_width(cp, font);
     }
-    return n;
+    return n > widest ? n : widest;
 }

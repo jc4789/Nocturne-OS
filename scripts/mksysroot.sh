@@ -39,6 +39,8 @@ mkdir -p "$S/usr/share/licenses/lexbor"
 cp third_party/lexbor/LICENSE third_party/lexbor/NOTICE third_party/lexbor/UPSTREAM.json "$S/usr/share/licenses/lexbor/"
 mkdir -p "$S/usr/share/licenses/ffmpeg"
 cp third_party/ffmpeg/LICENSE.md third_party/ffmpeg/COPYING.LGPLv2.1 third_party/ffmpeg/manifest.json third_party/ffmpeg/README.nocturne.md "$S/usr/share/licenses/ffmpeg/"
+mkdir -p "$S/usr/share/licenses/unifont"
+cp third_party/unifont/OFL-1.1.txt third_party/unifont/NOTICE.txt third_party/unifont/manifest.json "$S/usr/share/licenses/unifont/"
 cp $T/include/*.h "$S/usr/lib/tcc/include/"
 # the sources of the programs in /bin, as examples of the APIs
 mkdir -p "$S/usr/src/apps"

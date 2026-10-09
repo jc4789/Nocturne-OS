@@ -33,12 +33,14 @@ void gfx_blit(canvas_t *dst, int dx, int dy, const canvas_t *src, int sx, int sy
 void gfx_blit_alpha(canvas_t *dst, int dx, int dy, const canvas_t *src, int sx, int sy, int w, int h);
 void gfx_triangle(canvas_t *c, int x0, int y0, int x1, int y1, int x2, int y2, uint32_t col);
 
-int gfx_char(canvas_t *c, int x, int y, uint8_t glyph, uint32_t fg, uint32_t bg, int font);
+int gfx_char(canvas_t *c, int x, int y, uint32_t codepoint, uint32_t fg, uint32_t bg, int font);
 int gfx_text(canvas_t *c, int x, int y, const char *utf8, uint32_t fg, uint32_t bg, int font);
 int gfx_text_width(const char *utf8, int font);
 int gfx_font_w(int font);
 int gfx_font_h(int font);
-uint8_t gfx_glyph_for(uint32_t codepoint);
+/* Width of a Unicode glyph, including full-width cells and fallback. */
+int gfx_codepoint_width(uint32_t codepoint, int font);
+uint32_t gfx_glyph_for(uint32_t codepoint);
 /* decode one UTF-8 sequence; returns bytes consumed (>=1) */
 int gfx_utf8_decode(const char *s, uint32_t *cp);
 

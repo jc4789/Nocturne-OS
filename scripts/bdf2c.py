@@ -6,6 +6,7 @@ which are filled with handy Unicode symbols (box drawing, blocks, arrows, a moon
 A Unicode -> slot table is emitted too so text renderers can decode UTF-8.
 """
 import sys
+import gzip
 
 EXTRA = {
     1: 0x263A, 2: 0x263B, 3: 0x2665, 4: 0x2666, 5: 0x2663, 6: 0x2660, 7: 0x2022,
@@ -26,7 +27,8 @@ def parse_bdf(path):
     glyphs = {}
     fbb = None
     ascent = None
-    with open(path, encoding="latin-1") as f:
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8") as f:
         lines = f.read().splitlines()
     i = 0
     while i < len(lines):
@@ -119,4 +121,5 @@ def main():
             f.write("};\n#define %s_UMAP_COUNT %d\n" % (name.upper(), len(umap)))
 
 
-main()
+if __name__ == "__main__":
+    main()

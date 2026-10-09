@@ -33,10 +33,15 @@ static int mono_font(const wfont *f) { return f->px >= 24 ? FONT_LARGE : FONT_SM
 float wf_width(const wfont *f, const char *s, size_t n) {
     if (f->px < 1) return 0;
     if (f->ttf) return font_width(f->ttf, f->px, s, n);
-    int k = 0;
-    for (size_t i = 0; i < n; i++)
-        if (((unsigned char)s[i] & 0xC0) != 0x80) k++;
-    return (float)(k * gfx_font_w(mono_font(f)));
+    int width = 0;
+    for (size_t i = 0; i < n;) {
+        uint32_t cp;
+        int bytes = gfx_utf8_decode(s + i, &cp);
+        if ((size_t)bytes > n - i) break;
+        width += gfx_codepoint_width(cp, mono_font(f));
+        i += (size_t)bytes;
+    }
+    return (float)width;
 }
 
 void wf_metrics(const wfont *f, float *asc, float *desc) {
@@ -54,15 +59,16 @@ float wf_draw(canvas_t *c, const wfont *f, float x, int baseline, const char *s,
     if (f->px < 1) return x;
     if (f->ttf) return font_draw(c, f->ttf, f->px, x, baseline, s, n, color);
     int font = mono_font(f);
-    int fh = gfx_font_h(font), cw = gfx_font_w(font);
+    int fh = gfx_font_h(font);
     int top = baseline - (int)(fh * 0.75f);
     for (size_t i = 0; i < n;) {
         uint32_t cp;
-        i += (size_t)gfx_utf8_decode(s + i, &cp);
-        uint8_t g = gfx_glyph_for(cp);
-        gfx_char(c, (int)x, top, g, color, 0, font);
-        if (f->bold) gfx_char(c, (int)x + 1, top, g, color, 0, font);
-        x += (float)cw;
+        int bytes = gfx_utf8_decode(s + i, &cp);
+        if ((size_t)bytes > n - i) break;
+        i += (size_t)bytes;
+        int advance = gfx_char(c, (int)x, top, cp, color, 0, font);
+        if (f->bold) gfx_char(c, (int)x + 1, top, cp, color, 0, font);
+        x += (float)advance;
     }
     return x;
 }
