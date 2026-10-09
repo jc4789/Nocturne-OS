@@ -11,7 +11,7 @@ static bool control_edit_target(web_doc *d,node_t *n,bool write){
     return true;
 }
 static web_doc *control_edit_owner(web_doc *top,node_t *n){
-    if(!top||!n||!n->owner||web_focused(top)!=n)return NULL;
+    if(!top||!top->live||top->inert||!n||!n->owner||web_focused(top)!=n)return NULL;
     web_doc *owner=n->owner,*p=owner;
     for(;p&&p!=top;p=p->frame_parent)if(!p->live)return NULL;
     return p==top?owner:NULL;
@@ -43,8 +43,8 @@ static int control_user_replace(web_doc *d,node_t *n,uint32_t start,uint32_t end
     for(struct control_edit_guard *p=control_edits_running;p;p=p->previous)if(p->document==d)return 1;
     doc_control_init(d,n);
     const char *value=web_input_edit_text(n);size_t bytes=strlen(value);
-    if(bytes>(16u<<20)||text_len>(16u<<20)||(!text&&text_len)||
-       (text_len&&!control_edit_utf8(text,text_len))||bytes+text_len>(16u<<20)+6u)return 1;
+    if(bytes>SIZE_MAX-7||text_len>SIZE_MAX-7-bytes||(!text&&text_len)||
+       (text_len&&!control_edit_utf8(text,text_len)))return 1;
     uint32_t length=doc_utf16_length(value);if(start>end||end>length)return 1;
     char *old=malloc(bytes+1),*data=malloc(text_len+1);sbuf proposal={0};
     if(!old||!data){free(old);free(data);return 1;}
@@ -61,9 +61,10 @@ static int control_user_replace(web_doc *d,node_t *n,uint32_t start,uint32_t end
                 if(n->tag==T_textarea){sb_putc(&proposal,'\n');if(i+1<text_len&&data[i+1]=='\n')i++;}
             }else if(c!='\n'||n->tag==T_textarea)sb_putc(&proposal,c);
         }
-        inserted=doc_utf16_length(proposal.p+at);caret=start+inserted;
+        inserted=doc_utf16_length(proposal.p+at);
+        if (inserted > UINT32_MAX - start || inserted > UINT32_MAX - (length - (end - start))) goto unchanged;
+        caret=start+inserted;
         control_slice(&proposal,old,end,length);
-        if(proposal.n>(16u<<20))goto unchanged;
         if(n->tag==T_input&&(web_input_type(n)==WEB_INPUT_URL||web_input_type(n)==WEB_INPUT_EMAIL)){
             while(leading<proposal.n&&(proposal.p[leading]==' '||proposal.p[leading]=='\t'||proposal.p[leading]=='\n'||proposal.p[leading]=='\r'||proposal.p[leading]=='\f'))leading++;
             uint32_t removed=doc_byte_to_utf16(proposal.p,leading);caret=caret>removed?caret-removed:0;
@@ -74,6 +75,7 @@ static int control_user_replace(web_doc *d,node_t *n,uint32_t start,uint32_t end
     node_t *root=d->root;uint32_t saved_start=n->selection_start,saved_end=n->selection_end;
     uint8_t direction=n->selection_direction;int kind=n->tag==T_textarea?-1:(int)web_input_type(n);
     struct control_edit_guard guard={d,control_edits_running};control_edits_running=&guard;
+    void *task=web_js_edit_begin(d);
     bool allowed=web_js_input_event(d,n,"beforeinput",input_type,null_data?NULL:data,text_len);
     if(allowed&&control_edit_target(d,n,true)&&d->root==root&&
        kind==(n->tag==T_textarea?-1:(int)web_input_type(n))&&
@@ -86,10 +88,11 @@ static int control_user_replace(web_doc *d,node_t *n,uint32_t start,uint32_t end
             doc_control_selection(d,n,caret,caret,0);
             /* Dispatch at the original owner only while it is still live. */
             web_js_input_event(d,n,"input",input_type,null_data?NULL:data,text_len);
-            control_edits_running=guard.previous;sb_free(&proposal);free(old);free(data);return 3;
+            control_edits_running=guard.previous;sb_free(&proposal);free(old);free(data);web_js_edit_end(task);return 3;
         }
     }
     control_edits_running=guard.previous;
+    web_js_edit_end(task);
 unchanged:sb_free(&proposal);free(old);free(data);return 1;
 }
 int web_control_edit(web_doc *top,web_node *target,const char *input_type,const char *data,size_t length){
@@ -108,8 +111,26 @@ char *web_control_selected_text(web_doc *top,web_node *target,size_t *length){
     if(!d||!control_edit_target(d,target,false)||!doc_control_selection_supported(target)||
        (target->tag==T_input&&web_input_type(target)==WEB_INPUT_PASSWORD))return NULL;
     doc_control_init(d,target);const char *value=web_input_edit_text(target);size_t bytes=strlen(value);
-    if(bytes>(16u<<20))return NULL;
+    if(bytes>SIZE_MAX-7)return NULL;
     sbuf text={0};text.cap=bytes+7;text.p=malloc(text.cap);if(!text.p)return NULL;text.p[0]=0;
     control_slice(&text,value,target->selection_start,target->selection_end);
+    /* Native controls preserve WTF-8/UTF-16 selection boundaries, whereas the
+       OS clipboard exports Unicode scalar text. Never store an unpaired
+       surrogate that a subsequent user paste would correctly reject. */
+    size_t in=0,out=0;
+    while(in<text.n){
+        const unsigned char *p=(const unsigned char *)text.p+in;
+        if(in+2<text.n&&p[0]==0xed&&p[1]>=0xa0&&p[1]<=0xbf&&(p[2]&0xc0)==0x80){
+            uint32_t unit=0xd000u|((p[1]&63u)<<6)|(p[2]&63u);in+=3;
+            const unsigned char *q=(const unsigned char *)text.p+in;
+            if(unit<0xdc00&&in+2<text.n&&q[0]==0xed&&q[1]>=0xb0&&q[1]<=0xbf&&(q[2]&0xc0)==0x80){
+                uint32_t low=0xd000u|((q[1]&63u)<<6)|(q[2]&63u);in+=3;
+                out+=(size_t)utf8_put(text.p+out,0x10000u+((unit-0xd800u)<<10)+(low-0xdc00u));
+            }else{
+                text.p[out++]=(char)0xef;text.p[out++]=(char)0xbf;text.p[out++]=(char)0xbd;
+            }
+        }else text.p[out++]=text.p[in++];
+    }
+    text.n=out;text.p[out]=0;
     if(length)*length=text.n;return text.p;
 }

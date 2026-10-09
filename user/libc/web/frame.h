@@ -1,11 +1,9 @@
 /* Native child browsing contexts. Windows are guarded by js.c; no JS DOM copy. */
 #pragma once
 #include "webi.h"
-#define WEB_FRAMES_MAX 32u
-#define WEB_FRAME_DEPTH_MAX 8u
-#define WEB_FRAME_NAVIGATIONS_MAX 128u
 struct web_frame {
     struct web_frame *next;
+    web_doc *owner;
     node_t *element;
     node_t *window_token;
     web_doc *document;
@@ -15,9 +13,17 @@ struct web_frame {
     uint64_t request;
     unsigned dom_order;
     bool notified, detached, failed, initial_failed;
+    canvas_t paint;
+    bool paint_failed;
     int scroll_x, scroll_y;
 };
 bool web_frame_element(const node_t *node);
+struct web_frame *web_frame_walk_next(web_doc *root,struct web_frame *frame,bool descend);
+node_t *web_frame_dom_next(node_t *root,node_t *node);
+/* 1 ancestor match, 0 distinct, -1 allocation failure. */
+int web_frame_ancestor_url(web_doc *parent,const char *url);
+void web_frames_prepare_paint(web_doc *root);
+void web_frames_finish_paint(web_doc *root);
 struct web_frame *web_frame_find(web_doc *document, node_t *element);
 struct web_frame *web_frame_ensure(web_doc *document, node_t *element);
 void web_frame_retire(struct web_frame *frame);

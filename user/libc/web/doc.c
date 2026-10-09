@@ -16,11 +16,10 @@
 #include "avmedia.h"
 #include "js_worker.h"
 #include "frame.h"
+#include "cssom.h"
+#include <limits.h>
 
-/* Cached source and its expanded selector/declaration AST have separate,
-   finite live-document budgets. All document and shadow sheets share cssmem. */
-#define CSS_SOURCE_LIMIT (8u << 20)
-#define CSS_AST_LIMIT (32u << 20)
+/* Document arenas and stylesheet storage grow through the OS allocator. */
 
 bool doc_viewport_overflow_box(const web_doc *d,const box_t *b) {
     if(!d || !b || !b->node || !d->html || !d->html->style || d->html->style->display==D_NONE)return false;
@@ -100,6 +99,7 @@ static char *data_url(const char *u, size_t *out_n) {
     const char *s = comma + 1;
     size_t n = strlen(s);
     char *o = malloc(n + 1);
+    if(!o)return NULL;
     size_t k = 0;
     if (base64) {
         uint32_t acc = 0;
@@ -155,70 +155,169 @@ static bool media_wanted(const char *m) {
     return false;
 }
 
-static void add_sheet(web_doc *d, const char *css, size_t n, const char *base, double order, const char *media, node_t *scope) {
-    if (d->css_depth >= 16) return;
-    d->css_depth++;
+struct sheet_walk {
+    struct sheet_walk *parent;
+    const char *url, *base; /* cached request/final URL, not an inline sheet's base */
+    sheet_t *sheet;
+    pvec imports;
+    int next;
+    sbuf wrapped;
+};
+
+static bool sheet_url_equal(const char *a, const char *b) {
+    if (!a || !b) return false;
+    size_t an = strcspn(a, "#"), bn = strcspn(b, "#");
+    return an == bn && !memcmp(a, b, an);
+}
+
+static bool sheet_ancestor_url(const struct sheet_walk *f, const char *url) {
+    for (; f; f = f->parent)
+        if (sheet_url_equal(url, f->url) || sheet_url_equal(url, f->base)) return true;
+    return false;
+}
+
+/* The vectors expose int indices. Their representable size and real allocation
+   failure, rather than a stylesheet-count quota, bound publication. */
+static bool sheet_push(pvec *p, void *value) {
+    if (p->n == INT_MAX) return false;
+    if (p->n == p->cap) {
+        int cap = p->cap ? (p->cap > INT_MAX / 2 ? INT_MAX : p->cap * 2) : 16;
+        if ((size_t)cap > SIZE_MAX / sizeof *p->v) return false;
+        void **v = realloc(p->v, sizeof *p->v * (size_t)cap);
+        if (!v) return false;
+        p->v = v; p->cap = cap;
+    }
+    p->v[p->n++] = value;
+    return true;
+}
+
+static void sheet_walk_free(struct sheet_walk *f) {
+    for (; f;) {
+        struct sheet_walk *parent = f->parent;
+        for (int i = f->next; i < f->imports.n; i++) {
+            struct css_import *im = f->imports.v[i];
+            free(im->url); free(im);
+        }
+        pv_free(&f->imports); sb_free(&f->wrapped); free(f);
+        f = parent;
+    }
+}
+
+static bool sheet_parse(web_doc *d, struct sheet_walk *f, const char *css, size_t n,
+                        const char *base, double order, const char *media, node_t *scope) {
     arena_t *arena = d->live ? &d->cssmem : &d->mem;
     const char *source = css ? css : "", *source_base = base ? base : "", *source_media = media ? media : "";
     for (struct css_sheet_reuse *c = d->css_reuse; c; c = c->next) {
         if (n != c->n || strcmp(source_base, c->base) || strcmp(source_media, c->media) || memcmp(source, c->css, n)) continue;
-        pv_push(&d->sty.sheets, css_sheet_instance(arena, c->sheet, order, scope));
-        d->need_style = true; d->css_depth--;
-        return;
+        f->sheet = css_sheet_instance(arena, c->sheet, order, scope);
+        return true;
     }
-    pvec imports = {0};
     sheet_t *sh;
     if (media && *media) {
-        sbuf w = {0};
-        sb_puts(&w, "@media ");
-        sb_puts(&w, media);
-        sb_puts(&w, "{\n");
-        sb_put(&w, css, n);
-        sb_puts(&w, "\n}");
-        sh = css_parse_sheet(arena, w.p, w.n, base, order, &imports);
-        sb_free(&w);
-    } else sh = css_parse_sheet(arena, css, n, base, order, &imports);
+        sbuf *w = &f->wrapped;
+        sb_puts(w, "@media "); sb_puts(w, media); sb_puts(w, "{\n");
+        sb_put(w, source, n); sb_puts(w, "\n}");
+        sh = css_parse_sheet(arena, w->p, w->n, source_base, order, &f->imports);
+        sb_free(w);
+    } else sh = css_parse_sheet(arena, source, n, source_base, order, &f->imports);
     css_sheet_scope(sh, scope);
-    pv_push(&d->sty.sheets, sh);
-    if (!imports.n && d->css_reuse_count < 128 && n <= CSS_SOURCE_LIMIT && d->css_reuse_bytes <= CSS_SOURCE_LIMIT - n) {
+    f->sheet = sh;
+    if (!f->imports.n && d->css_reuse_count < UINT_MAX && n < SIZE_MAX && d->css_reuse_bytes <= SIZE_MAX - n) {
         struct css_sheet_reuse *c = ar_alloc(arena, sizeof *c);
         c->css = ar_strndup(arena, source, n); c->n = n;
         c->base = ar_strdup(arena, source_base); c->media = ar_strdup(arena, source_media);
         c->sheet = sh; c->next = d->css_reuse; d->css_reuse = c;
         d->css_reuse_count++; d->css_reuse_bytes += n;
     }
-    for (int i = 0; i < imports.n; i++) {
-        struct css_import *im = imports.v[i];
+    return true;
+}
+
+static void add_sheet_ast(web_doc *d, const char *css, size_t n, const char *base, double order, const char *media, node_t *scope, sheet_t *native_ast) {
+    struct sheet_walk *volatile active = calloc(1, sizeof(struct sheet_walk));
+    if (!active) {
+        web_js_console(d, 2, "Stylesheet import traversal allocation failed");
+        return;
+    }
+    /* Inline sheets use their document URL for resolution, but are not an
+       imported ancestor of every stylesheet fetched from that document URL. */
+    for (int i = 0; d->live && i < d->css_cache.n; i++) {
+        struct cached_css *c = d->css_cache.v[i];
+        if (c->body == css && c->n == n) { active->url = c->url; active->base = c->base; break; }
+    }
+    arena_t *arena = d->live ? &d->cssmem : &d->mem;
+    jmp_buf trap;
+    jmp_buf *outer_trap = arena->trap;
+    arena->trap = &trap;
+    int arena_failed = setjmp(trap);
+    bool failed = false;
+    if (arena_failed) {
+        sheet_walk_free(active);
+        arena->trap = outer_trap;
+        if (outer_trap) longjmp(*outer_trap, arena_failed);
+        web_js_console(d, 2, "Stylesheet arena allocation failed during import traversal");
+        d->need_style = true;
+        return;
+    }
+    if (native_ast) {
+        active->sheet = css_sheet_instance(arena,native_ast,order,scope);
+        if (media && *media) css_sheet_media(active->sheet,ar_strdup(arena,media));
+        for (struct css_rule_info *r=css_sheet_rules(native_ast,NULL);r;r=r->next) if (r->import_url) {
+            struct css_import *im=calloc(1,sizeof *im);
+            if (!im) { failed=true;break; }
+            im->url=strdup(r->import_url); im->order=order;
+            if (!im->url || !sheet_push(&active->imports,im)) { free(im->url);free(im);failed=true;break; }
+        }
+    } else if (!sheet_parse(d, active, css, n, base, order, media, scope)) failed = true;
+    while (!failed && active) {
+        struct sheet_walk *f = active;
+        if (f->next == f->imports.n) {
+            /* Postorder is CSS import source order. All members of this root
+               sheet use its order key; the stable cascade sort then preserves
+               imports before the parent, without a shrinking floating-point
+               depth interval that can cross an earlier root stylesheet. */
+            if (!sheet_push(&d->sty.sheets, f->sheet)) { failed = true; break; }
+            d->sty.index_dirty = true;
+            active = f->parent; f->parent = NULL; sheet_walk_free(f);
+            continue;
+        }
+        /* Keep the parent slot until child creation succeeds: an arena failure
+           then cleans the current import as well as the remaining siblings. */
+        struct css_import *im = f->imports.v[f->next];
         struct cached_css *cached = d->live ? cached_css(d, im->url) : NULL;
+        bool cycle = sheet_ancestor_url(f, im->url) ||
+                     (cached && sheet_ancestor_url(f, cached->base));
+        if (cycle) { f->next++; free(im->url); free(im); continue; }
         if (cached && cached->done) {
-            if (cached->body) add_sheet(d, cached->body, cached->n, cached->base, im->order, media, scope);
-            free(im->url);
-            free(im);
+            if (cached->body) {
+                struct sheet_walk *child = calloc(1, sizeof *child);
+                if (!child) { failed = true; break; }
+                child->parent = f; child->url = cached->url; child->base = cached->base;
+                f->next++; free(im->url); free(im);
+                active = child;
+                if (!sheet_parse(d, child, cached->body, cached->n, cached->base, order, media, scope)) failed = true;
+            } else { f->next++; free(im->url); free(im); }
             continue;
         }
         if (d->live && css_queued(d, im->url)) {
-            free(im->url);
-            free(im);
+            f->next++; free(im->url); free(im);
             continue;
         }
-        if (d->live && d->css_cache.n >= 128) {
-            free(im->url);
-            free(im);
-            continue;
+        struct pending *p = calloc(1, sizeof *p);
+        if (!p) { failed = true; break; }
+        p->url = im->url; p->order = im->order; p->scope = scope;
+        p->media = media && *media ? strdup(media) : NULL;
+        if ((media && *media && !p->media) || !sheet_push(&d->pending_css, p)) {
+            free(p->media); free(p); failed = true; break;
         }
-        if (d->pending_css.n < 64) {
-            struct pending *p = calloc(1, sizeof *p);
-            p->url = im->url;
-            p->order = im->order;
-            p->media = media && *media ? strdup(media) : NULL;
-            p->scope = scope;
-            pv_push(&d->pending_css, p);
-        } else free(im->url);
-        free(im);
+        f->next++; free(im); /* URL ownership has moved to pending_css. */
     }
-    pv_free(&imports);
+    sheet_walk_free(active);
+    arena->trap = outer_trap;
     d->need_style = true;
-    d->css_depth--;
+    if (failed) web_js_console(d, 2, "Stylesheet import traversal allocation or index representation failed");
+}
+static void add_sheet(web_doc *d,const char *css,size_t n,const char *base,double order,const char *media,node_t *scope) {
+    add_sheet_ast(d,css,n,base,order,media,scope,NULL);
 }
 
 void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *base) {
@@ -226,27 +325,32 @@ void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *
 }
 
 static char *doc_absolute_url(const char *base,const char *relative) {
-    char *url=malloc(HTTP_URL_MAX);
-    if(url && url_resolve(base,relative,url,HTTP_URL_MAX))return url;
+    char *url=NULL;
+    if(web_resolve_url_owned(base,relative,&url)==1)return url;
     free(url);return NULL;
 }
-static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int preferred) {
-    if (preferred >= 0 && preferred < d->images.n && !strcmp(((struct web_image *)d->images.v[preferred])->url, abs)) return preferred;
+static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int preferred,bool image_upgrade) {
+    if (preferred >= 0 && preferred < d->images.n) {
+        struct web_image *im=d->images.v[preferred];
+        if(im->image_upgrade==image_upgrade && !strcmp(im->url,abs))return preferred;
+    }
     int failed_match = -1;
     for (int i = 0; i < d->images.n; i++) {
         struct web_image *im = d->images.v[i];
-        if (strcmp(im->url, abs)) continue;
+        if (im->image_upgrade!=image_upgrade || strcmp(im->url, abs)) continue;
         if (!im->done || !im->failed) return i;
         if (failed_match < 0) failed_match = i;
     }
     if (failed_match >= 0 && !retry_failed) return failed_match;
-    if (d->images.n >= 2000) return -1;
+    if (d->images.n == INT_MAX) return -1;
     struct web_image *im = calloc(1, sizeof *im);
     if (!im) return -1;
     im->url = strdup(abs);
+    im->image_upgrade = image_upgrade;
     if (!im->url) { free(im); return -1; }
     if (d->images.n == d->images.cap) {
-        int cap = d->images.cap ? d->images.cap * 2 : 16;
+        int cap = d->images.cap ? d->images.cap > INT_MAX/2 ? INT_MAX : d->images.cap * 2 : 16;
+        if((size_t)cap > SIZE_MAX/sizeof(void *)){free(im->url);free(im);return -1;}
         void **items = realloc(d->images.v, sizeof(void *) * (size_t)cap);
         if (!items) { free(im->url); free(im); return -1; }
         d->images.v = items; d->images.cap = cap;
@@ -261,13 +365,13 @@ static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int prefer
     }
     return idx;
 }
-static int add_image_request(web_doc *d, const char *rel, bool retry_failed, int preferred) {
+static int add_image_request(web_doc *d, const char *rel, bool retry_failed, int preferred,bool image_upgrade) {
     if(!rel || !*rel)return -1;
     while(is_space((unsigned char)*rel))rel++;
     char *abs=doc_absolute_url(d->base,rel);if(!abs)return -1;
-    int result=add_image_url(d,abs,retry_failed,preferred);free(abs);return result;
+    int result=add_image_url(d,abs,retry_failed,preferred,image_upgrade);free(abs);return result;
 }
-static int add_image(web_doc *d, const char *rel) { return add_image_request(d, rel, false, -1); }
+static int add_image(web_doc *d, const char *rel) { return add_image_request(d, rel, false, -1,true); }
 
 /* the srcset candidate for a 1x display: an "1x" one, else the first */
 static char *srcset_pick(const char *ss) {
@@ -340,7 +444,12 @@ void doc_image_sync(web_doc *d, node_t *n) {
     else if (placeholder_src(src) && lazy) src = lazy;
     else if (placeholder_src(src) && node_attr(n, "data-srcset")) src = pick = srcset_pick(node_attr(n, "data-srcset"));
     bool has_source = src != NULL || ss != NULL;
-    int requested = add_image_request(d, src, n->image_invalidated, n->image_initialized && !n->image_invalidated ? n->image_request : -1);
+    /* Keep responsive/CORS images outside this ordinary-image upgrade path.
+       In particular, URL deduplication must not promote a blocked imageset. */
+    bool image_upgrade=!ss && !node_attr(n,"data-srcset") && !node_attr(n,"crossorigin") &&
+        !(n->parent && !n->parent->foreign && n->parent->tag==T_picture);
+    int requested = add_image_request(d, src, n->image_invalidated,
+        n->image_initialized && !n->image_invalidated ? n->image_request : -1,image_upgrade);
     free(pick);
     if (!n->image_initialized || n->image_invalidated || requested != n->image_request || has_source != n->image_has_source) {
         n->image_initialized = true; n->image_invalidated = false;
@@ -373,20 +482,46 @@ void doc_control_init(web_doc *d, node_t *n) {
 }
 
 static bool link_stylesheet(node_t *n) {
-    if (!n || n->type != N_ELEM || n->foreign || n->tag != T_link ||
-        node_attr(n,"disabled")) return false;
+    if (!n || n->type != N_ELEM || n->foreign || n->tag != T_link) return false;
     const char *rel = node_attr(n,"rel"), *type = node_attr(n,"type");
-    if (!rel || (type && *type && !str_ieq(type,"text/css")) ||
-        !media_wanted(node_attr(n,"media"))) return false;
-    bool sheet = false, alternate = false;
+    if (!rel || (type && *type && !str_ieq(type,"text/css"))) return false;
+    bool sheet = false;
     while (*rel) {
         while (is_space((unsigned char)*rel)) rel++;
         const char *end = rel; while (*end && !is_space((unsigned char)*end)) end++;
         if (end-rel == 10 && strn_ieq(rel,"stylesheet",10)) sheet = true;
-        if (end-rel == 9 && strn_ieq(rel,"alternate",9)) alternate = true;
         rel = end;
     }
-    return sheet && !alternate;
+    return sheet;
+}
+static bool link_sheet_applies(node_t *n) {
+    if (cssom_owner_disabled(n) || !media_wanted(node_attr(n,"media"))) return false;
+    const char *rel=node_attr(n,"rel");
+    while (rel && *rel) {
+        while(is_space((unsigned char)*rel))rel++;
+        const char *end=rel;while(*end&&!is_space((unsigned char)*end))end++;
+        if(end-rel==9&&strn_ieq(rel,"alternate",9))return false;
+        rel=end;
+    }
+    return true;
+}
+/* Borrow only a completed native resource, never a fabricated empty sheet.
+   URL/data scratch is caller-owned; cache text/base survives the document. */
+int doc_cssom_link_source(web_doc *d,node_t *n,struct cssom_link_source *source) {
+    memset(source,0,sizeof *source);
+    if(!d||!n||n->owner!=d||!d->live||d->inert||!link_stylesheet(n)||
+        doc_node_root(n,true)!=d->root||node_ancestor(n,T_template))return CSSOM_INACTIVE;
+    const char *href=node_attr(n,"href");if(!href||!*href)return CSSOM_INACTIVE;
+    int resolved=web_resolve_url_owned(d->base,href,&source->url);
+    if(resolved!=1)return resolved<0?CSSOM_OOM:CSSOM_INACTIVE;
+    if(!strncasecmp(source->url,"data:",5)) {
+        source->owned_text=data_url(source->url,&source->length);
+        if(!source->owned_text){bool malformed=!strchr(source->url,',');free(source->url);memset(source,0,sizeof *source);return malformed?CSSOM_INACTIVE:CSSOM_OOM;}
+        source->text=source->owned_text;source->base=d->base;return CSSOM_OK;
+    }
+    struct cached_css *cached=cached_css(d,source->url);
+    if(!cached||!cached->done||!cached->body){free(source->url);memset(source,0,sizeof *source);return CSSOM_INACTIVE;}
+    source->text=cached->body;source->length=cached->n;source->base=cached->base;return CSSOM_OK;
 }
 bool doc_link_load_current(web_doc *d, node_t *n, uint64_t generation) {
     if (!d || !d->live || d->inert || !n || n->owner != d ||
@@ -485,13 +620,19 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             }
             struct cached_css *cached = d->live ? cached_css(d, abs) : NULL;
             if (cached && cached->done) {
-                if (cached->body) add_sheet(d, cached->body, cached->n, cached->base, d->next_sheet_order++, media, scope);
+                if (cached->body && link_sheet_applies(c)) {
+                    if(c->cssom_current) {
+                        int error;struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
+                        if(sheet)add_sheet_ast(d,sheet->source,sheet->length,sheet->base,d->next_sheet_order++,media,scope,sheet->ast);
+                        else if(error==CSSOM_OOM)web_js_console(d,2,"Native link style sheet allocation failed");
+                    }else add_sheet(d,cached->body,cached->n,cached->base,d->next_sheet_order++,media,scope);
+                }
                 link_stylesheet_complete(d,c,!cached->body);
                 free(abs);
                 break;
             }
+            if(cssom_owner_disabled(c)){free(abs);break;}
             if (d->live && css_queued(d, abs)) {free(abs);break;}
-            if (d->live && d->css_cache.n >= 128) {free(abs);break;}
             struct pending *pd = calloc(1, sizeof *pd);
             if(!pd){free(abs);break;}
             pd->url = abs;
@@ -501,18 +642,19 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             if (!strncasecmp(abs, "data:", 5)) {
                 size_t dn;
                 char *css = data_url(abs, &dn);
-                if (css) add_sheet(d, css, dn, d->base, pd->order, pd->media, scope);
+                if (css && link_sheet_applies(c)) {
+                    if(c->cssom_current) {
+                        int error;struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
+                        if(sheet)add_sheet_ast(d,sheet->source,sheet->length,sheet->base,pd->order,pd->media,scope,sheet->ast);
+                        else if(error==CSSOM_OOM)web_js_console(d,2,"Native link style sheet allocation failed");
+                    }else add_sheet(d,css,dn,d->base,pd->order,pd->media,scope);
+                }
                 link_stylesheet_complete(d,c,!css);
                 free(css);
                 free(pd->url);
                 free(pd->media);
                 free(pd);
-            } else if (d->pending_css.n < 64) pv_push(&d->pending_css, pd);
-            else {
-                free(pd->url);
-                free(pd->media);
-                free(pd);
-            }
+            } else pv_push(&d->pending_css, pd);
             break;
         }
         case T_style: {
@@ -520,10 +662,17 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             const char *media = node_attr(c, "media");
             if (c->style_disabled || (type && *type && !str_ieq(type, "text/css")) ||
                 !media_wanted(media) || node_ancestor(c, T_template)) break;
-            sbuf b = {0};
-            text_of(c, &b);
-            add_sheet(d, b.p ? b.p : "", b.n, d->base, d->next_sheet_order++, media, scope);
-            sb_free(&b);
+            /* Keep the existing per-snapshot native AST reuse for untouched
+               sheets. A real CSSOM handle lazily promotes only its owner to
+               persistent parser storage, not every repeated component style. */
+            if (d->live && c->cssom_current) {
+                int error; struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
+                if (sheet) add_sheet_ast(d,sheet->source,sheet->length,sheet->base,d->next_sheet_order++,media,scope,sheet->ast);
+                else if (error==CSSOM_OOM) web_js_console(d,2,"Native style sheet allocation failed");
+            } else {
+                sbuf b = {0}; text_of(c,&b);
+                add_sheet(d,b.p ? b.p : "",b.n,d->base,d->next_sheet_order++,media,scope); sb_free(&b);
+            }
             break;
         }
         case T_img: doc_image_sync(d, c); break;
@@ -547,40 +696,17 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
 }
 
 /* ---------------------------------------------------------------- documents */
-static size_t browsing_dom_used(web_doc *d,web_doc *wanted,bool *seen) {
-    const size_t limit=32u<<20;
-    if(!d)return 0;
-    if(d==wanted)*seen=true;
-    size_t used=d->mem.allocated+d->control_bytes;if(used>=limit)return limit;
-    for(web_doc *p=d->dom_docs;p;p=p->dom_next){
-        size_t n=browsing_dom_used(p,wanted,seen);if(n>=limit-used)return limit;used+=n;
-    }
-    for(struct web_frame *f=d->frames;f;f=f->next){
-        size_t n=browsing_dom_used(f->document,wanted,seen);if(n>=limit-used)return limit;used+=n;
-        for(web_doc *p=f->retired;p;p=p->frame_retired_next){n=browsing_dom_used(p,wanted,seen);if(n>=limit-used)return limit;used+=n;}
-    }
-    return used;
-}
 size_t doc_dom_remaining(web_doc *d) {
-    web_doc *family = d->dom_family ? d->dom_family : d;
-    while(family->frame_parent)family=family->frame_parent;
-    bool seen=false;size_t used=browsing_dom_used(family,d,&seen);
-    /* A freshly constructed child is not committed into its frame yet. */
-    if(!seen){size_t own=d->mem.allocated+d->control_bytes;if(own>=(32u<<20)-MIN(used,32u<<20))return 0;used+=own;}
-    return used >= (32u << 20) ? 0 : (32u << 20) - used;
+    /* Accounting headroom, not a promise of physically available RAM. */
+    if (!d || d->control_bytes > SIZE_MAX - d->mem.allocated) return 0;
+    return SIZE_MAX - d->mem.allocated - d->control_bytes;
 }
 void doc_dom_budget(web_doc *d) {
-    if (!d || (!d->live && !d->dom_family && !d->inert)) return;
-    size_t left = doc_dom_remaining(d);
-    d->mem.limit = d->mem.allocated + left;
-    if (!d->mem.limit) d->mem.limit = 1; /* arena zero means unbounded */
+    if (d) d->mem.limit = 0; /* arena zero: actual allocator/overflow only */
 }
 web_doc *doc_inert(web_doc *family, const char *html, size_t n, const char *url) {
-    if (!family || n > (16u << 20)) return NULL;
+    if (!family || n == SIZE_MAX || (n && !html)) return NULL;
     family = family->dom_family ? family->dom_family : family;
-    unsigned count = 0;
-    for (web_doc *p = family->dom_docs; p; p = p->dom_next) count++;
-    if (count >= 64 || doc_dom_remaining(family) < 65536) return NULL;
     web_doc *d = calloc(1, sizeof *d);
     if (!d) return NULL;
     d->inert = true; d->dom_family = family;
@@ -621,11 +747,11 @@ web_doc *web_live(const char *html, size_t len, const char *url, const char *cha
 }
 web_doc *web_live_child(const char *html, size_t len, const char *url, const char *charset,
                        const struct web_host *host, web_doc *parent,node_t *frame,web_doc *inherited_origin) {
-    if (len > (16u << 20)) return NULL;
+    if (len == SIZE_MAX || (len && !html)) return NULL;
     web_doc *d = calloc(1, sizeof *d);
     if (!d) return NULL;
     d->live = true;
-    d->frame_parent=parent;d->frame_element=frame;d->frame_depth=parent?parent->frame_depth+1:0;
+    d->frame_parent=parent;d->frame_element=frame;
     if(parent && frame){struct web_frame *f=web_frame_find(parent,frame);d->window_token=f?f->window_token:NULL;}
     if(inherited_origin && parent){
         d->origin_owner=inherited_origin->origin_owner?inherited_origin->origin_owner:inherited_origin;
@@ -633,8 +759,8 @@ web_doc *web_live_child(const char *html, size_t len, const char *url, const cha
         if(!d->inherited_url){free(d);return NULL;}
     }
     d->dirty = d->need_style = d->resources_dirty = true;
-    d->mem.limit = 32u << 20;
-    d->cssmem.limit = CSS_AST_LIMIT;
+    d->mem.limit = 0;
+    d->cssmem.limit = 0;
     d->url = strdup(url && *url ? url : "about:blank");
     if (!d->url) { free((void *)d->inherited_url);free(d); return NULL; }
     snprintf(d->base, sizeof d->base, "%s", web_effective_url(d));
@@ -729,7 +855,6 @@ void doc_rescan(web_doc *d) {
     d->css_reuse = NULL; d->css_reuse_count = 0; d->css_reuse_bytes = 0;
     free_pending(d);
     d->next_sheet_order = 0;
-    d->css_depth = 0;
     d->base_seen = false;
     d->scan_title_seen = false;
     d->refresh_url = NULL;
@@ -787,7 +912,6 @@ void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const ch
     if (!d || !url) return;
     struct cached_css *c = cached_css(d, url);
     if (!c) {
-        if (d->css_cache.n >= 128) return;
         c = calloc(1, sizeof *c);
         if (!c) return;
         c->url = strdup(url);
@@ -797,14 +921,14 @@ void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const ch
     }
     if (c->done) return;
     c->done = true;
-    if (css && n <= CSS_SOURCE_LIMIT && d->css_bytes <= CSS_SOURCE_LIMIT - n) {
+    if (css && n < SIZE_MAX && d->css_bytes <= SIZE_MAX - n) {
         c->body = malloc(n + 1);
         if (c->body) {
             memcpy(c->body, css, n);
             c->body[n] = 0;
             c->n = n;
             d->css_bytes += n;
-        }
+        } else web_js_console(d, 2, "Stylesheet storage allocation failed in the OS allocator");
     }
     d->resources_dirty = d->dirty = d->need_style = true;
 }
@@ -844,10 +968,24 @@ int64_t web_deadline(web_doc *d) {
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *r) {
     if (d && d->live) {web_js_loaded(d, id, r);web_frames_loaded(d,id,r);}
 }
+bool web_response_set_url(struct web_response *r, const char *url) {
+    if (!r || !url) return false;
+    size_t length = strlen(url);
+    if (length == SIZE_MAX) return false;
+    char *owned = NULL;
+    if (length >= sizeof r->url) {
+        owned = malloc(length + 1);
+        if (!owned) return false;
+        memcpy(owned, url, length + 1);
+    } else memmove(r->url, url, length + 1);
+    free(r->url_full); r->url_full = owned;
+    if (owned) r->url[0] = 0;
+    return true;
+}
 void web_response_free(struct web_response *r) {
     if (!r) return;
-    free(r->body); free(r->headers_full);
-    r->body = r->headers_full = NULL; r->body_len = 0;
+    free(r->body); free(r->headers_full); free(r->url_full);
+    r->body = r->headers_full = r->url_full = NULL; r->body_len = 0;
 }
 bool web_dirty(web_doc *d) {
     if (!d) return false;
@@ -867,6 +1005,8 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
 }
 
 static void free_values(node_t *n) {
+    cssom_style_free(n);
+    web_paint_debug_node_free(n);
     css_animation_free(n);
     web_canvas_free(n);
     web_input_files_release(n);
@@ -884,6 +1024,7 @@ static void free_values(node_t *n) {
 
 void web_free(web_doc *d) {
     if (!d) return;
+    doc_active_cancel(d);
     web_dialog_free(d);
     web_avmedia_free(d);
     web_frames_free(d);
@@ -898,6 +1039,8 @@ void web_free(web_doc *d) {
     d->parser = NULL;
     if (d->owned_nodes) {
         for (node_t *n = d->owned_nodes; n; n = n->owned_next) {
+            cssom_style_free(n);
+            web_paint_debug_node_free(n);
             css_animation_free(n);
             web_canvas_free(n);
             web_input_files_release(n);
@@ -939,12 +1082,15 @@ void web_free(web_doc *d) {
     ar_free(&d->lmem);
     ar_free(&d->cssmem);
     free(d->url);
+    free(d->resolved_link);
+    free(d->find_text);
     free((void *)d->inherited_url);
     free(d);
 }
 
 const char *web_title(web_doc *d) { return d->title ? d->title : ""; }
 const char *web_url(web_doc *d) { return d->url; }
+#include "frame_address.h"
 bool web_set_url(web_doc *d, const char *url) {
     if (!d || !url) return false;
     char *copy = strdup(url);
@@ -1056,6 +1202,9 @@ int web_layout(web_doc *d, int width, int height) {
        result until DOM/style, viewport, or image intrinsic dimensions change. */
     if (d->layout_valid && !d->need_style && d->root_box &&
         d->width == width && d->height == height) return d->doc_h;
+    /* No independent patch may publish a previously committed video span
+       while geometry is incomplete. Native PCM/transport supply continues. */
+    web_avmedia_layout_begin(d);
     if(d->width!=width||d->height!=height){
         d->width=width;d->height=height;
         for(node_t *image=doc_image_node_next(d,NULL);image;image=doc_image_node_next(d,image))doc_image_sync(d,image);
@@ -1071,11 +1220,7 @@ int web_layout(web_doc *d, int width, int height) {
     layout_doc(d, width, height);
     d->layout_revision++;
     d->layout_valid = true;
-    if (d->find_text[0]) {
-        char t[sizeof d->find_text];
-        memcpy(t, d->find_text, sizeof t);
-        web_find(d, t, 0);
-    }
+    if (d->find_text && *d->find_text) web_find(d, d->find_text, 0);
     return d->doc_h;
 }
 
@@ -1084,7 +1229,9 @@ int web_doc_width(web_doc *d) {
     if (!d) return 0;
     double width = MAX(d->width,d->doc_w);
     if (d->root_box && isfinite(d->root_box->scroll_w)) width = MAX(width,d->root_box->scroll_w);
-    return width <= 0 ? 0 : width >= 100000000 ? 100000000 : (int)ceil(width);
+    /* The public viewport API is signed int; internal finite CSS extents are
+       not a page-size quota. Compare as double before the narrowing cast. */
+    return !isfinite(width) || width <= 0 ? 0 : width >= (double)INT_MAX ? INT_MAX : (int)ceil(width);
 }
 void web_viewport_position(web_doc *d, int x, int y) {
     if (d) { d->view_x = MAX(x,0); d->view_y = MAX(y,0); }
@@ -1177,18 +1324,27 @@ int doc_element_scroll_into_view(web_doc *d, node_t *n, int block, int inline_, 
     double target[4];
     if (!n->box || !n->box->st || n->box->st->display == D_NONE) return 0;
     box_t *first = n->box->kind == B_INLINE ? n->anchor_block : n->box->cb;
-    unsigned hops = 0, count = 0;
+    int count = 0;
+    box_t *slow = first, *fast = first;
     bool fixed = n->box->st->position == POS_FIXED;
     for (box_t *a = first; a; a = a->cb) {
-        if (++hops > 4096) return -2; /* refuse before changing any offset */
+        /* Reject an actual invalid containing-block cycle, not an arbitrary
+           number of legal ancestors. Detect it before mutating any offset. */
+        slow = slow ? slow->cb : NULL;
+        fast = fast && fast->cb ? fast->cb->cb : NULL;
+        if (slow && slow == fast) return -2;
         if (a->st && a->st->position == POS_FIXED) fixed = true;
-        if (box_element_scrollable(a) && (!nearest_only || !count)) count++;
+        if (box_element_scrollable(a) && (!nearest_only || !count)) {
+            if (count == INT_MAX) return -3; /* pvec's actual index type */
+            count++;
+        }
     }
     if (!scroll_target_rect(n, target)) return 0;
     if (count) {
+        if ((size_t)count > SIZE_MAX / sizeof *changed->v) return -3;
         changed->v = malloc((size_t)count * sizeof *changed->v);
         if (!changed->v) return -1;
-        changed->cap = (int)count;
+        changed->cap = count;
     }
     for (box_t *a = first; a; a = a->cb) {
         if (!box_element_scrollable(a)) continue;
@@ -1210,7 +1366,6 @@ int doc_element_scroll_into_view(web_doc *d, node_t *n, int block, int inline_, 
 }
 
 const char *doc_link_href(web_doc *d, node_t *a) {
-    static char buf[HTTP_URL_MAX];
     if (!a || !a->owner) return NULL;
     /* Adoption changes the URL base even if the caller retained its old doc. */
     d = a->owner;
@@ -1219,8 +1374,10 @@ const char *doc_link_href(web_doc *d, node_t *a) {
     if (!h) return NULL;
     while (is_space((unsigned char)*h)) h++;
     if (!strncasecmp(h, "javascript:", 11)) return NULL;
-    if (!url_resolve(d->base, h, buf, sizeof buf)) return NULL;
-    return buf;
+    char *resolved=NULL;
+    if(web_resolve_url_owned(d->base,h,&resolved)!=1)return NULL;
+    free(d->resolved_link);d->resolved_link=resolved;
+    return d->resolved_link;
 }
 
 /* the border-box top of the element's first box, or of the line its first inline box is on */
@@ -1240,37 +1397,149 @@ static bool node_top(node_t *n, float *y) {
     return false;
 }
 
-static node_t *find_anchor(node_t *n, const char *frag) {
-    for (node_t *c = n->first; c; c = c->next) {
-        if (c->type != N_ELEM) continue;
-        if (c->id && !strcmp(c->id, frag)) return c;
-        if (c->tag == T_a) {
+static node_t *find_anchor(node_t *root, const char *frag, bool named) {
+    /* Real document tree order, without native-stack depth or a fixed quota.
+       All matching IDs precede the legacy named-anchor fallback. */
+    for (node_t *c = root ? root->first : NULL; c;) {
+        if (c->type == N_ELEM && !named && c->id && !strcmp(c->id, frag)) return c;
+        if (named && c->type == N_ELEM && c->tag == T_a && !c->foreign) {
             const char *nm = node_attr(c, "name");
             if (nm && !strcmp(nm, frag)) return c;
         }
-        node_t *r = find_anchor(c, frag);
-        if (r) return r;
+        if (c->first) { c = c->first; continue; }
+        while (c != root && !c->next) c = c->parent;
+        if (c == root) break;
+        c = c->next;
     }
     return NULL;
 }
 
 int web_anchor_y(web_doc *d, const char *fragment) {
-    if (!fragment || !*fragment || !d->root) return -1;
-    if (!strcmp(fragment, "top")) return 0;
-    /* percent-decode */
-    char f[256];
+    if (!d || !fragment || !d->root) return -1;
+    if (!*fragment) return 0;
+    node_t *n = find_anchor(d->root, fragment, false);
+    if (!n) n = find_anchor(d->root, fragment, true);
+    float y;
+    if (n) {
+        if (!node_top(n, &y)) return -1;
+        return !isfinite(y) || y < 0 ? 0 : (double)y >= (double)INT_MAX ? INT_MAX : (int)y;
+    }
+    /* Percent decoding cannot increase the byte length. Retain the entire
+       fragment instead of silently matching an unrelated 255-byte prefix. */
+    size_t length = strlen(fragment);
+    if (length == SIZE_MAX) return -1;
+    char *f = malloc(length + 1);
+    if (!f) return -1;
     size_t k = 0;
-    for (const char *p = fragment; *p && k + 1 < sizeof f; p++) {
+    for (const char *p = fragment; *p; p++) {
         if (*p == '%' && hexv(p[1]) >= 0 && hexv(p[2]) >= 0) {
             f[k++] = (char)(hexv(p[1]) * 16 + hexv(p[2]));
             p += 2;
         } else f[k++] = *p;
     }
     f[k] = 0;
-    node_t *n = find_anchor(d->root, f);
-    float y;
+    /* The byte-oriented native attribute layer cannot represent an embedded
+       NUL. Do not turn it into a successful lookup of an unrelated prefix. */
+    if (memchr(f, 0, k)) { free(f); return -1; }
+    n = find_anchor(d->root, f, false);
+    if (!n) n = find_anchor(d->root, f, true);
+    bool top = str_ieq(f, "top");
+    free(f);
+    if (!n && top) return 0;
     if (!n || !node_top(n, &y)) return -1;
-    return y < 0 ? 0 : (int)y;
+    return !isfinite(y) || y < 0 ? 0 : (double)y >= (double)INT_MAX ? INT_MAX : (int)y;
+}
+
+static void hover_target_set(web_doc *d,node_t *target) {
+    if(d->hover_target==target)return;
+    d->hover_target=target;
+    if(d->live){
+        d->dirty=d->need_style=true;
+        for(web_doc *p=d->frame_parent;p && p->live;p=p->frame_parent)p->dirty=true;
+    }
+}
+void doc_hover_update(web_doc *d,node_t *target) {
+    if(!d)return;
+    web_doc *root=d;while(root->frame_parent)root=root->frame_parent;
+    web_doc *leaf=target?target->owner:NULL;
+    if(leaf && (!leaf->live || doc_node_root(target,true)!=leaf->root || web_dialog_inert(leaf,target)))leaf=NULL;
+    if(leaf){
+        web_doc *p=leaf;
+        while(p && p!=root){
+            struct web_frame *f=web_frame_find(p->frame_parent,p->frame_element);
+            if(!p->frame_parent || !p->frame_parent->live || !f || f->detached || f->document!=p ||
+               doc_node_root(p->frame_element,true)!=p->frame_parent->root){p=NULL;break;}
+            p=p->frame_parent;
+        }
+        if(p!=root)leaf=NULL;
+    }
+    if(!leaf)target=NULL;
+    if(root->hover_leaf==leaf && (!leaf || leaf->hover_target==target))return;
+    /* Find the context-chain intersection without allocating or scanning the
+       whole frame forest. Parent frame hover survives movement within a child. */
+    web_doc *old=root->hover_leaf,*a=old,*b=leaf;size_t da=0,db=0;
+    for(web_doc *p=a;p;p=p->frame_parent)da++;
+    for(web_doc *p=b;p;p=p->frame_parent)db++;
+    while(da>db){a=a->frame_parent;da--;}
+    while(db>da){b=b->frame_parent;db--;}
+    while(a!=b){a=a->frame_parent;b=b->frame_parent;}
+    for(web_doc *p=old;p && p!=a;p=p->frame_parent)hover_target_set(p,NULL);
+    for(web_doc *p=leaf;p;p=p->frame_parent){
+        hover_target_set(p,target);target=p->frame_element;
+    }
+    root->hover_leaf=leaf;
+}
+
+static void active_target_set(web_doc *d,node_t *target) {
+    if(d->active_target==target)return;
+    d->active_target=target;
+    if(d->live){
+        d->dirty=d->need_style=true;
+        for(web_doc *p=d->frame_parent;p && p->live;p=p->frame_parent)p->dirty=true;
+    }
+}
+static bool active_target_valid(web_doc *root,web_doc *leaf,node_t *target) {
+    if(!root || !root->live || !leaf || !leaf->live || !target || target->owner!=leaf ||
+       doc_node_root(target,true)!=leaf->root || web_dialog_inert(leaf,target))return false;
+    for(web_doc *p=leaf;p!=root;p=p->frame_parent){
+        if(!p || !p->frame_parent || !p->frame_parent->live)return false;
+        struct web_frame *f=web_frame_find(p->frame_parent,p->frame_element);
+        if(!f || f->detached || f->document!=p ||
+           doc_node_root(p->frame_element,true)!=p->frame_parent->root ||
+           web_dialog_inert(p->frame_parent,p->frame_element))return false;
+    }
+    return true;
+}
+void web_active_release(web_doc *d) {
+    if(!d)return;
+    web_doc *root=d;while(root->frame_parent)root=root->frame_parent;
+    web_doc *old=root->active_leaf;root->active_leaf=NULL;
+    for(web_doc *p=old;p;p=p->frame_parent)active_target_set(p,NULL);
+}
+void web_active_press(web_doc *d,node_t *target) {
+    if(!d)return;
+    web_doc *root=d;while(root->frame_parent)root=root->frame_parent;
+    web_doc *leaf=target?target->owner:NULL;
+    web_active_release(root);
+    if(!active_target_valid(root,leaf,target))return;
+    root->active_leaf=leaf;
+    for(web_doc *p=leaf;p;p=p->frame_parent){
+        active_target_set(p,target);target=p->frame_element;
+    }
+}
+void doc_active_cancel(web_doc *d) {
+    if(!d)return;
+    web_doc *root=d;while(root->frame_parent)root=root->frame_parent;
+    for(web_doc *p=root->active_leaf;p;p=p->frame_parent)
+        if(p==d){web_active_release(root);return;}
+}
+node_t *doc_active_target(web_doc *d) {
+    if(!d || !d->live)return NULL;
+    web_doc *root=d;while(root->frame_parent)root=root->frame_parent;
+    web_doc *leaf=root->active_leaf;
+    if(!active_target_valid(root,leaf,leaf?leaf->active_target:NULL))return NULL;
+    for(web_doc *p=leaf;p;p=p->frame_parent)if(p==d)return d->active_target;
+    return NULL;
 }
 
 bool web_node_rect(web_doc *d, web_node *n, int *x, int *y, int *w, int *h) {
@@ -1281,9 +1550,11 @@ bool web_node_rect(web_doc *d, web_node *n, int *x, int *y, int *w, int *h) {
         web_doc *ancestor=owner;while(ancestor && ancestor!=d)ancestor=ancestor->frame_parent;
         if (!owner || !owner->live || root!=owner->root || !ancestor) return false;
     }
-    box_t *b = n->box;
-    *x = (int)(box_visual_x(b) - b->p[3] - b->b[3]);
-    *y = (int)(box_visual_y(b) - b->p[0] - b->b[0]);
+    double rect[4];
+    if (!scroll_target_rect(n, rect)) return false;
+    for (unsigned i=0;i<4;i++) if(rect[i]<INT32_MIN || rect[i]>INT32_MAX)return false;
+    *x = (int)rect[0];
+    *y = (int)rect[1];
     web_dialog_scroll_offset(owner, n, x, y);
     for(web_doc *child=owner;child && child!=d;child=child->frame_parent) {
         struct web_frame *f=web_frame_find(child->frame_parent,child->frame_element);
@@ -1292,8 +1563,8 @@ bool web_node_rect(web_doc *d, web_node *n, int *x, int *y, int *w, int *h) {
         *y+=(int)box_visual_y(child->frame_element->box)-f->scroll_y;
         web_dialog_scroll_offset(child->frame_parent,child->frame_element,x,y);
     }
-    *w = (int)(b->w + b->p[1] + b->p[3] + b->b[1] + b->b[3]);
-    *h = (int)(b->h + b->p[0] + b->p[2] + b->b[0] + b->b[2]);
+    *w = (int)rect[2];
+    *h = (int)rect[3];
     return true;
 }
 
@@ -1385,7 +1656,7 @@ static bool control_replace(web_doc *d, node_t *n, uint32_t start, uint32_t end,
     if (end > length) end = length;
     if (start > end) return false;
     size_t bytes = strlen(value), replacement = strlen(text);
-    if (replacement > (16u << 20) || bytes > (16u << 20) || bytes + replacement > (16u << 20) + 6u) return false;
+    if (bytes > SIZE_MAX - 7 || replacement > SIZE_MAX - 7 - bytes) return false;
     /* Reserve enough for both split-surrogate boundaries. Do not let sbuf's
        abort-on-OOM grow path turn a failed edit into a browser process crash. */
     sbuf b = {0}; b.cap = bytes + replacement + 7; b.p = malloc(b.cap);
@@ -1481,7 +1752,10 @@ void web_focus(web_doc *d, web_node *n) {
 }
 
 web_node *web_focused(web_doc *d) {
-    if(d && web_frame_element(d->focus)){struct web_frame *f=web_frame_find(d,d->focus);if(f && f->document && !f->detached)return web_focused(f->document);}
+    while(d && web_frame_element(d->focus)){
+        struct web_frame *f=web_frame_find(d,d->focus);if(!f || !f->document || f->detached)break;
+        d=f->document;
+    }
     return d && !web_dialog_inert(d,d->focus) ? d->focus : NULL;
 }
 web_node *web_disclosure_focus(web_node *details) {
@@ -1500,11 +1774,14 @@ static bool readonly(node_t *n) {
 
 #include "control_edit.h"
 
-int web_key(web_doc *d, const struct gui_event *e) {
-    if(!d||!e)return 0;
+static int web_key_local(web_doc *d, const struct gui_event *e) {
+    if(!d||!e||!d->live||d->inert)return 0;
     node_t *n = d->focus;
-    if(web_frame_element(n)){struct web_frame *f=web_frame_find(d,n);if(f && f->document && !f->detached){int result=web_key(f->document,e);if(result)d->dirty=true;return result;}}
-    if (!control_edit_target(d,n,false)) return 0;
+    /* Range's existing arrow-step UI is numeric, never text replacement. */
+    bool range_step=n&&n->owner==d&&n->type==N_ELEM&&!n->foreign&&n->tag==T_input&&
+        web_input_type(n)==WEB_INPUT_RANGE&&(e->key==NKEY_UP||e->key==NKEY_DOWN)&&
+        doc_node_root(n,true)==d->root&&!web_control_disabled(n)&&!web_dialog_inert(d,n);
+    if (!control_edit_target(d,n,false)&&!range_step) return 0;
     doc_control_init(d, n);
     if (!n->value && !doc_node_value(d, n, "", 0)) return 0;
     const char *v = web_input_edit_text(n);
@@ -1627,6 +1904,16 @@ static node_t *form_of(web_doc *d, node_t *n) {
     return node_ancestor(n, T_form);
 }
 
+int web_key(web_doc *d,const struct gui_event *event) {
+    web_doc *root=d;
+    while(d && d->live && !d->inert && web_frame_element(d->focus)) {
+        struct web_frame *f=web_frame_find(d,d->focus);if(!f || !f->document || f->detached)break;
+        d=f->document;
+    }
+    int result=web_key_local(d,event);
+    if(result)for(web_doc *p=d;p && p!=root;p=p->frame_parent)if(p->frame_parent)p->frame_parent->dirty=true;
+    return result;
+}
 web_node *web_form_owner(web_doc *d, web_node *control) { return form_of(d, control); }
 bool web_take_validation_report(web_doc *d, web_node **control, const char **message, size_t *length) {
     if (!d || !d->validation_report_pending) return false;
@@ -1653,7 +1940,7 @@ static node_t *reset_form_id(node_t *n, const char *id) {
 
 static bool reset_form_text(node_t *n, char *out, size_t *len) {
     if (n->type == N_TEXT) {
-        if (n->textlen > (16u << 20) - *len) return false;
+        if (n->textlen > SIZE_MAX - *len) return false;
         if (out && n->textlen) memcpy(out + *len, n->text, n->textlen);
         *len += n->textlen;
     } else for (node_t *c = n->first; c; c = c->next)
@@ -1790,11 +2077,20 @@ bool web_submit(web_doc *d, web_node *submitter, char **url, char **body) {
 }
 
 int web_select_options(web_doc *d, web_node *sel, const char **labels, int max, int *selected) {
-    if (!d || !sel || sel->tag != T_select || !labels || max <= 0) return 0;
+    if (!d || !sel || sel->tag != T_select || max < 0 || (!labels && max)) return 0;
+    if (sel->owner != d) { if (!frame_address_live(d,sel->owner)) return 0; d=sel->owner; }
     doc_control_init(d, sel);
     if (selected) *selected = sel->selected;
+    if (!labels) {
+        int count=0;
+        for (node_t *o=web_select_next_option(sel,NULL); o; o=web_select_next_option(sel,o)) {
+            if (count == INT_MAX) return -1;
+            count++;
+        }
+        return count;
+    }
     int k = 0;
-    for (node_t *o; k < max && (o = doc_select_option(sel, k)); k++) {
+    for (node_t *o=web_select_next_option(sel,NULL); k < max && o; o=web_select_next_option(sel,o), k++) {
         if (!o->option_label || o->option_label_revision != d->dom_revision) {
             /* The heap buffer remains well-defined after an arena limit jump. */
             sbuf *t = calloc(1, sizeof *t);

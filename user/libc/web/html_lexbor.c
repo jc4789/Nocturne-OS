@@ -9,7 +9,7 @@
 #include <lexbor/html/interfaces/script_element.h>
 #include <lexbor/dom/interfaces/element.h>
 
-#define HTML_INPUT_LIMIT (16u << 20)
+#define HTML_INPUT_LIMIT ((size_t)UINT32_MAX)
 
 /* Incoming token spans can point into previously supplied chunks. Never move
    or free a span while its tokenizer is alive, including document.write input. */
@@ -86,8 +86,9 @@ static char *decode_input(const char *src, size_t n, const char *charset, bool b
     if (byte_input && n >= 3 && (unsigned char)src[0] == 0xef && (unsigned char)src[1] == 0xbb && (unsigned char)src[2] == 0xbf) {
         src += 3; n -= 3; cs = "utf-8";
     }
-    size_t capacity = n * 3;
+    size_t capacity = n > HTML_INPUT_LIMIT / 3 ? HTML_INPUT_LIMIT : n * 3;
     if (capacity > HTML_INPUT_LIMIT) capacity = HTML_INPUT_LIMIT;
+    if (capacity == SIZE_MAX) return NULL;
     struct decoded_html text = {malloc(capacity + 1), 0, capacity, false};
     if (!text.data) return NULL;
     bool ok = true;
@@ -120,7 +121,8 @@ static char *decode_input(const char *src, size_t n, const char *charset, bool b
 }
 
 static bool add_input(struct html_parser *p, char *data, size_t length, bool writing) {
-    if (length > HTML_INPUT_LIMIT - p->input_bytes || p->input_spans >= HTML_INPUT_LIMIT / sizeof(struct html_input)) {
+    if (p->input_bytes > HTML_INPUT_LIMIT || length > HTML_INPUT_LIMIT - p->input_bytes ||
+        length == SIZE_MAX || p->input_spans == SIZE_MAX) {
         free(data); return false;
     }
     struct html_input *in = calloc(1, sizeof *in);
@@ -224,7 +226,7 @@ int html_resume(struct html_parser *p, node_t **script) {
            before yielding, without consuming any following document input. */
         lxb_status_t status = p->fragment ? lxb_html_parse_fragment_chunk_process(p->lex, (const lxb_char_t *)start, size) :
                                            lxb_html_parse_chunk_process(p->lex, (const lxb_char_t *)start, size);
-        if (status != LXB_STATUS_OK || p->lex->tree->open_elements->length > 400) {
+        if (status != LXB_STATUS_OK) {
             p->failed = true; return -1;
         }
         in->offset += size;
@@ -253,18 +255,20 @@ int html_resume(struct html_parser *p, node_t **script) {
 
 bool html_write(struct html_parser *p, const char *text, size_t n) {
     if (!p || p->finished || p->failed || (!p->yielded && !p->stream_open) || !p->scripting || (!text && n) ||
-        n > HTML_INPUT_LIMIT - p->input_bytes) return false;
+        p->input_bytes > HTML_INPUT_LIMIT || n > HTML_INPUT_LIMIT - p->input_bytes) return false;
     if (!n) return true;
     /* Consecutive writes during one suspended script have not reached Lexbor
        yet, so they may share a growing span. Previously fed spans stay intact.
        This also bounds bookkeeping for many one-byte/empty writes. */
     if (p->write_tail) {
         struct html_input *in = p->write_tail;
+        if (in->length == SIZE_MAX || n > SIZE_MAX - in->length - 1) return false;
         size_t length = in->length + n;
         if (length + 1 > in->capacity) {
-            size_t capacity = in->capacity * 2;
+            size_t capacity = in->capacity > SIZE_MAX / 2 ? SIZE_MAX : in->capacity * 2;
             if (capacity < length + 1) capacity = length + 1;
-            if (capacity > HTML_INPUT_LIMIT + 1) capacity = HTML_INPUT_LIMIT + 1;
+            size_t maximum = HTML_INPUT_LIMIT < SIZE_MAX ? HTML_INPUT_LIMIT + 1 : SIZE_MAX;
+            if (capacity > maximum) capacity = maximum;
             char *data = realloc(in->data, capacity);
             if (!data) return false;
             in->data = data; in->capacity = capacity;
@@ -274,6 +278,7 @@ bool html_write(struct html_parser *p, const char *text, size_t n) {
         p->input_bytes += n;
         return true;
     }
+    if (n == SIZE_MAX) return false;
     char *data = malloc(n + 1);
     if (!data) return false;
     if (n) memcpy(data, text, n);

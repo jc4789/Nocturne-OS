@@ -1,6 +1,8 @@
 /* Mutable nodes belong to the document, not to the layout or to a JS wrapper.
-   Detached nodes stay valid until web_free; all mutation allocations are bounded. */
+   Detached nodes stay valid until web_free; allocation/representation failures
+   remain explicit, without author depth/name/attribute-count feature caps. */
 #include <stdio.h>
+#include <limits.h>
 #include "nocturne.h"
 #include "webi.h"
 #include "frame.h"
@@ -9,10 +11,35 @@
 #include "form_file.h"
 #include "elements.h"
 #include "js_canvas.h"
+#include "cssom.h"
 /* Internal lifetime query: implemented beside the wrapper cache. */
 bool web_js_nodes_same_forest(web_doc *document, node_t *node, node_t *parent);
 
-#define DOM_MAX_DEPTH 400
+/* Native DOM trees are already cycle-checked on insertion. Walk their parent
+   links rather than consuming the C stack or imposing an author depth limit.
+   Shadow/template edges are optional: neither is an ordinary child edge. */
+static node_t *tree_next(node_t *n, node_t *root, bool shadow, bool templates, bool descend) {
+    if (descend) {
+        if (n->first) return n->first;
+        if (shadow && n->shadow_root) return n->shadow_root;
+        if (templates && n->template_content) return n->template_content;
+    }
+    while (n != root) {
+        node_t *p;
+        if (n->parent) {
+            if (n->next) return n->next;
+            p = n->parent;
+            if (shadow && p->shadow_root) return p->shadow_root;
+            if (templates && p->template_content) return p->template_content;
+        } else if (n->shadow_host) {
+            p = n->shadow_host;
+            if (templates && p->template_content) return p->template_content;
+        } else if (n->template_host) p = n->template_host;
+        else return NULL;
+        n = p;
+    }
+    return NULL;
+}
 
 static void indices(node_t *p) {
     web_doc *d = p->owner;
@@ -65,10 +92,8 @@ static const char *slot_name(node_t *n, bool slot) {
     return name ? name : "";
 }
 static node_t *first_named_slot(node_t *root, const char *name) {
-    for (node_t *n = root->first; n; n = n->next) {
+    for (node_t *n = root->first; n; n = tree_next(n, root, false, false, true)) {
         if (is_slot(n) && !strcmp(slot_name(n, true), name)) return n;
-        node_t *found = first_named_slot(n, name);
-        if (found) return found;
     }
     return NULL;
 }
@@ -109,9 +134,8 @@ static void compare_slot(node_t *slot) {
     if (old || wanted) doc_slot_signal(slot);
 }
 static void compare_shadow_slots(node_t *root) {
-    for (node_t *n = root->first; n; n = n->next) {
+    for (node_t *n = root->first; n; n = tree_next(n, root, false, false, true)) {
         if (is_slot(n)) compare_slot(n);
-        compare_shadow_slots(n);
     }
 }
 void doc_shadow_reassign(web_doc *d) {
@@ -165,8 +189,6 @@ bool doc_shadow_host_valid(const node_t *n) {
 node_t *doc_shadow_attach(web_doc *d, node_t *host, bool closed, bool delegates_focus,
                          bool clonable, bool serializable, bool manual) {
     if (!d || !doc_shadow_host_valid(host) || host->shadow_root || host->owner != d) return NULL;
-    int depth = 0;
-    for (node_t *n = host; n; n = doc_shadow_parent(n)) if (++depth >= DOM_MAX_DEPTH) return NULL;
     node_t *root = doc_node_create(d, N_FRAGMENT, NULL, NULL, 0);
     if (!root) return NULL;
     root->shadow_host = host; host->shadow_root = root;
@@ -207,20 +229,58 @@ bool doc_slot_assign(node_t *slot, node_t **nodes, int count) {
     doc_shadow_reassign(slot->owner);
     return true;
 }
-static void slot_nodes(node_t *slot, bool flatten, pvec *out, int depth) {
-    if (!is_slot(slot) || depth > DOM_MAX_DEPTH) return;
-    node_t *root = doc_node_root(slot, false);
-    if (!root || !root->shadow_host) return;
+struct slot_walk { node_t *slot, *next; bool assigned; };
+static struct slot_walk slot_walk_start(node_t *slot, bool flatten) {
     node_t *first = slot->slot_assigned_first;
-    bool assigned = first != NULL;
-    for (node_t *n = first ? first : flatten ? slot->first : NULL; n; n = assigned ? n->assigned_next : n->next) {
+    return (struct slot_walk){slot, first ? first : flatten ? slot->first : NULL, first != NULL};
+}
+bool doc_slot_nodes(node_t *slot, bool flatten, pvec *out) {
+    if (!out || !is_slot(slot)) return true;
+    node_t *root = doc_node_root(slot, false);
+    if (!root || !root->shadow_host) return true;
+    size_t capacity = 16, used = 1;
+    struct slot_walk *stack = malloc(capacity * sizeof *stack);
+    if (!stack) return false;
+    stack[0] = slot_walk_start(slot, flatten);
+    while (used) {
+        struct slot_walk *at = &stack[used - 1];
+        node_t *n = at->next;
+        if (!n) { used--; continue; }
+        at->next = at->assigned ? n->assigned_next : n->next;
         if (!slottable(n)) continue;
         node_t *nr = is_slot(n) ? doc_node_root(n, false) : NULL;
-        if (flatten && nr && nr->shadow_host) slot_nodes(n, true, out, depth + 1);
-        else pv_push(out, n);
+        if (flatten && nr && nr->shadow_host) {
+            /* Manual slot assignments can form a virtual cycle even though
+               the native DOM is acyclic. Ignore only this cyclic edge, not a
+               legitimate repeated node in another expansion branch. */
+            bool cycle = false;
+            for (size_t i = 0; i < used; i++) if (stack[i].slot == n) { cycle = true; break; }
+            if (cycle) continue;
+            if (used == capacity) {
+                size_t max = SIZE_MAX / sizeof *stack;
+                if (capacity == max) { free(stack); return false; }
+                size_t next = capacity > max / 2 ? max : capacity * 2;
+                struct slot_walk *grown = realloc(stack, next * sizeof *stack);
+                if (!grown) { free(stack); return false; }
+                stack = grown; capacity = next;
+            }
+            stack[used++] = slot_walk_start(n, true);
+        } else {
+            if (out->n == out->cap) {
+                size_t max = SIZE_MAX / sizeof *out->v;
+                if (max > INT_MAX) max = INT_MAX;
+                if (out->cap < 0 || (size_t)out->cap >= max) { free(stack); return false; }
+                size_t next = out->cap ? (size_t)out->cap * 2 : 16;
+                if (next > max) next = max;
+                void **grown = realloc(out->v, next * sizeof *out->v);
+                if (!grown) { free(stack); return false; }
+                out->v = grown; out->cap = (int)next;
+            }
+            out->v[out->n++] = n;
+        }
     }
+    free(stack); return true;
 }
-void doc_slot_nodes(node_t *slot, bool flatten, pvec *out) { if (out) slot_nodes(slot, flatten, out, 0); }
 void doc_flat_children(node_t *n, pvec *out) {
     if (!n || !out) return;
     if (n->shadow_root) n = n->shadow_root;
@@ -287,9 +347,11 @@ void doc_mutated(web_doc *d, node_t *n) {
    not the authored sheet set. Preserve the scan for every node kind consumed
    by doc.c scan(), image candidates, and document identity. In particular a
    text edit inside style/title/control ancestors still needs that scan. */
-static bool resource_subtree(node_t *n, unsigned depth) {
-    if (!n || depth > DOM_MAX_DEPTH) return true;
-    if (n->type == N_ELEM && !n->foreign) {
+static bool resource_subtree(node_t *root) {
+    if (!root) return true;
+    for (node_t *n = root; n;) {
+      bool descend = true;
+      if (n->type == N_ELEM && !n->foreign) {
         switch (n->tag) {
         case T_html: case T_head: case T_body: case T_frameset:
         case T_base: case T_title: case T_meta: case T_link: case T_style:
@@ -298,11 +360,11 @@ static bool resource_subtree(node_t *n, unsigned depth) {
             return true;
         default: break;
         }
-        if (n->tag == T_template) return false; /* inert template content */
+        if (n->tag == T_template) descend = false; /* inert template content */
+      }
+      n = tree_next(n, root, true, false, descend);
     }
-    for (node_t *c = n->first; c; c = c->next)
-        if (resource_subtree(c, depth + 1)) return true;
-    return n->shadow_root && resource_subtree(n->shadow_root, depth + 1);
+    return false;
 }
 static bool resource_ancestor(node_t *n) {
     for (; n; n = n->parent) if (!n->foreign && n->type == N_ELEM &&
@@ -310,8 +372,10 @@ static bool resource_ancestor(node_t *n) {
     return false;
 }
 static void structure_changed_lifetime(web_doc *d, node_t *parent, node_t *subtree, bool lifetime_changed) {
+    cssom_style_text_changed(parent);
+    if (lifetime_changed) cssom_style_lifecycle(subtree);
     if (d && lifetime_changed) d->js_nodes_dirty = true;
-    changed(d, parent, resource_ancestor(parent) || resource_subtree(subtree, 0));
+    changed(d, parent, resource_ancestor(parent) || resource_subtree(subtree));
 }
 static void structure_changed(web_doc *d, node_t *parent, node_t *subtree) {
     structure_changed_lifetime(d, parent, subtree, true);
@@ -370,8 +434,8 @@ void doc_create_diagnostic(web_doc *d,unsigned stage,int type,size_t name_bytes,
 node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t len) {
     if (!d) return NULL;
     size_t name_bytes=name?strlen(name):0;
-    if(type<N_DOC || type>N_ATTR || len>(16u<<20) ||
-       (type==N_ELEM && (!name || !*name || name_bytes>=64)) ||
+    if(type<N_DOC || type>N_ATTR || len==SIZE_MAX || (len && !text) ||
+       (type==N_ELEM && (!name || !*name)) ||
        (type==N_PI && (!name || !doc_pi_target_valid(name,name_bytes)))) {
         doc_create_diagnostic(d,DOC_CREATE_INVALID,type,name_bytes,len);return NULL;
     }
@@ -392,12 +456,14 @@ node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text
     n->owned_next = d->owned_nodes;
     d->owned_nodes = n;
     if (type == N_ELEM) {
-        char lower_name[64];
         size_t l = strlen(name);
-        for (size_t i = 0; i < l; i++) lower_name[i] = (char)lower((unsigned char)name[i]);
-        lower_name[l] = 0;
-        n->tag = (uint16_t)tag_lookup(lower_name, l);
-        n->name = n->tag ? tag_names[n->tag] : ar_strndup(&d->mem, lower_name, l);
+        n->tag = (uint16_t)tag_lookup(name, l); /* lookup normalizes known short names itself */
+        if (n->tag) n->name = tag_names[n->tag];
+        else {
+            char *lower_name = ar_strndup(&d->mem, name, l);
+            for (size_t i = 0; i < l; i++) lower_name[i] = (char)lower((unsigned char)lower_name[i]);
+            n->name = lower_name;
+        }
         n->raw_name = ar_strdup(&d->mem, name);
     } else if (type == N_DOCTYPE) {
         n->name = ar_strdup(&d->mem, name ? name : "html");
@@ -426,6 +492,10 @@ static void attribute_cache(web_doc *d, node_t *n) {
     for (const char *p = classes; *p;) {
         while (is_space((unsigned char)*p)) p++;
         if (!*p) break;
+        if (count == INT_MAX || (size_t)count == SIZE_MAX / sizeof *n->classes) {
+            if (d->mem.trap) longjmp(*d->mem.trap, 1);
+            abort();
+        }
         count++;
         while (*p && !is_space((unsigned char)*p)) p++;
     }
@@ -485,14 +555,16 @@ node_t *doc_attr_node(web_doc *d, node_t *n, int i) {
     return made;
 }
 node_t *doc_attr_create(web_doc *d, const char *ns, const char *prefix, const char *local, const char *value) {
-    if (!d || !local || !*local || strlen(local) >= 128 || (value && strlen(value) > (16u << 20))) return NULL;
+    if (!d || !local || !*local) return NULL;
+    size_t pl = prefix ? strlen(prefix) : 0, ll = strlen(local);
+    size_t extra = pl ? 2 : 1;
+    if (pl > SIZE_MAX - extra || ll > SIZE_MAX - extra - pl) return NULL;
     node_t *made = doc_node_create(d, N_ATTR, NULL, NULL, 0);
     if (!made) return NULL;
     jmp_buf trap; jmp_buf *old = d->mem.trap; d->mem.trap = &trap;
     if (setjmp(trap)) { d->mem.trap = old; return NULL; }
     struct attr *a = ar_alloc(&d->mem, sizeof *a);
-    size_t pl = prefix ? strlen(prefix) : 0, ll = strlen(local);
-    char *raw = ar_alloc(&d->mem, pl + ll + (pl ? 2 : 1));
+    char *raw = ar_alloc(&d->mem, pl + ll + extra);
     if (pl) { memcpy(raw, prefix, pl); raw[pl] = ':'; }
     memcpy(raw + pl + (pl ? 1 : 0), local, ll + 1);
     a->raw = raw;
@@ -506,14 +578,8 @@ node_t *doc_attr_create(web_doc *d, const char *ns, const char *prefix, const ch
     d->mem.trap = old; return made;
 }
 
-static bool attribute_change(web_doc *d, node_t *n, int found, const char *name, const char *value,
-                             const char *ns, const char *prefix, const char *local, node_t *identity) {
-    if (!d || !n || n->type != N_ELEM || !name || !*name || strlen(name) >= 128 ||
-        (value && strlen(value) > (16u << 20))) return false;
-    char low[128];
-    size_t l = strlen(name);
-    for (size_t i = 0; i < l; i++) low[i] = (char)lower((unsigned char)name[i]);
-    low[l] = 0;
+static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const char *name, const char *value,
+                             const char *ns, const char *prefix, const char *local, node_t *identity, const char *low) {
     bool previously_selectable = doc_control_selection_supported(n);
     bool input_type_change = !ns && !n->foreign && n->tag == T_input &&
                              !strcmp(name, low) && !strcmp(low, "type");
@@ -542,8 +608,9 @@ static bool attribute_change(web_doc *d, node_t *n, int found, const char *name,
         }
         return true;
     }
+    if (n->nattrs < 0 || (found < 0 && n->nattrs == INT_MAX)) return false;
     int count = n->nattrs + (found < 0 ? 1 : value ? 0 : -1);
-    if (count > 1024) return false;
+    if (count < 0 || (size_t)count > SIZE_MAX / sizeof(struct attr)) return false;
     doc_dom_budget(d);
     jmp_buf trap;
     jmp_buf *old = d->mem.trap;
@@ -577,9 +644,12 @@ static bool attribute_change(web_doc *d, node_t *n, int found, const char *name,
     n->nclasses = temp.nclasses;
     d->mem.trap = old;
     bool ordinary = !ns && !n->foreign && !strcmp(name, low);
+    if (ordinary && n->tag==T_style && !strcmp(low,"type")) cssom_style_lifecycle(n);
     if (ordinary && n->tag == T_link && (!strcmp(low,"href") || !strcmp(low,"rel") ||
         !strcmp(low,"media") || !strcmp(low,"type") || !strcmp(low,"disabled"))) {
         n->stylesheet_generation++; n->stylesheet_url = NULL; n->stylesheet_notified = false;
+        if(!strcmp(low,"disabled")){n->style_disabled_set=false;n->style_disabled=false;}
+        if(!strcmp(low,"href")||!strcmp(low,"rel")||!strcmp(low,"type"))cssom_style_lifecycle(n);
     }
     if (input_type_change && previous_type != web_input_type(n)) {
         if (previous_type == WEB_INPUT_FILE) web_input_files_clear(d, n);
@@ -644,16 +714,33 @@ static bool attribute_change(web_doc *d, node_t *n, int found, const char *name,
     return true;
 }
 
+static bool attribute_change(web_doc *d, node_t *n, int found, const char *name, const char *value,
+                             const char *ns, const char *prefix, const char *local, node_t *identity) {
+    if (!d || !n || n->type != N_ELEM || !name || !*name) return false;
+    size_t length = strlen(name);
+    if (length == SIZE_MAX) return false;
+    char *low = malloc(length + 1);
+    if (!low) return false;
+    for (size_t i = 0; i < length; i++) low[i] = (char)lower((unsigned char)name[i]);
+    low[length] = 0;
+    bool result = attribute_change_normalized(d, n, found, name, value, ns, prefix, local, identity, low);
+    free(low); return result;
+}
+
 bool doc_node_attr(web_doc *d, node_t *n, const char *name, const char *value) {
     int found = doc_attr_index(n, NULL, name, false);
     if (found < 0 && !value) return true;
     const struct attr *a = found >= 0 ? &n->attrs[found] : NULL;
-    char normalized[128];
-    if (!name || strlen(name) >= sizeof normalized) return false;
-    snprintf(normalized, sizeof normalized, "%s", name);
+    if (!name) return false;
+    size_t length = strlen(name);
+    if (length == SIZE_MAX) return false;
+    char *normalized = malloc(length + 1);
+    if (!normalized) return false;
+    memcpy(normalized, name, length + 1);
     if (n && !n->foreign) for (char *p = normalized; *p; p++) *p = (char)lower((unsigned char)*p);
-    return attribute_change(d, n, found, a ? a->raw : normalized, value,
+    bool result = attribute_change(d, n, found, a ? a->raw : normalized, value,
         a ? a->namespace_uri : NULL, a ? a->prefix : NULL, a ? a->local : normalized, NULL);
+    free(normalized); return result;
 }
 bool doc_attr_set_ns(web_doc *d, node_t *n, const char *ns, const char *prefix, const char *local, const char *value) {
     int found = doc_attr_index(n, ns, local, true);
@@ -661,9 +748,15 @@ bool doc_attr_set_ns(web_doc *d, node_t *n, const char *ns, const char *prefix, 
         struct attr *a = &n->attrs[found];
         return attribute_change(d, n, found, a->raw, value, a->namespace_uri, a->prefix, a->local, NULL);
     }
-    char name[128];
-    int len = prefix ? snprintf(name, sizeof name, "%s:%s", prefix, local) : snprintf(name, sizeof name, "%s", local);
-    return len > 0 && (size_t)len < sizeof name && attribute_change(d, n, -1, name, value, ns, prefix, local, NULL);
+    if (!local || !*local) return false;
+    size_t pl = prefix ? strlen(prefix) : 0, ll = strlen(local), extra = prefix ? 2 : 1;
+    if (pl > SIZE_MAX - extra || ll > SIZE_MAX - extra - pl) return false;
+    char *name = malloc(pl + ll + extra);
+    if (!name) return false;
+    if (prefix) { memcpy(name, prefix, pl); name[pl] = ':'; }
+    memcpy(name + pl + (prefix ? 1 : 0), local, ll + 1);
+    bool result = attribute_change(d, n, -1, name, value, ns, prefix, local, NULL);
+    free(name); return result;
 }
 bool doc_attr_set_node(web_doc *d, node_t *n, node_t *attribute) {
     if (!n || n->type != N_ELEM || !attribute || attribute->type != N_ATTR ||
@@ -679,7 +772,7 @@ bool doc_attr_remove(web_doc *d, node_t *n, int i) {
     return attribute_change(d, n, i, a->raw, NULL, a->namespace_uri, a->prefix, a->local, NULL);
 }
 bool doc_attr_value(web_doc *d, node_t *n, const char *value) {
-    if (!n || n->type != N_ATTR || !n->attribute || !value || strlen(value) > (16u << 20)) return false;
+    if (!n || n->type != N_ATTR || !n->attribute || !value) return false;
     if (n->attr_owner) {
         struct attr *a = n->attribute;
         return doc_attr_set_ns(d, n->attr_owner, a->namespace_uri, a->prefix, a->local ? a->local : a->raw, value);
@@ -691,20 +784,19 @@ bool doc_attr_value(web_doc *d, node_t *n, const char *value) {
     d->mem.trap = old; return true;
 }
 
-static void stylesheet_detach(node_t *n, unsigned depth) {
-    if (!n || depth > DOM_MAX_DEPTH) return;
-    if (n->stylesheet_url) {
-        n->stylesheet_generation++; n->stylesheet_url = NULL;
-        n->stylesheet_owner = NULL; n->stylesheet_notified = false;
+static void stylesheet_detach(node_t *root) {
+    for (node_t *n = root; n;) {
+        if (n->stylesheet_url) {
+            n->stylesheet_generation++; n->stylesheet_url = NULL;
+            n->stylesheet_owner = NULL; n->stylesheet_notified = false;
+        }
+        n = tree_next(n, root, true, false, n->foreign || n->tag != T_template);
     }
-    if (!n->foreign && n->tag == T_template) return;
-    for (node_t *c = n->first; c; c = c->next) stylesheet_detach(c,depth+1);
-    if (n->shadow_root) stylesheet_detach(n->shadow_root,depth+1);
 }
 static void detach(node_t *n) {
     node_t *p = n->parent;
     if (!p) return;
-    stylesheet_detach(n,0);
+    stylesheet_detach(n);
     if (n->prev) n->prev->next = n->next; else p->first = n->next;
     if (n->next) n->next->prev = n->prev; else p->last = n->prev;
     n->parent = n->prev = n->next = NULL;
@@ -712,28 +804,10 @@ static void detach(node_t *n) {
     textarea_changed(p);
 }
 
-static int tree_depth(node_t *n, int depth) {
-    if (depth > DOM_MAX_DEPTH) return depth;
-    int max = depth;
-    for (node_t *c = n->first; c; c = c->next) {
-        int h = tree_depth(c, depth + 1);
-        if (h > max) max = h;
-        if (max > DOM_MAX_DEPTH) break;
-    }
-    if (n->shadow_root && max <= DOM_MAX_DEPTH) {
-        int h = tree_depth(n->shadow_root, depth + 1);
-        if (h > max) max = h;
-    }
-    return max;
-}
-
 static bool may_insert(node_t *p, node_t *c) {
     if (!p || !c || p == c || under(p, c) || c->type == N_DOC || c->type == N_ATTR ||
         (p->type != N_DOC && p->type != N_ELEM && p->type != N_FRAGMENT)) return false;
     for (node_t *n = p; n; n = n->parent ? n->parent : n->shadow_host ? n->shadow_host : n->template_host) if (n == c) return false;
-    int depth = 0;
-    for (node_t *n = p; n; n = doc_shadow_parent(n)) depth++;
-    if (tree_depth(c, depth) > DOM_MAX_DEPTH) return false;
     if (p->type == N_DOC) {
         if (c->type == N_TEXT) return false;
         if (c->type == N_ELEM) for (node_t *n = p->first; n; n = n->next)
@@ -753,7 +827,7 @@ static bool assignment_structure(node_t *p, node_t *c) {
 }
 
 bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
-    if (!d || !p || !c || (before && before->parent != p)) return false;
+    if (!d || !p || !c || p->owner != d || (before && before->parent != p)) return false;
     (d->dom_family ? d->dom_family : d)->profile.inserts++;
     if (before == c) return true;
     if (c->type == N_FRAGMENT) {
@@ -815,37 +889,34 @@ void doc_node_remove(web_doc *d, node_t *n) {
     if (select) web_select_sync(select->owner, select, false);
 }
 
-static void adopt_subtree(web_doc *d, node_t *n) {
-    n->owner = d;
-    for (int i = 0; i < n->nattrs; i++) if (n->attrs[i].node) n->attrs[i].node->owner = d;
+static void adopt_subtree(web_doc *d, node_t *root) {
+  for (node_t *n = root; n; n = tree_next(n, root, true, true, true)) {
+    web_doc *owner = d;
+    if (n != root) {
+        if (n->parent) owner = n->parent->owner;
+        else if (n->shadow_host) owner = n->shadow_host->owner;
+        else if (n->template_host) {
+            owner = n->template_host->owner;
+            owner = owner->template_owner ? owner : owner->template_doc;
+        }
+    }
+    n->owner = owner;
+    for (int i = 0; i < n->nattrs; i++) if (n->attrs[i].node) n->attrs[i].node->owner = owner;
     n->style = n->animation_base_style = NULL; n->box = n->anchor_block = NULL;
     n->image = -1; n->image_request = -1; n->image_initialized = false;
     n->image_generation++;
     /* Adoption is an image-data mutation even without a later insertion or
        getter. Keep allocation ownership untouched; schedule the live scan. */
-    if (!d->inert && n->type == N_ELEM && !n->foreign && n->tag == T_img)
-        d->resources_dirty = d->dirty = d->need_style = true;
-    for (node_t *c = n->first; c; c = c->next) adopt_subtree(d, c);
+    if (!owner->inert && n->type == N_ELEM && !n->foreign && n->tag == T_img)
+        owner->resources_dirty = owner->dirty = owner->need_style = true;
     if (n->shadow_root) {
-        (d->dom_family ? d->dom_family : d)->has_shadow = true;
-        adopt_subtree(d, n->shadow_root);
+        (owner->dom_family ? owner->dom_family : owner)->has_shadow = true;
     }
-    if (n->template_content) {
-        web_doc *owner = d->template_owner ? d : d->template_doc;
-        if (!owner) {
-            owner = doc_inert(d, "", 0, "about:blank");
-            if (owner) {
-                while (owner->root->first) doc_node_remove(owner, owner->root->first);
-                owner->template_owner = true; d->template_doc = owner;
-            }
-        }
-        if (owner) adopt_subtree(owner, n->template_content);
-    }
+  }
 }
-static bool has_template(node_t *n) {
-    if (n->template_content) return true;
-    if (n->shadow_root && has_template(n->shadow_root)) return true;
-    for (node_t *c = n->first; c; c = c->next) if (has_template(c)) return true;
+static bool has_template(node_t *root) {
+    for (node_t *n = root; n; n = tree_next(n, root, true, false, true))
+        if (n->template_content) return true;
     return false;
 }
 bool doc_node_adopt(web_doc *d, node_t *n) {
@@ -885,19 +956,20 @@ node_t *doc_template_content(web_doc *d, node_t *n) {
 }
 
 bool doc_templates_finish(web_doc *d, node_t *root) {
-    for (node_t *n = root; n; n = n->next) {
+  for (node_t *top = root; top; top = top->next) {
+    for (node_t *n = top; n; n = tree_next(n, top, false, true, true)) {
         if (n->type == N_ELEM && !n->foreign && n->tag == T_template) {
             node_t *content = doc_template_content(n->owner ? n->owner : d, n);
             if (!content) return false;
             while (n->first) if (!doc_node_move(content->owner, content, n->first, NULL)) return false;
-            if (!doc_templates_finish(content->owner, content->first)) return false;
-        } else if (n->first && !doc_templates_finish(d, n->first)) return false;
+        }
     }
+  }
     return true;
 }
 
 bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
-    if (!d || !n || len > (16u << 20)) return false;
+    if (!d || !n || len == SIZE_MAX || (len && !text)) return false;
     if (n->type == N_ATTR) return doc_attr_value(d, n, text);
     if (n->type == N_DOC || n->type == N_DOCTYPE) return true;
     doc_dom_budget(d);
@@ -916,12 +988,13 @@ bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
         while (n->first) doc_node_remove(d, n->first);
         if (t && !doc_node_move(d, n, t, NULL)) return false;
     }
+    cssom_style_text_changed(n);
     changed(d, n, resource_ancestor(n));
     return true;
 }
 
 bool doc_node_html(web_doc *d, node_t *n, const char *html, size_t len) {
-    if (!d || !n || (n->type != N_ELEM && n->type != N_FRAGMENT) || len > (16u << 20)) return false;
+    if (!d || !n || (n->type != N_ELEM && n->type != N_FRAGMENT) || len == SIZE_MAX || (len && !html)) return false;
     node_t *context = n->shadow_host ? n->shadow_host : n;
     if (n->type == N_ELEM && !n->foreign && n->tag == T_template) {
         n = doc_template_content(d, n);
@@ -937,15 +1010,15 @@ bool doc_node_html(web_doc *d, node_t *n, const char *html, size_t len) {
 }
 
 bool doc_node_value(web_doc *d, node_t *n, const char *text, size_t len) {
-    if (!d || !n || len > (16u << 20) || (len && !text)) return false;
+    if (!d || !n || len == SIZE_MAX || (len && !text)) return false;
     web_doc *allocation = n->allocation_doc ? n->allocation_doc : d;
     bool input = n->type == N_ELEM && !n->foreign && n->tag == T_input;
     size_t capacity = input && len < 127 ? 128 : len + 1;
+    if (n->input_edit_capacity > SIZE_MAX - n->value_capacity) return false;
     size_t replaced = n->value_capacity + n->input_edit_capacity;
-    if (d->dom_family && capacity > doc_dom_remaining(d) + replaced) return false;
+    if (allocation->control_bytes < replaced) return false;
     size_t next = allocation->control_bytes - replaced;
-    if (!d->dom_family && d->live && (capacity > (32u << 20) || next > (32u << 20) - capacity ||
-                    d->mem.allocated > (32u << 20) - next - capacity)) return false;
+    if (capacity > SIZE_MAX - next) return false;
     char *value = malloc(capacity);
     if (!value) return false;
     if (input && web_input_type(n) == WEB_INPUT_FILE) { size_t files_bytes = n->files ? n->files->allocation : 0; web_input_files_clear(d, n); next -= files_bytes; }
@@ -967,8 +1040,7 @@ bool doc_node_value(web_doc *d, node_t *n, const char *text, size_t len) {
     if (n->selection_end > units) n->selection_end = units;
     doc_control_caret(d, n);
     allocation->control_bytes = next + capacity;
-    if (d->dom_family) doc_dom_budget(d);
-    else if (d->live) d->mem.limit = (32u << 20) - d->control_bytes;
+    doc_dom_budget(d);
     d->dirty = d->need_style = true;
     return true;
 }
@@ -979,7 +1051,7 @@ bool doc_node_value(web_doc *d, node_t *n, const char *text, size_t len) {
    allocation document; never retain source-owner pointers or Attr identities. */
 static bool clone_attributes(web_doc *d, node_t *copy, const node_t *source) {
     if (!source->nattrs) return true;
-    if (source->nattrs < 0 || source->nattrs > 1024) return false;
+    if (source->nattrs < 0 || (size_t)source->nattrs > SIZE_MAX / sizeof(struct attr)) return false;
     if (!source->foreign) switch (source->tag) {
     case T_input: case T_select: case T_option: case T_details:
     case T_img: case T_source:
@@ -1023,7 +1095,7 @@ static bool clone_attributes(web_doc *d, node_t *copy, const node_t *source) {
     return true;
 }
 
-node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
+static node_t *clone_one(web_doc *d, node_t *n) {
     if (!d || !n || n->type == N_DOC || n->shadow_host) return NULL;
     if (n->type == N_ATTR) {
         struct attr *a = n->attribute;
@@ -1055,25 +1127,68 @@ node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
     if (n->tag == T_template && !n->foreign) {
         node_t *content = doc_template_content(d, c);
         if (!content) return NULL;
-        if (deep) for (node_t *ch = n->template_content ? n->template_content->first : NULL; ch; ch = ch->next) {
-            node_t *copy = doc_node_clone(content->owner, ch, true);
-            if (!copy || !doc_node_move(content->owner, content, copy, NULL)) return NULL;
-        }
-    }
-    if (deep) for (node_t *ch = n->first; ch; ch = ch->next) {
-        node_t *copy = doc_node_clone(d, ch, true);
-        if (!copy || !doc_node_move(d, c, copy, NULL)) return NULL;
-    }
-    if (n->shadow_root && n->shadow_root->shadow_clonable) {
-        node_t *source = n->shadow_root;
-        node_t *root = doc_shadow_attach(d, c, source->shadow_closed, source->shadow_delegates_focus,
-            true, source->shadow_serializable, source->shadow_manual);
-        if (!root) return NULL;
-        root->shadow_declarative = source->shadow_declarative;
-        for (node_t *ch = source->first; ch; ch = ch->next) {
-            node_t *copy = doc_node_clone(d, ch, true);
-            if (!copy || !doc_node_move(d, root, copy, NULL)) return NULL;
-        }
     }
     return c;
+}
+
+/* Keep the recursive algorithm's observable order: template descendants,
+   ordinary descendants, then clonable shadow descendants; insert a completed
+   child only after cloning it. The correspondence stack grows on demand and
+   never turns DOM depth into C stack depth. Partial clones remain unescaped. */
+struct clone_walk {
+    node_t *source, *copy, *attach, *target, *next;
+    unsigned stage;
+    bool deep;
+};
+node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
+    node_t *root = clone_one(d, n);
+    if (!root || n->type == N_ATTR) return root;
+    size_t capacity = 16, used = 1;
+    struct clone_walk *stack = malloc(capacity * sizeof *stack);
+    if (!stack) return NULL;
+    stack[0] = (struct clone_walk){.source=n, .copy=root, .deep=deep};
+    while (used) {
+        struct clone_walk *at = &stack[used - 1];
+        node_t *source = at->source, *copy = at->copy;
+        if (!at->stage) {
+            at->target = copy->template_content;
+            at->next = at->deep && at->target && source->template_content ? source->template_content->first : NULL;
+            at->stage = 1;
+        }
+        if (!at->next && at->stage == 1) {
+            at->target = copy;
+            at->next = at->deep ? source->first : NULL;
+            at->stage = 2;
+        }
+        if (!at->next && at->stage == 2) {
+            node_t *shadow = source->shadow_root;
+            at->stage = 3;
+            if (shadow && shadow->shadow_clonable) {
+                at->target = doc_shadow_attach(copy->owner, copy, shadow->shadow_closed,
+                    shadow->shadow_delegates_focus, true, shadow->shadow_serializable, shadow->shadow_manual);
+                if (!at->target) { free(stack); return NULL; }
+                at->target->shadow_declarative = shadow->shadow_declarative;
+                at->next = shadow->first;
+            }
+        }
+        if (!at->next) {
+            node_t *attach = at->attach;
+            if (attach && !doc_node_move(attach->owner, attach, copy, NULL)) { free(stack); return NULL; }
+            used--; continue;
+        }
+        node_t *child = at->next, *target = at->target;
+        at->next = child->next;
+        if (used == capacity) {
+            size_t max = SIZE_MAX / sizeof *stack;
+            if (capacity == max) { free(stack); return NULL; }
+            size_t next = capacity > max / 2 ? max : capacity * 2;
+            struct clone_walk *grown = realloc(stack, next * sizeof *stack);
+            if (!grown) { free(stack); return NULL; }
+            stack = grown; capacity = next;
+        }
+        node_t *made = clone_one(target->owner, child);
+        if (!made) { free(stack); return NULL; }
+        stack[used++] = (struct clone_walk){.source=child, .copy=made, .attach=target, .deep=true};
+    }
+    free(stack); return root;
 }

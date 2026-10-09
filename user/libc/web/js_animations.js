@@ -5,12 +5,13 @@
     const effects=new WeakMap(),animations=new WeakMap(),timelines=new WeakMap();
     const relevant=new Set(),running=new Set();
     let frame=0,nextId=1;
+    const animationId=()=>{if(nextId>0xffffffff)throw new RangeError('Native animation identity is not representable');return nextId++;};
     const finite=(v,name)=>{v=Number(v);if(!Number.isFinite(v))throw new TypeError('Invalid '+name);return v;};
     const element=(v)=>{if(v!==null && (!rawDom('isNode',null,v)||rawDom('get',v,'nodeType')!==1))throw new TypeError('Expected Element');return v;};
     const effectState=(v)=>{const s=effects.get(v);if(!s)throw new TypeError('Illegal AnimationEffect receiver');return s;};
     const animationState=(v)=>{const s=animations.get(v);if(!s)throw new TypeError('Illegal Animation receiver');return s;};
     const names=new Set(['offset','easing','composite','computedOffset']);
-    function cssValue(value){const text=String(value);if(text.length>512)throw new DOMException('Animation value is too long','QuotaExceededError');return text;}
+    function cssValue(value){return String(value);}
     function easing(value) {
         const text=String(value).trim(),aliases={ease:[.25,.1,.25,1],'ease-in':[.42,0,1,1],'ease-out':[0,0,.58,1],'ease-in-out':[.42,0,.58,1]};
         if(text==='linear')return x=>x;
@@ -43,13 +44,12 @@
         if(input==null)return [];
         let out=[];
         if(Array.isArray(input)||typeof input[Symbol.iterator]==='function'){
-            for(const entry of input){if(out.length>=512)throw new DOMException('Too many animation keyframes','QuotaExceededError');if(entry==null||typeof entry!=='object')throw new TypeError('Invalid keyframe');const f={offset:entry.offset==null?null:finite(entry.offset,'offset'),easing:entry.easing===undefined?'linear':String(entry.easing),composite:entry.composite===undefined?'auto':String(entry.composite)};for(const key of Object.keys(entry))if(!names.has(key))f[cssName(key)]=cssValue(entry[key]);out.push(f);}
+            for(const entry of input){if(entry==null||typeof entry!=='object')throw new TypeError('Invalid keyframe');const f={offset:entry.offset==null?null:finite(entry.offset,'offset'),easing:entry.easing===undefined?'linear':String(entry.easing),composite:entry.composite===undefined?'auto':String(entry.composite)};for(const key of Object.keys(entry))if(!names.has(key))f[cssName(key)]=cssValue(entry[key]);out.push(f);}
         }else{
             const object=Object(input),byOffset=new Map();
             for(const key of Object.keys(object)){
                 if(names.has(key))continue;
                 const values=Array.isArray(object[key])?object[key]:[object[key]];
-                if(values.length>512)throw new DOMException('Too many animation keyframes','QuotaExceededError');
                 for(let i=0;i<values.length;i++){const off=values.length===1?1:i/(values.length-1);let f=byOffset.get(off);if(!f)byOffset.set(off,f={offset:off,easing:'linear',composite:'auto'});f[cssName(key)]=cssValue(values[i]);}
             }
             out=Array.from(byOffset.values()).sort((a,b)=>a.offset-b.offset);
@@ -58,10 +58,8 @@
             const composites=object.composite===undefined?null:(Array.isArray(object.composite)?object.composite:[object.composite]);
             for(let i=0;i<out.length;i++){if(offsets&&i<offsets.length)out[i].offset=offsets[i]==null?null:finite(offsets[i],'offset');if(easings&&easings.length)out[i].easing=String(easings[i%easings.length]);if(composites&&composites.length)out[i].composite=String(composites[i%composites.length]);}
         }
-        if(out.length>512)throw new DOMException('Too many animation keyframes','QuotaExceededError');
         let last=-1;const properties=new Set();
         for(const f of out){for(const key of Object.keys(f))if(!names.has(key))properties.add(key);if(f.offset!==null){if(f.offset<0||f.offset>1||f.offset<last)throw new TypeError('Keyframe offsets are not ordered');last=f.offset;}easing(f.easing);if(!['auto','replace'].includes(f.composite))throw new DOMException('Additive animation composition is not implemented','NotSupportedError');}
-        if(properties.size>64)throw new DOMException('Too many animated properties','QuotaExceededError');
         if(!out.length)return out;
         if(out.length===1&&out[0].offset===null)out[0].offset=1;
         if(out[0].offset===null)out[0].offset=0;
@@ -162,7 +160,7 @@
         }}finally{schedule();}
     }
     function schedule(){const moving=Array.from(running).some(a=>animationState(a).rate!==0);if(!frame&&moving)frame=requestAnimationFrame(tick);else if(frame&&!moving){cancelAnimationFrame(frame);frame=0;}}
-    function remember(a){if(!relevant.has(a)&&relevant.size>=128)throw new DOMException('Too many document animations','QuotaExceededError');relevant.add(a);}
+    function remember(a){relevant.add(a);}
     function changed(effect){const e=effectState(effect);if(e.animation){sample(e.animation);schedule();}}
     class AnimationTimeline {constructor(){throw new TypeError('Illegal AnimationTimeline constructor');}get currentTime(){if(!timelines.has(this))throw new TypeError('Illegal AnimationTimeline receiver');return host.now()-timelines.get(this).origin;}}
     class DocumentTimeline extends AnimationTimeline {
@@ -191,7 +189,7 @@
     }
     class AnimationPlaybackEvent extends Event {constructor(type,options={}){super(type,options);this.currentTime=options.currentTime==null?null:finite(options.currentTime,'currentTime');this.timelineTime=options.timelineTime==null?null:finite(options.timelineTime,'timelineTime');}}
     class Animation extends EventTarget {
-        constructor(effect=null,clock=timeline){super();if(clock!==timeline)throw new DOMException('Only the document timeline is implemented','NotSupportedError');animations.set(this,{id:nextId++,effect:null,state:'idle',hold:null,start:null,rate:1,target:null,pseudo:'',pairs:null,finished:null,ready:null,persisted:false,generation:0,handlers:new Map()});this.id='';this.effect=effect;}
+        constructor(effect=null,clock=timeline){super();if(clock!==timeline)throw new DOMException('Only the document timeline is implemented','NotSupportedError');animations.set(this,{id:animationId(),effect:null,state:'idle',hold:null,start:null,rate:1,target:null,pseudo:'',pairs:null,finished:null,ready:null,persisted:false,generation:0,handlers:new Map()});this.id='';this.effect=effect;}
         get effect(){return animationState(this).effect;}set effect(v){const s=animationState(this);if(v!==null)effectState(v);if(s.effect)effectState(s.effect).animation=null;if(v){const e=effectState(v);if(e.animation&&e.animation!==this)e.animation.effect=null;e.animation=this;}s.effect=v;sample(this);}
         get timeline(){animationState(this);return timeline;}set timeline(v){animationState(this);if(v!==timeline)throw new DOMException('Only the document timeline is implemented','NotSupportedError');}
         get currentTime(){return localTime(animationState(this));}set currentTime(v){const s=animationState(this);if(v===null){if(s.state!=='idle')throw new TypeError('Cannot clear a running currentTime');return;}s.hold=finite(v,'currentTime');if(s.state==='running')s.start=s.rate?host.now()-s.hold/s.rate:null;else if(s.state==='idle')s.state='paused';else if(s.state==='finished'){s.state='paused';s.finished=null;s.generation++;}remember(this);sample(this);}

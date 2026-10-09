@@ -85,14 +85,18 @@ $(BUILD)/u/user/libc/media.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ff
 $(BUILD)/u/user/libc/media_adaptive.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
 $(BUILD)/u/user/libc/media_mse.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
 
-# プロセス単位の生存メディア割当。全heap/RSSの上限ではない。
+# プロセス単位の生存メディア割当。既定は固定quotaなし、実OSmalloc失敗で判定。
 # FF原文は維持し、allocator/entropyの3接点だけをprivate familyへ接続。
-# native decoderと表示frameも同じ予算を使う。
-MEDIA_QUOTA_BYTES ?= 100663296
+# native decoderと表示frameも同じ課金統計を使う。有限quotaは明示useroverrideのみ。
+MEDIA_QUOTA_BYTES ?= SIZE_MAX
 .PHONY: media-quota-config
 $(BUILD)/media-quota.cfg: media-quota-config
 	@mkdir -p $(dir $@)
-	@if [ ! -f "$@" ] || [ "$$(cat "$@")" != '$(MEDIA_QUOTA_BYTES)' ]; then printf '%s\n' '$(MEDIA_QUOTA_BYTES)' > "$@"; fi
+	@if [ ! -f "$@" ] || [ "$$(cat "$@")" != '$(MEDIA_QUOTA_BYTES)' ]; then \
+	    printf '%s\n' '$(MEDIA_QUOTA_BYTES)' > "$@"; \
+	    if [ '$(MEDIA_QUOTA_BYTES)' = SIZE_MAX ]; then printf '%s\n' 'media heap: 固定quotaなし（実OS割当、size_t overflow/OOM判定）'; \
+	    else printf '%s\n' 'media heap: 明示user quota $(MEDIA_QUOTA_BYTES) bytes'; fi; \
+	fi
 $(BUILD)/u/user/libc/media_alloc.o: UCFLAGS += -DNMEDIA_ALLOC_LIMIT_BYTES=$(MEDIA_QUOTA_BYTES)
 $(BUILD)/u/user/libc/media_alloc.o: $(BUILD)/media-quota.cfg Makefile
 $(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/mem.o: FFFLAGS += -DMALLOC_PREFIX=nmedia_ff_
@@ -148,9 +152,9 @@ user/libc/web/js_bootstrap.inc user/libc/web/js_form_url.inc &: $(wildcard user/
 	@$(PY) user/libc/web/js_embed.py
 $(BUILD)/u/user/libc/web/js.o: user/libc/web/js_bootstrap.inc
 $(BUILD)/u/user/libc/web/form_validation.o: user/libc/web/js_form_url.inc
-user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_clone.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_embed.py
+user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_clone.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_worker_embed.py
 	@$(PY) user/libc/web/js_worker_embed.py
-$(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc
+$(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc user/libc/web/js_worker_transfer.h
 
 $(BUILD)/u/%.asm.o: %.asm
 	@mkdir -p $(dir $@)

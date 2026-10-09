@@ -1,17 +1,16 @@
 #include "media_mse_parser.h"
+#include "media_alloc_private.h"
 #include <math.h>
 #include <string.h>
 
-#define LIMIT ((size_t)32 * 1024 * 1024)
-#define MAX_ELEMENTS 32768u
-#define MAX_DEPTH 16u
-#define MAX_RUNS 256u
+/* Native demux AVIO offsets are signed 64-bit; not a staging memory quota. */
+#define LIMIT ((size_t)INT64_MAX)
 #define TAG(a,b,c,d) (((uint32_t)(a)<<24)|((uint32_t)(b)<<16)|((uint32_t)(c)<<8)|(uint32_t)(d))
 
-struct parser { const uint8_t *b; size_t n; unsigned count; char *error; size_t error_size; };
+struct parser { const uint8_t *b; size_t n,count; char *error; size_t error_size; };
 struct box { uint32_t type; size_t start, body, end; };
 struct run { size_t first, last; bool known, covered; };
-struct fragment { struct run runs[MAX_RUNS]; unsigned count, trafs; bool unknown, explicit_base; };
+struct fragment { struct run *runs; size_t count, capacity, trafs; bool unknown, explicit_base; };
 struct element { uint32_t id; size_t start, body, end; uint64_t size; bool unknown; };
 
 static int fail(struct parser *p, const char *text) {
@@ -22,13 +21,25 @@ static int fail(struct parser *p, const char *text) {
     }
     return -1;
 }
+/* Metadata grows with the actual finite input, never a codec/box-count quota.
+ * A failed realloc retains its old owner; all traversals release on every exit. */
+static void *grow_records(struct parser *p,void *data,size_t *capacity,size_t need,size_t unit){
+    if(need<=*capacity)return data;
+    if(!unit||need>SIZE_MAX/unit||need>(size_t)PTRDIFF_MAX/unit){fail(p,"Parser metadata size overflow");return NULL;}
+    size_t maximum=(size_t)PTRDIFF_MAX/unit,cap=*capacity?*capacity:8;
+    while(cap<need){if(cap>maximum/2){cap=need;break;}cap*=2;}
+    if(cap>maximum)cap=need;
+    void *next=nmedia_ff_realloc(data,cap*unit);
+    if(!next){fail(p,"Parser metadata allocation failed");return NULL;}
+    *capacity=cap;return next;
+}
 static uint32_t be32(const uint8_t *b) {
     return ((uint32_t)b[0]<<24)|((uint32_t)b[1]<<16)|((uint32_t)b[2]<<8)|b[3];
 }
 static uint64_t be64(const uint8_t *b) { return ((uint64_t)be32(b)<<32)|be32(b+4); }
 static int more(struct parser *p, bool eos) { return eos ? fail(p, "Truncated media segment") : 0; }
 static int count(struct parser *p) {
-    return ++p->count > MAX_ELEMENTS ? fail(p, "Too many container elements") : 1;
+    if(p->count==SIZE_MAX)return fail(p,"Container element count overflow");p->count++;return 1;
 }
 
 /* A zero-sized top-level MP4 box is only closed by EOS. Nested zero sizes
@@ -75,71 +86,65 @@ static bool audio_entry(uint32_t t) {
            t == TAG('f','L','a','C') || t == TAG('a','c','-','3') ||
            t == TAG('e','c','-','3') || t == TAG('a','l','a','c');
 }
-static int inspect_boxes(struct parser *p, size_t at, size_t end, unsigned depth, bool init);
-static int sample_entries(struct parser *p, const struct box *b, unsigned depth) {
-    if (b->end - b->body < 8 || p->b[b->body]) return fail(p, "Invalid sample description");
-    uint32_t entries = be32(p->b + b->body + 4);
-    if (!entries || entries > 256) return fail(p, "Invalid sample description count");
-    size_t at = b->body + 8;
-    for (uint32_t i = 0; i < entries; ++i) {
-        struct box e;
-        int r = box_at(p, at, b->end, true, &e);
-        if (r <= 0) return r < 0 ? r : fail(p, "Truncated sample description");
-        if (encrypted_box(e.type)) return fail(p, "Encrypted media is unsupported");
-        if (e.end - e.body < 8 || p->b[e.body + 7] != 1 || p->b[e.body + 6])
-            return fail(p, "External sample data is unsupported");
-        size_t fixed = 0;
-        if (visual_entry(e.type)) fixed = 78;
-        else if (audio_entry(e.type)) {
-            if (e.end - e.body < 28) return fail(p, "Truncated audio sample description");
-            unsigned version = ((unsigned)p->b[e.body+8]<<8)|p->b[e.body+9];
-            if (version > 2) return fail(p, "Unsupported audio sample description");
-            fixed = version == 2 ? 64 : version == 1 ? 44 : 28;
-        } else if (e.type == TAG('r','t','p',' ')) {
-            /* RTP hint tracks accompany some clear AVC/AAC fragmented MP4s.
-             * They are not codec tracks; their hint description is opaque to
-             * the playback demuxer after the generic data-reference header. */
-            at = e.end; continue;
-        } else return fail(p, "Unsupported sample description");
-        if (fixed > e.end - e.body) return fail(p, "Truncated sample description");
-        r = inspect_boxes(p, e.body + fixed, e.end, depth + 1, true);
-        if (r < 0) return r;
-        at = e.end;
-    }
-    return at == b->end ? 1 : fail(p, "Invalid sample description length");
-}
-static int inspect_boxes(struct parser *p, size_t at, size_t end, unsigned depth, bool init) {
-    if (depth > MAX_DEPTH) return fail(p, "MP4 nesting limit exceeded");
-    while (at < end) {
-        struct box b;
-        int r = box_at(p, at, end, true, &b);
-        if (r <= 0) return r < 0 ? r : fail(p, "Truncated nested MP4 box");
-        if (encrypted_box(b.type)) return fail(p, "Encrypted media is unsupported");
-        if (b.type == TAG('u','u','i','d')) return fail(p, "Unsupported UUID media extension");
-        if (b.type == TAG('s','g','p','d') || b.type == TAG('s','b','g','p')) {
-            if (b.end - b.body < 8) return fail(p, "Truncated sample grouping");
-            if (be32(p->b+b.body+4) == TAG('s','e','i','g'))
-                return fail(p, "Encrypted media is unsupported");
+struct box_scope {size_t at,end;uint32_t entries;bool init,samples;};
+static int inspect_boxes(struct parser *p,size_t at,size_t end,bool init){
+    if(at==end)return 1;
+    struct box_scope *stack=NULL;size_t used=0,capacity=0;int result=1;
+    stack=grow_records(p,stack,&capacity,1,sizeof *stack);if(!stack)return NMEDIA_MSE_PARSE_MEMORY;
+    stack[used++]=(struct box_scope){.at=at,.end=end,.init=init};
+    while(used){
+        struct box_scope *scope=&stack[used-1];
+        if(scope->at==scope->end){
+            if(scope->samples&&scope->entries){result=fail(p,"Truncated sample description");goto done;}
+            used--;continue;
         }
-        if (init && (b.type == TAG('s','t','t','s') || b.type == TAG('s','t','s','c') ||
-                     b.type == TAG('s','t','c','o') || b.type == TAG('c','o','6','4'))) {
-            if (b.end - b.body != 8 || be32(p->b+b.body+4))
-                return fail(p, "Non-fragmented MP4 initialization");
+        if(scope->samples&&!scope->entries){result=fail(p,"Invalid sample description length");goto done;}
+        struct box b;int r=box_at(p,scope->at,scope->end,true,&b);
+        if(r<=0){result=r<0?r:fail(p,scope->samples?"Truncated sample description":"Truncated nested MP4 box");goto done;}
+        scope->at=b.end;
+        if(encrypted_box(b.type)){result=fail(p,"Encrypted media is unsupported");goto done;}
+        bool descend=false;struct box_scope child={0};
+        if(scope->samples){
+            scope->entries--;
+            if(b.end-b.body<8||p->b[b.body+7]!=1||p->b[b.body+6]){result=fail(p,"External sample data is unsupported");goto done;}
+            size_t fixed=0;
+            if(visual_entry(b.type))fixed=78;
+            else if(audio_entry(b.type)){
+                if(b.end-b.body<28){result=fail(p,"Truncated audio sample description");goto done;}
+                unsigned version=((unsigned)p->b[b.body+8]<<8)|p->b[b.body+9];
+                if(version>2){result=fail(p,"Unsupported audio sample description");goto done;}
+                fixed=version==2?64:version==1?44:28;
+            }else if(b.type==TAG('r','t','p',' '))continue;
+            else {result=fail(p,"Unsupported sample description");goto done;}
+            if(fixed>b.end-b.body){result=fail(p,"Truncated sample description");goto done;}
+            child=(struct box_scope){.at=b.body+fixed,.end=b.end,.init=true};descend=true;
+        }else{
+            if(b.type==TAG('u','u','i','d')){result=fail(p,"Unsupported UUID media extension");goto done;}
+            if(b.type==TAG('s','g','p','d')||b.type==TAG('s','b','g','p')){
+                if(b.end-b.body<8){result=fail(p,"Truncated sample grouping");goto done;}
+                if(be32(p->b+b.body+4)==TAG('s','e','i','g')){result=fail(p,"Encrypted media is unsupported");goto done;}
+            }
+            if(scope->init&&(b.type==TAG('s','t','t','s')||b.type==TAG('s','t','s','c')||b.type==TAG('s','t','c','o')||b.type==TAG('c','o','6','4'))){
+                if(b.end-b.body!=8||be32(p->b+b.body+4)){result=fail(p,"Non-fragmented MP4 initialization");goto done;}
+            }
+            if(b.type==TAG('s','t','s','d')){
+                if(b.end-b.body<8||p->b[b.body]){result=fail(p,"Invalid sample description");goto done;}
+                uint32_t entries=be32(p->b+b.body+4);
+                if(!entries||entries>(b.end-b.body-8)/16){result=fail(p,"Invalid sample description count");goto done;}
+                child=(struct box_scope){.at=b.body+8,.end=b.end,.entries=entries,.init=true,.samples=true};descend=true;
+            }else if(b.type==TAG('d','r','e','f')){
+                if(b.end-b.body<8||p->b[b.body]||be32(p->b+b.body+4)!=1){result=fail(p,"External data references are unsupported");goto done;}
+                struct box ref;r=box_at(p,b.body+8,b.end,true,&ref);
+                if(r<=0||ref.end!=b.end||ref.type!=TAG('u','r','l',' ')||ref.end-ref.body!=4||be32(p->b+ref.body)!=1){result=fail(p,"External data references are unsupported");goto done;}
+            }else if(container_box(b.type)){child=(struct box_scope){.at=b.body,.end=b.end,.init=scope->init};descend=true;}
         }
-        if (b.type == TAG('s','t','s','d')) r = sample_entries(p, &b, depth);
-        else if (b.type == TAG('d','r','e','f')) {
-            if (b.end-b.body < 8 || p->b[b.body] || be32(p->b+b.body+4) != 1)
-                return fail(p, "External data references are unsupported");
-            struct box ref;
-            r = box_at(p, b.body+8, b.end, true, &ref);
-            if (r <= 0 || ref.end != b.end || ref.type != TAG('u','r','l',' ') ||
-                ref.end-ref.body != 4 || be32(p->b+ref.body) != 1)
-                return fail(p, "External data references are unsupported");
-        } else if (container_box(b.type)) r = inspect_boxes(p, b.body, b.end, depth+1, init);
-        if (r < 0) return r;
-        at = b.end;
+        if(descend&&child.at<child.end){
+            if(used==SIZE_MAX){result=fail(p,"Parser nesting count overflow");goto done;}
+            struct box_scope *next=grow_records(p,stack,&capacity,used+1,sizeof *stack);
+            if(!next){result=NMEDIA_MSE_PARSE_MEMORY;goto done;}stack=next;stack[used++]=child;
+        }else if(descend&&child.samples&&child.entries){result=fail(p,"Truncated sample description");goto done;}
     }
-    return 1;
+done:nmedia_ff_free(stack);return result;
 }
 static int validate_init(struct parser *p, const struct box *moov) {
     bool mvex = false, track = false;
@@ -153,7 +158,7 @@ static int validate_init(struct parser *p, const struct box *moov) {
         at = b.end;
     }
     if (!mvex || !track) return fail(p, "Missing fragmented MP4 initialization");
-    return inspect_boxes(p, moov->body, moov->end, 1, true);
+    return inspect_boxes(p, moov->body, moov->end, true);
 }
 static int validate_traf(struct parser *p, const struct box *traf, size_t moof,
                          struct fragment *f) {
@@ -197,13 +202,13 @@ static int validate_traf(struct parser *p, const struct box *traf, size_t moof,
         if (b.type == TAG('t','r','u','n')) {
             if (b.end-b.body < 8 || p->b[b.body] > 1) return fail(p, "Invalid track run");
             uint32_t flags = be32(p->b+b.body)&0xffffff, samples = be32(p->b+b.body+4);
-            if (flags & ~0xf05u || (!trun && !(flags&1)) || samples > LIMIT)
+            if (flags & ~0xf05u || (!trun && !(flags&1)))
                 return fail(p, "Invalid track run flags or count");
             size_t off = b.body+8;
             if (flags&1) {
                 if (b.end-off < 4) return fail(p, "Truncated track run offset");
                 uint32_t offset = be32(p->b+off); off += 4;
-                if (offset > LIMIT || moof > LIMIT-offset) return fail(p, "Invalid track run data offset");
+                if (moof > LIMIT-offset) return fail(p, "Invalid track run data offset");
                 cursor = moof+offset; cursor_known = true;
             }
             if (flags&4) off += 4;
@@ -222,7 +227,9 @@ static int validate_traf(struct parser *p, const struct box *traf, size_t moof,
             } else if (default_known) bytes = (uint64_t)samples*default_size;
             if (bytes > LIMIT || (known && cursor > LIMIT-bytes)) return fail(p, "Oversized track run");
             if (samples) {
-                if (f->count == MAX_RUNS) return fail(p, "Too many track runs");
+                if(f->count==SIZE_MAX)return fail(p,"Track run count overflow");
+                struct run *runs=grow_records(p,f->runs,&f->capacity,f->count+1,sizeof *runs);
+                if(!runs)return NMEDIA_MSE_PARSE_MEMORY;f->runs=runs;
                 f->runs[f->count++] = (struct run){cursor, known?cursor+(size_t)bytes:0, known, false};
                 if (!known) f->unknown = true;
             }
@@ -234,14 +241,14 @@ static int validate_traf(struct parser *p, const struct box *traf, size_t moof,
     return trun ? 1 : fail(p, "Missing track run");
 }
 static int validate_moof(struct parser *p, const struct box *moof, struct fragment *f) {
-    int r = inspect_boxes(p, moof->body, moof->end, 1, false);
+    int r = inspect_boxes(p, moof->body, moof->end, false);
     if (r < 0) return r;
     size_t at = moof->body;
     while (at < moof->end) {
         struct box b; r = box_at(p, at, moof->end, true, &b);
         if (r <= 0) return r < 0 ? r : fail(p, "Truncated movie fragment");
         if (b.type == TAG('t','r','a','f')) {
-            if (++f->trafs > 32) return fail(p, "Too many track fragments");
+            if(f->trafs==SIZE_MAX)return fail(p,"Track fragment count overflow");f->trafs++;
             r = validate_traf(p, &b, moof->start, f);
             if (r < 0) return r;
         }
@@ -253,13 +260,12 @@ static int validate_moof(struct parser *p, const struct box *moof, struct fragme
 }
 static bool runs_complete(const struct fragment *f) {
     if (f->unknown) return false;
-    for (unsigned i = 0; i < f->count; ++i) if (!f->runs[i].covered) return false;
+    for (size_t i = 0; i < f->count; ++i) if (!f->runs[i].covered) return false;
     return true;
 }
-static int mp4_boundary(struct parser *p, bool have_init, bool eos, size_t *init_end, size_t *segment_end) {
+static int mp4_boundary_impl(struct parser *p, bool have_init, bool eos, size_t *init_end, size_t *segment_end,struct fragment *f) {
     size_t at = 0, media_start = 0;
     bool ftyp = false, initialized = have_init, moof = false, mdat = false;
-    struct fragment f = {0};
     while (at < p->n) {
         /* A complete next-segment header closes a fragment whose sizes are
          * inherited from trex. Do not wait for that next fragment's payload. */
@@ -267,8 +273,8 @@ static int mp4_boundary(struct parser *p, bool have_init, bool eos, size_t *init
             uint32_t type = be32(p->b+at+4), size = be32(p->b+at);
             if ((type == TAG('m','o','o','f') || type == TAG('s','t','y','p') || type == TAG('s','i','d','x') || type == TAG('f','t','y','p')) &&
                 (size != 1 || p->n-at >= 16)) {
-                for (unsigned i = 0; i < f.count; ++i)
-                    if (f.runs[i].known && !f.runs[i].covered) return fail(p, "Track run exceeds media data");
+                for (size_t i = 0; i < f->count; ++i)
+                    if (f->runs[i].known && !f->runs[i].covered) return fail(p, "Track run exceeds media data");
                 *segment_end = at; return 1;
             }
         }
@@ -302,27 +308,27 @@ static int mp4_boundary(struct parser *p, bool have_init, bool eos, size_t *init
         } else if (b.type == TAG('m','o','o','f')) {
             if (moof) {
                 if (!mdat) return fail(p, "Movie fragment has no media data");
-                for (unsigned i = 0; i < f.count; ++i)
-                    if (f.runs[i].known && !f.runs[i].covered) return fail(p, "Track run exceeds media data");
+                for (size_t i = 0; i < f->count; ++i)
+                    if (f->runs[i].known && !f->runs[i].covered) return fail(p, "Track run exceeds media data");
                 *segment_end = b.start; return 1;
             }
-            moof = true; r = validate_moof(p, &b, &f); if (r < 0) return r;
+            moof = true; r = validate_moof(p, &b, f); if (r < 0) return r;
         } else if (b.type == TAG('m','d','a','t')) {
             if (!moof) return fail(p, "Media data precedes movie fragment");
             mdat = true;
-            for (unsigned i = 0; i < f.count; ++i) {
-                struct run *run = &f.runs[i];
+            for (size_t i = 0; i < f->count; ++i) {
+                struct run *run = &f->runs[i];
                 if (run->known && run->first >= b.body && run->last <= b.end) run->covered = true;
                 if (run->known && run->first < b.end && run->last > b.body && !run->covered)
                     return fail(p, "Track run crosses media box boundary");
             }
-            if (runs_complete(&f)) { *segment_end = b.end; return 1; }
+            if (runs_complete(f)) { *segment_end = b.end; return 1; }
         } else if (b.type == TAG('f','t','y','p') || b.type == TAG('m','o','o','v')) {
             return fail(p, "Unexpected MP4 initialization segment");
         } else if (b.type == TAG('s','t','y','p') || b.type == TAG('s','i','d','x')) {
             if (moof && mdat) {
-                for (unsigned i = 0; i < f.count; ++i)
-                    if (f.runs[i].known && !f.runs[i].covered) return fail(p, "Track run exceeds media data");
+                for (size_t i = 0; i < f->count; ++i)
+                    if (f->runs[i].known && !f->runs[i].covered) return fail(p, "Track run exceeds media data");
                 *segment_end = b.start; return 1;
             }
             if (moof) return fail(p, "Unexpected media segment prefix");
@@ -333,13 +339,18 @@ static int mp4_boundary(struct parser *p, bool have_init, bool eos, size_t *init
     }
     if (eos && moof) {
         if (!mdat) return fail(p, "Truncated movie fragment data");
-        for (unsigned i = 0; i < f.count; ++i)
-            if (f.runs[i].known && !f.runs[i].covered) return fail(p, "Track run exceeds media data");
+        for (size_t i = 0; i < f->count; ++i)
+            if (f->runs[i].known && !f->runs[i].covered) return fail(p, "Track run exceeds media data");
         *segment_end = at; return 1;
     }
     if (*init_end) return 1;
     if (eos && at > media_start && initialized && !moof) { *segment_end = at; return 1; }
     return more(p, eos);
+}
+
+static int mp4_boundary(struct parser *p,bool have_init,bool eos,size_t *init_end,size_t *segment_end){
+    struct fragment f={0};int r=mp4_boundary_impl(p,have_init,eos,init_end,segment_end,&f);
+    nmedia_ff_free(f.runs);return r;
 }
 
 /* EBML VINT decoding never searches byte strings for delimiters: frame data
@@ -390,23 +401,27 @@ static int ebml_uint(struct parser *p, const struct element *e, uint64_t *v) {
     for (size_t i = e->body; i < e->end; ++i) n = (n<<8)|p->b[i];
     *v = n; return 1;
 }
-static int inspect_ebml(struct parser *p, size_t at, size_t end, unsigned depth) {
-    if (depth > MAX_DEPTH) return fail(p, "WebM nesting limit exceeded");
-    while (at < end) {
-        struct element e; int r = element_at(p, at, end, false, &e);
-        if (r <= 0) return r < 0 ? r : fail(p, "Truncated nested WebM element");
-        if (e.unknown) return fail(p, "Unknown size on finite WebM metadata");
-        if (e.id == 0x5035 || e.id == 0x47e1 || e.id == 0x47e2 || e.id == 0x47e7)
-            return fail(p, "Encrypted WebM is unsupported");
-        if (e.id == 0x5033) {
-            uint64_t type; r = ebml_uint(p, &e, &type);
-            if (r < 0) return r;
-            if (type) return fail(p, "Encrypted WebM is unsupported");
+struct ebml_scope {size_t at,end;};
+static int inspect_ebml(struct parser *p,size_t at,size_t end){
+    if(at==end)return 1;
+    struct ebml_scope *stack=NULL;size_t used=0,capacity=0;int result=1;
+    stack=grow_records(p,stack,&capacity,1,sizeof *stack);if(!stack)return NMEDIA_MSE_PARSE_MEMORY;
+    stack[used++]=(struct ebml_scope){at,end};
+    while(used){
+        struct ebml_scope *scope=&stack[used-1];if(scope->at==scope->end){used--;continue;}
+        struct element e;int r=element_at(p,scope->at,scope->end,false,&e);
+        if(r<=0){result=r<0?r:fail(p,"Truncated nested WebM element");goto done;}
+        scope->at=e.end;
+        if(e.unknown){result=fail(p,"Unknown size on finite WebM metadata");goto done;}
+        if(e.id==0x5035||e.id==0x47e1||e.id==0x47e2||e.id==0x47e7){result=fail(p,"Encrypted WebM is unsupported");goto done;}
+        if(e.id==0x5033){uint64_t type;r=ebml_uint(p,&e,&type);if(r<0){result=r;goto done;}if(type){result=fail(p,"Encrypted WebM is unsupported");goto done;}}
+        if(ebml_master(e.id)&&e.body<e.end){
+            if(used==SIZE_MAX){result=fail(p,"Parser nesting count overflow");goto done;}
+            struct ebml_scope *next=grow_records(p,stack,&capacity,used+1,sizeof *stack);
+            if(!next){result=NMEDIA_MSE_PARSE_MEMORY;goto done;}stack=next;stack[used++]=(struct ebml_scope){e.body,e.end};
         }
-        if (ebml_master(e.id)) { r = inspect_ebml(p, e.body, e.end, depth+1); if (r < 0) return r; }
-        at = e.end;
     }
-    return 1;
+done:nmedia_ff_free(stack);return result;
 }
 static int validate_header(struct parser *p, const struct element *header) {
     size_t at = header->body; bool webm = false;
@@ -479,7 +494,7 @@ static int validate_group(struct parser *p, const struct element *group, bool ti
         }
         at = e.end;
     }
-    int r = inspect_ebml(p, group->body, group->end, 1);
+    int r = inspect_ebml(p, group->body, group->end);
     if (r < 0) return r;
     return block ? 1 : fail(p, "Missing WebM block");
 }
@@ -544,7 +559,7 @@ static int webm_boundary(struct parser *p, bool have_init, bool eos, size_t *ini
                 if (!info || tracks) return fail(p, "Invalid WebM Tracks order");
                 tracks = true;
             }
-            if (ebml_master(e.id)) { r = inspect_ebml(p, e.body, e.end, 1); if (r < 0) return r; }
+            if (ebml_master(e.id)) { r = inspect_ebml(p, e.body, e.end); if (r < 0) return r; }
             at = e.end;
             if (tracks) *init_end = at;
         }

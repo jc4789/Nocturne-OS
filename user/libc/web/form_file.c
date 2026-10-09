@@ -1,6 +1,7 @@
 /* Only the trusted native picker calls the filesystem path entry point.
    Script file assignment transfers immutable bytes, never a local path. */
 #include <stdio.h>
+#include <limits.h>
 #include "nocturne.h"
 #include "form_file.h"
 #include "form_value.h"
@@ -11,9 +12,27 @@ struct web_form_files *web_input_files_create(void) {
     if (files) { files->refs = 1; files->allocation = sizeof *files; }
     return files;
 }
+bool web_input_files_reserve(struct web_form_files *files, unsigned count) {
+    if (!files || files->refs != 1) return false; /* published lists are immutable */
+    if (count <= files->capacity) return true;
+    unsigned capacity = files->capacity ? files->capacity : 8;
+    while (capacity < count) {
+        if (capacity > UINT_MAX / 2) { capacity = count; break; }
+        capacity *= 2;
+    }
+    if ((size_t)capacity > SIZE_MAX / sizeof *files->files) return false;
+    size_t extra = (size_t)(capacity - files->capacity) * sizeof *files->files;
+    if (extra > SIZE_MAX - files->allocation) return false;
+    struct web_form_file *array = realloc(files->files, (size_t)capacity * sizeof *array);
+    if (!array) return false;
+    memset(array + files->capacity, 0, extra);
+    files->files = array; files->capacity = capacity; files->allocation += extra;
+    return true;
+}
 void web_input_files_dispose(struct web_form_files *files) {
     if (!files || --files->refs) return;
     for (unsigned i = 0; i < files->count; i++) free(files->files[i].bytes);
+    free(files->files);
     free(files);
 }
 void web_input_files_release(node_t *input) {
@@ -25,15 +44,14 @@ bool web_input_files_replace(web_doc *d, node_t *input, struct web_form_files *f
     if (!d || !web_input_is_file(input) || input->owner != d) return false;
     web_doc *allocation = input->allocation_doc ? input->allocation_doc : d;
     size_t old = input->files ? input->files->allocation : 0, next = files ? files->allocation : 0;
-    if (next > WEB_FILE_BYTES + sizeof *files || allocation->control_bytes < old) return false;
-    if (d->dom_family && next > doc_dom_remaining(d) + old) return false;
+    if (allocation->control_bytes < old || (files && files->refs == UINT_MAX)) return false;
     size_t base = allocation->control_bytes - old;
-    if (!d->dom_family && d->live && (base > (32u << 20) || next > (32u << 20) - base || d->mem.allocated > (32u << 20) - base - next)) return false;
+    if (next > SIZE_MAX - base) return false;
     if (files) files->refs++;
     web_input_files_release(input); input->files = files;
     input->file_revision++;
     allocation->control_bytes = base + next;
-    if (d->dom_family) doc_dom_budget(d); else if (d->live) d->mem.limit = (32u << 20) - allocation->control_bytes;
+    doc_dom_budget(d);
     doc_mutated(d, input); return true;
 }
 void web_input_files_clear(web_doc *d, node_t *input) {
@@ -41,7 +59,7 @@ void web_input_files_clear(web_doc *d, node_t *input) {
     web_doc *allocation = input->allocation_doc ? input->allocation_doc : d;
     if (allocation && allocation->control_bytes >= input->files->allocation) allocation->control_bytes -= input->files->allocation;
     web_input_files_release(input); input->file_revision++;
-    if (d) { if (d->dom_family) doc_dom_budget(d); else if (d->live) d->mem.limit = (32u << 20) - d->control_bytes; doc_mutated(d, input); }
+    if (d) { doc_dom_budget(d); doc_mutated(d, input); }
 }
 bool web_input_files_clone(web_doc *d, node_t *target, node_t *source) { return !source->files || web_input_files_replace(d, target, source->files); }
 static const char *file_mime(const char *name) {
@@ -55,11 +73,12 @@ static const char *file_mime(const char *name) {
     return "";
 }
 static bool file_read(struct web_form_files *files, const char *path, const char *relative) {
-    if (files->count >= WEB_FILE_COUNT) return false;
+    if (files->count == UINT_MAX || !web_input_files_reserve(files, files->count + 1)) return false;
     struct n_stat st;
     int fd = open(path, O_RDONLY);
     if (fd < 0) return false;
-    if (fstat(fd, &st) < 0 || st.type != N_FT_FILE || st.size > WEB_FILE_BYTES || st.size > WEB_FILE_BYTES + sizeof *files - files->allocation) { close(fd); return false; }
+    if (fstat(fd, &st) < 0 || st.type != N_FT_FILE || st.size > SIZE_MAX ||
+        (st.size ? (size_t)st.size : 1) > SIZE_MAX - files->allocation) { close(fd); return false; }
     struct web_form_file *file = &files->files[files->count];
     const char *name = strrchr(path, '/'); name = name ? name + 1 : path;
     if (strlen(name) >= sizeof file->name || (relative && strlen(relative) >= sizeof file->relative_path)) { close(fd); return false; }
@@ -73,7 +92,7 @@ static bool file_read(struct web_form_files *files, const char *path, const char
     if (!stable) { free(file->bytes); file->bytes = NULL; return false; }
     strcpy(file->name, name); strcpy(file->relative_path, relative ? relative : ""); strcpy(file->type, file_mime(name));
     file->last_modified = st.mtime > INT64_MAX / 1000 ? INT64_MAX : st.mtime < 0 ? 0 : st.mtime * 1000;
-    files->allocation += file->size; files->count++; return true;
+    files->allocation += file->size ? file->size : 1; files->count++; return true;
 }
 static bool file_directory(struct web_form_files *files, const char *path, const char *relative, unsigned depth) {
     if (depth > 32) return false;
@@ -93,7 +112,7 @@ static bool file_directory(struct web_form_files *files, const char *path, const
     close(fd); return ok && result >= 0;
 }
 bool web_input_file_paths(web_doc *d, web_node *input, const char *const *paths, unsigned count, bool directory) {
-    if (!d || !web_input_is_file(input) || web_control_disabled(input) || !paths || !count || count > WEB_FILE_COUNT) return false;
+    if (!d || !web_input_is_file(input) || web_control_disabled(input) || !paths || !count) return false;
     if (directory && (!node_attr(input, "webkitdirectory") || count != 1)) return false;
     if (!directory && !node_attr(input, "multiple") && count != 1) return false;
     struct web_form_files *files = web_input_files_create(); if (!files) return false;

@@ -3,7 +3,6 @@
 #include "webi.h"
 
 /* Native top layer; DOM parent/child links and author inert attributes never change. */
-#define WEB_DIALOG_LIMIT 16
 enum { WEB_DIALOG_READY, WEB_DIALOG_ALREADY_MODAL, WEB_DIALOG_NONMODAL,
        WEB_DIALOG_INACTIVE, WEB_DIALOG_CAPACITY };
 int web_dialog_prepare(web_doc *d, node_t *n);

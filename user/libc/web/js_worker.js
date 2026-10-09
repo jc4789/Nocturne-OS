@@ -16,24 +16,24 @@ const workerBridge=(()=>{
         postMessage(value,options){
             const s=slots.get(this);if(!s)throw new TypeError('Illegal invocation');if(s.closed)return;
             const list=Array.isArray(options)?options:options?.transfer;
-            const packet=cloneData.prepare(value,cloneData.transferList(list),true);
-            if(packet.data[1].some(record=>record[0]==='Blob'))throw new DOMException('Blob cloning across Worker realms is not supported','DataCloneError');
-            native(1,s.id,packet.data);cloneData.commit(packet);
+            const prepared=messagingBridge.prepareWorker(value,cloneData.transferList(list),s.id);
+            try{native(3,s.id,prepared.packet,prepared.plan);}catch(error){messagingBridge.abortWorker(prepared);throw error;}
         }
-        terminate(){const s=slots.get(this);if(!s)throw new TypeError('Illegal invocation');if(s.closed)return;s.closed=true;live.delete(s.id);native(2,s.id);}
+        terminate(){const s=slots.get(this);if(!s)throw new TypeError('Illegal invocation');if(s.closed)return;s.closed=true;live.delete(s.id);messagingBridge.closeWorker(s.id);native(2,s.id);}
     }
     cloneData.registerUncloneable(value=>slots.has(value));
     Object.defineProperty(Worker.prototype,Symbol.toStringTag,{value:'Worker',configurable:true});
     globalThis.Worker=Worker;
-    return {deliver(id,kind,payload){
+    return {deliver(id,kind,payload,request=0,flags=0){
         const worker=live.get(id);if(!worker)return;
         if(kind===7){host.log(0,String(payload.message||''));return;}
+        if(kind===8||kind===9){messagingBridge.receiveWorkerPort(id,request,flags,payload,kind===9);return;}
         let event;
         if(kind===2){
-            try{event=new MessageEvent('message',{data:cloneData.deserialize(payload)});}
+            try{const message=flags===3?messagingBridge.importWorker(payload,id):{data:cloneData.deserialize(payload),ports:[]};if(slots.get(worker).closed)return;event=new MessageEvent('message',{data:message.data,ports:message.ports});}
             catch(_){event=new MessageEvent('messageerror');}
         }else if(kind===4)event=new ErrorEvent('error',{cancelable:true,message:String(payload.message||'Worker failed'),filename:String(payload.filename||''),lineno:payload.lineno||0});
-        else if(kind===6){slots.get(worker).closed=true;live.delete(id);return;}else return;
+        else if(kind===6){slots.get(worker).closed=true;live.delete(id);messagingBridge.closeWorker(id);return;}else return;
         event.isTrusted=true;
         if(dispatch(worker,event)&&kind===4)host.log(2,'Worker: '+event.message);
     }};

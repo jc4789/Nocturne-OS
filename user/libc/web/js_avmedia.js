@@ -123,11 +123,8 @@ const avmediaBridge = (() => {
                     const response=await fetch(url,{signal:controller.signal,credentials:node.crossOrigin==='use-credentials'?'include':'same-origin'});
                     if(!current(node,s,generation,url))throw abortError();
                     if(!response.ok)throw new Error('Media HTTP status '+response.status);
-                    const declared=Number(response.headers.get('content-length'));
-                    if(Number.isFinite(declared)&&declared>33554432)throw new RangeError('Media input exceeds 32 MiB');
                     const bytes=await response.arrayBuffer();
                     if(!current(node,s,generation,url))throw abortError();
-                    if(bytes.byteLength>33554432)throw new RangeError('Media input exceeds 32 MiB');
                     if(!native('load',node,bytes,generation))throw new Error(native('state',node).error||'Unsupported media input');
                 }
                 if(!current(node,s,generation,url)||controller.signal.aborted)throw abortError();
@@ -222,14 +219,15 @@ const avmediaBridge = (() => {
             if(pending)await pending;
             if(s.intent!==intent||source(this)!==s.currentSrc)throw abortError();
             if(snapshot(this).ended&&!native('seek',this,0))throw new DOMException('Input cannot restart','NotSupportedError');
-            native('preparePlay',this);
-            while(snapshot(this).seeking){
+            if(!native('preparePlay',this))throw new DOMException(native('state',this).error||'Cannot prepare playback','NotSupportedError');
+            for(let prepared=snapshot(this);prepared.seeking||prepared.playPreparing;prepared=snapshot(this)){
                 await new Promise(resolve=>setTimeout(resolve,10));
                 if(s.intent!==intent||source(this)!==s.currentSrc)throw abortError();
                 if(snapshot(this).error)throw new Error(snapshot(this).error);
             }
             if(s.intent!==intent)throw new DOMException('Pending play was cancelled','AbortError');
             if(source(this)!==s.currentSrc)throw abortError();
+            if(snapshot(this).error)throw new Error(snapshot(this).error);
             const wasPaused=snapshot(this).paused;
             if(!native('play',this))throw new DOMException(native('state',this).error||'No playable media','NotSupportedError');
             s.last=native('state',this);active.add(this);monitor();

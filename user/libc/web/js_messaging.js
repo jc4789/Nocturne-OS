@@ -12,6 +12,13 @@ const messagingBridge=(() => {
     const postTask=host.postTask,cancelPost=host.cancelPost,string=elementURL.string;
     const iteratorSymbol=Symbol.iterator,eventInitMethod=Event.prototype.initEvent;
     const portBrand=p=>has(ports,p);
+    const workerRoutes=new Map(),routeGet=Map.prototype.get,routeSet=Map.prototype.set,routeDelete=Map.prototype.delete,routeEach=Map.prototype.forEach,isInteger=Number.isInteger;
+    const workerNative=host.worker;
+    const workerKey=(child,id,creator)=>child+':'+creator+':'+id;
+    const workerRoute=(child,id,creator)=>apply(routeGet,workerRoutes,[workerKey(child,id,creator)]);
+    const appendWorker=(a,v)=>define(a,a.length,{value:v,writable:true,enumerable:true,configurable:true});
+    function workerPlan(){return {buffers:[],writes:[],cancels:[],generations:[realm.generation]};}
+    function workerWrite(plan,object,key,value){appendWorker(plan.writes,{object,key,value});}
     const fail=()=>{throw new DomError('Value cannot be transferred','DataCloneError');};
     function check(p){const s=get(ports,p);if(!s)throw new TypeErr('Illegal MessagePort receiver');return s;}
     function eventCheck(e){const s=get(events,e);if(!s)throw new TypeErr('Illegal MessageEvent receiver');return s;}
@@ -148,6 +155,12 @@ const messagingBridge=(() => {
         postMessage(message,options={}){
             const s=check(this);if(!arguments.length)throw new TypeErr('Message required');
             const target=s.endpoint?s.endpoint.peer:null,transfers=listOrOptions(options);
+            if(s.endpoint?.broker){
+                for(let i=0;i<transfers.length;i++)if(portBrand(transfers[i]))throw new DomError('Brokered port re-transfer is not supported','DataCloneError');
+                const packet=cloneData.prepare({data:message,ports:[]},transfers,true),plan=cloneData.commitPlan(packet);plan.generations=[realm.generation];cloneData.validate(packet);
+                const route=s.endpoint.broker;if(route.closed){host.frame('transferCommit',plan);return;}
+                workerNative(6,route.child,packet.data,plan,route.id,route.creator);return;
+            }
             let doomed=false;
             for(let i=0;i<transfers.length;i++){
                 if(transfers[i]===this)fail();
@@ -178,7 +191,9 @@ const messagingBridge=(() => {
         }
         start(){enable(check(this));}
         close(){
-            const s=check(this);s.detached=true;
+            const s=check(this);
+            if(s.endpoint?.broker&&!s.endpoint.broker.closed){const r=s.endpoint.broker;workerNative(7,r.child,null,workerPlan(),r.id,r.creator);r.closed=true;}
+            s.detached=true;
             if(s.endpoint&&s.endpoint.peer){s.endpoint.peer.peer=null;s.endpoint.peer=null;}
             if(s.endpoint){cancelScheduled(s.endpoint);s.endpoint.head=s.endpoint.tail=null;s.endpoint.count=0;}
         }
@@ -189,8 +204,8 @@ const messagingBridge=(() => {
     }
     class MessageChannel {
         constructor(){
-            const a={peer:null,owner:null,head:null,tail:null,count:0,scheduled:false,scheduledRealm:null};
-            const b={peer:a,owner:null,head:null,tail:null,count:0,scheduled:false,scheduledRealm:null};
+            const a={peer:null,owner:null,head:null,tail:null,count:0,scheduled:false,scheduledRealm:null,broker:null};
+            const b={peer:a,owner:null,head:null,tail:null,count:0,scheduled:false,scheduledRealm:null,broker:null};
             a.peer=b;a.owner=makePort(a);b.owner=makePort(b);
             put(channels,this,[a.owner.value,b.owner.value]);
         }
@@ -198,10 +213,20 @@ const messagingBridge=(() => {
         get port2(){const c=get(channels,this);if(!c)throw new TypeErr('Illegal MessageChannel receiver');return c[1];}
     }
     cloneData.registerTransfer({
+        name:'MessagePort',
         brand:portBrand,
-        validate(p){if(check(p).detached)fail();},
+        validate(p){const s=check(p);if(s.detached||s.endpoint?.broker)fail();},
         prepare(p){return makePort(check(p).endpoint);},
         prepareExternal(p){return {endpoint:check(p).endpoint};},
+        prepareWorker(p,child){
+            const source=check(p),endpoint=source.endpoint,peer=endpoint?.peer;
+            if(endpoint?.broker||!peer||peer.broker)throw new DomError('Only initial entangled Worker port transfers are supported','DataCloneError');
+            const id=workerNative(4,child),key=workerKey(child,id,0),queued=[];
+            for(let entry=endpoint.head;entry;entry=entry.next){const payload=get(readyPackets,entry.data);if(!payload||payload.ports.length)throw new DomError('Queued nested Port transfer is not supported','DataCloneError');appendWorker(queued,cloneData.prepare(payload,[],true).data);}
+            const route={child,id,creator:0,key,endpoint:peer,active:false,closed:false};
+            const receiver={value:null,endpoint,detached:false,enabled:false,realm,queue:{head:null,tail:null,count:0},exportRoute:route};
+            const token={receiver,meta:[id,0,queued],route};apply(routeSet,workerRoutes,[key,route]);return token;
+        },
         commitPlan(p,receiver){
             const source=check(p),endpoint=source.endpoint,queue=receiver.queue;
             const writes=[{object:source,key:'detached',value:true},{object:source,key:'endpoint',value:null},
@@ -210,6 +235,7 @@ const messagingBridge=(() => {
                 const key=keys[i];define(writes,writes.length,{value:{object:endpoint,key,value:queue[key]},writable:true,enumerable:true,configurable:true});
             }}
             define(writes,writes.length,{value:{object:receiver,key:'queue',value:null},writable:true,enumerable:true,configurable:true});
+            if(receiver.exportRoute){const route=receiver.exportRoute;appendWorker(writes,{object:route,key:'active',value:true});appendWorker(writes,{object:endpoint,key:'broker',value:route});appendWorker(writes,{object:endpoint.peer,key:'broker',value:route});}
             return {writes,cancel:endpoint.scheduled?{generation:endpoint.scheduledRealm.generation,id:endpoint.scheduled}:null};
         },
         commit(p,prepared){
@@ -277,8 +303,40 @@ const messagingBridge=(() => {
             commitImported(imported);data=imported.packet;
         }catch(error){cancelPost(reserved);throw error;}
     }
+    function prepareWorker(message,transfers,child){
+        try{
+        const transferred=[],seen=[];
+        for(let i=0;i<transfers.length;i++)if(portBrand(transfers[i])){const endpoint=check(transfers[i]).endpoint;for(let j=0;j<seen.length;j++)if(seen[j]===endpoint||seen[j]===endpoint?.peer)throw new DomError('Both ends cannot be exported together','DataCloneError');appendWorker(seen,endpoint);appendWorker(transferred,transfers[i]);}
+        const packet=cloneData.prepare({data:message,ports:transferred},transfers,'worker',child),receivers=[],metadata=[];
+        for(let i=0;i<packet.tokens.length;i++){const token=packet.tokens[i];appendWorker(receivers,token?token.receiver:null);appendWorker(metadata,token?token.meta:null);}
+        const plan=cloneData.commitPlan(packet,receivers);plan.generations=[realm.generation];cloneData.validate(packet);return {packet:[packet.data,metadata],plan,tokens:packet.tokens};
+        }catch(error){apply(routeEach,workerRoutes,[(route,key)=>{if(!route.active)apply(routeDelete,workerRoutes,[key]);}]);throw error;}
+    }
+    function abortWorker(prepared){for(let i=0;i<prepared.tokens.length;i++){const token=prepared.tokens[i];if(token&&!token.route.active)apply(routeDelete,workerRoutes,[token.route.key]);}}
+    function importWorker(wire,child){
+        const metadata=wire[1],receivers=[],added=[];
+        try{
+        for(let i=0;i<metadata.length;i++){const m=metadata[i];if(m===null){appendWorker(receivers,null);continue;}
+            const id=m[0],creator=m[1],key=workerKey(child,id,creator);if(!isInteger(id)||id<=0||id>4294967295||creator!==1||workerRoute(child,id,creator))throw new TypeErr('Invalid Worker port ownership');
+            const endpoint={peer:null,owner:null,head:null,tail:null,count:0,scheduled:0,scheduledRealm:null,broker:null},owner=makePort(endpoint);
+            const route={key,child,id,creator,endpoint,closed:false,active:true};endpoint.owner=owner;endpoint.broker=route;appendWorker(added,route);apply(routeSet,workerRoutes,[key,route]);
+            for(let j=0;j<m[2].length;j++){const payload=cloneData.deserialize(m[2][j],null,true);if(payload.ports.length)throw new TypeErr('Nested Worker port queue unsupported');const packet={};put(readyPackets,packet,payload);const entry={data:packet,next:null};if(endpoint.tail)endpoint.tail.next=entry;else endpoint.head=entry;endpoint.tail=entry;endpoint.count++;}
+            appendWorker(receivers,owner);
+        }
+        return cloneData.deserialize(wire[0],receivers,true);
+        }catch(error){for(let i=0;i<added.length;i++){const route=added[i];route.closed=true;route.endpoint.head=route.endpoint.tail=null;route.endpoint.count=0;apply(routeDelete,workerRoutes,[route.key]);}throw error;}
+    }
+    function receiveWorkerPort(child,id,creator,data,closing=false){
+        const route=workerRoute(child,id,creator);if(!route||!route.active||route.closed)return;const endpoint=route.endpoint;
+        if(closing){route.closed=true;cancelScheduled(endpoint);endpoint.head=endpoint.tail=null;endpoint.count=0;return;}
+        const payload=cloneData.deserialize(data,null,true);if(payload.ports.length)throw new TypeErr('Nested Worker port transfer unsupported');
+        const packet={};put(readyPackets,packet,payload);const entry={data:packet,next:null};
+        // Reserve before publishing a new head: OOM cannot create an un-wakeable queue.
+        schedule(endpoint,true);if(endpoint.tail)endpoint.tail.next=entry;else endpoint.head=entry;endpoint.tail=entry;endpoint.count++;
+    }
+    function closeWorker(child){apply(routeEach,workerRoutes,[(route,key)=>{if(route.child!==child)return;route.closed=true;const endpoint=route.endpoint;cancelScheduled(endpoint);endpoint.head=endpoint.tail=null;endpoint.count=0;apply(routeDelete,workerRoutes,[key]);}]);}
     for(const [C,name] of [[MessagePort,'MessagePort'],[MessageChannel,'MessageChannel'],[MessageEvent,'MessageEvent'],[BroadcastChannel,'BroadcastChannel']])
         define(C.prototype,Symbol.toStringTag,{value:name,configurable:true});
     Object.assign(globalThis,{MessageChannel,MessagePort,MessageEvent,BroadcastChannel,postMessage});
-    return {postMessage,local,prepare,importPacket,commitImported,receive:deliver};
+    return {postMessage,local,prepare,importPacket,commitImported,receive:deliver,prepareWorker,abortWorker,importWorker,receiveWorkerPort,closeWorker};
 })();

@@ -115,7 +115,6 @@
             if(result===null)result=match(normalized,prefixable,imports);
             if(result===null)result=asURL;
             if(result===null)throw new TypeErrorClass('Unmapped bare module specifier: '+specifier);
-            if(recordCount>=16384)throw new RangeErrorClass('The document module-resolution limit was reached');
             if(!has(resolved,base))resolved[base]=create(null);
             resolved[base][normalized]=result;records[recordCount++]={base,specifier:normalized,prefixable};
             return result;

@@ -6,6 +6,8 @@
 #include <math.h>
 #include "font.h"
 #include "stb_truetype.h"
+static unsigned font_probe_depth;
+static bool font_probe_failed;
 
 enum { FALLBACK_NONE, FALLBACK_UI, FALLBACK_SANS, FALLBACK_SERIF };
 
@@ -22,8 +24,12 @@ struct font {
 };
 
 static int next_font_id = 1;
+static uint64_t font_metrics_epoch = 1;
+
+uint64_t font_metrics_generation(void) { return font_metrics_epoch; }
 
 font_t *font_open(const char *path) {
+    if(font_probe_depth){font_probe_failed=true;return NULL;}
     FILE *fp = fopen(path, "rb");
     if (!fp) return NULL;
     fseek(fp, 0, SEEK_END);
@@ -50,6 +56,9 @@ font_t *font_open(const char *path) {
     if (!f->adv) { free(f->data); free(f); return NULL; }
     for (int i = 0; i < f->info.numGlyphs; i++) f->adv[i] = INT16_MIN;
     memset(f->lo_glyph, 0xFF, sizeof f->lo_glyph);
+    /* A successful lazy fallback changes the available measurement backend.
+     * Unsigned wrap disables reuse permanently rather than creating an ABA. */
+    if (font_metrics_epoch) font_metrics_epoch++;
     return f;
 }
 
@@ -65,6 +74,7 @@ font_t *font_ui(int style) {
     static bool tried[4];
     style &= 3;
     if (!tried[style]) {
+        if(font_probe_depth){font_probe_failed=true;return NULL;}
         static const char *names[4] = {"MapleMono-NF-Regular.ttf", "MapleMono-NF-Bold.ttf",
                                       "MapleMono-NF-Italic.ttf", "MapleMono-NF-BoldItalic.ttf"};
         cache[style] = open_bundled(names[style]);
@@ -85,6 +95,7 @@ static font_t *noto_face(int which) {
         "NotoSerifLiving-Regular.ttf", "NotoSerifHistorical-Regular.ttf"
     };
     if (!tried[which]) {
+        if(font_probe_depth){font_probe_failed=true;return NULL;}
         tried[which] = true;
         cache[which] = open_bundled(names[which]);
         if (cache[which]) {
@@ -102,6 +113,7 @@ static font_t *inter_backup(int style) {
     static const char *names[4] = {"Inter-Regular.ttf", "Inter-Bold.ttf", "Inter-Italic.ttf", "Inter-BoldItalic.ttf"};
     style &= 3;
     if (!tried[style]) {
+        if(font_probe_depth){font_probe_failed=true;return NULL;}
         tried[style] = true;
         cache[style] = open_bundled(names[style]);
         if (cache[style]) cache[style]->fallback = FALLBACK_SANS;
@@ -120,6 +132,7 @@ font_t *font_family(int family, int style) {
 
 static int glyph_of(font_t *f, uint32_t cp) {
     if (cp < 0x250) {
+        if(font_probe_depth && f->lo_glyph[cp]==0xFFFF){font_probe_failed=true;return 0;}
         if (f->lo_glyph[cp] == 0xFFFF) f->lo_glyph[cp] = (uint16_t)stbtt_FindGlyphIndex(&f->info, (int)cp);
         return f->lo_glyph[cp];
     }
@@ -133,6 +146,7 @@ static font_t *shared_cjk(int which) {
         "MapleMono-NF-CN-Regular.ttf", "PlangothicP2-Regular.ttf", "PlangothicP1-Regular.ttf"
     };
     if (!tried[which]) {
+        if(font_probe_depth){font_probe_failed=true;return NULL;}
         tried[which] = true;
         cache[which] = open_bundled(names[which]);
     }
@@ -147,6 +161,7 @@ static font_t *family_cjk(bool serif) {
     static const char *names[2] = {"NotoSansCJKjp-Regular.otf", "NotoSerifCJKjp-Regular.otf"};
     int which = serif ? 1 : 0;
     if (!tried[which]) {
+        if(font_probe_depth){font_probe_failed=true;return NULL;}
         tried[which] = true;
         cache[which] = open_bundled(names[which]);
     }
@@ -217,6 +232,7 @@ static font_t *glyph_face(font_t *f, uint32_t cp, int *glyph) {
         if (e->font == f->id && e->cp == cp) { *glyph = e->glyph; return e->face; }
         if (!e->font && !slot) slot = e;
     }
+    if(font_probe_depth){font_probe_failed=true;*glyph=0;return f;}
     font_t *face = glyph_face_uncached(f, cp, glyph);
     if (!slot) slot = &face_cache[set][face_victim[set]++ & (FACE_CACHE_WAYS - 1)];
     slot->font = f->id; slot->cp = cp; slot->face = face; slot->glyph = *glyph;
@@ -226,6 +242,7 @@ static font_t *glyph_face(font_t *f, uint32_t cp, int *glyph) {
 static int glyph_adv(font_t *f, int g) {
     if (g < 0 || g >= f->info.numGlyphs) return 0;
     if (f->adv[g] == INT16_MIN) {
+        if(font_probe_depth){font_probe_failed=true;return 0;}
         int a, lsb;
         stbtt_GetGlyphHMetrics(&f->info, g, &a, &lsb);
         f->adv[g] = (int16_t)a;
@@ -291,6 +308,8 @@ struct gent {
     uint8_t *bmp;
 };
 
+void font_probe_begin(void){if(!font_probe_depth)font_probe_failed=false;font_probe_depth++;}
+bool font_probe_end(void){bool ok=!font_probe_failed;if(font_probe_depth)font_probe_depth--;return ok;}
 static struct gent *gc;
 static int gc_count;
 static uint8_t gamma_tab[256];
@@ -304,6 +323,7 @@ static void gc_flush(void) {
 
 static struct gent *gc_get(font_t *f, int g, float px, int phase) {
     if (!gc) {
+        if(font_probe_depth){font_probe_failed=true;return NULL;}
         gc = calloc(GC_SIZE, sizeof(struct gent));
         if (!gc) return NULL;
         /* coverage -> alpha: a little heavier than linear, so text does not look washed out */
@@ -314,6 +334,7 @@ static struct gent *gc_get(font_t *f, int g, float px, int phase) {
     for (uint32_t i = 0;; i++) {
         struct gent *e = &gc[(h + i) & (GC_SIZE - 1)];
         if (!e->used) {
+            if(font_probe_depth){font_probe_failed=true;return NULL;}
             if (gc_count >= GC_MAX) {
                 gc_flush();
                 return gc_get(f, g, px, phase);

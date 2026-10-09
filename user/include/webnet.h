@@ -5,25 +5,28 @@
 #include <stdbool.h>
 #include "http.h"
 
-#define WEBNET_BODY_LIMIT (16u * 1024u * 1024u)
-#define WEBNET_SCRIPT_BODY_LIMIT (32u * 1024u * 1024u)
-#define WEBNET_TIMEOUT_MS 30000u
-#define WEBNET_URL_MAX HTTP_URL_MAX
+/* Body lengths are uint32_t on the native worker wire; storage grows lazily. */
+#define WEBNET_BODY_LIMIT ((size_t)UINT32_MAX)
+#define WEBNET_SCRIPT_BODY_LIMIT WEBNET_BODY_LIMIT
+/* No short browser resource quota. The user-requested 32-bit duration is
+   accumulated in a uint64_t wire deadline; signed OS waits clamp per call. */
+#define WEBNET_TIMEOUT_MS UINT32_MAX
+#define WEBNET_URL_MAX HTTP_URL_MAX /* legacy fixed caller/wire bound; owned transport opts out */
 #define WEBNET_REQUEST_HEADERS_MAX 8192
 #define WEBNET_HEADERS_MAX WEBNET_REQUEST_HEADERS_MAX /* legacy request-sized alias */
 /* Response storage includes NUL plus room for negotiated status/metadata.
    Independent of the unchanged 8 KiB author request-header bound. */
 #define WEBNET_RESPONSE_HEADERS_MAX (64u * 1024u + 512u + 1u)
-#define WEBNET_METHOD_MAX 64
+#define WEBNET_METHOD_MAX ((size_t)UINT32_MAX) /* length bytes on the native wire, excluding NUL */
 
 /* HTTP token validation belongs at the native boundary as well as in Web IDL.
    No method spelling can inject bytes into the request line. */
 static inline bool webnet_method_valid(const char *s) {
     if (!s || !*s) return false;
-    unsigned n = 0;
+    size_t n = 0;
     for (; s[n]; n++) {
         unsigned char c = (unsigned char)s[n];
-        if (n + 1 >= WEBNET_METHOD_MAX) return false;
+        if (n == WEBNET_METHOD_MAX) return false;
         if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) continue;
         switch (c) {
         case '!': case '#': case '$': case '%': case '&': case '\'': case '*': case '+':
@@ -63,6 +66,9 @@ struct webnet_request {
     bool force_preflight; /* Fetch use-CORS-preflight flag, not an author request header. */
     bool redirect_error; /* Refuse a redirect before issuing its target request. */
     bool same_origin; /* Enforced on every redirect hop, not just the initial URL. */
+    bool keepalive; /* Fetch survives generation retirement; explicit cancel still aborts. */
+    bool image_upgrade; /* Trusted ordinary non-CORS, non-imageset image only; RESOURCE. */
+    uint64_t fetch_group; /* Distinct environment settings object, including child documents. */
     enum webnet_cache cache_mode; /* Cacheless host: network misses, or cache-only failure; never stored responses. */
 };
 struct webnet_response {
@@ -91,5 +97,6 @@ void webnet_pump(webnet *, uint64_t now_ms);
 int webnet_timeout(const webnet *, uint64_t now_ms); /* -1 idle, otherwise <=10 ms */
 bool webnet_busy(const webnet *);
 void webnet_cancel(webnet *, uint64_t id); /* cancellation does not invoke the callback */
-/* Document teardown: kills and reaps matching children before returning (no callbacks). */
+/* Document teardown: kills/reaps non-keepalive children; keepalive callbacks and
+   copied request policy remain owned by net until completion or explicit cancel. */
 void webnet_cancel_generation(webnet *, uint64_t generation);

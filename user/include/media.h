@@ -11,7 +11,6 @@
 typedef struct nmedia nmedia;
 enum { NMEDIA_AGAIN = 0, NMEDIA_AUDIO = 1, NMEDIA_VIDEO = 2, NMEDIA_END = 3, NMEDIA_ERROR = -1 };
 #define NMEDIA_MAX_BYTES (32u * 1024u * 1024u)
-#define NMEDIA_MAX_PIXELS (2048u * 1152u)
 struct nmedia_info {
     bool audio, video;
     int channels, sample_rate, width, height;

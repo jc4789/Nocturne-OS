@@ -3,14 +3,12 @@
 #include "media.h"
 #include <stdint.h>
 #define NMEDIA_WORKER_MAGIC 0x4e4d5731u
-#define NMEDIA_WORKER_URL 2048u
 #define NMEDIA_WORKER_DEADLINE 30000u
-#define NMEDIA_WORKER_FRAME_BYTES (NMEDIA_MAX_PIXELS * 4u)
 enum { NMW_OPEN=1, NMW_STEP=2, NMW_SEEK=3 };
 struct nmedia_worker_command {
     uint32_t magic, operation, generation, sequence;
     int64_t seek_ms;
-    uint32_t url_bytes, document_bytes;
+    uint32_t url_bytes, document_bytes; /* exact OPEN spans, no NUL on wire */
 };
 struct nmedia_worker_response {
     uint32_t magic, operation, generation, sequence;
@@ -29,11 +27,18 @@ bool nmedia_worker_available(void);
 void nmedia_worker_background(uint64_t now_ms);
 int64_t nmedia_worker_deadline(uint64_t now_ms);
 void nmedia_worker_pump(nmedia_worker *,uint64_t now_ms);
+/* Anonymous cumulative transport counters and the current receive span. */
+struct nmedia_worker_stats {
+    uint64_t requests,responses,request_ms,max_request_ms,tx_bytes,rx_bytes,handoffs,header_waits;
+    size_t header_bytes,payload_bytes,payload_total;
+    bool waiting;
+};
+void nmedia_worker_snapshot(const nmedia_worker *,struct nmedia_worker_stats *);
 /* One caller-owned burst budget, shared by every STEP/collect in that burst.
  * Cooperative callers use allow_spawn=false: no process/URL open is started. */
 struct nmedia_worker_budget {
     uint64_t until;
-    size_t tx_bytes,rx_bytes;
+    size_t tx_bytes;
     unsigned handoffs;
 };
 void nmedia_worker_pump_budget(nmedia_worker *,uint64_t now_ms,
@@ -51,5 +56,13 @@ bool nmedia_worker_seeking(nmedia_worker *);
 bool nmedia_worker_seek(nmedia_worker *,int64_t ms);
 /* Output is borrowed until the next requested step/seek or close. */
 int nmedia_worker_take(nmedia_worker *,struct nmedia_output *);
+/* Only a complete VIDEO just returned by take, before another STEP/seek.
+ * Move its allocation to the caller and return the caller's distinct owned
+ * spare to the transport. capacity is uint32_t pixels, not bytes. No copying
+ * or allocation. A false return leaves both owners unchanged. Old wire
+ * response/counters describe the consumed response, never the spare's data.
+ * The caller must not retain readers of its spare (paint/snapshot included). */
+bool nmedia_worker_move_video(nmedia_worker *,const struct nmedia_output *,
+                             uint32_t **pixels,size_t *capacity);
 void nmedia_worker_step(nmedia_worker *);
 void nmedia_worker_close(nmedia_worker *);

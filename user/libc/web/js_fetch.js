@@ -2,8 +2,10 @@
    https://fetch.spec.whatwg.org/#fetch-api (consulted 2026-10-06).
    Body bytes are real snapshots, not String(BufferSource). Response and Blob
    bodies expose real Streams; the host network transport is still buffered.
-   Stream uploads, opaque responses and background keepalive fail
+   Stream uploads and opaque responses fail
    explicitly rather than pretending to perform unsupported transport work.
+   Buffered keepalive requests use a native, document-independent transport;
+   Fetch's 64 KiB inflight body accounting belongs to that native fetch group.
    Request cache modes use the cacheless native host's genuine network path;
    only-if-cached always misses and never sends a network request. No Cache
    API or stored responses are fabricated. HTTP-generated cache headers belong
@@ -372,7 +374,6 @@ const fetchBridge = (() => {
             if(s.mode==='no-cors')throw notSupported('Opaque no-cors responses are not supported');
             if(s.redirect==='manual')throw notSupported('Opaque manual redirect responses are not supported');
             if(s.integrity)throw notSupported('Subresource integrity is not supported by fetch');
-            if(s.keepalive)throw notSupported('Background keepalive requests are not supported');
             if(s.referrer!=='about:client'||s.referrerPolicy)throw notSupported('Fetch referrer overrides are not supported');
             // This host has no stored HTTP responses. A cache-only miss is a
             // Fetch network error (TypeError), not a synthetic HTTP 504, and
@@ -383,7 +384,7 @@ const fetchBridge = (() => {
                 return new NativePromise(resolve=>resolve(responseObject({status:local.status,statusText:local.status===206?'Partial Content':'OK',url:s.url.split('#')[0],headers,redirected:false,type:'basic'},{bytes:local.bytes,used:false,abort:s.signal})));
             }
             let raw='';for(const [name,value]of sortedHeaders(headerSlots.get(s.headers)))raw+=name+': '+value+'\r\n';
-            const pair=host.fetch(s.url,s.method,raw,b.bytes===null?'':b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),false,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache));
+            const pair=host.fetch(s.url,s.method,raw,b.bytes===null?'':b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),false,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache),s.keepalive);
             if(b.bytes!==null)b.used=true;
             return new NativePromise((resolve,reject)=>{
                 let finished=false;

@@ -53,6 +53,6 @@ int main(void) {
     check("not (unknown-feature)",800,600,true,false,"not all");
     Q("screen/**/and/**/(color)",true);Q("screen/* trailing comment",true);
     check("(min-width:800px)",799,600,true,false,NULL);
-    char deep[300];memset(deep,'(',100);strcpy(deep+100,"color");memset(deep+105,')',100);deep[205]=0;Q(deep,false);
+    char deep[300];memset(deep,'(',100);strcpy(deep+100,"color");memset(deep+105,')',100);deep[205]=0;Q(deep,true);
     printf("mediapolicytest: %d checks, %d failed\n",checks,failed);return failed!=0;
 }

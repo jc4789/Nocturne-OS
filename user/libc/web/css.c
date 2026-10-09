@@ -3,10 +3,13 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <stdarg.h>
+#include <math.h>
+#include <nocturne.h>
 #include "webi.h"
 #include "web_dialog.h"
 #include "form_validation.h"
 #include "form_value.h"
+#include "avmedia.h"
 
 /* ---------------------------------------------------------------- data structures */
 enum { SK_TAG, SK_ID, SK_CLASS, SK_ATTR, SK_PC, SK_SLOTTED };
@@ -16,7 +19,7 @@ enum { AO_EXISTS, AO_EQ, AO_INCL, AO_DASH, AO_PREFIX, AO_SUFFIX, AO_SUBSTR };
 enum { PC_FIRST_CHILD, PC_LAST_CHILD, PC_ONLY_CHILD, PC_NTH_CHILD, PC_NTH_LAST_CHILD, PC_FIRST_OF_TYPE,
        PC_LAST_OF_TYPE, PC_ONLY_OF_TYPE, PC_NTH_OF_TYPE, PC_NTH_LAST_OF_TYPE, PC_NOT, PC_IS, PC_NEVER,
        PC_ALWAYS, PC_LINK, PC_CHECKED, PC_DISABLED, PC_ENABLED, PC_ROOT, PC_EMPTY, PC_REQUIRED, PC_OPTIONAL,
-       PC_LANG, PC_PLACEHOLDER_SHOWN, PC_READ_WRITE, PC_READ_ONLY, PC_OPEN, PC_HOST, PC_FOCUS, PC_FOCUS_WITHIN,
+       PC_LANG, PC_PLACEHOLDER_SHOWN, PC_READ_WRITE, PC_READ_ONLY, PC_OPEN, PC_HOST, PC_FOCUS, PC_FOCUS_WITHIN, PC_HOVER, PC_ACTIVE,
        PC_VALID, PC_INVALID, PC_IN_RANGE, PC_OUT_OF_RANGE, PC_INDETERMINATE, PC_MODAL };
 
 struct sellist;
@@ -63,6 +66,7 @@ struct rule {
     int ndecls;
     const struct mcond *media;
     struct rule *next;
+    const char *selector_text;
 };
 
 struct sheet {
@@ -70,6 +74,11 @@ struct sheet {
     double order;
     bool ua;
     node_t *scope; /* NULL: document author sheet; otherwise its shadow root */
+    const char *owner_media;
+    struct css_rule_info *cssom_first, *cssom_last;
+    uint32_t cssom_count;
+    const char *cssom_source;
+    size_t cssom_length;
 };
 
 struct pctx {
@@ -79,12 +88,13 @@ struct pctx {
     pvec *imports;
     int nimports;
     bool supports_probe; /* reject accepted-but-unimplemented selector fallbacks */
+    unsigned rule_depth;
 };
 
 /* ---------------------------------------------------------------- scanning */
 /* the first of stops at nesting depth 0, skipping strings, escapes, () and [] */
 static const char *scan_to(const char *s, const char *e, const char *stops) {
-    int depth = 0;
+    size_t depth = 0;
     while (s < e) {
         char c = *s;
         if (c == '\\') {
@@ -246,7 +256,7 @@ static const struct {
     {"enabled", PC_ENABLED}, {"root", PC_ROOT}, {"scope", PC_ROOT}, {"empty", PC_EMPTY},
     {"required", PC_REQUIRED}, {"optional", PC_OPTIONAL}, {"placeholder-shown", PC_PLACEHOLDER_SHOWN},
     {"read-write", PC_READ_WRITE}, {"read-only", PC_READ_ONLY}, {"open", PC_OPEN}, {"defined", PC_ALWAYS},
-    {"visited", PC_NEVER}, {"hover", PC_NEVER}, {"active", PC_NEVER}, {"focus", PC_FOCUS},
+    {"visited", PC_NEVER}, {"hover", PC_HOVER}, {"active", PC_ACTIVE}, {"focus", PC_FOCUS},
     {"focus-within", PC_FOCUS_WITHIN}, {"focus-visible", PC_NEVER}, {"target", PC_NEVER}, {"target-within", PC_NEVER},
     {"indeterminate", PC_INDETERMINATE}, {"invalid", PC_INVALID}, {"valid", PC_VALID}, {"user-invalid", PC_NEVER},
     {"user-valid", PC_NEVER}, {"default", PC_NEVER}, {"fullscreen", PC_NEVER}, {"modal", PC_MODAL},
@@ -597,6 +607,16 @@ static bool match_attr(const struct simple *x, const node_t *e) {
     return false;
 }
 
+static bool css_hovered(node_t *e) {
+    web_doc *d=e?e->owner:NULL;node_t *target=d?d->hover_target:NULL;
+    if(!d || !d->live || !target || target->owner!=d || doc_node_root(target,true)!=d->root)return false;
+    for(node_t *p=target;p;p=doc_flat_parent(p))if(p==e)return true;
+    return false;
+}
+static bool css_active(node_t *e) {
+    for(node_t *p=doc_active_target(e?e->owner:NULL);p;p=doc_flat_parent(p))if(p==e)return true;
+    return false;
+}
 static bool match_pc(const struct simple *x, node_t *e, node_t *scope) {
     switch (x->pc) {
     case PC_FIRST_CHILD: return !prev_elem(e);
@@ -638,6 +658,8 @@ static bool match_pc(const struct simple *x, node_t *e, node_t *scope) {
         for (node_t *f = e->owner ? e->owner->focus : NULL; f; f = doc_flat_parent(f))
             if (f == e) return true;
         return false;
+    case PC_HOVER: return css_hovered(e);
+    case PC_ACTIVE: return css_active(e);
     case PC_NEVER: return false;
     case PC_ALWAYS: return true;
     case PC_LINK: return (e->tag == T_a || e->tag == T_area) && node_attr(e, "href");
@@ -813,17 +835,15 @@ bool css_matches(node_t *node, const char *selector, bool *valid) {
 /* ---------------------------------------------------------------- feature queries
    The same evaluator serves CSS.supports and @supports. Invalid syntax is kept
    separate from unsupported features, so `not` cannot turn a parse error true.
-   Scratch arenas and bounded input/depth make queries independent of the DOM. */
-#define SUPPORTS_MAX 65536u
-#define SUPPORTS_DEPTH 32
+   Scratch arenas and explicit continuations make queries independent of the DOM. */
 struct supports_result { bool valid, value; };
 
 /* Validate component values, remove comments, and preserve strings/escapes.
    Unlike the stylesheet recovery parser, a query must consume the whole input. */
 static char *supports_clean(arena_t *a, const char *s, size_t n, size_t *out) {
-    if (!s || n > SUPPORTS_MAX) return NULL;
-    char stack[SUPPORTS_DEPTH], quote = 0;
-    int depth = 0;
+    if (!s || n == SIZE_MAX) return NULL;
+    char *stack = ar_alloc(a, n ? n : 1), quote = 0;
+    size_t depth = 0;
     char *b = ar_alloc(a, n + 1);
     size_t k = 0;
     for (size_t i = 0; i < n; i++) {
@@ -850,7 +870,6 @@ static char *supports_clean(arena_t *a, const char *s, size_t n, size_t *out) {
             b[k++] = ' ';
             continue;
         } else if (c == '(' || c == '[' || c == '{') {
-            if (depth == SUPPORTS_DEPTH) return NULL;
             stack[depth++] = c == '(' ? ')' : c == '[' ? ']' : '}';
         } else if (c == ')' || c == ']' || c == '}') {
             if (!depth || c != (unsigned char)stack[--depth]) return NULL;
@@ -865,7 +884,7 @@ static char *supports_clean(arena_t *a, const char *s, size_t n, size_t *out) {
 
 /* Find a top-level delimiter; input was already balanced by supports_clean. */
 static const char *supports_delim(const char *s, const char *e, const char *delims) {
-    int depth = 0;
+    size_t depth = 0;
     char q = 0;
     for (; s < e; s++) {
         char c = *s;
@@ -889,8 +908,7 @@ static bool supports_custom_name(const char *s, size_t n) {
    parsed as its fallback alone. Invalid variable references must still fail.
    Strings are not scanned as functions. env() is not advertised: its current
    substitution fallback is not an environment-variable implementation. */
-static bool supports_vars(arena_t *a, const char *s, const char *e, bool *has, int depth) {
-    if (depth > SUPPORTS_DEPTH) return false;
+static bool supports_vars(arena_t *a, const char *s, const char *e, bool *has) {
     while (s < e) {
         /* Hash/at-keyword tokens consume their name: #var( and @var( are not
            var() function tokens. An actual function inside a later block is
@@ -940,9 +958,10 @@ static bool supports_vars(arena_t *a, const char *s, const char *e, bool *has, i
                     const char *id = read_ident(a, &p, pe, false);
                     if (p != pe || !id || !supports_custom_name(id, strlen(id))) return false;
                     *has = true;
-                    if (comma < end && !supports_vars(a, comma + 1, end, has, depth + 1)) return false;
-                } else if (!supports_vars(a, s + 1, end, has, depth + 1)) return false;
-                s = end + 1;
+                    /* The balanced component stream can be visited in place:
+                       descend into fallback without a C call/return stack. */
+                    s = comma < end ? comma + 1 : end + 1;
+                } else s++;
             }
         } else s++;
     }
@@ -950,7 +969,7 @@ static bool supports_vars(arena_t *a, const char *s, const char *e, bool *has, i
 }
 
 static bool supports_decl(arena_t *a, const char *property, size_t pn, const char *v, size_t vn) {
-    if (!property || !pn || pn > 255 || memchr(property, 0, pn)) return false;
+    if (!property || !pn || memchr(property, 0, pn)) return false;
     bool custom = supports_custom_name(property, pn);
     const struct propdef *p = custom ? NULL : css_prop_lookup(property, pn);
     if (!custom && !p) return false;
@@ -960,17 +979,16 @@ static bool supports_decl(arena_t *a, const char *property, size_t pn, const cha
     if (supports_delim(v, v + vn, ";!") != v + vn) return false;
     if (!custom && supports_delim(v, v + vn, "{}") != v + vn) return false;
     bool has = false;
-    if (!supports_vars(a, v, v + vn, &has, 0)) return false;
+    if (!supports_vars(a, v, v + vn, &has)) return false;
     if (custom) return true;
     if (!vn) return false;
     return has || css_value_supported(p, v, vn);
 }
 
 bool css_supports_declaration(const char *property, size_t pn, const char *value, size_t vn) {
-    if (!property || !value || pn > SUPPORTS_MAX || vn > SUPPORTS_MAX) return false;
+    if (!property || !value || pn == SIZE_MAX || vn == SIZE_MAX) return false;
     arena_t *a = calloc(1, sizeof *a);
     if (!a) return false;
-    a->limit = 1u << 20;
     jmp_buf trap;
     a->trap = &trap;
     if (setjmp(trap)) { ar_free(a); free(a); return false; }
@@ -982,94 +1000,105 @@ bool css_supports_declaration(const char *property, size_t pn, const char *value
     return result;
 }
 
-static struct supports_result supports_expr(arena_t *a, const char *s, const char *e, int depth);
-static struct supports_result supports_paren(arena_t *a, const char **ps, const char *e, int depth) {
-    struct supports_result bad = {false, false};
-    const char *s = skip_ws(*ps, e);
-    if (s == e || depth > SUPPORTS_DEPTH) return bad;
-    if (*s != '(') {
-        const char *name = read_ident(a, &s, e, true);
-        if (!name || s == e || *s != '(') return bad;
-        const char *end = supports_delim(s + 1, e, ")");
-        if (end == e) return bad;
-        *ps = end + 1;
-        if (!strcmp(name, "selector")) {
-            struct pctx pc = {.a = a, .supports_probe = true};
-            /* selector() is one complex selector, not a selector list. */
-            bool yes = supports_delim(s + 1, end, ",") == end && parse_complex(&pc, s + 1, end) != NULL;
-            return (struct supports_result){true, yes};
-        }
-        return (struct supports_result){true, false}; /* general-enclosed function */
-    }
-    const char *end = supports_delim(s + 1, e, ")");
-    if (end == e) return bad;
-    *ps = end + 1;
-    const char *p = skip_ws(s + 1, end), *pe = end;
-    trim_r(p, &pe);
-    if (p == pe) return bad;
-    const char *colon = supports_delim(p, pe, ":");
-    if (colon < pe) {
-        const char *ne = colon;
-        trim_r(p, &ne);
-        const char *name = read_ident(a, &p, ne, false);
-        if (!name || p != ne) return bad;
-        const char *v = skip_ws(colon + 1, pe);
-        if (supports_delim(v, pe, ";") != pe) return bad;
-        const char *bang = supports_delim(v, pe, "!");
-        if (bang < pe) {
-            const char *q = skip_ws(bang + 1, pe);
-            const char *important = read_ident(a, &q, pe, true);
-            if (!important || strcmp(important, "important") || skip_ws(q, pe) != pe) return bad;
-            pe = bang;
-        }
-        return (struct supports_result){true, supports_decl(a, name, strlen(name), v, (size_t)(pe - v))};
-    }
-    struct supports_result nested = supports_expr(a, p, pe, depth + 1);
-    if (nested.valid) return nested;
-    /* Reserved logical syntax is malformed, not an unknown feature whose
-       negation could accidentally become true. Other component values are
-       general-enclosed and evaluate false. */
-    const char *q = p;
-    const char *name = read_ident(a, &q, pe, true);
-    if (*p == '(' || (name && (!strcmp(name, "not") || !strcmp(name, "and") || !strcmp(name, "or")))) return bad;
-    return (struct supports_result){true, false};
-}
+struct supports_walk {
+    struct supports_walk *parent;
+    const char *s, *e, *p, *next;
+    struct supports_result value;
+    unsigned stage, op;
+    bool term, negate;
+};
 
-static struct supports_result supports_expr(arena_t *a, const char *s, const char *e, int depth) {
-    struct supports_result bad = {false, false};
-    if (depth > SUPPORTS_DEPTH) return bad;
-    s = skip_ws(s, e);
-    trim_r(s, &e);
-    const char *p = s;
-    const char *word = read_ident(a, &p, e, true);
-    if (word && !strcmp(word, "not")) {
-        if (p == e || !is_space((unsigned char)*p)) return bad;
-        struct supports_result r = supports_paren(a, &p, e, depth + 1);
-        if (!r.valid || skip_ws(p, e) != e) return bad;
-        r.value = !r.value;
-        return r;
+static struct supports_result supports_expr(arena_t *a, const char *s, const char *e) {
+    struct supports_result bad = {false, false}, result = bad;
+    struct supports_walk *f = ar_alloc(a, sizeof *f);
+    f->s = s; f->e = e;
+    while (f) {
+        if (!f->stage && !f->term) {
+            f->s = skip_ws(f->s, f->e); trim_r(f->s, &f->e);
+            f->p = f->s;
+            const char *word = read_ident(a, &f->p, f->e, true);
+            f->negate = word && !strcmp(word, "not");
+            if (f->negate && (f->p == f->e || !is_space((unsigned char)*f->p))) { result = bad; goto done; }
+            if (!f->negate) f->p = f->s;
+            f->stage = 1;
+            goto term;
+        }
+        if (!f->stage && f->term) {
+            const char *p = skip_ws(f->s, f->e);
+            if (p == f->e) { result = bad; goto done; }
+            if (*p != '(') {
+                const char *name = read_ident(a, &p, f->e, true);
+                if (!name || p == f->e || *p != '(') { result = bad; goto done; }
+                const char *end = supports_delim(p + 1, f->e, ")");
+                if (end == f->e) { result = bad; goto done; }
+                f->next = end + 1;
+                bool yes = false;
+                if (!strcmp(name, "selector")) {
+                    struct pctx pc = {.a = a, .supports_probe = true};
+                    yes = supports_delim(p + 1, end, ",") == end && parse_complex(&pc, p + 1, end) != NULL;
+                }
+                result = (struct supports_result){true, yes}; goto done;
+            }
+            const char *end = supports_delim(p + 1, f->e, ")");
+            if (end == f->e) { result = bad; goto done; }
+            f->next = end + 1; f->s = skip_ws(p + 1, end); f->e = end; trim_r(f->s, &f->e);
+            p = f->s;
+            if (p == f->e) { result = bad; goto done; }
+            const char *colon = supports_delim(p, f->e, ":");
+            if (colon < f->e) {
+                const char *ne = colon; trim_r(p, &ne);
+                const char *name = read_ident(a, &p, ne, false);
+                if (!name || p != ne) { result = bad; goto done; }
+                const char *v = skip_ws(colon + 1, f->e), *ve = f->e;
+                if (supports_delim(v, ve, ";") != ve) { result = bad; goto done; }
+                const char *bang = supports_delim(v, ve, "!");
+                if (bang < ve) {
+                    const char *q = skip_ws(bang + 1, ve), *important = read_ident(a, &q, ve, true);
+                    if (!important || strcmp(important, "important") || skip_ws(q, ve) != ve) { result = bad; goto done; }
+                    ve = bang;
+                }
+                result = (struct supports_result){true, supports_decl(a, name, strlen(name), v, (size_t)(ve-v))}; goto done;
+            }
+            f->stage = 1;
+            struct supports_walk *child = ar_alloc(a, sizeof *child);
+            child->parent = f; child->s = f->s; child->e = f->e; f = child; continue;
+        }
+        if (f->term) {
+            if (!result.valid) {
+                const char *p = f->s, *name = read_ident(a, &p, f->e, true);
+                if (*f->s != '(' && !(name && (!strcmp(name,"not") || !strcmp(name,"and") || !strcmp(name,"or"))))
+                    result = (struct supports_result){true, false};
+            }
+            goto done;
+        }
+        if (!result.valid) goto done; /* Validate RHS even when boolean short-circuits. */
+        if (f->stage == 1) f->value = result;
+        else f->value.value = f->op == 1 ? f->value.value && result.value : f->value.value || result.value;
+        f->p = skip_ws(f->p, f->e);
+        if (f->negate) {
+            result = f->p == f->e ? (struct supports_result){true, !f->value.value} : bad; goto done;
+        }
+        if (f->p == f->e) { result = f->value; goto done; }
+        const char *word = read_ident(a, &f->p, f->e, true);
+        unsigned op = word && !strcmp(word,"and") ? 1 : word && !strcmp(word,"or") ? 2 : 0;
+        if (!op || (f->op && f->op != op) || f->p == f->e || !is_space((unsigned char)*f->p)) { result = bad; goto done; }
+        f->op = op; f->stage = 2;
+term:;
+        struct supports_walk *child = ar_alloc(a, sizeof *child);
+        child->parent = f; child->term = true; child->s = f->p; child->e = f->e; f = child;
+        continue;
+done:;
+        struct supports_walk *parent = f->parent;
+        if (parent && f->term) parent->p = f->next;
+        f = parent;
     }
-    p = s;
-    struct supports_result r = supports_paren(a, &p, e, depth + 1);
-    if (!r.valid) return bad;
-    int op = 0;
-    while ((p = skip_ws(p, e)) < e) {
-        word = read_ident(a, &p, e, true);
-        int next = word && !strcmp(word, "and") ? 1 : word && !strcmp(word, "or") ? 2 : 0;
-        if (!next || (op && op != next) || p == e || !is_space((unsigned char)*p)) return bad;
-        op = next;
-        struct supports_result term = supports_paren(a, &p, e, depth + 1);
-        if (!term.valid) return bad; /* no boolean short-circuit of validation */
-        r.value = op == 1 ? r.value && term.value : r.value || term.value;
-    }
-    return r;
+    return result;
 }
 
 bool css_supports_condition(const char *condition, size_t n, bool implied_parens) {
-    if (!condition || n > SUPPORTS_MAX) return false;
+    if (!condition || n > SIZE_MAX - 3) return false;
     arena_t *a = calloc(1, sizeof *a);
     if (!a) return false;
-    a->limit = 1u << 20;
     jmp_buf trap;
     a->trap = &trap;
     if (setjmp(trap)) { ar_free(a); free(a); return false; }
@@ -1077,14 +1106,14 @@ bool css_supports_condition(const char *condition, size_t n, bool implied_parens
     char *s = supports_clean(a, condition, n, &len);
     bool result = false;
     if (s) {
-        struct supports_result r = supports_expr(a, s, s + len, 0);
+        struct supports_result r = supports_expr(a, s, s + len);
         result = r.valid && r.value;
         if (!result && implied_parens) {
             char *wrapped = ar_alloc(a, len + 3);
             wrapped[0] = '(';
             memcpy(wrapped + 1, s, len);
             wrapped[len + 1] = ')'; wrapped[len + 2] = 0;
-            r = supports_expr(a, wrapped, wrapped + len + 2, 0);
+            r = supports_expr(a, wrapped, wrapped + len + 2);
             result = r.valid && r.value;
         }
     }
@@ -1281,6 +1310,7 @@ static void parse_style_rule(struct pctx *pc, const char *ps, const char *pe, co
     if (!sl) return;
     struct rule *r = ar_alloc(pc->a, sizeof *r);
     r->sel = sl;
+    r->selector_text = sel_text;
     r->media = media;
     /* append before parsing the body, so nested rules come after their parent */
     if (pc->sh->last) pc->sh->last->next = r;
@@ -1288,8 +1318,21 @@ static void parse_style_rule(struct pctx *pc, const char *ps, const char *pe, co
     pc->sh->last = r;
     parse_body(pc, bs, be, sel_text, media, &r->decls, &r->ndecls);
 }
+static struct css_rule_info *cssom_record(struct pctx *pc, uint32_t type, const char *s, const char *e) {
+    if (pc->rule_depth != 1 || !type) return NULL;
+    if (pc->sh->cssom_count == UINT32_MAX) {
+        if (pc->a->trap) longjmp(*pc->a->trap, 1);
+        abort();
+    }
+    struct css_rule_info *info = ar_alloc(pc->a, sizeof *info);
+    info->type = type; info->text = ar_strndup(pc->a, s, (size_t)(e - s));
+    if (pc->sh->cssom_last) pc->sh->cssom_last->next = info;
+    else pc->sh->cssom_first = info;
+    pc->sh->cssom_last = info; pc->sh->cssom_count++; return info;
+}
 
 static void parse_rules(struct pctx *pc, const char *s, const char *e, const struct mcond *media) {
+    pc->rule_depth++;
     while (s < e) {
         s = skip_ws(s, e);
         if (s >= e) break;
@@ -1299,8 +1342,12 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
             const char *p = scan_to(ns, e, "{;");
             const char *qs = skip_ws(ns, p), *qe = p;
             trim_r(qs, &qe);
+            uint32_t type = !name ? 0 : !strcmp(name,"import") ? 3 : !strcmp(name,"media") ? 4 :
+                !strcmp(name,"font-face") ? 5 : !strcmp(name,"page") ? 6 : !strcmp(name,"keyframes") ? 7 :
+                !strcmp(name,"namespace") ? 10 : !strcmp(name,"supports") ? 12 : 0;
             if (p >= e || *p == ';') {
-                if (name && !strcmp(name, "import") && pc->imports) {
+                struct css_rule_info *info = p < e ? cssom_record(pc, type, s, p + 1) : NULL;
+                if (name && !strcmp(name, "import")) {
                     /* @import url [media]: fetched later, ordered just before this sheet */
                     const char *ue = scan_to(qs, qe, " \t\n");
                     const char *t = qs;
@@ -1324,10 +1371,13 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
                     }
                     char abs[2048];
                     if (ok && url_resolve(pc->base, sb_cstr(&u), abs, sizeof abs)) {
-                        struct css_import *im = malloc(sizeof *im);
-                        im->url = strdup(abs);
-                        im->order = pc->sh->order - 0.1 + 0.001 * pc->nimports++;
-                        pv_push(pc->imports, im);
+                        if (info) info->import_url = ar_strdup(pc->a, abs);
+                        if (pc->imports) {
+                            struct css_import *im = malloc(sizeof *im);
+                            im->url = strdup(abs);
+                            im->order = pc->sh->order - 0.1 + 0.001 * pc->nimports++;
+                            pv_push(pc->imports, im);
+                        }
                     }
                     sb_free(&u);
                 }
@@ -1335,6 +1385,7 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
                 continue;
             }
             const char *be = block_end(p + 1, e);
+            cssom_record(pc, type, s, be < e ? be + 1 : e);
             if (name) {
                 if (!strcmp(name, "media")) {
                     struct mcond *mc = ar_alloc(pc->a, sizeof *mc);
@@ -1359,9 +1410,16 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
             continue;
         }
         const char *be = block_end(p + 1, e);
+        struct rule *before = pc->sh->last;
         parse_style_rule(pc, s, p, p + 1, be, media, NULL);
+        struct rule *native = before ? before->next : pc->sh->first;
+        if (native) {
+            struct css_rule_info *info = cssom_record(pc, 1, s, be < e ? be + 1 : e);
+            if (info) { info->native_rule = native; info->selector = native->selector_text; }
+        }
         s = be < e ? be + 1 : e;
     }
+    pc->rule_depth--;
 }
 
 /* comments out, <!-- --> out */
@@ -1405,6 +1463,23 @@ static char *strip_comments(arena_t *a, const char *css, size_t n, size_t *out_n
 }
 
 void css_sheet_scope(sheet_t *sheet, node_t *shadow_root) { if (sheet) sheet->scope = shadow_root; }
+void css_sheet_media(sheet_t *sheet, const char *media) { if (sheet) sheet->owner_media = media; }
+struct css_rule_info *css_sheet_rules(sheet_t *sheet, uint32_t *length) {
+    if (length) *length = sheet ? sheet->cssom_count : 0;
+    return sheet ? sheet->cssom_first : NULL;
+}
+bool css_sheet_single_style(sheet_t *sheet, const char *source, size_t length) {
+    (void)source; (void)length;
+    uint32_t count = 0; struct css_rule_info *info = css_sheet_rules(sheet, &count);
+    if (count != 1 || !info || info->type != 1 || !info->native_rule) return false;
+    /* Native parser recovery may accept a prefix/missing close. insertRule
+       requires one entire qualified rule, not forgiving stylesheet recovery. */
+    size_t n = sheet->cssom_length; const char *clean = sheet->cssom_source;
+    const char *s = skip_ws(clean, clean + n), *p = scan_to(s, clean + n, "{;}");
+    bool ok = p < clean + n && *p == '{';
+    if (ok) { const char *end = block_end(p + 1, clean + n); ok = end < clean + n && skip_ws(end + 1, clean + n) == clean + n; }
+    return ok;
+}
 
 /* Rules/selectors/declarations are immutable after parsing. Each adoption in
    the native cascade still needs its OWN scope and source-order identity. */
@@ -1416,21 +1491,22 @@ sheet_t *css_sheet_instance(arena_t *a, const sheet_t *source, double order, nod
 }
 
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
-    struct pctx pc = {a, NULL, base_url, imports, 0, false};
+    struct pctx pc = {a, NULL, base_url, imports, 0, false, 0};
     pc.sh = ar_alloc(a, sizeof(sheet_t));
     pc.sh->order = order;
     size_t cn;
     char *c = strip_comments(a, css, n, &cn);
+    pc.sh->cssom_source = c; pc.sh->cssom_length = cn;
     parse_rules(&pc, c, c + cn, NULL);
     return pc.sh;
 }
 
 /* ---------------------------------------------------------------- media queries */
-/* CSS and matchMedia share this bounded parser and device model. Unknown
+/* CSS and matchMedia share this explicit-stack parser and device model. Unknown
    features use Kleene logic: negating an unsupported feature is not a match. */
 enum { MQ_UNKNOWN = -1, MQ_FALSE, MQ_TRUE };
 enum { MQ_LENGTH = 1, MQ_RATIO, MQ_RESOLUTION, MQ_INTEGER, MQ_NUMBER };
-struct mq { const char *s, *e; int vw, vh, depth; bool scripting, valid; };
+struct mq { const char *s, *e; int vw, vh; bool scripting, valid; };
 static int mq_cond(struct mq *m, bool allow_or);
 static int mq_not(int a) { return a < 0 ? a : !a; }
 static int mq_and(int a, int b) { return !a || !b ? 0 : a < 0 || b < 0 ? -1 : 1; }
@@ -1458,8 +1534,8 @@ static bool mq_number(const char *s, const char *e, const char **end, double *ou
         const char *exp=p+1; if(exp<e && (*exp=='+'||*exp=='-'))exp++;
         if(exp<e && *exp>='0'&&*exp<='9'){p=exp+1;while(p<e&&*p>='0'&&*p<='9')p++;}
     }
-    size_t n=(size_t)(p-s); if(n>=64)return false; char b[64]; memcpy(b,s,n);b[n]=0;
-    double v=strtod(b,NULL); if(!(v>=-1e30 && v<=1e30))return false;
+    size_t n=(size_t)(p-s); if(n==SIZE_MAX)return false;char *b=malloc(n+1);if(!b)return false;memcpy(b,s,n);b[n]=0;
+    double v=strtod(b,NULL);free(b);if(!isfinite(v))return false;
     *out=v;*end=p;return true;
 }
 static bool mq_value(const char *s,const char *e,int kind,const struct mq *m,double *out) {
@@ -1578,32 +1654,56 @@ static int mq_feature(const char *s,const char *e,struct mq *m) {
     const char *allowed,*value=mq_discrete(s,(size_t)(e-s),m,&allowed);
     return value ? strcmp(value,"none")&&strcmp(value,"no-preference")&&strcmp(value,"0") : MQ_UNKNOWN;
 }
-static int mq_term(struct mq *m) {
-    m->s=skip_ws(m->s,m->e);if(m->depth>=64||m->s==m->e){m->valid=false;return MQ_UNKNOWN;}
-    /* General-enclosed functions are unknown, never guessed true. */
-    bool function=*m->s!='(';const char *open=m->s;
-    if(function){while(open<m->e&&ident_char((unsigned char)*open))open++;}
-    if(open==m->e||*open!='('){m->valid=false;return MQ_UNKNOWN;}
-    int level=1;const char *close=open+1;
-    for(;close<m->e;close++){if(*close=='(')level++;else if(*close==')'&&!--level)break;}
-    if(close==m->e){m->valid=false;return MQ_UNKNOWN;}
-    m->s=close+1;if(function)return MQ_UNKNOWN;
-    const char *in=skip_ws(open+1,close);struct mq sub={in,close,m->vw,m->vh,m->depth+1,m->scripting,true};
-    int r;
-    if(in<close&&(*in=='('||((size_t)(close-in)>=3&&strn_ieq(in,"not",3)&&
-       (in+3==close||!ident_char((unsigned char)in[3]))))) {
-        r=mq_cond(&sub,true);if(!sub.valid||skip_ws(sub.s,sub.e)!=sub.e)m->valid=false;
-    }else r=mq_feature(in,close,m);
-    return r;
-}
+struct mq_walk {
+    struct mq_walk *parent;
+    struct mq m;
+    int value, mode;
+    unsigned stage;
+    bool allow_or, negate;
+};
 static int mq_cond(struct mq *m,bool allow_or) {
-    if(mq_word(m,"not"))return mq_not(mq_term(m));
-    int r=mq_term(m),mode=0;
-    for(;;){
-        int next=mq_word(m,"and")?1:mq_word(m,"or")?2:0;if(!next)break;
-        if((mode&&mode!=next)||(next==2&&!allow_or)){m->valid=false;return MQ_UNKNOWN;}mode=next;
-        int rhs=mq_term(m);r=mode==1?mq_and(r,rhs):mq_or(r,rhs);
-    }return r;
+    struct mq_walk *f=calloc(1,sizeof*f);
+    if(!f){m->valid=false;return MQ_UNKNOWN;}
+    f->m=*m;f->allow_or=allow_or;int result=MQ_UNKNOWN;
+    while(f){
+        if(!f->stage){f->negate=mq_word(&f->m,"not");f->stage=1;goto term;}
+        goto term_done;
+term:;
+        struct mq *q=&f->m;
+        q->s=skip_ws(q->s,q->e);
+        if(q->s==q->e){q->valid=false;result=MQ_UNKNOWN;goto term_done;}
+        bool function=*q->s!='(';const char *open=q->s;
+        if(function)while(open<q->e&&ident_char((unsigned char)*open))open++;
+        if(open==q->e||*open!='('){q->valid=false;result=MQ_UNKNOWN;goto term_done;}
+        size_t level=1;const char *close=open+1;
+        for(;close<q->e;close++){if(*close=='(')level++;else if(*close==')'&&!--level)break;}
+        if(close==q->e){q->valid=false;result=MQ_UNKNOWN;goto term_done;}
+        q->s=close+1;
+        if(function){result=MQ_UNKNOWN;goto term_done;}
+        const char *in=skip_ws(open+1,close);
+        if(in<close&&(*in=='('||((size_t)(close-in)>=3&&strn_ieq(in,"not",3)&&
+           (in+3==close||!ident_char((unsigned char)in[3]))))){
+            struct mq_walk *child=calloc(1,sizeof*child);
+            if(!child){m->valid=false;while(f){struct mq_walk *p=f->parent;free(f);f=p;}return MQ_UNKNOWN;}
+            child->parent=f;child->m=(struct mq){in,close,q->vw,q->vh,q->scripting,true};child->allow_or=true;
+            f=child;continue;
+        }
+        result=mq_feature(in,close,q);
+term_done:
+        if(f->stage==1)f->value=result;
+        else f->value=f->mode==1?mq_and(f->value,result):mq_or(f->value,result);
+        if(f->negate){result=mq_not(f->value);goto done;}
+        int next=mq_word(&f->m,"and")?1:mq_word(&f->m,"or")?2:0;
+        if(!next){result=f->value;goto done;}
+        if((f->mode&&f->mode!=next)||(next==2&&!f->allow_or)){f->m.valid=false;result=MQ_UNKNOWN;goto done;}
+        f->mode=next;f->stage=2;goto term;
+done:;
+        struct mq_walk *parent=f->parent;
+        if(parent){if(!f->m.valid||skip_ws(f->m.s,f->m.e)!=f->m.e)parent->m.valid=false;}
+        else {m->s=f->m.s;m->valid=m->valid&&f->m.valid;}
+        free(f);f=parent;
+    }
+    return result;
 }
 static int mq_query(struct mq *m) {
     m->s=skip_ws(m->s,m->e);const char *start=m->s;
@@ -1626,7 +1726,7 @@ static bool mq_append(char *out,size_t cap,size_t *used,const char *s,size_t n) 
 /* Each empty comma-delimited query can expand to "not all, ". */
 bool css_media_evaluate(const char *query,int vw,int vh,bool scripting,char *out,size_t cap) {
     if(out&&cap)out[0]=0;if(!query||(out&&!cap))return false;
-    size_t length=strlen(query);if(length>16384)return false;
+    size_t length=strlen(query);if(length==SIZE_MAX)return false;
     char *text=malloc(length+1);if(!text)return false;size_t n=0;
     for(size_t i=0;i<length;i++){
         if(query[i]=='/'&&i+1<length&&query[i+1]=='*'){
@@ -1636,11 +1736,11 @@ bool css_media_evaluate(const char *query,int vw,int vh,bool scripting,char *out
     const char *s=text,*e=text+n;size_t used=0;bool any=false,first=true,ok=true;
     if(skip_ws(s,e)==e){free(text);return true;}
     for(;;){
-        const char *end=s;int depth=0;bool bad=false;
+        const char *end=s;size_t depth=0;bool bad=false;
         while(end<e){char c=*end;if(c=='(')depth++;else if(c==')'){if(!depth)bad=true;else depth--;}
             if(!depth&&c==',')break;if((unsigned char)c<32&&!is_space(c))bad=true;
             if(c=='\\'||c=='\''||c=='"'||c=='{'||c=='}'||c==';'||c=='['||c==']')bad=true;end++;}
-        struct mq m={s,end,vw,vh,0,scripting,!bad&&!depth};int r=mq_query(&m);
+        struct mq m={s,end,vw,vh,scripting,!bad&&!depth};int r=mq_query(&m);
         bool valid=m.valid&&skip_ws(m.s,m.e)==m.e;any|=valid&&r==MQ_TRUE;
         if(!first)ok=ok&&mq_append(out,cap,&used,", ",2);first=false;
         if(!valid||r==MQ_UNKNOWN)ok=ok&&mq_append(out,cap,&used,"not all",7);
@@ -1765,8 +1865,10 @@ static struct css_ctx *build_index(web_doc *d, int vw, int vh) {
     uint32_t order = 1;
     for (int i = -2; i < sh->n; i++) {
         sheet_t *s = i == -2 ? ua_sheet : i == -1 ? quirks_sheet : sh->v[i];
+        if (s->owner_media && !css_media_evaluate(s->owner_media, vw, vh, web_js_enabled(d), NULL, 0)) continue;
         if (i == -1 && !d->quirks) continue;
         for (struct rule *r = s->first; r; r = r->next, order++) {
+            web_avmedia_checkpoint();
             if (!r->ndecls || !media_chain_ok(r->media, vw, vh, web_js_enabled(d))) continue;
             for (int k = 0; k < r->sel->n; k++) index_rule(x, r, r->sel->v[k], order, s->ua, s->scope);
         }
@@ -1942,33 +2044,30 @@ struct css_animation {
     uint8_t pseudo;
     char *text;
 };
-static unsigned animation_count;
 int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text) {
     struct css_animation **slot = &n->animations;
-    unsigned count = 0;
     while (*slot && ((*slot)->id != id || (*slot)->pseudo != pseudo)) {
-        count++; slot = &(*slot)->next;
+        slot = &(*slot)->next;
     }
     struct css_animation *old = *slot;
     if (!text || !*text) {
         if (!old) return 0;
-        *slot = old->next; free(old->text); free(old); animation_count--; return 1;
+        *slot = old->next; free(old->text); free(old); return 1;
     }
     if (old && !strcmp(old->text, text)) return 0;
-    if (!old && (animation_count >= 128 || count >= 32)) return -2;
     char *copy = strdup(text);
     if (!copy) return -1;
     if (old) { free(old->text); old->text = copy; return 1; }
     struct css_animation *a = malloc(sizeof *a);
     if (!a) { free(copy); return -1; }
     *a = (struct css_animation){NULL, id, pseudo, copy};
-    *slot = a; animation_count++; return 1;
+    *slot = a; return 1;
 }
 void css_animation_free(node_t *n) {
     while (n->animations) {
         struct css_animation *a = n->animations;
         n->animations = a->next;
-        free(a->text); free(a); animation_count--;
+        free(a->text); free(a);
     }
 }
 struct dent {
@@ -2015,6 +2114,7 @@ static void add_rule_decls(const struct rule *r, uint32_t spec, uint32_t order, 
 static void collect(const struct ient *l, node_t *e) {
     node_t *root = doc_node_root(e, false);
     for (; l; l = l->next) {
+        web_avmedia_checkpoint();
         if (!l->ua) {
             if (!l->scope && root && root->shadow_host) continue;
             if (l->scope && l->sel->pseudo != PE_SLOTTED && root != l->scope && e != l->scope->shadow_host) continue;
@@ -2045,48 +2145,209 @@ static int cmp_dent(const void *a, const void *b) {
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
-static const char *find_var(const struct custom_prop *v, const char *name, size_t n) {
+static const struct custom_prop *find_var(const struct custom_prop *v, const char *name, size_t n) {
     for (; v; v = v->next)
-        if (strlen(v->name) == n && !memcmp(v->name, name, n)) return v->value;
+        if (strlen(v->name) == n && !memcmp(v->name, name, n)) return v;
     return NULL;
 }
 
-/* replace var() and env() references; false if a variable is missing without a fallback */
-static bool subst(const char *s, size_t n, const struct custom_prop *vars, sbuf *out, int depth) {
-    if (depth > 16) return false;
-    size_t i = 0;
-    while (i < n) {
+static bool subst_put(sbuf *b, const char *s, size_t n) {
+    if (b->n == SIZE_MAX || n > SIZE_MAX - b->n - 1) return false;
+    size_t need = b->n + n + 1;
+    if (need > b->cap) {
+        size_t cap = b->cap ? b->cap : 64;
+        while (cap < need) {
+            if (cap > SIZE_MAX / 2) { cap = need; break; }
+            cap *= 2;
+        }
+        char *p = realloc(b->p, cap);
+        if (!p) return false;
+        b->p = p; b->cap = cap;
+    }
+    memcpy(b->p + b->n, s, n); b->n += n; b->p[b->n] = 0;
+    return true;
+}
+
+struct subst_walk {
+    struct subst_walk *parent;
+    const struct custom_prop *property;
+    const char *s;
+    size_t n, i;
+};
+
+/* No C recursion: real allocation/output overflow bounds expansion. Cyclic
+   computed custom properties are represented by NULL, distinct from an empty
+   but valid value; a defensive active-property check also protects raw callers. */
+static bool subst(const char *s, size_t n, const struct custom_prop *vars, sbuf *out) {
+    size_t original = out->n;
+    struct subst_walk *f = calloc(1, sizeof *f);
+    if (!f) return false;
+    f->s = s; f->n = n;
+    bool ok = true;
+    while (f) {
+        s = f->s; n = f->n; size_t i = f->i;
+        if (i == n) { struct subst_walk *parent = f->parent; free(f); f = parent; continue; }
         if (s[i] == '"' || s[i] == '\'') {
-            size_t start = i;
-            char quote = s[i++];
+            size_t start = i; char quote = s[i++];
             while (i < n && s[i] != quote) { if (s[i] == '\\' && i + 1 < n) i++; i++; }
             if (i < n) i++;
-            sb_put(out, s + start, i - start);
+            if (!subst_put(out, s + start, i - start)) { ok = false; break; }
+            f->i = i;
             continue;
         }
-        bool is_var = i + 4 <= n && strn_ieq(s + i, "var(", 4) && (i == 0 || !ident_char((unsigned char)s[i - 1]));
-        bool is_env = !is_var && i + 4 <= n && strn_ieq(s + i, "env(", 4) && (i == 0 || !ident_char((unsigned char)s[i - 1]));
+        bool token = i == 0 || (!ident_char((unsigned char)s[i-1]) && s[i-1] != '#' && s[i-1] != '@');
+        bool is_var = n - i >= 4 && strn_ieq(s + i, "var(", 4) && token;
+        bool is_env = !is_var && n - i >= 4 && strn_ieq(s + i, "env(", 4) && token;
         if (!is_var && !is_env) {
-            sb_putc(out, s[i++]);
+            if (!subst_put(out, s + i, 1)) { ok = false; break; }
+            f->i++;
             continue;
         }
         const char *a = s + i + 4, *e = s + n;
         const char *close = scan_to(a, e, ")");
-        if (close >= e) return false;
+        if (close >= e) { ok = false; break; }
         const char *comma = scan_to(a, close, ",");
         const char *ns = skip_ws(a, comma), *ne = comma;
         trim_r(ns, &ne);
-        const char *val = is_var ? find_var(vars, ns, (size_t)(ne - ns)) : NULL;
+        if (is_var && !supports_custom_name(ns, (size_t)(ne-ns))) { ok = false; break; }
+        const struct custom_prop *property = is_var ? find_var(vars, ns, (size_t)(ne - ns)) : NULL;
+        const char *val = property ? property->value : NULL, *text;
+        size_t length;
         if (val) {
-            if (!subst(val, strlen(val), vars, out, depth + 1)) return false;
+            for (struct subst_walk *p = f; p; p = p->parent)
+                if (p->property == property) { ok = false; break; }
+            if (!ok) break;
+            text = val; length = strlen(val);
         } else if (comma < close) {
-            if (!subst(comma + 1, (size_t)(close - comma - 1), vars, out, depth + 1)) return false;
+            text = comma + 1; length = (size_t)(close - comma - 1); property = NULL;
         } else if (is_env) {
-            sb_puts(out, "0px");
-        } else return false;
-        i = (size_t)(close + 1 - s);
+            if (!subst_put(out, "0px", 3)) { ok = false; break; }
+            f->i = (size_t)(close + 1 - s); continue;
+        } else { ok = false; break; }
+        struct subst_walk *child = calloc(1, sizeof *child);
+        if (!child) { ok = false; break; }
+        child->parent = f; child->property = property; child->s = text; child->n = length;
+        f->i = (size_t)(close + 1 - s); f = child;
     }
-    return true;
+    while (f) { struct subst_walk *parent = f->parent; free(f); f = parent; }
+    if (!ok) { out->n = original; if (out->p && out->cap > original) out->p[original] = 0; }
+    return ok;
+}
+
+struct var_walk {
+    struct var_walk *next, *parent, *component;
+    struct custom_prop *property;
+    const char *s, *e;
+    size_t index, low;
+    bool seen, on_stack, self_edge;
+};
+
+static struct var_walk *var_lookup(struct var_walk *v, const char *name, size_t n) {
+    for (; v; v = v->next)
+        if (strlen(v->property->name) == n && !memcmp(v->property->name, name, n)) return v;
+    return NULL;
+}
+
+/* Iterate every var() token, including references in an unused fallback.
+   Strings and hash/at-keywords are not variable function tokens. */
+static struct var_walk *var_dependency(struct var_walk *f, struct var_walk *all) {
+    const char *s = f->s, *e = f->e;
+    while (s < e) {
+        if (*s == '"' || *s == '\'') {
+            char quote = *s++;
+            while (s < e && *s != quote) { if (*s == '\\' && s + 1 < e) s++; s++; }
+            if (s < e) s++;
+            continue;
+        }
+        if ((*s == '#' || *s == '@') && s + 1 < e && ident_char((unsigned char)s[1])) {
+            s++; while (s < e && ident_char((unsigned char)*s)) s++; continue;
+        }
+        if ((size_t)(e-s) >= 4 && strn_ieq(s,"var(",4) &&
+            (s == f->property->value || !ident_char((unsigned char)s[-1]))) {
+            const char *close = scan_to(s + 4, e, ")");
+            if (close == e) { f->s = e; return NULL; }
+            const char *comma = scan_to(s + 4, close, ","), *ns = skip_ws(s + 4, comma), *ne = comma;
+            trim_r(ns,&ne); s += 4; /* Scan fallback tokens on the next call too. */
+            struct var_walk *dep = var_lookup(all, ns, (size_t)(ne-ns));
+            if (dep) { f->s = s; return dep; }
+        } else s++;
+    }
+    f->s = e; return NULL;
+}
+
+static bool value_references(const char *s) {
+    if (!s) return false;
+    size_t n = strlen(s);
+    for (size_t i=0; n-i>=4; i++)
+        if (strn_ieq(s+i,"var(",4) || strn_ieq(s+i,"env(",4)) return true;
+    return false;
+}
+
+/* Iterative Tarjan: only declarations on this element form graph vertices.
+   Inherited properties are already computed, so cannot form child cycles.
+   Components are resolved in dependency order before mutating raw values. */
+static void resolve_vars(web_doc *d, struct custom_prop *mine, const struct custom_prop *inherited) {
+    bool references=false;
+    for (struct custom_prop *m=mine;m!=inherited;m=m->next)
+        if (value_references(m->value)) { references=true; break; }
+    if (!references) return; /* Retain immutable literal AST values, no scratch/copy. */
+    struct var_workspace { arena_t arena; sbuf output; } *work = calloc(1,sizeof *work);
+    if (!work) {
+        for (struct custom_prop *m=mine;m!=inherited;m=m->next) m->value=NULL;
+        web_js_console(d,2,"Custom property graph allocation failed"); return;
+    }
+    jmp_buf trap; jmp_buf *outer = d->smem.trap;
+    work->arena.trap = d->smem.trap = &trap;
+    int failed = setjmp(trap);
+    if (failed) {
+        sb_free(&work->output); ar_free(&work->arena); free(work); d->smem.trap=outer;
+        if (outer) longjmp(*outer,failed);
+        for (struct custom_prop *m=mine;m!=inherited;m=m->next) m->value=NULL;
+        web_js_console(d,2,"Custom property graph/value allocation failed"); return;
+    }
+    struct var_walk *all=NULL;
+    for (struct custom_prop *m=mine;m!=inherited;m=m->next) {
+        struct var_walk *v=ar_alloc(&work->arena,sizeof *v);
+        v->property=m;v->s=m->value?m->value:"";v->e=v->s+strlen(v->s);v->next=all;all=v;
+    }
+    size_t index=0;
+    struct var_walk *components=NULL;
+    for (struct var_walk *root=all;root;root=root->next) {
+        if (root->seen) continue;
+        struct var_walk *f=root;
+        while (f) {
+            if (!f->seen) {
+                if (index==SIZE_MAX) longjmp(trap,1);
+                f->seen=f->on_stack=true;f->index=f->low=++index;
+                f->component=components;components=f;
+            }
+            struct var_walk *dep=var_dependency(f,all);
+            if (dep) {
+                if (dep==f) f->self_edge=true;
+                if (!dep->seen) { dep->parent=f;f=dep;continue; }
+                if (dep->on_stack && dep->index<f->low) f->low=dep->index;
+                continue;
+            }
+            if (f->low==f->index) {
+                bool cycle=components!=f || f->self_edge;
+                struct var_walk *v;
+                do {
+                    v=components;components=v->component;v->on_stack=false;
+                    if (cycle) v->property->value=NULL;
+                    else if (value_references(v->property->value)) {
+                        work->output.n=0;
+                        if (subst(v->property->value,strlen(v->property->value),mine,&work->output))
+                            v->property->value=ar_strndup(&d->smem,work->output.p?work->output.p:"",work->output.n);
+                        else v->property->value=NULL;
+                    }
+                } while (v!=f);
+            }
+            struct var_walk *parent=f->parent;
+            if (parent && f->low<parent->low) parent->low=f->low;
+            f=parent;
+        }
+    }
+    sb_free(&work->output); ar_free(&work->arena); free(work); d->smem.trap=outer;
 }
 
 struct cascade {
@@ -2097,11 +2358,15 @@ struct cascade {
 };
 
 static void apply_decl(struct cascade *c, struct cx *cx, const struct decl *d) {
+    /* A winning longhand cannot consume this value. Skip var lookup / scratch
+       expansion before css_apply discards it. Shorthand indices are never
+       marked: their individual longhands may still need this declaration. */
+    if (cx->set[css_prop_index(d->p)]) return;
     const char *v = d->value;
     size_t n = strlen(v);
-    if (strstr(v, "var(") || strstr(v, "env(")) {
+    if (value_references(v)) {
         c->vbuf.n = 0;
-        if (!subst(v, n, cx->s->vars, &c->vbuf, 0)) return;
+        if (!subst(v, n, cx->s->vars, &c->vbuf)) return;
         v = sb_cstr(&c->vbuf);
         n = c->vbuf.n;
     }
@@ -2133,14 +2398,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
         while (last->next) last = last->next;
         last->next = (struct custom_prop *)inherited;
         s->vars = mine;
-        /* resolve references now, so descendants see this element's values */
-        for (struct custom_prop *m = mine; m != inherited; m = m->next) {
-            if (!strstr(m->value, "var(")) continue;
-            sbuf b = {0};
-            if (subst(m->value, strlen(m->value), s->vars, &b, 0)) m->value = ar_strndup(&d->smem, b.p ? b.p : "", b.n);
-            else m->value = "";
-            sb_free(&b);
-        }
+        resolve_vars(d,mine,inherited);
     }
     memset(setbits, 0, (size_t)css_prop_count());
     struct cx cx = {s, parent, e, parent ? parent->font_size : 16, c->rem, (float)c->vw, (float)c->vh,
@@ -2181,6 +2439,9 @@ static void clear_styles(node_t *n) {
 }
 
 static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
+    /* Native-only supply may run while this tree is being rebuilt. It never
+       executes author code or reads the incomplete style/box tree. */
+    web_avmedia_checkpoint();
     web_doc *d = c->d;
     struct css_ctx *x = d->sty.ctx;
     ndents = 0;
@@ -2206,14 +2467,14 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     for (int i = 0; i < h.n; i++) add_dent(&h.d[i], 1ull << 62, PE_NONE, depth);
     const char *sa = node_attr(e, "style");
     if (sa && *sa) {
-        struct pctx pc = {&d->smem, NULL, d->base, NULL, 0, false};
+        struct pctx pc = {&d->smem, NULL, d->base, NULL, 0, false, 0};
         struct decl *ds;
         int nd;
         parse_body(&pc, sa, sa + strlen(sa), NULL, NULL, &ds, &nd);
         for (int i = 0; i < nd; i++) add_dent(&ds[i], 1ull << 62 | (uint64_t)0x3FFFFFFF << 32 | (uint64_t)(i < 255 ? i : 255), PE_NONE, depth);
     }
     for (struct css_animation *a = e->animations; a; a = a->next) {
-        struct pctx pc = {&d->smem, NULL, d->base, NULL, 0, false};
+        struct pctx pc = {&d->smem, NULL, d->base, NULL, 0, false, 0};
         struct decl *ds; int nd;
         parse_body(&pc, a->text, a->text + strlen(a->text), NULL, NULL, &ds, &nd);
         for (int i = 0; i < nd; i++) {
@@ -2264,13 +2525,26 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
 }
 
 void css_cascade(web_doc *d, int vw, int vh) {
-    if (d->sty.ctx) {
-        ar_free(&d->sty.ctx->a);
-        free(d->sty.ctx);
+    bool scripting = web_js_enabled(d);
+    /* Rule indexing depends on the stylesheet snapshot/media environment,
+       not on the current hover/active target, class attribute or inline style.
+       Those changes still recompute every real selector and computed style.
+       Resource/CSSOM replacement unpublishes ctx before releasing its AST;
+       new sheets mark index_dirty at their publication boundary. */
+    if (!d->sty.ctx || d->sty.index_dirty || d->sty.index_w != vw || d->sty.index_h != vh ||
+        d->sty.index_scripting != scripting || d->sty.index_quirks != d->quirks) {
+        if (d->sty.ctx) {
+            ar_free(&d->sty.ctx->a);
+            free(d->sty.ctx);
+            d->sty.ctx = NULL;
+        }
+        d->sty.ctx = build_index(d, vw, vh);
+        d->sty.index_w = vw;
+        d->sty.index_h = vh;
+        d->sty.index_scripting = scripting;
+        d->sty.index_quirks = d->quirks;
+        d->sty.index_dirty = false;
     }
-    d->sty.ctx = build_index(d, vw, vh);
-    d->sty.index_w = vw;
-    d->sty.index_h = vh;
     if (!setbits) setbits = malloc((size_t)css_prop_count());
     ar_free(&d->smem);
     if (d->root) clear_styles(d->root);

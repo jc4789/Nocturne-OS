@@ -55,13 +55,13 @@ int main(void){
     web_frames_detach_tree(&parent,&element);check("removal clears generation",frame.detached && !frame.initial_failed && !frame.window_token);
     reject_child=false;check("reinsert creates native child",web_frame_initial_create(&frame,&host));
     check("success resets failed state",frame.document==&child && !frame.failed && !frame.initial_failed && !frame.detached);
-    check("success navigation count",parent.frame_navigation_count==1);check("success not blocked",!web_frame_initial_blocked(&frame,"/one",NULL));
+    check("success container identity",child.frame_container==&frame);check("success not blocked",!web_frame_initial_blocked(&frame,"/one",NULL));
     frame.document=NULL;frame.window_token=NULL;reject_token=true;
     check("token allocation failure",!web_frame_initial_create(&frame,&host));int before=tokens;
     for(int i=0;i<20;i++)check("token failure no retry",!web_frame_initial_create(&frame,&host));
     check("one failed token allocation",tokens==before);check("token failure blocked",web_frame_initial_blocked(&frame,"/one",NULL));
-    reject_token=false;frame.detached=true;parent.frame_navigation_count=WEB_FRAME_NAVIGATIONS_MAX;
-    check("navigation cap failure",!web_frame_initial_create(&frame,&host));check("cap failure latched",frame.initial_failed && frame.failed && !frame.detached);
+    reject_token=false;reject_child=true;frame.detached=true;
+    check("actual context allocation failure",!web_frame_initial_create(&frame,&host));check("allocation failure latched",frame.initial_failed && frame.failed && !frame.detached);
     free(frame.navigation);free(frame.navigation_origin);
     printf("frame initial failure: %d checks, %d failed\n",checks,failures);return failures!=0;
 }

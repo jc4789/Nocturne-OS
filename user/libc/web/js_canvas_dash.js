@@ -1,22 +1,23 @@
-/* Native Canvas stroke accepts at most 8192 points, including NaN subpath
- * separators. Prepare the entire dashed path before any native draw. */
+/* Prepare the entire dashed path before native drawing. Storage grows with
+ * actual geometry; only numeric progress and engine array representation can
+ * fail before its real allocator does. */
 const canvasDash = (() => {
     'use strict';
     const finite=Number.isFinite, nan=Number.isNaN, hypot=Math.hypot, abs=Math.abs, min=Math.min, max=Math.max;
     const TypeErrorImpl=TypeError, RangeErrorImpl=RangeError, DOMExceptionImpl=DOMException;
-    const POINTS=8192, PATTERN=256, STEPS=32768;
-    function limit(){throw new RangeErrorImpl('Canvas dash tessellation limit');}
+    const ARRAY_LENGTH=0xffffffff;
+    function limit(){throw new RangeErrorImpl('Canvas dash size/coordinate representation');}
     function copy(values){const out=[];for(let i=0;i<values.length;i++)out[i]=values[i];return out;}
     function convert(value){
         if(value===null || (typeof value!=='object' && typeof value!=='function'))
             throw new TypeErrorImpl('Line dash requires an iterable sequence');
         const out=[];let invalid=false;
         for(const entry of value){
-            if(out.length===PATTERN)limit();
+            if(out.length===ARRAY_LENGTH)limit();
             const n=+entry;out[out.length]=n;if(!finite(n)||n<0)invalid=true;
         }
         if(invalid)return null;
-        if(out.length&1){const count=out.length;if(count*2>PATTERN)limit();for(let i=0;i<count;i++)out[count+i]=out[i];}
+        if(out.length&1){const count=out.length;if(count*2>ARRAY_LENGTH)limit();for(let i=0;i<count;i++)out[count+i]=out[i];}
         return out;
     }
     function uniform(matrix){
@@ -28,7 +29,7 @@ const canvasDash = (() => {
         return abs(dot)<=1e-10?a:null;
     }
     function prepare(state,points){
-        if(points.length&1 || points.length>POINTS*2)limit();
+        if(points.length&1)limit();
         const source=state.dash,scale=uniform(state.matrix);
         let total=0,on=false,off=false;
         for(let i=0;i<source.length;i++){total+=source[i];if(i&1)off=off||source[i]>0;else on=on||source[i]>0;}
@@ -50,23 +51,26 @@ const canvasDash = (() => {
         const phase=(state.dashOffset%total)*scale;
         if(!finite(phase))limit();
         const offset=phase<0?phase+cycle:phase;
-        const out=[];let steps=0,index=0,left=0,pen=false,previous=null;
-        const step=()=>{if(++steps>STEPS)limit();};
+        const out=[];let index=0,left=0,pen=false,previous=null;
         const add=(x,y)=>{
             if(!finite(x)||!finite(y))limit();
             if(out.length>=2 && out[out.length-2]===x && out[out.length-1]===y)return;
-            if(out.length+2>POINTS*2)limit();out[out.length]=x;out[out.length]=y;
+            if(out.length+2>ARRAY_LENGTH)limit();out[out.length]=x;out[out.length]=y;
         };
         const advance=()=>{
-            do{step();index=(index+1)%pattern.length;left=pattern[index];}while(!left);
+            /* There is a nonzero interval, checked above. Never loop over
+               zero entries beyond one actual pattern traversal. */
+            for(let visited=0;visited<pattern.length;visited++){index=(index+1)%pattern.length;left=pattern[index];if(left)return;}limit();
         };
         const restart=()=>{
             index=0;let at=offset;
-            for(;;){step();left=pattern[index];if(left>at){left-=at;break;}at-=left;index=(index+1)%pattern.length;}
+            let found=false;
+            for(let visited=0;visited<pattern.length;visited++){left=pattern[index];if(left>at){left-=at;found=true;break;}at-=left;index=(index+1)%pattern.length;}
+            if(!found)limit();
             pen=false;
         };
         for(let i=0;i<points.length;i+=2){
-            step();const x=points[i],y=points[i+1];
+            const x=points[i],y=points[i+1];
             if(nan(x)&&nan(y)){previous=null;pen=false;continue;}
             if(!finite(x)||!finite(y))limit();
             if(!previous){previous=[x,y];restart();continue;}
@@ -74,11 +78,11 @@ const canvasDash = (() => {
             if(!finite(length))limit();if(!length)continue;
             let at=0;
             while(at<length){
-                step();const count=min(left,length-at),end=at+count;
+                const count=min(left,length-at),end=at+count;
                 if(!(count>0)||!(end>at))limit();
                 if(!(index&1)){
                     if(!pen){
-                        if(out.length){if(out.length+2>POINTS*2)limit();out[out.length]=NaN;out[out.length]=NaN;}
+                        if(out.length){if(out.length+2>ARRAY_LENGTH)limit();out[out.length]=NaN;out[out.length]=NaN;}
                         add(at?ax+dx*(at/length):ax,at?ay+dy*(at/length):ay);pen=true;
                     }
                     add(end===length?x:ax+dx*(end/length),end===length?y:ay+dy*(end/length));

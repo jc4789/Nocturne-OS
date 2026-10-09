@@ -13,11 +13,11 @@
 #include <limits.h>
 
 #define VALIDATION_REGEX_CACHE 16
-#define VALIDATION_PATTERN_LIMIT 65536u
-#define VALIDATION_INPUT_LIMIT (16u << 20)
-#define VALIDATION_MEMORY_LIMIT (16u << 20)
-#define VALIDATION_MATCH_MS 20u
-#define VALIDATION_URL_STARTUP_MS 1000u
+/* Cache eviction does not reject controls. The execution watchdog prevents
+   pathological regexes from permanently blocking the native GUI, matching
+   the browser's author-task watchdog rather than imposing a byte quota. */
+#define VALIDATION_MATCH_MS 15000u
+#define VALIDATION_URL_STARTUP_MS VALIDATION_MATCH_MS
 
 struct validation_pattern {
     char *text;
@@ -136,7 +136,7 @@ static struct validation_state *validation_state(web_doc *d) {
     s->url_check = JS_UNDEFINED;
     s->rt = JS_NewRuntime();
     if (!s->rt) { free(s); return NULL; }
-    JS_SetMemoryLimit(s->rt, VALIDATION_MEMORY_LIMIT);
+    JS_SetMemoryLimit(s->rt, SIZE_MAX);
     JS_SetMaxStackSize(s->rt, 256u << 10);
     s->ctx = JS_NewContext(s->rt);
     if (!s->ctx) { JS_FreeRuntime(s->rt); free(s); return NULL; }
@@ -173,7 +173,7 @@ static JSValue url_decode(JSContext *ctx, JSValueConst self, int argc, JSValueCo
     size_t len = 0;
     uint8_t *bytes = argc ? JS_GetArrayBuffer(ctx, &len, argv[0]) : NULL;
     if (argc && !bytes) return JS_EXCEPTION;
-    if (len > VALIDATION_INPUT_LIMIT) return JS_ThrowRangeError(ctx, "UTF-8 decode limit");
+    if (len > (SIZE_MAX - 1) / 3) return JS_ThrowRangeError(ctx, "UTF-8 decode allocation length is not representable");
     char *out = malloc(len * 3 + 1);
     if (!out) return JS_ThrowOutOfMemory(ctx);
     size_t written = 0;
@@ -223,7 +223,7 @@ static bool url_prepare(struct validation_state *s) {
     s->deadline = uptime_ms() + VALIDATION_URL_STARTUP_MS;
     /* Build transactionally in a fresh context. Timeout/OOM can leave bundle
        globals partly installed; retry must never reuse those partial roots.
-       Both contexts share one bounded runtime, and regex cache ownership is
+       Both contexts share one OS-allocated runtime, and regex cache ownership is
        unaffected by a failed URL initialization. */
     JSContext *ctx = JS_NewContext(s->rt);
     if (!ctx) { JS_RunGC(s->rt); return false; }
@@ -268,7 +268,7 @@ static struct validation_pattern *pattern_compile(struct validation_state *s, co
         if (!p->text || p->used < entry->used) entry = p;
     }
     size_t len = strlen(pattern);
-    if (len > VALIDATION_PATTERN_LIMIT) return NULL;
+    if (len > SIZE_MAX - 8) return NULL;
     char *source = malloc(len + 8), *key = strdup(pattern);
     if (!source || !key) { free(source); free(key); return NULL; }
     memcpy(source, "^(?:", 4); memcpy(source + 4, pattern, len); memcpy(source + 4 + len, ")$", 3);
@@ -307,7 +307,7 @@ static uint32_t utf8_next(const unsigned char **at, const unsigned char *end) {
    timeout do NOT turn an untested value into a valid value. */
 static bool pattern_matches(web_doc *d, const char *pattern, const char *text, size_t bytes) {
     struct validation_state *s = validation_state(d);
-    if (!s || bytes > VALIDATION_INPUT_LIMIT) return false;
+    if (!s || bytes > (SIZE_MAX / sizeof(uint16_t)) - 1) return false;
     JS_UpdateStackTop(s->rt); s->deadline = uptime_ms() + VALIDATION_MATCH_MS;
     struct validation_pattern *entry = pattern_compile(s, pattern);
     if (!entry) return false;
@@ -320,6 +320,8 @@ static bool pattern_matches(web_doc *d, const char *pattern, const char *text, s
     int len = 0;
     while (at < end) {
         uint32_t cp = utf8_next(&at, end);
+        /* libregexp consumes an int UTF-16 length, not a browser quota. */
+        if (len > INT_MAX - (cp > 0xffff ? 2 : 1)) { free(input); free(capture); return false; }
         if (cp > 0xffff) { cp -= 0x10000; input[len++] = (uint16_t)(0xd800 + (cp >> 10)); input[len++] = (uint16_t)(0xdc00 + (cp & 1023)); }
         else input[len++] = (uint16_t)cp;
     }
@@ -479,7 +481,7 @@ int web_control_in_range(web_doc *d, node_t *n) {
     return !(web_control_validity(d, n) & (WEB_VALIDITY_RANGE_UNDERFLOW | WEB_VALIDITY_RANGE_OVERFLOW));
 }
 bool web_control_set_custom_validity(web_doc *d, node_t *n, const char *text, size_t length) {
-    if (!d || !web_control_validation_interface(n) || !text || length > (1u << 20)) return false;
+    if (!d || !web_control_validation_interface(n) || !text || length == SIZE_MAX) return false;
     web_doc *allocation = n->allocation_doc ? n->allocation_doc : d;
     if (!length) { n->custom_validity = NULL; n->custom_validity_length = 0; }
     else if (!n->custom_validity || n->custom_validity_length != length || memcmp(n->custom_validity, text, length)) {
@@ -540,8 +542,9 @@ bool web_control_check_validity(web_doc *d, node_t *n, bool report) {
 }
 static bool snapshot_push(pvec *p, node_t *n) {
     if (p->n == p->cap) {
-        int capacity = p->cap ? p->cap * 2 : 16;
-        if (capacity <= p->cap || capacity > INT_MAX / (int)sizeof(void *)) return false;
+        if (p->cap == INT_MAX) return false;
+        int capacity = p->cap ? (p->cap > INT_MAX / 2 ? INT_MAX : p->cap * 2) : 16;
+        if ((size_t)capacity > SIZE_MAX / sizeof(void *)) return false;
         void **items = realloc(p->v, (size_t)capacity * sizeof *items);
         if (!items) return false;
         p->v = items; p->cap = capacity;

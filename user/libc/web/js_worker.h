@@ -4,6 +4,12 @@
 #include <stdint.h>
 #include <stddef.h>
 typedef struct web_workers web_workers;
+typedef struct web_worker_publication web_worker_publication;
+/* Private bridge: prepare owns all wire/ledger allocation; publish is pointer
+ * linking only, after the caller's native transfer plan commits. */
+web_worker_publication *web_worker_prepare(web_workers *,uint32_t,unsigned,uint32_t,unsigned,JSValueConst);
+void web_worker_publish(web_worker_publication *);
+void web_worker_abort(web_worker_publication *);
 /* URLs are already absolute. Parent MUST enforce its ordinary document
  * same-origin/CORS/cookie/security policy; child has no direct network API.
  * Completion may queue bytes only, never execute author JS. */

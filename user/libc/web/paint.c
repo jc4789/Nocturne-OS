@@ -6,6 +6,7 @@
    Hit testing walks the same order and keeps the last thing under the point. */
 #include <stdio.h>
 #include <math.h>
+#include <nocturne.h>
 #include "webi.h"
 #include "frame.h"
 #include "web_dialog.h"
@@ -30,6 +31,7 @@ struct pctx {
     box_t *top_root;
     uint32_t canvas_bg_from; /* 1: html's background was used for the canvas, 2: body's */
 };
+#include "paint_media_debug.h"
 
 static bool positioned(const box_t *b) {
     if (!b->st || b->kind == B_INLINE || b->kind == B_TEXT) return false;
@@ -41,8 +43,14 @@ static bool positioned(const box_t *b) {
 }
 
 static bool stacking_context(const box_t *b) {
-    return positioned(b) && !b->st->z_auto;
+    if (!b->st || b->kind == B_INLINE || b->kind == B_TEXT) return false;
+    /* Opacity groups are atomic even in normal flow. Fixed/sticky boxes also
+       establish a context with auto z-index; their descendants cannot escape
+       into the outer context's global sort after author layout hydration. */
+    return b->st->opacity < 1.0f || b->st->position == POS_FIXED || b->st->position == POS_STICKY ||
+           (positioned(b) && !b->st->z_auto);
 }
+static bool paint_box_layer(const box_t *b) { return positioned(b) || stacking_context(b); }
 
 static float cy(const box_t *b) { return box_visual_y(b) + b->content_dy; }
 
@@ -529,6 +537,7 @@ static image_t *scaled_image(struct web_image *im, int w, int h) {
     if (w <= 0 || h <= 0 || !im->img) return NULL;
     if (im->img->w == w && im->img->h == h) return im->img;
     if (im->scaled && im->scaled->w == w && im->scaled->h == h) return im->scaled;
+    if(web_avmedia_snapshot_is_probe()){web_avmedia_snapshot_reject();return NULL;}
     if ((long)w * h > IMAGE_MAX_PIXELS) return NULL;
     if (im->scaled) image_free(im->scaled);
     im->scaled = im->svg ? image_decode_svg(im->svg, im->svg_n, w, h) : image_scale(im->img, w, h);
@@ -719,12 +728,14 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     }
     case AT_PLACEHOLDER: {
         int X = (int)roundf(x), Y = (int)roundf(y), W = (int)roundf(w), H = (int)roundf(h);
+        if(web_frame_element(n))web_avmedia_snapshot_reject();
         if(web_frame_paint(n,c,X,Y,W,H))break;
         if (n->tag == T_canvas) {
             web_canvas_paint(n,c,X,Y,W,H);
             break;
         }
         if (n->tag == T_audio || n->tag == T_video) {
+            paint_debug_reached(n,c,X,Y,W,H);
             if(web_avmedia_paint(P->d,n,c,X,Y,W,H))break;
         }
         if (n->tag == T_meter || n->tag == T_progress) {
@@ -809,6 +820,7 @@ static void paint_replaced(struct pctx *P, box_t *b) {
     if (b->atomic == AT_SVG && b->svg) {
         struct svg_cache *sc = b->svg;
         if (!sc->img || sc->w != W || sc->h != H) {
+            if(web_avmedia_snapshot_is_probe()){web_avmedia_snapshot_reject();return;}
             if (sc->img) image_free(sc->img);
             sc->img = W > 0 && H > 0 && (long)W * H <= IMAGE_MAX_PIXELS ? image_decode_svg(sc->src, sc->n, W, H) : NULL;
             sc->w = W;
@@ -883,8 +895,13 @@ static bool hit_style(const style_t *st) {
     return st && !st->visibility && !st->pointer_events;
 }
 
+static void hit_target(struct pctx *P,node_t *target) {
+    P->target=target;
+    P->hit_any=false;
+    memset(P->hit,0,sizeof *P->hit);
+}
 static void set_hit(struct pctx *P, int kind, node_t *n, node_t *link) {
-    if (n) P->target = n;
+    if (n) hit_target(P,n);
     P->hit_any = true;
     P->hit->kind = kind;
     P->hit->node = n;
@@ -922,12 +939,16 @@ static void finish_disclosure_hit(struct pctx *P) {
 /* ---------------------------------------------------------------- the tree walk */
 static void paint_box(struct pctx *P, box_t *b, bool layer_root);
 static void paint_stacked_layer(struct pctx *P, box_t *l);
-static int layer_z(const box_t *b) { return b->st->z_auto ? 0 : b->st->z_index; }
+static int layer_z(const box_t *b) {
+    /* A static opacity context's author z-index is still inapplicable unless
+       it is a flex/grid item. Sticky z-index remains applicable. */
+    return b->st->z_auto || (!positioned(b) && b->st->position != POS_STICKY) ? 0 : b->st->z_index;
+}
 
 static void collect_layers(web_doc *d, pvec *layers, box_t *b) {
     for (box_t *c = b->first; c; c = c->next) {
         if ((c->st && c->st->display == D_NONE) || web_dialog_layer_box(d,c)) continue;
-        if (positioned(c)) pv_push(layers, c);
+        if (paint_box_layer(c)) pv_push(layers, c);
         if (!stacking_context(c)) collect_layers(d, layers, c);
     }
 }
@@ -935,7 +956,7 @@ static void collect_layers(web_doc *d, pvec *layers, box_t *b) {
 /* the atomic inlines and floats inside an inline formatting context, in tree order */
 static void inline_children(struct pctx *P, box_t *b, bool floats) {
     for (box_t *c = b->first; c; c = c->next) {
-        if (positioned(c)) continue;
+        if (paint_box_layer(c)) continue;
         if (c->kind == B_INLINE) {
             inline_children(P, c, floats);
             continue;
@@ -957,7 +978,7 @@ static void paint_runs(struct pctx *P, box_t *b) {
         const style_t *st = d->st;
         if (st->visibility) continue;
         if (P->mode == M_HIT) {
-            if (hit_style(st) && d->node && inside(P, bx + d->x, by + d->y, d->w, d->h)) P->target = d->node;
+            if (hit_style(st) && d->node && inside(P, bx + d->x, by + d->y, d->w, d->h)) hit_target(P,d->node);
             continue;
         }
         float l = d->first ? 0 : 0;
@@ -987,7 +1008,7 @@ static void paint_runs(struct pctx *P, box_t *b) {
             float asc, desc;
             wf_metrics(&f, &asc, &desc);
             if (inside(P, bx + r->x, by + r->y - asc, r->w, asc + desc)) {
-                if (r->node) P->target = r->node->type == N_ELEM ? r->node : doc_flat_parent(r->node);
+                if (r->node) hit_target(P,r->node->type == N_ELEM ? r->node : doc_flat_parent(r->node));
                 if (r->link) set_hit(P, WEB_HIT_NONE, NULL, r->link);
             }
             continue;
@@ -1000,7 +1021,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (!b->st || b->st->display == D_NONE) return;
     if (web_dialog_layer_box(P->d,b) && b != P->top_root) return;
     if (P->mode == M_HIT && b->node && web_dialog_inert(P->d,b->node)) return;
-    if (positioned(b) && !layer_root) return; /* painted with the layers */
+    if (paint_box_layer(b) && !layer_root) return; /* painted with the layers */
     const style_t *st = b->st;
     /* Transparent auto boxes still participate in hit testing. */
     if (P->mode == M_PAINT && st->opacity <= 0.001f) return;
@@ -1020,14 +1041,14 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     float bh = b->h + b->p[0] + b->p[2] + b->b[0] + b->b[2];
     if (P->mode == M_HIT && hit_style(st) && b->node &&
         b->kind != B_TEXT && inside(P, bx, by, bw, bh))
-        P->target = b->node->type == N_ELEM ? b->node : doc_flat_parent(b->node);
+        hit_target(P,b->node->type == N_ELEM ? b->node : doc_flat_parent(b->node));
     if (P->mode == M_HIT && hit_style(st) && b->node && !b->node->foreign &&
         b->kind != B_TEXT && (inside(P, bx, by, bw, bh) ||
         ((b->marker || b->marker_shape) && inside(P, bx - st->font_size * 2, by, st->font_size * 2, bh)))) {
         node_t *details = b->node->tag == T_summary ? doc_details_activation(b->node) :
                           b->anon && b->node->tag == T_details && !doc_details_summary(b->node) ? b->node : NULL;
         if (details) {
-            P->target = b->node;
+            hit_target(P,b->node);
             set_disclosure_hit(P, details);
         }
     }
@@ -1038,6 +1059,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     uint32_t *saved = NULL;
     int gx = 0, gy = 0, gw = 0, gh = 0;
     if (P->mode == M_PAINT && st->opacity < 0.999f && b->kind != B_TEXT) {
+        web_avmedia_snapshot_reject();
         gx = (int)floorf(P->ox + bx);
         gy = (int)floorf(P->oy + by);
         gw = (int)ceilf(bw) + 1;
@@ -1138,7 +1160,7 @@ static void walk(struct pctx *P) {
         if(P->mode==M_HIT) {
             if(n!=web_dialog_top(P->d))continue;
             memset(P->hit,0,sizeof *P->hit); P->hit_any=false;
-            P->target=hit_style(n->style)?n:NULL;
+            hit_target(P,hit_style(n->style)?n:NULL);
         }
         box_t *layers[2]={web_dialog_backdrop(P->d,n),n->box};
         for(int j=0;j<2;j++) {
@@ -1167,6 +1189,9 @@ uint32_t doc_canvas_bg(web_doc *d, int *from) {
 }
 
 void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y) {
+    paint_debug_begin(d);
+    bool snapshot_root=!d->frame_parent;
+    if(snapshot_root){web_frames_prepare_paint(d);web_avmedia_snapshot_begin(d);}
     d->view_x=doc_x; d->view_y=doc_y;
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
     gfx_clip(c, x, y, w, h);
@@ -1183,6 +1208,26 @@ void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, i
     gfx_fill_blend(c, x, y, w, h, bg);
     P.canvas_bg_from = (uint32_t)from;
     walk(&P);
+    paint_debug_finish(d);
+    if(snapshot_root) {
+        canvas_t probe;int px,py;
+        if(web_avmedia_snapshot_prepare(d,c,&probe,&px,&py,doc_x,doc_y)) {
+            /* Only normal paint examines the committed tree. The small probe
+             * canvas changes neither document view offsets nor the real UI. */
+            struct pctx Q=P;Q.c=&probe;Q.ox-=px;Q.oy-=py;
+            font_probe_begin();
+            for(unsigned phase=1;phase<=2;phase++) {
+                web_avmedia_snapshot_probe(phase);
+                gfx_noclip(&probe);
+                gfx_fill(&probe,0,0,probe.w,probe.h,RGB(255,255,255));
+                gfx_fill_blend(&probe,x-px,y-py,w,h,bg);
+                walk(&Q);
+            }
+            if(!font_probe_end())web_avmedia_snapshot_reject();
+        }
+        web_avmedia_snapshot_finish();
+        web_frames_finish_paint(d);
+    }
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
 }
 
@@ -1200,12 +1245,19 @@ bool web_hit_test(web_doc *d, int x, int y, struct web_hit *hit) {
     P.hit = hit;
     walk(&P);
     finish_disclosure_hit(&P);
-    if (!P.hit_any) return false;
-    return hit->kind != WEB_HIT_NONE;
+    /* A later noninteractive overlay is still a hit-test target. Never keep
+       an earlier link/control merely because the overlay has no activation. */
+    bool disclosure=hit->kind==WEB_HIT_DETAILS;
+    if(!web_node_action(d,P.target,hit))return false;
+    if(hit->kind==WEB_HIT_DETAILS && !disclosure){
+        memset(hit,0,sizeof *hit);return false; /* default details body, not its legend */
+    }
+    return true;
 }
 
 web_node *web_node_at(web_doc *d, int x, int y) {
-    if (!d || !d->root_box) return NULL;
+    node_t *fallback=NULL;
+    while(d && d->root_box) {
     struct pctx P = {0};
     struct web_hit hit = {0};
     canvas_t dummy = {0};
@@ -1225,11 +1277,29 @@ web_node *web_node_at(web_doc *d, int x, int y) {
             int child_y=y-(int)box_visual_y(box)+frame->scroll_y;
             if(child_x>=frame->scroll_x && child_y>=frame->scroll_y &&
                child_x<frame->scroll_x+(int)box->w && child_y<frame->scroll_y+(int)box->h){
-                web_node *child=web_node_at(frame->document,child_x,child_y);if(child)return child;
+                fallback=P.target;d=frame->document;x=child_x;y=child_y;continue;
             }
         }
     }
-    return P.target && !web_dialog_inert(d,P.target) ? P.target : NULL;
+    return P.target && !web_dialog_inert(d,P.target) ? P.target : fallback;
+    }
+    return fallback;
+}
+
+node_t *doc_element_at(web_doc *d,int x,int y) {
+    node_t *hit=web_node_at(d,x,y);
+    /* Native input deliberately enters child viewports. A Document query must
+       instead expose the containing frame, including at cross-origin borders. */
+    while(hit && hit->owner!=d){
+        web_doc *child=hit->owner;
+        if(!child || !child->live || !child->frame_parent || !child->frame_element)return NULL;
+        struct web_frame *frame=web_frame_find(child->frame_parent,child->frame_element);
+        if(!frame || frame->detached || frame->document!=child ||
+           doc_node_root(child->frame_element,true)!=child->frame_parent->root)return NULL;
+        hit=child->frame_element;
+    }
+    if(hit && hit->type!=N_ELEM)hit=doc_flat_parent(hit);
+    return hit;
 }
 
 web_node *web_link_activation_anchor(web_doc *d, web_node *target) {
@@ -1383,10 +1453,22 @@ static void highlight(box_t *b, int off, size_t qn) {
 }
 
 int web_find(web_doc *d, const char *text, int from_y) {
+    if (!d) return -1;
+    if (!text || !*text) {
+        free(d->find_text); d->find_text = NULL;
+        if (d->root_box) clear_highlight(d->root_box);
+        return -1;
+    }
+    /* Allocate before committing, including a substring of our previous query.
+       A relayout can reuse the exact owned query without another allocation. */
+    if (text != d->find_text) {
+        char *copy = strdup(text);
+        if (!copy) return -2;
+        free(d->find_text); d->find_text = copy;
+    }
+    text = d->find_text;
     if (!d->root_box) return -1;
     clear_highlight(d->root_box);
-    snprintf(d->find_text, sizeof d->find_text, "%s", text ? text : "");
-    if (!text || !*text) return -1;
     struct fmatch F = {0};
     F.d = d;
     F.q = text;

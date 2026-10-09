@@ -381,6 +381,24 @@
         get innerHTML() { return dom('get',this,'innerHTML'); }
         set innerHTML(v) { dom('set',this,'innerHTML',String(v)); }
         get outerHTML() { return dom('get',this,'outerHTML'); }
+        set outerHTML(value) {
+            if(rawDom('get',this,'nodeType')!==1)throw new TypeError('Element receiver required');
+            const markup=value===null?'':elementURL.string(value);
+            // Conversion can move the receiver; sample its native parent only
+            // afterwards. Fragment parsing is inert, unlike contextual Range.
+            const parent=rawDom('get',this,'parentNode');
+            if(!parent)return;
+            const type=rawDom('get',parent,'nodeType');
+            if(type===9)throw new DOMException('Document elements cannot be replaced with outerHTML','NoModificationAllowedError');
+            const owner=rawDom('get',this,'ownerDocument');
+            if(rawDom('get',owner,'contentType')!=='text/html')throw new DOMException('XML fragments are not implemented','NotSupportedError');
+            customElementsBridge.reactions(()=>{
+                const context=type===11?rawDom('create',owner,1,'body',''):parent;
+                const fragment=rawDom('parseFragment',context,markup,false);
+                dom('insert',parent,fragment,this);
+                dom('remove',this);
+            });
+        }
         querySelector(selector) { return dom('query',this,String(selector),true); }
         querySelectorAll(selector) { return list(dom('query',this,String(selector),false)); }
         matches(selector) { return dom('matches',this,String(selector)); }
@@ -770,8 +788,17 @@
     function requestAnimationFrame(fn){if(typeof fn!=='function')throw new TypeError('Expected callback');return timer(2,fn,16,[]);}
     function cancelAnimationFrame(id){host.clear(Number(id));}
     function queueMicrotask(fn){return host.microtask(fn);}
-    const navigator={userAgent:'Nocturne/1.0 QuickJS',platform:'Nocturne',language:'en-US',languages:['en-US'],onLine:true};
-    Object.assign(globalThis,{document,console,navigator,Node,Element,HTMLElement,HTMLUnknownElement,HTMLIFrameElement,HTMLFrameElement,HTMLImageElement,Image,
+    const navigatorToken={},navigatorBrands=new WeakSet(),navigatorLanguages=Object.freeze(['en-US']);
+    class Navigator {
+        constructor(token){if(token!==navigatorToken)throw new TypeError('Illegal Navigator constructor');navigatorBrands.add(this);}
+    }
+    const navigator=new Navigator(navigatorToken);
+    for(const [name,value] of Object.entries({userAgent:'Nocturne/1.0 QuickJS',platform:'Nocturne',language:'en-US',languages:navigatorLanguages,onLine:true}))
+        Object.defineProperty(Navigator.prototype,name,{configurable:true,enumerable:true,get(){
+            if(!navigatorBrands.has(this))throw new TypeError('Illegal Navigator receiver');return value;
+        }});
+    Object.defineProperty(Navigator.prototype,Symbol.toStringTag,{value:'Navigator',configurable:true});
+    Object.assign(globalThis,{document,console,navigator,Navigator,Node,Element,HTMLElement,HTMLUnknownElement,HTMLIFrameElement,HTMLFrameElement,HTMLImageElement,Image,
         HTMLInputElement,HTMLButtonElement,HTMLSelectElement,HTMLTextAreaElement,HTMLFieldSetElement,HTMLObjectElement,HTMLOutputElement,HTMLOptionElement,
         HTMLScriptElement,HTMLFormElement,HTMLAnchorElement,HTMLAreaElement,
         Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,CDATASection,Comment,ProcessingInstruction,DocumentFragment,
@@ -842,6 +869,7 @@
     /* @include js_document_commands.js */
     /* @include js_frames.js */
     /* @include js_range.js */
+    /* @include js_document_selection.js */
     /* @include js_traversal.js */
     /* @include js_svg.js */
     /* @include js_attributes.js */

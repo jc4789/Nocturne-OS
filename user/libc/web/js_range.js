@@ -12,6 +12,7 @@ const rangeBridge = (() => {
     let replacing=null;
     function node(n){if(!rawDom('isNode',null,n))throw new TypeError('Expected a native Node');return n;}
     function data(r){const d=states.get(r);if(!d)throw new TypeError('Illegal Range receiver');return d;}
+    function changed(d){if(d.selectionChanged)d.selectionChanged();}
     function required(count,min){if(count<min)throw new TypeError('Missing Range arguments');}
     function string(v){if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol to DOMString');return String(v);}
     const offset=v=>(+v)>>>0;
@@ -36,6 +37,7 @@ const rangeBridge = (() => {
         validate(n,o);const p=[n,o],other=which==='start'?'end':'start';
         if(root(d.start[0])!==root(n) || compare(p,d[other])===(which==='start'?1:-1))d[other]=p.slice();
         d[which]=p;
+        changed(d);
     }
     function relative(r,which,n,after){
         const d=data(r);node(n);const p=parent(n);
@@ -48,6 +50,34 @@ const rangeBridge = (() => {
     function make(d){return register(Object.create(Range.prototype),{start:d.start.slice(),end:d.end.slice()});}
     function contained(n,d){return compare([n,0],d.start)>0 && compare([n,length(n)],d.end)<0;}
     function partial(n,d){return inside(n,d.start[0])!==inside(n,d.end[0]);}
+    function deleteRange(d){
+        if(collapsed(d))return;
+        // Snapshot the original endpoints and topmost contained nodes before
+        // native mutations move any live boundary. Only the actual DOM tree
+        // participates: do not cross shadow/template/Attr ownership edges.
+        const start=d.start.slice(),end=d.end.slice();
+        if(start[0]===end[0] && character(start[0])){
+            replace(start[0],start[1],end[1]-start[1],'');return;
+        }
+        const original={start,end},remove=[],stack=[common(original)];
+        while(stack.length){
+            const n=stack.pop();
+            if(contained(n,original)){remove.push(n);continue;}
+            const kids=children(n);for(let i=kids.length-1;i>=0;i--)stack.push(kids[i]);
+        }
+        let newNode=start[0],newOffset=start[1];
+        if(!inside(start[0],end[0])){
+            let reference=start[0],p=parent(reference);
+            while(p && !inside(p,end[0])){reference=p;p=parent(reference);}
+            newNode=p;newOffset=children(p).indexOf(reference)+1;
+        }
+        // DOM deleteContents collapses BEFORE deleting. Subsequent native
+        // removal/splice hooks also update this caret and all other ranges.
+        d.start=[newNode,newOffset];d.end=d.start.slice();changed(d);
+        if(character(start[0]))replace(start[0],start[1],length(start[0])-start[1],'');
+        for(const n of remove)dom('remove',n);
+        if(character(end[0]))replace(end[0],0,end[1],'');
+    }
     function clone(d){
         const owner=get(d.start[0],'nodeType')===9?d.start[0]:get(d.start[0],'ownerDocument');
         const fragment=rawDom('create',owner,11,'#document-fragment','');
@@ -82,13 +112,13 @@ const rangeBridge = (() => {
         setStartAfter(n){required(arguments.length,1);relative(this,'start',n,true);}
         setEndBefore(n){required(arguments.length,1);relative(this,'end',n,false);}
         setEndAfter(n){required(arguments.length,1);relative(this,'end',n,true);}
-        collapse(toStart=false){const d=data(this);if(toStart)d.end=d.start.slice();else d.start=d.end.slice();}
+        collapse(toStart=false){const d=data(this);if(toStart)d.end=d.start.slice();else d.start=d.end.slice();changed(d);}
         selectNode(n){
             const d=data(this);required(arguments.length,1);node(n);const p=parent(n);
             if(!p)throw new DOMException('The node has no parent','InvalidNodeTypeError');
-            const i=children(p).indexOf(n);d.start=[p,i];d.end=[p,i+1];
+            const i=children(p).indexOf(n);d.start=[p,i];d.end=[p,i+1];changed(d);
         }
-        selectNodeContents(n){const d=data(this);required(arguments.length,1);node(n);validate(n,0);d.start=[n,0];d.end=[n,length(n)];}
+        selectNodeContents(n){const d=data(this);required(arguments.length,1);node(n);validate(n,0);d.start=[n,0];d.end=[n,length(n)];changed(d);}
         compareBoundaryPoints(how,source){
             const d=data(this);required(arguments.length,2);how=offset(how)&65535;const other=data(source);
             if(how>3)throw new DOMException('Unknown comparison mode','NotSupportedError');
@@ -97,6 +127,7 @@ const rangeBridge = (() => {
         }
         cloneRange(){return make(data(this));}
         cloneContents(){const d=data(this);return customElementsBridge.reactions(()=>clone({start:d.start.slice(),end:d.end.slice()}));}
+        deleteContents(){const d=data(this);return customElementsBridge.reactions(()=>deleteRange(d));}
         createContextualFragment(markup){
             const d=data(this);required(arguments.length,1);markup=string(markup);
             // DOMString conversion may run author code and change the range;
@@ -155,7 +186,8 @@ const rangeBridge = (() => {
     });
     for(const [k,v] of [['START_TO_START',0],['START_TO_END',1],['END_TO_END',2],['END_TO_START',3]])
         for(const target of [Range,Range.prototype])Object.defineProperty(target,k,{value:v,enumerable:true});
-    for(const k of ['deleteContents','extractContents','insertNode','surroundContents','getClientRects','getBoundingClientRect'])
+    Object.defineProperty(Range.prototype,'deleteContents',{enumerable:true});
+    for(const k of ['extractContents','insertNode','surroundContents','getClientRects','getBoundingClientRect'])
         Object.defineProperty(Range.prototype,k,{enumerable:true,configurable:true,writable:true,value:function(){data(this);
             throw new DOMException('Range '+k+' is not implemented','NotSupportedError');
         }});
@@ -204,7 +236,10 @@ const rangeBridge = (() => {
         }else for(const child of children(n))remove(child);
         return ranges;
     }
-    function after(ranges){if(!ranges)return;for(const r of ranges){r.d.start=r.start;r.d.end=r.end;}}
+    function after(ranges){if(!ranges)return;for(const r of ranges){
+        const moved=r.d.start[0]!==r.start[0]||r.d.start[1]!==r.start[1]||r.d.end[0]!==r.end[0]||r.d.end[1]!==r.end[1];
+        r.d.start=r.start;r.d.end=r.end;if(moved)changed(r.d);
+    }}
 
     // Keep splice provenance rather than guessing a diff between two strings:
     // repeated characters and same-value replacements still have DOM semantics.
@@ -219,5 +254,6 @@ const rangeBridge = (() => {
     CharacterData.prototype.insertData=function(at,value){characterDataBrand(this);required(arguments.length,2);at=offset(at);value=string(value);replace(this,at,0,value);};
     CharacterData.prototype.deleteData=function(at,count){characterDataBrand(this);required(arguments.length,2);at=offset(at);count=offset(count);replace(this,at,count,'');};
     CharacterData.prototype.replaceData=function(at,count,value){characterDataBrand(this);required(arguments.length,3);at=offset(at);count=offset(count);value=string(value);replace(this,at,count,value);};
-    return {before,after};
+    return {before,after,isRange:r=>states.has(r),boundaries:r=>{const d=data(r);return {start:d.start.slice(),end:d.end.slice()};},comparePoints:compare,
+        listen:(r,listener)=>{data(r).selectionChanged=listener;}};
 })();

@@ -3,10 +3,12 @@
    need, list items get markers, ::before/::after become boxes, and replaced elements (images,
    form controls, inline SVG) become atomic boxes. */
 #include <stdio.h>
+#include <nocturne.h>
 #include "webi.h"
 #include "web_dialog.h"
 #include "elements.h"
 #include "svg_geometry.h"
+#include "avmedia.h"
 
 struct bctx {
     web_doc *d;
@@ -277,11 +279,14 @@ static void make_marker(struct bctx *b, box_t *x, node_t *n, style_t *st) {
 
 /* ---------------------------------------------------------------- inline SVG */
 static node_t *find_id(node_t *n, const char *id) {
-    for (node_t *c = n->first; c; c = c->next) {
-        if (c->type != N_ELEM) continue;
-        if (c->id && !strcmp(c->id, id)) return c;
-        node_t *r = find_id(c, id);
-        if (r) return r;
+    for (node_t *c = n->first; c;) {
+        if (c->type == N_ELEM) {
+            if (c->id && !strcmp(c->id, id)) return c;
+            if (c->first) { c = c->first; continue; }
+        }
+        while (c != n && !c->next) c = c->parent;
+        if (c == n) break;
+        c = c->next;
     }
     return NULL;
 }
@@ -297,46 +302,7 @@ static void xml_escape(sbuf *b, const char *s, size_t n, bool attr) {
     }
 }
 
-static void svg_ser(web_doc *d, sbuf *b, node_t *n, const char *color, int depth) {
-    if (depth > 64) return;
-    if (n->type == N_TEXT) {
-        xml_escape(b, n->text, n->textlen, false);
-        return;
-    }
-    if (n->type != N_ELEM) return;
-    float viewbox[4];
-    int view = n->tag == T_svg ? svg_viewbox(node_attr(n, "viewBox"), viewbox) : 0;
-    if (view == 2) return; /* valid zero viewport suppresses its contents */
-    if (!strcmp(n->name, "use")) { /* inline what it refers to: nanosvg has no <use> */
-        const char *h = node_attr(n, "href");
-        if (!h) {
-            int index = doc_attr_index(n, "http://www.w3.org/1999/xlink", "href", true);
-            if (index >= 0) h = n->attrs[index].value;
-        }
-        node_t *scope = doc_node_root(n, false);
-        node_t *t = h && h[0] == '#' && scope ? find_id(scope, h + 1) : NULL;
-        if (t && depth < 32) {
-            sb_puts(b, "<g");
-            const char *x = node_attr(n, "x"), *y = node_attr(n, "y");
-            if (x || y) {
-                char tr[96];
-                snprintf(tr, sizeof tr, " transform=\"translate(%s %s)\"", x ? x : "0", y ? y : "0");
-                sb_puts(b, tr);
-            }
-            const char *f = node_attr(n, "fill");
-            if (f) {
-                sb_puts(b, " fill=\"");
-                xml_escape(b, strstr(f, "currentColor") ? color : f, strlen(strstr(f, "currentColor") ? color : f), true);
-                sb_puts(b, "\"");
-            }
-            sb_puts(b, ">");
-            if (!strcmp(t->name, "symbol"))
-                for (node_t *c = t->first; c; c = c->next) svg_ser(d, b, c, color, depth + 1);
-            else svg_ser(d, b, t, color, depth + 1);
-            sb_puts(b, "</g>");
-        }
-        return;
-    }
+static void svg_open(sbuf *b, node_t *n, const char *color, int view, bool root) {
     sb_putc(b, '<');
     sb_puts(b, n->raw_name);
     bool xmlns = false;
@@ -374,7 +340,7 @@ static void svg_ser(web_doc *d, sbuf *b, node_t *n, const char *color, int depth
         }
         sb_putc(b, '"');
     }
-    if (depth == 0) {
+    if (root) {
         if (!xmlns) sb_puts(b, " xmlns=\"http://www.w3.org/2000/svg\"");
         if (!node_attr(n, "fill")) {
             sb_puts(b, " fill=\"");
@@ -383,10 +349,85 @@ static void svg_ser(web_doc *d, sbuf *b, node_t *n, const char *color, int depth
         }
     }
     sb_putc(b, '>');
-    for (node_t *c = n->first; c; c = c->next) svg_ser(d, b, c, color, depth + 1);
-    sb_puts(b, "</");
-    sb_puts(b, n->raw_name);
-    sb_putc(b, '>');
+}
+
+struct svg_walk {
+    struct svg_walk *parent;
+    node_t *node, *next;
+    unsigned kind; /* 0=entry, 1=element, 2=use group, 3=virtual symbol */
+};
+
+static bool svg_use_cycle(const struct svg_walk *f, node_t *target) {
+    /* Reject actual shadow-including ancestor references as well as a virtual
+       use-instance ancestor. A sibling can refer to the same graphic again. */
+    for (node_t *n = f->node; n; n = n->parent ? n->parent : n->shadow_host)
+        if (n == target) return true;
+    for (; f; f = f->parent) if (f->node == target) return true;
+    return false;
+}
+
+static bool svg_ser(web_doc *d, sbuf *b, node_t *root, const char *color) {
+    (void)d;
+    struct svg_walk *active = calloc(1, sizeof *active);
+    if (!active) return false;
+    active->node = root;
+    bool failed = false;
+    while (active) {
+        struct svg_walk *f = active;
+        node_t *n = f->node;
+        if (!f->kind) {
+            if (n->type == N_TEXT) xml_escape(b, n->text, n->textlen, false);
+            if (n->type != N_ELEM) goto pop;
+            float viewbox[4];
+            int view = n->tag == T_svg ? svg_viewbox(node_attr(n, "viewBox"), viewbox) : 0;
+            if (view == 2) goto pop;
+            if (!strcmp(n->name, "use")) {
+                const char *h = node_attr(n, "href");
+                if (!h) {
+                    int index = doc_attr_index(n, "http://www.w3.org/1999/xlink", "href", true);
+                    if (index >= 0) h = n->attrs[index].value;
+                }
+                node_t *scope = doc_node_root(n, false);
+                node_t *t = h && h[0] == '#' && scope ? find_id(scope, h + 1) : NULL;
+                if (!t || svg_use_cycle(f, t)) goto pop;
+                struct svg_walk *child = calloc(1, sizeof *child);
+                if (!child) { failed = true; break; }
+                child->parent = f; child->node = t;
+                if (!strcmp(t->name, "symbol")) { child->kind = 3; child->next = t->first; }
+                sb_puts(b, "<g");
+                const char *x = node_attr(n, "x"), *y = node_attr(n, "y");
+                if (x || y) {
+                    sb_puts(b, " transform=\"translate(");
+                    xml_escape(b, x ? x : "0", strlen(x ? x : "0"), true);
+                    sb_putc(b, ' ');
+                    xml_escape(b, y ? y : "0", strlen(y ? y : "0"), true);
+                    sb_puts(b, ")\"");
+                }
+                const char *fill = node_attr(n, "fill");
+                if (fill) {
+                    const char *value = strstr(fill, "currentColor") ? color : fill;
+                    sb_puts(b, " fill=\""); xml_escape(b, value, strlen(value), true); sb_putc(b, '"');
+                }
+                sb_putc(b, '>'); f->kind = 2; active = child;
+                continue;
+            }
+            svg_open(b, n, color, view, !f->parent);
+            f->kind = 1; f->next = n->first;
+        }
+        if (f->next) {
+            struct svg_walk *child = calloc(1, sizeof *child);
+            if (!child) { failed = true; break; }
+            child->node = f->next; child->parent = f;
+            f->next = f->next->next; active = child;
+            continue;
+        }
+        if (f->kind == 1) { sb_puts(b, "</"); sb_puts(b, n->raw_name); sb_putc(b, '>'); }
+        else if (f->kind == 2) sb_puts(b, "</g>");
+pop:
+        active = f->parent; free(f);
+    }
+    while (active) { struct svg_walk *parent = active->parent; free(active); active = parent; }
+    return !failed;
 }
 
 struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color) {
@@ -397,8 +438,11 @@ struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color) {
     char hex[16];
     snprintf(hex, sizeof hex, "#%06x", color & 0xFFFFFF);
     sbuf b = {0};
-    svg_ser(d, &b, svg, hex, 0);
+    if (!svg_ser(d, &b, svg, hex)) {
+        sb_free(&b); web_js_console(d, 2, "SVG serialization traversal allocation failed"); return NULL;
+    }
     struct svg_cache *c = calloc(1, sizeof *c);
+    if (!c) { sb_free(&b); web_js_console(d, 2, "SVG cache allocation failed"); return NULL; }
     c->node = svg;
     c->n = b.n;
     c->src = b.p ? b.p : strdup("");
@@ -531,6 +575,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
 }
 
 static void gen(struct bctx *b, box_t *pb, node_t *n, style_t *pst) {
+    web_avmedia_checkpoint();
     if (n->type == N_TEXT) {
         if (pst && n->textlen) text_box(b, pb, n, n->text, n->textlen, pst);
         return;

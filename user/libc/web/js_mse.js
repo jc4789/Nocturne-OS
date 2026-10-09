@@ -10,7 +10,7 @@ const mseBridge = (() => {
     const getter=(p,k)=>Object.getOwnPropertyDescriptor(p,k).get;
     const taBuffer=getter(ta,'buffer'),taOffset=getter(ta,'byteOffset'),taLength=getter(ta,'byteLength'),taTag=getter(ta,Symbol.toStringTag);
     const abLength=getter(AB.prototype,'byteLength'),dvBuffer=getter(DataView.prototype,'buffer'),dvOffset=getter(DataView.prototype,'byteOffset'),dvLength=getter(DataView.prototype,'byteLength'),set=U8.prototype.set;
-    const EventType=Event,ErrorType=DOMException,token={},schedule=(fn)=>host.timer(0,fn,0,[]),MAX=32*1024*1024;
+    const EventType=Event,ErrorType=DOMException,token={},schedule=(fn)=>host.timer(0,fn,0,[]);
     const read=(map,value,label)=>{const s=apply(get,map,[value]);if(!s)throw new TypeError('Illegal '+label+' receiver');return s;};
     cloneData.registerUncloneable(value=>apply(get,sources,[value])!==undefined||apply(get,buffers,[value])!==undefined||apply(get,lists,[value])!==undefined||apply(get,ranges,[value])!==undefined||apply(get,tracksData,[value])!==undefined||apply(get,trackSlots,[value])!==undefined);
     const source=v=>read(sources,v,'MediaSource'),buffer=v=>read(buffers,v,'SourceBuffer');
@@ -19,15 +19,12 @@ const mseBridge = (() => {
     const finite=v=>{const n=+v;if(!Number.isFinite(n))throw new TypeError('Expected finite number');return n;};
     function fire(target,type){const e=new EventType(type);e.isTrusted=true;dispatch(target,e);}
     function queue(target,type){schedule(()=>fire(target,type));}
-    function bytes(value,quota){
+    function bytes(value){
         let b=value,o=0,n;
         if(isView(value)){const typed=apply(taTag,value,[])!==undefined;b=apply(typed?taBuffer:dvBuffer,value,[]);o=apply(typed?taOffset:dvOffset,value,[]);n=apply(typed?taLength:dvLength,value,[]);}
         const size=apply(abLength,b,[]),input=new U8(b,o,n===undefined?size:n);n=apply(taLength,input,[]);
-        if(n>MAX)throw error('QuotaExceededError','Append exceeds 32 MiB');
-        // Reject a full native buffer before allocating a fragment snapshot.
-        // The snapshot remains required: author mutations after append cannot
-        // change the asynchronously parsed bytes.
-        if(n>quota)throw error('QuotaExceededError','Native media buffer quota exceeded');
+        // Snapshot remains required: later author mutations cannot change
+        // asynchronous parser input. Real backing allocation may fail.
         const out=new U8(n);apply(set,out,[input]);return apply(taBuffer,out,[]);
     }
     class TimeRanges {
@@ -113,11 +110,10 @@ const mseBridge = (() => {
             if(s.epoch!==epoch||s.removed||source(s.parent).node!==node||source(s.parent).generation!==generation)return;
             try{
                 if(!callback(p))throw new TypeError(native('state',p.node).error||'Media segment processing failed');
-                const deadline=host.now()+30000;
                 const poll=()=>{
                     if(s.epoch!==epoch||s.removed||source(s.parent).node!==node||source(s.parent).generation!==generation)return;
                     try{const state=native('state',p.node);if(state.error)throw state.mseQuotaError?error('QuotaExceededError',state.error):new TypeError(state.error);
-                        if(state.msePending){if(host.now()>deadline)throw new Error('MSE worker deadline exceeded');s.timer=host.timer(0,poll,10,[]);return;}
+                        if(state.msePending){s.timer=host.timer(0,poll,10,[]);return;}
                         if(s.mode==='sequence'){const info=native('mseInfo',p.node,s.id);if(Number.isFinite(info.sequenceOffset))s.offset=info.sequenceOffset;}
                         updateDuration(p);completed(object,s,epoch,'update');
                     }catch(e){fail(e);}
@@ -150,7 +146,7 @@ const mseBridge = (() => {
         appendBuffer(value){
             if(!arguments.length)throw new TypeError('BufferSource required');const s=buffer(this),p=mutable(s);
             if(native('state',p.node).error)throw error('InvalidStateError','Media element has an error');
-            const data=bytes(value,native('mseQuota',p.node,s.id));
+            const data=bytes(value);
             operation(this,s,parent=>native('mseAppend',parent.node,s.id,data,s.offset,s.start,s.end,s.mode==='sequence'));
         }
         abort(){const s=buffer(this),p=live(s);if(p.state!=='open')throw error('InvalidStateError','MediaSource is not open');
@@ -175,7 +171,7 @@ const mseBridge = (() => {
         get duration(){return source(this).duration;}
         set duration(value){const p=source(this),n=+value;idle(p);if(Number.isNaN(n)||n<0)throw new TypeError('Invalid media duration');if(!native('mseDuration',p.node,n))throw error('InvalidStateError','Native duration change failed');p.duration=n;}
         addSourceBuffer(value){if(!arguments.length)throw new TypeError('Type required');const p=source(this),type=str(value);if(!type)throw new TypeError('Type is empty');if(!support(type))throw error('NotSupportedError','Unsupported MSE type');if(p.state!=='open')throw error('InvalidStateError','MediaSource is not open');
-            if(p.buffers.length>=2)throw error('QuotaExceededError','At most two SourceBuffers');const id=p.nextId++;
+            if(p.nextId>0xffffffff)throw new RangeError('SourceBuffer id representation');const id=p.nextId++;
             if(!native('mseAdd',p.node,id,type))throw error('QuotaExceededError','Native SourceBuffer could not be created');
             const s=new SourceBuffer(token,this,id,type);add(p.buffers,s);return s;
         }
@@ -190,11 +186,11 @@ const mseBridge = (() => {
                 p.duration=highest;
                 /* EOS can finish the final open-sized Cluster/fragment in the
                  * child. Never trim/clamp to ranges cached before its ACK. */
-                const node=p.node,generation=p.generation,deadline=host.now()+30000;
+                const node=p.node,generation=p.generation;
                 const finish=()=>{
                     if(p.node!==node||p.generation!==generation||p.state!=='ended')return;
                     const state=native('state',node);if(state.error)return;
-                    if(state.msePending){if(host.now()<deadline)host.timer(0,finish,10,[]);return;}
+                    if(state.msePending){host.timer(0,finish,10,[]);return;}
                     let end=0;for(const sb of p.buffers){const s=buffer(sb),a=native('mseRanges',node,s.id);for(let i=0;i<a.length;i++)end=Math.max(end,a[i][1]);}
                     p.duration=end;native('mseDuration',node,end);
                 };

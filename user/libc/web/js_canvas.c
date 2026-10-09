@@ -1,5 +1,5 @@
 /* Actual Canvas2D RAM bitmap. No dummy WebGL or falsely successful methods.
- * Per-document bitmap memory and per-path work are bounded. Attribute changes
+ * Bitmap/temporary storage follows real allocation and size representation. Attribute changes
  * release/reset the bitmap, detached nodes remain allocation-document owned. */
 #include "js_canvas.h"
 #include "js_memory.h"
@@ -11,11 +11,6 @@
 #include <math.h>
 #include <float.h>
 
-#define CANVAS_MAX_PIXELS (1u<<20)
-#define CANVAS_BUDGET (16u<<20)
-#define MAX_POINTS 8192
-#define PATH_SCAN_BUDGET (8u<<20)
-#define PATH_STROKE_BUDGET (16u<<20)
 /* Immutable clip masks share ownership across save()/restore(). Every live
  * mask (including saved states) is charged to the allocation document. */
 struct canvas_clip { unsigned refs; size_t bytes; uint8_t pixels[]; };
@@ -24,10 +19,37 @@ struct web_canvas {
     uint32_t *pixels;
     size_t bytes;
     bool tainted;
-    struct canvas_clip *clip,*saved_clip[64];
-    unsigned saved_count;
+    struct canvas_clip *clip,**saved_clip;
+    size_t saved_count,saved_capacity,saved_bytes;
 };
 static web_doc *allocation_doc(node_t *n) { return n->allocation_doc?n->allocation_doc:n->owner; }
+/* Native bitmap/gfx dimensions and pitch are int. No area or document quota:
+ * reject only unrepresentable sizes, accounting overflow, or actual OOM. */
+static bool canvas_extent(size_t w,size_t h,size_t pixel_bytes,size_t *bytes) {
+    if (!w || !h || w>INT32_MAX || h>INT32_MAX || !pixel_bytes || h>SIZE_MAX/w || w*h>SIZE_MAX/pixel_bytes) return false;
+    *bytes=w*h*pixel_bytes; return true;
+}
+static bool canvas_room(const web_doc *d,size_t bytes) {
+    return d && bytes<=SIZE_MAX-d->canvas_bytes;
+}
+static bool canvas_save(node_t *n,struct web_canvas *c) {
+    if (c->clip && c->clip->refs==UINT32_MAX) return false;
+    if (c->saved_count==c->saved_capacity) {
+        if (c->saved_count==SIZE_MAX/sizeof *c->saved_clip) return false;
+        size_t capacity=c->saved_capacity?c->saved_capacity:8,required=c->saved_count+1;
+        if (capacity<required) capacity=capacity>SIZE_MAX/sizeof *c->saved_clip/2?required:capacity*2;
+        if (capacity>SIZE_MAX/sizeof *c->saved_clip) return false;
+        size_t bytes=capacity*sizeof *c->saved_clip,extra=bytes-c->saved_bytes;
+        web_doc *d=allocation_doc(n);
+        if (!canvas_room(d,extra)) return false;
+        struct canvas_clip **saved=realloc(c->saved_clip,bytes);
+        if (!saved) return false;
+        c->saved_clip=saved;c->saved_capacity=capacity;c->saved_bytes=bytes;d->canvas_bytes+=extra;
+    }
+    c->saved_clip[c->saved_count++]=c->clip;
+    if (c->clip) c->clip->refs++;
+    return true;
+}
 static void clip_release(node_t *n,struct canvas_clip *clip) {
     if (!clip || --clip->refs) return;
     web_doc *d=allocation_doc(n);
@@ -56,9 +78,11 @@ static void release(node_t *n) {
     if (!c) return;
     free(c->pixels); c->pixels=NULL;
     clip_release(n,c->clip); c->clip=NULL;
-    while (c->saved_count) { unsigned i=--c->saved_count; clip_release(n,c->saved_clip[i]); c->saved_clip[i]=NULL; }
+    while (c->saved_count) { size_t i=--c->saved_count; clip_release(n,c->saved_clip[i]); }
     web_doc *d=n->allocation_doc?n->allocation_doc:n->owner;
     if (d && d->canvas_bytes>=c->bytes) d->canvas_bytes-=c->bytes;
+    if (d && d->canvas_bytes>=c->saved_bytes) d->canvas_bytes-=c->saved_bytes;
+    free(c->saved_clip);c->saved_clip=NULL;c->saved_capacity=c->saved_bytes=0;
     c->bytes=0;
 }
 void web_canvas_free(node_t *n) { if (n) { release(n); free(n->canvas); n->canvas=NULL; } }
@@ -76,11 +100,10 @@ static struct web_canvas *ensure(node_t *n) {
     if (c->w!=w || c->h!=h) { release(n); c->w=w; c->h=h; c->generation++; c->tainted=false; }
     if (!w || !h) return c;
     if (c->pixels) return c;
-    if ((uint64_t)w*h>CANVAS_MAX_PIXELS) return NULL;
     web_doc *d=n->allocation_doc?n->allocation_doc:n->owner;
-    size_t bytes=(size_t)w*h*4;
-    if (!d || d->canvas_bytes>CANVAS_BUDGET || bytes>CANVAS_BUDGET-d->canvas_bytes) return NULL;
-    c->pixels=calloc((size_t)w*h,4);
+    size_t bytes;
+    if (!canvas_extent(w,h,4,&bytes) || !canvas_room(d,bytes)) return NULL;
+    c->pixels=calloc(1,bytes);
     if (!c->pixels) return NULL;
     c->bytes=bytes; d->canvas_bytes+=bytes;
     return c;
@@ -99,10 +122,15 @@ static JSValue canvas_export(JSContext *ctx,node_t *n,struct web_canvas *c,bool 
     if (c && c->tainted) return JS_FALSE; /* JS throws SecurityError synchronously. */
     if (!c || !c->w || !c->h || !c->pixels) return data_url?JS_NewString(ctx,"data:,"):JS_NULL;
     size_t png_size=png_encode_rgba_bound((int)c->w,(int)c->h);
-    size_t url_size=data_url?22+((png_size+2)/3)*4:0;
-    size_t reserve=png_size+(data_url?url_size+1:0);
+    size_t url_size=0,reserve=png_size;
+    if (data_url) {
+        if (png_size>SIZE_MAX-2 || (png_size+2)/3>(SIZE_MAX-23)/4) return JS_NewString(ctx,"data:,");
+        url_size=22+((png_size+2)/3)*4;
+        if (url_size+1>SIZE_MAX-reserve) return JS_NewString(ctx,"data:,");
+        reserve+=url_size+1;
+    }
     web_doc *d=allocation_doc(n);
-    if (!png_size || !d || d->canvas_bytes>CANVAS_BUDGET || reserve>CANVAS_BUDGET-d->canvas_bytes)
+    if (!png_size || !canvas_room(d,reserve))
         return data_url?JS_NewString(ctx,"data:,"):JS_NULL;
     d->canvas_bytes+=reserve;
     uint8_t *png=NULL; size_t size=0; JSValue out;
@@ -182,7 +210,7 @@ static bool image_gpu_blit(struct web_canvas *c,web_doc *allocation,const uint32
     for (unsigned y=y0;y<y0+ch;y++) for (unsigned x=x0;x<x0+cw;x++)
         if (pixels[(size_t)y*w+x]>>24!=255) return false;
     size_t bytes=(size_t)(unsigned)dw*(unsigned)dh*4;
-    if (!allocation || allocation->canvas_bytes>CANVAS_BUDGET || bytes>CANVAS_BUDGET-allocation->canvas_bytes) return false;
+    if (!canvas_room(allocation,bytes)) return false;
     uint32_t *output=malloc(bytes);
     if (!output) return false;
     allocation->canvas_bytes+=bytes;
@@ -221,7 +249,7 @@ JSValue web_canvas_draw_image(JSContext *ctx,node_t *n,node_t *source,int argc,J
     if (source->tag==T_canvas) {
         if (!web_canvas_dimension(source,"width") || !web_canvas_dimension(source,"height")) return JS_NewInt32(ctx,1);
         struct web_canvas *src=ensure(source);
-        if (!src) return JS_ThrowRangeError(ctx,"Canvas bitmap memory limit");
+        if (!src) return JS_ThrowOutOfMemory(ctx);
         pixels=src->pixels; w=src->w; h=src->h; tainted=src->tainted;
     } else {
         web_doc *d=source->owner;
@@ -246,7 +274,7 @@ JSValue web_canvas_draw_image(JSContext *ctx,node_t *n,node_t *source,int argc,J
     if (dw<0) { dx+=dw; dw=-dw; } if (dh<0) { dy+=dh; dh=-dh; }
     bool crop_inside=sx>=0 && sy>=0 && sx+sw<=w && sy+sh<=h;
     struct web_canvas *c=ensure(n);
-    if (!c) return JS_ThrowRangeError(ctx,"Canvas bitmap memory limit");
+    if (!c) return JS_ThrowOutOfMemory(ctx);
     /* Clearing/putImageData never untaints; only resetting bitmap dimensions
        does. A fully clipped or zero-alpha draw still carries the origin. */
     if (tainted) c->tainted=true;
@@ -271,8 +299,7 @@ JSValue web_canvas_draw_image(JSContext *ctx,node_t *n,node_t *source,int argc,J
     web_doc *allocation=n->allocation_doc?n->allocation_doc:n->owner;
     if (source==n) {
         bytes=(size_t)w*h*4;
-        if (!allocation || allocation->canvas_bytes>CANVAS_BUDGET || bytes>CANVAS_BUDGET-allocation->canvas_bytes)
-            return JS_ThrowRangeError(ctx,"Canvas snapshot memory limit");
+        if (!canvas_room(allocation,bytes)) return JS_ThrowRangeError(ctx,"Canvas snapshot accounting overflow");
         snapshot=malloc(bytes);
         if (!snapshot) return JS_ThrowOutOfMemory(ctx);
         allocation->canvas_bytes+=bytes; memcpy(snapshot,pixels,bytes); pixels=snapshot;
@@ -284,7 +311,7 @@ JSValue web_canvas_draw_image(JSContext *ctx,node_t *n,node_t *source,int argc,J
         free(snapshot); if (bytes) allocation->canvas_bytes-=bytes;
         changed(n); return JS_UNDEFINED;
     }
-    /* Work is bounded by the destination bitmap (at most 1M pixels), not
+    /* Work is clipped by the actual destination bitmap, not
        author dimensions. Only finite, clamped source positions become indices. */
     for (int y=y0;y<y1;y++) for (int x=x0;x<x1;x++) {
         if (!visible(c,x,y)) continue;
@@ -443,7 +470,7 @@ static bool segment_outline(const double *a,const double *b,double half,double *
     for(unsigned i=0;i<8;i++)if(!isfinite(out[i]))return false;
     return true;
 }
-static bool stroke_shape(struct web_canvas *c,const double *matrix,const double *outline,unsigned count,uint8_t *mask,size_t *work) {
+static bool stroke_shape(struct web_canvas *c,const double *matrix,const double *outline,unsigned count,uint8_t *mask) {
     double transformed[8];
     for(unsigned i=0;i<count;i++){
         double x=outline[i*2],y=outline[i*2+1];
@@ -455,14 +482,12 @@ static bool stroke_shape(struct web_canvas *c,const double *matrix,const double 
     for(unsigned i=1;i<count;i++){ax=fmin(ax,transformed[i*2]);ay=fmin(ay,transformed[i*2+1]);bx=fmax(bx,transformed[i*2]);by=fmax(by,transformed[i*2+1]);}
     unsigned x0=(unsigned)fmax(0,fmin(c->w,floor(ax))),y0=(unsigned)fmax(0,fmin(c->h,floor(ay)));
     unsigned x1=(unsigned)fmax(0,fmin(c->w,ceil(bx))),y1=(unsigned)fmax(0,fmin(c->h,ceil(by)));
-    size_t area=(size_t)(x1-x0)*(y1-y0);
-    if(area>PATH_STROKE_BUDGET-*work)return false;*work+=area;
     for(unsigned y=y0;y<y1;y++)for(unsigned x=x0;x<x1;x++)
         if(visible(c,x,y)&&path_hit(transformed,count,x+0.5,y+0.5,false))mask[(size_t)y*c->w+x]=1;
     return true;
 }
 static bool stroke_mask(struct web_canvas *c,const double *points,size_t count,double width,const double *matrix,uint8_t *mask) {
-    size_t first=0,work=0;
+    size_t first=0;
     while(first<count){
         while(first<count&&(!isfinite(points[first*2])||!isfinite(points[first*2+1])))first++;
         size_t end=first;while(end<count&&isfinite(points[end*2])&&isfinite(points[end*2+1]))end++;
@@ -470,16 +495,16 @@ static bool stroke_mask(struct web_canvas *c,const double *points,size_t count,d
         for(size_t i=first+1;i<end;i++){
             const double *a=points+previous*2,*b=points+i*2;if(a[0]==b[0]&&a[1]==b[1])continue;
             double outline[8];
-            if(!segment_outline(a,b,width/2,outline)||!stroke_shape(c,matrix,outline,4,mask,&work))return false;
+            if(!segment_outline(a,b,width/2,outline)||!stroke_shape(c,matrix,outline,4,mask))return false;
             size_t next=i+1;while(next<end&&points[next*2]==b[0]&&points[next*2+1]==b[1])next++;
-            if(next<end){unsigned n=join_outline(a,b,points+next*2,width/2,outline);if(n&&!stroke_shape(c,matrix,outline,n,mask,&work))return false;}
+            if(next<end){unsigned n=join_outline(a,b,points+next*2,width/2,outline);if(n&&!stroke_shape(c,matrix,outline,n,mask))return false;}
             previous=i;
         }
         if(end<count&&points[end*2+1]==INFINITY&&end-first>2){
             size_t before=end-2;while(before>first&&points[before*2]==points[first*2]&&points[before*2+1]==points[first*2+1])before--;
             size_t after=first+1;while(after<end&&points[after*2]==points[first*2]&&points[after*2+1]==points[first*2+1])after++;
             if(after<end){double outline[8];unsigned n=join_outline(points+before*2,points+first*2,points+after*2,width/2,outline);
-                if(n&&!stroke_shape(c,matrix,outline,n,mask,&work))return false;}
+                if(n&&!stroke_shape(c,matrix,outline,n,mask))return false;}
         }
         first=end+1;
     }
@@ -503,7 +528,7 @@ static void intersection_sort(struct intersection *v,size_t n) {
 static void polygon(struct web_canvas *c,const double *points,size_t count,uint32_t color,bool evenodd,bool clear,uint8_t *mask,struct intersection *hits) {
     if ((!c->pixels && !mask) || count<3) return;
     for (unsigned y=0;y<c->h;y++) {
-        unsigned n=0; double yy=y+0.5;
+        size_t n=0; double yy=y+0.5;
         size_t first=0;
         while (first<count) {
             while (first<count && (!isfinite(points[first*2]) || !isfinite(points[first*2+1]))) first++;
@@ -513,14 +538,14 @@ static void polygon(struct web_canvas *c,const double *points,size_t count,uint3
                 size_t j=i+1<end?i+1:first;
                 double x0=points[i*2],y0=points[i*2+1],x1=points[j*2],y1=points[j*2+1];
                 double hit;
-                if (edge_intersection(x0,y0,x1,y1,yy,&hit) && n<MAX_POINTS)
+                if (edge_intersection(x0,y0,x1,y1,yy,&hit))
                     hits[n++]=(struct intersection){hit,y1>y0?1:-1};
             }
             first=end+1;
         }
         intersection_sort(hits,n);
         int winding=0;
-        for (unsigned i=0;i+1<n;i++) {
+        for (size_t i=0;i+1<n;i++) {
             winding=evenodd?(winding^1):winding+hits[i].direction;
             if (!winding) continue;
             double from=fmax(0,fmin(c->w,hits[i].x)),to=fmax(0,fmin(c->w,hits[i+1].x));
@@ -553,8 +578,9 @@ static void text_free(node_t *n,struct canvas_text *t) {
     t->pixels=NULL; t->bytes=0;
 }
 static int text_raster(JSContext *ctx,node_t *n,const char *text,size_t length,double px,unsigned style,unsigned family,struct canvas_text *t) {
-    if (length>16384 || !isfinite(px) || px<0 || px>512 || style>3 || family>FONT_FAMILY_MONO) {
-        JS_ThrowRangeError(ctx,"Canvas text limit"); return -1;
+    /* The existing font renderer stores quarter-pixel size in uint16_t. */
+    if (!isfinite(px) || px<0 || px>(UINT16_MAX-0.5)/4 || style>3 || family>FONT_FAMILY_MONO) {
+        JS_ThrowRangeError(ctx,"Canvas font representation"); return -1;
     }
     wfont f={.ttf=font_family(family,style),.px=(float)px,.bold=(style&FONT_BOLD)!=0};
     float ascent,descent;
@@ -562,17 +588,17 @@ static int text_raster(JSContext *ctx,node_t *n,const char *text,size_t length,d
     t->ascent=ascent; t->descent=descent;
     if (!length || !px) return 0;
     /* Extra bearings cover italic and fallback glyphs without clipping to the
-     * advance width. Both the scratch allocation and work have hard bounds. */
+     * advance width. Scratch follows actual allocation and gfx int geometry. */
     t->pad=(unsigned)ceil(px)+2;
     double w=ceil(t->width)+2*t->pad,h=ceil(ascent+descent)+2*t->pad;
-    if (!isfinite(w) || !isfinite(h) || w<1 || h<1 || w>32768 || h>4096 || w*h>CANVAS_MAX_PIXELS) {
-        JS_ThrowRangeError(ctx,"Canvas text bitmap limit"); return -1;
+    size_t bytes;
+    if (!isfinite(w) || !isfinite(h) || w<1 || h<1 || w>INT32_MAX || h>INT32_MAX || !canvas_extent((size_t)w,(size_t)h,4,&bytes)) {
+        JS_ThrowRangeError(ctx,"Canvas text bitmap representation"); return -1;
     }
     t->w=(unsigned)w; t->h=(unsigned)h; t->baseline=t->pad+(unsigned)ceil(ascent);
-    size_t bytes=(size_t)t->w*t->h*4;
     web_doc *d=allocation_doc(n);
-    if (!d || d->canvas_bytes>CANVAS_BUDGET || bytes>CANVAS_BUDGET-d->canvas_bytes) {
-        JS_ThrowRangeError(ctx,"Canvas text memory limit"); return -1;
+    if (!canvas_room(d,bytes)) {
+        JS_ThrowRangeError(ctx,"Canvas text accounting overflow"); return -1;
     }
     t->pixels=calloc(1,bytes);
     if (!t->pixels) { JS_ThrowOutOfMemory(ctx); return -1; }
@@ -674,11 +700,11 @@ static JSValue canvas_font(JSContext *ctx,node_t *n,JSValueConst value) {
     for (unsigned i=0;i<sizeof wide/sizeof *wide;i++)
         if (trimmed_length==strlen(wide[i]) && !strncasecmp(trimmed,wide[i],trimmed_length)) goto done;
     const struct propdef *font=css_prop_lookup("font",4);
-    if (length<=1024 && css_value_supported(font,text,length)) {
+    if (css_value_supported(font,text,length)) {
         arena_t *arena=calloc(1,sizeof *arena);
         if (!arena) out=JS_ThrowOutOfMemory(ctx);
         else {
-            arena->limit=1u<<16; jmp_buf trap; arena->trap=&trap;
+            jmp_buf trap; arena->trap=&trap;
             if (!setjmp(trap)) {
                 style_t parent,st; css_style_init(&parent,NULL);
                 if (n->style) parent=*n->style;
@@ -695,6 +721,7 @@ static JSValue canvas_font(JSContext *ctx,node_t *n,JSValueConst value) {
                     }
                 }
             }
+            else out=JS_ThrowOutOfMemory(ctx);
             ar_free(arena); free(arena);
         }
     }
@@ -735,7 +762,7 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
         /* Pure geometry: no bitmap allocation, taint read, clip sampling,
            painting or dirty/generation mutation. Queries may be off-canvas. */
         size_t bytes=0; uint8_t *data=argc>1?JS_GetArrayBuffer(ctx,&bytes,argv[1]):NULL;
-        if (!data || bytes%16 || bytes/16>MAX_POINTS) { out=JS_ThrowRangeError(ctx,"Canvas path limit"); goto done; }
+        if (!data || bytes%16) { out=JS_ThrowTypeError(ctx,"Invalid Canvas path packet"); goto done; }
         double query[2]; int numbers=numeric(ctx,argc,argv,2,query,2);
         if (numbers<0) { out=JS_EXCEPTION; goto done; }
         if (!numbers) { out=JS_FALSE; goto done; }
@@ -757,13 +784,11 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
     } else {
         struct web_canvas *c=ensure(n);
         if (!strcmp(op,"png") || !strcmp(op,"dataURL")) { out=canvas_export(ctx,n,c,!strcmp(op,"dataURL")); goto done; }
-        if (!c) { out=!strcmp(op,"context")?JS_FALSE:JS_ThrowRangeError(ctx,"Canvas bitmap memory limit"); goto done; }
+        if (!c) { out=!strcmp(op,"context")?JS_FALSE:JS_ThrowOutOfMemory(ctx); goto done; }
         if (!strcmp(op,"context")) out=JS_TRUE;
         else if (!strcmp(op,"version")) out=JS_NewUint32(ctx,c->generation);
         else if (!strcmp(op,"save")) {
-            if (c->saved_count==64) { out=JS_ThrowRangeError(ctx,"Canvas save stack limit"); goto done; }
-            c->saved_clip[c->saved_count++]=c->clip;
-            if (c->clip) c->clip->refs++;
+            if (!canvas_save(n,c)) { out=JS_ThrowOutOfMemory(ctx); goto done; }
         } else if (!strcmp(op,"restore")) {
             if (c->saved_count) { clip_release(n,c->clip); c->clip=c->saved_clip[--c->saved_count]; c->saved_clip[c->saved_count]=NULL; }
         } else if (!strcmp(op,"measureText") || !strcmp(op,"fillText")) out=text_native(ctx,n,c,op,argc,argv);
@@ -778,7 +803,7 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
         } else if (!strcmp(op,"poly") || !strcmp(op,"stroke") || !strcmp(op,"clip")) {
             size_t bytes; uint8_t *data=argc>1?JS_GetArrayBuffer(ctx,&bytes,argv[1]):NULL;
             uint32_t color=0; double width=1,matrix[6]={1,0,0,1,0,0}; bool evenodd=false,clear=false;
-            if (!data || bytes%16 || bytes/16>MAX_POINTS) { out=JS_ThrowRangeError(ctx,"Canvas path limit"); goto done; }
+            if (!data || bytes%16) { out=JS_ThrowTypeError(ctx,"Invalid Canvas path packet"); goto done; }
             if (argc>2 && JS_ToUint32(ctx,&color,argv[2])<0) { out=JS_EXCEPTION; goto done; }
             if (argc>3) {
                 if (!strcmp(op,"stroke")) { if (JS_ToFloat64(ctx,&width,argv[3])<0) { out=JS_EXCEPTION; goto done; } }
@@ -793,15 +818,16 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
             }
             size_t count=bytes/16;
             bool stroke=!strcmp(op,"stroke");
-            if(!stroke && count && c->h>PATH_SCAN_BUDGET/count){out=JS_ThrowRangeError(ctx,"Canvas path scan budget");goto done;}
+            if (!stroke && count>SIZE_MAX/sizeof(struct intersection)) { out=JS_ThrowRangeError(ctx,"Canvas path size overflow");goto done; }
             double *points=bytes?js_malloc(ctx,bytes):NULL;
             struct intersection *hits=!stroke&&count?js_malloc(ctx,count*sizeof *hits):NULL;
             if((bytes&&!points)||(!stroke&&count&&!hits)){js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowOutOfMemory(ctx);goto done;}
             if(bytes)memcpy(points,data,bytes);
             if (!strcmp(op,"clip")) {
-                size_t bytes=sizeof(struct canvas_clip)+(size_t)c->w*c->h;
+                size_t bytes=(size_t)c->w*c->h;
                 web_doc *d=allocation_doc(n);
-                if (!d || d->canvas_bytes>CANVAS_BUDGET || bytes>CANVAS_BUDGET-d->canvas_bytes) { js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowRangeError(ctx,"Canvas clip memory limit"); goto done; }
+                if (bytes>SIZE_MAX-sizeof(struct canvas_clip) || !canvas_room(d,bytes+sizeof(struct canvas_clip))) { js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowRangeError(ctx,"Canvas clip accounting overflow"); goto done; }
+                bytes+=sizeof(struct canvas_clip);
                 struct canvas_clip *clip=calloc(1,bytes);
                 if (!clip) { js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowOutOfMemory(ctx); goto done; }
                 clip->refs=1; clip->bytes=bytes; d->canvas_bytes+=bytes;
@@ -814,14 +840,14 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
                 /* Union the complete stroke before compositing: overlapping
                    segments/joins must apply globalAlpha exactly once. */
                 size_t mask_bytes=(size_t)c->w*c->h;web_doc *d=allocation_doc(n);
-                if(!d||d->canvas_bytes>CANVAS_BUDGET||mask_bytes>CANVAS_BUDGET-d->canvas_bytes){js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowRangeError(ctx,"Canvas stroke memory limit");goto done;}
+                if(!canvas_room(d,mask_bytes)){js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowRangeError(ctx,"Canvas stroke accounting overflow");goto done;}
                 uint8_t *mask=calloc(1,mask_bytes);
                 if(!mask){js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowOutOfMemory(ctx);goto done;}
                 d->canvas_bytes+=mask_bytes;
                 bool complete=stroke_mask(c,points,count,width,matrix,mask);
                 if(complete)for(size_t i=0;i<mask_bytes;i++)if(mask[i])c->pixels[i]=over(c->pixels[i],color);
                 free(mask);d->canvas_bytes-=mask_bytes;
-                if(!complete){js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowRangeError(ctx,"Canvas stroke work/coordinate limit");goto done;}
+                if(!complete){js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowRangeError(ctx,"Canvas stroke coordinate representation");goto done;}
             }
             js_free(ctx,points);js_free(ctx,hits);
             changed(n);
@@ -829,11 +855,14 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
             double v[4];
             int numbers=numeric(ctx,argc,argv,1,v,4);
             if (numbers<0) { out=JS_EXCEPTION; goto done; }
-            if (!numbers || v[2]<1 || v[3]<1 || v[2]>4096 || v[3]>4096 || v[2]*v[3]>CANVAS_MAX_PIXELS || fabs(v[0])>1e9 || fabs(v[1])>1e9) {
+            size_t bytes;
+            /* JS ArrayBuffer length is INT32_MAX in the current engine. */
+            if (!numbers || v[2]<1 || v[3]<1 || v[2]>INT32_MAX || v[3]>INT32_MAX || v[0]<INT32_MIN || v[0]>INT32_MAX || v[1]<INT32_MIN || v[1]>INT32_MAX ||
+                !canvas_extent((size_t)v[2],(size_t)v[3],4,&bytes) || bytes>INT32_MAX) {
                 out=JS_ThrowRangeError(ctx,"Invalid ImageData size"); goto done;
             }
             if (c->tainted) { out=JS_NULL; goto done; }
-            int x=(int)v[0],y=(int)v[1]; unsigned w=(unsigned)v[2],h=(unsigned)v[3]; size_t bytes=(size_t)w*h*4;
+            int x=(int)v[0],y=(int)v[1]; unsigned w=(unsigned)v[2],h=(unsigned)v[3];
             web_js_prepare_bytes(ctx,bytes);
             uint8_t *data=js_mallocz(ctx,bytes);
             if (!data) { out=JS_ThrowOutOfMemory(ctx); goto done; }
@@ -852,8 +881,9 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
             uint8_t *data=argc>5?JS_GetArrayBuffer(ctx,&bytes,argv[5]):NULL;
             uint32_t offset=0;
             if(argc>6&&JS_ToUint32(ctx,&offset,argv[6])<0){out=JS_EXCEPTION;goto done;}
-            if (!numbers || v[2]<1 || v[3]<1 || v[2]>4096 || v[3]>4096 || v[2]*v[3]>CANVAS_MAX_PIXELS ||
-                fabs(v[0])>1e9 || fabs(v[1])>1e9 || !data || offset>bytes || bytes-offset<(size_t)(unsigned)v[2]*(unsigned)v[3]*4) {
+            size_t required;
+            if (!numbers || v[2]<1 || v[3]<1 || v[2]>INT32_MAX || v[3]>INT32_MAX || v[0]<INT32_MIN || v[0]>INT32_MAX || v[1]<INT32_MIN || v[1]>INT32_MAX ||
+                !canvas_extent((size_t)v[2],(size_t)v[3],4,&required) || !data || offset>bytes || bytes-offset<required) {
                 out=JS_ThrowRangeError(ctx,"Invalid ImageData buffer"); goto done;
             }
             data+=offset;

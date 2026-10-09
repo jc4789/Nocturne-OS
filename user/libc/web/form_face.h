@@ -1,7 +1,5 @@
 #pragma once
 #include "webi.h"
-#define WEB_FACE_ENTRIES 64u
-#define WEB_FACE_BYTES (16u << 20)
 struct web_face_entry {
     char *name, *filename, *mime;
     unsigned char *bytes;
@@ -10,10 +8,10 @@ struct web_face_entry {
     bool file;
 };
 struct web_face_value {
-    unsigned refs, count;
+    unsigned refs, count, capacity;
     bool single;
     size_t allocation;
-    struct web_face_entry entries[WEB_FACE_ENTRIES];
+    struct web_face_entry *entries;
 };
 struct web_face_state {
     bool attached;
@@ -24,6 +22,7 @@ struct web_face_state {
     struct web_face_value *value, *state;
 };
 struct web_face_value *web_face_value_create(bool single);
+bool web_face_value_reserve(struct web_face_value *value, unsigned count);
 void web_face_value_free(struct web_face_value *value);
 bool web_face_prepare(web_doc *d, node_t *n, bool associated);
 bool web_face_set_value(web_doc *d, node_t *n, struct web_face_value *value, struct web_face_value *state);

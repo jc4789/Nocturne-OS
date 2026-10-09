@@ -31,7 +31,7 @@ struct webcookie_jar {
     char *psl_text, **rules;
     size_t rule_count;
 };
-struct address { char host[DOMAIN_MAX + 1], path[2048]; bool secure, ip; };
+struct address { char host[DOMAIN_MAX + 1]; const char *path; size_t path_len; bool secure, ip; };
 
 static unsigned char lower(unsigned char c) { return c >= 'A' && c <= 'Z' ? c + 32 : c; }
 static bool digit(unsigned char c) { return c >= '0' && c <= '9'; }
@@ -58,7 +58,7 @@ static bool address(const char *url, struct address *a) {
     else if (!strncasecmp(url, "http://", 7)) { a->secure = false; p = url + 7; }
     else return false;
     size_t n = strlen(url);
-    if (n > 8192) return false;
+    if (n > UINT32_MAX || n == SIZE_MAX) return false;
     for (size_t i = 0; i < n; i++) if ((unsigned char)url[i] <= 32 || (unsigned char)url[i] >= 127 || url[i] == '\\') return false;
     const char *end = p + strcspn(p, "/?#"), *colon = memchr(p, ':', (size_t)(end - p));
     const char *host_end = colon ? colon : end;
@@ -66,24 +66,23 @@ static bool address(const char *url, struct address *a) {
     if (colon) {
         unsigned port = 0; p = colon + 1;
         if (p == end) return false;
-        while (p < end) { if (!digit((unsigned char)*p)) return false; port = port * 10 + (unsigned)(*p++ - '0'); if (port > 65535) return false; }
+        while (p < end) { if (!digit((unsigned char)*p) || port > (65535u-(unsigned)(*p-'0'))/10u) return false; port = port * 10 + (unsigned)(*p++ - '0'); }
         if (!port) return false;
     }
     a->ip = true;
     for (p = a->host; *p; p++) if (!digit((unsigned char)*p) && *p != '.') a->ip = false;
     size_t pathlen = *end == '/' ? strcspn(end, "?#") : 0;
-    if (pathlen >= sizeof a->path) return false;
-    if (!pathlen) { strcpy(a->path, "/"); return true; }
-    memcpy(a->path, end, pathlen); a->path[pathlen] = 0; return true;
+    a->path=pathlen?end:"/";a->path_len=pathlen?pathlen:1;return true;
 }
 static bool domain_match(const char *host, const char *domain) {
     size_t h = strlen(host), d = strlen(domain);
     return h == d ? !strcmp(host, domain) : h > d && host[h-d-1] == '.' && !strcmp(host+h-d, domain);
 }
-static bool path_match(const char *path, const char *cookie_path) {
-    size_t n = strlen(cookie_path), p = strlen(path);
+static bool path_match_n(const char *path,size_t p,const char *cookie_path) {
+    size_t n = strlen(cookie_path);
     return p >= n && !memcmp(path, cookie_path, n) && (p == n || cookie_path[n-1] == '/' || path[n] == '/');
 }
+static bool path_match(const char *path,const char *cookie_path){return path_match_n(path,strlen(path),cookie_path);}
 static int rule_compare(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 static bool rule(const webcookie_jar *j, const char *key) {
     size_t lo = 0, hi = j->rule_count;
@@ -227,7 +226,7 @@ int webcookie_set(webcookie_jar *j, const struct webcookie_context *ctx, const c
     if (eq) { *eq=0; name=trim(copy); value=trim(eq+1); } else { name=""; value=trim(copy); }
     if ((!*name && !*value) || !name_ok(name) || strlen(name)+strlen(value)>4096) { free(copy); return 0; }
     char domain[DOMAIN_MAX+1], path[COOKIE_PATH_MAX+1], default_path[COOKIE_PATH_MAX+1]; strcpy(domain,a.host);
-    size_t pl=strlen(a.path); while (pl>1 && a.path[pl-1]!='/') pl--; if (pl>1) pl--;
+    size_t pl=a.path_len; while (pl>1 && a.path[pl-1]!='/') pl--; if (pl>1) pl--;
     if (pl > COOKIE_PATH_MAX) { free(copy); return 0; } memcpy(path,a.path,pl); path[pl]=0; strcpy(default_path,path);
     bool domain_attr=false, path_root=false, secure=false, http_only=false, age=false, persistent=false, bad=false, partitioned=false;
     unsigned same=S_LAX; int64_t expires=NEVER, age_time=NEVER;
@@ -312,7 +311,7 @@ long webcookie_get(webcookie_jar *j,const struct webcookie_context *ctx,char *ou
     for (size_t i=0;i<j->count;i++) {
         struct cookie *c=j->cookies[i];
         if ((c->flags&F_HOST) ? strcmp(a.host,c->domain)!=0 : !domain_match(a.host,c->domain)) continue;
-        if (!path_match(a.path,c->path) || ((c->flags&F_SECURE)&&!a.secure) || ((c->flags&F_HTTP)&&!ctx->http)) continue;
+        if (!path_match_n(a.path,a.path_len,c->path) || ((c->flags&F_SECURE)&&!a.secure) || ((c->flags&F_HTTP)&&!ctx->http)) continue;
         if (!same && c->same!=S_NONE && !(c->same==S_LAX && ctx->http && ctx->top_level && safe)) continue;
         list[count++]=c; len+=c->nl+c->vl+(c->nl?1:0)+(count>1?2:0);
     }

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <limits.h>
 #include "http.h"
 
 bool url_parse(const char *s, struct url *u) {
@@ -32,12 +33,128 @@ bool url_parse(const char *s, struct url *u) {
     return n >= 0 && (size_t)n < sizeof u->path;
 }
 
+void url_owned_free(struct url_owned *u) {
+    if (!u) return;
+    free(u->host); free(u->path); memset(u, 0, sizeof *u);
+}
+
+static enum http_url_result url_parse_owned_status(const char *s, size_t length, struct url_owned *u) {
+    if (!u) return HTTP_URL_INVALID;
+    memset(u, 0, sizeof *u);
+    if (!s || !length || length > UINT32_MAX || length == SIZE_MAX || memchr(s, 0, length)) return HTTP_URL_INVALID;
+    const char *end = s + length, *authority = s;
+    bool tls = length >= 8 && !strncasecmp(s, "https://", 8);
+    if (tls) authority += 8;
+    else if (length >= 7 && !strncasecmp(s, "http://", 7)) authority += 7;
+    else {
+        /* Keep the legacy bare-host entry, but never interpret another
+           explicit scheme as a host/port or permit request-line controls. */
+        for (const char *p = s; (size_t)(end - p) > 2; p++)
+            if (p[0] == ':' && p[1] == '/' && p[2] == '/') return HTTP_URL_INVALID;
+    }
+    for (const unsigned char *p = (const unsigned char *)s; p < (const unsigned char *)end; p++)
+        if (*p <= 32 || *p == 127 || *p == '\\') return HTTP_URL_INVALID;
+    const char *tail = authority;
+    while (tail < end && *tail != '/' && *tail != '?' && *tail != '#') tail++;
+    const char *colon = NULL;
+    for (const char *p = authority; p < tail; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == ':') { if (colon) return HTTP_URL_INVALID; colon = p; }
+        else if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_')) return HTTP_URL_INVALID;
+    }
+    size_t host_length = (size_t)((colon ? colon : tail) - authority);
+    if (!host_length || host_length == SIZE_MAX) return HTTP_URL_INVALID;
+    unsigned port = tls ? 443 : 80;
+    if (colon) {
+        if (colon + 1 == tail) return HTTP_URL_INVALID;
+        port = 0;
+        for (const char *p = colon + 1; p < tail; p++) {
+            if (*p < '0' || *p > '9' || port > (65535u - (unsigned)(*p - '0')) / 10u) return HTTP_URL_INVALID;
+            port = port * 10u + (unsigned)(*p - '0');
+        }
+        if (!port) return HTTP_URL_INVALID;
+    }
+    const char *path_end = tail;
+    while (path_end < end && *path_end != '#') path_end++;
+    size_t supplied = (size_t)(path_end - tail);
+    bool prepend = !supplied || *tail == '?';
+    if (supplied > SIZE_MAX - (size_t)prepend - 1) return HTTP_URL_INVALID;
+    size_t path_length = supplied + (size_t)prepend;
+    char *host = malloc(host_length + 1), *path = malloc(path_length + 1);
+    if (!host || !path) { free(host); free(path); return HTTP_URL_OOM; }
+    for (size_t i = 0; i < host_length; i++) {
+        unsigned char c = (unsigned char)authority[i];
+        host[i] = c >= 'A' && c <= 'Z' ? (char)(c + ('a' - 'A')) : (char)c;
+    }
+    host[host_length] = 0;
+    size_t at = 0; if (prepend) path[at++] = '/';
+    memcpy(path + at, tail, supplied); path[path_length] = 0;
+    u->tls = tls; u->port = (uint16_t)port; u->host = host; u->path = path;
+    return HTTP_URL_TUPLE;
+}
+
+enum http_url_result url_parse_owned_result_n(const char *s, size_t length, struct url_owned *u) {
+    return url_parse_owned_status(s, length, u);
+}
+
+bool url_parse_owned_n(const char *s, size_t length, struct url_owned *u) {
+    return url_parse_owned_result_n(s, length, u) == HTTP_URL_TUPLE;
+}
+
+bool url_parse_owned(const char *s, struct url_owned *u) {
+    return url_parse_owned_n(s, s ? strlen(s) : 0, u);
+}
+
+enum http_url_result http_canonical_owned_n(const char *raw, size_t length, char **canonical, char **origin) {
+    if (canonical) *canonical = NULL;
+    if (!origin) return HTTP_URL_INVALID;
+    *origin = NULL;
+    if (!raw || !length || length > UINT32_MAX || length == SIZE_MAX || memchr(raw, 0, length)) return HTTP_URL_INVALID;
+    bool secure = length >= 8 && !strncasecmp(raw, "https://", 8);
+    bool plain = length >= 7 && !strncasecmp(raw, "http://", 7);
+    if (!secure && !plain) {
+        if ((length >= 6 && !strncasecmp(raw, "https:", 6)) ||
+            (length >= 5 && !strncasecmp(raw, "http:", 5))) return HTTP_URL_INVALID;
+        /* Non-HTTP URL parsing/inherited blob origin belongs to its caller.
+           No tuple, equality permission or empty serialization is invented. */
+        return HTTP_URL_OPAQUE;
+    }
+    struct url_owned parsed;
+    enum http_url_result result = url_parse_owned_status(raw, length, &parsed);
+    if (result != HTTP_URL_TUPLE) return result;
+    char port[8] = "";
+    if (parsed.port != (parsed.tls ? 443 : 80)) snprintf(port, sizeof port, ":%u", parsed.port);
+    const char *scheme = parsed.tls ? "https://" : "http://";
+    size_t sl = strlen(scheme), hl = strlen(parsed.host), pl = strlen(port);
+    if (hl > SIZE_MAX - sl - pl - 1) { url_owned_free(&parsed); return HTTP_URL_INVALID; }
+    size_t ol = sl + hl + pl, path_length = strlen(parsed.path);
+    if (canonical && (path_length > SIZE_MAX - ol - 1 ||
+                      ol > UINT32_MAX || path_length > UINT32_MAX - ol)) { url_owned_free(&parsed); return HTTP_URL_INVALID; }
+    char *o = malloc(ol + 1), *c = canonical ? malloc(ol + path_length + 1) : NULL;
+    if (!o || (canonical && !c)) { free(o); free(c); url_owned_free(&parsed); return HTTP_URL_OOM; }
+    memcpy(o, scheme, sl); memcpy(o + sl, parsed.host, hl); memcpy(o + sl + hl, port, pl + 1);
+    if (c) { memcpy(c, o, ol); memcpy(c + ol, parsed.path, path_length + 1); }
+    url_owned_free(&parsed); *origin = o; if (canonical) *canonical = c;
+    return HTTP_URL_TUPLE;
+}
+
+enum http_url_result http_origin_owned_n(const char *raw, size_t length, char **origin) {
+    return http_canonical_owned_n(raw, length, NULL, origin);
+}
+
+enum http_url_result http_origin_owned(const char *raw, char **origin) {
+    return http_origin_owned_n(raw, raw ? strlen(raw) : 0, origin);
+}
+
 /* buffered reader on top of a stream */
 struct rd {
     net_stream *s;
     char buf[4096];
     size_t pos, len;
-    bool eof, err, line_truncated, line_invalid;
+    char *line;
+    size_t line_capacity;
+    bool eof, err, line_invalid, line_oom;
 };
 
 static bool rd_fill(struct rd *r) {
@@ -55,13 +172,19 @@ static bool rd_fill(struct rd *r) {
 }
 
 /* read a line without the CRLF; false at end of stream */
-static bool rd_line(struct rd *r, char *out, size_t n) {
+static bool rd_line(struct rd *r, char **out) {
     size_t k = 0;
-    r->line_truncated = r->line_invalid = false;
+    r->line_invalid = r->line_oom = false;
+    if (!r->line) {
+        r->line = malloc(256);
+        if (!r->line) { r->line_oom = true; *out = NULL; return false; }
+        r->line_capacity = 256;
+    }
+    *out = r->line;
     bool cr = false;
     for (;;) {
         if (!rd_fill(r)) {
-            out[k] = 0;
+            r->line[k] = 0;
             return false; /* a partial line is not a complete HTTP field */
         }
         char c = r->buf[r->pos++];
@@ -69,13 +192,20 @@ static bool rd_line(struct rd *r, char *out, size_t n) {
         if (cr || ((unsigned char)c < 32 && c != '\r' && c != '\t') || (unsigned char)c == 127) r->line_invalid = true;
         cr = c == '\r';
         if (c != '\r') {
-            if (k + 1 < n) out[k++] = c;
-            else r->line_truncated = true;
+            if (k + 1 == r->line_capacity) {
+                if (r->line_capacity == SIZE_MAX) { r->line_oom = true; return false; }
+                size_t capacity = r->line_capacity > SIZE_MAX / 2 ? SIZE_MAX : r->line_capacity * 2;
+                char *grown = realloc(r->line, capacity);
+                if (!grown) { r->line_oom = true; return false; }
+                r->line = *out = grown; r->line_capacity = capacity;
+            }
+            r->line[k++] = c;
         }
     }
-    out[k] = 0;
+    r->line[k] = 0;
     return true;
 }
+static void rd_free(struct rd *r) { free(r->line); free(r); }
 
 struct sink {
     const struct http_req *rq;
@@ -138,6 +268,9 @@ static bool copy_body(struct rd *r, struct sink *k, size_t n) {
 const char *http_response_headers(const struct http_resp *resp) {
     return resp->headers_full ? resp->headers_full : resp->headers;
 }
+const char *http_response_status_text(const struct http_resp *resp) {
+    return resp->status_text_full ? resp->status_text_full : resp->status_text;
+}
 
 char *http_header(const struct http_resp *resp, const char *name, char *out, size_t n) {
     if (!n) return NULL;
@@ -199,7 +332,7 @@ static bool body_size(const char *p, int base, size_t *out, bool chunk) {
     return true;
 }
 
-#define HTTP_GZIP_LIMIT (16u * 1024u * 1024u)
+#define HTTP_GZIP_LIMIT ((size_t)UINT32_MAX)
 /* Private adapter to the existing image codec's bounded DEFLATE implementation. */
 extern int http_inflate(char *out, int cap, const char *in, int len, int *consumed);
 
@@ -249,8 +382,14 @@ static bool gunzip_body(struct http_resp *rs, size_t limit) {
         if (n - pos < 8) goto invalid;
         int took = 0, got;
         for (;;) {
-            got = http_inflate(out + used, (int)(cap - used), (const char *)in + pos, (int)(n - pos), &took);
+            size_t available = cap - used, encoded = n - pos;
+            got = http_inflate(out + used, available > INT_MAX ? INT_MAX : (int)available,
+                (const char *)in + pos, encoded > INT_MAX ? INT_MAX : (int)encoded, &took);
             if (got != -2) break;
+            if (cap - used >= (size_t)INT_MAX) {
+                snprintf(rs->error, sizeof rs->error, "gzip member length cannot be represented by the inflater API");
+                free(out); return false;
+            }
             if (cap == limit) {
                 if (!(limit % (1024u * 1024u)))
                     snprintf(rs->error, sizeof rs->error, "gzip response exceeds %lu MiB", (unsigned long)(limit / (1024u * 1024u)));
@@ -281,41 +420,57 @@ invalid:
 }
 
 struct http_scratch {
-    struct url url;
-    char head[HTTP_URL_PATH_MAX + 512u];
-    char line[HTTP_RESPONSE_HEADER_LINE_MAX];
+    struct url_owned url;
+    char *head;
+    size_t head_length;
 };
+static const char *request_head(const struct http_req *rq, struct http_scratch *work) {
+    const char *method = rq->method ? rq->method : "GET";
+    if (!*method) return "invalid HTTP method";
+    /* HTTP method = token. Browser-only forbidden methods are enforced by
+       WebNET; the general HTTP client still has to reject request-line bytes. */
+    for (const unsigned char *p = (const unsigned char *)method; *p; p++)
+        if (!((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') ||
+              strchr("!#$%&'*+-.^_`|~", *p))) return "invalid HTTP method";
+    struct url_owned *u = &work->url;
+    char port[8] = "", content_length[64] = "";
+    if (u->port != (u->tls ? 443 : 80)) snprintf(port, sizeof port, ":%u", u->port);
+    if (rq->body || strcmp(method, "GET"))
+        snprintf(content_length, sizeof content_length, "Content-Length: %zu\r\n", rq->body_len);
+    const char *parts[] = {method, " ", u->path, " HTTP/1.1\r\nHost: ", u->host, port,
+        "\r\nUser-Agent: Nocturne/1.0\r\nConnection: close\r\n", content_length};
+    size_t length = 0;
+    for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) {
+        size_t n = strlen(parts[i]);
+        if (n > SIZE_MAX - length - 1) return "HTTP request-line allocation size overflow";
+        length += n;
+    }
+    char *head = malloc(length + 1);
+    if (!head) return "out of memory preparing HTTP request line";
+    size_t at = 0;
+    for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) {
+        size_t n = strlen(parts[i]); memcpy(head + at, parts[i], n); at += n;
+    }
+    head[at] = 0; work->head = head; work->head_length = length;
+    return NULL;
+}
 static int request_inner(const struct http_req *rq, struct http_resp *rs, struct http_scratch *work, size_t body_limit) {
     memset(rs, 0, sizeof *rs);
-    struct url *u = &work->url;
-    if (!url_parse(rq->url, u)) {
-        snprintf(rs->error, sizeof rs->error, "bad URL: %s", rq->url);
+    struct url_owned *u = &work->url;
+    if (!url_parse_owned(rq->url, u)) {
+        snprintf(rs->error, sizeof rs->error, "invalid URL or URL allocation failure");
         return -1;
     }
-    int timeout = rq->timeout_ms ? rq->timeout_ms : 60000;
+    const char *method = rq->method ? rq->method : "GET";
+    const char *head_error = request_head(rq, work);
+    if (head_error) { snprintf(rs->error, sizeof rs->error, "%s", head_error); return -1; }
+    /* This legacy API accepts signed int durations. Its default is the
+       representation maximum, not an independent 60-second resource quota. */
+    int timeout = rq->timeout_ms ? rq->timeout_ms : INT_MAX;
     net_stream *s = ns_open(u->host, u->port, u->tls, timeout, rs->error, sizeof rs->error);
     if (!s) return -1;
 
-    const char *method = rq->method ? rq->method : "GET";
-    bool std_port = u->port == (u->tls ? 443 : 80);
-    char hostport[140], *head = work->head;
-    if (std_port) snprintf(hostport, sizeof hostport, "%s", u->host);
-    else snprintf(hostport, sizeof hostport, "%s:%d", u->host, u->port);
-    int hn = snprintf(head, sizeof work->head, "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Nocturne/1.0\r\nConnection: close\r\n",
-                      method, u->path, hostport);
-    if (hn < 0 || hn >= (int)sizeof work->head - 2) {
-        snprintf(rs->error, sizeof rs->error, "request too large");
-        ns_close(s);
-        return -1;
-    }
-    if (rq->body || strcmp(method, "GET"))
-        hn += snprintf(head + hn, sizeof work->head - hn, "Content-Length: %zu\r\n", rq->body_len);
-    if (hn < 0 || hn >= (int)sizeof work->head - 2) {
-        snprintf(rs->error, sizeof rs->error, "request too large");
-        ns_close(s);
-        return -1;
-    }
-    bool ok = ns_write(s, head, (size_t)hn) >= 0 && (!rq->headers || ns_write(s, rq->headers, strlen(rq->headers)) >= 0) &&
+    bool ok = ns_write(s, work->head, work->head_length) >= 0 && (!rq->headers || ns_write(s, rq->headers, strlen(rq->headers)) >= 0) &&
               ns_write(s, "\r\n", 2) >= 0 && (!rq->body_len || ns_write(s, rq->body, rq->body_len) >= 0);
     if (!ok) {
         snprintf(rs->error, sizeof rs->error, "send: %s", ns_error(s));
@@ -330,32 +485,32 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
         return -1;
     }
     r->s = s;
-    char *line = work->line;
+    char *line = NULL;
     int status = 0;
     /* status line, skipping any 100 Continue */
     do {
-        if (!rd_line(r, line, sizeof work->line) || r->line_invalid || r->line_truncated || sscanf(line, "HTTP/%*d.%*d %d", &status) != 1) {
-            snprintf(rs->error, sizeof rs->error, "no HTTP response (%s)", ns_error(s)[0] ? ns_error(s) : "connection closed");
-            free(r);
+        if (!rd_line(r, &line) || r->line_invalid || sscanf(line, "HTTP/%*d.%*d %d", &status) != 1) {
+            snprintf(rs->error, sizeof rs->error, "no HTTP response (%s)", r->line_oom ? "out of memory reading line" : ns_error(s)[0] ? ns_error(s) : "connection closed");
+            rd_free(r);
             ns_close(s);
             return -1;
         }
         if (status == 100) {
             size_t interim_len = 0;
             for (;;) {
-                if (!rd_line(r, line, sizeof work->line) || r->line_invalid || r->line_truncated) {
+                if (!rd_line(r, &line) || r->line_invalid) {
                     snprintf(rs->error, sizeof rs->error, "invalid interim response headers");
-                    free(r); ns_close(s); return -1;
+                    rd_free(r); ns_close(s); return -1;
                 }
                 if (!line[0]) break;
                 if (!valid_header_line(line)) {
                     snprintf(rs->error, sizeof rs->error, "invalid interim response header field");
-                    free(r); ns_close(s); return -1;
+                    rd_free(r); ns_close(s); return -1;
                 }
                 size_t l = strlen(line);
-                if (l + 2 > HTTP_RESPONSE_HEADERS_LIMIT - interim_len) {
-                    snprintf(rs->error, sizeof rs->error, "response headers exceed 64 KiB limit");
-                    free(r); ns_close(s); return -1;
+                if (interim_len > SIZE_MAX - 2 || l > SIZE_MAX - interim_len - 2) {
+                    snprintf(rs->error, sizeof rs->error, "response header length overflow");
+                    rd_free(r); ns_close(s); return -1;
                 }
                 interim_len += l + 2;
             }
@@ -367,33 +522,37 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
         while (*reason == ' ') reason++;
         while (*reason >= '0' && *reason <= '9') reason++;
         if (*reason == ' ') reason++;
-        if (strlen(reason) >= sizeof rs->status_text) {
-            snprintf(rs->error, sizeof rs->error, "HTTP reason phrase exceeds limit");
-            free(r); ns_close(s); return -1;
+        size_t reason_len = strlen(reason);
+        if (reason_len >= sizeof rs->status_text) {
+            rs->status_text_full = malloc(reason_len + 1);
+            if (!rs->status_text_full) {
+                snprintf(rs->error, sizeof rs->error, "out of memory storing HTTP reason phrase");
+                rd_free(r); ns_close(s); return -1;
+            }
+            memcpy(rs->status_text_full, reason, reason_len + 1);
+        } else {
+            memcpy(rs->status_text, reason, reason_len + 1);
         }
-        memcpy(rs->status_text, reason, strlen(reason) + 1);
     }
     size_t hl = 0, headers_cap = sizeof rs->headers, length = 0;
     bool chunked = false, have_length = false, gzip = false, have_encoding = false;
     const char *header_error = NULL;
     for (;;) {
-        if (!rd_line(r, line, sizeof work->line)) { header_error = "incomplete response headers"; break; }
+        if (!rd_line(r, &line)) { header_error = r->line_oom ? "out of memory reading response header" : "incomplete response headers"; break; }
         if (r->line_invalid) { header_error = "invalid response header characters"; break; }
         if (!line[0]) break;
-        if (r->line_truncated) { header_error = "response header exceeds 16 KiB"; break; }
         if (!valid_header_line(line)) { header_error = "invalid response header field"; break; }
         size_t l = strlen(line);
         /* Store every field or reject the response. Late security fields must
            never disappear behind the old inline capacity. */
-        if (l + 2 > HTTP_RESPONSE_HEADERS_LIMIT - hl) {
-            header_error = "response headers exceed 64 KiB limit"; break;
+        if (hl > SIZE_MAX - 3 || l > SIZE_MAX - hl - 3) {
+            header_error = "response header length overflow"; break;
         }
         size_t need = hl + l + 3;
         if (need > headers_cap) {
             size_t cap = headers_cap;
             while (cap < need) {
-                cap = cap > (HTTP_RESPONSE_HEADERS_LIMIT + 1u) / 2u ?
-                    HTTP_RESPONSE_HEADERS_LIMIT + 1u : cap * 2u;
+                cap = cap > SIZE_MAX / 2 ? need : cap * 2u;
             }
             bool had_full = rs->headers_full != NULL;
             char *larger = realloc(rs->headers_full, cap);
@@ -408,17 +567,17 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
         if (rq->on_header && rq->on_header(rq->ctx, line, l) < 0) { header_error = "response header callback aborted"; break; }
         char *v;
         if ((v = header_value(line, "Transfer-Encoding"))) {
-            if (r->line_truncated || chunked || strcasecmp(v, "chunked"))
+            if (chunked || strcasecmp(v, "chunked"))
                 header_error = "unsupported or invalid Transfer-Encoding";
             chunked = true;
         } else if ((v = header_value(line, "Content-Length"))) {
             size_t parsed = 0;
-            if (r->line_truncated || !body_size(v, 10, &parsed, false) || (have_length && parsed != length))
+            if (!body_size(v, 10, &parsed, false) || (have_length && parsed != length))
                 header_error = "invalid Content-Length";
             length = parsed;
             have_length = true;
         } else if ((v = header_value(line, "Content-Encoding"))) {
-            if (r->line_truncated || have_encoding || (strcasecmp(v, "gzip") && strcasecmp(v, "identity")))
+            if (have_encoding || (strcasecmp(v, "gzip") && strcasecmp(v, "identity")))
                 header_error = "unsupported or invalid Content-Encoding";
             gzip = !strcasecmp(v, "gzip");
             have_encoding = true;
@@ -428,7 +587,7 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     if (header_error) {
         snprintf(rs->error, sizeof rs->error, "%s", header_error);
         free(rs->headers_full); rs->headers_full = NULL; rs->headers[0] = 0;
-        free(r); ns_close(s); return -1;
+        rd_free(r); ns_close(s); return -1;
     }
     rs->headers_len = hl;
     if (rs->headers_full) rs->headers[0] = 0;
@@ -445,16 +604,16 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
         body_ok = false;
         for (;;) {
             size_t n;
-            if (!rd_line(r, line, sizeof work->line) || r->line_truncated || r->line_invalid || !body_size(line, 16, &n, true)) break;
+            if (!rd_line(r, &line) || r->line_invalid || !body_size(line, 16, &n, true)) break;
             if (n == 0) {
-                while (rd_line(r, line, sizeof work->line)) {
-                    if (r->line_invalid || r->line_truncated) break;
+                while (rd_line(r, &line)) {
+                    if (r->line_invalid || (line[0] && !valid_header_line(line))) break;
                     if (!line[0]) { body_ok = true; break; }
                 }
                 break;
             }
             if (!copy_body(r, &k, n)) break;
-            if (!rd_line(r, line, sizeof work->line) || line[0] || r->line_truncated || r->line_invalid) break;
+            if (!rd_line(r, &line) || line[0] || r->line_invalid) break;
         }
     } else if (have_length) {
         body_ok = copy_body(r, &k, length);
@@ -477,13 +636,13 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     }
     int ret = 0;
     if (!body_ok && !k.aborted) {
-        if (!rs->error[0]) snprintf(rs->error, sizeof rs->error, "response cut short (%s)", ns_error(s)[0] ? ns_error(s) : "connection closed");
+        if (!rs->error[0]) snprintf(rs->error, sizeof rs->error, "response cut short (%s)", r->line_oom ? "out of memory reading line" : ns_error(s)[0] ? ns_error(s) : "connection closed");
         ret = -1;
     } else if (k.aborted) {
         if (!rs->error[0]) snprintf(rs->error, sizeof rs->error, "aborted");
         ret = -1;
     }
-    free(r);
+    rd_free(r);
     ns_close(s);
     if (ret < 0) {
         free(rs->headers_full); rs->headers_full = NULL;
@@ -493,13 +652,15 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
 }
 
 static int request_with_limit(const struct http_req *rq, struct http_resp *rs, size_t body_limit) {
-    struct http_scratch *work = malloc(sizeof *work);
+    struct http_scratch *work = calloc(1, sizeof *work);
     if (!work) {
         memset(rs, 0, sizeof *rs);
         snprintf(rs->error, sizeof rs->error, "out of memory");
         return -1;
     }
     int result = request_inner(rq, rs, work, body_limit);
+    free(work->head);
+    url_owned_free(&work->url);
     free(work);
     return result;
 }
@@ -516,6 +677,7 @@ int http_request_limited(const struct http_req *rq, struct http_resp *rs, size_t
 }
 
 void http_resp_free(struct http_resp *resp) {
+    free(resp->status_text_full); resp->status_text_full = NULL; resp->status_text[0] = 0;
     free(resp->headers_full);
     resp->headers_full = NULL;
     resp->headers[0] = 0;

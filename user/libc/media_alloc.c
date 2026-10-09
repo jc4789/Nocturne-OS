@@ -42,28 +42,33 @@ size_t nmedia_alloc_charge(size_t requested) {
 void nmedia_alloc_snapshot(struct nmedia_alloc_stats *out) {
     if (out) *out = totals;
 }
-bool nmedia_alloc_reserve_worker(void) {
-    if(totals.reserved || NMEDIA_WORKER_BYTES > totals.limit-totals.current) {
+static bool admit_charge(size_t charge) {
+    /* SIZE_MAX means no artificial quota, not permission to wrap current,
+       current or peak. Explicit finite user limits are checked separately. */
+    if (charge > SIZE_MAX - totals.current) {
+        rejected(NMEDIA_ALLOC_OVERFLOW);return false;
+    }
+    size_t used = totals.current;
+    if (totals.limit != SIZE_MAX && (used > totals.limit || charge > totals.limit - used)) {
         rejected(NMEDIA_ALLOC_LIMIT);return false;
     }
-    totals.reserved=NMEDIA_WORKER_BYTES;
-    if(totals.peak<totals.current+totals.reserved)totals.peak=totals.current+totals.reserved;
     return true;
 }
-void nmedia_alloc_release_worker(void) { totals.reserved=0; }
+bool nmedia_alloc_reserve_worker(void) {
+    if(totals.reserved==SIZE_MAX){rejected(NMEDIA_ALLOC_OVERFLOW);return false;}
+    totals.reserved++;
+    return true;
+}
+void nmedia_alloc_release_worker(void) { if(totals.reserved)totals.reserved--; }
 bool nmedia_alloc_restrict_worker(void) {
     if(worker_restricted||totals.current||totals.blocks||totals.reserved||totals.peak)return false;
-    if(totals.limit>NMEDIA_WORKER_BYTES)totals.limit=NMEDIA_WORKER_BYTES;
     worker_restricted=true;
     return true;
 }
 void *nmedia_ff_malloc(size_t size) {
     size_t charge = nmedia_alloc_charge(size);
     if (!charge) { rejected(NMEDIA_ALLOC_OVERFLOW); return NULL; }
-    if (charge > totals.limit - totals.current - totals.reserved) {
-        rejected(NMEDIA_ALLOC_LIMIT);
-        return NULL;
-    }
+    if (!admit_charge(charge)) return NULL;
     void *base = NMEDIA_BASE_MALLOC(charge);
     if (!base) {
         increment(&totals.backend_ooms);
@@ -78,7 +83,7 @@ void *nmedia_ff_malloc(size_t size) {
     a->charge = charge;
     totals.current += charge;
     ++totals.blocks;
-    if (totals.peak < totals.current+totals.reserved) totals.peak = totals.current+totals.reserved;
+    if (totals.peak < totals.current) totals.peak = totals.current;
     return (void *)aligned;
 }
 void nmedia_ff_free(void *pointer) {

@@ -14,7 +14,16 @@ const cloneData = (() => {
     // assembling a transaction, especially after its final validation pass.
     const add=(array,value)=>define(array,array.length,{value,writable:true,enumerable:true,configurable:true});
     const field=(record,key,value)=>define(record,key,{value,writable:true,enumerable:true,configurable:true});
-    const kinds=new M(),constructors=new M(),classID=host.classID,detach=host.detach,uncloneable=[],transferTypes=[];
+    const kinds=new M(),constructors=new M(),classID=host.classID,detach=host.detach,uncloneable=[],uncloneableNames=[],transferTypes=[];
+    const workerDiagnostics=typeof host.frame!=='function'&&typeof host.transferCommit==='function';
+    const exceptionBridge=typeof workerExceptionBridge==='undefined'?null:workerExceptionBridge;
+    const blobSnapshotBridge=typeof blobBridge==='undefined'?null:blobBridge;
+    const handlerName=handler=>{const d=descriptor(handler,'name');return d&&'value'in d&&typeof d.value==='string'?d.value:'Transferable';};
+    const diagnosticKinds=new M();
+    if(workerDiagnostics){
+        put(diagnosticKinds,classID(Promise.resolve()),'Promise');put(diagnosticKinds,classID(new WeakMap()),'WeakMap');
+        put(diagnosticKinds,classID(new WeakSet()),'WeakSet');put(diagnosticKinds,classID(new Proxy({},{})),'Proxy');
+    }
     const register=(name,sample,ctor)=>{put(kinds,classID(sample),name);if(ctor)put(constructors,name,ctor);};
     register('Object',{});register('Array',[]);register('Date',new DateType());
     register('RegExp',/a/);register('Map',new M());register('Set',new S());
@@ -37,48 +46,61 @@ const cloneData = (() => {
         .map((key,i)=>[descriptor(RegExpType.prototype,key)?.get,'dgimsuvy'[i]]);
     const boxed={Boolean:Boolean.prototype.valueOf,Number:Number.prototype.valueOf,String:String.prototype.valueOf,BigInt:BigInt.prototype.valueOf};
     const errors={Error,EvalError,RangeError,ReferenceError,SyntaxError,TypeError,URIError};
-    const fail=()=>{throw new DomError('Value cannot be cloned','DataCloneError');};
+    const fail=(stage='unsupported',value,count=0,external=false,brand)=>{
+        // These labels come only from private built-in registration, never an
+        // author constructor/name/toString/getter or a property/URL/value.
+        let message='Value cannot be cloned';
+        if(workerDiagnostics){const id=classID(value),exception=exceptionBridge&&exceptionBridge.brand(value);
+            const kind=brand||(exception?'DOMException':get(kinds,id)||get(diagnosticKinds,id)||typeof value);
+            message+=' [stage '+stage+', brand '+kind+', nativeclass '+id+', transfers '+count+', external '+(external?'yes':'no')+']';}
+        throw new DomError(message,'DataCloneError');
+    };
     const resizable=buffer=>abResizable&&apply(abResizable,buffer,[]);
-    function copyBuffer(buffer) {
+    function copyBuffer(buffer,reject=fail) {
         // No slice/species or constructor hooks from the source buffer.
         let size,input;
-        try{size=apply(abLength,buffer,[]);input=new U8(buffer,0,size);}catch(_){return fail();}
+        try{size=apply(abLength,buffer,[]);input=new U8(buffer,0,size);}catch(_){return reject('detached-buffer',buffer);}
         const output=resizable(buffer)?new AB(size,{maxByteLength:apply(abMaxLength,buffer,[])}):new AB(size);
         apply(byteSet,new U8(output),[input]);return output;
     }
     const packets=new WeakMap(),packetGet=WeakMap.prototype.get,packetSet=WeakMap.prototype.set;
-    function prepare(input,transfers,external=false) {
+    function prepare(input,transfers,external=false,workerContext=null) {
         const seen=new M(),records=[],handlers=[],prepared=[];
+        const reject=(stage,value,brand)=>fail(stage,value,transfers?transfers.length:0,external,brand);
         // Register placeholders first; capture transferred bytes after user getters.
         if(transfers)for(let i=0;i<transfers.length;i++){
-            const item=transfers[i];if(has(seen,item))fail();
+            const item=transfers[i];if(has(seen,item))reject('duplicate-transfer',item);
             let handler=null;
             if(classID(item)!==arrayBufferID){
                 for(let j=0;j<transferTypes.length;j++)if(transferTypes[j].brand(item)){handler=transferTypes[j];break;}
-                if(!handler)fail();handler.validate(item);
+                if(!handler)reject('invalid-transfer-kind',item);handler.validate(item);
                 // External factories are private, same-runtime endpoint
                 // capabilities; they are never part of the serialized graph.
                 // Workers use boolean external=true and must keep rejecting
                 // ports: only the private Window/endpoint path opts in.
-                if(external&&(external!=='ports'||!handler.prepareExternal))fail();
-            }else {try{new U8(item,0,0);}catch(_){fail();}}
+                if(external&&(external==='worker'?!handler.prepareWorker:(external!=='ports'||!handler.prepareExternal)))reject('external-transfer-unsupported',item,handlerName(handler));
+            }else {try{new U8(item,0,0);}catch(_){reject('detached-transfer-buffer',item);}}
             add(handlers,handler);put(seen,item,records.length);add(records,[handler?'Transferred':'ArrayBuffer',null]);
         }
         function visit(value) {
-            if(typeof value==='symbol'||typeof value==='function')return fail();
+            if(typeof value==='symbol'||typeof value==='function')return reject('non-cloneable-primitive',value);
             if(value===null||typeof value!=='object')return [0,value];
             // JS-backed Web IDL objects share QuickJS's ordinary Object class
             // ID. Their private brands reject them here, during this same walk,
             // before ordinary properties/getters are read (no second traversal).
             if(has(seen,value))return [1,get(seen,value)];
-            for(let i=0;i<uncloneable.length;i++)if(apply(uncloneable[i],undefined,[value]))return fail();
-            if(typeof blobBridge!=='undefined'){
-                if(blobBridge.readerBrand(value))return fail();
-                if(blobBridge.brand(value)){
-                    const id=records.length;put(seen,value,id);add(records,['Blob',blobBridge.snapshot(value)]);return [1,id];
+            for(let i=0;i<uncloneable.length;i++)if(apply(uncloneable[i],undefined,[value]))return reject('non-serializable-brand',value,uncloneableNames[i]);
+            if(exceptionBridge&&exceptionBridge.brand(value)){
+                const id=records.length;put(seen,value,id);add(records,['DOMException',exceptionBridge.snapshot(value)]);return [1,id];
+            }
+            if(blobSnapshotBridge){
+                if(blobSnapshotBridge.readerBrand(value))return reject('non-serializable-brand',value,'FileReader');
+                if(blobSnapshotBridge.brand(value)){
+                    if(external==='worker')return reject('worker-blob-unsupported',value,'Blob');
+                    const id=records.length;put(seen,value,id);add(records,['Blob',blobSnapshotBridge.snapshot(value)]);return [1,id];
                 }
             }
-            const kind=get(kinds,classID(value));if(!kind)return fail();
+            const kind=get(kinds,classID(value));if(!kind)return reject('unknown-native-class',value);
             const id=records.length,record=[kind];add(records,record);put(seen,value,id);
             if(kind==='Object'||kind==='Array'){
                 field(record,1,kind==='Array'?value.length:0);field(record,2,[]);
@@ -93,7 +115,7 @@ const cloneData = (() => {
                 apply(kind==='Map'?mapEach:setEach,value,[(v,k)=>add(entries,kind==='Map'?[k,v]:v)]);
                 field(record,1,[]);
                 for(let i=0;i<entries.length;i++)add(record[1],kind==='Map'?[visit(entries[i][0]),visit(entries[i][1])]:visit(entries[i]));
-            }else if(kind==='ArrayBuffer')field(record,1,copyBuffer(value));
+            }else if(kind==='ArrayBuffer')field(record,1,copyBuffer(value,reject));
             else if(has(constructors,kind)){
                 const dataView=kind==='DataView';let buffer,offset,size;
                 try{
@@ -101,10 +123,10 @@ const cloneData = (() => {
                     buffer=apply(dataView?viewBuffer:byteBuffer,value,[]);
                     offset=apply(dataView?viewOffset:byteOffset,value,[]);
                     size=apply(dataView?viewLength:length,value,[]);new U8(buffer,0,0);
-                }catch(_){return fail();}
+                }catch(_){return reject('invalid-view-state',value);}
                 // Public getters cannot distinguish fixed from length-tracking
                 // views. Reject instead of silently changing their semantics.
-                if(resizable(buffer))return fail();
+                if(resizable(buffer))return reject('resizable-view-unsupported',value);
                 field(record,1,visit(buffer));field(record,2,offset);field(record,3,size);
             }else if(kind==='Date')field(record,1,apply(date,value,[]));
             else if(kind==='RegExp'){
@@ -125,8 +147,8 @@ const cloneData = (() => {
         if(transfers){
             for(let i=0;i<transfers.length;i++){
                 const handler=handlers[i];
-                if(handler){handler.validate(transfers[i]);add(prepared,external?handler.prepareExternal(transfers[i]):handler.prepare(transfers[i]));}
-                else add(prepared,copyBuffer(transfers[i]));
+                if(handler){handler.validate(transfers[i]);add(prepared,external==='worker'?handler.prepareWorker(transfers[i],workerContext):external?handler.prepareExternal(transfers[i]):handler.prepare(transfers[i]));}
+                else add(prepared,copyBuffer(transfers[i],reject));
             }
             for(let i=0;i<transfers.length;i++){
                 const handler=handlers[i];
@@ -148,7 +170,7 @@ const cloneData = (() => {
         // also catches reentrant author getters that transferred another item.
         if(p.transfers)for(let i=0;i<p.transfers.length;i++){
             if(p.handlers[i])p.handlers[i].validate(p.transfers[i]);
-            else try{new U8(p.transfers[i],0,0);}catch(_){fail();}
+            else try{new U8(p.transfers[i],0,0);}catch(_){fail('late-detached-buffer',p.transfers[i],p.transfers.length,p.external);}
         }
         return p;
     }
@@ -159,6 +181,7 @@ const cloneData = (() => {
             const plan=commitPlan(packet,receivers);plan.generations=[host.frame('transferGeneration')];
             return host.frame('transferCommit',plan);
         }
+        if(typeof host.transferCommit==='function')return host.transferCommit(commitPlan(packet,receivers));
         // A worker has no same-runtime DOM endpoint bridge. Its boolean
         // external preparation already rejects every MessagePort transfer.
         p.committed=true;
@@ -194,7 +217,11 @@ const cloneData = (() => {
             else if(kind==='ArrayBuffer')value=copyBytes?copyBuffer(r[1]):r[1];
             else if(kind==='Transferred')value=r[1].value;
             else if(kind==='ExternalTransferred')value=receivers[r[1]].value;
-            else if(kind==='Blob')value=blobBridge.restore(r[1]);
+            else if(kind==='Blob'){
+                if(!blobSnapshotBridge)return fail('target-brand-unavailable',undefined,0,false,'Blob');
+                value=blobSnapshotBridge.restore(r[1]);
+            }
+            else if(kind==='DOMException')value=new DomError(r[1][1],r[1][0]);
             else if(has(constructors,kind))value=new(get(constructors,kind))(read(r[1]),r[2],r[3]);
             else if(kind==='Date')value=new DateType(r[1]);else if(kind==='RegExp')value=new RegExpType(r[1],r[2]);
             else if(kind==='Error')value=new errors[r[1]](r[2]);else value=Obj(r[1]);
@@ -234,9 +261,9 @@ const cloneData = (() => {
         commit(packet);return result;
     };
     return {serialize,prepare,validate,commit,commitPlan,deserialize,transferList,registerTransfer(handler){
-        add(transferTypes,handler);add(uncloneable,handler.brand);
-    },registerUncloneable(test){
+        add(transferTypes,handler);add(uncloneable,handler.brand);add(uncloneableNames,handlerName(handler));
+    },registerUncloneable(test,name='Web object'){
         if(typeof test!=='function')throw new TypeErr('Expected a private brand predicate');
-        add(uncloneable,test);
+        add(uncloneable,test);add(uncloneableNames,name);
     }};
 })();

@@ -5,6 +5,7 @@
 #include "form_file.h"
 #include "form_value.h"
 #include "form_validation.h"
+#define NATIVE_PICKER_FILE_COUNT 64 /* trusted picker selection storage, not script FileList quota */
 
 struct picker_entry { char name[256]; uint32_t type; bool selected; };
 struct picker_state { struct picker_entry entries[512]; char path[1024], message[160]; int count, cursor, top; };
@@ -28,7 +29,7 @@ static void picker_load(struct picker_state *picker) {
         strlcpy(dest->name, entry.name, sizeof dest->name); dest->type = entry.type; dest->selected = false;
     }
     close(fd); qsort(picker->entries, picker->count, sizeof *picker->entries, picker_compare);
-    snprintf(picker->message, sizeof picker->message, "%d entries; limit 64 files / 16 MiB", picker->count);
+    snprintf(picker->message, sizeof picker->message, "%d entries; select up to %u files", picker->count, NATIVE_PICKER_FILE_COUNT);
 }
 static void picker_up(struct picker_state *picker) {
     char *slash = strrchr(picker->path, '/');
@@ -59,11 +60,11 @@ static bool picker_commit(web_doc *d, node_t *input, struct picker_state *picker
         if (picker->cursor >= 0 && picker->entries[picker->cursor].type == N_FT_DIR && !picker_join(path, sizeof path, picker->path, picker->entries[picker->cursor].name)) return false;
         const char *paths[] = {path}; return web_input_file_paths(d, input, paths, 1, true);
     }
-    char (*storage)[1024] = malloc(WEB_FILE_COUNT * 1024); if (!storage) return false;
-    const char *paths[WEB_FILE_COUNT]; unsigned count = 0; bool ok = true;
+    char (*storage)[1024] = malloc(NATIVE_PICKER_FILE_COUNT * 1024); if (!storage) return false;
+    const char *paths[NATIVE_PICKER_FILE_COUNT]; unsigned count = 0; bool ok = true;
     for (int index = 0; index < picker->count; index++) {
         struct picker_entry *entry = &picker->entries[index]; if (!entry->selected || entry->type != N_FT_FILE) continue;
-        if (count >= WEB_FILE_COUNT || !picker_join(storage[count], 1024, picker->path, entry->name)) { ok = false; break; }
+        if (count >= NATIVE_PICKER_FILE_COUNT || !picker_join(storage[count], 1024, picker->path, entry->name)) { ok = false; break; }
         paths[count] = storage[count]; count++;
     }
     ok = ok && count && web_input_file_paths(d, input, paths, count, false); free(storage); return ok;
@@ -107,7 +108,7 @@ bool web_input_choose_files(web_doc *d, web_node *input) {
             if (entry->type == N_FT_DIR) { char path[1024]; if (picker_join(path, sizeof path, picker->path, entry->name)) { strcpy(picker->path, path); picker_load(picker); } }
             else if (!directory) { entry->selected = true; commit = true; }
         }
-        if (commit) { if (picker_commit(d, input, picker, directory)) { chosen = true; break; } strcpy(picker->message, "Selection failed: regular files only; 64 files / 16 MiB maximum"); }
+        if (commit) { if (picker_commit(d, input, picker, directory)) { chosen = true; break; } strcpy(picker->message, "Selection failed: regular files, picker metadata and available memory required"); }
         int rows = MAX(1, (window->h - 100) / 24);
         picker->top = MAX(0, MIN(picker->top, picker->count - rows));
         if (picker->cursor >= 0) { if (picker->cursor < picker->top) picker->top = picker->cursor; else if (picker->cursor >= picker->top + rows) picker->top = picker->cursor - rows + 1; }

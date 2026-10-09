@@ -1,4 +1,4 @@
-/* Bounded, real Canvas2D subset. Unsupported GPU contexts return null rather
+/* Real Canvas2D subset. Unsupported GPU contexts return null rather
  * than a fabricated WebGL object. Native storage is painted by web_paint. */
 const canvasBridge = (() => {
     'use strict';
@@ -7,7 +7,9 @@ const canvasBridge = (() => {
     const Float64=Float64Array, Bytes=Uint8ClampedArray, finite=Number.isFinite;
     const abs=Math.abs,ceil=Math.ceil,floor=Math.floor,cos=Math.cos,sin=Math.sin,atan2=Math.atan2;
     const native=host.canvas, defer=setTimeout, apply=Reflect.apply, blobFrom=blobBridge.fromBytes;
-    const PATH_VALUES=8192*2;
+    /* Array length is a uint32 representation in this engine. Typed-array
+       backing buffers enforce their own representation/allocation failures. */
+    const ARRAY_LENGTH=0xffffffff;
     const byteProto=Object.getPrototypeOf(Bytes.prototype), byteBuffer=Object.getOwnPropertyDescriptor(byteProto,'buffer').get, byteOffset=Object.getOwnPropertyDescriptor(byteProto,'byteOffset').get;
     class HTMLCanvasElement extends HTMLElement {constructor(){throw new TypeError('Illegal HTMLCanvasElement constructor');}}
     class CanvasRenderingContext2D {constructor(){throw new TypeError('Illegal CanvasRenderingContext2D constructor');}}
@@ -22,10 +24,10 @@ const canvasBridge = (() => {
     function valid(values){return values.every(finite);}
     function point(s,x,y){const m=s.matrix;return [m[0]*x+m[2]*y+m[4],m[1]*x+m[3]*y+m[5]];}
     function color(s,stroke=false){const v=stroke?s.strokeColor:s.fillColor;return ((v&0xffffff)|((floor((v>>>24)*s.alpha+0.5)&255)<<24))>>>0;}
-    function pathBuffer(points){if(points.length>PATH_VALUES)throw new RangeError('Canvas path limit');return new Float64(points).buffer;}
-    function append(s,p,move=false){if(s.path.length+(move&&s.path.length?4:2)>PATH_VALUES)throw new RangeError('Canvas path limit');if(move&&s.path.length)s.path.push(NaN,NaN);s.path.push(p[0],p[1]);s.last=p;if(move||!s.first){s.first=p;s.subpathCount=1;}else s.subpathCount++;}
+    function pathBuffer(points){return new Float64(points).buffer;}
+    function append(s,p,move=false){capacity(s,move&&s.path.length?2:1);if(move&&s.path.length)s.path.push(NaN,NaN);s.path.push(p[0],p[1]);s.last=p;if(move||!s.first){s.first=p;s.subpathCount=1;}else s.subpathCount++;}
     function resetPath(s){s.path=[];s.first=null;s.last=null;s.subpathCount=0;}
-    function capacity(s,points){if(s.path.length+points*2>PATH_VALUES)throw new RangeError('Canvas path limit');}
+    function capacity(s,points){if(s.path.length+points*2>ARRAY_LENGTH)throw new RangeError('Canvas path array length representation');}
     function matrixDictionary(value){
         if(value==null)return [1,0,0,1,0,0];
         if(typeof value!=='object'&&typeof value!=='function')throw new TypeError('Expected matrix dictionary');
@@ -80,9 +82,12 @@ const canvasBridge = (() => {
         if(valid([rx,ry,cx,cy,start,end])){ellipsePath(s,cx,cy,rx,ry,rotation,start,end,!sweep);s.path[s.path.length-2]=x;s.path[s.path.length-1]=y;s.last=[x,y];}
     }
     function svgPath(receiver,text){
-        if(text.length>16384)throw new RangeError('SVG path source limit');const s=paths.get(receiver);let at=0,command='',previous='',cx=0,cy=0,first=null,control=null;
+        const s=paths.get(receiver);let at=0,command='',previous='',cx=0,cy=0,first=null,control=null;
+        /* Match at the cursor without copying the remaining source once for
+           every token: large real SVG paths stay linear in source storage. */
+        const scalar=/[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/y,arcFlag=/[01]/y;
         const skip=()=>{while(at<text.length&&/[\t\n\f\r ,]/.test(text[at]))at++;};
-        const take=(flag=false)=>{skip();const m=(flag?/^[01]/:/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/).exec(text.slice(at));if(!m)return null;at+=m[0].length;const n=number(m[0]);return finite(n)?n:null;};
+        const take=(flag=false)=>{skip();const parser=flag?arcFlag:scalar;parser.lastIndex=at;const m=parser.exec(text);if(!m)return null;at=parser.lastIndex;const n=number(m[0]);return finite(n)?n:null;};
         while(at<text.length){skip();if(at===text.length)break;if(/[A-Za-z]/.test(text[at]))command=text[at++];
             const upper=command.toUpperCase(),relative=command!==upper,arity={M:2,L:2,H:1,V:1,C:6,S:4,Q:4,T:2,A:7,Z:0}[upper];
             if(arity===undefined||(!first&&upper!=='M'))break;
@@ -138,7 +143,7 @@ const canvasBridge = (() => {
                 if(split<0)dashed=[...dashed,NaN,Infinity];
                 else dashed=[...dashed.slice(last+2),...dashed.slice(2,split),...dashed.slice(split,last)];
             }
-            if(dashed.length){if(out.length)out.push(NaN,NaN);for(let i=0;i<dashed.length;i++)out.push(dashed[i]);if(out.length>PATH_VALUES)throw new RangeError('Canvas path limit');}
+            if(dashed.length){if(out.length+dashed.length+(out.length?2:0)>ARRAY_LENGTH)throw new RangeError('Canvas path array length representation');if(out.length)out.push(NaN,NaN);for(let i=0;i<dashed.length;i++)out.push(dashed[i]);}
             first=end+2;
         }
         return {points:out,width:s.lineWidth};
@@ -190,7 +195,7 @@ const canvasBridge = (() => {
         getLineDash(){return canvasDash.copy(state(this).dash);},
         fillRect(...v){rect(this,'rect',v);},clearRect(...v){rect(this,'clear',v);},
         strokeRect(...v){state(this);v=args(v,4);const s=state(this);if(!valid(v))return;const [x,y,w,h]=v,p=[point(s,x,y),point(s,x+w,y),point(s,x+w,y+h),point(s,x,y+h),point(s,x,y)];strokePath(s,[...p.flat(),NaN,Infinity]);},
-        save(){const s=state(this);if(s.stack.length===64)throw new RangeError('Canvas save stack limit');const saved={fill:s.fill,stroke:s.stroke,fillColor:s.fillColor,strokeColor:s.strokeColor,alpha:s.alpha,lineWidth:s.lineWidth,dash:canvasDash.copy(s.dash),dashOffset:s.dashOffset,smoothing:s.smoothing,font:s.font,fontSize:s.fontSize,fontStyle:s.fontStyle,fontFamily:s.fontFamily,align:s.align,baseline:s.baseline,direction:s.direction,matrix:s.matrix.slice()};s.stack.push(saved);try{native(s.canvas,'save');}catch(e){s.stack.pop();throw e;}},
+        save(){const s=state(this);const saved={fill:s.fill,stroke:s.stroke,fillColor:s.fillColor,strokeColor:s.strokeColor,alpha:s.alpha,lineWidth:s.lineWidth,dash:canvasDash.copy(s.dash),dashOffset:s.dashOffset,smoothing:s.smoothing,font:s.font,fontSize:s.fontSize,fontStyle:s.fontStyle,fontFamily:s.fontFamily,align:s.align,baseline:s.baseline,direction:s.direction,matrix:s.matrix.slice()};s.stack.push(saved);try{native(s.canvas,'save');}catch(e){s.stack.pop();throw e;}},
         restore(){const s=state(this),saved=s.stack[s.stack.length-1];if(saved){native(s.canvas,'restore');s.stack.pop();Object.assign(s,saved);}},
         reset(){const s=state(this);native(s.canvas,'reset');s.version=native(s.canvas,'version');defaults(s);},
         beginPath(){resetPath(state(this));},
@@ -224,8 +229,8 @@ const canvasBridge = (() => {
     for(const [name,value] of Object.entries(pathMethods))define(Path2D.prototype,name,{value:function(...args){if(!paths.has(this))throw new TypeError('Illegal Path2D receiver');return apply(value,this,args);},writable:true,configurable:true});
     class ImageData {
         constructor(a,b,c){let data,w,h;if(a instanceof Bytes){data=a;w=number(b)>>>0;h=c===undefined?data.length/4/w:number(c)>>>0;if(!w||!finite(h)||h!==floor(h)||h<1||data.length!==w*h*4)throw namedError('IndexSizeError','Invalid ImageData dimensions');}
-            else{w=abs(Math.trunc(number(a)));h=abs(Math.trunc(number(b)));if(!finite(w)||!finite(h)||!w||!h)throw namedError('IndexSizeError','Invalid ImageData dimensions');if(w*h>1048576)throw new RangeError('ImageData memory limit');data=new Bytes(w*h*4);}
-            if(w*h>1048576)throw new RangeError('ImageData memory limit');images.set(this,{data,w,h});}
+            else{w=abs(Math.trunc(number(a)));h=abs(Math.trunc(number(b)));if(!finite(w)||!finite(h)||!w||!h||w>ARRAY_LENGTH||h>ARRAY_LENGTH)throw namedError('IndexSizeError','Invalid ImageData dimensions');if(!Number.isSafeInteger(w*h*4))throw new RangeError('ImageData byte size representation');data=new Bytes(w*h*4);}
+            images.set(this,{data,w,h});}
         get width(){const s=images.get(this);if(!s)throw new TypeError('Illegal ImageData receiver');return s.w;}
         get height(){const s=images.get(this);if(!s)throw new TypeError('Illegal ImageData receiver');return s.h;}
         get data(){const s=images.get(this);if(!s)throw new TypeError('Illegal ImageData receiver');return s.data;}

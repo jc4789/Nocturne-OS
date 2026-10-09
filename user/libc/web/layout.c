@@ -7,6 +7,8 @@
    it was laid out in); w, h are its content size. */
 #include <stdio.h>
 #include <math.h>
+#include <limits.h>
+#include <nocturne.h>
 #include "webi.h"
 #include "web_dialog.h"
 #include "js_canvas.h"
@@ -92,7 +94,7 @@ static float line_height_px(const style_t *st) {
 float style_line_height(const style_t *st) { return line_height_px(st); }
 
 /* letter- and word-spacing aware width */
-static float text_width(const style_t *st, const wfont *f, const char *s, size_t n) {
+static float text_width_uncached(const style_t *st, const wfont *f, const char *s, size_t n) {
     float w = wf_width(f, s, n);
     if (st->letter_spacing != 0 || st->word_spacing != 0) {
         for (size_t i = 0; i < n; i++) {
@@ -102,6 +104,8 @@ static float text_width(const style_t *st, const wfont *f, const char *s, size_t
     }
     return w;
 }
+
+#include "layout_text_cache.h"
 
 /* ---------------------------------------------------------------- geometry helpers */
 static float hext(const box_t *b) { return b->p[1] + b->p[3] + b->b[1] + b->b[3]; }
@@ -157,6 +161,21 @@ static float clamp_h(const box_t *b, float h, float cbh) {
     float mn = spec_h(b, &b->st->min_height, cbh);
     if (mn >= 0 && h < mn) h = mn;
     return h < 0 ? 0 : h;
+}
+
+/* A non-replaced absolute/fixed box with auto height and both vertical
+   insets specified has a definite content height before its descendants are
+   laid out. Applying that height only after layout makes height:100% children
+   incorrectly see an indefinite containing block and collapse to zero. */
+static float resolved_content_height(const box_t *b,float cbh) {
+    float h=spec_h(b,&b->st->height,cbh);
+    if(h>=0 || !len_auto(&b->st->height) || !b->abspos || cbh<0 ||
+       (b->kind==B_ATOMIC && b->atomic!=AT_INLINE_BLOCK) ||
+       len_auto(&b->st->inset[0]) || len_auto(&b->st->inset[2]) ||
+       (b->node && b->node->box==b && web_dialog_is_modal(D,b->node)))return h;
+    h=cbh-len_resolve(&b->st->inset[0],cbh)-len_resolve(&b->st->inset[2],cbh)-
+      vext(b)-b->m[0]-b->m[2];
+    return clamp_h(b,h,cbh);
 }
 
 static float mcollapse(float a, float b) {
@@ -287,6 +306,7 @@ static float bfc_bottom(const struct bfc *f) { return bfc_clear(f, CL_BOTH); }
 
 /* ---------------------------------------------------------------- forward declarations */
 static void layout_inner(box_t *b, struct bfc *f, float ox, float oy, float cbh);
+static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float cbh, float usedh);
 static void intrinsic(box_t *b, float *mn, float *mx);
 static void outer_intrinsic(box_t *c, float *mn, float *mx);
 static void size_atomic(box_t *c, float cbw, float cbh);
@@ -629,6 +649,7 @@ static void text_items(box_t *t, struct ibuild *s) {
 
 static void build_items(box_t *parent, struct ibuild *s) {
     for (box_t *c = parent->first; c; c = c->next) {
+        web_avmedia_checkpoint();
         if (c->abspos) {
             ipush(s->v, IT_ABS)->box = c;
             continue;
@@ -711,14 +732,14 @@ struct iline {
     float ox, oy;
     struct ivec *items;
     sbuf runs, decos;
-    struct open_box open[64];
+    struct open_box *open;
     int nopen;
     float y;           /* top of the current line */
     float left, right; /* available space of the current line */
     bool first_line;
     float first_bl, last_bl;
     float strut_lh;
-    int pending_floats[64];
+    int *pending_floats;
     int npending;
 };
 
@@ -737,8 +758,8 @@ static void line_space(struct iline *L) {
 
 static void add_deco(struct iline *L, box_t *ib, float x0, float x1, float baseline, bool first, bool last) {
     const style_t *st = ib->st;
-    bool visible = (st->bg_color >> 24) || st->has_grad || st->bg_img || st->mask_img || ib->b[0] || ib->b[1] || ib->b[2] || ib->b[3];
-    if (!visible) return;
+    /* These are also the element's real line-fragment border boxes. A plain
+       link still has geometry and is hit-testable without a painted background. */
     wfont f = style_font(st);
     float asc, desc;
     wf_metrics(&f, &asc, &desc);
@@ -866,12 +887,10 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
         switch (it->kind) {
         case IT_OPEN: {
             box_t *ib = it->box;
-            if (L->nopen < 64) {
-                L->open[L->nopen].box = ib;
-                L->open[L->nopen].x = x + ib->m[3];
-                L->open[L->nopen].first = true;
-                L->nopen++;
-            }
+            L->open[L->nopen].box = ib;
+            L->open[L->nopen].x = x + ib->m[3];
+            L->open[L->nopen].first = true;
+            L->nopen++;
             if (ib->node && !ib->node->anchor_block) {
                 ib->node->anchor_block = b;
                 ib->node->anchor_dy = L->y;
@@ -983,20 +1002,20 @@ static int split_word(struct iline *L, int i, float avail) {
     return 1;
 }
 
+static node_t *inline_link_ancestor(const box_t *b) {
+    /* Anonymous boxes have no extra DOM ancestry. The closest native box's
+       flat-tree ancestors already include display:contents and shadow/slot
+       hosts; restarting this walk at every outer box is quadratic. Top-layer
+       reparenting also keeps this native DOM ancestry, not the paint parent. */
+    while(b && !b->node)b=b->parent;
+    for(node_t *n=b?b->node:NULL;n;n=doc_flat_parent(n))
+        if(n->type==N_ELEM && n->tag==T_a && node_attr(n,"href"))return n;
+    return NULL;
+}
 static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh) {
     struct ivec iv = {0};
     struct ibuild bs = {&iv, true, NULL, 0};
-    if (b->node && b->node->tag == T_a && node_attr(b->node, "href")) bs.link = b->node;
-    for (node_t *n = b->node; n && !bs.link; n = doc_flat_parent(n))
-        if (n->type == N_ELEM && n->tag == T_a && node_attr(n, "href")) bs.link = n;
-    if (!bs.link)
-        for (box_t *p = b->parent; p && !bs.link; p = p->parent)
-            if (p->node)
-                for (node_t *n = p->node; n; n = doc_flat_parent(n))
-                    if (n->type == N_ELEM && n->tag == T_a && node_attr(n, "href")) {
-                        bs.link = n;
-                        break;
-                    }
+    bs.link=inline_link_ancestor(b);
     build_items(b, &bs);
     /* widths of inline box edges and atomic inlines */
     for (int i = 0; i < iv.n; i++) {
@@ -1015,6 +1034,14 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
     }
     struct iline L;
     memset(&L, 0, sizeof L);
+    size_t opens=0,floats=0;
+    for(int i=0;i<iv.n;i++){
+        if(iv.v[i].kind==IT_OPEN)opens++;
+        else if(iv.v[i].kind==IT_FLOAT)floats++;
+    }
+    if(opens>SIZE_MAX/sizeof *L.open || floats>SIZE_MAX/sizeof *L.pending_floats)ar_alloc(&D->lmem,SIZE_MAX);
+    if(opens)L.open=ar_alloc(&D->lmem,opens*sizeof *L.open);
+    if(floats)L.pending_floats=ar_alloc(&D->lmem,floats*sizeof *L.pending_floats);
     L.blk = b;
     L.f = f;
     L.ox = ox;
@@ -1033,7 +1060,7 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
             if (line_w == 0 && chunk_w == 0) {
                 place_float(c, b, f, ox, oy, L.y);
                 line_space(&L);
-            } else if (L.npending < 64) L.pending_floats[L.npending++] = i;
+            } else L.pending_floats[L.npending++] = i;
             continue;
         }
         if (it->kind == IT_ABS) continue;
@@ -1169,13 +1196,17 @@ static box_t *first_inflow(const box_t *b) {
 }
 
 /* the top margin of c, collapsed with its first child's if they touch */
-static float top_chain(box_t *c, float cbw, int depth) {
-    float m = len_auto(&c->st->margin[0]) ? 0 : len_resolve(&c->st->margin[0], cbw);
-    if (depth < 32 && collapses_top(c)) {
-        box_t *f = first_inflow(c);
-        if (f) m = mcollapse(m, top_chain(f, cbw, depth + 1));
+static float top_chain(box_t *c, float cbw) {
+    /* A collapsed margin group takes its greatest positive and most negative
+       member. Native box trees are acyclic; a first-child chain needs neither
+       a depth quota nor a C call frame for each descendant. */
+    float positive = 0, negative = 0;
+    for (; c; c = collapses_top(c) ? first_inflow(c) : NULL) {
+        float m = len_auto(&c->st->margin[0]) ? 0 : len_resolve(&c->st->margin[0], cbw);
+        if (m > positive) positive = m;
+        if (m < negative) negative = m;
     }
-    return m;
+    return positive + negative;
 }
 
 /* the width of a block-level box in normal flow; sets w, x and auto margins */
@@ -1232,8 +1263,10 @@ static void layout_blocks(box_t *b, struct bfc *f, float ox, float oy, float cbh
             continue;
         }
         resolve_edges(c, cw);
-        float mt = top_chain(c, cw, 0);
-        if (!(first && hoisted)) pend = mcollapse(pend, mt);
+        /* The first child's collapsed top margin is already hoisted to b's
+           parent. Do not rescan its entire first-child chain for a value we
+           discard; repeating that at every nested block is quadratic. */
+        if (!(first && hoisted)) pend = mcollapse(pend, top_chain(c, cw));
         float y = cursor + pend;
         bool cleared = false;
         if (c->st->clear && f) {
@@ -1645,16 +1678,122 @@ struct fitem {
     float base, hypo, mn, mx, ext, size, cross;
     int align;
 };
+struct fline {
+    int first, end;
+    float cross, ascent, descent;
+};
 
-static void layout_flex(box_t *b, float cbh) {
+static bool stretches_height(const box_t *b, int align) {
+    return align == AI_STRETCH && len_auto(&b->st->height) &&
+           !len_auto(&b->st->margin[0]) && !len_auto(&b->st->margin[2]) &&
+           !(b->kind == B_ATOMIC && b->atomic != AT_INLINE_BLOCK);
+}
+
+static void layout_stretched_height(box_t *b, float usedh, float cbh) {
+    /* The final flex line / grid area, not an intrinsic measurement, supplies
+       this definite content height. Keep CSS height:auto and never feed the
+       resulting percentage content back into line or track sizing. Tables
+       retain their separate row-height model; this is not a table-cell fix. */
+    if (b->kind == B_TABLE) {
+        if (usedh > b->h) b->h = usedh;
+    } else if (b->first) layout_inner_used(b, NULL, 0, 0, cbh, usedh);
+    else b->h = usedh;
+}
+
+/* Sizes and main-axis placement are fixed before this pass. Reverse wrapping
+   swaps the cross edges; it never reverses order or mirrors rendered content. */
+static void flex_cross_lines(box_t *b, struct fitem *it, struct fline *lines,
+                             int count, bool column, bool single, float defh, float gap) {
+    bool flip = b->st->flex_wrap == FW_WRAP_REVERSE;
+    float sum = gap * (float)(count > 0 ? count - 1 : 0);
+    for (int l = 0; l < count; l++) sum += lines[l].cross;
+    float available = column ? b->w : defh >= 0 ? defh : sum;
+    float left = available - sum, start = 0, between = gap;
+    if (single && count) lines[0].cross = available;
+    else if (count) {
+        switch (b->st->align_content) {
+        case AC_NORMAL: case AC_STRETCH:
+            if (left > 0) for (int l = 0; l < count; l++) lines[l].cross += left / (float)count;
+            break;
+        case AC_FLEX_END: start = left; break;
+        case AC_START: start = flip ? left : 0; break;
+        case AC_END: start = flip ? 0 : left; break;
+        case AC_CENTER: start = left / 2; break;
+        case AC_BETWEEN: if (left > 0 && count > 1) between += left / (float)(count - 1); break;
+        case AC_AROUND:
+            if (left > 0) start = left / (float)count / 2, between += left / (float)count;
+            break;
+        case AC_EVENLY:
+            if (left > 0) start = left / ((float)count + 1), between += left / ((float)count + 1);
+            break;
+        }
+    }
+    float cursor = start, first_bl = -1;
+    for (int l = 0; l < count; l++) {
+        struct fline *line = &lines[l];
+        float origin = flip ? available - cursor - line->cross : cursor;
+        for (int i = line->first; i < line->end; i++) {
+            web_avmedia_checkpoint();
+            box_t *c = it[i].b;
+            int lo = column ? 3 : 0, hi = column ? 1 : 2;
+            bool auto_lo = len_auto(&c->st->margin[lo]), auto_hi = len_auto(&c->st->margin[hi]);
+            if (!auto_lo && !auto_hi && it[i].align == AI_STRETCH) {
+                if (!column && stretches_height(c, it[i].align)) {
+                    float want = clamp_h(c, line->cross - vext(c) - c->m[0] - c->m[2], defh);
+                    layout_stretched_height(c, want, defh);
+                } else if (column && len_auto(&c->st->width) && c->kind != B_TABLE &&
+                           !(c->kind == B_ATOMIC && c->atomic != AT_INLINE_BLOCK)) {
+                    float want = clamp_w(c, line->cross - hext(c) - c->m[1] - c->m[3], b->w);
+                    if (want != c->w) {
+                        c->w = want;
+                        /* A wrapped column has a definite main reference. Its
+                           final cross stretch cannot change its flexed height. */
+                        if (defh >= 0) layout_inner_used(c, NULL, 0, 0, defh, c->h);
+                        else layout_inner(c, NULL, 0, 0, defh);
+                    }
+                }
+            }
+            float outer = column ? c->w + hext(c) + c->m[1] + c->m[3] :
+                                   c->h + vext(c) + c->m[0] + c->m[2];
+            float off = 0, extra = line->cross - outer;
+            if (auto_lo || auto_hi) {
+                /* Auto margins refer to physical sides, not reversed edges.
+                   Oversized items overflow the physical block/inline end. */
+                if (extra > 0 && auto_lo) off = auto_hi ? extra / 2 : extra;
+            } else if (it[i].align == AI_CENTER) off = extra / 2;
+            else if (it[i].align == AI_END) off = flip ? 0 : extra;
+            else if (!column && it[i].align == AI_BASELINE && c->baseline >= 0) {
+                float baseline = c->m[0] + c->b[0] + c->p[0] + c->baseline;
+                off = (flip ? line->cross - line->descent : line->ascent) - baseline;
+            } else off = flip ? extra : 0;
+            float coordinate = origin + off + c->m[lo] + c->b[lo] + c->p[lo];
+            if (column) c->x = coordinate;
+            else c->y = coordinate;
+            if (first_bl < 0 && c->baseline >= 0) first_bl = c->y + c->baseline;
+        }
+        cursor += line->cross + between;
+    }
+    if (!column) b->h = available;
+    b->baseline = b->last_baseline = first_bl;
+}
+
+static void layout_flex(box_t *b, float defh) {
     const style_t *st = b->st;
     bool column = st->flex_direction == FD_COLUMN || st->flex_direction == FD_COLUMN_REVERSE;
     bool reverse = st->flex_direction == FD_ROW_REVERSE || st->flex_direction == FD_COLUMN_REVERSE;
     float cw = b->w;
-    float defh = spec_h(b, &st->height, cbh);
     int n = 0;
-    for (box_t *c = b->first; c; c = c->next) n++;
+    for (box_t *c = b->first; c; c = c->next) {
+        if (n == INT_MAX) { ar_alloc(&D->lmem, SIZE_MAX); return; }
+        n++;
+    }
     struct fitem *it = calloc((size_t)n + 1, sizeof *it);
+    struct fline *lines = calloc((size_t)n + 1, sizeof *lines);
+    if (!it || !lines) {
+        free(it); free(lines);
+        ar_alloc(&D->lmem, SIZE_MAX);
+        return;
+    }
     int k = 0;
     for (box_t *c = b->first; c; c = c->next) {
         c->cb = b;
@@ -1676,10 +1815,10 @@ static void layout_flex(box_t *b, float cbh) {
             it[j - 1] = t;
         }
     float gap_main = column ? st->gap_row : st->gap_col, gap_cross = column ? st->gap_col : st->gap_row;
-    float first_bl = -1;
+    int line_count = 0;
+    bool single = st->flex_wrap == FW_NOWRAP;
 
     if (column) {
-        float y = 0;
         for (int i = 0; i < n; i++) {
             box_t *c = it[i].b;
             resolve_edges(c, cw);
@@ -1691,54 +1830,74 @@ static void layout_flex(box_t *b, float cbh) {
             } else if (c->kind == B_TABLE) {
                 table_width(c, cw);
                 w = c->w;
-            } else if (w < 0) w = al == AI_STRETCH ? cw - hext(c) - c->m[1] - c->m[3] : stf_width(c, cw);
+            } else if (w < 0) w = single && al == AI_STRETCH &&
+                !len_auto(&c->st->margin[1]) && !len_auto(&c->st->margin[3]) ?
+                cw - hext(c) - c->m[1] - c->m[3] : stf_width(c, cw);
             c->w = clamp_w(c, w, cw);
             if (c->kind != B_ATOMIC || c->atomic == AT_INLINE_BLOCK) layout_inner(c, NULL, 0, 0, defh);
             it[i].size = c->h + vext(c) + c->m[0] + c->m[2];
             it[i].align = al;
         }
-        /* grow into a definite height */
-        float total = gap_main * (float)(n > 0 ? n - 1 : 0);
-        float grow = 0;
-        for (int i = 0; i < n; i++) total += it[i].size, grow += it[i].b->st->flex_grow;
-        float free_space = defh >= 0 ? defh - total : 0;
-        if (free_space > 0 && grow > 0) {
-            for (int i = 0; i < n; i++) {
-                float add = free_space * it[i].b->st->flex_grow / grow;
-                it[i].b->h += add;
-                it[i].size += add;
+        int i0 = 0;
+        float content_height = 0;
+        while (i0 < n) {
+            int i1 = i0;
+            float total = 0;
+            /* Indefinite height cannot create arbitrary column breaks. */
+            while (i1 < n) {
+                float add = it[i1].size + (i1 > i0 ? gap_main : 0);
+                if (!single && defh >= 0 && i1 > i0 && total + add > defh + 0.01f) break;
+                total += add;
+                i1++;
             }
-            free_space = 0;
-        }
-        float start = 0, between = gap_main;
-        if (free_space > 0) {
-            switch (st->justify_content) {
-            case JC_END: start = free_space; break;
-            case JC_CENTER: start = free_space / 2; break;
-            case JC_BETWEEN: if (n > 1) between += free_space / (float)(n - 1); break;
-            case JC_AROUND: start = free_space / (float)n / 2; between += free_space / (float)n; break;
-            case JC_EVENLY: start = free_space / (float)(n + 1); between += free_space / (float)(n + 1); break;
+            float grow = 0;
+            for (int i = i0; i < i1; i++) grow += it[i].b->st->flex_grow;
+            float free_space = defh >= 0 ? defh - total : 0;
+            if (free_space > 0 && grow > 0) {
+                float share = free_space * fminf_(grow, 1);
+                for (int i = i0; i < i1; i++) {
+                    box_t *c = it[i].b;
+                    float old = c->h, want = clamp_h(c, old + share * c->st->flex_grow / grow, defh);
+                    layout_stretched_height(c, want, defh);
+                    it[i].size += c->h - old;
+                    total += c->h - old;
+                }
+                free_space = defh - total;
             }
+            float start = 0, between = gap_main, auto_m = 0;
+            size_t nauto = 0;
+            for (int i = i0; i < i1; i++)
+                nauto += len_auto(&it[i].b->st->margin[0]) + len_auto(&it[i].b->st->margin[2]);
+            if (free_space > 0 && nauto) auto_m = free_space / (float)nauto;
+            else if (free_space > 0) {
+                int count = i1 - i0;
+                switch (st->justify_content) {
+                case JC_END: start = free_space; break;
+                case JC_CENTER: start = free_space / 2; break;
+                case JC_BETWEEN: if (count > 1) between += free_space / (float)(count - 1); break;
+                case JC_AROUND: start = free_space / (float)count / 2; between += free_space / (float)count; break;
+                case JC_EVENLY: start = free_space / ((float)count + 1); between += free_space / ((float)count + 1); break;
+                }
+            }
+            struct fline *line = &lines[line_count++];
+            *line = (struct fline){.first=i0, .end=i1};
+            float y = start, extent = defh >= 0 ? defh : total;
+            for (int i = i0; i < i1; i++) {
+                box_t *c = it[i].b;
+                int lead = reverse ? 2 : 0, trail = reverse ? 0 : 2;
+                if (len_auto(&c->st->margin[lead])) y += auto_m;
+                float by = reverse ? extent - y - it[i].size : y;
+                c->y = by + c->m[0] + c->b[0] + c->p[0];
+                line->cross = fmaxf_(line->cross, c->w + hext(c) + c->m[1] + c->m[3]);
+                y += it[i].size + between;
+                if (len_auto(&c->st->margin[trail])) y += auto_m;
+            }
+            content_height = fmaxf_(content_height, extent);
+            i0 = i1;
         }
-        y = start;
-        for (int ii = 0; ii < n; ii++) {
-            int i = reverse ? n - 1 - ii : ii;
-            box_t *c = it[i].b;
-            float mw = c->w + hext(c) + c->m[1] + c->m[3];
-            float xoff = 0;
-            if (len_auto(&c->st->margin[3]) && len_auto(&c->st->margin[1])) xoff = (cw - mw) / 2;
-            else if (len_auto(&c->st->margin[3])) xoff = cw - mw;
-            else if (it[i].align == AI_CENTER) xoff = (cw - mw) / 2;
-            else if (it[i].align == AI_END) xoff = cw - mw;
-            c->x = xoff + c->m[3] + c->b[3] + c->p[3];
-            c->y = y + c->m[0] + c->b[0] + c->p[0];
-            if (first_bl < 0 && c->baseline >= 0) first_bl = c->y + c->baseline;
-            y += it[i].size + between;
-        }
-        b->h = n ? y - between : 0;
-        if (defh >= 0) b->h = defh;
-        b->baseline = b->last_baseline = first_bl;
-        free(it);
+        b->h = defh >= 0 ? defh : content_height;
+        flex_cross_lines(b, it, lines, line_count, true, single, defh, gap_cross);
+        free(lines); free(it);
         return;
     }
 
@@ -1780,9 +1939,7 @@ static void layout_flex(box_t *b, float cbh) {
         it[i].align = c->st->align_self != 255 ? c->st->align_self : st->align_items;
     }
     /* lines */
-    float y = 0;
     int i0 = 0;
-    bool single = !st->flex_wrap;
     while (i0 < n) {
         int i1 = i0;
         float used = 0;
@@ -1813,7 +1970,8 @@ static void layout_flex(box_t *b, float cbh) {
             it[i].size = fminf_(fmaxf_(s, it[i].mn), it[i].mx);
         }
         /* lay out the items at their sizes */
-        float cross = 0, line_bl = -1;
+        struct fline *line = &lines[line_count++];
+        *line = (struct fline){.first=i0, .end=i1};
         for (int i = i0; i < i1; i++) {
             box_t *c = it[i].b;
             if (!(c->kind == B_ATOMIC && c->atomic != AT_INLINE_BLOCK)) {
@@ -1821,14 +1979,18 @@ static void layout_flex(box_t *b, float cbh) {
                 layout_inner(c, NULL, 0, 0, defh);
             } else c->w = it[i].size;
             it[i].cross = c->h + vext(c) + c->m[0] + c->m[2];
-            cross = fmaxf_(cross, it[i].cross);
-            if (it[i].align == AI_BASELINE && c->baseline >= 0)
-                line_bl = fmaxf_(line_bl, c->m[0] + c->b[0] + c->p[0] + c->baseline);
+            line->cross = fmaxf_(line->cross, it[i].cross);
+            if (it[i].align == AI_BASELINE && c->baseline >= 0 &&
+                !len_auto(&c->st->margin[0]) && !len_auto(&c->st->margin[2])) {
+                float ascent = c->m[0] + c->b[0] + c->p[0] + c->baseline;
+                line->ascent = fmaxf_(line->ascent, ascent);
+                line->descent = fmaxf_(line->descent, it[i].cross - ascent);
+            }
         }
-        if (single && defh >= 0) cross = defh;
+        line->cross = fmaxf_(line->cross, line->ascent + line->descent);
         /* main axis positions */
         float total = gap_main * (float)(i1 - i0 - 1);
-        int nauto = 0;
+        size_t nauto = 0;
         for (int i = i0; i < i1; i++) {
             total += it[i].size + it[i].ext;
             nauto += len_auto(&it[i].b->st->margin[3]) + len_auto(&it[i].b->st->margin[1]);
@@ -1842,43 +2004,23 @@ static void layout_flex(box_t *b, float cbh) {
             case JC_CENTER: start = left / 2; break;
             case JC_BETWEEN: if (i1 - i0 > 1) between += left / (float)(i1 - i0 - 1); break;
             case JC_AROUND: start = left / (float)(i1 - i0) / 2; between += left / (float)(i1 - i0); break;
-            case JC_EVENLY: start = left / (float)(i1 - i0 + 1); between += left / (float)(i1 - i0 + 1); break;
+            case JC_EVENLY: start = left / ((float)(i1 - i0) + 1); between += left / ((float)(i1 - i0) + 1); break;
             }
         }
         float x = start;
-        for (int ii = i0; ii < i1; ii++) {
-            int i = reverse ? i1 - 1 - (ii - i0) : ii;
+        for (int i = i0; i < i1; i++) {
             box_t *c = it[i].b;
-            if (len_auto(&c->st->margin[3])) x += auto_m;
-            float bx = x + c->m[3];
-            float off = 0;
-            switch (it[i].align) {
-            case AI_CENTER: off = (cross - it[i].cross) / 2; break;
-            case AI_END: off = cross - it[i].cross; break;
-            case AI_BASELINE:
-                if (line_bl >= 0 && c->baseline >= 0) off = line_bl - (c->m[0] + c->b[0] + c->p[0] + c->baseline);
-                break;
-            case AI_STRETCH:
-                if (len_auto(&c->st->height) && !(c->kind == B_ATOMIC && c->atomic != AT_INLINE_BLOCK)) {
-                    float want = cross - vext(c) - c->m[0] - c->m[2];
-                    want = clamp_h(c, want, defh);
-                    if (want > c->h) c->h = want;
-                }
-                break;
-            }
+            int lead = reverse ? 1 : 3, trail = reverse ? 3 : 1;
+            if (len_auto(&c->st->margin[lead])) x += auto_m;
+            float bx = (reverse ? cw - x - it[i].size - it[i].ext : x) + c->m[3];
             c->x = bx + c->b[3] + c->p[3];
-            c->y = y + off + c->m[0] + c->b[0] + c->p[0];
-            if (first_bl < 0 && c->baseline >= 0) first_bl = c->y + c->baseline;
             x += it[i].size + it[i].ext + between;
-            if (len_auto(&c->st->margin[1])) x += auto_m;
+            if (len_auto(&c->st->margin[trail])) x += auto_m;
         }
-        y += cross + gap_cross;
         i0 = i1;
     }
-    b->h = n ? y - gap_cross : 0;
-    if (defh >= 0) b->h = defh;
-    b->baseline = b->last_baseline = first_bl;
-    free(it);
+    flex_cross_lines(b, it, lines, line_count, false, single, defh, gap_cross);
+    free(lines); free(it);
 }
 
 /* ---------------------------------------------------------------- grid */
@@ -2345,10 +2487,9 @@ static void grid_intrinsic(box_t *b, float *mn, float *mx) {
     gr_free(&g);
 }
 
-static void layout_grid(box_t *b, float cbh) {
+static void layout_grid(box_t *b, float defh) {
     const style_t *st = b->st;
     float cw = b->w;
-    float defh = spec_h(b, &st->height, cbh);
     for (box_t *c = b->first; c; c = c->next) {
         c->cb = b;
         if (c->abspos) {
@@ -2423,14 +2564,14 @@ static void layout_grid(box_t *b, float cbh) {
         else if (js == AI_CENTER) xoff = (aw - ow) / 2;
         else if (js == AI_END) xoff = aw - ow;
         float yoff = 0;
-        bool vam = len_auto(&c->st->margin[0]) || len_auto(&c->st->margin[2]);
         if (len_auto(&c->st->margin[0]) && len_auto(&c->st->margin[2])) yoff = (ah - t->h) / 2;
         else if (len_auto(&c->st->margin[0])) yoff = ah - t->h;
         else if (as == AI_CENTER) yoff = (ah - t->h) / 2;
         else if (as == AI_END) yoff = ah - t->h;
-        else if (as == AI_STRETCH && !replaced && !vam && len_auto(&c->st->height)) {
+        else if (stretches_height(c, as)) {
             float want = clamp_h(c, ah - vext(c) - c->m[0] - c->m[2], ah);
-            if (want > c->h) c->h = want;
+            layout_stretched_height(c, want, ah);
+            t->h = c->h + vext(c) + c->m[0] + c->m[2];
         }
         c->x = ax + xoff + c->m[3] + c->b[3] + c->p[3];
         c->y = ay + yoff + c->m[0] + c->b[0] + c->p[0];
@@ -2597,43 +2738,73 @@ static void outer_intrinsic(box_t *c, float *mn, float *mx) {
 /* Legacy frameset track grammar: integer pixels, percentages and weighted *.
    It lays out native child viewport boxes, never inserts their DOM into the
    containing document. Oversubscribed fixed tracks shrink proportionally. */
-static unsigned frameset_tracks(const char *text,float extent,float tracks[32]) {
-    unsigned count=0;float fixed=0,stars=0;float weights[32]={0};
-    if(!text || !*text){tracks[0]=extent;return 1;}
+struct frameset_track { double value, weight; };
+static struct frameset_track *frameset_tracks(const char *text,float extent,size_t *length) {
+    size_t capacity=1;
+    if(text)for(const char *p=text;*p;p++)if(*p==',' && p[1]){
+        if(capacity==SIZE_MAX)ar_alloc(&D->lmem,SIZE_MAX);
+        capacity++;
+    }
+    if(capacity>SIZE_MAX/sizeof(struct frameset_track))ar_alloc(&D->lmem,SIZE_MAX);
+    struct frameset_track *tracks=ar_alloc(&D->lmem,capacity*sizeof *tracks);
+    size_t count=0;double fixed=0,stars=0;
+    double available=isfinite(extent) && extent>0?extent:0;
+    if(!text || !*text){tracks[0].value=available;*length=1;return tracks;}
     const char *p=text;
-    while(*p && count<32){
+    while(*p){
         while(is_space(*p))p++;
-        char *end;float value=strtof(p,&end);if(end==p)value=0;
+        char *end;double value=strtof(p,&end);if(end==p || !isfinite(value) || value<0)value=0;
         p=end;while(is_space(*p))p++;
-        if(*p=='*'){weights[count]=value>0?value:1;stars+=weights[count];tracks[count]=0;p++;}
-        else {if(*p=='%'){value=extent*value/100;p++;}tracks[count]=fmaxf_(0,value);fixed+=tracks[count];}
+        if(*p=='*'){tracks[count].weight=value>0?value:1;stars+=tracks[count].weight;p++;}
+        else {if(*p=='%'){value=available*(value/100);p++;}tracks[count].value=value;fixed+=value;}
         count++;while(*p && *p!=',')p++;if(*p)p++;
     }
-    if(!count){tracks[0]=extent;return 1;}
-    if(fixed>extent && fixed>0)for(unsigned i=0;i<count;i++)tracks[i]*=extent/fixed;
-    else if(stars>0)for(unsigned i=0;i<count;i++)tracks[i]+=(extent-fixed)*weights[i]/stars;
-    else if(fixed<extent && fixed>0)for(unsigned i=0;i<count;i++)tracks[i]*=extent/fixed;
-    else if(fixed==0)for(unsigned i=0;i<count;i++)tracks[i]=extent/count;
-    return count;
+    if(fixed>available && fixed>0)for(size_t i=0;i<count;i++)tracks[i].value*=available/fixed;
+    else if(stars>0)for(size_t i=0;i<count;i++)tracks[i].value+=(available-fixed)*tracks[i].weight/stars;
+    else if(fixed>0)for(size_t i=0;i<count;i++)tracks[i].value*=available/fixed;
+    else for(size_t i=0;i<count;i++)tracks[i].value=available/count;
+    *length=count;return tracks;
+}
+struct frameset_layout {
+    struct frameset_layout *previous;
+    box_t *box,*next;
+    struct frameset_track *rows,*cols;
+    size_t nr,nc,row,col;
+    float x,y;
+};
+static struct frameset_layout *frameset_layout_push(box_t *b,float height,struct frameset_layout *previous) {
+    struct frameset_layout *s=ar_alloc(&D->lmem,sizeof *s);
+    s->previous=previous;s->box=b;s->next=b->first;
+    s->rows=frameset_tracks(node_attr(b->node,"rows"),height,&s->nr);
+    s->cols=frameset_tracks(node_attr(b->node,"cols"),b->w,&s->nc);
+    b->h=height;b->inline_ctx=false;return s;
 }
 static void layout_frameset(box_t *b,float height) {
-    float rows[32],cols[32];
-    unsigned nr=frameset_tracks(node_attr(b->node,"rows"),height,rows),nc=frameset_tracks(node_attr(b->node,"cols"),b->w,cols);
-    unsigned index=0;float y=0,x=0;
-    for(box_t *child=b->first;child;child=child->next,index++){
-        unsigned row=index/nc,col=index%nc;
-        if(row>=nr){child->w=child->h=0;continue;}
-        if(col==0){x=0;if(row)y+=rows[row-1];}
-        child->cb=b;child->x=x;child->y=y;child->w=cols[col];child->h=rows[row];
+    /* Both track storage and nested frameset traversal follow actual demand;
+       no native stack recursion or fixed number of accepted rows/columns. */
+    struct frameset_layout *s=frameset_layout_push(b,height,NULL);
+    while(s){
+        box_t *child=s->next;
+        if(!child){s=s->previous;continue;}
+        s->next=child->next;
+        if(s->row>=s->nr){child->w=child->h=0;continue;}
+        child->cb=s->box;child->x=s->x;child->y=s->y;
+        child->w=(float)s->cols[s->col].value;child->h=(float)s->rows[s->row].value;
         memset(child->m,0,sizeof child->m);memset(child->p,0,sizeof child->p);memset(child->b,0,sizeof child->b);
-        if(child->node && child->node->tag==T_frameset)layout_frameset(child,rows[row]);
-        child->baseline=child->last_baseline=child->h;x+=cols[col];
+        child->baseline=child->last_baseline=child->h;
+        s->x+=child->w;
+        if(++s->col==s->nc){s->col=0;s->x=0;s->y+=(float)s->rows[s->row++].value;}
+        if(child->node && child->node->tag==T_frameset)s=frameset_layout_push(child,child->h,s);
     }
-    b->h=height;b->inline_ctx=false;
 }
 static void layout_inner(box_t *b, struct bfc *f, float ox, float oy, float cbh) {
+    layout_inner_used(b, f, ox, oy, cbh, -1);
+}
+
+static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float cbh, float usedh) {
+    web_avmedia_checkpoint();
     if(b->node && !b->node->foreign && b->node->tag==T_frameset){
-        layout_frameset(b,cbh>=0?cbh:VH);return;
+        layout_frameset(b,usedh>=0?usedh:cbh>=0?cbh:VH);return;
     }
     struct bfc own = {0};
     bool root = is_bfc_root(b);
@@ -2641,19 +2812,20 @@ static void layout_inner(box_t *b, struct bfc *f, float ox, float oy, float cbh)
         f = &own;
         ox = oy = 0;
     }
-    float sh = spec_h(b, &b->st->height, cbh);
+    float sh = usedh >= 0 ? usedh : resolved_content_height(b, cbh);
     /* The anonymous initial containing block supplies the viewport height,
        even though its own auto height follows document content. Otherwise
        html/body height:100% lose their definite reference at the first box.
        A definite height's min/max constraints also apply to descendants;
-       auto heights (including min-height-only boxes) remain indefinite. */
+       normal-flow auto heights (including min-height-only boxes) remain
+       indefinite. Inset-constrained absolute heights are already definite. */
     float child_cbh = b == D->root_box ? VH : sh >= 0 ? clamp_h(b, sh, cbh) : -1;
     b->baseline = b->last_baseline = -1;
     b->nruns = b->ndecos = 0;
     switch (b->kind) {
     case B_TABLE: layout_table(b, cbh); break;
-    case B_FLEX: layout_flex(b, cbh); break;
-    case B_GRID: layout_grid(b, cbh); break;
+    case B_FLEX: layout_flex(b, sh >= 0 ? clamp_h(b, sh, cbh) : sh); break;
+    case B_GRID: layout_grid(b, sh); break;
     default:
         if (b->inline_ctx) layout_inline(b, f, ox, oy, child_cbh);
         else layout_blocks(b, f, ox, oy, child_cbh);
@@ -2718,8 +2890,7 @@ static void layout_abs(box_t *a) {
             w = fmaxf_(w, a->w);
         }
         a->w = clamp_w(a, w, cbw);
-        float sh = spec_h(a, &a->st->height, cbh);
-        if (sh < 0 && !ta && !ba && !(a->node && a->node->box==a && web_dialog_is_modal(D,a->node))) sh = clamp_h(a, cbh - t - bo - vext(a) - a->m[0] - a->m[2], cbh);
+        float sh = resolved_content_height(a, cbh);
         layout_inner(a, NULL, 0, 0, cbh);
         if (sh >= 0 && a->kind != B_TABLE) a->h = clamp_h(a, sh, cbh);
     }
@@ -2754,7 +2925,31 @@ static void layout_abs(box_t *a) {
    unrelated intermediate scroller. Clipped children's private overflow does
    not leak into their ancestor's scrolling area. */
 static float scroll_extent(float value) {
-    return !isfinite(value) || value < 0 ? 0 : value > 100000000 ? 100000000 : value;
+    return !isfinite(value) || value < 0 ? 0 : value;
+}
+
+static int document_extent(float value) {
+    /* Compare in double: (float)INT_MAX rounds up to 2147483648. Never cast
+       that rounded value, NaN, or infinity to the public API's signed int. */
+    double extent=ceil((double)value);
+    return !(extent>=0) ? 0 : extent>(double)INT_MAX ? INT_MAX : (int)extent;
+}
+
+static void scroll_area_publish(box_t *b) {
+    box_t *cb = b->cb;
+    if (!cb || b->kind == B_INLINE || b->kind == B_TEXT || b->kind == B_BR ||
+        (b->st && b->st->position == POS_FIXED) || web_dialog_layer_box(D, b)) return;
+    bool clipped = b->st && b->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(D, b);
+    float bw = clipped ? b->w + b->p[1] + b->p[3] : b->scroll_w;
+    float bh = clipped ? b->h + b->p[0] + b->p[2] : b->scroll_h;
+    /* cb is b's actual coordinate parent. The shared cb chain cancels:
+       x(b)-x(cb) = b.x+b.rel_dx; y(b)-y(cb) additionally has cb.content_dy.
+       Do not walk that same ancestor chain four times for every box. Local
+       coordinates also avoid losing small offsets beside a huge ancestor. */
+    float right = b->x + b->rel_dx - b->p[3] + bw + b->b[1] + b->m[1] + cb->p[3] + cb->p[1];
+    float bottom = b->y + b->rel_dy + cb->content_dy - b->p[0] + bh + b->b[2] + b->m[2] + cb->p[0] + cb->p[2];
+    cb->scroll_w = fmaxf_(cb->scroll_w, scroll_extent(right));
+    cb->scroll_h = fmaxf_(cb->scroll_h, scroll_extent(bottom));
 }
 
 static void scroll_areas(box_t *b) {
@@ -2776,16 +2971,7 @@ static void scroll_areas(box_t *b) {
     }
     for (box_t *c = b->first; c; c = c->next) scroll_areas(c);
     box_scroll_clamp(b);
-    box_t *cb = b->cb;
-    if (!cb || b->kind == B_INLINE || b->kind == B_TEXT || b->kind == B_BR ||
-        (b->st && b->st->position == POS_FIXED) || web_dialog_layer_box(D, b)) return;
-    bool clipped = b->st && b->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(D, b);
-    float bw = clipped ? b->w + b->p[1] + b->p[3] : b->scroll_w;
-    float bh = clipped ? b->h + b->p[0] + b->p[2] : b->scroll_h;
-    float right = box_abs_x(b) - box_abs_x(cb) - b->p[3] + bw + b->b[1] + b->m[1] + cb->p[3] + cb->p[1];
-    float bottom = box_abs_y(b) - box_abs_y(cb) - b->p[0] + bh + b->b[2] + b->m[2] + cb->p[0] + cb->p[2];
-    cb->scroll_w = fmaxf_(cb->scroll_w, scroll_extent(right));
-    cb->scroll_h = fmaxf_(cb->scroll_h, scroll_extent(bottom));
+    scroll_area_publish(b);
 }
 
 static float max_bottom(box_t *b, float base) {
@@ -2810,6 +2996,22 @@ void layout_doc(web_doc *d, int width, int height) {
     d->abs_boxes.n = 0;
     box_t *root = d->root_box;
     if (!root) return;
+    /* Heap state survives arena longjmp without indeterminate automatic
+     * locals. A nested layout gets its own table, even when calloc fails. */
+    struct layout_text_cache *cache = calloc(1, sizeof *cache);
+    struct layout_text_cache *previous_cache = layout_text_active;
+    jmp_buf cleanup_trap;
+    jmp_buf *outer_trap = d->lmem.trap;
+    layout_text_active = cache;
+    d->lmem.trap = &cleanup_trap;
+    int arena_failed = setjmp(cleanup_trap);
+    if (arena_failed) {
+        layout_text_active = previous_cache;
+        layout_text_cache_free(cache);
+        d->lmem.trap = outer_trap;
+        if (outer_trap) longjmp(*outer_trap, arena_failed);
+        abort();
+    }
     root->x = root->y = 0;
     root->w = VW;
     root->cb = NULL;
@@ -2824,6 +3026,9 @@ void layout_doc(web_doc *d, int width, int height) {
         float ay = box_abs_y(a);
         h = fmaxf_(h, ay + a->h + a->p[2] + a->b[2]);
     }
-    d->doc_h = h != h || h < 0 ? 0 : h > 1e8f ? 100000000 : (int)ceilf(h);
+    d->doc_h = document_extent(h);
     d->doc_w = width;
+    layout_text_active = previous_cache;
+    layout_text_cache_free(cache);
+    d->lmem.trap = outer_trap;
 }

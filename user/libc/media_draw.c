@@ -1,10 +1,11 @@
 #include "media.h"
+#include "media_video_private.h"
 #include <limits.h>
 
 static int64_t maximum(int64_t a, int64_t b) { return a > b ? a : b; }
 static int64_t minimum(int64_t a, int64_t b) { return a < b ? a : b; }
 void nmedia_draw(canvas_t *c, const uint32_t *pixels, int sw, int sh, int x, int y, int w, int h) {
-    if (!c || !c->px || !pixels || sw <= 0 || sh <= 0 || (uint64_t)sw * sh > NMEDIA_MAX_PIXELS ||
+    if (!c || !c->px || !pixels || !nmedia_video_size(sw,sh,NULL,NULL) ||
         w <= 0 || h <= 0 || c->w <= 0 || c->h <= 0 || c->pitch < c->w) return;
     int64_t dw = w, dh = (int64_t)sh * w / sw;
     if (dh > h) dh = h, dw = (int64_t)sw * h / sh;

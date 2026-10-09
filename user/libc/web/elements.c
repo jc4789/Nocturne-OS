@@ -72,16 +72,26 @@ static void queue_toggle(node_t *details, bool old_open, bool new_open) {
     details->details_toggle_new_open = new_open;
 }
 
+static node_t *details_next(node_t *n, node_t *root, bool shadow) {
+    if (n->first) return n->first;
+    if (shadow && n->shadow_root) return n->shadow_root;
+    while (n != root) {
+        if (n->parent) {
+            if (n->next) return n->next;
+            n = n->parent;
+            if (shadow && n->shadow_root) return n->shadow_root;
+        } else if (shadow && n->shadow_host) n = n->shadow_host;
+        else return NULL;
+    }
+    return NULL;
+}
 static node_t *open_peer(node_t *root, node_t *details, const char *name) {
-    if (root != details && html_tag(root, T_details) && node_attr(root, "open")) {
-        const char *other_name = node_attr(root, "name");
-        if (other_name && !strcmp(name, other_name)) return root;
-    }
     /* Name groups use the DOM tree, not the flat or shadow-including tree. */
-    for (node_t *n = root->first; n; n = n->next) {
-        node_t *peer = open_peer(n, details, name);
-        if (peer) return peer;
-    }
+    for (node_t *n = root; n; n = details_next(n, root, false))
+        if (n != details && html_tag(n, T_details) && node_attr(n, "open")) {
+            const char *other_name = node_attr(n, "name");
+            if (other_name && !strcmp(name, other_name)) return n;
+        }
     return NULL;
 }
 
@@ -109,10 +119,8 @@ void doc_details_attribute_changed(web_doc *d, node_t *details, const char *name
 }
 
 void doc_details_inserted(node_t *subtree) {
-    if (!subtree) return;
-    if (html_tag(subtree, T_details)) enforce_group(subtree, true);
-    for (node_t *n = subtree->first; n; n = n->next) doc_details_inserted(n);
-    if (subtree->shadow_root) doc_details_inserted(subtree->shadow_root);
+    for (node_t *n = subtree; n; n = details_next(n, subtree, true))
+        if (html_tag(n, T_details)) enforce_group(n, true);
 }
 
 void doc_details_parser_attribute_changed(node_t *details, bool old_open) {
@@ -122,13 +130,11 @@ void doc_details_parser_attribute_changed(node_t *details, bool old_open) {
 }
 
 void doc_details_parser_finish(node_t *root) {
-    if (!root) return;
     /* A newly parsed group preserves its first open member in tree order.
        Closing peers uses ordinary native mutations, so queued toggle tasks
        and exported attributes also survive later script/parser boundaries. */
-    if (html_tag(root, T_details) && node_attr(root, "open")) enforce_group(root, false);
-    for (node_t *n = root->first; n; n = n->next) doc_details_parser_finish(n);
-    if (root->shadow_root) doc_details_parser_finish(root->shadow_root);
+    for (node_t *n = root; n; n = details_next(n, root, true))
+        if (html_tag(n, T_details) && node_attr(n, "open")) enforce_group(n, false);
 }
 
 node_t *doc_details_take_toggle(web_doc *d, bool *old_open, bool *new_open) {

@@ -2,6 +2,7 @@
  * -> persistent FFmpeg codec. Never concatenate/redecode the entire history.
  * All input is page-fetched bytes; there is no FFmpeg URL/POSIX protocol. */
 #include "media_mse_private.h"
+#include "media_video_private.h"
 #include "media_mse_parser.h"
 #include "media_feed_private.h"
 #include "media_alloc_private.h"
@@ -71,8 +72,11 @@ nmedia_mse *nmedia_mse_create(const char *type,char *error,size_t size){
 const char *nmedia_mse_error(const nmedia_mse *m){return m?m->error:"no MSE source buffer";}
 bool nmedia_mse_quota_error(const nmedia_mse *m){return m&&m->quota_error;}
 size_t nmedia_mse_quota(const nmedia_mse *m){
-    if(!m)return 0;size_t used=m->init_size+m->staged+m->packet_bytes+m->configuration_bytes;
-    return used>=NMEDIA_MAX_BYTES?0:NMEDIA_MAX_BYTES-used;
+    if(!m)return 0;size_t used=m->init_size;
+    if(m->staged>SIZE_MAX-used)return 0;used+=m->staged;
+    if(m->packet_bytes>SIZE_MAX-used)return 0;used+=m->packet_bytes;
+    if(m->configuration_bytes>SIZE_MAX-used)return 0;used+=m->configuration_bytes;
+    return SIZE_MAX-used;
 }
 const struct nmedia_info *nmedia_mse_info(const nmedia_mse *m){return m?nmedia_get_info(m->decoder):NULL;}
 uint64_t nmedia_mse_revision(const nmedia_mse *m){return m?m->revision:0;}
@@ -162,11 +166,11 @@ static struct mse_configuration *configuration_copy(nmedia_mse *m,const AVFormat
     size_t bytes=sizeof(struct mse_configuration);
     for(unsigned i=0;i<source->nb_streams;i++){
         const AVCodecParameters *p=source->streams[i]->codecpar;
-        if(p->extradata_size<0||p->extradata_size>1024*1024){bad(m,"MSE codec configuration size limit",false);return NULL;}
+        if(p->extradata_size<0||(size_t)p->extradata_size>SIZE_MAX-bytes){bad(m,"MSE codec configuration size overflow",false);return NULL;}
         bytes+=(size_t)p->extradata_size;
     }
-    if(m->configuration_count>=64||bytes>2*1024*1024-MIN(m->configuration_bytes,(size_t)2*1024*1024)||bytes>nmedia_mse_quota(m)){
-        bad(m,"MSE retained codec configuration quota",true);return NULL;
+    if(m->configuration_count==SIZE_MAX||bytes>nmedia_mse_quota(m)){
+        bad(m,"MSE retained codec configuration accounting overflow",true);return NULL;
     }
     struct mse_configuration *c=nmedia_ff_mallocz(sizeof *c);if(!c){bad(m,"MSE configuration allocation quota",true);return NULL;}
     c->format=avformat_alloc_context();if(!c->format)goto failed;
@@ -189,6 +193,7 @@ static bool replace_decoder(nmedia_mse *m,struct mse_configuration *c){
     configuration_ref(c);m->decode_configuration=c;m->configuration_boundary=false;m->revision++;return true;
 }
 static bool demux(nmedia_mse *m,const uint8_t *body,size_t bytes,int64_t offset,int64_t window0,int64_t window1,bool sequence){
+    if(m->init_size>INT64_MAX||bytes>INT64_MAX-m->init_size)return bad(m,"MSE AVIO offset size overflow",true);
     const uint8_t empty_cluster[]={0x1f,0x43,0xb6,0x75,0x80};
     struct fragment_input input={m->init,body,m->init_size,bytes,0};
     if(!bytes&&m->webm){input.body=empty_cluster;input.body_size=sizeof empty_cluster;}
@@ -217,10 +222,10 @@ static bool demux(nmedia_mse *m,const uint8_t *body,size_t bytes,int64_t offset,
         configuration=m->configuration;configuration_ref(configuration);
     }
     packet=av_packet_alloc();if(!packet){bad(m,"MSE packet allocation quota",true);goto done;}
-    for(unsigned budget=0;budget<65536;budget++){
+    for(;;){
         r=av_read_frame(format,packet);if(r==AVERROR_EOF){ok=true;break;}
         if(r<0){demux_error(m,"fragment packet",r);goto done;}
-        if(packet->stream_index<0||(unsigned)packet->stream_index>=format->nb_streams||packet->size<0||packet->size>16*1024*1024){bad(m,"invalid MSE packet limits",false);goto done;}
+        if(packet->stream_index<0||(unsigned)packet->stream_index>=format->nb_streams||packet->size<0){bad(m,"invalid MSE packet representation",false);goto done;}
         if(av_packet_get_side_data(packet,AV_PKT_DATA_ENCRYPTION_INFO,NULL)||av_packet_get_side_data(packet,AV_PKT_DATA_ENCRYPTION_INIT_INFO,NULL)){bad(m,"encrypted MSE packet is unsupported",false);goto done;}
         AVStream *stream=format->streams[packet->stream_index];bool video=stream->codecpar->codec_type==AVMEDIA_TYPE_VIDEO;
         if(stream->codecpar->codec_type!=AVMEDIA_TYPE_AUDIO&&!video){av_packet_unref(packet);continue;}
@@ -240,7 +245,7 @@ static bool demux(nmedia_mse *m,const uint8_t *body,size_t bytes,int64_t offset,
         bool key=(packet->flags&AV_PKT_FLAG_KEY)!=0;
         if(video&&need_key&&!key){av_packet_unref(packet);continue;}if(video)need_key=false;
         if((size_t)packet->size>nmedia_mse_quota(m)-MIN(nmedia_mse_quota(m),new_bytes)){bad(m,"MSE encoded input quota",true);goto done;}
-        if(m->frame_count+new_count>=65536){bad(m,"MSE coded frame count quota",true);goto done;}
+        if(new_count==SIZE_MAX-m->frame_count||configuration->references==SIZE_MAX){bad(m,"MSE coded frame/reference overflow",true);goto done;}
         struct coded_frame *f=nmedia_ff_mallocz(sizeof *f);if(!f){bad(m,"MSE track buffer quota",true);goto done;}
         f->packet=av_packet_clone(packet);if(!f->packet){nmedia_ff_free(f);bad(m,"MSE packet copy quota",true);goto done;}
         int64_t delta=av_rescale_q(shift,(AVRational){1,1000},stream->time_base);
@@ -253,7 +258,6 @@ static bool demux(nmedia_mse *m,const uint8_t *body,size_t bytes,int64_t offset,
         f->video=video;f->key=key;f->configuration=configuration;configuration_ref(configuration);new_bytes+=(size_t)packet->size;new_count++;
         if(new_tail)new_tail->next=f;else new_frames=f;new_tail=f;av_packet_unref(packet);
     }
-    if(!ok)bad(m,"MSE fragment packet budget exceeded",false);
 done:
     if(ok){
         if(!bytes){configuration_unref(m->configuration);m->configuration=configuration;configuration=NULL;m->video_key=true;
@@ -280,10 +284,10 @@ done:
     return ok;
 }
 static bool process(nmedia_mse *m,int64_t offset,int64_t window0,int64_t window1,bool sequence,bool eos){
-    for(int budget=0;budget<1024;budget++){
+    for(;;){
         size_t init=0,end=0;int r=nmedia_mse_boundary(m->staging,m->staged,m->webm,m->init!=NULL,eos,&init,&end,m->error,sizeof m->error);
-        if(r<0)return false;if(!r)return true;
-        if(init){if(init>m->staged||init>1024*1024)return bad(m,"MSE initialization limit",false);
+        if(r<0){if(r==NMEDIA_MSE_PARSE_MEMORY)m->quota_error=true;return false;}if(!r)return true;
+        if(init){if(init>m->staged)return bad(m,"MSE initialization boundary",false);
             uint8_t *candidate=nmedia_ff_malloc(init);if(!candidate)return bad(m,"MSE initialization quota",true);
             memcpy(candidate,m->staging,init);uint8_t *old=m->init;size_t old_size=m->init_size;m->init=candidate;m->init_size=init;
             size_t staged=m->staged;m->staged-=init;bool ok=demux(m,NULL,0,offset,window0,window1,false);m->staged=staged;
@@ -297,7 +301,7 @@ static bool process(nmedia_mse *m,int64_t offset,int64_t window0,int64_t window1
         bool ok=demux(m,m->staging,end,offset,window0,window1,sequence);
         m->staged=staged;if(!ok)return false;
         memmove(m->staging,m->staging+end,m->staged-end);m->staged-=end;
-    }return bad(m,"MSE segment parser budget exceeded",false);
+    }
 }
 /* Demuxed packets own their buffers. Once successful processing leaves no
  * partial byte stream, retaining the peak-sized staging copy serves no owner.
@@ -312,14 +316,14 @@ static bool append(nmedia_mse *m,const void *bytes,void *owned,size_t count,int6
     if(m->staged&&(offset!=m->offset||window0!=m->window0||window1!=m->window1||sequence!=m->sequence)){bad(m,"abort partial segment before changing append properties",false);goto done;}
     if(sequence&&(!m->sequence||offset!=m->offset||!m->frames)){m->sequence_group=true;m->sequence_start=offset;}
     m->offset=offset;m->window0=window0;m->window1=window1;m->sequence=sequence;
-    if(count>nmedia_mse_quota(m)){bad(m,"MSE encoded input exceeds 32 MiB",true);goto done;}
+    if(count>nmedia_mse_quota(m)||count>INT64_MAX-m->staged){bad(m,"MSE encoded input size overflow",true);goto done;}
     if(owned&&count&&!m->staged){
         /* The worker wire block becomes the parser's sole writable input.
          * Failed parsing retains it for the same rollback/abort contract as
          * copied appends; successful complete processing releases it once. */
         release_empty_staging(m);m->staging=owned;m->capacity=count;owned=NULL;
     }else {
-        if(m->staged+count>m->capacity){size_t cap=MIN(NMEDIA_MAX_BYTES,MAX(m->staged+count,(size_t)4096));
+        if(m->staged+count>m->capacity){size_t cap=MAX(m->staged+count,(size_t)4096);
             uint8_t *p=nmedia_ff_realloc(m->staging,cap);if(!p){bad(m,"MSE append allocation quota",true);goto done;}m->staging=p;m->capacity=cap;}
         if(count)memcpy(m->staging+m->staged,bytes,count);
     }
@@ -355,6 +359,9 @@ int nmedia_mse_step(nmedia_mse *m,struct nmedia_output *out){
     }memset(out,0,sizeof *out);return NMEDIA_AGAIN;
 }
 bool nmedia_mse_waiting_for_input(const nmedia_mse *m){return !m||!m->decoder||m->input_waiting;}
+bool nmedia_mse_move_video(nmedia_mse *m,const struct nmedia_output *o,uint32_t **pixels,size_t *capacity){
+    return m&&!m->error[0]&&nmedia_move_video(m->decoder,o,pixels,capacity);
+}
 bool nmedia_mse_seek(nmedia_mse *m,int64_t ms){
     if(!m||!m->decoder||ms<0)return false;m->seek_target=ms;m->configuration_boundary=false;
     if(!packet_seek(m,ms))return false;
@@ -408,7 +415,10 @@ static size_t track_ranges(nmedia_mse *m,bool video,struct nmedia_time_range *ou
 size_t nmedia_mse_ranges(nmedia_mse *m,struct nmedia_time_range *out,size_t maximum){
     const struct nmedia_info *info=nmedia_mse_info(m);if(!info||!maximum)return 0;
     if(!info->audio||!info->video)return track_ranges(m,info->video,out,maximum);
-    struct nmedia_time_range a[64],v[64];size_t na=track_ranges(m,false,a,64),nv=track_ranges(m,true,v,64),n=0,i=0,j=0;
-    while(i<na&&j<nv&&n<maximum){int64_t lo=MAX(a[i].start_ms,v[j].start_ms),hi=MIN(a[i].end_ms,v[j].end_ms);if(hi>lo)out[n++]=(struct nmedia_time_range){lo,hi};if(a[i].end_ms<v[j].end_ms)i++;else j++;}return n;
+    if(m->frame_count>SIZE_MAX/sizeof(struct nmedia_time_range)/2){bad(m,"MSE range size overflow",true);return 0;}
+    struct nmedia_time_range *a=nmedia_ff_malloc(m->frame_count*sizeof *a*2);if(!a){bad(m,"MSE range allocation failed",true);return 0;}
+    struct nmedia_time_range *v=a+m->frame_count;size_t na=track_ranges(m,false,a,m->frame_count),nv=track_ranges(m,true,v,m->frame_count),n=0,i=0,j=0;
+    while(i<na&&j<nv&&n<maximum){int64_t lo=MAX(a[i].start_ms,v[j].start_ms),hi=MIN(a[i].end_ms,v[j].end_ms);if(hi>lo)out[n++]=(struct nmedia_time_range){lo,hi};if(a[i].end_ms<v[j].end_ms)i++;else j++;}nmedia_ff_free(a);return n;
 }
+size_t nmedia_mse_range_capacity(const nmedia_mse *m){return m?m->frame_count:0;}
 void nmedia_mse_close(nmedia_mse *m){if(!m)return;nmedia_close(m->decoder);configuration_unref(m->decode_configuration);while(m->frames){struct coded_frame *f=m->frames;m->frames=f->next;release_frame(m,f);}configuration_unref(m->configuration);nmedia_ff_free(m->init);nmedia_ff_free(m->staging);nmedia_ff_free(m);}

@@ -10,6 +10,7 @@
 #include "../mm/heap.h"
 #include "../sys/sched.h"
 #include "../sys/syscall.h"
+#include "dns_name.h"
 
 static struct netif *nif;
 static uint32_t my_ip, my_mask, my_gw, my_dns;
@@ -625,18 +626,9 @@ static int64_t dns_query(const char *name, uint32_t *out) {
     q[1] = (uint8_t)id;
     q[2] = 0x01; /* recursion desired */
     q[5] = 1;    /* one question */
-    const char *s = name;
-    while (*s) {
-        const char *dot = strchr(s, '.');
-        size_t l = dot ? (size_t)(dot - s) : strlen(s);
-        if (l == 0 || l > 63 || n + l + 6 > sizeof q) return -EINVAL;
-        q[n++] = (uint8_t)l;
-        memcpy(q + n, s, l);
-        n += l;
-        s += l;
-        if (*s == '.') s++;
-    }
-    q[n++] = 0;
+    size_t name_bytes = 0;
+    if (!dns_name_encode(name, strlen(name), q + n, sizeof q - n - 4, &name_bytes)) return -EINVAL;
+    n += name_bytes;
     q[n++] = 0;
     q[n++] = 1; /* A */
     q[n++] = 0;
@@ -680,10 +672,14 @@ static int64_t dns_query(const char *name, uint32_t *out) {
                 o += 10;
                 if (type == 1 && rdlen == 4 && o + 4 <= len) {
                     *out = ip_get(p + o);
-                    int c = dns_cache_next++ % DNS_CACHE;
-                    strlcpy(dns_cache[c].name, name, sizeof dns_cache[c].name);
-                    dns_cache[c].ip = *out;
-                    dns_cache[c].expires = uptime_ms() + (uint64_t)MIN(ttl, 3600u) * 1000;
+                    /* Never cache a truncated prefix as a different hostname.
+                       Long valid names still resolve; cache size is scheduling. */
+                    if (strlen(name) < sizeof dns_cache[0].name) {
+                        int c = dns_cache_next++ % DNS_CACHE;
+                        strcpy(dns_cache[c].name, name);
+                        dns_cache[c].ip = *out;
+                        dns_cache[c].expires = uptime_ms() + (uint64_t)MIN(ttl, 3600u) * 1000;
+                    }
                     ret = 0;
                     break;
                 }
@@ -1403,12 +1399,13 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
         if (!nif) return -ENETDOWN;
         return sys_ping((uint32_t)a, (int)b, (int)c);
     case SYS_NET_DNS: {
-        char name[128];
-        int r = user_str(name, (const char *)a, sizeof name);
-        if (r < 0) return r;
         if (!user_ok_w((void *)b, 4)) return -EFAULT;
+        char *name = NULL;
+        int r = dns_user_name_copy((const char *)a, &name);
+        if (r < 0) return r;
         uint32_t ip = 0;
         int64_t ret = dns_query(name, &ip);
+        kfree(name);
         if (ret == 0) *(uint32_t *)b = ip;
         return ret;
     }

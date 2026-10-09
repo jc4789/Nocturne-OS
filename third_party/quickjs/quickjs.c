@@ -23172,6 +23172,11 @@ static __exception int next_token(JSParseState *s)
     BOOL ident_has_escape;
     JSAtom atom;
 
+    /* Parsing large sources must service the same host interrupt hook as
+       bytecode execution, including cancellation and native media supply. */
+    if (js_poll_interrupts(s->ctx))
+        return -1;
+
     if (js_check_stack_overflow(s->ctx->rt, 0)) {
         return js_parse_error(s, "stack overflow");
     }
@@ -34612,6 +34617,8 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
 
     line_num = 0; /* avoid warning */
     for (pos = 0; pos < bc_len; pos = pos_next) {
+        if (js_poll_interrupts(ctx))
+            goto fail;
         op = bc_buf[pos];
         len = opcode_info[op].size;
         pos_next = pos + len;

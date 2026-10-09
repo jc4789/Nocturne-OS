@@ -2082,6 +2082,9 @@ static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
     }
     w->pml4 = current_task->pml4;
     zorder[nwin++] = w;
+    /* Use the ordinary WM transition and resize event. The client still owns
+       its real framebuffer allocation; startup must not invent a viewport. */
+    if (flags & WIN_START_MAXIMIZED) toggle_maximize(w);
     return fd;
 }
 

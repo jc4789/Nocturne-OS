@@ -45,6 +45,9 @@ struct web_request {
     int credentials; /* 0 omit, 1 same-origin, 2 include */
     bool force_preflight; /* XHR upload listeners require CORS preflight even with safe headers. */
     bool redirect_error, same_origin;
+    bool image_upgrade; /* Native ordinary-image destination, never imageset/Fetch/script. */
+    bool keepalive; /* Buffered Fetch may outlive this document, not the browser process. */
+    uint64_t fetch_group; /* Native per-environment identity; not supplied by page headers. */
     int cache_mode; /* Fetch: 0 default, 1 no-store, 2 reload, 3 no-cache, 4 force-cache, 5 only-if-cached. */
 };
 enum { WEB_HISTORY_INFO, WEB_HISTORY_PUSH, WEB_HISTORY_REPLACE, WEB_HISTORY_GO, WEB_HISTORY_SCROLL };
@@ -61,9 +64,14 @@ struct web_response {
     char *body;
     size_t body_len;
     char *headers_full; /* Complete block when too large for inline headers; never a truncated tail. */
+    char *url_full; /* Complete owned URL for native transports; inline URL remains legacy-compatible. */
 };
+static inline const char *web_response_url(const struct web_response *r) {
+    return r->url_full ? r->url_full : r->url;
+}
+bool web_response_set_url(struct web_response *r, const char *url);
 /* Includes the native HTTP status/private metadata prefix. */
-#define WEB_RESPONSE_HEADERS_MAX (64u * 1024u + 512u + 1u)
+#define WEB_RESPONSE_HEADERS_MAX ((size_t)UINT32_MAX)
 static inline const char *web_response_headers(const struct web_response *r) {
     return r->headers_full ? r->headers_full : r->headers;
 }
@@ -75,11 +83,11 @@ struct web_navigation_timing {
     bool valid, fetch_valid, response_end_valid;
     uint64_t navigation_start_ms, fetch_start_ms, response_end_ms;
 };
-/* Only the native embedder chooses this limit; page code cannot change it.
-   Zero preserves the conservative default for custom hosts. */
-#define WEB_JS_TASK_DEFAULT_MS 5000u
-#define WEB_JS_TASK_MIN_MS 1000u
-#define WEB_JS_TASK_MAX_MS 30000u
+/* Optional native-host cancellation deadline. Normal pages are not rejected
+   at an arbitrary 5/15/30-second cutoff. Page code cannot reset it. */
+#define WEB_JS_TASK_DEFAULT_MS UINT32_MAX
+#define WEB_JS_TASK_MIN_MS 1u
+#define WEB_JS_TASK_MAX_MS UINT32_MAX
 #define WEB_WINDOW_VISIBLE 1u
 #define WEB_WINDOW_FOCUSED 2u
 /* A bounded, native video-layer update from the last published document scene.
@@ -94,7 +102,14 @@ struct web_host {
     void *opaque;
     bool (*request)(void *opaque, const struct web_request *request);
     void (*cancel)(void *opaque, uint64_t id);
+    /* Document retirement, unlike explicit AbortSignal: detach callback delivery
+       and retain a keepalive transport. A host without this cannot accept it. */
+    void (*release_request)(void *opaque, uint64_t id);
     bool (*sync_load)(void *opaque, const char *url, int kind, struct web_response *response);
+    /* Origin-aware module transport. Prefer this over the legacy top-document
+       callback; origin/credentials are native initiating-realm values. Same
+       native-only wait/response ownership contract as sync_load applies. */
+    bool (*sync_request)(void *opaque, const struct web_request *request, struct web_response *response);
     void (*navigate)(void *opaque, const char *url, const char *post);
     /* Native form bytes are not a NUL-terminated urlencoded substitute.
        The host must copy transient data before returning to the JS task. */
@@ -123,9 +138,13 @@ struct web_host {
     bool media_range;
     /* Zero-initialized custom hosts keep the explicit document-init epoch. */
     struct web_navigation_timing navigation_timing;
-    /* Native embedder-selected outer-task limit; 0 keeps the 5-second default.
-       Page code cannot reset it. Values outside 1000..30000 use the default. */
+    /* Native embedder-selected deadline; 0 keeps the uint32 representation
+       maximum. Page code cannot reset it. */
     uint32_t js_task_budget_ms;
+    /* Optional native-only cancellation checkpoint. NEVER dispatch JS/DOM,
+       layout, paint, navigation or free a document here. False stops this
+       task after a user close/stop request, not after a page-count quota. */
+    bool (*script_checkpoint)(void *opaque);
 };
 bool web_set_url(web_doc *d, const char *url);
 /* Call between JS tasks, after the host history position and document URL change. */
@@ -138,6 +157,8 @@ void web_tick(web_doc *d, uint64_t now_ms);
  * No document/node callback is retained by this process-lifetime cleanup. */
 void web_media_background(uint64_t now_ms);
 int64_t web_media_background_deadline(uint64_t now_ms);
+/* Native playback transitions are reported only when explicitly requested. */
+void web_avmedia_debug(bool enabled);
 /* -1: no deadline, otherwise an absolute uptime_ms() deadline. */
 int64_t web_deadline(web_doc *d);
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *response);
@@ -170,6 +191,10 @@ void web_document_scroll(web_doc *d);
    sends out/leave/over/enter as needed, then mousemove for a non-NULL target.
    event is pointer state: its type may be NULL, since the hook chooses types. */
 void web_hover(web_doc *d, web_node *target, const struct web_event *event);
+/* Native primary-button state only: no DOM event dispatch or author callbacks.
+   Release also applies outside the page and when native capture/focus is lost. */
+void web_active_press(web_doc *d, web_node *target);
+void web_active_release(web_doc *d);
 web_node *web_node_at(web_doc *d, int x, int y);
 bool web_node_action(web_doc *d, web_node *target, struct web_hit *hit);
 /* Capture before click dispatch, then resolve only that anchor after dispatch.
@@ -179,6 +204,10 @@ bool web_link_action(web_doc *d, web_node *anchor, struct web_hit *hit);
 /* Trusted native link activation: true when a child-frame destination consumed
    the navigation. Script location changes use their own, stricter child path. */
 bool web_frame_navigate(web_doc *top, web_node *anchor, const char *url);
+/* Actual active child URL for native chrome only. The parent URL is unchanged.
+   Selection validates the complete live embedding chain; no author callbacks. */
+const char *web_frame_address(web_doc *top);
+void web_frame_address_select(web_doc *top, web_node *node);
 void web_free(web_doc *d);
 const char *web_title(web_doc *d); /* "" if none */
 const char *web_url(web_doc *d);
@@ -187,6 +216,9 @@ const char *web_refresh_url(web_doc *d, int *delay_s);
 
 /* resolve a (possibly relative) URL against base into out; false if it cannot be made absolute */
 bool web_resolve_url(const char *base, const char *rel, char *out, size_t n);
+/* Fresh malloc output: 1 resolved, 0 invalid/representation overflow, -1 OOM.
+   No legacy fixed-buffer URL quota; caller frees successful output. */
+int web_resolve_url_owned(const char *base, const char *rel, char **out);
 
 /* ---- resources ---- */
 const char *web_pending_stylesheet(web_doc *d);                   /* next stylesheet to fetch, or NULL */
@@ -206,6 +238,8 @@ int web_doc_width(web_doc *d);
 void web_viewport_position(web_doc *d, int x, int y);
 /* paint the document rectangle at (doc_x, doc_y) into the canvas rectangle (x, y, w, h) */
 void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y);
+/* Debug-only native video geometry/paint transitions; no page state changes. */
+void web_paint_debug(bool enabled);
 
 /* ---- interaction ---- */
 enum { WEB_HIT_NONE, WEB_HIT_LINK, WEB_HIT_TEXT_INPUT, WEB_HIT_CHECKBOX, WEB_HIT_RADIO, WEB_HIT_SUBMIT,
@@ -268,5 +302,6 @@ web_node *web_label_activation(web_node *target);
 bool web_node_rect(web_doc *d, web_node *n, int *x, int *y, int *w, int *h);
 
 /* find in page: the next match at or after (doc) y = from_y (wrapping around); highlights it and
-   returns its y, or -1. An empty string clears the highlight. */
+   returns its y, -1 when not found, or -2 on query allocation failure (the
+   previous query/highlight is retained). An empty string clears the highlight. */
 int web_find(web_doc *d, const char *text, int from_y);

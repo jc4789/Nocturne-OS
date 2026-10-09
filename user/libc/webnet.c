@@ -7,10 +7,9 @@
 #include <stdio.h>
 #include <errno.h>
 #include <time.h>
+#include <limits.h>
 
-#define REQUEST_MAX 64
 #define WORKERS 4
-#define QUEUE_BYTES (32u * 1024u * 1024u)
 #define PUMP_BYTES (256u * 1024u)
 struct request {
     struct request *next;
@@ -27,6 +26,10 @@ struct request {
     char *cookie_site;
     enum webnet_credentials credentials;
     bool top_level;
+    bool keepalive;
+    bool image_upgrade;
+    uint64_t fetch_group;
+    size_t keepalive_bytes;
     char error[160];
 };
 struct slot { struct request *rq; int pid, in, out; };
@@ -90,22 +93,44 @@ int webnet_cookie_set(webnet *n, const char *url, const char *value) {
     return n && value ? webcookie_set(n->cookies, &c, value, strlen(value), time(NULL)) : -1;
 }
 uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callback cb, void *opaque) {
-    if (!n || !q || !q->url || !cb || n->count >= REQUEST_MAX || q->kind > WEBNET_FETCH ||
+    if (!n || !q || !q->url || !cb || n->count == UINT_MAX || q->kind > WEBNET_FETCH ||
         q->kind < WEBNET_NAVIGATION || q->body_len > WEBNET_BODY_LIMIT || (q->body_len && !q->body) ||
         q->credentials < WEBNET_CREDENTIALS_OMIT || q->credentials > WEBNET_CREDENTIALS_INCLUDE ||
         q->cache_mode < WEBNET_CACHE_DEFAULT || q->cache_mode > WEBNET_CACHE_ONLY_IF_CACHED ||
-        (q->kind != WEBNET_FETCH && q->cache_mode != WEBNET_CACHE_DEFAULT)) return 0;
+        (q->kind != WEBNET_FETCH && q->cache_mode != WEBNET_CACHE_DEFAULT) ||
+        (q->keepalive && (q->kind != WEBNET_FETCH || !q->fetch_group)) ||
+        (q->image_upgrade && q->kind != WEBNET_RESOURCE)) return 0;
+    /* Fetch Standard's inflight keepalive body bound, per fetch group. Queued
+       and active requests both count; explicit aborted requests are done. */
+    if (q->keepalive) {
+        size_t bytes = q->body_len;
+        if (bytes > 65536u) return 0;
+        for (const struct request *p = n->queue; p; p = p->next)
+            if (p->keepalive && !p->cancelled && p->fetch_group == q->fetch_group) {
+                if (p->keepalive_bytes > 65536u - bytes) return 0;
+                bytes += p->keepalive_bytes;
+            }
+        for (int i = 0; i < WORKERS; i++) {
+            const struct request *p = n->slots[i].rq;
+            if (p && p->keepalive && !p->cancelled && p->fetch_group == q->fetch_group) {
+                if (p->keepalive_bytes > 65536u - bytes) return 0;
+                bytes += p->keepalive_bytes;
+            }
+        }
+    }
     const char *origin = q->origin ? q->origin : "";
     const char *method = q->method ? q->method : "GET";
     const char *headers = q->headers ? q->headers : "";
     size_t ul = strlen(q->url), ol = strlen(origin), ml = strlen(method), hl = strlen(headers);
-    if (!ul || ul >= WEBNET_URL_MAX || ol >= WEBNET_URL_MAX || !webnet_method_valid(method) || hl >= WEBNET_REQUEST_HEADERS_MAX ||
+    if (!ul || ul > UINT32_MAX || ol > UINT32_MAX || ul == SIZE_MAX || ol == SIZE_MAX || ml > UINT32_MAX || !webnet_method_valid(method) || hl > UINT32_MAX ||
         ((!strcmp(method, "GET") || !strcmp(method, "HEAD")) && q->body_len)) return 0;
     int64_t cookie_now=time(NULL);
     long cookie_len = q->credentials == WEBNET_CREDENTIALS_OMIT ? 0 : webcookie_export(n->cookies, NULL, 0, cookie_now);
     if (cookie_len < 0) return 0;
-    size_t len = sizeof(struct webnet_wire_request) + ul + ol + ml + hl + q->body_len + (size_t)cookie_len;
-    if (len > QUEUE_BYTES - n->queued_bytes) return 0;
+    if ((uint64_t)cookie_len > UINT32_MAX) return 0;
+    uint64_t total = sizeof(struct webnet_wire_request) + (uint64_t)ul + ol + ml + hl + q->body_len + (uint64_t)cookie_len;
+    if (total > SIZE_MAX || total > SIZE_MAX - n->queued_bytes) return 0;
+    size_t len = (size_t)total;
     struct request *r = calloc(1, sizeof *r);
     if (!r) return 0;
     r->tx = malloc(len);
@@ -116,6 +141,9 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     r->id = ++n->serial;
     if (!r->id) r->id = ++n->serial;
     r->generation = q->generation;
+    r->keepalive = q->keepalive; r->fetch_group = q->fetch_group;
+    r->image_upgrade = q->image_upgrade;
+    r->keepalive_bytes = q->keepalive ? q->body_len : 0;
     r->response_limit = webnet_response_limit(q->kind);
     r->deadline = uptime_ms() + WEBNET_TIMEOUT_MS;
     r->callback = cb; r->opaque = opaque; r->tx_len = len;
@@ -127,9 +155,10 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     h.user_navigation = (q->user_navigation ? WEBNET_WIRE_USER_NAVIGATION : 0) |
                         (q->force_preflight ? WEBNET_WIRE_FORCE_PREFLIGHT : 0) |
                         (q->redirect_error ? WEBNET_WIRE_REDIRECT_ERROR : 0) |
-                        (q->same_origin ? WEBNET_WIRE_SAME_ORIGIN : 0) | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS |
+                        (q->same_origin ? WEBNET_WIRE_SAME_ORIGIN : 0) | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_DYNAMIC_BODY | WEBNET_WIRE_DYNAMIC_HEADERS | WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS | WEBNET_WIRE_DYNAMIC_URL |
                         ((uint32_t)q->cache_mode << WEBNET_WIRE_CACHE_SHIFT);
     if (q->kind == WEBNET_CLASSIC || q->kind == WEBNET_MODULE) h.user_navigation |= WEBNET_WIRE_LARGE_SCRIPT;
+    if (q->image_upgrade) h.user_navigation |= WEBNET_WIRE_IMAGE_UPGRADE;
     h.credentials = q->credentials; h.cookie_len = (uint32_t)cookie_len;
     h.id = r->id; h.generation = r->generation; h.deadline = r->deadline;
     h.url_len = ul; h.origin_len = ol; h.method_len = ml; h.headers_len = hl; h.body_len = q->body_len;
@@ -176,7 +205,7 @@ fail:
     snprintf(r->error, sizeof r->error, "Cannot start /bin/webfetch: %s (errno %d)", stage, saved_errno);
     return false;
 }
-struct cookie_scratch { char url[WEBNET_URL_MAX]; struct url a, b; };
+struct cookie_scratch { char *url, *site_origin; };
 static bool cookie_events_inner(webnet *n, struct request *r, struct cookie_scratch *work) {
     size_t pos = (size_t)r->head.url_len + r->head.headers_len + r->head.body_len + r->head.error_len + 4;
     const unsigned char *p = r->rx + pos, *end = p + r->head.cookie_len;
@@ -186,14 +215,17 @@ static bool cookie_events_inner(webnet *n, struct request *r, struct cookie_scra
         while (p < end) {
             if ((size_t)(end-p) < sizeof(struct webnet_wire_cookie)) return false;
             struct webnet_wire_cookie e; memcpy(&e,p,sizeof e); p += sizeof e;
-            if (!e.url_len || e.url_len >= WEBNET_URL_MAX || e.value_len > WEBCOOKIE_FIELD_MAX ||
+            uint64_t length=(uint64_t)e.url_len+e.value_len;
+            if (!e.url_len || e.value_len > WEBCOOKIE_FIELD_MAX ||
                 e.redirect_cross_site > 1 || e.reserved || e.received < 0 || e.received > time(NULL) + 60 ||
-                (size_t)e.url_len + e.value_len > (size_t)(end-p) || memchr(p,0,(size_t)e.url_len+e.value_len)) return false;
-            char *url = work->url; memcpy(url,p,e.url_len); url[e.url_len]=0;
+                length > (size_t)(end-p) || length >= SIZE_MAX || memchr(p,0,(size_t)length)) return false;
+            char *url=malloc((size_t)e.url_len+1);if(!url)return false;
+            free(work->url);work->url=url;memcpy(url,p,e.url_len);url[e.url_len]=0;
             if (r->credentials == WEBNET_CREDENTIALS_OMIT) return false;
             if (r->credentials == WEBNET_CREDENTIALS_SAME_ORIGIN) {
-                struct url *a=&work->a, *b=&work->b;
-                if (!url_parse(url,a) || !url_parse(r->cookie_site,b) || a->tls!=b->tls || a->port!=b->port || strcasecmp(a->host,b->host)) return false;
+                char *origin=NULL;enum http_url_result parsed=http_origin_owned(url,&origin);
+                bool same=parsed==HTTP_URL_TUPLE&&work->site_origin&&!strcmp(origin,work->site_origin);
+                free(origin);if(!same)return false;
             }
             if (pass) {
                 struct webcookie_context c = {url, *r->cookie_site ? r->cookie_site : r->top_level ? NULL : "", "GET", r->top_level, true, e.redirect_cross_site != 0};
@@ -206,9 +238,11 @@ static bool cookie_events_inner(webnet *n, struct request *r, struct cookie_scra
 }
 static bool cookie_events(webnet *n, struct request *r) {
     if (!r->head.cookie_len) return true;
-    struct cookie_scratch *work = malloc(sizeof *work);
+    struct cookie_scratch *work = calloc(1,sizeof *work);
     if (!work) return false;
-    bool ok = cookie_events_inner(n, r, work);
+    bool ok=r->credentials!=WEBNET_CREDENTIALS_SAME_ORIGIN||http_origin_owned(r->cookie_site,&work->site_origin)==HTTP_URL_TUPLE;
+    if(ok)ok = cookie_events_inner(n, r, work);
+    free(work->url);free(work->site_origin);
     free(work);
     return ok;
 }
@@ -223,9 +257,9 @@ static void complete(webnet *n, struct slot *s) {
         if (!r->error[0] && r->rx) {
             char *p = (char *)r->rx;
             response.status = (int)r->head.status;
-            response.final_url = p; p += r->head.url_len + 1;
-            response.headers = p; p += r->head.headers_len + 1;
-            response.body = p; response.body_len = r->head.body_len; p += r->head.body_len + 1;
+            response.final_url = p; p += (size_t)r->head.url_len + 1;
+            response.headers = p; p += (size_t)r->head.headers_len + 1;
+            response.body = p; response.body_len = r->head.body_len; p += (size_t)r->head.body_len + 1;
             response.error = p;
         }
         r->callback(n, r->id, r->generation, &response, r->opaque);
@@ -235,7 +269,12 @@ static void complete(webnet *n, struct slot *s) {
 /* Wire data has no terminators; insert them after the complete payload has arrived. */
 static bool unpack(struct request *r) {
     const struct webnet_wire_response *h = &r->head;
-    size_t wire_len = (size_t)h->url_len + h->headers_len + h->body_len + h->error_len + h->cookie_len;
+    size_t wire_len;
+    if (!webnet_wire_payload_size(h, &wire_len)) return false;
+    /* A successful retained upgrade-class request from HTTPS cannot publish
+       an insecure final response, even if a worker violates the hop policy. */
+    if (r->image_upgrade && !strncasecmp(r->cookie_site, "https://", 8) && h->status &&
+        (h->url_len < 8 || strncasecmp((const char *)r->rx, "https://", 8))) return false;
     unsigned char *out = malloc(wire_len + 4);
     if (!out) return false;
     size_t sizes[4] = {h->url_len, h->headers_len, h->body_len, h->error_len};
@@ -303,12 +342,12 @@ void webnet_pump(webnet *n, uint64_t now) {
                     if (r->head_pos == sizeof r->head) {
                         struct webnet_wire_response *h = &r->head;
                         if (h->magic != WEBNET_MAGIC || h->id != r->id || h->generation != r->generation ||
-                            h->url_len >= WEBNET_URL_MAX || h->headers_len >= WEBNET_RESPONSE_HEADERS_MAX ||
+                            h->headers_len > webnet_wire_header_limit(WEBNET_WIRE_DYNAMIC_HEADERS) ||
                             h->body_len > r->response_limit || h->error_len >= sizeof r->error || h->status > 999 ||
-                            h->cookie_len > WEBNET_COOKIE_EVENTS_MAX) {
+                            h->cookie_len > webnet_wire_cookie_limit(WEBNET_WIRE_DYNAMIC_URL)) {
                             slot_stop(s, "Invalid worker response"); break;
                         }
-                        r->rx_len = (size_t)h->url_len + h->headers_len + h->body_len + h->error_len + h->cookie_len;
+                        if (!webnet_wire_payload_size(h, &r->rx_len)) { slot_stop(s, "Worker response size overflow"); break; }
                         r->rx = malloc(r->rx_len + 1);
                         if (!r->rx) { slot_stop(s, "Out of memory reading response"); break; }
                     }
@@ -348,12 +387,12 @@ static void cancel(webnet *n, uint64_t key, bool generation) {
     struct request **p = &n->queue;
     while (*p) {
         struct request *r = *p;
-        if ((generation ? r->generation : r->id) != key) { p = &r->next; continue; }
+        if ((generation ? r->generation : r->id) != key || (generation && r->keepalive)) { p = &r->next; continue; }
         *p = r->next; n->count--; n->queued_bytes -= r->tx_len; request_free(r);
     }
     for (int i = 0; i < WORKERS; i++) {
         struct slot *s = &n->slots[i];
-        if (s->rq && (generation ? s->rq->generation : s->rq->id) == key) {
+        if (s->rq && (generation ? s->rq->generation : s->rq->id) == key && !(generation && s->rq->keepalive)) {
             s->rq->cancelled = true; slot_stop(s, NULL);
             if (s->pid > 0) kill(s->pid);
         }
@@ -364,7 +403,7 @@ static void cancel(webnet *n, uint64_t key, bool generation) {
            Individual fetch aborts still use the nonblocking pump/reap path above. */
         for (int i = 0; i < WORKERS; i++) {
             struct slot *s = &n->slots[i];
-            if (!s->rq || s->rq->generation != key) continue;
+            if (!s->rq || s->rq->generation != key || s->rq->keepalive) continue;
             if (s->pid > 0) waitpid(s->pid, NULL, 0);
             complete(n, s); /* cancelled requests never invoke their callback */
         }

@@ -170,6 +170,11 @@ const performanceBridge = (() => {
         }
         clearMarks(name){slot(performances,this);clear('mark',name===undefined?undefined:string(name));}
         clearMeasures(name){slot(performances,this);clear('measure',name===undefined?undefined:string(name));}
+        // Clear only the resource partition of the actual private timeline.
+        // Marks, measures and previously queued observer records survive.
+        // Transport/resource collection is not advertised until implemented;
+        // this operation does not manufacture empty timing entries or marks.
+        clearResourceTimings(){slot(performances,this);clear('resource');}
         getEntries(){slot(performances,this);return selected(buffer);}
         getEntriesByType(type){slot(performances,this);if(!arguments.length)throw new TypeErr('An entry type is required');return selected(buffer,undefined,string(type));}
         getEntriesByName(name,type){slot(performances,this);if(!arguments.length)throw new TypeErr('An entry name is required');return selected(buffer,string(name),type===undefined?undefined:string(type));}

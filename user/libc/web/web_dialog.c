@@ -1,9 +1,21 @@
 #include "web_dialog.h"
 #include "form_value.h"
 #include "form_validation.h"
+#include <limits.h>
 
 struct dialog_entry { node_t *node, *previous; box_t *backdrop; };
-struct web_dialog_state { int count; struct dialog_entry stack[WEB_DIALOG_LIMIT]; };
+struct web_dialog_state { int count, capacity; struct dialog_entry *stack; };
+
+static bool reserve_dialog(struct web_dialog_state *s) {
+    if (!s || s->count == INT_MAX) return false;
+    if (s->count < s->capacity) return true;
+    int capacity = s->capacity ? (s->capacity > INT_MAX / 2 ? INT_MAX : s->capacity * 2) : 8;
+    if ((size_t)capacity > SIZE_MAX / sizeof *s->stack) return false;
+    struct dialog_entry *entries = realloc(s->stack, (size_t)capacity * sizeof *entries);
+    if (!entries) return false;
+    s->stack = entries; s->capacity = capacity;
+    return true;
+}
 
 static bool valid(web_doc *d, const node_t *n) {
     return d && n && n->owner == d && n->type == N_ELEM && !n->foreign &&
@@ -78,15 +90,15 @@ int web_dialog_prepare(web_doc *d, node_t *n) {
     web_dialog_sync(d);
     if (node_attr(n, "open")) return web_dialog_is_modal(d, n) ? WEB_DIALOG_ALREADY_MODAL : WEB_DIALOG_NONMODAL;
     if (!d->dialogs) d->dialogs = calloc(1, sizeof *d->dialogs);
-    return !d->dialogs || d->dialogs->count == WEB_DIALOG_LIMIT ? WEB_DIALOG_CAPACITY : WEB_DIALOG_READY;
+    return reserve_dialog(d->dialogs) ? WEB_DIALOG_READY : WEB_DIALOG_CAPACITY;
 }
 bool web_dialog_enter(web_doc *d, node_t *n) {
-    if (!valid(d, n) || d->inert || !d->dialogs || d->dialogs->count == WEB_DIALOG_LIMIT || index_of(d, n) >= 0) return false;
+    if (!valid(d, n) || d->inert || index_of(d, n) >= 0 || !reserve_dialog(d->dialogs)) return false;
     d->dialogs->stack[d->dialogs->count++] = (struct dialog_entry){.node=n, .previous=d->focus};
     d->dirty = d->need_style = true; d->layout_valid = false;
     return true;
 }
-void web_dialog_free(web_doc *d) { if (d) { free(d->dialogs); d->dialogs = NULL; } }
+void web_dialog_free(web_doc *d) { if (d) { if (d->dialogs) free(d->dialogs->stack); free(d->dialogs); d->dialogs = NULL; } }
 bool web_dialog_inert(web_doc *d, node_t *n) {
     node_t *top = web_dialog_top(d);
     if (top && !under(n, top, true)) return true;
@@ -117,12 +129,24 @@ bool web_dialog_rendered(node_t *n) {
 struct focus_scan {
     web_doc *d; node_t *current, *first, *last, *next, *previous;
     uint64_t current_key, first_key, last_key, next_key, previous_key;
-    int visits; bool seen, autofocus, tab;
+    uint32_t visits; bool seen, autofocus, tab;
 };
-static void scan_focus(struct focus_scan *s, node_t *n, int depth) {
-    if (!n || depth > 400 || ++s->visits > 65536) return;
-    if (n->type == N_ELEM) {
-        if (!n->style || n->style->display == D_NONE || web_dialog_inert(s->d, n)) return;
+struct focus_walk { node_t *node, *next; bool entered, assigned; };
+static bool scan_focus(struct focus_scan *s, node_t *root, bool include_root) {
+    if (!root) return true;
+    size_t depth = 1, capacity = 16;
+    struct focus_walk *walk = calloc(capacity, sizeof *walk);
+    if (!walk) return false;
+    walk[0].node = root;
+    while (depth) {
+        struct focus_walk *frame = &walk[depth - 1];
+        node_t *n = frame->node;
+        if (!frame->entered) {
+            frame->entered = true;
+            if (s->visits == UINT32_MAX) { free(walk); return false; }
+            s->visits++;
+            if (n->type == N_ELEM && (!n->style || n->style->display == D_NONE || web_dialog_inert(s->d, n))) { depth--; continue; }
+            if (n->type == N_ELEM && (include_root || n != root)) {
         node_t *candidate = (!s->autofocus || node_attr(n, "autofocus")) ? web_focus_candidate(s->d, n) : NULL;
         const char *ti = candidate ? node_attr(candidate, "tabindex") : NULL;
         if (s->tab && ((ti && strtol(ti, NULL, 10) < 0) || (candidate && candidate->tag == T_dialog && !ti))) candidate = NULL;
@@ -142,32 +166,45 @@ static void scan_focus(struct focus_scan *s, node_t *n, int depth) {
                 s->last=candidate;
             }
         }
+            }
+            node_t *container = n->shadow_root ? n->shadow_root : n;
+            node_t *tree = container->type == N_ELEM && !container->foreign && container->tag == T_slot ? doc_node_root(container, false) : NULL;
+            frame->assigned = tree && tree->shadow_host && container->slot_assigned_first;
+            frame->next = frame->assigned ? container->slot_assigned_first : container->first;
+        }
+        if (!frame->next) { depth--; continue; }
+        node_t *child = frame->next;
+        frame->next = frame->assigned ? child->assigned_next : child->next;
+        if (depth == capacity) {
+            if (capacity > SIZE_MAX / 2 / sizeof *walk) { free(walk); return false; }
+            size_t next = capacity * 2;
+            struct focus_walk *grown = realloc(walk, next * sizeof *walk);
+            if (!grown) { free(walk); return false; }
+            walk = grown; capacity = next;
+        }
+        walk[depth++] = (struct focus_walk){.node=child};
     }
-    pvec children = {0}; doc_flat_children(n, &children);
-    for (int i = 0; i < children.n; i++) scan_focus(s, children.v[i], depth + 1);
-    pv_free(&children);
+    free(walk); return true;
 }
 node_t *web_dialog_focus_target(web_doc *d, node_t *n) {
     if (!d || !n || !doc_node_connected(n)) return NULL;
     web_layout(d, d->width > 0 ? d->width : 800, d->height > 0 ? d->height : 600);
     if (node_attr(n, "autofocus") && web_focus_candidate(d, n)) return n;
-    struct focus_scan s = {.d=d, .autofocus=true}; scan_focus(&s, n, 0);
+    struct focus_scan s = {.d=d, .autofocus=true}; if (!scan_focus(&s, n, true)) return NULL;
     if (s.first) return s.first;
     s = (struct focus_scan){.d=d};
-    pvec children = {0}; doc_flat_children(n, &children);
-    for (int i = 0; i < children.n; i++) scan_focus(&s, children.v[i], 0);
-    pv_free(&children);
+    if (!scan_focus(&s, n, false)) return NULL;
     return s.first ? s.first : web_focus_candidate(d, n);
 }
 node_t *web_dialog_tab_target(web_doc *d, bool backward) {
     node_t *top = web_dialog_top(d); if (!top) return NULL;
     web_layout(d, d->width > 0 ? d->width : 800, d->height > 0 ? d->height : 600);
-    struct focus_scan s = {.d=d, .current=d->focus, .tab=true}; scan_focus(&s, top, 0);
+    struct focus_scan s = {.d=d, .current=d->focus, .tab=true}; if (!scan_focus(&s, top, true)) return NULL;
     /* Positive tabindex values precede zero/default values, ordered by numeric
-       value and then flat-tree order. A second bounded pass finds both neighbours. */
+       value and then flat-tree order. A second finite pass finds both neighbours. */
     if (s.seen) {
         s = (struct focus_scan){.d=d, .current=d->focus, .tab=true, .seen=true, .current_key=s.current_key};
-        scan_focus(&s,top,0);
+        if (!scan_focus(&s, top, true)) return NULL;
     }
     return backward ? (s.previous ? s.previous : s.last ? s.last : top) :
                      (s.next ? s.next : s.first ? s.first : top);

@@ -456,17 +456,13 @@ bool web_input_user_value(web_doc *d, node_t *n, const char *text, size_t len) {
         if (ok) n->control_user_edited = true;
         return ok;
     }
-    if (len > (16u << 20) || (len && !text)) return false;
+    if (len == SIZE_MAX || (len && !text)) return false;
     size_t raw_capacity = len + 1, canonical_capacity = len < 127 ? 128 : len + 1;
+    if (n->input_edit_capacity > SIZE_MAX - n->value_capacity || canonical_capacity > SIZE_MAX - raw_capacity) return false;
     size_t old_capacity = n->value_capacity + n->input_edit_capacity;
     web_doc *allocation = n->allocation_doc ? n->allocation_doc : d;
-    if (d->dom_family) {
-        if (raw_capacity + canonical_capacity > doc_dom_remaining(d) + old_capacity) return false;
-    } else if (d->live) {
-        size_t other = allocation->control_bytes - old_capacity;
-        if (other > (32u << 20) || raw_capacity + canonical_capacity > (32u << 20) - other ||
-            d->mem.allocated > (32u << 20) - other - raw_capacity - canonical_capacity) return false;
-    }
+    if (allocation->control_bytes < old_capacity ||
+        raw_capacity + canonical_capacity > SIZE_MAX - (allocation->control_bytes - old_capacity)) return false;
     char *raw = malloc(raw_capacity); if (!raw) return false;
     if (len) memcpy(raw, text, len);
     raw[len] = 0;
@@ -479,8 +475,7 @@ bool web_input_user_value(web_doc *d, node_t *n, const char *text, size_t len) {
     uint32_t units = doc_utf16_length(raw);
     if (n->selection_start > units) n->selection_start = units;
     if (n->selection_end > units) n->selection_end = units;
-    if (d->dom_family) doc_dom_budget(d);
-    else if (d->live) d->mem.limit = (32u << 20) - d->control_bytes;
+    doc_dom_budget(d);
     return true;
 }
 
@@ -606,13 +601,14 @@ void web_select_attribute_changed(web_doc *d, node_t *node, const char *name, bo
 }
 struct select_move { node_t *old_select, *new_select, *selected; };
 static void select_subtree_moved(web_doc *d, node_t *node, node_t *subtree, node_t *old_parent, struct select_move *move) {
+  while (node) {
+    bool descend = true;
     if (html_tag(node, T_select)) {
         /* Its own options retain the same nearest select when the whole select
            or an enclosing container moves. Preserve an explicit empty value. */
         web_select_sync(d, node, !node->control_ready);
-        return;
-    }
-    if (html_tag(node, T_option)) {
+        descend = false;
+    } else if (html_tag(node, T_option)) {
         option_init(node);
         node_t *old_select = option_select_before(node, subtree, old_parent);
         node_t *select = web_option_select(node);
@@ -623,10 +619,13 @@ static void select_subtree_moved(web_doc *d, node_t *node, node_t *subtree, node
                 if (node->checked) move->selected = node;
             }
         }
-        return;
-    }
-    if (html_tag(node, T_template)) return;
-    for (node_t *n = node->first; n; n = n->next) select_subtree_moved(d, n, subtree, old_parent, move);
+        descend = false;
+    } else if (html_tag(node, T_template)) descend = false;
+    if (descend && node->first) { node = node->first; continue; }
+    while (node != subtree && !node->next) node = node->parent;
+    if (node == subtree) return;
+    node = node->next;
+  }
 }
 void web_select_inserted(web_doc *d, node_t *subtree, node_t *old_parent) {
     struct select_move move = {0};
@@ -727,7 +726,13 @@ node_t *web_datalist_option(node_t *input, int index) {
     }
 }
 int web_datalist_options(web_doc *d, web_node *input, const char **labels, int capacity) {
-    if (!d || !input || input->owner != d || !labels || capacity <= 0) return 0;
+    if (input && input->owner && input->owner->frame_parent) d=input->owner;
+    if (!d || !input || input->owner != d || capacity < 0 || (!labels && capacity)) return 0;
+    if (!labels) {
+        int count=0;
+        while (web_datalist_option(input,count)) { if (count == INT32_MAX) return -1; count++; }
+        return count;
+    }
     int count = 0;
     for (node_t *option; count < capacity && (option = web_datalist_option(input, count)); count++) {
         if (!option->option_label || option->option_label_revision != d->dom_revision) {
@@ -785,14 +790,30 @@ int web_meter_quality(const node_t *n) {
 /* API values remain LF-only. Submission normalization and hard wrapping do
    not make the control dirty or alter selection/validation lengths. */
 static bool submission_capacity(sbuf *out, size_t length) {
-    if (length > WEB_FILE_BYTES) return false;
+    if (length == SIZE_MAX) return false; /* terminating NUL must be representable */
     if (length < out->cap) return true;
     size_t capacity = out->cap ? out->cap : 64;
-    while (capacity <= length && capacity < WEB_FILE_BYTES) capacity *= 2;
-    if (capacity <= length) capacity = WEB_FILE_BYTES + 1;
+    while (capacity <= length) {
+        if (capacity > SIZE_MAX / 2) { capacity = length + 1; break; }
+        capacity *= 2;
+    }
     char *bytes = realloc(out->p, capacity);
     if (!bytes) return false;
     out->p = bytes; out->cap = capacity; return true;
+}
+static bool submission_add(size_t *length, size_t extra) {
+    if (extra > SIZE_MAX - *length) return false;
+    *length += extra; return true;
+}
+static bool submission_sum(size_t *length, const size_t *parts, size_t count) {
+    *length = 0;
+    for (size_t i = 0; i < count; i++) if (!submission_add(length, parts[i])) return false;
+    return true;
+}
+#define SUBMISSION_SUM(length,...) submission_sum(&(length),(size_t[]){__VA_ARGS__},sizeof((size_t[]){__VA_ARGS__})/sizeof(size_t))
+static bool submission_append_capacity(sbuf *out, size_t extra) {
+    size_t length = out->n;
+    return submission_add(&length, extra) && submission_capacity(out, length);
 }
 bool web_textarea_submission(node_t *n, sbuf *out) {
     const char *value = n->value ? n->value : "", *wrap = node_attr(n, "wrap");
@@ -807,7 +828,7 @@ bool web_textarea_submission(node_t *n, sbuf *out) {
     for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
         size_t extra = *p == '\r' || *p == '\n' ? 2 :
             1 + (hard && (*p & 0xc0) != 0x80 && column == columns ? 2 : 0);
-        if (!submission_capacity(out, out->n + extra)) return false;
+        if (!submission_append_capacity(out, extra)) return false;
         if (*p == '\r' || *p == '\n') { if (*p == '\r' && p[1] == '\n') p++; sb_puts(out, "\r\n"); column = 0; }
         else {
             if ((*p & 0xc0) != 0x80) { if (hard && column == columns) { sb_puts(out, "\r\n"); column = 0; } column++; }
@@ -878,11 +899,10 @@ static bool submission_contains(const void *bytes, size_t length, const char *ne
 static bool submission_newlines(sbuf *out, const char *text) {
     size_t length = 0;
     for (const char *p = text ? text : ""; *p; p++) {
-        length += *p == '\r' || *p == '\n' ? 2 : 1;
+        if (!submission_add(&length, *p == '\r' || *p == '\n' ? 2 : 1)) return false;
         if (*p == '\r' && p[1] == '\n') p++;
-        if (length > WEB_FILE_BYTES) return false;
     }
-    if (!submission_capacity(out, out->n + length)) return false;
+    if (!submission_append_capacity(out, length)) return false;
     for (const char *p = text ? text : ""; *p; p++) {
         if (*p == '\r' || *p == '\n') { if (*p == '\r' && p[1] == '\n') p++; sb_puts(out, "\r\n"); }
         else sb_putc(out, *p);
@@ -891,13 +911,13 @@ static bool submission_newlines(sbuf *out, const char *text) {
 }
 static size_t multipart_name_length(const char *name) {
     size_t length = 0;
-    for (const char *p = name; *p; p++) length += *p == '"' || *p == '\r' || *p == '\n' ? 3 : 1;
+    for (const char *p = name; *p; p++) if (!submission_add(&length, *p == '"' || *p == '\r' || *p == '\n' ? 3 : 1)) return SIZE_MAX;
     return length;
 }
 static size_t submission_url_length(const char *text) {
     size_t length = 0;
     for (const unsigned char *p = (const unsigned char *)text; *p; p++)
-        length += ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '*' || *p == '-' || *p == '.' || *p == '_' || *p == ' ') ? 1 : 3;
+        if (!submission_add(&length, ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '*' || *p == '-' || *p == '.' || *p == '_' || *p == ' ') ? 1 : 3)) return SIZE_MAX;
     return length;
 }
 static void multipart_name(sbuf *out, const char *name) {
@@ -907,8 +927,6 @@ static void multipart_name(sbuf *out, const char *name) {
 }
 static void submission_pair(struct form_encoding *encoding, const char *name, const char *text) {
     if (encoding->failed) return;
-    size_t name_len = strlen(name), text_len = strlen(text ? text : "");
-    if (name_len > (16u << 20) || text_len > (16u << 20) || encoding->body.n > (16u << 20) - name_len || text_len > (16u << 20) - name_len - encoding->body.n) { encoding->failed = true; return; }
     sbuf normalized_name = {0}, normalized_value = {0};
     if (!submission_newlines(&normalized_name, name) || !submission_newlines(&normalized_value, text)) {
         encoding->failed = true; sb_free(&normalized_name); sb_free(&normalized_value); return;
@@ -916,10 +934,11 @@ static void submission_pair(struct form_encoding *encoding, const char *name, co
     name = normalized_name.p ? sb_cstr(&normalized_name) : "";
     text = normalized_value.p ? sb_cstr(&normalized_value) : "";
     sbuf *body = &encoding->body;
-    size_t extra = !strcmp(encoding->kind, "text/plain") ? normalized_name.n + normalized_value.n + 3 :
-        !strcmp(encoding->kind, "multipart/form-data") ? 2 + strlen(encoding->boundary) + strlen("\r\nContent-Disposition: form-data; name=\"") + multipart_name_length(name) + 5 + normalized_value.n + 2 :
-        (body->n ? 1 : 0) + submission_url_length(name) + 1 + submission_url_length(text);
-    if (!submission_capacity(body, body->n + extra)) { encoding->failed = true; sb_free(&normalized_name); sb_free(&normalized_value); return; }
+    size_t extra;
+    bool fits = !strcmp(encoding->kind, "text/plain") ? SUBMISSION_SUM(extra,normalized_name.n,normalized_value.n,3) :
+        !strcmp(encoding->kind, "multipart/form-data") ? SUBMISSION_SUM(extra,2,strlen(encoding->boundary),strlen("\r\nContent-Disposition: form-data; name=\""),multipart_name_length(name),5,normalized_value.n,2) :
+        SUBMISSION_SUM(extra,body->n ? 1 : 0,submission_url_length(name),1,submission_url_length(text));
+    if (!fits || !submission_append_capacity(body, extra)) { encoding->failed = true; sb_free(&normalized_name); sb_free(&normalized_value); return; }
     if (!strcmp(encoding->kind, "text/plain")) {
         sb_puts(body, name); sb_putc(body, '='); sb_puts(body, text); sb_puts(body, "\r\n");
     } else if (!strcmp(encoding->kind, "multipart/form-data")) {
@@ -931,7 +950,6 @@ static void submission_pair(struct form_encoding *encoding, const char *name, co
         if (body->n) sb_putc(body, '&');
         url_encode_form(body, name); sb_putc(body, '='); url_encode_form(body, text);
     }
-    if (body->n > (16u << 20)) encoding->failed = true;
     sb_free(&normalized_name); sb_free(&normalized_value);
 }
 /* FACE FormData entries retain lengths, including embedded NUL and file
@@ -939,9 +957,8 @@ static void submission_pair(struct form_encoding *encoding, const char *name, co
 static bool face_newlines(sbuf *out,const void *data,size_t length){
     const unsigned char *bytes=data;size_t size=0;
     for(size_t i=0;i<length;i++){
-        size+=bytes[i]=='\r'||bytes[i]=='\n'?2:1;
+        if(!submission_add(&size,bytes[i]=='\r'||bytes[i]=='\n'?2:1))return false;
         if(bytes[i]=='\r'&&i+1<length&&bytes[i+1]=='\n')i++;
-        if(size>WEB_FILE_BYTES)return false;
     }
     if(!submission_capacity(out,size))return false;
     for(size_t i=0;i<length;i++){
@@ -952,7 +969,7 @@ static bool face_newlines(sbuf *out,const void *data,size_t length){
 static bool face_url_safe(unsigned char c){return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='*'||c=='-'||c=='.'||c=='_'||c==' ';}
 static size_t face_encoded_size(const sbuf *text,bool name){
     size_t size=0;for(size_t i=0;i<text->n;i++){unsigned char c=(unsigned char)text->p[i];
-        size+=name?(c=='"'||c=='\r'||c=='\n'?3:1):(face_url_safe(c)?1:3);
+        if(!submission_add(&size,name?(c=='"'||c=='\r'||c=='\n'?3:1):(face_url_safe(c)?1:3)))return SIZE_MAX;
     }return size;
 }
 static void face_encoded(sbuf *out,const sbuf *text,bool name){
@@ -974,13 +991,15 @@ static void submission_face(struct form_encoding *encoding,const struct web_face
     const char *mime=entry->mime&&*entry->mime?entry->mime:"application/octet-stream";
     size_t extra=0;
     if(!encoding->failed){
-        if(plain)extra=normal_name.n+normal_value.n+3;
+        bool fits;
+        if(plain)fits=SUBMISSION_SUM(extra,normal_name.n,normal_value.n,3);
         else if(multipart){
-            extra=2+strlen(encoding->boundary)+strlen("\r\nContent-Disposition: form-data; name=\"")+face_encoded_size(&normal_name,true)+5+2;
-            if(entry->file)extra+=strlen("; filename=\"")+face_encoded_size(&normal_value,true)+1+strlen("\r\nContent-Type: ")+strlen(mime)+entry->size;
-            else extra+=normal_value.n;
-        }else extra=(body->n?1:0)+face_encoded_size(&normal_name,false)+1+face_encoded_size(&normal_value,false);
-        if(body->n>WEB_FILE_BYTES||extra>WEB_FILE_BYTES-body->n||!submission_capacity(body,body->n+extra))encoding->failed=true;
+            fits=SUBMISSION_SUM(extra,2,strlen(encoding->boundary),strlen("\r\nContent-Disposition: form-data; name=\""),face_encoded_size(&normal_name,true),5,2);
+            size_t suffix;
+            if(entry->file)fits= fits && SUBMISSION_SUM(suffix,strlen("; filename=\""),face_encoded_size(&normal_value,true),1,strlen("\r\nContent-Type: "),strlen(mime),entry->size) && submission_add(&extra,suffix);
+            else fits= fits && submission_add(&extra,normal_value.n);
+        }else fits=SUBMISSION_SUM(extra,body->n?1:0,face_encoded_size(&normal_name,false),1,face_encoded_size(&normal_value,false));
+        if(!fits||!submission_append_capacity(body,extra))encoding->failed=true;
     }
     if(!encoding->failed){
         if(plain){sb_put(body,normal_name.p,normal_name.n);sb_putc(body,'=');sb_put(body,normal_value.p,normal_value.n);sb_puts(body,"\r\n");}
@@ -1017,7 +1036,8 @@ static void submission_collect(web_doc *d, node_t *form, node_t *scope, node_t *
                     submission_face(encoding,&v->entries[i],v->single?name:NULL);
             } else if (n->tag == T_input && web_input_type(n) == WEB_INPUT_IMAGE && n == submitter) {
                 sbuf coord = {0};
-                if (!submission_capacity(&coord, (name ? strlen(name) : 0) + 2)) { encoding->failed = true; return; }
+                size_t coord_length;
+                if (!SUBMISSION_SUM(coord_length,name ? strlen(name) : 0,2) || !submission_capacity(&coord,coord_length)) { encoding->failed = true; return; }
                 if (name && *name) { sb_puts(&coord, name); sb_putc(&coord, '.'); } sb_putc(&coord, 'x');
                 submission_pair(encoding, sb_cstr(&coord), "0"); coord.n--; sb_putc(&coord, 'y'); submission_pair(encoding, sb_cstr(&coord), "0"); sb_free(&coord);
             } else if (name && *name) {
@@ -1034,15 +1054,16 @@ static void submission_collect(web_doc *d, node_t *form, node_t *scope, node_t *
                             if (strcmp(encoding->kind, "multipart/form-data")) submission_pair(encoding, name, filename);
                             else {
                                 sbuf *body = &encoding->body;
-                                if (encoding->failed || body->n > WEB_FILE_BYTES || (file && file->size > WEB_FILE_BYTES - body->n)) { encoding->failed = true; break; }
+                                if (encoding->failed) break;
                                 sbuf part_name = {0}, part_filename = {0};
                                 if (!submission_newlines(&part_name, name) || !submission_newlines(&part_filename, filename)) {
                                     encoding->failed = true; sb_free(&part_name); sb_free(&part_filename); break;
                                 }
                                 const char *field_name = sb_cstr(&part_name), *field_filename = sb_cstr(&part_filename), *mime = file && *file->type ? file->type : "application/octet-stream";
-                                size_t extra = 2 + strlen(encoding->boundary) + strlen("\r\nContent-Disposition: form-data; name=\"") + multipart_name_length(field_name) +
-                                    strlen("\"; filename=\"") + multipart_name_length(field_filename) + strlen("\"\r\nContent-Type: ") + strlen(mime) + 4 + (file ? file->size : 0) + 2;
-                                if (!submission_capacity(body, body->n + extra)) { encoding->failed = true; sb_free(&part_name); sb_free(&part_filename); break; }
+                                size_t extra;
+                                if (!SUBMISSION_SUM(extra,2,strlen(encoding->boundary),strlen("\r\nContent-Disposition: form-data; name=\""),multipart_name_length(field_name),
+                                    strlen("\"; filename=\""),multipart_name_length(field_filename),strlen("\"\r\nContent-Type: "),strlen(mime),4,file ? file->size : 0,2) ||
+                                    !submission_append_capacity(body,extra)) { encoding->failed = true; sb_free(&part_name); sb_free(&part_filename); break; }
                                 if ((file && file->size && submission_contains(file->bytes, file->size, encoding->boundary)) || strstr(filename, encoding->boundary) || strstr(name, encoding->boundary)) encoding->collision = true;
                                 sb_puts(body, "--"); sb_puts(body, encoding->boundary);
                                 sb_puts(body, "\r\nContent-Disposition: form-data; name=\""); multipart_name(body, field_name);
@@ -1050,7 +1071,6 @@ static void submission_collect(web_doc *d, node_t *form, node_t *scope, node_t *
                                 sb_puts(body, "\"\r\nContent-Type: "); sb_puts(body, mime);
                                 sb_puts(body, "\r\n\r\n"); if (file && file->size) sb_put(body, (const char *)file->bytes, file->size); sb_puts(body, "\r\n");
                                 sb_free(&part_name); sb_free(&part_filename);
-                                if (body->n > WEB_FILE_BYTES) encoding->failed = true;
                             }
                         }
                     } else if (kind < WEB_INPUT_SUBMIT) submission_pair(encoding, name, n->value ? n->value : "");
@@ -1065,12 +1085,11 @@ static void submission_collect(web_doc *d, node_t *form, node_t *scope, node_t *
                         sbuf value = {0};
                         const char *attribute = node_attr(option, "value"); size_t capacity = attribute ? strlen(attribute) : 0;
                         if (!attribute) for (node_t *p = option; p; ) {
-                            if (p->type == N_TEXT) capacity += p->textlen;
-                            if (capacity > WEB_FILE_BYTES) break;
+                            if (p->type == N_TEXT && !submission_add(&capacity,p->textlen)) { encoding->failed = true; break; }
                             if (p->first && !html_tag(p, T_script)) p = p->first;
                             else { while (p != option && !p->next) p = p->parent; if (p == option) break; p = p->next; }
                         }
-                        if (!submission_capacity(&value, capacity)) { encoding->failed = true; break; }
+                        if (encoding->failed || !submission_capacity(&value, capacity)) { encoding->failed = true; break; }
                         web_option_value(option, &value);
                         submission_pair(encoding, name, value.p ? sb_cstr(&value) : ""); sb_free(&value);
                     }
@@ -1128,7 +1147,8 @@ bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request
     }
     if (encoding.failed || encoding.collision) { sb_free(&encoding.body); return false; }
     if (!strcmp(kind, "multipart/form-data")) {
-        if (!submission_capacity(&encoding.body, encoding.body.n + strlen(encoding.boundary) + 6)) { sb_free(&encoding.body); return false; }
+        size_t suffix;
+        if (!SUBMISSION_SUM(suffix,strlen(encoding.boundary),6) || !submission_append_capacity(&encoding.body,suffix)) { sb_free(&encoding.body); return false; }
         sb_puts(&encoding.body, "--"); sb_puts(&encoding.body, encoding.boundary); sb_puts(&encoding.body, "--\r\n");
     }
     request->target = strdup(target);
@@ -1145,7 +1165,8 @@ bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request
         char fragment_text[2048] = {0};
         char *fragment = strchr(absolute, '#'); if (fragment) { strcpy(fragment_text, fragment); *fragment = 0; }
         char *query = strchr(absolute, '?'); if (query) *query = 0;
-        size_t length = strlen(absolute) + encoding.body.n + strlen(fragment_text) + 2;
+        size_t length;
+        if (!SUBMISSION_SUM(length,strlen(absolute),encoding.body.n,strlen(fragment_text),2)) { sb_free(&encoding.body); web_submit_request_free(request); return false; }
         request->url = malloc(length);
         if (request->url) snprintf(request->url, length, "%s?%s%s", absolute, encoding.body.p ? sb_cstr(&encoding.body) : "", fragment_text);
     }

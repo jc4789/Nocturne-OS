@@ -1,34 +1,30 @@
 /* Native rendered-text collection. Included by js.c, never author hooks.
  * https://html.spec.whatwg.org/multipage/dom.html#the-innertext-idl-attribute */
-#define INNER_TEXT_MAX (1024u * 1024u)
-#define INNER_TEXT_VISITS 262144u
 struct inner_text_buffer {
     JSContext *ctx;
     char *p;
     size_t n, cap;
-    unsigned visits, required;
+    unsigned required;
     bool space, failed;
 };
 static bool inner_text_put(struct inner_text_buffer *b, const char *s, size_t n) {
     if (b->failed) return false;
-    if (n > INNER_TEXT_MAX - b->n) {
-        JS_ThrowRangeError(b->ctx, "Rendered text exceeds the native 1 MiB limit");
+    if (n > SIZE_MAX - b->n) {
+        JS_ThrowRangeError(b->ctx, "Rendered text size is not representable");
         b->failed = true; return false;
     }
     if (b->n + n > b->cap) {
         size_t cap = b->cap ? b->cap : 256;
-        while (cap < b->n + n) cap *= 2;
+        while (cap < b->n + n) {
+            if (cap > SIZE_MAX / 2) { cap = b->n + n; break; }
+            cap *= 2;
+        }
         char *p = js_realloc(b->ctx, b->p, cap);
         if (!p) { b->failed = true; return false; }
         b->p = p; b->cap = cap;
     }
     if (n) memcpy(b->p + b->n, s, n);
     b->n += n; return true;
-}
-static bool inner_text_visit(struct inner_text_buffer *b) {
-    if (++b->visits <= INNER_TEXT_VISITS) return true;
-    JS_ThrowRangeError(b->ctx, "Rendered text traversal exceeds the native node limit");
-    b->failed = true; return false;
 }
 static void inner_text_required(struct inner_text_buffer *b, unsigned count) {
     if (!count) return;
@@ -95,7 +91,6 @@ static void inner_text_exit(struct inner_text_buffer *b, const node_t *n) {
 static void inner_text_collect(struct inner_text_buffer *b, node_t *element, bool rendered) {
     node_t *n = element->first;
     while (n && !b->failed) {
-        if (!inner_text_visit(b)) break;
         if (n->type == N_TEXT) {
             if (!rendered) inner_text_put(b, n->text ? n->text : "", n->textlen);
             else if (n->box && n->box->kind == B_TEXT) inner_text_box(b, n->box);
@@ -110,9 +105,19 @@ static void inner_text_collect(struct inner_text_buffer *b, node_t *element, boo
     }
 }
 static void flush_layout(struct web_js_state *s);
-static void inner_text_flush_owner(web_doc *d) {
-    web_doc *chain[9]; unsigned count = 0;
-    for (web_doc *p = d; p && count < 9; p = p->frame_parent) chain[count++] = p;
+static bool inner_text_flush_owner(web_doc *d) {
+    size_t count = 0;
+    for (web_doc *p = d; p; p = p->frame_parent) {
+        if (count == SIZE_MAX / sizeof(web_doc *)) {
+            JS_ThrowRangeError(d->js->ctx, "Frame ancestor chain size is not representable");
+            return false;
+        }
+        count++;
+    }
+    web_doc **chain = count ? js_malloc(d->js->ctx, count * sizeof *chain) : NULL;
+    if (count && !chain) return false;
+    size_t at = 0;
+    for (web_doc *p = d; p; p = p->frame_parent) chain[at++] = p;
     while (count) {
         web_doc *owner = chain[--count];
         struct web_js_state *s = owner->js;
@@ -127,6 +132,8 @@ static void inner_text_flush_owner(web_doc *d) {
             if (owner->layout_revision != revision) s->task_layout_flushes++;
         } else flush_layout(s);
     }
+    js_free(d->js->ctx, chain);
+    return true;
 }
 static JSValue rendered_inner_text(struct web_js_state *s, node_t *element) {
     JSContext *ctx = s->ctx;
@@ -136,7 +143,7 @@ static JSValue rendered_inner_text(struct web_js_state *s, node_t *element) {
     bool connected = d->live && !d->inert && doc_node_connected(element);
     /* Adopted wrappers may belong to a different realm. Flush the owning
        Document, and never reactivate a retired or inert browsing context. */
-    if (connected && d->js && !d->js->disabled) inner_text_flush_owner(d);
+    if (connected && d->js && !d->js->disabled && !inner_text_flush_owner(d)) return JS_EXCEPTION;
     bool rendered = connected && d->layout_valid && element->box;
     struct inner_text_buffer b = {.ctx=ctx};
     inner_text_collect(&b, element, rendered);

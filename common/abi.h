@@ -117,6 +117,7 @@ struct gui_event {
 #define WIN_RESIZABLE 1
 #define WIN_NO_DECOR 2
 #define WIN_CENTER 4
+#define WIN_START_MAXIMIZED 8
 #define WIN_STATE_VISIBLE 1
 #define WIN_STATE_FOCUSED 2
 

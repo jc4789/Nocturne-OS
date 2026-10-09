@@ -18,6 +18,7 @@ bool nmedia_mse_parsing(const nmedia_mse *);
 int64_t nmedia_mse_group_end(const nmedia_mse *);
 int64_t nmedia_mse_duration(const nmedia_mse *);
 int nmedia_mse_step(nmedia_mse *,struct nmedia_output *);
+bool nmedia_mse_move_video(nmedia_mse *,const struct nmedia_output *,uint32_t **,size_t *);
 /* Valid after AGAIN: true only for absent decoder/input, not bounded decode
  * work (e.g. seek preroll) that must be resumed without another append. */
 bool nmedia_mse_waiting_for_input(const nmedia_mse *);
@@ -27,4 +28,6 @@ void nmedia_mse_abort(nmedia_mse *);
 bool nmedia_mse_end(nmedia_mse *,bool);
 bool nmedia_mse_change_type(nmedia_mse *,const char *);
 size_t nmedia_mse_ranges(nmedia_mse *,struct nmedia_time_range *,size_t);
+/* Actual retained-frame count, an upper bound for dynamic range allocation. */
+size_t nmedia_mse_range_capacity(const nmedia_mse *);
 void nmedia_mse_close(nmedia_mse *);

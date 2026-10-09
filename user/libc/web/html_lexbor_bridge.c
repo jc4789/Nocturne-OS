@@ -4,6 +4,7 @@
    in Lexbor deliberately bypass some of those callbacks. */
 #include "html_lexbor.h"
 #include "elements.h"
+#include <limits.h>
 #include <lexbor/dom/interfaces/character_data.h>
 #include <lexbor/dom/interfaces/document_type.h>
 #include <lexbor/dom/interfaces/document_fragment.h>
@@ -46,7 +47,9 @@ static struct binding *by_lex(lxb_dom_node_t *n) {
 
 static struct binding *bind_node(struct html_parser *p, lxb_dom_node_t *lex, node_t *native) {
     struct html_bridge *b = p->bridge;
-    if ((b->length + 1) * 2 >= b->table_size) {
+    if (b->length == SIZE_MAX) return NULL;
+    if (b->length + 1 >= b->table_size / 2) {
+        if (b->table_size > SIZE_MAX / 2 / sizeof *b->table) return NULL;
         size_t size = b->table_size ? b->table_size * 2 : 128;
         struct binding **table = calloc(size, sizeof *table);
         if (!table) return NULL;
@@ -59,6 +62,7 @@ static struct binding *bind_node(struct html_parser *p, lxb_dom_node_t *lex, nod
         free(b->table); b->table = table; b->table_size = size;
     }
     if (b->length == b->capacity) {
+        if (b->capacity > SIZE_MAX / 2 / sizeof *b->items) return NULL;
         size_t size = b->capacity ? b->capacity * 2 : 64;
         struct binding **items = realloc(b->items, size * sizeof *items);
         if (!items) return NULL;
@@ -201,6 +205,10 @@ static void attr_cache(web_doc *d, node_t *n) {
     while (*s) {
         while (is_space((unsigned char)*s)) s++;
         if (!*s) break;
+        if (count == INT_MAX || count == SIZE_MAX / sizeof *n->classes) {
+            if (d->mem.trap) longjmp(*d->mem.trap, 1);
+            abort();
+        }
         count++;
         while (*s && !is_space((unsigned char)*s)) s++;
     }
@@ -228,7 +236,10 @@ static bool import_fields(struct binding *b) {
         if (!attrs_equal(n, el)) {
             bool was_open=node_attr(n,"open")!=NULL;
             size_t count = 0;
-            for (lxb_dom_attr_t *a = el->first_attr; a; a = a->next) count++;
+            for (lxb_dom_attr_t *a = el->first_attr; a; a = a->next) {
+                if (count == INT_MAX || count == SIZE_MAX / sizeof(struct attr)) { d->mem.trap = old; return false; }
+                count++;
+            }
             struct attr *attrs = count ? ar_alloc(&d->mem, count * sizeof *attrs) : NULL;
             size_t i = 0;
             for (lxb_dom_attr_t *a = el->first_attr; a; a = a->next, i++) {
@@ -292,12 +303,6 @@ bool html_bridge_import(struct html_parser *p) {
     for (size_t pass = 0; pass < 2; pass++) {
         for (size_t i = 0; i < b->length; i++) {
             struct binding *v = b->items[i];
-            /* Native style/layout walks have a bounded recursive depth. Reject
-               hostile trees before publishing links, never flatten HTML into
-               a different document to pretend it parsed successfully. */
-            unsigned depth = 0;
-            for (lxb_dom_node_t *a = v->lex; a; a = a->parent)
-                if (++depth > 400) return false;
             if (!import_fields(v)) return false;
             for (lxb_dom_node_t *ch = v->lex->first_child; ch; ch = ch->next)
                 if (!import_node(p, ch, v->native->owner)) return false;

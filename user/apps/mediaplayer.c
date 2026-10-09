@@ -2,6 +2,7 @@
  * windows are Nocturne's, never an external player or a POSIX runtime. */
 #include "nocturne.h"
 #include "media.h"
+#include "media_video_private.h"
 #include "media_alloc_private.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,10 +31,10 @@ static void open_audio(void) {
     if(audio_fd>=0&&read(audio_fd,&queued,4)!=4)clear_audio();
 }
 static bool present_picture(void) {
-    if(!pending.pixels||pending.width<=0||pending.height<=0||(uint64_t)pending.width*pending.height>NMEDIA_MAX_PIXELS){strlcpy(error,"Invalid video frame.",sizeof error);return false;}
-    size_t count=(size_t)pending.width*pending.height;
-    if(count>picture_capacity){uint32_t *p=nmedia_ff_realloc(picture,count*4);if(!p){strlcpy(error,"Video presentation allocation failed.",sizeof error);return false;}picture=p;picture_capacity=count;}
-    memcpy(picture,pending.pixels,count*4);picture_w=pending.width;picture_h=pending.height;return true;
+    size_t count,bytes;
+    if(!pending.pixels||!nmedia_video_size(pending.width,pending.height,&count,&bytes)){strlcpy(error,"Invalid video frame.",sizeof error);return false;}
+    if(count>picture_capacity){uint32_t *p=nmedia_ff_realloc(picture,bytes);if(!p){strlcpy(error,"Video presentation allocation failed.",sizeof error);return false;}picture=p;picture_capacity=count;}
+    memcpy(picture,pending.pixels,bytes);picture_w=pending.width;picture_h=pending.height;return true;
 }
 static bool seek_to(int64_t ms) {
     if (!media || !nmedia_seek(media, ms)) { strlcpy(error,"This input cannot seek to that position.",sizeof error); return false; }

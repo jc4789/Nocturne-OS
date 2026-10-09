@@ -67,7 +67,7 @@ static JSValue document_command_dom(struct web_js_state *s,node_t *document,int 
            old_len!=strlen(web_input_edit_text(target))||memcmp(old,web_input_edit_text(target),old_len)||
            target->selection_start!=start||target->selection_end!=end)goto release;
         if(select){doc_control_selection(d,target,0,UINT32_MAX,0);result=JS_TRUE;goto release;}
-        if(new_len>(16u<<20)||strlen(next)!=new_len)goto release;
+        if(strlen(next)!=new_len)goto release;
         uint32_t limit=0,new_units=doc_utf16_length(next),old_units=doc_utf16_length(old);
         if(document_command_maxlength(target,&limit)&&new_units>limit&&new_units>old_units)goto release;
         struct document_command_guard guard={d,document_commands_running};document_commands_running=&guard;

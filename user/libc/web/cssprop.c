@@ -810,7 +810,11 @@ static const struct kw kw_visibility[] = {{"visible", 0}, {"hidden", 1}, {"colla
 static const struct kw kw_bcollapse[] = {{"separate", 0}, {"collapse", 1}, {0}};
 static const struct kw kw_fdir[] = {{"row", FD_ROW}, {"row-reverse", FD_ROW_REVERSE}, {"column", FD_COLUMN},
                                     {"column-reverse", FD_COLUMN_REVERSE}, {0}};
-static const struct kw kw_fwrap[] = {{"nowrap", 0}, {"wrap", 1}, {"wrap-reverse", 1}, {0}};
+static const struct kw kw_fwrap[] = {{"nowrap", FW_NOWRAP}, {"wrap", FW_WRAP}, {"wrap-reverse", FW_WRAP_REVERSE}, {0}};
+static const struct kw kw_acontent[] = {{"normal", AC_NORMAL}, {"stretch", AC_STRETCH},
+    {"flex-start", AC_FLEX_START}, {"flex-end", AC_FLEX_END}, {"center", AC_CENTER},
+    {"space-between", AC_BETWEEN}, {"space-around", AC_AROUND}, {"space-evenly", AC_EVENLY},
+    {"start", AC_START}, {"end", AC_END}, {0}};
 static const struct kw kw_justify[] = {{"flex-start", JC_START}, {"start", JC_START}, {"left", JC_START},
                                        {"normal", JC_START}, {"stretch", JC_START}, {"flex-end", JC_END},
                                        {"end", JC_END}, {"right", JC_END}, {"center", JC_CENTER},
@@ -847,6 +851,7 @@ static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}
 
 /* sorted by name at first use */
 static struct propdef props[] = {
+    {"align-content", PT_KW, 0, false, O(align_content), kw_acontent, 0},
     {"align-items", PT_KW, 0, false, O(align_items), kw_align, 0},
     {"align-self", PT_KW, 0, false, O(align_self), kw_align, 0},
     SH("background", SH_BACKGROUND),
@@ -1033,6 +1038,7 @@ static void init_initial(void) {
     s->text_indent.kind = LK_LEN;
     s->flex_basis.kind = LK_AUTO;
     s->flex_shrink = 1;
+    s->align_content = AC_NORMAL;
     s->opacity = 1;
     s->object_pos[0].kind=s->object_pos[1].kind=LK_LEN;
     s->object_pos[0].pct=s->object_pos[1].pct=50;

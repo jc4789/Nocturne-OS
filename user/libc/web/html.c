@@ -57,9 +57,12 @@ node_t *node_ancestor(node_t *n, int tag) {
 }
 
 void node_text_content(const node_t *n, sbuf *out) {
-    if (n->type == N_TEXT) {
-        sb_put(out, n->text, n->textlen);
-        return;
+    const node_t *root = n;
+    while (n) {
+        if (n->type == N_TEXT) sb_put(out, n->text, n->textlen);
+        if (n->type != N_TEXT && n->first) { n = n->first; continue; }
+        while (n != root && !n->next) n = n->parent;
+        if (n == root) break;
+        n = n->next;
     }
-    for (node_t *c = n->first; c; c = c->next) node_text_content(c, out);
 }

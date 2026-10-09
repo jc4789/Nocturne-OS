@@ -185,9 +185,13 @@ typedef struct node {
     int js_image;
     uint64_t js_image_generation;
     bool style_disabled; /* stylesheet state, not the HTML disabled attribute */
+    bool style_disabled_set; /* link IDL/CSSOM override of its initial disabled attribute */
+    struct cssom_sheet *cssom_sheets, *cssom_current; /* native owner/source/AST, allocation-owned */
+    uint32_t cssom_serial;
     uint64_t resource_revision;
     const char *option_label;
     uint64_t option_label_revision;
+    struct web_paint_diagnostic *paint_diagnostic; /* debug-only, allocation owner frees */
 } node_t;
 
 const char *node_attr(const node_t *n, const char *name); /* NULL if absent */
@@ -225,8 +229,11 @@ enum { TT_NONE, TT_UPPER, TT_LOWER, TT_CAPITALIZE };
 enum { TD_UNDERLINE = 1, TD_OVERLINE = 2, TD_LINE_THROUGH = 4 };
 enum { OV_VISIBLE, OV_HIDDEN, OV_SCROLL, OV_AUTO, OV_CLIP };
 enum { FD_ROW, FD_ROW_REVERSE, FD_COLUMN, FD_COLUMN_REVERSE };
+enum { FW_NOWRAP, FW_WRAP, FW_WRAP_REVERSE };
 enum { JC_START, JC_END, JC_CENTER, JC_BETWEEN, JC_AROUND, JC_EVENLY };
 enum { AI_STRETCH, AI_START, AI_END, AI_CENTER, AI_BASELINE };
+enum { AC_NORMAL, AC_STRETCH, AC_FLEX_START, AC_FLEX_END, AC_CENTER,
+       AC_BETWEEN, AC_AROUND, AC_EVENLY, AC_START, AC_END };
 enum { BR_REPEAT, BR_REPEAT_X, BR_REPEAT_Y, BR_NO_REPEAT };
 enum { BSZ_AUTO, BSZ_COVER, BSZ_CONTAIN, BSZ_LEN };
 
@@ -280,7 +287,7 @@ struct gradient {
 typedef struct style {
     uint8_t display, position, float_, clear, white_space, text_align, vertical_align, list_style,
         list_style_inside, font_style, text_transform, text_decoration, overflow, box_sizing, visibility, pointer_events,
-        border_collapse, flex_direction, flex_wrap, justify_content, align_items, align_self, table_layout;
+        border_collapse, flex_direction, flex_wrap, justify_content, align_items, align_self, align_content, table_layout;
     uint8_t border_style[4];
     uint16_t font_weight;
     uint8_t font_family; /* FONT_FAMILY_*; inherited as one byte */
@@ -330,12 +337,20 @@ typedef struct style {
 /* ---------------------------------------------------------------- stylesheets */
 typedef struct sheet sheet_t;
 typedef struct css_ctx css_ctx;
+/* Parser-owned CSSOM metadata points at the SAME native cascade AST. */
+struct css_rule_info {
+    struct css_rule_info *next;
+    const char *text, *selector, *import_url;
+    uint32_t type, id;
+    void *native_rule;
+};
 
 /* the document's styling state */
 struct styling {
     pvec sheets;   /* sheet_t*, in cascade order */
     css_ctx *ctx;  /* rule index for the current viewport */
     int index_w, index_h;
+    bool index_dirty, index_scripting, index_quirks;
 };
 
 /* imports: receives struct css_import* for each @import, to be fetched and added with their order */
@@ -346,6 +361,9 @@ struct css_import {
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports);
 void css_sheet_scope(sheet_t *sheet, node_t *shadow_root);
 sheet_t *css_sheet_instance(arena_t *a, const sheet_t *source, double order, node_t *scope);
+void css_sheet_media(sheet_t *sheet, const char *media);
+struct css_rule_info *css_sheet_rules(sheet_t *sheet, uint32_t *length);
+bool css_sheet_single_style(sheet_t *sheet, const char *source, size_t length);
 const char *css_ua_sheet(void);
 /* compute every element's style for the viewport */
 void css_cascade(web_doc *d, int vw, int vh);
@@ -463,6 +481,11 @@ struct deco {
     node_t *node;
 };
 
+node_t *doc_element_at(web_doc *d,int x,int y); /* hit retargeted to this Document's frame boundary */
+void doc_hover_update(web_doc *document,node_t *target); /* native-only CSS state; no JS dispatch */
+void doc_active_cancel(web_doc *document); /* retire/free only this context subtree */
+node_t *doc_active_target(web_doc *document); /* validates live native press and embedding generation */
+
 void boxes_build(web_doc *d, arena_t *a);
 void layout_doc(web_doc *d, int width, int height);
 float box_abs_x(const box_t *b);
@@ -470,6 +493,7 @@ float box_abs_y(const box_t *b);
 /* Paint/hit/DOMRect positions; box_abs remains unscrolled offset geometry. */
 float box_visual_x(const box_t *b);
 float box_visual_y(const box_t *b);
+void web_paint_debug_node_free(node_t *node);
 bool box_element_scrollable(const box_t *b);
 void box_scroll_clamp(box_t *b);
 
@@ -495,6 +519,7 @@ struct web_image {
     char *svg;       /* SVG source, rasterized again at the size it is drawn at */
     size_t svg_n;
     bool done, failed;
+    bool image_upgrade; /* Part of request identity: imageset must not share an upgraded image. */
 };
 
 /* Monotonic diagnostic counters, sampled at task boundaries. No timing limit
@@ -509,11 +534,13 @@ struct web_doc {
     web_doc *frame_parent;
     web_doc *frame_retired_next;
     node_t *frame_element;
+    node_t *address_frame; /* native chrome selection; resolves the current child generation */
     struct web_frame *frames;
     const char *inherited_url; /* about:blank/srcdoc base and origin, never an author property */
     web_doc *origin_owner; /* inherited opaque origins retain native identity */
     node_t *window_token; /* stable for navigation, distinct after removal */
-    unsigned frame_depth, frame_count, frame_navigation_count;
+    struct web_frame *frame_container;
+    web_doc *frame_free_next;
     struct web_profile profile;
     web_doc *dom_family, *dom_docs, *dom_next;
     bool js_nodes_dirty; /* structural/Attr ownership changed; not text/style */
@@ -532,6 +559,7 @@ struct web_doc {
     size_t control_bytes;
     size_t canvas_bytes;
     uint8_t dom_create_reported; /* one numeric failure diagnostic per stage */
+    bool frame_allocation_reported;
     uint64_t dom_revision;
     uint64_t layout_revision;
     struct html_parser *parser;
@@ -541,12 +569,12 @@ struct web_doc {
     struct css_sheet_reuse *css_reuse; /* current CSS arena only, no DOM ownership */
     size_t css_reuse_bytes;
     unsigned css_reuse_count;
-    int css_depth;
     size_t css_bytes;
     bool scan_title_seen;
     node_t *root;   /* the document node */
     node_t *html, *head, *body;
     char *url;      /* the document's own URL */
+    char *resolved_link; /* native hit/getter URL, borrowed until this doc's next link getter */
     char base[HTTP_URL_MAX];
     bool base_seen;
     bool quirks; /* no (or a legacy) doctype */
@@ -564,6 +592,10 @@ struct web_doc {
     int styled_w, styled_h; /* viewport the cascade ran for */
     bool need_style, need_boxes, layout_valid;
     node_t *focus;
+    node_t *hover_target; /* native pointer target, not an author-set property */
+    web_doc *hover_leaf;  /* top document's last hovered child context; arenas remain owned */
+    node_t *active_target; /* native primary-button press, independent of hover/events */
+    web_doc *active_leaf; /* top document's pressed context; native arenas remain owned */
     struct web_dialog_state *dialogs; /* native modal/top-layer ownership */
     int view_x, view_y; /* last native viewport scroll; fixed top-layer coordinates */
     node_t *validation_target;
@@ -574,7 +606,7 @@ struct web_doc {
     int caret;
     node_t *find_node;
     struct run *find_run;
-    char find_text[128];
+    char *find_text; /* document-owned full search query */
 };
 
 node_t *html_parse(web_doc *d, const char *html, size_t n, const char *charset);
@@ -623,7 +655,7 @@ node_t *doc_shadow_attach(web_doc *d, node_t *host, bool closed, bool delegates_
 node_t *doc_assigned_slot(node_t *node, bool open_only);
 void doc_shadow_reassign(web_doc *d);
 void doc_slot_signal(node_t *slot);
-void doc_slot_nodes(node_t *slot, bool flatten, pvec *out);
+bool doc_slot_nodes(node_t *slot, bool flatten, pvec *out);
 bool doc_slot_assign(node_t *slot, node_t **nodes, int count);
 /* Appends immediate rendered children. Slots remain nodes (display:contents).
    This never mutates native parent/first/next and never crosses template trees. */
@@ -669,6 +701,7 @@ bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out);
 bool css_matches(node_t *node, const char *selector, bool *valid);
 void web_js_start(web_doc *d, const struct web_host *host);
 void web_js_console(web_doc *d, int level, const char *message);
+bool web_js_video_present(web_doc *d,const struct web_video_patch *patch);
 void web_js_focus_control(web_doc *d, node_t *control);
 void web_js_face_reset(web_doc *d, node_t *form);
 node_t *web_autofocus_candidate(web_doc *d);
@@ -688,6 +721,9 @@ bool web_js_enabled(web_doc *d);
 bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *e);
 /* Native edit event: NULL data means InputEvent.data=null. */
 bool web_js_input_event(web_doc *d,node_t *target,const char *type,const char *input_type,const char *data,size_t length);
+/* One physical edit task encloses beforeinput, native default and input. */
+void *web_js_edit_begin(web_doc *d);
+void web_js_edit_end(void *scope);
 void web_js_selection_changed(web_doc *d, node_t *node);
 
 /* URL helpers (util.c) */

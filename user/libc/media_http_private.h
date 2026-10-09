@@ -2,12 +2,15 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include "http.h"
 
 /* Single-owner synchronous anonymous HTTP(S) reader. Not a browser fetch API. */
 #define NMEDIA_HTTP_CACHE_BYTES (256u * 1024u)
-#define NMEDIA_HTTP_URL_BYTES 2048u
 #define NMEDIA_HTTP_COMPLETE_BYTES (16u * 1024u * 1024u)
 typedef struct nmedia_http nmedia_http;
+/* Shared native redirect/manifest resolution. Exact owned HTTP(S) URL;
+ * no credentials, fragments, controls or HTTPS downgrade. nmedia_ff_free. */
+enum http_url_result nmedia_http_resolve(const char *base, const char *location, char **out);
 nmedia_http *nmedia_http_open(const char *url, char *error, size_t error_size);
 /* Native document URL only: anonymous CORS on each range, no redirects. */
 bool nmedia_http_browser_url(const char *url, const char *document_url);

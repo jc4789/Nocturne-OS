@@ -101,9 +101,9 @@ int main(void) {
     check("value embedded nul",css_supports_declaration("color",5,"red\0junk",8),false);
     char deep[256],long_input[65538];
     memset(deep,'(',40);memcpy(deep+40,"color:red",9);memset(deep+49,')',40);deep[89]=0;
-    check("recursion bound",css_supports_condition(deep,89,true),false);
+    check("deep valid condition",css_supports_condition(deep,89,true),true);
     memset(long_input,' ',sizeof long_input);memcpy(long_input,"(color:red)",11);
-    check("length bound",css_supports_condition(long_input,sizeof long_input,true),false);
+    check("long valid condition",css_supports_condition(long_input,sizeof long_input,true),true);
     rule_check("#probe{width:11px;color:red}@supports (not-a-property:x){#probe{width:99px}}"
                "@supports not (display:nonsense){#probe{width:21px;color:blue}}",21,RGB(0,0,255),"rules true false not");
     rule_check("#probe{width:11px;color:red}@supports (color:var(--test,red)){#probe{width:31px}}"

@@ -1,4 +1,5 @@
 #include "media.h"
+#include "media_video_private.h"
 #include "media_alloc_private.h"
 #include "media_http_private.h"
 #include "media_feed_private.h"
@@ -33,6 +34,8 @@ struct nmedia {
     char error[160];
     uint32_t *pixels;
     size_t pixel_capacity;
+    bool video_borrowed;
+    int64_t video_loan_pts;
     int16_t samples[4096 * 2];
     uint64_t phase, step;
     int frame_audio, source_rate;
@@ -99,7 +102,6 @@ static AVCodecContext *open_decoder(nmedia *m, int stream) {
     AVCodecContext *c = avcodec_alloc_context3(codec);
     if (!c) { fail(m, "decoder allocation", AVERROR(ENOMEM)); return NULL; }
     c->thread_count = 1; c->thread_type = 0;
-    c->max_pixels = NMEDIA_MAX_PIXELS;
     /* Decoder-side pre-skip/discard adjusts frame PTS in packet time units. */
     c->pkt_timebase = s->time_base;
     int r = avcodec_parameters_to_context(c, s->codecpar);
@@ -112,7 +114,8 @@ static AVCodecContext *open_decoder(nmedia *m, int stream) {
 static nmedia *open_input(nmedia *m, char *error, size_t error_size) {
     m->audio_index = m->video_index = -1;
     m->audio_seek_ms = m->video_seek_ms = -1;
-    av_max_alloc(64u * 1024u * 1024u);
+    /* libavutil retains its own ptrdiff_t/size arithmetic representation. */
+    av_max_alloc(SIZE_MAX);
     uint8_t *buffer = av_malloc(32768);
     m->io = buffer ? avio_alloc_context(buffer, 32768, 0, m, input_read, NULL, input_seek) : NULL;
     if (!m->io) { av_free(buffer); fail(m, "input allocation", AVERROR(ENOMEM)); goto bad; }
@@ -128,12 +131,12 @@ static nmedia *open_input(nmedia *m, char *error, size_t error_size) {
     if (probe_streams > 8) { fail(m, "stream count", AVERROR(EINVAL)); goto bad; }
     for (unsigned i = 0; i < probe_streams; i++) {
         AVCodecParameters *p = m->format->streams[i]->codecpar;
-        if ((p->width > 0 && p->height > 0 && (uint64_t)p->width * p->height > NMEDIA_MAX_PIXELS) || p->sample_rate > 384000 || p->ch_layout.nb_channels > 8) {
+        if (!nmedia_video_dimensions(p->width,p->height) || p->sample_rate > 384000 || p->ch_layout.nb_channels > 8) {
             fail(m, "stream resource limits", AVERROR(EINVAL));
             for (unsigned j = 0; j < probe_streams; j++) av_dict_free(&probe_options[j]);
             goto bad;
         }
-        if(av_dict_set(&probe_options[i], "max_pixels", "2359296", 0)<0 || av_dict_set(&probe_options[i], "threads", "1", 0)<0){
+        if(av_dict_set(&probe_options[i], "threads", "1", 0)<0){
             fail(m,"probe options allocation",AVERROR(ENOMEM));
             for(unsigned j=0;j<probe_streams;j++)av_dict_free(&probe_options[j]);goto bad;
         }
@@ -182,8 +185,8 @@ nmedia *nmedia_open(const char *path, char *error, size_t error_size) {
     return m;
 }
 nmedia *nmedia_open_memory(const void *bytes, size_t size, char *error, size_t error_size) {
-    if (!bytes || !size || size > NMEDIA_MAX_BYTES) {
-        if (error && error_size) strlcpy(error, "empty or oversized media input", error_size); return NULL;
+    if (!bytes || !size || size > INT64_MAX) {
+        if (error && error_size) strlcpy(error, "empty or unrepresentable media input", error_size); return NULL;
     }
     nmedia *m = nmedia_ff_mallocz(sizeof *m);
     if (!m) { if (error && error_size) strlcpy(error, "media allocation", error_size); return NULL; }
@@ -231,8 +234,7 @@ nmedia *nmedia_open_packets(const AVFormatContext *source, nmedia_packet_reader 
         if(!s||avcodec_parameters_copy(s->codecpar,source->streams[i]->codecpar)<0)goto bad;
         s->time_base=source->streams[i]->time_base;s->avg_frame_rate=source->streams[i]->avg_frame_rate;
         AVCodecParameters *p=s->codecpar;
-        if(s->time_base.num<=0||s->time_base.den<=0||p->width<0||p->height<0||
-           (uint64_t)p->width*p->height>NMEDIA_MAX_PIXELS||p->sample_rate>384000||p->ch_layout.nb_channels>8)goto bad;
+        if(s->time_base.num<=0||s->time_base.den<=0||!nmedia_video_dimensions(p->width,p->height)||p->sample_rate>384000||p->ch_layout.nb_channels>8)goto bad;
         if(p->codec_type==AVMEDIA_TYPE_AUDIO&&m->audio_index<0)m->audio_index=(int)i;
         if(p->codec_type==AVMEDIA_TYPE_VIDEO&&m->video_index<0)m->video_index=(int)i;
     }
@@ -359,10 +361,10 @@ static int audio_output(nmedia *m, struct nmedia_output *o) {
 static unsigned clamp8(int n) { return (unsigned)(n < 0 ? 0 : n > 255 ? 255 : n); }
 static int video_output(nmedia *m, struct nmedia_output *o) {
     AVFrame *f = m->frame; int w = f->width, h = f->height;
-    if (w <= 0 || h <= 0 || (uint64_t)w * h > NMEDIA_MAX_PIXELS) return fail(m, "video dimensions", AVERROR(EINVAL));
-    size_t count = (size_t)w * h;
+    size_t count,bytes;
+    if (!nmedia_video_size(w,h,&count,&bytes)) return fail(m, "video dimensions/byte representation", AVERROR(EINVAL));
     if (count > m->pixel_capacity) {
-        uint32_t *p = nmedia_ff_realloc(m->pixels, count * 4);
+        uint32_t *p = nmedia_ff_realloc(m->pixels, bytes);
         if (!p) return fail(m, "video output allocation", AVERROR(ENOMEM));
         m->pixels = p; m->pixel_capacity = count;
     }
@@ -396,7 +398,7 @@ static int video_output(nmedia *m, struct nmedia_output *o) {
         } else if (format == AV_PIX_FMT_GRAY8) r = g = b = f->data[0][(ptrdiff_t)y * f->linesize[0] + x];
         else {
             int bytes = format == AV_PIX_FMT_RGB24 || format == AV_PIX_FMT_BGR24 ? 3 : 4;
-            const uint8_t *p = f->data[0] + (ptrdiff_t)y * f->linesize[0] + x * bytes;
+            const uint8_t *p = f->data[0] + (ptrdiff_t)y * f->linesize[0] + (ptrdiff_t)x * bytes;
             bool bgr = format == AV_PIX_FMT_BGR24 || format == AV_PIX_FMT_BGRA || format == AV_PIX_FMT_BGR0;
             r = p[bgr ? 2 : 0]; g = p[1]; b = p[bgr ? 0 : 2];
         }
@@ -413,6 +415,7 @@ static int video_output(nmedia *m, struct nmedia_output *o) {
 }
 int nmedia_step(nmedia *m, struct nmedia_output *o) {
     if (!m || !o) return NMEDIA_ERROR;
+    m->video_borrowed=false;
     memset(o, 0, sizeof *o);
     if (m->error[0]) return NMEDIA_ERROR;
     if (m->frame_audio) return audio_output(m, o);
@@ -424,6 +427,7 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
                     int result = video_output(m, o);
                     if (result == NMEDIA_VIDEO && m->video_seek_ms >= 0 && o->pts_ms < m->video_seek_ms) continue;
                     if (result == NMEDIA_VIDEO) m->video_seek_ms = -1;
+                    if (result == NMEDIA_VIDEO) {m->video_borrowed=true;m->video_loan_pts=o->pts_ms;}
                     return result;
                 }
                 AVFrame *f = m->frame;
@@ -465,7 +469,17 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
     }
     return NMEDIA_AGAIN;
 }
+bool nmedia_move_video(nmedia *m,const struct nmedia_output *o,uint32_t **pixels,size_t *capacity){
+    size_t count;
+    if(!m||!o||!pixels||!capacity||m->error[0]||!m->video_borrowed||o->kind!=NMEDIA_VIDEO||
+       o->pixels!=m->pixels||o->pts_ms!=m->video_loan_pts||o->width!=m->info.width||o->height!=m->info.height||
+       !nmedia_video_size(o->width,o->height,&count,NULL)||count>m->pixel_capacity||
+       *capacity>SIZE_MAX/sizeof(uint32_t)||(!*pixels&&*capacity)||*pixels==m->pixels)return false;
+    uint32_t *completed=m->pixels;size_t available=m->pixel_capacity;
+    m->pixels=*pixels;m->pixel_capacity=*capacity;m->video_borrowed=false;*pixels=completed;*capacity=available;return true;
+}
 static void close_decoder(nmedia *m) {
+    m->video_borrowed=false;
     av_channel_layout_uninit(&m->mix_layout); m->mix_valid = false;
     av_frame_free(&m->frame); av_packet_free(&m->packet);
     avcodec_free_context(&m->audio); avcodec_free_context(&m->video);
@@ -490,6 +504,7 @@ static bool restart_flac(nmedia *m) {
 }
 bool nmedia_seek(nmedia *m, int64_t ms) {
     if (!m || !m->format || ms < 0 || ms > INT64_MAX / 1000) return false;
+    m->video_borrowed=false;
     int r = m->packet_reader ? (m->packet_seeker&&m->packet_seeker(m->packet_owner,ms)?0:AVERROR(EINVAL)) :
         avformat_seek_file(m->format, -1, INT64_MIN, ms * 1000, ms * 1000, 0);
     if (r < 0) {
@@ -511,6 +526,7 @@ bool nmedia_seek(nmedia *m, int64_t ms) {
  * selected cursor and seek trim. No original input/lifecycle is released. */
 bool nmedia_packets_reclaim(nmedia *m) {
     if (!m || !m->packet_reader) return false;
+    m->video_borrowed=false;
     m->pending = NULL; m->frame_audio = 0;
     av_frame_unref(m->frame); av_packet_unref(m->packet);
     avcodec_free_context(&m->audio); avcodec_free_context(&m->video);

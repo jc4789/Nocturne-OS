@@ -7,7 +7,7 @@ static void frame_cancel(struct web_js_state *s,struct web_frame *f) {
     }
     f->request=0;
 }
-void web_js_retire(web_doc *d) {
+static void frame_retire_document(web_doc *d) {
     struct web_js_state *s=d?d->js:NULL;if(!s)return;
     s->disabled=true;
     release_document_tasks(s);
@@ -16,10 +16,22 @@ void web_js_retire(web_doc *d) {
     web_avmedia_free(d);
     web_worker_free(s->workers);s->workers=NULL;
     for(struct js_pending *p=s->pending;p;p=p->next) {
-        if(!p->done && s->host.cancel)s->host.cancel(s->host.opaque,p->id);
+        if(!p->done)release_pending_request(s,p);
         p->aborted=true;pending_error(p,"Child browsing context retired");
     }
-    for(struct web_frame *f=d->frames;f;f=f->next){f->detached=true;f->window_token=NULL;web_frame_retire(f);}
+}
+void web_js_retire(web_doc *d) {
+    frame_retire_document(d);
+    for(struct web_frame *f=d?d->frames:NULL;f;) {
+        struct web_frame *next=web_frame_walk_next(d,f,true);
+        web_doc *old=f->document;
+        f->detached=true;f->window_token=NULL;
+        if(old) {
+            frame_retire_document(old);old->live=false;
+            old->frame_retired_next=f->retired;f->retired=old;f->document=NULL;f->notified=false;
+        }
+        f=next;
+    }
 }
 bool web_js_complete(web_doc *d){return d && d->js && (d->js->load_sent || d->js->disabled);}
 static bool frame_string_replace(char **slot,const char *text) {
@@ -30,7 +42,7 @@ static bool frame_string_replace(char **slot,const char *text) {
 static void frame_sync(struct web_js_state *s,node_t *n) {
     if(!web_frame_element(n) || !connected(s,n) || n->owner!=s->doc)return;
     struct web_frame *f=web_frame_ensure(s->doc,n);
-    if(!f){log_text(s,1,"Frame browsing-context count/depth limit reached");return;}
+    if(!f){if(!s->doc->frame_allocation_reported){s->doc->frame_allocation_reported=true;log_text(s,2,"Frame metadata allocation failed");}return;}
     const char *src=node_attr(n,"src"),*srcdoc=n->tag==T_iframe?node_attr(n,"srcdoc"):NULL,*sandbox=node_attr(n,"sandbox");
     if(!src)src="";
     if(web_frame_initial_blocked(f,src,srcdoc))return;
@@ -56,7 +68,7 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
     }
     if(srcdoc && !f->navigation){
         if(!web_frame_commit(f,srcdoc,strlen(srcdoc),"about:srcdoc","utf-8",&s->host,true))
-            log_text(s,2,"Frame srcdoc navigation exceeded its context/memory limit");
+            log_text(s,2,"Frame srcdoc document allocation failed");
         return;
     }
     const char *desired=f->navigation?f->navigation:src;
@@ -74,10 +86,17 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
         }else log_text(s,1,"Cross-origin javascript frame navigation blocked");
         free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;f->navigation_owner=NULL;return;
     }
-    char *url=malloc(HTTP_URL_MAX);
-    bool valid=url && url_resolve(s->doc->base,desired,url,HTTP_URL_MAX) && permitted_url(s,url,false);
+    char *url=NULL;
+    int resolved=web_resolve_url_owned(s->doc->base,desired,&url);
+    bool valid=resolved==1 && permitted_url(s,url,false);
     free(f->navigation);f->navigation=NULL;
-    if(!valid){free(url);free(f->navigation_origin);f->navigation_origin=NULL;f->navigation_owner=NULL;f->failed=true;log_text(s,1,"Frame source URL is not permitted");return;}
+    if(!valid){free(url);free(f->navigation_origin);f->navigation_origin=NULL;f->navigation_owner=NULL;f->failed=true;log_text(s,resolved<0?2:1,resolved<0?"Frame source URL allocation failed":"Frame source URL is not permitted");return;}
+    int ancestor=f->navigation_owner?0:web_frame_ancestor_url(s->doc,url);
+    if(ancestor){
+        free(url);free(f->navigation_origin);f->navigation_origin=NULL;f->failed=true;
+        log_text(s,ancestor<0?2:1,ancestor<0?"Frame ancestor URL comparison allocation failed":
+                 "Frame src repeats an ancestor document URL (fragment excluded)");return;
+    }
     struct js_pending *p=pending_new(s,P_FRAME,url);free(url);
     if(p && f->navigation_origin){p->origin=js_strdup(s->ctx,f->navigation_origin);if(!p->origin)pending_error(p,"Frame initiator could not be retained");}
     free(f->navigation_origin);f->navigation_origin=NULL;f->navigation_owner=NULL;
@@ -85,16 +104,18 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
     p->frame=f;f->request=p->id;f->notified=false;
     if(!p->done)send_request(s,p,WEB_RESOURCE_FRAME,"GET",NULL,NULL,0);
 }
-static void frames_walk(struct web_js_state *s,node_t *n,unsigned depth,unsigned *order) {
-    if(!n || depth>400 || (n->type==N_ELEM && !n->foreign && n->tag==T_template))return;
-    if(web_frame_element(n)){frame_sync(s,n);struct web_frame *f=web_frame_find(s->doc,n);if(f)f->dom_order=(*order)++;}
-    if(n->shadow_root)frames_walk(s,n->shadow_root,depth+1,order);
-    for(node_t *c=n->first;c;c=c->next)frames_walk(s,c,depth+1,order);
+static void frames_walk(struct web_js_state *s,node_t *root,unsigned *order) {
+    for(node_t *n=root;n;) {
+        node_t *next=web_frame_dom_next(root,n);
+        if(web_frame_element(n)){frame_sync(s,n);struct web_frame *f=web_frame_find(s->doc,n);if(f)f->dom_order=(*order)++;}
+        n=next;
+    }
 }
 void web_js_frames_sync(web_doc *d) {
     struct web_js_state *s=d?d->js:NULL;if(!s || !s->ctx || s->disabled)return;
     if(!s->frames_scanned || s->frames_revision!=d->dom_revision){
-        unsigned order=0;frames_walk(s,d->root,0,&order);s->frames_scanned=true;s->frames_revision=d->dom_revision;
+        uint64_t revision=d->dom_revision;
+        unsigned order=0;frames_walk(s,d->root,&order);s->frames_scanned=true;s->frames_revision=revision;
     }
     for(struct web_frame *f=d->frames;f;f=f->next)if(f->navigation)frame_sync(s,f->element);
     for(struct web_frame *f=d->frames;f;f=f->next)if(!connected(s,f->element) || f->element->owner!=d) {
@@ -128,10 +149,10 @@ static void frame_response(struct web_js_state *s,struct js_pending *p,bool ok) 
     struct web_frame *f=p->frame;
     if(!f || f->request!=p->id || !connected(s,f->element) || f->element->owner!=s->doc)return;
     f->request=0;
-    const char *url=p->response.url[0]?p->response.url:p->url;
+    const char *url=web_response_url(&p->response)[0]?web_response_url(&p->response):p->url;
     if(ok && permitted_url(s,url,false) && frame_response_allowed(s,&p->response,url)) {
         if(web_frame_commit(f,p->response.body,p->response.body_len,url,NULL,&s->host,false))return;
-        log_text(s,2,"Frame document could not be created within the browsing-context limit");
+        log_text(s,2,"Frame document allocation failed");
     }else log_text(s,1,"Frame document navigation failed or was blocked by its embedding policy");
     f->failed=true;f->notified=true;script_event(s,f->element,true);
 }
@@ -278,43 +299,37 @@ static JSValue frame_message_deliver(JSContext *ctx,JSValueConst this_val,int ar
     node_t *generation=unwrap(ctx,data[4]),*sender=unwrap(ctx,data[5]);
     if(!task_context_active(s) || !generation || generation->owner!=s->doc || generation!=s->doc->root)return JS_UNDEFINED;
     const char *expected=JS_ToCString(ctx,data[3]);if(!expected)return JS_EXCEPTION;
-    char current[256];bool origin_ok=make_origin(web_effective_url(s->doc),current,sizeof current);
-    const char *sent_origin=JS_ToCString(ctx,data[2]);if(!sent_origin){JS_FreeCString(ctx,expected);return JS_EXCEPTION;}
-    bool default_match=!strcmp(sent_origin,"null")?!origin_ok&&sender&&web_frame_same_origin(sender->owner,s->doc):origin_ok&&!strcmp(sent_origin,current);
+    char *current=NULL;
+    enum http_url_result origin_status=make_origin(web_effective_url(s->doc),&current);
+    if(origin_status==HTTP_URL_OOM){JS_FreeCString(ctx,expected);return JS_ThrowOutOfMemory(ctx);}
+    bool origin_ok=origin_status==HTTP_URL_TUPLE;
+    const char *sent_origin=JS_ToCString(ctx,data[2]);if(!sent_origin){free(current);JS_FreeCString(ctx,expected);return JS_EXCEPTION;}
+    bool default_match=!strcmp(sent_origin,"null")?origin_status==HTTP_URL_OPAQUE&&sender&&web_frame_same_origin(sender->owner,s->doc):origin_ok&&!strcmp(sent_origin,current);
     bool allowed=!strcmp(expected,"*") || (!strcmp(expected,"/")?default_match:
         origin_ok&&strcmp(expected,"null")&&!strcmp(expected,current));
-    JS_FreeCString(ctx,sent_origin);
+    free(current);JS_FreeCString(ctx,sent_origin);
     JS_FreeCString(ctx,expected);if(!allowed)return JS_UNDEFINED;
     JSValue global=JS_GetGlobalObject(ctx),args[]={global,data[0],data[1],data[2]};
     JSValue result=custom_element_hook(s,"windowMessageReceive",4,args);JS_FreeValue(ctx,global);return result;
 }
-static JSValue frame_message_send(JSContext *ctx,struct web_js_state *s,struct web_js_state *caller,int argc,JSValueConst *argv) {
-    bool brand=false;web_doc *document=argc>1?frame_message_receiver(s,argv[1],&brand):NULL;
-    if(!brand)return JS_ThrowTypeError(ctx,"Illegal Window receiver");
-    struct web_js_state *target=document?document->js:NULL;
-    if(argc<5 || !task_context_active(caller) || !task_context_active(target))return JS_ThrowTypeError(ctx,"Window message browsing context is inactive");
-    JSValue args[]={argv[2],argv[3],argv[4]};
-    if(caller==target)return custom_element_hook(target,"windowMessageLocal",3,args);
-    if(JS_GetRuntime(caller->ctx)!=JS_GetRuntime(target->ctx))return JS_ThrowTypeError(ctx,"Window transfers require the same runtime");
-    if(target->posted_count>=4096)return JS_ThrowRangeError(ctx,"Document posted task limit reached");
-    char origin[256];
-    const char *sender_url=web_effective_url(caller->doc);
-    if(!make_origin(sender_url,origin,sizeof origin)) {
-        if(!strncasecmp(sender_url,"http://",7)||!strncasecmp(sender_url,"https://",8))return JS_ThrowTypeError(ctx,"Window message sender origin is unavailable");
-        snprintf(origin,sizeof origin,"null");
-    }
+/* Hold the original sender origin as an immutable engine string across author
+   clone getters. Native bytes are freed before any author call; every exit
+   leaves exactly one string reference for the outer caller to release. */
+static JSValue frame_message_send_data(JSContext *ctx,struct web_js_state *s,
+    struct web_js_state *caller,struct web_js_state *target,web_doc *document,
+    JSValueConst sender_origin,JSValue *args,JSValueConst *argv) {
+    (void)s;(void)args;
     node_t *sender_generation=caller->doc->root,*target_generation=document->root;
     JSValue prepared=custom_element_hook(caller,"windowMessagePrepare",2,(JSValue[]){argv[2],argv[4]});
     if(JS_IsException(prepared))return prepared;
     // Author clone getters can navigate/remove either context or post again.
     // Recheck before any publication, with no transfer committed yet.
     if(!task_context_active(caller) || caller->doc->root!=sender_generation || !task_context_active(target) ||
-       target->doc->root!=target_generation || target->posted_count>=4096){JS_FreeValue(ctx,prepared);return JS_ThrowTypeError(ctx,"Window message context changed during serialization");}
+       target->doc->root!=target_generation || target->posted_count==UINT_MAX){JS_FreeValue(ctx,prepared);return JS_ThrowTypeError(ctx,"Window message context changed during serialization");}
     JSValue graph=JS_GetPropertyStr(caller->ctx,prepared,"data");
     if(JS_IsException(graph)){JS_FreeValue(ctx,prepared);return JS_EXCEPTION;}
     size_t length=0;uint8_t *bytes=JS_WriteObject(caller->ctx,&length,graph,JS_WRITE_OBJ_REFERENCE);JS_FreeValue(ctx,graph);
     if(!bytes){JS_FreeValue(ctx,prepared);return JS_EXCEPTION;}
-    if(length>(1u<<20)){js_free(caller->ctx,bytes);JS_FreeValue(ctx,prepared);return JS_ThrowRangeError(ctx,"Window message exceeds 1 MiB");}
     JSContext *dest=target->ctx;JSValue record=JS_ReadObject(dest,bytes,length,JS_READ_OBJ_REFERENCE);js_free(caller->ctx,bytes);
     if(JS_IsException(record)){JS_FreeValue(ctx,prepared);return record;}
     // Private endpoint capabilities remain JSValue references in this runtime;
@@ -328,8 +343,8 @@ static JSValue frame_message_send(JSContext *ctx,struct web_js_state *s,struct w
     JSValue source=JS_IsException(token)?JS_EXCEPTION:custom_element_hook(target,"frameWindowProxy",1,&token);JS_FreeValue(dest,token);
     if(JS_IsException(source)){JS_FreeValue(dest,record);JS_FreeValue(dest,imported);JS_FreeValue(ctx,prepared);return source;}
     if(!task_context_active(caller) || caller->doc->root!=sender_generation || !task_context_active(target) ||
-       target->doc->root!=target_generation || target->posted_count>=4096){JS_FreeValue(dest,source);JS_FreeValue(dest,record);JS_FreeValue(dest,imported);JS_FreeValue(ctx,prepared);return JS_ThrowTypeError(ctx,"Window message context changed before publication");}
-    JSValue data[]={record,source,JS_NewString(dest,origin),JS_DupValue(dest,argv[3]),wrap(target,target_generation),wrap(target,sender_generation)};
+       target->doc->root!=target_generation || target->posted_count==UINT_MAX){JS_FreeValue(dest,source);JS_FreeValue(dest,record);JS_FreeValue(dest,imported);JS_FreeValue(ctx,prepared);return JS_ThrowTypeError(ctx,"Window message context changed before publication");}
+    JSValue data[]={record,source,JS_DupValue(dest,sender_origin),JS_DupValue(dest,argv[3]),wrap(target,target_generation),wrap(target,sender_generation)};
     JSValue fn=JS_UNDEFINED;bool valid=true;
     for(unsigned i=0;i<6;i++)if(JS_IsException(data[i]))valid=false;
     if(valid)fn=JS_NewCFunctionData(dest,frame_message_deliver,0,0,6,data);
@@ -343,10 +358,30 @@ static JSValue frame_message_send(JSContext *ctx,struct web_js_state *s,struct w
     JS_FreeValue(dest,imported);JS_FreeValue(ctx,prepared);
     if(JS_IsException(committed)){js_free(dest,p);JS_FreeValue(dest,fn);return committed;}
     JS_FreeValue(dest,committed);
-    p->fn=fn;p->next=NULL;p->id=++target->next_posted;if(!p->id)p->id=++target->next_posted;
+    p->fn=fn;p->next=NULL;p->id=allocate_posted_id(target);
     if(target->last_posted)target->last_posted->next=p;else target->posted=p;
     target->last_posted=p;target->posted_count++;return JS_UNDEFINED;
 }
+static JSValue frame_message_send(JSContext *ctx,struct web_js_state *s,struct web_js_state *caller,int argc,JSValueConst *argv) {
+    bool brand=false;web_doc *document=argc>1?frame_message_receiver(s,argv[1],&brand):NULL;
+    if(!brand)return JS_ThrowTypeError(ctx,"Illegal Window receiver");
+    struct web_js_state *target=document?document->js:NULL;
+    if(argc<5 || !task_context_active(caller) || !task_context_active(target))return JS_ThrowTypeError(ctx,"Window message browsing context is inactive");
+    JSValue args[]={argv[2],argv[3],argv[4]};
+    if(caller==target)return custom_element_hook(target,"windowMessageLocal",3,args);
+    if(JS_GetRuntime(caller->ctx)!=JS_GetRuntime(target->ctx))return JS_ThrowTypeError(ctx,"Window transfers require the same runtime");
+    if(target->posted_count==UINT_MAX)return JS_ThrowRangeError(ctx,"Document posted task count cannot be represented");
+    char *origin=NULL;
+    enum http_url_result status=make_origin(web_effective_url(caller->doc),&origin);
+    if(status==HTTP_URL_OOM)return JS_ThrowOutOfMemory(ctx);
+    if(status==HTTP_URL_INVALID)return JS_ThrowTypeError(ctx,"Window message sender origin is unavailable");
+    JSValue sender_origin=JS_NewString(ctx,status==HTTP_URL_TUPLE?origin:"null");
+    free(origin);
+    if(JS_IsException(sender_origin))return sender_origin;
+    JSValue result=frame_message_send_data(ctx,s,caller,target,document,sender_origin,args,argv);
+    JS_FreeValue(ctx,sender_origin);return result;
+}
+
 static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
     struct web_js_state *caller=s->runtime_owner->runtime_active?s->runtime_owner->runtime_active:s;
@@ -412,9 +447,9 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
         struct web_frame *f=web_frame_find(target->frame_parent,target->frame_element);
         if(!value)result=JS_EXCEPTION;
         else {
-            char *url=js_malloc(ctx,HTTP_URL_MAX);
+            char *url=js_resolve_owned(ctx,caller->doc->base,value);
             if(!url)result=JS_EXCEPTION;
-            else if(!url_resolve(caller->doc->base,value,url,HTTP_URL_MAX) || !permitted_url(caller,url,false))result=JS_ThrowTypeError(ctx,"Child navigation URL is not permitted");
+            else if(!permitted_url(caller,url,false))result=JS_ThrowTypeError(ctx,"Child navigation URL is not permitted");
             else if(!web_frame_set_navigation(f,url,caller->doc))result=oom(ctx);
             js_free(ctx,url);
         }
@@ -467,15 +502,17 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
                 result=JS_ThrowTypeError(ctx,"Captured Window method belongs to an inactive document");
                 JS_FreeValue(ctx,global);goto out;
             }
-            JSValue function=argc>2?JS_DupValue(ctx,argv[2]):JS_UNDEFINED,args[64];unsigned count=0;
+            JSValue function=argc>2?JS_DupValue(ctx,argv[2]):JS_UNDEFINED,*args=NULL;unsigned count=0;
             JSValue length=argc>3?JS_GetPropertyStr(ctx,argv[3],"length"):JS_UNDEFINED;
-            uint32_t n=0;bool valid=JS_IsFunction(ctx,function) && argc>3 && JS_ToUint32(ctx,&n,length)==0 && n<=64;
+            uint32_t n=0;bool valid=JS_IsFunction(ctx,function) && argc>3 && JS_ToUint32(ctx,&n,length)==0 &&
+                n<=INT_MAX && (size_t)n<=SIZE_MAX/sizeof *args;
             JS_FreeValue(ctx,length);
+            if(valid && n){args=js_malloc(ctx,(size_t)n*sizeof *args);if(!args)valid=false;}
             if(valid)for(;count<n;count++){args[count]=JS_GetPropertyUint32(ctx,argv[3],count);if(JS_IsException(args[count])){valid=false;count++;break;}}
-            begin_task(target->js);
-            result=valid?JS_Call(ctx,function,global,(int)count,args):JS_ThrowRangeError(ctx,"Window method argument limit exceeded");
-            end_task(target->js);
-            for(unsigned i=0;i<count;i++)JS_FreeValue(ctx,args[i]);JS_FreeValue(ctx,function);
+            if(valid && target->live && !target->js->disabled && frame_window_document(token)==target) {
+                begin_task(target->js);result=JS_Call(ctx,function,global,(int)count,args);end_task(target->js);
+            } else result=JS_HasException(ctx)?JS_EXCEPTION:JS_ThrowTypeError(ctx,"Window method arguments or captured context are invalid");
+            for(unsigned i=0;i<count;i++)JS_FreeValue(ctx,args[i]);js_free(ctx,args);JS_FreeValue(ctx,function);
         }
         else if(!strcmp(op,"set"))result=JS_NewBool(ctx,argc>3 && JS_SetPropertyStr(ctx,global,key,JS_DupValue(ctx,argv[3]))>=0);
         else if(!strcmp(op,"has")){JSAtom atom=JS_NewAtom(ctx,key);result=JS_NewBool(ctx,JS_HasProperty(ctx,global,atom)>0);JS_FreeAtom(ctx,atom);}
