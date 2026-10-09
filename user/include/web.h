@@ -120,7 +120,7 @@ void web_visibility_event(web_doc *d);
 web_doc *web_live(const char *html, size_t len, const char *url, const char *charset,
                   const struct web_host *host);
 void web_tick(web_doc *d, uint64_t now_ms);
-/* Private media children outlive a retired document until nonblocking reap.
+/* Private media/JS-worker children outlive a retired document until nonblocking reap.
  * No document/node callback is retained by this process-lifetime cleanup. */
 void web_media_background(uint64_t now_ms);
 int64_t web_media_background_deadline(uint64_t now_ms);
@@ -157,6 +157,10 @@ void web_document_scroll(web_doc *d);
 void web_hover(web_doc *d, web_node *target, const struct web_event *event);
 web_node *web_node_at(web_doc *d, int x, int y);
 bool web_node_action(web_doc *d, web_node *target, struct web_hit *hit);
+/* Capture before click dispatch, then resolve only that anchor after dispatch.
+   Detached HTML anchors can navigate; their owner must still be the active d. */
+web_node *web_link_activation_anchor(web_doc *d, web_node *target);
+bool web_link_action(web_doc *d, web_node *anchor, struct web_hit *hit);
 void web_free(web_doc *d);
 const char *web_title(web_doc *d); /* "" if none */
 const char *web_url(web_doc *d);

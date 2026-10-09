@@ -47,7 +47,7 @@ static size_t decode_utf8(const uint8_t *bytes, size_t length, bool fatal,
     return written;
 }
 
-static JSValue native_decode_utf8(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+static JSValue decode_utf8_call(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv, bool document) {
     (void)self;
     uint64_t offset,length;
     if(argc<5)return JS_ThrowTypeError(ctx,"UTF-8 decode requires a buffer view");
@@ -69,10 +69,10 @@ static JSValue native_decode_utf8(JSContext *ctx, JSValueConst self, int argc, J
     if(!malformed) {
         /* ASCII goes straight to one final string allocation. Valid Unicode
            never creates a per-character JS array or a copied source buffer. */
-        web_js_prepare_bytes(ctx,len*2u+64u);
+        if(document)web_js_prepare_bytes(ctx,len*2u+64u);
         return JS_NewStringLen(ctx,(const char *)bytes,len);
     }
-    web_js_prepare_bytes(ctx,written*3u+64u);
+    if(document)web_js_prepare_bytes(ctx,written*3u+64u);
     char *output=js_malloc(ctx,written?written:1);
     if(!output)return JS_EXCEPTION;
     decode_utf8(bytes,len,false,output,&malformed);
@@ -80,8 +80,18 @@ static JSValue native_decode_utf8(JSContext *ctx, JSValueConst self, int argc, J
     js_free(ctx,output);
     return result;
 }
+static JSValue native_decode_utf8(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    return decode_utf8_call(ctx,self,argc,argv,true);
+}
+static JSValue isolated_decode_utf8(JSContext *ctx, JSValueConst self, int argc, JSValueConst *argv) {
+    return decode_utf8_call(ctx,self,argc,argv,false);
+}
 
 void web_js_encoding_init(JSContext *ctx, JSValue host) {
     static const JSCFunctionListEntry functions[]={JS_CFUNC_DEF("decodeUTF8",5,native_decode_utf8)};
+    JS_SetPropertyFunctionList(ctx,host,functions,sizeof functions/sizeof *functions);
+}
+void web_js_encoding_init_isolated(JSContext *ctx, JSValue host) {
+    static const JSCFunctionListEntry functions[]={JS_CFUNC_DEF("decodeUTF8",5,isolated_decode_utf8)};
     JS_SetPropertyFunctionList(ctx,host,functions,sizeof functions/sizeof *functions);
 }

@@ -42,7 +42,8 @@ const cloneData = (() => {
         const output=resizable(buffer)?new AB(size,{maxByteLength:apply(abMaxLength,buffer,[])}):new AB(size);
         apply(byteSet,new U8(output),[input]);return output;
     }
-    function serialize(input,transfers) {
+    const packets=new WeakMap(),packetGet=WeakMap.prototype.get,packetSet=WeakMap.prototype.set;
+    function prepare(input,transfers,external=false) {
         const seen=new M(),records=[],handlers=[],prepared=[];
         // Register placeholders first; capture transferred bytes after user getters.
         if(transfers)for(let i=0;i<transfers.length;i++){
@@ -51,6 +52,9 @@ const cloneData = (() => {
             if(classID(item)!==arrayBufferID){
                 for(let j=0;j<transferTypes.length;j++)if(transferTypes[j].brand(item)){handler=transferTypes[j];break;}
                 if(!handler)fail();handler.validate(item);
+                // A DOM MessagePort's private receiver belongs to this realm;
+                // it is not a transferable native endpoint in another process.
+                if(external)fail();
             }else {try{new U8(item,0,0);}catch(_){fail();}}
             add(handlers,handler);put(seen,item,records.length);add(records,[handler?'Transferred':'ArrayBuffer',null]);
         }
@@ -121,10 +125,23 @@ const cloneData = (() => {
             for(let i=0;i<transfers.length;i++){
                 const handler=handlers[i];
                 records[get(seen,transfers[i])][1]=prepared[i];
-                if(handler)handler.commit(transfers[i],prepared[i]);else detach(transfers[i]);
             }
         }
-        return [root,records];
+        const packet={data:[root,records]};
+        apply(packetSet,packets,[packet,{transfers,handlers,prepared,committed:false}]);
+        return packet;
+    }
+    function commit(packet) {
+        const p=apply(packetGet,packets,[packet]);
+        if(!p||p.committed)throw new TypeErr('Invalid structured clone commit');
+        p.committed=true;
+        if(p.transfers)for(let i=0;i<p.transfers.length;i++){
+            const handler=p.handlers[i];
+            if(handler)handler.commit(p.transfers[i],p.prepared[i]);else detach(p.transfers[i]);
+        }
+    }
+    function serialize(input,transfers) {
+        const packet=prepare(input,transfers);commit(packet);return packet.data;
     }
     function deserialize(serialized) {
         const root=serialized[0],records=serialized[1],values=new M();
@@ -172,7 +189,7 @@ const cloneData = (() => {
         const transfers=transferList(options.transfer);
         return deserialize(serialize(value,transfers));
     };
-    return {serialize,deserialize,transferList,registerTransfer(handler){
+    return {serialize,prepare,commit,deserialize,transferList,registerTransfer(handler){
         add(transferTypes,handler);add(uncloneable,handler.brand);
     },registerUncloneable(test){
         if(typeof test!=='function')throw new TypeErr('Expected a private brand predicate');

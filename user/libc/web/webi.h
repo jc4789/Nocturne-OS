@@ -555,7 +555,7 @@ void doc_dom_budget(web_doc *d);
 bool doc_node_adopt(web_doc *d, node_t *node);
 node_t *doc_template_content(web_doc *d, node_t *node);
 bool doc_templates_finish(web_doc *d, node_t *root);
-const char *doc_link_href(web_doc *d, node_t *a); /* absolute URL; valid until the next call */
+const char *doc_link_href(web_doc *d, node_t *a); /* node-owner-relative absolute URL; valid until the next call */
 void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *base);
 
 /* Incremental parser: 1 script boundary, 0 complete, -1 allocation failure.

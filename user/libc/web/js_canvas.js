@@ -37,7 +37,7 @@ const canvasBridge = (() => {
         }
         return out;
     }
-    function transformedPath(s,path){const p=paths.get(path);if(!p)throw new TypeError('Expected Path2D');const out=[];for(let i=0;i<p.path.length;i+=2)out.push(...point(s,p.path[i],p.path[i+1]));return out;}
+    function transformedPath(s,path){const p=paths.get(path);if(!p)throw new TypeError('Expected Path2D');const out=[];for(let i=0;i<p.path.length;i+=2){if(Number.isNaN(p.path[i]))out.push(NaN,p.path[i+1]);else out.push(...point(s,p.path[i],p.path[i+1]));}return out;}
     function ellipsePath(s,x,y,rx,ry,rotation,start,end,ccw){
         const tau=Math.PI*2;let delta=end-start;
         if(!ccw){if(delta>=tau)delta=tau;else delta=((delta%tau)+tau)%tau;}
@@ -49,8 +49,8 @@ const canvasBridge = (() => {
     const pathMethods={
         moveTo(...v){pathState(this);v=args(v,2);const s=pathState(this);if(valid(v))append(s,point(s,...v),true);},
         lineTo(...v){pathState(this);v=args(v,2);const s=pathState(this);if(valid(v))append(s,point(s,...v),!s.last);},
-        closePath(){const s=pathState(this);if(s.first&&s.last&&s.subpathCount>1){capacity(s,3);append(s,s.first);/* A following line begins at the closed subpath's first point. */append(s,s.first,true);}},
-        rect(...v){pathState(this);v=args(v,4);const s=pathState(this);if(!valid(v))return;capacity(s,8);const [x,y,w,h]=v;append(s,point(s,x,y),true);append(s,point(s,x+w,y));append(s,point(s,x+w,y+h));append(s,point(s,x,y+h));append(s,point(s,x,y));append(s,point(s,x,y),true);},
+        closePath(){const s=pathState(this);if(s.first&&s.last&&s.subpathCount>1){capacity(s,3);append(s,s.first);/* NaN/Infinity marks a closed preceding contour; a following line starts at its first point. */append(s,s.first,true);s.path[s.path.length-3]=Infinity;}},
+        rect(...v){pathState(this);v=args(v,4);const s=pathState(this);if(!valid(v))return;capacity(s,8);const [x,y,w,h]=v;append(s,point(s,x,y),true);append(s,point(s,x+w,y));append(s,point(s,x+w,y+h));append(s,point(s,x,y+h));append(s,point(s,x,y));append(s,point(s,x,y),true);s.path[s.path.length-3]=Infinity;},
         quadraticCurveTo(...v){pathState(this);v=args(v,4);const s=pathState(this);if(!valid(v))return;capacity(s,18);const c=point(s,v[0],v[1]),b=point(s,v[2],v[3]);if(!s.last)append(s,c,true);const a=s.last;for(let i=1;i<=16;i++){const t=i/16,u=1-t;append(s,[u*u*a[0]+2*u*t*c[0]+t*t*b[0],u*u*a[1]+2*u*t*c[1]+t*t*b[1]]);}},
         bezierCurveTo(...v){pathState(this);v=args(v,6);const s=pathState(this);if(!valid(v))return;capacity(s,26);const b=point(s,v[0],v[1]),c=point(s,v[2],v[3]),d=point(s,v[4],v[5]);if(!s.last)append(s,b,true);const a=s.last;for(let i=1;i<=24;i++){const t=i/24,u=1-t;append(s,[u*u*u*a[0]+3*u*u*t*b[0]+3*u*t*t*c[0]+t*t*t*d[0],u*u*u*a[1]+3*u*u*t*b[1]+3*u*t*t*c[1]+t*t*t*d[1]]);}},
         arc(...values){pathState(this);const v=args(values,5),s=pathState(this);if(!valid(v))return;if(v[2]<0)throw namedError('IndexSizeError','Negative arc radius');ellipsePath(s,v[0],v[1],v[2],v[2],0,v[3],v[4],!!values[5]);},
@@ -107,7 +107,53 @@ const canvasBridge = (() => {
             const copy=transformedPath({matrix},path);capacity(s,copy.length/2+(s.path.length?1:0)+2);if(s.path.length)s.path.push(NaN,NaN);for(let i=0;i<copy.length;i++)s.path.push(copy[i]);
             if(source.first)s.first=point({matrix},...source.first);if(source.last){s.last=point({matrix},...source.last);append(s,s.last,true);}}
     }
-    function strokePath(s,points){if(!points.length)return;const stroke=canvasDash.prepare(s,points);if(stroke.points.length)native(s.canvas,'stroke',pathBuffer(stroke.points),color(s,true),stroke.width);}
+    function strokeGeometry(s,points){
+        /* Trace in the current pen's coordinate system, then apply the CTM.
+           Existing default-path vertices already contain their creation-time
+           transform; an inverse here changes the pen, not that saved path. */
+        const m=s.matrix,scale=Math.max(abs(m[0]),abs(m[1]),abs(m[2]),abs(m[3]));
+        if(!finite(scale)||!scale)return {points:[],width:s.lineWidth};
+        const a=m[0]/scale,b=m[1]/scale,c=m[2]/scale,d=m[3]/scale,det=a*d-b*c;
+        if(!finite(det)||!det)return {points:[],width:s.lineWidth};
+        const local=[];
+        for(let i=0;i<points.length;i+=2){
+            if(Number.isNaN(points[i])){local.push(NaN,points[i+1]);continue;}
+            const x=points[i]/scale-m[4]/scale,y=points[i+1]/scale-m[5]/scale;
+            const xx=(d*x-c*y)/det,yy=(a*y-b*x)/det;
+            if(!finite(xx)||!finite(yy))throw new RangeError('Canvas stroke transform limit');local.push(xx,yy);
+        }
+        const pen={matrix:[1,0,0,1,0,0],lineWidth:s.lineWidth,dash:s.dash,dashOffset:s.dashOffset};
+        if(!s.dash.some(v=>v>0))return canvasDash.prepare(pen,local);
+        const out=[];let first=0;
+        while(first<local.length){
+            while(first<local.length&&Number.isNaN(local[first]))first+=2;
+            let end=first;while(end<local.length&&!Number.isNaN(local[end]))end+=2;
+            if(end===first)break;
+            const input=local.slice(first,end),stroke=canvasDash.prepare(pen,input);let dashed=stroke.points;
+            /* A dash crossing a closed contour's origin is one connected run,
+               not two butt caps. Merge the last/first runs without mutating
+               the source path or the dash state. */
+            if(local[end+1]===Infinity&&dashed.length>=4&&dashed[0]===input[0]&&dashed[1]===input[1]&&dashed[dashed.length-2]===input[0]&&dashed[dashed.length-1]===input[1]){
+                let split=-1,last=-1;for(let i=0;i<dashed.length;i+=2)if(Number.isNaN(dashed[i])){if(split<0)split=i;last=i;}
+                if(split<0)dashed=[...dashed,NaN,Infinity];
+                else dashed=[...dashed.slice(last+2),...dashed.slice(2,split),...dashed.slice(split,last)];
+            }
+            if(dashed.length){if(out.length)out.push(NaN,NaN);for(let i=0;i<dashed.length;i++)out.push(dashed[i]);if(out.length>PATH_VALUES)throw new RangeError('Canvas path limit');}
+            first=end+2;
+        }
+        return {points:out,width:s.lineWidth};
+    }
+    function strokePath(s,points){if(!points.length)return;const stroke=strokeGeometry(s,points);if(stroke.points.length)native(s.canvas,'stroke',pathBuffer(stroke.points),color(s,true),stroke.width,new Float64(s.matrix).buffer);}
+    function hitArguments(ctx,values,fill){
+        state(ctx);const external=paths.has(values[0]),start=external?1:0;
+        if(values.length<start+2)throw new TypeError('Missing Canvas hit-test arguments');
+        const x=+values[start],y=+values[start+1];
+        const rule=fill?string(values[start+2]===undefined?'nonzero':values[start+2]):'nonzero';
+        if(rule!=='nonzero'&&rule!=='evenodd')throw new TypeError('Invalid fill rule');
+        /* Conversions can resize the canvas. Refresh before borrowing its
+           current path/state; the query point never receives the CTM. */
+        const s=state(ctx);return {s,x,y,rule,points:external?transformedPath(s,values[0]):s.path};
+    }
     function multiply(s,m){const a=s.matrix;s.matrix=[a[0]*m[0]+a[2]*m[1],a[1]*m[0]+a[3]*m[1],a[0]*m[2]+a[2]*m[3],a[1]*m[2]+a[3]*m[3],a[0]*m[4]+a[2]*m[5]+a[4],a[1]*m[4]+a[3]*m[5]+a[5]];}
     function alignment(s){if(s.align==='center')return 0.5;if(s.align==='right')return 1;if(s.align==='left')return 0;const rtl=s.direction==='rtl'||(s.direction==='inherit'&&native(s.canvas,'rtl'));return s.align==='start'?(rtl?1:0):(rtl?0:1);}
     const baselines=['alphabetic','top','hanging','middle','ideographic','bottom'];
@@ -143,7 +189,7 @@ const canvasBridge = (() => {
         setLineDash(segments){state(this);if(!arguments.length)throw new TypeError('setLineDash requires segments');const dash=canvasDash.convert(segments),s=state(this);if(dash!==null)s.dash=dash;},
         getLineDash(){return canvasDash.copy(state(this).dash);},
         fillRect(...v){rect(this,'rect',v);},clearRect(...v){rect(this,'clear',v);},
-        strokeRect(...v){state(this);v=args(v,4);const s=state(this);if(!valid(v))return;const [x,y,w,h]=v,p=[point(s,x,y),point(s,x+w,y),point(s,x+w,y+h),point(s,x,y+h),point(s,x,y)];strokePath(s,p.flat());},
+        strokeRect(...v){state(this);v=args(v,4);const s=state(this);if(!valid(v))return;const [x,y,w,h]=v,p=[point(s,x,y),point(s,x+w,y),point(s,x+w,y+h),point(s,x,y+h),point(s,x,y)];strokePath(s,[...p.flat(),NaN,Infinity]);},
         save(){const s=state(this);if(s.stack.length===64)throw new RangeError('Canvas save stack limit');const saved={fill:s.fill,stroke:s.stroke,fillColor:s.fillColor,strokeColor:s.strokeColor,alpha:s.alpha,lineWidth:s.lineWidth,dash:canvasDash.copy(s.dash),dashOffset:s.dashOffset,smoothing:s.smoothing,font:s.font,fontSize:s.fontSize,fontStyle:s.fontStyle,fontFamily:s.fontFamily,align:s.align,baseline:s.baseline,direction:s.direction,matrix:s.matrix.slice()};s.stack.push(saved);try{native(s.canvas,'save');}catch(e){s.stack.pop();throw e;}},
         restore(){const s=state(this),saved=s.stack[s.stack.length-1];if(saved){native(s.canvas,'restore');s.stack.pop();Object.assign(s,saved);}},
         reset(){const s=state(this);native(s.canvas,'reset');s.version=native(s.canvas,'version');defaults(s);},
@@ -151,6 +197,8 @@ const canvasBridge = (() => {
         fill(pathOrRule='nonzero',rule='nonzero'){state(this);const external=paths.has(pathOrRule);rule=string(external?rule:pathOrRule);if(rule!=='nonzero'&&rule!=='evenodd')throw new TypeError('Invalid fill rule');const s=state(this),path=external?transformedPath(s,pathOrRule):s.path;if(path.length)native(s.canvas,'poly',pathBuffer(path),color(s),rule==='evenodd',false);},
         clip(pathOrRule='nonzero',rule='nonzero'){state(this);const external=paths.has(pathOrRule);rule=string(external?rule:pathOrRule);if(rule!=='nonzero'&&rule!=='evenodd')throw new TypeError('Invalid fill rule');const s=state(this),path=external?transformedPath(s,pathOrRule):s.path;native(s.canvas,'clip',pathBuffer(path),0,rule==='evenodd');},
         stroke(path){const s=state(this),points=path===undefined?s.path:transformedPath(s,path);strokePath(s,points);},
+        isPointInPath(...values){const hit=hitArguments(this,values,true);if(!finite(hit.x)||!finite(hit.y))return false;return native(hit.s.canvas,'hitPath',pathBuffer(hit.points),hit.x,hit.y,hit.rule==='evenodd');},
+        isPointInStroke(...values){const hit=hitArguments(this,values,false);if(!finite(hit.x)||!finite(hit.y)||!hit.points.length)return false;const stroke=strokeGeometry(hit.s,hit.points);return native(hit.s.canvas,'hitStroke',pathBuffer(stroke.points),hit.x,hit.y,stroke.width,new Float64(hit.s.matrix).buffer);},
         measureText(value){state(this);if(!arguments.length)throw new TypeError('measureText requires text');const text=textValue(value),s=state(this),result=native(s.canvas,'measureText',text,s.fontSize,s.fontStyle,alignment(s),baselines.indexOf(s.baseline),s.fontFamily);const out=create(TextMetrics.prototype);metrics.set(out,result);return out;},
         fillText(value,x,y,maxWidth){state(this);if(arguments.length<3)throw new TypeError('fillText requires text and coordinates');const text=textValue(value),v=[number(x),number(y)],width=arguments.length>3?number(maxWidth):Infinity;if(!valid(v)||!(width>0))return;const s=state(this);native(s.canvas,'fillText',text,s.fontSize,s.fontStyle,alignment(s),baselines.indexOf(s.baseline),s.fontFamily,new Float64([...v,width,...s.matrix]).buffer,color(s));},
         transform(...v){const s=state(this);v=args(v,6);if(valid(v))multiply(s,v);},

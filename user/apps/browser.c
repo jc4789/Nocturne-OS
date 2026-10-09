@@ -1617,23 +1617,21 @@ static void page_click(web_node *target, int x, int y, bool keyboard) {
     if(web_control_disabled(target))return;
     /* Author click listeners may reparent the target. Capture its first
        native link activation now, without changing the event target. */
-    struct web_hit initial_action = {0};
-    web_node *anchor = web_node_action(doc,target,&initial_action) &&
-                       initial_action.kind==WEB_HIT_LINK ? initial_action.node : NULL;
+    web_node *anchor = web_link_activation_anchor(doc,target);
     struct gui_event native = {.x = x, .y = y, .buttons = 1};
     struct web_control_activation activation;
     web_control_activation_begin(doc, target, &activation);
     bool allowed = dispatch_native("click", target, &native, true);
     bool input_events = web_control_activation_end(doc, &activation, allowed);
     if (!allowed) { flush_dom_layout(); return; }
-    if (web_media_activate(doc,target)) { page_focus(target); flush_dom_layout(); return; }
-    web_node *label_control = web_label_activation(target);
+    if (!anchor && web_media_activate(doc,target)) { page_focus(target); flush_dom_layout(); return; }
+    web_node *label_control = anchor ? NULL : web_label_activation(target);
     if (label_control) { page_focus(label_control); page_click(label_control, x, y, keyboard); return; }
     struct web_hit hit = {0};
     if (anchor) {
         /* Read this same anchor's latest href after dispatch. Removal of
            href or reparenting must not select another ancestor anchor. */
-        if (!web_node_action(doc,anchor,&hit) || hit.kind!=WEB_HIT_LINK || hit.node!=anchor) return;
+        if (!web_link_action(doc,anchor,&hit)) return;
     } else if (!web_node_action(doc,target,&hit) || hit.kind==WEB_HIT_LINK) return;
     if (!keyboard && hit.kind==WEB_HIT_DETAILS) {
         struct web_hit pointer={0};

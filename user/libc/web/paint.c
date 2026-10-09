@@ -1215,6 +1215,36 @@ web_node *web_node_at(web_doc *d, int x, int y) {
     return P.target && !web_dialog_inert(d,P.target) ? P.target : NULL;
 }
 
+web_node *web_link_activation_anchor(web_doc *d, web_node *target) {
+    if (!d || d->inert || !target || target->owner != d || web_dialog_inert(d,target)) return NULL;
+    for (node_t *n = target; n; n = doc_flat_parent(n)) {
+        if (n->type != N_ELEM || n->foreign) continue;
+        /* Activation identity does not depend on today's href: a listener may
+           add/change it. Never switch to another anchor after dispatch. */
+        if (n->tag == T_a) return n;
+        /* Hidden controls have no hit box, but still own activation rather
+           than allowing a descendant click to escape into an outer anchor. */
+        if (n->tag == T_input || n->tag == T_button || n->tag == T_select ||
+            n->tag == T_textarea || n->tag == T_label || n->tag == T_summary ||
+            n->tag == T_iframe || n->tag == T_embed ||
+            ((n->tag == T_audio || n->tag == T_video) && node_attr(n, "controls")) ||
+            ((n->tag == T_img || n->tag == T_object) && node_attr(n, "usemap"))) return NULL;
+    }
+    return NULL;
+}
+
+bool web_link_action(web_doc *d, web_node *anchor, struct web_hit *hit) {
+    memset(hit, 0, sizeof *hit);
+    if (!d || d->inert || !anchor || anchor->owner != d || anchor->type != N_ELEM ||
+        anchor->foreign || anchor->tag != T_a || web_dialog_inert(d,anchor)) return false;
+    /* HTML's cannot-navigate rule exempts <a> from connectedness. Keeping its
+       owner/activity check rejects adoption into inert auxiliary documents. */
+    const char *href = doc_link_href(d, anchor);
+    if (!href) return false;
+    hit->kind = WEB_HIT_LINK; hit->node = anchor; hit->href = href;
+    return true;
+}
+
 bool web_node_action(web_doc *d, web_node *target, struct web_hit *hit) {
     memset(hit, 0, sizeof *hit);
     if (!d || !target || web_dialog_inert(d,target)) return false;

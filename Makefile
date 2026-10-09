@@ -141,6 +141,9 @@ user/libc/web/js_bootstrap.inc user/libc/web/js_form_url.inc &: $(wildcard user/
 	@$(PY) user/libc/web/js_embed.py
 $(BUILD)/u/user/libc/web/js.o: user/libc/web/js_bootstrap.inc
 $(BUILD)/u/user/libc/web/form_validation.o: user/libc/web/js_form_url.inc
+user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_clone.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_embed.py
+	@$(PY) user/libc/web/js_worker_embed.py
+$(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc
 
 $(BUILD)/u/%.asm.o: %.asm
 	@mkdir -p $(dir $@)

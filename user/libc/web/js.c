@@ -21,6 +21,7 @@
 #include "js_crypto.h"
 #include "js_encoding.h"
 #include "js_collator_native.h"
+#include "js_worker.h"
 #include "js_bootstrap.inc"
 
 /* Live YouTube's 10.8 MB program was rejected while compiling at exactly the
@@ -43,12 +44,16 @@
 #define JS_STARTUP_MS 10000u /* trusted, built-in platform initialization only */
 #define JS_TIMERS_INITIAL 32u
 #define JS_TIMERS_MAX 1024u
+#define JS_IDLE_MAX 1024u
+#define JS_IDLE_PERIOD_MS 50u
+#define JS_IDLE_PERIOD_CALLBACKS 8u
 #define JS_REQUESTS 64
 
 #define JS_NODE_BUCKETS 4096
 struct js_node_ref { node_t *node; JSValue object; bool force_async_set, force_async, image_notified; int image; uint64_t image_generation; struct js_node_ref *next, *hash_next; };
 struct js_timer { uint32_t id; int kind; uint64_t due, interval; JSValue fn, args; };
 struct js_posted_task { struct js_posted_task *next; JSValue fn; uint32_t id; };
+struct js_idle_task { struct js_idle_task *next; JSValue fn; uint32_t id; uint64_t due; };
 struct js_script {
     node_t *node;
     char *url, *base, *source;
@@ -58,11 +63,13 @@ struct js_script {
     uint64_t request;
     struct js_script *next;
 };
-enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE };
+enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE, P_WORKER };
 struct js_pending {
     uint64_t id, deadline;
     int kind, credentials, cache_mode;
     int image;
+    uint32_t worker, worker_request;
+    int worker_kind;
     struct js_script *script;
     JSValue resolve, reject;
     char *url;
@@ -98,6 +105,8 @@ struct web_js_state {
     struct js_node_ref *node_buckets[JS_NODE_BUCKETS];
     struct js_script *scripts, *last_script, *blocker;
     struct js_pending *pending;
+    web_workers *workers;
+    bool worker_turn;
     struct js_module *modules;
     const char *module_entry_url;
     struct js_timer *timers;
@@ -106,6 +115,11 @@ struct web_js_state {
     unsigned posted_count;
     uint32_t next_posted;
     bool posted_turn;
+    struct js_idle_task *idle_pending, *last_idle_pending, *idle_runnable, *last_idle_runnable;
+    unsigned idle_count, idle_period_callbacks;
+    uint32_t next_idle;
+    uint64_t idle_period_end;
+    bool idle_timeout_turn, idle_period_stopped;
     struct js_rejection rejections[32];
     struct js_resource_event *events, *last_event;
     struct js_image_decode *image_decodes, *last_image_decode;
@@ -2429,22 +2443,7 @@ static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, 
 /* Capture the native activation path before author listeners can reparent
    the clicked descendant. The event target itself remains the clicked node. */
 static node_t *native_click_anchor(web_doc *d, node_t *target) {
-    /* Preserve direct A.click(), including its existing detached-node path. */
-    if (target->tag == T_a) return target;
-    struct web_hit action = {0};
-    if (!web_node_action(d, target, &action) || action.kind != WEB_HIT_LINK) return NULL;
-    for (node_t *n = target; n; n = doc_flat_parent(n)) {
-        if (n == action.node) return n;
-        if (n->type != N_ELEM || n->foreign) continue;
-        /* A hidden/unlaid-out control has no hit box, but must not let a
-           descendant's synthetic activation escape into an outer anchor. */
-        if (n->tag == T_input || n->tag == T_button || n->tag == T_select ||
-            n->tag == T_textarea || n->tag == T_label || n->tag == T_summary ||
-            n->tag == T_iframe || n->tag == T_embed ||
-            ((n->tag == T_audio || n->tag == T_video) && node_attr(n, "controls")) ||
-            ((n->tag == T_img || n->tag == T_object) && node_attr(n, "usemap"))) return NULL;
-    }
-    return NULL;
+    return web_link_activation_anchor(d, target);
 }
 static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv);
 static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -2465,19 +2464,21 @@ static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc
     if (!allowed) return JS_UNDEFINED;
     e.synthetic = false; /* default-action input/change/submit events are UA generated */
     if (s->doc->resources_dirty) doc_rescan(s->doc);
-    node_t *label_control = web_label_activation(n);
+    node_t *label_control = anchor ? NULL : web_label_activation(n);
     if (label_control && !web_control_disabled(label_control)) {
         web_js_focus_control(s->doc, label_control);
         JSValue argument = wrap(s, label_control);
         JSValue result = JS_IsException(argument) ? argument : native_click(ctx, this_val, 1, &argument);
         JS_FreeValue(ctx, argument); return result;
     }
-    node_t *disclosure=doc_details_activation(n);
+    node_t *disclosure=anchor ? NULL : doc_details_activation(n);
     if (disclosure) doc_details_toggle(s->doc,disclosure);
-    else if (n->tag == T_audio || n->tag == T_video) web_media_activate(s->doc, n);
+    else if (!anchor && (n->tag == T_audio || n->tag == T_video)) web_media_activate(s->doc, n);
     else if (anchor) {
-        const char *href = doc_link_href(s->doc, anchor);
-        if (href && permitted_url(s, href, false) && s->host.navigate) s->host.navigate(s->host.opaque, href, NULL);
+        struct web_hit action = {0};
+        if (web_link_action(s->doc, anchor, &action) &&
+            permitted_url(s, action.href, false) && s->host.navigate)
+            s->host.navigate(s->host.opaque, action.href, NULL);
     } else if (n->tag == T_input) {
         const char *type = node_attr(n, "type");
         if (type && (str_ieq(type, "checkbox") || str_ieq(type, "radio"))) {
@@ -2574,6 +2575,52 @@ static JSValue native_cancel_post(JSContext *ctx, JSValueConst this_val, int arg
     }
     return JS_UNDEFINED;
 }
+/* Native idle-task source: no timer alias, no allocation until requested, and
+   every callback reference/queue node is charged to the existing JS quota. */
+static struct js_idle_task *take_idle(struct js_idle_task **first, struct js_idle_task **last, uint32_t id) {
+    struct js_idle_task **link = first, *previous = NULL;
+    while (*link) {
+        struct js_idle_task *p = *link;
+        if (p->id == id) {
+            *link = p->next; if (*last == p) *last = previous;
+            p->next = NULL; return p;
+        }
+        previous = p; link = &p->next;
+    }
+    return NULL;
+}
+static struct js_idle_task *take_idle_id(struct web_js_state *s, uint32_t id) {
+    struct js_idle_task *p = take_idle(&s->idle_pending, &s->last_idle_pending, id);
+    if (!p) p = take_idle(&s->idle_runnable, &s->last_idle_runnable, id);
+    if (p) s->idle_count--;
+    return p;
+}
+static bool idle_id_used(struct web_js_state *s, uint32_t id) {
+    for (struct js_idle_task *p = s->idle_pending; p; p = p->next) if (p->id == id) return true;
+    for (struct js_idle_task *p = s->idle_runnable; p; p = p->next) if (p->id == id) return true;
+    return false;
+}
+static JSValue native_idle(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s = state(ctx); uint32_t timeout = 0;
+    if (!argc || !JS_IsFunction(ctx, argv[0])) return JS_ThrowTypeError(ctx, "Expected idle callback");
+    if (argc > 1 && JS_ToUint32(ctx, &timeout, argv[1]) < 0) return JS_EXCEPTION;
+    if (s->idle_count >= JS_IDLE_MAX) return JS_ThrowRangeError(ctx, "Document idle callback limit reached");
+    struct js_idle_task *p = js_malloc(ctx, sizeof *p); if (!p) return JS_EXCEPTION;
+    uint32_t id;
+    do { id = ++s->next_idle; } while (!id || idle_id_used(s, id));
+    p->id = id; p->fn = JS_DupValue(ctx, argv[0]); p->next = NULL;
+    p->due = timeout ? uptime_ms() + timeout : UINT64_MAX;
+    if (s->last_idle_pending) s->last_idle_pending->next = p; else s->idle_pending = p;
+    s->last_idle_pending = p; s->idle_count++;
+    return JS_NewUint32(ctx, id);
+}
+static JSValue native_cancel_idle(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s = state(ctx); uint32_t id;
+    if (!argc || JS_ToUint32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+    struct js_idle_task *p = take_idle_id(s, id);
+    if (p) { JS_FreeValue(ctx, p->fn); js_free(ctx, p); }
+    return JS_UNDEFINED;
+}
 static JSValue native_css_supports(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if (!argc) return JS_ThrowTypeError(ctx, "CSS.supports requires an argument");
     size_t an, bn = 0;
@@ -2637,6 +2684,92 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
     bool ok = s->host.request && s->host.request(s->host.opaque, &r);
     if (!ok) pending_error(p, "The browser rejected the resource request");
     return ok;
+}
+/* Children have no networking/file host. Parent transport owns cookies, CORS,
+   redirects and generation cancellation; completions only queue native bytes. */
+static bool worker_load(void *opaque, uint32_t worker, uint32_t request,
+                        const char *url, int kind) {
+    struct web_js_state *s = opaque;
+    if (!s || s->disabled || kind < 0 || kind > 2) return false;
+    struct js_pending *p = pending_new(s, P_WORKER, url);
+    if (!p) {
+        /* Loader rejection is reported over Worker IPC. Do not leave an OOM
+           exception pending in a parent realm that is not executing a task. */
+        if (JS_HasException(s->ctx)) { JSValue error=JS_GetException(s->ctx); JS_FreeValue(s->ctx,error); }
+        return false;
+    }
+    p->worker = worker; p->worker_request = request; p->worker_kind = kind;
+    bool blob = !strncasecmp(url,"blob:",5);
+    if (strlen(url) >= WEBNET_URL_MAX || (!blob && !permitted_url(s,url,true)) || (blob && kind == 2)) {
+        pending_error(p,"Worker resource URL is not permitted"); return true;
+    }
+    if (blob) {
+        p->done = true; p->response.status = 200;
+        /* Worker(blobURL) starts fetching now. Retain its bytes before author
+           code can revoke the URL immediately after the constructor returns.
+           Other child requests are resolved at a later bounded task boundary. */
+        if (kind == 0 && s->running) {
+            char mime[128];
+            p->response.body=script_blob_source(s,url,true,&p->response.body_len,mime);
+            if (!p->response.body) {
+                if (JS_HasException(s->ctx)) { JSValue error=JS_GetException(s->ctx); JS_FreeValue(s->ctx,error); }
+                pending_error(p,"Worker object URL is unavailable or has an invalid JavaScript MIME type");
+            } else snprintf(p->response.headers,sizeof p->response.headers,"Content-Type: %s\r\n",mime);
+        }
+        return true;
+    }
+    char origin[256], target[256];
+    if (kind == 0 && (!make_origin(s->doc->url,origin,sizeof origin) ||
+        !make_origin(url,target,sizeof target) || strcmp(origin,target))) {
+        pending_error(p,"Worker startup requires a same-origin script"); return true;
+    }
+    struct web_request r = {.id=p->id, .kind=kind == 2 ? WEB_RESOURCE_FETCH : WEB_RESOURCE_SCRIPT,
+        .url=p->url, .method="GET", .credentials=1, .same_origin=kind == 0};
+    if (!s->host.request || !s->host.request(s->host.opaque,&r))
+        pending_error(p,"The browser rejected the Worker resource request");
+    return true;
+}
+static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    struct web_js_state *s = state(ctx); int32_t op;
+    if (!argc || JS_ToInt32(ctx,&op,argv[0])) return JS_EXCEPTION;
+    if (op == 0) {
+        const char *url = argc > 2 ? JS_ToCString(ctx,argv[2]) : NULL;
+        if (!url) return JS_EXCEPTION;
+        char origin[256], target[256];
+        bool blob = !strncasecmp(url,"blob:",5);
+        bool allowed = strlen(url)<WEBNET_URL_MAX && (blob || (permitted_url(s,url,true) &&
+            make_origin(s->doc->url,origin,sizeof origin) && make_origin(url,target,sizeof target) && !strcmp(origin,target)));
+        JS_FreeCString(ctx,url);
+        if (!allowed) return JS_ThrowTypeError(ctx,"SecurityError: Worker source must be same-origin");
+    }
+    if (!s->workers) {
+        if (op != 0) return JS_UNDEFINED;
+        static uint32_t generation;
+        if (!++generation) ++generation;
+        s->workers = web_worker_new(ctx,generation,worker_load,s);
+        if (!s->workers) return oom(ctx);
+        JSValue fn = JS_GetPropertyStr(ctx,s->hooks,"workerNotify");
+        if (JS_IsException(fn)) return fn;
+        web_worker_set_callback(s->workers,fn); JS_FreeValue(ctx,fn);
+    }
+    JSValue result=web_worker_native(s->workers,argc,argv);
+    if (op == 2 && argc > 1 && !JS_IsException(result)) {
+        uint32_t id;
+        if (!JS_ToUint32(ctx,&id,argv[1])) {
+            struct js_pending **link=&s->pending;
+            while (*link) {
+                struct js_pending *p=*link;
+                if (p->kind != P_WORKER || p->worker != id) { link=&p->next; continue; }
+                *link=p->next;
+                if (s->host.cancel) s->host.cancel(s->host.opaque,p->id);
+                JS_FreeValue(ctx,p->resolve); JS_FreeValue(ctx,p->reject);
+                js_free(ctx,p->url); js_free(ctx,p->response.body); js_free(ctx,p->response.headers_full);
+                js_free(ctx,p); s->pending_count--;
+            }
+        }
+    }
+    return result;
 }
 static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx);
@@ -3246,7 +3379,7 @@ static void diagnostic_resource(struct web_js_state *s, struct js_pending *p, co
         }
         h=*end?end+1:end;
     }
-    static const char *const kinds[]={"script","fetch","stylesheet","image"};
+    static const char *const kinds[]={"script","fetch","stylesheet","image","worker"};
     uint64_t started=p->deadline>=30000?p->deadline-30000:0;
     snprintf(message,sizeof message,"Resource #%lu %s: HTTP %d, %lu bytes, MIME %s, elapsed %lu ms, %s; %s",
         (unsigned long)p->id,kinds[p->kind],p->response.status,(unsigned long)p->response.body_len,mime,
@@ -3261,7 +3394,8 @@ static bool process_pending(struct web_js_state *s) {
         struct js_pending *p = *link;
         if (!p->done && now >= p->deadline) { if (s->host.cancel) s->host.cancel(s->host.opaque, p->id); pending_error(p, "Resource request exceeded its 30 second deadline"); }
         if (!p->done) { link = &p->next; continue; }
-        if (p->kind == P_FETCH && ran_task && !s->disabled) { link = &p->next; continue; }
+        if (ran_task && !s->disabled && (p->kind == P_FETCH ||
+            (p->kind == P_WORKER && !strncasecmp(p->url,"blob:",5)))) { link = &p->next; continue; }
         *link = p->next;
         bool ok = !p->response.error[0] && p->response.status >= 200 && p->response.status < 300;
         if (!ok && (p->kind != P_FETCH || p->response.error[0] || p->response.status >= 400))
@@ -3290,6 +3424,29 @@ static bool process_pending(struct web_js_state *s) {
                 }
                 prepare_module_script(s, script);
             }
+        } else if (p->kind == P_WORKER && !s->disabled) {
+            if (!strncasecmp(p->url,"blob:",5) && !p->response.body && !p->response.error[0]) {
+                char mime[128];
+                ran_task = true; begin_named_task(s,"Worker object-URL source",p->worker);
+                p->response.body = script_blob_source(s,p->url,true,&p->response.body_len,mime);
+                if (!p->response.body) {
+                    if (JS_HasException(s->ctx)) exception(s);
+                    pending_error(p,"Worker object URL is unavailable or has an invalid JavaScript MIME type");
+                } else snprintf(p->response.headers,sizeof p->response.headers,"Content-Type: %s\r\n",mime);
+                end_task(s);
+            }
+            const char *final = p->response.url[0] ? p->response.url : p->url;
+            if (!p->response.error[0] && strncasecmp(p->url,"blob:",5)) {
+                bool valid = permitted_url(s,final,true);
+                char origin[256], target[256];
+                if (p->worker_kind == 0) valid = valid && make_origin(s->doc->url,origin,sizeof origin) &&
+                    make_origin(final,target,sizeof target) && !strcmp(origin,target);
+                if (p->worker_kind != 2) valid = valid && p->response.status>=200 && p->response.status<300 &&
+                    javascript_mime(web_response_headers(&p->response));
+                if (!valid) pending_error(p,"Worker response rejected (URL, origin, HTTP status or JavaScript MIME type)");
+            }
+            web_worker_loaded(s->workers,p->worker,p->worker_request,p->response.status,final,
+                web_response_headers(&p->response),p->response.body,p->response.body_len,p->response.error);
         } else if (p->kind == P_CSS) doc_css_loaded(s->doc, p->url, p->response.url[0] ? p->response.url : p->url, ok ? p->response.body : NULL, ok ? p->response.body_len : 0);
         else if (p->kind == P_IMAGE) {
             web_image_loaded(s->doc, p->image, ok ? p->response.body : NULL, ok ? p->response.body_len : 0);
@@ -3717,10 +3874,104 @@ static bool run_details_toggle(struct web_js_state *s) {
     for(int i=0;i<3;i++)JS_FreeValue(s->ctx,args[i]);
     end_task(s);return true;
 }
+static uint64_t idle_timeout_due(struct web_js_state *s) {
+    uint64_t due = UINT64_MAX;
+    for (struct js_idle_task *p = s->idle_runnable; p; p = p->next) if (p->due < due) due = p->due;
+    for (struct js_idle_task *p = s->idle_pending; p; p = p->next) if (p->due < due) due = p->due;
+    return due;
+}
+static bool invoke_idle(struct web_js_state *s, uint32_t id, uint64_t end, bool timed_out) {
+    struct js_idle_task *p = take_idle_id(s, id); if (!p) return false;
+    /* Unpublish/free the queue node before script, including its microtasks.
+       Cancellation/re-registration/GC cannot invalidate any retained pointer. */
+    JSValue fn = p->fn; js_free(s->ctx, p);
+    begin_named_task(s, timed_out ? "idle callback timeout" : "idle callback", id);
+    JSValue args[] = {JS_NewFloat64(s->ctx, (double)relative_time(s, end)), JS_NewBool(s->ctx, timed_out)};
+    JSValue global = JS_GetGlobalObject(s->ctx), result = JS_Call(s->ctx, fn, global, 2, args);
+    if (JS_IsException(result)) exception(s); else JS_FreeValue(s->ctx, result);
+    JS_FreeValue(s->ctx, args[0]); JS_FreeValue(s->ctx, args[1]);
+    JS_FreeValue(s->ctx, global); JS_FreeValue(s->ctx, fn); end_task(s);
+    return true;
+}
+static bool run_idle_timeout(struct web_js_state *s, uint64_t now) {
+    uint64_t due = UINT64_MAX; uint32_t id = 0;
+    /* Earlier timeout first, with FIFO ties across older runnable and pending
+       lists; a timeout and ordinary idle invocation remove the same entry. */
+    for (struct js_idle_task *p = s->idle_runnable; p; p = p->next)
+        if (p->due <= now && p->due < due) { due = p->due; id = p->id; }
+    for (struct js_idle_task *p = s->idle_pending; p; p = p->next)
+        if (p->due <= now && p->due < due) { due = p->due; id = p->id; }
+    if (!id) return false;
+    s->idle_period_stopped = true;
+    return invoke_idle(s, id, now, true);
+}
+static bool idle_eligible(struct web_js_state *s, uint64_t now) {
+    web_doc *d = s->doc, *family = d->dom_family ? d->dom_family : d;
+    struct js_script *script;
+    if (!s->parsing_done || d->dirty || d->resources_dirty || d->need_style || d->need_boxes || !d->layout_valid ||
+        s->events || s->posted || s->media_width != d->width || s->media_height != d->height ||
+        family->shadow_slots_pending || family->details_toggle_first || JS_IsJobPending(s->rt) ||
+        web_worker_runnable(s->workers) || ready_script(s, &script)) return false;
+    if (observers_dirty(s) && s->observer_due <= now) return false;
+    for (struct js_pending *p = s->pending; p; p = p->next) if (p->done || p->deadline <= now) return false;
+    for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && s->timers[i].due <= now) return false;
+    for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) return false;
+    return true;
+}
+static uint64_t idle_period_deadline(struct web_js_state *s, uint64_t now) {
+    uint64_t end = now + JS_IDLE_PERIOD_MS;
+    /* Animation/observer/media and already scheduled resource/timer wakeups
+       shorten a quiet 50ms period to their actual native frame/task budget. */
+    for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && s->timers[i].due < end) end = s->timers[i].due;
+    for (struct js_pending *p = s->pending; p; p = p->next) if (p->deadline < end) end = p->deadline;
+    if (observers_dirty(s) && s->observer_due < end) end = s->observer_due;
+    int64_t media = web_avmedia_deadline(s->doc, now);
+    if (media >= 0 && (uint64_t)media < end) end = (uint64_t)media;
+    int64_t worker = web_worker_deadline(s->workers,now);
+    if (worker >= 0 && (uint64_t)worker < end) end = (uint64_t)worker;
+    return end;
+}
+static bool run_idle_period(struct web_js_state *s, uint64_t now) {
+    if (!s->idle_count) return false;
+    if (!idle_eligible(s, now)) { s->idle_period_stopped = true; return false; }
+    if (now >= s->idle_period_end) {
+        uint64_t end = idle_period_deadline(s, now); if (end <= now) return false;
+        if (s->idle_pending) {
+            if (s->last_idle_runnable) s->last_idle_runnable->next = s->idle_pending; else s->idle_runnable = s->idle_pending;
+            s->last_idle_runnable = s->last_idle_pending;
+            s->idle_pending = s->last_idle_pending = NULL;
+        }
+        s->idle_period_end = end; s->idle_period_callbacks = 0; s->idle_period_stopped = false;
+    }
+    if (s->idle_period_stopped || !s->idle_runnable || s->idle_period_callbacks >= JS_IDLE_PERIOD_CALLBACKS) return false;
+    /* One callback per tick; new registrations remain pending until a later
+       period, even if the callback/microtask checkpoint cancels the whole run list. */
+    uint32_t id = s->idle_runnable->id; s->idle_period_callbacks++;
+    return invoke_idle(s, id, s->idle_period_end, false);
+}
 void web_js_tick(web_doc *d, uint64_t now) {
     struct web_js_state *s = d ? d->js : NULL;
     if (!s || s->running) return;
-    bool ran = process_pending(s);
+    web_worker_pump(s->workers,now);
+    /* Expired idle requests are ordinary watchdog-bounded tasks, not idle
+       periods. Alternate with other task sources so even continuous fetch,
+       scripts or posted/timer work cannot starve an author-supplied timeout. */
+    if (!s->disabled && s->idle_timeout_turn && run_idle_timeout(s, uptime_ms())) {
+        s->idle_timeout_turn = false;
+        /* Preserve the usual post-watchdog script/lifecycle cleanup even when
+           this fairness turn bypasses the other task sources. */
+        if (s->disabled) for (struct js_script *p = s->scripts; p; p = p->next) { p->executed = true; JS_FreeValue(s->ctx, p->evaluation); p->evaluation = JS_UNDEFINED; }
+        request_styles(s); request_images(s); return;
+    }
+    s->idle_timeout_turn = true;
+    bool ran = false;
+    /* Messages are ordinary JS tasks, with the same watchdog/checkpoint as
+       events and timers. Alternate ready workers with other sources. */
+    if (!s->disabled && s->worker_turn && web_worker_runnable(s->workers)) {
+        begin_named_task(s,"Worker message",0); ran = web_worker_run_one(s->workers);
+        if (JS_HasException(s->ctx)) exception(s);
+        end_task(s); s->worker_turn = false;
+    } else { s->worker_turn = true; ran = process_pending(s); }
     request_styles(s);
     if (s->blocker && (s->blocker->executed || s->disabled)) s->blocker = NULL;
     /* A tick executes at most one JavaScript task plus its microtask checkpoint.
@@ -3792,14 +4043,26 @@ void web_js_tick(web_doc *d, uint64_t now) {
         else if (run_timer(s, now)) { s->posted_turn = true; ran = true; }
         else if (run_posted_task(s)) { s->posted_turn = false; ran = true; }
         else if (JS_IsJobPending(s->rt)) { begin_task(s); end_task(s); ran = true; }
+        else if (web_worker_runnable(s->workers)) {
+            begin_named_task(s,"Worker message",0); ran = web_worker_run_one(s->workers);
+            if (JS_HasException(s->ctx)) exception(s);
+            end_task(s); s->worker_turn = false;
+        }
     }
     if (s->disabled) for (struct js_script *p = s->scripts; p; p = p->next) { p->executed = true; JS_FreeValue(s->ctx, p->evaluation); p->evaluation = JS_UNDEFINED; }
     request_styles(s); request_images(s);
-    if (!ran) run_document_event(s);
+    if (!ran) ran = run_document_event(s);
+    if (ran) s->idle_period_stopped = true;
+    else if (!s->disabled) {
+        uint64_t idle_now = uptime_ms();
+        if (!run_idle_timeout(s, idle_now)) run_idle_period(s, idle_now);
+    }
 }
 int64_t web_js_deadline(web_doc *d) {
     struct web_js_state *s = d ? d->js : NULL; if (!s) return -1;
     uint64_t deadline = UINT64_MAX, now = uptime_ms();
+    int64_t worker_deadline = web_worker_deadline(s->workers,now);
+    if (worker_deadline >= 0) deadline = (uint64_t)worker_deadline;
     if (!s->parsing_done && (!s->blocker || s->blocker->executed || s->disabled)) return (int64_t)now;
     for (struct js_pending *p = s->pending; p; p = p->next) {
         if (p->done) return (int64_t)now;
@@ -3816,6 +4079,13 @@ int64_t web_js_deadline(web_doc *d) {
         struct js_script *ready; if (ready_script(s, &ready)) return (int64_t)now;
         for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && s->timers[i].due < deadline) deadline = s->timers[i].due;
         for (struct js_script *p = s->scripts; p; p = p->next) if (p->module && p->executed && !p->notified && script_finished(s, p)) return (int64_t)now;
+        uint64_t idle_due = idle_timeout_due(s); if (idle_due < deadline) deadline = idle_due;
+        if (s->idle_count && idle_eligible(s, now)) {
+            uint64_t idle_wake = now;
+            if (now < s->idle_period_end && (s->idle_period_stopped || !s->idle_runnable || s->idle_period_callbacks >= JS_IDLE_PERIOD_CALLBACKS))
+                idle_wake = s->idle_period_end;
+            if (idle_wake < deadline) deadline = idle_wake;
+        }
     }
     if (s->parsing_done && ((!s->domcontent_sent && !unfinished_deferred(s)) || (s->domcontent_sent && !s->load_sent && !unfinished_scripts(s) && !styles_busy(s) && !pending_kind(s, P_IMAGE) && !pending_kind(s, P_SCRIPT)))) return (int64_t)now;
     return deadline == UINT64_MAX ? -1 : (int64_t)deadline;
@@ -3943,6 +4213,8 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("click", 1, native_click), JS_CFUNC_DEF("timer", 4, native_timer), JS_CFUNC_DEF("clear", 1, native_clear),
         JS_CFUNC_DEF("microtask", 1, native_microtask),
         JS_CFUNC_DEF("postTask", 1, native_post_task), JS_CFUNC_DEF("cancelPost", 1, native_cancel_post),
+        JS_CFUNC_DEF("idle", 2, native_idle), JS_CFUNC_DEF("cancelIdle", 1, native_cancel_idle),
+        JS_CFUNC_DEF("worker", 3, native_worker),
         JS_CFUNC_DEF("cssSupports", 2, native_css_supports),
         JS_CFUNC_DEF("storage", 5, native_storage),
         JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("cancel", 1, native_cancel)
@@ -3992,6 +4264,9 @@ void web_js_free(web_doc *d) {
     struct web_js_state *s = d ? d->js : NULL; if (!s) return;
     d->js = NULL;
     if (s->ctx) {
+        web_worker_free(s->workers); s->workers = NULL;
+        while (s->idle_pending) { struct js_idle_task *p = s->idle_pending; s->idle_pending = p->next; JS_FreeValue(s->ctx, p->fn); js_free(s->ctx, p); }
+        while (s->idle_runnable) { struct js_idle_task *p = s->idle_runnable; s->idle_runnable = p->next; JS_FreeValue(s->ctx, p->fn); js_free(s->ctx, p); }
         while (s->posted) { struct js_posted_task *p = s->posted; s->posted = p->next; JS_FreeValue(s->ctx, p->fn); js_free(s->ctx, p); }
         while (s->image_decodes) {
             struct js_image_decode *p = s->image_decodes; s->image_decodes = p->next;

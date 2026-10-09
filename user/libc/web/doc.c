@@ -13,6 +13,7 @@
 #include "js_canvas.h"
 #include "image_source.h"
 #include "avmedia.h"
+#include "js_worker.h"
 
 /* Cached source and its expanded selector/declaration AST have separate,
    finite live-document budgets. All document and shadow sheets share cssmem. */
@@ -740,9 +741,11 @@ void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const ch
 
 void web_media_background(uint64_t now) {
     web_avmedia_background(now);
+    web_worker_background();
 }
 int64_t web_media_background_deadline(uint64_t now) {
-    return web_avmedia_background_deadline(now);
+    int64_t media = web_avmedia_background_deadline(now), worker = web_worker_background_deadline(now);
+    return media < 0 ? worker : worker < 0 ? media : MIN(media,worker);
 }
 void web_tick(web_doc *d, uint64_t now) {
     web_media_background(now);
@@ -994,6 +997,10 @@ int web_doc_height(web_doc *d) { return d->doc_h; }
 
 const char *doc_link_href(web_doc *d, node_t *a) {
     static char buf[2048];
+    if (!a || !a->owner) return NULL;
+    /* Adoption changes the URL base even if the caller retained its old doc. */
+    d = a->owner;
+    if (d->resources_dirty) doc_sync_tree(d);
     const char *h = node_attr(a, "href");
     if (!h) return NULL;
     while (is_space((unsigned char)*h)) h++;

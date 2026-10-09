@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 
 #define CANVAS_MAX_PIXELS (1u<<20)
 #define CANVAS_BUDGET (16u<<20)
@@ -326,6 +327,164 @@ static void rectangle(struct web_canvas *c,double *v,uint32_t color,bool clear) 
     }
 }
 struct intersection { double x; int direction; };
+/* Shared half-open ray crossing. Weighted interpolation avoids overflowing
+ * finite transformed coordinates; raster fill and point queries use the same
+ * winding contribution, including the implicit closing edge of open paths. */
+static bool edge_intersection(double x0,double y0,double x1,double y1,double y,double *x) {
+    if (!((y0<=y && y1>y) || (y1<=y && y0>y))) return false;
+    double scale=fmax(fabs(y0),fabs(y1));
+    double t=scale>1 ? (y/scale-y0/scale)/(y1/scale-y0/scale) : (y-y0)/(y1-y0);
+    *x=x0*(1-t)+x1*t; return isfinite(*x);
+}
+static bool point_on_edge(double ax,double ay,double bx,double by,double x,double y) {
+    if (x<fmin(ax,bx) || x>fmax(ax,bx) || y<fmin(ay,by) || y>fmax(ay,by)) return false;
+    /* Scale before subtraction/cross products, rather than overflowing with
+       a valid path spanning -DBL_MAX to DBL_MAX. No pixel rounding is used. */
+    double scale=fmax(fmax(fabs(ax),fabs(ay)),fmax(fmax(fabs(bx),fabs(by)),fmax(fabs(x),fabs(y))));
+    if (!scale) return true;
+    double dx=bx/scale-ax/scale,dy=by/scale-ay/scale,px=x/scale-ax/scale,py=y/scale-ay/scale;
+    double left=dx*py,right=dy*px;
+    return fabs(left-right)<=8*DBL_EPSILON*(fabs(left)+fabs(right));
+}
+static bool path_hit(const double *points,size_t count,double x,double y,bool evenodd) {
+    int winding=0; size_t first=0;
+    while (first<count) {
+        while (first<count && (!isfinite(points[first*2]) || !isfinite(points[first*2+1]))) first++;
+        size_t end=first;
+        while (end<count && isfinite(points[end*2]) && isfinite(points[end*2+1])) end++;
+        /* A lone moveTo has no line/path region. Two points still have their
+           boundary, but their forward/reverse crossing cancels the area. */
+        if (end-first>1) for (size_t i=first;i<end;i++) {
+            size_t j=i+1<end?i+1:first;
+            double ax=points[i*2],ay=points[i*2+1],bx=points[j*2],by=points[j*2+1],hit;
+            if (point_on_edge(ax,ay,bx,by,x,y)) return true;
+            if (edge_intersection(ax,ay,bx,by,y,&hit) && hit>x)
+                winding=evenodd?(winding^1):winding+(by>ay?1:-1);
+        }
+        first=end+1;
+    }
+    return winding!=0;
+}
+/* Butt-cap segment predicate in the pen's coordinate system. */
+static bool segment_hit(double ax,double ay,double bx,double by,double half,double x,double y) {
+    double scale=fmax(fmax(fabs(ax),fabs(ay)),fmax(fmax(fabs(bx),fabs(by)),fmax(fabs(x),fabs(y))));
+    scale=fmax(scale,half); if (!(scale>0)) return false;
+    double dx=bx/scale-ax/scale,dy=by/scale-ay/scale,px=x/scale-ax/scale,py=y/scale-ay/scale;
+    double length=hypot(dx,dy); if (!(length>0)) return false;
+    double along=px*(dx/length)+py*(dy/length);
+    double error=8*DBL_EPSILON*(fabs(px)+fabs(py)+length);
+    if (along < -error || along>length+error) return false;
+    return fabs(px*(dy/length)-py*(dx/length))<=half/scale+error;
+}
+static bool stroke_direction(const double *a,const double *b,double *x,double *y) {
+    double scale=fmax(fmax(fabs(a[0]),fabs(a[1])),fmax(fabs(b[0]),fabs(b[1])));
+    if (!(scale>0)) return false;
+    double dx=b[0]/scale-a[0]/scale,dy=b[1]/scale-a[1]/scale,length=hypot(dx,dy);
+    if (!(length>0)) return false; *x=dx/length; *y=dy/length; return true;
+}
+/* Default miter join, miterLimit=10; overflow/too-sharp joins bevel as required.
+ * This same outline is rasterized and queried, never a hit-test-only join. */
+static unsigned join_outline(const double *a,const double *b,const double *c,double half,double *out) {
+    double ax,ay,bx,by;
+    if (!stroke_direction(a,b,&ax,&ay) || !stroke_direction(b,c,&bx,&by)) return 0;
+    double cross=ax*by-ay*bx,dot=ax*bx+ay*by;
+    if (!cross) return 0;
+    double side=cross>0?1:-1,nx=side*ay,ny=-side*ax,mx=side*by,my=-side*bx;
+    out[0]=b[0];out[1]=b[1];out[2]=b[0]+half*nx;out[3]=b[1]+half*ny;
+    unsigned count=3;
+    double denominator=1+dot,ratio=denominator>0?sqrt(2/denominator):INFINITY;
+    if (ratio<=10) {
+        out[4]=b[0]+half*(nx+mx)/denominator;out[5]=b[1]+half*(ny+my)/denominator; count=4;
+    }
+    out[(count-1)*2]=b[0]+half*mx;out[(count-1)*2+1]=b[1]+half*my;
+    for (unsigned i=0;i<count*2;i++) if (!isfinite(out[i])) return 0;
+    return count;
+}
+static bool stroke_hit(const double *points,size_t count,double x,double y,double width) {
+    if (!isfinite(width) || width<=0) return false;
+    size_t first=0;
+    while (first<count) {
+        while(first<count && (!isfinite(points[first*2]) || !isfinite(points[first*2+1])))first++;
+        size_t end=first;while(end<count && isfinite(points[end*2]) && isfinite(points[end*2+1]))end++;
+        size_t previous=first;
+        for(size_t i=first+1;i<end;i++) {
+            const double *a=points+previous*2,*b=points+i*2;
+            if (a[0]==b[0] && a[1]==b[1])continue;
+            if(segment_hit(a[0],a[1],b[0],b[1],width/2,x,y))return true;
+            size_t next=i+1;while(next<end && points[next*2]==b[0] && points[next*2+1]==b[1])next++;
+            if(next<end){double outline[8];unsigned n=join_outline(a,b,points+next*2,width/2,outline);
+                if(n && path_hit(outline,n,x,y,false))return true;}
+            previous=i;
+        }
+        if(end<count && points[end*2+1]==INFINITY && end-first>2) {
+            size_t before=end-2;while(before>first && points[before*2]==points[first*2] && points[before*2+1]==points[first*2+1])before--;
+            size_t after=first+1;while(after<end && points[after*2]==points[first*2] && points[after*2+1]==points[first*2+1])after++;
+            if(after<end){double outline[8];unsigned n=join_outline(points+before*2,points+first*2,points+after*2,width/2,outline);
+                if(n && path_hit(outline,n,x,y,false))return true;}
+        }
+        first=end+1;
+    }
+    return false;
+}
+static bool stroke_inverse(const double *matrix,double x,double y,double *out) {
+    double scale=fmax(fmax(fabs(matrix[0]),fabs(matrix[1])),fmax(fabs(matrix[2]),fabs(matrix[3])));
+    if (!(scale>0) || !isfinite(scale)) return false;
+    double a=matrix[0]/scale,b=matrix[1]/scale,c=matrix[2]/scale,d=matrix[3]/scale,det=a*d-b*c;
+    if (!det || !isfinite(det)) return false;
+    double dx=x/scale-matrix[4]/scale,dy=y/scale-matrix[5]/scale;
+    out[0]=(d*dx-c*dy)/det;out[1]=(a*dy-b*dx)/det;
+    return isfinite(out[0]) && isfinite(out[1]);
+}
+static bool segment_outline(const double *a,const double *b,double half,double *out) {
+    double dx,dy;if(!stroke_direction(a,b,&dx,&dy))return false;
+    double nx=dy*half,ny=-dx*half;
+    out[0]=a[0]+nx;out[1]=a[1]+ny;out[2]=b[0]+nx;out[3]=b[1]+ny;
+    out[4]=b[0]-nx;out[5]=b[1]-ny;out[6]=a[0]-nx;out[7]=a[1]-ny;
+    for(unsigned i=0;i<8;i++)if(!isfinite(out[i]))return false;
+    return true;
+}
+static bool stroke_shape(struct web_canvas *c,const double *matrix,const double *outline,unsigned count,uint8_t *mask,size_t *work) {
+    double transformed[8];
+    for(unsigned i=0;i<count;i++){
+        double x=outline[i*2],y=outline[i*2+1];
+        transformed[i*2]=matrix[0]*x+matrix[2]*y+matrix[4];
+        transformed[i*2+1]=matrix[1]*x+matrix[3]*y+matrix[5];
+        if(!isfinite(transformed[i*2])||!isfinite(transformed[i*2+1]))return false;
+    }
+    double ax=transformed[0],ay=transformed[1],bx=ax,by=ay;
+    for(unsigned i=1;i<count;i++){ax=fmin(ax,transformed[i*2]);ay=fmin(ay,transformed[i*2+1]);bx=fmax(bx,transformed[i*2]);by=fmax(by,transformed[i*2+1]);}
+    unsigned x0=(unsigned)fmax(0,fmin(c->w,floor(ax))),y0=(unsigned)fmax(0,fmin(c->h,floor(ay)));
+    unsigned x1=(unsigned)fmax(0,fmin(c->w,ceil(bx))),y1=(unsigned)fmax(0,fmin(c->h,ceil(by)));
+    size_t area=(size_t)(x1-x0)*(y1-y0);
+    if(area>PATH_STROKE_BUDGET-*work)return false;*work+=area;
+    for(unsigned y=y0;y<y1;y++)for(unsigned x=x0;x<x1;x++)
+        if(visible(c,x,y)&&path_hit(transformed,count,x+0.5,y+0.5,false))mask[(size_t)y*c->w+x]=1;
+    return true;
+}
+static bool stroke_mask(struct web_canvas *c,const double *points,size_t count,double width,const double *matrix,uint8_t *mask) {
+    size_t first=0,work=0;
+    while(first<count){
+        while(first<count&&(!isfinite(points[first*2])||!isfinite(points[first*2+1])))first++;
+        size_t end=first;while(end<count&&isfinite(points[end*2])&&isfinite(points[end*2+1]))end++;
+        size_t previous=first;
+        for(size_t i=first+1;i<end;i++){
+            const double *a=points+previous*2,*b=points+i*2;if(a[0]==b[0]&&a[1]==b[1])continue;
+            double outline[8];
+            if(!segment_outline(a,b,width/2,outline)||!stroke_shape(c,matrix,outline,4,mask,&work))return false;
+            size_t next=i+1;while(next<end&&points[next*2]==b[0]&&points[next*2+1]==b[1])next++;
+            if(next<end){unsigned n=join_outline(a,b,points+next*2,width/2,outline);if(n&&!stroke_shape(c,matrix,outline,n,mask,&work))return false;}
+            previous=i;
+        }
+        if(end<count&&points[end*2+1]==INFINITY&&end-first>2){
+            size_t before=end-2;while(before>first&&points[before*2]==points[first*2]&&points[before*2+1]==points[first*2+1])before--;
+            size_t after=first+1;while(after<end&&points[after*2]==points[first*2]&&points[after*2+1]==points[first*2+1])after++;
+            if(after<end){double outline[8];unsigned n=join_outline(points+before*2,points+first*2,points+after*2,width/2,outline);
+                if(n&&!stroke_shape(c,matrix,outline,n,mask,&work))return false;}
+        }
+        first=end+1;
+    }
+    return true;
+}
 /* Bounded heap sort: long chart paths must not consume the native stack or
  * acquire quadratic insertion-sort cost on adversarial intersections. */
 static void intersection_sort(struct intersection *v,size_t n) {
@@ -353,14 +512,9 @@ static void polygon(struct web_canvas *c,const double *points,size_t count,uint3
             for (size_t i=first;i<end;i++) {
                 size_t j=i+1<end?i+1:first;
                 double x0=points[i*2],y0=points[i*2+1],x1=points[j*2],y1=points[j*2+1];
-                if ((y0<=yy && y1>yy) || (y1<=yy && y0>yy)) {
-                    /* Weighted interpolation avoids overflowing x1-x0 for
-                     * extreme but finite transformed web coordinates. */
-                    double scale=fmax(fabs(y0),fabs(y1));
-                    double t=scale>1 ? (yy/scale-y0/scale)/(y1/scale-y0/scale) : (yy-y0)/(y1-y0);
-                    double hit=x0*(1-t)+x1*t;
-                    if (isfinite(hit) && n<MAX_POINTS) hits[n++]=(struct intersection){hit,y1>y0?1:-1};
-                }
+                double hit;
+                if (edge_intersection(x0,y0,x1,y1,yy,&hit) && n<MAX_POINTS)
+                    hits[n++]=(struct intersection){hit,y1>y0?1:-1};
             }
             first=end+1;
         }
@@ -378,34 +532,6 @@ static void polygon(struct web_canvas *c,const double *points,size_t count,uint3
             }
         }
     }
-}
-static void segment(struct web_canvas *c,double ax,double ay,double bx,double by,double width,uint32_t color) {
-    if (!c->pixels) return;
-    double dx=bx-ax,dy=by-ay,len=dx*dx+dy*dy;
-    if (!len || !isfinite(len)) return;
-    double half=width/2;
-    int x0=(int)fmax(0,fmin(c->w,floor(fmin(ax,bx)-half))),x1=(int)fmax(0,fmin(c->w,ceil(fmax(ax,bx)+half)));
-    int y0=(int)fmax(0,fmin(c->h,floor(fmin(ay,by)-half))),y1=(int)fmax(0,fmin(c->h,ceil(fmax(ay,by)+half)));
-    for (int y=y0;y<y1;y++) for (int x=x0;x<x1;x++) {
-        if (!visible(c,x,y)) continue;
-        double px=x+0.5-ax,py=y+0.5-ay,t=(px*dx+py*dy)/len;
-        if (t<0 || t>1) continue; /* default butt caps */
-        double distance=fabs(px*dy-py*dx)/sqrt(len);
-        if (distance<=half) { uint32_t *p=&c->pixels[(size_t)y*c->w+x]; *p=over(*p,color); }
-    }
-}
-static bool stroke_work(const struct web_canvas *c,const double *points,size_t count,double width) {
-    size_t work=0;double half=width/2;
-    for(size_t i=1;i<count;i++){
-        const double *a=points+(i-1)*2,*b=points+i*2;
-        if(!isfinite(a[0])||!isfinite(a[1])||!isfinite(b[0])||!isfinite(b[1]))continue;
-        double dx=b[0]-a[0],dy=b[1]-a[1],len=dx*dx+dy*dy;
-        if(!len||!isfinite(len))continue;
-        unsigned x0=(unsigned)fmax(0,fmin(c->w,floor(fmin(a[0],b[0])-half))),x1=(unsigned)fmax(0,fmin(c->w,ceil(fmax(a[0],b[0])+half)));
-        unsigned y0=(unsigned)fmax(0,fmin(c->h,floor(fmin(a[1],b[1])-half))),y1=(unsigned)fmax(0,fmin(c->h,ceil(fmax(a[1],b[1])+half)));
-        size_t area=(size_t)(x1-x0)*(y1-y0);
-        if(area>PATH_STROKE_BUDGET-work)return false;work+=area;
-    }return true;
 }
 static void canvas_buffer_free(JSRuntime *rt,void *opaque,void *bytes) {
     (void)opaque;js_free_rt(rt,bytes);
@@ -605,7 +731,30 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
             if (direction && !strcasecmp(direction,"ltr")) break;
         }
     } else if (!strcmp(op,"reset")) { web_canvas_attr_changed(n,"width"); changed(n); }
-    else {
+    else if (!strcmp(op,"hitPath") || !strcmp(op,"hitStroke")) {
+        /* Pure geometry: no bitmap allocation, taint read, clip sampling,
+           painting or dirty/generation mutation. Queries may be off-canvas. */
+        size_t bytes=0; uint8_t *data=argc>1?JS_GetArrayBuffer(ctx,&bytes,argv[1]):NULL;
+        if (!data || bytes%16 || bytes/16>MAX_POINTS) { out=JS_ThrowRangeError(ctx,"Canvas path limit"); goto done; }
+        double query[2]; int numbers=numeric(ctx,argc,argv,2,query,2);
+        if (numbers<0) { out=JS_EXCEPTION; goto done; }
+        if (!numbers) { out=JS_FALSE; goto done; }
+        double *points=bytes?js_malloc(ctx,bytes):NULL;
+        if (bytes && !points) { out=JS_ThrowOutOfMemory(ctx); goto done; }
+        if (bytes) memcpy(points,data,bytes);
+        bool hit=false;
+        if (!strcmp(op,"hitPath")) hit=path_hit(points,bytes/16,query[0],query[1],argc>4&&JS_ToBool(ctx,argv[4]));
+        else {
+            double width=1;
+            if (argc>4 && JS_ToFloat64(ctx,&width,argv[4])<0) { js_free(ctx,points); out=JS_EXCEPTION; goto done; }
+            double matrix[6]={1,0,0,1,0,0},local[2];
+            size_t matrix_bytes=0;uint8_t *matrix_data=argc>5?JS_GetArrayBuffer(ctx,&matrix_bytes,argv[5]):NULL;
+            if(argc>5 && (!matrix_data||matrix_bytes!=sizeof matrix)){js_free(ctx,points);out=JS_ThrowTypeError(ctx,"Invalid Canvas stroke transform");goto done;}
+            if(matrix_data)memcpy(matrix,matrix_data,sizeof matrix);
+            if(stroke_inverse(matrix,query[0],query[1],local))hit=stroke_hit(points,bytes/16,local[0],local[1],width);
+        }
+        js_free(ctx,points); out=JS_NewBool(ctx,hit);
+    } else {
         struct web_canvas *c=ensure(n);
         if (!strcmp(op,"png") || !strcmp(op,"dataURL")) { out=canvas_export(ctx,n,c,!strcmp(op,"dataURL")); goto done; }
         if (!c) { out=!strcmp(op,"context")?JS_FALSE:JS_ThrowRangeError(ctx,"Canvas bitmap memory limit"); goto done; }
@@ -628,14 +777,20 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
             }
         } else if (!strcmp(op,"poly") || !strcmp(op,"stroke") || !strcmp(op,"clip")) {
             size_t bytes; uint8_t *data=argc>1?JS_GetArrayBuffer(ctx,&bytes,argv[1]):NULL;
-            uint32_t color=0; double width=1; bool evenodd=false,clear=false;
+            uint32_t color=0; double width=1,matrix[6]={1,0,0,1,0,0}; bool evenodd=false,clear=false;
             if (!data || bytes%16 || bytes/16>MAX_POINTS) { out=JS_ThrowRangeError(ctx,"Canvas path limit"); goto done; }
             if (argc>2 && JS_ToUint32(ctx,&color,argv[2])<0) { out=JS_EXCEPTION; goto done; }
             if (argc>3) {
                 if (!strcmp(op,"stroke")) { if (JS_ToFloat64(ctx,&width,argv[3])<0) { out=JS_EXCEPTION; goto done; } }
                 else evenodd=JS_ToBool(ctx,argv[3]);
             }
-            if (argc>4) clear=JS_ToBool(ctx,argv[4]);
+            if (argc>4) {
+                if(!strcmp(op,"stroke")){
+                    size_t matrix_bytes=0;uint8_t *matrix_data=JS_GetArrayBuffer(ctx,&matrix_bytes,argv[4]);
+                    if(!matrix_data||matrix_bytes!=sizeof matrix){out=JS_ThrowTypeError(ctx,"Invalid Canvas stroke transform");goto done;}
+                    memcpy(matrix,matrix_data,sizeof matrix);
+                }else clear=JS_ToBool(ctx,argv[4]);
+            }
             size_t count=bytes/16;
             bool stroke=!strcmp(op,"stroke");
             if(!stroke && count && c->h>PATH_SCAN_BUDGET/count){out=JS_ThrowRangeError(ctx,"Canvas path scan budget");goto done;}
@@ -643,8 +798,6 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
             struct intersection *hits=!stroke&&count?js_malloc(ctx,count*sizeof *hits):NULL;
             if((bytes&&!points)||(!stroke&&count&&!hits)){js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowOutOfMemory(ctx);goto done;}
             if(bytes)memcpy(points,data,bytes);
-            if(stroke&&isfinite(width)&&width>0&&!stroke_work(c,points,count,width)){
-                js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowRangeError(ctx,"Canvas stroke work budget");goto done;}
             if (!strcmp(op,"clip")) {
                 size_t bytes=sizeof(struct canvas_clip)+(size_t)c->w*c->h;
                 web_doc *d=allocation_doc(n);
@@ -657,9 +810,18 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
                 polygon(c,points,count,0,evenodd,false,clip->pixels,hits);
                 clip_release(n,c->clip); c->clip=clip;
             } else if (!strcmp(op,"poly")) polygon(c,points,count,color,evenodd,clear,NULL,hits);
-            else if (isfinite(width) && width>0) for (size_t i=1;i<count;i++) {
-                const double *a=&points[(i-1)*2],*b=&points[i*2];
-                if (isfinite(a[0]) && isfinite(a[1]) && isfinite(b[0]) && isfinite(b[1])) segment(c,a[0],a[1],b[0],b[1],width,color);
+            else if (c->pixels && isfinite(width) && width>0) {
+                /* Union the complete stroke before compositing: overlapping
+                   segments/joins must apply globalAlpha exactly once. */
+                size_t mask_bytes=(size_t)c->w*c->h;web_doc *d=allocation_doc(n);
+                if(!d||d->canvas_bytes>CANVAS_BUDGET||mask_bytes>CANVAS_BUDGET-d->canvas_bytes){js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowRangeError(ctx,"Canvas stroke memory limit");goto done;}
+                uint8_t *mask=calloc(1,mask_bytes);
+                if(!mask){js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowOutOfMemory(ctx);goto done;}
+                d->canvas_bytes+=mask_bytes;
+                bool complete=stroke_mask(c,points,count,width,matrix,mask);
+                if(complete)for(size_t i=0;i<mask_bytes;i++)if(mask[i])c->pixels[i]=over(c->pixels[i],color);
+                free(mask);d->canvas_bytes-=mask_bytes;
+                if(!complete){js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowRangeError(ctx,"Canvas stroke work/coordinate limit");goto done;}
             }
             js_free(ctx,points);js_free(ctx,hits);
             changed(n);

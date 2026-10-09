@@ -789,10 +789,12 @@
     /* @include js_object_url.js */
     fetchBridge.initializeObjectURLs(objectURLBridge);
     /* @include js_clone.js */
+    /* @include js_worker.js */
     /* @include js_storage.js */
     /* @include js_messaging.js */
     /* @include js_css_supports.js */
     /* @include js_performance.js */
+    /* @include js_idle.js */
     /* @include js_history.js */
     /* @include js_custom_elements.js */
     /* @include js_media.js */
@@ -869,6 +871,7 @@
         };
     }
     return {
+        workerNotify:workerBridge.deliver,
         storageOrigin:storageBridge.origin,
         formNamedProperty:formNameBridge.property,
         formNamedKeys:formNameBridge.keys,
