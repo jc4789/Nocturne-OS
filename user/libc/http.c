@@ -7,6 +7,7 @@
 #include "http.h"
 
 bool url_parse(const char *s, struct url *u) {
+    if (!s || !u || strlen(s) >= HTTP_URL_MAX) return false;
     memset(u, 0, sizeof *u);
     if (!strncmp(s, "https://", 8)) {
         u->tls = true;
@@ -81,12 +82,12 @@ struct sink {
     struct http_resp *rs;
     size_t cap;
     bool aborted;
-    size_t limit; /* only buffered compressed responses need this additional bound */
+    size_t limit; /* encoded/decoded bound, or zero for legacy uncompressed streaming */
 };
 
 static bool sink_put(struct sink *k, const char *data, size_t n) {
     if (n >= (size_t)-1 - k->rs->body_len ||
-        (k->limit && n > k->limit - k->rs->body_len)) {
+        (k->limit && (k->rs->body_len > k->limit || n > k->limit - k->rs->body_len))) {
         snprintf(k->rs->error, sizeof k->rs->error, "response exceeds size limit");
         k->aborted = true;
         return false;
@@ -105,6 +106,7 @@ static bool sink_put(struct sink *k, const char *data, size_t n) {
             if (cap > (size_t)-1 / 2) { cap = k->rs->body_len + n + 1; break; }
             cap *= 2;
         }
+        if (k->limit && cap > k->limit + 1) cap = k->limit + 1;
         char *nb = realloc(k->rs->body, cap);
         if (!nb) {
             snprintf(k->rs->error, sizeof k->rs->error, "out of memory");
@@ -216,9 +218,9 @@ static uint32_t le32(const unsigned char *p) {
 
 /* Validate each gzip member, including optional headers, checksum and size.
    Concatenated members are permitted; unrelated trailing bytes are not. */
-static bool gunzip_body(struct http_resp *rs) {
+static bool gunzip_body(struct http_resp *rs, size_t limit) {
     const unsigned char *in = (const unsigned char *)rs->body;
-    size_t pos = 0, used = 0, cap = 65536;
+    size_t pos = 0, used = 0, cap = limit < 65536 ? limit : 65536;
     char *out = malloc(cap + 1);
     if (!out) { snprintf(rs->error, sizeof rs->error, "out of memory"); return false; }
     do {
@@ -249,11 +251,13 @@ static bool gunzip_body(struct http_resp *rs) {
         for (;;) {
             got = http_inflate(out + used, (int)(cap - used), (const char *)in + pos, (int)(n - pos), &took);
             if (got != -2) break;
-            if (cap == HTTP_GZIP_LIMIT) {
-                snprintf(rs->error, sizeof rs->error, "gzip response exceeds 16 MiB");
+            if (cap == limit) {
+                if (!(limit % (1024u * 1024u)))
+                    snprintf(rs->error, sizeof rs->error, "gzip response exceeds %lu MiB", (unsigned long)(limit / (1024u * 1024u)));
+                else snprintf(rs->error, sizeof rs->error, "gzip response exceeds %lu bytes", (unsigned long)limit);
                 free(out); return false;
             }
-            cap *= 2;
+            cap = cap * 2 < limit ? cap * 2 : limit;
             char *larger = realloc(out, cap + 1);
             if (!larger) { snprintf(rs->error, sizeof rs->error, "out of memory"); free(out); return false; }
             out = larger;
@@ -276,32 +280,37 @@ invalid:
     return false;
 }
 
-int http_request(const struct http_req *rq, struct http_resp *rs) {
+struct http_scratch {
+    struct url url;
+    char head[HTTP_URL_PATH_MAX + 512u];
+    char line[HTTP_RESPONSE_HEADER_LINE_MAX];
+};
+static int request_inner(const struct http_req *rq, struct http_resp *rs, struct http_scratch *work, size_t body_limit) {
     memset(rs, 0, sizeof *rs);
-    struct url u;
-    if (!url_parse(rq->url, &u)) {
+    struct url *u = &work->url;
+    if (!url_parse(rq->url, u)) {
         snprintf(rs->error, sizeof rs->error, "bad URL: %s", rq->url);
         return -1;
     }
     int timeout = rq->timeout_ms ? rq->timeout_ms : 60000;
-    net_stream *s = ns_open(u.host, u.port, u.tls, timeout, rs->error, sizeof rs->error);
+    net_stream *s = ns_open(u->host, u->port, u->tls, timeout, rs->error, sizeof rs->error);
     if (!s) return -1;
 
     const char *method = rq->method ? rq->method : "GET";
-    bool std_port = u.port == (u.tls ? 443 : 80);
-    char hostport[140], head[HTTP_URL_PATH_MAX + 512u];
-    if (std_port) snprintf(hostport, sizeof hostport, "%s", u.host);
-    else snprintf(hostport, sizeof hostport, "%s:%d", u.host, u.port);
-    int hn = snprintf(head, sizeof head, "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Nocturne/1.0\r\nConnection: close\r\n",
-                      method, u.path, hostport);
-    if (hn < 0 || hn >= (int)sizeof head - 2) {
+    bool std_port = u->port == (u->tls ? 443 : 80);
+    char hostport[140], *head = work->head;
+    if (std_port) snprintf(hostport, sizeof hostport, "%s", u->host);
+    else snprintf(hostport, sizeof hostport, "%s:%d", u->host, u->port);
+    int hn = snprintf(head, sizeof work->head, "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Nocturne/1.0\r\nConnection: close\r\n",
+                      method, u->path, hostport);
+    if (hn < 0 || hn >= (int)sizeof work->head - 2) {
         snprintf(rs->error, sizeof rs->error, "request too large");
         ns_close(s);
         return -1;
     }
     if (rq->body || strcmp(method, "GET"))
-        hn += snprintf(head + hn, sizeof head - hn, "Content-Length: %zu\r\n", rq->body_len);
-    if (hn < 0 || hn >= (int)sizeof head - 2) {
+        hn += snprintf(head + hn, sizeof work->head - hn, "Content-Length: %zu\r\n", rq->body_len);
+    if (hn < 0 || hn >= (int)sizeof work->head - 2) {
         snprintf(rs->error, sizeof rs->error, "request too large");
         ns_close(s);
         return -1;
@@ -321,11 +330,11 @@ int http_request(const struct http_req *rq, struct http_resp *rs) {
         return -1;
     }
     r->s = s;
-    char line[HTTP_RESPONSE_HEADER_LINE_MAX];
+    char *line = work->line;
     int status = 0;
     /* status line, skipping any 100 Continue */
     do {
-        if (!rd_line(r, line, sizeof line) || r->line_invalid || r->line_truncated || sscanf(line, "HTTP/%*d.%*d %d", &status) != 1) {
+        if (!rd_line(r, line, sizeof work->line) || r->line_invalid || r->line_truncated || sscanf(line, "HTTP/%*d.%*d %d", &status) != 1) {
             snprintf(rs->error, sizeof rs->error, "no HTTP response (%s)", ns_error(s)[0] ? ns_error(s) : "connection closed");
             free(r);
             ns_close(s);
@@ -334,7 +343,7 @@ int http_request(const struct http_req *rq, struct http_resp *rs) {
         if (status == 100) {
             size_t interim_len = 0;
             for (;;) {
-                if (!rd_line(r, line, sizeof line) || r->line_invalid || r->line_truncated) {
+                if (!rd_line(r, line, sizeof work->line) || r->line_invalid || r->line_truncated) {
                     snprintf(rs->error, sizeof rs->error, "invalid interim response headers");
                     free(r); ns_close(s); return -1;
                 }
@@ -368,7 +377,7 @@ int http_request(const struct http_req *rq, struct http_resp *rs) {
     bool chunked = false, have_length = false, gzip = false, have_encoding = false;
     const char *header_error = NULL;
     for (;;) {
-        if (!rd_line(r, line, sizeof line)) { header_error = "incomplete response headers"; break; }
+        if (!rd_line(r, line, sizeof work->line)) { header_error = "incomplete response headers"; break; }
         if (r->line_invalid) { header_error = "invalid response header characters"; break; }
         if (!line[0]) break;
         if (r->line_truncated) { header_error = "response header exceeds 16 KiB"; break; }
@@ -427,7 +436,8 @@ int http_request(const struct http_req *rq, struct http_resp *rs) {
     struct http_req buffered = *rq;
     buffered.on_body = NULL;
     bool no_body = !strcmp(method, "HEAD") || status == 204 || status == 304;
-    struct sink k = {gzip ? &buffered : rq, rs, 0, false, gzip ? HTTP_GZIP_LIMIT : 0};
+    size_t decoded_limit = body_limit ? body_limit : HTTP_GZIP_LIMIT;
+    struct sink k = {gzip ? &buffered : rq, rs, 0, false, gzip ? decoded_limit : body_limit};
     bool body_ok;
     if (no_body) {
         body_ok = true;
@@ -435,16 +445,16 @@ int http_request(const struct http_req *rq, struct http_resp *rs) {
         body_ok = false;
         for (;;) {
             size_t n;
-            if (!rd_line(r, line, sizeof line) || r->line_truncated || r->line_invalid || !body_size(line, 16, &n, true)) break;
+            if (!rd_line(r, line, sizeof work->line) || r->line_truncated || r->line_invalid || !body_size(line, 16, &n, true)) break;
             if (n == 0) {
-                while (rd_line(r, line, sizeof line)) {
+                while (rd_line(r, line, sizeof work->line)) {
                     if (r->line_invalid || r->line_truncated) break;
                     if (!line[0]) { body_ok = true; break; }
                 }
                 break;
             }
             if (!copy_body(r, &k, n)) break;
-            if (!rd_line(r, line, sizeof line) || line[0] || r->line_truncated || r->line_invalid) break;
+            if (!rd_line(r, line, sizeof work->line) || line[0] || r->line_truncated || r->line_invalid) break;
         }
     } else if (have_length) {
         body_ok = copy_body(r, &k, length);
@@ -452,7 +462,7 @@ int http_request(const struct http_req *rq, struct http_resp *rs) {
         body_ok = copy_body(r, &k, (size_t)-1);
     }
     if (body_ok && gzip && !no_body) {
-        body_ok = gunzip_body(rs);
+        body_ok = gunzip_body(rs, decoded_limit);
         if (body_ok && rq->on_body) {
             char *body = rs->body;
             size_t len = rs->body_len;
@@ -480,6 +490,29 @@ int http_request(const struct http_req *rq, struct http_resp *rs) {
         rs->headers[0] = 0; rs->headers_len = 0;
     }
     return ret;
+}
+
+static int request_with_limit(const struct http_req *rq, struct http_resp *rs, size_t body_limit) {
+    struct http_scratch *work = malloc(sizeof *work);
+    if (!work) {
+        memset(rs, 0, sizeof *rs);
+        snprintf(rs->error, sizeof rs->error, "out of memory");
+        return -1;
+    }
+    int result = request_inner(rq, rs, work, body_limit);
+    free(work);
+    return result;
+}
+int http_request(const struct http_req *rq, struct http_resp *rs) {
+    return request_with_limit(rq, rs, 0);
+}
+int http_request_limited(const struct http_req *rq, struct http_resp *rs, size_t body_limit) {
+    if (!body_limit || body_limit > HTTP_RESPONSE_BODY_MAX) {
+        memset(rs, 0, sizeof *rs);
+        snprintf(rs->error, sizeof rs->error, "invalid finite response size limit");
+        return -1;
+    }
+    return request_with_limit(rq, rs, body_limit);
 }
 
 void http_resp_free(struct http_resp *resp) {

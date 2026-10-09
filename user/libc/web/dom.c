@@ -3,11 +3,14 @@
 #include <stdio.h>
 #include "nocturne.h"
 #include "webi.h"
+#include "frame.h"
 #include "web_dialog.h"
 #include "form_value.h"
 #include "form_file.h"
 #include "elements.h"
 #include "js_canvas.h"
+/* Internal lifetime query: implemented beside the wrapper cache. */
+bool web_js_nodes_same_forest(web_doc *document, node_t *node, node_t *parent);
 
 #define DOM_MAX_DEPTH 400
 
@@ -243,12 +246,23 @@ static void textarea_changed(node_t *n) {
 
 static void changed(web_doc *d, node_t *n, bool resources) {
     if (!d) return;
+    d->dom_revision++;
+    if (d->js_nodes_dirty) { d->js_nodes_dirty = false; web_js_nodes_changed(d); }
+    if (n) n->resource_revision++;
+    /* Detached forests are often prepared between geometry reads (jQuery,
+       consent banners, ads). They cannot change the live cascade.
+       Preserve DOM/reaction revisions; insertion/removal notifies the live
+       parent and invalidates the snapshot at the actual connection boundary. */
+    if (n && doc_node_root(n, true) != d->root) {
+        /* HTML images fetch even while disconnected. Keep that resource path
+           observable; ordinary detached forests need no live sheet rescan. */
+        if (resources && !n->foreign && n->tag == T_img) d->resources_dirty = d->dirty = true;
+        textarea_changed(n); return;
+    }
     d->dirty = d->need_style = true;
     if (resources) d->resources_dirty = true;
-    d->dom_revision++;
     d->find_node = NULL;
     d->find_run = NULL;
-    if (n) n->resource_revision++;
     web_dialog_sync(d);
     textarea_changed(n);
     /* SVG cache source and the box tree are snapshots, not a second DOM. */
@@ -261,11 +275,46 @@ static void changed(web_doc *d, node_t *n, bool resources) {
     d->svgs.n = 0;
 }
 void doc_mutated(web_doc *d, node_t *n) {
+    if (d && !n) d->js_nodes_dirty = true;
     changed(d, n, true);
     /* NULL denotes a parser's complete forest transaction. Ordinary control or
        CharacterData notifications cannot change assignment; structural/attribute
        mutations below identify the exact assignment-relevant boundary instead. */
     if (!n) doc_shadow_reassign(d);
+}
+
+/* Structural edits of ordinary text/elements change selectors and geometry,
+   not the authored sheet set. Preserve the scan for every node kind consumed
+   by doc.c scan(), image candidates, and document identity. In particular a
+   text edit inside style/title/control ancestors still needs that scan. */
+static bool resource_subtree(node_t *n, unsigned depth) {
+    if (!n || depth > DOM_MAX_DEPTH) return true;
+    if (n->type == N_ELEM && !n->foreign) {
+        switch (n->tag) {
+        case T_html: case T_head: case T_body: case T_frameset:
+        case T_base: case T_title: case T_meta: case T_link: case T_style:
+        case T_img: case T_input: case T_textarea: case T_select: case T_option:
+        case T_picture: case T_source:
+            return true;
+        default: break;
+        }
+        if (n->tag == T_template) return false; /* inert template content */
+    }
+    for (node_t *c = n->first; c; c = c->next)
+        if (resource_subtree(c, depth + 1)) return true;
+    return n->shadow_root && resource_subtree(n->shadow_root, depth + 1);
+}
+static bool resource_ancestor(node_t *n) {
+    for (; n; n = n->parent) if (!n->foreign && n->type == N_ELEM &&
+        (n->tag == T_style || n->tag == T_title || n->tag == T_textarea || n->tag == T_select)) return true;
+    return false;
+}
+static void structure_changed_lifetime(web_doc *d, node_t *parent, node_t *subtree, bool lifetime_changed) {
+    if (d && lifetime_changed) d->js_nodes_dirty = true;
+    changed(d, parent, resource_ancestor(parent) || resource_subtree(subtree, 0));
+}
+static void structure_changed(web_doc *d, node_t *parent, node_t *subtree) {
+    structure_changed_lifetime(d, parent, subtree, true);
 }
 
 /* XML 1.0 Name, required by the DOM PI creation APIs. HTML tokenization has
@@ -304,15 +353,38 @@ bool doc_pi_target_valid(const char *target, size_t len) {
     return true;
 }
 
+void doc_create_diagnostic(web_doc *d,unsigned stage,int type,size_t name_bytes,size_t data_bytes) {
+    static const char *const reasons[]={"validation", "DOM family quota", "Nocturne allocator",
+        "arena size overflow", "template contents", "native wrapper"};
+    if(!d || stage>=sizeof reasons/sizeof *reasons || (d->dom_create_reported&(1u<<stage)))return;
+    d->dom_create_reported|=(uint8_t)(1u<<stage);
+    // Controlled stage labels and byte counts only: no author key/name/value/URL.
+    char message[320];
+    snprintf(message,sizeof message,"DOM creation failure: %s; type=%d node_bytes=%zu name_bytes=%zu data_bytes=%zu; arena allocated=%zu limit=%zu; family remaining=%zu bytes",
+        reasons[stage],type,sizeof(node_t),name_bytes,data_bytes,d->mem.allocated,d->mem.limit,doc_dom_remaining(d));
+    web_doc *report=d->js?d:d->dom_family?d->dom_family:d;
+    while(report && !report->js && report->frame_parent)report=report->frame_parent;
+    web_js_console(report,2,message);
+}
+
 node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t len) {
-    if (!d || type < N_DOC || type > N_ATTR || len > (16u << 20)) return NULL;
-    if (type == N_ELEM && (!name || !*name || strlen(name) >= 64)) return NULL;
-    if (type == N_PI && (!name || !doc_pi_target_valid(name, strlen(name)))) return NULL;
+    if (!d) return NULL;
+    size_t name_bytes=name?strlen(name):0;
+    if(type<N_DOC || type>N_ATTR || len>(16u<<20) ||
+       (type==N_ELEM && (!name || !*name || name_bytes>=64)) ||
+       (type==N_PI && (!name || !doc_pi_target_valid(name,name_bytes)))) {
+        doc_create_diagnostic(d,DOC_CREATE_INVALID,type,name_bytes,len);return NULL;
+    }
     doc_dom_budget(d);
     jmp_buf trap;
     jmp_buf *old = d->mem.trap;
     d->mem.trap = &trap;
-    if (setjmp(trap)) { d->mem.trap = old; return NULL; }
+    int failure=setjmp(trap);
+    if(failure) {
+        d->mem.trap=old;
+        doc_create_diagnostic(d,failure==2?DOC_CREATE_QUOTA:failure==3?DOC_CREATE_ALLOCATOR:DOC_CREATE_OVERFLOW,type,name_bytes,len);
+        return NULL;
+    }
     node_t *n = ar_alloc(&d->mem, sizeof *n);
     n->type = (uint8_t)type;
     n->owner = n->allocation_doc = d;
@@ -375,10 +447,14 @@ void doc_attrs_publish(node_t *n, struct attr *attrs, int count) {
         node_t *identity = n->attrs[i].node;
         bool retained = false;
         for (int j = 0; j < count; j++) if (attrs[j].node == identity) { retained = true; break; }
-        if (!retained) identity->attr_owner = NULL;
+        if (!retained) {
+            identity->attr_owner = NULL;
+            if (n->owner) n->owner->js_nodes_dirty = true;
+        }
     }
     n->attrs = attrs; n->nattrs = count;
     for (int i = 0; i < count; i++) if (attrs[i].node) {
+        if (attrs[i].node->attr_owner != n && n->owner) n->owner->js_nodes_dirty = true;
         attrs[i].node->attribute = &attrs[i];
         attrs[i].node->attr_owner = n;
         attrs[i].node->owner = n->owner;
@@ -446,11 +522,18 @@ static bool attribute_change(web_doc *d, node_t *n, int found, const char *name,
     if (!ns && !n->foreign && n->tag == T_select && !strcmp(name, low) &&
         (!strcmp(low, "multiple") || !strcmp(low, "size"))) doc_control_init(d, n);
     if (found < 0 && !value) return true;
+    bool html_image = !n->foreign && n->tag == T_img;
+    bool image_candidate = !ns && !n->foreign && !strcmp(name, low) &&
+        ((html_image && (!strcmp(low, "src") || !strcmp(low, "srcset") || !strcmp(low, "sizes") ||
+          !strcmp(low, "data-src") || !strcmp(low, "data-lazy-src") || !strcmp(low, "data-original") ||
+          !strcmp(low, "data-srcset"))) ||
+         (n->tag == T_source && n->parent && !n->parent->foreign && n->parent->tag == T_picture &&
+          (!strcmp(low, "srcset") || !strcmp(low, "sizes") || !strcmp(low, "media") || !strcmp(low, "type"))));
     bool resources = n->tag == T_base || n->tag == T_link || n->tag == T_style ||
-                     n->tag == T_img || n->tag == T_input || n->tag == T_meta;
+                     (n->tag == T_img && !html_image) || n->tag == T_input || n->tag == T_meta;
     /* Keep JS attribute/CE reactions in native_dom, but an identical ordinary
        attribute has no new style to cascade and needs no arena allocation. */
-    if (!resources && !identity && found >= 0 && value && !strcmp(n->attrs[found].value, value)) {
+    if (!resources && !image_candidate && !identity && found >= 0 && value && !strcmp(n->attrs[found].value, value)) {
         /* Canvasの寸法設定は同値でもbitmap/contextをresetする。arena再割当は不要。 */
         if (!ns && !n->foreign && n->tag == T_canvas && !strcmp(name, low) &&
             (!strcmp(low, "width") || !strcmp(low, "height"))) {
@@ -494,6 +577,10 @@ static bool attribute_change(web_doc *d, node_t *n, int found, const char *name,
     n->nclasses = temp.nclasses;
     d->mem.trap = old;
     bool ordinary = !ns && !n->foreign && !strcmp(name, low);
+    if (ordinary && n->tag == T_link && (!strcmp(low,"href") || !strcmp(low,"rel") ||
+        !strcmp(low,"media") || !strcmp(low,"type") || !strcmp(low,"disabled"))) {
+        n->stylesheet_generation++; n->stylesheet_url = NULL; n->stylesheet_notified = false;
+    }
     if (input_type_change && previous_type != web_input_type(n)) {
         if (previous_type == WEB_INPUT_FILE) web_input_files_clear(d, n);
         enum web_input_mode before = web_input_value_mode(previous_type);
@@ -539,6 +626,15 @@ static bool attribute_change(web_doc *d, node_t *n, int found, const char *name,
        of authored sheets. Re-parsing every external CSS sheet here made geometry
        reads after classList updates needlessly rebuild all sheet snapshots. */
     changed(d, n, resources);
+    /* Candidate changes retain image requests (including detached images) but
+       cannot add/remove authored stylesheets. Attribute selectors and attr()
+       still invalidate the live cascade through changed() above. */
+    if (image_candidate) {
+        if (html_image) n->image_invalidated = true;
+        else for (node_t *child = n->parent->first; child; child = child->next)
+            if (!child->foreign && child->tag == T_img) child->image_invalidated = true;
+        d->images_dirty = d->dirty = true;
+    }
     if (!ns && ((!strcmp(name, "slot") && n->parent && n->parent->shadow_root && !n->parent->shadow_root->shadow_manual) ||
         (!strcmp(name, "name") && is_slot(n) && doc_node_root(n, false)->shadow_host && !doc_node_root(n, false)->shadow_manual)))
         doc_shadow_reassign(d);
@@ -595,9 +691,20 @@ bool doc_attr_value(web_doc *d, node_t *n, const char *value) {
     d->mem.trap = old; return true;
 }
 
+static void stylesheet_detach(node_t *n, unsigned depth) {
+    if (!n || depth > DOM_MAX_DEPTH) return;
+    if (n->stylesheet_url) {
+        n->stylesheet_generation++; n->stylesheet_url = NULL;
+        n->stylesheet_owner = NULL; n->stylesheet_notified = false;
+    }
+    if (!n->foreign && n->tag == T_template) return;
+    for (node_t *c = n->first; c; c = c->next) stylesheet_detach(c,depth+1);
+    if (n->shadow_root) stylesheet_detach(n->shadow_root,depth+1);
+}
 static void detach(node_t *n) {
     node_t *p = n->parent;
     if (!p) return;
+    stylesheet_detach(n,0);
     if (n->prev) n->prev->next = n->next; else p->first = n->next;
     if (n->next) n->next->prev = n->prev; else p->last = n->prev;
     n->parent = n->prev = n->next = NULL;
@@ -662,6 +769,7 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
         return true;
     }
     if (!may_insert(p, c)) return false;
+    bool same_lifetime_forest = web_js_nodes_same_forest(d, c, p);
     if (c->owner != d && !doc_node_adopt(d, c)) return false;
     node_t *old_parent = c->parent;
     node_t *old_select = node_ancestor(old_parent, T_select);
@@ -669,6 +777,7 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
     if (is_slot(old_parent) && !old_parent->slot_assigned_first && doc_node_root(old_parent, false)->shadow_host)
         doc_slot_signal(old_parent);
     if(old_parent)web_dialog_removed(d,c);
+    if(old_parent)web_frames_detach_tree(d,c);
     detach(c);
     c->parent = p;
     c->next = before;
@@ -678,7 +787,9 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
     indices(p);
     if (is_slot(p) && !p->slot_assigned_first && doc_node_root(p, false)->shadow_host)
         doc_slot_signal(p);
-    doc_mutated(d, p);
+    /* A move into a detached forest still removes content from the live tree. */
+    if (old_parent && old_parent != p) structure_changed_lifetime(d, old_parent, c, !same_lifetime_forest);
+    structure_changed_lifetime(d, p, c, !same_lifetime_forest);
     if (assignment_changed) doc_shadow_reassign(d);
     doc_details_inserted(c);
     node_t *new_select = node_ancestor(p, T_select);
@@ -696,8 +807,9 @@ void doc_node_remove(web_doc *d, node_t *n) {
     if (shadow_under(d->focus, n)) { d->focus = NULL; d->caret = 0; }
     if (is_slot(p) && !p->slot_assigned_first && doc_node_root(p, false)->shadow_host)
         doc_slot_signal(p);
+    web_frames_detach_tree(d,n);
     detach(n);
-    doc_mutated(d, p);
+    structure_changed(d, p, n);
     if (assignment_changed) doc_shadow_reassign(d);
     web_select_inserted(d, n, p);
     if (select) web_select_sync(select->owner, select, false);
@@ -752,6 +864,7 @@ bool doc_node_adopt(web_doc *d, node_t *n) {
     }
     if (n->parent) doc_node_remove(n->owner ? n->owner : d, n);
     adopt_subtree(d, n);
+    web_js_nodes_changed(d);
     doc_shadow_reassign(d);
     return true;
 }
@@ -803,7 +916,7 @@ bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
         while (n->first) doc_node_remove(d, n->first);
         if (t && !doc_node_move(d, n, t, NULL)) return false;
     }
-    doc_mutated(d, n);
+    changed(d, n, resource_ancestor(n));
     return true;
 }
 
@@ -860,6 +973,56 @@ bool doc_node_value(web_doc *d, node_t *n, const char *text, size_t len) {
     return true;
 }
 
+/* A clone has no escaped Attr wrappers or native control state yet. Build
+   ordinary attributes once rather than retaining 1+2+...+N arena arrays and
+   re-tokenizing class after every attribute. All strings belong to the clone's
+   allocation document; never retain source-owner pointers or Attr identities. */
+static bool clone_attributes(web_doc *d, node_t *copy, const node_t *source) {
+    if (!source->nattrs) return true;
+    if (source->nattrs < 0 || source->nattrs > 1024) return false;
+    if (!source->foreign) switch (source->tag) {
+    case T_input: case T_select: case T_option: case T_details:
+    case T_img: case T_source:
+        /* Keep native value/selection/toggle and detached-image side effects
+           on their existing, independently tested setter path. */
+        for (int i = 0; i < source->nattrs; i++) {
+            const struct attr *a = &source->attrs[i];
+            if (!doc_attr_set_ns(d, copy, a->namespace_uri, a->prefix,
+                    a->local ? a->local : a->raw, a->value)) return false;
+        }
+        return true;
+    default: break;
+    }
+    doc_dom_budget(d);
+    jmp_buf trap;
+    jmp_buf *old = d->mem.trap;
+    d->mem.trap = &trap;
+    if (setjmp(trap)) { d->mem.trap = old; return false; }
+    struct attr *attrs = ar_alloc(&d->mem, (size_t)source->nattrs * sizeof *attrs);
+    for (int i = 0; i < source->nattrs; i++) {
+        const struct attr *a = &source->attrs[i];
+        attrs[i] = (struct attr){
+            .name = ar_strdup(&d->mem, a->name),
+            .raw = ar_strdup(&d->mem, a->raw),
+            .value = ar_strdup(&d->mem, a->value),
+            .namespace_uri = a->namespace_uri ? ar_strdup(&d->mem, a->namespace_uri) : NULL,
+            .prefix = a->prefix ? ar_strdup(&d->mem, a->prefix) : NULL,
+            .local = a->local ? ar_strdup(&d->mem, a->local) : NULL,
+            .node = NULL
+        };
+    }
+    node_t ready = *copy;
+    ready.attrs = attrs;
+    ready.nattrs = source->nattrs;
+    attribute_cache(d, &ready);
+    doc_attrs_publish(copy, ready.attrs, ready.nattrs);
+    copy->id = ready.id;
+    copy->classes = ready.classes;
+    copy->nclasses = ready.nclasses;
+    d->mem.trap = old;
+    return true;
+}
+
 node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
     if (!d || !n || n->type == N_DOC || n->shadow_host) return NULL;
     if (n->type == N_ATTR) {
@@ -878,10 +1041,7 @@ node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
         c->system_id = ar_strdup(&d->mem, n->system_id ? n->system_id : "");
         d->mem.trap = old;
     }
-    for (int i = 0; i < n->nattrs; i++) {
-        struct attr *a = &n->attrs[i];
-        if (!doc_attr_set_ns(d, c, a->namespace_uri, a->prefix, a->local ? a->local : a->raw, a->value)) return NULL;
-    }
+    if (!clone_attributes(d, c, n)) return NULL;
     c->checked = n->checked;
     c->indeterminate = n->indeterminate;
     c->selected = n->selected;

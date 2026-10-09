@@ -398,21 +398,42 @@ static void cache_tests(void) {
           "native submission validates cache metadata before enqueueing");
 }
 static void concurrency_tests(void) {
-    struct result r[3] = {{0}};
+    static struct result r[3]; /* large bounded response storage is not stack scratch */
     uint64_t ids[3];
     for (int i = 0; i < 3; i++) ids[i] = request(&r[i], 0, "/api/slow?ms=800", WEBNET_FETCH, "GET", NULL, NULL, 0, 20);
     webnet_pump(net, uptime_ms());
-    check(ids[0] && ids[1] && ids[2] && children() == 2, "at most two workers for three queued requests");
+    check(ids[0] && ids[1] && ids[2] && children() == 3, "three Fetch workers leave one document dependency slot reserved");
     bool good = true; uint64_t until = uptime_ms() + 6000;
     while (webnet_busy(net) && uptime_ms() < until) {
         webnet_pump(net, uptime_ms());
-        if (children() > 2) good = false;
+        if (children() > 4) good = false;
         msleep(5);
     }
     for (int i = 0; i < 3; i++) good = good && success(&r[i]);
     check(good && !webnet_busy(net) && children() == 0, "queued requests complete and workers are reaped");
     webnet_cancel_generation(net, 20);
     for (int i = 0; i < 3; i++) release(&r[i]);
+
+    /* A real production worker regression: don't count Fetch as a document
+       load dependency, or let its long-poll channels occupy the reserved slot. */
+    for (int i = 0; i < 3; i++) ids[i] = request(&r[i], 0, "/api/slow?ms=5000", WEBNET_FETCH, "GET", NULL, NULL, 0, 23);
+    pump_for(100);
+    static struct result dependency;
+    uint64_t dependency_id = request(&dependency, 0, "/api/json", WEBNET_RESOURCE, "GET", NULL, NULL, 0, 24);
+    check(ids[0] && ids[1] && ids[2] && dependency_id && wait_result(&dependency, 2500) && success(&dependency) &&
+          !r[0].calls && !r[1].calls && !r[2].calls && children() <= 4,
+          "later document resource completes while three long-lived Fetch channels remain active");
+    webnet_cancel_generation(net, 23); webnet_cancel_generation(net, 24);
+    for (int i = 0; i < 3; i++) release(&r[i]);
+    release(&dependency);
+
+    for (int i = 0; i < 3; i++) ids[i] = request(&r[i], 0, "/api/slow?ms=800", WEBNET_RESOURCE, "GET", NULL, NULL, 0, 25);
+    dependency_id = request(&dependency, 0, "/api/json", WEBNET_FETCH, "GET", NULL, NULL, 0, 26);
+    check(dependency_id && wait_result(&dependency, 2500) && success(&dependency),
+          "Fetch still progresses alongside a finite batch of document resources");
+    webnet_cancel_generation(net, 25); webnet_cancel_generation(net, 26);
+    for (int i = 0; i < 3; i++) release(&r[i]);
+    release(&dependency);
 
     ids[0] = request(&r[0], 0, "/api/slow?ms=5000", WEBNET_FETCH, "GET", NULL, NULL, 0, 21);
     pump_for(100); webnet_cancel(net, ids[0]);
@@ -494,6 +515,28 @@ static void redirect_tests(void) {
     expect_request(0, "/api/infinite-redirect", WEBNET_FETCH, NULL, false, "redirect loop is bounded");
     expect_request(0, "/api/redirect?url=file%3A%2F%2F%2Fhome%2Fwebnet-outside.js", WEBNET_RESOURCE, NULL, false,
                    "HTTP redirect cannot cross into local files");
+}
+static void long_url_tests(void) {
+    static struct result r;
+    static char path[WEBNET_URL_MAX], initial[WEBNET_URL_MAX], encoded[WEBNET_URL_MAX], url[WEBNET_URL_MAX+1];
+    strcpy(path,"/api/json?pad=");size_t prefix=strlen(path);
+    memset(path+prefix,'x',6000);path[prefix+6000]=0;
+    uint64_t id=request(&r,0,path,WEBNET_RESOURCE,"GET",NULL,NULL,0,43);
+    snprintf(url,sizeof url,"http://10.0.2.2:%d%s",ports[0],path);
+    check(id&&wait_result(&r,40000)&&success(&r)&&!strcmp(r.url,url),
+          "6000-byte real worker URL survives request, HTTP path, response framing and final URL without truncation");
+    release(&r);
+    bool encoded_ok=encode_query(path,encoded,sizeof encoded);
+    if(encoded_ok)snprintf(initial,sizeof initial,"/api/redirect?url=%s",encoded);
+    id=encoded_ok?request(&r,0,initial,WEBNET_RESOURCE,"GET",NULL,NULL,0,43):0;
+    check(id&&wait_result(&r,40000)&&success(&r)&&!strcmp(r.url,url),
+          "6000-byte Location survives the production redirect resolver with the complete final URL");
+    release(&r);
+    strcpy(url,"http://10.0.2.2/");prefix=strlen(url);
+    memset(url+prefix,'x',WEBNET_URL_MAX-prefix);url[WEBNET_URL_MAX]=0;
+    struct webnet_request q={.kind=WEBNET_FETCH,.generation=43,.url=url,.origin=document,.method="GET",.credentials=WEBNET_CREDENTIALS_OMIT};
+    check(!webnet_submit(net,&q,completed,&r)&&!r.calls,"URL at the shared storage bound is rejected before creating a worker");
+    webnet_cancel_generation(net,43);
 }
 static void file_request(const char *url, const char *origin, enum webnet_kind kind, bool user, bool allow,
                          const char *what) {
@@ -763,7 +806,7 @@ int main(int argc, char **argv) {
     snprintf(document, sizeof document, "http://10.0.2.2:%d/index.html", ports[0]);
     net = webnet_create();
     if (!net) { puts("FAIL webnet allocation"); return 1; }
-    http_tests(); fetch_contract_tests(); cache_tests(); concurrency_tests(); cors_tests(); redirect_tests(); file_tests(); cookie_tests(); header_block_tests(); cors_boundary_regression_tests(); limit_tests();
+    http_tests(); fetch_contract_tests(); cache_tests(); concurrency_tests(); cors_tests(); redirect_tests(); long_url_tests(); file_tests(); cookie_tests(); header_block_tests(); cors_boundary_regression_tests(); limit_tests();
     webnet_free(net);
     printf("webnettest: %d failed\n", failed);
     return failed != 0;

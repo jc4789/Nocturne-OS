@@ -369,6 +369,10 @@ struct JSRuntime {
     void *host_promise_rejection_tracker_opaque;
 
     struct list_head job_list; /* list of JSJobEntry.link */
+#ifdef CONFIG_NOCTURNE
+    JSHostJobFilter *host_job_filter;
+    void *host_job_filter_opaque;
+#endif
 
     JSModuleNormalizeFunc *module_normalize_func;
     BOOL module_loader_has_attr;
@@ -957,6 +961,9 @@ typedef struct JSJobEntry {
     JSContext *realm;
     JSJobFunc *job_func;
     int argc;
+#ifdef CONFIG_NOCTURNE
+    BOOL propagation_only;
+#endif
     JSValue argv[0];
 } JSJobEntry;
 
@@ -1095,6 +1102,7 @@ struct JSObject {
 typedef struct JSMapRecord {
     int ref_count; /* used during enumeration to avoid freeing the record */
     BOOL empty : 8; /* TRUE if the record is deleted */
+    BOOL gc_activated : 8; /* weak value edge restored by this GC's fixed point */
     struct list_head link;
     struct JSMapRecord *hash_next;
     JSValue key;
@@ -1103,6 +1111,7 @@ typedef struct JSMapRecord {
 
 typedef struct JSMapState {
     BOOL is_weak; /* TRUE if WeakSet/WeakMap */
+    JSObject *object; /* non-owning; its finalizer unlinks weakref_header */
     struct list_head records; /* list of JSMapRecord.link */
     uint32_t record_count;
     JSMapRecord **hash_table;
@@ -1273,6 +1282,11 @@ static JSValue js_compile_regexp(JSContext *ctx, JSValueConst pattern,
                                  JSValueConst flags);
 static JSValue JS_NewRegexp(JSContext *ctx, JSValue pattern, JSValue bc);
 static void gc_decref(JSRuntime *rt);
+static void gc_decref_child(JSRuntime *rt, JSGCObjectHeader *p);
+static void gc_scan_incref_child(JSRuntime *rt, JSGCObjectHeader *p);
+static void gc_scan_incref_child2(JSRuntime *rt, JSGCObjectHeader *p);
+static BOOL gc_scan_ephemerons(JSRuntime *rt);
+static void gc_prune_ephemerons(JSRuntime *rt);
 static int JS_NewClass1(JSRuntime *rt, JSClassID class_id,
                         const JSClassDef *class_def, JSAtom name);
 
@@ -2287,8 +2301,9 @@ int JS_GetStripInfo(JSRuntime *rt)
     return rt->strip_flags;
 }
 
-static int JS_EnqueueJob2(JSContext *ctx, JSJobFunc *job_func,
-                          int argc, JSValueConst *argv, BOOL no_exception)
+static int JS_EnqueueJob3(JSContext *ctx, JSJobFunc *job_func,
+                          int argc, JSValueConst *argv, BOOL no_exception,
+                          BOOL propagation_only)
 {
     JSRuntime *rt = ctx->rt;
     JSJobEntry *e;
@@ -2303,11 +2318,20 @@ static int JS_EnqueueJob2(JSContext *ctx, JSJobFunc *job_func,
     e->realm = JS_DupContext(ctx);
     e->job_func = job_func;
     e->argc = argc;
+#ifdef CONFIG_NOCTURNE
+    e->propagation_only = propagation_only;
+#endif
     for(i = 0; i < argc; i++) {
         e->argv[i] = JS_DupValue(ctx, argv[i]);
     }
     list_add_tail(&e->link, &rt->job_list);
     return 0;
+}
+
+static int JS_EnqueueJob2(JSContext *ctx, JSJobFunc *job_func,
+                          int argc, JSValueConst *argv, BOOL no_exception)
+{
+    return JS_EnqueueJob3(ctx, job_func, argc, argv, no_exception, FALSE);
 }
 
 /* return 0 if OK, < 0 if exception */
@@ -2316,6 +2340,37 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
 {
     return JS_EnqueueJob2(ctx, job_func, argc, argv, FALSE);
 }
+
+#ifdef CONFIG_NOCTURNE
+static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj);
+static JSContext *JS_GetJobCallbackRealm(JSContext *ctx, JSValueConst callback,
+                                         BOOL *propagation_only);
+
+void JS_SetHostJobFilter(JSRuntime *rt, JSHostJobFilter *filter, void *opaque)
+{
+    rt->host_job_filter = filter;
+    rt->host_job_filter_opaque = opaque;
+}
+
+int JS_EnqueueJobForCallback(JSContext *ctx, JSValueConst callback,
+                             JSJobFunc *job_func, int argc, JSValueConst *argv)
+{
+    JSContext *realm;
+    BOOL propagation_only;
+    if (!ctx->rt->host_job_filter)
+        return JS_EnqueueJob(ctx, job_func, argc, argv);
+    realm = JS_GetJobCallbackRealm(ctx, callback, &propagation_only);
+    if (!realm) {
+        /* A revoked callable Proxy fails when the job invokes it, not while
+           scheduling. Keep that asynchronous failure in the original realm. */
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        realm = ctx;
+    }
+    /* Internal Promise result plumbing must not strand a live continuation. */
+    return JS_EnqueueJob3(realm, job_func, argc, argv, FALSE,
+                          propagation_only);
+}
+#endif
 
 BOOL JS_IsJobPending(JSRuntime *rt)
 {
@@ -2344,6 +2399,12 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     e = list_entry(rt->job_list.next, JSJobEntry, link);
     list_del(&e->link);
     ctx = e->realm;
+#ifdef CONFIG_NOCTURNE
+    if (!e->propagation_only && rt->host_job_filter &&
+        !rt->host_job_filter(ctx, rt->host_job_filter_opaque))
+        res = JS_UNDEFINED;
+    else
+#endif
     res = e->job_func(ctx, e->argc, (JSValueConst *)e->argv);
     for(i = 0; i < e->argc; i++)
         JS_FreeValue(ctx, e->argv[i]);
@@ -6605,6 +6666,21 @@ static void remove_gc_object(JSGCObjectHeader *h)
     list_del(&h->link);
 }
 
+/* Symbols are ref-counted leaves, not gc_obj_list entries. Trial-deletion
+   accounting is nevertheless required when they are ephemeron keys captured
+   by a value (including a Symbol property name stored in a shape). */
+static void gc_mark_symbol(JSString *p, JS_MarkFunc *mark_func)
+{
+    if (p->atom_type != JS_ATOM_TYPE_SYMBOL || p->hash == JS_ATOM_HASH_PRIVATE)
+        return;
+    if (mark_func == gc_decref_child) {
+        assert(js_rc(p)->ref_count > 0);
+        js_rc(p)->ref_count--;
+    } else if (mark_func == gc_scan_incref_child || mark_func == gc_scan_incref_child2) {
+        js_rc(p)->ref_count++;
+    }
+}
+
 void JS_MarkValue(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
 {
     if (JS_VALUE_HAS_REF_COUNT(val)) {
@@ -6613,6 +6689,9 @@ void JS_MarkValue(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
         case JS_TAG_FUNCTION_BYTECODE:
         case JS_TAG_MODULE:
             mark_func(rt, JS_VALUE_GET_PTR(val));
+            break;
+        case JS_TAG_SYMBOL:
+            gc_mark_symbol(JS_VALUE_GET_STRING(val), mark_func);
             break;
         default:
             break;
@@ -6717,6 +6796,14 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
     case JS_GC_OBJ_TYPE_SHAPE:
         {
             JSShape *sh = (JSShape *)gp;
+            JSShapeProperty *props = get_shape_prop(sh);
+            for (int i = 0; i < sh->prop_count; i++) {
+                JSAtom atom = props[i].atom;
+                /* Const atoms (including well-known Symbol names) are not
+                   refcounted by JS_DupAtom/FreeAtom and are runtime roots. */
+                if (!__JS_AtomIsConst(atom))
+                    gc_mark_symbol(rt->atom_array[atom], mark_func);
+            }
             if (sh->proto != NULL) {
                 mark_func(rt, &sh->proto->header);
             }
@@ -6794,11 +6881,21 @@ static void gc_scan(JSRuntime *rt)
     JSGCObjectHeader *p;
 
     /* keep the objects with a refcount > 0 and their children. */
-    list_for_each(el, &rt->gc_obj_list) {
-        p = list_entry(el, JSGCObjectHeader, link);
-        assert(js_rc(p)->ref_count > 0);
-        js_rc(p)->mark = 0; /* reset the mark for the next GC call */
-        mark_children(rt, p, gc_scan_incref_child);
+    el = rt->gc_obj_list.next;
+    for (;;) {
+        for (; el != &rt->gc_obj_list; el = el->next) {
+            p = list_entry(el, JSGCObjectHeader, link);
+            assert(js_rc(p)->ref_count > 0);
+            js_rc(p)->mark = 0;
+            mark_children(rt, p, gc_scan_incref_child);
+        }
+        /* A value may reach another key/map, so interleave ordinary scanning
+           and ephemeron activation until no new conditional edge remains.
+           Existing objects must not be scanned (and incref'd) twice. */
+        el = rt->gc_obj_list.prev;
+        if (!gc_scan_ephemerons(rt))
+            break;
+        el = el->next;
     }
 
     /* restore the refcount of the objects to be deleted. */
@@ -6806,6 +6903,7 @@ static void gc_scan(JSRuntime *rt)
         p = list_entry(el, JSGCObjectHeader, link);
         mark_children(rt, p, gc_scan_incref_child2);
     }
+    gc_prune_ephemerons(rt);
 }
 
 static void gc_free_cycles(JSRuntime *rt)
@@ -20960,6 +21058,9 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
     JSObject *p;
     JSContext *realm;
 
+    /* Bound functions and callable Proxies can form arbitrarily deep chains.
+       Resolve their realm without unguarded native C recursion. */
+    for (;;) {
     if (JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)
         return ctx;
     p = JS_VALUE_GET_OBJ(func_obj);
@@ -20986,14 +21087,16 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
                 JS_ThrowTypeErrorRevokedProxy(ctx);
                 return NULL;
             } else {
-                realm = JS_GetFunctionRealm(ctx, s->target);
+                func_obj = s->target;
+                continue;
             }
         }
         break;
     case JS_CLASS_BOUND_FUNCTION:
         {
             JSBoundFunction *bf = p->u.bound_function;
-            realm = JS_GetFunctionRealm(ctx, bf->func_obj);
+            func_obj = bf->func_obj;
+            continue;
         }
         break;
     default:
@@ -21001,6 +21104,7 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
         break;
     }
     return realm;
+    }
 }
 
 static JSValue js_create_from_ctor(JSContext *ctx, JSValueConst ctor,
@@ -52209,6 +52313,7 @@ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
         goto fail;
     init_list_head(&s->records);
     s->is_weak = is_weak;
+    s->object = JS_VALUE_GET_OBJ(obj);
     if (is_weak) {
         s->weakref_header.weakref_type = JS_WEAKREF_TYPE_MAP;
         list_add_tail(&s->weakref_header.link, &ctx->rt->weakref_list);
@@ -52522,35 +52627,25 @@ static void map_decref_record(JSRuntime *rt, JSMapRecord *mr)
     }
 }
 
+static void map_remove_weak_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
+{
+    JSMapRecord **pmr = &s->hash_table[map_hash_key(mr->key, s->hash_bits)];
+    while (*pmr && *pmr != mr)
+        pmr = &(*pmr)->hash_next;
+    if (*pmr)
+        *pmr = mr->hash_next;
+    map_delete_record_internal(rt, s, mr);
+}
+
 static void map_delete_weakrefs(JSRuntime *rt, JSWeakRefHeader *wh)
 {
     JSMapState *s = container_of(wh, JSMapState, weakref_header);
     struct list_head *el, *el1;
-    JSMapRecord *mr1, **pmr;
-    uint32_t h;
 
     list_for_each_safe(el, el1, &s->records) {
         JSMapRecord *mr = list_entry(el, JSMapRecord, link);
-        if (!js_weakref_is_live(mr->key)) {
-
-            /* even if key is not live it can be hashed as a pointer */
-            h = map_hash_key(mr->key, s->hash_bits);
-            pmr = &s->hash_table[h];
-            for(;;) {
-                mr1 = *pmr;
-                /* the entry may already be removed from the hash
-                   table if the map was resized */
-                if (mr1 == NULL)
-                    goto done; 
-                if (mr1 == mr)
-                    break;
-                pmr = &mr1->hash_next;
-            }
-            /* remove from the hash table */
-            *pmr = mr1->hash_next;
-        done:
-            map_delete_record_internal(rt, s, mr);
-        }
+        if (!js_weakref_is_live(mr->key))
+            map_remove_weak_record(rt, s, mr);
     }
 }
 
@@ -52924,11 +53019,72 @@ static void js_map_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
     if (s) {
         list_for_each(el, &s->records) {
             mr = list_entry(el, JSMapRecord, link);
-            if (!s->is_weak)
+            if (!s->is_weak) {
                 JS_MarkValue(rt, mr->key, mark_func);
+            } else {
+                if (mark_func == gc_decref_child)
+                    mr->gc_activated = FALSE;
+                if (mark_func == gc_scan_incref_child)
+                    continue; /* conditional edges are scanned by fixed point */
+            }
             JS_MarkValue(rt, mr->value, mark_func);
         }
     }
+}
+
+static BOOL gc_scan_ephemerons(JSRuntime *rt)
+{
+    struct list_head *el, *record;
+    BOOL changed = FALSE;
+    list_for_each(el, &rt->weakref_list) {
+        JSWeakRefHeader *wh = list_entry(el, JSWeakRefHeader, link);
+        if (wh->weakref_type != JS_WEAKREF_TYPE_MAP)
+            continue;
+        JSMapState *s = container_of(wh, JSMapState, weakref_header);
+        if (js_rc(s->object)->mark != 0)
+            continue; /* an unreachable map cannot activate its values */
+        list_for_each(record, &s->records) {
+            JSMapRecord *mr = list_entry(record, JSMapRecord, link);
+            if (mr->empty || mr->gc_activated)
+                continue;
+            BOOL live = JS_IsObject(mr->key) ?
+                !JS_VALUE_GET_OBJ(mr->key)->free_mark &&
+                    js_rc(JS_VALUE_GET_OBJ(mr->key))->mark == 0 :
+                js_rc(JS_VALUE_GET_STRING(mr->key))->ref_count > 0;
+            if (!live)
+                continue;
+            mr->gc_activated = TRUE;
+            JS_MarkValue(rt, mr->value, gc_scan_incref_child);
+            changed = TRUE;
+        }
+    }
+    return changed;
+}
+
+static void gc_prune_ephemerons(JSRuntime *rt)
+{
+    struct list_head *el, *record, *next;
+    /* Refcounts of the white graph have been restored. Restore each inactive
+       reachable-map value edge immediately before removing it. Suppress
+       zero-ref finalization until gc_free_cycles, so this walk neither
+       changes weakref_list nor runs author/finalizer callbacks. */
+    rt->gc_phase = JS_GC_PHASE_REMOVE_CYCLES;
+    list_for_each(el, &rt->weakref_list) {
+        JSWeakRefHeader *wh = list_entry(el, JSWeakRefHeader, link);
+        if (wh->weakref_type != JS_WEAKREF_TYPE_MAP)
+            continue;
+        JSMapState *s = container_of(wh, JSMapState, weakref_header);
+        if (js_rc(s->object)->mark != 0)
+            continue;
+        list_for_each_safe(record, next, &s->records) {
+            JSMapRecord *mr = list_entry(record, JSMapRecord, link);
+            if (mr->empty || mr->gc_activated)
+                continue;
+            JS_MarkValue(rt, mr->value, gc_scan_incref_child2);
+            map_remove_weak_record(rt, s, mr);
+        }
+    }
+    rt->gc_phase = JS_GC_PHASE_NONE;
 }
 
 /* Map Iterator */
@@ -53889,7 +54045,11 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
         args[2] = rd->handler;
         args[3] = JS_NewBool(ctx, is_reject);
         args[4] = value;
+#ifdef CONFIG_NOCTURNE
+        JS_EnqueueJobForCallback(ctx, rd->handler, promise_reaction_job, 5, args);
+#else
         JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+#endif
         list_del(&rd->link);
         promise_reaction_data_free(ctx->rt, rd);
     }
@@ -54049,7 +54209,11 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
         args[0] = s->promise;
         args[1] = resolution;
         args[2] = then;
+#ifdef CONFIG_NOCTURNE
+        JS_EnqueueJobForCallback(ctx, then, js_promise_resolve_thenable_job, 3, args);
+#else
         JS_EnqueueJob(ctx, js_promise_resolve_thenable_job, 3, args);
+#endif
         JS_FreeValue(ctx, then);
     }
     return JS_UNDEFINED;
@@ -54653,7 +54817,11 @@ static __exception int perform_promise_then(JSContext *ctx,
         args[2] = rd->handler;
         args[3] = JS_NewBool(ctx, i);
         args[4] = s->promise_result;
+#ifdef CONFIG_NOCTURNE
+        JS_EnqueueJobForCallback(ctx, rd->handler, promise_reaction_job, 5, args);
+#else
         JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+#endif
         for(i = 0; i < 2; i++)
             promise_reaction_data_free(ctx->rt, rd_array[i]);
     }
@@ -54778,6 +54946,68 @@ static JSValue js_promise_finally(JSContext *ctx, JSValueConst this_val,
     JS_FreeValue(ctx, then_funcs[1]);
     return ret;
 }
+
+#ifdef CONFIG_NOCTURNE
+static JSContext *JS_GetJobCallbackRealm(JSContext *ctx, JSValueConst callback,
+                                         BOOL *propagation_only)
+{
+    JSContext *realm;
+    JSObject *p;
+    *propagation_only = JS_IsUndefined(callback);
+    realm = JS_GetFunctionRealm(ctx, callback);
+    if (!realm)
+        return NULL;
+    /* The public function-realm operation intentionally falls back to ctx for
+       engine continuations. Their saved callback/state gives the actual user
+       realm, while pure Promise result plumbing must remain runnable. */
+    while (JS_IsObject(callback)) {
+        p = JS_VALUE_GET_OBJ(callback);
+        if (p->class_id == JS_CLASS_BOUND_FUNCTION) {
+            callback = p->u.bound_function->func_obj;
+            continue;
+        }
+        if (p->class_id == JS_CLASS_PROXY && p->u.proxy_data) {
+            callback = p->u.proxy_data->target;
+            continue;
+        }
+        if (p->class_id == JS_CLASS_ASYNC_FUNCTION_RESOLVE ||
+            p->class_id == JS_CLASS_ASYNC_FUNCTION_REJECT) {
+            JSAsyncFunctionState *s = p->u.async_function_data;
+            return s ? JS_GetFunctionRealm(ctx, s->frame.cur_func) : realm;
+        }
+        if (p->class_id == JS_CLASS_C_FUNCTION &&
+            p->u.cfunc.cproto == JS_CFUNC_generic &&
+            p->u.cfunc.c_function.generic == js_promise_then) {
+            /* Cross-realm native Promise adoption invokes its built-in then.
+               This is result plumbing, unlike an author-defined thenable. */
+            *propagation_only = TRUE;
+        } else if (p->class_id == JS_CLASS_PROMISE_RESOLVE_FUNCTION ||
+            p->class_id == JS_CLASS_PROMISE_REJECT_FUNCTION) {
+            *propagation_only = TRUE;
+        } else if (p->class_id == JS_CLASS_C_FUNCTION_DATA) {
+            JSCFunctionDataRecord *d = p->u.opaque;
+            if (d->func == js_promise_all_resolve_element ||
+                d->func == js_promise_finally_value_thunk ||
+                d->func == js_promise_finally_thrower) {
+                *propagation_only = TRUE;
+            } else if (d->func == js_promise_then_finally_func) {
+                return JS_GetFunctionRealm(ctx, d->data[1]);
+            } else if (d->func == js_async_generator_resolve_function) {
+                JSAsyncGeneratorData *s = JS_GetOpaque(d->data[0], JS_CLASS_ASYNC_GENERATOR);
+                if (s && s->func_state)
+                    return JS_GetFunctionRealm(ctx, s->func_state->frame.cur_func);
+                *propagation_only = TRUE;
+            } else if (d->func == js_async_module_execution_fulfilled ||
+                       d->func == js_async_module_execution_rejected) {
+                JSModuleDef *m = JS_VALUE_GET_PTR(d->data[0]);
+                return JS_GetFunctionRealm(ctx, m->func_obj);
+            }
+        }
+        break;
+    }
+    return realm;
+}
+#endif
 
 static const JSCFunctionListEntry js_promise_funcs[] = {
     JS_CFUNC_MAGIC_DEF("resolve", 1, js_promise_resolve, 0 ),
@@ -61587,6 +61817,39 @@ typedef struct JSWeakRefData {
     JSWeakRefHeader weakref_header;
     JSValue target;
 } JSWeakRefData;
+
+JSWeakRef *JS_NewWeakRef(JSContext *ctx, JSValueConst target)
+{
+    JSWeakRefData *ref;
+    if (!js_weakref_is_target(target)) {
+        JS_ThrowTypeError(ctx, "invalid weak target");
+        return NULL;
+    }
+    ref = js_mallocz(ctx, sizeof(*ref));
+    if (!ref)
+        return NULL;
+    ref->target = js_weakref_new(ctx, target);
+    ref->weakref_header.weakref_type = JS_WEAKREF_TYPE_WEAKREF;
+    list_add_tail(&ref->weakref_header.link, &ctx->rt->weakref_list);
+    return ref;
+}
+
+JSValue JS_GetWeakRefValue(JSContext *ctx, const JSWeakRef *ref)
+{
+    if (!ref || !js_weakref_is_live(ref->target) ||
+        (JS_IsObject(ref->target) && !JS_IsLiveObject(ctx->rt, ref->target)))
+        return JS_UNDEFINED;
+    return JS_DupValue(ctx, ref->target);
+}
+
+void JS_FreeWeakRef(JSRuntime *rt, JSWeakRef *ref)
+{
+    if (!ref)
+        return;
+    list_del(&ref->weakref_header.link);
+    js_weakref_free(rt, ref->target);
+    js_free_rt(rt, ref);
+}
 
 static void js_weakref_finalizer(JSRuntime *rt, JSValue val)
 {

@@ -1,8 +1,8 @@
     /* Independent native HTML documents. No second JS DOM and no active loader. */
     const documentBridge = (() => {
         const parserBrands=new WeakSet(), implementations=new WeakMap(), implementationBrands=new WeakMap();
-        const formCollections=new WeakMap(), weakGet=WeakMap.prototype.get, weakSet=WeakMap.prototype.set;
-        const filter=Array.prototype.filter;
+        const formCollections=new WeakMap(), treeCollections=new WeakMap(), weakGet=WeakMap.prototype.get, weakSet=WeakMap.prototype.set;
+        const filter=Array.prototype.filter, createObject=Object.create;
         const nodeTypeGetter=Object.getOwnPropertyDescriptor(Node.prototype,'nodeType').get;
         const StringImpl=String;
         function string(value){if(typeof value==='symbol')throw new TypeError('Cannot convert Symbol to DOMString');return StringImpl(value);}
@@ -51,6 +51,23 @@
         for(const key of ['charset','inputEncoding'])Object.defineProperty(Document.prototype,key,{configurable:true,get(){brand(this);return dom('get',this,'characterSet');}});
         for(const key of ['defaultView','location','currentScript'])Object.defineProperty(Document.prototype,key,{configurable:true,get(){brand(this);return this!==document?null:key==='defaultView'?globalThis:key==='location'?location:host.current();}});
         Object.defineProperty(Document.prototype,'readyState',{configurable:true,get(){brand(this);return this===document?host.ready():'complete';}});
+        function treeCollection(owner,key,query){
+            let cache=apply(weakGet,treeCollections,[owner]);
+            if(!cache){cache=createObject(null);apply(weakSet,treeCollections,[owner,cache]);}
+            if(!cache[key])cache[key]=collectionBridge.domHTML(owner,()=>apply(filter,dom('query',owner,query,false),[
+                node=>rawDom('get',node,'namespaceURI')==='http://www.w3.org/1999/xhtml'
+            ]));
+            return cache[key];
+        }
+        // Native document-tree queries exclude shadow roots, frame documents,
+        // inert template contents and non-HTML namespace lookalikes.
+        for(const [key,query] of [['links','a[href],area[href]'],['images','img'],['scripts','script'],
+            ['embeds','embed'],['anchors','a[name]']])Object.defineProperty(Document.prototype,key,{
+            configurable:true,enumerable:true,get(){brand(this);return treeCollection(this,key,query);}
+        });
+        Object.defineProperty(Document.prototype,'plugins',{
+            configurable:true,enumerable:true,get(){brand(this);return treeCollection(this,'embeds','embed');}
+        });
         // [SameObject] live native-tree collection. Hidden forms participate,
         // but SVG lookalikes, shadow roots and inert template contents do not.
         Object.defineProperty(Document.prototype,'forms',{configurable:true,enumerable:true,get(){
@@ -69,7 +86,7 @@
             brand(this);if(arguments.length<2)throw new TypeError('Two coordinates required');
             return rawDom('elementFromPoint',this,x,y);
         };
-        Document.prototype.getElementsByName=function(name){brand(this);if(!arguments.length)throw new TypeError('Missing name');const query='[name="'+CSS.escape(string(name))+'"]';return collectionBridge.live(()=>dom('query',this,query,false));};
+        Document.prototype.getElementsByName=function(name){brand(this);if(!arguments.length)throw new TypeError('Missing name');const query='[name="'+CSS.escape(string(name))+'"]';return collectionBridge.domLive(this,()=>dom('query',this,query,false));};
         function create(receiver,name,options,foreign){
             brand(receiver);name=string(name);
             if(receiver===document && !foreign)return customElementsBridge.create(name,options);

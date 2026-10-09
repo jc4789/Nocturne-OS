@@ -24,9 +24,26 @@ _Static_assert(sizeof(struct nmedia_worker_response)==328,"native media response
 typedef struct nmedia_worker nmedia_worker;
 nmedia_worker *nmedia_worker_open(const char *url,const char *native_document,
                                   uint32_t generation,char *error,size_t size);
+/* A queued HTML element must not allocate another child/reservation. */
+bool nmedia_worker_available(void);
 void nmedia_worker_background(uint64_t now_ms);
 int64_t nmedia_worker_deadline(uint64_t now_ms);
 void nmedia_worker_pump(nmedia_worker *,uint64_t now_ms);
+/* One caller-owned burst budget, shared by every STEP/collect in that burst.
+ * Cooperative callers use allow_spawn=false: no process/URL open is started. */
+struct nmedia_worker_budget {
+    uint64_t until;
+    size_t tx_bytes,rx_bytes;
+    unsigned handoffs;
+};
+void nmedia_worker_pump_budget(nmedia_worker *,uint64_t now_ms,
+                              struct nmedia_worker_budget *,bool allow_spawn);
+/* One nonblocking reap of an already-dispatched response; no send/yield/spawn. */
+void nmedia_worker_collect(nmedia_worker *,struct nmedia_worker_budget *);
+bool nmedia_worker_running(const nmedia_worker *);
+bool nmedia_worker_pending(const nmedia_worker *);
+/* Only after consuming/copying the last borrowed AUDIO/VIDEO span. */
+void nmedia_worker_prefetch(nmedia_worker *,struct nmedia_worker_budget *);
 const struct nmedia_info *nmedia_worker_info(nmedia_worker *);
 const char *nmedia_worker_error(nmedia_worker *);
 bool nmedia_worker_loading(nmedia_worker *);

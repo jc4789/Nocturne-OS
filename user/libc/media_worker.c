@@ -21,6 +21,11 @@ struct nmedia_worker {
     char error[160];
 };
 static nmedia_worker *owner,*retired;
+bool nmedia_worker_available(void) {
+    struct nmedia_alloc_stats a;
+    nmedia_alloc_snapshot(&a);
+    return !owner&&!retired&&!a.reserved;
+}
 static void pipes_close(nmedia_worker *w) {
     if(w->in>=0)close(w->in);if(w->out>=0)close(w->out);w->in=w->out=-1;
 }
@@ -109,31 +114,45 @@ static void completed(nmedia_worker *w) {
     else if(r->operation==NMW_STEP&&!w->want_seek){w->output_ready=true;if(r->kind==NMEDIA_VIDEO){w->info.width=r->width;w->info.height=r->height;}}
     if(w->want_seek){w->want_seek=false;queue(w,NMW_SEEK,w->seek_ms);}
 }
-void nmedia_worker_pump(nmedia_worker *w,uint64_t now) {
+static void pump_io(nmedia_worker *w,uint64_t now,struct nmedia_worker_budget *b,bool dispatch,bool allow_spawn) {
     nmedia_worker_background(now);
-    if(!w||w->stopping||!w->waiting)return;
+    if(!w||!b||w->stopping||!w->waiting)return;
     if(now>=w->deadline){stop(w,"native media worker request deadline exceeded");return;}
-    if(!w->pid) {if(retired)return;if(!spawn_child(w))return;}
-    struct n_pollfd p[2]={{w->in,N_POLLOUT,0},{w->out,N_POLLIN,0}};
+    if(dispatch&&uptime_ms()>=b->until)return;
+    if(!w->pid) {if(!dispatch||!allow_spawn||retired)return;if(!spawn_child(w))return;}
+    if(!dispatch&&w->tx_pos<w->tx_len)return;
+    struct n_pollfd p[2]={{w->in,dispatch?N_POLLOUT:0,0},{w->out,N_POLLIN,0}};
     if(poll(p,2,0)<0){stop(w,"native media worker poll failed");return;}
-    size_t budget=65536;
-    while(w->tx_pos<w->tx_len&&budget&&(p[0].revents&N_POLLOUT)) {
-        size_t take=MIN(w->tx_len-w->tx_pos,budget);ssize_t n=write(w->in,w->tx+w->tx_pos,take);
+    while(dispatch&&w->tx_pos<w->tx_len&&b->tx_bytes&&(p[0].revents&N_POLLOUT)) {
+        size_t take=MIN(w->tx_len-w->tx_pos,b->tx_bytes);ssize_t n=write(w->in,w->tx+w->tx_pos,take);
         if(n<0&&(errno==EAGAIN||errno==EINTR))break;
         if(n<=0){stop(w,"native media worker command pipe failed");return;}
-        w->tx_pos+=(size_t)n;budget-=(size_t)n;
+        w->tx_pos+=(size_t)n;b->tx_bytes-=(size_t)n;
     }
-    budget=262144;
-    while(w->waiting&&budget&&(p[1].revents&(N_POLLIN|N_POLLHUP))) {
+    /* Initial revents predate STEP dispatch. Collect a fast peer's response
+     * now instead of inserting an entire author-JS/browser pass. */
+    if(dispatch&&w->tx_pos==w->tx_len&&!(p[1].revents&(N_POLLIN|N_POLLHUP))){
+        if(poll(&p[1],1,0)<0){stop(w,"native media worker response poll failed");return;}
+    }
+    /* A video frame used to drain at most one 16 KiB pipe window per 10 ms
+     * GUI tick. Wake the blocked writer cooperatively instead of multiplying
+     * that timer delay by every window. Never wait for network/decode: only
+     * yield after receiving payload, bounded by bytes, time and handoffs. */
+    while(w->waiting&&b->rx_bytes&&(p[1].revents&(N_POLLIN|N_POLLHUP))) {
         bool head=w->head_pos<sizeof w->response;
         size_t take=head?sizeof w->response-w->head_pos:w->response.payload_bytes-w->rx_pos;
         if(!take){completed(w);break;}
-        take=MIN(take,budget);
+        take=MIN(take,b->rx_bytes);
         void *dest=head?(unsigned char *)&w->response+w->head_pos:w->payload+w->rx_pos;
         ssize_t n=read(w->out,dest,take);
+        if(n<0&&errno==EAGAIN&&dispatch&&w->rx_pos&&b->rx_bytes&&b->handoffs<16&&uptime_ms()<b->until) {
+            b->handoffs++;yield();
+            if(uptime_ms()>=b->until)break;
+            continue;
+        }
         if(n<0&&(errno==EAGAIN||errno==EINTR))break;
         if(n<=0){stop(w,"native media worker response ended early");return;}
-        budget-=(size_t)n;
+        b->rx_bytes-=(size_t)n;
         if(head) {
             w->head_pos+=(size_t)n;
             if(w->head_pos==sizeof w->response) {
@@ -150,6 +169,21 @@ void nmedia_worker_pump(nmedia_worker *w,uint64_t now) {
         } else w->rx_pos+=(size_t)n;
         if(w->head_pos==sizeof w->response&&w->rx_pos==w->response.payload_bytes){completed(w);break;}
     }
+}
+void nmedia_worker_pump_budget(nmedia_worker *w,uint64_t now,struct nmedia_worker_budget *b,bool allow_spawn){pump_io(w,now,b,true,allow_spawn);}
+void nmedia_worker_collect(nmedia_worker *w,struct nmedia_worker_budget *b){pump_io(w,uptime_ms(),b,false,false);}
+void nmedia_worker_pump(nmedia_worker *w,uint64_t now){
+    struct nmedia_worker_budget b={.until=uptime_ms()+2,.tx_bytes=65536,.rx_bytes=262144};
+    nmedia_worker_pump_budget(w,now,&b,true);
+}
+bool nmedia_worker_running(const nmedia_worker *w){return w&&w->pid>0&&!w->stopping;}
+bool nmedia_worker_pending(const nmedia_worker *w){return w&&w->waiting&&!w->stopping;}
+void nmedia_worker_prefetch(nmedia_worker *w,struct nmedia_worker_budget *b){
+    if(!w||!b||w->stopping||w->waiting||w->output_ready||w->seeking||w->want_seek)return;
+    if(w->response.kind!=NMEDIA_AUDIO&&w->response.kind!=NMEDIA_VIDEO)return;
+    /* Caller has released the borrowed span. Queue at most one successor;
+     * transport uses the same byte/time/handoff budget and cannot spawn. */
+    nmedia_worker_step(w);nmedia_worker_pump_budget(w,uptime_ms(),b,false);
 }
 const struct nmedia_info *nmedia_worker_info(nmedia_worker *w){return w&&w->metadata?&w->info:NULL;}
 const char *nmedia_worker_error(nmedia_worker *w){return w?w->error:"no native worker";}
@@ -178,4 +212,7 @@ void nmedia_worker_close(nmedia_worker *w) {
     if(reap(w))nmedia_ff_free(w);
     else retired=w; /* One child maximum; pending replacement has no PID. */
 }
-int64_t nmedia_worker_deadline(uint64_t now) {return retired||(owner&&(owner->waiting||(owner->stopping&&owner->pid>0)))?(int64_t)now+10:-1;}
+int64_t nmedia_worker_deadline(uint64_t now) {
+    if(owner&&owner->waiting)return (int64_t)now+1;
+    return retired||(owner&&owner->stopping&&owner->pid>0)?(int64_t)now+10:-1;
+}

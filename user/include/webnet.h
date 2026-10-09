@@ -3,10 +3,12 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include "http.h"
 
 #define WEBNET_BODY_LIMIT (16u * 1024u * 1024u)
+#define WEBNET_SCRIPT_BODY_LIMIT (32u * 1024u * 1024u)
 #define WEBNET_TIMEOUT_MS 30000u
-#define WEBNET_URL_MAX 2048
+#define WEBNET_URL_MAX HTTP_URL_MAX
 #define WEBNET_REQUEST_HEADERS_MAX 8192
 #define WEBNET_HEADERS_MAX WEBNET_REQUEST_HEADERS_MAX /* legacy request-sized alias */
 /* Response storage includes NUL plus room for negotiated status/metadata.
@@ -40,6 +42,10 @@ static inline bool webnet_method_valid(const char *s) {
 
 typedef struct webnet webnet;
 enum webnet_kind { WEBNET_NAVIGATION, WEBNET_CLASSIC, WEBNET_MODULE, WEBNET_RESOURCE, WEBNET_FETCH };
+/* Response-only policy. Author request/POST bounds remain WEBNET_BODY_LIMIT. */
+static inline size_t webnet_response_limit(enum webnet_kind kind) {
+    return kind == WEBNET_CLASSIC || kind == WEBNET_MODULE ? WEBNET_SCRIPT_BODY_LIMIT : WEBNET_BODY_LIMIT;
+}
 enum webnet_credentials { WEBNET_CREDENTIALS_OMIT, WEBNET_CREDENTIALS_SAME_ORIGIN, WEBNET_CREDENTIALS_INCLUDE };
 enum webnet_cache { WEBNET_CACHE_DEFAULT, WEBNET_CACHE_NO_STORE, WEBNET_CACHE_RELOAD,
                     WEBNET_CACHE_NO_CACHE, WEBNET_CACHE_FORCE_CACHE, WEBNET_CACHE_ONLY_IF_CACHED };

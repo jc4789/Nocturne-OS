@@ -21,7 +21,16 @@
 #define WEBNET_WIRE_CACHE_SHIFT 6u
 #define WEBNET_WIRE_CACHE_MASK (7u << WEBNET_WIRE_CACHE_SHIFT)
 #define WEBNET_WIRE_CACHE_MODE(flags) (((flags) & WEBNET_WIRE_CACHE_MASK) >> WEBNET_WIRE_CACHE_SHIFT)
-#define WEBNET_WIRE_REQUEST_FLAGS (WEBNET_WIRE_USER_NAVIGATION | WEBNET_WIRE_FORCE_PREFLIGHT | WEBNET_WIRE_REDIRECT_ERROR | WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_CACHE_MASK)
+/* New clients may receive up to 32 MiB only for classic/module scripts. An old
+   persisted client omitting this flag still receives the legacy 16 MiB bound. */
+#define WEBNET_WIRE_LARGE_SCRIPT 512u
+#define WEBNET_WIRE_REQUEST_FLAGS (WEBNET_WIRE_USER_NAVIGATION | WEBNET_WIRE_FORCE_PREFLIGHT | WEBNET_WIRE_REDIRECT_ERROR | WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_CACHE_MASK | WEBNET_WIRE_LARGE_SCRIPT)
+static inline bool webnet_wire_script_flag_valid(uint32_t kind, uint32_t flags) {
+    return !(flags & WEBNET_WIRE_LARGE_SCRIPT) || kind == WEBNET_CLASSIC || kind == WEBNET_MODULE;
+}
+static inline size_t webnet_wire_response_limit(uint32_t kind, uint32_t flags) {
+    return flags & WEBNET_WIRE_LARGE_SCRIPT ? webnet_response_limit((enum webnet_kind)kind) : WEBNET_BODY_LIMIT;
+}
 struct webnet_wire_request {
     uint32_t magic, kind, user_navigation, credentials; /* user_navigation is a flags word. */
     uint64_t id, generation, deadline;

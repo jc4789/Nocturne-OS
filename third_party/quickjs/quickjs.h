@@ -384,6 +384,13 @@ typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);
 void JS_MarkValue(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
 void JS_RunGC(JSRuntime *rt);
 JS_BOOL JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
+/* Native weak identity handles. They do not keep their target alive. Values
+   returned by JS_GetWeakRefValue are owned strong references. The handle and
+   context must belong to the same runtime; free handles before that runtime. */
+typedef struct JSWeakRefData JSWeakRef;
+JSWeakRef *JS_NewWeakRef(JSContext *ctx, JSValueConst target);
+JSValue JS_GetWeakRefValue(JSContext *ctx, const JSWeakRef *ref);
+void JS_FreeWeakRef(JSRuntime *rt, JSWeakRef *ref);
 
 JSContext *JS_NewContext(JSRuntime *rt);
 void JS_FreeContext(JSContext *s);
@@ -977,6 +984,15 @@ JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m);
 
 typedef JSValue JSJobFunc(JSContext *ctx, int argc, JSValueConst *argv);
 int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func, int argc, JSValueConst *argv);
+
+/* Nocturne engine extensions. Embedders need not define CONFIG_NOCTURNE.
+   A rejected job is consumed without calling page code, using normal cleanup.
+   Internal Promise propagation is preserved, including undefined handlers.
+   With no filter installed, enqueue/execution retain the upstream behavior. */
+typedef JS_BOOL JSHostJobFilter(JSContext *job_realm, void *opaque);
+void JS_SetHostJobFilter(JSRuntime *rt, JSHostJobFilter *filter, void *opaque);
+int JS_EnqueueJobForCallback(JSContext *ctx, JSValueConst callback,
+                             JSJobFunc *job_func, int argc, JSValueConst *argv);
 
 JS_BOOL JS_IsJobPending(JSRuntime *rt);
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);

@@ -1,7 +1,8 @@
 /* Nocturne browser storage. This uses the existing native file API; no new
- * filesystem/ABI/POSIX requirement. rename is copy-and-unlink on Nocturne, NOT
- * atomic. Alternate checksum-validated snapshots keep the previous slot intact
- * while publishing a new slot. fsync/power-loss durability and cross-process
+ * filesystem/ABI/POSIX requirement. Alternate checksum-validated snapshots
+ * write only the inactive slot and keep the previous confirmed slot intact.
+ * Full write, close and readback establish publication; no copy-and-unlink
+ * rename is used. fsync/power-loss durability and cross-process
  * cache coherence are not provided by this backend. */
 #include <webstorage.h>
 #include <nocturne.h>
@@ -171,12 +172,13 @@ static bool storage_same_entries(struct storage_area *a, struct storage_area *b)
         if (e->kn!=f->kn || e->vn!=f->vn || memcmp(e->key,f->key,e->kn) || memcmp(e->value,f->value,e->vn)) return false;
     return !e && !f;
 }
-static int storage_save(struct storage_area *a) {
+static int storage_save(struct storage_area *a, struct web_storage_result *out) {
     if (a->generation==UINT64_MAX || !storage_dirs()) return WEB_STORAGE_IO;
     size_t on=strlen(a->origin), n=56+on;
     for (struct storage_entry *e=a->entries;e;e=e->next) n+=8+e->kn+e->vn;
     if (n>STORAGE_FILE_MAX) return WEB_STORAGE_QUOTA;
     uint8_t *bytes=malloc(n); if (!bytes) return WEB_STORAGE_QUOTA;
+    out->snapshot_bytes=n;
     memcpy(bytes,"NWEBST1",8); storage_put64(bytes+40,a->generation+1);
     storage_put32(bytes+48,(uint32_t)on); storage_put32(bytes+52,a->count); memcpy(bytes+56,a->origin,on);
     size_t at=56+on;
@@ -186,9 +188,8 @@ static int storage_save(struct storage_area *a) {
     }
     storage_hash(bytes+40,n-40,bytes+8);
     int slot=a->slot==0?1:0;
-    char path[160], temp[192]; storage_path(a->origin,slot,path);
-    snprintf(temp,sizeof temp,"%s.tmp-%d",path,getpid());
-    int fd=open(temp,O_WRONLY|O_CREAT|O_TRUNC), result=WEB_STORAGE_IO;
+    char path[160]; storage_path(a->origin,slot,path);
+    int fd=open(path,O_WRONLY|O_CREAT|O_TRUNC), result=WEB_STORAGE_IO;
     if (fd>=0) {
         size_t done=0;
         while (done<n) {
@@ -199,23 +200,22 @@ static int storage_save(struct storage_area *a) {
         }
         int closed=close(fd);
         if (done==n && closed==0) {
-            /* rename can fail after completing its copy (unlink failure), and
-             * vfs_write_whole does not check a short write. Readback, not its
-             * return code alone, establishes whether publication completed. */
-            (void)rename(temp,path);
+            /* Never overwrite the last confirmed slot. A full native write
+             * and successful close still need checksum/generation/map readback
+             * before the caller's RAM map can adopt this candidate. */
             struct storage_area *check=NULL;
             if (storage_read(a->origin,slot,&check)==1 && check->generation==a->generation+1 && storage_same_entries(a,check)) {
                 result=WEB_STORAGE_OK; a->generation++; a->slot=slot;
             }
             storage_area_free(check);
-            if (result!=WEB_STORAGE_OK) {
-                /* Only the inactive candidate is removed; the last confirmed
-                 * snapshot was never overwritten. If invalidation itself is
-                 * uncertain, fail this area closed for the window lifetime. */
-                if (unlink(path)<0 && errno!=ENOENT) a->unavailable=true;
-            }
         }
-        (void)unlink(temp);
+    }
+    if (result!=WEB_STORAGE_OK) {
+        /* Even a failed open may have truncated the candidate before failing
+         * to allocate a file handle. Remove only this inactive slot on every
+         * unsuccessful write/close/readback. Uncertain invalidation makes the
+         * area unavailable; never report success or silently serve stale RAM. */
+        if (unlink(path)<0 && errno!=ENOENT) a->unavailable=true;
     }
     free(bytes); return result;
 }
@@ -300,9 +300,13 @@ int webstorage_access(webstorage *s, const char *origin, const struct web_storag
         free((*link)->value); (*link)->value=value; (*link)->vn=r->value_len; (*link)->units=ku+vu;
     }
     b->units=newunits;
-    if (b->kind==WEB_STORAGE_LOCAL && (result=storage_save(b))!=WEB_STORAGE_OK) {
-        if (b->unavailable) a->unavailable=true;
-        storage_area_free(b); return result;
+    if (b->kind==WEB_STORAGE_LOCAL) {
+        uint64_t start=uptime_ms();out->save_attempts=1;
+        result=storage_save(b,out);out->save_ms=uptime_ms()-start;
+        if (result!=WEB_STORAGE_OK) {
+            if (b->unavailable) a->unavailable=true;
+            storage_area_free(b); return result;
+        }
     }
     s->units=s->units-a->units+b->units;
     storage_entries_free(a->entries); a->entries=b->entries; b->entries=NULL;

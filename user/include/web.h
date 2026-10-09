@@ -15,6 +15,7 @@
 #include "gfx.h"
 #include "abi.h"
 #include "webstorage.h"
+#include "http.h"
 
 typedef struct web_doc web_doc;
 typedef struct node web_node; /* an element of the document */
@@ -33,11 +34,12 @@ web_doc *web_parse(const char *html, size_t len, const char *url, const char *ch
    to one document; the embedder must also
    check its navigation generation before delivering a completion. */
 enum { WEB_RESOURCE_SCRIPT, WEB_RESOURCE_MODULE, WEB_RESOURCE_CSS,
-       WEB_RESOURCE_IMAGE, WEB_RESOURCE_FETCH };
+       WEB_RESOURCE_IMAGE, WEB_RESOURCE_FETCH, WEB_RESOURCE_FRAME };
 struct web_request {
     uint64_t id;
     int kind;
     const char *url, *method, *headers;
+    const char *origin; /* initiating document's effective origin URL; NULL uses embedder document */
     const void *body;
     size_t body_len;
     int credentials; /* 0 omit, 1 same-origin, 2 include */
@@ -55,7 +57,7 @@ struct web_history {
 };
 struct web_response {
     int status;
-    char url[2048], headers[4096], error[160];
+    char url[HTTP_URL_MAX], headers[4096], error[160];
     char *body;
     size_t body_len;
     char *headers_full; /* Complete block when too large for inline headers; never a truncated tail. */
@@ -80,6 +82,14 @@ struct web_navigation_timing {
 #define WEB_JS_TASK_MAX_MS 30000u
 #define WEB_WINDOW_VISIBLE 1u
 #define WEB_WINDOW_FOCUSED 2u
+/* A bounded, native video-layer update from the last published document scene.
+   The host validates identity/viewport before touching its canvas. */
+struct web_video_patch {
+    canvas_t canvas;
+    int scroll_x, scroll_y;
+    int x, y, w, h, pitch;
+    const uint32_t *pixels;
+};
 struct web_host {
     void *opaque;
     bool (*request)(void *opaque, const struct web_request *request);
@@ -94,6 +104,10 @@ struct web_host {
     void (*scroll)(void *opaque, int *x, int *y);
     void (*scroll_to)(void *opaque, int x, int y);
     unsigned (*window_state)(void *opaque); /* actual host visibility/page focus; optional */
+    /* Native-only getter: a queued navigation/close cancels stale default edits. */
+    bool (*navigation_pending)(void *opaque);
+    bool (*video_present)(void *opaque, web_doc *document,
+                          const struct web_video_patch *patch);
     bool (*history)(void *opaque, int operation, const char *url, const void *state,
                     size_t state_len, int value, struct web_history *out);
     /* The host owns the cookie jar; returned text is malloc'd, never HttpOnly. */
@@ -127,7 +141,8 @@ int64_t web_media_background_deadline(uint64_t now_ms);
 /* -1: no deadline, otherwise an absolute uptime_ms() deadline. */
 int64_t web_deadline(web_doc *d);
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *response);
-bool web_dirty(web_doc *d); /* consumes the paint/layout dirty notification */
+bool web_dirty(web_doc *d); /* consumes the legacy layout/paint notification */
+bool web_paint_dirty(web_doc *d); /* consumes a paint-only media notification */
 bool web_script_running(web_doc *d);
 /* Explicit developer-console input only. It runs in the active page realm,
  * under the ordinary JS watchdog, and grants no native module/file access. */
@@ -161,6 +176,9 @@ bool web_node_action(web_doc *d, web_node *target, struct web_hit *hit);
    Detached HTML anchors can navigate; their owner must still be the active d. */
 web_node *web_link_activation_anchor(web_doc *d, web_node *target);
 bool web_link_action(web_doc *d, web_node *anchor, struct web_hit *hit);
+/* Trusted native link activation: true when a child-frame destination consumed
+   the navigation. Script location changes use their own, stricter child path. */
+bool web_frame_navigate(web_doc *top, web_node *anchor, const char *url);
 void web_free(web_doc *d);
 const char *web_title(web_doc *d); /* "" if none */
 const char *web_url(web_doc *d);
@@ -182,6 +200,10 @@ void web_image_loaded(web_doc *d, int i, const void *data, size_t n); /* data NU
 /* lay the page out for a viewport; returns the document height */
 int web_layout(web_doc *d, int width, int height);
 int web_doc_height(web_doc *d);
+/* Laid-out root scrolling area, including propagated horizontal overflow. */
+int web_doc_width(web_doc *d);
+/* Native viewport position only: no layout, event dispatch or painting. */
+void web_viewport_position(web_doc *d, int x, int y);
 /* paint the document rectangle at (doc_x, doc_y) into the canvas rectangle (x, y, w, h) */
 void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y);
 
@@ -204,6 +226,12 @@ bool web_modal_active(web_doc *d);
 const char *web_control_value(web_node *control);
 /* a key for the focused text control: 0 ignored, 1 changed (repaint), 2 Enter: submit its form */
 int web_key(web_doc *d, const struct gui_event *e);
+/* Native user edits only, not a script clipboard grant. 0 unsupported,
+   1 consumed/cancelled, 3 changed. data is a bounded UTF-8 byte string. */
+int web_control_edit(web_doc *top, web_node *target, const char *input_type,
+                     const char *data, size_t length);
+/* Caller owns the selected UTF-8 text. Password/default-copy is denied. */
+char *web_control_selected_text(web_doc *top, web_node *target, size_t *length);
 struct web_control_activation { web_node *control, *previous; bool checked, indeterminate, radio; };
 void web_control_activation_begin(web_doc *d, web_node *control, struct web_control_activation *activation);
 bool web_control_activation_end(web_doc *d, struct web_control_activation *activation, bool allowed);

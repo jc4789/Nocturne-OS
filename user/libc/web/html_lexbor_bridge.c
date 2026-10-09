@@ -275,7 +275,7 @@ static bool import_fields(struct binding *b) {
 bool html_bridge_init(struct html_parser *p) {
     p->bridge = calloc(1, sizeof *p->bridge);
     if (!p->bridge) return false;
-    p->native_root = doc_node_create(p->d, p->fragment ? N_FRAGMENT : N_DOC, NULL, NULL, 0);
+    if(!p->native_root)p->native_root = doc_node_create(p->d, p->fragment ? N_FRAGMENT : N_DOC, NULL, NULL, 0);
     return p->native_root && bind_node(p, p->root, p->native_root);
 }
 

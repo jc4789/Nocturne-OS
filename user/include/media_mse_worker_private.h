@@ -33,15 +33,23 @@ typedef struct nmedia_mse_worker nmedia_mse_worker;
 nmedia_mse_worker *nmedia_mse_worker_open(uint32_t,char *,size_t);
 bool nmedia_mse_worker_command(nmedia_mse_worker *,unsigned,unsigned,const void *,size_t,int64_t,int64_t,int64_t,bool);
 void nmedia_mse_worker_pump(nmedia_mse_worker *,uint64_t);
+/* Native-only browser burst: all nested handoffs share the caller's end time. */
+void nmedia_mse_worker_pump_budget(nmedia_mse_worker *,uint64_t,uint64_t);
+/* One nonblocking receive pass only: never spawn, send, or yield. */
+void nmedia_mse_worker_collect(nmedia_mse_worker *);
 void nmedia_mse_worker_background(uint64_t);
 int64_t nmedia_mse_worker_deadline(uint64_t);
 bool nmedia_mse_worker_pending(const nmedia_mse_worker *);
+bool nmedia_mse_worker_running(const nmedia_mse_worker *);
 bool nmedia_mse_worker_quota_error(const nmedia_mse_worker *);
 const char *nmedia_mse_worker_error(const nmedia_mse_worker *);
 const struct nmedia_info *nmedia_mse_worker_info(const nmedia_mse_worker *,unsigned);
 size_t nmedia_mse_worker_quota(const nmedia_mse_worker *,unsigned);
 size_t nmedia_mse_worker_ranges(const nmedia_mse_worker *,unsigned,struct nmedia_time_range *,size_t);
 int nmedia_mse_worker_step(nmedia_mse_worker *,struct nmedia_output *);
+/* Consume/copy the previously returned span before this call: its storage may
+ * be reused. At most one STEP, sharing the current native burst end time. */
+void nmedia_mse_worker_prefetch(nmedia_mse_worker *,uint64_t);
 void nmedia_mse_worker_close(nmedia_mse_worker *);
 
 bool nmedia_mse_worker_seeking(const nmedia_mse_worker *);

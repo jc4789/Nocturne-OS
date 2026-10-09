@@ -22,6 +22,10 @@ struct web_storage_result {
     char *text; /* malloc'd; caller frees; NULL for an absent key */
     size_t text_len;
     uint32_t length;
+    /* Host-only aggregate diagnostics. No key/value/origin is retained here.
+     * Bytes are serialized snapshot bytes, not a claim of completed disk IO. */
+    uint32_t save_attempts;
+    uint64_t save_ms, snapshot_bytes;
 };
 typedef struct webstorage webstorage;
 /* One instance per browser window, surviving document navigation. Local writes

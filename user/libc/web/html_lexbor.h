@@ -28,7 +28,7 @@ struct html_parser {
     /* Contextual fragments may run eligible scripts only after insertion;
        ordinary innerHTML fragments remain inert. Neither mode yields scripts
        during parsing, and scripting-disabled documents cannot enable it. */
-    bool scripting, fragment, contextual_fragment, finished, failed, yielded;
+    bool scripting, fragment, contextual_fragment, finished, failed, yielded, stream_open;
 };
 
 bool html_bridge_init(struct html_parser *p);

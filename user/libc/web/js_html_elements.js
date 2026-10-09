@@ -47,6 +47,124 @@ const htmlElementsBridge = (() => {
         if(rawDom('get',node,'namespaceURI')!=='http://www.w3.org/1999/xhtml')
             throw new TypeErrorImpl('HTMLElement receiver required');
     }
+    // CSSOM View element scrolling uses the real native scrolling box. There
+    // are no author-visible offset fields or CSS transforms standing in for it.
+    const finiteScroll=Number.isFinite,postScrollTask=host.postTask;
+    const scrollTasks=new WeakMap();let smoothScrollReported=false;
+    function scrollNumber(value){
+        value=+value; // WebIDL ToNumber: Symbol and BigInt must throw.
+        return finiteScroll(value)?value:0;
+    }
+    function elementScrollPosition(node,axis){
+        rawDom('get',node,'elementBrand');
+        return rawDom('geometry',node,axis);
+    }
+    function queueElementScroll(node){
+        if(scrollTasks.has(node))return;
+        const owner=rawDom('get',node,'ownerDocument');
+        const record={owner};scrollTasks.set(node,record);
+        try{postScrollTask(()=>{
+            if(scrollTasks.get(node)!==record)return;
+            scrollTasks.delete(node);
+            if(rawDom('get',node,'ownerDocument')!==owner || !rawDom('get',node,'elementScrollActive'))return;
+            const event=new Event('scroll');event.isTrusted=true;dispatch(node,event);
+        });}catch(error){scrollTasks.delete(node);throw error;}
+    }
+    function applyElementScroll(node,x,y){
+        // Native rechecks the current owner, active document and associated
+        // box after all author conversions. Viewport forwarding queues its
+        // existing Window event and intentionally returns false here.
+        if(rawDom('elementScroll',node,x,y))queueElementScroll(node);
+    }
+    function instantScrollBehavior(behavior){
+        if(behavior==='smooth' && !smoothScrollReported){
+            smoothScrollReported=true;
+            host.log(1,'Capability: smooth element scrolling is not implemented; applying an instant scroll');
+        }
+    }
+    function elementScroll(node,args,relative){
+        rawDom('get',node,'elementBrand');
+        let x,y,behavior='auto';
+        if(args.length>=2){x=scrollNumber(args[0]);y=scrollNumber(args[1]);}
+        else {
+            const options=args[0];
+            if(options!=null && typeof options!=='object' && typeof options!=='function')
+                throw new TypeErrorImpl('Scroll options must be a dictionary');
+            if(options!=null){
+                // Inherited dictionary member first, then left/top in IDL order.
+                const b=options.behavior;
+                if(b!==undefined){behavior=string(b);
+                    if(behavior!=='auto' && behavior!=='instant' && behavior!=='smooth')
+                        throw new TypeErrorImpl('Invalid scroll behavior');}
+                const left=options.left;if(left!==undefined)x=scrollNumber(left);
+                const top=options.top;if(top!==undefined)y=scrollNumber(top);
+            }
+        }
+        // Read positions only after dictionary getters/value conversion, which
+        // may themselves scroll, detach or adopt the receiver.
+        if(relative || x===undefined)x=(relative?(x===undefined?0:x):0)+elementScrollPosition(node,'scrollLeft');
+        if(relative || y===undefined)y=(relative?(y===undefined?0:y):0)+elementScrollPosition(node,'scrollTop');
+        instantScrollBehavior(behavior);
+        applyElementScroll(node,x,y);
+    }
+    for(const axis of ['scrollLeft','scrollTop'])define(Element.prototype,axis,{configurable:true,enumerable:true,
+        get(){return elementScrollPosition(this,axis);},
+        set(value){
+            rawDom('get',this,'elementBrand');value=scrollNumber(value);
+            const other=elementScrollPosition(this,axis==='scrollLeft'?'scrollTop':'scrollLeft');
+            applyElementScroll(this,axis==='scrollLeft'?value:other,axis==='scrollTop'?value:other);
+        }});
+    for(const size of ['scrollWidth','scrollHeight'])define(Element.prototype,size,{configurable:true,enumerable:true,
+        get(){return elementScrollPosition(this,size);}});
+    define(Element.prototype,'scroll',{configurable:true,enumerable:true,writable:true,
+        value:function scroll(options=undefined){elementScroll(this,arguments,false);}});
+    define(Element.prototype,'scrollTo',{configurable:true,enumerable:true,writable:true,
+        value:function scrollTo(options=undefined){elementScroll(this,arguments,false);}});
+    define(Element.prototype,'scrollBy',{configurable:true,enumerable:true,writable:true,
+        value:function scrollBy(options=undefined){elementScroll(this,arguments,true);}});
+    function scrollLogical(value){
+        value=string(value);
+        if(value==='start')return 0;if(value==='end')return 1;
+        if(value==='center')return 2;if(value==='nearest')return 3;
+        throw new TypeErrorImpl('Invalid scroll alignment');
+    }
+    define(Element.prototype,'scrollIntoView',{configurable:true,enumerable:true,writable:true,
+        value:function scrollIntoView(options=undefined){
+            rawDom('get',this,'elementBrand');
+            let behavior='auto',block=0,inline=3,nearest=false;
+            if(options!=null && (typeof options==='object'||typeof options==='function')){
+                const b=options.behavior;
+                if(b!==undefined){behavior=string(b);
+                    if(behavior!=='auto'&&behavior!=='instant'&&behavior!=='smooth')
+                        throw new TypeErrorImpl('Invalid scroll behavior');}
+                const at=options.block;if(at!==undefined)block=scrollLogical(at);
+                const container=options.container;
+                if(container!==undefined){const c=string(container);
+                    if(c!=='all'&&c!=='nearest')throw new TypeErrorImpl('Invalid scroll container');nearest=c==='nearest';}
+                const side=options.inline;if(side!==undefined)inline=scrollLogical(side);
+            }else if(options!==undefined && options!==null && !options)block=1;
+            instantScrollBehavior(behavior);
+            // The native containing-block tree reflects rendered shadow/slot
+            // distribution. Never invent a DOM parent or cross-frame traversal.
+            const changed=rawDom('elementScrollIntoView',this,block,inline,nearest);
+            for(let i=0;i<changed.length;i++)queueElementScroll(changed[i]);
+        }});
+    define(HTMLElement.prototype,'innerText',{configurable:true,enumerable:true,get(){
+        htmlBrand(this);return rawDom('get',this,'innerText');
+    },set(value){
+        htmlBrand(this);value=string(value);
+        const owner=rawDom('get',this,'ownerDocument'),fragment=rawDom('create',owner,11,'#document-fragment','');
+        // Build the native fragment before replace-all. CRLF is one break;
+        // lone CR/LF becomes a real HTML br, not markup or a text alias.
+        const lines=value.split(/\r\n|[\r\n]/);
+        for(let i=0;i<lines.length;i++){
+            if(lines[i])dom('insert',fragment,rawDom('create',owner,3,'#text',lines[i]),null);
+            if(i+1<lines.length)dom('insert',fragment,rawDom('create',owner,1,'br',''),null);
+        }
+        customElementsBridge.reactions(()=>{
+            dom('set',this,'textContent','');dom('insert',this,fragment,null);
+        });
+    }});
     define(HTMLElement.prototype,'hidden',{configurable:true,enumerable:true,get(){
         htmlBrand(this);const value=reflectedAttr(this,'hidden');
         return value===null?false:lower(value)==='until-found'?'until-found':true;
@@ -77,6 +195,32 @@ const htmlElementsBridge = (() => {
         position=string(position);markup=string(markup);const point=adjacent(this,position);
         const fragment=rawDom('parseFragment',point.context,markup);
         dom('insert',point.parent,fragment,point.before);
+    }});
+    function insertAdjacentNode(node,position,child){
+        position=lower(position);let parent,before;
+        if(position==='beforebegin'||position==='afterend'){
+            parent=rawDom('get',node,'parentNode');if(!parent)return null;
+            before=position==='beforebegin'?node:rawDom('get',node,'nextSibling');
+        }else if(position==='afterbegin'||position==='beforeend'){
+            parent=node;before=position==='afterbegin'?rawDom('get',node,'firstChild'):null;
+        }else throw new DOMException('Invalid adjacent position','SyntaxError');
+        if(rawDom('get',parent,'nodeType')===9 &&
+           (rawDom('get',child,'nodeType')===3 || child!==node))
+            throw new DOMException('Document cannot have text or a second root element','HierarchyRequestError');
+        for(let ancestor=parent;ancestor;ancestor=rawDom('get',ancestor,'parentNode')||rawDom('get',ancestor,'insertionHost'))
+            if(ancestor===child)throw new DOMException('Insertion would create a cycle','HierarchyRequestError');
+        dom('insert',parent,child,before);return child;
+    }
+    define(Element.prototype,'insertAdjacentElement',{configurable:true,enumerable:true,writable:true,value:function(position,element){
+        rawDom('get',this,'elementBrand');if(arguments.length<2)throw new TypeErrorImpl('Position and element required');
+        position=string(position);rawDom('get',element,'elementBrand');
+        return insertAdjacentNode(this,position,element);
+    }});
+    define(Element.prototype,'insertAdjacentText',{configurable:true,enumerable:true,writable:true,value:function(position,data){
+        rawDom('get',this,'elementBrand');if(arguments.length<2)throw new TypeErrorImpl('Position and text required');
+        position=string(position);data=string(data);
+        const child=rawDom('create',rawDom('get',this,'ownerDocument'),3,'#text',data);
+        insertAdjacentNode(this,position,child);
     }});
     const innerDescriptor=Object.getOwnPropertyDescriptor(Element.prototype,'innerHTML');
     define(Element.prototype,'innerHTML',{...innerDescriptor,set(value){

@@ -10,6 +10,11 @@ const customElementsBridge = (() => {
     const HTML = 'http://www.w3.org/1999/xhtml';
     const definitions = new Map(), constructors = new Map(), pending = new Map();
     const states = new WeakMap(), scopes = [], backup = [], faceElements=new Set();
+    let constructionDepth=0;
+    function invokeConstructor(constructor) {
+        constructionDepth++;
+        try{return Reflect.construct(constructor,[]);}finally{constructionDepth--;}
+    }
     const constructed = Symbol('already constructed'), registryKey = {};
     const reserved = new Set(['annotation-xml','color-profile','font-face','font-face-src',
         'font-face-uri','font-face-format','font-face-name','missing-glyph']);
@@ -103,7 +108,7 @@ const customElementsBridge = (() => {
             if(d.disableShadow && get(element,'shadowRoot'))throw fail('This custom element disables shadow roots');
             s.state = 'precustomized';
             rawDom('face',element,'metadata',d.formAssociated);
-            if (Reflect.construct(d.constructor, []) !== element) throw new TypeError('Custom element constructor returned a different object');
+            if (invokeConstructor(d.constructor) !== element) throw new TypeError('Custom element constructor returned a different object');
             s.state = 'custom';
             if(d.formAssociated){faceElements.add(element);refreshFormElement(element);}
         } catch (e) {
@@ -142,7 +147,7 @@ const customElementsBridge = (() => {
         if (!d) return rawDom('create', null, 1, name, '');
         return reactions(() => {
             try {
-                const element = Reflect.construct(d.constructor, []), s = states.get(element);
+                const element = invokeConstructor(d.constructor), s = states.get(element);
                 if (!s || s.definition !== d || get(element,'nodeType') !== 1 || get(element,'namespaceURI') !== HTML)
                     throw new TypeError('Constructor did not create an HTMLElement');
                 if (get(element,'localName') !== name || get(element,'parentNode') || children(element).length || get(element,'attributeNames').length)
@@ -332,5 +337,5 @@ const customElementsBridge = (() => {
     Object.defineProperty(globalThis, 'customElements', {get() { return registry; },enumerable:true,configurable:true});
     Object.defineProperty(globalThis, 'CustomElementRegistry', {value:CustomElementRegistry,writable:true,configurable:true});
     function allowShadow(element){const d=definitions.get(get(element,'localName'));return !d || !d.disableShadow;}
-    return {construct,create,reactions,inserted,removed,attributeChanged,upgradeTree,before,after,allowShadow,internalsInfo,formRefresh,formReset};
+    return {construct,create,reactions,inserted,removed,attributeChanged,upgradeTree,before,after,allowShadow,internalsInfo,formRefresh,formReset,constructing:()=>constructionDepth>0};
 })();

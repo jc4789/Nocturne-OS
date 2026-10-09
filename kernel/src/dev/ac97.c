@@ -1,7 +1,9 @@
 /* Intel AC'97 audio (ICH and compatibles; QEMU's -device AC97, VirtualBox's default).
    Output only, at 48 kHz stereo. The PCM-out DMA engine walks a ring of 32 buffer descriptors;
    instead of taking its interrupts we top the ring up from the timer tick, keeping a few
-   10 ms buffers queued ahead of the one playing (CIV) up to the last valid one (LVI). */
+   10 ms buffers queued ahead of the one playing (CIV) up to the last valid one (LVI).
+   An empty software queue does not extend LVI with silence: the issued PCM drains, then
+   the engine is paused until the next PCM. Idle service performs no port I/O. */
 #include "dev/audio.h"
 #include "arch/cpu.h"
 #include "dev/pci.h"
@@ -26,6 +28,7 @@
 #define CR_RUN     0x01
 #define CR_RESET   0x02
 #define SR_HALTED  0x01
+#define SR_CELV    0x02 /* final descriptor has been processed, not merely CIV == LVI */
 #define SR_CLEAR   0x1C /* write 1 to clear: last valid buffer, completion, FIFO error */
 
 #define NBUF       32
@@ -41,6 +44,7 @@ struct bd {
 static uint16_t nam, nabm;
 static int16_t *bufs;
 static int lvi;
+static bool dma_live; /* RUN set; issued descriptors may still belong to the device */
 
 static void spin_ms(uint64_t ms) { /* early in boot: no sleeping yet */
     uint64_t until = uptime_ms() + ms + 1;
@@ -48,20 +52,47 @@ static void spin_ms(uint64_t ms) { /* early in boot: no sleeping yet */
 }
 
 static void ac97_fill(void) {
-    uint16_t before = audio_trace_active ? inw(nabm + PO_SR) : 0;
+    bool remote = audio_remote();
+    bool pending = !remote && audio_pending();
+    if (!dma_live && !pending) return; /* no DMA owner, no wake: zero VM exits */
+
+    /* ICH7 PRM 2.2.2-4 permits this aligned read; QEMU nabm_readl also returns
+       CIV | LVI<<8 | SR<<16. One snapshot replaces separate CIV/SR reads. */
+    uint32_t state = dma_live ? inl(nabm + PO_CIV) : 0;
+    uint16_t before = (uint16_t)(state >> 16);
+    int civ = (int)(state & (NBUF - 1));
     unsigned filled = 0;
-    int civ = inb(nabm + PO_CIV) & (NBUF - 1);
-    while (((lvi - civ) & (NBUF - 1)) < AHEAD) {
+    bool restarted = false;
+    if (dma_live && !pending && civ == lvi &&
+        (before & (SR_HALTED | SR_CELV)) == (SR_HALTED | SR_CELV)) {
+        /* Never pause a partly consumed descriptor. QEMU then drains its
+           already mixed host queue (pending_disable); no DMA buffer is erased. */
+        outb(nabm + PO_CR, 0);
+        dma_live = false;
+    }
+    if (before & SR_CLEAR) outw(nabm + PO_SR, before & SR_CLEAR);
+
+    /* On first start/reset PIV is 0 and lvi is 31. After a complete drain PIV
+       is the successor of lvi. Only these unpublished successors are writable.
+       While live, a stale CIV can only under-estimate room as DMA advances. */
+    int room = dma_live ? AHEAD - ((lvi - civ) & (NBUF - 1)) : AHEAD;
+    while (!remote && room-- > 0 && audio_pending()) {
         int next = (lvi + 1) & (NBUF - 1);
-        audio_mix(bufs + next * BUF_FRAMES * 2, BUF_FRAMES);
+        if (!audio_mix(bufs + next * BUF_FRAMES * 2, BUF_FRAMES)) break;
         lvi = next;
         filled++;
-        outb(nabm + PO_LVI, (uint8_t)lvi); /* also restarts an engine that ran dry */
     }
-    uint16_t after = inw(nabm + PO_SR);
-    if (after & SR_HALTED) outb(nabm + PO_CR, CR_RUN);
-    if (audio_trace_active) audio_trace_ac97(before, after, filled, (after & SR_HALTED) != 0);
-    outw(nabm + PO_SR, SR_CLEAR);
+    if (filled) {
+        __sync_synchronize(); /* publish all PCM before the single LVI doorbell */
+        outb(nabm + PO_LVI, (uint8_t)lvi);
+        if (!dma_live) {
+            outb(nabm + PO_CR, CR_RUN);
+            dma_live = true;
+            restarted = true;
+        } else restarted = (before & SR_HALTED) != 0; /* LVI wakes a drained RUN engine */
+    }
+    /* The extra raw after-snapshot is opt-in only, not normal sink traffic. */
+    if (audio_trace_active) audio_trace_ac97(before, inw(nabm + PO_SR), filled, restarted);
 }
 
 void ac97_init(void) {
@@ -103,9 +134,8 @@ void ac97_init(void) {
         bdl[i].flags = 0;
     }
     outl(nabm + PO_BDBAR, (uint32_t)bdl_phys);
-    lvi = AHEAD - 1;
-    outb(nabm + PO_LVI, (uint8_t)lvi);
-    outb(nabm + PO_CR, CR_RUN);
+    lvi = NBUF - 1; /* no descriptor has been issued; reset PIV will start at 0 */
+    dma_live = false; /* do not start a perpetual silence DMA stream at boot */
     audio_set_card("AC'97", ac97_fill);
     kprintf("audio: AC'97 (%04x) at ports %#x/%#x, 48 kHz stereo\n", d->device, nam, nabm);
 }

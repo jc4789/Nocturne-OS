@@ -18,12 +18,14 @@ static int64_t pipe_read(struct vnode *v, struct file *f, void *buf, uint64_t of
     for (;;) {
         uint64_t fl = irq_save();
         if (p->count > 0) {
-            size_t got = 0;
-            while (got < n && p->count > 0) {
-                out[got++] = p->buf[p->tail];
-                p->tail = (p->tail + 1) % PIPE_SIZE;
-                p->count--;
-            }
+            /* One bounded ring read has at most two contiguous segments.
+               Keep the existing IRQ/wake boundary, not a per-byte update. */
+            size_t got = n < p->count ? n : p->count;
+            size_t first = got < PIPE_SIZE - p->tail ? got : PIPE_SIZE - p->tail;
+            if (first) memcpy(out, p->buf + p->tail, first);
+            if (got > first) memcpy(out + first, p->buf, got - first);
+            p->tail = (p->tail + got) % PIPE_SIZE;
+            p->count -= got;
             wq_wake_all(&p->wq);
             poll_notify();
             irq_restore(fl);
@@ -57,11 +59,14 @@ static int64_t pipe_write(struct vnode *v, struct file *f, const void *buf, uint
             return done ? (int64_t)done : -EPIPE;
         }
         if (p->count < PIPE_SIZE) {
-            while (done < n && p->count < PIPE_SIZE) {
-                p->buf[p->head] = in[done++];
-                p->head = (p->head + 1) % PIPE_SIZE;
-                p->count++;
-            }
+            size_t space = PIPE_SIZE - p->count;
+            size_t put = n - done < space ? n - done : space;
+            size_t first = put < PIPE_SIZE - p->head ? put : PIPE_SIZE - p->head;
+            if (first) memcpy(p->buf + p->head, in + done, first);
+            if (put > first) memcpy(p->buf, in + done + first, put - first);
+            p->head = (p->head + put) % PIPE_SIZE;
+            p->count += put;
+            done += put;
             wq_wake_all(&p->rq);
             poll_notify();
             irq_restore(fl);

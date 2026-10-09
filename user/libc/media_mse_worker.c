@@ -94,21 +94,37 @@ static void completed(nmedia_mse_worker *w){
     w->tx_pos=w->head_pos=w->rx_pos=0;
     if(w->head){w->head->c.sequence=++w->sequence;w->deadline=uptime_ms()+30000;memset(&w->response,0,sizeof w->response);}
 }
-void nmedia_mse_worker_pump(nmedia_mse_worker *w,uint64_t now){
+static void pump_io(nmedia_mse_worker *w,uint64_t now,uint64_t until,bool dispatch){
     nmedia_mse_worker_background(now);if(!w||w->stopping||!w->head)return;
     if(now>=w->deadline){stop(w,"MSE worker request deadline exceeded");return;}
-    if(!w->pid){if(retired)return;if(!spawn_child(w))return;}
-    struct n_pollfd p[2]={{w->in,N_POLLOUT,0},{w->out,N_POLLIN,0}};if(poll(p,2,0)<0){stop(w,"MSE worker poll failed");return;}
+    if(!w->pid){if(!dispatch||retired)return;if(!spawn_child(w))return;}
+    if(!dispatch&&w->tx_pos<sizeof w->head->c+w->head->c.bytes)return;
+    struct n_pollfd p[2]={{w->in,dispatch?N_POLLOUT:0,0},{w->out,N_POLLIN,0}};if(poll(p,2,0)<0){stop(w,"MSE worker poll failed");return;}
     size_t budget=65536,total=sizeof w->head->c+w->head->c.bytes;
-    while(w->tx_pos<total&&budget&&(p[0].revents&N_POLLOUT)){
+    /* Append bytes and decoded pixels both cross a 16 KiB pipe. Cooperatively
+     * wake the blocked peer after transfer progress; never wait for decode or
+     * a network request. Both directions share one bounded handoff interval. */
+    uint64_t transfer_end=MIN(uptime_ms()+2,until);unsigned handoffs=0;
+    while(dispatch&&w->tx_pos<total&&budget&&(p[0].revents&N_POLLOUT)){
         bool header=w->tx_pos<sizeof w->head->c;const uint8_t *src=header?(const uint8_t *)&w->head->c+w->tx_pos:w->head->bytes+w->tx_pos-sizeof w->head->c;
         size_t take=MIN(budget,header?sizeof w->head->c-w->tx_pos:total-w->tx_pos);ssize_t n=write(w->in,src,take);
+        if(n<0&&errno==EAGAIN&&w->tx_pos>sizeof w->head->c&&budget&&handoffs<16&&uptime_ms()<transfer_end){
+            handoffs++;yield();if(uptime_ms()>=transfer_end)break;continue;
+        }
         if(n<0&&(errno==EAGAIN||errno==EINTR))break;if(n<=0){stop(w,"MSE worker command pipe failed");return;}w->tx_pos+=(size_t)n;budget-=(size_t)n;
+    }
+    /* The first poll predates command dispatch. A fast peer may already have
+     * replied by now; do not schedule a whole browser pass on stale revents. */
+    if(dispatch&&w->tx_pos==total&&!(p[1].revents&(N_POLLIN|N_POLLHUP))){
+        if(poll(&p[1],1,0)<0){stop(w,"MSE worker response poll failed");return;}
     }
     budget=262144;
     while(w->head&&budget&&(p[1].revents&(N_POLLIN|N_POLLHUP))){
         bool header=w->head_pos<sizeof w->response;size_t take=header?sizeof w->response-w->head_pos:w->response.payload_bytes-w->rx_pos;
         if(!take){completed(w);break;}take=MIN(take,budget);void *dest=header?(uint8_t *)&w->response+w->head_pos:w->payload+w->rx_pos;ssize_t n=read(w->out,dest,take);
+        if(n<0&&errno==EAGAIN&&w->rx_pos&&budget&&handoffs<16&&uptime_ms()<transfer_end){
+            handoffs++;yield();if(uptime_ms()>=transfer_end)break;continue;
+        }
         if(n<0&&(errno==EAGAIN||errno==EINTR))break;if(n<=0){stop(w,"MSE worker response ended early");return;}budget-=(size_t)n;
         if(header){w->head_pos+=(size_t)n;if(w->head_pos==sizeof w->response){if(!valid(w)){stop(w,"invalid native MSE worker response");return;}
             if(w->response.payload_bytes>w->capacity){uint8_t *a=nmedia_ff_realloc(w->payload,w->response.payload_bytes);if(!a){stop(w,"MSE worker frame aggregate quota");return;}w->payload=a;w->capacity=w->response.payload_bytes;}}}
@@ -116,7 +132,11 @@ void nmedia_mse_worker_pump(nmedia_mse_worker *w,uint64_t now){
         if(w->head_pos==sizeof w->response&&w->rx_pos==w->response.payload_bytes){completed(w);break;}
     }
 }
+void nmedia_mse_worker_pump_budget(nmedia_mse_worker *w,uint64_t now,uint64_t until){pump_io(w,now,until,true);}
+void nmedia_mse_worker_collect(nmedia_mse_worker *w){uint64_t now=uptime_ms();pump_io(w,now,now,false);}
+void nmedia_mse_worker_pump(nmedia_mse_worker *w,uint64_t now){nmedia_mse_worker_pump_budget(w,now,uptime_ms()+2);}
 bool nmedia_mse_worker_pending(const nmedia_mse_worker *w){if(!w)return false;for(struct request *r=w->head;r;r=r->next)if(r->c.op!=NMSW_STEP&&r->c.op!=NMSW_SEEK)return true;return false;}
+bool nmedia_mse_worker_running(const nmedia_mse_worker *w){return w&&w->pid>0&&!w->stopping;}
 bool nmedia_mse_worker_quota_error(const nmedia_mse_worker *w){return w&&w->quota_error;}
 const char *nmedia_mse_worker_error(const nmedia_mse_worker *w){return w?w->error:"no MSE worker";}
 const struct nmedia_info *nmedia_mse_worker_info(const nmedia_mse_worker *w,unsigned slot){return w&&slot<2&&w->metadata[slot]?&w->info[slot]:NULL;}
@@ -124,13 +144,30 @@ size_t nmedia_mse_worker_quota(const nmedia_mse_worker *w,unsigned slot){if(!w||
 size_t nmedia_mse_worker_ranges(const nmedia_mse_worker *w,unsigned slot,struct nmedia_time_range *out,size_t maximum){if(!w||slot>1)return 0;size_t n=MIN((size_t)w->counts[slot],maximum);memcpy(out,w->ranges[slot],n*sizeof *out);return n;}
 int nmedia_mse_worker_step(nmedia_mse_worker *w,struct nmedia_output *out){
     if(!w||w->error[0])return NMEDIA_ERROR;
-    if(w->output_ready){w->output_ready=false;*out=w->output;int kind=out->kind;if(kind==NMSW_BUSY)memset(out,0,sizeof *out);return kind;}
+    if(w->output_ready){w->output_ready=false;*out=w->output;int kind=out->kind;if(kind==NMSW_BUSY){memset(out,0,sizeof *out);
+        /* BUSY owns no borrowed span: enqueue its continuation now, rather
+         * than spending another handoff just to discover an empty head. */
+        if(!w->head&&!nmedia_mse_worker_command(w,NMSW_STEP,0,NULL,0,0,0,0,false)){stop(w,"MSE STEP queue quota");return NMEDIA_ERROR;}
+    }return kind;}
     if(w->starving&&!w->head)return NMEDIA_AGAIN;
     if(!w->head&&!nmedia_mse_worker_command(w,NMSW_STEP,0,NULL,0,0,0,0,false)){stop(w,"MSE STEP queue quota");return NMEDIA_ERROR;}return NMSW_BUSY;
 }
+void nmedia_mse_worker_prefetch(nmedia_mse_worker *w,uint64_t until){
+    if(!w||w->stopping||w->error[0]||w->head||w->output_ready||w->starving)return;
+    int kind=w->output.kind;
+    if(kind!=NMEDIA_AUDIO&&kind!=NMEDIA_VIDEO&&kind!=NMSW_CLOCK)return;
+    /* The caller has consumed/copied the last borrowed span. Reuse its charged
+     * payload, dispatch exactly one STEP, and overlap decode with GUI/JS work.
+     * No queue growth, extra frame buffer, wait, or new burst deadline. */
+    if(!nmedia_mse_worker_command(w,NMSW_STEP,0,NULL,0,0,0,0,false)){stop(w,"MSE STEP queue quota");return;}
+    nmedia_mse_worker_pump_budget(w,uptime_ms(),until);
+}
 void nmedia_mse_worker_close(nmedia_mse_worker *w){if(!w)return;if(owner==w)owner=NULL;stop(w,NULL);nmedia_ff_free(w->payload);w->payload=NULL;
     if(reap(w))nmedia_ff_free(w);else retired=w;}
-int64_t nmedia_mse_worker_deadline(uint64_t now){return retired||(owner&&(owner->head||(owner->stopping&&owner->pid>0)))?(int64_t)now+10:-1;}
+int64_t nmedia_mse_worker_deadline(uint64_t now){
+    if(owner&&owner->head&&!owner->stopping)return (int64_t)now+1;
+    return retired||(owner&&owner->stopping&&owner->pid>0)?(int64_t)now+10:-1;
+}
 
 bool nmedia_mse_worker_seeking(const nmedia_mse_worker *w){if(!w)return false;for(struct request *r=w->head;r;r=r->next)if(r->c.op==NMSW_SEEK)return true;return false;}
 uint64_t nmedia_mse_worker_revision(const nmedia_mse_worker *w,unsigned slot){return w&&slot<2?(w->epoch[slot]<<32)^w->revision[slot]:0;}

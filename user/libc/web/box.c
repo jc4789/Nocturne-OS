@@ -426,7 +426,7 @@ static int atomic_kind(node_t *n) {
     case T_textarea: return AT_TEXTAREA;
     case T_button: return AT_INLINE_BLOCK;
     case T_svg: return n->parent && n->parent->foreign ? AT_NONE : AT_SVG;
-    case T_iframe: case T_video: case T_canvas: case T_embed: case T_object: case T_applet: case T_meter:
+    case T_iframe: case T_frame: case T_video: case T_canvas: case T_embed: case T_object: case T_applet: case T_meter:
     case T_progress:
         return AT_PLACEHOLDER;
     case T_audio: return node_attr(n, "controls") ? AT_PLACEHOLDER : AT_NONE;
@@ -444,6 +444,7 @@ static void text_box(struct bctx *b, box_t *pb, node_t *n, const char *s, size_t
     box_t *x = nbox(b, B_TEXT, n, st);
     x->text = t;
     x->len = k;
+    if (n && n->type == N_TEXT) n->box = x;
     append(pb, x);
 }
 
@@ -547,11 +548,19 @@ static void gen(struct bctx *b, box_t *pb, node_t *n, style_t *pst) {
         return;
     }
     if (n->tag == T_br || n->tag == T_wbr) {
-        append(pb, nbox(b, B_BR, n, st));
+        box_t *line = nbox(b, B_BR, n, st);
+        n->box = line;
+        append(pb, line);
         return;
     }
     box_t *x;
     int at = atomic_kind(n);
+    if(!n->foreign && n->tag==T_frameset){
+        x=nbox(b,B_BLOCK,n,st);
+        for(node_t *child=n->first;child;child=child->next)
+            if(child->type==N_ELEM && !child->foreign && (child->tag==T_frame || child->tag==T_frameset))gen(b,x,child,st);
+        append(pb,x);return;
+    }
     if (at) {
         x = nbox(b, B_ATOMIC, n, st);
         x->atomic = (uint8_t)at;

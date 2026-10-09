@@ -193,6 +193,18 @@ struct html_parser *html_begin(web_doc *d, const char *src, size_t n, const char
     return p;
 }
 
+struct html_parser *html_open(web_doc *d) {
+    struct html_parser *p=parser_create(d,true);
+    if(!p)return NULL;
+    p->stream_open=true;p->native_root=d->root;
+    p->document=lxb_html_parse_chunk_begin(p->lex);
+    if(!p->document){html_finish(p);return NULL;}
+    p->root=lxb_dom_interface_node(p->document);install_callback(p);
+    if(!html_bridge_init(p) || !html_bridge_import(p)){html_finish(p);return NULL;}
+    return p;
+}
+void html_close(struct html_parser *p){if(p)p->stream_open=false;}
+
 int html_resume(struct html_parser *p, node_t **script) {
     if (script) *script = NULL;
     if (!p || p->failed) return -1;
@@ -217,7 +229,7 @@ int html_resume(struct html_parser *p, node_t **script) {
         }
         in->offset += size;
     }
-    if (!p->pending_script) {
+    if (!p->pending_script && !p->stream_open) {
         bool ok = p->fragment ? lxb_html_parse_fragment_chunk_end(p->lex) != NULL :
                                lxb_html_parse_chunk_end(p->lex) == LXB_STATUS_OK;
         if (!ok) { p->failed = true; return -1; }
@@ -235,11 +247,12 @@ int html_resume(struct html_parser *p, node_t **script) {
         p->yielded = true;
         if (script) *script = node;
     }
+    if(p->stream_open && !p->pending_script){p->yielded=true;return 2;}
     return p->yielded ? 1 : 0;
 }
 
 bool html_write(struct html_parser *p, const char *text, size_t n) {
-    if (!p || p->finished || p->failed || !p->yielded || !p->scripting || (!text && n) ||
+    if (!p || p->finished || p->failed || (!p->yielded && !p->stream_open) || !p->scripting || (!text && n) ||
         n > HTML_INPUT_LIMIT - p->input_bytes) return false;
     if (!n) return true;
     /* Consecutive writes during one suspended script have not reached Lexbor

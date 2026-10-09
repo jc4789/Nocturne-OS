@@ -83,8 +83,8 @@ const avmediaBridge = (() => {
         s.controller=null;s.generation=(s.generation+1)>>>0;s.intent++;s.seekIntent++;s.promise=null;s.error=null;s.network=0;s.currentSrc='';s.last=null;
         native('reset',node,s.generation);textTrackBridge.reset(node);active.delete(node);
     }
-    async function load(node) {
-        const s=get(node);reset(node,s);const generation=s.generation;
+    async function load(node,forPlay=false) {
+        const s=get(node);reset(node,s);const generation=s.generation,loadIntent=s.intent;
         let url;try{url=source(node);}catch(e){s.error=new MediaError(4,'Invalid media URL');s.network=3;event(node,'error');throw e;}
         if(!url){s.network=3;event(node,'emptied');throw new DOMException('No supported media source','NotSupportedError');}
         const controller=new AbortController();s.currentSrc=url;s.network=2;s.controller=controller;active.add(node);monitor();notify(node,s,generation,url,'loadstart');
@@ -105,13 +105,17 @@ const avmediaBridge = (() => {
                 } else if(blob) {
                     if(!native('load',node,blobBridge.bytes(blob),generation))throw new Error(native('state',node).error||'Unsupported Blob media');
                 } else if(native('range',node,url)) {
-                    if(!native('loadURL',node,url,generation))throw new Error(native('state',node).error||'Unsupported Range media input');
-                    const deadline=host.now()+30000;
+                    if(!native('loadURL',node,url,generation,forPlay&&s.intent===loadIntent))throw new Error(native('state',node).error||'Unsupported Range media input');
+                    let deadline=host.now()+30000;
                     for(;;) {
                         if(!current(node,s,generation,url)||controller.signal.aborted)throw abortError();
                         const now=native('state',node);
                         if(now.error)throw new Error(now.error);
                         if(now.readyState>=2&&!now.loading)break;
+                        /* Waiting for another HTML element's bounded child is
+                         * not a network request timeout. No additional child
+                         * or decoder reservation is held by this element. */
+                        if(now.queued)deadline=host.now()+30000;
                         if(host.now()>=deadline){native('reset',node,generation);throw new Error('Native media metadata deadline exceeded');}
                         await new Promise(resolve=>setTimeout(resolve,10));
                     }
@@ -199,14 +203,26 @@ const avmediaBridge = (() => {
         load(){get(this);load(this).catch(()=>{});}
         async play(){
             const s=get(this),url=source(this);
+            const initialIntent=s.intent;
+            /* A bounded Range child is a process resource, not a permanent
+             * privilege of the first video. Explicit playback releases the
+             * previous Range owner through its normal pause/intent path. */
+            if(native('range',this,url))for(const other of Array.from(active)){
+                if(other===this)continue;
+                const old=native('state',other);
+                if(old.rangeInput&&(!old.paused||old.loading||old.seeking))other.pause();
+                if(s.intent!==initialIntent||source(this)!==url)throw abortError();
+            }
             let pending=null,intent=s.intent;
             if(s.currentSrc!==url||!snapshot(this).readyState){
                 if(s.promise&&s.currentSrc===url)pending=s.promise;
-                else {intent=s.intent+1;pending=load(this);} /* Only load's own reset; a loadstart handler may cancel. */
+                else {intent=s.intent+1;pending=load(this,true);} /* Only load's own reset; a loadstart handler may cancel. */
             }
+            if(pending)native('preparePlay',this);
             if(pending)await pending;
             if(s.intent!==intent||source(this)!==s.currentSrc)throw abortError();
             if(snapshot(this).ended&&!native('seek',this,0))throw new DOMException('Input cannot restart','NotSupportedError');
+            native('preparePlay',this);
             while(snapshot(this).seeking){
                 await new Promise(resolve=>setTimeout(resolve,10));
                 if(s.intent!==intent||source(this)!==s.currentSrc)throw abortError();
@@ -237,6 +253,10 @@ const avmediaBridge = (() => {
         set height(v){brand(this);this.setAttribute('height',String(Number(v)>>>0));}
         get poster(){brand(this);const v=this.getAttribute('poster');return v===null?'':new URL(v,this.baseURI).href;}
         set poster(v){brand(this);this.setAttribute('poster',String(v));}
+        getVideoPlaybackQuality(){
+            const s=snapshot(this);
+            return {creationTime:performance.now(),totalVideoFrames:s.totalVideoFrames||0,droppedVideoFrames:s.droppedVideoFrames||0,corruptedVideoFrames:0};
+        }
     }
     function Audio(src){const node=document.createElement('audio');node.preload='auto';if(arguments.length)node.src=src;return node;}
     Audio.prototype=HTMLAudioElement.prototype;

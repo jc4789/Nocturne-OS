@@ -7,9 +7,13 @@ const cloneData = (() => {
     const own=Object.hasOwn,toString=String,iteratorSymbol=Symbol.iterator;
     const mHas=M.prototype.has,mGet=M.prototype.get,mSet=M.prototype.set;
     const setAdd=S.prototype.add,mapEach=M.prototype.forEach,setEach=S.prototype.forEach;
-    const push=A.prototype.push,byteSet=U8.prototype.set;
+    const byteSet=U8.prototype.set;
     const has=(map,key)=>apply(mHas,map,[key]),get=(map,key)=>apply(mGet,map,[key]);
-    const put=(map,key,value)=>apply(mSet,map,[key,value]),add=(array,value)=>apply(push,array,[value]);
+    const put=(map,key,value)=>apply(mSet,map,[key,value]);
+    // Internal slots must not run author Array.prototype index setters while
+    // assembling a transaction, especially after its final validation pass.
+    const add=(array,value)=>define(array,array.length,{value,writable:true,enumerable:true,configurable:true});
+    const field=(record,key,value)=>define(record,key,{value,writable:true,enumerable:true,configurable:true});
     const kinds=new M(),constructors=new M(),classID=host.classID,detach=host.detach,uncloneable=[],transferTypes=[];
     const register=(name,sample,ctor)=>{put(kinds,classID(sample),name);if(ctor)put(constructors,name,ctor);};
     register('Object',{});register('Array',[]);register('Date',new DateType());
@@ -52,9 +56,11 @@ const cloneData = (() => {
             if(classID(item)!==arrayBufferID){
                 for(let j=0;j<transferTypes.length;j++)if(transferTypes[j].brand(item)){handler=transferTypes[j];break;}
                 if(!handler)fail();handler.validate(item);
-                // A DOM MessagePort's private receiver belongs to this realm;
-                // it is not a transferable native endpoint in another process.
-                if(external)fail();
+                // External factories are private, same-runtime endpoint
+                // capabilities; they are never part of the serialized graph.
+                // Workers use boolean external=true and must keep rejecting
+                // ports: only the private Window/endpoint path opts in.
+                if(external&&(external!=='ports'||!handler.prepareExternal))fail();
             }else {try{new U8(item,0,0);}catch(_){fail();}}
             add(handlers,handler);put(seen,item,records.length);add(records,[handler?'Transferred':'ArrayBuffer',null]);
         }
@@ -75,7 +81,7 @@ const cloneData = (() => {
             const kind=get(kinds,classID(value));if(!kind)return fail();
             const id=records.length,record=[kind];add(records,record);put(seen,value,id);
             if(kind==='Object'||kind==='Array'){
-                record[1]=kind==='Array'?value.length:0;record[2]=[];
+                field(record,1,kind==='Array'?value.length:0);field(record,2,[]);
                 const properties=keys(value);
                 for(let i=0;i<properties.length;i++){
                     const key=properties[i];
@@ -85,9 +91,9 @@ const cloneData = (() => {
             }else if(kind==='Map'||kind==='Set'){
                 const entries=[];
                 apply(kind==='Map'?mapEach:setEach,value,[(v,k)=>add(entries,kind==='Map'?[k,v]:v)]);
-                record[1]=[];
+                field(record,1,[]);
                 for(let i=0;i<entries.length;i++)add(record[1],kind==='Map'?[visit(entries[i][0]),visit(entries[i][1])]:visit(entries[i]));
-            }else if(kind==='ArrayBuffer')record[1]=copyBuffer(value);
+            }else if(kind==='ArrayBuffer')field(record,1,copyBuffer(value));
             else if(has(constructors,kind)){
                 const dataView=kind==='DataView';let buffer,offset,size;
                 try{
@@ -99,18 +105,18 @@ const cloneData = (() => {
                 // Public getters cannot distinguish fixed from length-tracking
                 // views. Reject instead of silently changing their semantics.
                 if(resizable(buffer))return fail();
-                record[1]=visit(buffer);record[2]=offset;record[3]=size;
-            }else if(kind==='Date')record[1]=apply(date,value,[]);
+                field(record,1,visit(buffer));field(record,2,offset);field(record,3,size);
+            }else if(kind==='Date')field(record,1,apply(date,value,[]));
             else if(kind==='RegExp'){
-                record[1]=apply(source,value,[]);record[2]='';
+                field(record,1,apply(source,value,[]));field(record,2,'');
                 for(let i=0;i<flagGetters.length;i++)if(flagGetters[i][0]&&apply(flagGetters[i][0],value,[]))record[2]+=flagGetters[i][1];
             }else if(kind==='Error'){
-                const name=value.name;record[1]=typeof name==='string'&&own(errors,name)?name:'Error';
+                const name=value.name;field(record,1,typeof name==='string'&&own(errors,name)?name:'Error');
                 const message=descriptor(value,'message');
-                record[2]=message&&'value'in message?toString(message.value):undefined;
-                const cause=descriptor(value,'cause');record[3]=!!cause;if(cause)record[4]=visit(value.cause);
-                const stack=descriptor(value,'stack');record[5]=stack&&typeof stack.value==='string'?stack.value:undefined;
-            }else record[1]=apply(boxed[kind],value,[]);
+                field(record,2,message&&'value'in message?toString(message.value):undefined);
+                const cause=descriptor(value,'cause');field(record,3,!!cause);if(cause)field(record,4,visit(value.cause));
+                const stack=descriptor(value,'stack');field(record,5,stack&&typeof stack.value==='string'?stack.value:undefined);
+            }else field(record,1,apply(boxed[kind],value,[]));
             return [1,id];
         }
         const root=visit(input);
@@ -119,39 +125,75 @@ const cloneData = (() => {
         if(transfers){
             for(let i=0;i<transfers.length;i++){
                 const handler=handlers[i];
-                if(handler){handler.validate(transfers[i]);add(prepared,handler.prepare(transfers[i]));}
+                if(handler){handler.validate(transfers[i]);add(prepared,external?handler.prepareExternal(transfers[i]):handler.prepare(transfers[i]));}
                 else add(prepared,copyBuffer(transfers[i]));
             }
             for(let i=0;i<transfers.length;i++){
                 const handler=handlers[i];
-                records[get(seen,transfers[i])][1]=prepared[i];
+                const record=records[get(seen,transfers[i])];
+                if(external&&handler){record[0]='ExternalTransferred';field(record,1,i);}
+                else field(record,1,prepared[i]);
             }
         }
-        const packet={data:[root,records]};
-        apply(packetSet,packets,[packet,{transfers,handlers,prepared,committed:false}]);
+        const tokens=[];
+        if(external)for(let i=0;i<prepared.length;i++)add(tokens,handlers[i]?prepared[i]:null);
+        const packet={data:[root,records],tokens:external?tokens:null};
+        apply(packetSet,packets,[packet,{transfers,handlers,prepared,external,committed:false}]);
         return packet;
     }
-    function commit(packet) {
+    function validate(packet) {
         const p=apply(packetGet,packets,[packet]);
         if(!p||p.committed)throw new TypeErr('Invalid structured clone commit');
+        // A complete late pass precedes the first irreversible detach. This
+        // also catches reentrant author getters that transferred another item.
+        if(p.transfers)for(let i=0;i<p.transfers.length;i++){
+            if(p.handlers[i])p.handlers[i].validate(p.transfers[i]);
+            else try{new U8(p.transfers[i],0,0);}catch(_){fail();}
+        }
+        return p;
+    }
+    function commit(packet,receivers,validated=false) {
+        const p=validated?apply(packetGet,packets,[packet]):validate(packet);
+        if(!p.transfers||!p.transfers.length){p.committed=true;return;}
+        if(typeof host.frame==='function'){
+            const plan=commitPlan(packet,receivers);plan.generations=[host.frame('transferGeneration')];
+            return host.frame('transferCommit',plan);
+        }
+        // A worker has no same-runtime DOM endpoint bridge. Its boolean
+        // external preparation already rejects every MessagePort transfer.
         p.committed=true;
         if(p.transfers)for(let i=0;i<p.transfers.length;i++){
             const handler=p.handlers[i];
-            if(handler)handler.commit(p.transfers[i],p.prepared[i]);else detach(p.transfers[i]);
+            if(handler)handler.commit(p.transfers[i],p.external?receivers[i]:p.prepared[i]);else detach(p.transfers[i]);
         }
+    }
+    function commitPlan(packet,receivers){
+        const p=apply(packetGet,packets,[packet]);
+        if(!p||p.committed)throw new TypeErr('Invalid structured clone commit');
+        const plan={buffers:[],writes:[],cancels:[]};
+        if(p.transfers)for(let i=0;i<p.transfers.length;i++){
+            const handler=p.handlers[i];
+            if(handler){
+                const port=handler.commitPlan(p.transfers[i],p.external?receivers[i]:p.prepared[i]);
+                for(let j=0;j<port.writes.length;j++)add(plan.writes,port.writes[j]);
+                if(port.cancel)add(plan.cancels,port.cancel);
+            }else add(plan.buffers,p.transfers[i]);
+        }
+        add(plan.writes,{object:p,key:'committed',value:true});return plan;
     }
     function serialize(input,transfers) {
         const packet=prepare(input,transfers);commit(packet);return packet.data;
     }
-    function deserialize(serialized) {
+    function deserialize(serialized,receivers=null,copyBytes=false) {
         const root=serialized[0],records=serialized[1],values=new M();
         function read(ref){
             if(ref[0]===0)return ref[1];const id=ref[1];if(has(values,id))return get(values,id);
             const r=records[id],kind=r[0];let value;
             if(kind==='Object')value={};else if(kind==='Array')value=new A(r[1]);
             else if(kind==='Map')value=new M();else if(kind==='Set')value=new S();
-            else if(kind==='ArrayBuffer')value=r[1];
+            else if(kind==='ArrayBuffer')value=copyBytes?copyBuffer(r[1]):r[1];
             else if(kind==='Transferred')value=r[1].value;
+            else if(kind==='ExternalTransferred')value=receivers[r[1]].value;
             else if(kind==='Blob')value=blobBridge.restore(r[1]);
             else if(has(constructors,kind))value=new(get(constructors,kind))(read(r[1]),r[2],r[3]);
             else if(kind==='Date')value=new DateType(r[1]);else if(kind==='RegExp')value=new RegExpType(r[1],r[2]);
@@ -187,9 +229,11 @@ const cloneData = (() => {
         if(options==null)options={};
         if(typeof options!=='object'&&typeof options!=='function')throw new TypeErr('Expected a dictionary');
         const transfers=transferList(options.transfer);
-        return deserialize(serialize(value,transfers));
+        const packet=prepare(value,transfers),result=deserialize(packet.data);
+        // Even same-realm target graph allocation must precede source detach.
+        commit(packet);return result;
     };
-    return {serialize,prepare,commit,deserialize,transferList,registerTransfer(handler){
+    return {serialize,prepare,validate,commit,commitPlan,deserialize,transferList,registerTransfer(handler){
         add(transferTypes,handler);add(uncloneable,handler.brand);
     },registerUncloneable(test){
         if(typeof test!=='function')throw new TypeErr('Expected a private brand predicate');

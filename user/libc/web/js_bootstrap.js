@@ -30,7 +30,7 @@
     let blobHandlerTarget = () => false;
     let mseHandlerTarget = () => false;
     let textTrackHandlerTarget = () => false;
-    const globalHandlerTypes = new Set(('abort beforetoggle blur cancel change click close dblclick error focus focusin focusout input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
+    const globalHandlerTypes = new Set(('abort beforeinput beforetoggle blur cancel change click close dblclick error focus focusin focusout input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
     const windowHandlerTypes = new Set(['hashchange','popstate','message','messageerror']);
     const state = new WeakMap();
     /* @include js_collections.js */
@@ -65,6 +65,7 @@
     }
     Object.assign(Event, {NONE:0, CAPTURING_PHASE:1, AT_TARGET:2, BUBBLING_PHASE:3});
     Object.assign(Event.prototype, {NONE:0, CAPTURING_PHASE:1, AT_TARGET:2, BUBBLING_PHASE:3});
+    /* @include js_error_event.js */
     class CustomEvent extends Event {
         constructor(t, o = {}) { super(t,o); this.detail = o.detail === undefined ? null : o.detail; }
         initCustomEvent(type,bubbles=false,cancelable=false,detail=null) {
@@ -81,6 +82,7 @@
             Event.prototype.initEvent.call(this,type,bubbles,cancelable);this.view=view;this.detail=(+detail)>>0;
         }
     }
+    /* @include js_input_event.js */
     const focusData=new WeakMap();
     class FocusEvent extends UIEvent {
         constructor(type,init={}) {
@@ -123,6 +125,26 @@
         }
         if (entry.signal) entry.signal.removeEventListener('abort', entry.abort);
         entry.signal = entry.abort = null;
+    }
+    function resetDocumentEvents(root) {
+        // document.open removes listeners and handlers, not the old attributes.
+        // Keep null handler records so retained old nodes cannot recompile them.
+        const pending=[root,globalThis];
+        while(pending.length) {
+            const target=pending.pop(),listeners=listenerMap.get(target);
+            if(listeners)for(const entry of listeners.slice())removeListener(target,entry);
+            const handlers=new Map();
+            for(const type of globalHandlerTypes)if(handlerTarget(target,type))
+                handlers.set(type,{value:null,text:null,compiled:true,entry:null});
+            if(target===globalThis)for(const type of windowHandlerTypes)
+                handlers.set(type,{value:null,text:null,compiled:true,entry:null});
+            handlerMap.set(target,handlers);inlineMap.delete(target);
+            if(target!==globalThis) {
+                const shadow=rawDom('get',target,'shadowRoot');if(shadow)pending.push(shadow);
+                for(const child of rawDom('get',target,'childNodes'))pending.push(child);
+            }
+        }
+        hoverPath=[];hoverSnapshot=shadowBridge.capture([]);
     }
     class EventTarget {
         addEventListener(type, callback, init) {
@@ -288,6 +310,7 @@
         cloneNode(deep = false) { if(rawDom('get',this,'shadowHost'))throw new DOMException('Shadow roots cannot be cloned directly','NotSupportedError');return dom('clone',this,!!deep); }
         isEqualNode(other = null) { return dom('equal',this,other); }
         isSameNode(other = null) { return dom('same',this,other); }
+        compareDocumentPosition(other) { return rawDom('position',this,other); }
         contains(other) { for(let n=other;n;n=n.parentNode) if(n===this) return true; return false; }
         hasChildNodes() { return this.firstChild !== null; }
         getRootNode(options={}) { return rawDom('root',this,!!shadowBridge.dictionary(options).composed); }
@@ -362,8 +385,8 @@
         querySelectorAll(selector) { return list(dom('query',this,String(selector),false)); }
         matches(selector) { return dom('matches',this,String(selector)); }
         closest(selector) { for(let n=this;n&&n.nodeType===1;n=n.parentElement) if(n.matches(selector))return n; return null; }
-        getElementsByTagName(name) { const query=String(name)==='*'?'*':CSS.escape(String(name));return collectionBridge.html(()=>dom('query',this,query,false)); }
-        getElementsByClassName(names) { const query=String(names).trim().split(/\s+/).filter(Boolean).map(x=>'.'+CSS.escape(x)).join('');return collectionBridge.html(()=>query?dom('query',this,query,false):[]); }
+        getElementsByTagName(name) { const query=String(name)==='*'?'*':CSS.escape(String(name));return collectionBridge.domHTML(this,()=>dom('query',this,query,false)); }
+        getElementsByClassName(names) { const query=String(names).trim().split(/\s+/).filter(Boolean).map(x=>'.'+CSS.escape(x)).join('');return collectionBridge.domHTML(this,()=>query?dom('query',this,query,false):[]); }
         getBoundingClientRect() { return dom('rect',this); }
         get clientWidth() { return dom('geometry',this,'clientWidth'); }
         get clientHeight() { return dom('geometry',this,'clientHeight'); }
@@ -400,6 +423,9 @@
     // Nested browsing contexts/navigation are not implemented by this class.
     class HTMLIFrameElement extends HTMLElement {
         constructor() { throw new TypeError('Illegal HTMLIFrameElement constructor'); }
+    }
+    class HTMLFrameElement extends HTMLElement {
+        constructor(){throw new TypeError('Illegal HTMLFrameElement constructor');}
     }
     class HTMLUnknownElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLUnknownElement constructor');}
@@ -578,6 +604,8 @@
     }
     Object.assign(Node, {ELEMENT_NODE:1,TEXT_NODE:3,CDATA_SECTION_NODE:4,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
     Object.assign(Node.prototype, {ELEMENT_NODE:1,TEXT_NODE:3,CDATA_SECTION_NODE:4,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
+    for(const [name,value] of [['DISCONNECTED',1],['PRECEDING',2],['FOLLOWING',4],['CONTAINS',8],['CONTAINED_BY',16],['IMPLEMENTATION_SPECIFIC',32]])
+        for(const target of [Node,Node.prototype])Object.defineProperty(target,'DOCUMENT_POSITION_'+name,{value,enumerable:true});
     class Document extends Node {}
     class HTMLDocument extends Document {}
     function characterDataBrand(node){
@@ -646,7 +674,16 @@
         if(arguments.length<2)throw new TypeError('Target and data required');
         return processingInstructionCreate(this,target,data);
     };
-    class DocumentFragment extends Node {}
+    class DocumentFragment extends Node {
+        constructor(){
+            // Return a genuinely branded native fragment, as createDocumentFragment
+            // does. Calling Node's illegal public constructor would reject Lit's
+            // slot capture before its DOM move can run.
+            const node=dom('create',document,11,'#document-fragment',''),proto=new.target.prototype;
+            if(proto!==null && (typeof proto==='object'||typeof proto==='function'))Object.setPrototypeOf(node,proto);
+            return node;
+        }
+    }
     class DocumentType extends Node {
         get name(){return dom('get',this,'doctypeName');}
         get publicId(){return dom('get',this,'publicId');}
@@ -675,10 +712,10 @@
         URL:{get(){return host.url();}}, documentURI:{get(){return host.url();}},
         baseURI:{get(){return dom('get',document,'baseURI');}},
         readyState:{get(){return host.ready();}}, activeElement:{get(){return dom('get',document,'activeElement');}},
-        defaultView:{value:globalThis}, currentScript:{get(){return host.current();}}
+        defaultView:{configurable:true,value:globalThis}, currentScript:{get(){return host.current();}}
     });
     document.getElementById=id=>dom('id',document,String(id));
-    document.getElementsByName=name=>{const query='[name="'+CSS.escape(String(name))+'"]';return collectionBridge.live(()=>dom('query',document,query,false));};
+    document.getElementsByName=name=>{const query='[name="'+CSS.escape(String(name))+'"]';return collectionBridge.domLive(document,()=>dom('query',document,query,false));};
     document.createElement=(name,options)=>customElementsBridge.create(name,options);
     document.createElementNS=(ns,name,options)=>{if(ns==='http://www.w3.org/1999/xhtml')return customElementsBridge.create(name,options,true);if(ns!=='http://www.w3.org/2000/svg')throw new DOMException('Unsupported namespace','NotSupportedError');return dom('create',null,1,String(name),'',true);};
     document.createTextNode=text=>dom('create',null,3,'#text',String(text));
@@ -734,11 +771,11 @@
     function cancelAnimationFrame(id){host.clear(Number(id));}
     function queueMicrotask(fn){return host.microtask(fn);}
     const navigator={userAgent:'Nocturne/1.0 QuickJS',platform:'Nocturne',language:'en-US',languages:['en-US'],onLine:true};
-    Object.assign(globalThis,{document,console,navigator,Node,Element,HTMLElement,HTMLUnknownElement,HTMLIFrameElement,HTMLImageElement,Image,
+    Object.assign(globalThis,{document,console,navigator,Node,Element,HTMLElement,HTMLUnknownElement,HTMLIFrameElement,HTMLFrameElement,HTMLImageElement,Image,
         HTMLInputElement,HTMLButtonElement,HTMLSelectElement,HTMLTextAreaElement,HTMLFieldSetElement,HTMLObjectElement,HTMLOutputElement,HTMLOptionElement,
         HTMLScriptElement,HTMLFormElement,HTMLAnchorElement,HTMLAreaElement,
         Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,CDATASection,Comment,ProcessingInstruction,DocumentFragment,
-        Event,CustomEvent,UIEvent,FocusEvent,MouseEvent,WheelEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,AbortController,AbortSignal,
+        Event,ErrorEvent,CustomEvent,UIEvent,InputEvent,FocusEvent,MouseEvent,WheelEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,AbortController,AbortSignal,
         fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,
         performance:{now:()=>host.now()},getComputedStyle:n=>new Proxy({getPropertyValue:k=>dom('computed',n,String(k))},{get(t,k){return k in t?t[k]:t.getPropertyValue(cssName(k));}})});
     Object.defineProperty(globalThis,'location',{configurable:true,get(){return location;},set(v){host.navigate(String(v));}});
@@ -802,6 +839,8 @@
     /* @include js_mutations.js */
     /* @include js_selection.js */
     /* @include js_document.js */
+    /* @include js_document_commands.js */
+    /* @include js_frames.js */
     /* @include js_range.js */
     /* @include js_traversal.js */
     /* @include js_svg.js */
@@ -885,6 +924,16 @@
         },
         observerFrame(){observerBridge.frame();},
         eventHandlerAttribute:handlerAttribute,
+        documentOpenReset:resetDocumentEvents,
+        documentCommandEvent:documentCommandBridge.event,
+        frameMethodOriginal:frameBridge.methodOriginal,
+        frameWindowProxy:frameBridge.windowProxy,
+        windowMessageMethod:messagingBridge.postMessage,
+        windowMessageLocal:messagingBridge.local,
+        windowMessagePrepare:messagingBridge.prepare,
+        windowMessageImport:messagingBridge.importPacket,
+        windowMessageCommit:messagingBridge.commitImported,
+        windowMessageReceive:messagingBridge.receive,
         imageError(){return new DOMException('The image request changed or could not be decoded','EncodingError');},
         hover,
         customElementBefore(...args){
@@ -907,6 +956,8 @@
         dialogSubmit(node,result){return htmlElementsBridge.submit(node,result);},
         detailsToggle(target,oldOpen,newOpen){semanticElementsBridge.toggle(target,oldOpen,newOpen);},
         historyEvent(oldURL,popstate){historyEvent(oldURL,popstate);},
+        historyOperation:historyBridge.operation,
+        historySecurityError:historyBridge.securityError,
         mediaChanged(){mediaBridge.changed();},
         avmediaActivate(node){return avmediaBridge.activate(node);},
         inertClick(target){return dispatch(target,new MouseEvent('click',{bubbles:true,cancelable:true,composed:true}));},
@@ -914,7 +965,7 @@
             Text.prototype,Comment.prototype,DocumentFragment.prototype,HTMLIFrameElement.prototype,HTMLImageElement.prototype,
             HTMLInputElement.prototype,HTMLButtonElement.prototype,HTMLSelectElement.prototype,HTMLTextAreaElement.prototype,
             HTMLFieldSetElement.prototype,HTMLObjectElement.prototype,HTMLOutputElement.prototype,HTMLOptionElement.prototype,HTMLTemplateElement.prototype,DocumentType.prototype,
-            HTMLScriptElement.prototype,HTMLFormElement.prototype,HTMLAnchorElement.prototype,HTMLAreaElement.prototype,...svgBridge.nodeProtos,ProcessingInstruction.prototype,attributeBridge.nodeProto,...htmlElementsBridge.nodeProtos,shadowBridge.ShadowRoot.prototype,shadowBridge.HTMLSlotElement.prototype,...semanticElementsBridge.nodeProtos,HTMLUnknownElement.prototype,...canvasBridge.nodeProtos,HTMLMediaElement.prototype,HTMLAudioElement.prototype,HTMLVideoElement.prototype,...formControlBridge.nodeProtos,...htmlElementsBridge.extraNodeProtos,...textTrackBridge.nodeProtos],
+            HTMLScriptElement.prototype,HTMLFormElement.prototype,HTMLAnchorElement.prototype,HTMLAreaElement.prototype,...svgBridge.nodeProtos,ProcessingInstruction.prototype,attributeBridge.nodeProto,...htmlElementsBridge.nodeProtos,shadowBridge.ShadowRoot.prototype,shadowBridge.HTMLSlotElement.prototype,...semanticElementsBridge.nodeProtos,HTMLUnknownElement.prototype,...canvasBridge.nodeProtos,HTMLMediaElement.prototype,HTMLAudioElement.prototype,HTMLVideoElement.prototype,...formControlBridge.nodeProtos,...htmlElementsBridge.extraNodeProtos,...textTrackBridge.nodeProtos,HTMLFrameElement.prototype],
         dispatch:nativeDispatch,
         response(...args){return fetchBridge.response(...args);},
         reject(message,abort){return abort?new DOMException(message,'AbortError'):new TypeError(message);}

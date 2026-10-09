@@ -2629,6 +2629,7 @@ const char *css_ua_sheet(void) {
            "img, video, canvas, iframe, embed, object, svg, input, select, textarea, button, meter, progress "
            "{ display: inline-block; }\n"
            "iframe { border: 2px inset; }\n"
+           "frameset, frame { display:block; margin:0; padding:0; border:0; }\n"
            "video, audio, canvas, iframe, embed, object { background-color: #e8e8e8; }\n"
            "fieldset { margin: 0 2px; padding: 0.35em 0.75em 0.625em; border: 2px groove #c0c0c0; }\n"
            "legend { padding: 0 2px; }\n"

@@ -154,9 +154,10 @@ void audio_tick(void) {
         trace.max_tick_gap = MAX(trace.max_tick_gap, at-trace.last_tick);
         trace.last_tick = at; trace.ticks++;
     }
-    if (remote_users) return; /* the client pulls the sound itself */
+    /* A card may finish already-issued DMA while remote owns new PCM. Its
+       fill() must not mix from our streams in remote mode; idle is I/O-free. */
     if (card_fill) card_fill();
-    else audio_mix(NULL, (int)(elapsed * AUDIO_RATE / 1000)); /* no card: play into nothing */
+    else if (!remote_users) audio_mix(NULL, (int)(elapsed * AUDIO_RATE / 1000)); /* no card: play into nothing */
 }
 
 void audio_set_card(const char *name, void (*fill)(void)) {

@@ -1,0 +1,68 @@
+/* New same-runtime transfer boundary only. No previous message cases run. */
+int main(void){
+    JSRuntime *rt=JS_NewRuntime();JS_SetMemoryLimit(rt,128u<<20);JS_SetMaxStackSize(rt,1u<<20);
+    JS_NewClassID(&node_class);JSClassDef definition={.class_name="FixtureNativeNode"};JS_NewClass(rt,node_class,&definition);
+    struct web_js_state top={.ctx=JS_NewContext(rt)},child={.ctx=JS_NewContext(rt)};
+    node_t tr={0},cr={0},ct={0};web_doc td={.js=&top,.live=true,.root=&tr,.window_token=&tr,.origin="https://parent.test",.url="https://parent.test/page"};
+    web_doc cd={.js=&child,.live=true,.root=&cr,.window_token=&ct,.parent=&td,.origin="https://child.test",.url="https://child.test/page"};
+    tr.owner=tr.document=&td;cr.owner=cr.document=&cd;ct.owner=&td;ct.document=&cd;
+    top.doc=&td;child.doc=&cd;top.runtime_owner=child.runtime_owner=&top;install(&top);install(&child);
+    tr.wrapper=JS_NewObjectClass(top.ctx,node_class);cr.wrapper=JS_NewObjectClass(child.ctx,node_class);ct.wrapper=JS_NewObjectClass(top.ctx,node_class);
+    JS_SetOpaque(tr.wrapper,&tr);JS_SetOpaque(cr.wrapper,&cr);JS_SetOpaque(ct.wrapper,&ct);
+    load(&top,"build/goal-20261009/frame-transfer-bindings.js");load(&child,"build/goal-20261009/frame-transfer-bindings.js");
+    JSValue token=wrap(&top,&ct),proxy=custom_element_hook(&top,"frameWindowProxy",1,&token);JS_FreeValue(top.ctx,token);
+    JSValue global=JS_GetGlobalObject(top.ctx);JS_SetPropertyStr(top.ctx,global,"childWindow",proxy);JS_FreeValue(top.ctx,global);
+    js_check(&child,"globalThis.buf=new Uint8Array([3,5,8]).buffer;parent.postMessage({buf,view:new Uint8Array(buf)},'*',[buf]);buf.byteLength===0","buffer-detach-after-success");
+    verify(top.posted_count==1&&child.posted_count==0,"window-target-task");pump(&top);
+    js_check(&top,"received.length===1&&received[0].data.buf instanceof ArrayBuffer&&received[0].data.view instanceof Uint8Array&&received[0].data.view.buffer===received[0].data.buf&&received[0].data.view[2]===8&&received[0].source===childWindow&&received[0].origin==='https://child.test'","buffer-target-realm-alias-source-origin");
+    js_check(&child,"globalThis.ch=new MessageChannel();ch.port1.postMessage({queued:[7]});parent.postMessage({port:ch.port2},'*',[ch.port2]);(()=>{try{structuredClone(ch.port2,{transfer:[ch.port2]})}catch(e){return e.name==='DataCloneError'}return false})()","source-port-detached");pump(&top);
+    js_check(&top,"globalThis.p=received[1].data.port;globalThis.packets=[];p.onmessage=e=>packets.push(e);p instanceof MessagePort&&received[1].ports[0]===p&&Object.getPrototypeOf(p)===MessagePort.prototype","true-target-port-brand");
+    verify(top.posted_count==1&&child.posted_count==0,"moved-queue-target-scheduler");pump(&top);
+    js_check(&top,"packets.length===1&&packets[0].data.queued instanceof Array&&packets[0].data.queued[0]===7","queued-before-transfer-target-realm");
+    js_check(&child,"globalThis.replies=[];ch.port1.onmessage=e=>replies.push(e.data);true","enable-peer");
+    js_check(&top,"p.postMessage({reply:[11]});true","port-cross-realm-reply-send");
+    verify(child.posted_count==1&&top.posted_count==0,"reply-uses-child-task");pump(&child);
+    js_check(&child,"replies.length===1&&replies[0].reply instanceof Array&&replies[0].reply[0]===11","reply-target-constructor");
+    js_check(&child,"ch.port1.postMessage(new Map([['next',[13]]]));true","peer-to-transferred-port");pump(&top);
+    js_check(&top,"packets.length===2&&packets[1].data instanceof Map&&packets[1].data.get('next') instanceof Array","peer-entanglement-target-constructor");
+    js_check(&top,"childWindow.postMessage({again:p},'*',[p]);(()=>{try{structuredClone(p,{transfer:[p]})}catch(e){return e.name==='DataCloneError'}return false})()","port-retransfer-detach");pump(&child);
+    js_check(&child,"globalThis.again=received[0].data.again;globalThis.round=[];again.onmessage=e=>round.push(e.data);again instanceof MessagePort&&received[0].ports[0]===again","retransfer-brand");
+    js_check(&child,"ch.port1.postMessage([17]);true","retransfer-peer-send");pump(&child);
+    js_check(&child,"round.length===1&&round[0] instanceof Array&&round[0][0]===17","retransfer-queue-and-entanglement");
+    js_check(&child,"(()=>{const c=new MessageChannel(),b=new ArrayBuffer(4);try{parent.postMessage('x','*',[b,c.port1,c.port1])}catch(e){return e.name==='DataCloneError'&&b.byteLength===4&&structuredClone(c.port1,{transfer:[c.port1]}) instanceof MessagePort}return false})()","duplicate-port-atomic-no-buffer-detach");
+    js_check(&child,"(()=>{const b=new ArrayBuffer(4);try{parent.postMessage('x','*',[b,{}])}catch(e){return e.name==='DataCloneError'&&b.byteLength===4}return false})()","invalid-port-atomic-no-detach");
+    js_check(&child,"(()=>{const c=new MessageChannel();try{parent.postMessage({p:c.port1},'*')}catch(e){return e.name==='DataCloneError'}return false})()","unlisted-port-not-ordinary-object");
+    verify(top.posted_count==0,"invalid-transfers-no-task");
+    js_check(&child,"globalThis.n=new MessageChannel();globalThis.outer=new MessageChannel();n.port1.postMessage({before:[19]});outer.port1.postMessage({inner:n.port2},[n.port2]);parent.postMessage({outer:outer.port2},'*',[outer.port2]);true","nested-queued-port-transfer");pump(&top);
+    js_check(&top,"globalThis.outer=received[2].data.outer;globalThis.inner=null;globalThis.nested=[];outer.onmessage=e=>{inner=e.data.inner;inner.onmessage=x=>nested.push(x.data)};true","start-nested-queue");pump(&top);
+    js_check(&top,"inner instanceof MessagePort&&nested.length===1&&nested[0].before instanceof Array&&nested[0].before[0]===19","nested-port-queue-real-target-brand");
+    top.posted_count=4096;
+    js_check(&child,"(()=>{const b=new ArrayBuffer(5),c=new MessageChannel();try{parent.postMessage('quota','*',[b,c.port1])}catch(e){return e.name==='RangeError'&&b.byteLength===5&&structuredClone(c.port1,{transfer:[c.port1]}) instanceof MessagePort}return false})()","native-task-quota-no-detach");top.posted_count=0;
+    js_check(&child,"(()=>{const b=new ArrayBuffer(4),c=new MessageChannel();try{parent.postMessage({huge:'x'.repeat(1100000)},'*',[b,c.port1])}catch(e){return e.name==='RangeError'&&b.byteLength===4&&structuredClone(c.port1,{transfer:[c.port1]}) instanceof MessagePort}return false})()","wire-bound-no-detach");
+    // Deliberate target-factory allocation failure before commit.
+    JSValue original=JS_GetPropertyStr(top.ctx,top.hooks,"windowMessageImport");
+    JSValue throwing=evaluate(&top,"(()=>{throw new RangeError('injected target allocation failure')})");
+    JS_SetPropertyStr(top.ctx,top.hooks,"windowMessageImport",throwing);
+    js_check(&child,"(()=>{const b=new ArrayBuffer(6),c=new MessageChannel();try{parent.postMessage({p:c.port1},'*',[b,c.port1])}catch(e){return e.name==='RangeError'&&b.byteLength===6&&structuredClone(c.port1,{transfer:[c.port1]}) instanceof MessagePort}return false})()","target-prepare-failure-rollback");
+    JS_SetPropertyStr(top.ctx,top.hooks,"windowMessageImport",original);verify(top.posted_count==0,"target-failure-no-publication");
+    fail_transfer_task_allocation=true;
+    js_check(&child,"(()=>{const b=new ArrayBuffer(9),c=new MessageChannel();try{parent.postMessage({p:c.port1},'*',[b,c.port1])}catch(e){return b.byteLength===9&&structuredClone(c.port1,{transfer:[c.port1]}) instanceof MessagePort}return false})()","real-native-task-allocation-failure-no-detach");
+    verify(!fail_transfer_task_allocation&&top.posted_count==0,"native-task-failure-no-publication");
+    js_check(&child,"(()=>{const b=new ArrayBuffer(2),c=new MessageChannel();try{parent.postMessage({get mutate(){structuredClone(c.port1,{transfer:[c.port1]});return 1}},'*',[b,c.port1])}catch(e){return e.name==='DataCloneError'&&b.byteLength===2}return false})()","reentrant-getter-complete-validation");
+    js_check(&child,"globalThis.drop=new MessageChannel();parent.postMessage({p:drop.port2},'https://wrong.test',[drop.port2]);true","origin-rejection-still-transfer");pump(&top);
+    js_check(&top,"received.length===3","target-origin-filter-still-enforced");
+    js_check(&child,"globalThis.scheduled=new MessageChannel();scheduled.port2.onmessage=()=>{throw new Error('old realm dispatched')};scheduled.port1.postMessage([23]);parent.postMessage(scheduled.port2,'*',[scheduled.port2]);true","scheduled-old-queue-transfer");
+    verify(child.posted_count==0,"old-realm-posted-task-cancelled");pump(&top);
+    js_check(&top,"globalThis.newPackets=[];received[3].data.onmessage=e=>newPackets.push(e.data);true","new-owner-starts-moved-scheduled-queue");pump(&top);
+    js_check(&top,"newPackets.length===1&&newPackets[0] instanceof Array&&newPackets[0][0]===23","scheduled-queue-only-target-delivery");
+    td.live=false;top.disabled=true;
+    js_check(&child,"(()=>{const b=new ArrayBuffer(3),c=new MessageChannel();try{parent.postMessage('retired','*',[b,c.port1])}catch(e){return e.name==='TypeError'&&b.byteLength===3&&structuredClone(c.port1,{transfer:[c.port1]}) instanceof MessagePort}return false})()","inactive-target-no-detach");
+    td.live=true;top.disabled=false;
+    js_check(&child,"globalThis.generationPort=new MessageChannel();parent.postMessage(generationPort.port1,'*',[generationPort.port1]);true","transfer-before-generation-retirement");
+    node_t changed_root={.owner=&td};td.root=&changed_root;pump(&top);td.root=&tr;
+    js_check(&top,"received.length===4","new-generation-never-receives-old-transferred-message");
+    JS_FreeValue(top.ctx,tr.wrapper);JS_FreeValue(child.ctx,cr.wrapper);JS_FreeValue(top.ctx,ct.wrapper);JS_FreeValue(top.ctx,top.hooks);JS_FreeValue(child.ctx,child.hooks);
+    while(top.frame_proxies){struct js_frame_proxy *p=top.frame_proxies;top.frame_proxies=p->next;JS_FreeValue(top.ctx,p->proxy);js_free(top.ctx,p);}
+    JS_FreeContext(child.ctx);JS_FreeContext(top.ctx);JS_FreeRuntime(rt);
+    printf("frame transfers native: %d checks, %d failed\n",checks,failures);return failures!=0;
+}

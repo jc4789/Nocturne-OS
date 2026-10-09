@@ -23,6 +23,18 @@
 static struct ata_disk disks[4];
 static int ndisks;
 
+/* Transfer exactly one 512-byte DRQ sector. Use one bounded string I/O
+   operation instead of 256 scalar instructions; device
+   command/status/DRQ and cache-flush ordering remain unchanged. */
+static void pio_read_sector(uint16_t port, void *buffer) {
+    size_t words = 256;
+    __asm__ volatile("cld; rep insw" : "+D"(buffer), "+c"(words) : "d"(port) : "memory", "cc");
+}
+static void pio_write_sector(uint16_t port, const void *buffer) {
+    size_t words = 256;
+    __asm__ volatile("cld; rep outsw" : "+S"(buffer), "+c"(words) : "d"(port) : "memory", "cc");
+}
+
 static void delay400(uint16_t ctl) {
     for (int i = 0; i < 4; i++) inb(ctl);
 }
@@ -67,7 +79,7 @@ static void probe(uint16_t io, uint16_t ctl, bool slave) {
     if (inb(io + REG_LBA1) || inb(io + REG_LBA2)) return; /* ATAPI or SATA signature */
     if (wait_drq(&d) < 0) return;
     uint16_t id[256];
-    for (int i = 0; i < 256; i++) id[i] = inw(io + REG_DATA);
+    pio_read_sector(io + REG_DATA, id);
     d.lba48 = id[83] & (1u << 10);
     d.sectors = d.lba48 ? (uint64_t)id[100] | (uint64_t)id[101] << 16 | (uint64_t)id[102] << 32
                         : (uint64_t)id[60] | (uint64_t)id[61] << 16;
@@ -146,7 +158,7 @@ int ata_read(struct ata_disk *d, uint64_t lba, uint32_t count, void *buf) {
         if (r < 0) return r;
         for (uint32_t s = 0; s < n; s++) {
             if (wait_drq(d) < 0) return -EIO;
-            for (int i = 0; i < 256; i++) *p++ = inw(d->io + REG_DATA);
+            pio_read_sector(d->io + REG_DATA, p); p += 256;
             delay400(d->ctl);
         }
         lba += n;
@@ -163,7 +175,7 @@ int ata_write(struct ata_disk *d, uint64_t lba, uint32_t count, const void *buf)
         if (r < 0) return r;
         for (uint32_t s = 0; s < n; s++) {
             if (wait_drq(d) < 0) return -EIO;
-            for (int i = 0; i < 256; i++) outw(d->io + REG_DATA, *p++);
+            pio_write_sector(d->io + REG_DATA, p); p += 256;
             delay400(d->ctl);
         }
         lba += n;

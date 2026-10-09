@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <math.h>
 #include "webi.h"
+#include "frame.h"
 #include "web_dialog.h"
 #include "js_canvas.h"
 #include "avmedia.h"
@@ -43,7 +44,7 @@ static bool stacking_context(const box_t *b) {
     return positioned(b) && !b->st->z_auto;
 }
 
-static float cy(const box_t *b) { return box_abs_y(b) + b->content_dy; }
+static float cy(const box_t *b) { return box_visual_y(b) + b->content_dy; }
 
 static image_t *scaled_image(struct web_image *im, int w, int h);
 
@@ -718,6 +719,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     }
     case AT_PLACEHOLDER: {
         int X = (int)roundf(x), Y = (int)roundf(y), W = (int)roundf(w), H = (int)roundf(h);
+        if(web_frame_paint(n,c,X,Y,W,H))break;
         if (n->tag == T_canvas) {
             web_canvas_paint(n,c,X,Y,W,H);
             break;
@@ -763,7 +765,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
 }
 
 static void paint_replaced(struct pctx *P, box_t *b) {
-    float x = P->ox + box_abs_x(b), y = P->oy + cy(b);
+    float x = P->ox + box_visual_x(b), y = P->oy + cy(b);
     int X = (int)roundf(x), Y = (int)roundf(y), W = (int)roundf(b->w), H = (int)roundf(b->h);
     canvas_t *c = P->c;
     if (Y > c->cy1 || Y + H < c->cy0) return;
@@ -822,7 +824,7 @@ static void paint_replaced(struct pctx *P, box_t *b) {
 static void paint_marker(struct pctx *P, box_t *b) {
     const style_t *st = b->st;
     if (st->visibility || (!b->marker && !b->marker_shape)) return;
-    float x = P->ox + box_abs_x(b), y = P->oy + cy(b);
+    float x = P->ox + box_visual_x(b), y = P->oy + cy(b);
     wfont f = style_font(st);
     float asc, desc;
     wf_metrics(&f, &asc, &desc);
@@ -944,7 +946,11 @@ static void inline_children(struct pctx *P, box_t *b, bool floats) {
 }
 
 static void paint_runs(struct pctx *P, box_t *b) {
-    float bx = box_abs_x(b), by = cy(b);
+    float bx = box_visual_x(b), by = cy(b);
+    if (box_element_scrollable(b)) {
+        bx -= (float)b->node->scroll_x;
+        by -= (float)b->node->scroll_y;
+    }
     /* inline box backgrounds */
     for (int i = 0; i < b->ndecos; i++) {
         struct deco *d = &b->decos[i];
@@ -969,7 +975,7 @@ static void paint_runs(struct pctx *P, box_t *b) {
             if (P->mode == M_HIT) {
                 box_t *a = r->atomic;
                 if (!hit_style(a->st)) continue;
-                float ax = box_abs_x(a) - a->p[3] - a->b[3], ay = cy(a) - a->p[0] - a->b[0];
+                float ax = box_visual_x(a) - a->p[3] - a->b[3], ay = cy(a) - a->p[0] - a->b[0];
                 if (inside(P, ax, ay, a->w + a->p[1] + a->p[3] + a->b[1] + a->b[3], a->h + a->p[0] + a->p[2] + a->b[0] + a->b[2]))
                     set_hit(P, control_hit(a), a->node, r->link);
             }
@@ -1008,7 +1014,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             }
     }
     canvas_t *c = P->c;
-    float x = box_abs_x(b), y = box_abs_y(b);
+    float x = box_visual_x(b), y = box_visual_y(b);
     float bx = x - b->p[3] - b->b[3], by = y - b->p[0] - b->b[0];
     float bw = b->w + b->p[1] + b->p[3] + b->b[1] + b->b[3];
     float bh = b->h + b->p[0] + b->p[2] + b->b[0] + b->b[2];
@@ -1114,7 +1120,7 @@ static void paint_stacked_layer(struct pctx *P, box_t *l) {
         if (a->st && a->kind != B_INLINE && a->st->position != POS_STATIC) reached = true;
         if (a->st && a->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(P->d,a) && a->kind != B_INLINE && reached &&
             l->st->position != POS_FIXED) {
-            float ax = box_abs_x(a) - a->p[3], ay = box_abs_y(a) - a->p[0];
+            float ax = box_visual_x(a) - a->p[3], ay = box_visual_y(a) - a->p[0];
             gfx_clip(c, (int)(P->ox + ax), (int)(P->oy + ay), (int)(a->w + a->p[1] + a->p[3]), (int)(a->h + a->p[0] + a->p[2]));
         }
     }
@@ -1212,10 +1218,22 @@ web_node *web_node_at(web_doc *d, int x, int y) {
     P.hy = (float)y;
     P.hit = &hit;
     walk(&P);
+    if(P.target && web_frame_element(P.target)){
+        struct web_frame *frame=web_frame_find(d,P.target);box_t *box=P.target->box;
+        if(frame && frame->document && !frame->detached && box){
+            int child_x=x-(int)box_visual_x(box)+frame->scroll_x;
+            int child_y=y-(int)box_visual_y(box)+frame->scroll_y;
+            if(child_x>=frame->scroll_x && child_y>=frame->scroll_y &&
+               child_x<frame->scroll_x+(int)box->w && child_y<frame->scroll_y+(int)box->h){
+                web_node *child=web_node_at(frame->document,child_x,child_y);if(child)return child;
+            }
+        }
+    }
     return P.target && !web_dialog_inert(d,P.target) ? P.target : NULL;
 }
 
 web_node *web_link_activation_anchor(web_doc *d, web_node *target) {
+    if(target && target->owner && target->owner!=d && target->owner->frame_parent)d=target->owner;
     if (!d || d->inert || !target || target->owner != d || web_dialog_inert(d,target)) return NULL;
     for (node_t *n = target; n; n = doc_flat_parent(n)) {
         if (n->type != N_ELEM || n->foreign) continue;
@@ -1234,6 +1252,7 @@ web_node *web_link_activation_anchor(web_doc *d, web_node *target) {
 }
 
 bool web_link_action(web_doc *d, web_node *anchor, struct web_hit *hit) {
+    if(anchor && anchor->owner && anchor->owner!=d && anchor->owner->frame_parent)d=anchor->owner;
     memset(hit, 0, sizeof *hit);
     if (!d || d->inert || !anchor || anchor->owner != d || anchor->type != N_ELEM ||
         anchor->foreign || anchor->tag != T_a || web_dialog_inert(d,anchor)) return false;
@@ -1246,6 +1265,7 @@ bool web_link_action(web_doc *d, web_node *anchor, struct web_hit *hit) {
 }
 
 bool web_node_action(web_doc *d, web_node *target, struct web_hit *hit) {
+    if(target && target->owner && target->owner!=d && target->owner->frame_parent)d=target->owner;
     memset(hit, 0, sizeof *hit);
     if (!d || !target || web_dialog_inert(d,target)) return false;
     node_t *root = doc_node_root(target, true);

@@ -11,6 +11,9 @@
 #include <stdbool.h>
 
 #define MEDIA_HTTP_TIMEOUT_MS 5000
+/* The shared HTTP parser may grow independently. Our redirect/dot-removal
+ * scratch contract is still the original finite media path bound. */
+#define MEDIA_HTTP_PATH_BYTES 1024u
 struct nmedia_http {
     char url[NMEDIA_HTTP_URL_BYTES], etag[160], modified[30], error[160];
     uint8_t *complete;
@@ -117,7 +120,12 @@ static bool valid_url(const char *s, struct url *parsed) {
         if (!decimal(&p, &port) || p != end || port < 1 || port > 65535) return false;
     }
     size_t path_size = *end == '?' ? strlen(end) + 1 : *end ? strlen(end) : 1;
-    return path_size < sizeof parsed->path && url_parse(s, parsed);
+    return path_size < MEDIA_HTTP_PATH_BYTES && path_size < sizeof parsed->path && url_parse(s, parsed);
+}
+static bool valid_url_text(const char *s){
+    struct url *parsed=nmedia_ff_malloc(sizeof *parsed);
+    if(!parsed)return false;
+    bool valid=valid_url(s,parsed);nmedia_ff_free(parsed);return valid;
 }
 /* Serialize a native HTTP document's origin. Fragment/path never grant a new
  * origin; userinfo/opaque URLs fail closed. Host case/default ports normalize. */
@@ -131,17 +139,18 @@ static bool origin(const char *url, char out[160], bool *tls) {
     if(n+2>=sizeof raw)return false;
     memcpy(raw,url,n);raw[n]='/';raw[n+1]=0;
     memcpy(raw,!strncasecmp(url,"https://",8)?"https://":"http://",(size_t)(a-url));
-    struct url parsed;if(!valid_url(raw,&parsed))return false;
-    for(char *p=parsed.host;*p;p++)if(*p>='A'&&*p<='Z')*p=(char)(*p+'a'-'A');
-    int got=parsed.port==(parsed.tls?443:80)?snprintf(out,160,"%s://%s",parsed.tls?"https":"http",parsed.host):
-        snprintf(out,160,"%s://%s:%u",parsed.tls?"https":"http",parsed.host,parsed.port);
-    if(tls)*tls=parsed.tls;
-    return got>0&&got<160;
+    struct url *parsed=nmedia_ff_malloc(sizeof *parsed);if(!parsed)return false;
+    if(!valid_url(raw,parsed)){nmedia_ff_free(parsed);return false;}
+    for(char *p=parsed->host;*p;p++)if(*p>='A'&&*p<='Z')*p=(char)(*p+'a'-'A');
+    int got=parsed->port==(parsed->tls?443:80)?snprintf(out,160,"%s://%s",parsed->tls?"https":"http",parsed->host):
+        snprintf(out,160,"%s://%s:%u",parsed->tls?"https":"http",parsed->host,parsed->port);
+    if(tls)*tls=parsed->tls;
+    nmedia_ff_free(parsed);return got>0&&got<160;
 }
 bool nmedia_http_browser_url(const char *url,const char *document_url) {
-    struct url parsed;char site[160],target[160];bool tls;
-    return valid_url(url,&parsed)&&origin(document_url,site,&tls)&&
-        origin(url,target,NULL)&&(!tls||parsed.tls);
+    char site[160],target[160];bool tls,target_tls;
+    return valid_url_text(url)&&origin(document_url,site,&tls)&&
+        origin(url,target,&target_tls)&&(!tls||target_tls);
 }
 static int cors(struct transfer *t) {
     if(t->reader->cross&&(!t->have_origin||
@@ -167,21 +176,20 @@ static void remove_dots(char *path) {
     }
     out[used]=0;memcpy(path,out,used+1); /* deletion-only, prevalidated <1024 */
 }
-static bool redirect_url(const char *base, const char *location, char *out, size_t cap) {
-    struct url before, after;
-    if (!valid_url(base, &before) || !location[0]) return false;
+static bool redirect_parsed(const char *base,const char *location,char *out,size_t cap,struct url *before,struct url *after) {
+    if (!valid_url(base, before) || !location[0]) return false;
     int n;
     if (!strncmp(location, "http://", 7) || !strncmp(location, "https://", 8))
         n = snprintf(out, cap, "%s", location);
     else if (!strncmp(location, "//", 2))
-        n = snprintf(out, cap, "%s:%s", before.tls ? "https" : "http", location);
+        n = snprintf(out, cap, "%s:%s", before->tls ? "https" : "http", location);
     else {
         const char *colon=strchr(location,':');
         if (colon && colon<location+strcspn(location,"/?")) return false;
         const char *start = strstr(base, "://") + 3;
         size_t origin = (size_t)(start + strcspn(start, "/?") - base);
         char path[1024];
-        snprintf(path, sizeof path, "%s", before.path);
+        snprintf(path, sizeof path, "%s", before->path);
         char *query = strchr(path, '?'); if (query) *query = 0;
         if (location[0] == '/') n = snprintf(out, cap, "%.*s%s", (int)origin, base, location);
         else if (location[0] == '?') n = snprintf(out, cap, "%.*s%s%s", (int)origin, base, path, location);
@@ -190,15 +198,20 @@ static bool redirect_url(const char *base, const char *location, char *out, size
             n = snprintf(out, cap, "%.*s%s%s", (int)origin, base, path, location);
         }
     }
-    if(n<0||(size_t)n>=cap||!valid_url(out,&after)||(before.tls&&!after.tls))return false;
+    if(n<0||(size_t)n>=cap||!valid_url(out,after)||(before->tls&&!after->tls))return false;
     char query[1024], normalized[NMEDIA_HTTP_URL_BYTES];
-    char *q=strchr(after.path,'?');snprintf(query,sizeof query,"%s",q?q:"");if(q)*q=0;
-    remove_dots(after.path);
+    char *q=strchr(after->path,'?');snprintf(query,sizeof query,"%s",q?q:"");if(q)*q=0;
+    remove_dots(after->path);
     const char *authority=strstr(out,"://")+3;
     size_t origin=(size_t)(authority+strcspn(authority,"/?")-out);
-    n=snprintf(normalized,sizeof normalized,"%.*s%s%s",(int)origin,out,after.path[0]?after.path:"/",query);
-    if(n<0||(size_t)n>=sizeof normalized||(size_t)n>=cap||!valid_url(normalized,&after))return false;
+    n=snprintf(normalized,sizeof normalized,"%.*s%s%s",(int)origin,out,after->path[0]?after->path:"/",query);
+    if(n<0||(size_t)n>=sizeof normalized||(size_t)n>=cap||!valid_url(normalized,after))return false;
     memcpy(out,normalized,(size_t)n+1);return true;
+}
+static bool redirect_url(const char *base,const char *location,char *out,size_t cap){
+    struct url *parsed=nmedia_ff_malloc(2*sizeof *parsed);if(!parsed)return false;
+    bool valid=redirect_parsed(base,location,out,cap,parsed,parsed+1);
+    nmedia_ff_free(parsed);return valid;
 }
 static int header(void *opaque, const char *line, size_t size) {
     struct transfer *t = opaque;
@@ -366,8 +379,7 @@ static int download_body(void *opaque,const char *bytes,size_t size) {
 bool nmedia_http_get_bounded_cors(const char *url,const char *document_url,size_t maximum,
     uint8_t **bytes,size_t *length,char *error,size_t error_size) {
     if(bytes)*bytes=NULL;if(length)*length=0;
-    struct url parsed;
-    if(!bytes||!length||!maximum||maximum>NMEDIA_HTTP_COMPLETE_BYTES||!valid_url(url,&parsed)||
+    if(!bytes||!length||!maximum||maximum>NMEDIA_HTTP_COMPLETE_BYTES||!valid_url_text(url)||
        (document_url&&!nmedia_http_browser_url(url,document_url))){
         if(error&&error_size)snprintf(error,error_size,"invalid or unbounded complete media URL");return false;
     }
@@ -406,8 +418,7 @@ bool nmedia_http_get_bounded_cors(const char *url,const char *document_url,size_
 }
 
 static nmedia_http *open_reader(const char *url,const char *document_url,char *error,size_t error_size) {
-    struct url parsed;
-    if (!valid_url(url,&parsed)||(document_url&&!nmedia_http_browser_url(url,document_url))) {
+    if (!valid_url_text(url)||(document_url&&!nmedia_http_browser_url(url,document_url))) {
         if(error&&error_size)snprintf(error,error_size,"invalid, opaque or mixed-content media URL");return NULL;
     }
     nmedia_http *r = nmedia_ff_mallocz(sizeof *r);

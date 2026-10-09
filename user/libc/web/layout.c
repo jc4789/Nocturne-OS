@@ -188,6 +188,42 @@ float box_abs_y(const box_t *b) {
     return y;
 }
 
+bool box_element_scrollable(const box_t *b) {
+    return b && b->node && b->node->type == N_ELEM && b->node->box == b &&
+           !b->anon && b->kind != B_INLINE && b->kind != B_TEXT && b->st &&
+           (b->st->overflow == OV_HIDDEN || b->st->overflow == OV_AUTO || b->st->overflow == OV_SCROLL) &&
+           b->node->owner && !doc_viewport_overflow_box(b->node->owner, b);
+}
+
+static double scroll_limit(double value, double maximum) {
+    if (!isfinite(value) || !isfinite(maximum) || value < 0 || maximum <= 0) return 0;
+    return value > maximum ? maximum : value;
+}
+
+void box_scroll_clamp(box_t *b) {
+    if (!b || !b->node || b->node->box != b || b->anon) return;
+    node_t *n = b->node;
+    bool scrollable = box_element_scrollable(b);
+    double mx = scrollable ? (double)b->scroll_w - b->w - b->p[1] - b->p[3] : 0;
+    double my = scrollable ? (double)b->scroll_h - b->h - b->p[0] - b->p[2] : 0;
+    n->scroll_x = scroll_limit(n->scroll_x, mx);
+    n->scroll_y = scroll_limit(n->scroll_y, my);
+}
+
+float box_visual_x(const box_t *b) {
+    double x = box_abs_x(b);
+    for (const box_t *c = b ? b->cb : NULL; c; c = c->cb)
+        if (c->node && c->node->scroll_x != 0 && box_element_scrollable(c)) x -= c->node->scroll_x;
+    return (float)x;
+}
+
+float box_visual_y(const box_t *b) {
+    double y = box_abs_y(b);
+    for (const box_t *c = b ? b->cb : NULL; c; c = c->cb)
+        if (c->node && c->node->scroll_y != 0 && box_element_scrollable(c)) y -= c->node->scroll_y;
+    return (float)y;
+}
+
 static void list_abs(box_t *b) {
     if (b->gen == GEN) return;
     b->gen = GEN;
@@ -2558,7 +2594,47 @@ static void outer_intrinsic(box_t *c, float *mn, float *mx) {
 
 /* ---------------------------------------------------------------- dispatch */
 /* lay out the inside of b, whose width (b->w) and position are already known */
+/* Legacy frameset track grammar: integer pixels, percentages and weighted *.
+   It lays out native child viewport boxes, never inserts their DOM into the
+   containing document. Oversubscribed fixed tracks shrink proportionally. */
+static unsigned frameset_tracks(const char *text,float extent,float tracks[32]) {
+    unsigned count=0;float fixed=0,stars=0;float weights[32]={0};
+    if(!text || !*text){tracks[0]=extent;return 1;}
+    const char *p=text;
+    while(*p && count<32){
+        while(is_space(*p))p++;
+        char *end;float value=strtof(p,&end);if(end==p)value=0;
+        p=end;while(is_space(*p))p++;
+        if(*p=='*'){weights[count]=value>0?value:1;stars+=weights[count];tracks[count]=0;p++;}
+        else {if(*p=='%'){value=extent*value/100;p++;}tracks[count]=fmaxf_(0,value);fixed+=tracks[count];}
+        count++;while(*p && *p!=',')p++;if(*p)p++;
+    }
+    if(!count){tracks[0]=extent;return 1;}
+    if(fixed>extent && fixed>0)for(unsigned i=0;i<count;i++)tracks[i]*=extent/fixed;
+    else if(stars>0)for(unsigned i=0;i<count;i++)tracks[i]+=(extent-fixed)*weights[i]/stars;
+    else if(fixed<extent && fixed>0)for(unsigned i=0;i<count;i++)tracks[i]*=extent/fixed;
+    else if(fixed==0)for(unsigned i=0;i<count;i++)tracks[i]=extent/count;
+    return count;
+}
+static void layout_frameset(box_t *b,float height) {
+    float rows[32],cols[32];
+    unsigned nr=frameset_tracks(node_attr(b->node,"rows"),height,rows),nc=frameset_tracks(node_attr(b->node,"cols"),b->w,cols);
+    unsigned index=0;float y=0,x=0;
+    for(box_t *child=b->first;child;child=child->next,index++){
+        unsigned row=index/nc,col=index%nc;
+        if(row>=nr){child->w=child->h=0;continue;}
+        if(col==0){x=0;if(row)y+=rows[row-1];}
+        child->cb=b;child->x=x;child->y=y;child->w=cols[col];child->h=rows[row];
+        memset(child->m,0,sizeof child->m);memset(child->p,0,sizeof child->p);memset(child->b,0,sizeof child->b);
+        if(child->node && child->node->tag==T_frameset)layout_frameset(child,rows[row]);
+        child->baseline=child->last_baseline=child->h;x+=cols[col];
+    }
+    b->h=height;b->inline_ctx=false;
+}
 static void layout_inner(box_t *b, struct bfc *f, float ox, float oy, float cbh) {
+    if(b->node && !b->node->foreign && b->node->tag==T_frameset){
+        layout_frameset(b,cbh>=0?cbh:VH);return;
+    }
     struct bfc own = {0};
     bool root = is_bfc_root(b);
     if (root) {
@@ -2672,6 +2748,46 @@ static void layout_abs(box_t *a) {
 }
 
 /* ---------------------------------------------------------------- entry */
+/* Build each scrolling area's bounds once per layout, never from its current
+   scroll position. Propagate through the actual containing block: fixed boxes
+   and absolute boxes with an outside containing block do not inflate an
+   unrelated intermediate scroller. Clipped children's private overflow does
+   not leak into their ancestor's scrolling area. */
+static float scroll_extent(float value) {
+    return !isfinite(value) || value < 0 ? 0 : value > 100000000 ? 100000000 : value;
+}
+
+static void scroll_areas(box_t *b) {
+    b->scroll_w = scroll_extent(b->w + b->p[1] + b->p[3]);
+    b->scroll_h = scroll_extent(b->h + b->p[0] + b->p[2]);
+    for (int i = 0; i < b->nruns; i++) {
+        const struct run *r = &b->runs[i];
+        if (r->atomic) continue; /* its native box contributes below */
+        wfont font = style_font(r->st);
+        float asc, desc;
+        wf_metrics(&font, &asc, &desc);
+        b->scroll_w = fmaxf_(b->scroll_w, scroll_extent(b->p[3] + r->x + r->w + b->p[1]));
+        b->scroll_h = fmaxf_(b->scroll_h, scroll_extent(b->p[0] + b->content_dy + r->y + desc + b->p[2]));
+    }
+    for (int i = 0; i < b->ndecos; i++) {
+        const struct deco *r = &b->decos[i];
+        b->scroll_w = fmaxf_(b->scroll_w, scroll_extent(b->p[3] + r->x + r->w + b->p[1]));
+        b->scroll_h = fmaxf_(b->scroll_h, scroll_extent(b->p[0] + b->content_dy + r->y + r->h + b->p[2]));
+    }
+    for (box_t *c = b->first; c; c = c->next) scroll_areas(c);
+    box_scroll_clamp(b);
+    box_t *cb = b->cb;
+    if (!cb || b->kind == B_INLINE || b->kind == B_TEXT || b->kind == B_BR ||
+        (b->st && b->st->position == POS_FIXED) || web_dialog_layer_box(D, b)) return;
+    bool clipped = b->st && b->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(D, b);
+    float bw = clipped ? b->w + b->p[1] + b->p[3] : b->scroll_w;
+    float bh = clipped ? b->h + b->p[0] + b->p[2] : b->scroll_h;
+    float right = box_abs_x(b) - box_abs_x(cb) - b->p[3] + bw + b->b[1] + b->m[1] + cb->p[3] + cb->p[1];
+    float bottom = box_abs_y(b) - box_abs_y(cb) - b->p[0] + bh + b->b[2] + b->m[2] + cb->p[0] + cb->p[2];
+    cb->scroll_w = fmaxf_(cb->scroll_w, scroll_extent(right));
+    cb->scroll_h = fmaxf_(cb->scroll_h, scroll_extent(bottom));
+}
+
 static float max_bottom(box_t *b, float base) {
     float y = base + b->y + b->rel_dy;
     float bottom = y + b->h + b->p[2] + b->b[2];
@@ -2700,6 +2816,7 @@ void layout_doc(web_doc *d, int width, int height) {
     layout_inner(root, NULL, 0, 0, VH);
     for (int i = 0; i < d->abs_boxes.n; i++) layout_abs(d->abs_boxes.v[i]);
     relative_offsets(root);
+    scroll_areas(root);
     float h = fmaxf_(root->h, max_bottom(root, 0));
     for (int i = 0; i < d->abs_boxes.n; i++) {
         box_t *a = d->abs_boxes.v[i];

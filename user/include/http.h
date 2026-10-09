@@ -15,7 +15,8 @@ const char *ns_error(net_stream *s);                     /* last error, "" if no
 void ns_close(net_stream *s);
 
 /* ---- URLs ---- */
-#define HTTP_URL_PATH_MAX 2048u /* storage includes the terminating NUL */
+#define HTTP_URL_MAX 16384u /* shared HTTP/browser URL bound, including NUL */
+#define HTTP_URL_PATH_MAX HTTP_URL_MAX
 struct url {
     bool tls;
     char host[128];
@@ -58,6 +59,11 @@ struct http_resp {
 
 /* returns 0 when a response arrived (check status), -1 on failure with resp->error set */
 int http_request(const struct http_req *rq, struct http_resp *resp);
+/* Explicit finite response bound for trusted resource loaders. Applies to both
+   encoded wire bytes and decoded bytes, including callback delivery. The legacy
+   entry keeps its existing defaults; http_req and persisted caller ABI are unchanged. */
+#define HTTP_RESPONSE_BODY_MAX (32u * 1024u * 1024u)
+int http_request_limited(const struct http_req *rq, struct http_resp *resp, size_t body_limit);
 /* Both successful and failed responses may be freed. Do not free a borrowed
    headers_full used solely to adapt an existing header block for lookup. */
 void http_resp_free(struct http_resp *resp);

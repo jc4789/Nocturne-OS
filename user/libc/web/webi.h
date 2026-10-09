@@ -8,6 +8,7 @@
      paint.c   painting, hit testing, find
      doc.c     the public API: documents, resources, forms */
 #pragma once
+#include <http.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -140,6 +141,14 @@ typedef struct node {
     struct box *box;          /* the element's first box */
     struct box *anchor_block; /* inline elements: the block holding its first line */
     float anchor_dy;
+    /* Persistent CSSOM element scroll position; box/layout arenas are rebuilt.
+       Only the element's principal box consumes these offsets. */
+    double scroll_x, scroll_y;
+    /* Link completion identity survives stylesheet snapshot rebuilds. */
+    const char *stylesheet_url;
+    struct web_doc *stylesheet_owner;
+    uint64_t stylesheet_generation;
+    bool stylesheet_notified;
     /* form controls */
     char *value; /* current value of input/textarea (malloc'd) */
     size_t value_capacity;
@@ -171,6 +180,10 @@ typedef struct node {
     bool image_initialized, image_invalidated, image_has_source;
     struct node *owned_next; /* document-owned allocation list, including detached nodes */
     bool control_ready, script_started;
+    /* Native resource state must survive collection/recreation of a JS wrapper. */
+    bool js_force_async_set, js_force_async, js_image_notified;
+    int js_image;
+    uint64_t js_image_generation;
     bool style_disabled; /* stylesheet state, not the HTML disabled attribute */
     uint64_t resource_revision;
     const char *option_label;
@@ -397,6 +410,7 @@ typedef struct box {
     float m[4], p[4], b[4]; /* used margin, padding, border widths */
     float content_dy;       /* table cells: vertical-align shift of the content */
     float rel_dx, rel_dy;   /* position: relative */
+    float scroll_w, scroll_h; /* padding-edge scrolling area, unscrolled layout */
     float baseline;         /* first baseline, relative to the content box top (-1: none) */
     float last_baseline;    /* last baseline (inline-blocks align by it) */
     /* absolutely positioned boxes: where they would have been (relative to static_cb) */
@@ -453,6 +467,11 @@ void boxes_build(web_doc *d, arena_t *a);
 void layout_doc(web_doc *d, int width, int height);
 float box_abs_x(const box_t *b);
 float box_abs_y(const box_t *b);
+/* Paint/hit/DOMRect positions; box_abs remains unscrolled offset geometry. */
+float box_visual_x(const box_t *b);
+float box_visual_y(const box_t *b);
+bool box_element_scrollable(const box_t *b);
+void box_scroll_clamp(box_t *b);
 
 /* Inter / Noto Serif / Maple Mono, with family-aware missing-glyph fallback. */
 typedef struct wfont {
@@ -487,8 +506,17 @@ struct web_profile {
     uint64_t metadata_syncs, metadata_visits, metadata_ms;
 };
 struct web_doc {
+    web_doc *frame_parent;
+    web_doc *frame_retired_next;
+    node_t *frame_element;
+    struct web_frame *frames;
+    const char *inherited_url; /* about:blank/srcdoc base and origin, never an author property */
+    web_doc *origin_owner; /* inherited opaque origins retain native identity */
+    node_t *window_token; /* stable for navigation, distinct after removal */
+    unsigned frame_depth, frame_count, frame_navigation_count;
     struct web_profile profile;
     web_doc *dom_family, *dom_docs, *dom_next;
+    bool js_nodes_dirty; /* structural/Attr ownership changed; not text/style */
     bool inert; /* independent DOM only: no window, loader, style/resource scan */
     bool template_owner;
     bool has_shadow; /* family-wide fast path: stays set after a shadow root exists */
@@ -503,11 +531,12 @@ struct web_doc {
     node_t *owned_nodes;
     size_t control_bytes;
     size_t canvas_bytes;
+    uint8_t dom_create_reported; /* one numeric failure diagnostic per stage */
     uint64_t dom_revision;
     uint64_t layout_revision;
     struct html_parser *parser;
     struct web_js_state *js;
-    bool live, dirty, resources_dirty;
+    bool live, dirty, paint_dirty, resources_dirty, images_dirty;
     pvec css_cache;
     struct css_sheet_reuse *css_reuse; /* current CSS arena only, no DOM ownership */
     size_t css_reuse_bytes;
@@ -518,7 +547,7 @@ struct web_doc {
     node_t *root;   /* the document node */
     node_t *html, *head, *body;
     char *url;      /* the document's own URL */
-    char base[1024];
+    char base[HTTP_URL_MAX];
     bool base_seen;
     bool quirks; /* no (or a legacy) doctype */
     char *title;
@@ -561,6 +590,8 @@ void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *
 /* Incremental parser: 1 script boundary, 0 complete, -1 allocation failure.
    web_parse remains a scripting-disabled, fully parsed document. */
 struct html_parser *html_begin(web_doc *d, const char *html, size_t n, const char *charset, bool scripting);
+struct html_parser *html_open(web_doc *d);
+void html_close(struct html_parser *parser);
 int html_resume(struct html_parser *p, node_t **script);
 bool html_write(struct html_parser *p, const char *text, size_t n);
 void html_finish(struct html_parser *p);
@@ -569,6 +600,19 @@ node_t *html_contextual_fragment(web_doc *d, node_t *context, const char *html, 
 /* CSS overflow propagated from html/body belongs to the viewport, not a
    scrolled element-sized clipping rectangle. Computed styles stay intact. */
 bool doc_viewport_overflow_box(const web_doc *d, const box_t *b);
+bool doc_element_scroll_metrics(web_doc *d, node_t *n, float *width, float *height);
+/* True only when the regular element's native position actually changed.
+   Root/quirks-body viewport forwarding belongs to the Window host bridge. */
+bool doc_element_scroll(web_doc *d, node_t *n, double x, double y);
+enum doc_scroll_alignment { DOC_SCROLL_START, DOC_SCROLL_END, DOC_SCROLL_CENTER, DOC_SCROLL_NEAREST };
+/* Horizontal-LTR only. Current viewport positions enter through x/y; desired
+   positions leave through them. changed must start empty and is heap-owned.
+   1 rendered, 0 inactive/no box, -1 allocation, -2 bounded-chain refusal. */
+int doc_element_scroll_into_view(web_doc *d, node_t *n, int block, int inline_, bool nearest_only,
+                                double *x, double *y, pvec *changed);
+enum doc_create_failure { DOC_CREATE_INVALID, DOC_CREATE_QUOTA, DOC_CREATE_ALLOCATOR,
+    DOC_CREATE_OVERFLOW, DOC_CREATE_TEMPLATE, DOC_CREATE_WRAPPER };
+void doc_create_diagnostic(web_doc *d, unsigned stage, int type, size_t name_bytes, size_t data_bytes);
 node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t n);
 node_t *doc_node_root(node_t *node, bool composed);
 node_t *doc_shadow_parent(node_t *node); /* parent, or a shadow root's host */
@@ -619,6 +663,8 @@ void doc_sync_tree(web_doc *d);
 node_t *doc_image_node_next(web_doc *d, node_t *previous);
 void doc_image_sync(web_doc *d, node_t *n);
 void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const char *css, size_t n);
+bool doc_link_load_current(web_doc *d, node_t *n, uint64_t generation);
+bool web_js_stylesheet_event(web_doc *d, node_t *n, bool failed);
 bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out);
 bool css_matches(node_t *node, const char *selector, bool *valid);
 void web_js_start(web_doc *d, const struct web_host *host);
@@ -628,11 +674,20 @@ void web_js_face_reset(web_doc *d, node_t *form);
 node_t *web_autofocus_candidate(web_doc *d);
 void web_js_tick(web_doc *d, uint64_t now);
 void web_js_free(web_doc *d);
+void web_js_nodes_changed(web_doc *d);
+void web_js_retire(web_doc *d);
+bool web_js_complete(web_doc *d);
+void web_js_frames_sync(web_doc *d);
+web_doc *web_live_child(const char *html, size_t len, const char *url, const char *charset,
+                        const struct web_host *host, web_doc *parent, node_t *frame, web_doc *inherited_origin);
+const char *web_effective_url(web_doc *d);
 void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *r);
 int64_t web_js_deadline(web_doc *d);
 bool web_js_running(web_doc *d);
 bool web_js_enabled(web_doc *d);
 bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *e);
+/* Native edit event: NULL data means InputEvent.data=null. */
+bool web_js_input_event(web_doc *d,node_t *target,const char *type,const char *input_type,const char *data,size_t length);
 void web_js_selection_changed(web_doc *d, node_t *node);
 
 /* URL helpers (util.c) */

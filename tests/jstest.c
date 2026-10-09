@@ -59,13 +59,15 @@ struct fixture {
     int fetch_requests;
     int outside_running, navigations;
     int scroll_x, scroll_y;
-    bool expected_errors;
+    bool expected_errors, retirement_errors;
+    int retirement_interrupts, retirement_unexpected;
     const char *module_mime_headers;
     struct { char *url; void *data; size_t len; uint64_t entry; bool manual; } history[16];
     int history_pos, history_length, history_delta;
     uint64_t history_serial;
     bool history_pending;
-    char navigation[2048], post[256], last_error[512];
+    char navigation[2048], post[256], last_error[512], error_trace[8192];
+    int diagnostic_batches;
 };
 static struct fixture fixture;
 static int total, failed;
@@ -103,6 +105,13 @@ static void receive_log(void *opaque, int level, const char *message) {
     } else if (level == 2) {
         f->errors++;
         snprintf(f->last_error, sizeof f->last_error, "%s", message);
+        size_t used = strlen(f->error_trace);
+        snprintf(f->error_trace + used, sizeof f->error_trace - used, "%s\n", message);
+        if (!strncmp(message, "Diagnostic #", 12)) f->diagnostic_batches++;
+        if (f->retirement_errors) {
+            if (!strncmp(message,"InternalError: interrupted",26)) f->retirement_interrupts++;
+            else if (strncmp(message,"Diagnostic #",12) && strncmp(message,"Source ",7)) f->retirement_unexpected++;
+        }
         if (!f->expected_errors) printf("jstest: unexpected JavaScript error: %s\n", message);
     }
 }
@@ -307,16 +316,146 @@ static void external_case_expected(const char *file, const char *tail, const cha
     char *page = script_page(source); free(source);
     test_check("api-page-allocation", page != NULL); if (!page) return;
     if (open_case_url(page, expected_errors != 0, url)) {
+        fixture.retirement_errors=expected_errors==-1 && !strcmp(file,"js_retired_task_roots_cases.js");
         /* The collation oracle covers thousands of comparisons and yields
            between batches. This is a harness deadline, not the page watchdog. */
         test_check(file, pump("api-done", !strcmp(file,"js_collator_cases.js") ? 120000 : 15000));
-        test_check("api-expected-exceptions", fixture.errors == expected_errors && fixture.js_failures == 0);
+        if(fixture.retirement_errors)
+            test_check("api-retirement-interrupts",fixture.retirement_interrupts==3 && fixture.diagnostic_batches==3 && fixture.retirement_unexpected==0 && fixture.js_failures==0);
+        else test_check("api-expected-exceptions", fixture.errors == expected_errors && fixture.js_failures == 0);
         if (!strcmp(file,"js_form_validation_cases.js")) test_check("form-direct-submit-navigation",fixture.navigations==1);
         close_case();
     }
     free(page);
 }
 static void external_case(const char *file, const char *tail, const char *url) { external_case_expected(file,tail,url,0); }
+static void test_broadcast(void) {
+    external_case("js_broadcast_cases.js", ";runBroadcastCases().then(n=>{console.log('Broadcast API checks '+n);check('broadcast-count',n===27);mark('api-done');},e=>{console.log('FAIL broadcast '+e+' '+e.stack);mark('api-done');});", BASE);
+}
+static void test_retired_jobs(void) {
+    external_case("js_retired_frame_jobs_cases.js", ";runRetiredFrameJobCases().then(n=>{console.log('Retired frame API checks '+n);check('retired-job-count',n===18);mark('api-done');},e=>{console.log('FAIL retired-jobs '+e+' '+e.stack);mark('api-done');});", BASE);
+}
+static void test_retired_tasks(void) {
+    external_case_expected("js_retired_task_roots_cases.js", ";runRetiredTaskRootCases().then(n=>{console.log('Retired task root checks '+n);check('retired-task-count',n===21);mark('api-done');},e=>{console.log('FAIL retired tasks '+e+' '+e.stack);mark('api-done');});", BASE,-1);
+}
+static void test_error_event(void) {
+    external_case("js_error_event_cases.js", ";console.log('ErrorEvent API checks '+runErrorEventCases());mark('api-done');", BASE);
+}
+static void test_history_receiver(void) {
+    external_case("js_history_receiver_cases.js", ";runHistoryReceiverCases().then(n=>{console.log('History receiver checks '+n);check('history-receiver-count',n>=30);mark('api-done');},e=>{console.log('FAIL history receiver '+e+' '+e.stack);mark('api-done');});", BASE);
+}
+static void test_inner_text(void) {
+    external_case("js_inner_text_cases.js", ";runInnerTextCases().then(n=>{console.log('Inner text checks '+n);check('inner-text-count',n>=30);mark('api-done');},e=>{console.log('FAIL inner text '+e+' '+e.stack);mark('api-done');});", BASE);
+}
+static void test_collections(void) {
+    external_case("js_collections_cases.js", ";runCollectionCases().then(n=>{console.log('Collection API checks '+n);check('collections-count',n>=100);mark('api-done');},e=>{console.log('FAIL collections '+e+' '+e.stack);mark('api-done');});", BASE);
+    external_case("js_document_collections_cases.js", ";runDocumentCollectionCases().then(n=>{console.log('Document collection API checks '+n);check('document-collections-count',n>=120);mark('api-done');},e=>{console.log('FAIL document collections '+e+' '+e.stack);mark('api-done');});", BASE);
+}
+static void test_adjacent(void) {
+    external_case("js_adjacent_cases.js", ";runAdjacentCases().then(n=>{console.log('Adjacent API checks '+n);check('adjacent-count',n===67);mark('api-done');},e=>{console.log('FAIL adjacent '+e+' '+e.stack);mark('api-done');});", BASE);
+}
+static void test_fragment_constructor(void) {
+    external_case("js_fragment_constructor_cases.js", ";runFragmentConstructorCases().then(n=>{console.log('Fragment constructor API checks '+n);check('fragment-constructor-count',n>=45);mark('api-done');},e=>{console.log('FAIL fragment constructor '+e+' '+e.stack);mark('api-done');});", BASE);
+}
+static void test_resource_structure(void) {
+    external_case("js_resource_structure_cases.js", ";runResourceStructureCases().then(n=>{console.log('Resource structure API checks '+n);check('resource-structure-count',n===17);mark('api-done');},e=>{console.log('FAIL resource structure '+e+' '+e.stack);mark('api-done');});", BASE);
+}
+static void test_detached_invalidation(void) {
+    const char *page=START "</head><body style='margin:0'><div id=target style='height:20px'></div><div id=sentinel></div><script>mark('detached-ready');</script></body>";
+    if (!open_case(page,false)) return;
+    test_check("detached-document-ready",pump("detached-ready",3000));
+    (void)web_dirty(fixture.doc);
+    const char *prepare="globalThis.detached=document.createElement('div');detached.setAttribute('class','prepared');detached.style.height='35px';detached.textContent='prepared';";
+    test_check("detached-mutation-eval",web_console_eval(fixture.doc,prepare,strlen(prepare)));
+    /* The developer console itself requests repaint. Verify the public layout
+       boundary rather than confusing that notification with style dirtiness. */
+    web_layout(fixture.doc,VW,VH);
+    test_check("detached-preserves-live-layout",web_anchor_y(fixture.doc,"sentinel")==20);
+    const char *insert="document.body.insertBefore(detached,document.getElementById('sentinel'));";
+    test_check("detached-insert-eval",web_console_eval(fixture.doc,insert,strlen(insert)));
+    test_check("detached-insert-dirties-live-tree",web_dirty(fixture.doc));
+    web_layout(fixture.doc,VW,VH);
+    test_check("detached-insert-height",web_anchor_y(fixture.doc,"sentinel")==55);
+    const char *remove="globalThis.forest=document.createElement('section');forest.appendChild(document.getElementById('target'));";
+    test_check("live-to-detached-eval",web_console_eval(fixture.doc,remove,strlen(remove)));
+    test_check("live-to-detached-dirties-old-parent",web_dirty(fixture.doc));
+    web_layout(fixture.doc,VW,VH);
+    test_check("live-to-detached-height",web_anchor_y(fixture.doc,"sentinel")==35);
+    const char *image="globalThis.detachedImage=new Image();detachedImage.src='missing-detached.png';";
+    test_check("detached-image-eval",web_console_eval(fixture.doc,image,strlen(image)));
+    step(&fixture); /* Resource requests are issued by the next web_tick. */
+    test_check("detached-image-resource-path-kept",fixture.requests>0);
+    test_check("detached-no-js-errors",fixture.errors==0);
+    close_case();
+}
+static void test_image_invalidation(void) {
+    const char *page=START "<style>img{display:block;width:20px;height:20px}img[data-original='two.svg']{height:40px}</style></head>"
+        "<body style='margin:0'><img id=image data-original='one.svg'><div id=sentinel></div>"
+        "<picture><source id=source srcset='picture-one.svg 1x'><img id=picture></picture>"
+        "<script>mark('image-invalidation-ready');</script></body>";
+    if (!open_case(page,false)) return;
+    test_check("image-invalidation-ready",pump("image-invalidation-ready",3000));
+    web_layout(fixture.doc,VW,VH);
+    test_check("image-attribute-initial-layout",web_anchor_y(fixture.doc,"sentinel")==20);
+    const char *change="document.getElementById('image').setAttribute('data-original','two.svg');"
+        "document.getElementById('source').setAttribute('srcset','picture-two.svg 1x');";
+    test_check("image-candidate-mutation-eval",web_console_eval(fixture.doc,change,strlen(change)));
+    web_layout(fixture.doc,VW,VH);
+    test_check("image-candidate-preserves-attribute-selector",web_anchor_y(fixture.doc,"sentinel")==40);
+    bool image_url=false,picture_url=false;
+    for(int i=0;i<web_image_count(fixture.doc);i++) {
+        const char *url=web_image_url(fixture.doc,i);
+        image_url|=url && strstr(url,"/two.svg")!=NULL;
+        picture_url|=url && strstr(url,"/picture-two.svg")!=NULL;
+    }
+    test_check("image-lazy-candidate-updated",image_url);
+    test_check("image-picture-source-updated",picture_url);
+    for(int i=0;i<30;i++){step(&fixture);msleep(1);}
+    int previous_requests=fixture.requests;
+    const char *idle="requestIdleCallback(()=>{globalThis.lastIdleImage=new Image();lastIdleImage.src='last-idle-image.svg';mark('last-idle-image-set');});";
+    test_check("last-idle-image-queued",web_console_eval(fixture.doc,idle,strlen(idle)));
+    test_check("last-idle-image-callback",pump("last-idle-image-set",3000));
+    test_check("last-idle-image-wake",web_deadline(fixture.doc)>=0);
+    step(&fixture);
+    test_check("last-idle-image-dispatch",fixture.requests>previous_requests);
+    test_check("image-invalidation-no-js-errors",fixture.errors==0);
+    close_case();
+
+    /* Fetch is not a load blocker, but an unqueued wanted image still is.
+       Exercise a full JS queue without the harness's 1ms pump hiding a
+       deadline that incorrectly wakes forever instead of waiting for Fetch. */
+    const char *full=START "</head><body><script>"
+        "addEventListener('load',()=>mark('image-queue-load'));"
+        "document.addEventListener('DOMContentLoaded',()=>mark('image-queue-dom-ready'));"
+        "for(let i=0;i<8;i++)fetch('/dir/api/slow').catch(()=>{});"
+        "globalThis.waitingImage=new Image();waitingImage.src='queued-wanted.svg';"
+        "</script></body>";
+    if (!open_case(full,false)) return;
+    test_check("image-queue-dom-ready",pump("image-queue-dom-ready",3000));
+    test_check("image-queue-eight-fetch-requests",fixture.fetch_requests==8 && fixture.requests==8);
+    test_check("image-queue-eight-held-requests",queued_count(&fixture)==8 && fixture.completions==0);
+    bool wanted=false,queued_image=false;
+    for(int i=0;i<web_image_count(fixture.doc);i++) {
+        const char *url=web_image_url(fixture.doc,i);
+        if(url && strstr(url,"/queued-wanted.svg") && web_image_wanted(fixture.doc,i))wanted=true;
+    }
+    for(int i=0;i<SLOTS;i++)if(fixture.queue[i].used && fixture.queue[i].kind==WEB_RESOURCE_IMAGE)queued_image=true;
+    test_check("image-queue-detached-image-wanted",wanted);
+    test_check("image-queue-image-not-dispatched",!queued_image);
+    int future=0;
+    for(int i=0;i<16;i++) {
+        step(&fixture);web_layout(fixture.doc,VW,VH);
+        uint64_t now=uptime_ms();int64_t deadline=web_deadline(fixture.doc);
+        if(i>=8 && deadline>(int64_t)now)future++;
+        msleep(1);
+    }
+    test_check("image-queue-full-deadline-waits",future==8);
+    test_check("image-queue-load-still-blocked",!has_mark(&fixture,"image-queue-load"));
+    test_check("image-queue-no-extra-requests",fixture.requests==8 && queued_count(&fixture)==8);
+    test_check("image-queue-no-js-errors",fixture.errors==0 && fixture.js_failures==0);
+    close_case();
+    test_check("image-queue-close-cancels-held-fetch",queued_count(&fixture)==0 && fixture.cancellations==8);
+}
 static void test_lexbor(void) {
     external_case("js_lexbor_cases.js", ";const r=runLexborCases();check('lexbor-probe-count',r.checks===62&&r.legacyTotal===1&&r.unsupportedAPITotal===0);mark('api-done');", BASE);
 }
@@ -679,8 +818,10 @@ static void test_host_microtasks(void) {
     if(page && open_case(page,true)) {
         test_check("microtask-error-finished",pump("microtask-error-done",5000));
         test_check("microtask-error-drained",has_mark(&fixture,"microtasks-drain-after-error"));
-        test_check("microtask-error-reported",fixture.errors==1&&strstr(fixture.last_error,"host-microtask-failure")!=NULL);
-        test_check("microtask-error-not-rejection",strstr(fixture.last_error,"Unhandled promise rejection")==NULL);
+        /* One exception now has several console diagnostics. Retain the whole
+           bounded report rather than overwriting its error with the excerpt. */
+        test_check("microtask-error-reported",fixture.errors>0&&fixture.diagnostic_batches==1&&strstr(fixture.error_trace,"host-microtask-failure")!=NULL);
+        test_check("microtask-error-not-rejection",strstr(fixture.error_trace,"Unhandled promise rejection")==NULL);
         close_case();
     }
     free(page);
@@ -688,7 +829,7 @@ static void test_host_microtasks(void) {
     test_check("rejection-stack-page",page!=NULL);
     if(page && open_case(page,true)) {
         test_check("rejection-stack-finished",pump("rejection-done",5000));
-        test_check("rejection-stack-reported",fixture.errors==1&&strstr(fixture.last_error,"Unhandled promise rejection: Error: module-diagnostic")&&strstr(fixture.last_error,BASE));
+        test_check("rejection-stack-reported",fixture.errors>0&&fixture.diagnostic_batches==1&&strstr(fixture.error_trace,"Unhandled promise rejection: Error: module-diagnostic")&&strstr(fixture.error_trace,BASE));
         close_case();
     }
     free(page);
@@ -898,12 +1039,28 @@ static void test_lifetime(void) {
     free(old); free(fresh);
 }
 
+#include "js_frames_native.h"
+#include "js_node_position_native.h"
 int main(int argc, char **argv) {
     uint64_t start = uptime_ms();
     /* Optional selectors make a failing feature reproducible in the real OS. */
 #define RUN(name, fn) do { if (argc == 1 || !strcmp(argv[1], name)) { printf("jstest: %s\n", name); fflush(stdout); fn(); } } while (0)
     RUN("language", test_language);
     RUN("platform", test_platform);
+    RUN("broadcast", test_broadcast);
+    RUN("retired-jobs", test_retired_jobs);
+    RUN("retired-tasks", test_retired_tasks);
+    RUN("error-event", test_error_event);
+    RUN("history-receiver", test_history_receiver);
+    RUN("inner-text", test_inner_text);
+    RUN("collections", test_collections);
+    RUN("adjacent", test_adjacent);
+    RUN("fragment-constructors", test_fragment_constructor);
+    RUN("resource-structure", test_resource_structure);
+    RUN("detached", test_detached_invalidation);
+    RUN("image-invalidation", test_image_invalidation);
+    RUN("frames", test_frames);
+    RUN("node-position", test_node_position);
     RUN("cssom", test_cssom);
     /* Already included in platform above; selecting lexbor runs only its probes. */
     if (argc > 1 && !strcmp(argv[1], "lexbor")) { printf("jstest: lexbor\n"); fflush(stdout); test_lexbor(); }

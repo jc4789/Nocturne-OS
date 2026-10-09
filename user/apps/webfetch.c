@@ -13,7 +13,14 @@
 struct job {
     struct webnet_wire_request wire;
     char *url, *document, *method, *headers, *request_body;
-    char origin[WEBNET_URL_MAX], final_url[WEBNET_URL_MAX], error[160];
+    char origin[160], final_url[WEBNET_URL_MAX], error[160];
+    /* User processes have a 64 KiB stack. Keep bounded URL/header work on the
+       already heap-owned job; do not grow six local arrays on every hop. */
+    char current[WEBNET_URL_MAX], document_url[WEBNET_URL_MAX];
+    char location[WEBNET_URL_MAX], resolved[WEBNET_URL_MAX];
+    char decoded[WEBNET_URL_MAX], cookie_url[WEBNET_URL_MAX];
+    char path[WEBNET_URL_MAX], document_path[WEBNET_URL_MAX];
+    char outgoing[WEBNET_REQUEST_HEADERS_MAX + WEBCOOKIE_OUTPUT_MAX + 288];
     char *response_headers;
     size_t response_headers_len;
     char *body;
@@ -119,10 +126,10 @@ static int hex(unsigned char c) {
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
 }
-static bool file_path(const char *url, char *out, size_t cap) {
+static bool file_path(const char *url, char *out, size_t cap, char *decoded) {
     if (strncmp(url, "file:///", 8)) return false;
     const char *p = url + 7;
-    char decoded[WEBNET_URL_MAX]; size_t n = 0;
+    size_t n = 0;
     while (*p && *p != '?' && *p != '#') {
         unsigned char c = (unsigned char)*p++;
         if (c == '%') {
@@ -130,7 +137,7 @@ static bool file_path(const char *url, char *out, size_t cap) {
             if (a < 0 || b < 0) return false;
             c = (unsigned char)((a << 4) | b); p += 2;
         }
-        if (!c || c < 32 || c == 127 || c == '\\' || n + 1 >= sizeof decoded) return false;
+        if (!c || c < 32 || c == 127 || c == '\\' || n + 1 >= WEBNET_URL_MAX) return false;
         decoded[n++] = (char)c;
     }
     decoded[n] = 0;
@@ -157,12 +164,12 @@ static bool file_path(const char *url, char *out, size_t cap) {
 }
 static bool load_file(struct job *j) {
     if (j->wire.kind == WEBNET_FETCH) return fail(j, "fetch accepts only HTTP(S)");
-    char path[WEBNET_URL_MAX], document_path[WEBNET_URL_MAX];
-    if (!file_path(j->url, path, sizeof path)) return fail(j, "Invalid local URL");
+    char *path = j->path, *document_path = j->document_path;
+    if (!file_path(j->url, path, sizeof j->path, j->decoded)) return fail(j, "Invalid local URL");
     if (j->wire.kind == WEBNET_NAVIGATION) {
         if (!(j->wire.user_navigation & WEBNET_WIRE_USER_NAVIGATION)) return fail(j, "Only a user navigation may open a local file");
     } else {
-        if (!file_path(j->document, document_path, sizeof document_path)) return fail(j, "Remote pages cannot open local files");
+        if (!file_path(j->document, document_path, sizeof j->document_path, j->decoded)) return fail(j, "Remote pages cannot open local files");
         char *slash = strrchr(document_path, '/');
         if (!slash) return fail(j, "Invalid local document URL");
         size_t dl = (size_t)(slash - document_path) + 1;
@@ -172,7 +179,7 @@ static bool load_file(struct job *j) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) return fail(j, "Cannot open local resource");
     struct n_stat st;
-    if (fstat(fd, &st) < 0 || st.type != N_FT_FILE || st.size > WEBNET_BODY_LIMIT) {
+    if (fstat(fd, &st) < 0 || st.type != N_FT_FILE || st.size > webnet_wire_response_limit(j->wire.kind, j->wire.user_navigation)) {
         close(fd); return fail(j, "Invalid or oversized local resource");
     }
     j->body = malloc((size_t)st.size + 1);
@@ -345,7 +352,7 @@ static void remove_body_headers(char *headers) {
     remove_request_header(headers, "Content-Type");
 }
 static bool cors_allowed(struct job *j, const struct http_resp *r) {
-    char allow[WEBNET_URL_MAX];
+    char allow[160]; /* serialized supported origin is <=159 bytes */
     const char *headers = http_response_headers(r);
     if (!field(headers, "Access-Control-Allow-Origin", allow, sizeof allow) ||
         (strcmp(allow, "*") && strcmp(allow, request_origin(j)))) return fail(j, "Cross-origin response is not allowed");
@@ -381,9 +388,9 @@ static bool apply_cookie_events(struct job *j,size_t start,const char *method) {
     const unsigned char *p=j->cookie_events+start,*end=j->cookie_events+j->cookie_len;
     while(p<end){
         struct webnet_wire_cookie e;memcpy(&e,p,sizeof e);p+=sizeof e;
-        char url[WEBNET_URL_MAX];memcpy(url,p,e.url_len);url[e.url_len]=0;p+=e.url_len;
+        char *url=j->cookie_url;memcpy(url,p,e.url_len);url[e.url_len]=0;p+=e.url_len;
         struct webcookie_context c={url,*j->document?j->document:j->wire.kind==WEBNET_NAVIGATION?NULL:"",method,
-            j->wire.kind==WEBNET_NAVIGATION,true,e.redirect_cross_site!=0};
+            j->wire.kind==WEBNET_NAVIGATION && (j->wire.user_navigation & WEBNET_WIRE_USER_NAVIGATION),true,e.redirect_cross_site!=0};
         if(webcookie_set(j->cookies,&c,(const char*)p,e.value_len,e.received)<0)return fail(j,"Out of memory applying cookies");
         p+=e.value_len;
     }
@@ -392,11 +399,14 @@ static bool apply_cookie_events(struct job *j,size_t start,const char *method) {
 static int body_cb(void *opaque, const char *data, size_t n) {
     struct job *j = opaque;
     if (!remaining(j)) return -1;
-    if (n > WEBNET_BODY_LIMIT - j->body_len) { fail(j, "Response exceeds 16 MiB"); return -1; }
+    size_t limit = webnet_wire_response_limit(j->wire.kind, j->wire.user_navigation);
+    if (j->body_len > limit || n > limit - j->body_len) {
+        fail(j, limit == WEBNET_BODY_LIMIT ? "Response exceeds 16 MiB" : "Script response exceeds 32 MiB"); return -1;
+    }
     size_t need = j->body_len + n + 1;
     if (need > j->body_cap) {
         size_t cap = j->body_cap ? j->body_cap : 8192;
-        while (cap < need) cap = MIN(cap * 2, (size_t)WEBNET_BODY_LIMIT + 1);
+        while (cap < need) cap = MIN(cap * 2, limit + 1);
         char *p = realloc(j->body, cap);
         if (!p) { fail(j, "Out of memory receiving response"); return -1; }
         j->body = p; j->body_cap = cap;
@@ -528,9 +538,10 @@ static bool response_headers(struct job *j, const struct http_resp *r, bool cros
     return true;
 }
 static bool run_http(struct job *j) {
-    char current[WEBNET_URL_MAX], target_origin[WEBNET_URL_MAX], document_url[WEBNET_URL_MAX];
-    if (!http_url(j->url, current, sizeof current, target_origin, sizeof target_origin)) return fail(j, "Invalid HTTP(S) URL");
-    bool document_http = http_url(j->document, document_url, sizeof document_url, j->origin, sizeof j->origin);
+    char *current = j->current, *document_url = j->document_url;
+    char target_origin[160];
+    if (!http_url(j->url, current, sizeof j->current, target_origin, sizeof target_origin)) return fail(j, "Invalid HTTP(S) URL");
+    bool document_http = http_url(j->document, document_url, sizeof j->document_url, j->origin, sizeof j->origin);
     if (!document_http) snprintf(j->origin, sizeof j->origin, "null");
     char names[WEBNET_REQUEST_HEADERS_MAX];
     if (!validate_headers(j, names, sizeof names)) return false;
@@ -543,8 +554,8 @@ static bool run_http(struct job *j) {
     for (unsigned hop = 0; hop <= 10; hop++) {
         if (hop == 10) return fail(j, "Too many redirects");
         if (!http_url(current, j->final_url, sizeof j->final_url, target_origin, sizeof target_origin)) return fail(j, "Redirect target is not HTTP(S)");
-        snprintf(current, sizeof current, "%s", j->final_url);
-        if (j->wire.kind != WEBNET_NAVIGATION && document_http && !strncmp(j->origin, "https://", 8) && !strncmp(current, "http://", 7)) return fail(j, "HTTPS page cannot load insecure content");
+        snprintf(current, sizeof j->current, "%s", j->final_url);
+        if ((j->wire.kind != WEBNET_NAVIGATION || !(j->wire.user_navigation & WEBNET_WIRE_USER_NAVIGATION)) && document_http && !strncmp(j->origin, "https://", 8) && !strncmp(current, "http://", 7)) return fail(j, "HTTPS page cannot load insecure content");
         bool cross = strcmp(j->origin, target_origin) != 0;
         if (cross && (j->wire.user_navigation & WEBNET_WIRE_SAME_ORIGIN))
             return fail(j, "Cross-origin fetch is forbidden by same-origin mode");
@@ -556,22 +567,22 @@ static bool run_http(struct job *j) {
         if (!validate_headers(j, names, sizeof names)) return false;
         bool simple_method = !strcmp(method, "GET") || !strcmp(method, "HEAD") || !strcmp(method, "POST");
         if (j->cors_tainted && (!simple_method || *names || (j->wire.user_navigation & WEBNET_WIRE_FORCE_PREFLIGHT)) && !preflight(j, current, method, names)) return false;
-        char headers[WEBNET_REQUEST_HEADERS_MAX + WEBNET_URL_MAX + WEBCOOKIE_OUTPUT_MAX + 128];
+        char *headers = j->outgoing;
         int hn;
-        if (cors_kind(j)) hn = snprintf(headers, sizeof headers, "%sOrigin: %s\r\n", j->headers, request_origin(j));
-        else hn = snprintf(headers, sizeof headers, "%s", j->headers);
-        if (hn < 0 || (size_t)hn >= sizeof headers) return fail(j, "Request headers too large");
-        if (!cache_headers(j, headers, sizeof headers, &hn)) return false;
+        if (cors_kind(j)) hn = snprintf(headers, sizeof j->outgoing, "%sOrigin: %s\r\n", j->headers, request_origin(j));
+        else hn = snprintf(headers, sizeof j->outgoing, "%s", j->headers);
+        if (hn < 0 || (size_t)hn >= sizeof j->outgoing) return fail(j, "Request headers too large");
+        if (!cache_headers(j, headers, sizeof j->outgoing, &hn)) return false;
         j->hop_cookies=j->wire.credentials==WEBNET_CREDENTIALS_INCLUDE ||
             (j->wire.credentials==WEBNET_CREDENTIALS_SAME_ORIGIN && !cross && !j->cors_tainted);
         if(j->hop_cookies){
             struct webcookie_context c={current,*j->document?j->document:j->wire.kind==WEBNET_NAVIGATION?NULL:"",method,
-                j->wire.kind==WEBNET_NAVIGATION,true,j->redirect_cross_site};
+                j->wire.kind==WEBNET_NAVIGATION && (j->wire.user_navigation & WEBNET_WIRE_USER_NAVIGATION),true,j->redirect_cross_site};
             long size=webcookie_get(j->cookies,&c,NULL,0,time(NULL));
-            if(size<0 || (size_t)size+12>=sizeof headers-(size_t)hn)return fail(j,"Cookie request header exceeds limit");
+            if(size<0 || (size_t)size+12>=sizeof j->outgoing-(size_t)hn)return fail(j,"Cookie request header exceeds limit");
             if(size){
                 memcpy(headers+hn,"Cookie: ",8);hn+=8;
-                long wrote=webcookie_get(j->cookies,&c,headers+hn,sizeof headers-(size_t)hn-2,time(NULL));
+                long wrote=webcookie_get(j->cookies,&c,headers+hn,sizeof j->outgoing-(size_t)hn-2,time(NULL));
                 if(wrote<0)return fail(j,"Cannot serialize request cookies");
                 hn+=(int)wrote;memcpy(headers+hn,"\r\n",3);hn+=2;
             }
@@ -583,7 +594,10 @@ static bool run_http(struct job *j) {
                              left, body_cb, j, cookie_header};
         struct http_resp r;
         size_t cookie_start=j->cookie_len;
-        int result = http_request(&q, &r);
+        size_t body_limit = webnet_wire_response_limit(j->wire.kind, j->wire.user_navigation);
+        /* Only the negotiated script response may expand past the legacy gzip
+           cap. General resources retain their existing streaming/default path. */
+        int result = body_limit > WEBNET_BODY_LIMIT ? http_request_limited(&q, &r, body_limit) : http_request(&q, &r);
         if (result < 0) { j->cookie_len=cookie_start; if (!j->error[0]) fail(j, r.error); http_resp_free(&r); return false; }
         if (!apply_cookie_events(j,cookie_start,method)) { http_resp_free(&r); return false; }
         if (j->cors_tainted && !cors_allowed(j, &r)) { http_resp_free(&r); return false; }
@@ -592,12 +606,12 @@ static bool run_http(struct job *j) {
             if (j->wire.user_navigation & WEBNET_WIRE_REDIRECT_ERROR) {
                 http_resp_free(&r); return fail(j, "Redirect forbidden by redirect mode");
             }
-            char location[WEBNET_URL_MAX], resolved[WEBNET_URL_MAX];
-            char previous_origin[WEBNET_URL_MAX];
+            char *location = j->location, *resolved = j->resolved;
+            char previous_origin[160];
             snprintf(previous_origin, sizeof previous_origin, "%s", target_origin);
-            if (!field(http_response_headers(&r), "Location", location, sizeof location) ||
-                !web_resolve_url(current, location, resolved, sizeof resolved) ||
-                !http_url(resolved, current, sizeof current, target_origin, sizeof target_origin)) {
+            if (!field(http_response_headers(&r), "Location", location, sizeof j->location) ||
+                !web_resolve_url(current, location, resolved, sizeof j->resolved) ||
+                !http_url(resolved, current, sizeof j->current, target_origin, sizeof target_origin)) {
                 http_resp_free(&r); return fail(j, "Invalid or prohibited redirect target");
             }
             if (!webcookie_same_site(j->cookies,j->final_url,current)) j->redirect_cross_site=true;
@@ -644,6 +658,7 @@ int main(void) {
         !w->url_len || w->url_len >= WEBNET_URL_MAX || w->origin_len >= WEBNET_URL_MAX ||
         !w->method_len || w->method_len >= WEBNET_METHOD_MAX || w->headers_len >= WEBNET_REQUEST_HEADERS_MAX || w->body_len > WEBNET_BODY_LIMIT ||
         w->credentials>WEBNET_CREDENTIALS_INCLUDE || (w->user_navigation & ~WEBNET_WIRE_REQUEST_FLAGS) || w->cookie_len>WEBCOOKIE_SNAPSHOT_MAX ||
+        !webnet_wire_script_flag_valid(w->kind, w->user_navigation) ||
         (w->credentials==WEBNET_CREDENTIALS_OMIT && w->cookie_len) ||
         WEBNET_WIRE_CACHE_MODE(w->user_navigation) > WEBNET_CACHE_ONLY_IF_CACHED ||
         (w->kind != WEBNET_FETCH && WEBNET_WIRE_CACHE_MODE(w->user_navigation) != WEBNET_CACHE_DEFAULT)) { free(j); return 1; }

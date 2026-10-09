@@ -103,6 +103,8 @@ def main():
     ap.add_argument('--guest-file', action='append', default=[], help='明示したconsole入力を隔離dataの/testsへコピー（サイトfixture用ではない）')
     ap.add_argument('--cmdline', default='')
     ap.add_argument('--seconds', type=float, default=60)
+    ap.add_argument('--screen-interval', type=float, default=30, help='画面観察間隔（秒、最小1秒）')
+    ap.add_argument('--defer-screen-png', action='store_true', help='再生中のhost圧縮負荷を避け、VM停止後に画面をPNG化')
     ap.add_argument('--memory', type=int, default=2048)
     ap.add_argument('--cpus', type=int, default=4)
     ap.add_argument('--cpu-model', help='この専用QEMUだけに渡すCPUモデルと機能指定')
@@ -117,6 +119,7 @@ def main():
     ap.add_argument('--key', action='append', default=[])
     ap.add_argument('--timed-key', action='append', default=[], help='秒:QEMUキー。実ページの準備後にconsole等を操作する')
     ap.add_argument('--mouse-marker', help='serialの「接頭辞 識別番号 x y」に応じて隔離PS/2で実クリック')
+    ap.add_argument('--mouse-keys', help='markerクリック後の実PS/2キー列（カンマ区切り、最大128キー）')
     ap.add_argument('--mouse-origin', default='0:0', help='marker座標に足す画面内原点 x:y')
     ap.add_argument('--mouse-position-marker', help='native mousemove の「接頭辞 x y」で加速・coalescingのずれを補正')
     ap.add_argument('--scroll-pages', type=int, default=0, help='実ページをクリックしてから結果一覧を順に下へ送り画面を保存')
@@ -126,10 +129,14 @@ def main():
     ap.add_argument('--allow-panic', action='store_true', help='期待panicの負例検証だけで使用')
     ap.add_argument('--stop-when-expected', action='store_true')
     a = ap.parse_args()
+    if a.url and any(re.match(r'\s*(?:/data/bin/)?browser(?:\s|$)', command) for command in a.command):
+        ap.error('--urlとbrowser起動commandは併用できません。操作console付き起動は--commandだけ指定してください')
     if not re.fullmatch('[a-zA-Z0-9_-]+', a.label) or not 1 <= a.cpus <= 16 or not 256 <= a.memory <= 16384:
         ap.error('不正なラベル、CPU数またはRAMです')
     if not 1 <= a.seconds <= 3600 or any(x in a.cmdline for x in '\r\n\0'):
         ap.error('不正な実行時間またはboot引数です')
+    if not 1 <= a.screen_interval <= 3600:
+        ap.error('画面間隔は1から3600秒です')
     if any(not re.fullmatch('[a-zA-Z0-9_-]+', x) for x in a.key):
         ap.error('不正なQEMUキー名です')
     timed_keys = []
@@ -141,6 +148,10 @@ def main():
     timed_keys.sort()
     if a.mouse_marker and not re.fullmatch('[a-zA-Z0-9_]+', a.mouse_marker):
         ap.error('不正なマウスmarkerです')
+    mouse_keys = a.mouse_keys.split(',') if a.mouse_keys else []
+    if mouse_keys and (not a.mouse_marker or len(mouse_keys)>128 or
+                      any(not re.fullmatch('[a-zA-Z0-9_-]+',x) for x in mouse_keys)):
+        ap.error('mouse-keysはmarkerと有効な128個以内のキー名が必要です')
     if a.mouse_position_marker and not re.fullmatch('[a-zA-Z0-9_]+', a.mouse_position_marker):
         ap.error('不正なマウス位置markerです')
     origin = re.fullmatch(r'([0-9]{1,5}):([0-9]{1,5})', a.mouse_origin)
@@ -230,13 +241,16 @@ def main():
                          creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
     metadata['pid'] = p.pid
     start = time.monotonic()
+    captures = []
     metadata_path = here / 'metadata.json'
     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
 
     def shot(mon, name):
         ppm, png = here / (name+'.ppm'), here / (name+'.png')
         mon.cmd('screendump '+ppm.relative_to(ROOT).as_posix())
-        png_from_ppm(ppm, png)
+        captures.append({'name':name, 'elapsed':round(time.monotonic()-start, 3)})
+        if not a.defer_screen_png:
+            png_from_ppm(ppm, png)
 
     failure = None
     mon = None
@@ -298,13 +312,16 @@ def main():
                     mon.cmd('mouse_button 1')
                     time.sleep(.1)
                     mon.cmd('mouse_button 0')
-                    mouse_actions.append({'id':ident, 'screen':[sx, sy], 'marker':[int(x), int(y)]})
+                    for key in mouse_keys:
+                        mon.cmd('sendkey '+key)
+                        time.sleep(.2)
+                    mouse_actions.append({'id':ident, 'screen':[sx, sy], 'marker':[int(x), int(y)], 'keys':mouse_keys})
                     (here/'mouse-actions.json').write_text(json.dumps(mouse_actions, indent=2), encoding='utf-8')
                     print('隔離PS/2クリック:', ident, sx, sy, flush=True)
             if elapsed >= next_shot:
                 shot(mon, 'screen-'+str(index))
                 index += 1
-                next_shot += 30
+                next_shot += a.screen_interval
                 if index == 1:
                     if (a.key or a.scroll_pages) and not a.no_focus_click:
                         mon.cmd('mouse_button 1')
@@ -362,6 +379,11 @@ def main():
         if mon is not None:
             mon.s.close()
         err.close()
+        if a.defer_screen_png:
+            for capture in captures:
+                ppm = here / (capture['name']+'.ppm')
+                png_from_ppm(ppm, ppm.with_suffix('.png'))
+        metadata['screen_captures'] = captures
         log = serial.read_text(encoding='utf-8', errors='replace') if serial.exists() else ''
         missing = [x for x in a.expect if x not in log]
         rejected = [x for x in a.reject if x in log]

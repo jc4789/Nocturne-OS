@@ -1,7 +1,8 @@
 /* Session history is owned by the native browser, not an unrelated JS stack. */
-{
+const historyBridge=(()=>{
     const URLImpl = globalThis.URL;
     const apply = Reflect.apply, create = Object.create;
+    const slice=Array.prototype.slice,DOMEx=DOMException;
     const urlKeys = ['href','origin','username','password','protocol','host','hostname','port','pathname','search','hash'];
     const urlGet = create(null), urlSet = create(null);
     for (const key of urlKeys) {
@@ -25,7 +26,9 @@
         return cachedLocation;
     }
     let cachedEntry = -1, cachedState = null;
-    const check = receiver => { if (receiver !== history) throw new TypeError('Illegal invocation'); };
+    function invoke(receiver,operation,args){
+        return host.historyCall(receiver,operation,args);
+    }
     const string = value => { if(typeof value==='symbol') throw new TypeError('Cannot convert Symbol to string'); return String(value); };
     function update(replace, data, unused, url, argc) {
         if (argc < 2) throw new TypeError('History state and unused title are required');
@@ -44,25 +47,15 @@
     }
     class History {
         constructor() { throw new TypeError('Illegal constructor'); }
-        get length() { check(this); return host.history(0).length; }
-        get state() {
-            check(this); const info = host.history(0,null,null,1);
-            if (info.entry !== cachedEntry) {
-                cachedState = info.data === null ? null : cloneData.deserialize(host.unpack(info.data)); cachedEntry = info.entry;
-            }
-            return cachedState;
-        }
-        get scrollRestoration() { check(this); return host.history(0).manual ? 'manual' : 'auto'; }
-        set scrollRestoration(value) {
-            check(this); value = String(value);
-            if (value !== 'auto' && value !== 'manual') throw new TypeError('Invalid scroll restoration mode');
-            host.history(4, null, null, value === 'manual' ? 1 : 0);
-        }
-        pushState(data, unused, url) { check(this); update(false, data, unused, url, arguments.length); }
-        replaceState(data, unused, url) { check(this); update(true, data, unused, url, arguments.length); }
-        go(delta = 0) { check(this); host.history(3, null, null, +delta | 0); }
-        back() { check(this); host.history(3, null, null, -1); }
-        forward() { check(this); host.history(3, null, null, 1); }
+        get length() { return invoke(this,'length',[]); }
+        get state() { return invoke(this,'state',[]); }
+        get scrollRestoration() { return invoke(this,'scrollRestoration',[]); }
+        set scrollRestoration(value) { invoke(this,'setScrollRestoration',[value]); }
+        pushState(data, unused, url) { invoke(this,'pushState',apply(slice,arguments,[])); }
+        replaceState(data, unused, url) { invoke(this,'replaceState',apply(slice,arguments,[])); }
+        go(delta = 0) { invoke(this,'go',[delta]); }
+        back() { invoke(this,'back',[]); }
+        forward() { invoke(this,'forward',[]); }
     }
     class PopStateEvent extends Event {
         constructor(type, init = {}) { super(type, init); this.state = init.state === undefined ? null : init.state; }
@@ -70,7 +63,7 @@
     class HashChangeEvent extends Event {
         constructor(type, init = {}) { super(type, init); this.oldURL = String(init.oldURL || ''); this.newURL = String(init.newURL || ''); }
     }
-    const history = Object.create(History.prototype);
+    const history = host.historyCreate(History.prototype);
     Object.assign(globalThis, {History, history, PopStateEvent, HashChangeEvent});
     historyEvent = (oldURL, popstate) => {
         if (popstate && document.readyState === 'loading') {
@@ -97,4 +90,28 @@
         });
     }
     Object.defineProperty(location, 'origin', {configurable:true,get(){ return currentLocation().origin; }});
-}
+    return {securityError:message=>new DOMEx(message,'SecurityError'),operation(operation,args){
+        // Native registration selected this receiver's owning Document/realm.
+        // Never redispatch through overridable public History properties.
+        switch(operation){
+            case 'length':return host.history(0).length;
+            case 'state':{
+                const info=host.history(0,null,null,1);
+                if(info.entry!==cachedEntry){cachedState=info.data===null?null:cloneData.deserialize(host.unpack(info.data));cachedEntry=info.entry;}
+                return cachedState;
+            }
+            case 'scrollRestoration':return host.history(0).manual?'manual':'auto';
+            case 'setScrollRestoration':{
+                const value=String(args[0]);
+                if(value!=='auto' && value!=='manual')throw new TypeError('Invalid scroll restoration mode');
+                host.history(4,null,null,value==='manual'?1:0);return;
+            }
+            case 'pushState':return update(false,args[0],args[1],args[2],args.length);
+            case 'replaceState':return update(true,args[0],args[1],args[2],args.length);
+            case 'go':return host.history(3,null,null,+args[0]|0);
+            case 'back':return host.history(3,null,null,-1);
+            case 'forward':return host.history(3,null,null,1);
+        }
+        throw new TypeError('Unknown History operation');
+    }};
+})();

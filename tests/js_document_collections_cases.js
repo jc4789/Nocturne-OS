@@ -1,0 +1,92 @@
+/* Supplementary native Document collection regression, not website acceptance. */
+async function runDocumentCollectionCases(){
+    let checks=0;
+    const eq=(a,b,label)=>{checks++;check('document-collections-'+label,Object.is(a,b));if(!Object.is(a,b))throw Error(label+': '+String(a)+' != '+String(b));};
+    const rejects=(fn,label)=>{let error;try{fn();}catch(e){error=e;}eq(error instanceof TypeError,true,label);};
+    const keys=['links','images','scripts','embeds','anchors'];
+    const own=document.implementation.createHTMLDocument('collections owner');
+    const other=document.implementation.createHTMLDocument('collections other');
+    const make=(tag,parent,owner=own)=>{const n=owner.createElement(tag);if(parent)parent.appendChild(n);return n;};
+    const root=make('section',own.body),collections={};
+    eq(typeof document.links.length,'number','top-links-length');
+    const linksDescriptor=Object.getOwnPropertyDescriptor(Document.prototype,'links');
+    eq(linksDescriptor.enumerable,true,'links-enumerable');eq(linksDescriptor.set,undefined,'links-readonly');
+    for(const key of keys){
+        collections[key]=own[key];eq(own[key] instanceof HTMLCollection,true,key+'-brand');
+        eq(own[key],collections[key],key+'-same-object');eq(own[key].length,0,key+'-initial-empty');
+        const get=Object.getOwnPropertyDescriptor(Document.prototype,key).get;
+        rejects(()=>get.call({nodeType:9}),key+'-forged-brand');rejects(()=>get.call(own.body),key+'-element-brand');
+        rejects(()=>get.call(Object.create(Document.prototype)),key+'-prototype-forged-brand');
+    }
+    const pluginsGet=Object.getOwnPropertyDescriptor(Document.prototype,'plugins').get;
+    rejects(()=>pluginsGet.call({}),'plugins-brand');eq(own.plugins,own.embeds,'plugins-native-embeds-alias');
+    Object.defineProperty(own,'embeds',{configurable:true,value:'author expando'});
+    eq(own.plugins,collections.embeds,'plugins-does-not-read-public-embeds');delete own.embeds;
+    const noHref=make('a',root),a=make('a',root),area=make('area',root),notLink=make('link',root);
+    a.setAttribute('href','#one');a.id='document-link-id';a.setAttribute('name','document-link-name');
+    area.setAttribute('href','');area.setAttribute('name','document-area-name');notLink.setAttribute('href','#sheet');
+    const namespaced=make('a',root);namespaced.setAttributeNS('urn:document-collections','q:href','#not-html-href');namespaced.setAttributeNS('urn:document-collections','q:name','not-html-name');
+    eq(collections.links.length,2,'namespaced-href-does-not-participate');
+    eq(collections.links.length,2,'a-area-only');eq(collections.links[0],a,'link-tree-order-first');eq(collections.links[1],area,'empty-href-participates');
+    eq(Array.from(collections.links)[1],area,'links-native-iteration');
+    eq(collections.links.namedItem('document-link-id'),a,'link-named-id');eq(collections.links.namedItem('document-link-name'),a,'link-named-name');
+    eq(collections.links['document-area-name'],area,'link-named-property');eq(collections.links.item(2),null,'link-item-out-of-range');
+    eq(collections.links.namedItem(''),null,'empty-name-not-supported');eq('document-link-id' in collections.links,true,'named-has');
+    eq(Object.getOwnPropertyDescriptor(collections.links,'document-link-id').value,a,'named-descriptor');
+    const snapshot=own.querySelectorAll('a[href]');eq(snapshot.length,1,'static-before');
+    a.removeAttribute('href');eq(collections.links.length,1,'href-removal-live');eq(collections.links[0],area,'href-removal-order');
+    eq(snapshot[0],a,'static-node-retained');eq(snapshot.length,1,'static-length-retained');
+    noHref.setAttribute('href','');eq(collections.links.length,2,'href-addition-live');eq(collections.links[0],noHref,'href-addition-tree-order');
+    a.setAttribute('href','#again');a.id='document-link-renamed';
+    eq(collections.links.length,3,'href-readdition-live');eq(collections.links.namedItem('document-link-id'),null,'old-id-removed');
+    eq(collections.links.namedItem('document-link-renamed'),a,'id-change-live');
+    area.remove();eq(collections.links.length,2,'link-detach-live');root.insertBefore(area,noHref);eq(collections.links[0],area,'link-reinsert-order');
+    noHref.setAttribute('name','');eq(collections.anchors.length,2,'anchors-name-presence-includes-empty');
+    eq(collections.anchors[0],noHref,'anchors-not-area');eq(collections.anchors[1],a,'anchors-order');
+    a.removeAttribute('name');eq(collections.anchors.length,1,'anchor-name-removal-live');
+    const image=make('img',root),input=make('input',root),script=make('script',root),embed=make('embed',root),object=make('object',root);
+    image.id='document-image';image.setAttribute('name','document-image-name');input.type='image';
+    script.type='application/json';script.id='document-script';embed.setAttribute('name','document-embed');
+    eq(collections.images.length,1,'images-img-only-even-without-src');eq(collections.images[0],image,'image-node');
+    eq(collections.images['document-image-name'],image,'image-named-property');eq(collections.scripts.length,1,'scripts-includes-non-executable-type');
+    eq(collections.scripts.namedItem('document-script'),script,'script-named-id');eq(collections.embeds.length,1,'embeds-not-object');
+    eq(own.plugins[0],embed,'plugins-embed-node');eq(collections.embeds.namedItem('document-embed'),embed,'embed-named-name');
+    const foreign=[];
+    for(const tag of ['a','area','img','script','embed']){
+        const n=own.createElementNS('http://www.w3.org/2000/svg',tag);n.setAttribute('href','#foreign');n.setAttribute('name','foreign');root.appendChild(n);foreign.push(n);
+    }
+    eq(collections.links.length,3,'links-html-namespace-only');eq(collections.images.length,1,'images-html-namespace-only');
+    eq(collections.scripts.length,1,'scripts-html-namespace-only');eq(collections.embeds.length,1,'embeds-html-namespace-only');eq(collections.anchors.length,1,'anchors-html-namespace-only');
+    const host=make('div',root),shadow=host.attachShadow({mode:'open'});
+    for(const tag of ['a','img','script','embed']){const n=make(tag,shadow);n.setAttribute('href','#shadow');n.setAttribute('name','shadow');}
+    const template=make('template',root);template.innerHTML='<a href="#inert" name="inert"></a><img><script type="application/json"></scr'+'ipt><embed>';
+    eq(collections.links.length,3,'links-shadow-template-boundary');eq(collections.images.length,1,'images-shadow-template-boundary');
+    eq(collections.scripts.length,1,'scripts-shadow-template-boundary');eq(collections.embeds.length,1,'embeds-shadow-template-boundary');
+    const forms=own.forms,form=make('form',root);eq(own.forms,forms,'forms-preserved-same-object');eq(forms[0],form,'forms-preserved-live');
+    root.remove();for(const key of keys)eq(collections[key].length,0,key+'-document-detach');eq(forms.length,0,'forms-detach');
+    own.body.appendChild(root);eq(collections.links.length,3,'document-reinsert-live');eq(collections.images[0],image,'document-reinsert-image');
+    const otherLinks=other.links,otherImages=other.images;other.adoptNode(root);other.body.appendChild(root);
+    eq(collections.links.length,0,'adopt-old-owner-links');eq(collections.images.length,0,'adopt-old-owner-images');
+    eq(otherLinks.length,3,'adopt-new-owner-links');eq(otherImages[0],image,'adopt-new-owner-image');
+    area.removeAttribute('href');eq(otherLinks.length,2,'adopt-new-owner-attribute');eq(collections.links.length,0,'adopt-old-owner-independent');
+    own.body.appendChild(root);eq(otherLinks.length,0,'implicit-adopt-back-other');eq(collections.links.length,2,'implicit-adopt-back-own');
+    const linksGet=Object.getOwnPropertyDescriptor(Document.prototype,'links').get;
+    eq(linksGet.call(own),collections.links,'borrowed-getter-same-owner');eq(other.links,otherLinks,'different-document-same-object');
+    eq(other.links===own.links,false,'different-document-identity');eq(own.collectionVersion,undefined,'private-version-not-exposed');
+    const topLinks=document.links,topBefore=topLinks.length,topRoot=make('div',document.body,document);
+    const topA=make('a',topRoot,document);topA.setAttribute('href','#top');topA.id='document-top-link';
+    eq(topLinks.length,topBefore+1,'top-live-insertion');eq(topLinks.namedItem('document-top-link'),topA,'top-live-name');
+    const frame=make('iframe',topRoot,document),child=frame.contentDocument;
+    eq(child!==null,true,'frame-document');const childLinks=child.links,childImages=child.images;
+    eq(childLinks instanceof child.defaultView.HTMLCollection,true,'frame-own-realm-brand');
+    eq(childLinks,child.links,'frame-same-object');eq(childLinks===topLinks,false,'frame-distinct-collection');eq(childLinks.length,0,'frame-empty');
+    const childA=make('a',child.body,child);childA.setAttribute('href','#child');childA.id='document-child-link';
+    const childImage=make('img',child.body,child);eq(childLinks[0],childA,'frame-own-link');eq(childImages[0],childImage,'frame-own-image');
+    eq(topLinks.length,topBefore+1,'top-excludes-child-tree');eq(topLinks.namedItem('document-child-link'),null,'top-excludes-child-name');
+    const borrowedChild=linksGet.call(child);eq(borrowedChild.length,1,'borrowed-child-owner');eq(borrowedChild[0],childA,'borrowed-child-native-identity');
+    childA.removeAttribute('href');eq(childLinks.length,0,'frame-own-href-removal');eq(borrowedChild.length,0,'borrowed-child-live');
+    eq(topLinks.length,topBefore+1,'child-revision-not-top');childA.setAttribute('href','#child-again');eq(childLinks.length,1,'frame-own-href-reinsert');
+    topA.remove();eq(topLinks.length,topBefore,'top-removal');eq(childLinks.length,1,'top-revision-not-child');
+    frame.remove();topRoot.remove();root.remove();
+    return checks;
+}

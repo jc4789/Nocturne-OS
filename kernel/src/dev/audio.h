@@ -23,7 +23,9 @@ int audio_flush_file(struct file *file);
 bool audio_mix(int16_t *out, int frames);
 bool audio_pending(void); /* some stream has frames waiting */
 
-/* A sound card: fill() tops up its buffers with audio_mix(); it is called from audio_tick(). */
+/* A sound card: fill() tops up its buffers with audio_mix(); it is called from audio_tick().
+   While audio_remote() it may only drain already-issued buffers, not mix new PCM.
+   An idle sink should return without device I/O; the next tick wakes it on new PCM. */
 void audio_set_card(const char *name, void (*fill)(void));
 const char *audio_card(void); /* NULL without one */
 

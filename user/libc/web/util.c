@@ -18,14 +18,16 @@ void *ar_alloc(arena_t *a, size_t n) {
     struct achunk *c = a->head;
     if (!c || c->used + n > c->cap) {
         size_t cap = n > 60000 ? n : 65536 - sizeof(struct achunk);
-        if ((a->limit && (cap > a->limit || a->allocated > a->limit - cap)) ||
-            cap > SIZE_MAX - sizeof(struct achunk)) {
-            if (a->trap) longjmp(*a->trap, 1);
+        bool quota=a->limit && (cap>a->limit || a->allocated>a->limit-cap);
+        if (quota || cap > SIZE_MAX - sizeof(struct achunk)) {
+            /* Every existing arena trap tests nonzero; retain the failure
+               semantics while distinguishing quota from allocator failure. */
+            if (a->trap) longjmp(*a->trap, quota ? 2 : 1);
             abort();
         }
         c = malloc(sizeof(struct achunk) + cap);
         if (!c) {
-            if (a->trap) longjmp(*a->trap, 1);
+            if (a->trap) longjmp(*a->trap, 3);
             abort();
         }
         a->allocated += cap;
@@ -158,10 +160,10 @@ struct urlparts {
     char scheme[16];
     char auth[256]; /* host[:port], empty for file: */
     bool has_auth;
-    char path[2048];
-    char query[2048];
+    char path[HTTP_URL_MAX];
+    char query[HTTP_URL_MAX];
     bool has_query;
-    char frag[512];
+    char frag[HTTP_URL_MAX];
     bool has_frag;
 };
 
@@ -174,14 +176,15 @@ static size_t scheme_len(const char *s) {
     return s[i] == ':' && i < 15 ? i : 0;
 }
 
-static void copy_until(char *dst, size_t cap, const char *s, size_t n) {
-    if (n >= cap) n = cap - 1;
+static bool copy_until(char *dst, size_t cap, const char *s, size_t n) {
+    if (n >= cap) return false;
     memcpy(dst, s, n);
     dst[n] = 0;
+    return true;
 }
 
 /* split a URL that may lack a scheme or authority */
-static void url_split(const char *s, struct urlparts *u) {
+static bool url_split(const char *s, struct urlparts *u) {
     memset(u, 0, sizeof *u);
     size_t sl = scheme_len(s);
     if (sl) {
@@ -191,30 +194,30 @@ static void url_split(const char *s, struct urlparts *u) {
     if (s[0] == '/' && s[1] == '/') {
         s += 2;
         size_t n = strcspn(s, "/?#");
-        copy_until(u->auth, sizeof u->auth, s, n);
+        if (!copy_until(u->auth, sizeof u->auth, s, n)) return false;
         for (char *p = u->auth; *p; p++) *p = (char)lower((unsigned char)*p);
         u->has_auth = true;
         s += n;
     }
     size_t n = strcspn(s, "?#");
-    copy_until(u->path, sizeof u->path, s, n);
+    if (!copy_until(u->path, sizeof u->path, s, n)) return false;
     s += n;
     if (*s == '?') {
         s++;
         n = strcspn(s, "#");
-        copy_until(u->query, sizeof u->query, s, n);
+        if (!copy_until(u->query, sizeof u->query, s, n)) return false;
         u->has_query = true;
         s += n;
     }
     if (*s == '#') {
-        copy_until(u->frag, sizeof u->frag, s + 1, strlen(s + 1));
+        if (!copy_until(u->frag, sizeof u->frag, s + 1, strlen(s + 1))) return false;
         u->has_frag = true;
     }
+    return true;
 }
 
 /* RFC 3986 5.2.4 */
-static void remove_dots(char *path) {
-    char out[2048];
+static void remove_dots(char *path, char *out) {
     size_t on = 0;
     const char *in = path;
     while (*in) {
@@ -229,7 +232,7 @@ static void remove_dots(char *path) {
         } else if (!strcmp(in, ".") || !strcmp(in, "..")) in += strlen(in);
         else {
             do {
-                if (on < sizeof out - 1) out[on++] = *in;
+                out[on++] = *in; /* removal never grows a checked input path */
                 in++;
             } while (*in && *in != '/');
         }
@@ -242,95 +245,125 @@ static bool special_scheme(const char *s) {
     return !strcmp(s, "http") || !strcmp(s, "https") || !strcmp(s, "file") || !strcmp(s, "ftp");
 }
 
-bool url_resolve(const char *base, const char *rel, char *out, size_t n) {
+struct resolve_scratch {
+    struct urlparts b, r, t;
+    char clean[HTTP_URL_MAX], dots[HTTP_URL_MAX];
+};
+static bool url_append(char *out, size_t *used, const char *text, size_t length) {
+    if (length >= HTTP_URL_MAX - *used) return false;
+    memcpy(out + *used, text, length); *used += length; out[*used] = 0;
+    return true;
+}
+static bool resolve_inner(const char *base, const char *rel, char *out, size_t n,
+                          struct resolve_scratch *work) {
     /* strip surrounding whitespace and remove tabs and newlines, as browsers do */
-    char clean[4096];
+    char *clean = work->clean;
     size_t cn = 0;
     while (is_space((unsigned char)*rel)) rel++;
-    for (const char *p = rel; *p && cn < sizeof clean - 1; p++)
-        if (*p != '\t' && *p != '\n' && *p != '\r') clean[cn++] = *p == '\\' ? '/' : *p;
+    for (const char *p = rel; *p; p++) {
+        if (*p == '\t' || *p == '\n' || *p == '\r') continue;
+        if (cn + 1 >= HTTP_URL_MAX) return false;
+        clean[cn++] = *p == '\\' ? '/' : *p;
+    }
     while (cn > 0 && is_space((unsigned char)clean[cn - 1])) cn--;
     clean[cn] = 0;
 
-    static struct urlparts b, r, t; /* large; the engine is single-threaded */
-    url_split(clean, &r);
-    if (r.scheme[0] && !special_scheme(r.scheme)) { /* data:, mailto:, javascript:, about: ... */
-        snprintf(out, n, "%s", clean);
+    /* Large, reentrant scratch is caller-owned heap storage, not GUI/JS stack. */
+    struct urlparts *b = &work->b, *r = &work->r, *t = &work->t;
+    if (!url_split(clean, r)) return false;
+    if (r->scheme[0] && !special_scheme(r->scheme)) { /* data:, mailto:, javascript:, about: ... */
+        if (cn >= n) return false;
+        memcpy(out, clean, cn + 1);
         return true;
     }
-    url_split(base ? base : "", &b);
-    if (r.scheme[0] && (r.has_auth || strcmp(r.scheme, b.scheme))) {
-        t = r;
-        remove_dots(t.path);
+    if (base && strlen(base) >= HTTP_URL_MAX) return false;
+    if (!url_split(base ? base : "", b)) return false;
+    if (r->scheme[0] && (r->has_auth || strcmp(r->scheme, b->scheme))) {
+        *t = *r;
+        remove_dots(t->path, work->dots);
     } else {
-        if (!b.scheme[0]) return false;
-        memset(&t, 0, sizeof t);
-        strcpy(t.scheme, b.scheme);
-        if (r.has_auth) {
-            strcpy(t.auth, r.auth);
-            t.has_auth = true;
-            strcpy(t.path, r.path);
-            remove_dots(t.path);
-            strcpy(t.query, r.query);
-            t.has_query = r.has_query;
+        if (!b->scheme[0]) return false;
+        memset(t, 0, sizeof *t);
+        strcpy(t->scheme, b->scheme);
+        if (r->has_auth) {
+            strcpy(t->auth, r->auth);
+            t->has_auth = true;
+            strcpy(t->path, r->path);
+            remove_dots(t->path, work->dots);
+            strcpy(t->query, r->query);
+            t->has_query = r->has_query;
         } else {
-            strcpy(t.auth, b.auth);
-            t.has_auth = b.has_auth;
-            if (!r.path[0]) {
-                strcpy(t.path, b.path);
-                if (r.has_query) {
-                    strcpy(t.query, r.query);
-                    t.has_query = true;
+            strcpy(t->auth, b->auth);
+            t->has_auth = b->has_auth;
+            if (!r->path[0]) {
+                strcpy(t->path, b->path);
+                if (r->has_query) {
+                    strcpy(t->query, r->query);
+                    t->has_query = true;
                 } else {
-                    strcpy(t.query, b.query);
-                    t.has_query = b.has_query;
+                    strcpy(t->query, b->query);
+                    t->has_query = b->has_query;
                 }
             } else {
-                if (r.path[0] == '/') strcpy(t.path, r.path);
+                if (r->path[0] == '/') strcpy(t->path, r->path);
                 else {
                     /* merge with the base path up to its last slash */
-                    char *slash = strrchr(b.path, '/');
-                    size_t keep = slash ? (size_t)(slash - b.path + 1) : 0;
-                    if (!keep && b.has_auth) snprintf(t.path, sizeof t.path, "/%s", r.path);
-                    else snprintf(t.path, sizeof t.path, "%.*s%s", (int)keep, b.path, r.path);
+                    char *slash = strrchr(b->path, '/');
+                    size_t keep = slash ? (size_t)(slash - b->path + 1) : 0;
+                    int length = !keep && b->has_auth
+                        ? snprintf(t->path, sizeof t->path, "/%s", r->path)
+                        : snprintf(t->path, sizeof t->path, "%.*s%s", (int)keep, b->path, r->path);
+                    if (length < 0 || (size_t)length >= sizeof t->path) return false;
                 }
-                remove_dots(t.path);
-                strcpy(t.query, r.query);
-                t.has_query = r.has_query;
+                remove_dots(t->path, work->dots);
+                strcpy(t->query, r->query);
+                t->has_query = r->has_query;
             }
         }
-        strcpy(t.frag, r.frag);
-        t.has_frag = r.has_frag;
+        strcpy(t->frag, r->frag);
+        t->has_frag = r->has_frag;
     }
-    if (!t.path[0] && t.has_auth) strcpy(t.path, "/");
+    if (!t->path[0] && t->has_auth) strcpy(t->path, "/");
 
     /* reassemble, percent-encoding what may not appear in a URL */
-    sbuf o = {0};
-    sb_puts(&o, t.scheme);
-    sb_putc(&o, ':');
-    if (t.has_auth) {
-        sb_puts(&o, "//");
-        sb_puts(&o, t.auth);
+    /* Reuse cleaned-input scratch after splitting. No abort-on-OOM sbuf or
+       unbounded encoded expansion is necessary for a URL with a finite bound. */
+    char *assembled = work->clean;
+    size_t used = 0;
+    if (!url_append(assembled, &used, t->scheme, strlen(t->scheme)) ||
+        !url_append(assembled, &used, ":", 1)) return false;
+    if (t->has_auth) {
+        if (!url_append(assembled, &used, "//", 2) ||
+            !url_append(assembled, &used, t->auth, strlen(t->auth))) return false;
     }
-    const char *parts[3] = {t.path, t.has_query ? t.query : NULL, t.has_frag ? t.frag : NULL};
+    const char *parts[3] = {t->path, t->has_query ? t->query : NULL, t->has_frag ? t->frag : NULL};
     for (int k = 0; k < 3; k++) {
         if (!parts[k]) continue;
-        if (k == 1) sb_putc(&o, '?');
-        if (k == 2) sb_putc(&o, '#');
+        if (k && !url_append(assembled, &used, k == 1 ? "?" : "#", 1)) return false;
         for (const unsigned char *p = (const unsigned char *)parts[k]; *p; p++) {
             if (*p <= ' ' || *p >= 0x7F || *p == '"' || *p == '<' || *p == '>' || *p == '`' ||
                 (k == 0 && *p == '{') || (k == 0 && *p == '}')) {
                 char hx[4];
                 snprintf(hx, sizeof hx, "%%%02X", *p);
-                sb_puts(&o, hx);
+                if (!url_append(assembled, &used, hx, 3)) return false;
             } else {
-                sb_putc(&o, (char)*p);
+                if (!url_append(assembled, &used, (const char *)p, 1)) return false;
             }
         }
     }
-    bool ok = o.n < n;
-    snprintf(out, n, "%s", sb_cstr(&o));
-    sb_free(&o);
+    if (used >= n) return false;
+    memcpy(out, assembled, used + 1);
+    return true;
+}
+
+bool url_resolve(const char *base, const char *rel, char *out, size_t n) {
+    if (!out || !n) return false;
+    if (!rel) { out[0] = 0; return false; }
+    struct resolve_scratch *work = calloc(1, sizeof *work);
+    if (!work) { out[0] = 0; return false; }
+    bool ok = resolve_inner(base, rel, out, n, work);
+    free(work);
+    if (!ok) out[0] = 0; /* never hand a caller a different, truncated URL */
     return ok;
 }
 
