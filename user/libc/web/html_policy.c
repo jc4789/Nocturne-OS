@@ -2,6 +2,11 @@
    Each header field/list policy is retained separately for intersection. */
 #include "html_policy.h"
 #include <stdio.h>
+bool html_policy_requires_script(const web_doc *d) {
+    for(const struct web_html_policy_rule *r=d && d->html_policy?d->html_policy->first:NULL;r;r=r->next)
+        if(r->require_script)return true;
+    return false;
+}
 static void rule_free(struct web_html_policy_rule *rule) {
     for(size_t i=0;i<rule->count;i++)free(rule->names[i]);
     for(size_t i=0;i<rule->report_uri_count;i++)free(rule->report_uris[i]);

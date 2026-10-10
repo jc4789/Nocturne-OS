@@ -87,6 +87,10 @@ static JSValue worker_policy_state(JSContext *ctx,struct worker *w){
     ok=policy_field(ctx,out,"requirements",requirements);requirements=JS_UNDEFINED;if(!ok)goto fail;return out;
 fail:JS_FreeValue(ctx,out);JS_FreeValue(ctx,rules);JS_FreeValue(ctx,requirements);return JS_EXCEPTION;
 }
+static JSValue native_safety_required(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){
+    (void)self;(void)argc;(void)argv;
+    return JS_NewBool(ctx,html_policy_requires_script(&state(ctx)->policy_doc));
+}
 static JSValue native_safety(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){
     (void)self;struct worker *w=state(ctx);if(!argc)return JS_ThrowTypeError(ctx,"Worker safety operation required");
     const char *op=JS_ToCString(ctx,argv[0]);if(!op)return JS_EXCEPTION;
@@ -133,7 +137,9 @@ static bool worker_policy_start(struct worker *w,JSValueConst start){
 done:JS_FreeValue(ctx,inherit);JS_FreeValue(ctx,headers);JS_FreeValue(ctx,url);JS_FreeValue(ctx,status);return ok;
 }
 static JSValue worker_code_check(JSContext *ctx,JSValueConst value,int kind,int argc,JSValueConst *argv,void *opaque){
-    struct worker *w=opaque;JSValue args_array=JS_NewArray(ctx);if(JS_IsException(args_array))return args_array;
+    struct worker *w=opaque;
+    if(!html_policy_requires_script(&w->policy_doc) && (kind==JS_DYNAMIC_FUNCTION || !JS_IsObject(value)))return JS_DupValue(ctx,value);
+    JSValue args_array=JS_NewArray(ctx);if(JS_IsException(args_array))return args_array;
     for(int i=0;i<argc;i++)if(JS_DefinePropertyValueUint32(ctx,args_array,(uint32_t)i,JS_DupValue(ctx,argv[i]),JS_PROP_C_W_E)<0){JS_FreeValue(ctx,args_array);return JS_EXCEPTION;}
     JSValue args[]={JS_DupValue(ctx,value),JS_NewInt32(ctx,kind),args_array};
     /* A nested dynamic-code check must not cancel the outer task's leases. */
@@ -254,7 +260,7 @@ static void policy_task(struct worker *w){
 int main(void){
     struct worker w={0};w.hooks=JS_UNDEFINED;w.rt=JS_NewRuntime();if(!w.rt)return 1;JS_SetMemoryLimit(w.rt,NJW_HEAP_BYTES);JS_SetMaxStackSize(w.rt,512u*1024u);JS_SetCanBlock(w.rt,false);JS_SetInterruptHandler(w.rt,interrupt,&w);w.ctx=JS_NewContext(w.rt);if(!w.ctx){JS_FreeRuntime(w.rt);return 1;}JS_SetContextOpaque(w.ctx,&w);w.until=uptime_ms()+10000;
     if(trusted_native_init(w.ctx)<0)goto shutdown;
-    JSValue global=JS_GetGlobalObject(w.ctx),host=JS_NewObject(w.ctx);const JSCFunctionListEntry funcs[]={JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),JS_CFUNC_DEF("send",3,native_send),JS_CFUNC_DEF("classID",1,native_class),JS_CFUNC_DEF("detach",1,native_detach),JS_CFUNC_DEF("transferCommit",1,native_transfer_commit),JS_CFUNC_DEF("portSend",6,native_port_send),JS_CFUNC_DEF("portLease",3,native_port_lease),JS_CFUNC_DEF("now",0,native_now),JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",3,native_request),JS_CFUNC_DEF("cancel",1,native_cancel),JS_CFUNC_DEF("import",1,native_import),JS_CFUNC_DEF("eval",2,native_eval)};JS_SetPropertyFunctionList(w.ctx,host,funcs,sizeof funcs/sizeof funcs[0]);web_js_encoding_init_isolated(w.ctx,host);web_js_navigator_init(w.ctx,host);JS_SetPropertyStr(w.ctx,global,"__workerHost",host);JS_FreeValue(w.ctx,global);
+    JSValue global=JS_GetGlobalObject(w.ctx),host=JS_NewObject(w.ctx);const JSCFunctionListEntry funcs[]={JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),JS_CFUNC_DEF("safetyRequired",1,native_safety_required),JS_CFUNC_DEF("send",3,native_send),JS_CFUNC_DEF("classID",1,native_class),JS_CFUNC_DEF("detach",1,native_detach),JS_CFUNC_DEF("transferCommit",1,native_transfer_commit),JS_CFUNC_DEF("portSend",6,native_port_send),JS_CFUNC_DEF("portLease",3,native_port_lease),JS_CFUNC_DEF("now",0,native_now),JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",3,native_request),JS_CFUNC_DEF("cancel",1,native_cancel),JS_CFUNC_DEF("import",1,native_import),JS_CFUNC_DEF("eval",2,native_eval)};JS_SetPropertyFunctionList(w.ctx,host,funcs,sizeof funcs/sizeof funcs[0]);web_js_encoding_init_isolated(w.ctx,host);web_js_navigator_init(w.ctx,host);JS_SetPropertyStr(w.ctx,global,"__workerHost",host);JS_FreeValue(w.ctx,global);
     w.hooks=JS_Eval(w.ctx,js_worker_runtime,sizeof js_worker_runtime-1,"<worker-bootstrap>",JS_EVAL_TYPE_GLOBAL);if(JS_IsException(w.hooks))goto shutdown;
     JS_SetDynamicCodeCheck(w.ctx,worker_code_check,&w);
     if(fcntl(1,F_SETFL,O_NONBLOCK)<0)goto shutdown;

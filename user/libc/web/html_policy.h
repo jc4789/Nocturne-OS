@@ -9,6 +9,7 @@ struct web_html_policy_rule {
     bool from_meta;
 };
 struct web_html_policy { struct web_html_policy_rule *first, *last; };
+bool html_policy_requires_script(const web_doc *document);
 bool html_policy_init(web_doc *document,const char *headers,const web_doc *inherit);
 bool html_policy_meta(web_doc *document,const char *content,size_t length);
 void html_policy_free(web_doc *document);

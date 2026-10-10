@@ -30,6 +30,12 @@ static JSValue html_policy_state(JSContext *ctx,web_doc *document) {
     return out;
 fail:JS_FreeValue(ctx,out);JS_FreeValue(ctx,rules);JS_FreeValue(ctx,requirements);return JS_EXCEPTION;
 }
+static JSValue native_safety_required(JSContext *ctx,JSValueConst this_value,int argc,JSValueConst *argv){
+    (void)this_value;struct web_js_state *s=state(ctx);
+    node_t *node=argc && !JS_IsNull(argv[0]) && !JS_IsUndefined(argv[0])?unwrap(ctx,argv[0]):NULL;
+    web_doc *owner=node && node->owner && node->owner->js?node->owner:s->doc;
+    return JS_NewBool(ctx,html_policy_requires_script(owner));
+}
 static JSValue native_safety(JSContext *ctx,JSValueConst this_value,int argc,JSValueConst *argv){
     (void)this_value;struct web_js_state *s=state(ctx);
     if(!argc)return JS_ThrowTypeError(ctx,"HTML safety operation required");
@@ -139,6 +145,7 @@ static JSValue native_safety(JSContext *ctx,JSValueConst this_value,int argc,JSV
 static JSValue trusted_code_check(JSContext *ctx,JSValueConst value,int kind,int argc,JSValueConst *argv,void *opaque){
     struct web_js_state *s=opaque;
     if(!s || !JS_IsObject(s->hooks))return JS_DupValue(ctx,value);
+    if(!html_policy_requires_script(s->doc) && (kind==JS_DYNAMIC_FUNCTION || !JS_IsObject(value)))return JS_DupValue(ctx,value);
     JSValue args_array=JS_NewArray(ctx);
     if(JS_IsException(args_array))return args_array;
     for(int i=0;i<argc;i++)if(JS_SetPropertyUint32(ctx,args_array,(uint32_t)i,JS_DupValue(ctx,argv[i]))<0){JS_FreeValue(ctx,args_array);return JS_EXCEPTION;}

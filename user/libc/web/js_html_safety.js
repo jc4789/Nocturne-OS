@@ -8,6 +8,8 @@ const htmlSafetyBridge=(()=>{
     const stringify=JSON.stringify,StringImpl=String,arrayFrom=Array.from,arraySplice=Array.prototype.splice,arrayFilter=Array.prototype.filter;
     const weakGet=WeakMap.prototype.get,weakSet=WeakMap.prototype.set,configs=new WeakMap(),policies=new WeakMap();
     const nativeTrusted=host.trusted,nativeSafety=host.safety,get=(n,k)=>rawDom.get(n,k);
+    const nativeRequired=typeof host.safetyRequired==='function'?host.safetyRequired:()=>true;
+    function fast(value,node){return typeof value==='string'&&!nativeRequired(node||null);}
     const wGet=(m,k)=>apply(weakGet,m,[k]),wSet=(m,k,v)=>apply(weakSet,m,[k,v]),filter=(a,fn)=>apply(arrayFilter,a,[fn]);
     const names=[null,"TrustedHTML","TrustedScript","TrustedScriptURL","TrustedHTMLParserOptions"];
     const methods=[null,"createHTML","createScript","createScriptURL","createParserOptions"];
@@ -232,6 +234,7 @@ const htmlSafetyBridge=(()=>{
     const emptyHTML=make(1,''),emptyScript=make(2,'');
     function check(value,k,sink,node=null){
         if(typeof k==='string'){for(let i=1;i<names.length;i++)if(names[i]===k){k=i;break;}}
+        if(fast(value,node))return value;
         if(trustedKind(value)===k)return payload(value,k);
         const input=ttString(value),routed=ownerRoute(node,'check',input,k,sink);if(routed)return routed.value;
         const c=security(node);if(!c.required)return input;
@@ -270,7 +273,7 @@ const htmlSafetyBridge=(()=>{
         define(proto,'setHTML',{configurable:true,writable:true,enumerable:true,value:function(html,options={}){if(!arguments.length)throw new TypeError('HTML required');setHTML(this,html,options,true);}});
         define(proto,'setHTMLUnsafe',{configurable:true,writable:true,enumerable:true,value:function(html,options={}){if(!arguments.length)throw new TypeError('HTML required');setHTML(this,html,options,false);}});
         const descriptor=Object.getOwnPropertyDescriptor(proto,'innerHTML');
-        define(proto,'innerHTML',{...descriptor,set(value){setHTML(this,value===null?'':value,{},false,false,true,descriptor.set);}});
+        define(proto,'innerHTML',{...descriptor,set(value){if(fast(value,this))return apply(descriptor.set,this,[value]);setHTML(this,value===null?'':value,{},false,false,true,descriptor.set);}});
         define(proto,'getHTML',{configurable:true,writable:true,enumerable:true,value:function(options={}){target(this);const o=dictionary(options),serializable=!!o.serializableShadowRoots,supplied=o.shadowRoots,roots=supplied===undefined?[]:sequence(supplied);for(let i=0;i<roots.length;i++)if(!get(roots[i],'shadowHost'))throw new TypeError('ShadowRoot list required');return nativeSafety('serialize',this,serializable,roots);}});
     }
     for(const [name,safe] of [['parseHTML',true],['parseHTMLUnsafe',false]])define(Document,name,{configurable:true,writable:true,enumerable:true,value:function(html,input={}){
@@ -282,7 +285,7 @@ const htmlSafetyBridge=(()=>{
         const previous=nativeSafety('scriptText',node,value);
         try{return apply(setter,node,[value]);}catch(error){nativeSafety('scriptText',node,previous);throw error;}
     }
-    function wrapSetter(proto,key,kind,sink,condition){const d=Object.getOwnPropertyDescriptor(proto,key);if(!d||!d.set||!d.configurable)return;define(proto,key,{...d,set(v){if(!condition||condition(this)){v=check(v==null?'':v,kind,sink,this);if(kind===2)return approvedTextSetter(this,v,d.set);}return apply(d.set,this,[v]);}});}
+    function wrapSetter(proto,key,kind,sink,condition){const d=Object.getOwnPropertyDescriptor(proto,key);if(!d||!d.set||!d.configurable)return;define(proto,key,{...d,set(v){if(!condition||condition(this)){if(fast(v,this))return kind===2?approvedTextSetter(this,v,d.set):apply(d.set,this,[v]);v=check(v==null?'':v,kind,sink,this);if(kind===2)return approvedTextSetter(this,v,d.set);}return apply(d.set,this,[v]);}});}
     const script=n=>get(n,'nodeType')===1&&get(n,'namespaceURI')===HTML&&get(n,'localName')==='script';
     wrapSetter(HTMLScriptElement.prototype,'src',3,'HTMLScriptElement src');wrapSetter(HTMLScriptElement.prototype,'text',2,'HTMLScriptElement text');
     wrapSetter(HTMLIFrameElement.prototype,'srcdoc',1,'HTMLIFrameElement srcdoc');
@@ -290,6 +293,12 @@ const htmlSafetyBridge=(()=>{
     for(const key of ['textContent','nodeValue']){
         const d=Object.getOwnPropertyDescriptor(Node.prototype,key);
         define(Node.prototype,key,{...d,set(value){
+            if(fast(value,this)){
+                // An admitted script text slot must survive a later CSP rule.
+                // Skipping it would re-check old text under the new policy.
+                if(key==='textContent'&&get(this,'localName')==='script'&&script(this))return approvedTextSetter(this,value,d.set);
+                return apply(d.set,this,[value]);
+            }
             const type=get(this,'nodeType');
             if(type===2){const owner=get(this,'attrOwner');if(owner){const data=attributeSink(owner,get(this,'localName'),get(this,'namespaceURI'));if(data.kind)value=check(value==null?'':value,data.kind,data.sink,owner);}}
             else if(key==='textContent'&&script(this)){value=check(value==null?'':value,2,'HTMLScriptElement textContent',this);return approvedTextSetter(this,value,d.set);}
@@ -298,7 +307,7 @@ const htmlSafetyBridge=(()=>{
     }
     const outer=Object.getOwnPropertyDescriptor(Element.prototype,'outerHTML');
     define(Element.prototype,'outerHTML',{...outer,set(value){
-        get(this,'elementBrand');const v=compliantInput(value===null?'':value,{},'Element outerHTML',this,false),parent=get(this,'parentNode');if(!parent)return;
+        get(this,'elementBrand');if(fast(value,this))return apply(outer.set,this,[value]);const v=compliantInput(value===null?'':value,{},'Element outerHTML',this,false),parent=get(this,'parentNode');if(!parent)return;
         if(!v.options.sanitizer&&!v.options.runScripts)return apply(outer.set,this,[v.html]);
         if(get(parent,'nodeType')===9)throw new DOMException('Document element cannot be replaced','NoModificationAllowedError');
         const owner=get(this,'ownerDocument'),context=get(parent,'nodeType')===11?rawDom.create(owner,1,'body',''):parent,fragment=rawDom.parseFragment(context,v.html,false,{allowShadow:false,runScripts:!!v.options.runScripts,sanitizing:!!v.options.sanitizer});
@@ -307,7 +316,7 @@ const htmlSafetyBridge=(()=>{
     }});
     const adjacentOriginal=Element.prototype.insertAdjacentHTML;
     define(Element.prototype,'insertAdjacentHTML',{configurable:true,writable:true,enumerable:true,value:function(position,html){
-        get(this,'elementBrand');if(arguments.length<2)throw new TypeError('Position and HTML required');position=string(position).toLowerCase();const v=compliantInput(html,{},'Element insertAdjacentHTML',this,false);
+        get(this,'elementBrand');if(arguments.length<2)throw new TypeError('Position and HTML required');position=string(position).toLowerCase();if(fast(html,this))return apply(adjacentOriginal,this,[position,html]);const v=compliantInput(html,{},'Element insertAdjacentHTML',this,false);
         if(!v.options.sanitizer&&!v.options.runScripts)return apply(adjacentOriginal,this,[position,v.html]);
         let parent,before;if(position==='beforebegin'||position==='afterend'){parent=get(this,'parentNode');if(!parent||get(parent,'nodeType')===9)throw new DOMException('No insertion parent','NoModificationAllowedError');before=position==='beforebegin'?this:get(this,'nextSibling');}
         else if(position==='afterbegin'||position==='beforeend'){parent=this;before=position==='afterbegin'?get(this,'firstChild'):null;}else throw new DOMException('Invalid position','SyntaxError');
@@ -317,7 +326,14 @@ const htmlSafetyBridge=(()=>{
     }});
     const parserOriginal=DOMParser.prototype.parseFromString;DOMParser.prototype.parseFromString=function(input,type){if(arguments.length<2)return apply(parserOriginal,this,arguments);return apply(parserOriginal,this,[check(input,1,'DOMParser parseFromString',null),type]);};
     for(const key of ['setAttribute','setAttributeNS']){
-        const original=Element.prototype[key];Element.prototype[key]=function(...args){get(this,'elementBrand');if(args.length<(key==='setAttributeNS'?3:2))return apply(original,this,args);const isNS=key==='setAttributeNS',ns=isNS?(args[0]==null?null:string(args[0])||null):null,name=string(args[isNS?1:0]),valueIndex=isNS?2:1,local=name.includes(':')?name.slice(name.indexOf(':')+1):name,data=attributeSink(this,isNS?local:name,ns);args[isNS?1:0]=name;if(isNS)args[0]=ns;if(data.kind)args[valueIndex]=check(args[valueIndex],data.kind,data.sink,this);return apply(original,this,args);};
+        const original=Element.prototype[key];Element.prototype[key]=function(...args){
+            get(this,'elementBrand');if(args.length<(key==='setAttributeNS'?3:2))return apply(original,this,args);
+            const isNS=key==='setAttributeNS',ns=isNS?(args[0]==null?null:string(args[0])||null):null,name=string(args[isNS?1:0]),valueIndex=isNS?2:1,local=isNS&&name.includes(':')?name.slice(name.indexOf(':')+1):name;
+            args[isNS?1:0]=name;if(isNS)args[0]=ns;
+            const lower=local.toLowerCase();
+            if(!lower.startsWith('on')&&lower!=='src'&&lower!=='srcdoc'&&lower!=='href')return apply(original,this,args);
+            const data=attributeSink(this,local,ns);if(data.kind)args[valueIndex]=check(args[valueIndex],data.kind,data.sink,this);return apply(original,this,args);
+        };
     }
     for(const key of ['value','nodeValue','textContent']){
         const d=Object.getOwnPropertyDescriptor(Attr.prototype,key);define(Attr.prototype,key,{...d,set(value){get(this,'attrBrand');const owner=get(this,'attrOwner');if(owner){const data=attributeSink(owner,get(this,'localName'),get(this,'namespaceURI'));if(data.kind)value=check(value==null?'':value,data.kind,data.sink,owner);}return apply(d.set,this,[value]);}});
@@ -373,6 +389,7 @@ const htmlSafetyBridge=(()=>{
     }
     const DynamicFunction=Function;
     function writeInput(values,sink,node){
+        if(!nativeRequired(node)){let strings=true;for(let i=0;i<values.length;i++)if(typeof values[i]!=='string'){strings=false;break;}if(strings)return values.join('');}
         let html='',trusted=true;
         for(let i=0;i<values.length;i++){const genuine=trustedKind(values[i])===1;trusted=trusted&&genuine;html+=genuine?payload(values[i],1):string(values[i]);}
         return trusted?html:check(html,1,sink,node);
