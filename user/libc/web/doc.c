@@ -16,6 +16,8 @@
 #include "avmedia.h"
 #include "js_worker.h"
 #include "frame.h"
+#include "html_policy.h"
+#include "html_encoding.h"
 #include "cssom.h"
 #include <limits.h>
 
@@ -756,6 +758,9 @@ void doc_dom_budget(web_doc *d) {
     if (d) d->mem.limit = 0; /* arena zero: actual allocator/overflow only */
 }
 web_doc *doc_inert(web_doc *family, const char *html, size_t n, const char *url) {
+    return doc_inert_ex(family, html, n, url, false);
+}
+web_doc *doc_inert_ex(web_doc *family, const char *html, size_t n, const char *url, bool allow_shadow) {
     if (!family || n == SIZE_MAX || (n && !html)) return NULL;
     family = family->dom_family ? family->dom_family : family;
     web_doc *d = calloc(1, sizeof *d);
@@ -768,7 +773,7 @@ web_doc *doc_inert(web_doc *family, const char *html, size_t n, const char *url)
     d->dom_next = family->dom_docs; family->dom_docs = d;
     doc_dom_budget(d);
     web_doc *previous = d->dom_next;
-    d->root = html_parse(d, html ? html : "", n, "utf-8");
+    d->root = html_parse_string(d, html ? html : "", n, allow_shadow);
     if (!d->root) {
         /* No wrappers have escaped: discard every nested template document too. */
         while (family->dom_docs != previous) {
@@ -796,8 +801,16 @@ web_doc *web_live(const char *html, size_t len, const char *url, const char *cha
                   const struct web_host *host) {
     return web_live_child(html,len,url,charset,host,NULL,NULL,NULL);
 }
+web_doc *web_live_response(const char *html,size_t len,const char *url,const char *charset,
+                         const char *headers,const struct web_host *host) {
+    return web_live_child_response(html,len,url,charset,headers,host,NULL,NULL,NULL);
+}
 web_doc *web_live_child(const char *html, size_t len, const char *url, const char *charset,
                        const struct web_host *host, web_doc *parent,node_t *frame,web_doc *inherited_origin) {
+    return web_live_child_response(html,len,url,charset,NULL,host,parent,frame,inherited_origin);
+}
+web_doc *web_live_child_response(const char *html,size_t len,const char *url,const char *charset,
+                       const char *headers,const struct web_host *host,web_doc *parent,node_t *frame,web_doc *inherited_origin) {
     if (len == SIZE_MAX || (len && !html)) return NULL;
     web_doc *d = calloc(1, sizeof *d);
     if (!d) return NULL;
@@ -819,7 +832,17 @@ web_doc *web_live_child(const char *html, size_t len, const char *url, const cha
     d->url = strdup(url && *url ? url : "about:blank");
     if (!d->url) { free((void *)d->inherited_url);free(d); return NULL; }
     snprintf(d->base, sizeof d->base, "%s", web_effective_url(d));
-    d->parser = html_begin(d, html ? html : "", html ? len : 0, charset, !(d->sandbox_flags&SB_SCRIPTS));
+    if(!html_policy_init(d,headers,inherited_origin)){web_free(d);return NULL;}
+    char transport_label[64]={0};
+    if(headers){
+        struct http_resp response_headers={.headers_full=(char *)headers};char type[512]={0};
+        http_header(&response_headers,"Content-Type",type,sizeof type);
+        html_transport_label(type,transport_label,sizeof transport_label);
+        if(transport_label[0])charset=transport_label;
+    }
+    d->html_srcdoc=parent && url && !strcmp(url,"about:srcdoc");
+    d->parser = d->html_srcdoc?html_begin_string(d,html?html:"",html?len:0,!(d->sandbox_flags&SB_SCRIPTS),true):
+        html_begin(d, html ? html : "", html ? len : 0, charset, !(d->sandbox_flags&SB_SCRIPTS));
     if (!d->parser) { web_free(d); return NULL; }
     /* The restricted initial blank exposes only a native WindowProxy token.
        Do not create a QuickJS realm whose raw Function/eval could bypass
@@ -1115,6 +1138,7 @@ void web_free(web_doc *d) {
     web_avmedia_free(d);
     web_frames_free(d);
     web_js_free(d);
+    html_policy_free(d);
     css_motion_doc_free(d);
     while(d->fonts) {
         struct web_font_resource *f=d->fonts;d->fonts=f->next;
@@ -2084,6 +2108,8 @@ static node_t *form_of(web_doc *d, node_t *n) {
         node_t *f = *fid && doc_node_connected(n) ? form_id(doc_node_root(n,false),fid) : NULL;
         return f && f->type==N_ELEM && !f->foreign && f->tag==T_form ? f : NULL;
     }
+    if (n->parser_form_owner && n->parser_form_owner->owner == n->owner &&
+        doc_node_root(n, false) == doc_node_root(n->parser_form_owner, false)) return n->parser_form_owner;
     return node_ancestor(n, T_form);
 }
 

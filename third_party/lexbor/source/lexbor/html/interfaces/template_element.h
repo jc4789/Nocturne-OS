@@ -21,6 +21,12 @@ struct lxb_html_template_element {
     lxb_html_element_t          element;
 
     lxb_dom_document_fragment_t *content;
+    /* Private token-time destinations. They are not template DOM children. */
+    lxb_dom_node_t              *insertion_target;
+    lxb_dom_node_t              *insertion_start;
+    lxb_dom_node_t              *insertion_end;
+    lxb_dom_node_t              *shadow_host;
+    bool                       parser_only;
 };
 
 

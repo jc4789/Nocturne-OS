@@ -397,6 +397,14 @@ void JS_FreeContext(JSContext *s);
 JSContext *JS_DupContext(JSContext *ctx);
 void *JS_GetContextOpaque(JSContext *ctx);
 void JS_SetContextOpaque(JSContext *ctx, void *opaque);
+/* Optional host check for author-created dynamic code. The callback returns an
+   owned value (or JS_EXCEPTION); direct eval retains its lexical scope. It is
+   not used for host JS_Eval calls, module loading, or bytecode execution. */
+typedef JSValue JSDynamicCodeCheck(JSContext *ctx, JSValueConst input,
+                                 int kind, int argc, JSValueConst *argv,
+                                 void *opaque);
+enum { JS_DYNAMIC_EVAL, JS_DYNAMIC_FUNCTION, JS_DYNAMIC_FUNCTION_ARGUMENT };
+void JS_SetDynamicCodeCheck(JSContext *ctx, JSDynamicCodeCheck *check, void *opaque);
 JSRuntime *JS_GetRuntime(JSContext *ctx);
 void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj);
 JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id);

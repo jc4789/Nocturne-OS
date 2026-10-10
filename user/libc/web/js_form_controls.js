@@ -219,10 +219,10 @@ const formControlBridge = (() => {
        form owner, labels, selected value, or gauge state belongs to script. */
     const define = Object.defineProperty, fieldsetCollections = new WeakMap(),
         labelCollections = new WeakMap(), datalistCollections = new WeakMap();
-    class HTMLLabelElement extends HTMLElement { constructor() { throw new TypeError('Illegal HTMLLabelElement constructor'); } }
-    class HTMLDataListElement extends HTMLElement { constructor() { throw new TypeError('Illegal HTMLDataListElement constructor'); } }
-    class HTMLProgressElement extends HTMLElement { constructor() { throw new TypeError('Illegal HTMLProgressElement constructor'); } }
-    class HTMLMeterElement extends HTMLElement { constructor() { throw new TypeError('Illegal HTMLMeterElement constructor'); } }
+    class HTMLLabelElement extends HTMLElement { constructor(){return customElementsBridge.construct(new.target,HTMLLabelElement);} }
+    class HTMLDataListElement extends HTMLElement { constructor(){return customElementsBridge.construct(new.target,HTMLDataListElement);} }
+    class HTMLProgressElement extends HTMLElement { constructor(){return customElementsBridge.construct(new.target,HTMLProgressElement);} }
+    class HTMLMeterElement extends HTMLElement { constructor(){return customElementsBridge.construct(new.target,HTMLMeterElement);} }
     function readonly(C, tag, name, get) {
         define(C.prototype, name, {configurable:true, enumerable:true, get() { htmlElementBrand(this, tag); return get(this); }});
     }

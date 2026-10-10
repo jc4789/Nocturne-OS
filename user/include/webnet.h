@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 #include "http.h"
 
 /* Body lengths are uint32_t on the native worker wire; storage grows lazily. */
@@ -44,7 +45,14 @@ static inline bool webnet_method_valid(const char *s) {
 }
 
 typedef struct webnet webnet;
-enum webnet_kind { WEBNET_NAVIGATION, WEBNET_CLASSIC, WEBNET_MODULE, WEBNET_RESOURCE, WEBNET_FETCH };
+enum webnet_kind { WEBNET_NAVIGATION, WEBNET_CLASSIC, WEBNET_MODULE, WEBNET_RESOURCE, WEBNET_FETCH,
+                   WEBNET_REPORT }; /* Append-only native CSP transport. */
+/* A separate destination must not become a generic CORS bypass. Both the
+   submitting host and isolated worker enforce this exact generated field. */
+#define WEBNET_CSP_REPORT_HEADERS "Content-Type: application/csp-report\r\n"
+static inline bool webnet_report_fields_valid(const char *method,const char *headers) {
+    return method && headers && !strcmp(method,"POST") && !strcmp(headers,WEBNET_CSP_REPORT_HEADERS);
+}
 /* Response-only policy. Author request/POST bounds remain WEBNET_BODY_LIMIT. */
 static inline size_t webnet_response_limit(enum webnet_kind kind) {
     return kind == WEBNET_CLASSIC || kind == WEBNET_MODULE ? WEBNET_SCRIPT_BODY_LIMIT : WEBNET_BODY_LIMIT;

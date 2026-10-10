@@ -523,6 +523,7 @@ node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text
     node_t *n = ar_alloc(&d->mem, sizeof *n);
     n->type = (uint8_t)type;
     n->owner = n->allocation_doc = d;
+    n->custom_registry_id = -2;
     n->image = -1;
     n->owned_next = d->owned_nodes;
     d->owned_nodes = n;
@@ -736,6 +737,7 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
     n->nclasses = temp.nclasses;
     d->mem.trap = old;
     bool ordinary = !ns && !n->foreign && !strcmp(name, low);
+    if (ordinary && !strcmp(low,"form")) doc_parser_form_set(n,NULL);
     if (ordinary && n->tag==T_style && !strcmp(low,"type")) cssom_style_lifecycle(n);
     if (ordinary && n->tag == T_link && (!strcmp(low,"href") || !strcmp(low,"rel") ||
         !strcmp(low,"media") || !strcmp(low,"type") || !strcmp(low,"disabled"))) {
@@ -975,6 +977,29 @@ int doc_node_replace_validity(node_t *p, node_t *c, node_t *old) {
     return insertion_validity(p,c,old,old);
 }
 
+void doc_parser_form_set(node_t *node,node_t *form){
+    if(!node || node->parser_form_owner==form)return;
+    web_doc *d=node->owner;if(!d)return;
+    if(node->parser_form_owner){
+        node_t **link=&d->parser_form_nodes;
+        while(*link && *link!=node)link=&(*link)->parser_form_next;
+        if(*link)*link=node->parser_form_next;
+    }
+    node->parser_form_owner=form;node->parser_form_next=NULL;
+    if(form){node->parser_form_next=d->parser_form_nodes;d->parser_form_nodes=node;}
+}
+static void reset_parser_forms(node_t *root) {
+    if(!root->owner || !root->owner->parser_form_nodes)return;
+    for (node_t *n=root;n;n=tree_next(n,root,true,true,true)) if(n->parser_form_owner)doc_parser_form_set(n,NULL);
+    /* A moved form may own foster-parented controls outside its subtree. */
+    web_doc *d=root->owner;
+    if (!d) return;
+    for (node_t *n=d->parser_form_nodes,*next;n;n=next) {
+        next=n->parser_form_next;
+        node_t *f=n->parser_form_owner;
+        if (doc_node_root(n,false)!=doc_node_root(f,false)) doc_parser_form_set(n,NULL);
+    }
+}
 bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
     if (!d || !p || !c || p->owner != d || doc_node_insert_validity(p, c, before)) return false;
     (d->dom_family ? d->dom_family : d)->profile.inserts++;
@@ -1009,6 +1034,7 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
     if (c->prev) c->prev->next = c; else p->first = c;
     if (before) before->prev = c; else p->last = c;
     indices(p);
+    reset_parser_forms(c);
     if (is_slot(p) && !p->slot_assigned_first && doc_node_root(p, false)->shadow_host)
         doc_slot_signal(p);
     /* A move into a detached forest still removes content from the live tree. */
@@ -1033,6 +1059,7 @@ void doc_node_remove(web_doc *d, node_t *n) {
         doc_slot_signal(p);
     web_frames_detach_tree(d,n);
     detach(n);
+    reset_parser_forms(n);
     css_node_style_unpublish(n); /* inherited borrows cannot outlive the former parent */
     structure_changed(d, p, n);
     web_select_inserted(d, n, p);
@@ -1066,7 +1093,7 @@ static void adopt_subtree(web_doc *d, node_t *root) {
         free(n->adopted_sheets); n->adopted_sheets = NULL; n->adopted_count = 0;
     }
     if(n->owner!=owner)n->style_scope=NULL;
-    n->owner = owner;
+    doc_parser_form_set(n,NULL);n->owner = owner;
     for (int i = 0; i < n->nattrs; i++) if (n->attrs[i].node) n->attrs[i].node->owner = owner;
     n->style = n->animation_base_style = NULL; n->box = n->anchor_block = NULL;
     n->image = -1; n->image_request = -1; n->image_initialized = false;
@@ -1181,6 +1208,7 @@ bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
                 rebuild_boxes=false; d->layout_valid=false;
             }
         }
+        if(n->type==N_PI){n->pi_attributes_ready=false;n->pi_attribute_count=0;n->pi_attributes=NULL;}
     } else {
         bool had_text=false,text_children=true;
         for(node_t *child=n->first;child;child=child->next) {
@@ -1205,7 +1233,9 @@ bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
 
 bool doc_node_html(web_doc *d, node_t *n, const char *html, size_t len) {
     if (!d || !n || (n->type != N_ELEM && n->type != N_FRAGMENT) || len == SIZE_MAX || (len && !html)) return false;
-    node_t *context = n->shadow_host ? n->shadow_host : n;
+    /* Fragment parsing needs the actual ShadowRoot registry, while its HTML
+       element context is selected by the parser without losing that root. */
+    node_t *context = n;
     if (n->type == N_ELEM && !n->foreign && n->tag == T_template) {
         n = doc_template_content(d, n);
         if (!n) return false;
@@ -1316,6 +1346,14 @@ static node_t *clone_one(web_doc *d, node_t *n) {
     if (!c) return NULL;
     c->foreign = n->foreign;
     c->namespace_id = n->namespace_id;
+    c->custom_registry_id = n->custom_registry_id;
+    c->custom_registry_realm = n->custom_registry_realm;
+    if (n->custom_is) {
+        jmp_buf trap; jmp_buf *old = d->mem.trap; d->mem.trap = &trap;
+        if (setjmp(trap)) { d->mem.trap = old; return NULL; }
+        c->custom_is = ar_strdup(&d->mem, n->custom_is);
+        d->mem.trap = old;
+    }
     if (n->type == N_DOCTYPE) {
         /* Doctype strings are arena-owned like ordinary attributes. */
         jmp_buf trap; jmp_buf *old = d->mem.trap; d->mem.trap = &trap;
@@ -1382,6 +1420,8 @@ node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
                     shadow->shadow_delegates_focus, true, shadow->shadow_serializable, shadow->shadow_manual);
                 if (!at->target) { free(stack); return NULL; }
                 at->target->shadow_declarative = shadow->shadow_declarative;
+                at->target->custom_registry_id = shadow->custom_registry_id;
+                at->target->custom_registry_realm = shadow->custom_registry_realm;
                 at->next = shadow->first;
             }
         }

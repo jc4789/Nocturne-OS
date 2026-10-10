@@ -99,6 +99,7 @@ const textTrackBridge = (() => {
         if(!t){t=new TextTrack(token,null,'subtitles','','',node);put(elementSlots,node,t);}
         const p=node.parentNode;if(p&&p.namespaceURI===HTML&&(p.localName==='video'||p.localName==='audio')){const o=owner(p);sync(o);}return t;}
     class HTMLTrackElement extends HTMLElement {
+        constructor(){return customElementsBridge.construct(new.target,HTMLTrackElement);}
         get kind(){elementBrand(this);const v=(this.getAttribute('kind')||'subtitles').toLowerCase();return KINDS.includes(v)?v:'metadata';}
         set kind(v){elementBrand(this);this.setAttribute('kind',string(v));}
         get src(){elementBrand(this);const v=this.getAttribute('src');return v?new URL(v,this.baseURI).href:'';}

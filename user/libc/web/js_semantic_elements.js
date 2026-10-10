@@ -4,11 +4,11 @@
 const semanticElementsBridge = (() => {
     'use strict';
     const define=Object.defineProperty, string=elementURL.string, NumberImpl=Number;
-    class HTMLTimeElement extends HTMLElement {constructor(){throw new TypeError('Illegal HTMLTimeElement constructor');}}
-    class HTMLDataElement extends HTMLElement {constructor(){throw new TypeError('Illegal HTMLDataElement constructor');}}
-    class HTMLDetailsElement extends HTMLElement {constructor(){throw new TypeError('Illegal HTMLDetailsElement constructor');}}
-    class HTMLOListElement extends HTMLElement {constructor(){throw new TypeError('Illegal HTMLOListElement constructor');}}
-    class HTMLLIElement extends HTMLElement {constructor(){throw new TypeError('Illegal HTMLLIElement constructor');}}
+    class HTMLTimeElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLTimeElement);}}
+    class HTMLDataElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLDataElement);}}
+    class HTMLDetailsElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLDetailsElement);}}
+    class HTMLOListElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLOListElement);}}
+    class HTMLLIElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLLIElement);}}
     function reflect(C,tag,property,attribute=property){
         define(C.prototype,property,{configurable:true,enumerable:true,
             get(){htmlElementBrand(this,tag);return reflectedAttr(this,attribute)||'';},

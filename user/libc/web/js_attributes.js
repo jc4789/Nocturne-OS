@@ -132,5 +132,5 @@ const attributeBridge = (() => {
         if(a){name=get(a,'localName');ns=get(a,'namespaceURI');}
         return {node:el,name,namespace:ns,oldValue:a?get(a,'attrValue'):null};
     }
-    return {nodeProto:Attr.prototype,mutation};
+    return {nodeProto:Attr.prototype,mutation,owner};
 })();

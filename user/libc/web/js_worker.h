@@ -21,6 +21,11 @@ typedef bool (*web_worker_loader)(void *,uint32_t,uint32_t,const char *,int);
 /* Request zero retires all outstanding resources of this real child owner. */
 typedef void (*web_worker_canceler)(void *,uint32_t,uint32_t);
 web_workers *web_worker_new(JSContext *,uint32_t,web_worker_loader,void *);
+/* Private native creator policy snapshot, copied when each child is created.
+ * Local-script workers inherit it; HTTP workers use their response policy. */
+bool web_worker_set_policy(web_workers *,const char *);
+typedef void (*web_worker_reporter)(void *,JSValueConst);
+void web_worker_set_reporter(web_workers *,web_worker_reporter,void *);
 void web_worker_set_canceler(web_workers *,web_worker_canceler);
 JSValue web_worker_native(web_workers *,int,JSValueConst *);
 void web_worker_set_callback(web_workers *,JSValueConst);

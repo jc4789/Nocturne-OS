@@ -8,17 +8,24 @@
 #include <stdio.h>
 struct packet {struct packet *next;struct njw_header h;size_t at;uint8_t *data;};
 #include "js_worker_port_lifetime.h"
-struct child {struct child *next;char *name;size_t name_len;uint32_t id,parent_port;int pid,in,out;bool started,stopped,closing;struct packet *tx,*tail;struct broker_pair *ports;struct njw_header rx;size_t head_at,data_at,rx_charge;uint8_t *data;};
+struct child {struct child *next;char *name,*creator_policy;size_t name_len;uint32_t id,parent_port;int pid,in,out;bool started,stopped,closing,inherit_policy;struct packet *tx,*tail;struct broker_pair *ports;struct njw_header rx;size_t head_at,data_at,rx_charge;uint8_t *data;};
 struct event {struct event *next;uint32_t id;struct njw_header h;uint8_t *data;};
-struct web_workers {JSContext *ctx;JSValue callback;uint32_t generation,next_id;web_worker_loader load;web_worker_canceler cancel;void *opaque;struct child *children;struct event *events,*last;size_t queued;uint32_t next_lease;struct broker_lease *leases;};
+struct web_workers {JSContext *ctx;JSValue callback;uint32_t generation,next_id;web_worker_loader load;web_worker_canceler cancel;void *opaque;char *creator_policy;web_worker_reporter reporter;void *report_opaque;struct child *children;struct event *events,*last;size_t queued;uint32_t next_lease;struct broker_lease *leases;};
 struct web_worker_publication {web_workers *owner;struct child *child;struct packet *packet;struct broker_pair *ports,*close_pair,*ack_pair;};
 static struct broker_pair *broker_find(struct child *c,uint32_t id,uint32_t creator){return worker_port_find(c->ports,id,creator);}
 static void broker_packet_free(void *opaque){struct packet *p=opaque;if(p){free(p->data);free(p);}}
 static size_t broker_free(struct broker_pair *p){size_t released=0;while(p){struct broker_pair *n=p->next;struct packet*a=p->held_close,*b=p->held_ack;if(a)released+=sizeof a->h+a->h.bytes;if(b)released+=sizeof b->h+b->h.bytes;broker_packet_free(a);broker_packet_free(b);free(p);p=n;}return released;}
 static bool broker_metadata(JSContext *ctx,struct child *c,JSValueConst value,unsigned creator,struct broker_pair **result){return worker_port_metadata(ctx,value,creator,c->ports,creator?UINT32_MAX:c->parent_port,result);}
+static char *policy_copy(const char *headers){size_t n=strlen(headers?headers:"");if(n==SIZE_MAX)return NULL;char *copy=malloc(n+1);if(copy)memcpy(copy,headers?headers:"",n+1);return copy;}
+static void child_free(struct child *c){if(c){free(c->creator_policy);free(c->name);free(c);}}
+static bool resource_field(JSContext *ctx,JSValueConst record,uint32_t index,JSValue value){
+    if(JS_IsException(value))return false;
+    /* Resource completion is not an author-JS task. Bypass prototype setters. */
+    return JS_DefinePropertyValueUint32(ctx,record,index,value,JS_PROP_C_W_E)>=0;
+}
 static struct child *retired;
 static unsigned active_children;
-void web_worker_background(void){struct child **p=&retired;while(*p){struct child *r=*p;int n=waitpid(r->pid,NULL,WNOHANG);if(n==r->pid||(n<0&&errno==ECHILD)){*p=r->next;free(r->name);free(r);if(active_children)active_children--;}else p=&r->next;}}
+void web_worker_background(void){struct child **p=&retired;while(*p){struct child *r=*p;int n=waitpid(r->pid,NULL,WNOHANG);if(n==r->pid||(n<0&&errno==ECHILD)){*p=r->next;child_free(r);if(active_children)active_children--;}else p=&r->next;}}
 int64_t web_worker_background_deadline(uint64_t now){return retired?(int64_t)now+10:-1;}
 static struct child *find(web_workers *w,uint32_t id){for(struct child *c=w->children;c;c=c->next)if(c->id==id)return c;return NULL;}
 static bool queue_room(const web_workers *w,size_t length){return length<=SIZE_MAX-sizeof(struct njw_header)&&length+sizeof(struct njw_header)<=SIZE_MAX-w->queued;}
@@ -103,17 +110,19 @@ static bool spawn_child(web_workers *w,struct child *c){
 bad:for(int i=0;i<2;i++){if(ip[i]>=0)close(ip[i]);if(op[i]>=0)close(op[i]);}if(nullfd>=0)close(nullfd);fail(w,c,"Cannot spawn native dedicated Worker");return false;
 }
 web_workers *web_worker_new(JSContext *ctx,uint32_t generation,web_worker_loader load,void *opaque){web_workers *w=calloc(1,sizeof *w);if(!w)return NULL;w->ctx=ctx;w->generation=generation;w->callback=JS_UNDEFINED;w->load=load;w->opaque=opaque;return w;}
+bool web_worker_set_policy(web_workers *w,const char *headers){if(!w)return false;char *copy=policy_copy(headers);if(!copy)return false;free(w->creator_policy);w->creator_policy=copy;return true;}
+void web_worker_set_reporter(web_workers *w,web_worker_reporter reporter,void *opaque){if(w){w->reporter=reporter;w->report_opaque=opaque;}}
 void web_worker_set_canceler(web_workers *w,web_worker_canceler cancel){if(w)w->cancel=cancel;}
 void web_worker_set_callback(web_workers *w,JSValueConst fn){if(!w)return;JS_FreeValue(w->ctx,w->callback);w->callback=JS_DupValue(w->ctx,fn);}
 JSValue web_worker_native(web_workers *w,int argc,JSValueConst *argv){
     if(!w)return JS_UNDEFINED;JSContext *ctx=w->ctx;uint32_t op=0,id=0;if(argc<2||JS_ToUint32(ctx,&op,argv[0])<0||JS_ToUint32(ctx,&id,argv[1])<0)return JS_EXCEPTION;
     if(op==0){if(w->next_id==UINT32_MAX)return JS_ThrowRangeError(ctx,"Worker identifier space exhausted");
-        const char *url=argc>2?JS_ToCString(ctx,argv[2]):NULL;if(!url)return JS_EXCEPTION;struct child *c=calloc(1,sizeof *c);if(!c){JS_FreeCString(ctx,url);return JS_ThrowOutOfMemory(ctx);}size_t name_len=0;const char *name=argc>3?JS_ToCStringLen(ctx,&name_len,argv[3]):"";if(!name){JS_FreeCString(ctx,url);free(c);return JS_EXCEPTION;}if(name_len!=SIZE_MAX)c->name=malloc(name_len+1);if(c->name){memcpy(c->name,name,name_len);c->name[name_len]=0;c->name_len=name_len;}if(argc>3)JS_FreeCString(ctx,name);if(!c->name){JS_FreeCString(ctx,url);free(c);return JS_ThrowOutOfMemory(ctx);}c->id=++w->next_id;c->in=c->out=-1;c->next=w->children;w->children=c;
-        bool ok=w->load&&w->load(w->opaque,c->id,0,url,0);JS_FreeCString(ctx,url);if(!ok){w->children=c->next;free(c->name);free(c);return JS_ThrowTypeError(ctx,"Worker source URL rejected or request unavailable");}return JS_NewUint32(ctx,c->id);
+        const char *url=argc>2?JS_ToCString(ctx,argv[2]):NULL;if(!url)return JS_EXCEPTION;struct child *c=calloc(1,sizeof *c);if(!c){JS_FreeCString(ctx,url);return JS_ThrowOutOfMemory(ctx);}size_t name_len=0;const char *name=argc>3?JS_ToCStringLen(ctx,&name_len,argv[3]):"";if(!name){JS_FreeCString(ctx,url);free(c);return JS_EXCEPTION;}if(name_len!=SIZE_MAX)c->name=malloc(name_len+1);if(c->name){memcpy(c->name,name,name_len);c->name[name_len]=0;c->name_len=name_len;}if(argc>3)JS_FreeCString(ctx,name);if(!c->name){JS_FreeCString(ctx,url);free(c);return JS_ThrowOutOfMemory(ctx);}c->creator_policy=policy_copy(w->creator_policy);if(!c->creator_policy){JS_FreeCString(ctx,url);child_free(c);return JS_ThrowOutOfMemory(ctx);}c->inherit_policy=!strncasecmp(url,"blob:",5)||!strncasecmp(url,"data:",5)||!strncasecmp(url,"about:",6);c->id=++w->next_id;c->in=c->out=-1;c->next=w->children;w->children=c;
+        bool ok=w->load&&w->load(w->opaque,c->id,0,url,0);JS_FreeCString(ctx,url);if(!ok){w->children=c->next;child_free(c);return JS_ThrowTypeError(ctx,"Worker source URL rejected or request unavailable");}return JS_NewUint32(ctx,c->id);
     }
     struct child *c=find(w,id);if(!c||c->stopped)return JS_UNDEFINED;
     if(op==4){if(c->parent_port==UINT32_MAX)return JS_ThrowRangeError(ctx,"Worker port identifier space exhausted");return JS_NewUint32(ctx,++c->parent_port);}
-    if(op==2){stop(w,c);if(!c->pid){struct child **at=&w->children;while(*at&&*at!=c)at=&(*at)->next;if(*at)*at=c->next;free(c->name);free(c);}return JS_UNDEFINED;}
+    if(op==2){stop(w,c);if(!c->pid){struct child **at=&w->children;while(*at&&*at!=c)at=&(*at)->next;if(*at)*at=c->next;child_free(c);}return JS_UNDEFINED;}
     if(op==1){if(argc<3)return JS_ThrowTypeError(ctx,"Worker message required");if(!serialized(w,c,NJW_MESSAGE,0,0,argv[2],false))return JS_ThrowRangeError(ctx,"Worker message allocation, representation or transport failed");return JS_UNDEFINED;}
     return JS_ThrowTypeError(ctx,"Invalid Worker operation");
 }
@@ -137,9 +146,15 @@ void web_worker_loaded(web_workers *w,uint32_t id,uint32_t request,int status,co
         }
     }
     if(n>NJW_MAX_BYTES){fail(w,c,"Worker resource length is not representable on the wire");return;}
-    JSContext *ctx=w->ctx;JSValue a=JS_NewArray(ctx);JS_SetPropertyUint32(ctx,a,0,JS_NewInt32(ctx,status));JS_SetPropertyUint32(ctx,a,1,JS_NewString(ctx,url?url:""));JS_SetPropertyUint32(ctx,a,2,JS_NewString(ctx,headers?headers:""));JS_SetPropertyUint32(ctx,a,3,JS_NewArrayBufferCopy(ctx,bytes,n));JS_SetPropertyUint32(ctx,a,4,JS_NewString(ctx,error?error:""));JS_SetPropertyUint32(ctx,a,5,JS_NewStringLen(ctx,c->name?c->name:"",c->name_len));
-    JS_SetPropertyUint32(ctx,a,6,JS_NewBool(ctx,w->cancel!=NULL));
-    bool first=request==0;bool ok=serialized(w,c,first?NJW_START:NJW_LOADED,request,kind,a,first);JS_FreeValue(ctx,a);if(!ok){fail(w,c,"Worker resource allocation, representation or transport failed");return;}if(first)c->started=true;
+    JSContext *ctx=w->ctx;JSValue a=JS_NewArray(ctx);
+    bool filled=!JS_IsException(a) && resource_field(ctx,a,0,JS_NewInt32(ctx,status)) &&
+        resource_field(ctx,a,1,JS_NewString(ctx,url?url:"")) && resource_field(ctx,a,2,JS_NewString(ctx,headers?headers:"")) &&
+        resource_field(ctx,a,3,JS_NewArrayBufferCopy(ctx,bytes,n)) && resource_field(ctx,a,4,JS_NewString(ctx,error?error:"")) &&
+        resource_field(ctx,a,5,JS_NewStringLen(ctx,c->name?c->name:"",c->name_len)) && resource_field(ctx,a,6,JS_NewBool(ctx,w->cancel!=NULL));
+    bool first=request==0;
+    if(first)filled=filled && resource_field(ctx,a,NJW_START_CREATOR_POLICY,JS_NewString(ctx,c->creator_policy?c->creator_policy:"")) &&
+        resource_field(ctx,a,NJW_START_INHERIT_POLICY,JS_NewBool(ctx,c->inherit_policy));
+    bool ok=filled && serialized(w,c,first?NJW_START:NJW_LOADED,request,kind,a,first);JS_FreeValue(ctx,a);if(!ok){fail(w,c,"Worker resource allocation, representation or transport failed");return;}if(first)c->started=true;
 }
 void web_worker_pump(web_workers *w,uint64_t now){
     (void)now;web_worker_background();if(!w)return;
@@ -153,11 +168,11 @@ void web_worker_pump(web_workers *w,uint64_t now){
             size_t left=header?sizeof c->rx-c->head_at:c->rx.bytes-c->data_at;size_t take=left<budget?left:budget;ssize_t n=read(c->out,header?(void *)((uint8_t *)&c->rx+c->head_at):(void *)(c->data+c->data_at),take);if(n<0&&(errno==EAGAIN||errno==EINTR))break;if(n<=0){fail(w,c,"Worker process exited");break;}budget-=n;
             if(header){c->head_at+=n;if(c->head_at==sizeof c->rx){bool port=c->rx.op==NJW_PORT_MESSAGE||c->rx.op==NJW_PORT_CLOSE||c->rx.op==NJW_PORT_DRAINED;
                 bool valid_kind=port?c->rx.kind<=1:c->rx.op==NJW_MESSAGE?(c->rx.kind==0||c->rx.kind==NJW_WITH_PORTS):c->rx.op==NJW_LOAD?njw_load_kind_valid(c->rx.kind):c->rx.op==NJW_CANCEL?c->rx.kind==0&&c->rx.request!=0:c->rx.kind<=2;
-                if(c->rx.magic!=NJW_MAGIC||c->rx.generation!=w->generation||!c->rx.bytes||(c->rx.op!=NJW_MESSAGE&&c->rx.op!=NJW_ERROR&&c->rx.op!=NJW_LOAD&&c->rx.op!=NJW_CANCEL&&c->rx.op!=NJW_CLOSE&&c->rx.op!=NJW_CONSOLE&&!port)||!valid_kind||!queue_room(w,c->rx.bytes)){fail(w,c,"Invalid Worker response or receive size overflow");break;}c->data=malloc(c->rx.bytes);if(!c->data){fail(w,c,"Worker receive allocation failed");break;}c->rx_charge=sizeof c->rx+c->rx.bytes;w->queued+=c->rx_charge;}}else c->data_at+=n;
+                if(c->rx.magic!=NJW_MAGIC||c->rx.generation!=w->generation||!c->rx.bytes||(c->rx.op!=NJW_MESSAGE&&c->rx.op!=NJW_ERROR&&c->rx.op!=NJW_LOAD&&c->rx.op!=NJW_CANCEL&&c->rx.op!=NJW_CLOSE&&c->rx.op!=NJW_CONSOLE&&c->rx.op!=NJW_CSP_REPORT&&!port)||!valid_kind||!queue_room(w,c->rx.bytes)){fail(w,c,"Invalid Worker response or receive size overflow");break;}c->data=malloc(c->rx.bytes);if(!c->data){fail(w,c,"Worker receive allocation failed");break;}c->rx_charge=sizeof c->rx+c->rx.bytes;w->queued+=c->rx_charge;}}else c->data_at+=n;
             if(c->head_at==sizeof c->rx&&c->data_at==c->rx.bytes){struct event *e=calloc(1,sizeof *e);if(!e){fail(w,c,"Worker event allocation failed");break;}e->id=c->id;e->h=c->rx;e->data=c->data;c->data=NULL;c->head_at=c->data_at=0;c->rx_charge=0;if(w->last)w->last->next=e;else w->events=e;w->last=e;if(e->h.op==NJW_CLOSE){c->closing=true;break;}}
         }
     }
-    struct child **at=&w->children;while(*at){struct child *c=*at;if(c->stopped&&!c->pid){*at=c->next;free(c->name);free(c);}else at=&c->next;}
+    struct child **at=&w->children;while(*at){struct child *c=*at;if(c->stopped&&!c->pid){*at=c->next;child_free(c);}else at=&c->next;}
 }
 bool web_worker_runnable(const web_workers *w){return w&&w->events;}
 static bool console_prefix(JSContext *ctx,JSValueConst value,const struct child *c){
@@ -178,6 +193,17 @@ static bool console_prefix(JSContext *ctx,JSValueConst value,const struct child 
     if(JS_IsException(result))return false;
     return JS_SetPropertyStr(ctx,value,"message",result)>=0;
 }
+/* IPC recreates Object/Array prototypes in the receiving realm. Strip them
+ * again before this private report dictionary reaches CSP field reads/JSON:
+ * author prototype getters and toJSON are never report authority. */
+static bool report_private(JSContext *ctx,JSValueConst value){
+    if(!JS_IsObject(value))return false;
+    if(JS_SetPrototype(ctx,value,JS_NULL)<0)return false;
+    JSValue init=JS_GetPropertyStr(ctx,value,"init"),endpoints=JS_GetPropertyStr(ctx,value,"endpoints");
+    bool ok=JS_IsObject(init)&&JS_IsArray(ctx,endpoints)>0;
+    if(ok)ok=JS_SetPrototype(ctx,init,JS_NULL)>=0&&JS_SetPrototype(ctx,endpoints,JS_NULL)>=0;
+    JS_FreeValue(ctx,init);JS_FreeValue(ctx,endpoints);return ok;
+}
 bool web_worker_run_one(web_workers *w){
     if(!w||!w->events)return false;struct event *e=w->events;w->events=e->next;if(!w->events)w->last=NULL;w->queued-=sizeof e->h+e->h.bytes;struct child *c=find(w,e->id);
     if((c&&!c->stopped)||e->h.op==NJW_ERROR){JSContext *ctx=w->ctx;JSValue v=JS_ReadObject(ctx,e->data,e->h.bytes,JS_READ_OBJ_REFERENCE);if(!JS_IsException(v)){
@@ -190,10 +216,11 @@ bool web_worker_run_one(web_workers *w){
             }
         }
         if(e->h.op==NJW_LOAD){const char *url=JS_IsString(v)?JS_ToCString(ctx,v):NULL;bool ok=e->h.request&&url&&w->load&&w->load(w->opaque,c->id,e->h.request,url,e->h.kind);JS_FreeCString(ctx,url);if(!ok)web_worker_loaded(w,c->id,e->h.request,0,"","",NULL,0,"Worker resource URL rejected");}
+        else if(e->h.op==NJW_CSP_REPORT){if(report_private(ctx,v)){if(w->reporter)w->reporter(w->report_opaque,v);}else fail(w,c,"Invalid private Worker CSP report");}
         else if(e->h.op==NJW_CANCEL){if(!JS_IsNull(v)||!w->cancel)fail(w,c,"Worker host cannot cancel this resource");else w->cancel(w->opaque,c->id,e->h.request);}
         else {if(e->h.op!=NJW_CONSOLE||!c||console_prefix(ctx,v,c)){JSValue args[]={JS_NewUint32(ctx,e->id),JS_NewUint32(ctx,e->h.op),v,JS_NewUint32(ctx,e->h.request),JS_NewUint32(ctx,e->h.kind)};JSValue r=JS_Call(ctx,w->callback,JS_UNDEFINED,5,args);JS_FreeValue(ctx,r);JS_FreeValue(ctx,args[0]);JS_FreeValue(ctx,args[1]);JS_FreeValue(ctx,args[3]);JS_FreeValue(ctx,args[4]);if(e->h.op==NJW_CLOSE&&c)stop(w,c);}}
         JS_FreeValue(ctx,v);
     }}done:free(e->data);free(e);return true;
 }
 int64_t web_worker_deadline(const web_workers *w,uint64_t now){if(!w)return -1;if(w->events)return (int64_t)now;for(struct child *c=w->children;c;c=c->next)if(c->pid||(!c->stopped&&c->started))return (int64_t)now+10;return -1;}
-void web_worker_free(web_workers *w){if(!w)return;while(w->children){struct child *c=w->children;w->children=c->next;stop(w,c);if(c->pid){c->next=retired;retired=c;}else {free(c->name);free(c);}}while(w->events){struct event *e=w->events;w->events=e->next;free(e->data);free(e);}while(w->leases){struct broker_lease*l=w->leases;w->leases=l->next;free(l);}JS_FreeValue(w->ctx,w->callback);free(w);}
+void web_worker_free(web_workers *w){if(!w)return;while(w->children){struct child *c=w->children;w->children=c->next;stop(w,c);if(c->pid){c->next=retired;retired=c;}else {child_free(c);}}while(w->events){struct event *e=w->events;w->events=e->next;free(e->data);free(e);}while(w->leases){struct broker_lease*l=w->leases;w->leases=l->next;free(l);}JS_FreeValue(w->ctx,w->callback);free(w->creator_policy);free(w);}

@@ -38,6 +38,8 @@ bool web_frame_initial_blocked(const struct web_frame *frame,const char *source,
 bool web_frame_initial_create(struct web_frame *frame,const struct web_host *host);
 bool web_frame_commit(struct web_frame *frame, const char *html, size_t length,
                       const char *url, const char *charset, const struct web_host *host, bool inherited);
+bool web_frame_commit_response(struct web_frame *frame,const char *html,size_t length,
+                      const char *url,const char *charset,const char *headers,const struct web_host *host,bool inherited);
 void web_frames_free(web_doc *document);
 void web_frames_tick(web_doc *document, uint64_t now);
 int64_t web_frames_deadline(web_doc *document);

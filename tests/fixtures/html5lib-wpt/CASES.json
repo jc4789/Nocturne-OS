@@ -1,0 +1,5515 @@
+{
+  "files": [
+    {
+      "path": "D:\\Programes\\llm vibe slop os\\tests\\fixtures\\html5lib-wpt\\tests1.dat",
+      "sha256": "aada6e3d12d624051bc978694475bd6a12bcedd7758781ba62425314684d23f3",
+      "bytes": 39460
+    },
+    {
+      "path": "D:\\Programes\\llm vibe slop os\\tests\\fixtures\\html5lib-wpt\\foreign-fragment.dat",
+      "sha256": "73e1785753c66420c067e5b29f89b17e7ebe1079687a512040ef19c6d42ac2c2",
+      "bytes": 9082
+    },
+    {
+      "path": "D:\\Programes\\llm vibe slop os\\tests\\fixtures\\html5lib-wpt\\template.dat",
+      "sha256": "72667fae7be5d2020b679409e45fed7b6923a3e9394da11a02c5bd9650323264",
+      "bytes": 28004
+    }
+  ],
+  "source_cases": 305,
+  "generated_cases": 610,
+  "skipped_cases": 0,
+  "parse_error_counts_checked": false,
+  "cases": [
+    {
+      "id": "tests1.dat:1",
+      "line": 1,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:1",
+      "line": 1,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:2",
+      "line": 11,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:2",
+      "line": 11,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:3",
+      "line": 24,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:3",
+      "line": 24,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:4",
+      "line": 40,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:4",
+      "line": 40,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:5",
+      "line": 49,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:5",
+      "line": 49,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:6",
+      "line": 58,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:6",
+      "line": 58,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:7",
+      "line": 67,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:7",
+      "line": 67,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:8",
+      "line": 76,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:8",
+      "line": 76,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:9",
+      "line": 85,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:9",
+      "line": 85,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:10",
+      "line": 94,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:10",
+      "line": 94,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:11",
+      "line": 103,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:11",
+      "line": 103,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:12",
+      "line": 112,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:12",
+      "line": 112,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:13",
+      "line": 121,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:13",
+      "line": 121,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:14",
+      "line": 130,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:14",
+      "line": 130,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:15",
+      "line": 139,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:15",
+      "line": 139,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:16",
+      "line": 148,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:16",
+      "line": 148,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:17",
+      "line": 157,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:17",
+      "line": 157,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:18",
+      "line": 166,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:18",
+      "line": 166,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:19",
+      "line": 175,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:19",
+      "line": 175,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:20",
+      "line": 184,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:20",
+      "line": 184,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:21",
+      "line": 202,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 5
+    },
+    {
+      "id": "tests1.dat:21",
+      "line": 202,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 5
+    },
+    {
+      "id": "tests1.dat:22",
+      "line": 222,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:22",
+      "line": 222,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:23",
+      "line": 237,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:23",
+      "line": 237,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:24",
+      "line": 256,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:24",
+      "line": 256,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:25",
+      "line": 272,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:25",
+      "line": 272,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:26",
+      "line": 286,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 6
+    },
+    {
+      "id": "tests1.dat:26",
+      "line": 286,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 6
+    },
+    {
+      "id": "tests1.dat:27",
+      "line": 307,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:27",
+      "line": 307,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:28",
+      "line": 323,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 6
+    },
+    {
+      "id": "tests1.dat:28",
+      "line": 323,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 6
+    },
+    {
+      "id": "tests1.dat:29",
+      "line": 342,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:29",
+      "line": 342,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:30",
+      "line": 355,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:30",
+      "line": 355,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:31",
+      "line": 373,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 9
+    },
+    {
+      "id": "tests1.dat:31",
+      "line": 373,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 9
+    },
+    {
+      "id": "tests1.dat:32",
+      "line": 405,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:32",
+      "line": 405,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:33",
+      "line": 426,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 15
+    },
+    {
+      "id": "tests1.dat:33",
+      "line": 426,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 15
+    },
+    {
+      "id": "tests1.dat:34",
+      "line": 462,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "tests1.dat:34",
+      "line": 462,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "tests1.dat:35",
+      "line": 481,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:35",
+      "line": 481,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:36",
+      "line": 499,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:36",
+      "line": 499,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:37",
+      "line": 512,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:37",
+      "line": 512,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:38",
+      "line": 525,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:38",
+      "line": 525,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:39",
+      "line": 538,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:39",
+      "line": 538,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:40",
+      "line": 551,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:40",
+      "line": 551,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:41",
+      "line": 562,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:41",
+      "line": 562,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:42",
+      "line": 574,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:42",
+      "line": 574,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:43",
+      "line": 587,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:43",
+      "line": 587,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:44",
+      "line": 600,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:44",
+      "line": 600,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:45",
+      "line": 610,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:45",
+      "line": 610,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:46",
+      "line": 623,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:46",
+      "line": 623,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:47",
+      "line": 636,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:47",
+      "line": 636,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:48",
+      "line": 646,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:48",
+      "line": 646,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:49",
+      "line": 659,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:49",
+      "line": 659,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:50",
+      "line": 672,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:50",
+      "line": 672,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:51",
+      "line": 684,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:51",
+      "line": 684,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:52",
+      "line": 698,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:52",
+      "line": 698,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:53",
+      "line": 712,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:53",
+      "line": 712,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:54",
+      "line": 729,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:54",
+      "line": 729,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:55",
+      "line": 747,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:55",
+      "line": 747,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:56",
+      "line": 763,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:56",
+      "line": 763,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:57",
+      "line": 776,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:57",
+      "line": 776,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:58",
+      "line": 796,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:58",
+      "line": 796,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:59",
+      "line": 809,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:59",
+      "line": 809,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:60",
+      "line": 825,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:60",
+      "line": 825,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:61",
+      "line": 842,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:61",
+      "line": 842,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:62",
+      "line": 861,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:62",
+      "line": 861,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:63",
+      "line": 870,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:63",
+      "line": 870,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:64",
+      "line": 881,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:64",
+      "line": 881,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:65",
+      "line": 893,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:65",
+      "line": 893,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:66",
+      "line": 906,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:66",
+      "line": 906,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:67",
+      "line": 920,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:67",
+      "line": 920,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:68",
+      "line": 935,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:68",
+      "line": 935,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:69",
+      "line": 951,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:69",
+      "line": 951,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:70",
+      "line": 968,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:70",
+      "line": 968,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:71",
+      "line": 986,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:71",
+      "line": 986,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:72",
+      "line": 1007,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:72",
+      "line": 1007,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:73",
+      "line": 1029,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:73",
+      "line": 1029,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:74",
+      "line": 1053,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:74",
+      "line": 1053,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:75",
+      "line": 1078,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:75",
+      "line": 1078,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:76",
+      "line": 1103,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:76",
+      "line": 1103,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:77",
+      "line": 1129,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:77",
+      "line": 1129,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:78",
+      "line": 1141,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 8
+    },
+    {
+      "id": "tests1.dat:78",
+      "line": 1141,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 8
+    },
+    {
+      "id": "tests1.dat:79",
+      "line": 1173,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:79",
+      "line": 1173,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:80",
+      "line": 1196,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 8
+    },
+    {
+      "id": "tests1.dat:80",
+      "line": 1196,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 8
+    },
+    {
+      "id": "tests1.dat:81",
+      "line": 1228,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:81",
+      "line": 1228,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:82",
+      "line": 1248,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:82",
+      "line": 1248,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:83",
+      "line": 1266,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:83",
+      "line": 1266,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:84",
+      "line": 1278,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:84",
+      "line": 1278,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:85",
+      "line": 1292,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:85",
+      "line": 1292,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:86",
+      "line": 1306,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:86",
+      "line": 1306,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:87",
+      "line": 1318,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:87",
+      "line": 1318,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:88",
+      "line": 1339,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:88",
+      "line": 1339,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:89",
+      "line": 1356,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:89",
+      "line": 1356,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:90",
+      "line": 1367,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:90",
+      "line": 1367,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:91",
+      "line": 1379,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 10
+    },
+    {
+      "id": "tests1.dat:91",
+      "line": 1379,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 10
+    },
+    {
+      "id": "tests1.dat:92",
+      "line": 1404,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:92",
+      "line": 1404,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:93",
+      "line": 1416,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:93",
+      "line": 1416,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:94",
+      "line": 1428,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 5
+    },
+    {
+      "id": "tests1.dat:94",
+      "line": 1428,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 5
+    },
+    {
+      "id": "tests1.dat:95",
+      "line": 1447,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:95",
+      "line": 1447,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:96",
+      "line": 1460,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:96",
+      "line": 1460,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:97",
+      "line": 1476,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:97",
+      "line": 1476,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:98",
+      "line": 1490,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 6
+    },
+    {
+      "id": "tests1.dat:98",
+      "line": 1490,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 6
+    },
+    {
+      "id": "tests1.dat:99",
+      "line": 1510,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:99",
+      "line": 1510,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:100",
+      "line": 1524,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:100",
+      "line": 1524,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:101",
+      "line": 1541,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:101",
+      "line": 1541,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:102",
+      "line": 1551,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 10
+    },
+    {
+      "id": "tests1.dat:102",
+      "line": 1551,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 10
+    },
+    {
+      "id": "tests1.dat:103",
+      "line": 1579,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:103",
+      "line": 1579,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "tests1.dat:104",
+      "line": 1604,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:104",
+      "line": 1604,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:105",
+      "line": 1619,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:105",
+      "line": 1619,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:106",
+      "line": 1632,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 5
+    },
+    {
+      "id": "tests1.dat:106",
+      "line": 1632,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 5
+    },
+    {
+      "id": "tests1.dat:107",
+      "line": 1652,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:107",
+      "line": 1652,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "tests1.dat:108",
+      "line": 1674,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:108",
+      "line": 1674,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:109",
+      "line": 1700,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:109",
+      "line": 1700,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "tests1.dat:110",
+      "line": 1722,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 85
+    },
+    {
+      "id": "tests1.dat:110",
+      "line": 1722,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 85
+    },
+    {
+      "id": "tests1.dat:111",
+      "line": 1817,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 111
+    },
+    {
+      "id": "tests1.dat:111",
+      "line": 1817,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 111
+    },
+    {
+      "id": "tests1.dat:112",
+      "line": 1941,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "tests1.dat:112",
+      "line": 1941,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "foreign-fragment.dat:1",
+      "line": 1,
+      "scripting": false,
+      "context": "path",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "foreign-fragment.dat:1",
+      "line": 1,
+      "scripting": true,
+      "context": "path",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "foreign-fragment.dat:2",
+      "line": 12,
+      "scripting": false,
+      "context": "path",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:2",
+      "line": 12,
+      "scripting": true,
+      "context": "path",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:3",
+      "line": 23,
+      "scripting": false,
+      "context": "path",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:3",
+      "line": 23,
+      "scripting": true,
+      "context": "path",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:4",
+      "line": 32,
+      "scripting": false,
+      "context": "path",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "foreign-fragment.dat:4",
+      "line": 32,
+      "scripting": true,
+      "context": "path",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "foreign-fragment.dat:5",
+      "line": 43,
+      "scripting": false,
+      "context": "path",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:5",
+      "line": 43,
+      "scripting": true,
+      "context": "path",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:6",
+      "line": 52,
+      "scripting": false,
+      "context": "foreignObject",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:6",
+      "line": 52,
+      "scripting": true,
+      "context": "foreignObject",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:7",
+      "line": 61,
+      "scripting": false,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:7",
+      "line": 61,
+      "scripting": true,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:8",
+      "line": 70,
+      "scripting": false,
+      "context": "title",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:8",
+      "line": 70,
+      "scripting": true,
+      "context": "title",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:9",
+      "line": 79,
+      "scripting": false,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:9",
+      "line": 79,
+      "scripting": true,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:10",
+      "line": 88,
+      "scripting": false,
+      "context": "mfenced",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:10",
+      "line": 88,
+      "scripting": true,
+      "context": "mfenced",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:11",
+      "line": 97,
+      "scripting": false,
+      "context": "malignmark",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:11",
+      "line": 97,
+      "scripting": true,
+      "context": "malignmark",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:12",
+      "line": 106,
+      "scripting": false,
+      "context": "math",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:12",
+      "line": 106,
+      "scripting": true,
+      "context": "math",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:13",
+      "line": 115,
+      "scripting": false,
+      "context": "annotation-xml",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:13",
+      "line": 115,
+      "scripting": true,
+      "context": "annotation-xml",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:14",
+      "line": 124,
+      "scripting": false,
+      "context": "mtext",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:14",
+      "line": 124,
+      "scripting": true,
+      "context": "mtext",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:15",
+      "line": 133,
+      "scripting": false,
+      "context": "mi",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:15",
+      "line": 133,
+      "scripting": true,
+      "context": "mi",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:16",
+      "line": 142,
+      "scripting": false,
+      "context": "mo",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:16",
+      "line": 142,
+      "scripting": true,
+      "context": "mo",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:17",
+      "line": 151,
+      "scripting": false,
+      "context": "mn",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:17",
+      "line": 151,
+      "scripting": true,
+      "context": "mn",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:18",
+      "line": 160,
+      "scripting": false,
+      "context": "ms",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:18",
+      "line": 160,
+      "scripting": true,
+      "context": "ms",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:19",
+      "line": 169,
+      "scripting": false,
+      "context": "ms",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:19",
+      "line": 169,
+      "scripting": true,
+      "context": "ms",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:20",
+      "line": 187,
+      "scripting": false,
+      "context": "ms",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:20",
+      "line": 187,
+      "scripting": true,
+      "context": "ms",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:21",
+      "line": 195,
+      "scripting": false,
+      "context": "ms",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:21",
+      "line": 195,
+      "scripting": true,
+      "context": "ms",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:22",
+      "line": 203,
+      "scripting": false,
+      "context": "ms",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:22",
+      "line": 203,
+      "scripting": true,
+      "context": "ms",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:23",
+      "line": 211,
+      "scripting": false,
+      "context": "mn",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:23",
+      "line": 211,
+      "scripting": true,
+      "context": "mn",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:24",
+      "line": 229,
+      "scripting": false,
+      "context": "mn",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:24",
+      "line": 229,
+      "scripting": true,
+      "context": "mn",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:25",
+      "line": 237,
+      "scripting": false,
+      "context": "mn",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:25",
+      "line": 237,
+      "scripting": true,
+      "context": "mn",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:26",
+      "line": 245,
+      "scripting": false,
+      "context": "mn",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:26",
+      "line": 245,
+      "scripting": true,
+      "context": "mn",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:27",
+      "line": 253,
+      "scripting": false,
+      "context": "mo",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:27",
+      "line": 253,
+      "scripting": true,
+      "context": "mo",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:28",
+      "line": 271,
+      "scripting": false,
+      "context": "mo",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:28",
+      "line": 271,
+      "scripting": true,
+      "context": "mo",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:29",
+      "line": 279,
+      "scripting": false,
+      "context": "mo",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:29",
+      "line": 279,
+      "scripting": true,
+      "context": "mo",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:30",
+      "line": 287,
+      "scripting": false,
+      "context": "mo",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:30",
+      "line": 287,
+      "scripting": true,
+      "context": "mo",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:31",
+      "line": 295,
+      "scripting": false,
+      "context": "mi",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:31",
+      "line": 295,
+      "scripting": true,
+      "context": "mi",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:32",
+      "line": 313,
+      "scripting": false,
+      "context": "mi",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:32",
+      "line": 313,
+      "scripting": true,
+      "context": "mi",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:33",
+      "line": 321,
+      "scripting": false,
+      "context": "mi",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:33",
+      "line": 321,
+      "scripting": true,
+      "context": "mi",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:34",
+      "line": 329,
+      "scripting": false,
+      "context": "mi",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:34",
+      "line": 329,
+      "scripting": true,
+      "context": "mi",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:35",
+      "line": 337,
+      "scripting": false,
+      "context": "mtext",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:35",
+      "line": 337,
+      "scripting": true,
+      "context": "mtext",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:36",
+      "line": 355,
+      "scripting": false,
+      "context": "mtext",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:36",
+      "line": 355,
+      "scripting": true,
+      "context": "mtext",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:37",
+      "line": 363,
+      "scripting": false,
+      "context": "mtext",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:37",
+      "line": 363,
+      "scripting": true,
+      "context": "mtext",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:38",
+      "line": 371,
+      "scripting": false,
+      "context": "mtext",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:38",
+      "line": 371,
+      "scripting": true,
+      "context": "mtext",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:39",
+      "line": 379,
+      "scripting": false,
+      "context": "annotation-xml",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:39",
+      "line": 379,
+      "scripting": true,
+      "context": "annotation-xml",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:40",
+      "line": 388,
+      "scripting": false,
+      "context": "annotation-xml",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:40",
+      "line": 388,
+      "scripting": true,
+      "context": "annotation-xml",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:41",
+      "line": 396,
+      "scripting": false,
+      "context": "math",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:41",
+      "line": 396,
+      "scripting": true,
+      "context": "math",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:42",
+      "line": 405,
+      "scripting": false,
+      "context": "math",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:42",
+      "line": 405,
+      "scripting": true,
+      "context": "math",
+      "namespace": 2,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:43",
+      "line": 413,
+      "scripting": false,
+      "context": "foreignObject",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:43",
+      "line": 413,
+      "scripting": true,
+      "context": "foreignObject",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:44",
+      "line": 421,
+      "scripting": false,
+      "context": "foreignObject",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:44",
+      "line": 421,
+      "scripting": true,
+      "context": "foreignObject",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:45",
+      "line": 429,
+      "scripting": false,
+      "context": "title",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:45",
+      "line": 429,
+      "scripting": true,
+      "context": "title",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:46",
+      "line": 437,
+      "scripting": false,
+      "context": "title",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:46",
+      "line": 437,
+      "scripting": true,
+      "context": "title",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:47",
+      "line": 445,
+      "scripting": false,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:47",
+      "line": 445,
+      "scripting": true,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:48",
+      "line": 453,
+      "scripting": false,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:48",
+      "line": 453,
+      "scripting": true,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:49",
+      "line": 464,
+      "scripting": false,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:49",
+      "line": 464,
+      "scripting": true,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:50",
+      "line": 473,
+      "scripting": false,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:50",
+      "line": 473,
+      "scripting": true,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "foreign-fragment.dat:51",
+      "line": 481,
+      "scripting": false,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:51",
+      "line": 481,
+      "scripting": true,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:52",
+      "line": 491,
+      "scripting": false,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:52",
+      "line": 491,
+      "scripting": true,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:53",
+      "line": 500,
+      "scripting": false,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:53",
+      "line": 500,
+      "scripting": true,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:54",
+      "line": 509,
+      "scripting": false,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:54",
+      "line": 509,
+      "scripting": true,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:55",
+      "line": 518,
+      "scripting": false,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:55",
+      "line": 518,
+      "scripting": true,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:56",
+      "line": 527,
+      "scripting": false,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:56",
+      "line": 527,
+      "scripting": true,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:57",
+      "line": 536,
+      "scripting": false,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:57",
+      "line": 536,
+      "scripting": true,
+      "context": "desc",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:58",
+      "line": 545,
+      "scripting": false,
+      "context": "div",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:58",
+      "line": 545,
+      "scripting": true,
+      "context": "div",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:59",
+      "line": 555,
+      "scripting": false,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:59",
+      "line": 555,
+      "scripting": true,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "foreign-fragment.dat:60",
+      "line": 564,
+      "scripting": false,
+      "context": "div",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:60",
+      "line": 564,
+      "scripting": true,
+      "context": "div",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:61",
+      "line": 577,
+      "scripting": false,
+      "context": "div",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:61",
+      "line": 577,
+      "scripting": true,
+      "context": "div",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:62",
+      "line": 590,
+      "scripting": false,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:62",
+      "line": 590,
+      "scripting": true,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:63",
+      "line": 602,
+      "scripting": false,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:63",
+      "line": 602,
+      "scripting": true,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:64",
+      "line": 614,
+      "scripting": false,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:64",
+      "line": 614,
+      "scripting": true,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "foreign-fragment.dat:65",
+      "line": 625,
+      "scripting": false,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "foreign-fragment.dat:65",
+      "line": 625,
+      "scripting": true,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "foreign-fragment.dat:66",
+      "line": 636,
+      "scripting": false,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "foreign-fragment.dat:66",
+      "line": 636,
+      "scripting": true,
+      "context": "svg",
+      "namespace": 1,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:1",
+      "line": 1,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:1",
+      "line": 1,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:2",
+      "line": 13,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:2",
+      "line": 13,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:3",
+      "line": 25,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:3",
+      "line": 25,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:4",
+      "line": 37,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:4",
+      "line": 37,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:5",
+      "line": 49,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:5",
+      "line": 49,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:6",
+      "line": 61,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:6",
+      "line": 61,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:7",
+      "line": 78,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:7",
+      "line": 78,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:8",
+      "line": 94,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:8",
+      "line": 94,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:9",
+      "line": 105,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:9",
+      "line": 105,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:10",
+      "line": 117,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:10",
+      "line": 117,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:11",
+      "line": 132,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:11",
+      "line": 132,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:12",
+      "line": 148,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:12",
+      "line": 148,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:13",
+      "line": 164,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:13",
+      "line": 164,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:14",
+      "line": 177,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:14",
+      "line": 177,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:15",
+      "line": 191,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:15",
+      "line": 191,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:16",
+      "line": 206,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:16",
+      "line": 206,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:17",
+      "line": 219,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:17",
+      "line": 219,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:18",
+      "line": 233,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:18",
+      "line": 233,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:19",
+      "line": 247,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:19",
+      "line": 247,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:20",
+      "line": 259,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:20",
+      "line": 259,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:21",
+      "line": 272,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:21",
+      "line": 272,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:22",
+      "line": 286,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:22",
+      "line": 286,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:23",
+      "line": 299,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:23",
+      "line": 299,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:24",
+      "line": 312,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:24",
+      "line": 312,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:25",
+      "line": 326,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:25",
+      "line": 326,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:26",
+      "line": 341,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:26",
+      "line": 341,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:27",
+      "line": 357,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:27",
+      "line": 357,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:28",
+      "line": 371,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:28",
+      "line": 371,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:29",
+      "line": 384,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:29",
+      "line": 384,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:30",
+      "line": 400,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:30",
+      "line": 400,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:31",
+      "line": 414,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:31",
+      "line": 414,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:32",
+      "line": 428,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:32",
+      "line": 428,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:33",
+      "line": 441,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:33",
+      "line": 441,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:34",
+      "line": 458,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:34",
+      "line": 458,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:35",
+      "line": 474,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:35",
+      "line": 474,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:36",
+      "line": 490,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:36",
+      "line": 490,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:37",
+      "line": 504,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:37",
+      "line": 504,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:38",
+      "line": 516,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:38",
+      "line": 516,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:39",
+      "line": 531,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:39",
+      "line": 531,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:40",
+      "line": 547,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:40",
+      "line": 547,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:41",
+      "line": 560,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 6
+    },
+    {
+      "id": "template.dat:41",
+      "line": 560,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 6
+    },
+    {
+      "id": "template.dat:42",
+      "line": 576,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:42",
+      "line": 576,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:43",
+      "line": 591,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:43",
+      "line": 591,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:44",
+      "line": 606,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:44",
+      "line": 606,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:45",
+      "line": 619,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:45",
+      "line": 619,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:46",
+      "line": 633,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:46",
+      "line": 633,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:47",
+      "line": 647,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:47",
+      "line": 647,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:48",
+      "line": 660,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:48",
+      "line": 660,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:49",
+      "line": 673,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:49",
+      "line": 673,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:50",
+      "line": 686,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:50",
+      "line": 686,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:51",
+      "line": 700,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:51",
+      "line": 700,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:52",
+      "line": 715,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:52",
+      "line": 715,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:53",
+      "line": 732,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:53",
+      "line": 732,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:54",
+      "line": 747,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:54",
+      "line": 747,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:55",
+      "line": 761,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:55",
+      "line": 761,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:56",
+      "line": 775,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:56",
+      "line": 775,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:57",
+      "line": 790,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:57",
+      "line": 790,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:58",
+      "line": 805,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:58",
+      "line": 805,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:59",
+      "line": 819,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:59",
+      "line": 819,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:60",
+      "line": 833,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:60",
+      "line": 833,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:61",
+      "line": 847,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:61",
+      "line": 847,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:62",
+      "line": 861,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:62",
+      "line": 861,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:63",
+      "line": 875,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:63",
+      "line": 875,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:64",
+      "line": 889,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:64",
+      "line": 889,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:65",
+      "line": 903,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:65",
+      "line": 903,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:66",
+      "line": 916,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:66",
+      "line": 916,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:67",
+      "line": 928,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:67",
+      "line": 928,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:68",
+      "line": 941,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:68",
+      "line": 941,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:69",
+      "line": 954,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:69",
+      "line": 954,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:70",
+      "line": 967,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:70",
+      "line": 967,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:71",
+      "line": 982,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:71",
+      "line": 982,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:72",
+      "line": 998,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:72",
+      "line": 998,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:73",
+      "line": 1014,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:73",
+      "line": 1014,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:74",
+      "line": 1031,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 6
+    },
+    {
+      "id": "template.dat:74",
+      "line": 1031,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 6
+    },
+    {
+      "id": "template.dat:75",
+      "line": 1048,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:75",
+      "line": 1048,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:76",
+      "line": 1065,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:76",
+      "line": 1065,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:77",
+      "line": 1083,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:77",
+      "line": 1083,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:78",
+      "line": 1101,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:78",
+      "line": 1101,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:79",
+      "line": 1115,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:79",
+      "line": 1115,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:80",
+      "line": 1129,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:80",
+      "line": 1129,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:81",
+      "line": 1142,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:81",
+      "line": 1142,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:82",
+      "line": 1156,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:82",
+      "line": 1156,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:83",
+      "line": 1170,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 7
+    },
+    {
+      "id": "template.dat:83",
+      "line": 1170,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 7
+    },
+    {
+      "id": "template.dat:84",
+      "line": 1188,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:84",
+      "line": 1188,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:85",
+      "line": 1205,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 5
+    },
+    {
+      "id": "template.dat:85",
+      "line": 1205,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 5
+    },
+    {
+      "id": "template.dat:86",
+      "line": 1224,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:86",
+      "line": 1224,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:87",
+      "line": 1241,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:87",
+      "line": 1241,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:88",
+      "line": 1256,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:88",
+      "line": 1256,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:89",
+      "line": 1271,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:89",
+      "line": 1271,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:90",
+      "line": 1284,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:90",
+      "line": 1284,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:91",
+      "line": 1300,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:91",
+      "line": 1300,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:92",
+      "line": 1316,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:92",
+      "line": 1316,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:93",
+      "line": 1332,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:93",
+      "line": 1332,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:94",
+      "line": 1348,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:94",
+      "line": 1348,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:95",
+      "line": 1364,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:95",
+      "line": 1364,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:96",
+      "line": 1380,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:96",
+      "line": 1380,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:97",
+      "line": 1396,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:97",
+      "line": 1396,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:98",
+      "line": 1412,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:98",
+      "line": 1412,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:99",
+      "line": 1430,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 6
+    },
+    {
+      "id": "template.dat:99",
+      "line": 1430,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 6
+    },
+    {
+      "id": "template.dat:100",
+      "line": 1450,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:100",
+      "line": 1450,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:101",
+      "line": 1466,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:101",
+      "line": 1466,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:102",
+      "line": 1484,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:102",
+      "line": 1484,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:103",
+      "line": 1502,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:103",
+      "line": 1502,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:104",
+      "line": 1518,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:104",
+      "line": 1518,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:105",
+      "line": 1533,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:105",
+      "line": 1533,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:106",
+      "line": 1549,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:106",
+      "line": 1549,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:107",
+      "line": 1563,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:107",
+      "line": 1563,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:108",
+      "line": 1582,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:108",
+      "line": 1582,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:109",
+      "line": 1598,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:109",
+      "line": 1598,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:110",
+      "line": 1618,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:110",
+      "line": 1618,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:111",
+      "line": 1631,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:111",
+      "line": 1631,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:112",
+      "line": 1644,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:112",
+      "line": 1644,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:113",
+      "line": 1657,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:113",
+      "line": 1657,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 3
+    },
+    {
+      "id": "template.dat:114",
+      "line": 1670,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:114",
+      "line": 1670,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 4
+    },
+    {
+      "id": "template.dat:115",
+      "line": 1692,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 5
+    },
+    {
+      "id": "template.dat:115",
+      "line": 1692,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 5
+    },
+    {
+      "id": "template.dat:116",
+      "line": 1710,
+      "scripting": false,
+      "context": "template",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "template.dat:116",
+      "line": 1710,
+      "scripting": true,
+      "context": "template",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "template.dat:117",
+      "line": 1724,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:117",
+      "line": 1724,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:118",
+      "line": 1738,
+      "scripting": false,
+      "context": "template",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:118",
+      "line": 1738,
+      "scripting": true,
+      "context": "template",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:119",
+      "line": 1748,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:119",
+      "line": 1748,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:120",
+      "line": 1764,
+      "scripting": false,
+      "context": "template",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "template.dat:120",
+      "line": 1764,
+      "scripting": true,
+      "context": "template",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "template.dat:121",
+      "line": 1773,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:121",
+      "line": 1773,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:122",
+      "line": 1788,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:122",
+      "line": 1788,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:123",
+      "line": 1803,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:123",
+      "line": 1803,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:124",
+      "line": 1817,
+      "scripting": false,
+      "context": "template",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:124",
+      "line": 1817,
+      "scripting": true,
+      "context": "template",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 2
+    },
+    {
+      "id": "template.dat:125",
+      "line": 1833,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "template.dat:125",
+      "line": 1833,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "template.dat:126",
+      "line": 1847,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "template.dat:126",
+      "line": 1847,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 0
+    },
+    {
+      "id": "template.dat:127",
+      "line": 1865,
+      "scripting": false,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    },
+    {
+      "id": "template.dat:127",
+      "line": 1865,
+      "scripting": true,
+      "context": "",
+      "namespace": 0,
+      "skip": "",
+      "expected_errors_unchecked": 1
+    }
+  ]
+}

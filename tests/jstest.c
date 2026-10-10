@@ -6,6 +6,7 @@
 #include <string.h>
 #include "nocturne.h"
 #include "web.h"
+#include "webnet.h"
 
 #define BASE "http://fixture.test/dir/index.html"
 #define VW 800
@@ -45,18 +46,20 @@ static const struct asset assets[] = {
 
 struct queued {
     bool used, no_cors, no_referrer;
-    uint64_t id, due;
+    uint64_t id, due, transport_id;
     int kind;
-    char url[2048], method[16], headers[1024], body[256];
+    char url[2048], method[16], headers[1024], body[4096];
     size_t body_len;
     int cache_mode;
 };
 struct fixture {
     web_doc *doc;
+    webnet *net;
     struct queued queue[SLOTS];
     char marks[MARKS][96];
     int nmarks, js_failures, errors, requests, cancellations, completions, sync_loads;
     int fetch_requests;
+    int policy_report_requests, policy_report_completed, policy_report_bad;
     int outside_running, navigations;
     int scroll_x, scroll_y;
     bool expected_errors, retirement_errors;
@@ -70,6 +73,9 @@ struct fixture {
     int diagnostic_batches;
 };
 static struct fixture fixture;
+static const char *case_response_headers;
+static const char *case_meta_policy;
+static bool case_real_network;
 static int total, failed;
 static uint32_t pixels[VW * VH];
 
@@ -117,6 +123,21 @@ static void receive_log(void *opaque, int level, const char *message) {
         if (!f->expected_errors) printf("jstest: unexpected JavaScript error: %s\n", message);
     }
 }
+static void network_complete(webnet *net,uint64_t id,uint64_t generation,
+                             const struct webnet_response *response,void *opaque){
+    (void)net;(void)generation;struct queued *q=opaque;
+    if(!q->used||q->transport_id!=id||!fixture.doc)return;
+    if(q->kind==WEB_RESOURCE_REPORT){fixture.policy_report_completed++;if(response->status!=204||*response->error)fixture.policy_report_bad++;}
+    struct web_response r={0};r.status=response->status;
+    web_response_set_url(&r,response->final_url);
+    r.headers_full=strdup(response->headers?response->headers:"");
+    snprintf(r.error,sizeof r.error,"%s",response->error?response->error:"");
+    r.body=malloc(response->body_len+1);r.body_len=response->body_len;
+    if(r.body){if(r.body_len)memcpy(r.body,response->body,r.body_len);r.body[r.body_len]=0;}
+    if(!r.body||!r.headers_full)snprintf(r.error,sizeof r.error,"fixture response allocation failed");
+    q->used=false;web_resource_loaded(fixture.doc,q->id,&r);
+    web_response_free(&r);fixture.completions++;
+}
 static bool request(void *opaque, const struct web_request *r) {
     struct fixture *f = opaque;
     for (int i = 0; i < SLOTS; i++) if (!f->queue[i].used) {
@@ -133,9 +154,26 @@ static bool request(void *opaque, const struct web_request *r) {
         size_t n = r->body_len < sizeof q->body - 1 ? r->body_len : sizeof q->body - 1;
         if (n) memcpy(q->body, r->body, n);
         q->body[n] = 0;
+        if(r->kind==WEB_RESOURCE_REPORT){
+            f->policy_report_requests++;
+            if(strcmp(q->method,"POST")||strcmp(q->headers,"Content-Type: application/csp-report\r\n")||
+               r->credentials!=1||!r->redirect_error||r->no_cors||
+               !strstr(q->body,"\"csp-report\"")||!strstr(q->body,"\"original-policy\"")||
+               !strstr(q->body,"\"script-sample\"")||q->body_len>=sizeof q->body)f->policy_report_bad++;
+        }
         const struct asset *a = lookup(q->url);
         q->due = uptime_ms() + (a ? a->delay_ms : 0);
         f->requests++;
+        if(f->net&&!strncmp(r->url,"http://10.0.2.2:",16)){
+            struct webnet_request native={.kind=r->kind==WEB_RESOURCE_REPORT?WEBNET_REPORT:r->kind==WEB_RESOURCE_FETCH?WEBNET_FETCH:
+                r->kind==WEB_RESOURCE_MODULE?WEBNET_MODULE:r->kind==WEB_RESOURCE_SCRIPT?WEBNET_CLASSIC:WEBNET_RESOURCE,
+                .generation=1,.url=r->url,.origin=r->origin,.method=r->method,.headers=r->headers,
+                .body=r->body,.body_len=r->body_len,.credentials=(enum webnet_credentials)r->credentials,
+                .same_origin=r->same_origin,.redirect_error=r->redirect_error,
+                .no_cors=r->no_cors,.no_referrer=r->no_referrer};
+            q->transport_id=webnet_submit(f->net,&native,network_complete,q);
+            if(!q->transport_id){q->used=false;return false;}
+        }
         return true;
     }
     return false;
@@ -143,6 +181,7 @@ static bool request(void *opaque, const struct web_request *r) {
 static void cancel(void *opaque, uint64_t id) {
     struct fixture *f = opaque;
     for (int i = 0; i < SLOTS; i++) if (f->queue[i].used && f->queue[i].id == id) {
+        if(f->queue[i].transport_id&&f->net)webnet_cancel(f->net,f->queue[i].transport_id);
         f->queue[i].used = false; f->cancellations++; break;
     }
 }
@@ -202,7 +241,7 @@ static bool history_host(void *opaque, int op, const char *url, const void *data
 }
 static void deliver(struct fixture *f) {
     uint64_t now = uptime_ms();
-    for (int i = 0; i < SLOTS; i++) if (f->queue[i].used && f->queue[i].due <= now) {
+    for (int i = 0; i < SLOTS; i++) if (f->queue[i].used && !f->queue[i].transport_id && f->queue[i].due <= now) {
         struct queued q = f->queue[i]; f->queue[i].used = false;
         const struct asset *a = lookup(q.url);
         struct web_response r; memset(&r, 0, sizeof r);
@@ -264,12 +303,13 @@ static void deliver(struct fixture *f) {
 }
 static web_doc *open_case_url_budget(const char *html, bool expected_errors, const char *url, uint32_t task_budget_ms) {
     memset(&fixture, 0, sizeof fixture); fixture.expected_errors = expected_errors;
+    if(case_real_network)fixture.net=webnet_create();
     struct web_host host = {.opaque=&fixture, .request=request, .cancel=cancel, .sync_load=sync_load,
                             .navigate=navigate, .console=receive_log, .scroll=scroll_position,.history=history_host,
                             .js_task_budget_ms=task_budget_ms};
     fixture.history_length = 1; fixture.history_serial = 1;
     fixture.history[0].url = strdup(url); fixture.history[0].entry = 1;
-    fixture.doc = web_live(html, strlen(html), url, "utf-8", &host);
+    fixture.doc = web_live_response(html, strlen(html), url, "utf-8",case_response_headers,&host);
     test_check("web-live-allocation", fixture.doc != NULL);
     return fixture.doc;
 }
@@ -290,6 +330,7 @@ static void step(struct fixture *f) {
         }
     }
     deliver(f);
+    if(f->net)webnet_pump(f->net,uptime_ms());
     web_tick(f->doc, uptime_ms());
     if (web_dirty(f->doc)) {
         web_layout(f->doc, VW, VH);
@@ -312,15 +353,26 @@ static void require_marks(const char *const *names, size_t count) {
 }
 static void close_case(void) {
     if (fixture.doc) { web_free(fixture.doc); fixture.doc = NULL; }
+    if(fixture.net){webnet_free(fixture.net);fixture.net=NULL;}
     for (int i = 0; i < fixture.history_length; i++) { free(fixture.history[i].url); free(fixture.history[i].data); }
     fixture.history_length = 0;
 }
 static char *script_page(const char *source) {
     const char *a = START "</head><body style='margin:0'><div id=target style='height:20px'></div><div id=sentinel></div><script>";
     const char *b = "</script></body></html>";
-    size_t n = strlen(a) + strlen(source) + strlen(b) + 1;
+    /* API files contain literal HTML strings. An inline HTML script is not
+       JavaScript-aware: escape its end-tag spelling without changing strings. */
+    size_t escapes=0,length=strlen(source);
+    for(size_t i=0;i+8<=length;i++)if(!strncasecmp(source+i,"</script",8))escapes++;
+    char *safe=malloc(length+escapes+1);if(!safe)return NULL;
+    size_t at=0;for(size_t i=0;i<length;i++){
+        safe[at++]=source[i];if(source[i]=='<' && i+8<=length && !strncasecmp(source+i,"</script",8))safe[at++]='\\';
+    }
+    safe[at]=0;
+    size_t n = strlen(a) + at + strlen(b) + 1+(case_meta_policy?strlen(case_meta_policy):0);
     char *page = malloc(n);
-    if (page) snprintf(page, n, "%s%s%s", a, source, b);
+    if (page){if(case_meta_policy){const char *script=strstr(a,"<script>");snprintf(page,n,"%.*s%s%s%s%s",(int)(script-a),a,case_meta_policy,script,safe,b);}else snprintf(page, n, "%s%s%s", a, safe, b);}
+    free(safe);
     return page;
 }
 
@@ -342,11 +394,17 @@ static void external_case_expected(const char *file, const char *tail, const cha
         fixture.retirement_errors=expected_errors==-1 && !strcmp(file,"js_retired_task_roots_cases.js");
         /* The collation oracle covers thousands of comparisons and yields
            between batches. This is a harness deadline, not the page watchdog. */
-        test_check(file, pump("api-done", !strcmp(file,"js_collator_cases.js") ? 120000 : 15000));
+        test_check(file, pump("api-done", !strcmp(file,"js_collator_cases.js") ? 120000 : !strcmp(file,"js_parser_worker_safety_cases.js")?60000:15000));
         if(fixture.retirement_errors)
             test_check("api-retirement-interrupts",fixture.retirement_interrupts==3 && fixture.diagnostic_batches==3 && fixture.retirement_unexpected==0 && fixture.js_failures==0);
         else test_check("api-expected-exceptions", fixture.errors == expected_errors && fixture.js_failures == 0);
         if (!strcmp(file,"js_form_validation_cases.js")) test_check("form-direct-submit-navigation",fixture.navigations==1);
+        if(!strcmp(file,"js_html_csp_cases.js")){
+            test_check("csp-report-transport-settles",pump(NULL,10000));
+            int expected=case_meta_policy?0:case_response_headers&&strstr(case_response_headers,"Content-Security-Policy:")?10:6;
+            test_check("csp-report-native-request-count",fixture.policy_report_requests==expected);
+            test_check("csp-report-real-http-completion",fixture.policy_report_completed==expected&&fixture.policy_report_bad==0);
+        }
         close_case();
     }
     free(page);
@@ -1079,11 +1137,74 @@ static void test_lifetime(void) {
 
 #include "js_frames_native.h"
 #include "js_node_position_native.h"
+static void test_html_parser(void){
+    external_case("js_parser_custom_cases.js",";runParserCustomElementCases().then(n=>{console.log('Parser CE checks '+n);check('parser-ce-count',n>=60);mark('api-done');},e=>{console.log('FAIL parser-ce '+e+' '+e.stack);mark('api-done');});",BASE);
+    external_case("js_html_safety_cases.js",";try{let n=runHTMLSafetyCases();console.log('HTML safety checks '+n);check('html-safety-count',n>=50);}catch(e){console.log('FAIL html-safety '+e+' '+e.stack);}mark('api-done');",BASE);
+    external_case("js_pi_cases.js",";runProcessingInstructionCases().then(n=>{console.log('PI API checks '+n);check('pi-count',n>=30);mark('api-done');},e=>{console.log('FAIL PI '+e+' '+e.stack);mark('api-done');});",BASE);
+    case_response_headers="Content-Security-Policy: require-trusted-types-for 'script'; trusted-types script-snapshot-test default\r\n";
+    external_case_expected("js_html_script_safety_cases.js",";try{check('script-safety-count',runHTMLScriptSafetyCases()===10);}catch(e){console.log('FAIL script safety '+e+' '+e.stack);}mark('api-done');",BASE,3);
+    case_response_headers=NULL;
+    const char *source=START "</head><body><script>"
+        "globalThis.order=[];document.write('<p id=written>now</p>');"
+        "check('write-visible-immediately',document.getElementById('written').textContent==='now');"
+        "check('network-suffix-not-consumed',document.getElementById('future')===null);"
+        "document.write('<scr'+'ipt>order.push(1);document.write(\"<b id=nested>nested</b>\");</scr'+'ipt>');"
+        "check('nested-inline-synchronous',order.join(',')==='1'&&document.getElementById('nested')!==null);"
+        "order.push(2);</script><p id=future>end</p><svg><script>order.push(3);</script></svg>"
+        "<script>check('svg-script-parser-order',order.join(',')==='1,2,3');mark('parser-done');</script></body>";
+    if(open_case(source,false)){
+        test_check("parser-write-and-svg",pump("parser-done",5000));
+        test_check("parser-write-no-exceptions",fixture.errors==0 && fixture.js_failures==0);
+        close_case();
+    }
+    const char *timing=START "<script>globalThis.ceLog=[];class ParserTiming extends HTMLElement{"
+        "static observedAttributes=['data-token'];constructor(){super();ceLog.push('ctor');"
+        "check('ce-parser-before-attrs',this.attributes.length===0);check('ce-parser-before-children',this.childNodes.length===0);"
+        "check('ce-parser-before-connection',!this.isConnected);check('ce-parser-before-future',document.getElementById('ce-future')===null);"
+        "let blocked=false;try{document.write('<p>forbidden</p>');}catch(e){blocked=e.name==='InvalidStateError';}check('ce-parser-write-guard',blocked);}"
+        "attributeChangedCallback(n,o,v){ceLog.push('attr');check('ce-token-attr-reaction',n==='data-token'&&o===null&&v==='yes');}"
+        "connectedCallback(){ceLog.push('connected');check('ce-parser-connected-before-children',this.childNodes.length===0);}}"
+        "customElements.define('nocturne-parser-timing',ParserTiming);</script></head><body>"
+        "<nocturne-parser-timing data-token=yes><i>child</i></nocturne-parser-timing><p id=ce-future>later</p><script>"
+        "check('ce-token-reaction-order',ceLog.join(',')==='ctor,attr,connected');"
+        "check('ce-parser-child-published',document.querySelector('nocturne-parser-timing').firstChild.localName==='i');mark('ce-timing-done');</script></body>";
+    if(open_case(timing,false)){test_check("parser-ce-timing",pump("ce-timing-done",5000));test_check("parser-ce-timing-no-errors",fixture.errors==0&&fixture.js_failures==0);close_case();}
+    char *stream=script_page("const originalDoc=document;globalThis.openPreserved=42;addEventListener('load',()=>{document.open();"
+        "check('open-top-level-identity',document===originalDoc&&openPreserved===42);document.write('<p id=stream-now>now</p>');"
+        "check('open-write-immediate',document.getElementById('stream-now').textContent==='now');document.close();mark('stream-done');},{once:true});");
+    if(stream&&open_case(stream,false)){test_check("top-level-open-stream",pump("stream-done",5000));test_check("top-level-stream-no-errors",fixture.errors==0&&fixture.js_failures==0);close_case();}free(stream);
+}
+static void test_html_worker(void){
+    FILE *ports=fopen("/data/tests/webports","r");unsigned first=0,second=0;char port_text[96];
+    test_check("worker-fixture-ports",ports && fgets(port_text,sizeof port_text,ports) && sscanf(port_text,"%u %u",&first,&second)==2 && first);
+    if(ports)fclose(ports);if(!first)return;
+    char origin[128],tail[1600];snprintf(origin,sizeof origin,"http://10.0.2.2:%u/",first);
+    snprintf(tail,sizeof tail,";runParserWorkerSafetyCases({plainURL:'%sworkers/parser-safety-plain.js',enforceURL:'%sworkers/parser-safety-enforce.js',reportURL:'%sworkers/parser-safety-report.js',importURL:'%sworkers/parser-safety-import.js'}).then(n=>{check('worker-safety-count',n>=100);mark('api-done');},e=>{console.log('FAIL Worker safety '+e+' '+e.stack);mark('api-done');});",origin,origin,origin,origin);
+    case_real_network=true;external_case("js_parser_worker_safety_cases.js",tail,origin);case_real_network=false;
+}
+static void test_html_csp(void){
+    FILE *ports=fopen("/data/tests/webports","r");unsigned first=0,second=0;char port_text[96],origin[128];
+    test_check("csp-fixture-ports",ports&&fgets(port_text,sizeof port_text,ports)&&sscanf(port_text,"%u %u",&first,&second)==2&&first);
+    if(ports)fclose(ports);if(!first)return;snprintf(origin,sizeof origin,"http://10.0.2.2:%u/dir/index.html",first);
+    const char *headers[]={
+        "Content-Security-Policy: require-trusted-types-for 'script'; trusted-types allowed default duplicate 'allow-duplicates'; report-uri /__csp-report\r\nContent-Security-Policy-Report-Only: require-trusted-types-for 'script'; trusted-types allowed default duplicate; report-uri /__csp-report-only\r\n",
+        "Content-Security-Policy-Report-Only: require-trusted-types-for 'script'; trusted-types allowed default duplicate; report-uri /__csp-report-only\r\n",NULL};
+    const char *modes[]={"enforce","report","meta"};
+    for(unsigned i=0;i<3;i++){
+        case_response_headers=headers[i];case_meta_policy=i==2?"<meta http-equiv=Content-Security-Policy content=\"require-trusted-types-for 'script'; trusted-types allowed default duplicate; report-uri /__csp-meta-must-not-send\">":NULL;
+        char tail[400];snprintf(tail,sizeof tail,";runHTMLCSPCases('%s').then(n=>{console.log('CSP API checks '+n);check('csp-count',n>=30);mark('api-done');},e=>{console.log('FAIL CSP '+e+' '+e.stack);mark('api-done');});",modes[i]);
+        case_real_network=true;external_case("js_html_csp_cases.js",tail,origin);case_real_network=false;
+        case_response_headers=case_meta_policy=NULL;
+    }
+}
 int main(int argc, char **argv) {
     uint64_t start = uptime_ms();
     /* Optional selectors make a failing feature reproducible in the real OS. */
 #define RUN(name, fn) do { if (argc == 1 || !strcmp(argv[1], name)) { printf("jstest: %s\n", name); fflush(stdout); fn(); } } while (0)
     RUN("language", test_language);
+    RUN("html-parser", test_html_parser);
+    RUN("html-worker", test_html_worker);
+    RUN("html-csp", test_html_csp);
     RUN("platform", test_platform);
     /* An API-only selector avoids repeating the full platform batch. */
     if (argc > 1 && !strcmp(argv[1], "fetch-api")) { printf("jstest: fetch-api\n"); fflush(stdout); test_fetch_api(); }

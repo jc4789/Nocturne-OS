@@ -301,12 +301,23 @@ lxb_html_tree_insertion_mode_in_head_template(lxb_html_tree_t *tree,
                                               lxb_html_token_t *token)
 {
     lxb_html_element_t *element;
-
-    element = lxb_html_tree_insert_html_element(tree, token);
+    lxb_dom_node_t *host = lxb_html_tree_adjusted_current_node(tree);
+    lxb_html_tree_insertion_position_t ipos;
+    lxb_dom_node_t *position = lxb_html_tree_appropriate_place_inserting_node(tree, NULL, &ipos);
+    element = lxb_html_tree_insert_foreign_element(tree, token, LXB_NS_HTML,
+                                                  tree->template_open != NULL);
     if (element == NULL) {
         tree->status = LXB_STATUS_ERROR_MEMORY_ALLOCATION;
 
         return lxb_html_tree_process_abort(tree);
+    }
+
+    if (tree->template_open != NULL && !tree->template_open(tree, token,
+                  lxb_html_interface_template(element), host, position,
+                  ipos == LXB_HTML_TREE_INSERTION_POSITION_BEFORE,
+                  tree->template_callback_context)) {
+        if (tree->status != LXB_STATUS_OK) return lxb_html_tree_process_abort(tree);
+        lxb_html_tree_insert_node(position, lxb_dom_interface_node(element), ipos);
     }
 
     tree->status = lxb_html_tree_active_formatting_push_marker(tree);
@@ -342,6 +353,21 @@ lxb_html_tree_insertion_mode_in_head_template_closed(lxb_html_tree_t *tree,
         lxb_html_tree_parse_error(tree, token,
                                   LXB_HTML_RULES_ERROR_TECLTOWIOPINHEMO);
         return true;
+    }
+
+    lxb_html_template_element_t *template = lxb_html_interface_template(temp_node);
+    if (template->insertion_target != NULL) {
+        if (tree->template_close != NULL) {
+            tree->status = tree->template_close(tree, template, tree->template_callback_context);
+            if (tree->status != LXB_STATUS_OK) return lxb_html_tree_process_abort(tree);
+        }
+        if (template->insertion_start != NULL && template->insertion_start->parent != NULL)
+            lxb_dom_node_remove_wo_events(template->insertion_start);
+        if (template->insertion_end != NULL && template->insertion_end->parent != NULL)
+            lxb_dom_node_remove_wo_events(template->insertion_end);
+        template->insertion_target = NULL;
+        template->insertion_start = NULL;
+        template->insertion_end = NULL;
     }
 
     lxb_html_tree_generate_all_implied_end_tags_thoroughly(tree, LXB_TAG__UNDEF,

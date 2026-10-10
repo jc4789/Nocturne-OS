@@ -211,7 +211,7 @@ static bool load_file_open(struct job *j,const char *path) {
     free(j->final_url);j->final_url=url;j->status=200;return true;
 }
 static bool load_file(struct job *j) {
-    if(j->wire.kind==WEBNET_FETCH)return fail(j,"fetch accepts only HTTP(S)");
+    if(j->wire.kind==WEBNET_FETCH||j->wire.kind==WEBNET_REPORT)return fail(j,"fetch/report accepts only HTTP(S)");
     char *path=NULL,*document_path=NULL;int parsed=file_path(j->url,&path);bool ok=false;
     if(parsed!=1)return fail(j,parsed<0?"Out of memory preparing local URL":"Invalid local URL");
     if(j->wire.kind==WEBNET_NAVIGATION){
@@ -374,7 +374,7 @@ static bool cache_headers(struct job *j) {
 static bool prepare_outgoing(struct job *j, const char *current, const char *method, bool cross) {
     j->outgoing.length = 0;
     if (!header_text(j, &j->outgoing, j->headers)) return false;
-    if ((cors_kind(j) || (no_cors(j) && strcmp(method,"GET") && strcmp(method,"HEAD"))) && !(header_text(j, &j->outgoing, "Origin: ") &&
+    if ((cors_kind(j) || j->wire.kind==WEBNET_REPORT || (no_cors(j) && strcmp(method,"GET") && strcmp(method,"HEAD"))) && !(header_text(j, &j->outgoing, "Origin: ") &&
         header_text(j, &j->outgoing, no_cors(j) && (j->wire.user_navigation & WEBNET_WIRE_NO_REFERRER)?"null":request_origin(j)) && header_text(j, &j->outgoing, "\r\n"))) return false;
     if (!cache_headers(j)) return false;
     j->hop_cookies = j->wire.credentials == WEBNET_CREDENTIALS_INCLUDE ||
@@ -471,7 +471,7 @@ static bool apply_cookie_events(struct job *j,size_t start,const char *method) {
 static int body_cb(void *opaque, const char *data, size_t n) {
     struct job *j = opaque;
     if (!remaining(j)) return -1;
-    if(j->opaque_tainted)return 0; /* Complete the real HTTP body, retain no hidden bytes. */
+    if(j->opaque_tainted||j->wire.kind==WEBNET_REPORT)return 0; /* Retain no opaque/report response bytes. */
     size_t limit = webnet_wire_response_limit(j->wire.kind, j->wire.user_navigation);
     if (j->body_len > limit || n > limit - j->body_len) {
         fail(j, "Response body exceeds the negotiated wire representation"); return -1;
@@ -595,6 +595,7 @@ static bool include_response_field(const struct job *j, const char *headers, con
         exposed_header(headers, p, len, j->wire.credentials != WEBNET_CREDENTIALS_INCLUDE);
 }
 static bool response_headers(struct job *j, const struct http_resp *r, bool cross) {
+    if(j->wire.kind==WEBNET_REPORT){free(j->response_headers);j->response_headers=NULL;j->response_headers_len=0;return true;}
     const char *headers = http_response_headers(r);
     char *prefix = NULL;
     size_t prefix_len = 0;
@@ -777,11 +778,11 @@ int main(void) {
     if (!j) return 1;
     struct webnet_wire_request *w = &j->wire;
     size_t payload_size;
-    if (!read_all(0, w, sizeof *w) || w->magic != WEBNET_MAGIC || w->kind > WEBNET_FETCH ||
+    if (!read_all(0, w, sizeof *w) || w->magic != WEBNET_MAGIC || w->kind > WEBNET_REPORT ||
         !w->url_len || w->url_len > webnet_wire_url_limit(w->user_navigation) || w->origin_len > webnet_wire_url_limit(w->user_navigation) ||
         !w->method_len || w->headers_len > webnet_wire_request_header_limit(w->user_navigation) || w->body_len > WEBNET_BODY_LIMIT ||
         w->credentials>WEBNET_CREDENTIALS_INCLUDE || (w->user_navigation & ~WEBNET_WIRE_REQUEST_FLAGS) || w->cookie_len>WEBCOOKIE_SNAPSHOT_MAX ||
-        !webnet_wire_script_flag_valid(w->kind, w->user_navigation) || !webnet_wire_image_flag_valid(w->kind, w->user_navigation) || !webnet_wire_request_payload_size(w, &payload_size) ||
+        !webnet_wire_script_flag_valid(w->kind, w->user_navigation) || !webnet_wire_image_flag_valid(w->kind, w->user_navigation) || !webnet_wire_report_flag_valid(w->kind,w->user_navigation,w->credentials) || !webnet_wire_request_payload_size(w, &payload_size) ||
         (w->credentials==WEBNET_CREDENTIALS_OMIT && w->cookie_len) ||
         WEBNET_WIRE_CACHE_MODE(w->user_navigation) > WEBNET_CACHE_ONLY_IF_CACHED ||
         (w->kind != WEBNET_FETCH && (WEBNET_WIRE_CACHE_MODE(w->user_navigation) != WEBNET_CACHE_DEFAULT || (w->user_navigation & (WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER)))) ||
@@ -821,6 +822,7 @@ int main(void) {
     }
     free(cookie_snapshot);
     if (!j->url || !j->document || !j->method || !j->headers || !j->request_body) fail(j, "Invalid request or out of memory");
+    else if(w->kind==WEBNET_REPORT && (!w->body_len || !webnet_report_fields_valid(j->method,j->headers)))fail(j,"Invalid native CSP report request");
     else if (!webnet_method_valid(j->method) || ((!strcmp(j->method, "GET") || !strcmp(j->method, "HEAD")) && w->body_len)) fail(j, "Invalid HTTP method or body");
     else if (!j->error[0] && remaining(j)) {
         if (!strncmp(j->url, "file:", 5)) load_file(j);

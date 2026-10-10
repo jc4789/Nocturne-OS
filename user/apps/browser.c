@@ -777,6 +777,7 @@ static enum webnet_kind network_kind(int kind) {
     case WEB_RESOURCE_SCRIPT: return WEBNET_CLASSIC;
     case WEB_RESOURCE_MODULE: return WEBNET_MODULE;
     case WEB_RESOURCE_FETCH: return WEBNET_FETCH;
+    case WEB_RESOURCE_REPORT: return WEBNET_REPORT;
     case WEB_RESOURCE_FRAME: return WEBNET_NAVIGATION;
     default: return WEBNET_RESOURCE;
     }
@@ -1327,7 +1328,7 @@ static void finish_navigation(void) {
     document_host.debug_js = debug_js;
     document_host.navigation_timing = navigation_timing;
     document_host.js_task_budget_ms = js_task_budget_ms;
-    web_doc *nd = web_live(html, hlen, final_url, charset, &document_host);
+    web_doc *nd = web_live_response(html, hlen, final_url, charset, web_response_headers(f), &document_host);
     free(html);
     if (!nd) { web_response_free(f); free(f); loading = false; set_status("Out of memory creating document"); return; }
 

@@ -1,6 +1,7 @@
 /* Only this private host crosses the native pipe. No window, document, native
  * modules, files, sockets or process functions are installed in this realm. */
 (function(host){
+    const apply=Reflect.apply;
     delete globalThis.__workerHost;
     delete globalThis.SharedArrayBuffer;delete globalThis.Atomics;
     /* @include js_dom_exception.js */
@@ -16,6 +17,8 @@
     /* @include js_url.js */
     /* @include js_clone.js */
     /* @include js_worker_messaging.js */
+    /* @include js_sanitizer_constants.js */
+    /* @include js_html_safety.js */
     const {MessageEvent,MessagePort,MessageChannel}=workerMessagingBridge;
     Object.assign(globalThis,{MessageEvent,MessagePort,MessageChannel});
     const target=new EventTarget(),timers=new Map(),fetches=new Map();let nextTimer=0,closed=false,address='',workerName='',workerCanCancel=false,reporting=false,lastPortTask=false;
@@ -24,8 +27,8 @@
     function evalSource(text,url){return host.eval(String(text),String(url));}
     function postMessage(value,options){if(closed)return;const list=Array.isArray(options)?options:options?.transfer,prepared=workerMessagingBridge.prepareExternal(value,cloneData.transferList(list));try{host.portSend(2,0,0,prepared.packet,prepared.plan);}catch(error){workerMessagingBridge.abortExternal(prepared);throw error;}}
     function close(){if(closed)return;closed=true;timers.clear();workerMessagingBridge.close();host.close();}
-    function timer(fn,ms,args,repeat){if(closed)return 0;if(typeof fn!=='function')fn=new Function(String(fn));let id;for(let i=0;i<=timers.size;i++){nextTimer=nextTimer===4294967295?1:nextTimer+1;if(!timers.has(nextTimer)){id=nextTimer;break;}}if(id===undefined)throw new RangeError('Worker timer identifier space exhausted');const delay=Math.max(1,Math.min(2147483647,Number(ms)||0));timers.set(id,{fn,args,repeat,delay,due:host.now()+delay});return id;}
-    function importScripts(...urls){for(const u of urls){const url=new URL(String(u),address).href;const r=host.import(url);if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker script load failed','NetworkError');evalSource(new TextDecoder().decode(r[3]),r[1]||url);}}
+    function timer(fn,ms,args,repeat){if(closed)return 0;if(typeof fn!=='function')fn=new Function(htmlSafetyBridge.timerCode(fn,repeat?'setInterval':'setTimeout'));let id;for(let i=0;i<=timers.size;i++){nextTimer=nextTimer===4294967295?1:nextTimer+1;if(!timers.has(nextTimer)){id=nextTimer;break;}}if(id===undefined)throw new RangeError('Worker timer identifier space exhausted');const delay=Math.max(1,Math.min(2147483647,Number(ms)||0));timers.set(id,{fn,args,repeat,delay,due:host.now()+delay});return id;}
+    function importScripts(...urls){for(const u of urls){const url=new URL(htmlSafetyBridge.check(u,3,'WorkerGlobalScope importScripts'),address).href;const r=host.import(url);if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker script load failed','NetworkError');evalSource(new TextDecoder().decode(r[3]),r[1]||url);}}
     const workerAbortBridge=(()=>{
         const apply=Reflect.apply,get=WeakMap.prototype.get,set=WeakMap.prototype.set,has=WeakMap.prototype.has,
             add=Set.prototype.add,remove=Set.prototype.delete,values=Set.prototype.values,clear=Set.prototype.clear,
@@ -156,8 +159,11 @@
         queueMicrotask:fn=>{if(typeof fn!=='function')throw new TypeError('Callback required');Promise.resolve().then(fn).catch(report);},
         performance:{now:()=>host.now()},console:Object.fromEntries(['log','warn','error','info','debug'].map(k=>[k,(...args)=>host.send(7,0,{message:args.map(String).join(' '),filename:address})])),
         addEventListener:target.addEventListener.bind(target),removeEventListener:target.removeEventListener.bind(target),dispatchEvent:target.dispatchEvent.bind(target)});
-    Object.defineProperties(globalThis,{name:{get:()=>workerName},onmessage:{get:()=>target.onmessage,set:fn=>target.onmessage=fn},onmessageerror:{get:()=>target.onmessageerror,set:fn=>target.onmessageerror=fn},onerror:{get:()=>target.onerror,set:fn=>target.onerror=fn}});
+    Object.defineProperties(globalThis,{name:{get:()=>workerName},onmessage:{get:()=>target.onmessage,set:fn=>target.onmessage=fn},onmessageerror:{get:()=>target.onmessageerror,set:fn=>target.onmessageerror=fn},onerror:{get:()=>target.onerror,set:fn=>target.onerror=fn},onsecuritypolicyviolation:{get:()=>target.onsecuritypolicyviolation,set:fn=>target.onsecuritypolicyviolation=fn}});
     return {
+        safetyCheck:htmlSafetyBridge.check,
+        safetyDynamicCode:htmlSafetyBridge.dynamicCode,
+        safetyViolation(init){if(!closed)target.dispatchEvent(htmlSafetyBridge.violationEvent(init));},
         start(r){address=r[1];workerName=String(r[5]||"");workerCanCancel=r[6]===true;if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker source failed','NetworkError');Object.defineProperty(globalThis,'location',{value:Object.freeze({href:address,origin:new URL(address).origin,toString(){return address;}}),configurable:true});evalSource(new TextDecoder().decode(r[3]),address);},
         receive(packet,op=2,id=0,kind=0){try{if(op===8||op===9||op===10){workerMessagingBridge.receivePort(id,kind,packet,op!==8);return;}const payload=kind===3?workerMessagingBridge.importExternal(packet):{data:cloneData.deserialize(packet),ports:[]};if(!closed)target.dispatchEvent(new MessageEvent('message',{data:payload.data,ports:payload.ports}));}catch(e){if(!closed)target.dispatchEvent(new MessageEvent('messageerror'));}},
         loaded(id,r,flags=0){const p=workerFetchBridge.take(id);if(!p||closed)return;p.cleanup();if(r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!p.noCors)){p.reject(new TypeError(r[4]||'Worker fetch failed'));return;}try{p.resolve(workerFetchBridge.networkResponse(r,flags,p.signal));}catch(error){p.reject(error);}},

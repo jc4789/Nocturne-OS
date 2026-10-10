@@ -13,7 +13,7 @@ const canvasBridge = (() => {
        backing buffers enforce their own representation/allocation failures. */
     const ARRAY_LENGTH=0xffffffff;
     const byteProto=Object.getPrototypeOf(Bytes.prototype), byteBuffer=Object.getOwnPropertyDescriptor(byteProto,'buffer').get, byteOffset=Object.getOwnPropertyDescriptor(byteProto,'byteOffset').get;
-    class HTMLCanvasElement extends HTMLElement {constructor(){throw new TypeError('Illegal HTMLCanvasElement constructor');}}
+    class HTMLCanvasElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLCanvasElement);}}
     class CanvasRenderingContext2D {constructor(){throw new TypeError('Illegal CanvasRenderingContext2D constructor');}}
     class CanvasGradient {
         constructor(){throw new TypeError('Illegal CanvasGradient constructor');}

@@ -1,0 +1,23 @@
+{
+  "upstream_manifest": "UPSTREAM.json",
+  "baseline": "Lexbor 3.1.0, f4cbbcd91359a0ec9499e3ce7e263de629482d61",
+  "notice": "UPSTREAM.json records the imported baseline; the files below intentionally contain local integration changes, not pristine upstream hashes.",
+  "patches": [
+    {
+      "name": "Nocturne token-time native tree integration, 2026-10-10",
+      "files": [
+        "source/lexbor/html/tree.h",
+        "source/lexbor/html/tree.c",
+        "source/lexbor/html/interfaces/element.h",
+        "source/lexbor/html/interfaces/template_element.h",
+        "source/lexbor/html/tree/insertion_mode/in_head.c"
+      ],
+      "purpose": "Optional synchronous element creation/reaction boundaries; stable parser form-owner/is metadata; declarative shadow roots and content-patching template destinations.",
+      "default_behavior": "With optional embedder callbacks unset, ordinary upstream template construction and inert-template behavior remain in place.",
+      "specifications": [
+        "https://html.spec.whatwg.org/multipage/parsing.html",
+        "https://html.spec.whatwg.org/multipage/scripting.html#the-template-element"
+      ]
+    }
+  ]
+}

@@ -344,10 +344,41 @@ class Handler(SimpleHTTPRequestHandler):
         return True
 
     def do_GET(self):
+        path = urlsplit(self.path).path
+        if path.startswith("/workers/parser-safety-"):
+            variant = path.removeprefix("/workers/parser-safety-")
+            if variant not in {"plain.js", "enforce.js", "report.js", "import.js"}:
+                self.send_error(404)
+                return
+            body = (b"self.__workerImport=true;" if variant == "import.js" else
+                    (Path(__file__).resolve().parents[2] / "js_parser_worker_safety_cases.js").read_bytes())
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            if variant in {"enforce.js", "report.js"}:
+                self.send_header("Content-Security-Policy" if variant == "enforce.js" else "Content-Security-Policy-Report-Only",
+                                 "trusted-types tt-worker 'allow-duplicates'; require-trusted-types-for 'script'")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if not self.api():
             super().do_GET()
 
     def do_POST(self):
+        if urlsplit(self.path).path in {"/__csp-report", "/__csp-report-only"}:
+            try:
+                data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+                report = data["csp-report"]
+                valid = (self.headers.get("Content-Type") == "application/csp-report" and
+                         report["effective-directive"] in {"trusted-types", "require-trusted-types-for"} and
+                         "trusted-types" in report["original-policy"] and
+                         report["disposition"] in {"enforce", "report"})
+            except (ValueError, KeyError, TypeError):
+                valid = False
+            self.send_response(204 if valid else 400)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if not self.api():
             self.send_json({"error": "POST is only supported by /api endpoints"}, status=405)
 

@@ -165,7 +165,7 @@ def make_disk(a, tcp_port, web_ports):
     srcs.append(os.path.join(ROOT, "third_party", "quickjs", "quickjs.h"))
     srcs.append(os.path.join(ROOT, "user", "apps", "browser_events.h"))
     srcs += [os.path.join(ROOT, "user", "libc", "web", name) for name in
-             ("form_value.h", "form_validation.h", "elements.h", "frame.h", "html_lexbor.h", "sandbox.h")]
+             ("form_value.h", "form_validation.h", "elements.h", "frame.h", "html_lexbor.h", "html_policy.h", "html_pi.h", "sandbox.h")]
     srcs += sorted(glob.glob(os.path.join(ROOT, "tests", "*.h")))
     mtools("mcopy", "-i", PART, *srcs, "::/tests/")
     mtools("mcopy", "-i", PART, "-s", os.path.join(ROOT, "tests", "media-fixtures"), "::/tests/")

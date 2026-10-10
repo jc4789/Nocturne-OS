@@ -21,6 +21,7 @@ const shadowBridge = (() => {
         get clonable(){return get(this,'shadowClonable');}
         get serializable(){return get(this,'shadowSerializable');}
         get slotAssignment(){return get(this,'shadowSlotAssignment');}
+        get customElementRegistry(){return customElementsBridge.registryFor(shadow(this));}
         get innerHTML(){return get(shadow(this),'innerHTML');}
         set innerHTML(value){shadow(this);dom('set',this,'innerHTML',value===null?'':string(value));}
         get activeElement(){return get(shadow(this),'activeElement');}
@@ -30,7 +31,7 @@ const shadowBridge = (() => {
         }
     }
     class HTMLSlotElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLSlotElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLSlotElement);}
         get name(){slot(this);return reflectedAttr(this,'name')||'';}
         set name(value){slot(this);reflectedAttr(this,'name',string(value));}
         assignedNodes(options={}){slot(this);return rawDom.slotNodes(this,!!dictionary(options).flatten);}
@@ -51,10 +52,21 @@ const shadowBridge = (() => {
             const mode=string(modeValue),serializable=!!o.serializable,assignmentValue=o.slotAssignment;
             const assignment=assignmentValue===undefined?'named':string(assignmentValue);
             if(!['open','closed'].includes(mode) || !['named','manual'].includes(assignment))throw new TypeError('Invalid shadow root mode or slot assignment');
-            if(registry!==undefined && registry!==customElements)throw new DOMException('Scoped registries are not implemented','NotSupportedError');
-            if(!get(this,'shadowHostValid') || get(this,'shadowRoot') || !customElementsBridge.allowShadow(this))
+            const owner=get(this,'ownerDocument');
+            const selectedRegistry=customElementsBridge.registryOption(registry,customElementsBridge.registryFor(owner));
+            const existing=get(this,'shadowRoot');
+            if(!get(this,'shadowHostValid') || !customElementsBridge.allowShadow(this) ||
+               existing && (!get(existing,'shadowDeclarative') || get(existing,'shadowMode')!==mode))
                 throw new DOMException('This element cannot attach a shadow root','NotSupportedError');
-            return dom('shadowAttach',this,mode==='closed',delegates,clonable,serializable,assignment==='manual');
+            return customElementsBridge.reactions(()=>{
+                // Native root identity/flags survive declarative reuse. Remove
+                // through the regular path so observers and CE disconnections
+                // see the emptied tree, not an unreported wholesale clear.
+                if(existing)for(const child of get(existing,'childNodes'))dom('remove',child);
+                const made=dom('shadowAttach',this,mode==='closed',delegates,clonable,serializable,assignment==='manual');
+                if(!existing)customElementsBridge.setRegistry(made,selectedRegistry);
+                return made;
+            });
         }}
     });
     for(const proto of [Element.prototype,Text.prototype])Object.defineProperty(proto,'assignedSlot',{

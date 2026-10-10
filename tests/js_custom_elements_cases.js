@@ -27,7 +27,7 @@ async function runCustomElementCases() {
         throws(()=>customElements.define(name(),class {connectedCallback=1;} .prototype),'TypeError');
         const bad = class extends HTMLElement {}; bad.prototype.connectedCallback = null;
         throws(()=>customElements.define(name(),bad),'TypeError');
-        const builtin = name(); throws(()=>customElements.define(builtin,class extends HTMLElement {},{extends:'div'}),'NotSupportedError');
+        const builtin = name(); throws(()=>customElements.define(builtin,class extends HTMLElement {},{extends:'unknown-local-name'}),'NotSupportedError');
         equal(customElements.get(builtin),undefined);
         throws(()=>customElements.get.call({},n1),'TypeError');
 

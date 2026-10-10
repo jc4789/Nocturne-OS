@@ -1,0 +1,43 @@
+{
+  "repository": "https://github.com/web-platform-tests/wpt",
+  "commit": "6a3c46c7c119fc84a80a1082fc8d21f9f5c24e66",
+  "files": [
+    {
+      "path": "tests1.dat",
+      "upstream_path": "html/syntax/parsing/resources/tests1.dat",
+      "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/6a3c46c7c119fc84a80a1082fc8d21f9f5c24e66/html/syntax/parsing/resources/tests1.dat",
+      "sha256": "aada6e3d12d624051bc978694475bd6a12bcedd7758781ba62425314684d23f3",
+      "bytes": 39460
+    },
+    {
+      "path": "README.upstream.md",
+      "upstream_path": "html/syntax/parsing/resources/README.md",
+      "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/6a3c46c7c119fc84a80a1082fc8d21f9f5c24e66/html/syntax/parsing/resources/README.md",
+      "sha256": "4567612328829c9019b1ab0a15447b11135e81f317e960b57d26a7cd63625965",
+      "bytes": 4941
+    },
+    {
+      "path": "LICENSE.wpt.md",
+      "upstream_path": "LICENSE.md",
+      "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/6a3c46c7c119fc84a80a1082fc8d21f9f5c24e66/LICENSE.md",
+      "sha256": "5fac07febb0e2a97fb0d7b0def149ec08b642e1ba4b9c345283ab1cbd2af6570",
+      "bytes": 1500
+    },
+    {
+      "path": "foreign-fragment.dat",
+      "upstream_path": "html/syntax/parsing/resources/foreign-fragment.dat",
+      "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/6a3c46c7c119fc84a80a1082fc8d21f9f5c24e66/html/syntax/parsing/resources/foreign-fragment.dat",
+      "sha256": "73e1785753c66420c067e5b29f89b17e7ebe1079687a512040ef19c6d42ac2c2",
+      "bytes": 9082
+    },
+    {
+      "path": "template.dat",
+      "upstream_path": "html/syntax/parsing/resources/template.dat",
+      "url": "https://raw.githubusercontent.com/web-platform-tests/wpt/6a3c46c7c119fc84a80a1082fc8d21f9f5c24e66/html/syntax/parsing/resources/template.dat",
+      "sha256": "72667fae7be5d2020b679409e45fed7b6923a3e9394da11a02c5bd9650323264",
+      "bytes": 28004
+    }
+  ],
+  "scope": "Official parser corpus; not a real-site acceptance substitute",
+  "generator": "scripts/html5lib_cases.py"
+}

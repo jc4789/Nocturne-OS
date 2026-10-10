@@ -104,6 +104,11 @@ typedef struct node {
     web_doc *allocation_doc; /* arena/value lifetime owner; never changes */
     struct node *template_content; /* separate inert tree, not element children */
     struct node *template_host; /* host-inclusive cycle validation only */
+    struct node *parser_form_owner; /* parser's non-ancestor association; reset by DOM mutation */
+    struct node *parser_form_next; /* only nodes with parser associations, not every DOM node */
+    int32_t custom_registry_id; /* -2 unset, -1 explicit null, 0 global, positive scoped */
+    void *custom_registry_realm; /* native identity, never an author-visible property */
+    const char *custom_is; /* internal customized built-in name, independent of is attribute */
     /* Shadow trees share the native node arena but never the DOM parent links.
        Only an N_FRAGMENT root has shadow_host; only an element has shadow_root. */
     struct node *shadow_root, *shadow_host;
@@ -136,6 +141,10 @@ typedef struct node {
     struct node *attr_owner; /* Not a DOM parent. */
     char *text; /* Text, Comment and ProcessingInstruction data */
     size_t textlen;
+    struct html_pi_attribute *pi_attributes;
+    size_t pi_attribute_count;
+    bool pi_attributes_ready;
+    bool html_policy_processed;
     struct node *parent, *first, *last, *next, *prev;
     const char *id;
     const char **classes;
@@ -203,6 +212,10 @@ typedef struct node {
     bool image_initialized, image_invalidated, image_has_source;
     struct node *owned_next; /* document-owned allocation list, including detached nodes */
     bool control_ready, script_started;
+    bool script_parse_eligible; /* fragment script closed before EOF; explicit runScripts only */
+    const char *script_text_snapshot; /* admitted source, allocation_doc arena; never a DOM property */
+    size_t script_text_snapshot_len;
+    bool script_text_snapshot_valid;
     /* Native resource state must survive collection/recreation of a JS wrapper. */
     bool js_force_async_set, js_force_async, js_image_notified;
     int js_image;
@@ -686,6 +699,7 @@ struct web_doc {
     arena_t lmem;   /* layout results */
     arena_t cssmem; /* authored sheets: replaced on a DOM stylesheet mutation */
     node_t *owned_nodes;
+    node_t *parser_form_nodes;
     size_t control_bytes;
     size_t canvas_bytes;
     uint8_t dom_create_reported; /* one numeric failure diagnostic per stage */
@@ -708,6 +722,13 @@ struct web_doc {
     char base[HTTP_URL_MAX];
     bool base_seen;
     bool quirks; /* no (or a legacy) doctype */
+    uint8_t document_mode; /* 0 no-quirks, 1 quirks, 2 limited-quirks (Lexbor values) */
+    char encoding[32]; /* canonical transport encoding; DOMString documents use UTF-8 */
+    bool encoding_certain; /* BOM/transport/accepted meta/author entry; strings never reparse */
+    bool html_srcdoc;
+    int32_t custom_registry_id;
+    void *custom_registry_realm;
+    struct web_html_policy *html_policy;
     char *title;
     char *refresh_url;
     int refresh_delay;
@@ -746,7 +767,9 @@ struct web_doc {
 };
 
 node_t *html_parse(web_doc *d, const char *html, size_t n, const char *charset);
+node_t *html_parse_string(web_doc *d, const char *html, size_t n, bool allow_shadow);
 web_doc *doc_inert(web_doc *family, const char *html, size_t n, const char *url);
+web_doc *doc_inert_ex(web_doc *family, const char *html, size_t n, const char *url, bool allow_shadow);
 size_t doc_dom_remaining(web_doc *d);
 void doc_dom_budget(web_doc *d);
 bool doc_node_adopt(web_doc *d, node_t *node);
@@ -766,15 +789,20 @@ void doc_font_loaded(web_doc *d, struct web_font_resource *font, const void *byt
 /* Incremental parser: 1 script boundary, 0 complete, -1 allocation failure.
    web_parse remains a scripting-disabled, fully parsed document. */
 struct html_parser *html_begin(web_doc *d, const char *html, size_t n, const char *charset, bool scripting);
+struct html_parser *html_begin_string(web_doc *d, const char *html, size_t n, bool scripting, bool allow_shadow);
 struct html_parser *html_open(web_doc *d);
 void html_close(struct html_parser *parser);
 int html_resume(struct html_parser *p, node_t **script);
+void *html_write_boundary(struct html_parser *p);
+int html_resume_written(struct html_parser *p, node_t **script, void *boundary);
 bool html_pending_input(const struct html_parser *p); /* unconsumed bytes, not stream EOF */
 bool html_import_changed(const struct html_parser *p); /* actual change in latest resume/import */
+void html_declarative_shadow_set(struct html_parser *parser,bool enabled);
 bool html_write(struct html_parser *p, const char *text, size_t n);
 void html_finish(struct html_parser *p);
 node_t *html_fragment(web_doc *d, node_t *context, const char *html, size_t n);
 node_t *html_contextual_fragment(web_doc *d, node_t *context, const char *html, size_t n);
+node_t *html_fragment_ex(web_doc *d, node_t *context, const char *html, size_t n, bool allow_shadow, bool run_scripts);
 /* CSS overflow propagated from html/body belongs to the viewport, not a
    scrolled element-sized clipping rectangle. Computed styles stay intact. */
 bool doc_viewport_overflow_box(const web_doc *d, const box_t *b);
@@ -828,6 +856,9 @@ bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before);
 bool doc_node_replace(web_doc *d, node_t *parent, node_t *child, node_t *old);
 void doc_node_remove(web_doc *d, node_t *node);
 bool doc_node_text(web_doc *d, node_t *node, const char *text, size_t n);
+void doc_parser_form_set(node_t *node,node_t *form);
+bool web_js_script_parser_capture(web_doc *d,node_t *node);
+bool web_js_encoding_restart(web_doc *d);
 bool doc_node_html(web_doc *d, node_t *node, const char *html, size_t n);
 bool doc_node_value(web_doc *d, node_t *node, const char *text, size_t n);
 bool doc_control_selection_supported(const node_t *node);
@@ -854,6 +885,11 @@ bool web_js_stylesheet_event(web_doc *d, node_t *n, bool failed);
 bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out);
 bool css_matches(node_t *node, const char *selector, bool *valid);
 void web_js_start(web_doc *d, const struct web_host *host);
+bool web_js_parser_candidate(web_doc *d, const char *name, const char *is);
+node_t *web_js_parser_element(web_doc *d, node_t *node, const char *is, bool finish);
+void web_js_parser_inserted(web_doc *d);
+bool web_js_shadow_allowed(web_doc *d, node_t *host);
+void web_js_parser_remove(web_doc *d, node_t *node);
 void web_js_console(web_doc *d, int level, const char *message);
 /* Native trusted link activation only; not exposed as a script popup API. */
 bool web_js_auxiliary_link(web_doc *d,const char *url);
@@ -869,6 +905,8 @@ bool web_js_complete(web_doc *d);
 void web_js_frames_sync(web_doc *d);
 web_doc *web_live_child(const char *html, size_t len, const char *url, const char *charset,
                         const struct web_host *host, web_doc *parent, node_t *frame, web_doc *inherited_origin);
+web_doc *web_live_child_response(const char *html,size_t len,const char *url,const char *charset,
+                        const char *headers,const struct web_host *host,web_doc *parent,node_t *frame,web_doc *inherited_origin);
 const char *web_effective_url(web_doc *d);
 void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *r);
 int64_t web_js_deadline(web_doc *d);

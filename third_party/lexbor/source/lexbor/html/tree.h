@@ -30,6 +30,26 @@ typedef lxb_status_t
 (*lxb_html_tree_append_attr_f)(lxb_html_tree_t *tree,
                                lxb_dom_attr_t *attr, void *ctx);
 
+/* Optional embedder boundaries. Defaults preserve upstream behavior. */
+typedef lxb_status_t
+(*lxb_html_tree_element_create_f)(lxb_html_tree_t *tree,
+                                  lxb_dom_node_t *node,
+                                  lxb_html_token_t *token, void *ctx);
+typedef lxb_status_t
+(*lxb_html_tree_after_token_f)(lxb_html_tree_t *tree,
+                              lxb_html_token_t *token, void *ctx);
+typedef bool
+(*lxb_html_tree_template_open_f)(lxb_html_tree_t *tree,
+                                 lxb_html_token_t *token,
+                                 lxb_html_template_element_t *element,
+                                 lxb_dom_node_t *host,
+                                 lxb_dom_node_t *position,
+                                 bool before, void *ctx);
+typedef lxb_status_t
+(*lxb_html_tree_template_close_f)(lxb_html_tree_t *tree,
+                                  lxb_html_template_element_t *element,
+                                  void *ctx);
+
 typedef struct {
     lexbor_array_obj_t *text_list;
     bool               have_non_ws;
@@ -59,6 +79,13 @@ struct lxb_html_tree {
     lxb_html_tree_insertion_mode_f mode;
     lxb_html_tree_insertion_mode_f original_mode;
     lxb_html_tree_append_attr_f    before_append_attr;
+    lxb_html_tree_element_create_f before_create_element;
+    lxb_html_tree_element_create_f after_create_element;
+    void                          *element_callback_context;
+    lxb_html_tree_after_token_f    after_token;
+    lxb_html_tree_template_open_f  template_open;
+    lxb_html_tree_template_close_f template_close;
+    void                          *template_callback_context;
 
     lxb_status_t                   status;
 
@@ -212,6 +239,9 @@ lxb_html_tree_check_scope_element(lxb_html_tree_t *tree);
 
 LXB_API bool
 lxb_html_tree_parsing_template_contents(lxb_html_tree_t *tree);
+
+LXB_API bool
+lxb_html_tree_parsing_inert_template_contents(lxb_html_tree_t *tree);
 
 LXB_API lxb_status_t
 lxb_html_tree_close_p_element(lxb_html_tree_t *tree, lxb_html_token_t *token);

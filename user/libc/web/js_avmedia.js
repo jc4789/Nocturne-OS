@@ -238,8 +238,9 @@ const avmediaBridge = (() => {
     }
     avmediaHandlerTarget=(target,type)=>target instanceof HTMLMediaElement && mediaEvents.includes(type);
     installHandlers(HTMLMediaElement.prototype,mediaEvents);
-    class HTMLAudioElement extends HTMLMediaElement {}
+    class HTMLAudioElement extends HTMLMediaElement {constructor(){return customElementsBridge.construct(new.target,HTMLAudioElement);}}
     class HTMLVideoElement extends HTMLMediaElement {
+        constructor(){return customElementsBridge.construct(new.target,HTMLVideoElement);}
         get videoWidth(){return snapshot(this).videoWidth;}
         get videoHeight(){return snapshot(this).videoHeight;}
         get width(){brand(this);return Math.max(0,Number(this.getAttribute('width'))||0);}

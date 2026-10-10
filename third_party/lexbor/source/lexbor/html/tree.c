@@ -205,6 +205,9 @@ lxb_html_tree_token_callback(lxb_html_tokenizer_t *tkz,
     lxb_status_t status;
 
     status = lxb_html_tree_insertion_mode(ctx, token);
+    lxb_html_tree_t *tree = ctx;
+    if (status == LXB_STATUS_OK && tree->after_token != NULL)
+        status = tree->after_token(tree, token, tree->element_callback_context);
     if (status != LXB_STATUS_OK) {
         tkz->status = status;
         return NULL;
@@ -302,6 +305,21 @@ lxb_html_tree_insertion_mode(lxb_html_tree_t *tree, lxb_html_token_t *token)
 /*
  * Action
  */
+static lxb_dom_node_t *
+lxb_html_tree_template_destination(lxb_html_template_element_t *element,
+                                  lxb_html_tree_insertion_position_t *ipos)
+{
+    if (element->insertion_target != NULL) {
+        if (element->insertion_end != NULL &&
+            element->insertion_end->parent == element->insertion_target) {
+            *ipos = LXB_HTML_TREE_INSERTION_POSITION_BEFORE;
+            return element->insertion_end;
+        }
+        return element->insertion_target;
+    }
+    return lxb_dom_interface_node(element->content);
+}
+
 lxb_dom_node_t *
 lxb_html_tree_appropriate_place_inserting_node(lxb_html_tree_t *tree,
                                        lxb_dom_node_t *override_target,
@@ -341,11 +359,8 @@ lxb_html_tree_appropriate_place_inserting_node(lxb_html_tree_t *tree,
         if(last_temp != NULL && (last_table == NULL
                          || last_temp_idx > last_table_idx))
         {
-            lxb_dom_document_fragment_t *doc_fragment;
-
-            doc_fragment = lxb_html_interface_template(last_temp)->content;
-
-            return lxb_dom_interface_node(doc_fragment);
+            return lxb_html_tree_template_destination(
+                         lxb_html_interface_template(last_temp), ipos);
         }
         else if (last_table == NULL) {
             adjusted_location = lxb_html_tree_open_elements_first(tree);
@@ -381,10 +396,8 @@ lxb_html_tree_appropriate_place_inserting_node(lxb_html_tree_t *tree,
      * after its last child (if any).
      */
     if (lxb_html_tree_node_is(adjusted_location, LXB_TAG_TEMPLATE)) {
-        lxb_dom_document_fragment_t *df;
-
-        df = lxb_html_interface_template(adjusted_location)->content;
-        adjusted_location = lxb_dom_interface_node(df);
+        adjusted_location = lxb_html_tree_template_destination(
+                          lxb_html_interface_template(adjusted_location), ipos);
     }
 
     return adjusted_location;
@@ -435,6 +448,32 @@ lxb_html_tree_create_element_for_token(lxb_html_tree_t *tree,
     lxb_status_t status;
     lxb_dom_element_t *element = lxb_dom_interface_element(node);
 
+    if (ns == LXB_NS_HTML) {
+        lxb_dom_element_t *base = token->base_element;
+        if (base != NULL && base->is_value != NULL) {
+            lexbor_str_t *is = base->is_value;
+            status = lxb_dom_element_is_set(element, is->data, is->length);
+            if (status != LXB_STATUS_OK) return lxb_html_interface_destroy(element);
+        } else for (lxb_html_token_attr_t *attr = token->attr_first; attr; attr = attr->next) {
+            size_t length = 0;
+            const lxb_char_t *name = lxb_html_token_attr_name(attr, &length);
+            if (length == 2 && name[0] == 'i' && name[1] == 's') {
+                status = lxb_dom_element_is_set(element, attr->value ? attr->value : (const lxb_char_t *)"", attr->value_size);
+                if (status != LXB_STATUS_OK) return lxb_html_interface_destroy(element);
+                break;
+            }
+        }
+    }
+
+    if (tree->before_create_element != NULL) {
+        status = tree->before_create_element(tree, node, token,
+                                              tree->element_callback_context);
+        if (status != LXB_STATUS_OK) {
+            tree->status = status;
+            return NULL;
+        }
+    }
+
     if (token->base_element == NULL) {
         status = lxb_html_tree_append_attributes(tree, element, token, ns);
     }
@@ -447,7 +486,49 @@ lxb_html_tree_create_element_for_token(lxb_html_tree_t *tree,
         return lxb_html_interface_destroy(element);
     }
 
+    if (ns == LXB_NS_HTML && tree->form != NULL && tree->fragment == NULL &&
+        !lxb_html_tree_parsing_template_contents(tree) &&
+        !lxb_dom_element_has_attribute(element, (const lxb_char_t *) "form", 4)) {
+        lxb_html_tree_insertion_position_t ipos;
+        lxb_dom_node_t *parent = lxb_html_tree_appropriate_place_inserting_node(tree, NULL, &ipos);
+        if (parent != NULL && ipos == LXB_HTML_TREE_INSERTION_POSITION_BEFORE) parent = parent->parent;
+        lxb_dom_node_t *form = lxb_dom_interface_node(tree->form);
+        lxb_dom_node_t *form_root = form;
+        while (parent != NULL && parent->parent != NULL) parent = parent->parent;
+        while (form_root->parent != NULL) form_root = form_root->parent;
+        if (parent == form_root) {
+        switch (node->local_name) {
+            case LXB_TAG_BUTTON: case LXB_TAG_FIELDSET: case LXB_TAG_INPUT:
+            case LXB_TAG_OBJECT: case LXB_TAG_OUTPUT: case LXB_TAG_SELECT:
+            case LXB_TAG_TEXTAREA:
+                lxb_html_interface_element(node)->parser_form_owner =
+                                                  form;
+                break;
+            default: break;
+        }
+        }
+    }
+    if (tree->after_create_element != NULL) {
+        status = tree->after_create_element(tree, node, token,
+                                             tree->element_callback_context);
+        if (status != LXB_STATUS_OK) {
+            tree->status = status;
+            return NULL;
+        }
+    }
+
     return lxb_html_interface_element(node);
+}
+
+bool
+lxb_html_tree_parsing_inert_template_contents(lxb_html_tree_t *tree)
+{
+    for (size_t i = tree->open_elements->length; i != 0; i--) {
+        lxb_dom_node_t *node = tree->open_elements->list[i - 1];
+        if (lxb_html_tree_node_is(node, LXB_TAG_TEMPLATE) &&
+            !lxb_html_interface_template(node)->parser_only) return true;
+    }
+    return lxb_html_tree_is_fragment_element(tree, LXB_TAG_TEMPLATE, LXB_NS_HTML);
 }
 
 lxb_status_t

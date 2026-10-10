@@ -4,6 +4,7 @@
    in Lexbor deliberately bypass some of those callbacks. */
 #include "html_lexbor.h"
 #include "elements.h"
+#include "html_pi.h"
 #include <limits.h>
 #include <lexbor/dom/interfaces/character_data.h>
 #include <lexbor/dom/interfaces/document_type.h>
@@ -11,6 +12,8 @@
 #include <lexbor/dom/interfaces/processing_instruction.h>
 #include <lexbor/html/interfaces/template_element.h>
 #include <lexbor/html/tree/active_formatting.h>
+extern bool web_js_shadow_allowed(web_doc *, node_t *);
+extern void web_js_parser_remove(web_doc *, node_t *);
 
 struct binding {
     lxb_dom_node_t *lex;
@@ -20,6 +23,7 @@ struct binding {
 struct html_bridge {
     struct binding **items, **table;
     size_t length, capacity, table_size;
+    bool ce_pending;
 };
 
 static size_t ptr_hash(const void *p) {
@@ -80,6 +84,22 @@ static struct binding *bind_node(struct html_parser *p, lxb_dom_node_t *lex, nod
     return v;
 }
 
+static bool rebind_native(struct html_parser *p, struct binding *binding, node_t *native) {
+    if (!native) return false;
+    if (binding->native == native) return true;
+    struct html_bridge *bridge = p->bridge;
+    if (by_native(bridge, native)) return false;
+    binding->native = native;
+    memset(bridge->table, 0, bridge->table_size * sizeof *bridge->table);
+    for (size_t i = 0; i < bridge->length; i++) {
+        struct binding *item = bridge->items[i];
+        size_t slot = ptr_hash(item->native) & (bridge->table_size - 1);
+        while (bridge->table[slot]) slot = (slot + 1) & (bridge->table_size - 1);
+        bridge->table[slot] = item;
+    }
+    return true;
+}
+
 static char *native_lower(arena_t *a, const lxb_char_t *s, size_t len) {
     char *v = ar_strndup(a, (const char *)s, len);
     for (size_t i = 0; i < len; i++) v[i] = (char)lower((unsigned char)v[i]);
@@ -94,6 +114,9 @@ static node_t *new_native(struct html_parser *p, lxb_dom_node_t *lex, web_doc *o
     if (setjmp(trap)) { d->mem.trap = old; return NULL; }
     node_t *n = ar_alloc(&d->mem, sizeof *n);
     n->owner = n->allocation_doc = d;
+        n->custom_registry_id = -2;
+        if (!p->fragment && lex->ns == LXB_NS_HTML && lex->local_name == LXB_TAG_META)
+            n->html_policy_processed = true;
     n->image = n->image_request = -1;
     n->owned_next = d->owned_nodes; d->owned_nodes = n;
     size_t len = 0;
@@ -107,12 +130,23 @@ static node_t *new_native(struct html_parser *p, lxb_dom_node_t *lex, web_doc *o
         n->tag = (uint16_t)tag_lookup(n->name, len);
         n->namespace_id = lex->ns == LXB_NS_SVG ? NS_SVG : lex->ns == LXB_NS_MATH ? NS_MATHML : NS_HTML;
         n->foreign = n->namespace_id != NS_HTML;
+        struct binding *parent = by_lex(lex->parent);
+        n->custom_registry_id = parent && parent->native->custom_registry_id != -2 ?
+                               parent->native->custom_registry_id : d->custom_registry_id;
+        n->custom_registry_realm = parent && parent->native->custom_registry_id != -2 ?
+                                  parent->native->custom_registry_realm : d->custom_registry_realm;
+        if (lxb_dom_interface_element(lex)->is_value) {
+            lexbor_str_t *is = lxb_dom_interface_element(lex)->is_value;
+            n->custom_is = ar_strndup(&d->mem, (const char *)is->data, is->length);
+        }
         /* Contextual Fragment mode is distinct from innerHTML's Inert mode.
            A detached eligible HTML script is not already started, but parsing
            never executes it. Preserve inert template owners/foreign scripts;
            html_resume independently marks EOF-truncated scripts as started. */
         n->script_started = n->tag == T_script && (d->inert ||
             (p->fragment && (!p->contextual_fragment || !p->scripting || n->foreign)));
+        n->script_parse_eligible = n->tag == T_script && p->fragment && p->scripting && !d->inert &&
+                                  (n->namespace_id == NS_HTML || n->namespace_id == NS_SVG);
         break;
     case LXB_DOM_NODE_TYPE_DOCUMENT: n->type = N_DOC; break;
     case LXB_DOM_NODE_TYPE_DOCUMENT_FRAGMENT: n->type = N_FRAGMENT; break;
@@ -288,11 +322,254 @@ static bool import_fields(struct binding *b) {
     return true;
 }
 
+static bool ascii_value_is(const lxb_char_t *value, size_t length, const char *expected) {
+    if (!value || strlen(expected) != length) return false;
+    for (size_t i = 0; i < length; i++)
+        if (lower(value[i]) != (unsigned char)expected[i]) return false;
+    return true;
+}
+static bool pi_target_is(lxb_dom_node_t *node, const char *target) {
+    if (!node || node->type != LXB_DOM_NODE_TYPE_PROCESSING_INSTRUCTION) return false;
+    lexbor_str_t *name = &lxb_dom_interface_processing_instruction(node)->target;
+    return name->length == strlen(target) && !memcmp(name->data, target, name->length);
+}
+static lxb_dom_node_t *next_descendant(lxb_dom_node_t *scope, lxb_dom_node_t *node) {
+    if (node->first_child) return node->first_child;
+    while (node != scope && !node->next) node = node->parent;
+    return node == scope ? NULL : node->next;
+}
+static bool prepare_patch(struct html_parser *p, lxb_html_template_element_t *t, lxb_dom_node_t *scope,
+                          const lxb_char_t *name, size_t length) {
+    if (!scope || !length) return false;
+    lxb_dom_node_t *start = NULL, *end = NULL;
+    for (lxb_dom_node_t *n = scope->first_child; n; n = next_descendant(scope, n)) {
+        if (!pi_target_is(n, "marker") && !pi_target_is(n, "start")) continue;
+        lexbor_str_t *data = &lxb_dom_interface_character_data(n)->data;
+        struct html_pi_attribute *attrs; size_t count;
+        if (!html_pi_parse((const char *)data->data, data->length, &attrs, &count)) continue;
+        bool match = false;
+        for (size_t i = 0; i < count; i++)
+            if (!strcmp(attrs[i].name, "name") && attrs[i].value_length == length &&
+                !memcmp(attrs[i].value, name, length)) match = true;
+        html_pi_free(attrs, count);
+        if (!match) continue;
+        start = n;
+        if (pi_target_is(n, "marker")) end = n;
+        else {
+            size_t depth = 0;
+            for (lxb_dom_node_t *s = n->next; s; s = s->next) {
+                if (pi_target_is(s, "start")) depth++;
+                else if (pi_target_is(s, "end")) {
+                    if (!depth) { end = s; break; }
+                    depth--;
+                }
+            }
+        }
+        break;
+    }
+    if (!start) return false;
+    t->insertion_target = start->parent;
+    t->insertion_start = start;
+    t->insertion_end = end;
+    t->parser_only = true;
+    if (start != end) {
+        if (!html_bridge_import(p)) goto fail;
+        size_t count = 0;
+        for (lxb_dom_node_t *n = start->next; n && n != end; n = n->next) count++;
+        if (count > SIZE_MAX / sizeof(node_t *)) goto fail;
+        node_t **removed = count ? malloc(count * sizeof *removed) : NULL;
+        if (count && !removed) goto fail;
+        size_t i = 0;
+        for (lxb_dom_node_t *n = start->next; n && n != end; n = n->next) {
+            struct binding *binding = by_lex(n);
+            if (!binding) { free(removed); goto fail; }
+            removed[i++] = binding->native;
+        }
+        for (i = 0; i < count; i++) if (removed[i]->parent) {
+            web_js_parser_remove(removed[i]->owner, removed[i]);
+            if (!html_bridge_export(p)) { free(removed); goto fail; }
+        }
+        free(removed);
+    }
+    return true;
+fail:
+    p->lex->tree->status = LXB_STATUS_ERROR_MEMORY_ALLOCATION; return false;
+}
+/* Called while the template is only on SOE. A successful DSD template is never
+   inserted into the light tree; its Lexbor content is the native ShadowRoot. */
+static bool modern_template_open(lxb_html_tree_t *tree, lxb_html_token_t *token,
+        lxb_html_template_element_t *t, lxb_dom_node_t *host,
+        lxb_dom_node_t *position, bool before, void *context) {
+    (void)token;
+    struct html_parser *p = context;
+    lxb_dom_element_t *element = lxb_dom_interface_element(t);
+    size_t length = 0;
+    const lxb_char_t *mode = lxb_dom_element_get_attribute(element,
+                                      (const lxb_char_t *)"shadowrootmode", 14, &length);
+    bool closed = ascii_value_is(mode, length, "closed");
+    if (closed || ascii_value_is(mode, length, "open")) {
+        if (!p->allow_declarative_shadow || !host || !tree->open_elements->length ||
+            host == tree->open_elements->list[0]) return false;
+        t->parser_only = true; /* do not bind the temporary inert content */
+        if (!html_bridge_import(p)) goto fail;
+        node_t *native_host = p->fragment && host == tree->fragment ? p->context_node : html_bridge_native(p, host);
+        if (native_host && native_host->shadow_host) native_host = native_host->shadow_host;
+        if (!native_host || !doc_shadow_host_valid(native_host) || native_host->shadow_root) {
+            t->parser_only = false; return false;
+        }
+        if (!web_js_shadow_allowed(native_host->owner, native_host)) {
+            t->parser_only = false; return false;
+        }
+#define HAS(name) lxb_dom_element_has_attribute(element, (const lxb_char_t *)(name), sizeof(name)-1)
+        size_t slot_length = 0;
+        const lxb_char_t *slot = lxb_dom_element_get_attribute(element,
+                   (const lxb_char_t *)"shadowrootslotassignment", 24, &slot_length);
+        node_t *root = doc_shadow_attach(native_host->owner, native_host, closed,
+                         HAS("shadowrootdelegatesfocus"), HAS("shadowrootclonable"),
+                         HAS("shadowrootserializable"), ascii_value_is(slot, slot_length, "manual"));
+        if (!root) { t->parser_only = false; return false; }
+        root->shadow_declarative = true;
+        root->custom_registry_id = HAS("shadowrootcustomelementregistry") ? -1 : native_host->owner->custom_registry_id;
+        root->custom_registry_realm = native_host->owner->custom_registry_realm;
+#undef HAS
+        t->shadow_host = host;
+        if (!bind_node(p, lxb_dom_interface_node(t->content), root)) goto fail;
+        return true;
+    }
+    const lxb_char_t *name = lxb_dom_element_get_attribute(element,
+                                             (const lxb_char_t *)"for", 3, &length);
+    if (name) {
+        lxb_dom_node_t *scope = before ? position->parent : position;
+        if (scope && scope->ns == LXB_NS_HTML && scope->local_name == LXB_TAG_BODY)
+            scope = scope->parent;
+        return prepare_patch(p, t, scope, name, length);
+    }
+    return false;
+fail:
+    tree->status = LXB_STATUS_ERROR_MEMORY_ALLOCATION; return false;
+}
+static lxb_status_t modern_template_close(lxb_html_tree_t *tree,
+                                          lxb_html_template_element_t *t, void *context) {
+    (void)tree;
+    struct html_parser *p = context;
+    if (!html_bridge_import(p)) return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+    lxb_dom_node_t *markers[] = {t->insertion_start, t->insertion_end};
+    for (size_t i = 0; i < 2; i++) {
+        struct binding *binding = by_lex(markers[i]);
+        if (binding && binding->native->parent) {
+            web_js_parser_remove(binding->native->owner, binding->native);
+            if (!html_bridge_export(p)) return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+        }
+    }
+    return LXB_STATUS_OK;
+}
+
+static lxb_status_t parser_element_before(lxb_html_tree_t *tree, lxb_dom_node_t *node,
+                                          lxb_html_token_t *token, void *context) {
+    (void)token;
+    struct html_parser *p = context;
+    if (node->ns != LXB_NS_HTML || p->fragment || !p->scripting ||
+        lxb_html_tree_parsing_inert_template_contents(tree)) return LXB_STATUS_OK;
+    lxb_dom_element_t *element = lxb_dom_interface_element(node);
+    size_t name_length = 0;
+    const lxb_char_t *name = lxb_dom_element_qualified_name(element, &name_length);
+    lexbor_str_t *is_value = element->is_value;
+    if (!is_value && !memchr(name, '-', name_length)) return LXB_STATUS_OK;
+    char *local = malloc(name_length + 1);
+    char *is = is_value ? malloc(is_value->length + 1) : NULL;
+    if (!local || (is_value && !is)) { free(local); free(is); return LXB_STATUS_ERROR_MEMORY_ALLOCATION; }
+    memcpy(local, name, name_length); local[name_length] = 0;
+    if (is_value) { memcpy(is, is_value->data, is_value->length); is[is_value->length] = 0; }
+    bool candidate = web_js_parser_candidate(p->d, local, is);
+    free(local);
+    if (!candidate) { free(is); return LXB_STATUS_OK; }
+    if (!html_bridge_import(p)) { free(is); return LXB_STATUS_ERROR_MEMORY_ALLOCATION; }
+    lxb_html_tree_insertion_position_t ipos;
+    lxb_dom_node_t *position = lxb_html_tree_appropriate_place_inserting_node(tree, NULL, &ipos);
+    lxb_dom_node_t *parent = ipos == LXB_HTML_TREE_INSERTION_POSITION_BEFORE && position ? position->parent : position;
+    struct binding *parent_binding = parent ? by_lex(parent) : NULL;
+    struct binding *binding = import_node(p, node, parent_binding ? parent_binding->native->owner : p->d);
+    if (binding) {
+        node_t *registry_parent = parent_binding ? parent_binding->native : NULL;
+        while (registry_parent && registry_parent->custom_registry_id == -2)
+            registry_parent = registry_parent->parent;
+        if (registry_parent) {
+            binding->native->custom_registry_id = registry_parent->custom_registry_id;
+            binding->native->custom_registry_realm = registry_parent->custom_registry_realm;
+        } else {
+            binding->native->custom_registry_id = binding->native->owner->custom_registry_id;
+            binding->native->custom_registry_realm = binding->native->owner->custom_registry_realm;
+        }
+    }
+    node_t *created = binding ? web_js_parser_element(p->d, binding->native, is, false) : NULL;
+    if (!binding || !rebind_native(p, binding, created)) {
+        free(is); return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+    }
+    free(is);
+    p->bridge->ce_pending = true;
+    return html_bridge_export(p) ? LXB_STATUS_OK : LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+}
+static lxb_status_t parser_element_after(lxb_html_tree_t *tree, lxb_dom_node_t *node,
+                                         lxb_html_token_t *token, void *context) {
+    struct html_parser *p = context;
+    if (node->ns == LXB_NS_HTML && node->local_name == LXB_TAG_META &&
+        !html_parser_meta_encoding(p, token))
+        return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+    struct binding *binding = by_lex(node);
+    if (!binding || !p->bridge->ce_pending) return LXB_STATUS_OK;
+    if (binding->native->face_associated && tree->form && !p->fragment &&
+        !lxb_html_tree_parsing_template_contents(tree) &&
+        !lxb_dom_element_has_attribute(lxb_dom_interface_element(node), (const lxb_char_t *)"form", 4)) {
+        lxb_html_tree_insertion_position_t ipos;
+        lxb_dom_node_t *parent = lxb_html_tree_appropriate_place_inserting_node(tree, NULL, &ipos);
+        if (parent && ipos == LXB_HTML_TREE_INSERTION_POSITION_BEFORE) parent = parent->parent;
+        lxb_dom_node_t *form = lxb_dom_interface_node(tree->form), *root = form;
+        while (parent && parent->parent) parent = parent->parent;
+        while (root->parent) root = root->parent;
+        if (root == parent) lxb_html_interface_element(node)->parser_form_owner = form;
+    }
+    if (!import_fields(binding) || !web_js_parser_element(p->d, binding->native,
+                                                        binding->native->custom_is, true))
+        return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+    return html_bridge_export(p) ? LXB_STATUS_OK : LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+}
+static lxb_status_t parser_token_after(lxb_html_tree_t *tree,
+                                       lxb_html_token_t *token, void *context) {
+    (void)tree; (void)token;
+    struct html_parser *p = context;
+    if (!p->bridge->ce_pending) return LXB_STATUS_OK;
+    p->bridge->ce_pending = false;
+    if (!html_bridge_import(p)) return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+    web_js_parser_inserted(p->d);
+    return html_bridge_export(p) ? LXB_STATUS_OK : LXB_STATUS_ERROR_MEMORY_ALLOCATION;
+}
+
 bool html_bridge_init(struct html_parser *p) {
     p->bridge = calloc(1, sizeof *p->bridge);
     if (!p->bridge) return false;
     if(!p->native_root)p->native_root = doc_node_create(p->d, p->fragment ? N_FRAGMENT : N_DOC, NULL, NULL, 0);
-    return p->native_root && bind_node(p, p->root, p->native_root);
+    if (p->fragment && p->native_root) {
+        node_t *context = p->context_node;
+        bool template_context = context && (context->template_host ||
+                               (context->type == N_ELEM && context->tag == T_template && !context->foreign));
+        p->native_root->custom_registry_id = template_context ? -1 :
+                context && context->custom_registry_id != -2 ? context->custom_registry_id :
+                context && context->owner ? context->owner->custom_registry_id : p->d->custom_registry_id;
+        p->native_root->custom_registry_realm = template_context ? NULL :
+                context && context->custom_registry_id != -2 ? context->custom_registry_realm :
+                context && context->owner ? context->owner->custom_registry_realm : p->d->custom_registry_realm;
+    }
+    if (!p->native_root || !bind_node(p, p->root, p->native_root)) return false;
+    if (p->lex && p->lex->tree) {
+        p->lex->tree->template_open = modern_template_open;
+        p->lex->tree->template_close = modern_template_close;
+        p->lex->tree->template_callback_context = p;
+        p->lex->tree->before_create_element = parser_element_before;
+        p->lex->tree->after_create_element = parser_element_after;
+        p->lex->tree->after_token = parser_token_after;
+        p->lex->tree->element_callback_context = p;
+    }
+    return true;
 }
 
 node_t *html_bridge_native(struct html_parser *p, lxb_dom_node_t *node) {
@@ -347,10 +624,19 @@ bool html_bridge_import(struct html_parser *p) {
                 if (!import_node(p, ch, v->native->owner)) return false;
             if (v->native->type == N_ELEM && v->lex->ns == LXB_NS_HTML && v->lex->local_name == LXB_TAG_TEMPLATE) {
                 lxb_html_template_element_t *t = lxb_html_interface_template(v->lex);
+                if (t->parser_only) continue;
                 node_t *content = doc_template_content(v->native->owner, v->native);
                 if (!content || !t->content) return false;
                 lxb_dom_node_t *lc = lxb_dom_interface_node(t->content);
                 if (!by_lex(lc) && !bind_node(p, lc, content)) return false;
+            }
+            if (v->native->type == N_ELEM && v->lex->ns == LXB_NS_HTML) {
+                lxb_dom_node_t *form = lxb_html_interface_element(v->lex)->parser_form_owner;
+                if (form) {
+                    struct binding *owner = import_node(p, form, v->native->owner);
+                    if (!owner) return false;
+                    doc_parser_form_set(v->native, owner->native);
+                } else doc_parser_form_set(v->native, NULL);
             }
         }
         if (pass == 0 && p->lex && p->lex->tree) {
@@ -364,6 +650,7 @@ bool html_bridge_import(struct html_parser *p) {
     }
     struct changed_documents changed={0};
     bool document_changed=!p->fragment && (p->d->root!=p->native_root ||
+        p->d->document_mode!=(uint8_t)p->document->dom_document.compat_mode ||
         p->d->quirks!=(p->document->dom_document.compat_mode==LXB_DOM_DOCUMENT_CMODE_QUIRKS));
     if(document_changed && !changed_document_add(&changed,p->d))goto fail_changes;
     /* Compare against the still-coherent old links before adoption or commit.
@@ -425,6 +712,7 @@ bool html_bridge_import(struct html_parser *p) {
     }
     if (!p->fragment) {
         p->d->root = p->native_root;
+        p->d->document_mode = (uint8_t)p->document->dom_document.compat_mode;
         p->d->quirks = p->document->dom_document.compat_mode == LXB_DOM_DOCUMENT_CMODE_QUIRKS;
     }
     doc_details_parser_finish(p->native_root);
@@ -445,7 +733,8 @@ static lxb_dom_node_t *new_lex(struct html_parser *p, node_t *n) {
         const char *ns = n->namespace_id == NS_SVG ? "http://www.w3.org/2000/svg" :
             n->namespace_id == NS_MATHML ? "http://www.w3.org/1998/Math/MathML" : "http://www.w3.org/1999/xhtml";
         return lxb_dom_interface_node(lxb_dom_element_create(d, (const lxb_char_t *)name, strlen(name),
-            (const lxb_char_t *)ns, strlen(ns), NULL, 0, NULL, 0, false));
+            (const lxb_char_t *)ns, strlen(ns), NULL, 0,
+            (const lxb_char_t *)n->custom_is, n->custom_is ? strlen(n->custom_is) : 0, false));
     }
     case N_TEXT:
         return lxb_dom_interface_node(lxb_dom_document_create_text_node(d, (const lxb_char_t *)n->text, n->textlen));
@@ -532,6 +821,10 @@ failed:
 static bool export_fields(struct html_parser *p, struct binding *b) {
     node_t *n = b->native;
     if (n->type == N_ELEM) {
+        if (b->lex->ns == LXB_NS_HTML) {
+            struct binding *form = n->parser_form_owner ? by_native(p->bridge, n->parser_form_owner) : NULL;
+            lxb_html_interface_element(b->lex)->parser_form_owner = form ? form->lex : NULL;
+        }
         lxb_dom_element_t *el = lxb_dom_interface_element(b->lex);
         if (attrs_equal(n, el)) return true;
         /* Qualified names may be duplicated across namespaces. by_name/set_attr
@@ -571,6 +864,8 @@ bool html_bridge_export(struct html_parser *p) {
         if (!export_fields(p, v)) return false;
         if (n->parent && !export_node(p, n->parent)) return false;
         for (node_t *ch = n->first; ch; ch = ch->next) if (!export_node(p, ch)) return false;
+        if (n->shadow_root && !export_node(p, n->shadow_root)) return false;
+        if (n->shadow_host && !export_node(p, n->shadow_host)) return false;
         if (n->template_content) {
             lxb_html_template_element_t *t = lxb_html_interface_template(v->lex);
             lxb_dom_node_t *content = lxb_dom_interface_node(t->content);

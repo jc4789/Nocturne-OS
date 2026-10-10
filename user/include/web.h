@@ -34,7 +34,8 @@ web_doc *web_parse(const char *html, size_t len, const char *url, const char *ch
    to one document; the embedder must also
    check its navigation generation before delivering a completion. */
 enum { WEB_RESOURCE_SCRIPT, WEB_RESOURCE_MODULE, WEB_RESOURCE_CSS,
-       WEB_RESOURCE_IMAGE, WEB_RESOURCE_FETCH, WEB_RESOURCE_FRAME };
+       WEB_RESOURCE_IMAGE, WEB_RESOURCE_FETCH, WEB_RESOURCE_FRAME,
+       WEB_RESOURCE_REPORT }; /* Native CSP POST only; never author Fetch. */
 struct web_request {
     uint64_t id;
     int kind;
@@ -157,6 +158,8 @@ void web_history_event(web_doc *d, const char *old_url, bool popstate);
 void web_visibility_event(web_doc *d);
 web_doc *web_live(const char *html, size_t len, const char *url, const char *charset,
                   const struct web_host *host);
+web_doc *web_live_response(const char *html,size_t len,const char *url,const char *charset,
+                         const char *headers,const struct web_host *host);
 void web_tick(web_doc *d, uint64_t now_ms);
 /* Private media/JS-worker children outlive a retired document until nonblocking reap.
  * No document/node callback is retained by this process-lifetime cleanup. */

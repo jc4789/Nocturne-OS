@@ -48,6 +48,12 @@ static inline size_t webnet_wire_url_limit(uint32_t flags) {
 static inline bool webnet_wire_image_flag_valid(uint32_t kind, uint32_t flags) {
     return !(flags & WEBNET_WIRE_IMAGE_UPGRADE) || kind == WEBNET_RESOURCE;
 }
+static inline bool webnet_wire_report_flag_valid(uint32_t kind,uint32_t flags,uint32_t credentials) {
+    if(kind!=WEBNET_REPORT)return true;
+    return credentials==WEBNET_CREDENTIALS_SAME_ORIGIN && (flags&WEBNET_WIRE_REDIRECT_ERROR) &&
+        !(flags&(WEBNET_WIRE_USER_NAVIGATION|WEBNET_WIRE_FORCE_PREFLIGHT|WEBNET_WIRE_SAME_ORIGIN|
+                 WEBNET_WIRE_NO_CORS|WEBNET_WIRE_NO_REFERRER|WEBNET_WIRE_IMAGE_UPGRADE|WEBNET_WIRE_CACHE_MASK));
+}
 static inline size_t webnet_wire_request_header_limit(uint32_t flags) {
     return flags & WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS ? (size_t)UINT32_MAX : WEBNET_REQUEST_HEADERS_MAX - 1u;
 }

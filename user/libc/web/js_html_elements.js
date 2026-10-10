@@ -8,17 +8,17 @@ const htmlElementsBridge = (() => {
     const hrefGet=Object.getOwnPropertyDescriptor(URLImpl.prototype,'href').get;
     const string=elementURL.string, scalar=elementURL.scalar, TypeErrorImpl=TypeError;
     const lower=text=>text.replace(/[A-Z]/g,c=>c.toLowerCase());
-    class HTMLMetaElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLMetaElement constructor');}}
-    class HTMLLinkElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLLinkElement constructor');}}
-    class HTMLStyleElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLStyleElement constructor');}}
-    class HTMLBaseElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLBaseElement constructor');}}
-    class HTMLTitleElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLTitleElement constructor');}}
-    class HTMLHeadElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLHeadElement constructor');}}
-    class HTMLHeadingElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLHeadingElement constructor');}}
-    class HTMLPictureElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLPictureElement constructor');}}
-    class HTMLSourceElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLSourceElement constructor');}}
-    class HTMLMenuElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLMenuElement constructor');}}
-    class HTMLDivElement extends HTMLElement {constructor(){throw new TypeErrorImpl('Illegal HTMLDivElement constructor');}}
+    class HTMLMetaElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLMetaElement);}}
+    class HTMLLinkElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLLinkElement);}}
+    class HTMLStyleElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLStyleElement);}}
+    class HTMLBaseElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLBaseElement);}}
+    class HTMLTitleElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLTitleElement);}}
+    class HTMLHeadElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLHeadElement);}}
+    class HTMLHeadingElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLHeadingElement);}}
+    class HTMLPictureElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLPictureElement);}}
+    class HTMLSourceElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLSourceElement);}}
+    class HTMLMenuElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLMenuElement);}}
+    class HTMLDivElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLDivElement);}}
     reflect(HTMLDivElement,'div','align');
     function headingBrand(node){
         const tag=rawDom.get(node,'localName');
@@ -280,7 +280,7 @@ const htmlElementsBridge = (() => {
         return true;
     }
     class HTMLDialogElement extends HTMLElement {
-        constructor(){throw new TypeErrorImpl('Illegal HTMLDialogElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLDialogElement);}
         get open(){dialogState(this);return reflectedAttr(this,'open')!==null;}
         set open(value){dialogState(this);reflectedAttr(this,'open',value?'':null);}
         get returnValue(){return dialogState(this).returnValue;}

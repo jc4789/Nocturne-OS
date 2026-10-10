@@ -93,7 +93,7 @@ int webnet_cookie_set(webnet *n, const char *url, const char *value) {
     return n && value ? webcookie_set(n->cookies, &c, value, strlen(value), time(NULL)) : -1;
 }
 uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callback cb, void *opaque) {
-    if (!n || !q || !q->url || !cb || n->count == UINT_MAX || q->kind > WEBNET_FETCH ||
+    if (!n || !q || !q->url || !cb || n->count == UINT_MAX || q->kind > WEBNET_REPORT ||
         q->kind < WEBNET_NAVIGATION || q->body_len > WEBNET_BODY_LIMIT || (q->body_len && !q->body) ||
         q->credentials < WEBNET_CREDENTIALS_OMIT || q->credentials > WEBNET_CREDENTIALS_INCLUDE ||
         q->cache_mode < WEBNET_CACHE_DEFAULT || q->cache_mode > WEBNET_CACHE_ONLY_IF_CACHED ||
@@ -102,6 +102,11 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
         (q->no_cors && (q->same_origin || q->force_preflight)) ||
         (q->keepalive && (q->kind != WEBNET_FETCH || !q->fetch_group)) ||
         (q->image_upgrade && q->kind != WEBNET_RESOURCE)) return 0;
+    if(q->kind==WEBNET_REPORT && (!webnet_report_fields_valid(q->method,q->headers) || !q->origin ||
+        !q->body_len || q->credentials!=WEBNET_CREDENTIALS_SAME_ORIGIN || !q->redirect_error ||
+        q->user_navigation || q->force_preflight || q->same_origin || q->no_cors || q->no_referrer ||
+        q->keepalive || q->image_upgrade || q->cache_mode!=WEBNET_CACHE_DEFAULT ||
+        (strncasecmp(q->url,"http://",7)&&strncasecmp(q->url,"https://",8))))return 0;
     /* Fetch Standard's inflight keepalive body bound, per fetch group. Queued
        and active requests both count; explicit aborted requests are done. */
     if (q->keepalive) {
@@ -151,7 +156,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     r->callback = cb; r->opaque = opaque; r->tx_len = len;
     r->priority = q->kind == WEBNET_NAVIGATION ? 0 :
                   (q->kind == WEBNET_CLASSIC || q->kind == WEBNET_MODULE) ? 1 :
-                  q->kind == WEBNET_FETCH ? 3 : 2;
+                  (q->kind == WEBNET_FETCH || q->kind == WEBNET_REPORT) ? 3 : 2;
     struct webnet_wire_request h = {0};
     h.magic = WEBNET_MAGIC; h.kind = q->kind;
     h.user_navigation = (q->user_navigation ? WEBNET_WIRE_USER_NAVIGATION : 0) |

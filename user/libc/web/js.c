@@ -11,6 +11,10 @@
 #include "webi.h"
 #include "web_dialog.h"
 #include "html_serialize.h"
+#include "html_lexbor.h"
+#include "html_policy.h"
+#include "html_encoding.h"
+#include "js_script_safety.h"
 #include "js_canvas.h"
 #include "js_memory.h"
 #include "avmedia.h"
@@ -59,6 +63,7 @@ struct js_node_ref {
     struct js_node_ref *next, **prev, *hash_next, **hash_prev;
 };
 struct js_timer { uint32_t id; int kind; uint64_t due, interval; JSValue fn, args; };
+struct js_policy_violation {struct js_policy_violation *next;JSValue init;struct web_html_policy_rule *rule;};
 struct js_posted_task { struct js_posted_task *next; JSValue fn; uint32_t id; };
 struct js_idle_task { struct js_idle_task *next; JSValue fn; uint32_t id; uint64_t due; };
 struct js_script {
@@ -70,7 +75,7 @@ struct js_script {
     uint64_t request;
     struct js_script *next;
 };
-enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE, P_WORKER, P_FRAME, P_FONT };
+enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE, P_WORKER, P_FRAME, P_FONT, P_POLICY_REPORT };
 struct js_pending {
     uint64_t id, deadline;
     int kind, credentials, cache_mode;
@@ -146,6 +151,7 @@ struct web_js_state {
     struct js_rejection *rejections,*last_rejection;
     bool rejection_oom;
     struct js_resource_event *events, *last_event;
+    struct js_policy_violation *policy_violations,*last_policy_violation;
     struct js_image_decode *image_decodes, *last_image_decode;
     uint64_t next_request, task_deadline, now;
     uint64_t fetch_group;
@@ -175,6 +181,7 @@ struct web_js_state {
     unsigned resource_failures;
     unsigned suspicious_script_urls;
     bool document_open,document_waiting;
+    unsigned dynamic_markup_counter;
     bool frames_scanned;
     uint64_t frames_revision;
     uint32_t script_count;
@@ -201,7 +208,12 @@ static JSValue native_document_stream(JSContext *ctx, JSValueConst this_val, int
 static void frame_sync(struct web_js_state *s,node_t *node);
 static void frame_response(struct web_js_state *s,struct js_pending *pending,bool ok);
 static bool frame_stream_pump(struct web_js_state *state);
+static bool parser_write_pump(struct web_js_state *state, void *boundary);
+static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int opcode);
+static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv);
 static bool frame_string_replace(char **slot, const char *text);
+static void policy_report_send(struct web_js_state *s,JSValueConst init,struct web_html_policy_rule *rule);
+static void js_policy_worker_report(void *opaque,JSValueConst message);
 static void signal_slots(struct web_js_state *s) {
     web_doc *family = s->doc->dom_family ? s->doc->dom_family : s->doc;
     if (!s->disabled && family->shadow_slots_pending) {
@@ -779,10 +791,10 @@ static unsigned compare_node_position(node_t *self,node_t *other) {
     return node_precedes(node1,node2)?PRECEDING:FOLLOWING;
 }
 static bool custom_candidate(const node_t *n) {
-    return n && n->type == N_ELEM && !n->foreign && n->name && strchr(n->name, '-');
+    return n && n->type == N_ELEM && !n->foreign && n->name && (n->custom_is || strchr(n->name, '-'));
 }
 static bool custom_candidates_walk(struct web_js_state *s, node_t *n, const char *name, JSValue result, uint32_t *index) {
-    if (custom_candidate(n) && (!name || !strcmp(n->name, name))) {
+    if (custom_candidate(n) && (!name || !strcmp(n->name, name) || (n->custom_is && !strcmp(n->custom_is,name)))) {
         JSValue object = wrap(s, n);
         if (JS_IsException(object) || JS_SetPropertyUint32(s->ctx, result, (*index)++, object) < 0) return false;
     }
@@ -883,6 +895,7 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     }
     if (!strcmp(p, "shadowRoot")) return wrap(s, n->shadow_root);
     if (!strcmp(p, "shadowHost")) return wrap(s, n->shadow_host);
+    if (!strcmp(p, "shadowDeclarative")) return JS_NewBool(ctx, n->shadow_declarative);
     if (!strcmp(p, "insertionHost")) return wrap(s, n->shadow_host ? n->shadow_host : n->template_host);
     if (!strcmp(p, "shadowHostValid")) return JS_NewBool(ctx, doc_shadow_host_valid(n));
     if (!strcmp(p, "assignedSlot")) return wrap(s, doc_assigned_slot(n, false));
@@ -937,7 +950,7 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
        empty DOMString, not undefined (and never invent a previous URL). */
     if (!strcmp(p, "referrer")) return JS_NewString(ctx, "");
     if (!strcmp(p, "contentType")) return JS_NewString(ctx, "text/html");
-    if (!strcmp(p, "characterSet")) return JS_NewString(ctx, "UTF-8");
+    if (!strcmp(p, "characterSet")) return JS_NewString(ctx, d->encoding[0] ? d->encoding : "UTF-8");
     if (!strcmp(p, "compatMode")) return JS_NewString(ctx, d->quirks ? "BackCompat" : "CSS1Compat");
     if (!strcmp(p, "doctype")) { for (node_t *c = d->root->first; c; c = c->next) if (c->type == N_DOCTYPE) return wrap(s, c); return JS_NULL; }
     if (!strcmp(p, "doctypeName") || !strcmp(p, "publicId") || !strcmp(p, "systemId")) {
@@ -1714,6 +1727,68 @@ static JSValue custom_element_hook(struct web_js_state *s, const char *name, int
     JS_FreeValue(s->ctx, fn);
     return result;
 }
+bool web_js_parser_candidate(web_doc *d, const char *name, const char *is) {
+    struct web_js_state *s=d?d->js:NULL;
+    if (!s || s->disabled || !s->ce_hooks_active) return false;
+    JSValue args[]={JS_NewString(s->ctx,name?name:""),is?JS_NewString(s->ctx,is):JS_NULL};
+    JSValue value=custom_element_hook(s,"customElementParserCandidate",2,args);
+    bool candidate=!JS_IsException(value) && JS_ToBool(s->ctx,value)>0;
+    if (JS_IsException(value)) exception(s);
+    JS_FreeValue(s->ctx,value); JS_FreeValue(s->ctx,args[0]); JS_FreeValue(s->ctx,args[1]);
+    return candidate;
+}
+node_t *web_js_parser_element(web_doc *d, node_t *n, const char *is, bool finish) {
+    struct web_js_state *s=d?d->js:NULL;
+    if (!s || s->disabled) return n;
+    JSValue args[]={wrap(s,n),is?JS_NewString(s->ctx,is):JS_NULL};
+    if (JS_IsException(args[0]) || JS_IsException(args[1])) {
+        JS_FreeValue(s->ctx,args[0]); JS_FreeValue(s->ctx,args[1]); return NULL;
+    }
+    if (!finish) s->dynamic_markup_counter++;
+    struct html_parser *parser=d->parser;if(parser)parser->callback_depth++;
+    JSValue result=custom_element_hook(s,finish?"customElementParserFinish":"customElementParserCreate",finish?1:2,args);
+    if (!finish) s->dynamic_markup_counter--;
+    if(parser)parser->callback_depth--;
+    if (JS_IsException(result)) exception(s);
+    node_t *created=finish?n:node_opaque(result);
+    JS_FreeValue(s->ctx,result); JS_FreeValue(s->ctx,args[0]); JS_FreeValue(s->ctx,args[1]);
+    return s->disabled?NULL:created?created:n;
+}
+bool web_js_script_parser_capture(web_doc *d,node_t *node){
+    (void)d;
+    if(!node || node->namespace_id!=NS_HTML || node->tag!=T_script)return true;
+    sbuf text={0};node_text_content(node,&text);
+    bool ok=js_script_text_capture(node,text.p?text.p:"",text.n);sb_free(&text);return ok;
+}
+bool web_js_shadow_allowed(web_doc *d,node_t *host) {
+    struct web_js_state *s=d?d->js:NULL;
+    if (!s || s->disabled || !s->ce_hooks_active) return true;
+    JSValue arg=wrap(s,host),result=JS_IsException(arg)?JS_EXCEPTION:custom_element_hook(s,"customElementAllowShadow",1,&arg);
+    bool allowed=!JS_IsException(result)&&JS_ToBool(s->ctx,result)>0;
+    if (JS_IsException(result)) exception(s);
+    JS_FreeValue(s->ctx,arg);JS_FreeValue(s->ctx,result);return allowed;
+}
+void web_js_parser_remove(web_doc *d,node_t *node) {
+    if (!node || !node->parent) return;
+    struct web_js_state *s=d?d->js:NULL;
+    if (!s || s->disabled) { doc_node_remove(node->owner,node); return; }
+    JSValue args[]={JS_NewString(s->ctx,"remove"),wrap(s,node)};
+    struct html_parser *parser=d->parser;if(parser)parser->callback_depth++;
+    JSValue result=JS_IsException(args[0])||JS_IsException(args[1])?JS_EXCEPTION:
+        native_dom_impl(s->ctx,JS_UNDEFINED,2,args,DOM_remove);
+    if(parser)parser->callback_depth--;
+    if (JS_IsException(result)) exception(s);
+    JS_FreeValue(s->ctx,result);JS_FreeValue(s->ctx,args[0]);JS_FreeValue(s->ctx,args[1]);
+}
+void web_js_parser_inserted(web_doc *d) {
+    struct web_js_state *s=d?d->js:NULL;
+    if (!s || s->disabled) return;
+    struct html_parser *parser=d->parser;if(parser)parser->callback_depth++;
+    JSValue result=custom_element_hook(s,"customElementParserInserted",0,NULL);
+    if(parser)parser->callback_depth--;
+    if (JS_IsException(result)) exception(s);
+    JS_FreeValue(s->ctx,result);
+}
 static bool form_exotic_receiver(JSContext *ctx, JSValueConst object) {
     node_t *node=node_opaque(object); struct web_js_state *s=state(ctx);
     return node && node->type==N_ELEM && !node->foreign && node->tag==T_form && s && JS_IsObject(s->hooks);
@@ -2196,19 +2271,44 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     } break;
     case DOM_parseDocument: {
         size_t len; const char *html = argc > 2 ? JS_ToCStringLen(ctx, &len, argv[2]) : NULL;
-        bool blank = argc > 3 && JS_ToBool(ctx, argv[3]) > 0;
-        web_doc *made = html ? doc_inert(s->doc, html, len, blank ? "about:blank" : s->doc->url) : NULL;
+        bool blank = argc > 3 && !JS_IsObject(argv[3]) && JS_ToBool(ctx, argv[3]) > 0;
+        bool allow_shadow=false;
+        JSValueConst options=argc>4?argv[4]:argc>3?argv[3]:JS_UNDEFINED;
+        if (JS_IsObject(options)) {
+            JSValue flag=JS_GetPropertyStr(ctx,options,"allowShadow");
+            if (JS_IsException(flag)) { JS_FreeCString(ctx,html); result=JS_EXCEPTION; break; }
+            allow_shadow=JS_ToBool(ctx,flag)>0; JS_FreeValue(ctx,flag);
+        }
+        web_doc *made = html ? doc_inert_ex(s->doc, html, len, blank ? "about:blank" : s->doc->url,allow_shadow) : NULL;
         result = !html ? JS_EXCEPTION : made ? wrap(s, made->root) : oom(ctx);
         JS_FreeCString(ctx, html);
 
     } break;
     case DOM_parseFragment: {
         size_t len = 0; const char *html = argc > 2 ? JS_ToCStringLen(ctx, &len, argv[2]) : NULL;
-        if (!n || n->type != N_ELEM) result = JS_ThrowTypeError(ctx, "Element context required");
+        if (!n || (n->type != N_ELEM && !n->shadow_host)) result = JS_ThrowTypeError(ctx, "Element or ShadowRoot context required");
         else if (!html) result = JS_EXCEPTION;
         else {
-            bool contextual=argc>3 && JS_ToBool(ctx,argv[3])>0;
-            node_t *made=contextual?html_contextual_fragment(d,n,html,len):html_fragment(d,n,html,len);
+            bool contextual=argc>3 && !JS_IsObject(argv[3]) && JS_ToBool(ctx,argv[3])>0,allow_shadow=false;
+            JSValueConst options=argc>4?argv[4]:argc>3?argv[3]:JS_UNDEFINED;
+            if (JS_IsObject(options)) {
+                JSValue shadow=JS_GetPropertyStr(ctx,options,"allowShadow"),scripts=JS_GetPropertyStr(ctx,options,"runScripts");
+                if (JS_IsException(shadow)||JS_IsException(scripts)) {
+                    JS_FreeValue(ctx,shadow);JS_FreeValue(ctx,scripts);JS_FreeCString(ctx,html);result=JS_EXCEPTION;break;
+                }
+                allow_shadow=JS_ToBool(ctx,shadow)>0;contextual=JS_ToBool(ctx,scripts)>0;
+                JS_FreeValue(ctx,shadow);JS_FreeValue(ctx,scripts);
+            }
+            node_t *made=html_fragment_ex(d,n,html,len,allow_shadow,contextual);
+            if(made && contextual){
+                pvec stack={0};pv_push(&stack,made);
+                while(stack.n){node_t *c=stack.v[--stack.n];
+                    if(c->tag==T_script && c->script_parse_eligible && !web_js_script_parser_capture(d,c)){made=NULL;break;}
+                    if(c->shadow_root)pv_push(&stack,c->shadow_root);
+                    if(c->tag!=T_template || c->namespace_id!=NS_HTML)for(node_t *child=c->last;child;child=child->prev)pv_push(&stack,child);
+                }
+                pv_free(&stack);
+            }
             result=made?wrap(s,made):oom(ctx);
         }
         JS_FreeCString(ctx, html);
@@ -2562,7 +2662,8 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             if (!made) result = oom(ctx);
             else {
                 while (made->root->first) doc_node_remove(made, made->root->first);
-                bool ok = true; made->quirks = d->quirks;
+                bool ok = true; made->quirks = d->quirks; made->document_mode=d->document_mode;
+                snprintf(made->encoding,sizeof made->encoding,"%s",d->encoding);
                 for (node_t *c = deep ? n->first : NULL; c && ok; c = c->next) {
                     node_t *copy = doc_node_clone(made, c, true);
                     ok = copy && doc_node_move(made, made->root, copy, NULL);
@@ -2576,6 +2677,42 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         if (argc > 2 && !JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2])) p = JS_ToCString(ctx, argv[2]);
         result = argc > 2 && !JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2]) && !p ? JS_EXCEPTION : custom_candidates(s, n, p);
 
+    } break;
+    case DOM_customData: {
+        if (!n || argc<3) { result=JS_ThrowTypeError(ctx,"Custom metadata requires a Node and key"); break; }
+        const char *key=JS_ToCString(ctx,argv[2]);
+        if (!key) { result=JS_EXCEPTION; break; }
+        if (!strcmp(key,"registry")) {
+            if (argc>3) {
+                int32_t id;
+                if (JS_ToInt32(ctx,&id,argv[3])<0) result=JS_EXCEPTION;
+                else if (id < -2) result=JS_ThrowTypeError(ctx,"Invalid registry identity");
+                else {
+                    n->custom_registry_id=id; n->custom_registry_realm=s->doc->root;
+                    if (n->type==N_DOC) { d->custom_registry_id=id;d->custom_registry_realm=s->doc->root; }
+                }
+            } else {
+                int32_t id=n->type==N_DOC?d->custom_registry_id:n->custom_registry_id;
+                void *realm=n->type==N_DOC?d->custom_registry_realm:n->custom_registry_realm;
+                /* Never reinterpret a scoped integer in a different registry table. */
+                result=JS_NewInt32(ctx,realm && realm!=s->doc->root && id>0?-1:id);
+            }
+        } else if (!strcmp(key,"authorConstructor")) {
+            if(n->type!=N_DOC)result=JS_ThrowTypeError(ctx,"Author constructor requires its Document");
+            else d->encoding_certain=true;
+        } else if (!strcmp(key,"is")) {
+            if (argc>3) {
+                const char *value=JS_IsNull(argv[3])?NULL:JS_ToCString(ctx,argv[3]);
+                if (!JS_IsNull(argv[3]) && !value) result=JS_EXCEPTION;
+                else {
+                    jmp_buf trap; jmp_buf *old=d->mem.trap;d->mem.trap=&trap;
+                    if (setjmp(trap)) result=oom(ctx);
+                    else n->custom_is=value?ar_strdup(&d->mem,value):NULL;
+                    d->mem.trap=old;JS_FreeCString(ctx,value);
+                }
+            } else result=n->custom_is?JS_NewString(ctx,n->custom_is):JS_NULL;
+        } else result=JS_ThrowTypeError(ctx,"Unknown custom metadata key");
+        JS_FreeCString(ctx,key);
     } break;
     case DOM_rect: {
         struct web_js_state *owner=geometry_owner(s,d);
@@ -2723,6 +2860,8 @@ static bool same_origin_urls(const char *a, const char *b, bool *allocation_fail
     bool same = xr == HTTP_URL_TUPLE && yr == HTTP_URL_TUPLE && !strcmp(x, y);
     free(x); free(y); return same;
 }
+#include "js_html_safety_host.h"
+#include "js_pi_native.h"
 static bool permitted_url(struct web_js_state *s, const char *url, bool fetch) {
     if (!strncasecmp(url, "https://", 8) || !strncasecmp(url, "http://", 7)) {
         struct url_owned parsed = {0};
@@ -3252,12 +3391,34 @@ static JSValue native_ready(JSContext *ctx, JSValueConst this_val, int argc, JSV
 static JSValue native_current(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) { return wrap(state(ctx), state(ctx)->current_script); }
 static JSValue native_write(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx);
-    if ((!s->parser_write && !s->document_open) || !s->doc->parser || s->parsing_done) return JS_ThrowTypeError(ctx, "document.write requires an open document stream or parser-blocking classic script");
+    if (s->dynamic_markup_counter) {
+        JSValue message=JS_NewString(ctx,"A custom element constructor cannot write to its parser document");
+        JSValue error=custom_element_hook(s,"invalidStateError",1,&message);JS_FreeValue(ctx,message);
+        return JS_IsException(error)?error:JS_Throw(ctx,error);
+    }
+    /* Asynchronously executing scripts with no insertion point must not erase
+       a still-loading document. A completed document uses the open algorithm. */
+    bool in_token=s->doc->parser && s->doc->parser->callback_depth;
+    if (!s->parser_write && !s->document_open && !in_token && s->doc->parser && !s->parsing_done) return JS_UNDEFINED;
+    if ((!s->doc->parser || s->parsing_done) && !s->document_open) {
+        JSValue operation=JS_NewInt32(ctx,0),opened=native_document_stream(ctx,this_val,1,&operation);
+        JS_FreeValue(ctx,operation);
+        if (JS_IsException(opened)) return opened;
+        JS_FreeValue(ctx,opened);
+    }
+    if (!s->doc->parser) return JS_UNDEFINED;
     if (!argc) return JS_UNDEFINED;
     size_t n; const char *text = JS_ToCStringLen(ctx, &n, argv[0]); if (!text) return JS_EXCEPTION;
+    bool pump=n && !in_token && (!s->current_script || s->current_script->namespace_id!=NS_SVG);
+    /* A paused SVG/token callback accumulates writes in author order. Only
+       a synchronous pump starts a new bounded insertion sequence. */
+    void *boundary=pump?html_write_boundary(s->doc->parser):NULL;
     bool ok = html_write(s->doc->parser, text, n); JS_FreeCString(ctx, text);
     if(ok)s->document_waiting=false;
-    if(ok && s->document_open)ok=frame_stream_pump(s);
+    /* SVG script executes with the parser pause flag set: it inserts input,
+       but does not reenter the tree builder until its script has returned. */
+    if(ok && pump)
+        ok=parser_write_pump(s,boundary);
     return ok ? JS_UNDEFINED : oom(ctx);
 }
 static JSValue native_encode(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -3612,7 +3773,7 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
     }
     struct web_request r = {.id=p->id, .kind=kind, .url=p->url, .method=method, .headers=headers, .body=body, .body_len=len,
         .origin=p->origin?p->origin:web_effective_url(s->doc),
-        .credentials=kind == WEB_RESOURCE_FETCH ? p->credentials : kind == WEB_RESOURCE_MODULE ? 1 : 2,
+        .credentials=(kind == WEB_RESOURCE_FETCH || kind == WEB_RESOURCE_REPORT) ? p->credentials : kind == WEB_RESOURCE_MODULE ? 1 : 2,
         .force_preflight=p->force_preflight, .redirect_error=p->redirect_error, .same_origin=p->same_origin,
         .no_cors=p->no_cors, .no_referrer=p->no_referrer,
         .cache_mode=p->cache_mode, .keepalive=p->keepalive, .fetch_group=p->keepalive?s->fetch_group:0};
@@ -3622,6 +3783,7 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
     if (!ok) pending_error(p, "The browser rejected the resource request");
     return ok;
 }
+#include "js_policy_report.h"
 #include "frame_native.h"
 /* Children have no networking/file host. Parent transport owns cookies, CORS,
    redirects and generation cancellation; completions only queue native bytes. */
@@ -3715,9 +3877,25 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
         s->workers = web_worker_new(ctx,generation,worker_load,s);
         if (!s->workers) return oom(ctx);
         web_worker_set_canceler(s->workers,s->host.cancel?worker_cancel:NULL);
+        web_worker_set_reporter(s->workers,js_policy_worker_report,s);
         JSValue fn = JS_GetPropertyStr(ctx,s->hooks,"workerNotify");
         if (JS_IsException(fn)) return fn;
         web_worker_set_callback(s->workers,fn); JS_FreeValue(ctx,fn);
+    }
+    if(op==0){
+        char *policy=html_policy_snapshot(s->doc);
+        if(!policy)return oom(ctx);
+        const char *address=argc>2?JS_ToCString(ctx,argv[2]):NULL;
+        bool blob=address && !strncasecmp(address,"blob:",5);JS_FreeCString(ctx,address);
+        if(blob){
+            JSValue snapshot=custom_element_hook(s,"blobPolicy",1,&argv[2]);
+            if(!JS_IsString(snapshot)){JS_FreeValue(ctx,snapshot);free(policy);return JS_ThrowTypeError(ctx,"Worker Blob policy snapshot is unavailable");}
+            const char *headers=JS_ToCString(ctx,snapshot);char *copy=headers?strdup(headers):NULL;
+            JS_FreeCString(ctx,headers);JS_FreeValue(ctx,snapshot);free(policy);policy=copy;
+            if(!policy)return oom(ctx);
+        }
+        bool ok=web_worker_set_policy(s->workers,policy);free(policy);
+        if(!ok)return oom(ctx);
     }
     if(op==8||op==9){
         if(argc<6)return JS_ThrowTypeError(ctx,"Worker capture arguments missing");
@@ -4198,11 +4376,31 @@ static bool script_type(node_t *n, bool *module) {
     size_t len = strlen(type); while (len && is_space((unsigned char)type[len - 1])) len--;
     return javascript_essence(type, len);
 }
+static JSValue script_compliant_source(void *opaque,node_t *node,JSValueConst input){
+    struct web_js_state *s=opaque,*owner=node->owner && node->owner->js?node->owner->js:s;
+    if(owner->disabled)return JS_ThrowTypeError(s->ctx,"Script owner realm is inactive");
+    JSValue args[]={JS_DupValue(owner->ctx,input),JS_NewInt32(owner->ctx,2),JS_NewString(owner->ctx,"HTMLScriptElement text"),wrap(owner,node)};
+    begin_task(owner);
+    JSValue result=custom_element_hook(owner,"safetyCheck",4,args);
+    for(unsigned i=0;i<4;i++)JS_FreeValue(owner->ctx,args[i]);
+    if(JS_IsException(result) && owner!=s)result=JS_Throw(s->ctx,JS_GetException(owner->ctx));
+    end_task(owner);return result;
+}
+static bool prepared_script_text(struct web_js_state *s,node_t *node,sbuf *text){
+    if(node->namespace_id!=NS_HTML)return true;
+    JSValue approved=js_script_source_check(s->ctx,node,text->p?text->p:"",text->n,script_compliant_source,s);
+    if(JS_IsException(approved)){exception(s);return false;}
+    size_t length;const char *bytes=JS_ToCStringLen(s->ctx,&length,approved);
+    if(!bytes){JS_FreeValue(s->ctx,approved);exception(s);return false;}
+    sb_free(text);sb_put(text,bytes,length);
+    JS_FreeCString(s->ctx,bytes);JS_FreeValue(s->ctx,approved);return true;
+}
 static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dynamic) {
     if (n->script_started) return NULL;
     if(s->doc->sandbox_flags&SB_SCRIPTS){n->script_started=true;return NULL;}
     if (s->doc->resources_dirty) doc_sync_tree(s->doc);
-    const char *src = node_attr(n, "src");
+    const char *src = n->namespace_id==NS_SVG?node_attr(n,"href"):node_attr(n, "src");
+    if (n->namespace_id==NS_SVG && !src) src=node_attr(n,"xlink:href");
     const char *type = node_attr(n, "type");
     bool importmap = type && str_ieq(type, "importmap");
     if (!src || (!*src && !importmap)) {
@@ -4211,10 +4409,12 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
         if (!text) return NULL;
     }
     n->script_started = true;
+    n->script_parse_eligible=false;
     if (importmap) {
         if (s->disabled || node_ancestor(n, T_template)) return NULL;
         if (src) { log_text(s, 2, "Import maps must be inline; src is not permitted"); script_event(s, n, true); return NULL; }
         sbuf text = {0}; node_text_content(n, &text);
+        if(!prepared_script_text(s,n,&text)){sb_free(&text);return NULL;}
         begin_task(s);
         JSValue value = text.n > JS_BODY_LIMIT ? JS_ThrowRangeError(s->ctx, "Import map length is not representable") :
             module_bridge_call(s, "registerImportMap", text.p ? text.p : "", text.n, s->doc->base);
@@ -4273,7 +4473,8 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
         } else if (url) script->url = js_strdup(s->ctx, url);
         js_free(s->ctx, url);
         sbuf b = {0}; node_text_content(n, &b);
-        script->source = js_strndup(s->ctx, b.p ? b.p : "", b.n); script->len = b.n; sb_free(&b);
+        if(prepared_script_text(s,n,&b)){script->source = js_strndup(s->ctx, b.p ? b.p : "", b.n);script->len=b.n;}
+        sb_free(&b);
         script->ready = true; if (!script->source) script->failed = true;
     }
     if (module && script->url && !script->failed) {
@@ -4292,6 +4493,17 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
     return script;
 }
 static void dynamic_scripts_walk(struct web_js_state *s, node_t *n) {
+    if(n->type==N_ELEM && !n->foreign && n->tag==T_meta && !n->html_policy_processed && connected(s,n)){
+        web_doc *owner=n->owner;
+        if(owner->resources_dirty)doc_sync_tree(owner);
+        if(node_ancestor(n,T_head)==owner->head){
+            const char *equiv=node_attr(n,"http-equiv"),*content=node_attr(n,"content");
+            if(equiv && content && str_ieq(equiv,"content-security-policy")){
+                if(!html_policy_meta(owner,content,strlen(content))){JS_ThrowOutOfMemory(s->ctx);exception(s);return;}
+                n->html_policy_processed=true;
+            }
+        }
+    }
     if(web_frame_element(n) && connected(s,n))frame_sync(s,n);
     if (n->shadow_root) dynamic_scripts_walk(s, n->shadow_root);
     for (node_t *c = n->first; c; c = c->next) {
@@ -4339,6 +4551,7 @@ static void run_script(struct web_js_state *s, struct js_script *script) {
     if(s->doc->sandbox_flags&SB_SCRIPTS){script->executed=true;return;}
     script->executed = true;
     if (s->disabled || script->failed || !script->source) { if (!s->disabled) { script_event(s, script->node, true); script->notified = true; } return; }
+    s->doc->encoding_certain=true;
     begin_named_task(s,script->module?"module script":"classic script",script->request);
     node_t *old_current = s->current_script; bool old_write = s->parser_write;
     s->current_script = script->module ? NULL : script->node;
@@ -4380,6 +4593,24 @@ static void pending_free(struct web_js_state *s, struct js_pending *p) {
     JS_FreeValue(s->ctx, p->resolve); JS_FreeValue(s->ctx, p->reject);
     js_free(s->ctx, p->url);js_free(s->ctx,p->origin); js_free(s->ctx, p->response.body); js_free(s->ctx, p->response.headers_full); js_free(s->ctx,p->response.url_full);
     js_free(s->ctx, p); s->pending_count--;
+}
+bool web_js_encoding_restart(web_doc *document){
+    struct web_js_state *s=document?document->js:NULL;
+    if(!s)return true;
+    if(document->encoding_certain || s->current_script)return false;
+    struct js_pending **link=&s->pending;
+    while(*link){struct js_pending *p=*link;
+        if(p->kind!=P_SCRIPT){link=&p->next;continue;}
+        *link=p->next;release_pending_request(s,p);pending_free(s,p);
+    }
+    while(s->scripts){struct js_script *p=s->scripts;s->scripts=p->next;
+        JS_FreeValue(s->ctx,p->evaluation);js_free(s->ctx,p->url);js_free(s->ctx,p->base);js_free(s->ctx,p->source);js_free(s->ctx,p);
+    }
+    while(s->modules){struct js_module *m=s->modules;s->modules=m->next;
+        JS_FreeValue(s->ctx,m->compiled);JS_FreeValue(s->ctx,m->error);js_free(s->ctx,m->url);js_free(s->ctx,m->base);js_free(s->ctx,m->source);js_free(s->ctx,m);
+    }
+    s->last_script=s->blocker=NULL;s->script_count=0;
+    return true;
 }
 void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *response) {
     struct web_js_state *s = d ? d->js : NULL;
@@ -5259,6 +5490,16 @@ void web_js_tick(web_doc *d, uint64_t now) {
         if (JS_HasException(s->ctx)) exception(s);
         end_task(s); s->worker_turn = false;
     } else { s->worker_turn = true; ran = process_pending(s); }
+    if(!ran && !s->disabled && s->policy_violations){
+        struct js_policy_violation *event=s->policy_violations;
+        s->policy_violations=event->next;if(!s->policy_violations)s->last_policy_violation=NULL;
+        begin_named_task(s,"Security policy violation",0);
+        policy_report_send(s,event->init,event->rule);
+        JSValue value=custom_element_hook(s,"safetyViolation",1,&event->init);
+        if(JS_IsException(value))exception(s);
+        JS_FreeValue(s->ctx,value);JS_FreeValue(s->ctx,event->init);js_free(s->ctx,event);
+        end_task(s);ran=true;
+    }
     request_styles(s);
     if (s->blocker && (s->blocker->executed || s->disabled)) s->blocker = NULL;
     /* A tick executes at most one JavaScript task plus its microtask checkpoint.
@@ -5266,7 +5507,8 @@ void web_js_tick(web_doc *d, uint64_t now) {
     if (!s->parsing_done && !s->blocker && d->parser) {
         node_t *created_before = d->owned_nodes;
         for (int step = 0; step < 32 && !s->blocker; step++) {
-            node_t *node = NULL; int result = html_resume(d->parser, &node);
+            node_t *node = NULL;
+            begin_task(s); int result = html_resume(d->parser, &node); end_task(s);
             /* Script/EOF boundaries can import a byte-identical forest. Only
                real parser changes publish resources; errors stay conservative. */
             if (result < 0 || html_import_changed(d->parser)) d->dirty = d->resources_dirty = true;
@@ -5494,12 +5736,14 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     }else s->heap_limit=s->runtime_owner->heap_limit;
     s->ctx = JS_NewContext(s->rt); if (!s->ctx) goto failed;
     JS_SetContextOpaque(s->ctx, s);
+    if(trusted_native_init(s->ctx)<0)goto failed;
     if (!node_class) JS_NewClassID(&node_class);
     JSClassDef class_def = {.class_name="NocturneDOMNode",.finalizer=node_finalizer,.gc_mark=node_gc_mark,.exotic=&node_exotic};
     if (s->runtime_owner==s && JS_NewClass(s->rt, node_class, &class_def) < 0) goto failed;
     JSValue api = JS_NewObject(s->ctx);
     static const JSCFunctionListEntry functions[] = {
         JS_CFUNC_DEF("dom", 2, native_dom), JS_CFUNC_DEF("log", 1, native_log),
+        JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),
         JS_CFUNC_DEF("domHooks",2,native_dom_hooks),
         JS_CFUNC_DEF("sandboxFlags",1,native_sandbox_flags),
         JS_CFUNC_DEF("svgGeometry",2,native_svg_geometry),
@@ -5521,6 +5765,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("pointerCapturePending", 1, native_pointer_capture_pending),
         JS_CFUNC_DEF("resolve", 1, native_resolve), JS_CFUNC_DEF("ready", 0, native_ready), JS_CFUNC_DEF("current", 0, native_current),
         JS_CFUNC_DEF("write", 1, native_write), JS_CFUNC_DEF("encode", 1, native_encode), JS_CFUNC_DEF("navigate", 1, native_navigate),
+        JS_CFUNC_DEF("pi",2,native_pi),
         JS_CFUNC_DEF("inline", 1, native_inline),
         JS_CFUNC_DEF("click", 1, native_click), JS_CFUNC_DEF("timer", 4, native_timer), JS_CFUNC_DEF("clear", 1, native_clear),
         JS_CFUNC_DEF("microtask", 1, native_microtask),
@@ -5554,6 +5799,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     if(!s->runtime_previous)s->task_deadline = uptime_ms() + JS_STARTUP_MS;
     s->hooks = load_browser_bindings(s->ctx);
     if (JS_IsException(s->hooks)) { exception(s); s->hooks = JS_UNDEFINED; end_task(s); goto failed; }
+    JS_SetDynamicCodeCheck(s->ctx,trusted_code_check,s);
     s->dispatch = JS_GetPropertyStr(s->ctx, s->hooks, "dispatch"); s->response = JS_GetPropertyStr(s->ctx, s->hooks, "response");
     s->reject = JS_GetPropertyStr(s->ctx, s->hooks, "reject");
     JSValue protos = JS_GetPropertyStr(s->ctx, s->hooks, "nodeProtos");
@@ -5601,6 +5847,8 @@ void web_js_free(web_doc *d) {
             JS_FreeValue(s->ctx, p->resolve); JS_FreeValue(s->ctx, p->reject); js_free(s->ctx, p);
         }
         while (s->events) { struct js_resource_event *e = s->events; s->events = e->next; js_free(s->ctx, e); }
+        while(s->policy_violations){struct js_policy_violation *e=s->policy_violations;s->policy_violations=e->next;JS_FreeValue(s->ctx,e->init);js_free(s->ctx,e);}
+        JS_SetDynamicCodeCheck(s->ctx,NULL,NULL);
         while (s->pending) { struct js_pending *p = s->pending; s->pending = p->next; release_pending_request(s, p); pending_free(s, p); }
         while (s->scripts) { struct js_script *p = s->scripts; s->scripts = p->next; JS_FreeValue(s->ctx, p->evaluation); js_free(s->ctx, p->url); js_free(s->ctx, p->base); js_free(s->ctx, p->source); js_free(s->ctx, p); }
         while (s->modules) { struct js_module *m = s->modules; s->modules = m->next; JS_FreeValue(s->ctx, m->compiled); JS_FreeValue(s->ctx, m->error); js_free(s->ctx, m->url); js_free(s->ctx, m->base); js_free(s->ctx, m->source); js_free(s->ctx, m); }

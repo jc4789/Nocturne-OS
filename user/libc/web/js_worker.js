@@ -8,7 +8,7 @@ const workerBridge=(()=>{
                 throw new DOMException('Module workers are not supported','NotSupportedError');
             if(options.credentials!==undefined&&String(options.credentials)!=='same-origin')
                 throw new DOMException('Worker credentials mode is not supported','NotSupportedError');
-            const address=new URL(String(url),document.baseURI).href;
+            const address=new URL(htmlSafetyBridge.check(url,3,'Worker constructor'),document.baseURI).href;
             let id;try{id=native(0,0,address,String(options.name??''));}catch(e){if(String(e?.message||'').startsWith('SecurityError:'))throw new DOMException(e.message,'SecurityError');throw e;}
             slots.set(this,{id,closed:false});live.set(id,this);
             this.onmessage=null;this.onmessageerror=null;this.onerror=null;

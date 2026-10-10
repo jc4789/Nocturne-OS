@@ -127,6 +127,10 @@ bool web_frame_initial_create(struct web_frame *f,const struct web_host *host) {
 }
 bool web_frame_commit(struct web_frame *f,const char *html,size_t n,const char *url,const char *charset,
                       const struct web_host *host,bool inherited) {
+    return web_frame_commit_response(f,html,n,url,charset,NULL,host,inherited);
+}
+bool web_frame_commit_response(struct web_frame *f,const char *html,size_t n,const char *url,const char *charset,
+                      const char *headers,const struct web_host *host,bool inherited) {
     web_doc *parent=f?f->element->owner:NULL;
     if(!parent)return false;
     f->pending_sandbox_flags|=parent->sandbox_flags;
@@ -135,7 +139,7 @@ bool web_frame_commit(struct web_frame *f,const char *html,size_t n,const char *
         f->window_token=doc_node_create(parent,N_FRAGMENT,NULL,"",0);
         if(!f->window_token)return false;
     }
-    web_doc *made=web_live_child(html,n,url,charset,host,parent,f->element,
+    web_doc *made=web_live_child_response(html,n,url,charset,headers,host,parent,f->element,
         inherited?(f->navigation_owner?f->navigation_owner:parent):NULL);
     if(!made)return false;
     made->frame_container=f;

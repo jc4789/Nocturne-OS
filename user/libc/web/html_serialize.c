@@ -52,15 +52,33 @@ static void attribute_name(const struct attr *a, sbuf *out) {
     } else sb_puts(out, a->raw ? a->raw : local);
 }
 
-void html_serialize_children(const node_t *node, sbuf *out) {
+struct serialization_options {bool serializable;node_t **roots;size_t count;};
+static void serialize_node(const node_t *node,sbuf *out,const struct serialization_options *options);
+static bool include_shadow(const node_t *root,const struct serialization_options *options){
+    if(!options)return false;
+    if(options->serializable && root->shadow_serializable)return true;
+    for(size_t i=0;i<options->count;i++)if(options->roots[i]==root)return true;
+    return false;
+}
+static void serialize_children(const node_t *node, sbuf *out,const struct serialization_options *options) {
     if (!node || serializes_as_void(node)) return;
     const node_t *parent = node->type == N_ELEM && node->namespace_id == NS_HTML && node->tag == T_template ?
         node->template_content : node;
+    if(node->shadow_root && include_shadow(node->shadow_root,options)){
+        const node_t *r=node->shadow_root;
+        sb_puts(out,"<template shadowrootmode=\"");sb_puts(out,r->shadow_closed?"closed":"open");sb_putc(out,'"');
+        if(r->shadow_delegates_focus)sb_puts(out," shadowrootdelegatesfocus=\"\"");
+        if(r->shadow_clonable)sb_puts(out," shadowrootclonable=\"\"");
+        if(r->shadow_serializable)sb_puts(out," shadowrootserializable=\"\"");
+        if(r->shadow_manual)sb_puts(out," shadowrootslotassignment=\"manual\"");
+        if(r->custom_registry_id==-1)sb_puts(out," shadowrootcustomelementregistry=\"\"");
+        sb_putc(out,'>');serialize_children(r,out,options);sb_puts(out,"</template>");
+    }
     for (const node_t *child = parent ? parent->first : NULL; child; child = child->next)
-        html_serialize_node(child, out);
+        serialize_node(child, out,options);
 }
 
-void html_serialize_node(const node_t *node, sbuf *out) {
+static void serialize_node(const node_t *node, sbuf *out,const struct serialization_options *options) {
     if (!node) return;
     if (node->type == N_TEXT) {
         if (literal_text(node)) sb_put(out, node->text ? node->text : "", node->textlen);
@@ -75,6 +93,9 @@ void html_serialize_node(const node_t *node, sbuf *out) {
     } else if (node->type == N_ELEM) {
         const char *name = node->namespace_id == NS_HTML ? node->name : node->raw_name ? node->raw_name : node->name;
         sb_putc(out, '<'); sb_puts(out, name);
+        if(node->custom_is && !node_attr(node,"is")){
+            sb_puts(out," is=\"");escaped(out,node->custom_is,strlen(node->custom_is),true);sb_putc(out,'"');
+        }
         for (int i = 0; i < node->nattrs; i++) {
             const struct attr *a = &node->attrs[i];
             sb_putc(out, ' '); attribute_name(a, out); sb_puts(out, "=\"");
@@ -82,8 +103,13 @@ void html_serialize_node(const node_t *node, sbuf *out) {
         }
         sb_putc(out, '>');
         if (!serializes_as_void(node)) {
-            html_serialize_children(node, out);
+            serialize_children(node, out,options);
             sb_puts(out, "</"); sb_puts(out, name); sb_putc(out, '>');
         }
-    } else if (node->type == N_DOC || node->type == N_FRAGMENT) html_serialize_children(node, out);
+    } else if (node->type == N_DOC || node->type == N_FRAGMENT) serialize_children(node, out,options);
+}
+void html_serialize_node(const node_t *node,sbuf *out){serialize_node(node,out,NULL);}
+void html_serialize_children(const node_t *node,sbuf *out){serialize_children(node,out,NULL);}
+void html_serialize_get(const node_t *node,sbuf *out,bool serializable,node_t **roots,size_t count){
+    struct serialization_options options={serializable,roots,count};serialize_children(node,out,&options);
 }

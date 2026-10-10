@@ -17,6 +17,7 @@ extern "C" {
 
 struct lxb_html_element {
     lxb_dom_element_t element;
+    lxb_dom_node_t    *parser_form_owner;
 };
 
 

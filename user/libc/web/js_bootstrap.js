@@ -3,7 +3,7 @@
     'use strict';
     delete globalThis.__nocturne_host;
     const domOperations=host.domOperations || Object.fromEntries(
-        ['adopt', 'animationComputed', 'animationStyle', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport'].map(op=>[op,(...args)=>host.dom(op,...args)]));
+        ['adopt', 'animationComputed', 'animationStyle', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport'].map(op=>[op,(...args)=>host.dom(op,...args)]));
     const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
     function validateInsertion(parent,child,before) {
         if(!rawDom.isNode(null,parent) || !rawDom.isNode(null,child) ||
@@ -454,21 +454,21 @@
     // A distinct native interface, not an alias or an instanceof override.
     // Nested browsing contexts/navigation are not implemented by this class.
     class HTMLIFrameElement extends HTMLElement {
-        constructor() { throw new TypeError('Illegal HTMLIFrameElement constructor'); }
+        constructor(){return customElementsBridge.construct(new.target,HTMLIFrameElement);}
     }
     class HTMLFrameElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLFrameElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLFrameElement);}
     }
     class HTMLUnknownElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLUnknownElement constructor');}
     }
     Object.defineProperty(HTMLUnknownElement.prototype,Symbol.toStringTag,{value:'HTMLUnknownElement',configurable:true});
     class HTMLTemplateElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLTemplateElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLTemplateElement);}
         get content(){return dom('get',this,'templateContent');}
     }
     class HTMLImageElement extends HTMLElement {
-        constructor() { throw new TypeError('Illegal HTMLImageElement constructor'); }
+        constructor(){return customElementsBridge.construct(new.target,HTMLImageElement);}
         get width() { return dom('get',this,'imageWidth'); }
         set width(v) { dom('set',this,'imageWidth',v); }
         get height() { return dom('get',this,'imageHeight'); }
@@ -491,14 +491,14 @@
         decode() { return Promise.resolve().then(()=>dom('imageDecode',this)); }
     }
     function Image() {
-        const image=dom('create',null,1,'img','');
+        const image=new.target && new.target!==Image?customElementsBridge.construct(new.target,HTMLImageElement):dom('create',null,1,'img','');
         if(arguments.length>0)dom('set',image,'imageWidth',arguments[0]);
         if(arguments.length>1)dom('set',image,'imageHeight',arguments[1]);
         return image;
     }
     Object.defineProperty(Image,'prototype',{value:HTMLImageElement.prototype,writable:false});
     class HTMLInputElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLInputElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLInputElement);}
         get form(){return dom('get',this,'form:input');}
         get defaultValue(){return reflectedAttr(this,'value')||'';}
         set defaultValue(v){reflectedAttr(this,'value',String(v));}
@@ -506,33 +506,33 @@
         set defaultChecked(v){reflectedAttr(this,'checked',v?'':null);}
     }
     class HTMLButtonElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLButtonElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLButtonElement);}
         get form(){return dom('get',this,'form:button');}
     }
     class HTMLSelectElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLSelectElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLSelectElement);}
         get form(){return dom('get',this,'form:select');}
     }
     class HTMLTextAreaElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLTextAreaElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLTextAreaElement);}
         get form(){return dom('get',this,'form:textarea');}
         get defaultValue(){return this.textContent||'';}
         set defaultValue(v){this.textContent=v==null?'':String(v);}
     }
     class HTMLFieldSetElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLFieldSetElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLFieldSetElement);}
         get form(){return dom('get',this,'form:fieldset');}
     }
     class HTMLObjectElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLObjectElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLObjectElement);}
         get form(){return dom('get',this,'form:object');}
     }
     class HTMLOutputElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLOutputElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLOutputElement);}
         get form(){return dom('get',this,'form:output');}
     }
     class HTMLOptionElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLOptionElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLOptionElement);}
         get form(){return dom('get',this,'form:option');}
         get defaultSelected(){return reflectedAttr(this,'selected')!==null;}
         set defaultSelected(v){reflectedAttr(this,'selected',v?'':null);}
@@ -557,7 +557,7 @@
         return collection;
     }
     class HTMLScriptElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLScriptElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLScriptElement);}
         static supports(type){
             if(!arguments.length)throw new TypeError('Script type required');
             type=elementURL.string(type);return type==='classic'||type==='module'||type==='importmap';
@@ -582,7 +582,7 @@
         set crossOrigin(v){htmlElementBrand(this,'script');reflectedAttr(this,'crossorigin',v==null?null:elementURL.string(v));}
     }
     class HTMLFormElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLFormElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLFormElement);}
         get elements(){return formControls(this);}
         get length(){return formControls(this).length;}
         get action(){return elementURL.attribute(this,'form','action',true);}
@@ -629,10 +629,10 @@
     }
     /* @include js_form_named.js */
     class HTMLAnchorElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLAnchorElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLAnchorElement);}
     }
     class HTMLAreaElement extends HTMLElement {
-        constructor(){throw new TypeError('Illegal HTMLAreaElement constructor');}
+        constructor(){return customElementsBridge.construct(new.target,HTMLAreaElement);}
     }
     Object.assign(Node, {ELEMENT_NODE:1,TEXT_NODE:3,CDATA_SECTION_NODE:4,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
     Object.assign(Node.prototype, {ELEMENT_NODE:1,TEXT_NODE:3,CDATA_SECTION_NODE:4,PROCESSING_INSTRUCTION_NODE:7,COMMENT_NODE:8,DOCUMENT_NODE:9,DOCUMENT_TYPE_NODE:10,DOCUMENT_FRAGMENT_NODE:11});
@@ -813,7 +813,7 @@
     const DOMTokenList=tokenListBridge.DOMTokenList;
     /* @include js_fetch.js */
     const location={assign(url){host.navigate(String(url),0);},replace(url){host.navigate(String(url),2);},reload(){host.navigate(host.url(),1);},toString(){return this.href;}};
-    Object.defineProperties(location,{href:{get(){return host.url();},set(v){host.navigate(String(v));}}});
+    Object.defineProperties(location,{href:{get(){return host.url();},set(v){host.navigate(htmlSafetyBridge.navigationInput(v));}}});
     document.location=location;
     const console={};for(const [i,name]of ['log','warn','error','info','debug'].entries())console[name]=(...args)=>host.log(i===2?2:i===1?1:0,...args);
     console.assert=(yes,...args)=>{if(!yes)console.error('Assertion failed:',...args);};
@@ -915,6 +915,9 @@
     /* @include js_mse.js */
     /* @include js_avmedia.js */
     /* @include js_texttracks.js */
+    /* @include js_sanitizer_constants.js */
+    /* @include js_html_safety.js */
+    /* @include js_pi.js */
     customElementsReady = true;
     /* Private native-input state, never reachable from page JS. C supplies the
        hit target's complete ancestry BEFORE any event handler can change it.
@@ -983,6 +986,7 @@
             if(!blob)throw new TypeError('Blob script URL is revoked or unavailable in this document');
             return [blobBridge.bytes(blob),blobBridge.type(blob)];
         },
+        blobPolicy:objectURLBridge.policy,
         observerFrame(){observerBridge.frame();},
         pointerCaptureTarget:pointerCaptureBridge.target,
         pointerClickTarget:pointerCaptureBridge.clickTarget,
@@ -999,6 +1003,13 @@
         windowMessageCommit:messagingBridge.commitImported,
         windowMessageReceive:messagingBridge.receive,
         imageError(){return new DOMException('The image request changed or could not be decoded','EncodingError');},
+        invalidStateError(message){return new DOMException(message,'InvalidStateError');},
+        safetyCheck:htmlSafetyBridge.check,
+        safetyOptions:htmlSafetyBridge.options,
+        safetyDynamicCode:htmlSafetyBridge.dynamicCode,
+        safetyMutation:htmlSafetyBridge.mutation,
+        safetyInput:htmlSafetyBridge.compliantInput,
+        safetyViolation(init){return dispatch(document,htmlSafetyBridge.violationEvent(init));},
         hover,
         customElementBefore(...args){
             const reactionArgs=args[0]==='adopt' && args[2] && rawDom.get(args[2],'nodeType')!==2?['remove',args[2]]:args;
@@ -1015,6 +1026,11 @@
         customElementAfter(token,result){rangeBridge.after(token.range);if(!mutationBridge.native)mutationBridge.after(token.mutation);if(!['clone','import'].includes(token.op) || !result || rawDom.get(result,'scripting'))customElementsBridge.after(token.ce,result);},
         mutationFlush(){mutationBridge.flush();},
         customElementScan(){customElementsBridge.upgradeTree(document);customElementsBridge.formRefresh();},
+        customElementParserCandidate:customElementsBridge.parserCandidate,
+        customElementParserCreate:customElementsBridge.parserCreate,
+        customElementParserFinish:customElementsBridge.parserFinish,
+        customElementParserInserted:customElementsBridge.parserInserted,
+        customElementAllowShadow:customElementsBridge.allowShadow,
         customFormReset(form){customElementsBridge.formReset(form);},
         slotChanges(){mutationBridge.signalSlots();},
         dialogRequestClose(node){htmlElementsBridge.requestClose(node);},

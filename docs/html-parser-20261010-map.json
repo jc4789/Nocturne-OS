@@ -1,0 +1,83 @@
+{
+  "summary": "既存Lexbor/native DOMを保全したHTML入力・木構築・JS API・Sanitizer/Trusted Types統合。guest検証中、実サイト未受入。",
+  "areas": [
+    {
+      "path": "user/libc/web/html_lexbor.c",
+      "purpose": "バイトデコード、DOMString入力、script境界、断片文脈"
+    },
+    {
+      "path": "user/libc/web/html_lexbor_bridge.c",
+      "purpose": "native identityを維持した解析木の差分同期"
+    },
+    {
+      "path": "user/libc/web/js.c",
+      "purpose": "JS/native公開APIとscript/task統合"
+    },
+    {
+      "path": "user/libc/web/js_custom_elements.js",
+      "purpose": "既存CE反応・FACEの拡張"
+    },
+    {
+      "path": "third_party/lexbor/source/lexbor/html",
+      "purpose": "局所tree hookと新template木構築"
+    },
+    {
+      "path": "tests",
+      "purpose": "製品経路の回帰・新規契約試験"
+    },
+    {
+      "path": "scripts/platform_qa.py",
+      "purpose": "隔離WHPX guestで実サイトとスクロールを観測"
+    },
+    {
+      "path": "user/libc/web/html_encoding.c",
+      "purpose": "BOM/HTTP/prescan復号とtentative encoding再解析"
+    },
+    {
+      "path": "user/libc/web/html_policy.c",
+      "purpose": "native CSPヘッダ/metaとprivate policy snapshot"
+    },
+    {
+      "path": "user/libc/web/js_html_safety.js",
+      "purpose": "Sanitizer・Trusted Types・HTML更新API"
+    },
+    {
+      "path": "user/libc/web/js_pi_native.h",
+      "purpose": "native PI順序付き属性map"
+    },
+    {
+      "path": "user/apps/browserjsworker.c",
+      "purpose": "Workerのnative CSPとTrusted Types"
+    }
+  ],
+  "facts": [
+    {
+      "claim": "html_resumeはscript境界でnative木を公開し、再開前にJS編集をexportする",
+      "evidence": "user/libc/web/html_lexbor.c"
+    },
+    {
+      "claim": "build.pyは同梱MSYS2でmakeを実行し、platform_qaは隔離bootのRAM・解像度・acceleratorを指定できる",
+      "evidence": "scripts/platform_qa.py"
+    }
+  ],
+  "contracts": [
+    "root: native統合・network response headers・DOM owner/metadata・bootstrap・guest/real-site acceptance",
+    "modern_tree: Lexbor tree/bridge、PI、WPT corpus product adapter",
+    "custom_elements: CE、Worker policy/script slot、encoding restart",
+    "safety: Sanitizer/Trusted Types、native policy、QuickJS dynamic compile、CSP report transport",
+    "既存GUI-first/RAM-root/data semanticsを変更しない。既存検査を削除せず、失敗/未確認を成功扱いしない。"
+  ],
+  "tests": [
+    "python -X utf8 scripts/build.py -j 8 all",
+    "isolated tests and platform_qa with WHPX 4096MiB 1920x1080x32"
+  ],
+  "unknowns": [
+    "guest新機能試験実行中。実サイト表示/scrollは未実行。",
+    "一般CSP source-list/XML parserとHyper-Vは対象外。Reporting API report-toは未実装として報告。"
+  ],
+  "inventory_exclusions": [
+    "tools/ is unchanged bundled MSYS2/toolchain; scripts/jspace_html_control.py excludes it from inventory, not source/evidence gates. Original controller state is retained under build/."
+  ],
+  "execution": "collaborative",
+  "level": "medium"
+}

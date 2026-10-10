@@ -97,8 +97,7 @@
         Document.prototype.getElementsByName=function(name){brand(this);if(!arguments.length)throw new TypeError('Missing name');const query='[name="'+CSS.escape(string(name))+'"]';return collectionBridge.domLive(this,()=>dom('query',this,query,false));};
         function create(receiver,name,options,foreign){
             brand(receiver);name=string(name);
-            if(receiver===document && !foreign)return customElementsBridge.create(name,options);
-            if(options && options.is!==undefined)throw new DOMException('Customized built-ins are not implemented','NotSupportedError');
+            if(!foreign)return customElementsBridge.create(name,options,false,receiver);
             if(!/^[A-Za-z_\u0080-\uFFFF][A-Za-z0-9_.:\-\u0080-\uFFFF]*$/.test(name))throw new DOMException('Invalid element name','InvalidCharacterError');
             return dom('create',receiver,1,name,'',!!foreign);
         }

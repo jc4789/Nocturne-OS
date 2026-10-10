@@ -1,24 +1,35 @@
-/* Autonomous custom elements on Nocturne's existing native DOM wrappers.
+/* Custom elements on Nocturne's existing native DOM wrappers.
  * Algorithms: https://html.spec.whatwg.org/multipage/custom-elements.html
  * Native shadow trees participate in upgrade/connection/adoption. Form-associated
  * definition metadata connects ElementInternals to actual native ownership,
- * validation, submission and CE form callbacks. Scoped registries
- * and customized built-ins remain explicitly unsupported.
+ * validation, submission and CE form callbacks. Registry and internal is values
+ * are native node metadata, so parsing, cloning and adoption use the same tree.
  * Embedded in js_bootstrap.js; rawDom/document/HTMLElement/report are private. */
 const customElementsBridge = (() => {
     'use strict';
     const HTML = 'http://www.w3.org/1999/xhtml';
-    const definitions = new Map(), constructors = new Map(), pending = new Map();
-    const states = new WeakMap(), scopes = [], backup = [], faceElements=new Set();
-    let constructionDepth=0;
-    function invokeConstructor(constructor) {
+    const registryStates = new WeakMap(), registries = new Map(), activeDefinitions = new WeakMap();
+    const states = new WeakMap(), scopes = [], backup = [], faceElements=new Set(), parserConnections=new Set();
+    const nativeInterfaces = new Map(),parserNames=new Set(),parserBuiltins=new Map();
+    let constructionDepth=0, nextRegistry=1, definitionCount=0;
+    function invokeConstructor(d) {
+        const previous=activeDefinitions.get(d.constructor);
+        activeDefinitions.set(d.constructor,d);
         constructionDepth++;
-        try{return Reflect.construct(constructor,[]);}finally{constructionDepth--;}
+        try{
+            // The parser candidate set is a union of all registries. Only an
+            // actual author constructor fixes this document's byte encoding.
+            rawDom.customData(document,'authorConstructor');
+            return Reflect.construct(d.constructor,[]);
+        }finally{
+            constructionDepth--;
+            if(previous)activeDefinitions.set(d.constructor,previous);else activeDefinitions.delete(d.constructor);
+        }
     }
     const constructed = Symbol('already constructed'), registryKey = {};
     const reserved = new Set(['annotation-xml','color-profile','font-face','font-face-src',
         'font-face-uri','font-face-format','font-face-name','missing-glyph']);
-    let defining = false, backupScheduled = false;
+    let backupScheduled = false;
     const StringImpl = String;
     const string = value => { if (typeof value === 'symbol') throw new TypeError('Cannot convert Symbol to DOMString'); return StringImpl(value); };
     const lower = name => name.replace(/[A-Z]/g, c => c.toLowerCase());
@@ -45,6 +56,47 @@ const customElementsBridge = (() => {
     // Traverse the actual native tree once, in tree order. Ordinary HTML/text
     // nodes never need wrappers or per-node JS/native crossings for this query.
     const elements = (root, name=null) => rawDom.customCandidates(root,name);
+    function registryState(value) {
+        const state=registryStates.get(value);
+        if(!state)throw new TypeError('CustomElementRegistry receiver required');
+        return state;
+    }
+    function registryOption(value, fallback) {
+        if(value===undefined)return fallback;
+        if(value===null)return null;
+        registryState(value);return value;
+    }
+    function setRegistry(node,value) {
+        rawDom.customData(node,'registry',value===null?-1:registryState(value).id);
+        if(value!==null){
+            const state=registryState(value);
+            if(state.scoped)state.documents.add(get(node,'nodeType')===9?node:get(node,'ownerDocument'));
+        }
+    }
+    function registryFor(node) {
+        const type=get(node,'nodeType');
+        if(type!==1 && type!==9 && !(type===11 && get(node,'shadowHost')))return null;
+        const id=rawDom.customData(node,'registry');
+        if(id!==-2)return id===-1?null:registries.get(id)||null;
+        // Older/native callers may leave the slot unassigned. Resolve once;
+        // subsequent moves never replace an element's established registry.
+        const value=type===9?(get(node,'scripting')?registry:null):registryFor(get(node,'ownerDocument'));
+        setRegistry(node,value);return value;
+    }
+    function lookup(element) {
+        if(get(element,'namespaceURI')!==HTML)return null;
+        const value=registryFor(element);if(value===null)return null;
+        const table=registryState(value).definitions,local=get(element,'localName'),is=rawDom.customData(element,'is');
+        const autonomous=table.get(local);
+        if(autonomous && autonomous.localName===local && autonomous.name===local)return autonomous;
+        const builtin=is===null?null:table.get(is);
+        return builtin && builtin.localName===local && builtin.name!==local?builtin:null;
+    }
+    function nativeInterface(localName) {
+        let proto=nativeInterfaces.get(localName);
+        if(!proto){proto=Object.getPrototypeOf(rawDom.create(null,1,localName,''));nativeInterfaces.set(localName,proto);}
+        return proto;
+    }
     function stateFor(element) {
         let s = states.get(element);
         if (!s) { s = {state:'undefined', definition:null, reactions:[]}; states.set(element, s); }
@@ -87,13 +139,12 @@ const customElementsBridge = (() => {
         enqueue(element, {callback:d.callbacks[name], args});
     }
     function tryUpgrade(element) {
-        if (get(element, 'namespaceURI') !== HTML) return;
-        const d = definitions.get(get(element, 'localName'));
+        const d = lookup(element);
         const s = states.get(element);
         if (d && (!s || s.state === 'undefined' || s.state === 'precustomized')) enqueue(element, {definition:d});
     }
     function upgradeTree(root) {
-        if (!definitions.size) return;
+        if (!definitionCount) return;
         for (const element of elements(root)) tryUpgrade(element);
     }
     function upgrade(element, d) {
@@ -107,10 +158,10 @@ const customElementsBridge = (() => {
         try {
             if(d.disableShadow && get(element,'shadowRoot'))throw fail('This custom element disables shadow roots');
             s.state = 'precustomized';
-            rawDom.face(element,'metadata',d.formAssociated);
-            if (invokeConstructor(d.constructor) !== element) throw new TypeError('Custom element constructor returned a different object');
+            rawDom.face(element,'metadata',d.formAssociated && d.localName===d.name);
+            if (invokeConstructor(d) !== element) throw new TypeError('Custom element constructor returned a different object');
             s.state = 'custom';
-            if(d.formAssociated){faceElements.add(element);refreshFormElement(element);}
+            if(d.formAssociated && d.localName===d.name){faceElements.add(element);refreshFormElement(element);}
         } catch (e) {
             rawDom.face(element,'metadata',false);
             faceElements.delete(element);
@@ -118,11 +169,13 @@ const customElementsBridge = (() => {
             throw e;
         } finally { d.stack.pop(); }
     }
-    function construct(newTarget) {
-        const d = constructors.get(newTarget);
-        if (newTarget === HTMLElement || !d) throw new TypeError('Illegal HTMLElement constructor');
+    function construct(newTarget,base=HTMLElement) {
+        const d = activeDefinitions.get(newTarget) || registryState(registry).constructors.get(newTarget);
+        if (newTarget === base || !d) throw new TypeError('Illegal HTML element constructor');
+        if(d.localName===d.name?base!==HTMLElement:nativeInterface(d.localName)!==base.prototype)
+            throw new TypeError('Custom element definition does not match this HTML interface');
         let prototype = newTarget.prototype;
-        if (!isObject(prototype)) prototype = HTMLElement.prototype;
+        if (!isObject(prototype)) prototype = base.prototype;
         if (d.stack.length) {
             const i = d.stack.length - 1, element = d.stack[i];
             if (element === constructed) throw new TypeError('Custom element is already constructed');
@@ -130,47 +183,57 @@ const customElementsBridge = (() => {
             d.stack[i] = constructed;
             return element;
         }
-        const element = rawDom.create(null, 1, d.name, '');
-        rawDom.face(element,'metadata',d.formAssociated);
+        const element = rawDom.create(null, 1, d.localName, '');
+        setRegistry(element,d.registry);
+        if(d.localName!==d.name)rawDom.customData(element,'is',d.name);
+        rawDom.face(element,'metadata',d.formAssociated && d.localName===d.name);
         Object.setPrototypeOf(element, prototype);
         states.set(element, {state:'custom', definition:d, reactions:[]});
-        if(d.formAssociated)faceElements.add(element);
+        if(d.formAssociated && d.localName===d.name)faceElements.add(element);
         return element;
     }
-    function create(name, options, preserveCase=false) {
+    function create(name, options, preserveCase=false,owner=document) {
         name = string(name); if (!preserveCase) name = lower(name);
-        if (options != null && typeof options === 'object') {
-            if (options.customElementRegistry !== undefined || options.is !== undefined)
-                throw fail('Scoped registries and customized built-in elements are not implemented');
+        if(get(owner,'nodeType')!==9)throw new TypeError('Document receiver required');
+        let value=registryFor(owner),is=null;
+        if(isObject(options)){
+            value=registryOption(options.customElementRegistry,value);
+            const optionIs=options.is;if(optionIs!==undefined)is=string(optionIs);
         }
-        const d = definitions.get(name);
-        if (!d) return rawDom.create(null, 1, name, '');
+        const make=()=>{const element=rawDom.create(owner,1,name,'');setRegistry(element,value);
+            if(is!==null)rawDom.customData(element,'is',is);return element;};
+        const table=value===null?null:registryState(value).definitions;
+        const candidate=table && (table.get(name)||is!==null && table.get(is));
+        const d=candidate && candidate.localName===name && (candidate.name===name || candidate.name===is)?candidate:null;
+        if(!d)return make();
         return reactions(() => {
+            if(d.localName!==d.name){const element=make();try{upgrade(element,d);}catch(e){report(e);}return element;}
             try {
-                const element = invokeConstructor(d.constructor), s = states.get(element);
+                const element = invokeConstructor(d), s = states.get(element);
                 if (!s || s.definition !== d || get(element,'nodeType') !== 1 || get(element,'namespaceURI') !== HTML)
                     throw new TypeError('Constructor did not create an HTMLElement');
-                if (get(element,'localName') !== name || get(element,'parentNode') || children(element).length || get(element,'attributeNames').length)
+                if (get(element,'localName') !== name || get(element,'parentNode') || children(element).length || get(element,'attributeNames').length || get(element,'ownerDocument')!==document)
                     throw fail('Custom element constructor changed its name, parent, children or attributes');
+                if(get(element,'ownerDocument')!==owner)rawDom.adopt(owner,element);
                 return element;
             } catch (e) {
                 report(e);
-                const element = rawDom.create(null, 1, name, '');
+                const element = make();
                 states.set(element, {state:'failed', definition:null, reactions:[]});
                 return element;
             }
         });
     }
     function inserted(root) {
-        if (!definitions.size || !connected(root)) return;
+        if (!definitionCount || !connected(root)) return;
         for (const element of elements(root)) {
             const s = states.get(element);
-            if (s && s.state === 'custom') callback(element, 'connectedCallback');
+            if (s && s.state === 'custom') {parserConnections.delete(element);callback(element, 'connectedCallback');}
             else tryUpgrade(element);
         }
     }
     function removed(root, wasConnected) {
-        if (!wasConnected || !definitions.size) return;
+        if (!wasConnected || !definitionCount) return;
         for (const element of elements(root)) {
             const s = states.get(element);
             if (s && s.state === 'custom') callback(element, 'disconnectedCallback');
@@ -184,7 +247,7 @@ const customElementsBridge = (() => {
     // Snapshot native values only. Page overrides of getters/prototypes cannot
     // make internal tree algorithms operate on a different, invented DOM.
     function before(op, node, key, value, extra) {
-        if (!definitions.size || !node) return null;
+        if (!definitionCount || !node) return null;
         if(op==='adopt' && key && get(key,'nodeType')!==2)
             return {op,node:key,was:connected(key),parent:get(key,'parentNode'),elements:elements(key),oldDocument:get(key,'ownerDocument')};
         const change=attributeBridge.mutation(op,node,key,value,extra);
@@ -244,7 +307,7 @@ const customElementsBridge = (() => {
 
     function internalsInfo(element){
         const s=states.get(element);
-        return s && (s.state==='custom'||s.state==='precustomized') ? s.definition : null;
+        return s && (s.state==='custom'||s.state==='precustomized') && s.definition.localName===s.definition.name ? s.definition : null;
     }
     function refreshFormElement(element){
         const s=states.get(element);if(!s||s.state!=='custom'||!s.definition.formAssociated)return;
@@ -265,18 +328,29 @@ const customElementsBridge = (() => {
         });
     }
     class CustomElementRegistry {
-        constructor(key) { if (key !== registryKey) throw new TypeError('Scoped custom element registries are not implemented'); }
+        constructor(key) {
+            const id=key===registryKey?0:nextRegistry++;
+            registryStates.set(this,{id,scoped:key!==registryKey,definitions:new Map(),constructors:new Map(),pending:new Map(),documents:new Set(),defining:false});
+            registries.set(id,this);
+        }
         define(name, constructor, options={}) {
-            if (this !== registry) throw new TypeError('Illegal invocation');
+            const rs=registryState(this);
             if (arguments.length < 2) throw new TypeError('define requires name and constructor');
             name = string(name);
             return reactions(() => {
                 if (!isConstructor(constructor)) throw new TypeError('Expected constructor');
                 if (!validName(name)) throw fail('Invalid custom element name','SyntaxError');
-                if (definitions.has(name) || constructors.has(constructor)) throw fail('Custom element name or constructor is already defined');
-                if (options != null && options.extends !== undefined) throw fail('Customized built-in elements are not implemented');
-                if (defining) throw fail('Custom element definition is already running');
-                defining = true;
+                if (rs.definitions.has(name) || rs.constructors.has(constructor)) throw fail('Custom element name or constructor is already defined');
+                if(options!=null && !isObject(options))throw new TypeError('ElementDefinitionOptions must be a dictionary');
+                const extension=options==null?undefined:options.extends;
+                let localName=name;
+                if(extension!==undefined){
+                    localName=string(extension);
+                    if(rs.scoped || !/^[a-z][a-z0-9]*$/.test(localName) || validName(localName) || nativeInterface(localName)===HTMLUnknownElement.prototype)
+                        throw fail('Cannot extend this element in this registry');
+                }
+                if (rs.defining) throw fail('Custom element definition is already running');
+                rs.defining = true;
                 let d;
                 try {
                     const prototype = constructor.prototype;
@@ -300,53 +374,118 @@ const customElementsBridge = (() => {
                         if (value !== undefined && typeof value !== 'function') throw new TypeError(key+' must be callable');
                         callbacks[key] = value || null;
                     }
-                    // Definition is not use of ElementInternals. Record the
-                    // declared metadata instead of rejecting the whole bundle
-                    // before its own feature-detected polyfill can be evaluated.
-                    // Native form linkage, values and lifecycle delivery remain
-                    // unavailable; no attachInternals capability is fabricated.
-                    d = {name,constructor,callbacks,observed,stack:[],formAssociated,
+                    d = {name,localName,registry:this,constructor,callbacks,observed,stack:[],formAssociated,
                         disableInternals:disabledFeatures.includes('internals'),disableShadow:disabledFeatures.includes('shadow')};
-                } finally { defining = false; }
-                definitions.set(name,d); constructors.set(constructor,d);
+                } finally { rs.defining = false; }
+                rs.definitions.set(name,d); rs.constructors.set(constructor,d);definitionCount++;
+                if(localName===name)parserNames.add(name);
+                else{let names=parserBuiltins.get(localName);if(!names)parserBuiltins.set(localName,names=new Set());names.add(name);}
                 if(host.domHooks)host.domHooks(0,true);
                 if(d.formAssociated && host.domHooks)host.domHooks(2,true);
-                for (const element of elements(document,name)) tryUpgrade(element);
-                const waiting = pending.get(name);
-                if (waiting) { pending.delete(name); waiting.resolve(constructor); }
+                for(const owner of rs.scoped?rs.documents:[document])
+                    for(const element of elements(owner,localName))if(registryFor(element)===this)tryUpgrade(element);
+                const waiting = rs.pending.get(name);
+                if (waiting) { rs.pending.delete(name); waiting.resolve(constructor); }
             });
         }
         get(name) {
-            if (this !== registry) throw new TypeError('Illegal invocation');
+            const rs=registryState(this);
             if (!arguments.length) throw new TypeError('get requires a name');
-            const d = definitions.get(string(name)); return d ? d.constructor : undefined;
+            const d = rs.definitions.get(string(name)); return d ? d.constructor : undefined;
         }
         getName(constructor) {
-            if (this !== registry || typeof constructor !== 'function') throw new TypeError('Expected constructor');
-            const d = constructors.get(constructor); return d ? d.name : null;
+            const rs=registryState(this);
+            if(typeof constructor !== 'function') throw new TypeError('Expected constructor');
+            const d = rs.constructors.get(constructor); return d ? d.name : null;
         }
         whenDefined(name) {
             try {
-                if (this !== registry || !arguments.length) throw new TypeError('whenDefined requires a name');
+                const rs=registryState(this);
+                if (!arguments.length) throw new TypeError('whenDefined requires a name');
                 name = string(name);
                 if (!validName(name)) throw fail('Invalid custom element name','SyntaxError');
-                const d = definitions.get(name); if (d) return Promise.resolve(d.constructor);
-                if (!pending.has(name)) {
-                    let resolve; const promise = new Promise(r => { resolve = r; }); pending.set(name,{promise,resolve});
+                const d = rs.definitions.get(name); if (d) return Promise.resolve(d.constructor);
+                if (!rs.pending.has(name)) {
+                    let resolve; const promise = new Promise(r => { resolve = r; }); rs.pending.set(name,{promise,resolve});
                 }
-                return pending.get(name).promise;
+                return rs.pending.get(name).promise;
             } catch (e) { return Promise.reject(e); }
         }
         upgrade(root) {
-            if (this !== registry || !root) throw new TypeError('upgrade requires a Node');
+            registryState(this);
+            if (!root) throw new TypeError('upgrade requires a Node');
             get(root,'nodeType');
-            return reactions(() => upgradeTree(root));
+            return reactions(() => {for(const element of elements(root))if(registryFor(element)===this)tryUpgrade(element);});
+        }
+        initialize(root) {
+            const rs=registryState(this);
+            if(!arguments.length)throw new TypeError('initialize requires a Node');
+            const type=get(root,'nodeType'),owner=type===9?root:get(root,'ownerDocument');
+            if(!rs.scoped && (type===9 || registryFor(owner)!==this))throw fail('Global registry cannot initialize this root');
+            return reactions(()=>{
+                if((type===9 || type===11 && get(root,'shadowHost')) && registryFor(root)===null)setRegistry(root,this);
+                function visit(node){
+                    if(get(node,'nodeType')===1){
+                        if(registryFor(node)===null)setRegistry(node,rs.scoped?thisRegistry:registry);
+                        if(registryFor(node)===thisRegistry)tryUpgrade(node);
+                    }
+                    // initialize is inclusive tree order, not shadow-including.
+                    for(const child of children(node))visit(child);
+                }
+                const thisRegistry=this;visit(root);
+            });
         }
     }
     const registry = new CustomElementRegistry(registryKey);
     Object.defineProperty(CustomElementRegistry.prototype, Symbol.toStringTag, {value:'CustomElementRegistry',configurable:true});
     Object.defineProperty(globalThis, 'customElements', {get() { return registry; },enumerable:true,configurable:true});
     Object.defineProperty(globalThis, 'CustomElementRegistry', {value:CustomElementRegistry,writable:true,configurable:true});
-    function allowShadow(element){const d=definitions.get(get(element,'localName'));return !d || !d.disableShadow;}
-    return {construct,create,reactions,inserted,removed,attributeChanged,upgradeTree,before,after,allowShadow,internalsInfo,formRefresh,formReset,active:()=>definitions.size!==0,constructing:()=>constructionDepth>0};
+    Object.defineProperty(Document.prototype,'customElementRegistry',{configurable:true,enumerable:true,get(){
+        if(get(this,'nodeType')!==9)throw new TypeError('Document receiver required');return registryFor(this);
+    }});
+    function parserCreate(element,is=null,synchronous=true){
+        if(is!==null)rawDom.customData(element,'is',string(is));
+        const d=lookup(element);if(!d)return element;
+        if(!synchronous){enqueue(element,{definition:d});return element;}
+        const owner=get(element,'ownerDocument');
+        const queue=[];scopes.push(queue);
+        try{
+            if(d.localName===d.name){
+                // Autonomous synchronous creation is not an upgrade. Construct
+                // a separate native element so a saved constructor `this` and
+                // shadow tree keep their identity even when creation fails.
+                const made=invokeConstructor(d),s=states.get(made);
+                if(!s || s.definition!==d || get(made,'nodeType')!==1 || get(made,'namespaceURI')!==HTML)
+                    throw new TypeError('Constructor did not create an HTMLElement');
+                if(get(made,'localName')!==d.localName || get(made,'parentNode') || children(made).length || get(made,'attributeNames').length || get(made,'ownerDocument')!==document)
+                    throw fail('Parser custom element constructor changed its parent, children, attributes or document');
+                if(owner!==document)rawDom.adopt(owner,made);
+                element=made;
+            }else upgrade(element,d);
+            const s=stateFor(element);s.parserAttributesPending=true;parserConnections.add(element);
+            return element;
+        }catch(error){
+            const s=stateFor(element);s.state='failed';s.definition=null;s.reactions.length=0;
+            faceElements.delete(element);rawDom.face(element,'metadata',false);
+            report(error);return element;
+        }finally{scopes.pop();invoke(queue);}
+    }
+    function parserFinish(element){
+        const s=states.get(element);if(!s || s.state!=='custom' || !s.parserAttributesPending)return element;
+        s.parserAttributesPending=false;
+        reactions(()=>{for(const a of rawDom.attrList(element))callback(element,'attributeChangedCallback',
+            [get(a,'localName'),null,get(a,'attrValue'),get(a,'namespaceURI')]);});
+        return element;
+    }
+    function parserInserted(){
+        reactions(()=>{for(const element of parserConnections){
+            if(!connected(element))continue;
+            parserConnections.delete(element);callback(element,'connectedCallback');refreshFormElement(element);
+        }});
+    }
+    function parserCandidate(name,is=null){return parserNames.has(name) || is!==null && !!parserBuiltins.get(name)?.has(is);}
+    function allowShadow(element){const d=lookup(element);return !d || !d.disableShadow;}
+    return {construct,create,reactions,inserted,removed,attributeChanged,upgradeTree,before,after,allowShadow,internalsInfo,
+        formRefresh,formReset,registryFor,registryOption,setRegistry,parserCreate,parserFinish,parserInserted,parserCandidate,
+        active:()=>definitionCount!==0,constructing:()=>constructionDepth>0};
 })();

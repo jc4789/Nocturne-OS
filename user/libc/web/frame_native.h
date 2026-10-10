@@ -173,7 +173,11 @@ static void frame_response(struct web_js_state *s,struct js_pending *p,bool ok) 
     const char *url=web_response_url(&p->response)[0]?web_response_url(&p->response):p->url;
     if(ok && permitted_url(s,url,false) && frame_response_allowed(s,&p->response,url) &&
        web_sandbox_document_allowed(f,url,false)) {
-        if(web_frame_commit(f,p->response.body,p->response.body_len,url,NULL,&s->host,false))return;
+        char charset[64]={0},content_type[256]={0};
+        struct http_resp response_headers={.headers_full=(char *)web_response_headers(&p->response)};
+        http_header(&response_headers,"Content-Type",content_type,sizeof content_type);
+        html_transport_label(content_type,charset,sizeof charset);
+        if(web_frame_commit_response(f,p->response.body,p->response.body_len,url,charset,web_response_headers(&p->response),&s->host,false))return;
         log_text(s,2,"Frame document allocation failed");
     }else log_text(s,1,"Frame document navigation failed or was blocked by its embedding policy");
     f->failed=true;f->notified=true;script_event(s,f->element,true);
@@ -561,12 +565,16 @@ static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int a
     if(argc && JS_ToInt32(ctx,&operation,argv[0]))return JS_EXCEPTION;
     if(s->disabled || !s->doc->live)return JS_ThrowTypeError(ctx,"Document stream belongs to an inactive browsing context");
     if((sandbox_authority(s)&SB_SCRIPTS) || sandbox_borrowed(s))return history_security_error(ctx,"Sandbox denied document stream authority");
-    if(!s->doc->frame_parent)return JS_ThrowTypeError(ctx,"Explicit document.open streams are currently supported in child browsing contexts");
+    if(s->dynamic_markup_counter){
+        JSValue message=JS_NewString(ctx,"A custom element constructor cannot open its parser document");
+        JSValue error=custom_element_hook(s,"invalidStateError",1,&message);JS_FreeValue(ctx,message);
+        return JS_IsException(error)?error:JS_Throw(ctx,error);
+    }
     if(operation==0){
         // Parser-executed scripts cannot replace their active input stream.
-        if(s->parser_write)return wrap(s,s->doc->root);
-        struct web_frame *f=web_frame_find(s->doc->frame_parent,s->doc->frame_element);
-        if(!f || f->document!=s->doc || f->detached)return JS_ThrowTypeError(ctx,"Document is not the active frame document");
+        if(s->parser_write || (s->doc->parser && s->doc->parser->callback_depth))return wrap(s,s->doc->root);
+        struct web_frame *f=s->doc->frame_parent?web_frame_find(s->doc->frame_parent,s->doc->frame_element):NULL;
+        if(s->doc->frame_parent && (!f || f->document!=s->doc || f->detached))return JS_ThrowTypeError(ctx,"Document is not the active frame document");
         JSValue reset=JS_GetPropertyStr(ctx,s->hooks,"documentOpenReset"),root=wrap(s,s->doc->root);
         JSValue cleared=JS_IsException(reset)||JS_IsException(root)?JS_EXCEPTION:JS_Call(ctx,reset,s->hooks,1,&root);
         JS_FreeValue(ctx,reset);JS_FreeValue(ctx,root);
@@ -580,7 +588,7 @@ static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int a
         s->document_open=s->document_waiting=true;
         // A new stream has its own child/embedding-element load lifecycle,
         // although the Document and WindowProxy objects themselves are reused.
-        f->notified=false;f->failed=false;s->doc->frame_parent->dirty=true;
+        if(f){f->notified=false;f->failed=false;s->doc->frame_parent->dirty=true;}
         return wrap(s,s->doc->root);
     }
     if(operation==1 && s->document_open){
@@ -608,4 +616,27 @@ static bool frame_stream_pump(struct web_js_state *s) {
         }
     }
     return true;
+}
+/* Synchronous document.write may execute only scripts reached in the newly
+   inserted spans. Never consume the suspended network suffix, dispatch a
+   timer, or pump the general event loop while the outer author call is live. */
+static bool parser_write_pump(struct web_js_state *s,void *boundary) {
+    struct html_parser *parser=s->doc->parser;
+    struct js_script *outer=s->blocker;
+    while(parser && s->doc->parser==parser && !s->disabled){
+        node_t *node=NULL;int result=html_resume_written(parser,&node,boundary);
+        if(result<0 || html_import_changed(parser))s->doc->dirty=s->doc->resources_dirty=true;
+        if(result<0)return false;
+        if(result==2 || !result)break;
+        if(node && node->tag==T_script){
+            struct js_script *script=queue_script(s,node,false);
+            if(script && !script->deferred && !script->asynchronous){
+                if(!script->ready){s->blocker=script;return true;}
+                s->blocker=script;run_script(s,script);
+                if(s->blocker==script)s->blocker=outer;
+                else return true; /* a nested external script remains blocked */
+            }
+        }
+    }
+    return !s->disabled;
 }

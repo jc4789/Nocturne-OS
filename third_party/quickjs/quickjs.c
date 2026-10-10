@@ -574,6 +574,8 @@ struct JSContext {
                              const char *input, size_t input_len,
                              const char *filename, int flags, int scope_idx);
     void *user_opaque;
+    JSDynamicCodeCheck *dynamic_code_check;
+    void *dynamic_code_opaque;
 };
 
 typedef union JSFloat64Union {
@@ -2747,6 +2749,12 @@ void *JS_GetContextOpaque(JSContext *ctx)
 void JS_SetContextOpaque(JSContext *ctx, void *opaque)
 {
     ctx->user_opaque = opaque;
+}
+
+void JS_SetDynamicCodeCheck(JSContext *ctx, JSDynamicCodeCheck *check, void *opaque)
+{
+    ctx->dynamic_code_check = check;
+    ctx->dynamic_code_opaque = opaque;
 }
 
 /* set the new value and free the old value after (freeing the value
@@ -37741,16 +37749,30 @@ static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
                              JSValueConst val, int flags, int scope_idx)
 {
     JSValue ret;
+    JSValue checked = JS_UNDEFINED;
     const char *str;
     size_t len;
 
-    if (!JS_IsString(val))
-        return JS_DupValue(ctx, val);
+    if (ctx->dynamic_code_check) {
+        checked = ctx->dynamic_code_check(ctx, val, JS_DYNAMIC_EVAL, 0, NULL,
+                                         ctx->dynamic_code_opaque);
+        if (JS_IsException(checked))
+            return checked;
+        val = checked;
+    }
+    if (!JS_IsString(val)) {
+        ret = JS_DupValue(ctx, val);
+        JS_FreeValue(ctx, checked);
+        return ret;
+    }
     str = JS_ToCStringLen(ctx, &len, val);
-    if (!str)
+    if (!str) {
+        JS_FreeValue(ctx, checked);
         return JS_EXCEPTION;
+    }
     ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", flags, scope_idx);
     JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, checked);
     return ret;
 }
 
@@ -41497,7 +41519,7 @@ static JSValue js_function_constructor(JSContext *ctx, JSValueConst new_target,
 {
     JSFunctionKindEnum func_kind = magic;
     int i, n, ret;
-    JSValue s, proto, obj = JS_UNDEFINED;
+    JSValue s, proto, part, obj = JS_UNDEFINED;
     StringBuffer b_s, *b = &b_s;
 
     string_buffer_init(ctx, b, 0);
@@ -41518,12 +41540,28 @@ static JSValue js_function_constructor(JSContext *ctx, JSValueConst new_target,
         if (i != 0) {
             string_buffer_putc8(b, ',');
         }
-        if (string_buffer_concat_value(b, argv[i]))
+        part = ctx->dynamic_code_check ?
+            ctx->dynamic_code_check(ctx, argv[i], JS_DYNAMIC_FUNCTION_ARGUMENT,
+                                    0, NULL, ctx->dynamic_code_opaque) :
+            JS_DupValue(ctx, argv[i]);
+        if (JS_IsException(part))
+            goto fail;
+        ret = string_buffer_concat_value(b, part);
+        JS_FreeValue(ctx, part);
+        if (ret)
             goto fail;
     }
     string_buffer_puts8(b, "\n) {\n");
     if (n >= 0) {
-        if (string_buffer_concat_value(b, argv[n]))
+        part = ctx->dynamic_code_check ?
+            ctx->dynamic_code_check(ctx, argv[n], JS_DYNAMIC_FUNCTION_ARGUMENT,
+                                    0, NULL, ctx->dynamic_code_opaque) :
+            JS_DupValue(ctx, argv[n]);
+        if (JS_IsException(part))
+            goto fail;
+        ret = string_buffer_concat_value(b, part);
+        JS_FreeValue(ctx, part);
+        if (ret)
             goto fail;
     }
     string_buffer_puts8(b, "\n})");
@@ -41531,7 +41569,27 @@ static JSValue js_function_constructor(JSContext *ctx, JSValueConst new_target,
     if (JS_IsException(s))
         goto fail1;
 
-    obj = JS_EvalObject(ctx, ctx->global_obj, s, JS_EVAL_TYPE_INDIRECT, -1);
+    if (ctx->dynamic_code_check) {
+        JSValue checked = ctx->dynamic_code_check(ctx, s, JS_DYNAMIC_FUNCTION, argc, argv,
+                                                 ctx->dynamic_code_opaque);
+        JS_FreeValue(ctx, s);
+        s = checked;
+        if (JS_IsException(s))
+            goto fail1;
+    }
+    /* Already checked as Function, not eval. Avoid a second default-policy
+       invocation and leave the normal constructor/new_target path intact. */
+    {
+        size_t len;
+        const char *source = JS_ToCStringLen(ctx, &len, s);
+        if (!source) {
+            JS_FreeValue(ctx, s);
+            goto fail1;
+        }
+        obj = JS_EvalInternal(ctx, ctx->global_obj, source, len, "<input>",
+                              JS_EVAL_TYPE_INDIRECT, -1);
+        JS_FreeCString(ctx, source);
+    }
     JS_FreeValue(ctx, s);
     if (JS_IsException(obj))
         goto fail1;

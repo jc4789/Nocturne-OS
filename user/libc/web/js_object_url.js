@@ -15,7 +15,8 @@ const objectURLBridge = (() => {
         const size=blob?apply(blobSize,value,[]):0;
         if(count>=256||size>LIMIT-bytes)throw new DOMException('Object URL quota exceeded','QuotaExceededError');
         let id;do{const data=new Uint8Array(16);apply(random,cryptoObject,[data]);id='';for(let i=0;i<data.length;i++)id+=apply(pad,apply(hex,data[i],[16]),[2,'0']);id='blob:'+origin+'/'+id;}while(lookup(id));
-        apply(put,urls,[id,{value,size,blob}]);bytes+=size;count++;return id;
+        const policyHeaders=host.safety('policyHeaders',null);
+        apply(put,urls,[id,{value,size,blob,policyHeaders}]);bytes+=size;count++;return id;
     }
     function revokeObjectURL(value){const id=key(value),entry=apply(get,urls,[id]);if(entry){apply(remove,urls,[id]);bytes-=entry.size;count--;}}
     define(URLType,'createObjectURL',{value:createObjectURL,writable:true,configurable:true,enumerable:true});
@@ -24,6 +25,7 @@ const objectURLBridge = (() => {
         registerMediaSource(fn){mediaBrand=fn;},
         mediaSource(value){const entry=lookup(value);return entry&&!entry.blob?entry.value:null;},
         blob(value){const entry=lookup(value);return entry&&entry.blob?entry.value:null;},
+        policy(value){const entry=lookup(value);return entry&&entry.blob?entry.policyHeaders:null;},
         fetch(value,method,range=null){
             const entry=lookup(value);if(!entry||!entry.blob||method!=='GET'&&method!=='HEAD')throw new TypeError('Blob URL is revoked, unavailable, or not fetchable');
             const type=blobBridge.type(entry.value);let first=0,last=entry.size-1,status=200;
