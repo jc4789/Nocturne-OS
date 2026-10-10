@@ -13,6 +13,59 @@ static int parse(struct cssom_sheet *s, const char *text, size_t length, const c
     s->ast = css_parse_sheet(&s->arena, s->source, length, s->base, 0, NULL);
     s->arena.trap = NULL; return CSSOM_OK;
 }
+static void invalidate(web_doc *d) {
+    css_styling_free(&d->sty);
+    d->resources_dirty = d->dirty = d->need_style = true;
+    d->layout_valid = false;
+}
+void cssom_changed(struct cssom_sheet *s) {
+    if (s->constructed) invalidate(s->document);
+    else if (s->associated && s->owner->cssom_current == s && s->owner->owner == s->document)
+        invalidate(s->document);
+}
+struct cssom_sheet *cssom_construct(web_doc *d, int *error) {
+    *error = CSSOM_OK;
+    node_t *owner = d->root;
+    if (owner->cssom_serial == UINT32_MAX) { *error = CSSOM_OOM; return NULL; }
+    struct cssom_sheet *s = calloc(1, sizeof *s);
+    if (!s) { *error = CSSOM_OOM; return NULL; }
+    *error = parse(s, "", 0, d->base);
+    if (*error) { discard_parse(s); free(s); return NULL; }
+    s->document = d; s->owner = owner; s->id = ++owner->cssom_serial;
+    s->constructed = s->origin_clean = true;
+    s->next = owner->cssom_sheets; owner->cssom_sheets = s;
+    return s;
+}
+int cssom_adopt(node_t *root, struct cssom_sheet **sheets, uint32_t count) {
+    for (uint32_t i = 0; i < count; i++)
+        if (!sheets[i] || !sheets[i]->constructed || sheets[i]->document != root->owner) return CSSOM_NOT_ALLOWED;
+    struct cssom_sheet **copy = count ? malloc((size_t)count * sizeof *copy) : NULL;
+    if (count && !copy) return CSSOM_OOM;
+    if (count) memcpy(copy, sheets, (size_t)count * sizeof *copy);
+    free(root->adopted_sheets); root->adopted_sheets = copy; root->adopted_count = count;
+    invalidate(root->owner); return CSSOM_OK;
+}
+int cssom_replace_sync(struct cssom_sheet *s, const char *text, size_t length) {
+    if (!s || !s->constructed) return CSSOM_NOT_ALLOWED;
+    struct cssom_sheet fresh = {0};
+    int error = parse(&fresh, text, length, s->base);
+    if (error) { discard_parse(&fresh); return error; }
+    /* Constructed sheets never fetch @import; drop these rules from the AST
+       and source via a second parse, preserving all other parsed rules. */
+    sbuf source = {0};
+    for (struct css_rule_info *r = css_sheet_rules(fresh.ast, NULL); r; r = r->next)
+        if (r->type != 3) { sb_puts(&source, r->text); sb_putc(&source, '\n'); }
+    discard_parse(&fresh); memset(&fresh, 0, sizeof fresh);
+    error = parse(&fresh, sb_cstr(&source), source.n, s->base); sb_free(&source);
+    if (error) { discard_parse(&fresh); return error; }
+    uint32_t count; css_sheet_rules(fresh.ast, &count);
+    if (count > UINT32_MAX - s->next_rule_id) { discard_parse(&fresh); return CSSOM_OOM; }
+    for (struct css_rule_info *r = css_sheet_rules(fresh.ast, NULL); r; r = r->next) r->id = ++s->next_rule_id;
+    cssom_changed(s); /* unpublish borrowed AST pointers before releasing */
+    discard_parse(s); s->arena = fresh.arena; s->ast = fresh.ast;
+    s->source = fresh.source; s->base = fresh.base; s->length = fresh.length;
+    return CSSOM_OK;
+}
 static bool active(web_doc *d, node_t *n) {
     return d && n && n->owner == d && n->type == N_ELEM && !n->foreign && (n->tag == T_style || n->tag == T_link) &&
         d->live && !d->inert && doc_node_root(n, true) == d->root && !node_ancestor(n,T_template);
@@ -192,10 +245,7 @@ static int replace(struct cssom_sheet *s, const char *text, size_t length, uint3
         }
         /* Unpublish all index/wrapper pointers before freeing the old AST.
            The next native layout/task scan builds from the new real AST. */
-        if (s->associated && s->owner->cssom_current==s && s->owner->owner==s->document) {
-            css_styling_free(&s->document->sty);
-            s->document->resources_dirty=s->document->dirty=s->document->need_style=true;
-        }
+        cssom_changed(s);
         discard_parse(s); s->arena=candidate->arena; s->ast=candidate->ast;
         s->source=candidate->source; s->base=candidate->base; s->length=candidate->length;
         if (insertion) s->next_rule_id++;
@@ -230,10 +280,11 @@ void cssom_style_lifecycle(node_t *root) {
     }
 }
 void cssom_style_free(node_t *n) {
+    free(n->adopted_sheets); n->adopted_sheets = NULL; n->adopted_count = 0;
     for (struct cssom_sheet *s=n->cssom_sheets;s;) {
         struct cssom_sheet *next=s->next;
         for(struct css_rule_info*r=s->removed;r;){struct css_rule_info*next_rule=r->next;free((void*)r->text);free((void*)r->selector);free(r);r=next_rule;}
-        discard_parse(s);free(s->dom_source);free(s->dom_href);free(s->href);free(s);s=next;
+        discard_parse(s);free(s->media);free(s->dom_source);free(s->dom_href);free(s->href);free(s);s=next;
     }
     n->cssom_sheets=n->cssom_current=NULL;
 }

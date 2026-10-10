@@ -446,6 +446,17 @@ static int interrupt(JSRuntime *rt, void *opaque) {
     if (s->running && uptime_ms() >= s->task_deadline) { s->timed_out = true; s->task_timed_out = true; s->disabled = true; return 1; }
     return 0;
 }
+bool web_native_checkpoint(web_doc *d) {
+    if (!d) return true;
+    if (d->native_cancelled) return false;
+    if ((++d->native_checkpoint_count & 63u) != 0) return true;
+    struct web_js_state *s = d->js;
+    if (!s || s->starting) return true;
+    bool stopped = s->running && !s->disabled ? interrupt(s->rt, s) != 0 :
+        s->host.script_checkpoint && !s->host.script_checkpoint(s->host.opaque);
+    if (stopped) { d->native_cancelled = true; s->disabled = true; return false; }
+    return true;
+}
 static void begin_task(struct web_js_state *s) {
     if (!s->running) {
         /* A nested child-realm call must not move the shared stack guard past
@@ -472,6 +483,7 @@ static void begin_named_task(struct web_js_state *s,const char *name,uint64_t id
     if(s->running==1){s->diagnostic_task=name;s->diagnostic_task_id=id;}
 }
 static void end_task(struct web_js_state *s) {
+    doc_shadow_flush(s->doc);
     if (s->running == 1 && !s->disabled) {
         signal_slots(s);
         JSContext *ctx;
@@ -2038,6 +2050,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     } else if (!strcmp(op, "slotChanges")) {
         web_doc *family = s->doc->dom_family ? s->doc->dom_family : s->doc;
         result = JS_NewArray(ctx); uint32_t index = 0;
+        doc_shadow_flush(d);
         while (!JS_IsException(result) && family->shadow_slots_first) {
             node_t *slot = family->shadow_slots_first;
             JSValue object = wrap(s, slot);
@@ -4971,7 +4984,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
     }
     if (s->parsing_done && !s->disabled) dynamic_scripts(s, d->root);
     web_doc *family = d->dom_family ? d->dom_family : d;
-    if (!s->disabled && !ran && family->shadow_slots_pending) {
+    if (!s->disabled && !ran && (family->shadow_slots_pending || family->shadow_dirty_first)) {
         /* Native/parser assignment changes also queue the mutation checkpoint,
            even when there is no timer or script task to drive it. */
         begin_task(s); end_task(s); ran = true;

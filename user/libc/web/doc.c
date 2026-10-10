@@ -538,6 +538,7 @@ static void link_stylesheet_complete(web_doc *d, node_t *n, bool failed) {
 }
 static void scan(web_doc *d, node_t *n, node_t *scope) {
     for (node_t *c = n->first; c; c = c->next) {
+        if (!web_native_checkpoint(d)) return;
         if (c->type != N_ELEM) continue;
         if (c->foreign) {
             scan(d, c, scope);
@@ -693,6 +694,15 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             if (c->shadow_root) scan(d, c->shadow_root, c->shadow_root);
         }
     }
+    /* Adopted sheets follow tree-owned sheets in this scope. Their persistent
+       native AST is instantiated, never reparsed for each component root. */
+    if (n == d->root || n->shadow_host) {
+        for (uint32_t i = 0; i < n->adopted_count; i++) {
+            struct cssom_sheet *s = n->adopted_sheets[i];
+            if (!s->disabled) add_sheet_ast(d, s->source, s->length, s->base,
+                d->next_sheet_order++, s->media, scope, s->ast);
+        }
+    }
 }
 
 /* ---------------------------------------------------------------- documents */
@@ -821,6 +831,7 @@ void doc_sync_tree(web_doc *d) {
 }
 
 void doc_rescan(web_doc *d) {
+    if (d && d->native_cancelled) return;
     if (d && d->inert && d->resources_dirty) {
         d->resources_dirty = false; d->html = d->head = d->body = NULL;
         snprintf(d->base, sizeof d->base, "%s", d->url);
@@ -1232,10 +1243,13 @@ static void clear_intrinsic(box_t *b) {
 }
 
 int web_layout(web_doc *d, int width, int height) {
+    if (d->native_cancelled) return d->doc_h;
+    doc_shadow_flush(d);
     if (width < 1) width = 1;
     if (height < 1) height = 1;
     web_dialog_sync(d);
     if (d->resources_dirty || d->images_dirty) doc_rescan(d);
+    if (d->native_cancelled) goto cancelled;
     /* Geometry reads may flush layout repeatedly within one script. Reuse the
        result until DOM/style, viewport, or image intrinsic dimensions change. */
     if (d->layout_valid && !d->need_style && !d->need_boxes && d->root_box &&
@@ -1250,10 +1264,12 @@ int web_layout(web_doc *d, int width, int height) {
     if (d->need_style || d->styled_w != width || d->styled_h != height || !d->root_box) {
         boxes_discard(d); /* no box may retain a soon-to-be-freed computed style */
         css_cascade(d, width, height);
+        if (d->native_cancelled) goto cancelled;
         if (d->root) register_bg(d, d->root);
         d->bmem.trap=d->smem.trap;
         boxes_build(d, &d->bmem);
         d->bmem.trap=NULL;
+        if (d->native_cancelled) goto cancelled;
         d->need_style = false;
         d->need_boxes = false;
     } else if(d->need_boxes) {
@@ -1263,14 +1279,22 @@ int web_layout(web_doc *d, int width, int height) {
         d->bmem.trap=d->smem.trap;
         boxes_build(d,&d->bmem);
         d->bmem.trap=NULL;
+        if (d->native_cancelled) goto cancelled;
         d->need_boxes=false;
     } else if (d->root_box) clear_intrinsic(d->root_box);
     d->width = width;
     d->height = height;
     layout_doc(d, width, height);
+    if (d->native_cancelled) goto cancelled;
     d->layout_revision++;
     d->layout_valid = true;
     if (d->find_text && *d->find_text && !d->find_revealing) web_find(d, d->find_text, 0);
+    return d->doc_h;
+cancelled:
+    /* Never paint/hit-test a half-built tree or label it a valid layout. */
+    d->bmem.trap = NULL;
+    boxes_discard(d);
+    d->layout_valid = false; d->dirty = false;
     return d->doc_h;
 }
 

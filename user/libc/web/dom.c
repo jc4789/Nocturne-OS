@@ -98,74 +98,125 @@ static node_t *first_named_slot(node_t *root, const char *name) {
     return NULL;
 }
 node_t *doc_assigned_slot(node_t *n, bool open_only) {
+    if (n && n->owner) doc_shadow_flush(n->owner);
     if (!slottable(n) || !n->parent || !n->parent->shadow_root) return NULL;
     node_t *root = n->parent->shadow_root;
     if (open_only && root->shadow_closed) return NULL;
-    if (root->shadow_manual) {
-        node_t *slot = n->manual_slot;
-        return slot && doc_node_root(slot, false) == root ? slot : NULL;
-    }
-    return first_named_slot(root, slot_name(n, false));
+    return n->assigned_slot;
 }
 /* Keep assignment snapshots as intrusive native lists, without arena churn or
    a parallel JS DOM. All comparisons happen before rewriting any next link. */
-static node_t *allocation_next(web_doc *family, web_doc **allocation, node_t *n) {
-    if (n && n->owned_next) return n->owned_next;
-    do {
-        *allocation = *allocation == family ? family->dom_docs : (*allocation)->dom_next;
-    } while (*allocation && !(*allocation)->owned_nodes);
-    return *allocation ? (*allocation)->owned_nodes : NULL;
-}
-static node_t *slot_candidate(node_t *slot, node_t *after) {
-    node_t *root = doc_node_root(slot, false);
-    if (!root || !root->shadow_host) return NULL;
-    if (root->shadow_manual) {
-        for (node_t *n = after ? after->manual_next : slot->slot_manual_first; n; n = n->manual_next)
-            if (n->parent == root->shadow_host) return n;
-    } else {
-        for (node_t *n = after ? after->next : root->shadow_host->first; n; n = n->next)
-            if (doc_assigned_slot(n, false) == slot) return n;
-    }
-    return NULL;
-}
 static void compare_slot(node_t *slot) {
-    node_t *old = slot->slot_assigned_first, *wanted = slot_candidate(slot, NULL);
-    while (old && wanted && old == wanted) { old = old->assigned_next; wanted = slot_candidate(slot, wanted); }
+    node_t *old = slot->slot_assigned_first, *wanted = slot->slot_wanted_first;
+    while (old && wanted && old == wanted) { old = old->assigned_next; wanted = wanted->pending_assigned_next; }
     if (old || wanted) doc_slot_signal(slot);
+}
+static size_t slot_hash(const char *name) {
+    size_t hash = 2166136261u;
+    for (; *name; name++) hash = (hash ^ (unsigned char)*name) * 16777619u;
+    return hash;
+}
+static void wanted_append(node_t *slot, node_t *n) {
+    n->pending_assigned_slot = slot; n->pending_assigned_next = NULL;
+    if (slot->slot_wanted_last) slot->slot_wanted_last->pending_assigned_next = n;
+    else slot->slot_wanted_first = n;
+    slot->slot_wanted_last = n;
+}
+static bool shadow_wanted(node_t *root, web_doc *family) {
+    size_t slots = 0, capacity = 1;
+    for (node_t *s = root->first; s; s = tree_next(s, root, false, false, true)) {
+        family->profile.shadow_visits++;
+        if (!web_native_checkpoint(root->owner)) return false;
+        if (is_slot(s)) { slots++; s->slot_wanted_first = s->slot_wanted_last = NULL; }
+    }
+    while (capacity <= slots && capacity <= SIZE_MAX / 2 / sizeof(node_t *)) capacity *= 2;
+    node_t **names = slots && !root->shadow_manual ? calloc(capacity, sizeof *names) : NULL;
+    for (node_t *s = root->first; s; s = tree_next(s, root, false, false, true)) if (is_slot(s)) {
+        if (root->shadow_manual) {
+            for (node_t *n = s->slot_manual_first; n; n = n->manual_next)
+                if (n->parent == root->shadow_host) wanted_append(s, n);
+        } else if (names) {
+            size_t at = slot_hash(slot_name(s, true)) & (capacity - 1);
+            while (names[at] && strcmp(slot_name(names[at], true), slot_name(s, true))) at = (at + 1) & (capacity - 1);
+            if (!names[at]) names[at] = s; /* first slot in native tree order */
+        }
+    }
+    if (!root->shadow_manual && slots) for (node_t *n = root->shadow_host->first; n; n = n->next) {
+        family->profile.shadow_visits++;
+        if (!web_native_checkpoint(root->owner)) { free(names); return false; }
+        if (!slottable(n)) continue;
+        node_t *s;
+        if (names) {
+            const char *name = slot_name(n, false); size_t at = slot_hash(name) & (capacity - 1);
+            while (names[at] && strcmp(slot_name(names[at], true), name)) at = (at + 1) & (capacity - 1);
+            s = names[at];
+        } else s = first_named_slot(root, slot_name(n, false)); /* allocation failure: local fallback */
+        if (s) wanted_append(s, n);
+    }
+    free(names); return true;
 }
 static void compare_shadow_slots(node_t *root) {
     for (node_t *n = root->first; n; n = tree_next(n, root, false, false, true)) {
         if (is_slot(n)) compare_slot(n);
     }
 }
-void doc_shadow_reassign(web_doc *d) {
+void doc_shadow_dirty(node_t *root) {
+    if (!root || !root->shadow_host || root->shadow_dirty) return;
+    web_doc *d = root->owner, *family = d->dom_family ? d->dom_family : d;
+    root->shadow_dirty = true; root->shadow_dirty_next = NULL;
+    if (family->shadow_dirty_last) family->shadow_dirty_last->shadow_dirty_next = root;
+    else family->shadow_dirty_first = root;
+    family->shadow_dirty_last = root;
+}
+void doc_shadow_flush(web_doc *d) {
     if (!d) return;
     web_doc *family = d->dom_family ? d->dom_family : d;
-    if (!family->has_shadow) return;
-    family->profile.shadow_reassigns++;
-    web_doc *allocation = family;
-    node_t *n = family->owned_nodes;
-    if (!n) n = allocation_next(family, &allocation, NULL);
-    for (; n; n = allocation_next(family, &allocation, n)) {
-        if (n->shadow_host) compare_shadow_slots(n); /* standard tree-order signals, not allocation order */
-        else if (is_slot(n) && !doc_node_root(n, false)->shadow_host) compare_slot(n);
+    if (family->shadow_flushing || !family->shadow_dirty_first) return;
+    family->shadow_flushing = true;
+    for (node_t *r = family->shadow_dirty_first; r; r = r->shadow_dirty_next)
+        if (!shadow_wanted(r, family)) { family->shadow_flushing = false; return; }
+    /* Compare every affected root before touching shared assignment links.
+       A slot can move between two roots in the same transaction. */
+    for (node_t *r = family->shadow_dirty_first; r; r = r->shadow_dirty_next) {
+        family->profile.shadow_reassigns++;
+        compare_shadow_slots(r);
+        for (node_t *s = r->shadow_slots; s; s = s->shadow_slot_next)
+            if (!doc_node_root(s, false)->shadow_host) {
+                s->slot_wanted_first = s->slot_wanted_last = NULL; compare_slot(s);
+            }
     }
-    allocation = family; n = family->owned_nodes;
-    if (!n) n = allocation_next(family, &allocation, NULL);
-    for (; n; n = allocation_next(family, &allocation, n)) {
-        n->assigned_slot = n->assigned_next = NULL;
-        n->slot_assigned_first = n->slot_assigned_last = NULL;
-    }
-    allocation = family; n = family->owned_nodes;
-    if (!n) n = allocation_next(family, &allocation, NULL);
-    for (; n; n = allocation_next(family, &allocation, n)) if (is_slot(n)) {
-        for (node_t *c = slot_candidate(n, NULL); c; c = slot_candidate(n, c)) {
-            c->assigned_slot = n;
-            if (n->slot_assigned_last) n->slot_assigned_last->assigned_next = c;
-            else n->slot_assigned_first = c;
-            n->slot_assigned_last = c;
+    for (node_t *r = family->shadow_dirty_first; r; r = r->shadow_dirty_next) {
+        for (node_t *s = r->shadow_slots; s; s = s->shadow_slot_next) {
+            for (node_t *c = s->slot_assigned_first, *next; c; c = next) {
+                next = c->assigned_next; c->assigned_slot = c->assigned_next = NULL;
+            }
+            s->slot_assigned_first = s->slot_assigned_last = NULL;
         }
     }
+    /* Old root lists are no longer needed after the clear phase. */
+    for (node_t *r = family->shadow_dirty_first; r; r = r->shadow_dirty_next) r->shadow_slots = NULL;
+    for (node_t *r = family->shadow_dirty_first, *next; r; r = next) {
+        next = r->shadow_dirty_next;
+        node_t **tail = &r->shadow_slots;
+        for (node_t *s = r->first; s; s = tree_next(s, r, false, false, true)) if (is_slot(s)) {
+            *tail = s; tail = &s->shadow_slot_next;
+            for (node_t *c = s->slot_wanted_first; c; c = c->pending_assigned_next) {
+                c->assigned_slot = s;
+                if (s->slot_assigned_last) s->slot_assigned_last->assigned_next = c;
+                else s->slot_assigned_first = c;
+                s->slot_assigned_last = c;
+            }
+        }
+        *tail = NULL; r->shadow_dirty = false; r->shadow_dirty_next = NULL;
+    }
+    family->shadow_dirty_first = family->shadow_dirty_last = NULL;
+    family->shadow_flushing = false;
+}
+void doc_shadow_reassign(web_doc *d) {
+    /* Parser-only complete-tree notification; mutations queue exact roots. */
+    if (!d || !(d->dom_family ? d->dom_family : d)->has_shadow) return;
+    for (node_t *n = d->root; n; n = tree_next(n, d->root, true, true, true))
+        if (n->shadow_host) doc_shadow_dirty(n);
 }
 bool doc_shadow_host_valid(const node_t *n) {
     if (!n || n->type != N_ELEM || n->foreign || n->namespace_id != NS_HTML) return false;
@@ -196,7 +247,7 @@ node_t *doc_shadow_attach(web_doc *d, node_t *host, bool closed, bool delegates_
     root->shadow_clonable = clonable; root->shadow_serializable = serializable; root->shadow_manual = manual;
     (d->dom_family ? d->dom_family : d)->has_shadow = true;
     doc_mutated(d, host);
-    doc_shadow_reassign(d);
+    doc_shadow_dirty(root);
     return root;
 }
 static void manual_unlink(node_t *n) {
@@ -220,13 +271,14 @@ bool doc_slot_assign(node_t *slot, node_t **nodes, int count) {
     for (int i = 0; i < count; i++) {
         node_t *n = nodes[i];
         if (n->manual_slot == slot) continue; /* ordered-set duplicate */
+        if (n->manual_slot) doc_shadow_dirty(doc_node_root(n->manual_slot, false));
         manual_unlink(n);
         n->manual_slot = slot;
         if (slot->slot_manual_last) slot->slot_manual_last->manual_next = n; else slot->slot_manual_first = n;
         slot->slot_manual_last = n;
     }
     doc_mutated(slot->owner, slot);
-    doc_shadow_reassign(slot->owner);
+    doc_shadow_dirty(doc_node_root(slot, false));
     return true;
 }
 struct slot_walk { node_t *slot, *next; bool assigned; };
@@ -235,6 +287,7 @@ static struct slot_walk slot_walk_start(node_t *slot, bool flatten) {
     return (struct slot_walk){slot, first ? first : flatten ? slot->first : NULL, first != NULL};
 }
 bool doc_slot_nodes(node_t *slot, bool flatten, pvec *out) {
+    if (slot && slot->owner) doc_shadow_flush(slot->owner);
     if (!out || !is_slot(slot)) return true;
     node_t *root = doc_node_root(slot, false);
     if (!root || !root->shadow_host) return true;
@@ -283,6 +336,7 @@ bool doc_slot_nodes(node_t *slot, bool flatten, pvec *out) {
 }
 void doc_flat_children(node_t *n, pvec *out) {
     if (!n || !out) return;
+    doc_shadow_flush(n->owner);
     if (n->shadow_root) n = n->shadow_root;
     node_t *root = is_slot(n) ? doc_node_root(n, false) : NULL;
     if (root && root->shadow_host && n->slot_assigned_first) {
@@ -291,6 +345,7 @@ void doc_flat_children(node_t *n, pvec *out) {
 }
 node_t *doc_flat_parent(node_t *n) {
     if (!n || n->shadow_host) return NULL;
+    doc_shadow_flush(n->owner);
     node_t *p = n->parent;
     if (!p) return NULL;
     if (p->shadow_root) return doc_assigned_slot(n, false);
@@ -730,7 +785,7 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
     }
     if (!ns && ((!strcmp(name, "slot") && n->parent && n->parent->shadow_root && !n->parent->shadow_root->shadow_manual) ||
         (!strcmp(name, "name") && is_slot(n) && doc_node_root(n, false)->shadow_host && !doc_node_root(n, false)->shadow_manual)))
-        doc_shadow_reassign(d);
+        doc_shadow_dirty(n->parent && n->parent->shadow_root ? n->parent->shadow_root : doc_node_root(n, false));
     if (!ns) doc_details_attribute_changed(d, n, local, found >= 0);
     if (ordinary) web_select_attribute_changed(d, n, local, value != NULL);
     if (ordinary) web_canvas_attr_changed(n, local);
@@ -843,10 +898,14 @@ static bool may_insert(node_t *p, node_t *c) {
 
 static bool assignment_structure(node_t *p, node_t *c) {
     if (!p || !c) return false;
-    if (p->shadow_root && slottable(c)) return true;
-    /* Element insertions/removals can add, remove or reorder descendant slots.
-       Text/comment/PI changes within a shadow tree cannot change slot matching. */
-    return c->type == N_ELEM && doc_node_root(p, false)->shadow_host;
+    return (p->shadow_root && slottable(c)) ||
+        (c->type == N_ELEM && doc_node_root(p, false)->shadow_host);
+}
+static void assignment_dirty(node_t *p, node_t *c) {
+    if (!assignment_structure(p, c)) return;
+    if (!p || !c) return;
+    if (p->shadow_root && slottable(c)) doc_shadow_dirty(p->shadow_root);
+    if (c->type == N_ELEM) doc_shadow_dirty(doc_node_root(p, false));
 }
 
 /* Private status: 0 valid, 1 hierarchy, 2 reference-not-found. This performs
@@ -910,7 +969,8 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
     if (c->owner != d && !doc_node_adopt(d, c)) return false;
     node_t *old_parent = c->parent;
     node_t *old_select = node_ancestor(old_parent, T_select);
-    bool assignment_changed = assignment_structure(old_parent, c) || assignment_structure(p, c);
+    if (is_slot(old_parent) || is_slot(p)) doc_shadow_flush(d);
+    assignment_dirty(old_parent, c); assignment_dirty(p, c);
     if (is_slot(old_parent) && !old_parent->slot_assigned_first && doc_node_root(old_parent, false)->shadow_host)
         doc_slot_signal(old_parent);
     if(old_parent)web_dialog_removed(d,c);
@@ -927,7 +987,6 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
     /* A move into a detached forest still removes content from the live tree. */
     if (old_parent && old_parent != p) structure_changed_lifetime(d, old_parent, c, !same_lifetime_forest);
     structure_changed_lifetime(d, p, c, !same_lifetime_forest);
-    if (assignment_changed) doc_shadow_reassign(d);
     doc_details_inserted(c);
     node_t *new_select = node_ancestor(p, T_select);
     web_select_inserted(d, c, old_parent);
@@ -940,14 +999,14 @@ void doc_node_remove(web_doc *d, node_t *n) {
     if (!d || !n || !n->parent) return;
     node_t *p = n->parent;
     node_t *select = node_ancestor(p, T_select);
-    bool assignment_changed = assignment_structure(p, n);
+    if (is_slot(p)) doc_shadow_flush(d);
+    assignment_dirty(p, n);
     if (shadow_under(d->focus, n)) { d->focus = NULL; d->caret = 0; }
     if (is_slot(p) && !p->slot_assigned_first && doc_node_root(p, false)->shadow_host)
         doc_slot_signal(p);
     web_frames_detach_tree(d,n);
     detach(n);
     structure_changed(d, p, n);
-    if (assignment_changed) doc_shadow_reassign(d);
     web_select_inserted(d, n, p);
     if (select) web_select_sync(select->owner, select, false);
 }
@@ -975,6 +1034,9 @@ static void adopt_subtree(web_doc *d, node_t *root) {
             owner = owner->template_owner ? owner : owner->template_doc;
         }
     }
+    if (n->owner != owner && n->adopted_count) {
+        free(n->adopted_sheets); n->adopted_sheets = NULL; n->adopted_count = 0;
+    }
     n->owner = owner;
     for (int i = 0; i < n->nattrs; i++) if (n->attrs[i].node) n->attrs[i].node->owner = owner;
     n->style = n->animation_base_style = NULL; n->box = n->anchor_block = NULL;
@@ -986,6 +1048,7 @@ static void adopt_subtree(web_doc *d, node_t *root) {
         owner->resources_dirty = owner->dirty = owner->need_style = true;
     if (n->shadow_root) {
         (owner->dom_family ? owner->dom_family : owner)->has_shadow = true;
+        doc_shadow_dirty(n->shadow_root);
     }
   }
 }
@@ -1009,9 +1072,9 @@ bool doc_node_adopt(web_doc *d, node_t *n) {
         owner->template_owner = true; d->template_doc = owner;
     }
     if (n->parent) doc_node_remove(n->owner ? n->owner : d, n);
+    if (n->owner) doc_shadow_flush(n->owner); /* drain the source-family queue before owner migration */
     adopt_subtree(d, n);
     web_js_nodes_changed(d);
-    doc_shadow_reassign(d);
     return true;
 }
 

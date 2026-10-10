@@ -106,11 +106,15 @@ typedef struct node {
     /* Shadow trees share the native node arena but never the DOM parent links.
        Only an N_FRAGMENT root has shadow_host; only an element has shadow_root. */
     struct node *shadow_root, *shadow_host;
+    struct node *shadow_dirty_next, *shadow_slots, *shadow_slot_next;
+    bool shadow_dirty;
     bool shadow_closed, shadow_delegates_focus, shadow_clonable, shadow_serializable;
     bool shadow_manual, shadow_declarative;
     /* Native assignment snapshots/lists: these are not child/parent links. */
     struct node *assigned_slot, *assigned_next;
+    struct node *pending_assigned_slot, *pending_assigned_next;
     struct node *slot_assigned_first, *slot_assigned_last;
+    struct node *slot_wanted_first, *slot_wanted_last;
     struct node *manual_slot, *manual_next, *slot_manual_first, *slot_manual_last;
     bool slot_change_pending;
     struct node *slot_change_next; /* family-owned FIFO, deduplicated while pending */
@@ -190,6 +194,8 @@ typedef struct node {
     bool style_disabled_set; /* link IDL/CSSOM override of its initial disabled attribute */
     struct cssom_sheet *cssom_sheets, *cssom_current; /* native owner/source/AST, allocation-owned */
     uint32_t cssom_serial;
+    struct cssom_sheet **adopted_sheets;
+    uint32_t adopted_count;
     uint64_t resource_revision;
     const char *option_label;
     uint64_t option_label_revision;
@@ -550,7 +556,7 @@ struct web_image {
    or DOM semantics depend on these values. Times can overlap (inclusive). */
 struct web_profile {
     uint64_t inserts, index_visits, index_ms, rescans, rescan_ms;
-    uint64_t shadow_reassigns;
+    uint64_t shadow_reassigns, shadow_visits;
     uint64_t script_scans, script_visits, script_ms, native_calls, native_ms;
     uint64_t metadata_syncs, metadata_visits, metadata_ms;
 };
@@ -573,6 +579,10 @@ struct web_doc {
     bool has_shadow; /* family-wide fast path: stays set after a shadow root exists */
     bool shadow_slots_pending;
     node_t *shadow_slots_first, *shadow_slots_last;
+    node_t *shadow_dirty_first, *shadow_dirty_last;
+    bool shadow_flushing;
+    bool native_cancelled;
+    uint32_t native_checkpoint_count;
     node_t *details_toggle_first, *details_toggle_last;
     web_doc *template_doc;
     arena_t mem;    /* DOM, stylesheets */
@@ -693,6 +703,9 @@ node_t *doc_shadow_attach(web_doc *d, node_t *host, bool closed, bool delegates_
                         bool clonable, bool serializable, bool manual);
 node_t *doc_assigned_slot(node_t *node, bool open_only);
 void doc_shadow_reassign(web_doc *d);
+void doc_shadow_dirty(node_t *root);
+void doc_shadow_flush(web_doc *d);
+bool web_native_checkpoint(web_doc *d);
 void doc_slot_signal(node_t *slot);
 bool doc_slot_nodes(node_t *slot, bool flatten, pvec *out);
 bool doc_slot_assign(node_t *slot, node_t **nodes, int count);

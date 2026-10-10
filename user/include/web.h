@@ -143,7 +143,8 @@ struct web_host {
        maximum. Page code cannot reset it. */
     uint32_t js_task_budget_ms;
     /* Optional native-only cancellation checkpoint. NEVER dispatch JS/DOM,
-       layout, paint, navigation or free a document here. False stops this
+       layout, document paint, navigation or free a document here. Chrome-only
+       console painting is safe. False stops native style/layout as well as JS
        task after a user close/stop request, not after a page-count quota. */
     bool (*script_checkpoint)(void *opaque);
 };

@@ -160,6 +160,7 @@ def make_disk(a, tcp_port, web_ports):
     srcs += sorted(glob.glob(os.path.join(ROOT, "tests", "js_*_cases.js")))
     # Internal metadata regression reads diagnostic counters from the real DOM.
     srcs.append(os.path.join(ROOT, "user", "libc", "web", "webi.h"))
+    srcs.append(os.path.join(ROOT, "user", "libc", "web", "cssom.h"))
     srcs.append(os.path.join(ROOT, "third_party", "quickjs", "quickjs.h"))
     srcs += [os.path.join(ROOT, "user", "libc", "web", name) for name in
              ("form_value.h", "form_validation.h", "elements.h")]

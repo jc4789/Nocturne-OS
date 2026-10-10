@@ -652,6 +652,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
 }
 
 static void gen(struct bctx *b, box_t *pb, node_t *n, style_t *pst) {
+    if (!web_native_checkpoint(b->d)) return;
     web_avmedia_checkpoint();
     if (n->type == N_TEXT) {
         if (pst && n->textlen) text_box(b, pb, n, n->text, n->textlen, pst);

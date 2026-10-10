@@ -1,5 +1,5 @@
 /* CSSOM handles address native style/link parser storage and the same cascade
- * AST. Constructed/adopted sheets and group-rule mutations remain unsupported. */
+ * AST. Constructed sheets share that AST across native document/shadow scopes. */
 (() => {
     'use strict';
     const define = Object.defineProperty, apply = Reflect.apply;
@@ -7,10 +7,13 @@
     const ReflectGet = Reflect.get, ReflectSet = Reflect.set, OwnKeys = Reflect.ownKeys, Descriptor = Reflect.getOwnPropertyDescriptor;
     const DefineProperty = Reflect.defineProperty, DeleteProperty = Reflect.deleteProperty;
     const push = Array.prototype.push, concat = Array.prototype.concat;
+    const slice = Array.prototype.slice, splice = Array.prototype.splice;
+    const constructorDocument = document, PromiseType = Promise;
     const mapGet = Map.prototype.get, mapSet = Map.prototype.set;
     const indexPattern = /^(0|[1-9][0-9]*)$/, regexTest = RegExp.prototype.test;
     const owners = new WeakMap(), sheets = new WeakMap(), ruleOwners = new WeakMap(), listOwners = new WeakMap(),
-        sheetListOwners = new WeakMap(), documentLists = new WeakMap(), token = {};
+        sheetListOwners = new WeakMap(), documentLists = new WeakMap(), constructedSheets = new WeakMap(),
+        adoptedLists = new WeakMap(), token = {};
     const get = WeakMap.prototype.get, set = WeakMap.prototype.set;
     function owner(sheet) {
         const node = apply(get, owners, [sheet]);
@@ -21,7 +24,7 @@
     function index(value) { return (+value) >>> 0; }
     function checked(result) {
         if (typeof result === 'number' && result < 0) {
-            const names = ['', '', 'IndexSizeError', 'SyntaxError', 'NotSupportedError', 'InvalidStateError', 'HierarchyRequestError', 'SecurityError'];
+            const names = ['', '', 'IndexSizeError', 'SyntaxError', 'NotSupportedError', 'InvalidStateError', 'HierarchyRequestError', 'SecurityError', 'NotAllowedError'];
             throw new Exception('Native style sheet operation failed', names[-result] || 'InvalidStateError');
         }
         return result;
@@ -102,14 +105,22 @@
             return operation(this,'current') ? state.node : null;
         }
         get parentStyleSheet() { owner(this); return null; }
-        get title() { return reflectedAttr(owner(this).node, 'title') || ''; }
+        get title() { return owner(this).constructed ? null : reflectedAttr(owner(this).node, 'title') || ''; }
         get disabled() { return operation(this,'disabled'); }
         set disabled(value) { operation(this,'disable',value ? 1 : 0); }
     }
     class CSSStyleSheet extends StyleSheet {
         constructor(key, node, id) {
-            if (key !== token) throw new Exception('Constructed style sheets are not implemented', 'NotSupportedError');
-            super(key, node, id);
+            const constructed = key !== token;
+            const options = constructed ? key ?? {} : null;
+            if (constructed) { node = constructorDocument; id = checked(rawDom('cssom', node, 'construct')); }
+            super(token, node, id);
+            if (constructed) {
+                const state = owner(this); state.constructed = true;
+                rememberConstructed(node, id, this);
+                if (options.media !== undefined) operation(this, 'media', 0, string(options.media));
+                if (options.disabled) this.disabled = true;
+            }
         }
         get ownerRule() { owner(this); return null; }
         get cssRules() { return rulesFor(this); }
@@ -119,6 +130,26 @@
             const text=string(rule), i=index(at);return operation(this,'insert',i,text);
         }
         deleteRule(at) { owner(this);if(!arguments.length)throw new TypeErr('deleteRule requires index');operation(this,'delete',index(at)); }
+        replaceSync(text) {
+            owner(this); if (!arguments.length) throw new TypeErr('replaceSync requires text');
+            operation(this, 'replace', 0, string(text));
+        }
+        replace(text) {
+            owner(this); if (!arguments.length) return PromiseType.reject(new TypeErr('replace requires text'));
+            try { this.replaceSync(text); return PromiseType.resolve(this); }
+            catch (error) { return PromiseType.reject(error); }
+        }
+    }
+    function rememberConstructed(node, id, sheet) {
+        let cache = apply(get, constructedSheets, [node]);
+        if (!cache) { cache = new MapType(); apply(set, constructedSheets, [node, cache]); }
+        apply(mapSet, cache, [id, sheet]);
+    }
+    function constructedFor(node, id) {
+        const cache = apply(get, constructedSheets, [node]);
+        let sheet = cache && apply(mapGet, cache, [id]);
+        if (!sheet) { sheet = new CSSStyleSheet(token, node, id); owner(sheet).constructed = true; rememberConstructed(node, id, sheet); }
+        return sheet;
     }
     function sheetFor(node) {
         const id=checked(rawDom('cssom',node,'sheet'));if(!id)return null;
@@ -163,6 +194,59 @@
     }
     define(Document.prototype,'styleSheets',{configurable:true,enumerable:true,get:documentSheets});
     define(ShadowRoot.prototype,'styleSheets',{configurable:true,enumerable:true,get:documentSheets});
+    function adopt(root, values) {
+        const pairs = [];
+        for (const sheet of values) {
+            const state = owner(sheet);
+            if (!state.constructed) throw new Exception('Only constructed style sheets can be adopted', 'NotAllowedError');
+            apply(push, pairs, [[state.node, state.id]]);
+        }
+        checked(rawDom('cssom', root, 'adopt', pairs));
+    }
+    function adoptedSheets() {
+        checked(rawDom('cssom', this, 'adopted')); // native brand and current document
+        let list = apply(get, adoptedLists, [this]);
+        if (list) return list;
+        const root = this, target = [];
+        function sync() {
+            const pairs = checked(rawDom('cssom', root, 'adopted'));
+            target.length = 0;
+            for (const pair of pairs) apply(push, target, [constructedFor(pair[0], pair[1])]);
+        }
+        function commit(values) { adopt(root, values); sync(); }
+        list = new ProxyType(target, {
+            get(t, key, receiver) { sync(); return ReflectGet(t, key, receiver); },
+            set(t, key, value) {
+                sync(); const i = numeric(key), values = apply(slice, t, []);
+                if (key === 'length') {
+                    const length = +value;
+                    if (length !== (length >>> 0) || length > values.length) throw new RangeError('Invalid adoptedStyleSheets length');
+                    values.length = length;
+                } else if (i !== null) {
+                    if (i > values.length) throw new RangeError('Sparse adoptedStyleSheets is not supported');
+                    values[i] = value;
+                } else return ReflectSet(t, key, value);
+                commit(values); return true;
+            },
+            deleteProperty(t, key) {
+                sync(); const i = numeric(key); if (i === null) return DeleteProperty(t, key);
+                const values = apply(slice, t, []); apply(splice, values, [i, 1]); commit(values); return true;
+            },
+            defineProperty(t, key, descriptor) {
+                if (key === 'length' || numeric(key) !== null) return false;
+                return DefineProperty(t, key, descriptor);
+            },
+            has(t, key) { sync(); return key in t; },
+            ownKeys(t) { sync(); return OwnKeys(t); },
+            getOwnPropertyDescriptor(t, key) { sync(); return Descriptor(t, key); },
+            preventExtensions() { return false; }
+        });
+        apply(set, adoptedLists, [root, list]); return list;
+    }
+    for (const C of [Document, ShadowRoot]) define(C.prototype, 'adoptedStyleSheets', {
+        configurable: true, enumerable: true, get: adoptedSheets,
+        set(values) { checked(rawDom('cssom', this, 'adopted')); adopt(this, values); }
+    });
     define(HTMLStyleElement.prototype, 'disabled', { configurable: true, enumerable: true,
         get() { htmlElementBrand(this, 'style'); return rawDom('styleDisabled', this); },
         set(value) { htmlElementBrand(this, 'style'); rawDom('styleDisabled', this, !!value); }

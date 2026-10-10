@@ -649,6 +649,7 @@ static void text_items(box_t *t, struct ibuild *s) {
 
 static void build_items(box_t *parent, struct ibuild *s) {
     for (box_t *c = parent->first; c; c = c->next) {
+        if (!web_native_checkpoint(D)) break;
         web_avmedia_checkpoint();
         if (c->abspos) {
             ipush(s->v, IT_ABS)->box = c;
@@ -1251,6 +1252,7 @@ static void layout_blocks(box_t *b, struct bfc *f, float ox, float oy, float cbh
     float first_bl = -1, last_bl = -1;
     for (box_t *c = b->first; c; c = c->next) {
         c->cb = b;
+        if (!web_native_checkpoint(D)) break;
         if (c->abspos) {
             c->static_cb = b;
             c->static_x = 0;
@@ -1733,6 +1735,7 @@ static void flex_cross_lines(box_t *b, struct fitem *it, struct fline *lines,
         struct fline *line = &lines[l];
         float origin = flip ? available - cursor - line->cross : cursor;
         for (int i = line->first; i < line->end; i++) {
+            if (!web_native_checkpoint(D)) break;
             web_avmedia_checkpoint();
             box_t *c = it[i].b;
             int lo = column ? 3 : 0, hi = column ? 1 : 2;
@@ -1810,6 +1813,7 @@ static void layout_flex(box_t *b, float defh) {
     /* stable sort by order */
     for (int i = 1; i < n; i++)
         for (int j = i; j > 0 && it[j - 1].b->st->order > it[j].b->st->order; j--) {
+            if (!web_native_checkpoint(D)) { free(lines); free(it); return; }
             struct fitem t = it[j];
             it[j] = it[j - 1];
             it[j - 1] = t;
@@ -2186,6 +2190,7 @@ static int gr_place(struct gitem *it, int n, int nc, int nr) {
         if (it[i].r0 >= 0 && it[i].c0 >= 0) GR_MARK(i);
     for (int i = 0; i < n; i++) {
         if (it[i].r0 < 0 || it[i].c0 >= 0) continue;
+        if (!web_native_checkpoint(D)) goto placement_done;
         int span = it[i].c1 > nc ? nc : it[i].c1, c = 0;
         while (c + span < nc && !gr_free_at(occ, rows, nc, it[i].r0, it[i].r1, c, c + span)) c++;
         it[i].c0 = c;
@@ -2196,14 +2201,19 @@ static int gr_place(struct gitem *it, int n, int nc, int nr) {
     int cr = 0, cc = 0;
     for (int i = 0; i < n; i++) {
         if (it[i].r0 >= 0) continue;
+        if (!web_native_checkpoint(D)) goto placement_done;
         int rspan = it[i].r1;
         if (it[i].c0 >= 0) {
             if (it[i].c0 < cc) cr++;
             cc = it[i].c0;
-            while (cr < GR_MAX_ROWS && !gr_free_at(occ, rows, nc, cr, cr + rspan, it[i].c0, it[i].c1)) cr++;
+            while (cr < GR_MAX_ROWS && !gr_free_at(occ, rows, nc, cr, cr + rspan, it[i].c0, it[i].c1)) {
+                if (!web_native_checkpoint(D)) goto placement_done;
+                cr++;
+            }
         } else {
             int span = it[i].c1 > nc ? nc : it[i].c1;
             for (;;) {
+                if (!web_native_checkpoint(D)) goto placement_done;
                 if (cc + span > nc) {
                     cr++;
                     cc = 0;
@@ -2221,6 +2231,7 @@ static int gr_place(struct gitem *it, int n, int nc, int nr) {
         cc = it[i].c1;
     }
 #undef GR_MARK
+placement_done:
     free(occ);
     return rows > nr ? rows : nr;
 }
@@ -2252,6 +2263,7 @@ static void gr_setup(struct grid *g, box_t *b, float cw) {
     n = g->n;
     for (int i = 1; i < n; i++)
         for (int j = i; j > 0 && g->it[j - 1].b->st->order > g->it[j].b->st->order; j--) {
+            if (!web_native_checkpoint(D)) return;
             struct gitem t = g->it[j];
             g->it[j] = g->it[j - 1];
             g->it[j - 1] = t;
@@ -2289,6 +2301,9 @@ static void gr_setup(struct grid *g, box_t *b, float cw) {
         for (int i = 0; i < n; i++)
             if (g->it[i].c1 > g->nc) g->nc = g->it[i].c1;
     }
+    /* Auto-placement may leave later items unresolved after a stop. Never
+       use their negative coordinates to index the track arrays. */
+    if (D->native_cancelled) { free(cx); free(rx); return; }
     g->col = calloc((size_t)g->nc + 1, sizeof *g->col);
     g->row = calloc((size_t)g->nr + 1, sizeof *g->row);
     gr_init_tracks(g->col, g->nc, cx, ncx, st->grid_auto_cols);
@@ -2312,6 +2327,7 @@ static bool gr_intrinsic_kind(int k) { return k == GT_AUTO || k == GT_MIN || k =
 static void gr_size(struct gtr *tr, int nt, float gap, struct gitem *it, int n, bool col, float avail, bool min,
                     float pct) {
     for (int i = 0; i < nt; i++) {
+        if (!web_native_checkpoint(D)) return;
         struct gtr *t = &tr[i];
         t->base = 0;
         t->limit = -1;
@@ -2466,6 +2482,7 @@ static float gr_positions(struct gtr *tr, int nt, float gap, float start, float 
 
 static void gr_contributions(struct grid *g) {
     for (int i = 0; i < g->n; i++) {
+        if (!web_native_checkpoint(D)) return;
         box_t *c = g->it[i].b;
         outer_intrinsic(c, &g->it[i].mn, &g->it[i].mx);
         /* scroll containers have no content-based minimum */
@@ -2478,7 +2495,9 @@ static void gr_contributions(struct grid *g) {
 static void grid_intrinsic(box_t *b, float *mn, float *mx) {
     struct grid g;
     gr_setup(&g, b, -1);
+    if (D->native_cancelled) { *mn = *mx = 0; gr_free(&g); return; }
     gr_contributions(&g);
+    if (D->native_cancelled) { *mn = *mx = 0; gr_free(&g); return; }
     float gap = b->st->gap_col;
     gr_size(g.col, g.nc, gap, g.it, g.n, true, -1, true, -1);
     *mn = gr_positions(g.col, g.nc, gap, 0, 0);
@@ -2501,8 +2520,10 @@ static void layout_grid(box_t *b, float defh) {
     }
     struct grid g;
     gr_setup(&g, b, cw);
+    if (D->native_cancelled) { gr_free(&g); return; }
     gr_contributions(&g);
     /* columns */
+    if (D->native_cancelled) { gr_free(&g); return; }
     gr_size(g.col, g.nc, st->gap_col, g.it, g.n, true, cw, false, cw);
     float total = 0, start = 0, between = 0;
     total = gr_positions(g.col, g.nc, st->gap_col, 0, 0);
@@ -2802,6 +2823,7 @@ static void layout_inner(box_t *b, struct bfc *f, float ox, float oy, float cbh)
 }
 
 static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float cbh, float usedh) {
+    if (!web_native_checkpoint(D)) return;
     web_avmedia_checkpoint();
     if(b->node && !b->node->foreign && b->node->tag==T_frameset){
         layout_frameset(b,usedh>=0?usedh:cbh>=0?cbh:VH);return;
@@ -3016,6 +3038,7 @@ void layout_doc(web_doc *d, int width, int height) {
     root->w = VW;
     root->cb = NULL;
     layout_inner(root, NULL, 0, 0, VH);
+    if (d->native_cancelled) goto finished;
     for (int i = 0; i < d->abs_boxes.n; i++) layout_abs(d->abs_boxes.v[i]);
     relative_offsets(root);
     scroll_areas(root);
@@ -3028,6 +3051,7 @@ void layout_doc(web_doc *d, int width, int height) {
     }
     d->doc_h = document_extent(h);
     d->doc_w = width;
+finished:
     layout_text_active = previous_cache;
     layout_text_cache_free(cache);
     d->lmem.trap = outer_trap;

@@ -8,9 +8,10 @@ static JSValue cssom_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst 
     const char *operation=JS_ToCString(ctx,argv[2]),*text=NULL;
     uint32_t id=0,index=0;size_t length=0;JSValue result=JS_EXCEPTION;
     if (!operation) return JS_EXCEPTION;
-    if (argc>3 && JS_ToUint32(ctx,&id,argv[3])<0) goto out;
+    bool adoption = !strcmp(operation,"adopt");
+    if (!adoption && argc>3 && JS_ToUint32(ctx,&id,argv[3])<0) goto out;
     if (argc>4 && JS_ToUint32(ctx,&index,argv[4])<0) goto out;
-    if (!strcmp(operation,"insert")) {
+    if (!strcmp(operation,"insert") || !strcmp(operation,"replace")) {
         if (argc<6) { result=JS_ThrowTypeError(ctx,"insertRule requires rule and index");goto out; }
         text=JS_ToCStringLen(ctx,&length,argv[5]);if(!text)goto out;
     }
@@ -18,6 +19,44 @@ static JSValue cssom_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst 
     if (!d || d!=original || d->root!=root || !d->live || d->inert || !web_js_enabled(d) ||
         !d->js || JS_GetRuntime(d->js->ctx)!=JS_GetRuntime(ctx) ||
         !s->doc->live || s->doc->js!=s || s->disabled) { result=JS_NewInt32(ctx,-CSSOM_INACTIVE);goto out; }
+    if (!strcmp(operation,"construct")) {
+        if(n!=d->root){result=JS_ThrowTypeError(ctx,"Constructed sheet document required");goto out;}
+        int error;struct cssom_sheet *sheet=cssom_construct(d,&error);
+        result=error==CSSOM_OOM?oom(ctx):JS_NewInt64(ctx,sheet?sheet->id:0);goto out;
+    }
+    if (adoption || !strcmp(operation,"adopted")) {
+        if(!((n->type==N_DOC&&n==d->root)||(n->type==N_FRAGMENT&&n->shadow_host))) {
+            result=JS_ThrowTypeError(ctx,"Document or ShadowRoot adoptedStyleSheets receiver required");goto out;
+        }
+        if(!adoption) {
+            result=JS_NewArray(ctx);
+            for(uint32_t i=0;!JS_IsException(result)&&i<n->adopted_count;i++) {
+                JSValue pair=JS_NewArray(ctx);
+                struct cssom_sheet *sheet=n->adopted_sheets[i];
+                if(JS_IsException(pair)||JS_SetPropertyUint32(ctx,pair,0,wrap(s,sheet->owner))<0||
+                    JS_SetPropertyUint32(ctx,pair,1,JS_NewInt64(ctx,sheet->id))<0||JS_SetPropertyUint32(ctx,result,i,pair)<0) {
+                    JS_FreeValue(ctx,result);result=JS_EXCEPTION;break;
+                }
+            }
+            goto out;
+        }
+        uint32_t count;JSValue len=argc>3?JS_GetPropertyStr(ctx,argv[3],"length"):JS_UNDEFINED;
+        int converted=JS_ToUint32(ctx,&count,len);JS_FreeValue(ctx,len);if(converted<0)goto out;
+        if((size_t)count>SIZE_MAX/sizeof(struct cssom_sheet*)){result=oom(ctx);goto out;}
+        struct cssom_sheet **items=count?calloc(count,sizeof *items):NULL;
+        if(count&&!items){result=oom(ctx);goto out;}
+        int error=CSSOM_OK;
+        for(uint32_t i=0;i<count;i++) {
+            JSValue pair=JS_GetPropertyUint32(ctx,argv[3],i),a=JS_GetPropertyUint32(ctx,pair,0),b=JS_GetPropertyUint32(ctx,pair,1);
+            node_t *owner=unwrap(ctx,a);uint32_t serial;
+            if(!owner||JS_ToUint32(ctx,&serial,b)<0)error=CSSOM_NOT_ALLOWED;
+            else items[i]=cssom_style_find(owner,serial);
+            JS_FreeValue(ctx,a);JS_FreeValue(ctx,b);JS_FreeValue(ctx,pair);
+            if(error)break;
+        }
+        if(!error)error=cssom_adopt(n,items,count);free(items);
+        result=error==CSSOM_OOM?oom(ctx):JS_NewInt32(ctx,-error);goto out;
+    }
     if(!strcmp(operation,"listLength")||!strcmp(operation,"listItem")) {
         if(!((n->type==N_DOC&&n==d->root)||(n->type==N_FRAGMENT&&n->shadow_host))) {
             result=JS_ThrowTypeError(ctx,"Document or ShadowRoot styleSheets receiver required");goto out;
@@ -27,7 +66,7 @@ static JSValue cssom_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst 
         node_t *item=cssom_list_owner(d,n,index,select,&count,&error);
         result=error==CSSOM_OOM?oom(ctx):select?wrap(s,item):JS_NewInt64(ctx,count);goto out;
     }
-    if(n->type!=N_ELEM||n->foreign||(n->tag!=T_style&&n->tag!=T_link)) {
+    if(n!=d->root && (n->type!=N_ELEM||n->foreign||(n->tag!=T_style&&n->tag!=T_link))) {
         result=JS_ThrowTypeError(ctx,"Native style or link sheet owner required");goto out;
     }
     if (!strcmp(operation,"sheet")) {
@@ -42,6 +81,7 @@ static JSValue cssom_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst 
     if (!sheet) { result=JS_NewInt32(ctx,-CSSOM_INACTIVE);goto out; }
     if(!strcmp(operation,"href")){result=sheet->href?JS_NewString(ctx,sheet->href):JS_NULL;goto out;}
     if (!strcmp(operation,"current")) {
+        if(sheet->constructed){result=JS_FALSE;goto out;}
         int error;struct cssom_sheet *current=cssom_style_sheet(d,n,&error);
         result=error==CSSOM_OOM ? oom(ctx) : JS_NewBool(ctx,current==sheet&&sheet->associated);goto out;
     }
@@ -55,9 +95,23 @@ static JSValue cssom_dom(struct web_js_state *s,node_t *n,int argc,JSValueConst 
         if(current)sheet->disabled=cssom_owner_disabled(n);
         if(!strcmp(operation,"disable")) {
             sheet->disabled=index!=0;
+            if(sheet->constructed)cssom_changed(sheet);
             if(current){n->style_disabled=sheet->disabled;n->style_disabled_set=true;d->resources_dirty=d->dirty=d->need_style=true;}
         }
         result=JS_NewBool(ctx,sheet->disabled);goto out;
+    }
+    if (!strcmp(operation,"media")) {
+        if(argc>5 && !JS_IsUndefined(argv[5])) {
+            const char *value=JS_ToCString(ctx,argv[5]);if(!value)goto out;
+            char *copy=strdup(value);JS_FreeCString(ctx,value);
+            if(!copy){result=oom(ctx);goto out;}
+            free(sheet->media);sheet->media=copy;cssom_changed(sheet);
+        }
+        result=JS_NewString(ctx,sheet->media?sheet->media:"");goto out;
+    }
+    if (!strcmp(operation,"replace")) {
+        int error=cssom_replace_sync(sheet,text,length);
+        result=error==CSSOM_OOM?oom(ctx):JS_NewInt32(ctx,-error);goto out;
     }
     if (!strcmp(operation,"insert") || !strcmp(operation,"delete")) {
         int error=!strcmp(operation,"insert") ? cssom_insert(sheet,text,length,index) : cssom_delete(sheet,index);

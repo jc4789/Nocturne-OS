@@ -753,6 +753,7 @@ static bool match_compound(const struct compound *c, node_t *e, node_t *scope) {
 }
 
 static bool match_from(const struct compound *c, node_t *e, node_t *scope) {
+    if (e && !web_native_checkpoint(e->owner)) return false;
     for (int i = 0; i < c->n; i++) if (c->s[i].kind == SK_SLOTTED) {
         if (!scope || !match_list(c->s[i].args, e, NULL)) return false;
         node_t *slot = doc_assigned_slot(e, false);
@@ -1996,6 +1997,7 @@ static struct css_ctx *build_index(web_doc *d, int vw, int vh) {
     pvec *sh = &d->sty.sheets;
     for (int i = 1; i < sh->n; i++)
         for (int j = i; j > 0 && ((sheet_t *)sh->v[j - 1])->order > ((sheet_t *)sh->v[j])->order; j--) {
+            if (!web_native_checkpoint(d)) return x;
             void *t = sh->v[j];
             sh->v[j] = sh->v[j - 1];
             sh->v[j - 1] = t;
@@ -2006,6 +2008,7 @@ static struct css_ctx *build_index(web_doc *d, int vw, int vh) {
         if (s->owner_media && !css_media_evaluate(s->owner_media, vw, vh, web_js_enabled(d), NULL, 0)) continue;
         if (i == -1 && !d->quirks) continue;
         for (struct rule *r = s->first; r; r = r->next, order++) {
+            if (!web_native_checkpoint(d)) return x;
             web_avmedia_checkpoint();
             if (!r->ndecls || !media_chain_ok(r->media, vw, vh, web_js_enabled(d))) continue;
             for (int k = 0; k < r->sel->n; k++) index_rule(x, r, r->sel->v[k], order, s->ua, s->scope);
@@ -2265,6 +2268,7 @@ static void add_rule_decls(const struct rule *r, uint32_t spec, uint32_t order, 
 static void collect(const struct ient *l, node_t *e) {
     node_t *root = doc_node_root(e, false);
     for (; l; l = l->next) {
+        if (!web_native_checkpoint(e->owner)) return;
         web_avmedia_checkpoint();
         if (!l->ua) {
             if (!l->scope && root && root->shadow_host) continue;
@@ -2664,6 +2668,7 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
        executes author code or reads the incomplete style/box tree. */
     web_avmedia_checkpoint();
     web_doc *d = c->d;
+    if (!web_native_checkpoint(d)) return;
     struct css_ctx *x = d->sty.ctx;
     ndents = 0;
     if (e->id) {
@@ -2681,6 +2686,7 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     struct ient **l = ht_slot(NULL, &x->tags, e->name, false);
     if (l) collect(*l, e);
     collect(x->univ, e);
+    if (d->native_cancelled) return;
     /* presentational hints and the style attribute */
     struct hints h = {.n = 0, .a = &d->smem};
     if (!e->foreign || e->tag == T_svg) pres_hints(e, &h);
@@ -2752,7 +2758,7 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     }
     pvec children = {0};
     doc_flat_children(e, &children);
-    for (int i = 0; i < children.n; i++) {
+    for (int i = 0; i < children.n && !d->native_cancelled; i++) {
         node_t *ch = children.v[i];
         if (ch->type == N_ELEM) cascade_node(c, ch, s);
         else ch->style = NULL;

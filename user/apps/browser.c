@@ -327,10 +327,7 @@ static void draw_page(void) {
     }
 }
 
-static void draw(void) {
-    draw_toolbar();
-    draw_page();
-    draw_status();
+static void draw_console(void) {
     if (console_open) {
         canvas_t *c = &w->c;
         int top = TB + page_h(), h = console_h();
@@ -359,6 +356,9 @@ static void draw(void) {
             gfx_vline(&input,x,top+h-19,15,UI_ACCENT2);}
     }
     console_dirty = false;
+}
+static void draw(void) {
+    draw_toolbar(); draw_page(); draw_status(); draw_console();
 }
 
 static void console_add(const char *level, const char *message) {
@@ -1078,6 +1078,18 @@ static bool host_script_checkpoint(void *opaque) {
         if(!event)break;
         if(e.type==EV_CLOSE){quit=true;return false;}
         if(e.type==EV_KEY && e.pressed && e.key==NKEY_ESC)return false;
+        if(e.type==EV_KEY && e.pressed && e.key==NKEY_F12) {
+            int old_top=TB+page_h(),old_height=console_h();
+            console_open=!console_open;
+            if(console_open)focus=F_CONSOLE;else if(focus==F_CONSOLE)focus=F_PAGE;
+            need_layout=need_paint=true;
+            /* Chrome only: never read the document's half-built layout here.
+               The exposed page area is restored after the task unwinds. */
+            if(console_open)draw_console();
+            else gfx_fill(&w->c,0,old_top,w->w,old_height,UI_BG);
+            win_update(w);
+            continue;
+        }
         if(evq_n==evq_capacity) {
             int capacity=evq_capacity?(evq_capacity>INT_MAX/2?INT_MAX:evq_capacity*2):64;
             void *grown=evq_n<INT_MAX && (size_t)capacity<=SIZE_MAX/sizeof *evq?

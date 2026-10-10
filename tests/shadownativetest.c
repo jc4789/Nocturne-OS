@@ -14,6 +14,7 @@ static node_t *element(web_doc *d, const char *name) {
     return n;
 }
 static void clear_changes(web_doc *d) {
+    doc_shadow_flush(d);
     web_doc *family = d->dom_family ? d->dom_family : d;
     for (node_t *n = family->shadow_slots_first, *next; n; n = next) {
         next = n->slot_change_next; n->slot_change_pending = false; n->slot_change_next = NULL;

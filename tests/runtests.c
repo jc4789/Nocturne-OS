@@ -102,6 +102,12 @@ static const struct test tests[] = {
     /* the web engine, offline: layout, painting, forms, charsets, URLs, hostile input */
     {"web", "fonts", "tcc -o /home/fonttest /data/tests/fonttest.c && /home/fonttest", 0,
      {"fonttest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"browserfreeze", "slot-cssom-native-stop", "tcc -I/data/tests -o /home/browserfreezetest /data/tests/browserfreezetest.c && /home/browserfreezetest", 0,
+     {"browserfreezetest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"browserlayoutstop", "flex-native-stop", "tcc -I/data/tests -o /home/browserfreezetest /data/tests/browserfreezetest.c && /home/browserfreezetest --layout-only", 0,
+     {"browserfreezetest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"browsergridstop", "grid-native-stop", "tcc -I/data/tests -o /home/browserfreezetest /data/tests/browserfreezetest.c && /home/browserfreezetest --grid-only", 0,
+     {"browserfreezetest: ", ", 0 failed"}, "FAIL", 120, false, true},
     {"web", "engine", "tcc -I/data/tests -o /home/webtest /data/tests/webtest.c && /home/webtest", 0, {"webtest: ", ", 0 failed"}, "FAIL",
      120, false, true},
     {"web", "javascript", "tcc -o /home/jstest /data/tests/jstest.c && /home/jstest", 0,
