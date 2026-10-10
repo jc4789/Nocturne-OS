@@ -31,6 +31,6 @@ const documentCommandBridge=(()=>{
     return {event(target,type,data,inputType='insertText'){
         const event=new InputEventType(type,{bubbles:true,cancelable:type==='beforeinput',composed:true,view:realm,
             data,inputType,isComposing:false});
-        event.isTrusted=true;return dispatch(target,event);
+        eventState(event).isTrusted=true;return dispatch(target,event);
     }};
 })();

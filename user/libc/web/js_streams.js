@@ -1,7 +1,7 @@
 /* WHATWG Streams algorithms from pinned MIT web-streams-polyfill. No native
  * OS ABI, disk, network, or host capability is exposed through these classes.
- * Fetch remains a buffered transport; its real response bytes are consumed via
- * this implementation with locks, backpressure, cancellation and BYOB. */
+ * Fetch's native response frames feed these controllers on demand, preserving
+ * locks, backpressure, cancellation and BYOB. */
 const streamBridge=(()=>{
     const types=(()=>{
         /* @streams-ponyfill */
@@ -16,8 +16,10 @@ const streamBridge=(()=>{
     const read=types.ReadableStreamDefaultReader.prototype.read;
     const release=types.ReadableStreamDefaultReader.prototype.releaseLock;
     const cancel=types.ReadableStreamDefaultReader.prototype.cancel;
+    const enqueue=types.ReadableByteStreamController.prototype.enqueue;
+    const close=types.ReadableByteStreamController.prototype.close,error=types.ReadableByteStreamController.prototype.error;
     const encoder=TextEncoder,decoder=TextDecoder,encode=encoder.prototype.encode,decode=decoder.prototype.decode;
-    const LIMIT=16*1024*1024;
+    const LIMIT=0xffffffff;
     function brand(value){try{apply(locked,value,[]);return true;}catch(_){return false;}}
     function disturbed(value){return !!value._disturbed;}
     function fromBytes(bytes,check=()=>{}){
@@ -30,12 +32,21 @@ const streamBridge=(()=>{
             }catch(e){source=null;controller.error(e);}
         },cancel(){source=null;}},{highWaterMark:0});
     }
+    function network(pull,cancelSource){
+        let controller,ended=false;
+        const stream=new ReadableStream({type:'bytes',start(c){controller=c;},pull(){return pull();},cancel(reason){ended=true;return cancelSource(reason);}},{highWaterMark:0});
+        return Object.freeze({stream,
+            enqueue(bytes){if(!ended)apply(enqueue,controller,[new U8(bytes)]);},
+            close(){if(!ended){ended=true;apply(close,controller,[]);}},
+            error(reason){if(!ended){ended=true;apply(error,controller,[reason]);}}
+        });
+    }
     async function collect(stream){
         const reader=apply(getReader,stream,[]),chunks=[];let total=0;
         try{for(;;){const item=await apply(read,reader,[]);if(item.done)break;
             if(apply(tag,item.value,[])!=='Uint8Array')throw new TypeError('Body stream must contain Uint8Array chunks');
             const n=apply(length,item.value,[]);
-            if(n>LIMIT-total)throw new DOMException('Body exceeds the 16 MiB limit','QuotaExceededError');
+            if(n>LIMIT-total)throw new RangeError('Body length is not representable');
             const copy=new U8(n);apply(set,copy,[item.value]);chunks.push(copy);total+=n;
         }}catch(e){try{await apply(cancel,reader,[e]);}catch(_){}throw e;}
         finally{apply(release,reader,[]);}
@@ -60,5 +71,5 @@ const streamBridge=(()=>{
         }
     }
     Object.assign(globalThis,types,{TextEncoderStream,TextDecoderStream});
-    return Object.freeze({brand,disturbed,fromBytes,collect,locked:v=>apply(locked,v,[]),tee:v=>apply(tee,v,[])});
+    return Object.freeze({brand,disturbed,fromBytes,network,collect,locked:v=>apply(locked,v,[]),tee:v=>apply(tee,v,[])});
 })();

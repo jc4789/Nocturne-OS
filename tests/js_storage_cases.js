@@ -5,6 +5,13 @@ function runStorageCases(){
     function throws(fn,name,message){let error;try{fn();}catch(e){error=e;}check(error && error.name===name,message);}
     const C=Storage, proto=C.prototype, local=localStorage,session=sessionStorage;
     const get=proto.getItem,set=proto.setItem,clear=proto.clear,remove=proto.removeItem,key=proto.key;
+    const event=new StorageEvent('custom',{key:'',oldValue:'\ud800',newValue:'\0',url:'\ud800',storageArea:local});
+    check(event.key==='' && event.oldValue==='\ud800' && event.newValue==='\0' && event.url==='\ufffd' && event.storageArea===local && !event.isTrusted,'StorageEvent values and USVString');
+    check(!Reflect.set(event,'key','forged') && event.key==='','StorageEvent readonly');
+    throws(()=>Object.getOwnPropertyDescriptor(StorageEvent.prototype,'key').get.call({}),'TypeError','StorageEvent brand');
+    event.initStorageEvent('changed');check(event.type==='changed' && event.key===null && event.oldValue===null && event.newValue===null && event.url==='' && event.storageArea===null,'legacy init optional defaults');
+    const target=new EventTarget();target.addEventListener('changed',()=>event.initStorageEvent('forged',true,true,'k','o','n','url',local));target.dispatchEvent(event);
+    check(event.type==='changed' && event.key===null && !event.isTrusted,'legacy init does not change dispatching event');
     check(local===localStorage && session===sessionStorage,'same window objects');
     check(local!==session && local instanceof C && session instanceof C,'separate branded areas');
     check(Object.prototype.toString.call(local)==='[object Storage]','toStringTag');

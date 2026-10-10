@@ -857,6 +857,7 @@ static void resource_completed(webnet *net, uint64_t id, uint64_t gen,
         struct web_response *r = malloc(sizeof *r);
         if (r) {
             response_copy(r, result, network_kind(t->kind));
+            r->event = result->event; r->uploaded = result->uploaded;
             web_resource_loaded(doc, t->resource_id, r);
             web_response_free(r); free(r);
         } else {
@@ -864,7 +865,8 @@ static void resource_completed(webnet *net, uint64_t id, uint64_t gen,
             web_resource_loaded(doc, t->resource_id, &failure);
         }
     }
-    remove_transfer(t);
+    if (result->event == WEBNET_COMPLETE || result->event == WEBNET_END) remove_transfer(t);
+    else if (t->detached) webnet_resume(net, id);
 }
 
 static bool host_request(void *opaque, const struct web_request *request) {
@@ -886,6 +888,7 @@ static bool host_request(void *opaque, const struct web_request *request) {
         .image_upgrade = request->kind == WEB_RESOURCE_IMAGE && request->image_upgrade,
         .cache_mode = request->cache_mode, .keepalive = request->keepalive,
         .fetch_group = request->fetch_group
+        , .stream_response = request->stream_response
     };
     t->network_id = webnet_submit(network, &r, resource_completed, t);
     if (!t->network_id) { free(t); return false; }
@@ -908,10 +911,15 @@ static void host_release_request(void *opaque, uint64_t id) {
     (void)opaque;
     for (struct transfer *t = transfers; t; t = t->next)
         if (t->generation == generation && t->resource_id == id) {
-            if (t->keepalive) t->detached = true;
+            if (t->keepalive) { t->detached = true; webnet_resume(network, t->network_id); }
             else { webnet_cancel(network, t->network_id); remove_transfer(t); }
             return;
         }
+}
+static void host_resume_request(void *opaque, uint64_t id) {
+    (void)opaque;
+    for (struct transfer *t = transfers; t; t = t->next)
+        if (t->generation == generation && t->resource_id == id) { webnet_resume(network, t->network_id); return; }
 }
 
 static void cancel_document_requests(void) {
@@ -923,7 +931,7 @@ static void cancel_document_requests(void) {
            retains native requests but permanently removes old JS delivery. */
         if (quit) { webnet_cancel(network,t->network_id); *at=t->next; free(t); continue; }
         if (t->generation != generation) { at=&t->next; continue; }
-        if (t->keepalive) { t->detached=true; at=&t->next; continue; }
+        if (t->keepalive) { t->detached=true; webnet_resume(network,t->network_id); at=&t->next; continue; }
         *at=t->next; free(t);
     }
 }
@@ -1239,7 +1247,7 @@ static bool host_sync_load(void *opaque, const char *url, int kind, struct web_r
 }
 
 static const struct web_host browser_host = {
-    .request = host_request, .cancel = host_cancel, .release_request = host_release_request, .sync_load = host_sync_load,
+    .request = host_request, .cancel = host_cancel, .release_request = host_release_request, .resume_request = host_resume_request, .sync_load = host_sync_load,
     .sync_request = host_sync_request,
     .navigate = host_navigate, .console = host_console, .scroll = host_scroll,
     .navigate_form = host_navigate_form,
@@ -1251,7 +1259,7 @@ static const struct web_host browser_host = {
     .cookie_get = host_cookie_get, .cookie_set = host_cookie_set,
     .cookie_enabled = host_cookie_enabled
     , .navigate_mode = host_navigate_mode
-    , .storage = host_storage
+    , .storage = host_storage, .storage_events = true
     , .media_range = true
 };
 

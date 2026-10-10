@@ -940,7 +940,7 @@ static void assignment_dirty(node_t *p, node_t *c) {
 /* Private status: 0 valid, 1 hierarchy, 2 reference-not-found. This performs
    no adoption, detach, Range migration or observer delivery. Validate a whole
    fragment before moving its first child, including Document's order rules. */
-static int insertion_validity(node_t *p, node_t *c, node_t *before, node_t *replaced) {
+static int insertion_validity(node_t *p, node_t *c, node_t *before, node_t *replaced, bool replace_all) {
     if (!p || !c || (p->type != N_DOC && p->type != N_ELEM && p->type != N_FRAGMENT) ||
         c->type == N_DOC || c->type == N_ATTR) return 1;
     for (node_t *a = p; a; a = a->parent ? a->parent : a->shadow_host ? a->shadow_host : a->template_host)
@@ -959,7 +959,7 @@ static int insertion_validity(node_t *p, node_t *c, node_t *before, node_t *repl
     bool preceding = true;
     for (node_t *n = p->first; n; n = n->next) {
         if (n == before) preceding = false;
-        if (n == c || n == replaced) continue;
+        if (replace_all || n == c || n == replaced) continue;
         if (elements && (n->type == N_ELEM || (!preceding && n->type == N_DOCTYPE))) return 1;
         if (doctypes && (n->type == N_DOCTYPE || (preceding && n->type == N_ELEM))) return 1;
     }
@@ -967,14 +967,18 @@ static int insertion_validity(node_t *p, node_t *c, node_t *before, node_t *repl
 }
 
 int doc_node_insert_validity(node_t *p, node_t *c, node_t *before) {
-    return insertion_validity(p,c,before,NULL);
+    return insertion_validity(p,c,before,NULL,false);
 }
 
 int doc_node_replace_validity(node_t *p, node_t *c, node_t *old) {
     /* Do not remove Document's old root merely to make insertion validation
        pass. Its exclusion is part of validation, before any tree mutation. */
     if(!old)return 2;
-    return insertion_validity(p,c,old,old);
+    return insertion_validity(p,c,old,old,false);
+}
+int doc_node_replace_all_validity(node_t *p,node_t *c) {
+    if(!c)return !p || (p->type!=N_DOC&&p->type!=N_ELEM&&p->type!=N_FRAGMENT);
+    return insertion_validity(p,c,NULL,NULL,true);
 }
 
 void doc_parser_form_set(node_t *node,node_t *form){
@@ -1076,6 +1080,13 @@ bool doc_node_replace(web_doc *d, node_t *p, node_t *c, node_t *old) {
     if(!doc_node_adopt(d,c))return false;
     if(old->parent)doc_node_remove(d,old);
     return doc_node_move(d,p,c,reference);
+}
+bool doc_node_replace_all(web_doc *d,node_t *p,node_t *c) {
+    if(!d||!p||p->owner!=d||doc_node_replace_all_validity(p,c))return false;
+    /* Reserve/adopt before touching the old children, as with replacement. */
+    if(c&&(c->owner!=d||c->parent)&&!doc_node_adopt(d,c))return false;
+    while(p->first)doc_node_remove(d,p->first);
+    return !c||doc_node_move(d,p,c,NULL);
 }
 
 static void adopt_subtree(web_doc *d, node_t *root) {

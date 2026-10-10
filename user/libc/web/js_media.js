@@ -52,7 +52,7 @@ const mediaBridge = (() => {
             const s=get(target), matches=evaluate(s.query);
             if (matches !== s.last) {
                 s.last=matches;const event=new MediaQueryListEvent('change',{media:s.media,matches});
-                event.isTrusted=true;dispatch(target,event);
+                eventState(event).isTrusted=true;dispatch(target,event);
             }
             retain(target);
         }

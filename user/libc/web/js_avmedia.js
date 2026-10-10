@@ -8,7 +8,7 @@ const avmediaBridge = (() => {
     const native = host.avmedia, states = new WeakMap(), active = new Set();
     let timer = 0;
     const mediaEvents = ['loadstart','loadedmetadata','loadeddata','canplay','canplaythrough','play','playing','pause','timeupdate','ended','error','emptied','seeking','seeked','volumechange','durationchange','abort','waiting','stalled','progress'];
-    function event(node,type) { const e=new Event(type);e.isTrusted=true;dispatch(node,e); }
+    function event(node,type) { const e=new Event(type);eventState(e).isTrusted=true;dispatch(node,e); }
     function brand(node) {
         if (!node || (node.localName !== 'audio' && node.localName !== 'video') || node.namespaceURI !== 'http://www.w3.org/1999/xhtml') throw new TypeError('HTMLMediaElement receiver required');
         native('state',node); // native opaque node brand, not a user-spoofed tag string

@@ -7,6 +7,42 @@ function parserWorkerSafetyProgram(){
     let synchronouslyRunning=true,firstBlocked=false,firstResult,checks=0;
     const errors=[],events=[];
     const check=(name,value)=>{checks++;if(!value)errors.push(name);};
+    function workerRuntimeEventCases(message){
+        check('workerRuntimeEvent native message trusted',message.isTrusted===true&&message.target===self&&message.currentTarget===self&&message.eventPhase===2);
+        const target=new EventTarget(),event=new Event('private',{cancelable:false});let calls=0;
+        target.addEventListener('private',()=>calls++);target.addEventListener('forged',()=>calls+=100);
+        Object.defineProperty(event,'type',{value:'forged'});event._stop=true;event._dispatching=true;
+        target.dispatchEvent(event);check('workerRuntimeEvent public fields do not select dispatch',calls===1);
+        Object.defineProperty(event,'cancelable',{value:true});Object.defineProperty(event,'defaultPrevented',{value:true});event.preventDefault();
+        check('workerRuntimeEvent forged cancellation does not cancel',target.dispatchEvent(event)===true);
+        let forged=false;try{Object.defineProperty(event,'isTrusted',{value:true});}catch(_){forged=true;}
+        check('workerRuntimeEvent trust unforgeable',forged&&event.isTrusted===false);
+        check('workerRuntimeEvent base readonly IDL',Object.getOwnPropertyDescriptor(Event.prototype,'type').set===undefined&&Object.getOwnPropertyDescriptor(event,'isTrusted').configurable===false);
+        const stopped=new Event('private');stopped.stopPropagation();target.dispatchEvent(stopped);
+        check('workerRuntimeEvent pre-stopped dispatch',calls===2);target.dispatchEvent(stopped);
+        check('workerRuntimeEvent stop flags reset after dispatch',calls===3);
+        const phases=[],order=new EventTarget();order.addEventListener('order',()=>phases.push('bubble'));order.addEventListener('order',()=>phases.push('capture'),true);
+        order.dispatchEvent(new Event('order'));check('workerRuntimeEvent target capture before bubble',phases.join(',')==='capture,bubble');
+        const immediate=new EventTarget();let suppressed=0;
+        immediate.addEventListener('once',e=>{suppressed++;e.stopImmediatePropagation();});immediate.addEventListener('once',()=>suppressed+=100);immediate.ononce=()=>suppressed+=100;
+        immediate.dispatchEvent(new Event('once'));check('workerRuntimeEvent immediate stops handlers',suppressed===1);
+        const passive=new EventTarget();passive.addEventListener('passive',e=>e.preventDefault(),{passive:true});
+        check('workerRuntimeEvent passive listener does not cancel',passive.dispatchEvent(new Event('passive',{cancelable:true})));
+        const active=new EventTarget();active.addEventListener('active',e=>e.preventDefault());check('workerRuntimeEvent real cancellation',!active.dispatchEvent(new Event('active',{cancelable:true})));
+        const reentrant=new EventTarget();let invalid=false,path=false;const running=new Event('running');
+        reentrant.addEventListener('running',e=>{path=e.composedPath()[0]===reentrant;try{reentrant.dispatchEvent(e);}catch(x){invalid=x.name==='InvalidStateError';}e.initEvent('changed');});
+        reentrant.dispatchEvent(running);check('workerRuntimeEvent reentrant blocked and init ignored',invalid&&running.type==='running');
+        check('workerRuntimeEvent path and dispatch state cleanup',path&&running.currentTarget===null&&running.eventPhase===0&&running.composedPath().length===0);
+        const controller=new AbortController();let abortEvent;controller.signal.addEventListener('abort',e=>abortEvent=e);controller.abort();
+        check('workerRuntimeEvent native abort trusted',abortEvent&&abortEvent.isTrusted===true);controller.signal.dispatchEvent(abortEvent);
+        check('workerRuntimeEvent author redispatch clears trusted',abortEvent.isTrusted===false);
+        const removed=new EventTarget(),removeController=new AbortController();let removedCalls=0;
+        removed.addEventListener('removed',()=>removedCalls++,{signal:removeController.signal});removeController.abort();removed.dispatchEvent(new Event('removed'));
+        check('workerRuntimeEvent signal removes listeners',removedCalls===0);
+        const channel=new MessageChannel();let portMessage=false;
+        channel.port2.onmessage=e=>{portMessage=e.isTrusted===true&&e.target===channel.port2&&e.data===42;};channel.port1.postMessage(42);
+        return ()=>{check('workerRuntimeEvent native local port trusted',portMessage);channel.port1.close();channel.port2.close();};
+    }
     const blocked=fn=>{try{fn();return false;}catch(e){return e instanceof TypeError;}};
     self.onsecuritypolicyviolation=e=>events.push({trusted:e.isTrusted,async:!synchronouslyRunning,
         directive:e.effectiveDirective,disposition:e.disposition,uri:e.documentURI});
@@ -18,6 +54,7 @@ function parserWorkerSafetyProgram(){
         const restore=()=>{for(const [prototype,key,descriptor] of poisoned){
             if(descriptor)Object.defineProperty(prototype,key,descriptor);else delete prototype[key];}};
         try{
+            const finishEvents=workerRuntimeEventCases(e);
             for(const prototype of [Object.prototype,Array.prototype]){
                 poisoned.push([prototype,'toJSON',Object.getOwnPropertyDescriptor(prototype,'toJSON')]);
                 Object.defineProperty(prototype,'toJSON',{configurable:true,value(){jsonCalls++;throw new Error('author toJSON in native CSP');}});
@@ -51,6 +88,7 @@ function parserWorkerSafetyProgram(){
             check('importScripts untrusted URL',blocked(()=>importScripts(importURL))===enforce);
             importScripts(p.createScriptURL(importURL));check('importScripts trusted URL',self.__workerImport===true);
             setTimeout(()=>{
+                finishEvents();
                 check('timer result',enforce?self.__workerTimer===undefined:self.__workerTimer===7);
                 check('native CSP event asynchronous and trusted',events.every(x=>x.async&&x.trusted));
                 check('violation event policy',mode==='plain'?events.length===0:events.some(x=>x.disposition===(report?'report':'enforce')&&x.directive==='require-trusted-types-for'));

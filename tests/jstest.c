@@ -135,7 +135,9 @@ static void network_complete(webnet *net,uint64_t id,uint64_t generation,
     r.body=malloc(response->body_len+1);r.body_len=response->body_len;
     if(r.body){if(r.body_len)memcpy(r.body,response->body,r.body_len);r.body[r.body_len]=0;}
     if(!r.body||!r.headers_full)snprintf(r.error,sizeof r.error,"fixture response allocation failed");
-    q->used=false;web_resource_loaded(fixture.doc,q->id,&r);
+    r.event=response->event;r.uploaded=response->uploaded;
+    if(response->event==WEBNET_COMPLETE||response->event==WEBNET_END)q->used=false;
+    web_resource_loaded(fixture.doc,q->id,&r);
     web_response_free(&r);fixture.completions++;
 }
 static bool request(void *opaque, const struct web_request *r) {
@@ -170,7 +172,7 @@ static bool request(void *opaque, const struct web_request *r) {
                 .generation=1,.url=r->url,.origin=r->origin,.method=r->method,.headers=r->headers,
                 .body=r->body,.body_len=r->body_len,.credentials=(enum webnet_credentials)r->credentials,
                 .same_origin=r->same_origin,.redirect_error=r->redirect_error,
-                .no_cors=r->no_cors,.no_referrer=r->no_referrer};
+                .no_cors=r->no_cors,.no_referrer=r->no_referrer,.stream_response=r->stream_response};
             q->transport_id=webnet_submit(f->net,&native,network_complete,q);
             if(!q->transport_id){q->used=false;return false;}
         }
@@ -183,6 +185,12 @@ static void cancel(void *opaque, uint64_t id) {
     for (int i = 0; i < SLOTS; i++) if (f->queue[i].used && f->queue[i].id == id) {
         if(f->queue[i].transport_id&&f->net)webnet_cancel(f->net,f->queue[i].transport_id);
         f->queue[i].used = false; f->cancellations++; break;
+    }
+}
+static void resume_request(void *opaque,uint64_t id){
+    struct fixture *f=opaque;
+    for(int i=0;i<SLOTS;i++)if(f->queue[i].used&&f->queue[i].id==id&&f->queue[i].transport_id){
+        webnet_resume(f->net,f->queue[i].transport_id);break;
     }
 }
 static void long_headers(struct web_response *r, const char *mime) {
@@ -307,6 +315,7 @@ static web_doc *open_case_url_budget(const char *html, bool expected_errors, con
     struct web_host host = {.opaque=&fixture, .request=request, .cancel=cancel, .sync_load=sync_load,
                             .navigate=navigate, .console=receive_log, .scroll=scroll_position,.history=history_host,
                             .js_task_budget_ms=task_budget_ms};
+    if(case_real_network)host.resume_request=resume_request;
     fixture.history_length = 1; fixture.history_serial = 1;
     fixture.history[0].url = strdup(url); fixture.history[0].entry = 1;
     fixture.doc = web_live_response(html, strlen(html), url, "utf-8",case_response_headers,&host);
@@ -1174,6 +1183,15 @@ static void test_html_parser(void){
         "check('open-write-immediate',document.getElementById('stream-now').textContent==='now');document.close();mark('stream-done');},{once:true});");
     if(stream&&open_case(stream,false)){test_check("top-level-open-stream",pump("stream-done",5000));test_check("top-level-stream-no-errors",fixture.errors==0&&fixture.js_failures==0);close_case();}free(stream);
 }
+static void test_network_stream(void){
+    FILE *ports=fopen("/data/tests/webports","r");unsigned first=0,second=0;char text[96],origin[128];
+    test_check("stream-fixture-ports",ports&&fgets(text,sizeof text,ports)&&sscanf(text,"%u %u",&first,&second)==2&&first);
+    if(ports)fclose(ports);if(!first)return;
+    snprintf(origin,sizeof origin,"http://10.0.2.2:%u/",first);
+    case_real_network=true;
+    external_case("js_network_stream_cases.js",";runNetworkStreamCases().then(()=>mark('api-done'),e=>{check('stream-unexpected-error',false);console.log(String(e)+' '+e.stack);mark('api-done');});",origin);
+    case_real_network=false;
+}
 static void test_html_worker(void){
     FILE *ports=fopen("/data/tests/webports","r");unsigned first=0,second=0;char port_text[96];
     test_check("worker-fixture-ports",ports && fgets(port_text,sizeof port_text,ports) && sscanf(port_text,"%u %u",&first,&second)==2 && first);
@@ -1205,9 +1223,17 @@ int main(int argc, char **argv) {
     RUN("html-parser", test_html_parser);
     RUN("html-worker", test_html_worker);
     RUN("html-csp", test_html_csp);
+    RUN("network-stream", test_network_stream);
     RUN("platform", test_platform);
     /* An API-only selector avoids repeating the full platform batch. */
     if (argc > 1 && !strcmp(argv[1], "fetch-api")) { printf("jstest: fetch-api\n"); fflush(stdout); test_fetch_api(); }
+    if (argc > 1 && !strcmp(argv[1], "dom-api")) {
+        printf("jstest: dom-api\n"); fflush(stdout);
+        external_case("js_event_handler_cases.js", ";check('event-handler-count',runEventHandlerCases()===18);mark('api-done');", BASE);
+        external_case("js_observer_cases.js", ";runObserverCases().then(n=>{check('observer-count',n>=40);mark('api-done');},e=>{console.log('FAIL observer '+e);mark('api-done');});", BASE);
+        external_case("js_dom_runtime_cases.js", ";runDOMRuntimeCases().then(n=>{check('dom-runtime-count',n>=40);mark('api-done');},e=>{console.log('FAIL dom-runtime '+e);mark('api-done');});", BASE);
+        external_case("js_custom_elements_cases.js", ";runCustomElementCases().then(n=>{check('custom-elements-count',n>30);mark('api-done');},e=>{console.log('FAIL custom-elements '+e);mark('api-done');});", BASE);
+    }
     RUN("broadcast", test_broadcast);
     RUN("retired-jobs", test_retired_jobs);
     RUN("retired-tasks", test_retired_tasks);

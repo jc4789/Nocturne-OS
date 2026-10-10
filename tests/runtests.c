@@ -26,6 +26,21 @@ struct test {
 };
 
 static const struct test tests[] = {
+    /* Focused product routes for the eight WHATWG repairs. */
+    {"slop8", "script-lifecycle", "tcc -o /home/scriptlifecycletest /data/tests/scriptlifecycletest.c && /home/scriptlifecycletest", 0,
+     {"scriptlifecycletest: 15 checks, 0 failed"}, "FAIL", 60, false, true},
+    {"slop8", "storage-windows", "tcc -o /home/storagewindowtest /data/tests/storagewindowtest.c && /home/storagewindowtest", 0,
+     {"STORAGE-WINDOW-DONE", "failures=0"}, "FAIL", 120, false, true},
+    {"slop8", "dom-events-observers", "tcc -o /home/jstest /data/tests/jstest.c && /home/jstest dom-api", 0,
+     {"jstest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"slop8", "network-stream", "tcc -o /home/jstest /data/tests/jstest.c && /home/jstest network-stream", 0,
+     {"jstest: ", ", 0 failed"}, "FAIL", 180, false, true},
+    {"slop8", "fetch-regression", "tcc -o /home/jstest /data/tests/jstest.c && /home/jstest fetch-api", 0,
+     {"jstest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"slop8", "xhr-regression", "tcc -o /home/jstest /data/tests/jstest.c && /home/jstest xhr", 0,
+     {"jstest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"slop8", "worker-events", "tcc -o /home/jstest /data/tests/jstest.c && /home/jstest html-worker", 0,
+     {"jstest: ", ", 0 failed"}, "FAIL", 180, false, true},
     /* shell */
     {"sh", "pipe", "echo hello world | grep world", 0, {"hello world"}},
     {"sh", "and-or", "false || echo A; true && echo B; false && echo C", NONZERO, {"A\nB\n"}, "C"},

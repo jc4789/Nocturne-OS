@@ -26,7 +26,7 @@ const textTrackBridge = (() => {
     function plain(value){const text=string(value);if(text.includes('\0'))throw new TypeError('Cue contains NUL');
         if(/<[^>]*>/.test(text))throw unsupported('WebVTT cue markup/internal timestamps are unsupported');
         if(size(text)>MAX_TEXT)throw quota('Cue text exceeds 2 KiB');return text;}
-    function fire(target,type,extra){const e=new Event(type);if(extra)for(const k of Object.keys(extra))define(e,k,{value:extra[k],enumerable:true});e.isTrusted=true;dispatch(target,e);}
+    function fire(target,type,extra){const e=new Event(type);if(extra)for(const k of Object.keys(extra))define(e,k,{value:extra[k],enumerable:true});eventState(e).isTrusted=true;dispatch(target,e);}
     function queue(target,type,extra,guard){schedule(()=>{if(!guard||guard())fire(target,type,extra);});}
     function indexed(object,items){const s=lookup(listSlots,object,'Text track list');s.items=items;
         for(let i=0;i<s.indexed;i++)delete object[i];

@@ -6,7 +6,7 @@
 const mutationBridge = (() => {
     const native=typeof host.mutationObserve==='function';
     const registrations=new WeakMap(), observers=new WeakMap(), records=new WeakMap();
-    const pending=new Set(),signalSlots=new Set();let scheduled=false,active=0;
+    const pending=new Set(),signalSlots=new Set();let scheduled=false,active=0,nextObserver=0;
     const get=(n,k)=>rawDom.get(n,k), parent=n=>get(n,'parentNode'), children=n=>get(n,'childNodes');
     const attr=(n,k)=>reflectedAttr(n,k);
     function data(o){const d=observers.get(o);if(!d)throw new TypeError('Illegal MutationObserver receiver');return d;}
@@ -14,6 +14,7 @@ const mutationBridge = (() => {
         if(!native)return;
         for(const row of host.mutationTake()){
             const d=observers.get(row.observer);if(!d || !d.active)continue;
+            pending.add(row.observer);if(!row.fields)continue;
             const fields=row.fields,record=Object.create(MutationRecord.prototype);
             records.set(record,{...fields,addedNodes:list(fields.addedNodes),removedNodes:list(fields.removedNodes)});
             d.queue.push(record);pending.add(row.observer);
@@ -22,12 +23,16 @@ const mutationBridge = (() => {
     function ancestorRegistrations(n){const a=[];for(;n;n=parent(n)){const r=registrations.get(n);if(r)a.push(...r);}return a;}
     function notify(){
         drain();
-        scheduled=false;const deliver=Array.from(pending),slots=Array.from(signalSlots);pending.clear();signalSlots.clear();
-        for(const o of deliver){const d=data(o),q=d.queue;d.queue=[];
+        scheduled=false;const deliver=Array.from(pending).sort((a,b)=>data(a).index-data(b).index),slots=Array.from(signalSlots);pending.clear();signalSlots.clear();
+        for(const o of deliver){
+            // A prior callback can queue native records for an observer whose
+            // turn has not started. Snapshot that observer only at its turn.
+            drain();pending.delete(o);const d=data(o),q=d.queue;d.queue=[];
+            if(native)host.mutationObserve(o,null,-1);
             for(const r of Array.from(d.regs))if(r.source){registrations.get(r.node).delete(r);d.regs.delete(r);}
             if(q.length)try{apply(d.callback,o,[q,o]);}catch(e){report(e);}
         }
-        for(const slot of slots){const event=new Event('slotchange',{bubbles:true});event.isTrusted=true;dispatch(slot,event);}
+        for(const slot of slots){const event=new Event('slotchange',{bubbles:true});eventState(event).isTrusted=true;dispatch(slot,event);}
     }
     function enqueue(type,target,fields={}){
         const interested=new Map();
@@ -70,6 +75,11 @@ const mutationBridge = (() => {
                 same:key===value,previousSibling:get(value,'previousSibling'),nextSibling};
         }
         if(op==='remove')return {op,removal:removal(node)};
+        if(op==='replaceAll'){
+            const nodes=key?(get(key,'nodeType')===11?children(key):[key]):[];
+            return {op:'replaceAll',node,old:children(node),regs:ancestorRegistrations(node),
+                fragment:key&&get(key,'nodeType')===11?key:null,nodes,removals:nodes.map(removal)};
+        }
         if(op==='set' && ['innerHTML','textContent','nodeValue'].includes(key)){
             const type=get(node,'nodeType');
             if((key==='nodeValue' || key==='textContent') && (type===3 || type===7 || type===8))return {op:'characterData',node,oldValue:get(node,'nodeValue')};
@@ -89,7 +99,11 @@ const mutationBridge = (() => {
             const now=rawDom.attrNS(t.node,t.namespace,t.name);
             if((now!==null || t.oldValue!==null) && (!t.style || now!==t.oldValue))enqueue('attributes',t.node,{attributeName:t.name,attributeNamespace:t.namespace,oldValue:t.oldValue});
         }else if(t.op==='characterData')enqueue('characterData',t.node,{oldValue:t.oldValue});
-        else if(t.op==='children'){
+        else if(t.op==='replaceAll'){
+            if(t.fragment&&t.nodes.length){for(const r of t.removals)if(r)transient(r.node,r.regs);enqueue('childList',t.fragment,{removedNodes:t.nodes});}
+            for(const n of t.old)transient(n,t.regs);
+            if(t.old.length||t.nodes.length)enqueue('childList',t.node,{addedNodes:t.nodes,removedNodes:t.old});
+        }else if(t.op==='children'){
             const added=children(t.node);for(const n of t.old)transient(n,t.regs);
             if(added.length || t.old.length)enqueue('childList',t.node,{addedNodes:added,removedNodes:t.old});
         }else if(t.op==='replace'){
@@ -112,7 +126,7 @@ const mutationBridge = (() => {
         }
     }
     class MutationObserver {
-        constructor(callback){if(typeof callback!=='function')throw new TypeError('Expected callback');observers.set(this,{callback,queue:[],regs:new Set(),active:false});}
+        constructor(callback){if(typeof callback!=='function')throw new TypeError('Expected callback');observers.set(this,{callback,queue:[],regs:new Set(),active:false,index:nextObserver++});}
         observe(target,options={}){
             const d=data(this);if(!target || typeof target!=='object')throw new TypeError('Expected Node');get(target,'nodeType');
             if(options===null)options={};if(typeof options!=='object' && typeof options!=='function')throw new TypeError('Expected options dictionary');

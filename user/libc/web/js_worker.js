@@ -39,7 +39,7 @@ const workerBridge=(()=>{
             event=new ErrorEvent('error',{cancelable:true,message:String(payload.message||'Worker failed'),filename:String(payload.filename||''),lineno:payload.lineno||0});
         }
         else if(kind===6){slots.get(worker).closed=true;live.delete(id);messagingBridge.closeWorker(id);return;}else return;
-        event.isTrusted=true;
+        eventState(event).isTrusted=true;
         if(dispatch(worker,event)&&kind===4)host.log(2,'Worker: '+event.message);
     }};
 })();

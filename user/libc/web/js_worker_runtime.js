@@ -6,10 +6,82 @@
     delete globalThis.SharedArrayBuffer;delete globalThis.Atomics;
     /* @include js_dom_exception.js */
     const DOMException=domExceptionBridge.DOMException;
-    class Event{constructor(type,init={}){this.type=String(type);this.cancelable=!!init.cancelable;this.defaultPrevented=false;this.target=null;this.currentTarget=null;}preventDefault(){if(this.cancelable)this.defaultPrevented=true;}}
-    class ErrorEvent extends Event{constructor(type,init={}){super(type,init);Object.assign(this,{message:init.message||'',filename:init.filename||'',lineno:init.lineno||0,colno:init.colno||0,error:init.error});}}
-    const listeners=new WeakMap();
-    class EventTarget{constructor(){listeners.set(this,new Map());}addEventListener(type,fn,options={}){if(fn==null)return;const m=listeners.get(this);if(!m)throw new TypeError('Illegal invocation');type=String(type);const list=m.get(type)||[];if(!list.some(x=>x.fn===fn))list.push({fn,once:!!options?.once});m.set(type,list);}removeEventListener(type,fn){const m=listeners.get(this);if(!m)throw new TypeError('Illegal invocation');m.set(String(type),(m.get(String(type))||[]).filter(x=>x.fn!==fn));}dispatchEvent(event){const m=listeners.get(this);if(!m||!(event instanceof Event))throw new TypeError('Invalid EventTarget/Event');const receiver=this===target?globalThis:this;event.target=event.currentTarget=receiver;for(const x of [...(m.get(event.type)||[])]){if(x.once)this.removeEventListener(event.type,x.fn);try{if(typeof x.fn==='function')x.fn.call(receiver,event);else x.fn.handleEvent(event);}catch(e){report(e);}}const fn=this['on'+event.type];if(typeof fn==='function'){try{fn.call(receiver,event);}catch(e){report(e);}}return !event.defaultPrevented;}}
+    const eventStates=new WeakMap(),listeners=new WeakMap(),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set;
+    const eventDefine=Object.defineProperty,eventMapGet=Map.prototype.get,eventMapSet=Map.prototype.set,eventSlice=Array.prototype.slice;
+    const EventMap=Map,EventString=String,eventIndexOf=Array.prototype.indexOf,eventSplice=Array.prototype.splice;
+    const eventString=value=>{if(typeof value==='symbol')throw new TypeError('Symbol is not a DOMString');return EventString(value);};
+    function eventState(event){const s=apply(eventGet,eventStates,[event]);if(!s)throw new TypeError('Illegal Event receiver');return s;}
+    class Event{
+        constructor(type,init={}){
+            if(!arguments.length)throw new TypeError('Event requires type');type=eventString(type);init=init==null?{}:Object(init);
+            apply(eventSet,eventStates,[this,{type,bubbles:!!init.bubbles,cancelable:!!init.cancelable,composed:!!init.composed,
+                target:null,currentTarget:null,eventPhase:0,defaultPrevented:false,isTrusted:false,timeStamp:host.now(),
+                stop:false,immediate:false,passive:false,dispatching:false,initialized:true,path:[]}]);
+            eventDefine(this,'isTrusted',{enumerable:true,get(){return eventState(this).isTrusted;}});
+        }
+        initEvent(type,bubbles=false,cancelable=false){
+            const s=eventState(this);if(!arguments.length)throw new TypeError('initEvent requires type');type=eventString(type);if(s.dispatching)return;
+            s.type=type;s.bubbles=!!bubbles;s.cancelable=!!cancelable;s.stop=s.immediate=s.defaultPrevented=false;s.isTrusted=false;s.target=null;s.initialized=true;
+        }
+        preventDefault(){const s=eventState(this);if(s.cancelable&&!s.passive)s.defaultPrevented=true;}
+        stopPropagation(){eventState(this).stop=true;}
+        stopImmediatePropagation(){const s=eventState(this);s.stop=s.immediate=true;}
+        composedPath(){return apply(eventSlice,eventState(this).path,[]);}
+        get cancelBubble(){return eventState(this).stop;}set cancelBubble(value){if(value)eventState(this).stop=true;}
+        get returnValue(){return !eventState(this).defaultPrevented;}set returnValue(value){const s=eventState(this);if(!value&&s.cancelable&&!s.passive)s.defaultPrevented=true;}
+    }
+    for(const key of ['type','target','srcElement','currentTarget','eventPhase','bubbles','cancelable','composed','defaultPrevented','timeStamp'])
+        eventDefine(Event.prototype,key,{configurable:true,enumerable:true,get(){return eventState(this)[key==='srcElement'?'target':key];}});
+    for(const [key,value]of [['NONE',0],['CAPTURING_PHASE',1],['AT_TARGET',2],['BUBBLING_PHASE',3]]){
+        eventDefine(Event,key,{value,enumerable:true});eventDefine(Event.prototype,key,{value,enumerable:true});
+    }
+    /* @include js_error_event.js */
+    function workerListeners(value){const m=apply(eventGet,listeners,[value]);if(!m)throw new TypeError('Illegal EventTarget receiver');return m;}
+    function removeWorkerListener(list,entry){if(entry.removed)return;entry.removed=true;const index=apply(eventIndexOf,list,[entry]);if(index>=0)apply(eventSplice,list,[index,1]);if(entry.unlisten){entry.unlisten();entry.unlisten=null;}}
+    class EventTarget{
+        constructor(){apply(eventSet,listeners,[this,new EventMap()]);}
+        addEventListener(type,fn,options={}){
+            const m=workerListeners(this);type=eventString(type);if(fn==null)return;
+            if(typeof fn!=='function'&&typeof fn!=='object')throw new TypeError('Invalid event listener');
+            const capture=typeof options==='boolean'?options:!!options?.capture,once=typeof options==='object'&&!!options?.once,
+                passive=typeof options==='object'&&!!options?.passive,signal=typeof options==='object'?options?.signal:null;
+            if(signal!=null&&!workerAbortBridge.brand(signal))throw new TypeError('Expected AbortSignal');
+            if(signal!=null&&workerAbortBridge.state(signal).aborted)return;
+            const list=apply(eventMapGet,m,[type])||[];
+            if(list.some(x=>!x.removed&&x.fn===fn&&x.capture===capture))return;
+            const entry={fn,capture,once,passive,removed:false,unlisten:null};list.push(entry);apply(eventMapSet,m,[type,list]);
+            if(signal!=null)entry.unlisten=workerAbortBridge.subscribe(signal,()=>removeWorkerListener(list,entry));
+        }
+        removeEventListener(type,fn,options={}){
+            const m=workerListeners(this);type=eventString(type);const capture=typeof options==='boolean'?options:!!options?.capture,
+                list=apply(eventMapGet,m,[type])||[];
+            for(const entry of list)if(!entry.removed&&entry.fn===fn&&entry.capture===capture){removeWorkerListener(list,entry);break;}
+        }
+        dispatchEvent(event){workerListeners(this);const s=eventState(event);if(!s.initialized||s.dispatching)throw new DOMException('Uninitialized or dispatching event','InvalidStateError');s.isTrusted=false;return dispatchWorkerEvent(this,event);}
+    }
+    function dispatchWorkerEvent(object,event){
+        const m=workerListeners(object),s=eventState(event);if(!s.initialized||s.dispatching)throw new DOMException('Uninitialized or dispatching event','InvalidStateError');
+        const receiver=object===target?globalThis:object,type=s.type,reached=!s.stop;s.dispatching=true;s.target=receiver;s.path=[receiver];
+        try{
+            const invoke=capture=>{
+                if(s.stop)return;s.currentTarget=receiver;s.eventPhase=2;
+                const list=apply(eventMapGet,m,[type])||[],snapshot=apply(eventSlice,list,[]);
+                for(const entry of snapshot){
+                    if(entry.removed||entry.capture!==capture)continue;if(entry.once)removeWorkerListener(list,entry);s.passive=entry.passive;
+                    try{if(typeof entry.fn==='function')apply(entry.fn,receiver,[event]);else{const fn=entry.fn.handleEvent;if(typeof fn==='function')apply(fn,entry.fn,[event]);}}catch(error){report(error);}finally{s.passive=false;}
+                    if(s.immediate)break;
+                }
+            };
+            if(reached)invoke(true);if(reached&&!s.immediate){
+                /* stopPropagation at this target still permits its remaining
+                 * listeners; stopImmediatePropagation suppresses them. */
+                const stopped=s.stop;s.stop=false;invoke(false);s.stop=s.stop||stopped;
+                if(!s.immediate){try{const fn=object['on'+type];if(typeof fn==='function'&&apply(fn,receiver,[event])===false&&s.cancelable)s.defaultPrevented=true;}catch(error){report(error);}}
+            }
+            return !s.defaultPrevented;
+        }finally{s.currentTarget=null;s.eventPhase=0;s.path=[];s.dispatching=s.passive=s.stop=s.immediate=false;}
+    }
+    function dispatchNativeWorkerEvent(object,event){eventState(event).isTrusted=true;return dispatchWorkerEvent(object,event);}
     Object.assign(globalThis,{DOMException,Event,ErrorEvent,EventTarget});
     /* @include js_navigator.js */
     const {navigator,Interface:WorkerNavigator}=navigatorBridge.create(true);
@@ -23,7 +95,7 @@
     Object.assign(globalThis,{MessageEvent,MessagePort,MessageChannel});
     const target=new EventTarget(),timers=new Map(),fetches=new Map();let nextTimer=0,closed=false,address='',workerName='',workerCanCancel=false,reporting=false,lastPortTask=false;
     const errorPayload=e=>({message:String(e?.message||e),filename:address,lineno:0,stack:String(e?.stack||'')});
-    function report(e){const info=errorPayload(e);if(reporting){host.send(4,0,info);return;}reporting=true;try{const event=new ErrorEvent('error',{...info,error:e,cancelable:true});if(target.dispatchEvent(event))host.send(4,0,info);}finally{reporting=false;}}
+    function report(e){const info=errorPayload(e);if(reporting){host.send(4,0,info);return;}reporting=true;try{const event=new ErrorEvent('error',{...info,error:e,cancelable:true});if(dispatchNativeWorkerEvent(target,event))host.send(4,0,info);}finally{reporting=false;}}
     function evalSource(text,url){return host.eval(String(text),String(url));}
     function postMessage(value,options){if(closed)return;const list=Array.isArray(options)?options:options?.transfer,prepared=workerMessagingBridge.prepareExternal(value,cloneData.transferList(list));try{host.portSend(2,0,0,prepared.packet,prepared.plan);}catch(error){workerMessagingBridge.abortExternal(prepared);throw error;}}
     function close(){if(closed)return;closed=true;timers.clear();workerMessagingBridge.close();host.close();}
@@ -43,9 +115,9 @@
         const text=value=>{if(typeof value==='symbol')throw new TypeError('Symbol is not a DOMString');return string(value);};
         const removeDependencies=list=>{for(let i=0;i<list.length;i++)apply(remove,state(list[i][0]).dependents,[list[i][1]]);};
         const finalizer=new FinalizationRegistry(removeDependencies),register=FinalizationRegistry.prototype.register,unregister=FinalizationRegistry.prototype.unregister;
-        function retain(signal){const s=state(signal),m=apply(get,listeners,[signal]),events=m&&apply(mapGet,m,['abort']);if(!s.aborted&&size(s.sources)&&(size(s.algorithms)||s.handler||(events&&events.length)))apply(add,retained,[signal]);else apply(remove,retained,[signal]);}
+        function retain(signal){const s=state(signal),m=apply(get,listeners,[signal]),events=m&&apply(mapGet,m,['abort']);if(!s.aborted&&size(s.sources)&&(size(s.algorithms)||s.handler||(events&&events.some(entry=>!entry.removed))))apply(add,retained,[signal]);else apply(remove,retained,[signal]);}
         function clean(signal){const s=state(signal);removeDependencies(s.dependencies);s.dependencies=[];apply(clear,s.sources,[]);apply(unregister,finalizer,[signal]);apply(remove,retained,[signal]);}
-        function run(signal){const s=state(signal);each(s.algorithms,algorithm=>{try{algorithm(s.reason);}catch(error){safeReport(error);}});apply(clear,s.algorithms,[]);clean(signal);const event=new Event('abort');define(event,'isTrusted',{value:true,enumerable:true});try{apply(dispatch,signal,[event]);}catch(error){safeReport(error);}}
+        function run(signal){const s=state(signal);each(s.algorithms,algorithm=>{try{algorithm(s.reason);}catch(error){safeReport(error);}});apply(clear,s.algorithms,[]);clean(signal);const event=new Event('abort');try{dispatchNativeWorkerEvent(signal,event);}catch(error){safeReport(error);}}
         function abort(signal,reason){
             const s=state(signal);if(s.aborted)return;s.aborted=true;s.reason=reason===undefined?new DOMException('The operation was aborted','AbortError'):reason;
             const dependents=[];each(s.dependents,reference=>{const dependent=apply(deref,reference,[]);if(!dependent){apply(remove,s.dependents,[reference]);return;}const d=state(dependent);if(!d.aborted){d.aborted=true;d.reason=s.reason;dependents[dependents.length]=dependent;}});
@@ -163,9 +235,9 @@
     return {
         safetyCheck:htmlSafetyBridge.check,
         safetyDynamicCode:htmlSafetyBridge.dynamicCode,
-        safetyViolation(init){if(!closed)target.dispatchEvent(htmlSafetyBridge.violationEvent(init));},
+        safetyViolation(init){if(!closed)dispatchNativeWorkerEvent(target,htmlSafetyBridge.violationEvent(init));},
         start(r){address=r[1];workerName=String(r[5]||"");workerCanCancel=r[6]===true;if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker source failed','NetworkError');Object.defineProperty(globalThis,'location',{value:Object.freeze({href:address,origin:new URL(address).origin,toString(){return address;}}),configurable:true});evalSource(new TextDecoder().decode(r[3]),address);},
-        receive(packet,op=2,id=0,kind=0){try{if(op===8||op===9||op===10){workerMessagingBridge.receivePort(id,kind,packet,op!==8);return;}const payload=kind===3?workerMessagingBridge.importExternal(packet):{data:cloneData.deserialize(packet),ports:[]};if(!closed)target.dispatchEvent(new MessageEvent('message',{data:payload.data,ports:payload.ports}));}catch(e){if(!closed)target.dispatchEvent(new MessageEvent('messageerror'));}},
+        receive(packet,op=2,id=0,kind=0){try{if(op===8||op===9||op===10){workerMessagingBridge.receivePort(id,kind,packet,op!==8);return;}const payload=kind===3?workerMessagingBridge.importExternal(packet):{data:cloneData.deserialize(packet),ports:[]};if(!closed)dispatchNativeWorkerEvent(target,new MessageEvent('message',{data:payload.data,ports:payload.ports}));}catch(e){if(!closed)dispatchNativeWorkerEvent(target,new MessageEvent('messageerror'));}},
         loaded(id,r,flags=0){const p=workerFetchBridge.take(id);if(!p||closed)return;p.cleanup();if(r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!p.noCors)){p.reject(new TypeError(r[4]||'Worker fetch failed'));return;}try{p.resolve(workerFetchBridge.networkResponse(r,flags,p.signal));}catch(error){p.reject(error);}},
         tick(now){if(closed)return false;const ports=workerMessagingBridge.ready();if(ports&&!lastPortTask){lastPortTask=true;return workerMessagingBridge.runOne();}for(const [id,t]of timers){if(t.due>now)continue;lastPortTask=false;if(t.repeat)t.due=now+t.delay;else timers.delete(id);try{t.fn(...t.args);}catch(e){report(e);}return true;}lastPortTask=ports;return ports?workerMessagingBridge.runOne():false;},
         deadline(){if(workerMessagingBridge.ready())return host.now();let due=-1;for(const t of timers.values())if(due<0||t.due<due)due=t.due;return due;},report

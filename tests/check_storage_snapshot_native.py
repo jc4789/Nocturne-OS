@@ -9,7 +9,7 @@ include = out / "storage-native-include"
 include.mkdir(parents=True, exist_ok=True)
 (include / "webstorage.h").write_text((root / "user/include/webstorage.h").read_text(encoding="utf-8"), encoding="utf-8")
 (include / "nocturne.h").write_text("#pragma once\n", encoding="utf-8")
-(include / "fcntl.h").write_text("#pragma once\n#define O_RDONLY 0\n#define O_WRONLY 1\n#define O_CREAT 0x40\n#define O_TRUNC 0x200\n", encoding="utf-8")
+(include / "fcntl.h").write_text("#pragma once\n#define O_RDONLY 0\n#define O_WRONLY 1\n#define O_RDWR 2\n#define O_CREAT 0x40\n#define O_TRUNC 0x200\n#define F_NLOCK 1024\n#define F_NUNLOCK 1025\n", encoding="utf-8")
 cc = root / "tools/msys64/ucrt64/bin/clang.exe"
 env = dict(os.environ, PATH=str(cc.parent)+os.pathsep+os.environ.get("PATH", ""))
 exe = out / "storage-snapshot-native.exe"

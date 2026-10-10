@@ -30,6 +30,9 @@ struct job {
     size_t cookie_len, cookie_cap;
     bool hop_cookies, redirect_cross_site;
     bool cors_tainted, origin_tainted, redirected, opaque_tainted;
+    bool stream_headers_sent, stream_final, upload_finished;
+    size_t cookie_start;
+    const char *hop_method;
 };
 static bool read_all(int fd, void *p, size_t n) {
     while (n) {
@@ -472,6 +475,17 @@ static int body_cb(void *opaque, const char *data, size_t n) {
     struct job *j = opaque;
     if (!remaining(j)) return -1;
     if(j->opaque_tainted||j->wire.kind==WEBNET_REPORT)return 0; /* Retain no opaque/report response bytes. */
+    if (j->wire.user_navigation & WEBNET_WIRE_STREAM) {
+        while (n) {
+            size_t count = MIN(n, WEBNET_STREAM_CHUNK_MAX);
+            struct webnet_wire_response frame = {0};
+            frame.magic = WEBNET_STREAM_CHUNK; frame.id = j->wire.id; frame.generation = j->wire.generation;
+            frame.body_len = (uint32_t)count;
+            if (!write_all(1, &frame, sizeof frame) || !write_all(1, data, count)) return -1;
+            data += count; n -= count;
+        }
+        return 0;
+    }
     size_t limit = webnet_wire_response_limit(j->wire.kind, j->wire.user_navigation);
     if (j->body_len > limit || n > limit - j->body_len) {
         fail(j, "Response body exceeds the negotiated wire representation"); return -1;
@@ -654,6 +668,53 @@ static bool response_headers(struct job *j, const struct http_resp *r, bool cros
     free(j->response_headers); j->response_headers = out; j->response_headers_len = used;
     return true;
 }
+static int stream_upload(void *opaque, size_t sent, size_t total) {
+    struct job *j = opaque;
+    if (!(j->wire.user_navigation & WEBNET_WIRE_STREAM) || j->upload_finished) return 0;
+    struct webnet_wire_response frame = {0};
+    frame.magic = WEBNET_STREAM_UPLOAD; frame.id = j->wire.id; frame.generation = j->wire.generation;
+    frame.status = (uint32_t)sent;
+    if (sent == total) j->upload_finished = true;
+    return write_all(1, &frame, sizeof frame) ? 0 : -1;
+}
+static int response_start(void *opaque, const struct http_resp *response) {
+    struct job *j = opaque;
+    if (!apply_cookie_events(j, j->cookie_start, j->hop_method)) return -1;
+    if (j->cors_tainted && !cors_allowed(j, response)) return -1;
+    int status = response->status;
+    bool redirect = status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
+    if (redirect) {
+        if (j->wire.user_navigation & WEBNET_WIRE_REDIRECT_ERROR) { fail(j, "Redirect forbidden by redirect mode"); return -1; }
+        /* A missing Location is a received response, not a network failure. */
+        if (field_exists(http_response_headers(response), "Location")) return 1;
+    }
+    bool cross = !j->origin || strcmp(j->origin, j->target_origin);
+    if (j->opaque_tainted && cross) {
+        const char *policy = NULL; size_t length = 0;
+        if (field_exists(http_response_headers(response), "Cross-Origin-Resource-Policy") &&
+            !field_slice(http_response_headers(response), "Cross-Origin-Resource-Policy", &policy, &length)) {
+            fail(j, "Invalid Cross-Origin-Resource-Policy"); return -1;
+        }
+        if (policy && ((length == 11 && !memcmp(policy, "same-origin", 11)) ||
+            (length == 9 && !memcmp(policy, "same-site", 9) && !webcookie_same_site(j->cookies, j->document, j->final_url)))) {
+            fail(j, "No-cors response blocked by Cross-Origin-Resource-Policy"); return -1;
+        }
+    }
+    j->stream_final = true;
+    if (!(j->wire.user_navigation & WEBNET_WIRE_STREAM)) return 0;
+    if (!response_headers(j, response, j->cors_tainted)) return -1;
+    struct webnet_wire_response frame = {0};
+    frame.magic = WEBNET_STREAM_HEADERS; frame.status = status;
+    frame.id = j->wire.id; frame.generation = j->wire.generation;
+    frame.url_len = strlen(j->final_url); frame.headers_len = j->response_headers_len;
+    frame.cookie_len = j->cookie_len;
+    if (!write_all(1, &frame, sizeof frame) || !write_all(1, j->final_url, frame.url_len) ||
+        !write_all(1, j->response_headers, frame.headers_len) || !write_all(1, j->cookie_events, frame.cookie_len)) return -1;
+    j->stream_headers_sent = true;
+    /* Native cookies were published with the headers, not deferred until EOF. */
+    j->cookie_len = 0;
+    return 0;
+}
 static bool run_http(struct job *j) {
     enum http_url_result parsed = *j->document ? http_url(j->document, NULL, &j->origin) : HTTP_URL_OPAQUE;
     if (parsed != HTTP_URL_TUPLE && parsed != HTTP_URL_OPAQUE)
@@ -670,7 +731,6 @@ static bool run_http(struct job *j) {
     }
     bool drop_body = false;
     for (unsigned hop = 0; hop <= 20; hop++) {
-        if (hop == 20) return fail(j, "Fetch redirect count exceeded");
         /* Initial and every redirect hop were fully prepared before publish.
            The current final URL is the single canonical owner, not a copy. */
         const char *current=j->final_url;
@@ -695,14 +755,14 @@ static bool run_http(struct job *j) {
                              drop_body ? NULL : j->request_body, drop_body ? 0 : j->wire.body_len,
                              left, body_cb, j, cookie_header};
         struct http_resp r;
-        size_t cookie_start=j->cookie_len;
+        size_t cookie_start=j->cookie_len; j->cookie_start = cookie_start; j->stream_final = false; j->hop_method = method;
         size_t body_limit = webnet_wire_response_limit(j->wire.kind, j->wire.user_navigation);
-        int result = http_request_limited(&q, &r, body_limit);
-        if (result < 0) { j->cookie_len=cookie_start; if (!j->error[0]) fail(j, r.error); http_resp_free(&r); return false; }
-        if (!apply_cookie_events(j,cookie_start,method)) { http_resp_free(&r); return false; }
-        if (j->cors_tainted && !cors_allowed(j, &r)) { http_resp_free(&r); return false; }
-        bool redirect = r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308;
+        const struct http_stream_hooks hooks = {response_start, stream_upload};
+        int result = http_request_stream(&q, &r, body_limit, &hooks);
+        if (result < 0) { j->cookie_len=j->stream_headers_sent?0:cookie_start; if (!j->error[0]) fail(j, r.error); http_resp_free(&r); return false; }
+        bool redirect = !j->stream_final && (r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308);
         if (redirect) {
+            if (hop == 20) { http_resp_free(&r); return fail(j, "Fetch redirect count exceeded"); }
             if (j->wire.user_navigation & WEBNET_WIRE_REDIRECT_ERROR) {
                 http_resp_free(&r); return fail(j, "Redirect forbidden by redirect mode");
             }
@@ -756,16 +816,7 @@ static bool run_http(struct job *j) {
             }
         }
         j->status = r.status;
-        if(j->opaque_tainted && cross){
-            const char *policy=NULL;size_t length=0;
-            if(field_exists(http_response_headers(&r),"Cross-Origin-Resource-Policy") && !field_slice(http_response_headers(&r),"Cross-Origin-Resource-Policy",&policy,&length)){
-                http_resp_free(&r);return fail(j,"Invalid Cross-Origin-Resource-Policy");
-            }
-            if(policy && ((length==11 && !memcmp(policy,"same-origin",11)) ||
-                (length==9 && !memcmp(policy,"same-site",9) && !webcookie_same_site(j->cookies,j->document,current)))){
-                http_resp_free(&r);return fail(j,"No-cors response blocked by Cross-Origin-Resource-Policy");
-            }
-        }
+        if (j->wire.user_navigation & WEBNET_WIRE_STREAM) { http_resp_free(&r); return true; }
         bool headers_ok = response_headers(j, &r, j->cors_tainted); http_resp_free(&r);
         if (!headers_ok) return false;
         if (!j->body) { j->body = calloc(1, 1); if (!j->body) return fail(j, "Out of memory"); }
@@ -786,7 +837,8 @@ int main(void) {
         (w->credentials==WEBNET_CREDENTIALS_OMIT && w->cookie_len) ||
         WEBNET_WIRE_CACHE_MODE(w->user_navigation) > WEBNET_CACHE_ONLY_IF_CACHED ||
         (w->kind != WEBNET_FETCH && (WEBNET_WIRE_CACHE_MODE(w->user_navigation) != WEBNET_CACHE_DEFAULT || (w->user_navigation & (WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER)))) ||
-        ((w->user_navigation & WEBNET_WIRE_NO_CORS) && (w->user_navigation & (WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_FORCE_PREFLIGHT)))) { free(j); return 1; }
+        ((w->user_navigation & WEBNET_WIRE_NO_CORS) && (w->user_navigation & (WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_FORCE_PREFLIGHT))) ||
+        ((w->user_navigation & WEBNET_WIRE_STREAM) && w->kind != WEBNET_FETCH)) { free(j); return 1; }
     j->url = read_string(w->url_len, false); j->document = read_string(w->origin_len, false);
     j->method = read_string(w->method_len, false); j->headers = read_string(w->headers_len, false);
     j->request_body = read_string(w->body_len, true);
@@ -833,10 +885,12 @@ int main(void) {
         free(j->response_headers); j->response_headers = NULL; j->response_headers_len = 0;
     }
     struct webnet_wire_response out = {0};
-    out.magic = WEBNET_MAGIC; out.id = w->id; out.generation = w->generation; out.status = j->status;
+    bool streaming = (w->user_navigation & WEBNET_WIRE_STREAM) != 0;
+    out.magic = streaming ? WEBNET_STREAM_END : WEBNET_MAGIC;
+    out.id = w->id; out.generation = w->generation; out.status = streaming ? 0 : j->status;
     const char *final_url=j->final_url?j->final_url:"";
-    out.url_len = strlen(final_url); out.headers_len = j->response_headers_len;
-    out.body_len = j->body_len; out.error_len = strlen(j->error);
+    out.url_len = streaming ? 0 : strlen(final_url); out.headers_len = streaming ? 0 : j->response_headers_len;
+    out.body_len = streaming ? 0 : j->body_len; out.error_len = strlen(j->error);
     out.cookie_len=(uint32_t)j->cookie_len;
     bool ok = write_all(1, &out, sizeof out) && write_all(1, final_url, out.url_len) &&
               write_all(1, j->response_headers, out.headers_len) && write_all(1, j->body, out.body_len) && write_all(1, j->error, out.error_len) &&

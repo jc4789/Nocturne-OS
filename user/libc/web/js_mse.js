@@ -17,7 +17,7 @@ const mseBridge = (() => {
     const str=v=>{if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol to string');return String(v);};
     const error=(name,message)=>new ErrorType(message,name);
     const finite=v=>{const n=+v;if(!Number.isFinite(n))throw new TypeError('Expected finite number');return n;};
-    function fire(target,type){const e=new EventType(type);e.isTrusted=true;dispatch(target,e);}
+    function fire(target,type){const e=new EventType(type);eventState(e).isTrusted=true;dispatch(target,e);}
     function queue(target,type){schedule(()=>fire(target,type));}
     function bytes(value){
         let b=value,o=0,n;
@@ -59,7 +59,7 @@ const mseBridge = (() => {
         for(const t of old)if(!items.includes(t))queueTrack(list,'removetrack',t);
         for(const t of items)if(!old.includes(t))queueTrack(list,'addtrack',t);
     }
-    function queueTrack(list,type,track){schedule(()=>{const event=new EventType(type);define(event,'track',{value:track,enumerable:true});event.isTrusted=true;dispatch(list,event);});}
+    function queueTrack(list,type,track){schedule(()=>{const event=new EventType(type);define(event,'track',{value:track,enumerable:true});eventState(event).isTrusted=true;dispatch(list,event);});}
     function refreshTracks(p){const audio=[],video=[];
         for(const sb of p.buffers){const s=buffer(sb),info=native('mseInfo',p.node,s.id);
             for(const kind of ['audio','video']){const list=kind==='audio'?s.audioTracks:s.videoTracks,old=read(tracksData,list,'TrackList').items;

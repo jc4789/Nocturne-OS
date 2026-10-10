@@ -50,12 +50,16 @@ static void expect(const char *origin,int kind,const char *key,const char *value
     check(status==WEB_STORAGE_OK && (value?(out.text && out.text_len==strlen(value) && !memcmp(out.text,value,out.text_len)):!out.text),name);
     free(out.text);
 }
-static void fixture_path(const char *origin,int slot,char path[160]){
+static void fixture_path_at(const char *root,const char *origin,int slot,char path[160]){
     br_sha256_context context;uint8_t digest[32];char hex[65];const char chars[]="0123456789abcdef";
     br_sha256_init(&context);br_sha256_update(&context,origin,strlen(origin));br_sha256_out(&context,digest);
     for(int i=0;i<32;i++){hex[2*i]=chars[digest[i]>>4];hex[2*i+1]=chars[digest[i]&15];}hex[64]=0;
-    snprintf(path,160,"/data/browser/storage/%s.%d",hex,slot);
+    snprintf(path,160,"%s/%s.%d",root,hex,slot);
 }
+static void fixture_path(const char *origin,int slot,char path[160]){fixture_path_at("/data/browser/storage",origin,slot,path);}
+/* Simulate loss of RAM-root after closing all backends. Corrupting a disk slot
+ * must not replace the live shared map; cold recovery is a separate boundary. */
+static void cold_fixture(const char *origin){char path[160];for(int i=0;i<5;i++){fixture_path_at("/tmp/browser-storage",origin,i,path);unlink(path);}}
 static void corrupt(const char *origin,int slot){
     char path[160];fixture_path(origin,slot,path);int fd=open(path,O_WRONLY);
     check(fd>=0,"open OWN fixture snapshot");if(fd>=0){check(write(fd,"!",1)==1,"corrupt OWN fixture snapshot");close(fd);}
@@ -86,7 +90,7 @@ int main(int argc,char **argv){
     script("file:///home/storage-fixture.html","for(const key of ['localStorage','sessionStorage']){let ok=false;try{globalThis[key];}catch(e){ok=e.name==='SecurityError';}if(!ok)console.log('FAIL opaque storage '+key);}console.log('STORAGE-DONE opaque');");
     check(calls==oldcalls,"opaque origins never reach backend");
     expect(fixture_origin,WEB_STORAGE_SESSION,"navigation","kept","session survives document navigation");
-    webstorage_free(store);store=webstorage_create();
+    webstorage_free(store);cold_fixture(fixture_origin);store=webstorage_create();
     expect(fixture_origin,WEB_STORAGE_LOCAL,"persistent","yes","local persists across backend recreation");
     expect(fixture_origin,WEB_STORAGE_SESSION,"navigation",NULL,"fresh window session is empty");
     struct web_storage_result out={0};
@@ -99,11 +103,11 @@ int main(int argc,char **argv){
     check(webstorage_flush(store,true,&out)==WEB_STORAGE_OK,"flush generation one");
     check(direct(corrupt_origin,WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"key","two",&out)==WEB_STORAGE_OK,"snapshot generation two");
     check(webstorage_flush(store,true,&out)==WEB_STORAGE_OK,"flush generation two");
-    corrupt(corrupt_origin,1);webstorage_free(store);store=webstorage_create();
+    corrupt(corrupt_origin,1);webstorage_free(store);cold_fixture(corrupt_origin);store=webstorage_create();
     expect(corrupt_origin,WEB_STORAGE_LOCAL,"key","one","invalid new slot recovers previous snapshot");
     check(direct(corrupt_origin,WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"key","three",&out)==WEB_STORAGE_OK,"write repairs inactive slot");
-    webstorage_free(store);store=webstorage_create();expect(corrupt_origin,WEB_STORAGE_LOCAL,"key","three","repaired snapshot persists");
-    corrupt(corrupt_origin,0);corrupt(corrupt_origin,1);webstorage_free(store);store=webstorage_create();
+    webstorage_free(store);cold_fixture(corrupt_origin);store=webstorage_create();expect(corrupt_origin,WEB_STORAGE_LOCAL,"key","three","repaired snapshot persists");
+    corrupt(corrupt_origin,0);corrupt(corrupt_origin,1);webstorage_free(store);cold_fixture(corrupt_origin);store=webstorage_create();
     check(direct(corrupt_origin,WEB_STORAGE_LOCAL,WEB_STORAGE_GET,"key",NULL,&out)==WEB_STORAGE_IO,"all snapshots corrupt: explicit failure, not reset");
     script(corrupt_origin,"let error;try{localStorage;}catch(e){error=e;}if(!error||error.name!=='UnknownError')console.log('FAIL corrupt storage error');console.log('STORAGE-DONE corrupt');");
     expect(fixture_origin,WEB_STORAGE_LOCAL,"persistent","yes","other origin preserved after corruption");

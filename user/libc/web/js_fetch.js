@@ -1,7 +1,7 @@
-/* Buffered Fetch API over the native, CORS-checked browser transport.
+/* Fetch API over the native, CORS-checked browser transport.
    https://fetch.spec.whatwg.org/#fetch-api (consulted 2026-10-06).
    Body bytes are real snapshots, not String(BufferSource). Response and Blob
-   bodies expose real Streams; the host network transport is still buffered.
+   bodies expose real Streams with native headers/chunk/end flow control.
    Stream uploads and manual opaque redirects fail explicitly. Native no-cors
    fetches perform actual HTTP and expose an empty opaque response after a
    cross-origin hop; the native worker checks safelists and resource policy.
@@ -15,15 +15,17 @@
    Included after DOMException; initialize after js_encoding.js/js_url.js. */
 const fetchBridge = (() => {
     const headerSlots=new WeakMap(), requestSlots=new WeakMap(), responseSlots=new WeakMap();
-    const bodySlots=new WeakMap(), signalSlots=new WeakMap(), controllerSlots=new WeakMap();
+    const bodySlots=new WeakMap(), signalSlots=new WeakMap(), controllerSlots=new WeakMap(),networkSlots=new WeakMap();
     const NativePromise=Promise, then=Promise.prototype.then, apply=Reflect.apply;
     const NativeWeakRef=WeakRef, deref=WeakRef.prototype.deref;
+    const registerFinalizer=FinalizationRegistry.prototype.register,unregisterFinalizer=FinalizationRegistry.prototype.unregister;
     const dependentFinalizer=new FinalizationRegistry(cleanups=>{for(const [s,fn]of cleanups)s.algorithms.delete(fn);});
+    const networkFinalizer=new FinalizationRegistry(id=>host.cancel(id));
     const define=Object.defineProperty, create=Object.create, keys=Object.keys, setPrototype=Object.setPrototypeOf;
     const weakGet=WeakMap.prototype.get, weakSet=WeakMap.prototype.set, weakHas=WeakMap.prototype.has;
     // These maps contain the exclusive native transport buffer. Page changes
     // to WeakMap.prototype must not expose private records through callbacks.
-    for(const map of [headerSlots,requestSlots,responseSlots,bodySlots,signalSlots,controllerSlots]) {
+    for(const map of [headerSlots,requestSlots,responseSlots,bodySlots,signalSlots,controllerSlots,networkSlots]) {
         define(map,'get',{value:key=>apply(weakGet,map,[key])});
         define(map,'set',{value:(key,value)=>apply(weakSet,map,[key,value])});
         define(map,'has',{value:key=>apply(weakHas,map,[key])});
@@ -219,7 +221,7 @@ const fetchBridge = (() => {
         s.sources=null;
         const algorithms=[...s.algorithms];s.algorithms.clear();
         for(const fn of algorithms){try{fn(s.reason);}catch(e){report(e);}}
-        const e=new Event('abort');e.isTrusted=true;dispatch(signal,e);
+        const e=new Event('abort');eventState(e).isTrusted=true;dispatch(signal,e);
     }
     function dependentSignal(sources) {
         const signal=newSignal(),out=signalSlots.get(signal),cleanups=[],reference=new NativeWeakRef(signal);
@@ -374,10 +376,10 @@ const fetchBridge = (() => {
     }
     for(const name of ['type','url','redirected','status','statusText','headers'])define(Response.prototype,name,{configurable:true,enumerable:true,get(){return slot(responseSlots,this,'Response')[name];}});
     installBody(Request.prototype);installBody(Response.prototype);
-    function fetch(input,init) {
+    function fetchCore(input,init,observer,forcePreflight=false) {
         let r,s,b;
         try {
-            if(!arguments.length)throw new TypeError('fetch requires input');r=new Request(input,init);s=requestSlots.get(r);b=bodySlots.get(r);
+            r=new Request(input,init);s=requestSlots.get(r);b=bodySlots.get(r);
             const signal=signalSlots.get(s.signal);if(signal.aborted)return reject(signal.reason);
             if(s.mode==='no-cors'&&!host.noCorsFetch)throw notSupported('This native context has no no-cors transport');
             if(s.redirect==='manual')throw notSupported('Opaque manual redirect responses are not supported');
@@ -395,28 +397,68 @@ const fetchBridge = (() => {
                 return new NativePromise(resolve=>resolve(responseObject({status:local.status,statusText:local.status===206?'Partial Content':'OK',url:s.url.split('#')[0],headers,redirected:false,type:'basic'},{bytes:local.bytes,used:false,abort:s.signal})));
             }
             let raw='';for(const [name,value]of sortedHeaders(headerSlots.get(s.headers)))raw+=name+': '+value+'\r\n';
-            const pair=host.fetch(s.url,s.method,raw,b.bytes===null?'':b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),false,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache),s.keepalive,s.mode==='no-cors',noReferrer);
+            let pair,channel,channelRef,waiting,transportId=0,done=false,hasBody=false,finishStream=()=>{};
+            const liveChannel=()=>channel||(channelRef&&apply(deref,channelRef,[]));
+            const resume=()=>{if(!done&&transportId)host.resumeFetch(transportId);};
+            if(host.streamingFetch&&streams){
+                channel=streams.network(()=>new NativePromise(resolve=>{waiting=resolve;resume();}),reason=>{
+                    if(done)return;done=true;finishStream();host.cancel(transportId);
+                    if(waiting){const resolve=waiting;waiting=null;resolve();}
+                });
+            }
+            const notify=channel?(event,value)=>{
+                if(done)return true;
+                const active=liveChannel();
+                if(!active){done=true;finishStream();host.cancel(transportId);return false;}
+                if(event===1){
+                    const state=slot(bodySlots,value,'Body'),meta=slot(responseSlots,value,'Response');
+                    hasBody=s.method!=='HEAD'&&meta.type!=='opaque'&&!nullStatuses.has(meta.status);
+                    state.bytes=null;state.abort=s.signal;
+                    if(hasBody&&!observer){state.stream=active.stream;networkSlots.set(active.stream,active);apply(registerFinalizer,networkFinalizer,[active,transportId,active]);channelRef=new NativeWeakRef(active);channel=null;}
+                    if(observer){observer('headers',value,resume);return false;}
+                    return !hasBody;
+                }
+                if(event===2){
+                    if(observer){if(!hasBody)return true;observer('chunk',value,resume);return false;}
+                    if(hasBody)active.enqueue(value);
+                    if(waiting){const resolve=waiting;waiting=null;resolve();}
+                    return !hasBody;
+                }
+                if(event===4){if(observer){observer('upload',value,resume);return false;}return true;}
+                if(event===3){
+                    done=true;finishStream();
+                    if(value!==undefined)active.error(value);else active.close();
+                    apply(unregisterFinalizer,networkFinalizer,[active]);channel=null;channelRef=null;
+                    if(waiting){const resolve=waiting;waiting=null;resolve();}
+                    if(observer)observer('end',value,()=>{});
+                }
+                return false;
+            }:undefined;
+            pair=host.fetch(s.url,s.method,raw,b.bytes===null?'':b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),forcePreflight,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache),s.keepalive,s.mode==='no-cors',noReferrer,notify);
+            transportId=pair.id;const transportPromise=pair.promise;pair=null;
             if(b.bytes!==null)b.used=true;
             return new NativePromise((resolve,reject)=>{
-                let finished=false;
+                let finished=false,pendingReject=reject;
                 const sig=signalSlots.get(s.signal),cleanup=()=>sig.algorithms.delete(abort);
-                const abort=reason=>{if(finished)return;finished=true;cleanup();try{host.cancel(pair.id);}finally{reject(reason);}};
+                const abort=reason=>{if(done)return;done=true;finished=true;cleanup();const active=liveChannel();if(active){active.error(reason);apply(unregisterFinalizer,networkFinalizer,[active]);}channel=null;channelRef=null;if(waiting){const resolve=waiting;waiting=null;resolve();}try{host.cancel(transportId);}finally{if(pendingReject)pendingReject(reason);pendingReject=null;if(observer)observer('end',reason,()=>{});}};
+                finishStream=cleanup;
                 sig.algorithms.add(abort);
                 try {
-                    define(pair.promise,'constructor',{value:promiseConstructor});
-                    apply(then,pair.promise,[response=>{
-                        if(finished)return;finished=true;cleanup();
+                    define(transportPromise,'constructor',{value:promiseConstructor});
+                    apply(then,transportPromise,[response=>{
+                        if(finished)return;finished=true;pendingReject=null;if(!notify)cleanup();
                         try {
                             const state=slot(bodySlots,response,'Body');state.abort=s.signal;
                             if(s.method==='HEAD')state.bytes=null;
                             resolve(response);
                         }catch(e){reject(e);}
-                    },error=>{if(finished)return;finished=true;cleanup();reject(error);}]);
-                }catch(e){finished=true;cleanup();host.cancel(pair.id);reject(e);}
+                    },error=>{if(finished)return;finished=true;done=true;cleanup();reject(error);}]);
+                }catch(e){finished=true;done=true;cleanup();const active=liveChannel();if(active)active.error(e);host.cancel(transportId);pendingReject=null;reject(e);}
                 if(sig.aborted)abort(sig.reason);
             });
         }catch(e){return reject(e);}
     }
+    function fetch(input,init){if(!arguments.length)return reject(new TypeError('fetch requires input'));return fetchCore(input,init);}
     for(const [C,name]of [[Headers,'Headers'],[Request,'Request'],[Response,'Response'],[AbortSignal,'AbortSignal'],[AbortController,'AbortController']]) {
         define(C.prototype,Symbol.toStringTag,{value:name,configurable:true});
         for(const key of Object.getOwnPropertyNames(C.prototype)){if(key==='constructor')continue;const d=Object.getOwnPropertyDescriptor(C.prototype,key);d.enumerable=true;define(C.prototype,key,d);}
@@ -437,6 +479,8 @@ const fetchBridge = (() => {
             const bytes=b.bytes===null?new AB(0):b.bytes;b.bytes=null;b.used=true;
             return {status:s.status,statusText:s.statusText,url:s.url,headers:s.headers,bytes};
         },
+        xhrFetch(url,init,observer,forcePreflight){const signal=newSignal();return {promise:fetchCore(url,{...init,signal},observer,forcePreflight),cancel(){abortSignal(signal);}};},
+        xhrMetadata(response){const s=slot(responseSlots,response,'Response');return {status:s.status,statusText:s.statusText,url:s.url,headers:s.headers};},
         response(status,url,raw,text,bytes,redirected,statusText,type) {
             // Native completions redact the opaque internals before entering
             // this realm. Do not inspect author-modifiable regex/URL methods.

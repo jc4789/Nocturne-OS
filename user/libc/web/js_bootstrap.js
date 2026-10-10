@@ -3,7 +3,7 @@
     'use strict';
     delete globalThis.__nocturne_host;
     const domOperations=host.domOperations || Object.fromEntries(
-        ['adopt', 'animationComputed', 'animationStyle', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport'].map(op=>[op,(...args)=>host.dom(op,...args)]));
+        ['adopt', 'animationComputed', 'animationStyle', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'customData', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replaceAll', 'replaceAllStatus', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport'].map(op=>[op,(...args)=>host.dom(op,...args)]));
     const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
     function validateInsertion(parent,child,before) {
         if(!rawDom.isNode(null,parent) || !rawDom.isNode(null,child) ||
@@ -15,7 +15,7 @@
     let customElementsReady = false;
     function dom(...args) {
         const op = args[0];
-        const mutation = op === 'shadowAttach' || op === 'slotAssign' || op === 'insert' || op === 'replace' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'import' || op === 'set' || op === 'attrSetNode' || op === 'attrRemoveNode' ||
+        const mutation = op === 'shadowAttach' || op === 'slotAssign' || op === 'insert' || op === 'replace' || op === 'replaceAll' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'import' || op === 'set' || op === 'attrSetNode' || op === 'attrRemoveNode' ||
             (op === 'attrNS' && args.length > 4) ||
             ((op === 'attr' || op === 'style') && args.length > 3);
         return mutation && customElementsReady && customElementsBridge.active() ? customElementsBridge.reactions(() => rawDom(...args)) : rawDom(...args);
@@ -40,7 +40,7 @@
     let mseHandlerTarget = () => false;
     let textTrackHandlerTarget = () => false;
     const globalHandlerTypes = new Set(('abort beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
-    const windowHandlerTypes = new Set(['hashchange','popstate','message','messageerror']);
+    const windowHandlerTypes = new Set(['hashchange','popstate','message','messageerror','storage']);
     const state = new WeakMap();
     /* @include js_collections.js */
     function list(a) { return collectionBridge.list(a); }
@@ -48,30 +48,37 @@
     // Preserve Error identity for native task context/source diagnostics. The
     // native logger reads only an own stack data property, never a stack getter.
     function report(e) { host.log(2, e); }
+    const eventStates=new WeakMap(),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set,eventDefine=Object.defineProperty;
+    const eventFields=new Set(['type','target','srcElement','currentTarget','eventPhase','bubbles','cancelable','composed','defaultPrevented','isTrusted','timeStamp']);
+    function eventState(event){const state=apply(eventGet,eventStates,[event]);if(!state)throw new TypeError('Illegal Event receiver');return state;}
     class Event {
         constructor(type, init = {}) {
-            this.type = String(type); this.bubbles = !!init.bubbles;
-            this.cancelable = !!init.cancelable; this.composed = !!init.composed;
-            this.target = null; this.currentTarget = null; this.eventPhase = 0;
-            this.defaultPrevented = false; this.isTrusted = false;
-            this.timeStamp = host.now(); this._stop = false; this._immediate = false;
-            this._passive = false; this._dispatching = false; this._initialized = true;
+            if(!arguments.length)throw new TypeError('Event requires type');
+            type=String(type);init=init==null?{}:Object(init);
+            apply(eventSet,eventStates,[this,{type,bubbles:!!init.bubbles,cancelable:!!init.cancelable,composed:!!init.composed,
+                target:null,currentTarget:null,eventPhase:0,defaultPrevented:false,isTrusted:false,timeStamp:host.now(),
+                stop:false,immediate:false,passive:false,dispatching:false,initialized:true}]);
+            eventDefine(this,'isTrusted',{enumerable:true,get(){return eventState(this).isTrusted;}});
         }
         initEvent(type,bubbles=false,cancelable=false) {
+            const s=eventState(this);
             if(!arguments.length)throw new TypeError('initEvent requires type');
-            if(this._dispatching)return;
-            this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;
-            this._stop=this._immediate=this.defaultPrevented=false;this.isTrusted=false;this.target=null;this._initialized=true;
+            type=String(type);if(s.dispatching)return;
+            s.type=type;s.bubbles=!!bubbles;s.cancelable=!!cancelable;
+            s.stop=s.immediate=s.defaultPrevented=false;s.isTrusted=false;s.target=null;s.initialized=true;
         }
-        preventDefault() { if (this.cancelable && !this._passive) this.defaultPrevented = true; }
-        stopPropagation() { this._stop = true; }
-        stopImmediatePropagation() { this._stop = this._immediate = true; }
+        preventDefault() { const s=eventState(this);if(s.cancelable && !s.passive)s.defaultPrevented=true; }
+        stopPropagation() { eventState(this).stop=true; }
+        stopImmediatePropagation() { const s=eventState(this);s.stop=s.immediate=true; }
         composedPath() { return apply(eventSlice,eventPaths.get(this)||[],[]); }
-        get cancelBubble() { return this._stop; }
+        get cancelBubble() { return eventState(this).stop; }
         set cancelBubble(v) { if (v) this.stopPropagation(); }
-        get returnValue() { return !this.defaultPrevented; }
+        get returnValue() { return !eventState(this).defaultPrevented; }
         set returnValue(v) { if (!v) this.preventDefault(); }
     }
+    for(const key of eventFields)if(key!=='isTrusted')Object.defineProperty(Event.prototype,key,{
+        configurable:true,enumerable:true,get(){return eventState(this)[key==='srcElement'?'target':key];}
+    });
     Object.assign(Event, {NONE:0, CAPTURING_PHASE:1, AT_TARGET:2, BUBBLING_PHASE:3});
     Object.assign(Event.prototype, {NONE:0, CAPTURING_PHASE:1, AT_TARGET:2, BUBBLING_PHASE:3});
     /* @include js_error_event.js */
@@ -79,7 +86,7 @@
         constructor(t, o = {}) { super(t,o); this.detail = o.detail === undefined ? null : o.detail; }
         initCustomEvent(type,bubbles=false,cancelable=false,detail=null) {
             if(!arguments.length)throw new TypeError('initCustomEvent requires type');
-            if(this._dispatching)return;
+            if(eventState(this).dispatching)return;
             this.initEvent(type,bubbles,cancelable);this.detail=detail;
         }
     }
@@ -87,7 +94,7 @@
         constructor(t,o={}){super(t,o);this.view=o.view??null;this.detail=(+(o.detail??0))>>0;}
         initUIEvent(type,bubbles=false,cancelable=false,view=null,detail=0){
             if(!arguments.length)throw new TypeError('initUIEvent requires type');
-            if(this._dispatching)return;
+            if(eventState(this).dispatching)return;
             Event.prototype.initEvent.call(this,type,bubbles,cancelable);this.view=view;this.detail=(+detail)>>0;
         }
     }
@@ -107,11 +114,12 @@
     Object.defineProperty(FocusEvent.prototype,Symbol.toStringTag,{configurable:true,value:'FocusEvent'});
     Object.defineProperty(FocusEvent.prototype,'relatedTarget',Object.assign({},Object.getOwnPropertyDescriptor(FocusEvent.prototype,'relatedTarget'),{enumerable:true}));
     class MouseEvent extends UIEvent {
-        constructor(t, o = {}) { super(t,o); mouseAssign(this, {clientX:0, clientY:0, pageX:0, pageY:0,
-            screenX:0,screenY:0,button:0, buttons:0, relatedTarget:null, ctrlKey:false, shiftKey:false, altKey:false, metaKey:false}, o); }
+        constructor(t, o = {}) { super(t,o);const defaults={clientX:0, clientY:0, pageX:0, pageY:0,
+            screenX:0,screenY:0,button:0, buttons:0, relatedTarget:null, ctrlKey:false, shiftKey:false, altKey:false, metaKey:false};
+            o=o==null?{}:Object(o);for(const key of Object.keys(defaults))this[key]=o[key]===undefined?defaults[key]:o[key]; }
         initMouseEvent(type,bubbles=false,cancelable=false,view=null,detail=0,screenX=0,screenY=0,clientX=0,clientY=0,ctrlKey=false,altKey=false,shiftKey=false,metaKey=false,button=0,relatedTarget=null){
             if(!arguments.length)throw new TypeError('initMouseEvent requires type');
-            if(this._dispatching)return;
+            if(eventState(this).dispatching)return;
             if(relatedTarget!==null && !(relatedTarget instanceof EventTarget) && relatedTarget!==globalThis)throw new TypeError('Expected an EventTarget');
             UIEvent.prototype.initUIEvent.call(this,type,bubbles,cancelable,view,detail);
             mouseAssign(this,{screenX:(+screenX)>>0,screenY:(+screenY)>>0,clientX:(+clientX)>>0,clientY:(+clientY)>>0,
@@ -121,8 +129,9 @@
         getModifierState(key){return ({Control:this.ctrlKey,Alt:this.altKey,Shift:this.shiftKey,Meta:this.metaKey})[String(key)]||false;}
     }
     class KeyboardEvent extends UIEvent {
-        constructor(t, o = {}) { super(t,o); Object.assign(this, {key:'', code:'', keyCode:0, which:0,
-            ctrlKey:false, shiftKey:false, altKey:false, metaKey:false, repeat:false}, o); }
+        constructor(t, o = {}) { super(t,o);const defaults={key:'', code:'', keyCode:0, which:0,
+            ctrlKey:false, shiftKey:false, altKey:false, metaKey:false, repeat:false};
+            o=o==null?{}:Object(o);for(const key of Object.keys(defaults))this[key]=o[key]===undefined?defaults[key]:o[key]; }
     }
     function removeListener(target, entry) {
         if (entry.removed) return;
@@ -181,9 +190,9 @@
             }
         }
         dispatchEvent(event) {
-            if (!(event instanceof Event)) throw new TypeError('Invalid event');
-            if (!event._initialized || event._dispatching) throw new DOMException('Uninitialized or dispatching event','InvalidStateError');
-            event.isTrusted=false;
+            const s=eventState(event);
+            if (!s.initialized || s.dispatching) throw new DOMException('Uninitialized or dispatching event','InvalidStateError');
+            s.isTrusted=false;
             return dispatch(this, event);
         }
     }
@@ -235,31 +244,31 @@
         });
     }
     function invoke(target, event, capture) {
-        event.currentTarget = target;
-        handlerRecord(target,event.type);
+        const s=eventState(event);s.currentTarget=target;
+        handlerRecord(target,s.type);
         const a = listenerMap.get(target);
         if (a) for (const x of a.slice()) {
-            if (x.removed || x.capture !== capture || x.type !== event.type) continue;
+            if (x.removed || x.capture !== capture || x.type !== s.type) continue;
             if (x.once) removeListener(target, x);
-            event._passive = x.passive;
+            s.passive=x.passive;
             try {
                 if (typeof x.callback === 'function') x.callback.call(target,event);
                 else x.callback.handleEvent(event);
             } catch (e) { report(e); }
-            event._passive = false;
-            if (event._immediate) break;
+            s.passive=false;
+            if(s.immediate)break;
         }
-        if (!capture && !event._immediate && !handlerTarget(target,event.type)) {
-            let fn = target['on' + event.type];
+        if (!capture && !s.immediate && !handlerTarget(target,s.type)) {
+            let fn = target['on' + s.type];
             if (fn === undefined && target instanceof Node && target.nodeType === 1) {
-                const text = reflectedAttr(target,'on' + event.type);
+                const text = reflectedAttr(target,'on' + s.type);
                 if (text !== null && rawDom.get(target,'scripting')) {
                     let cache = inlineMap.get(target);
                     if (!cache) inlineMap.set(target, cache = new Map());
-                    let x = cache.get(event.type);
+                    let x = cache.get(s.type);
                     if (!x || x.text !== text) {
-                        try { x = {text, fn:host.inline(text)}; cache.set(event.type,x); }
-                        catch (e) { report(e); x = {text,fn:null}; cache.set(event.type,x); }
+                        try { x = {text, fn:host.inline(text)}; cache.set(s.type,x); }
+                        catch (e) { report(e); x = {text,fn:null}; cache.set(s.type,x); }
                     }
                     fn = x.fn;
                 }
@@ -271,29 +280,32 @@
         }
     }
     function dispatch(target, event, snapshot) {
-        event._dispatching = true; event.target = target; event._stop = event._immediate = false;
-        const plan=snapshot && snapshot.entries?snapshot:shadowBridge.path(target,event,snapshot),entries=plan.entries;
+        const s=eventState(event);s.dispatching=true;s.target=target;
+        try {
+        const plan=snapshot && snapshot.entries?snapshot:shadowBridge.path(target,{type:s.type,composed:s.composed,relatedTarget:event.relatedTarget},snapshot),entries=plan.entries;
         const hasRelated='relatedTarget' in event;
         // Retarget the private FocusEvent slot, not its read-only IDL getter.
         // Mouse events still use their existing internal writable field.
         function related(value){if(focusData.has(event))focusData.set(event,value);else event.relatedTarget=value;}
         function visit(entry,capture,phase){
-            event.target=entry.target;if(hasRelated)related(entry.related);
-            eventPaths.set(event,entry.visible);event.eventPhase=phase;invoke(entry.node,event,capture);
+            s.target=entry.target;if(hasRelated)related(entry.related);
+            eventPaths.set(event,entry.visible);s.eventPhase=phase;invoke(entry.node,event,capture);
         }
-        for(let i=entries.length-1;i>0 && !event._stop;i--)visit(entries[i],true,entries[i].atTarget?2:1);
-        if(entries.length && !event._stop){
+        for(let i=entries.length-1;i>0 && !s.stop;i--)visit(entries[i],true,entries[i].atTarget?2:1);
+        if(entries.length && !s.stop){
             /* Capture and noncapture at AT_TARGET are distinct invocations.
                stopPropagation keeps this capture listener list running, but
                prevents the following noncapture invocation. */
-            visit(entries[0],true,2);if(!event._stop)visit(entries[0],false,2);
+            visit(entries[0],true,2);if(!s.stop)visit(entries[0],false,2);
         }
-        for(let i=1;i<entries.length && !event._stop;i++)
-            if(event.bubbles || entries[i].atTarget)visit(entries[i],false,entries[i].atTarget?2:3);
-        event.target=plan.finalTarget;if(hasRelated)related(plan.finalRelated);
+        for(let i=1;i<entries.length && !s.stop;i++)
+            if(s.bubbles || entries[i].atTarget)visit(entries[i],false,entries[i].atTarget?2:3);
+        s.target=plan.finalTarget;if(hasRelated)related(plan.finalRelated);
         eventPaths.delete(event);
-        event.currentTarget = null; event.eventPhase = 0; event._dispatching = false; event._passive = false;
-        return !event.defaultPrevented;
+        return !s.defaultPrevented;
+        } finally {
+            eventPaths.delete(event);s.currentTarget=null;s.eventPhase=0;s.dispatching=s.passive=s.stop=s.immediate=false;
+        }
     }
     class Node extends EventTarget {
         constructor() { super(); throw new TypeError('Use document.createElement/createTextNode'); }
@@ -373,7 +385,25 @@
         remove() { if (this.parentNode) this.parentNode.removeChild(this); }
         append(...nodes) { for (const n of nodes) this.appendChild(rawDom.isNode(null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n))); }
         prepend(...nodes) { const before=this.firstChild; for (const n of nodes) this.insertBefore(rawDom.isNode(null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n)),before); }
-        replaceChildren(...nodes) { this.textContent=''; this.append(...nodes); }
+        replaceChildren(...nodes) {
+            const type=rawDom.get(this,'nodeType');
+            if(![1,9,11].includes(type))throw new TypeError('ParentNode receiver required');
+            const values=nodes.map(n=>rawDom.isNode(null,n)?n:elementURL.string(n));
+            return customElementsBridge.reactions(()=>{
+                const owner=type===9?this:rawDom.get(this,'ownerDocument');
+                const make=value=>typeof value==='string'?rawDom.create(owner,3,'#text',value):value;
+                let replacement=null;
+                if(values.length===1)replacement=make(values[0]);
+                else if(values.length){replacement=rawDom.create(owner,11,'#document-fragment','');
+                    for(const value of values){const child=make(value);validateInsertion(replacement,child,null);dom('insert',replacement,child,null);}}
+                if(rawDom.replaceAllStatus(this,replacement))throw new DOMException('The replacement cannot be inserted here','HierarchyRequestError');
+                if(replacement){
+                    if(rawDom.get(replacement,'parentNode'))dom('remove',replacement);
+                    if(rawDom.get(replacement,'ownerDocument')!==owner)dom('adopt',owner,replacement);
+                }
+                dom('replaceAll',this,replacement);
+            });
+        }
         before(...nodes) { if(this.parentNode) for(const n of nodes) this.parentNode.insertBefore(rawDom.isNode(null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),this); }
         after(...nodes) { if(this.parentNode) { const next=this.nextSibling; for(const n of nodes) this.parentNode.insertBefore(rawDom.isNode(null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),next); } }
         replaceWith(...nodes) { replaceChildNode(this,nodes); }
@@ -786,7 +816,7 @@
         else if(type==='focusevent')e=new FocusEvent('');
         else if(['keyboardevent','keyevents'].includes(type))e=new KeyboardEvent('');
         else throw new DOMException('Unsupported event interface','NotSupportedError');
-        e._initialized=false;return e;
+        eventState(e).initialized=false;return e;
     };
     function cssName(k){return k==='cssFloat'?'float':String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase());}
     function inlineStyle(node){
@@ -942,10 +972,10 @@
             const own=ancestry===previous?previousSnapshot:currentSnapshot,other=ancestry===previous?currentSnapshot:previousSnapshot;
             const part={nodes:apply(eventSlice,ancestry,[index]),info:own.info};
             const pointer=new PointerEvent(type.replace('mouse','pointer'),mousePointerInit(mouseAssign({},values,{button:-1})));
-            pointer.isTrusted=true;
+            eventState(pointer).isTrusted=true;
             tasks[tasks.length]={event:pointer,target:part.nodes[0],plan:shadowBridge.path(part.nodes[0],pointer,part,other)};
             if(type!=='mousemove'||!suppressCompatibilityMouse){
-                const e=new MouseEvent(type,values);e.isTrusted=true;
+                const e=new MouseEvent(type,values);eventState(e).isTrusted=true;
                 tasks[tasks.length]={event:e,target:part.nodes[0],plan:shadowBridge.path(part.nodes[0],e,part,other)};
             }
         }
@@ -976,6 +1006,7 @@
     return {
         workerNotify:workerBridge.deliver,
         storageOrigin:storageBridge.origin,
+        storageEvent:storageBridge.deliver,
         formNamedProperty:formNameBridge.property,
         formNamedKeys:formNameBridge.keys,
         registerImportMap:importMapsBridge.register,

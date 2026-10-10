@@ -59,6 +59,6 @@ const semanticElementsBridge = (() => {
     Object.assign(globalThis,exports,{ToggleEvent});
     return {nodeProtos:Object.values(exports).map(C=>C.prototype),toggle(target,oldOpen,newOpen){
         const event=new ToggleEvent('toggle',{oldState:oldOpen?'open':'closed',newState:newOpen?'open':'closed'});
-        event.isTrusted=true;dispatch(target,event);
+        eventState(event).isTrusted=true;dispatch(target,event);
     }};
 })();

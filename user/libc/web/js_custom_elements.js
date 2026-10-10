@@ -263,6 +263,7 @@ const customElementsBridge = (() => {
                 adopted:nodes.map(node=>({elements:elements(node),oldDocument:get(node,'ownerDocument')}))};
         }
         if (op === 'remove') return {op,node,was:connected(node),parent:get(node,'parentNode')};
+        if(op==='replaceAll')return {op:'children',node,nodes:children(node),was:connected(node)};
         if (op === 'clone' || op === 'import') return {op};
         if (op === 'set' && (key === 'innerHTML' || key === 'textContent') && [1,11].includes(get(node,'nodeType')))
             return {op:'children',node,nodes:children(node),was:connected(node)};

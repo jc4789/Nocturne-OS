@@ -214,9 +214,10 @@ struct sink {
     size_t cap;
     bool aborted;
     size_t limit; /* encoded/decoded bound, or zero for legacy uncompressed streaming */
+    struct http_gzip *gzip;
 };
 
-static bool sink_put(struct sink *k, const char *data, size_t n) {
+static bool sink_plain_put(struct sink *k, const char *data, size_t n) {
     if (n >= (size_t)-1 - k->rs->body_len ||
         (k->limit && (k->rs->body_len > k->limit || n > k->limit - k->rs->body_len))) {
         snprintf(k->rs->error, sizeof k->rs->error, "response exceeds size limit");
@@ -251,6 +252,10 @@ static bool sink_put(struct sink *k, const char *data, size_t n) {
     k->rs->body_len += n;
     k->rs->body[k->rs->body_len] = 0;
     return true;
+}
+#include "http_gzip.h"
+static bool sink_put(struct sink *k,const char *data,size_t n){
+    return k->gzip?gzip_feed(k->gzip,k,data,n,false):sink_plain_put(k,data,n);
 }
 
 /* copy exactly n bytes (or until the end of stream when n == SIZE_MAX) to the sink */
@@ -455,7 +460,8 @@ static const char *request_head(const struct http_req *rq, struct http_scratch *
     head[at] = 0; work->head = head; work->head_length = length;
     return NULL;
 }
-static int request_inner(const struct http_req *rq, struct http_resp *rs, struct http_scratch *work, size_t body_limit) {
+static int request_inner(const struct http_req *rq, struct http_resp *rs, struct http_scratch *work, size_t body_limit,
+                         const struct http_stream_hooks *hooks) {
     memset(rs, 0, sizeof *rs);
     struct url_owned *u = &work->url;
     if (!url_parse_owned(rq->url, u)) {
@@ -472,7 +478,15 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     if (!s) return -1;
 
     bool ok = ns_write(s, work->head, work->head_length) >= 0 && (!rq->headers || ns_write(s, rq->headers, strlen(rq->headers)) >= 0) &&
-              ns_write(s, "\r\n", 2) >= 0 && (!rq->body_len || ns_write(s, rq->body, rq->body_len) >= 0);
+              ns_write(s, "\r\n", 2) >= 0;
+    for (size_t sent = 0; ok && sent < rq->body_len;) {
+        size_t count = rq->body_len - sent;
+        if (count > 65536u) count = 65536u;
+        ok = ns_write(s, (const char *)rq->body + sent, count) >= 0;
+        sent += count;
+        if (ok && hooks && hooks->upload) ok = hooks->upload(rq->ctx, sent, rq->body_len) >= 0;
+    }
+    if (ok && !rq->body_len && hooks && hooks->upload) ok = hooks->upload(rq->ctx, 0, 0) >= 0;
     if (!ok) {
         snprintf(rs->error, sizeof rs->error, "send: %s", ns_error(s));
         ns_close(s);
@@ -592,12 +606,21 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     }
     rs->headers_len = hl;
     if (rs->headers_full) rs->headers[0] = 0;
+    if (hooks && hooks->headers) {
+        int decision = hooks->headers(rq->ctx, rs);
+        if (decision) {
+            if (decision < 0 && !rs->error[0]) snprintf(rs->error, sizeof rs->error, "response headers rejected");
+            rd_free(r); ns_close(s); return decision < 0 ? -1 : 0;
+        }
+    }
 
     struct http_req buffered = *rq;
     buffered.on_body = NULL;
     bool no_body = !strcmp(method, "HEAD") || status == 204 || status == 304;
     size_t decoded_limit = body_limit ? body_limit : HTTP_GZIP_LIMIT;
-    struct sink k = {gzip ? &buffered : rq, rs, 0, false, gzip ? decoded_limit : body_limit};
+    bool stream_gzip=gzip&&hooks&&rq->on_body&&!no_body;
+    struct sink k = {gzip&&!stream_gzip ? &buffered : rq, rs, 0, false, gzip ? decoded_limit : body_limit,NULL};
+    if(stream_gzip){k.gzip=gzip_create();if(!k.gzip){snprintf(rs->error,sizeof rs->error,"out of memory decoding gzip");rd_free(r);ns_close(s);return -1;}}
     bool body_ok;
     if (no_body) {
         body_ok = true;
@@ -621,7 +644,9 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     } else {
         body_ok = copy_body(r, &k, (size_t)-1);
     }
-    if (body_ok && gzip && !no_body) {
+    if(body_ok&&stream_gzip)body_ok=gzip_feed(k.gzip,&k,NULL,0,true);
+    free(k.gzip);k.gzip=NULL;
+    if (body_ok && gzip && !stream_gzip && !no_body) {
         body_ok = gunzip_body(rs, decoded_limit);
         if (body_ok && rq->on_body) {
             char *body = rs->body;
@@ -652,21 +677,22 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     return ret;
 }
 
-static int request_with_limit(const struct http_req *rq, struct http_resp *rs, size_t body_limit) {
+static int request_with_limit(const struct http_req *rq, struct http_resp *rs, size_t body_limit,
+                              const struct http_stream_hooks *hooks) {
     struct http_scratch *work = calloc(1, sizeof *work);
     if (!work) {
         memset(rs, 0, sizeof *rs);
         snprintf(rs->error, sizeof rs->error, "out of memory");
         return -1;
     }
-    int result = request_inner(rq, rs, work, body_limit);
+    int result = request_inner(rq, rs, work, body_limit, hooks);
     free(work->head);
     url_owned_free(&work->url);
     free(work);
     return result;
 }
 int http_request(const struct http_req *rq, struct http_resp *rs) {
-    return request_with_limit(rq, rs, 0);
+    return request_with_limit(rq, rs, 0, NULL);
 }
 int http_request_limited(const struct http_req *rq, struct http_resp *rs, size_t body_limit) {
     if (!body_limit || body_limit > HTTP_RESPONSE_BODY_MAX) {
@@ -674,7 +700,11 @@ int http_request_limited(const struct http_req *rq, struct http_resp *rs, size_t
         snprintf(rs->error, sizeof rs->error, "invalid finite response size limit");
         return -1;
     }
-    return request_with_limit(rq, rs, body_limit);
+    return request_with_limit(rq, rs, body_limit, NULL);
+}
+int http_request_stream(const struct http_req *rq, struct http_resp *rs, size_t limit,
+                        const struct http_stream_hooks *hooks) {
+    return request_with_limit(rq, rs, limit, hooks);
 }
 
 void http_resp_free(struct http_resp *resp) {

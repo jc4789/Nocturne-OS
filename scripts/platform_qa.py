@@ -372,6 +372,7 @@ def main():
         mon = Monitor(p, port)
         print('隔離QEMU 起動:', p.pid, here, flush=True)
         next_shot, index, scroll_at, scroll_count = 15, 0, 45, 0
+        startup_shot, startup_index = 15, 0
         while time.monotonic() < deadline and p.poll() is None:
             if ready_at is None:
                 if serial.exists() and a.ready_marker in serial.read_text(encoding='utf-8', errors='replace'):
@@ -381,6 +382,12 @@ def main():
                     metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
                     print('実guest観察開始:', round(ready_at-start, 3), flush=True)
                 else:
+                    # Loading or a failed observation hook must stay visible;
+                    # author readiness controls input timing, never capture.
+                    if time.monotonic()-start >= startup_shot:
+                        shot(mon, 'startup-'+str(startup_index))
+                        startup_index += 1
+                        startup_shot += a.screen_interval
                     time.sleep(.2)
                     continue
             elapsed = time.monotonic()-ready_at
@@ -556,7 +563,10 @@ def main():
         metadata['screen_captures'] = captures
         if a.resolution:
             expected_dimensions = list(map(int, a.resolution.split('x')[:2]))
-            metadata['resolution_matched'] = bool(captures) and all(c.get('resolution') == expected_dimensions for c in captures)
+            # Limine uses its own boot video mode before the guest switches to
+            # the requested desktop mode. Keep those early pictures as evidence,
+            # but check the settled guest screen rather than the boot loader.
+            metadata['resolution_matched'] = bool(captures) and captures[-1].get('resolution') == expected_dimensions
             if not metadata['resolution_matched']:
                 failure = (failure+'; ' if failure else '')+'要求解像度と実QEMU画面寸法が不一致です'
         log = serial.read_text(encoding='utf-8', errors='replace') if serial.exists() else ''

@@ -190,15 +190,11 @@ const htmlSafetyBridge=(()=>{
             for(const key of ['documentURI','referrer','blockedURI','sourceFile'])data[key]=data[key].toWellFormed();
             if(data.disposition!=='enforce'&&data.disposition!=='report')throw new TypeError('Invalid policy violation disposition');
             for(let i=0;i<violationNumbers.length;i++){const key=violationNumbers[i],number=+init[key]>>>0;data[key]=key==='statusCode'?number&65535:number;}
-            data.trusted=false;wSet(violationSlots,this,data);
-            // The existing EventTarget resets trust on author redispatch.
-            // Its false assignment can downgrade this private slot, while an
-            // author cannot promote an event by assigning true.
-            define(this,'isTrusted',{enumerable:true,get(){return wGet(violationSlots,this).trusted;},set(value){if(value===false)wGet(violationSlots,this).trusted=false;}});
+            wSet(violationSlots,this,data);
         }
     }
     for(const key of [...violationStrings,...violationNumbers])define(SecurityPolicyViolationEvent.prototype,key,{configurable:true,enumerable:true,get(){const data=wGet(violationSlots,this);if(!data)throw new TypeError('Illegal SecurityPolicyViolationEvent receiver');return data[key];}});
-    function violationEvent(init){const event=new SecurityPolicyViolationEvent('securitypolicyviolation',{...init,bubbles:true,composed:true});wGet(violationSlots,event).trusted=true;return event;}
+    function violationEvent(init){const event=new SecurityPolicyViolationEvent('securitypolicyviolation',{...init,bubbles:true,composed:true});eventState(event).isTrusted=true;return event;}
     function ownerRoute(node,hook,...args){return node?nativeSafety('owner',node,hook,...args):null;}
     const factoryBrands=new WeakMap();
     function factory(v){if(!wGet(factoryBrands,v))throw new TypeError('Illegal TrustedTypePolicyFactory receiver');}

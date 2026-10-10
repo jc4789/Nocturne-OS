@@ -10,6 +10,7 @@ static void frame_cancel(struct web_js_state *s,struct web_frame *f) {
 static void frame_retire_document(web_doc *d) {
     struct web_js_state *s=d?d->js:NULL;if(!s)return;
     s->disabled=true;
+    storage_release_document(s);
     release_document_tasks(s);
     history_forget(s);
     broadcast_free(s);
@@ -581,7 +582,7 @@ static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int a
         if(JS_IsException(cleared))return cleared;JS_FreeValue(ctx,cleared);
         html_finish(s->doc->parser);s->doc->parser=NULL;
         while(s->doc->root->first)doc_node_remove(s->doc,s->doc->root->first);
-        for(struct js_script *script=s->scripts;script;script=script->next)script->executed=true;
+        for(struct js_script *script=s->scripts;script;script=script->next)script->executed=script->parser_released=true;
         s->blocker=NULL;s->parsing_done=s->domcontent_sent=s->load_sent=false;
         s->doc->parser=html_open(s->doc);
         if(!s->doc->parser)return oom(ctx);

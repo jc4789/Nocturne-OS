@@ -96,6 +96,15 @@ int http_request(const struct http_req *rq, struct http_resp *resp);
    entry keeps its existing defaults; http_req and persisted caller ABI are unchanged. */
 #define HTTP_RESPONSE_BODY_MAX ((size_t)UINT32_MAX)
 int http_request_limited(const struct http_req *rq, struct http_resp *resp, size_t body_limit);
+/* Opt-in lifecycle hooks without changing the persisted http_req layout.
+   Headers are complete/validated before body callbacks. A positive headers
+   return stops after metadata (redirects); negative aborts the request. */
+struct http_stream_hooks {
+    int (*headers)(void *ctx, const struct http_resp *response);
+    int (*upload)(void *ctx, size_t transmitted, size_t total);
+};
+int http_request_stream(const struct http_req *, struct http_resp *, size_t,
+                        const struct http_stream_hooks *);
 /* Both successful and failed responses may be freed. Do not free a borrowed
    headers_full used solely to adapt an existing header block for lookup. */
 void http_resp_free(struct http_resp *resp);

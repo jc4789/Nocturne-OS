@@ -23,6 +23,7 @@ struct request {
     struct webnet_wire_response head;
     size_t head_pos;
     bool cancelled, finishing;
+    bool streaming, paused, headers_seen;
     char *cookie_site;
     enum webnet_credentials credentials;
     bool top_level;
@@ -32,17 +33,18 @@ struct request {
     size_t keepalive_bytes;
     char error[160];
 };
-struct slot { struct request *rq; int pid, in, out; };
+struct slot { struct request *rq; int pid, in, out; struct slot *next; };
 struct webnet {
     struct request *queue;
     struct slot slots[WORKERS];
+    struct slot *parked;
     uint64_t serial;
     unsigned count;
     size_t queued_bytes;
     webcookie_jar *cookies;
 };
 
-static void request_free(struct request *r) { free(r->tx); free(r->rx); free(r->cookie_site); free(r); }
+static void request_free(struct request *r) { if(!r)return;free(r->tx); free(r->rx); free(r->cookie_site); free(r); }
 static void load_cookie_psl(webcookie_jar *jar) {
     FILE *f = fopen("/usr/share/browser/public_suffix_list.dat", "r");
     if (!f) return; /* Jar falls back to host-only, not a guessed suffix table. */
@@ -81,6 +83,7 @@ void webnet_free(webnet *n) {
         if (s->pid > 0) { kill(s->pid); waitpid(s->pid, NULL, 0); }
         request_free(s->rq);
     }
+    while(n->parked){struct slot *s=n->parked;n->parked=s->next;slot_close(s);if(s->pid>0){kill(s->pid);waitpid(s->pid,NULL,0);}request_free(s->rq);free(s);}
     while (n->queue) { struct request *r = n->queue; n->queue = r->next; request_free(r); }
     webcookie_free(n->cookies); free(n);
 }
@@ -101,7 +104,8 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
         ((q->no_cors || q->no_referrer) && q->kind != WEBNET_FETCH) ||
         (q->no_cors && (q->same_origin || q->force_preflight)) ||
         (q->keepalive && (q->kind != WEBNET_FETCH || !q->fetch_group)) ||
-        (q->image_upgrade && q->kind != WEBNET_RESOURCE)) return 0;
+        (q->image_upgrade && q->kind != WEBNET_RESOURCE) ||
+        (q->stream_response && q->kind != WEBNET_FETCH)) return 0;
     if(q->kind==WEBNET_REPORT && (!webnet_report_fields_valid(q->method,q->headers) || !q->origin ||
         !q->body_len || q->credentials!=WEBNET_CREDENTIALS_SAME_ORIGIN || !q->redirect_error ||
         q->user_navigation || q->force_preflight || q->same_origin || q->no_cors || q->no_referrer ||
@@ -124,6 +128,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
                 bytes += p->keepalive_bytes;
             }
         }
+        for(const struct slot *s=n->parked;s;s=s->next){const struct request *p=s->rq;if(p&&p->keepalive&&!p->cancelled&&p->fetch_group==q->fetch_group){if(p->keepalive_bytes>65536u-bytes)return 0;bytes+=p->keepalive_bytes;}}
     }
     const char *origin = q->origin ? q->origin : "";
     const char *method = q->method ? q->method : "GET";
@@ -150,6 +155,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     r->generation = q->generation;
     r->keepalive = q->keepalive; r->fetch_group = q->fetch_group;
     r->image_upgrade = q->image_upgrade;
+    r->streaming = q->stream_response;
     r->keepalive_bytes = q->keepalive ? q->body_len : 0;
     r->response_limit = webnet_response_limit(q->kind);
     r->deadline = uptime_ms() + WEBNET_TIMEOUT_MS;
@@ -168,6 +174,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     if (q->image_upgrade) h.user_navigation |= WEBNET_WIRE_IMAGE_UPGRADE;
     if (q->no_cors) h.user_navigation |= WEBNET_WIRE_NO_CORS;
     if (q->no_referrer) h.user_navigation |= WEBNET_WIRE_NO_REFERRER;
+    if (q->stream_response) h.user_navigation |= WEBNET_WIRE_STREAM;
     h.credentials = q->credentials; h.cookie_len = (uint32_t)cookie_len;
     h.id = r->id; h.generation = r->generation; h.deadline = r->deadline;
     h.url_len = ul; h.origin_len = ol; h.method_len = ml; h.headers_len = hl; h.body_len = q->body_len;
@@ -260,9 +267,10 @@ static void complete(webnet *n, struct slot *s) {
     s->rq = NULL; s->pid = 0; slot_close(s); n->count--;
     if (r->tx) n->queued_bytes -= r->tx_len;
     if (!r->cancelled) {
-        if (!r->error[0] && r->rx && !cookie_events(n,r)) snprintf(r->error,sizeof r->error,"Invalid cookie update or out of memory");
+        if (!r->streaming && !r->error[0] && r->rx && !cookie_events(n,r)) snprintf(r->error,sizeof r->error,"Invalid cookie update or out of memory");
         struct webnet_response response = {0};
         response.final_url = ""; response.headers = ""; response.body = ""; response.error = r->error;
+        response.event = r->streaming ? WEBNET_END : WEBNET_COMPLETE;
         if (!r->error[0] && r->rx) {
             char *p = (char *)r->rx;
             response.status = (int)r->head.status;
@@ -297,30 +305,44 @@ static bool unpack(struct request *r) {
     free(r->rx); r->rx = out;
     return true;
 }
-void webnet_pump(webnet *n, uint64_t now) {
-    if (!n) return;
-    /* Expired queued requests also finish through a normal callback, never during submit. */
-    struct request **qp = &n->queue;
-    while (*qp) {
-        struct request *r = *qp;
-        if (now < r->deadline) { qp = &r->next; continue; }
-        *qp = r->next; r->next = NULL;
-        struct slot temp = {r, 0, -1, -1};
-        snprintf(r->error, sizeof r->error, "Request deadline exceeded"); complete(n, &temp);
-        qp = &n->queue; /* callbacks may have changed the queue */
-    }
-    for (int i = 0; i < WORKERS; i++) {
-        struct slot *s = &n->slots[i];
-        /* Keep one slot available to document dependencies. A long-lived
-           Fetch channel must not block later scripts/styles behind all workers.
-           The other three slots still service Fetch, with the same total deadline. */
-        if (!s->rq && n->queue && (i != 0 || n->queue->priority < 3)) {
-            struct request *r = n->queue; n->queue = r->next; r->next = NULL; start(s, r);
-        }
+static bool stream_frame_valid(struct request *r) {
+    const struct webnet_wire_response *h = &r->head;
+    if (h->magic == WEBNET_STREAM_HEADERS)
+        return !r->headers_seen && h->status >= 200 && h->status <= 599 && h->url_len && !h->body_len && !h->error_len;
+    if (h->magic == WEBNET_STREAM_CHUNK)
+        return r->headers_seen && h->body_len && h->body_len <= WEBNET_STREAM_CHUNK_MAX &&
+            !h->url_len && !h->headers_len && !h->error_len && !h->cookie_len && !h->status;
+    if (h->magic == WEBNET_STREAM_UPLOAD)
+        return !r->headers_seen && !h->url_len && !h->headers_len && !h->body_len && !h->error_len && !h->cookie_len;
+    return h->magic == WEBNET_STREAM_END && !h->url_len && !h->headers_len && !h->body_len && !h->status &&
+        (r->headers_seen || h->error_len);
+}
+static bool dispatch_stream_frame(webnet *n, struct request *r) {
+    if (!unpack(r)) return false;
+    if (!cookie_events(n, r)) return false;
+    if (r->head.magic == WEBNET_STREAM_END) return true; /* terminal callback after reaping */
+    char *p = (char *)r->rx;
+    struct webnet_response response = {0};
+    response.status = (int)r->head.status;
+    response.final_url = p; p += (size_t)r->head.url_len + 1;
+    response.headers = p; p += (size_t)r->head.headers_len + 1;
+    response.body = p; response.body_len = r->head.body_len; p += (size_t)r->head.body_len + 1;
+    response.error = p;
+    response.event = r->head.magic == WEBNET_STREAM_HEADERS ? WEBNET_HEADERS :
+        r->head.magic == WEBNET_STREAM_CHUNK ? WEBNET_CHUNK : WEBNET_UPLOAD;
+    response.uploaded = r->head.magic == WEBNET_STREAM_UPLOAD ? r->head.status : 0;
+    if (response.event == WEBNET_HEADERS) r->headers_seen = true;
+    r->paused = true;
+    r->callback(n, r->id, r->generation, &response, r->opaque);
+    free(r->rx); r->rx = NULL; r->rx_len = r->rx_pos = r->head_pos = 0;
+    memset(&r->head, 0, sizeof r->head);
+    return true;
+}
+static void pump_slot(webnet *n,struct slot *s,uint64_t now){
         struct request *r = s->rq;
-        if (!r) continue;
+        if (!r) return;
         if (!r->finishing && now >= r->deadline) slot_stop(s, "Request deadline exceeded");
-        if (!r->finishing) {
+        if (!r->finishing&&!r->paused) {
             struct n_pollfd pf[2] = {{s->out, N_POLLIN, 0}, {s->in, N_POLLOUT, 0}};
             if (poll(pf, s->in >= 0 ? 2 : 1, 0) < 0) slot_stop(s, "Worker poll failed");
             size_t budget = PUMP_BYTES;
@@ -336,7 +358,7 @@ void webnet_pump(webnet *n, uint64_t now) {
                 }
             }
             budget = PUMP_BYTES;
-            while (!r->finishing && budget && (pf[0].revents & (N_POLLIN | N_POLLHUP))) {
+            while (!r->finishing && !r->paused && budget && (pf[0].revents & (N_POLLIN | N_POLLHUP))) {
                 void *dest; size_t take;
                 if (r->head_pos < sizeof r->head) {
                     dest = (unsigned char *)&r->head + r->head_pos; take = sizeof r->head - r->head_pos;
@@ -350,9 +372,9 @@ void webnet_pump(webnet *n, uint64_t now) {
                     r->head_pos += k;
                     if (r->head_pos == sizeof r->head) {
                         struct webnet_wire_response *h = &r->head;
-                        if (h->magic != WEBNET_MAGIC || h->id != r->id || h->generation != r->generation ||
+                        if ((!r->streaming && h->magic != WEBNET_MAGIC) || (r->streaming && !stream_frame_valid(r)) || h->id != r->id || h->generation != r->generation ||
                             h->headers_len > webnet_wire_header_limit(WEBNET_WIRE_DYNAMIC_HEADERS) ||
-                            h->body_len > r->response_limit || h->error_len >= sizeof r->error || h->status > 999 ||
+                            h->body_len > r->response_limit || h->error_len >= sizeof r->error || (!r->streaming && h->status > 999) ||
                             h->cookie_len > webnet_wire_cookie_limit(WEBNET_WIRE_DYNAMIC_URL)) {
                             slot_stop(s, "Invalid worker response"); break;
                         }
@@ -362,6 +384,11 @@ void webnet_pump(webnet *n, uint64_t now) {
                     }
                 } else r->rx_pos += k;
                 if (r->head_pos == sizeof r->head && r->rx_pos == r->rx_len) {
+                    if (r->streaming) {
+                        bool terminal = r->head.magic == WEBNET_STREAM_END;
+                        if (!dispatch_stream_frame(n, r)) { slot_stop(s, "Invalid stream response or out of memory"); break; }
+                        if (!terminal) break; /* one bounded frame per worker per pump */
+                    } else
                     if (!unpack(r)) { slot_stop(s, "Invalid response or out of memory"); break; }
                     r->finishing = true; slot_close(s);
                 }
@@ -373,6 +400,24 @@ void webnet_pump(webnet *n, uint64_t now) {
             int status = 0;
             int reaped = s->pid > 0 ? waitpid(s->pid, &status, WNOHANG) : -1;
             if (reaped != 0) complete(n, s);
+        }
+}
+void webnet_pump(webnet *n,uint64_t now){
+    if(!n)return;
+    struct request **qp=&n->queue;
+    while(*qp){struct request *r=*qp;if(now<r->deadline){qp=&r->next;continue;}*qp=r->next;r->next=NULL;struct slot temp={r,0,-1,-1,NULL};snprintf(r->error,sizeof r->error,"Request deadline exceeded");complete(n,&temp);qp=&n->queue;}
+    /* Paused pipes retain their process and bounded pipe storage, but do not
+       occupy a scheduling slot. Resumed readers consume one frame per pump. */
+    struct slot **park=&n->parked;
+    while(*park){struct slot *s=*park;pump_slot(n,s,now);if(!s->rq){*park=s->next;free(s);}else park=&s->next;}
+    for(int i=0;i<WORKERS;i++){
+        struct slot *s=&n->slots[i];
+        if(!s->rq&&n->queue&&(i!=0||n->queue->priority<3)){struct request *r=n->queue;n->queue=r->next;r->next=NULL;start(s,r);}
+        pump_slot(n,s,now);
+        if(s->rq&&s->rq->paused&&!s->rq->finishing){
+            struct slot *held=malloc(sizeof *held);
+            if(!held){slot_stop(s,"Out of memory retaining stream transport");continue;}
+            *held=*s;held->next=n->parked;n->parked=held;memset(s,0,sizeof *s);s->in=s->out=-1;
         }
     }
 }
@@ -389,6 +434,7 @@ int webnet_timeout(const webnet *n, uint64_t now) {
         if (r->finishing || now >= r->deadline) return 0;
         if (r->deadline - now < (uint64_t)ms) ms = (int)(r->deadline - now);
     }
+    for(const struct slot *s=n->parked;s;s=s->next)if(s->rq){const struct request *r=s->rq;if(r->finishing||now>=r->deadline)return 0;if(r->deadline-now<(uint64_t)ms)ms=(int)(r->deadline-now);}
     return ms;
 }
 static void cancel(webnet *n, uint64_t key, bool generation) {
@@ -406,6 +452,7 @@ static void cancel(webnet *n, uint64_t key, bool generation) {
             if (s->pid > 0) kill(s->pid);
         }
     }
+    for(struct slot *s=n->parked;s;s=s->next)if(s->rq&&(generation?s->rq->generation:s->rq->id)==key&&!(generation&&s->rq->keepalive)){s->rq->cancelled=true;slot_stop(s,NULL);}
     if (generation) {
         /* Document teardown needs stopped children, not merely pending kill requests.
            Signal both first; Nocturne wakes blocked killed tasks so wait can reap them.
@@ -416,7 +463,16 @@ static void cancel(webnet *n, uint64_t key, bool generation) {
             if (s->pid > 0) waitpid(s->pid, NULL, 0);
             complete(n, s); /* cancelled requests never invoke their callback */
         }
+        for(struct slot *s=n->parked;s;s=s->next)if(s->rq&&s->rq->generation==key&&!s->rq->keepalive){if(s->pid>0)waitpid(s->pid,NULL,0);complete(n,s);}
     }
 }
 void webnet_cancel(webnet *n, uint64_t id) { cancel(n, id, false); }
+void webnet_resume(webnet *n, uint64_t id) {
+    if (!n) return;
+    for (int i = 0; i < WORKERS; i++) {
+        struct request *r = n->slots[i].rq;
+        if (r && r->id == id && r->streaming && !r->cancelled) { r->paused = false; return; }
+    }
+    for(struct slot *s=n->parked;s;s=s->next){struct request *r=s->rq;if(r&&r->id==id&&r->streaming&&!r->cancelled){r->paused=false;return;}}
+}
 void webnet_cancel_generation(webnet *n, uint64_t generation) { cancel(n, generation, true); }

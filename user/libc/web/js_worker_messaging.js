@@ -151,7 +151,7 @@ const workerMessagingBridge=(()=>{
             if(task.cancelled||tasks.closed||endpoint.owner!==s||endpoint.scheduled!==task||!s.enabled)continue;
             endpoint.scheduled=null;const entry=endpoint.head;if(!entry)continue;
             endpoint.head=entry.next;if(!endpoint.head)endpoint.tail=null;
-            try{apply(dispatch,s.value,[new MessageEvent('message',{data:entry.message.data,ports:entry.message.ports})]);}
+            try{dispatchNativeWorkerEvent(s.value,new MessageEvent('message',{data:entry.message.data,ports:entry.message.ports}));}
             finally{schedule(endpoint);}return true;
         }return false;
     }

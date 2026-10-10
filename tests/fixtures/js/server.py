@@ -10,6 +10,7 @@ import json
 import mimetypes
 import threading
 import time
+import zlib
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +23,8 @@ mimetypes.add_type("text/javascript", ".mjs")
 
 class Handler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    stream_gates = {}
+    stream_lock = threading.Lock()
     preflights = {}
     preflight_cookies = {}
     preflight_headers = {}
@@ -96,6 +99,57 @@ class Handler(SimpleHTTPRequestHandler):
         if not path.startswith("/api/"):
             return False
         query = parse_qs(parsed.query)
+        if path == "/api/stream-release":
+            key = query.get("key", [""])[0]
+            phase = int(query.get("phase", ["1"])[0])
+            with self.stream_lock:
+                gates = self.stream_gates.get(key)
+            if gates and phase in (1, 2):
+                gates[phase - 1].set()
+            self.send_json({"released": bool(gates)}, cors=True)
+            return True
+        if path == "/api/stream":
+            key = query.get("key", [""])[0]
+            gates = (threading.Event(), threading.Event())
+            with self.stream_lock:
+                self.stream_gates[key] = gates
+            if self.command == "POST":
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            compressed = query.get("gzip") == ["1"]
+            compressor = zlib.compressobj(wbits=31) if compressed else None
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Transfer-Encoding", "chunked")
+            if compressed:
+                self.send_header("Content-Encoding", "gzip")
+            self.cors(credentials=True)
+            self.end_headers()
+            self.wfile.flush()
+            try:
+                for gate, body, last in ((gates[0], b"first", False), (gates[1], b"-last", True)):
+                    if not gate.wait(8):
+                        break
+                    if compressor:
+                        body = compressor.compress(body) + compressor.flush(zlib.Z_FINISH if last else zlib.Z_SYNC_FLUSH)
+                    self.wfile.write(('%x\r\n' % len(body)).encode() + body + b"\r\n")
+                    self.wfile.flush()
+                else:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                with self.stream_lock:
+                    if self.stream_gates.get(key) is gates:
+                        del self.stream_gates[key]
+            return True
+        if path == "/api/redirect-no-location":
+            self.send_response(302)
+            self.send_header("Content-Length", "4")
+            self.cors(credentials=True)
+            self.end_headers()
+            self.wfile.write(b"stay")
+            return True
         with self.preflight_lock:
             methods = self.actual_requests.setdefault(self.path, {})
             methods[self.command] = methods.get(self.command, 0) + 1

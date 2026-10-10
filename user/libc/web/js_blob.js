@@ -104,7 +104,7 @@ const blobBridge = (() => {
         get webkitRelativePath(){const s=apply(get,files,[this]);if(!s)throw new TypeError('Illegal File receiver');return s.relativePath||'';}
     }
     const readerState=v=>{const s=apply(get,readers,[v]);if(!s)throw new TypeError('Illegal FileReader receiver');return s;};
-    function fire(reader,type,total=0){const event=new ProgressEventType(type,{lengthComputable:true,loaded:type==='loadstart'?0:total,total});event.isTrusted=true;dispatch(reader,event);}
+    function fire(reader,type,total=0){const event=new ProgressEventType(type,{lengthComputable:true,loaded:type==='loadstart'?0:total,total});eventState(event).isTrusted=true;dispatch(reader,event);}
     function start(reader,blob,kind,encoding){
         const s=readerState(reader),b=state(blob);
         if(s.ready===1)throw new DOMException('Reader is already loading','InvalidStateError');

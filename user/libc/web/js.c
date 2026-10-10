@@ -71,6 +71,7 @@ struct js_script {
     char *url, *base, *source;
     size_t len;
     bool module, deferred, asynchronous, dynamic, ready, failed, executed, notified;
+    bool external, parser_released;
     JSValue evaluation;
     uint64_t request;
     struct js_script *next;
@@ -85,9 +86,10 @@ struct js_pending {
     struct js_script *script;
     struct web_frame *frame;
     struct web_font_resource *font;
-    JSValue resolve, reject;
+    JSValue resolve, reject, stream_callback;
     char *url,*origin;
     bool done, aborted, force_preflight, redirect_error, same_origin, keepalive, no_cors, no_referrer;
+    bool streaming, headers_delivered;
     struct web_response response;
     struct js_pending *next;
 };
@@ -182,6 +184,12 @@ struct web_js_state {
     unsigned suspicious_script_urls;
     bool document_open,document_waiting;
     unsigned dynamic_markup_counter;
+    unsigned ignore_destructive_writes_counter;
+    uint64_t storage_source, storage_poll_due;
+    char *storage_origin;
+    bool storage_subscribed[2];
+    bool storage_event_turn;
+    unsigned storage_event_kind;
     bool frames_scanned;
     uint64_t frames_revision;
     uint32_t script_count;
@@ -214,6 +222,7 @@ static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int a
 static bool frame_string_replace(char **slot, const char *text);
 static void policy_report_send(struct web_js_state *s,JSValueConst init,struct web_html_policy_rule *rule);
 static void js_policy_worker_report(void *opaque,JSValueConst message);
+static void storage_release_document(struct web_js_state *s);
 static void signal_slots(struct web_js_state *s) {
     web_doc *family = s->doc->dom_family ? s->doc->dom_family : s->doc;
     if (!s->disabled && family->shadow_slots_pending) {
@@ -2158,7 +2167,7 @@ static bool dom_custom_subtree(node_t *node) {
 static bool dom_synchronous_hooks(struct web_js_state *s,int opcode,node_t *n,int argc,JSValueConst *argv) {
     node_t *incoming=argc>2?node_opaque(argv[2]):NULL,*old=argc>3?node_opaque(argv[3]):NULL;
     if(s->face_hooks_active)return true; /* form/id/fieldset changes affect FACE */
-    bool structure=opcode==DOM_insert||opcode==DOM_replace||opcode==DOM_remove||opcode==DOM_adopt;
+    bool structure=opcode==DOM_insert||opcode==DOM_replace||opcode==DOM_replaceAll||opcode==DOM_remove||opcode==DOM_adopt;
     if(s->range_hooks_active&&structure)return true;
     if(opcode==DOM_set&&argc>2&&JS_IsString(argv[2])){
         const char *key=JS_ToCString(s->ctx,argv[2]);
@@ -2171,7 +2180,7 @@ static bool dom_synchronous_hooks(struct web_js_state *s,int opcode,node_t *n,in
     if(opcode==DOM_adopt&&incoming&&incoming->type==N_ATTR)return custom_candidate(incoming->attr_owner);
     if(structure||opcode==DOM_clone||opcode==DOM_import){
         return dom_custom_subtree(opcode==DOM_remove||opcode==DOM_clone?n:incoming)||
-            (opcode==DOM_replace&&dom_custom_subtree(old));
+            (opcode==DOM_replace&&dom_custom_subtree(old))||(opcode==DOM_replaceAll&&dom_custom_subtree(n));
     }
     if(n&&n->type==N_ATTR)n=n->attr_owner;
     return custom_candidate(n);
@@ -2186,7 +2195,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
        (sandbox_actor(s)->doc->sandbox_flags && sandbox_actor(s)->doc!=d)))
         return history_security_error(ctx,"Sandbox denied borrowed document authority");
     doc_dom_budget(d);
-    bool mutation = opcode == DOM_shadowAttach || opcode == DOM_slotAssign || opcode == DOM_insert || opcode == DOM_replace || opcode == DOM_remove || opcode == DOM_adopt || opcode == DOM_clone || opcode == DOM_import || opcode == DOM_set ||
+    bool mutation = opcode == DOM_shadowAttach || opcode == DOM_slotAssign || opcode == DOM_insert || opcode == DOM_replace || opcode == DOM_replaceAll || opcode == DOM_remove || opcode == DOM_adopt || opcode == DOM_clone || opcode == DOM_import || opcode == DOM_set ||
                     opcode == DOM_attrSetNode || opcode == DOM_attrRemoveNode ||
                     ((opcode == DOM_attr || opcode == DOM_style) && argc > 3) || (opcode == DOM_attrNS && argc > 4);
     bool synchronous_hooks=mutation&&(s->ce_hooks_active||s->range_hooks_active)&&dom_synchronous_hooks(s,opcode,n,argc,argv);
@@ -2230,6 +2239,15 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     case DOM_isNode: {
         result = JS_NewBool(ctx, argc > 2 && node_opaque(argv[2]) != NULL);
 
+    } break;
+    case DOM_replaceAllStatus: {
+        node_t *child=argc>2?unwrap(ctx,argv[2]):NULL;
+        result=JS_NewInt32(ctx,doc_node_replace_all_validity(n,child));
+    } break;
+    case DOM_replaceAll: {
+        node_t *child=argc>2?unwrap(ctx,argv[2]):NULL;
+        if(doc_node_replace_all_validity(n,child))result=JS_ThrowTypeError(ctx,"Invalid native replace-all");
+        else result=doc_node_replace_all(d,n,child)?JS_UNDEFINED:oom(ctx);
     } break;
     case DOM_animationStyle: case DOM_animationComputed: {
         result = animation_dom(s, n, opcode == DOM_animationComputed, argc, argv);
@@ -2805,7 +2823,7 @@ mutation_after(s,&observed,!JS_IsException(result));
     }
     JS_FreeValue(ctx, ce_token);
     if (!JS_IsException(result) && mutation) signal_slots(s);
-    if (!JS_IsException(result) && n && (opcode == DOM_insert || opcode == DOM_replace) && connected(s, n)) {
+    if (!JS_IsException(result) && n && (opcode == DOM_insert || opcode == DOM_replace || opcode == DOM_replaceAll) && connected(s, n)) {
         dynamic_scripts(s, n);
         for (struct js_script *script = s->scripts; script; script = script->next)
             if (script->dynamic && script->ready && !script->executed && !script->module && !node_attr(script->node, "src")) run_script(s, script);
@@ -3283,7 +3301,7 @@ static JSValue native_cookie(JSContext *ctx, JSValueConst this_val, int argc, JS
  * from page code; even after argument conversion the current native URL wins. */
 static JSValue native_storage_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
-    if(!task_context_active(s) || sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Sandbox or inactive storage authority");
+    if(!task_context_active(s) || sandbox_borrowed(s) || (sandbox_authority(s)&(SB_SCRIPTS|SB_ORIGIN)))return history_security_error(ctx,"Sandbox or inactive storage authority");
     int32_t kind=0, op=0; uint32_t index=0;
     if (argc<2) return JS_ThrowTypeError(ctx,"Storage kind/operation required");
     if (JS_ToInt32(ctx,&kind,argv[0])<0 || JS_ToInt32(ctx,&op,argv[1])<0) return JS_EXCEPTION;
@@ -3293,7 +3311,10 @@ static JSValue native_storage_impl(JSContext *ctx, JSValueConst this_val, int ar
         if (argc<5) return JS_ThrowTypeError(ctx,"Storage index required");
         if (JS_ToUint32(ctx,&index,argv[4])<0) return JS_EXCEPTION;
     }
-    struct web_storage_request request={.kind=kind,.operation=op,.index=index};
+    if(kind<WEB_STORAGE_LOCAL || kind>WEB_STORAGE_SESSION || op<WEB_STORAGE_LENGTH || op>WEB_STORAGE_CHECK)
+        return JS_ThrowTypeError(ctx,"Invalid Storage operation");
+    struct web_storage_request request={.kind=kind,.operation=op,.index=index,
+        .source=s->host.storage_events?s->storage_source:0,.url=s->doc->url};
     const char *key=NULL,*value=NULL;
     if (op==WEB_STORAGE_GET || op==WEB_STORAGE_SET || op==WEB_STORAGE_REMOVE) {
         if (argc<3) return JS_ThrowTypeError(ctx,"Storage key required");
@@ -3324,6 +3345,7 @@ static JSValue native_storage_impl(JSContext *ctx, JSValueConst this_val, int ar
         if (len && len<2048 && len==strlen(origin) && s->host.storage) {
             uint64_t start=s->host.debug_js?uptime_ms():0;if(s->host.debug_js)profile->backend_calls++;
             status=s->host.storage(s->host.opaque,origin,&request,&out);
+            if(status==WEB_STORAGE_OK && s->host.storage_events)s->storage_subscribed[kind]=true;
             if(s->host.debug_js){profile->backend_ms+=uptime_ms()-start;
                 profile->saves+=out.save_attempts;profile->save_ms+=out.save_ms;
                 profile->snapshot_bytes+=out.snapshot_bytes;}
@@ -3343,6 +3365,61 @@ done:
     free(out.text); JS_FreeCString(ctx,origin); JS_FreeValue(ctx,origin_value);
     JS_FreeValue(ctx,argument); JS_FreeValue(ctx,fn); JS_FreeCString(ctx,key); JS_FreeCString(ctx,value);
     return result;
+}
+static void storage_subscribe_document(struct web_js_state *s) {
+    if(!s->host.storage_events || !s->host.storage || (s->doc->sandbox_flags&(SB_ORIGIN|SB_SCRIPTS)))return;
+    static uint32_t serial;
+    if(!s->storage_source)s->storage_source=((uint64_t)(uint32_t)getpid()<<32)|__atomic_add_fetch(&serial,1,__ATOMIC_RELAXED);
+    if(!s->storage_origin){
+        JSValue argument=JS_NewString(s->ctx,web_effective_url(s->doc));
+        JSValue value=custom_element_hook(s,"storageOrigin",1,&argument);JS_FreeValue(s->ctx,argument);
+        if(JS_IsException(value)){exception(s);return;}
+        if(!JS_IsNull(value) && !JS_IsUndefined(value)){
+            size_t n=0;const char *origin=JS_ToCStringLen(s->ctx,&n,value);
+            if(origin && n && n<2048 && n==strlen(origin))s->storage_origin=strdup(origin);
+            JS_FreeCString(s->ctx,origin);
+        }
+        JS_FreeValue(s->ctx,value);
+    }
+    /* Holders are created by their first getter. A successful native CHECK
+     * registers the realm; unused storage neither reads disk nor polls. */
+    s->storage_poll_due=uptime_ms()+100;
+}
+static void storage_release_document(struct web_js_state *s) {
+    if(s->storage_source && s->host.storage_events && s->host.storage){
+        struct web_storage_request request={.operation=WEB_STORAGE_RELEASE,.source=s->storage_source};
+        struct web_storage_result out={0};s->host.storage(s->host.opaque,NULL,&request,&out);webstorage_result_free(&out);
+    }
+    free(s->storage_origin);s->storage_origin=NULL;s->storage_source=0;
+    s->storage_subscribed[0]=s->storage_subscribed[1]=false;
+}
+static bool storage_run_event(struct web_js_state *s,uint64_t now) {
+    if(!s->storage_origin || (!s->storage_subscribed[0]&&!s->storage_subscribed[1]) || now<s->storage_poll_due)return false;
+    s->storage_poll_due=now+100;
+    for(int step=0;step<2;step++){
+        int kind=(s->storage_event_kind+step)%2;
+        if(!s->storage_subscribed[kind])continue;
+        struct web_storage_request request={.kind=kind,.operation=WEB_STORAGE_POLL,.source=s->storage_source};
+        struct web_storage_result out={0};int status=s->host.storage(s->host.opaque,s->storage_origin,&request,&out);
+        if(status!=WEB_STORAGE_OK || !out.event){webstorage_result_free(&out);continue;}
+        JSValue args[5]={JS_NewInt32(s->ctx,kind),out.event_key?JS_NewStringLen(s->ctx,out.event_key,out.event_key_len):JS_NULL,
+            out.old_value?JS_NewStringLen(s->ctx,out.old_value,out.old_len):JS_NULL,
+            out.new_value?JS_NewStringLen(s->ctx,out.new_value,out.new_len):JS_NULL,JS_NewString(s->ctx,out.url?out.url:"")};
+        bool failed=false;for(int i=0;i<5;i++)if(JS_IsException(args[i]))failed=true;
+        if(!failed){
+            begin_named_task(s,"storage event",out.cursor);
+            JSValue result=custom_element_hook(s,"storageEvent",5,args);
+            if(JS_IsException(result))exception(s);JS_FreeValue(s->ctx,result);end_task(s);
+            /* Exceptions in an event handler do not cancel its delivery. A
+             * retired realm releases the reader instead of acknowledging it. */
+            if(s->storage_source){request.operation=WEB_STORAGE_ACK;request.cursor=out.cursor;
+                struct web_storage_result ignored={0};s->host.storage(s->host.opaque,s->storage_origin,&request,&ignored);webstorage_result_free(&ignored);}
+        }else exception(s);
+        for(int i=0;i<5;i++)JS_FreeValue(s->ctx,args[i]);webstorage_result_free(&out);
+        /* Drain queued events as separate tasks without a further 100ms delay. */
+        s->storage_event_kind=1-kind;s->storage_poll_due=now;return true;
+    }
+    return false;
 }
 static JSValue native_storage(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if(!state(ctx)->host.debug_js)return native_storage_impl(ctx,this_val,argc,argv);
@@ -3399,6 +3476,8 @@ static JSValue native_write(JSContext *ctx, JSValueConst this_val, int argc, JSV
     /* Asynchronously executing scripts with no insertion point must not erase
        a still-loading document. A completed document uses the open algorithm. */
     bool in_token=s->doc->parser && s->doc->parser->callback_depth;
+    if (!s->parser_write && !s->document_open && !in_token && s->ignore_destructive_writes_counter)
+        return JS_UNDEFINED;
     if (!s->parser_write && !s->document_open && !in_token && s->doc->parser && !s->parsing_done) return JS_UNDEFINED;
     if ((!s->doc->parser || s->parsing_done) && !s->document_open) {
         JSValue operation=JS_NewInt32(ctx,0),opened=native_document_stream(ctx,this_val,1,&operation);
@@ -3742,7 +3821,7 @@ static struct js_pending *pending_new(struct web_js_state *s, int kind, const ch
     p->url = js_strdup(s->ctx, url);
     if (!p->url) { js_free(s->ctx, p); return NULL; }
     p->id = ++s->runtime_owner->next_request; p->kind = kind; p->deadline = uptime_ms() + WEBNET_TIMEOUT_MS;
-    p->resolve = p->reject = JS_UNDEFINED; p->next = s->pending; s->pending = p; s->pending_count++;
+    p->resolve = p->reject = p->stream_callback = JS_UNDEFINED; p->next = s->pending; s->pending = p; s->pending_count++;
     return p;
 }
 static void pending_error(struct js_pending *p, const char *error) { p->done = true; snprintf(p->response.error, sizeof p->response.error, "%s", error); }
@@ -3776,7 +3855,8 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
         .credentials=(kind == WEB_RESOURCE_FETCH || kind == WEB_RESOURCE_REPORT) ? p->credentials : kind == WEB_RESOURCE_MODULE ? 1 : 2,
         .force_preflight=p->force_preflight, .redirect_error=p->redirect_error, .same_origin=p->same_origin,
         .no_cors=p->no_cors, .no_referrer=p->no_referrer,
-        .cache_mode=p->cache_mode, .keepalive=p->keepalive, .fetch_group=p->keepalive?s->fetch_group:0};
+        .cache_mode=p->cache_mode, .keepalive=p->keepalive, .fetch_group=p->keepalive?s->fetch_group:0,
+        .stream_response=p->streaming};
     if(kind==WEB_RESOURCE_IMAGE && p->kind==P_IMAGE && p->image>=0 && p->image<s->doc->images.n)
         r.image_upgrade=((struct web_image *)s->doc->images.v[p->image])->image_upgrade;
     bool ok = s->host.request && s->host.request(s->host.opaque, &r);
@@ -4001,6 +4081,8 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     p->force_preflight = argc > 6 && JS_ToBool(ctx, argv[6]) > 0;
     p->no_cors = argc > 10 && JS_ToBool(ctx, argv[10]) > 0;
     p->no_referrer = argc > 11 && JS_ToBool(ctx, argv[11]) > 0;
+    p->streaming = argc > 12 && JS_IsFunction(ctx, argv[12]) && s->host.resume_request;
+    if (p->streaming) p->stream_callback = JS_DupValue(ctx, argv[12]);
     JSValue funcs[2]; JSValue promise = JS_NewPromiseCapability(ctx, funcs);
     if (JS_IsException(promise)) { pending_error(p, "Out of memory"); goto out; }
     p->resolve = funcs[0]; p->reject = funcs[1];
@@ -4021,10 +4103,21 @@ out:
 static JSValue native_cancel(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     int64_t id; if (!argc || JS_ToInt64(ctx, &id, argv[0])) return JS_EXCEPTION;
     struct web_js_state *s = state(ctx);
-    for (struct js_pending *p = s->pending; p; p = p->next) if (p->id == (uint64_t)id && p->kind == P_FETCH && !p->done) {
+    for (struct js_pending *p = s->pending; p; p = p->next) if (p->id == (uint64_t)id && p->kind == P_FETCH && !p->aborted) {
         if (s->host.cancel) s->host.cancel(s->host.opaque, p->id);
         p->aborted = true; pending_error(p, "The operation was aborted"); break;
     }
+    return JS_UNDEFINED;
+}
+static JSValue native_resume_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    int64_t id; if (!argc || JS_ToInt64(ctx, &id, argv[0])) return JS_EXCEPTION;
+    struct web_js_state *s = state(ctx);
+    for (struct js_pending *p = s->pending; p; p = p->next)
+        if (p->id == (uint64_t)id && p->streaming && !p->aborted) {
+            if (s->host.resume_request) s->host.resume_request(s->host.opaque, p->id);
+            break;
+        }
     return JS_UNDEFINED;
 }
 
@@ -4427,6 +4520,7 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
     struct js_script *script = js_mallocz(s->ctx, sizeof *script);
     if (!script) { exception(s); return NULL; }
     script->evaluation = JS_UNDEFINED; script->node = n; script->module = module; script->dynamic = dynamic;
+    script->external = src && *src;
     bool force_async = dynamic;
     if (n->js_force_async_set) force_async = n->js_force_async;
     /* Capture preparation-time state for both classic and module scripts. */
@@ -4519,11 +4613,6 @@ static void dynamic_scripts(struct web_js_state *s, node_t *n) {
     dynamic_scripts_walk(s, n);
     if(s->host.debug_js)s->doc->profile.script_ms += uptime_ms() - start;
 }
-static bool script_finished(struct web_js_state *s, struct js_script *script) {
-    if (!script->executed) return false;
-    if (JS_IsUndefined(script->evaluation)) return true;
-    return JS_PromiseState(s->ctx, script->evaluation) != JS_PROMISE_PENDING;
-}
 static struct js_resource_event *script_event(struct web_js_state *s, node_t *n, bool failed) {
     if (s->disabled) return NULL;
     struct js_resource_event *e = js_mallocz(s->ctx, sizeof *e);
@@ -4548,14 +4637,16 @@ void web_js_selection_changed(web_doc *d, node_t *n) {
 }
 static void run_script(struct web_js_state *s, struct js_script *script) {
     if (script->executed || !script->ready) return;
-    if(s->doc->sandbox_flags&SB_SCRIPTS){script->executed=true;return;}
+    if(s->doc->sandbox_flags&SB_SCRIPTS){script->executed=script->parser_released=true;return;}
     script->executed = true;
-    if (s->disabled || script->failed || !script->source) { if (!s->disabled) { script_event(s, script->node, true); script->notified = true; } return; }
+    if (s->disabled || script->failed || !script->source) { script->parser_released=true; if (!s->disabled) { script_event(s, script->node, true); script->notified = true; } return; }
     s->doc->encoding_certain=true;
     begin_named_task(s,script->module?"module script":"classic script",script->request);
     node_t *old_current = s->current_script; bool old_write = s->parser_write;
     s->current_script = script->module ? NULL : script->node;
     s->parser_write = !script->module && s->blocker == script && !s->parsing_done;
+    bool guard_writes=script->external || script->module;
+    if(guard_writes)s->ignore_destructive_writes_counter++;
     uint64_t source_start = s->host.debug_js?uptime_ms():0, compiled_at = source_start;
     JSValue result;bool compilation_failed=false;
     if (script->module) {
@@ -4584,13 +4675,17 @@ static void run_script(struct web_js_state *s, struct js_script *script) {
        checkpoint before execute-the-script restores currentScript. Promise
        continuations registered by this script must still see its element. */
     s->current_script = old_current; s->parser_write = old_write;
+    if(guard_writes)s->ignore_destructive_writes_counter--;
+    /* HTML removes a deferred/ordered element after execute-the-script returns,
+       independently of its module evaluation promise (including top-level await). */
+    script->parser_released=true;
     /* Inline classic scripts have no resource load event. */
     if (!script->module && node_attr(script->node, "src")) { script_event(s, script->node, script->failed); script->notified = true; }
     js_free(s->ctx, script->source); script->source = NULL;
 }
 static void pending_free(struct web_js_state *s, struct js_pending *p) {
     if(p->kind==P_FONT && p->font)p->font->loading=false;
-    JS_FreeValue(s->ctx, p->resolve); JS_FreeValue(s->ctx, p->reject);
+    JS_FreeValue(s->ctx, p->resolve); JS_FreeValue(s->ctx, p->reject); JS_FreeValue(s->ctx, p->stream_callback);
     js_free(s->ctx, p->url);js_free(s->ctx,p->origin); js_free(s->ctx, p->response.body); js_free(s->ctx, p->response.headers_full); js_free(s->ctx,p->response.url_full);
     js_free(s->ctx, p); s->pending_count--;
 }
@@ -4710,6 +4805,71 @@ static int fetch_transport_flags(const char *headers) {
     if(!meta||sscanf(meta+2,"HTTP/Nocturne-Meta cors=%u redirected=%u opaque=%u",&cors,&redirected,&opaque)<2||cors>1||redirected>1||opaque>1)return -1;
     return (cors?NJW_LOADED_CORS:0)|(redirected?NJW_LOADED_REDIRECTED:0)|(opaque?NJW_LOADED_OPAQUE:0);
 }
+/* Consume exactly one native stream frame in its own task. Metadata/chunks
+   are owned by this pending request; no JS callback runs inside network pump. */
+static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
+    begin_task(s);
+    int event = p->response.event;
+    bool terminal = event == WEBNET_END || p->response.error[0] || p->aborted;
+    JSValue value = JS_UNDEFINED;
+    if (event == WEBNET_HEADERS && !terminal) {
+        int flags = fetch_transport_flags(web_response_headers(&p->response));
+        bool opaque = flags >= 0 && (flags & NJW_LOADED_OPAQUE);
+        if (flags < 0 || (opaque && !p->no_cors)) {
+            pending_error(p, "Native Fetch response contradicts its filtering policy"); terminal = true;
+        } else {
+            JSValue args[] = {JS_NewInt32(s->ctx, opaque ? 0 : p->response.status),
+                JS_NewString(s->ctx, opaque ? "" : web_response_url(&p->response)),
+                JS_NewString(s->ctx, opaque ? "" : web_response_headers(&p->response)), JS_UNDEFINED,
+                JS_NewArrayBufferCopy(s->ctx, NULL, 0), JS_NewBool(s->ctx, !opaque && (flags & NJW_LOADED_REDIRECTED)),
+                JS_UNDEFINED, JS_NewString(s->ctx, opaque ? "opaque" : (flags & NJW_LOADED_CORS) ? "cors" : "basic")};
+            bool valid = true; for (unsigned i = 0; i < 8; i++) if (JS_IsException(args[i])) valid = false;
+            value = valid ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 8, args) : JS_EXCEPTION;
+            for (unsigned i = 0; i < 8; i++) JS_FreeValue(s->ctx, args[i]);
+        }
+    } else if (event == WEBNET_CHUNK && !terminal) {
+        value = JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body, p->response.body_len, fetch_body_free, NULL, false);
+        if (!JS_IsException(value)) p->response.body = NULL;
+    } else if (event == WEBNET_UPLOAD && !terminal) value = JS_NewInt64(s->ctx, p->response.uploaded);
+    if (JS_IsException(value)) {
+        exception(s); pending_error(p, "Could not construct Fetch stream frame"); terminal = true; value = JS_UNDEFINED;
+    }
+    if (terminal && (p->response.error[0] || p->aborted)) {
+        JS_FreeValue(s->ctx, value);
+        JSValue args[] = {JS_NewString(s->ctx, p->response.error), JS_NewBool(s->ctx, p->aborted)};
+        value = JS_Call(s->ctx, s->reject, JS_UNDEFINED, 2, args);
+        JS_FreeValue(s->ctx, args[0]); JS_FreeValue(s->ctx, args[1]);
+        event = WEBNET_END;
+    }
+    JSValue args[] = {JS_NewInt32(s->ctx, event), value};
+    JSValue result = JS_Call(s->ctx, p->stream_callback, JS_UNDEFINED, 2, args);
+    bool resume = !JS_IsException(result) && JS_ToBool(s->ctx, result) > 0;
+    if (JS_IsException(result)) { exception(s); terminal = true; }
+    JS_FreeValue(s->ctx, result); JS_FreeValue(s->ctx, args[0]);
+    if (event == WEBNET_HEADERS && !terminal) {
+        result = JS_Call(s->ctx, p->resolve, JS_UNDEFINED, 1, &value);
+        p->headers_delivered = true;
+        if (JS_IsException(result)) exception(s); JS_FreeValue(s->ctx, result);
+        /* Resolving functions retain the settled promise and its Response.
+           The reader now owns the body; transport must not pin that owner. */
+        JS_FreeValue(s->ctx,p->resolve);p->resolve=JS_UNDEFINED;
+        JS_FreeValue(s->ctx,p->reject);p->reject=JS_UNDEFINED;
+    } else if (terminal && !p->headers_delivered) {
+        result = JS_Call(s->ctx, p->reject, JS_UNDEFINED, 1, &value);
+        if (JS_IsException(result)) exception(s); JS_FreeValue(s->ctx, result);
+    }
+    JS_FreeValue(s->ctx, value);
+    if (terminal) {
+        if ((event != WEBNET_END || p->response.error[0] || p->aborted) && s->host.cancel) s->host.cancel(s->host.opaque, p->id);
+        pending_free(s, p);
+    } else {
+        js_free(s->ctx, p->response.body); js_free(s->ctx, p->response.headers_full); js_free(s->ctx, p->response.url_full);
+        memset(&p->response, 0, sizeof p->response); p->done = false;
+        p->next = s->pending; s->pending = p;
+        if (resume && s->host.resume_request) s->host.resume_request(s->host.opaque, p->id);
+    }
+    end_task(s);
+}
 static bool process_pending(struct web_js_state *s) {
     struct js_pending **link = &s->pending;
     uint64_t now = uptime_ms();
@@ -4721,6 +4881,9 @@ static bool process_pending(struct web_js_state *s) {
         if (ran_task && !s->disabled && (p->kind == P_FETCH ||
             (p->kind == P_WORKER && !strncasecmp(p->url,"blob:",5)))) { link = &p->next; continue; }
         *link = p->next;
+        if (p->streaming && !s->disabled) {
+            process_fetch_frame(s, p); ran_task = true; link = &s->pending; continue;
+        }
         bool ok = !p->response.error[0] && p->response.status >= 200 && p->response.status < 300;
         if (!ok && (p->kind != P_FETCH || p->response.error[0] || p->response.status >= 400))
             diagnostic_resource(s,p,p->aborted?"aborted":p->response.error[0]?p->response.error:"unsuccessful HTTP response");
@@ -5316,11 +5479,11 @@ done:
     end_task(s);
 }
 static bool unfinished_deferred(struct web_js_state *s) {
-    for (struct js_script *p = s->scripts; p; p = p->next) if (p->deferred && !script_finished(s, p)) return true;
+    for (struct js_script *p = s->scripts; p; p = p->next) if (p->deferred && !p->parser_released) return true;
     return false;
 }
 static bool unfinished_scripts(struct web_js_state *s) {
-    for (struct js_script *p = s->scripts; p; p = p->next) if (!script_finished(s, p)) return true;
+    for (struct js_script *p = s->scripts; p; p = p->next) if (!p->parser_released) return true;
     return false;
 }
 static bool ready_script(struct web_js_state *s, struct js_script **out) {
@@ -5330,12 +5493,12 @@ static bool ready_script(struct web_js_state *s, struct js_script **out) {
         if (p->asynchronous) { *out = p; return true; }
         if (p->dynamic && !p->deferred) {
             bool earlier = false;
-            for (struct js_script *q = s->scripts; q != p; q = q->next) if (q->dynamic && !q->asynchronous && !script_finished(s, q)) { earlier = true; break; }
+            for (struct js_script *q = s->scripts; q != p; q = q->next) if (q->dynamic && !q->asynchronous && !q->parser_released) { earlier = true; break; }
             if (!earlier) { *out = p; return true; }
         }
         if (s->parsing_done && p->deferred && !styles_busy(s)) {
             bool earlier = false;
-            for (struct js_script *q = s->scripts; q != p; q = q->next) if (q->deferred && !script_finished(s, q)) { earlier = true; break; }
+            for (struct js_script *q = s->scripts; q != p; q = q->next) if (q->deferred && !q->parser_released) { earlier = true; break; }
             if (!earlier) { *out = p; return true; }
         }
     }
@@ -5470,6 +5633,7 @@ static bool run_idle_period(struct web_js_state *s, uint64_t now) {
 void web_js_tick(web_doc *d, uint64_t now) {
     struct web_js_state *s = d ? d->js : NULL;
     if (!s || s->running) return;
+    if(s->disabled && s->storage_source)storage_release_document(s);
     web_worker_pump(s->workers,now);
     /* Expired idle requests are ordinary watchdog-bounded tasks, not idle
        periods. Alternate with other task sources so even continuous fetch,
@@ -5482,14 +5646,15 @@ void web_js_tick(web_doc *d, uint64_t now) {
         request_styles(s); request_fonts(s); request_images(s); return;
     }
     s->idle_timeout_turn = true;
-    bool ran = false;
+    bool ran = !s->disabled && s->storage_event_turn && storage_run_event(s,now);
+    s->storage_event_turn=!ran;
     /* Messages are ordinary JS tasks, with the same watchdog/checkpoint as
        events and timers. Alternate ready workers with other sources. */
-    if (!s->disabled && s->worker_turn && web_worker_runnable(s->workers)) {
+    if (!ran && !s->disabled && s->worker_turn && web_worker_runnable(s->workers)) {
         begin_named_task(s,"Worker message",0); ran = web_worker_run_one(s->workers);
         if (JS_HasException(s->ctx)) exception(s);
         end_task(s); s->worker_turn = false;
-    } else { s->worker_turn = true; ran = process_pending(s); }
+    } else if(!ran) { s->worker_turn = true; ran = process_pending(s); }
     if(!ran && !s->disabled && s->policy_violations){
         struct js_policy_violation *event=s->policy_violations;
         s->policy_violations=event->next;if(!s->policy_violations)s->last_policy_violation=NULL;
@@ -5546,14 +5711,13 @@ void web_js_tick(web_doc *d, uint64_t now) {
         begin_task(s); end_task(s); ran = true;
     }
     image_events(s);
-    /* Completion notification is queued before lifecycle/task selection. A
-       perpetually active task source cannot starve a module's load/error, and
-       Window load must not overtake that module's resource event. */
+    /* Execute-the-script returns without awaiting module evaluation. External
+       elements fire load after that return; evaluation rejections are reported
+       separately and must not turn a successful fetch into an element error. */
     if (!s->disabled) {
-        for (struct js_script *p = s->scripts; p; p = p->next) if (p->module && p->executed && !p->notified && script_finished(s, p)) {
+        for (struct js_script *p = s->scripts; p; p = p->next) if (p->module && p->parser_released && !p->notified) {
             p->notified = true;
-            bool failed = p->failed || (!JS_IsUndefined(p->evaluation) && JS_PromiseState(s->ctx, p->evaluation) == JS_PROMISE_REJECTED);
-            script_event(s, p->node, failed);
+            if (p->external) script_event(s, p->node, false);
         }
     }
     if (!s->disabled && !ran) {
@@ -5585,7 +5749,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
             end_task(s); s->worker_turn = false;
         }
     }
-    if (s->disabled) for (struct js_script *p = s->scripts; p; p = p->next) { p->executed = true; JS_FreeValue(s->ctx, p->evaluation); p->evaluation = JS_UNDEFINED; }
+    if (s->disabled) for (struct js_script *p = s->scripts; p; p = p->next) { p->executed = p->parser_released = true; JS_FreeValue(s->ctx, p->evaluation); p->evaluation = JS_UNDEFINED; }
     request_styles(s); request_fonts(s); request_images(s);
     if (!ran) ran = run_document_event(s);
     if (ran) s->idle_period_stopped = true;
@@ -5624,9 +5788,10 @@ int64_t web_js_deadline(web_doc *d) {
         for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) return (int64_t)now;
         if (JS_IsJobPending(s->rt)) return (int64_t)now;
         if (observers_dirty(s) && s->observer_due < deadline) deadline=s->observer_due;
+        if (s->storage_origin && (s->storage_subscribed[0]||s->storage_subscribed[1]) && s->storage_poll_due<deadline) deadline=s->storage_poll_due;
         struct js_script *ready; if (ready_script(s, &ready)) return (int64_t)now;
         for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && s->timers[i].due < deadline) deadline = s->timers[i].due;
-        for (struct js_script *p = s->scripts; p; p = p->next) if (p->module && p->executed && !p->notified && script_finished(s, p)) return (int64_t)now;
+        for (struct js_script *p = s->scripts; p; p = p->next) if (p->module && p->parser_released && !p->notified) return (int64_t)now;
         uint64_t idle_due = idle_timeout_due(s); if (idle_due < deadline) deadline = idle_due;
         if (s->idle_count && idle_eligible(s, now)) {
             uint64_t idle_wake = now;
@@ -5775,7 +5940,8 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("worker", 3, native_worker),
         JS_CFUNC_DEF("cssSupports", 2, native_css_supports),
         JS_CFUNC_DEF("storage", 5, native_storage),
-        JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("cancel", 1, native_cancel)
+        JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("cancel", 1, native_cancel),
+        JS_CFUNC_DEF("resumeFetch", 1, native_resume_fetch)
     };
     JS_SetPropertyFunctionList(s->ctx, api, functions, sizeof functions / sizeof *functions);
     JSValue operations=JS_NewObject(s->ctx);
@@ -5784,6 +5950,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
             JS_NewCFunctionMagic(s->ctx,native_dom_magic,dom_opcode_names[opcode],1,JS_CFUNC_generic_magic,opcode));
     JS_SetPropertyStr(s->ctx,api,"domOperations",operations);
     JS_SetPropertyStr(s->ctx,api,"noCorsFetch",JS_TRUE);
+    JS_SetPropertyStr(s->ctx,api,"streamingFetch",JS_NewBool(s->ctx,s->host.resume_request != NULL));
     web_js_navigator_init(s->ctx,api);
     web_js_crypto_init(s->ctx, api);
     web_js_encoding_init(s->ctx, api);
@@ -5821,6 +5988,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         }
     node_cache_release(s);
     if (prototype_failed) { exception(s); end_task(s); goto failed; }
+    storage_subscribe_document(s);
     end_task(s); s->starting = false;
     if(d->sandbox_flags&SB_SCRIPTS)s->disabled=true;
     char limits[192];
@@ -5834,6 +6002,7 @@ failed:
 }
 void web_js_free(web_doc *d) {
     struct web_js_state *s = d ? d->js : NULL; if (!s) return;
+    storage_release_document(s);
     d->js = NULL;
     if (s->ctx) {
         mutation_free(s);

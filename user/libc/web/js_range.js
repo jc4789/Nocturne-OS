@@ -317,7 +317,7 @@ const rangeBridge = (() => {
         return a;
     }
     function before(op,n,key,value){
-        if(!n || !live.size || !(op==='insert' || op==='replace' || op==='remove' || op==='set' && ['innerHTML','textContent','nodeValue','title'].includes(key)))return null;
+        if(!n || !live.size || !(op==='insert' || op==='replace' || op==='replaceAll' || op==='remove' || op==='set' && ['innerHTML','textContent','nodeValue','title'].includes(key)))return null;
         if(op==='insert' && (!key || key===value))return null;
         const type=get(n,'nodeType');
         if(op==='set' && (key==='nodeValue' && !character(n) || key==='textContent' && !character(n) && type!==1 && type!==11))return null;
@@ -336,6 +336,10 @@ const rangeBridge = (() => {
             siblings.splice(i,1);
         }
         if(op==='remove')remove(n);
+        else if(op==='replaceAll'){
+            if(key&&get(key,'nodeType')===11)for(const child of children(key))remove(child);
+            for(const child of children(n))remove(child);
+        }
         else if(op==='replace'){
             let reference=get(value,'nextSibling');if(reference===key)reference=get(key,'nextSibling');
             const nodes=get(key,'nodeType')===11?children(key):[key];

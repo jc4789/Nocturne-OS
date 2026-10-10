@@ -7,6 +7,7 @@
 int main(void){
     const char *origin="https://storage-batch.invalid";char path[160];
     storage_path(origin,0,path);_unlink(path);storage_path(origin,1,path);_unlink(path);
+    cold_shared(origin);
     webstorage *s=webstorage_create();struct web_storage_result out;reset(F_NONE);
     for(int i=0;i<50;i++){char value[16];snprintf(value,sizeof value,"%d",i);
         verify(storage_test_access(s,origin,WEB_STORAGE_SET,"burst",value,&out)==WEB_STORAGE_OK,"ram-set");}
@@ -15,14 +16,15 @@ int main(void){
     verify(webstorage_flush(s,false,&out)==WEB_STORAGE_OK&&out.save_attempts==0&&writes==0,"quiet-period-debounce");
     verify(webstorage_flush(s,true,&out)==WEB_STORAGE_OK&&out.save_attempts==1,"one-force-publication");
     verify(writes==1&&reads==0&&bytes_written==out.snapshot_bytes&&!webstorage_pending(s),"no-snapshot-readback");
-    uint64_t generation=s->areas->generation;webstorage_free(s);
+    uint64_t generation=s->areas->generation;webstorage_free(s);cold_shared(origin);
     reset(F_NONE);s=webstorage_create();verify(value_is(s,origin,"burst","49")&&reads==1,"validated-load-after-reopen");
     reset(F_WRITE_CLOSE);verify(storage_test_access(s,origin,WEB_STORAGE_SET,"burst","new",&out)==WEB_STORAGE_OK,"ram-write-before-io-error");
     verify(webstorage_flush(s,true,&out)==WEB_STORAGE_IO&&webstorage_pending(s),"failed-flush-remains-dirty");
     int failed_writes=writes;
     verify(webstorage_flush(s,false,&out)==WEB_STORAGE_OK&&out.save_attempts==0&&writes==failed_writes,"failed-io-retry-backoff");
     verify(s->areas->generation==generation&&value_is(s,origin,"burst","new"),"failed-flush-does-not-roll-back-ram");
-    webstorage *old=webstorage_create();reset(F_NONE);verify(value_is(old,origin,"burst","49"),"last-completed-slot-survives-failure");webstorage_free(old);
+    reset(F_NONE);verify(disk_value_is(origin,s->areas->slot,"burst","49"),"last-completed-slot-survives-failure");
+    reset(F_NONE);webstorage *other=webstorage_create();verify(value_is(other,origin,"burst","new"),"other-window-sees-unflushed-write");webstorage_free(other);
     reset(F_EINTR);verify(webstorage_flush(s,true,&out)==WEB_STORAGE_OK&&out.save_attempts==1&&reads==0,"flush-retries-eintr-without-readback");
     verify(s->areas->generation==generation+1&&!webstorage_pending(s),"retry-publishes-one-generation");
     reset(F_NONE);verify(storage_test_access(s,origin,WEB_STORAGE_SET,"closing","saved",&out)==WEB_STORAGE_OK,"shutdown-pending");webstorage_free(s);

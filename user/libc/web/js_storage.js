@@ -91,5 +91,36 @@ const storageBridge=(()=>{
     define(globalThis,'localStorage',{configurable:true,enumerable:true,get:getter(local)});
     define(globalThis,'sessionStorage',{configurable:true,enumerable:true,get:getter(session)});
     define(globalThis,'Storage',{configurable:true,writable:true,value:Storage});
-    return {origin};
+    const EventImpl=Event, initEvent=Event.prototype.initEvent, wellFormed=String.prototype.toWellFormed;
+    const eventRecords=new WeakMap();
+    function eventRecord(event){const r=call(mapGet,eventRecords,[event]);if(!r)throw new TypeErrorImpl('Illegal StorageEvent receiver');return r;}
+    function nullable(value){return value==null?null:string(value);}
+    function fields(init){
+        const area=init.storageArea==null?null:init.storageArea;if(area!==null)brand(area);
+        return {key:nullable(init.key),oldValue:nullable(init.oldValue),newValue:nullable(init.newValue),
+            url:init.url===undefined?'':call(wellFormed,string(init.url),[]),storageArea:area};
+    }
+    class StorageEvent extends EventImpl {
+        constructor(type,init={}){
+            if(!arguments.length)throw new TypeErrorImpl('StorageEvent requires type');
+            init=init==null?{}:Object(init);super(type,init);call(mapSet,eventRecords,[this,fields(init)]);
+        }
+        initStorageEvent(type,bubbles=false,cancelable=false,key=null,oldValue=null,newValue=null,url='',storageArea=null){
+            eventRecord(this);
+            if(!arguments.length)throw new TypeErrorImpl('initStorageEvent requires type');
+            const data=fields({key,oldValue,newValue,url,storageArea});type=string(type);
+            if(eventState(this).dispatching)return;
+            call(initEvent,this,[type,bubbles,cancelable]);call(mapSet,eventRecords,[this,data]);
+        }
+    }
+    for(const key of ['key','oldValue','newValue','url','storageArea'])define(StorageEvent.prototype,key,{
+        configurable:true,enumerable:true,get(){return eventRecord(this)[key];}
+    });
+    define(StorageEvent.prototype,Symbol.toStringTag,{configurable:true,value:'StorageEvent'});
+    define(globalThis,'StorageEvent',{configurable:true,writable:true,value:StorageEvent});
+    function deliver(kind,key,oldValue,newValue,url){
+        const event=new StorageEvent('storage',{key,oldValue,newValue,url,storageArea:kind===0?local:session});
+        eventState(event).isTrusted=true;dispatch(windowObject,event);
+    }
+    return {origin,deliver};
 })();

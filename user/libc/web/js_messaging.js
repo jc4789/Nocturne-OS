@@ -47,7 +47,7 @@ const messagingBridge=(() => {
         initMessageEvent(type,bubbles=false,cancelable=false,data=null,origin='',lastEventId='',source=null,ports=[]){
             eventCheck(this);if(!arguments.length)throw new TypeErr('MessageEvent requires a type');
             const t=string(type),init=eventInit({data,origin,lastEventId,source,ports});
-            if(this._dispatching)return;
+            if(eventState(this).dispatching)return;
             apply(eventInitMethod,this,[t,bubbles,cancelable]);put(events,this,init);
         }
     }
@@ -61,7 +61,7 @@ const messagingBridge=(() => {
             const payload=get(readyPackets,packet)||cloneData.deserialize(packet);
             event=new MessageEvent('message',{data:payload.data,ports:payload.ports,source,origin:senderOrigin});
         }catch(_){event=new MessageEvent('messageerror',{source,origin:senderOrigin});}
-        event.isTrusted=true;dispatch(target,event);
+        eventState(event).isTrusted=true;dispatch(target,event);
     }
     function schedule(endpoint,reserve=false){
         if(endpoint.owner.realm!==realm)return endpoint.owner.realm.schedule(endpoint,reserve);
@@ -260,7 +260,7 @@ const messagingBridge=(() => {
                 let event;
                 try{event=new MessageEvent('message',{data:cloneData.deserialize(packet),origin:nativeOrigin()});}
                 catch(_){event=new MessageEvent('messageerror',{origin:nativeOrigin()});}
-                event.isTrusted=true;dispatch(s.value,event);
+                eventState(event).isTrusted=true;dispatch(s.value,event);
             });
         }
         get name(){return broadcastCheck(this).name;}

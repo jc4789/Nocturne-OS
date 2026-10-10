@@ -67,7 +67,7 @@ const htmlElementsBridge = (() => {
             if(scrollTasks.get(node)!==record)return;
             scrollTasks.delete(node);
             if(rawDom.get(node,'ownerDocument')!==owner || !rawDom.get(node,'elementScrollActive'))return;
-            const event=new Event('scroll');event.isTrusted=true;dispatch(node,event);
+            const event=new Event('scroll');eventState(event).isTrusted=true;dispatch(node,event);
         });}catch(error){scrollTasks.delete(node);throw error;}
     }
     function applyElementScroll(node,x,y){
@@ -180,7 +180,7 @@ const htmlElementsBridge = (() => {
         for(const node of ancestors){
             if(rawDom.get(node,'ownerDocument')!==owner || !rawDom.get(node,'isConnected') ||
                 lower(rawDom.attr(node,'hidden')||'')!=='until-found')return false;
-            const event=new Event('beforematch',{bubbles:true});event.isTrusted=true;dispatch(node,event);
+            const event=new Event('beforematch',{bubbles:true});eventState(event).isTrusted=true;dispatch(node,event);
             if(rawDom.get(node,'ownerDocument')!==owner || !rawDom.get(node,'isConnected') ||
                 lower(rawDom.attr(node,'hidden')||'')!=='until-found')return false;
             dom('attr',node,'hidden',null);
@@ -252,12 +252,12 @@ const htmlElementsBridge = (() => {
         record.task=setTimeout(()=>{
             if(value.toggle!==record)return;value.toggle=null;
             const event=new ToggleEventImpl('toggle',{oldState:record.oldState,newState:record.newState});
-            event.isTrusted=true;dispatch(node,event);
+            eventState(event).isTrusted=true;dispatch(node,event);
         },0);
     }
     function dialogBefore(node,oldState,newState,cancelable){
         const event=new ToggleEventImpl('beforetoggle',{oldState,newState,cancelable});
-        event.isTrusted=true;return dispatch(node,event);
+        eventState(event).isTrusted=true;return dispatch(node,event);
     }
     function descendant(node,ancestor){
         for(;node;){
@@ -326,13 +326,13 @@ const htmlElementsBridge = (() => {
                 const remaining=rawDom.get(owner,'activeElement');
                 if(descendant(remaining,this))dom('blur',remaining);
             }
-            setTimeout(()=>{const event=new Event('close');event.isTrusted=true;dispatch(this,event);},0);
+            setTimeout(()=>{const event=new Event('close');eventState(event).isTrusted=true;dispatch(this,event);},0);
         }
         requestClose(result=undefined){
             dialogState(this);const hasResult=arguments.length>0 && result!==undefined;
             if(hasResult)result=string(result);if(reflectedAttr(this,'open')===null)return;
             if(!rawDom.get(this,'isConnected') || rawDom.get(this,'ownerDocument')!==document)return;
-            const event=new Event('cancel',{cancelable:true});event.isTrusted=true;
+            const event=new Event('cancel',{cancelable:true});eventState(event).isTrusted=true;
             if(dispatch(this,event))call(closeDialog,this,hasResult?[result]:[]);
         }
     }

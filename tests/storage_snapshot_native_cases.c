@@ -16,6 +16,13 @@ enum { F_NONE, F_SHORT, F_EINTR, F_ZERO, F_WRITE, F_WRITE_CLOSE,
        F_READ_ZERO, F_READ_CLOSE, F_CORRUPT, F_OPEN_TRUNCATE, F_UNLINK };
 static FILE *handles[32];
 static bool writing[32];
+static bool persistent[32];
+struct n_procinfo { int pid;uint64_t start_ms;int state; };
+static int probe_getpid(void){return 42;}
+static int probe_proclist(struct n_procinfo *out,int max){if(max<1)return 0;out[0]=(struct n_procinfo){42,1,0};return 1;}
+static int probe_fcntl(int fd,int command,...){(void)fd;(void)command;return 0;}
+static long probe_lseek(int fd,long at,int whence){return fseek(handles[fd],at,whence)==0?ftell(handles[fd]):-1;}
+static int probe_fstat(int fd,struct n_stat *out){struct _stat64 st;if(_fstat64(_fileno(handles[fd]),&st)<0)return -1;out->size=st.st_size;out->type=1;return 0;}
 static int fault, writes, reads, unlinks, renames, checks, failures;
 static size_t bytes_written, bytes_read;
 static bool injected;
@@ -26,36 +33,42 @@ static int probe_stat(const char *path, struct n_stat *out) {
 }
 static int probe_mkdir(const char *path, ...) { return _mkdir(path); }
 static int probe_open(const char *path, int flags, ...) {
-    bool wr=(flags&3)!=0;FILE *f=fopen(path,wr?"wb":"rb");
+    bool wr=(flags&3)!=0,disk=strstr(path,"storage-native-fault/")!=NULL;
+    FILE *f=fopen(path,(flags&3)==2?"r+b":wr?"wb":"rb");
+    if(!f && (flags&3)==2 && (flags&0x40))f=fopen(path,"w+b");
     if(!f)return -1;
-    if(wr&&fault==F_OPEN_TRUNCATE&&!injected){injected=true;fclose(f);errno=ENOMEM;return -1;}
-    for(int i=0;i<32;i++)if(!handles[i]){handles[i]=f;writing[i]=wr;return i;}
+    /* Native write publishes to the vnode before returning. Separate opens
+     * must not retain the host stdio adapter's private read/write buffers. */
+    setvbuf(f,NULL,_IONBF,0);
+    if(wr&&disk&&fault==F_OPEN_TRUNCATE&&!injected){injected=true;fclose(f);errno=ENOMEM;return -1;}
+    for(int i=0;i<32;i++)if(!handles[i]){handles[i]=f;writing[i]=wr;persistent[i]=disk;return i;}
     fclose(f);errno=EMFILE;return -1;
 }
 static ssize_t probe_write(int fd,const void *data,size_t n) {
-    writes++;
-    if(fault==F_EINTR&&!injected){injected=true;errno=EINTR;return -1;}
-    if((fault==F_ZERO||fault==F_WRITE||fault==F_UNLINK)&&injected){errno=EIO;return fault==F_ZERO?0:-1;}
-    if((fault==F_SHORT||fault==F_ZERO||fault==F_WRITE||fault==F_UNLINK)&&!injected){if(n>7)n=7;injected=true;}
-    size_t done=fwrite(data,1,n,handles[fd]);bytes_written+=done;
+    if(persistent[fd])writes++;
+    if(persistent[fd]&&fault==F_EINTR&&!injected){injected=true;errno=EINTR;return -1;}
+    if(persistent[fd]&&(fault==F_ZERO||fault==F_WRITE||fault==F_UNLINK)&&injected){errno=EIO;return fault==F_ZERO?0:-1;}
+    if(persistent[fd]&&(fault==F_SHORT||fault==F_ZERO||fault==F_WRITE||fault==F_UNLINK)&&!injected){if(n>7)n=7;injected=true;}
+    size_t done=fwrite(data,1,n,handles[fd]);if(persistent[fd])bytes_written+=done;
     return done==0&&ferror(handles[fd])?-1:(ssize_t)done;
 }
 static ssize_t probe_read(int fd,void *data,size_t n) {
-    reads++;
-    if(fault==F_READ_ZERO){if(injected)return 0;if(n>7)n=7;injected=true;}
-    size_t done=fread(data,1,n,handles[fd]);bytes_read+=done;
-    if(fault==F_CORRUPT&&!injected&&done>8){((unsigned char *)data)[8]^=1;injected=true;}
+    if(persistent[fd])reads++;
+    if(persistent[fd]&&fault==F_READ_ZERO){if(injected)return 0;if(n>7)n=7;injected=true;}
+    size_t done=fread(data,1,n,handles[fd]);if(persistent[fd])bytes_read+=done;
+    if(persistent[fd]&&fault==F_CORRUPT&&!injected&&done>8){((unsigned char *)data)[8]^=1;injected=true;}
     return done==0&&ferror(handles[fd])?-1:(ssize_t)done;
 }
 static int probe_close(int fd) {
-    bool wr=writing[fd];int result=fclose(handles[fd]);handles[fd]=NULL;
-    if((wr&&fault==F_WRITE_CLOSE)||(!wr&&fault==F_READ_CLOSE)){errno=EIO;return -1;}
+    bool wr=writing[fd],disk=persistent[fd];int result=fclose(handles[fd]);handles[fd]=NULL;
+    if(disk&&((wr&&fault==F_WRITE_CLOSE)||(!wr&&fault==F_READ_CLOSE))){errno=EIO;return -1;}
     return result;
 }
-static int probe_unlink(const char *path) {unlinks++;if(fault==F_UNLINK){errno=EIO;return -1;}return _unlink(path);}
+static int probe_unlink(const char *path) {bool disk=strstr(path,"storage-native-fault/")!=NULL;if(disk)unlinks++;if(disk&&fault==F_UNLINK){errno=EIO;return -1;}return _unlink(path);}
 static int probe_rename(const char *from,const char *to){renames++;return rename(from,to);}
 static uint64_t uptime_ms(void){static uint64_t clock;return ++clock;}
 #define WEBSTORAGE_ROOT "build/goal-20261009/storage-native-fault"
+#define WEBSTORAGE_SHARED_ROOT "build/goal-20261009/storage-native-shared"
 #define stat probe_stat
 #define mkdir probe_mkdir
 #define open probe_open
@@ -64,6 +77,11 @@ static uint64_t uptime_ms(void){static uint64_t clock;return ++clock;}
 #define close probe_close
 #define unlink probe_unlink
 #define rename probe_rename
+#define fstat probe_fstat
+#define lseek probe_lseek
+#define fcntl probe_fcntl
+#define getpid probe_getpid
+#define proclist probe_proclist
 #include "../user/libc/webstorage.c"
 #undef stat
 #undef mkdir
@@ -73,8 +91,18 @@ static uint64_t uptime_ms(void){static uint64_t clock;return ++clock;}
 #undef close
 #undef unlink
 #undef rename
+#undef fstat
+#undef lseek
+#undef fcntl
+#undef getpid
+#undef proclist
 static void verify(bool ok,const char *name){checks++;if(!ok){failures++;printf("FAIL %s\n",name);}}
 static void reset(int value){fault=value;injected=false;writes=reads=unlinks=renames=0;bytes_written=bytes_read=0;}
+static void cold_shared(const char *origin){char path[160];for(int i=0;i<5;i++){storage_path_at(WEBSTORAGE_SHARED_ROOT,origin,i,path);_unlink(path);}}
+static bool disk_value_is(const char *origin,int slot,const char *key,const char *value){
+    struct storage_area *a=NULL;if(storage_read(origin,slot,&a)!=1)return false;
+    struct storage_entry *e=storage_find(a,key,strlen(key));bool ok=e&&e->vn==strlen(value)&&!memcmp(e->value,value,e->vn);storage_area_free(a);return ok;
+}
 static int storage_test_access(webstorage *s,const char *origin,int operation,const char *key,const char *value,struct web_storage_result *out){
     struct web_storage_request request={.kind=WEB_STORAGE_LOCAL,.operation=operation,.key=key,.key_len=key?strlen(key):0,.value=value,.value_len=value?strlen(value):0};
     return webstorage_access(s,origin,&request,out);
@@ -90,6 +118,7 @@ static unsigned char *file_bytes(const char *path,size_t *len){
 static void exercise(int mode){
     char origin[96],confirmed[160],candidate[160];snprintf(origin,sizeof origin,"https://storage-fault-%d.invalid",mode);
     storage_path(origin,0,confirmed);storage_path(origin,1,candidate);_unlink(confirmed);_unlink(candidate);
+    cold_shared(origin);
     webstorage *s=webstorage_create();struct web_storage_result out;reset(F_NONE);
     verify(storage_test_access(s,origin,WEB_STORAGE_SET,"first","old",&out)==WEB_STORAGE_OK,"initial-publication");
     verify(webstorage_flush(s,true,&out)==WEB_STORAGE_OK,"initial-flush");
@@ -117,9 +146,9 @@ static void exercise(int mode){
     verify(value_is(s,origin,"first","new")&&value_is(s,origin,"second","kept"),"ram-map-retained-for-retry");
     struct web_storage_request key={.kind=WEB_STORAGE_LOCAL,.operation=WEB_STORAGE_KEY,.index=0};
     verify(webstorage_access(s,origin,&key,&out)==WEB_STORAGE_OK&&out.text&&!strcmp(out.text,"first"),"key-order-preserved");free(out.text);
-    webstorage *disk=webstorage_create();verify(value_is(disk,origin,"first",success?"new":"old"),"disk-keeps-last-completed-slot");webstorage_free(disk);
+    verify(disk_value_is(origin,s->areas->slot,"first",success?"new":"old"),"disk-keeps-last-completed-slot");
     if(!success)verify(webstorage_flush(s,true,&out)==WEB_STORAGE_OK,"failed-commit-can-retry");
-    webstorage_free(s);s=webstorage_create();
+    webstorage_free(s);cold_shared(origin);s=webstorage_create();
     verify(value_is(s,origin,"first","new")&&value_is(s,origin,"second","kept"),"reopen-recovers-completed-retry");
     webstorage_free(s);storage_path(origin,0,confirmed);storage_path(origin,1,candidate);_unlink(confirmed);_unlink(candidate);
 }

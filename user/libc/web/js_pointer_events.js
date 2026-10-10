@@ -65,7 +65,7 @@ const pointerCaptureBridge=(()=>{
         const e=new PointerEvent(type,mousePointerInit(mouseAssign({},init,{
             view:globalThis,bubbles:true,cancelable:false
         })));
-        e.composed=true;e.isTrusted=true;
+        eventState(e).composed=true;eventState(e).isTrusted=true;
         dispatch(target,e);
     }
     function process(init){
@@ -130,7 +130,7 @@ function nativeDispatch(target,type,init) {
         if(type==='mouseup')pointerCaptureBridge.pointerUp(target);
         const pointer=new PointerEvent(type==='mousedown'?'pointerdown':'pointerup',mousePointerInit(init));
         pointer.view=globalThis;
-        pointer.composed=true;pointer.isTrusted=true;
+        eventState(pointer).composed=true;eventState(pointer).isTrusted=true;
         const allowed=dispatch(target,pointer);
         if(type==='mousedown')suppressCompatibilityMouse=!allowed;
         if(type==='mouseup')pointerCaptureBridge.release(init);
@@ -140,8 +140,8 @@ function nativeDispatch(target,type,init) {
     const C=type==='submit'?formValidationBridge.SubmitEvent:focus?FocusEvent:type==='wheel'?WheelEvent:/^(key)/.test(type)?KeyboardEvent:/^(pointer|click$)/.test(type)?PointerEvent:/^(mouse|dblclick)/.test(type)?MouseEvent:Event;
     const ui=focus||C===MouseEvent||C===PointerEvent||C===WheelEvent;
     const e=new C(type,ui?mouseAssign({},init,{view:globalThis}):init);
-    for(const key of Object.keys(init))if(key!=='submitter'&&!(focus&&key==='relatedTarget')&&!(wheelData.has(e)&&wheelFields.has(key))&&!pointerData.has(e))e[key]=init[key];
-    e.composed=/^(?:keydown|keyup|keypress|click|dblclick|mousedown|mouseup|mouseout|mousemove|mouseover|pointerdown|pointerup|pointermove|pointerout|pointerover|pointercancel|wheel|focus|blur|focusin|focusout|input)$/.test(type);
-    e.isTrusted=init.isTrusted!==false;
+    for(const key of Object.keys(init))if(!eventFields.has(key)&&key!=='submitter'&&!(focus&&key==='relatedTarget')&&!(wheelData.has(e)&&wheelFields.has(key))&&!pointerData.has(e))e[key]=init[key];
+    eventState(e).composed=/^(?:keydown|keyup|keypress|click|dblclick|mousedown|mouseup|mouseout|mousemove|mouseover|pointerdown|pointerup|pointermove|pointerout|pointerover|pointercancel|wheel|focus|blur|focusin|focusout|input)$/.test(type);
+    eventState(e).isTrusted=init.isTrusted!==false;
     return dispatch(target,e);
 }

@@ -97,9 +97,8 @@ static void mutation_clear_transients(struct web_js_state *s,JSValueConst observ
 }
 static JSValue mutation_notify_job(JSContext *ctx,int argc,JSValueConst *argv) {
     (void)argc;(void)argv;struct web_js_state *s=state(ctx);s->mutation_job_pending=false;
-    /* Removal's transient registrations expire before observer callbacks, but
-     * takeRecords() alone must not expire them. */
-    mutation_clear_transients(s,JS_UNDEFINED,true);
+    /* Each observer expires its own transient registrations immediately before
+     * its callback. Earlier callbacks may still mutate later observers' trees. */
     return custom_element_hook(s,"mutationFlush",0,NULL);
 }
 static void mutation_schedule(struct web_js_state *s) {
@@ -150,7 +149,17 @@ static struct js_mutation_snapshot mutation_before(struct web_js_state *s,int op
     }
     JS_FreeCString(s->ctx,owned_name);JS_FreeCString(s->ctx,owned_ns);
     if(c.mode==6)return c;
-    if(opcode==DOM_insert||opcode==DOM_replace){
+    if(opcode==DOM_replaceAll){
+        c.mode=4;c.target=n;
+        if(incoming&&incoming->type==N_FRAGMENT){
+            struct js_mutation_record *fragment=mutation_record(s,MO_CHILD,incoming,NULL,NULL,NULL);
+            for(node_t *child=incoming->first;child;child=child->next){mutation_removed(s,&c,child,true);if(fragment)pv_push(&fragment->removed,child);}
+            if(fragment&&fragment->removed.n)mutation_snapshot_add(&c,fragment);else if(fragment)mutation_record_free(s,fragment);
+        }
+        struct js_mutation_record *e=mutation_record(s,MO_CHILD,n,NULL,NULL,NULL);
+        for(node_t *child=n->first;child;child=child->next){mutation_removed(s,&c,child,true);if(e)pv_push(&e->removed,child);}
+        if(e)mutation_snapshot_add(&c,e);
+    }else if(opcode==DOM_insert||opcode==DOM_replace){
         if(!incoming||(opcode==DOM_insert&&incoming==old))return c;
         c.mode=opcode==DOM_insert?1:2;c.target=n;
         bool fragment=incoming->type==N_FRAGMENT;
@@ -206,7 +215,8 @@ static JSValue native_mutation_control(JSContext *ctx,JSValueConst this_val,int 
     (void)this_val;struct web_js_state *s=state(ctx);int32_t flags=0;
     if(argc<2||!JS_IsObject(argv[0]))return JS_ThrowTypeError(ctx,"MutationObserver registration required");
     JSValueConst observer=argv[0];node_t *target=JS_IsNull(argv[1])?NULL:unwrap(ctx,argv[1]);
-    if(target&&argc>2&&JS_ToInt32(ctx,&flags,argv[2])<0)return JS_EXCEPTION;
+    if(argc>2&&JS_ToInt32(ctx,&flags,argv[2])<0)return JS_EXCEPTION;
+    if(!target&&flags==-1){mutation_clear_transients(s,observer,false);return JS_UNDEFINED;}
     struct js_mutation_registration *made=NULL;
     if(target){made=calloc(1,sizeof *made);if(!made)return oom(ctx);
         made->node=target;made->observer=JS_DupValue(ctx,observer);made->flags=(unsigned)flags;
@@ -248,6 +258,14 @@ static JSValue native_mutation_take(JSContext *ctx,JSValueConst this_val,int arg
             if(JS_SetPropertyUint32(ctx,array,index++,row)<0){JS_FreeValue(ctx,array);array=JS_EXCEPTION;}
         }
         mutation_record_free(s,r);r=next;
+    }
+    /* A removed subtree may need transient expiry even if its observer did
+     * not request childList records. Signal the private checkpoint without
+     * fabricating a public MutationRecord. takeRecords() still preserves it. */
+    for(struct js_mutation_registration *t=s->mutation_registrations;t&&!JS_IsException(array);t=t->next)if(t->transient){
+        JSValue row=JS_NewObject(ctx);JS_SetPropertyStr(ctx,row,"observer",JS_DupValue(ctx,t->observer));
+        JS_SetPropertyStr(ctx,row,"fields",JS_NULL);
+        if(JS_SetPropertyUint32(ctx,array,index++,row)<0){JS_FreeValue(ctx,array);array=JS_EXCEPTION;}
     }
     return array;
 }

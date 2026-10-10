@@ -3,12 +3,13 @@
  * write only the inactive slot and keep the previous confirmed slot intact.
  * A complete write and successful close publish the inactive snapshot; checksum
  * validation happens once when opening a store, not after every write. No
- * copy-and-unlink rename is used. fsync/power-loss durability and cross-process
- * cache coherence are not provided by this backend. */
+ * copy-and-unlink rename is used. Shared RAM journals publish per-key changes
+ * between windows; persistent snapshots remain debounced. */
 #include <webstorage.h>
 #include <nocturne.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,9 @@
 /* Only native regression translation units override this constant. */
 #ifndef WEBSTORAGE_ROOT
 #define WEBSTORAGE_ROOT "/data/browser/storage"
+#endif
+#ifndef WEBSTORAGE_SHARED_ROOT
+#define WEBSTORAGE_SHARED_ROOT "/tmp/browser-storage"
 #endif
 #define STORAGE_MAX_ORIGINS 64u
 #define STORAGE_MAX_KEYS 4096u
@@ -39,8 +43,14 @@ struct storage_area {
     bool unavailable; /* inactive snapshot invalidation failed; retry, RAM wins */
     bool dirty;
     uint64_t dirty_since, changed_at, retry_at;
+    int shared_fd, shared_log_fd;
+    uint64_t shared_epoch, shared_cursor;
+    bool shared_holder;
 };
-struct webstorage { struct storage_area *areas; unsigned count; size_t units; };
+struct storage_source;
+struct webstorage { struct storage_area *areas; struct storage_source *sources; unsigned count; size_t units, event_bytes; uint64_t identity; };
+static int storage_shared_flush(webstorage *, struct storage_area *, struct web_storage_result *);
+static void storage_sources_free(webstorage *);
 
 static char *storage_copy(const char *s, size_t n) {
     char *p = malloc(n + 1);
@@ -77,13 +87,19 @@ static void storage_entries_free(struct storage_entry *e) {
     while (e) { struct storage_entry *next = e->next; free(e->key); free(e->value); free(e); e = next; }
 }
 static void storage_area_free(struct storage_area *a) {
-    if (a) { storage_entries_free(a->entries); free(a->origin); free(a); }
+    if (a) { if(a->shared_fd>=0)close(a->shared_fd);if(a->shared_log_fd>=0)close(a->shared_log_fd); storage_entries_free(a->entries); free(a->origin); free(a); }
 }
-webstorage *webstorage_create(void) { return calloc(1, sizeof(webstorage)); }
+static uint32_t storage_serial;
+webstorage *webstorage_create(void) {
+    webstorage *s=calloc(1,sizeof *s);
+    if(s)s->identity=(uint64_t)(uint32_t)getpid()<<32 | __atomic_add_fetch(&storage_serial,1,__ATOMIC_RELAXED);
+    return s;
+}
 void webstorage_free(webstorage *s) {
     if (!s) return;
     struct web_storage_result result;
     webstorage_flush(s, true, &result);
+    storage_sources_free(s);
     while (s->areas) { struct storage_area *a = s->areas; s->areas = a->next; storage_area_free(a); }
     free(s);
 }
@@ -96,13 +112,14 @@ static void storage_hash(const void *data, size_t n, uint8_t out[32]) {
     br_sha256_context context;
     br_sha256_init(&context); br_sha256_update(&context, data, n); br_sha256_out(&context, out);
 }
-static void storage_path(const char *origin, int slot, char path[160]) {
+static void storage_path_at(const char *root,const char *origin, int slot, char path[160]) {
     uint8_t digest[32]; char name[65]; const char hex[] = "0123456789abcdef";
     storage_hash(origin, strlen(origin), digest);
     for (int i = 0; i < 32; i++) { name[2*i] = hex[digest[i] >> 4]; name[2*i+1] = hex[digest[i] & 15]; }
     name[64] = 0;
-    snprintf(path, 160, "%s/%s.%d", WEBSTORAGE_ROOT, name, slot);
+    snprintf(path, 160, "%s/%s.%d", root, name, slot);
 }
+static void storage_path(const char *origin,int slot,char path[160]){storage_path_at(WEBSTORAGE_ROOT,origin,slot,path);}
 static uint32_t storage_u32(const uint8_t *p) {
     return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
@@ -112,8 +129,8 @@ static void storage_put64(uint8_t *p, uint64_t v) { storage_put32(p,(uint32_t)v)
 
 /* 0 absent, 1 valid, -1 invalid/I/O. An invalid existing store is never silently
  * reset to an empty map. A valid other slot can recover an interrupted write. */
-static int storage_read(const char *origin, int slot, struct storage_area **out) {
-    char path[160]; storage_path(origin, slot, path);
+static int storage_read_at(const char *root,const char *origin, int slot, struct storage_area **out) {
+    char path[160]; storage_path_at(root,origin, slot, path);
     struct n_stat st;
     if (stat(path, &st) < 0) return errno == ENOENT ? 0 : -1;
     if (st.type != 1 || st.size < 56 || st.size > STORAGE_FILE_MAX) return -1;
@@ -137,6 +154,7 @@ static int storage_read(const char *origin, int slot, struct storage_area **out)
     if (!generation || on != strlen(origin) || on > n - 56 || count > STORAGE_MAX_KEYS || memcmp(bytes+56,origin,on)) { free(bytes); return -1; }
     struct storage_area *a = calloc(1, sizeof *a);
     if (!a) { free(bytes); return -1; }
+    a->shared_fd=a->shared_log_fd=-1;
     a->origin = storage_copy(origin,on); a->kind=WEB_STORAGE_LOCAL; a->slot=slot; a->generation=generation;
     if (!a->origin) { storage_area_free(a); free(bytes); return -1; }
     size_t at=56+on; struct storage_entry **tail=&a->entries; bool ok=true;
@@ -157,6 +175,7 @@ static int storage_read(const char *origin, int slot, struct storage_area **out)
     if (!ok || at!=n) { storage_area_free(a); return -1; }
     *out=a; return 1;
 }
+static int storage_read(const char *origin,int slot,struct storage_area **out){return storage_read_at(WEBSTORAGE_ROOT,origin,slot,out);}
 static bool storage_directory(const char *path) {
     struct n_stat st;
     if (stat(path,&st)==0) return st.type==2;
@@ -164,14 +183,14 @@ static bool storage_directory(const char *path) {
     if (mkdir(path)<0 && errno!=EEXIST) return false;
     return stat(path,&st)==0 && st.type==2;
 }
-static bool storage_dirs(void) {
+static bool storage_dirs_at(const char *root) {
     /* Paths are native constants only. Do not create /data itself when absent. */
-    char parent[160]; snprintf(parent,sizeof parent,"%s",WEBSTORAGE_ROOT);
+    char parent[160]; snprintf(parent,sizeof parent,"%s",root);
     char *slash=strrchr(parent,'/'); if (!slash || slash==parent) return false; *slash=0;
-    return storage_directory(parent) && storage_directory(WEBSTORAGE_ROOT);
+    return storage_directory(parent) && storage_directory(root);
 }
-static int storage_save(struct storage_area *a, struct web_storage_result *out) {
-    if (a->generation==UINT64_MAX || !storage_dirs()) return WEB_STORAGE_IO;
+static int storage_save_at(const char *root,struct storage_area *a, struct web_storage_result *out) {
+    if (a->generation==UINT64_MAX || !storage_dirs_at(root)) return WEB_STORAGE_IO;
     size_t on=strlen(a->origin), n=56+on;
     for (struct storage_entry *e=a->entries;e;e=e->next) n+=8+e->kn+e->vn;
     if (n>STORAGE_FILE_MAX) return WEB_STORAGE_QUOTA;
@@ -186,7 +205,7 @@ static int storage_save(struct storage_area *a, struct web_storage_result *out) 
     }
     storage_hash(bytes+40,n-40,bytes+8);
     int slot=a->slot==0?1:0;
-    char path[160]; storage_path(a->origin,slot,path);
+    char path[160]; storage_path_at(root,a->origin,slot,path);
     int fd=open(path,O_WRONLY|O_CREAT|O_TRUNC), result=WEB_STORAGE_IO;
     if (fd>=0) {
         size_t done=0;
@@ -213,6 +232,7 @@ static int storage_save(struct storage_area *a, struct web_storage_result *out) 
     }
     free(bytes); return result;
 }
+static int storage_save(struct storage_area *a,struct web_storage_result *out){return storage_save_at(WEBSTORAGE_ROOT,a,out);}
 bool webstorage_pending(webstorage *s) {
     for (struct storage_area *a=s?s->areas:NULL;a;a=a->next) if(a->dirty)return true;
     return false;
@@ -227,7 +247,7 @@ int webstorage_flush(webstorage *s, bool force, struct web_storage_result *out) 
         if(!a->dirty || (!force && (now<a->retry_at || (now-a->changed_at<100 && now-a->dirty_since<1000))))continue;
         out->save_attempts++;
         uint64_t start=uptime_ms();
-        int result=storage_save(a,out);out->save_ms+=uptime_ms()-start;
+        int result=storage_shared_flush(s,a,out);out->save_ms+=uptime_ms()-start;
         if(result==WEB_STORAGE_OK){a->dirty=false;a->unavailable=false;a->retry_at=0;}
         else {status=result;a->retry_at=now+1000;}
     }
@@ -240,21 +260,16 @@ static int storage_get_area(webstorage *s, const char *origin, int kind, struct 
         }
     if (s->count>=STORAGE_MAX_ORIGINS) return WEB_STORAGE_QUOTA;
     struct storage_area *a=NULL;
-    if (kind==WEB_STORAGE_LOCAL) {
-        struct storage_area *b=NULL; int ar=storage_read(origin,0,&a), br=storage_read(origin,1,&b);
-        if (b && (!a || b->generation>a->generation)) { storage_area_free(a); a=b; b=NULL; }
-        storage_area_free(b);
-        if (!a && (ar<0 || br<0)) return WEB_STORAGE_IO;
-    }
     if (!a) {
         a=calloc(1,sizeof *a); if (!a) return WEB_STORAGE_QUOTA;
+        a->shared_fd=a->shared_log_fd=-1;
         a->origin=storage_copy(origin,strlen(origin)); a->kind=kind; a->slot=-1;
         if (!a->origin) { storage_area_free(a); return WEB_STORAGE_QUOTA; }
     }
     if (a->units>STORAGE_WINDOW_BYTES/2-s->units) { storage_area_free(a); return WEB_STORAGE_QUOTA; }
     a->next=s->areas; s->areas=a; s->count++; s->units+=a->units; *out=a; return WEB_STORAGE_OK;
 }
-int webstorage_access(webstorage *s, const char *origin, const struct web_storage_request *r, struct web_storage_result *out) {
+static int storage_access_ram(webstorage *s, const char *origin, const struct web_storage_request *r, struct web_storage_result *out) {
     if (!out) return WEB_STORAGE_IO;
     memset(out,0,sizeof *out);
     if (!s || !r || !storage_origin(origin) || (r->kind!=WEB_STORAGE_LOCAL && r->kind!=WEB_STORAGE_SESSION)) return WEB_STORAGE_SECURITY;
@@ -302,3 +317,4 @@ int webstorage_access(webstorage *s, const char *origin, const struct web_storag
     if(a->kind==WEB_STORAGE_LOCAL){uint64_t now=uptime_ms();if(!a->dirty)a->dirty_since=now;a->changed_at=now;a->dirty=true;}
     return WEB_STORAGE_OK;
 }
+#include "webstorage_shared.h"

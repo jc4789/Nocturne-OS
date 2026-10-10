@@ -207,6 +207,28 @@ int64_t vfs_seek(struct file *f, int64_t off, int whence) {
     return n < 0 ? -EINVAL : n;
 }
 
+int vfs_lease(struct file *f, bool acquire) {
+    struct vnode *v = f->vn;
+    if (v->type != VT_FILE) return -EINVAL;
+    uint64_t flags = irq_save();
+    if (acquire) {
+        while (v->lease_owner && v->lease_owner != f) {
+            if (current_task->killed) { irq_restore(flags); return -EINTR; }
+            wq_wait(&v->lease_wait);
+        }
+        if (current_task->killed) { irq_restore(flags); return -EINTR; }
+        v->lease_owner = f;
+    } else if (v->lease_owner == f) {
+        v->lease_owner = NULL;
+        wq_wake_all(&v->lease_wait);
+    } else if (v->lease_owner) {
+        irq_restore(flags);
+        return -EPERM;
+    }
+    irq_restore(flags);
+    return 0;
+}
+
 void vfs_close(struct file *f) {
     if (!f) return;
     uint64_t flags = irq_save();
@@ -216,6 +238,7 @@ void vfs_close(struct file *f) {
     /* The last close callback can drain audio and sleep. Reference ownership,
        not an IRQ-disabled driver invocation, keeps this detached file alive. */
     struct vnode *v = f->vn;
+    vfs_lease(f, false);
     if (v->ops && v->ops->close) v->ops->close(v, f);
     vnode_unref(v);
     kfree(f);

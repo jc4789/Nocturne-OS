@@ -1,6 +1,6 @@
-/* Buffered asynchronous XHR over Nocturne's existing, CORS-checked transport.
+/* Asynchronous XHR over Nocturne's CORS-checked streaming transport.
    No page-replaceable fetch/Promise methods are used to schedule host work.
-   Streaming, synchronous requests and XML documents are
+   Synchronous requests and XML documents are
    not implemented; unsupported operations must not pretend to succeed. */
 {
     const states = new WeakMap(), uploadStates = new WeakMap(), progressStates = new WeakMap();
@@ -9,6 +9,10 @@
     const defineProperty=Object.defineProperty, promiseConstructor=Object.freeze({[Symbol.species]:Promise});
     const create=Object.create, assign=Object.assign, NativeNumber=Number;
     const bufferLength=Object.getOwnPropertyDescriptor(ArrayBuffer.prototype,'byteLength').get;
+    const U8=Uint8Array,typedPrototype=Object.getPrototypeOf(U8.prototype);
+    const typedBuffer=Object.getOwnPropertyDescriptor(typedPrototype,'buffer').get;
+    const typedLength=Object.getOwnPropertyDescriptor(typedPrototype,'byteLength').get;
+    const typedSet=U8.prototype.set;
     const decode=Decoder.prototype.decode, split=String.prototype.split;
     const weakGet=WeakMap.prototype.get, weakSet=WeakMap.prototype.set, weakHas=WeakMap.prototype.has;
     for(const map of [states,uploadStates,progressStates]) {
@@ -67,11 +71,11 @@
     }
     function fire(x,type,loaded=0,total=0,computable=false) {
         const e=type==='readystatechange'?new Event(type):new ProgressEvent(type,{loaded,total,lengthComputable:computable});
-        e.isTrusted=true;dispatch(x,e);
+        eventState(e).isTrusted=true;dispatch(x,e);
     }
     function stopTimer(s){if(s.timer)host.clear(s.timer);s.timer=0;}
-    function clearResponse(s){s.status=0;s.statusText='';s.responseURL='';s.responseHeaders=null;s.text='';s.bytes=null;s.object=null;s.objectSet=false;}
-    function cancel(s){if(s.id)host.cancel(s.id);s.id=0;stopTimer(s);}
+    function clearResponse(s){s.status=0;s.statusText='';s.responseURL='';s.responseHeaders=null;s.text='';s.bytes=null;s.object=null;s.objectSet=false;s.chunks=[];s.loaded=0;s.total=0;s.decoder=null;s.progressAt=0;s.uploadProgressAt=0;}
+    function cancel(s){if(s.transport){s.transport.cancel();s.transport=null;}if(s.id)host.cancel(s.id);s.id=0;stopTimer(s);}
     function error(x,s,epoch,type) {
         if(!current(s,epoch))return;
         cancel(s);s.sent=false;clearResponse(s);s.ready=4;
@@ -94,7 +98,9 @@
     }
     function queue(x,s,epoch,fn) {
         if(!current(s,epoch))return;
-        try{host.timer(0,fn,0,[]);}
+        // abort()/open() can replace the response after this task is queued.
+        // Revalidate at delivery before an old frame touches the new request.
+        try{host.timer(0,()=>{if(current(s,epoch))fn();},0,[]);}
         catch(_){
             // Resource exhaustion must not leave an in-flight request hung.
             // An emergency native job reports failure, never a fake success.
@@ -143,6 +149,56 @@
         fire(x,'load',loaded,computable?total:0,computable);if(s.epoch!==epoch)return;
         fire(x,'loadend',loaded,computable?total:0,computable);
     }
+    function receivedHeaders(x,s,epoch,response) {
+        const result=fetchBridge.xhrMetadata(response);
+        s.status=result.status;s.statusText=result.statusText;s.responseURL=nativeApply(split,result.url,['#'])[0];s.responseHeaders=result.headers;
+        const header=nativeApply(headerGet,s.responseHeaders,['content-length']);
+        if(header!==null){const values=header.split(',').map(value=>value.trim());if(values.length&&/^\d+$/.test(values[0])&&values.every(value=>value===values[0]))s.total=NativeNumber(values[0]);}
+        s.ready=2;fire(x,'readystatechange');
+    }
+    function prepareDecoder(s) {
+        if(!s.decoder&&s.type!=='arraybuffer'&&s.type!=='blob'){
+            const charset=mime=>{const m=/;\s*charset\s*=\s*(?:"([^"]*)"|([^;\s]*))/i.exec(mime);return m?(m[1]??m[2]):null;};
+            const encoding=s.type==='json'?'utf-8':charset(s.mime)??charset(nativeApply(headerGet,s.responseHeaders,['content-type'])||'')??'utf-8';
+            try{s.decoder=new Decoder(encoding);}catch(_){s.decoder=new Decoder('utf-8');}
+        }
+    }
+    function receivedChunk(x,s,epoch,bytes) {
+        prepareDecoder(s);
+        const count=nativeApply(bufferLength,bytes,[]);s.loaded+=count;
+        if(s.decoder)s.text+=nativeApply(decode,s.decoder,[bytes,{stream:true}]);else s.chunks.push(bytes);
+        s.ready=3;
+        const now=host.now();
+        if(now-s.progressAt<50)return;
+        s.progressAt=now;fire(x,'readystatechange');if(!current(s,epoch))return;
+        fire(x,'progress',s.loaded,s.total,s.total>0);
+    }
+    function receivedEnd(x,s,epoch,reason) {
+        if(reason!==undefined){error(x,s,epoch,'error');return;}
+        prepareDecoder(s);
+        if(s.decoder)s.text+=nativeApply(decode,s.decoder,[]);
+        else {
+            const bytes=new U8(s.loaded);let at=0;
+            for(const chunk of s.chunks){const input=new U8(chunk);nativeApply(typedSet,bytes,[input,at]);at+=nativeApply(typedLength,input,[]);}
+            s.bytes=nativeApply(typedBuffer,bytes,[]);
+        }
+        s.chunks=[];s.decoder=null;s.transport=null;
+        fire(x,'progress',s.loaded,s.total,s.total>0);if(!current(s,epoch))return;
+        stopTimer(s);s.sent=false;s.ready=4;
+        fire(x,'readystatechange');if(s.epoch!==epoch)return;
+        fire(x,'load',s.loaded,s.total,s.total>0);if(s.epoch!==epoch)return;
+        fire(x,'loadend',s.loaded,s.total,s.total>0);
+    }
+    function uploaded(s,epoch,count) {
+        if(s.uploadDone)return;
+        const done=count===s.uploadSize,now=host.now();
+        if(done)s.uploadDone=true;
+        if(s.uploadListener&&(done||now-s.uploadProgressAt>=50)){
+            s.uploadProgressAt=now;fire(s.upload,'progress',count,s.uploadSize,s.uploadSize>0);
+            if(s.epoch!==epoch)return;
+            if(done){fire(s.upload,'load',count,s.uploadSize,s.uploadSize>0);if(s.epoch!==epoch)return;fire(s.upload,'loadend',count,s.uploadSize,s.uploadSize>0);}
+        }
+    }
     class XMLHttpRequest extends XMLHttpRequestEventTarget {
         constructor() {
             super();const upload=new XMLHttpRequestUpload(uploadToken);
@@ -179,6 +235,7 @@
         }
         send(body=null) {
             const s=state(this);if(s.ready!==1 || s.sent)fail('InvalidStateError','The request is not open');
+            if(s.method==='GET' || s.method==='HEAD')body=null;
             if(body!==null && body instanceof Document)fail('NotSupportedError','Document uploads are not supported');
             const extracted=fetchBridge.xhrBody(body),contentType=extracted.type;
             body=extracted.bytes;
@@ -195,6 +252,22 @@
             if(!s.uploadDone && s.uploadListener){fire(s.upload,'loadstart');if(!current(s,epoch))return;}
             try{armTimer(this,s,epoch);}catch(e){cancel(s);s.sent=false;s.epoch++;throw e;}
             let pair;
+            if(host.streamingFetch&&!s.url.startsWith('blob:')){
+                s.transport=fetchBridge.xhrFetch(s.url,{method:s.method,headers:Object.fromEntries(s.headers),body,credentials:s.credentials?'include':'same-origin'},(event,value,resume)=>{
+                    queue(this,s,epoch,()=>{
+                        try{
+                            if(event==='headers')receivedHeaders(this,s,epoch,value);
+                            else if(event==='chunk')receivedChunk(this,s,epoch,value);
+                            else if(event==='upload')uploaded(s,epoch,value);
+                            else if(event==='end')receivedEnd(this,s,epoch,value);
+                        }catch(e){error(this,s,epoch,'error');report(e);}
+                        finally{if(current(s,epoch))resume();}
+                    });
+                },s.uploadListener);
+                defineProperty(s.transport.promise,'constructor',{value:promiseConstructor});
+                nativeApply(nativeThen,s.transport.promise,[()=>{},()=>queue(this,s,epoch,()=>error(this,s,epoch,'error'))]);
+                return;
+            }
             try{pair=s.url.startsWith('blob:')?{id:0,promise:fetchBridge.fetch(s.url,{method:s.method,headers:Object.fromEntries(s.headers),body})}:host.fetch(s.url,s.method,raw,body??'',false,s.credentials?2:1,s.uploadListener);}
             catch(_){queue(this,s,epoch,()=>error(this,s,epoch,'error'));return;}
             s.id=pair.id;

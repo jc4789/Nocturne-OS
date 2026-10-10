@@ -824,6 +824,7 @@ node_t *doc_doctype_create(web_doc *d, const char *name, size_t name_len,
     const char *public_id, size_t public_len, const char *system_id, size_t system_len);
 int doc_node_insert_validity(node_t *parent, node_t *child, node_t *before);
 int doc_node_replace_validity(node_t *parent, node_t *child, node_t *old);
+int doc_node_replace_all_validity(node_t *parent,node_t *child);
 node_t *doc_node_root(node_t *node, bool composed);
 node_t *doc_shadow_parent(node_t *node); /* parent, or a shadow root's host */
 bool doc_node_connected(node_t *node);
@@ -854,6 +855,7 @@ bool doc_attr_value(web_doc *d, node_t *attribute, const char *value);
 void doc_attrs_publish(node_t *element, struct attr *attrs, int count);
 bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before);
 bool doc_node_replace(web_doc *d, node_t *parent, node_t *child, node_t *old);
+bool doc_node_replace_all(web_doc *d,node_t *parent,node_t *child);
 void doc_node_remove(web_doc *d, node_t *node);
 bool doc_node_text(web_doc *d, node_t *node, const char *text, size_t n);
 void doc_parser_form_set(node_t *node,node_t *form);

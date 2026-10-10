@@ -51,6 +51,7 @@ struct web_request {
     bool keepalive; /* Buffered Fetch may outlive this document, not the browser process. */
     uint64_t fetch_group; /* Native per-environment identity; not supplied by page headers. */
     int cache_mode; /* Fetch: 0 default, 1 no-store, 2 reload, 3 no-cache, 4 force-cache, 5 only-if-cached. */
+    bool stream_response;
 };
 enum { WEB_HISTORY_INFO, WEB_HISTORY_PUSH, WEB_HISTORY_REPLACE, WEB_HISTORY_GO, WEB_HISTORY_SCROLL };
 struct web_history {
@@ -67,6 +68,8 @@ struct web_response {
     size_t body_len;
     char *headers_full; /* Complete block when too large for inline headers; never a truncated tail. */
     char *url_full; /* Complete owned URL for native transports; inline URL remains legacy-compatible. */
+    int event; /* webnet_event; zero retains the complete-response contract. */
+    size_t uploaded;
 };
 static inline const char *web_response_url(const struct web_response *r) {
     return r->url_full ? r->url_full : r->url;
@@ -107,6 +110,7 @@ struct web_host {
     /* Document retirement, unlike explicit AbortSignal: detach callback delivery
        and retain a keepalive transport. A host without this cannot accept it. */
     void (*release_request)(void *opaque, uint64_t id);
+    void (*resume_request)(void *opaque, uint64_t id);
     bool (*sync_load)(void *opaque, const char *url, int kind, struct web_response *response);
     /* Origin-aware module transport. Prefer this over the legacy top-document
        callback; origin/credentials are native initiating-realm values. Same
@@ -137,6 +141,7 @@ struct web_host {
        never a page-selected directory. Output text transfers malloc ownership. */
     int (*storage)(void *opaque, const char *origin, const struct web_storage_request *request,
                    struct web_storage_result *out);
+    bool storage_events; /* backend supports document subscriptions and ACK */
     /* Opt in only for the native browser embedder. Custom/fixture hosts keep
        their request() transport; this flag does not grant origin/CORS access. */
     bool media_range;

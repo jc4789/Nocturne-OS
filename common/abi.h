@@ -114,6 +114,8 @@ struct n_pciinfo {
 #define F_GETFL 3
 #define F_SETFL 4
 #define F_SETTTY 100 /* mark a pipe as a terminal (the terminal emulator does this), so isatty() is true */
+#define F_NLOCK 1024   /* Nocturne: wait for a vnode lease owned by this open file */
+#define F_NUNLOCK 1025 /* release that lease; the last close also releases it */
 
 /* ---- GUI ---- */
 enum {

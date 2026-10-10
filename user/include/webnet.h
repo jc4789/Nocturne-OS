@@ -79,7 +79,9 @@ struct webnet_request {
     bool image_upgrade; /* Trusted ordinary non-CORS, non-imageset image only; RESOURCE. */
     uint64_t fetch_group; /* Distinct environment settings object, including child documents. */
     enum webnet_cache cache_mode; /* Cacheless host: network misses, or cache-only failure; never stored responses. */
+    bool stream_response; /* Fetch lifecycle frames; other destinations remain buffered. */
 };
+enum webnet_event { WEBNET_COMPLETE, WEBNET_HEADERS, WEBNET_CHUNK, WEBNET_END, WEBNET_UPLOAD };
 struct webnet_response {
     int status;
     const char *final_url;
@@ -87,6 +89,8 @@ struct webnet_response {
     const void *body;
     size_t body_len;
     const char *error; /* empty for a received HTTP response, including HTTP errors */
+    enum webnet_event event;
+    size_t uploaded;
 };
 typedef void (*webnet_callback)(webnet *, uint64_t id, uint64_t generation,
                                const struct webnet_response *, void *opaque);
@@ -106,6 +110,9 @@ void webnet_pump(webnet *, uint64_t now_ms);
 int webnet_timeout(const webnet *, uint64_t now_ms); /* -1 idle, otherwise <=10 ms */
 bool webnet_busy(const webnet *);
 void webnet_cancel(webnet *, uint64_t id); /* cancellation does not invoke the callback */
+/* One-frame demand gate. No reads while paused: the child's pipe applies
+   backpressure all the way to its network body callback. */
+void webnet_resume(webnet *, uint64_t id);
 /* Document teardown: kills/reaps non-keepalive children; keepalive callbacks and
    copied request policy remain owned by net until completion or explicit cancel. */
 void webnet_cancel_generation(webnet *, uint64_t generation);
