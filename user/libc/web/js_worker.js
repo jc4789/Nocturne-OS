@@ -27,12 +27,17 @@ const workerBridge=(()=>{
     return {deliver(id,kind,payload,request=0,flags=0){
         const worker=live.get(id);if(!worker)return;
         if(kind===7){host.log(0,String(payload.message||''));return;}
-        if(kind===8||kind===9){messagingBridge.receiveWorkerPort(id,request,flags,payload,kind===9);return;}
+        if(kind===8||kind===9||kind===10){messagingBridge.receiveWorkerPort(id,request,flags,payload,kind!==8);return;}
         let event;
         if(kind===2){
             try{const message=flags===3?messagingBridge.importWorker(payload,id):{data:cloneData.deserialize(payload),ports:[]};if(slots.get(worker).closed)return;event=new MessageEvent('message',{data:message.data,ports:message.ports});}
             catch(_){event=new MessageEvent('messageerror');}
-        }else if(kind===4)event=new ErrorEvent('error',{cancelable:true,message:String(payload.message||'Worker failed'),filename:String(payload.filename||''),lineno:payload.lineno||0});
+        }else if(kind===4){
+            // Only a native transport/process failure is terminal. An ordinary
+            // author exception must leave its live Worker/ports usable.
+            if(payload.terminal===true){slots.get(worker).closed=true;live.delete(id);messagingBridge.closeWorker(id);}
+            event=new ErrorEvent('error',{cancelable:true,message:String(payload.message||'Worker failed'),filename:String(payload.filename||''),lineno:payload.lineno||0});
+        }
         else if(kind===6){slots.get(worker).closed=true;live.delete(id);messagingBridge.closeWorker(id);return;}else return;
         event.isTrusted=true;
         if(dispatch(worker,event)&&kind===4)host.log(2,'Worker: '+event.message);

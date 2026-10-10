@@ -66,6 +66,7 @@ struct webnet_request {
     bool force_preflight; /* Fetch use-CORS-preflight flag, not an author request header. */
     bool redirect_error; /* Refuse a redirect before issuing its target request. */
     bool same_origin; /* Enforced on every redirect hop, not just the initial URL. */
+    bool no_cors, no_referrer; /* Safelisted Fetch; opaque response after cross-origin hop. */
     bool keepalive; /* Fetch survives generation retirement; explicit cancel still aborts. */
     bool image_upgrade; /* Trusted ordinary non-CORS, non-imageset image only; RESOURCE. */
     uint64_t fetch_group; /* Distinct environment settings object, including child documents. */

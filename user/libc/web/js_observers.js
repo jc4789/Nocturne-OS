@@ -64,18 +64,22 @@ const observerBridge=(()=>{
         unobserve(target){const s=slot(roSlots,this);element(target);s.targets.delete(target);if(!s.targets.size)resize.delete(this);wake();}
         disconnect(){slot(roSlots,this).targets.clear();resize.delete(this);wake();}
     }
-    function depth(target){let d=0;for(let n=target;n;n=n.parentNode)d++;return d;}
     function resizeFrame(){
         let limit=0,skipped=false;
         for(;;){
-            let shallow=Infinity;const batches=[];skipped=false;
+            let shallow=Infinity;const batches=[],geometry=new Map();skipped=false;
             for(const observer of Array.from(resize)){
                 const s=roSlots.get(observer),entries=[];
                 for(const [target,old] of s.targets){
-                    const g=dom('observerGeometry',target,null),device=[0,0,Math.round(g.content[2]),Math.round(g.content[3])];
+                    /* Several observers may watch the same native box. Share
+                       one real layout sample within this gather only, never
+                       across callbacks that can change layout or slotting. */
+                    let g=geometry.get(target);
+                    if(!g){g=dom('observerGeometry',target,null);geometry.set(target,g);}
+                    const device=[0,0,Math.round(g.content[2]),Math.round(g.content[3])];
                     const box=old.box==='border-box'?g.border:old.box==='device-pixel-content-box'?device:g.content;
                     if(box[2]===old.w && box[3]===old.h)continue;
-                    const d=depth(target);if(d<=limit){skipped=true;continue;}
+                    const d=g.depth;if(d<=limit){skipped=true;continue;}
                     old.w=box[2];old.h=box[3];shallow=Math.min(shallow,d);
                     const e=Object.create(ResizeObserverEntry.prototype);
                     entries.push(readonly(e,{target,contentRect:rect(g.content),borderBoxSize:sizes(g.border),

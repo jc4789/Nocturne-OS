@@ -174,6 +174,19 @@ const htmlElementsBridge = (() => {
         if(value!=null && typeof value!=='boolean' && typeof value!=='number' && typeof value!=='string')value=string(value);
         reflectedAttr(this,'hidden',typeof value==='string' && lower(value)==='until-found'?'until-found':value?'':null);
     }});
+    function revealHidden(ancestors,owner){
+        // Native flat-tree snapshot is captured before any author callback.
+        // Use the real attribute mutation bridge, including CE/MO reactions.
+        for(const node of ancestors){
+            if(rawDom('get',node,'ownerDocument')!==owner || !rawDom('get',node,'isConnected') ||
+                lower(rawDom('attr',node,'hidden')||'')!=='until-found')return false;
+            const event=new Event('beforematch',{bubbles:true});event.isTrusted=true;dispatch(node,event);
+            if(rawDom('get',node,'ownerDocument')!==owner || !rawDom('get',node,'isConnected') ||
+                lower(rawDom('attr',node,'hidden')||'')!=='until-found')return false;
+            dom('attr',node,'hidden',null);
+        }
+        return true;
+    }
     function adjacent(node,position){
         rawDom('get',node,'elementBrand');position=lower(string(position));
         let parent,before;
@@ -392,7 +405,7 @@ const htmlElementsBridge = (() => {
     const extraExports={HTMLHeadingElement,HTMLPictureElement,HTMLSourceElement,HTMLMenuElement,HTMLDialogElement,HTMLDivElement};
     for(const C of [...Object.values(exports),...Object.values(extraExports)])define(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
     Object.assign(globalThis,exports,extraExports);
-    return {nodeProtos:Object.values(exports).map(C=>C.prototype),extraNodeProtos:Object.values(extraExports).map(C=>C.prototype),exports:{...exports,...extraExports},
+    return {revealHidden,nodeProtos:Object.values(exports).map(C=>C.prototype),extraNodeProtos:Object.values(extraExports).map(C=>C.prototype),exports:{...exports,...extraExports},
         initializeDialogs(C){if(ToggleEventImpl)throw new TypeErrorImpl('Dialog events already initialized');ToggleEventImpl=C;},
         requestClose(node){dialogState(node);call(requestCloseDialog,node,[]);},
         submit(node,result){

@@ -76,7 +76,7 @@ FF_OBJ := $(patsubst %.c,$(BUILD)/ffmpeg/%.o,$(FFMPEG_C))
 $(FF_OBJ): third_party/ffmpeg/config.h third_party/ffmpeg/config_components.h third_party/ffmpeg/libavutil/avconfig.h
 FFFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg -Ithird_party/ffmpeg/compat/stdbit \
            $(filter-out -W%,$(UCFLAGS)) -w -DHAVE_AV_CONFIG_H -D_ISOC11_SOURCE -D_FILE_OFFSET_BITS=64 \
-           -D_LARGEFILE_SOURCE -std=c17 -Oz -fno-math-errno -fno-signed-zeros -mstack-alignment=16
+           -D_LARGEFILE_SOURCE -std=c17 -O3 -fno-math-errno -fno-signed-zeros -mstack-alignment=16
 $(BUILD)/ffmpeg/%.o: %.c
 	@mkdir -p $(dir $@)
 	@echo "  FF   $<"
@@ -152,9 +152,10 @@ user/libc/web/js_bootstrap.inc user/libc/web/js_form_url.inc &: $(wildcard user/
 	@$(PY) user/libc/web/js_embed.py
 $(BUILD)/u/user/libc/web/js.o: user/libc/web/js_bootstrap.inc
 $(BUILD)/u/user/libc/web/form_validation.o: user/libc/web/js_form_url.inc
-user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_clone.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_worker_embed.py
+user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_dom_exception.js user/libc/web/js_clone.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_worker_embed.py
 	@$(PY) user/libc/web/js_worker_embed.py
-$(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc user/libc/web/js_worker_transfer.h
+$(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc user/libc/web/js_worker_transfer.h user/libc/web/js_worker_port_lifetime.h
+$(BUILD)/u/user/libc/web/js_worker.o: user/libc/web/js_worker.h user/include/js_worker_wire.h user/libc/web/js_worker_port_lifetime.h
 
 $(BUILD)/u/%.asm.o: %.asm
 	@mkdir -p $(dir $@)

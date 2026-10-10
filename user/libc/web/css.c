@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <stdarg.h>
 #include <math.h>
+#include <limits.h>
 #include <nocturne.h>
 #include "webi.h"
 #include "web_dialog.h"
@@ -60,6 +61,16 @@ struct mcond {
     const struct mcond *up;
 };
 
+struct font_source {const char *url;struct font_source *next;};
+struct font_face {
+    const char *family;
+    struct font_source *sources;
+    unsigned weight_lo,weight_hi;
+    bool italic;
+    const struct mcond *media;
+    struct font_face *next;
+};
+
 struct rule {
     struct sellist *sel;
     struct decl *decls;
@@ -71,6 +82,7 @@ struct rule {
 
 struct sheet {
     struct rule *first, *last;
+    struct font_face *fonts,*fonts_last;
     double order;
     bool ua;
     node_t *scope; /* NULL: document author sheet; otherwise its shadow root */
@@ -1143,15 +1155,16 @@ static char *absolute_urls(struct pctx *pc, const char *v, const char *ve) {
             while (a < z && is_space((unsigned char)*a)) a++;
             while (z > a && is_space((unsigned char)z[-1])) z--;
             if (z - a >= 2 && (*a == '"' || *a == '\'') && z[-1] == *a) a++, z--;
-            char rel[2048], abs[2048];
-            size_t rn = (size_t)(z - a) < sizeof rel - 1 ? (size_t)(z - a) : sizeof rel - 1;
-            memcpy(rel, a, rn);
-            rel[rn] = 0;
-            if (rn && !strchr(rel, '"') && url_resolve(pc->base, rel, abs, sizeof abs)) {
+            size_t rn = (size_t)(z - a);
+            char *rel = ar_strndup(pc->a, a, rn), *absolute = NULL;
+            int result = rn && !strchr(rel, '"') ? web_resolve_url_owned(pc->base, rel, &absolute) : 0;
+            if (result < 0) { sb_free(&b); ar_alloc(pc->a, SIZE_MAX); }
+            if (result == 1) {
                 sb_puts(&b, "url(\"");
-                sb_puts(&b, abs);
+                sb_puts(&b, absolute);
                 sb_puts(&b, "\")");
             } else sb_put(&b, p, (size_t)(e + 1 - p));
+            free(absolute);
             p = e + 1;
             continue;
         }
@@ -1331,6 +1344,65 @@ static struct css_rule_info *cssom_record(struct pctx *pc, uint32_t type, const 
     pc->sh->cssom_last = info; pc->sh->cssom_count++; return info;
 }
 
+static struct font_source *font_sources(struct pctx *pc,const char *s,const char *e) {
+    struct font_source *first=NULL,**tail=&first;
+    while(s<e) {
+        const char *end=scan_to(s,e,",");s=skip_ws(s,end);
+        if(end-s>=4 && strn_ieq(s,"url(",4)) {
+            const char *a=skip_ws(s+4,end),*z=scan_to(a,end,")");
+            if(z<end) {
+                const char *finish=z;trim_r(a,&finish);
+                if(finish-a>=2 && (*a=='"' || *a=='\'') && finish[-1]==*a){a++;finish--;}
+                sbuf decoded={0};css_unescape(&decoded,a,(size_t)(finish-a));
+                const char *rel=sb_cstr(&decoded);char *absolute=NULL;
+                int resolved=decoded.n?web_resolve_url_owned(pc->base,rel,&absolute):0;
+                if(resolved<0){sb_free(&decoded);ar_alloc(pc->a,SIZE_MAX);}
+                if(resolved==1) {
+                    struct font_source *src=ar_alloc(pc->a,sizeof *src);
+                    src->url=ar_strdup(pc->a,absolute);src->next=NULL;*tail=src;tail=&src->next;
+                }
+                free(absolute);sb_free(&decoded);
+            }
+        }
+        /* local() is not falsely resolved to a class-substitute font. Unknown
+           binary formats are decoded only by the actual native resource gate. */
+        s=end<e?end+1:e;
+    }
+    return first;
+}
+static void parse_font_face(struct pctx *pc,const char *s,const char *e,const struct mcond *media) {
+    struct font_face *f=ar_alloc(pc->a,sizeof *f);memset(f,0,sizeof *f);
+    f->weight_lo=f->weight_hi=400;f->media=media;
+    while(s<e) {
+        const char *end=scan_to(s,e,";"),*colon=scan_to(s,end,":"),*name_end=colon;
+        const char *name=skip_ws(s,name_end);trim_r(name,&name_end);
+        if(colon<end) {
+            const char *value=skip_ws(colon+1,end),*ve=end;trim_r(value,&ve);
+            size_t n=(size_t)(name_end-name);
+            if(n==11 && strn_ieq(name,"font-family",n)) {
+                const char *cursor=value,*family=css_font_family_next(pc->a,&cursor,ve);
+                if(family && cursor==ve)f->family=family;
+            } else if(n==3 && strn_ieq(name,"src",n))f->sources=font_sources(pc,value,ve);
+            else if(n==10 && strn_ieq(name,"font-style",n))f->italic=(ve-value>=6 && strn_ieq(value,"italic",6)) || (ve-value>=7 && strn_ieq(value,"oblique",7));
+            else if(n==11 && strn_ieq(name,"font-weight",n)) {
+                if(ve-value==6 && strn_ieq(value,"normal",6))f->weight_lo=f->weight_hi=400;
+                else if(ve-value==4 && strn_ieq(value,"bold",4))f->weight_lo=f->weight_hi=700;
+                else {
+                    char *text=ar_strndup(pc->a,value,(size_t)(ve-value)),*tail;
+                    unsigned long lo=strtoul(text,&tail,10),hi=lo;
+                    if(tail!=text){while(is_space((unsigned char)*tail))tail++;if(*tail)hi=strtoul(tail,&tail,10);
+                        while(is_space((unsigned char)*tail))tail++;
+                        if(!*tail && lo>=1 && lo<=1000 && hi>=lo && hi<=1000){f->weight_lo=(unsigned)lo;f->weight_hi=(unsigned)hi;}}
+                }
+            }
+        }
+        s=end<e?end+1:e;
+    }
+    if(!f->family || !f->sources)return;
+    if(pc->sh->fonts_last)pc->sh->fonts_last->next=f;else pc->sh->fonts=f;
+    pc->sh->fonts_last=f;
+}
+
 static void parse_rules(struct pctx *pc, const char *s, const char *e, const struct mcond *media) {
     pc->rule_depth++;
     while (s < e) {
@@ -1387,7 +1459,8 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
             const char *be = block_end(p + 1, e);
             cssom_record(pc, type, s, be < e ? be + 1 : e);
             if (name) {
-                if (!strcmp(name, "media")) {
+                if (!strcmp(name, "font-face")) parse_font_face(pc,p+1,be,media);
+                else if (!strcmp(name, "media")) {
                     struct mcond *mc = ar_alloc(pc->a, sizeof *mc);
                     mc->q = ar_strndup(pc->a, qs, (size_t)(qe - qs));
                     mc->up = media;
@@ -1398,7 +1471,7 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
                            !strcmp(name, "document") || !strcmp(name, "-moz-document")) {
                     parse_rules(pc, p + 1, be, media);
                 }
-                /* @font-face, @keyframes, @page, @property, @starting-style ... are skipped */
+                /* @keyframes, @page, @property, @starting-style ... are skipped */
             }
             s = be < e ? be + 1 : e;
             continue;
@@ -1763,6 +1836,71 @@ static bool media_chain_ok(const struct mcond *m,int vw,int vh,bool scripting) {
     for(;m;m=m->up)if(!css_media_evaluate(m->q,vw,vh,scripting,NULL,0))return false;return true;
 }
 
+struct font_binding {
+    const char *names;node_t *scope;unsigned weight;bool italic;font_t *face;
+};
+static struct font_binding *font_bindings;
+static size_t font_binding_count,font_binding_capacity;
+static bool font_faces_available;
+static void font_bindings_clear(void) {
+    free(font_bindings);font_bindings=NULL;font_binding_count=font_binding_capacity=0;
+}
+static font_t *select_web_font_uncached(web_doc *d,node_t *node,style_t *style,int vw,int vh) {
+    if(!style->font_names)return NULL;
+    const char *cursor=style->font_names,*end=cursor+strlen(cursor);
+    node_t *scope=doc_node_root(node,false);bool scripting=web_js_enabled(d);
+    while(cursor<end) {
+        const char *token=skip_ws(cursor,end);bool quoted=token<end && (*token=='"' || *token=='\'');
+        const char *family=css_font_family_next(&d->smem,&cursor,end);if(!family || !cursor)return NULL;
+        /* Generic keywords terminate named lookup in the authored fallback
+           order. A quoted name with that spelling is still a named family. */
+        if(!quoted && (!strcasecmp(family,"serif") || !strcasecmp(family,"sans-serif") || !strcasecmp(family,"monospace") ||
+            !strcasecmp(family,"system-ui") || !strcasecmp(family,"cursive") || !strcasecmp(family,"fantasy")))return NULL;
+        struct font_face *best=NULL;unsigned score=UINT_MAX;
+        for(int i=0;i<d->sty.sheets.n;i++) {
+            sheet_t *sheet=d->sty.sheets.v[i];
+            if((sheet->scope && sheet->scope!=scope) || (!sheet->scope && scope && scope->shadow_host))continue;
+            if(sheet->owner_media && !css_media_evaluate(sheet->owner_media,vw,vh,scripting,NULL,0))continue;
+            for(struct font_face *f=sheet->fonts;f;f=f->next) {
+                if(strcasecmp(family,f->family) || !media_chain_ok(f->media,vw,vh,scripting))continue;
+                unsigned weight=style->font_weight,dist=weight<f->weight_lo?f->weight_lo-weight:weight>f->weight_hi?weight-f->weight_hi:0;
+                unsigned candidate=dist+((style->font_style!=0)!=f->italic?10000u:0u);
+                if(candidate<=score){best=f;score=candidate;}
+            }
+        }
+        if(!best)continue;
+        for(struct font_source *src=best->sources;src;src=src->next) {
+            struct web_font_resource *r=doc_font_resource(d,src->url);
+            if(!r){ar_alloc(&d->smem,SIZE_MAX);return NULL;}
+            if(r->failed)continue;
+            r->wanted=true;return r->face;
+        }
+    }
+    return NULL;
+}
+static font_t *select_web_font(web_doc *d,node_t *node,style_t *style,int vw,int vh) {
+    if(!font_faces_available || !style->font_names)return NULL;
+    node_t *scope=doc_node_root(node,false);unsigned weight=style->font_weight;bool italic=style->font_style!=0;
+    for(size_t i=0;i<font_binding_count;i++) {
+        const struct font_binding *b=&font_bindings[i];
+        if(b->scope==scope && b->weight==weight && b->italic==italic &&
+           (b->names==style->font_names || !strcmp(b->names,style->font_names)))return b->face;
+    }
+    font_t *face=select_web_font_uncached(d,node,style,vw,vh);
+    if(font_binding_count==font_binding_capacity) {
+        size_t cap=font_binding_capacity?font_binding_capacity:16;
+        if(cap<=SIZE_MAX/2)cap*=2;
+        if(cap<=SIZE_MAX/sizeof *font_bindings) {
+            void *p=realloc(font_bindings,cap*sizeof *font_bindings);
+            if(p){font_bindings=p;font_binding_capacity=cap;}
+        }
+    }
+    /* Optional acceleration only: allocator failure never rejects a font. */
+    if(font_binding_count<font_binding_capacity)
+        font_bindings[font_binding_count++]=(struct font_binding){style->font_names,scope,weight,italic,face};
+    return face;
+}
+
 /* ---------------------------------------------------------------- the rule index */
 struct ient {
     const struct selector *sel;
@@ -1887,24 +2025,37 @@ void css_styling_free(struct styling *st) {
 
 /* ---------------------------------------------------------------- presentational hints */
 struct hints {
-    struct decl d[24];
-    int n;
+    struct decl *d;
+    int n, cap;
     arena_t *a;
 };
 
-static void hint(struct hints *h, const char *prop, const char *fmt, ...) {
-    if (h->n >= 24) return;
-    char buf[256];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
+static void hint_value(struct hints *h, const char *prop, const char *value) {
     const struct propdef *p = css_prop_lookup(prop, strlen(prop));
     if (!p) return;
+    if (h->n == h->cap) {
+        if (h->cap == INT_MAX) ar_alloc(h->a, SIZE_MAX);
+        int cap = h->cap ? h->cap > INT_MAX / 2 ? INT_MAX : h->cap * 2 : 16;
+        if ((size_t)cap > SIZE_MAX / sizeof(struct decl)) ar_alloc(h->a, SIZE_MAX);
+        struct decl *next = ar_alloc(h->a, (size_t)cap * sizeof *next);
+        if (h->n) memcpy(next, h->d, (size_t)h->n * sizeof *next);
+        h->d = next; h->cap = cap;
+    }
     struct decl *d = &h->d[h->n++];
     memset(d, 0, sizeof *d);
     d->p = p;
-    d->value = ar_strdup(h->a, buf);
+    d->value = ar_strdup(h->a, value);
+}
+
+static void hint(struct hints *h, const char *prop, const char *fmt, ...) {
+    va_list ap, count;
+    va_start(ap, fmt); va_copy(count, ap);
+    int n = vsnprintf(NULL, 0, fmt, count);
+    va_end(count);
+    if (n < 0) { va_end(ap); return; }
+    char *value = ar_alloc(h->a, (size_t)n + 1);
+    vsnprintf(value, (size_t)n + 1, fmt, ap); va_end(ap);
+    hint_value(h, prop, value);
 }
 
 /* an HTML length attribute: "100", "50%", "100px" */
@@ -2145,7 +2296,76 @@ static int cmp_dent(const void *a, const void *b) {
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
+struct var_index_entry {
+    const struct custom_prop *property;
+    size_t length;
+    uint32_t hash;
+};
+static const struct custom_prop *var_index_head;
+static struct var_index_entry *var_index;
+static size_t var_index_capacity;
+
+static void var_index_clear(void) {
+    free(var_index);
+    var_index = NULL;
+    var_index_head = NULL;
+    var_index_capacity = 0;
+}
+
+static uint32_t var_name_hash(const char *name, size_t n) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < n; i++) hash = (hash ^ (unsigned char)name[i]) * 16777619u;
+    return hash;
+}
+
+static void var_index_prepare(const struct custom_prop *head) {
+    if (head == var_index_head) return;
+    var_index_clear();
+    var_index_head = head;
+    size_t count = 0, capacity = 1;
+    for (const struct custom_prop *v = head; v; v = v->next) {
+        if (count == SIZE_MAX / 2) return;
+        count++;
+    }
+    if (!count) return;
+    while (capacity < count * 2) {
+        if (capacity > SIZE_MAX / 2) return;
+        capacity *= 2;
+    }
+    if (capacity > SIZE_MAX / sizeof *var_index) return;
+    struct var_index_entry *entries = calloc(capacity, sizeof *entries);
+    if (!entries) return; /* An optional accelerator, not a style/OOM policy. */
+    for (const struct custom_prop *v = head; v; v = v->next) {
+        size_t length = strlen(v->name);
+        uint32_t hash = var_name_hash(v->name, length);
+        size_t slot = hash & (capacity - 1);
+        while (entries[slot].property) {
+            if (entries[slot].hash == hash && entries[slot].length == length &&
+                !memcmp(entries[slot].property->name, v->name, length)) break;
+            slot = (slot + 1) & (capacity - 1);
+        }
+        /* The first property in the immutable inheritance list wins. Values
+           may resolve in place, so retain the property, not a value snapshot. */
+        if (!entries[slot].property)
+            entries[slot] = (struct var_index_entry){v, length, hash};
+    }
+    var_index = entries;
+    var_index_capacity = capacity;
+}
+
 static const struct custom_prop *find_var(const struct custom_prop *v, const char *name, size_t n) {
+    var_index_prepare(v);
+    if (var_index) {
+        uint32_t hash = var_name_hash(name, n);
+        size_t slot = hash & (var_index_capacity - 1);
+        while (var_index[slot].property) {
+            const struct var_index_entry *entry = &var_index[slot];
+            if (entry->hash == hash && entry->length == n &&
+                !memcmp(entry->property->name, name, n)) return entry->property;
+            slot = (slot + 1) & (var_index_capacity - 1);
+        }
+        return NULL;
+    }
     for (; v; v = v->next)
         if (strlen(v->name) == n && !memcmp(v->name, name, n)) return v;
     return NULL;
@@ -2415,6 +2635,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
         if(s->display==D_CONTENTS)s->display=D_BLOCK; s->float_=FL_NONE;
     }
     css_style_finish(s, parent, e == d->html && !pseudo);
+    s->named_font=select_web_font(d,e,s,c->vw,c->vh);
     if (parent && parent->display == D_CONTENTS) {
         /* Inheritance uses the slot, while flex/grid blockification uses the
            nearest box-generating flat ancestor. A contents slot is not an
@@ -2463,6 +2684,21 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     /* presentational hints and the style attribute */
     struct hints h = {.n = 0, .a = &d->smem};
     if (!e->foreign || e->tag == T_svg) pres_hints(e, &h);
+    if (e->namespace_id == NS_SVG) {
+        static const char *const svg_properties[] = {
+            "fill", "fill-opacity", "fill-rule", "stroke", "stroke-opacity", "stroke-width",
+            "stroke-linecap", "stroke-linejoin", "stop-color", "stop-opacity", "color", "opacity",
+            "display", "visibility"
+        };
+        /* SVG presentation attributes participate at author specificity zero.
+           Only null-namespace, exact-case attributes are presentation attributes. */
+        for (size_t k = 0; k < sizeof svg_properties / sizeof *svg_properties; k++)
+            for (int i = 0; i < e->nattrs; i++) {
+                const struct attr *a = &e->attrs[i];
+                if (!a->namespace_uri && !strcmp(a->raw, svg_properties[k]))
+                    hint_value(&h, svg_properties[k], a->value);
+            }
+    }
     int depth = scope_depth(doc_node_root(e, false));
     for (int i = 0; i < h.n; i++) add_dent(&h.d[i], 1ull << 62, PE_NONE, depth);
     const char *sa = node_attr(e, "style");
@@ -2525,6 +2761,12 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
 }
 
 void css_cascade(web_doc *d, int vw, int vh) {
+    /* Keys borrow computed-style names. Never carry a previous document or
+       style-arena generation into this cascade; release on normal exit too. */
+    var_index_clear();
+    font_bindings_clear();font_faces_available=false;
+    for(int i=0;i<d->sty.sheets.n;i++)if(((sheet_t *)d->sty.sheets.v[i])->fonts){font_faces_available=true;break;}
+    for(struct web_font_resource *f=d->fonts;f;f=f->next)f->wanted=false;
     bool scripting = web_js_enabled(d);
     /* Rule indexing depends on the stylesheet snapshot/media environment,
        not on the current hover/active target, class attribute or inline style.
@@ -2550,6 +2792,8 @@ void css_cascade(web_doc *d, int vw, int vh) {
     if (d->root) clear_styles(d->root);
     struct cascade c = {d, 16, vw, vh, {0}};
     if (d->html) cascade_node(&c, d->html, NULL);
+    var_index_clear();
+    font_bindings_clear();
     sb_free(&c.vbuf);
     d->styled_w = vw;
     d->styled_h = vh;

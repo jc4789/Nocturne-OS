@@ -302,16 +302,68 @@ static void xml_escape(sbuf *b, const char *s, size_t n, bool attr) {
     }
 }
 
-static void svg_open(sbuf *b, node_t *n, const char *color, int view, bool root) {
+static void svg_paint_value(sbuf *b, const char *name, const struct svg_paint *paint, uint32_t current) {
+    sb_puts(b, name); sb_putc(b, ':');
+    if (paint->kind == SVG_PAINT_NONE) sb_puts(b, "none");
+    else if (paint->kind == SVG_PAINT_REF) {
+        sb_puts(b, "url("); xml_escape(b, paint->ref, strlen(paint->ref), true); sb_putc(b, ')');
+    } else {
+        uint32_t c = paint->color == COLOR_CURRENT ? current : paint->color;
+        char value[16]; snprintf(value, sizeof value, "#%06x", c & 0xffffff);
+        sb_puts(b, value);
+    }
+    sb_putc(b, ';');
+}
+
+static void svg_computed_style(sbuf *b, node_t *n, bool root) {
+    const style_t *st = n->style;
+    if (!st) return;
+    sb_puts(b, " style=\"");
+    const char *original = node_attr(n, "style");
+    /* Preserve codec-supported properties not yet represented by native CSS
+       (e.g. stroke dashes), then override only our computed painting subset. */
+    if (original) xml_escape(b, original, strlen(original), true);
+    sb_putc(b, ';');
+    svg_paint_value(b, "fill", &st->svg_fill, st->color);
+    svg_paint_value(b, "stroke", &st->svg_stroke, st->color);
+    uint32_t fc = st->svg_fill.color == COLOR_CURRENT ? st->color : st->svg_fill.color;
+    uint32_t sc = st->svg_stroke.color == COLOR_CURRENT ? st->color : st->svg_stroke.color;
+    float fa = st->svg_fill.kind == SVG_PAINT_COLOR ? (float)(fc >> 24) / 255 : 1;
+    float sa = st->svg_stroke.kind == SVG_PAINT_COLOR ? (float)(sc >> 24) / 255 : 1;
+    uint32_t stop = st->svg_stop_color == COLOR_CURRENT ? st->color : st->svg_stop_color;
+    char value[256];
+    static const char *const caps[] = {"butt", "round", "square"};
+    static const char *const joins[] = {"miter", "round", "bevel"};
+    char width[48];
+    snprintf(width, sizeof width, "%g%s", (double)(st->svg_stroke_width.pct ? st->svg_stroke_width.pct : st->svg_stroke_width.px), st->svg_stroke_width.pct ? "%" : "");
+    snprintf(value, sizeof value,
+        "fill-opacity:%g;stroke-opacity:%g;stroke-width:%s;fill-rule:%s;stroke-linecap:%s;stroke-linejoin:%s;stop-color:#%06x;stop-opacity:%g;",
+        (double)(fa * st->svg_fill_opacity), (double)(sa * st->svg_stroke_opacity), width,
+        st->svg_fill_rule ? "evenodd" : "nonzero", caps[st->svg_stroke_cap < 3 ? st->svg_stroke_cap : 0],
+        joins[st->svg_stroke_join < 3 ? st->svg_stroke_join : 0], stop & 0xffffff,
+        (double)(st->svg_stop_opacity * (float)(stop >> 24) / 255));
+    sb_puts(b, value);
+    /* Root opacity is composited once by paint.c, outside this atomic image. */
+    if (root) sb_puts(b, "opacity:1;");
+    sb_putc(b, '"');
+}
+
+static void svg_open(sbuf *b, node_t *n, const char *color, int view, bool root, bool computed) {
     sb_putc(b, '<');
     sb_puts(b, n->raw_name);
     bool xmlns = false;
+    char own_color[16];
+    if (computed && n->style) {
+        snprintf(own_color, sizeof own_color, "#%06x", n->style->color & 0xffffff);
+        color = own_color;
+    }
     for (int i = 0; i < n->nattrs; i++) {
         const char *attribute_name = n->attrs[i].raw;
         const char *ns = n->attrs[i].namespace_uri, *local = n->attrs[i].local;
         /* The codec recognizes literal prefixes, not DOM namespaces. A colon
            in an ordinary DOM attribute must not fabricate an XML/XLink one. */
         if (!ns && strchr(attribute_name, ':')) continue;
+        if (computed && n->style && !ns && !strcmp(attribute_name, "style")) continue;
         /* Lexbor already adjusted parsed SVG names. Preserve DOM spelling and
            never serialize arbitrary namespaced fill/viewBox as ordinary SVG. */
         if (ns) {
@@ -340,6 +392,7 @@ static void svg_open(sbuf *b, node_t *n, const char *color, int view, bool root)
         }
         sb_putc(b, '"');
     }
+    if (computed) svg_computed_style(b, n, root);
     if (root) {
         if (!xmlns) sb_puts(b, " xmlns=\"http://www.w3.org/2000/svg\"");
         if (!node_attr(n, "fill")) {
@@ -355,6 +408,7 @@ struct svg_walk {
     struct svg_walk *parent;
     node_t *node, *next;
     unsigned kind; /* 0=entry, 1=element, 2=use group, 3=virtual symbol */
+    bool instance; /* virtual use descendants retain their instance inheritance */
 };
 
 static bool svg_use_cycle(const struct svg_walk *f, node_t *target) {
@@ -378,6 +432,7 @@ static bool svg_ser(web_doc *d, sbuf *b, node_t *root, const char *color) {
         if (!f->kind) {
             if (n->type == N_TEXT) xml_escape(b, n->text, n->textlen, false);
             if (n->type != N_ELEM) goto pop;
+            if (!f->instance && n->style && n->style->display == D_NONE) goto pop;
             float viewbox[4];
             int view = n->tag == T_svg ? svg_viewbox(node_attr(n, "viewBox"), viewbox) : 0;
             if (view == 2) goto pop;
@@ -393,6 +448,7 @@ static bool svg_ser(web_doc *d, sbuf *b, node_t *root, const char *color) {
                 struct svg_walk *child = calloc(1, sizeof *child);
                 if (!child) { failed = true; break; }
                 child->parent = f; child->node = t;
+                child->instance = true;
                 if (!strcmp(t->name, "symbol")) { child->kind = 3; child->next = t->first; }
                 sb_puts(b, "<g");
                 const char *x = node_attr(n, "x"), *y = node_attr(n, "y");
@@ -408,16 +464,18 @@ static bool svg_ser(web_doc *d, sbuf *b, node_t *root, const char *color) {
                     const char *value = strstr(fill, "currentColor") ? color : fill;
                     sb_puts(b, " fill=\""); xml_escape(b, value, strlen(value), true); sb_putc(b, '"');
                 }
+                if (!f->instance) svg_computed_style(b, n, false);
                 sb_putc(b, '>'); f->kind = 2; active = child;
                 continue;
             }
-            svg_open(b, n, color, view, !f->parent);
+            svg_open(b, n, color, view, !f->parent, !f->instance);
             f->kind = 1; f->next = n->first;
         }
         if (f->next) {
             struct svg_walk *child = calloc(1, sizeof *child);
             if (!child) { failed = true; break; }
             child->node = f->next; child->parent = f;
+            child->instance = f->instance;
             f->next = f->next->next; active = child;
             continue;
         }
@@ -431,9 +489,10 @@ pop:
 }
 
 struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color) {
+    struct svg_cache *cached = NULL;
     for (int i = 0; i < d->svgs.n; i++) {
         struct svg_cache *c = d->svgs.v[i];
-        if (c->node == svg) return c;
+        if (c->node == svg) { cached = c; break; }
     }
     char hex[16];
     snprintf(hex, sizeof hex, "#%06x", color & 0xFFFFFF);
@@ -441,9 +500,24 @@ struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color) {
     if (!svg_ser(d, &b, svg, hex)) {
         sb_free(&b); web_js_console(d, 2, "SVG serialization traversal allocation failed"); return NULL;
     }
+    if (cached) {
+        if (cached->n == b.n && (!b.n || !memcmp(cached->src, b.p, b.n))) {
+            cached->used = true;
+            sb_free(&b); return cached;
+        }
+        char *source = b.p ? b.p : strdup("");
+        if (!source) { web_js_console(d, 2, "SVG source allocation failed"); return NULL; }
+        free(cached->src);
+        if (cached->img) image_free(cached->img);
+        cached->src = source; cached->n = b.n; cached->img = NULL;
+        cached->w = cached->h = 0;
+        cached->used = true;
+        return cached;
+    }
     struct svg_cache *c = calloc(1, sizeof *c);
     if (!c) { sb_free(&b); web_js_console(d, 2, "SVG cache allocation failed"); return NULL; }
     c->node = svg;
+    c->used = true;
     c->n = b.n;
     c->src = b.p ? b.p : strdup("");
     pv_push(&d->svgs, c);
@@ -510,6 +584,9 @@ static void pseudo_box(struct bctx *b, box_t *pb, node_t *e, style_t *ps) {
 }
 
 static void children(struct bctx *b, box_t *pb, node_t *e, style_t *st) {
+    /* Keep the principal box/background/border, but not the skipped contents.
+       The flat DOM and its computed styles remain available to find-in-page. */
+    if(st->content_visibility==CV_HIDDEN)return;
     if (st->before) pseudo_box(b, pb, e, st->before);
     pvec list = {0};
     doc_flat_children(e, &list);
@@ -670,6 +747,7 @@ static void gen(struct bctx *b, box_t *pb, node_t *n, style_t *pst) {
     }
     x->floated = st->float_ != FL_NONE;
     x->abspos = st->position == POS_ABSOLUTE || st->position == POS_FIXED;
+    if(st->content_visibility!=CV_VISIBLE && x->kind!=B_INLINE)x->is_bfc=true;
     if (!n->box) n->box = x;
     append(pb, x);
 }
@@ -837,8 +915,23 @@ static void clear_boxes(node_t *n) {
     }
 }
 
+static void unpublish_boxes(box_t *b) {
+    if(!b)return;
+    if(b->node && b->node->box==b){b->node->box=NULL;b->node->anchor_block=NULL;}
+    for(box_t *child=b->first;child;child=child->next)unpublish_boxes(child);
+}
+void boxes_discard(web_doc *d) {
+    if(!d)return;
+    /* Walk the OLD published tree too: a removed/adopted node need not occur
+       in the current DOM, but may still borrow this document's prior box. */
+    unpublish_boxes(d->root_box);d->root_box=NULL;d->abs_boxes.n=0;
+    if(d->root)clear_boxes(d->root); /* also clears an unpublished failed rebuild */
+    for(int i=0;i<web_dialog_count(d);i++)web_dialog_set_backdrop(d,web_dialog_at(d,i),NULL);
+    ar_free(&d->bmem);
+}
 void boxes_build(web_doc *d, arena_t *a) {
     struct bctx b = {.d=d, .a=a};
+    for (int i = 0; i < d->svgs.n; i++) ((struct svg_cache *)d->svgs.v[i])->used = false;
     if (d->root) clear_boxes(d->root);
     box_t *root = nbox(&b, B_BLOCK, NULL, anon_style(&b, NULL, D_BLOCK));
     root->anon = true;
@@ -859,4 +952,17 @@ void boxes_build(web_doc *d, arena_t *a) {
         }
         b.top=n; gen(&b,root,n,NULL); b.top=NULL;
     }
+    /* The new tree now owns only entries marked by real SVG generation.
+       Compact in place; no quota, replacement array, or stale-node retention. */
+    int retained = 0;
+    for (int i = 0; i < d->svgs.n; i++) {
+        struct svg_cache *cache = d->svgs.v[i];
+        if (cache->used) d->svgs.v[retained++] = cache;
+        else {
+            if (cache->img) image_free(cache->img);
+            free(cache->src);
+            free(cache);
+        }
+    }
+    d->svgs.n = retained;
 }

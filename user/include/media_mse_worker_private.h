@@ -64,8 +64,9 @@ size_t nmedia_mse_worker_quota(const nmedia_mse_worker *,unsigned);
 size_t nmedia_mse_worker_ranges(const nmedia_mse_worker *,unsigned,struct nmedia_time_range *,size_t);
 const struct nmedia_time_range *nmedia_mse_worker_ranges_view(const nmedia_mse_worker *,unsigned,size_t *);
 int nmedia_mse_worker_step(nmedia_mse_worker *,struct nmedia_output *);
-/* Taken, current-generation/revision VIDEO only. The legacy muxed control
- * payload requires no queued successor; the split lane is a separate owner.
+/* Taken, current-generation/revision VIDEO only. Both independent and muxed
+ * decoder VIDEO use the separate lane; its owner permits a queued successor.
+ * The retained control-payload compatibility path requires no successor.
  * Swap its completed owner for the caller's exclusively owned spare; capacity
  * is pixels, not bytes. No copy, wait, allocation or JS. */
 bool nmedia_mse_worker_move_video(nmedia_mse_worker *,const struct nmedia_output *,

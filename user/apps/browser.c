@@ -276,14 +276,8 @@ static void draw_toolbar(void) {
             gfx_text(c, cx - 4, cy - 7, "H", col, TRANSPARENT, FONT_SMALL);
         }
     }
-    const char *child_url = doc ? web_frame_address(doc) : NULL;
     int room = W - ADDR_X - 8;
-    if (focus != F_ADDR && child_url && *child_url && room >= 240) {
-        int parent_room = room / 3;
-        field(c, ADDR_X, 8, parent_room, 24, cur_url, false, 0, false);
-        gfx_text(c, ADDR_X + parent_room + 6, 12, "Frame:", UI_ACCENT2, TRANSPARENT, FONT_SMALL);
-        field(c, ADDR_X + parent_room + 60, 8, room - parent_room - 60, 24, child_url, false, 0, false);
-    } else field(c, ADDR_X, 8, room, 24, focus == F_ADDR ? addr : cur_url, focus == F_ADDR,
+    field(c, ADDR_X, 8, room, 24, focus == F_ADDR ? addr : cur_url, focus == F_ADDR,
                 focus == F_ADDR ? acur : 0, addr_all);
 }
 
@@ -884,6 +878,7 @@ static bool host_request(void *opaque, const struct web_request *request) {
         .headers = request->headers, .body = request->body, .body_len = request->body_len,
         .credentials = request->credentials, .force_preflight = request->force_preflight,
         .redirect_error = request->redirect_error, .same_origin = request->same_origin,
+        .no_cors = request->no_cors, .no_referrer = request->no_referrer,
         .image_upgrade = request->kind == WEB_RESOURCE_IMAGE && request->image_upgrade,
         .cache_mode = request->cache_mode, .keepalive = request->keepalive,
         .fetch_group = request->fetch_group
@@ -1594,7 +1589,7 @@ static int event_key_code(uint32_t key) {
     }
 }
 
-static bool dispatch_native(const char *type, web_node *target, const struct gui_event *e, bool cancelable) {
+static bool dispatch_native_mode(const char *type, web_node *target, const struct gui_event *e, bool cancelable, bool keyboard) {
     if (!doc || native_wait) return true;
     char key_text[8];
     struct web_event event = {
@@ -1606,11 +1601,20 @@ static bool dispatch_native(const char *type, web_node *target, const struct gui
         .key = e ? event_key(e->key, key_text) : "",
         .key_code = e ? event_key_code(e->key) : 0,
         .ctrl = e && (e->mods & NMOD_CTRL), .shift = e && (e->mods & NMOD_SHIFT),
-        .alt = e && (e->mods & NMOD_ALT)
+        .alt = e && (e->mods & NMOD_ALT), .keyboard_activation = keyboard
     };
     bool allowed = web_dispatch(doc, target, &event);
     flush_dom_layout();
     return allowed;
+}
+static bool dispatch_native(const char *type, web_node *target, const struct gui_event *e, bool cancelable) {
+    return dispatch_native_mode(type,target,e,cancelable,false);
+}
+static web_node *native_capture_target(const struct gui_event *e) {
+    if(!doc || native_wait || !e)return NULL;
+    struct web_event event={.x=e->x,.y=e->y-TB,.button=e->type==EV_MOUSE_MOVE?-1:0,.buttons=e->buttons,
+        .ctrl=(e->mods&NMOD_CTRL)!=0,.shift=(e->mods&NMOD_SHIFT)!=0,.alt=(e->mods&NMOD_ALT)!=0};
+    return web_pointer_capture_target(doc,&event);
 }
 
 static void page_focus(web_node *node) {
@@ -2013,10 +2017,10 @@ static void page_click(web_node *target, int x, int y, bool keyboard) {
     /* Author click listeners may reparent the target. Capture its first
        native link activation now, without changing the event target. */
     web_node *anchor = web_link_activation_anchor(doc,target);
-    struct gui_event native = {.x = x, .y = y, .buttons = 1};
+    struct gui_event native = {.x = x, .y = y, .buttons = 0};
     struct web_control_activation activation;
     web_control_activation_begin(doc, target, &activation);
-    bool allowed = dispatch_native("click", target, &native, true);
+    bool allowed = dispatch_native_mode("click", target, &native, true, keyboard);
     bool input_events = web_control_activation_end(doc, &activation, allowed);
     if (!allowed) { flush_dom_layout(); return; }
     if (!anchor && web_media_activate(doc,target)) { page_focus(target); flush_dom_layout(); return; }
@@ -2096,13 +2100,7 @@ static void mouse_down(const struct gui_event *e) {
     if (y < TB) {
         if (x >= ADDR_X) {
             if (focus != F_ADDR) {
-                const char *child_url = doc ? web_frame_address(doc) : NULL;
-                int room = w->w - ADDR_X - 8;
                 addr_focus();
-                if (child_url && room >= 240 && x >= ADDR_X + room / 3 + 60) {
-                    if (url_text_set(&address_text, child_url)) acur = strlen(addr);
-                    else console_add("error", "Frame address allocation failed");
-                }
             }
             else { /* place the caret */
                 addr_all = false;
@@ -2183,6 +2181,8 @@ static void mouse_move(const struct gui_event *e) {
         node = web_node_at(doc, document_x(e->x), e->y - TB + scroll_y);
     }
     if (doc && !native_wait && !web_script_running(doc)) {
+        web_node *captured=native_capture_target(e);
+        if(captured)node=captured;
         struct web_event event = {
             .x=e->x, .y=e->y-TB, .buttons=e->buttons,
             .ctrl=(e->mods & NMOD_CTRL)!=0, .shift=(e->mods & NMOD_SHIFT)!=0,
@@ -2201,7 +2201,7 @@ static void mouse_move(const struct gui_event *e) {
 static void handle(const struct gui_event *e) {
     switch (e->type) {
     case EV_CLOSE: quit = true; return;
-    case EV_UNFOCUS: web_active_release(doc);pressed_node=NULL;break;
+    case EV_UNFOCUS: web_pointer_cancel(doc);web_active_release(doc);pressed_node=NULL;break;
     case EV_KEY:
         if (!e->pressed) {
             if (focus == F_PAGE) dispatch_native("keyup", doc ? web_focused(doc) : NULL, e, false);
@@ -2218,10 +2218,17 @@ static void handle(const struct gui_event *e) {
         if(!(e->buttons&1))web_active_release(doc);
         else break; /* another button's release does not end the primary press */
         if (drag_sb) { drag_sb = false; pressed_node = NULL; break; }
-        if (doc && e->y >= TB && e->y < TB + page_h() && e->x < page_w()) {
-            web_node *target = web_node_at(doc, document_x(e->x), e->y - TB + scroll_y);
+        if (doc) {
+            web_node *capture=native_capture_target(e);
+            bool inside=e->y>=TB && e->y<TB+page_h() && e->x>=0 && e->x<page_w();
+            web_node *target=capture?capture:inside?web_node_at(doc,document_x(e->x),e->y-TB+scroll_y):NULL;
+            web_node *down = pressed_node;
             dispatch_native("mouseup", target, e, false);
-            if (pressed_node && target == pressed_node) page_click(target, e->x, e->y,false);
+            web_node *captured_click=web_pointer_capture_click_target(doc,target);
+            web_node *click_target = pressed_node ? captured_click?captured_click:web_pointer_click_target(doc,down,target) : NULL;
+            if(debug_js)fprintf(stderr,"[web-input:click] down=%p up=%p target=%p same=%d\n",
+                                (void *)down,(void *)target,(void *)click_target,down==target);
+            if (click_target) page_click(click_target, e->x, e->y,false);
         }
         pressed_node = NULL;
         break;

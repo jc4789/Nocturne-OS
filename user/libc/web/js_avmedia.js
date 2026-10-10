@@ -106,17 +106,14 @@ const avmediaBridge = (() => {
                     if(!native('load',node,blobBridge.bytes(blob),generation))throw new Error(native('state',node).error||'Unsupported Blob media');
                 } else if(native('range',node,url)) {
                     if(!native('loadURL',node,url,generation,forPlay&&s.intent===loadIntent))throw new Error(native('state',node).error||'Unsupported Range media input');
-                    let deadline=host.now()+30000;
                     for(;;) {
                         if(!current(node,s,generation,url)||controller.signal.aborted)throw abortError();
                         const now=native('state',node);
                         if(now.error)throw new Error(now.error);
                         if(now.readyState>=2&&!now.loading)break;
-                        /* Waiting for another HTML element's bounded child is
-                         * not a network request timeout. No additional child
-                         * or decoder reservation is held by this element. */
-                        if(now.queued)deadline=host.now()+30000;
-                        if(host.now()>=deadline){native('reset',node,generation);throw new Error('Native media metadata deadline exceeded');}
+                        /* Metadata progress is not a request timeout. Real
+                         * child/network errors and explicit cancellation above
+                         * terminate this load; elapsed GUI time must not reset it. */
                         await new Promise(resolve=>setTimeout(resolve,10));
                     }
                 } else {

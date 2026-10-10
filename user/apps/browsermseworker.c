@@ -127,29 +127,31 @@ int main(void){
             for(size_t i=0;i<count;i++)if(slots[i].buffer){
                 const struct nmedia_info *info=nmedia_mse_info(slots[i].buffer);if(!info)continue;
                 bool needed=(!enabled[0]&&!enabled[1])||(info->audio&&enabled[0])||(info->video&&enabled[1]);if(needed)active++;
-                /* Only independent video buffers use the split lane. Their
-                   already-owned image must not block decoding another AUDIO
-                   buffer. Muxed/video-first demux retains its existing order. */
+                /* A detached VIDEO does not borrow the decoder's storage.
+                   Independent video buffers can wait for the lane; a muxed
+                   decoder may still yield PCM behind the detached image.
+                   If it yields the next image, retain that decoder loan and
+                   stop advancing it until the existing lane packet drains. */
                 if(video.pending&&info->video&&!info->audio&&enabled[1])continue;
                 for(int budget=0;budget<16;budget++){
-                    if(!slots[i].pending.kind){int result=nmedia_mse_step(slots[i].buffer,&slots[i].pending);if(result==NMEDIA_ERROR){m=slots[i].buffer;ok=false;break;}if(result==NMEDIA_AGAIN){if(needed&&!nmedia_mse_waiting_for_input(slots[i].buffer))busy=true;break;}}
+                    if(!slots[i].pending.kind){int result=nmedia_mse_step_at(slots[i].buffer,&slots[i].pending,c.current);if(result==NMEDIA_ERROR){m=slots[i].buffer;ok=false;break;}if(result==NMEDIA_AGAIN){if(needed&&!nmedia_mse_waiting_for_input(slots[i].buffer))busy=true;break;}}
                     if((slots[i].pending.kind==NMEDIA_AUDIO&&!enabled[0])||(slots[i].pending.kind==NMEDIA_VIDEO&&!enabled[1])){
                         if(!enabled[0]&&!enabled[1]){int64_t end=slots[i].pending.pts_ms+(slots[i].pending.kind==NMEDIA_AUDIO?(int64_t)slots[i].pending.frames*1000/SOUND_RATE:40);memset(&slots[i].pending,0,sizeof slots[i].pending);slots[i].pending.kind=NMSW_CLOCK;slots[i].pending.pts_ms=end;break;}
                         slots[i].pending.kind=0;if(budget==15&&needed)busy=true;continue;}break;
                 }
                 if(!ok)break;if(!needed)continue;
-                if(slots[i].pending.kind==NMEDIA_END){ended++;continue;}if(!slots[i].pending.kind)continue;if(selected<0||slots[i].pending.pts_ms<slots[selected].pending.pts_ms)selected=i;
+                if(slots[i].pending.kind==NMEDIA_END){ended++;continue;}if(!slots[i].pending.kind)continue;
+                if(video.pending&&slots[i].pending.kind==NMEDIA_VIDEO)continue;
+                if(selected<0||slots[i].pending.pts_ms<slots[selected].pending.pts_ms)selected=i;
             }
-            /* Independent SourceBuffers may exhaust their input at different
-               PTS. An input wait must not suppress another buffer's decoded
-               output. Bounded decoder work still holds it: that decoder can
-               produce an earlier PTS before it next needs appended input. */
-            if(ok&&!busy&&selected>=0){r.slot=selected;output=slots[selected].pending;slots[selected].pending.kind=0;r.kind=output.kind;r.pts=output.pts_ms;r.frames=(uint32_t)output.frames;r.width=output.width;r.height=output.height;
+            /* An independent video decoder's preroll/catch-up work must not
+               hold already decoded PCM. Its retained video remains owned and
+               will be selected with its real PTS on a subsequent STEP. */
+            if(ok&&selected>=0&&(!busy||slots[selected].pending.kind==NMEDIA_AUDIO)){r.slot=selected;output=slots[selected].pending;slots[selected].pending.kind=0;r.kind=output.kind;r.pts=output.pts_ms;r.frames=(uint32_t)output.frames;r.width=output.width;r.height=output.height;
                 if(output.kind==NMEDIA_AUDIO)r.payload_bytes=(uint32_t)output.frames*4;
                 else if(output.kind==NMEDIA_VIDEO){
                     if(!nmedia_video_wire_bytes(output.width,output.height,&r.payload_bytes)){r.kind=NMEDIA_ERROR;strlcpy(r.error,"MSE video payload length is not representable",sizeof r.error);}
-                    else {const struct nmedia_info *info=nmedia_mse_info(slots[selected].buffer);
-                        if(info&&info->video&&!info->audio){
+                    else {
                             if(video.pending||!nmedia_mse_move_video(slots[selected].buffer,&output,&video.pixels,&video.capacity)){
                                 r.kind=NMEDIA_ERROR;r.payload_bytes=0;strlcpy(r.error,"MSE VIDEO owner transfer failed",sizeof r.error);
                             }else{
@@ -157,7 +159,6 @@ int main(void){
                                     .bytes=r.payload_bytes,.epoch=c.epoch,.revision=nmedia_mse_revision(slots[selected].buffer),.pts=output.pts_ms,.width=output.width,.height=output.height};
                                 video.pending=true;video.position=0;r.kind=NMSW_VIDEO_PENDING;r.payload_bytes=0;
                             }
-                        }
                     }
                 }}
             else if(ok&&active&&ended==active&&!video.pending){r.kind=NMEDIA_END;}

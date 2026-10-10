@@ -25,7 +25,7 @@ static uint32_t GEN;
 wfont style_font(const style_t *st) {
     wfont f = {NULL, st->font_size, st->font_weight >= 600};
     int idx = (f.bold ? FONT_BOLD : 0) | (st->font_style ? FONT_ITALIC : 0);
-    f.ttf = font_family(st->font_family, idx);
+    f.ttf = st->named_font ? st->named_font : font_family(st->font_family, idx);
     if (!f.ttf) f.ttf = font_ui(FONT_REGULAR);
     return f;
 }

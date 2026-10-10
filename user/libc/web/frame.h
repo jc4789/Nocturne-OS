@@ -15,6 +15,8 @@ struct web_frame {
     bool notified, detached, failed, initial_failed;
     canvas_t paint;
     bool paint_failed;
+    bool paint_visible;
+    int paint_x,paint_y,viewport_w,viewport_h; /* crop offset; CSS viewport is unchanged */
     int scroll_x, scroll_y;
 };
 bool web_frame_element(const node_t *node);

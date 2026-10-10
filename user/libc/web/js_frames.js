@@ -35,6 +35,7 @@
                 get(_,key){
                     if(key==='window'||key==='self'||key==='frames')return proxy;
                     if(key==='parent'||key==='top')return windowProxy(access(key,token));
+                    if(key==='opener')return access('opener',token);
                     if(key==='closed'||key==='length'||key==='frameElement')return access(key,token);
                     if(key==='location')return locationProxy(token);
                     if(key===Symbol.toStringTag)return 'Window';
@@ -59,7 +60,7 @@
                     if(typeof key==='symbol')return false;
                     return access('set',token,key,value);
                 },
-                has(_,key){if(['window','self','frames','parent','top','closed','length','location','postMessage'].includes(key))return true;return typeof key==='string'&&access('has',token,key);},
+                has(_,key){if(['window','self','frames','parent','top','opener','closed','length','location','postMessage'].includes(key))return true;return typeof key==='string'&&access('has',token,key);},
                 defineProperty(){throw new DOMException('WindowProxy property definition is not implemented','NotSupportedError');},
                 setPrototypeOf(){return false;},preventExtensions(){return false;}
             });proxy=access('proxySet',token,proxy);proxies.set(token,proxy);return proxy;
@@ -83,6 +84,9 @@
         Object.defineProperty(document,'defaultView',{configurable:true,get(){return host.frame('top',selfToken)===selfToken?globalThis:windowProxy(selfToken);}});
         Object.defineProperty(Document.prototype,'defaultView',{configurable:true,get(){if(rawDom('get',this,'nodeType')!==9)throw new TypeError('Document receiver required');return this===document?document.defaultView:null;}});
         Object.defineProperties(globalThis,{
+            // Native new windows are independent, never fake opener proxies.
+            // Child browsing contexts likewise have no opener relationship.
+            opener:{configurable:true,enumerable:true,get(){return null;},set(value){if(value!==null)Object.defineProperty(this,'opener',{value,writable:true,enumerable:true,configurable:true});}},
             parent:{configurable:true,get(){const token=host.frame('parent',selfToken);return token===selfToken?globalThis:windowProxy(token);}},
             top:{configurable:true,get(){const token=host.frame('top',selfToken);return token===selfToken?globalThis:windowProxy(token);}},
             frameElement:{configurable:true,get(){return access('frameElement',selfToken);}},

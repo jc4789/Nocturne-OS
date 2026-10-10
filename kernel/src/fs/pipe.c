@@ -3,34 +3,53 @@
 #include "mm/heap.h"
 #include "arch/cpu.h"
 
-#define PIPE_SIZE 16384
+#define PIPE_SEGMENT_SIZE 16384 /* allocation/copy granularity, not a capacity ceiling */
+
+struct pipe_segment {
+    struct pipe_segment *next;
+    size_t read_at, write_at;
+    uint8_t bytes[PIPE_SEGMENT_SIZE];
+};
 
 struct pipe {
-    uint8_t buf[PIPE_SIZE];
-    uint32_t head, tail, count;
+    struct pipe_segment *head, *tail;
+    size_t count;
     int readers, writers;
     struct wait_queue rq, wq;
 };
 
+static struct pipe_segment *pipe_segment_new(void){
+    struct pipe_segment *s=kmalloc(sizeof *s);
+    if(s){s->next=NULL;s->read_at=s->write_at=0;}
+    return s;
+}
+
 static int64_t pipe_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
     struct pipe *p = v->priv;
     uint8_t *out = buf;
+    size_t done=0;
+    if(!n)return 0;
     for (;;) {
         uint64_t fl = irq_save();
         if (p->count > 0) {
-            /* One bounded ring read has at most two contiguous segments.
-               Keep the existing IRQ/wake boundary, not a per-byte update. */
-            size_t got = n < p->count ? n : p->count;
-            size_t first = got < PIPE_SIZE - p->tail ? got : PIPE_SIZE - p->tail;
-            if (first) memcpy(out, p->buf + p->tail, first);
-            if (got > first) memcpy(out + first, p->buf, got - first);
-            p->tail = (p->tail + got) % PIPE_SIZE;
+            struct pipe_segment *s=p->head;
+            size_t available=s->write_at-s->read_at;
+            size_t got = n-done < available ? n-done : available;
+            memcpy(out+done,s->bytes+s->read_at,got);
+            s->read_at+=got;
             p->count -= got;
+            done+=got;
+            if(s->read_at==s->write_at){
+                if(s!=p->tail){p->head=s->next;kfree(s);}
+                else s->read_at=s->write_at=0; /* reuse the empty final owner */
+            }
             wq_wake_all(&p->wq);
             poll_notify();
             irq_restore(fl);
-            return got;
+            if(done==n)return (int64_t)done;
+            continue;
         }
+        if(done){irq_restore(fl);return (int64_t)done;}
         if (p->writers == 0) {
             irq_restore(fl);
             return 0; /* EOF */
@@ -58,30 +77,36 @@ static int64_t pipe_write(struct vnode *v, struct file *f, const void *buf, uint
             irq_restore(fl);
             return done ? (int64_t)done : -EPIPE;
         }
-        if (p->count < PIPE_SIZE) {
-            size_t space = PIPE_SIZE - p->count;
-            size_t put = n - done < space ? n - done : space;
-            size_t first = put < PIPE_SIZE - p->head ? put : PIPE_SIZE - p->head;
-            if (first) memcpy(p->buf + p->head, in + done, first);
-            if (put > first) memcpy(p->buf, in + done + first, put - first);
-            p->head = (p->head + put) % PIPE_SIZE;
+        if(current_task->killed){
+            irq_restore(fl);
+            return done?(int64_t)done:-EINTR;
+        }
+        if(n-done>SIZE_MAX-p->count){irq_restore(fl);return done?(int64_t)done:-EINVAL;}
+        size_t committed=0;int error=0;
+        /* Grow only by the segment receiving actual bytes. Existing owners
+           never move. At most one segment allocation and the former 16 KiB
+           copy quantum occur per IRQ boundary, even for a large VIDEO.
+           Writes within that quantum retain their original atomic boundary. */
+        while(done<n&&committed<PIPE_SEGMENT_SIZE){
+            struct pipe_segment *s=p->tail;
+            if(s->write_at==PIPE_SEGMENT_SIZE){
+                struct pipe_segment *next=pipe_segment_new();
+                if(!next){error=-ENOMEM;break;}
+                s->next=next;p->tail=s=next;
+            }
+            size_t put=MIN(n-done,MIN(PIPE_SEGMENT_SIZE-s->write_at,PIPE_SEGMENT_SIZE-committed));
+            memcpy(s->bytes+s->write_at,in+done,put);
+            s->write_at+=put;
             p->count += put;
             done += put;
+            committed+=put;
+        }
+        if(committed){
             wq_wake_all(&p->rq);
             poll_notify();
-            irq_restore(fl);
-            continue;
         }
-        if (f->flags & O_NONBLOCK) {
-            irq_restore(fl);
-            return done ? (int64_t)done : -EAGAIN;
-        }
-        if (current_task->killed) {
-            irq_restore(fl);
-            return done ? (int64_t)done : -EINTR;
-        }
-        wq_wait(&p->wq);
         irq_restore(fl);
+        if(error)return done?(int64_t)done:error;
     }
     return done;
 }
@@ -93,7 +118,10 @@ static bool pipe_can_read(struct vnode *v, struct file *f) {
 
 static bool pipe_can_write(struct vnode *v, struct file *f) {
     struct pipe *p = v->priv;
-    return p->count < PIPE_SIZE || p->readers == 0;
+    /* Full current storage is not backpressure: the next write can grow it.
+       poll must allow that attempt, without allocating or guessing OOM here.
+       A closed reader is writable readiness for the real EPIPE result. */
+    return p->count < SIZE_MAX || p->readers == 0;
 }
 
 static void pipe_close(struct vnode *v, struct file *f) {
@@ -108,6 +136,8 @@ static void pipe_close(struct vnode *v, struct file *f) {
 }
 
 static void pipe_release(struct vnode *v) {
+    struct pipe *p=v->priv;
+    for(struct pipe_segment *s=p->head;s;){struct pipe_segment *next=s->next;kfree(s);s=next;}
     kfree(v->priv);
     kfree(v);
 }
@@ -124,8 +154,10 @@ static struct vnode_ops pipe_ops = {
 int pipe_create(struct file **rd, struct file **wr) {
     struct vnode *v = kzalloc(sizeof *v);
     struct pipe *p = kzalloc(sizeof *p);
-    if (!v || !p) {
+    if(p)p->head=p->tail=pipe_segment_new();
+    if (!v || !p || !p->head) {
         kfree(v);
+        if(p)kfree(p->head);
         kfree(p);
         return -ENOMEM;
     }
@@ -137,6 +169,8 @@ int pipe_create(struct file **rd, struct file **wr) {
     p->readers = 1;
     p->writers = 1;
     *rd = vfs_open_vnode(v, O_RDONLY);
+    if(!*rd){pipe_release(v);*wr=NULL;return -ENOMEM;}
     *wr = vfs_open_vnode(v, O_WRONLY);
+    if(!*wr){vfs_close(*rd);*rd=NULL;return -ENOMEM;}
     return 0;
 }

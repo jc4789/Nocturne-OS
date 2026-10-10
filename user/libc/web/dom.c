@@ -304,7 +304,7 @@ static void textarea_changed(node_t *n) {
         if (n->type == N_ELEM && !n->foreign && n->tag == T_textarea && !n->value_dirty) n->control_ready = false;
 }
 
-static void changed(web_doc *d, node_t *n, bool resources) {
+static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recascade, bool boxes) {
     if (!d) return;
     d->dom_revision++;
     if (d->js_nodes_dirty) { d->js_nodes_dirty = false; web_js_nodes_changed(d); }
@@ -319,20 +319,22 @@ static void changed(web_doc *d, node_t *n, bool resources) {
         if (resources && !n->foreign && n->tag == T_img) d->resources_dirty = d->dirty = true;
         textarea_changed(n); return;
     }
-    d->dirty = d->need_style = true;
+    d->dirty = true;
+    if(recascade)d->need_style=true;
+    if(boxes){d->need_boxes=true;d->layout_valid=false;}
     if (resources) d->resources_dirty = true;
     d->find_node = NULL;
     d->find_run = NULL;
     web_dialog_sync(d);
     textarea_changed(n);
-    /* SVG cache source and the box tree are snapshots, not a second DOM. */
-    for (int i = 0; i < d->svgs.n; i++) {
-        struct svg_cache *s = d->svgs.v[i];
-        if (s->img) image_free(s->img);
-        free(s->src);
-        free(s);
-    }
-    d->svgs.n = 0;
+    /* Keep SVG raster ownership until the next box publication. doc_svg
+       serializes the real DOM/computed paint on every rebuild and compares
+       the complete source before reusing pixels. A mutation outside an SVG
+       must not discard every icon; removed/hidden entries are swept after
+       boxes_build has stopped borrowing the old cache pointers. */
+}
+static void changed(web_doc *d,node_t *n,bool resources) {
+    changed_geometry(d,n,resources,true,false);
 }
 void doc_mutated(web_doc *d, node_t *n) {
     if (d && !n) d->js_nodes_dirty = true;
@@ -375,7 +377,7 @@ static void structure_changed_lifetime(web_doc *d, node_t *parent, node_t *subtr
     cssom_style_text_changed(parent);
     if (lifetime_changed) cssom_style_lifecycle(subtree);
     if (d && lifetime_changed) d->js_nodes_dirty = true;
-    changed(d, parent, resource_ancestor(parent) || resource_subtree(subtree));
+    changed(d, parent, parent->type==N_DOC || resource_ancestor(parent) || resource_subtree(subtree));
 }
 static void structure_changed(web_doc *d, node_t *parent, node_t *subtree) {
     structure_changed_lifetime(d, parent, subtree, true);
@@ -472,6 +474,27 @@ node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text
         n->text = ar_strndup(&d->mem, text ? text : "", text ? len : 0);
         n->textlen = text ? len : 0;
     }
+    d->mem.trap = old;
+    return n;
+}
+
+node_t *doc_doctype_create(web_doc *d, const char *name, size_t name_len,
+    const char *public_id, size_t public_len, const char *system_id, size_t system_len) {
+    if (!d || !name || name_len == SIZE_MAX || public_len == SIZE_MAX || system_len == SIZE_MAX ||
+        (public_len && !public_id) || (system_len && !system_id)) return NULL;
+    /* DOM doctype names are not XML QNames. Empty names are permitted; their
+       only forbidden code points are ASCII whitespace, NUL and '>'. */
+    for (size_t i = 0; i < name_len; i++)
+        if (!name[i] || name[i] == '>' || name[i] == ' ' || name[i] == '\t' ||
+            name[i] == '\n' || name[i] == '\r' || name[i] == '\f') return NULL;
+    node_t *n = doc_node_create(d, N_DOCTYPE, name, NULL, 0);
+    if (!n) return NULL;
+    jmp_buf trap; jmp_buf *old = d->mem.trap; d->mem.trap = &trap;
+    if (setjmp(trap)) { d->mem.trap = old; return NULL; }
+    n->public_id = ar_strndup(&d->mem, public_id ? public_id : "", public_len);
+    n->system_id = ar_strndup(&d->mem, system_id ? system_id : "", system_len);
+    n->public_id_len = public_len; n->system_id_len = system_len;
+    n->doctype_identifiers_sized = true;
     d->mem.trap = old;
     return n;
 }
@@ -826,8 +849,48 @@ static bool assignment_structure(node_t *p, node_t *c) {
     return c->type == N_ELEM && doc_node_root(p, false)->shadow_host;
 }
 
+/* Private status: 0 valid, 1 hierarchy, 2 reference-not-found. This performs
+   no adoption, detach, Range migration or observer delivery. Validate a whole
+   fragment before moving its first child, including Document's order rules. */
+static int insertion_validity(node_t *p, node_t *c, node_t *before, node_t *replaced) {
+    if (!p || !c || (p->type != N_DOC && p->type != N_ELEM && p->type != N_FRAGMENT) ||
+        c->type == N_DOC || c->type == N_ATTR || c->shadow_host) return 1;
+    for (node_t *a = p; a; a = a->parent ? a->parent : a->shadow_host ? a->shadow_host : a->template_host)
+        if (a == c) return 1;
+    if (before && before->parent != p) return 2;
+    if (before == c) before = c->next;
+    if (p->type != N_DOC) return c->type == N_DOCTYPE ? 1 : 0;
+    node_t *first = c->type == N_FRAGMENT ? c->first : c;
+    unsigned elements = 0, doctypes = 0;
+    for (node_t *n = first; n; n = c->type == N_FRAGMENT ? n->next : NULL) {
+        if (n->type == N_TEXT || n->type == N_DOC || n->type == N_ATTR || n->type == N_FRAGMENT) return 1;
+        if (n->type == N_ELEM && ++elements > 1) return 1;
+        if (n->type == N_DOCTYPE && ++doctypes > 1) return 1;
+    }
+    if (c->type == N_FRAGMENT && doctypes) return 1;
+    bool preceding = true;
+    for (node_t *n = p->first; n; n = n->next) {
+        if (n == before) preceding = false;
+        if (n == c || n == replaced) continue;
+        if (elements && (n->type == N_ELEM || (!preceding && n->type == N_DOCTYPE))) return 1;
+        if (doctypes && (n->type == N_DOCTYPE || (preceding && n->type == N_ELEM))) return 1;
+    }
+    return 0;
+}
+
+int doc_node_insert_validity(node_t *p, node_t *c, node_t *before) {
+    return insertion_validity(p,c,before,NULL);
+}
+
+int doc_node_replace_validity(node_t *p, node_t *c, node_t *old) {
+    /* Do not remove Document's old root merely to make insertion validation
+       pass. Its exclusion is part of validation, before any tree mutation. */
+    if(!old)return 2;
+    return insertion_validity(p,c,old,old);
+}
+
 bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
-    if (!d || !p || !c || p->owner != d || (before && before->parent != p)) return false;
+    if (!d || !p || !c || p->owner != d || doc_node_insert_validity(p, c, before)) return false;
     (d->dom_family ? d->dom_family : d)->profile.inserts++;
     if (before == c) return true;
     if (c->type == N_FRAGMENT) {
@@ -887,6 +950,18 @@ void doc_node_remove(web_doc *d, node_t *n) {
     if (assignment_changed) doc_shadow_reassign(d);
     web_select_inserted(d, n, p);
     if (select) web_select_sync(select->owner, select, false);
+}
+
+bool doc_node_replace(web_doc *d, node_t *p, node_t *c, node_t *old) {
+    if(!d || !p || p->owner!=d || doc_node_replace_validity(p,c,old))return false;
+    node_t *reference=old->next;
+    if(reference==c)reference=c->next;
+    /* Adoption reserves a needed template owner before detaching its source.
+       Complete that potentially failing work BEFORE removing the old child.
+       Subsequent moves already have the destination document as their owner. */
+    if(!doc_node_adopt(d,c))return false;
+    if(old->parent)doc_node_remove(d,old);
+    return doc_node_move(d,p,c,reference);
 }
 
 static void adopt_subtree(web_doc *d, node_t *root) {
@@ -968,28 +1043,61 @@ bool doc_templates_finish(web_doc *d, node_t *root) {
     return true;
 }
 
+static bool ordinary_text_geometry(node_t *n) {
+    /* The conservative boundary keeps control/resource, SVG serialization and
+       slot/shadow assignment styling on their established full-cascade path. */
+    for(node_t *p=n;p;p=p->parent) {
+        if(p->foreign || p->shadow_root || p->shadow_host || p->assigned_slot || p->manual_slot)return false;
+        if(p->type==N_ELEM) switch(p->tag) {
+        case T_style:case T_title:case T_script:case T_input:case T_textarea:
+        case T_select:case T_option:case T_slot:return false;
+        default:break;
+        }
+    }
+    return true;
+}
 bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
     if (!d || !n || len == SIZE_MAX || (len && !text)) return false;
     if (n->type == N_ATTR) return doc_attr_value(d, n, text);
     if (n->type == N_DOC || n->type == N_DOCTYPE) return true;
+    bool resources=resource_ancestor(n),ordinary=!resources && ordinary_text_geometry(n);
+    bool keep_style=false,rebuild_boxes=false,was_need_style=d->need_style;
     doc_dom_budget(d);
     if (n->type == N_TEXT || n->type == N_COMMENT || n->type == N_PI) {
-        jmp_buf trap;
-        jmp_buf *old = d->mem.trap;
-        d->mem.trap = &trap;
-        if (setjmp(trap)) { d->mem.trap = old; return false; }
-        char *v = ar_strndup(&d->mem, text, len);
-        n->text = v;
-        n->textlen = len;
-        d->mem.trap = old;
+        bool same=n->textlen==len && (!len || (n->text && !memcmp(n->text,text,len)));
+        keep_style=ordinary && (n->type!=N_TEXT || ((n->textlen!=0)==(len!=0)));
+        rebuild_boxes=keep_style && n->type==N_TEXT && !same;
+        /* Same-value CharacterData still goes through mutation/revision hooks.
+           Only its identical native string/storage/geometry can be reused. */
+        if(!same) {
+            jmp_buf trap;
+            jmp_buf *old = d->mem.trap;
+            d->mem.trap = &trap;
+            if (setjmp(trap)) { d->mem.trap = old; return false; }
+            char *v = ar_strndup(&d->mem, text, len);
+            n->text = v;
+            n->textlen = len;
+            d->mem.trap = old;
+        }
     } else {
+        bool had_text=false,text_children=true;
+        for(node_t *child=n->first;child;child=child->next) {
+            if(child->type==N_TEXT){if(child->textlen)had_text=true;}
+            else if(child->type!=N_COMMENT && child->type!=N_PI){text_children=false;break;}
+        }
+        keep_style=ordinary && text_children && (had_text==(len!=0));
         node_t *t = len ? doc_node_create(d, N_TEXT, NULL, text, len) : NULL;
         if (len && !t) return false;
         while (n->first) doc_node_remove(d, n->first);
         if (t && !doc_node_move(d, n, t, NULL)) return false;
+        /* Keep real replacement identities, Range adjustments and all native
+           insertion/removal notifications. No author callback runs inside the
+           text-only transaction, so its selector-invariant invalidations can
+           be downgraded without clearing an already pending cascade. */
+        if(keep_style){d->need_style=was_need_style;rebuild_boxes=true;}
     }
     cssom_style_text_changed(n);
-    changed(d, n, resource_ancestor(n));
+    changed_geometry(d,n,resources,!keep_style,rebuild_boxes);
     return true;
 }
 
@@ -1109,8 +1217,11 @@ static node_t *clone_one(web_doc *d, node_t *n) {
         /* Doctype strings are arena-owned like ordinary attributes. */
         jmp_buf trap; jmp_buf *old = d->mem.trap; d->mem.trap = &trap;
         if (setjmp(trap)) { d->mem.trap = old; return NULL; }
-        c->public_id = ar_strdup(&d->mem, n->public_id ? n->public_id : "");
-        c->system_id = ar_strdup(&d->mem, n->system_id ? n->system_id : "");
+        c->public_id_len = n->doctype_identifiers_sized ? n->public_id_len : n->public_id ? strlen(n->public_id) : 0;
+        c->system_id_len = n->doctype_identifiers_sized ? n->system_id_len : n->system_id ? strlen(n->system_id) : 0;
+        c->public_id = ar_strndup(&d->mem, n->public_id ? n->public_id : "", c->public_id_len);
+        c->system_id = ar_strndup(&d->mem, n->system_id ? n->system_id : "", c->system_id_len);
+        c->doctype_identifiers_sized = true;
         d->mem.trap = old;
     }
     if (!clone_attributes(d, c, n)) return NULL;

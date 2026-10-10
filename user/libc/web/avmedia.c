@@ -364,7 +364,14 @@ static bool present_ahead(struct web_avmedia *s,uint64_t now) {
     if(!s->ahead.kind)return true;
     if(s->ahead_generation!=s->generation||(s->mse_active&&s->ahead_revision!=nmedia_mse_worker_revision(s->mse_worker,(unsigned)s->ahead_slot))){advance_ahead(s);return true;}
     if(s->ahead.pts_ms>current(s,now)+5)return true;
-    if(s->pixels&&s->ahead.pts_ms<current(s,now)-100){s->dropped_video_frames++;advance_ahead(s);return true;}
+    int64_t due=current(s,now)+5;
+    struct web_video_ahead *next=s->ahead_next;
+    bool newer=(s->pending.kind==NMEDIA_VIDEO&&s->pending.pts_ms>s->ahead.pts_ms&&s->pending.pts_ms<=due)||
+        (next&&next->generation==s->generation&&next->output.pts_ms>s->ahead.pts_ms&&next->output.pts_ms<=due&&
+         (!s->mse_active||next->revision==nmedia_mse_worker_revision(s->mse_worker,(unsigned)next->slot)));
+    /* A late but unique real image is still the only image we can present.
+       Drop it only for an actually owned, due, newer decoded picture. */
+    if(newer){s->dropped_video_frames++;advance_ahead(s);return true;}
     if(!s->video_enabled){advance_ahead(s);return true;}
     size_t count;
     if(s->ahead.pixels!=s->ahead_pixels||!nmedia_video_size(s->ahead.width,s->ahead.height,&count,NULL)||count>s->ahead_capacity){strlcpy(s->error,"invalid owned video span",sizeof s->error);return false;}
@@ -694,7 +701,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
     if(uptime_ms()>=mse_until)return;
     struct nmedia_worker_budget range_budget={.until=mse_until,.tx_bytes=65536};
     if(s->url_input&&s->error[0]){if(s->worker)range_failed(s,s->error);return;}
-    if(!cooperative&&s->url_input&&s->range_waiting&&!s->worker&&nmedia_worker_available()){
+    if(!cooperative&&s->url_input&&s->range_waiting&&!s->worker){
         /* Revalidate after an idle element is resumed. An adopted/removed
          * document cannot reuse a stale origin grant or asynchronous handle. */
         if(!range_node(s->doc,s->node,s->range_url)){
@@ -706,6 +713,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
         s->input_size=NMEDIA_HTTP_CACHE_BYTES;
     }
     if(s->mse_worker){
+        nmedia_mse_worker_time(s->mse_worker,current(s,now));
         nmedia_mse_worker_pump_budget(s->mse_worker,now,mse_until);
         const char *error=nmedia_mse_worker_error(s->mse_worker);if(*error){strlcpy(s->error,error,sizeof s->error);s->mse_quota_error=nmedia_mse_worker_quota_error(s->mse_worker);s->mse_preparing=false;if(!s->mse_quota_error){s->mse_resume_needed=false;s->base_ms=current(s,now);s->playing=false;close_audio(s);}s->doc->dirty=true;return;}
         if(s->mse_quota_error){s->mse_quota_error=false;s->error[0]=0;}
@@ -718,12 +726,14 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
             if(revision!=s->mse[i].revision_seen){
                 if(s->ahead.kind&&s->ahead_slot==i&&s->ahead_revision!=revision)clear_ahead(s);
                 if(s->pending.kind&&s->mse_pending_slot==i&&s->mse_pending_revision!=revision){s->pending.kind=0;s->audio_at=0;}
-                if(s->mse[i].audio_owner||(info&&info->audio)){s->base_ms=current(s,now);s->started=now;close_audio(s);if(s->playing&&!audio_open(s))s->playing=false;}
+                if(s->mse[i].audio_owner||(info&&info->audio)){s->base_ms=current(s,now);s->started=now;close_audio(s);if(s->playing&&!s->mse_seeking&&!audio_open(s))s->playing=false;}
                 s->mse[i].revision_seen=revision;
             }s->mse[i].audio_owner=info&&info->audio;
         }
         if(!s->ready)for(size_t i=0;i<s->mse_count;i++)if(nmedia_mse_worker_info(s->mse_worker,(unsigned)i)){s->ready=1;break;}
-        if(s->mse_seeking){if(nmedia_mse_worker_seeking(s->mse_worker))return;s->mse_seeking=false;s->started=now;if(s->playing&&!audio_open(s)){s->playing=false;return;}}
+        /* The SEEK ACK only moves packet cursors. An unbuffered seek still
+           needs appended bytes and real decoded output before seeked. */
+        if(s->mse_seeking&&nmedia_mse_worker_seeking(s->mse_worker))return;
         if(mse_prepare_pump(s,mse_until,cooperative))return;
         /* A paused loaded element services append/remove/abort ACKs above,
            but must not consume decoder output behind the retained position. */
@@ -742,9 +752,10 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
             if(!queued&&!s->starved){s->base_ms=current(s,now);s->starved=true;s->ready=1;s->doc->dirty=true;}return;
         }
         if(r==NMEDIA_AUDIO||r==NMEDIA_VIDEO||r==NMSW_CLOCK){
+            s->mse_seeking=false;
             s->ready=2;if(s->starved){s->starved=false;s->started=now;if(s->playing&&s->fd<0&&!audio_open(s)){s->playing=false;return;}}
             if(r==NMEDIA_VIDEO&&!s->playing){if(!present(s))return;}
-        }
+        }else if(r==NMEDIA_END)s->mse_seeking=false;
     }
     if(s->worker) {
         bool was_seeking=nmedia_worker_seeking(s->worker);
@@ -813,9 +824,8 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
                     continue;
                 }return;
             }
-            /* Keep decoding reference frames, but do not spend full document
-             * paint/layout work displaying a backlog of obsolete frames. */
-            if(s->pixels&&s->pending.pts_ms<current(s,now)-100){s->dropped_video_frames++;s->pending.kind=0;continue;}
+            /* No newer decoded image is available here. Never suppress the
+               only real frame merely because its transport was late. */
             if(!present(s)){s->base_ms=current(s,now);s->playing=false;close_audio(s);s->doc->dirty=true;return;}
             s->pending.kind=0;
         }else if(s->pending.kind==NMEDIA_AUDIO){
@@ -938,12 +948,14 @@ void web_avmedia_service(uint64_t now){
     if(service_clock_set&&start>=service_at&&start-service_at<10)return;
     service_at=start;service_clock_set=true;service_running=true;
     /* Shared across every context: one existing live MSE/Range child, not one new
-     * 2ms allowance per iframe. Candidate scanning itself is bounded and fair.
+     * 2ms allowance per iframe. Candidate scanning visits at most one real
+     * registry cycle and shares that elapsed allowance, not a fixed 16-owner
+     * quota that delays media behind unrelated idle elements.
      * Supply changes private media state; an already committed, safe video
      * layer may then publish an independent patch without DOM/JS/layout. */
     uint64_t until=start+2;
     struct web_avmedia *first=service_cursor&&service_cursor->next?service_cursor->next:streams,*s=first;
-    for(unsigned scanned=0;s&&scanned<16&&uptime_ms()<until;scanned++){
+    while(s&&uptime_ms()<until){
         service_cursor=s;
         if((s->playing||s->mse_preparing)&&s->doc&&s->doc->live&&s->node&&
            (s->node->owner==s->doc||(s->node->owner&&s->node->owner->dom_family==s->doc))&&

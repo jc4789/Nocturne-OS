@@ -36,7 +36,15 @@
                 return made;
             }
             createDocument(){if(!implementationBrands.has(this))throw new TypeError('Illegal DOMImplementation receiver');throw new DOMException('XML documents are not implemented','NotSupportedError');}
-            createDocumentType(){if(!implementationBrands.has(this))throw new TypeError('Illegal DOMImplementation receiver');throw new DOMException('DocumentType creation is not implemented','NotSupportedError');}
+            createDocumentType(name,publicId,systemId){
+                const owner=implementationBrands.get(this);
+                if(!owner)throw new TypeError('Illegal DOMImplementation receiver');
+                if(arguments.length<3)throw new TypeError('Three doctype arguments are required');
+                name=string(name);publicId=string(publicId);systemId=string(systemId);
+                if(/[\0\t\n\f\r >]/.test(name))throw new DOMException('Invalid doctype name','InvalidCharacterError');
+                return rawDom('doctypeCreate',owner,name,publicId,systemId);
+            }
+            hasFeature(){if(!implementationBrands.has(this))throw new TypeError('Illegal DOMImplementation receiver');return true;}
         }
         Object.defineProperty(Document.prototype,'implementation',{configurable:true,get(){
             brand(this);let implementation=implementations.get(this);

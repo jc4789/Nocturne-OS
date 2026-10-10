@@ -1022,6 +1022,22 @@ static void free_values(node_t *n) {
     }
 }
 
+struct web_font_resource *doc_font_resource(web_doc *d,const char *url) {
+    if(!d || !url || !*url)return NULL;
+    for(struct web_font_resource *f=d->fonts;f;f=f->next)if(!strcmp(f->url,url))return f;
+    struct web_font_resource *f=calloc(1,sizeof *f);if(!f)return NULL;
+    f->url=strdup(url);if(!f->url){free(f);return NULL;}
+    f->next=d->fonts;d->fonts=f;return f;
+}
+void doc_font_loaded(web_doc *d,struct web_font_resource *f,const void *bytes,size_t length) {
+    if(!d || !f || f->done)return;
+    f->face=bytes && length?font_open_memory(bytes,length):NULL;
+    f->loading=false;f->done=true;f->failed=!f->face;
+    /* Both real decode success and failure must recascade: success changes
+       metrics/paint; failure makes the following authored src eligible. */
+    d->need_style=d->dirty=true;d->layout_valid=false;d->paint_dirty=true;
+}
+
 void web_free(web_doc *d) {
     if (!d) return;
     doc_active_cancel(d);
@@ -1029,6 +1045,10 @@ void web_free(web_doc *d) {
     web_avmedia_free(d);
     web_frames_free(d);
     web_js_free(d);
+    while(d->fonts) {
+        struct web_font_resource *f=d->fonts;d->fonts=f->next;
+        font_close(f->face);free(f->url);free(f);
+    }
     web_form_validation_free(d);
     while (d->dom_docs) {
         web_doc *child = d->dom_docs;
@@ -1078,6 +1098,7 @@ void web_free(web_doc *d) {
     pv_free(&d->svgs);
     pv_free(&d->abs_boxes);
     ar_free(&d->mem);
+    ar_free(&d->bmem);
     ar_free(&d->smem);
     ar_free(&d->lmem);
     ar_free(&d->cssmem);
@@ -1153,7 +1174,7 @@ void web_image_loaded(web_doc *d, int i, const void *data, size_t n) {
         else im->img = image_decode(data, n);
     }
     if (!im->img) im->failed = true;
-    d->layout_valid = false; d->dirty = true;
+    bool intrinsic_changed = false;
     for (node_t *node = doc_image_node_next(d, NULL); node; node = doc_image_node_next(d, node)) {
         if (node->tag == T_img && node->image_initialized && node->image_request == i) {
             bool in_template = false;
@@ -1162,7 +1183,24 @@ void web_image_loaded(web_doc *d, int i, const void *data, size_t n) {
             }
             if (!in_template) node->image = i;
         }
+        if (node->image != i) continue;
+        box_t *box = node->box;
+        if (!box || box->node != node || box->kind != B_ATOMIC || box->atomic != AT_IMG ||
+            doc_node_root(node, true) != d->root) continue;
+        const style_t *style = box->st;
+        /* Image availability/natural size never changes the author's CSS.
+           Both definite absolute axes make replaced sizing independent of
+           natural dimensions, including intrinsic width contributions. Keep
+           percentage/auto/ratio-dependent cases conservative; failure can
+           also introduce the alt-text intrinsic size. Background/mask-only,
+           hidden and detached image completions need pixels/events, not a
+           whole-document geometry pass. */
+        if (!style || style->width.kind != LK_LEN || style->width.pct != 0 ||
+            style->height.kind != LK_LEN || style->height.pct != 0)
+            intrinsic_changed = true;
     }
+    d->paint_dirty = true;
+    if (intrinsic_changed) { d->layout_valid = false; d->dirty = true; }
 }
 
 /* CSS background images are known once styles are: add them to the document's images */
@@ -1200,7 +1238,7 @@ int web_layout(web_doc *d, int width, int height) {
     if (d->resources_dirty || d->images_dirty) doc_rescan(d);
     /* Geometry reads may flush layout repeatedly within one script. Reuse the
        result until DOM/style, viewport, or image intrinsic dimensions change. */
-    if (d->layout_valid && !d->need_style && d->root_box &&
+    if (d->layout_valid && !d->need_style && !d->need_boxes && d->root_box &&
         d->width == width && d->height == height) return d->doc_h;
     /* No independent patch may publish a previously committed video span
        while geometry is incomplete. Native PCM/transport supply continues. */
@@ -1210,17 +1248,29 @@ int web_layout(web_doc *d, int width, int height) {
         for(node_t *image=doc_image_node_next(d,NULL);image;image=doc_image_node_next(d,image))doc_image_sync(d,image);
     }
     if (d->need_style || d->styled_w != width || d->styled_h != height || !d->root_box) {
+        boxes_discard(d); /* no box may retain a soon-to-be-freed computed style */
         css_cascade(d, width, height);
         if (d->root) register_bg(d, d->root);
-        boxes_build(d, &d->smem);
+        d->bmem.trap=d->smem.trap;
+        boxes_build(d, &d->bmem);
+        d->bmem.trap=NULL;
         d->need_style = false;
+        d->need_boxes = false;
+    } else if(d->need_boxes) {
+        /* Computed styles remain owned by smem. Only text boxes/anonymous
+           styles borrow bmem, so old box ownership can be reclaimed safely. */
+        boxes_discard(d);
+        d->bmem.trap=d->smem.trap;
+        boxes_build(d,&d->bmem);
+        d->bmem.trap=NULL;
+        d->need_boxes=false;
     } else if (d->root_box) clear_intrinsic(d->root_box);
     d->width = width;
     d->height = height;
     layout_doc(d, width, height);
     d->layout_revision++;
     d->layout_valid = true;
-    if (d->find_text && *d->find_text) web_find(d, d->find_text, 0);
+    if (d->find_text && *d->find_text && !d->find_revealing) web_find(d, d->find_text, 0);
     return d->doc_h;
 }
 
@@ -1509,6 +1559,25 @@ static bool active_target_valid(web_doc *root,web_doc *leaf,node_t *target) {
            web_dialog_inert(p->frame_parent,p->frame_element))return false;
     }
     return true;
+}
+web_node *web_pointer_click_target(web_doc *d,node_t *down,node_t *up) {
+    if(!d || !down || !up || down->owner!=up->owner)return NULL;
+    web_doc *root=d;while(root->frame_parent)root=root->frame_parent;
+    web_doc *leaf=down->owner;
+    if(!leaf || leaf->inert || !active_target_valid(root,leaf,down) ||
+       !active_target_valid(root,leaf,up))return NULL;
+    /* DOM inclusive ancestry, not CSS boxes, slots, or a synthetic ancestor
+       across separate shadow roots/documents. Native insertion cycle checks
+       already guarantee finite parent chains. No allocation or depth quota. */
+    node_t *a=down,*b=up,*ar=NULL,*br=NULL;
+    size_t da=0,db=0;
+    for(node_t *p=a;p;p=p->parent){ar=p;da++;}
+    for(node_t *p=b;p;p=p->parent){br=p;db++;}
+    if(ar!=br)return NULL;
+    while(da>db){a=a->parent;da--;}
+    while(db>da){b=b->parent;db--;}
+    while(a!=b){a=a->parent;b=b->parent;}
+    return a;
 }
 void web_active_release(web_doc *d) {
     if(!d)return;

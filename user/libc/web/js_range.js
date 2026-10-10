@@ -5,7 +5,7 @@
  * Incremental parser/native-only mutations still need native range emission.
  * No selection painting or invented layout rectangles are provided here. */
 const rangeBridge = (() => {
-    const states=new WeakMap(), live=new Set(), Ref=WeakRef, deref=WeakRef.prototype.deref;
+    const states=new WeakMap(), staticStates=new WeakMap(),live=new Set(), Ref=WeakRef, deref=WeakRef.prototype.deref;
     const abstractToken={}, get=(n,k)=>rawDom('get',n,k);
     const parent=n=>get(n,'parentNode'), children=n=>get(n,'childNodes');
     const character=n=>[3,4,7,8].includes(get(n,'nodeType'));
@@ -102,7 +102,120 @@ const rangeBridge = (() => {
         }
         return fragment;
     }
+    function extract(d){
+        const owner=get(d.start[0],'nodeType')===9?d.start[0]:get(d.start[0],'ownerDocument');
+        const fragment=rawDom('create',owner,11,'#document-fragment','');
+        if(collapsed(d))return fragment;
+        const start=d.start.slice(),end=d.end.slice(),original={start,end};
+        const append=n=>dom('insert',fragment,n,null);
+        function characterClone(n,at,to){
+            const copy=dom('clone',n,false);
+            dom('set',copy,'nodeValue',get(n,'nodeValue').slice(at,to));return copy;
+        }
+        if(start[0]===end[0] && character(start[0])){
+            append(characterClone(start[0],start[1],end[1]));
+            replace(start[0],start[1],end[1]-start[1],'');return fragment;
+        }
+        // Capture the original native children before moving anything. Whole
+        // children are MOVED (identity/listeners retained), not clone+deleted.
+        const kids=children(common(original)),whole=kids.filter(n=>contained(n,original));
+        if(whole.some(n=>get(n,'nodeType')===10))
+            throw new DOMException('Cannot extract a doctype into a fragment','HierarchyRequestError');
+        const first=inside(start[0],end[0])?null:kids.find(n=>partial(n,original));
+        const last=inside(end[0],start[0])?null:kids.slice().reverse().find(n=>partial(n,original));
+        let newNode=start[0],newOffset=start[1];
+        if(!inside(start[0],end[0])){
+            let reference=start[0],p=parent(reference);
+            while(p && !inside(p,end[0])){reference=p;p=parent(reference);}
+            newNode=p;newOffset=children(p).indexOf(reference)+1;
+        }
+        // DOM extraction, like deletion, collapses BEFORE native splices and
+        // removals. Normal native hooks then adjust this and every other range.
+        d.start=[newNode,newOffset];d.end=d.start.slice();changed(d);
+        if(first){
+            if(character(first)){
+                append(characterClone(first,start[1],length(first)));
+                replace(first,start[1],length(first)-start[1],'');
+            }else{
+                const copy=dom('clone',first,false);append(copy);
+                dom('insert',copy,extract({start:start.slice(),end:[first,length(first)]}),null);
+            }
+        }
+        for(const n of whole)append(n);
+        if(last){
+            if(character(last)){
+                append(characterClone(last,0,end[1]));replace(last,0,end[1],'');
+            }else{
+                const copy=dom('clone',last,false);append(copy);
+                dom('insert',copy,extract({start:[last,0],end:end.slice()}),null);
+            }
+        }
+        return fragment;
+    }
+    function insertionValidity(p,n,before){
+        const status=rawDom('insertionStatus',p,n,before);
+        if(status)throw new DOMException(status===2?'The reference node is not a child':'The node cannot be inserted here',
+            status===2?'NotFoundError':'HierarchyRequestError');
+    }
+    function insertRange(d,n){
+        const start=d.start.slice(),type=get(start[0],'nodeType'),text=type===3 || type===4;
+        if(type===7 || type===8 || text && !parent(start[0]) || n===start[0])
+            throw new DOMException('The start container cannot accept this insertion','HierarchyRequestError');
+        let reference=text?start[0]:children(start[0])[start[1]]||null;
+        const p=reference?parent(reference):start[0];
+        // Validate before splitting Text: a rejected insertion must not damage
+        // the source text or move live boundaries as a side effect.
+        insertionValidity(p,n,reference);
+        if(text)reference=apply(splitText,start[0],[start[1]]);
+        if(n===reference)reference=get(reference,'nextSibling');
+        if(parent(n))dom('remove',n);
+        const newOffset=(reference?children(p).indexOf(reference):length(p))+
+            (get(n,'nodeType')===11?length(n):1);
+        dom('insert',p,n,reference);
+        if(collapsed(d)){d.end=[p,newOffset];changed(d);}
+    }
+    function surround(d,n){
+        const stack=[common(d)];
+        while(stack.length){
+            const child=stack.pop(),type=get(child,'nodeType');
+            if(type!==3 && type!==4 && partial(child,d))
+                throw new DOMException('A non-Text node is partially selected','InvalidStateError');
+            for(const c of children(child))stack.push(c);
+        }
+        if([9,10,11].includes(get(n,'nodeType')))
+            throw new DOMException('The wrapper has an invalid node type','InvalidNodeTypeError');
+        const fragment=extract(d);
+        for(const c of children(n))dom('remove',c);
+        insertRange(d,n);
+        dom('insert',n,fragment,null);
+        const p=parent(n),index=children(p).indexOf(n);
+        d.start=[p,index];d.end=[p,index+1];changed(d);
+    }
     class AbstractRange {constructor(token){if(token!==abstractToken)throw new TypeError('Illegal AbstractRange constructor');}}
+    class StaticRange extends AbstractRange {
+        constructor(init){
+            super(abstractToken);required(arguments.length,1);
+            if(init===null || typeof init!=='object' && typeof init!=='function')
+                throw new TypeError('StaticRangeInit is required');
+            // Web IDL converts dictionary members in lexicographic order.
+            const endContainer=init.endContainer;
+            if(endContainer===undefined)throw new TypeError('endContainer is required');
+            node(endContainer);
+            const endValue=init.endOffset;
+            if(endValue===undefined)throw new TypeError('endOffset is required');
+            const endOffset=offset(endValue),startContainer=init.startContainer;
+            if(startContainer===undefined)throw new TypeError('startContainer is required');
+            node(startContainer);
+            const startValue=init.startOffset;
+            if(startValue===undefined)throw new TypeError('startOffset is required');
+            const startOffset=offset(startValue);
+            if([2,10].includes(get(startContainer,'nodeType')) || [2,10].includes(get(endContainer,'nodeType')))
+                throw new DOMException('Invalid static boundary container','InvalidNodeTypeError');
+            // A StaticRange is a snapshot, not a live, normalized Range. Its
+            // endpoints must not join the mutation-adjusted weak live set.
+            staticStates.set(this,{start:[startContainer,startOffset],end:[endContainer,endOffset]});
+        }
+    }
     class Range extends AbstractRange {
         constructor(){super(abstractToken);register(this,{start:[document,0],end:[document,0]});}
         get commonAncestorContainer(){return common(data(this));}
@@ -127,7 +240,10 @@ const rangeBridge = (() => {
         }
         cloneRange(){return make(data(this));}
         cloneContents(){const d=data(this);return customElementsBridge.reactions(()=>clone({start:d.start.slice(),end:d.end.slice()}));}
+        extractContents(){const d=data(this);return customElementsBridge.reactions(()=>extract(d));}
         deleteContents(){const d=data(this);return customElementsBridge.reactions(()=>deleteRange(d));}
+        insertNode(n){const d=data(this);required(arguments.length,1);node(n);return customElementsBridge.reactions(()=>insertRange(d,n));}
+        surroundContents(n){const d=data(this);required(arguments.length,1);node(n);return customElementsBridge.reactions(()=>surround(d,n));}
         createContextualFragment(markup){
             const d=data(this);required(arguments.length,1);markup=string(markup);
             // DOMString conversion may run author code and change the range;
@@ -182,18 +298,18 @@ const rangeBridge = (() => {
         }
     }
     for(const k of ['startContainer','startOffset','endContainer','endOffset','collapsed'])Object.defineProperty(AbstractRange.prototype,k,{
-        enumerable:true,configurable:true,get(){const d=data(this);return k==='collapsed'?collapsed(d):d[k.startsWith('start')?'start':'end'][k.endsWith('Container')?0:1];}
+        enumerable:true,configurable:true,get(){const d=states.get(this)||staticStates.get(this);if(!d)throw new TypeError('Illegal AbstractRange receiver');return k==='collapsed'?collapsed(d):d[k.startsWith('start')?'start':'end'][k.endsWith('Container')?0:1];}
     });
     for(const [k,v] of [['START_TO_START',0],['START_TO_END',1],['END_TO_END',2],['END_TO_START',3]])
         for(const target of [Range,Range.prototype])Object.defineProperty(target,k,{value:v,enumerable:true});
-    Object.defineProperty(Range.prototype,'deleteContents',{enumerable:true});
-    for(const k of ['extractContents','insertNode','surroundContents','getClientRects','getBoundingClientRect'])
+    for(const k of ['deleteContents','extractContents'])Object.defineProperty(Range.prototype,k,{enumerable:true});
+    for(const k of ['getClientRects','getBoundingClientRect'])
         Object.defineProperty(Range.prototype,k,{enumerable:true,configurable:true,writable:true,value:function(){data(this);
             throw new DOMException('Range '+k+' is not implemented','NotSupportedError');
         }});
-    for(const C of [AbstractRange,Range])Object.defineProperty(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
+    for(const C of [AbstractRange,Range,StaticRange])Object.defineProperty(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
     Document.prototype.createRange=function(){documentBridge.brand(this);return make({start:[this,0],end:[this,0]});};
-    Object.assign(globalThis,{AbstractRange,Range});
+    Object.assign(globalThis,{AbstractRange,Range,StaticRange});
 
     function capture(){
         const a=[];for(const ref of live){const r=apply(deref,ref,[]);if(!r){live.delete(ref);continue;}
@@ -201,7 +317,7 @@ const rangeBridge = (() => {
         return a;
     }
     function before(op,n,key,value){
-        if(!n || !live.size || !(op==='insert' || op==='remove' || op==='set' && ['innerHTML','textContent','nodeValue','title'].includes(key)))return null;
+        if(!n || !live.size || !(op==='insert' || op==='replace' || op==='remove' || op==='set' && ['innerHTML','textContent','nodeValue','title'].includes(key)))return null;
         if(op==='insert' && (!key || key===value))return null;
         const type=get(n,'nodeType');
         if(op==='set' && (key==='nodeValue' && !character(n) || key==='textContent' && !character(n) && type!==1 && type!==11))return null;
@@ -220,7 +336,15 @@ const rangeBridge = (() => {
             siblings.splice(i,1);
         }
         if(op==='remove')remove(n);
-        else if(op==='insert'){
+        else if(op==='replace'){
+            let reference=get(value,'nextSibling');if(reference===key)reference=get(key,'nextSibling');
+            const nodes=get(key,'nodeType')===11?children(key):[key];
+            for(const child of nodes)remove(child);
+            if(value!==key)remove(value);
+            const siblings=tree(n),i=reference?siblings.indexOf(reference):siblings.length;
+            if(i<0)return null;
+            points(q=>{if(q[0]===n && q[1]>i)q[1]+=nodes.length;});
+        }else if(op==='insert'){
             const nodes=get(key,'nodeType')===11?children(key):[key];if(!nodes.length)return null;
             for(const child of nodes)remove(child);
             const siblings=tree(n),i=value?siblings.indexOf(value):siblings.length;
@@ -250,6 +374,69 @@ const rangeBridge = (() => {
         const previous=replacing;replacing={node,offset:at,count,inserted:insert.length};
         try{dom('set',node,'nodeValue',old.slice(0,at)+insert+old.slice(at+count));}finally{replacing=previous;}
     }
+    function splitText(at){
+        const type=get(this,'nodeType');
+        if(type!==3 && type!==4)throw new TypeError('Illegal Text receiver');
+        required(arguments.length,1);at=offset(at);
+        // Conversion may execute author code. Snapshot data/parent afterwards.
+        const text=get(this,'nodeValue');
+        if(at>text.length)throw new DOMException('Offset exceeds data length','IndexSizeError');
+        return customElementsBridge.reactions(()=>{
+            const next=rawDom('create',get(this,'ownerDocument'),3,'#text',text.slice(at));
+            const p=parent(this);
+            if(p){
+                const index=children(p).indexOf(this);
+                dom('insert',p,next,get(this,'nextSibling'));
+                // Ordinary insertion already adjusts later parent boundaries.
+                // Splitting has two additional live-range rules: migrate only
+                // offsets strictly after the split, and move the parent point
+                // immediately after the old Text past the inserted Text.
+                const ranges=capture();
+                for(const r of ranges)for(const q of [r.start,r.end]){
+                    if(q[0]===this && q[1]>at){q[0]=next;q[1]-=at;}
+                    else if(q[0]===p && q[1]===index+1)q[1]++;
+                }
+                after(ranges);
+            }
+            replace(this,at,text.length-at,'');return next;
+        });
+    }
+    Text.prototype.splitText=splitText;
+    Object.defineProperty(Node.prototype,'normalize',{configurable:true,enumerable:true,writable:true,value:function(){
+        const scope=node(this);
+        return customElementsBridge.reactions(()=>{
+            function following(n){
+                while(n!==scope){const next=get(n,'nextSibling');if(next)return next;n=parent(n);}
+                return null;
+            }
+            for(let n=get(scope,'firstChild');n;){
+                if(get(n,'nodeType')!==3){n=get(n,'firstChild')||following(n);continue;}
+                let size=length(n);
+                if(!size){const next=following(n);dom('remove',n);n=next;continue;}
+                const merged=[],parts=[];
+                for(let next=get(n,'nextSibling');next && get(next,'nodeType')===3;next=get(next,'nextSibling')){
+                    merged.push(next);parts.push(get(next,'nodeValue'));
+                }
+                if(merged.length){
+                    // One actual CharacterData splice, then ordinary removals.
+                    // Migrate live boundaries before removal so they retain
+                    // their character offsets, rather than becoming a parent
+                    // caret at the removed Text's former child index.
+                    replace(n,size,0,parts.join(''));
+                    const p=parent(n);
+                    for(let i=0;i<merged.length;i++){
+                        const next=merged[i],index=children(p).indexOf(next),ranges=capture();
+                        for(const r of ranges)for(const q of [r.start,r.end]){
+                            if(q[0]===next){q[0]=n;q[1]+=size;}
+                            else if(q[0]===p && q[1]===index){q[0]=n;q[1]=size;}
+                        }
+                        after(ranges);size+=parts[i].length;dom('remove',next);
+                    }
+                }
+                n=following(n);
+            }
+        });
+    }});
     CharacterData.prototype.appendData=function(value){characterDataBrand(this);required(arguments.length,1);value=string(value);replace(this,length(this),0,value);};
     CharacterData.prototype.insertData=function(at,value){characterDataBrand(this);required(arguments.length,2);at=offset(at);value=string(value);replace(this,at,0,value);};
     CharacterData.prototype.deleteData=function(at,count){characterDataBrand(this);required(arguments.length,2);at=offset(at);count=offset(count);replace(this,at,count,'');};

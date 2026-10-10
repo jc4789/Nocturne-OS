@@ -135,6 +135,10 @@ static void completed(nmedia_mse_worker *w){
 static void control_io(nmedia_mse_worker *w,uint64_t now,uint64_t until,bool dispatch){
     nmedia_mse_worker_background(now);if(!w||w->stopping||!w->head)return;
     if(!w->pid){if(!dispatch)return;if(!spawn_child(w))return;}
+    /* Queued APPEND/REMOVE can wait behind transfer or author JS work. Their
+       decoder resume point must use the real sink clock at dispatch, not the
+       old enqueue clock. Never mutate a partially transmitted wire header. */
+    if(dispatch&&!w->tx_pos)w->head->c.current=w->current;
     if(!dispatch&&w->tx_pos<sizeof w->head->c+w->head->c.bytes)return;
     struct n_pollfd p[2]={{w->in,dispatch?N_POLLOUT:0,0},{w->out,N_POLLIN,0}};if(poll(p,2,0)<0){stop(w,"MSE worker poll failed");return;}
     size_t budget=65536,total=sizeof w->head->c+w->head->c.bytes;
@@ -219,12 +223,11 @@ static void video_io(nmedia_mse_worker *w,uint64_t until){
 static void pump_io(nmedia_mse_worker *w,uint64_t now,uint64_t until,bool dispatch){
     if(!w||w->stopping)return;
     until=MIN(until,uptime_ms()+2);
-    struct request *head=w->head;size_t tx=w->tx_pos,h=w->head_pos,m=w->meta_pos,r=w->rx_pos;
-    /* PCM and command ACKs use their own pipe and always get first service.
-       VIDEO shares the same elapsed budget, never a second two-ms burst. */
+    /* PCM/control first, but each ready lane gets its initial nonblocking
+       read. Sustained APPEND/control progress must not suppress already
+       delivered VIDEO. Further reads/yields obey the same original end time. */
     control_io(w,now,until,dispatch);if(w->stopping)return;
-    bool progressed=w->head!=head||w->tx_pos!=tx||w->head_pos!=h||w->meta_pos!=m||w->rx_pos!=r;
-    if(uptime_ms()<until||!progressed)video_io(w,until);
+    video_io(w,until);
 }
 void nmedia_mse_worker_pump_budget(nmedia_mse_worker *w,uint64_t now,uint64_t until){pump_io(w,now,until,true);}
 void nmedia_mse_worker_collect(nmedia_mse_worker *w){uint64_t now=uptime_ms();pump_io(w,now,now,false);}

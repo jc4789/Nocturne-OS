@@ -194,6 +194,11 @@ const customElementsBridge = (() => {
             const nodes = get(key,'nodeType') === 11 ? children(key) : [key];
             return {op,nodes,was:nodes.map(connected),adopted:nodes.map(node=>({elements:elements(node),oldDocument:get(node,'ownerDocument')}))};
         }
+        if(op==='replace'){
+            const nodes=get(key,'nodeType')===11?children(key):[key];
+            return {op,nodes,was:nodes.map(connected),old:value,oldWas:connected(value),same:key===value,
+                adopted:nodes.map(node=>({elements:elements(node),oldDocument:get(node,'ownerDocument')}))};
+        }
         if (op === 'remove') return {op,node,was:connected(node),parent:get(node,'parentNode')};
         if (op === 'clone' || op === 'import') return {op};
         if (op === 'set' && (key === 'innerHTML' || key === 'textContent') && [1,11].includes(get(node,'nodeType')))
@@ -215,6 +220,10 @@ const customElementsBridge = (() => {
         }}
         if (token.op === 'insert') {
             token.nodes.forEach((node,i) => { removed(node,token.was[i]);adopted(token.adopted[i]);inserted(node); });
+        } else if(token.op==='replace'){
+            token.nodes.forEach((node,i)=>{removed(node,token.was[i]);adopted(token.adopted[i]);});
+            if(!token.same)removed(token.old,token.oldWas);
+            for(const node of token.nodes)inserted(node);
         } else if(token.op==='adopt'){
             removed(token.node,token.was);adopted(token);
         } else if (token.op === 'remove') {

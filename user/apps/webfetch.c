@@ -29,7 +29,7 @@ struct job {
     unsigned char *cookie_events;
     size_t cookie_len, cookie_cap;
     bool hop_cookies, redirect_cross_site;
-    bool cors_tainted, origin_tainted, redirected;
+    bool cors_tainted, origin_tainted, redirected, opaque_tainted;
 };
 static bool read_all(int fd, void *p, size_t n) {
     while (n) {
@@ -227,7 +227,8 @@ static bool load_file(struct job *j) {
 out:
     free(path);free(document_path);return ok;
 }
-static bool cors_kind(const struct job *j) { return j->wire.kind == WEBNET_FETCH || j->wire.kind == WEBNET_MODULE; }
+static bool no_cors(const struct job *j) { return (j->wire.user_navigation & WEBNET_WIRE_NO_CORS)!=0; }
+static bool cors_kind(const struct job *j) { return (j->wire.kind == WEBNET_FETCH && !no_cors(j)) || j->wire.kind == WEBNET_MODULE; }
 /* Redirect-taint changes the serialized Origin, not the document origin used
    for same-origin mode and mixed-content checks. It can never be cleared. */
 static const char *request_origin(const struct job *j) { return j->origin_tainted || !j->origin ? "null" : j->origin; }
@@ -341,6 +342,7 @@ static bool validate_headers(struct job *j) {
         bool safe = false;
         if (vl <= 128) { char value[129]; memcpy(value, v, vl); value[vl] = 0; safe = safelisted(name, value); }
         if (!safe) {
+            if(no_cors(j)){fail(j,"No-cors request requires safelisted headers");goto out;}
             if ((names.length && !header_text(j, &names, ", ")) || !header_append(j, &names, name, nl)) goto out;
         }
         free(name); name = NULL;
@@ -372,8 +374,8 @@ static bool cache_headers(struct job *j) {
 static bool prepare_outgoing(struct job *j, const char *current, const char *method, bool cross) {
     j->outgoing.length = 0;
     if (!header_text(j, &j->outgoing, j->headers)) return false;
-    if (cors_kind(j) && !(header_text(j, &j->outgoing, "Origin: ") &&
-        header_text(j, &j->outgoing, request_origin(j)) && header_text(j, &j->outgoing, "\r\n"))) return false;
+    if ((cors_kind(j) || (no_cors(j) && strcmp(method,"GET") && strcmp(method,"HEAD"))) && !(header_text(j, &j->outgoing, "Origin: ") &&
+        header_text(j, &j->outgoing, no_cors(j) && (j->wire.user_navigation & WEBNET_WIRE_NO_REFERRER)?"null":request_origin(j)) && header_text(j, &j->outgoing, "\r\n"))) return false;
     if (!cache_headers(j)) return false;
     j->hop_cookies = j->wire.credentials == WEBNET_CREDENTIALS_INCLUDE ||
         (j->wire.credentials == WEBNET_CREDENTIALS_SAME_ORIGIN && !cross && !j->cors_tainted);
@@ -469,6 +471,7 @@ static bool apply_cookie_events(struct job *j,size_t start,const char *method) {
 static int body_cb(void *opaque, const char *data, size_t n) {
     struct job *j = opaque;
     if (!remaining(j)) return -1;
+    if(j->opaque_tainted)return 0; /* Complete the real HTTP body, retain no hidden bytes. */
     size_t limit = webnet_wire_response_limit(j->wire.kind, j->wire.user_navigation);
     if (j->body_len > limit || n > limit - j->body_len) {
         fail(j, "Response body exceeds the negotiated wire representation"); return -1;
@@ -554,6 +557,7 @@ static bool exposed_header(const char *headers, const char *name, size_t len, bo
     return false;
 }
 static bool include_response_field(const struct job *j, const char *headers, const char *p, const char *end, bool cross) {
+    if(j->opaque_tainted)return false;
     const char *colon = memchr(p, ':', (size_t)(end - p));
     if (!colon || colon == p) return false;
     size_t len = (size_t)(colon - p);
@@ -576,7 +580,7 @@ static bool response_headers(struct job *j, const struct http_resp *r, bool cros
         size_t reason_len = strlen(reason);
         char start[32], end[96];
         int a = snprintf(start, sizeof start, "HTTP/1.1 %d ", r->status);
-        int b = snprintf(end, sizeof end, "\r\nHTTP/Nocturne-Meta cors=%d redirected=%d\r\n", j->cors_tainted, j->redirected);
+        int b = snprintf(end, sizeof end, "\r\nHTTP/Nocturne-Meta cors=%d redirected=%d%s\r\n", j->cors_tainted, j->redirected,j->opaque_tainted?" opaque=1":"");
         if (a < 0 || b < 0 || (size_t)a >= sizeof start || (size_t)b >= sizeof end ||
             reason_len > SIZE_MAX - (size_t)a - (size_t)b - 1) return fail(j, "Response metadata length overflow");
         prefix_len = (size_t)a + reason_len + (size_t)b;
@@ -630,14 +634,15 @@ static bool run_http(struct job *j) {
     parsed = image_http_url(j, j->url, &j->final_url, &j->target_origin);
     if (parsed != HTTP_URL_TUPLE) return url_failure(j, parsed, "Invalid HTTP(S) URL");
     if (!validate_headers(j)) return false;
+    if(no_cors(j) && strcmp(j->method,"GET") && strcmp(j->method,"HEAD") && strcmp(j->method,"POST"))return fail(j,"No-cors request requires a safelisted method");
     if (WEBNET_WIRE_CACHE_MODE(j->wire.user_navigation) == WEBNET_CACHE_ONLY_IF_CACHED) {
         if (!(j->wire.user_navigation & WEBNET_WIRE_SAME_ORIGIN))
             return fail(j, "only-if-cached requires same-origin mode");
         return fail(j, "No cached response is available");
     }
     bool drop_body = false;
-    for (unsigned hop = 0; hop <= 10; hop++) {
-        if (hop == 10) return fail(j, "Too many redirects");
+    for (unsigned hop = 0; hop <= 20; hop++) {
+        if (hop == 20) return fail(j, "Fetch redirect count exceeded");
         /* Initial and every redirect hop were fully prepared before publish.
            The current final URL is the single canonical owner, not a copy. */
         const char *current=j->final_url;
@@ -648,6 +653,7 @@ static bool run_http(struct job *j) {
         /* Main fetch never changes cors response taint back to basic, even
            when a redirect returns to the original document's origin. */
         if (cors_kind(j) && cross) j->cors_tainted = true;
+        if(no_cors(j) && cross)j->opaque_tainted=true;
         const char *method = drop_body ? "GET" : j->method;
         /* Redirects can remove authorization/body fields; rederive the preflight names. */
         if (!validate_headers(j)) return false;
@@ -717,6 +723,16 @@ static bool run_http(struct job *j) {
             }
         }
         j->status = r.status;
+        if(j->opaque_tainted && cross){
+            const char *policy=NULL;size_t length=0;
+            if(field_exists(http_response_headers(&r),"Cross-Origin-Resource-Policy") && !field_slice(http_response_headers(&r),"Cross-Origin-Resource-Policy",&policy,&length)){
+                http_resp_free(&r);return fail(j,"Invalid Cross-Origin-Resource-Policy");
+            }
+            if(policy && ((length==11 && !memcmp(policy,"same-origin",11)) ||
+                (length==9 && !memcmp(policy,"same-site",9) && !webcookie_same_site(j->cookies,j->document,current)))){
+                http_resp_free(&r);return fail(j,"No-cors response blocked by Cross-Origin-Resource-Policy");
+            }
+        }
         bool headers_ok = response_headers(j, &r, j->cors_tainted); http_resp_free(&r);
         if (!headers_ok) return false;
         if (!j->body) { j->body = calloc(1, 1); if (!j->body) return fail(j, "Out of memory"); }
@@ -736,7 +752,8 @@ int main(void) {
         !webnet_wire_script_flag_valid(w->kind, w->user_navigation) || !webnet_wire_image_flag_valid(w->kind, w->user_navigation) || !webnet_wire_request_payload_size(w, &payload_size) ||
         (w->credentials==WEBNET_CREDENTIALS_OMIT && w->cookie_len) ||
         WEBNET_WIRE_CACHE_MODE(w->user_navigation) > WEBNET_CACHE_ONLY_IF_CACHED ||
-        (w->kind != WEBNET_FETCH && WEBNET_WIRE_CACHE_MODE(w->user_navigation) != WEBNET_CACHE_DEFAULT)) { free(j); return 1; }
+        (w->kind != WEBNET_FETCH && (WEBNET_WIRE_CACHE_MODE(w->user_navigation) != WEBNET_CACHE_DEFAULT || (w->user_navigation & (WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER)))) ||
+        ((w->user_navigation & WEBNET_WIRE_NO_CORS) && (w->user_navigation & (WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_FORCE_PREFLIGHT)))) { free(j); return 1; }
     j->url = read_string(w->url_len, false); j->document = read_string(w->origin_len, false);
     j->method = read_string(w->method_len, false); j->headers = read_string(w->headers_len, false);
     j->request_body = read_string(w->body_len, true);

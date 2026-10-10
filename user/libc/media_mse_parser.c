@@ -1,6 +1,7 @@
 #include "media_mse_parser.h"
 #include "media_alloc_private.h"
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 /* Native demux AVIO offsets are signed 64-bit; not a staging memory quota. */
@@ -529,7 +530,11 @@ static int cluster_span(struct parser *p, const struct element *cluster, bool eo
 }
 static int webm_boundary(struct parser *p, bool have_init, bool eos, size_t *init_end, size_t *segment_end) {
     size_t at = 0; bool info = false, tracks = false;
-    if (!have_init) {
+    /* MSE can append a new initialization segment after earlier media. The
+       old initialization is retained until process() has validated/demuxed
+       this complete candidate. Recognize only the aligned header at the
+       current byte-stream boundary, never an ID inside compressed payload. */
+    if (!have_init || (p->n >= 4 && be32(p->b) == 0x1a45dfa3)) {
         struct element h; int r = element_at(p, at, p->n, false, &h);
         if (r <= 0) return r < 0 ? r : more(p, eos);
         if (h.id != 0x1a45dfa3 || h.unknown) return fail(p, "Missing finite WebM EBML header");
@@ -574,8 +579,11 @@ static int webm_boundary(struct parser *p, bool have_init, bool eos, size_t *ini
             r = cluster_span(p, &e, eos, segment_end);
             return r == 0 && *init_end ? 1 : r;
         }
-        if (e.id != 0xec && e.id != 0xbf && e.id != 0x1c53bb6b && e.id != 0x1043a770 && e.id != 0x114d9b74)
-            return fail(p, "Expected WebM Cluster");
+        if (e.id != 0xec && e.id != 0xbf && e.id != 0x1c53bb6b && e.id != 0x1043a770 && e.id != 0x114d9b74) {
+            if (p->error && p->error_size)
+                snprintf(p->error,p->error_size,"Expected WebM Cluster: element 0x%08x at byte %zu",e.id,at);
+            return -1;
+        }
         if (e.unknown) return fail(p, "Unknown size on WebM metadata");
         if (!e.end) return *init_end ? 1 : more(p, eos);
         at = e.end;

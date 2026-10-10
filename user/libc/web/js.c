@@ -69,7 +69,7 @@ struct js_script {
     uint64_t request;
     struct js_script *next;
 };
-enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE, P_WORKER, P_FRAME };
+enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE, P_WORKER, P_FRAME, P_FONT };
 struct js_pending {
     uint64_t id, deadline;
     int kind, credentials, cache_mode;
@@ -78,9 +78,10 @@ struct js_pending {
     int worker_kind;
     struct js_script *script;
     struct web_frame *frame;
+    struct web_font_resource *font;
     JSValue resolve, reject;
     char *url,*origin;
-    bool done, aborted, force_preflight, redirect_error, same_origin, keepalive;
+    bool done, aborted, force_preflight, redirect_error, same_origin, keepalive, no_cors, no_referrer;
     struct web_response response;
     struct js_pending *next;
 };
@@ -157,7 +158,7 @@ struct web_js_state {
     unsigned task_layout_flushes;
     unsigned profile_dom_depth;
     struct js_storage_profile storage_profile;
-    bool observers_active, observers_force;
+    bool observers_active, observers_force, pointer_capture_pending;
     uint64_t observer_due, observer_layout, observer_dom;
     int observer_x, observer_y, observer_w, observer_h;
     uint32_t next_timer;
@@ -304,6 +305,15 @@ void web_js_prepare_bytes(JSContext *ctx, size_t bytes) {
 void web_js_console(web_doc *d, int level, const char *message) {
     /* Native resource/layout failures remain observable after scripting stops. */
     if (d && d->js) log_text(d->js, level, message);
+}
+bool web_js_auxiliary_link(web_doc *d,const char *url) {
+    /* The native click path has applied sandbox and opener policy. This GET
+       uses the host's real new-window spawn, with no opener or initiator URL.
+       As with existing navigation, Nocturne sends no referrer. */
+    if(!d || !d->live || d->inert || !d->js || !d->js->host.navigate_form || !url)return false;
+    if(strncmp(url,"https://",8) && strncmp(url,"http://",7))return false;
+    d->js->host.navigate_form(d->js->host.opaque,url,NULL,0,NULL,"_blank");
+    return true; /* Accepted by host, not a promise that native spawn succeeded. */
 }
 bool web_js_video_present(web_doc *d, const struct web_video_patch *patch) {
     /* This is a native published-scene patch, never a JS/event/layout hook. */
@@ -475,6 +485,9 @@ static void end_task(struct web_js_state *s) {
         s->task_microtask_ms += uptime_ms() - microtask_start;
     }
     if (s->running == 1) {
+        /* Interrupted/OOM JS may not reach its finally. No captured Worker
+         * target is permitted to pin a native close beyond its outer task. */
+        web_worker_cancel_captures(s->workers);
         /* Module evaluation failures can be promise rejections, not exceptions
            returned to C. Keep the native allocation cause visible there too. */
         report_allocation_failure(s);
@@ -665,8 +678,13 @@ static bool equal_nodes(const node_t *a, const node_t *b) {
             if (!found) return false;
         }
     } else if (a->type == N_DOCTYPE) {
-        if (strcmp(a->name, b->name) || strcmp(a->public_id ? a->public_id : "", b->public_id ? b->public_id : "") ||
-            strcmp(a->system_id ? a->system_id : "", b->system_id ? b->system_id : "")) return false;
+        if (strcmp(a->name, b->name)) return false;
+        size_t apl = a->doctype_identifiers_sized ? a->public_id_len : a->public_id ? strlen(a->public_id) : 0;
+        size_t bpl = b->doctype_identifiers_sized ? b->public_id_len : b->public_id ? strlen(b->public_id) : 0;
+        size_t asl = a->doctype_identifiers_sized ? a->system_id_len : a->system_id ? strlen(a->system_id) : 0;
+        size_t bsl = b->doctype_identifiers_sized ? b->system_id_len : b->system_id ? strlen(b->system_id) : 0;
+        if (apl != bpl || asl != bsl || (apl && memcmp(a->public_id, b->public_id, apl)) ||
+            (asl && memcmp(a->system_id, b->system_id, asl))) return false;
     } else if (a->type == N_TEXT || a->type == N_COMMENT || a->type == N_PI) {
         if (a->type == N_PI && strcmp(a->name, b->name)) return false;
         if (a->textlen != b->textlen || (a->textlen && memcmp(a->text, b->text, a->textlen))) return false;
@@ -877,7 +895,11 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     if (!strcmp(p, "doctype")) { for (node_t *c = d->root->first; c; c = c->next) if (c->type == N_DOCTYPE) return wrap(s, c); return JS_NULL; }
     if (!strcmp(p, "doctypeName") || !strcmp(p, "publicId") || !strcmp(p, "systemId")) {
         if (n->type != N_DOCTYPE) return JS_ThrowTypeError(ctx, "DocumentType receiver required");
-        return JS_NewString(ctx, !strcmp(p, "doctypeName") ? n->name : !strcmp(p, "publicId") ? (n->public_id ? n->public_id : "") : (n->system_id ? n->system_id : ""));
+        if (!strcmp(p, "doctypeName")) return JS_NewString(ctx, n->name);
+        bool public = !strcmp(p, "publicId");
+        const char *id = public ? n->public_id : n->system_id;
+        size_t len = n->doctype_identifiers_sized ? (public ? n->public_id_len : n->system_id_len) : id ? strlen(id) : 0;
+        return JS_NewStringLen(ctx, id ? id : "", len);
     }
     if (!strncmp(p, "image", 5)) return get_image(s, n, p);
     if (!strncmp(p, "form:", 5)) {
@@ -1271,6 +1293,10 @@ static JSValue observer_geometry(struct web_js_state *s, node_t *n, node_t *root
     bool resizable=b && (b->kind!=B_INLINE || b->kind==B_ATOMIC);
     JS_SetPropertyStr(ctx,out,"content",rect_array(ctx,b?b->p[3]:0,b?b->p[0]:0,resizable?b->w:0,resizable?b->h:0));
     JS_SetPropertyStr(ctx,out,"border",rect_array(ctx,0,0,resizable?w:0,resizable?h:0));
+    size_t depth=0;
+    for(node_t *p=n;p;p=p->assigned_slot?p->assigned_slot:doc_shadow_parent(p))
+        if(p->type==N_ELEM)depth++;
+    JS_SetPropertyStr(ctx,out,"depth",JS_NewFloat64(ctx,(double)depth));
     float rx=0,ry=0,rw=d->width,rh=d->height;
     bool root_ok=!root || root==d->root;
     if(root && root!=d->root) {
@@ -1403,6 +1429,21 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property)
     flush_layout(s);
     style_t *st = n->style; char out[128]; out[0] = 0;
     if (!st) return JS_NewString(ctx, "");
+    if (!strcmp(property, "fill") || !strcmp(property, "stroke")) {
+        const struct svg_paint *paint = !strcmp(property, "fill") ? &st->svg_fill : &st->svg_stroke;
+        if (paint->kind == SVG_PAINT_NONE) return JS_NewString(ctx, "none");
+        if (paint->kind == SVG_PAINT_REF) {
+            char *absolute = NULL;
+            int resolved = web_resolve_url_owned(d->url, paint->ref, &absolute);
+            if (resolved < 0) return JS_ThrowInternalError(ctx, "SVG computed URL allocation failed");
+            sbuf value = {0}; sb_puts(&value, "url(\""); sb_puts(&value, absolute ? absolute : paint->ref); sb_puts(&value, "\")");
+            JSValue result = JS_NewStringLen(ctx, value.p, value.n);
+            free(absolute); sb_free(&value); return result;
+        }
+        uint32_t c = paint->color == COLOR_CURRENT ? st->color : paint->color;
+        snprintf(out, sizeof out, "rgba(%u, %u, %u, %g)", (c >> 16) & 255, (c >> 8) & 255, c & 255, (double)(c >> 24) / 255);
+        return JS_NewString(ctx, out);
+    }
     uint32_t color = 0; bool is_color = false; float px = 0; bool is_px = false;
     if (!strcmp(property, "color")) { color = st->color; is_color = true; }
     else if (!strcmp(property, "background-color")) { color = st->bg_color; is_color = true; }
@@ -1412,12 +1453,25 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property)
        not advertise RTL/bidi layout, which is not implemented yet. */
     else if (!strcmp(property, "direction")) snprintf(out, sizeof out, "ltr");
     else if (!strcmp(property, "font-size")) { px = st->font_size; is_px = true; }
+    else if (!strcmp(property, "font-family")) return JS_NewString(ctx,st->font_names?st->font_names:st->font_family==FONT_FAMILY_MONO?"monospace":st->font_family==FONT_FAMILY_SANS?"sans-serif":"serif");
     else if (!strcmp(property, "font-weight")) snprintf(out, sizeof out, "%u", st->font_weight);
     else if (!strcmp(property, "opacity")) snprintf(out, sizeof out, "%g", (double)st->opacity);
+    else if (!strcmp(property, "fill-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_fill_opacity);
+    else if (!strcmp(property, "stroke-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_stroke_opacity);
+    else if (!strcmp(property, "stop-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_stop_opacity);
+    else if (!strcmp(property, "stop-color")) { color = st->svg_stop_color == COLOR_CURRENT ? st->color : st->svg_stop_color; is_color = true; }
+    else if (!strcmp(property, "stroke-width")) {
+        if (st->svg_stroke_width.pct) snprintf(out, sizeof out, "%g%%", (double)st->svg_stroke_width.pct);
+        else { px = st->svg_stroke_width.px; is_px = true; }
+    }
+    else if (!strcmp(property, "fill-rule")) snprintf(out, sizeof out, "%s", st->svg_fill_rule ? "evenodd" : "nonzero");
+    else if (!strcmp(property, "stroke-linecap")) { static const char *const names[] = {"butt", "round", "square"}; snprintf(out, sizeof out, "%s", names[st->svg_stroke_cap < 3 ? st->svg_stroke_cap : 0]); }
+    else if (!strcmp(property, "stroke-linejoin")) { static const char *const names[] = {"miter", "round", "bevel"}; snprintf(out, sizeof out, "%s", names[st->svg_stroke_join < 3 ? st->svg_stroke_join : 0]); }
     else if (!strcmp(property, "flex-grow")) snprintf(out, sizeof out, "%g", (double)st->flex_grow);
     else if (!strcmp(property, "flex-shrink")) snprintf(out, sizeof out, "%g", (double)st->flex_shrink);
     else if (!strcmp(property, "order")) snprintf(out, sizeof out, "%d", st->order);
     else if (!strcmp(property,"visibility")) snprintf(out,sizeof out,"%s",st->visibility==0?"visible":st->visibility==2?"collapse":"hidden");
+    else if (!strcmp(property,"content-visibility")) snprintf(out,sizeof out,"%s",st->content_visibility==CV_AUTO?"auto":st->content_visibility==CV_HIDDEN?"hidden":"visible");
     else if (!strcmp(property,"white-space")) {
         static const char *const names[]={"normal","pre","nowrap","pre-wrap","pre-line","break-spaces"};
         snprintf(out,sizeof out,"%s",names[st->white_space<6?st->white_space:0]);
@@ -1941,7 +1995,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     if (!n && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) { JS_FreeCString(ctx, op); return JS_EXCEPTION; }
     if (n && n->owner) d = n->owner;
     doc_dom_budget(d);
-    bool mutation = !strcmp(op, "shadowAttach") || !strcmp(op, "slotAssign") || !strcmp(op, "insert") || !strcmp(op, "remove") || !strcmp(op, "adopt") || !strcmp(op, "clone") || !strcmp(op, "import") || !strcmp(op, "set") ||
+    bool mutation = !strcmp(op, "shadowAttach") || !strcmp(op, "slotAssign") || !strcmp(op, "insert") || !strcmp(op, "replace") || !strcmp(op, "remove") || !strcmp(op, "adopt") || !strcmp(op, "clone") || !strcmp(op, "import") || !strcmp(op, "set") ||
                     !strcmp(op, "attrSetNode") || !strcmp(op, "attrRemoveNode") ||
                     ((!strcmp(op, "attr") || !strcmp(op, "style")) && argc > 3) || (!strcmp(op, "attrNS") && argc > 4);
     JSValue ce_token = mutation ? custom_element_hook(s, "customElementBefore", argc, argv) : JS_NULL;
@@ -1951,7 +2005,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     node_t *attribute_target = NULL;
     const char *attribute_name = NULL;
     bool old_attribute_present = false;
-    char created_attribute_name[128];
+    char *created_attribute_name = NULL;
     if (mutation && n && n->type == N_ATTR && !strcmp(op, "set") && n->attr_owner && !n->attribute->namespace_uri) {
         attribute_target = n->attr_owner; attribute_name = n->attribute->local ? n->attribute->local : n->attribute->raw;
         old_attribute_present = true;
@@ -2010,6 +2064,27 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             result=made?wrap(s,made):oom(ctx);
         }
         JS_FreeCString(ctx, html);
+    } else if (!strcmp(op, "doctypeCreate")) {
+        size_t nl = 0, pl = 0, sl = 0;
+        const char *name = argc > 2 ? JS_ToCStringLen(ctx, &nl, argv[2]) : NULL;
+        const char *public_id = argc > 3 ? JS_ToCStringLen(ctx, &pl, argv[3]) : NULL;
+        const char *system_id = argc > 4 ? JS_ToCStringLen(ctx, &sl, argv[4]) : NULL;
+        if (!n || n->type != N_DOC) result = JS_ThrowTypeError(ctx, "Document receiver required");
+        else if (!name || !public_id || !system_id) result = JS_EXCEPTION;
+        else {
+            node_t *made = doc_doctype_create(d, name, nl, public_id, pl, system_id, sl);
+            result = made ? wrap(s, made) : oom(ctx);
+        }
+        JS_FreeCString(ctx, name); JS_FreeCString(ctx, public_id); JS_FreeCString(ctx, system_id);
+    } else if (!strcmp(op, "insertionStatus")) {
+        node_t *child = argc > 2 ? unwrap(ctx, argv[2]) : NULL;
+        node_t *before = argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3]) ? unwrap(ctx, argv[3]) : NULL;
+        if (!n || !child || (argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3]) && !before)) result = JS_ThrowTypeError(ctx, "Node arguments are required");
+        else result = JS_NewInt32(ctx, doc_node_insert_validity(n, child, before));
+    } else if (!strcmp(op, "replacementStatus")) {
+        node_t *child=argc>2?unwrap(ctx,argv[2]):NULL,*old=argc>3?unwrap(ctx,argv[3]):NULL;
+        if(!n || !child || !old)result=JS_ThrowTypeError(ctx,"Node arguments are required");
+        else result=JS_NewInt32(ctx,doc_node_replace_validity(n,child,old));
     } else if (!strcmp(op, "create")) {
         int32_t type; if (argc < 5 || JS_ToInt32(ctx, &type, argv[2])) result = JS_EXCEPTION;
         else {
@@ -2163,11 +2238,12 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                 if (!ns || !*ns) {
                     attribute_target = n; old_attribute_present = i >= 0;
                     if (i >= 0) attribute_name = n->attrs[i].local ? n->attrs[i].local : n->attrs[i].raw;
-                    else { snprintf(created_attribute_name, sizeof created_attribute_name, "%s", name); attribute_name = created_attribute_name; }
+                    else { created_attribute_name = strdup(name); attribute_name = created_attribute_name; }
                 }
                 const char *value = JS_IsNull(argv[4]) ? NULL : JS_ToCString(ctx, argv[4]);
                 const char *prefix = argc > 5 && !JS_IsNull(argv[5]) ? JS_ToCString(ctx, argv[5]) : NULL;
                 result = (!JS_IsNull(argv[4]) && !value) || (argc > 5 && !JS_IsNull(argv[5]) && !prefix) ? JS_EXCEPTION :
+                    (attribute_target && !attribute_name) ? oom(ctx) :
                     (value ? doc_attr_set_ns(d, n, ns, prefix, name, value) : doc_attr_remove(d, n, i)) ? JS_UNDEFINED : oom(ctx);
                 JS_FreeCString(ctx, value); JS_FreeCString(ctx, prefix);
             } else if (!strcmp(op, "attrNS")) result = str_or_null(ctx, i >= 0 ? n->attrs[i].value : NULL);
@@ -2263,6 +2339,11 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             bool cycle = false; for (node_t *a = n; a; a = a->parent ? a->parent : a->shadow_host ? a->shadow_host : a->template_host) if (a == child) cycle = true;
             result = cycle ? JS_ThrowTypeError(ctx, "HierarchyRequestError") : doc_node_move(d, n, child, before) ? JS_UNDEFINED : oom(ctx);
         }
+    } else if (!strcmp(op, "replace")) {
+        node_t *child=argc>2?unwrap(ctx,argv[2]):NULL,*old=argc>3?unwrap(ctx,argv[3]):NULL;
+        if(!n || !child || !old)result=JS_ThrowTypeError(ctx,"Node arguments are required");
+        else if(doc_node_replace_validity(n,child,old))result=JS_ThrowTypeError(ctx,"Invalid native replacement");
+        else result=doc_node_replace(d,n,child,old)?JS_UNDEFINED:oom(ctx);
     } else if (!strcmp(op, "remove")) doc_node_remove(d, n);
     else if (!strcmp(op, "position")) {
         node_t *other=argc>2?unwrap(ctx,argv[2]):NULL;
@@ -2339,12 +2420,13 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                 attribute_target = n; attribute_name = n->attrs[index].local ? n->attrs[index].local : n->attrs[index].raw;
                 old_attribute_present = true;
             } else if (index < 0) {
-                snprintf(created_attribute_name, sizeof created_attribute_name, "%s", p);
-                if (!n->foreign) for (char *q = created_attribute_name; *q; q++) *q = (char)lower((unsigned char)*q);
+                created_attribute_name = strdup(p);
+                if (created_attribute_name && !n->foreign) for (char *q = created_attribute_name; *q; q++) *q = (char)lower((unsigned char)*q);
                 attribute_target = n; attribute_name = created_attribute_name;
             }
             const char *v = JS_IsNull(argv[3]) ? NULL : JS_ToCString(ctx, argv[3]);
-            result = !JS_IsNull(argv[3]) && !v ? JS_EXCEPTION : doc_node_attr(d, n, p, v) ? JS_UNDEFINED : oom(ctx);
+            result = !JS_IsNull(argv[3]) && !v ? JS_EXCEPTION :
+                (attribute_target && !attribute_name) ? oom(ctx) : doc_node_attr(d, n, p, v) ? JS_UNDEFINED : oom(ctx);
             JS_FreeCString(ctx, v);
         }
     } else if (!strcmp(op, "id")) result = wrap(s, find_id(n, p));
@@ -2371,7 +2453,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     }
     JS_FreeValue(ctx, ce_token);
     if (!JS_IsException(result) && mutation) signal_slots(s);
-    if (!JS_IsException(result) && n && !strcmp(op, "insert") && connected(s, n)) {
+    if (!JS_IsException(result) && n && (!strcmp(op, "insert") || !strcmp(op, "replace")) && connected(s, n)) {
         dynamic_scripts(s, n);
         for (struct js_script *script = s->scripts; script; script = script->next)
             if (script->dynamic && script->ready && !script->executed && !script->module && !node_attr(script->node, "src")) run_script(s, script);
@@ -2384,6 +2466,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         struct js_script *script = queue_script(s, attribute_target, true);
         if (script && script->ready && !script->module && !node_attr(attribute_target, "src")) run_script(s, script);
     }
+    free(created_attribute_name);
     JS_FreeCString(ctx, p); JS_FreeCString(ctx, op); return result;
 }
 
@@ -2729,6 +2812,13 @@ static JSValue native_media(JSContext *ctx, JSValueConst this_val, int argc, JSV
     JSValue result = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, result, "matches", JS_NewBool(ctx, matches));
     JS_SetPropertyStr(ctx, result, "media", JS_NewString(ctx, text)); js_free(ctx, text); return result;
+}
+static JSValue native_pointer_capture_pending(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s=state(ctx);
+    int pending=argc?JS_ToBool(ctx,argv[0]):0;
+    if(pending<0)return JS_EXCEPTION;
+    s->pointer_capture_pending=pending!=0;
+    return JS_UNDEFINED;
 }
 static JSValue native_observers(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
@@ -3189,7 +3279,7 @@ static void release_pending_request(struct web_js_state *s, struct js_pending *p
 static bool send_request(struct web_js_state *s, struct js_pending *p, int kind, const char *method,
                          const char *headers, const void *body, size_t len) {
     if(s->disabled){pending_error(p,"Browsing context is inactive");return false;}
-    if (p->kind==P_SCRIPT && (!strncasecmp(p->url,"data:",5) || !strncasecmp(p->url,"blob:",5))) {
+    if ((p->kind==P_SCRIPT || p->kind==P_FONT) && (!strncasecmp(p->url,"data:",5) || !strncasecmp(p->url,"blob:",5))) {
         char mime[128];
         p->response.body=!strncasecmp(p->url,"data:",5)
             ? script_data_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime)
@@ -3209,6 +3299,7 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
         .origin=p->origin?p->origin:web_effective_url(s->doc),
         .credentials=kind == WEB_RESOURCE_FETCH ? p->credentials : kind == WEB_RESOURCE_MODULE ? 1 : 2,
         .force_preflight=p->force_preflight, .redirect_error=p->redirect_error, .same_origin=p->same_origin,
+        .no_cors=p->no_cors, .no_referrer=p->no_referrer,
         .cache_mode=p->cache_mode, .keepalive=p->keepalive, .fetch_group=p->keepalive?s->fetch_group:0};
     if(kind==WEB_RESOURCE_IMAGE && p->kind==P_IMAGE && p->image>=0 && p->image<s->doc->images.n)
         r.image_upgrade=((struct web_image *)s->doc->images.v[p->image])->image_upgrade;
@@ -3222,7 +3313,10 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
 static bool worker_load(void *opaque, uint32_t worker, uint32_t request,
                         const char *url, int kind) {
     struct web_js_state *s = opaque;
-    if (!s || s->disabled || kind < 0 || kind > 2) return false;
+    if (!s || s->disabled || kind < 0 ||
+        (kind != 0 && !njw_load_kind_valid((uint32_t)kind))) return false;
+    const uint32_t policy = (uint32_t)kind & NJW_LOAD_POLICY_FLAGS;
+    kind = (int)((uint32_t)kind & ~NJW_LOAD_POLICY_FLAGS);
     struct js_pending *p = pending_new(s, P_WORKER, url);
     if (!p) {
         /* Loader rejection is reported over Worker IPC. Do not leave an OOM
@@ -3260,10 +3354,23 @@ static bool worker_load(void *opaque, uint32_t worker, uint32_t request,
            about:blank/srcdoc children. Never let the shared host substitute
            the top-level document as the initiator of startup/import/fetch. */
         .url=p->url, .origin=web_effective_url(s->doc), .method="GET",
-        .credentials=1, .same_origin=kind == 0};
+        .credentials=1, .same_origin=kind == 0,
+        .no_cors=(policy & NJW_LOAD_NO_CORS)!=0,
+        .no_referrer=(policy & NJW_LOAD_NO_REFERRER)!=0};
     if (!s->host.request || !s->host.request(s->host.opaque,&r))
         pending_error(p,"The browser rejected the Worker resource request");
     return true;
+}
+static void worker_cancel(void *opaque,uint32_t worker,uint32_t request) {
+    struct web_js_state *s=opaque;if(!s)return;
+    for(struct js_pending *p=s->pending;p;p=p->next){
+        if(p->kind!=P_WORKER||p->worker!=worker||p->done||
+           (request&&(p->worker_request!=request||p->worker_kind!=2)))continue;
+        /* The child's request identity never names a parent or sibling fetch.
+           Retire before cancellation so a native completion cannot revive it. */
+        p->aborted=true;pending_error(p,"The Worker resource was aborted");
+        if(s->host.cancel)s->host.cancel(s->host.opaque,p->id);
+    }
 }
 static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val;
@@ -3291,15 +3398,25 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
         if (!++generation) ++generation;
         s->workers = web_worker_new(ctx,generation,worker_load,s);
         if (!s->workers) return oom(ctx);
+        web_worker_set_canceler(s->workers,s->host.cancel?worker_cancel:NULL);
         JSValue fn = JS_GetPropertyStr(ctx,s->hooks,"workerNotify");
         if (JS_IsException(fn)) return fn;
         web_worker_set_callback(s->workers,fn); JS_FreeValue(ctx,fn);
+    }
+    if(op==8||op==9){
+        if(argc<6)return JS_ThrowTypeError(ctx,"Worker capture arguments missing");
+        uint32_t id=0,port=0,creator=0;
+        if(JS_ToUint32(ctx,&id,argv[1])<0||JS_ToUint32(ctx,&port,argv[4])<0||JS_ToUint32(ctx,&creator,argv[5])<0)return JS_EXCEPTION;
+        if(op==9){web_worker_release_capture(s->workers,port);return JS_UNDEFINED;}
+        if(!task_context_active(s))return JS_ThrowTypeError(ctx,"Worker capture context is inactive");
+        return web_worker_capture(s->workers,id,port,creator);
     }
     if(op==3||op==6||op==7){
         if(argc<4||!task_context_active(s))return JS_ThrowTypeError(ctx,"Worker transfer context is inactive");
         uint32_t id=0,port=0,creator=0;if(JS_ToUint32(ctx,&id,argv[1])<0)return JS_EXCEPTION;
         if(op!=3&&(argc<6||JS_ToUint32(ctx,&port,argv[4])<0||JS_ToUint32(ctx,&creator,argv[5])<0))return JS_EXCEPTION;
-        web_worker_publication *publication=web_worker_prepare(s->workers,id,op==3?NJW_MESSAGE:op==6?NJW_PORT_MESSAGE:NJW_PORT_CLOSE,port,op==3?NJW_WITH_PORTS:creator,argv[2]);
+        uint32_t capture=0;if(argc>6&&JS_ToUint32(ctx,&capture,argv[6])<0)return JS_EXCEPTION;
+        web_worker_publication *publication=web_worker_prepare_captured(s->workers,id,op==3?NJW_MESSAGE:op==6?NJW_PORT_MESSAGE:NJW_PORT_CLOSE,port,op==3?NJW_WITH_PORTS:creator,argv[2],capture);
         if(!publication)return JS_EXCEPTION;
         JSValue result=frame_transfer_commit(ctx,s,argv[3]);
         if(JS_IsException(result)){web_worker_abort(publication);return result;}
@@ -3387,6 +3504,8 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     p->same_origin = same_origin;
     p->redirect_error = redirect == 1;
     p->force_preflight = argc > 6 && JS_ToBool(ctx, argv[6]) > 0;
+    p->no_cors = argc > 10 && JS_ToBool(ctx, argv[10]) > 0;
+    p->no_referrer = argc > 11 && JS_ToBool(ctx, argv[11]) > 0;
     JSValue funcs[2]; JSValue promise = JS_NewPromiseCapability(ctx, funcs);
     if (JS_IsException(promise)) { pending_error(p, "Out of memory"); goto out; }
     p->resolve = funcs[0]; p->reject = funcs[1];
@@ -3935,6 +4054,7 @@ static void run_script(struct web_js_state *s, struct js_script *script) {
     js_free(s->ctx, script->source); script->source = NULL;
 }
 static void pending_free(struct web_js_state *s, struct js_pending *p) {
+    if(p->kind==P_FONT && p->font)p->font->loading=false;
     JS_FreeValue(s->ctx, p->resolve); JS_FreeValue(s->ctx, p->reject);
     js_free(s->ctx, p->url);js_free(s->ctx,p->origin); js_free(s->ctx, p->response.body); js_free(s->ctx, p->response.headers_full); js_free(s->ctx,p->response.url_full);
     js_free(s->ctx, p); s->pending_count--;
@@ -4022,12 +4142,20 @@ static void diagnostic_resource(struct web_js_state *s, struct js_pending *p, co
         }
         h=*end?end+1:end;
     }
-    static const char *const kinds[]={"script","fetch","stylesheet","image","worker"};
+    static const char *const kinds[]={"script","fetch","stylesheet","image","worker","frame","font"};
     uint64_t started=p->deadline>=WEBNET_TIMEOUT_MS?p->deadline-WEBNET_TIMEOUT_MS:0;
     snprintf(message,sizeof message,"Resource #%lu %s: HTTP %d, %lu bytes, MIME %s, elapsed %lu ms, %s; %s",
         (unsigned long)p->id,kinds[p->kind],p->response.status,(unsigned long)p->response.body_len,mime,
         (unsigned long)(uptime_ms()-started),reason,url);
     log_text(s,p->kind==P_SCRIPT?2:1,message);
+}
+static int fetch_transport_flags(const char *headers) {
+    /* The HTTP host writes this non-field line; server header fields cannot
+       forge it. Keep security decisions out of mutable author JS built-ins. */
+    const char *meta=headers?strstr(headers,"\r\nHTTP/Nocturne-Meta cors="):NULL;
+    unsigned cors=0,redirected=0,opaque=0;
+    if(!meta||sscanf(meta+2,"HTTP/Nocturne-Meta cors=%u redirected=%u opaque=%u",&cors,&redirected,&opaque)<2||cors>1||redirected>1||opaque>1)return -1;
+    return (cors?NJW_LOADED_CORS:0)|(redirected?NJW_LOADED_REDIRECTED:0)|(opaque?NJW_LOADED_OPAQUE:0);
 }
 static bool process_pending(struct web_js_state *s) {
     struct js_pending **link = &s->pending;
@@ -4093,29 +4221,44 @@ static bool process_pending(struct web_js_state *s) {
             web_worker_loaded(s->workers,p->worker,p->worker_request,p->response.status,final,
                 web_response_headers(&p->response),p->response.body,p->response.body_len,p->response.error);
         } else if (p->kind == P_CSS) doc_css_loaded(s->doc, p->url, web_response_url(&p->response)[0] ? web_response_url(&p->response) : p->url, ok ? p->response.body : NULL, ok ? p->response.body_len : 0);
+        else if(p->kind==P_FONT) {
+            doc_font_loaded(s->doc,p->font,ok?p->response.body:NULL,ok?p->response.body_len:0);
+            if(ok && p->font && p->font->failed)diagnostic_resource(s,p,"Font decode failed: malformed/unsupported SFNT or allocation failure; native CFF/WOFF/WOFF2 decoding is unavailable");
+        }
         else if (p->kind == P_IMAGE) {
             web_image_loaded(s->doc, p->image, ok ? p->response.body : NULL, ok ? p->response.body_len : 0);
-            s->doc->dirty = true; s->doc->need_style = true;
         } else if (!s->disabled && p->kind == P_FETCH) {
             ran_task = true;
             begin_task(s);
             JSValue value;
             bool success = !p->response.error[0];
+            int transport=fetch_transport_flags(web_response_headers(&p->response));
+            bool opaque=transport>=0&&(transport & NJW_LOADED_OPAQUE)!=0;
+            if(success&&((opaque&&!p->no_cors)||(p->no_cors&&transport<0))){
+                pending_error(p,"Native Fetch response is missing or contradicts its filtering policy");success=false;
+            }
             if (success) {
                 /* Transfer the already runtime-charged native snapshot. The
                    current QuickJS adopts external data only on success;
                    construction failure leaves pending_free as its owner. */
-                JSValue bytes = JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body,
+                JSValue bytes = opaque?JS_NULL:JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body,
                     p->response.body_len, fetch_body_free, NULL, false);
-                if (!JS_IsException(bytes)) p->response.body = NULL;
+                if (!opaque&&!JS_IsException(bytes)) p->response.body = NULL;
                 /* Response decodes bytes only when its consumer asks for text.
                    The old fourth argument was unused and eagerly expanded
                    every binary media fragment into a large JS string. */
-                JSValue args[] = {JS_NewInt32(s->ctx, p->response.status), JS_NewString(s->ctx, web_response_url(&p->response)[0] ? web_response_url(&p->response) : p->url), JS_NewString(s->ctx, web_response_headers(&p->response)), JS_UNDEFINED, bytes, JS_NewBool(s->ctx, web_response_url(&p->response)[0] && strcmp(p->url, web_response_url(&p->response)))};
+                bool redirected=transport>=0?(transport & NJW_LOADED_REDIRECTED)!=0:
+                    web_response_url(&p->response)[0]&&strcmp(p->url,web_response_url(&p->response));
+                JSValue type=opaque?JS_NewString(s->ctx,"opaque"):transport<0?JS_UNDEFINED:
+                    JS_NewString(s->ctx,(transport & NJW_LOADED_CORS)?"cors":"basic");
+                JSValue args[] = {JS_NewInt32(s->ctx,opaque?0:p->response.status),
+                    JS_NewString(s->ctx,opaque?"":web_response_url(&p->response)[0]?web_response_url(&p->response):p->url),
+                    JS_NewString(s->ctx,opaque?"":web_response_headers(&p->response)),JS_UNDEFINED,bytes,
+                    JS_NewBool(s->ctx,!opaque&&redirected),JS_UNDEFINED,type};
                 bool valid_args = true;
-                for (int i = 0; i < 6; ++i) if (JS_IsException(args[i])) valid_args = false;
-                value = valid_args ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 6, args) : JS_EXCEPTION;
-                for (int i = 0; i < 6; ++i) JS_FreeValue(s->ctx, args[i]);
+                for (int i = 0; i < 8; ++i) if (JS_IsException(args[i])) valid_args = false;
+                value = valid_args ? JS_Call(s->ctx, s->response, JS_UNDEFINED, 8, args) : JS_EXCEPTION;
+                for (int i = 0; i < 8; ++i) JS_FreeValue(s->ctx, args[i]);
                 if (JS_IsException(value)) { exception(s); success = false; value = JS_NewString(s->ctx, "Could not construct fetch response"); }
             } else { JSValue args[] = {JS_NewString(s->ctx, p->response.error), JS_NewBool(s->ctx, p->aborted)}; value = JS_Call(s->ctx, s->reject, JS_UNDEFINED, 2, args); JS_FreeValue(s->ctx, args[0]); JS_FreeValue(s->ctx, args[1]); }
             JSValue r = JS_Call(s->ctx, success ? p->resolve : p->reject, JS_UNDEFINED, 1, &value);
@@ -4208,6 +4351,22 @@ static void request_styles(struct web_js_state *s) {
         return;
     }
     send_request(s, p, WEB_RESOURCE_CSS, "GET", NULL, NULL, 0);
+}
+static void request_fonts(struct web_js_state *s) {
+    if(!s->ctx)return;
+    for(struct web_font_resource *f=s->doc->fonts;f;f=f->next) {
+        if(!f->wanted || f->loading || f->done)continue;
+        struct js_pending *p=pending_new(s,P_FONT,f->url);
+        if(!p) {
+            JSValue error=JS_GetException(s->ctx);JS_FreeValue(s->ctx,error);
+            doc_font_loaded(s->doc,f,NULL,0);log_text(s,1,"Font request allocation failed");continue;
+        }
+        p->font=f;f->loading=true;p->credentials=1;
+        /* Font loads use the real anonymous CORS fetch path, not image no-CORS
+           or the module synchronous loader. The host retains origin/redirect
+           checks and cancellation for this document generation. */
+        send_request(s,p,WEB_RESOURCE_FETCH,"GET",NULL,NULL,0);
+    }
 }
 static void request_images(struct web_js_state *s) {
     if (!s->ctx) return;
@@ -4347,6 +4506,12 @@ static JSValue event_init(struct web_js_state *s, const struct web_event *event)
     SET_B("ctrlKey", event->ctrl); SET_B("shiftKey", event->shift); SET_B("altKey", event->alt);
     SET_I("clientX", event->x); SET_I("clientY", event->y); SET_I("pageX", event->x + sx); SET_I("pageY", event->y + sy);
     SET_I("button", event->button); SET_I("buttons", event->buttons);
+    if(event->type && !strcmp(event->type,"click")) {
+        bool mouse=!event->keyboard_activation && !event->synthetic;
+        SET_I("pointerId",mouse?1:-1); SET("pointerType",JS_NewString(s->ctx,mouse?"mouse":""));
+        SET_B("isPrimary",mouse); SET_I("width",1); SET_I("height",1);
+        SET("pressure",JS_NewFloat64(s->ctx,0));
+    }
     if(event->type && !strcmp(event->type,"wheel")) {
         SET("deltaX",JS_NewFloat64(s->ctx,event->delta_x));
         SET("deltaY",JS_NewFloat64(s->ctx,event->delta_y));
@@ -4427,6 +4592,36 @@ bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *event) 
     }
     end_task(s); return allowed;
 }
+bool web_js_reveal_hidden(web_doc *d,node_t *target) {
+    if(!d || !target || target->owner!=d || !doc_node_connected(target))return false;
+    struct web_js_state *s=d->js;
+    if(!s || s->disabled) {
+        for(node_t *n=target;n && doc_flat_parent(n);n=doc_flat_parent(n)) {
+            const char *value=!n->foreign?node_attr(n,"hidden"):NULL;
+            if(value && str_ieq(value,"until-found") && !doc_node_attr(d,n,"hidden",NULL))return false;
+        }
+        return true;
+    }
+    begin_named_task(s,"find ancestor revelation",0);
+    JSContext *ctx=s->ctx;
+    JSValue args[]={JS_NewArray(ctx),wrap(s,d->root)};
+    uint32_t index=0;bool ok=!JS_IsException(args[0]) && !JS_IsException(args[1]);
+    /* The real flat ancestors are snapshotted before beforematch can move,
+       remove, adopt, or replace them. JS wrappers retain their DOM ownership. */
+    for(node_t *n=target;ok && n && doc_flat_parent(n);n=doc_flat_parent(n)) {
+        const char *value=!n->foreign?node_attr(n,"hidden"):NULL;
+        if(!value || !str_ieq(value,"until-found"))continue;
+        if(index==UINT32_MAX){ok=false;break;} /* JS Array index representation */
+        JSValue node=wrap(s,n);
+        if(JS_IsException(node))ok=false;
+        else if(JS_SetPropertyUint32(ctx,args[0],index++,node)<0)ok=false;
+    }
+    JSValue result=ok?custom_element_hook(s,"revealHidden",2,args):JS_EXCEPTION;
+    if(JS_IsException(result)){exception(s);ok=false;}
+    else {ok=JS_ToBool(ctx,result)>0;JS_FreeValue(ctx,result);}
+    JS_FreeValue(ctx,args[0]);JS_FreeValue(ctx,args[1]);end_task(s);
+    return ok && target->owner==d && doc_node_connected(target);
+}
 void *web_js_edit_begin(web_doc *d) {
     struct web_js_state *s=d?d->js:NULL;if(!task_context_active(s))return NULL;
     begin_named_task(s,"native physical edit",0);return s;
@@ -4461,6 +4656,63 @@ bool web_media_activate(web_doc *d, web_node *target) {
     JS_FreeValue(s->ctx, argument);
     end_task(s);
     return activated;
+}
+static node_t *pointer_capture_in_document(web_doc *root,web_doc *d,const struct web_event *event) {
+    struct web_js_state *s=d && d->live && !d->inert?d->js:NULL;
+    if(!s || s->disabled || s->running || !s->pointer_capture_pending)return NULL;
+    struct web_event local;
+    if(d!=root && (!event || !child_event_coordinates(root,d,event,&local)))return NULL;
+    begin_named_task(s,"native pointer capture",0);
+    JSValue init=event?event_init(s,d==root?event:&local):JS_UNDEFINED;
+    JSValue result=JS_IsException(init)?JS_EXCEPTION:custom_element_hook(s,"pointerCaptureTarget",1,&init);
+    node_t *target=NULL;
+    if(JS_IsException(result))exception(s);
+    else {
+        target=node_opaque(result);
+        JS_FreeValue(s->ctx,result);
+    }
+    JS_FreeValue(s->ctx,init);end_task(s);
+    if(!target || target->owner!=d || !web_pointer_click_target(root,target,target))target=NULL;
+    return target;
+}
+web_node *web_pointer_capture_target(web_doc *d,const struct web_event *event) {
+    if(!d || !d->live)return NULL;
+    while(d->frame_parent)d=d->frame_parent;
+    node_t *target=pointer_capture_in_document(d,d,event);
+    if(target)return target;
+    for(struct web_frame *f=d->frames;f;f=web_frame_walk_next(d,f,true)) {
+        if(f->detached || !f->document)continue;
+        target=pointer_capture_in_document(d,f->document,event);
+        if(target)return target;
+    }
+    return NULL;
+}
+static void pointer_cancel_document(web_doc *d) {
+    struct web_js_state *s=d && d->live && !d->inert?d->js:NULL;
+    if(!s || s->disabled || s->running)return;
+    begin_named_task(s,"native pointer cancellation",0);
+    JSValue result=custom_element_hook(s,"pointerCancel",0,NULL);
+    if(JS_IsException(result))exception(s);else JS_FreeValue(s->ctx,result);
+    end_task(s);
+}
+web_node *web_pointer_capture_click_target(web_doc *d,node_t *released_target) {
+    web_doc *owner=released_target?released_target->owner:NULL;
+    struct web_js_state *s=owner && owner->live && !owner->inert?owner->js:NULL;
+    if(!d || !s || s->disabled || s->running)return NULL;
+    begin_named_task(s,"native captured click",0);
+    JSValue result=custom_element_hook(s,"pointerClickTarget",0,NULL);
+    node_t *target=NULL;
+    if(JS_IsException(result))exception(s);
+    else{target=node_opaque(result);JS_FreeValue(s->ctx,result);}
+    end_task(s);
+    return target && target->owner==owner?web_pointer_click_target(d,target,target):NULL;
+}
+void web_pointer_cancel(web_doc *d) {
+    if(!d || !d->live)return;
+    while(d->frame_parent)d=d->frame_parent;
+    pointer_cancel_document(d);
+    for(struct web_frame *f=d->frames;f;f=web_frame_walk_next(d,f,true))
+        if(!f->detached && f->document)pointer_cancel_document(f->document);
 }
 void web_hover(web_doc *d, web_node *target, const struct web_event *event) {
     if(!event)return;
@@ -4671,7 +4923,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
         /* Preserve the usual post-watchdog script/lifecycle cleanup even when
            this fairness turn bypasses the other task sources. */
         if (s->disabled) for (struct js_script *p = s->scripts; p; p = p->next) { p->executed = true; JS_FreeValue(s->ctx, p->evaluation); p->evaluation = JS_UNDEFINED; }
-        request_styles(s); request_images(s); return;
+        request_styles(s); request_fonts(s); request_images(s); return;
     }
     s->idle_timeout_turn = true;
     bool ran = false;
@@ -4761,7 +5013,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
         }
     }
     if (s->disabled) for (struct js_script *p = s->scripts; p; p = p->next) { p->executed = true; JS_FreeValue(s->ctx, p->evaluation); p->evaluation = JS_UNDEFINED; }
-    request_styles(s); request_images(s);
+    request_styles(s); request_fonts(s); request_images(s);
     if (!ran) ran = run_document_event(s);
     if (ran) s->idle_period_stopped = true;
     else if (!s->disabled) {
@@ -4782,6 +5034,8 @@ int64_t web_js_deadline(web_doc *d) {
     /* Dirty registration and wanted, unqueued images are work, even after the
        final idle/console task. Do not spin while the bounded queue is full. */
     if (d->resources_dirty || d->images_dirty) return (int64_t)now;
+    for(struct web_font_resource *f=d->fonts;f;f=f->next)
+        if(f->wanted && !f->done && !f->loading)return (int64_t)now;
     if (s->pending_count < 8) for (int i = 0; i < web_image_count(d); i++) {
         if (!web_image_wanted(d, i)) continue;
         bool pending = false;
@@ -4924,6 +5178,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("canvas", 2, native_canvas),
         JS_CFUNC_DEF("avmedia", 4, native_avmedia),
         JS_CFUNC_DEF("observers", 1, native_observers),
+        JS_CFUNC_DEF("pointerCapturePending", 1, native_pointer_capture_pending),
         JS_CFUNC_DEF("resolve", 1, native_resolve), JS_CFUNC_DEF("ready", 0, native_ready), JS_CFUNC_DEF("current", 0, native_current),
         JS_CFUNC_DEF("write", 1, native_write), JS_CFUNC_DEF("encode", 1, native_encode), JS_CFUNC_DEF("navigate", 1, native_navigate),
         JS_CFUNC_DEF("inline", 1, native_inline),
@@ -4938,6 +5193,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("cancel", 1, native_cancel)
     };
     JS_SetPropertyFunctionList(s->ctx, api, functions, sizeof functions / sizeof *functions);
+    JS_SetPropertyStr(s->ctx,api,"noCorsFetch",JS_TRUE);
     web_js_crypto_init(s->ctx, api);
     web_js_encoding_init(s->ctx, api);
     web_js_collator_init(s->ctx, api);

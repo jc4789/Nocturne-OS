@@ -213,13 +213,46 @@ void web_frames_free(web_doc *d) {
 }
 static bool frame_surface_prepare(struct web_frame *f) {
     box_t *b=f->element?f->element->box:NULL;
+    /* An old publication must not be overwritten by gfx_init (or reused after
+       the element becomes unrendered). Ownership is independent of the crop. */
+    free(f->paint.px);memset(&f->paint,0,sizeof f->paint);f->paint_visible=false;
     if(!f->document || f->detached || !b || !b->st || b->st->display==D_NONE ||
+       b->st->visibility || b->st->content_visibility==CV_HIDDEN ||
        !isfinite(b->w) || !isfinite(b->h) || b->w<0.5f || b->h<0.5f ||
        (double)b->w>(double)INT_MAX-1 || (double)b->h>(double)INT_MAX-1)return false;
     int w=(int)roundf(b->w),h=(int)roundf(b->h);
-    if((size_t)w>SIZE_MAX/4/(size_t)h)return false;
-    f->paint.w=w;f->paint.h=h;f->paint.pitch=w;
-    web_layout(f->document,w,h);return true;
+    f->viewport_w=w;f->viewport_h=h;
+    f->document->view_x=f->scroll_x;f->document->view_y=f->scroll_y;
+    web_layout(f->document,w,h);
+    web_doc *owner=f->owner;struct web_frame *container=owner->frame_container;
+    double left=owner->view_x,top=owner->view_y;
+    double right=left+owner->width,bottom=top+owner->height;
+    if(container) {
+        left+=container->paint_x;top+=container->paint_y;
+        right=left+container->paint.w;bottom=top+container->paint.h;
+    }
+    double x=box_visual_x(b),y=(double)box_visual_y(b)+b->content_dy;
+    bool fixed=false;
+    for(box_t *a=b;a;a=a->parent)if(a->st && a->st->position==POS_FIXED){fixed=true;break;}
+    if(fixed){x+=owner->view_x;y+=owner->view_y;}
+    /* Nested overflow clips are real paint bounds, not a document-size quota.
+       Viewport-fixed descendants follow the same escape as native paint. */
+    if(!fixed)for(box_t *a=b->parent;a;a=a->parent)if(a->st && a->kind!=B_INLINE &&
+        a->st->overflow!=OV_VISIBLE && !doc_viewport_overflow_box(owner,a)) {
+        double ax=(double)box_visual_x(a)-a->p[3];
+        double ay=(double)box_visual_y(a)+a->content_dy-a->p[0];
+        left=fmax(left,ax);top=fmax(top,ay);
+        right=fmin(right,ax+a->w+a->p[3]+a->p[1]);
+        bottom=fmin(bottom,ay+a->h+a->p[0]+a->p[2]);
+    }
+    left=fmax(left,x);top=fmax(top,y);right=fmin(right,x+w);bottom=fmin(bottom,y+h);
+    if(!isfinite(left) || !isfinite(top) || !isfinite(right) || !isfinite(bottom) || right<=left || bottom<=top)return false;
+    int ox=(int)fmax(0,floor(left-x)),oy=(int)fmax(0,floor(top-y));
+    int ex=(int)fmin(w,ceil(right-x)),ey=(int)fmin(h,ceil(bottom-y));
+    int cw=ex-ox,ch=ey-oy;
+    if(cw<=0 || ch<=0 || (size_t)cw>SIZE_MAX/4/(size_t)ch)return false;
+    f->paint_x=ox;f->paint_y=oy;f->paint.w=cw;f->paint.h=ch;f->paint.pitch=cw;
+    f->paint_visible=true;return true;
 }
 void web_frames_prepare_paint(web_doc *d) {
     /* Layout flows top-down, then published pixels bottom-up. Each child
@@ -228,9 +261,12 @@ void web_frames_prepare_paint(web_doc *d) {
     struct web_frame *f=d?d->frames:NULL;bool entering=true;
     while(f) {
         if(entering && frame_surface_prepare(f) && f->document->frames){f=f->document->frames;continue;}
-        if(f->paint.w && f->paint.h && f->document && !f->detached) {
+        if(f->paint_visible && f->paint.w && f->paint.h && f->document && !f->detached) {
             int w=f->paint.w,h=f->paint.h;uint32_t *pixels=malloc((size_t)w*h*4);
-            if(pixels){gfx_init(&f->paint,pixels,w,h,w);web_paint(f->document,&f->paint,0,0,w,h,f->scroll_x,f->scroll_y);}
+            if(pixels){gfx_init(&f->paint,pixels,w,h,w);f->paint_failed=false;
+                /* Negative crop origin leaves layout/media queries/fixed
+                   positioning and the author's actual scroll unchanged. */
+                web_paint(f->document,&f->paint,-f->paint_x,-f->paint_y,f->viewport_w,f->viewport_h,f->scroll_x,f->scroll_y);}
             else if(!f->paint_failed){f->paint_failed=true;web_js_console(f->owner,2,"Frame paint surface allocation failed");}
             /* A completed parent owns the composite. Child surfaces no longer
              * need to survive, so a deep single chain peaks at two surfaces. */
@@ -251,8 +287,16 @@ bool web_frame_paint(node_t *n,canvas_t *c,int x,int y,int w,int h) {
     if(!web_frame_element(n))return false;
     if(w<=0 || h<=0)return true;
     if(!f || !f->document || f->detached) {gfx_fill(c,x,y,w,h,RGB(255,255,255));return true;}
-    if(!f->paint.px || f->paint.w!=w || f->paint.h!=h){gfx_fill(c,x,y,w,h,RGB(255,255,255));return true;}
-    gfx_blit(c,x,y,&f->paint,0,0,w,h);
+    if(!f->paint_visible)return true; /* no pixel intersects the parent viewport */
+    if(!f->paint.px || f->viewport_w!=w || f->viewport_h!=h) {
+        /* Actual OOM must not replace a usable document with a white box.
+           The parent's existing canvas is a valid native paint target. This
+           emergency path allocates no additional full-frame pixel buffer. */
+        web_paint(f->document,c,x,y,w,h,f->scroll_x,f->scroll_y);return true;
+    }
+    int64_t px=(int64_t)x+f->paint_x,py=(int64_t)y+f->paint_y;
+    if(px>=INT_MIN && px<=INT_MAX && py>=INT_MIN && py<=INT_MAX)
+        gfx_blit(c,(int)px,(int)py,&f->paint,0,0,f->paint.w,f->paint.h);
     return true;
 }
 static web_doc *named_frame(web_doc *d,const char *name) {
@@ -261,16 +305,70 @@ static web_doc *named_frame(web_doc *d,const char *name) {
     }
     return NULL;
 }
+static bool frame_link_space(unsigned char c) {
+    return c==' ' || c=='\t' || c=='\n' || c=='\r' || c=='\f';
+}
+static bool frame_link_token(const char *value,const char *token) {
+    if(!value)return false;
+    size_t length=strlen(token);
+    while(*value){
+        while(frame_link_space((unsigned char)*value))value++;
+        const char *start=value;while(*value && !frame_link_space((unsigned char)*value))value++;
+        if((size_t)(value-start)==length && !strncasecmp(start,token,length))return true;
+    }
+    return false;
+}
+static const char *frame_link_target(web_doc *source,node_t *anchor) {
+    const char *target=node_attr(anchor,"target");
+    if(target)return target; /* An explicitly empty target overrides base. */
+    node_t *root=source->root,*n=root;
+    while(n){
+        if(n->type==N_ELEM && n->namespace_id==NS_HTML && n->name && !strcmp(n->name,"base")){
+            target=node_attr(n,"target");if(target)return target;
+        }
+        /* Only the document tree participates, not shadow/template contents. */
+        if(n->first && !(n->type==N_ELEM && n->namespace_id==NS_HTML && n->name && !strcmp(n->name,"template")))n=n->first;
+        else {while(n!=root && !n->next)n=n->parent;if(n==root)break;n=n->next;}
+    }
+    return NULL;
+}
+static bool frame_auxiliary_allowed(web_doc *source) {
+    for(web_doc *d=source;d;d=d->frame_parent){
+        if(!d->live || d->inert){web_js_console(source,1,"Inactive document cannot open a link window");return false;}
+        if(!d->frame_parent)break;
+        struct web_frame *f=web_frame_find(d->frame_parent,d->frame_element);
+        if(!f || f->detached || f->document!=d){web_js_console(source,1,"Detached frame cannot open a link window");return false;}
+        /* The saved sandbox belongs to this active document. A later DOM
+           attribute mutation must not invent different active sandbox flags. */
+        if(!f->sandbox)continue;
+        if(!frame_link_token(f->sandbox,"allow-popups")){
+            web_js_console(source,1,"Sandbox disallows auxiliary link navigation");return false;
+        }
+        if(!frame_link_token(f->sandbox,"allow-popups-to-escape-sandbox")){
+            web_js_console(source,1,"Auxiliary window sandbox inheritance is not implemented");return false;
+        }
+    }
+    return true;
+}
 bool web_frame_navigate(web_doc *top,web_node *anchor,const char *url) {
     web_doc *source=anchor?anchor->owner:NULL;
-    if(!top || !source || !url || !source->live)return false;
+    if(!top || !source || !url)return false;
+    if(!source->live){web_js_console(source,1,"Inactive document link navigation discarded");return true;}
     web_doc *root=source;while(root->frame_parent)root=root->frame_parent;
-    if(root!=top)return false;
-    const char *target=node_attr(anchor,"target");web_doc *destination=source;
+    if(root!=top){web_js_console(source,1,"Link source belongs to another browsing context");return true;}
+    const char *target=frame_link_target(source,anchor);web_doc *destination=source;
     if(target && *target && strcasecmp(target,"_self")){
         if(!strcasecmp(target,"_top"))destination=top;
         else if(!strcasecmp(target,"_parent"))destination=source->frame_parent?source->frame_parent:source;
-        else if(!strcasecmp(target,"_blank")){web_js_console(source,1,"New auxiliary browsing contexts are not implemented");return true;}
+        else if(!strcasecmp(target,"_blank")){
+            if(!frame_auxiliary_allowed(source))return true;
+            const char *rel=node_attr(anchor,"rel");
+            if(frame_link_token(rel,"opener") && !frame_link_token(rel,"noopener") && !frame_link_token(rel,"noreferrer")){
+                web_js_console(source,1,"Auxiliary link opener relationships are not implemented");return true;
+            }
+            if(!web_js_auxiliary_link(source,url))web_js_console(source,2,"Auxiliary link requires an HTTP(S) destination and a native window host");
+            return true;
+        }
         else {destination=named_frame(top,target);if(!destination){web_js_console(source,1,"Named link target has no browsing context");return true;}}
     }
     if(destination==top)return false;

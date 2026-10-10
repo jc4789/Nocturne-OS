@@ -3,10 +3,17 @@
     'use strict';
     delete globalThis.__nocturne_host;
     const rawDom = host.dom;
+    function validateInsertion(parent,child,before) {
+        if(!rawDom('isNode',null,parent) || !rawDom('isNode',null,child) ||
+            before!=null && !rawDom('isNode',null,before))throw new TypeError('Node arguments are required');
+        const status=rawDom('insertionStatus',parent,child,before==null?null:before);
+        if(status)throw new DOMException(status===2?'The reference node is not a child':'The node cannot be inserted here',
+            status===2?'NotFoundError':'HierarchyRequestError');
+    }
     let customElementsReady = false;
     function dom(...args) {
         const op = args[0];
-        const mutation = op === 'shadowAttach' || op === 'slotAssign' || op === 'insert' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'import' || op === 'set' || op === 'attrSetNode' || op === 'attrRemoveNode' ||
+        const mutation = op === 'shadowAttach' || op === 'slotAssign' || op === 'insert' || op === 'replace' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'import' || op === 'set' || op === 'attrSetNode' || op === 'attrRemoveNode' ||
             (op === 'attrNS' && args.length > 4) ||
             ((op === 'attr' || op === 'style') && args.length > 3);
         return mutation && customElementsReady ? customElementsBridge.reactions(() => rawDom(...args)) : rawDom(...args);
@@ -30,7 +37,7 @@
     let blobHandlerTarget = () => false;
     let mseHandlerTarget = () => false;
     let textTrackHandlerTarget = () => false;
-    const globalHandlerTypes = new Set(('abort beforeinput beforetoggle blur cancel change click close dblclick error focus focusin focusout input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
+    const globalHandlerTypes = new Set(('abort beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
     const windowHandlerTypes = new Set(['hashchange','popstate','message','messageerror']);
     const state = new WeakMap();
     /* @include js_collections.js */
@@ -145,6 +152,7 @@
             }
         }
         hoverPath=[];hoverSnapshot=shadowBridge.capture([]);
+        pointerCaptureBridge.reset();
     }
     class EventTarget {
         addEventListener(type, callback, init) {
@@ -303,10 +311,17 @@
         get isConnected() { return dom('get',this,'isConnected'); }
         get textContent() { return dom('get',this,'textContent'); }
         set textContent(v) { dom('set',this,'textContent',v == null ? '' : String(v)); }
-        appendChild(child) { dom('insert',this,child,null); return child; }
-        insertBefore(child,before) { dom('insert',this,child,before); return child; }
-        removeChild(child) { if (child.parentNode !== this) throw new Error('NotFoundError'); dom('remove',child); return child; }
-        replaceChild(child,old) { if(child!==old){this.insertBefore(child,old);this.removeChild(old);}return old; }
+        appendChild(child) { validateInsertion(this,child,null);dom('insert',this,child,null); return child; }
+        insertBefore(child,before) { if(arguments.length<2)throw new TypeError('Two insertion arguments are required');validateInsertion(this,child,before);dom('insert',this,child,before==null?null:before); return child; }
+        removeChild(child) { if(!rawDom('isNode',null,this)||!rawDom('isNode',null,child))throw new TypeError('Node arguments are required');if (rawDom('get',child,'parentNode') !== this) throw new DOMException('The node is not a child','NotFoundError'); dom('remove',child); return child; }
+        replaceChild(child,old) {
+            if(arguments.length<2 || !rawDom('isNode',null,this) || !rawDom('isNode',null,child) || !rawDom('isNode',null,old))
+                throw new TypeError('Two Node arguments are required');
+            const status=rawDom('replacementStatus',this,child,old);
+            if(status)throw new DOMException(status===2?'The old node is not a child':'The replacement cannot be inserted here',
+                status===2?'NotFoundError':'HierarchyRequestError');
+            dom('replace',this,child,old);return old;
+        }
         cloneNode(deep = false) { if(rawDom('get',this,'shadowHost'))throw new DOMException('Shadow roots cannot be cloned directly','NotSupportedError');return dom('clone',this,!!deep); }
         isEqualNode(other = null) { return dom('equal',this,other); }
         isSameNode(other = null) { return dom('same',this,other); }
@@ -324,10 +339,6 @@
         for(let i=0;i<nodes.length;i++)values[i]=rawDom('isNode',null,nodes[i])?nodes[i]:elementURL.string(nodes[i]);
         const parent=rawDom('get',receiver,'parentNode');
         if(!parent)return;
-        if(values.length===1 && values[0]===receiver)return;
-        // Native insert/remove cannot atomically replace Document's sole root.
-        // Refuse before moving anything rather than delete the old root first.
-        if(rawDom('get',parent,'nodeType')===9)throw new DOMException('Atomic Document replacement is not implemented','NotSupportedError');
         let next=rawDom('get',receiver,'nextSibling');
         while(next){let used=false;for(let i=0;i<values.length;i++)if(values[i]===next){used=true;break;}
             if(!used)break;next=rawDom('get',next,'nextSibling');}
@@ -341,9 +352,10 @@
                 for(let i=0;i<values.length;i++)rawDom('insert',replacement,make(values[i]),null);
             }
             if(rawDom('get',receiver,'parentNode')===parent){
-                rawDom('insert',parent,replacement,receiver);
-                rawDom('remove',receiver);
-            }else rawDom('insert',parent,replacement,next);
+                const status=rawDom('replacementStatus',parent,replacement,receiver);
+                if(status)throw new DOMException('The replacement cannot be inserted here',status===2?'NotFoundError':'HierarchyRequestError');
+                rawDom('replace',parent,replacement,receiver);
+            }else {validateInsertion(parent,replacement,next);rawDom('insert',parent,replacement,next);}
         };
         // rawDom still invokes native CE/MO hooks. One outer reaction scope
         // prevents author CE callbacks observing a half-finished replacement.
@@ -357,11 +369,11 @@
         get previousElementSibling() { let n=this.previousSibling; while(n && n.nodeType !== 1) n=n.previousSibling; return n; }
         get childElementCount() { return this.children.length; }
         remove() { if (this.parentNode) this.parentNode.removeChild(this); }
-        append(...nodes) { for (const n of nodes) this.appendChild(n instanceof Node ? n : (this.ownerDocument||this).createTextNode(String(n))); }
-        prepend(...nodes) { const before=this.firstChild; for (const n of nodes) this.insertBefore(n instanceof Node ? n : (this.ownerDocument||this).createTextNode(String(n)),before); }
+        append(...nodes) { for (const n of nodes) this.appendChild(rawDom('isNode',null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n))); }
+        prepend(...nodes) { const before=this.firstChild; for (const n of nodes) this.insertBefore(rawDom('isNode',null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n)),before); }
         replaceChildren(...nodes) { this.textContent=''; this.append(...nodes); }
-        before(...nodes) { if(this.parentNode) for(const n of nodes) this.parentNode.insertBefore(n instanceof Node?n:this.ownerDocument.createTextNode(String(n)),this); }
-        after(...nodes) { if(this.parentNode) { const next=this.nextSibling; for(const n of nodes) this.parentNode.insertBefore(n instanceof Node?n:this.ownerDocument.createTextNode(String(n)),next); } }
+        before(...nodes) { if(this.parentNode) for(const n of nodes) this.parentNode.insertBefore(rawDom('isNode',null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),this); }
+        after(...nodes) { if(this.parentNode) { const next=this.nextSibling; for(const n of nodes) this.parentNode.insertBefore(rawDom('isNode',null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),next); } }
         replaceWith(...nodes) { replaceChildNode(this,nodes); }
         get tagName() { return this.nodeType === 1 ? this.nodeName : undefined; }
         get localName() { return dom('get',this,'localName'); }
@@ -627,7 +639,7 @@
     class Document extends Node {}
     class HTMLDocument extends Document {}
     function characterDataBrand(node){
-        const type=rawDom('get',node,'nodeType');if(type!==3 && type!==7 && type!==8)throw new TypeError('Illegal CharacterData receiver');
+        const type=rawDom('get',node,'nodeType');if(type!==3 && type!==4 && type!==7 && type!==8)throw new TypeError('Illegal CharacterData receiver');
     }
     class CharacterData extends Node {
         get data(){characterDataBrand(this);return rawDom('get',this,'nodeValue');}
@@ -662,7 +674,22 @@
             dom('set',this,'nodeValue',old.slice(0,offset)+data+old.slice(offset+count));
         }
     }
-    class Text extends CharacterData {}
+    class Text extends CharacterData {
+        constructor(data=''){
+            const node=dom('create',document,3,'#text',elementURL.string(data)),proto=new.target.prototype;
+            if(proto!==null && (typeof proto==='object'||typeof proto==='function'))Object.setPrototypeOf(node,proto);
+            return node;
+        }
+        get wholeText(){
+            const text=n=>{const t=rawDom('get',n,'nodeType');return t===3||t===4;};
+            if(!text(this))throw new TypeError('Illegal Text receiver');
+            let first=this,p;
+            while((p=rawDom('get',first,'previousSibling')) && text(p))first=p;
+            const parts=[];
+            for(let n=first;n && text(n);n=rawDom('get',n,'nextSibling'))parts.push(rawDom('get',n,'nodeValue'));
+            return parts.join('');
+        }
+    }
     // CDATASection is an exposed Text-derived interface even in an HTML realm.
     // HTML documents cannot create CDATA nodes; do not alias it to Text or
     // advertise an XML parser that the native document model does not have.
@@ -670,7 +697,13 @@
         constructor(){throw new TypeError('Illegal CDATASection constructor');}
     }
     Object.defineProperty(CDATASection.prototype,Symbol.toStringTag,{value:'CDATASection',configurable:true});
-    class Comment extends CharacterData {}
+    class Comment extends CharacterData {
+        constructor(data=''){
+            const node=dom('create',document,8,'#comment',elementURL.string(data)),proto=new.target.prototype;
+            if(proto!==null && (typeof proto==='object'||typeof proto==='function'))Object.setPrototypeOf(node,proto);
+            return node;
+        }
+    }
     function processingInstructionCreate(receiver,target,data){
         if(rawDom('get',receiver,'nodeType')!==9)throw new TypeError('Document receiver required');
         target=elementURL.string(target);data=elementURL.string(data);
@@ -771,8 +804,8 @@
     for(const name of ['name','type','src','href','rel','action','method','placeholder','lang','dir','title'])
         Object.defineProperty(HTMLElement.prototype,name,{configurable:true,get(){const s=reflectedAttr(this,name)||'';if(['src','href','action'].includes(name)&&s){try{return new URL(s,this.baseURI).href;}catch(_){return s;}}return s;},set(v){reflectedAttr(this,name,String(v));}});
     const CSS={escape(s){return Array.from(String(s)).map((c,i)=>/[a-zA-Z_\-]/.test(c)||(/[0-9]/.test(c)&&i>0)?c:'\\'+c.codePointAt(0).toString(16)+' ').join('');}};
-    const exceptionString=String;
-    class DOMException extends Error {constructor(message='',name='Error'){super(message);this.name=exceptionString(name);}}
+    /* @include js_dom_exception.js */
+    const DOMException=domExceptionBridge.DOMException;
     /* @include js_pointer_events.js */
     /* @include js_tokens.js */
     const DOMTokenList=tokenListBridge.DOMTokenList;
@@ -894,6 +927,11 @@
     let hoverPath = [];
     let hoverSnapshot = shadowBridge.capture([]);
     function hover(path, init) {
+        const capture=pointerCaptureBridge.prepare(mouseAssign({},init,{button:-1}));
+        if(capture){
+            path=[];
+            for(let n=capture;n;n=rawDom('get',n,'assignedSlot')||rawDom('get',n,'parentNode')||rawDom('get',n,'shadowHost'))path.push(n);
+        }
         if (path.length && path[path.length-1] === document) path[path.length] = globalThis;
         const previous = hoverPath, from = previous[0] || null, to = path[0] || null;
         const previousSnapshot=hoverSnapshot,currentSnapshot=shadowBridge.capture(path);
@@ -901,7 +939,7 @@
         function contains(a,n) { for (let i=0;i<a.length;i++) if(a[i]===n) return true; return false; }
         function queue(type, ancestry, index, related, boundary) {
             const values=mouseAssign({},init,{
-                relatedTarget:related,bubbles:!boundary,cancelable:!boundary,composed:!boundary
+                view:globalThis,relatedTarget:related,bubbles:!boundary,cancelable:!boundary,composed:!boundary
             });
             const own=ancestry===previous?previousSnapshot:currentSnapshot,other=ancestry===previous?currentSnapshot:previousSnapshot;
             const part={nodes:apply(eventSlice,ancestry,[index]),info:own.info};
@@ -951,6 +989,9 @@
             return [blobBridge.bytes(blob),blobBridge.type(blob)];
         },
         observerFrame(){observerBridge.frame();},
+        pointerCaptureTarget:pointerCaptureBridge.target,
+        pointerClickTarget:pointerCaptureBridge.clickTarget,
+        pointerCancel:pointerCaptureBridge.cancel,
         eventHandlerAttribute:handlerAttribute,
         documentOpenReset:resetDocumentEvents,
         documentCommandEvent:documentCommandBridge.event,
@@ -981,6 +1022,7 @@
         customFormReset(form){customElementsBridge.formReset(form);},
         slotChanges(){mutationBridge.signalSlots();},
         dialogRequestClose(node){htmlElementsBridge.requestClose(node);},
+        revealHidden:htmlElementsBridge.revealHidden,
         dialogSubmit(node,result){return htmlElementsBridge.submit(node,result);},
         detailsToggle(target,oldOpen,newOpen){semanticElementsBridge.toggle(target,oldOpen,newOpen);},
         historyEvent(oldURL,popstate){historyEvent(oldURL,popstate);},

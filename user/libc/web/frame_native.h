@@ -425,6 +425,13 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
         if(!strcmp(op,"top"))while(d && d->frame_parent)d=d->frame_parent;
         result=wrap(s,frame_window_token(d));
     }else if(!strcmp(op,"closed"))result=JS_NewBool(ctx,!target || !target->live);
+    else if(!strcmp(op,"opener")) {
+        /* No native Window in this implementation has an opener browsing
+           context. The original getter is cross-origin readable as null;
+           same-origin author replacements remain ordinary property values. */
+        if(!target || !target->live || !target->js || !target->js->ctx || !web_frame_same_origin(caller->doc,target))result=JS_NULL;
+        else {JSValue global=JS_GetGlobalObject(target->js->ctx);result=JS_GetPropertyStr(ctx,global,"opener");JS_FreeValue(ctx,global);}
+    }
     else if(!strcmp(op,"length") || !strcmp(op,"index")) {
         unsigned count=0;uint32_t index=0;
         if(!strcmp(op,"index") && (argc<3 || JS_ToUint32(ctx,&index,argv[2]))) {result=JS_EXCEPTION;goto out;}

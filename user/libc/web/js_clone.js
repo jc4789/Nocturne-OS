@@ -16,7 +16,7 @@ const cloneData = (() => {
     const field=(record,key,value)=>define(record,key,{value,writable:true,enumerable:true,configurable:true});
     const kinds=new M(),constructors=new M(),classID=host.classID,detach=host.detach,uncloneable=[],uncloneableNames=[],transferTypes=[];
     const workerDiagnostics=typeof host.frame!=='function'&&typeof host.transferCommit==='function';
-    const exceptionBridge=typeof workerExceptionBridge==='undefined'?null:workerExceptionBridge;
+    const exceptionBridge=domExceptionBridge;
     const blobSnapshotBridge=typeof blobBridge==='undefined'?null:blobBridge;
     const handlerName=handler=>{const d=descriptor(handler,'name');return d&&'value'in d&&typeof d.value==='string'?d.value:'Transferable';};
     const diagnosticKinds=new M();
@@ -178,7 +178,7 @@ const cloneData = (() => {
         const p=validated?apply(packetGet,packets,[packet]):validate(packet);
         if(!p.transfers||!p.transfers.length){p.committed=true;return;}
         if(typeof host.frame==='function'){
-            const plan=commitPlan(packet,receivers);plan.generations=[host.frame('transferGeneration')];
+            const plan=commitPlan(packet,receivers);define(plan,'generations',{value:[host.frame('transferGeneration')],writable:true,enumerable:true,configurable:true});
             return host.frame('transferCommit',plan);
         }
         if(typeof host.transferCommit==='function')return host.transferCommit(commitPlan(packet,receivers));

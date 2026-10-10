@@ -98,6 +98,8 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
         q->credentials < WEBNET_CREDENTIALS_OMIT || q->credentials > WEBNET_CREDENTIALS_INCLUDE ||
         q->cache_mode < WEBNET_CACHE_DEFAULT || q->cache_mode > WEBNET_CACHE_ONLY_IF_CACHED ||
         (q->kind != WEBNET_FETCH && q->cache_mode != WEBNET_CACHE_DEFAULT) ||
+        ((q->no_cors || q->no_referrer) && q->kind != WEBNET_FETCH) ||
+        (q->no_cors && (q->same_origin || q->force_preflight)) ||
         (q->keepalive && (q->kind != WEBNET_FETCH || !q->fetch_group)) ||
         (q->image_upgrade && q->kind != WEBNET_RESOURCE)) return 0;
     /* Fetch Standard's inflight keepalive body bound, per fetch group. Queued
@@ -159,6 +161,8 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
                         ((uint32_t)q->cache_mode << WEBNET_WIRE_CACHE_SHIFT);
     if (q->kind == WEBNET_CLASSIC || q->kind == WEBNET_MODULE) h.user_navigation |= WEBNET_WIRE_LARGE_SCRIPT;
     if (q->image_upgrade) h.user_navigation |= WEBNET_WIRE_IMAGE_UPGRADE;
+    if (q->no_cors) h.user_navigation |= WEBNET_WIRE_NO_CORS;
+    if (q->no_referrer) h.user_navigation |= WEBNET_WIRE_NO_REFERRER;
     h.credentials = q->credentials; h.cookie_len = (uint32_t)cookie_len;
     h.id = r->id; h.generation = r->generation; h.deadline = r->deadline;
     h.url_len = ul; h.origin_len = ol; h.method_len = ml; h.headers_len = hl; h.body_len = q->body_len;

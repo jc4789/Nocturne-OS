@@ -19,13 +19,15 @@
 #include "libavutil/pixfmt.h"
 #include "libavutil/dict.h"
 #include "libswresample/swresample.h"
+#include <emmintrin.h>
 
 struct nmedia {
     AVFormatContext *format;
     AVIOContext *io;
     AVCodecContext *audio, *video, *pending;
     AVPacket *packet;
-    AVFrame *frame;
+    AVFrame *frame, *video_late;
+    bool video_late_set; int64_t video_late_pts;
     int fd, audio_index, video_index, flush, eof;
     nmedia_http *http;
     uint8_t *bytes;
@@ -36,6 +38,7 @@ struct nmedia {
     size_t pixel_capacity;
     bool video_borrowed;
     int64_t video_loan_pts;
+    int64_t video_present_ms;bool video_present_set;
     int16_t samples[4096 * 2];
     uint64_t phase, step;
     int frame_audio, source_rate;
@@ -111,7 +114,12 @@ static AVCodecContext *open_decoder(nmedia *m, int stream) {
     if (r < 0) { fail(m, "open decoder", r); avcodec_free_context(&c); return NULL; }
     return c;
 }
+static void release_probe_options(AVDictionary **options,unsigned count){
+    if(options)for(unsigned i=0;i<count;i++)av_dict_free(&options[i]);
+    nmedia_ff_free(options);
+}
 static nmedia *open_input(nmedia *m, char *error, size_t error_size) {
+    AVDictionary **probe_options=NULL;unsigned probe_streams=0;
     m->audio_index = m->video_index = -1;
     m->audio_seek_ms = m->video_seek_ms = -1;
     /* libavutil retains its own ptrdiff_t/size arithmetic representation. */
@@ -123,26 +131,28 @@ static nmedia *open_input(nmedia *m, char *error, size_t error_size) {
     if (!m->format) { fail(m, "container allocation", AVERROR(ENOMEM)); goto bad; }
     m->format->pb = m->io; m->format->flags |= AVFMT_FLAG_CUSTOM_IO;
     m->format->probesize = 1024 * 1024; m->format->max_analyze_duration = 2000000;
-    m->format->max_streams = 8;
+    m->format->max_streams = INT_MAX;
     int r = avformat_open_input(&m->format, NULL, NULL, NULL);
     if (r < 0) { fail(m, "container", r); goto bad; }
-    AVDictionary *probe_options[8] = {0};
-    unsigned probe_streams = m->format->nb_streams;
-    if (probe_streams > 8) { fail(m, "stream count", AVERROR(EINVAL)); goto bad; }
+    probe_streams = m->format->nb_streams;
+    if(probe_streams>(unsigned)INT_MAX||(size_t)probe_streams>SIZE_MAX/sizeof *probe_options){fail(m,"stream count representation",AVERROR(EINVAL));goto bad;}
+    if(probe_streams){
+        probe_options=nmedia_ff_mallocz((size_t)probe_streams*sizeof *probe_options);
+        if(!probe_options){fail(m,"probe options allocation",AVERROR(ENOMEM));goto bad;}
+    }
     for (unsigned i = 0; i < probe_streams; i++) {
         AVCodecParameters *p = m->format->streams[i]->codecpar;
         if (!nmedia_video_dimensions(p->width,p->height) || p->sample_rate > 384000 || p->ch_layout.nb_channels > 8) {
             fail(m, "stream resource limits", AVERROR(EINVAL));
-            for (unsigned j = 0; j < probe_streams; j++) av_dict_free(&probe_options[j]);
             goto bad;
         }
         if(av_dict_set(&probe_options[i], "threads", "1", 0)<0){
             fail(m,"probe options allocation",AVERROR(ENOMEM));
-            for(unsigned j=0;j<probe_streams;j++)av_dict_free(&probe_options[j]);goto bad;
+            goto bad;
         }
     }
     r = avformat_find_stream_info(m->format, probe_options);
-    for (unsigned i = 0; i < probe_streams; i++) av_dict_free(&probe_options[i]);
+    release_probe_options(probe_options,probe_streams);probe_options=NULL;probe_streams=0;
     if (r < 0) { fail(m, "stream information", r); goto bad; }
     strlcpy(m->info.container, m->format->iformat->name, sizeof m->info.container);
     m->info.duration_ms = m->format->duration == AV_NOPTS_VALUE ? -1 : m->format->duration / 1000;
@@ -168,6 +178,7 @@ static nmedia *open_input(nmedia *m, char *error, size_t error_size) {
     if (error && error_size) *error = 0;
     return m;
 bad:
+    release_probe_options(probe_options,probe_streams);
     if (error && error_size) strlcpy(error, m->error, error_size);
     return NULL; /* caller retains input ownership, including seek restart */
 }
@@ -228,7 +239,9 @@ nmedia *nmedia_open_packets(const AVFormatContext *source, nmedia_packet_reader 
     m->fd=-1;m->audio_index=m->video_index=-1;m->audio_seek_ms=m->video_seek_ms=-1;
     m->packet_reader=reader;m->packet_seeker=seeker;m->packet_owner=owner;
     m->format=avformat_alloc_context();
-    if(!m->format||!source||!reader||source->nb_streams>8)goto bad;
+    if(!m->format){fail(m,"packet container allocation",AVERROR(ENOMEM));goto bad;}
+    if(!source||!reader||source->nb_streams>(unsigned)INT_MAX)goto bad;
+    m->format->max_streams=INT_MAX;
     for(unsigned i=0;i<source->nb_streams;i++){
         AVStream *s=avformat_new_stream(m->format,NULL);
         if(!s||avcodec_parameters_copy(s->codecpar,source->streams[i]->codecpar)<0)goto bad;
@@ -359,15 +372,60 @@ static int audio_output(nmedia *m, struct nmedia_output *o) {
     return o->kind;
 }
 static unsigned clamp8(int n) { return (unsigned)(n < 0 ? 0 : n > 255 ? 255 : n); }
-static int video_output(nmedia *m, struct nmedia_output *o) {
-    AVFrame *f = m->frame; int w = f->width, h = f->height;
+static __m128i video_mul4(__m128i value,int coefficient,bool high){
+    __m128i zero=_mm_setzero_si128();
+    return _mm_madd_epi16(high?_mm_unpackhi_epi16(value,zero):_mm_unpacklo_epi16(value,zero),_mm_set1_epi32(coefficient));
+}
+static __m128i video_channel(__m128i y,__m128i u,__m128i v,int yc,int uc,int vc){
+    __m128i lo=_mm_add_epi32(video_mul4(y,yc,false),_mm_add_epi32(video_mul4(u,uc,false),video_mul4(v,vc,false)));
+    __m128i hi=_mm_add_epi32(video_mul4(y,yc,true),_mm_add_epi32(video_mul4(u,uc,true),video_mul4(v,vc,true)));
+    lo=_mm_srai_epi32(_mm_add_epi32(lo,_mm_set1_epi32(128)),8);
+    hi=_mm_srai_epi32(_mm_add_epi32(hi,_mm_set1_epi32(128)),8);
+    return _mm_packus_epi16(_mm_packs_epi32(lo,hi),_mm_setzero_si128());
+}
+/* Baseline x86-64 SSE2, not AVX or an external thread backend. Loads touch
+   only complete eight-pixel groups; the existing scalar tail handles width
+   and chroma oddities. Signed row strides and all existing color coefficients
+   are preserved exactly. */
+static int video_yuv_row(AVFrame *f,int row,int w,int sx,int sy,bool full,bool bt709,uint32_t *out){
+    const uint8_t *yp=f->data[0]+(ptrdiff_t)row*f->linesize[0];
+    const uint8_t *up=f->data[1]+(ptrdiff_t)(row>>sy)*f->linesize[1];
+    const uint8_t *vp=f->data[2]+(ptrdiff_t)(row>>sy)*f->linesize[2];
+    __m128i zero=_mm_setzero_si128(),center=_mm_set1_epi16(128),alpha=_mm_set1_epi8(-1);
+    int yc=full?256:298,rv=full?(bt709?403:359):(bt709?459:409);
+    int gu=full?(bt709?48:88):(bt709?55:100),gv=full?(bt709?120:183):(bt709?136:208);
+    int bu=full?(bt709?475:454):(bt709?541:516),x=0;
+    for(;w-x>=8;x+=8){
+        __m128i y=_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(yp+x)),zero),u,v;
+        if(sx){
+            uint32_t a,b;memcpy(&a,up+(x>>sx),4);memcpy(&b,vp+(x>>sx),4);
+            u=_mm_unpacklo_epi8(_mm_cvtsi32_si128((int)a),zero);v=_mm_unpacklo_epi8(_mm_cvtsi32_si128((int)b),zero);
+            u=_mm_unpacklo_epi16(u,u);v=_mm_unpacklo_epi16(v,v);
+        }else{
+            u=_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(up+x)),zero);
+            v=_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(vp+x)),zero);
+        }
+        u=_mm_sub_epi16(u,center);v=_mm_sub_epi16(v,center);
+        if(!full)y=_mm_max_epi16(_mm_sub_epi16(y,_mm_set1_epi16(16)),zero);
+        __m128i r=video_channel(y,u,v,yc,0,rv),g=video_channel(y,u,v,yc,-gu,-gv),b=video_channel(y,u,v,yc,bu,0);
+        __m128i bg=_mm_unpacklo_epi8(b,g),ra=_mm_unpacklo_epi8(r,alpha);
+        _mm_storeu_si128((__m128i *)(out+x),_mm_unpacklo_epi16(bg,ra));
+        _mm_storeu_si128((__m128i *)(out+x+4),_mm_unpackhi_epi16(bg,ra));
+    }
+    return x;
+}
+static int64_t video_stamp(nmedia *m,AVFrame *f){
+    AVStream *stream=m->format->streams[m->video_index];
+    int64_t stamp=f->best_effort_timestamp;
+    int64_t pts=stamp==AV_NOPTS_VALUE?m->video_clock:av_rescale_q(stamp,stream->time_base,(AVRational){1,1000});
+    AVRational rate=stream->avg_frame_rate.num?stream->avg_frame_rate:(AVRational){25,1};
+    m->video_clock=pts+av_rescale_q(1,av_inv_q(rate),(AVRational){1,1000});
+    return pts;
+}
+static int video_output(nmedia *m,AVFrame *f,int64_t pts,struct nmedia_output *o) {
+    int w = f->width, h = f->height;
     size_t count,bytes;
     if (!nmedia_video_size(w,h,&count,&bytes)) return fail(m, "video dimensions/byte representation", AVERROR(EINVAL));
-    if (count > m->pixel_capacity) {
-        uint32_t *p = nmedia_ff_realloc(m->pixels, bytes);
-        if (!p) return fail(m, "video output allocation", AVERROR(ENOMEM));
-        m->pixels = p; m->pixel_capacity = count;
-    }
     enum AVPixelFormat format = (enum AVPixelFormat)f->format;
     /* Upstream also compiles 10/12-bit VP9 DSP, but that is not a promise
      * that our native ARGB output can render those profiles or HDR. */
@@ -381,11 +439,18 @@ static int video_output(nmedia *m, struct nmedia_output *o) {
     bool yuv = format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P || format == AV_PIX_FMT_YUV422P || format == AV_PIX_FMT_YUVJ422P || format == AV_PIX_FMT_YUV444P || format == AV_PIX_FMT_YUVJ444P;
     bool rgb = format == AV_PIX_FMT_RGB24 || format == AV_PIX_FMT_BGR24 || format == AV_PIX_FMT_BGRA || format == AV_PIX_FMT_RGBA || format == AV_PIX_FMT_BGR0 || format == AV_PIX_FMT_RGB0;
     if (!yuv && !rgb && format != AV_PIX_FMT_GRAY8) return fail(m, "unsupported decoded pixel format", AVERROR(ENOSYS));
+    if (count > m->pixel_capacity) {
+        uint32_t *p = nmedia_ff_realloc(m->pixels, bytes);
+        if (!p) return fail(m, "video output allocation", AVERROR(ENOMEM));
+        m->pixels = p; m->pixel_capacity = count;
+    }
     bool full = f->color_range == AVCOL_RANGE_JPEG || format == AV_PIX_FMT_YUVJ420P || format == AV_PIX_FMT_YUVJ422P || format == AV_PIX_FMT_YUVJ444P;
     bool bt709 = f->colorspace == AVCOL_SPC_BT709;
     int sx = format == AV_PIX_FMT_YUV444P || format == AV_PIX_FMT_YUVJ444P ? 0 : 1;
     int sy = format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P ? 1 : 0;
-    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+    for (int y = 0; y < h; y++) {
+      int x=yuv?video_yuv_row(f,y,w,sx,sy,full,bt709,m->pixels+(size_t)y*w):0;
+      for (; x < w; x++) {
         int r, g, b;
         if (yuv) {
             int yy = f->data[0][(ptrdiff_t)y * f->linesize[0] + x];
@@ -403,15 +468,21 @@ static int video_output(nmedia *m, struct nmedia_output *o) {
             r = p[bgr ? 2 : 0]; g = p[1]; b = p[bgr ? 0 : 2];
         }
         m->pixels[(size_t)y * w + x] = 0xff000000u | clamp8(r) << 16 | clamp8(g) << 8 | clamp8(b);
+      }
     }
     m->info.width = w; m->info.height = h;
     o->kind = NMEDIA_VIDEO; o->pixels = m->pixels; o->width = w; o->height = h;
-    AVStream *s = m->format->streams[m->video_index];
-    int64_t stamp = f->best_effort_timestamp;
-    o->pts_ms = stamp == AV_NOPTS_VALUE ? m->video_clock : av_rescale_q(stamp, s->time_base, (AVRational){1,1000});
-    AVRational rate = s->avg_frame_rate.num ? s->avg_frame_rate : (AVRational){25,1};
-    m->video_clock = o->pts_ms + av_rescale_q(1, av_inv_q(rate), (AVRational){1,1000});
+    o->pts_ms=pts;
     av_frame_unref(f); return o->kind;
+}
+static int video_return(nmedia *m,AVFrame *f,int64_t pts,struct nmedia_output *o){
+    int result=video_output(m,f,pts,o);
+    if(result==NMEDIA_VIDEO){m->video_seek_ms=-1;m->video_borrowed=true;m->video_loan_pts=pts;}
+    return result;
+}
+static int video_candidate(nmedia *m,struct nmedia_output *o){
+    if(!m->video_late_set)return NMEDIA_AGAIN;
+    m->video_late_set=false;return video_return(m,m->video_late,m->video_late_pts,o);
 }
 int nmedia_step(nmedia *m, struct nmedia_output *o) {
     if (!m || !o) return NMEDIA_ERROR;
@@ -424,11 +495,20 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
             int r = avcodec_receive_frame(m->pending, m->frame);
             if (r >= 0) {
                 if (m->pending == m->video) {
-                    int result = video_output(m, o);
-                    if (result == NMEDIA_VIDEO && m->video_seek_ms >= 0 && o->pts_ms < m->video_seek_ms) continue;
-                    if (result == NMEDIA_VIDEO) m->video_seek_ms = -1;
-                    if (result == NMEDIA_VIDEO) {m->video_borrowed=true;m->video_loan_pts=o->pts_ms;}
-                    return result;
+                    int64_t pts=video_stamp(m,m->frame);
+                    if(m->video_seek_ms>=0&&pts<m->video_seek_ms){av_frame_unref(m->frame);continue;}
+                    if(m->video_present_set&&pts<m->video_present_ms){
+                        /* Own one real decoded candidate. Replace it only once
+                           a newer real frame exists, never by a clock value. */
+                        if(!m->video_late){m->video_late=av_frame_alloc();if(!m->video_late)return fail(m,"video catch-up ownership",AVERROR(ENOMEM));}
+                        if(!m->video_late_set||pts>m->video_late_pts){
+                            av_frame_unref(m->video_late);av_frame_move_ref(m->video_late,m->frame);
+                            m->video_late_pts=pts;m->video_late_set=true;
+                        }else av_frame_unref(m->frame);
+                        continue;
+                    }
+                    if(m->video_late_set){av_frame_unref(m->video_late);m->video_late_set=false;}
+                    return video_return(m,m->frame,pts,o);
                 }
                 AVFrame *f = m->frame;
                 if (f->sample_rate < 1000 || f->sample_rate > 384000 || f->ch_layout.nb_channels < 1 || f->ch_layout.nb_channels > 8 || f->nb_samples <= 0 || f->nb_samples > 65536 || av_get_bytes_per_sample((enum AVSampleFormat)f->format) <= 0)
@@ -445,6 +525,7 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
                  * sentinel into a second trim (Opus -7ms -> lost 288 frames). */
                 if (m->audio_seek_ms >= 0 && m->audio_seek_ms > m->audio_pts) m->phase = (uint64_t)(m->audio_seek_ms - m->audio_pts) * f->sample_rate / 1000 << 32;
                 m->audio_seek_ms = -1; m->frame_audio = 1;
+                if(m->video_late_set)return video_candidate(m,o);
                 return audio_output(m, o);
             }
             if (r != AVERROR(EAGAIN) && r != AVERROR_EOF) return fail(m, "decode", r);
@@ -452,23 +533,25 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
         }
         if (m->eof) {
             AVCodecContext *c = m->flush == 0 ? m->audio : m->flush == 1 ? m->video : NULL;
-            if (m->flush >= 2) { o->kind = NMEDIA_END; return NMEDIA_END; }
+            if (m->flush >= 2) {if(m->video_late_set)return video_candidate(m,o);o->kind = NMEDIA_END; return NMEDIA_END; }
             m->flush++;
             if (c) { int r = avcodec_send_packet(c, NULL); if (r < 0 && r != AVERROR_EOF) return fail(m, "flush", r); m->pending = c; }
             continue;
         }
         int r = m->packet_reader ? m->packet_reader(m->packet_owner,m->packet) : av_read_frame(m->format, m->packet);
-        if(r==AVERROR(EAGAIN))return NMEDIA_AGAIN;
+        if(r==AVERROR(EAGAIN))return video_candidate(m,o);
         if (r == AVERROR_EOF) { m->eof = 1; continue; }
         if (r < 0) return fail(m, "read packet", r);
-        if (m->packet->size > 16 * 1024 * 1024) { av_packet_unref(m->packet); return fail(m,"packet resource limit",AVERROR(EINVAL)); }
+        if(m->packet->size<0||m->packet->stream_index<0||(unsigned)m->packet->stream_index>=m->format->nb_streams||
+           (m->packet->size&&!m->packet->data)){av_packet_unref(m->packet);return fail(m,"packet representation",AVERROR(EINVAL));}
         AVCodecContext *c = m->packet->stream_index == m->audio_index ? m->audio : m->packet->stream_index == m->video_index ? m->video : NULL;
         if (c) { r = avcodec_send_packet(c, m->packet); m->pending = c; }
         av_packet_unref(m->packet);
         if (c && r < 0) return fail(m, "send packet", r);
     }
-    return NMEDIA_AGAIN;
+    return video_candidate(m,o);
 }
+void nmedia_video_time(nmedia *m,int64_t ms){if(m){m->video_present_ms=ms;m->video_present_set=ms>=0;}}
 bool nmedia_move_video(nmedia *m,const struct nmedia_output *o,uint32_t **pixels,size_t *capacity){
     size_t count;
     if(!m||!o||!pixels||!capacity||m->error[0]||!m->video_borrowed||o->kind!=NMEDIA_VIDEO||
@@ -481,6 +564,7 @@ bool nmedia_move_video(nmedia *m,const struct nmedia_output *o,uint32_t **pixels
 static void close_decoder(nmedia *m) {
     m->video_borrowed=false;
     av_channel_layout_uninit(&m->mix_layout); m->mix_valid = false;
+    av_frame_free(&m->video_late);m->video_late_set=false;
     av_frame_free(&m->frame); av_packet_free(&m->packet);
     avcodec_free_context(&m->audio); avcodec_free_context(&m->video);
     if(m->packet_reader){avformat_free_context(m->format);m->format=NULL;}
@@ -504,7 +588,7 @@ static bool restart_flac(nmedia *m) {
 }
 bool nmedia_seek(nmedia *m, int64_t ms) {
     if (!m || !m->format || ms < 0 || ms > INT64_MAX / 1000) return false;
-    m->video_borrowed=false;
+    m->video_borrowed=false;m->video_late_set=false;if(m->video_late)av_frame_unref(m->video_late);
     int r = m->packet_reader ? (m->packet_seeker&&m->packet_seeker(m->packet_owner,ms)?0:AVERROR(EINVAL)) :
         avformat_seek_file(m->format, -1, INT64_MIN, ms * 1000, ms * 1000, 0);
     if (r < 0) {
@@ -526,7 +610,7 @@ bool nmedia_seek(nmedia *m, int64_t ms) {
  * selected cursor and seek trim. No original input/lifecycle is released. */
 bool nmedia_packets_reclaim(nmedia *m) {
     if (!m || !m->packet_reader) return false;
-    m->video_borrowed=false;
+    m->video_borrowed=false;m->video_late_set=false;if(m->video_late)av_frame_unref(m->video_late);
     m->pending = NULL; m->frame_audio = 0;
     av_frame_unref(m->frame); av_packet_unref(m->packet);
     avcodec_free_context(&m->audio); avcodec_free_context(&m->video);

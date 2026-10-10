@@ -11,7 +11,7 @@ const workerMessagingBridge=(()=>{
     const tasks=record({head:null,tail:null,closed:false});
     const routes=new Map(),mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapDelete=Map.prototype.delete,mapEach=Map.prototype.forEach,mapClear=Map.prototype.clear,isInteger=Number.isInteger;let nextRoute=0;
     const routeGet=key=>apply(mapGet,routes,[key]),routePut=(key,value)=>apply(mapSet,routes,[key,value]);
-    const portSend=host.portSend;
+    const portSend=host.portSend,portLease=host.portLease;
     const routeKey=(id,creator)=>creator+':'+id;
     const nativeCommit=host.transferCommit,iterator=Symbol.iterator,string=String;
     const wellFormed=String.prototype.toWellFormed;
@@ -23,7 +23,7 @@ const workerMessagingBridge=(()=>{
     const brand=value=>has(states,value);
     const write=(plan,object,key,value)=>append(plan.writes,{object,key,value});
     function reservation(plan,endpoint,owner){
-        if(tasks.closed||endpoint.scheduled||!owner.enabled||owner.closed||owner.detached)return;
+        if(tasks.closed||endpoint.scheduled||!owner.enabled)return;
         const task=record({endpoint,owner,next:null,cancelled:false});
         write(plan,endpoint,'scheduled',task);
         if(tasks.tail)write(plan,tasks.tail,'next',task);else write(plan,tasks,'head',task);
@@ -34,7 +34,7 @@ const workerMessagingBridge=(()=>{
         const plan={buffers:[],writes:[],cancels:[]};reservation(plan,endpoint,owner);
         if(plan.writes.length)nativeCommit(plan);
     }
-    function enable(s){if(s.detached||s.closed||tasks.closed)return;s.enabled=true;schedule(s.endpoint);}
+    function enable(s){if(!s.endpoint||tasks.closed)return;s.enabled=true;schedule(s.endpoint);}
     function optionsTransfer(options){
         if(options==null)return [];
         if(typeof options!=='object'&&typeof options!=='function')throw new TypeErr('Expected postMessage options or sequence');
@@ -60,14 +60,19 @@ const workerMessagingBridge=(()=>{
         constructor(){throw new TypeErr('Illegal constructor');}
         postMessage(value,options){
             const s=state(this);if(!arguments.length)throw new TypeErr('Message required');
-            const target=s.detached||s.closed?null:s.endpoint?.peer;
-            const transfers=optionsTransfer(options),ports=[];
-            if(s.endpoint?.broker){
-                for(let i=0;i<transfers.length;i++)if(brand(transfers[i]))throw new ErrorType('Brokered port re-transfer is not supported','DataCloneError');
-                const packet=cloneData.prepare({data:value,ports:[]},transfers,true),plan=cloneData.commitPlan(packet);cloneData.validate(packet);
-                const route=s.endpoint.broker;if(route.closed){nativeCommit(plan);return;}
-                portSend(8,route.id,route.creator,packet.data,plan);return;
+            // Do not re-read a detached source after author getters have run.
+            const target=s.detached||s.closed?null:s.endpoint?.peer,route=s.endpoint?.broker;let transfers;const ports=[];
+            if(route){
+                const capture=!s.detached&&!route.closed?portLease(0,route.id,route.creator):0;
+                try{
+                    transfers=optionsTransfer(options);
+                    for(let i=0;i<transfers.length;i++)if(brand(transfers[i]))throw new ErrorType('Brokered port re-transfer is not supported','DataCloneError');
+                    const packet=cloneData.prepare({data:value,ports:[]},transfers,true),plan=cloneData.commitPlan(packet);cloneData.validate(packet);
+                    if(capture)portSend(8,route.id,route.creator,packet.data,plan,capture);else nativeCommit(plan);
+                }finally{if(capture)portLease(1,capture,0);}
+                return;
             }
+            transfers=optionsTransfer(options);
             for(let i=0;i<transfers.length;i++){if(transfers[i]===this)fail();if(brand(transfers[i]))append(ports,transfers[i]);}
             const packet=cloneData.prepare({data:value,ports},transfers),message=cloneData.deserialize(packet.data);
             const plan=cloneData.commitPlan(packet);
@@ -75,7 +80,7 @@ const workerMessagingBridge=(()=>{
             cloneData.validate(packet);
             let doomed=false;for(let i=0;i<ports.length;i++)if(get(states,ports[i]).endpoint===target)doomed=true;
             const owner=target?.owner;
-            if(!tasks.closed&&target&&owner&&!owner.detached&&!owner.closed&&!doomed){
+            if(!tasks.closed&&target&&owner&&!doomed){
                 const entry=record({message,next:null});
                 if(target.tail)write(plan,target.tail,'next',entry);else write(plan,target,'head',entry);
                 write(plan,target,'tail',entry);reservation(plan,target,owner);
@@ -89,10 +94,9 @@ const workerMessagingBridge=(()=>{
             const s=state(this);if(s.detached||s.closed)return;
             const endpoint=s.endpoint;
             if(endpoint.broker&&!endpoint.broker.closed){portSend(9,endpoint.broker.id,endpoint.broker.creator,null,{buffers:[],writes:[],cancels:[]});endpoint.broker.closed=true;}
-            s.closed=true;s.enabled=false;s.detached=true;if(endpoint.scheduled)endpoint.scheduled.cancelled=true;
-            endpoint.scheduled=null;endpoint.head=endpoint.tail=null;
+            s.closed=true;s.detached=true;
             const peer=endpoint.peer;endpoint.peer=null;if(peer&&peer.peer===endpoint)peer.peer=null;
-            s.endpoint=null;
+            // Retain the closed port queue; tasks captured earlier still run.
         }
         get onmessage(){return state(this).onmessage;}
         set onmessage(value){const s=state(this);s.onmessage=typeof value==='function'?value:null;enable(s);}
@@ -120,7 +124,7 @@ const workerMessagingBridge=(()=>{
             if(nextRoute===4294967295)throw new RangeError('Worker port identifier space exhausted');
             const id=++nextRoute,key=routeKey(id,1),queued=[];
             for(let entry=endpoint.head;entry;entry=entry.next){if(entry.message.ports.length)throw new ErrorType('Queued nested Port transfer is not supported','DataCloneError');append(queued,cloneData.prepare(entry.message,[],true).data);}
-            const route=record({key,id,creator:1,endpoint:peer,closed:false,active:false});
+            const route=record({key,id,creator:1,endpoint:peer,closed:false,sealed:false,active:false});
             const receiver=record({value:null,endpoint,closed:false,detached:false,enabled:false,onmessage:null,onmessageerror:null,exportRoute:route});
             const token=record({receiver,meta:[id,1,queued],route});routePut(key,route);return token;
         },
@@ -144,7 +148,7 @@ const workerMessagingBridge=(()=>{
         while(tasks.head){
             const task=tasks.head;tasks.head=task.next;if(!tasks.head)tasks.tail=null;
             const endpoint=task.endpoint,s=task.owner;
-            if(task.cancelled||tasks.closed||endpoint.owner!==s||endpoint.scheduled!==task||s.detached||s.closed||!s.enabled)continue;
+            if(task.cancelled||tasks.closed||endpoint.owner!==s||endpoint.scheduled!==task||!s.enabled)continue;
             endpoint.scheduled=null;const entry=endpoint.head;if(!entry)continue;
             endpoint.head=entry.next;if(!endpoint.head)endpoint.tail=null;
             try{apply(dispatch,s.value,[new MessageEvent('message',{data:entry.message.data,ports:entry.message.ports})]);}
@@ -169,7 +173,7 @@ const workerMessagingBridge=(()=>{
         for(let i=0;i<metadata.length;i++){const m=metadata[i];if(m===null){append(receivers,null);continue;}
             const id=m[0],creator=m[1],key=routeKey(id,creator);if(!isInteger(id)||id<=0||id>4294967295||creator!==0||routeGet(key))throw new TypeErr('Invalid Worker port ownership');
             const endpoint=record({peer:null,owner:null,head:null,tail:null,scheduled:null,broker:null}),owner=makePort(endpoint);
-            const route=record({key,id,creator,endpoint,closed:false,active:true});endpoint.owner=owner;endpoint.broker=route;append(added,route);routePut(key,route);
+            const route=record({key,id,creator,endpoint,closed:false,sealed:false,active:true});endpoint.owner=owner;endpoint.broker=route;append(added,route);routePut(key,route);
             for(let j=0;j<m[2].length;j++){const message=cloneData.deserialize(m[2][j],null,true);if(message.ports.length)throw new TypeErr('Nested Worker port queue unsupported');const entry=record({message,next:null});if(endpoint.tail)endpoint.tail.next=entry;else endpoint.head=entry;endpoint.tail=entry;}
             append(receivers,owner);
         }
@@ -177,8 +181,8 @@ const workerMessagingBridge=(()=>{
         }catch(error){for(let i=0;i<added.length;i++){const route=added[i];route.closed=true;route.endpoint.head=route.endpoint.tail=null;apply(mapDelete,routes,[route.key]);}throw error;}
     }
     function receivePort(id,creator,data,closing=false){
-        const route=routeGet(routeKey(id,creator));if(!route||!route.active||route.closed||tasks.closed)return;
-        const endpoint=route.endpoint;if(closing){route.closed=true;if(endpoint.scheduled)endpoint.scheduled.cancelled=true;endpoint.scheduled=null;endpoint.head=endpoint.tail=null;return;}
+        const route=routeGet(routeKey(id,creator));if(!route||!route.active||route.sealed||tasks.closed)return;
+        const endpoint=route.endpoint;if(closing){route.closed=route.sealed=true;apply(mapDelete,routes,[route.key]);return;}
         const message=cloneData.deserialize(data,null,true);if(message.ports.length)throw new TypeErr('Nested Worker port transfer unsupported');
         const entry=record({message,next:null}),plan={buffers:[],writes:[],cancels:[]};
         if(endpoint.tail)write(plan,endpoint.tail,'next',entry);else write(plan,endpoint,'head',entry);write(plan,endpoint,'tail',entry);reservation(plan,endpoint,endpoint.owner);nativeCommit(plan);

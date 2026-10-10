@@ -202,6 +202,11 @@
     function removals(op,target,key,value){
         if(!target)return [];
         if(op==='remove')return parent(target)?[target]:[];
+        if(op==='replace' && key && value){
+            const nodes=get(key,'nodeType')===11?Array.from(get(key,'childNodes')):parent(key)?[key]:[];
+            if(value!==key && parent(value))nodes.push(value);
+            return nodes;
+        }
         if(op==='insert' && key && key!==value){
             if(!rawDom('isNode',null,key))return [];
             return get(key,'nodeType')===11?Array.from(get(key,'childNodes')):parent(key)?[key]:[];

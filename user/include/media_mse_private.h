@@ -18,6 +18,7 @@ bool nmedia_mse_parsing(const nmedia_mse *);
 int64_t nmedia_mse_group_end(const nmedia_mse *);
 int64_t nmedia_mse_duration(const nmedia_mse *);
 int nmedia_mse_step(nmedia_mse *,struct nmedia_output *);
+int nmedia_mse_step_at(nmedia_mse *,struct nmedia_output *,int64_t);
 bool nmedia_mse_move_video(nmedia_mse *,const struct nmedia_output *,uint32_t **,size_t *);
 /* Valid after AGAIN: true only for absent decoder/input, not bounded decode
  * work (e.g. seek preroll) that must be resumed without another append. */

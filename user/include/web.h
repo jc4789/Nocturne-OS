@@ -45,6 +45,7 @@ struct web_request {
     int credentials; /* 0 omit, 1 same-origin, 2 include */
     bool force_preflight; /* XHR upload listeners require CORS preflight even with safe headers. */
     bool redirect_error, same_origin;
+    bool no_cors, no_referrer; /* Private Fetch policy, never author headers. */
     bool image_upgrade; /* Native ordinary-image destination, never imageset/Fetch/script. */
     bool keepalive; /* Buffered Fetch may outlive this document, not the browser process. */
     uint64_t fetch_group; /* Native per-environment identity; not supplied by page headers. */
@@ -178,6 +179,7 @@ struct web_event {
     double delta_x, delta_y, delta_z;
     unsigned delta_mode; /* 0=pixels, 1=lines, 2=pages */
     bool synthetic; /* DOM .click() is not a trusted user click */
+    bool keyboard_activation; /* trusted keyboard activation has no pointer device */
 };
 /* NULL target means window. false means preventDefault() was called. */
 bool web_dispatch(web_doc *d, web_node *target, const struct web_event *event);
@@ -196,6 +198,14 @@ void web_hover(web_doc *d, web_node *target, const struct web_event *event);
 void web_active_press(web_doc *d, web_node *target);
 void web_active_release(web_doc *d);
 web_node *web_node_at(web_doc *d, int x, int y);
+/* Uncaptured native primary mouse only. Resolve after mouseup handlers, using
+   the current DOM; detached nodes and inactive embedding chains cannot click. */
+web_node *web_pointer_click_target(web_doc *d, web_node *down, web_node *up);
+/* Real native mouse capture, including active child documents. The returned
+   target is borrowed, live and connected; page properties cannot spoof it. */
+web_node *web_pointer_capture_target(web_doc *d, const struct web_event *event);
+web_node *web_pointer_capture_click_target(web_doc *d, web_node *released_target);
+void web_pointer_cancel(web_doc *d);
 bool web_node_action(web_doc *d, web_node *target, struct web_hit *hit);
 /* Capture before click dispatch, then resolve only that anchor after dispatch.
    Detached HTML anchors can navigate; their owner must still be the active d. */

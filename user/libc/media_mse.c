@@ -202,10 +202,10 @@ static bool demux(nmedia_mse *m,const uint8_t *body,size_t bytes,int64_t offset,
     bool ok=false,need_key=m->video_key;struct mse_configuration *configuration=NULL;nmedia *candidate=NULL;
     struct coded_frame *new_frames=NULL,*new_tail=NULL;size_t new_bytes=0,new_count=0;int64_t shift=offset,first=INT64_MIN;
     if(!format){bad(m,"MSE demux allocation quota",true);goto done;}
-    format->pb=io;format->flags|=AVFMT_FLAG_CUSTOM_IO;format->max_streams=8;format->probesize=1024*1024;
+    format->pb=io;format->flags|=AVFMT_FLAG_CUSTOM_IO;format->max_streams=INT_MAX;format->probesize=1024*1024;
     int r=avformat_open_input(&format,NULL,av_find_input_format(m->webm?"matroska":"mov"),NULL);
     if(r<0){demux_error(m,"initialization/fragment",r);goto done;}
-    if(!format||!format->nb_streams||format->nb_streams>8){bad(m,"invalid MSE initialization/fragment",false);goto done;}
+    if(!format||!format->nb_streams||format->nb_streams>(unsigned)INT_MAX){bad(m,"invalid MSE initialization/fragment",false);goto done;}
     if(encrypted(format)){bad(m,"encrypted MSE media is unsupported",false);goto done;}
     unsigned audio_tracks=0,video_tracks=0;
     for(unsigned i=0;i<format->nb_streams;i++){audio_tracks+=format->streams[i]->codecpar->codec_type==AVMEDIA_TYPE_AUDIO;video_tracks+=format->streams[i]->codecpar->codec_type==AVMEDIA_TYPE_VIDEO;}
@@ -340,11 +340,12 @@ bool nmedia_mse_append(nmedia_mse *m,const void *bytes,size_t count,int64_t offs
 bool nmedia_mse_append_take(nmedia_mse *m,void *bytes,size_t count,int64_t offset,int64_t window0,int64_t window1,bool sequence){
     return append(m,bytes,bytes,count,offset,window0,window1,sequence);
 }
-int nmedia_mse_step(nmedia_mse *m,struct nmedia_output *out){
+int nmedia_mse_step_at(nmedia_mse *m,struct nmedia_output *out,int64_t video_ms){
     if(!m||!out||m->error[0])return NMEDIA_ERROR;
     m->input_waiting=false;
     if(!m->decoder){memset(out,0,sizeof *out);m->input_waiting=!m->ended;return m->ended?NMEDIA_END:NMEDIA_AGAIN;}
     for(unsigned budget=0;budget<2;budget++){
+        nmedia_video_time(m->decoder,video_ms);
         int r=nmedia_step(m->decoder,out);if(r==NMEDIA_ERROR)strlcpy(m->error,nmedia_error(m->decoder),sizeof m->error);
         if(r==NMEDIA_END&&m->configuration_boundary){
             m->configuration_boundary=false;
@@ -358,6 +359,7 @@ int nmedia_mse_step(nmedia_mse *m,struct nmedia_output *out){
         return r;
     }memset(out,0,sizeof *out);return NMEDIA_AGAIN;
 }
+int nmedia_mse_step(nmedia_mse *m,struct nmedia_output *out){return nmedia_mse_step_at(m,out,-1);}
 bool nmedia_mse_waiting_for_input(const nmedia_mse *m){return !m||!m->decoder||m->input_waiting;}
 bool nmedia_mse_move_video(nmedia_mse *m,const struct nmedia_output *o,uint32_t **pixels,size_t *capacity){
     return m&&!m->error[0]&&nmedia_move_video(m->decoder,o,pixels,capacity);

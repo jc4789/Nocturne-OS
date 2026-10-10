@@ -138,8 +138,7 @@ void css_unescape(sbuf *out, const char *s, size_t n) {
             if (i < n && is_space((unsigned char)s[i])) i++;
             i--;
             if (cp == 0 || cp > 0x10FFFF) cp = 0xFFFD;
-            /* private-use characters are icon-font glyphs we cannot show */
-            if ((cp >= 0xE000 && cp <= 0xF8FF) || cp >= 0xF0000) continue;
+            if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;
             sb_utf8(out, cp);
         } else sb_putc(out, s[i]);
     }
@@ -245,13 +244,22 @@ static struct cexpr *cnode(struct cx *cx, char op, struct cexpr *a, struct cexpr
 
 /* the arguments of min(), max() or clamp() up to the closing parenthesis */
 static struct cexpr *calc_args(const char **s, const char *e, struct cx *cx, char op, bool clamp) {
-    struct cexpr *args[16];
-    int n = 0;
+    struct cexpr *result = NULL, *first = NULL, *second = NULL;
+    /* min/max accept an author-sized list. Keep only clamp's grammatical
+       arity, not an arbitrary fixed argument array or quota. Arena OOM is
+       handled by the same allocation trap as the expression nodes. */
+    unsigned clamp_count = 0;
     for (;;) {
         cskip(s, e);
         struct cexpr *x = calc_sum(s, e, cx);
-        if (!x || n >= 16) return NULL;
-        args[n++] = x;
+        if (!x) return NULL;
+        if (clamp) {
+            if (clamp_count == 3) return NULL;
+            if (clamp_count == 0) first = x;
+            else if (clamp_count == 1) second = x;
+            else result = cnode(cx, 'M', first, cnode(cx, 'm', second, x));
+            clamp_count++;
+        } else result = result ? cnode(cx, op, result, x) : x;
         cskip(s, e);
         if (*s < e && **s == ',') {
             (*s)++;
@@ -263,13 +271,8 @@ static struct cexpr *calc_args(const char **s, const char *e, struct cx *cx, cha
         }
         return NULL;
     }
-    if (clamp) {
-        if (n != 3) return NULL;
-        return cnode(cx, 'M', args[0], cnode(cx, 'm', args[1], args[2]));
-    }
-    struct cexpr *r = args[0];
-    for (int i = 1; i < n; i++) r = cnode(cx, op, r, args[i]);
-    return r;
+    if (clamp && clamp_count != 3) return NULL;
+    return result;
 }
 
 static struct cexpr *calc_value(const char **s, const char *e, struct cx *cx) {
@@ -757,7 +760,7 @@ struct kw {
 
 enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_FONT_SIZE, PT_FONT_WEIGHT,
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
-       PT_OVERFLOW, PT_OPACITY, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE };
+       PT_OVERFLOW, PT_OPACITY, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
@@ -807,6 +810,7 @@ static const struct kw kw_bg_repeat[] = {{"repeat", BR_REPEAT}, {"repeat-x", BR_
 /* HTML hit testing supports auto/none; SVG painted/geometry keywords remain unsupported. */
 static const struct kw kw_pointer_events[] = {{"auto", 0}, {"none", 1}, {0}};
 static const struct kw kw_visibility[] = {{"visible", 0}, {"hidden", 1}, {"collapse", 1}, {0}};
+static const struct kw kw_content_visibility[] = {{"visible", CV_VISIBLE}, {"auto", CV_AUTO}, {"hidden", CV_HIDDEN}, {0}};
 static const struct kw kw_bcollapse[] = {{"separate", 0}, {"collapse", 1}, {0}};
 static const struct kw kw_fdir[] = {{"row", FD_ROW}, {"row-reverse", FD_ROW_REVERSE}, {"column", FD_COLUMN},
                                     {"column-reverse", FD_COLUMN_REVERSE}, {0}};
@@ -836,6 +840,9 @@ static const struct kw kw_gflow[] = {{"row", 0}, {"column", 1}, {"dense", 0}, {"
                                      {"column dense", 1}, {"dense row", 0}, {"dense column", 1}, {0}};
 static const struct kw kw_capside[] = {{"top", 0}, {"bottom", 1}, {"block-start", 0}, {"block-end", 1}, {0}};
 static const struct kw kw_tlayout[] = {{"auto", 0}, {"fixed", 1}, {0}};
+static const struct kw kw_svg_fill_rule[] = {{"nonzero", 0}, {"evenodd", 1}, {0}};
+static const struct kw kw_svg_cap[] = {{"butt", 0}, {"round", 1}, {"square", 2}, {0}};
+static const struct kw kw_svg_join[] = {{"miter", 0}, {"round", 1}, {"bevel", 2}, {0}};
 static const struct kw kw_bstyle[] = {{"none", BS_NONE}, {"hidden", BS_HIDDEN}, {"solid", BS_SOLID},
                                       {"dashed", BS_DASHED}, {"dotted", BS_DOTTED}, {"double", BS_DOUBLE},
                                       {"groove", BS_GROOVE}, {"ridge", BS_RIDGE}, {"inset", BS_INSET},
@@ -892,6 +899,7 @@ static struct propdef props[] = {
     {"color", PT_COLOR, 0, true, O(color), NULL, 0},
     {"column-gap", PT_PX, LF_NOPCT, false, O(gap_col), kw_normal0, 0},
     {"content", PT_CONTENT, 0, false, O(content), NULL, 0},
+    {"content-visibility", PT_KW, 0, false, O(content_visibility), kw_content_visibility, 0},
     {"display", PT_DISPLAY, 0, false, O(display), NULL, 0},
     SH("flex", SH_FLEX),
     {"flex-basis", PT_LEN, LF_AUTO, false, O(flex_basis), NULL, 0},
@@ -901,6 +909,9 @@ static struct propdef props[] = {
     {"flex-shrink", PT_NUM, 0, false, O(flex_shrink), NULL, 0},
     {"flex-wrap", PT_KW, 0, false, O(flex_wrap), kw_fwrap, 0},
     {"float", PT_KW, 0, false, O(float_), kw_float, 0},
+    {"fill", PT_SVG_PAINT, 0, true, O(svg_fill), NULL, 0},
+    {"fill-opacity", PT_OPACITY, 0, true, O(svg_fill_opacity), NULL, 0},
+    {"fill-rule", PT_KW, 0, true, O(svg_fill_rule), kw_svg_fill_rule, 0},
     SH("font", SH_FONT),
     {"font-family", PT_FONT_FAMILY, 0, true, O(font_family), NULL, 0},
     {"font-size", PT_FONT_SIZE, 0, true, O(font_size), NULL, 0},
@@ -971,6 +982,13 @@ static struct propdef props[] = {
     {"position", PT_KW, 0, false, O(position), kw_position, 0},
     {"right", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[1]), NULL, 0},
     {"row-gap", PT_PX, LF_NOPCT, false, O(gap_row), kw_normal0, 0},
+    {"stroke", PT_SVG_PAINT, 0, true, O(svg_stroke), NULL, 0},
+    {"stroke-opacity", PT_OPACITY, 0, true, O(svg_stroke_opacity), NULL, 0},
+    {"stroke-width", PT_SVG_WIDTH, 0, true, O(svg_stroke_width), NULL, 0},
+    {"stroke-linecap", PT_KW, 0, true, O(svg_stroke_cap), kw_svg_cap, 0},
+    {"stroke-linejoin", PT_KW, 0, true, O(svg_stroke_join), kw_svg_join, 0},
+    {"stop-color", PT_COLOR, 0, false, O(svg_stop_color), NULL, 0},
+    {"stop-opacity", PT_OPACITY, 0, false, O(svg_stop_opacity), NULL, 0},
     {"table-layout", PT_KW, 0, false, O(table_layout), kw_tlayout, 0},
     {"text-align", PT_KW, 0, true, O(text_align), kw_talign, 0},
     SH("text-decoration", SH_TEXT_DECORATION),
@@ -1021,6 +1039,11 @@ static void init_initial(void) {
     style_t *s = &initial;
     s->display = D_INLINE;
     s->color = 0xFF000000u;
+    s->svg_fill.kind = SVG_PAINT_COLOR;
+    s->svg_fill.color = s->svg_stop_color = 0xFF000000u;
+    s->svg_stroke.kind = SVG_PAINT_NONE;
+    s->svg_fill_opacity = s->svg_stroke_opacity = s->svg_stop_opacity = 1;
+    s->svg_stroke_width.kind = LK_LEN; s->svg_stroke_width.px = 1;
     for (int i = 0; i < 4; i++) {
         s->border_color[i] = COLOR_CURRENT;
         s->border_width[i] = 3;
@@ -1195,26 +1218,47 @@ static bool parse_font_weight(const char *s, size_t n, struct cx *cx, uint16_t *
     return true;
 }
 
-static bool choose_family(const char *s, size_t n, uint8_t *out, struct cx *cx) {
-    const char *t[16];
-    size_t tl[16];
-    int k = split_checked(s, n, t, tl, 16, ',', cx);
-    if (cx->supports_probe) {
-        for (int i=0;i<k;i++) {
-            const char *f=t[i];size_t len=tl[i];
-            if (!len) return false;
-            if (f[0]=='"' || f[0]=='\'') { if (len<2 || f[len-1]!=f[0]) return false; continue; }
-            for (size_t j=0;j<len;) {
-                while (j<len && is_space((unsigned char)f[j])) j++;
-                size_t start=j;
-                if (j<len && (isdigit((unsigned char)f[j]) || (f[j]=='-' && j+1<len && isdigit((unsigned char)f[j+1])))) return false;
-                while (j<len && (isalnum((unsigned char)f[j]) || f[j]=='-' || f[j]=='_' || (unsigned char)f[j]>=128)) j++;
-                if (j==start || (j<len && !is_space((unsigned char)f[j]))) return false;
-                if (ident_is(f+start,j-start,"inherit") || ident_is(f+start,j-start,"initial") ||
-                    ident_is(f+start,j-start,"unset") || ident_is(f+start,j-start,"revert") || ident_is(f+start,j-start,"revert-layer")) return false;
+const char *css_font_family_next(arena_t *a,const char **cursor,const char *end) {
+    const char *s=*cursor;while(s<end && is_space((unsigned char)*s))s++;
+    const char *begin=s,*finish=s;bool quoted=s<end && (*s=='"' || *s=='\'');
+    if(quoted) {
+        char quote=*s++;begin=s;
+        while(s<end && *s!=quote) {if(*s=='\\' && s+1<end)s++;s++;}
+        if(s==end)goto bad;finish=s++;
+        while(s<end && is_space((unsigned char)*s))s++;
+        if(s<end && *s!=',')goto bad;
+    } else {
+        while(s<end && *s!=',') {
+            if(*s=='\\') {s++;if(s==end || *s=='\n' || *s=='\r' || *s=='\f')goto bad;
+                if(isxdigit((unsigned char)*s)){unsigned n=0;while(s<end && n<6 && isxdigit((unsigned char)*s)){s++;n++;}if(s<end && is_space((unsigned char)*s))s++;}
+                else s++;
+                continue;
             }
+            if(!isalnum((unsigned char)*s) && *s!='-' && *s!='_' && (unsigned char)*s<128 && !is_space((unsigned char)*s))goto bad;
+            if((s==begin || is_space((unsigned char)s[-1])) && isdigit((unsigned char)*s))goto bad;
+            s++;
         }
+        finish=s;while(finish>begin && is_space((unsigned char)finish[-1]))finish--;
     }
+    if(finish==begin)goto bad;
+    sbuf b={0};css_unescape(&b,begin,(size_t)(finish-begin));
+    if(!quoted) {
+        size_t write=0;bool space=false;
+        for(size_t i=0;i<b.n;i++)if(is_space((unsigned char)b.p[i]))space=true;
+        else {if(space && write)b.p[write++]=' ';b.p[write++]=b.p[i];space=false;}
+        b.n=write;
+    }
+    const char *name=ar_strndup(a,b.p?b.p:"",b.n);sb_free(&b);
+    if(!quoted && (!strcasecmp(name,"inherit") || !strcasecmp(name,"initial") || !strcasecmp(name,"unset") ||
+       !strcasecmp(name,"revert") || !strcasecmp(name,"revert-layer")))goto bad;
+    if(s<end){s++;const char *tail=s;while(tail<end && is_space((unsigned char)*tail))tail++;if(tail==end)goto bad;}
+    *cursor=s;return name;
+bad:*cursor=NULL;return NULL;
+}
+
+static bool choose_family(const char *s, size_t n, uint8_t *out, struct cx *cx) {
+    const char *cursor=s,*end=s+n;bool any=false,chosen=false;
+    *out=FONT_FAMILY_SERIF;
     static const char *const mono[] = {"monospace", "ui-monospace", "courier", "courier new", "consolas",
                                        "menlo", "monaco", "sfmono-regular", "sf mono", "fira code", "fira mono",
                                        "source code pro", "dejavu sans mono", "liberation mono", "roboto mono",
@@ -1230,28 +1274,18 @@ static bool choose_family(const char *s, size_t n, uint8_t *out, struct cx *cx) 
                                        "inter", "roboto", "segoe ui", "verdana",
                                        "tahoma", "cursive", "fantasy", "noto sans", "open sans",
                                        "ubuntu", "cantarell", "lato", NULL};
-    for (int i = 0; i < k; i++) {
-        const char *f = t[i];
-        size_t fl = tl[i];
-        if (fl >= 2 && (f[0] == '"' || f[0] == '\'')) f++, fl -= 2;
-        for (int j = 0; mono[j]; j++)
-            if (ident_is(f, fl, mono[j])) {
-                *out = FONT_FAMILY_MONO;
-                return true;
-            }
-        for (int j = 0; serif[j]; j++)
-            if (ident_is(f, fl, serif[j])) {
-                *out = FONT_FAMILY_SERIF;
-                return true;
-            }
-        for (int j = 0; sans[j]; j++)
-            if (ident_is(f, fl, sans[j])) {
-                *out = FONT_FAMILY_SANS;
-                return true;
-            }
+    while(cursor<end) {
+        const char *f=css_font_family_next(cx->a,&cursor,end);
+        if(!f || !cursor)return false;any=true;size_t fl=strlen(f);
+        if(chosen)continue;
+        for(int j=0;mono[j];j++)if(ident_is(f,fl,mono[j])){*out=FONT_FAMILY_MONO;chosen=true;break;}
+        if(chosen)continue;
+        for(int j=0;serif[j];j++)if(ident_is(f,fl,serif[j])){*out=FONT_FAMILY_SERIF;chosen=true;break;}
+        if(chosen)continue;
+        for(int j=0;sans[j];j++)if(ident_is(f,fl,sans[j])){*out=FONT_FAMILY_SANS;chosen=true;break;}
     }
-    *out = FONT_FAMILY_SERIF;
-    return k > 0;
+    return any;
+
 }
 
 static bool parse_list_type(const char *s, size_t n, struct cx *cx, uint8_t *out, const char **str) {
@@ -1786,6 +1820,7 @@ static bool parse_gline(const char *s, size_t n, struct cx *cx, struct gline *g)
 static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src) {
     memcpy((char *)dst + p->off, (const char *)src + p->off, p->size);
     switch (p->type) {
+    case PT_FONT_FAMILY: dst->font_names=src->font_names;dst->named_font=src->named_font;break;
     case PT_VALIGN: dst->vertical_align_px = src->vertical_align_px; break;
     case PT_LIST_TYPE: dst->list_style_string = src->list_style_string; break;
     case PT_BG_IMAGE:
@@ -1877,6 +1912,40 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         *(uint32_t *)field = c;
         return true;
     }
+    case PT_SVG_WIDTH: {
+        len_t width;
+        if (!parse_len(v, n, cx, &width, 0) || width.kind != LK_LEN || (width.pct && width.px)) return false;
+        /* Pure percentages must reach the SVG viewport, not the HTML parent.
+           The codec cannot yet evaluate mixed length/percentage expressions. */
+        *(len_t *)field = width;
+        return true;
+    }
+    case PT_SVG_PAINT: {
+        struct svg_paint paint = {0};
+        if (ident_is(v, n, "none")) paint.kind = SVG_PAINT_NONE;
+        else if (css_color_checked(v, n, &paint.color, cx)) paint.kind = SVG_PAINT_COLOR;
+        else {
+            /* The rasterizer can resolve local SVG gradients, not external
+               paint servers or context paints. Do not claim those in supports(). */
+            const char *ref = n >= 5 && strn_ieq(v, "url(", 4) && v[n-1] == ')' ? parse_url(v, n, cx->a) : NULL;
+            if (!ref) return false;
+            if (ref[0] != '#') {
+                const char *fragment = strchr(ref, '#');
+                web_doc *doc = cx->node ? cx->node->owner : NULL;
+                const char *document_url = doc ? doc->url : NULL;
+                size_t prefix = fragment ? (size_t)(fragment - ref) : 0;
+                size_t document_prefix = document_url ? strcspn(document_url, "#") : 0;
+                if (!fragment || !document_url || prefix != document_prefix || memcmp(ref, document_url, prefix)) return false;
+                ref = fragment;
+            }
+            if (!ref[1]) return false;
+            for (const char *q = ref + 1; *q; q++)
+                if (is_space((unsigned char)*q) || strchr("()\"';\\", *q)) return false;
+            paint.kind = SVG_PAINT_REF; paint.ref = ref;
+        }
+        *(struct svg_paint *)field = paint;
+        return true;
+    }
     case PT_NUM: {
         const char *q = v;
         float x;
@@ -1909,7 +1978,9 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     }
     case PT_FONT_SIZE: return parse_font_size(v, n, cx, &s->font_size);
     case PT_FONT_WEIGHT: return parse_font_weight(v, n, cx, &s->font_weight);
-    case PT_FONT_FAMILY: return choose_family(v, n, &s->font_family, cx);
+    case PT_FONT_FAMILY:
+        if(!choose_family(v,n,&s->font_family,cx))return false;
+        s->font_names=ar_strndup(cx->a,v,n);s->named_font=NULL;return true;
     case PT_LINE_HEIGHT: {
         len_t l;
         if (ident_is(v, n, "normal")) {
@@ -2588,8 +2659,9 @@ const char *css_ua_sheet(void) {
            "legend, listing, main, p, plaintext, pre, search, xmp, article, aside, h1, h2, h3, h4, h5, h6, hgroup, "
            "nav, section, dir, dd, dl, dt, menu, ol, ul, details, summary, fieldset, optgroup { display: block; }\n"
            "head, script, style, title, meta, link, base, template, datalist, param, noembed, noframes, area, map, "
-           "track, source, rp, [hidden], input[type=hidden], dialog:not([open]) "
+           "track, source, rp, [hidden]:not([hidden=until-found i]), input[type=hidden], dialog:not([open]) "
            "{ display: none; }\n"
+           "[hidden=until-found i] { content-visibility: hidden; }\n"
            "li { display: list-item; }\n"
            "table { display: table; border-spacing: 2px; border-collapse: separate; box-sizing: border-box; "
            "text-indent: 0; }\n"

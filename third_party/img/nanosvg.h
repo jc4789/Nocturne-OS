@@ -141,7 +141,7 @@ typedef struct NSVGpath
 
 typedef struct NSVGshape
 {
-	char id[64];				// Optional 'id' attr of the shape or its group
+	const char* id;			// Image-owned optional shape/group identifier; never truncated
 	NSVGpaint fill;				// Fill paint
 	NSVGpaint stroke;			// Stroke paint
 	float opacity;				// Opacity of the shape.
@@ -155,8 +155,8 @@ typedef struct NSVGshape
 	char fillRule;				// Fill rule, see NSVGfillRule.
 	unsigned char flags;		// Logical or of NSVG_FLAGS_* flags
 	float bounds[4];			// Tight bounding box of the shape [minx,miny,maxx,maxy].
-	char fillGradient[64];		// Optional 'id' of fill gradient
-	char strokeGradient[64];	// Optional 'id' of stroke gradient
+	const char* fillGradient;	// Image-owned fill gradient identifier
+	const char* strokeGradient;	// Image-owned stroke gradient identifier
 	float xform[6];				// Root transformation for fill/stroke gradient
 	NSVGpath* paths;			// Linked list of paths in the image.
 	struct NSVGshape* next;		// Pointer to next shape, or NULL if last element.
@@ -167,6 +167,7 @@ typedef struct NSVGimage
 	float width;				// Width of the image.
 	float height;				// Height of the image.
 	NSVGshape* shapes;			// Linked list of shapes in the image.
+	struct NSVGownedString* identifierOwner; // Private string ownership, released by nsvgDelete
 } NSVGimage;
 
 // Parses SVG file from a file, returns SVG image as paths.
@@ -399,8 +400,8 @@ typedef struct NSVGradialData {
 
 typedef struct NSVGgradientData
 {
-	char id[64];
-	char ref[64];
+	const char* id;
+	const char* ref;
 	signed char type;
 	union {
 		NSVGlinearData linear;
@@ -416,15 +417,15 @@ typedef struct NSVGgradientData
 
 typedef struct NSVGattrib
 {
-	char id[64];
+	const char* id;
 	float xform[6];
 	unsigned int fillColor;
 	unsigned int strokeColor;
 	float opacity;
 	float fillOpacity;
 	float strokeOpacity;
-	char fillGradient[64];
-	char strokeGradient[64];
+	const char* fillGradient;
+	const char* strokeGradient;
 	float strokeWidth;
 	float strokeDashOffset;
 	float strokeDashArray[NSVG_MAX_DASHES];
@@ -442,6 +443,15 @@ typedef struct NSVGattrib
 	char visible;
 } NSVGattrib;
 
+/* Nocturne: attribute-stack copies borrow immutable strings from the image.
+ * This keeps identifiers alive after parser teardown and avoids ownership
+ * duplication when inherited attributes are pushed/popped. */
+typedef struct NSVGownedString
+{
+    struct NSVGownedString* next;
+    char text[];
+} NSVGownedString;
+
 typedef struct NSVGparser
 {
 	NSVGattrib attr[NSVG_MAX_ATTR];
@@ -458,7 +468,23 @@ typedef struct NSVGparser
 	float dpi;
 	char pathFlag;
 	char defsFlag;
+	char identifierFailed;
 } NSVGparser;
+
+static const char* nsvg__ownIdentifier(NSVGparser* p, const char* text, size_t n)
+{
+    NSVGownedString* item;
+    if (p->identifierFailed) return NULL;
+    if (n > (size_t)-1 - sizeof(NSVGownedString) - 1) {
+        p->identifierFailed = 1; return NULL;
+    }
+    item = (NSVGownedString*)malloc(sizeof(NSVGownedString) + n + 1);
+    if (item == NULL) { p->identifierFailed = 1; return NULL; }
+    memcpy(item->text, text, n); item->text[n] = '\0';
+    item->next = p->image->identifierOwner;
+    p->image->identifierOwner = item;
+    return item->text;
+}
 
 static void nsvg__xformIdentity(float* t)
 {
@@ -630,7 +656,7 @@ static NSVGparser* nsvg__createParser(void)
 
 	// Init style
 	nsvg__xformIdentity(p->attr[0].xform);
-	memset(p->attr[0].id, 0, sizeof p->attr[0].id);
+	p->attr[0].id = NULL;
 	p->attr[0].fillColor = NSVG_RGB(0,0,0);
 	p->attr[0].strokeColor = NSVG_RGB(0,0,0);
 	p->attr[0].opacity = 1;
@@ -779,12 +805,14 @@ static float nsvg__actualOrigY(NSVGparser* p)
 
 static float nsvg__actualWidth(NSVGparser* p)
 {
-	return p->viewWidth;
+	/* Nocturne: percentage geometry is parsed before the final viewBox
+	 * inference pass. An absent viewBox uses the already parsed viewport. */
+	return p->viewWidth != 0.0f ? p->viewWidth : p->image->width;
 }
 
 static float nsvg__actualHeight(NSVGparser* p)
 {
-	return p->viewHeight;
+	return p->viewHeight != 0.0f ? p->viewHeight : p->image->height;
 }
 
 static float nsvg__actualLength(NSVGparser* p)
@@ -818,11 +846,16 @@ static NSVGgradientData* nsvg__findGradientData(NSVGparser* p, const char* id)
 	if (id == NULL || *id == '\0')
 		return NULL;
 	while (grad != NULL) {
-		if (strcmp(grad->id, id) == 0)
+		if (grad->id != NULL && strcmp(grad->id, id) == 0)
 			return grad;
 		grad = grad->next;
 	}
 	return NULL;
+}
+
+static NSVGgradientData* nsvg__gradientNext(NSVGparser* p, NSVGgradientData* data)
+{
+    return data != NULL ? nsvg__findGradientData(p, data->ref) : NULL;
 }
 
 static NSVGgradient* nsvg__createGradient(NSVGparser* p, const char* id, const float* localBounds, float *xform, signed char* paintType)
@@ -833,26 +866,34 @@ static NSVGgradient* nsvg__createGradient(NSVGparser* p, const char* id, const f
 	NSVGgradient* grad;
 	float ox, oy, sw, sh, sl;
 	int nstops = 0;
-	int refIter;
+	NSVGgradientData *slow, *fast, *cycle = NULL;
+	int enteredCycle = 0;
 
 	data = nsvg__findGradientData(p, id);
 	if (data == NULL) return NULL;
 
 	// TODO: use ref to fill in all unset values too.
+	/* Detect the real pointer cycle, not an arbitrary 32-hop limit. A cycle
+	 * may still contain a stop owner, so visit every distinct cycle member. */
+	slow = fast = data;
+	while (fast != NULL) {
+		slow = nsvg__gradientNext(p, slow);
+		fast = nsvg__gradientNext(p, nsvg__gradientNext(p, fast));
+		if (slow != NULL && slow == fast) {
+			cycle = data;
+			while (cycle != slow) { cycle = nsvg__gradientNext(p, cycle); slow = nsvg__gradientNext(p, slow); }
+			break;
+		}
+	}
 	ref = data;
-	refIter = 0;
 	while (ref != NULL) {
-		NSVGgradientData* nextRef = NULL;
+		if (ref == cycle) { if (enteredCycle) break; enteredCycle = 1; }
 		if (stops == NULL && ref->stops != NULL) {
 			stops = ref->stops;
 			nstops = ref->nstops;
 			break;
 		}
-		nextRef = nsvg__findGradientData(p, ref->ref);
-		if (nextRef == ref) break; // prevent infite loops on malformed data
-		ref = nextRef;
-		refIter++;
-		if (refIter > 32) break; // prevent infite loops on malformed data
+		ref = nsvg__gradientNext(p, ref);
 	}
 	if (stops == NULL) return NULL;
 
@@ -964,9 +1005,9 @@ static void nsvg__addShape(NSVGparser* p)
 	if (shape == NULL) goto error;
 	memset(shape, 0, sizeof(NSVGshape));
 
-	memcpy(shape->id, attr->id, sizeof shape->id);
-	memcpy(shape->fillGradient, attr->fillGradient, sizeof shape->fillGradient);
-	memcpy(shape->strokeGradient, attr->strokeGradient, sizeof shape->strokeGradient);
+	shape->id = attr->id;
+	shape->fillGradient = attr->fillGradient;
+	shape->strokeGradient = attr->strokeGradient;
 	memcpy(shape->xform, attr->xform, sizeof shape->xform);
 	scale = nsvg__getAverageScale(attr->xform);
 	shape->strokeWidth = attr->strokeWidth * scale;
@@ -1705,17 +1746,27 @@ static void nsvg__parseTransform(float* xform, const char* str)
 	}
 }
 
-static void nsvg__parseUrl(char* id, const char* str)
+static const char* nsvg__parseUrl(NSVGparser* p, const char* str)
 {
-	int i = 0;
-	str += 4; // "url(";
-	if (*str && *str == '#')
-		str++;
-	while (i < 63 && *str && *str != ')') {
-		id[i] = *str++;
-		i++;
-	}
-	id[i] = '\0';
+    const char *begin, *end;
+    char quote = 0;
+    if (strncmp(str, "url(", 4) != 0) return NULL;
+    begin = str + 4;
+    while (*begin && nsvg__isspace(*begin)) begin++;
+    if (*begin == '\'' || *begin == '"') quote = *begin++;
+    if (*begin++ != '#') return NULL; // external references are not local IDs
+    end = begin;
+    while (*end && (quote ? *end != quote : *end != ')')) end++;
+    if (quote) {
+        const char* tail = *end ? end + 1 : end;
+        while (*tail && nsvg__isspace(*tail)) tail++;
+        if (*end != quote || *tail != ')') return NULL;
+    } else {
+        if (*end != ')') return NULL;
+        while (end > begin && nsvg__isspace(end[-1])) end--;
+    }
+    if (end == begin) return NULL;
+    return nsvg__ownIdentifier(p, begin, (size_t)(end - begin));
 }
 
 static char nsvg__parseLineCap(const char* str)
@@ -1814,7 +1865,7 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 			attr->hasFill = 0;
 		} else if (strncmp(value, "url(", 4) == 0) {
 			attr->hasFill = 2;
-			nsvg__parseUrl(attr->fillGradient, value);
+			attr->fillGradient = nsvg__parseUrl(p, value);
 		} else {
 			attr->hasFill = 1;
 			attr->fillColor = nsvg__parseColor(value);
@@ -1828,7 +1879,7 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 			attr->hasStroke = 0;
 		} else if (strncmp(value, "url(", 4) == 0) {
 			attr->hasStroke = 2;
-			nsvg__parseUrl(attr->strokeGradient, value);
+			attr->strokeGradient = nsvg__parseUrl(p, value);
 		} else {
 			attr->hasStroke = 1;
 			attr->strokeColor = nsvg__parseColor(value);
@@ -1861,8 +1912,7 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 	} else if (strcmp(name, "offset") == 0) {
 		attr->stopOffset = nsvg__parseCoordinate(p, value, 0.0f, 1.0f);
 	} else if (strcmp(name, "id") == 0) {
-		strncpy(attr->id, value, 63);
-		attr->id[63] = '\0';
+		attr->id = nsvg__ownIdentifier(p, value, strlen(value));
 	} else {
 		return 0;
 	}
@@ -1871,55 +1921,57 @@ static int nsvg__parseAttr(NSVGparser* p, const char* name, const char* value)
 
 static int nsvg__parseNameValue(NSVGparser* p, const char* start, const char* end)
 {
-	const char* str;
-	const char* val;
-	char name[512];
-	char value[512];
-	int n;
-
-	str = start;
-	while (str < end && *str != ':') ++str;
-
-	val = str;
-
-	// Right Trim
-	while (str > start &&  (*str == ':' || nsvg__isspace(*str))) --str;
-	++str;
-
-	n = (int)(str - start);
-	if (n > 511) n = 511;
-	if (n) memcpy(name, start, n);
-	name[n] = 0;
-
-	while (val < end && (*val == ':' || nsvg__isspace(*val))) ++val;
-
-	n = (int)(end - val);
-	if (n > 511) n = 511;
-	if (n) memcpy(value, val, n);
-	value[n] = 0;
-
-	return nsvg__parseAttr(p, name, value);
+    const char *colon = start, *nameEnd, *valueStart;
+    char *name, *value;
+    size_t nameLength, valueLength;
+    int parsed;
+    while (colon < end && *colon != ':') colon++;
+    if (colon == end) return 0;
+    nameEnd = colon;
+    while (nameEnd > start && nsvg__isspace(nameEnd[-1])) nameEnd--;
+    valueStart = colon + 1;
+    while (valueStart < end && nsvg__isspace(*valueStart)) valueStart++;
+    while (end > valueStart && nsvg__isspace(end[-1])) end--;
+    nameLength = (size_t)(nameEnd - start);
+    valueLength = (size_t)(end - valueStart);
+    if (nameLength == 0 || p->identifierFailed) return 0;
+    if (nameLength == (size_t)-1 || valueLength == (size_t)-1) {
+        p->identifierFailed = 1; return 0;
+    }
+    name = (char*)malloc(nameLength + 1);
+    value = (char*)malloc(valueLength + 1);
+    if (name == NULL || value == NULL) {
+        free(name); free(value); p->identifierFailed = 1; return 0;
+    }
+    memcpy(name, start, nameLength); name[nameLength] = '\0';
+    memcpy(value, valueStart, valueLength); value[valueLength] = '\0';
+    parsed = nsvg__parseAttr(p, name, value);
+    free(name); free(value);
+    return parsed;
 }
 
 static void nsvg__parseStyle(NSVGparser* p, const char* str)
 {
-	const char* start;
-	const char* end;
-
-	while (*str) {
-		// Left Trim
-		while(*str && nsvg__isspace(*str)) ++str;
-		start = str;
-		while(*str && *str != ';') ++str;
-		end = str;
-
-		// Right Trim
-		while (end > start &&  (*end == ';' || nsvg__isspace(*end))) --end;
-		if (*end) ++end;
-
-		nsvg__parseNameValue(p, start, end);
-		if (*str) ++str;
-	}
+    const char* start;
+    size_t parentheses;
+    char quote;
+    while (*str && !p->identifierFailed) {
+        while (*str && nsvg__isspace(*str)) str++;
+        start = str; parentheses = 0; quote = 0;
+        while (*str) {
+            if (*str == '\\' && str[1]) { str += 2; continue; }
+            if (quote) { if (*str == quote) quote = 0; }
+            else if (*str == '\'' || *str == '"') quote = *str;
+            else if (*str == '(') {
+                if (parentheses == (size_t)-1) { p->identifierFailed = 1; return; }
+                parentheses++;
+            } else if (*str == ')' && parentheses) parentheses--;
+            else if (*str == ';' && !parentheses) break;
+            str++;
+        }
+        nsvg__parseNameValue(p, start, str);
+        if (*str) str++;
+    }
 }
 
 static void nsvg__parseAttribs(NSVGparser* p, const char** attr)
@@ -2679,8 +2731,7 @@ static void nsvg__parseGradient(NSVGparser* p, const char** attr, signed char ty
 
 	for (i = 0; attr[i]; i += 2) {
 		if (strcmp(attr[i], "id") == 0) {
-			strncpy(grad->id, attr[i+1], 63);
-			grad->id[63] = '\0';
+			grad->id = nsvg__ownIdentifier(p, attr[i+1], strlen(attr[i+1]));
 		} else if (!nsvg__parseAttr(p, attr[i], attr[i + 1])) {
 			if (strcmp(attr[i], "gradientUnits") == 0) {
 				if (strcmp(attr[i+1], "objectBoundingBox") == 0)
@@ -2714,10 +2765,9 @@ static void nsvg__parseGradient(NSVGparser* p, const char** attr, signed char ty
 					grad->spread = NSVG_SPREAD_REFLECT;
 				else if (strcmp(attr[i+1], "repeat") == 0)
 					grad->spread = NSVG_SPREAD_REPEAT;
-			} else if (strcmp(attr[i], "xlink:href") == 0) {
+			} else if (strcmp(attr[i], "xlink:href") == 0 || strcmp(attr[i], "href") == 0) {
 				const char *href = attr[i+1];
-				strncpy(grad->ref, href+1, 62);
-				grad->ref[62] = '\0';
+				grad->ref = href[0] == '#' && href[1] ? nsvg__ownIdentifier(p, href+1, strlen(href+1)) : NULL;
 			}
 		}
 	}
@@ -2987,7 +3037,7 @@ static void nsvg__createGradients(NSVGparser* p)
 
 	for (shape = p->image->shapes; shape != NULL; shape = shape->next) {
 		if (shape->fill.type == NSVG_PAINT_UNDEF) {
-			if (shape->fillGradient[0] != '\0') {
+			if (shape->fillGradient != NULL && shape->fillGradient[0] != '\0') {
 				float inv[6], localBounds[4];
 				nsvg__xformInverse(inv, shape->xform);
 				nsvg__getLocalBounds(localBounds, shape, inv);
@@ -2998,7 +3048,7 @@ static void nsvg__createGradients(NSVGparser* p)
 			}
 		}
 		if (shape->stroke.type == NSVG_PAINT_UNDEF) {
-			if (shape->strokeGradient[0] != '\0') {
+			if (shape->strokeGradient != NULL && shape->strokeGradient[0] != '\0') {
 				float inv[6], localBounds[4];
 				nsvg__xformInverse(inv, shape->xform);
 				nsvg__getLocalBounds(localBounds, shape, inv);
@@ -3023,6 +3073,7 @@ NSVGimage* nsvgParse(char* input, const char* units, float dpi)
 	p->dpi = dpi;
 
 	nsvg__parseXML(input, nsvg__startElement, nsvg__endElement, nsvg__content, p);
+	if (p->identifierFailed) { nsvg__deleteParser(p); return NULL; }
 
 	// Create gradients after all definitions have been parsed
 	nsvg__createGradients(p);
@@ -3100,6 +3151,7 @@ error:
 void nsvgDelete(NSVGimage* image)
 {
 	NSVGshape *snext, *shape;
+	NSVGownedString *string, *nextString;
 	if (image == NULL) return;
 	shape = image->shapes;
 	while (shape != NULL) {
@@ -3110,6 +3162,8 @@ void nsvgDelete(NSVGimage* image)
 		free(shape);
 		shape = snext;
 	}
+	string = image->identifierOwner;
+	while (string != NULL) { nextString = string->next; free(string); string = nextString; }
 	free(image);
 }
 

@@ -52,6 +52,12 @@ const mutationBridge = (() => {
             const fragment=get(key,'nodeType')===11,nodes=fragment?children(key):[key];
             return {op,node,nodes,fragment:fragment?key:null,removals:nodes.map(removal)};
         }
+        if(op==='replace'){
+            const fragment=get(key,'nodeType')===11,nodes=fragment?children(key):[key];
+            let nextSibling=get(value,'nextSibling');if(nextSibling===key)nextSibling=get(key,'nextSibling');
+            return {op,node,nodes,fragment:fragment?key:null,removals:nodes.map(removal),old:removal(value),
+                same:key===value,previousSibling:get(value,'previousSibling'),nextSibling};
+        }
         if(op==='remove')return {op,removal:removal(node)};
         if(op==='set' && ['innerHTML','textContent','nodeValue'].includes(key)){
             const type=get(node,'nodeType');
@@ -75,6 +81,18 @@ const mutationBridge = (() => {
         else if(t.op==='children'){
             const added=children(t.node);for(const n of t.old)transient(n,t.regs);
             if(added.length || t.old.length)enqueue('childList',t.node,{addedNodes:added,removedNodes:t.old});
+        }else if(t.op==='replace'){
+            // Adoption removes the incoming node from its old parent normally;
+            // only the replaced child's removal is observer-suppressed. One
+            // final record describes the actual replacement, even for an
+            // empty fragment or replacing a node with itself.
+            if(t.fragment){
+                for(const r of t.removals)if(r)transient(r.node,r.regs);
+                if(t.nodes.length)enqueue('childList',t.fragment,{removedNodes:t.nodes});
+            }else for(const r of t.removals)removed(r);
+            if(t.old&&!t.same)transient(t.old.node,t.old.regs);
+            enqueue('childList',t.node,{addedNodes:t.nodes,removedNodes:t.old&&!t.same?[t.old.node]:[],
+                previousSibling:t.previousSibling,nextSibling:t.nextSibling});
         }else if(t.op==='remove'){if(t.removal && parent(t.removal.node)!==t.removal.parent)removed(t.removal);}
         else if(t.op==='insert' && t.nodes.length){
             if(t.fragment){for(const r of t.removals)if(r)transient(r.node,r.regs);enqueue('childList',t.fragment,{removedNodes:t.nodes});}

@@ -122,6 +122,8 @@ static node_t *new_native(struct html_parser *p, lxb_dom_node_t *lex, web_doc *o
         n->name = ar_strndup(&d->mem, (const char *)name, len);
         n->public_id = ar_strndup(&d->mem, (const char *)dt->public_id.data, dt->public_id.length);
         n->system_id = ar_strndup(&d->mem, (const char *)dt->system_id.data, dt->system_id.length);
+        n->public_id_len = dt->public_id.length; n->system_id_len = dt->system_id.length;
+        n->doctype_identifiers_sized = true;
         break;
     }
     case LXB_DOM_NODE_TYPE_TEXT:
@@ -409,7 +411,8 @@ static lxb_dom_node_t *new_lex(struct html_parser *p, node_t *n) {
         const char *name = n->name ? n->name : "html";
         const char *pub = n->public_id ? n->public_id : "", *sys = n->system_id ? n->system_id : "";
         return lxb_dom_interface_node(lxb_dom_document_type_create(d, (const lxb_char_t *)name, strlen(name),
-            (const lxb_char_t *)pub, strlen(pub), (const lxb_char_t *)sys, strlen(sys), NULL));
+            (const lxb_char_t *)pub, n->doctype_identifiers_sized ? n->public_id_len : strlen(pub),
+            (const lxb_char_t *)sys, n->doctype_identifiers_sized ? n->system_id_len : strlen(sys), NULL));
     }
     default:
         /* External document roots only serve as private attachment containers;

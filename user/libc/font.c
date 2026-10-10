@@ -6,6 +6,7 @@
 #include <math.h>
 #include "font.h"
 #include "stb_truetype.h"
+#include "font_sfnt.h"
 static unsigned font_probe_depth;
 static bool font_probe_failed;
 
@@ -14,42 +15,31 @@ enum { FALLBACK_NONE, FALLBACK_UI, FALLBACK_SANS, FALLBACK_SERIF };
 struct font {
     stbtt_fontinfo info;
     unsigned char *data;
-    int id;
+    uint64_t id;
     int ascent, descent, line_gap; /* font units; descent is negative */
     float unit_scale;              /* pixels per font unit at 1 px/em */
     int16_t *adv;                  /* advance width per glyph in font units, INT16_MIN = not looked up */
     uint16_t lo_glyph[0x250];      /* glyph index for code points below 0x250, 0xFFFF = not looked up */
     uint8_t fallback;             /* font_open は単一 face、同梱 family だけを拡張する */
     bool merged_metrics;         /* 統合版の巨大な全字形 hhea を通常本文の行箱に使わない */
+    bool web_face;               /* validated TTF; explicit-stack composite renderer */
 };
 
-static int next_font_id = 1;
+static uint64_t next_font_id = 1;
 static uint64_t font_metrics_epoch = 1;
 
 uint64_t font_metrics_generation(void) { return font_metrics_epoch; }
 
-font_t *font_open(const char *path) {
-    if(font_probe_depth){font_probe_failed=true;return NULL;}
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
-    fseek(fp, 0, SEEK_END);
-    long n = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    unsigned char *data = n > 0 ? malloc((size_t)n) : NULL;
-    if (!data || fread(data, 1, (size_t)n, fp) != (size_t)n) {
-        fclose(fp);
-        free(data);
-        return NULL;
-    }
-    fclose(fp);
+static font_t *font_adopt(unsigned char *data, bool web_face) {
     font_t *f = calloc(1, sizeof *f);
-    if (!f || !stbtt_InitFont(&f->info, data, stbtt_GetFontOffsetForIndex(data, 0))) {
+    if (!next_font_id || !f || !stbtt_InitFont(&f->info, data, web_face ? 0 : stbtt_GetFontOffsetForIndex(data, 0))) {
         free(f);
         free(data);
         return NULL;
     }
     f->data = data;
     f->id = next_font_id++;
+    f->web_face = web_face;
     stbtt_GetFontVMetrics(&f->info, &f->ascent, &f->descent, &f->line_gap);
     f->unit_scale = stbtt_ScaleForMappingEmToPixels(&f->info, 1.0f);
     f->adv = malloc(sizeof(int16_t) * (size_t)(f->info.numGlyphs > 0 ? f->info.numGlyphs : 1));
@@ -60,6 +50,22 @@ font_t *font_open(const char *path) {
      * Unsigned wrap disables reuse permanently rather than creating an ABA. */
     if (font_metrics_epoch) font_metrics_epoch++;
     return f;
+}
+
+font_t *font_open(const char *path) {
+    if(font_probe_depth){font_probe_failed=true;return NULL;}
+    FILE *fp=fopen(path,"rb");if(!fp)return NULL;
+    fseek(fp,0,SEEK_END);long n=ftell(fp);fseek(fp,0,SEEK_SET);
+    unsigned char *data=n>0?malloc((size_t)n):NULL;
+    if(!data || fread(data,1,(size_t)n,fp)!=(size_t)n){fclose(fp);free(data);return NULL;}
+    fclose(fp);return font_adopt(data,false);
+}
+
+font_t *font_open_memory(const void *data,size_t length) {
+    if(font_probe_depth){font_probe_failed=true;return NULL;}
+    if(!data || !font_sfnt_valid(data,length))return NULL;
+    unsigned char *copy=malloc(length);if(!copy)return NULL;
+    memcpy(copy,data,length);return font_adopt(copy,true);
 }
 
 static font_t *open_bundled(const char *name) {
@@ -131,6 +137,26 @@ font_t *font_family(int family, int style) {
 }
 
 static int glyph_of(font_t *f, uint32_t cp) {
+    if(f->web_face) {
+        /* Use the validated mapping. In format 4 idDelta also applies to a
+         * nonzero glyphIdArray entry (the bundled stb path omits that case). */
+        const unsigned char *p=f->data+f->info.index_map;unsigned format=sf_u16(p);
+        if(format==0)return cp<256?p[6+cp]:0;
+        if(format==6){unsigned first=sf_u16(p+6),n=sf_u16(p+8);return cp>=first && cp-first<n?sf_u16(p+10+2*(cp-first)):0;}
+        if(format==4) {
+            if(cp>65535)return 0;unsigned n=sf_u16(p+6)/2,lo=0,hi=n;
+            while(lo<hi){unsigned mid=lo+(hi-lo)/2;if(cp>sf_u16(p+14+2*mid))lo=mid+1;else hi=mid;}
+            if(lo==n)return 0;unsigned start=sf_u16(p+16+2*n+2*lo);if(cp<start)return 0;
+            unsigned offset=16+6*n+2*lo,range=sf_u16(p+offset);int delta=sf_i16(p+16+4*n+2*lo);
+            if(!range)return (uint16_t)(cp+delta);
+            unsigned g=sf_u16(p+offset+range+2*(cp-start));return g?(uint16_t)(g+delta):0;
+        }
+        unsigned lo=0,hi=sf_u32(p+12);
+        while(lo<hi){unsigned mid=lo+(hi-lo)/2;const unsigned char *r=p+16+(size_t)mid*12;
+            unsigned first=sf_u32(r),last=sf_u32(r+4);if(cp<first)hi=mid;else if(cp>last)lo=mid+1;
+            else return (int)(sf_u32(r+8)+(format==12?cp-first:0));}
+        return 0;
+    }
     if (cp < 0x250) {
         if(font_probe_depth && f->lo_glyph[cp]==0xFFFF){font_probe_failed=true;return 0;}
         if (f->lo_glyph[cp] == 0xFFFF) f->lo_glyph[cp] = (uint16_t)stbtt_FindGlyphIndex(&f->info, (int)cp);
@@ -214,7 +240,7 @@ static font_t *glyph_face_uncached(font_t *f, uint32_t cp, int *glyph) {
    サイズ／位置には依存しない。固定 4096 件、4-way の局所置換で全消去しない。
    font は現在プロセス寿命まで保持され、id は再利用されない。 */
 enum { FACE_CACHE_SETS = 1024, FACE_CACHE_WAYS = 4 };
-struct face_entry { int font; uint32_t cp; font_t *face; int glyph; };
+struct face_entry { uint64_t font; uint32_t cp; font_t *face; int glyph; };
 static struct face_entry face_cache[FACE_CACHE_SETS][FACE_CACHE_WAYS];
 static uint8_t face_victim[FACE_CACHE_SETS];
 
@@ -298,7 +324,7 @@ float font_width(font_t *f, float px, const char *s, size_t n) {
 #define GC_MAX  6000 /* flush everything beyond this many glyphs */
 
 struct gent {
-    int font;
+    uint64_t font;
     int glyph;
     uint16_t size4; /* px * 4 */
     uint8_t phase;  /* x offset in quarter pixels */
@@ -319,6 +345,81 @@ static void gc_flush(void) {
         if (gc[i].used) free(gc[i].bmp);
     memset(gc, 0, sizeof(struct gent) * GC_SIZE);
     gc_count = 0;
+}
+
+void font_close(font_t *f) {
+    if(!f || !f->web_face)return;
+    /* Remove borrowers before the owned bytes. A full glyph-table flush keeps
+     * open-addressing chains intact; no dangling face cache entry survives. */
+    for(unsigned i=0;i<FACE_CACHE_SETS;i++)for(unsigned j=0;j<FACE_CACHE_WAYS;j++)
+        if(face_cache[i][j].font==f->id || face_cache[i][j].face==f)memset(&face_cache[i][j],0,sizeof face_cache[i][j]);
+    if(gc)gc_flush();
+    free(f->adv);free(f->data);free(f);
+    if(font_metrics_epoch)font_metrics_epoch++;
+}
+
+/* Web composites never enter stb's recursive glyph parser. Each simple glyph
+ * has already passed the byte gate; placement follows the native stb matrix
+ * convention, with explicit heap frames and checked vertex representation. */
+static int web_glyph_shape(font_t *f,unsigned glyph,stbtt_vertex **vertices) {
+    const unsigned char *data=f->data;bool wide=f->info.indexToLocFormat!=0;
+    struct sf_span loca={data+f->info.loca,0};
+    uint32_t start=sf_glyph_at(loca,glyph,wide),end=sf_glyph_at(loca,glyph+1,wide);
+    *vertices=NULL;if(start==end)return 0;
+    if(sf_i16(data+f->info.glyf+start)>=0)return stbtt_GetGlyphShape(&f->info,(int)glyph,vertices);
+    struct shape_frame {unsigned glyph;size_t at;bool entered,more;float matrix[6],mx,my;};
+    struct shape_frame *stack=calloc((size_t)f->info.numGlyphs,sizeof *stack);
+    if(!stack)return -1;
+    size_t depth=1,count=0,capacity=0;stbtt_vertex *out=NULL;
+    stack[0].glyph=glyph;
+    while(depth) {
+        struct shape_frame *v=&stack[depth-1];
+        start=sf_glyph_at(loca,v->glyph,wide);end=sf_glyph_at(loca,v->glyph+1,wide);
+        const unsigned char *p=data+f->info.glyf+start;
+        if(!v->entered) {
+            v->entered=true;v->at=10;v->more=start!=end && sf_i16(p)==-1;
+            if(start!=end && sf_i16(p)>0) {
+                stbtt_vertex *simple=NULL;int n=stbtt_GetGlyphShape(&f->info,(int)v->glyph,&simple);
+                if(n<=0 || !simple)goto bad;
+                if((size_t)n>(size_t)INT_MAX/sizeof *out-count){stbtt_FreeShape(&f->info,simple);goto bad;}
+                size_t need=count+(size_t)n;
+                if(need>capacity) {
+                    size_t cap=capacity?capacity:16;
+                    while(cap<need){if(cap>(size_t)INT_MAX/sizeof *out/2){cap=need;break;}cap*=2;}
+                    void *q=realloc(out,cap*sizeof *out);if(!q){stbtt_FreeShape(&f->info,simple);goto bad;}out=q;capacity=cap;
+                }
+                for(int i=0;i<n;i++) {
+                    stbtt_vertex s=simple[i];
+                    for(size_t a=depth;a>1;a--) {
+                        const struct shape_frame *t=&stack[a-1];float x=s.x,y=s.y,cx=s.cx,cy=s.cy;
+                        float values[4]={t->mx*(t->matrix[0]*x+t->matrix[2]*y+t->matrix[4]),
+                            t->my*(t->matrix[1]*x+t->matrix[3]*y+t->matrix[5]),
+                            t->mx*(t->matrix[0]*cx+t->matrix[2]*cy+t->matrix[4]),
+                            t->my*(t->matrix[1]*cx+t->matrix[3]*cy+t->matrix[5])};
+                        for(unsigned z=0;z<4;z++)if(!isfinite(values[z]) || values[z]<INT16_MIN || values[z]>INT16_MAX){stbtt_FreeShape(&f->info,simple);goto bad;}
+                        s.x=(int16_t)values[0];s.y=(int16_t)values[1];s.cx=(int16_t)values[2];s.cy=(int16_t)values[3];
+                    }
+                    out[count++]=s;
+                }
+                stbtt_FreeShape(&f->info,simple);
+            }
+        }
+        if(!v->more){depth--;continue;}
+        struct sf_span bytes={p,end-start};size_t at=v->at;unsigned flags,child;
+        if(!sf_component(bytes,&v->at,(unsigned)f->info.numGlyphs,&child,&flags) || depth==(size_t)f->info.numGlyphs)goto bad;
+        v->more=(flags&32)!=0;
+        struct shape_frame *ch=&stack[depth++];memset(ch,0,sizeof *ch);ch->glyph=child;ch->matrix[0]=ch->matrix[3]=1;
+        at+=4;
+        if(flags&1){ch->matrix[4]=sf_i16(p+at);ch->matrix[5]=sf_i16(p+at+2);at+=4;}
+        else {ch->matrix[4]=(int8_t)p[at];ch->matrix[5]=(int8_t)p[at+1];at+=2;}
+        if(flags&8)ch->matrix[0]=ch->matrix[3]=sf_i16(p+at)/16384.0f;
+        else if(flags&64){ch->matrix[0]=sf_i16(p+at)/16384.0f;ch->matrix[3]=sf_i16(p+at+2)/16384.0f;}
+        else if(flags&128)for(unsigned z=0;z<4;z++)ch->matrix[z]=sf_i16(p+at+2*z)/16384.0f;
+        ch->mx=sqrtf(ch->matrix[0]*ch->matrix[0]+ch->matrix[1]*ch->matrix[1]);
+        ch->my=sqrtf(ch->matrix[2]*ch->matrix[2]+ch->matrix[3]*ch->matrix[3]);
+    }
+    free(stack);*vertices=out;return (int)count;
+bad:free(stack);free(out);return -1;
 }
 
 static struct gent *gc_get(font_t *f, int g, float px, int phase) {
@@ -352,8 +453,15 @@ static struct gent *gc_get(font_t *f, int g, float px, int phase) {
             e->w = (uint16_t)(x1 > x0 ? x1 - x0 : 0);
             e->h = (uint16_t)(y1 > y0 ? y1 - y0 : 0);
             e->bmp = NULL;
-            if (e->w && e->h && (e->bmp = malloc((size_t)e->w * e->h)))
-                stbtt_MakeGlyphBitmapSubpixel(&f->info, e->bmp, e->w, e->h, e->w, scale, scale, shift, 0, g);
+            if (e->w && e->h && (e->bmp = calloc((size_t)e->w,e->h))) {
+                if(f->web_face) {
+                    stbtt_vertex *vertices=NULL;int count=web_glyph_shape(f,(unsigned)g,&vertices);
+                    if(count<0){free(e->bmp);memset(e,0,sizeof *e);return NULL;}
+                    stbtt__bitmap bitmap={e->w,e->h,e->w,e->bmp};
+                    stbtt_Rasterize(&bitmap,0.35f,vertices,count,scale,scale,shift,0,x0,y0,1,f->info.userdata);
+                    free(vertices);
+                } else stbtt_MakeGlyphBitmapSubpixel(&f->info, e->bmp, e->w, e->h, e->w, scale, scale, shift, 0, g);
+            }
             gc_count++;
             return e;
         }

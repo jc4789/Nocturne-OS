@@ -123,6 +123,8 @@ typedef struct node {
     const char *name; /* lowercase tag name; case-preserving PI target */
     const char *raw_name;
     const char *public_id, *system_id;
+    size_t public_id_len, system_id_len;
+    bool doctype_identifiers_sized;
     struct attr *attrs;
     int nattrs;
     struct attr *attribute; /* N_ATTR: the canonical current record, attached or detached. */
@@ -264,6 +266,7 @@ struct gline {
 
 #define COLOR_CURRENT 0x00FFFFFEu /* placeholder for currentColor while computing */
 enum { OF_FILL, OF_CONTAIN, OF_COVER, OF_NONE, OF_SCALE_DOWN };
+enum { CV_VISIBLE, CV_AUTO, CV_HIDDEN };
 
 struct custom_prop {
     const char *name, *value;
@@ -284,19 +287,35 @@ struct gradient {
     len_t pos[GRAD_MAX];    /* LK_AUTO: spread between its neighbours */
 };
 
+enum { SVG_PAINT_NONE, SVG_PAINT_COLOR, SVG_PAINT_REF };
+struct svg_paint {
+    uint32_t color; /* COLOR_CURRENT is resolved against each element, not the SVG root. */
+    const char *ref; /* local paint-server fragment; no external resource bypass */
+    uint8_t kind;
+};
+
 typedef struct style {
     uint8_t display, position, float_, clear, white_space, text_align, vertical_align, list_style,
         list_style_inside, font_style, text_transform, text_decoration, overflow, box_sizing, visibility, pointer_events,
-        border_collapse, flex_direction, flex_wrap, justify_content, align_items, align_self, align_content, table_layout;
+        border_collapse, flex_direction, flex_wrap, justify_content, align_items, align_self, align_content, table_layout,
+        content_visibility;
     uint8_t border_style[4];
     uint16_t font_weight;
     uint8_t font_family; /* FONT_FAMILY_*; inherited as one byte */
+    const char *font_names; /* full authored family list, computed-style arena */
+    font_t *named_font;     /* document-owned downloaded face, never AST-owned */
     uint8_t object_fit;
     len_t object_pos[2]; /* position within (content box - fitted image) */
     float font_size;
     len_t line_height;
     float vertical_align_px;
     uint32_t color, bg_color;
+    struct svg_paint svg_fill, svg_stroke;
+    float svg_fill_opacity, svg_stroke_opacity;
+    uint32_t svg_stop_color;
+    float svg_stop_opacity;
+    len_t svg_stroke_width;
+    uint8_t svg_fill_rule, svg_stroke_cap, svg_stroke_join;
     uint32_t border_color[4];
     float border_width[4];
     float border_radius;
@@ -405,6 +424,9 @@ void css_style_init(style_t *s, const style_t *parent);
 void css_style_finish(style_t *s, const style_t *parent, bool root);
 /* unescape a CSS string or identifier body (backslash escapes) */
 void css_unescape(sbuf *out, const char *s, size_t n);
+/* One decoded family at a time; no fixed family-count/identifier truncation.
+   cursor=NULL means malformed input; cursor=end means a complete list. */
+const char *css_font_family_next(arena_t *a, const char **cursor, const char *end);
 
 /* ---------------------------------------------------------------- boxes */
 enum { B_BLOCK, B_INLINE, B_TEXT, B_ATOMIC, B_TABLE, B_ROW_GROUP, B_ROW, B_CELL, B_CAPTION, B_BR, B_FLEX, B_GRID };
@@ -459,6 +481,7 @@ struct svg_cache {
     size_t n;
     image_t *img;
     int w, h; /* size it was drawn at */
+    bool used; /* reachable from the box tree currently being rebuilt */
 };
 struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color);
 bool box_block_level(const box_t *b);
@@ -487,6 +510,7 @@ void doc_active_cancel(web_doc *document); /* retire/free only this context subt
 node_t *doc_active_target(web_doc *document); /* validates live native press and embedding generation */
 
 void boxes_build(web_doc *d, arena_t *a);
+void boxes_discard(web_doc *d); /* unpublish node/top-layer borrowers, then bmem */
 void layout_doc(web_doc *d, int width, int height);
 float box_abs_x(const box_t *b);
 float box_abs_y(const box_t *b);
@@ -552,7 +576,8 @@ struct web_doc {
     node_t *details_toggle_first, *details_toggle_last;
     web_doc *template_doc;
     arena_t mem;    /* DOM, stylesheets */
-    arena_t smem;   /* styles and boxes (rebuilt by the cascade) */
+    arena_t smem;   /* computed styles: retained across text-only box rebuilds */
+    arena_t bmem;   /* box/anonymous-style ownership, never the computed styles */
     arena_t lmem;   /* layout results */
     arena_t cssmem; /* authored sheets: replaced on a DOM stylesheet mutation */
     node_t *owned_nodes;
@@ -585,6 +610,7 @@ struct web_doc {
     pvec pending_css; /* char* URLs still to fetch */
     double next_sheet_order;
     pvec images;      /* struct web_image* */
+    struct web_font_resource *fonts; /* stable URL identities across CSS rescans */
     pvec svgs;        /* struct svg_cache* */
     box_t *root_box;
     pvec abs_boxes;   /* absolutely positioned boxes, painted last */
@@ -607,6 +633,7 @@ struct web_doc {
     node_t *find_node;
     struct run *find_run;
     char *find_text; /* document-owned full search query */
+    bool find_revealing; /* author beforematch may flush layout, not restart find */
 };
 
 node_t *html_parse(web_doc *d, const char *html, size_t n, const char *charset);
@@ -618,6 +645,14 @@ node_t *doc_template_content(web_doc *d, node_t *node);
 bool doc_templates_finish(web_doc *d, node_t *root);
 const char *doc_link_href(web_doc *d, node_t *a); /* node-owner-relative absolute URL; valid until the next call */
 void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *base);
+struct web_font_resource {
+    struct web_font_resource *next;
+    char *url;
+    font_t *face;
+    bool wanted, loading, done, failed;
+};
+struct web_font_resource *doc_font_resource(web_doc *d, const char *url);
+void doc_font_loaded(web_doc *d, struct web_font_resource *font, const void *bytes, size_t length);
 
 /* Incremental parser: 1 script boundary, 0 complete, -1 allocation failure.
    web_parse remains a scripting-disabled, fully parsed document. */
@@ -646,6 +681,10 @@ enum doc_create_failure { DOC_CREATE_INVALID, DOC_CREATE_QUOTA, DOC_CREATE_ALLOC
     DOC_CREATE_OVERFLOW, DOC_CREATE_TEMPLATE, DOC_CREATE_WRAPPER };
 void doc_create_diagnostic(web_doc *d, unsigned stage, int type, size_t name_bytes, size_t data_bytes);
 node_t *doc_node_create(web_doc *d, int type, const char *name, const char *text, size_t n);
+node_t *doc_doctype_create(web_doc *d, const char *name, size_t name_len,
+    const char *public_id, size_t public_len, const char *system_id, size_t system_len);
+int doc_node_insert_validity(node_t *parent, node_t *child, node_t *before);
+int doc_node_replace_validity(node_t *parent, node_t *child, node_t *old);
 node_t *doc_node_root(node_t *node, bool composed);
 node_t *doc_shadow_parent(node_t *node); /* parent, or a shadow root's host */
 bool doc_node_connected(node_t *node);
@@ -672,6 +711,7 @@ bool doc_attr_remove(web_doc *d, node_t *element, int index);
 bool doc_attr_value(web_doc *d, node_t *attribute, const char *value);
 void doc_attrs_publish(node_t *element, struct attr *attrs, int count);
 bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before);
+bool doc_node_replace(web_doc *d, node_t *parent, node_t *child, node_t *old);
 void doc_node_remove(web_doc *d, node_t *node);
 bool doc_node_text(web_doc *d, node_t *node, const char *text, size_t n);
 bool doc_node_html(web_doc *d, node_t *node, const char *html, size_t n);
@@ -701,6 +741,8 @@ bool css_select(web_doc *d, node_t *scope, const char *selector, pvec *out);
 bool css_matches(node_t *node, const char *selector, bool *valid);
 void web_js_start(web_doc *d, const struct web_host *host);
 void web_js_console(web_doc *d, int level, const char *message);
+/* Native trusted link activation only; not exposed as a script popup API. */
+bool web_js_auxiliary_link(web_doc *d,const char *url);
 bool web_js_video_present(web_doc *d,const struct web_video_patch *patch);
 void web_js_focus_control(web_doc *d, node_t *control);
 void web_js_face_reset(web_doc *d, node_t *form);
@@ -719,6 +761,7 @@ int64_t web_js_deadline(web_doc *d);
 bool web_js_running(web_doc *d);
 bool web_js_enabled(web_doc *d);
 bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *e);
+bool web_js_reveal_hidden(web_doc *d, node_t *target);
 /* Native edit event: NULL data means InputEvent.data=null. */
 bool web_js_input_event(web_doc *d,node_t *target,const char *type,const char *input_type,const char *data,size_t length);
 /* One physical edit task encloses beforeinput, native default and input. */

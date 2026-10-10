@@ -2,8 +2,9 @@
    https://fetch.spec.whatwg.org/#fetch-api (consulted 2026-10-06).
    Body bytes are real snapshots, not String(BufferSource). Response and Blob
    bodies expose real Streams; the host network transport is still buffered.
-   Stream uploads and opaque responses fail
-   explicitly rather than pretending to perform unsupported transport work.
+   Stream uploads and manual opaque redirects fail explicitly. Native no-cors
+   fetches perform actual HTTP and expose an empty opaque response after a
+   cross-origin hop; the native worker checks safelists and resource policy.
    Buffered keepalive requests use a native, document-independent transport;
    Fetch's 64 KiB inflight body accounting belongs to that native fetch group.
    Request cache modes use the cacheless native host's genuine network path;
@@ -245,9 +246,16 @@ const fetchBridge = (() => {
         static timeout(ms) {
             if(!arguments.length)throw new TypeError('timeout requires milliseconds');
             ms=+ms;if(!Number.isFinite(ms))throw new TypeError('Invalid timeout');
-            ms=Math.trunc(ms);if(ms<0||ms>Number.MAX_SAFE_INTEGER)throw new TypeError('Invalid timeout');
-            if(ms>2147483647)throw new RangeError('Timeout exceeds the browser timer limit');
-            const signal=newSignal();host.timer(0,()=>abortSignal(signal,new DOMException('Timed out','TimeoutError')),ms,[]);return signal;
+            ms=Math.trunc(ms);if(ms<0||ms>=18446744073709551616)throw new TypeError('Invalid timeout');
+            // AbortSignal takes unsigned long long, not setTimeout's signed
+            // long. Keep its complete duration and split only the native wait.
+            const signal=newSignal(),started=host.now();
+            const elapsed=()=>{
+                const remaining=ms-(host.now()-started);
+                if(remaining>0)host.timer(0,elapsed,Math.min(remaining,2147483647),[]);
+                else abortSignal(signal,new DOMException('Timed out','TimeoutError'));
+            };
+            host.timer(0,elapsed,Math.min(ms,2147483647),[]);return signal;
         }
         static any(signals) {
             if(!arguments.length)throw new TypeError('any requires signals');
@@ -371,10 +379,13 @@ const fetchBridge = (() => {
         try {
             if(!arguments.length)throw new TypeError('fetch requires input');r=new Request(input,init);s=requestSlots.get(r);b=bodySlots.get(r);
             const signal=signalSlots.get(s.signal);if(signal.aborted)return reject(signal.reason);
-            if(s.mode==='no-cors')throw notSupported('Opaque no-cors responses are not supported');
+            if(s.mode==='no-cors'&&!host.noCorsFetch)throw notSupported('This native context has no no-cors transport');
             if(s.redirect==='manual')throw notSupported('Opaque manual redirect responses are not supported');
             if(s.integrity)throw notSupported('Subresource integrity is not supported by fetch');
-            if(s.referrer!=='about:client'||s.referrerPolicy)throw notSupported('Fetch referrer overrides are not supported');
+            // These overrides really request the native host's existing
+            // no-referrer behavior. Do not reject them as missing transport.
+            const noReferrer=s.referrer===''||s.referrerPolicy==='no-referrer';
+            if(!noReferrer&&(s.referrer!=='about:client'||s.referrerPolicy))throw notSupported('Fetch referrer overrides requiring a Referer header are not supported');
             // This host has no stored HTTP responses. A cache-only miss is a
             // Fetch network error (TypeError), not a synthetic HTTP 504, and
             // cannot reach host.fetch even for a cross-origin target URL.
@@ -384,7 +395,7 @@ const fetchBridge = (() => {
                 return new NativePromise(resolve=>resolve(responseObject({status:local.status,statusText:local.status===206?'Partial Content':'OK',url:s.url.split('#')[0],headers,redirected:false,type:'basic'},{bytes:local.bytes,used:false,abort:s.signal})));
             }
             let raw='';for(const [name,value]of sortedHeaders(headerSlots.get(s.headers)))raw+=name+': '+value+'\r\n';
-            const pair=host.fetch(s.url,s.method,raw,b.bytes===null?'':b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),false,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache),s.keepalive);
+            const pair=host.fetch(s.url,s.method,raw,b.bytes===null?'':b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),false,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache),s.keepalive,s.mode==='no-cors',noReferrer);
             if(b.bytes!==null)b.used=true;
             return new NativePromise((resolve,reject)=>{
                 let finished=false;
@@ -427,13 +438,17 @@ const fetchBridge = (() => {
             return {status:s.status,statusText:s.statusText,url:s.url,headers:s.headers,bytes};
         },
         response(status,url,raw,text,bytes,redirected,statusText,type) {
+            // Native completions redact the opaque internals before entering
+            // this realm. Do not inspect author-modifiable regex/URL methods.
+            if(type==='opaque')return responseObject({status:0,statusText:'',url:'',headers:makeHeaders(undefined,'immutable'),redirected:false,type:'opaque'},{bytes:null,used:false,abort:null});
             const headers=makeHeaders(undefined,'response');
             for(const line of raw.split(/\r?\n/)){const i=line.indexOf(':');if(i>0&&!line.startsWith('HTTP/'))appendHeader(headerSlots.get(headers),normalizeName(line.slice(0,i)),normalizeValue(line.slice(i+1)));}
             headerSlots.get(headers).guard='immutable';
             if(statusText===undefined){const m=/^HTTP\/\S+\s+\d{3}(?:[ \t]+([^\r\n]*))?/.exec(raw);statusText=m?(m[1]||''):'';}
             // Negotiated native metadata is not an HTTP field: webfetch only
             // copies server fields containing ':', so a server cannot forge it.
-            const transport=/^HTTP\/Nocturne-Meta cors=([01]) redirected=([01])\r?$/m.exec(raw);
+            const transport=type===undefined?/^HTTP\/Nocturne-Meta cors=([01]) redirected=([01])(?: opaque=([01]))?\r?$/m.exec(raw):null;
+            if(transport&&transport[3]==='1')return responseObject({status:0,statusText:'',url:'',headers:makeHeaders(undefined,'immutable'),redirected:false,type:'opaque'},{bytes:null,used:false,abort:null});
             if(transport){type=transport[1]==='1'?'cors':'basic';redirected=transport[2]==='1';}
             if(type===undefined)type=new NativeURL(url).origin===new NativeURL(host.url()).origin?'basic':'cors';
             return responseObject({status,statusText,url:usv(url).split('#')[0],headers,redirected:!!redirected,type},

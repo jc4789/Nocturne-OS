@@ -53,6 +53,11 @@ def main():
     # These overrides remove unused upstream helper assumptions, not new syscalls.
     config=out/'config.h';text=config.read_text(encoding='utf-8')
     for token in ['MMAP','FCNTL','MKSTEMP']:text=text.replace('#define HAVE_'+token+' 1','#define HAVE_'+token+' 0')
+    # Native x86-64 integer loads are fast, including unaligned inputs. The
+    # asm-disabled configure path must not disable these portable C fast paths.
+    for token in ['FAST_64BIT','FAST_UNALIGNED']:text=text.replace('#define HAVE_'+token+' 0','#define HAVE_'+token+' 1')
+    avconfig=out/'libavutil/avconfig.h'
+    avconfig.write_text(avconfig.read_text(encoding='utf-8').replace('#define AV_HAVE_FAST_UNALIGNED 0','#define AV_HAVE_FAST_UNALIGNED 1'),encoding='utf-8',newline='\n')
     # configure emits an empty EXTERN_ASM macro with a trailing space.
     # Normalize generated configuration only, never upstream C/license bytes.
     text='\n'.join(line.rstrip(' \t') for line in text.splitlines())+'\n'

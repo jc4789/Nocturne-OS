@@ -46,18 +46,100 @@ Object.defineProperties(PointerEvent.prototype,{x:{configurable:true,enumerable:
 for(const type of ['pointerover','pointerenter','pointerdown','pointermove','pointerup','pointercancel','pointerout','pointerleave','gotpointercapture','lostpointercapture'])globalHandlerTypes.add(type);
 const mousePointerInit=init=>mouseAssign({},init,{pointerId:1,pointerType:'mouse',isPrimary:true,width:1,height:1,pressure:init.buttons ? .5 : 0});
 let suppressCompatibilityMouse=false;
+/* Only the real native mouse stream can activate a pointer. dispatchEvent()
+   must not create a device, grant capture, or release an existing capture. */
+const pointerCaptureBridge=(()=>{
+    const get=rawDom, define=Object.defineProperty;
+    let active=false,buttons=0,pending=null,captured=null,lastUpCapture=null,last={};
+    function sync(){host.pointerCapturePending(pending!==null || captured!==null);}
+    function element(value){get('get',value,'elementBrand');return value;}
+    function identifier(value){return (+value)>>0;}
+    function pointer(id){
+        if(id!==1 || !active)throw new DOMException('The pointer is not active','NotFoundError');
+    }
+    function connected(target){
+        return target!==null && get('get',target,'isConnected') &&
+            get('get',target,'ownerDocument')===document;
+    }
+    function event(type,target,init){
+        const e=new PointerEvent(type,mousePointerInit(mouseAssign({},init,{
+            view:globalThis,bubbles:true,cancelable:false
+        })));
+        e.composed=true;e.isTrusted=true;
+        dispatch(target,e);
+    }
+    function process(init){
+        last=mouseAssign({},init);
+        if(pending && !connected(pending))pending=null;
+        const previous=captured,next=pending;
+        if(previous===next)return;
+        /* Capture event dispatch itself may change the pending override. */
+        if(previous)event('lostpointercapture',connected(previous)?previous:document,init);
+        if(next && connected(next))event('gotpointercapture',next,init);
+        if(pending && !connected(pending))pending=null;
+        captured=pending;
+        sync();
+    }
+    for(const [name,method] of [
+        ['setPointerCapture',function(id){
+            const target=element(this);
+            if(!arguments.length)throw new TypeError('Pointer identifier is required');
+            id=identifier(id);pointer(id);
+            if(!connected(target))throw new DOMException('The element is not connected','InvalidStateError');
+            if(!buttons)return;
+            pending=target;
+            sync();
+        }],
+        ['releasePointerCapture',function(id){
+            const target=element(this);
+            if(!arguments.length)throw new TypeError('Pointer identifier is required');
+            id=identifier(id);pointer(id);
+            if(pending===target){pending=null;sync();}
+        }],
+        ['hasPointerCapture',function(id){
+            const target=element(this);
+            if(!arguments.length)throw new TypeError('Pointer identifier is required');
+            id=identifier(id);
+            return active && id===1 && pending===target;
+        }]
+    ])define(Element.prototype,name,{configurable:true,enumerable:true,writable:true,value:method});
+    return {
+        target(init){
+            /* A release or removal must reach its old document even when the
+               next real hit is in a different frame or native chrome. */
+            if(active && (!pending || !connected(pending)) && captured)process(init||last);
+            return active && connected(pending)?pending:null;
+        },
+        prepare(init){active=true;buttons=init.buttons>>>0;process(init);return connected(captured)?captured:null;},
+        pointerUp(target){lastUpCapture=connected(captured)?target:null;},
+        clickTarget(){const target=lastUpCapture;lastUpCapture=null;return connected(target)?target:null;},
+        release(init){buttons=0;pending=null;process(init);},
+        cancel(){
+            const init=mouseAssign({},last,{buttons:0});
+            if(active && buttons)event('pointercancel',connected(captured)?captured:document,init);
+            buttons=0;pending=null;process(init);active=false;lastUpCapture=null;suppressCompatibilityMouse=false;
+        },
+        reset(){active=false;buttons=0;pending=captured=lastUpCapture=null;last={};suppressCompatibilityMouse=false;sync();}
+    };
+})();
 function nativeDispatch(target,type,init) {
     target=target===null?globalThis:target;
     if(init.isTrusted!==false && (type==='mousedown'||type==='mouseup')) {
+        const capture=pointerCaptureBridge.prepare(init);
+        if(capture)target=capture;
+        if(type==='mouseup')pointerCaptureBridge.pointerUp(target);
         const pointer=new PointerEvent(type==='mousedown'?'pointerdown':'pointerup',mousePointerInit(init));
+        pointer.view=globalThis;
         pointer.composed=true;pointer.isTrusted=true;
         const allowed=dispatch(target,pointer);
         if(type==='mousedown')suppressCompatibilityMouse=!allowed;
+        if(type==='mouseup')pointerCaptureBridge.release(init);
         if(suppressCompatibilityMouse){if(type==='mouseup')suppressCompatibilityMouse=false;return true;}
     }
     const focus=/^(?:focus|blur|focusin|focusout)$/.test(type);
-    const C=type==='submit'?formValidationBridge.SubmitEvent:focus?FocusEvent:type==='wheel'?WheelEvent:/^(key)/.test(type)?KeyboardEvent:/^pointer/.test(type)?PointerEvent:/^(mouse|click|dblclick)/.test(type)?MouseEvent:Event;
-    const e=new C(type,focus?mouseAssign({},init,{view:globalThis}):init);
+    const C=type==='submit'?formValidationBridge.SubmitEvent:focus?FocusEvent:type==='wheel'?WheelEvent:/^(key)/.test(type)?KeyboardEvent:/^(pointer|click$)/.test(type)?PointerEvent:/^(mouse|dblclick)/.test(type)?MouseEvent:Event;
+    const ui=focus||C===MouseEvent||C===PointerEvent||C===WheelEvent;
+    const e=new C(type,ui?mouseAssign({},init,{view:globalThis}):init);
     for(const key of Object.keys(init))if(key!=='submitter'&&!(focus&&key==='relatedTarget')&&!(wheelData.has(e)&&wheelFields.has(key))&&!pointerData.has(e))e[key]=init[key];
     e.composed=/^(?:keydown|keyup|keypress|click|dblclick|mousedown|mouseup|mouseout|mousemove|mouseover|pointerdown|pointerup|pointermove|pointerout|pointerover|pointercancel|wheel|focus|blur|focusin|focusout|input)$/.test(type);
     e.isTrusted=init.isTrusted!==false;

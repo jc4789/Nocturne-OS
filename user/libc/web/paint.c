@@ -1077,7 +1077,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             bool skip_bg = (P->canvas_bg_from == 1 && b->node == P->d->html && b->node) ||
                            (P->canvas_bg_from == 2 && b->node == P->d->body && b->node);
             paint_bg_border(P, st, P->ox + bx, P->oy + by, bw, bh, b->b, skip_bg, false, false);
-        } else if (P->mode == M_HIT && hit_style(st) && b->kind == B_ATOMIC && inside(P, bx, by, bw, bh)) {
+        } else if (P->mode == M_HIT && hit_style(st) && st->content_visibility!=CV_HIDDEN && b->kind == B_ATOMIC && inside(P, bx, by, bw, bh)) {
             int k = control_hit(b);
             if (k != WEB_HIT_NONE) set_hit(P, k, b->node, NULL);
         }
@@ -1086,9 +1086,10 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         paint_bg_border(P, st, P->ox + x, P->oy + y, b->w, b->h, z, false, false, false);
     }
     if (b->kind == B_ATOMIC && b->atomic != AT_INLINE_BLOCK) {
-        if (P->mode == M_PAINT && visible) paint_replaced(P, b);
+        if (P->mode == M_PAINT && visible && st->content_visibility!=CV_HIDDEN) paint_replaced(P, b);
         goto done;
     }
+    if(st->content_visibility==CV_HIDDEN)goto done;
     if (b->marker || b->marker_shape) {
         if (P->mode == M_PAINT) paint_marker(P, b);
     }
@@ -1190,9 +1191,9 @@ uint32_t doc_canvas_bg(web_doc *d, int *from) {
 
 void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y) {
     paint_debug_begin(d);
+    d->view_x=doc_x; d->view_y=doc_y; /* frame crops use this paint's real scroll */
     bool snapshot_root=!d->frame_parent;
     if(snapshot_root){web_frames_prepare_paint(d);web_avmedia_snapshot_begin(d);}
-    d->view_x=doc_x; d->view_y=doc_y;
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
     gfx_clip(c, x, y, w, h);
     struct pctx P = {0};
@@ -1382,7 +1383,9 @@ struct fmatch {
     int from_y;
     float best_y, first_y;
     box_t *best_b, *first_b;
-    int best_r, first_r, best_off, first_off;
+    int best_r, first_r;
+    size_t best_off, first_off;
+    bool failed;
 };
 
 static bool ieq_at(const char *s, size_t n, const char *q, size_t qn) {
@@ -1392,8 +1395,121 @@ static bool ieq_at(const char *s, size_t n, const char *q, size_t qn) {
     return true;
 }
 
+/* Flat-tree iteration keeps slots/shadow contents in native render order and
+   never enters an inactive template forest. No fixed-depth traversal stack. */
+static node_t *find_flat_first(node_t *n) {
+    if(n->shadow_root)n=n->shadow_root;
+    if(!n->foreign && n->tag==T_slot && n->slot_assigned_first && doc_node_root(n,false)->shadow_host)
+        return n->slot_assigned_first;
+    return n->first;
+}
+static node_t *find_flat_next(node_t *root,node_t *n,bool descend) {
+    node_t *child=descend?find_flat_first(n):NULL;if(child)return child;
+    while(n && n!=root) {
+        node_t *p=doc_flat_parent(n);if(!p)return NULL;
+        node_t *next=!p->foreign && p->tag==T_slot && p->slot_assigned_first?n->assigned_next:n->next;
+        if(next)return next;n=p;
+    }
+    return NULL;
+}
+static bool find_until_found(node_t *n) {
+    const char *value=n->type==N_ELEM && !n->foreign?node_attr(n,"hidden"):NULL;
+    return value && str_ieq(value,"until-found");
+}
+static bool find_contained(const style_t *st) {
+    return st && st->display!=D_NONE && st->display!=D_INLINE && st->display!=D_CONTENTS;
+}
+struct hidden_match {
+    struct fmatch *visible;
+    size_t *prefix, matched, position;
+    node_t **owners, *first, *best;
+    float first_y,best_y;
+    bool space;
+};
+static void hidden_byte(struct hidden_match *H,unsigned char c,node_t *owner,float y) {
+    const char *q=H->visible->q;size_t qn=H->visible->qn;c=(unsigned char)lower(c);
+    H->owners[H->position]=owner;if(++H->position==qn)H->position=0;
+    while(H->matched && c!=(unsigned char)lower((unsigned char)q[H->matched]))H->matched=H->prefix[H->matched-1];
+    if(c==(unsigned char)lower((unsigned char)q[H->matched]))H->matched++;
+    if(H->matched==qn) {
+        node_t *start=H->owners[H->position];
+        if(!H->first){H->first=start;H->first_y=y;}
+        if(!H->best && y>=H->visible->from_y){H->best=start;H->best_y=y;}
+        H->matched=H->prefix[qn-1];
+    }
+    H->space=c==' ';
+}
+static void hidden_text(struct hidden_match *H,node_t *n,const style_t *st,float y) {
+    bool collapse=!st || st->white_space==WS_NORMAL || st->white_space==WS_NOWRAP || st->white_space==WS_PRE_LINE;
+    for(size_t i=0;i<n->textlen;i++) {
+        unsigned char c=(unsigned char)n->text[i];
+        if(collapse && is_space(c)){if(H->space)continue;c=' ';}
+        hidden_byte(H,c,n,y);
+    }
+}
+/* Search skipped content without temporarily exposing it or changing author
+   CSS/DOM. Only the selected real match enters the ancestor reveal algorithm. */
+static bool find_hidden(struct hidden_match *H) {
+    web_doc *d=H->visible->d;size_t qn=H->visible->qn;
+    for(node_t *n=d->root;n;) {
+        web_avmedia_checkpoint();
+        bool descend=true;
+        if(n->type==N_ELEM) {
+            style_t *st=n->style;
+            if(!st || st->display==D_NONE || web_dialog_inert(d,n))descend=false;
+            else if(st->content_visibility==CV_HIDDEN) {
+                descend=false;
+                if(find_until_found(n) && find_contained(st) && n->box) {
+                    if(!H->prefix) {
+                        if(qn>SIZE_MAX/sizeof *H->prefix || qn>SIZE_MAX/sizeof *H->owners)return false;
+                        H->prefix=malloc(qn*sizeof *H->prefix);H->owners=malloc(qn*sizeof *H->owners);
+                        if(!H->prefix || !H->owners)return false;
+                        H->prefix[0]=0;
+                        for(size_t i=1,k=0;i<qn;i++) {
+                            unsigned char c=(unsigned char)lower((unsigned char)H->visible->q[i]);
+                            while(k && c!=(unsigned char)lower((unsigned char)H->visible->q[k]))k=H->prefix[k-1];
+                            if(c==(unsigned char)lower((unsigned char)H->visible->q[k]))k++;
+                            H->prefix[i]=k;
+                        }
+                    }
+                    H->matched=H->position=0;H->space=false;float y=cy(n->box);node_t *text_block=NULL;
+                    for(node_t *text=find_flat_first(n);text;) {
+                        bool below=true;
+                        node_t *parent=doc_flat_parent(text);
+                        if(parent && !parent->foreign && parent->tag==T_details && !node_attr(parent,"open") &&
+                            doc_details_summary(parent)!=text) {
+                            text=find_flat_next(n,text,false);continue;
+                        }
+                        if(text->type==N_ELEM) {
+                            style_t *ts=text->style;
+                            if(!ts || ts->display==D_NONE || web_dialog_inert(d,text) ||
+                                (ts->content_visibility==CV_HIDDEN && (!find_until_found(text) || !find_contained(ts))))below=false;
+                            else if(ts->display!=D_INLINE && ts->display!=D_CONTENTS && H->matched && !H->space)
+                                hidden_byte(H,' ',text,y);
+                            if(!text->foreign && (text->tag==T_template || text->tag==T_input || text->tag==T_select || text->tag==T_textarea))below=false;
+                        } else if(text->type==N_TEXT && text->textlen) {
+                            node_t *p=doc_flat_parent(text);const style_t *ts=p?p->style:NULL;
+                            if(ts && !ts->visibility) {
+                                node_t *block=p;
+                                while(block && block!=n && block->style &&
+                                    (block->style->display==D_INLINE || block->style->display==D_CONTENTS))block=doc_flat_parent(block);
+                                if(text_block && block!=text_block && H->matched && !H->space)hidden_byte(H,' ',text,y);
+                                text_block=block;hidden_text(H,text,ts,y);
+                            }
+                        }
+                        text=find_flat_next(n,text,below);
+                    }
+                }
+            }
+            if(!n->foreign && n->tag==T_template)descend=false;
+        }
+        n=find_flat_next(d->root,n,descend);
+    }
+    return true;
+}
+
 static void find_in(struct fmatch *F, box_t *b) {
-    if (!b->st || b->st->display == D_NONE || (b->node && web_dialog_inert(F->d,b->node))) return;
+    if (F->failed || !b->st || b->st->display == D_NONE || b->st->content_visibility==CV_HIDDEN || (b->node && web_dialog_inert(F->d,b->node))) return;
     if (b->nruns) {
         /* the block's text, with the run each byte came from */
         sbuf t = {0};
@@ -1402,27 +1518,31 @@ static void find_in(struct fmatch *F, box_t *b) {
         float prev_y = -1e30f;
         for (int i = 0; i < b->nruns; i++) {
             struct run *r = &b->runs[i];
-            if (r->atomic || !r->n) continue;
+            if (r->atomic || !r->n || r->st->visibility) continue;
             if (t.n && r->y != prev_y && t.p[t.n - 1] != ' ') sb_putc(&t, ' ');
             sb_put(&t, r->s, (size_t)r->n);
             prev_y = r->y;
             if (t.n > cap) {
                 size_t old = cap;
-                cap = t.n * 2;
-                owner = realloc(owner, sizeof(int) * cap);
+                size_t max=SIZE_MAX/sizeof *owner;
+                if(t.n>max){F->failed=true;free(owner);sb_free(&t);return;}
+                cap = t.n>max/2?t.n:t.n*2;
+                int *grown = realloc(owner, sizeof *owner * cap);
+                if(!grown){F->failed=true;free(owner);sb_free(&t);return;}
+                owner=grown;
                 for (size_t k = old; k < cap; k++) owner[k] = -1;
             }
             for (size_t k = t.n - (size_t)r->n; k < t.n; k++) owner[k] = i;
         }
-        for (size_t k = 0; k + F->qn <= t.n; k++) {
+        for (size_t k = 0; F->qn<=t.n && k<=t.n-F->qn; k++) {
             if (!ieq_at(t.p + k, t.n - k, F->q, F->qn)) continue;
             size_t j = k;
             while (j < t.n && owner[j] < 0) j++;
             if (j >= t.n) break;
             int ri = owner[j];
             float y = cy(b) + b->runs[ri].y;
-            if (!F->first_b) F->first_b = b, F->first_r = ri, F->first_y = y, F->first_off = (int)k;
-            if (y >= (float)F->from_y && !F->best_b) F->best_b = b, F->best_r = ri, F->best_y = y, F->best_off = (int)k;
+            if (!F->first_b) F->first_b = b, F->first_r = ri, F->first_y = y, F->first_off = k;
+            if (y >= (float)F->from_y && !F->best_b) F->best_b = b, F->best_r = ri, F->best_y = y, F->best_off = k;
         }
         free(owner);
         sb_free(&t);
@@ -1436,13 +1556,13 @@ static void clear_highlight(box_t *b) {
 }
 
 /* highlight the runs that make up the match starting at byte off of b's text */
-static void highlight(box_t *b, int off, size_t qn) {
+static void highlight(box_t *b, size_t off, size_t qn) {
     size_t pos = 0;
     float prev_y = -1e30f;
     bool last_space = false;
     for (int i = 0; i < b->nruns; i++) {
         struct run *r = &b->runs[i];
-        if (r->atomic || !r->n) continue;
+        if (r->atomic || !r->n || r->st->visibility) continue;
         if (pos && r->y != prev_y && !last_space) pos++;
         size_t s = pos, e = pos + (size_t)r->n;
         if (e > (size_t)off && s < (size_t)off + qn) r->highlight = true;
@@ -1454,6 +1574,7 @@ static void highlight(box_t *b, int off, size_t qn) {
 
 int web_find(web_doc *d, const char *text, int from_y) {
     if (!d) return -1;
+    if(d->find_revealing)return -1;
     if (!text || !*text) {
         free(d->find_text); d->find_text = NULL;
         if (d->root_box) clear_highlight(d->root_box);
@@ -1467,6 +1588,9 @@ int web_find(web_doc *d, const char *text, int from_y) {
         free(d->find_text); d->find_text = copy;
     }
     text = d->find_text;
+    if(d->need_style || d->need_boxes || !d->layout_valid) {
+        d->find_revealing=true;web_layout(d,MAX(d->width,1),MAX(d->height,1));d->find_revealing=false;
+    }
     if (!d->root_box) return -1;
     clear_highlight(d->root_box);
     struct fmatch F = {0};
@@ -1475,9 +1599,29 @@ int web_find(web_doc *d, const char *text, int from_y) {
     F.qn = strlen(text);
     F.from_y = from_y;
     find_in(&F, d->root_box);
+    if(F.failed)return -2;
+    struct hidden_match H={.visible=&F};bool searched=find_hidden(&H);
+    node_t *hidden=NULL;
+    if(H.best && (!F.best_b || H.best_y<F.best_y))hidden=H.best;
+    else if(!F.best_b && !H.best && H.first && (!F.first_b || H.first_y<F.first_y))hidden=H.first;
+    free(H.prefix);free(H.owners);
+    if(!searched)return -2;
+    if(hidden) {
+        /* No box/run pointer from the old layout crosses author beforematch.
+           Its callbacks may remove/adopt the target or force a fresh layout. */
+        d->find_revealing=true;
+        web_js_reveal_hidden(d,hidden);
+        web_layout(d,MAX(d->width,1),MAX(d->height,1));
+        d->find_revealing=false;
+        if(!d->root_box)return -1;
+        clear_highlight(d->root_box);
+        F=(struct fmatch){.d=d,.q=d->find_text,.qn=strlen(d->find_text),.from_y=from_y};
+        find_in(&F,d->root_box);
+        if(F.failed)return -2;
+    }
     box_t *b = F.best_b ? F.best_b : F.first_b;
     if (!b) return -1;
-    int off = F.best_b ? F.best_off : F.first_off;
+    size_t off = F.best_b ? F.best_off : F.first_off;
     float y = F.best_b ? F.best_y : F.first_y;
     highlight(b, off, F.qn);
     wfont f = style_font(b->runs[F.best_b ? F.best_r : F.first_r].st);
