@@ -1,0 +1,6 @@
+interface:
+  display_name: "Nocturne：実画面から修正"
+  short_description: "実QEMU画面をまとめて撮影・目視し、表示と操作の不具合を直す開発手順"
+  default_prompt: "$nocturne-project に従い、Nocturneの実画面確認と製品修正を優先して作業してください。"
+policy:
+  allow_implicit_invocation: true
