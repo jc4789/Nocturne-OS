@@ -42,13 +42,14 @@ static int on_header(void *ctx,const char *line,size_t n) {
     return header_result;
 }
 
+static size_t explicit_body_limit;
 static void response(const void *wire, size_t n, size_t split, bool io_error,
                      bool cb, bool ok, const char *body) {
     stream = (struct net_stream){wire, n, 0, split, io_error};
     struct http_req q = {.url = "https://transport.test/", .on_body = cb ? callback : NULL};
     struct http_resp r;
     callbacks = 0; callback_len = 0; callback_body[0] = 0;
-    int result = http_request(&q, &r);
+    int result = explicit_body_limit ? http_request_limited(&q, &r, explicit_body_limit) : http_request(&q, &r);
     CHECK((result == 0) == ok);
     if (ok && body) {
         CHECK(r.body_len == strlen(body));
@@ -166,6 +167,8 @@ int main(void) {
         memset(gzip_limit + limit_len, gzip_limit_runs[i][1], gzip_limit_runs[i][0]);
         limit_len += gzip_limit_runs[i][0];
     }
+    /* Defaults are unlimited now; fault injection uses an explicit caller budget. */
+    explicit_body_limit = 16u << 20;
     encoded(gzip_limit, limit_len, false, true, false, NULL); CHECK(callbacks == 0);
     printf("httptest: %d checks, %d failed\n", checks, failed);
     return failed != 0;

@@ -161,10 +161,12 @@ def make_disk(a, tcp_port, web_ports):
     # Internal metadata regression reads diagnostic counters from the real DOM.
     srcs.append(os.path.join(ROOT, "user", "libc", "web", "webi.h"))
     srcs.append(os.path.join(ROOT, "user", "libc", "web", "cssom.h"))
+    srcs.append(os.path.join(ROOT, "user", "libc", "web", "js_canvas.h"))
     srcs.append(os.path.join(ROOT, "third_party", "quickjs", "quickjs.h"))
+    srcs.append(os.path.join(ROOT, "user", "apps", "browser_events.h"))
     srcs += [os.path.join(ROOT, "user", "libc", "web", name) for name in
-             ("form_value.h", "form_validation.h", "elements.h")]
-    srcs.append(os.path.join(ROOT, "tests", "web_form_validation_cases.h"))
+             ("form_value.h", "form_validation.h", "elements.h", "frame.h", "html_lexbor.h", "sandbox.h")]
+    srcs += sorted(glob.glob(os.path.join(ROOT, "tests", "*.h")))
     mtools("mcopy", "-i", PART, *srcs, "::/tests/")
     mtools("mcopy", "-i", PART, "-s", os.path.join(ROOT, "tests", "media-fixtures"), "::/tests/")
     if a.full:
@@ -246,6 +248,20 @@ def run_vm(a, tcp_port, web_ports, processes):
     # 起動媒体も専用コピー。検証中の次ビルドと元imageを共有しない。
     boot = os.path.join(BUILD, "test-boot.img")
     shutil.copyfile(a.boot_image, boot)
+    if a.resolution:
+        conf = os.path.join(BUILD, "test-limine.conf")
+        conf_arg = os.path.relpath(conf, ROOT).replace("\\", "/")
+        boot_part = os.path.relpath(boot, ROOT).replace("\\", "/") + "@@1048576"
+        mtools("mcopy", "-o", "-i", boot_part, "::/boot/limine/limine.conf", conf_arg)
+        with open(conf, encoding="utf-8") as f:
+            config = f.read()
+        first_entry = config.split("\n/", 2)[1]
+        updated, count = re.subn(r"(?m)^    resolution: [^\n]+$", "    resolution: " + a.resolution, first_entry)
+        if count != 1:
+            sys.exit("test: primary boot entry must have exactly one resolution")
+        with open(conf, "w", encoding="utf-8", newline="\n") as f:
+            f.write(config.replace(first_entry, updated, 1))
+        mtools("mcopy", "-o", "-i", boot_part, conf_arg, "::/boot/limine/limine.conf")
     payload = {}
     for name in ("kernel.elf", "initrd.tar"):
         extracted = os.path.join(BUILD, "test-" + name)
@@ -275,7 +291,8 @@ def run_vm(a, tcp_port, web_ports, processes):
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     processes.append(q)
     metadata = {"pid": q.pid, "arguments": cmd, "boot_sha256": image_hash,
-                "boot_source": a.boot_image, "boot_payload_sha256": payload, "user_data_attached": False}
+                "boot_source": a.boot_image, "boot_payload_sha256": payload, "user_data_attached": False,
+                "requested_resolution": a.resolution}
     metadata_path = os.path.join(BUILD, "test-metadata.json")
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
@@ -308,10 +325,16 @@ def run_vm(a, tcp_port, web_ports, processes):
         time.sleep(0.5)
 
     log = open(SERIAL, "rb").read().decode("utf-8", "replace") if os.path.exists(SERIAL) else ""
-    metadata.update(exit_code=q.returncode, timed_out=timed_out, elapsed_seconds=time.time()-t0, process_stopped=True)
+    video = re.search(r"video: (\d+)x(\d+), (\d+) bpp", log)
+    actual_resolution = "x".join(video.groups()) if video else None
+    resolution_matched = not a.resolution or actual_resolution == a.resolution
+    metadata.update(exit_code=q.returncode, timed_out=timed_out, elapsed_seconds=time.time()-t0, process_stopped=True,
+                    actual_resolution=actual_resolution, resolution_matched=resolution_matched)
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
     problems = []
+    if not resolution_matched:
+        problems.append("requested video resolution differs from the actual guest boot mode")
     if timed_out:
         problems.append("timed out after %d s (the VM did not power off)" % a.timeout)
     if q.returncode != 0:
@@ -320,8 +343,15 @@ def run_vm(a, tcp_port, web_ports, processes):
         problems.append("the in-OS runner did not finish (did tcc fail to build it?)")
     for m in re.finditer(r"(?im)^.*(panic|kernel fault|double fault).*$", log):
         problems.append("kernel: " + m.group(0).strip())
-    # wxtest crashes its probe children on purpose; any other user crash is a bug
+    # Permission probes and one explicitly confirmed native-helper UD2 are
+    # deliberate. Do not suppress other threadtest faults or multiple faults.
+    expected_helper_faults = int("threadtest: expected helper fault status=134" in log and
+                               re.search(r"^PASS threads/", log, re.M) is not None)
     for m in re.finditer(r"^\[(segfault|crash)\] pid \d+ \(([^)]*)\).*$", log, re.M):
+        if expected_helper_faults and re.fullmatch(
+                r"\[crash\] pid \d+ \(threadtest\) cpu\d+: Invalid opcode at rip=[0-9a-fA-F]+\r?", m.group(0)):
+            expected_helper_faults -= 1
+            continue
         if m.group(2) != "wxtest":
             problems.append(m.group(0))
     fc = subprocess.run([sys.executable, os.path.join(ROOT, "scripts", "fatcheck.py"), IMG],
@@ -355,12 +385,15 @@ def main():
     ap.add_argument("--memory", type=int, default=2048, help="QEMU RAM in MiB (default: 2048)")
     ap.add_argument("--cpus", type=int, default=4, help="QEMU CPU count (default: 4)")
     ap.add_argument("--accel", choices=("tcg", "whpx"), default="tcg", help="No silent accelerator fallback")
+    ap.add_argument("--resolution", help="Override only the isolated primary boot entry: widthxheightx32")
     ap.add_argument("--qemu", default=QEMU, help="QEMU executable (prefer the installed QEMU)")
     ap.add_argument("--gpu", choices=("none", "virgl"), default="none", help="Optional secondary virgl GPU; requires host GL")
     ap.add_argument("--boot-image", default=os.path.join(CORE_BUILD, "nocturne.img"), help="Boot input; internal payload must match current build")
     ap.add_argument("--output-dir", help="New, unused directory under build/; preserve earlier test evidence")
     ap.add_argument("groups", nargs="*")
     a = ap.parse_args()
+    if a.resolution and not re.fullmatch(r"[1-9][0-9]{0,4}x[1-9][0-9]{0,4}x32", a.resolution):
+        ap.error("--resolution requires positive widthxheightx32")
     if a.memory < 256:
         ap.error("--memory must be at least 256 MiB")
     if not 1 <= a.cpus <= 32:
@@ -385,7 +418,7 @@ def main():
                               ("test-data.img", "test-serial.log", "test-audio.wav")]
         PART = IMG + "@@1048576"
     overwritten = (IMG, SERIAL, AUDIO, *(os.path.join(BUILD, name) for name in
-                   ("test-boot.img", "test-kernel.elf", "test-initrd.tar", "test-metadata.json", "tcpport", "webports", "autorun.sh")))
+                   ("test-boot.img", "test-kernel.elf", "test-initrd.tar", "test-metadata.json", "test-limine.conf", "tcpport", "webports", "autorun.sh")))
     if os.path.normcase(os.path.realpath(a.boot_image)) in {os.path.normcase(os.path.realpath(p)) for p in overwritten}:
         ap.error("--boot-image must not be a test output path")
     servers, processes = [], []

@@ -6,11 +6,11 @@
  * No selection painting or invented layout rectangles are provided here. */
 const rangeBridge = (() => {
     const states=new WeakMap(), staticStates=new WeakMap(),live=new Set(), Ref=WeakRef, deref=WeakRef.prototype.deref;
-    const abstractToken={}, get=(n,k)=>rawDom('get',n,k);
+    const abstractToken={}, get=(n,k)=>rawDom.get(n,k);
     const parent=n=>get(n,'parentNode'), children=n=>get(n,'childNodes');
     const character=n=>[3,4,7,8].includes(get(n,'nodeType'));
     let replacing=null;
-    function node(n){if(!rawDom('isNode',null,n))throw new TypeError('Expected a native Node');return n;}
+    function node(n){if(!rawDom.isNode(null,n))throw new TypeError('Expected a native Node');return n;}
     function data(r){const d=states.get(r);if(!d)throw new TypeError('Illegal Range receiver');return d;}
     function changed(d){if(d.selectionChanged)d.selectionChanged();}
     function required(count,min){if(count<min)throw new TypeError('Missing Range arguments');}
@@ -46,7 +46,7 @@ const rangeBridge = (() => {
     }
     function common(d){let n=d.start[0];while(!inside(n,d.end[0]))n=parent(n);return n;}
     function collapsed(d){return d.start[0]===d.end[0] && d.start[1]===d.end[1];}
-    function register(r,d){states.set(r,d);live.add(new Ref(r));return r;}
+    function register(r,d){states.set(r,d);live.add(new Ref(r));if(host.domHooks)host.domHooks(1,true);return r;}
     function make(d){return register(Object.create(Range.prototype),{start:d.start.slice(),end:d.end.slice()});}
     function contained(n,d){return compare([n,0],d.start)>0 && compare([n,length(n)],d.end)<0;}
     function partial(n,d){return inside(n,d.start[0])!==inside(n,d.end[0]);}
@@ -80,10 +80,10 @@ const rangeBridge = (() => {
     }
     function clone(d){
         const owner=get(d.start[0],'nodeType')===9?d.start[0]:get(d.start[0],'ownerDocument');
-        const fragment=rawDom('create',owner,11,'#document-fragment','');
+        const fragment=rawDom.create(owner,11,'#document-fragment','');
         if(collapsed(d))return fragment;
-        function append(n){rawDom('insert',fragment,n,null);}
-        function characterClone(n,start,end){const c=rawDom('clone',n,false);rawDom('set',c,'nodeValue',get(n,'nodeValue').slice(start,end));return c;}
+        function append(n){rawDom.insert(fragment,n,null);}
+        function characterClone(n,start,end){const c=rawDom.clone(n,false);rawDom.set(c,'nodeValue',get(n,'nodeValue').slice(start,end));return c;}
         if(d.start[0]===d.end[0] && character(d.start[0])){
             append(characterClone(d.start[0],d.start[1],d.end[1]));return fragment;
         }
@@ -93,18 +93,18 @@ const rangeBridge = (() => {
         const last=inside(d.end[0],d.start[0])?null:kids.slice().reverse().find(n=>partial(n,d));
         if(first){
             if(character(first))append(characterClone(first,d.start[1],length(first)));
-            else{const c=rawDom('clone',first,false);append(c);rawDom('insert',c,clone({start:d.start.slice(),end:[first,length(first)]}),null);}
+            else{const c=rawDom.clone(first,false);append(c);rawDom.insert(c,clone({start:d.start.slice(),end:[first,length(first)]}),null);}
         }
-        for(const n of whole)append(rawDom('clone',n,true));
+        for(const n of whole)append(rawDom.clone(n,true));
         if(last){
             if(character(last))append(characterClone(last,0,d.end[1]));
-            else{const c=rawDom('clone',last,false);append(c);rawDom('insert',c,clone({start:[last,0],end:d.end.slice()}),null);}
+            else{const c=rawDom.clone(last,false);append(c);rawDom.insert(c,clone({start:[last,0],end:d.end.slice()}),null);}
         }
         return fragment;
     }
     function extract(d){
         const owner=get(d.start[0],'nodeType')===9?d.start[0]:get(d.start[0],'ownerDocument');
-        const fragment=rawDom('create',owner,11,'#document-fragment','');
+        const fragment=rawDom.create(owner,11,'#document-fragment','');
         if(collapsed(d))return fragment;
         const start=d.start.slice(),end=d.end.slice(),original={start,end};
         const append=n=>dom('insert',fragment,n,null);
@@ -153,7 +153,7 @@ const rangeBridge = (() => {
         return fragment;
     }
     function insertionValidity(p,n,before){
-        const status=rawDom('insertionStatus',p,n,before);
+        const status=rawDom.insertionStatus(p,n,before);
         if(status)throw new DOMException(status===2?'The reference node is not a child':'The node cannot be inserted here',
             status===2?'NotFoundError':'HierarchyRequestError');
     }
@@ -259,12 +259,12 @@ const rangeBridge = (() => {
                 throw new DOMException('Foreign-namespace fragment contexts are not implemented','NotSupportedError');
             // The HTML Standard uses a new body, not the document's existing
             // body and its ancestry, for null context or an HTML html element.
-            if(!context || get(context,'localName')==='html')context=rawDom('create',owner,1,'body','');
+            if(!context || get(context,'localName')==='html')context=rawDom.create(owner,1,'body','');
             return customElementsBridge.reactions(()=>{
                 // true requests the native contextual (runScripts) mode. The
                 // fragment remains detached and never executes while parsing;
                 // eligible scripts are prepared by native code on insertion.
-                const fragment=rawDom('parseFragment',context,markup,true);
+                const fragment=rawDom.parseFragment(context,markup,true);
                 if(get(fragment,'scripting'))customElementsBridge.upgradeTree(fragment);
                 return fragment;
             });
@@ -382,7 +382,7 @@ const rangeBridge = (() => {
         const text=get(this,'nodeValue');
         if(at>text.length)throw new DOMException('Offset exceeds data length','IndexSizeError');
         return customElementsBridge.reactions(()=>{
-            const next=rawDom('create',get(this,'ownerDocument'),3,'#text',text.slice(at));
+            const next=rawDom.create(get(this,'ownerDocument'),3,'#text',text.slice(at));
             const p=parent(this);
             if(p){
                 const index=children(p).indexOf(this);
@@ -441,6 +441,6 @@ const rangeBridge = (() => {
     CharacterData.prototype.insertData=function(at,value){characterDataBrand(this);required(arguments.length,2);at=offset(at);value=string(value);replace(this,at,0,value);};
     CharacterData.prototype.deleteData=function(at,count){characterDataBrand(this);required(arguments.length,2);at=offset(at);count=offset(count);replace(this,at,count,'');};
     CharacterData.prototype.replaceData=function(at,count,value){characterDataBrand(this);required(arguments.length,3);at=offset(at);count=offset(count);value=string(value);replace(this,at,count,value);};
-    return {before,after,isRange:r=>states.has(r),boundaries:r=>{const d=data(r);return {start:d.start.slice(),end:d.end.slice()};},comparePoints:compare,
+    return {before,after,active:()=>live.size!==0,isRange:r=>states.has(r),boundaries:r=>{const d=data(r);return {start:d.start.slice(),end:d.end.slice()};},comparePoints:compare,
         listen:(r,listener)=>{data(r).selectionChanged=listener;}};
 })();

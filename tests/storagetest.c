@@ -96,7 +96,9 @@ int main(int argc,char **argv){
     check(direct("https://wrong.invalid/../../data",WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"x","y",&out)==WEB_STORAGE_SECURITY,"no origin path injection");
     char corrupt_origin[160];snprintf(corrupt_origin,sizeof corrupt_origin,"https://corrupt-%d-%llu.invalid",getpid(),(unsigned long long)uptime_ms());
     check(direct(corrupt_origin,WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"key","one",&out)==WEB_STORAGE_OK,"snapshot generation one");
+    check(webstorage_flush(store,true,&out)==WEB_STORAGE_OK,"flush generation one");
     check(direct(corrupt_origin,WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"key","two",&out)==WEB_STORAGE_OK,"snapshot generation two");
+    check(webstorage_flush(store,true,&out)==WEB_STORAGE_OK,"flush generation two");
     corrupt(corrupt_origin,1);webstorage_free(store);store=webstorage_create();
     expect(corrupt_origin,WEB_STORAGE_LOCAL,"key","one","invalid new slot recovers previous snapshot");
     check(direct(corrupt_origin,WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"key","three",&out)==WEB_STORAGE_OK,"write repairs inactive slot");

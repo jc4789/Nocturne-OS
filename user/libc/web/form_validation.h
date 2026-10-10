@@ -32,6 +32,18 @@ size_t web_control_validation_message_length(web_doc *d, node_t *n);
 bool web_control_check_validity(web_doc *d, node_t *n, bool report);
 /* Event-free :valid/:invalid aggregate for a form or fieldset. */
 bool web_form_constraints_valid(web_doc *d, node_t *form_or_fieldset);
+/* Selector-dependent preparation runs on the supervisor before CSS jobs.
+   The immutable result is used only by cascade matching, never live DOM queries. */
+enum web_style_form_feature {
+    WEB_STYLE_FORM_CHECKED = 1u << 0, WEB_STYLE_FORM_VALIDITY = 1u << 1,
+    WEB_STYLE_FORM_RANGE = 1u << 2, WEB_STYLE_FORM_PLACEHOLDER = 1u << 3
+};
+enum web_style_form_state {
+    WEB_STYLE_CHECKED = 1u << 0, WEB_STYLE_VALIDATABLE = 1u << 1,
+    WEB_STYLE_INVALID = 1u << 2, WEB_STYLE_RANGE = 1u << 3,
+    WEB_STYLE_IN_RANGE = 1u << 4, WEB_STYLE_PLACEHOLDER = 1u << 5
+};
+bool web_form_style_snapshot(web_doc *d, unsigned features);
 bool web_form_check_validity(web_doc *d, node_t *form, bool report);
 /* Interactive validation only. HTMLFormElement.submit deliberately bypasses it. */
 bool web_form_submission_validate(web_doc *d, node_t *submitter);

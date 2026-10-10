@@ -32,6 +32,11 @@ typedef struct webstorage webstorage;
  * go to the fixed /data/browser/storage managed directory. No path argument. */
 webstorage *webstorage_create(void);
 void webstorage_free(webstorage *store);
+/* Mutations publish to RAM immediately. Idle commits coalesce all writes to an
+ * origin; force is used for navigation/window shutdown. A failure keeps the
+ * dirty RAM map for retry and leaves the last completed snapshot untouched. */
+int webstorage_flush(webstorage *store, bool force, struct web_storage_result *out);
+bool webstorage_pending(webstorage *store);
 int webstorage_access(webstorage *store, const char *origin,
                       const struct web_storage_request *request,
                       struct web_storage_result *out);

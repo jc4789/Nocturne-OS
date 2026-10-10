@@ -18,6 +18,11 @@ void *ar_alloc(arena_t *a, size_t n) {
     struct achunk *c = a->head;
     if (!c || n > c->cap - c->used) {
         size_t cap = n > 60000 ? n : 65536 - sizeof(struct achunk);
+        if (a->chunk_size) {
+            cap = a->chunk_size > sizeof(struct achunk) ?
+                (a->chunk_size - sizeof(struct achunk)) & ~(size_t)7 : 8;
+            if (cap < n) cap = n;
+        }
         bool quota=a->limit && (cap>a->limit || a->allocated>a->limit-cap);
         if (quota || cap > SIZE_MAX - sizeof(struct achunk) || cap > SIZE_MAX - a->allocated) {
             /* Every existing arena trap tests nonzero; retain the failure

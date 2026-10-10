@@ -11,6 +11,9 @@ enum {
     SYS_CPU_INFO, SYS_GPU_INFO, SYS_GPU_RENDER, SYS_AUDIO_FLUSH,
     SYS_GPU_RENDER_BATCH,
     SYS_GPU_BLIT,
+    SYS_CLOCK_INFO, SYS_THREAD_CREATE, SYS_THREAD_JOIN, SYS_THREAD_EXIT,
+    SYS_WAIT_ADDRESS, SYS_WAKE_ADDRESS, SYS_THREAD_ID, SYS_CPU_INDEX,
+    SYS_THREAD_TLS,
     SYS_WIN_CREATE = 64, SYS_WIN_MAP, SYS_WIN_PRESENT, SYS_WIN_SET_TITLE, SYS_SCREEN_INFO,
     SYS_WIN_MOVE, SYS_CLIPBOARD_SET, SYS_CLIPBOARD_GET, SYS_WIN_RESIZE, SYS_GUI_LAUNCH,
     SYS_SCREEN_GRAB, SYS_WIN_STATE,
@@ -62,8 +65,22 @@ struct n_sysinfo {
     char os[64];
 };
 
-/* Separate versioned extension: the existing n_sysinfo layout is unchanged.
-   APs run bounded kernel jobs, not arbitrary user processes or JS workers. */
+/* Versioned extensions keep the original n_sysinfo layout unchanged. */
+struct n_clockinfo {
+    uint32_t version, flags;
+    uint64_t tsc_hz, tsc_sample, uptime_ms;
+    uint64_t reference_page, reference_sample_100ns;
+};
+#define N_CLOCK_USER_TSC 1u
+#define N_CLOCK_HV_REFERENCE 2u
+/* Read-only Hyper-V reference page. Hypervisor updates use sequence protocol. */
+struct n_reference_tsc {
+    volatile uint32_t sequence;
+    uint32_t reserved;
+    volatile uint64_t scale;
+    volatile int64_t offset;
+};
+
 struct n_cpuinfo {
     uint32_t version, detected_cpus, online_cpus, worker_cpus, scheduler_cpus, flags;
     uint64_t parallel_jobs, worker_chunks;
@@ -71,6 +88,7 @@ struct n_cpuinfo {
 #define N_CPU_AP_WORKERS 1u
 #define N_CPU_SSE2 2u
 #define N_CPU_AVX 4u
+#define N_CPU_USER_THREADS 8u
 
 struct n_pollfd {
     int fd;

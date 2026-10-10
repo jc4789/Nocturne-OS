@@ -45,7 +45,11 @@ uint32_t gfx_glyph_for(uint32_t codepoint);
 int gfx_utf8_decode(const char *s, uint32_t *cp);
 
 static inline uint32_t gfx_mix(uint32_t a, uint32_t b, int t /* 0..255 weight of b */) {
-    uint32_t rb = ((a & 0xFF00FF) * (255 - t) + (b & 0xFF00FF) * t) >> 8;
-    uint32_t g = ((a & 0x00FF00) * (255 - t) + (b & 0x00FF00) * t) >> 8;
-    return 0xFF000000u | (rb & 0xFF00FF) | (g & 0x00FF00);
+    /* The weights sum to 255, not 256. Round independent channels so both
+       endpoints and equal colors are exact (including an unchanged 255). */
+    uint32_t w = (uint32_t)t, inv = 255 - w;
+    uint32_t r = (((a >> 16) & 255) * inv + ((b >> 16) & 255) * w + 127) / 255;
+    uint32_t g = (((a >> 8) & 255) * inv + ((b >> 8) & 255) * w + 127) / 255;
+    uint32_t blue = ((a & 255) * inv + (b & 255) * w + 127) / 255;
+    return 0xFF000000u | (r << 16) | (g << 8) | blue;
 }

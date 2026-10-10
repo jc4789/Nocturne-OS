@@ -17,7 +17,7 @@ struct cpu_worker {
     unsigned index;
     bool enabled;
     unsigned ready, failed, runner_ready;
-    uint64_t epoch, done;
+    uint64_t epoch, done, seen;
     cpu_job_fn fn;
     void *context;
     size_t begin, end;
@@ -35,7 +35,7 @@ static uint64_t next_epoch, jobs;
 static uint64_t max_job_ticks;
 static uint64_t bsp_pat;
 static bool have_pat;
-static unsigned runner;
+static uint32_t runner_mask;
 
 extern NORETURN void smp_switch_stack(uint64_t top, void (*entry)(void *), void *argument);
 
@@ -57,35 +57,45 @@ void smp_get_info(struct n_cpuinfo *info) {
     info->detected_cpus = detected;
     info->online_cpus = online;
     info->worker_cpus = cpu_worker_count();
-    info->scheduler_cpus = cpu_runner_ready() ? 2 : 1;
-    info->flags = N_CPU_SSE2 | (info->worker_cpus ? N_CPU_AP_WORKERS : 0) | (fpu_has_avx() ? N_CPU_AVX : 0);
+    info->scheduler_cpus = 1;
+    for (unsigned i = 1; i < slots; i++) if (cpu_runner_ready_at(i)) info->scheduler_cpus++;
+    info->flags = N_CPU_SSE2 | N_CPU_USER_THREADS | (info->worker_cpus ? N_CPU_AP_WORKERS : 0) | (fpu_has_avx() ? N_CPU_AVX : 0);
     info->parallel_jobs = jobs;
     for (unsigned i = 1; i < slots; i++) info->worker_chunks += cpu_worker_items(i);
 }
 
-unsigned cpu_runner_index(void) { return __atomic_load_n(&runner, __ATOMIC_ACQUIRE); }
-bool cpu_is_runner(void) { unsigned i = cpu_runner_index(); return i && cpu_current_index() == i; }
-bool cpu_is_worker(void) { return cpu_current_index() != 0 && !cpu_is_runner(); }
+unsigned cpu_runner_index(void) {
+    for (unsigned i = 1; i < slots; i++) if (cpu_runner_ready_at(i)) return i;
+    return 0;
+}
+bool cpu_is_runner(void) {
+    return (__atomic_load_n(&runner_mask, __ATOMIC_ACQUIRE) & (1u << cpu_current_index())) != 0;
+}
+bool cpu_is_worker(void) { return cpu_current_index() != 0 && (!cpu_is_runner() || !current_task); }
 unsigned cpu_worker_count(void) {
     unsigned count = 0;
     for (unsigned i = 1; i < slots; i++) if (workers[i].enabled) count++;
     return count;
 }
 bool cpu_runner_ready(void) {
-    unsigned i = cpu_runner_index();
-    return i && __atomic_load_n(&workers[i].runner_ready, __ATOMIC_ACQUIRE);
+    return cpu_runner_index() != 0;
+}
+bool cpu_runner_ready_at(unsigned i) {
+    return i && i < slots && (__atomic_load_n(&runner_mask, __ATOMIC_ACQUIRE) & (1u << i)) &&
+           __atomic_load_n(&workers[i].runner_ready, __ATOMIC_ACQUIRE);
 }
 void cpu_runner_started(void) {
     __atomic_store_n(&workers[cpu_current_index()].runner_ready, 1, __ATOMIC_RELEASE);
 }
 void cpu_runner_wake(void) {
-    unsigned i = cpu_runner_index();
-    if (i && !lapic_send_ipi(workers[i].apic_id, VEC_USER_STOP))
+    for (unsigned i = 1; i < slots; i++) if (cpu_runner_ready_at(i)) cpu_runner_wake_at(i);
+}
+void cpu_runner_wake_at(unsigned i) {
+    if (i && i < slots && !lapic_send_ipi(workers[i].apic_id, VEC_USER_STOP))
         panic("smp: user runner IPI failed; context retained");
 }
 void cpu_runner_check(void) {
-    unsigned i = cpu_runner_index();
-    if (i && __atomic_load_n(&workers[i].failed, __ATOMIC_ACQUIRE)) {
+    for (unsigned i = 1; i < slots; i++) if (cpu_runner_ready_at(i) && __atomic_load_n(&workers[i].failed, __ATOMIC_ACQUIRE)) {
         struct cpu_worker *w = &workers[i];
         panic("smp: user runner fault %lu rip=%p addr=%p err=%lx; context retained",
               w->fault_vector, (void *)w->fault_rip, (void *)w->fault_addr, w->fault_error);
@@ -116,6 +126,21 @@ static bool deadline(uint64_t since, unsigned ms, uint64_t spins) {
     return spins > 100000000;
 }
 
+bool cpu_worker_poll(void) {
+    struct cpu_worker *w = &workers[cpu_current_index()];
+    uint64_t epoch = __atomic_load_n(&w->epoch, __ATOMIC_ACQUIRE);
+    if (epoch == w->seen) return false;
+    write_cr3(kernel_pml4);
+    vmm_flush_all();
+    fpu_reset();
+    for (size_t i = w->begin; i < w->end; i++) w->fn(i, w->context);
+    __asm__ volatile("sfence" : : : "memory");
+    __atomic_fetch_add(&w->items, w->end - w->begin, __ATOMIC_RELAXED);
+    w->seen = epoch;
+    __atomic_store_n(&w->done, epoch, __ATOMIC_RELEASE);
+    return true;
+}
+
 static NORETURN void worker_main(void *argument) {
     struct cpu_worker *w = argument;
     cli();
@@ -137,32 +162,20 @@ static NORETURN void worker_main(void *argument) {
         for (;;) hlt();
     }
     __atomic_store_n(&w->ready, 1, __ATOMIC_RELEASE);
-    uint64_t seen = 0;
     for (;;) {
         cli();
-        if (w->index == cpu_runner_index()) {
+        if (cpu_is_runner()) {
             if (!lapic_runner_timer_start()) {
                 __atomic_store_n(&w->failed, 1, __ATOMIC_RELEASE);
                 for (;;) hlt();
             }
             sched_ap_loop();
         }
-        uint64_t epoch = __atomic_load_n(&w->epoch, __ATOMIC_ACQUIRE);
-        if (epoch == seen) {
+        if (!cpu_worker_poll()) {
             /* IF=0 の検査から sti;hlt までに IPI が来ても lost wake にならない。 */
             __asm__ volatile("sti; hlt" : : : "memory");
             continue;
         }
-        /* BSP が増設した共有 page table と新しい vmalloc の stale TLB を除く。
-           この callback 中は mapping の変更/解放も BSP の schedule も禁止。 */
-        write_cr3(kernel_pml4);
-        vmm_flush_all();
-        fpu_reset();
-        for (size_t i = w->begin; i < w->end; i++) w->fn(i, w->context);
-        __asm__ volatile("sfence" : : : "memory"); /* framebuffer WC の書込完了 */
-        __atomic_fetch_add(&w->items, w->end - w->begin, __ATOMIC_RELAXED);
-        seen = epoch;
-        __atomic_store_n(&w->done, epoch, __ATOMIC_RELEASE);
     }
 }
 
@@ -182,6 +195,7 @@ void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context) {
     cpu_require_bsp();
     uint64_t irq_flags = irq_save(), since_job = rdtsc();
     bool nested = busy;
+    if (!nested) sched_quiesce_space(0);
     busy = true;
     struct fpu_state saved_fpu;
     fpu_save(&saved_fpu);
@@ -385,23 +399,22 @@ void smp_init(struct limine_mp_response *response) {
     }
     kprintf("smp: %u/%lu CPUs online, initial AP worker selftest (kernel/IRQ BSP-owned)\n", online, response->cpu_count);
     selftest();
-    /* 初期の全CPU job検査後に一つだけuser実行役へ移す。timer較正はBSPのみ。 */
+    /* 初期job検査後、全APでuser mailboxを開始。kernel jobはidle stackで共用。 */
     if (!cmdline_has("nousermp")) for (unsigned i = 1; i < slots; i++) {
         struct cpu_worker *w = &workers[i];
         if (!w->enabled) continue;
-        w->enabled = false;
-        __atomic_store_n(&runner, i, __ATOMIC_RELEASE);
-        cpu_runner_wake();
+        __atomic_fetch_or(&runner_mask, 1u << i, __ATOMIC_RELEASE);
+        cpu_runner_wake_at(i);
         uint64_t since = rdtsc(), spins = 0;
-        while (!cpu_runner_ready() && !__atomic_load_n(&w->failed, __ATOMIC_ACQUIRE) &&
+        while (!cpu_runner_ready_at(i) && !__atomic_load_n(&w->failed, __ATOMIC_ACQUIRE) &&
                !deadline(since, START_TIMEOUT_MS, ++spins)) pause();
-        if (!cpu_runner_ready()) {
-            __atomic_store_n(&runner, 0, __ATOMIC_RELEASE);
+        if (!cpu_runner_ready_at(i)) {
+            __atomic_fetch_and(&runner_mask, ~(1u << i), __ATOMIC_RELEASE);
+            w->enabled = false;
             online--;
             kprintf("smp: user runner startup failed; CPU excluded\n");
         } else {
-            kprintf("smp: user scheduler CPUs=2 runner=%u workers=%u; kernel/GUI BSP-owned\n", i, cpu_worker_count());
+            kprintf("smp: user runner CPU=%u online; kernel/WM requests BSP-owned\n", i);
         }
-        break;
     }
 }

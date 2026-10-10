@@ -22,6 +22,19 @@ struct web_canvas {
     struct canvas_clip *clip,**saved_clip;
     size_t saved_count,saved_capacity,saved_bytes;
 };
+struct image_bitmap { unsigned w,h;bool tainted;uint32_t *pixels; };
+static JSClassID bitmap_class;
+static void bitmap_finalizer(JSRuntime *rt,JSValue object) {
+    struct image_bitmap *b=JS_GetOpaque(object,bitmap_class);
+    if(b){js_free_rt(rt,b->pixels);js_free_rt(rt,b);}
+}
+bool web_image_bitmap_is(JSValueConst value) {
+    return bitmap_class && JS_GetOpaque(value,bitmap_class)!=NULL;
+}
+bool web_image_bitmap_dimensions(JSValueConst value,unsigned *width,unsigned *height) {
+    struct image_bitmap *b=bitmap_class?JS_GetOpaque(value,bitmap_class):NULL;
+    if(!b)return false;*width=b->w;*height=b->h;return true;
+}
 static web_doc *allocation_doc(node_t *n) { return n->allocation_doc?n->allocation_doc:n->owner; }
 /* Native bitmap/gfx dimensions and pitch are int. No area or document quota:
  * reject only unrepresentable sizes, accounting overflow, or actual OOM. */
@@ -118,6 +131,27 @@ static uint32_t over(uint32_t d,uint32_t s) {
     unsigned b=((s&255)*sa+(d&255)*old+alpha/2)/alpha;
     return (alpha<<24)|(r<<16)|(g<<8)|b;
 }
+/* The same usable bitmap and conservative origin provenance serve drawImage
+   and ImageBitmap snapshots. Status 2 means an ordinary image is still loading;
+   drawImage does nothing, while createImageBitmap rejects its unusable source. */
+static int canvas_source(JSContext *ctx,node_t *source,const uint32_t **pixels,unsigned *w,unsigned *h,bool *tainted) {
+    if(!source || source->type!=N_ELEM || source->foreign || (source->tag!=T_canvas&&source->tag!=T_img)){
+        JS_ThrowTypeError(ctx,"Expected HTMLCanvasElement or HTMLImageElement");return -1;
+    }
+    if(source->tag==T_canvas){
+        if(!web_canvas_dimension(source,"width")||!web_canvas_dimension(source,"height"))return 1;
+        struct web_canvas *c=ensure(source);if(!c){JS_ThrowOutOfMemory(ctx);return -1;}
+        *pixels=c->pixels;*w=c->w;*h=c->h;*tainted=c->tainted;return 0;
+    }
+    web_doc *d=source->owner;if(!d)return 1;
+    if(d->resources_dirty)doc_sync_tree(d);doc_image_sync(d,source);
+    struct web_image *im=source->image>=0&&source->image<d->images.n?d->images.v[source->image]:NULL;
+    if(!im||!im->done)return 2;
+    if(im->failed||!im->img||!im->img->px||im->img->w<=0||im->img->h<=0)return 1;
+    *w=(unsigned)im->img->w;*h=(unsigned)im->img->h;
+    if((uint64_t)(*w)*(*h)>IMAGE_MAX_PIXELS){JS_ThrowRangeError(ctx,"Image bitmap limit");return -1;}
+    *pixels=im->img->px;*tainted=!im->url||strncasecmp(im->url,"data:",5)!=0;return 0;
+}
 static JSValue canvas_export(JSContext *ctx,node_t *n,struct web_canvas *c,bool data_url) {
     if (c && c->tainted) return JS_FALSE; /* JS throws SecurityError synchronously. */
     if (!c || !c->w || !c->h || !c->pixels) return data_url?JS_NewString(ctx,"data:,"):JS_NULL;
@@ -186,6 +220,137 @@ static uint32_t image_sample(const uint32_t *px,unsigned w,unsigned h,double x,d
     if (!alpha) return 0;
     return (alpha<<24)|((unsigned)fmin(255,r/a+0.5)<<16)|((unsigned)fmin(255,g/a+0.5)<<8)|(unsigned)fmin(255,b/a+0.5);
 }
+static void bitmap_service(void *context) { web_native_checkpoint(context); }
+static uint32_t bitmap_rgba_sample(const uint8_t *rgba,unsigned w,unsigned h,double x,double y,bool smooth) {
+    if(!smooth){
+        size_t i=((size_t)(unsigned)floor(y)*w+(unsigned)floor(x))*4;
+        return (uint32_t)rgba[i+3]<<24|(uint32_t)rgba[i]<<16|(uint32_t)rgba[i+1]<<8|rgba[i+2];
+    }
+    /* Match the ordinary image sampler: interpolate associated channels,
+       then store straight ARGB. Transparent RGB must not bleed into edges. */
+    x=fmax(0,fmin(w-1,x-0.5));y=fmax(0,fmin(h-1,y-0.5));
+    unsigned ix=(unsigned)x,iy=(unsigned)y,jx=ix+1<w?ix+1:ix,jy=iy+1<h?iy+1:iy;
+    size_t indexes[4]={((size_t)iy*w+ix)*4,((size_t)iy*w+jx)*4,((size_t)jy*w+ix)*4,((size_t)jy*w+jx)*4};
+    double tx=x-ix,ty=y-iy,weights[4]={(1-tx)*(1-ty),tx*(1-ty),(1-tx)*ty,tx*ty},a=0,r=0,g=0,b=0;
+    for(unsigned i=0;i<4;i++){const uint8_t *p=rgba+indexes[i];double v=p[3]*weights[i];a+=v;r+=p[0]*v;g+=p[1]*v;b+=p[2]*v;}
+    unsigned alpha=(unsigned)fmin(255,a+0.5);if(!alpha)return 0;
+    return alpha<<24|(unsigned)fmin(255,r/a+0.5)<<16|(unsigned)fmin(255,g/a+0.5)<<8|(unsigned)fmin(255,b/a+0.5);
+}
+/* The current raster decoder has no EXIF orientation stage. Do not silently
+   claim from-image orientation for tagged encoded data. flipY explicitly
+   disregards that metadata. Only container headers, not arbitrary byte text,
+   establish this unsupported metadata case. */
+static bool bitmap_has_exif(const uint8_t *data,size_t size) {
+    if(size>=2&&data[0]==0xff&&data[1]==0xd8){
+        size_t at=2;
+        while(at<size){
+            if(data[at++]!=0xff)break;while(at<size&&data[at]==0xff)at++;
+            if(at==size)break;unsigned marker=data[at++];
+            if(marker==0xda||marker==0xd9)break;if(marker==0x01||(marker>=0xd0&&marker<=0xd7))continue;
+            if(size-at<2)break;size_t length=(size_t)data[at]*256+data[at+1];
+            if(length<2||length>size-at)break;
+            if(marker==0xe1&&length>=8&&!memcmp(data+at+2,"Exif\0\0",6))return true;at+=length;
+        }
+    }else if(size>=8&&!memcmp(data,"\211PNG\r\n\032\n",8)){
+        for(size_t at=8;size-at>=12;){
+            uint32_t length=(uint32_t)data[at]<<24|(uint32_t)data[at+1]<<16|(uint32_t)data[at+2]<<8|data[at+3];
+            if(length>size-at-12)break;if(!memcmp(data+at+4,"eXIf",4))return true;at+=(size_t)length+12;
+        }
+    }else if(size>=12&&!memcmp(data,"RIFF",4)&&!memcmp(data+8,"WEBP",4)){
+        for(size_t at=12;size-at>=8;){
+            uint32_t length=(uint32_t)data[at+4]|(uint32_t)data[at+5]<<8|(uint32_t)data[at+6]<<16|(uint32_t)data[at+7]<<24;
+            size_t span=(size_t)length+(length&1u);if(span>size-at-8)break;
+            if(!memcmp(data+at,"EXIF",4))return true;at+=span+8;
+        }
+    }
+    return false;
+}
+JSValue web_image_bitmap_native(JSContext *ctx,web_doc *document,node_t *node,int argc,JSValueConst *argv) {
+    if(!argc||!JS_IsString(argv[0]))return JS_ThrowTypeError(ctx,"ImageBitmap operation required");
+    const char *op=JS_ToCString(ctx,argv[0]);if(!op)return JS_EXCEPTION;
+    bool create=!strcmp(op,"create"),close=!strcmp(op,"close"),width=!strcmp(op,"width"),height=!strcmp(op,"height");
+    JS_FreeCString(ctx,op);
+    if(!create){
+        struct image_bitmap *b=argc>1&&bitmap_class?JS_GetOpaque2(ctx,argv[1],bitmap_class):NULL;
+        if(!b)return JS_ThrowTypeError(ctx,"Illegal ImageBitmap receiver");
+        if(close){uint32_t *pixels=b->pixels;b->pixels=NULL;b->w=b->h=0;js_free(ctx,pixels);return JS_UNDEFINED;}
+        if(width)return JS_NewUint32(ctx,b->w);if(height)return JS_NewUint32(ctx,b->h);
+        return JS_ThrowTypeError(ctx,"Unsupported ImageBitmap operation");
+    }
+    if(argc<5)return JS_ThrowTypeError(ctx,"Invalid ImageBitmap creation packet");
+    int kind;if(JS_ToInt32(ctx,&kind,argv[1])<0)return JS_EXCEPTION;
+    if(kind<0||kind>3)return JS_ThrowTypeError(ctx,"Unsupported ImageBitmap source");
+    size_t packet_size=0;uint8_t *packet=JS_GetArrayBuffer(ctx,&packet_size,argv[3]);double v[9];
+    if(!packet||packet_size!=sizeof v)return JS_ThrowTypeError(ctx,"Invalid ImageBitmap transform packet");
+    memcpy(v,packet,sizeof v);for(unsigned i=0;i<9;i++)if(!isfinite(v[i]))return JS_ThrowTypeError(ctx,"Nonfinite ImageBitmap transform");
+    if((v[0]!=0&&v[0]!=1)||(v[7]!=0&&v[7]!=1)||(v[8]!=0&&v[8]!=1))return JS_ThrowTypeError(ctx,"Invalid ImageBitmap flags");
+    if(v[0]&&(!v[3]||!v[4]))return JS_NULL;
+    const uint32_t *pixels=NULL;const uint8_t *rgba=NULL;unsigned w=0,h=0;bool tainted=false;
+    image_t *decoded=NULL;JSValue result=JS_UNDEFINED;
+    if(!web_native_checkpoint(document))return JS_ThrowInternalError(ctx,"ImageBitmap decoding cancelled");
+    if(kind==0){
+        size_t size=0;uint8_t *data=JS_GetArrayBuffer(ctx,&size,argv[2]);
+        if(!data){JSValue exception=JS_GetException(ctx);JS_FreeValue(ctx,exception);return JS_NULL;}
+        /* SVG's native fallback sizes are for ordinary document rendering,
+           not a claim of valid Blob natural dimensions for this subset. */
+        if(image_is_svg(data,size)||(!v[7]&&bitmap_has_exif(data,size)))return JS_NewInt32(ctx,1);
+        decoded=image_decode_serviced(data,size,bitmap_service,document);
+        if(!web_native_checkpoint(document)){image_free(decoded);return JS_ThrowInternalError(ctx,"ImageBitmap decoding cancelled");}
+        if(!decoded||!decoded->px||decoded->w<=0||decoded->h<=0){image_free(decoded);return JS_NULL;}
+        pixels=decoded->px;w=(unsigned)decoded->w;h=(unsigned)decoded->h;
+    }else if(kind==1){
+        size_t size=0;uint8_t *data=JS_GetArrayBuffer(ctx,&size,argv[2]);
+        if(!data){JSValue exception=JS_GetException(ctx);JS_FreeValue(ctx,exception);return JS_NULL;}
+        double dimensions[3];size_t dimensions_size=0;uint8_t *dimensions_data=JS_GetArrayBuffer(ctx,&dimensions_size,argv[4]);
+        if(!dimensions_data||dimensions_size!=sizeof dimensions)return JS_ThrowTypeError(ctx,"Invalid ImageData bitmap packet");
+        memcpy(dimensions,dimensions_data,sizeof dimensions);size_t bytes=0;
+        for(unsigned i=0;i<3;i++)if(!isfinite(dimensions[i])||dimensions[i]<0||floor(dimensions[i])!=dimensions[i])return JS_NULL;
+        /* SIZE_MAX rounds up to 2^64 as a double. Equality at that rounded
+           boundary is already unrepresentable and must precede size_t casts. */
+        if(dimensions[0]>INT32_MAX||dimensions[1]>INT32_MAX||dimensions[2]>=(double)SIZE_MAX)return JS_NULL;
+        if(!canvas_extent((size_t)dimensions[0],(size_t)dimensions[1],4,&bytes)||dimensions[2]>size||bytes>size-(size_t)dimensions[2])return JS_NULL;
+        w=(unsigned)dimensions[0];h=(unsigned)dimensions[1];rgba=data+(size_t)dimensions[2];
+    }else if(kind==2){
+        int status=canvas_source(ctx,node,&pixels,&w,&h,&tainted);
+        if(status<0)return JS_EXCEPTION;if(status)return JS_NULL;
+    }else{
+        struct image_bitmap *source=bitmap_class?JS_GetOpaque2(ctx,argv[2],bitmap_class):NULL;
+        if(!source)return JS_ThrowTypeError(ctx,"Illegal ImageBitmap source");
+        if(!source->pixels||!source->w||!source->h)return JS_NULL;
+        pixels=source->pixels;w=source->w;h=source->h;tainted=source->tainted;
+    }
+    double sx=v[0]?v[1]:0,sy=v[0]?v[2]:0,sw=v[0]?v[3]:w,sh=v[0]?v[4]:h;
+    if(sw<0){sx+=sw;sw=-sw;}if(sh<0){sy+=sh;sh=-sh;}
+    double ow=v[5]?v[5]:(v[6]?ceil(sw*v[6]/sh):sw),oh=v[6]?v[6]:(v[5]?ceil(sh*v[5]/sw):sh);
+    size_t bytes=0;
+    if(!(ow>0)||!(oh>0)||ow>INT32_MAX||oh>INT32_MAX||floor(ow)!=ow||floor(oh)!=oh||!canvas_extent((size_t)ow,(size_t)oh,4,&bytes)){
+        result=JS_ThrowRangeError(ctx,"ImageBitmap size representation");goto done;
+    }
+    if(!bitmap_class)JS_NewClassID(&bitmap_class);
+    if(!JS_IsRegisteredClass(JS_GetRuntime(ctx),bitmap_class)){
+        JSClassDef definition={.class_name="NocturneImageBitmap",.finalizer=bitmap_finalizer};
+        if(JS_NewClass(JS_GetRuntime(ctx),bitmap_class,&definition)<0){result=JS_ThrowOutOfMemory(ctx);goto done;}
+    }
+    struct image_bitmap *b=js_mallocz(ctx,sizeof *b);if(!b){result=JS_EXCEPTION;goto done;}
+    b->pixels=js_malloc(ctx,bytes);if(!b->pixels){js_free(ctx,b);result=JS_EXCEPTION;goto done;}
+    b->w=(unsigned)ow;b->h=(unsigned)oh;b->tainted=tainted;
+    for(unsigned y=0;y<b->h;y++){
+        if(!web_native_checkpoint(document)){js_free(ctx,b->pixels);js_free(ctx,b);result=JS_ThrowInternalError(ctx,"ImageBitmap snapshot cancelled");goto done;}
+        double yy=sy+(v[7]?b->h-y-0.5:y+0.5)*sh/b->h;
+        for(unsigned x=0;x<b->w;x++){
+            double xx=sx+(x+0.5)*sw/b->w;uint32_t color=0;
+            if(xx>=0&&yy>=0&&xx<w&&yy<h){
+                if(rgba)color=bitmap_rgba_sample(rgba,w,h,xx,yy,v[8]!=0);
+                else color=image_sample(pixels,w,h,xx,yy,v[8]!=0);
+            }
+            b->pixels[(size_t)y*b->w+x]=color;
+        }
+    }
+    result=JS_NewObjectProtoClass(ctx,JS_NULL,bitmap_class);
+    if(JS_IsException(result)){js_free(ctx,b->pixels);js_free(ctx,b);}else JS_SetOpaque(result,b);
+done:
+    image_free(decoded);return result;
+}
 static bool image_clip_axis(double *s,double *span,double *d,double *length,unsigned extent) {
     double lo=fmax(0,*s),hi=fmin(extent,*s+*span);
     if (!(hi>lo)) return false;
@@ -222,11 +387,9 @@ static bool image_gpu_blit(struct web_canvas *c,web_doc *allocation,const uint32
     free(output); allocation->canvas_bytes-=bytes;
     return ok;
 }
-JSValue web_canvas_draw_image(JSContext *ctx,node_t *n,node_t *source,int argc,JSValueConst *argv) {
+static JSValue canvas_draw_image(JSContext *ctx,node_t *n,node_t *source,struct image_bitmap *bitmap,int argc,JSValueConst *argv) {
     if (!n || n->type!=N_ELEM || n->foreign || n->tag!=T_canvas)
         return JS_ThrowTypeError(ctx,"Illegal Canvas receiver");
-    if (!source || source->type!=N_ELEM || source->foreign || (source->tag!=T_canvas && source->tag!=T_img))
-        return JS_ThrowTypeError(ctx,"Expected HTMLCanvasElement or HTMLImageElement");
     if (argc!=4) return JS_ThrowTypeError(ctx,"Invalid drawImage packet");
     size_t coord_bytes=0,matrix_bytes=0;
     uint8_t *coords=JS_GetArrayBuffer(ctx,&coord_bytes,argv[0]);
@@ -246,25 +409,12 @@ JSValue web_canvas_draw_image(JSContext *ctx,node_t *n,node_t *source,int argc,J
     /* No author callback runs after acquiring these borrowed pixels. Images
        belong to their owner document and are freed only with that document. */
     const uint32_t *pixels; unsigned w,h; bool tainted;
-    if (source->tag==T_canvas) {
-        if (!web_canvas_dimension(source,"width") || !web_canvas_dimension(source,"height")) return JS_NewInt32(ctx,1);
-        struct web_canvas *src=ensure(source);
-        if (!src) return JS_ThrowOutOfMemory(ctx);
-        pixels=src->pixels; w=src->w; h=src->h; tainted=src->tainted;
+    if (bitmap) {
+        if(!bitmap->pixels||!bitmap->w||!bitmap->h)return JS_NewInt32(ctx,1);
+        pixels=bitmap->pixels;w=bitmap->w;h=bitmap->h;tainted=bitmap->tainted;
     } else {
-        web_doc *d=source->owner;
-        if (!d) return JS_NewInt32(ctx,1);
-        if (d->resources_dirty) doc_sync_tree(d);
-        doc_image_sync(d,source);
-        struct web_image *im=source->image>=0 && source->image<d->images.n?d->images.v[source->image]:NULL;
-        if (!im || !im->done) return JS_UNDEFINED;
-        if (im->failed || !im->img || !im->img->px || im->img->w<=0 || im->img->h<=0) return JS_NewInt32(ctx,1);
-        w=(unsigned)im->img->w; h=(unsigned)im->img->h;
-        if ((uint64_t)w*h>IMAGE_MAX_PIXELS) return JS_ThrowRangeError(ctx,"Image bitmap limit");
-        pixels=im->img->px;
-        /* The current cache lacks redirect/CORS provenance. Conservatively
-           taint ALL network/unknown-origin images, even same-origin HTTP. */
-        tainted=!im->url || strncasecmp(im->url,"data:",5)!=0;
+        int status=canvas_source(ctx,source,&pixels,&w,&h,&tainted);
+        if(status<0)return JS_EXCEPTION;if(status==1)return JS_NewInt32(ctx,1);if(status==2)return JS_UNDEFINED;
     }
     double sx=0,sy=0,sw=w,sh=h,dx=v[0],dy=v[1],dw=w,dh=h;
     if (coord_bytes==32) { dw=v[2]; dh=v[3]; }
@@ -325,7 +475,139 @@ JSValue web_canvas_draw_image(JSContext *ctx,node_t *n,node_t *source,int argc,J
     free(snapshot); if (bytes) allocation->canvas_bytes-=bytes;
     changed(n); return JS_UNDEFINED;
 }
-static void rectangle(struct web_canvas *c,double *v,uint32_t color,bool clear) {
+JSValue web_canvas_draw_image(JSContext *ctx,node_t *n,node_t *source,int argc,JSValueConst *argv) {
+    return canvas_draw_image(ctx,n,source,NULL,argc,argv);
+}
+JSValue web_canvas_draw_bitmap(JSContext *ctx,node_t *n,JSValueConst token,int argc,JSValueConst *argv) {
+    struct image_bitmap *b=bitmap_class?JS_GetOpaque2(ctx,token,bitmap_class):NULL;
+    if(!b)return JS_ThrowTypeError(ctx,"Invalid ImageBitmap token");
+    return canvas_draw_image(ctx,n,NULL,b,argc,argv);
+}
+/* A synchronous borrowed packet rooted by the native call's arguments. The
+ * JS WeakMap owns stop storage and rebuilds it only on addColorStop; no native
+ * gradient allocation, author callback, or CSS parse occurs per pixel. */
+struct canvas_paint {
+    unsigned kind;
+    double alpha,g[6],matrix[6],inverse[4],matrix_scale,geometry_scale;
+    const uint8_t *stops;
+    size_t count;
+    bool invertible,empty;
+    web_doc *document;
+};
+static double paint_stop(const struct canvas_paint *p,size_t i,unsigned field) {
+    double value;memcpy(&value,p->stops+(i*2+field)*sizeof value,sizeof value);return value;
+}
+static int paint_packet(JSContext *ctx,node_t *n,int argc,JSValueConst *argv,int index,struct canvas_paint *p) {
+    memset(p,0,sizeof *p);p->document=n->owner;
+    if(argc<=index || JS_IsUndefined(argv[index]))return 0;
+    size_t bytes=0;uint8_t *data=JS_GetArrayBuffer(ctx,&bytes,argv[index]);
+    if(!data || bytes<14*sizeof(double) || (bytes-14*sizeof(double))%(2*sizeof(double)))goto invalid;
+    double header[14];memcpy(header,data,sizeof header);
+    for(unsigned i=0;i<14;i++)if(!isfinite(header[i]))goto invalid;
+    if((header[0]!=1&&header[0]!=2) || header[1]<0 || header[1]>1 || header[4]<0 || header[7]<0)goto invalid;
+    p->kind=(unsigned)header[0];p->alpha=header[1];
+    memcpy(p->matrix,header+8,sizeof p->matrix);
+    p->stops=data+sizeof header;p->count=(bytes-sizeof header)/(2*sizeof(double));
+    double previous=-1;
+    for(size_t i=0;i<p->count;i++){
+        double offset=paint_stop(p,i,0),color=paint_stop(p,i,1);
+        if(!isfinite(offset)||offset<previous||offset<0||offset>1||!isfinite(color)||color<0||color>UINT32_MAX||floor(color)!=color)goto invalid;
+        previous=offset;
+    }
+    p->geometry_scale=1;
+    for(unsigned i=0;i<6;i++)p->geometry_scale=fmax(p->geometry_scale,fabs(header[i+2]));
+    for(unsigned i=0;i<6;i++)p->g[i]=header[i+2]/p->geometry_scale;
+    p->empty=!p->count || (header[2]==header[5]&&header[3]==header[6]&&(p->kind==1||header[4]==header[7])) ||
+        (p->kind==2&&header[4]==0&&header[7]==0);
+    const double *m=p->matrix;
+    p->matrix_scale=fmax(fmax(fabs(m[0]),fabs(m[1])),fmax(fabs(m[2]),fabs(m[3])));
+    if(p->matrix_scale>0){
+        double a=m[0]/p->matrix_scale,b=m[1]/p->matrix_scale,c=m[2]/p->matrix_scale,d=m[3]/p->matrix_scale,det=a*d-b*c;
+        if(det){p->inverse[0]=d/det;p->inverse[1]=-b/det;p->inverse[2]=-c/det;p->inverse[3]=a/det;
+            p->invertible=isfinite(p->inverse[0])&&isfinite(p->inverse[1])&&isfinite(p->inverse[2])&&isfinite(p->inverse[3]);}
+    }
+    return 0;
+invalid:
+    JS_ThrowTypeError(ctx,"Invalid Canvas gradient paint packet");return -1;
+}
+static uint32_t paint_stops(const struct canvas_paint *p,double t) {
+    if(isnan(t)||!p->count)return 0;
+    uint32_t a,b;double fraction=0;
+    if(t<paint_stop(p,0,0))a=b=(uint32_t)paint_stop(p,0,1);
+    else {
+        /* Upper bound preserves insertion order at coincident color stops. */
+        size_t lo=0,hi=p->count;
+        while(lo<hi){size_t mid=lo+(hi-lo)/2;if(paint_stop(p,mid,0)<=t)lo=mid+1;else hi=mid;}
+        size_t left=lo?lo-1:0;a=(uint32_t)paint_stop(p,left,1);b=a;
+        if(lo<p->count){b=(uint32_t)paint_stop(p,lo,1);fraction=(t-paint_stop(p,left,0))/(paint_stop(p,lo,0)-paint_stop(p,left,0));}
+    }
+    uint32_t result=0;
+    /* HTML Canvas sRGB gradients interpolate RGB and alpha independently,
+       without premultiplication; source-over below still uses real alpha. */
+    for(unsigned shift=0;shift<32;shift+=8){double value=((a>>shift)&255)*(1-fraction)+((b>>shift)&255)*fraction;
+        if(shift==24)value*=p->alpha;result|=(uint32_t)floor(value+0.5)<<shift;}
+    return result;
+}
+static uint32_t paint_color(const struct canvas_paint *p,uint32_t solid,double x,double y) {
+    if(!p || !p->kind)return solid;
+    if(p->empty)return 0;
+    const double *g=p->g,*m=p->matrix;double qx,qy;
+    if(p->invertible){
+        double xx=x/p->matrix_scale-m[4]/p->matrix_scale,yy=y/p->matrix_scale-m[5]/p->matrix_scale;
+        qx=(p->inverse[0]*xx+p->inverse[2]*yy)/p->geometry_scale;
+        qy=(p->inverse[1]*xx+p->inverse[3]*yy)/p->geometry_scale;
+    }else{
+        if(p->kind==2)return 0; /* Radial gradients under singular CTMs. */
+        double sx=m[0]*g[0]+m[2]*g[1]+m[4]/p->geometry_scale,sy=m[1]*g[0]+m[3]*g[1]+m[5]/p->geometry_scale;
+        double ex=m[0]*g[3]+m[2]*g[4]+m[4]/p->geometry_scale,ey=m[1]*g[3]+m[3]*g[4]+m[5]/p->geometry_scale;
+        double dx=ex-sx,dy=ey-sy,scale=fmax(fabs(dx),fabs(dy));
+        if(!(scale>0)||!isfinite(scale))return 0;
+        dx/=scale;dy/=scale;
+        return paint_stops(p,((x/p->geometry_scale-sx)/scale*dx+(y/p->geometry_scale-sy)/scale*dy)/(dx*dx+dy*dy));
+    }
+    if(!isfinite(qx)||!isfinite(qy))return 0;
+    double ux=qx-g[0],uy=qy-g[1],dx=g[3]-g[0],dy=g[4]-g[1];
+    if(p->kind==1){
+        double scale=fmax(fabs(dx),fabs(dy));if(!(scale>0))return 0;dx/=scale;dy/=scale;
+        return paint_stops(p,(ux/scale*dx+uy/scale*dy)/(dx*dx+dy*dy));
+    }
+    /* The radial cone consists of C(t)=C0+t(C1-C0), r(t)=r0+t(r1-r0).
+       Painting in descending t selects the greatest root with positive
+       radius. Negative-radius roots and points outside the cone never paint. */
+    double scale=fmax(1,fmax(fabs(ux),fabs(uy)));ux/=scale;uy/=scale;dx/=scale;dy/=scale;
+    double r0=g[2]/scale,dr=(g[5]-g[2])/scale;
+    double a=dx*dx+dy*dy-dr*dr,b=-2*(ux*dx+uy*dy+r0*dr),c=ux*ux+uy*uy-r0*r0;
+    /* Cancellation may hide an exact tangent after coordinate normalization.
+       Compare with the terms that formed each coefficient, never an absolute
+       epsilon: small but well-conditioned geometry must remain quadratic. */
+    double tolerance=16*DBL_EPSILON;
+    if(fabs(a)<=tolerance*(dx*dx+dy*dy+dr*dr))a=0;
+    if(fabs(b)<=tolerance*2*(fabs(ux*dx)+fabs(uy*dy)+fabs(r0*dr)))b=0;
+    if(fabs(c)<=tolerance*(ux*ux+uy*uy+r0*r0))c=0;
+    double roots[2];unsigned count=0;
+    if(a==0){
+        if(b!=0)roots[count++]=-c/b;
+        else if(c==0)return paint_stops(p,dr<0?-r0/dr:INFINITY);
+    }
+    else{
+        double disc=b*b-4*a*c,tolerance=16*DBL_EPSILON*(b*b+fabs(4*a*c));
+        if(disc<0&&disc>=-tolerance)disc=0;
+        if(disc<0)return 0;
+        double q=-0.5*(b+copysign(sqrt(disc),b));
+        if(q==0)roots[count++]=-b/(2*a);
+        else{roots[count++]=q/a;roots[count++]=c/q;}
+    }
+    double chosen=-INFINITY;
+    /* Include the limiting color of a collapsed circle at its center. A
+       zero-radius family was rejected above; this avoids a spurious one-pixel
+       transparent hole in an otherwise continuous radial field. */
+    for(unsigned i=0;i<count;i++)if(isfinite(roots[i])&&g[2]+roots[i]*(g[5]-g[2])>=0&&roots[i]>chosen)chosen=roots[i];
+    return chosen==-INFINITY?0:paint_stops(p,chosen);
+}
+static bool paint_checkpoint(const struct canvas_paint *p,unsigned row) {
+    (void)row;return !p || !p->kind || web_native_checkpoint(p->document);
+}
+static void rectangle(struct web_canvas *c,double *v,uint32_t color,bool clear,const struct canvas_paint *paint) {
     if (!c->pixels) return;
     double ax=v[0],ay=v[1],bx=ax+v[2],by=ay+v[3];
     if (bx<ax) { double t=ax; ax=bx; bx=t; } if (by<ay) { double t=ay; ay=by; by=t; }
@@ -335,7 +617,7 @@ static void rectangle(struct web_canvas *c,double *v,uint32_t color,bool clear) 
     int w=x1-x0,h=y1-y0;
     /* Real native virgl clear only for opaque, integer-aligned sizable fills.
        Other Canvas work remains explicitly software; no WebGL is advertised. */
-    if (!c->clip && !clear && color>>24==255 && w>=64 && h>=64 && w<=512 && h<=512 &&
+    if ((!paint || !paint->kind) && !c->clip && !clear && color>>24==255 && w>=64 && h>=64 && w<=512 && h<=512 &&
         ax==x0 && ay==y0 && bx==x1 && by==y1) {
         size_t bytes=(size_t)w*h*4; uint32_t *pixels=malloc(bytes);
         struct n_gpu_render r={.width=(unsigned)w,.height=(unsigned)h,.operation=N_GPU_CLEAR,.clear_argb=color};
@@ -345,13 +627,14 @@ static void rectangle(struct web_canvas *c,double *v,uint32_t color,bool clear) 
         }
         free(pixels);
     }
-    for (int y=y0;y<y1;y++) for (int x=x0;x<x1;x++) {
+    for (int y=y0;y<y1;y++) { if(!paint_checkpoint(paint,(unsigned)y))break;
+      for (int x=x0;x<x1;x++) {
         if (!visible(c,x,y)) continue;
         double coverage=fmax(0,fmin(bx,x+1)-fmax(ax,x))*fmax(0,fmin(by,y+1)-fmax(ay,y));
         uint32_t *p=&c->pixels[(size_t)y*c->w+x];
         if (clear) { unsigned a=(unsigned)((*p>>24)*(1-coverage)+0.5); *p=a?(*p&0xffffff)|(a<<24):0; }
-        else { unsigned a=(unsigned)((color>>24)*coverage+0.5); *p=over(*p,(color&0xffffff)|(a<<24)); }
-    }
+        else { uint32_t source=paint_color(paint,color,x+0.5,y+0.5);unsigned a=(unsigned)((source>>24)*coverage+0.5); *p=over(*p,(source&0xffffff)|(a<<24)); }
+    }}
 }
 struct intersection { double x; int direction; };
 /* Shared half-open ray crossing. Weighted interpolation avoids overflowing
@@ -525,9 +808,10 @@ static void intersection_sort(struct intersection *v,size_t n) {
             if(v[root].x>=v[child].x)break;
             t=v[root];v[root]=v[child];v[child]=t;root=child;}}
 }
-static void polygon(struct web_canvas *c,const double *points,size_t count,uint32_t color,bool evenodd,bool clear,uint8_t *mask,struct intersection *hits) {
+static void polygon(struct web_canvas *c,const double *points,size_t count,uint32_t color,bool evenodd,bool clear,uint8_t *mask,struct intersection *hits,const struct canvas_paint *paint) {
     if ((!c->pixels && !mask) || count<3) return;
     for (unsigned y=0;y<c->h;y++) {
+        if(!paint_checkpoint(paint,y))break;
         size_t n=0; double yy=y+0.5;
         size_t first=0;
         while (first<count) {
@@ -553,7 +837,7 @@ static void polygon(struct web_canvas *c,const double *points,size_t count,uint3
             for (int x=x0;x<x1;x++) {
                 if (!visible(c,x,y)) continue;
                 if (mask) mask[(size_t)y*c->w+x]=1;
-                else { uint32_t *p=&c->pixels[(size_t)y*c->w+x]; *p=clear?0:over(*p,color); }
+                else { uint32_t *p=&c->pixels[(size_t)y*c->w+x]; *p=clear?0:over(*p,paint_color(paint,color,x+0.5,y+0.5)); }
             }
         }
     }
@@ -622,7 +906,7 @@ static double baseline_offset(const struct canvas_text *t,unsigned baseline) {
     if (baseline==4 || baseline==5) return -t->descent; /* ideographic/bottom */
     return 0;
 }
-static void text_draw(struct web_canvas *c,const struct canvas_text *t,const double *v,uint32_t color,double align,unsigned baseline) {
+static void text_draw(struct web_canvas *c,const struct canvas_text *t,const double *v,uint32_t color,double align,unsigned baseline,const struct canvas_paint *paint) {
     if (!c->pixels || !t->pixels || !(v[2]>0)) return;
     double shrink=t->width>v[2]?v[2]/t->width:1;
     const double *m=v+3;
@@ -642,7 +926,8 @@ static void text_draw(struct web_canvas *c,const struct canvas_text *t,const dou
     if (!det || !isfinite(det)) return;
     int x0=(int)floor(fmax(0,fmin(c->w,minx))),x1=(int)ceil(fmax(0,fmin(c->w,maxx)));
     int y0=(int)floor(fmax(0,fmin(c->h,miny))),y1=(int)ceil(fmax(0,fmin(c->h,maxy)));
-    for (int yy=y0;yy<y1;yy++) for (int xx=x0;xx<x1;xx++) {
+    for (int yy=y0;yy<y1;yy++) { if(!paint_checkpoint(paint,(unsigned)yy))break;
+      for (int xx=x0;xx<x1;xx++) {
         if (!visible(c,xx,yy)) continue;
         double dx=(xx+0.5)/scale-ox/scale,dy=(yy+0.5)/scale-oy/scale;
         double u=(dx*f-dy*e)/det,vv=(dy*a-dx*b)/det;
@@ -650,9 +935,10 @@ static void text_draw(struct web_canvas *c,const struct canvas_text *t,const dou
         /* All scratch pixels (including black background) are opaque, so the
          * interpolated intensity is the glyph's coverage, never its UI alpha. */
         uint32_t sample=image_sample(t->pixels,t->w,t->h,u*t->w,vv*t->h,true);
-        unsigned alpha=((sample&255)*(color>>24)+127)/255;
-        uint32_t *p=&c->pixels[(size_t)yy*c->w+xx]; *p=over(*p,(color&0xffffff)|(alpha<<24));
-    }
+        uint32_t source=paint_color(paint,color,xx+0.5,yy+0.5);
+        unsigned alpha=((sample&255)*(source>>24)+127)/255;
+        uint32_t *p=&c->pixels[(size_t)yy*c->w+xx]; *p=over(*p,(source&0xffffff)|(alpha<<24));
+    }}
 }
 static JSValue text_native(JSContext *ctx,node_t *n,struct web_canvas *c,const char *op,int argc,JSValueConst *argv) {
     if (argc<7) return JS_ThrowTypeError(ctx,"Invalid Canvas text packet");
@@ -680,7 +966,9 @@ static JSValue text_native(JSContext *ctx,node_t *n,struct web_canvas *c,const c
         else {
             double values[9]; memcpy(values,data,sizeof values);
             bool valid=true; for (unsigned i=0;i<9;i++) if (i!=2 && !isfinite(values[i])) valid=false;
-            if (valid && values[2]>0) { text_draw(c,&t,values,color,align,baseline); changed(n); }
+            struct canvas_paint paint;
+            if(paint_packet(ctx,n,argc,argv,9,&paint)<0)out=JS_EXCEPTION;
+            else if (valid && values[2]>0) { text_draw(c,&t,values,color,align,baseline,&paint); changed(n); }
         }
     }
     text_free(n,&t);
@@ -744,10 +1032,15 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
     const char *op=JS_ToCString(ctx,argv[0]); if (!op) return JS_EXCEPTION;
     JSValue out=JS_UNDEFINED;
     if (!strcmp(op,"width") || !strcmp(op,"height")) out=JS_NewUint32(ctx,web_canvas_dimension(n,op));
-    else if (!strcmp(op,"color")) {
-        const char *text=argc>1?JS_ToCString(ctx,argv[1]):NULL; uint32_t color;
+    else if (!strcmp(op,"color") || !strcmp(op,"gradientColor")) {
+        size_t length=0;const char *text=argc>1?JS_ToCStringLen(ctx,&length,argv[1]):NULL; uint32_t color;
         if (argc>1 && !text) { out=JS_EXCEPTION; goto done; }
-        out=text && css_color(text,strlen(text),&color)?JS_NewUint32(ctx,color):JS_NULL;
+        bool gradient=!strcmp(op,"gradientColor");
+        bool valid=text && (!gradient||css_supports_declaration("color",5,text,length)) && css_color(text,length,&color);
+        /* Canvas-neutral gradient colors resolve currentColor to the initial
+           CSS color, never the canvas element that happened to create it. */
+        if(valid && gradient && color==COLOR_CURRENT)color=0xff000000u;
+        out=valid?JS_NewUint32(ctx,color):JS_NULL;
         JS_FreeCString(ctx,text);
     } else if (!strcmp(op,"font")) out=argc>1?canvas_font(ctx,n,argv[1]):JS_NULL;
     else if (!strcmp(op,"rtl")) {
@@ -798,7 +1091,9 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
             if (numbers<0) { out=JS_EXCEPTION; goto done; }
             if (numbers) {
                 if (argc>5 && JS_ToUint32(ctx,&color,argv[5])<0) { out=JS_EXCEPTION; goto done; }
-                rectangle(c,v,color,!strcmp(op,"clear")); changed(n);
+                struct canvas_paint paint;
+                if(paint_packet(ctx,n,argc,argv,6,&paint)<0){out=JS_EXCEPTION;goto done;}
+                rectangle(c,v,color,!strcmp(op,"clear"),&paint); changed(n);
             }
         } else if (!strcmp(op,"poly") || !strcmp(op,"stroke") || !strcmp(op,"clip")) {
             size_t bytes; uint8_t *data=argc>1?JS_GetArrayBuffer(ctx,&bytes,argv[1]):NULL;
@@ -816,6 +1111,8 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
                     memcpy(matrix,matrix_data,sizeof matrix);
                 }else clear=JS_ToBool(ctx,argv[4]);
             }
+            struct canvas_paint paint;
+            if(paint_packet(ctx,n,argc,argv,5,&paint)<0){out=JS_EXCEPTION;goto done;}
             size_t count=bytes/16;
             bool stroke=!strcmp(op,"stroke");
             if (!stroke && count>SIZE_MAX/sizeof(struct intersection)) { out=JS_ThrowRangeError(ctx,"Canvas path size overflow");goto done; }
@@ -833,9 +1130,9 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
                 clip->refs=1; clip->bytes=bytes; d->canvas_bytes+=bytes;
                 /* polygon samples the old clip as well: intersection, not
                  * replacement. Even an empty path produces an empty clip. */
-                polygon(c,points,count,0,evenodd,false,clip->pixels,hits);
+                polygon(c,points,count,0,evenodd,false,clip->pixels,hits,NULL);
                 clip_release(n,c->clip); c->clip=clip;
-            } else if (!strcmp(op,"poly")) polygon(c,points,count,color,evenodd,clear,NULL,hits);
+            } else if (!strcmp(op,"poly")) polygon(c,points,count,color,evenodd,clear,NULL,hits,&paint);
             else if (c->pixels && isfinite(width) && width>0) {
                 /* Union the complete stroke before compositing: overlapping
                    segments/joins must apply globalAlpha exactly once. */
@@ -845,7 +1142,10 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
                 if(!mask){js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowOutOfMemory(ctx);goto done;}
                 d->canvas_bytes+=mask_bytes;
                 bool complete=stroke_mask(c,points,count,width,matrix,mask);
-                if(complete)for(size_t i=0;i<mask_bytes;i++)if(mask[i])c->pixels[i]=over(c->pixels[i],color);
+                if(complete)for(unsigned y=0;y<c->h;y++){
+                    if(!paint_checkpoint(&paint,y))break;
+                    for(unsigned x=0;x<c->w;x++){size_t i=(size_t)y*c->w+x;
+                        if(mask[i])c->pixels[i]=over(c->pixels[i],paint_color(&paint,color,x+0.5,y+0.5));}}
                 free(mask);d->canvas_bytes-=mask_bytes;
                 if(!complete){js_free(ctx,points);js_free(ctx,hits);out=JS_ThrowRangeError(ctx,"Canvas stroke coordinate representation");goto done;}
             }

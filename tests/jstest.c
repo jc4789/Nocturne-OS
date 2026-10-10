@@ -44,7 +44,7 @@ static const struct asset assets[] = {
 };
 
 struct queued {
-    bool used;
+    bool used, no_cors, no_referrer;
     uint64_t id, due;
     int kind;
     char url[2048], method[16], headers[1024], body[256];
@@ -100,11 +100,13 @@ static void receive_log(void *opaque, int level, const char *message) {
         if (f->nmarks < MARKS) snprintf(f->marks[f->nmarks++], sizeof f->marks[0], "%s", message + 3);
     } else if (!strncmp(message, "FAIL ", 5)) {
         printf("%s\n", message); fflush(stdout); f->js_failures++; failed++; total++;
-    } else if (!strncmp(message, "XHR checks ", 11) || !strncmp(message, "Document checks ", 16) || !strncmp(message, "Document limit mode ", 20) || !strncmp(message, "Lexbor ", 7) || strstr(message, " API checks ")) {
+    } else if (!strncmp(message, "NATIVE-SELECTION ", 17) || !strncmp(message, "XHR checks ", 11) || !strncmp(message, "Document checks ", 16) || !strncmp(message, "Document limit mode ", 20) || !strncmp(message, "Lexbor ", 7) || strstr(message, " API checks ")) {
         printf("%s\n", message);
     } else if (level == 2) {
-        f->errors++;
-        snprintf(f->last_error, sizeof f->last_error, "%s", message);
+        /* One exception can have Diagnostic/Source continuation messages.
+           Keep them in the trace, not in the semantic exception count. */
+        bool detail=!strncmp(message,"Diagnostic #",12)||!strncmp(message,"Source ",7);
+        if(!detail){f->errors++;snprintf(f->last_error, sizeof f->last_error, "%s", message);}
         size_t used = strlen(f->error_trace);
         snprintf(f->error_trace + used, sizeof f->error_trace - used, "%s\n", message);
         if (!strncmp(message, "Diagnostic #", 12)) f->diagnostic_batches++;
@@ -126,6 +128,7 @@ static bool request(void *opaque, const struct web_request *r) {
         snprintf(q->headers, sizeof q->headers, "%s", r->headers ? r->headers : "");
         q->body_len = r->body_len;
         q->cache_mode = r->cache_mode;
+        q->no_cors = r->no_cors; q->no_referrer = r->no_referrer;
         if (r->kind == WEB_RESOURCE_FETCH) f->fetch_requests++;
         size_t n = r->body_len < sizeof q->body - 1 ? r->body_len : sizeof q->body - 1;
         if (n) memcpy(q->body, r->body, n);
@@ -212,10 +215,10 @@ static void deliver(struct fixture *f) {
             snprintf(r.headers, sizeof r.headers, "HTTP/1.1 200 OK\r\n%s\r\n", f->module_mime_headers);
         r.body = strdup(a ? a->body : "not found"); r.body_len = strlen(r.body ? r.body : "");
         if (strstr(q.url, "/api/long-headers")) long_headers(&r, "text/plain");
-        if (strstr(q.url, "/api/oversized-headers")) {
-            r.headers_full = malloc(WEB_RESPONSE_HEADERS_MAX + 1);
-            if (r.headers_full) { memset(r.headers_full, 'X', WEB_RESPONSE_HEADERS_MAX); r.headers_full[WEB_RESPONSE_HEADERS_MAX] = 0; }
-            else strcpy(r.error, "fixture header allocation failed");
+        if (strstr(q.url, "/api/header-allocation-failure")) {
+            /* A real host failure, not an attempt to allocate the entire
+               representable 4 GiB wire size after removing old quotas. */
+            strcpy(r.error, "fixture header allocation failed");
         }
         if (!strcmp(q.url, "http://fixture.test/dir/api/echo")) {
             free(r.body); r.body = malloc(q.body_len + 1); r.body_len = q.body_len; r.status = 200;
@@ -232,6 +235,19 @@ static void deliver(struct fixture *f) {
                 strstr(q.headers, "pragma:") ? "true" : "false");
             free(r.body); r.body = strdup(metadata); r.body_len = strlen(metadata); r.status = 200;
         }
+        if (!strcmp(q.url, "http://fixture.test/dir/api/fetch-policy")) {
+            char metadata[96];
+            snprintf(metadata,sizeof metadata,"{\"no_cors\":%s,\"no_referrer\":%s}",
+                q.no_cors ? "true" : "false", q.no_referrer ? "true" : "false");
+            free(r.body); r.body=strdup(metadata); r.body_len=strlen(metadata); r.status=200;
+        }
+        if (q.no_cors) {
+            /* This in-memory transport serves same-origin responses. Like the
+               production HTTP host, affirm filtering through the private
+               non-field metadata line; absence must remain a network error. */
+            size_t n=strlen(r.headers);
+            snprintf(r.headers+n,sizeof r.headers-n,"HTTP/Nocturne-Meta cors=0 redirected=0 opaque=0\r\n");
+        }
         if (!strcmp(q.url, "http://fixture.test/dir/api/post") &&
             (strcmp(q.method, "POST") || strcmp(q.body, "Nocturne request body") || q.body_len != 21 || !strstr(q.headers, "x-fixture: yes"))) {
             snprintf(r.error, sizeof r.error, "Invalid POST request in the fixture");
@@ -246,17 +262,24 @@ static void deliver(struct fixture *f) {
         web_response_free(&r); f->completions++;
     }
 }
-static web_doc *open_case_url(const char *html, bool expected_errors, const char *url) {
+static web_doc *open_case_url_budget(const char *html, bool expected_errors, const char *url, uint32_t task_budget_ms) {
     memset(&fixture, 0, sizeof fixture); fixture.expected_errors = expected_errors;
     struct web_host host = {.opaque=&fixture, .request=request, .cancel=cancel, .sync_load=sync_load,
-                            .navigate=navigate, .console=receive_log, .scroll=scroll_position,.history=history_host};
+                            .navigate=navigate, .console=receive_log, .scroll=scroll_position,.history=history_host,
+                            .js_task_budget_ms=task_budget_ms};
     fixture.history_length = 1; fixture.history_serial = 1;
     fixture.history[0].url = strdup(url); fixture.history[0].entry = 1;
     fixture.doc = web_live(html, strlen(html), url, "utf-8", &host);
     test_check("web-live-allocation", fixture.doc != NULL);
     return fixture.doc;
 }
+static web_doc *open_case_url(const char *html, bool expected_errors, const char *url) {
+    return open_case_url_budget(html,expected_errors,url,0);
+}
 static web_doc *open_case(const char *html, bool expected_errors) { return open_case_url(html, expected_errors, BASE); }
+/* Deliberate runaway fixtures opt in to a deadline. The product default stays
+ * unlimited; normal finite feature cases retain the ordinary native host. */
+static web_doc *open_watchdog_case(const char *html) { return open_case_url_budget(html,true,BASE,5000); }
 static void step(struct fixture *f) {
     if (f->history_pending) {
         f->history_pending = false;
@@ -462,6 +485,9 @@ static void test_lexbor(void) {
 static void test_cssom(void) {
     external_case("js_cssom_cases.js", ";check('cssom-count',runCSSOMCases()===28);mark('api-done');", BASE);
 }
+static void test_fetch_api(void) {
+    external_case("js_fetch_cases.js", ";runFetchCases().then(n=>{console.log('Fetch API checks '+n);check('fetch-api-count',n>100);mark('api-done');},e=>{console.log('FAIL fetch-api '+e+' '+e.stack);mark('api-done');});", BASE);
+}
 static void test_platform(void) {
     test_cssom();
     test_lexbor();
@@ -473,7 +499,7 @@ static void test_platform(void) {
     external_case("js_form_controls_cases.js", ";Promise.resolve().then(()=>runFormControlCases()).then(n=>{console.log('Form control API checks '+n);check('form-controls-count',n>250);mark('api-done');},e=>{console.log('FAIL form-controls '+e+' '+e.stack);mark('api-done');});", BASE);
     external_case("js_form_validation_cases.js", ";Promise.resolve().then(()=>runFormValidationCases()).then(n=>{console.log('Form validation API checks '+n);check('form-validation-count',n>150);mark('api-done');},e=>{console.log('FAIL form-validation '+e+' '+e.stack);mark('api-done');});", BASE);
     external_case("js_semantic_elements_cases.js", ";Promise.resolve().then(()=>runSemanticElementCases()).then(n=>{console.log('Semantic element API checks '+n);check('semantic-elements-count',n>200);mark('api-done');},e=>{console.log('FAIL semantic-elements '+e+' '+e.stack);mark('api-done');});", BASE);
-    external_case("js_fetch_cases.js", ";runFetchCases().then(n=>{console.log('Fetch API checks '+n);check('fetch-api-count',n>100);mark('api-done');},e=>{console.log('FAIL fetch-api '+e+' '+e.stack);mark('api-done');});", BASE);
+    test_fetch_api();
     external_case("js_css_supports_cases.js", ";mark('api-done');", BASE);
     external_case("js_svg_dom_cases.js", ";check('svg-dom-count',runSVGDOMCases()>=30);mark('api-done');", BASE);
     external_case("js_url_cases.js", ";for(const f of __urlTestResults.failures)console.log('FAIL url '+f.name+' '+f.error);check('url-count',__urlTestResults.total===32);mark('api-done');", BASE);
@@ -508,8 +534,8 @@ static void test_documents(void) {
     external_case("js_document_cases.js", ";try{const n=runDocumentCases();console.log('Document checks '+n);check('document-count',n>=80);}catch(e){console.log('FAIL documents '+e+' '+e.stack);}mark('api-done');", BASE);
     test_check("inert-document-no-network",fixture.requests==0);
     test_check("inert-document-no-navigation",fixture.navigations==0);
-    external_case("js_document_cases.js", ";try{check('document-count-limit',runDocumentLimitCases('count')>=10);}catch(e){console.log('FAIL document count limit '+e+' '+e.stack);}mark('api-done');", BASE);
-    external_case("js_document_cases.js", ";try{check('document-arena-limit',runDocumentLimitCases('arena')>=10);}catch(e){console.log('FAIL document arena limit '+e+' '+e.stack);}mark('api-done');", BASE);
+    external_case("js_document_cases.js", ";try{check('document-count-capacity',runDocumentCapacityCases('count')>=10);}catch(e){console.log('FAIL document count capacity '+e+' '+e.stack);}mark('api-done');", BASE);
+    external_case("js_document_cases.js", ";try{check('document-arena-capacity',runDocumentCapacityCases('arena')>=10);}catch(e){console.log('FAIL document arena capacity '+e+' '+e.stack);}mark('api-done');", BASE);
 }
 
 static void test_language(void) {
@@ -611,7 +637,7 @@ static void test_dom_and_scripts(void) {
         "</script><div id=future></div><script src=classic.js></script><script>"
         "const target=document.getElementById('target');target.style.height='37px';target.className='one two';"
         "check('dom-node-identity',document.querySelector('#target')===target);"
-        "check('dom-prototype-hierarchy',Object.getPrototypeOf(target)===HTMLElement.prototype&&Object.getPrototypeOf(HTMLElement.prototype)===Element.prototype&&Object.getPrototypeOf(Element.prototype)===Node.prototype&&target instanceof HTMLElement&&target instanceof Element&&target instanceof Node);"
+        "check('dom-prototype-hierarchy',Object.getPrototypeOf(target)===HTMLDivElement.prototype&&Object.getPrototypeOf(HTMLDivElement.prototype)===HTMLElement.prototype&&Object.getPrototypeOf(HTMLElement.prototype)===Element.prototype&&Object.getPrototypeOf(Element.prototype)===Node.prototype&&target instanceof HTMLDivElement&&target instanceof HTMLElement&&target instanceof Element&&target instanceof Node);"
         "check('dom-document-interface',Object.getPrototypeOf(document)===HTMLDocument.prototype&&Object.getPrototypeOf(HTMLDocument.prototype)===Document.prototype&&document instanceof Document&&document instanceof Node&&!(document instanceof Element)&&document.className===undefined&&document.getAttribute===undefined&&document.matches===undefined&&document.href===undefined);"
         "check('dom-element-prototype-method',typeof Element.prototype.matches==='function'&&Element.prototype.matches.call(target,'#target')&&Node.prototype.matches===undefined);"
         "class DerivedElement extends Element{};check('dom-no-fake-instanceof',!(target instanceof DerivedElement));"
@@ -876,7 +902,7 @@ static void test_execution_budget(const char *name, const char *source) {
     char *page = script_page(combined); free(combined);
     test_check("budget-page-allocation", page != NULL);
     if (!page) return;
-    if (open_case(page, true)) {
+    if (open_watchdog_case(page)) {
         uint64_t start = uptime_ms();
         test_check(name, pump(NULL, 10000));
         uint64_t elapsed = uptime_ms() - start;
@@ -892,16 +918,16 @@ static void test_execution_budget(const char *name, const char *source) {
     free(page);
 }
 
-static void test_allocation_limit(const char *kind, const char *source, const char *marker) {
+static void test_allocation_contract(const char *kind, const char *source, const char *marker) {
     char *page = script_page(source);
     test_check("limit-page-allocation", page != NULL);
     if (!page) return;
     if (open_case(page, false)) {
         test_check(kind, pump(marker, 12000));
-        test_check("allocation-limit-caught", has_mark(&fixture, marker));
-        test_check("allocation-limit-not-running", !web_script_running(fixture.doc));
-        test_check("allocation-limit-no-uncaught", fixture.errors == 0);
-        test_check("allocation-limit-native-survives", web_anchor_y(fixture.doc, "sentinel") >= 0);
+        test_check("allocation-contract-completed", has_mark(&fixture, marker));
+        test_check("allocation-contract-not-running", !web_script_running(fixture.doc));
+        test_check("allocation-contract-no-uncaught", fixture.errors == 0);
+        test_check("allocation-contract-native-survives", web_anchor_y(fixture.doc, "sentinel") >= 0);
         close_case();
     }
     free(page);
@@ -911,24 +937,31 @@ static void test_limits(void) {
     test_execution_budget("loop-budget", "mark('loop-start');for(;;){}");
     test_execution_budget("microtask-budget", "mark('microtask-start');function forever(){Promise.resolve().then(forever);}forever();");
     test_execution_budget("host-microtask-budget", "mark('microtask-start');function forever(){queueMicrotask(forever);}forever();");
-    /* Split allocations into browser tasks: a time-limit failure cannot stand in
-       for enforcing either allocation quota. No private allocator APIs are used. */
-    test_allocation_limit("heap-128m-limit",
-        "let buffers=[],allocated=0;function consume(){try{for(let i=0;i<4;i++){buffers.push(new ArrayBuffer(1048576));allocated++;}setTimeout(consume,0);}"
-        "catch(e){buffers.length=0;check('heap-bound',allocated>96&&allocated<128);mark('heap-limit');}}consume();", "heap-limit");
-    require_marks((const char *const[]){"heap-bound"}, 1);
-    test_allocation_limit("dom-32m-limit",
-        "const payload='x'.repeat(262144);let nodes=0;function consume(){try{for(let i=0;i<4;i++){document.createTextNode(payload);nodes++;}setTimeout(consume,0);}"
-        "catch(e){check('dom-bound',nodes>64&&nodes<128);mark('dom-limit');}}consume();", "dom-limit");
-    require_marks((const char *const[]){"dom-bound"}, 1);
-    test_allocation_limit("timer-count-limit",
-        "let handles=[];try{for(let i=0;i<130;i++)handles.push(setTimeout(()=>{},60000));check('timer-bound',false);}"
-        "catch(e){check('timer-bound',handles.length===128&&e instanceof RangeError);}for(const h of handles)clearTimeout(h);mark('timer-limit');", "timer-limit");
-    require_marks((const char *const[]){"timer-bound"}, 1);
+    /* The old 128MiB/32MiB/128-handle policy was removed from production.
+       Exercise the real contract with finite allocations, not a loop that
+       consumes all guest RAM waiting for a quota which no longer exists.
+       Native allocation-failure/queue-growth tests separately inject OOM. */
+    test_allocation_contract("heap-past-former-128m-cap",
+        "let buffers=[];function consume(){for(let i=0;i<4&&buffers.length<129;i++)buffers.push(new ArrayBuffer(1048576));"
+        "if(buffers.length<129){setTimeout(consume,0);return;}new Uint8Array(buffers[128])[1048575]=73;"
+        "check('heap-past-old-bound',buffers.length===129&&new Uint8Array(buffers[128])[1048575]===73);"
+        "let rejected=false;try{new ArrayBuffer(2**53);}catch(e){rejected=e instanceof RangeError;}check('heap-length-overflow',rejected);"
+        "buffers.length=0;mark('heap-complete');}consume();", "heap-complete");
+    require_marks((const char *const[]){"heap-past-old-bound","heap-length-overflow"}, 2);
+    test_allocation_contract("dom-past-former-32m-cap",
+        "const payload='x'.repeat(262144);let nodes=[];function consume(){for(let i=0;i<4&&nodes.length<136;i++)nodes.push(document.createTextNode(payload));"
+        "if(nodes.length<136){setTimeout(consume,0);return;}check('dom-past-old-bound',nodes.length===136&&nodes[0].data===payload&&nodes[135].length===262144);"
+        "nodes[135].data='survives';check('dom-after-allocation',nodes[135].data==='survives');mark('dom-complete');}consume();", "dom-complete");
+    require_marks((const char *const[]){"dom-past-old-bound","dom-after-allocation"}, 2);
+    test_allocation_contract("timers-past-former-128-cap",
+        "let handles=[];for(let i=0;i<130;i++)handles.push(setTimeout(()=>{},60000));"
+        "check('timer-past-old-bound',handles.length===130&&new Set(handles).size===130);for(const h of handles)clearTimeout(h);"
+        "setTimeout(()=>mark('timer-complete'),0);", "timer-complete");
+    require_marks((const char *const[]){"timer-past-old-bound"}, 1);
 
     char *page = script_page("document.getElementById('target').addEventListener('runaway',e=>{e.preventDefault();for(;;){}});mark('runaway-ready');");
     test_check("runaway-event-page-allocation", page != NULL);
-    if (page && open_case(page, true)) {
+    if (page && open_watchdog_case(page)) {
         test_check("runaway-event-ready", pump("runaway-ready", 4000));
         web_node *target = web_node_at(fixture.doc, 3, 4);
         struct web_event e = {.type="runaway",.cancelable=true};
@@ -954,7 +987,7 @@ static void test_scripting_presentation(void) {
     web_doc *static_doc=web_parse(page,strlen(page),BASE,"utf-8");
     test_check("scripting-disabled-document",static_doc!=NULL);
     if(static_doc){web_layout(static_doc,VW,VH);test_check("noscript-disabled-fallback",web_anchor_y(static_doc,"sentinel")==50);web_free(static_doc);}
-    if(open_case(page,true)) {
+    if(open_watchdog_case(page)) {
         /* Like the browser's navigation path, establish the viewport before
            the first script runs; this page has no blocking external resource. */
         web_layout(fixture.doc,VW,VH);
@@ -972,7 +1005,10 @@ static void test_native_selection(void) {
     const char *source =
         "const input=document.createElement('input');input.style.cssText='position:absolute;left:0;top:0;width:200px;height:30px';"
         "document.body.appendChild(input);input.value='abcdef';input.setSelectionRange(1,4);input.focus();let stage=0;"
+        "const log=(kind,e)=>console.log('NATIVE-SELECTION '+kind+' stage='+stage+' value='+JSON.stringify(input.value)+' range='+input.selectionStart+':'+input.selectionEnd+':'+input.selectionDirection+(e?' data='+JSON.stringify(e.data)+' type='+e.inputType+' cancelled='+e.defaultPrevented:''));"
+        "input.addEventListener('beforeinput',e=>log('beforeinput',e));input.addEventListener('input',e=>log('input',e));log('ready');"
         "input.addEventListener('selection-probe',()=>{"
+        "log('probe');"
         "if(stage===0){check('native-range-replacement',input.value==='aZef'&&input.selectionStart===2&&input.selectionEnd===2);input.value='a\\ud83d\\ude00b';input.setSelectionRange(3,3);}"
         "if(stage===1)check('native-left-scalar',input.selectionStart===1&&input.selectionEnd===1);"
         "if(stage===2)check('native-shift-selection',input.selectionStart===1&&input.selectionEnd===3&&input.selectionDirection==='forward');"
@@ -996,7 +1032,9 @@ static void test_native_selection(void) {
         for(unsigned i=0;input && i<sizeof keys/sizeof *keys;i++) {
             struct gui_event key={.key=keys[i],.mods=(i==2||i==5||i==6)?NMOD_SHIFT:0};
             int result=web_key(fixture.doc,&key);
-            test_check("native-selection-key-handled",result==(i==8?0:1));
+            printf("NATIVE-SELECTION key stage=%u result=%d\n",i,result);fflush(stdout);
+            /* Rejected maxlength growth still consumes the editing key. */
+            test_check("native-selection-key-handled",result==1);
             struct web_event probe={.type="selection-probe"};web_dispatch(fixture.doc,input,&probe);
             char mark[48];snprintf(mark,sizeof mark,"native-selection-step-%u",i+1);
             test_check("native-selection-step",has_mark(&fixture,mark));
@@ -1047,6 +1085,8 @@ int main(int argc, char **argv) {
 #define RUN(name, fn) do { if (argc == 1 || !strcmp(argv[1], name)) { printf("jstest: %s\n", name); fflush(stdout); fn(); } } while (0)
     RUN("language", test_language);
     RUN("platform", test_platform);
+    /* An API-only selector avoids repeating the full platform batch. */
+    if (argc > 1 && !strcmp(argv[1], "fetch-api")) { printf("jstest: fetch-api\n"); fflush(stdout); test_fetch_api(); }
     RUN("broadcast", test_broadcast);
     RUN("retired-jobs", test_retired_jobs);
     RUN("retired-tasks", test_retired_tasks);

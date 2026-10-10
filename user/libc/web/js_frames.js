@@ -82,7 +82,7 @@
         document.close=function(){host.documentStream(1);};
         const selfToken=host.frame('self',null);
         Object.defineProperty(document,'defaultView',{configurable:true,get(){return host.frame('top',selfToken)===selfToken?globalThis:windowProxy(selfToken);}});
-        Object.defineProperty(Document.prototype,'defaultView',{configurable:true,get(){if(rawDom('get',this,'nodeType')!==9)throw new TypeError('Document receiver required');return this===document?document.defaultView:null;}});
+        Object.defineProperty(Document.prototype,'defaultView',{configurable:true,get(){if(rawDom.get(this,'nodeType')!==9)throw new TypeError('Document receiver required');return this===document?document.defaultView:null;}});
         Object.defineProperties(globalThis,{
             // Native new windows are independent, never fake opener proxies.
             // Child browsing contexts likewise have no opener relationship.

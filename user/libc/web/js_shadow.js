@@ -3,8 +3,8 @@
  * https://dom.spec.whatwg.org/#shadow-trees
  * https://html.spec.whatwg.org/multipage/scripting.html#the-slot-element */
 const shadowBridge = (() => {
-    const get=(n,key)=>rawDom('get',n,key), root=n=>rawDom('root',n,false);
-    const isNode=n=>rawDom('isNode',null,n);
+    const get=(n,key)=>rawDom.get(n,key), root=n=>rawDom.root(n,false);
+    const isNode=n=>rawDom.isNode(null,n);
     const string=value=>{if(typeof value==='symbol')throw new TypeError('Cannot convert Symbol to DOMString');return String(value);};
     function dictionary(value){
         if(value==null)return {};
@@ -26,15 +26,15 @@ const shadowBridge = (() => {
         get activeElement(){return get(shadow(this),'activeElement');}
         elementFromPoint(x,y){
             shadow(this);if(arguments.length<2)throw new TypeError('Two coordinates required');
-            return rawDom('elementFromPoint',this,x,y);
+            return rawDom.elementFromPoint(this,x,y);
         }
     }
     class HTMLSlotElement extends HTMLElement {
         constructor(){throw new TypeError('Illegal HTMLSlotElement constructor');}
         get name(){slot(this);return reflectedAttr(this,'name')||'';}
         set name(value){slot(this);reflectedAttr(this,'name',string(value));}
-        assignedNodes(options={}){slot(this);return rawDom('slotNodes',this,!!dictionary(options).flatten);}
-        assignedElements(options={}){slot(this);return rawDom('slotNodes',this,!!dictionary(options).flatten).filter(n=>get(n,'nodeType')===1);}
+        assignedNodes(options={}){slot(this);return rawDom.slotNodes(this,!!dictionary(options).flatten);}
+        assignedElements(options={}){slot(this);return rawDom.slotNodes(this,!!dictionary(options).flatten).filter(n=>get(n,'nodeType')===1);}
         assign(...nodes){slot(this);dom('slotAssign',this,...nodes);}
     }
     Object.defineProperties(Element.prototype,{
@@ -66,7 +66,7 @@ const shadowBridge = (() => {
     });
     Object.defineProperty(DocumentFragment.prototype,'getElementById',{configurable:true,enumerable:true,writable:true,value:function(id){
         if(get(this,'nodeType')!==11)throw new TypeError('DocumentFragment receiver required');
-        if(!arguments.length)throw new TypeError('Identifier required');return rawDom('id',this,string(id));
+        if(!arguments.length)throw new TypeError('Identifier required');return rawDom.id(this,string(id));
     }});
     for(const C of [ShadowRoot,HTMLSlotElement])Object.defineProperty(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
     Object.assign(globalThis,{ShadowRoot,HTMLSlotElement});

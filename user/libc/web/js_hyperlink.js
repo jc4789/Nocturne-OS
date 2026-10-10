@@ -26,14 +26,14 @@
         return result;
     }
     function parse(el,attribute){
-        try { return new URLImpl(attribute,rawDom('get',el,'baseURI')); }
+        try { return new URLImpl(attribute,rawDom.get(el,'baseURI')); }
         catch(error){if(error instanceof TypeErrorImpl)return null;throw error;}
     }
     function parsedHref(el){const value=reflectedAttr(el,'href');return value===null?null:parse(el,value);}
     function attribute(el,tag,name,emptyDocument){
         htmlElementBrand(el,tag);
         const value=reflectedAttr(el,name);
-        if(emptyDocument && (value===null || value===''))return rawDom('get',rawDom('get',el,'ownerDocument'),'URL');
+        if(emptyDocument && (value===null || value===''))return rawDom.get(rawDom.get(el,'ownerDocument'),'URL');
         if(value===null)return '';
         const url=parse(el,value);return url?call(urlGet.href,url,[]):scalar(value);
     }
@@ -61,6 +61,6 @@
         define(C.prototype,'toString',{configurable:true,writable:true,value(){return attribute(this,tag,'href',false);}});
     }
     define(HTMLAnchorElement.prototype,'text',{configurable:true,enumerable:true,
-        get(){htmlElementBrand(this,'a');return rawDom('get',this,'textContent');},
+        get(){htmlElementBrand(this,'a');return rawDom.get(this,'textContent');},
         set(value){htmlElementBrand(this,'a');dom('set',this,'textContent',string(value));}});
 })();

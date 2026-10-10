@@ -280,7 +280,7 @@ const fetchBridge = (() => {
         return out;
     }
     function enumValue(v,allowed,label){v=str(v);if(!allowed.includes(v))throw new TypeError('Invalid '+label);return v;}
-    function makeURL(value){return new NativeURL(usv(value),rawDom('get',document,'baseURI'));}
+    function makeURL(value){return new NativeURL(usv(value),rawDom.get(document,'baseURI'));}
     function methodValue(value){const method=byteString(value),upper=method.toUpperCase();if(!token.test(method)||['CONNECT','TRACE','TRACK'].includes(upper))throw new TypeError('Invalid or forbidden HTTP method');return ['DELETE','GET','HEAD','OPTIONS','POST','PUT'].includes(upper)?upper:method;}
     function cloneBody(b){if(unusable(b))throw new TypeError('Body already consumed or locked');let stream;
         if(b.stream){const branches=streams.tee(b.stream);b.stream=branches[0];stream=branches[1];}

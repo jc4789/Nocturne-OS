@@ -77,8 +77,8 @@ const formDataBridge = (() => {
         constructor(form=undefined,submitter=null){
             if(form!==undefined)htmlElementBrand(form,'form');
             if(submitter!=null){
-                rawDom('get',submitter,'elementBrand');
-                if(rawDom('get',submitter,'namespaceURI')!=='http://www.w3.org/1999/xhtml')throw new TypeErr('Submitter must be an HTMLElement');
+                rawDom.get(submitter,'elementBrand');
+                if(rawDom.get(submitter,'namespaceURI')!=='http://www.w3.org/1999/xhtml')throw new TypeErr('Submitter must be an HTMLElement');
             }
             if(form!==undefined)throw new DomErr('Native FormData(form) entry collection is not implemented','NotSupportedError');
             apply(put,slots,[this,list()]);

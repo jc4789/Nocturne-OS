@@ -209,6 +209,7 @@ def main():
     ap.add_argument('--native-pointer-marker', help='browser native受信の「接頭辞 seq x y」。DOM callback待ちを位置ackにしない')
     ap.add_argument('--mouse-confirm-marker', help='実trusted hover後の読取observerが「接頭辞 id x y」で最終targetを確認')
     ap.add_argument('--scroll-pages', type=int, default=0, help='実ページをクリックしてから結果一覧を順に下へ送り画面を保存')
+    ap.add_argument('--scroll-interval', type=int, default=6, help='実ページ送りの間隔、1～60秒。クリック対象の確認期限は変更しない')
     ap.add_argument('--no-focus-click', action='store_true', help='既にactiveなbrowserへPgDnだけ送る。ページ中央のselect等を誤操作しない')
     ap.add_argument('--expect', action='append', default=[], help='serialに必要な文字列（複数可）')
     ap.add_argument('--reject', action='append', default=[], help='serialに出てはいけない文字列（複数可）')
@@ -259,6 +260,8 @@ def main():
     mouse_seen, mouse_actions = set(), []
     if not 0 <= a.scroll_pages <= 40:
         ap.error('スクロール回数は0から40です')
+    if not 1 <= a.scroll_interval <= 60:
+        ap.error('ページ送りの間隔は1から60秒です')
     if a.cpu_model is not None and not re.fullmatch('[a-zA-Z0-9_.,=+_-]+', a.cpu_model):
         ap.error('不正なQEMU CPUモデルです')
     if a.url and any(x in a.url for x in '\n\r\0 |&;`$'):
@@ -336,6 +339,7 @@ def main():
     metadata = {'arguments': args, 'boot_payload_sha256': hashes, 'user_data_attached': False,
                 'boot_snapshot': True, 'scratch_snapshot': True, 'requested_seconds': a.seconds,
                 'requested_resolution': a.resolution,
+                'requested_scroll_interval': a.scroll_interval,
                 'expected_serial': a.expect, 'rejected_serial': a.reject,
                 'guest_console_sha256': guest_hashes, 'guest_autorun_sha256': digest(script)}
     err = (here / 'qemu-stderr.log').open('wb')
@@ -409,8 +413,17 @@ def main():
                     mouse_actions.append(action)
                     (here/'mouse-actions.json').write_text(json.dumps(mouse_actions, indent=2), encoding='utf-8')
                     if a.native_pointer_marker:
-                        action['native_pointer']=move_native_pointer(mon, serial, a.native_pointer_marker,
-                                                                     int(x), int(y), deadline)
+                        # A stale author marker must not monopolize the run:
+                        # keep captures and keyboard scrolling observable even
+                        # when layout moved the target. Never click without ACK.
+                        try:
+                            action['native_pointer']=move_native_pointer(mon, serial, a.native_pointer_marker,
+                                                                         int(x), int(y), min(deadline, time.monotonic()+12))
+                        except RuntimeError as input_error:
+                            action.update(stage='refused', error=str(input_error))
+                            (here/'mouse-actions.json').write_text(json.dumps(mouse_actions, indent=2), encoding='utf-8')
+                            shot(mon, 'mouse-refused-'+ident)
+                            continue
                         action['stage']='arrived'
                         (here/'mouse-actions.json').write_text(json.dumps(mouse_actions, indent=2), encoding='utf-8')
                     # Clamp at the corner, then use <=5 deltas to avoid the
@@ -450,7 +463,14 @@ def main():
                         else:
                             raise RuntimeError('native mousemove の有限補正が一致しません')
                     if kind=='click' and a.mouse_confirm_marker:
-                        confirm_native_target(serial, a.mouse_confirm_marker, ident, int(x), int(y), deadline)
+                        try:
+                            confirm_native_target(serial, a.mouse_confirm_marker, ident, int(x), int(y),
+                                                  min(deadline, time.monotonic()+12))
+                        except RuntimeError as input_error:
+                            action.update(stage='refused', error=str(input_error))
+                            (here/'mouse-actions.json').write_text(json.dumps(mouse_actions, indent=2), encoding='utf-8')
+                            shot(mon, 'mouse-refused-'+ident)
+                            continue
                         action['stage']='confirmed'
                     shot(mon, 'mouse-'+kind+'-'+ident)
                     if kind=='click':
@@ -482,7 +502,7 @@ def main():
                 shot(mon, 'page-'+str(scroll_count))
                 mon.cmd('sendkey pgdn')
                 scroll_count += 1
-                scroll_at += 6
+                scroll_at += a.scroll_interval
             if a.stop_when_expected and serial.exists():
                 log = serial.read_text(encoding='utf-8', errors='replace')
                 if all(x in log for x in a.expect):
@@ -544,9 +564,13 @@ def main():
         if a.ready_marker and ready_at is None:
             missing.append(a.ready_marker)
         rejected = [x for x in a.reject if x in log]
+        refused = [x for x in mouse_actions if x.get('stage') == 'refused']
+        if refused:
+            failure = (failure+'; ' if failure else '')+'実pointer操作を拒否しました（座標またはhover未確認）'
         ok = failure is None and p.returncode == 0 and not missing and not rejected and (a.allow_panic or 'KERNEL PANIC' not in log)
         metadata.update(exit_code=p.returncode, elapsed_seconds=round(time.monotonic()-start, 2),
-                        process_stopped=True, harness_accepted=ok, missing_serial=missing, rejected_serial_found=rejected, harness_error=failure,
+                         process_stopped=True, harness_accepted=ok, missing_serial=missing, rejected_serial_found=rejected, harness_error=failure,
+                         refused_pointer_actions=refused,
                         site_acceptance='画面と操作結果の別確認が必要')
         metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
         print('隔離QEMU 終了:', p.returncode, '検査:', '成功' if ok else '失敗', flush=True)

@@ -292,7 +292,7 @@ static int64_t sys_ping(uint32_t dst, int seq, int timeout_ms) {
     struct ping_wait *w = &pings[slot];
     w->used = true;
     w->done = false;
-    w->id = (uint16_t)(0x4E00 + current_task->pid);
+    w->id = (uint16_t)(0x4E00 + task_process()->pid);
     w->seq = (uint16_t)seq;
     struct icmp_hdr *h = (struct icmp_hdr *)L4;
     h->type = 8;
@@ -426,7 +426,7 @@ static struct udp_dgram *udp_wait(int i, int timeout_ms, int *err) {
 }
 
 static struct udp_sock *user_udp(int h) {
-    if (h < 0 || h >= UDP_N || !udp_socks[h].used || udp_socks[h].pid != current_task->pid) return NULL;
+    if (h < 0 || h >= UDP_N || !udp_socks[h].used || udp_socks[h].pid != task_process()->pid) return NULL;
     return &udp_socks[h];
 }
 
@@ -1179,7 +1179,7 @@ static void tcp_input_held(size_t n) {
 }
 
 static struct tcb *user_tcb(int h) {
-    if (h < 0 || h >= TCP_N || tcbs[h].state == T_FREE || !tcbs[h].user_open || tcbs[h].pid != current_task->pid)
+    if (h < 0 || h >= TCP_N || tcbs[h].state == T_FREE || !tcbs[h].user_open || tcbs[h].pid != task_process()->pid)
         return NULL;
     return &tcbs[h];
 }
@@ -1215,7 +1215,7 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
         tcp_free(t);
         return -ENOMEM;
     }
-    t->pid = current_task->pid;
+    t->pid = task_process()->pid;
     t->user_open = true;
     t->rip = ip;
     t->rport = port;
@@ -1411,7 +1411,7 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
     }
     case SYS_UDP_SOCKET:
         if (!nif) return -ENETDOWN;
-        return udp_alloc((uint16_t)a, current_task->pid);
+        return udp_alloc((uint16_t)a, task_process()->pid);
     case SYS_UDP_SEND: {
         struct udp_sock *s = user_udp((int)a);
         if (!s) return -EBADF;
@@ -1458,7 +1458,7 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
         if (a) {
             if (!user_ok((void *)a, sizeof(struct n_netfault))) return -EFAULT;
             fault = *(const struct n_netfault *)a;
-            fault_pid = fault.rx_drop || fault.rx_reorder || fault.tx_drop ? current_task->pid : 0;
+            fault_pid = fault.rx_drop || fault.rx_reorder || fault.tx_drop ? task_process()->pid : 0;
         }
         if (b) {
             if (!user_ok_w((void *)b, sizeof(struct n_tcpstats))) return -EFAULT;

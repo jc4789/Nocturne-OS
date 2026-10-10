@@ -1,6 +1,7 @@
 /* Native child browsing contexts. Windows are guarded by js.c; no JS DOM copy. */
 #pragma once
 #include "webi.h"
+#include "sandbox.h"
 struct web_frame {
     struct web_frame *next;
     web_doc *owner;
@@ -13,6 +14,8 @@ struct web_frame {
     uint64_t request;
     unsigned dom_order;
     bool notified, detached, failed, initial_failed;
+    uint32_t pending_sandbox_flags;
+    bool sandbox_initial;
     canvas_t paint;
     bool paint_failed;
     bool paint_visible;
@@ -41,4 +44,8 @@ int64_t web_frames_deadline(web_doc *document);
 bool web_frames_busy(web_doc *document);
 void web_frames_loaded(web_doc *document, uint64_t id, const struct web_response *response);
 bool web_frame_same_origin(web_doc *first, web_doc *second);
+bool web_sandbox_document_allowed(struct web_frame *frame,const char *url,bool inherited);
+bool web_sandbox_navigation_allowed(web_doc *source,web_doc *destination,bool trusted);
+bool web_sandbox_forms_allowed(web_doc *document);
+bool web_sandbox_auxiliary_allowed(web_doc *document);
 bool web_frame_paint(node_t *element, canvas_t *canvas, int x, int y, int width, int height);

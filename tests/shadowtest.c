@@ -180,7 +180,7 @@ static void css_arena_boundary(void) {
     struct web_host callbacks = {.opaque=&log,.console=css_failure_console};
     web_doc *d = web_live(html,strlen(html),"https://shadow.test/arena","utf-8",&callbacks);
     check(d != NULL,"CSS arena boundary document"); if (!d) return;
-    check(d->cssmem.limit == (32u << 20),"live CSS AST default has a finite 32 MiB budget");
+    check(d->cssmem.limit == 0,"live CSS AST default has no fixed budget");
     for (int i = 0; i < 8; i++) web_tick(d,uptime_ms());
     node_t *n = query(d,d->root,"#arena");
     web_layout(d,VW,VH);

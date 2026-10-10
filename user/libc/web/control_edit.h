@@ -61,6 +61,9 @@ static int control_user_replace(web_doc *d,node_t *n,uint32_t start,uint32_t end
                 if(n->tag==T_textarea){sb_putc(&proposal,'\n');if(i+1<text_len&&data[i+1]=='\n')i++;}
             }else if(c!='\n'||n->tag==T_textarea)sb_putc(&proposal,c);
         }
+        /* sb_put/sb_putc maintain a counted buffer, not a C string. Scan only
+           the normalized insertion, never uninitialized reservation bytes. */
+        proposal.p[proposal.n]=0;
         inserted=doc_utf16_length(proposal.p+at);
         if (inserted > UINT32_MAX - start || inserted > UINT32_MAX - (length - (end - start))) goto unchanged;
         caret=start+inserted;

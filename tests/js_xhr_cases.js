@@ -125,20 +125,19 @@ async function runXHRCases() {
         const done=settle(mime);mime.send('x');await done;
         assert(mime.responseText==='content-type: '+want+'\r\n','MIME charset respects quoted parameters');
     }
-    const timers=[];let exhausted=false;
-    try{for(let i=0;i<130;i++)timers.push(setTimeout(()=>{},60000));}catch(e){exhausted=e.name==='RangeError';}
-    assert(exhausted,'native timer cap reached');
-    const capacity=new XMLHttpRequest();capacity.open('GET','api/json');capacity.timeout=10;
-    throws(()=>capacity.send(),'RangeError','timer exhaustion rejected before request');
-    assert(capacity.readyState===1,'timer exhaustion keeps opened state');
+    const timers=[];for(let i=0;i<130;i++)timers.push(setTimeout(()=>{},60000));
+    assert(timers.length===130&&new Set(timers).size===130,'native timers grow past the former cap');
+    const capacity=new XMLHttpRequest();capacity.open('GET','api/json');capacity.timeout=1000;
+    const capacityDone=settle(capacity);capacity.send();await capacityDone;
+    assert(capacity.status===200&&capacity.readyState===4,'XHR timeout timer coexists with grown table');
     for(const id of timers)clearTimeout(id);
-    capacity.timeout=0;const capacityDone=settle(capacity);capacity.send();await capacityDone;
-    assert(capacity.status===200,'retry after timer allocation failure');
+    capacity.open('GET','api/json');capacity.timeout=0;const retryDone=settle(capacity);capacity.send();await retryDone;
+    assert(capacity.status===200,'XHR reuse after timer cancellation');
     const backlog=new XMLHttpRequest();backlog.open('GET','api/json');
     let backlogError=false;backlog.onerror=()=>backlogError=true;const backlogDone=settle(backlog);backlog.send();
-    timers.length=0;try{for(let i=0;i<130;i++)timers.push(setTimeout(()=>{},60000));}catch(_){}
+    timers.length=0;for(let i=0;i<130;i++)timers.push(setTimeout(()=>{},60000));
     await backlogDone;for(const id of timers)clearTimeout(id);
-    assert(backlogError && backlog.status===0 && backlog.readyState===4,'completion task exhaustion fails without hanging');
+    assert(!backlogError && backlog.status===200 && backlog.readyState===4,'completion task survives grown timer table');
     const invalid=new XMLHttpRequest();invalid.open('GET','file:///home/not-a-network-url');let networkError=false;invalid.onerror=()=>networkError=true;
     const ip=settle(invalid);invalid.send();assert(!networkError,'unsupported network error asynchronous');await ip;
     assert(networkError && invalid.status===0,'transport rejects non HTTP');

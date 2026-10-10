@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <nocturne.h>
+#include <parallel.h>
 #include "webi.h"
 #include "frame.h"
 #include "web_dialog.h"
@@ -87,7 +88,7 @@ static uint32_t lerp_col(uint32_t a, uint32_t b, float t) {
 }
 
 /* fill a rectangle with rounded corners (radius r) with a vertical gradient top..bot */
-static void fill_rrect(canvas_t *c, float x, float y, float w, float h, float r, uint32_t top, uint32_t bot) {
+static void fill_rrect_serial(canvas_t *c, float x, float y, float w, float h, float r, uint32_t top, uint32_t bot) {
     if (w <= 0 || h <= 0) return;
     if (r > w / 2) r = w / 2;
     if (r > h / 2) r = h / 2;
@@ -125,7 +126,7 @@ static void fill_rrect(canvas_t *c, float x, float y, float w, float h, float r,
 }
 
 /* a border ring with rounded corners: everything between the outer and the inner rounded rect */
-static void ring_rrect(canvas_t *c, float x, float y, float w, float h, float r, const float *bw, const uint32_t *col) {
+static void ring_rrect_serial(canvas_t *c, float x, float y, float w, float h, float r, const float *bw, const uint32_t *col) {
     float ix = x + bw[3], iy = y + bw[0], iw = w - bw[1] - bw[3], ih = h - bw[0] - bw[2];
     float maxb = fmaxf(fmaxf(bw[0], bw[1]), fmaxf(bw[2], bw[3]));
     float ir = r - maxb;
@@ -156,6 +157,52 @@ static void ring_rrect(canvas_t *c, float x, float y, float w, float h, float r,
             gfx_blend_pixel(c, px, py, with_alpha(cc, a));
         }
     }
+}
+
+/* Each primitive is joined before the next one, preserving stacking/alpha
+ * order. Helpers see only immutable geometry and private canvas clip state;
+ * DOM, font, image-cache, video and debug side effects stay on the caller. */
+struct raster_job {
+    canvas_t canvas;
+    void (*draw)(canvas_t *, const void *);
+    const void *geometry;
+    int y0, y1, visible_width;
+};
+static void raster_tile(size_t tile, void *context) {
+    const struct raster_job *j = context;
+    canvas_t c = j->canvas;
+    c.cy0 = j->y0 + (int)tile * 32;
+    c.cy1 = MIN(c.cy0 + 32, j->y1);
+    parallel_record_work(PARALLEL_RASTER, (uint64_t)j->visible_width * (c.cy1 - c.cy0));
+    j->draw(&c, j->geometry);
+}
+static void raster_draw(canvas_t *c, float x, float y, float w, float h,
+                        void (*draw)(canvas_t *, const void *), const void *geometry) {
+    if (!isfinite(x) || !isfinite(y) || !isfinite(w) || !isfinite(h) || w <= 0 || h <= 0) return;
+    /* Intersect in floating point before converting untrusted CSS dimensions. */
+    int y0 = (int)fmaxf((float)c->cy0, fminf((float)c->cy1, floorf(y)));
+    int y1 = (int)fmaxf((float)c->cy0, fminf((float)c->cy1, ceilf(y + h)));
+    float visible_w = fmaxf(0, fminf((float)c->cx1, x + w) - fmaxf((float)c->cx0, x));
+    if (y1 - y0 < 64 || visible_w * (y1 - y0) < 65536) { draw(c, geometry); return; }
+    struct raster_job j = {*c, draw, geometry, y0, y1, (int)ceilf(visible_w)};
+    parallel_for_stage(PARALLEL_RASTER,(size_t)(y1 - y0 + 31) / 32, raster_tile, &j,NULL,NULL);
+}
+struct rrect_geometry { float x, y, w, h, r; uint32_t top, bottom; const float *bw; const uint32_t *colors; };
+static void raster_fill(canvas_t *c, const void *geometry) {
+    const struct rrect_geometry *g = geometry;
+    fill_rrect_serial(c, g->x, g->y, g->w, g->h, g->r, g->top, g->bottom);
+}
+static void raster_ring(canvas_t *c, const void *geometry) {
+    const struct rrect_geometry *g = geometry;
+    ring_rrect_serial(c, g->x, g->y, g->w, g->h, g->r, g->bw, g->colors);
+}
+static void fill_rrect(canvas_t *c, float x, float y, float w, float h, float r, uint32_t top, uint32_t bot) {
+    struct rrect_geometry g = {x,y,w,h,r,top,bot,NULL,NULL};
+    raster_draw(c,x,y,w,h,raster_fill,&g);
+}
+static void ring_rrect(canvas_t *c, float x, float y, float w, float h, float r, const float *bw, const uint32_t *col) {
+    struct rrect_geometry g = {x,y,w,h,r,0,0,bw,col};
+    raster_draw(c,x,y,w,h,raster_ring,&g);
 }
 
 static uint32_t shade(uint32_t c, float f) {
@@ -371,7 +418,7 @@ static uint32_t stops_at(const struct gstops *s, float t) {
     return s->col[s->n - 1];
 }
 
-static void fill_gradient(canvas_t *c, float x, float y, float w, float h, float r, const struct gradient *g, uint32_t cur) {
+static void fill_gradient_serial(canvas_t *c, float x, float y, float w, float h, float r, const struct gradient *g, uint32_t cur) {
     if (w <= 0 || h <= 0) return;
     if (r > w / 2) r = w / 2;
     if (r > h / 2) r = h / 2;
@@ -444,6 +491,16 @@ static void fill_gradient(canvas_t *c, float x, float y, float w, float h, float
             gfx_blend_pixel(c, px, py, col);
         }
     }
+}
+
+struct gradient_geometry { float x,y,w,h,r; const struct gradient *gradient; uint32_t color; };
+static void raster_gradient(canvas_t *c, const void *geometry) {
+    const struct gradient_geometry *g = geometry;
+    fill_gradient_serial(c,g->x,g->y,g->w,g->h,g->r,g->gradient,g->color);
+}
+static void fill_gradient(canvas_t *c, float x, float y, float w, float h, float r, const struct gradient *g, uint32_t cur) {
+    struct gradient_geometry geometry = {x,y,w,h,r,g,cur};
+    raster_draw(c,x,y,w,h,raster_gradient,&geometry);
 }
 
 static void paint_bg_border(struct pctx *P, const style_t *st, float x, float y, float w, float h, const float *bw,
@@ -947,7 +1004,7 @@ static int layer_z(const box_t *b) {
 
 static void collect_layers(web_doc *d, pvec *layers, box_t *b) {
     for (box_t *c = b->first; c; c = c->next) {
-        if ((c->st && c->st->display == D_NONE) || web_dialog_layer_box(d,c)) continue;
+        if (c->clamp_hidden || (c->st && c->st->display == D_NONE) || web_dialog_layer_box(d,c)) continue;
         if (paint_box_layer(c)) pv_push(layers, c);
         if (!stacking_context(c)) collect_layers(d, layers, c);
     }
@@ -956,6 +1013,7 @@ static void collect_layers(web_doc *d, pvec *layers, box_t *b) {
 /* the atomic inlines and floats inside an inline formatting context, in tree order */
 static void inline_children(struct pctx *P, box_t *b, bool floats) {
     for (box_t *c = b->first; c; c = c->next) {
+        if (c->clamp_hidden) continue;
         if (paint_box_layer(c)) continue;
         if (c->kind == B_INLINE) {
             inline_children(P, c, floats);
@@ -1018,7 +1076,7 @@ static void paint_runs(struct pctx *P, box_t *b) {
 }
 
 static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
-    if (!b->st || b->st->display == D_NONE) return;
+    if (b->clamp_hidden || !b->st || b->st->display == D_NONE) return;
     if (web_dialog_layer_box(P->d,b) && b != P->top_root) return;
     if (P->mode == M_HIT && b->node && web_dialog_inert(P->d,b->node)) return;
     if (paint_box_layer(b) && !layer_root) return; /* painted with the layers */
@@ -1052,7 +1110,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             set_disclosure_hit(P, details);
         }
     }
-    bool clip = st->overflow != OV_VISIBLE && b->kind != B_INLINE && b->parent && !doc_viewport_overflow_box(P->d,b);
+    bool clip = (b->clamp_truncated || st->overflow != OV_VISIBLE) && b->kind != B_INLINE && b->parent && !doc_viewport_overflow_box(P->d,b);
     /* Off-screen contexts can still contain viewport-fixed descendants. */
     if (clip && !layers.n && (P->oy + by > c->cy1 || P->oy + by + bh < c->cy0)) { pv_free(&layers); return; }
     /* group opacity: paint, then blend the result with what was there */
@@ -1139,13 +1197,16 @@ static void paint_stacked_layer(struct pctx *P, box_t *l) {
     c->cx0 = P->vx0, c->cy0 = P->vy0, c->cx1 = P->vx1, c->cy1 = P->vy1;
     bool skip = false, reached = l->st->position != POS_ABSOLUTE;
     for (box_t *a = l->parent; a && a->parent; a = a->parent) {
-        if (a->st && a->st->display == D_NONE) skip = true;
+        if (a->clamp_hidden || (a->st && a->st->display == D_NONE)) skip = true;
         if (a->st && a->kind != B_INLINE && a->st->position != POS_STATIC) reached = true;
-        if (a->st && a->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(P->d,a) && a->kind != B_INLINE && reached &&
+        if (a->st && (a->clamp_truncated || a->st->overflow != OV_VISIBLE) && !doc_viewport_overflow_box(P->d,a) && a->kind != B_INLINE && reached &&
             l->st->position != POS_FIXED) {
             float ax = box_visual_x(a) - a->p[3], ay = box_visual_y(a) - a->p[0];
             gfx_clip(c, (int)(P->ox + ax), (int)(P->oy + ay), (int)(a->w + a->p[1] + a->p[3]), (int)(a->h + a->p[0] + a->p[2]));
         }
+        /* Internal overflow still clips, but a viewport-fixed ancestor and
+           its descendants escape ancestors outside that containing block. */
+        if (a->st && a->st->position == POS_FIXED) break;
     }
     if (!skip) paint_box(P, l, true);
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
@@ -1166,9 +1227,9 @@ static void walk(struct pctx *P) {
         box_t *layers[2]={web_dialog_backdrop(P->d,n),n->box};
         for(int j=0;j<2;j++) {
             box_t *b=layers[j]; if(!b)continue;
-            bool fixed=b->st->position==POS_FIXED;
-            P->ox=ox+(fixed?P->d->view_x:0); P->oy=oy+(fixed?P->d->view_y:0);
-            P->hx=hx-(fixed?P->d->view_x:0); P->hy=hy-(fixed?P->d->view_y:0);
+            /* Fixed top-layer boxes already carry the viewport offset in
+               box_visual_* just like ordinary fixed stacking contexts. */
+            P->ox=ox; P->oy=oy; P->hx=hx; P->hy=hy;
             P->top_root=b; paint_box(P,b,true);
         }
     }
@@ -1509,7 +1570,7 @@ static bool find_hidden(struct hidden_match *H) {
 }
 
 static void find_in(struct fmatch *F, box_t *b) {
-    if (F->failed || !b->st || b->st->display == D_NONE || b->st->content_visibility==CV_HIDDEN || (b->node && web_dialog_inert(F->d,b->node))) return;
+    if (F->failed || b->clamp_hidden || !b->st || b->st->display == D_NONE || b->st->content_visibility==CV_HIDDEN || (b->node && web_dialog_inert(F->d,b->node))) return;
     if (b->nruns) {
         /* the block's text, with the run each byte came from */
         sbuf t = {0};

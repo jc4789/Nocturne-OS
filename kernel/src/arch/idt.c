@@ -105,9 +105,13 @@ static void exception(struct regs *r, uint64_t cr2, unsigned source_cpu) {
                 t->pid, t->name, source_cpu, name, (void *)r->rip);
         if (r->vector == 14) kprintf(" addr=%p err=%lx", (void *)cr2, r->error);
         kprintf("\n");
-        task_printf_stderr(t, "\n\x1b[31m*** %s (%s) at %p, addr %p ***\x1b[0m\n", name, t->name,
-                           (void *)r->rip, r->vector == 14 ? (void *)cr2 : 0);
-        task_exit(128 + (int)r->vector);
+        /* A helper can die while its owner waits for a completion token or
+           while stderr's pipe is full. Never block process abort on that pipe;
+           the serial diagnostic above still records the exact exception. */
+        if (!t->is_thread)
+            task_printf_stderr(t, "\n\x1b[31m*** %s (%s) at %p, addr %p ***\x1b[0m\n", name, t->name,
+                               (void *)r->rip, r->vector == 14 ? (void *)cr2 : 0);
+        task_fault_exit(128 + (int)r->vector);
     }
     panic_regs(name, r);
 }
@@ -149,7 +153,7 @@ void isr_dispatch(struct regs *r) {
 void isr_dispatch_remote(struct regs *r, uint64_t cr2) {
     cpu_require_bsp();
     ASSERT((r->cs & 3) == 3);
-    if (r->vector < 32) exception(r, cr2, cpu_runner_index());
+    if (r->vector < 32) exception(r, cr2, current_task->trap_cpu);
     else if (r->vector == 0x80) syscall_dispatch(r);
     else panic("smp: invalid remote user trap %lu", r->vector);
     sched_user_return(r);

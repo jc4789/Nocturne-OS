@@ -4,7 +4,7 @@
 const attributeBridge = (() => {
     const maps=new WeakMap(), elements=new WeakMap();
     const HTML='http://www.w3.org/1999/xhtml', XML='http://www.w3.org/XML/1998/namespace', XMLNS='http://www.w3.org/2000/xmlns/';
-    const string=elementURL.string, get=(n,k)=>rawDom('get',n,k);
+    const string=elementURL.string, get=(n,k)=>rawDom.get(n,k);
     const lower=s=>s.replace(/[A-Z]/g,c=>c.toLowerCase());
     function element(n){get(n,'elementBrand');return n;}
     function attribute(n){get(n,'attrBrand');return n;}
@@ -39,7 +39,7 @@ const attributeBridge = (() => {
         get specified(){attribute(this);return true;}
     }
     function owner(map){const el=elements.get(map);if(!el)throw new TypeError('Illegal NamedNodeMap receiver');return el;}
-    function values(map){return rawDom('attrList',owner(map));}
+    function values(map){return rawDom.attrList(owner(map));}
     function setNode(el,a){
         element(el);attribute(a);
         const used=get(a,'attrOwner');
@@ -51,8 +51,8 @@ const attributeBridge = (() => {
         if(get(a,'attrOwner')!==el)throw new DOMException('Attribute does not belong to this element','NotFoundError');
         return dom('attrRemoveNode',el,a);
     }
-    function byName(el,name){return rawDom('attrNode',el,name);}
-    function byNS(el,ns,local){return rawDom('attrNodeNS',el,ns,local);}
+    function byName(el,name){return rawDom.attrNode(el,name);}
+    function byNS(el,ns,local){return rawDom.attrNodeNS(el,ns,local);}
     class NamedNodeMap {
         constructor(){throw new TypeError('Illegal NamedNodeMap constructor');}
         get length(){return get(owner(this),'attributeNames').length;}
@@ -73,7 +73,7 @@ const attributeBridge = (() => {
         element(el);let result=maps.get(el);if(result)return result;
         const target=Object.create(NamedNodeMap.prototype);
         const visible=(t,k)=>typeof k==='string' && !(k in t) && names(el).includes(k);
-        const read=k=>index(k)?rawDom('attrList',el)[Number(k)]:byName(el,k);
+        const read=k=>index(k)?rawDom.attrList(el)[Number(k)]:byName(el,k);
         result=new Proxy(target,{
             get(t,k,r){if(index(k))return read(k);if(visible(t,k))return read(k);return Reflect.get(t,k,r);},
             has(t,k){return (index(k)?Number(k)<get(el,'attributeNames').length:visible(t,k))||Reflect.has(t,k);},
@@ -91,25 +91,25 @@ const attributeBridge = (() => {
     Object.defineProperty(Element.prototype,'attributes',{enumerable:true,configurable:true,get(){return map(this);}});
     Element.prototype.hasAttributes=function(){element(this);return get(this,'attributeNames').length!==0;};
     Element.prototype.getAttributeNames=function(){element(this);return get(this,'attributeNames');};
-    Element.prototype.getAttribute=function(name){element(this);required(arguments.length,1);return rawDom('attr',this,string(name));};
-    Element.prototype.hasAttribute=function(name){element(this);required(arguments.length,1);return rawDom('attr',this,string(name))!==null;};
+    Element.prototype.getAttribute=function(name){element(this);required(arguments.length,1);return rawDom.attr(this,string(name));};
+    Element.prototype.hasAttribute=function(name){element(this);required(arguments.length,1);return rawDom.attr(this,string(name))!==null;};
     Element.prototype.setAttribute=function(name,value){element(this);required(arguments.length,2);name=string(name);value=valueString(value);localValid(name);dom('attr',this,name,value);};
     Element.prototype.removeAttribute=function(name){element(this);required(arguments.length,1);dom('attr',this,string(name),null);};
     Element.prototype.toggleAttribute=function(name,force){element(this);required(arguments.length,1);name=string(name);localValid(name);
-        const present=rawDom('attr',this,name)!==null, wanted=force===undefined?!present:!!force;
+        const present=rawDom.attr(this,name)!==null, wanted=force===undefined?!present:!!force;
         if(wanted && !present)dom('attr',this,name,'');else if(!wanted && present)dom('attr',this,name,null);return wanted;};
     Element.prototype.getAttributeNode=function(name){element(this);required(arguments.length,1);return byName(this,string(name));};
     Element.prototype.getAttributeNodeNS=function(ns,local){element(this);required(arguments.length,2);return byNS(this,namespace(ns),string(local));};
     Element.prototype.setAttributeNode=function(a){required(arguments.length,1);return setNode(this,a);};
     Element.prototype.setAttributeNodeNS=Element.prototype.setAttributeNode;
     Element.prototype.removeAttributeNode=function(a){required(arguments.length,1);return removeNode(this,a);};
-    Element.prototype.getAttributeNS=function(ns,local){element(this);required(arguments.length,2);return rawDom('attrNS',this,namespace(ns),string(local));};
-    Element.prototype.hasAttributeNS=function(ns,local){element(this);required(arguments.length,2);return rawDom('attrNS',this,namespace(ns),string(local))!==null;};
+    Element.prototype.getAttributeNS=function(ns,local){element(this);required(arguments.length,2);return rawDom.attrNS(this,namespace(ns),string(local));};
+    Element.prototype.hasAttributeNS=function(ns,local){element(this);required(arguments.length,2);return rawDom.attrNS(this,namespace(ns),string(local))!==null;};
     Element.prototype.setAttributeNS=function(ns,name,value){element(this);required(arguments.length,3);ns=namespace(ns);name=string(name);value=valueString(value);const x=extract(ns,name);dom('attrNS',this,x.ns,x.local,value,x.prefix);};
     Element.prototype.removeAttributeNS=function(ns,local){element(this);required(arguments.length,2);dom('attrNS',this,namespace(ns),string(local),null);};
     Document.prototype.createAttribute=function(name){documentBridge.brand(this);required(arguments.length,1);name=string(name);localValid(name);
-        return rawDom('attrCreate',this,null,null,lower(name));};
-    Document.prototype.createAttributeNS=function(ns,name){documentBridge.brand(this);required(arguments.length,2);const x=extract(ns,name);return rawDom('attrCreate',this,x.ns,x.prefix,x.local);};
+        return rawDom.attrCreate(this,null,null,lower(name));};
+    Document.prototype.createAttributeNS=function(ns,name){documentBridge.brand(this);required(arguments.length,2);const x=extract(ns,name);return rawDom.attrCreate(this,x.ns,x.prefix,x.local);};
     for(const [C,name] of [[Attr,'Attr'],[NamedNodeMap,'NamedNodeMap']])Object.defineProperty(C.prototype,Symbol.toStringTag,{value:name,configurable:true});
     Object.defineProperty(Node.prototype,'ATTRIBUTE_NODE',{value:2,enumerable:true});
     Object.defineProperty(Node,'ATTRIBUTE_NODE',{value:2,enumerable:true});

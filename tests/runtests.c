@@ -108,6 +108,62 @@ static const struct test tests[] = {
      {"browserfreezetest: ", ", 0 failed"}, "FAIL", 120, false, true},
     {"browsergridstop", "grid-native-stop", "tcc -I/data/tests -o /home/browserfreezetest /data/tests/browserfreezetest.c && /home/browserfreezetest --grid-only", 0,
      {"browserfreezetest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"threads", "native-shared-threads", "tcc -o /home/threadtest /data/tests/threadtest.c && /home/threadtest", 0,
+     {"threadtest: ", "PASS", "active="}, "FAIL", 120, false, true},
+    {"parallel", "native-browser-parallel", "tcc -I/data/tests -o /home/paralleltest /data/tests/paralleltest.c && /home/paralleltest", 0,
+     {"paralleltest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"styleincremental", "native-scoped-incremental-style", "tcc -I/data/tests -o /home/styleincrementaltest /data/tests/styleincrementaltest.c && /home/styleincrementaltest", 0,
+     {"styleincremental: ", ", 0 failures"}, "FAIL", 120, false, true},
+    {"csscache", "completed-external-ast", "tcc -I/data/tests -o /home/csscachetest /data/tests/csscachetest.c && /home/csscachetest", 0,
+     {"csscache: 23 checks, 0 failures"}, "FAIL", 120, false, true},
+    {"paralleljs", "native-dom-hooks", "tcc -I/data/tests -o /home/paralleljstest /data/tests/paralleljstest.c && /home/paralleljstest", 0,
+     {"paralleljstest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"currentscript", "classic-checkpoint", "tcc -I/data/tests -o /home/currentscripttest /data/tests/currentscripttest.c && /home/currentscripttest", 0,
+     {"currentscripttest: 21 checks, 0 failed"}, "FAIL", 120, false, true},
+    {"waitingstream", "inputless-native-parser", "tcc -I/data/tests -o /home/waitingstreamtest /data/tests/waitingstreamtest.c && /home/waitingstreamtest", 0,
+     {"waitingstreamtest: 29 checks, 0 failed"}, "FAIL", 120, false, true},
+    {"svggeometry", "native-viewbox-path-ctm", "tcc -I/data/tests -o /home/svggeometrytest /data/tests/svggeometrytest.c && /home/svggeometrytest", 0,
+     {"svggeometrytest: 109 checks, 0 failed"}, "FAIL", 120, false, true},
+    {"parserdedup", "native-transaction-delta", "tcc -I/data/tests -o /home/parserdeduptest /data/tests/parserdeduptest.c && /home/parserdeduptest", 0,
+     {"parserdedup: 37 checks, 0 failures"}, "FAIL", 120, false, true},
+    {"observerfairness", "continuous-rendering-feedback", "tcc -I/data/tests -o /home/observerfairnesstest /data/tests/observerfairnesstest.c && /home/observerfairnesstest", 0,
+     {"observerfairnesstest: 11 checks, 0 failed"}, "FAIL", 120, false, true},
+    {"objectfallback", "native-unsupported-flow", "tcc -I/data/tests -o /home/objectfallbacktest /data/tests/objectfallbacktest.c && /home/objectfallbacktest", 0,
+     {"objectfallback: 37 checks, 0 failures"}, "FAIL", 120, false, true},
+    {"fixedvisual", "native-viewport-contract", "tcc -I/data/tests -o /home/fixedvisualtest /data/tests/fixedvisualtest.c && /home/fixedvisualtest", 0,
+     {"fixedvisual: 57 checks, 0 failures"}, "FAIL", 120, false, true},
+    {"canvascontextprobe", "debug-only-native-context", "tcc -I/data/tests -o /home/canvascontextprobetest /data/tests/canvascontextprobetest.c && /home/canvascontextprobetest", 0,
+     {"canvascontextprobe: 22 checks, 0 failed"}, "FAIL", 120, false, true},
+    {"sandboxprofile", "generation-bound-native-policy", "tcc -I/data/tests -o /home/sandboxprofiletest /data/tests/sandboxprofiletest.c && /home/sandboxprofiletest", 0,
+     {"sandboxprofiletest: 92 checks, 0 failed"}, "FAIL", 120, false, true},
+    {"browserdeferred", "hover-fifo-boundaries", "tcc -I/data/tests -o /home/browserdeferredtest /data/tests/browserdeferredtest.c && /home/browserdeferredtest", 0,
+     {"browserdeferred: 27 checks, 0 failed"}, "FAIL", 120, false, true},
+    {"canvasgradient", "native-linear-radial-rgba", "tcc -I/data/tests -o /home/canvasgradienttest /data/tests/canvasgradienttest.c && /home/canvasgradienttest", 0,
+     {"canvasgradient: 89 checks, 0 failed"}, "FAIL", 120, false, true},
+    {"lineclamp", "legacy-native-fragments", "tcc -I/data/tests -o /home/lineclamptest /data/tests/lineclamptest.c && /home/lineclamptest", 0,
+     {"lineclamp: 83 checks, 0 failures"}, "FAIL", 120, false, true},
+    {"lineclampflow", "anonymous-inline-list-height", "tcc -I/data/tests -o /home/lineclampflowtest /data/tests/lineclampflowtest.c && /home/lineclampflowtest", 0,
+     {"lineclampflow: 35 checks, 0 failures"}, "FAIL", 120, false, true},
+    {"svgcsssize", "viewbox-css-auto-axis", "tcc -I/data/tests -o /home/svgcsssizetest /data/tests/svgcsssizetest.c && /home/svgcsssizetest", 0,
+     {"svgcsssize: 37 checks, 0 failures"}, "FAIL", 120, false, true},
+    {"cssanimation", "native-scoped-opacity-clock", "tcc -I/data/tests -o /home/cssanimationtest /data/tests/cssanimationtest.c && /home/cssanimationtest", 0,
+     {"cssanimation: 94 checks, 0 failures (JS 10/0)"}, "FAIL", 120, false, true},
+    {"lineclamppredicate", "debug-eligible-candidate-publication", "tcc -I/data/tests -o /home/lineclamppredicatetest /data/tests/lineclamppredicatetest.c && /home/lineclamppredicatetest", 0,
+     {"lineclamppredicate: 25 checks, 0 failures"}, "FAIL", 120, false, true},
+    {"cssanimationregression", "live-resource-publication-failed-boundary", "tcc -I/data/tests -o /home/cssanimationregressiontest /data/tests/cssanimationregressiontest.c && /home/cssanimationregressiontest", 0,
+     {"cssanimationregression: 34 checks, 0 failures (JS 1/0)"}, "FAIL", 120, false, true},
+    {"lineclampreentry", "same-pass-measurement-stale-visibility", "tcc -I/data/tests -o /home/lineclampreentrytest /data/tests/lineclampreentrytest.c && /home/lineclampreentrytest", 0,
+     {"lineclampreentry: 60 checks, 0 failures"}, "FAIL", 120, false, true},
+    {"cssanimationpixel", "opacity-invariant-blend-failed-boundary", "tcc -I/data/tests -o /home/cssanimationpixeltest /data/tests/cssanimationpixeltest.c && /home/cssanimationpixeltest", 0,
+     {"cssanimationpixel: 4 checks, 0 failures"}, "FAIL", 120, false, true},
+    {"imagebitmap", "native-owned-decode-raster", "tcc -I/data/tests -o /home/imagebitmaptest /data/tests/imagebitmaptest.c && /home/imagebitmaptest", 0,
+     {"imagebitmap: 109 checks, 0 failed (JS 84)"}, "FAIL", 120, false, true},
+    {"imagebitmapheap", "sized-allocator-lifetime", "tcc -I/data/tests -o /home/imagebitmaptest /data/tests/imagebitmaptest.c && /home/imagebitmaptest --heap", 0,
+     {"imagebitmapheap: 9 checks, 0 failed"}, "FAIL", 120, false, true},
+    {"imagebitmapoom", "observed-allocation-request", "tcc -I/data/tests -o /home/imagebitmaptest /data/tests/imagebitmaptest.c && /home/imagebitmaptest --heap-oom", 0,
+     {"imagebitmapheapoom: 3 checks, 0 failed"}, "FAIL", 120, false, true},
+    {"imagebitmappromise", "early-rejection-microtasks", "tcc -I/data/tests -o /home/imagebitmappromisetest /data/tests/imagebitmappromisetest.c && /home/imagebitmappromisetest", 0,
+     {"imagebitmappromise: 14 checks, 0 failed (JS 10)"}, "FAIL", 120, false, true},
     {"web", "engine", "tcc -I/data/tests -o /home/webtest /data/tests/webtest.c && /home/webtest", 0, {"webtest: ", ", 0 failed"}, "FAIL",
      120, false, true},
     {"web", "javascript", "tcc -o /home/jstest /data/tests/jstest.c && /home/jstest", 0,
@@ -208,6 +264,14 @@ static void snippet(const char *out, char *dst, size_t n) {
     dst[i] = 0;
 }
 
+static void show_output(const char *out) {
+    for (const char *line = out, *nl; *line; line = nl ? nl + 1 : line + strlen(line)) {
+        nl = strchr(line, '\n');
+        printf("  | %.*s\n", nl ? (int)(nl - line) : (int)strlen(line), line);
+    }
+    fflush(stdout);
+}
+
 static void run(const struct test *t) {
     int nfail_before = nfail;
     int fd = open(OUT, O_WRONLY | O_CREAT | O_TRUNC);
@@ -232,6 +296,9 @@ static void run(const struct test *t) {
         snprintf(why, sizeof why, "timed out after %d s", timeout / 1000);
         result("FAIL", t, why);
         nfail++;
+        char *out = slurp(OUT);
+        show_output(out);
+        free(out);
         return;
     }
     char *out = slurp(OUT), snip[128];
@@ -260,11 +327,7 @@ static void run(const struct test *t) {
     }
     if (nfail != nfail_before || t->show) {
         /* the whole output, indented, for the serial log */
-        for (char *line = out, *nl; *line; line = nl ? nl + 1 : line + strlen(line)) {
-            nl = strchr(line, '\n');
-            printf("  | %.*s\n", nl ? (int)(nl - line) : (int)strlen(line), line);
-        }
-        fflush(stdout);
+        show_output(out);
     }
     free(out);
 }
@@ -286,7 +349,9 @@ int main(int argc, char **argv) {
         const struct test *t = &tests[i];
         if (nonly) {
             bool hit = false;
-            for (int k = 0; k < nonly; k++) hit |= !strcmp(only[k], t->group);
+            char qualified[128];snprintf(qualified,sizeof qualified,"%s/%s",t->group,t->name);
+            for (int k = 0; k < nonly; k++)
+                hit |= !strcmp(only[k], t->group) || !strcmp(only[k],qualified);
             if (!hit) continue;
         }
         const char *skip = NULL;

@@ -117,7 +117,10 @@ bool web_frame_initial_blocked(const struct web_frame *f,const char *src,const c
 }
 bool web_frame_initial_create(struct web_frame *f,const struct web_host *host) {
     if(!f || (f->initial_failed && !f->detached))return false;
-    if(web_frame_commit(f,"",0,"about:blank",NULL,host,true))return true;
+    f->sandbox_initial=true;
+    bool made=web_frame_commit(f,"",0,"about:blank",NULL,host,true);
+    f->sandbox_initial=false;
+    if(made)return true;
     // A failed generation is quiescent, not an invitation to allocate and log
     // again on each unrelated DOM revision/contentWindow read.
     f->initial_failed=true;f->failed=true;f->detached=false;return false;
@@ -126,6 +129,8 @@ bool web_frame_commit(struct web_frame *f,const char *html,size_t n,const char *
                       const struct web_host *host,bool inherited) {
     web_doc *parent=f?f->element->owner:NULL;
     if(!parent)return false;
+    f->pending_sandbox_flags|=parent->sandbox_flags;
+    if(!web_sandbox_document_allowed(f,url,inherited))return false;
     if(!f->window_token) {
         f->window_token=doc_node_create(parent,N_FRAGMENT,NULL,"",0);
         if(!f->window_token)return false;
@@ -136,6 +141,60 @@ bool web_frame_commit(struct web_frame *f,const char *html,size_t n,const char *
     made->frame_container=f;
     web_frame_retire(f);f->document=made;f->failed=false;f->initial_failed=false;f->detached=false;f->notified=false;f->paint_failed=false;
     parent->dirty=true;return true;
+}
+/* Opaque origins and same-origin ancestor authored realms are deliberately
+ * outside this safe subset. The latter require authority propagation through
+ * arbitrary borrowed Function/Promise jobs, not just native URL checks. */
+bool web_sandbox_document_allowed(struct web_frame *f,const char *url,bool inherited) {
+    if(!f || !f->element || !f->element->owner)return false;
+    uint32_t flags=f->pending_sandbox_flags;
+    if(!flags)return true;
+    if(!sandbox_supported(flags))return false;
+    if(f->sandbox_initial)return url && !strcmp(url,"about:blank");
+    if(inherited || !url || (strncasecmp(url,"https://",8) && strncasecmp(url,"http://",7)))return false;
+    char *origin=NULL;if(http_origin_owned(url,&origin)!=HTTP_URL_TUPLE){free(origin);return false;}
+    bool allowed=true;
+    for(web_doc *p=f->element->owner;p;p=p->frame_parent) {
+        char *ancestor=NULL;
+        enum http_url_result parsed=http_origin_owned(web_effective_url(p),&ancestor);
+        if(parsed!=HTTP_URL_TUPLE || !strcmp(origin,ancestor))allowed=false;
+        free(ancestor);if(!allowed)break;
+    }
+    free(origin);return allowed;
+}
+static bool sandbox_active_document(web_doc *d) {
+    if(!d || !d->live || d->inert)return false;
+    for(web_doc *p=d;p && p->frame_parent;p=p->frame_parent) {
+        struct web_frame *f=web_frame_find(p->frame_parent,p->frame_element);
+        if(!f || f->detached || f->document!=p || !p->frame_parent->live)return false;
+    }
+    return true;
+}
+bool web_sandbox_forms_allowed(web_doc *d) {
+    return d && !(d->sandbox_flags&SB_FORMS) && (!d->sandbox_flags || sandbox_active_document(d));
+}
+bool web_sandbox_form_submission_allowed(web_doc *top,web_node *submitter) {
+    web_doc *owner=submitter?submitter->owner:NULL,*root=owner;
+    if(!top || !owner || !sandbox_active_document(owner))return false;
+    while(root->frame_parent)root=root->frame_parent;
+    web_doc *top_root=top;while(top_root->frame_parent)top_root=top_root->frame_parent;
+    return root==top_root && web_sandbox_forms_allowed(owner);
+}
+bool web_sandbox_auxiliary_allowed(web_doc *d) {
+    /* Opening a sandbox-inheriting window is not implemented: decline it,
+       rather than open an unrestricted host window under allow-popups. */
+    return sandbox_active_document(d) && !(d->sandbox_flags&(SB_POPUPS|SB_PROPAGATE|SB_SCRIPTS));
+}
+bool web_sandbox_navigation_allowed(web_doc *source,web_doc *destination,bool trusted) {
+    if(!source || !destination)return false;
+    if(!source->sandbox_flags)return true;
+    if(!sandbox_active_document(source) || !sandbox_active_document(destination) ||
+       (source->sandbox_flags&SB_SCRIPTS))return false;
+    for(web_doc *p=destination;p;p=p->frame_parent)if(p==source)return true;
+    /* The only supported ancestor escape is explicit top-by-user-activation.
+       Sibling/named/parent targets and unactivated top destinations stay closed. */
+    if(!destination->frame_parent && trusted && !(source->sandbox_flags&SB_TOP_ACTIVATION))return true;
+    return false;
 }
 bool web_frame_same_origin(web_doc *a,web_doc *b) {
     if(a==b)return true;
@@ -234,7 +293,6 @@ static bool frame_surface_prepare(struct web_frame *f) {
     double x=box_visual_x(b),y=(double)box_visual_y(b)+b->content_dy;
     bool fixed=false;
     for(box_t *a=b;a;a=a->parent)if(a->st && a->st->position==POS_FIXED){fixed=true;break;}
-    if(fixed){x+=owner->view_x;y+=owner->view_y;}
     /* Nested overflow clips are real paint bounds, not a document-size quota.
        Viewport-fixed descendants follow the same escape as native paint. */
     if(!fixed)for(box_t *a=b->parent;a;a=a->parent)if(a->st && a->kind!=B_INLINE &&
@@ -333,21 +391,7 @@ static const char *frame_link_target(web_doc *source,node_t *anchor) {
     return NULL;
 }
 static bool frame_auxiliary_allowed(web_doc *source) {
-    for(web_doc *d=source;d;d=d->frame_parent){
-        if(!d->live || d->inert){web_js_console(source,1,"Inactive document cannot open a link window");return false;}
-        if(!d->frame_parent)break;
-        struct web_frame *f=web_frame_find(d->frame_parent,d->frame_element);
-        if(!f || f->detached || f->document!=d){web_js_console(source,1,"Detached frame cannot open a link window");return false;}
-        /* The saved sandbox belongs to this active document. A later DOM
-           attribute mutation must not invent different active sandbox flags. */
-        if(!f->sandbox)continue;
-        if(!frame_link_token(f->sandbox,"allow-popups")){
-            web_js_console(source,1,"Sandbox disallows auxiliary link navigation");return false;
-        }
-        if(!frame_link_token(f->sandbox,"allow-popups-to-escape-sandbox")){
-            web_js_console(source,1,"Auxiliary window sandbox inheritance is not implemented");return false;
-        }
-    }
+    if(!web_sandbox_auxiliary_allowed(source)){web_js_console(source,1,"Sandbox auxiliary policy denied link navigation");return false;}
     return true;
 }
 bool web_frame_navigate(web_doc *top,web_node *anchor,const char *url) {
@@ -356,6 +400,7 @@ bool web_frame_navigate(web_doc *top,web_node *anchor,const char *url) {
     if(!source->live){web_js_console(source,1,"Inactive document link navigation discarded");return true;}
     web_doc *root=source;while(root->frame_parent)root=root->frame_parent;
     if(root!=top){web_js_console(source,1,"Link source belongs to another browsing context");return true;}
+    if(source->sandbox_flags && node_attr(anchor,"download") && (source->sandbox_flags&SB_DOWNLOADS)){web_js_console(source,1,"Sandbox denied link download");return true;}
     const char *target=frame_link_target(source,anchor);web_doc *destination=source;
     if(target && *target && strcasecmp(target,"_self")){
         if(!strcasecmp(target,"_top"))destination=top;
@@ -371,6 +416,7 @@ bool web_frame_navigate(web_doc *top,web_node *anchor,const char *url) {
         }
         else {destination=named_frame(top,target);if(!destination){web_js_console(source,1,"Named link target has no browsing context");return true;}}
     }
+    if(!web_sandbox_navigation_allowed(source,destination,true)){web_js_console(source,1,"Sandbox destination policy denied link navigation");return true;}
     if(destination==top)return false;
     struct web_frame *frame=web_frame_find(destination->frame_parent,destination->frame_element);
     if(!web_frame_set_navigation(frame,url,source)){web_js_console(source,2,"Child link navigation could not retain its URL and initiator");return true;}

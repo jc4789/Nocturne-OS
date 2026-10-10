@@ -85,7 +85,7 @@ static uint64_t *next_level(uint64_t *table, int idx, bool create, bool user, in
     return tbl(n);
 }
 
-bool vmm_map_page(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags) {
+static bool vmm_map_page_locked(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags) {
     sched_quiesce_space(va >= USER_TOP ? 0 : pml4);
     if ((flags & (PTE_U | PTE_W | PTE_SHARED)) == (PTE_U | PTE_W | PTE_SHARED))
         sched_pin_space(pml4);
@@ -102,6 +102,15 @@ bool vmm_map_page(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags) {
     user_page_count_change(pml4,va,old,*leaf);
     invlpg(va);
     return true;
+}
+
+bool vmm_map_page(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags) {
+    /* Retiring APs does not exclude another BSP syscall. In particular, the
+       next_level lookup/allocate/publication must not lose a sibling's table. */
+    uint64_t saved = irq_save();
+    bool result = vmm_map_page_locked(pml4, va, pa, flags);
+    irq_restore(saved);
+    return result;
 }
 
 static bool map_2m(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags) {
@@ -159,14 +168,16 @@ uint64_t vmm_translate(uint64_t pml4, uint64_t va) {
 }
 
 uint64_t vmm_unmap_page(uint64_t pml4, uint64_t va) {
+    uint64_t flags = irq_save();
     sched_quiesce_space(va >= USER_TOP ? 0 : pml4);
     bool huge = false;
     uint64_t *p = walk(pml4, va, &huge);
-    if (!p || !(*p & PTE_P) || huge) return 0;
+    if (!p || !(*p & PTE_P) || huge) { irq_restore(flags); return 0; }
     uint64_t old = *p;
     *p = 0;
     user_page_count_change(pml4,va,old,0);
     invlpg(va);
+    irq_restore(flags);
     return old;
 }
 
@@ -327,6 +338,7 @@ int vmm_user_alloc(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
         uint64_t *pte = walk(pml4, a, &huge);
         if (pte && (*pte & PTE_P)) {
             if (huge) return -EINVAL;
+            if ((*pte & PTE_SHARED_RO) && (prot & (VM_W | VM_X))) return -EPERM;
             if (prot & VM_W) *pte |= PTE_W;
             if (prot & VM_X) *pte &= ~PTE_NX;
             invlpg(a);
@@ -350,6 +362,7 @@ int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
         bool huge = false;
         uint64_t *pte = walk(pml4, a, &huge);
         if (!pte || !(*pte & PTE_P) || huge || !(*pte & PTE_U)) return -ENOMEM;
+        if ((*pte & PTE_SHARED_RO) && (prot & (VM_W | VM_X))) return -EPERM;
     }
     for (uint64_t a = start; a < end; a += PAGE_SIZE) {
         bool huge = false;

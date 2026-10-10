@@ -3,16 +3,120 @@
 const canvasBridge = (() => {
     'use strict';
     const define=Object.defineProperty, create=Object.create, number=Number, string=elementURL.string;
-    const contexts=new WeakMap(), states=new WeakMap(), images=new WeakMap(), metrics=new WeakMap(), paths=new WeakMap();
+    const contexts=new WeakMap(), states=new WeakMap(), images=new WeakMap(), metrics=new WeakMap(), paths=new WeakMap(), gradients=new WeakMap(), bitmaps=new WeakMap();
     const Float64=Float64Array, Bytes=Uint8ClampedArray, finite=Number.isFinite;
     const abs=Math.abs,ceil=Math.ceil,floor=Math.floor,cos=Math.cos,sin=Math.sin,atan2=Math.atan2;
     const native=host.canvas, defer=setTimeout, apply=Reflect.apply, blobFrom=blobBridge.fromBytes;
+    const nativeBitmap=host.imageBitmap, PromiseCtor=Promise;
+    const debugProbe=host.debugCanvasProbe===true;
     /* Array length is a uint32 representation in this engine. Typed-array
        backing buffers enforce their own representation/allocation failures. */
     const ARRAY_LENGTH=0xffffffff;
     const byteProto=Object.getPrototypeOf(Bytes.prototype), byteBuffer=Object.getOwnPropertyDescriptor(byteProto,'buffer').get, byteOffset=Object.getOwnPropertyDescriptor(byteProto,'byteOffset').get;
     class HTMLCanvasElement extends HTMLElement {constructor(){throw new TypeError('Illegal HTMLCanvasElement constructor');}}
     class CanvasRenderingContext2D {constructor(){throw new TypeError('Illegal CanvasRenderingContext2D constructor');}}
+    class CanvasGradient {
+        constructor(){throw new TypeError('Illegal CanvasGradient constructor');}
+        addColorStop(offset,value){
+            const g=gradients.get(this);if(!g)throw new TypeError('Illegal CanvasGradient receiver');
+            if(arguments.length<2)throw new TypeError('addColorStop requires offset and color');
+            offset=+offset;
+            if(!finite(offset))throw new TypeError('Nonfinite gradient offset');
+            const text=string(value);
+            if(offset<0||offset>1)throw namedError('IndexSizeError','Gradient offset outside [0,1]');
+            const c=native(g.canvas,'gradientColor',text);
+            if(c===null)throw namedError('SyntaxError','Invalid gradient color');
+            g.stops.push([offset,c>>>0]);g.packet=null;
+        }
+    }
+    function bitmapToken(value){const token=bitmaps.get(value);if(!token)throw new TypeError('Illegal ImageBitmap receiver');return token;}
+    class ImageBitmap {
+        constructor(){throw new TypeError('Illegal ImageBitmap constructor');}
+        get width(){return nativeBitmap('width',bitmapToken(this));}
+        get height(){return nativeBitmap('height',bitmapToken(this));}
+        close(){nativeBitmap('close',bitmapToken(this));}
+    }
+    function bitmapEnum(value,choices,fallback){
+        if(value===undefined)return fallback;value=string(value);
+        if(!choices.includes(value))throw new TypeError('Invalid ImageBitmap option');return value;
+    }
+    function bitmapSize(value){
+        if(value===undefined)return null;value=+value;
+        if(!finite(value))throw new TypeError('Nonfinite ImageBitmap resize dimension');value=Math.trunc(value);
+        if(value<0||value>ARRAY_LENGTH)throw new TypeError('ImageBitmap resize dimension outside unsigned long');
+        return value;
+    }
+    function bitmapOptions(value){
+        if(value===null||value===undefined)value={};
+        if(typeof value!=='object'&&typeof value!=='function')throw new TypeError('ImageBitmapOptions must be a dictionary');
+        /* WebIDL dictionary members are converted in lexicographic order.
+           These getters may mutate, close or detach the source; borrow later. */
+        const color=bitmapEnum(value.colorSpaceConversion,['none','default'],'default');
+        const orientation=bitmapEnum(value.imageOrientation,['from-image','flipY'],'from-image');
+        const alpha=bitmapEnum(value.premultiplyAlpha,['none','premultiply','default'],'default');
+        const height=bitmapSize(value.resizeHeight);
+        const quality=bitmapEnum(value.resizeQuality,['pixelated','low','medium','high'],'low');
+        const width=bitmapSize(value.resizeWidth);
+        /* Conversion precedes the HTML algorithm: zero crop has priority
+           over zero resize (and over this subset's unsupported raster modes).
+           Keep absent and explicitly zero resize dimensions distinct. */
+        return {width,height,flip:orientation==='flipY',smooth:quality!=='pixelated',
+            unsupported:alpha==='premultiply'||quality==='medium'||quality==='high'};
+    }
+    function createImageBitmap(image,...values){
+        const argumentCount=arguments.length;
+        return new PromiseCtor((resolve,reject)=>{
+            let kind,source=image,dimensions,packet;
+            try {
+                if(argumentCount<1)throw new TypeError('createImageBitmap requires a source');
+                const bitmap=bitmaps.get(image),im=images.get(image);
+                if(bitmap)kind=3;
+                else if(im)kind=1;
+                else if(blobBridge.brand(image))kind=0;
+                else {
+                    const tag=rawDom.get(image,'localName');
+                    if(tag==='canvas'||tag==='img'){htmlElementBrand(image,tag);kind=2;}
+                    else if(tag==='video'||tag==='image')throw namedError('NotSupportedError','This ImageBitmap source is not implemented');
+                    else throw new TypeError('Unsupported ImageBitmap source');
+                }
+                const crop=values.length>=4;
+                let rect=[0,0,0,0];
+                if(crop)rect=values.slice(0,4).map(value=>(+value)|0);
+                const options=bitmapOptions(values[crop?4:0]);
+                if(crop&&(!rect[2]||!rect[3]))throw new RangeError('Empty ImageBitmap crop rectangle');
+                if(options.width===0||options.height===0)
+                    throw namedError('InvalidStateError','Empty ImageBitmap resize dimension');
+                if(options.unsupported)
+                    throw namedError('NotSupportedError','This ImageBitmap raster option is not implemented');
+                if(kind===3)source=bitmap;
+                else if(kind===1){source=apply(byteBuffer,im.data,[]);dimensions=new Float64([im.w,im.h,apply(byteOffset,im.data,[])]).buffer;}
+                else if(kind===0)source=blobBridge.bytes(image);
+                /* Straight-alpha sRGB; default conversion is implementation-
+                   specific and none does not apply ICC conversion. */
+                packet=new Float64([crop?1:0,...rect,options.width??0,options.height??0,options.flip?1:0,options.smooth?1:0]).buffer;
+            }catch(e){
+                /* A Promise-returning WebIDL operation never throws conversion
+                   errors to its caller. Reject now; reactions are microtasks,
+                   not a later bitmap task. Preserve even falsy thrown values. */
+                reject(e);return;
+            }
+            let token,error,failed=false;
+            try {
+                token=nativeBitmap('create',kind,source,packet,dimensions);
+                if(token===null)throw namedError('InvalidStateError','The source has no usable bitmap');
+                if(token===1)throw namedError('NotSupportedError','Encoded SVG or EXIF orientation is not implemented for ImageBitmap');
+            }catch(e){error=e;failed=true;}
+            /* Snapshot before returning: later Canvas/ImageData mutations cannot
+               change it. Native decode success/failure and cancellation retain
+               their deferred bitmap-task settlement contract. */
+            defer(()=>{
+                if(failed){reject(error);return;}
+                try{const result=create(ImageBitmap.prototype);bitmaps.set(result,token);resolve(result);}
+                catch(e){reject(e);}
+            },0);
+        });
+    }
+    cloneData.registerUncloneable(value=>bitmaps.has(value),'ImageBitmap');
     class TextMetrics {constructor(){throw new TypeError('Illegal TextMetrics constructor');}}
     function defaults(s){s.fill='#000000';s.stroke='#000000';s.fillColor=0xff000000;s.strokeColor=0xff000000;s.alpha=1;s.lineWidth=1;s.dash=[];s.dashOffset=0;s.smoothing=true;s.font='10px sans-serif';s.fontSize=10;s.fontStyle=0;s.fontFamily=0;s.align='start';s.baseline='alphabetic';s.direction='inherit';s.matrix=[1,0,0,1,0,0];s.path=[];s.first=null;s.last=null;s.subpathCount=0;s.stack=[];}
     function state(ctx){const s=states.get(ctx);if(!s)throw new TypeError('Illegal CanvasRenderingContext2D receiver');const v=native(s.canvas,'version');if(v!==s.version){defaults(s);s.version=v;}return s;}
@@ -24,6 +128,26 @@ const canvasBridge = (() => {
     function valid(values){return values.every(finite);}
     function point(s,x,y){const m=s.matrix;return [m[0]*x+m[2]*y+m[4],m[1]*x+m[3]*y+m[5]];}
     function color(s,stroke=false){const v=stroke?s.strokeColor:s.fillColor;return ((v&0xffffff)|((floor((v>>>24)*s.alpha+0.5)&255)<<24))>>>0;}
+    /* A private, reusable native paint packet. Gradients are canvas-neutral;
+       their coordinates receive the current drawing transform at paint time.
+       Stops are stable-sorted only after mutation, never once per pixel. */
+    function paint(s,stroke=false){
+        const g=gradients.get(stroke?s.stroke:s.fill);if(!g)return undefined;
+        if(!g.packet){const stops=g.stops.slice().sort((a,b)=>a[0]-b[0]);
+            const p=new Float64(14+stops.length*2);p[0]=g.kind;p.set(g.geometry,2);
+            for(let i=0;i<stops.length;i++){p[14+i*2]=stops[i][0];p[15+i*2]=stops[i][1];}g.packet=p;}
+        g.packet[1]=s.alpha;g.packet.set(s.matrix,8);return g.packet.buffer;
+    }
+    function gradient(ctx,values,radial){
+        state(ctx);const count=radial?6:4;
+        if(values.length<count)throw new TypeError('Missing gradient arguments');
+        const v=values.slice(0,count).map(value=>{const n=+value;
+            if(!finite(n))throw new TypeError('Nonfinite gradient coordinates');return n;});
+        if(radial&&(v[2]<0||v[5]<0))throw namedError('IndexSizeError','Negative gradient radius');
+        const s=state(ctx),out=create(CanvasGradient.prototype);
+        gradients.set(out,{canvas:s.canvas,kind:radial?2:1,
+            geometry:radial?v:[v[0],v[1],0,v[2],v[3],0],stops:[],packet:null});return out;
+    }
     function pathBuffer(points){return new Float64(points).buffer;}
     function append(s,p,move=false){capacity(s,move&&s.path.length?2:1);if(move&&s.path.length)s.path.push(NaN,NaN);s.path.push(p[0],p[1]);s.last=p;if(move||!s.first){s.first=p;s.subpathCount=1;}else s.subpathCount++;}
     function resetPath(s){s.path=[];s.first=null;s.last=null;s.subpathCount=0;}
@@ -148,7 +272,7 @@ const canvasBridge = (() => {
         }
         return {points:out,width:s.lineWidth};
     }
-    function strokePath(s,points){if(!points.length)return;const stroke=strokeGeometry(s,points);if(stroke.points.length)native(s.canvas,'stroke',pathBuffer(stroke.points),color(s,true),stroke.width,new Float64(s.matrix).buffer);}
+    function strokePath(s,points){if(!points.length)return;const stroke=strokeGeometry(s,points);if(stroke.points.length)native(s.canvas,'stroke',pathBuffer(stroke.points),color(s,true),stroke.width,new Float64(s.matrix).buffer,paint(s,true));}
     function hitArguments(ctx,values,fill){
         state(ctx);const external=paths.has(values[0]),start=external?1:0;
         if(values.length<start+2)throw new TypeError('Missing Canvas hit-test arguments');
@@ -163,14 +287,14 @@ const canvasBridge = (() => {
     function alignment(s){if(s.align==='center')return 0.5;if(s.align==='right')return 1;if(s.align==='left')return 0;const rtl=s.direction==='rtl'||(s.direction==='inherit'&&native(s.canvas,'rtl'));return s.align==='start'?(rtl?1:0):(rtl?0:1);}
     const baselines=['alphabetic','top','hanging','middle','ideographic','bottom'];
     function textValue(value){return string(value).replace(/[\t\n\f\r]/g,' ');}
-    function rect(ctx,op,v){const s=state(ctx);v=args(v,4);if(!valid(v)||!v[2]||!v[3])return;const m=s.matrix;
-        if(m[0]===1&&m[1]===0&&m[2]===0&&m[3]===1)native(s.canvas,op,v[0]+m[4],v[1]+m[5],v[2],v[3],color(s));
-        else {const p=[point(s,v[0],v[1]),point(s,v[0]+v[2],v[1]),point(s,v[0]+v[2],v[1]+v[3]),point(s,v[0],v[1]+v[3])];native(s.canvas,'poly',pathBuffer(p.flat()),color(s),false,op==='clear');}}
+    function rect(ctx,op,v){state(ctx);v=args(v,4);if(!valid(v)||!v[2]||!v[3])return;const s=state(ctx),m=s.matrix,painter=op==='clear'?undefined:paint(s);
+        if(m[0]===1&&m[1]===0&&m[2]===0&&m[3]===1)native(s.canvas,op,v[0]+m[4],v[1]+m[5],v[2],v[3],color(s),painter);
+        else {const p=[point(s,v[0],v[1]),point(s,v[0]+v[2],v[1]),point(s,v[0]+v[2],v[1]+v[3]),point(s,v[0],v[1]+v[3])];native(s.canvas,'poly',pathBuffer(p.flat()),color(s),false,op==='clear',painter);}}
     for(const name of ['width','height'])define(HTMLCanvasElement.prototype,name,{configurable:true,enumerable:true,
         get(){htmlElementBrand(this,'canvas');return native(this,name);},set(value){htmlElementBrand(this,'canvas');reflectedAttr(this,name,string(number(value)>>>0));}});
     define(HTMLCanvasElement.prototype,'getContext',{configurable:true,writable:true,value:function(type,options){
         htmlElementBrand(this,'canvas');if(!arguments.length)throw new TypeError('getContext requires context type');
-        type=string(type);if(type!=='2d')return null;
+        type=string(type);if(debugProbe)native(this,'contextProbe',type);if(type!=='2d')return null;
         let ctx=contexts.get(this);if(ctx)return ctx;
         if(!native(this,'context'))return null;
         ctx=create(CanvasRenderingContext2D.prototype);const s={canvas:this,version:native(this,'version')};defaults(s);states.set(ctx,s);contexts.set(this,ctx);return ctx;
@@ -179,7 +303,8 @@ const canvasBridge = (() => {
     define(HTMLCanvasElement.prototype,'toBlob',{configurable:true,writable:true,value:function(callback,type='image/png',quality){htmlElementBrand(this,'canvas');if(typeof callback!=='function')throw new TypeError('toBlob requires a callback');string(type);const bytes=native(this,'png');if(bytes===false)throw namedError('SecurityError','Canvas is not origin-clean');defer(()=>{let blob=null;if(bytes!==null){try{blob=blobFrom(bytes,'image/png');}catch(e){/* A failed serialization/Blob allocation reports null, never a fake Blob. */}}apply(callback,undefined,[blob]);},0);}});
     define(CanvasRenderingContext2D.prototype,'canvas',{enumerable:true,configurable:true,get(){return state(this).canvas;}});
     for(const [property,key,colorkey] of [['fillStyle','fill','fillColor'],['strokeStyle','stroke','strokeColor']])define(CanvasRenderingContext2D.prototype,property,{enumerable:true,configurable:true,
-        get(){return state(this)[key];},set(value){const s=state(this),text=string(value),c=native(s.canvas,'color',text);if(c!==null){s[key]=text;s[colorkey]=c>>>0;}}});
+        get(){return state(this)[key];},set(value){state(this);if(gradients.has(value)){state(this)[key]=value;return;}
+            const text=string(value),s=state(this),c=native(s.canvas,'color',text);if(c!==null){s[key]=text;s[colorkey]=c>>>0;}}});
     define(CanvasRenderingContext2D.prototype,'globalAlpha',{enumerable:true,configurable:true,get(){return state(this).alpha;},set(value){const s=state(this),v=number(value);if(finite(v)&&v>=0&&v<=1)s.alpha=v;}});
     define(CanvasRenderingContext2D.prototype,'lineWidth',{enumerable:true,configurable:true,get(){return state(this).lineWidth;},set(value){const s=state(this),v=number(value);if(finite(v)&&v>0)s.lineWidth=v;}});
     define(CanvasRenderingContext2D.prototype,'lineDashOffset',{enumerable:true,configurable:true,get(){return state(this).dashOffset;},set(value){state(this);const v=+value,s=state(this);if(finite(v))s.dashOffset=v;}});
@@ -191,6 +316,8 @@ const canvasBridge = (() => {
     define(CanvasRenderingContext2D.prototype,'globalCompositeOperation',{enumerable:true,configurable:true,get(){state(this);return 'source-over';},set(value){state(this);string(value);}});
     const methods={
         ...pathMethods,
+        createLinearGradient(x0,y0,x1,y1){return gradient(this,Array.from(arguments),false);},
+        createRadialGradient(x0,y0,r0,x1,y1,r1){return gradient(this,Array.from(arguments),true);},
         setLineDash(segments){state(this);if(!arguments.length)throw new TypeError('setLineDash requires segments');const dash=canvasDash.convert(segments),s=state(this);if(dash!==null)s.dash=dash;},
         getLineDash(){return canvasDash.copy(state(this).dash);},
         fillRect(...v){rect(this,'rect',v);},clearRect(...v){rect(this,'clear',v);},
@@ -199,13 +326,13 @@ const canvasBridge = (() => {
         restore(){const s=state(this),saved=s.stack[s.stack.length-1];if(saved){native(s.canvas,'restore');s.stack.pop();Object.assign(s,saved);}},
         reset(){const s=state(this);native(s.canvas,'reset');s.version=native(s.canvas,'version');defaults(s);},
         beginPath(){resetPath(state(this));},
-        fill(pathOrRule='nonzero',rule='nonzero'){state(this);const external=paths.has(pathOrRule);rule=string(external?rule:pathOrRule);if(rule!=='nonzero'&&rule!=='evenodd')throw new TypeError('Invalid fill rule');const s=state(this),path=external?transformedPath(s,pathOrRule):s.path;if(path.length)native(s.canvas,'poly',pathBuffer(path),color(s),rule==='evenodd',false);},
+        fill(pathOrRule='nonzero',rule='nonzero'){state(this);const external=paths.has(pathOrRule);rule=string(external?rule:pathOrRule);if(rule!=='nonzero'&&rule!=='evenodd')throw new TypeError('Invalid fill rule');const s=state(this),path=external?transformedPath(s,pathOrRule):s.path;if(path.length)native(s.canvas,'poly',pathBuffer(path),color(s),rule==='evenodd',false,paint(s));},
         clip(pathOrRule='nonzero',rule='nonzero'){state(this);const external=paths.has(pathOrRule);rule=string(external?rule:pathOrRule);if(rule!=='nonzero'&&rule!=='evenodd')throw new TypeError('Invalid fill rule');const s=state(this),path=external?transformedPath(s,pathOrRule):s.path;native(s.canvas,'clip',pathBuffer(path),0,rule==='evenodd');},
         stroke(path){const s=state(this),points=path===undefined?s.path:transformedPath(s,path);strokePath(s,points);},
         isPointInPath(...values){const hit=hitArguments(this,values,true);if(!finite(hit.x)||!finite(hit.y))return false;return native(hit.s.canvas,'hitPath',pathBuffer(hit.points),hit.x,hit.y,hit.rule==='evenodd');},
         isPointInStroke(...values){const hit=hitArguments(this,values,false);if(!finite(hit.x)||!finite(hit.y)||!hit.points.length)return false;const stroke=strokeGeometry(hit.s,hit.points);return native(hit.s.canvas,'hitStroke',pathBuffer(stroke.points),hit.x,hit.y,stroke.width,new Float64(hit.s.matrix).buffer);},
         measureText(value){state(this);if(!arguments.length)throw new TypeError('measureText requires text');const text=textValue(value),s=state(this),result=native(s.canvas,'measureText',text,s.fontSize,s.fontStyle,alignment(s),baselines.indexOf(s.baseline),s.fontFamily);const out=create(TextMetrics.prototype);metrics.set(out,result);return out;},
-        fillText(value,x,y,maxWidth){state(this);if(arguments.length<3)throw new TypeError('fillText requires text and coordinates');const text=textValue(value),v=[number(x),number(y)],width=arguments.length>3?number(maxWidth):Infinity;if(!valid(v)||!(width>0))return;const s=state(this);native(s.canvas,'fillText',text,s.fontSize,s.fontStyle,alignment(s),baselines.indexOf(s.baseline),s.fontFamily,new Float64([...v,width,...s.matrix]).buffer,color(s));},
+        fillText(value,x,y,maxWidth){state(this);if(arguments.length<3)throw new TypeError('fillText requires text and coordinates');const text=textValue(value),v=[number(x),number(y)],width=arguments.length>3?number(maxWidth):Infinity;if(!valid(v)||!(width>0))return;const s=state(this);native(s.canvas,'fillText',text,s.fontSize,s.fontStyle,alignment(s),baselines.indexOf(s.baseline),s.fontFamily,new Float64([...v,width,...s.matrix]).buffer,color(s),paint(s));},
         transform(...v){const s=state(this);v=args(v,6);if(valid(v))multiply(s,v);},
         setTransform(...v){const s=state(this);if(v.length===0){s.matrix=[1,0,0,1,0,0];return;}if(v.length===1&&typeof v[0]==='object'){const m=v[0];v=[m.a??1,m.b??0,m.c??0,m.d??1,m.e??0,m.f??0];}v=args(v,6);if(valid(v))s.matrix=v;},
         resetTransform(){state(this).matrix=[1,0,0,1,0,0];},
@@ -217,7 +344,7 @@ const canvasBridge = (() => {
             const v=args([dx,dy,...rest],count>=8?8:count),s=state(this);
             /* All author conversions precede borrowing the native bitmap. A
                conversion can resize/reset the canvas, so refresh state again. */
-            const result=native(s.canvas,'drawImage',image,new Float64(v).buffer,new Float64(s.matrix).buffer,s.alpha,s.smoothing);
+            const result=native(s.canvas,'drawImage',bitmaps.get(image)||image,new Float64(v).buffer,new Float64(s.matrix).buffer,s.alpha,s.smoothing);
             if(result===1)throw namedError('InvalidStateError','The source image has no usable bitmap');},
         getImageData(...v){const s=state(this);v=args(v,4);if(!valid(v))throw new TypeError('Nonfinite ImageData coordinates');let [x,y,w,h]=v.map(Math.trunc);if(!w||!h)throw namedError('IndexSizeError','Empty ImageData rectangle');if(w<0){x+=w;w=-w;}if(h<0){y+=h;h=-h;}const data=native(s.canvas,'read',x,y,w,h);if(data===null)throw namedError('SecurityError','Canvas contains an image with unverified origin');return new ImageData(new Bytes(data),w,h);},
         putImageData(image,dx,dy,...dirty){const s=state(this),im=images.get(image);if(!im)throw new TypeError('Expected ImageData');dx=Math.trunc(number(dx));dy=Math.trunc(number(dy));if(!finite(dx)||!finite(dy))throw new TypeError('Nonfinite ImageData coordinates');
@@ -237,7 +364,7 @@ const canvasBridge = (() => {
         get colorSpace(){if(!images.has(this))throw new TypeError('Illegal ImageData receiver');return 'srgb';}
     }
     for(const [i,name] of ['width','actualBoundingBoxLeft','actualBoundingBoxRight','actualBoundingBoxAscent','actualBoundingBoxDescent','fontBoundingBoxAscent','fontBoundingBoxDescent'].entries())define(TextMetrics.prototype,name,{enumerable:true,configurable:true,get(){const values=metrics.get(this);if(!values)throw new TypeError('Illegal TextMetrics receiver');return values[i];}});
-    for(const C of [HTMLCanvasElement,CanvasRenderingContext2D,ImageData,TextMetrics,Path2D])define(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
-    Object.assign(globalThis,{HTMLCanvasElement,CanvasRenderingContext2D,ImageData,TextMetrics,Path2D});
+    for(const C of [HTMLCanvasElement,CanvasRenderingContext2D,CanvasGradient,ImageData,ImageBitmap,TextMetrics,Path2D])define(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
+    Object.assign(globalThis,{HTMLCanvasElement,CanvasRenderingContext2D,CanvasGradient,ImageData,ImageBitmap,createImageBitmap,TextMetrics,Path2D});
     return {nodeProtos:[HTMLCanvasElement.prototype]};
 })();

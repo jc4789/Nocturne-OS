@@ -86,25 +86,26 @@ globalThis.runDocumentCases=function(){
 };
 
 /* Run each mode in a FRESH native document fixture, then destroy that fixture.
-   Deliberately reaches the real DOM limit; not suitable for the shared API fixture. */
-globalThis.runDocumentLimitCases=function(mode){
-    let count=0;function eq(a,b,label){count++;if(a!==b)throw Error('document limit: '+label);}
+   The 64-document/32MiB artificial quotas were removed. Use finite capacity
+   probes while keeping ownership/adoption checks; allocator faults are separate. */
+globalThis.runDocumentCapacityCases=function(mode){
+    let count=0;function eq(a,b,label){count++;if(a!==b)throw Error('document capacity: '+label);}
     const liveRoot=document.documentElement,liveBody=document.body;
     const safe=new DOMParser().parseFromString('<!doctype html><p id="kept">sentinel</p><input id="value">','text/html');
     const kept=safe.getElementById('kept'),control=safe.getElementById('value');control.value='safe';
     let succeeded=0,rejected=false;
     if(mode==='count'){
         for(let i=0;i<100;i++){try{safe.implementation.createHTMLDocument();succeeded++;}catch(_){rejected=true;break;}}
-        eq(succeeded,63,'exact 64 independent document limit (one safe plus 63 created)');
+        eq(succeeded,100,'independent documents grow past the former 64-document cap');
     }else if(mode==='arena'){
         const payload='x'.repeat(1024*1024);
         for(let i=0;i<40;i++){try{safe.createTextNode(payload);succeeded++;}catch(_){rejected=true;break;}}
-        eq(succeeded>0 && succeeded<32,true,'finite aggregate DOM arena');
-    }else throw Error('Unknown document limit mode');
-    console.log('Document limit mode '+mode+' successful allocations '+succeeded);
-    eq(rejected,true,'native limit actually rejected');eq(safe.getElementById('kept'),kept,'old wrapper preserved');eq(kept.textContent,'sentinel','old text preserved');eq(control.value,'safe','old control preserved');
-    document.adoptNode(control);control.value='OK';eq(control.ownerDocument,document,'adopt after limit');eq(control.value,'OK','value update after limit');
+        eq(succeeded,40,'aggregate DOM arena grows past the former 32MiB cap');
+    }else throw Error('Unknown document capacity mode');
+    console.log('Document capacity mode '+mode+' successful allocations '+succeeded);
+    eq(rejected,false,'no invented quota failure');eq(safe.getElementById('kept'),kept,'old wrapper preserved');eq(kept.textContent,'sentinel','old text preserved');eq(control.value,'safe','old control preserved');
+    document.adoptNode(control);control.value='OK';eq(control.ownerDocument,document,'adopt after allocation');eq(control.value,'OK','value update after allocation');
     eq(document.documentElement,liveRoot,'main root preserved');eq(document.body,liveBody,'main body preserved');
-    safe.adoptNode(control);eq(control.value,'OK','adopt back after limit');
+    safe.adoptNode(control);eq(control.value,'OK','adopt back after allocation');
     return count;
 };

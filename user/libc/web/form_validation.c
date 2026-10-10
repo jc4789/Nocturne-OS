@@ -551,6 +551,73 @@ static bool snapshot_push(pvec *p, node_t *n) {
     }
     p->v[p->n++] = n; return true;
 }
+bool web_form_style_snapshot(web_doc *d, unsigned features) {
+    if (!features || !d || !d->root) return true;
+    pvec roots = {0}, controls = {0};
+    bool ok = snapshot_push(&roots, d->root);
+    /* Walk the live DOM, including hidden light children and each shadow tree,
+       not the lifetime allocation list or only the rendered flat tree. A form
+       can own an out-of-tree control via form=; hidden controls still validate. */
+    for (int i = 0; ok && i < roots.n; i++) {
+        node_t *root = roots.v[i];
+        for (node_t *n = root; n; n = tree_next(root, n)) {
+            if (!web_native_checkpoint(d)) { ok = false; break; }
+            if (n->shadow_root && !snapshot_push(&roots, n->shadow_root)) { ok = false; break; }
+            if (!html_element(n) || !(n->tag == T_form || n->tag == T_option || web_control_validation_interface(n))) continue;
+            n->style_form_state = 0;
+            if (!snapshot_push(&controls, n)) { ok = false; break; }
+            /* Radio groups and select options must all be initialized before
+               any member's validity/checkedness is evaluated. Select sync can
+               modify its options, so no worker is allowed to call it. */
+            if (n->tag == T_input || n->tag == T_textarea || n->tag == T_select)
+                doc_control_init(d, n);
+        }
+    }
+    for (int i = 0; ok && i < controls.n; i++) {
+        if (!web_native_checkpoint(d)) { ok = false; break; }
+        node_t *n = controls.v[i];
+        unsigned state = 0;
+        uint32_t validity = 0;
+        bool have_validity = false;
+        if ((features & WEB_STYLE_FORM_CHECKED) &&
+            ((n->tag == T_input && n->checked) || (n->tag == T_option && doc_option_selected(n)))) state |= WEB_STYLE_CHECKED;
+        if (features & WEB_STYLE_FORM_VALIDITY) {
+            if (n->tag == T_form || n->tag == T_fieldset) state |= WEB_STYLE_VALIDATABLE;
+            else if (web_control_will_validate(n)) {
+                state |= WEB_STYLE_VALIDATABLE;
+                validity = web_control_validity(d, n); have_validity = true;
+                if (validity) state |= WEB_STYLE_INVALID;
+            }
+        }
+        if ((features & WEB_STYLE_FORM_RANGE) && n->tag == T_input) {
+            struct web_input_limits limits; web_input_constraints(n, &limits);
+            if (limits.numeric && (limits.has_min || limits.has_max)) {
+                state |= WEB_STYLE_RANGE;
+                if (!have_validity) validity = web_control_validity(d, n);
+                if (!(validity & (WEB_VALIDITY_RANGE_UNDERFLOW | WEB_VALIDITY_RANGE_OVERFLOW))) state |= WEB_STYLE_IN_RANGE;
+            }
+        }
+        if ((features & WEB_STYLE_FORM_PLACEHOLDER) && (n->tag == T_input || n->tag == T_textarea) &&
+            node_attr(n, "placeholder") && !*web_input_edit_text(n)) state |= WEB_STYLE_PLACEHOLDER;
+        n->style_form_state = (uint8_t)state;
+    }
+    /* Aggregate the already-computed invalid controls once. Re-evaluating a
+       form on every matching rule used to re-enter its shared QuickJS regex/URL
+       validation realm and repeatedly resynchronize selects. Neither is safe
+       on APs. Fieldset aggregation stays in its ordinary DOM tree. */
+    if (features & WEB_STYLE_FORM_VALIDITY) for (int i = 0; ok && i < controls.n; i++) {
+        if (!web_native_checkpoint(d)) { ok = false; break; }
+        node_t *n = controls.v[i];
+        if (n->tag == T_form || n->tag == T_fieldset ||
+            (n->style_form_state & (WEB_STYLE_VALIDATABLE | WEB_STYLE_INVALID)) != (WEB_STYLE_VALIDATABLE | WEB_STYLE_INVALID)) continue;
+        node_t *form = web_form_owner(d, n);
+        if (form) form->style_form_state |= WEB_STYLE_INVALID;
+        for (node_t *p = n->parent; p; p = p->parent)
+            if (html_element(p) && p->tag == T_fieldset) p->style_form_state |= WEB_STYLE_INVALID;
+    }
+    pv_free(&roots); pv_free(&controls);
+    return ok;
+}
 bool web_form_constraints_valid(web_doc *d, node_t *container) {
     if (!d || !html_element(container) || (container->tag != T_form && container->tag != T_fieldset)) return true;
     node_t *root = container->tag == T_form ? doc_node_root(container, false) : container;

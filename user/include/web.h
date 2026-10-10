@@ -129,6 +129,8 @@ struct web_host {
     /* The host owns the cookie jar; returned text is malloc'd, never HttpOnly. */
     char *(*cookie_get)(void *opaque, const char *url);
     void (*cookie_set)(void *opaque, const char *url, const char *value);
+    /* Actual runtime cookie-jar capability; NULL means unavailable/unknown. */
+    bool (*cookie_enabled)(void *opaque);
     void (*navigate_mode)(void *opaque, const char *url, int mode); /* 0 assign, 1 reload, 2 replace */
     /* origin is derived from the native document URL by the private URL parser,
        never a page-selected directory. Output text transfers malloc ownership. */
@@ -147,6 +149,7 @@ struct web_host {
        console painting is safe. False stops native style/layout as well as JS
        task after a user close/stop request, not after a page-count quota. */
     bool (*script_checkpoint)(void *opaque);
+    bool debug_js; /* native profiling is off unless the host explicitly opts in */
 };
 bool web_set_url(web_doc *d, const char *url);
 /* Call between JS tasks, after the host history position and document URL change. */
@@ -269,7 +272,7 @@ web_node *web_focused(web_doc *d);
 bool web_node_inert(web_doc *d, web_node *n); /* native author/modal flat-tree inertness */
 bool web_modal_active(web_doc *d);
 const char *web_control_value(web_node *control);
-/* a key for the focused text control: 0 ignored, 1 changed (repaint), 2 Enter: submit its form */
+/* a key for the focused text control: 0 ignored, 1 consumed (may request repaint), 2 Enter: submit its form */
 int web_key(web_doc *d, const struct gui_event *e);
 /* Native user edits only, not a script clipboard grant. 0 unsupported,
    1 consumed/cancelled, 3 changed. data is a bounded UTF-8 byte string. */
@@ -290,6 +293,8 @@ struct web_form_request { char *url, *body, *content_type, *target; size_t body_
    -1 dialog method without closure (no target, image coordinates, or no JS state).
    Call after validation/submit cancellation; never navigate on a nonzero result. */
 int web_js_dialog_submit(web_doc *d, web_node *submitter);
+/* Native form activation: validates the actual active owner/family and its immutable sandbox. */
+bool web_sandbox_form_submission_allowed(web_doc *top, web_node *submitter);
 bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request *request);
 void web_submit_request_free(struct web_form_request *request);
 bool web_submit(web_doc *d, web_node *submitter, char **url, char **body);

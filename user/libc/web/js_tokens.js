@@ -95,7 +95,7 @@ const tokenListBridge = (() => {
         slots.set(target,s);slots.set(proxy,s);return proxy;
     }
     return {DOMTokenList,for(node,attribute,supported=null){
-        if(rawDom('get',node,'nodeType')!==1)throw new TypeErrorImpl('DOMTokenList requires an element');
+        if(rawDom.get(node,'nodeType')!==1)throw new TypeErrorImpl('DOMTokenList requires an element');
         let cache=lists.get(node);if(!cache){cache=new Map();lists.set(node,cache);}
         let list=cache.get(attribute);if(!list){list=make(node,attribute,supported);cache.set(attribute,list);}return list;
     }};

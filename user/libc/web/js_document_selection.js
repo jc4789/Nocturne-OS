@@ -8,10 +8,10 @@
     for(const key of ['setStart','setEnd','collapse','cloneRange','selectNodeContents','toString','deleteContents'])rangeMethods[key]=NativeRange.prototype[key];
     const call=(r,key,...args)=>apply(rangeMethods[key],r,args);
     const data=s=>{const d=states.get(s);if(!d)throw new TypeError('Illegal Selection receiver');return d;};
-    const get=(n,key)=>rawDom('get',n,key);
+    const get=(n,key)=>rawDom.get(n,key);
     function root(n){let p;while((p=get(n,'parentNode')))n=p;return n;}
     function inDocument(n){let r=root(n);while(r!==document){const host=get(r,'shadowHost');if(!host)return false;r=root(host);}return true;}
-    function node(n){if(!rawDom('isNode',null,n))throw new TypeError('Expected a native Node');return n;}
+    function node(n){if(!rawDom.isNode(null,n))throw new TypeError('Expected a native Node');return n;}
     const offset=n=>(+n)>>>0;
     function point(n,o){node(n);const r=new NativeRange();call(r,'setStart',n,o);call(r,'collapse',true);return r;}
     function notice(d){if(d.scheduled)return;d.scheduled=true;enqueue(()=>{d.scheduled=false;dispatch(document,new SelectionEvent('selectionchange'));},0);}
@@ -84,7 +84,7 @@
     for(const name of Object.getOwnPropertyNames(Selection.prototype))if(name!=='constructor')
         Object.defineProperty(Selection.prototype,name,{...Object.getOwnPropertyDescriptor(Selection.prototype,name),enumerable:true});
     Object.defineProperty(Document.prototype,'getSelection',{configurable:true,writable:true,enumerable:true,value:function(){
-        if(!rawDom('isNode',null,this)||get(this,'nodeType')!==9)throw new TypeError('Document receiver required');return this===document?selection:null;
+        if(!rawDom.isNode(null,this)||get(this,'nodeType')!==9)throw new TypeError('Document receiver required');return this===document?selection:null;
     }});
     Object.defineProperty(globalThis,'getSelection',{configurable:true,writable:true,enumerable:true,value:function(){return selection;}});
     globalThis.Selection=Selection;

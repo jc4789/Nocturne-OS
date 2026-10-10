@@ -543,6 +543,33 @@ static bool js_mime(const char *headers) {
            !strcasecmp(mime, "text/ecmascript") || !strcasecmp(mime, "application/ecmascript") ||
            !strcasecmp(mime, "application/x-javascript");
 }
+/* A rejected response deliberately has no body/status/header exposure on the
+   wire. Preserve only bounded, non-secret rejection metadata in its error;
+   otherwise a real HTTP denial becomes an indistinguishable "HTTP 0". Never
+   include a response body, URL suffix, cookies, or arbitrary header values. */
+static bool reject_script_response(struct job *j, const struct http_resp *r,
+                                   const char *message, const char *reason) {
+    const char *headers = http_response_headers(r), *value;
+    size_t length;
+    char mime[49] = "(missing)", nosniff[64];
+    if (field_slice(headers, "Content-Type", &value, &length)) {
+        const char *semi = memchr(value, ';', length);
+        if (semi) length = (size_t)(semi - value);
+        while (length && (value[length - 1] == ' ' || value[length - 1] == '\t')) length--;
+        size_t n = MIN(length, sizeof mime - 1);
+        bool valid = n != 0;
+        for (size_t i = 0; i < length && valid; i++)
+            if (value[i] != '/' && !token_char((unsigned char)value[i])) valid = false;
+        if (valid) { memcpy(mime, value, n); mime[n] = 0; }
+        else strcpy(mime, "(invalid)");
+    } else if (field_exists(headers, "Content-Type")) strcpy(mime, "(invalid)");
+    const char *sniff = !field_exists(headers, "X-Content-Type-Options") ? "absent" :
+        !field(headers, "X-Content-Type-Options", nosniff, sizeof nosniff) ? "invalid" :
+        !strcasecmp(nosniff, "nosniff") ? "nosniff" : "other";
+    snprintf(j->error, sizeof j->error, "%s (HTTP %d; MIME %.48s; nosniff=%s; reason=%s)",
+             message, r->status, mime, sniff, reason);
+    return false;
+}
 /* List-valued exposure fields may repeat. Scan every complete value without
    copying it into a smaller temporary array or dropping long field names. */
 static bool exposed_header(const char *headers, const char *name, size_t len, bool wildcard) {
@@ -710,7 +737,9 @@ static bool run_http(struct job *j) {
             http_resp_free(&r); continue;
         }
         if (j->wire.kind == WEBNET_MODULE && (r.status < 200 || r.status >= 300 || !js_mime(http_response_headers(&r)))) {
-            http_resp_free(&r); return fail(j, "Module response must be successful JavaScript");
+            reject_script_response(j, &r, "Module response rejected",
+                                   r.status < 200 || r.status >= 300 ? "status" : "MIME");
+            http_resp_free(&r); return false;
         }
         if (j->wire.kind == WEBNET_CLASSIC) {
             char nosniff[64];
@@ -719,7 +748,10 @@ static bool run_http(struct job *j) {
             if (r.status < 200 || r.status >= 300 ||
                 (have_nosniff && (!field(headers, "X-Content-Type-Options", nosniff, sizeof nosniff) ||
                     (!strcasecmp(nosniff, "nosniff") && !js_mime(headers))))) {
-                http_resp_free(&r); return fail(j, "Script response is not executable");
+                reject_script_response(j, &r, "Script response is not executable",
+                    r.status < 200 || r.status >= 300 ? "status" :
+                    !field(headers, "X-Content-Type-Options", nosniff, sizeof nosniff) ? "nosniff-field" : "MIME");
+                http_resp_free(&r); return false;
             }
         }
         j->status = r.status;

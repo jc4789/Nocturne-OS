@@ -105,7 +105,7 @@
     function domain(receiver) {
         documentBrand(receiver);
         // Never trust an overridden document.URL, location, or global URL binding.
-        const nativeURL = rawDom('get', receiver, 'URL');
+        const nativeURL = rawDom.get(receiver, 'URL');
         try {
             const url = new URLImpl(nativeURL), origin = call(originGet, url, []);
             if (origin === 'null') return '';
@@ -115,7 +115,7 @@
             throw e;
         }
     }
-    function host(value) {
+    function parseDomainHost(value) {
         if (!value) return null;
         // URL parsing is not host parsing: do not let path/userinfo/port or
         // whitespace removal make an invalid host into a same-host write.
@@ -134,10 +134,11 @@
         get() { return domain(this); },
         set(value) {
             documentBrand(this); value = string(value);
+            if (host.sandboxFlags(this) & 256) throw new Exception('Sandbox forbids document.domain writes', 'SecurityError');
             if (this !== document) throw new Exception('The document has no browsing context', 'SecurityError');
             const current = domain(this);
             if (!current) throw new Exception('The document has an opaque origin', 'SecurityError');
-            const requested = host(value);
+            const requested = parseDomainHost(value);
             if (!requested) throw new Exception('The value is not a valid host', 'SecurityError');
             // Nocturne has no origin-domain relaxation. An equal-host write is
             // a safe compatibility no-op; it never clears ports or affects SOP.

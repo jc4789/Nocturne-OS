@@ -22,7 +22,7 @@ const customElementsBridge = (() => {
     const StringImpl = String;
     const string = value => { if (typeof value === 'symbol') throw new TypeError('Cannot convert Symbol to DOMString'); return StringImpl(value); };
     const lower = name => name.replace(/[A-Z]/g, c => c.toLowerCase());
-    const get = (node, key) => rawDom('get', node, key);
+    const get = (node, key) => rawDom.get(node, key);
     const children = node => get(node, 'childNodes');
     const attr = (node, key) => reflectedAttr(node, key);
     const fail = (message, name='NotSupportedError') => new DOMException(message, name);
@@ -44,7 +44,7 @@ const customElementsBridge = (() => {
     const connected = node => get(node, 'isConnected');
     // Traverse the actual native tree once, in tree order. Ordinary HTML/text
     // nodes never need wrappers or per-node JS/native crossings for this query.
-    const elements = (root, name=null) => rawDom('customCandidates',root,name);
+    const elements = (root, name=null) => rawDom.customCandidates(root,name);
     function stateFor(element) {
         let s = states.get(element);
         if (!s) { s = {state:'undefined', definition:null, reactions:[]}; states.set(element, s); }
@@ -100,19 +100,19 @@ const customElementsBridge = (() => {
         const s = stateFor(element);
         if (s.state !== 'undefined') return;
         s.definition = d; s.state = 'failed';
-        for (const attribute of rawDom('attrList',element)) callback(element, 'attributeChangedCallback',
+        for (const attribute of rawDom.attrList(element)) callback(element, 'attributeChangedCallback',
             [get(attribute,'localName'),null,get(attribute,'attrValue'),get(attribute,'namespaceURI')]);
         if (connected(element)) callback(element, 'connectedCallback');
         d.stack.push(element);
         try {
             if(d.disableShadow && get(element,'shadowRoot'))throw fail('This custom element disables shadow roots');
             s.state = 'precustomized';
-            rawDom('face',element,'metadata',d.formAssociated);
+            rawDom.face(element,'metadata',d.formAssociated);
             if (invokeConstructor(d.constructor) !== element) throw new TypeError('Custom element constructor returned a different object');
             s.state = 'custom';
             if(d.formAssociated){faceElements.add(element);refreshFormElement(element);}
         } catch (e) {
-            rawDom('face',element,'metadata',false);
+            rawDom.face(element,'metadata',false);
             faceElements.delete(element);
             s.state = 'failed'; s.definition = null; s.reactions.length = 0;
             throw e;
@@ -130,8 +130,8 @@ const customElementsBridge = (() => {
             d.stack[i] = constructed;
             return element;
         }
-        const element = rawDom('create', null, 1, d.name, '');
-        rawDom('face',element,'metadata',d.formAssociated);
+        const element = rawDom.create(null, 1, d.name, '');
+        rawDom.face(element,'metadata',d.formAssociated);
         Object.setPrototypeOf(element, prototype);
         states.set(element, {state:'custom', definition:d, reactions:[]});
         if(d.formAssociated)faceElements.add(element);
@@ -144,7 +144,7 @@ const customElementsBridge = (() => {
                 throw fail('Scoped registries and customized built-in elements are not implemented');
         }
         const d = definitions.get(name);
-        if (!d) return rawDom('create', null, 1, name, '');
+        if (!d) return rawDom.create(null, 1, name, '');
         return reactions(() => {
             try {
                 const element = invokeConstructor(d.constructor), s = states.get(element);
@@ -155,7 +155,7 @@ const customElementsBridge = (() => {
                 return element;
             } catch (e) {
                 report(e);
-                const element = rawDom('create', null, 1, name, '');
+                const element = rawDom.create(null, 1, name, '');
                 states.set(element, {state:'failed', definition:null, reactions:[]});
                 return element;
             }
@@ -233,7 +233,7 @@ const customElementsBridge = (() => {
             for (const node of token.nodes) removed(node,token.was);
             for (const node of children(token.node)) { upgradeTree(node); inserted(node); }
         } else if (token.op === 'attribute') {
-            const current = rawDom('attrNS',token.node,token.namespace??null,token.forced);
+            const current = rawDom.attrNS(token.node,token.namespace??null,token.forced);
             if (token.old !== null || current !== null) attributeChanged(token.node,token.forced,token.old,current,token.namespace??null);
         }
         // Cloning creates a separate native tree: existing FACE ownership is
@@ -248,7 +248,7 @@ const customElementsBridge = (() => {
     }
     function refreshFormElement(element){
         const s=states.get(element);if(!s||s.state!=='custom'||!s.definition.formAssociated)return;
-        const form=rawDom('face',element,'form'),disabled=rawDom('face',element,'disabled');
+        const form=rawDom.face(element,'form'),disabled=rawDom.face(element,'disabled');
         const oldForm=s.formOwner??null,oldDisabled=s.formDisabled??false;
         s.formOwner=form;s.formDisabled=disabled;
         if(form!==oldForm)callback(element,'formAssociatedCallback',[form]);
@@ -260,8 +260,8 @@ const customElementsBridge = (() => {
     function formReset(form){
         reactions(()=>{
             // The private native collector snapshots successful FACE ownership.
-            for(const element of rawDom('faceControls',form))
-                if(rawDom('face',element,'form')===form)callback(element,'formResetCallback');
+            for(const element of rawDom.faceControls(form))
+                if(rawDom.face(element,'form')===form)callback(element,'formResetCallback');
         });
     }
     class CustomElementRegistry {
@@ -309,6 +309,8 @@ const customElementsBridge = (() => {
                         disableInternals:disabledFeatures.includes('internals'),disableShadow:disabledFeatures.includes('shadow')};
                 } finally { defining = false; }
                 definitions.set(name,d); constructors.set(constructor,d);
+                if(host.domHooks)host.domHooks(0,true);
+                if(d.formAssociated && host.domHooks)host.domHooks(2,true);
                 for (const element of elements(document,name)) tryUpgrade(element);
                 const waiting = pending.get(name);
                 if (waiting) { pending.delete(name); waiting.resolve(constructor); }
@@ -346,5 +348,5 @@ const customElementsBridge = (() => {
     Object.defineProperty(globalThis, 'customElements', {get() { return registry; },enumerable:true,configurable:true});
     Object.defineProperty(globalThis, 'CustomElementRegistry', {value:CustomElementRegistry,writable:true,configurable:true});
     function allowShadow(element){const d=definitions.get(get(element,'localName'));return !d || !d.disableShadow;}
-    return {construct,create,reactions,inserted,removed,attributeChanged,upgradeTree,before,after,allowShadow,internalsInfo,formRefresh,formReset,constructing:()=>constructionDepth>0};
+    return {construct,create,reactions,inserted,removed,attributeChanged,upgradeTree,before,after,allowShadow,internalsInfo,formRefresh,formReset,active:()=>definitions.size!==0,constructing:()=>constructionDepth>0};
 })();

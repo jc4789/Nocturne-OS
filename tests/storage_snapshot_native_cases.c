@@ -92,17 +92,20 @@ static void exercise(int mode){
     storage_path(origin,0,confirmed);storage_path(origin,1,candidate);_unlink(confirmed);_unlink(candidate);
     webstorage *s=webstorage_create();struct web_storage_result out;reset(F_NONE);
     verify(storage_test_access(s,origin,WEB_STORAGE_SET,"first","old",&out)==WEB_STORAGE_OK,"initial-publication");
+    verify(webstorage_flush(s,true,&out)==WEB_STORAGE_OK,"initial-flush");
     verify(storage_test_access(s,origin,WEB_STORAGE_SET,"second","kept",&out)==WEB_STORAGE_OK,"second-publication");
+    verify(webstorage_flush(s,true,&out)==WEB_STORAGE_OK,"second-flush");
     int slot=s->areas->slot;uint64_t generation=s->areas->generation;
     storage_path(origin,slot,confirmed);storage_path(origin,1-slot,candidate);
     size_t oldn=0;unsigned char *old=file_bytes(confirmed,&oldn);verify(old!=NULL,"confirmed-readable");
-    reset(mode);int r=storage_test_access(s,origin,WEB_STORAGE_SET,"first","new",&out);
-    bool success=mode==F_NONE||mode==F_SHORT||mode==F_EINTR;
+    reset(mode);verify(storage_test_access(s,origin,WEB_STORAGE_SET,"first","new",&out)==WEB_STORAGE_OK,"ram-publication");
+    int r=webstorage_flush(s,true,&out);
+    bool success=mode==F_NONE||mode==F_SHORT||mode==F_EINTR||mode==F_READ_ZERO||mode==F_READ_CLOSE||mode==F_CORRUPT;
     verify(r==(success?WEB_STORAGE_OK:WEB_STORAGE_IO),"publication-result");
     verify(renames==0,"no-copy-rename");
     if(success){
         verify(s->areas->generation==generation+1&&s->areas->slot==1-slot,"generation-adopted-once");
-        verify(bytes_written==out.snapshot_bytes&&bytes_read==out.snapshot_bytes&&unlinks==0,"one-write-one-readback-no-copy");
+        verify(bytes_written==out.snapshot_bytes&&bytes_read==0&&unlinks==0,"one-write-no-readback-no-copy");
     }else{
         verify(s->areas->generation==generation&&s->areas->slot==slot,"failed-generation-unpublished");
         struct _stat64 st;verify(mode==F_UNLINK?s->areas->unavailable:_stat64(candidate,&st)<0&&errno==ENOENT,"candidate-invalidated-or-failclosed");
@@ -111,16 +114,13 @@ static void exercise(int mode){
     size_t currentn=0;unsigned char *current=file_bytes(confirmed,&currentn);
     verify(old&&current&&oldn==currentn&&!memcmp(old,current,oldn),"last-confirmed-slot-untouched");free(old);free(current);
     reset(F_NONE);
-    if(mode==F_UNLINK){
-        verify(storage_test_access(s,origin,WEB_STORAGE_CHECK,NULL,NULL,&out)==WEB_STORAGE_IO,"uncertain-window-failclosed");
-        verify(storage_test_access(s,origin,WEB_STORAGE_SET,"first","later",&out)==WEB_STORAGE_IO&&writes==0,"uncertain-window-no-new-publication");
-    }else{
-        verify(value_is(s,origin,"first",success?"new":"old")&&value_is(s,origin,"second","kept"),"ram-map-only-adopts-confirmed");
-        struct web_storage_request key={.kind=WEB_STORAGE_LOCAL,.operation=WEB_STORAGE_KEY,.index=0};
-        verify(webstorage_access(s,origin,&key,&out)==WEB_STORAGE_OK&&out.text&&!strcmp(out.text,"first"),"key-order-preserved");free(out.text);
-    }
+    verify(value_is(s,origin,"first","new")&&value_is(s,origin,"second","kept"),"ram-map-retained-for-retry");
+    struct web_storage_request key={.kind=WEB_STORAGE_LOCAL,.operation=WEB_STORAGE_KEY,.index=0};
+    verify(webstorage_access(s,origin,&key,&out)==WEB_STORAGE_OK&&out.text&&!strcmp(out.text,"first"),"key-order-preserved");free(out.text);
+    webstorage *disk=webstorage_create();verify(value_is(disk,origin,"first",success?"new":"old"),"disk-keeps-last-completed-slot");webstorage_free(disk);
+    if(!success)verify(webstorage_flush(s,true,&out)==WEB_STORAGE_OK,"failed-commit-can-retry");
     webstorage_free(s);s=webstorage_create();
-    verify(value_is(s,origin,"first",success?"new":"old")&&value_is(s,origin,"second","kept"),"reopen-recovers-confirmed-slot");
+    verify(value_is(s,origin,"first","new")&&value_is(s,origin,"second","kept"),"reopen-recovers-completed-retry");
     webstorage_free(s);storage_path(origin,0,confirmed);storage_path(origin,1,candidate);_unlink(confirmed);_unlink(candidate);
 }
 int main(void){

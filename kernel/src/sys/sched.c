@@ -8,6 +8,7 @@
 #include "fs/vfs.h"
 #include "gui/wm.h"
 #include "net/net.h"
+#include "abi.h"
 
 static struct task *cpu_current[CPU_MAX_COUNT];
 static volatile bool cpu_resched[CPU_MAX_COUNT];
@@ -19,7 +20,8 @@ volatile bool *sched_resched_slot(void) { return &cpu_resched[cpu_current_index(
 
 static struct task *idle_task;
 #define MLFQ_LEVELS 4
-static struct { struct task *head, *tail; } rq[MLFQ_LEVELS];
+static struct { struct task *head, *tail; } rq[CPU_MAX_COUNT][MLFQ_LEVELS];
+static unsigned enqueue_cpu, dequeue_cpu;
 static struct task *dead_list;
 static int next_pid;
 
@@ -91,21 +93,35 @@ static void bsp_account(void) {
 }
 
 static unsigned rq_highest(void) {
-    for (unsigned i = 0; i < MLFQ_LEVELS; i++) if (rq[i].head) return i;
+    for (unsigned i = 0; i < MLFQ_LEVELS; i++)
+        for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++) if (rq[cpu][i].head) return i;
     return MLFQ_LEVELS;
 }
 
-static void rq_push(struct task *t) {
+static void rq_append(struct task *t, unsigned cpu) {
     ASSERT(!t->on_rq && !t->owner_cpu && t != idle_task);
     if (t->sched_epoch != boost_epoch) mlfq_reset(t);
     unsigned level = t->sched_level;
     ASSERT(level < MLFQ_LEVELS);
     t->state = TASK_READY;
     t->on_rq = true;
+    t->rq_cpu = cpu;
     t->rq_next = NULL;
-    if (rq[level].tail) rq[level].tail->rq_next = t;
-    else rq[level].head = t;
-    rq[level].tail = t;
+    if (rq[cpu][level].tail) rq[cpu][level].tail->rq_next = t;
+    else rq[cpu][level].head = t;
+    rq[cpu][level].tail = t;
+}
+static void rq_push(struct task *t) {
+    unsigned cpu = 0;
+    if (t->is_user) {
+        /* Only BSP mutates queues. APs receive sealed contexts, never a shared
+           queue lock; round-robin allocation and dequeue permit work stealing. */
+        for (unsigned n = 0; n < CPU_MAX_COUNT; n++) {
+            unsigned candidate = (++enqueue_cpu) % CPU_MAX_COUNT;
+            if (!candidate || cpu_runner_ready_at(candidate)) { cpu = candidate; break; }
+        }
+    }
+    rq_append(t, cpu);
 }
 
 /* FIFO is retained within each priority. A periodic boost bounds starvation
@@ -114,16 +130,18 @@ static void mlfq_boost(uint64_t now) {
     if (now - boost_at < BOOST_MS) return;
     boost_at = now;
     boost_epoch++;
+    for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++) {
     for (unsigned level = 0; level < MLFQ_LEVELS; level++) {
-        struct task *t = rq[level].head;
-        rq[level].head = rq[level].tail = NULL;
+        struct task *t = rq[cpu][level].head;
+        rq[cpu][level].head = rq[cpu][level].tail = NULL;
         while (t) {
             struct task *next = t->rq_next;
             t->on_rq = false;
             mlfq_reset(t);
-            rq_push(t);
+            rq_append(t, cpu);
             t = next;
         }
+    }
     }
     /* The loop above appends level 1..3 to already rebuilt level 0; it never
        reprocesses them. AP-owned policy is reset only after its ACK. */
@@ -133,86 +151,102 @@ static void mlfq_boost(uint64_t now) {
 /* ready/wait/tasklist/allocatorはBSPのみ。APは一つのuser所有と固定mailboxだけ。
    phase release/acquireはksp/XSTATE保存とtaskstack離脱を含む所有移譲境界。 */
 enum runner_phase { RUN_EMPTY, RUN_RESERVED, RUN_LAUNCH, RUN_USER, RUN_RETIRING, RUN_RETURNED };
-static struct {
+static struct runner_mailbox {
     unsigned phase, stop;
     struct task *task;
     unsigned level;           /* immutable BSP snapshot until AP retire ACK */
     uint32_t quantum_us;
     uint64_t stamp, elapsed_us;
     unsigned ticks;           /* only fallback clock when no calibrated TSC */
-} runner_mail;
-static uint64_t runner_idle_sp;
+} runner_mails[CPU_MAX_COUNT];
+static uint64_t runner_idle_sp[CPU_MAX_COUNT];
 
 static void request_priority_preemption(void) {
     unsigned ready = rq_highest();
     if (ready == MLFQ_LEVELS) return;
     if (current_task == idle_task || ready < current_task->sched_level) need_resched = true;
-    unsigned phase = __atomic_load_n(&runner_mail.phase, __ATOMIC_ACQUIRE);
+    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
+    struct runner_mailbox *mail = &runner_mails[cpu];
+    unsigned phase = __atomic_load_n(&mail->phase, __ATOMIC_ACQUIRE);
     if ((phase == RUN_LAUNCH || phase == RUN_USER) &&
-        (ready < runner_mail.level ||
-         (runner_mail.task->sched_epoch != boost_epoch && runner_mail.level != 0)) &&
-        !__atomic_load_n(&runner_mail.stop, __ATOMIC_RELAXED)) {
-        __atomic_store_n(&runner_mail.stop, 1, __ATOMIC_RELEASE);
-        cpu_runner_wake();
+        (ready < mail->level ||
+         (mail->task->sched_epoch != boost_epoch && mail->level != 0)) &&
+        !__atomic_load_n(&mail->stop, __ATOMIC_RELAXED)) {
+        __atomic_store_n(&mail->stop, 1, __ATOMIC_RELEASE);
+        cpu_runner_wake_at(cpu);
+    }
     }
 }
 
 static void collect_runner(void) {
     cpu_runner_check();
-    if (__atomic_load_n(&runner_mail.phase, __ATOMIC_ACQUIRE) != RUN_RETURNED) return;
-    struct task *t = runner_mail.task;
+    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
+    struct runner_mailbox *mail = &runner_mails[cpu];
+    if (__atomic_load_n(&mail->phase, __ATOMIC_ACQUIRE) != RUN_RETURNED) continue;
+    struct task *t = mail->task;
     ASSERT(t && t->owner_cpu != 0 && !t->on_rq);
     t->owner_cpu = 0;
-    mlfq_charge(t, runner_mail.elapsed_us);
-    runner_mail.task = NULL;
-    __atomic_store_n(&runner_mail.stop, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&runner_mail.phase, RUN_EMPTY, __ATOMIC_RELEASE);
+    mlfq_charge(t, mail->elapsed_us);
+    mail->task = NULL;
+    __atomic_store_n(&mail->stop, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&mail->phase, RUN_EMPTY, __ATOMIC_RELEASE);
     sched_make_ready(t);
+    }
 }
 
 void sched_post_switch(void) {
     if (cpu_is_runner()) {
-        if (__atomic_load_n(&runner_mail.phase, __ATOMIC_RELAXED) == RUN_RETIRING)
-            __atomic_store_n(&runner_mail.phase, RUN_RETURNED, __ATOMIC_RELEASE);
-    } else if (cpu_current_index() == 0 &&
-               __atomic_load_n(&runner_mail.phase, __ATOMIC_RELAXED) == RUN_RESERVED) {
+        struct runner_mailbox *mail = &runner_mails[cpu_current_index()];
+        if (__atomic_load_n(&mail->phase, __ATOMIC_RELAXED) == RUN_RETIRING)
+            __atomic_store_n(&mail->phase, RUN_RETURNED, __ATOMIC_RELEASE);
+    } else if (cpu_current_index() == 0) {
         /* context_switchが旧taskのkspを書き、BSPが別stackへ移った後。 */
-        __atomic_store_n(&runner_mail.phase, RUN_LAUNCH, __ATOMIC_RELEASE);
-        cpu_runner_wake();
+        for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
+            struct runner_mailbox *mail = &runner_mails[cpu];
+            if (__atomic_load_n(&mail->phase, __ATOMIC_RELAXED) != RUN_RESERVED) continue;
+            __atomic_store_n(&mail->phase, RUN_LAUNCH, __ATOMIC_RELEASE);
+            cpu_runner_wake_at(cpu);
+        }
     }
 }
 
 NORETURN void sched_ap_loop(void) {
     cli();
     current_task = NULL;
+    unsigned cpu = cpu_current_index();
+    struct runner_mailbox *mail = &runner_mails[cpu];
     cpu_runner_started();
     for (;;) {
         cli();
-        if (__atomic_load_n(&runner_mail.phase, __ATOMIC_ACQUIRE) != RUN_LAUNCH) {
+        if (cpu_worker_poll()) continue;
+        if (__atomic_load_n(&mail->phase, __ATOMIC_ACQUIRE) != RUN_LAUNCH) {
             __asm__ volatile("sti; hlt" : : : "memory");
             continue;
         }
         /* idleは固定kernel image/stackだけ。heapのtaskを読む前にglobalもflush。 */
         vmm_switch(kernel_pml4);
         vmm_flush_all();
-        if (__atomic_load_n(&runner_mail.stop, __ATOMIC_ACQUIRE)) {
-            __atomic_store_n(&runner_mail.phase, RUN_RETURNED, __ATOMIC_RELEASE);
+        if (__atomic_load_n(&mail->stop, __ATOMIC_ACQUIRE)) {
+            __atomic_store_n(&mail->phase, RUN_RETURNED, __ATOMIC_RELEASE);
             continue; /* user stackは一度も使用していない */
         }
-        struct task *t = runner_mail.task;
+        struct task *t = mail->task;
         current_task = t;
         tss_set_rsp0((uint64_t)t->kstack + KSTACK_PAGES * PAGE_SIZE);
         vmm_switch(t->pml4);
+        wrmsr(0xC0000100, t->tls_base);
         fpu_restore(&t->fpu);
-        runner_mail.ticks = 0;
-        runner_mail.stamp = run_stamp();
-        __atomic_store_n(&runner_mail.phase, RUN_USER, __ATOMIC_RELEASE);
-        context_switch(&runner_idle_sp, t->ksp);
+        mail->ticks = 0;
+        mail->stamp = run_stamp();
+        __atomic_store_n(&mail->phase, RUN_USER, __ATOMIC_RELEASE);
+        context_switch(&runner_idle_sp[cpu], t->ksp);
         /* AP trapがこの固定stackへ戻りpost_switchでACKした。tにはもう触れない。 */
     }
 }
 
 void sched_ap_interrupt(struct regs *r) {
+    unsigned cpu = cpu_current_index();
+    struct runner_mailbox *mail = &runner_mails[cpu];
     uint64_t vector = r->vector;
     if (vector >= 32 && vector != 0x80 && vector != 0xFF) lapic_eoi();
     if ((r->cs & 3) != 3) {
@@ -220,20 +254,28 @@ void sched_ap_interrupt(struct regs *r) {
         return;
     }
     bool dispatch = vector < 32 || vector == 0x80;
-    if (vector == VEC_TIMER) runner_mail.ticks++;
-    runner_mail.elapsed_us = tsc_hz >= 1000000 ? run_elapsed_us(runner_mail.stamp, run_stamp()) :
-                            (uint64_t)runner_mail.ticks * 1000;
-    if (!dispatch && !__atomic_load_n(&runner_mail.stop, __ATOMIC_ACQUIRE) &&
-        runner_mail.elapsed_us < runner_mail.quantum_us) return;
+    if (vector == VEC_TIMER) mail->ticks++;
+    mail->elapsed_us = tsc_hz >= 1000000 ? run_elapsed_us(mail->stamp, run_stamp()) :
+                            (uint64_t)mail->ticks * 1000;
+    /* Read-only identity queries need no BSP kernel continuation. */
+    if (vector == 0x80 && (r->rax == SYS_CPU_INDEX || r->rax == SYS_THREAD_ID ||
+                          r->rax == SYS_GETPID || r->rax == SYS_UPTIME)) {
+        r->rax = r->rax == SYS_CPU_INDEX ? cpu : r->rax == SYS_THREAD_ID ? current_task->pid :
+                 r->rax == SYS_GETPID ? task_process()->pid : uptime_ms();
+        dispatch = false;
+    }
+    if (!dispatch && !__atomic_load_n(&mail->stop, __ATOMIC_ACQUIRE) &&
+        mail->elapsed_us < mail->quantum_us) return;
     struct task *t = current_task;
+    t->trap_cpu = cpu;
     /* CR2はfaultを起こしたCPUでcapture。BSPのread_cr2は決して代用しない。 */
     uint64_t remote_cr2 = vector == 14 ? read_cr2() : 0;
     fpu_save(&t->fpu);
     vmm_switch(kernel_pml4);
     vmm_flush_all();
     current_task = NULL;
-    __atomic_store_n(&runner_mail.phase, RUN_RETIRING, __ATOMIC_RELAXED);
-    context_switch(&t->ksp, runner_idle_sp);
+    __atomic_store_n(&mail->phase, RUN_RETIRING, __ATOMIC_RELAXED);
+    context_switch(&t->ksp, runner_idle_sp[cpu]);
     /* このcontinuationはretire ACK→BSP ready queue→scheduleでBSPだけに戻す。 */
     cpu_require_bsp();
     if (dispatch) isr_dispatch_remote(r, remote_cr2);
@@ -245,13 +287,15 @@ void sched_quiesce_space(uint64_t pml4) {
     if (!cpu_runner_ready()) return;
     ASSERT(!cpu_jobs_active()); /* worker callbackでmappingの変更/解放は禁止 */
     uint64_t flags = irq_save();
-    unsigned phase = __atomic_load_n(&runner_mail.phase, __ATOMIC_ACQUIRE);
-    if (phase != RUN_EMPTY && (!pml4 || runner_mail.task->pml4 == pml4)) {
+    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
+    struct runner_mailbox *mail = &runner_mails[cpu];
+    unsigned phase = __atomic_load_n(&mail->phase, __ATOMIC_ACQUIRE);
+    if (phase != RUN_EMPTY && (!pml4 || mail->task->pml4 == pml4)) {
         ASSERT(phase != RUN_RESERVED); /* BSP stack-switch publication中はVM変更しない */
-        __atomic_store_n(&runner_mail.stop, 1, __ATOMIC_RELEASE);
-        cpu_runner_wake();
+        __atomic_store_n(&mail->stop, 1, __ATOMIC_RELEASE);
+        cpu_runner_wake_at(cpu);
         uint64_t since = rdtsc(), spins = 0;
-        while (__atomic_load_n(&runner_mail.phase, __ATOMIC_ACQUIRE) != RUN_RETURNED) {
+        while (__atomic_load_n(&mail->phase, __ATOMIC_ACQUIRE) != RUN_RETURNED) {
             cpu_runner_check();
             if ((tsc_hz && rdtsc() - since > tsc_hz) || ++spins > 100000000)
                 panic("smp: user retire timeout; task/space/context retained");
@@ -259,14 +303,15 @@ void sched_quiesce_space(uint64_t pml4) {
         }
         collect_runner();
     }
+    }
     /* IRQ待ちにBSPのqueue/allocator lockをAPへ要求しない。再入はRETURNEDを回収済み。 */
     irq_restore(flags);
 }
 
 void sched_pin_space(uint64_t pml4) {
+    /* WM operations arrive as BSP-owned trap messages. Writable pixels are
+       snapshotted by present, so having a window no longer pins user execution. */
     sched_quiesce_space(pml4);
-    for (struct task *t = task_list; t; t = t->all_next)
-        if (t->pml4 == pml4) t->bsp_only = true;
 }
 
 void sched_init(void) {
@@ -350,14 +395,17 @@ void sched_make_ready(struct task *t) {
 static struct task *rq_pop(void) {
     unsigned level = rq_highest();
     if (level == MLFQ_LEVELS) return NULL;
-    struct task *t = rq[level].head;
-    if (t) {
-        rq[level].head = t->rq_next;
-        if (!rq[level].head) rq[level].tail = NULL;
+    for (unsigned n = 0; n < CPU_MAX_COUNT; n++) {
+        unsigned cpu = (++dequeue_cpu) % CPU_MAX_COUNT;
+        struct task *t = rq[cpu][level].head;
+        if (!t) continue;
+        rq[cpu][level].head = t->rq_next;
+        if (!rq[cpu][level].head) rq[cpu][level].tail = NULL;
         t->on_rq = false;
         t->rq_next = NULL;
+        return t;
     }
-    return t;
+    return NULL;
 }
 
 static void free_task(struct task *t) {
@@ -366,6 +414,8 @@ static void free_task(struct task *t) {
     struct task **pp = &task_list;
     while (*pp && *pp != t) pp = &(*pp)->all_next;
     if (*pp) *pp = t->all_next;
+    if (t->is_thread && t->user_stack && t->pml4 != kernel_pml4)
+        vmm_user_free(t->pml4, t->user_stack, t->user_stack_size);
     vfree(t->kstack, KSTACK_PAGES);
     kfree(t);
 }
@@ -387,13 +437,14 @@ void schedule(void) {
     mlfq_boost(uptime_ms());
     struct task *prev = current_task;
     if (prev->owner_cpu) {
-        ASSERT(__atomic_load_n(&runner_mail.phase, __ATOMIC_RELAXED) == RUN_RESERVED);
+        struct runner_mailbox *mail = &runner_mails[prev->owner_cpu];
+        ASSERT(__atomic_load_n(&mail->phase, __ATOMIC_RELAXED) == RUN_RESERVED);
         /* schedule accounting can exhaust a final sub-ms BSP remainder. Seal
            the AP snapshot only now, before stack-switch launch publication. */
         if (prev->sched_epoch != boost_epoch) mlfq_reset(prev);
         if (!prev->slice_us) prev->slice_us = quantum_us[prev->sched_level];
-        runner_mail.level = prev->sched_level;
-        runner_mail.quantum_us = prev->slice_us;
+        mail->level = prev->sched_level;
+        mail->quantum_us = prev->slice_us;
     }
     if (prev->state == TASK_RUNNING && prev != idle_task && !prev->owner_cpu) {
         rq_push(prev);
@@ -412,6 +463,7 @@ void schedule(void) {
     bsp_stamp = run_stamp();
     tss_set_rsp0((uint64_t)next->kstack + KSTACK_PAGES * PAGE_SIZE);
     vmm_switch(next->pml4);
+    wrmsr(0xC0000100, next->tls_base);
     fpu_save(&prev->fpu);
     fpu_restore(&next->fpu);
     context_switch(&prev->ksp, next->ksp);
@@ -448,31 +500,30 @@ void sched_user_return(struct regs *r) {
     (void)r;
     /* syscall_dispatchはstiして返る。所有publicationからiretまでIRQを閉じる。 */
     cli();
-    if (current_task->killed) task_exit(130);
+    if (current_task->killed) task_exit(current_task->kill_code);
     if (need_resched) schedule();
-    if (current_task->killed) task_exit(130);
+    if (current_task->killed) task_exit(current_task->kill_code);
     struct task *t = current_task;
-    if (!cpu_runner_ready() || t->bsp_only || !t->is_user) return;
-    /* create/map前からwindow FDを持つtaskをpin。close後もshared mapping履歴を保持。 */
-    for (unsigned i = 0; i < MAX_FDS; i++) if (t->fds[i] && t->fds[i]->vn->type == VT_WINDOW) {
-        t->bsp_only = true;
-        return;
-    }
+    if (!cpu_runner_ready() || !t->is_user) return;
     collect_runner();
-    if (__atomic_load_n(&runner_mail.phase, __ATOMIC_ACQUIRE) == RUN_EMPTY && rq_highest() != MLFQ_LEVELS) {
+    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
+    struct runner_mailbox *mail = &runner_mails[cpu];
+    if (cpu_runner_ready_at(cpu) && __atomic_load_n(&mail->phase, __ATOMIC_ACQUIRE) == RUN_EMPTY) {
         ASSERT(!(read_rflags() & 0x200) && !cpu_jobs_active());
         /* Finish BSP accounting before publishing the AP's remaining quantum. */
         bsp_account();
         if (!t->slice_us) t->slice_us = quantum_us[t->sched_level];
-        t->owner_cpu = cpu_runner_index();
-        runner_mail.task = t;
-        runner_mail.level = t->sched_level;
-        runner_mail.quantum_us = t->slice_us;
-        runner_mail.ticks = 0;
-        runner_mail.elapsed_us = 0;
-        __atomic_store_n(&runner_mail.phase, RUN_RESERVED, __ATOMIC_RELAXED);
+        t->owner_cpu = cpu;
+        mail->task = t;
+        mail->level = t->sched_level;
+        mail->quantum_us = t->slice_us;
+        mail->ticks = 0;
+        mail->elapsed_us = 0;
+        __atomic_store_n(&mail->phase, RUN_RESERVED, __ATOMIC_RELAXED);
         schedule();
         /* 最後の安全接点。APでresume後はshared scheduler/kernelを呼ばずiretへ。 */
+        return;
+    }
     }
 }
 
@@ -527,10 +578,148 @@ void sleep_ms(uint64_t ms) { wq_wait_timeout(NULL, ms); }
 
 /* ---- task lifecycle ---- */
 
+static int task_thread_create_locked(uint64_t entry, uint64_t function, uint64_t argument) {
+    struct task *owner = task_process();
+    if (!owner->is_user || owner->exiting || owner->killed) return -EINTR;
+    unsigned count = 0;
+    for (struct task *p = task_list; p; p = p->all_next)
+        if (p->is_thread && p->process == owner) count++;
+    if (count >= 128) return -EAGAIN;
+    struct task *t = task_alloc(owner->name);
+    if (!t) return -ENOMEM;
+    t->is_user = t->is_thread = true;
+    t->process = t->parent = owner;
+    t->pml4 = owner->pml4;
+    t->user_stack_size = 256 * 1024;
+    if (owner->mmap_next >= USER_STACK_TOP - USER_STACK_MAX - t->user_stack_size - 2 * PAGE_SIZE) {
+        free_task(t);
+        return -ENOMEM;
+    }
+    /* Unmapped page at each end, distinct from every other thread's stack. */
+    t->user_stack = owner->mmap_next + PAGE_SIZE;
+    owner->mmap_next = t->user_stack + t->user_stack_size + PAGE_SIZE;
+    if (vmm_user_alloc(t->pml4, t->user_stack, t->user_stack_size, VM_W) < 0) {
+        vmm_user_free(t->pml4, t->user_stack, t->user_stack_size);
+        t->user_stack = 0;
+        free_task(t);
+        return -ENOMEM;
+    }
+    extern void user_trampoline(void);
+    struct regs frame;
+    memset(&frame, 0, sizeof frame);
+    frame.rip = entry;
+    frame.cs = USER_CS;
+    frame.ss = USER_DS;
+    frame.rflags = 0x202;
+    frame.rsp = t->user_stack + t->user_stack_size - 8;
+    frame.rdi = function;
+    frame.rsi = argument;
+    t->ksp -= sizeof frame;
+    memcpy((void *)t->ksp, &frame, sizeof frame);
+    push(t, (uint64_t)user_trampoline);
+    for (unsigned i = 0; i < 6; i++) push(t, 0);
+    sched_make_ready(t);
+    return t->pid;
+}
+
+int task_thread_create(uint64_t entry, uint64_t function, uint64_t argument) {
+    uint64_t flags = irq_save();
+    int tid = task_thread_create_locked(entry, function, argument);
+    irq_restore(flags);
+    return tid;
+}
+
+int task_thread_join(int tid) {
+    struct task *owner = task_process();
+    struct task *t = NULL;
+    uint64_t flags = irq_save();
+    for (struct task *p = task_list; p; p = p->all_next)
+        if (p->pid == tid && p->is_thread && p->process == owner) { t = p; break; }
+    if (!t || t == current_task || t->joining) {
+        irq_restore(flags);
+        return -EINVAL;
+    }
+    t->joining = true;
+    for (;;) {
+        if (current_task->killed || owner->exiting) {
+            t->joining = false;
+            wq_wake_all(&owner->child_wait);
+            irq_restore(flags);
+            return -EINTR;
+        }
+        if (t->state == TASK_ZOMBIE) break;
+        wq_wait(&owner->child_wait);
+    }
+    free_task(t);
+    irq_restore(flags);
+    return 0;
+}
+
+static struct wait_queue address_wait;
+int task_wait_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms) {
+    uint64_t flags = irq_save();
+    /* Kill and enrollment are both BSP-owned. A queued/migrated syscall must
+       never register an infinite wait after its kill wake already happened. */
+    if (current_task->killed) { irq_restore(flags); return -EINTR; }
+    if (__atomic_load_n(address, __ATOMIC_ACQUIRE) != expected) {
+        irq_restore(flags);
+        return -EAGAIN;
+    }
+    if (!timeout_ms) { irq_restore(flags); return -ETIMEDOUT; }
+    struct task *t = current_task;
+    t->wait_address = address;
+    bool awake = true;
+    if (timeout_ms == UINT32_MAX) wq_wait(&address_wait);
+    else awake = wq_wait_timeout(&address_wait, timeout_ms);
+    t->wait_address = NULL;
+    irq_restore(flags);
+    if (t->killed) return -EINTR;
+    return awake ? 0 : -ETIMEDOUT;
+}
+
+int task_wake_address(volatile uint32_t *address, unsigned count) {
+    uint64_t flags = irq_save();
+    unsigned done = 0;
+    struct task **pp = &address_wait.head;
+    while (*pp) {
+        struct task *t = *pp;
+        if (t->pml4 == current_task->pml4 && t->wait_address == address) {
+            *pp = t->wq_next;
+            t->wq_next = NULL;
+            t->wq = NULL;
+            t->wake_at = 0;
+            sched_make_ready(t);
+            done++;
+            if (count && done >= count) break;
+        } else pp = &t->wq_next;
+    }
+    irq_restore(flags);
+    return (int)done;
+}
+
 struct task *task_find(int pid) {
     for (struct task *t = task_list; t; t = t->all_next)
         if (t->pid == pid && t->state != TASK_ZOMBIE) return t;
     return NULL;
+}
+
+NORETURN void task_fault_exit(int code) {
+    cpu_require_bsp();
+    cli();
+    struct task *owner = task_process();
+    if (current_task->is_thread && !owner->exiting) {
+        /* A fault may abandon a pool descriptor or a shared mutex. It cannot
+           be recovered by zombifying just this helper: abort/wake the owner
+           and every sibling so no user continuation waits for a dead holder.
+           task_exit then joins them before destroying their shared mappings. */
+        for (struct task *t = task_list; t; t = t->all_next) {
+            if (t == current_task || t->state == TASK_ZOMBIE || t->killed) continue;
+            if (t == owner || (t->is_thread && t->process == owner)) {
+                if (task_kill(t->pid) == 0) t->kill_code = code;
+            }
+        }
+    }
+    task_exit(code);
 }
 
 NORETURN void task_exit(int code) {
@@ -539,6 +728,34 @@ NORETURN void task_exit(int code) {
     ASSERT(!t->owner_cpu);
     if (t == idle_task) panic("idle task tried to exit");
     t->exit_code = code;
+    if (t->is_thread) {
+        /* Do not close shared descriptors, orphan process children or destroy VM. */
+        cli();
+        t->state = TASK_ZOMBIE;
+        wq_wake_all(&t->process->child_wait);
+        schedule();
+        panic("zombie thread %d was scheduled", t->pid);
+    }
+    /* SYS_EXIT enters with IRQs enabled. Keep the state test and child_wait
+       enrollment atomic on the BSP: a sibling may otherwise exit during a
+       timer preemption between those two operations and its last wake is lost.
+       wq_wait switches to other tasks with their own interrupt state, so sibling
+       syscall continuations can still finish while this owner is sleeping. */
+    cli();
+    t->exiting = true;
+    /* Process exit first retires and joins every shared-space thread. Nothing
+       can access its VM or window buffers after the last ACK and zombie join. */
+    sched_quiesce_space(t->pml4);
+    for (struct task *c = task_list; c; c = c->all_next)
+        if (c->is_thread && c->process == t && c->state != TASK_ZOMBIE) task_kill(c->pid);
+    for (;;) {
+        struct task *child = NULL;
+        for (struct task *c = task_list; c; c = c->all_next)
+            if (c->is_thread && c->process == t) { child = c; break; }
+        if (!child) break;
+        if (child->state == TASK_ZOMBIE && !child->joining) free_task(child);
+        else wq_wait(&t->child_wait);
+    }
     sti();
     for (int i = 0; i < MAX_FDS; i++) {
         if (t->fds[i]) {
@@ -578,11 +795,12 @@ NORETURN void task_exit(int code) {
 }
 
 int task_kill(int pid) {
-    struct task *t = task_find(pid);
-    if (!t || t == idle_task) return -ESRCH;
-    if (!t->is_user) return -EPERM;
     uint64_t f = irq_save();
+    struct task *t = task_find(pid);
+    if (!t || t == idle_task) { irq_restore(f); return -ESRCH; }
+    if (!t->is_user) { irq_restore(f); return -EPERM; }
     sched_quiesce_space(t->pml4);
+    if (!t->killed) t->kill_code = 130;
     t->killed = true;
     if (t->state == TASK_BLOCKED) {
         if (t->wq) {
@@ -599,12 +817,13 @@ int task_kill(int pid) {
 }
 
 int task_wait(int pid, int *status, bool nohang) {
-    struct task *me = current_task;
+    struct task *me = task_process();
     for (;;) {
         uint64_t f = irq_save();
+        if (current_task->killed || me->exiting) { irq_restore(f); return -EINTR; }
         bool have_child = false;
         for (struct task *c = task_list; c; c = c->all_next) {
-            if (c->parent != me) continue;
+            if (c->parent != me || c->is_thread) continue;
             if (pid > 0 && c->pid != pid) continue;
             have_child = true;
             if (c->state == TASK_ZOMBIE) {
@@ -639,5 +858,9 @@ void task_printf_stderr(struct task *t, const char *fmt, ...) {
     int n = kvsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
     if (n > (int)sizeof buf - 1) n = sizeof buf - 1;
-    if (t->fds[2]) vfs_write(t->fds[2], buf, n);
+    struct task *owner = t->process ? t->process : t;
+    uint64_t flags = irq_save();
+    struct file *file = owner->fds[2] ? vfs_dup(owner->fds[2]) : NULL;
+    irq_restore(flags);
+    if (file) { vfs_write(file, buf, n); vfs_close(file); }
 }

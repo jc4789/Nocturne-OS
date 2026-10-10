@@ -4,6 +4,9 @@ async function runBroadcastCases() {
     const assert=(name,value)=>{n++;if(!value)throw new Error(name);check('broadcast-'+name,true);};
     const throws=(fn,name)=>{try{fn();return false;}catch(e){return e.name===name;}};
     const pause=()=>new Promise(resolve=>setTimeout(resolve,10));
+    // A timer and posted-message tasks are different task sources. A 10ms
+    // timer does not guarantee completion of every queued recipient task.
+    const received=async(predicate)=>{const end=performance.now()+3000;while(!predicate()){if(performance.now()>=end)throw Error('broadcast delivery deadline');await pause();}};
     assert('requires-name',throws(()=>new BroadcastChannel(),'TypeError'));
     assert('symbol-name',throws(()=>new BroadcastChannel(Symbol()),'TypeError'));
     assert('illegal-name-receiver',throws(()=>Object.getOwnPropertyDescriptor(BroadcastChannel.prototype,'name').get.call({}),'TypeError'));
@@ -24,7 +27,7 @@ async function runBroadcastCases() {
         const bytes=new Uint8Array([7,8]),data={bytes,alias:bytes,map:new Map()};data.self=data;data.map.set(data,bytes);
         a.postMessage(data);bytes[0]=99;
         assert('async-delivery',events.length===0&&second.length===0);
-        await pause();
+        await received(()=>events.length===1&&second.length===1);
         assert('no-self-or-other-name',self===0&&foreign===0);
         assert('all-receivers',events.length===1&&second.length===1);
         const e=events[0],x=e.data,y=second[0].data;
@@ -35,13 +38,13 @@ async function runBroadcastCases() {
         assert('buffer-snapshot',x.bytes[0]===7&&bytes[0]===99&&bytes.byteLength===2);
         x.bytes[0]=31;
         assert('separate-recipient-clones',y!==x&&y.bytes[0]===7&&y.self===y);
-        events=[];second=[];a.postMessage(1);a.postMessage(2);a.postMessage(3);await pause();
+        events=[];second=[];a.postMessage(1);a.postMessage(2);a.postMessage(3);await received(()=>events.length===3&&second.length===3);
         assert('fifo',events.map(e=>e.data).join()==='1,2,3'&&second.map(e=>e.data).join()==='1,2,3');
         const closed=new BroadcastChannel(name);let closedCount=0;closed.onmessage=()=>closedCount++;
-        a.postMessage('queued');closed.close();closed.close();await pause();
+        a.postMessage('queued');closed.close();closed.close();await received(()=>events.length===4&&second.length===4);
         assert('close-drops-queued',closedCount===0);
         assert('closed-post-error',throws(()=>closed.postMessage(1),'InvalidStateError'));
-        events=[];a.postMessage('before-close');a.close();await pause();
+        events=[];a.postMessage('before-close');a.close();await received(()=>events.length===1&&second.length===5);
         assert('sender-close-keeps-sent',events.length===1&&events[0].data==='before-close');
         assert('closed-name-kept',a.name===name);
         b.onmessage=null;assert('clear-handler',b.onmessage===null);

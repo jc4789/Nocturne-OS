@@ -22,6 +22,7 @@
 #include "js_encoding.h"
 #include "js_collator_native.h"
 #include "js_worker.h"
+#include "js_navigator_native.h"
 #include "js_worker_wire.h"
 #include "frame.h"
 #include <limits.h>
@@ -96,7 +97,7 @@ enum { NP_NODE, NP_DOCUMENT, NP_ELEMENT, NP_HTML, NP_TEXT, NP_COMMENT, NP_FRAGME
        NP_SCRIPT, NP_FORM, NP_ANCHOR, NP_AREA, NP_SVG, NP_SVGSVG, NP_PI, NP_ATTR,
        NP_META, NP_LINK, NP_STYLE, NP_BASE, NP_TITLE, NP_HEAD, NP_SHADOW, NP_SLOT,
        NP_TIME, NP_DATA, NP_DETAILS, NP_OL, NP_LI, NP_UNKNOWN, NP_CANVAS,
-       NP_AVMEDIA, NP_AUDIO, NP_VIDEO, NP_LABEL, NP_DATALIST, NP_PROGRESS, NP_METER, NP_HEADING, NP_PICTURE, NP_SOURCE, NP_MENU, NP_DIALOG, NP_DIV, NP_TRACK, NP_FRAME, NP_COUNT };
+       NP_AVMEDIA, NP_AUDIO, NP_VIDEO, NP_LABEL, NP_DATALIST, NP_PROGRESS, NP_METER, NP_HEADING, NP_PICTURE, NP_SOURCE, NP_MENU, NP_DIALOG, NP_DIV, NP_TRACK, NP_FRAME, NP_SVGGRAPHICS, NP_SVGPATH, NP_COUNT };
 struct js_alloc_diagnostics { size_t current, peak, requested, used, limit; unsigned failures, reported; bool quota; };
 struct js_storage_profile {
     uint64_t calls[2][7], inclusive_ms, backend_calls, backend_ms, set_bytes;
@@ -134,7 +135,9 @@ struct web_js_state {
     unsigned posted_count;
     uint32_t next_posted;
     bool posted_id_wrapped;
-    bool posted_turn;
+    bool posted_turn, observer_turn;
+    uint32_t canvas_probe_seen;
+    uint32_t image_bitmap_seen;
     struct js_idle_task *idle_pending, *last_idle_pending, *idle_runnable, *last_idle_runnable;
     unsigned idle_count, idle_period_callbacks;
     uint32_t next_idle;
@@ -158,6 +161,10 @@ struct web_js_state {
     unsigned task_layout_flushes;
     unsigned profile_dom_depth;
     struct js_storage_profile storage_profile;
+    bool ce_hooks_active, range_hooks_active, face_hooks_active;
+    struct js_mutation_registration *mutation_registrations;
+    struct js_mutation_record *mutation_first,*mutation_last;
+    bool mutation_job_pending;
     bool observers_active, observers_force, pointer_capture_pending;
     uint64_t observer_due, observer_layout, observer_dom;
     int observer_x, observer_y, observer_w, observer_h;
@@ -255,6 +262,28 @@ static size_t qusable(const void *p) { return p ? ((const union alloc_header *)p
 static const JSMallocFunctions allocator = {qmalloc, qfree, qrealloc, qusable};
 
 static struct web_js_state *state(JSContext *ctx) { return JS_GetContextOpaque(ctx); }
+static JSValue history_security_error(JSContext *ctx,const char *message);
+static bool task_context_active(const struct web_js_state *state);
+/* Keep the real native initiator across a borrowed realm method's begin_task.
+ * Permissions are never inferred from a replaceable JS receiver or URL. */
+static struct web_js_state *sandbox_actor(struct web_js_state *s) {
+    struct web_js_state *active=s->runtime_owner && s->runtime_owner->runtime_active?
+        s->runtime_owner->runtime_active:s;
+    for(struct web_js_state *p=active;p;p=p->runtime_previous)
+        if(p->doc->sandbox_flags && !p->starting)return p;
+    return active;
+}
+static uint32_t sandbox_authority(struct web_js_state *s) {
+    uint32_t flags=s->doc->sandbox_flags;
+    struct web_js_state *active=s->runtime_owner && s->runtime_owner->runtime_active?
+        s->runtime_owner->runtime_active:s;
+    for(struct web_js_state *p=active;p;p=p->runtime_previous)flags|=p->doc->sandbox_flags;
+    return flags;
+}
+static bool sandbox_borrowed(struct web_js_state *s) {
+    struct web_js_state *actor=sandbox_actor(s);
+    return actor->doc->sandbox_flags && actor->doc!=s->doc;
+}
 static struct web_js_state *profile_task(struct web_js_state *s) {
     return s->runtime_owner && s->runtime_owner->runtime_active ? s->runtime_owner->runtime_active : s;
 }
@@ -262,6 +291,7 @@ static void log_text(struct web_js_state *s, int level, const char *msg) {
     if (s->host.console) s->host.console(s->host.opaque, level, msg ? msg : "JavaScript error");
 }
 static void storage_profile_report(struct web_js_state *s) {
+    if(!s->host.debug_js)return;
     const struct web_js_state *task=profile_task(s);
     const struct js_storage_profile *p=&task->storage_profile;
     bool used=p->cookie_calls!=0;
@@ -310,7 +340,7 @@ bool web_js_auxiliary_link(web_doc *d,const char *url) {
     /* The native click path has applied sandbox and opener policy. This GET
        uses the host's real new-window spawn, with no opener or initiator URL.
        As with existing navigation, Nocturne sends no referrer. */
-    if(!d || !d->live || d->inert || !d->js || !d->js->host.navigate_form || !url)return false;
+    if(!d || !d->live || d->inert || !d->js || !d->js->host.navigate_form || !url || !web_sandbox_auxiliary_allowed(d))return false;
     if(strncmp(url,"https://",8) && strncmp(url,"http://",7))return false;
     d->js->host.navigate_form(d->js->host.opaque,url,NULL,0,NULL,"_blank");
     return true; /* Accepted by host, not a promise that native spawn succeeded. */
@@ -448,13 +478,13 @@ static int interrupt(JSRuntime *rt, void *opaque) {
 }
 bool web_native_checkpoint(web_doc *d) {
     if (!d) return true;
-    if (d->native_cancelled) return false;
+    if (__atomic_load_n(&d->native_cancelled,__ATOMIC_ACQUIRE)) return false;
     if ((++d->native_checkpoint_count & 63u) != 0) return true;
     struct web_js_state *s = d->js;
     if (!s || s->starting) return true;
     bool stopped = s->running && !s->disabled ? interrupt(s->rt, s) != 0 :
         s->host.script_checkpoint && !s->host.script_checkpoint(s->host.opaque);
-    if (stopped) { d->native_cancelled = true; s->disabled = true; return false; }
+    if (stopped) { __atomic_store_n(&d->native_cancelled,true,__ATOMIC_RELEASE); s->disabled = true; return false; }
     return true;
 }
 static void begin_task(struct web_js_state *s) {
@@ -487,14 +517,14 @@ static void end_task(struct web_js_state *s) {
     if (s->running == 1 && !s->disabled) {
         signal_slots(s);
         JSContext *ctx;
-        uint64_t microtask_start = uptime_ms();
+        uint64_t microtask_start = s->host.debug_js?uptime_ms():0;
         while (JS_IsJobPending(s->rt)) {
             if (interrupt(s->rt, s)) break;
             int r = JS_ExecutePendingJob(s->rt, &ctx);
             if (r < 0) exception(state(ctx)?state(ctx):s);
             if (r == 0) break;
         }
-        s->task_microtask_ms += uptime_ms() - microtask_start;
+        if(s->host.debug_js)s->task_microtask_ms += uptime_ms() - microtask_start;
     }
     if (s->running == 1) {
         /* Interrupted/OOM JS may not reach its finally. No captured Worker
@@ -605,7 +635,12 @@ static bool unknown_html_interface(const node_t *n) {
 }
 static JSValueConst node_prototype(struct web_js_state *s, const node_t *n) {
     int kind = n->type == N_DOC ? NP_DOCUMENT : n->type == N_ELEM ?
-               (n->namespace_id == NS_SVG ? (!strcmp(n->raw_name, "svg") ? NP_SVGSVG : NP_SVG) :
+               (n->namespace_id == NS_SVG ? (!strcmp(n->raw_name, "svg") ? NP_SVGSVG :
+                !strcmp(n->raw_name,"path") ? NP_SVGPATH :
+                (!strcmp(n->raw_name,"g")||!strcmp(n->raw_name,"rect")||!strcmp(n->raw_name,"circle")||
+                 !strcmp(n->raw_name,"ellipse")||!strcmp(n->raw_name,"line")||!strcmp(n->raw_name,"polyline")||
+                 !strcmp(n->raw_name,"polygon")||!strcmp(n->raw_name,"text")||!strcmp(n->raw_name,"image")||
+                 !strcmp(n->raw_name,"use")||!strcmp(n->raw_name,"foreignObject")) ? NP_SVGGRAPHICS : NP_SVG) :
                 n->foreign ? NP_ELEMENT : n->tag == T_iframe ? NP_IFRAME : NP_HTML) :
                n->type == N_TEXT ? NP_TEXT : n->type == N_COMMENT ? NP_COMMENT : n->type == N_DOCTYPE ? NP_DOCTYPE : n->type == N_PI ? NP_PI : n->type == N_ATTR ? NP_ATTR : n->shadow_host ? NP_SHADOW : NP_FRAGMENT;
     if (n->type == N_ELEM && !n->foreign) switch (n->tag) {
@@ -1070,14 +1105,18 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     return JS_UNDEFINED;
 }
 
-static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValueConst value) {
+#include "js_dom_opcodes.h"
+#include "js_mutations.h"
+static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValueConst value,int argc,JSValueConst *argv) {
     JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
     if (d->resources_dirty && !strcmp(p, "title")) doc_rescan(d);
     if (!strcmp(p, "imageWidth") || !strcmp(p, "imageHeight")) {
         if (!html_image(n)) return JS_ThrowTypeError(ctx, "HTMLImageElement receiver required");
         uint32_t number; if (JS_ToUint32(ctx, &number, value) < 0) return JS_EXCEPTION;
         char text[16]; snprintf(text, sizeof text, "%u", number);
-        return doc_attr_set_ns(d, n, NULL, NULL, !strcmp(p, "imageWidth") ? "width" : "height", text) ? JS_UNDEFINED : oom(ctx);
+        struct js_mutation_snapshot observed=mutation_before(s,DOM_set,n,argc,argv);
+        bool ok=doc_attr_set_ns(d,n,NULL,NULL,!strcmp(p,"imageWidth")?"width":"height",text);
+        mutation_after(s,&observed,ok);return ok?JS_UNDEFINED:oom(ctx);
     }
     if (!strcmp(p, "value") || !strcmp(p, "checked") || !strcmp(p, "selectedIndex") || !strcmp(p, "selected")) doc_control_init(d, n);
     if (!strcmp(p, "indeterminate")) { int b = JS_ToBool(ctx, value); if (b < 0) return JS_EXCEPTION; n->indeterminate = b; doc_mutated(d, n); return JS_UNDEFINED; }
@@ -1087,7 +1126,9 @@ static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValue
         int b = JS_ToBool(ctx, value); if (b < 0) return JS_EXCEPTION;
         /* The IDL value reflects the attribute; it is not the force-async flag. */
         n->js_force_async_set = true; n->js_force_async = false;
-        return doc_attr_set_ns(d, n, NULL, NULL, "async", b ? "" : NULL) ? JS_UNDEFINED : oom(ctx);
+        struct js_mutation_snapshot observed=mutation_before(s,DOM_set,n,argc,argv);
+        bool ok=doc_attr_set_ns(d,n,NULL,NULL,"async",b?"":NULL);
+        mutation_after(s,&observed,ok);return ok?JS_UNDEFINED:oom(ctx);
     }
     if (!strcmp(p, "selectedIndex")) { int32_t i; if (JS_ToInt32(ctx, &i, value)) return JS_EXCEPTION; web_select_set_index(d, n, i); doc_mutated(d, n); return JS_UNDEFINED; }
     if (!strcmp(p, "selected") || !strcmp(p, "optionFactorySelected")) {
@@ -1100,19 +1141,20 @@ static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValue
     size_t len; const char *text = JS_ToCStringLen(ctx, &len, value);
     if (!text) return JS_EXCEPTION;
     if (n->type == N_ATTR && strlen(text) != len) { JS_FreeCString(ctx, text); return JS_ThrowTypeError(ctx, "NUL in native attribute values is not implemented"); }
+    struct js_mutation_snapshot observed=mutation_before(s,DOM_set,n,argc,argv);
     bool ok = true;
     if (!strcmp(p, "attrValue") && n->type == N_ATTR) ok = doc_attr_value(d, n, text);
     else if (!strcmp(p, "nodeValue")) { if (n->type == N_TEXT || n->type == N_COMMENT || n->type == N_PI || n->type == N_ATTR) ok = doc_node_text(d, n, text, len); }
     else if (!strcmp(p, "textContent")) { if (n->type != N_DOC) ok = doc_node_text(d, n, text, len); }
     else if (!strcmp(p, "innerHTML")) {
-        if (n->type != N_ELEM && n->type != N_FRAGMENT) { JS_FreeCString(ctx, text); return JS_ThrowTypeError(ctx, "innerHTML requires an element"); }
+        if (n->type != N_ELEM && n->type != N_FRAGMENT) { mutation_after(s,&observed,false);JS_FreeCString(ctx, text); return JS_ThrowTypeError(ctx, "innerHTML requires an element"); }
         ok = doc_node_html(d, n, text, len);
     } else if (!strcmp(p, "value")) {
         if (n->tag == T_select) {
             int found = -1, i = 0;
             for (node_t *option = web_select_next_option(n, NULL); option; option = web_select_next_option(n, option), i++) {
                 JSValue v = option_value(ctx, option); const char *p = JS_ToCString(ctx, v);
-                if (!p) { JS_FreeValue(ctx, v); JS_FreeCString(ctx, text); return JS_EXCEPTION; }
+                if (!p) { mutation_after(s,&observed,false);JS_FreeValue(ctx, v); JS_FreeCString(ctx, text); return JS_EXCEPTION; }
                 bool matches = !strcmp(p, text); JS_FreeCString(ctx, p); JS_FreeValue(ctx, v);
                 if (matches) { found = i; break; }
             }
@@ -1137,7 +1179,8 @@ static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValue
         if (d->head) for (node_t *c = d->head->first; c; c = c->next) if (c->tag == T_title) { title = c; break; }
         if (!title && d->head) { title = doc_node_create(d, N_ELEM, "title", NULL, 0); if (title) ok = doc_node_move(d, d->head, title, NULL); }
         if (title && ok) ok = doc_node_text(d, title, text, len); else ok = false;
-    } else { JS_FreeCString(ctx, text); return JS_ThrowTypeError(ctx, "Unknown DOM setter"); }
+    } else { mutation_after(s,&observed,false);JS_FreeCString(ctx, text); return JS_ThrowTypeError(ctx, "Unknown DOM setter"); }
+    mutation_after(s,&observed,ok);
     JS_FreeCString(ctx, text);
     return ok ? JS_UNDEFINED : oom(ctx);
 }
@@ -1275,11 +1318,11 @@ static void flush_layout(struct web_js_state *s) {
     web_doc *d = s->doc;
     if (d->width < 1) return;
     web_avmedia_service(uptime_ms());
-    uint64_t start = uptime_ms();
+    uint64_t start = s->host.debug_js?uptime_ms():0;
     uint64_t revision = d->layout_revision;
     web_layout(d, d->width, d->height);
-    s->task_layout_ms += uptime_ms() - start;
-    if (d->layout_revision != revision) s->task_layout_flushes++;
+    if(s->host.debug_js){s->task_layout_ms += uptime_ms() - start;
+        if (d->layout_revision != revision) s->task_layout_flushes++;}
     web_avmedia_service(uptime_ms());
 }
 static JSValue rect_array(JSContext *ctx, float x, float y, float w, float h) {
@@ -1289,6 +1332,7 @@ static JSValue rect_array(JSContext *ctx, float x, float y, float w, float h) {
     return a;
 }
 static void viewport_scroll_position(struct web_js_state *s,int *x,int *y);
+#include "js_svg_native.h"
 static JSValue observer_geometry(struct web_js_state *s, node_t *n, node_t *root) {
     JSContext *ctx=s->ctx; web_doc *d=s->doc;
     if (!n || n->type!=N_ELEM || (root && root->type!=N_ELEM && root!=d->root))
@@ -1324,13 +1368,13 @@ static JSValue observer_geometry(struct web_js_state *s, node_t *n, node_t *root
     unsigned count=0;
     /* Use the same overflow/containing-block rule as native painting. */
     bool reached=!b || !b->st || b->st->position!=POS_ABSOLUTE;
-    for(box_t *a=b?b->parent:NULL;a && a->parent;a=a->parent) {
+    for(box_t *a=b && (!b->st || b->st->position!=POS_FIXED)?b->parent:NULL;a && a->parent;a=a->parent) {
         if(root && a->node==root)break;
         if(a->st && a->kind!=B_INLINE && a->st->position!=POS_STATIC)reached=true;
-        if(a->st && a->st->overflow!=OV_VISIBLE && !doc_viewport_overflow_box(d,a) && a->kind!=B_INLINE && reached &&
-           (!b->st || b->st->position!=POS_FIXED))
+        if(a->st && a->st->overflow!=OV_VISIBLE && !doc_viewport_overflow_box(d,a) && a->kind!=B_INLINE && reached)
             JS_SetPropertyUint32(ctx,clips,count++,rect_array(ctx,box_visual_x(a)-a->p[3]-sx,
                 box_visual_y(a)-a->p[0]-sy,a->w+a->p[1]+a->p[3],a->h+a->p[0]+a->p[2]));
+        if(a->st && a->st->position==POS_FIXED)break;
     }
     JS_SetPropertyStr(ctx,out,"root",rect_array(ctx,rx,ry,rw,rh));
     JS_SetPropertyStr(ctx,out,"clips",clips);
@@ -1468,6 +1512,14 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property)
     else if (!strcmp(property, "font-family")) return JS_NewString(ctx,st->font_names?st->font_names:st->font_family==FONT_FAMILY_MONO?"monospace":st->font_family==FONT_FAMILY_SANS?"sans-serif":"serif");
     else if (!strcmp(property, "font-weight")) snprintf(out, sizeof out, "%u", st->font_weight);
     else if (!strcmp(property, "opacity")) snprintf(out, sizeof out, "%g", (double)st->opacity);
+    else if (!strcmp(property, "animation-name")) return JS_NewString(ctx,st->motion.name?st->motion.name:"none");
+    else if (!strcmp(property, "animation-duration")) snprintf(out,sizeof out,"%gs",(double)st->motion.duration/1000);
+    else if (!strcmp(property, "animation-delay")) snprintf(out,sizeof out,"%gs",(double)st->motion.delay/1000);
+    else if (!strcmp(property, "animation-iteration-count")) {if(isfinite(st->motion.iterations))snprintf(out,sizeof out,"%g",(double)st->motion.iterations);else snprintf(out,sizeof out,"infinite");}
+    else if (!strcmp(property, "animation-play-state")) snprintf(out,sizeof out,"%s",st->motion.paused?"paused":"running");
+    else if (!strcmp(property, "animation-fill-mode")) {static const char *const names[]={"none","forwards","backwards","both"};snprintf(out,sizeof out,"%s",names[st->motion.fill<4?st->motion.fill:0]);}
+    else if (!strcmp(property, "animation-direction")) {static const char *const names[]={"normal","reverse","alternate","alternate-reverse"};snprintf(out,sizeof out,"%s",names[st->motion.direction<4?st->motion.direction:0]);}
+    else if (!strcmp(property, "animation-timing-function")) {const struct css_easing *e=&st->motion.easing;if(e->kind==CM_LINEAR)snprintf(out,sizeof out,"linear");else if(e->kind==CM_STEP_START)snprintf(out,sizeof out,"step-start");else if(e->kind==CM_STEP_END)snprintf(out,sizeof out,"step-end");else snprintf(out,sizeof out,"cubic-bezier(%g, %g, %g, %g)",(double)e->x1,(double)e->y1,(double)e->x2,(double)e->y2);}
     else if (!strcmp(property, "fill-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_fill_opacity);
     else if (!strcmp(property, "stroke-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_stroke_opacity);
     else if (!strcmp(property, "stop-opacity")) snprintf(out, sizeof out, "%g", (double)st->svg_stop_opacity);
@@ -1484,6 +1536,10 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property)
     else if (!strcmp(property, "order")) snprintf(out, sizeof out, "%d", st->order);
     else if (!strcmp(property,"visibility")) snprintf(out,sizeof out,"%s",st->visibility==0?"visible":st->visibility==2?"collapse":"hidden");
     else if (!strcmp(property,"content-visibility")) snprintf(out,sizeof out,"%s",st->content_visibility==CV_AUTO?"auto":st->content_visibility==CV_HIDDEN?"hidden":"visible");
+    else if (!strcmp(property,"container-type")) snprintf(out,sizeof out,"%s",st->container_type==CT_SIZE?"size":st->container_type==CT_INLINE_SIZE?"inline-size":"normal");
+    else if (!strcmp(property,"container-name")) return JS_NewString(ctx,st->container_names?st->container_names:"none");
+    else if (!strcmp(property,"-webkit-box-orient")) snprintf(out,sizeof out,"%s",st->box_orient==BO_VERTICAL?"vertical":"horizontal");
+    else if (!strcmp(property,"-webkit-line-clamp")) {if(st->line_clamp)snprintf(out,sizeof out,"%u",st->line_clamp);else snprintf(out,sizeof out,"none");}
     else if (!strcmp(property,"white-space")) {
         static const char *const names[]={"normal","pre","nowrap","pre-wrap","pre-line","break-spaces"};
         snprintf(out,sizeof out,"%s",names[st->white_space<6?st->white_space:0]);
@@ -1511,6 +1567,10 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property)
     }
     else if (!strcmp(property, "display")) {
         static const char *const names[] = {"none", "inline", "block", "list-item", "inline-block", "table", "inline-table", "table-row-group", "table-header-group", "table-footer-group", "table-row", "table-cell", "table-column", "table-column-group", "table-caption", "flex", "inline-flex", "grid", "inline-grid", "contents", "flow-root"};
+        if(st->legacy_box && !(st->box_orient==BO_VERTICAL && st->line_clamp)) {
+            if(st->display==D_BLOCK)return JS_NewString(ctx,"-webkit-box");
+            if(st->display==D_INLINE_BLOCK)return JS_NewString(ctx,"-webkit-inline-box");
+        }
         snprintf(out, sizeof out, "%s", st->display < sizeof names / sizeof *names ? names[st->display] : "block");
     } else if (!strcmp(property, "position")) { static const char *const names[] = {"static", "relative", "absolute", "fixed", "sticky"}; snprintf(out, sizeof out, "%s", names[st->position < 5 ? st->position : 0]); }
     else if (!strcmp(property, "width") || !strcmp(property, "height")) { px = n->box ? (!strcmp(property, "width") ? n->box->w : n->box->h) : 0; is_px = true; }
@@ -1959,6 +2019,7 @@ static JSValue control_selection_dom(struct web_js_state *s, node_t *n, int argc
    did so, except HTMLFormElement.submit(), which deliberately bypasses both.
    A recognized dialog method never falls back to navigation, even on failure. */
 int web_js_dialog_submit(web_doc *d, web_node *submitter) {
+    if(!web_sandbox_forms_allowed(d) || (d->js && (sandbox_authority(d->js)&SB_FORMS)))return -1;
     node_t *dialog; const char *result;
     int branch = web_dialog_submission(d, submitter, &dialog, &result);
     if (branch != 1) return branch;
@@ -1983,6 +2044,7 @@ int web_js_dialog_submit(web_doc *d, web_node *submitter) {
     return status;
 }
 static void navigate_form_request(struct web_js_state *s, node_t *submitter) {
+    if(sandbox_authority(s)&SB_FORMS){log_text(s,1,"Sandbox denied form submission");return;}
     if (web_js_dialog_submit(s->doc,submitter) != 0) return;
     if(s->doc->frame_parent){web_js_console(s->doc,2,"Child form navigation requires a destination/origin-aware embedder and is not implemented");return;}
     struct web_form_request request;
@@ -1999,43 +2061,110 @@ static void navigate_form_request(struct web_js_state *s, node_t *submitter) {
 }
 #include "js_document_commands.h"
 #include "js_cssom.h"
-static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue native_dom_hooks(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
+    (void)this_val;struct web_js_state *s=state(ctx);int32_t kind=0;
+    if(argc<2||JS_ToInt32(ctx,&kind,argv[0])<0)return JS_EXCEPTION;
+    bool active=JS_ToBool(ctx,argv[1])>0;
+    if(kind==0)s->ce_hooks_active=active;else if(kind==1)s->range_hooks_active=active;
+    else if(kind==2)s->face_hooks_active=active;
+    return JS_UNDEFINED;
+}
+static bool dom_custom_subtree(node_t *node) {
+    if(!node)return false;
+    node_t *current=node;
+    for(;;){
+        if(custom_candidate(current))return true;
+        if(current->shadow_root&&dom_custom_subtree(current->shadow_root))return true;
+        if(current->first){current=current->first;continue;}
+        while(current!=node&&!current->next)current=current->parent;
+        if(current==node)return false;current=current->next;
+    }
+}
+static bool dom_synchronous_hooks(struct web_js_state *s,int opcode,node_t *n,int argc,JSValueConst *argv) {
+    node_t *incoming=argc>2?node_opaque(argv[2]):NULL,*old=argc>3?node_opaque(argv[3]):NULL;
+    if(s->face_hooks_active)return true; /* form/id/fieldset changes affect FACE */
+    bool structure=opcode==DOM_insert||opcode==DOM_replace||opcode==DOM_remove||opcode==DOM_adopt;
+    if(s->range_hooks_active&&structure)return true;
+    if(opcode==DOM_set&&argc>2&&JS_IsString(argv[2])){
+        const char *key=JS_ToCString(s->ctx,argv[2]);
+        bool content=key&&(!strcmp(key,"innerHTML")||!strcmp(key,"textContent")||!strcmp(key,"nodeValue")||!strcmp(key,"title"));
+        bool markup=key&&!strcmp(key,"innerHTML");JS_FreeCString(s->ctx,key);
+        if(s->range_hooks_active&&content)return true;
+        if(s->ce_hooks_active&&(markup||(content&&dom_custom_subtree(n))))return true;
+    }
+    if(!s->ce_hooks_active)return false;
+    if(opcode==DOM_adopt&&incoming&&incoming->type==N_ATTR)return custom_candidate(incoming->attr_owner);
+    if(structure||opcode==DOM_clone||opcode==DOM_import){
+        return dom_custom_subtree(opcode==DOM_remove||opcode==DOM_clone?n:incoming)||
+            (opcode==DOM_replace&&dom_custom_subtree(old));
+    }
+    if(n&&n->type==N_ATTR)n=n->attr_owner;
+    return custom_candidate(n);
+}
+static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int opcode) {
     struct web_js_state *s = state(ctx); web_doc *d = s->doc;
     if (argc < 2) return JS_ThrowTypeError(ctx, "DOM operation requires a receiver");
-    const char *op = JS_ToCString(ctx, argv[0]); if (!op) return JS_EXCEPTION;
     node_t *n = unwrap(ctx, argv[1]);
-    if (!n && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) { JS_FreeCString(ctx, op); return JS_EXCEPTION; }
+    if (!n && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) { return JS_EXCEPTION; }
     if (n && n->owner) d = n->owner;
+    if(!s->starting && ((sandbox_authority(s)&SB_SCRIPTS) ||
+       (sandbox_actor(s)->doc->sandbox_flags && sandbox_actor(s)->doc!=d)))
+        return history_security_error(ctx,"Sandbox denied borrowed document authority");
     doc_dom_budget(d);
-    bool mutation = !strcmp(op, "shadowAttach") || !strcmp(op, "slotAssign") || !strcmp(op, "insert") || !strcmp(op, "replace") || !strcmp(op, "remove") || !strcmp(op, "adopt") || !strcmp(op, "clone") || !strcmp(op, "import") || !strcmp(op, "set") ||
-                    !strcmp(op, "attrSetNode") || !strcmp(op, "attrRemoveNode") ||
-                    ((!strcmp(op, "attr") || !strcmp(op, "style")) && argc > 3) || (!strcmp(op, "attrNS") && argc > 4);
-    JSValue ce_token = mutation ? custom_element_hook(s, "customElementBefore", argc, argv) : JS_NULL;
-    if (JS_IsException(ce_token)) { JS_FreeCString(ctx, op); return ce_token; }
+    bool mutation = opcode == DOM_shadowAttach || opcode == DOM_slotAssign || opcode == DOM_insert || opcode == DOM_replace || opcode == DOM_remove || opcode == DOM_adopt || opcode == DOM_clone || opcode == DOM_import || opcode == DOM_set ||
+                    opcode == DOM_attrSetNode || opcode == DOM_attrRemoveNode ||
+                    ((opcode == DOM_attr || opcode == DOM_style) && argc > 3) || (opcode == DOM_attrNS && argc > 4);
+    bool synchronous_hooks=mutation&&(s->ce_hooks_active||s->range_hooks_active)&&dom_synchronous_hooks(s,opcode,n,argc,argv);
+    JSValue operation=synchronous_hooks ? JS_NewString(ctx,dom_opcode_names[opcode]) : JS_UNDEFINED;
+    if(JS_IsException(operation))return operation;
+    /* Only the synchronous CE/Range slow path needs an operation string. */
+    if(synchronous_hooks)((JSValue *)argv)[0]=operation;
+    JSValue ce_token = synchronous_hooks ? custom_element_hook(s, "customElementBefore", argc, argv) : JS_NULL;
+    JS_FreeValue(ctx,operation);
+    if (JS_IsException(ce_token)) { return ce_token; }
+    struct js_mutation_snapshot observed=opcode==DOM_set?(struct js_mutation_snapshot){0}:mutation_before(s,opcode,n,argc,argv);
     JSValue result = JS_UNDEFINED;
     const char *p = NULL;
     node_t *attribute_target = NULL;
     const char *attribute_name = NULL;
     bool old_attribute_present = false;
     char *created_attribute_name = NULL;
-    if (mutation && n && n->type == N_ATTR && !strcmp(op, "set") && n->attr_owner && !n->attribute->namespace_uri) {
+    if (mutation && n && n->type == N_ATTR && opcode == DOM_set && n->attr_owner && !n->attribute->namespace_uri) {
         attribute_target = n->attr_owner; attribute_name = n->attribute->local ? n->attribute->local : n->attribute->raw;
         old_attribute_present = true;
     }
-    if (!strcmp(op, "adopt") && argc > 2) {
+    if (opcode == DOM_adopt && argc > 2) {
         node_t *a = unwrap(ctx, argv[2]);
         if (a && a->type == N_ATTR && a->attr_owner && !a->attribute->namespace_uri) {
             attribute_target = a->attr_owner; attribute_name = a->attribute->local ? a->attribute->local : a->attribute->raw;
             old_attribute_present = true;
         }
     }
-    if (!strcmp(op, "isNode")) {
+    if(!n){switch(opcode){
+    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: case DOM_root: case DOM_shadowAttach: case DOM_slotNodes: case DOM_slotAssign: case DOM_attrCreate: case DOM_attrList: case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: case DOM_attrSetNode: case DOM_attrRemoveNode: case DOM_documentCommand: case DOM_selection: case DOM_filesSet: case DOM_formValue: case DOM_face: case DOM_faceControls: case DOM_formControls: case DOM_validation: case DOM_observerGeometry: case DOM_elementScrollIntoView: case DOM_elementScroll: case DOM_imageDecode: case DOM_insert: case DOM_replace: case DOM_remove: case DOM_position: case DOM_equal: case DOM_same: case DOM_adopt: case DOM_import: case DOM_clone: case DOM_customCandidates: case DOM_rect: case DOM_submit: case DOM_reset: case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry:
+        result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");goto dom_complete;
+    default:break;
+    }}
+    switch(opcode){
+    case DOM_get: case DOM_set: case DOM_attr: case DOM_id: case DOM_query: case DOM_matches: case DOM_style: case DOM_stylePriority: case DOM_computed: case DOM_geometry:
+        if(argc<3 || !(p=JS_ToCString(ctx,argv[2]))){result=JS_EXCEPTION;goto dom_complete;}
+        break;
+    default:break;
+    }
+    switch(opcode){
+    case DOM_isNode: {
         result = JS_NewBool(ctx, argc > 2 && node_opaque(argv[2]) != NULL);
-    } else if (!strcmp(op, "animationStyle") || !strcmp(op, "animationComputed")) {
-        result = animation_dom(s, n, !strcmp(op, "animationComputed"), argc, argv);
-    } else if (!strcmp(op, "cssom")) {
+
+    } break;
+    case DOM_animationStyle: case DOM_animationComputed: {
+        result = animation_dom(s, n, opcode == DOM_animationComputed, argc, argv);
+
+    } break;
+    case DOM_cssom: {
         result=cssom_dom(s,n,argc,argv);
-    } else if (!strcmp(op, "styleDisabled")) {
+
+    } break;
+    case DOM_styleDisabled: {
         if (!n || n->type != N_ELEM || n->foreign || n->tag != T_style)
             result = JS_ThrowTypeError(ctx, "HTMLStyleElement receiver required");
         else if (argc > 2) {
@@ -2047,7 +2176,9 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                 d->resources_dirty = d->dirty = d->need_style = true;
             }
         } else result = JS_NewBool(ctx, n->style_disabled);
-    } else if (!strcmp(op, "slotChanges")) {
+
+    } break;
+    case DOM_slotChanges: {
         web_doc *family = s->doc->dom_family ? s->doc->dom_family : s->doc;
         result = JS_NewArray(ctx); uint32_t index = 0;
         doc_shadow_flush(d);
@@ -2061,13 +2192,17 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             slot->slot_change_pending = false; slot->slot_change_next = NULL;
         }
         if (!family->shadow_slots_first) { family->shadow_slots_last = NULL; family->shadow_slots_pending = false; }
-    } else if (!strcmp(op, "parseDocument")) {
+
+    } break;
+    case DOM_parseDocument: {
         size_t len; const char *html = argc > 2 ? JS_ToCStringLen(ctx, &len, argv[2]) : NULL;
         bool blank = argc > 3 && JS_ToBool(ctx, argv[3]) > 0;
         web_doc *made = html ? doc_inert(s->doc, html, len, blank ? "about:blank" : s->doc->url) : NULL;
         result = !html ? JS_EXCEPTION : made ? wrap(s, made->root) : oom(ctx);
         JS_FreeCString(ctx, html);
-    } else if (!strcmp(op, "parseFragment")) {
+
+    } break;
+    case DOM_parseFragment: {
         size_t len = 0; const char *html = argc > 2 ? JS_ToCStringLen(ctx, &len, argv[2]) : NULL;
         if (!n || n->type != N_ELEM) result = JS_ThrowTypeError(ctx, "Element context required");
         else if (!html) result = JS_EXCEPTION;
@@ -2077,7 +2212,9 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             result=made?wrap(s,made):oom(ctx);
         }
         JS_FreeCString(ctx, html);
-    } else if (!strcmp(op, "doctypeCreate")) {
+
+    } break;
+    case DOM_doctypeCreate: {
         size_t nl = 0, pl = 0, sl = 0;
         const char *name = argc > 2 ? JS_ToCStringLen(ctx, &nl, argv[2]) : NULL;
         const char *public_id = argc > 3 ? JS_ToCStringLen(ctx, &pl, argv[3]) : NULL;
@@ -2089,16 +2226,22 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             result = made ? wrap(s, made) : oom(ctx);
         }
         JS_FreeCString(ctx, name); JS_FreeCString(ctx, public_id); JS_FreeCString(ctx, system_id);
-    } else if (!strcmp(op, "insertionStatus")) {
+
+    } break;
+    case DOM_insertionStatus: {
         node_t *child = argc > 2 ? unwrap(ctx, argv[2]) : NULL;
         node_t *before = argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3]) ? unwrap(ctx, argv[3]) : NULL;
         if (!n || !child || (argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3]) && !before)) result = JS_ThrowTypeError(ctx, "Node arguments are required");
         else result = JS_NewInt32(ctx, doc_node_insert_validity(n, child, before));
-    } else if (!strcmp(op, "replacementStatus")) {
+
+    } break;
+    case DOM_replacementStatus: {
         node_t *child=argc>2?unwrap(ctx,argv[2]):NULL,*old=argc>3?unwrap(ctx,argv[3]):NULL;
         if(!n || !child || !old)result=JS_ThrowTypeError(ctx,"Node arguments are required");
         else result=JS_NewInt32(ctx,doc_node_replace_validity(n,child,old));
-    } else if (!strcmp(op, "create")) {
+
+    } break;
+    case DOM_create: {
         int32_t type; if (argc < 5 || JS_ToInt32(ctx, &type, argv[2])) result = JS_EXCEPTION;
         else {
             size_t name_len, len;
@@ -2126,7 +2269,9 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             }
             JS_FreeCString(ctx, name); JS_FreeCString(ctx, text);
         }
-    } else if (!strcmp(op, "elementFromPoint")) {
+
+    } break;
+    case DOM_elementFromPoint: {
         double x, y;
         struct web_js_state *owner=NULL;
         if (!n || (n->type != N_DOC && !(n->type == N_FRAGMENT && n->shadow_host)))
@@ -2155,11 +2300,14 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             }
             result = wrap(s, hit);
         }
-    } else if (!strcmp(op, "viewport")) { int32_t axis = 0; if (argc > 2) JS_ToInt32(ctx, &axis, argv[2]); result = JS_NewInt32(ctx, axis ? d->height : d->width); }
-    else if (!strcmp(op, "focus") || !strcmp(op, "blur")) {
+
+    } break;
+    case DOM_viewport: { int32_t axis = 0; if (argc > 2) JS_ToInt32(ctx, &axis, argv[2]); result = JS_NewInt32(ctx, axis ? d->height : d->width);
+    } break;
+    case DOM_focus: case DOM_blur: {
         node_t *old = d->focus;
         bool permitted = true;
-        if (!strcmp(op, "blur")) {
+        if (opcode == DOM_blur) {
             permitted = n && old == n;
             if (n && n->shadow_root && n->shadow_root->shadow_delegates_focus) {
                 for (node_t *target = old; target; target = doc_shadow_parent(target))
@@ -2169,26 +2317,30 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
         if (permitted) web_js_focus_control(d,n);
         d->dirty = true;
-    } else if (!n) result = JS_ThrowTypeError(ctx, "Invalid DOM receiver");
-    else if (!strncmp(op,"dialog",6)) {
+
+    } break;
+    case DOM_dialogEnter: case DOM_dialogFocus: case DOM_dialogLeave: case DOM_dialogModal: case DOM_dialogPrepare: {
         if(n->type!=N_ELEM || n->foreign || n->tag!=T_dialog) result=JS_ThrowTypeError(ctx,"HTMLDialogElement receiver required");
-        else if(!strcmp(op,"dialogPrepare")) result=JS_NewInt32(ctx,d==s->doc?web_dialog_prepare(d,n):WEB_DIALOG_INACTIVE);
-        else if(!strcmp(op,"dialogEnter")) result=JS_NewBool(ctx,d==s->doc && web_dialog_enter(d,n));
-        else if(!strcmp(op,"dialogModal")) result=JS_NewBool(ctx,web_dialog_is_modal(d,n));
-        else if(!strcmp(op,"dialogLeave")) result=wrap(s,web_dialog_leave(d,n));
-        else if(!strcmp(op,"dialogFocus")) result=wrap(s,d==s->doc?web_dialog_focus_target(d,n):NULL);
+        else if(opcode == DOM_dialogPrepare) result=JS_NewInt32(ctx,d==s->doc?web_dialog_prepare(d,n):WEB_DIALOG_INACTIVE);
+        else if(opcode == DOM_dialogEnter) result=JS_NewBool(ctx,d==s->doc && web_dialog_enter(d,n));
+        else if(opcode == DOM_dialogModal) result=JS_NewBool(ctx,web_dialog_is_modal(d,n));
+        else if(opcode == DOM_dialogLeave) result=wrap(s,web_dialog_leave(d,n));
+        else if(opcode == DOM_dialogFocus) result=wrap(s,d==s->doc?web_dialog_focus_target(d,n):NULL);
         else result=JS_ThrowTypeError(ctx,"Unknown dialog operation");
-    }
-    else if (!strcmp(op, "root")) result = wrap(s, doc_node_root(n, argc > 2 && JS_ToBool(ctx, argv[2]) > 0));
-    else if (!strcmp(op, "shadowAttach")) {
+
+    } break;
+    case DOM_root: {result = wrap(s, doc_node_root(n, argc > 2 && JS_ToBool(ctx, argv[2]) > 0));
+    } break;
+    case DOM_shadowAttach: {
         if (argc < 7 || !doc_shadow_host_valid(n) || n->shadow_root) result = JS_ThrowTypeError(ctx, "Invalid shadow host");
         else {
             node_t *root = doc_shadow_attach(d, n, JS_ToBool(ctx, argv[2]) > 0, JS_ToBool(ctx, argv[3]) > 0,
                 JS_ToBool(ctx, argv[4]) > 0, JS_ToBool(ctx, argv[5]) > 0, JS_ToBool(ctx, argv[6]) > 0);
             result = root ? wrap(s, root) : oom(ctx);
         }
-    }
-    else if (!strcmp(op, "slotNodes")) {
+
+    } break;
+    case DOM_slotNodes: {
         if (n->type != N_ELEM || n->foreign || n->tag != T_slot) result = JS_ThrowTypeError(ctx, "HTMLSlotElement receiver required");
         else {
             pvec nodes = {0};
@@ -2203,8 +2355,9 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             }
             pv_free(&nodes);
         }
-    }
-    else if (!strcmp(op, "slotAssign")) {
+
+    } break;
+    case DOM_slotAssign: {
         int count = argc - 2; node_t **nodes = count ? js_malloc(ctx, (size_t)count * sizeof *nodes) : NULL;
         bool valid = n->type == N_ELEM && !n->foreign && n->tag == T_slot;
         if (count && !nodes) result = JS_EXCEPTION;
@@ -2217,8 +2370,9 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                 doc_slot_assign(n, nodes, count) ? JS_UNDEFINED : oom(ctx);
         }
         js_free(ctx, nodes);
-    }
-    else if (!strcmp(op, "attrCreate")) {
+
+    } break;
+    case DOM_attrCreate: {
         const char *ns = argc > 2 && !JS_IsNull(argv[2]) ? JS_ToCString(ctx, argv[2]) : NULL;
         const char *prefix = argc > 3 && !JS_IsNull(argv[3]) ? JS_ToCString(ctx, argv[3]) : NULL;
         const char *local = argc > 4 ? JS_ToCString(ctx, argv[4]) : NULL;
@@ -2226,8 +2380,9 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         else if (!local || (argc > 2 && !JS_IsNull(argv[2]) && !ns) || (argc > 3 && !JS_IsNull(argv[3]) && !prefix)) result = JS_EXCEPTION;
         else { node_t *made = doc_attr_create(d, ns, prefix, local, ""); result = made ? wrap(s, made) : oom(ctx); }
         JS_FreeCString(ctx, ns); JS_FreeCString(ctx, prefix); JS_FreeCString(ctx, local);
-    }
-    else if (!strcmp(op, "attrList")) {
+
+    } break;
+    case DOM_attrList: {
         if (n->type != N_ELEM) result = JS_ThrowTypeError(ctx, "Element receiver required");
         else {
             result = JS_NewArray(ctx);
@@ -2238,16 +2393,17 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                 }
             }
         }
-    }
-    else if (!strcmp(op, "attrNode") || !strcmp(op, "attrNodeNS") || !strcmp(op, "attrNS")) {
-        bool namespaced = strcmp(op, "attrNode") != 0;
+
+    } break;
+    case DOM_attrNode: case DOM_attrNodeNS: case DOM_attrNS: {
+        bool namespaced = opcode != DOM_attrNode;
         const char *ns = namespaced && argc > 2 && !JS_IsNull(argv[2]) ? JS_ToCString(ctx, argv[2]) : NULL;
         const char *name = argc > (namespaced ? 3 : 2) ? JS_ToCString(ctx, argv[namespaced ? 3 : 2]) : NULL;
         if (n->type != N_ELEM) result = JS_ThrowTypeError(ctx, "Element receiver required");
         else if (!name || (namespaced && argc > 2 && !JS_IsNull(argv[2]) && !ns)) result = JS_EXCEPTION;
         else {
             int i = doc_attr_index(n, ns, name, namespaced);
-            if (!strcmp(op, "attrNS") && argc > 4) {
+            if (opcode == DOM_attrNS && argc > 4) {
                 if (!ns || !*ns) {
                     attribute_target = n; old_attribute_present = i >= 0;
                     if (i >= 0) attribute_name = n->attrs[i].local ? n->attrs[i].local : n->attrs[i].raw;
@@ -2259,15 +2415,16 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                     (attribute_target && !attribute_name) ? oom(ctx) :
                     (value ? doc_attr_set_ns(d, n, ns, prefix, name, value) : doc_attr_remove(d, n, i)) ? JS_UNDEFINED : oom(ctx);
                 JS_FreeCString(ctx, value); JS_FreeCString(ctx, prefix);
-            } else if (!strcmp(op, "attrNS")) result = str_or_null(ctx, i >= 0 ? n->attrs[i].value : NULL);
+            } else if (opcode == DOM_attrNS) result = str_or_null(ctx, i >= 0 ? n->attrs[i].value : NULL);
             else { node_t *a = i >= 0 ? doc_attr_node(d, n, i) : NULL; result = i >= 0 && !a ? oom(ctx) : wrap(s, a); }
         }
         JS_FreeCString(ctx, ns); JS_FreeCString(ctx, name);
-    }
-    else if (!strcmp(op, "attrSetNode") || !strcmp(op, "attrRemoveNode")) {
+
+    } break;
+    case DOM_attrSetNode: case DOM_attrRemoveNode: {
         node_t *a = argc > 2 ? unwrap(ctx, argv[2]) : NULL;
         if (!a || a->type != N_ATTR || n->type != N_ELEM) result = JS_ThrowTypeError(ctx, "Element and Attr required");
-        else if (!strcmp(op, "attrRemoveNode")) {
+        else if (opcode == DOM_attrRemoveNode) {
             int i = a->attr_owner == n ? (int)(a->attribute - n->attrs) : -1;
             if (i >= 0 && !a->attribute->namespace_uri) {
                 attribute_target = n; attribute_name = a->attribute->local ? a->attribute->local : a->attribute->raw; old_attribute_present = true;
@@ -2283,19 +2440,28 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             }
             result = i >= 0 && !old ? oom(ctx) : doc_attr_set_node(d, n, a) ? wrap(s, old) : oom(ctx);
         }
-    }
-    else if (!strcmp(op,"documentCommand")) result=document_command_dom(s,n,argc,argv);
-    else if (!strcmp(op, "selection")) result = control_selection_dom(s, n, argc, argv);
-    else if (!strcmp(op, "filesSet")) result = files_dom(s, n, argc, argv);
-    else if (!strcmp(op, "formValue")) result = form_value_dom(s, n, argc, argv);
-    else if (!strcmp(op, "face")) result = face_dom(s, n, argc, argv);
-    else if (!strcmp(op, "faceControls") || !strcmp(op, "formControls")) result = face_controls_dom(s,n,argc,argv,!strcmp(op,"formControls"));
-    else if (!strcmp(op, "validation")) result = validation_dom(s, n, argc, argv);
-    else if (!strcmp(op,"observerGeometry")) {
+
+    } break;
+    case DOM_documentCommand: {result=document_command_dom(s,n,argc,argv);
+    } break;
+    case DOM_selection: {result = control_selection_dom(s, n, argc, argv);
+    } break;
+    case DOM_filesSet: {result = files_dom(s, n, argc, argv);
+    } break;
+    case DOM_formValue: {result = form_value_dom(s, n, argc, argv);
+    } break;
+    case DOM_face: {result = face_dom(s, n, argc, argv);
+    } break;
+    case DOM_faceControls: case DOM_formControls: {result = face_controls_dom(s,n,argc,argv,opcode == DOM_formControls);
+    } break;
+    case DOM_validation: {result = validation_dom(s, n, argc, argv);
+    } break;
+    case DOM_observerGeometry: {
         node_t *root=argc>2 && !JS_IsNull(argv[2])?unwrap(ctx,argv[2]):NULL;
         result=argc>2 && !JS_IsNull(argv[2]) && !root?JS_EXCEPTION:observer_geometry(s,n,root);
-    }
-    else if (!strcmp(op,"elementScrollIntoView")) {
+
+    } break;
+    case DOM_elementScrollIntoView: {
         int32_t block,inline_;int nearest;
         if(!n || n->type!=N_ELEM)result=JS_ThrowTypeError(ctx,"Scrolling requires an Element");
         else if(argc<5)result=JS_ThrowTypeError(ctx,"Scroll alignment is required");
@@ -2324,8 +2490,9 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                 pv_free(&changed);
             }
         }
-    }
-    else if (!strcmp(op,"elementScroll")) {
+
+    } break;
+    case DOM_elementScroll: {
         double x,y;
         result=JS_FALSE;
         if(!n || n->type!=N_ELEM)result=JS_ThrowTypeError(ctx,"Scrolling requires an Element");
@@ -2342,9 +2509,11 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                 else result=JS_NewBool(ctx,doc_element_scroll(owner,n,x,y));
             }
         }
-    }
-    else if (!strcmp(op, "imageDecode")) result = image_decode_promise(s, n);
-    else if (!strcmp(op, "insert")) {
+
+    } break;
+    case DOM_imageDecode: {result = image_decode_promise(s, n);
+    } break;
+    case DOM_insert: {
         node_t *child = argc > 2 ? unwrap(ctx, argv[2]) : NULL, *before = argc > 3 ? unwrap(ctx, argv[3]) : NULL;
         if (!child || child->type == N_DOC || (n->type != N_ELEM && n->type != N_DOC && n->type != N_FRAGMENT)) result = JS_ThrowTypeError(ctx, "HierarchyRequestError");
         else if (before && before->parent != n) result = JS_ThrowTypeError(ctx, "NotFoundError");
@@ -2352,29 +2521,41 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
             bool cycle = false; for (node_t *a = n; a; a = a->parent ? a->parent : a->shadow_host ? a->shadow_host : a->template_host) if (a == child) cycle = true;
             result = cycle ? JS_ThrowTypeError(ctx, "HierarchyRequestError") : doc_node_move(d, n, child, before) ? JS_UNDEFINED : oom(ctx);
         }
-    } else if (!strcmp(op, "replace")) {
+
+    } break;
+    case DOM_replace: {
         node_t *child=argc>2?unwrap(ctx,argv[2]):NULL,*old=argc>3?unwrap(ctx,argv[3]):NULL;
         if(!n || !child || !old)result=JS_ThrowTypeError(ctx,"Node arguments are required");
         else if(doc_node_replace_validity(n,child,old))result=JS_ThrowTypeError(ctx,"Invalid native replacement");
         else result=doc_node_replace(d,n,child,old)?JS_UNDEFINED:oom(ctx);
-    } else if (!strcmp(op, "remove")) doc_node_remove(d, n);
-    else if (!strcmp(op, "position")) {
+
+    } break;
+    case DOM_remove: {doc_node_remove(d, n);
+    } break;
+    case DOM_position: {
         node_t *other=argc>2?unwrap(ctx,argv[2]):NULL;
-        if(argc<3)result=JS_ThrowTypeError(ctx,"compareDocumentPosition requires a Node argument");
-        else result=other?JS_NewUint32(ctx,compare_node_position(n,other)):JS_EXCEPTION;
-    }
-    else if (!strcmp(op, "equal") || !strcmp(op, "same")) {
+        /* The JS wrapper supplies undefined for an omitted argument. unwrap
+         * accepts nullish values for optional-node operations, but position
+         * requires a real Node. JS_EXCEPTION without a pending exception would
+         * leak QuickJS's uninitialized exception sentinel into a catch binding. */
+        if(!other)result=JS_ThrowTypeError(ctx,"compareDocumentPosition requires a Node argument");
+        else result=JS_NewUint32(ctx,compare_node_position(n,other));
+
+    } break;
+    case DOM_equal: case DOM_same: {
         node_t *other = argc > 2 ? unwrap(ctx, argv[2]) : NULL;
         if (argc > 2 && !JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2]) && !other) result = JS_EXCEPTION;
-        else result = JS_NewBool(ctx, !strcmp(op, "equal") ? equal_nodes(n, other) : n == other);
-    }
-    else if (!strcmp(op, "adopt") || !strcmp(op, "import")) {
+        else result = JS_NewBool(ctx, opcode == DOM_equal ? equal_nodes(n, other) : n == other);
+
+    } break;
+    case DOM_adopt: case DOM_import: {
         node_t *child = argc > 2 ? unwrap(ctx, argv[2]) : NULL;
         if (n->type != N_DOC || !child || child->type == N_DOC) result = JS_ThrowTypeError(ctx, "Invalid document node transfer");
-        else if (!strcmp(op, "adopt")) result = doc_node_adopt(d, child) ? wrap(s, child) : oom(ctx);
+        else if (opcode == DOM_adopt) result = doc_node_adopt(d, child) ? wrap(s, child) : oom(ctx);
         else { node_t *copy = doc_node_clone(d, child, argc > 3 && JS_ToBool(ctx, argv[3]) > 0); result = copy ? wrap(s, copy) : oom(ctx); }
-    }
-    else if (!strcmp(op, "clone")) {
+
+    } break;
+    case DOM_clone: {
         bool deep = argc > 2 && JS_ToBool(ctx, argv[2]) > 0;
         if (n->type == N_DOC) {
             web_doc *made = doc_inert(s->doc, "", 0, d->url);
@@ -2389,12 +2570,14 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                 result = ok ? wrap(s, made->root) : oom(ctx);
             }
         } else { node_t *copy = doc_node_clone(d, n, deep); result = copy ? wrap(s, copy) : oom(ctx); }
-    }
-    else if (!strcmp(op, "customCandidates")) {
+
+    } break;
+    case DOM_customCandidates: {
         if (argc > 2 && !JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2])) p = JS_ToCString(ctx, argv[2]);
         result = argc > 2 && !JS_IsNull(argv[2]) && !JS_IsUndefined(argv[2]) && !p ? JS_EXCEPTION : custom_candidates(s, n, p);
-    }
-    else if (!strcmp(op, "rect")) {
+
+    } break;
+    case DOM_rect: {
         struct web_js_state *owner=geometry_owner(s,d);
         int x = 0, y = 0, w = 0, h = 0;
         bool visible = owner && connected(owner, n);
@@ -2411,15 +2594,22 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         JS_SetPropertyStr(ctx, result, "left", JS_NewFloat64(ctx, left)); JS_SetPropertyStr(ctx, result, "top", JS_NewFloat64(ctx, top));
         JS_SetPropertyStr(ctx, result, "right", JS_NewFloat64(ctx, left + w)); JS_SetPropertyStr(ctx, result, "bottom", JS_NewFloat64(ctx, top + h));
         JS_SetPropertyStr(ctx, result, "width", JS_NewInt32(ctx, w)); JS_SetPropertyStr(ctx, result, "height", JS_NewInt32(ctx, h));
-    } else if (!strcmp(op, "submit")) {
+
+    } break;
+    case DOM_submit: {
         if (!d->inert) navigate_form_request(s,n);
-    } else if (!strcmp(op, "reset")) {
+
+    } break;
+    case DOM_reset: {
         if (n->type != N_ELEM || n->foreign || n->tag != T_form) result = JS_ThrowTypeError(ctx, "HTMLFormElement receiver required");
         else result = doc_form_reset(d, n) ? JS_UNDEFINED : oom(ctx);
-    } else if (argc < 3 || !(p = JS_ToCString(ctx, argv[2]))) result = JS_EXCEPTION;
-    else if (!strcmp(op, "get")) result = get_dom(s, n, p);
-    else if (!strcmp(op, "set")) result = argc > 3 ? set_dom(s, n, p, argv[3]) : JS_ThrowTypeError(ctx, "Missing DOM value");
-    else if (!strcmp(op, "attr")) {
+
+    } break;
+    case DOM_get: {result = get_dom(s, n, p);
+    } break;
+    case DOM_set: {result = argc > 3 ? set_dom(s, n, p, argv[3],argc,argv) : JS_ThrowTypeError(ctx, "Missing DOM value");
+    } break;
+    case DOM_attr: {
         if (n->type != N_ELEM) result = JS_ThrowTypeError(ctx, "Attributes require an element");
         else if (argc == 3) {
             const char *value = NULL;
@@ -2442,18 +2632,30 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                 (attribute_target && !attribute_name) ? oom(ctx) : doc_node_attr(d, n, p, v) ? JS_UNDEFINED : oom(ctx);
             JS_FreeCString(ctx, v);
         }
-    } else if (!strcmp(op, "id")) result = wrap(s, find_id(n, p));
-    else if (!strcmp(op, "query")) {
+
+    } break;
+    case DOM_id: {result = wrap(s, find_id(n, p));
+    } break;
+    case DOM_query: {
         pvec found = {0};
         if (!css_select(d, n, p, &found)) result = JS_ThrowSyntaxError(ctx, "Invalid CSS selector");
         else if (argc > 3 && JS_ToBool(ctx, argv[3]) > 0) result = wrap(s, found.n ? found.v[0] : NULL);
         else { result = JS_NewArray(ctx); for (int i = 0; i < found.n; ++i) if (JS_SetPropertyUint32(ctx, result, i, wrap(s, found.v[i])) < 0) { JS_FreeValue(ctx, result); result = JS_EXCEPTION; break; } }
         pv_free(&found);
-    } else if (!strcmp(op, "matches")) { bool valid; bool matches = css_matches(n, p, &valid); result = valid ? JS_NewBool(ctx, matches) : JS_ThrowSyntaxError(ctx, "Invalid CSS selector"); }
-    else if (!strcmp(op, "style") || !strcmp(op, "stylePriority")) result = style_access(s, n, p, argc > 3, argc > 3 ? argv[3] : JS_UNDEFINED, argc > 4 ? argv[4] : JS_UNDEFINED, !strcmp(op, "stylePriority"));
-    else if (!strcmp(op, "computed")) result = computed(s, n, p);
-    else if (!strcmp(op, "geometry")) result = geometry(s, n, p);
-    else result = JS_ThrowTypeError(ctx, "Unknown DOM operation");
+
+    } break;
+    case DOM_matches: { bool valid; bool matches = css_matches(n, p, &valid); result = valid ? JS_NewBool(ctx, matches) : JS_ThrowSyntaxError(ctx, "Invalid CSS selector");
+    } break;
+    case DOM_style: case DOM_stylePriority: {result = style_access(s, n, p, argc > 3, argc > 3 ? argv[3] : JS_UNDEFINED, argc > 4 ? argv[4] : JS_UNDEFINED, opcode == DOM_stylePriority);
+    } break;
+    case DOM_computed: {result = computed(s, n, p);
+    } break;
+    case DOM_geometry: {result = geometry(s, n, p);
+    } break;
+    default: result = JS_ThrowTypeError(ctx, "Unknown DOM operation"); break;
+    }
+dom_complete:;
+mutation_after(s,&observed,!JS_IsException(result));
     if (!JS_IsException(result) && attribute_target && attribute_name) {
         JSValue notified = attribute_native_changed(s, attribute_target, attribute_name, old_attribute_present);
         if (JS_IsException(notified)) { JS_FreeValue(ctx, result); result = notified; } else JS_FreeValue(ctx, notified);
@@ -2466,12 +2668,12 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     }
     JS_FreeValue(ctx, ce_token);
     if (!JS_IsException(result) && mutation) signal_slots(s);
-    if (!JS_IsException(result) && n && (!strcmp(op, "insert") || !strcmp(op, "replace")) && connected(s, n)) {
+    if (!JS_IsException(result) && n && (opcode == DOM_insert || opcode == DOM_replace) && connected(s, n)) {
         dynamic_scripts(s, n);
         for (struct js_script *script = s->scripts; script; script = script->next)
             if (script->dynamic && script->ready && !script->executed && !script->module && !node_attr(script->node, "src")) run_script(s, script);
     }
-    if (!JS_IsException(result) && n && n->tag == T_script && !n->script_started && connected(s, n) && (!strcmp(op, "attr") || !strcmp(op, "set"))) {
+    if (!JS_IsException(result) && n && n->tag == T_script && !n->script_started && connected(s, n) && (opcode == DOM_attr || opcode == DOM_set)) {
         struct js_script *script = queue_script(s, n, true);
         if (script && script->ready && !script->module && !node_attr(n, "src")) run_script(s, script);
     }
@@ -2480,18 +2682,33 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         if (script && script->ready && !script->module && !node_attr(attribute_target, "src")) run_script(s, script);
     }
     free(created_attribute_name);
-    JS_FreeCString(ctx, p); JS_FreeCString(ctx, op); return result;
+    JS_FreeCString(ctx, p); return result;
 }
 
-static JSValue native_dom(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static JSValue native_dom_magic(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int opcode) {
     struct web_js_state *s = state(ctx);
-    bool outer = s->profile_dom_depth++ == 0;
-    uint64_t start = outer ? uptime_ms() : 0;
-    s->doc->profile.native_calls++;
-    JSValue result = native_dom_impl(ctx, this_val, argc, argv);
-    s->profile_dom_depth--;
-    if (outer) s->doc->profile.native_ms += uptime_ms() - start;
+    JSValueConst local[8], *args=local;
+    if(argc>=8){args=js_malloc(ctx,(size_t)(argc+1)*sizeof *args);if(!args)return JS_EXCEPTION;}
+    args[0]=JS_UNDEFINED;
+    for(int i=0;i<argc;i++)args[i+1]=argv[i];
+    bool profiling=s->host.debug_js;
+    bool outer=profiling && s->profile_dom_depth++==0;
+    uint64_t start=outer?uptime_ms():0;
+    if(profiling)s->doc->profile.native_calls++;
+    JSValue result=native_dom_impl(ctx,this_val,argc+1,args,opcode);
+    if(profiling)s->profile_dom_depth--;
+    if(outer)s->doc->profile.native_ms+=uptime_ms()-start;
+    if(args!=local)js_free(ctx,args);
     return result;
+}
+/* Private compatibility bridge for dynamically selected operations only. Hot
+ * bootstrap calls use JS_NewCFunctionMagic and never stringify/search an op. */
+static JSValue native_dom(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if(argc<1)return JS_ThrowTypeError(ctx,"DOM operation is required");
+    const char *name=JS_ToCString(ctx,argv[0]);if(!name)return JS_EXCEPTION;
+    int opcode=dom_opcode(name);JS_FreeCString(ctx,name);
+    if(opcode<0)return JS_ThrowTypeError(ctx,"Unknown DOM operation");
+    return native_dom_magic(ctx,this_val,argc-1,argv+1,opcode);
 }
 
 static enum http_url_result make_origin(const char *url, char **out) {
@@ -2713,11 +2930,12 @@ static JSValue native_history_call(JSContext *ctx,JSValueConst this_val,int argc
     if(!argc)return JS_ThrowTypeError(ctx,"History receiver required");
     if(!receiver)return JS_EXCEPTION;
     struct web_js_state *target=receiver->owner;
-    struct web_js_state *caller=source->runtime_owner->runtime_active?source->runtime_owner->runtime_active:source;
+    struct web_js_state *caller=sandbox_actor(source);
     if(!target || target->disabled || !target->doc->live || caller->disabled || !caller->doc->live)
         return history_security_error(ctx,"History belongs to an inactive Document");
     if(!web_frame_same_origin(caller->doc,target->doc))
         return history_security_error(ctx,"Cross-origin History access is forbidden");
+    if(caller->doc->sandbox_flags && caller->doc!=target->doc)return history_security_error(ctx,"Sandbox denied borrowed History authority");
     int array=argc>2?JS_IsArray(ctx,argv[2]):0;
     if(array<0)return JS_EXCEPTION;
     if(argc<3 || !JS_IsString(argv[1]) || array!=1)
@@ -2733,7 +2951,7 @@ static JSValue native_history_call(JSContext *ctx,JSValueConst this_val,int argc
 }
 static JSValue native_history(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx);
-    if(s->disabled || !s->doc->live)return history_security_error(ctx,"History belongs to an inactive Document");
+    if(s->disabled || !s->doc->live || sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"History belongs to an inactive or sandbox-inaccessible Document");
     int32_t op = 0, value = 0;
     if ((argc && JS_ToInt32(ctx, &op, argv[0])) || (argc > 3 && JS_ToInt32(ctx, &value, argv[3]))) return JS_EXCEPTION;
     if(s->doc->frame_parent){
@@ -2761,21 +2979,79 @@ static JSValue native_history(JSContext *ctx, JSValueConst this_val, int argc, J
     JS_SetPropertyStr(ctx, out, "data", op == WEB_HISTORY_INFO && value && result.state_len ? JS_NewArrayBufferCopy(ctx, result.state, result.state_len) : JS_NULL);
     return out;
 }
+static JSValue native_sandbox_flags(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
+    struct web_js_state *s=state(ctx);node_t *node=argc?unwrap(ctx,argv[0]):NULL;
+    if(argc && !node)return JS_EXCEPTION;
+    return JS_NewUint32(ctx,sandbox_authority(s)|(node && node->owner?node->owner->sandbox_flags:0));
+}
 static JSValue native_canvas(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if (argc < 2) return JS_ThrowTypeError(ctx, "Canvas node and operation required");
     node_t *node = unwrap(ctx, argv[0]);
     if (!node) return JS_ThrowTypeError(ctx, "Native Canvas receiver required");
     const char *op = JS_ToCString(ctx, argv[1]);
     if (!op) return JS_EXCEPTION;
+    if(!strcmp(op,"contextProbe")) {
+        JS_FreeCString(ctx,op);
+        struct web_js_state *s=node->owner && node->owner->js?node->owner->js:state(ctx);
+        if(s->host.debug_js && argc>2 && JS_IsString(argv[2])) {
+            const char *type=JS_ToCString(ctx,argv[2]);if(!type)return JS_EXCEPTION;
+            static const char *known[]={"2d","webgl","webgl2","experimental-webgl","bitmaprenderer","webgpu"};
+            for(unsigned i=0;i<sizeof known/sizeof *known;i++)if(!strcmp(type,known[i])) {
+                if(!(s->canvas_probe_seen&(1u<<i))) {
+                    s->canvas_probe_seen|=1u<<i;
+                    char *origin=NULL;enum http_url_result parsed=http_origin_owned(web_effective_url(s->doc),&origin);
+                    char message[320];snprintf(message,sizeof message,
+                        "Canvas context request: type=%s frame=%d connected=%d origin=%.160s",
+                        known[i],s->doc->frame_parent!=NULL,connected(s,node),parsed==HTTP_URL_TUPLE?origin:"null");
+                    log_text(s,0,message);free(origin);
+                }
+                break;
+            }
+            JS_FreeCString(ctx,type);
+        }
+        return JS_UNDEFINED;
+    }
     bool draw_image = !strcmp(op, "drawImage");
     JS_FreeCString(ctx, op);
     if (draw_image) {
         if (argc < 3) return JS_ThrowTypeError(ctx, "Canvas image source required");
+        if(web_image_bitmap_is(argv[2]))return web_canvas_draw_bitmap(ctx,node,argv[2],argc-3,argv+3);
         node_t *source = unwrap(ctx, argv[2]);
         if (!source) return JS_ThrowTypeError(ctx, "Native Canvas image source required");
         return web_canvas_draw_image(ctx, node, source, argc - 3, argv + 3);
     }
     return web_canvas_native(ctx, node, argc - 1, argv + 1);
+}
+
+static JSValue native_image_bitmap(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
+    struct web_js_state *s=state(ctx);
+    if(!task_context_active(s) || sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))
+        return history_security_error(ctx,"ImageBitmap authority is inactive or sandbox-inaccessible");
+    node_t *source=NULL;int kind=-1;
+    if(argc>1 && JS_IsString(argv[0]) && JS_IsNumber(argv[1])) {
+        if(JS_ToInt32(ctx,&kind,argv[1])<0)return JS_EXCEPTION;
+        if(kind==2) {
+            if(argc<3 || !(source=unwrap(ctx,argv[2])))return JS_ThrowTypeError(ctx,"Native ImageBitmap image source required");
+            if(!source->owner || !source->owner->live ||
+               (source->owner->js && !task_context_active(source->owner->js)))
+                return history_security_error(ctx,"ImageBitmap source belongs to a retired document");
+        }
+    }
+    JSValue result=web_image_bitmap_native(ctx,s->doc,source,argc,argv);
+    /* Actual decoder/snapshot success only; no URL, author text or encoded
+       bytes. Debug-off takes no extra profiling/native bridge round trip. */
+    if(s->host.debug_js && !JS_IsException(result) && web_image_bitmap_is(result)) {
+        unsigned index=kind==0?0:kind==1?1:kind==2?(source&&source->tag==T_img?3:2):4;
+        if(!(s->image_bitmap_seen&(1u<<index))) {
+            unsigned w,h;
+            if(web_image_bitmap_dimensions(result,&w,&h)) {
+                static const char *const names[]={"Blob","ImageData","HTMLCanvasElement","HTMLImageElement","ImageBitmap"};
+                char message[128];snprintf(message,sizeof message,"ImageBitmap decoded: source=%s width=%u height=%u",names[index],w,h);
+                s->image_bitmap_seen|=1u<<index;log_text(s,0,message);
+            }
+        }
+    }
+    return result;
 }
 
 static JSValue native_avmedia_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -2840,8 +3116,14 @@ static JSValue native_observers(JSContext *ctx, JSValueConst this_val, int argc,
     if(!s->observer_due)s->observer_due=uptime_ms();
     return JS_UNDEFINED;
 }
+static JSValue native_cookie_enabled(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s=state(ctx);
+    return JS_NewBool(ctx,s->host.cookie_get && s->host.cookie_set &&
+        s->host.cookie_enabled && s->host.cookie_enabled(s->host.opaque));
+}
 static JSValue native_cookie_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx);
+    if(!task_context_active(s) || sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Sandbox or inactive cookie authority");
     if (argc) {
         const char *v = JS_ToCString(ctx, argv[0]); if (!v) return JS_EXCEPTION;
         if (s->host.cookie_set) s->host.cookie_set(s->host.opaque, web_effective_url(s->doc), v);
@@ -2851,6 +3133,7 @@ static JSValue native_cookie_impl(JSContext *ctx, JSValueConst this_val, int arg
     JSValue out = JS_NewString(ctx, value ? value : ""); free(value); return out;
 }
 static JSValue native_cookie(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if(!state(ctx)->host.debug_js)return native_cookie_impl(ctx,this_val,argc,argv);
     struct js_storage_profile *p=&profile_task(state(ctx))->storage_profile;
     uint64_t start=uptime_ms();p->cookie_calls++;
     JSValue result=native_cookie_impl(ctx,this_val,argc,argv);
@@ -2861,11 +3144,12 @@ static JSValue native_cookie(JSContext *ctx, JSValueConst this_val, int argc, JS
  * from page code; even after argument conversion the current native URL wins. */
 static JSValue native_storage_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
+    if(!task_context_active(s) || sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Sandbox or inactive storage authority");
     int32_t kind=0, op=0; uint32_t index=0;
     if (argc<2) return JS_ThrowTypeError(ctx,"Storage kind/operation required");
     if (JS_ToInt32(ctx,&kind,argv[0])<0 || JS_ToInt32(ctx,&op,argv[1])<0) return JS_EXCEPTION;
     struct js_storage_profile *profile=&profile_task(s)->storage_profile;
-    if(kind>=0 && kind<2 && op>=0 && op<7)profile->calls[kind][op]++;
+    if(s->host.debug_js&&kind>=0 && kind<2 && op>=0 && op<7)profile->calls[kind][op]++;
     if (op==WEB_STORAGE_KEY) {
         if (argc<5) return JS_ThrowTypeError(ctx,"Storage index required");
         if (JS_ToUint32(ctx,&index,argv[4])<0) return JS_EXCEPTION;
@@ -2883,7 +3167,7 @@ static JSValue native_storage_impl(JSContext *ctx, JSValueConst this_val, int ar
         value=JS_ToCStringLen2(ctx,&request.value_len,argv[3],true);
         if (!value) { JS_FreeCString(ctx,key); return JS_EXCEPTION; }
         request.value=value;
-        profile->set_bytes+=request.value_len;
+        if(s->host.debug_js)profile->set_bytes+=request.value_len;
     }
     JSValue fn=JS_GetPropertyStr(ctx,s->hooks,"storageOrigin"), result=JS_EXCEPTION;
     JSValue origin_value=JS_UNDEFINED, argument=JS_UNDEFINED;
@@ -2899,11 +3183,11 @@ static JSValue native_storage_impl(JSContext *ctx, JSValueConst this_val, int ar
         size_t len=0; origin=JS_ToCStringLen(ctx,&len,origin_value);
         if (!origin) goto done;
         if (len && len<2048 && len==strlen(origin) && s->host.storage) {
-            uint64_t start=uptime_ms();profile->backend_calls++;
+            uint64_t start=s->host.debug_js?uptime_ms():0;if(s->host.debug_js)profile->backend_calls++;
             status=s->host.storage(s->host.opaque,origin,&request,&out);
-            profile->backend_ms+=uptime_ms()-start;
-            profile->saves+=out.save_attempts;profile->save_ms+=out.save_ms;
-            profile->snapshot_bytes+=out.snapshot_bytes;
+            if(s->host.debug_js){profile->backend_ms+=uptime_ms()-start;
+                profile->saves+=out.save_attempts;profile->save_ms+=out.save_ms;
+                profile->snapshot_bytes+=out.snapshot_bytes;}
         }
     }
     result=JS_NewArray(ctx);
@@ -2922,6 +3206,7 @@ done:
     return result;
 }
 static JSValue native_storage(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if(!state(ctx)->host.debug_js)return native_storage_impl(ctx,this_val,argc,argv);
     struct js_storage_profile *p=&profile_task(state(ctx))->storage_profile;
     bool outer=p->depth++==0;uint64_t start=outer?uptime_ms():0;
     JSValue result=native_storage_impl(ctx,this_val,argc,argv);
@@ -2930,6 +3215,7 @@ static JSValue native_storage(JSContext *ctx, JSValueConst this_val, int argc, J
 }
 static JSValue native_scroll(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); int x = 0, y = 0;
+    if(sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Sandbox denied borrowed viewport authority");
     if (argc > 1) {
         double a,b;
         if(JS_ToFloat64(ctx,&a,argv[0])<0 || JS_ToFloat64(ctx,&b,argv[1])<0)return JS_EXCEPTION;
@@ -2980,6 +3266,7 @@ static JSValue native_encode(JSContext *ctx, JSValueConst this_val, int argc, JS
     JSValue v = JS_NewArrayBufferCopy(ctx, (const uint8_t *)text, n); JS_FreeCString(ctx, text); return v;
 }
 static JSValue native_inline(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if(sandbox_authority(state(ctx))&SB_SCRIPTS)return history_security_error(ctx,"Sandbox disallows scripts");
     if (!argc) return JS_UNDEFINED;
     size_t n; const char *text = JS_ToCStringLen(ctx, &n, argv[0]); if (!text) return JS_EXCEPTION;
     sbuf b = {0}; sb_puts(&b, "(function(event){\n"); sb_put(&b, text, n); sb_puts(&b, "\n})");
@@ -2988,7 +3275,13 @@ static JSValue native_inline(JSContext *ctx, JSValueConst this_val, int argc, JS
 }
 static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if (!argc) return JS_UNDEFINED;
-    struct web_js_state *s = state(ctx); const char *p = JS_ToCString(ctx, argv[0]); if (!p) return JS_EXCEPTION;
+    struct web_js_state *s = state(ctx);
+    if(!task_context_active(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Inactive or script-disabled navigation context");
+    struct web_js_state *actor=sandbox_actor(s);
+    bool activated=actor->doc->sandbox_activation_until>uptime_ms();
+    if(!web_sandbox_navigation_allowed(actor->doc,s->doc,activated))return history_security_error(ctx,"Sandbox denied destination navigation");
+    const char *p = JS_ToCString(ctx, argv[0]); if (!p) return JS_EXCEPTION;
+    if(!task_context_active(s) || !task_context_active(actor)){JS_FreeCString(ctx,p);return history_security_error(ctx,"Navigation context retired during conversion");}
     if (s->doc->resources_dirty) doc_sync_tree(s->doc);
     char *url = js_resolve_owned(ctx, s->doc->base, p);
     if (!url) { JS_FreeCString(ctx, p); return JS_EXCEPTION; }
@@ -2997,9 +3290,11 @@ static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, 
     if (!ok) { js_free(ctx, url); return JS_ThrowTypeError(ctx, "Navigation URL is not permitted"); }
     int32_t mode = 0;
     if (argc > 1 && JS_ToInt32(ctx, &mode, argv[1])) { js_free(ctx, url); return JS_EXCEPTION; }
+    if(!task_context_active(s) || !task_context_active(actor) || !web_sandbox_navigation_allowed(actor->doc,s->doc,actor->doc->sandbox_activation_until>uptime_ms())){js_free(ctx,url);return history_security_error(ctx,"Navigation authority changed during conversion");}
+    if(actor->doc!=s->doc)actor->doc->sandbox_activation_until=0;
     if (s->doc->frame_parent) {
         struct web_frame *f=web_frame_find(s->doc->frame_parent,s->doc->frame_element);
-        if (!web_frame_set_navigation(f,url,s->doc)) { js_free(ctx,url); return oom(ctx); }
+        if (!web_frame_set_navigation(f,url,actor->doc)) { js_free(ctx,url); return oom(ctx); }
     }
     else if (s->host.navigate_mode) s->host.navigate_mode(s->host.opaque, url, mode);
     else if (s->host.navigate) s->host.navigate(s->host.opaque, url, NULL);
@@ -3014,6 +3309,8 @@ static JSValue native_click(JSContext *ctx, JSValueConst this_val, int argc, JSV
 static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); node_t *n = argc ? unwrap(ctx, argv[0]) : NULL;
     if (!n) return JS_EXCEPTION;
+    if((sandbox_authority(s)&SB_SCRIPTS) || (sandbox_borrowed(s) && n->owner!=sandbox_actor(s)->doc))
+        return history_security_error(ctx,"Sandbox denied borrowed activation authority");
     if (n->owner && n->owner->inert) {
         JSValue args[] = {argv[0], JS_NewString(ctx, "click")};
         JSValue value = custom_element_hook(s, "inertClick", 2, args);
@@ -3040,6 +3337,7 @@ static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc
     if (disclosure) doc_details_toggle(s->doc,disclosure);
     else if (!anchor && (n->tag == T_audio || n->tag == T_video)) web_media_activate(s->doc, n);
     else if (anchor) {
+        if(node_attr(anchor,"download") && (sandbox_authority(s)&SB_DOWNLOADS))return JS_UNDEFINED;
         struct web_hit action = {0};
         if (web_link_action(s->doc, anchor, &action) && permitted_url(s, action.href, false)) {
             if(s->doc->frame_parent) {
@@ -3056,14 +3354,14 @@ static JSValue native_click_impl(JSContext *ctx, JSValueConst this_val, int argc
         } else if (type && (str_ieq(type, "submit") || str_ieq(type, "image"))) {
             node_t *form = web_form_owner(s->doc, n); e.type = "submit";
             e.submitter=n;
-            if (form && web_form_submission_validate(s->doc,n) && web_js_dispatch(s->doc, form, &e)) {
+            if (form && web_sandbox_forms_allowed(s->doc) && web_form_submission_validate(s->doc,n) && web_js_dispatch(s->doc, form, &e)) {
                 navigate_form_request(s,n);
             }
         } else if (type && str_ieq(type,"reset")) web_reset(s->doc,n);
     } else if (n->tag == T_button) {
         const char *type = node_attr(n, "type"); node_t *form = web_form_owner(s->doc, n);
         if (type && str_ieq(type,"reset")) web_reset(s->doc,n);
-        else if (form && web_control_submit_button(n)) { e.type = "submit"; e.submitter=n; if (web_form_submission_validate(s->doc,n) && web_js_dispatch(s->doc, form, &e)) navigate_form_request(s,n); }
+        else if (form && web_control_submit_button(n) && web_sandbox_forms_allowed(s->doc)) { e.type = "submit"; e.submitter=n; if (web_form_submission_validate(s->doc,n) && web_js_dispatch(s->doc, form, &e)) navigate_form_request(s,n); }
     }
     return JS_UNDEFINED;
 }
@@ -3132,6 +3430,7 @@ static uint32_t allocate_timer_id(struct web_js_state *s) {
 }
 static JSValue native_timer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); int32_t kind = 0; double delay = 0;
+    if((sandbox_authority(s)&SB_SCRIPTS) || sandbox_borrowed(s))return history_security_error(ctx,"Sandbox denied borrowed timer authority");
     if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "Timer browsing context is inactive");
     if (argc < 4 || JS_ToInt32(ctx, &kind, argv[0]) || !JS_IsFunction(ctx, argv[1]) || JS_ToFloat64(ctx, &delay, argv[2])) return JS_ThrowTypeError(ctx, "Invalid timer");
     if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "Timer browsing context retired during conversion");
@@ -3173,6 +3472,7 @@ static uint32_t allocate_posted_id(struct web_js_state *s) {
 #include "js_broadcast.h"
 static JSValue native_post_task(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx);
+    if(sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Sandbox denied borrowed asynchronous authority");
     if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "Posted-task browsing context is inactive");
     if (!argc || !JS_IsFunction(ctx, argv[0])) return JS_ThrowTypeError(ctx, "Expected posted task callback");
     if(s->posted_count==UINT_MAX)return JS_ThrowOutOfMemory(ctx);
@@ -3223,7 +3523,8 @@ static bool idle_id_used(struct web_js_state *s, uint32_t id) {
     return false;
 }
 static JSValue native_idle(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    struct web_js_state *s = state(ctx); uint32_t timeout = 0;
+    struct web_js_state *s = state(ctx);
+    if(sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Sandbox denied borrowed asynchronous authority"); uint32_t timeout = 0;
     if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "Idle-callback browsing context is inactive");
     if (!argc || !JS_IsFunction(ctx, argv[0])) return JS_ThrowTypeError(ctx, "Expected idle callback");
     if (argc > 1 && JS_ToUint32(ctx, &timeout, argv[1]) < 0) return JS_EXCEPTION;
@@ -3265,6 +3566,7 @@ static JSValue microtask_job(JSContext *ctx, int argc, JSValueConst *argv) {
     return JS_Call(ctx, argv[0], JS_UNDEFINED, 0, NULL);
 }
 static JSValue native_microtask(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if((sandbox_authority(state(ctx))&SB_SCRIPTS) || sandbox_borrowed(state(ctx)))return history_security_error(ctx,"Sandbox denied borrowed microtask authority");
     if (!argc || !JS_IsFunction(ctx, argv[0])) return JS_ThrowTypeError(ctx, "Expected callback");
     /* A browser microtask is a host job, not a call through the page's mutable
        Promise constructor. Promise polyfills themselves use queueMicrotask;
@@ -3389,6 +3691,7 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
     (void)this_val;
     struct web_js_state *s = state(ctx); int32_t op;
     if (!argc || JS_ToInt32(ctx,&op,argv[0])) return JS_EXCEPTION;
+    if((sandbox_authority(s)&SB_SCRIPTS) || sandbox_borrowed(s))return history_security_error(ctx,"Sandbox denied Worker authority");
     if(s->disabled)return op==2?JS_UNDEFINED:JS_ThrowTypeError(ctx,"Worker belongs to an inactive browsing context");
     if (op == 0) {
         struct node *generation = s->doc->root;
@@ -3456,6 +3759,7 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
 static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     static uint64_t fetch_group_serial;
     struct web_js_state *s = state(ctx);
+    if(sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Sandbox denied borrowed asynchronous authority");
     if (argc < 4) return JS_ThrowTypeError(ctx, "Invalid fetch request");
     if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "Fetch browsing context is inactive");
     struct node *generation = s->doc->root;
@@ -3896,6 +4200,7 @@ static bool script_type(node_t *n, bool *module) {
 }
 static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dynamic) {
     if (n->script_started) return NULL;
+    if(s->doc->sandbox_flags&SB_SCRIPTS){n->script_started=true;return NULL;}
     if (s->doc->resources_dirty) doc_sync_tree(s->doc);
     const char *src = node_attr(n, "src");
     const char *type = node_attr(n, "type");
@@ -3990,17 +4295,17 @@ static void dynamic_scripts_walk(struct web_js_state *s, node_t *n) {
     if(web_frame_element(n) && connected(s,n))frame_sync(s,n);
     if (n->shadow_root) dynamic_scripts_walk(s, n->shadow_root);
     for (node_t *c = n->first; c; c = c->next) {
-        s->doc->profile.script_visits++;
+        if(s->host.debug_js)s->doc->profile.script_visits++;
         if (c->type != N_ELEM || c->tag == T_template) continue;
         if (c->tag == T_script && !c->script_started) queue_script(s, c, true);
         dynamic_scripts_walk(s, c);
     }
 }
 static void dynamic_scripts(struct web_js_state *s, node_t *n) {
-    uint64_t start = uptime_ms();
-    s->doc->profile.script_scans++;
+    uint64_t start = s->host.debug_js?uptime_ms():0;
+    if(s->host.debug_js)s->doc->profile.script_scans++;
     dynamic_scripts_walk(s, n);
-    s->doc->profile.script_ms += uptime_ms() - start;
+    if(s->host.debug_js)s->doc->profile.script_ms += uptime_ms() - start;
 }
 static bool script_finished(struct web_js_state *s, struct js_script *script) {
     if (!script->executed) return false;
@@ -4031,13 +4336,14 @@ void web_js_selection_changed(web_doc *d, node_t *n) {
 }
 static void run_script(struct web_js_state *s, struct js_script *script) {
     if (script->executed || !script->ready) return;
+    if(s->doc->sandbox_flags&SB_SCRIPTS){script->executed=true;return;}
     script->executed = true;
     if (s->disabled || script->failed || !script->source) { if (!s->disabled) { script_event(s, script->node, true); script->notified = true; } return; }
     begin_named_task(s,script->module?"module script":"classic script",script->request);
     node_t *old_current = s->current_script; bool old_write = s->parser_write;
     s->current_script = script->module ? NULL : script->node;
     s->parser_write = !script->module && s->blocker == script && !s->parsing_done;
-    uint64_t source_start = uptime_ms(), compiled_at = source_start;
+    uint64_t source_start = s->host.debug_js?uptime_ms():0, compiled_at = source_start;
     JSValue result;bool compilation_failed=false;
     if (script->module) {
         struct js_module *m = cache_module(s, script->url, script->source, script->len, script->base);
@@ -4046,22 +4352,25 @@ static void run_script(struct web_js_state *s, struct js_script *script) {
         s->module_entry_url = NULL;
     } else {
         result = compile_source(s, script->source, script->len, script->url, JS_EVAL_TYPE_GLOBAL);
-        compiled_at = uptime_ms();
+        compiled_at = s->host.debug_js?uptime_ms():0;
         compilation_failed=JS_IsException(result);
         if (!JS_IsException(result)) result = JS_EvalFunction(s->ctx, result);
     }
-    if (s->timed_out || uptime_ms() - source_start >= 250) {
+    if (s->host.debug_js&&(s->timed_out || uptime_ms() - source_start >= 250)) {
         char message[192];
         snprintf(message, sizeof message, "Script task profile: %lu bytes, compile %lu ms, execute %lu ms, layout %lu ms in %u reads%s",
                  (unsigned long)script->len, (unsigned long)(compiled_at - source_start),
                  (unsigned long)(uptime_ms() - compiled_at), (unsigned long)s->task_layout_ms, s->task_layout_flushes,compilation_failed?", compilation failed":"");
         log_text(s, 0, message);
     }
-    s->current_script = old_current; s->parser_write = old_write;
     if (JS_IsException(result)) { exception(s); script->failed = true; }
     else if (script->module && JS_IsObject(result)) script->evaluation = result;
     else JS_FreeValue(s->ctx, result);
     end_task(s);
+    /* HTML's classic-script cleanup performs the stack-empty microtask
+       checkpoint before execute-the-script restores currentScript. Promise
+       continuations registered by this script must still see its element. */
+    s->current_script = old_current; s->parser_write = old_write;
     /* Inline classic scripts have no resource load event. */
     if (!script->module && node_attr(script->node, "src")) { script_event(s, script->node, script->failed); script->notified = true; }
     js_free(s->ctx, script->source); script->source = NULL;
@@ -4415,7 +4724,7 @@ static bool run_timer(struct web_js_state *s, uint64_t now) {
     /* The callback/microtask checkpoint may grow the table, clear its interval
        or reuse a one-shot slot. Only local JSValue roots survive that boundary. */
     timer = NULL;
-    uint64_t start = uptime_ms();
+    uint64_t start = s->host.debug_js?uptime_ms():0;
     struct web_profile before = s->doc->profile;
     uint64_t initial_dom_rev = s->doc ? s->doc->dom_revision : 0;
     begin_named_task(s,kind==2?"animation frame":kind==1?"interval":"timeout",timer_id);
@@ -4436,18 +4745,18 @@ static bool run_timer(struct web_js_state *s, uint64_t now) {
             if(JS_IsException(arg)){prepared=false;break;}args[count++]=arg;
         }
     }
-    uint64_t js_start = uptime_ms();
+    uint64_t js_start = s->host.debug_js?uptime_ms():0;
     JSValue global=JS_UNDEFINED,result=JS_EXCEPTION;
     if(prepared&&task_context_active(s)){global=JS_GetGlobalObject(s->ctx);result=JS_Call(s->ctx,fn,global,count,args);}
     else if(prepared)result=JS_UNDEFINED;
-    uint64_t js_ms = uptime_ms() - js_start;
+    uint64_t js_ms = s->host.debug_js?uptime_ms() - js_start:0;
     if (JS_IsException(result)) exception(s); else JS_FreeValue(s->ctx, result);
     for (int i = 0; i < count; i++) JS_FreeValue(s->ctx, args[i]);
     if(heap_args)js_free(s->ctx,args);
     JS_FreeValue(s->ctx, global); JS_FreeValue(s->ctx, fn); JS_FreeValue(s->ctx, args_array);
     end_task(s);
-    uint64_t elapsed = uptime_ms() - start;
-    if (elapsed >= 250 || s->task_timed_out) {
+    uint64_t elapsed = s->host.debug_js?uptime_ms() - start:0;
+    if (s->host.debug_js&&(elapsed >= 250 || s->task_timed_out)) {
         char message[768];
         uint64_t layout_ms = s->task_layout_ms >= initial_layout_ms ? s->task_layout_ms - initial_layout_ms : s->task_layout_ms;
         unsigned flushes = s->task_layout_flushes >= initial_flushes ? s->task_layout_flushes - initial_flushes : s->task_layout_flushes;
@@ -4480,14 +4789,14 @@ static bool run_posted_task(struct web_js_state *s) {
     s->posted = p->next; if (!s->posted) s->last_posted = NULL;
     s->posted_count--;
     JSValue fn = p->fn; js_free(s->ctx, p);
-    uint64_t start = uptime_ms();
+    uint64_t start = s->host.debug_js?uptime_ms():0;
     struct web_profile before = s->doc->profile;
     begin_named_task(s,"posted callback",0);
     JSValue result = JS_Call(s->ctx, fn, JS_UNDEFINED, 0, NULL);
     if (JS_IsException(result)) exception(s); else JS_FreeValue(s->ctx, result);
     JS_FreeValue(s->ctx, fn); end_task(s);
-    uint64_t elapsed = uptime_ms() - start;
-    if (elapsed >= 250 || s->task_timed_out) {
+    uint64_t elapsed = s->host.debug_js?uptime_ms() - start:0;
+    if (s->host.debug_js&&(elapsed >= 250 || s->task_timed_out)) {
         char message[320];
         snprintf(message, sizeof message,
                  "Posted task profile: total %lu ms, microtasks-inclusive %lu ms, native %lu calls/%lu ms, resources %lu scans/%lu ms",
@@ -4581,6 +4890,9 @@ bool web_js_dispatch(web_doc *d, node_t *target, const struct web_event *event) 
     if(!event->synthetic && target && web_dialog_inert(d,target) &&
        (!strncmp(event->type,"key",3) || !strncmp(event->type,"mouse",5) || !strcmp(event->type,"click") || !strcmp(event->type,"dblclick"))) return false;
     if(!target && !event->synthetic && !strncmp(event->type,"key",3) && web_dialog_top(d)) target=web_dialog_top(d);
+    if(!event->synthetic && (!strcmp(event->type,"click") ||
+       (!strcmp(event->type,"keydown") && !event->ctrl && !event->alt && event->key &&
+        (!strcmp(event->key,"Enter") || !strcmp(event->key," ")))))d->sandbox_activation_until=uptime_ms()+5000;
     begin_named_task(s,"DOM event",0);
     JSValue init = event_init(s, event);
     JSValue args[] = {wrap(s, target), JS_NewString(s->ctx, event->type), init};
@@ -4813,7 +5125,7 @@ static bool run_observers(struct web_js_state *s,uint64_t now) {
     if(s->host.scroll)s->host.scroll(s->host.opaque,&s->observer_x,&s->observer_y);
     JSValue result=custom_element_hook(s,"observerFrame",0,NULL);
     if(JS_IsException(result))exception(s);else JS_FreeValue(s->ctx,result);
-    end_task(s);s->observer_due=uptime_ms()+16;
+    end_task(s);s->observer_due=uptime_ms()+16;s->observer_turn=false;
     return true;
 }
 static bool run_document_event(struct web_js_state *s) {
@@ -4955,7 +5267,9 @@ void web_js_tick(web_doc *d, uint64_t now) {
         node_t *created_before = d->owned_nodes;
         for (int step = 0; step < 32 && !s->blocker; step++) {
             node_t *node = NULL; int result = html_resume(d->parser, &node);
-            d->dirty = true; d->resources_dirty = true;
+            /* Script/EOF boundaries can import a byte-identical forest. Only
+               real parser changes publish resources; errors stay conservative. */
+            if (result < 0 || html_import_changed(d->parser)) d->dirty = d->resources_dirty = true;
             if(result==2){s->document_waiting=true;break;} /* document.open stream awaits another write or close */
             if (result <= 0) {
                 if (result < 0) log_text(s, 2, "HTML parsing stopped at the document's memory limit");
@@ -5014,10 +5328,14 @@ void web_js_tick(web_doc *d, uint64_t now) {
         else if (ready_script(s, &script)) { run_script(s, script); ran = true; }
         else if (run_document_event(s)) ran = true;
         else if (run_details_toggle(s)) ran = true;
+        /* A continuously dirty rendering observer cannot preempt every ready
+           timer/rAF/posted task. Give another task source the next turn,
+           retaining observer delivery when no ordinary task is runnable. */
+        else if (s->observer_turn && run_observers(s, now)) ran = true;
+        else if (s->posted_turn && run_posted_task(s)) { s->posted_turn = false; s->observer_turn = true; ran = true; }
+        else if (run_timer(s, now)) { s->posted_turn = true; s->observer_turn = true; ran = true; }
+        else if (run_posted_task(s)) { s->posted_turn = false; s->observer_turn = true; ran = true; }
         else if (run_observers(s, now)) ran = true;
-        else if (s->posted_turn && run_posted_task(s)) { s->posted_turn = false; ran = true; }
-        else if (run_timer(s, now)) { s->posted_turn = true; ran = true; }
-        else if (run_posted_task(s)) { s->posted_turn = false; ran = true; }
         else if (JS_IsJobPending(s->rt)||s->rejections||s->rejection_oom) { begin_task(s); end_task(s); ran = true; }
         else if (web_worker_runnable(s->workers)) {
             begin_named_task(s,"Worker message",0); ran = web_worker_run_one(s->workers);
@@ -5142,6 +5460,7 @@ static JSValue load_browser_bindings(JSContext *ctx) {
 void web_js_start(web_doc *d, const struct web_host *host) {
     struct web_js_state *s = calloc(1, sizeof *s); if (!s) return;
     d->js = s; s->doc = d; if (host) s->host = *host;
+    d->profile_enabled=s->host.debug_js;
     s->runtime_owner=d->frame_parent && d->frame_parent->js?d->frame_parent->js->runtime_owner:s;
     uint32_t budget = s->host.js_task_budget_ms;
     s->task_budget_ms = budget ? budget : WEB_JS_TASK_DEFAULT_MS;
@@ -5158,6 +5477,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     if (seeded && navigation->response_end_valid && navigation->response_end_ms >= s->now && navigation->response_end_ms <= initialized)
         timing_record(s, JS_RESPONSE_END, navigation->response_end_ms);
     timing_record(s, JS_DOM_LOADING, initialized);
+    s->observer_turn = true;
     s->hooks = s->dispatch = s->response = s->reject = JS_UNDEFINED;
     for (int i = 0; i < NP_COUNT; i++) s->node_protos[i] = JS_UNDEFINED;
     /* Grow on demand through the real OS allocator. An invented page quota
@@ -5180,15 +5500,22 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     JSValue api = JS_NewObject(s->ctx);
     static const JSCFunctionListEntry functions[] = {
         JS_CFUNC_DEF("dom", 2, native_dom), JS_CFUNC_DEF("log", 1, native_log),
+        JS_CFUNC_DEF("domHooks",2,native_dom_hooks),
+        JS_CFUNC_DEF("sandboxFlags",1,native_sandbox_flags),
+        JS_CFUNC_DEF("svgGeometry",2,native_svg_geometry),
+        JS_CFUNC_DEF("mutationObserve",4,native_mutation_control),
+        JS_CFUNC_DEF("mutationTake",0,native_mutation_take),
         JS_CFUNC_DEF("frame", 3, native_frame),JS_CFUNC_DEF("documentStream",1,native_document_stream),
         JS_CFUNC_DEF("now", 0, native_now), JS_CFUNC_DEF("timing", 1, native_timing), JS_CFUNC_DEF("url", 0, native_url), JS_CFUNC_DEF("origin", 0, native_origin),
         JS_CFUNC_DEF("screen", 0, native_screen),
         JS_CFUNC_DEF("windowState",0,native_window_state),
+        JS_CFUNC_DEF("cookieEnabled",0,native_cookie_enabled),
         JS_CFUNC_DEF("pack", 1, native_pack), JS_CFUNC_DEF("unpack", 1, native_unpack),
         JS_CFUNC_DEF("classID", 1, native_class_id), JS_CFUNC_DEF("detach", 1, native_detach),
         JS_CFUNC_DEF("history", 4, native_history),JS_CFUNC_DEF("historyCreate",1,native_history_create),JS_CFUNC_DEF("historyCall",3,native_history_call), JS_CFUNC_DEF("cookie", 1, native_cookie), JS_CFUNC_DEF("scroll", 2, native_scroll),
         JS_CFUNC_DEF("media", 1, native_media),
         JS_CFUNC_DEF("canvas", 2, native_canvas),
+        JS_CFUNC_DEF("imageBitmap", 5, native_image_bitmap),
         JS_CFUNC_DEF("avmedia", 4, native_avmedia),
         JS_CFUNC_DEF("observers", 1, native_observers),
         JS_CFUNC_DEF("pointerCapturePending", 1, native_pointer_capture_pending),
@@ -5206,10 +5533,17 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("cancel", 1, native_cancel)
     };
     JS_SetPropertyFunctionList(s->ctx, api, functions, sizeof functions / sizeof *functions);
+    JSValue operations=JS_NewObject(s->ctx);
+    for(int opcode=0;opcode<DOM_OPCODE_COUNT;opcode++)
+        JS_SetPropertyStr(s->ctx,operations,dom_opcode_names[opcode],
+            JS_NewCFunctionMagic(s->ctx,native_dom_magic,dom_opcode_names[opcode],1,JS_CFUNC_generic_magic,opcode));
+    JS_SetPropertyStr(s->ctx,api,"domOperations",operations);
     JS_SetPropertyStr(s->ctx,api,"noCorsFetch",JS_TRUE);
+    web_js_navigator_init(s->ctx,api);
     web_js_crypto_init(s->ctx, api);
     web_js_encoding_init(s->ctx, api);
     web_js_collator_init(s->ctx, api);
+    JS_SetPropertyStr(s->ctx, api, "debugCanvasProbe", JS_NewBool(s->ctx,s->host.debug_js));
     JS_SetPropertyStr(s->ctx, api, "document", wrap(s, d->root));
     JSValue global = JS_GetGlobalObject(s->ctx);
     JS_SetPropertyStr(s->ctx, global, "__nocturne_host", api); JS_FreeValue(s->ctx, global);
@@ -5242,6 +5576,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     node_cache_release(s);
     if (prototype_failed) { exception(s); end_task(s); goto failed; }
     end_task(s); s->starting = false;
+    if(d->sandbox_flags&SB_SCRIPTS)s->disabled=true;
     char limits[192];
     snprintf(limits,sizeof limits,"JavaScript runtime: OS-allocated heap (no page quota), dynamically allocated timers; stack guard %u KiB, task budget %u ms",
              JS_STACK_LIMIT/1024u,s->task_budget_ms);
@@ -5255,6 +5590,7 @@ void web_js_free(web_doc *d) {
     struct web_js_state *s = d ? d->js : NULL; if (!s) return;
     d->js = NULL;
     if (s->ctx) {
+        mutation_free(s);
         history_forget(s);
         broadcast_free(s);
         while(s->frame_proxies){struct js_frame_proxy *p=s->frame_proxies;s->frame_proxies=p->next;JS_FreeValue(s->ctx,p->proxy);js_free(s->ctx,p);}
@@ -5274,6 +5610,7 @@ void web_js_free(web_doc *d) {
         node_cache_free(s);
         JS_FreeValue(s->ctx, s->hooks); JS_FreeValue(s->ctx, s->dispatch); JS_FreeValue(s->ctx, s->response); JS_FreeValue(s->ctx, s->reject);
         for (int i = 0; i < NP_COUNT; i++) JS_FreeValue(s->ctx, s->node_protos[i]);
+        JS_SetContextOpaque(s->ctx,NULL); /* queued host jobs must reject retired realms */
         JS_FreeContext(s->ctx);
     }
     if (s->rt && s->runtime_owner==s) JS_FreeRuntime(s->rt);

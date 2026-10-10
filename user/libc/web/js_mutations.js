@@ -4,13 +4,24 @@
  * Incremental HTML parser/document.write mutations still need native emission;
  * they do not pass through the script-facing DOM operation boundary. */
 const mutationBridge = (() => {
+    const native=typeof host.mutationObserve==='function';
     const registrations=new WeakMap(), observers=new WeakMap(), records=new WeakMap();
     const pending=new Set(),signalSlots=new Set();let scheduled=false,active=0;
-    const get=(n,k)=>rawDom('get',n,k), parent=n=>get(n,'parentNode'), children=n=>get(n,'childNodes');
+    const get=(n,k)=>rawDom.get(n,k), parent=n=>get(n,'parentNode'), children=n=>get(n,'childNodes');
     const attr=(n,k)=>reflectedAttr(n,k);
     function data(o){const d=observers.get(o);if(!d)throw new TypeError('Illegal MutationObserver receiver');return d;}
+    function drain(){
+        if(!native)return;
+        for(const row of host.mutationTake()){
+            const d=observers.get(row.observer);if(!d || !d.active)continue;
+            const fields=row.fields,record=Object.create(MutationRecord.prototype);
+            records.set(record,{...fields,addedNodes:list(fields.addedNodes),removedNodes:list(fields.removedNodes)});
+            d.queue.push(record);pending.add(row.observer);
+        }
+    }
     function ancestorRegistrations(n){const a=[];for(;n;n=parent(n)){const r=registrations.get(n);if(r)a.push(...r);}return a;}
     function notify(){
+        drain();
         scheduled=false;const deliver=Array.from(pending),slots=Array.from(signalSlots);pending.clear();signalSlots.clear();
         for(const o of deliver){const d=data(o),q=d.queue;d.queue=[];
             for(const r of Array.from(d.regs))if(r.source){registrations.get(r.node).delete(r);d.regs.delete(r);}
@@ -75,7 +86,7 @@ const mutationBridge = (() => {
     function after(t){
         if(!t)return;
         if(t.op==='attributes'){
-            const now=rawDom('attrNS',t.node,t.namespace,t.name);
+            const now=rawDom.attrNS(t.node,t.namespace,t.name);
             if((now!==null || t.oldValue!==null) && (!t.style || now!==t.oldValue))enqueue('attributes',t.node,{attributeName:t.name,attributeNamespace:t.namespace,oldValue:t.oldValue});
         }else if(t.op==='characterData')enqueue('characterData',t.node,{oldValue:t.oldValue});
         else if(t.op==='children'){
@@ -116,16 +127,19 @@ const mutationBridge = (() => {
             if(r){for(const t of Array.from(d.regs))if(t.source===r){registrations.get(t.node).delete(t);d.regs.delete(t);}r.options=o;}
             else{r={node:target,observer:this,options:o};set.add(r);d.regs.add(r);}
             if(!d.active){d.active=true;active++;}
+            if(native)host.mutationObserve(this,target,
+                (o.childList?1:0)|(o.attributes?2:0)|(o.characterData?4:0)|(o.subtree?8:0)|
+                (o.attributeOldValue?16:0)|(o.characterDataOldValue?32:0)|(o.attributeFilter?64:0),o.attributeFilter||[]);
         }
-        disconnect(){const d=data(this);for(const r of d.regs)registrations.get(r.node).delete(r);d.regs.clear();d.queue=[];if(d.active){active--;d.active=false;}}
-        takeRecords(){const d=data(this),q=d.queue;d.queue=[];return q;}
+        disconnect(){const d=data(this);drain();if(native)host.mutationObserve(this,null);for(const r of d.regs)registrations.get(r.node).delete(r);d.regs.clear();d.queue=[];if(d.active){active--;d.active=false;}}
+        takeRecords(){const d=data(this);drain();const q=d.queue;d.queue=[];return q;}
     }
     class MutationRecord {constructor(){throw new TypeError('Illegal MutationRecord constructor');}}
     for(const k of ['type','target','addedNodes','removedNodes','previousSibling','nextSibling','attributeName','attributeNamespace','oldValue'])Object.defineProperty(MutationRecord.prototype,k,{enumerable:true,configurable:true,get(){const r=records.get(this);if(!r)throw new TypeError('Illegal MutationRecord receiver');return r[k];}});
     for(const C of [MutationObserver,MutationRecord])Object.defineProperty(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
     function collectSlots(){
-        for(const slot of rawDom('slotChanges',null))signalSlots.add(slot);
+        for(const slot of rawDom.slotChanges(null))signalSlots.add(slot);
         if(signalSlots.size && !scheduled){scheduled=true;queueMicrotask(notify);}
     }
-    Object.assign(globalThis,{MutationObserver,MutationRecord});return {before,after,signalSlots:collectSlots};
+    Object.assign(globalThis,{MutationObserver,MutationRecord});return {native,flush:notify,before,after,signalSlots:collectSlots};
 })();

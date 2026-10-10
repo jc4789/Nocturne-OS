@@ -12,6 +12,7 @@
 #define PTE_PAT4K  (1ULL << 7)
 #define PTE_G      (1ULL << 8)
 #define PTE_SHARED (1ULL << 9) /* not owned by this address space: don't free */
+#define PTE_SHARED_RO (1ULL << 10) /* read-only shared ABI page: never grant W/X */
 #define PTE_PAT2M  (1ULL << 12)
 #define PTE_ADDR   0x000FFFFFFFFFF000ULL
 #define PTE_NX     (1ULL << 63)

@@ -6,6 +6,7 @@
 #include "form_validation.h"
 #include "form_direction.h"
 #include "form_file.h"
+#include "frame.h"
 
 #define DAY_MS 86400000.0
 #define WEEK_MS 604800000.0
@@ -1116,7 +1117,7 @@ static const char *submit_attribute(node_t *form, node_t *submitter, const char 
 bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request *request) {
     if (!request) return false;
     memset(request, 0, sizeof *request);
-    if (!d || !submitter || submitter->owner != d || submitter->type != N_ELEM || submitter->foreign) return false;
+    if (!d || !submitter || submitter->owner != d || submitter->type != N_ELEM || submitter->foreign || !web_sandbox_forms_allowed(d)) return false;
     node_t *form = html_tag(submitter, T_form) ? submitter : web_form_owner(d, submitter);
     if (!html_tag(form, T_form)) return false;
     const char *action = submit_attribute(form, submitter, "formaction", "action");

@@ -1,8 +1,9 @@
 /* Nocturne browser storage. This uses the existing native file API; no new
  * filesystem/ABI/POSIX requirement. Alternate checksum-validated snapshots
  * write only the inactive slot and keep the previous confirmed slot intact.
- * Full write, close and readback establish publication; no copy-and-unlink
- * rename is used. fsync/power-loss durability and cross-process
+ * A complete write and successful close publish the inactive snapshot; checksum
+ * validation happens once when opening a store, not after every write. No
+ * copy-and-unlink rename is used. fsync/power-loss durability and cross-process
  * cache coherence are not provided by this backend. */
 #include <webstorage.h>
 #include <nocturne.h>
@@ -35,7 +36,9 @@ struct storage_area {
     unsigned count;
     int kind, slot;
     uint64_t generation;
-    bool unavailable; /* uncertain publication: never silently serve stale RAM */
+    bool unavailable; /* inactive snapshot invalidation failed; retry, RAM wins */
+    bool dirty;
+    uint64_t dirty_since, changed_at, retry_at;
 };
 struct webstorage { struct storage_area *areas; unsigned count; size_t units; };
 
@@ -79,6 +82,8 @@ static void storage_area_free(struct storage_area *a) {
 webstorage *webstorage_create(void) { return calloc(1, sizeof(webstorage)); }
 void webstorage_free(webstorage *s) {
     if (!s) return;
+    struct web_storage_result result;
+    webstorage_flush(s, true, &result);
     while (s->areas) { struct storage_area *a = s->areas; s->areas = a->next; storage_area_free(a); }
     free(s);
 }
@@ -165,20 +170,13 @@ static bool storage_dirs(void) {
     char *slash=strrchr(parent,'/'); if (!slash || slash==parent) return false; *slash=0;
     return storage_directory(parent) && storage_directory(WEBSTORAGE_ROOT);
 }
-static bool storage_same_entries(struct storage_area *a, struct storage_area *b) {
-    if (a->count!=b->count) return false;
-    struct storage_entry *e=a->entries, *f=b->entries;
-    for (;e && f;e=e->next,f=f->next)
-        if (e->kn!=f->kn || e->vn!=f->vn || memcmp(e->key,f->key,e->kn) || memcmp(e->value,f->value,e->vn)) return false;
-    return !e && !f;
-}
 static int storage_save(struct storage_area *a, struct web_storage_result *out) {
     if (a->generation==UINT64_MAX || !storage_dirs()) return WEB_STORAGE_IO;
     size_t on=strlen(a->origin), n=56+on;
     for (struct storage_entry *e=a->entries;e;e=e->next) n+=8+e->kn+e->vn;
     if (n>STORAGE_FILE_MAX) return WEB_STORAGE_QUOTA;
     uint8_t *bytes=malloc(n); if (!bytes) return WEB_STORAGE_QUOTA;
-    out->snapshot_bytes=n;
+    out->snapshot_bytes+=n;
     memcpy(bytes,"NWEBST1",8); storage_put64(bytes+40,a->generation+1);
     storage_put32(bytes+48,(uint32_t)on); storage_put32(bytes+52,a->count); memcpy(bytes+56,a->origin,on);
     size_t at=56+on;
@@ -200,29 +198,44 @@ static int storage_save(struct storage_area *a, struct web_storage_result *out) 
         }
         int closed=close(fd);
         if (done==n && closed==0) {
-            /* Never overwrite the last confirmed slot. A full native write
-             * and successful close still need checksum/generation/map readback
-             * before the caller's RAM map can adopt this candidate. */
-            struct storage_area *check=NULL;
-            if (storage_read(a->origin,slot,&check)==1 && check->generation==a->generation+1 && storage_same_entries(a,check)) {
-                result=WEB_STORAGE_OK; a->generation++; a->slot=slot;
-            }
-            storage_area_free(check);
+            /* The native API reports short writes and close failure. Reopening
+             * and rehashing this exact snapshot adds synchronous storvsc I/O,
+             * but not durability. Keep the other completed slot for recovery. */
+            result=WEB_STORAGE_OK; a->generation++; a->slot=slot;
         }
     }
     if (result!=WEB_STORAGE_OK) {
         /* Even a failed open may have truncated the candidate before failing
          * to allocate a file handle. Remove only this inactive slot on every
-         * unsuccessful write/close/readback. Uncertain invalidation makes the
+         * unsuccessful write/close. Uncertain invalidation makes the
          * area unavailable; never report success or silently serve stale RAM. */
         if (unlink(path)<0 && errno!=ENOENT) a->unavailable=true;
     }
     free(bytes); return result;
 }
+bool webstorage_pending(webstorage *s) {
+    for (struct storage_area *a=s?s->areas:NULL;a;a=a->next) if(a->dirty)return true;
+    return false;
+}
+int webstorage_flush(webstorage *s, bool force, struct web_storage_result *out) {
+    struct web_storage_result ignored;
+    if(!out)out=&ignored;
+    memset(out,0,sizeof *out);
+    if(!s)return WEB_STORAGE_IO;
+    uint64_t now=uptime_ms(); int status=WEB_STORAGE_OK;
+    for(struct storage_area *a=s->areas;a;a=a->next) {
+        if(!a->dirty || (!force && (now<a->retry_at || (now-a->changed_at<100 && now-a->dirty_since<1000))))continue;
+        out->save_attempts++;
+        uint64_t start=uptime_ms();
+        int result=storage_save(a,out);out->save_ms+=uptime_ms()-start;
+        if(result==WEB_STORAGE_OK){a->dirty=false;a->unavailable=false;a->retry_at=0;}
+        else {status=result;a->retry_at=now+1000;}
+    }
+    return status;
+}
 static int storage_get_area(webstorage *s, const char *origin, int kind, struct storage_area **out) {
     for (struct storage_area *a=s->areas;a;a=a->next)
         if (a->kind==kind && !strcmp(a->origin,origin)) {
-            if (a->unavailable) return WEB_STORAGE_IO;
             *out=a; return WEB_STORAGE_OK;
         }
     if (s->count>=STORAGE_MAX_ORIGINS) return WEB_STORAGE_QUOTA;
@@ -240,20 +253,6 @@ static int storage_get_area(webstorage *s, const char *origin, int kind, struct 
     }
     if (a->units>STORAGE_WINDOW_BYTES/2-s->units) { storage_area_free(a); return WEB_STORAGE_QUOTA; }
     a->next=s->areas; s->areas=a; s->count++; s->units+=a->units; *out=a; return WEB_STORAGE_OK;
-}
-static struct storage_area *storage_clone(struct storage_area *a) {
-    struct storage_area *b=calloc(1,sizeof *b); if (!b) return NULL;
-    b->origin=storage_copy(a->origin,strlen(a->origin)); b->kind=a->kind; b->generation=a->generation; b->slot=a->slot;
-    if (!b->origin) { storage_area_free(b); return NULL; }
-    struct storage_entry **tail=&b->entries;
-    for (struct storage_entry *e=a->entries;e;e=e->next) {
-        struct storage_entry *f=calloc(1,sizeof *f); if (!f) { storage_area_free(b); return NULL; }
-        f->kn=e->kn; f->vn=e->vn; f->units=e->units;
-        f->key=storage_copy(e->key,e->kn); f->value=storage_copy(e->value,e->vn);
-        if (!f->key || !f->value) { storage_entries_free(f); storage_area_free(b); return NULL; }
-        *tail=f; tail=&f->next; b->count++; b->units+=f->units;
-    }
-    return b;
 }
 int webstorage_access(webstorage *s, const char *origin, const struct web_storage_request *r, struct web_storage_result *out) {
     if (!out) return WEB_STORAGE_IO;
@@ -284,32 +283,22 @@ int webstorage_access(webstorage *s, const char *origin, const struct web_storag
     size_t newunits=r->operation==WEB_STORAGE_CLEAR?0:a->units-(e?e->units:0)+(r->operation==WEB_STORAGE_SET?ku+vu:0);
     if (newunits>WEB_STORAGE_QUOTA_BYTES/2 || newunits>STORAGE_WINDOW_BYTES/2-(s->units-a->units) ||
         (r->operation==WEB_STORAGE_SET && !e && a->count>=STORAGE_MAX_KEYS)) return WEB_STORAGE_QUOTA;
-    struct storage_area *b=storage_clone(a); if (!b) return WEB_STORAGE_QUOTA;
-    struct storage_entry **link=&b->entries;
+    struct storage_entry **link=&a->entries;
     while (*link && !((*link)->kn==r->key_len && (!r->key_len || !memcmp((*link)->key,r->key,r->key_len)))) link=&(*link)->next;
-    if (r->operation==WEB_STORAGE_CLEAR) { storage_entries_free(b->entries); b->entries=NULL; b->count=0; }
-    else if (r->operation==WEB_STORAGE_REMOVE) { struct storage_entry *old=*link; *link=old->next; old->next=NULL; storage_entries_free(old); b->count--; }
+    if (r->operation==WEB_STORAGE_CLEAR) { storage_entries_free(a->entries); a->entries=NULL; a->count=0; }
+    else if (r->operation==WEB_STORAGE_REMOVE) { struct storage_entry *old=*link; *link=old->next; old->next=NULL; storage_entries_free(old); a->count--; }
     else {
         char *value=storage_copy(r->value,r->value_len);
-        if (!value) { storage_area_free(b); return WEB_STORAGE_QUOTA; }
+        if (!value) return WEB_STORAGE_QUOTA;
         if (!*link) {
             struct storage_entry *f=calloc(1,sizeof *f);
-            if (!f || !(f->key=storage_copy(r->key,r->key_len))) { free(f); free(value); storage_area_free(b); return WEB_STORAGE_QUOTA; }
-            f->kn=r->key_len; *link=f; b->count++;
+            if (!f || !(f->key=storage_copy(r->key,r->key_len))) { free(f); free(value); return WEB_STORAGE_QUOTA; }
+            f->kn=r->key_len; *link=f; a->count++;
         }
         free((*link)->value); (*link)->value=value; (*link)->vn=r->value_len; (*link)->units=ku+vu;
     }
-    b->units=newunits;
-    if (b->kind==WEB_STORAGE_LOCAL) {
-        uint64_t start=uptime_ms();out->save_attempts=1;
-        result=storage_save(b,out);out->save_ms=uptime_ms()-start;
-        if (result!=WEB_STORAGE_OK) {
-            if (b->unavailable) a->unavailable=true;
-            storage_area_free(b); return result;
-        }
-    }
-    s->units=s->units-a->units+b->units;
-    storage_entries_free(a->entries); a->entries=b->entries; b->entries=NULL;
-    a->count=b->count; a->units=b->units; a->generation=b->generation; a->slot=b->slot;
-    storage_area_free(b); return WEB_STORAGE_OK;
+    s->units=s->units-a->units+newunits;
+    a->units=newunits;
+    if(a->kind==WEB_STORAGE_LOCAL){uint64_t now=uptime_ms();if(!a->dirty)a->dirty_since=now;a->changed_at=now;a->dirty=true;}
+    return WEB_STORAGE_OK;
 }

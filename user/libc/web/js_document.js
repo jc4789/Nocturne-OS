@@ -11,7 +11,7 @@
             brand(receiver);
             const kind=apply(nodeTypeGetter,node,[]);
             if(kind===9)throw new DOMException('A Document cannot be transferred','NotSupportedError');
-            if(rawDom('get',node,'shadowHost'))throw new DOMException('A shadow root cannot be transferred directly',adopt?'HierarchyRequestError':'NotSupportedError');
+            if(rawDom.get(node,'shadowHost'))throw new DOMException('A shadow root cannot be transferred directly',adopt?'HierarchyRequestError':'NotSupportedError');
             return dom(adopt?'adopt':'import',receiver,node,!!deep);
         }
         class DOMParser {
@@ -22,7 +22,7 @@
                 input=string(input);type=string(type);
                 if(!['text/html','text/xml','application/xml','application/xhtml+xml','image/svg+xml'].includes(type))throw new TypeError('Invalid parser MIME type');
                 if(type!=='text/html')throw new DOMException('XML parsing is not implemented','NotSupportedError');
-                return rawDom('parseDocument',null,input,false);
+                return rawDom.parseDocument(null,input,false);
             }
         }
         class DOMImplementation {
@@ -31,7 +31,7 @@
                 if(!implementationBrands.has(this))throw new TypeError('Illegal DOMImplementation receiver');
                 const present=arguments.length>0;
                 if(present)title=string(title);
-                const made=rawDom('parseDocument',null,'<!doctype html><html><head></head><body></body></html>',true);
+                const made=rawDom.parseDocument(null,'<!doctype html><html><head></head><body></body></html>',true);
                 if(present){const element=made.createElement('title');element.appendChild(made.createTextNode(title));made.head.appendChild(element);}
                 return made;
             }
@@ -42,7 +42,7 @@
                 if(arguments.length<3)throw new TypeError('Three doctype arguments are required');
                 name=string(name);publicId=string(publicId);systemId=string(systemId);
                 if(/[\0\t\n\f\r >]/.test(name))throw new DOMException('Invalid doctype name','InvalidCharacterError');
-                return rawDom('doctypeCreate',owner,name,publicId,systemId);
+                return rawDom.doctypeCreate(owner,name,publicId,systemId);
             }
             hasFeature(){if(!implementationBrands.has(this))throw new TypeError('Illegal DOMImplementation receiver');return true;}
         }
@@ -63,7 +63,7 @@
             let cache=apply(weakGet,treeCollections,[owner]);
             if(!cache){cache=createObject(null);apply(weakSet,treeCollections,[owner,cache]);}
             if(!cache[key])cache[key]=collectionBridge.domHTML(owner,()=>apply(filter,dom('query',owner,query,false),[
-                node=>rawDom('get',node,'namespaceURI')==='http://www.w3.org/1999/xhtml'
+                node=>rawDom.get(node,'namespaceURI')==='http://www.w3.org/1999/xhtml'
             ]));
             return cache[key];
         }
@@ -83,7 +83,7 @@
             if(!collection){
                 const owner=this;
                 collection=collectionBridge.html(()=>apply(filter,dom('query',owner,'form',false),[
-                    node=>rawDom('get',node,'namespaceURI')==='http://www.w3.org/1999/xhtml'
+                    node=>rawDom.get(node,'namespaceURI')==='http://www.w3.org/1999/xhtml'
                 ]));
                 apply(weakSet,formCollections,[owner,collection]);
             }
@@ -92,7 +92,7 @@
         Document.prototype.getElementById=function(id){brand(this);if(!arguments.length)throw new TypeError('Missing id');return dom('id',this,string(id));};
         Document.prototype.elementFromPoint=function(x,y){
             brand(this);if(arguments.length<2)throw new TypeError('Two coordinates required');
-            return rawDom('elementFromPoint',this,x,y);
+            return rawDom.elementFromPoint(this,x,y);
         };
         Document.prototype.getElementsByName=function(name){brand(this);if(!arguments.length)throw new TypeError('Missing name');const query='[name="'+CSS.escape(string(name))+'"]';return collectionBridge.domLive(this,()=>dom('query',this,query,false));};
         function create(receiver,name,options,foreign){

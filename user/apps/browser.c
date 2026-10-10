@@ -11,6 +11,7 @@
 #include "web.h"
 #include "webnet.h"
 #include "webstorage.h"
+#include <parallel.h>
 
 #define TB 40   /* toolbar */
 #define SB 24   /* status / find bar */
@@ -151,7 +152,9 @@ static int drag_off;
 static struct gui_event *evq;
 static int evq_n, evq_capacity;
 static bool evq_failure_logged;
+static bool evq_hover_tail_valid;
 static bool scroll_event_pending;
+#include "browser_events.h"
 
 static int page_w(void) { return MAX(w->w - SCRW, 50); }
 static int console_h(void) { return console_open ? MIN(220, MAX(80, (w->h - TB - SB) / 3)) : 0; }
@@ -1030,7 +1033,7 @@ static int browser_event(struct gui_event *event, int timeout) {
     int result=win_event(w,event,timeout);
     /* Release/capture cancellation is native state, even while author JS is
        running. Never hit-test, dispatch, or lay out mutable DOM at dequeue. */
-    if(result>0)native_active_event(event);
+    if(result>0){native_active_event(event);browser_hover_boundary(&evq_hover_tail_valid,event);}
     if(result>0 && debug_js && (event->type==EV_MOUSE_MOVE ||
        event->type==EV_MOUSE_DOWN || event->type==EV_MOUSE_UP)) {
         static uint64_t sequence;
@@ -1090,6 +1093,7 @@ static bool host_script_checkpoint(void *opaque) {
             win_update(w);
             continue;
         }
+        if(browser_coalesce_hover(evq,evq_n,&e,evq_hover_tail_valid))continue;
         if(evq_n==evq_capacity) {
             int capacity=evq_capacity?(evq_capacity>INT_MAX/2?INT_MAX:evq_capacity*2):64;
             void *grown=evq_n<INT_MAX && (size_t)capacity<=SIZE_MAX/sizeof *evq?
@@ -1100,7 +1104,7 @@ static bool host_script_checkpoint(void *opaque) {
             }
             evq=grown;evq_capacity=capacity;
         }
-        evq[evq_n++]=e;
+        evq[evq_n++]=e;evq_hover_tail_valid=browser_hover_tail(&e);
         if(native_navigation_command(&e))return false;
     }
     return !quit;
@@ -1110,6 +1114,11 @@ static unsigned host_window_state(void *opaque) {
     if(state<0)return 0;
     return ((state&WIN_STATE_VISIBLE)?WEB_WINDOW_VISIBLE:0) |
            ((state&WIN_STATE_FOCUSED) && focus==F_PAGE?WEB_WINDOW_FOCUSED:0);
+}
+static bool host_cookie_enabled(void *opaque) {
+    (void)opaque;
+    /* webnet_create succeeds only with an actual session cookie jar. */
+    return network != NULL;
 }
 static char *host_cookie_get(void *opaque, const char *url) {
     (void)opaque;
@@ -1238,7 +1247,8 @@ static const struct web_host browser_host = {
     .navigation_pending=host_navigation_pending,
     .script_checkpoint=host_script_checkpoint,
     .video_present=host_video_present,
-    .cookie_get = host_cookie_get, .cookie_set = host_cookie_set
+    .cookie_get = host_cookie_get, .cookie_set = host_cookie_set,
+    .cookie_enabled = host_cookie_enabled
     , .navigate_mode = host_navigate_mode
     , .storage = host_storage
     , .media_range = true
@@ -1314,6 +1324,7 @@ static void finish_navigation(void) {
     if (!hlen) hlen = strlen(html);
     const char *final_url = web_response_url(f)[0] ? web_response_url(f) : navigation_url;
     struct web_host document_host = browser_host;
+    document_host.debug_js = debug_js;
     document_host.navigation_timing = navigation_timing;
     document_host.js_task_budget_ms = js_task_budget_ms;
     web_doc *nd = web_live(html, hlen, final_url, charset, &document_host);
@@ -1329,7 +1340,7 @@ static void finish_navigation(void) {
     if (doc) web_free(doc);
     doc = nd;
     generation = navigation_generation;
-    evq_n = 0;
+    evq_n = 0;evq_hover_tail_valid=false;
     url_pair_commit(current, address);
     if (navigation_mode == NAV_PUSH) hist_push(cur_url);
     else if (hpos >= 0) {
@@ -1371,6 +1382,11 @@ static void finish_navigation(void) {
 }
 
 static void navigate_inner(const char *url, const void *post, size_t length, const char *headers, int mode) {
+    if (storage && webstorage_pending(storage)) {
+        struct web_storage_result result;
+        if (webstorage_flush(storage, true, &result) != WEB_STORAGE_OK)
+            console_add("error", "Local storage flush failed; changes remain in RAM.");
+    }
     if (hpos >= 0 && mode != NAV_HISTORY) history_scroll_save();
     sel_node = NULL; hover[0] = 0; refresh_at = 0;
     if (focus == F_ADDR) focus = F_PAGE;
@@ -1531,6 +1547,7 @@ static void apply_pending_history(void) {
 }
 
 static void submit(web_node *n) {
+    if (!web_sandbox_form_submission_allowed(doc, n)) return;
     web_node *form = web_form_owner(doc, n);
     if(!form || !web_form_submission_validate(doc,n)) {flush_dom_layout();return;}
     struct web_event event = {.type = "submit", .bubbles = true, .cancelable = true};
@@ -2287,7 +2304,11 @@ static void handle_native_wait(const struct gui_event *e) {
         uint32_t k = e->key;
         if (k >= 'A' && k <= 'Z') k += 32;
         if (e->key == NKEY_ESC) { sync_stopped = true; return; }
-        if (e->key == NKEY_F12) { console_open = !console_open; prepare_native_snapshot(true); redraw(); return; }
+        if (e->key == NKEY_F12) {
+            console_open = !console_open;
+            if (console_open) focus = F_CONSOLE; else if (focus == F_CONSOLE) focus = F_PAGE;
+            prepare_native_snapshot(true); redraw(); return;
+        }
         if ((e->mods & NMOD_CTRL) && k == 'l') { addr_focus(); redraw(); return; }
         if (focus == F_ADDR) { addr_key(e); redraw(); return; }
         if (e->key == NKEY_F5 || ((e->mods & NMOD_CTRL) && k == 'r')) {
@@ -2304,7 +2325,7 @@ static void handle_native_wait(const struct gui_event *e) {
     if (e->type == EV_MOUSE_MOVE && drag_sb) { scrollbar_drag(e->y); redraw(); return; }
     if (e->type == EV_MOUSE_UP && drag_sb) { drag_sb = false; redraw(); return; }
     if (try_scroll_event(e)) moved = true;
-    else {
+    else if (!browser_coalesce_hover(evq,evq_n,e,evq_hover_tail_valid)) {
         if (evq_n == evq_capacity) {
             int capacity = evq_capacity ? (evq_capacity > INT_MAX / 2 ? INT_MAX : evq_capacity * 2) : 64;
             void *grown = evq_n < INT_MAX && (size_t)capacity <= SIZE_MAX / sizeof *evq ?
@@ -2312,7 +2333,7 @@ static void handle_native_wait(const struct gui_event *e) {
             if (grown) { evq = grown; evq_capacity = capacity; }
             else if (!evq_failure_logged) { console_add("error", "Deferred native event storage allocation failed"); evq_failure_logged = true; }
         }
-        if (evq_n < evq_capacity) evq[evq_n++] = *e;
+        if (evq_n < evq_capacity) {evq[evq_n++] = *e;evq_hover_tail_valid=browser_hover_tail(e);}
     }
     if (moved) redraw();
 }
@@ -2367,16 +2388,29 @@ static void report_loop_profile(uint64_t now) {
     if (now - loop_profile.since < 2000) return;
     char message[512];
     snprintf(message, sizeof message,
-             "Browser loop profile: wall %lu ms, ticks %u/%lu ms/max %lu, host layout %u/%lu ms, draw %u/%lu ms, update %lu ms, net %lu ms, wait %lu ms (inclusive)",
+             "Browser loop profile: wall %lu ms, ticks %u/%lu ms/max %lu, host layout %u/%lu ms, draw %u/%lu ms, update %lu ms, net %lu ms, wait %lu ms, parallel jobs %lu (inclusive)",
              (unsigned long)(now-loop_profile.since), loop_profile.ticks,
              (unsigned long)loop_profile.tick_ms, (unsigned long)loop_profile.tick_max_ms,
              loop_profile.layouts, (unsigned long)loop_profile.layout_ms,
              loop_profile.draws, (unsigned long)loop_profile.draw_ms,
              (unsigned long)loop_profile.update_ms, (unsigned long)loop_profile.net_ms,
-             (unsigned long)loop_profile.wait_ms);
+             (unsigned long)loop_profile.wait_ms, (unsigned long)parallel_jobs());
     memset(&loop_profile, 0, sizeof loop_profile);
     loop_profile.since = now;
     host_console(NULL, 0, message);
+    static uint64_t reported_batches[PARALLEL_STAGE_COUNT];
+    for (int stage = 1; stage < PARALLEL_STAGE_COUNT; stage++) {
+        struct parallel_stats s;
+        if (!parallel_get_stats((enum parallel_stage)stage, &s) || s.batches == reported_batches[stage]) continue;
+        reported_batches[stage] = s.batches;
+        snprintf(message,sizeof message,
+            "Native parallel %s: batches %lu, items %lu/AP %lu, work %lu/AP %lu, wall %lu ms, workers %lu ms/AP %lu ms (inclusive), sampled CPUs %lx/AP %lx (cumulative)",
+            parallel_stage_name((enum parallel_stage)stage),(unsigned long)s.batches,
+            (unsigned long)s.items,(unsigned long)s.helper_items,(unsigned long)s.work,(unsigned long)s.helper_work,
+            (unsigned long)s.wall_ms,(unsigned long)s.worker_ms,(unsigned long)s.helper_ms,
+            (unsigned long)s.sampled_cpu_mask,(unsigned long)s.sampled_helper_cpu_mask);
+        host_console(NULL,0,message);
+    }
 }
 
 int main(int argc, char **argv) {
@@ -2428,6 +2462,7 @@ int main(int argc, char **argv) {
     screen_size(&sw, &sh);
     web_avmedia_debug(debug_js);
     web_paint_debug(debug_js);
+    parallel_profile_enable(debug_js);
     w = win_open(MIN(1100, sw - 40), MIN(800, sh - 70), "Web",
                  WIN_RESIZABLE | (start_maximized ? WIN_START_MAXIMIZED : 0));
     if (!w) return 1;
@@ -2486,11 +2521,17 @@ int main(int argc, char **argv) {
         if (evq_n) {
             e = evq[0];
             memmove(evq, evq + 1, sizeof evq[0] * (size_t)--evq_n);
-            if (!evq_n) evq_failure_logged=false;
+            if (!evq_n) {evq_failure_logged=false;evq_hover_tail_valid=false;}
             handle(&e);
             continue;
         }
         int timeout = webnet_timeout(network, now);
+        if (webstorage_pending(storage)) {
+            struct web_storage_result result;
+            if (webstorage_flush(storage, false, &result) != WEB_STORAGE_OK)
+                console_add("error", "Local storage flush failed; retrying later.");
+            if (webstorage_pending(storage) && (timeout < 0 || timeout > 100)) timeout = 100;
+        }
         int64_t deadline = web_deadline(doc); /* retired media children also wake a document-less window */
         if (deadline >= 0) {
             int due = deadline <= (int64_t)now ? 0 : (int)MIN(deadline - (int64_t)now, 0x7fffffff);
@@ -2524,6 +2565,7 @@ int main(int argc, char **argv) {
     web_media_background(uptime_ms()); /* cancel already killed children; never block the closing GUI */
     webnet_free(network);
     webstorage_free(storage);
+    parallel_shutdown();
     free(pending_post); free(pending_content_type);
     free(current_text.p); free(navigation_text.p); free(pending_text.p); free(address_text.p); free(refresh_text.p);
     free(focus_value); free(find_text.p);

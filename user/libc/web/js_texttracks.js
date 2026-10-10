@@ -94,7 +94,7 @@ const textTrackBridge = (() => {
     }
     function clearCues(s){for(const c of s.items){cue(c).track=null;cue(c).active=false;}
         if(s.owner){s.owner.bytes-=s.bytes;s.owner.cueCount-=s.items.length;}s.bytes=0;s.items=[];s.activeItems=[];indexed(s.cues,[]);indexed(s.active,[]);}
-    function elementBrand(node){rawDom('get',node,'elementBrand');if(node.localName!=='track'||node.namespaceURI!==HTML)throw new TypeError('HTMLTrackElement receiver required');}
+    function elementBrand(node){rawDom.get(node,'elementBrand');if(node.localName!=='track'||node.namespaceURI!==HTML)throw new TypeError('HTMLTrackElement receiver required');}
     function elementTrack(node){elementBrand(node);let t=apply(mapGet,elementSlots,[node]);
         if(!t){t=new TextTrack(token,null,'subtitles','','',node);put(elementSlots,node,t);}
         const p=node.parentNode;if(p&&p.namespaceURI===HTML&&(p.localName==='video'||p.localName==='audio')){const o=owner(p);sync(o);}return t;}

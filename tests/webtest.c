@@ -27,8 +27,15 @@ static web_doc *load(const char *html) {
     return d;
 }
 
+static web_doc *load_controls(const char *html) {
+    web_doc *d=web_live(html,strlen(html),BASE,NULL,NULL);
+    if(d){web_tick(d,uptime_ms());web_layout(d,VW,VH);}
+    return d;
+}
+
 /* the y of #t must be want (to within a pixel) */
 static void y_is(const char *name, const char *html, int want) {
+    printf("WEB-STAGE %s\n",name);fflush(stdout);
     total++;
     web_doc *d = load(html);
     int y = web_anchor_y(d, "t");
@@ -256,7 +263,7 @@ static void str_is(const char *name, const char *got, const char *want) {
 }
 
 static void test_forms(void) {
-    web_doc *d = load("<body style=margin:0><a href='/x?y=1' style=display:block;height:20px>link</a>"
+    web_doc *d = load_controls("<body style=margin:0><a href='/x?y=1' style=display:block;height:20px>link</a>"
                       "<a href='sub/p#frag' style=display:block;height:20px>rel</a>");
     struct web_hit h;
     web_hit_test(d, 5, 5, &h);
@@ -265,7 +272,7 @@ static void test_forms(void) {
     str_is("link-relative", h.href, "http://h.test/dir/sub/p#frag");
     web_free(d);
 
-    d = load("<style>input,select{display:block;height:20px;margin:0;box-sizing:border-box}</style>"
+    d = load_controls("<style>input,select{display:block;height:20px;margin:0;box-sizing:border-box}</style>"
              "<body style=margin:0><form action=/s><input name=q value=hi>"
              "<input type=hidden name=h value='a b'><input type=checkbox name=c checked>"
              "<select name=s><option>one<option value=2>two</select>"
@@ -307,7 +314,7 @@ static void test_forms(void) {
     }
     web_free(d);
 
-    d = load("<body style=margin:0><form method=post action=p><input name=a value='1&2=3 4' style=display:block;height:20px></form>");
+    d = load_controls("<body style=margin:0><form method=post action=p><input name=a value='1&2=3 4' style=display:block;height:20px></form>");
     web_node *a = node_at(d, 5, 5, WEB_HIT_TEXT_INPUT, "form-post-hit");
     if (a) {
         char *url, *body;
@@ -391,6 +398,7 @@ static void test_text(void) {
 
 /* ---------------------------------------------------------------- hostile input */
 static void survives(const char *name, const char *html) {
+    printf("WEB-STAGE %s\n",name);fflush(stdout);
     total++;
     web_doc *d = load(html);
     int h = web_doc_height(d);
@@ -426,6 +434,7 @@ static void test_hostile(void) {
 
     /* a long page: layout time is logged */
     s = repeat("<p>Lorem ipsum dolor sit amet, <b>consectetur</b> adipiscing elit, <a href=x>sed do</a> eiusmod.</p>", "", 3000);
+    printf("WEB-STAGE 3000-paragraphs\n");fflush(stdout);
     uint64_t t0 = uptime_ms();
     web_doc *d = load(s);
     printf("webtest: 3000 paragraphs laid out in %d ms, height %d\n", (int)(uptime_ms() - t0), web_doc_height(d));
@@ -434,12 +443,19 @@ static void test_hostile(void) {
 }
 
 int main(void) {
+    printf("WEB-STAGE layout\n");fflush(stdout);
     test_layout();
+    printf("WEB-STAGE test_paint\n");fflush(stdout);
     test_paint();
+    printf("WEB-STAGE test_item_z_order\n");fflush(stdout);
     test_item_z_order();
+    printf("WEB-STAGE test_forms\n");fflush(stdout);
     test_forms();
+    printf("WEB-STAGE form-validation\n");fflush(stdout);
     run_native_form_validation_cases(&total,&failed);
+    printf("WEB-STAGE test_text\n");fflush(stdout);
     test_text();
+    printf("WEB-STAGE test_hostile\n");fflush(stdout);
     test_hostile();
     printf("webtest: %d checks, %d failed\n", total, failed);
     return failed != 0;

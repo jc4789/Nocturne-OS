@@ -197,6 +197,7 @@ struct rdp {
     } vc[16];
     bool fastpath_output, attached, started, active, suppress;
     uint32_t *shadow; /* the picture the client has, for spotting changed tiles */
+    uint32_t tile[TILE * TILE]; /* owned snapshot; never borrow the WM frame */
     uint8_t *dirty;   /* tiles to look at */
     int tiles_x, tiles_y;
     int pointer_shape;
@@ -745,22 +746,24 @@ static int push_updates(struct rdp *c) {
         int r = send_pointer(c, shape);
         if (r) return r;
     }
-    int pitch;
-    const uint32_t *px = wm_remote_frame(&pitch);
     for (int ty = 0; ty < c->tiles_y; ty++)
         for (int tx = 0; tx < c->tiles_x; tx++) {
             if (!c->dirty[ty * c->tiles_x + tx]) continue;
             c->dirty[ty * c->tiles_x + tx] = 0;
             int x = tx * TILE, y = ty * TILE;
             int w = MIN(TILE, c->width - x), h = MIN(TILE, c->height - y);
+            if (!wm_remote_copy(c->tile, TILE, x, y, w, h)) {
+                c->dirty[ty * c->tiles_x + tx] = 1;
+                continue; /* desktop resize; retry with the next negotiated size */
+            }
             bool same = true;
             for (int j = 0; j < h && same; j++)
-                same = !memcmp(px + (size_t)(y + j) * pitch + x, c->shadow + (size_t)(y + j) * c->width + x,
+                same = !memcmp(c->tile + (size_t)j * TILE, c->shadow + (size_t)(y + j) * c->width + x,
                                (size_t)w * 4);
             if (same) continue;
             for (int j = 0; j < h; j++)
-                memcpy(c->shadow + (size_t)(y + j) * c->width + x, px + (size_t)(y + j) * pitch + x, (size_t)w * 4);
-            int r = send_tile(c, px, pitch, x, y, w, h);
+                memcpy(c->shadow + (size_t)(y + j) * c->width + x, c->tile + (size_t)j * TILE, (size_t)w * 4);
+            int r = send_tile(c, c->shadow, c->width, x, y, w, h);
             if (r) return r;
         }
     return 0;
@@ -907,7 +910,7 @@ static int clip_send(struct rdp *c, uint16_t type, uint16_t flags, const void *d
 
 static int clip_start(struct rdp *c) {
     if (c->clip < 0) return 0;
-    wm_clipboard(&(size_t){0}, &c->clip_seq); /* what we have now is not news */
+    wm_clipboard_info(&(size_t){0}, &c->clip_seq); /* what we have now is not news */
     static const uint8_t caps[] = {1, 0, 0, 0, /* one set, the general one: */
                                    1, 0, 12, 0, 2, 0, 0, 0, 0, 0, 0, 0}; /* version 2, short format names */
     int r = clip_send(c, CB_CLIP_CAPS, 0, caps, sizeof caps);
@@ -982,8 +985,9 @@ static size_t from_utf16(const uint8_t *p, uint32_t n, char *out) {
 
 /* the client wants our text */
 static int clip_data_request(struct rdp *c, uint32_t format) {
-    size_t n;
-    const char *text = wm_clipboard(&n, NULL);
+    size_t n = 0;
+    char *text = wm_clipboard_snapshot(&n);
+    if (!text) return clip_send(c, CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_FAIL, NULL, 0);
     uint8_t *d = NULL;
     uint32_t len = 0;
     if (format == CF_UNICODETEXT) {
@@ -999,6 +1003,7 @@ static int clip_data_request(struct rdp *c, uint32_t format) {
             }
         if (d) d[len++] = 0;
     }
+    kfree(text); /* no borrowed clipboard storage across network waits */
     int r = d ? clip_send(c, CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_OK, d, len)
               : clip_send(c, CB_FORMAT_DATA_RESPONSE, CB_RESPONSE_FAIL, NULL, 0);
     kfree(d);
@@ -1020,7 +1025,7 @@ static void clip_data(struct rdp *c, const uint8_t *p, uint32_t n, uint32_t form
     }
     wm_clipboard_set(t, len);
     kfree(t);
-    wm_clipboard(&len, &c->clip_seq); /* do not announce it back */
+    wm_clipboard_info(&len, &c->clip_seq); /* do not announce it back */
 }
 
 static int clip_message(struct rdp *c, const uint8_t *m, uint32_t n) {
@@ -1061,7 +1066,7 @@ static int clip_poll(struct rdp *c) {
     if (c->clip < 0 || !c->clip_ready) return 0;
     size_t n;
     uint32_t seq;
-    wm_clipboard(&n, &seq);
+    wm_clipboard_info(&n, &seq);
     if (seq == c->clip_seq) return 0;
     c->clip_seq = seq;
     uint8_t list[36] = {CF_UNICODETEXT}; /* one short-name entry, no name */

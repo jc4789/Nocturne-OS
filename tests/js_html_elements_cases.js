@@ -82,8 +82,12 @@ async function runHTMLElementCases() {
     rejects(()=>link.sizes.supports('any'),'sizes-no-vocabulary');equal(link.blocking.supports('render'),false,'blocking-not-falsely-supported');
     equal(link.relList.supports('stylesheet'),true,'native-stylesheet-supported');
     for(const unsupported of ['preload','modulepreload','icon','preconnect','dns-prefetch','manifest'])equal(link.relList.supports(unsupported),false,'unsupported-'+unsupported);
-    equal(Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype,'sheet'),undefined,'no-fake-link-sheet');
-    equal(Object.getOwnPropertyDescriptor(HTMLStyleElement.prototype,'sheet'),undefined,'no-fake-style-sheet');
+    ok(typeof Object.getOwnPropertyDescriptor(HTMLLinkElement.prototype,'sheet').get==='function','native-link-sheet-getter');
+    ok(typeof Object.getOwnPropertyDescriptor(HTMLStyleElement.prototype,'sheet').get==='function','native-style-sheet-getter');
+    const nativeStyle=document.createElement('style');nativeStyle.textContent='.native-sheet-probe{color:rgb(17,31,47)}';document.head.appendChild(nativeStyle);
+    ok(nativeStyle.sheet instanceof CSSStyleSheet&&nativeStyle.sheet===nativeStyle.sheet,'native-style-sheet-identity');
+    equal(nativeStyle.sheet.cssRules.length,1,'native-style-sheet-real-rule');equal(nativeStyle.sheet.cssRules[0].selectorText,'.native-sheet-probe','native-style-sheet-selector');
+    nativeStyle.remove();
     const bases=parsed.querySelectorAll('base'),firstBase=bases[0],secondBase=parsed.createElement('base');
     secondBase.href='other/';parsed.head.appendChild(secondBase);
     equal(firstBase.href,'https://metadata.fixture/one/','base-absolute-reflection');

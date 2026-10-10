@@ -10,6 +10,8 @@
     const listeners=new WeakMap();
     class EventTarget{constructor(){listeners.set(this,new Map());}addEventListener(type,fn,options={}){if(fn==null)return;const m=listeners.get(this);if(!m)throw new TypeError('Illegal invocation');type=String(type);const list=m.get(type)||[];if(!list.some(x=>x.fn===fn))list.push({fn,once:!!options?.once});m.set(type,list);}removeEventListener(type,fn){const m=listeners.get(this);if(!m)throw new TypeError('Illegal invocation');m.set(String(type),(m.get(String(type))||[]).filter(x=>x.fn!==fn));}dispatchEvent(event){const m=listeners.get(this);if(!m||!(event instanceof Event))throw new TypeError('Invalid EventTarget/Event');const receiver=this===target?globalThis:this;event.target=event.currentTarget=receiver;for(const x of [...(m.get(event.type)||[])]){if(x.once)this.removeEventListener(event.type,x.fn);try{if(typeof x.fn==='function')x.fn.call(receiver,event);else x.fn.handleEvent(event);}catch(e){report(e);}}const fn=this['on'+event.type];if(typeof fn==='function'){try{fn.call(receiver,event);}catch(e){report(e);}}return !event.defaultPrevented;}}
     Object.assign(globalThis,{DOMException,Event,ErrorEvent,EventTarget});
+    /* @include js_navigator.js */
+    const {navigator,Interface:WorkerNavigator}=navigatorBridge.create(true);
     /* @include js_encoding.js */
     /* @include js_url.js */
     /* @include js_clone.js */
@@ -148,7 +150,7 @@
             return new workerFetchBridge.NativePromise((resolve,reject)=>{const id=host.request(requestURL,requestMode==='no-cors',noReferrer),p={resolve,reject,noCors:requestMode==='no-cors',signal,cleanup:()=>{}};workerFetchBridge.remember(id,p);if(signal!=null)p.cleanup=workerAbortBridge.subscribe(signal,reason=>{if(!workerFetchBridge.take(id))return;p.cleanup();try{host.cancel(id);}finally{reject(reason);}});});
         }catch(error){return workerFetchBridge.reject(error);}
     }
-    Object.assign(globalThis,{self:globalThis,postMessage,close,importScripts,Headers,Response,AbortSignal,AbortController,fetch,
+    Object.assign(globalThis,{self:globalThis,navigator,WorkerNavigator,postMessage,close,importScripts,Headers,Response,AbortSignal,AbortController,fetch,
         setTimeout:(fn,ms,...args)=>timer(fn,ms,args,false),setInterval:(fn,ms,...args)=>timer(fn,ms,args,true),
         clearTimeout:id=>timers.delete(Number(id)),clearInterval:id=>timers.delete(Number(id)),
         queueMicrotask:fn=>{if(typeof fn!=='function')throw new TypeError('Callback required');Promise.resolve().then(fn).catch(report);},

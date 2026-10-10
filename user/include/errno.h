@@ -1,5 +1,6 @@
 #pragma once
-extern int errno;
+int *__errno_location(void);
+#define errno (*__errno_location())
 #define EPERM 1
 #define ENOENT 2
 #define ESRCH 3

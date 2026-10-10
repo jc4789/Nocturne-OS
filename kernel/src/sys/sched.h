@@ -23,8 +23,17 @@ struct task {
     bool is_user;
     bool killed;
     bool on_rq;
+    unsigned rq_cpu;        /* BSP-owned per-CPU run queue / load balancing hint */
     unsigned owner_cpu;       /* 0=BSP。AP retire ACK前はqueue/free禁止 */
-    bool bsp_only;            /* writable GUI/shared mappingを持つtaskはsticky pin */
+    bool is_thread;
+    bool exiting;
+    bool joining;
+    struct task *process;     /* shared VM / descriptors / cwd / brk owner */
+    uint64_t user_stack, user_stack_size;
+    volatile uint32_t *wait_address;
+    unsigned trap_cpu;
+    uint64_t tls_base;
+    uint64_t clock_page;
     uint64_t ksp;
     uint8_t *kstack;
     uint64_t pml4;
@@ -32,6 +41,7 @@ struct task {
     char cwd[256];
     struct task *parent;
     int exit_code;
+    int kill_code;          /* ordinary kill=130; fatal sibling keeps exception status */
     uint64_t wake_at;        /* ms; 0 = no timeout */
     bool timed_out;
     struct task *rq_next;     /* ready queue */
@@ -55,6 +65,9 @@ volatile bool *sched_resched_slot(void);
 #define current_task (*sched_current_slot())
 #define need_resched (*sched_resched_slot())
 extern struct task *task_list;
+static inline struct task *task_process(void) {
+    return current_task->process ? current_task->process : current_task;
+}
 
 void sched_init(void);
 struct task *task_alloc(const char *name);
@@ -69,7 +82,12 @@ NORETURN void sched_ap_loop(void);
 void sched_ap_interrupt(struct regs *r);
 void sched_quiesce_space(uint64_t pml4); /* 0=shared kernel変更、他は該当user space */
 void sched_pin_space(uint64_t pml4);
+int task_thread_create(uint64_t entry, uint64_t function, uint64_t argument);
+int task_thread_join(int tid);
+int task_wait_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms);
+int task_wake_address(volatile uint32_t *address, unsigned count);
 NORETURN void task_exit(int code);
+NORETURN void task_fault_exit(int code); /* fatal user exception aborts shared process */
 struct task *task_find(int pid);
 int task_kill(int pid);
 int task_wait(int pid, int *status, bool nohang);

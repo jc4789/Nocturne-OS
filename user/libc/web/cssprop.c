@@ -199,14 +199,15 @@ static bool unit_px(const char *u, size_t un, float v, const struct cx *cx, floa
     float em = cx->em;
     static const struct {
         const char *u;
-        int kind; /* 0 absolute factor, 1 em, 2 rem, 3 vw, 4 vh, 5 vmin, 6 vmax */
+        int kind; /* 0 absolute, 1 em, 2 rem, 3..6 viewport, 7..10 container */
         float f;
     } units[] = {
         {"px", 0, 1},     {"em", 1, 1},     {"rem", 2, 1},    {"ex", 1, 0.5f}, {"ch", 1, 0.6f},
         {"lh", 1, 1.2f},  {"rlh", 2, 1.2f}, {"cap", 1, 0.7f}, {"ic", 1, 1},    {"vw", 3, 1},
         {"vh", 4, 1},     {"svw", 3, 1},    {"svh", 4, 1},    {"lvw", 3, 1},   {"lvh", 4, 1},
-        {"dvw", 3, 1},    {"dvh", 4, 1},    {"cqw", 3, 1},    {"cqh", 4, 1},   {"vi", 3, 1},
-        {"vb", 4, 1},     {"vmin", 5, 1},   {"vmax", 6, 1},   {"cqmin", 5, 1}, {"cqmax", 6, 1},
+        {"dvw", 3, 1},    {"dvh", 4, 1},    {"cqw", 7, 1},    {"cqh", 8, 1},   {"vi", 3, 1},
+        {"vb", 4, 1},     {"vmin", 5, 1},   {"vmax", 6, 1},   {"cqmin", 9, 1}, {"cqmax", 10, 1},
+        {"cqi", 7, 1},    {"cqb", 8, 1},
         {"pt", 0, 4.0f / 3}, {"pc", 0, 16}, {"in", 0, 96},    {"cm", 0, 96 / 2.54f}, {"mm", 0, 96 / 25.4f},
         {"q", 0, 96 / 101.6f},
     };
@@ -221,6 +222,16 @@ static bool unit_px(const char *u, size_t un, float v, const struct cx *cx, floa
         case 4: *px = v * f * cx->vh / 100; break;
         case 5: *px = v * f * (cx->vw < cx->vh ? cx->vw : cx->vh) / 100; break;
         case 6: *px = v * f * (cx->vw > cx->vh ? cx->vw : cx->vh) / 100; break;
+        case 7: *px = v * f * (cx->cq_width_set ? cx->cq_width : cx->vw) / 100; break;
+        case 8: *px = v * f * (cx->cq_height_set ? cx->cq_height : cx->vh) / 100; break;
+        case 9: {
+            float w=cx->cq_width_set?cx->cq_width:cx->vw,h=cx->cq_height_set?cx->cq_height:cx->vh;
+            *px=v*f*(w<h?w:h)/100;break;
+        }
+        case 10: {
+            float w=cx->cq_width_set?cx->cq_width:cx->vw,h=cx->cq_height_set?cx->cq_height:cx->vh;
+            *px=v*f*(w>h?w:h)/100;break;
+        }
         }
         return true;
     }
@@ -760,14 +771,15 @@ struct kw {
 
 enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_FONT_SIZE, PT_FONT_WEIGHT,
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
-       PT_OVERFLOW, PT_OPACITY, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH };
+       PT_OVERFLOW, PT_OPACITY, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
+       PT_MOTION_NAME, PT_MOTION_TIME, PT_MOTION_ITERATIONS, PT_MOTION_EASING };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
        SH_MARGIN_INLINE, SH_MARGIN_BLOCK, SH_PADDING_INLINE, SH_PADDING_BLOCK, SH_INSET_INLINE, SH_INSET_BLOCK,
        SH_LIST_STYLE, SH_FONT, SH_BACKGROUND, SH_FLEX, SH_FLEX_FLOW, SH_GAP, SH_OVERFLOW, SH_TEXT_DECORATION,
        SH_PLACE_ITEMS, SH_PLACE_SELF, SH_PLACE_CONTENT, SH_GRID_AREA, SH_GRID_ROW, SH_GRID_COLUMN,
-       SH_GRID_TEMPLATE, SH_GRID };
+       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION };
 
 struct propdef {
     const char *name;
@@ -780,6 +792,13 @@ struct propdef {
 
 static const struct kw kw_position[] = {{"static", POS_STATIC}, {"relative", POS_RELATIVE}, {"absolute", POS_ABSOLUTE},
                                         {"fixed", POS_FIXED}, {"sticky", POS_STICKY}, {"-webkit-sticky", POS_STICKY}, {0}};
+static const struct kw kw_box_orient[] = {{"horizontal", BO_HORIZONTAL}, {"inline-axis", BO_HORIZONTAL},
+                                        {"vertical", BO_VERTICAL}, {"block-axis", BO_VERTICAL}, {0}};
+static const struct kw kw_motion_direction[] = {{"normal",CM_NORMAL},{"reverse",CM_REVERSE},
+    {"alternate",CM_ALTERNATE},{"alternate-reverse",CM_ALTERNATE_REVERSE},{0}};
+static const struct kw kw_motion_fill[] = {{"none",CM_FILL_NONE},{"forwards",CM_FILL_FORWARDS},
+    {"backwards",CM_FILL_BACKWARDS},{"both",CM_FILL_BOTH},{0}};
+static const struct kw kw_motion_play[] = {{"running",0},{"paused",1},{0}};
 static const struct kw kw_float[] = {{"none", FL_NONE}, {"left", FL_LEFT}, {"right", FL_RIGHT},
                                      {"inline-start", FL_LEFT}, {"inline-end", FL_RIGHT}, {0}};
 static const struct kw kw_clear[] = {{"none", CL_NONE}, {"left", CL_LEFT}, {"right", CL_RIGHT}, {"both", CL_BOTH},
@@ -811,6 +830,7 @@ static const struct kw kw_bg_repeat[] = {{"repeat", BR_REPEAT}, {"repeat-x", BR_
 static const struct kw kw_pointer_events[] = {{"auto", 0}, {"none", 1}, {0}};
 static const struct kw kw_visibility[] = {{"visible", 0}, {"hidden", 1}, {"collapse", 1}, {0}};
 static const struct kw kw_content_visibility[] = {{"visible", CV_VISIBLE}, {"auto", CV_AUTO}, {"hidden", CV_HIDDEN}, {0}};
+static const struct kw kw_container_type[] = {{"normal", CT_NORMAL}, {"inline-size", CT_INLINE_SIZE}, {"size", CT_SIZE}, {0}};
 static const struct kw kw_bcollapse[] = {{"separate", 0}, {"collapse", 1}, {0}};
 static const struct kw kw_fdir[] = {{"row", FD_ROW}, {"row-reverse", FD_ROW_REVERSE}, {"column", FD_COLUMN},
                                     {"column-reverse", FD_COLUMN_REVERSE}, {0}};
@@ -858,6 +878,17 @@ static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}
 
 /* sorted by name at first use */
 static struct propdef props[] = {
+    {"-webkit-box-orient", PT_KW, 0, false, O(box_orient), kw_box_orient, 0},
+    {"-webkit-line-clamp", PT_LINE_CLAMP, 0, false, O(line_clamp), NULL, 0},
+    SH("animation", SH_ANIMATION),
+    {"animation-name",PT_MOTION_NAME,0,false,O(motion.name),NULL,0},
+    {"animation-duration",PT_MOTION_TIME,0,false,O(motion.duration),NULL,0},
+    {"animation-delay",PT_MOTION_TIME,LF_NEG,false,O(motion.delay),NULL,0},
+    {"animation-timing-function",PT_MOTION_EASING,0,false,O(motion.easing),NULL,0},
+    {"animation-iteration-count",PT_MOTION_ITERATIONS,0,false,O(motion.iterations),NULL,0},
+    {"animation-direction",PT_KW,0,false,O(motion.direction),kw_motion_direction,0},
+    {"animation-fill-mode",PT_KW,0,false,O(motion.fill),kw_motion_fill,0},
+    {"animation-play-state",PT_KW,0,false,O(motion.paused),kw_motion_play,0},
     {"align-content", PT_KW, 0, false, O(align_content), kw_acontent, 0},
     {"align-items", PT_KW, 0, false, O(align_items), kw_align, 0},
     {"align-self", PT_KW, 0, false, O(align_self), kw_align, 0},
@@ -900,6 +931,9 @@ static struct propdef props[] = {
     {"column-gap", PT_PX, LF_NOPCT, false, O(gap_col), kw_normal0, 0},
     {"content", PT_CONTENT, 0, false, O(content), NULL, 0},
     {"content-visibility", PT_KW, 0, false, O(content_visibility), kw_content_visibility, 0},
+    SH("container", SH_CONTAINER),
+    {"container-name", PT_CONTAINER_NAMES, 0, false, O(container_names), NULL, 0},
+    {"container-type", PT_KW, 0, false, O(container_type), kw_container_type, 0},
     {"display", PT_DISPLAY, 0, false, O(display), NULL, 0},
     SH("flex", SH_FLEX),
     {"flex-basis", PT_LEN, LF_AUTO, false, O(flex_basis), NULL, 0},
@@ -1025,7 +1059,7 @@ static const struct {
     {"margin-inline-start", "margin-left"}, {"max-block-size", "max-height"}, {"max-inline-size", "max-width"},
     {"min-block-size", "min-height"}, {"min-inline-size", "min-width"}, {"padding-block-end", "padding-bottom"},
     {"padding-block-start", "padding-top"}, {"padding-inline-end", "padding-right"},
-    {"padding-inline-start", "padding-left"}, {"word-wrap", ""}, {"-webkit-box-orient", ""},
+    {"padding-inline-start", "padding-left"}, {"word-wrap", ""},
 };
 
 static bool props_sorted;
@@ -1063,6 +1097,8 @@ static void init_initial(void) {
     s->flex_shrink = 1;
     s->align_content = AC_NORMAL;
     s->opacity = 1;
+    s->motion.iterations = 1;
+    s->motion.easing = (struct css_easing){.x1=.25f,.y1=.1f,.x2=.25f,.y2=1,.kind=CM_BEZIER};
     s->object_pos[0].kind=s->object_pos[1].kind=LK_LEN;
     s->object_pos[0].pct=s->object_pos[1].pct=50;
     s->align_self = 255;
@@ -1114,6 +1150,9 @@ int css_prop_index(const struct propdef *p) { return (int)(p - props); }
 bool css_prop_is_font(const struct propdef *p) {
     return (p->type == PT_FONT_SIZE) || (p->type == PT_SHORT && p->sh == SH_FONT);
 }
+bool css_prop_is_motion(const struct propdef *p) {
+    return p && (!strcmp(p->name,"animation") || !strncmp(p->name,"animation-",10));
+}
 
 /* ---------------------------------------------------------------- longhand values */
 static bool kw_find(const struct kw *k, const char *s, size_t n, uint8_t *out) {
@@ -1131,8 +1170,8 @@ static bool parse_display(const char *s, size_t n, uint8_t *out, struct cx *cx) 
     int k = split_checked(s, n, t, tl, 3, ' ', cx);
     if (k == 1) {
         if (cx->supports_probe && (ident_is(s,n,"run-in") || ident_is(s,n,"ruby") ||
-            ident_is(s,n,"ruby-base") || ident_is(s,n,"ruby-text") || ident_is(s,n,"-webkit-box") ||
-            ident_is(s,n,"-moz-box") || ident_is(s,n,"-webkit-inline-box"))) return false;
+            ident_is(s,n,"ruby-base") || ident_is(s,n,"ruby-text") ||
+            ident_is(s,n,"-moz-box"))) return false;
         static const struct kw kd[] = {
             {"none", D_NONE}, {"inline", D_INLINE}, {"block", D_BLOCK}, {"list-item", D_LIST_ITEM},
             {"inline-block", D_INLINE_BLOCK}, {"table", D_TABLE}, {"inline-table", D_INLINE_TABLE},
@@ -1778,6 +1817,77 @@ static bool is_custom_ident(const char *s, size_t n) {
     return !ident_is(s, n, "auto") && !ident_is(s, n, "span");
 }
 
+/* Deliberately one CSS animation, with an opacity interpolation backend.
+   Lists/steps()/timelines/composition are not accepted as fake support. */
+static bool motion_name(const char *s, size_t n) {
+    if (!n || ident_is(s,n,"initial") || ident_is(s,n,"inherit") || ident_is(s,n,"unset") ||
+        ident_is(s,n,"revert") || ident_is(s,n,"revert-layer") || ident_is(s,n,"default") ||
+        isdigit((unsigned char)s[0]) || s[0]=='+') return false;
+    if (s[0]=='-' && (n==1 || isdigit((unsigned char)s[1]))) return false;
+    for (size_t i=0;i<n;i++) if ((unsigned char)s[i]<128 && !isalnum((unsigned char)s[i]) &&
+        s[i]!='_' && s[i]!='-') return false;
+    return true;
+}
+static bool motion_time(const char *s,size_t n,float *out) {
+    const char *p=s;float v;
+    if (!parse_number(&p,s+n,&v) || !isfinite(v)) return false;
+    if (s+n-p==1 && (*p|32)=='s') v*=1000;
+    else if (s+n-p!=2 || (p[0]|32)!='m' || (p[1]|32)!='s') return false;
+    if (!isfinite(v)) return false;
+    *out=v;return true;
+}
+bool css_easing_parse(const char *s,size_t n,struct css_easing *out) {
+    struct css_easing v={.kind=CM_BEZIER,.y2=1};
+    if(ident_is(s,n,"linear"))v.kind=CM_LINEAR;
+    else if(ident_is(s,n,"step-start"))v.kind=CM_STEP_START;
+    else if(ident_is(s,n,"step-end"))v.kind=CM_STEP_END;
+    else if(ident_is(s,n,"ease")){v.x1=.25f;v.y1=.1f;v.x2=.25f;}
+    else if(ident_is(s,n,"ease-in")){v.x1=.42f;v.x2=1;}
+    else if(ident_is(s,n,"ease-out")){v.x2=.58f;}
+    else if(ident_is(s,n,"ease-in-out")){v.x1=.42f;v.x2=.58f;}
+    else {
+        if(n<15 || !strn_ieq(s,"cubic-bezier(",13) || s[n-1]!=')')return false;
+        const char *p=s+13,*e=s+n-1;float a[4];
+        for(int i=0;i<4;i++) {
+            while(p<e && is_space((unsigned char)*p))p++;
+            if(!parse_number(&p,e,&a[i]) || !isfinite(a[i]))return false;
+            while(p<e && is_space((unsigned char)*p))p++;
+            if(i<3){if(p==e || *p++!=',')return false;}else if(p!=e)return false;
+        }
+        if(a[0]<0 || a[0]>1 || a[2]<0 || a[2]>1)return false;
+        v.x1=a[0];v.y1=a[1];v.x2=a[2];v.y2=a[3];
+    }
+    *out=v;return true;
+}
+static bool motion_shorthand(const char *s,size_t n,struct cx *cx,struct css_motion *out) {
+    const char *t[10];size_t tl[10];int k=split(s,n,t,tl,10,' ');
+    if(!k || t[k-1]+tl[k-1]!=s+n)return false;
+    struct css_motion v=initial.motion;
+    unsigned seen=0,times=0;
+    for(int i=0;i<k;i++) {
+        float f;uint8_t kw;struct css_easing ease;
+        if(motion_time(t[i],tl[i],&f)) {
+            if(times==0){if(f<0)return false;v.duration=f;}
+            else if(times==1)v.delay=f;else return false;
+            times++;continue;
+        }
+        if(!(seen&1) && css_easing_parse(t[i],tl[i],&ease)){v.easing=ease;seen|=1;continue;}
+        if(!(seen&2) && kw_find(kw_motion_direction,t[i],tl[i],&kw)){v.direction=kw;seen|=2;continue;}
+        if(!(seen&4) && kw_find(kw_motion_fill,t[i],tl[i],&kw)){v.fill=kw;seen|=4;continue;}
+        if(!(seen&8) && kw_find(kw_motion_play,t[i],tl[i],&kw)){v.paused=kw;seen|=8;continue;}
+        const char *p=t[i];
+        if(!(seen&16) && (ident_is(t[i],tl[i],"infinite") ||
+            (parse_number(&p,t[i]+tl[i],&f) && p==t[i]+tl[i] && isfinite(f) && f>=0))) {
+            v.iterations=ident_is(t[i],tl[i],"infinite")?INFINITY:f;seen|=16;continue;
+        }
+        if(!(seen&32) && (ident_is(t[i],tl[i],"none") || motion_name(t[i],tl[i]))) {
+            v.name=ident_is(t[i],tl[i],"none")?NULL:ar_strndup(cx->a,t[i],tl[i]);seen|=32;continue;
+        }
+        return false;
+    }
+    *out=v;return true;
+}
+
 static bool parse_gline(const char *s, size_t n, struct cx *cx, struct gline *g) {
     memset(g, 0, sizeof *g);
     if (ident_is(s, n, "auto")) return true;
@@ -1820,6 +1930,7 @@ static bool parse_gline(const char *s, size_t n, struct cx *cx, struct gline *g)
 static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src) {
     memcpy((char *)dst + p->off, (const char *)src + p->off, p->size);
     switch (p->type) {
+    case PT_DISPLAY: dst->legacy_box = src->legacy_box; break;
     case PT_FONT_FAMILY: dst->font_names=src->font_names;dst->named_font=src->named_font;break;
     case PT_VALIGN: dst->vertical_align_px = src->vertical_align_px; break;
     case PT_LIST_TYPE: dst->list_style_string = src->list_style_string; break;
@@ -1852,6 +1963,25 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         return true;
     }
     switch (p->type) {
+    case PT_MOTION_NAME:
+        if(!ident_is(v,n,"none") && !motion_name(v,n))return false;
+        *(const char **)field=ident_is(v,n,"none")?NULL:ar_strndup(cx->a,v,n);return true;
+    case PT_MOTION_TIME: {
+        float value;if(!motion_time(v,n,&value) || (!(p->flags&LF_NEG) && value<0))return false;
+        *(float *)field=value;return true;
+    }
+    case PT_MOTION_ITERATIONS: {
+        float value;const char *q=v;
+        if(ident_is(v,n,"infinite"))value=INFINITY;
+        else if(!parse_number(&q,v+n,&value) || q!=v+n || !isfinite(value) || value<0)return false;
+        *(float *)field=value;return true;
+    }
+    case PT_MOTION_EASING: return css_easing_parse(v,n,(struct css_easing *)field);
+    case PT_CONTAINER_NAMES:
+        if (ident_is(v, n, "none")) { s->container_names = NULL; return true; }
+        if (!css_container_names_valid(v,n)) return false;
+        s->container_names = ar_strndup(cx->a,v,n);
+        return true;
     case PT_KW: {
         uint8_t k;
         if (cx->supports_probe && ((p->kws == kw_textwrap && !ident_is(v,n,"wrap") && !ident_is(v,n,"nowrap")) ||
@@ -1866,7 +1996,25 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         *(uint8_t *)field = k;
         return true;
     }
-    case PT_DISPLAY: return parse_display(v, n, (uint8_t *)field, cx);
+    case PT_DISPLAY:
+        if (!parse_display(v, n, (uint8_t *)field, cx)) return false;
+        s->legacy_box = ident_is(v, n, "-webkit-box") || ident_is(v, n, "-webkit-inline-box");
+        return true;
+    case PT_LINE_CLAMP: {
+        if (ident_is(v, n, "none")) { s->line_clamp = 0; return true; }
+        size_t i = n && v[0] == '+' ? 1 : 0;
+        uint32_t value = 0;
+        if (i == n) return false;
+        for (; i < n; i++) {
+            if (v[i] < '0' || v[i] > '9') return false;
+            unsigned digit = (unsigned)(v[i] - '0');
+            if (value > (UINT32_MAX - digit) / 10) return false;
+            value = value * 10 + digit;
+        }
+        if (!value) return false;
+        s->line_clamp = value;
+        return true;
+    }
     case PT_LEN: {
         len_t l;
         if (!parse_len(v, n, cx, &l, p->flags)) return false;
@@ -2292,6 +2440,49 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     bool global = ident_is(v, n, "inherit") || ident_is(v, n, "initial") || ident_is(v, n, "unset") ||
                   ident_is(v, n, "revert") || ident_is(v, n, "revert-layer");
     switch (p->sh) {
+    case SH_ANIMATION: {
+        static const char *const names[]={"animation-name","animation-duration","animation-delay",
+            "animation-timing-function","animation-iteration-count","animation-direction",
+            "animation-fill-mode","animation-play-state"};
+        if(global){for(unsigned i=0;i<8;i++)set_long(names[i],v,n,cx);return true;}
+        struct css_motion motion;
+        if(!motion_shorthand(v,n,cx,&motion))return false;
+        /* The shorthand resets all longhands, but cannot override a higher
+           priority longhand already selected by this cascade. */
+        style_t temp=*cx->s;temp.motion=motion;
+        for(unsigned i=0;i<8;i++) {
+            const struct propdef *q=find_prop(names[i],strlen(names[i]));int at=css_prop_index(q);
+            if(!cx->set[at]){copy_prop(q,cx->s,&temp);cx->set[at]=1;}
+        }
+        return true;
+    }
+    case SH_CONTAINER: {
+        if (global) {
+            set_long("container-name",v,n,cx);
+            set_long("container-type",v,n,cx);
+            return true;
+        }
+        const char *slash=NULL,*names=v;
+        for(size_t i=0;i<n;i++) {
+            if(v[i]=='\\' && i+1<n) {
+                i++;unsigned count=0;
+                while(i<n && isxdigit((unsigned char)v[i]) && count<6){i++;count++;}
+                if(count && i<n && !is_space((unsigned char)v[i]))i--;
+                continue;
+            }
+            if(v[i]=='/'){slash=v+i;break;}
+        }
+        size_t nn=slash?(size_t)(slash-v):n; trim(&names,&nn);
+        const char *type=slash?slash+1:"normal";
+        size_t tn=slash?(size_t)(v+n-type):6; trim(&type,&tn);
+        type=css_value_canonical(cx->a,type,tn,&tn);
+        uint8_t dummy;
+        if ((!ident_is(names,nn,"none") && !css_container_names_valid(names,nn)) ||
+            !kw_find(kw_container_type,type,tn,&dummy)) return false;
+        set_long("container-name",names,nn,cx);
+        set_long("container-type",type,tn,cx);
+        return true;
+    }
     case SH_MARGIN: return set_box("margin-%s", v, n, cx, all, 4);
     case SH_PADDING: return set_box("padding-%s", v, n, cx, all, 4);
     case SH_INSET: {
@@ -2644,6 +2835,10 @@ void css_style_finish(style_t *s, const style_t *parent, bool root) {
         }
     }
     if (root && s->display == D_CONTENTS) s->display = D_BLOCK;
+    /* Legacy vertical clamping is a block formatting context, not a flex
+       row. Retain the authored display flag for CSS-wide copies/activation. */
+    if (s->legacy_box && s->box_orient == BO_VERTICAL && s->line_clamp && s->display == D_BLOCK)
+        s->display = D_FLOW_ROOT;
 }
 
 /* ---------------------------------------------------------------- the user agent stylesheet */
@@ -2704,11 +2899,11 @@ const char *css_ua_sheet(void) {
            "a:link { color: #0645ad; text-decoration: underline; }\n"
            "abbr[title] { text-decoration: underline; }\n"
            "q::before { content: open-quote; } q::after { content: close-quote; }\n"
-           "img, video, canvas, iframe, embed, object, svg, input, select, textarea, button, meter, progress "
+           "img, video, canvas, iframe, embed, svg, input, select, textarea, button, meter, progress "
            "{ display: inline-block; }\n"
            "iframe { border: 2px inset; }\n"
            "frameset, frame { display:block; margin:0; padding:0; border:0; }\n"
-           "video, audio, canvas, iframe, embed, object { background-color: #e8e8e8; }\n"
+           "video, audio, canvas, iframe, embed { background-color: #e8e8e8; }\n"
            "fieldset { margin: 0 2px; padding: 0.35em 0.75em 0.625em; border: 2px groove #c0c0c0; }\n"
            "legend { padding: 0 2px; }\n"
            "input, select, textarea, button { font-size: 13.33px; font-family: sans-serif; color: black; "

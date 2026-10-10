@@ -151,5 +151,11 @@ const observerBridge=(()=>{
         }
     }
     Object.assign(globalThis,{DOMRectReadOnly,DOMRect,SVGRect:DOMRect,ResizeObserver,ResizeObserverEntry,ResizeObserverSize,IntersectionObserver,IntersectionObserverEntry});
-    return {createSVGRect(){return new DOMRect();},frame(){resizeFrame();intersectionFrame();}};
+    return {createSVGRect(){return new DOMRect();},
+        createLiveSVGRect(read,write){
+            const rect=write?new DOMRect():new DOMRectReadOnly(),values=[0,0,0,0];
+            for(let i=0;i<4;i++)rectDefine(values,i,{get(){return read()[i];},
+                ...(write?{set(v){write(i,v);}}:{}),configurable:true});
+            rectApply(rectSet,rectSlots,[rect,values]);return rect;
+        },frame(){resizeFrame();intersectionFrame();}};
 })();

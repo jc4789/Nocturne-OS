@@ -44,13 +44,13 @@ static node_t *tree_next(node_t *n, node_t *root, bool shadow, bool templates, b
 static void indices(node_t *p) {
     web_doc *d = p->owner;
     if (d && d->dom_family) d = d->dom_family;
-    uint64_t start = uptime_ms(), visited = 0;
+    uint64_t start = d && d->profile_enabled ? uptime_ms() : 0, visited = 0;
     int i = 0;
     for (node_t *c = p->first; c; c = c->next) {
         visited++;
         if (c->type == N_ELEM) c->elem_index = ++i;
     }
-    if (d) { d->profile.index_visits += visited; d->profile.index_ms += uptime_ms() - start; }
+    if (d) { d->profile.index_visits += visited; if(d->profile_enabled)d->profile.index_ms += uptime_ms() - start; }
 }
 
 static bool under(node_t *n, node_t *ancestor) {
@@ -161,8 +161,16 @@ static void compare_shadow_slots(node_t *root) {
     }
 }
 void doc_shadow_dirty(node_t *root) {
-    if (!root || !root->shadow_host || root->shadow_dirty) return;
+    if (!root || !root->shadow_host) return;
     web_doc *d = root->owner, *family = d->dom_family ? d->dom_family : d;
+    /* Slot reassignment can change fallback visibility and inherited parents
+     * without touching those elements directly. Preserve deferred assignment,
+     * but do not reuse a stale flat-tree style/box topology after publication. */
+    if(d->live && !d->inert && doc_node_root(root->shadow_host,true)==d->root) {
+        d->need_style=d->style_full_dirty=d->need_boxes=true;
+        d->layout_valid=false;
+    }
+    if(root->shadow_dirty)return;
     root->shadow_dirty = true; root->shadow_dirty_next = NULL;
     if (family->shadow_dirty_last) family->shadow_dirty_last->shadow_dirty_next = root;
     else family->shadow_dirty_first = root;
@@ -375,9 +383,14 @@ static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recasca
         textarea_changed(n); return;
     }
     d->dirty = true;
-    if(recascade)d->need_style=true;
+    if(recascade)css_mark_dirty(d,n);
     if(boxes){d->need_boxes=true;d->layout_valid=false;}
-    if (resources) d->resources_dirty = true;
+    if (resources) d->resources_dirty = d->style_full_dirty = true;
+    if (recascade || boxes) {
+        d->layout_valid = false;
+        if (n && n->box && (boxes || n->box->kind==B_ATOMIC)) layout_invalidate(n->box);
+    }
+    for(node_t *p=n;p;p=p->parent)if(p->foreign){d->need_boxes=true;break;}
     d->find_node = NULL;
     d->find_run = NULL;
     web_dialog_sync(d);
@@ -392,7 +405,7 @@ static void changed(web_doc *d,node_t *n,bool resources) {
     changed_geometry(d,n,resources,true,false);
 }
 void doc_mutated(web_doc *d, node_t *n) {
-    if (d && !n) d->js_nodes_dirty = true;
+    if (d && !n) { d->js_nodes_dirty = true; d->need_boxes = true; }
     changed(d, n, true);
     /* NULL denotes a parser's complete forest transaction. Ordinary control or
        CharacterData notifications cannot change assignment; structural/attribute
@@ -432,6 +445,7 @@ static void structure_changed_lifetime(web_doc *d, node_t *parent, node_t *subtr
     cssom_style_text_changed(parent);
     if (lifetime_changed) cssom_style_lifecycle(subtree);
     if (d && lifetime_changed) d->js_nodes_dirty = true;
+    if (d && doc_node_root(parent, true) == d->root) d->need_boxes = true;
     changed(d, parent, parent->type==N_DOC || resource_ancestor(parent) || resource_subtree(subtree));
 }
 static void structure_changed(web_doc *d, node_t *parent, node_t *subtree) {
@@ -774,6 +788,19 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
        of authored sheets. Re-parsing every external CSS sheet here made geometry
        reads after classList updates needlessly rebuild all sheet snapshots. */
     changed(d, n, resources);
+    /* These native HTML semantics are consumed while building boxes rather
+       than encoded in computed CSS. Equal styles therefore do not imply the
+       old marker text, suppressed descendants, or atomic kind is reusable. */
+    bool semantic_boxes = ordinary &&
+        ((!strcmp(low,"colspan") || !strcmp(low,"rowspan")) ||
+         (n->tag == T_ol && (!strcmp(low,"start") || !strcmp(low,"reversed"))) ||
+         (n->tag == T_li && !strcmp(low,"value")) ||
+         (n->tag == T_details && !strcmp(low,"open")) ||
+         (n->tag == T_input && !strcmp(low,"type")) ||
+         (n->tag == T_audio && !strcmp(low,"controls")));
+    if (semantic_boxes && doc_node_root(n, true) == d->root) {
+        d->need_boxes=true; d->layout_valid=false;
+    }
     /* Candidate changes retain image requests (including detached images) but
        cannot add/remove authored stylesheets. Attribute selectors and attr()
        still invalidate the live cascade through changed() above. */
@@ -913,7 +940,7 @@ static void assignment_dirty(node_t *p, node_t *c) {
    fragment before moving its first child, including Document's order rules. */
 static int insertion_validity(node_t *p, node_t *c, node_t *before, node_t *replaced) {
     if (!p || !c || (p->type != N_DOC && p->type != N_ELEM && p->type != N_FRAGMENT) ||
-        c->type == N_DOC || c->type == N_ATTR || c->shadow_host) return 1;
+        c->type == N_DOC || c->type == N_ATTR) return 1;
     for (node_t *a = p; a; a = a->parent ? a->parent : a->shadow_host ? a->shadow_host : a->template_host)
         if (a == c) return 1;
     if (before && before->parent != p) return 2;
@@ -1006,6 +1033,7 @@ void doc_node_remove(web_doc *d, node_t *n) {
         doc_slot_signal(p);
     web_frames_detach_tree(d,n);
     detach(n);
+    css_node_style_unpublish(n); /* inherited borrows cannot outlive the former parent */
     structure_changed(d, p, n);
     web_select_inserted(d, n, p);
     if (select) web_select_sync(select->owner, select, false);
@@ -1037,6 +1065,7 @@ static void adopt_subtree(web_doc *d, node_t *root) {
     if (n->owner != owner && n->adopted_count) {
         free(n->adopted_sheets); n->adopted_sheets = NULL; n->adopted_count = 0;
     }
+    if(n->owner!=owner)n->style_scope=NULL;
     n->owner = owner;
     for (int i = 0; i < n->nattrs; i++) if (n->attrs[i].node) n->attrs[i].node->owner = owner;
     n->style = n->animation_base_style = NULL; n->box = n->anchor_block = NULL;
@@ -1046,10 +1075,11 @@ static void adopt_subtree(web_doc *d, node_t *root) {
        getter. Keep allocation ownership untouched; schedule the live scan. */
     if (!owner->inert && n->type == N_ELEM && !n->foreign && n->tag == T_img)
         owner->resources_dirty = owner->dirty = owner->need_style = true;
-    if (n->shadow_root) {
+    if (n->shadow_root)
         (owner->dom_family ? owner->dom_family : owner)->has_shadow = true;
-        doc_shadow_dirty(n->shadow_root);
-    }
+    /* Queue after this shadow root itself changed owner; queuing from its
+     * host iteration would put the migrated root back in the source family. */
+    if (n->shadow_host) doc_shadow_dirty(n);
   }
 }
 static bool has_template(node_t *root) {
@@ -1071,7 +1101,13 @@ bool doc_node_adopt(web_doc *d, node_t *n) {
         while (owner->root->first) doc_node_remove(owner, owner->root->first);
         owner->template_owner = true; d->template_doc = owner;
     }
+    web_doc *previous_owner=n->owner;
     if (n->parent) doc_node_remove(n->owner ? n->owner : d, n);
+    if(previous_owner && previous_owner!=d && previous_owner->root_box) {
+        /* Cross-document adoption must not leave the source box tree borrowing
+           element-owned style arenas reclaimed by a destination layout read. */
+        boxes_discard(previous_owner);previous_owner->need_boxes=true;previous_owner->layout_valid=false;
+    }
     if (n->owner) doc_shadow_flush(n->owner); /* drain the source-family queue before owner migration */
     adopt_subtree(d, n);
     web_js_nodes_changed(d);
@@ -1129,7 +1165,7 @@ bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
     if (n->type == N_TEXT || n->type == N_COMMENT || n->type == N_PI) {
         bool same=n->textlen==len && (!len || (n->text && !memcmp(n->text,text,len)));
         keep_style=ordinary && (n->type!=N_TEXT || ((n->textlen!=0)==(len!=0)));
-        rebuild_boxes=keep_style && n->type==N_TEXT && !same;
+        rebuild_boxes=n->type==N_TEXT && !same;
         /* Same-value CharacterData still goes through mutation/revision hooks.
            Only its identical native string/storage/geometry can be reused. */
         if(!same) {
@@ -1141,6 +1177,9 @@ bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
             n->text = v;
             n->textlen = len;
             d->mem.trap = old;
+            if (keep_style && rebuild_boxes && boxes_update_text(d,n)) {
+                rebuild_boxes=false; d->layout_valid=false;
+            }
         }
     } else {
         bool had_text=false,text_children=true;
@@ -1213,6 +1252,7 @@ bool doc_node_value(web_doc *d, node_t *n, const char *text, size_t len) {
     allocation->control_bytes = next + capacity;
     doc_dom_budget(d);
     d->dirty = d->need_style = true;
+    if(n->box)layout_invalidate(n->box);
     return true;
 }
 

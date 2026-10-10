@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include "http.h"
+#include "browser_identity.h"
 
 bool url_parse(const char *s, struct url *u) {
     if (!s || !u || strlen(s) >= HTTP_URL_MAX) return false;
@@ -438,7 +439,7 @@ static const char *request_head(const struct http_req *rq, struct http_scratch *
     if (rq->body || strcmp(method, "GET"))
         snprintf(content_length, sizeof content_length, "Content-Length: %zu\r\n", rq->body_len);
     const char *parts[] = {method, " ", u->path, " HTTP/1.1\r\nHost: ", u->host, port,
-        "\r\nUser-Agent: Nocturne/1.0\r\nConnection: close\r\n", content_length};
+        "\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\nConnection: close\r\n", content_length};
     size_t length = 0;
     for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) {
         size_t n = strlen(parts[i]);

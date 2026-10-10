@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/smp.h"
+#include "arch/hyperv.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
 #include "sys/proc.h"
@@ -68,38 +69,64 @@ static int user_path(const char *upath, char *out) {
     char tmp[PATH_MAX_LEN];
     int r = user_str(tmp, upath, sizeof tmp);
     if (r < 0) return r;
-    return vfs_normalize(current_task->cwd, tmp, out);
+    char cwd[sizeof task_process()->cwd];
+    uint64_t flags = irq_save();
+    memcpy(cwd, task_process()->cwd, sizeof cwd);
+    irq_restore(flags);
+    return vfs_normalize(cwd, tmp, out);
 }
 
+/* Raw lookup is allowed only inside a BSP IRQ guard. Never carry this
+   borrowed pointer across validation, preemption or a blocking operation. */
 static struct file *getfd(int fd) {
     if (fd < 0 || fd >= MAX_FDS) return NULL;
-    return current_task->fds[fd];
+    return task_process()->fds[fd];
 }
 
-static int allocfd(struct file *f) {
+static struct file *getfd_ref(int fd) {
+    uint64_t flags = irq_save();
+    struct file *f = getfd(fd);
+    if (f) vfs_dup(f);
+    irq_restore(flags);
+    return f;
+}
+
+static int allocfd_locked(struct file *f) {
     for (int i = 0; i < MAX_FDS; i++) {
-        if (!current_task->fds[i]) {
-            current_task->fds[i] = f;
+        if (!task_process()->fds[i]) {
+            task_process()->fds[i] = f;
             return i;
         }
     }
     return -EMFILE;
 }
 
+/* Consumes the caller's reference only on successful publication. */
+static int allocfd(struct file *f) {
+    uint64_t flags = irq_save();
+    int fd = allocfd_locked(f);
+    irq_restore(flags);
+    return fd;
+}
+
 /* ---- handlers ---- */
 
 static int64_t sys_read(int fd, void *buf, size_t n) {
-    struct file *f = getfd(fd);
+    struct file *f = getfd_ref(fd);
     if (!f) return -EBADF;
-    if (!user_ok_w(buf, n)) return -EFAULT;
-    return vfs_read(f, buf, n);
+    if (!user_ok_w(buf, n)) { vfs_close(f); return -EFAULT; }
+    int64_t result = vfs_read(f, buf, n);
+    vfs_close(f);
+    return result;
 }
 
 static int64_t sys_write(int fd, const void *buf, size_t n) {
-    struct file *f = getfd(fd);
+    struct file *f = getfd_ref(fd);
     if (!f) return -EBADF;
-    if (!user_ok(buf, n)) return -EFAULT;
-    return vfs_write(f, buf, n);
+    if (!user_ok(buf, n)) { vfs_close(f); return -EFAULT; }
+    int64_t result = vfs_write(f, buf, n);
+    vfs_close(f);
+    return result;
 }
 
 static int64_t sys_open(const char *upath, int flags) {
@@ -115,9 +142,12 @@ static int64_t sys_open(const char *upath, int flags) {
 }
 
 static int64_t sys_close(int fd) {
+    uint64_t flags = irq_save();
     struct file *f = getfd(fd);
-    if (!f) return -EBADF;
-    current_task->fds[fd] = NULL;
+    if (!f) { irq_restore(flags); return -EBADF; }
+    task_process()->fds[fd] = NULL;
+    irq_restore(flags);
+    /* Final audio close may sleep. The detached slot's reference owns f. */
     vfs_close(f);
     return 0;
 }
@@ -131,21 +161,26 @@ static int64_t sys_stat(const char *upath, struct kstat *st) {
 }
 
 static int64_t sys_fstat(int fd, struct kstat *st) {
-    struct file *f = getfd(fd);
+    struct file *f = getfd_ref(fd);
     if (!f) return -EBADF;
-    if (!user_ok_w(st, sizeof *st)) return -EFAULT;
+    if (!user_ok_w(st, sizeof *st)) { vfs_close(f); return -EFAULT; }
+    uint64_t flags = irq_save();
     st->type = f->vn->tty ? VT_CHAR : f->vn->type;
     st->size = f->vn->size;
     st->mtime = f->vn->mtime;
     st->mode = f->vn->mode;
+    irq_restore(flags);
+    vfs_close(f);
     return 0;
 }
 
 static int64_t sys_readdir(int fd, uint64_t idx, struct dirent *d) {
-    struct file *f = getfd(fd);
+    struct file *f = getfd_ref(fd);
     if (!f) return -EBADF;
-    if (!user_ok_w(d, sizeof *d)) return -EFAULT;
-    return vfs_readdir(f, idx, d);
+    if (!user_ok_w(d, sizeof *d)) { vfs_close(f); return -EFAULT; }
+    int64_t result = vfs_readdir(f, idx, d);
+    vfs_close(f);
+    return result;
 }
 
 static int64_t sys_mkdir(const char *upath) {
@@ -186,15 +221,21 @@ static int64_t sys_chdir(const char *upath) {
     struct kstat st;
     if (vfs_stat(path, &st) < 0) return -ENOENT;
     if (st.type != VT_DIR) return -ENOTDIR;
-    strlcpy(current_task->cwd, path, sizeof current_task->cwd);
+    uint64_t flags = irq_save();
+    strlcpy(task_process()->cwd, path, sizeof task_process()->cwd);
+    irq_restore(flags);
     return 0;
 }
 
 static int64_t sys_getcwd(char *buf, size_t n) {
-    size_t l = strlen(current_task->cwd) + 1;
+    char cwd[sizeof task_process()->cwd];
+    uint64_t flags = irq_save();
+    memcpy(cwd, task_process()->cwd, sizeof cwd);
+    irq_restore(flags);
+    size_t l = strlen(cwd) + 1;
     if (n < l) return -ERANGE;
     if (!user_ok_w(buf, l)) return -EFAULT;
-    memcpy(buf, current_task->cwd, l);
+    memcpy(buf, cwd, l);
     return l;
 }
 
@@ -205,6 +246,7 @@ static int64_t sys_spawn(const char *upath, char **uargv, const int *ufdmap, int
     char *argv[32];
     int argc = 0;
     int64_t ret;
+    struct file *fds[3] = {NULL, NULL, NULL};
     if (uargv) {
         while (argc < 31) {
             if (!user_ok(&uargv[argc], 8)) { ret = -EFAULT; goto out; }
@@ -217,17 +259,24 @@ static int64_t sys_spawn(const char *upath, char **uargv, const int *ufdmap, int
         }
     }
     if (argc == 0) argv[argc++] = strdup(path);
-    struct file *fds[3];
+    int sources[3] = {0, 1, 2};
     for (int i = 0; i < 3; i++) {
-        int src = i;
         if (ufdmap) {
             if (!user_ok(&ufdmap[i], 4)) { ret = -EFAULT; goto out; }
-            src = ufdmap[i];
+            sources[i] = ufdmap[i];
         }
-        fds[i] = src >= 0 ? getfd(src) : NULL;
     }
-    ret = proc_spawn(path, argc, argv, fds, current_task->cwd, (flags & SPAWN_DETACH) ? NULL : current_task);
+    char cwd[sizeof task_process()->cwd];
+    uint64_t irq_flags = irq_save();
+    for (int i = 0; i < 3; i++) {
+        fds[i] = getfd(sources[i]);
+        if (fds[i]) vfs_dup(fds[i]);
+    }
+    memcpy(cwd, task_process()->cwd, sizeof cwd);
+    irq_restore(irq_flags);
+    ret = proc_spawn(path, argc, argv, fds, cwd, (flags & SPAWN_DETACH) ? NULL : task_process());
 out:
+    for (unsigned i = 0; i < 3; i++) if (fds[i]) vfs_close(fds[i]);
     for (int i = 0; i < argc; i++) kfree(argv[i]);
     return ret;
 }
@@ -240,8 +289,8 @@ static int64_t sys_waitpid(int pid, int *ustatus, int flags) {
     return r;
 }
 
-static int64_t sys_sbrk(int64_t inc) {
-    struct task *t = current_task;
+static int64_t sys_sbrk_locked(int64_t inc) {
+    struct task *t = task_process();
     uint64_t old = t->brk;
     if (inc == 0) return old;
     uint64_t nb = t->brk + inc;
@@ -265,43 +314,52 @@ static int64_t sys_sbrk(int64_t inc) {
     return old;
 }
 
+static int64_t sys_sbrk(int64_t inc) {
+    return sys_sbrk_locked(inc);
+}
+
 static int64_t sys_pipe(int *ufds) {
     if (!user_ok_w(ufds, 8)) return -EFAULT;
     struct file *r, *w;
     int e = pipe_create(&r, &w);
     if (e < 0) return e;
-    int a = allocfd(r);
-    if (a < 0) {
-        vfs_close(r);
-        vfs_close(w);
-        return a;
+    uint64_t flags = irq_save();
+    int a = -1, b = -1;
+    for (int i = 0; i < MAX_FDS; i++) if (!task_process()->fds[i]) {
+        if (a < 0) a = i;
+        else { b = i; break; }
     }
-    int b = allocfd(w);
     if (b < 0) {
-        current_task->fds[a] = NULL;
+        irq_restore(flags);
         vfs_close(r);
         vfs_close(w);
-        return b;
+        return -EMFILE;
     }
+    task_process()->fds[a] = r;
+    task_process()->fds[b] = w;
     ufds[0] = a;
     ufds[1] = b;
+    irq_restore(flags);
     return 0;
 }
 
 static int64_t sys_dup2(int oldfd, int newfd) {
+    uint64_t flags = irq_save();
     struct file *f = getfd(oldfd);
-    if (!f || newfd < 0 || newfd >= MAX_FDS) return -EBADF;
-    if (oldfd == newfd) return newfd;
-    if (current_task->fds[newfd]) vfs_close(current_task->fds[newfd]);
-    current_task->fds[newfd] = vfs_dup(f);
+    if (!f || newfd < 0 || newfd >= MAX_FDS) { irq_restore(flags); return -EBADF; }
+    if (oldfd == newfd) { irq_restore(flags); return newfd; }
+    struct file *previous = task_process()->fds[newfd];
+    task_process()->fds[newfd] = vfs_dup(f);
+    irq_restore(flags);
+    vfs_close(previous);
     return newfd;
 }
 
 static int64_t sys_dup(int oldfd) {
-    struct file *f = getfd(oldfd);
+    struct file *f = getfd_ref(oldfd);
     if (!f) return -EBADF;
     int fd = allocfd(f);
-    if (fd >= 0) vfs_dup(f);
+    if (fd < 0) vfs_close(f);
     return fd;
 }
 
@@ -344,6 +402,7 @@ static int64_t sys_poll(struct n_pollfd *ufds, int n, int timeout) {
 
 static int64_t sys_proclist(struct n_procinfo *out, int max) {
     if (max < 0 || !user_ok_w(out, (size_t)max * sizeof *out)) return -EFAULT;
+    uint64_t flags = irq_save();
     int n = 0;
     for (struct task *t = task_list; t && n < max; t = t->all_next) {
         struct n_procinfo *p = &out[n++];
@@ -357,6 +416,7 @@ static int64_t sys_proclist(struct n_procinfo *out, int max) {
         p->mem_kb = proc_user_pages(t) * 4;
         p->start_ms = t->start_ms;
     }
+    irq_restore(flags);
     return n;
 }
 
@@ -367,8 +427,10 @@ static int64_t sys_sysinfo(struct n_sysinfo *si) {
     si->free_mem = pmm_free_pages() * PAGE_SIZE;
     si->heap_used = heap_used_bytes();
     si->uptime_ms = uptime_ms();
+    uint64_t flags = irq_save();
     int n = 0;
     for (struct task *t = task_list; t; t = t->all_next) n++;
+    irq_restore(flags);
     si->ntasks = n;
     si->fb_w = fb.width;
     si->fb_h = fb.height;
@@ -379,22 +441,27 @@ static int64_t sys_sysinfo(struct n_sysinfo *si) {
 }
 
 static int64_t sys_fcntl(int fd, int cmd, int arg) {
+    uint64_t flags = irq_save();
     struct file *f = getfd(fd);
-    if (!f) return -EBADF;
-    if (cmd == F_GETFL) return f->flags;
-    if (cmd == F_SETTTY) {
+    int64_t result = -EINVAL;
+    if (!f) result = -EBADF;
+    else if (cmd == F_GETFL) result = f->flags;
+    else if (cmd == F_SETTTY) {
         f->vn->tty = arg != 0;
-        return 0;
-    }
-    if (cmd == F_SETFL) {
+        result = 0;
+    } else if (cmd == F_SETFL) {
         f->flags = (f->flags & O_ACCMODE) | (arg & ~O_ACCMODE);
-        return 0;
+        result = 0;
     }
-    return -EINVAL;
+    irq_restore(flags);
+    return result;
 }
 
 static int64_t sys_killtree(int pid, int include_self) {
     /* kill every descendant of pid (used for Ctrl+C) */
+    /* BSP task-list ownership must span ancestry traversal, not only each
+       task_kill call: preemption may otherwise let another waiter reap t/a. */
+    uint64_t flags = irq_save();
     int killed = 0;
     bool again = true;
     while (again) {
@@ -413,15 +480,18 @@ static int64_t sys_killtree(int pid, int include_self) {
         }
     }
     if (include_self && task_kill(pid) == 0) killed++;
+    irq_restore(flags);
     return killed;
 }
 
 /* anonymous memory in its own region above the heap (window buffers live there too) */
-static int64_t sys_mmap(size_t len, int prot) {
-    struct task *t = current_task;
+static int64_t sys_mmap_locked(size_t len, int prot) {
+    struct task *t = task_process();
     if (len == 0 || len > (1ULL << 32)) return -EINVAL;
     len = ALIGN_UP(len, PAGE_SIZE);
     uint64_t va = t->mmap_next;
+    if (va >= USER_STACK_TOP - USER_STACK_MAX ||
+        len + PAGE_SIZE > USER_STACK_TOP - USER_STACK_MAX - va) return -ENOMEM;
     int vp = (prot & N_PROT_WRITE ? VM_W : 0) | (prot & N_PROT_EXEC ? VM_X : 0);
     if (vmm_user_alloc(t->pml4, va, len, vp) < 0) {
         vmm_user_free(t->pml4, va, len);
@@ -431,8 +501,8 @@ static int64_t sys_mmap(size_t len, int prot) {
     return (int64_t)va;
 }
 
-static int64_t sys_munmap(uint64_t va, size_t len) {
-    struct task *t = current_task;
+static int64_t sys_munmap_locked(uint64_t va, size_t len) {
+    struct task *t = task_process();
     if (va & (PAGE_SIZE - 1) || va < USER_MMAP_BASE || va + len > t->mmap_next || va + len < va) return -EINVAL;
     for (uint64_t a = va; a < va + len; a += PAGE_SIZE)
         if (vmm_get_pte(t->pml4, a) & PTE_SHARED) return -EINVAL; /* a window buffer */
@@ -440,10 +510,23 @@ static int64_t sys_munmap(uint64_t va, size_t len) {
     return 0;
 }
 
-static int64_t sys_mprotect(uint64_t va, size_t len, int prot) {
+static int64_t sys_mprotect_locked(uint64_t va, size_t len, int prot) {
     if (va & (PAGE_SIZE - 1) || va >= USER_TOP || va + len > USER_TOP || va + len < va) return -EINVAL;
     int vp = (prot & N_PROT_WRITE ? VM_W : 0) | (prot & N_PROT_EXEC ? VM_X : 0);
     return vmm_user_protect(current_task->pml4, va, len, vp);
+}
+
+/* These finite BSP helpers do not sleep. Kernel-mode timer IRQs request a
+   reschedule but cannot switch their continuation (idt.c). Keep IRQ delivery
+   enabled for large allocations; each PTE publication has its own short guard. */
+static int64_t sys_mmap(size_t len, int prot) {
+    return sys_mmap_locked(len, prot);
+}
+static int64_t sys_munmap(uint64_t va, size_t len) {
+    return sys_munmap_locked(va, len);
+}
+static int64_t sys_mprotect(uint64_t va, size_t len, int prot) {
+    return sys_mprotect_locked(va, len, prot);
 }
 
 static int64_t sys_dmesg(char *buf, size_t n) {
@@ -452,6 +535,11 @@ static int64_t sys_dmesg(char *buf, size_t n) {
 }
 
 void syscall_dispatch(struct regs *r) {
+    /* An AP trap may be queued as a BSP continuation when a sibling aborts
+       its process. Do not execute that pending syscall after it is killed:
+       a blocking syscall could enroll a new wait after task_kill's wake and
+       never reach the return-to-user kill check. */
+    if (current_task->killed) task_exit(current_task->kill_code);
     sti();
     uint64_t a = r->rdi, b = r->rsi, c = r->rdx, d = r->r10, e = r->r8;
     int64_t ret = -ENOSYS;
@@ -462,13 +550,15 @@ void syscall_dispatch(struct regs *r) {
     case SYS_OPEN: ret = sys_open((const char *)a, (int)b); break;
     case SYS_CLOSE: ret = sys_close((int)a); break;
     case SYS_AUDIO_FLUSH: {
-        struct file *f = getfd((int)a);
+        struct file *f = getfd_ref((int)a);
         ret = f ? audio_flush_file(f) : -EBADF;
+        vfs_close(f);
         break;
     }
     case SYS_LSEEK: {
-        struct file *f = getfd((int)a);
+        struct file *f = getfd_ref((int)a);
         ret = f ? vfs_seek(f, (int64_t)b, (int)c) : -EBADF;
+        vfs_close(f);
         break;
     }
     case SYS_STAT: ret = sys_stat((const char *)a, (struct kstat *)b); break;
@@ -481,8 +571,8 @@ void syscall_dispatch(struct regs *r) {
     case SYS_GETCWD: ret = sys_getcwd((char *)a, b); break;
     case SYS_SPAWN: ret = sys_spawn((const char *)a, (char **)b, (const int *)c, (int)d); break;
     case SYS_WAITPID: ret = sys_waitpid((int)a, (int *)b, (int)c); break;
-    case SYS_GETPID: ret = current_task->pid; break;
-    case SYS_GETPPID: ret = current_task->parent ? current_task->parent->pid : 0; break;
+    case SYS_GETPID: ret = task_process()->pid; break;
+    case SYS_GETPPID: ret = task_process()->parent ? task_process()->parent->pid : 0; break;
     case SYS_KILL: ret = task_kill((int)a); break;
     case SYS_KILLTREE: ret = sys_killtree((int)a, (int)b); break;
     case SYS_SBRK: ret = sys_sbrk((int64_t)a); break;
@@ -501,6 +591,62 @@ void syscall_dispatch(struct regs *r) {
         else { smp_get_info(&info); memcpy((void *)a, &info, sizeof info); ret = 0; }
         break;
     }
+    case SYS_CLOCK_INFO: {
+        struct n_clockinfo info = {.version = 1};
+        if (!user_ok_w((void *)a, sizeof info)) { ret = -EFAULT; break; }
+        uint32_t ca, cb, cc, cd, max;
+        cpuid(0x80000000, 0, &max, &cb, &cc, &cd);
+        cd = 0;
+        if (max >= 0x80000007) cpuid(0x80000007, 0, &ca, &cb, &cc, &cd);
+        if (!hv.present && tsc_hz >= 1000000 && (cd & (1u << 8))) {
+            info.flags = N_CLOCK_USER_TSC;
+            info.tsc_hz = tsc_hz;
+        }
+        uint64_t flags = irq_save();
+        uint64_t reference_phys = hv_reference_tsc_page();
+        struct task *owner = task_process();
+        if (reference_phys && !owner->clock_page &&
+            owner->mmap_next <= USER_STACK_TOP - USER_STACK_MAX - 2 * PAGE_SIZE) {
+            uint64_t va = owner->mmap_next;
+            if (vmm_map_page(owner->pml4, va, reference_phys, PTE_P | PTE_U | PTE_SHARED | PTE_SHARED_RO | pte_nx)) {
+                owner->clock_page = va;
+                owner->mmap_next = va + 2 * PAGE_SIZE;
+            }
+        }
+        if (owner->clock_page) {
+            info.flags = N_CLOCK_HV_REFERENCE;
+            info.reference_page = owner->clock_page;
+        }
+        info.tsc_sample = rdtsc();
+        info.uptime_ms = uptime_ms();
+        if (info.reference_page) hv_reference_time(&info.reference_sample_100ns);
+        memcpy((void *)a, &info, sizeof info);
+        irq_restore(flags);
+        ret = 0;
+        break;
+    }
+    case SYS_THREAD_CREATE:
+        if (!user_ok((void *)a, 1) || !user_ok((void *)c, 1) ||
+            (vmm_get_pte(current_task->pml4, a) & PTE_NX) ||
+            (vmm_get_pte(current_task->pml4, c) & PTE_NX)) ret = -EFAULT;
+        else ret = task_thread_create(c, a, b);
+        break;
+    case SYS_THREAD_JOIN: ret = task_thread_join((int)a); break;
+    case SYS_THREAD_EXIT: task_exit(0);
+    case SYS_THREAD_ID: ret = current_task->pid; break;
+    case SYS_CPU_INDEX: ret = 0; break;
+    case SYS_THREAD_TLS:
+        if (!user_ok_w((void *)a, b) || b < 16 || b > PAGE_SIZE) ret = -EFAULT;
+        else { current_task->tls_base = a; wrmsr(0xC0000100, a); ret = 0; }
+        break;
+    case SYS_WAIT_ADDRESS:
+        if ((a & 3) || !user_ok((void *)a, sizeof(uint32_t))) ret = -EFAULT;
+        else ret = task_wait_address((volatile uint32_t *)a, (uint32_t)b, (unsigned)c);
+        break;
+    case SYS_WAKE_ADDRESS:
+        if ((a & 3) || !user_ok((void *)a, sizeof(uint32_t))) ret = -EFAULT;
+        else ret = task_wake_address((volatile uint32_t *)a, (unsigned)b);
+        break;
     case SYS_GPU_INFO: {
         struct n_gpu_info info;
         if (!user_ok_w((void *)a, sizeof info)) ret = -EFAULT;

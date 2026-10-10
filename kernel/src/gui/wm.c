@@ -48,6 +48,7 @@ struct window {
     int x, y;   /* outer frame position */
     int cw, ch; /* client size */
     uint32_t *buf;
+    uint32_t *user_buf; /* mapped producer pixels; compositor reads buf snapshot only */
     size_t pages;
     uint64_t uaddr;
     int flags;
@@ -65,6 +66,31 @@ static bool running;
 static int sw, sh;
 static canvas_t back, wall;
 static struct wait_queue wm_wq;
+
+/* BSP kernel continuations can be timer-preempted too. Serialize borrowed
+   window/frame state without masking interrupts during allocation or copies.
+   Reentrancy is needed for notifications and final vnode close from a WM call.
+   IRQ input sinks only enqueue input; they never acquire this sleeping lock. */
+static struct task *wm_owner;
+static unsigned wm_depth;
+static struct wait_queue wm_lock_wait;
+static void wm_lock(void) {
+    cpu_require_bsp();
+    uint64_t flags = irq_save();
+    while (wm_owner && wm_owner != current_task) wq_wait(&wm_lock_wait);
+    wm_owner = current_task;
+    wm_depth++;
+    irq_restore(flags);
+}
+static void wm_unlock(void) {
+    uint64_t flags = irq_save();
+    if (wm_owner != current_task || !wm_depth) panic("wm: invalid owner");
+    if (!--wm_depth) {
+        wm_owner = NULL;
+        wq_wake_all(&wm_lock_wait);
+    }
+    irq_restore(flags);
+}
 
 static struct window *zorder[MAX_WIN]; /* bottom .. top */
 static int nwin;
@@ -218,20 +244,22 @@ static bool in_resize_grip(struct window *w, int x, int y) {
 
 /* ---- event queues ---- */
 static void push_event(struct window *w, const struct gui_event *e) {
-    if (!w || w->dead) return;
+    uint64_t flags = irq_save();
+    if (!w || w->dead) { irq_restore(flags); return; }
     if (e->type == EV_MOUSE_MOVE && w->ev_count) {
         int last = (w->ev_head + EVQ - 1) % EVQ;
         if (w->ev[last].type == EV_MOUSE_MOVE) {
             w->ev[last] = *e;
-            return;
+            irq_restore(flags); return;
         }
     }
-    if (w->ev_count == EVQ) return;
+    if (w->ev_count == EVQ) { irq_restore(flags); return; }
     w->ev[w->ev_head] = *e;
     w->ev_head = (w->ev_head + 1) % EVQ;
     w->ev_count++;
     wq_wake_all(&w->wq);
     poll_notify();
+    irq_restore(flags);
 }
 
 static void send_simple(struct window *w, int type) {
@@ -309,13 +337,15 @@ static void unmap_user(struct window *w) {
     w->uaddr = 0;
 }
 
-static void win_destroy(struct window *w) {
+static void win_destroy_locked(struct window *w) {
     if (w->dead) return;
     if (w->shown) damage_window(w);
     damage_taskbar(); /* its button goes away even when focus does not change */
     unmap_user(w);
     if (w->buf) vfree(w->buf, w->pages);
+    if (w->user_buf) vfree(w->user_buf, w->pages);
     w->buf = NULL;
+    w->user_buf = NULL;
     int i = zindex(w);
     if (i >= 0) {
         for (; i < nwin - 1; i++) zorder[i] = zorder[i + 1];
@@ -334,6 +364,12 @@ static void win_destroy(struct window *w) {
     wq_wake_all(&w->wq);
     poll_notify();
     wake_compositor();
+}
+
+static void win_destroy(struct window *w) {
+    wm_lock();
+    win_destroy_locked(w);
+    wm_unlock();
 }
 
 static int64_t win_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
@@ -389,7 +425,10 @@ static bool alloc_buffer(struct window *w, int cw, int ch) {
     size_t pages = ALIGN_UP((uint64_t)cw * ch * 4, PAGE_SIZE) / PAGE_SIZE;
     uint32_t *buf = vmalloc(pages);
     if (!buf) return false;
+    uint32_t *producer = vmalloc(pages);
+    if (!producer) { vfree(buf, pages); return false; }
     w->buf = buf;
+    w->user_buf = producer;
     w->pages = pages;
     w->cw = cw;
     w->ch = ch;
@@ -397,12 +436,22 @@ static bool alloc_buffer(struct window *w, int cw, int ch) {
 }
 
 static uint64_t map_user(struct window *w, struct task *t) {
+    uint64_t flags = irq_save();
     uint64_t va = t->mmap_next;
-    for (size_t i = 0; i < w->pages; i++) {
-        uint64_t pa = vmm_translate(kernel_pml4, (uint64_t)w->buf + i * PAGE_SIZE);
-        if (!vmm_map_page(t->pml4, va + i * PAGE_SIZE, pa, PTE_P | PTE_W | PTE_U | PTE_SHARED | pte_nx)) return 0;
+    uint64_t bytes = (w->pages + 1) * PAGE_SIZE;
+    if (va >= USER_STACK_TOP - USER_STACK_MAX ||
+        bytes > USER_STACK_TOP - USER_STACK_MAX - va) {
+        irq_restore(flags); return 0;
     }
-    t->mmap_next = va + (w->pages + 1) * PAGE_SIZE;
+    t->mmap_next = va + bytes; /* reserve before an IRQ-enabled page loop */
+    irq_restore(flags);
+    for (size_t i = 0; i < w->pages; i++) {
+        uint64_t pa = vmm_translate(kernel_pml4, (uint64_t)w->user_buf + i * PAGE_SIZE);
+        if (!vmm_map_page(t->pml4, va + i * PAGE_SIZE, pa, PTE_P | PTE_W | PTE_U | PTE_SHARED | pte_nx)) {
+            while (i) vmm_unmap_page(t->pml4, va + --i * PAGE_SIZE);
+            return 0;
+        }
+    }
     w->uaddr = va;
     w->pml4 = t->pml4;
     return va;
@@ -1800,6 +1849,7 @@ static void wm_thread(void *arg) {
             if (waiting) { uint64_t ticks=rdtsc()-waiting; wt.wait_ticks+=ticks; wt.max_wait=MAX(wt.max_wait,ticks); }
         }
         irq_restore(fl);
+        wm_lock();
         struct trace_frame frame={.begin=trace_active?rdtsc():0,.waited=waited};
 
         while (in_tail != in_head) {
@@ -1832,6 +1882,7 @@ static void wm_thread(void *arg) {
         }
         composite();
         trace_frame_end(&frame);
+        wm_unlock();
         /* 全join/presentと借用終了後だけ譲る。合成中のkernel preemptionではない。 */
         if (wm_yield) {
             if (trace_active) wt.yield_calls++; /* switch数ではなく実呼出数。 */
@@ -1853,17 +1904,32 @@ bool wm_clipboard_set(const char *text, size_t n) {
     if (!nb) return false;
     memcpy(nb, text, n);
     nb[n] = 0;
+    wm_lock();
     if (clipboard) kfree(clipboard);
     clipboard = nb;
     clipboard_len = n;
     clipboard_seq++;
+    wm_unlock();
     return true;
 }
 
-const char *wm_clipboard(size_t *len, uint32_t *seq) {
+void wm_clipboard_info(size_t *len, uint32_t *seq) {
+    wm_lock();
     *len = clipboard_len;
     if (seq) *seq = clipboard_seq;
-    return clipboard ? clipboard : "";
+    wm_unlock();
+}
+
+char *wm_clipboard_snapshot(size_t *len) {
+    wm_lock();
+    char *text = kmalloc(clipboard_len + 1);
+    if (text) {
+        if (clipboard_len) memcpy(text, clipboard, clipboard_len);
+        text[clipboard_len] = 0;
+        *len = clipboard_len;
+    }
+    wm_unlock();
+    return text;
 }
 
 /* ---- remote display ---- */
@@ -1919,39 +1985,52 @@ static bool set_screen_size(int w, int h) {
 }
 
 void wm_remote_resize(int *w, int *h) {
+    wm_lock();
     if (*w > 0 && *h > 0) set_screen_size(MAX(640, MIN(*w, 3840)), MAX(480, MIN(*h, 2160)));
     *w = sw;
     *h = sh;
     damage_all(); /* repaint without the pointer */
     wake_compositor();
+    wm_unlock();
 }
 
 bool wm_remote_attach(int *w, int *h) {
-    if (!running) return false;
+    wm_lock();
+    if (!running) { wm_unlock(); return false; }
     remote_users++;
     wm_remote_resize(w, h);
+    wm_unlock();
     return true;
 }
 
 void wm_remote_detach(void) {
+    wm_lock();
     if (remote_users > 0) remote_users--;
     if (!remote_users) set_screen_size((int)fb.width, (int)fb.height);
     damage_all();
     wake_compositor();
+    wm_unlock();
 }
 
 int wm_remote_damage(struct wm_rect *out, int max) {
-    uint64_t f = irq_save();
+    wm_lock();
     int n = MIN(nrdamage, max);
     for (int i = 0; i < n; i++) out[i] = (struct wm_rect){rdamage[i].x, rdamage[i].y, rdamage[i].w, rdamage[i].h};
     nrdamage = 0;
-    irq_restore(f);
+    wm_unlock();
     return n;
 }
 
-const uint32_t *wm_remote_frame(int *pitch) {
-    *pitch = back.pitch;
-    return back.px;
+bool wm_remote_copy(uint32_t *dst, int pitch, int x, int y, int w, int h) {
+    wm_lock();
+    bool valid = x >= 0 && y >= 0 && w >= 0 && h >= 0 &&
+                 x <= sw && y <= sh && w <= sw - x && h <= sh - y;
+    if (valid)
+        for (int row = 0; row < h; row++)
+            memcpy(dst + (size_t)row * pitch,
+                   back.px + (size_t)(y + row) * back.pitch + x, (size_t)w * 4);
+    wm_unlock();
+    return valid;
 }
 
 int wm_cursor_shape(void) { return cursor_shape; }
@@ -2002,26 +2081,28 @@ void wm_notify(const char *title, const char *text) {
         kprintf("[%s] %s\n", title, text);
         return;
     }
+    wm_lock();
     strlcpy(toast_title, title, sizeof toast_title);
     strlcpy(toast_text, text, sizeof toast_text);
     toast_until = uptime_ms() + 4000;
     struct rect t = toast_rect();
     damage_rect(t.x, t.y, t.w, t.h);
     wake_compositor();
+    wm_unlock();
 }
 
 void wm_process_exit(int pid) {
     if (!running) return;
+    wm_lock();
     for (int i = nwin - 1; i >= 0; i--) {
         if (i >= nwin) continue;
         if (zorder[i]->pid == pid) win_destroy(zorder[i]);
     }
+    wm_unlock();
 }
 
 /* ---- syscalls ---- */
-static struct window *fd_window(int fd) {
-    if (fd < 0 || fd >= MAX_FDS) return NULL;
-    struct file *f = current_task->fds[fd];
+static struct window *fd_window(struct file *f) {
     if (!f || f->vn->type != VT_WINDOW) return NULL;
     struct window *w = f->vn->priv;
     return w->dead ? NULL : w;
@@ -2039,7 +2120,7 @@ static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
     if (utitle && user_str(w->title, utitle, sizeof w->title) < 0) strcpy(w->title, "window");
     if (!utitle) strcpy(w->title, current_task->name);
     w->flags = flags;
-    w->pid = current_task->pid;
+    w->pid = task_process()->pid;
     w->id = next_win_id++;
     if (!alloc_buffer(w, cw, ch)) {
         kfree(w);
@@ -2059,6 +2140,7 @@ static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
     struct vnode *v = kzalloc(sizeof *v);
     if (!v) {
         vfree(w->buf, w->pages);
+        vfree(w->user_buf, w->pages);
         kfree(w);
         return -ENOMEM;
     }
@@ -2069,13 +2151,20 @@ static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
     v->unlinked = true;
     w->vn = v;
     struct file *f = vfs_open_vnode(v, O_RDWR);
+    if (!f) {
+        vfree(w->buf, w->pages);
+        vfree(w->user_buf, w->pages);
+        kfree(w); kfree(v); return -ENOMEM;
+    }
     int fd = -EMFILE;
+    uint64_t irq = irq_save();
     for (int i = 0; i < MAX_FDS; i++)
-        if (!current_task->fds[i]) {
-            current_task->fds[i] = f;
+        if (!task_process()->fds[i]) {
+            task_process()->fds[i] = f;
             fd = i;
             break;
         }
+    irq_restore(irq);
     if (fd < 0) {
         vfs_close(f); /* destroys the window and frees everything */
         return fd;
@@ -2096,25 +2185,25 @@ static void show_if_needed(struct window *w) {
     damage_rect(0, sh - TASKBAR_H, sw, TASKBAR_H);
 }
 
-int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
+static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e, struct file *file) {
     switch (num) {
     case SYS_WIN_CREATE: return sys_win_create((int)a, (int)b, (const char *)c, (int)d);
     case SYS_WIN_MAP: {
-        struct window *w = fd_window((int)a);
+        struct window *w = fd_window(file);
         if (!w) return -EBADF;
         if (w->pml4 != current_task->pml4) return -EPERM;
         if (w->uaddr) return (int64_t)w->uaddr;
-        uint64_t va = map_user(w, current_task);
+        uint64_t va = map_user(w, task_process());
         return va ? (int64_t)va : -ENOMEM;
     }
     case SYS_WIN_STATE: {
-        struct window *w=fd_window((int)a);
+        struct window *w=fd_window(file);
         if(!w)return -EBADF;
         if(w->pml4!=current_task->pml4)return -EPERM;
         return (visible(w)?WIN_STATE_VISIBLE:0) | (focused()==w?WIN_STATE_FOCUSED:0);
     }
     case SYS_WIN_PRESENT: {
-        struct window *w = fd_window((int)a);
+        struct window *w = fd_window(file);
         if (!w) return -EBADF;
         int x = (int)b, y = (int)c, rw = (int)(d >> 32), rh = (int)(d & 0xFFFFFFFF);
         if (rw <= 0 || rh <= 0) {
@@ -2122,13 +2211,21 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
             rw = w->cw;
             rh = w->ch;
         }
+        /* A present message publishes only the requested rectangle. Mutable
+           user pixels are never referenced by asynchronous compositor jobs. */
+        int x0 = MAX(0, MIN(x, w->cw)), y0 = MAX(0, MIN(y, w->ch));
+        int x1 = MAX(x0, (int)MIN((int64_t)w->cw, (int64_t)x + rw));
+        int y1 = MAX(y0, (int)MIN((int64_t)w->ch, (int64_t)y + rh));
+        for (int row = y0; row < y1; row++)
+            memcpy(w->buf + (size_t)row * w->cw + x0,
+                   w->user_buf + (size_t)row * w->cw + x0, (size_t)(x1 - x0) * 4);
         if (!w->shown) show_if_needed(w);
         else if (visible(w)) damage_rect(client_x(w) + x, client_y(w) + y, MIN(rw, w->cw - x), MIN(rh, w->ch - y));
         wake_compositor();
         return 0;
     }
     case SYS_WIN_SET_TITLE: {
-        struct window *w = fd_window((int)a);
+        struct window *w = fd_window(file);
         if (!w) return -EBADF;
         if (user_str(w->title, (const char *)b, sizeof w->title) < 0) return -EFAULT;
         if (w->shown) {
@@ -2146,7 +2243,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
         return running ? 0 : -ENOSYS;
     }
     case SYS_WIN_MOVE: {
-        struct window *w = fd_window((int)a);
+        struct window *w = fd_window(file);
         if (!w) return -EBADF;
         damage_window(w);
         w->x = (int)b;
@@ -2168,30 +2265,36 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
         return (int64_t)clipboard_len;
     }
     case SYS_WIN_RESIZE: {
-        struct window *w = fd_window((int)a);
+        struct window *w = fd_window(file);
         if (!w) return -EBADF;
         if (w->pml4 != current_task->pml4) return -EPERM;
         int ncw = MAX(16, MIN((int)b, sw)), nch = MAX(16, MIN((int)c, sh));
         damage_window(w);
         uint32_t *obuf = w->buf;
+        uint32_t *ouser = w->user_buf;
         size_t opages = w->pages;
         int ocw = w->cw, och = w->ch;
         bool was_mapped = w->uaddr != 0;
         if (!alloc_buffer(w, ncw, nch)) {
             w->buf = obuf;
+            w->user_buf = ouser;
             w->pages = opages;
             return -ENOMEM;
         }
-        for (int y = 0; y < MIN(och, nch); y++) memcpy(&w->buf[y * ncw], &obuf[y * ocw], MIN(ocw, ncw) * 4);
+        for (int y = 0; y < MIN(och, nch); y++) {
+            memcpy(&w->buf[y * ncw], &obuf[y * ocw], MIN(ocw, ncw) * 4);
+            memcpy(&w->user_buf[y * ncw], &ouser[y * ocw], MIN(ocw, ncw) * 4);
+        }
         /* unmap the old buffer from the owner */
         if (was_mapped) {
             for (size_t i = 0; i < opages; i++) vmm_unmap_page(w->pml4, w->uaddr + i * PAGE_SIZE);
             w->uaddr = 0;
         }
         vfree(obuf, opages);
+        vfree(ouser, opages);
         damage_window(w);
         wake_compositor();
-        uint64_t va = map_user(w, current_task);
+        uint64_t va = map_user(w, task_process());
         return va ? (int64_t)va : -ENOMEM;
     }
     case SYS_SCREEN_GRAB: {
@@ -2215,4 +2318,22 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
     }
     default: return -ENOSYS;
     }
+}
+
+int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
+    if (num == SYS_GUI_LAUNCH) return wm_syscall_locked(num,a,b,c,d,e,NULL);
+    struct file *file = NULL;
+    if (num == SYS_WIN_MAP || num == SYS_WIN_STATE || num == SYS_WIN_PRESENT ||
+        num == SYS_WIN_SET_TITLE || num == SYS_WIN_MOVE || num == SYS_WIN_RESIZE) {
+        uint64_t flags = irq_save();
+        int fd = (int)a;
+        if (fd >= 0 && fd < MAX_FDS && task_process()->fds[fd])
+            file = vfs_dup(task_process()->fds[fd]);
+        irq_restore(flags);
+    }
+    wm_lock();
+    int64_t result = wm_syscall_locked(num,a,b,c,d,e,file);
+    wm_unlock();
+    vfs_close(file);
+    return result;
 }

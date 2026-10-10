@@ -92,7 +92,11 @@ globalThis.runAttributeCases=async function(){
     rejects(()=>document.createAttributeNS('urn:wrong','xmlns'),'NamespaceError');rejects(()=>document.createAttributeNS(XMLNS,'name'),'NamespaceError');
     rejects(()=>document.createAttributeNS(NS,':name'),'InvalidCharacterError');rejects(()=>n.setAttributeNS(NS,'p:','x'),'InvalidCharacterError');
     equal(document.createAttribute('9name').name,'9name','current relaxed attribute grammar');equal(document.createAttribute('@name').name,'@name');equal(document.createAttributeNS(NS,'p:a:b').localName,'a:b');
-    rejects(()=>document.createAttribute('x'.repeat(128)),'NotSupportedError','explicit native size boundary');
+    const longName='x'.repeat(600),longAttribute=document.createAttribute(longName);
+    equal(longAttribute.name,longName,'attribute names are not artificially capped');longAttribute.value='long-name-value';
+    equal(n.setAttributeNode(longAttribute),null);equal(n.getAttributeNode(longName),longAttribute,'long native Attr identity');
+    equal(n.getAttribute(longName),'long-name-value','long native attribute value');equal(n.removeAttributeNode(longAttribute),longAttribute);
+    equal(longAttribute.ownerElement,null);equal(longAttribute.name,longName,'detached long Attr lifetime');
     rejects(()=>{replacement.value='a\0b';},'NotSupportedError','NUL values are not silently truncated');
     rejects(()=>n.setAttributeNS('urn:a\0b','name','value'),'NotSupportedError','NUL namespace boundary');
     for(const fn of [()=>n.getAttribute(),()=>n.setAttribute('x'),()=>n.getAttributeNS(null),()=>attrs.item(),()=>attrs.setNamedItem(),()=>document.createAttributeNS(NS)])rejects(fn,'TypeError');

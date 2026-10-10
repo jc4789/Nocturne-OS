@@ -1,6 +1,7 @@
 #pragma once
 #include "kernel.h"
 #include "sys/sched.h"
+#include "sys/sched.h"
 
 enum { VT_FILE = 1, VT_DIR = 2, VT_CHAR = 3, VT_PIPE = 4, VT_WINDOW = 5 };
 
@@ -74,6 +75,8 @@ struct file {
     int flags;
     int refs;
     void *priv;
+    bool io_busy;
+    struct wait_queue io_wait; /* regular-file shared offset; device directions stay independent */
 };
 
 extern struct vnode *vfs_root;

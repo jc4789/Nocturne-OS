@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <errno.h>
 #include "nocturne.h"
 
@@ -24,6 +25,27 @@ typedef struct fblk {
 
 static blk *sentinel;
 static fblk *freelist;
+static uint32_t allocator_lock;
+
+static void heap_lock(void) {
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n(&allocator_lock, &expected, 1, false,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    while (__atomic_exchange_n(&allocator_lock, 2, __ATOMIC_ACQUIRE)) {
+#ifndef MALLOCTRIM_MODEL
+        wait_on_address(&allocator_lock, 2, UINT32_MAX);
+#else
+        __asm__ volatile("pause");
+#endif
+    }
+}
+static void heap_unlock(void) {
+    if (__atomic_exchange_n(&allocator_lock, 0, __ATOMIC_RELEASE) == 2) {
+#ifndef MALLOCTRIM_MODEL
+        wake_address(&allocator_lock, 1);
+#endif
+    }
+}
 
 static size_t bsize(blk *b) { return b->size & ~(size_t)USED; }
 static blk *next_blk(blk *b) { return (blk *)((char *)b + bsize(b)); }
@@ -117,7 +139,7 @@ static int grow(size_t need) {
     return 0;
 }
 
-void *malloc(size_t n) {
+static void *malloc_locked(size_t n) {
     if (!sentinel && heap_init() < 0) return NULL;
     if (n > ((size_t)1 << 40)) return NULL;
     size_t need = (n + HDR + 15) & ~(size_t)15;
@@ -144,7 +166,7 @@ void *malloc(size_t n) {
     return NULL;
 }
 
-void free(void *p) {
+static void free_locked(void *p) {
     if (!p) return;
     blk *b = (blk *)((char *)p - HDR);
     b->size &= ~(size_t)USED;
@@ -161,10 +183,10 @@ void *calloc(size_t n, size_t m) {
     return p;
 }
 
-void *realloc(void *p, size_t n) {
-    if (!p) return malloc(n);
+static void *realloc_locked(void *p, size_t n) {
+    if (!p) return malloc_locked(n);
     if (!n) {
-        free(p);
+        free_locked(p);
         return NULL;
     }
     blk *b = (blk *)((char *)p - HDR);
@@ -189,9 +211,30 @@ void *realloc(void *p, size_t n) {
         }
         return p;
     }
-    void *q = malloc(n);
+    void *q = malloc_locked(n);
     if (!q) return NULL;
     memcpy(q, p, have);
-    free(p);
+    free_locked(p);
+    return q;
+}
+
+void *malloc(size_t n) {
+    heap_lock();
+    void *p = malloc_locked(n);
+    heap_unlock();
+    return p;
+}
+void free(void *p) {
+    if (!p) return;
+    int saved_errno = errno;
+    heap_lock();
+    free_locked(p);
+    heap_unlock();
+    errno = saved_errno;
+}
+void *realloc(void *p, size_t n) {
+    heap_lock();
+    void *q = realloc_locked(p, n);
+    heap_unlock();
     return q;
 }

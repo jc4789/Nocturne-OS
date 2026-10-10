@@ -6,11 +6,44 @@
 #include <math.h>
 #include <limits.h>
 #include <nocturne.h>
+#include <parallel.h>
 #include "webi.h"
 #include "web_dialog.h"
 #include "form_validation.h"
 #include "form_value.h"
 #include "avmedia.h"
+
+/* Slot 2 is reserved for CSS. The supervisor and each subtree worker own
+   independent declaration/variable scratch; rule indexes and DOM are frozen. */
+struct dent;
+struct var_index_entry;
+struct css_scratch {
+    struct dent *declarations;
+    int declaration_count, declaration_capacity;
+    uint8_t *properties;
+    const struct custom_prop *variable_head;
+    struct var_index_entry *variables;
+    size_t variable_capacity;
+    arena_t *arena;
+    bool worker;
+    bool form_snapshot;
+};
+static struct css_scratch css_main_scratch;
+static struct css_scratch *css_scratch_get(void) {
+    struct css_scratch *s = thread_local_get(2);
+    return s ? s : &css_main_scratch;
+}
+static bool css_worker(void) { return css_scratch_get()->worker; }
+/* Rank 0 also executes subtree jobs, with isolated worker scratch. Its native
+   chrome service must remain responsive while APs only observe cancellation. */
+static bool css_can_service(void) { return !css_worker() || parallel_worker_index() == 0; }
+#define dents (css_scratch_get()->declarations)
+#define ndents (css_scratch_get()->declaration_count)
+#define capdents (css_scratch_get()->declaration_capacity)
+#define setbits (css_scratch_get()->properties)
+#define var_index_head (css_scratch_get()->variable_head)
+#define var_index (css_scratch_get()->variables)
+#define var_index_capacity (css_scratch_get()->variable_capacity)
 
 /* ---------------------------------------------------------------- data structures */
 enum { SK_TAG, SK_ID, SK_CLASS, SK_ATTR, SK_PC, SK_SLOTTED };
@@ -59,6 +92,9 @@ struct decl {
 struct mcond {
     const char *q;
     const struct mcond *up;
+    const char *name; /* escaped, case-sensitive container identifier */
+    uint8_t axes;    /* 1 = inline, 2 = both (horizontal writing mode) */
+    bool container;
 };
 
 struct font_source {const char *url;struct font_source *next;};
@@ -80,9 +116,23 @@ struct rule {
     const char *selector_text;
 };
 
+struct opacity_frame {
+    struct opacity_frame *next;
+    float offset;
+    struct decl *decls;
+    int count;
+};
+struct opacity_keyframes {
+    struct opacity_keyframes *next;
+    const char *name;
+    const struct mcond *media;
+    struct opacity_frame *first, *last;
+};
+
 struct sheet {
     struct rule *first, *last;
     struct font_face *fonts,*fonts_last;
+    struct opacity_keyframes *motions, *motions_last;
     double order;
     bool ua;
     node_t *scope; /* NULL: document author sheet; otherwise its shadow root */
@@ -167,6 +217,88 @@ static void trim_r(const char *s, const char **e) {
 }
 
 static bool ident_char(unsigned char c) { return isalnum(c) || c == '-' || c == '_' || c >= 0x80; }
+
+/* Container names must not acquire a length cap or allocate scratch memory
+   while selectors are matched on APs. Decode one codepoint at a time. */
+static unsigned container_hex(unsigned char c) {
+    return c >= '0' && c <= '9' ? c-'0' : c >= 'a' && c <= 'f' ? c-'a'+10 :
+           c >= 'A' && c <= 'F' ? c-'A'+10 : 16;
+}
+static uint32_t container_char(const char **ps,const char *e) {
+    const unsigned char *s=(const unsigned char *)*ps;
+    uint32_t cp=*s++; unsigned count=0;
+    if(cp=='\\' && (const char *)s<e) {
+        cp=0;
+        while((const char *)s<e && container_hex(*s)<16 && count++<6)cp=cp*16+container_hex(*s++);
+        if(!count)cp=*s++;
+        else if((const char *)s<e && is_space(*s)) { if(*s++=='\r' && (const char *)s<e && *s=='\n')s++; }
+        if(!cp || cp>0x10ffff || (cp>=0xd800 && cp<=0xdfff))cp=0xfffd;
+    } else if(cp>=0xc0) {
+        unsigned more=cp<0xe0?1:cp<0xf0?2:3;
+        cp &= more==1?31:more==2?15:7;
+        while(more-- && (const char *)s<e && (*s&0xc0)==0x80)cp=(cp<<6)|(*s++&63);
+    }
+    *ps=(const char *)s;return cp;
+}
+static const char *container_ident_end(const char *s,const char *e) {
+    while(s<e) {
+        if(ident_char((unsigned char)*s)){s++;continue;}
+        if(*s!='\\' || s+1==e || s[1]=='\n' || s[1]=='\r' || s[1]=='\f')break;
+        container_char(&s,e);
+    }
+    return s;
+}
+static bool container_ident_equal(const char *s,const char *e,const char *t,const char *te,bool insensitive) {
+    while(s<e && t<te) {
+        uint32_t a=container_char(&s,e),b=container_char(&t,te);
+        if(insensitive && a<128 && b<128){a=lower(a);b=lower(b);}
+        if(a!=b)return false;
+    }
+    return s==e && t==te;
+}
+static bool container_reserved(const char *s,const char *e) {
+    static const char *reserved[]={"none","and","or","not","initial","inherit","unset","revert","revert-layer","default"};
+    for(size_t i=0;i<sizeof reserved/sizeof *reserved;i++)
+        if(container_ident_equal(s,e,reserved[i],reserved[i]+strlen(reserved[i]),true))return true;
+    return false;
+}
+static bool container_ident_valid(const char *s,const char *e) {
+    if(s==e || container_ident_end(s,e)!=e || container_reserved(s,e))return false;
+    /* Escaping a digit is valid; an unescaped digit at the start is not. */
+    const char *p=s;if(*p=='-'){if(++p==e)return false;if(*p=='-')return true;}
+    return *p=='\\' || *p=='_' || isalpha((unsigned char)*p) || (unsigned char)*p>=0x80;
+}
+bool css_container_names_valid(const char *s,size_t n) {
+    const char *e=s+n;bool any=false;
+    while((s=skip_ws(s,e))<e) {
+        const char *p=container_ident_end(s,e);
+        if(!container_ident_valid(s,p) || (p<e && !is_space((unsigned char)*p)))return false;
+        any=true;s=p;
+    }
+    return any;
+}
+static bool container_preserve_names(const char *property,size_t pn,const char *v,size_t vn) {
+    if(strn_ieq(property,"container-name",pn))return css_container_names_valid(v,vn);
+    if(!strn_ieq(property,"container",pn))return false;
+    const char *s=v,*e=v+vn;
+    while((s=skip_ws(s,e))<e && *s!='/') {
+        const char *p=container_ident_end(s,e);
+        if(p==s || (p<e && !is_space((unsigned char)*p) && *p!='/'))return false;
+        s=p;
+    }
+    return css_container_names_valid(v,(size_t)(s-v));
+}
+static bool container_names_match(const char *names,const char *name) {
+    if(!name)return true;if(!names)return false;
+    const char *s=names,*e=names+strlen(names),*ne=name+strlen(name);
+    while((s=skip_ws(s,e))<e) {
+        const char *p=container_ident_end(s,e);
+        if(p==s)break;
+        if(container_ident_equal(s,p,name,ne,false))return true;
+        s=p;
+    }
+    return false;
+}
 
 /* an identifier with escapes resolved, or NULL */
 static const char *read_ident(arena_t *a, const char **ps, const char *e, bool lowercase) {
@@ -678,6 +810,7 @@ static bool match_pc(const struct simple *x, node_t *e, node_t *scope) {
     case PC_INDETERMINATE:
         return !e->foreign && ((e->tag == T_input && web_input_type(e) == WEB_INPUT_CHECKBOX && e->indeterminate) || (e->tag == T_progress && !node_attr(e, "value")));
     case PC_CHECKED:
+        if (css_scratch_get()->form_snapshot) return (e->style_form_state & WEB_STYLE_CHECKED) != 0;
         return (e->tag == T_input && e->checked) || doc_option_selected(e);
     case PC_DISABLED: return form_control(e) && web_control_disabled(e);
     case PC_ENABLED: return form_control(e) && !web_control_disabled(e);
@@ -689,6 +822,9 @@ static bool match_pc(const struct simple *x, node_t *e, node_t *scope) {
     case PC_REQUIRED: return web_control_required(e);
     case PC_OPTIONAL: return web_control_required_applicable(e) && !web_control_required(e);
     case PC_VALID: case PC_INVALID: {
+        if (css_scratch_get()->form_snapshot)
+            return (e->style_form_state & WEB_STYLE_VALIDATABLE) &&
+                ((e->style_form_state & WEB_STYLE_INVALID) != 0) == (x->pc == PC_INVALID);
         if (!e->foreign && (e->tag == T_form || e->tag == T_fieldset)) {
             bool valid = web_form_constraints_valid(e->owner, e);
             return x->pc == PC_VALID ? valid : !valid;
@@ -698,6 +834,9 @@ static bool match_pc(const struct simple *x, node_t *e, node_t *scope) {
         return x->pc == PC_VALID ? valid : !valid;
     }
     case PC_IN_RANGE: case PC_OUT_OF_RANGE: {
+        if (css_scratch_get()->form_snapshot)
+            return (e->style_form_state & WEB_STYLE_RANGE) &&
+                ((e->style_form_state & WEB_STYLE_IN_RANGE) != 0) == (x->pc == PC_IN_RANGE);
         int range = web_control_in_range(e->owner, e);
         return range >= 0 && (x->pc == PC_IN_RANGE ? range == 1 : range == 0);
     }
@@ -712,6 +851,7 @@ static bool match_pc(const struct simple *x, node_t *e, node_t *scope) {
         }
         return false;
     case PC_PLACEHOLDER_SHOWN:
+        if (css_scratch_get()->form_snapshot) return (e->style_form_state & WEB_STYLE_PLACEHOLDER) != 0;
         return !e->foreign && (e->tag == T_input || e->tag == T_textarea) &&
                node_attr(e, "placeholder") && !*web_input_edit_text(e);
     case PC_READ_WRITE: return read_write(e);
@@ -753,7 +893,10 @@ static bool match_compound(const struct compound *c, node_t *e, node_t *scope) {
 }
 
 static bool match_from(const struct compound *c, node_t *e, node_t *scope) {
-    if (e && !web_native_checkpoint(e->owner)) return false;
+    if (e) {
+        if (css_can_service()) { if (!web_native_checkpoint(e->owner)) return false; }
+        else if (__atomic_load_n(&e->owner->native_cancelled, __ATOMIC_ACQUIRE)) return false;
+    }
     for (int i = 0; i < c->n; i++) if (c->s[i].kind == SK_SLOTTED) {
         if (!scope || !match_list(c->s[i].args, e, NULL)) return false;
         node_t *slot = doc_assigned_slot(e, false);
@@ -986,7 +1129,7 @@ static bool supports_decl(arena_t *a, const char *property, size_t pn, const cha
     bool custom = supports_custom_name(property, pn);
     const struct propdef *p = custom ? NULL : css_prop_lookup(property, pn);
     if (!custom && !p) return false;
-    v = css_value_canonical(a, v, vn, &vn);
+    if(!container_preserve_names(property,pn,v,vn))v = css_value_canonical(a, v, vn, &vn);
     while (vn && is_space((unsigned char)*v)) v++, vn--;
     while (vn && is_space((unsigned char)v[vn - 1])) vn--;
     if (supports_delim(v, v + vn, ";!") != v + vn) return false;
@@ -1208,7 +1351,7 @@ static struct decl *parse_decl(struct pctx *pc, const char *s, const char *e, st
         }
     }
     size_t vn = (size_t)(ve - v);
-    v = css_value_canonical(pc->a, v, vn, &vn);
+    if(!container_preserve_names(name,namelen,v,vn))v = css_value_canonical(pc->a, v, vn, &vn);
     ve = v + vn;
     if (namelen > 2 && name[0] == '-' && name[1] == '-') {
         d->name = ar_strndup(pc->a, name, namelen);
@@ -1224,6 +1367,33 @@ static struct decl *parse_decl(struct pctx *pc, const char *s, const char *e, st
 static void parse_rules(struct pctx *pc, const char *s, const char *e, const struct mcond *media);
 static void parse_style_rule(struct pctx *pc, const char *ps, const char *pe, const char *bs, const char *be,
                              const struct mcond *media, const char *parent);
+
+static const struct mcond *parse_condition(struct pctx *pc,const char *qs,const char *qe,
+                                           const struct mcond *up,bool container) {
+    struct mcond *mc=ar_alloc(pc->a,sizeof *mc);
+    mc->up=up;mc->container=container;mc->axes=1;
+    if(container && qs<qe && *qs!='(') {
+        const char *p=container_ident_end(qs,qe),*rest=skip_ws(p,qe);
+        /* not/style()/unknown functions belong to the condition, not a name. */
+        if(p>qs && rest>p && container_ident_valid(qs,p)) {
+            mc->name=ar_strndup(pc->a,qs,(size_t)(p-qs));qs=rest;
+        }
+    }
+    char *q=ar_strndup(pc->a,qs,(size_t)(qe-qs));mc->q=q;
+    if(container) {
+        for(char *p=q;*p;p++)*p=(char)lower((unsigned char)*p);
+        const char *s=q,*e=q+strlen(q);
+        while(s<e) {
+            if(!ident_char((unsigned char)*s)){s++;continue;}
+            const char *p=s;while(s<e && ident_char((unsigned char)*s))s++;
+            size_t n=(size_t)(s-p);
+            if(n>=4 && (!memcmp(p,"min-",4) || !memcmp(p,"max-",4)))p+=4,n-=4;
+            if(strn_ieq(p,"height",n) || strn_ieq(p,"block-size",n) ||
+               strn_ieq(p,"aspect-ratio",n) || strn_ieq(p,"orientation",n))mc->axes=2;
+        }
+    }
+    return mc;
+}
 
 /* a nested rule's selector, relative to its parent's: & is the parent */
 static char *nest_selector(struct pctx *pc, const char *ps, const char *pe, const char *parent) {
@@ -1278,12 +1448,8 @@ static void parse_body(struct pctx *pc, const char *s, const char *e, const char
                 if (name && (!strcmp(name, "media") || !strcmp(name, "supports") || !strcmp(name, "container") ||
                              !strcmp(name, "layer") || !strcmp(name, "scope"))) {
                     const struct mcond *m = media;
-                    if (!strcmp(name, "media")) {
-                        struct mcond *mc = ar_alloc(pc->a, sizeof *mc);
-                        mc->q = ar_strndup(pc->a, qs, (size_t)(qe - qs));
-                        mc->up = media;
-                        m = mc;
-                    }
+                    if (!strcmp(name,"media") || !strcmp(name,"container"))
+                        m=parse_condition(pc,qs,qe,media,!strcmp(name,"container"));
                     if (strcmp(name, "supports") || css_supports_condition(qs, (size_t)(p - qs), false)) {
                         static const char amp[] = "&";
                         parse_style_rule(pc, amp, amp + 1, p + 1, be, m, sel);
@@ -1333,7 +1499,10 @@ static void parse_style_rule(struct pctx *pc, const char *ps, const char *pe, co
     parse_body(pc, bs, be, sel_text, media, &r->decls, &r->ndecls);
 }
 static struct css_rule_info *cssom_record(struct pctx *pc, uint32_t type, const char *s, const char *e) {
-    if (pc->rule_depth != 1 || !type) return NULL;
+    /* New grouping rules have no legacy CSSRule numeric constant (type 0).
+       They still need source metadata: replaceSync and CSSOM edits rebuild
+       the native AST from this list, not from its already-flattened rules. */
+    if (pc->rule_depth != 1) return NULL;
     if (pc->sh->cssom_count == UINT32_MAX) {
         if (pc->a->trap) longjmp(*pc->a->trap, 1);
         abort();
@@ -1404,6 +1573,54 @@ static void parse_font_face(struct pctx *pc,const char *s,const char *e,const st
     pc->sh->fonts_last=f;
 }
 
+static void parse_opacity_keyframes(struct pctx *pc,const char *ns,const char *ne,
+    const char *s,const char *e,const struct mcond *media) {
+    const char *cursor=ns,*name=read_ident(pc->a,&cursor,ne,false);
+    if(!name || skip_ws(cursor,ne)!=ne || !strcasecmp(name,"none") || !strcasecmp(name,"initial") ||
+        !strcasecmp(name,"inherit") || !strcasecmp(name,"unset") || !strcasecmp(name,"default") ||
+        !strcasecmp(name,"revert") || !strcasecmp(name,"revert-layer"))return;
+    struct opacity_keyframes *key=ar_alloc(pc->a,sizeof *key);key->name=name;key->media=media;
+    while((s=skip_ws(s,e))<e) {
+        const char *p=scan_to(s,e,"{;}");if(p==e)break;
+        if(*p!='{'){s=p+1;continue;}
+        const char *end=block_end(p+1,e);
+        struct decl *decls=NULL;int count=0;parse_body(pc,p+1,end,NULL,NULL,&decls,&count);
+        /* One frame block may target several percentages. Invalid selector
+           lists discard that block; important declarations are ignored later. */
+        float offsets[64];int no=0;const char *q=s;bool valid=true;
+        while(q<p) {
+            const char *comma=scan_to(q,p,",");const char *a=skip_ws(q,comma),*z=comma;trim_r(a,&z);
+            float off=-1;
+            if(z-a==4 && strn_ieq(a,"from",4))off=0;
+            else if(z-a==2 && strn_ieq(a,"to",2))off=1;
+            else if(z>a && z[-1]=='%') {
+                char *text=ar_strndup(pc->a,a,(size_t)(z-a-1)),*tail;double v=strtod(text,&tail);
+                if(tail!=text && !*tail && isfinite(v) && v>=0 && v<=100)off=(float)(v/100);
+            }
+            if(off<0 || no==64){valid=false;break;}offsets[no++]=off;
+            q=comma<p?comma+1:p;
+            if(comma<p && q==p){valid=false;break;}
+        }
+        if(valid)for(int i=0;i<no;i++) {
+            /* Duplicate offsets are one keyframe cascade, including timing
+               declarations in a later block which omits opacity. */
+            struct opacity_frame *same=NULL;
+            for(struct opacity_frame *f=key->first;f;f=f->next)if(f->offset==offsets[i]){same=f;break;}
+            if(same) {
+                struct decl *joined=ar_alloc(pc->a,sizeof *joined*(size_t)(same->count+count));
+                memcpy(joined,same->decls,sizeof *joined*(size_t)same->count);
+                memcpy(joined+same->count,decls,sizeof *joined*(size_t)count);
+                same->decls=joined;same->count+=count;continue;
+            }
+            struct opacity_frame *f=ar_alloc(pc->a,sizeof *f);f->offset=offsets[i];f->decls=decls;f->count=count;
+            if(key->last)key->last->next=f;else key->first=f;key->last=f;
+        }
+        s=end<e?end+1:e;
+    }
+    if(pc->sh->motions_last)pc->sh->motions_last->next=key;else pc->sh->motions=key;
+    pc->sh->motions_last=key;
+}
+
 static void parse_rules(struct pctx *pc, const char *s, const char *e, const struct mcond *media) {
     pc->rule_depth++;
     while (s < e) {
@@ -1416,10 +1633,13 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
             const char *qs = skip_ws(ns, p), *qe = p;
             trim_r(qs, &qe);
             uint32_t type = !name ? 0 : !strcmp(name,"import") ? 3 : !strcmp(name,"media") ? 4 :
-                !strcmp(name,"font-face") ? 5 : !strcmp(name,"page") ? 6 : !strcmp(name,"keyframes") ? 7 :
+                !strcmp(name,"font-face") ? 5 : !strcmp(name,"page") ? 6 :
+                (!strcmp(name,"keyframes") || !strcmp(name,"-webkit-keyframes")) ? 7 :
                 !strcmp(name,"namespace") ? 10 : !strcmp(name,"supports") ? 12 : 0;
+            bool known_group = name && (!strcmp(name,"container") || !strcmp(name,"layer") ||
+                !strcmp(name,"scope") || !strcmp(name,"document") || !strcmp(name,"-moz-document"));
             if (p >= e || *p == ';') {
-                struct css_rule_info *info = p < e ? cssom_record(pc, type, s, p + 1) : NULL;
+                struct css_rule_info *info = p < e && (type || known_group) ? cssom_record(pc, type, s, p + 1) : NULL;
                 if (name && !strcmp(name, "import")) {
                     /* @import url [media]: fetched later, ordered just before this sheet */
                     const char *ue = scan_to(qs, qe, " \t\n");
@@ -1458,21 +1678,21 @@ static void parse_rules(struct pctx *pc, const char *s, const char *e, const str
                 continue;
             }
             const char *be = block_end(p + 1, e);
-            cssom_record(pc, type, s, be < e ? be + 1 : e);
+            if(type || known_group)cssom_record(pc, type, s, be < e ? be + 1 : e);
             if (name) {
                 if (!strcmp(name, "font-face")) parse_font_face(pc,p+1,be,media);
-                else if (!strcmp(name, "media")) {
-                    struct mcond *mc = ar_alloc(pc->a, sizeof *mc);
-                    mc->q = ar_strndup(pc->a, qs, (size_t)(qe - qs));
-                    mc->up = media;
-                    parse_rules(pc, p + 1, be, mc);
+                else if (!strcmp(name,"keyframes") || !strcmp(name,"-webkit-keyframes"))
+                    parse_opacity_keyframes(pc,qs,qe,p+1,be,media);
+                else if (!strcmp(name,"media") || !strcmp(name,"container")) {
+                    const struct mcond *mc=parse_condition(pc,qs,qe,media,!strcmp(name,"container"));
+                    parse_rules(pc,p+1,be,mc);
                 } else if (!strcmp(name, "supports")) {
                     if (css_supports_condition(qs, (size_t)(p - qs), false)) parse_rules(pc, p + 1, be, media);
-                } else if (!strcmp(name, "layer") || !strcmp(name, "container") || !strcmp(name, "scope") ||
+                } else if (!strcmp(name, "layer") || !strcmp(name, "scope") ||
                            !strcmp(name, "document") || !strcmp(name, "-moz-document")) {
                     parse_rules(pc, p + 1, be, media);
                 }
-                /* @keyframes, @page, @property, @starting-style ... are skipped */
+                /* @page, @property, @starting-style ... remain unsupported */
             }
             s = be < e ? be + 1 : e;
             continue;
@@ -1575,12 +1795,47 @@ sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base
     return pc.sh;
 }
 
+struct sheet_parse_job {
+    arena_t *arena;
+    const char *text, *base;
+    size_t length;
+    double order;
+    pvec *imports;
+    sheet_t *result;
+    int failed;
+};
+static void sheet_parse_worker(size_t index, void *context) {
+    (void)index;
+    struct sheet_parse_job *job = context;
+    parallel_record_work(PARALLEL_CSS_PARSE, job->length);
+    jmp_buf trap; jmp_buf *outer = job->arena->trap;
+    job->arena->trap = &trap;
+    job->failed = setjmp(trap);
+    if (!job->failed) job->result = css_parse_sheet(job->arena, job->text, job->length, job->base, job->order, job->imports);
+    job->arena->trap = outer;
+}
+static void sheet_parse_service(void *context) { web_native_checkpoint(context); }
+sheet_t *css_parse_sheet_serviced(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports) {
+    if (!d || !d->live || n < 16384 || parallel_active())
+        return css_parse_sheet(a,css,n,base_url,order,imports);
+    struct sheet_parse_job job = {a,css,base_url,n,order,imports,NULL,0};
+    parallel_call_stage(PARALLEL_CSS_PARSE,sheet_parse_worker,&job,sheet_parse_service,d);
+    if (job.failed) {
+        if (a->trap) longjmp(*a->trap,job.failed);
+        ar_alloc(a,SIZE_MAX); return NULL;
+    }
+    return job.result;
+}
+
 /* ---------------------------------------------------------------- media queries */
 /* CSS and matchMedia share this explicit-stack parser and device model. Unknown
    features use Kleene logic: negating an unsupported feature is not a match. */
 enum { MQ_UNKNOWN = -1, MQ_FALSE, MQ_TRUE };
 enum { MQ_LENGTH = 1, MQ_RATIO, MQ_RESOLUTION, MQ_INTEGER, MQ_NUMBER };
-struct mq { const char *s, *e; int vw, vh; bool scripting, valid; };
+struct mq {
+    const char *s,*e; float vw,vh; bool scripting,valid;
+    bool container; float em,rem,viewport_width,viewport_height;
+};
 static int mq_cond(struct mq *m, bool allow_or);
 static int mq_not(int a) { return a < 0 ? a : !a; }
 static int mq_and(int a, int b) { return !a || !b ? 0 : a < 0 || b < 0 ? -1 : 1; }
@@ -1630,17 +1885,18 @@ static bool mq_value(const char *s,const char *e,int kind,const struct mq *m,dou
     }else {
         if(!n){if(v!=0)return false;}
         else if(strn_ieq(p,"px",n))scale=1;
-        else if(strn_ieq(p,"em",n)||strn_ieq(p,"rem",n))scale=16;
+        else if(strn_ieq(p,"em",n))scale=m->container?m->em:16;
+        else if(strn_ieq(p,"rem",n))scale=m->container?m->rem:16;
         else if(strn_ieq(p,"pt",n))scale=96.0/72;
         else if(strn_ieq(p,"pc",n))scale=16;
         else if(strn_ieq(p,"in",n))scale=96;
         else if(strn_ieq(p,"cm",n))scale=96/2.54;
         else if(strn_ieq(p,"mm",n))scale=96/25.4;
         else if(strn_ieq(p,"q",n))scale=96/101.6;
-        else if(strn_ieq(p,"vw",n))scale=m->vw/100.0;
-        else if(strn_ieq(p,"vh",n))scale=m->vh/100.0;
-        else if(strn_ieq(p,"vmin",n))scale=(m->vw<m->vh?m->vw:m->vh)/100.0;
-        else if(strn_ieq(p,"vmax",n))scale=(m->vw>m->vh?m->vw:m->vh)/100.0;
+        else if(strn_ieq(p,"vw",n))scale=(m->container?m->viewport_width:m->vw)/100.0;
+        else if(strn_ieq(p,"vh",n))scale=(m->container?m->viewport_height:m->vh)/100.0;
+        else if(strn_ieq(p,"vmin",n))scale=m->container?fminf(m->viewport_width,m->viewport_height)/100.0:fminf(m->vw,m->vh)/100.0;
+        else if(strn_ieq(p,"vmax",n))scale=m->container?fmaxf(m->viewport_width,m->viewport_height)/100.0:fmaxf(m->vw,m->vh)/100.0;
         else return false;
     }
     *out=v*scale;return true;
@@ -1648,9 +1904,10 @@ static bool mq_value(const char *s,const char *e,int kind,const struct mq *m,dou
 static int mq_numeric(const char *s,size_t n,const struct mq *m,double *v) {
     /* Screen dimensions are not supplied by the embedder. Deprecated device-*
        features stay unknown rather than falsely equating screen and window. */
-    if(strn_ieq(s,"width",n)){*v=m->vw;return MQ_LENGTH;}
-    if(strn_ieq(s,"height",n)){*v=m->vh;return MQ_LENGTH;}
+    if(strn_ieq(s,"width",n) || (m->container && strn_ieq(s,"inline-size",n))){*v=m->vw;return MQ_LENGTH;}
+    if(strn_ieq(s,"height",n) || (m->container && strn_ieq(s,"block-size",n))){*v=m->vh;return MQ_LENGTH;}
     if(strn_ieq(s,"aspect-ratio",n)){*v=m->vh?(double)m->vw/m->vh:0;return MQ_RATIO;}
+    if(m->container)return 0;
     if(strn_ieq(s,"resolution",n)){*v=1;return MQ_RESOLUTION;}
     if(strn_ieq(s,"-webkit-device-pixel-ratio",n)||strn_ieq(s,"device-pixel-ratio",n)){*v=1;return MQ_NUMBER;}
     if(strn_ieq(s,"color",n)){*v=8;return MQ_INTEGER;}
@@ -1660,6 +1917,7 @@ static int mq_numeric(const char *s,size_t n,const struct mq *m,double *v) {
 static const char *mq_discrete(const char *s,size_t n,const struct mq *m,const char **allowed) {
 #define FEATURE(name,value,choices) if(strn_ieq(s,name,n)){*allowed=choices;return value;}
     FEATURE("orientation",m->vw>m->vh?"landscape":"portrait","portrait landscape")
+    if(m->container)return NULL;
     FEATURE("prefers-color-scheme","light","light dark")
     FEATURE("prefers-reduced-motion","no-preference","no-preference reduce")
     FEATURE("prefers-reduced-transparency","no-preference","no-preference reduce")
@@ -1759,7 +2017,7 @@ term:;
            (in+3==close||!ident_char((unsigned char)in[3]))))){
             struct mq_walk *child=calloc(1,sizeof*child);
             if(!child){m->valid=false;while(f){struct mq_walk *p=f->parent;free(f);f=p;}return MQ_UNKNOWN;}
-            child->parent=f;child->m=(struct mq){in,close,q->vw,q->vh,q->scripting,true};child->allow_or=true;
+            child->parent=f;child->m=*q;child->m.s=in;child->m.e=close;child->m.valid=true;child->allow_or=true;
             f=child;continue;
         }
         result=mq_feature(in,close,q);
@@ -1814,7 +2072,7 @@ bool css_media_evaluate(const char *query,int vw,int vh,bool scripting,char *out
         while(end<e){char c=*end;if(c=='(')depth++;else if(c==')'){if(!depth)bad=true;else depth--;}
             if(!depth&&c==',')break;if((unsigned char)c<32&&!is_space(c))bad=true;
             if(c=='\\'||c=='\''||c=='"'||c=='{'||c=='}'||c==';'||c=='['||c==']')bad=true;end++;}
-        struct mq m={s,end,vw,vh,scripting,!bad&&!depth};int r=mq_query(&m);
+        struct mq m={.s=s,.e=end,.vw=vw,.vh=vh,.scripting=scripting,.valid=!bad&&!depth};int r=mq_query(&m);
         bool valid=m.valid&&skip_ws(m.s,m.e)==m.e;any|=valid&&r==MQ_TRUE;
         if(!first)ok=ok&&mq_append(out,cap,&used,", ",2);first=false;
         if(!valid||r==MQ_UNKNOWN)ok=ok&&mq_append(out,cap,&used,"not all",7);
@@ -1834,7 +2092,36 @@ bool css_media_evaluate(const char *query,int vw,int vh,bool scripting,char *out
     free(text);if(!ok&&out&&cap)out[0]=0;return ok&&any;
 }
 static bool media_chain_ok(const struct mcond *m,int vw,int vh,bool scripting) {
-    for(;m;m=m->up)if(!css_media_evaluate(m->q,vw,vh,scripting,NULL,0))return false;return true;
+    for(;m;m=m->up)if(!m->container && !css_media_evaluate(m->q,vw,vh,scripting,NULL,0))return false;return true;
+}
+static bool font_conditions_ok(const struct mcond *m,int vw,int vh,bool scripting) {
+    /* Global font resources have no element against which a size condition
+       can be tested. Unsupported conditional non-style rules are not enabled. */
+    for(const struct mcond *p=m;p;p=p->up)if(p->container)return false;
+    return media_chain_ok(m,vw,vh,scripting);
+}
+
+static node_t *query_container(node_t *e,const char *name,unsigned axes,bool inclusive) {
+    if(inclusive && e->container_valid && (axes==1 || e->container_type==CT_SIZE) &&
+       container_names_match(e->container_names,name))return e;
+    if(!name)return axes==1?e->query_inline_container:e->query_size_container;
+    for(node_t *n=doc_flat_parent(e);n;n=doc_flat_parent(n))
+        if(n->container_valid && (axes==1 || n->container_type==CT_SIZE) &&
+           container_names_match(n->container_names,name))return n;
+    return NULL;
+}
+static bool container_chain_ok(const struct mcond *mc,node_t *e,bool inclusive) {
+    for(;mc;mc=mc->up) {
+        if(!mc->container)continue;
+        node_t *n=query_container(e,mc->name,mc->axes,inclusive);
+        if(!n)return false; /* unavailable/unsupported is unknown, even under not */
+        struct mq m={.s=mc->q,.e=mc->q+strlen(mc->q),.vw=n->container_width,.vh=n->container_height,
+            .valid=true,.container=true,.em=n->container_em,.rem=e->owner->container_rem,
+            .viewport_width=e->owner->width,.viewport_height=e->owner->height};
+        int value=mq_cond(&m,true);
+        if(!m.valid || skip_ws(m.s,m.e)!=m.e || value!=MQ_TRUE)return false;
+    }
+    return true;
 }
 
 struct font_binding {
@@ -1846,48 +2133,41 @@ static bool font_faces_available;
 static void font_bindings_clear(void) {
     free(font_bindings);font_bindings=NULL;font_binding_count=font_binding_capacity=0;
 }
-static font_t *select_web_font_uncached(web_doc *d,node_t *node,style_t *style,int vw,int vh) {
+static struct font_face *scoped_font_face(web_doc *d, node_t *scope, const char *family, unsigned weight, bool italic, int vw, int vh);
+static font_t *select_web_font_uncached(web_doc *d,node_t *node,style_t *style,int vw,int vh,arena_t *a) {
     if(!style->font_names)return NULL;
     const char *cursor=style->font_names,*end=cursor+strlen(cursor);
-    node_t *scope=doc_node_root(node,false);bool scripting=web_js_enabled(d);
+    node_t *scope=doc_node_root(node,false);
     while(cursor<end) {
         const char *token=skip_ws(cursor,end);bool quoted=token<end && (*token=='"' || *token=='\'');
-        const char *family=css_font_family_next(&d->smem,&cursor,end);if(!family || !cursor)return NULL;
+        const char *family=css_font_family_next(a,&cursor,end);if(!family || !cursor)return NULL;
         /* Generic keywords terminate named lookup in the authored fallback
            order. A quoted name with that spelling is still a named family. */
         if(!quoted && (!strcasecmp(family,"serif") || !strcasecmp(family,"sans-serif") || !strcasecmp(family,"monospace") ||
             !strcasecmp(family,"system-ui") || !strcasecmp(family,"cursive") || !strcasecmp(family,"fantasy")))return NULL;
-        struct font_face *best=NULL;unsigned score=UINT_MAX;
-        for(int i=0;i<d->sty.sheets.n;i++) {
-            sheet_t *sheet=d->sty.sheets.v[i];
-            if((sheet->scope && sheet->scope!=scope) || (!sheet->scope && scope && scope->shadow_host))continue;
-            if(sheet->owner_media && !css_media_evaluate(sheet->owner_media,vw,vh,scripting,NULL,0))continue;
-            for(struct font_face *f=sheet->fonts;f;f=f->next) {
-                if(strcasecmp(family,f->family) || !media_chain_ok(f->media,vw,vh,scripting))continue;
-                unsigned weight=style->font_weight,dist=weight<f->weight_lo?f->weight_lo-weight:weight>f->weight_hi?weight-f->weight_hi:0;
-                unsigned candidate=dist+((style->font_style!=0)!=f->italic?10000u:0u);
-                if(candidate<=score){best=f;score=candidate;}
-            }
-        }
+        struct font_face *best=scoped_font_face(d,scope,family,style->font_weight,style->font_style!=0,vw,vh);
         if(!best)continue;
         for(struct font_source *src=best->sources;src;src=src->next) {
-            struct web_font_resource *r=doc_font_resource(d,src->url);
-            if(!r){ar_alloc(&d->smem,SIZE_MAX);return NULL;}
+            struct web_font_resource *r=NULL;
+            if(css_worker()) { for(r=d->fonts;r && strcmp(r->url,src->url);r=r->next) {} }
+            else r=doc_font_resource(d,src->url);
+            if(!r){ar_alloc(a,SIZE_MAX);return NULL;}
             if(r->failed)continue;
-            r->wanted=true;return r->face;
+            __atomic_store_n(&r->wanted,true,__ATOMIC_RELAXED);return r->face;
         }
     }
     return NULL;
 }
-static font_t *select_web_font(web_doc *d,node_t *node,style_t *style,int vw,int vh) {
+static font_t *select_web_font(web_doc *d,node_t *node,style_t *style,int vw,int vh,arena_t *a) {
     if(!font_faces_available || !style->font_names)return NULL;
+    if(css_worker())return select_web_font_uncached(d,node,style,vw,vh,a);
     node_t *scope=doc_node_root(node,false);unsigned weight=style->font_weight;bool italic=style->font_style!=0;
     for(size_t i=0;i<font_binding_count;i++) {
         const struct font_binding *b=&font_bindings[i];
         if(b->scope==scope && b->weight==weight && b->italic==italic &&
            (b->names==style->font_names || !strcmp(b->names,style->font_names)))return b->face;
     }
-    font_t *face=select_web_font_uncached(d,node,style,vw,vh);
+    font_t *face=select_web_font_uncached(d,node,style,vw,vh,a);
     if(font_binding_count==font_binding_capacity) {
         size_t cap=font_binding_capacity?font_binding_capacity:16;
         if(cap<=SIZE_MAX/2)cap*=2;
@@ -1908,7 +2188,6 @@ struct ient {
     const struct rule *r;
     uint32_t order;
     bool ua;
-    node_t *scope;
     struct ient *next;
 };
 
@@ -1923,11 +2202,101 @@ struct htab {
     uint32_t cap;
 };
 
-struct css_ctx {
-    arena_t a;
+struct css_index {
     struct htab ids, classes, tags;
     struct ient *univ;
+    const struct rule *source;
+    struct font_face *fonts;
+    struct opacity_keyframes *motions;
+    bool ua;
+    uint32_t rules;
+    unsigned form_features;
+    bool containers;
+    struct css_index *next;
 };
+struct css_binding {
+    struct css_index *index;
+    uint32_t order;
+    struct css_binding *next;
+};
+struct css_scope {
+    node_t *root;
+    struct css_binding *first, *last;
+    struct css_scope *next;
+};
+struct css_ctx {
+    arena_t a;
+    struct css_index *indexes[256];
+    struct css_scope *scopes;
+    struct css_binding *ua;
+    bool relational, siblings, parallel_safe, containers;
+    unsigned form_features;
+};
+
+/* Custom-property declarations can feed a container unit to an ordinary
+   property through var(), so inspect all declaration values, not just lengths. */
+static bool container_units_used(const char *s) {
+    while(*s) {
+        if(lower((unsigned char)s[0])=='c' && lower((unsigned char)s[1])=='q') {
+            const char *p=s+2;while(ident_char((unsigned char)*p))p++;
+            size_t n=(size_t)(p-s);
+            if(strn_ieq(s,"cqw",n)||strn_ieq(s,"cqh",n)||strn_ieq(s,"cqi",n)||
+               strn_ieq(s,"cqb",n)||strn_ieq(s,"cqmin",n)||strn_ieq(s,"cqmax",n))return true;
+        }
+        s++;
+    }
+    return false;
+}
+
+static node_t *container_first(node_t *n) {
+    if(n->shadow_root)n=n->shadow_root;
+    if(n->type==N_ELEM && !n->foreign && n->tag==T_slot && n->slot_assigned_first &&
+       doc_node_root(n,false)->shadow_host)return n->slot_assigned_first;
+    return n->first;
+}
+static node_t *container_next(node_t *n) {
+    node_t *p=doc_flat_parent(n);
+    if(p && p->type==N_ELEM && !p->foreign && p->tag==T_slot && p->slot_assigned_first &&
+       doc_node_root(p,false)->shadow_host)return n->assigned_next;
+    return n->next;
+}
+
+bool css_containers_update(web_doc *d) {
+    struct css_ctx *x=d?d->sty.ctx:NULL;
+    if(!x || !__atomic_load_n(&x->containers,__ATOMIC_ACQUIRE) || !d->html)return false;
+    bool changed=false;float rem=d->html->style?d->html->style->font_size:16;
+    if(d->container_rem!=rem){changed=true;d->container_rem=rem;}
+    for(node_t *n=d->html;n;) {
+        if(!web_native_checkpoint(d))return false;
+        node_t *parent=doc_flat_parent(n);
+        node_t *in=parent?(parent->container_valid?parent:parent->query_inline_container):NULL;
+        node_t *block=parent?(parent->container_valid && parent->container_type==CT_SIZE?parent:parent->query_size_container):NULL;
+        if(n->query_inline_container!=in || n->query_size_container!=block)changed=true;
+        n->query_inline_container=in;n->query_size_container=block;
+        const style_t *st=n->style;box_t *b=n->box;
+        bool valid=st && st->container_type!=CT_NORMAL && b && !b->anon &&
+            st->display!=D_INLINE && st->display!=D_INLINE_TABLE &&
+            (b->kind==B_BLOCK || b->kind==B_FLEX || b->kind==B_GRID || b->kind==B_ATOMIC);
+        unsigned type=valid?st->container_type:CT_NORMAL;
+        float width=valid?b->w:0,height=valid && type==CT_SIZE?b->h:0,em=valid?st->font_size:0;
+        const char *names=valid?st->container_names:NULL;
+        bool names_equal=(!names && !n->container_names) || (names && n->container_names && !strcmp(names,n->container_names));
+        if(!names_equal) {
+            char *copy=names?strdup(names):NULL;
+            if(names && !copy){__atomic_store_n(&d->native_cancelled,true,__ATOMIC_RELEASE);return false;}
+            free(n->container_names);n->container_names=copy;changed=true;
+        }
+        if(n->container_valid!=valid || n->container_type!=type || n->container_width!=width ||
+           n->container_height!=height || n->container_em!=em)changed=true;
+        n->container_valid=valid;n->container_type=type;
+        n->container_width=width;n->container_height=height;n->container_em=em;
+        node_t *child=container_first(n);
+        if(child){n=child;continue;}
+        while(n && n!=d->html && !container_next(n))n=doc_flat_parent(n);
+        n=n && n!=d->html?container_next(n):NULL;
+    }
+    return changed;
+}
 
 static uint32_t hash_str(const char *s) {
     uint32_t h = 2166136261u;
@@ -1952,14 +2321,13 @@ static struct ient **ht_slot(arena_t *a, struct htab *t, const char *key, bool c
     return &b->list;
 }
 
-static void index_rule(struct css_ctx *x, const struct rule *r, const struct selector *s, uint32_t order, bool ua, node_t *scope) {
+static void index_rule(arena_t *a, struct css_index *x, const struct rule *r, const struct selector *s, uint32_t order, bool ua) {
     if (s->pseudo == PE_OTHER) return;
-    struct ient *ie = ar_alloc(&x->a, sizeof *ie);
+    struct ient *ie = ar_alloc(a, sizeof *ie);
     ie->sel = s;
     ie->r = r;
     ie->order = order;
     ie->ua = ua;
-    ie->scope = scope;
     const struct compound *c = s->right;
     const char *id = NULL, *cls = NULL, *tag = NULL;
     for (int i = 0; s->pseudo != PE_SLOTTED && i < c->n; i++) {
@@ -1967,9 +2335,9 @@ static void index_rule(struct css_ctx *x, const struct rule *r, const struct sel
         else if (c->s[i].kind == SK_CLASS && !cls) cls = c->s[i].name;
         else if (c->s[i].kind == SK_TAG) tag = c->s[i].name;
     }
-    struct ient **slot = id ? ht_slot(&x->a, &x->ids, id, true)
-                       : cls ? ht_slot(&x->a, &x->classes, cls, true)
-                       : tag ? ht_slot(&x->a, &x->tags, tag, true)
+    struct ient **slot = id ? ht_slot(a, &x->ids, id, true)
+                       : cls ? ht_slot(a, &x->classes, cls, true)
+                       : tag ? ht_slot(a, &x->tags, tag, true)
                              : &x->univ;
     ie->next = *slot;
     *slot = ie;
@@ -1978,11 +2346,34 @@ static void index_rule(struct css_ctx *x, const struct rule *r, const struct sel
 static sheet_t *ua_sheet, *quirks_sheet;
 static arena_t ua_arena;
 
+static unsigned selector_form_features(const struct compound *compound) {
+    unsigned features = 0;
+    for (const struct compound *c=compound;c;c=c->left)
+        for(int i=0;i<c->n;i++) {
+            const struct simple *s=&c->s[i];
+            if(s->kind==SK_PC) {
+                if(s->pc==PC_CHECKED)features |= WEB_STYLE_FORM_CHECKED;
+                if(s->pc==PC_VALID || s->pc==PC_INVALID)features |= WEB_STYLE_FORM_VALIDITY;
+                if(s->pc==PC_IN_RANGE || s->pc==PC_OUT_OF_RANGE)features |= WEB_STYLE_FORM_RANGE;
+                if(s->pc==PC_PLACEHOLDER_SHOWN)features |= WEB_STYLE_FORM_PLACEHOLDER;
+            }
+            if(s->args)for(int k=0;k<s->args->n;k++)features |= selector_form_features(s->args->v[k]->right);
+        }
+    return features;
+}
+static bool selector_siblings(const struct compound *compound) {
+    for(const struct compound *c=compound;c;c=c->left) {
+        if(c->comb=='+' || c->comb=='~')return true;
+        for(int i=0;i<c->n;i++)if(c->s[i].args)
+            for(int k=0;k<c->s[i].args->n;k++)if(selector_siblings(c->s[i].args->v[k]->right))return true;
+    }
+    return false;
+}
+
 static struct css_ctx *build_index(web_doc *d, int vw, int vh) {
     struct css_ctx *x = calloc(1, sizeof *x);
-    ht_init(&x->a, &x->ids, 1024);
-    ht_init(&x->a, &x->classes, 4096);
-    ht_init(&x->a, &x->tags, 256);
+    if (!x) { ar_alloc(&d->smem, SIZE_MAX); return NULL; }
+    x->parallel_safe = true;
     if (!ua_sheet) {
         const char *ua = css_ua_sheet();
         ua_sheet = css_parse_sheet(&ua_arena, ua, strlen(ua), "about:blank", -1, NULL);
@@ -2007,20 +2398,79 @@ static struct css_ctx *build_index(web_doc *d, int vw, int vh) {
         sheet_t *s = i == -2 ? ua_sheet : i == -1 ? quirks_sheet : sh->v[i];
         if (s->owner_media && !css_media_evaluate(s->owner_media, vw, vh, web_js_enabled(d), NULL, 0)) continue;
         if (i == -1 && !d->quirks) continue;
-        for (struct rule *r = s->first; r; r = r->next, order++) {
-            if (!web_native_checkpoint(d)) return x;
-            web_avmedia_checkpoint();
-            if (!r->ndecls || !media_chain_ok(r->media, vw, vh, web_js_enabled(d))) continue;
-            for (int k = 0; k < r->sel->n; k++) index_rule(x, r, r->sel->v[k], order, s->ua, s->scope);
+        unsigned bucket = ((uintptr_t)s->first >> 4) & 255;
+        struct css_index *index = x->indexes[bucket];
+        while (index && (index->source != s->first || index->fonts != s->fonts || index->motions != s->motions || index->ua != s->ua)) index = index->next;
+        if (!index) {
+            index = ar_alloc(&x->a, sizeof *index);
+            index->source = s->first; index->fonts=s->fonts; index->motions=s->motions; index->ua = s->ua;
+            index->next = x->indexes[bucket]; x->indexes[bucket] = index;
+            /* Small component sheets no longer allocate a document-sized hash
+               table, nor duplicate selector entries for every adoption. */
+            ht_init(&x->a, &index->ids, 64);
+            ht_init(&x->a, &index->classes, 128);
+            ht_init(&x->a, &index->tags, 64);
+            /* Registry identities are published before workers start. Worker
+               font selection only reads this list and atomically marks demand. */
+            for(struct font_face *font=s->fonts;font;font=font->next)
+                for(struct font_source *source=font->sources;source;source=source->next)
+                    if(!doc_font_resource(d,source->url))x->parallel_safe=false;
+            for (struct rule *r = s->first; r; r = r->next, index->rules++) {
+                if (!web_native_checkpoint(d)) return x;
+                if (r->selector_text && strstr(r->selector_text, ":has(")) x->relational = true;
+                for(const struct mcond *m=r->media;m;m=m->up)if(m->container)index->containers=true;
+                for(int k=0;k<r->ndecls;k++)if(container_units_used(r->decls[k].value))index->containers=true;
+                if (!r->ndecls || !media_chain_ok(r->media, vw, vh, web_js_enabled(d))) continue;
+                for (int k = 0; k < r->sel->n; k++) {
+                    index->form_features |= selector_form_features(r->sel->v[k]->right);
+                    if(selector_siblings(r->sel->v[k]->right))x->siblings=true;
+                    index_rule(&x->a, index, r, r->sel->v[k], index->rules, s->ua);
+                    if(d->profile_enabled)d->profile.style_index_entries++;
+                }
+            }
         }
+        x->form_features |= index->form_features;
+        x->containers |= index->containers;
+        struct css_binding *binding = ar_alloc(&x->a, sizeof *binding);
+        binding->index = index; binding->order = order; order += index->rules;
+        if (s->ua) { binding->next = x->ua; x->ua = binding; continue; }
+        node_t *root = s->scope ? s->scope : d->root;
+        struct css_scope *scope = root ? root->style_scope : NULL;
+        if (!scope) {
+            scope = ar_alloc(&x->a, sizeof *scope); scope->root = root;
+            scope->next = x->scopes; x->scopes = scope;
+            if (root) root->style_scope = scope;
+        }
+        if (scope->last) scope->last->next = binding; else scope->first = binding;
+        scope->last = binding;
     }
     return x;
 }
 
+static struct font_face *scoped_font_face(web_doc *d,node_t *root,const char *family,unsigned weight,bool italic,int vw,int vh) {
+    struct css_scope *scope=root?root->style_scope:NULL;
+    struct font_face *best=NULL;unsigned score=UINT_MAX;
+    bool scripting=d->sty.index_scripting;
+    for(struct css_binding *binding=scope?scope->first:NULL;binding;binding=binding->next)
+        for(struct font_face *f=binding->index->fonts;f;f=f->next) {
+            if(strcasecmp(family,f->family)||!font_conditions_ok(f->media,vw,vh,scripting))continue;
+            unsigned distance=weight<f->weight_lo?f->weight_lo-weight:weight>f->weight_hi?weight-f->weight_hi:0;
+            unsigned candidate=distance+(italic!=f->italic?10000u:0u);
+            if(candidate<=score){best=f;score=candidate;}
+        }
+    return best;
+}
+
+static void css_ctx_free(struct css_ctx *x) {
+    if (!x) return;
+    for (struct css_scope *s = x->scopes; s; s = s->next)
+        if (s->root && s->root->style_scope == s) s->root->style_scope = NULL;
+    ar_free(&x->a); free(x);
+}
+
 void css_styling_free(struct styling *st) {
     if (st->ctx) {
-        ar_free(&st->ctx->a);
-        free(st->ctx);
+        css_ctx_free(st->ctx);
         st->ctx = NULL;
     }
     pv_free(&st->sheets);
@@ -2198,6 +2648,49 @@ struct css_animation {
     uint8_t pseudo;
     char *text;
 };
+/* Playback owns only a name/time/identity, never an AST or computed-style
+   pointer. The supervisor ticks after joins; workers publish disjoint nodes
+   onto the document list with CAS and read one supervisor clock snapshot. */
+struct css_motion_state {
+    struct css_motion_state *next;
+    web_doc *document;
+    node_t *node;
+    char *name;
+    uint64_t last;
+    double elapsed;
+    bool paused, running;
+};
+static void css_motion_reset(node_t *n) {
+    if(n && n->css_motion){n->css_motion->node=NULL;n->css_motion->running=false;n->css_motion=NULL;}
+}
+void css_motion_doc_free(web_doc *d) {
+    while(d->css_motions) {
+        struct css_motion_state *s=d->css_motions;d->css_motions=s->next;
+        if(s->node && s->node->css_motion==s)s->node->css_motion=NULL;
+        free(s->name);free(s);
+    }
+}
+void css_motion_tick(web_doc *d,uint64_t now) {
+    if(!d || __atomic_load_n(&d->native_cancelled,__ATOMIC_ACQUIRE))return;
+    struct css_motion_state **slot=&d->css_motions;
+    while(*slot) {
+        struct css_motion_state *s=*slot;
+        if(!s->node){*slot=s->next;free(s->name);free(s);continue;}
+        slot=&s->next;
+        if(!s->node || !s->running || now<s->last || now-s->last<16)continue;
+        if(doc_node_root(s->node,true)!=d->root){css_motion_reset(s->node);continue;}
+        css_mark_dirty(d,s->node);d->need_style=d->dirty=true;
+    }
+}
+int64_t css_motion_deadline(web_doc *d,uint64_t now) {
+    if(!d || __atomic_load_n(&d->native_cancelled,__ATOMIC_ACQUIRE))return -1;
+    uint64_t deadline=UINT64_MAX;
+    for(struct css_motion_state *s=d->css_motions;s;s=s->next)if(s->node && s->running) {
+        uint64_t due=s->last>UINT64_MAX-16?UINT64_MAX:s->last+16;
+        if(due<deadline)deadline=due;
+    }
+    return deadline==UINT64_MAX?-1:deadline<=now?0:(int64_t)(deadline-now);
+}
 int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text) {
     struct css_animation **slot = &n->animations;
     while (*slot && ((*slot)->id != id || (*slot)->pseudo != pseudo)) {
@@ -2218,6 +2711,7 @@ int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text) 
     *slot = a; return 1;
 }
 void css_animation_free(node_t *n) {
+    css_motion_reset(n);
     while (n->animations) {
         struct css_animation *a = n->animations;
         n->animations = a->next;
@@ -2232,9 +2726,6 @@ struct dent {
     bool animation;
 };
 
-static struct dent *dents;
-static int ndents, capdents;
-static uint8_t *setbits;
 
 static int scope_depth(node_t *root) {
     int depth = 0;
@@ -2244,8 +2735,11 @@ static int scope_depth(node_t *root) {
 
 static void add_dent(const struct decl *d, uint64_t key, uint8_t pseudo, int depth) {
     if (ndents == capdents) {
-        capdents = capdents ? capdents * 2 : 256;
-        dents = realloc(dents, sizeof *dents * (size_t)capdents);
+        if(capdents>INT_MAX/2)ar_alloc(css_scratch_get()->arena,SIZE_MAX);
+        int capacity = capdents ? capdents * 2 : 256;
+        struct dent *next = realloc(dents, sizeof *dents * (size_t)capacity);
+        if(!next)ar_alloc(css_scratch_get()->arena,SIZE_MAX);
+        dents=next;capdents=capacity;
     }
     dents[ndents].d = d;
     /* Important origins reverse the normal order: UA rules such as scripting
@@ -2265,19 +2759,53 @@ static void add_rule_decls(const struct rule *r, uint32_t spec, uint32_t order, 
     }
 }
 
-static void collect(const struct ient *l, node_t *e) {
+static void collect(const struct ient *l, node_t *e, node_t *scope, uint32_t order) {
     node_t *root = doc_node_root(e, false);
     for (; l; l = l->next) {
-        if (!web_native_checkpoint(e->owner)) return;
-        web_avmedia_checkpoint();
+        if (css_worker() && __atomic_load_n(&e->owner->native_cancelled, __ATOMIC_ACQUIRE)) return;
+        if (css_can_service() && !web_native_checkpoint(e->owner)) return;
+        if (css_can_service()) web_avmedia_checkpoint();
+        if(e->owner->profile_enabled)__atomic_fetch_add(&e->owner->profile.style_rule_checks, 1, __ATOMIC_RELAXED);
         if (!l->ua) {
-            if (!l->scope && root && root->shadow_host) continue;
-            if (l->scope && l->sel->pseudo != PE_SLOTTED && root != l->scope && e != l->scope->shadow_host) continue;
+            if (!scope && root && root->shadow_host) continue;
+            if (scope && l->sel->pseudo != PE_SLOTTED && root != scope && e != scope->shadow_host) continue;
         }
-        if (match_from(l->sel->right, e, l->scope))
-            add_rule_decls(l->r, l->sel->spec, l->order, !l->ua,
-                           l->sel->pseudo == PE_SLOTTED ? PE_NONE : l->sel->pseudo, scope_depth(l->scope));
+        if (!container_chain_ok(l->r->media,e,l->sel->pseudo==PE_BEFORE || l->sel->pseudo==PE_AFTER)) continue;
+        /* Only cascade rule matching reads the published form snapshot. Live
+           matches()/querySelector() outside this call keep their normal API. */
+        bool previous = css_scratch_get()->form_snapshot;
+        css_scratch_get()->form_snapshot = true;
+        bool matches = match_from(l->sel->right, e, scope);
+        css_scratch_get()->form_snapshot = previous;
+        if (matches)
+            add_rule_decls(l->r, l->sel->spec, l->order + order, !l->ua,
+                           l->sel->pseudo == PE_SLOTTED ? PE_NONE : l->sel->pseudo, scope_depth(scope));
     }
+}
+
+static void collect_index(struct css_binding *binding, node_t *e, node_t *scope) {
+    for (; binding; binding = binding->next) {
+        struct css_index *x = binding->index;
+        if (e->id) {
+            struct ient **l = ht_slot(NULL, &x->ids, e->id, false);
+            if (l) collect(*l, e, scope, binding->order);
+        }
+        for (int i = 0; i < e->nclasses; i++) {
+            bool duplicate = false;
+            for (int j = 0; j < i; j++) if (!strcmp(e->classes[i], e->classes[j])) duplicate = true;
+            if (duplicate) continue;
+            struct ient **l = ht_slot(NULL, &x->classes, e->classes[i], false);
+            if (l) collect(*l, e, scope, binding->order);
+        }
+        struct ient **l = ht_slot(NULL, &x->tags, e->name, false);
+        if (l) collect(*l, e, scope, binding->order);
+        collect(x->univ, e, scope, binding->order);
+    }
+}
+
+static void collect_scope(node_t *root, node_t *e) {
+    if (root && root->style_scope)
+        collect_index(root->style_scope->first, e, root->shadow_host ? root : NULL);
 }
 
 static int cmp_dent(const void *a, const void *b) {
@@ -2305,9 +2833,6 @@ struct var_index_entry {
     size_t length;
     uint32_t hash;
 };
-static const struct custom_prop *var_index_head;
-static struct var_index_entry *var_index;
-static size_t var_index_capacity;
 
 static void var_index_clear(void) {
     free(var_index);
@@ -2510,21 +3035,22 @@ static bool value_references(const char *s) {
 /* Iterative Tarjan: only declarations on this element form graph vertices.
    Inherited properties are already computed, so cannot form child cycles.
    Components are resolved in dependency order before mutating raw values. */
-static void resolve_vars(web_doc *d, struct custom_prop *mine, const struct custom_prop *inherited) {
+static void resolve_vars(web_doc *d, arena_t *a, struct custom_prop *mine, const struct custom_prop *inherited) {
     bool references=false;
     for (struct custom_prop *m=mine;m!=inherited;m=m->next)
         if (value_references(m->value)) { references=true; break; }
     if (!references) return; /* Retain immutable literal AST values, no scratch/copy. */
     struct var_workspace { arena_t arena; sbuf output; } *work = calloc(1,sizeof *work);
     if (!work) {
+        if (css_worker()) { ar_alloc(a, SIZE_MAX); return; }
         for (struct custom_prop *m=mine;m!=inherited;m=m->next) m->value=NULL;
         web_js_console(d,2,"Custom property graph allocation failed"); return;
     }
-    jmp_buf trap; jmp_buf *outer = d->smem.trap;
-    work->arena.trap = d->smem.trap = &trap;
+    jmp_buf trap; jmp_buf *outer = a->trap;
+    work->arena.trap = a->trap = &trap;
     int failed = setjmp(trap);
     if (failed) {
-        sb_free(&work->output); ar_free(&work->arena); free(work); d->smem.trap=outer;
+        sb_free(&work->output); ar_free(&work->arena); free(work); a->trap=outer;
         if (outer) longjmp(*outer,failed);
         for (struct custom_prop *m=mine;m!=inherited;m=m->next) m->value=NULL;
         web_js_console(d,2,"Custom property graph/value allocation failed"); return;
@@ -2561,7 +3087,7 @@ static void resolve_vars(web_doc *d, struct custom_prop *mine, const struct cust
                     else if (value_references(v->property->value)) {
                         work->output.n=0;
                         if (subst(v->property->value,strlen(v->property->value),mine,&work->output))
-                            v->property->value=ar_strndup(&d->smem,work->output.p?work->output.p:"",work->output.n);
+                            v->property->value=ar_strndup(a,work->output.p?work->output.p:"",work->output.n);
                         else v->property->value=NULL;
                     }
                 } while (v!=f);
@@ -2571,7 +3097,7 @@ static void resolve_vars(web_doc *d, struct custom_prop *mine, const struct cust
             f=parent;
         }
     }
-    sb_free(&work->output); ar_free(&work->arena); free(work); d->smem.trap=outer;
+    sb_free(&work->output); ar_free(&work->arena); free(work); a->trap=outer;
 }
 
 struct cascade {
@@ -2579,6 +3105,10 @@ struct cascade {
     float rem;
     int vw, vh;
     sbuf vbuf;
+    arena_t *a;
+    bool full;
+    jmp_buf *trap;
+    struct cascade_frontier *frontier;
 };
 
 static void apply_decl(struct cascade *c, struct cx *cx, const struct decl *d) {
@@ -2599,7 +3129,7 @@ static void apply_decl(struct cascade *c, struct cx *cx, const struct decl *d) {
 
 static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uint8_t pseudo, bool underlying) {
     web_doc *d = c->d;
-    style_t *s = ar_alloc(&d->smem, sizeof *s);
+    style_t *s = ar_alloc(c->a, sizeof *s);
     css_style_init(s, parent);
     /* custom properties: the most important declaration of each name */
     const struct custom_prop *inherited = s->vars;
@@ -2611,7 +3141,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
         for (struct custom_prop *m = mine; m; m = m->next)
             if (!strcmp(m->name, x->name)) dup = true;
         if (dup) continue;
-        struct custom_prop *cp = ar_alloc(&d->smem, sizeof *cp);
+        struct custom_prop *cp = ar_alloc(c->a, sizeof *cp);
         cp->name = x->name;
         cp->value = x->value;
         cp->next = mine;
@@ -2622,11 +3152,18 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
         while (last->next) last = last->next;
         last->next = (struct custom_prop *)inherited;
         s->vars = mine;
-        resolve_vars(d,mine,inherited);
+        resolve_vars(d,c->a,mine,inherited);
     }
     memset(setbits, 0, (size_t)css_prop_count());
     struct cx cx = {s, parent, e, parent ? parent->font_size : 16, c->rem, (float)c->vw, (float)c->vh,
-                    &d->smem, setbits, true, false, false, 0};
+                    c->a, setbits, true, false, false, 0, 0, 0, false, false};
+    struct css_ctx *index=d->sty.ctx;
+    if(index && __atomic_load_n(&index->containers,__ATOMIC_ACQUIRE)) {
+        bool inclusive=pseudo==PE_BEFORE || pseudo==PE_AFTER;
+        node_t *inline_container=query_container(e,NULL,1,inclusive),*block_container=query_container(e,NULL,2,inclusive);
+        if(inline_container){cx.cq_width=inline_container->container_width;cx.cq_width_set=true;}
+        if(block_container){cx.cq_height=block_container->container_height;cx.cq_height_set=true;}
+    }
     for (int i = 0; i < ndents; i++)
         if ((!underlying || !dents[i].animation) && dents[i].pseudo == pseudo && dents[i].d->p && css_prop_is_font(dents[i].d->p)) apply_decl(c, &cx, dents[i].d);
     cx.font_pass = false;
@@ -2639,7 +3176,7 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
         if(s->display==D_CONTENTS)s->display=D_BLOCK; s->float_=FL_NONE;
     }
     css_style_finish(s, parent, e == d->html && !pseudo);
-    s->named_font=select_web_font(d,e,s,c->vw,c->vh);
+    s->named_font=select_web_font(d,e,s,c->vw,c->vh,c->a);
     if (parent && parent->display == D_CONTENTS) {
         /* Inheritance uses the slot, while flex/grid blockification uses the
            nearest box-generating flat ancestor. A contents slot is not an
@@ -2654,6 +3191,117 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     return s;
 }
 
+static double motion_eased(const struct css_easing *e,double x) {
+    if(e->kind==CM_STEP_START)return 1;
+    if(e->kind==CM_STEP_END)return x>=1?1:0;
+    if(e->kind==CM_LINEAR || x<=0 || x>=1)return x;
+    double lo=0,hi=1,t=x;
+    for(unsigned i=0;i<30;i++) {
+        double u=1-t,z=3*u*u*t*e->x1+3*u*t*t*e->x2+t*t*t;
+        if(fabs(z-x)<1e-9)break;
+        if(z<x)lo=t;else hi=t;t=(lo+hi)/2;
+    }
+    double u=1-t;return 3*u*u*t*e->y1+3*u*t*t*e->y2+t*t*t;
+}
+static const struct opacity_keyframes *motion_keyframes(struct cascade *c,node_t *n,const char *name) {
+    node_t *root=doc_node_root(n,false);
+    /* Bindings are already ordered (including imports) and filtered by owner
+       media. Search the current tree first, then only its nearest ancestor
+       trees if unresolved; never scan unrelated shadow roots globally. */
+    while(root) {
+        const struct opacity_keyframes *found=NULL;
+        struct css_scope *scope=root->style_scope;
+        for(struct css_binding *b=scope?scope->first:NULL;b;b=b->next)
+            for(const struct opacity_keyframes *k=b->index->motions;k;k=k->next) {
+                if(__atomic_load_n(&c->d->native_cancelled,__ATOMIC_ACQUIRE) ||
+                    (css_can_service() && !web_native_checkpoint(c->d)))return NULL;
+                if(!strcmp(k->name,name) && font_conditions_ok(k->media,c->vw,c->vh,web_js_enabled(c->d)))found=k;
+            }
+        if(found)return found;
+        root=root->shadow_host?doc_node_root(root->shadow_host,false):NULL;
+    }
+    return NULL;
+}
+static struct css_motion_state *motion_state(struct cascade *c,node_t *n,const char *name) {
+    struct css_motion_state *state=n->css_motion;
+    if(state && (state->document!=c->d || strcmp(state->name,name)))css_motion_reset(n),state=NULL;
+    if(!state) {
+        state=calloc(1,sizeof *state);char *copy=strdup(name);
+        if(!state || !copy){free(state);free(copy);ar_alloc(c->a,SIZE_MAX);return NULL;}
+        state->node=n;state->document=c->d;state->name=copy;state->last=c->d->css_motion_now;
+        struct css_motion_state *head;
+        do { head=__atomic_load_n(&c->d->css_motions,__ATOMIC_RELAXED);state->next=head; }
+        while(!__atomic_compare_exchange_n(&c->d->css_motions,&head,state,false,__ATOMIC_RELEASE,__ATOMIC_RELAXED));
+        n->css_motion=state;
+    }
+    return state;
+}
+static bool motion_frame_value(struct cascade *c,node_t *n,const style_t *base,const style_t *parent,
+    const struct opacity_frame *frame,float *opacity,struct css_easing *easing) {
+    uint8_t bits[css_prop_count()];memset(bits,0,sizeof bits);
+    style_t temp=*base;
+    struct cx cx={.s=&temp,.parent=parent,.node=n,.em=base->font_size,.rem=c->rem,
+        .vw=(float)c->vw,.vh=(float)c->vh,.a=c->a,.set=bits};
+    bool has=false;
+    const struct propdef *opacity_prop=css_prop_lookup("opacity",7),
+        *timing_prop=css_prop_lookup("animation-timing-function",25);
+    /* Same-offset blocks cascade in source order; the last valid declaration
+       in each block wins. Invalid later values do not erase valid earlier ones. */
+    for(int i=frame->count-1;i>=0;i--) {
+        const struct decl *x=&frame->decls[i];if(x->important || !x->p)continue;
+        if(x->p==opacity_prop){int at=css_prop_index(x->p);bool before=bits[at];apply_decl(c,&cx,x);if(!before && bits[at])has=true;}
+        else if(x->p==timing_prop)apply_decl(c,&cx,x);
+    }
+    *opacity=temp.opacity;*easing=temp.motion.easing;return has;
+}
+static bool motion_opacity(struct cascade *c,node_t *n,const style_t *base,const style_t *parent,float *out) {
+    const struct css_motion *spec=&base->motion;
+    if(!spec->name || base->display==D_NONE || doc_node_root(n,true)!=c->d->root) {
+        css_motion_reset(n);return false;
+    }
+    const struct opacity_keyframes *key=motion_keyframes(c,n,spec->name);
+    if(!key){css_motion_reset(n);return false;} /* unresolved names do not start */
+    struct css_motion_state *state=motion_state(c,n,spec->name);if(!state)return false;
+    uint64_t now=c->d->css_motion_now;
+    if(!state->paused && now>=state->last)state->elapsed+=(double)(now-state->last);
+    state->last=now;state->paused=spec->paused;
+    double local=state->elapsed-spec->delay;
+    double ad=spec->duration==0 || spec->iterations==0?0:(double)spec->duration*spec->iterations;
+    state->running=!spec->paused && state->elapsed<(double)spec->delay+ad;
+    double overall;
+    if(local<0) {
+        if(spec->fill!=CM_FILL_BACKWARDS && spec->fill!=CM_FILL_BOTH)return false;
+        overall=0;
+    } else if(local>=ad) {
+        if(spec->fill!=CM_FILL_FORWARDS && spec->fill!=CM_FILL_BOTH)return false;
+        overall=spec->iterations; if(!isfinite(overall))overall=1;
+    } else overall=spec->duration>0?local/spec->duration:0;
+    double iteration=floor(overall),progress=overall-iteration;
+    if(local>=ad && overall>0 && progress==0){progress=1;iteration-=1;}
+    bool reverse=spec->direction==CM_REVERSE ||
+        (spec->direction==CM_ALTERNATE && fmod(iteration,2)!=0) ||
+        (spec->direction==CM_ALTERNATE_REVERSE && fmod(iteration,2)==0);
+    if(reverse)progress=1-progress;
+    float left=0,right=1,lv=base->opacity,rv=base->opacity;
+    struct css_easing ease=spec->easing;bool any=false;
+    for(const struct opacity_frame *f=key->first;f;f=f->next) {
+        if(__atomic_load_n(&c->d->native_cancelled,__ATOMIC_ACQUIRE) ||
+            (css_can_service() && !web_native_checkpoint(c->d)))return false;
+        float value;struct css_easing frame_ease;
+        if(!motion_frame_value(c,n,base,parent,f,&value,&frame_ease))continue;
+        any=true;
+        if(f->offset<=progress && f->offset>=left){left=f->offset;lv=value;ease=frame_ease;}
+        if(f->offset>progress && f->offset<=right){right=f->offset;rv=value;}
+    }
+    if(!any){state->running=false;return false;}
+    /* Backwards fill during the delay is the directed first endpoint, not
+       an easing sample: step-start must not jump before the active phase. */
+    double fraction=right>left?(progress-left)/(right-left):0;
+    double p=local<0?fraction:motion_eased(&ease,fraction);
+    double value=lv+(rv-lv)*p;
+    *out=(float)(value<0?0:value>1?1:value);return true;
+}
+
 static void clear_styles(node_t *n) {
     n->animation_base_style = NULL;
     if (n->shadow_root) clear_styles(n->shadow_root);
@@ -2662,33 +3310,223 @@ static void clear_styles(node_t *n) {
         clear_styles(c);
     }
 }
+static void motion_hide_subtree(node_t *n) {
+    css_motion_reset(n);
+    if(n->shadow_root)motion_hide_subtree(n->shadow_root);
+    for(node_t *ch=n->first;ch;ch=ch->next)motion_hide_subtree(ch);
+}
+
+void css_node_style_free(node_t *n) {
+    if (!n) return;
+    css_motion_reset(n);
+    ar_free(&n->style_mem); ar_free(&n->style_previous_mem);
+    n->style = n->animation_base_style = n->style_previous = NULL;
+}
+
+void css_node_style_unpublish(node_t *n) {
+    if (!n) return;
+    css_motion_reset(n);
+    /* Detached inherited styles can borrow an ancestor's variable/font data.
+       Keep their arenas alive until published box borrows have been retired,
+       but never let a detached tree expose those ancestor-dependent styles. */
+    n->style = n->animation_base_style = NULL;
+    n->container_valid = false;
+    n->query_inline_container=n->query_size_container=NULL;
+    if (n->shadow_root) css_node_style_unpublish(n->shadow_root);
+    if (n->template_content) css_node_style_unpublish(n->template_content);
+    for (node_t *c = n->first; c; c = c->next) css_node_style_unpublish(c);
+}
+
+void css_styles_release(web_doc *d) {
+    node_t *n = d->style_retired_first; d->style_retired_first = NULL;
+    while (n) {
+        node_t *next = n->style_retired_next;
+        /* A cancelled worker may have retired this arena but not published a
+           replacement. Never retain its old style or stack-local OOM target. */
+        if(n->style==n->style_previous)n->style=NULL;
+        n->style_mem.trap=NULL;
+        ar_free(&n->style_previous_mem); n->style_previous = NULL; n->style_retired_next = NULL;
+        n = next;
+    }
+}
+
+/* A mutation's sibling set is the conservative local boundary for +/-/~ and
+   nth/empty selectors. Descendants are restyled because inheritance and
+   ancestor combinators may change. Ancestor-dependent relational rules retain
+   a full invalidation fallback, as do viewport/resource/UI transactions. */
+static node_t *dirty_flat_parent(node_t *n) {
+    /* Mutation invalidation must NOT flush slot assignment: construction can
+       enqueue thousands of changes before any geometry/assignment read. The
+       last published snapshot is sufficient to propagate dirty ancestors;
+       an assignment/topology transaction separately requests a full cascade. */
+    if(!n || n->shadow_host)return NULL;
+    node_t *p=n->parent;
+    if(!p)return NULL;
+    if(p->shadow_root)return n->assigned_slot;
+    if(p->shadow_host)return p->shadow_host;
+    if(p->type==N_ELEM && !p->foreign && p->tag==T_slot && p->slot_assigned_first &&
+        doc_node_root(p,false)->shadow_host)return NULL;
+    return p;
+}
+void css_mark_dirty(web_doc *d, node_t *n) {
+    if (!d) return;
+    d->need_style = true;
+    if (!n || !d->sty.ctx || d->sty.ctx->relational) { d->style_full_dirty = true; return; }
+    if (n->type != N_ELEM) n = dirty_flat_parent(n);
+    if (!n) { d->style_full_dirty = true; return; }
+    node_t *parent = dirty_flat_parent(n);
+    if (d->sty.ctx->siblings && parent && parent->type == N_ELEM) n = parent;
+    n->style_dirty = true; d->style_pending_dirty = true;
+    for (node_t *p = dirty_flat_parent(n); p; p = dirty_flat_parent(p)) p->style_children_dirty = true;
+}
+
+static bool equal_string(const char *a,const char *b) { return a==b || (a && b && !strcmp(a,b)); }
+static bool equal_tracks(const struct gtemplate *a,const struct gtemplate *b) {
+    if(a==b)return true;
+    return a && b && a->n==b->n && a->rep_at==b->rep_at && a->rep_n==b->rep_n && a->rep_fit==b->rep_fit &&
+        (!a->n || !memcmp(a->t,b->t,(size_t)a->n*sizeof *a->t));
+}
+static bool equal_areas(const struct gareas *a,const struct gareas *b) {
+    if(a==b)return true;
+    if(!a || !b || a->rows!=b->rows || a->cols!=b->cols)return false;
+    for(int i=0;i<a->rows*a->cols;i++)if(!equal_string(a->cell[i],b->cell[i]))return false;
+    return true;
+}
+bool css_style_layout_equal(const style_t *a,const style_t *b) {
+    if(a==b)return true;
+    if(!a || !b)return false;
+    if(!equal_string(a->font_names,b->font_names) || !equal_string(a->content,b->content) ||
+        !equal_string(a->motion.name,b->motion.name) ||
+        !equal_string(a->container_names,b->container_names) ||
+        !equal_string(a->list_style_string,b->list_style_string) ||
+        !equal_tracks(a->grid_cols,b->grid_cols) || !equal_tracks(a->grid_rows,b->grid_rows) ||
+        !equal_tracks(a->grid_auto_cols,b->grid_auto_cols) || !equal_tracks(a->grid_auto_rows,b->grid_auto_rows) ||
+        !equal_areas(a->grid_areas,b->grid_areas))return false;
+    for(int i=0;i<4;i++)if(!equal_string(a->grid_place[i].name,b->grid_place[i].name))return false;
+    if(!css_style_layout_equal(a->before,b->before) || !css_style_layout_equal(a->after,b->after) ||
+        !css_style_layout_equal(a->backdrop,b->backdrop))return false;
+    style_t x=*a,y=*b;
+    x.motion.name=y.motion.name=NULL;
+    x.font_names=y.font_names=NULL; x.content=y.content=NULL; x.list_style_string=y.list_style_string=NULL;
+    x.container_names=y.container_names=NULL;
+    x.grid_cols=y.grid_cols=x.grid_rows=y.grid_rows=x.grid_auto_cols=y.grid_auto_cols=x.grid_auto_rows=y.grid_auto_rows=NULL;
+    x.grid_areas=y.grid_areas=NULL;
+    for(int i=0;i<4;i++)x.grid_place[i].name=y.grid_place[i].name=NULL;
+    x.before=y.before=x.after=y.after=x.backdrop=y.backdrop=NULL;
+    /* Custom properties have already been resolved into real properties. Paint
+       data/colors are replaced in boxes/runs, but cannot change geometry. */
+    x.vars=y.vars=NULL; x.gradient=y.gradient=NULL;
+    x.bg_image=y.bg_image=x.mask_image=y.mask_image=NULL;
+    x.bg_img=y.bg_img=x.mask_img=y.mask_img=0;
+    x.color=y.color=x.bg_color=y.bg_color=0;
+    memset(x.border_color,0,sizeof x.border_color);memset(y.border_color,0,sizeof y.border_color);
+    memset(&x.svg_fill,0,sizeof x.svg_fill);memset(&y.svg_fill,0,sizeof y.svg_fill);
+    memset(&x.svg_stroke,0,sizeof x.svg_stroke);memset(&y.svg_stroke,0,sizeof y.svg_stroke);
+    x.svg_stop_color=y.svg_stop_color=0;
+    x.opacity=y.opacity=x.svg_fill_opacity=y.svg_fill_opacity=x.svg_stroke_opacity=y.svg_stroke_opacity=x.svg_stop_opacity=y.svg_stop_opacity=0;
+    memset(x.grad,0,sizeof x.grad);memset(y.grad,0,sizeof y.grad);x.has_grad=y.has_grad=false;
+    x.bg_repeat=y.bg_repeat=x.bg_size_kind=y.bg_size_kind=x.mask_repeat=y.mask_repeat=x.mask_size_kind=y.mask_size_kind=0;
+    memset(x.bg_pos,0,sizeof x.bg_pos);memset(y.bg_pos,0,sizeof y.bg_pos);
+    memset(x.bg_size,0,sizeof x.bg_size);memset(y.bg_size,0,sizeof y.bg_size);
+    memset(x.mask_pos,0,sizeof x.mask_pos);memset(y.mask_pos,0,sizeof y.mask_pos);
+    memset(x.mask_size,0,sizeof x.mask_size);memset(y.mask_size,0,sizeof y.mask_size);
+    return !memcmp(&x,&y,sizeof x);
+}
+
+static bool style_box_compatible(node_t *e, const style_t *old, const style_t *next) {
+    if (!old || !next) return false;
+    if(e->foreign)return false; /* SVG snapshots serialize computed paint. */
+    if (css_style_layout_equal(old,next)) return true;
+    if (e->foreign || e->tag == T_input || e->tag == T_textarea || e->tag == T_select || e->tag == T_img ||
+        e->tag == T_canvas || e->tag == T_video || e->tag == T_iframe || e->tag == T_frameset ||
+        old->before || old->after || old->backdrop || next->before || next->after || next->backdrop) return false;
+    if (old->display != next->display || old->position != next->position || old->float_ != next->float_ ||
+        old->container_type != next->container_type ||
+        old->overflow != next->overflow || old->content_visibility != next->content_visibility ||
+        old->white_space != next->white_space || old->text_transform != next->text_transform ||
+        old->list_style != next->list_style || old->list_style_inside != next->list_style_inside) return false;
+    return old->display == D_BLOCK || old->display == D_FLOW_ROOT || old->display == D_INLINE || old->display == D_NONE;
+}
+
+static void retire_style(struct cascade *c, node_t *e) {
+    e->style_previous = e->style; e->style_previous_mem = e->style_mem;
+    memset(&e->style_mem, 0, sizeof e->style_mem);
+    e->style_mem.chunk_size = 4096;
+    e->style_mem.trap = c->trap;
+    node_t *head;
+    do { head = __atomic_load_n(&c->d->style_retired_first, __ATOMIC_RELAXED); e->style_retired_next = head; }
+    while (!__atomic_compare_exchange_n(&c->d->style_retired_first, &head, e, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+    c->a = &e->style_mem;
+}
+
+static void cascade_node(struct cascade *c, node_t *e, const style_t *parent);
+struct cascade_job { node_t *node; const style_t *parent; float rem; bool full; };
+struct cascade_frontier { struct cascade_job *v; size_t n, cap; };
+struct cascade_batch { struct cascade parent; struct cascade_job *jobs; };
+static void cascade_enqueue(struct cascade *c, node_t *e, const style_t *parent) {
+    if (!c->full && !e->style_dirty && !e->style_children_dirty && e->style) return;
+    struct cascade_frontier *f = c->frontier;
+    if (f->n == f->cap) {
+        size_t capacity = f->cap ? f->cap * 2 : 32;
+        if (capacity < f->cap || capacity > SIZE_MAX / sizeof *f->v) ar_alloc(c->a, SIZE_MAX);
+        struct cascade_job *v = realloc(f->v, capacity * sizeof *v);
+        if (!v) ar_alloc(c->a, SIZE_MAX);
+        f->v = v; f->cap = capacity;
+    }
+    f->v[f->n++] = (struct cascade_job){e, parent, c->rem, c->full};
+}
+static void cascade_worker(size_t i, void *context) {
+    struct cascade_batch *batch = context;
+    struct cascade_job *job = &batch->jobs[i];
+    node_t *e = job->node;
+    if (e->type != N_ELEM || __atomic_load_n(&batch->parent.d->native_cancelled, __ATOMIC_ACQUIRE)) return;
+    struct css_scratch scratch = {.worker=true};
+    void *previous = thread_local_get(2); thread_local_set(2, &scratch);
+    struct cascade c = batch->parent; c.vbuf = (sbuf){0};
+    c.rem = job->rem; c.full = job->full; c.frontier = NULL;
+    jmp_buf trap; c.trap = &trap;
+    if (setjmp(trap)) __atomic_store_n(&c.d->native_cancelled, true, __ATOMIC_RELEASE);
+    else {
+        setbits = malloc((size_t)css_prop_count());
+        if (!setbits) __atomic_store_n(&c.d->native_cancelled, true, __ATOMIC_RELEASE);
+        else cascade_node(&c, e, job->parent);
+    }
+    var_index_clear(); free(dents); free(setbits); sb_free(&c.vbuf);
+    thread_local_set(2, previous);
+}
+static void cascade_service(void *context) {
+    web_doc *d = context;
+    web_native_checkpoint(d); web_avmedia_checkpoint();
+}
 
 static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     /* Native-only supply may run while this tree is being rebuilt. It never
        executes author code or reads the incomplete style/box tree. */
-    web_avmedia_checkpoint();
+    if (css_can_service()) web_avmedia_checkpoint();
     web_doc *d = c->d;
-    if (!web_native_checkpoint(d)) return;
+    if (css_can_service()) { if (!web_native_checkpoint(d)) return; }
+    else if (__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE)) return;
+    bool redo = c->full || e->style_dirty || !e->style;
+    if (!redo && !e->style_children_dirty) return;
+    bool inherited_full = c->full;
+    if (!redo) goto descend;
+    retire_style(c, e);
+    css_scratch_get()->arena=c->a;
+    if(d->profile_enabled) {
+        parallel_record_work(PARALLEL_STYLE, 1);
+        __atomic_fetch_add(&d->profile.style_visits, 1, __ATOMIC_RELAXED);
+        if (css_worker() && parallel_worker_index()) __atomic_fetch_add(&d->profile.style_parallel_nodes, 1, __ATOMIC_RELAXED);
+    }
     struct css_ctx *x = d->sty.ctx;
     ndents = 0;
-    if (e->id) {
-        struct ient **l = ht_slot(NULL, &x->ids, e->id, false);
-        if (l) collect(*l, e);
-    }
-    for (int i = 0; i < e->nclasses; i++) {
-        bool dup = false;
-        for (int j = 0; j < i; j++)
-            if (!strcmp(e->classes[i], e->classes[j])) dup = true;
-        if (dup) continue;
-        struct ient **l = ht_slot(NULL, &x->classes, e->classes[i], false);
-        if (l) collect(*l, e);
-    }
-    struct ient **l = ht_slot(NULL, &x->tags, e->name, false);
-    if (l) collect(*l, e);
-    collect(x->univ, e);
-    if (d->native_cancelled) return;
+    collect_index(x->ua, e, NULL);
+    collect_scope(doc_node_root(e, false), e);
+    if (e->shadow_root) collect_scope(e->shadow_root, e); /* :host */
+    for (node_t *slot = e->assigned_slot; slot; slot = slot->assigned_slot)
+        collect_scope(doc_node_root(slot, false), e); /* ::slotted */
+    if (__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE)) return;
     /* presentational hints and the style attribute */
-    struct hints h = {.n = 0, .a = &d->smem};
+    struct hints h = {.n = 0, .a = c->a};
     if (!e->foreign || e->tag == T_svg) pres_hints(e, &h);
     if (e->namespace_id == NS_SVG) {
         static const char *const svg_properties[] = {
@@ -2709,16 +3547,37 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     for (int i = 0; i < h.n; i++) add_dent(&h.d[i], 1ull << 62, PE_NONE, depth);
     const char *sa = node_attr(e, "style");
     if (sa && *sa) {
-        struct pctx pc = {&d->smem, NULL, d->base, NULL, 0, false, 0};
+        struct pctx pc = {c->a, NULL, d->base, NULL, 0, false, 0};
         struct decl *ds;
         int nd;
         parse_body(&pc, sa, sa + strlen(sa), NULL, NULL, &ds, &nd);
+        for(int i=0;i<nd;i++)if(container_units_used(ds[i].value))
+            __atomic_store_n(&((struct css_ctx *)d->sty.ctx)->containers,true,__ATOMIC_RELEASE);
         for (int i = 0; i < nd; i++) add_dent(&ds[i], 1ull << 62 | (uint64_t)0x3FFFFFFF << 32 | (uint64_t)(i < 255 ? i : 255), PE_NONE, depth);
     }
+    /* CSS animations precede higher-priority script-created WAAPI effects.
+       Their omitted endpoints use the underlying cascade, never last frame's
+       computed opacity. The same normal declarations still outrank at the
+       important origin in cmp_dent(). */
+    bool motion_decl=e->css_motion!=NULL;
+    for(int i=0;!motion_decl && i<ndents;i++)if(css_prop_is_motion(dents[i].d->p))motion_decl=true;
+    style_t *motion_base=NULL;float opacity;
+    if(motion_decl) {
+        qsort(dents,(size_t)ndents,sizeof *dents,cmp_dent);
+        motion_base=compute(c,e,parent,PE_NONE,true);
+    }
+    if(motion_base && motion_opacity(c,e,motion_base,parent,&opacity)) {
+        char text[48];snprintf(text,sizeof text,"%.9g",(double)opacity);
+        struct decl *sample=ar_alloc(c->a,sizeof *sample);
+        *sample=(struct decl){.p=css_prop_lookup("opacity",7),.value=ar_strdup(c->a,text)};
+        add_dent(sample,0,PE_NONE,0);dents[ndents-1].animation=true;
+    }
     for (struct css_animation *a = e->animations; a; a = a->next) {
-        struct pctx pc = {&d->smem, NULL, d->base, NULL, 0, false, 0};
+        struct pctx pc = {c->a, NULL, d->base, NULL, 0, false, 0};
         struct decl *ds; int nd;
         parse_body(&pc, a->text, a->text + strlen(a->text), NULL, NULL, &ds, &nd);
+        for(int i=0;i<nd;i++)if(container_units_used(ds[i].value))
+            __atomic_store_n(&((struct css_ctx *)d->sty.ctx)->containers,true,__ATOMIC_RELEASE);
         for (int i = 0; i < nd; i++) {
             if (!ds[i].p || ds[i].important) continue;
             add_dent(&ds[i], a->id, a->pseudo, 0);
@@ -2734,8 +3593,8 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     style_t *s = compute(c, e, parent, PE_NONE, false);
     e->style = s;
     e->animation_base_style = NULL;
-    if (e->animations) {
-        style_t *base = compute(c, e, parent, PE_NONE, true);
+    if (e->animations || (motion_base && motion_base->motion.name)) {
+        style_t *base = motion_base?motion_base:compute(c,e,parent,PE_NONE,true);
         if (has_before) base->before = compute(c, e, s, PE_BEFORE, true);
         if (has_after) base->after = compute(c, e, s, PE_AFTER, true);
         e->animation_base_style = base;
@@ -2752,21 +3611,105 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
             if (a->content && a->display != D_NONE) s->after = a;
         }
     }
+    if (!style_box_compatible(e, e->style_previous, s))
+        __atomic_store_n(&d->style_boxes_changed, true, __ATOMIC_RELAXED);
+    e->style_mem.trap = NULL;
+descend:
+    e->style_dirty = e->style_children_dirty = false;
+    s = e->style;
     if (s->display == D_NONE) {
+        motion_hide_subtree(e);
         clear_styles(e);
         return;
     }
+    c->full = redo;
     pvec children = {0};
     doc_flat_children(e, &children);
-    for (int i = 0; i < children.n && !d->native_cancelled; i++) {
-        node_t *ch = children.v[i];
-        if (ch->type == N_ELEM) cascade_node(c, ch, s);
-        else ch->style = NULL;
+    if (c->frontier) {
+        for (int i = 0; i < children.n; i++) {
+            node_t *ch = children.v[i];
+            if (ch->type == N_ELEM) cascade_enqueue(c, ch, s);
+            else ch->style = NULL;
+        }
+    } else if (!css_worker() && children.n >= 8 && d->sty.ctx->parallel_safe) {
+        struct cascade_frontier f = {0};
+        c->frontier = &f;
+        for (int i = 0; i < children.n; i++) {
+            node_t *ch = children.v[i];
+            if (ch->type == N_ELEM) cascade_enqueue(c, ch, s);
+            else ch->style = NULL;
+        }
+        c->frontier = NULL;
+        struct cascade_batch batch = {*c, f.v};
+        parallel_for_stage(PARALLEL_STYLE,f.n,cascade_worker,&batch,cascade_service,d);
+        free(f.v);
+    } else {
+        for (int i = 0; i < children.n && !__atomic_load_n(&d->native_cancelled, __ATOMIC_ACQUIRE); i++) {
+            node_t *ch = children.v[i];
+            if (ch->type == N_ELEM) cascade_node(c, ch, s);
+            else ch->style = NULL;
+        }
     }
     pv_free(&children);
+    c->full = inherited_full;
+}
+
+static uint32_t cascade_work_count(web_doc *d, node_t *root) {
+    pvec nodes = {0}; pv_push(&nodes, root);
+    /* Parent-first enumeration, followed by a reverse accumulation, avoids
+       recursive counting on deeply nested flex/DOM chains. This is only done
+       for full cascades; leaf updates never add another document-wide pass. */
+    for (int i = 0; i < nodes.n; i++) {
+        if (!web_native_checkpoint(d)) { pv_free(&nodes); return 0; }
+        node_t *n = nodes.v[i]; n->style_subtree_work = n->type == N_ELEM;
+        if (n->type == N_ELEM) doc_flat_children(n, &nodes);
+    }
+    for (int i = nodes.n - 1; i > 0; i--) {
+        node_t *n = nodes.v[i], *parent = doc_flat_parent(n);
+        if (!parent) continue;
+        uint64_t sum = (uint64_t)parent->style_subtree_work + n->style_subtree_work;
+        parent->style_subtree_work = sum > UINT32_MAX ? UINT32_MAX : (uint32_t)sum;
+    }
+    pv_free(&nodes); return root->style_subtree_work;
+}
+
+static void cascade_frontier_run(struct cascade *c, node_t *root) {
+    uint32_t total = cascade_work_count(c->d, root);
+    if (__atomic_load_n(&c->d->native_cancelled, __ATOMIC_ACQUIRE)) return;
+    if (total < 128 || !c->d->sty.ctx->parallel_safe) { cascade_node(c, root, NULL); return; }
+    struct cascade_frontier f = {0};
+    c->frontier = &f; cascade_enqueue(c, root, NULL);
+    /* Resolve common ancestors on the supervisor, splitting the largest
+       remaining branch rather than stopping at the first eight siblings.
+       This exposes a feed hidden under one large wrapper alongside tiny nav
+       siblings. Every job inherits a finalized parent style/rem, and jobs are
+       disjoint flat subtrees; no worker observes a half-computed ancestor. */
+    uint32_t target = total / 32; if (target < 16) target = 16;
+    while (f.n && !__atomic_load_n(&c->d->native_cancelled, __ATOMIC_ACQUIRE)) {
+        size_t largest = 0;
+        for (size_t i = 1; i < f.n; i++)
+            if (f.v[i].node->style_subtree_work > f.v[largest].node->style_subtree_work) largest = i;
+        if (f.v[largest].node->style_subtree_work <= target) break;
+        struct cascade_job job = f.v[largest]; f.v[largest] = f.v[--f.n];
+        c->rem = job.rem; c->full = job.full;
+        cascade_node(c, job.node, job.parent);
+    }
+    c->frontier = NULL;
+    struct cascade_batch batch = {*c, f.v};
+    if (!__atomic_load_n(&c->d->native_cancelled, __ATOMIC_ACQUIRE))
+        parallel_for_stage(PARALLEL_STYLE,f.n,cascade_worker,&batch,cascade_service,c->d);
+    free(f.v);
 }
 
 void css_cascade(web_doc *d, int vw, int vh) {
+    d->css_motion_now=uptime_ms(); /* exactly one supervisor snapshot per cascade */
+    /* Direct native callers may recascade without the document publication
+       helper. Do not overwrite a prior retirement generation while boxes
+       still borrow it. The ordinary web_layout path releases after each join. */
+    if(d->style_retired_first) {
+        if(d->root_box){boxes_discard(d);d->need_boxes=true;d->layout_valid=false;}
+        css_styles_release(d);
+    }
     /* Keys borrow computed-style names. Never carry a previous document or
        style-arena generation into this cascade; release on normal exit too. */
     var_index_clear();
@@ -2781,26 +3724,34 @@ void css_cascade(web_doc *d, int vw, int vh) {
        new sheets mark index_dirty at their publication boundary. */
     if (!d->sty.ctx || d->sty.index_dirty || d->sty.index_w != vw || d->sty.index_h != vh ||
         d->sty.index_scripting != scripting || d->sty.index_quirks != d->quirks) {
-        if (d->sty.ctx) {
-            ar_free(&d->sty.ctx->a);
-            free(d->sty.ctx);
-            d->sty.ctx = NULL;
-        }
+        css_ctx_free(d->sty.ctx); d->sty.ctx = NULL;
         d->sty.ctx = build_index(d, vw, vh);
         d->sty.index_w = vw;
         d->sty.index_h = vh;
         d->sty.index_scripting = scripting;
         d->sty.index_quirks = d->quirks;
         d->sty.index_dirty = false;
+        d->style_full_dirty = true;
     }
-    if (!setbits) setbits = malloc((size_t)css_prop_count());
-    ar_free(&d->smem);
-    if (d->root) clear_styles(d->root);
-    struct cascade c = {d, 16, vw, vh, {0}};
-    if (d->html) cascade_node(&c, d->html, NULL);
+    if (!web_form_style_snapshot(d, d->sty.ctx->form_features)) {
+        __atomic_store_n(&d->native_cancelled, true, __ATOMIC_RELEASE);
+        return;
+    }
+    if (!setbits) { setbits = malloc((size_t)css_prop_count()); if(!setbits)ar_alloc(&d->smem,SIZE_MAX); }
+    bool full = d->style_full_dirty || !d->style_pending_dirty || !d->html || !d->html->style;
+    if(full && (d->need_boxes || !d->root_box) && d->root)
+        clear_styles(d->root); /* retire styles of nodes no longer in the flat tree */
+    d->style_boxes_changed = false;
+    struct cascade c = {.d=d, .rem=d->html && d->html->style ? d->html->style->font_size : 16,
+        .vw=vw, .vh=vh, .a=&d->smem, .full=full, .trap=d->smem.trap};
+    if (d->html) {
+        if (full) cascade_frontier_run(&c, d->html);
+        else cascade_node(&c, d->html, NULL);
+    }
     var_index_clear();
     font_bindings_clear();
     sb_free(&c.vbuf);
     d->styled_w = vw;
     d->styled_h = vh;
+    d->style_full_dirty = d->style_pending_dirty = false;
 }

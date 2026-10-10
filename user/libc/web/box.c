@@ -544,7 +544,11 @@ static int atomic_kind(node_t *n) {
     case T_textarea: return AT_TEXTAREA;
     case T_button: return AT_INLINE_BLOCK;
     case T_svg: return n->parent && n->parent->foreign ? AT_NONE : AT_SVG;
-    case T_iframe: case T_frame: case T_video: case T_canvas: case T_embed: case T_object: case T_applet: case T_meter:
+    /* No object resource renderer is installed. Resource-less and unsupported
+       objects therefore render their fallback children in ordinary CSS flow,
+       rather than swallowing them in a synthetic 300x150 replaced box. */
+    case T_object: return AT_NONE;
+    case T_iframe: case T_frame: case T_video: case T_canvas: case T_embed: case T_applet: case T_meter:
     case T_progress:
         return AT_PLACEHOLDER;
     case T_audio: return node_attr(n, "controls") ? AT_PLACEHOLDER : AT_NONE;
@@ -918,6 +922,8 @@ static void clear_boxes(node_t *n) {
 
 static void unpublish_boxes(box_t *b) {
     if(!b)return;
+    ar_free(&b->layout_mem);
+    ar_free(&b->text_mem);
     if(b->node && b->node->box==b){b->node->box=NULL;b->node->anchor_block=NULL;}
     for(box_t *child=b->first;child;child=child->next)unpublish_boxes(child);
 }
@@ -929,6 +935,104 @@ void boxes_discard(web_doc *d) {
     if(d->root)clear_boxes(d->root); /* also clears an unpublished failed rebuild */
     for(int i=0;i<web_dialog_count(d);i++)web_dialog_set_backdrop(d,web_dialog_at(d,i),NULL);
     ar_free(&d->bmem);
+}
+
+static style_t *replacement_style(node_t *n, style_t *old) {
+    for (; n; n=doc_flat_parent(n)) {
+        style_t *previous=n->style_previous,*next=n->style;
+        if (!previous || !next) continue;
+        if (old==previous) return next;
+        if (old==previous->before) return next->before;
+        if (old==previous->after) return next->after;
+        if (old==previous->backdrop) return next->backdrop;
+    }
+    return old;
+}
+static node_t *box_style_node(box_t *b) {
+    for (; b; b=b->parent) if(b->node)return b->node;
+    return NULL;
+}
+static bool wrapped_display(int display) {
+    return display == D_INLINE_TABLE || display == D_INLINE_FLEX || display == D_INLINE_GRID;
+}
+static bool restyle_derived(box_t *b, style_t *old) {
+    node_t *n=b->node;
+    if (!n || !n->style || !n->style_previous || old == n->style_previous) return false;
+    bool outer=b->kind == B_ATOMIC && b->atomic == AT_INLINE_BLOCK && wrapped_display(old->display) &&
+        b->first && b->first->node == n &&
+        (b->first->kind == B_TABLE || b->first->kind == B_GRID || b->first->kind == B_FLEX);
+    bool inner=b->parent && b->parent->node == n && b->parent->kind == B_ATOMIC &&
+        wrapped_display(b->parent->st->display) &&
+        (b->kind == B_TABLE || b->kind == B_GRID || b->kind == B_FLEX);
+    if (!outer && !inner) return false;
+    /* wrapped() owns derived shallow copies in bmem. Replace every borrowed
+       value too, not merely the principal node style, before arena retirement. */
+    style_t next=*n->style;
+    if (outer) {
+        for (int i=0;i<4;i++) {
+            next.border_width[i]=0;
+            next.padding[i].kind=LK_LEN; next.padding[i].px=next.padding[i].pct=0;
+        }
+        next.bg_color=0; next.bg_image=NULL; next.has_grad=false; next.gradient=NULL;
+        next.width.kind=next.height.kind=LK_AUTO;
+    } else {
+        next.display=b->kind == B_TABLE ? D_TABLE : b->kind == B_GRID ? D_GRID : D_FLEX;
+        for (int i=0;i<4;i++) {
+            next.margin[i].kind=LK_LEN; next.margin[i].px=next.margin[i].pct=0;
+        }
+    }
+    if (!css_style_layout_equal(old,&next)) layout_invalidate(b);
+    *old=next;
+    return true;
+}
+static void restyle_boxes(box_t *b) {
+    if (!b) return;
+    style_t *old = b->st;
+    if (restyle_derived(b,old)) {
+        /* The stable derived-style slot also updates existing run borrows. */
+    } else if (b->anon && b->parent) {
+        int display = old->display;
+        style_t next;
+        css_style_init(&next, b->parent->st);
+        css_style_finish(&next, NULL, false); next.display = (uint8_t)display;
+        if (b->node && !b->node->foreign && b->node->tag == T_details) {
+            next.list_style=old->list_style; next.list_style_string=old->list_style_string;
+            next.list_style_inside=old->list_style_inside;
+        }
+        if (!css_style_layout_equal(old,&next)) layout_invalidate(b);
+        *old = next;
+    } else {
+        b->st=replacement_style(box_style_node(b),old);
+        if (b->st != old && !css_style_layout_equal(old,b->st)) layout_invalidate(b);
+    }
+    /* An unchanged element may keep cached geometry even when its new style
+       has exactly the same values. Cached paint runs/decorations still borrow
+       that element's OLD arena, so update those references before retirement. */
+    node_t *fallback=box_style_node(b);
+    for(int i=0;i<b->nruns;i++) {
+        struct run *run=&b->runs[i];
+        run->st=replacement_style(run->node?run->node:fallback,run->st);
+    }
+    for(int i=0;i<b->ndecos;i++) {
+        struct deco *deco=&b->decos[i];
+        deco->st=replacement_style(deco->node?deco->node:fallback,deco->st);
+    }
+    for (box_t *c = b->first; c; c = c->next) restyle_boxes(c);
+}
+void boxes_restyle(web_doc *d) { restyle_boxes(d->root_box); }
+
+bool boxes_update_text(web_doc *d, node_t *n) {
+    if (!d || !n || !n->box || n->box->kind != B_TEXT || n->box->node != n) return false;
+    box_t *b = n->box, *block = b->parent;
+    while (block && block->kind == B_INLINE) block = block->parent;
+    if (!block || !block->inline_ctx) return false;
+    arena_t next = {.chunk_size=4096}; jmp_buf trap; next.trap = &trap;
+    if (setjmp(trap)) { ar_free(&next); return false; }
+    size_t length;
+    const char *text = ws_process(&next,n->text,n->textlen,b->st,&length);
+    next.trap = NULL; ar_free(&b->text_mem); b->text_mem = next;
+    b->text=text; b->len=length;
+    layout_invalidate(b); return true;
 }
 void boxes_build(web_doc *d, arena_t *a) {
     struct bctx b = {.d=d, .a=a};

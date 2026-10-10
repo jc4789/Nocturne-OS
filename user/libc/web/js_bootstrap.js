@@ -2,11 +2,13 @@
 (function (host) {
     'use strict';
     delete globalThis.__nocturne_host;
-    const rawDom = host.dom;
+    const domOperations=host.domOperations || Object.fromEntries(
+        ['adopt', 'animationComputed', 'animationStyle', 'attr', 'attrCreate', 'attrList', 'attrNS', 'attrNode', 'attrNodeNS', 'attrRemoveNode', 'attrSetNode', 'blur', 'clone', 'computed', 'create', 'cssom', 'customCandidates', 'dialogEnter', 'dialogFocus', 'dialogLeave', 'dialogModal', 'dialogPrepare', 'doctypeCreate', 'documentCommand', 'elementFromPoint', 'elementScroll', 'elementScrollIntoView', 'equal', 'face', 'faceControls', 'filesSet', 'focus', 'formControls', 'formValue', 'geometry', 'get', 'id', 'imageDecode', 'import', 'insert', 'insertionStatus', 'isNode', 'matches', 'observerGeometry', 'parseDocument', 'parseFragment', 'position', 'query', 'rect', 'remove', 'replace', 'replacementStatus', 'reset', 'root', 'same', 'selection', 'set', 'shadowAttach', 'slotAssign', 'slotChanges', 'slotNodes', 'style', 'styleDisabled', 'stylePriority', 'submit', 'validation', 'viewport'].map(op=>[op,(...args)=>host.dom(op,...args)]));
+    const rawDom=Object.assign((op,...args)=>domOperations[op](...args),domOperations);
     function validateInsertion(parent,child,before) {
-        if(!rawDom('isNode',null,parent) || !rawDom('isNode',null,child) ||
-            before!=null && !rawDom('isNode',null,before))throw new TypeError('Node arguments are required');
-        const status=rawDom('insertionStatus',parent,child,before==null?null:before);
+        if(!rawDom.isNode(null,parent) || !rawDom.isNode(null,child) ||
+            before!=null && !rawDom.isNode(null,before))throw new TypeError('Node arguments are required');
+        const status=rawDom.insertionStatus(parent,child,before==null?null:before);
         if(status)throw new DOMException(status===2?'The reference node is not a child':'The node cannot be inserted here',
             status===2?'NotFoundError':'HierarchyRequestError');
     }
@@ -16,12 +18,12 @@
         const mutation = op === 'shadowAttach' || op === 'slotAssign' || op === 'insert' || op === 'replace' || op === 'remove' || op === 'adopt' || op === 'clone' || op === 'import' || op === 'set' || op === 'attrSetNode' || op === 'attrRemoveNode' ||
             (op === 'attrNS' && args.length > 4) ||
             ((op === 'attr' || op === 'style') && args.length > 3);
-        return mutation && customElementsReady ? customElementsBridge.reactions(() => rawDom(...args)) : rawDom(...args);
+        return mutation && customElementsReady && customElementsBridge.active() ? customElementsBridge.reactions(() => rawDom(...args)) : rawDom(...args);
     }
     // IDL reflection always addresses the null namespace; getAttribute remains
     // a qualified-name lookup and may find an explicitly namespaced attribute.
     function reflectedAttr(node,name,...value) {
-        return value.length?dom('attrNS',node,null,name,value[0]):rawDom('attrNS',node,null,name);
+        return value.length?dom('attrNS',node,null,name,value[0]):rawDom.attrNS(node,null,name);
     }
     const apply = Reflect.apply;
     const eventSlice = Array.prototype.slice, mouseAssign = Object.assign;
@@ -147,8 +149,8 @@
                 handlers.set(type,{value:null,text:null,compiled:true,entry:null});
             handlerMap.set(target,handlers);inlineMap.delete(target);
             if(target!==globalThis) {
-                const shadow=rawDom('get',target,'shadowRoot');if(shadow)pending.push(shadow);
-                for(const child of rawDom('get',target,'childNodes'))pending.push(child);
+                const shadow=rawDom.get(target,'shadowRoot');if(shadow)pending.push(shadow);
+                for(const child of rawDom.get(target,'childNodes'))pending.push(child);
             }
         }
         hoverPath=[];hoverSnapshot=shadowBridge.capture([]);
@@ -210,7 +212,7 @@
     function handlerValue(target,type) {
         const r=handlerRecord(target,type);if(!r)throw new TypeError('Illegal event handler receiver');
         if(!r.compiled) {
-            if(target instanceof Node && !rawDom('get',target,'scripting'))return null;
+            if(target instanceof Node && !rawDom.get(target,'scripting'))return null;
             r.compiled=true;
             try{r.value=host.inline(r.text);}catch(e){r.value=null;report(e);}
         }
@@ -251,7 +253,7 @@
             let fn = target['on' + event.type];
             if (fn === undefined && target instanceof Node && target.nodeType === 1) {
                 const text = reflectedAttr(target,'on' + event.type);
-                if (text !== null && rawDom('get',target,'scripting')) {
+                if (text !== null && rawDom.get(target,'scripting')) {
                     let cache = inlineMap.get(target);
                     if (!cache) inlineMap.set(target, cache = new Map());
                     let x = cache.get(event.type);
@@ -313,49 +315,49 @@
         set textContent(v) { dom('set',this,'textContent',v == null ? '' : String(v)); }
         appendChild(child) { validateInsertion(this,child,null);dom('insert',this,child,null); return child; }
         insertBefore(child,before) { if(arguments.length<2)throw new TypeError('Two insertion arguments are required');validateInsertion(this,child,before);dom('insert',this,child,before==null?null:before); return child; }
-        removeChild(child) { if(!rawDom('isNode',null,this)||!rawDom('isNode',null,child))throw new TypeError('Node arguments are required');if (rawDom('get',child,'parentNode') !== this) throw new DOMException('The node is not a child','NotFoundError'); dom('remove',child); return child; }
+        removeChild(child) { if(!rawDom.isNode(null,this)||!rawDom.isNode(null,child))throw new TypeError('Node arguments are required');if (rawDom.get(child,'parentNode') !== this) throw new DOMException('The node is not a child','NotFoundError'); dom('remove',child); return child; }
         replaceChild(child,old) {
-            if(arguments.length<2 || !rawDom('isNode',null,this) || !rawDom('isNode',null,child) || !rawDom('isNode',null,old))
+            if(arguments.length<2 || !rawDom.isNode(null,this) || !rawDom.isNode(null,child) || !rawDom.isNode(null,old))
                 throw new TypeError('Two Node arguments are required');
-            const status=rawDom('replacementStatus',this,child,old);
+            const status=rawDom.replacementStatus(this,child,old);
             if(status)throw new DOMException(status===2?'The old node is not a child':'The replacement cannot be inserted here',
                 status===2?'NotFoundError':'HierarchyRequestError');
             dom('replace',this,child,old);return old;
         }
-        cloneNode(deep = false) { if(rawDom('get',this,'shadowHost'))throw new DOMException('Shadow roots cannot be cloned directly','NotSupportedError');return dom('clone',this,!!deep); }
+        cloneNode(deep = false) { if(rawDom.get(this,'shadowHost'))throw new DOMException('Shadow roots cannot be cloned directly','NotSupportedError');return dom('clone',this,!!deep); }
         isEqualNode(other = null) { return dom('equal',this,other); }
         isSameNode(other = null) { return dom('same',this,other); }
-        compareDocumentPosition(other) { return rawDom('position',this,other); }
+        compareDocumentPosition(other) { return rawDom.position(this,other); }
         contains(other) { for(let n=other;n;n=n.parentNode) if(n===this) return true; return false; }
         hasChildNodes() { return this.firstChild !== null; }
-        getRootNode(options={}) { return rawDom('root',this,!!shadowBridge.dictionary(options).composed); }
+        getRootNode(options={}) { return rawDom.root(this,!!shadowBridge.dictionary(options).composed); }
     }
     function replaceChildNode(receiver,nodes) {
-        const kind=rawDom('get',receiver,'nodeType');
+        const kind=rawDom.get(receiver,'nodeType');
         if(kind!==1 && kind!==3 && kind!==7 && kind!==8 && kind!==10)throw new TypeError('ChildNode receiver required');
         // Convert the union before reading the parent: author string conversion
         // can move the receiver. Native branding does not depend on prototypes.
         const values=[];
-        for(let i=0;i<nodes.length;i++)values[i]=rawDom('isNode',null,nodes[i])?nodes[i]:elementURL.string(nodes[i]);
-        const parent=rawDom('get',receiver,'parentNode');
+        for(let i=0;i<nodes.length;i++)values[i]=rawDom.isNode(null,nodes[i])?nodes[i]:elementURL.string(nodes[i]);
+        const parent=rawDom.get(receiver,'parentNode');
         if(!parent)return;
-        let next=rawDom('get',receiver,'nextSibling');
+        let next=rawDom.get(receiver,'nextSibling');
         while(next){let used=false;for(let i=0;i<values.length;i++)if(values[i]===next){used=true;break;}
-            if(!used)break;next=rawDom('get',next,'nextSibling');}
+            if(!used)break;next=rawDom.get(next,'nextSibling');}
         const replace=()=>{
-            const owner=rawDom('get',receiver,'ownerDocument');
-            const make=value=>typeof value==='string'?rawDom('create',owner,3,'#text',value):value;
+            const owner=rawDom.get(receiver,'ownerDocument');
+            const make=value=>typeof value==='string'?rawDom.create(owner,3,'#text',value):value;
             let replacement;
             if(values.length===1)replacement=make(values[0]);
             else {
-                replacement=rawDom('create',owner,11,'#document-fragment','');
-                for(let i=0;i<values.length;i++)rawDom('insert',replacement,make(values[i]),null);
+                replacement=rawDom.create(owner,11,'#document-fragment','');
+                for(let i=0;i<values.length;i++)rawDom.insert(replacement,make(values[i]),null);
             }
-            if(rawDom('get',receiver,'parentNode')===parent){
-                const status=rawDom('replacementStatus',parent,replacement,receiver);
+            if(rawDom.get(receiver,'parentNode')===parent){
+                const status=rawDom.replacementStatus(parent,replacement,receiver);
                 if(status)throw new DOMException('The replacement cannot be inserted here',status===2?'NotFoundError':'HierarchyRequestError');
-                rawDom('replace',parent,replacement,receiver);
-            }else {validateInsertion(parent,replacement,next);rawDom('insert',parent,replacement,next);}
+                rawDom.replace(parent,replacement,receiver);
+            }else {validateInsertion(parent,replacement,next);rawDom.insert(parent,replacement,next);}
         };
         // rawDom still invokes native CE/MO hooks. One outer reaction scope
         // prevents author CE callbacks observing a half-finished replacement.
@@ -369,11 +371,11 @@
         get previousElementSibling() { let n=this.previousSibling; while(n && n.nodeType !== 1) n=n.previousSibling; return n; }
         get childElementCount() { return this.children.length; }
         remove() { if (this.parentNode) this.parentNode.removeChild(this); }
-        append(...nodes) { for (const n of nodes) this.appendChild(rawDom('isNode',null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n))); }
-        prepend(...nodes) { const before=this.firstChild; for (const n of nodes) this.insertBefore(rawDom('isNode',null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n)),before); }
+        append(...nodes) { for (const n of nodes) this.appendChild(rawDom.isNode(null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n))); }
+        prepend(...nodes) { const before=this.firstChild; for (const n of nodes) this.insertBefore(rawDom.isNode(null,n) ? n : (this.ownerDocument||this).createTextNode(elementURL.string(n)),before); }
         replaceChildren(...nodes) { this.textContent=''; this.append(...nodes); }
-        before(...nodes) { if(this.parentNode) for(const n of nodes) this.parentNode.insertBefore(rawDom('isNode',null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),this); }
-        after(...nodes) { if(this.parentNode) { const next=this.nextSibling; for(const n of nodes) this.parentNode.insertBefore(rawDom('isNode',null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),next); } }
+        before(...nodes) { if(this.parentNode) for(const n of nodes) this.parentNode.insertBefore(rawDom.isNode(null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),this); }
+        after(...nodes) { if(this.parentNode) { const next=this.nextSibling; for(const n of nodes) this.parentNode.insertBefore(rawDom.isNode(null,n)?n:this.ownerDocument.createTextNode(elementURL.string(n)),next); } }
         replaceWith(...nodes) { replaceChildNode(this,nodes); }
         get tagName() { return this.nodeType === 1 ? this.nodeName : undefined; }
         get localName() { return dom('get',this,'localName'); }
@@ -394,19 +396,19 @@
         set innerHTML(v) { dom('set',this,'innerHTML',String(v)); }
         get outerHTML() { return dom('get',this,'outerHTML'); }
         set outerHTML(value) {
-            if(rawDom('get',this,'nodeType')!==1)throw new TypeError('Element receiver required');
+            if(rawDom.get(this,'nodeType')!==1)throw new TypeError('Element receiver required');
             const markup=value===null?'':elementURL.string(value);
             // Conversion can move the receiver; sample its native parent only
             // afterwards. Fragment parsing is inert, unlike contextual Range.
-            const parent=rawDom('get',this,'parentNode');
+            const parent=rawDom.get(this,'parentNode');
             if(!parent)return;
-            const type=rawDom('get',parent,'nodeType');
+            const type=rawDom.get(parent,'nodeType');
             if(type===9)throw new DOMException('Document elements cannot be replaced with outerHTML','NoModificationAllowedError');
-            const owner=rawDom('get',this,'ownerDocument');
-            if(rawDom('get',owner,'contentType')!=='text/html')throw new DOMException('XML fragments are not implemented','NotSupportedError');
+            const owner=rawDom.get(this,'ownerDocument');
+            if(rawDom.get(owner,'contentType')!=='text/html')throw new DOMException('XML fragments are not implemented','NotSupportedError');
             customElementsBridge.reactions(()=>{
-                const context=type===11?rawDom('create',owner,1,'body',''):parent;
-                const fragment=rawDom('parseFragment',context,markup,false);
+                const context=type===11?rawDom.create(owner,1,'body',''):parent;
+                const fragment=rawDom.parseFragment(context,markup,false);
                 dom('insert',parent,fragment,this);
                 dom('remove',this);
             });
@@ -536,8 +538,8 @@
         set defaultSelected(v){reflectedAttr(this,'selected',v?'':null);}
     }
     function htmlElementBrand(node,tag){
-        if(rawDom('get',node,'nodeType')!==1 || rawDom('get',node,'namespaceURI')!=='http://www.w3.org/1999/xhtml' ||
-           rawDom('get',node,'localName')!==tag)throw new TypeError('Illegal '+tag+' receiver');
+        if(rawDom.get(node,'nodeType')!==1 || rawDom.get(node,'namespaceURI')!=='http://www.w3.org/1999/xhtml' ||
+           rawDom.get(node,'localName')!==tag)throw new TypeError('Illegal '+tag+' receiver');
     }
     let elementURL; // Initialized by js_hyperlink after the private URL implementation.
     const formCollections=new WeakMap(), formResetting=new WeakSet();
@@ -547,8 +549,8 @@
         if(!collection){
             collection=formNameBridge.collection(()=>{
                 let root=form,parent;
-                while((parent=rawDom('get',root,'parentNode')))root=parent;
-                return rawDom('formControls',root,form);
+                while((parent=rawDom.get(root,'parentNode')))root=parent;
+                return rawDom.formControls(root,form);
             });
             formCollections.set(form,collection);
         }
@@ -570,7 +572,7 @@
         set type(v){htmlElementBrand(this,'script');reflectedAttr(this,'type',elementURL.string(v));}
         get noModule(){htmlElementBrand(this,'script');return reflectedAttr(this,'nomodule')!==null;}
         set noModule(v){htmlElementBrand(this,'script');reflectedAttr(this,'nomodule',v?'':null);}
-        get text(){htmlElementBrand(this,'script');return rawDom('get',this,'textContent');}
+        get text(){htmlElementBrand(this,'script');return rawDom.get(this,'textContent');}
         set text(v){htmlElementBrand(this,'script');dom('set',this,'textContent',v===null?'':elementURL.string(v));}
         get crossOrigin(){
             htmlElementBrand(this,'script');const v=reflectedAttr(this,'crossorigin');
@@ -614,11 +616,11 @@
         requestSubmit(submitter){
             htmlElementBrand(this,'form');
             if(submitter!=null){
-                const tag=rawDom('get',submitter,'localName'),type=(reflectedAttr(submitter,'type')||'').toLowerCase();
-                if(rawDom('get',submitter,'namespaceURI')!=='http://www.w3.org/1999/xhtml' ||
+                const tag=rawDom.get(submitter,'localName'),type=(reflectedAttr(submitter,'type')||'').toLowerCase();
+                if(rawDom.get(submitter,'namespaceURI')!=='http://www.w3.org/1999/xhtml' ||
                    !(tag==='input' && (type==='submit'||type==='image') || tag==='button' && type!=='reset' && type!=='button'))
                     throw new TypeError('submitter must be a submit button');
-                if(rawDom('get',submitter,'form:'+tag)!==this)throw new DOMException('submitter belongs to another form','NotFoundError');
+                if(rawDom.get(submitter,'form:'+tag)!==this)throw new DOMException('submitter belongs to another form','NotFoundError');
             }
             const e=new Event('submit',{bubbles:true,cancelable:true});
             e.submitter=submitter||null;
@@ -639,37 +641,37 @@
     class Document extends Node {}
     class HTMLDocument extends Document {}
     function characterDataBrand(node){
-        const type=rawDom('get',node,'nodeType');if(type!==3 && type!==4 && type!==7 && type!==8)throw new TypeError('Illegal CharacterData receiver');
+        const type=rawDom.get(node,'nodeType');if(type!==3 && type!==4 && type!==7 && type!==8)throw new TypeError('Illegal CharacterData receiver');
     }
     class CharacterData extends Node {
-        get data(){characterDataBrand(this);return rawDom('get',this,'nodeValue');}
+        get data(){characterDataBrand(this);return rawDom.get(this,'nodeValue');}
         set data(v){characterDataBrand(this);dom('set',this,'nodeValue',v===null?'':elementURL.string(v));}
-        get length(){characterDataBrand(this);return rawDom('get',this,'nodeValue').length;}
+        get length(){characterDataBrand(this);return rawDom.get(this,'nodeValue').length;}
         substringData(offset,count){
             characterDataBrand(this);if(arguments.length<2)throw new TypeError('Two arguments required');
-            offset=offset>>>0;count=count>>>0;const data=rawDom('get',this,'nodeValue');
+            offset=offset>>>0;count=count>>>0;const data=rawDom.get(this,'nodeValue');
             if(offset>data.length)throw new DOMException('Offset exceeds data length','IndexSizeError');
             return data.slice(offset,offset+count);
         }
         appendData(data){
             characterDataBrand(this);if(!arguments.length)throw new TypeError('Data required');
-            data=elementURL.string(data);dom('set',this,'nodeValue',rawDom('get',this,'nodeValue')+data);
+            data=elementURL.string(data);dom('set',this,'nodeValue',rawDom.get(this,'nodeValue')+data);
         }
         insertData(offset,data){
             characterDataBrand(this);if(arguments.length<2)throw new TypeError('Two arguments required');
-            offset=offset>>>0;data=elementURL.string(data);const old=rawDom('get',this,'nodeValue');
+            offset=offset>>>0;data=elementURL.string(data);const old=rawDom.get(this,'nodeValue');
             if(offset>old.length)throw new DOMException('Offset exceeds data length','IndexSizeError');
             dom('set',this,'nodeValue',old.slice(0,offset)+data+old.slice(offset));
         }
         deleteData(offset,count){
             characterDataBrand(this);if(arguments.length<2)throw new TypeError('Two arguments required');
-            offset=offset>>>0;count=count>>>0;const old=rawDom('get',this,'nodeValue');
+            offset=offset>>>0;count=count>>>0;const old=rawDom.get(this,'nodeValue');
             if(offset>old.length)throw new DOMException('Offset exceeds data length','IndexSizeError');
             dom('set',this,'nodeValue',old.slice(0,offset)+old.slice(offset+count));
         }
         replaceData(offset,count,data){
             characterDataBrand(this);if(arguments.length<3)throw new TypeError('Three arguments required');
-            offset=offset>>>0;count=count>>>0;data=elementURL.string(data);const old=rawDom('get',this,'nodeValue');
+            offset=offset>>>0;count=count>>>0;data=elementURL.string(data);const old=rawDom.get(this,'nodeValue');
             if(offset>old.length)throw new DOMException('Offset exceeds data length','IndexSizeError');
             dom('set',this,'nodeValue',old.slice(0,offset)+data+old.slice(offset+count));
         }
@@ -681,12 +683,12 @@
             return node;
         }
         get wholeText(){
-            const text=n=>{const t=rawDom('get',n,'nodeType');return t===3||t===4;};
+            const text=n=>{const t=rawDom.get(n,'nodeType');return t===3||t===4;};
             if(!text(this))throw new TypeError('Illegal Text receiver');
             let first=this,p;
-            while((p=rawDom('get',first,'previousSibling')) && text(p))first=p;
+            while((p=rawDom.get(first,'previousSibling')) && text(p))first=p;
             const parts=[];
-            for(let n=first;n && text(n);n=rawDom('get',n,'nextSibling'))parts.push(rawDom('get',n,'nodeValue'));
+            for(let n=first;n && text(n);n=rawDom.get(n,'nextSibling'))parts.push(rawDom.get(n,'nodeValue'));
             return parts.join('');
         }
     }
@@ -705,7 +707,7 @@
         }
     }
     function processingInstructionCreate(receiver,target,data){
-        if(rawDom('get',receiver,'nodeType')!==9)throw new TypeError('Document receiver required');
+        if(rawDom.get(receiver,'nodeType')!==9)throw new TypeError('Document receiver required');
         target=elementURL.string(target);data=elementURL.string(data);
         // XML 1.0 Name; this is distinct from HTML's PI token target syntax.
         if(!/^[:A-Z_a-z\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u02FF\u0370-\u037D\u037F-\u1FFF\u200C-\u200D\u2070-\u218F\u2C00-\u2FEF\u3001-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD\u{10000}-\u{EFFFF}][:A-Z_a-z0-9.\-\u00B7\u0300-\u036F\u203F-\u2040\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u02FF\u0370-\u037D\u037F-\u1FFF\u200C-\u200D\u2070-\u218F\u2C00-\u2FEF\u3001-\uD7FF\uF900-\uFDCF\uFDF0-\uFFFD\u{10000}-\u{EFFFF}]*(?![\s\S])/u.test(target) || data.includes('?>'))
@@ -719,7 +721,7 @@
             if(proto!==null && (typeof proto==='object'||typeof proto==='function'))Object.setPrototypeOf(node,proto);
             return node;
         }
-        get target(){return rawDom('get',this,'piTarget');}
+        get target(){return rawDom.get(this,'piTarget');}
     }
     Document.prototype.createProcessingInstruction=function(target,data){
         if(arguments.length<2)throw new TypeError('Target and data required');
@@ -788,7 +790,7 @@
     };
     function cssName(k){return k==='cssFloat'?'float':String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase());}
     function inlineStyle(node){
-        if(!rawDom('isNode',null,node)||rawDom('get',node,'nodeType')!==1)throw new TypeError('Expected an Element');
+        if(!rawDom.isNode(null,node)||rawDom.get(node,'nodeType')!==1)throw new TypeError('Expected an Element');
         let s=state.get(node);if(!s)state.set(node,s={});return s.style||(s.style=new StyleDeclaration(node));
     }
     class StyleDeclaration {
@@ -821,16 +823,8 @@
     function requestAnimationFrame(fn){if(typeof fn!=='function')throw new TypeError('Expected callback');return timer(2,fn,16,[]);}
     function cancelAnimationFrame(id){host.clear(Number(id));}
     function queueMicrotask(fn){return host.microtask(fn);}
-    const navigatorToken={},navigatorBrands=new WeakSet(),navigatorLanguages=Object.freeze(['en-US']);
-    class Navigator {
-        constructor(token){if(token!==navigatorToken)throw new TypeError('Illegal Navigator constructor');navigatorBrands.add(this);}
-    }
-    const navigator=new Navigator(navigatorToken);
-    for(const [name,value] of Object.entries({userAgent:'Nocturne/1.0 QuickJS',platform:'Nocturne',language:'en-US',languages:navigatorLanguages,onLine:true}))
-        Object.defineProperty(Navigator.prototype,name,{configurable:true,enumerable:true,get(){
-            if(!navigatorBrands.has(this))throw new TypeError('Illegal Navigator receiver');return value;
-        }});
-    Object.defineProperty(Navigator.prototype,Symbol.toStringTag,{value:'Navigator',configurable:true});
+    /* @include js_navigator.js */
+    const {navigator,Interface:Navigator}=navigatorBridge.create(false);
     Object.assign(globalThis,{document,console,navigator,Navigator,Node,Element,HTMLElement,HTMLUnknownElement,HTMLIFrameElement,HTMLFrameElement,HTMLImageElement,Image,
         HTMLInputElement,HTMLButtonElement,HTMLSelectElement,HTMLTextAreaElement,HTMLFieldSetElement,HTMLObjectElement,HTMLOutputElement,HTMLOptionElement,
         HTMLScriptElement,HTMLFormElement,HTMLAnchorElement,HTMLAreaElement,
@@ -904,6 +898,7 @@
     /* @include js_range.js */
     /* @include js_document_selection.js */
     /* @include js_traversal.js */
+    /* @include js_geometry.js */
     /* @include js_svg.js */
     /* @include js_attributes.js */
     /* @include js_shadow.js */
@@ -930,7 +925,7 @@
         const capture=pointerCaptureBridge.prepare(mouseAssign({},init,{button:-1}));
         if(capture){
             path=[];
-            for(let n=capture;n;n=rawDom('get',n,'assignedSlot')||rawDom('get',n,'parentNode')||rawDom('get',n,'shadowHost'))path.push(n);
+            for(let n=capture;n;n=rawDom.get(n,'assignedSlot')||rawDom.get(n,'parentNode')||rawDom.get(n,'shadowHost'))path.push(n);
         }
         if (path.length && path[path.length-1] === document) path[path.length] = globalThis;
         const previous = hoverPath, from = previous[0] || null, to = path[0] || null;
@@ -954,13 +949,13 @@
         if (from !== to && from) queue('mouseout',previous,0,to,false);
         for (let i=0;i<previous.length;i++) {
             const node=previous[i];
-            if(node!==globalThis && rawDom('get',node,'nodeType')===1 && !contains(path,node))
+            if(node!==globalThis && rawDom.get(node,'nodeType')===1 && !contains(path,node))
                 queue('mouseleave',previous,i,to,true);
         }
         if (from !== to && to) queue('mouseover',path,0,from,false);
         for (let i=path.length-1;i>=0;i--) {
             const node=path[i];
-            if(node!==globalThis && rawDom('get',node,'nodeType')===1 && !contains(previous,node))
+            if(node!==globalThis && rawDom.get(node,'nodeType')===1 && !contains(previous,node))
                 queue('mouseenter',path,i,from,true);
         }
         if (to) queue('mousemove',path,0,null,false);
@@ -1006,18 +1001,19 @@
         imageError(){return new DOMException('The image request changed or could not be decoded','EncodingError');},
         hover,
         customElementBefore(...args){
-            const reactionArgs=args[0]==='adopt' && args[2] && rawDom('get',args[2],'nodeType')!==2?['remove',args[2]]:args;
-            const reactionNode=args[0]==='adopt' && args[2] && rawDom('get',args[2],'nodeType')===2?rawDom('get',args[2],'attrOwner'):reactionArgs[1];
-            const ceActive=reactionNode && rawDom('get',reactionNode,'scripting') || args[0]==='adopt' && rawDom('get',args[1],'scripting');
+            const reactionArgs=args[0]==='adopt' && args[2] && rawDom.get(args[2],'nodeType')!==2?['remove',args[2]]:args;
+            const reactionNode=customElementsBridge.active()?(args[0]==='adopt' && args[2] && rawDom.get(args[2],'nodeType')===2?rawDom.get(args[2],'attrOwner'):reactionArgs[1]):null;
+            const ceActive=customElementsBridge.active()&&(reactionNode && rawDom.get(reactionNode,'scripting') || args[0]==='adopt' && rawDom.get(args[1],'scripting'));
             const ce=ceActive?customElementsBridge.before(...args):null;
             let mutationArgs=reactionArgs;
             if(args[0]==='set' && args[2]==='innerHTML' && args[1] instanceof HTMLTemplateElement)
-                mutationArgs=['set',rawDom('get',args[1],'templateContent'),'innerHTML',args[3]];
-            const mutation=mutationBridge.before(...mutationArgs);
-            const range=rangeBridge.before(...mutationArgs);
+                mutationArgs=['set',rawDom.get(args[1],'templateContent'),'innerHTML',args[3]];
+            const mutation=mutationBridge.native?null:mutationBridge.before(...mutationArgs);
+            const range=rangeBridge.active()?rangeBridge.before(...mutationArgs):null;
             return ce||mutation||range?{ce,mutation,range,op:args[0]}:null;
         },
-        customElementAfter(token,result){rangeBridge.after(token.range);mutationBridge.after(token.mutation);if(!['clone','import'].includes(token.op) || !result || rawDom('get',result,'scripting'))customElementsBridge.after(token.ce,result);},
+        customElementAfter(token,result){rangeBridge.after(token.range);if(!mutationBridge.native)mutationBridge.after(token.mutation);if(!['clone','import'].includes(token.op) || !result || rawDom.get(result,'scripting'))customElementsBridge.after(token.ce,result);},
+        mutationFlush(){mutationBridge.flush();},
         customElementScan(){customElementsBridge.upgradeTree(document);customElementsBridge.formRefresh();},
         customFormReset(form){customElementsBridge.formReset(form);},
         slotChanges(){mutationBridge.signalSlots();},
@@ -1035,7 +1031,7 @@
             Text.prototype,Comment.prototype,DocumentFragment.prototype,HTMLIFrameElement.prototype,HTMLImageElement.prototype,
             HTMLInputElement.prototype,HTMLButtonElement.prototype,HTMLSelectElement.prototype,HTMLTextAreaElement.prototype,
             HTMLFieldSetElement.prototype,HTMLObjectElement.prototype,HTMLOutputElement.prototype,HTMLOptionElement.prototype,HTMLTemplateElement.prototype,DocumentType.prototype,
-            HTMLScriptElement.prototype,HTMLFormElement.prototype,HTMLAnchorElement.prototype,HTMLAreaElement.prototype,...svgBridge.nodeProtos,ProcessingInstruction.prototype,attributeBridge.nodeProto,...htmlElementsBridge.nodeProtos,shadowBridge.ShadowRoot.prototype,shadowBridge.HTMLSlotElement.prototype,...semanticElementsBridge.nodeProtos,HTMLUnknownElement.prototype,...canvasBridge.nodeProtos,HTMLMediaElement.prototype,HTMLAudioElement.prototype,HTMLVideoElement.prototype,...formControlBridge.nodeProtos,...htmlElementsBridge.extraNodeProtos,...textTrackBridge.nodeProtos,HTMLFrameElement.prototype],
+            HTMLScriptElement.prototype,HTMLFormElement.prototype,HTMLAnchorElement.prototype,HTMLAreaElement.prototype,...svgBridge.nodeProtos,ProcessingInstruction.prototype,attributeBridge.nodeProto,...htmlElementsBridge.nodeProtos,shadowBridge.ShadowRoot.prototype,shadowBridge.HTMLSlotElement.prototype,...semanticElementsBridge.nodeProtos,HTMLUnknownElement.prototype,...canvasBridge.nodeProtos,HTMLMediaElement.prototype,HTMLAudioElement.prototype,HTMLVideoElement.prototype,...formControlBridge.nodeProtos,...htmlElementsBridge.extraNodeProtos,...textTrackBridge.nodeProtos,HTMLFrameElement.prototype,...svgBridge.geometryNodeProtos],
         dispatch:nativeDispatch,
         response(...args){return fetchBridge.response(...args);},
         reject(message,abort){return abort?new DOMException(message,'AbortError'):new TypeError(message);}

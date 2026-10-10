@@ -25,6 +25,7 @@ typedef struct arena {
     struct achunk *head;
     size_t allocated, limit;
     jmp_buf *trap;
+    size_t chunk_size; /* preferred total chunk bytes; 0 retains the 64 KiB default */
 } arena_t;
 
 void *ar_alloc(arena_t *a, size_t n); /* zeroed, 8-byte aligned */
@@ -142,8 +143,24 @@ typedef struct node {
     int elem_index; /* 1-based position among element siblings */
     /* cascade and layout */
     struct style *style;
+    arena_t style_mem; /* element-owned computed values; descendants borrow inherited values */
+    arena_t style_previous_mem;
+    struct style *style_previous;
+    struct node *style_retired_next;
+    bool style_dirty, style_children_dirty;
+    uint8_t style_form_state; /* supervisor-published form pseudo snapshot; cascade reads only */
+    uint32_t style_subtree_work; /* flat-tree element count, refreshed before a full cascade */
+    /* Published only after layout joins; CSS workers never read mutable boxes
+       or borrow this name list from a retired computed-style arena. */
+    char *container_names;
+    float container_width, container_height, container_em;
+    uint8_t container_type;
+    bool container_valid;
+    struct node *query_inline_container, *query_size_container;
+    struct css_scope *style_scope; /* root-only, borrowed from current immutable rule index */
     struct style *animation_base_style; /* cascade without this node's effects */
     struct css_animation *animations; /* bounded malloc storage, not DOM attributes */
+    struct css_motion_state *css_motion; /* document-owned native CSS playback, not a style-arena borrow */
     struct box *box;          /* the element's first box */
     struct box *anchor_block; /* inline elements: the block holding its first line */
     float anchor_dy;
@@ -273,6 +290,8 @@ struct gline {
 #define COLOR_CURRENT 0x00FFFFFEu /* placeholder for currentColor while computing */
 enum { OF_FILL, OF_CONTAIN, OF_COVER, OF_NONE, OF_SCALE_DOWN };
 enum { CV_VISIBLE, CV_AUTO, CV_HIDDEN };
+enum { CT_NORMAL, CT_INLINE_SIZE, CT_SIZE };
+enum { BO_HORIZONTAL, BO_VERTICAL };
 
 struct custom_prop {
     const char *name, *value;
@@ -300,12 +319,27 @@ struct svg_paint {
     uint8_t kind;
 };
 
+enum { CM_NORMAL, CM_REVERSE, CM_ALTERNATE, CM_ALTERNATE_REVERSE };
+enum { CM_FILL_NONE, CM_FILL_FORWARDS, CM_FILL_BACKWARDS, CM_FILL_BOTH };
+enum { CM_BEZIER, CM_LINEAR, CM_STEP_START, CM_STEP_END };
+struct css_easing { float x1, y1, x2, y2; uint8_t kind; };
+struct css_motion {
+    const char *name; /* NULL = none; one animation, never an accepted comma-list */
+    float duration, delay, iterations; /* milliseconds; infinity allowed only for iterations */
+    struct css_easing easing;
+    uint8_t direction, fill, paused;
+};
 typedef struct style {
     uint8_t display, position, float_, clear, white_space, text_align, vertical_align, list_style,
         list_style_inside, font_style, text_transform, text_decoration, overflow, box_sizing, visibility, pointer_events,
         border_collapse, flex_direction, flex_wrap, justify_content, align_items, align_self, align_content, table_layout,
         content_visibility;
     uint8_t border_style[4];
+    uint8_t container_type;
+    uint8_t box_orient;
+    bool legacy_box; /* authored -webkit-box/-webkit-inline-box display */
+    uint32_t line_clamp; /* legacy positive line budget; zero = none */
+    const char *container_names; /* authored identifier list, NULL = none */
     uint16_t font_weight;
     uint8_t font_family; /* FONT_FAMILY_*; inherited as one byte */
     const char *font_names; /* full authored family list, computed-style arena */
@@ -333,6 +367,7 @@ typedef struct style {
     float letter_spacing, word_spacing;
     float border_spacing;
     float opacity;
+    struct css_motion motion; /* native opacity animation subset; not inherited */
     int z_index, order;
     const char *content; /* ::before / ::after text, NULL = none */
     const char *list_style_string;
@@ -384,6 +419,7 @@ struct css_import {
     double order;
 };
 sheet_t *css_parse_sheet(arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports);
+sheet_t *css_parse_sheet_serviced(web_doc *d, arena_t *a, const char *css, size_t n, const char *base_url, double order, pvec *imports);
 void css_sheet_scope(sheet_t *sheet, node_t *shadow_root);
 sheet_t *css_sheet_instance(arena_t *a, const sheet_t *source, double order, node_t *scope);
 void css_sheet_media(sheet_t *sheet, const char *media);
@@ -392,8 +428,19 @@ bool css_sheet_single_style(sheet_t *sheet, const char *source, size_t length);
 const char *css_ua_sheet(void);
 /* compute every element's style for the viewport */
 void css_cascade(web_doc *d, int vw, int vh);
+bool css_containers_update(web_doc *d); /* supervisor, after layout; changed query inputs */
+bool css_container_names_valid(const char *s, size_t n);
+void css_mark_dirty(web_doc *d, node_t *n);
+void css_node_style_free(node_t *n);
+void css_node_style_unpublish(node_t *n);
+void css_styles_release(web_doc *d);
+bool css_style_layout_equal(const style_t *a, const style_t *b);
 int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text);
 void css_animation_free(node_t *n);
+void css_motion_tick(web_doc *d, uint64_t now);
+int64_t css_motion_deadline(web_doc *d, uint64_t now);
+void css_motion_doc_free(web_doc *d);
+bool css_easing_parse(const char *s, size_t n, struct css_easing *out);
 /* Shared @media / matchMedia evaluator; optional serialization cap >= 9*n+16. */
 bool css_media_evaluate(const char *query, int vw, int vh, bool scripting, char *out, size_t cap);
 void css_styling_free(struct styling *st);
@@ -406,6 +453,7 @@ const struct propdef *css_prop_lookup(const char *name, size_t n); /* NULL: not 
 int css_prop_count(void);
 int css_prop_index(const struct propdef *p);
 bool css_prop_is_font(const struct propdef *p); /* font-size or the font shorthand */
+bool css_prop_is_motion(const struct propdef *p);
 /* the values a declaration is resolved against */
 struct cx {
     style_t *s;
@@ -417,6 +465,8 @@ struct cx {
     bool font_pass;        /* only font-size is being computed */
     bool supports_probe, invalid; /* scratch validation: never touch a document */
     unsigned supports_nodes; /* bound arithmetic AST traversal, not just parentheses */
+    float cq_width, cq_height;
+    bool cq_width_set, cq_height_set;
 };
 /* apply a declaration (var() already substituted) unless its properties are all set; false if invalid */
 bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx);
@@ -441,6 +491,15 @@ enum { AT_NONE, AT_IMG, AT_INLINE_BLOCK, AT_INPUT, AT_CHECKBOX, AT_RADIO, AT_BUT
 
 struct run;  /* a positioned piece of text */
 struct deco; /* a background/border span of an inline box on one line */
+struct line_fragment;
+/* Numeric-only, debug_js diagnostics. Allocated in the box's private arena;
+ * helpers never call the console or publish an incomplete layout. */
+struct clamp_trace {
+    float usedh, sh, full_h, cut_h, post_h, last_y, line_bottom;
+    uint32_t limit, lines;
+    uint8_t last_kind;
+    bool eligible, applied, last_anon, cb_reached;
+};
 
 typedef struct box {
     uint8_t kind, atomic;
@@ -469,9 +528,20 @@ typedef struct box {
     int nruns;
     struct deco *decos;
     int ndecos;
+    struct line_fragment *lines;
+    int nlines;
+    bool clamp_hidden, clamp_truncated;
+    struct clamp_trace *clamp_trace;
     /* intrinsic widths cache */
     float min_cw, max_cw;
     bool intrinsic_done;
+    arena_t layout_mem, text_mem;
+    bool layout_dirty, layout_cache_valid, layout_cache_safe;
+    bool stretch_height_dependent;
+    float cached_width, cached_cbh, cached_usedh;
+    float cached_height, cached_baseline, cached_last_baseline, cached_content_dy;
+    uint64_t cached_font_generation;
+    float cached_padding[4], cached_border[4];
     /* tables */
     int colspan, rowspan, col, row;
     /* list items: marker text, or a shape (1 disc, 2 circle, 3 square) */
@@ -480,6 +550,20 @@ typedef struct box {
     /* inline <svg>: its entry in the document's cache */
     struct svg_cache *svg;
 } box_t;
+
+static inline bool box_line_clamp(const box_t *b) {
+    return b && !b->anon && b->st && b->st->legacy_box &&
+        b->st->box_orient == BO_VERTICAL && b->st->line_clamp &&
+        (b->kind == B_BLOCK || (b->kind == B_ATOMIC && b->atomic == AT_INLINE_BLOCK));
+}
+
+/* Actual inline line boundaries, retained only within a clamp subtree. A
+ * valign-shifted run is not a new line; counting distinct run baselines loses
+ * that distinction and incorrectly consumes the paragraph's line budget. */
+struct line_fragment {
+    int first_run, end_run, first_deco, end_deco;
+    float top, bottom, baseline, left, right;
+};
 
 struct svg_cache {
     node_t *node;
@@ -516,8 +600,12 @@ void doc_active_cancel(web_doc *document); /* retire/free only this context subt
 node_t *doc_active_target(web_doc *document); /* validates live native press and embedding generation */
 
 void boxes_build(web_doc *d, arena_t *a);
+void boxes_restyle(web_doc *d);
+bool boxes_update_text(web_doc *d, node_t *n);
 void boxes_discard(web_doc *d); /* unpublish node/top-layer borrowers, then bmem */
 void layout_doc(web_doc *d, int width, int height);
+void layout_clamp_trace_report(web_doc *d);
+void layout_invalidate(box_t *b);
 float box_abs_x(const box_t *b);
 float box_abs_y(const box_t *b);
 /* Paint/hit/DOMRect positions; box_abs remains unscrolled offset geometry. */
@@ -559,9 +647,14 @@ struct web_profile {
     uint64_t shadow_reassigns, shadow_visits;
     uint64_t script_scans, script_visits, script_ms, native_calls, native_ms;
     uint64_t metadata_syncs, metadata_visits, metadata_ms;
+    uint64_t style_visits, style_rule_checks, style_index_entries, style_parallel_nodes;
 };
 struct web_doc {
+    struct css_motion_state *css_motions;
+    uint64_t css_motion_now; /* supervisor snapshot; immutable during AP cascade */
     web_doc *frame_parent;
+    uint32_t sandbox_flags; /* immutable active document restrictions */
+    uint64_t sandbox_activation_until; /* only native trusted input writes this */
     web_doc *frame_retired_next;
     node_t *frame_element;
     node_t *address_frame; /* native chrome selection; resolves the current child generation */
@@ -572,6 +665,8 @@ struct web_doc {
     struct web_frame *frame_container;
     web_doc *frame_free_next;
     struct web_profile profile;
+    bool profile_enabled; /* debug_js only; diagnostic counters remain cheap */
+    uint8_t clamp_trace_reported; /* at most four numeric diagnostics per document */
     web_doc *dom_family, *dom_docs, *dom_next;
     bool js_nodes_dirty; /* structural/Attr ownership changed; not text/style */
     bool inert; /* independent DOM only: no window, loader, style/resource scan */
@@ -627,6 +722,10 @@ struct web_doc {
     int width, height, doc_h, doc_w;
     int styled_w, styled_h; /* viewport the cascade ran for */
     bool need_style, need_boxes, layout_valid;
+    bool style_full_dirty, style_pending_dirty;
+    bool style_boxes_changed;
+    float container_rem; /* immutable root font size of the layout snapshot */
+    node_t *style_retired_first;
     node_t *focus;
     node_t *hover_target; /* native pointer target, not an author-set property */
     web_doc *hover_leaf;  /* top document's last hovered child context; arenas remain owned */
@@ -670,6 +769,8 @@ struct html_parser *html_begin(web_doc *d, const char *html, size_t n, const cha
 struct html_parser *html_open(web_doc *d);
 void html_close(struct html_parser *parser);
 int html_resume(struct html_parser *p, node_t **script);
+bool html_pending_input(const struct html_parser *p); /* unconsumed bytes, not stream EOF */
+bool html_import_changed(const struct html_parser *p); /* actual change in latest resume/import */
 bool html_write(struct html_parser *p, const char *text, size_t n);
 void html_finish(struct html_parser *p);
 node_t *html_fragment(web_doc *d, node_t *context, const char *html, size_t n);

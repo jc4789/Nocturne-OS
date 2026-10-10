@@ -46,7 +46,7 @@ const semanticElementsBridge = (() => {
             const oldState=oldValue===undefined?'':string(oldValue);
             const newState=newValue===undefined?'':string(newValue);
             const source=sourceValue===undefined?null:sourceValue;
-            if(source!==null && (!rawDom('isNode',null,source) || rawDom('get',source,'nodeType')!==1))
+            if(source!==null && (!rawDom.isNode(null,source) || rawDom.get(source,'nodeType')!==1))
                 throw new TypeError('ToggleEvent source must be an Element');
             toggleValues.set(this,{oldState,newState,source});
         }

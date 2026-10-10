@@ -15,6 +15,7 @@
 struct binding {
     lxb_dom_node_t *lex;
     node_t *native;
+    bool changed;
 };
 struct html_bridge {
     struct binding **items, **table;
@@ -70,7 +71,7 @@ static struct binding *bind_node(struct html_parser *p, lxb_dom_node_t *lex, nod
     }
     struct binding *v = malloc(sizeof *v);
     if (!v) return NULL;
-    v->lex = lex; v->native = native;
+    v->lex = lex; v->native = native; v->changed = false;
     b->items[b->length++] = v;
     size_t i = ptr_hash(native) & (b->table_size - 1);
     while (b->table[i]) i = (i + 1) & (b->table_size - 1);
@@ -236,6 +237,7 @@ static bool import_fields(struct binding *b) {
     if (n->type == N_ELEM) {
         lxb_dom_element_t *el = lxb_dom_interface_element(b->lex);
         if (!attrs_equal(n, el)) {
+            b->changed = true;
             bool was_open=node_attr(n,"open")!=NULL;
             size_t count = 0;
             for (lxb_dom_attr_t *a = el->first_attr; a; a = a->next) {
@@ -277,6 +279,7 @@ static bool import_fields(struct binding *b) {
     } else if (n->type == N_TEXT || n->type == N_COMMENT || n->type == N_PI) {
         lexbor_str_t *s = &lxb_dom_interface_character_data(b->lex)->data;
         if (!n->text || n->textlen != s->length || (s->length && memcmp(n->text, s->data, s->length))) {
+            b->changed = true;
             n->text = ar_strndup(&d->mem, s->data ? (const char *)s->data : "", s->length);
             n->textlen = s->length;
         }
@@ -298,8 +301,42 @@ node_t *html_bridge_native(struct html_parser *p, lxb_dom_node_t *node) {
     return b ? b->native : NULL;
 }
 
+static node_t *bound_native(lxb_dom_node_t *lex) {
+    struct binding *b=by_lex(lex);return b?b->native:NULL;
+}
+static bool links_equal(struct binding *v) {
+    node_t *n=v->native;lxb_dom_node_t *lex=v->lex;
+    if(n->parent!=bound_native(lex->parent) || n->prev!=bound_native(lex->prev) ||
+       n->next!=bound_native(lex->next) || n->first!=bound_native(lex->first_child) ||
+       n->last!=bound_native(lex->last_child))return false;
+    /* First/last alone miss a reorder in the middle. The parent revision is
+       also the cache key for native nth-child indexing. */
+    node_t *child=n->first;
+    for(lxb_dom_node_t *lc=lex->first_child;lc;lc=lc->next) {
+        if(!child || child!=bound_native(lc))return false;
+        child=child->next;
+    }
+    return child==NULL;
+}
+struct changed_documents { web_doc **items;size_t length,capacity; };
+static bool changed_document_add(struct changed_documents *docs,web_doc *d) {
+    if(!d)return true;
+    for(size_t i=0;i<docs->length;i++)if(docs->items[i]==d)return true;
+    if(docs->length==docs->capacity) {
+        size_t max=SIZE_MAX/sizeof *docs->items;
+        if(docs->capacity==max)return false;
+        size_t capacity=docs->capacity?(docs->capacity>max/2?max:docs->capacity*2):8;
+        web_doc **items=realloc(docs->items,capacity*sizeof *items);
+        if(!items)return false;
+        docs->items=items;docs->capacity=capacity;
+    }
+    docs->items[docs->length++]=d;return true;
+}
+
 bool html_bridge_import(struct html_parser *p) {
     struct html_bridge *b = p->bridge;
+    p->import_changed=false;
+    for(size_t i=0;i<b->length;i++)b->items[i]->changed=false;
     /* Discover the entire forest, not just document descendants. Removed
        open elements and active formatting nodes still participate in parsing. */
     for (size_t pass = 0; pass < 2; pass++) {
@@ -325,6 +362,26 @@ bool html_bridge_import(struct html_parser *p) {
             }
         }
     }
+    struct changed_documents changed={0};
+    bool document_changed=!p->fragment && (p->d->root!=p->native_root ||
+        p->d->quirks!=(p->document->dom_document.compat_mode==LXB_DOM_DOCUMENT_CMODE_QUIRKS));
+    if(document_changed && !changed_document_add(&changed,p->d))goto fail_changes;
+    /* Compare against the still-coherent old links before adoption or commit.
+       Exported native edits already agree with Lexbor and must not be notified
+       twice. Removed roots/SOE/AFE/template forests are part of this list. */
+    for(size_t i=0;i<b->length;i++) {
+        struct binding *v=b->items[i];
+        if(!links_equal(v))v->changed=true;
+        lxb_dom_node_t *root=v->lex;
+        while(root!=p->root && root->parent)root=root->parent;
+        struct binding *ancestor=by_lex(root);
+        if(ancestor && v->native->owner!=ancestor->native->owner) {
+            v->changed=true;
+            if(!changed_document_add(&changed,ancestor->native->owner))goto fail_changes;
+        }
+        if(v->changed && !changed_document_add(&changed,v->native->owner))goto fail_changes;
+    }
+    if(!changed.length){free(changed.items);return true;}
     /* The tree builder can move an adopted formatting node again. Its native
        logical owner follows the destination forest, never the proxy's fixed
        Lexbor allocation document. Run adoption on the old coherent tree before
@@ -335,12 +392,10 @@ bool html_bridge_import(struct html_parser *p) {
         while (root != p->root && root->parent) root = root->parent;
         struct binding *ancestor = by_lex(root);
         if (ancestor && v->native->owner != ancestor->native->owner &&
-            !doc_node_adopt(ancestor->native->owner, v->native)) return false;
+            !doc_node_adopt(ancestor->native->owner, v->native)) goto fail_changes;
     }
     /* Commit links after every referenced native node and field is available.
        No observer or script is entered halfway through this transaction. */
-    web_doc *changed_docs[66];
-    size_t ndocs = 0;
     for (size_t i = 0; i < b->length; i++) {
         node_t *n = b->items[i]->native;
         n->parent = n->prev = n->next = n->first = n->last = NULL;
@@ -352,32 +407,34 @@ bool html_bridge_import(struct html_parser *p) {
         int index = 0;
         for (lxb_dom_node_t *ch = v->lex->first_child; ch; ch = ch->next) {
             struct binding *c = by_lex(ch);
-            if (!c) return false;
+            if (!c) goto fail_changes;
             node_t *n = c->native;
             n->parent = parent; n->prev = parent->last;
             if (parent->last) parent->last->next = n; else parent->first = n;
             parent->last = n;
             if (n->type == N_ELEM) n->elem_index = ++index;
         }
-        if (parent->tag == T_textarea && !parent->foreign && !parent->value_dirty) parent->control_ready = false;
-        web_doc *d = parent->owner;
-        parent->resource_revision++;
-        size_t j = 0;
-        while (j < ndocs && changed_docs[j] != d) j++;
-        if (j == ndocs) {
-            if (ndocs < sizeof changed_docs / sizeof *changed_docs) changed_docs[ndocs++] = d;
-        }
     }
     /* Publish mutation/slot snapshots only after every native link is coherent.
        A root's children can occur later than its host in this binding forest. */
-    doc_details_parser_finish(p->native_root);
-    for (size_t i = 0; i < ndocs; i++) doc_mutated(changed_docs[i], NULL);
+    for(size_t i=0;i<b->length;i++)if(b->items[i]->changed) {
+        node_t *n=b->items[i]->native;
+        n->resource_revision++;
+        for(;n;n=n->parent)
+            if(n->tag==T_textarea && !n->foreign && !n->value_dirty)n->control_ready=false;
+    }
     if (!p->fragment) {
         p->d->root = p->native_root;
         p->d->quirks = p->document->dom_document.compat_mode == LXB_DOM_DOCUMENT_CMODE_QUIRKS;
-        doc_sync_tree(p->d);
     }
+    doc_details_parser_finish(p->native_root);
+    for(size_t i=0;i<changed.length;i++)doc_mutated(changed.items[i],NULL);
+    p->import_changed=true;
+    if(!p->fragment)doc_sync_tree(p->d);
+    free(changed.items);
     return true;
+fail_changes:
+    free(changed.items);return false;
 }
 
 static lxb_dom_node_t *new_lex(struct html_parser *p, node_t *n) {

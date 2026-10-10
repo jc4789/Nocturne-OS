@@ -54,6 +54,19 @@ int poll(struct n_pollfd *fds, int n, int timeout_ms);
 int proclist(struct n_procinfo *out, int max);
 int sysinfo(struct n_sysinfo *si);
 int cpu_info(struct n_cpuinfo *info);
+int clock_info(struct n_clockinfo *info);
+/* Native tasks sharing this process's address space and descriptors. */
+int thread_create(void (*fn)(void *), void *arg);
+int thread_join(int tid);
+_Noreturn void thread_exit(void);
+int thread_id(void);
+unsigned cpu_index(void);
+/* Eight process-library TLS slots, independent of errno and thread identity. */
+void *thread_local_get(unsigned slot);
+void thread_local_set(unsigned slot, void *value);
+/* timeout_ms == UINT32_MAX waits indefinitely; count == 0 wakes all. */
+int wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms);
+int wake_address(volatile uint32_t *address, unsigned count);
 void yield(void);
 int poweroff(void);
 int reboot(void);

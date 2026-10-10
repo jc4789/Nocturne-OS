@@ -1,6 +1,7 @@
 /* PIT timer (1 kHz) and CMOS real-time clock. */
 #include "kernel.h"
 #include "arch/cpu.h"
+#include "arch/hyperv.h"
 #include "sys/sched.h"
 #include "dev/timer.h"
 #include "dev/audio.h"
@@ -8,13 +9,19 @@
 volatile uint64_t timer_ticks;
 static int64_t boot_unix_time;
 static uint64_t tsc_base, tsc_per_ms;
+static uint64_t reference_base;
+static bool reference_clock;
 
 /* The tick counts milliseconds. An emulator may drop timer interrupts when it falls behind (QEMU
    without acceleration loses a quarter of them), so with a measured TSC the count is set from it
    instead: a late tick catches up the time it missed. */
 static void timer_irq(struct regs *r) {
     (void)r;
-    if (tsc_per_ms) {
+    uint64_t reference;
+    if (reference_clock && hv_reference_time(&reference)) {
+        uint64_t ms = (reference - reference_base) / 10000;
+        if (ms > timer_ticks) timer_ticks = ms;
+    } else if (tsc_per_ms) {
         uint64_t ms = (rdtsc() - tsc_base) / tsc_per_ms;
         if (ms > timer_ticks) timer_ticks = ms;
     } else {
@@ -65,6 +72,10 @@ int64_t rtc_read_unix(void) {
 void timer_init(void) {
     /* The LAPIC timer works everywhere, including Hyper-V Generation 2, which has no PIT. */
     vector_register(VEC_TIMER, timer_irq);
+    hv_reference_tsc_page();
+    uint64_t reference;
+    reference_clock = hv_reference_time(&reference);
+    if (reference_clock) reference_base = reference - timer_ticks * 10000;
     if (lapic_timer_start(1000, VEC_TIMER)) {
         if (tsc_hz >= 1000000) { /* a TSC that is known and plausible */
             tsc_per_ms = tsc_hz / 1000;

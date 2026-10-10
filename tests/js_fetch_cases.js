@@ -114,7 +114,12 @@ async function runFetchCases() {
     throws(()=>Response.redirect('http://['),'TypeError','redirect URL');
     throws(()=>Response.prototype.clone.call({}),'TypeError','response receiver');
     await rejects(Response.prototype.text.call({}),'TypeError','Body promise receiver');
-    throws(()=>new Response('bytes').body,'NotSupportedError','stream body explicitly unsupported');
+    const streamed=new Response('bytes'),bodyStream=streamed.body;
+    assert(bodyStream instanceof ReadableStream&&streamed.body===bodyStream,'real same-object response stream');
+    const bodyReader=bodyStream.getReader(),firstChunk=await bodyReader.read();
+    assert(!firstChunk.done&&firstChunk.value instanceof Uint8Array&&new TextDecoder().decode(firstChunk.value)==='bytes','response stream contains real bytes');
+    assert((await bodyReader.read()).done&&streamed.bodyUsed,'stream EOF and disturbance');bodyReader.releaseLock();
+    await rejects(streamed.text(),'TypeError','stream reader consumes the body');
     const unsupported=new Response('keep');assert((await new Response('keep').blob()).size===4,'Blob contains real body bytes');await rejects(unsupported.formData(),'NotSupportedError','FormData explicitly unsupported');
     assert(!unsupported.bodyUsed&&await unsupported.text()==='keep','unsupported reader does not falsely consume');
 
@@ -133,15 +138,27 @@ async function runFetchCases() {
     const a=new AbortController(),b=new AbortController(),any=AbortSignal.any([a.signal,b.signal]);b.abort(reason);a.abort('later');assert(any.aborted&&any.reason===reason,'any first reason');
     assert(AbortSignal.any([signal]).reason===reason&&!AbortSignal.any([]).aborted,'any preaborted and empty');
     throws(()=>AbortSignal.any([{}]),'TypeError','any brand');throws(()=>AbortSignal.any({length:0}),'TypeError','any iterable');
-    throws(()=>AbortSignal.timeout(-1),'TypeError','negative timeout');throws(()=>AbortSignal.timeout(Infinity),'TypeError','infinite timeout');throws(()=>AbortSignal.timeout(2147483648),'RangeError','unsupported timeout range');
+    throws(()=>AbortSignal.timeout(-1),'TypeError','negative timeout');throws(()=>AbortSignal.timeout(Infinity),'TypeError','infinite timeout');
+    const longTimeout=AbortSignal.timeout(2147483648);
+    assert(longTimeout instanceof AbortSignal&&!longTimeout.aborted&&longTimeout.reason===undefined,'long timeout survives native timer chunk boundary');
+    throws(()=>AbortSignal.timeout(18446744073709551616),'TypeError','unsigned 64-bit timeout boundary');
     const timed=AbortSignal.timeout(1);await new Promise(resolve=>timed.addEventListener('abort',resolve,{once:true}));assert(timed.reason.name==='TimeoutError','native timeout');
 
     await rejects(fetch(),'TypeError','fetch required input');
     let sync=false,bad;try{bad=fetch('api/json',{headers:{'bad name':'x'}});}catch(_){sync=true;}
     assert(!sync&&bad instanceof Promise,'validation failure is promise');await rejects(bad,'TypeError','validation rejection');
     await rejects(fetch('file:///data/secret'),'TypeError','network local scheme rejected');
-    for(const init of [{mode:'no-cors'},{redirect:'manual'},{integrity:'sha256-test'},{keepalive:true},{referrer:''},{referrerPolicy:'no-referrer'}])
+    for(const init of [{redirect:'manual'},{integrity:'sha256-test'},{referrerPolicy:'origin'}])
         await rejects(fetch('api/json',init),'NotSupportedError','unsupported transport options explicit');
+    // This focused host intentionally has no release_request callback. Product
+    // browser keepalive support must not be confused with this host boundary.
+    await rejects(fetch('api/json',{keepalive:true}),'TypeError','host without keepalive retirement rejects explicitly');
+    const noCorsResponse=await fetch('api/fetch-policy',{mode:'no-cors'}),noCorsPolicy=await noCorsResponse.json();
+    assert(noCorsResponse.type==='basic'&&noCorsResponse.status===200&&noCorsPolicy.no_cors&&!noCorsPolicy.no_referrer,'same-origin no-cors reaches native policy');
+    for(const init of [{referrer:''},{referrerPolicy:'no-referrer'}]) {
+        const policy=await (await fetch('api/fetch-policy',init)).json();
+        assert(policy.no_referrer&&!policy.no_cors,'no-referrer override reaches native policy');
+    }
     let aborted;try{await fetch('api/json',{signal});}catch(e){aborted=e;}assert(aborted===reason,'preaborted exact reason');
     let cacheAborted;try{await fetch('api/json',{cache:'only-if-cached',mode:'same-origin',signal});}catch(e){cacheAborted=e;}
     assert(cacheAborted===reason,'preaborted cache-only fetch retains exact reason');
@@ -176,7 +193,7 @@ async function runFetchCases() {
     assert(largeHeaders.headers.get('x-long')==='L'.repeat(6000),'complete large header survives native completion lifetime');
     assert(largeHeaders.headers.get('x-tail')==='complete'&&largeHeaders.headers.get('content-type')==='text/plain','late native headers not truncated');
     const largeClone=largeHeaders.clone();assert(largeClone.headers.get('x-long').length===6000&&await largeClone.text()==='complete headers','large native headers clone');
-    await rejects(fetch('api/oversized-headers'),'TypeError','oversized native header block explicitly rejected');
+    await rejects(fetch('api/header-allocation-failure'),'TypeError','native header allocation failure explicitly rejected');
     assert((await import('./long-headers.mjs')).completeHeaders===42,'synchronous module MIME beyond inline header boundary');
     const form=new Request('api/echo',{method:'POST',body:new URLSearchParams([['message','a b'],['unicode','語']])});
     assert(form.headers.get('content-type')==='application/x-www-form-urlencoded;charset=UTF-8','URLSearchParams MIME');

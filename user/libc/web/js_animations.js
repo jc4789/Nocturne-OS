@@ -7,7 +7,7 @@
     let frame=0,nextId=1;
     const animationId=()=>{if(nextId>0xffffffff)throw new RangeError('Native animation identity is not representable');return nextId++;};
     const finite=(v,name)=>{v=Number(v);if(!Number.isFinite(v))throw new TypeError('Invalid '+name);return v;};
-    const element=(v)=>{if(v!==null && (!rawDom('isNode',null,v)||rawDom('get',v,'nodeType')!==1))throw new TypeError('Expected Element');return v;};
+    const element=(v)=>{if(v!==null && (!rawDom.isNode(null,v)||rawDom.get(v,'nodeType')!==1))throw new TypeError('Expected Element');return v;};
     const effectState=(v)=>{const s=effects.get(v);if(!s)throw new TypeError('Illegal AnimationEffect receiver');return s;};
     const animationState=(v)=>{const s=animations.get(v);if(!s)throw new TypeError('Illegal Animation receiver');return s;};
     const names=new Set(['offset','easing','composite','computedOffset']);
@@ -119,7 +119,7 @@
         for(const f of e.frames)for(const key of Object.keys(f))if(!names.has(key)){let a=tracks.get(key);if(!a)tracks.set(key,a=[]);a.push({offset:f.offset,value:f[key],easing:f.easing});}
         const pairs=[];
         for(const [key,a] of tracks){
-            const base=()=>String(rawDom('animationComputed',e.target,e.pseudo,key)||'');
+            const base=()=>String(rawDom.animationComputed(e.target,e.pseudo,key)||'');
             if(a[0].offset!==0)a.unshift({offset:0,value:base(),easing:'linear'});
             if(a[a.length-1].offset!==1)a.push({offset:1,value:base(),easing:'linear'});
             let left=0;while(left<a.length-2&&p.value>=a[left+1].offset)left++;
@@ -131,13 +131,13 @@
     }
     function promiseRecord(){let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};}
     function localTime(s){return s.state==='idle'?null:s.state==='running'&&s.start!==null?(host.now()-s.start)*s.rate:s.hold;}
-    function clearSample(s){if(s.target)rawDom('animationStyle',s.target,s.pseudo,s.id,null);s.target=null;s.pseudo='';s.pairs=null;}
+    function clearSample(s){if(s.target)rawDom.animationStyle(s.target,s.pseudo,s.id,null);s.target=null;s.pseudo='';s.pairs=null;}
     function sample(a){
         const s=animationState(a),e=s.effect&&effectState(s.effect);
         if(s.target&&(!e||s.target!==e.target||s.pseudo!==e.pseudo))clearSample(s);
         if(!e||!e.target){clearSample(s);return;}
         const pairs=values(s.effect,localTime(s));
-        if(pairs){if(!s.pairs||pairs.length!==s.pairs.length||pairs.some((value,i)=>value!==s.pairs[i]))rawDom('animationStyle',e.target,e.pseudo,s.id,pairs);s.target=e.target;s.pseudo=e.pseudo;s.pairs=pairs;}
+        if(pairs){if(!s.pairs||pairs.length!==s.pairs.length||pairs.some((value,i)=>value!==s.pairs[i]))rawDom.animationStyle(e.target,e.pseudo,s.id,pairs);s.target=e.target;s.pseudo=e.pseudo;s.pairs=pairs;}
         else clearSample(s);
     }
     function enqueueEvent(a,type){const s=animationState(a),generation=s.generation,current=localTime(s);setTimeout(()=>{if(s.generation!==generation)return;const event=new AnimationPlaybackEvent(type,{currentTime:current,timelineTime:host.now()});a.dispatchEvent(event);},0);}
@@ -208,7 +208,7 @@
         commitStyles(){const s=animationState(this);if(!s.effect||s.state==='idle')throw new DOMException('No animation effect to commit','InvalidStateError');const e=effectState(s.effect);if(e.pseudo)throw new DOMException('Pseudo-element styles cannot be committed','NoModificationAllowedError');const pairs=values(s.effect,localTime(s));if(!e.target||!pairs)throw new DOMException('Animation is not in effect','InvalidStateError');for(let i=0;i<pairs.length;i+=2)e.target.style.setProperty(pairs[i],pairs[i+1]);}
     }
     for(const type of ['finish','cancel','remove'])Object.defineProperty(Animation.prototype,'on'+type,{configurable:true,enumerable:true,get(){return animationState(this).handlers.get(type)||null;},set(value){const s=animationState(this),old=s.handlers.get(type);if(old)this.removeEventListener(type,old);if(typeof value==='function'){s.handlers.set(type,value);this.addEventListener(type,value);}else s.handlers.delete(type);}});
-    function getAnimations(root,options={}){const subtree=!!Object(options).subtree;return Array.from(relevant).filter(a=>{const s=animationState(a),e=s.effect&&effectState(s.effect);if(!e||!e.target||s.state==='idle')return false;if(root instanceof Document)return e.target.ownerDocument===root;if(root===e.target)return true;if(!subtree)return false;for(let node=e.target;node;node=node.parentNode||rawDom('get',node,'shadowHost'))if(node===root)return true;return false;});}
+    function getAnimations(root,options={}){const subtree=!!Object(options).subtree;return Array.from(relevant).filter(a=>{const s=animationState(a),e=s.effect&&effectState(s.effect);if(!e||!e.target||s.state==='idle')return false;if(root instanceof Document)return e.target.ownerDocument===root;if(root===e.target)return true;if(!subtree)return false;for(let node=e.target;node;node=node.parentNode||rawDom.get(node,'shadowHost'))if(node===root)return true;return false;});}
     Object.defineProperties(Element.prototype,{animate:{configurable:true,writable:true,value:function(input,options={}){element(this);const effect=new KeyframeEffect(this,input,options),a=new Animation(effect);if(options&&typeof options==='object'&&options.id!==undefined)a.id=String(options.id);a.play();return a;}},getAnimations:{configurable:true,writable:true,value:function(options={}){element(this);return getAnimations(this,options);}}});
     Object.defineProperties(Document.prototype,{timeline:{configurable:true,get(){if(this!==document)throw new DOMException('Inactive document timeline','NotSupportedError');return timeline;}},getAnimations:{configurable:true,writable:true,value:function(){if(this!==document)throw new DOMException('Inactive document animations','NotSupportedError');return getAnimations(this);}}});
     Object.assign(globalThis,{Animation,AnimationEffect,KeyframeEffect,AnimationTimeline,DocumentTimeline,AnimationPlaybackEvent});

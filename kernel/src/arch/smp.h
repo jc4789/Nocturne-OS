@@ -12,13 +12,13 @@ struct regs;
 struct n_cpuinfo;
 typedef void (*cpu_job_fn)(size_t index, void *context);
 
-/* runner以外のAPは独立計算worker。共有kernel/driver/allocatorはBSP専用。
-   user runnerは別mailbox契約でring3のみ実行し、kernel処理前にBSPへ退避する。
+/* 全APはuser実行と独立計算jobを交替で処理。共有kernel/driver/allocatorはBSP専用。
+   user runnerはCPU別mailboxでring3のみ実行し、kernel処理前にBSPへ退避する。
    context と参照先は共有された高位 kernel mapping で、join まで有効であること。
    callback は非重複領域だけを更新し、割当・I/O・syscall・待機・schedule・再入は禁止。
    SSE2 は使用可能。AVX はN_CPU_AVX公開時だけ。BSPの全許可XSTATEを保存復元する。
    countに必要なAPだけを投入し、同期 join が終わるまで戻らない。
-   起動失敗/単CPU/nosmp は逐次実行する。専用user runnerは計算jobへ投入しない。
+   起動失敗/単CPU/nosmp は逐次実行する。job前にuser所有を全員retireする。
    投入後の AP 故障は context を早期解放せず panic する。 */
 void smp_init(struct limine_mp_response *response);
 void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context);
@@ -33,8 +33,11 @@ bool cpu_is_runner(void);
 unsigned cpu_runner_index(void);
 unsigned cpu_worker_count(void);
 bool cpu_runner_ready(void);
+bool cpu_runner_ready_at(unsigned index);
 void cpu_runner_started(void); /* AP固定idle stack初期化後のready publication */
 void cpu_runner_wake(void);
+void cpu_runner_wake_at(unsigned index);
+bool cpu_worker_poll(void); /* AP idle stack only: execute a published bounded job */
 void cpu_runner_check(void); /* BSP: failed APはcontextを保持してpanic */
 bool cpu_jobs_active(void);
 void cpu_require_bsp(void);

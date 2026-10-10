@@ -6,19 +6,18 @@ void wm_init(void);           /* start the compositor thread */
 bool wm_running(void);
 void wm_screen_size(uint32_t *w, uint32_t *h); /* the desktop's size, which a remote viewer may have changed */
 
-/* The clipboard: UTF-8 text. wm_clipboard() returns it (valid until the next change, so use it
-   before blocking) and a number that changes whenever the text does. */
+/* UTF-8 clipboard metadata or a caller-owned snapshot (release with kfree).
+   Never lend mutable storage across BSP timer preemption. */
 #define WM_CLIPBOARD_MAX (1 << 20)
 bool wm_clipboard_set(const char *text, size_t n);
-const char *wm_clipboard(size_t *len, uint32_t *seq);
+void wm_clipboard_info(size_t *len, uint32_t *seq);
+char *wm_clipboard_snapshot(size_t *len);
 void wm_process_exit(int pid);
 int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e);
 void wm_notify(const char *title, const char *text); /* desktop toast */
 
-/* Remote display (the RDP server). While attached, the screen is composited without the
-   pointer (the remote side draws its own) and every redrawn area is recorded. The frame is
-   only consistent while the compositor thread is not running, which in this kernel means:
-   read it from another kernel thread between blocking calls. */
+/* Remote display: rectangle copies hold WM ownership only for the copy, never
+   while encoding or sending a network packet. */
 struct wm_rect {
     int x, y, w, h;
 };
@@ -28,7 +27,7 @@ bool wm_remote_attach(int *w, int *h);
 void wm_remote_resize(int *w, int *h); /* the viewer's window changed size: same rules */
 void wm_remote_detach(void);
 int wm_remote_damage(struct wm_rect *out, int max); /* takes the areas redrawn since the last call */
-const uint32_t *wm_remote_frame(int *pitch);
+bool wm_remote_copy(uint32_t *dst, int pitch, int x, int y, int w, int h);
 int wm_cursor_shape(void);
 
 /* desktop.c */

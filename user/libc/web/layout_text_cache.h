@@ -15,7 +15,7 @@ struct layout_text_cache {
     size_t capacity, count;
 };
 
-static struct layout_text_cache *layout_text_active;
+#define layout_text_active (layout_current()->text_cache)
 
 static uint64_t layout_text_hash_bytes(uint64_t h, const void *p, size_t n) {
     const unsigned char *s = p;

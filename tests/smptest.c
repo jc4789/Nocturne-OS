@@ -1,4 +1,4 @@
-/* 独自spawn/pipeによる2 userの実進行。fork/thread/POSIX共有kernelは導入しない。 */
+/* 独自spawn/pipeによる2 processの同時進行とAP間XSTATE/stack保存。 */
 #include <nocturne.h>
 #include <stdio.h>
 #include <stdlib.h>

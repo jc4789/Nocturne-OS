@@ -73,7 +73,7 @@ const formValidationBridge=(() => {
             if(typeof init!=='object'&&typeof init!=='function')throw new TypeError('Event dictionary required');
             super(elementURL.string(type),init);
             const value=init.submitter,submitter=value==null?null:value;
-            if(submitter!==null&&(rawDom('get',submitter,'nodeType')!==1||rawDom('get',submitter,'namespaceURI')!=='http://www.w3.org/1999/xhtml'))throw new TypeError('submitter must be an HTMLElement');
+            if(submitter!==null&&(rawDom.get(submitter,'nodeType')!==1||rawDom.get(submitter,'namespaceURI')!=='http://www.w3.org/1999/xhtml'))throw new TypeError('submitter must be an HTMLElement');
             submitters.set(this,submitter);
         }
         get submitter(){if(!submitters.has(this))throw new TypeError('Illegal SubmitEvent receiver');return submitters.get(this);}
@@ -82,10 +82,11 @@ const formValidationBridge=(() => {
     method(HTMLFormElement.prototype,'requestSubmit',function(submitter){
         htmlElementBrand(this,'form');
         if(submitter!=null){
-            const tag=rawDom('get',submitter,'localName');
+            const tag=rawDom.get(submitter,'localName');
             if(!dom('validation',submitter,'submitButton'))throw new TypeError('submitter must be a submit button');
-            if(rawDom('get',submitter,'form:'+tag)!==this)throw new DOMException('submitter belongs to another form','NotFoundError');
+            if(rawDom.get(submitter,'form:'+tag)!==this)throw new DOMException('submitter belongs to another form','NotFoundError');
         }
+        if(host.sandboxFlags(this)&32)return;
         if(submitting.has(this))return;
         submitting.add(this);
         try{

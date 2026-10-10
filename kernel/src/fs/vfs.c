@@ -7,12 +7,17 @@
 struct vnode *vfs_root;
 
 void vnode_ref(struct vnode *v) {
+    uint64_t flags = irq_save();
     if (v) v->refs++;
+    irq_restore(flags);
 }
 
 void vnode_unref(struct vnode *v) {
     if (!v) return;
-    if (--v->refs <= 0 && v->unlinked) {
+    uint64_t flags = irq_save();
+    bool release = --v->refs <= 0 && v->unlinked;
+    irq_restore(flags);
+    if (release) {
         if (v->ops && v->ops->release) v->ops->release(v);
     }
 }
@@ -138,13 +143,40 @@ int vfs_open(const char *path, int flags, struct file **out) {
     return 0;
 }
 
+/* A regular-file operation may sleep in its device. Do not hold IRQs off
+   across that callback, but do serialize its shared offset reservation/update.
+   Pipe/window/audio directions must remain independent to avoid read/write
+   dependency deadlocks. Every caller holds a file reference while waiting. */
+static int file_io_begin(struct file *f) {
+    if (f->vn->type != VT_FILE) return 0;
+    uint64_t flags = irq_save();
+    while (f->io_busy) {
+        if (current_task->killed) { irq_restore(flags); return -EINTR; }
+        wq_wait(&f->io_wait);
+    }
+    if (current_task->killed) { irq_restore(flags); return -EINTR; }
+    f->io_busy = true;
+    irq_restore(flags);
+    return 0;
+}
+static void file_io_end(struct file *f) {
+    if (f->vn->type != VT_FILE) return;
+    uint64_t flags = irq_save();
+    f->io_busy = false;
+    wq_wake_all(&f->io_wait);
+    irq_restore(flags);
+}
+
 int64_t vfs_read(struct file *f, void *buf, size_t n) {
     struct vnode *v = f->vn;
     if ((f->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
     if (v->type == VT_DIR) return -EISDIR;
     if (!v->ops->read) return -EINVAL;
+    int error = file_io_begin(f);
+    if (error) return error;
     int64_t r = v->ops->read(v, f, buf, f->off, n);
     if (r > 0 && (v->type == VT_FILE)) f->off += r;
+    file_io_end(f);
     return r;
 }
 
@@ -152,27 +184,37 @@ int64_t vfs_write(struct file *f, const void *buf, size_t n) {
     struct vnode *v = f->vn;
     if ((f->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
     if (!v->ops->write) return -EINVAL;
+    int error = file_io_begin(f);
+    if (error) return error;
     if ((f->flags & O_APPEND) && v->type == VT_FILE) f->off = v->size;
     int64_t r = v->ops->write(v, f, buf, f->off, n);
     if (r > 0 && v->type == VT_FILE) {
         f->off += r;
         v->mtime = time_now();
     }
+    file_io_end(f);
     return r;
 }
 
 int64_t vfs_seek(struct file *f, int64_t off, int whence) {
     if (f->vn->type != VT_FILE) return -ESPIPE;
+    int error = file_io_begin(f);
+    if (error) return error;
     int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)f->off : (int64_t)f->vn->size;
     int64_t n = base + off;
-    if (n < 0) return -EINVAL;
-    f->off = n;
-    return n;
+    if (n >= 0) f->off = n;
+    file_io_end(f);
+    return n < 0 ? -EINVAL : n;
 }
 
 void vfs_close(struct file *f) {
     if (!f) return;
-    if (--f->refs > 0) return;
+    uint64_t flags = irq_save();
+    bool last = --f->refs == 0;
+    irq_restore(flags);
+    if (!last) return;
+    /* The last close callback can drain audio and sleep. Reference ownership,
+       not an IRQ-disabled driver invocation, keeps this detached file alive. */
     struct vnode *v = f->vn;
     if (v->ops && v->ops->close) v->ops->close(v, f);
     vnode_unref(v);
@@ -180,7 +222,9 @@ void vfs_close(struct file *f) {
 }
 
 struct file *vfs_dup(struct file *f) {
+    uint64_t flags = irq_save();
     f->refs++;
+    irq_restore(flags);
     return f;
 }
 

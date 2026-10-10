@@ -16,6 +16,9 @@ typedef struct image {
 
 /* sniffs the format from the data; NULL if it is not an image we can decode */
 image_t *image_decode(const void *data, size_t n);
+/* Decode on a native helper; service may handle chrome/cancellation only.
+ * The source remains borrowed until the synchronous join returns. */
+image_t *image_decode_serviced(const void *data, size_t n, void (*service)(void *), void *context);
 /* an SVG drawn at w x h (scaled to fit, centred), or at its own size if w or h is 0 */
 image_t *image_decode_svg(const char *svg, size_t n, int w, int h);
 bool image_is_svg(const void *data, size_t n);

@@ -31,7 +31,7 @@
     }
     function operation(sheet, op, idx = 0, text) {
         const state = owner(sheet);
-        return checked(rawDom('cssom', state.node, op, state.id, idx, text));
+        return checked(rawDom.cssom(state.node, op, state.id, idx, text));
     }
     function ruleInfo(rule) {
         const state = apply(get, ruleOwners, [rule]);
@@ -113,7 +113,7 @@
         constructor(key, node, id) {
             const constructed = key !== token;
             const options = constructed ? key ?? {} : null;
-            if (constructed) { node = constructorDocument; id = checked(rawDom('cssom', node, 'construct')); }
+            if (constructed) { node = constructorDocument; id = checked(rawDom.cssom(node, 'construct')); }
             super(token, node, id);
             if (constructed) {
                 const state = owner(this); state.constructed = true;
@@ -152,7 +152,7 @@
         return sheet;
     }
     function sheetFor(node) {
-        const id=checked(rawDom('cssom',node,'sheet'));if(!id)return null;
+        const id=checked(rawDom.cssom(node,'sheet'));if(!id)return null;
         let sheet = apply(get, sheets, [node]);
         if (!sheet || owner(sheet).id!==id) { sheet = new CSSStyleSheet(token, node, id); apply(set, sheets, [node, sheet]); }
         return sheet;
@@ -162,9 +162,9 @@
         if(!root)throw new TypeErr('StyleSheetList receiver required');return root;
     }
     function sheetAt(root,i) {
-        const node=checked(rawDom('cssom',root,'listItem',0,i));return node ? sheetFor(node) : null;
+        const node=checked(rawDom.cssom(root,'listItem',0,i));return node ? sheetFor(node) : null;
     }
-    function sheetCount(root) { return checked(rawDom('cssom',root,'listLength')); }
+    function sheetCount(root) { return checked(rawDom.cssom(root,'listLength')); }
     class StyleSheetList {
         constructor(key,root) {
             if(key!==token)throw new TypeErr('Illegal StyleSheetList constructor');
@@ -188,7 +188,7 @@
         define(C.prototype,'sheet',{configurable:true,enumerable:true,get(){htmlElementBrand(this,tag);return sheetFor(this);}});
     }
     function documentSheets() {
-        checked(rawDom('cssom',this,'listLength')); // native Document/ShadowRoot brand
+        checked(rawDom.cssom(this,'listLength')); // native Document/ShadowRoot brand
         let list=apply(get,documentLists,[this]);
         if(!list){list=new StyleSheetList(token,this);apply(set,documentLists,[this,list]);}return list;
     }
@@ -201,15 +201,15 @@
             if (!state.constructed) throw new Exception('Only constructed style sheets can be adopted', 'NotAllowedError');
             apply(push, pairs, [[state.node, state.id]]);
         }
-        checked(rawDom('cssom', root, 'adopt', pairs));
+        checked(rawDom.cssom(root, 'adopt', pairs));
     }
     function adoptedSheets() {
-        checked(rawDom('cssom', this, 'adopted')); // native brand and current document
+        checked(rawDom.cssom(this, 'adopted')); // native brand and current document
         let list = apply(get, adoptedLists, [this]);
         if (list) return list;
         const root = this, target = [];
         function sync() {
-            const pairs = checked(rawDom('cssom', root, 'adopted'));
+            const pairs = checked(rawDom.cssom(root, 'adopted'));
             target.length = 0;
             for (const pair of pairs) apply(push, target, [constructedFor(pair[0], pair[1])]);
         }
@@ -245,11 +245,11 @@
     }
     for (const C of [Document, ShadowRoot]) define(C.prototype, 'adoptedStyleSheets', {
         configurable: true, enumerable: true, get: adoptedSheets,
-        set(values) { checked(rawDom('cssom', this, 'adopted')); adopt(this, values); }
+        set(values) { checked(rawDom.cssom(this, 'adopted')); adopt(this, values); }
     });
     define(HTMLStyleElement.prototype, 'disabled', { configurable: true, enumerable: true,
-        get() { htmlElementBrand(this, 'style'); return rawDom('styleDisabled', this); },
-        set(value) { htmlElementBrand(this, 'style'); rawDom('styleDisabled', this, !!value); }
+        get() { htmlElementBrand(this, 'style'); return rawDom.styleDisabled(this); },
+        set(value) { htmlElementBrand(this, 'style'); rawDom.styleDisabled(this, !!value); }
     });
     for (const C of [StyleSheet, CSSStyleSheet, CSSRule, CSSStyleRule, CSSRuleList, StyleSheetList]) {
         define(C.prototype, Symbol.toStringTag, { value: C.name, configurable: true });

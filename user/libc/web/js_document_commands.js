@@ -11,13 +11,13 @@ const documentCommandBridge=(()=>{
     for(const [name,mode] of [['queryCommandSupported','supported'],['queryCommandEnabled','enabled'],
         ['queryCommandState','state'],['queryCommandIndeterm','indeterm'],['queryCommandValue','value']])
         define(Document.prototype,name,{configurable:true,writable:true,value:function(commandId){
-            return rawDom('documentCommand',this,mode,args(this,arguments.length,commandId));
+            return rawDom.documentCommand(this,mode,args(this,arguments.length,commandId));
         }});
     define(Document.prototype,'execCommand',{configurable:true,writable:true,value:function(commandId,showUI=false,value=''){
         const cmd=args(this,arguments.length,commandId);showUI=!!showUI;value=string(value);
-        const snapshot=rawDom('documentCommand',this,'prepare',cmd);
+        const snapshot=rawDom.documentCommand(this,'prepare',cmd);
         if(!snapshot)return false;
-        if(cmd==='selectall')return rawDom('documentCommand',this,'execute',cmd,snapshot,'',0,'');
+        if(cmd==='selectall')return rawDom.documentCommand(this,'execute',cmd,snapshot,'',0,'');
         let text=snapshot.multiline?apply(replace,value,[/\r\n?/g,'\n']):apply(replace,value,[/[\r\n]/g,'']);
         let next=apply(slice,snapshot.value,[0,snapshot.start])+text+apply(slice,snapshot.value,[snapshot.end]);
         let caret=snapshot.start+text.length;
@@ -26,7 +26,7 @@ const documentCommandBridge=(()=>{
             next=apply(replace,next,[/^[\t\n\f\r ]+|[\t\n\f\r ]+$/g,'']);
             caret=max(0,min(next.length,caret-leading));
         }
-        return rawDom('documentCommand',this,'execute',cmd,snapshot,next,caret,value);
+        return rawDom.documentCommand(this,'execute',cmd,snapshot,next,caret,value);
     }});
     return {event(target,type,data,inputType='insertText'){
         const event=new InputEventType(type,{bubbles:true,cancelable:type==='beforeinput',composed:true,view:realm,

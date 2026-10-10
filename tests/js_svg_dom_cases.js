@@ -70,7 +70,7 @@ function runSVGDOMCases() {
     illegal(()=>new SVG(),'constructor');illegal(()=>new Root(),'root constructor');illegal(()=>new Animated(),'animated constructor');
     const root=document.createElementNS(NS,'svg'), group=document.createElementNS(NS,'g'), rect=document.createElementNS(NS,'rect');
     equal(Object.getPrototypeOf(root),Root.prototype,'native root prototype');equal(root instanceof SVG,true);equal(root instanceof Element,true);equal(root instanceof HTMLElement,false);
-    equal(Object.getPrototypeOf(group),SVG.prototype,'native generic prototype');equal(group instanceof Root,false);equal(group.namespaceURI,NS);equal(group.localName,'g');equal(group.tagName,'g');
+    equal(Object.getPrototypeOf(group),SVGGraphicsElement.prototype,'native generic prototype');equal(group instanceof Root,false);equal(group.namespaceURI,NS);equal(group.localName,'g');equal(group.tagName,'g');
     equal(root.ownerSVGElement,null);equal(root.viewportElement,null);equal(group.ownerSVGElement,null);
     root.appendChild(group);group.appendChild(rect);equal(group.ownerSVGElement,root);equal(rect.ownerSVGElement,root);equal(rect.viewportElement,root);
     const nested=document.createElementNS(NS,'svg');group.appendChild(nested);nested.appendChild(rect);

@@ -5,15 +5,15 @@ const formNameBridge=(()=>{
     const filter=Array.prototype.filter, mapGet=Map.prototype.get, mapSet=Map.prototype.set, mapDelete=Map.prototype.delete;
     const weakGet=WeakMap.prototype.get, weakSet=WeakMap.prototype.set, string=String;
     function read(form,images=false){
-        let root=form,parent;while((parent=rawDom('get',root,'parentNode')))root=parent;
-        return rawDom('formControls',root,form,images);
+        let root=form,parent;while((parent=rawDom.get(root,'parentNode')))root=parent;
+        return rawDom.formControls(root,form,images);
     }
     function matches(read,name){return apply(filter,read(),[n=>reflectedAttr(n,'id')===name || reflectedAttr(n,'name')===name]);}
-    function radio(n){return rawDom('get',n,'localName')==='input' && rawDom('get',n,'namespaceURI')===HTML && (reflectedAttr(n,'type')||'').toLowerCase()==='radio';}
+    function radio(n){return rawDom.get(n,'localName')==='input' && rawDom.get(n,'namespaceURI')===HTML && (reflectedAttr(n,'type')||'').toLowerCase()==='radio';}
     class RadioNodeList extends NodeList {
         constructor(){throw new TypeError('Illegal RadioNodeList constructor');}
         get value(){const source=apply(weakGet,groups,[this]);if(!source)throw new TypeError('Illegal RadioNodeList receiver');
-            for(const n of source())if(radio(n) && rawDom('get',n,'checked'))return reflectedAttr(n,'value')??'on';return '';
+            for(const n of source())if(radio(n) && rawDom.get(n,'checked'))return reflectedAttr(n,'value')??'on';return '';
         }
         set value(value){const source=apply(weakGet,groups,[this]);if(!source)throw new TypeError('Illegal RadioNodeList receiver');
             if(typeof value==='symbol')throw new TypeError('Cannot convert Symbol to DOMString');value=string(value);
@@ -34,7 +34,7 @@ const formNameBridge=(()=>{
     }
     function collection(source){const list=collectionBridge.form(source,HTMLFormControlsCollection.prototype,name=>named(source,name));apply(weakSet,sources,[list,source]);return list;}
     function pastNames(form){let names=apply(weakGet,past,[form]);if(!names){names=new Map();apply(weakSet,past,[form,names]);}
-        for(const [name,node] of names)if(rawDom('get',node,'form')!==form)apply(mapDelete,names,[name]);return names;
+        for(const [name,node] of names)if(rawDom.get(node,'form')!==form)apply(mapDelete,names,[name]);return names;
     }
     function property(form,key){
         const nodes=read(form);

@@ -37,6 +37,7 @@ static JSValue broadcast_deliver(JSContext *ctx, JSValueConst this_val, int argc
 }
 static JSValue native_broadcast(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); int32_t op;
+    if(sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Sandbox denied borrowed broadcast authority");
     if (argc < 2 || JS_ToInt32(ctx, &op, argv[0])) return JS_EXCEPTION;
     if (op == 0) {
         if (argc < 3 || !JS_IsFunction(ctx, argv[2])) return JS_ThrowTypeError(ctx, "Expected channel callback");

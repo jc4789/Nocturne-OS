@@ -6,12 +6,12 @@
     const walkers=new WeakMap(), iteratorData=new WeakMap(), iterators=new Set();
     const WeakRefImpl=WeakRef, deref=WeakRef.prototype.deref;
     const ACCEPT=1, REJECT=2, SKIP=3, SHOW_ALL=0xffffffff;
-    const get=(node,key)=>rawDom('get',node,key);
+    const get=(node,key)=>rawDom.get(node,key);
     const parent=node=>get(node,'parentNode');
     const first=node=>get(node,'firstChild'), last=node=>get(node,'lastChild');
     const next=node=>get(node,'nextSibling'), previous=node=>get(node,'previousSibling');
     function node(value){
-        if(!rawDom('isNode',null,value))throw new TypeError('Expected a native Node');
+        if(!rawDom.isNode(null,value))throw new TypeError('Expected a native Node');
         return value;
     }
     function data(map,value,name){
@@ -208,7 +208,7 @@
             return nodes;
         }
         if(op==='insert' && key && key!==value){
-            if(!rawDom('isNode',null,key))return [];
+            if(!rawDom.isNode(null,key))return [];
             return get(key,'nodeType')===11?Array.from(get(key,'childNodes')):parent(key)?[key]:[];
         }
         if(op==='set' && (key==='innerHTML' || key==='textContent')){

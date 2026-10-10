@@ -4,6 +4,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <nocturne.h>
+/* Font-family lazy loading and glyph caches belong to the process, not a
+ * layout worker. Internal recursion stays inside one lock acquisition. */
+#define font_open font_open_unlocked
+#define font_open_memory font_open_memory_unlocked
+#define font_close font_close_unlocked
+#define font_ui font_ui_unlocked
+#define font_family font_family_unlocked
+#define font_metrics font_metrics_unlocked
+#define font_has font_has_unlocked
+#define font_advance font_advance_unlocked
+#define font_width font_width_unlocked
+#define font_metrics_generation font_metrics_generation_unlocked
+#define font_draw font_draw_unlocked
+#define font_cell_width font_cell_width_unlocked
+#define font_cell_draw font_cell_draw_unlocked
+#define font_probe_begin font_probe_begin_unlocked
+#define font_probe_end font_probe_end_unlocked
 #include "font.h"
 #include "stb_truetype.h"
 #include "font_sfnt.h"
@@ -544,3 +562,46 @@ int font_cell_draw(canvas_t *c, int x, int y, uint32_t cp, uint32_t fg, uint32_t
     font_draw(c, f, px, x + (w - advance) * 0.5f, y + 12 * scale, text, (size_t)n, fg);
     return w;
 }
+
+#undef font_open
+#undef font_open_memory
+#undef font_close
+#undef font_ui
+#undef font_family
+#undef font_metrics
+#undef font_has
+#undef font_advance
+#undef font_width
+#undef font_metrics_generation
+#undef font_draw
+#undef font_cell_width
+#undef font_cell_draw
+#undef font_probe_begin
+#undef font_probe_end
+
+static volatile uint32_t font_lock;
+static void font_acquire(void) {
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n(&font_lock, &expected, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    while (__atomic_exchange_n(&font_lock, 2, __ATOMIC_ACQUIRE))
+        wait_on_address(&font_lock, 2, 100);
+}
+static void font_release(void) {
+    if (__atomic_exchange_n(&font_lock, 0, __ATOMIC_RELEASE) == 2)
+        wake_address(&font_lock, 1);
+}
+font_t * font_open(const char *path) { font_acquire(); font_t * result = font_open_unlocked(path); font_release(); return result; }
+font_t * font_open_memory(const void *data, size_t length) { font_acquire(); font_t * result = font_open_memory_unlocked(data, length); font_release(); return result; }
+void font_close(font_t *f) { font_acquire(); font_close_unlocked(f); font_release(); }
+font_t * font_ui(int style) { font_acquire(); font_t * result = font_ui_unlocked(style); font_release(); return result; }
+font_t * font_family(int family, int style) { font_acquire(); font_t * result = font_family_unlocked(family, style); font_release(); return result; }
+void font_metrics(font_t *f, float px, float *ascent, float *descent, float *gap) { font_acquire(); font_metrics_unlocked(f, px, ascent, descent, gap); font_release(); }
+bool font_has(font_t *f, uint32_t cp) { font_acquire(); bool result = font_has_unlocked(f, cp); font_release(); return result; }
+float font_advance(font_t *f, float px, uint32_t cp) { font_acquire(); float result = font_advance_unlocked(f, px, cp); font_release(); return result; }
+float font_width(font_t *f, float px, const char *s, size_t n) { font_acquire(); float result = font_width_unlocked(f, px, s, n); font_release(); return result; }
+uint64_t font_metrics_generation(void) { font_acquire(); uint64_t result = font_metrics_generation_unlocked(); font_release(); return result; }
+float font_draw(canvas_t *c, font_t *f, float px, float x, int y, const char *s, size_t n, uint32_t color) { font_acquire(); float result = font_draw_unlocked(c, f, px, x, y, s, n, color); font_release(); return result; }
+int font_cell_width(uint32_t cp, int size) { font_acquire(); int result = font_cell_width_unlocked(cp, size); font_release(); return result; }
+int font_cell_draw(canvas_t *c, int x, int y, uint32_t cp, uint32_t fg, uint32_t bg, int size) { font_acquire(); int result = font_cell_draw_unlocked(c, x, y, cp, fg, bg, size); font_release(); return result; }
+void font_probe_begin(void) { font_acquire(); font_probe_begin_unlocked(); font_release(); }
+bool font_probe_end(void) { font_acquire(); bool result = font_probe_end_unlocked(); font_release(); return result; }

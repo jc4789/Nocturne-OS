@@ -7,7 +7,28 @@
 #include <time.h>
 #include "nocturne.h"
 
+/* Keep the old data symbol for legacy dynamically compiled callers; rebuilt
+   code uses the FS-based TCB and does not share another thread's errno. */
+#undef errno
 int errno;
+struct libc_thread {
+    struct libc_thread *self;
+    int tid, error;
+    void *slots[8];
+};
+static struct libc_thread main_thread;
+static unsigned tls_initialized;
+static struct libc_thread *libc_thread_current(void) {
+    struct libc_thread *t;
+    if (!tls_initialized) return NULL;
+    __asm__ volatile("movq %%fs:0, %0" : "=r"(t));
+    return t;
+}
+int *__errno_location(void) {
+    struct libc_thread *t = libc_thread_current();
+    return t ? &t->error : &errno;
+}
+#define errno (*__errno_location())
 
 long __syscall(long n, long a, long b, long c, long d, long e) {
     long r;
@@ -108,7 +129,90 @@ unsigned sleep(unsigned s) {
     msleep(s * 1000);
     return 0;
 }
-uint64_t uptime_ms(void) { return (uint64_t)SC0(SYS_UPTIME); }
+static struct n_clockinfo user_clock;
+static unsigned clock_initialized;
+static uint64_t clock_last;
+static uint64_t user_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("lfence; rdtsc" : "=a"(lo), "=d"(hi) : : "memory");
+    return (uint64_t)hi << 32 | lo;
+}
+int clock_info(struct n_clockinfo *info) { return (int)ret(SC1(SYS_CLOCK_INFO, info)); }
+static uint64_t clock_publish(uint64_t ms) {
+    uint64_t previous = __atomic_load_n(&clock_last, __ATOMIC_RELAXED);
+    while (ms > previous && !__atomic_compare_exchange_n(&clock_last, &previous, ms, false,
+                                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    return ms < previous ? previous : ms;
+}
+uint64_t uptime_ms(void) {
+    if (__atomic_load_n(&clock_initialized, __ATOMIC_ACQUIRE) != 2) {
+        unsigned expected = 0;
+        if (__atomic_compare_exchange_n(&clock_initialized, &expected, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            if (clock_info(&user_clock) < 0) memset(&user_clock, 0, sizeof user_clock);
+            __atomic_store_n(&clock_initialized, 2, __ATOMIC_RELEASE);
+        } else return clock_publish((uint64_t)SC0(SYS_UPTIME));
+    }
+    if ((user_clock.flags & N_CLOCK_HV_REFERENCE) && user_clock.reference_page) {
+        const struct n_reference_tsc *p = (const struct n_reference_tsc *)(uintptr_t)user_clock.reference_page;
+        for (unsigned attempt = 0; attempt < 4; attempt++) {
+            uint32_t sequence = __atomic_load_n(&p->sequence, __ATOMIC_ACQUIRE);
+            if (!sequence) break;
+            uint64_t tsc = user_rdtsc();
+            uint64_t scale = p->scale;
+            int64_t offset = p->offset;
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
+            if (sequence != __atomic_load_n(&p->sequence, __ATOMIC_ACQUIRE)) continue;
+            uint64_t reference = (uint64_t)(((__uint128_t)tsc * scale) >> 64) + offset;
+            if (reference < user_clock.reference_sample_100ns) break;
+            return clock_publish(user_clock.uptime_ms + (reference - user_clock.reference_sample_100ns) / 10000);
+        }
+        return clock_publish((uint64_t)SC0(SYS_UPTIME));
+    }
+    if (!(user_clock.flags & N_CLOCK_USER_TSC) || user_clock.tsc_hz < 1000000)
+        return clock_publish((uint64_t)SC0(SYS_UPTIME));
+    uint64_t now = user_rdtsc();
+    if (now < user_clock.tsc_sample) return clock_publish((uint64_t)SC0(SYS_UPTIME));
+    uint64_t ms = user_clock.uptime_ms + (now - user_clock.tsc_sample) / (user_clock.tsc_hz / 1000);
+    return clock_publish(ms);
+}
+
+static void libc_thread_init(struct libc_thread *t) {
+    memset(t, 0, sizeof *t);
+    t->self = t;
+    t->tid = (int)SC0(SYS_THREAD_ID);
+    SC2(SYS_THREAD_TLS, t, sizeof *t);
+}
+static _Noreturn void libc_thread_entry(void (*fn)(void *), void *arg) {
+    struct libc_thread local;
+    libc_thread_init(&local);
+    fn(arg);
+    thread_exit();
+}
+int thread_create(void (*fn)(void *), void *arg) {
+    if (!fn) { errno = EINVAL; return -1; }
+    return (int)ret(SC3(SYS_THREAD_CREATE, fn, arg, libc_thread_entry));
+}
+int thread_join(int tid) { return (int)ret(SC1(SYS_THREAD_JOIN, tid)); }
+_Noreturn void thread_exit(void) { SC0(SYS_THREAD_EXIT); for (;;) {} }
+int thread_id(void) {
+    struct libc_thread *t = libc_thread_current();
+    return t ? t->tid : (int)SC0(SYS_THREAD_ID);
+}
+unsigned cpu_index(void) { return (unsigned)SC0(SYS_CPU_INDEX); }
+void *thread_local_get(unsigned slot) {
+    struct libc_thread *t = libc_thread_current();
+    return t && slot < 8 ? t->slots[slot] : NULL;
+}
+void thread_local_set(unsigned slot, void *value) {
+    struct libc_thread *t = libc_thread_current();
+    if (t && slot < 8) t->slots[slot] = value;
+}
+int wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms) {
+    return (int)ret(SC3(SYS_WAIT_ADDRESS, address, expected, timeout_ms));
+}
+int wake_address(volatile uint32_t *address, unsigned count) {
+    return (int)ret(SC2(SYS_WAKE_ADDRESS, address, count));
+}
 time_t time(time_t *t) {
     time_t v = SC0(SYS_TIME);
     if (t) *t = v;
@@ -332,8 +436,13 @@ _Noreturn void abort(void) {
     exit(134);
 }
 
-void __libc_start(int argc, char **argv) {
+void __libc_init(void) {
+    libc_thread_init(&main_thread);
+    tls_initialized = 1;
     __stdio_init();
+}
+void __libc_start(int argc, char **argv) {
+    __libc_init();
     exit(main(argc, argv));
 }
 

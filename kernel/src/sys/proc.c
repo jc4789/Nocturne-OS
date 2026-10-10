@@ -147,6 +147,6 @@ int proc_spawn_simple(const char *path, const char *arg1, struct task *parent) {
 }
 
 uint64_t proc_user_pages(struct task *t) {
-    if (!t->is_user || t->pml4 == kernel_pml4) return 0;
+    if (!t->is_user || t->is_thread || t->pml4 == kernel_pml4) return 0;
     return vmm_user_pages(t->pml4);
 }

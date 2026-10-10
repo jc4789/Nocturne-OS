@@ -9,15 +9,43 @@
 #include <math.h>
 #include <limits.h>
 #include <nocturne.h>
+#include <parallel.h>
 #include "webi.h"
 #include "web_dialog.h"
 #include "js_canvas.h"
 #include "avmedia.h"
 #include "svg_geometry.h"
 
-static web_doc *D;
-static float VW, VH;
-static uint32_t GEN;
+struct layout_text_cache;
+struct layout_context {
+    web_doc *document;
+    float viewport_w, viewport_h;
+    uint32_t generation;
+    struct layout_text_cache *text_cache;
+    bool pure;
+    unsigned clamp_depth; /* copied by value into independent layout helpers */
+    arena_t scratch; /* helper-owned allocation trap, never the caller stack */
+};
+static struct layout_context default_layout;
+static struct layout_context *layout_current(void) {
+    struct layout_context *c = thread_local_get(1);
+    return c ? c : &default_layout;
+}
+#define D (layout_current()->document)
+#define VW (layout_current()->viewport_w)
+#define VH (layout_current()->viewport_h)
+#define GEN (layout_current()->generation)
+static arena_t *layout_scratch(void) {
+    struct layout_context *c = layout_current();
+    return c->pure ? &c->scratch : &D->lmem;
+}
+static bool layout_checkpoint(void) {
+    return layout_current()->pure && parallel_worker_index() ?
+        !__atomic_load_n(&D->native_cancelled, __ATOMIC_ACQUIRE) : web_native_checkpoint(D);
+}
+static void layout_media_checkpoint(void) {
+    if (!layout_current()->pure) web_avmedia_checkpoint();
+}
 
 #define INF 1e30f
 
@@ -188,11 +216,18 @@ static bool is_flex_item(const box_t *b) {
     return b->parent && (b->parent->kind == B_FLEX || b->parent->kind == B_GRID) && !b->abspos;
 }
 
+static bool size_container(const box_t *b) {
+    return !b->anon && b->st->container_type!=CT_NORMAL &&
+        b->st->display!=D_INLINE && b->st->display!=D_INLINE_TABLE &&
+        (b->kind==B_BLOCK || b->kind==B_FLEX || b->kind==B_GRID || b->kind==B_ATOMIC);
+}
+
 static bool is_bfc_root(const box_t *b) {
     return !b->parent || b->floated || b->abspos || b->kind == B_ATOMIC || b->kind == B_CELL ||
            b->kind == B_CAPTION || b->kind == B_TABLE || b->kind == B_FLEX || b->kind == B_GRID ||
            (b->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(D,b)) ||
-           b->st->display == D_FLOW_ROOT || is_flex_item(b) || b->is_bfc;
+           b->st->display == D_FLOW_ROOT || (!b->anon && b->st->legacy_box) ||
+           size_container(b) || is_flex_item(b) || b->is_bfc;
 }
 
 float box_abs_x(const box_t *b) {
@@ -231,15 +266,28 @@ void box_scroll_clamp(box_t *b) {
 
 float box_visual_x(const box_t *b) {
     double x = box_abs_x(b);
-    for (const box_t *c = b ? b->cb : NULL; c; c = c->cb)
-        if (c->node && c->node->scroll_x != 0 && box_element_scrollable(c)) x -= c->node->scroll_x;
+    for (const box_t *c = b; c; c = c->cb) {
+        if (c != b && c->node && c->node->scroll_x != 0 && box_element_scrollable(c)) x -= c->node->scroll_x;
+        if (c->st && c->st->position == POS_FIXED) {
+            /* Visual coordinates are document coordinates. Layout keeps the
+               fixed containing block in viewport coordinates, so publish the
+               real viewport offset once, also for every fixed descendant. */
+            if (c->node && c->node->owner) x += c->node->owner->view_x;
+            break;
+        }
+    }
     return (float)x;
 }
 
 float box_visual_y(const box_t *b) {
     double y = box_abs_y(b);
-    for (const box_t *c = b ? b->cb : NULL; c; c = c->cb)
-        if (c->node && c->node->scroll_y != 0 && box_element_scrollable(c)) y -= c->node->scroll_y;
+    for (const box_t *c = b; c; c = c->cb) {
+        if (c != b && c->node && c->node->scroll_y != 0 && box_element_scrollable(c)) y -= c->node->scroll_y;
+        if (c->st && c->st->position == POS_FIXED) {
+            if (c->node && c->node->owner) y += c->node->owner->view_y;
+            break;
+        }
+    }
     return (float)y;
 }
 
@@ -394,14 +442,25 @@ static void replaced_natural(box_t *c, float *iw, float *ih, float *ratio) {
 static void size_replaced(box_t *c, float cbw, float cbh) {
     float iw, ih, ratio;
     replaced_natural(c, &iw, &ih, &ratio);
-    float w = spec_w(c, &c->st->width, cbw), h = spec_h(c, &c->st->height, cbh);
-    if (c->atomic == AT_SVG) {
-        /* Outermost inline SVG auto acts as 100% where the containing axis is
-           definite. Intrinsic passes use -1; do not invent a percentage base. */
-        if (len_auto(&c->st->width) && cbw >= 0) w = cbw;
-        if (len_auto(&c->st->height) && cbh >= 0) h = cbh;
+    if(size_container(c)) {
+        iw=0;ratio=0;
+        if(c->st->container_type==CT_SIZE)ih=0;
     }
+    float w = spec_w(c, &c->st->width, cbw), h = spec_h(c, &c->st->height, cbh);
     bool derive_w = w < 0, derive_h = h < 0;
+    if (c->atomic == AT_SVG && !size_container(c)) {
+        /* CSS embedding uses the SVG intrinsic ratio before viewport auto
+           fallback. A definite CSS width with auto height (or the converse)
+           must not acquire the containing block's unrelated other dimension.
+           Preserve the existing outermost-auto width negotiation only when
+           neither CSS axis supplies a size; intrinsic passes have no base. */
+        if (ratio > 0) {
+            if (w < 0 && h < 0 && len_auto(&c->st->width) && cbw >= 0) w = cbw;
+        } else {
+            if (len_auto(&c->st->width) && cbw >= 0) w = cbw;
+            if (len_auto(&c->st->height) && cbh >= 0) h = cbh;
+        }
+    }
     if (w < 0 && h < 0) w = iw, h = ih;
     else if (w < 0) w = ratio > 0 ? h * ratio : iw;
     else if (h < 0) h = ratio > 0 ? w / ratio : ih;
@@ -414,6 +473,17 @@ static void size_replaced(box_t *c, float cbw, float cbh) {
     if (mxh >= 0 && h > mxh) {
         if (ratio > 0 && derive_w) w = mxh * ratio;
         h = mxh;
+    }
+    if (c->atomic == AT_SVG && ratio > 0 && !size_container(c)) {
+        /* Transfer min constraints too when the opposite axis is automatic.
+           The final independent clamps retain both author limits when those
+           limits cannot be satisfied at the same aspect ratio. */
+        float cw = clamp_w(c, w, cbw);
+        if (derive_h && cw != w) h = cw / ratio;
+        w = cw;
+        float ch = clamp_h(c, h, cbh);
+        if (derive_w && ch != h) w = ch * ratio;
+        h = ch;
     }
     w = clamp_w(c, w, cbw);
     h = clamp_h(c, h, cbh);
@@ -472,6 +542,7 @@ static void size_control(box_t *c, float cbw, float cbh) {
         break;
     }
     }
+    if(size_container(c)){w=0;if(st->container_type==CT_SIZE)h=0;}
     float sw = spec_w(c, &st->width, cbw), sh = spec_h(c, &st->height, cbh);
     if (sw >= 0) w = sw;
     if (sh >= 0) h = sh;
@@ -649,8 +720,8 @@ static void text_items(box_t *t, struct ibuild *s) {
 
 static void build_items(box_t *parent, struct ibuild *s) {
     for (box_t *c = parent->first; c; c = c->next) {
-        if (!web_native_checkpoint(D)) break;
-        web_avmedia_checkpoint();
+        if (!layout_checkpoint()) break;
+        layout_media_checkpoint();
         if (c->abspos) {
             ipush(s->v, IT_ABS)->box = c;
             continue;
@@ -732,7 +803,7 @@ struct iline {
     struct bfc *f;
     float ox, oy;
     struct ivec *items;
-    sbuf runs, decos;
+    sbuf runs, decos, lines;
     struct open_box *open;
     int nopen;
     float y;           /* top of the current line */
@@ -810,6 +881,8 @@ static void item_vext(const struct item *it, float *above, float *below) {
 static void finish_line(struct iline *L, int ls, int le, bool forced) {
     struct item *v = L->items->v;
     box_t *b = L->blk;
+    int first_run = (int)(L->runs.n / sizeof(struct run));
+    int first_deco = (int)(L->decos.n / sizeof(struct deco));
     /* drop collapsible spaces at the start and end of the line */
     while (ls < le && v[ls].kind == IT_TEXT && v[ls].n > 0 && v[ls].space_end && v[ls].w == v[ls].sw &&
            (v[ls].st->white_space == WS_NORMAL || v[ls].st->white_space == WS_NOWRAP || v[ls].st->white_space == WS_PRE_LINE))
@@ -958,6 +1031,12 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
         if (L->first_bl < 0) L->first_bl = baseline;
         L->last_bl = baseline;
         L->first_line = false;
+        if (layout_current()->clamp_depth) {
+            struct line_fragment line = {first_run, (int)(L->runs.n / sizeof(struct run)),
+                first_deco, (int)(L->decos.n / sizeof(struct deco)),
+                L->y, L->y + lh, baseline, L->left, L->right};
+            sb_put(&L->lines, (const char *)&line, sizeof line);
+        }
     }
     L->y += lh;
     /* floats that did not fit on the line just finished */
@@ -1021,6 +1100,12 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
     /* widths of inline box edges and atomic inlines */
     for (int i = 0; i < iv.n; i++) {
         struct item *it = &iv.v[i];
+        /* Cached boxes survive a reflow; their first-line anchor does not.
+         * Clear only anchors owned by this formatting context, leaving reused
+         * sibling contexts and split-inline first fragments untouched. */
+        if(it->kind==IT_OPEN && it->box->node && it->box->node->anchor_block==b) {
+            it->box->node->anchor_block=NULL;it->box->node->anchor_dy=0;
+        }
         if (it->kind == IT_OPEN) it->w = inline_edge(it->box, true, b->w);
         else if (it->kind == IT_CLOSE) it->w = inline_edge(it->box, false, b->w);
         else if (it->kind == IT_ATOMIC) {
@@ -1040,9 +1125,9 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
         if(iv.v[i].kind==IT_OPEN)opens++;
         else if(iv.v[i].kind==IT_FLOAT)floats++;
     }
-    if(opens>SIZE_MAX/sizeof *L.open || floats>SIZE_MAX/sizeof *L.pending_floats)ar_alloc(&D->lmem,SIZE_MAX);
-    if(opens)L.open=ar_alloc(&D->lmem,opens*sizeof *L.open);
-    if(floats)L.pending_floats=ar_alloc(&D->lmem,floats*sizeof *L.pending_floats);
+    if(opens>SIZE_MAX/sizeof *L.open || floats>SIZE_MAX/sizeof *L.pending_floats)ar_alloc(layout_scratch(),SIZE_MAX);
+    if(opens)L.open=ar_alloc(&b->layout_mem,opens*sizeof *L.open);
+    if(floats)L.pending_floats=ar_alloc(&b->layout_mem,floats*sizeof *L.pending_floats);
     L.blk = b;
     L.f = f;
     L.ox = ox;
@@ -1125,17 +1210,24 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
     b->nruns = (int)(L.runs.n / sizeof(struct run));
     b->runs = NULL;
     if (b->nruns) {
-        b->runs = ar_alloc(&D->lmem, L.runs.n);
+        b->runs = ar_alloc(&b->layout_mem, L.runs.n);
         memcpy(b->runs, L.runs.p, L.runs.n);
     }
     b->ndecos = (int)(L.decos.n / sizeof(struct deco));
     b->decos = NULL;
     if (b->ndecos) {
-        b->decos = ar_alloc(&D->lmem, L.decos.n);
+        b->decos = ar_alloc(&b->layout_mem, L.decos.n);
         memcpy(b->decos, L.decos.p, L.decos.n);
+    }
+    b->nlines = (int)(L.lines.n / sizeof(struct line_fragment));
+    b->lines = NULL;
+    if (b->nlines) {
+        b->lines = ar_alloc(&b->layout_mem, L.lines.n);
+        memcpy(b->lines, L.lines.p, L.lines.n);
     }
     sb_free(&L.runs);
     sb_free(&L.decos);
+    sb_free(&L.lines);
     free(iv.v);
     b->baseline = L.first_bl;
     b->last_baseline = L.last_bl;
@@ -1252,7 +1344,7 @@ static void layout_blocks(box_t *b, struct bfc *f, float ox, float oy, float cbh
     float first_bl = -1, last_bl = -1;
     for (box_t *c = b->first; c; c = c->next) {
         c->cb = b;
-        if (!web_native_checkpoint(D)) break;
+        if (!layout_checkpoint()) break;
         if (c->abspos) {
             c->static_cb = b;
             c->static_x = 0;
@@ -1674,6 +1766,55 @@ static void layout_table(box_t *t, float cbh) {
     grid_free(&g);
 }
 
+/* Once flex/grid widths are resolved, ordinary sibling formatting contexts
+ * own disjoint boxes, line arrays and node anchors. Ancestor placement and
+ * cross-axis reductions wait for every worker. Floats, absolute descendants,
+ * tables, media and nested flex/grid retain the ordered dependency path. */
+static bool child_layout_safe(box_t *b) {
+    if ((b->kind==B_INLINE && b->node && b->node->box!=b) ||
+        b->abspos || b->floated || (b->kind != B_BLOCK && b->kind != B_INLINE &&
+        b->kind != B_TEXT && b->kind != B_BR) ||
+        (b->node && b->node->tag == T_frameset)) return false;
+    for (box_t *c=b->first;c;c=c->next) if (!child_layout_safe(c)) return false;
+    return true;
+}
+static void child_layout_traps_clear(box_t *b) {
+    b->layout_mem.trap=NULL;
+    for(box_t *c=b->first;c;c=c->next) child_layout_traps_clear(c);
+}
+struct child_layout_job {
+    box_t **boxes;
+    float cbh;
+    struct layout_context context;
+    volatile uint32_t failed;
+};
+static void child_layout_run(size_t i,void *context) {
+    struct child_layout_job *j=context;
+    struct layout_context *local=calloc(1,sizeof *local);
+    if(!local){__atomic_store_n(&j->failed,3,__ATOMIC_RELEASE);return;}
+    *local=j->context;local->pure=true;local->text_cache=NULL;
+    memset(&local->scratch,0,sizeof local->scratch);
+    jmp_buf trap;local->scratch.trap=&trap;
+    void *previous=thread_local_get(1);thread_local_set(1,local);
+    int failed=setjmp(trap);
+    if(!failed) layout_inner(j->boxes[i],NULL,0,0,j->cbh);
+    else __atomic_store_n(&j->failed,(uint32_t)failed,__ATOMIC_RELEASE);
+    child_layout_traps_clear(j->boxes[i]);
+    ar_free(&local->scratch);thread_local_set(1,previous);free(local);
+}
+static void child_layout_service(void *context) { web_native_checkpoint(context); }
+static bool layout_children_parallel(box_t **boxes,int n,float cbh) {
+    if(n<8 || layout_current()->pure)return false;
+    for(int i=0;i<n;i++)if(!child_layout_safe(boxes[i]))return false;
+    struct child_layout_job j={.boxes=boxes,.cbh=cbh,.context=*layout_current()};
+    parallel_for_stage(PARALLEL_LAYOUT,(size_t)n,child_layout_run,&j,child_layout_service,D);
+    /* Allocation failure may only unwind the supervisor after all helpers
+     * stopped borrowing its DOM; never longjmp across thread stacks. */
+    uint32_t failed=__atomic_load_n(&j.failed,__ATOMIC_ACQUIRE);
+    if(failed){arena_t *a=layout_scratch();if(a->trap)longjmp(*a->trap,(int)failed);abort();}
+    return true;
+}
+
 /* ---------------------------------------------------------------- flexbox */
 struct fitem {
     box_t *b;
@@ -1696,6 +1837,10 @@ static void layout_stretched_height(box_t *b, float usedh, float cbh) {
        this definite content height. Keep CSS height:auto and never feed the
        resulting percentage content back into line or track sizing. Tables
        retain their separate row-height model; this is not a table-cell fix. */
+    /* Without definite-height consumers an unchanged stretch is a no-op.
+       Re-entering every nested auto-height row otherwise alternates -1/usedh
+       cache inputs and doubles the subtree work at every depth. */
+    if (usedh == b->h && !b->stretch_height_dependent) return;
     if (b->kind == B_TABLE) {
         if (usedh > b->h) b->h = usedh;
     } else if (b->first) layout_inner_used(b, NULL, 0, 0, cbh, usedh);
@@ -1735,8 +1880,8 @@ static void flex_cross_lines(box_t *b, struct fitem *it, struct fline *lines,
         struct fline *line = &lines[l];
         float origin = flip ? available - cursor - line->cross : cursor;
         for (int i = line->first; i < line->end; i++) {
-            if (!web_native_checkpoint(D)) break;
-            web_avmedia_checkpoint();
+            if (!layout_checkpoint()) break;
+            layout_media_checkpoint();
             box_t *c = it[i].b;
             int lo = column ? 3 : 0, hi = column ? 1 : 2;
             bool auto_lo = len_auto(&c->st->margin[lo]), auto_hi = len_auto(&c->st->margin[hi]);
@@ -1787,14 +1932,14 @@ static void layout_flex(box_t *b, float defh) {
     float cw = b->w;
     int n = 0;
     for (box_t *c = b->first; c; c = c->next) {
-        if (n == INT_MAX) { ar_alloc(&D->lmem, SIZE_MAX); return; }
+        if (n == INT_MAX) { ar_alloc(layout_scratch(), SIZE_MAX); return; }
         n++;
     }
     struct fitem *it = calloc((size_t)n + 1, sizeof *it);
     struct fline *lines = calloc((size_t)n + 1, sizeof *lines);
     if (!it || !lines) {
         free(it); free(lines);
-        ar_alloc(&D->lmem, SIZE_MAX);
+        ar_alloc(layout_scratch(), SIZE_MAX);
         return;
     }
     int k = 0;
@@ -1813,7 +1958,7 @@ static void layout_flex(box_t *b, float defh) {
     /* stable sort by order */
     for (int i = 1; i < n; i++)
         for (int j = i; j > 0 && it[j - 1].b->st->order > it[j].b->st->order; j--) {
-            if (!web_native_checkpoint(D)) { free(lines); free(it); return; }
+            if (!layout_checkpoint()) { free(lines); free(it); return; }
             struct fitem t = it[j];
             it[j] = it[j - 1];
             it[j - 1] = t;
@@ -1976,12 +2121,14 @@ static void layout_flex(box_t *b, float defh) {
         /* lay out the items at their sizes */
         struct fline *line = &lines[line_count++];
         *line = (struct fline){.first=i0, .end=i1};
+        pvec children={0};
+        for(int i=i0;i<i1;i++){it[i].b->w=it[i].size;pv_push(&children,it[i].b);}
+        bool laid_out=layout_children_parallel((box_t **)children.v,children.n,defh);
+        pv_free(&children);
         for (int i = i0; i < i1; i++) {
             box_t *c = it[i].b;
-            if (!(c->kind == B_ATOMIC && c->atomic != AT_INLINE_BLOCK)) {
-                c->w = it[i].size;
+            if (!laid_out && !(c->kind == B_ATOMIC && c->atomic != AT_INLINE_BLOCK))
                 layout_inner(c, NULL, 0, 0, defh);
-            } else c->w = it[i].size;
             it[i].cross = c->h + vext(c) + c->m[0] + c->m[2];
             line->cross = fmaxf_(line->cross, it[i].cross);
             if (it[i].align == AI_BASELINE && c->baseline >= 0 &&
@@ -2190,7 +2337,7 @@ static int gr_place(struct gitem *it, int n, int nc, int nr) {
         if (it[i].r0 >= 0 && it[i].c0 >= 0) GR_MARK(i);
     for (int i = 0; i < n; i++) {
         if (it[i].r0 < 0 || it[i].c0 >= 0) continue;
-        if (!web_native_checkpoint(D)) goto placement_done;
+        if (!layout_checkpoint()) goto placement_done;
         int span = it[i].c1 > nc ? nc : it[i].c1, c = 0;
         while (c + span < nc && !gr_free_at(occ, rows, nc, it[i].r0, it[i].r1, c, c + span)) c++;
         it[i].c0 = c;
@@ -2201,19 +2348,19 @@ static int gr_place(struct gitem *it, int n, int nc, int nr) {
     int cr = 0, cc = 0;
     for (int i = 0; i < n; i++) {
         if (it[i].r0 >= 0) continue;
-        if (!web_native_checkpoint(D)) goto placement_done;
+        if (!layout_checkpoint()) goto placement_done;
         int rspan = it[i].r1;
         if (it[i].c0 >= 0) {
             if (it[i].c0 < cc) cr++;
             cc = it[i].c0;
             while (cr < GR_MAX_ROWS && !gr_free_at(occ, rows, nc, cr, cr + rspan, it[i].c0, it[i].c1)) {
-                if (!web_native_checkpoint(D)) goto placement_done;
+                if (!layout_checkpoint()) goto placement_done;
                 cr++;
             }
         } else {
             int span = it[i].c1 > nc ? nc : it[i].c1;
             for (;;) {
-                if (!web_native_checkpoint(D)) goto placement_done;
+                if (!layout_checkpoint()) goto placement_done;
                 if (cc + span > nc) {
                     cr++;
                     cc = 0;
@@ -2263,7 +2410,7 @@ static void gr_setup(struct grid *g, box_t *b, float cw) {
     n = g->n;
     for (int i = 1; i < n; i++)
         for (int j = i; j > 0 && g->it[j - 1].b->st->order > g->it[j].b->st->order; j--) {
-            if (!web_native_checkpoint(D)) return;
+            if (!layout_checkpoint()) return;
             struct gitem t = g->it[j];
             g->it[j] = g->it[j - 1];
             g->it[j - 1] = t;
@@ -2327,7 +2474,7 @@ static bool gr_intrinsic_kind(int k) { return k == GT_AUTO || k == GT_MIN || k =
 static void gr_size(struct gtr *tr, int nt, float gap, struct gitem *it, int n, bool col, float avail, bool min,
                     float pct) {
     for (int i = 0; i < nt; i++) {
-        if (!web_native_checkpoint(D)) return;
+        if (!layout_checkpoint()) return;
         struct gtr *t = &tr[i];
         t->base = 0;
         t->limit = -1;
@@ -2482,7 +2629,7 @@ static float gr_positions(struct gtr *tr, int nt, float gap, float start, float 
 
 static void gr_contributions(struct grid *g) {
     for (int i = 0; i < g->n; i++) {
-        if (!web_native_checkpoint(D)) return;
+        if (!layout_checkpoint()) return;
         box_t *c = g->it[i].b;
         outer_intrinsic(c, &g->it[i].mn, &g->it[i].mx);
         /* scroll containers have no content-based minimum */
@@ -2540,7 +2687,8 @@ static void layout_grid(box_t *b, float defh) {
         }
     }
     gr_positions(g.col, g.nc, st->gap_col, start, between);
-    /* lay the items out in their columns */
+    /* Resolve every independent column width before worker publication. */
+    pvec children={0};
     for (int i = 0; i < g.n; i++) {
         struct gitem *t = &g.it[i];
         box_t *c = t->b;
@@ -2557,9 +2705,16 @@ static void layout_grid(box_t *b, float defh) {
                 if (w < 0) w = js == AI_STRETCH && !am ? aw - ext : stf_width(c, aw);
                 c->w = clamp_w(c, w, aw);
             }
-            layout_inner(c, NULL, 0, 0, -1);
         }
-        t->h = c->h + vext(c) + c->m[0] + c->m[2];
+        pv_push(&children,c);
+    }
+    bool laid_out=layout_children_parallel((box_t **)children.v,children.n,-1);
+    pv_free(&children);
+    for(int i=0;i<g.n;i++){
+        box_t *c=g.it[i].b;
+        if(!laid_out && !(c->kind==B_ATOMIC && c->atomic!=AT_INLINE_BLOCK))
+            layout_inner(c,NULL,0,0,-1);
+        g.it[i].h=c->h+vext(c)+c->m[0]+c->m[2];
     }
     /* rows */
     gr_size(g.row, g.nr, st->gap_row, g.it, g.n, false, defh, false, defh);
@@ -2670,13 +2825,18 @@ static void inline_intrinsic(box_t *b, float *mn, float *mx) {
 }
 
 static void intrinsic(box_t *b, float *mn, float *mx) {
+    parallel_record_work(PARALLEL_INTRINSIC, 1);
     if (b->intrinsic_done) {
         *mn = b->min_cw;
         *mx = b->max_cw;
         return;
     }
     float a = 0, z = 0;
-    if (b->kind == B_ATOMIC && b->atomic != AT_INLINE_BLOCK) {
+    if (size_container(b)) {
+        /* Inline-axis intrinsic sizes are those of an empty principal box.
+           Explicit width/min/max and its edges are applied by outer_intrinsic. */
+        a=z=0;
+    } else if (b->kind == B_ATOMIC && b->atomic != AT_INLINE_BLOCK) {
         resolve_edges(b, 0);
         size_atomic(b, -1, -1);
         a = z = b->w;
@@ -2734,7 +2894,7 @@ static void outer_intrinsic(box_t *c, float *mn, float *mx) {
     resolve_edges(c, 0);
     float ext = hext(c) + c->m[1] + c->m[3];
     const len_t *wl = &c->st->width;
-    if (c->kind != B_ATOMIC && wl->kind == LK_LEN && wl->pct == 0) {
+    if ((c->kind != B_ATOMIC || size_container(c)) && wl->kind == LK_LEN && wl->pct == 0) {
         float w = wl->px - (c->st->box_sizing ? hext(c) : 0);
         w = clamp_w(c, w < 0 ? 0 : w, -1);
         *mn = *mx = w + ext;
@@ -2763,11 +2923,11 @@ struct frameset_track { double value, weight; };
 static struct frameset_track *frameset_tracks(const char *text,float extent,size_t *length) {
     size_t capacity=1;
     if(text)for(const char *p=text;*p;p++)if(*p==',' && p[1]){
-        if(capacity==SIZE_MAX)ar_alloc(&D->lmem,SIZE_MAX);
+        if(capacity==SIZE_MAX)ar_alloc(layout_scratch(),SIZE_MAX);
         capacity++;
     }
-    if(capacity>SIZE_MAX/sizeof(struct frameset_track))ar_alloc(&D->lmem,SIZE_MAX);
-    struct frameset_track *tracks=ar_alloc(&D->lmem,capacity*sizeof *tracks);
+    if(capacity>SIZE_MAX/sizeof(struct frameset_track))ar_alloc(layout_scratch(),SIZE_MAX);
+    struct frameset_track *tracks=ar_alloc(layout_scratch(),capacity*sizeof *tracks);
     size_t count=0;double fixed=0,stars=0;
     double available=isfinite(extent) && extent>0?extent:0;
     if(!text || !*text){tracks[0].value=available;*length=1;return tracks;}
@@ -2794,7 +2954,7 @@ struct frameset_layout {
     float x,y;
 };
 static struct frameset_layout *frameset_layout_push(box_t *b,float height,struct frameset_layout *previous) {
-    struct frameset_layout *s=ar_alloc(&D->lmem,sizeof *s);
+    struct frameset_layout *s=ar_alloc(layout_scratch(),sizeof *s);
     s->previous=previous;s->box=b;s->next=b->first;
     s->rows=frameset_tracks(node_attr(b->node,"rows"),height,&s->nr);
     s->cols=frameset_tracks(node_attr(b->node,"cols"),b->w,&s->nc);
@@ -2818,15 +2978,220 @@ static void layout_frameset(box_t *b,float height) {
         if(child->node && child->node->tag==T_frameset)s=frameset_layout_push(child,child->h,s);
     }
 }
+
+/* Legacy line clamping consumes real line boxes in this BFC, including
+ * anonymous inline contexts between paragraphs. Complete independent child
+ * layouts first, then reduce their immutable line results before the parent's
+ * size reduction. No shared line counter is borrowed by an AP. Intrinsic
+ * widths intentionally continue to see the original DOM/text. */
+struct clamp_state {
+    box_t *root, *last;
+    uint32_t limit, used;
+    int last_line;
+    bool truncated;
+};
+static const char clamp_ellipsis[] = "\xe2\x80\xa6";
+
+static void clamp_hide(box_t *b) {
+    b->clamp_hidden = true;
+    for (box_t *c = b->first; c; c = c->next) clamp_hide(c);
+}
+static void clamp_visibility_reset(box_t *b) {
+    if (!layout_checkpoint()) return;
+    b->clamp_hidden = false;
+    for (box_t *c = b->first; c; c = c->next) clamp_visibility_reset(c);
+}
+static void clamp_scan(struct clamp_state *state, box_t *b) {
+    if (b->clamp_hidden || !layout_checkpoint()) return;
+    if (state->truncated) { clamp_hide(b); return; }
+    if (b != state->root && (b->abspos || b->floated)) return;
+    if (b != state->root && state->used == state->limit && b->h + vext(b) > 0) {
+        state->truncated = true; clamp_hide(b); return;
+    }
+    /* Other BFCs (inline blocks, grid/flex, floats, overflow contexts) do not
+       consume the enclosing BFC's line budget. They can still occur after its
+       clamp point and must not resurrect elided content. */
+    if (b != state->root && is_bfc_root(b)) {
+        if (state->used == state->limit && b->h + vext(b) > 0) {
+            state->truncated = true; clamp_hide(b);
+        }
+        return;
+    }
+    if (b->inline_ctx && b->nlines) {
+        uint32_t remain = state->limit - state->used;
+        int keep = remain < (uint32_t)b->nlines ? (int)remain : b->nlines;
+        if (keep) {
+            state->used += (uint32_t)keep;
+            state->last = b; state->last_line = keep - 1;
+        }
+        if (keep < b->nlines) {
+            state->truncated = true;
+            if (!keep) clamp_hide(b);
+            else {
+                b->nruns = b->lines[keep - 1].end_run;
+                b->ndecos = b->lines[keep - 1].end_deco;
+                b->nlines = keep;
+            }
+        }
+        return; /* atomic inline descendants belong to one outer line */
+    }
+    for (box_t *c = b->first; c; c = c->next) clamp_scan(state, c);
+}
+
+/* Only surviving inline fragments keep their native paint/hit ancestry.
+   Atomic boxes keep their own private clamp state when their outer run fits. */
+static void clamp_inline_hide(box_t *b, box_t *owner, float bottom) {
+    for (box_t *c = b->first; c; c = c->next) {
+        if (c->abspos || c->floated) {
+            float y = c->abspos ? c->static_y : c->y;
+            if (y >= bottom) clamp_hide(c);
+            continue;
+        }
+        c->clamp_hidden = true;
+        if (c->kind == B_INLINE) clamp_inline_hide(c, owner, bottom);
+    }
+    (void)owner;
+}
+static void clamp_show_path(box_t *b, box_t *owner) {
+    box_t *p = b;
+    while (p && p != owner) p = p->parent;
+    if (!p) return; /* split inline's principal box may belong to another line context */
+    for (; b && b != owner; b = b->parent) b->clamp_hidden = false;
+}
+static int clamp_prefix(const struct run *r, float available, float *width) {
+    wfont font = style_font(r->st);
+    int count = 0;
+    for (int i = 0; i < r->n; i++) if (((unsigned char)r->s[i] & 0xc0) != 0x80) count++;
+    int low = 0, high = count;
+    while (low < high) {
+        int middle = low + (high - low + 1) / 2, bytes = 0, chars = 0;
+        while (bytes < r->n && chars < middle) {
+            bytes++; while (bytes < r->n && ((unsigned char)r->s[bytes] & 0xc0) == 0x80) bytes++;
+            chars++;
+        }
+        float w = text_width_uncached(r->st, &font, r->s, (size_t)bytes);
+        if (w <= available) low = middle; else high = middle - 1;
+    }
+    int bytes = 0, chars = 0;
+    while (bytes < r->n && chars < low) {
+        bytes++; while (bytes < r->n && ((unsigned char)r->s[bytes] & 0xc0) == 0x80) bytes++;
+        chars++;
+    }
+    while (bytes > 0 && r->s[bytes - 1] == ' ') bytes--;
+    *width = text_width_uncached(r->st, &font, r->s, (size_t)bytes);
+    return bytes;
+}
+static float clamp_local_y(box_t *b, box_t *root) {
+    float y = 0;
+    for (; b && b != root; b = b->cb)
+        y += b->y + (b->cb ? b->cb->content_dy : 0);
+    return y; /* normal-flow position, not relative/scroll/viewport transforms */
+}
+static void clamp_apply(box_t *root) {
+    struct clamp_state state = {.root = root, .limit = root->st->line_clamp};
+    clamp_scan(&state, root);
+    struct clamp_trace *trace = root->clamp_trace;
+    if (trace) { trace->full_h = root->h; trace->cut_h = root->h; trace->lines = state.used; }
+    if (trace && state.last) {
+        box_t *p = state.last;
+        while (p && p != root) p = p->cb;
+        trace->cb_reached = p == root;
+        trace->last_kind = state.last->kind; trace->last_anon = state.last->anon;
+        trace->last_y = clamp_local_y(state.last, root);
+        trace->line_bottom = state.last->lines[state.last_line].bottom;
+    }
+    if (!state.truncated || !state.last || !layout_checkpoint()) return;
+    box_t *b = state.last;
+    struct line_fragment *line = &b->lines[state.last_line];
+    b->nruns = line->end_run; b->ndecos = line->end_deco; b->nlines = state.last_line + 1;
+    wfont font = style_font(b->st);
+    float ellipsis_width = text_width_uncached(b->st, &font, clamp_ellipsis, sizeof clamp_ellipsis - 1);
+    float edge = fmaxf_(line->left, line->right - ellipsis_width), x = line->left;
+    int end = line->first_run;
+    for (int i = line->first_run; i < b->nruns; i++) {
+        struct run *r = &b->runs[i];
+        if (r->s == clamp_ellipsis) break;
+        if (r->x >= edge) break;
+        if (r->x + r->w > edge) {
+            if (r->atomic) break;
+            r->n = clamp_prefix(r, edge - r->x, &r->w);
+            if (r->n) { x = r->x + r->w; end = i + 1; }
+            break;
+        }
+        x = r->x + r->w; end = i + 1;
+    }
+    b->nruns = end;
+    /* Ellipsis is anonymous content, not a synthetic DOM node or a link. */
+    jmp_buf *previous_trap = b->layout_mem.trap;
+    b->layout_mem.trap = layout_scratch()->trap;
+    struct run *runs = ar_alloc(&b->layout_mem, ((size_t)end + 1) * sizeof *runs);
+    if (end) memcpy(runs, b->runs, (size_t)end * sizeof *runs);
+    runs[end] = (struct run){x, line->baseline, ellipsis_width, clamp_ellipsis,
+        sizeof clamp_ellipsis - 1, b->st, NULL, NULL, false, NULL};
+    b->layout_mem.trap = previous_trap;
+    b->runs = runs; b->nruns++; line->end_run = b->nruns;
+    for (int i = line->first_deco; i < b->ndecos; i++) {
+        struct deco *deco = &b->decos[i];
+        deco->w = fmaxf_(0, fminf_(deco->x + deco->w, x) - deco->x);
+    }
+    clamp_inline_hide(b, b, line->bottom);
+    for (int i = 0; i < b->nruns; i++) {
+        struct run *r = &b->runs[i];
+        if (r->atomic) clamp_show_path(r->atomic, b);
+        if (r->node) clamp_show_path(r->node->box, b);
+    }
+    for (int i = 0; i < b->ndecos; i++)
+        if (b->decos[i].node && b->decos[i].w > 0) clamp_show_path(b->decos[i].node->box, b);
+    float bottom = clamp_local_y(b, root) + line->bottom;
+    if (trace) trace->applied = true;
+    for (box_t *p = b; p && p != root; p = p->cb) {
+        if (len_auto(&p->st->height)) p->h = fminf_(p->h, fmaxf_(0, bottom - clamp_local_y(p, root)));
+        p->last_baseline = p == b ? line->baseline : b->last_baseline + clamp_local_y(b, p);
+    }
+    root->h = fminf_(root->h, fmaxf_(0, bottom));
+    if (trace) trace->cut_h = root->h;
+    root->last_baseline = line->baseline + clamp_local_y(b, root);
+    root->clamp_truncated = true;
+}
+
 static void layout_inner(box_t *b, struct bfc *f, float ox, float oy, float cbh) {
+    parallel_record_work(PARALLEL_LAYOUT, 1);
     layout_inner_used(b, f, ox, oy, cbh, -1);
 }
 
 static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float cbh, float usedh) {
-    if (!web_native_checkpoint(D)) return;
-    web_avmedia_checkpoint();
+    if (!layout_checkpoint()) return;
+    layout_media_checkpoint();
+    float input_width = b->w;
+    uint64_t font_generation = font_metrics_generation();
+    bool clamping = box_line_clamp(b);
+    bool reusable = !layout_current()->clamp_depth && !clamping &&
+        (!f || is_bfc_root(b)) && b->layout_cache_safe && font_generation;
+    if (reusable && b->layout_cache_valid && !b->layout_dirty &&
+        b->cached_width == input_width && b->cached_cbh == cbh &&
+        b->cached_usedh == usedh && b->cached_font_generation == font_generation &&
+        !memcmp(b->cached_padding, b->p, sizeof b->p) &&
+        !memcmp(b->cached_border, b->b, sizeof b->b)) {
+        b->h = b->cached_height;
+        b->baseline = b->cached_baseline;
+        b->last_baseline = b->cached_last_baseline;
+        b->content_dy = b->cached_content_dy;
+        return;
+    }
+    ar_free(&b->layout_mem);
+    b->layout_mem.chunk_size = 4096;
+    b->layout_mem.trap = layout_scratch()->trap;
+    b->clamp_trace = NULL;
+    if (!b->anon && b->st->line_clamp && D->profile_enabled) {
+        b->clamp_trace = ar_alloc(&b->layout_mem, sizeof *b->clamp_trace);
+        *b->clamp_trace = (struct clamp_trace){.usedh = usedh, .limit = b->st->line_clamp,
+            .eligible = clamping};
+    }
     if(b->node && !b->node->foreign && b->node->tag==T_frameset){
-        layout_frameset(b,usedh>=0?usedh:cbh>=0?cbh:VH);return;
+        layout_frameset(b,usedh>=0?usedh:cbh>=0?cbh:VH);
+        b->layout_mem.trap = NULL;
+        b->layout_cache_valid = false;
+        return;
     }
     struct bfc own = {0};
     bool root = is_bfc_root(b);
@@ -2835,6 +3200,8 @@ static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float
         ox = oy = 0;
     }
     float sh = usedh >= 0 ? usedh : resolved_content_height(b, cbh);
+    if(sh<0 && size_container(b) && b->st->container_type==CT_SIZE)sh=0;
+    if (b->clamp_trace) b->clamp_trace->sh = sh;
     /* The anonymous initial containing block supplies the viewport height,
        even though its own auto height follows document content. Otherwise
        html/body height:100% lose their definite reference at the first box.
@@ -2844,6 +3211,18 @@ static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float
     float child_cbh = b == D->root_box ? VH : sh >= 0 ? clamp_h(b, sh, cbh) : -1;
     b->baseline = b->last_baseline = -1;
     b->nruns = b->ndecos = 0;
+    b->nlines = 0; b->lines = NULL; b->clamp_truncated = false;
+    if (clamping) {
+        /* Flex/grid measurement and final placement can enter this subtree
+           more than once within one layout_doc, after its old clamp already
+           hid tail boxes. A fresh line result must not scan that stale paint
+           visibility: otherwise it consumes exactly the budget, skips the
+           hidden overflow, and publishes full height without an ellipsis.
+           This root owns the reset subtree; clamp_depth prevents its child
+           layouts (including independent nested clamps) reusing old runs. */
+        clamp_visibility_reset(b);
+        layout_current()->clamp_depth++;
+    }
     switch (b->kind) {
     case B_TABLE: layout_table(b, cbh); break;
     case B_FLEX: layout_flex(b, sh >= 0 ? clamp_h(b, sh, cbh) : sh); break;
@@ -2856,11 +3235,141 @@ static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float
         float fb = bfc_bottom(f);
         if (fb > b->h) b->h = fb;
     }
+    if (b->clamp_trace) b->clamp_trace->full_h = b->clamp_trace->cut_h = b->h;
+    if (clamping) {
+        clamp_apply(b);
+        layout_current()->clamp_depth--;
+    }
     if (b->kind != B_TABLE) {
         if (sh >= 0) b->h = sh;
         b->h = clamp_h(b, b->h, cbh);
     }
+    if (b->clamp_trace) b->clamp_trace->post_h = b->h;
     if (root) bfc_free(&own);
+    b->layout_mem.trap = NULL;
+    uint64_t final_generation = font_metrics_generation();
+    b->layout_cache_valid = reusable &&
+        !__atomic_load_n(&D->native_cancelled, __ATOMIC_ACQUIRE) && font_generation == final_generation;
+    b->layout_dirty = false;
+    b->cached_width = input_width;
+    b->cached_cbh = cbh;
+    b->cached_usedh = usedh;
+    b->cached_font_generation = final_generation;
+    memcpy(b->cached_padding, b->p, sizeof b->p);
+    memcpy(b->cached_border, b->b, sizeof b->b);
+    b->cached_height = b->h;
+    b->cached_baseline = b->baseline;
+    b->cached_last_baseline = b->last_baseline;
+    b->cached_content_dy = b->content_dy;
+}
+
+/* Called only by the supervisor after every helper joined and container
+ * settling finished. No author strings, node IDs, URLs or script callbacks.
+ * With debug_js off neither the extra traversal nor console call occurs. */
+static void clamp_trace_report_box(web_doc *d, box_t *b) {
+    if (!b || d->clamp_trace_reported >= 4) return;
+    const struct clamp_trace *t = b->clamp_trace;
+    if (t && !b->clamp_hidden && (t->applied ||
+        t->full_h > line_height_px(b->st) * (float)t->limit)) {
+        const style_t *s = b->st;
+        box_t *p = b->parent;
+        char message[768];
+        snprintf(message, sizeof message,
+            "Native clamp trace: #%u gate=%u eligible=%u applied=%u kind=%u legacy=%u "
+            "orient=%u display=%u inline_ctx=%u nlines=%d limit=%u lines=%u "
+            "height=%u/%.2f/%.2f min=%u/%.2f/%.2f max=%u/%.2f/%.2f "
+            "usedh=%.2f sh=%.2f full=%.2f cut=%.2f post=%.2f final=%.2f "
+            "last=%u/%u y=%.2f bottom=%.2f cb_reached=%u parent=%d/%.2f flow_bottom=%.2f next_y=%.2f",
+            ++d->clamp_trace_reported, d->profile_enabled, t->eligible, t->applied,
+            (unsigned)b->kind, s->legacy_box, (unsigned)s->box_orient, (unsigned)s->display,
+            b->inline_ctx, b->nlines, t->limit, t->lines,
+            (unsigned)s->height.kind, s->height.px, s->height.pct,
+            (unsigned)s->min_height.kind, s->min_height.px, s->min_height.pct,
+            (unsigned)s->max_height.kind, s->max_height.px, s->max_height.pct,
+            t->usedh, t->sh, t->full_h, t->cut_h, t->post_h, b->h,
+            (unsigned)t->last_kind, t->last_anon, t->last_y, t->line_bottom, t->cb_reached,
+            p ? (int)p->kind : -1, p ? p->h : -1,
+            b->y + b->h + b->p[2] + b->b[2], b->next ? b->next->y : -1);
+        web_js_console(d, 0, message);
+    }
+    for (box_t *c = b->first; c && d->clamp_trace_reported < 4; c = c->next)
+        clamp_trace_report_box(d, c);
+}
+void layout_clamp_trace_report(web_doc *d) {
+    if (d && d->profile_enabled && d->js && d->clamp_trace_reported < 4)
+        clamp_trace_report_box(d, d->root_box);
+}
+
+static void layout_dirty_subtree(box_t *b) {
+    b->layout_dirty = true;
+    b->layout_cache_valid = false;
+    b->intrinsic_done = false;
+    for (box_t *c = b->first; c; c = c->next) layout_dirty_subtree(c);
+}
+void layout_invalidate(box_t *b) {
+    if (!b) return;
+    layout_dirty_subtree(b);
+    for (b = b->parent; b; b = b->parent) {
+        b->layout_dirty = true;
+        b->intrinsic_done = false;
+    }
+}
+
+static bool layout_cache_prepare(box_t *b) {
+    b->clamp_hidden = false;
+    bool safe = !box_line_clamp(b) && !b->abspos && !(b->node && !b->node->foreign &&
+        (b->node->tag == T_frameset || b->node->tag == T_iframe || b->node->tag == T_embed));
+    const style_t *s=b->st;
+    bool dependent=b->kind==B_GRID || b->kind==B_TABLE ||
+        (b->kind==B_FLEX && (s->flex_direction==FD_COLUMN || s->flex_direction==FD_COLUMN_REVERSE)) ||
+        len_has_pct(&s->height) || len_has_pct(&s->flex_basis) ||
+        !len_auto(&s->min_height) || s->max_height.kind!=LK_NONE ||
+        len_has_pct(&s->inset[0]) || len_has_pct(&s->inset[2]);
+    for (box_t *c = b->first; c; c = c->next) {
+        if (!layout_cache_prepare(c)) safe = false;
+        if (c->stretch_height_dependent) dependent=true;
+    }
+    b->layout_cache_safe = safe;
+    b->stretch_height_dependent=dependent;
+    return safe;
+}
+
+/* Intrinsic contributions of sibling flex/grid subtrees are independent.
+ * Placement, float negotiation and ancestor-size reductions remain ordered.
+ * Tables, replaced/media controls and embedded grids use the serial path. */
+static bool intrinsic_parallel_safe(box_t *b) {
+    if (b->abspos || b->floated || b->kind == B_ATOMIC || b->kind == B_TABLE || b->kind == B_GRID ||
+        (b->node && b->node->tag == T_frameset)) return false;
+    for (box_t *c = b->first; c; c = c->next) if (!intrinsic_parallel_safe(c)) return false;
+    return true;
+}
+struct intrinsic_job { box_t **boxes; struct layout_context context; };
+static void intrinsic_job_run(size_t i, void *context) {
+    struct intrinsic_job *j = context;
+    struct layout_context local = j->context;
+    local.pure = true; local.text_cache = NULL;
+    void *previous = thread_local_get(1);
+    thread_local_set(1, &local);
+    float min_width, max_width;
+    intrinsic(j->boxes[i], &min_width, &max_width);
+    thread_local_set(1, previous);
+}
+static void intrinsic_service(void *context) { web_native_checkpoint(context); }
+static void intrinsic_collect(box_t *b, pvec *jobs) {
+    for (box_t *c = b->first; c; c = c->next) {
+        if ((b->kind == B_FLEX || b->kind == B_GRID) && !c->intrinsic_done && intrinsic_parallel_safe(c))
+            pv_push(jobs, c);
+        else intrinsic_collect(c, jobs);
+    }
+}
+static void intrinsic_parallel_prepare(box_t *root) {
+    pvec work = {0};
+    intrinsic_collect(root, &work);
+    if (work.n >= 8) {
+        struct intrinsic_job j = {(box_t **)work.v, *layout_current()};
+        parallel_for_stage(PARALLEL_INTRINSIC,(size_t)work.n, intrinsic_job_run, &j, intrinsic_service, D);
+    }
+    pv_free(&work);
 }
 
 /* relative positioning offsets, now that containing blocks have their sizes */
@@ -2888,6 +3397,7 @@ static box_t *abs_containing_block(box_t *a) {
 }
 
 static void layout_abs(box_t *a) {
+    if (a->clamp_hidden) return;
     box_t *cb = abs_containing_block(a);
     bool icb = cb == D->root_box;
     float pl = icb ? 0 : cb->p[3], pt = icb ? 0 : cb->p[0];
@@ -2959,9 +3469,9 @@ static int document_extent(float value) {
 
 static void scroll_area_publish(box_t *b) {
     box_t *cb = b->cb;
-    if (!cb || b->kind == B_INLINE || b->kind == B_TEXT || b->kind == B_BR ||
+    if (b->clamp_hidden || !cb || b->kind == B_INLINE || b->kind == B_TEXT || b->kind == B_BR ||
         (b->st && b->st->position == POS_FIXED) || web_dialog_layer_box(D, b)) return;
-    bool clipped = b->st && b->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(D, b);
+    bool clipped = b->clamp_truncated || (b->st && b->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(D, b));
     float bw = clipped ? b->w + b->p[1] + b->p[3] : b->scroll_w;
     float bh = clipped ? b->h + b->p[0] + b->p[2] : b->scroll_h;
     /* cb is b's actual coordinate parent. The shared cb chain cancels:
@@ -2975,6 +3485,7 @@ static void scroll_area_publish(box_t *b) {
 }
 
 static void scroll_areas(box_t *b) {
+    if (b->clamp_hidden) { b->scroll_w = b->scroll_h = 0; return; }
     b->scroll_w = scroll_extent(b->w + b->p[1] + b->p[3]);
     b->scroll_h = scroll_extent(b->h + b->p[0] + b->p[2]);
     for (int i = 0; i < b->nruns; i++) {
@@ -2992,14 +3503,19 @@ static void scroll_areas(box_t *b) {
         b->scroll_h = fmaxf_(b->scroll_h, scroll_extent(b->p[0] + b->content_dy + r->y + r->h + b->p[2]));
     }
     for (box_t *c = b->first; c; c = c->next) scroll_areas(c);
+    if (b->clamp_truncated) {
+        b->scroll_w = scroll_extent(b->w + b->p[1] + b->p[3]);
+        b->scroll_h = scroll_extent(b->h + b->p[0] + b->p[2]);
+    }
     box_scroll_clamp(b);
     scroll_area_publish(b);
 }
 
 static float max_bottom(box_t *b, float base) {
+    if (b->clamp_hidden) return base;
     float y = base + b->y + b->rel_dy;
     float bottom = y + b->h + b->p[2] + b->b[2];
-    if (b->st && b->st->overflow != OV_VISIBLE && b->kind != B_TEXT && !doc_viewport_overflow_box(D,b)) return bottom;
+    if (b->clamp_truncated || (b->st && b->st->overflow != OV_VISIBLE && b->kind != B_TEXT && !doc_viewport_overflow_box(D,b))) return bottom;
     for (box_t *c = b->first; c; c = c->next) {
         if (c->abspos || c->kind == B_TEXT || c->kind == B_INLINE || c->kind == B_BR) continue;
         if (c->cb != b) continue;
@@ -3009,15 +3525,16 @@ static float max_bottom(box_t *b, float base) {
 }
 
 void layout_doc(web_doc *d, int width, int height) {
-    D = d;
-    VW = (float)width;
-    VH = (float)height;
-    GEN++;
-    if (!GEN) GEN = 1;
+    static uint32_t next_generation;
+    struct layout_context context = {.document = d, .viewport_w = (float)width,
+        .viewport_h = (float)height, .generation = ++next_generation};
+    if (!context.generation) context.generation = ++next_generation;
+    void *previous_context = thread_local_get(1);
+    thread_local_set(1, &context);
     ar_free(&d->lmem);
     d->abs_boxes.n = 0;
     box_t *root = d->root_box;
-    if (!root) return;
+    if (!root) { thread_local_set(1, previous_context); return; }
     /* Heap state survives arena longjmp without indeterminate automatic
      * locals. A nested layout gets its own table, even when calloc fails. */
     struct layout_text_cache *cache = calloc(1, sizeof *cache);
@@ -3031,12 +3548,16 @@ void layout_doc(web_doc *d, int width, int height) {
         layout_text_active = previous_cache;
         layout_text_cache_free(cache);
         d->lmem.trap = outer_trap;
+        thread_local_set(1, previous_context);
         if (outer_trap) longjmp(*outer_trap, arena_failed);
         abort();
     }
     root->x = root->y = 0;
     root->w = VW;
     root->cb = NULL;
+    layout_cache_prepare(root);
+    intrinsic_parallel_prepare(root);
+    if (d->native_cancelled) goto finished;
     layout_inner(root, NULL, 0, 0, VH);
     if (d->native_cancelled) goto finished;
     for (int i = 0; i < d->abs_boxes.n; i++) layout_abs(d->abs_boxes.v[i]);
@@ -3045,7 +3566,7 @@ void layout_doc(web_doc *d, int width, int height) {
     float h = fmaxf_(root->h, max_bottom(root, 0));
     for (int i = 0; i < d->abs_boxes.n; i++) {
         box_t *a = d->abs_boxes.v[i];
-        if (a->st->position == POS_FIXED) continue;
+        if (a->clamp_hidden || a->st->position == POS_FIXED) continue;
         float ay = box_abs_y(a);
         h = fmaxf_(h, ay + a->h + a->p[2] + a->b[2]);
     }
@@ -3055,4 +3576,5 @@ finished:
     layout_text_active = previous_cache;
     layout_text_cache_free(cache);
     d->lmem.trap = outer_trap;
+    thread_local_set(1, previous_context);
 }

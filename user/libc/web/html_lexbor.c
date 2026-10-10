@@ -207,10 +207,26 @@ struct html_parser *html_open(web_doc *d) {
 }
 void html_close(struct html_parser *p){if(p)p->stream_open=false;}
 
+bool html_pending_input(const struct html_parser *p) {
+    if (!p || p->failed || p->finished) return false;
+    for (const struct html_input *in = p->input; in; in = in->next)
+        if (in->offset < in->length) return true;
+    return false;
+}
+
+bool html_import_changed(const struct html_parser *p) { return p && p->import_changed; }
+
 int html_resume(struct html_parser *p, node_t **script) {
     if (script) *script = NULL;
+    if (p) p->import_changed = false;
     if (!p || p->failed) return -1;
     if (p->finished) return 0;
+    /* A document.open stream can remain suspended for arbitrarily many ticks.
+       No token can change while it has neither input nor EOF. In particular,
+       importing the unchanged Lexbor tree would republish every native link.
+       Keep yielded set so native script mutations are exported before the next
+       actual write or close resumes the tree builder. */
+    if (p->stream_open && !html_pending_input(p)) { p->yielded = true; return 2; }
     doc_dom_budget(p->d);
     if (p->yielded && !html_bridge_export(p)) { p->failed = true; return -1; }
     p->yielded = false; p->pending_script = NULL; p->write_tail = NULL;

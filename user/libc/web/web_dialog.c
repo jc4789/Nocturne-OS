@@ -210,10 +210,9 @@ node_t *web_dialog_tab_target(web_doc *d, bool backward) {
                      (s.next ? s.next : s.first ? s.first : top);
 }
 void web_dialog_scroll_offset(web_doc *d, node_t *n, int *x, int *y) {
-    for (; n; n = doc_flat_parent(n)) if (web_dialog_is_modal(d, n)) {
-        if (n->style && n->style->position == POS_FIXED) { *x += d->view_x; *y += d->view_y; }
-        return;
-    }
+    /* Retain the internal compatibility symbol; fixed modal and descendant
+       offsets are now published once by the common visual geometry helper. */
+    (void)d; (void)n; (void)x; (void)y;
 }
 
 int web_dialog_submission(web_doc *d, node_t *submitter, node_t **dialog, const char **result) {
