@@ -1,5 +1,8 @@
 #pragma once
+#include <cdefs.h>
+NOCTURNE_BEGIN_DECLS
 int *__errno_location(void);
+NOCTURNE_END_DECLS
 #define errno (*__errno_location())
 #define EPERM 1
 #define ENOENT 2
@@ -34,3 +37,50 @@ int *__errno_location(void);
 #define ETIMEDOUT 110
 #define ECONNREFUSED 111
 #define EHOSTUNREACH 113
+/* Standard error identities used by C++ errc; existing native values stay intact.
+   These constants do not imply support for the corresponding POSIX facility. */
+#define ENXIO 6
+#define EACCES 13
+#define EXDEV 18
+#define ENODEV 19
+#define ENFILE 23
+#define ENOTTY 25
+#define ETXTBSY 26
+#define EFBIG 27
+#define EMLINK 31
+#define EDOM 33
+#define EDEADLK 35
+#define ENOLCK 37
+#define ELOOP 40
+#define ENOMSG 42
+#define EIDRM 43
+#define ENOSTR 60
+#define ENODATA 61
+#define ETIME 62
+#define ENOSR 63
+#define ENOLINK 67
+#define EPROTO 71
+#define EBADMSG 74
+#define EOVERFLOW 75
+#define EILSEQ 84
+#define ENOTSOCK 88
+#define EDESTADDRREQ 89
+#define EMSGSIZE 90
+#define EPROTOTYPE 91
+#define ENOPROTOOPT 92
+#define EPROTONOSUPPORT 93
+#define EOPNOTSUPP 95
+#define ENOTSUP EOPNOTSUPP
+#define EAFNOSUPPORT 97
+#define EADDRNOTAVAIL 99
+#define ENETUNREACH 101
+#define ENETRESET 102
+#define ECONNABORTED 103
+#define ENOBUFS 105
+#define EISCONN 106
+#define EALREADY 114
+#define EINPROGRESS 115
+#define ECANCELED 125
+#define EOWNERDEAD 130
+#define ENOTRECOVERABLE 131
+#define EWOULDBLOCK EAGAIN

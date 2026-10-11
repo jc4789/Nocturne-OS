@@ -6,6 +6,8 @@
 #include "abi.h"
 #include "fcntl.h"
 #include "gfx.h"
+#include <cdefs.h>
+NOCTURNE_BEGIN_DECLS
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -58,7 +60,7 @@ int clock_info(struct n_clockinfo *info);
 /* Native tasks sharing this process's address space and descriptors. */
 int thread_create(void (*fn)(void *), void *arg);
 int thread_join(int tid);
-_Noreturn void thread_exit(void);
+NOCTURNE_NORETURN void thread_exit(void);
 int thread_id(void);
 unsigned cpu_index(void);
 /* Eight process-library TLS slots, independent of errno and thread identity. */
@@ -188,3 +190,4 @@ void wav_close(struct wav *w);
 void wav_seek(struct wav *w, uint32_t frame); /* in the file's frames */
 int wav_read(struct wav *w, int16_t *out, int frames); /* fewer than asked at the end */
 uint32_t wav_ms(const struct wav *w, uint32_t frame);
+NOCTURNE_END_DECLS

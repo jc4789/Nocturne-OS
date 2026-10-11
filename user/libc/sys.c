@@ -414,18 +414,64 @@ void __stdio_init(void);
 void __stdio_flush_all(void);
 int main(int argc, char **argv);
 
-#define MAX_ATEXIT 16
-static void (*atexit_fns[MAX_ATEXIT])(void);
-static int natexit;
-
-int atexit(void (*fn)(void)) {
-    if (natexit == MAX_ATEXIT) return -1;
-    atexit_fns[natexit++] = fn;
+/* C and C++ callbacks share a LIFO so mixed-language registration order is
+   preserved. Remove a callback before invoking it: finalization may recurse or
+   register another callback, and a completed destructor must never run twice. */
+struct exit_callback {
+    struct exit_callback *next;
+    union { void (*c)(void); void (*cxx)(void *); } fn;
+    void *argument, *dso;
+    bool is_cxx;
+};
+static struct exit_callback *exit_callbacks;
+static uint32_t exit_callbacks_lock;
+static void exit_lock(void) {
+    while (__atomic_exchange_n(&exit_callbacks_lock, 1, __ATOMIC_ACQUIRE)) {
+        if (wait_on_address(&exit_callbacks_lock, 1, UINT32_MAX) < 0) yield();
+    }
+}
+static void exit_unlock(void) {
+    __atomic_store_n(&exit_callbacks_lock, 0, __ATOMIC_RELEASE);
+    wake_address(&exit_callbacks_lock, UINT32_MAX);
+}
+static int register_exit_callback(struct exit_callback *entry) {
+    if (!entry) return -1;
+    exit_lock();
+    entry->next = exit_callbacks;
+    exit_callbacks = entry;
+    exit_unlock();
     return 0;
+}
+int atexit(void (*fn)(void)) {
+    struct exit_callback *entry = malloc(sizeof *entry);
+    if (!entry) return -1;
+    *entry = (struct exit_callback){.fn.c = fn};
+    return register_exit_callback(entry);
+}
+int __cxa_atexit(void (*fn)(void *), void *argument, void *dso) {
+    struct exit_callback *entry = malloc(sizeof *entry);
+    if (!entry) return -1;
+    *entry = (struct exit_callback){.fn.cxx = fn, .argument = argument, .dso = dso, .is_cxx = true};
+    return register_exit_callback(entry);
+}
+void __cxa_finalize(void *dso) {
+    for (;;) {
+        exit_lock();
+        struct exit_callback **slot = &exit_callbacks;
+        while (*slot && dso && (!(*slot)->is_cxx || (*slot)->dso != dso)) slot = &(*slot)->next;
+        struct exit_callback *entry = *slot;
+        if (entry) *slot = entry->next;
+        exit_unlock();
+        if (!entry) return;
+        /* Do not hold the registry lock across application code or free(). */
+        if (entry->is_cxx) entry->fn.cxx(entry->argument);
+        else entry->fn.c();
+        free(entry);
+    }
 }
 
 _Noreturn void exit(int code) {
-    while (natexit) atexit_fns[--natexit]();
+    __cxa_finalize(NULL);
     __stdio_flush_all();
     SC1(SYS_EXIT, code);
     for (;;) {}
@@ -443,7 +489,27 @@ void __libc_init(void) {
 }
 void __libc_start(int argc, char **argv) {
     __libc_init();
+    /* Weak symbols also keep libc usable by the in-OS C compiler, whose link
+       path need not supply these sections. Empty arrays are a no-op for C. */
+    extern void (*__preinit_array_start[])(void) __attribute__((weak));
+    extern void (*__preinit_array_end[])(void) __attribute__((weak));
+    extern void (*__init_array_start[])(void) __attribute__((weak));
+    extern void (*__init_array_end[])(void) __attribute__((weak));
+    void __libc_fini_array(void);
+    extern void (*__fini_array_start[])(void) __attribute__((weak));
+    extern void (*__fini_array_end[])(void) __attribute__((weak));
+    if (__fini_array_start && __fini_array_end != __fini_array_start && atexit(__libc_fini_array)) abort();
+    if (__preinit_array_start)
+        for (void (**fn)(void) = __preinit_array_start; fn != __preinit_array_end; ++fn) (*fn)();
+    if (__init_array_start)
+        for (void (**fn)(void) = __init_array_start; fn != __init_array_end; ++fn) (*fn)();
     exit(main(argc, argv));
+}
+void __libc_fini_array(void) {
+    extern void (*__fini_array_start[])(void) __attribute__((weak));
+    extern void (*__fini_array_end[])(void) __attribute__((weak));
+    if (__fini_array_start)
+        for (void (**fn)(void) = __fini_array_end; fn != __fini_array_start;) (*--fn)();
 }
 
 /* ---- sys/mman.h: anonymous memory only ---- */

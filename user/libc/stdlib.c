@@ -228,6 +228,7 @@ long long atoll(const char *s) { return strtoll(s, NULL, 10); }
 long long llabs(long long x) { return x < 0 ? -x : x; }
 div_t div(int a, int b) { return (div_t){a / b, a % b}; }
 ldiv_t ldiv(long a, long b) { return (ldiv_t){a / b, a % b}; }
+lldiv_t lldiv(long long a, long long b) { return (lldiv_t){a / b, a % b}; }
 
 void *bsearch(const void *key, const void *base, size_t n, size_t size,
               int (*cmp)(const void *, const void *)) {

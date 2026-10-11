@@ -84,6 +84,10 @@ static const struct test tests[] = {
     {"fs", "fat32", "tcc -o /home/fstest /data/tests/fstest.c && /home/fstest /data/fstest", 0, {"fstest: 0 failed"}, "FAIL", 180},
     {"fs", "ramfs", "/home/fstest /home/fsdir", 0, {"fstest: 0 failed"}, "FAIL", 120},
 
+    /* Host cross-built C++ application, using the native C startup and APIs. */
+    {"cxx", "native-runtime", "cppdemo --self-test", 0,
+     {"CPP_SELFTEST_PASS", "CPP_EXIT_PASS"}, "CPP_FAIL", 120, false, true},
+
     /* the C compiler */
     {"tcc", "run", "tcc -run /usr/src/apps/echo.c one two", 0, {"one two"}},
     {"tcc", "errors", "echo 'int main(void) { return x; }' > /home/bad.c; tcc -c /home/bad.c", NONZERO, {"x"}},

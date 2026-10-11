@@ -1,5 +1,7 @@
 #pragma once
 #include <stddef.h>
+#include <cdefs.h>
+NOCTURNE_BEGIN_DECLS
 void *memcpy(void *dst, const void *src, size_t n);
 void *memmove(void *dst, const void *src, size_t n);
 void *memset(void *dst, int c, size_t n);
@@ -28,3 +30,4 @@ size_t strspn(const char *s, const char *accept);
 size_t strcspn(const char *s, const char *reject);
 char *strpbrk(const char *s, const char *accept);
 char *strerror(int e);
+NOCTURNE_END_DECLS

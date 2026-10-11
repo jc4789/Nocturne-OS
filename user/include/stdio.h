@@ -1,6 +1,8 @@
 #pragma once
 #include <stddef.h>
 #include <stdarg.h>
+#include <cdefs.h>
+NOCTURNE_BEGIN_DECLS
 #define EOF (-1)
 #define BUFSIZ 1024
 #define SEEK_SET 0
@@ -46,3 +48,4 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
 int sscanf(const char *s, const char *fmt, ...);
 void perror(const char *msg);
 int remove(const char *path);
+NOCTURNE_END_DECLS

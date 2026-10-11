@@ -15,7 +15,7 @@ usage: python scripts/test.py [--quick] [--full] [--no-net] [--timeout S] [group
   --quick   skip the slow tests (compile every app, tcc self-hosting)
   --full    also copy the TinyCC sources so tcc can rebuild itself inside the OS
   --no-net  skip the network tests (they need internet access from the host)
-  group     run only these groups: sh tools mem fs tcc gui audio media web tcp net agent
+  group     run only these groups: sh tools mem fs tcc cxx gui audio media web tcp net agent
 Exit status 0 when every test passed. Build first (build.ps1). Your own build/data.img is not
 touched: the tests use build/test-data.img.
 """

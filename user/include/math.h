@@ -1,4 +1,11 @@
 #pragma once
+#include <cdefs.h>
+NOCTURNE_BEGIN_DECLS
+#define FP_NAN 0
+#define FP_INFINITE 1
+#define FP_ZERO 2
+#define FP_SUBNORMAL 3
+#define FP_NORMAL 4
 #define M_PI 3.14159265358979323846
 #define M_E 2.7182818284590452354
 #define M_SQRT2 1.41421356237309504880
@@ -89,3 +96,4 @@ double log1p(double x);
 double acosh(double x);
 double asinh(double x);
 double atanh(double x);
+NOCTURNE_END_DECLS

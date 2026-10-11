@@ -343,6 +343,12 @@ Programs are linked statically against Nocturne's libc. They can use:
 
 tcc can also compile itself: its own source rebuilds inside the OS into a working compiler.
 
+## C++とCの併用
+
+ホストclangでNocturne向けのC++20アプリをクロスコンパイルできます。`user/apps/*.cpp`を追加し、`python -X utf8 scripts/build.py cxx`でビルドします。既存C APIをそのまま呼び出せます。OS内で`cppdemo`を起動すると、libc++の文字列・コンテナーとCのGUI APIを使う実例が動きます。
+
+初期構成は例外・RTTIなしで、標準ライブラリーの対応範囲には制限があります。ツールの場所、全媒体の生成、対応範囲と実行確認は[利用手順](docs/cpp-support.md)を参照してください。
+
 ## The AI agent
 
 ![agent](docs/agent.png)

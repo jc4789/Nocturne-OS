@@ -140,7 +140,9 @@ $(BUILD)/br/tls_roots.o: $(BUILD)/br/tls_roots.c
 	@$(CC) $(BRFLAGS) -c $< -o $@
 
 APPS     := $(notdir $(basename $(wildcard user/apps/*.c)))
-APP_BINS := $(addprefix $(BUILD)/root/bin/,$(APPS))
+CPP_APPS := $(notdir $(basename $(wildcard user/apps/*.cpp)))
+CPP_BINS := $(addprefix $(BUILD)/root/bin/,$(CPP_APPS))
+APP_BINS := $(addprefix $(BUILD)/root/bin/,$(APPS)) $(CPP_BINS)
 
 $(BUILD)/u/%.o: %.c
 	@mkdir -p $(dir $@)
@@ -174,6 +176,24 @@ $(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
 	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
+
+# C++ is an additional host cross-build path; C/TinyCC keep their own flags.
+CXX_HEADERS := $(shell find user/include -type f) common/abi.h common/gfx.h
+$(BUILD)/cxx/libc++.a: scripts/build_cxx.py $(CXX_HEADERS)
+	@$(PY) scripts/build_cxx.py library
+
+$(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT: $(BUILD)/cxx/libc++.a
+	@mkdir -p $(dir $@)
+	@cp $(BUILD)/cxx/LICENSE.libc++.txt $@
+
+$(BUILD)/u/%.cpp.o: %.cpp $(BUILD)/cxx/libc++.a $(CXX_HEADERS)
+	@echo "  CXX  $<"
+	@$(PY) scripts/build_cxx.py compile $< -o $@
+
+$(CPP_BINS): $(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.cpp.o $(BUILD)/u/user/libc/cxxabi.cpp.o $(BUILD)/cxx/libc++.a $(LIBC_RSP) $(BUILD)/u/user/libc/crt0.asm.o user/user.ld user/cxx.ld
+	@mkdir -p $(dir $@)
+	@echo "  LD++ $@"
+	@$(LD) $(patsubst user/user.ld,user/cxx.ld,$(ULDFLAGS)) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< $(BUILD)/u/user/libc/cxxabi.cpp.o $(BUILD)/cxx/libc++.a --start-lib @$(LIBC_RSP) --end-lib -o $@
 
 # ---------------------------------------------------------------- TinyCC (the in-OS C compiler)
 TCC_DIR   := third_party/tinycc
@@ -223,15 +243,16 @@ $(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(
 	@touch $@
 
 # ---------------------------------------------------------------- images
-.PHONY: all kernel user lexbor image run clean test test-quick test-full
+.PHONY: all kernel user cxx lexbor image run clean test test-quick test-full
 .SECONDARY:
 all: image
 
 kernel: $(BUILD)/kernel.elf
 user: $(APP_BINS) $(BUILD)/root/bin/tcc
+cxx: $(CPP_BINS) $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT
 lexbor: $(LXB_OBJ)
 
-$(BUILD)/initrd.tar: $(APP_BINS) $(BUILD)/root/bin/tcc $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
+$(BUILD)/initrd.tar: $(APP_BINS) $(BUILD)/root/bin/tcc $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
 	@echo "  TAR  $@"
 	@$(PY) scripts/mkinitrd.py $@ rootfs $(BUILD)/sounds $(BUILD)/root $(BUILD)/sysroot
 

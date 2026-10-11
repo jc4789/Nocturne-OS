@@ -1,6 +1,9 @@
 /* Nocturne shared 2D graphics library (used by kernel compositor and user apps). */
 #pragma once
 #include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef struct {
     uint32_t *px;
@@ -53,3 +56,6 @@ static inline uint32_t gfx_mix(uint32_t a, uint32_t b, int t /* 0..255 weight of
     uint32_t blue = ((a & 255) * inv + (b & 255) * w + 127) / 255;
     return 0xFF000000u | (r << 16) | (g << 8) | blue;
 }
+#ifdef __cplusplus
+}
+#endif
