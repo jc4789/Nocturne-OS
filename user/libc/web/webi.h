@@ -441,6 +441,8 @@ bool css_sheet_single_style(sheet_t *sheet, const char *source, size_t length);
 const char *css_ua_sheet(void);
 /* compute every element's style for the viewport */
 void css_cascade(web_doc *d, int vw, int vh);
+/* Retry failed font sources against the published style snapshot. */
+void css_refresh_font_selection(web_doc *d);
 bool css_containers_update(web_doc *d); /* supervisor, after layout; changed query inputs */
 bool css_container_names_valid(const char *s, size_t n);
 void css_mark_dirty(web_doc *d, node_t *n);
@@ -744,6 +746,7 @@ struct web_doc {
     int styled_w, styled_h; /* viewport the cascade ran for */
     bool need_style, need_boxes, layout_valid;
     bool style_full_dirty, style_pending_dirty;
+    bool font_selection_dirty; /* coalesced failed-font completion; no metrics changed yet */
     bool style_boxes_changed;
     float container_rem; /* immutable root font size of the layout snapshot */
     node_t *style_retired_first;

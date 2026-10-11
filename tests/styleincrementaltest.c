@@ -15,12 +15,14 @@ static void check(bool ok,const char *name) {
     checks++; if(!ok){failed++;printf("FAIL styleincremental %s\n",name);}
 }
 static bool checkpoint(void *context) { (void)context; return true; }
-static web_doc *load(void) {
-    const char *html="<!doctype html><html><head></head><body></body></html>";
+static web_doc *load_html(const char *html) {
     struct web_host host={.script_checkpoint=checkpoint};
     web_doc *d=web_live(html,strlen(html),"https://style.test/","utf-8",&host);
     if(d) { d->profile_enabled=true; parallel_profile_enable(true); for(int i=0;i<8;i++)web_tick(d,uptime_ms()); }
     return d;
+}
+static web_doc *load(void) {
+    return load_html("<!doctype html><html><head></head><body></body></html>");
 }
 static node_t *element(web_doc *d,const char *tag,node_t *parent,const char *classes) {
     node_t *n=doc_node_create(d,N_ELEM,tag,NULL,0);
@@ -418,8 +420,124 @@ static void container_queries(void) {
     check(child->box && near(child->box->w,100),"inline declaration alone enables container-unit measurement fastpath");
     web_free(d);
 }
+static void font_completion(void) {
+    web_doc *d=load_html("<!doctype html><html><head></head><body>"
+        "<svg width='40' height='20'><rect width='20' height='10'/></svg></body></html>");
+    check(d!=NULL,"font completion document");if(!d)return;
+    struct cssom_sheet *s=sheet(d,
+        "@font-face{font-family:Download;src:url(first.ttf),url(second.ttf),url(third.ttf)}"
+        ".download{font-family:Download,sans-serif;width:180px;display:flow-root}"
+        ".stable{width:240px;display:flow-root}.stable::before{content:'stable';display:block}");
+    check(s && cssom_adopt(d->root,&s,1)==CSSOM_OK,"font completion stylesheet");
+    node_t *use=element(d,"div",d->body,"download"),*stable=element(d,"div",d->body,"stable");
+    const char *text="WWW 日本語 WWW 日本語 WWW 日本語";
+    node_t *tn=doc_node_create(d,N_TEXT,NULL,text,strlen(text));doc_node_move(d,use,tn,NULL);
+    node_t *sn=doc_node_create(d,N_TEXT,NULL,"unchanged text",14);doc_node_move(d,stable,sn,NULL);
+    web_layout(d,800,600);
+    box_t *root=d->root_box,*used=use->box,*kept=stable->box;
+    check(root && used && kept && kept->layout_cache_valid,"font completion initial cache");
+    if(!root || !used || !kept){web_free(d);return;}
+    box_t *shaped=sn->box?sn->box->parent:NULL;
+    check(shaped && shaped->inline_ctx && shaped->nruns>0 && shaped->layout_mem.head,
+        "font completion has real cached inline shaping");
+    if(!shaped){web_free(d);return;}
+    struct achunk *arena=shaped->layout_mem.head;
+    struct run *runs=shaped->runs;
+    bool root_cache=root->layout_cache_valid,root_dirty=root->layout_dirty;
+    printf("font completion initial root cache=%d dirty=%d generation=%llu\n",
+        root_cache,root_dirty,(unsigned long long)root->cached_font_generation);
+    uint64_t generation=font_metrics_generation();
+    uint64_t visits=d->profile.style_visits;
+    struct web_font_resource *first=doc_font_resource(d,"https://style.test/first.ttf");
+    check(first && first->wanted && !first->done,"first src selected");
+    doc_font_loaded(d,first,NULL,0);
+    check(first && first->failed && first->done && !first->loading,"failed src settles resource");
+    /* Lazy bundled-font loading can leave the first root cache invalid. Failure
+       must preserve that committed state, not manufacture a valid cache. */
+    check(d->layout_valid && root->layout_cache_valid==root_cache && root->layout_dirty==root_dirty &&
+        kept->layout_cache_valid && !kept->layout_dirty,
+        "font failure preserves committed layout and box caches");
+    web_layout(d,800,600);
+    struct web_font_resource *second=doc_font_resource(d,"https://style.test/second.ttf");
+    check(second && second->wanted && !second->done,"font failure advances next authored src");
+    check(d->root_box==root && use->box==used && stable->box==kept && sn->box->parent==shaped &&
+        shaped->layout_mem.head==arena && shaped->runs==runs,
+        "failed font keeps SVG topology and unchanged inline shaping");
+    check(font_metrics_generation()==generation,"failed font does not advance metrics generation");
+    check(d->profile.style_visits==visits,"unchanged failed font does not recascade the tree");
+    const unsigned char malformed[]={0,1,2,3};
+    doc_node_attr(d,stable,"style","color:blue");
+    check(d->need_style && d->style_pending_dirty && !d->style_full_dirty,
+        "partial cascade queued alongside font completion");
+    doc_font_loaded(d,second,malformed,sizeof malformed);
+    web_layout(d,800,600);
+    struct web_font_resource *third=doc_font_resource(d,"https://style.test/third.ttf");
+    check(second && second->failed && third && third->wanted,"decode failure advances next src");
+    check(stable->style->color==0xff0000ffu,"font retry preserves concurrent style change");
+    check(d->root_box==root && stable->box==kept && sn->box->parent==shaped &&
+        shaped->layout_mem.head==arena && shaped->runs==runs,
+        "decode failure retains layout and shaping");
+    FILE *fp=fopen("/usr/share/fonts/Inter-Regular.ttf","rb");
+    long length=0;void *bytes=NULL;
+    if(fp && !fseek(fp,0,SEEK_END)) { length=ftell(fp);if(length>0 && !fseek(fp,0,SEEK_SET))bytes=malloc((size_t)length); }
+    bool read_ok=bytes && fread(bytes,1,(size_t)length,fp)==(size_t)length;
+    if(fp)fclose(fp);
+    check(read_ok,"real successful font payload");
+    if(read_ok) {
+        doc_font_loaded(d,third,bytes,(size_t)length);
+        check(third && third->face && !third->failed && !d->layout_valid && !kept->layout_cache_valid,
+            "successful font still invalidates metrics and layout");
+        web_layout(d,800,600);
+        check(use->style->named_font==third->face && font_has(third->face,0x65e5),
+            "successful next src is selected with bundled CJK fallback");
+        float height=use->box->h,width=use->box->w;
+        d->need_boxes=true;d->layout_valid=false;web_layout(d,800,600);
+        check(near(height,use->box->h) && near(width,use->box->w),"font swap geometry equals full reshape");
+        uint64_t revision=d->layout_revision;
+        doc_font_loaded(d,third,NULL,0);
+        check(!third->failed && third->face && d->layout_valid && d->layout_revision==revision,
+            "duplicate completion does not mutate loaded font or layout");
+    }
+    free(bytes);web_free(d);
+}
+
+static void font_flat_retry(void) {
+    web_doc *d=load();check(d!=NULL,"flat font document");if(!d)return;
+    struct cssom_sheet *outer=sheet(d,
+        "@font-face{font-family:LightRetry;src:url(light-first.ttf),url(light-next.ttf)}"
+        ".light{font-family:LightRetry}");
+    check(outer && cssom_adopt(d->root,&outer,1)==CSSOM_OK,"flat font document sheet");
+    node_t *host=element(d,"div",d->body,NULL);
+    node_t *shadow=doc_shadow_attach(d,host,false,false,false,false,false);
+    check(shadow!=NULL,"flat font shadow root");if(!shadow){web_free(d);return;}
+    struct cssom_sheet *inner=sheet(d,
+        "@font-face{font-family:ShadowRetry;src:url(shadow-first.ttf),url(shadow-next.ttf)}"
+        ".inside{font-family:ShadowRetry}");
+    check(inner && cssom_adopt(shadow,&inner,1)==CSSOM_OK,"flat font scoped sheet");
+    node_t *inside=element(d,"div",shadow,"inside");
+    node_t *slot=element(d,"slot",shadow,NULL);
+    element(d,"div",slot,"inside"); /* Inactive fallback content. */
+    node_t *assigned=element(d,"div",host,"light");
+    node_t *hidden=element(d,"div",host,"light");doc_node_attr(d,hidden,"slot","absent");
+    web_layout(d,800,600);
+    check(inside->style && assigned->style && assigned->assigned_slot==slot && !hidden->box,
+        "flat font styles cover shadow and assigned light nodes");
+    struct web_font_resource *light=doc_font_resource(d,"https://style.test/light-first.ttf");
+    struct web_font_resource *scoped=doc_font_resource(d,"https://style.test/shadow-first.ttf");
+    check(light && scoped && light->wanted && scoped->wanted,"both flat font sources requested");
+    box_t *root=d->root_box;uint64_t visits=d->profile.style_visits;
+    doc_font_loaded(d,light,NULL,0);doc_font_loaded(d,scoped,NULL,0);
+    web_layout(d,800,600);
+    light=doc_font_resource(d,"https://style.test/light-next.ttf");
+    scoped=doc_font_resource(d,"https://style.test/shadow-next.ttf");
+    check(light && scoped && light->wanted && scoped->wanted,"flat font failures advance both scoped sources");
+    check(d->root_box==root && d->profile.style_visits==visits && !d->font_selection_dirty && !d->need_style,
+        "flat font retry settles without rebuilding or recascading");
+    web_free(d);
+}
+
 int main(void) {
-    incremental();scopes();derived_styles();percentage_padding_cache();parallel_form_selectors();cssom_container_roundtrip();container_queries();
+    incremental();scopes();derived_styles();percentage_padding_cache();parallel_form_selectors();cssom_container_roundtrip();container_queries();font_completion();font_flat_retry();
     printf("styleincremental: %d checks, %d failures\n",checks,failed);
     return failed?1:0;
 }

@@ -38,7 +38,7 @@ struct font {
     float unit_scale;              /* pixels per font unit at 1 px/em */
     int16_t *adv;                  /* advance width per glyph in font units, INT16_MIN = not looked up */
     uint16_t lo_glyph[0x250];      /* glyph index for code points below 0x250, 0xFFFF = not looked up */
-    uint8_t fallback;             /* font_open は単一 face、同梱 family だけを拡張する */
+    uint8_t fallback;             /* font_open は単一 face、family/Web face は欠字を補完する */
     bool merged_metrics;         /* 統合版の巨大な全字形 hhea を通常本文の行箱に使わない */
     bool web_face;               /* validated TTF; explicit-stack composite renderer */
 };
@@ -58,6 +58,10 @@ static font_t *font_adopt(unsigned char *data, bool web_face) {
     f->data = data;
     f->id = next_font_id++;
     f->web_face = web_face;
+    /* A downloaded face supplies only its own glyphs. Missing characters use
+     * the same bundled selection in measurement and paint; the owned web bytes
+     * and primary metrics remain unchanged. Explicit font_open stays single-face. */
+    if (web_face) f->fallback = FALLBACK_SANS;
     stbtt_GetFontVMetrics(&f->info, &f->ascent, &f->descent, &f->line_gap);
     f->unit_scale = stbtt_ScaleForMappingEmToPixels(&f->info, 1.0f);
     f->adv = malloc(sizeof(int16_t) * (size_t)(f->info.numGlyphs > 0 ? f->info.numGlyphs : 1));
@@ -228,11 +232,19 @@ static bool cjk_codepoint(uint32_t cp) {
            (cp >= 0x1aff0 && cp <= 0x1b2ff) || (cp >= 0x20000 && cp <= 0x3ffff);
 }
 
+static bool private_codepoint(uint32_t cp) {
+    return (cp >= 0xe000 && cp <= 0xf8ff) || (cp >= 0xf0000 && cp <= 0xffffd) ||
+           (cp >= 0x100000 && cp <= 0x10fffd);
+}
+
 /* 収録判定・測定・描画は必ず同じ実 face を選ぶ。候補は有限で、必要時だけ
    読み込み、候補の glyph_face へ再帰しない。既存 UI/CN の優先順は維持する。 */
 static font_t *glyph_face_uncached(font_t *f, uint32_t cp, int *glyph) {
     *glyph = glyph_of(f, cp);
-    if (!*glyph && f->fallback != FALLBACK_NONE && cp > ' ') {
+    /* CSS Fonts character handling forbids installed/generic fallback for PUA:
+     * a web icon's private mapping must not become an unrelated bundled symbol. */
+    if (!*glyph && f->fallback != FALLBACK_NONE && cp > ' ' &&
+        !(f->web_face && private_codepoint(cp))) {
         font_t *face;
         bool cjk_first = f->fallback == FALLBACK_UI || cjk_codepoint(cp);
         if (cjk_first) {

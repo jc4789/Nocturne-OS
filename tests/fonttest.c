@@ -1,5 +1,6 @@
 /* Native rasterizer/measurement regressions. Not a substitute for real-site tests. */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include "font.h"
@@ -22,6 +23,19 @@ static uint32_t raster(font_t *f, const char *text, float px) {
     }
     check(ink > 0, "visible glyph pixels");
     return hash;
+}
+static font_t *memory_face(const char *path) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return NULL;
+    if (fseek(file, 0, SEEK_END)) { fclose(file); return NULL; }
+    long length = ftell(file);
+    if (length <= 0 || fseek(file, 0, SEEK_SET)) { fclose(file); return NULL; }
+    void *bytes = malloc((size_t)length);
+    font_t *face = NULL;
+    if (bytes && fread(bytes, 1, (size_t)length, file) == (size_t)length)
+        face = font_open_memory(bytes, (size_t)length);
+    free(bytes); fclose(file);
+    return face;
 }
 int main(void) {
     gfx_init(&canvas, pixels, 640, 96, 640);
@@ -90,6 +104,32 @@ int main(void) {
     }
     check(family_hash[0] != family_hash[1] && family_hash[0] != family_hash[2] && family_hash[1] != family_hash[2], "generic families have distinct rasters");
     check(font_family(FONT_FAMILY_MONO,FONT_REGULAR) == font_ui(FONT_REGULAR), "mono preserves UI face identity");
+    font_t *latin = font_open("/usr/share/fonts/Inter-Regular.ttf");
+    font_t *web = memory_face("/usr/share/fonts/Inter-Regular.ttf");
+    check(latin && web, "validated Latin-only web face opens from bytes");
+    if (latin && web) {
+        check(!font_has(latin,0x65e5) && font_has(web,0x65e5) && font_has(web,0x20bb7),
+              "web missing BMP and supplementary CJK use bundled glyphs");
+        check(fabsf(font_advance(web,24,'W')-font_advance(latin,24,'W')) < .001f &&
+              raster(web,"Latin Wi",24) == raster(latin,"Latin Wi",24), "web Latin metrics and raster are unchanged");
+        if (cjk[0]) {
+            check(fabsf(font_advance(web,24,0x65e5)-font_advance(cjk[0],24,0x65e5)) < .001f &&
+                  raster(web,"日本語",24) == raster(cjk[0],"日本語",24), "web CJK advance and raster use actual bundled CFF face");
+        }
+        float sum = 0; const char *p = mixed;
+        while (*p) { uint32_t cp; p += gfx_utf8_decode(p,&cp); sum += font_advance(web,24,cp); }
+        check(fabsf(sum-font_width(web,24,mixed,strlen(mixed))) < .01f, "web mixed advance and width agree");
+        raster(web,mixed,24);
+        check(!font_has(web,0x10ffff), "web absent glyph stays absent after fallback");
+        check(font_has(raw,0xf17c) && !font_has(latin,0xf17c) && !font_has(web,0xf17c),
+              "web private-use icon does not borrow an unrelated bundled glyph");
+        uint32_t bundled = raster(font_family(FONT_FAMILY_SANS,FONT_REGULAR),"日本語",24);
+        font_close(web); web = NULL;
+        check(raster(font_family(FONT_FAMILY_SANS,FONT_REGULAR),"日本語",24) == bundled,
+              "closing owned web face preserves borrowed bundled fallback");
+    }
+    font_close(web);
+    font_close(latin);
     uint32_t before[640 * 4];
     memset(pixels,0x5a,sizeof pixels); memcpy(before,pixels,sizeof before);
     gfx_clip(&canvas,10,10,70,40);

@@ -2461,6 +2461,57 @@ static struct font_face *scoped_font_face(web_doc *d,node_t *root,const char *fa
     return best;
 }
 
+/* Use the same flat tree as the cascade: shadow children and assigned nodes,
+   but not unassigned light children or inactive slot fallback content. Unlike
+   owned_nodes this also visits nodes adopted from another allocation arena. */
+static node_t *font_selection_next(node_t *n,node_t *root) {
+    node_t *child=container_first(n);
+    if(child)return child;
+    while(n && n!=root && !container_next(n))n=doc_flat_parent(n);
+    return n && n!=root?container_next(n):NULL;
+}
+
+void css_refresh_font_selection(web_doc *d) {
+    if(!d || d->need_style)return; /* A queued cascade already retries sources. */
+    if(!d->sty.ctx || d->sty.index_dirty || d->resources_dirty ||
+       d->style_full_dirty || d->style_pending_dirty || !d->root ||
+       d->sty.index_w!=d->styled_w || d->sty.index_h!=d->styled_h ||
+       d->sty.index_scripting!=web_js_enabled(d) || d->sty.index_quirks!=d->quirks) {
+        css_mark_dirty(d,NULL);
+        return;
+    }
+    /* Keep mutable arena state on the heap: it remains defined after longjmp.
+       Family tokens are scratch only; selected faces/resources are doc-owned. */
+    arena_t *scratch=calloc(1,sizeof *scratch);
+    if(!scratch){css_mark_dirty(d,NULL);return;}
+    jmp_buf trap;scratch->trap=&trap;scratch->chunk_size=4096;
+    if(setjmp(trap)) {
+        ar_free(scratch);free(scratch);css_mark_dirty(d,NULL);return;
+    }
+    for(node_t *n=d->root;n;n=font_selection_next(n,d->root)) {
+        if(!web_native_checkpoint(d))break;
+        if(n->type!=N_ELEM || n->owner!=d || !n->style)continue;
+        style_t *s=n->style,*base=n->animation_base_style;
+        style_t *styles[]={s,s->before,s->after,s->backdrop,base,
+            base?base->before:NULL,base?base->after:NULL,base?base->backdrop:NULL};
+        bool changed=false;
+        for(size_t i=0;i<sizeof styles/sizeof *styles;i++)if(styles[i]) {
+            font_t *face=select_web_font_uncached(d,n,styles[i],d->styled_w,d->styled_h,scratch);
+            if(face!=styles[i]->named_font)changed=true;
+        }
+        /* NULL -> NULL still marks the next source wanted, without recascading
+           unchanged SVG snapshots or reshaping existing inline formatting. */
+        if(changed) {
+            css_mark_dirty(d,n);
+            /* A partial cascade resets wanted flags, including font users
+               outside its dirty subtree. Retry their sources after publication. */
+            d->font_selection_dirty=true;
+        }
+        ar_free(scratch);
+    }
+    ar_free(scratch);free(scratch);
+}
+
 static void css_ctx_free(struct css_ctx *x) {
     if (!x) return;
     for (struct css_scope *s = x->scopes; s; s = s->next)

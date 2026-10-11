@@ -1120,10 +1120,15 @@ void doc_font_loaded(web_doc *d,struct web_font_resource *f,const void *bytes,si
     if(!d || !f || f->done)return;
     f->face=bytes && length?font_open_memory(bytes,length):NULL;
     f->loading=false;f->done=true;f->failed=!f->face;
-    /* Both real decode success and failure must recascade: success changes
-       metrics/paint; failure makes the following authored src eligible. */
-    d->need_style=d->dirty=true;d->layout_valid=false;d->paint_dirty=true;
-    invalidate_layout_tree(d->root_box);
+    d->dirty=true;
+    if(f->face) {
+        d->need_style=true;d->layout_valid=false;d->paint_dirty=true;
+        invalidate_layout_tree(d->root_box);
+    } else {
+        /* Advance failed src candidates together at the next layout boundary.
+           A failure alone introduces no new metrics or changed glyphs. */
+        d->font_selection_dirty=true;
+    }
 }
 
 void web_free(web_doc *d) {
@@ -1341,6 +1346,11 @@ int web_layout(web_doc *d, int width, int height) {
     web_dialog_sync(d);
     if (d->resources_dirty || d->images_dirty) doc_rescan(d);
     if (d->native_cancelled) goto cancelled;
+    if(d->font_selection_dirty && !d->need_style) {
+        d->font_selection_dirty=false;
+        css_refresh_font_selection(d);
+        if(d->native_cancelled)goto cancelled;
+    }
     /* Geometry reads may flush layout repeatedly within one script. Reuse the
        result until DOM/style, viewport, or image intrinsic dimensions change. */
     if (d->layout_valid && !d->need_style && !d->need_boxes && d->root_box &&
@@ -1382,6 +1392,14 @@ reflow:
         d->bmem.trap=NULL;
         if (d->native_cancelled) goto cancelled;
         d->need_boxes=false;
+    }
+    /* A partial cascade clears resource wanted bits too. Re-select unchanged
+       font users after publication so their next failed-src candidate survives. */
+    if(d->font_selection_dirty) {
+        d->font_selection_dirty=false;
+        css_refresh_font_selection(d);
+        if(d->native_cancelled)goto cancelled;
+        if(d->need_style)goto reflow;
     }
     d->width = width;
     d->height = height;

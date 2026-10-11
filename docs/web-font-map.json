@@ -1,0 +1,22 @@
+{
+  "summary": "J-space medium。Webフォント欠字の同梱補完と、読み込み失敗時の不要な全レイアウト無効化を修理する。主担当が統合・媒体・実画面、担当が字形補完を受け持つ。",
+  "areas": [
+    {"path": "user/libc/font.c", "purpose": "Web faceと同梱フォントの字形選択、計測・描画共通キャッシュ"},
+    {"path": "user/libc/web/doc.c", "purpose": "フォント成功/失敗の資源状態とレイアウト無効化"},
+    {"path": "user/libc/web/css.c", "purpose": "失敗srcの次候補選択とnamed_font差分"},
+    {"path": "user/libc/web/box.c", "purpose": "実際のスタイル差分だけをレイアウトへ伝える"},
+    {"path": "tests/fonttest.c", "purpose": "実字形・計測・描画・寿命の回帰検査"},
+    {"path": "tests/styleincrementaltest.c", "purpose": "失敗後のレイアウトキャッシュと次src進行の検査"}
+  ],
+  "contracts": [
+    "既存font_openの単一face、同梱フォント群、C/C++変更を保全する。",
+    "失敗でも次src候補へ進める。失敗だけで全boxをdirtyにしない。成功した字形切替は引き続き再計測する。",
+    "計測と描画は同じglyph_faceを使う。Web faceのPUAにはinstalled fallbackを使わない。",
+    "実サイトのDOM/CSSを差し替えず、隔離QEMUで主担当が表示と実スクロールを見る。"
+  ],
+  "specs": ["https://drafts.csswg.org/css-fonts-4/#font-matching-algorithm", "https://drafts.csswg.org/css-fonts-4/#char-handling-issues"],
+  "baseline": "git cleanから開始。最大化した実QEMUでTofuguと日本語MDNの本文を目視。両サイトでWebフォント復号失敗ログがある。今回は新しいフォント形式対応ではない。",
+  "results": ["web/fonts 267項目成功。最終styleincremental 115項目とcsscache 23項目成功。最初のroot cache前提の失敗と訂正理由をdocs/web-font-fix.mdへ保存。", "最大化した最新QEMUのTofugu・日本語MDNで実hover/クリックと本文899→1798→899→0の上下スクロールを確認。主担当が下と先頭の画像を目視。", "IMG/VHD/VHDX/ISO生成完了。最終VMのkernel/initrdと正規buildの一致、initrd中のbrowser/helper/cppdemoの一致を照合。"],
+  "unknowns": ["全authored family stack/cluster shapingと新しいWebフォント形式の復号は今回の範囲外。", "web/javascriptは以前から同じ19失敗。MDN実例のHTMLPreElement例外・Tofugu埋込媒体の既存問題は未解決。Hyper-V実機は未確認。"],
+  "status": "実装・対象経路の確認完了。既存失敗は区別して記録。"
+}
