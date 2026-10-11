@@ -12,7 +12,6 @@
 #define VW 800
 #define VH 600
 #define SLOTS 32
-#define MARKS 512 /* The combined API cases emit more than 192 assertion markers. */
 #define PRELUDE "function check(n,v){console.log((v?'OK ':'FAIL ')+n);}" \
                 "function mark(n){console.log('OK '+n);}"
 #define START "<!doctype html><html><head><script>" PRELUDE "</script>"
@@ -56,8 +55,10 @@ struct fixture {
     web_doc *doc;
     webnet *net;
     struct queued queue[SLOTS];
-    char marks[MARKS][96];
-    int nmarks, js_failures, errors, requests, cancellations, completions, sync_loads;
+    char **marks;
+    size_t nmarks, mark_capacity;
+    bool mark_allocation_failed;
+    int js_failures, errors, requests, cancellations, completions, sync_loads;
     int fetch_requests;
     int policy_report_requests, policy_report_completed, policy_report_bad;
     int outside_running, navigations;
@@ -92,8 +93,32 @@ static const struct asset *lookup(const char *url) {
     return NULL;
 }
 static bool has_mark(const struct fixture *f, const char *name) {
-    for (int i = 0; i < f->nmarks; i++) if (!strcmp(f->marks[i], name)) return true;
+    for (size_t i = 0; i < f->nmarks; i++) if (!strcmp(f->marks[i], name)) return true;
     return false;
+}
+static void free_marks(struct fixture *f) {
+    for(size_t i=0;i<f->nmarks;i++)free(f->marks[i]);
+    free(f->marks);f->marks=NULL;f->nmarks=f->mark_capacity=0;
+    f->mark_allocation_failed=false;
+}
+static void mark_allocation_failure(struct fixture *f,const char *reason) {
+    if(f->mark_allocation_failed)return;
+    f->mark_allocation_failed=true;f->js_failures++;
+    test_check(reason,false);
+}
+static void save_mark(struct fixture *f,const char *name) {
+    if(f->mark_allocation_failed)return;
+    if(f->nmarks==f->mark_capacity){
+        if(f->mark_capacity>SIZE_MAX/2){mark_allocation_failure(f,"fixture-marker-capacity-overflow");return;}
+        size_t capacity=f->mark_capacity?f->mark_capacity*2:32;
+        if(capacity>SIZE_MAX/sizeof *f->marks){mark_allocation_failure(f,"fixture-marker-size-overflow");return;}
+        char **marks=realloc(f->marks,capacity*sizeof *marks);
+        if(!marks){mark_allocation_failure(f,"fixture-marker-allocation");return;}
+        f->marks=marks;f->mark_capacity=capacity;
+    }
+    char *copy=strdup(name);
+    if(!copy){mark_allocation_failure(f,"fixture-marker-name-allocation");return;}
+    f->marks[f->nmarks++]=copy;
 }
 static int queued_count(const struct fixture *f) {
     int count = 0;
@@ -103,7 +128,7 @@ static int queued_count(const struct fixture *f) {
 static void receive_log(void *opaque, int level, const char *message) {
     struct fixture *f = opaque;
     if (!strncmp(message, "OK ", 3)) {
-        if (f->nmarks < MARKS) snprintf(f->marks[f->nmarks++], sizeof f->marks[0], "%s", message + 3);
+        save_mark(f,message+3);
     } else if (!strncmp(message, "FAIL ", 5)) {
         printf("%s\n", message); fflush(stdout); f->js_failures++; failed++; total++;
     } else if (!strncmp(message, "NATIVE-SELECTION ", 17) || !strncmp(message, "XHR checks ", 11) || !strncmp(message, "Document checks ", 16) || !strncmp(message, "Document limit mode ", 20) || !strncmp(message, "Lexbor ", 7) || strstr(message, " API checks ")) {
@@ -299,7 +324,7 @@ static void deliver(struct fixture *f) {
             (strcmp(q.method, "POST") || strcmp(q.body, "Nocturne request body") || q.body_len != 21 || !strstr(q.headers, "x-fixture: yes"))) {
             snprintf(r.error, sizeof r.error, "Invalid POST request in the fixture");
         }
-        int marks = f->nmarks;
+        size_t marks = f->nmarks;
         if (web_script_running(f->doc)) f->outside_running++;
         web_resource_loaded(f->doc, q.id, &r);
         if (f->nmarks != marks || web_script_running(f->doc)) f->outside_running++;
@@ -309,7 +334,9 @@ static void deliver(struct fixture *f) {
         web_response_free(&r); f->completions++;
     }
 }
+static void close_case(void);
 static web_doc *open_case_url_budget(const char *html, bool expected_errors, const char *url, uint32_t task_budget_ms) {
+    close_case();free_marks(&fixture);
     memset(&fixture, 0, sizeof fixture); fixture.expected_errors = expected_errors;
     if(case_real_network)fixture.net=webnet_create();
     struct web_host host = {.opaque=&fixture, .request=request, .cancel=cancel, .sync_load=sync_load,
@@ -351,6 +378,7 @@ static bool pump(const char *marker, unsigned timeout_ms) {
     uint64_t end = uptime_ms() + timeout_ms;
     while (uptime_ms() < end) {
         step(&fixture);
+        if(fixture.mark_allocation_failed)return false;
         if (marker && has_mark(&fixture, marker)) return true;
         if (!marker && !queued_count(&fixture) && web_deadline(fixture.doc) < 0) return true;
         msleep(1);
@@ -365,6 +393,8 @@ static void close_case(void) {
     if(fixture.net){webnet_free(fixture.net);fixture.net=NULL;}
     for (int i = 0; i < fixture.history_length; i++) { free(fixture.history[i].url); free(fixture.history[i].data); }
     fixture.history_length = 0;
+    /* Some callers inspect assertion marks after closing the document. Keep
+       them until the next fixture reset or final process cleanup. */
 }
 static char *script_page(const char *source) {
     const char *a = START "</head><body style='margin:0'><div id=target style='height:20px'></div><div id=sentinel></div><script>";
@@ -563,6 +593,7 @@ static void test_platform(void) {
     external_case("js_shadow_cases.js", ";runShadowCases().then(n=>{console.log('Shadow API checks '+n);check('shadow-count',n>120);mark('api-done');},e=>{console.log('FAIL shadow '+e+' '+e.stack);mark('api-done');});", BASE);
     external_case("js_web_legacy_cases.js", ";Promise.resolve().then(()=>runWebLegacyCases()).then(n=>{console.log('Web legacy API checks '+n);check('web-legacy-count',n>30);mark('api-done');},e=>{console.log('FAIL web-legacy '+e+' '+e.stack);mark('api-done');});", BASE);
     external_case("js_html_elements_cases.js", ";runHTMLElementCases().then(n=>{console.log('HTML element API checks '+n);check('html-elements-count',n>100);mark('api-done');},e=>{console.log('FAIL html-elements '+e+' '+e.stack);mark('api-done');});", BASE);
+    external_case("js_html_interface_cases.js", ";try{const n=runHTMLInterfaceCases();console.log('HTML interface API checks '+n);check('html-interfaces-count',n>500);}catch(e){console.log('FAIL html-interfaces '+e+' '+e.stack);}mark('api-done');", BASE);
     external_case("js_form_controls_cases.js", ";Promise.resolve().then(()=>runFormControlCases()).then(n=>{console.log('Form control API checks '+n);check('form-controls-count',n>250);mark('api-done');},e=>{console.log('FAIL form-controls '+e+' '+e.stack);mark('api-done');});", BASE);
     external_case("js_form_validation_cases.js", ";Promise.resolve().then(()=>runFormValidationCases()).then(n=>{console.log('Form validation API checks '+n);check('form-validation-count',n>150);mark('api-done');},e=>{console.log('FAIL form-validation '+e+' '+e.stack);mark('api-done');});", BASE);
     external_case("js_semantic_elements_cases.js", ";Promise.resolve().then(()=>runSemanticElementCases()).then(n=>{console.log('Semantic element API checks '+n);check('semantic-elements-count',n>200);mark('api-done');},e=>{console.log('FAIL semantic-elements '+e+' '+e.stack);mark('api-done');});", BASE);
@@ -712,7 +743,7 @@ static void test_dom_and_scripts(void) {
         "target.classList.remove('two');check('dom-class-cache',!target.matches('.two'));"
         "target.setAttribute('DATA-VALUE','yes');check('dom-attribute-case',target.getAttribute('data-value')==='yes'&&target.getAttribute('DATA-VALUE')==='yes');"
         "const child=document.createElement('span');child.textContent='native text';target.appendChild(child);child.remove();"
-        "check('dom-created-interface',Object.getPrototypeOf(child)===HTMLElement.prototype&&child instanceof Node);"
+        "check('dom-created-interface',Object.getPrototypeOf(child)===HTMLSpanElement.prototype&&child instanceof HTMLSpanElement&&child instanceof HTMLElement&&child instanceof Node);"
         "check('dom-detached',!child.isConnected&&child.textContent==='native text');target.appendChild(child);"
         "check('dom-reattach',target.firstChild===child&&child.parentNode===target);"
         "const fragment=document.createDocumentFragment();fragment.append('a',document.createElement('strong'));fragment.lastChild.textContent='b';target.appendChild(fragment);"
@@ -722,7 +753,7 @@ static void test_dom_and_scripts(void) {
         "check('dom-character-interfaces',Object.getPrototypeOf(textNode)===Text.prototype&&textNode instanceof CharacterData&&textNode instanceof Node&&commentNode instanceof Comment&&commentNode instanceof CharacterData&&textNode.className===undefined&&textNode.getAttribute===undefined);"
         "const foreign=document.createElementNS('http://www.w3.org/2000/svg','svg'),foreignGroup=document.createElementNS('http://www.w3.org/2000/svg','g');check('dom-foreign-interface',foreign instanceof SVGSVGElement&&foreign instanceof SVGElement&&foreign instanceof Element&&foreign instanceof Node&&!(foreign instanceof HTMLElement)&&Object.getPrototypeOf(foreign)===SVGSVGElement.prototype&&foreignGroup instanceof SVGElement&&foreignGroup instanceof Element&&!(foreignGroup instanceof SVGSVGElement)&&!(foreignGroup instanceof HTMLElement)&&Object.getPrototypeOf(foreignGroup)===SVGElement.prototype);"
         "const clone=child.cloneNode(true);check('dom-clone',clone!==child&&clone.textContent===child.textContent);"
-        "check('dom-clone-interface',Object.getPrototypeOf(clone)===HTMLElement.prototype&&clone.firstChild instanceof Text);"
+        "check('dom-clone-interface',Object.getPrototypeOf(clone)===HTMLSpanElement.prototype&&clone instanceof HTMLSpanElement&&clone instanceof HTMLElement&&clone.firstChild instanceof Text);"
         "const inert=document.createElement('div');globalThis.inertRan=false;inert.innerHTML='<span class=inner>parsed</span><script>inertRan=true;<\\/script>';target.appendChild(inert);"
         "check('inner-html-inert',!inertRan&&inert.querySelector('.inner').textContent==='parsed');"
         "const live=document.createElement('script');live.text='globalThis.inlineDynamicRan=true;';document.body.appendChild(live);"
@@ -1226,6 +1257,10 @@ int main(int argc, char **argv) {
     RUN("network-stream", test_network_stream);
     RUN("platform", test_platform);
     /* An API-only selector avoids repeating the full platform batch. */
+    if (argc > 1 && !strcmp(argv[1], "html-interfaces")) {
+        printf("jstest: html-interfaces\n"); fflush(stdout);
+        external_case("js_html_interface_cases.js", ";try{const n=runHTMLInterfaceCases();console.log('HTML interface API checks '+n);check('html-interfaces-count',n>500);}catch(e){console.log('FAIL html-interfaces '+e+' '+e.stack);}mark('api-done');", BASE);
+    }
     if (argc > 1 && !strcmp(argv[1], "fetch-api")) { printf("jstest: fetch-api\n"); fflush(stdout); test_fetch_api(); }
     if (argc > 1 && !strcmp(argv[1], "dom-api")) {
         printf("jstest: dom-api\n"); fflush(stdout);
@@ -1265,6 +1300,7 @@ int main(int argc, char **argv) {
     RUN("lifetime", test_lifetime);
 #undef RUN
     test_check("at-least-one-case", total != 0);
+    close_case();free_marks(&fixture);
     printf("jstest: %d checks, %d failed (%lu ms)\n", total, failed, (unsigned long)(uptime_ms()-start));
     return failed != 0;
 }

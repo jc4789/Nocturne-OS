@@ -45,6 +45,23 @@ const observerBridge=(()=>{
     }
     for(const [C,name] of [[DOMRectReadOnly,'DOMRectReadOnly'],[DOMRect,'DOMRect']])
         rectDefine(C.prototype,Symbol.toStringTag,{configurable:true,value:name});
+    const rectListSlots=new WeakMap();
+    function rectListRecord(value){const r=rectApply(rectGet,rectListSlots,[value]);if(!r)throw new rectTypeError('Illegal DOMRectList receiver');return r;}
+    class DOMRectList {
+        constructor(){throw new rectTypeError('Illegal DOMRectList constructor');}
+        get length(){return rectListRecord(this).length;}
+        item(index){const values=rectListRecord(this);if(!arguments.length)throw new rectTypeError('DOMRectList item requires an index');return values[index>>>0]||null;}
+    }
+    rectDefine(DOMRectList.prototype,Symbol.toStringTag,{value:'DOMRectList',configurable:true});
+    rectDefine(DOMRectList.prototype,Symbol.iterator,{value:Array.prototype.values,writable:true,configurable:true});
+    for(const name of ['length','item'])rectDefine(DOMRectList.prototype,name,{enumerable:true});
+    rectDefine(globalThis,'DOMRectList',{value:DOMRectList,writable:true,configurable:true});
+    function clientRects(values){
+        const rects=[];
+        for(let i=0;i<values.length;i++)rects.push(new DOMRect(...values[i]));
+        const list=collectionBridge.typed(()=>rects,DOMRectList.prototype);
+        rectApply(rectSet,rectListSlots,[list,rects]);return list;
+    }
     const rect=a=>new DOMRectReadOnly(...a);
     function readonly(object,values){for(const key of Object.keys(values))Object.defineProperty(object,key,{enumerable:true,value:values[key]});return object;}
     function slot(map,value){const s=map.get(value);if(!s)throw new TypeError('Illegal observer receiver');return s;}
@@ -151,7 +168,7 @@ const observerBridge=(()=>{
         }
     }
     Object.assign(globalThis,{DOMRectReadOnly,DOMRect,SVGRect:DOMRect,ResizeObserver,ResizeObserverEntry,ResizeObserverSize,IntersectionObserver,IntersectionObserverEntry});
-    return {createSVGRect(){return new DOMRect();},
+    return {clientRects,clientBoundingRect(value){return new DOMRect(value.x,value.y,value.width,value.height);},createSVGRect(){return new DOMRect();},
         createLiveSVGRect(read,write){
             const rect=write?new DOMRect():new DOMRectReadOnly(),values=[0,0,0,0];
             for(let i=0;i<4;i++)rectDefine(values,i,{get(){return read()[i];},

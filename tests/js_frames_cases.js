@@ -25,6 +25,30 @@ async function runFrameCases(){
         equal(window.childValue,41);child.close();
     });
     equal(child._loaded,1);equal(child._parserOpenIgnored,true);equal(child._ceOpen,'InvalidStateError');equal(document.getElementById('inside'),null);
+    const oldBody=child.body;
+    oldBody.setAttribute('onload','document._retainedBodyLoad=(document._retainedBodyLoad||0)+1');
+    const oldNode=child.createElement('span');oldNode.textContent='retained';child.body.appendChild(oldNode);
+    const oldHost=child.createElement('div'),oldShadow=oldHost.attachShadow({mode:'closed'}),oldShadowNode=child.createElement('span');
+    oldShadow.appendChild(oldShadowNode);child.body.appendChild(oldHost);
+    let oldEvents=0;oldNode.addEventListener('probe',()=>oldEvents++);oldShadowNode.addEventListener('probe',()=>oldEvents++);
+    oldNode.setAttribute('onclick','document._oldInline=1');oldNode.onclick=()=>oldEvents++;
+    let windowLoad=0;window.addEventListener('load',()=>windowLoad++);
+    await loaded(frame,()=>{
+        child.open();equal(window.onload,null);equal(oldBody.onload,null);
+        child.write('<body style="margin:0;background:#123456" onload="document._overriddenBodyLoad=(document._overriddenBodyLoad||0)+1">written again');
+        equal(typeof child.body.onload,'function');equal(child.body.onload,window.onload);
+        child.write('<scr'+'ipt>window.onload=function(){document._scriptWindowLoad=(document._scriptWindowLoad||0)+1;};</scr'+'ipt>');
+        child.close();
+    });
+    equal(windowLoad,0);equal(frame.contentDocument,child);equal(oldNode.onclick,null);
+    equal(child._scriptWindowLoad,1);equal(child._overriddenBodyLoad,undefined);equal(child._retainedBodyLoad,undefined);
+    equal(oldBody.getAttribute('onload'),'document._retainedBodyLoad=(document._retainedBodyLoad||0)+1');
+    equal(oldBody.onload,window.onload);window.onload=null;equal(oldBody.onload,null);
+    window.dispatchEvent(new window.Event('load'));
+    equal(child._scriptWindowLoad,1);equal(child._overriddenBodyLoad,undefined);equal(child._retainedBodyLoad,undefined);
+    console.log('OK frame-body-window-load-order');
+    oldNode.dispatchEvent(new window.Event('probe'));oldShadowNode.dispatchEvent(new window.Event('probe'));oldNode.dispatchEvent(new window.Event('click'));
+    equal(oldEvents,0);equal(child._oldInline,undefined);equal(oldNode.getAttribute('onclick'),'document._oldInline=1');
     let cancelledIdle=0;
     const cancelledHandle=window.requestIdleCallback(()=>cancelledIdle++,{timeout:1});equal(typeof cancelledHandle,'number');
     window.cancelIdleCallback(cancelledHandle);
@@ -62,16 +86,6 @@ async function runFrameCases(){
     }finally{window.setTimeout=heldTimer;window.requestIdleCallback=heldIdle;}
     equal(window.setTimeout,heldTimer);equal(window.requestIdleCallback,heldIdle);
     console.log('OK frame-window-method-overrides');
-    const oldNode=child.createElement('span');oldNode.textContent='retained';child.body.appendChild(oldNode);
-    const oldHost=child.createElement('div'),oldShadow=oldHost.attachShadow({mode:'closed'}),oldShadowNode=child.createElement('span');
-    oldShadow.appendChild(oldShadowNode);child.body.appendChild(oldHost);
-    let oldEvents=0;oldNode.addEventListener('probe',()=>oldEvents++);oldShadowNode.addEventListener('probe',()=>oldEvents++);
-    oldNode.setAttribute('onclick','document._oldInline=1');oldNode.onclick=()=>oldEvents++;
-    let windowLoad=0;window.addEventListener('load',()=>windowLoad++);
-    await loaded(frame,()=>{child.open();child.write('<body style="margin:0;background:#123456">written again');child.close();});
-    equal(windowLoad,0);equal(frame.contentDocument,child);equal(oldNode.onclick,null);
-    oldNode.dispatchEvent(new window.Event('probe'));oldShadowNode.dispatchEvent(new window.Event('probe'));oldNode.dispatchEvent(new window.Event('click'));
-    equal(oldEvents,0);equal(child._oldInline,undefined);equal(oldNode.getAttribute('onclick'),'document._oldInline=1');
     const channelName='frame-realms',parentChannel=new BroadcastChannel(channelName),childChannel=new window.BroadcastChannel(channelName);
     let crossMessages=0;parentChannel.onmessage=()=>crossMessages++;
     await new Promise((resolve,reject)=>{

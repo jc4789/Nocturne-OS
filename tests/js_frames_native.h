@@ -37,6 +37,7 @@ static void frame_test_deliver(void){
     }
 }
 static void test_frame_ui(void){
+    free_marks(&fixture);
     memset(&fixture,0,sizeof fixture);
     struct web_host host={.opaque=&fixture,.request=frame_test_request,.cancel=cancel,.console=receive_log,.scroll=scroll_position,.navigate=navigate};
     const char *page="<!doctype html><html><head></head><frameset cols='25%,*'><frame name='red' src='/frame-red.html'><frame name='green' src='/frame-green.html'></frameset></html>";
@@ -79,7 +80,7 @@ static void test_frames(void){
     if(!source){fclose(file);return;}size_t got=fread(source,1,(size_t)n,file);fclose(file);source[got]=0;
     strcat(source,";runFrameCases().then(n=>{check('frame-api-count',n>=40);mark('frames-done');},e=>{console.log('FAIL frames '+e+' '+e.stack);mark('frames-done');});");
     char *page=script_page(source);free(source);test_check("frame-case-page",page!=NULL);if(!page)return;
-    memset(&fixture,0,sizeof fixture);frame_origin_requests=0;
+    free_marks(&fixture);memset(&fixture,0,sizeof fixture);frame_origin_requests=0;
     struct web_host host={.opaque=&fixture,.request=frame_test_request,.cancel=cancel,.console=receive_log,.scroll=scroll_position,.navigate=navigate};
     fixture.doc=web_live(page,strlen(page),BASE,"utf-8",&host);free(page);test_check("frame-live-context",fixture.doc!=NULL);if(!fixture.doc)return;
     uint64_t end=uptime_ms()+15000;

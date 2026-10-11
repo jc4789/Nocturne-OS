@@ -86,7 +86,7 @@ extern const char *const tag_names[T_COUNT];
 enum { PE_NONE, PE_BEFORE, PE_AFTER, PE_OTHER, PE_BACKDROP }; /* pseudo-elements */
 
 enum { N_DOC, N_ELEM, N_TEXT, N_COMMENT, N_FRAGMENT, N_DOCTYPE, N_PI, N_ATTR };
-enum { NS_HTML, NS_SVG, NS_MATHML };
+enum { NS_HTML, NS_SVG, NS_MATHML, NS_NONE };
 
 struct attr {
     const char *name;  /* lowercase */
@@ -176,6 +176,12 @@ typedef struct node {
     /* Persistent CSSOM element scroll position; box/layout arenas are rebuilt.
        Only the element's principal box consumes these offsets. */
     double scroll_x, scroll_y;
+    /* Marquee motion belongs to the native element, not CSSOM scroll state.
+       Retained across detach/adopt and box reconstruction. */
+    float marquee_x, marquee_y, marquee_progress;
+    uint64_t marquee_last, marquee_loops;
+    uint8_t marquee_direction, marquee_behavior;
+    bool marquee_initialized, marquee_off, marquee_reverse;
     /* Link completion identity survives stylesheet snapshot rebuilds. */
     const char *stylesheet_url;
     struct web_doc *stylesheet_owner;
@@ -719,6 +725,7 @@ struct web_doc {
     bool scan_title_seen;
     node_t *root;   /* the document node */
     node_t *html, *head, *body;
+    pvec marquees; /* connected candidates collected by the existing resource scan */
     char *url;      /* the document's own URL */
     char *resolved_link; /* native hit/getter URL, borrowed until this doc's next link getter */
     char base[HTTP_URL_MAX];
@@ -881,6 +888,11 @@ bool doc_option_selected(node_t *option);
 node_t *doc_node_clone(web_doc *d, node_t *node, bool deep);
 void doc_mutated(web_doc *d, node_t *node);
 void doc_rescan(web_doc *d);
+void web_marquee_register(web_doc *d, node_t *node);
+void web_marquee_set(node_t *node, bool running);
+void web_marquee_tick(web_doc *d, uint64_t now);
+int64_t web_marquee_deadline(web_doc *d, uint64_t now);
+bool web_marquee_box(const box_t *box);
 void doc_sync_tree(web_doc *d);
 node_t *doc_image_node_next(web_doc *d, node_t *previous);
 void doc_image_sync(web_doc *d, node_t *n);

@@ -584,6 +584,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             if (c->shadow_root) scan(d, c->shadow_root, c->shadow_root);
             continue;
         }
+        if(c->tag==T_marquee)web_marquee_register(d,c);
         switch (c->tag) {
         case T_base: {
             if (scope) break;
@@ -932,6 +933,7 @@ void doc_rescan(web_doc *d) {
     d->profile.rescans++;
     d->resources_dirty = false;
     d->images_dirty = false;
+    d->marquees.n=0;
     css_styling_free(&d->sty);
     ar_free(&d->cssmem);
     d->css_reuse = NULL; d->css_reuse_count = 0; d->css_reuse_bytes = 0;
@@ -1029,6 +1031,7 @@ void web_tick(web_doc *d, uint64_t now) {
     doc_rescan(d);
     web_avmedia_tick(d, now);
     css_motion_tick(d,now);
+    web_marquee_tick(d,now);
     web_js_tick(d, now);
     doc_rescan(d);
     /* The child can complete while author JS runs. Refill before GUI paint,
@@ -1046,6 +1049,8 @@ int64_t web_deadline(web_doc *d) {
     int64_t deadline = js < 0 ? media : media < 0 ? js : MIN(js, media);
     int64_t motion=css_motion_deadline(d,now);
     if(motion>=0 && (deadline<0 || motion<deadline))deadline=motion;
+    int64_t marquee=web_marquee_deadline(d,now);
+    if(marquee>=0 && (deadline<0 || marquee<deadline))deadline=marquee;
     int64_t frames=web_frames_deadline(d);
     if(frames>=0 && (deadline<0 || frames<deadline))deadline=frames;
     return deadline < 0 ? background : background < 0 ? deadline : MIN(deadline, background);
@@ -1145,6 +1150,7 @@ void web_free(web_doc *d) {
     web_js_free(d);
     html_policy_free(d);
     css_motion_doc_free(d);
+    pv_free(&d->marquees);
     while(d->fonts) {
         struct web_font_resource *f=d->fonts;d->fonts=f->next;
         font_close(f->face);free(f->url);free(f);

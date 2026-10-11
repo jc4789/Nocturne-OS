@@ -1,6 +1,7 @@
 /* Native HTML semantic layout, paint, list order and disclosure interaction.
  * Run inside Nocturne; host C syntax or a JS mock is not rendering evidence. */
 #include <stdio.h>
+#include <math.h>
 #include "nocturne.h"
 #include "webi.h"
 #include "elements.h"
@@ -201,8 +202,74 @@ static void soft_break_layout(void) {
     web_free(d);
 }
 
+static bool pixel_is(int x,int y,uint32_t color) {
+    return x>=0 && y>=0 && x<400 && y<240 && (pixels[y*400+x]&0xffffff)==color;
+}
+static void marquee_motion_and_hit(void) {
+    const char *html="<!doctype html><body style='margin:0;background:white'>"
+        "<marquee id=moving behavior=alternate direction=left scrollamount=20 scrolldelay=10 truespeed "
+        "style='display:block;width:200px;height:24px;background:blue'>"
+        "<a id=target href='/destination' style='display:block;width:40px;height:20px;background:red'></a>"
+        "</marquee>";
+    struct web_host host={0};
+    web_doc *d=web_live(html,strlen(html),"http://semantics.test/","utf-8",&host);
+    check("marquee live document",d!=NULL);if(!d)return;
+    for(int i=0;i<8;i++)web_tick(d,uptime_ms());
+    web_layout(d,400,240);
+    node_t *moving=id(d,"moving"),*target=id(d,"target");
+    check("marquee native child geometry",moving&&moving->box&&target&&target->box);
+    if(!moving||!moving->box||!target||!target->box){web_free(d);return;}
+    box_t *root=d->root_box,*child_box=target->box;
+    float layout_x=box_abs_x(child_box),layout_y=box_abs_y(child_box);
+    uint64_t now=uptime_ms();
+    web_marquee_tick(d,now);
+    float before=box_visual_x(child_box),y=box_visual_y(child_box);
+    check("marquee registered for native tick",d->marquees.n==1&&moving->marquee_initialized);
+    check("marquee initial visible child",before>=0&&before+child_box->w<=200&&child_box->h==20);
+    paint(d);
+    check("marquee initial painted child",pixel_is((int)before+5,(int)y+5,0xff0000));
+    struct web_hit hit;
+    check("marquee initial child native hit",web_hit_test(d,(int)before+5,(int)y+5,&hit)&&hit.kind==WEB_HIT_LINK&&hit.node==target);
+    d->paint_dirty=false;
+    web_marquee_tick(d,now+10);
+    float moved=box_visual_x(child_box);
+    check("marquee real motion changes visual geometry",fabsf(moved-(before-20))<0.01f&&fabsf(box_visual_y(child_box)-y)<0.01f);
+    check("marquee motion preserves layout coordinates",box_abs_x(child_box)==layout_x&&box_abs_y(child_box)==layout_y);
+    check("marquee motion preserves layout tree",d->layout_valid&&d->root_box==root&&target->box==child_box);
+    check("marquee motion requests repaint",d->paint_dirty);
+    paint(d);
+    check("marquee translated child painted",pixel_is((int)moved+5,(int)y+5,0xff0000));
+    check("marquee old painted position cleared",pixel_is((int)before+35,(int)y+5,0x0000ff));
+    check("marquee translated target and link action",web_node_at(d,(int)moved+5,(int)y+5)==target&&
+        web_hit_test(d,(int)moved+5,(int)y+5,&hit)&&hit.kind==WEB_HIT_LINK&&hit.node==target&&
+        hit.href&&!strcmp(hit.href,"http://semantics.test/destination"));
+    check("marquee previous position not stale target",web_node_at(d,(int)before+35,(int)y+5)!=target);
+    check("marquee next native deadline",web_marquee_deadline(d,now+10)==10);
+    web_marquee_set(moving,false);d->paint_dirty=false;
+    web_marquee_tick(d,now+1000);
+    check("marquee stop freezes native visual geometry",fabsf(box_visual_x(child_box)-moved)<0.01f&&!d->paint_dirty);
+    check("marquee stop removes ticking deadline",web_marquee_deadline(d,now+1000)==-1);
+    paint(d);
+    check("marquee stopped child stays painted and hittable",pixel_is((int)moved+5,(int)y+5,0xff0000)&&
+        web_node_at(d,(int)moved+5,(int)y+5)==target);
+    web_marquee_set(moving,true);
+    uint64_t resumed=moving->marquee_last;
+    web_marquee_tick(d,resumed+9);
+    check("marquee resume does not accumulate stopped time",fabsf(box_visual_x(child_box)-moved)<0.01f);
+    web_marquee_tick(d,resumed+10);
+    float restarted=box_visual_x(child_box);
+    check("marquee restart advances one interval",fabsf(restarted-(moved-20))<0.01f);
+    paint(d);
+    check("marquee restarted paint and hit agree",pixel_is((int)restarted+5,(int)y+5,0xff0000)&&
+        web_hit_test(d,(int)restarted+5,(int)y+5,&hit)&&hit.node==target);
+    check("marquee restart retains layout boxes",d->layout_valid&&d->root_box==root&&target->box==child_box&&
+        box_abs_x(child_box)==layout_x&&box_abs_y(child_box)==layout_y);
+    web_free(d);
+}
+
 int main(void) {
     semantic_layout();reversed_lists();disclosure_layout_and_action();disclosure_state();disclosure_parser_snapshots();soft_break_layout();
+    marquee_motion_and_hit();
     printf("semanticstest: %d checks, %d failures\n",checks,failures);
     return failures != 0;
 }

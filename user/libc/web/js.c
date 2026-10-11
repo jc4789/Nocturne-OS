@@ -104,7 +104,10 @@ enum { NP_NODE, NP_DOCUMENT, NP_ELEMENT, NP_HTML, NP_TEXT, NP_COMMENT, NP_FRAGME
        NP_SCRIPT, NP_FORM, NP_ANCHOR, NP_AREA, NP_SVG, NP_SVGSVG, NP_PI, NP_ATTR,
        NP_META, NP_LINK, NP_STYLE, NP_BASE, NP_TITLE, NP_HEAD, NP_SHADOW, NP_SLOT,
        NP_TIME, NP_DATA, NP_DETAILS, NP_OL, NP_LI, NP_UNKNOWN, NP_CANVAS,
-       NP_AVMEDIA, NP_AUDIO, NP_VIDEO, NP_LABEL, NP_DATALIST, NP_PROGRESS, NP_METER, NP_HEADING, NP_PICTURE, NP_SOURCE, NP_MENU, NP_DIALOG, NP_DIV, NP_TRACK, NP_FRAME, NP_SVGGRAPHICS, NP_SVGPATH, NP_COUNT };
+       NP_AVMEDIA, NP_AUDIO, NP_VIDEO, NP_LABEL, NP_DATALIST, NP_PROGRESS, NP_METER, NP_HEADING, NP_PICTURE, NP_SOURCE, NP_MENU, NP_DIALOG, NP_DIV, NP_TRACK, NP_FRAME, NP_SVGGRAPHICS, NP_SVGPATH,
+       NP_BODY, NP_HTMLROOT, NP_PARAGRAPH, NP_SPAN, NP_BR, NP_HR, NP_PRE, NP_QUOTE, NP_MOD,
+       NP_UL, NP_DL, NP_DIRECTORY, NP_LEGEND, NP_OPTGROUP, NP_MAP, NP_EMBED, NP_PARAM, NP_FONT, NP_FRAMESET, NP_MARQUEE,
+       NP_TABLE, NP_CAPTION, NP_TABLESECTION, NP_TABLEROW, NP_TABLECELL, NP_TABLECOL, NP_COUNT };
 struct js_alloc_diagnostics { size_t current, peak, requested, used, limit; unsigned failures, reported; bool quota; };
 struct js_storage_profile {
     uint64_t calls[2][7], inclusive_ms, backend_calls, backend_ms, set_bytes;
@@ -194,7 +197,7 @@ struct web_js_state {
     uint64_t frames_revision;
     uint32_t script_count;
     int media_width, media_height;
-    node_t *current_script;
+    node_t *current_script, *handler_body;
     bool parsing_done, domcontent_sent, load_sent, disabled, timed_out, task_timed_out, parser_write, starting;
 };
 static JSClassID node_class,history_class;
@@ -206,6 +209,7 @@ static size_t bindings_bytecode_len;
 static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dynamic);
 static void dynamic_scripts(struct web_js_state *s, node_t *n);
 static void run_script(struct web_js_state *s, struct js_script *script);
+static void sync_parser_body_handlers(struct web_js_state *s);
 static struct js_resource_event *script_event(struct web_js_state *s, node_t *n, bool failed);
 static JSValue custom_element_hook(struct web_js_state *s, const char *name, int argc, JSValueConst *argv);
 static void exception(struct web_js_state *s);
@@ -654,7 +658,7 @@ static bool unknown_html_interface(const node_t *n) {
         if (is_space(*p) || *p=='/' || *p=='>' || (*p>='A' && *p<='Z')) return true;
     return false;
 }
-static JSValueConst node_prototype(struct web_js_state *s, const node_t *n) {
+static int node_prototype_kind(const node_t *n) {
     int kind = n->type == N_DOC ? NP_DOCUMENT : n->type == N_ELEM ?
                (n->namespace_id == NS_SVG ? (!strcmp(n->raw_name, "svg") ? NP_SVGSVG :
                 !strcmp(n->raw_name,"path") ? NP_SVGPATH :
@@ -706,9 +710,63 @@ static JSValueConst node_prototype(struct web_js_state *s, const node_t *n) {
         case T_menu: kind = NP_MENU; break;
         case T_dialog: kind = NP_DIALOG; break;
         case T_div: kind = NP_DIV; break;
+        case T_body: kind = NP_BODY; break;
+        case T_html: kind = NP_HTMLROOT; break;
+        case T_p: kind = NP_PARAGRAPH; break;
+        case T_span: kind = NP_SPAN; break;
+        case T_br: kind = NP_BR; break;
+        case T_hr: kind = NP_HR; break;
+        case T_pre: case T_listing: case T_xmp: kind = NP_PRE; break;
+        case T_q: case T_blockquote: kind = NP_QUOTE; break;
+        case T_ins: case T_del: kind = NP_MOD; break;
+        case T_ul: kind = NP_UL; break;
+        case T_dl: kind = NP_DL; break;
+        case T_dir: kind = NP_DIRECTORY; break;
+        case T_legend: kind = NP_LEGEND; break;
+        case T_optgroup: kind = NP_OPTGROUP; break;
+        case T_map: kind = NP_MAP; break;
+        case T_embed: kind = NP_EMBED; break;
+        case T_param: kind = NP_PARAM; break;
+        case T_font: kind = NP_FONT; break;
+        case T_frameset: kind = NP_FRAMESET; break;
+        case T_marquee: kind = NP_MARQUEE; break;
+        case T_table: kind = NP_TABLE; break;
+        case T_caption: kind = NP_CAPTION; break;
+        case T_thead: case T_tbody: case T_tfoot: kind = NP_TABLESECTION; break;
+        case T_tr: kind = NP_TABLEROW; break;
+        case T_td: case T_th: kind = NP_TABLECELL; break;
+        case T_col: case T_colgroup: kind = NP_TABLECOL; break;
     }
     if (kind == NP_HTML && unknown_html_interface(n)) kind = NP_UNKNOWN;
-    return s->node_protos[kind];
+    return kind;
+}
+static JSValueConst node_prototype(struct web_js_state *s, const node_t *n) {
+    return s->node_protos[node_prototype_kind(n)];
+}
+static const char *html_interface_name(const node_t *n) {
+    static const char *const names[NP_COUNT]={
+        [NP_HTML]="HTMLElement",[NP_UNKNOWN]="HTMLUnknownElement",
+        [NP_FIELDSET]="HTMLFieldSetElement",[NP_AREA]="HTMLAreaElement",
+        [NP_DIV]="HTMLDivElement",[NP_FORM]="HTMLFormElement",[NP_INPUT]="HTMLInputElement",[NP_BUTTON]="HTMLButtonElement",
+        [NP_SELECT]="HTMLSelectElement",[NP_TEXTAREA]="HTMLTextAreaElement",[NP_OBJECT]="HTMLObjectElement",[NP_OUTPUT]="HTMLOutputElement",
+        [NP_OPTION]="HTMLOptionElement",[NP_TEMPLATE]="HTMLTemplateElement",[NP_SCRIPT]="HTMLScriptElement",[NP_ANCHOR]="HTMLAnchorElement",
+        [NP_IFRAME]="HTMLIFrameElement",[NP_IMAGE]="HTMLImageElement",[NP_META]="HTMLMetaElement",[NP_LINK]="HTMLLinkElement",
+        [NP_STYLE]="HTMLStyleElement",[NP_BASE]="HTMLBaseElement",[NP_TITLE]="HTMLTitleElement",[NP_HEAD]="HTMLHeadElement",
+        [NP_SLOT]="HTMLSlotElement",[NP_TIME]="HTMLTimeElement",[NP_DATA]="HTMLDataElement",[NP_DETAILS]="HTMLDetailsElement",
+        [NP_OL]="HTMLOListElement",[NP_LI]="HTMLLIElement",[NP_CANVAS]="HTMLCanvasElement",[NP_AUDIO]="HTMLAudioElement",
+        [NP_VIDEO]="HTMLVideoElement",[NP_LABEL]="HTMLLabelElement",[NP_DATALIST]="HTMLDataListElement",[NP_PROGRESS]="HTMLProgressElement",
+        [NP_METER]="HTMLMeterElement",[NP_HEADING]="HTMLHeadingElement",[NP_PICTURE]="HTMLPictureElement",[NP_SOURCE]="HTMLSourceElement",
+        [NP_MENU]="HTMLMenuElement",[NP_DIALOG]="HTMLDialogElement",[NP_TRACK]="HTMLTrackElement",[NP_FRAME]="HTMLFrameElement",
+        [NP_BODY]="HTMLBodyElement",[NP_HTMLROOT]="HTMLHtmlElement",[NP_PARAGRAPH]="HTMLParagraphElement",
+        [NP_SPAN]="HTMLSpanElement",[NP_BR]="HTMLBRElement",[NP_HR]="HTMLHRElement",[NP_PRE]="HTMLPreElement",
+        [NP_QUOTE]="HTMLQuoteElement",[NP_MOD]="HTMLModElement",[NP_UL]="HTMLUListElement",[NP_DL]="HTMLDListElement",
+        [NP_DIRECTORY]="HTMLDirectoryElement",[NP_LEGEND]="HTMLLegendElement",[NP_OPTGROUP]="HTMLOptGroupElement",
+        [NP_MAP]="HTMLMapElement",[NP_EMBED]="HTMLEmbedElement",[NP_PARAM]="HTMLParamElement",[NP_FONT]="HTMLFontElement",
+        [NP_FRAMESET]="HTMLFrameSetElement",[NP_MARQUEE]="HTMLMarqueeElement",
+        [NP_TABLE]="HTMLTableElement",[NP_CAPTION]="HTMLTableCaptionElement",[NP_TABLESECTION]="HTMLTableSectionElement",
+        [NP_TABLEROW]="HTMLTableRowElement",[NP_TABLECELL]="HTMLTableCellElement",[NP_TABLECOL]="HTMLTableColElement"
+    };
+    return n && n->type==N_ELEM && !n->foreign?names[node_prototype_kind(n)]:NULL;
 }
 static unsigned node_bucket(const node_t *n) {
     uintptr_t key = (uintptr_t)n >> 4;
@@ -895,6 +953,25 @@ static JSValue image_decode_promise(struct web_js_state *s, node_t *n) {
 #include "js_inner_text.h"
 static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
+    if(!strcmp(p,"htmlInterface")) {
+        const char *name=html_interface_name(n);
+        return name?JS_NewString(ctx,name):JS_NULL;
+    }
+    if(!strcmp(p,"eventHandlerWindow")) {
+        if(n->type!=N_ELEM || n->foreign || (n->tag!=T_body && n->tag!=T_frameset))
+            return JS_ThrowTypeError(ctx,"Body or frameset receiver required");
+        if(!d->live || !d->js || !d->js->ctx)return JS_NULL;
+        if(!web_frame_same_origin(s->doc,d))return JS_ThrowTypeError(ctx,"SecurityError: cross-origin handler Window");
+        return JS_GetGlobalObject(d->js->ctx);
+    }
+    if(!strcmp(p,"embeddedSVGDocument")) {
+        if(n->type!=N_ELEM || n->foreign || n->tag!=T_embed)return JS_ThrowTypeError(ctx,"HTMLEmbedElement receiver required");
+        struct web_frame *frame=web_frame_find(d,n);
+        web_doc *child=frame && !frame->detached?frame->document:NULL;
+        if(!child || !child->live || !child->js || !web_frame_same_origin(d,child) ||
+           !child->html || child->html->namespace_id!=NS_SVG || strcmp(child->html->raw_name,"svg"))return JS_NULL;
+        return wrap(s,child->root);
+    }
     if (!strcmp(p, "styleSheetAvailable")) {
         if (n->type != N_ELEM || n->foreign || n->tag != T_style)
             return JS_ThrowTypeError(ctx, "HTMLStyleElement receiver required");
@@ -1004,7 +1081,7 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
         return JS_NewString(ctx, name);
     }
     if (!strcmp(p, "localName")) return n->type == N_ELEM ? JS_NewString(ctx, n->foreign ? n->raw_name : n->name) : JS_NULL;
-    if (!strcmp(p, "namespaceURI")) return n->type != N_ELEM ? JS_NULL : JS_NewString(ctx,
+    if (!strcmp(p, "namespaceURI")) return n->type != N_ELEM || n->namespace_id == NS_NONE ? JS_NULL : JS_NewString(ctx,
         n->namespace_id == NS_SVG ? "http://www.w3.org/2000/svg" :
         n->namespace_id == NS_MATHML ? "http://www.w3.org/1998/Math/MathML" : "http://www.w3.org/1999/xhtml");
     if (!strcmp(p, "piTarget")) return n->type == N_PI ? JS_NewString(ctx, n->name) : JS_ThrowTypeError(ctx, "ProcessingInstruction receiver required");
@@ -1131,6 +1208,11 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
 #include "js_mutations.h"
 static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValueConst value,int argc,JSValueConst *argv) {
     JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
+    if (!strcmp(p,"marqueeRunning")) {
+        if(n->type!=N_ELEM || n->foreign || n->tag!=T_marquee)return JS_ThrowTypeError(ctx,"HTMLMarqueeElement receiver required");
+        int running=JS_ToBool(ctx,value);if(running<0)return JS_EXCEPTION;
+        web_marquee_set(n,running);return JS_UNDEFINED;
+    }
     if (d->resources_dirty && !strcmp(p, "title")) doc_rescan(d);
     if (!strcmp(p, "imageWidth") || !strcmp(p, "imageHeight")) {
         if (!html_image(n)) return JS_ThrowTypeError(ctx, "HTMLImageElement receiver required");
@@ -2185,6 +2267,53 @@ static bool dom_synchronous_hooks(struct web_js_state *s,int opcode,node_t *n,in
     if(n&&n->type==N_ATTR)n=n->attr_owner;
     return custom_candidate(n);
 }
+/* Snapshot actual CSS border fragments. Inline geometry comes from the same
+   deco spans used by paint/hit testing; querying one node never scans the DOM. */
+static bool client_rect_append(JSContext *ctx, JSValueConst list, uint32_t *count,
+                               double x, double y, double w, double h) {
+    if (!isfinite(x) || !isfinite(y) || !isfinite(w) || !isfinite(h)) return true;
+    if (*count == UINT32_MAX) { JS_ThrowOutOfMemory(ctx); return false; }
+    JSValue rect = JS_NewArray(ctx);
+    if (JS_IsException(rect)) return false;
+    const double values[] = {x,y,w,h};
+    for (uint32_t i=0;i<4;i++) if (JS_SetPropertyUint32(ctx,rect,i,JS_NewFloat64(ctx,values[i]))<0) {
+        JS_FreeValue(ctx,rect);return false;
+    }
+    if (JS_SetPropertyUint32(ctx,list,(*count)++,rect)<0) return false;
+    return true;
+}
+static bool client_rect_box(JSContext *ctx,JSValueConst list,uint32_t *count,
+                            const box_t *b,int sx,int sy) {
+    return client_rect_append(ctx,list,count,box_visual_x(b)-b->p[3]-b->b[3]-sx,
+        box_visual_y(b)-b->p[0]-b->b[0]-sy,
+        b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3],
+        b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2]);
+}
+static JSValue element_client_rects(JSContext *ctx,node_t *n,int sx,int sy) {
+    JSValue list=JS_NewArray(ctx);if(JS_IsException(list))return list;
+    box_t *b=n->box;uint32_t count=0;
+    if(!b || !b->st || b->st->display==D_NONE)return list;
+    if(b->kind==B_INLINE){
+        box_t *a=n->anchor_block;
+        if(a){
+            double x=box_visual_x(a)-sx,y=box_visual_y(a)+a->content_dy-sy;
+            if(box_element_scrollable(a)){x-=a->node->scroll_x;y-=a->node->scroll_y;}
+            for(int i=0;i<a->ndecos;i++){
+                const struct deco *span=&a->decos[i];
+                if(span->node==n && !client_rect_append(ctx,list,&count,x+span->x,y+span->y,span->w,span->h))goto failed;
+            }
+        }
+    }else{
+        /* inline-table has a layout-only atomic wrapper around its table. */
+        if(b->kind==B_ATOMIC && b->first && b->first->kind==B_TABLE && b->first->node==n)b=b->first;
+        if(!client_rect_box(ctx,list,&count,b,sx,sy))goto failed;
+        if(b->kind==B_TABLE)for(box_t *c=b->first;c;c=c->next)
+            if(c->kind==B_CAPTION && !client_rect_box(ctx,list,&count,c,sx,sy))goto failed;
+    }
+    return list;
+failed:
+    JS_FreeValue(ctx,list);return JS_EXCEPTION;
+}
 static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int opcode) {
     struct web_js_state *s = state(ctx); web_doc *d = s->doc;
     if (argc < 2) return JS_ThrowTypeError(ctx, "DOM operation requires a receiver");
@@ -2362,10 +2491,11 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     case DOM_create: {
         int32_t type; if (argc < 5 || JS_ToInt32(ctx, &type, argv[2])) result = JS_EXCEPTION;
         else {
+            bool namespace_none = type == 1 && argc > 5 && JS_IsNull(argv[5]);
             size_t name_len, len;
             const char *name = JS_ToCStringLen(ctx, &name_len, argv[3]); const char *text = JS_ToCStringLen(ctx, &len, argv[4]);
             if (!name || !text) result = JS_EXCEPTION;
-            else if (type == 1 && (!*name || strpbrk(name, "<> \t\r\n/"))) result = JS_ThrowTypeError(ctx, "Invalid element name");
+            else if (type == 1 && (!*name || (!namespace_none && strpbrk(name, "<> \t\r\n/")))) result = JS_ThrowTypeError(ctx, "Invalid element name");
             else if (type == 7 && !doc_pi_target_valid(name, name_len)) result = JS_ThrowTypeError(ctx, "Invalid processing instruction target");
             else {
                 bool invalid_pi_data = false;
@@ -2373,7 +2503,8 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
                 int native_type = type == 1 ? N_ELEM : type == 3 ? N_TEXT : type == 8 ? N_COMMENT : type == 7 ? N_PI : N_FRAGMENT;
                 node_t *made = invalid_pi_data ? NULL : doc_node_create(d, native_type,
                     native_type == N_ELEM || native_type == N_PI ? name : NULL, text, len);
-                if (made && argc > 5 && JS_ToBool(ctx, argv[5]) > 0) { made->foreign = true; made->namespace_id = NS_SVG; }
+                if (made && namespace_none) { made->foreign = true; made->namespace_id = NS_NONE; }
+                else if (made && argc > 5 && JS_ToBool(ctx, argv[5]) > 0) { made->foreign = true; made->namespace_id = NS_SVG; }
                 /* The namespace must be known before establishing HTML-only
                    template contents. SVG <template> has ordinary children. */
                 if (made && made->type == N_ELEM && !made->foreign && made->tag == T_template && !doc_template_content(d, made)) {
@@ -2733,6 +2864,8 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         JS_FreeCString(ctx,key);
     } break;
     case DOM_rect: {
+        bool fragments=argc>2 && JS_ToBool(ctx,argv[2])>0;
+        if(fragments && (!n || n->type!=N_ELEM)){result=JS_ThrowTypeError(ctx,"Element receiver required");break;}
         struct web_js_state *owner=geometry_owner(s,d);
         int x = 0, y = 0, w = 0, h = 0;
         bool visible = owner && connected(owner, n);
@@ -2740,8 +2873,10 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         if(visible){
             flush_layout(owner);viewport_scroll_position(owner,&sx,&sy);
             d->view_x=sx;d->view_y=sy;
-            visible=web_node_rect(d,n,&x,&y,&w,&h);
+            if(fragments)visible=connected(owner,n);
+            else visible=web_node_rect(d,n,&x,&y,&w,&h);
         }
+        if(fragments){result=visible?element_client_rects(ctx,n,sx,sy):JS_NewArray(ctx);break;}
         if(!visible)x=y=w=h=0;
         double left=visible?(double)x-sx:0,top=visible?(double)y-sy:0;
         result = JS_NewObject(ctx);
@@ -3509,9 +3644,24 @@ static JSValue native_inline(JSContext *ctx, JSValueConst this_val, int argc, JS
     if(sandbox_authority(state(ctx))&SB_SCRIPTS)return history_security_error(ctx,"Sandbox disallows scripts");
     if (!argc) return JS_UNDEFINED;
     size_t n; const char *text = JS_ToCStringLen(ctx, &n, argv[0]); if (!text) return JS_EXCEPTION;
-    sbuf b = {0}; sb_puts(&b, "(function(event){\n"); sb_put(&b, text, n); sb_puts(&b, "\n})");
+    bool window_error = argc > 1 && JS_ToBool(ctx, argv[1]) > 0;
+    sbuf b = {0};
+    sb_puts(&b, window_error ? "(function(event,source,lineno,colno,error){\n" : "(function(event){\n");
+    sb_put(&b, text, n); sb_puts(&b, "\n})");
     JSValue result = JS_Eval(ctx, sb_cstr(&b), b.n, state(ctx)->doc->url, JS_EVAL_TYPE_GLOBAL);
     sb_free(&b); JS_FreeCString(ctx, text); return result;
+}
+static JSValue native_window_handler(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s=state(ctx);
+    node_t *n=argc>1?unwrap(ctx,argv[1]):NULL;
+    if(!n || n->type!=N_ELEM || n->foreign || (n->tag!=T_body && n->tag!=T_frameset))
+        return JS_ThrowTypeError(ctx,"HTMLBodyElement or HTMLFrameSetElement receiver required");
+    const char *op=JS_ToCString(ctx,argv[0]);if(!op)return JS_EXCEPTION;
+    bool getter=!strcmp(op,"get");JS_FreeCString(ctx,op);
+    web_doc *d=n->owner;
+    if(!d || !d->live || !d->js || !d->js->ctx)return getter?JS_NULL:JS_UNDEFINED;
+    if(d->js->rt!=s->rt || !web_frame_same_origin(s->doc,d))return history_security_error(ctx,"Cross-origin event handler access");
+    return custom_element_hook(d->js,getter?"bodyHandlerGet":"bodyHandlerSet",argc-1,argv+1);
 }
 static JSValue native_navigate(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     if (!argc) return JS_UNDEFINED;
@@ -4635,6 +4785,24 @@ void web_js_selection_changed(web_doc *d, node_t *n) {
     struct js_resource_event *event = script_event(s, n, false);
     if (event) event->selection = true;
 }
+static void sync_parser_body_handlers(struct web_js_state *s) {
+    /* Do not use doc_sync_tree here: parser script boundaries only need the
+       document element's direct body/frameset child, not a resource/CSS scan.
+       Native identity avoids allocating a wrapper on every author script. */
+    node_t *html = s->doc->root ? s->doc->root->first : NULL;
+    while (html && html->type != N_ELEM) html = html->next;
+    if (!html || html->namespace_id != NS_HTML || html->tag != T_html) return;
+    node_t *body = html->first;
+    while (body && !(body->type == N_ELEM && body->namespace_id == NS_HTML &&
+                     (body->tag == T_body || body->tag == T_frameset))) body = body->next;
+    if (!body || body == s->handler_body) return;
+    JSValue argument = wrap(s, body);
+    JSValue result = JS_IsException(argument) ? JS_EXCEPTION :
+        custom_element_hook(s, "parserBodyHandlers", 1, &argument);
+    if (JS_IsException(result)) exception(s);
+    else { s->handler_body = body; JS_FreeValue(s->ctx, result); }
+    JS_FreeValue(s->ctx, argument);
+}
 static void run_script(struct web_js_state *s, struct js_script *script) {
     if (script->executed || !script->ready) return;
     if(s->doc->sandbox_flags&SB_SCRIPTS){script->executed=script->parser_released=true;return;}
@@ -4642,6 +4810,7 @@ static void run_script(struct web_js_state *s, struct js_script *script) {
     if (s->disabled || script->failed || !script->source) { script->parser_released=true; if (!s->disabled) { script_event(s, script->node, true); script->notified = true; } return; }
     s->doc->encoding_certain=true;
     begin_named_task(s,script->module?"module script":"classic script",script->request);
+    sync_parser_body_handlers(s);
     node_t *old_current = s->current_script; bool old_write = s->parser_write;
     s->current_script = script->module ? NULL : script->node;
     s->parser_write = !script->module && s->blocker == script && !s->parsing_done;
@@ -5525,6 +5694,7 @@ static bool run_observers(struct web_js_state *s,uint64_t now) {
 static bool run_document_event(struct web_js_state *s) {
     web_doc *d = s->doc;
     if (s->parsing_done && !unfinished_deferred(s) && !s->domcontent_sent) {
+        begin_task(s); sync_parser_body_handlers(s); end_task(s);
         timing_record(s, JS_DOM_CONTENT_START, uptime_ms());
         s->domcontent_sent = true;
         struct web_event e = {.type="DOMContentLoaded", .bubbles=true};
@@ -5538,7 +5708,6 @@ static bool run_document_event(struct web_js_state *s) {
         s->load_sent = true; struct web_event e = {.type="load"};
         node_t *autofocus = web_autofocus_candidate(d); if (autofocus) web_js_focus_control(d, autofocus);
         timing_record(s, JS_LOAD_START, uptime_ms());
-        if(d->frame_parent && d->body && node_attr(d->body,"onload"))web_js_dispatch(d,d->body,&e);
         web_js_dispatch(d, NULL, &e);
         timing_record(s, JS_LOAD_END, uptime_ms()); return true;
     }
@@ -5673,7 +5842,10 @@ void web_js_tick(web_doc *d, uint64_t now) {
         node_t *created_before = d->owned_nodes;
         for (int step = 0; step < 32 && !s->blocker; step++) {
             node_t *node = NULL;
-            begin_task(s); int result = html_resume(d->parser, &node); end_task(s);
+            begin_task(s);
+            int result = html_resume(d->parser, &node);
+            if (result >= 0) sync_parser_body_handlers(s);
+            end_task(s);
             /* Script/EOF boundaries can import a byte-identical forest. Only
                real parser changes publish resources; errors stay conservative. */
             if (result < 0 || html_import_changed(d->parser)) d->dirty = d->resources_dirty = true;
@@ -5932,6 +6104,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("write", 1, native_write), JS_CFUNC_DEF("encode", 1, native_encode), JS_CFUNC_DEF("navigate", 1, native_navigate),
         JS_CFUNC_DEF("pi",2,native_pi),
         JS_CFUNC_DEF("inline", 1, native_inline),
+        JS_CFUNC_DEF("windowHandler", 5, native_window_handler),
         JS_CFUNC_DEF("click", 1, native_click), JS_CFUNC_DEF("timer", 4, native_timer), JS_CFUNC_DEF("clear", 1, native_clear),
         JS_CFUNC_DEF("microtask", 1, native_microtask),
         JS_CFUNC_DEF("postTask", 1, native_post_task), JS_CFUNC_DEF("cancelPost", 1, native_cancel_post),

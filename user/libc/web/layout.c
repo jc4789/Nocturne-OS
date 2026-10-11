@@ -266,6 +266,9 @@ void box_scroll_clamp(box_t *b) {
 
 float box_visual_x(const box_t *b) {
     double x = box_abs_x(b);
+    if(b->node && b->node->owner && b->node->owner->marquees.n)
+        for(const box_t *a=b->parent;a;a=a->parent)
+            if(web_marquee_box(a))x+=a->node->marquee_x;
     for (const box_t *c = b; c; c = c->cb) {
         if (c != b && c->node && c->node->scroll_x != 0 && box_element_scrollable(c)) x -= c->node->scroll_x;
         if (c->st && c->st->position == POS_FIXED) {
@@ -281,6 +284,9 @@ float box_visual_x(const box_t *b) {
 
 float box_visual_y(const box_t *b) {
     double y = box_abs_y(b);
+    if(b->node && b->node->owner && b->node->owner->marquees.n)
+        for(const box_t *a=b->parent;a;a=a->parent)
+            if(web_marquee_box(a))y+=a->node->marquee_y;
     for (const box_t *c = b; c; c = c->cb) {
         if (c != b && c->node && c->node->scroll_y != 0 && box_element_scrollable(c)) y -= c->node->scroll_y;
         if (c->st && c->st->position == POS_FIXED) {

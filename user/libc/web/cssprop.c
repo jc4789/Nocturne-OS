@@ -2924,7 +2924,7 @@ const char *css_ua_sheet(void) {
            "ruby { display: ruby; } rt { font-size: 50%; }\n"
            "nobr { white-space: nowrap; }\n"
            "wbr { display: inline; }\n"
-           "marquee { display: inline-block; }\n"
+           "marquee { display: inline-block; width: 100%; overflow: hidden; white-space: nowrap; }\n"
            "math { display: inline; }\n"
            "svg:not(:root) { overflow: hidden; }\n"
            "@media (scripting:enabled) { noscript { display: none !important; } }\n";

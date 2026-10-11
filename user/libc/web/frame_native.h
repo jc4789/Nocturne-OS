@@ -580,6 +580,7 @@ static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int a
         JSValue cleared=JS_IsException(reset)||JS_IsException(root)?JS_EXCEPTION:JS_Call(ctx,reset,s->hooks,1,&root);
         JS_FreeValue(ctx,reset);JS_FreeValue(ctx,root);
         if(JS_IsException(cleared))return cleared;JS_FreeValue(ctx,cleared);
+        s->handler_body=NULL;
         html_finish(s->doc->parser);s->doc->parser=NULL;
         while(s->doc->root->first)doc_node_remove(s->doc,s->doc->root->first);
         for(struct js_script *script=s->scripts;script;script=script->next)script->executed=script->parser_released=true;
@@ -604,6 +605,7 @@ static bool frame_stream_pump(struct web_js_state *s) {
         node_t *node=NULL;int result=html_resume(s->doc->parser,&node);
         if(result<0 || html_import_changed(s->doc->parser))s->doc->dirty=s->doc->resources_dirty=true;
         if(result<0)return false;
+        sync_parser_body_handlers(s);
         if(result==2){s->document_waiting=true;return true;}
         if(!result){html_finish(s->doc->parser);s->doc->parser=NULL;s->parsing_done=true;return true;}
         if(node && node->tag==T_script){
@@ -628,6 +630,7 @@ static bool parser_write_pump(struct web_js_state *s,void *boundary) {
         node_t *node=NULL;int result=html_resume_written(parser,&node,boundary);
         if(result<0 || html_import_changed(parser))s->doc->dirty=s->doc->resources_dirty=true;
         if(result<0)return false;
+        sync_parser_body_handlers(s);
         if(result==2 || !result)break;
         if(node && node->tag==T_script){
             struct js_script *script=queue_script(s,node,false);

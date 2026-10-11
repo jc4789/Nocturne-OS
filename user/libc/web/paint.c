@@ -1026,6 +1026,7 @@ static void inline_children(struct pctx *P, box_t *b, bool floats) {
 
 static void paint_runs(struct pctx *P, box_t *b) {
     float bx = box_visual_x(b), by = cy(b);
+    if(web_marquee_box(b)){bx+=b->node->marquee_x;by+=b->node->marquee_y;}
     if (box_element_scrollable(b)) {
         bx -= (float)b->node->scroll_x;
         by -= (float)b->node->scroll_y;
@@ -1110,7 +1111,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             set_disclosure_hit(P, details);
         }
     }
-    bool clip = (b->clamp_truncated || st->overflow != OV_VISIBLE) && b->kind != B_INLINE && b->parent && !doc_viewport_overflow_box(P->d,b);
+    bool clip = (web_marquee_box(b) || b->clamp_truncated || st->overflow != OV_VISIBLE) && b->kind != B_INLINE && b->parent && !doc_viewport_overflow_box(P->d,b);
     /* Off-screen contexts can still contain viewport-fixed descendants. */
     if (clip && !layers.n && (P->oy + by > c->cy1 || P->oy + by + bh < c->cy0)) { pv_free(&layers); return; }
     /* group opacity: paint, then blend the result with what was there */
@@ -1196,17 +1197,20 @@ static void paint_stacked_layer(struct pctx *P, box_t *l) {
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
     c->cx0 = P->vx0, c->cy0 = P->vy0, c->cx1 = P->vx1, c->cy1 = P->vy1;
     bool skip = false, reached = l->st->position != POS_ABSOLUTE;
+    bool fixed_escape=l->st->position==POS_FIXED;
     for (box_t *a = l->parent; a && a->parent; a = a->parent) {
         if (a->clamp_hidden || (a->st && a->st->display == D_NONE)) skip = true;
         if (a->st && a->kind != B_INLINE && a->st->position != POS_STATIC) reached = true;
-        if (a->st && (a->clamp_truncated || a->st->overflow != OV_VISIBLE) && !doc_viewport_overflow_box(P->d,a) && a->kind != B_INLINE && reached &&
-            l->st->position != POS_FIXED) {
+        if (a->st && (web_marquee_box(a) || ((a->clamp_truncated || a->st->overflow != OV_VISIBLE) && reached && !fixed_escape)) && !doc_viewport_overflow_box(P->d,a) && a->kind != B_INLINE) {
             float ax = box_visual_x(a) - a->p[3], ay = box_visual_y(a) - a->p[0];
             gfx_clip(c, (int)(P->ox + ax), (int)(P->oy + ay), (int)(a->w + a->p[1] + a->p[3]), (int)(a->h + a->p[0] + a->p[2]));
         }
         /* Internal overflow still clips, but a viewport-fixed ancestor and
            its descendants escape ancestors outside that containing block. */
-        if (a->st && a->st->position == POS_FIXED) break;
+        if (a->st && a->st->position == POS_FIXED) {
+            if(!P->d->marquees.n)break;
+            fixed_escape=true;
+        }
     }
     if (!skip) paint_box(P, l, true);
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;

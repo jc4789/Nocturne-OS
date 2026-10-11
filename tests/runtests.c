@@ -203,6 +203,8 @@ static const struct test tests[] = {
      /* Whole-suite QEMU wall time includes repeated fresh browser contexts and
         7,000+ collation comparisons; the page's 5s JS watchdog is unchanged. */
      {"jstest: ", ", 0 failed"}, "FAIL", 900, false, true},
+    {"web", "html-interfaces", "tcc -o /home/jstest /data/tests/jstest.c && /home/jstest html-interfaces", 0,
+     {"jstest: ", ", 0 failed"}, "FAIL", 180, false, true},
     {"web", "html-tree-builder", "tcc -I/data/tests -o /home/lexbortest /data/tests/lexbortest.c && /home/lexbortest", 0,
      {"lexbortest: ", ", 0 failures"}, "FAIL", 120, false, true},
     {"web", "attribute-nodes", "tcc -I/data/tests -o /home/js_attributes_native /data/tests/js_attributes_native.c && /home/js_attributes_native", 0,

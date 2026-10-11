@@ -40,7 +40,10 @@
     let mseHandlerTarget = () => false;
     let textTrackHandlerTarget = () => false;
     const globalHandlerTypes = new Set(('abort beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
-    const windowHandlerTypes = new Set(['hashchange','popstate','message','messageerror','storage']);
+    const windowHandlerTypes = new Set(('afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pageswap pagehide pagereveal pageshow popstate rejectionhandled storage unhandledrejection unload').split(' '));
+    const bodyWindowTypes=new Set([...windowHandlerTypes,'blur','error','focus','load','resize','scroll']);
+    const bodyWindowBrands=new WeakMap();
+    const parsedBodyHandlers=new WeakSet();
     const state = new WeakMap();
     /* @include js_collections.js */
     function list(a) { return collectionBridge.list(a); }
@@ -150,6 +153,7 @@
         const pending=[root,globalThis];
         while(pending.length) {
             const target=pending.pop(),listeners=listenerMap.get(target);
+            if(bodyWindowHandler(target,'load'))parsedBodyHandlers.add(target);
             if(listeners)for(const entry of listeners.slice())removeListener(target,entry);
             const handlers=new Map();
             for(const type of globalHandlerTypes)if(handlerTarget(target,type))
@@ -198,40 +202,90 @@
     }
     function handlerTarget(target,type) {
         return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document || svgHandlerTarget(target))) ||
-            (windowHandlerTypes.has(type) && target===globalThis) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || textTrackHandlerTarget(target,type);
+            (windowHandlerTypes.has(type) && target===globalThis) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || textTrackHandlerTarget(target,type);
     }
+    function bodyWindowHandler(target,type){
+        if(!bodyWindowTypes.has(type) || target===globalThis)return false;
+        if(target===null || (typeof target!=='object' && typeof target!=='function'))return false;
+        if(bodyWindowBrands.has(target))return bodyWindowBrands.get(target);
+        let body=false;
+        if(rawDom.isNode(null,target) && rawDom.get(target,'nodeType')===1){
+            const name=rawDom.get(target,'htmlInterface');body=name==='HTMLBodyElement'||name==='HTMLFrameSetElement';
+        }
+        // Native interface identity cannot change; the owner Window is resolved afresh.
+        bodyWindowBrands.set(target,body);return body;
+    }
+    function handlerOwner(target,type){return bodyWindowHandler(target,type)?rawDom.get(target,'eventHandlerWindow'):target;}
     function activateHandler(target,type,r) {
         if(r.entry)return;
         let a=listenerMap.get(target);if(!a)listenerMap.set(target,a=[]);
         r.entry={type,capture:false,once:false,passive:false,removed:false,signal:null,abort:null,
-            callback(event){const fn=handlerValue(target,type);if(typeof fn==='function' && fn.call(target,event)===false)event.preventDefault();}};
+            callback(event){
+                const fn=handlerValue(target,type);if(typeof fn!=='function')return;
+                if(target===globalThis && type==='error' && event instanceof ErrorEvent){
+                    if(fn.call(target,event.message,event.filename,event.lineno,event.colno,event.error)===true)event.preventDefault();
+                }else if(fn.call(target,event)===false)event.preventDefault();
+            }};
         a.push(r.entry);
     }
     function handlerRecord(target,type) {
         if(!handlerTarget(target,type))return null;
+        const original=target;target=handlerOwner(target,type);
+        if(!target)return null;
+        // Foreign owner globals use their own realm's listener/handler maps.
+        if(target!==original && target!==globalThis)return null;
         let map=handlerMap.get(target);if(!map)handlerMap.set(target,map=new Map());
         let r=map.get(type);
         if(!r) {
-            const text=(target instanceof HTMLElement || svgHandlerTarget(target))?reflectedAttr(target,'on'+type):null;
+            const source=target===globalThis && bodyWindowTypes.has(type)?rawDom.get(document,'body'):target;
+            const text=source && (source instanceof HTMLElement || svgHandlerTarget(source))?reflectedAttr(source,'on'+type):null;
             r={value:null,text,compiled:text===null,entry:null};map.set(type,r);
             if(text!==null)activateHandler(target,type,r);
         }
         return r;
     }
     function handlerValue(target,type) {
+        if(!handlerTarget(target,type))throw new TypeError('Illegal event handler receiver');
+        const owner=handlerOwner(target,type);
+        if(!owner)return null;
+        if(owner!==target && owner!==globalThis)return host.windowHandler('get',target,type);
+        target=owner;
         const r=handlerRecord(target,type);if(!r)throw new TypeError('Illegal event handler receiver');
         if(!r.compiled) {
             if(target instanceof Node && !rawDom.get(target,'scripting'))return null;
             r.compiled=true;
-            try{r.value=host.inline(r.text);}catch(e){r.value=null;report(e);}
+            try{r.value=host.inline(r.text,target===globalThis && type==='error');}catch(e){r.value=null;report(e);}
         }
         return r.value;
     }
     function setHandler(target,type,value,text) {
+        if(!handlerTarget(target,type))throw new TypeError('Illegal event handler receiver');
+        const owner=handlerOwner(target,type);
+        if(!owner)return;
+        if(owner!==target && owner!==globalThis)return host.windowHandler('set',target,type,value,text);
+        target=owner;
         const r=handlerRecord(target,type);if(!r)throw new TypeError('Illegal event handler receiver');
         r.value=typeof value==='function'?value:null;r.text=text;r.compiled=text===null;
         if(r.value!==null || text!==null)activateHandler(target,type,r);
         else if(r.entry){removeListener(target,r.entry);r.entry=null;}
+    }
+    function parserBodyHandlers(body) {
+        // Publish parser attributes before the next author script can replace
+        // the corresponding Window property. document.open's old bodies remain
+        // tombstoned, even if an author retains and later reinserts one.
+        if(parsedBodyHandlers.has(body) || !bodyWindowHandler(body,'load') ||
+           rawDom.get(body,'eventHandlerWindow')!==globalThis)return;
+        parsedBodyHandlers.add(body);
+        let map=handlerMap.get(globalThis);
+        if(!map)handlerMap.set(globalThis,map=new Map());
+        for(const type of bodyWindowTypes) {
+            const text=reflectedAttr(body,'on'+type);
+            if(text===null)continue;
+            let r=map.get(type);
+            if(!r)map.set(type,r={value:null,text:null,compiled:true,entry:null});
+            r.value=null;r.text=text;r.compiled=false;
+            activateHandler(globalThis,type,r);
+        }
     }
     function handlerAttribute(target,name,value) {
         const type=String(name).toLowerCase().slice(2);
@@ -449,7 +503,8 @@
         closest(selector) { for(let n=this;n&&n.nodeType===1;n=n.parentElement) if(n.matches(selector))return n; return null; }
         getElementsByTagName(name) { const query=String(name)==='*'?'*':CSS.escape(String(name));return collectionBridge.domHTML(this,()=>dom('query',this,query,false)); }
         getElementsByClassName(names) { const query=String(names).trim().split(/\s+/).filter(Boolean).map(x=>'.'+CSS.escape(x)).join('');return collectionBridge.domHTML(this,()=>query?dom('query',this,query,false):[]); }
-        getBoundingClientRect() { return dom('rect',this); }
+        getBoundingClientRect() { rawDom.get(this,'elementBrand');return observerBridge.clientBoundingRect(dom('rect',this)); }
+        getClientRects() { return observerBridge.clientRects(dom('rect',this,true)); }
         get clientWidth() { return dom('geometry',this,'clientWidth'); }
         get clientHeight() { return dom('geometry',this,'clientHeight'); }
         get clientLeft() { return dom('geometry',this,'clientLeft'); }
@@ -800,7 +855,22 @@
     document.getElementById=id=>dom('id',document,String(id));
     document.getElementsByName=name=>{const query='[name="'+CSS.escape(String(name))+'"]';return collectionBridge.domLive(document,()=>dom('query',document,query,false));};
     document.createElement=(name,options)=>customElementsBridge.create(name,options);
-    document.createElementNS=(ns,name,options)=>{if(ns==='http://www.w3.org/1999/xhtml')return customElementsBridge.create(name,options,true);if(ns!=='http://www.w3.org/2000/svg')throw new DOMException('Unsupported namespace','NotSupportedError');return dom('create',null,1,String(name),'',true);};
+    document.createElementNS=function(ns,name,options=undefined){
+        if(arguments.length<2)throw new TypeError('Namespace and qualified name are required');
+        ns=ns===null || ns===undefined?null:elementURL.string(ns);if(ns==='')ns=null;
+        name=elementURL.string(name);
+        if(ns===null){
+            const colon=name.indexOf(':'),prefix=colon<0?null:name.slice(0,colon),local=colon<0?name:name.slice(colon+1);
+            if(prefix!==null && (!prefix || /[\0\t\n\f\r />]/.test(prefix)) ||
+               !/^(?:[A-Za-z][^\0\t\n\f\r />]*|[:_\u0080-\u{10FFFF}][A-Za-z0-9_.:\-\u0080-\u{10FFFF}]*)$/u.test(local))
+                throw new DOMException('Invalid element name','InvalidCharacterError');
+            if(prefix!==null || name==='xmlns')throw new DOMException('A prefix requires a namespace','NamespaceError');
+            return dom('create',null,1,name,'',null);
+        }
+        if(ns==='http://www.w3.org/1999/xhtml')return customElementsBridge.create(name,options,true);
+        if(ns!=='http://www.w3.org/2000/svg')throw new DOMException('Unsupported namespace','NotSupportedError');
+        return dom('create',null,1,name,'',true);
+    };
     document.createTextNode=text=>dom('create',null,3,'#text',String(text));
     document.createComment=text=>dom('create',null,8,'#comment',String(text));
     document.createDocumentFragment=()=>dom('create',null,11,'#document-fragment','');
@@ -895,6 +965,9 @@
     /* @include js_importmaps.js */
     /* @include js_hyperlink.js */
     /* @include js_html_elements.js */
+    /* @include js_missing_html_elements.js */
+    for(const C of [HTMLBodyElement,HTMLFrameSetElement])installHandlers(C.prototype,windowHandlerTypes);
+    /* @include js_html_tables.js */
     /* @include js_xhr.js */
     /* @include js_blob.js */
     fetchBridge.initializeBlobs(blobBridge);
@@ -1023,7 +1096,9 @@
         pointerClickTarget:pointerCaptureBridge.clickTarget,
         pointerCancel:pointerCaptureBridge.cancel,
         eventHandlerAttribute:handlerAttribute,
+        bodyHandlerGet:handlerValue,bodyHandlerSet:setHandler,
         documentOpenReset:resetDocumentEvents,
+        parserBodyHandlers,
         documentCommandEvent:documentCommandBridge.event,
         frameMethodOriginal:frameBridge.methodOriginal,
         frameWindowProxy:frameBridge.windowProxy,
@@ -1078,7 +1153,7 @@
             Text.prototype,Comment.prototype,DocumentFragment.prototype,HTMLIFrameElement.prototype,HTMLImageElement.prototype,
             HTMLInputElement.prototype,HTMLButtonElement.prototype,HTMLSelectElement.prototype,HTMLTextAreaElement.prototype,
             HTMLFieldSetElement.prototype,HTMLObjectElement.prototype,HTMLOutputElement.prototype,HTMLOptionElement.prototype,HTMLTemplateElement.prototype,DocumentType.prototype,
-            HTMLScriptElement.prototype,HTMLFormElement.prototype,HTMLAnchorElement.prototype,HTMLAreaElement.prototype,...svgBridge.nodeProtos,ProcessingInstruction.prototype,attributeBridge.nodeProto,...htmlElementsBridge.nodeProtos,shadowBridge.ShadowRoot.prototype,shadowBridge.HTMLSlotElement.prototype,...semanticElementsBridge.nodeProtos,HTMLUnknownElement.prototype,...canvasBridge.nodeProtos,HTMLMediaElement.prototype,HTMLAudioElement.prototype,HTMLVideoElement.prototype,...formControlBridge.nodeProtos,...htmlElementsBridge.extraNodeProtos,...textTrackBridge.nodeProtos,HTMLFrameElement.prototype,...svgBridge.geometryNodeProtos],
+            HTMLScriptElement.prototype,HTMLFormElement.prototype,HTMLAnchorElement.prototype,HTMLAreaElement.prototype,...svgBridge.nodeProtos,ProcessingInstruction.prototype,attributeBridge.nodeProto,...htmlElementsBridge.nodeProtos,shadowBridge.ShadowRoot.prototype,shadowBridge.HTMLSlotElement.prototype,...semanticElementsBridge.nodeProtos,HTMLUnknownElement.prototype,...canvasBridge.nodeProtos,HTMLMediaElement.prototype,HTMLAudioElement.prototype,HTMLVideoElement.prototype,...formControlBridge.nodeProtos,...htmlElementsBridge.extraNodeProtos,...textTrackBridge.nodeProtos,HTMLFrameElement.prototype,...svgBridge.geometryNodeProtos,...missingHTMLElementsBridge.nodeProtos,...htmlTablesBridge.nodeProtos],
         dispatch:nativeDispatch,
         response(...args){return fetchBridge.response(...args);},
         reject(message,abort){return abort?new DOMException(message,'AbortError'):new TypeError(message);}
