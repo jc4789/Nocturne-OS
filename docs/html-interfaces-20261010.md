@@ -2,7 +2,7 @@
 
 ## 実装
 
-依頼された26インターフェース、別名を含む34タグを既存のネイティブDOMへ接続した。通常・旧式要素20種は `user/libc/web/js_missing_html_elements.js`、テーブル6種は `user/libc/web/js_html_tables.js`。既存のprototype番号を変更せず、Cの分類とJS配列の末尾に同じ順序で追加した。解析、createElement、clone、import、adopt、HTML以外の名前空間を扱い、空のクラスやinstanceofの上書きで対応を作っていない。
+依頼された26インターフェース、別名を含む34タグを既存のネイティブDOMへ接続した。通常・旧式要素20種は既存の `user/libc/web/js_html_elements.js` へ統合し、テーブル6種は `user/libc/web/js_html_tables.js`。既存のprototype番号を変更せず、Cの分類とJS配列の末尾に同じ順序で追加した。解析、createElement、clone、import、adopt、HTML以外の名前空間を扱い、空のクラスやinstanceofの上書きで対応を作っていない。
 
 - HTMLConstructor、受け手のブランド、IDL属性の型変換・URL反映・旧式属性、globalの記述子を実装。
 - Map.areas、table.rows/tBodies、section.rows、row.cellsはSameObjectのライブHTMLCollection。入れ子のテーブルを混ぜず、見出し・本文・フッターの順序を維持する。
@@ -17,7 +17,7 @@ GitHubのCodeボタンを実クリックすると、Reactが未実装のElement.
 
 ## 検査結果
 
-最終製品ビルドは `build/html-interfaces-geometry-build.log`。IMG、VHD、VHDX、ISOを更新し、initrd内のbrowser/browserjsworkerとbuild/rootの実行ファイル一致を確認した。
+要素追加・下記の実サイト確認時の製品ビルドは `build/html-interfaces-geometry-build.log`。IMG、VHD、VHDX、ISOを更新し、initrd内のbrowser/browserjsworkerとbuild/rootの実行ファイル一致を確認した。後の配置統合の媒体は末尾の追記で区別する。
 
 - kernel SHA-256: `07e2138949e4efa41023080b35aa84044ba323c5daffcb1007378f7e6bbaeb46`
 - initrd SHA-256: `16f78e08039fa6a5d1822b0662f28b6e0f947bc73077e1b7849bf7df20a501d6`
@@ -51,3 +51,11 @@ WHPX、4 CPU、4096MiB、1920×1080、主ブラウザー最大化。ホストRAM
 ## 後片付け
 
 今回のVMと検査プロセスの終了を確認し、使い捨てboot/data、PPM、検査用展開媒体を回収した。最後の回収では終了済み7 VMの117ファイル、Amazonと最終検査の21ファイルを削除した。これ以前の途中確認の一時媒体も回収済み。最後に確認したDドライブ空き容量は160.42GiB。PNG、ログ、metadata、ソース、最新配布媒体、通常の永続data.imgは保全した。回収済みVMコピーをそのまま再実行可能な保存媒体とは扱わない。
+
+## 既存モジュールへの配置統合
+
+追加分を専用ファイルに分けた配置を訂正し、20種類のクラスとIDLを既存の `js_html_elements.js` の同じhtmlElementsBridgeへ統合した。専用ファイルとmissingHTMLElementsBridgeは削除し、bootstrapの登録はCのprototype番号を保つ明示的な順序にした。テーブルは役割別の `js_html_tables.js` に置く。IDLの処理、属性記述子、イベント連携の動作は変更していない。
+
+`js_embed.py` で再生成し、`build/html-interfaces-placement-build.log` の全体ビルドでIMG、VHD、VHDX、ISOを更新した。kernelのハッシュは上記と同じ、最新initrd SHA-256は `464ad18be011f55ca5686a998df4f7b0027f3e6dc9fad2b3b4ae4ec8721e33ef`。browser/browserjsworkerの梱包一致も確認した。
+
+最新媒体で `web/html-interfaces` を一度実行し成功した。証拠は [統合後の検査ログ](../build/html-interfaces-placement-regression/test-serial.log)。この配置変更後に6サイトや既存19失敗の全検査は繰り返しておらず、上記の実サイト結果は配置統合前の媒体での確認として扱う。

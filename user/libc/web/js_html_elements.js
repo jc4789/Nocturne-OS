@@ -1,7 +1,8 @@
-/* Metadata interfaces backed by native DOM nodes, not instanceof overrides.
- * Include after js_hyperlink.js and js_tokens.js. Prototype order is shared
- * with NP_META..NP_HEAD in js.c. Native sheet metadata is in js_stylesheets.js.
- * https://html.spec.whatwg.org/multipage/semantics.html */
+/* HTML element interfaces backed by native DOM nodes, not instanceof overrides.
+ * Include after js_hyperlink.js and js_tokens.js. Native prototype registration
+ * in js_bootstrap.js must match js.c. Sheet metadata is in js_stylesheets.js;
+ * table interfaces are in js_html_tables.js.
+ * https://html.spec.whatwg.org/multipage/indices.html#element-interfaces */
 const htmlElementsBridge = (() => {
     'use strict';
     const define=Object.defineProperty, URLImpl=globalThis.URL, call=Reflect.apply;
@@ -19,6 +20,33 @@ const htmlElementsBridge = (() => {
     class HTMLSourceElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLSourceElement);}}
     class HTMLMenuElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLMenuElement);}}
     class HTMLDivElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLDivElement);}}
+    class HTMLBodyElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLBodyElement);}}
+    class HTMLHtmlElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLHtmlElement);}}
+    class HTMLParagraphElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLParagraphElement);}}
+    class HTMLSpanElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLSpanElement);}}
+    class HTMLBRElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLBRElement);}}
+    class HTMLHRElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLHRElement);}}
+    class HTMLPreElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLPreElement);}}
+    class HTMLQuoteElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLQuoteElement);}}
+    class HTMLModElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLModElement);}}
+    class HTMLUListElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLUListElement);}}
+    class HTMLDListElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLDListElement);}}
+    class HTMLDirectoryElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLDirectoryElement);}}
+    class HTMLLegendElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLLegendElement);}}
+    class HTMLOptGroupElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLOptGroupElement);}}
+    class HTMLMapElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLMapElement);}}
+    class HTMLEmbedElement extends HTMLElement {
+        constructor(){return customElementsBridge.construct(new.target,HTMLEmbedElement);}
+        getSVGDocument(){interfaceBrand(this,'HTMLEmbedElement');return rawDom.get(this,'embeddedSVGDocument');}
+    }
+    class HTMLParamElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLParamElement);}}
+    class HTMLFontElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLFontElement);}}
+    class HTMLFrameSetElement extends HTMLElement {constructor(){return customElementsBridge.construct(new.target,HTMLFrameSetElement);}}
+    class HTMLMarqueeElement extends HTMLElement {
+        constructor(){return customElementsBridge.construct(new.target,HTMLMarqueeElement);}
+        start(){interfaceBrand(this,'HTMLMarqueeElement');dom('set',this,'marqueeRunning',true);}
+        stop(){interfaceBrand(this,'HTMLMarqueeElement');dom('set',this,'marqueeRunning',false);}
+    }
     reflect(HTMLDivElement,'div','align');
     function headingBrand(node){
         const tag=rawDom.get(node,'localName');
@@ -401,11 +429,105 @@ const htmlElementsBridge = (() => {
     },set(value){htmlElementBrand(this,'title');dom('set',this,'textContent',string(value));}});
     // The modern head interface has no additional IDL members. Its inherited
     // tree APIs operate on the native head, including parser-created nodes.
+    function interfaceBrand(node,name){
+        if(rawDom.get(node,'htmlInterface')!==name)throw new TypeErrorImpl('Illegal '+name+' receiver');
+    }
+    function reflectInterface(C,property,attribute=property.toLowerCase(),nullEmpty=false){
+        const name=C.name;
+        define(C.prototype,property,{configurable:true,enumerable:true,
+            get(){interfaceBrand(this,name);return reflectedAttr(this,attribute)||'';},
+            set(value){interfaceBrand(this,name);reflectedAttr(this,attribute,nullEmpty && value===null?'':string(value));}});
+    }
+    function reflectBoolean(C,property,attribute=property.toLowerCase()){
+        const name=C.name;
+        define(C.prototype,property,{configurable:true,enumerable:true,
+            get(){interfaceBrand(this,name);return reflectedAttr(this,attribute)!==null;},
+            set(value){interfaceBrand(this,name);reflectedAttr(this,attribute,value?'':null);}});
+    }
+    const number=Number;
+    function reflectInteger(C,property,unsigned=false,fallback=0){
+        const name=C.name,attribute=property.toLowerCase();
+        define(C.prototype,property,{configurable:true,enumerable:true,get(){
+            interfaceBrand(this,name);
+            const match=/^[\t\n\f\r ]*([+-]?\d+)/.exec(reflectedAttr(this,attribute)||'');
+            if(!match)return fallback;
+            const value=number(match[1]);
+            return value>=(unsigned?0:-2147483648) && value<=2147483647?(value===0?0:value):fallback;
+        },set(value){
+            interfaceBrand(this,name);value=unsigned?value>>>0:value>>0;
+            reflectedAttr(this,attribute,string(unsigned && value>2147483647?fallback:value));
+        }});
+    }
+    function reflectURL(C,property){
+        const name=C.name;
+        define(C.prototype,property,{configurable:true,enumerable:true,
+            get(){interfaceBrand(this,name);return elementURL.attribute(this,rawDom.get(this,'localName'),property,false);},
+            set(value){interfaceBrand(this,name);reflectedAttr(this,property,scalar(value));}});
+    }
+    for(const property of ['text','link','vLink','aLink','bgColor'])reflectInterface(HTMLBodyElement,property,property.toLowerCase(),true);
+    reflectInterface(HTMLBodyElement,'background');
+    reflectInterface(HTMLHtmlElement,'version');reflectInterface(HTMLParagraphElement,'align');reflectInterface(HTMLBRElement,'clear');
+    for(const property of ['align','color','size','width'])reflectInterface(HTMLHRElement,property);
+    reflectBoolean(HTMLHRElement,'noShade');reflectInteger(HTMLPreElement,'width');
+    reflectURL(HTMLQuoteElement,'cite');reflectURL(HTMLModElement,'cite');reflectInterface(HTMLModElement,'dateTime');
+    for(const C of [HTMLUListElement,HTMLDListElement,HTMLDirectoryElement])reflectBoolean(C,'compact');
+    reflectInterface(HTMLUListElement,'type');reflectInterface(HTMLLegendElement,'align');
+    define(HTMLLegendElement.prototype,'form',{configurable:true,enumerable:true,get(){
+        interfaceBrand(this,'HTMLLegendElement');const parent=rawDom.get(this,'parentNode');
+        return parent && rawDom.get(parent,'nodeType')===1 && rawDom.get(parent,'namespaceURI')==='http://www.w3.org/1999/xhtml' &&
+            rawDom.get(parent,'localName')==='fieldset'?rawDom.get(parent,'form:fieldset'):null;
+    }});
+    reflectBoolean(HTMLOptGroupElement,'disabled');reflectInterface(HTMLOptGroupElement,'label');reflectInterface(HTMLMapElement,'name');
+    const mapAreas=new WeakMap();
+    define(HTMLMapElement.prototype,'areas',{configurable:true,enumerable:true,get(){
+        interfaceBrand(this,'HTMLMapElement');let areas=mapAreas.get(this);
+        if(!areas){
+            const node=this;
+            areas=collectionBridge.domHTML(node,()=>rawDom.query(node,'area',false).filter(n=>rawDom.get(n,'namespaceURI')==='http://www.w3.org/1999/xhtml'));
+            mapAreas.set(node,areas);
+        }
+        return areas;
+    }});
+    reflectURL(HTMLEmbedElement,'src');
+    for(const property of ['type','width','height','align','name'])reflectInterface(HTMLEmbedElement,property);
+    for(const property of ['name','value','type','valueType'])reflectInterface(HTMLParamElement,property);
+    reflectInterface(HTMLFontElement,'color','color',true);reflectInterface(HTMLFontElement,'face');reflectInterface(HTMLFontElement,'size');
+    reflectInterface(HTMLFrameSetElement,'cols');reflectInterface(HTMLFrameSetElement,'rows');
+    for(const property of ['behavior','bgColor','direction','height','width'])reflectInterface(HTMLMarqueeElement,property);
+    reflectInteger(HTMLMarqueeElement,'hspace',true);reflectInteger(HTMLMarqueeElement,'vspace',true);
+    reflectInteger(HTMLMarqueeElement,'scrollAmount',true,6);reflectInteger(HTMLMarqueeElement,'scrollDelay',true,85);
+    reflectBoolean(HTMLMarqueeElement,'trueSpeed');
+    function marqueeLoops(node){
+        const match=/^[\t\n\f\r ]*([+-]?\d+)/.exec(reflectedAttr(node,'loop')||'');
+        if(!match)return -1;
+        const value=number(match[1]);return value>=1 && value<=2147483647?value:-1;
+    }
+    define(HTMLMarqueeElement.prototype,'loop',{configurable:true,enumerable:true,
+        get(){interfaceBrand(this,'HTMLMarqueeElement');return marqueeLoops(this);},
+        set(value){
+            interfaceBrand(this,'HTMLMarqueeElement');value=value>>0;
+            if((value>0 || value===-1) && value!==marqueeLoops(this))reflectedAttr(this,'loop',string(value));
+        }});
+    const interfaces={HTMLBodyElement,HTMLHtmlElement,HTMLParagraphElement,HTMLSpanElement,HTMLBRElement,HTMLHRElement,
+        HTMLPreElement,HTMLQuoteElement,HTMLModElement,HTMLUListElement,HTMLDListElement,HTMLDirectoryElement,
+        HTMLLegendElement,HTMLOptGroupElement,HTMLMapElement,HTMLEmbedElement,HTMLParamElement,HTMLFontElement,
+        HTMLFrameSetElement,HTMLMarqueeElement};
+    for(const [C,names] of [[HTMLEmbedElement,['getSVGDocument']],[HTMLMarqueeElement,['start','stop']]])
+        for(const name of names)define(C.prototype,name,{enumerable:true});
+    for(const [name,C] of Object.entries(interfaces)){
+        define(C.prototype,Symbol.toStringTag,{value:name,configurable:true});
+        for(const property of Object.getOwnPropertyNames(C.prototype)){
+            const descriptor=Object.getOwnPropertyDescriptor(C.prototype,property);
+            if(descriptor.get)define(descriptor.get,'name',{value:'get '+property,configurable:true});
+            if(descriptor.set)define(descriptor.set,'name',{value:'set '+property,configurable:true});
+        }
+        define(globalThis,name,{value:C,writable:true,configurable:true});
+    }
     const exports={HTMLMetaElement,HTMLLinkElement,HTMLStyleElement,HTMLBaseElement,HTMLTitleElement,HTMLHeadElement};
     const extraExports={HTMLHeadingElement,HTMLPictureElement,HTMLSourceElement,HTMLMenuElement,HTMLDialogElement,HTMLDivElement};
     for(const C of [...Object.values(exports),...Object.values(extraExports)])define(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
     Object.assign(globalThis,exports,extraExports);
-    return {revealHidden,nodeProtos:Object.values(exports).map(C=>C.prototype),extraNodeProtos:Object.values(extraExports).map(C=>C.prototype),exports:{...exports,...extraExports},
+    return {revealHidden,nodeProtos:Object.values(exports).map(C=>C.prototype),extraNodeProtos:Object.values(extraExports).map(C=>C.prototype),exports:{...exports,...extraExports,...interfaces},
         initializeDialogs(C){if(ToggleEventImpl)throw new TypeErrorImpl('Dialog events already initialized');ToggleEventImpl=C;},
         requestClose(node){dialogState(node);call(requestCloseDialog,node,[]);},
         submit(node,result){

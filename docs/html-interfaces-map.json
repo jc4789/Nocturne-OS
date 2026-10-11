@@ -3,7 +3,7 @@
   "areas": [
     {"path":"user/libc/web/js.c","purpose":"解析・生成・clone/import/adopt共通の要素prototypeとnative brand"},
     {"path":"user/libc/web/js_bootstrap.js","purpose":"realm globals、body/frameset Window handler、prototype順序"},
-    {"path":"user/libc/web/js_missing_html_elements.js","purpose":"通常・obsolete要素20種のIDLとnative DOM/属性/collection接続"},
+    {"path":"user/libc/web/js_html_elements.js","purpose":"既存のHTML要素と通常・obsolete要素20種のIDLを同じmoduleへ統合"},
     {"path":"user/libc/web/js_html_tables.js","purpose":"テーブル6種のIDL・live collections・実DOM変更"},
     {"path":"tests/js_html_interface_cases.js","purpose":"本物のnative DOMでprototype・ブランド・操作・例外境界を検査"},
     {"path":"user/libc/web/marquee.c","purpose":"既存layout/paint/hitへ接続した移動・開始停止・寿命管理"},
@@ -15,5 +15,5 @@
   "baseline": "git clean開始。旧媒体MDNでHTMLPreElement未定義を確認。既存web/javascriptは1165 checks/19 failedであり、全合格とは扱わない。ホストRAMのため独立QEMUは2台ずつ。",
   "specs": ["https://html.spec.whatwg.org/multipage/indices.html#element-interfaces", "https://html.spec.whatwg.org/multipage/dom.html#htmlconstructor", "https://html.spec.whatwg.org/multipage/tables.html", "https://html.spec.whatwg.org/multipage/obsolete.html"],
   "unknowns": ["埋込みSVG文書ロード全体、CSS変換/SVG内部の幾何、Hyper-V実機は未確認または既存未対応。", "OpenAIの先頭再描画、Redditの次ページ取得、MDNデモ例外、百度の通信/装飾表示、既存19検査失敗と以前の速度低下は残件。"],
-  "status": "26種/34タグを実装し、最新IMG/VHD/VHDX/ISOを生成。最終HTML interface 1023項目は成功、全JSは変更前と同じ19失敗。GitHubのCode実クリック例外をnative getClientRectsで解消。6実サイトの画面・console・実入力を確認し、成立操作と未達を報告する。"
+  "status": "26種/34タグを実装。追加分20種を既存js_html_elements.jsへ統合し、専用ファイルとbridgeを削除。prototype番号とIDL動作を保全。最新IMG/VHD/VHDX/ISOを更新し、統合後web/html-interfacesを一度実行して成功。6サイト確認と既存19失敗の結果は配置統合前の媒体の証拠であり再試験していない。"
 }
