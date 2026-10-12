@@ -17,6 +17,19 @@ struct nmedia_info {
     int64_t duration_ms; /* -1 if the container cannot provide a duration */
     char audio_codec[32], video_codec[32], container[32];
 };
+enum { NMEDIA_VCODEC_NONE, NMEDIA_VCODEC_AVC, NMEDIA_VCODEC_HEVC, NMEDIA_VCODEC_VP8, NMEDIA_VCODEC_VP9 };
+struct nmedia_video_configuration {
+    uint32_t codec,profile,level,depth,compatibility;
+    uint64_t bitrate;
+};
+static inline bool nmedia_video_configuration_equal(const struct nmedia_video_configuration *a,const struct nmedia_video_configuration *b){
+    return a->codec==b->codec&&a->profile==b->profile&&a->level==b->level&&a->depth==b->depth&&a->compatibility==b->compatibility;
+}
+enum { NMEDIA_ACODEC_NONE,NMEDIA_ACODEC_OPUS,NMEDIA_ACODEC_VORBIS,NMEDIA_ACODEC_MP3,NMEDIA_ACODEC_AAC };
+struct nmedia_audio_observation {
+    uint64_t id,frames,work_ms; /* frames are real converted 48 kHz stereo */
+    uint32_t codec,profile,channels,rate;
+};
 struct nmedia_output {
     int kind;
     int64_t pts_ms;
@@ -25,6 +38,12 @@ struct nmedia_output {
     size_t frames; /* SOUND_RATE interleaved stereo frames */
     const uint32_t *pixels; /* opaque ARGB, row-major, valid until the next step */
     int width, height;
+    /* Successful native video conversions only; decode/conversion work,
+     * excluding demux, transport and presentation waits. */
+    uint64_t video_measured_frames, video_work_ms;
+    uint64_t video_measurement_id;
+    struct nmedia_video_configuration video_configuration;
+    struct nmedia_audio_observation audio_observation;
 };
 nmedia *nmedia_open(const char *path, char *error, size_t error_size);
 /* Anonymous HTTP(S), bounded synchronous Range cache. Large resources require
@@ -50,6 +69,10 @@ void nmedia_close(nmedia *media);
 bool nmedia_audio_extension(const char *name);
 /* Returns "maybe", "probably", or ""; never claims an unbuilt codec/MSE/DRM. */
 const char *nmedia_can_play_type(const char *type);
+/* Exact single-video observation key; false for omitted or unobserved
+   profiles/depth. A decoder name alone cannot identify a cost sample. */
+bool nmedia_performance_codec(const char *type,struct nmedia_video_configuration *);
+bool nmedia_performance_audio(const char *type,uint32_t *codec,uint32_t *profile);
 /* Aspect-fit nearest sampling. Destination clip and physical canvas bounds are
  * both enforced, including extreme/offscreen destination rectangles. */
 void nmedia_draw(canvas_t *canvas, const uint32_t *pixels, int source_width, int source_height,

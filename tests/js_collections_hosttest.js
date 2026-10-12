@@ -2,7 +2,7 @@
  * count native-tree reads. Actual DOM ownership is covered by jstest below. */
 const fs=require('node:fs'),path=require('node:path');
 const source=fs.readFileSync(path.join(__dirname,'../user/libc/web/js_collections.js'),'utf8');
-let checks=0,reads=0,versions=0;
+let checks=0,reads=0,versions=0,nameReads=0;
 const equal=(actual,expected,label)=>{checks++;if(!Object.is(actual,expected))throw Error(label+': '+String(actual)+' != '+String(expected));};
 const ownerA={revision:1n},ownerB={revision:1n};
 const node=(type=1,owner=ownerA,id='')=>({type,owner,id,name:'',children:[]});
@@ -16,7 +16,8 @@ const rawDom=(op,n,key)=>{
     if(key==='namespaceURI')return 'http://www.w3.org/1999/xhtml';
     throw Error('Unexpected property '+key);
 };
-const bridge=new Function('rawDom','reflectedAttr',source+';return collectionBridge;')(rawDom,(n,key)=>n[key]||null);
+rawDom.get=(n,key)=>rawDom('get',n,key); // Match the private typed product host.
+const bridge=new Function('rawDom','reflectedAttr',source+';return collectionBridge;')(rawDom,(n,key)=>{nameReads++;return n[key]||null;});
 const query=()=>{reads++;return root.children.filter(n=>n.type===1);};
 const live=bridge.domHTML(root,query);
 equal(live.length,2,'initial length');equal(live[0],one,'initial index');equal(live.item(1),two,'item');
@@ -77,4 +78,20 @@ for(const build of [bridge.live,bridge.html,r=>bridge.typed(r,NodeList.prototype
 }
 const staticList=bridge.list([one,two]);root.children=[];ownerB.revision++;
 equal(staticList.length,2,'static list unchanged');equal(staticList[1],two,'static list identity');
+// A full named enumeration followed by descriptors must not reread all IDs
+// for each supported name. The native model observes actual bridge calls.
+const many=node(1,ownerB);many.children=Array.from({length:2048},(_,i)=>node(1,ownerB,'id'+i));
+many.children[0].name='shared';many.children[1].id='shared';
+const manyLive=bridge.domHTML(many,()=>{reads++;return many.children.slice();});
+const beforeNames=nameReads,allKeys=Reflect.ownKeys(manyLive);
+for(const key of allKeys)Object.getOwnPropertyDescriptor(manyLive,key);
+equal(nameReads-beforeNames,4096,'one linear ID/name snapshot for all descriptors');
+equal(manyLive.namedItem('shared'),many.children[0],'tree-order name before later ID');
+equal(manyLive.shared,many.children[0],'property uses same first occurrence');
+many.children[0].name='';ownerB.revision++;
+equal(manyLive.namedItem('shared'),many.children[1],'attribute mutation invalidates named index');
+const genericNodes=[one];const genericHTML=bridge.html(()=>genericNodes);
+one.id='before';equal(genericHTML.namedItem('before'),one,'generic first named state');
+one.id='after';equal(genericHTML.namedItem('before'),null,'generic names not cached without DOM revision');
+equal(genericHTML.namedItem('after'),one,'generic state change with same backing array');
 console.log('collections host: '+checks+' checks, 0 failed; native snapshot reads '+reads+', version checks '+versions);

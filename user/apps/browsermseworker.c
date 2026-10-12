@@ -213,15 +213,15 @@ int main(void){
                         for(unsigned part=0;part<3&&frames<4096;part++){
                             struct nmedia_output *next=&slots[selected].pending;
                             if(!next->kind){int result=nmedia_mse_step_at(slots[selected].buffer,next,c.current);if(result==NMEDIA_ERROR){m=slots[selected].buffer;ok=false;break;}if(result==NMEDIA_AGAIN){memset(next,0,sizeof *next);break;}}
-                            if(next->kind!=NMEDIA_AUDIO||next->frames>4096-frames)break;
+                            if(next->kind!=NMEDIA_AUDIO||next->frames>4096-frames||next->audio_observation.id!=output.audio_observation.id)break;
                             int64_t expected=output.pts_ms+(int64_t)frames*1000/SOUND_RATE;
                             if(next->pts_ms<expected-1||next->pts_ms>expected+1||
                                (independent_video&&!video_ended&&(!video_delivered||next->pts_ms>video_delivered_pts)))break;
-                            memcpy(pcm_batch+frames*2,next->samples,next->frames*4);frames+=next->frames;next->kind=0;
+                            memcpy(pcm_batch+frames*2,next->samples,next->frames*4);frames+=next->frames;output.audio_observation=next->audio_observation;next->kind=0;
                         }
                         output.samples=pcm_batch;output.frames=frames;output.duration_ms=(int64_t)frames*1000/SOUND_RATE;r.frames=(uint32_t)frames;
                     }
-                    r.payload_bytes=(uint32_t)output.frames*4;
+                    r.audio_observation=output.audio_observation;r.payload_bytes=(uint32_t)output.frames*4;
                 }
                 else if(output.kind==NMEDIA_VIDEO){
                     if(!nmedia_video_wire_bytes(output.width,output.height,&r.payload_bytes)){r.kind=NMEDIA_ERROR;strlcpy(r.error,"MSE video payload length is not representable",sizeof r.error);}
@@ -230,7 +230,9 @@ int main(void){
                                 r.kind=NMEDIA_ERROR;r.payload_bytes=0;strlcpy(r.error,"MSE VIDEO owner transfer failed",sizeof r.error);
                             }else{
                                 video.header=(struct nmsw_video){.magic=NMSW_MAGIC,.generation=generation,.sequence=sequence,.slot=(uint32_t)selected,
-                                    .bytes=r.payload_bytes,.epoch=c.epoch,.revision=nmedia_mse_revision(slots[selected].buffer),.pts=output.pts_ms,.width=output.width,.height=output.height};
+                                    .bytes=r.payload_bytes,.epoch=c.epoch,.revision=nmedia_mse_revision(slots[selected].buffer),.pts=output.pts_ms,.width=output.width,.height=output.height,
+                                    .video_measured_frames=output.video_measured_frames,.video_work_ms=output.video_work_ms,
+                                    .video_measurement_id=output.video_measurement_id,.video_configuration=output.video_configuration};
                                 video.pending=true;video.position=0;r.kind=NMSW_VIDEO_PENDING;r.payload_bytes=0;
                                 /* A single coded image may intentionally span
                                    seconds. Use its real duration, not a fixed

@@ -10,7 +10,11 @@ const formDataBridge = (() => {
     const setPrototype=Object.setPrototypeOf, names=Object.getOwnPropertyNames;
     const descriptor=Object.getOwnPropertyDescriptor, get=WeakMap.prototype.get, put=WeakMap.prototype.set;
     const slots=new WeakMap(), iteratorSlots=new WeakMap();
-    const eventSlots=new WeakMap(),windowForms=typeof htmlElementBrand==='function'&&typeof rawDom==='object'&&typeof dom==='function';
+    /* Window's private DOM dispatch is callable and carries own operation
+       methods; Worker deliberately has no DOM dispatch. Do not infer this
+       capability from the public HTMLFormElement constructor or an object-
+       only typeof check, which rejected every real Window bootstrap. */
+    const eventSlots=new WeakMap(),windowForms=typeof htmlElementBrand==='function'&&typeof rawDom==='function'&&typeof dom==='function';
     const TypeErr=TypeError, DomErr=DOMException, StringImpl=String;
     const wellFormed=String.prototype.toWellFormed, slice=String.prototype.slice;
     const code=String.prototype.charCodeAt, Encoder=TextEncoder, encode=TextEncoder.prototype.encode;

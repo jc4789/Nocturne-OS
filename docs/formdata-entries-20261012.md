@@ -32,3 +32,11 @@ image submitterのselected coordinateは初期(0,0)。主担当は画像availabl
 - [HTML constructing the entry list](https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#constructing-the-entry-list)
 - [XMLHttpRequest FormData constructor](https://xhr.spec.whatwg.org/#dom-formdata)
 - [HTML image-button selected coordinates](https://html.spec.whatwg.org/multipage/input.html#image-button-state-(type=image))
+
+## 検証再開（同日・ユーザー訂正後）
+
+ユーザーが検証再開を明示したため、既存 `tests/js_form_controls_cases.js` に実DOM用entry-list確認を追加し、既存 `tests/js_form_controls_native.c` の `formdata-entries` 引数で新しいまとまりだけを実行する。disabled／fieldset第一legend／選択option／tree-order／重複／dirname／charset／実empty File／submitter例外／FormDataEvent変更コピーと再入／WebIDL順／FACEの実File bytesを確認する。native `web_input_files_replace` で選択Fileを設置し、実JS bootstrapのFile identity・内容・lastModified・FileList setterも確認する。画像座標はnative格納した合法な負座標を、非pointer `.click()` とcollectorが保持することを確認する範囲で、実pointerクリック受入ではない。
+
+主担当の正規guestバッチへ引き渡した。まだguest結果を受信しておらず、追加fixtureの作成を実行成功と報告しない。独立VMは起動していない。
+
+その後の初回実guest（`build/media-formdata-header-closure-20261012/test-serial.log`）では `HTMLFormElement is not available in this realm` が発生し、追加まとまりは14確認・4失敗。Windowのprivate `rawDom` は操作methodを持つcallable functionなのに、moduleのrealm判定が `typeof rawDom==='object'` だけを認めていたのが製品原因。`js_formdata.js` を既存callable dispatch契約へ合わせて修理した。公開constructorの存在や偽hostへ差替えて成功にしない。WorkerはDOM capabilityなしを保持する。修理後guestは主担当再実行待ち。先のfixture-header配置不足2回は主担当が `scripts/test.py` で修理してから今回の実製品失敗に到達している。

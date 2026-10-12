@@ -1,0 +1,62 @@
+#pragma once
+#include <webidb.h>
+#include <stdbool.h>
+
+/* Browser-private, pointer-free native storage broker protocol. Only the
+ * browser's origin-policy gate supplies origin; scripts never supply paths. */
+#define WEB_IDB_WIRE_MAGIC 0x49444231u
+enum webidb_operation {
+    WEB_IDB_BEGIN=1, WEB_IDB_STAGE, WEB_IDB_VALUE, WEB_IDB_COMMIT,
+    WEB_IDB_ABORT, WEB_IDB_DATABASES, WEB_IDB_CONNECTIONS, WEB_IDB_CONNECT,
+    WEB_IDB_POLL, WEB_IDB_DISCONNECT, WEB_IDB_FORGET, WEB_IDB_VALUES
+};
+struct webidb_wire_command {
+    uint32_t magic, operation, sequence, token;
+    uint64_t version, origin_length, name_length, payload_length, reference_count;
+};
+struct webidb_wire_result {
+    uint32_t magic, operation, sequence, status, token, pending;
+    uint64_t version, count, payload_length;
+};
+_Static_assert(sizeof(struct webidb_wire_command)==56,"IndexedDB broker command v1");
+_Static_assert(sizeof(struct webidb_wire_result)==48,"IndexedDB broker result v1");
+
+typedef struct webidb_async webidb_async;
+struct webidb_async_request {
+    unsigned operation;
+    uint32_t token;
+    uint64_t version;
+    const char *origin, *name;
+    size_t name_length;
+    const uint8_t *bytes;
+    size_t length;
+    const char *reference;
+    const char *const *references;
+    size_t reference_count;
+};
+struct webidb_async_result {
+    unsigned operation;
+    uint32_t sequence, token;
+    int status, pending;
+    uint64_t version;
+    size_t count;
+    uint8_t *bytes;
+    size_t length;
+    char reference[65];
+    struct webidb_database *items;
+    size_t item_count;
+};
+webidb_async *webidb_async_create(void);
+/* Copies private input into owned queue storage; never opens /data or waits
+ * for helper/disk. Zero means allocation/representation/spawn failure. */
+uint32_t webidb_async_submit(webidb_async *,const struct webidb_async_request *);
+/* At most 64 KiB per lane; nonblocking pipe I/O, no yield/wait or author JS. */
+void webidb_async_pump(webidb_async *);
+bool webidb_async_take(webidb_async *,struct webidb_async_result *);
+bool webidb_async_pending(const webidb_async *);
+bool webidb_async_ready(const webidb_async *);
+bool webidb_async_failed(const webidb_async *);
+void webidb_async_result_free(struct webidb_async_result *);
+/* Closes lanes and retires helper without a blocking wait. */
+void webidb_async_free(webidb_async *);
+void webidb_async_background(void);

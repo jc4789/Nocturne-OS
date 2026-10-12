@@ -1028,9 +1028,12 @@ static void presentation_service(void){
 }
 static bool host_presentation(void *opaque,web_doc *document,web_node *element,int mode){
     (void)opaque;
-    if(mode==0){if(fullscreen_doc!=document)return true;if(win_fullscreen(w,false)<0)return false;browser_fullscreen=false;fullscreen_doc=NULL;need_layout=need_paint=true;return true;}
+    if(mode==0||mode==4){if(fullscreen_doc!=document)return true;bool restored=w&&win_fullscreen(w,false)>=0;
+        if(!restored&&mode==0)return false;
+        browser_fullscreen=false;fullscreen_doc=NULL;need_layout=need_paint=true;return restored;}
     if(mode==3){if(pip_doc!=document)return true;if(pip_window)win_close(pip_window);pip_window=NULL;pip_doc=NULL;pip_node=NULL;pip_revision=0;return true;}
-    if(!w||document!=doc||quit||loading||pending_navigation)return false;
+    web_doc *top=web_presentation_root(document);
+    if(!w||!document||top!=doc||quit||loading||pending_navigation)return false;
     if(mode==1){if(win_fullscreen(w,true)<0)return false;browser_fullscreen=true;fullscreen_doc=document;focus=F_PAGE;need_layout=need_paint=true;return true;}
     if(mode==2){
         if(pip_window)return false;
@@ -1128,7 +1131,11 @@ static bool host_script_checkpoint(void *opaque) {
         if(event<0){quit=true;return false;}
         if(!event)break;
         if(e.type==EV_CLOSE){quit=true;return false;}
-        if(e.type==EV_KEY && e.pressed && e.key==NKEY_ESC)return false;
+        /* Escape in native chrome/fullscreen is an ordinary UI command, not
+           permission to permanently abort the page's author execution. Keep
+           it queued for the normal owner rather than swallowing it here. */
+        if(e.type==EV_KEY && e.pressed && e.key==NKEY_ESC && !browser_fullscreen &&
+           focus==F_PAGE && !sel_node && !find_open)return false;
         if(e.type==EV_KEY && e.pressed && e.key==NKEY_F12) {
             int old_top=TB+page_h(),old_height=console_h();
             console_open=!console_open;

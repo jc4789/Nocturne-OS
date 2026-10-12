@@ -47,6 +47,44 @@ async function runAvmediaCases() {
     await delay(550);check(overlong.ended&&overlong.paused&&overlong.currentTime<2,'corrupt duration cannot hold EOF indefinitely');
     release(overlong);
 
+    /* Real fragmented VP9 input through SourceBuffer -> native helper. The
+       initialization segment alone must expose metadata without waiting for
+       frames, while canplay must not precede actual future coded-frame data. */
+    const bytes=await (await fetch(fixture('mp4-vp9.mp4'))).arrayBuffer();
+    const view=new DataView(bytes);let mediaAt=0;
+    while(mediaAt+8<=bytes.byteLength){
+        const size=view.getUint32(mediaAt),type=view.getUint32(mediaAt+4);
+        if(type===0x6d6f6f66)break;
+        check(size>=8&&size<=bytes.byteLength-mediaAt,'valid native MSE fixture box');
+        mediaAt+=size;
+    }
+    check(mediaAt>0&&mediaAt+8<bytes.byteLength,'fixture separates initialization and media');
+    const ms=new MediaSource(),m=document.createElement('video'),url=URL.createObjectURL(ms);
+    const wait=(target,name)=>new Promise((resolve,reject)=>{
+        const fail=setTimeout(()=>{target.removeEventListener(name,ok);reject(new Error('avmedia timeout '+name+' ready='+m.readyState+' paused='+m.paused+' time='+m.currentTime+' duration='+ms.duration));},3000);
+        function ok(){clearTimeout(fail);resolve();}
+        target.addEventListener(name,ok,{once:true});
+    });
+    let metadataCount=0,dataCount=0,canplayCount=0;
+    m.addEventListener('loadedmetadata',()=>metadataCount++);
+    m.addEventListener('loadeddata',()=>dataCount++);
+    m.addEventListener('canplay',()=>canplayCount++);
+    const opened=wait(ms,'sourceopen');m.src=url;await opened;
+    const sb=ms.addSourceBuffer('video/mp4; codecs="vp09.00.10.08"');
+    const metadataReady=wait(m,'loadedmetadata'),initDone=wait(sb,'updateend');
+    sb.appendBuffer(bytes.slice(0,mediaAt));await initDone;await metadataReady;
+    check(m.readyState===1&&m.paused&&m.currentTime===0,'paused MSE exposes real initialization metadata');
+    check(metadataCount===1&&dataCount===0&&canplayCount===0,'metadata does not invent data or canplay');
+    const dataReady=wait(m,'loadeddata'),canplayReady=wait(m,'canplay'),appendDone=wait(sb,'updateend');
+    sb.appendBuffer(bytes.slice(mediaAt));await appendDone;await dataReady;await canplayReady;
+    check(m.readyState>=3&&m.paused&&m.currentTime===0,'paused buffered MSE exposes future data without starting clock');
+    check(metadataCount===1&&dataCount===1&&canplayCount===1,'ready events occur once at their actual transitions');
+    const through=wait(m,'canplaythrough');ms.endOfStream();await through;
+    check(m.readyState===4,'complete buffered EOS has enough data');
+    await m.play();await delay(100);
+    check(!m.paused&&m.currentTime>0&&m.getVideoPlaybackQuality().totalVideoFrames>0,'preloaded MSE progresses through native playback');
+    m.pause();release(m);URL.revokeObjectURL(url);
+
     const visible=document.getElementById('visible');visible.preload='none';visible.src=fixture('h264.mp4');
     await visible.play();check(!visible.paused&&visible.readyState>=2,'visible native frame');
     console.log('AVMEDIA_PAINT_READY');await delay(20);visible.pause();visible.currentTime=0.1;

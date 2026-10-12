@@ -52,7 +52,8 @@ static bool positioned(const box_t *b) {
 
 static bool stacking_context(const box_t *b) {
     if (!b->st || b->kind == B_TEXT || b->kind == B_BR) return false;
-    if (b->st->filter || b->st->opacity < 1) return true;
+    if (b->st->filter || b->st->opacity < 1 ||
+        (b->kind!=B_INLINE&&css_translation_active(b->st))) return true;
     if (b->kind == B_INLINE) return false;
     /* Opacity groups are atomic even in normal flow. Fixed/sticky boxes also
        establish a context with auto z-index; their descendants cannot escape
@@ -64,7 +65,8 @@ static bool paint_box_layer(const box_t *b) { return positioned(b) || stacking_c
 
 static float cy(const box_t *b) { return box_visual_y(b) + b->content_dy; }
 
-static image_t *scaled_image(struct web_image *im, int w, int h);
+static image_t *scaled_image(struct web_image *im, int w, int h,
+                             const canvas_t *canvas, int x, int y, int box_w, int box_h);
 
 /* ---------------------------------------------------------------- rounded rectangles */
 static float sdf_rrect(float px, float py, float x, float y, float w, float h, float r) {
@@ -335,12 +337,14 @@ static void paint_layer(struct pctx *P, int img_idx, uint8_t size_kind, const le
     int TW = (int)roundf(tw), TH = (int)roundf(th);
     if (TW < 1 || TH < 1) return;
     float px = ax + len_resolve(&pos[0], aw - (float)TW), py = ay + len_resolve(&pos[1], ah - (float)TH);
-    image_t *img = scaled_image(im, TW, TH);
-    if (!img) return;
     canvas_t *c = P->c;
+    int X0 = (int)roundf(x), Y0 = (int)roundf(y);
+    int X1 = (int)roundf(x + w), Y1 = (int)roundf(y + h);
+    if (X0 >= c->cx1 || Y0 >= c->cy1 || X1 <= c->cx0 || Y1 <= c->cy0) return;
+    image_t *img = scaled_image(im, TW, TH, c, X0, Y0, X1-X0, Y1-Y0);
+    if (!img) return;
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
     /* rounded edges, so a box at a fractional position shows no sliver of a neighbouring tile */
-    int X0 = (int)roundf(x), Y0 = (int)roundf(y);
     gfx_clip(c, X0, Y0, (int)roundf(x + w) - X0, (int)roundf(y + h) - Y0);
     bool rx = repeat == BR_REPEAT || repeat == BR_REPEAT_X;
     bool ry = repeat == BR_REPEAT || repeat == BR_REPEAT_Y;
@@ -599,11 +603,18 @@ static void paint_run_text(struct pctx *P, const struct run *r, float bx, float 
 }
 
 /* ---------------------------------------------------------------- replaced elements and controls */
-static image_t *scaled_image(struct web_image *im, int w, int h) {
+static image_t *scaled_image(struct web_image *im, int w, int h,
+                             const canvas_t *canvas, int x, int y, int box_w, int box_h) {
     if (w <= 0 || h <= 0 || !im->img) return NULL;
     if (im->img->w == w && im->img->h == h) return im->img;
     if (im->scaled && im->scaled->w == w && im->scaled->h == h) return im->scaled;
-    if(web_avmedia_snapshot_is_probe()){web_avmedia_snapshot_reject();return NULL;}
+    if(web_avmedia_snapshot_is_probe()){
+        /* An uncached image outside the committed video span must not disable
+           that surface. Probes neither allocate nor replace shared caches;
+           only an intersecting paint occurrence makes their result unsafe. */
+        web_avmedia_snapshot_reject_region(canvas,x,y,box_w,box_h);
+        return NULL;
+    }
     if ((long)w * h > IMAGE_MAX_PIXELS) return NULL;
     if (im->scaled) image_free(im->scaled);
     im->scaled = im->svg ? image_decode_svg(im->svg, im->svg_n, w, h) : image_scale(im->img, w, h);
@@ -794,7 +805,8 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     }
     case AT_PLACEHOLDER: {
         int X = (int)roundf(x), Y = (int)roundf(y), W = (int)roundf(w), H = (int)roundf(h);
-        if(web_frame_element(n))web_avmedia_snapshot_reject();
+        if(web_frame_element(n))web_avmedia_snapshot_reject_region(c,X,Y,W,H);
+        if(web_frame_element(n)&&web_avmedia_snapshot_is_probe())break;
         if(web_frame_paint(n,c,X,Y,W,H))break;
         if (n->tag == T_canvas) {
             web_canvas_paint(n,c,X,Y,W,H);
@@ -845,7 +857,8 @@ static void paint_replaced(struct pctx *P, box_t *b) {
     float x = P->ox + box_visual_x(b), y = P->oy + cy(b);
     int X = (int)roundf(x), Y = (int)roundf(y), W = (int)roundf(b->w), H = (int)roundf(b->h);
     canvas_t *c = P->c;
-    if (Y > c->cy1 || Y + H < c->cy0) return;
+    if (X >= c->cx1 || Y >= c->cy1 ||
+        (int64_t)X + W <= c->cx0 || (int64_t)Y + H <= c->cy0) return;
     if (b->atomic == AT_IMG) {
         node_t *n = b->node;
         struct web_image *im = n->image >= 0 && n->image < P->d->images.n ? P->d->images.v[n->image] : NULL;
@@ -861,7 +874,7 @@ static void paint_replaced(struct pctx *P, box_t *b) {
             if(fw>IMAGE_MAX_PIXELS || fh>IMAGE_MAX_PIXELS || fw*fh>IMAGE_MAX_PIXELS)return;
             fitted_w=(int)roundf(fw);fitted_h=(int)roundf(fh);
         }
-        image_t *s = im ? scaled_image(im, fitted_w, fitted_h) : NULL;
+        image_t *s = im ? scaled_image(im, fitted_w, fitted_h, c, X, Y, W, H) : NULL;
         if (s) {
             float dx=len_resolve(&b->st->object_pos[0],(float)(W-fitted_w));
             float dy=len_resolve(&b->st->object_pos[1],(float)(H-fitted_h));
@@ -886,7 +899,10 @@ static void paint_replaced(struct pctx *P, box_t *b) {
     if (b->atomic == AT_SVG && b->svg) {
         struct svg_cache *sc = b->svg;
         if (!sc->img || sc->w != W || sc->h != H) {
-            if(web_avmedia_snapshot_is_probe()){web_avmedia_snapshot_reject();return;}
+            if(web_avmedia_snapshot_is_probe()){
+                web_avmedia_snapshot_reject_region(c,X,Y,W,H);
+                return;
+            }
             if (sc->img) image_free(sc->img);
             sc->img = W > 0 && H > 0 && (long)W * H <= IMAGE_MAX_PIXELS ? image_decode_svg(sc->src, sc->n, W, H) : NULL;
             sc->w = W;
@@ -1185,7 +1201,6 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     uint32_t *saved = NULL;
     int gx = 0, gy = 0, gw = 0, gh = 0;
     if (P->mode == M_PAINT && group_opacity < 1 && b->kind != B_TEXT) {
-        web_avmedia_snapshot_reject();
         struct pctx measure = *P; measure.mode = M_BOUNDS; measure.bounds_valid = false;
         paint_box(&measure, b, true);
         if (measure.failed) { P->failed = true; pv_free(&layers); return; }
@@ -1196,6 +1211,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             if (right > P->vx1) right = P->vx1; if (bottom > P->vy1) bottom = P->vy1;
             if (right > left && bottom > top) {
                 gx = (int)left; gy = (int)top; gw = (int)(right - left); gh = (int)(bottom - top);
+                web_avmedia_snapshot_reject_region(c,gx,gy,gw,gh);
                 if ((size_t)gw > SIZE_MAX / sizeof *saved / (size_t)gh ||
                     !(saved = malloc(sizeof *saved * (size_t)gw * (size_t)gh))) {
                     P->failed = true; pv_free(&layers); return; /* never paint an unfiltered substitute */

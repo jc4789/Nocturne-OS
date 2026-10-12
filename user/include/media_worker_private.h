@@ -2,7 +2,7 @@
 #pragma once
 #include "media.h"
 #include <stdint.h>
-#define NMEDIA_WORKER_MAGIC 0x4e4d5732u /* v2: independent VIDEO lane */
+#define NMEDIA_WORKER_MAGIC 0x4e4d5734u /* v4: exact VIDEO observation configuration */
 #define NMW_VIDEO_PENDING 4 /* STEP ACK; actual pixels follow on VIDEO fd */
 enum { NMW_OPEN=1, NMW_STEP=2, NMW_SEEK=3 };
 struct nmedia_worker_command {
@@ -17,14 +17,18 @@ struct nmedia_worker_response {
     uint32_t payload_bytes, frames, audio, video, channels, sample_rate, reserved;
     int64_t pts_ms, duration_ms;
     char audio_codec[32], video_codec[32], container[32], error[160];
+    struct nmedia_audio_observation audio_observation;
 };
 struct nmedia_worker_video {
     uint32_t magic,generation,sequence,bytes;
     uint64_t epoch;int64_t pts;int32_t width,height;
+    uint64_t video_measured_frames,video_work_ms;
+    uint64_t video_measurement_id;
+    struct nmedia_video_configuration video_configuration;
 };
-_Static_assert(sizeof(struct nmedia_worker_video)==40,"Range VIDEO wire v2");
+_Static_assert(sizeof(struct nmedia_worker_video)==96,"Range VIDEO wire v4");
 _Static_assert(sizeof(struct nmedia_worker_command)==40,"native media command v2 layout");
-_Static_assert(sizeof(struct nmedia_worker_response)==328,"native media response layout");
+_Static_assert(sizeof(struct nmedia_worker_response)==368,"native media response v4 layout");
 typedef struct nmedia_worker nmedia_worker;
 nmedia_worker *nmedia_worker_open(const char *url,const char *native_document,
                                   uint32_t generation,char *error,size_t size);

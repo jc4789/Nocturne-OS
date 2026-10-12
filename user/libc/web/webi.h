@@ -256,6 +256,7 @@ typedef struct len {
     struct cexpr *expr;
 } len_t;
 float len_resolve(const len_t *l, float base); /* LK_AUTO/LK_NONE resolve to 0 */
+bool css_length_equal(const len_t *,const len_t *); /* semantic computed expression, not arena address */
 bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d); /* fallible/cancellable computed value; append/NUL or restore */
 struct css_filter_step { float value; bool percentage; };
 struct css_filter {
@@ -359,6 +360,10 @@ struct css_motion {
     struct css_easing easing;
     uint8_t direction, fill, paused;
 };
+/* Two-dimensional translation subset; percentages retain the element's
+ * border-box reference instead of the normal-flow containing-block size. */
+struct css_transform {struct css_transform *next;len_t xy[2];};
+struct css_translate {len_t xy[2];bool active;};
 typedef struct style {
     uint8_t display, position, float_, clear, white_space, text_align, vertical_align, list_style,
         list_style_inside, font_style, text_transform, text_decoration, overflow, box_sizing, visibility, pointer_events,
@@ -374,6 +379,7 @@ typedef struct style {
     uint8_t font_family; /* FONT_FAMILY_*; inherited as one byte */
     const char *font_names; /* full authored family list, computed-style arena */
     font_t *named_font;     /* document-owned downloaded face, never AST-owned */
+    const struct web_font_choice *font_choices; /* computed-arena composite family */
     uint8_t object_fit;
     len_t object_pos[2]; /* position within (content box - fitted image) */
     float font_size;
@@ -398,6 +404,8 @@ typedef struct style {
     float border_spacing;
     float opacity;
     const struct css_filter *filter; /* NULL: none; identity effects still establish a context */
+    const struct css_transform *transform;
+    struct css_translate translate;
     struct css_motion motion; /* native opacity animation subset; not inherited */
     int z_index, order;
     const char *content; /* ::before / ::after text, NULL = none */
@@ -573,6 +581,7 @@ typedef struct box {
     float paint_bounds[4]; /* document-space conservative subtree bounds, one paint only */
     bool paint_bounds_valid;
     bool paint_alpha; /* existing build/restyle traversal aggregates real subtree alpha effects */
+    bool style_sync_dirty; /* retirement join: this subtree has changed style borrows */
     /* inline formatting results (block containers with inline content) */
     struct run *runs;
     int nruns;
@@ -586,7 +595,7 @@ typedef struct box {
     float min_cw, max_cw;
     bool intrinsic_done;
     arena_t layout_mem, text_mem;
-    bool layout_dirty, layout_cache_valid, layout_cache_safe;
+    bool layout_dirty, layout_cache_valid, layout_cache_safe,layout_cache_exports_floats;
     bool stretch_height_dependent;
     float cached_width, cached_cbh, cached_usedh;
     float cached_height, cached_baseline, cached_last_baseline, cached_content_dy;
@@ -660,12 +669,16 @@ void boxes_discard(web_doc *d); /* unpublish node/top-layer borrowers, then bmem
 void layout_doc(web_doc *d, int width, int height);
 void layout_clamp_trace_report(web_doc *d);
 void layout_invalidate(box_t *b);
+void layout_invalidate_fonts(box_t *b);
 float box_abs_x(const box_t *b);
 float box_abs_y(const box_t *b);
 /* Paint/hit/DOMRect positions; box_abs remains unscrolled offset geometry. */
 float box_visual_x(const box_t *b);
 float box_visual_y(const box_t *b);
-bool box_filter_containing_block(const box_t *b); /* excludes the document root and boxless contents */
+bool box_filter_containing_block(const box_t *b); /* filters/transforms establish descendant containing blocks */
+bool css_translation_active(const style_t *s);
+enum { CSS_TRANSLATE_INDIVIDUAL=1,CSS_TRANSLATE_TRANSFORM=2 };
+float box_translation_axis(const box_t *b,unsigned axis,unsigned sources);
 bool box_viewport_fixed(const box_t *b); /* actual layout CB, not merely position:fixed */
 void box_abs_cb_rect(const box_t *cb, const web_doc *d, float rect[4]); /* x/y/w/h of padding CB in its content coordinates */
 void web_paint_debug_node_free(node_t *node);
@@ -677,6 +690,7 @@ typedef struct wfont {
     font_t *ttf; /* NULL: monospace bitmap */
     float px;
     bool bold;
+    const struct web_font_choice *choices;
 } wfont;
 wfont style_font(const style_t *st);
 float wf_width(const wfont *f, const char *s, size_t n);
@@ -694,6 +708,7 @@ struct web_image {
     char *svg;       /* SVG source, rasterized again at the size it is drawn at */
     size_t svg_n;
     bool done, failed;
+    uint64_t loading_id; /* The owning transport request, not a global resource-count gate. */
     bool image_upgrade; /* Part of request identity: imageset must not share an upgraded image. */
 };
 
@@ -755,12 +770,16 @@ struct web_doc {
     uint8_t dom_create_reported; /* one numeric failure diagnostic per stage */
     bool frame_allocation_reported;
     uint64_t dom_revision;
+    uint64_t metadata_revision;
+    bool metadata_valid;
     uint64_t layout_revision;
     struct html_parser *parser;
     struct web_js_state *js;
     bool live, dirty, paint_dirty, resources_dirty, images_dirty;
     pvec css_cache;
     struct css_sheet_reuse *css_reuse; /* immutable live inline ASTs, no DOM ownership */
+    struct css_sheet_reuse **css_reuse_buckets;
+    size_t css_reuse_capacity;
     size_t css_reuse_bytes;
     unsigned css_reuse_count;
     size_t css_bytes;
@@ -806,7 +825,11 @@ struct web_doc {
     web_doc *active_leaf; /* top document's pressed context; native arenas remain owned */
     struct web_dialog_state *dialogs; /* native modal/top-layer ownership */
     node_t *fullscreen_element,*pip_element;
-    uint64_t presentation_revision;
+    web_doc *fullscreen_owner,*pip_owner; /* top document's native presentation lease */
+    char *presentation_policy; /* Permissions-Policy response snapshot only */
+    uint8_t presentation_inherited;bool presentation_policy_ready;
+    struct web_presentation_event *presentation_events,*presentation_events_tail;
+    uint64_t presentation_revision,pip_session;
     int pip_width,pip_height;
     bool (*presentation_host)(void *,web_doc *,web_node *,int);
     void *presentation_opaque;
@@ -839,6 +862,14 @@ struct web_font_resource {
     char *url;
     font_t *face;
     bool wanted, loading, done, failed;
+};
+struct web_font_range { uint32_t first,last; };
+struct web_font_choice {
+    struct web_font_choice *next;
+    struct web_font_resource *resource;
+    font_t *face; /* selection snapshot for loaded-font invalidation */
+    const struct web_font_range *ranges;
+    size_t range_count; /* zero: U+0-10FFFF */
 };
 struct web_font_resource *doc_font_resource(web_doc *d, const char *url);
 void doc_font_loaded(web_doc *d, struct web_font_resource *font, const void *bytes, size_t length);

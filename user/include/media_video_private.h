@@ -11,6 +11,7 @@ bool nmedia_move_video(struct nmedia *,const struct nmedia_output *,uint32_t **,
  * frames are fully decoded, but obsolete output need not become ARGB/IPC. */
 void nmedia_video_time(struct nmedia *,int64_t);
 void nmedia_video_stats(const struct nmedia *,uint64_t *decoded,uint64_t *dropped);
+void nmedia_video_performance(const struct nmedia *,uint64_t *frames,uint64_t *work_ms);
 
 /* ARGB storage follows actual dimensions, not a configured pixel quota.
  * Pointer offsets and allocation bytes must remain representable. Metadata

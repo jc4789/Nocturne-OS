@@ -5,6 +5,8 @@
 #undef main
 #include <math.h>
 #include "form_value.h"
+#include "form_file.h"
+#include "form_face.h"
 
 static void native_value_cases(void) {
     const char html[] = "<!doctype html><html><head></head><body><form></form></body></html>";
@@ -166,7 +168,70 @@ static void native_parser_select_case(void) {
     close_case();
 }
 
+static void native_formdata_selected_case(void) {
+    const char *html=START "</head><body><form id='files'><input id='selected' type='file' name='upload'><input id='copy' type='file' name='copy'><input id='image' type='image' name='image'></form><script>"
+        "globalThis.formDataSelectedProbe=async()=>{const f=document.getElementById('files'),i=document.getElementById('selected'),copy=document.getElementById('copy'),image=document.getElementById('image');"
+        "const original=i.files[0],data=new FormData(f);check('fd-selected-file-identity',data.get('upload')===original);"
+        "check('fd-selected-name',original.name==='picked.txt');check('fd-selected-type',original.type==='text/plain');check('fd-selected-modified',original.lastModified===5678);"
+        "check('fd-selected-bytes',(await data.get('upload').text())==='native-file-bytes');"
+        "const previousMap=Array.prototype.map;Array.prototype.map=function(){throw new Error('author map must not read private FileList');};try{copy.files=i.files;}finally{Array.prototype.map=previousMap;}"
+        "check('fd-setter-original-identity',copy.files[0]===original);check('fd-setter-original-bytes',(await new FormData(f).get('copy').text())==='native-file-bytes');"
+        "const event=new Event('click',{bubbles:true,cancelable:true});image.dispatchEvent(event);image.click();const coordinates=new FormData(f,image);"
+        "check('fd-image-negative-x',coordinates.get('image.x')==='-4');check('fd-image-stored-y',coordinates.get('image.y')==='9');mark('fd-selected-done');};"
+        "document.getElementById('files').addEventListener('fd-selected-run',()=>formDataSelectedProbe().catch(e=>{console.log('FAIL formdata selected '+e+' '+e.stack);mark('fd-selected-done');}));mark('fd-selected-ready');</script></body>";
+    if(!open_case(html,false))return;
+    test_check("fd-selected-ready",pump("fd-selected-ready",5000));
+    node_t *form=fixture.doc->body->first,*input=form?form->first:NULL,*copy=input?input->next:NULL,*image=copy?copy->next:NULL;
+    test_check("fd-selected-native-tree",input&&copy&&image);if(!input||!image){close_case();return;}
+    struct web_form_files *files=web_input_files_create();
+    bool ready=files&&web_input_files_reserve(files,1);
+    if(ready){struct web_form_file *file=&files->files[0];memset(file,0,sizeof *file);strcpy(file->name,"picked.txt");strcpy(file->type,"text/plain");file->size=17;file->last_modified=5678;file->bytes=malloc(file->size);ready=file->bytes!=NULL;if(ready){memcpy(file->bytes,"native-file-bytes",file->size);files->count=1;files->allocation+=file->size;ready=web_input_files_replace(fixture.doc,input,files);}}
+    test_check("fd-selected-native-install",ready);web_input_files_dispose(files);if(!ready){close_case();return;}
+    image->image_submit_x=-4;image->image_submit_y=9;
+    struct web_event invoke={.type="fd-selected-run"};
+    /* Execute through a real DOM event listener, not a fabricated FormData host. */
+    web_dispatch(fixture.doc,form,&invoke);
+    test_check("fd-selected-finished",pump("fd-selected-done",15000));
+    test_check("fd-selected-no-js-errors",fixture.errors==0&&fixture.js_failures==0);close_case();
+}
+
+static void native_metadata_dependency_case(void) {
+    const char *html=START "<base href='/first/'></head><body><form><input name='value'></form><div><span>before</span></div><script>mark('metadata-ready');</script></body>";
+    if(!open_case(html,false))return;
+    test_check("metadata-native-ready",pump("metadata-ready",5000));
+    web_doc *d=fixture.doc;doc_sync_tree(d);
+    node_t *base=d->head?d->head->first:NULL;
+    while(base&&base->tag!=T_base)base=base->next;
+    node_t *form=d->body?d->body->first:NULL,*input=form?form->first:NULL,*regular=form?form->next:NULL,*span=regular?regular->first:NULL;
+    test_check("metadata-native-tree",base&&input&&span);if(!base||!input||!span){close_case();return;}
+    uint64_t visits=d->profile.metadata_visits;
+    for(unsigned i=0;i<32;i++){
+        doc_node_attr(d,regular,"class",i&1?"one":"two");doc_node_value(d,input,"value",5);
+        doc_node_text(d,span,i&1?"before":"after",i&1?6:5);doc_sync_tree(d);
+    }
+    test_check("metadata-unrelated-mutations-do-not-rescan",d->profile.metadata_visits==visits&&d->metadata_valid);
+    test_check("metadata-unrelated-base-preserved",!strcmp(d->base,"http://fixture.test/first/"));
+    test_check("metadata-href-change",doc_node_attr(d,base,"href","/second/")&&!d->metadata_valid);doc_sync_tree(d);
+    test_check("metadata-href-current",!strcmp(d->base,"http://fixture.test/second/")&&d->profile.metadata_visits>visits);
+    node_t *earlier=doc_node_create(d,N_ELEM,"base",NULL,0);
+    bool inserted=earlier&&doc_node_attr(d,earlier,"href","/earlier/")&&doc_node_move(d,d->head,earlier,base);
+    test_check("metadata-first-base-insert-invalidates",inserted&&!d->metadata_valid);doc_sync_tree(d);
+    test_check("metadata-insert-tree-order",!strcmp(d->base,"http://fixture.test/earlier/"));
+    test_check("metadata-base-reorder-invalidates",doc_node_move(d,d->head,earlier,NULL)&&!d->metadata_valid);doc_sync_tree(d);
+    test_check("metadata-reorder-tree-order",!strcmp(d->base,"http://fixture.test/second/"));
+    doc_node_remove(d,base);test_check("metadata-base-removal-invalidates",!d->metadata_valid);doc_sync_tree(d);
+    test_check("metadata-removal-tree-order",!strcmp(d->base,"http://fixture.test/earlier/"));
+    test_check("metadata-url-change-invalidates",web_set_url(d,"http://fixture.test/new/page")&&!d->metadata_valid);
+    test_check("metadata-no-js-errors",fixture.errors==0&&fixture.js_failures==0);close_case();
+}
+
 int main(int argc, char **argv) {
+    if(argc>1&&!strcmp(argv[1],"formdata-entries")){
+        external_case("js_form_controls_cases.js",";runFormDataEntryCases().then(n=>{check('fd-entry-case-count',n>=35);mark('api-done');},e=>{console.log('FAIL formdata entries '+e+' '+e.stack);mark('api-done');});",BASE);
+        native_formdata_selected_case();
+        native_metadata_dependency_case();
+        printf("js_form_controls_native/formdata-entries: %d checks, %d failed\n",total,failed);return failed!=0;
+    }
     (void)argc; (void)argv;
     external_case("js_form_controls_cases.js", ";try{const n=runFormControlCases();console.log('Input value checks '+n);check('input-value-count',n>300);}catch(e){console.log('FAIL input-value '+e+' '+e.stack);}mark('api-done');", BASE);
     native_value_cases(); native_key_case(); native_select_cases(); native_parser_select_case();

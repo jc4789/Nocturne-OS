@@ -2,6 +2,7 @@
 #include "media_alloc_private.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Native demux AVIO offsets are signed 64-bit; not a staging memory quota. */
@@ -9,7 +10,8 @@
 #define TAG(a,b,c,d) (((uint32_t)(a)<<24)|((uint32_t)(b)<<16)|((uint32_t)(c)<<8)|(uint32_t)(d))
 
 struct parser { const uint8_t *b; size_t n,count; char *error; size_t error_size;
-    const struct nmedia_mse_track_size *sizes;size_t size_count; };
+    const struct nmedia_mse_track_size *sizes;size_t size_count;
+    bool collect_times;struct nmedia_mse_sample_time *times;size_t time_count,time_capacity; };
 struct box { uint32_t type; size_t start, body, end; };
 struct run { size_t first, last; bool known, covered; };
 struct fragment { struct run *runs; size_t count, capacity, trafs; bool unknown, explicit_base; };
@@ -167,7 +169,7 @@ static int validate_init(struct parser *p, const struct box *moov) {
 static int validate_traf(struct parser *p, const struct box *traf, size_t moof,
                          struct fragment *f) {
     size_t at = traf->body, cursor = 0;
-    uint32_t default_size = 0;
+    uint32_t default_size = 0,default_duration=0,track_id=0;
     bool tfhd = false, tfdt = false, trun = false, cursor_known = false;
     bool default_known = false, base_is_moof = false;
     /* tfhd defaults apply to all runs, regardless of sibling ordering. */
@@ -179,15 +181,18 @@ static int validate_traf(struct parser *p, const struct box *traf, size_t moof,
             tfhd = true;
             uint32_t flags = be32(p->b+b.body)&0xffffff;
             if (flags & ~0x03003bu || flags & 1u) return fail(p, "External MP4 base offset is unsupported");
-            uint32_t track_id=be32(p->b+b.body+4);
+            track_id=be32(p->b+b.body+4);
             if (!track_id) return fail(p, "Invalid track ID");
             size_t low=0,high=p->size_count;
             while(low<high){size_t mid=low+(high-low)/2;if(p->sizes[mid].track_id<track_id)low=mid+1;else high=mid;}
-            if(low<p->size_count&&p->sizes[low].track_id==track_id){default_size=p->sizes[low].sample_size;default_known=true;}
+            if(low<p->size_count&&p->sizes[low].track_id==track_id){default_size=p->sizes[low].sample_size;default_duration=p->sizes[low].sample_duration;default_known=true;}
             base_is_moof = (flags&0x020000u) != 0;
             size_t off = b.body+8;
             if (flags&2) off += 4;
-            if (flags&8) off += 4;
+            if (flags&8) {
+                if(off>b.end||b.end-off<4)return fail(p,"Truncated sample duration default");
+                default_duration=be32(p->b+off);off+=4;
+            }
             if (flags&16) {
                 if (off > b.end || b.end-off < 4) return fail(p, "Truncated sample defaults");
                 default_size = be32(p->b+off); default_known = true; off += 4;
@@ -234,6 +239,24 @@ static int validate_traf(struct parser *p, const struct box *traf, size_t moof,
                 }
             } else if (default_known) bytes = (uint64_t)samples*default_size;
             if (bytes > LIMIT || (known && cursor > LIMIT-bytes)) return fail(p, "Oversized track run");
+            if(p->collect_times&&known&&((flags&0x200)||default_size)&&((flags&0x100)||default_duration)){
+                /* Zero-byte samples need no demux mapping. Metadata remains
+                   proportional to actual encoded samples, not packet-by-packet
+                   rescans of the fragment or a new fixed sample-count limit. */
+                size_t position=cursor;
+                for(uint32_t i=0;i<samples;i++){
+                    const uint8_t *sample=p->b+off+(size_t)i*fields;
+                    uint32_t duration=flags&0x100?be32(sample):default_duration;
+                    uint32_t size=flags&0x200?be32(sample+((flags&0x100)?4:0)):default_size;
+                    if(size&&duration){
+                        if(p->time_count==SIZE_MAX)return fail(p,"Sample time count overflow");
+                        struct nmedia_mse_sample_time *times=grow_records(p,p->times,&p->time_capacity,p->time_count+1,sizeof *times);
+                        if(!times)return NMEDIA_MSE_PARSE_MEMORY;p->times=times;
+                        p->times[p->time_count++]=(struct nmedia_mse_sample_time){position,track_id,duration};
+                    }
+                    position+=size;
+                }
+            }
             if (samples) {
                 if(f->count==SIZE_MAX)return fail(p,"Track run count overflow");
                 struct run *runs=grow_records(p,f->runs,&f->capacity,f->count+1,sizeof *runs);
@@ -636,12 +659,33 @@ int nmedia_mse_init_sizes(const uint8_t *bytes,size_t length,struct nmedia_mse_t
                 struct nmedia_mse_track_size *next=grow_records(&p,sizes,&capacity,used+1,sizeof *sizes);
                 if(!next){nmedia_ff_free(sizes);return NMEDIA_MSE_PARSE_MEMORY;}sizes=next;
                 for(size_t i=used;i>index;i--)sizes[i]=sizes[i-1];
-                sizes[index]=(struct nmedia_mse_track_size){id,be32(bytes+trex.body+16)};used++;
+                sizes[index]=(struct nmedia_mse_track_size){id,be32(bytes+trex.body+16),be32(bytes+trex.body+12)};used++;
             }
         }
     }
     *out=sizes;*out_count=used;return 1;
 invalid:nmedia_ff_free(sizes);return fail(&p,"Invalid or duplicate initialization track defaults");
+}
+static int sample_time_compare(const void *a,const void *b){
+    const struct nmedia_mse_sample_time *x=a,*y=b;
+    if(x->offset!=y->offset)return x->offset<y->offset?-1:1;
+    return x->track_id<y->track_id?-1:x->track_id>y->track_id;
+}
+int nmedia_mse_fragment_times(const uint8_t *bytes,size_t length,const struct nmedia_mse_track_size *sizes,size_t size_count,
+                             struct nmedia_mse_sample_time **out,size_t *out_count,char *error,size_t error_size){
+    struct parser p={.b=bytes,.n=length,.error=error,.error_size=error_size,.sizes=sizes,.size_count=size_count,.collect_times=true};
+    if(!out||!out_count)return fail(&p,"Missing sample times output");*out=NULL;*out_count=0;
+    if((!bytes&&length)||length>LIMIT)return fail(&p,"Invalid sample times input");
+    int result=1;
+    for(size_t at=0;at<length;){
+        struct box box;result=box_at(&p,at,length,true,&box);if(result<=0){if(!result)result=fail(&p,"Truncated sample times input");goto failed;}at=box.end;
+        if(box.type!=TAG('m','o','o','f'))continue;
+        struct fragment fragment={0};result=validate_moof(&p,&box,&fragment);nmedia_ff_free(fragment.runs);
+        if(result<0)goto failed;
+    }
+    if(p.time_count)qsort(p.times,p.time_count,sizeof *p.times,sample_time_compare);
+    *out=p.times;*out_count=p.time_count;return 1;
+failed:nmedia_ff_free(p.times);return result;
 }
 
 static int64_t duration_ms(uint64_t units, uint32_t scale) {

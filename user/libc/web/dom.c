@@ -408,7 +408,7 @@ static void changed(web_doc *d,node_t *n,bool resources) {
     changed_geometry(d,n,resources,true,false);
 }
 void doc_mutated(web_doc *d, node_t *n) {
-    if (d && !n) { d->js_nodes_dirty = true; d->need_boxes = true; }
+    if (d && !n) { d->js_nodes_dirty = true; d->need_boxes = true; d->metadata_valid=false; }
     changed(d, n, true);
     /* NULL denotes a parser's complete forest transaction. Ordinary control or
        CharacterData notifications cannot change assignment; structural/attribute
@@ -444,11 +444,24 @@ static bool resource_ancestor(node_t *n) {
         (n->tag == T_style || n->tag == T_title || n->tag == T_textarea || n->tag == T_select)) return true;
     return false;
 }
+static bool metadata_subtree(node_t *root) {
+    for(node_t *n=root;n;n=tree_next(n,root,false,false,n->foreign||n->tag!=T_template))
+        if(n->type==N_ELEM&&!n->foreign&&n->tag==T_base&&node_attr(n,"href"))return true;
+    return false;
+}
 static void structure_changed_lifetime(web_doc *d, node_t *parent, node_t *subtree, bool lifetime_changed) {
     html_bridge_native_changed(parent, HTML_BRIDGE_CHILDREN);
     cssom_style_text_changed(parent);
     if (lifetime_changed) cssom_style_lifecycle(subtree);
     if (d && lifetime_changed) d->js_nodes_dirty = true;
+    /* documentElement/head/body identities and the first ordinary-tree base
+       are metadata dependencies. Class/text/control/ARIA and shadow/template
+       mutations are not. Inspect the moved subtree even after detach: the
+       old live parent still owns removal invalidation at this boundary. */
+    if(d&&d->metadata_valid&&doc_node_root(parent,false)==d->root&&
+       !node_ancestor(parent,T_template)&&
+       (parent->type==N_DOC || parent==d->html || metadata_subtree(subtree)))
+        d->metadata_valid=false;
     if (d && doc_node_root(parent, true) == d->root) d->need_boxes = true;
     changed(d, parent, parent->type==N_DOC || resource_ancestor(parent) || resource_subtree(subtree));
 }
@@ -687,9 +700,7 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
     if (found < 0 && !value) return true;
     bool html_image = !n->foreign && n->tag == T_img;
     bool image_candidate = !ns && !n->foreign && !strcmp(name, low) &&
-        ((html_image && (!strcmp(low, "src") || !strcmp(low, "srcset") || !strcmp(low, "sizes") ||
-          !strcmp(low, "data-src") || !strcmp(low, "data-lazy-src") || !strcmp(low, "data-original") ||
-          !strcmp(low, "data-srcset"))) ||
+        ((html_image && (!strcmp(low, "src") || !strcmp(low, "srcset") || !strcmp(low, "sizes"))) ||
          (n->tag == T_source && n->parent && !n->parent->foreign && n->parent->tag == T_picture &&
           (!strcmp(low, "srcset") || !strcmp(low, "sizes") || !strcmp(low, "media") || !strcmp(low, "type"))));
     bool resources = n->tag == T_base || n->tag == T_link || n->tag == T_style ||
@@ -741,6 +752,8 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
     n->nclasses = temp.nclasses;
     d->mem.trap = old;
     bool ordinary = !ns && !n->foreign && !strcmp(name, low);
+    if(!ns&&!n->foreign&&n->tag==T_base&&!strcmp(low,"href")&&doc_node_root(n,false)==d->root&&
+       !node_ancestor(n,T_template))d->metadata_valid=false;
     if (ordinary && !strcmp(low,"form")) doc_parser_form_set(n,NULL);
     if (ordinary && n->tag==T_style && !strcmp(low,"type")) cssom_style_lifecycle(n);
     if (ordinary && n->tag == T_link && (!strcmp(low,"href") || !strcmp(low,"rel") ||

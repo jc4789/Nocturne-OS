@@ -225,8 +225,31 @@ struct cexpr {
     float px, pct;
     struct cexpr *a, *b;
 };
+static bool expression_equal(const struct cexpr *a,const struct cexpr *b){
+    struct expression_pair {const struct cexpr *a,*b;} local[32],*pending=local;
+    size_t count=0,capacity=32;bool equal=true;
+    for(;;){
+        if(a!=b){
+            if(!a||!b||a->op!=b->op||(a->op=='v'&&(a->num!=b->num||a->px!=b->px||a->pct!=b->pct))){equal=false;break;}
+            if(a->b!=b->b){
+                if(count==capacity){size_t n=capacity*2;
+                    if(n<capacity||n>SIZE_MAX/sizeof *pending){equal=false;break;}
+                    struct expression_pair *v=malloc(n*sizeof *v);if(!v){equal=false;break;}
+                    memcpy(v,pending,count*sizeof *v);if(pending!=local)free(pending);pending=v;capacity=n;
+                }
+                pending[count++]=(struct expression_pair){a->b,b->b};
+            }
+            a=a->a;b=b->a;continue;
+        }
+        if(!count)break;struct expression_pair p=pending[--count];a=p.a;b=p.b;
+    }
+    if(pending!=local)free(pending);return equal;
+}
+bool css_length_equal(const len_t *a,const len_t *b){
+    return a==b||(a&&b&&a->kind==b->kind&&a->px==b->px&&a->pct==b->pct&&expression_equal(a->expr,b->expr));
+}
 
-enum { LF_AUTO = 1, LF_NONE = 2, LF_NEG = 4, LF_NORMAL = 8, LF_NOPCT = 16 };
+enum { LF_AUTO = 1, LF_NONE = 2, LF_NEG = 4, LF_NORMAL = 8, LF_NOPCT = 16, LF_LENGTH = 32 };
 
 /* a dimension: number + unit; false if the unit is unknown */
 static bool unit_px(const char *u, size_t un, float v, const struct cx *cx, float *px, float *pct, bool *num) {
@@ -607,6 +630,13 @@ bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d) {
     return success;
 }
 
+static bool calc_dimension(const struct cexpr *x,bool *number){
+    if(!x)return false;if(x->op=='v'){*number=x->num;return true;}
+    bool a,b;if(!calc_dimension(x->a,&a)||!calc_dimension(x->b,&b))return false;
+    if(x->op=='*'){if(!a&&!b)return false;*number=a&&b;return true;}
+    if(x->op=='/'){if(!b)return false;*number=a;return true;}
+    if(a!=b)return false;*number=a;return true;
+}
 static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int flags) {
     trim(&s, &n);
     if (!n) return false;
@@ -651,6 +681,7 @@ static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int fl
         struct cexpr *x = calc_value(&p, s + n, cx);
         cskip(&p, s + n);
         if (!x || p != s + n || (cx->supports_probe && cx->invalid)) return false;
+        if(flags&LF_LENGTH){bool number;if(!calc_dimension(x,&number)||number)return false;}
         bool num;
         float px, pct;
         if (cfold(x, &num, &px, &pct)) {
@@ -670,6 +701,7 @@ static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int fl
     if (!parse_number(&p, s + n, &v)) return false;
     bool num;
     if (!unit_px(p, (size_t)(s + n - p), v, cx, &out->px, &out->pct, &num)) return false;
+    if((flags&LF_LENGTH)&&num&&v!=0)return false;
     if ((flags & LF_NOPCT) && out->pct) return false;
     if (!(flags & LF_NEG) && v < 0) return false;
     out->kind = LK_LEN;
@@ -943,7 +975,7 @@ struct kw {
 enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_FONT_SIZE, PT_FONT_WEIGHT,
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
        PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
-       PT_MOTION_NAME, PT_MOTION_TIME, PT_MOTION_ITERATIONS, PT_MOTION_EASING };
+       PT_MOTION_NAME, PT_MOTION_TIME, PT_MOTION_ITERATIONS, PT_MOTION_EASING, PT_TRANSFORM, PT_TRANSLATE };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
@@ -1203,6 +1235,8 @@ static struct propdef props[] = {
     {"text-transform", PT_KW, 0, true, O(text_transform), kw_ttrans, 0},
     {"text-wrap-mode", PT_KW, 0, true, O(white_space), kw_textwrap, 0},
     {"top", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[0]), NULL, 0},
+    {"transform", PT_TRANSFORM, 0, false, O(transform), NULL, 0},
+    {"translate", PT_TRANSLATE, 0, false, O(translate), NULL, 0},
     {"vertical-align", PT_VALIGN, 0, false, O(vertical_align), kw_valign, 0},
     {"visibility", PT_KW, 0, true, O(visibility), kw_visibility, 0},
     {"white-space", PT_KW, 0, true, O(white_space), kw_ws, 0},
@@ -1216,6 +1250,7 @@ static struct propdef props[] = {
 static const struct {
     const char *alias, *name;
 } aliases[] = {
+    {"-webkit-transform", "transform"},
     {"block-size", "height"}, {"border-block-end", "border-bottom"}, {"border-block-start", "border-top"},
     {"border-block-end-color", "border-bottom-color"}, {"border-block-start-color", "border-top-color"},
     {"border-block-end-width", "border-bottom-width"}, {"border-block-start-width", "border-top-width"},
@@ -2103,7 +2138,7 @@ static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src)
     memcpy((char *)dst + p->off, (const char *)src + p->off, p->size);
     switch (p->type) {
     case PT_DISPLAY: dst->legacy_box = src->legacy_box; break;
-    case PT_FONT_FAMILY: dst->font_names=src->font_names;dst->named_font=src->named_font;break;
+    case PT_FONT_FAMILY: dst->font_names=src->font_names;dst->named_font=src->named_font;dst->font_choices=src->font_choices;break;
     case PT_VALIGN: dst->vertical_align_px = src->vertical_align_px; break;
     case PT_LIST_TYPE: dst->list_style_string = src->list_style_string; break;
     case PT_BG_IMAGE:
@@ -2116,6 +2151,37 @@ static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src)
     case PT_BG_SIZE: dst->bg_size_kind = src->bg_size_kind; break;
     case PT_MASK_SIZE: dst->mask_size_kind = src->mask_size_kind; break;
     }
+}
+
+static bool parse_translate_value(const char *v,size_t n,struct cx *cx,struct css_translate *out){
+    struct css_translate t={.xy={{.kind=LK_LEN},{.kind=LK_LEN}}};
+    if(ident_is(v,n,"none")){*out=t;return true;}
+    const char *parts[3];size_t lengths[3];int count=split_checked(v,n,parts,lengths,3,' ',cx);
+    if(count<1||count>2)return false; /* no invented 3D support */
+    for(int i=0;i<count;i++)if(!parse_len(parts[i],lengths[i],cx,&t.xy[i],LF_NEG|LF_LENGTH))return false;
+    t.active=true;*out=t;return true;
+}
+static bool parse_transform_value(const char *v,size_t n,struct cx *cx,const struct css_transform **out){
+    if(ident_is(v,n,"none")){*out=NULL;return true;}
+    const char *p=v,*end=v+n;struct css_transform *first=NULL,**tail=&first;
+    while(p<end){
+        while(p<end&&isspace((unsigned char)*p))p++;
+        if(p==end)break;
+        const char *name=p;while(p<end&&isalnum((unsigned char)*p))p++;
+        size_t name_length=(size_t)(p-name);
+        bool three=ident_is(name,name_length,"translate3d"),both=ident_is(name,name_length,"translate"),x=ident_is(name,name_length,"translateX"),y=ident_is(name,name_length,"translateY");
+        if((!three&&!both&&!x&&!y)||p==end||*p!='(')return false;
+        const char *args=++p;unsigned depth=1;
+        while(p<end&&depth){if(*p=='(')depth++;else if(*p==')')depth--;if(depth)p++;}
+        if(depth)return false;
+        const char *parts[4];size_t lengths[4];int count=split_checked(args,(size_t)(p-args),parts,lengths,4,',',cx);
+        if(three){len_t z;if(count!=3||memchr(parts[2],'%',lengths[2])||!parse_len(parts[2],lengths[2],cx,&z,LF_NEG|LF_NOPCT|LF_LENGTH)||len_resolve(&z,0)!=0)return false;count=2;}
+        else if(count<1||count>(both?2:1))return false;
+        struct css_transform value={.xy={{.kind=LK_LEN},{.kind=LK_LEN}}};
+        for(int i=0;i<count;i++)if(!parse_len(parts[i],lengths[i],cx,&value.xy[y?1:i],LF_NEG|LF_LENGTH))return false;
+        struct css_transform *node=ar_alloc(cx->a,sizeof *node);*node=value;*tail=node;tail=&node->next;p++;
+    }
+    if(!first)return false;*out=first;return true;
 }
 
 static bool apply_long(const struct propdef *p, const char *v, size_t n, struct cx *cx) {
@@ -2135,6 +2201,8 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         return true;
     }
     switch (p->type) {
+    case PT_TRANSFORM:return parse_transform_value(v,n,cx,&s->transform);
+    case PT_TRANSLATE:return parse_translate_value(v,n,cx,&s->translate);
     case PT_MOTION_NAME:
         if(!ident_is(v,n,"none") && !motion_name(v,n))return false;
         *(const char **)field=ident_is(v,n,"none")?NULL:ar_strndup(cx->a,v,n);return true;
@@ -2301,7 +2369,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     case PT_FONT_WEIGHT: return parse_font_weight(v, n, cx, &s->font_weight);
     case PT_FONT_FAMILY:
         if(!choose_family(v,n,&s->font_family,cx))return false;
-        s->font_names=ar_strndup(cx->a,v,n);s->named_font=NULL;return true;
+        s->font_names=ar_strndup(cx->a,v,n);s->named_font=NULL;s->font_choices=NULL;return true;
     case PT_LINE_HEIGHT: {
         len_t l;
         if (ident_is(v, n, "normal")) {
@@ -3076,7 +3144,9 @@ const char *css_ua_sheet(void) {
            "{ display: inline-block; }\n"
            "iframe { border: 2px inset; }\n"
            "frameset, frame { display:block; margin:0; padding:0; border:0; }\n"
-           "video, audio, canvas, iframe, embed { background-color: #e8e8e8; }\n"
+           /* HTML canvas starts with transparent black pixels. Giving replaced
+              elements an invented gray CSS background made an empty overlay
+              canvas hide the real video underneath it. */
            "fieldset { margin: 0 2px; padding: 0.35em 0.75em 0.625em; border: 2px groove #c0c0c0; }\n"
            "legend { padding: 0 2px; }\n"
            "input, select, textarea, button { font-size: 13.33px; font-family: sans-serif; color: black; "

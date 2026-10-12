@@ -2,7 +2,7 @@
 #include "media_mse_private.h"
 /* A native child owns a dynamic SourceBuffer registry. Wire has no pointers,
  * size_t, file paths or page-chosen protocols. */
-#define NMSW_MAGIC 0x4e4d5335u /* v5; truthful frame decode/drop deltas */
+#define NMSW_MAGIC 0x4e4d5337u /* v7; exact VIDEO observation configuration */
 #define NMSW_BUSY 4
 #define NMSW_CLOCK 5 /* Decoded disabled tracks: time only, never fake AV data. */
 #define NMSW_VIDEO_PENDING 6 /* STEP ACK: one VIDEO packet on its own lane. */
@@ -25,6 +25,7 @@ struct nmsw_response {
     uint32_t metadata_bytes,metadata_count;
     uint32_t dropped_frames;
     char error[160];
+    struct nmedia_audio_observation audio_observation;
 };
 /* Each record is followed by count ranges. Records are ordered by slot. */
 struct nmsw_metadata {
@@ -40,11 +41,14 @@ struct nmsw_video {
     uint64_t epoch,revision;
     int64_t pts;
     int32_t width,height;
+    uint64_t video_measured_frames,video_work_ms;
+    uint64_t video_measurement_id;
+    struct nmedia_video_configuration video_configuration;
 };
 _Static_assert(sizeof(struct nmsw_command)==72,"MSE command wire v3");
-_Static_assert(sizeof(struct nmsw_video)==56,"MSE VIDEO wire v3");
+_Static_assert(sizeof(struct nmsw_video)==112,"MSE VIDEO wire v7");
 _Static_assert(sizeof(struct nmsw_info)==128,"MSE info wire");
-_Static_assert(sizeof(struct nmsw_response)==232,"MSE response wire v5");
+_Static_assert(sizeof(struct nmsw_response)==272,"MSE response wire v7");
 _Static_assert(sizeof(struct nmsw_metadata)==160,"MSE metadata wire v2");
 typedef struct nmedia_mse_worker nmedia_mse_worker;
 nmedia_mse_worker *nmedia_mse_worker_open(uint32_t,char *,size_t);

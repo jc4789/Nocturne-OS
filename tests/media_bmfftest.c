@@ -24,7 +24,12 @@ int main(void){
         check(fread(data,1,(size_t)size,f)==(size_t)size,"fixture read");fclose(f);
         nmedia *direct=nmedia_open_memory(data,(size_t)size,error,sizeof error);check(direct!=NULL,"real BMFF decoder opens");
         nmedia_mse *mse=nmedia_mse_create(fixtures[i].mime,error,sizeof error);check(mse!=NULL,"real MSE stream opens");
-        if(mse){check(nmedia_mse_append(mse,data,(size_t)size,0,0,INT64_MAX,false),"whole fragmented BMFF append");check(nmedia_mse_end(mse,true),"MSE EOS");}
+        if(mse){check(nmedia_mse_append(mse,data,(size_t)size,0,0,INT64_MAX,false),"whole fragmented BMFF append");check(nmedia_mse_end(mse,true),"MSE EOS");
+            if(!strcmp(fixtures[i].codec,"vp9")){
+                struct nmedia_time_range ranges[8];size_t count=nmedia_mse_ranges(mse,ranges,8);
+                check(count==1&&ranges[0].start_ms==0&&ranges[0].end_ms==400,"MP4 sample durations preserve contiguous 10fps range");
+            }
+        }
         free(data);
         for(unsigned mode=0;mode<2;mode++){
             if(mode?!mse:!direct)continue;

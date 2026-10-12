@@ -33,7 +33,7 @@ static bool recovery_checkpoint(void *context){
 static void recovery_log(void *context,int level,const char *line){
     struct recovery_control *c=context;
     if(strstr(line,"Native processing cancelled:"))c->stopped++;
-    if(strstr(line,"Native view recovered from coherent DOM"))c->recovered++;
+    if(strstr(line,"Native rendering recovered from coherent DOM"))c->recovered++;
     if(level>=1)printf("RECOVERY %s\n",line);
 }
 static void cancelled_view_recovery(void){
@@ -74,6 +74,29 @@ static void cancelled_view_recovery(void){
     settle(d,20);
     check(!d->parser&&!node_attr(d->body,"data-ready")&&!node_attr(d->body,"data-load"),"cancelled parser never fakes ready or load callbacks");
     check(control.stopped==1&&control.recovered==1,"stop and recovery console diagnostics are emitted once");
+    web_free(d);
+}
+static void cancelled_render_resume(void){
+    const char *page="<!doctype html><body><a id=go href='/go'>go</a></body>";
+    struct recovery_control control={0};
+    struct web_host host={.opaque=&control,.console=recovery_log,.script_checkpoint=recovery_checkpoint};
+    web_doc *d=web_live(page,strlen(page),"https://parser.test/","utf-8",&host);
+    check(d!=NULL,"render resume document");if(!d)return;control.document=d;
+    settle(d,8);
+    check(!d->parser&&eval(d,"if(document.readyState!=='complete')throw new Error('parser incomplete')"),"real parser and lifecycle completed before native interruption");
+    check(eval(d,"window.nativeResumeCount=0;setTimeout(()=>{window.nativeResumeCount++;const r=document.body.getBoundingClientRect();if(r.width<=0)throw new Error('unrecovered geometry');document.body.setAttribute('data-resumed','yes')},40)"),"queued author timer exists before interrupted rendering");
+    node_t *go=find_id(d->root,"go");
+    d->need_style=d->need_boxes=d->resources_dirty=true;
+    d->native_checkpoint_count=63;control.armed=true;
+    web_layout(d,320,200);
+    check(!control.inside_author&&d->native_cancelled&&!d->layout_valid&&!d->root_box,"autonomous native transaction cancelled without author stack");
+    web_tick(d,uptime_ms());
+    check(!d->native_cancelled&&!d->native_recovery_pending&&d->layout_valid&&find_id(d->root,"go")==go,"normal tick rebuilds coherent rendering before author callbacks");
+    settle(d,65);
+    check(node_attr(d->body,"data-resumed")&&!strcmp(node_attr(d->body,"data-resumed"),"yes"),"queued author timer survives native-only cancellation");
+    check(eval(d,"if(nativeResumeCount!==1)throw new Error('timer count');document.body.setAttribute('data-after','alive')"),"new author task remains executable after rendering recovery");
+    check(node_attr(d->body,"data-after")&&!strcmp(node_attr(d->body,"data-after"),"alive"),"new task changes the actual native DOM");
+    check(control.stopped==1&&control.recovered==1,"native-only interruption and recovery reported once");
     web_free(d);
 }
 static void isolated_owner_reparent(struct html_parser *p,web_doc *d,web_doc *shadow_owner,web_doc *template_owner){
@@ -233,7 +256,11 @@ static void adopted_forests(web_doc *d){
     html_finish(p);
 }
 
-int main(void){
+int main(int argc,char **argv){
+    if(argc>1&&!strcmp(argv[1],"--render-resume")){
+        cancelled_render_resume();
+        printf("parser-render-resume: %u checks, %u failures\n",checks,failures);return failures?1:0;
+    }
     cancelled_view_recovery();
     /* Missing DOCTYPE changes a normal document's mode, never a srcdoc
        document's. Exercise both real child contexts instead of allowing a

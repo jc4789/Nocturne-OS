@@ -9,6 +9,7 @@
 #include <webnet.h>
 #include <parallel.h>
 #include <webidb.h>
+#include <webidb_async.h>
 #include <quickjs.h>
 #include "webi.h"
 #include "web_dialog.h"
@@ -65,7 +66,7 @@ struct js_node_ref {
     struct js_node_ref *tree_root, *members, *member_next, **member_prev;
     struct js_node_ref *next, **prev, *hash_next, **hash_prev;
 };
-struct js_timer { uint32_t id; int kind; uint64_t due, interval; JSValue fn, args; };
+struct js_timer { uint32_t id; int kind; uint64_t due, interval, order; JSValue fn, args; };
 struct js_policy_violation {struct js_policy_violation *next;JSValue init;struct web_html_policy_rule *rule;};
 struct js_posted_task { struct js_posted_task *next; JSValue fn; uint32_t id; };
 struct js_idle_task { struct js_idle_task *next; JSValue fn; uint32_t id; uint64_t due; };
@@ -122,6 +123,12 @@ enum { JS_NAV_START, JS_UNLOAD_START, JS_UNLOAD_END, JS_REDIRECT_START, JS_REDIR
        JS_SECURE_START, JS_REQUEST_START, JS_RESPONSE_START, JS_RESPONSE_END,
        JS_DOM_LOADING, JS_DOM_INTERACTIVE, JS_DOM_CONTENT_START, JS_DOM_CONTENT_END,
        JS_DOM_COMPLETE, JS_LOAD_START, JS_LOAD_END, JS_TIMING_COUNT };
+struct js_idb_pending {
+    struct js_idb_pending *next;
+    uint32_t sequence;
+    unsigned operation;
+    JSValue resolve, reject;
+};
 struct web_js_state {
     struct js_alloc_diagnostics allocation;
     web_doc *doc;
@@ -129,6 +136,7 @@ struct web_js_state {
     JSRuntime *rt;
     JSContext *ctx;
     struct web_js_state *runtime_owner, *runtime_active, *runtime_previous;
+    struct web_js_state *runtime_realms, *runtime_next;
     struct js_frame_proxy *frame_proxies; /* only the runtime owner holds these */
     struct js_history_receiver *history_receiver;
     JSValue hooks, dispatch, response, reject, node_protos[NP_COUNT];
@@ -181,6 +189,7 @@ struct web_js_state {
     bool mutation_job_pending;
     bool observers_active, observers_force, pointer_capture_pending;
     uint64_t observer_due, observer_layout, observer_dom;
+    uint64_t rendering_due, next_timer_order;
     int observer_x, observer_y, observer_w, observer_h;
     uint32_t next_timer;
     unsigned pending_count;
@@ -193,9 +202,13 @@ struct web_js_state {
     unsigned ignore_destructive_writes_counter;
     uint64_t storage_source, storage_poll_due;
     char *storage_origin;
-    webidb *indexed_db;
+    webidb_async *indexed_db;
+    struct js_idb_pending *indexed_db_pending;
+    struct js_idb_pending *indexed_db_pending_last;
+    bool indexed_db_failed;
     bool storage_subscribed[2];
     bool storage_event_turn;
+    bool indexed_db_turn;
     unsigned storage_event_kind;
     bool frames_scanned;
     uint64_t frames_revision;
@@ -506,6 +519,7 @@ static int interrupt(JSRuntime *rt, void *opaque) {
        Service only bounded native transport/PCM state here, never author JS,
        layout or UI painting. Its time still belongs to this task's watchdog. */
     web_avmedia_service(now);
+    if(s->indexed_db)webidb_async_pump(s->indexed_db);
     if (s->running && uptime_ms() >= s->task_deadline) { s->timed_out = true; s->task_timed_out = true; s->disabled = true; return 1; }
     return 0;
 }
@@ -515,17 +529,24 @@ bool web_native_checkpoint(web_doc *d) {
     if ((++d->native_checkpoint_count & 63u) != 0) return true;
     struct web_js_state *s = d->js;
     if (!s || s->starting) return true;
+    if(!s->running&&s->indexed_db)webidb_async_pump(s->indexed_db);
     bool stopped = s->running && !s->disabled ? interrupt(s->rt, s) != 0 :
         s->host.script_checkpoint && !s->host.script_checkpoint(s->host.opaque);
     if (stopped) {
         bool first=!d->native_recovery_pending;
-        d->native_recovery_pending=true;d->dirty=true;s->disabled=true;
-        if(s->runtime_owner && s->runtime_owner->runtime_active)s->runtime_owner->runtime_active->disabled=true;
+        d->native_recovery_pending=true;d->dirty=true;
+        /* Cancelling an autonomous rendering transaction is not aborting an
+           author task. Only an active author stack or parser must be retired;
+           a completed document keeps its queued scripts and resource jobs. */
+        bool abort_author=s->running || (s->runtime_owner && s->runtime_owner->runtime_active &&
+            s->runtime_owner->runtime_active->running) || d->parser || !s->parsing_done || s->parsing_cancelled;
+        if(abort_author)s->disabled=true;
+        if(abort_author && s->runtime_owner && s->runtime_owner->runtime_active)s->runtime_owner->runtime_active->disabled=true;
         __atomic_store_n(&d->native_cancelled,true,__ATOMIC_RELEASE);
         if(first){
             char message[160];
-            snprintf(message,sizeof message,"Native processing cancelled: layout depth %u, author depth %d, parser %s; scripts stopped, coherent view recovery pending.",
-                d->native_layout_depth,s->running,d->parser?"active":"complete");
+            snprintf(message,sizeof message,"Native processing cancelled: layout depth %u, author depth %d, parser %s; %s, coherent view recovery pending.",
+                d->native_layout_depth,s->running,d->parser?"active":"complete",abort_author?"scripts stopped":"author tasks preserved");
             log_text(s,1,message);
         }
         return false;
@@ -559,7 +580,7 @@ static void begin_named_task(struct web_js_state *s,const char *name,uint64_t id
 }
 static void end_task(struct web_js_state *s) {
     doc_shadow_flush(s->doc);
-    if (s->running == 1 && !s->disabled) {
+    if (s->running == 1 && !s->disabled && (!s->runtime_previous||!s->runtime_previous->running)) {
         signal_slots(s);
         JSContext *ctx;
         uint64_t microtask_start = s->host.debug_js?uptime_ms():0;
@@ -570,6 +591,16 @@ static void end_task(struct web_js_state *s) {
             if (r == 0) break;
         }
         if(s->host.debug_js)s->task_microtask_ms += uptime_ms() - microtask_start;
+        /* IndexedDB's active period includes this task's microtasks, never
+           the next unrelated timer/event task. No filesystem work here. */
+        if(!s->disabled){
+            for(struct web_js_state *realm=s->runtime_owner->runtime_realms;realm;realm=realm->runtime_next){
+                if(!realm->ctx||realm->disabled||!realm->indexed_db)continue;
+                JSValue task_end=custom_element_hook(realm,"indexedDBTaskEnd",0,NULL);
+                if(JS_IsException(task_end))exception(realm);
+                JS_FreeValue(realm->ctx,task_end);
+            }
+        }
     }
     if (s->running == 1) {
         /* Interrupted/OOM JS may not reach its finally. No captured Worker
@@ -1079,6 +1110,11 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     if (!strcmp(p, "value") || !strcmp(p, "checked") || !strcmp(p, "selectedIndex") || !strcmp(p, "selected")) doc_control_init(d, n);
     if (!strcmp(p, "attrBrand")) return n->type == N_ATTR ? JS_TRUE : JS_ThrowTypeError(ctx, "Attr receiver required");
     if (!strcmp(p, "elementBrand")) return n->type == N_ELEM ? JS_TRUE : JS_ThrowTypeError(ctx, "Element receiver required");
+    if(!strcmp(p,"htmlElementBrand")){
+        if(n->type!=N_ELEM || n->namespace_id!=NS_HTML || n->foreign)
+            return JS_ThrowTypeError(ctx,"HTMLElement receiver required");
+        return JS_NewString(ctx,n->name);
+    }
     if (!strcmp(p,"elementScrollActive")) {
         web_doc *owner=n->owner;
         return JS_NewBool(ctx,n->type==N_ELEM && owner && owner->live && !owner->inert &&
@@ -1640,6 +1676,31 @@ static JSValue computed_length(JSContext *ctx, const len_t *length, web_doc *d) 
     JSValue result = JS_NewStringLen(ctx, text.p ? text.p : "", text.n);
     sb_free(&text); return result;
 }
+static JSValue computed_translation(JSContext *ctx,web_doc *d,const style_t *st,const box_t *principal,bool individual){
+    if(individual){
+        if(!st->translate.active)return JS_NewString(ctx,"none");
+        sbuf text={0},second={0};
+        bool ok=css_length_serialize(&st->translate.xy[0],&text,d);
+        if(ok)ok=css_length_serialize(&st->translate.xy[1],&second,d);
+        /* CSS Transforms 2 §5.1 requires omission of the default 0px Y. */
+        if(ok&&strcmp(sb_cstr(&second),"0px")){sb_putc(&text,' ');sb_puts(&text,sb_cstr(&second));}
+        sb_free(&second);
+        if(!ok){sb_free(&text);return JS_ThrowInternalError(ctx,"CSS translate serialization failed");}
+        JSValue result=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return result;
+    }
+    if(!st->transform)return JS_NewString(ctx,"none");
+    box_t resolved={0};
+    if(principal)resolved=*principal;
+    /* CSS Transforms resolved-value serialization composes the value even
+       on a non-transformable inline; rendering eligibility is separate. */
+    resolved.kind=B_BLOCK;
+    resolved.st=(style_t *)st;
+    char text[128];
+    snprintf(text,sizeof text,"matrix(1, 0, 0, 1, %g, %g)",
+        (double)box_translation_axis(&resolved,0,CSS_TRANSLATE_TRANSFORM),
+        (double)box_translation_axis(&resolved,1,CSS_TRANSLATE_TRANSFORM));
+    return JS_NewString(ctx,text);
+}
 static JSValue computed_inset(struct web_js_state *s, JSContext *ctx, node_t *n, unsigned side) {
     style_t *st = n->style;
     box_t *b = n->box;
@@ -1698,6 +1759,8 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property)
     for (unsigned side = 0; side < 4; side++) if (!strcmp(property, inset_names[side]))
         return computed_inset(owner, ctx, n, side);
     box_t *principal = geometry_principal_box(n);
+    if(!strcmp(property,"transform")||!strcmp(property,"translate"))
+        return computed_translation(ctx,d,st,principal,!strcmp(property,"translate"));
     if (!strcmp(property, "fill") || !strcmp(property, "stroke")) {
         const struct svg_paint *paint = !strcmp(property, "fill") ? &st->svg_fill : &st->svg_stroke;
         if (paint->kind == SVG_PAINT_NONE) return JS_NewString(ctx, "none");
@@ -1862,7 +1925,10 @@ static JSValue animation_dom(struct web_js_state *s, node_t *n, bool read, int a
             const len_t *length = NULL; float px = 0; bool numeric = false, is_color = false;
             uint32_t color = 0;
             if (!strcmp(p, "opacity")) snprintf(out, sizeof out, "%g", (double)st->opacity);
-            else if (!strcmp(p, "transform")) snprintf(out, sizeof out, "none"); /* not rendered yet */
+            else if (!strcmp(p,"transform")||!strcmp(p,"translate")) {
+                JSValue result=computed_translation(ctx,s->doc,st,geometry_principal_box(n),!strcmp(p,"translate"));
+                JS_FreeCString(ctx,p);return result;
+            }
             else if (!strcmp(p, "color")) { color = st->color; is_color = true; }
             else if (!strcmp(p, "background-color")) { color = st->bg_color; is_color = true; }
             else if (!strcmp(p, "border-radius")) { px = st->border_radius; numeric = true; }
@@ -2074,8 +2140,8 @@ static JSValue attribute_native_changed(struct web_js_state *s, node_t *n, const
         if (JS_IsException(notified)) return notified;
         JS_FreeValue(ctx, notified);
     }
-    if (html_image(n) && (!strcmp(name, "src") || !strcmp(name, "srcset") || !strcmp(name, "sizes") ||
-        !strcmp(name, "data-src") || !strcmp(name, "data-lazy-src") || !strcmp(name, "data-original") || !strcmp(name, "data-srcset"))) n->image_invalidated = true;
+    if (html_image(n) && (!strcmp(name, "src") || !strcmp(name, "srcset") || !strcmp(name, "sizes")))
+        n->image_invalidated = true;
     if (n->tag == T_input && !strcmp(name, "src")) {
         n->js_image_notified = false;
     }
@@ -3555,7 +3621,8 @@ static JSValue native_avmedia_impl(JSContext *ctx, JSValueConst this_val, int ar
     if (argc < 2) return JS_ThrowTypeError(ctx, "Media operation and receiver required");
     const char *op = JS_ToCString(ctx, argv[0]);
     if (!op) return JS_EXCEPTION;
-    bool capability = !strcmp(op, "type") || !strcmp(op, "mseType");
+    bool capability = !strcmp(op, "type") || !strcmp(op, "mseType") ||
+                      !strcmp(op, "decodingPerformance");
     node_t *node = capability ? NULL : unwrap(ctx, argv[1]);
     if (!node && !capability) {
         JS_FreeCString(ctx, op);
@@ -3603,7 +3670,52 @@ static JSValue native_presentation(JSContext *ctx,JSValueConst this_val,int argc
     if(!s || !argc)return JS_ThrowTypeError(ctx,"Presentation operation required");
     const char *op=JS_ToCString(ctx,argv[0]);if(!op)return JS_EXCEPTION;
     JSValue result;
-    if(!strcmp(op,"enabled"))result=JS_NewBool(ctx,s->host.presentation!=NULL && !s->doc->frame_parent);
+    if(!strcmp(op,"fullscreenEnabled")||!strcmp(op,"pipEnabled"))
+        result=JS_NewBool(ctx,web_presentation_enabled(s->doc,!strcmp(op,"fullscreenEnabled")?1:2,&s->host));
+    else if(!strcmp(op,"events")){
+        result=JS_NewArray(ctx);
+        if(!JS_IsException(result)){
+            uint32_t index=0;
+            const struct web_presentation_event *event=web_presentation_event_peek(s->doc);
+            while(event){
+                /* UINT32_MAX is a named property, not an Array index. Leave
+                   the next record queued for a subsequent representable batch. */
+                if(index==UINT32_MAX)break;
+                JSValue row=JS_NewArray(ctx);
+                if(JS_IsException(row)){JS_FreeValue(ctx,result);result=JS_EXCEPTION;break;}
+                JSValue element=wrap(s,event->node);
+                if(JS_IsException(element)){
+                    JS_FreeValue(ctx,row);JS_FreeValue(ctx,result);result=JS_EXCEPTION;break;
+                }
+                if(JS_DefinePropertyValueUint32(ctx,row,0,JS_NewInt32(ctx,event->kind),JS_PROP_C_W_E)<0){
+                    JS_FreeValue(ctx,element);JS_FreeValue(ctx,row);JS_FreeValue(ctx,result);result=JS_EXCEPTION;break;
+                }
+                if(JS_DefinePropertyValueUint32(ctx,row,1,element,JS_PROP_C_W_E)<0||
+                   JS_DefinePropertyValueUint32(ctx,row,2,JS_NewInt32(ctx,event->width),JS_PROP_C_W_E)<0||
+                   JS_DefinePropertyValueUint32(ctx,row,3,JS_NewInt32(ctx,event->height),JS_PROP_C_W_E)<0){
+                    JS_FreeValue(ctx,row);JS_FreeValue(ctx,result);result=JS_EXCEPTION;break;
+                }
+                JSValue session=JS_NewBigUint64(ctx,event->session);
+                if(JS_IsException(session)||JS_DefinePropertyValueUint32(ctx,row,4,session,JS_PROP_C_W_E)<0){
+                    JS_FreeValue(ctx,row);JS_FreeValue(ctx,result);result=JS_EXCEPTION;break;
+                }
+                if(JS_DefinePropertyValueUint32(ctx,result,index,row,JS_PROP_C_W_E)<0){
+                    JS_FreeValue(ctx,result);result=JS_EXCEPTION;break;
+                }
+                event=event->next;
+                index++;
+            }
+            /* Event/PiPWindow creation belongs to the private JS binding and
+               may still fail after these rows have been allocated. Peek only;
+               its task consumes a record immediately before dispatch. */
+        }
+    }
+    else if(!strcmp(op,"eventPop")){
+        if(!task_context_active(s)||sandbox_borrowed(s)||(sandbox_authority(s)&SB_SCRIPTS))
+            result=history_security_error(ctx,"Inactive presentation event authority");
+        else{bool pending=web_presentation_event_peek(s->doc)!=NULL;
+            if(pending)web_presentation_event_pop(s->doc);result=JS_NewBool(ctx,pending);}
+    }
     else if(!strcmp(op,"fullscreenElement") || !strcmp(op,"pipElement"))
         result=wrap(s,web_presentation_element(s->doc,!strcmp(op,"fullscreenElement")?1:2));
     else if(!strcmp(op,"pipSize")) {
@@ -3620,7 +3732,32 @@ static JSValue native_presentation(JSContext *ctx,JSValueConst this_val,int argc
     else if(!strcmp(op,"fullscreen") || !strcmp(op,"pip")) {
         node_t *node=argc>1?unwrap(ctx,argv[1]):NULL;
         if(!node)result=JS_ThrowTypeError(ctx,"Presentation Element required");
-        else result=JS_NewInt32(ctx,web_presentation_request(s->doc,node,!strcmp(op,"fullscreen")?1:2,&s->host));
+        else if(!strcmp(op,"fullscreen"))result=JS_NewInt32(ctx,web_presentation_request(s->doc,node,1,&s->host));
+        else{
+            bool changed=s->doc->pip_element!=node;
+            uint64_t session=s->doc->pip_session;
+            if(changed&&session!=UINT64_MAX)session++;
+            result=JS_NewArray(ctx);
+            JSValue identity=JS_IsException(result)?JS_EXCEPTION:JS_NewBigUint64(ctx,session);
+            if(JS_IsException(result)||JS_IsException(identity)){
+                JS_FreeValue(ctx,result);result=JS_EXCEPTION;
+            }else if(JS_DefinePropertyValueUint32(ctx,result,1,identity,JS_PROP_C_W_E)<0||
+                     JS_DefinePropertyValueUint32(ctx,result,0,JS_NewInt32(ctx,0),JS_PROP_C_W_E)<0||
+                     JS_DefinePropertyValueUint32(ctx,result,2,JS_NewInt32(ctx,0),JS_PROP_C_W_E)<0||
+                     JS_DefinePropertyValueUint32(ctx,result,3,JS_NewInt32(ctx,0),JS_PROP_C_W_E)<0||
+                     JS_DefinePropertyValueUint32(ctx,result,4,JS_NewBool(ctx,changed),JS_PROP_C_W_E)<0){
+                JS_FreeValue(ctx,result);result=JS_EXCEPTION;
+            }else{
+                /* No response allocation follows native window creation. All
+                   five private own properties already exist and are writable. */
+                int status=web_presentation_request(s->doc,node,2,&s->host);
+                if(JS_SetPropertyUint32(ctx,result,0,JS_NewInt32(ctx,status))<0||
+                   JS_SetPropertyUint32(ctx,result,2,JS_NewInt32(ctx,s->doc->pip_width))<0||
+                   JS_SetPropertyUint32(ctx,result,3,JS_NewInt32(ctx,s->doc->pip_height))<0){
+                    JS_FreeValue(ctx,result);result=JS_EXCEPTION;
+                }
+            }
+        }
     } else if(!strcmp(op,"exitFullscreen") || !strcmp(op,"exitPip"))
         result=JS_NewBool(ctx,web_presentation_exit(s->doc,!strcmp(op,"exitFullscreen")?1:2));
     else result=JS_ThrowTypeError(ctx,"Invalid presentation operation");
@@ -3753,7 +3890,15 @@ static void storage_subscribe_document(struct web_js_state *s) {
     s->storage_poll_due=uptime_ms()+100;
 }
 static void storage_release_document(struct web_js_state *s) {
-    webidb_free(s->indexed_db);s->indexed_db=NULL;
+    webidb_async_free(s->indexed_db);s->indexed_db=NULL;
+    while(s->indexed_db_pending){
+        struct js_idb_pending *p=s->indexed_db_pending;
+        s->indexed_db_pending=p->next;
+        JS_FreeValue(s->ctx,p->resolve);JS_FreeValue(s->ctx,p->reject);js_free(s->ctx,p);
+    }
+    s->indexed_db_pending_last=NULL;
+    s->indexed_db_failed=false;
+    s->indexed_db_turn=false;
     if(s->storage_source && s->host.storage_events && s->host.storage){
         struct web_storage_request request={.operation=WEB_STORAGE_RELEASE,.source=s->storage_source};
         struct web_storage_result out={0};s->host.storage(s->host.opaque,NULL,&request,&out);webstorage_result_free(&out);
@@ -3828,132 +3973,214 @@ static const char *indexed_db_origin(JSContext *ctx,struct web_js_state *s) {
     const char *origin=JS_IsException(value)||JS_IsNull(value)?NULL:JS_ToCString(ctx,value);
     JS_FreeValue(ctx,value);return origin;
 }
-static JSValue native_indexed_db(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+static void indexed_db_buffer_free(JSRuntime *runtime,void *opaque,void *bytes) {
+    (void)runtime;(void)opaque;free(bytes);
+}
+static JSValue indexed_db_take_buffer(JSContext *ctx,struct webidb_async_result *out) {
+    /* The broker result owns malloc storage, not QuickJS allocator storage.
+       Transfer it only after successful wrapper construction; on OOM the
+       ordinary result destructor still owns it. No page-size memcpy here. */
+    JSValue value=JS_NewArrayBuffer(ctx,out->bytes,out->length,indexed_db_buffer_free,NULL,false);
+    if(!JS_IsException(value)){out->bytes=NULL;out->length=0;}
+    return value;
+}
+static JSValue indexed_db_completion(JSContext *ctx,struct webidb_async_result *out) {
+    switch(out->operation){
+    case WEB_IDB_DATABASES: {
+        JSValue list=JS_NewArray(ctx);
+        if(JS_IsException(list))return list;
+        for(size_t i=0;i<out->item_count;i++){
+            if(i>=UINT32_MAX){JS_FreeValue(ctx,list);return JS_ThrowOutOfMemory(ctx);}
+            JSValue item=JS_NewObject(ctx);
+            if(JS_IsException(item)){JS_FreeValue(ctx,list);return JS_EXCEPTION;}
+            JSValue name=JS_NewStringLen(ctx,out->items[i].name,out->items[i].name_length);
+            if(JS_IsException(name)||
+               JS_DefinePropertyValueStr(ctx,item,"name",name,JS_PROP_C_W_E)<0||
+               JS_DefinePropertyValueStr(ctx,item,"version",JS_NewFloat64(ctx,(double)out->items[i].version),JS_PROP_C_W_E)<0){
+                JS_FreeValue(ctx,item);JS_FreeValue(ctx,list);return JS_EXCEPTION;
+            }
+            if(JS_DefinePropertyValueUint32(ctx,list,(uint32_t)i,item,JS_PROP_C_W_E)<0){JS_FreeValue(ctx,list);return JS_EXCEPTION;}
+        }
+        return indexed_db_result(ctx,out->status,list,JS_UNDEFINED,2);
+    }
+    case WEB_IDB_BEGIN:
+        return indexed_db_result(ctx,out->status,JS_NewUint32(ctx,out->token),
+            out->bytes?indexed_db_take_buffer(ctx,out):JS_NULL,3);
+    case WEB_IDB_STAGE:
+        return indexed_db_result(ctx,out->status,JS_NewString(ctx,out->reference),JS_UNDEFINED,2);
+    case WEB_IDB_VALUE:
+        return indexed_db_result(ctx,out->status,out->status==WEB_IDB_OK?
+            indexed_db_take_buffer(ctx,out):JS_NULL,JS_UNDEFINED,2);
+    case WEB_IDB_VALUES: {
+        JSValue list=JS_NewArray(ctx);
+        if(JS_IsException(list))return list;
+        size_t offset=0;
+        if(out->status==WEB_IDB_OK)for(size_t i=0;i<out->count;i++){
+            if(i>=UINT32_MAX||offset>out->length||out->length-offset<sizeof(uint64_t))goto malformed;
+            uint64_t length;memcpy(&length,out->bytes+offset,sizeof length);offset+=sizeof length;
+            if(length>SIZE_MAX||length>out->length-offset)goto malformed;
+            JSValue value=JS_NewArrayBufferCopy(ctx,out->bytes+offset,(size_t)length);
+            if(JS_IsException(value)||JS_DefinePropertyValueUint32(ctx,list,(uint32_t)i,value,JS_PROP_C_W_E)<0){
+                JS_FreeValue(ctx,list);return JS_EXCEPTION;
+            }
+            offset+=(size_t)length;
+        }
+        if(out->status==WEB_IDB_OK&&offset!=out->length)goto malformed;
+        return indexed_db_result(ctx,out->status,list,JS_UNDEFINED,2);
+malformed:
+        JS_FreeValue(ctx,list);return JS_ThrowInternalError(ctx,"Invalid IndexedDB value batch wire");
+    }
+    case WEB_IDB_CONNECT:
+        return indexed_db_result(ctx,out->status,JS_NewUint32(ctx,out->token),JS_UNDEFINED,2);
+    case WEB_IDB_CONNECTIONS:
+        return indexed_db_result(ctx,out->status,JS_NewFloat64(ctx,(double)out->count),JS_UNDEFINED,2);
+    case WEB_IDB_POLL:
+        return indexed_db_result(ctx,out->status,out->pending?JS_NewFloat64(ctx,(double)out->version):JS_NULL,JS_UNDEFINED,2);
+    default:return JS_NewInt32(ctx,out->status);
+    }
+}
+static bool indexed_db_run_one(struct web_js_state *s) {
+    if(s->disabled||(!s->indexed_db&&!s->indexed_db_failed))return false;
+    if(s->indexed_db)webidb_async_pump(s->indexed_db);
+    if(webidb_async_failed(s->indexed_db)){
+        webidb_async_free(s->indexed_db);s->indexed_db=NULL;
+        s->indexed_db_failed=true;
+    }
+    struct webidb_async_result out={0};
+    if(s->indexed_db_failed){
+        /* An old JS connection must never alias a restarted helper's handles. */
+        if(!s->indexed_db_pending)return false;
+        out.sequence=s->indexed_db_pending->sequence;
+        out.operation=s->indexed_db_pending->operation;out.status=WEB_IDB_IO;
+    }else if(!webidb_async_take(s->indexed_db,&out))return false;
+    struct js_idb_pending **link=&s->indexed_db_pending;
+    struct js_idb_pending *previous=NULL;
+    while(*link&&(*link)->sequence!=out.sequence){previous=*link;link=&(*link)->next;}
+    struct js_idb_pending *p=*link;
+    if(!p){webidb_async_result_free(&out);return false;}
+    *link=p->next;
+    if(s->indexed_db_pending_last==p)s->indexed_db_pending_last=previous;
+    begin_named_task(s,"IndexedDB completion",out.sequence);
+    JSValue value=indexed_db_completion(s->ctx,&out);
+    JSValue fn=p->resolve;
+    if(JS_IsException(value)){
+        value=JS_GetException(s->ctx);fn=p->reject;
+        if(out.token&&(out.operation==WEB_IDB_BEGIN||out.operation==WEB_IDB_CONNECT)){
+            struct webidb_async_request cleanup={.operation=out.operation==WEB_IDB_BEGIN?WEB_IDB_ABORT:WEB_IDB_FORGET,.token=out.token};
+            if(!webidb_async_submit(s->indexed_db,&cleanup)){
+                webidb_async_free(s->indexed_db);s->indexed_db=NULL;
+                s->indexed_db_failed=true;
+            }
+        }
+    }
+    JSValue called=JS_Call(s->ctx,fn,JS_UNDEFINED,1,&value);
+    if(JS_IsException(called))exception(s);
+    JS_FreeValue(s->ctx,called);JS_FreeValue(s->ctx,value);
+    JS_FreeValue(s->ctx,p->resolve);JS_FreeValue(s->ctx,p->reject);js_free(s->ctx,p);
+    webidb_async_result_free(&out);end_task(s);return true;
+}
+static JSValue native_indexed_db(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
-    if(!s || !task_context_active(s) || sandbox_borrowed(s) ||
-       (sandbox_authority(s)&(SB_SCRIPTS|SB_ORIGIN)))
+    if(!s||!task_context_active(s)||sandbox_borrowed(s)||(sandbox_authority(s)&(SB_SCRIPTS|SB_ORIGIN)))
         return history_security_error(ctx,"Sandbox or inactive IndexedDB authority");
-    if(argc<1)return JS_ThrowTypeError(ctx,"IndexedDB operation required");
+    if(!argc)return JS_ThrowTypeError(ctx,"IndexedDB operation required");
     const char *op=JS_ToCString(ctx,argv[0]);
     if(!op)return JS_EXCEPTION;
+    static const struct {const char *name;unsigned operation;} operations[]={
+        {"begin",WEB_IDB_BEGIN},{"stage",WEB_IDB_STAGE},{"value",WEB_IDB_VALUE},{"commit",WEB_IDB_COMMIT},
+        {"abort",WEB_IDB_ABORT},{"databases",WEB_IDB_DATABASES},{"connections",WEB_IDB_CONNECTIONS},
+        {"connect",WEB_IDB_CONNECT},{"poll",WEB_IDB_POLL},{"disconnect",WEB_IDB_DISCONNECT},{"forget",WEB_IDB_FORGET},
+        {"values",WEB_IDB_VALUES}};
+    struct webidb_async_request request={0};
+    for(unsigned i=0;i<sizeof operations/sizeof *operations;i++)if(!strcmp(op,operations[i].name)){request.operation=operations[i].operation;break;}
+    JS_FreeCString(ctx,op);
+    if(!request.operation)return JS_ThrowTypeError(ctx,"Invalid IndexedDB operation");
     JSValue result=JS_EXCEPTION;
-    uint32_t token=0;
-    int status=WEB_IDB_SECURITY;
-    if(!strcmp(op,"databases")) {
-        const char *origin=indexed_db_origin(ctx,s);
-        if(JS_HasException(ctx))goto done;
-        struct webidb_database *items=NULL;size_t count=0;
-        if(origin){if(!s->indexed_db)s->indexed_db=webidb_create();
-            status=s->indexed_db?webidb_databases(s->indexed_db,origin,&items,&count):WEB_IDB_MEMORY;}
-        JS_FreeCString(ctx,origin);
-        JSValue list=JS_NewArray(ctx);
-        if(!JS_IsException(list))for(size_t i=0;i<count;i++) {
-            if(i>UINT32_MAX){JS_ThrowOutOfMemory(ctx);JS_FreeValue(ctx,list);list=JS_EXCEPTION;break;}
-            JSValue item=JS_NewObject(ctx);
-            if(JS_IsException(item) ||
-               JS_DefinePropertyValueStr(ctx,item,"name",JS_NewStringLen(ctx,items[i].name,items[i].name_length),JS_PROP_C_W_E)<0 ||
-               JS_DefinePropertyValueStr(ctx,item,"version",JS_NewFloat64(ctx,(double)items[i].version),JS_PROP_C_W_E)<0) {
-                JS_FreeValue(ctx,item);JS_FreeValue(ctx,list);list=JS_EXCEPTION;break;
-            }
-            if(JS_DefinePropertyValueUint32(ctx,list,(uint32_t)i,item,JS_PROP_C_W_E)<0){JS_FreeValue(ctx,list);list=JS_EXCEPTION;break;}
+    const char *origin=NULL,*name=NULL,*reference=NULL;
+    const char **references=NULL;
+    size_t acquired=0;
+    if(request.operation==WEB_IDB_BEGIN||request.operation==WEB_IDB_DATABASES){
+        origin=indexed_db_origin(ctx,s);if(JS_HasException(ctx))goto done;
+        request.origin=origin;
+        if(request.operation==WEB_IDB_BEGIN){
+            if(argc<2){JS_ThrowTypeError(ctx,"IndexedDB name required");goto done;}
+            name=JS_ToCStringLen(ctx,&request.name_length,argv[1]);if(!name)goto done;
+            request.name=name;
         }
-        webidb_databases_free(items,count);
-        result=indexed_db_result(ctx,status,list,JS_UNDEFINED,2);
-    } else if(argc<2) result=JS_ThrowTypeError(ctx,"IndexedDB operation argument required");
-    else if(!strcmp(op,"begin")) {
-        size_t name_length=0;
-        const char *name=JS_ToCStringLen(ctx,&name_length,argv[1]);
-        if(!name)goto done;
-        JSValue fn=JS_GetPropertyStr(ctx,s->hooks,"storageOrigin");
-        JSValue url=JS_NewString(ctx,web_effective_url(s->doc));
-        JSValue origin_value=JS_EXCEPTION;
-        if(!JS_IsException(fn) && !JS_IsException(url) && JS_IsFunction(ctx,fn))
-            origin_value=JS_Call(ctx,fn,s->hooks,1,&url);
-        else if(!JS_IsException(fn) && !JS_IsException(url))
-            JS_ThrowInternalError(ctx,"Missing private origin parser");
-        JS_FreeValue(ctx,fn);JS_FreeValue(ctx,url);
-        if(JS_IsException(origin_value)){JS_FreeCString(ctx,name);goto done;}
-        const char *origin=JS_IsNull(origin_value)?NULL:JS_ToCString(ctx,origin_value);
-        if(!JS_IsNull(origin_value) && !origin){JS_FreeValue(ctx,origin_value);JS_FreeCString(ctx,name);goto done;}
-        uint8_t *bytes=NULL;size_t length=0;
-        if(origin && task_context_active(s) && !sandbox_borrowed(s) &&
-           !(sandbox_authority(s)&(SB_SCRIPTS|SB_ORIGIN))) {
-            if(!s->indexed_db)s->indexed_db=webidb_create();
-            status=s->indexed_db?webidb_begin(s->indexed_db,origin,name,name_length,&token,&bytes,&length):WEB_IDB_MEMORY;
+    }else{
+        if(argc<2){JS_ThrowTypeError(ctx,"IndexedDB token required");goto done;}
+        if(JS_ToUint32(ctx,&request.token,argv[1])<0)goto done;
+    }
+    if(request.operation==WEB_IDB_CONNECT||request.operation==WEB_IDB_CONNECTIONS||request.operation==WEB_IDB_COMMIT){
+        int version_index=request.operation==WEB_IDB_COMMIT?4:2;
+        double version;
+        if(argc<=version_index){JS_ThrowTypeError(ctx,"IndexedDB version required");goto done;}
+        if(JS_ToFloat64(ctx,&version,argv[version_index])<0)goto done;
+        if(!isfinite(version)||version<0||version>9007199254740991.0||floor(version)!=version){JS_ThrowTypeError(ctx,"Invalid IndexedDB version");goto done;}
+        request.version=(uint64_t)version;
+    }
+    if(request.operation==WEB_IDB_STAGE||request.operation==WEB_IDB_COMMIT){
+        if(argc<3){JS_ThrowTypeError(ctx,"IndexedDB payload required");goto done;}
+        uint8_t *bytes=NULL;
+        if(!indexed_db_buffer(ctx,argv[2],&bytes,&request.length))goto done;
+        request.bytes=bytes;
+    }
+    if(request.operation==WEB_IDB_VALUE){
+        if(argc<3){JS_ThrowTypeError(ctx,"IndexedDB reference required");goto done;}
+        reference=JS_ToCString(ctx,argv[2]);if(!reference)goto done;
+        request.reference=reference;
+    }
+    if(request.operation==WEB_IDB_COMMIT||request.operation==WEB_IDB_VALUES){
+        int index=request.operation==WEB_IDB_COMMIT?3:2;
+        if(argc<=index){JS_ThrowTypeError(ctx,"IndexedDB references required");goto done;}
+        JSValue count_value=JS_GetPropertyStr(ctx,argv[index],"length");uint32_t count=0;
+        int failed=JS_IsException(count_value)?-1:JS_ToUint32(ctx,&count,count_value);
+        JS_FreeValue(ctx,count_value);if(failed<0)goto done;
+        if((size_t)count>SIZE_MAX/sizeof *references){JS_ThrowOutOfMemory(ctx);goto done;}
+        references=count?js_mallocz(ctx,(size_t)count*sizeof *references):NULL;
+        if(count&&!references)goto done;
+        for(;acquired<count;acquired++){
+            JSValue value=JS_GetPropertyUint32(ctx,argv[index],(uint32_t)acquired);
+            if(JS_IsException(value)){JS_FreeValue(ctx,value);goto done;}
+            references[acquired]=JS_ToCString(ctx,value);JS_FreeValue(ctx,value);
+            if(!references[acquired])goto done;
         }
-        JS_FreeCString(ctx,origin);JS_FreeValue(ctx,origin_value);JS_FreeCString(ctx,name);
-        result=indexed_db_result(ctx,status,JS_NewUint32(ctx,token),bytes?JS_NewArrayBufferCopy(ctx,bytes,length):JS_NULL,3);
-        if(JS_IsException(result) && token)webidb_abort(s->indexed_db,token);
-        free(bytes);
-    } else {
-        if(JS_ToUint32(ctx,&token,argv[1])<0)goto done;
-        if(!s->indexed_db){result=JS_NewInt32(ctx,status);goto done;}
-        if(!strcmp(op,"connections") || !strcmp(op,"connect")) {
-            double version=0;
-            if(argc<3){JS_ThrowTypeError(ctx,"IndexedDB version required");goto done;}
-            if(JS_ToFloat64(ctx,&version,argv[2])<0)goto done;
-            if(!isfinite(version) || version<0 || version>9007199254740991.0 || floor(version)!=version) {
-                JS_ThrowTypeError(ctx,"Invalid IndexedDB version");goto done;
-            }
-            size_t count=0;uint32_t connection=0;
-            status=!strcmp(op,"connections")?
-                webidb_connections(s->indexed_db,token,(uint64_t)version,&count):
-                webidb_connect(s->indexed_db,token,(uint64_t)version,&connection);
-            result=indexed_db_result(ctx,status,!strcmp(op,"connections")?JS_NewFloat64(ctx,(double)count):JS_NewUint32(ctx,connection),JS_UNDEFINED,2);
-            if(JS_IsException(result) && connection)webidb_forget_connection(s->indexed_db,connection);
-        } else if(!strcmp(op,"poll")) {
-            int pending=0;uint64_t version=0;
-            status=webidb_poll(s->indexed_db,token,&pending,&version);
-            result=indexed_db_result(ctx,status,pending?JS_NewFloat64(ctx,(double)version):JS_NULL,JS_UNDEFINED,2);
-        } else if(!strcmp(op,"disconnect")) result=JS_NewInt32(ctx,webidb_disconnect(s->indexed_db,token));
-        else if(!strcmp(op,"abort")) result=JS_NewInt32(ctx,webidb_abort(s->indexed_db,token));
-        else if(!strcmp(op,"stage")) {
-            if(argc<3){JS_ThrowTypeError(ctx,"IndexedDB payload required");goto done;}
-            size_t length=0;uint8_t *bytes=NULL;
-            if(!indexed_db_buffer(ctx,argv[2],&bytes,&length))goto done;
-            char reference[65]={0};status=webidb_stage(s->indexed_db,token,bytes,length,reference);
-            result=indexed_db_result(ctx,status,JS_NewString(ctx,reference),JS_UNDEFINED,2);
-        } else if(!strcmp(op,"value")) {
-            if(argc<3){JS_ThrowTypeError(ctx,"IndexedDB reference required");goto done;}
-            const char *reference=JS_ToCString(ctx,argv[2]);if(!reference)goto done;
-            uint8_t *bytes=NULL;size_t length=0;
-            status=webidb_value(s->indexed_db,token,reference,&bytes,&length);
-            JS_FreeCString(ctx,reference);
-            result=indexed_db_result(ctx,status,status==WEB_IDB_OK?JS_NewArrayBufferCopy(ctx,bytes,length):JS_NULL,JS_UNDEFINED,2);
-            free(bytes);
-        } else if(!strcmp(op,"commit")) {
-            if(argc<5){JS_ThrowTypeError(ctx,"IndexedDB manifest and version required");goto done;}
-            double version=0;
-            if(JS_ToFloat64(ctx,&version,argv[4])<0)goto done;
-            if(!isfinite(version)||version<0||version>9007199254740991.0||floor(version)!=version){JS_ThrowTypeError(ctx,"Invalid IndexedDB version");goto done;}
-            JSValue count_value=JS_GetPropertyStr(ctx,argv[3],"length");uint32_t count=0;
-            int failed=JS_IsException(count_value)?-1:JS_ToUint32(ctx,&count,count_value);
-            JS_FreeValue(ctx,count_value);if(failed<0)goto done;
-            if((size_t)count>SIZE_MAX/sizeof(char*)){JS_ThrowOutOfMemory(ctx);goto done;}
-            const char **references=count?js_mallocz(ctx,(size_t)count*sizeof *references):NULL;
-            if(count && !references)goto done;
-            uint32_t acquired=0;
-            for(;acquired<count;acquired++) {
-                JSValue value=JS_GetPropertyUint32(ctx,argv[3],acquired);
-                if(JS_IsException(value)){JS_FreeValue(ctx,value);break;}
-                references[acquired]=JS_ToCString(ctx,value);JS_FreeValue(ctx,value);
-                if(!references[acquired])break;
-            }
-            if(acquired==count) {
-                size_t length=0;uint8_t *bytes=NULL;
-                if(indexed_db_buffer(ctx,argv[2],&bytes,&length)) {
-                    if(task_context_active(s) && s->indexed_db && !sandbox_borrowed(s) &&
-                       !(sandbox_authority(s)&(SB_SCRIPTS|SB_ORIGIN)))
-                        result=JS_NewInt32(ctx,webidb_commit(s->indexed_db,token,bytes,length,references,count,(uint64_t)version));
-                    else result=history_security_error(ctx,"Inactive IndexedDB commit authority");
-                }
-            }
-            for(uint32_t i=0;i<acquired;i++)JS_FreeCString(ctx,references[i]);
-            js_free(ctx,references);
-        } else result=JS_ThrowTypeError(ctx,"Invalid IndexedDB operation");
+        request.references=references;request.reference_count=count;
+    }
+    if(!task_context_active(s)||sandbox_borrowed(s)||(sandbox_authority(s)&(SB_SCRIPTS|SB_ORIGIN))){
+        result=history_security_error(ctx,"Inactive IndexedDB commit authority");goto done;
+    }
+    JSValue callbacks[2];
+    result=JS_NewPromiseCapability(ctx,callbacks);
+    if(JS_IsException(result))goto done;
+    struct js_idb_pending *pending=js_mallocz(ctx,sizeof *pending);
+    if(!pending){JS_FreeValue(ctx,result);result=JS_EXCEPTION;JS_FreeValue(ctx,callbacks[0]);JS_FreeValue(ctx,callbacks[1]);goto done;}
+    if(!s->indexed_db&&!s->indexed_db_failed)s->indexed_db=webidb_async_create();
+    uint32_t sequence=0;
+    if(s->indexed_db && (origin||request.operation!=WEB_IDB_BEGIN&&request.operation!=WEB_IDB_DATABASES))
+        sequence=webidb_async_submit(s->indexed_db,&request);
+    if(webidb_async_failed(s->indexed_db)){
+        webidb_async_free(s->indexed_db);s->indexed_db=NULL;
+        s->indexed_db_failed=true;
+    }
+    if(!sequence){
+        struct webidb_async_result out={.operation=request.operation,.status=!origin&&(request.operation==WEB_IDB_BEGIN||request.operation==WEB_IDB_DATABASES)?WEB_IDB_SECURITY:s->indexed_db_failed?WEB_IDB_IO:WEB_IDB_MEMORY};
+        JSValue value=indexed_db_completion(ctx,&out);
+        JSValue fn=callbacks[0];
+        if(JS_IsException(value)){value=JS_GetException(ctx);fn=callbacks[1];}
+        JSValue called=JS_Call(ctx,fn,JS_UNDEFINED,1,&value);
+        JS_FreeValue(ctx,value);JS_FreeValue(ctx,callbacks[0]);JS_FreeValue(ctx,callbacks[1]);js_free(ctx,pending);
+        if(JS_IsException(called)){JS_FreeValue(ctx,result);result=JS_EXCEPTION;}JS_FreeValue(ctx,called);
+    }else{
+        pending->sequence=sequence;pending->operation=request.operation;
+        pending->resolve=callbacks[0];pending->reject=callbacks[1];
+        if(s->indexed_db_pending_last)s->indexed_db_pending_last->next=pending;
+        else s->indexed_db_pending=pending;
+        s->indexed_db_pending_last=pending;
     }
 done:
-    JS_FreeCString(ctx,op);return result;
+    for(size_t i=0;i<acquired;i++)JS_FreeCString(ctx,references[i]);js_free(ctx,references);
+    JS_FreeCString(ctx,reference);JS_FreeCString(ctx,name);JS_FreeCString(ctx,origin);return result;
 }
 static JSValue native_scroll(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); int x = 0, y = 0;
@@ -4217,7 +4444,8 @@ static JSValue native_timer(JSContext *ctx, JSValueConst this_val, int argc, JSV
     if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "Timer browsing context retired during conversion");
     if (!isfinite(delay) || delay < 0) delay = 0;
     if (delay > 2147483647.0) delay = 2147483647.0;
-    uint64_t ms = (uint64_t)delay; if (kind == 1 && ms < 4) ms = 4; if (kind == 2) ms = 16;
+    uint64_t ms = (uint64_t)delay; if (kind == 1 && ms < 4) ms = 4; if (kind == 2) ms = 0;
+    if(s->next_timer_order==UINT64_MAX)return JS_ThrowOutOfMemory(ctx);
     unsigned index;
     for (index = 0; index < s->timer_capacity; ++index) if (!s->timers[index].id) break;
     if (index == s->timer_capacity) {
@@ -4236,6 +4464,7 @@ static JSValue native_timer(JSContext *ctx, JSValueConst this_val, int argc, JSV
     uint32_t id = allocate_timer_id(s);
     struct js_timer *t = &s->timers[index];
     t->id = id; t->kind = kind; t->interval = ms; t->due = uptime_ms() + ms;
+    t->order=++s->next_timer_order;
     t->fn = JS_DupValue(ctx, argv[1]); t->args = JS_DupValue(ctx, argv[3]);
     return JS_NewUint32(ctx, id);
 }
@@ -5304,6 +5533,10 @@ static void run_script(struct web_js_state *s, struct js_script *script) {
 }
 static void pending_free(struct web_js_state *s, struct js_pending *p) {
     if(p->kind==P_FONT && p->font)p->font->loading=false;
+    if(p->kind==P_IMAGE && p->image>=0 && p->image<s->doc->images.n){
+        struct web_image *image=s->doc->images.v[p->image];
+        if(image->loading_id==p->id)image->loading_id=0;
+    }
     JS_FreeValue(s->ctx, p->resolve); JS_FreeValue(s->ctx, p->reject); JS_FreeValue(s->ctx, p->stream_callback);
     js_free(s->ctx, p->url);js_free(s->ctx,p->origin); js_free(s->ctx, p->response.body); js_free(s->ctx, p->response.headers_full); js_free(s->ctx,p->response.url_full);
     js_free(s->ctx, p); s->pending_count--;
@@ -5316,10 +5549,17 @@ bool web_js_native_recover(web_doc *d) {
     /* A cancelled author/native operation can leave no renderable boxes, but
        clearing its flag while C/JS or a worker still owns them is unsafe. The
        parallel dispatcher joins every job before dropping parallel_active. */
-    if(!d || !d->native_recovery_pending || !d->native_cancelled || !s || !s->disabled ||
+    if(!d || !d->native_recovery_pending || !d->native_cancelled || !s ||
        s->running || s->starting || d->native_layout_depth || parallel_active() ||
        (s->runtime_owner && s->runtime_owner->runtime_active) ||
        (d->parser && d->parser->callback_depth))return false;
+    if(!s->disabled){
+        /* No author execution was interrupted. Discarded layout is rebuilt
+           below without retiring the independent script/resource queues. */
+        d->native_recovery_active=true;
+        __atomic_store_n(&d->native_cancelled,false,__ATOMIC_RELEASE);
+        return true;
+    }
     bool aborted_parser=d->parser || !s->parsing_done || s->parsing_cancelled;
     if(d->parser){html_finish(d->parser);d->parser=NULL;}
     s->blocker=NULL;s->parser_write=false;s->document_waiting=false;
@@ -5773,15 +6013,17 @@ static void request_images(struct web_js_state *s) {
     /* Register candidates before dispatch, including a last timer/idle task's
        detached image when no later input or network event will wake the page. */
     if (s->doc->resources_dirty || s->doc->images_dirty) doc_rescan(s->doc);
-    for (int i = 0; i < web_image_count(s->doc) && s->pending_count < 8; ++i) {
+    /* Network connection concurrency belongs to the transport queue. Pending
+       scripts/fetches must not prevent image requests from even being queued. */
+    for (int i = 0; i < web_image_count(s->doc); ++i) {
+        if((i&63)==0&&!web_native_checkpoint(s->doc))break;
         if (!web_image_wanted(s->doc, i)) continue;
-        bool pending = false;
-        for (struct js_pending *p = s->pending; p; p = p->next) if (p->kind == P_IMAGE && p->image == i) { pending = true; break; }
-        if (pending) continue;
         const char *url = web_image_url(s->doc, i); if (!url) continue;
         struct js_pending *p = pending_new(s, P_IMAGE, url);
         if (!p) { JSValue e = JS_GetException(s->ctx); JS_FreeValue(s->ctx, e); web_image_loaded(s->doc, i, NULL, 0); s->doc->dirty = true; continue; }
-        p->image = i; send_request(s, p, WEB_RESOURCE_IMAGE, "GET", NULL, NULL, 0);
+        p->image = i;
+        ((struct web_image *)s->doc->images.v[i])->loading_id=p->id;
+        send_request(s, p, WEB_RESOURCE_IMAGE, "GET", NULL, NULL, 0);
     }
 }
 static bool styles_busy(struct web_js_state *s) { return pending_kind(s, P_CSS) || web_pending_stylesheet(s->doc); }
@@ -5792,11 +6034,8 @@ static bool images_wanted(web_doc *d) {
     for (int i = 0; i < web_image_count(d); i++) if (web_image_wanted(d, i)) return true;
     return false;
 }
-static bool run_timer(struct web_js_state *s, uint64_t now) {
-    struct js_timer *timer = NULL;
-    unsigned timer_index = 0;
-    for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && s->timers[i].due <= now && (!timer || s->timers[i].due < timer->due)) { timer = &s->timers[i]; timer_index = i; }
-    if (!timer) return false;
+static bool run_timer_index(struct web_js_state *s, unsigned timer_index, uint64_t now) {
+    struct js_timer *timer=&s->timers[timer_index];
     uint32_t timer_id = timer->id;
     JSValue fn = JS_DupValue(s->ctx, timer->fn), args_array = JS_DupValue(s->ctx, timer->args);
     int kind = timer->kind;
@@ -5864,6 +6103,18 @@ static bool run_timer(struct web_js_state *s, uint64_t now) {
         log_text(s, 0, message);
     }
     return true;
+}
+static bool run_timer(struct web_js_state *s, uint64_t now) {
+    struct js_timer *timer=NULL;unsigned index=0;
+    for(unsigned i=0;i<s->timer_capacity;i++){
+        struct js_timer *candidate=&s->timers[i];
+        if(candidate->id && candidate->kind!=2 && candidate->due<=now &&
+           (!timer || candidate->due<timer->due ||
+            (candidate->due==timer->due && candidate->order<timer->order))){
+            timer=candidate;index=i;
+        }
+    }
+    return timer?run_timer_index(s,index,now):false;
 }
 static bool run_posted_task(struct web_js_state *s) {
     struct js_posted_task *p = s->posted; if (!p) return false;
@@ -6199,7 +6450,7 @@ static bool observers_dirty(struct web_js_state *s) {
         s->observer_w!=d->width || s->observer_h!=d->height;
 }
 static bool run_observers(struct web_js_state *s,uint64_t now) {
-    if(now<s->observer_due || !observers_dirty(s))return false;
+    if(!observers_dirty(s))return false;
     begin_task(s);flush_layout(s);
     s->observers_force=false;s->observer_dom=s->doc->dom_revision;s->observer_layout=s->doc->layout_revision;
     s->observer_w=s->doc->width;s->observer_h=s->doc->height;
@@ -6207,6 +6458,46 @@ static bool run_observers(struct web_js_state *s,uint64_t now) {
     JSValue result=custom_element_hook(s,"observerFrame",0,NULL);
     if(JS_IsException(result))exception(s);else JS_FreeValue(s->ctx,result);
     end_task(s);s->observer_due=uptime_ms()+16;s->observer_turn=false;
+    return true;
+}
+struct js_frame_callback {uint32_t id;unsigned index;uint64_t order;};
+static int frame_callback_order(const void *left,const void *right){
+    const struct js_frame_callback *a=left,*b=right;
+    return a->order<b->order?-1:a->order>b->order;
+}
+static bool run_rendering(struct web_js_state *s,uint64_t now){
+    if(s->disabled || s->running || now<s->rendering_due)return false;
+    size_t count=0;
+    for(unsigned i=0;i<s->timer_capacity;i++)
+        if(s->timers[i].id && s->timers[i].kind==2 && s->timers[i].due<=now)count++;
+    if(!count && !observers_dirty(s))return false;
+    /* HTML update-the-rendering runs the current animation callback map before
+       style/layout, ResizeObserver, and intersection observations. A snapshot
+       prevents callbacks registered by a callback from joining this frame. */
+    struct js_frame_callback *frames=NULL;
+    if(count){
+        if(count>SIZE_MAX/sizeof *frames)return false;
+        frames=js_malloc(s->ctx,count*sizeof *frames);
+        if(!frames){exception(s);s->rendering_due=now+16;return true;}
+        size_t at=0;
+        for(unsigned i=0;i<s->timer_capacity;i++){
+            const struct js_timer *t=&s->timers[i];
+            if(t->id && t->kind==2 && t->due<=now)
+                frames[at++]=(struct js_frame_callback){t->id,i,t->order};
+        }
+        qsort(frames,count,sizeof *frames,frame_callback_order);
+    }
+    uint64_t generation=s->stream_generation;
+    for(size_t at=0;at<count && !s->disabled && s->stream_generation==generation;at++){
+        /* Cancellation, growth, or reuse during an earlier callback must not
+           invalidate this snapshot or accidentally invoke a new callback. */
+        unsigned i=frames[at].index;
+        if(i<s->timer_capacity && s->timers[i].id==frames[at].id &&
+           s->timers[i].order==frames[at].order)run_timer_index(s,i,now);
+    }
+    js_free(s->ctx,frames);
+    if(!s->disabled && s->stream_generation==generation)run_observers(s,now);
+    s->rendering_due=uptime_ms()+16;
     return true;
 }
 static bool run_document_event(struct web_js_state *s) {
@@ -6330,7 +6621,8 @@ void web_js_tick(web_doc *d, uint64_t now) {
     struct web_js_state *s = d ? d->js : NULL;
     if (!s || s->running) return;
     prune_stream_scripts(s);
-    if(s->disabled && (s->storage_source || s->indexed_db))storage_release_document(s);
+    if(s->disabled && (s->storage_source || s->indexed_db || s->indexed_db_pending || s->indexed_db_failed))storage_release_document(s);
+    if(s->indexed_db)webidb_async_pump(s->indexed_db);
     web_worker_pump(s->workers,now);
     /* Expired idle requests are ordinary watchdog-bounded tasks, not idle
        periods. Alternate with other task sources so even continuous fetch,
@@ -6343,8 +6635,16 @@ void web_js_tick(web_doc *d, uint64_t now) {
         request_styles(s); request_fonts(s); request_images(s); return;
     }
     s->idle_timeout_turn = true;
-    bool ran = !s->disabled && s->storage_event_turn && storage_run_event(s,now);
-    s->storage_event_turn=!ran;
+    bool ran=false;
+    if(!s->disabled&&web_presentation_event_peek(d)){
+        begin_named_task(s,"presentation events",d->presentation_revision);
+        JSValue notified=custom_element_hook(s,"presentationSync",0,NULL);
+        if(JS_IsException(notified))exception(s);
+        JS_FreeValue(s->ctx,notified);end_task(s);ran=true;
+    }
+    if(!ran)ran=!s->disabled&&s->indexed_db_turn&&indexed_db_run_one(s);
+    s->indexed_db_turn=!ran;
+    if(!ran){ran=!s->disabled&&s->storage_event_turn&&storage_run_event(s,now);s->storage_event_turn=!ran;}
     /* Messages are ordinary JS tasks, with the same watchdog/checkpoint as
        events and timers. Alternate ready workers with other sources. */
     if (!ran && !s->disabled && s->worker_turn && web_worker_runnable(s->workers)) {
@@ -6445,11 +6745,9 @@ void web_js_tick(web_doc *d, uint64_t now) {
         /* A continuously dirty rendering observer cannot preempt every ready
            timer/rAF/posted task. Give another task source the next turn,
            retaining observer delivery when no ordinary task is runnable. */
-        else if (s->observer_turn && run_observers(s, now)) ran = true;
         else if (s->posted_turn && run_posted_task(s)) { s->posted_turn = false; s->observer_turn = true; ran = true; }
         else if (run_timer(s, now)) { s->posted_turn = true; s->observer_turn = true; ran = true; }
         else if (run_posted_task(s)) { s->posted_turn = false; s->observer_turn = true; ran = true; }
-        else if (run_observers(s, now)) ran = true;
         else if (JS_IsJobPending(s->rt)||s->rejections||s->rejection_oom) { begin_task(s); end_task(s); ran = true; }
         else if (web_worker_runnable(s->workers)) {
             begin_named_task(s,"Worker message",0); ran = web_worker_run_one(s->workers);
@@ -6460,6 +6758,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
     if (s->disabled) for (struct js_script *p = s->scripts; p; p = p->next) { p->executed = p->parser_released = true; JS_FreeValue(s->ctx, p->evaluation); p->evaluation = JS_UNDEFINED; }
     request_styles(s); request_fonts(s); request_images(s);
     if (!ran) ran = run_document_event(s);
+    if(!s->disabled && run_rendering(s,uptime_ms()))ran=true;
     if (ran) s->idle_period_stopped = true;
     else if (!s->disabled) {
         uint64_t idle_now = uptime_ms();
@@ -6481,12 +6780,9 @@ int64_t web_js_deadline(web_doc *d) {
     if (d->resources_dirty || d->images_dirty) return (int64_t)now;
     for(struct web_font_resource *f=d->fonts;f;f=f->next)
         if(f->wanted && !f->done && !f->loading)return (int64_t)now;
-    if (s->pending_count < 8) for (int i = 0; i < web_image_count(d); i++) {
+    for (int i = 0; i < web_image_count(d); i++) {
         if (!web_image_wanted(d, i)) continue;
-        bool pending = false;
-        for (struct js_pending *p = s->pending; p; p = p->next)
-            if (p->kind == P_IMAGE && p->image == i) { pending = true; break; }
-        if (!pending) return (int64_t)now;
+        return (int64_t)now;
     }
     if (!s->disabled) {
         if ((d->dom_family ? d->dom_family : d)->shadow_slots_pending) return (int64_t)now;
@@ -6495,10 +6791,22 @@ int64_t web_js_deadline(web_doc *d) {
         if (s->events || s->posted || s->rejections || s->rejection_oom) return (int64_t)now;
         for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) return (int64_t)now;
         if (JS_IsJobPending(s->rt)) return (int64_t)now;
-        if (observers_dirty(s) && s->observer_due < deadline) deadline=s->observer_due;
+        if (observers_dirty(s) && s->rendering_due < deadline) deadline=s->rendering_due;
         if (s->storage_origin && (s->storage_subscribed[0]||s->storage_subscribed[1]) && s->storage_poll_due<deadline) deadline=s->storage_poll_due;
+        if(s->indexed_db_failed&&s->indexed_db_pending)return (int64_t)now;
+        if(web_presentation_event_peek(d))return (int64_t)now;
+        if(s->indexed_db&&webidb_async_pending(s->indexed_db)){
+            webidb_async_pump(s->indexed_db);
+            if(webidb_async_ready(s->indexed_db))return (int64_t)now;
+            uint64_t storage_due=now+8;
+            if(storage_due<deadline)deadline=storage_due;
+        }
         struct js_script *ready; if (ready_script(s, &ready)) return (int64_t)now;
-        for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && s->timers[i].due < deadline) deadline = s->timers[i].due;
+        for (unsigned i = 0; i < s->timer_capacity; i++)if(s->timers[i].id){
+            uint64_t due=s->timers[i].due;
+            if(s->timers[i].kind==2 && due<s->rendering_due)due=s->rendering_due;
+            if(due<deadline)deadline=due;
+        }
         for (struct js_script *p = s->scripts; p; p = p->next) if (p->module && p->parser_released && !p->notified) return (int64_t)now;
         uint64_t idle_due = idle_timeout_due(s); if (idle_due < deadline) deadline = idle_due;
         if (s->idle_count && idle_eligible(s, now)) {
@@ -6518,6 +6826,10 @@ bool web_js_running(web_doc *d) { return d && d->js && d->js->running; }
 bool web_console_eval(web_doc *d,const char *source,size_t length) {
     struct web_js_state *s=d?d->js:NULL;
     if(!s||!source||!length||length>JS_SOURCE_LIMIT||s->running||s->starting||s->disabled)return false;
+    if(d->native_recovery_pending){
+        web_layout(d,d->width>0?d->width:1,d->height>0?d->height:1);
+        if(d->native_cancelled||d->native_recovery_pending||!d->layout_valid)return false;
+    }
     begin_named_task(s,"developer console",0);
     JSValue result=JS_Eval(s->ctx,source,length,"nocturne:developer-console",JS_EVAL_TYPE_GLOBAL);
     bool ok=!JS_IsException(result);
@@ -6580,6 +6892,8 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     d->js = s; s->doc = d; s->stream_generation=1; if (host) s->host = *host;
     d->profile_enabled=s->host.debug_js;
     s->runtime_owner=d->frame_parent && d->frame_parent->js?d->frame_parent->js->runtime_owner:s;
+    s->runtime_next=s->runtime_owner->runtime_realms;
+    s->runtime_owner->runtime_realms=s;
     uint32_t budget = s->host.js_task_budget_ms;
     s->task_budget_ms = budget ? budget : WEB_JS_TASK_DEFAULT_MS;
     s->media_width = d->width; s->media_height = d->height;
@@ -6716,6 +7030,12 @@ failed:
 }
 void web_js_free(web_doc *d) {
     struct web_js_state *s = d ? d->js : NULL; if (!s) return;
+    if(s->runtime_owner){
+        struct web_js_state **link=&s->runtime_owner->runtime_realms;
+        while(*link&&*link!=s)link=&(*link)->runtime_next;
+        if(*link)*link=s->runtime_next;
+        s->runtime_next=NULL;
+    }
     storage_release_document(s);
     d->js = NULL;
     if (s->ctx) {

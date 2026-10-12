@@ -277,14 +277,16 @@ int nmedia_worker_take(nmedia_worker *w,struct nmedia_output *o) {
     if(video&&(!audio||w->video_header.pts<=w->response.pts_ms)){
         const struct nmedia_worker_video *v=&w->video_header;w->video_ready=false;w->video_loan=true;
         w->info.width=v->width;w->info.height=v->height;
-        *o=(struct nmedia_output){.kind=NMEDIA_VIDEO,.pts_ms=v->pts,.width=v->width,.height=v->height,.pixels=(const uint32_t *)w->video_pixels};return NMEDIA_VIDEO;
+        *o=(struct nmedia_output){.kind=NMEDIA_VIDEO,.pts_ms=v->pts,.width=v->width,.height=v->height,.pixels=(const uint32_t *)w->video_pixels,
+            .video_measured_frames=v->video_measured_frames,.video_work_ms=v->video_work_ms,
+            .video_measurement_id=v->video_measurement_id,.video_configuration=v->video_configuration};return NMEDIA_VIDEO;
     }
     if(!w->output_ready)return NMEDIA_AGAIN;
     struct nmedia_worker_response *r=&w->response;
     if(r->kind==NMEDIA_END&&(w->video_head_pos||w->video_ready||w->video_expected_sequence>w->video_sequence))return NMEDIA_AGAIN;
     w->output_ready=false;
     if(r->kind==NMW_VIDEO_PENDING){memset(o,0,sizeof *o);return NMEDIA_AGAIN;}
-    *o=(struct nmedia_output){.kind=r->kind,.pts_ms=r->pts_ms,.frames=r->frames,.samples=(const int16_t *)w->payload};return r->kind;
+    *o=(struct nmedia_output){.kind=r->kind,.pts_ms=r->pts_ms,.frames=r->frames,.samples=(const int16_t *)w->payload,.audio_observation=r->audio_observation};return r->kind;
 }
 bool nmedia_worker_move_video(nmedia_worker *w,const struct nmedia_output *o,uint32_t **pixels,size_t *capacity){
     uint32_t bytes;

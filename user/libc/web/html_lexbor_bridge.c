@@ -150,18 +150,35 @@ static bool rebind_native(struct html_parser *p, struct binding *binding, node_t
     if (binding->native == native) return true;
     struct html_bridge *bridge = p->bridge;
     if (by_native(bridge, native)) return false;
+    /* Replace only this identity's probe entry. A synchronous custom-element
+       constructor can rebind once per token; rebuilding the entire forest's
+       table here makes parsing a stream of custom elements quadratic. The
+       table is under half full, so a terminating empty slot always exists. */
+    size_t mask = bridge->table_size - 1;
+    size_t gap = ptr_hash(binding->native) & mask;
+    while (bridge->table[gap] && bridge->table[gap] != binding)
+        gap = (gap + 1) & mask;
+    if (!bridge->table[gap]) return false;
+    for (size_t scan = (gap + 1) & mask; bridge->table[scan]; scan = (scan + 1) & mask) {
+        struct binding *item = bridge->table[scan];
+        size_t home = ptr_hash(item->native) & mask;
+        /* Move an entry only when the hole lies on its cyclic probe path.
+           Otherwise lookups for an intervening displaced entry would stop at
+           the hole, especially when a collision cluster wraps slot zero. */
+        if (((scan - home) & mask) >= ((scan - gap) & mask)) {
+            bridge->table[gap] = item;
+            gap = scan;
+        }
+    }
+    bridge->table[gap] = NULL;
     unsubscribe(binding);
     binding->native = native;
     binding->subscription_next = native->html_bindings;
     native->html_bindings = binding;
     native_changed(bridge, binding, HTML_BRIDGE_FIELDS | HTML_BRIDGE_LINKS | HTML_BRIDGE_CHILDREN);
-    memset(bridge->table, 0, bridge->table_size * sizeof *bridge->table);
-    for (size_t i = 0; i < bridge->length; i++) {
-        struct binding *item = bridge->items[i];
-        size_t slot = ptr_hash(item->native) & (bridge->table_size - 1);
-        while (bridge->table[slot]) slot = (slot + 1) & (bridge->table_size - 1);
-        bridge->table[slot] = item;
-    }
+    size_t slot = ptr_hash(native) & mask;
+    while (bridge->table[slot]) slot = (slot + 1) & mask;
+    bridge->table[slot] = binding;
     return true;
 }
 

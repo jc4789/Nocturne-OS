@@ -101,7 +101,7 @@ int main(void) {
                 if(!nmedia_seek(m,c.seek_ms)){r.kind=NMEDIA_ERROR;strlcpy(r.error,nmedia_error(m),sizeof r.error);if(!r.error[0])strlcpy(r.error,"native worker seek failed",sizeof r.error);}
             } else if(c.operation==NMW_STEP) {
                 if(!pending.kind)pending.kind=nmedia_step(m,&pending);
-                o=pending;r.kind=o.kind;r.pts_ms=o.pts_ms;
+                o=pending;r.kind=o.kind;r.pts_ms=o.pts_ms;r.audio_observation=o.audio_observation;
                 /* The first image is detached. Continue muxed PCM while it
                    drains; hold a second decoder image without overwriting it. */
                 if((r.kind==NMEDIA_VIDEO||r.kind==NMEDIA_END)&&video.pending)r.kind=NMEDIA_AGAIN;
@@ -110,7 +110,9 @@ int main(void) {
                     if(!nmedia_video_wire_bytes(o.width,o.height,&bytes)||!nmedia_move_video(m,&o,&video.pixels,&video.capacity)){
                         r.kind=NMEDIA_ERROR;strlcpy(r.error,"Range VIDEO owner/size transfer failed",sizeof r.error);
                     }else{video.header=(struct nmedia_worker_video){.magic=NMEDIA_WORKER_MAGIC,.generation=generation,.sequence=sequence,
-                        .bytes=bytes,.epoch=epoch,.pts=o.pts_ms,.width=o.width,.height=o.height};
+                        .bytes=bytes,.epoch=epoch,.pts=o.pts_ms,.width=o.width,.height=o.height,
+                        .video_measured_frames=o.video_measured_frames,.video_work_ms=o.video_work_ms,
+                        .video_measurement_id=o.video_measurement_id,.video_configuration=o.video_configuration};
                         video.position=0;video.pending=true;pending.kind=0;r.kind=NMW_VIDEO_PENDING;}
                 }else if(r.kind==NMEDIA_ERROR)strlcpy(r.error,nmedia_error(m),sizeof r.error);
                 else if(r.kind==NMEDIA_AGAIN)pending.kind=0;

@@ -536,8 +536,89 @@ static void font_flat_retry(void) {
     web_free(d);
 }
 
+static void dependent_cache_updates(void){
+    web_doc *d=load();check(d!=NULL,"dependent caches document");if(!d)return;
+    node_t *stable=element(d,"div",d->body,NULL),*flex=element(d,"div",d->body,NULL),*grid=element(d,"div",d->body,NULL);
+    node_t *fx=element(d,"div",flex,NULL),*gx=element(d,"div",grid,NULL),*gy=element(d,"div",grid,NULL);
+    node_t *text=doc_node_create(d,N_TEXT,NULL,"unchanged shaped content",24);doc_node_move(d,stable,text,NULL);
+    doc_node_attr(d,stable,"style","width:min(25%, 110px);height:30px;color:red");
+    doc_node_attr(d,flex,"style","display:flex;width:100px;height:40px;justify-content:flex-start");
+    doc_node_attr(d,fx,"style","width:30px;height:20px;flex-shrink:0");
+    doc_node_attr(d,grid,"style","display:grid;width:200px;grid-template-columns:50px 1fr");
+    doc_node_attr(d,gx,"style","height:20px");doc_node_attr(d,gy,"style","height:20px");
+    web_layout(d,800,600);
+    check(stable&&stable->box&&flex&&flex->box&&grid&&grid->box&&fx->box&&gx->box,"dependent cached boxes");
+    if(!stable->box||!flex->box||!grid->box||!fx->box||!gx->box){web_free(d);return;}
+    box_t *root=d->root_box,*sb=stable->box,*fb=flex->box,*gb=grid->box;
+    struct achunk *arena=sb->layout_mem.head;struct run *runs=sb->runs;
+    check(sb->st->width.kind==LK_EXPR&&sb->layout_cache_valid&&runs,"mixed min expression has native cached formatting");
+    doc_node_attr(d,stable,"style","width:min(25%, 110px);height:30px;color:blue");web_layout(d,800,600);
+    check(d->root_box==root&&stable->box==sb&&sb->layout_mem.head==arena&&sb->runs==runs,
+        "equivalent expression across arenas retains shaped layout");
+    check(sb->nruns&&sb->runs[0].st->color==0xff0000ffu&&near(sb->w,110),"retired paint borrow points to current style");
+    doc_node_attr(d,flex,"style","display:flex;width:140px;height:40px;justify-content:flex-end");web_layout(d,800,600);
+    check(d->root_box==root&&flex->box==fb&&stable->box==sb&&grid->box==gb,"flex geometry update preserves box topology");
+    check(near(fb->w,140)&&near(fx->box->x,110),"flex update reflows current geometry");
+    check(sb->layout_mem.head==arena&&sb->runs==runs,"unaffected sibling retains formatting arena");
+    doc_node_attr(d,grid,"style","display:grid;width:200px;grid-template-columns:80px 1fr");web_layout(d,800,600);
+    check(d->root_box==root&&grid->box==gb&&near(gx->box->w,80),"grid track update preserves topology and current geometry");
+    float x=fx->box->x,w=gx->box->w,stable_width=sb->w;
+    d->need_boxes=d->need_style=d->style_full_dirty=true;web_layout(d,800,600);
+    check(near(fx->box->x,x)&&near(gx->box->w,w)&&near(stable->box->w,stable_width),"local cache result equals forced full rebuild");
+    web_free(d);
+}
+static void shared_bfc_caches(void){
+    web_doc *d=load();check(d!=NULL,"shared BFC cache document");if(!d)return;
+    node_t *parent=element(d,"div",d->body,NULL),*normal=element(d,"div",parent,NULL);
+    node_t *text=doc_node_create(d,N_TEXT,NULL,"cached shaped words",19);doc_node_move(d,normal,text,NULL);
+    doc_node_attr(d,parent,"style","width:200px");
+    doc_node_attr(d,normal,"style","width:200px;height:40px");web_layout(d,800,600);
+    box_t *p=parent->box,*b=normal->box;
+    check(p&&b&&b->layout_cache_valid&&!b->layout_cache_exports_floats,"empty shared BFC caches normal formatting");
+    if(!p||!b){web_free(d);return;}
+    node_t *floated=element(d,"div",NULL,NULL);doc_node_attr(d,floated,"style","float:left;width:70px;height:80px");doc_node_move(d,parent,floated,normal);
+    web_layout(d,800,600);p=parent->box;b=normal->box;
+    check(p->layout_cache_exports_floats&&!p->layout_cache_valid,"shared BFC float registrations are never cached away");
+    check(!b->layout_cache_valid&&b->nruns&&near(b->runs[0].x,70),"external float defeats normal cache and narrows line");
+    doc_node_attr(d,floated,"style","float:left;width:120px;height:80px");web_layout(d,800,600);b=normal->box;
+    check(b->nruns&&near(b->runs[0].x,120),"changed external float reshapes the unchanged sibling");
+    float x=b->nruns?b->runs[0].x:0,height=b->h;
+    d->need_boxes=d->need_style=d->style_full_dirty=true;web_layout(d,800,600);b=normal->box;
+    check(b->nruns&&near(b->runs[0].x,x)&&near(b->h,height),"shared BFC cache geometry equals full layout");
+    web_free(d);
+}
+static void font_unicode_ranges(void) {
+    web_doc *d=load();check(d!=NULL,"unicode range document");if(!d)return;
+    struct cssom_sheet *css=sheet(d,
+        "@font-face{font-family:Subset;src:url(subset.ttf);unicode-range:U+E0??}"
+        "@font-face{font-family:Merged;src:url(merged.ttf);unicode-range:U+400-4FF,U+4??}"
+        ".subset{font-family:Subset,sans-serif}.merged{font-family:Merged,sans-serif}");
+    check(css&&cssom_adopt(d->root,&css,1)==CSSOM_OK,"unicode range sheet");
+    node_t *a=element(d,"div",d->body,"subset"),*b=element(d,"div",d->body,"subset");
+    node_t *merged=element(d,"div",d->body,"merged");
+    node_t *canvas=element(d,"canvas",d->body,NULL),*video=element(d,"video",d->body,NULL);
+    doc_node_move(d,a,doc_node_create(d,N_TEXT,NULL,"Latin",5),NULL);
+    doc_node_move(d,b,doc_node_create(d,N_TEXT,NULL,"Latin",5),NULL);
+    web_layout(d,800,600);
+    check(canvas->style->bg_color==0&&video->style->bg_color==0,"empty canvas and video CSS backgrounds stay transparent");
+    const struct web_font_choice *ca=a->style->font_choices,*cb=b->style->font_choices,*cm=merged->style->font_choices;
+    check(ca&&cb&&ca!=cb&&ca->ranges!=cb->ranges,"composite choices belong to each computed style arena");
+    check(ca&&ca->range_count==1&&ca->ranges[0].first==0xe000&&ca->ranges[0].last==0xe0ff,"unicode wildcard range expands exactly");
+    check(cm&&cm->range_count==1&&cm->ranges[0].first==0x400&&cm->ranges[0].last==0x4ff,"overlapping unicode ranges merge");
+    struct web_font_resource *resource=doc_font_resource(d,"https://style.test/subset.ttf");
+    check(resource&&!resource->wanted,"Latin text does not fetch private-use subset");
+    wfont font=style_font(b->style),fallback=font;fallback.choices=NULL;
+    float width=wf_width(&font,"Latin",5);
+    check(near(width,wf_width(&fallback,"Latin",5)),"out-of-range measurement uses the ordinary family fallback");
+    (void)wf_width(&font,"\xee\x80\x80",3);
+    check(resource->wanted,"in-range text requests its real subset");
+    doc_node_attr(d,a,"style","color:red");web_layout(d,800,600);
+    font=style_font(b->style);
+    check(near(width,wf_width(&font,"Latin",5)),"sibling subset choices survive another node's partial restyle");
+    web_free(d);
+}
 int main(void) {
-    incremental();scopes();derived_styles();percentage_padding_cache();parallel_form_selectors();cssom_container_roundtrip();container_queries();font_completion();font_flat_retry();
+    incremental();scopes();derived_styles();percentage_padding_cache();parallel_form_selectors();cssom_container_roundtrip();container_queries();font_completion();font_flat_retry();dependent_cache_updates();shared_bfc_caches();font_unicode_ranges();
     printf("styleincremental: %d checks, %d failures\n",checks,failed);
     return failed?1:0;
 }

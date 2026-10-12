@@ -31,7 +31,9 @@ int n_channel_accept(int f){(void)f;errno=EAGAIN;return -1;}
 #endif
 uint64_t uptime_ms(void){return 100;}
 int cpu_info(struct n_cpuinfo*p){(void)p;return -1;}
+#ifndef WORKER_BODY_NATIVE
 void web_js_encoding_init_isolated(JSContext*c,JSValue h){(void)c;(void)h;}
+#endif
 bool html_policy_requires_script(const web_doc*d){(void)d;return false;}
 bool html_policy_init(web_doc*d,const char*h,const web_doc*i){(void)d;(void)h;(void)i;return true;}
 bool html_policy_snapshot_init(web_doc*d,const char*h){(void)d;(void)h;return true;}

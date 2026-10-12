@@ -73,7 +73,7 @@ int main(void){
     FILE *f=fopen(AVMEDIA_CASES_SCRIPT,"rb");CHECK(f!=NULL);if(!f)return 1;
     char *script=malloc(32768);CHECK(script!=NULL);if(!script){fclose(f);return 1;}
     size_t n=fread(script,1,32767,f);script[n]=0;fclose(f);
-    const char *prefix="<!doctype html><style>body{margin:0;background:white}video{display:block;width:96px;height:64px}</style><body><video id=visible controls></video><script>";
+    const char *prefix="<!doctype html><style>body{margin:0;background:white}video{display:block;width:96px;height:64px}canvas{position:absolute;left:0;top:0;width:96px;height:32px;pointer-events:none}</style><body><video id=visible controls></video><canvas></canvas><script>";
     const char *tail=";runAvmediaCases().catch(e=>console.error('FAIL '+e+' '+e.stack));</script>";
     size_t size=strlen(prefix)+n+strlen(tail)+100;char *page=malloc(size);CHECK(page!=NULL);if(!page){free(script);return 1;}
     snprintf(page,size,"%svar nativeAudioAvailable=%s;%s%s",prefix,slots>0?"true":"false",script,tail);free(script);

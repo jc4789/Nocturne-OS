@@ -35,6 +35,9 @@ bool web_avmedia_pip_paint(web_doc *,node_t *,canvas_t *);
  * ordinary paint, without an independent fixed pixel ceiling. */
 void web_avmedia_snapshot_begin(web_doc *doc);
 void web_avmedia_snapshot_reject(void);
+/* Bounded-effect layers reject only their actual clipped screen extent.
+ * Probe coordinates are translated to the committed candidate surface. */
+void web_avmedia_snapshot_reject_region(const canvas_t *,int,int,int,int);
 bool web_avmedia_snapshot_prepare(web_doc *doc,canvas_t *committed,canvas_t *probe,
                                  int *x,int *y,int scroll_x,int scroll_y);
 void web_avmedia_snapshot_probe(unsigned phase);

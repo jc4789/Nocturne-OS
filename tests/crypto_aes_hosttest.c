@@ -24,6 +24,7 @@ static JSValue evaluate(JSContext *ctx,const char *source,const char *name){JSVa
 static void load(JSContext *ctx,const char *path){FILE *f=fopen(path,"rb");if(!f){perror(path);exit(2);}fseek(f,0,SEEK_END);long size=ftell(f);rewind(f);char *source=malloc((size_t)size+1);if(!source||fread(source,1,(size_t)size,f)!=(size_t)size)exit(2);fclose(f);source[size]=0;JS_FreeValue(ctx,evaluate(ctx,source,path));free(source);}
 static JSValue url(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){(void)self;(void)argc;(void)argv;return JS_NewString(ctx,"https://example.com/");}
 static int await_result(JSContext *ctx,JSValue p){JSContext *job;int n;while((n=JS_ExecutePendingJob(JS_GetRuntime(ctx),&job))>0){}if(n<0){exception(job);exit(2);}JSValue result=JS_PromiseResult(ctx,p);if(JS_PromiseState(ctx,p)!=JS_PROMISE_FULFILLED){JS_Throw(ctx,result);exception(ctx);exit(2);}int count=0;if(JS_ToInt32(ctx,&count,result)<0)exit(2);JS_FreeValue(ctx,result);JS_FreeValue(ctx,p);return count;}
+#ifndef WORKER_BODY_NATIVE
 int main(int argc,char **argv){
     JSRuntime *rt=JS_NewRuntime();JSContext *ctx=JS_NewContext(rt);
     JSValue global=JS_GetGlobalObject(ctx),host=JS_NewObject(ctx);web_js_crypto_init(ctx,host);
@@ -37,3 +38,4 @@ int main(int argc,char **argv){
     printf("Production EME lifecycle checks (mock media bridge): %d\n",await_result(ctx,evaluate(ctx,incremental?"runPSSHChunkCases()":"runEMECases()","EME cases")));
     JS_FreeContext(ctx);JS_FreeRuntime(rt);return 0;
 }
+#endif

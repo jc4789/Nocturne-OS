@@ -63,3 +63,44 @@ J-space medium。主担当が実QEMU・最大化画面・全媒体梱包を受�
 - flow媒体の実controls.pngを担当自身で目視。最初の画像/spinner/author-play後、実ログは約76.5秒taskで停止同然になった後に再開し、音声5414ms/映像5200ms、starved1/ahead2で止まるため成功ではない。全worker deadlock確定と決め付けず、協調取得の具体的なowner不整合を修理：`mse_next`のcooperative早期returnが実output slot/revision更新を飛ばしていた。通常/協調の完了境界を共通化し、先読みloanを実SourceBuffer ownerへ帰属させる。
 - 空STEP/BUSYが実byte進捗を作らない間、1〜16msの有限readiness予約で同じ非blockingFD probeのhotloop反復を抑える。実VIDEO byte/実output/非STEP ACK進捗で即解除、新APPEND/KEYS/controlも即解除。正常browser loopのwait/背圧は変更せず、協調経路にsleep/yieldを追加しない。予約はprobe終了時刻から取り、probe自身の所要時間で即期限切れになる再試行ループを防ぐ。最新対象Cのsyntax compile成功、新実受入待ち。
 - 同じ有限pump内の映像candidate比較は、1回の実device-consumption snapshotを共有してclock read syscall重複を除去。PCM/silence write、sink close/replacementで即失効し、pump終了時に解除。作者currentTime getterや外部観測に古いsnapshotを流用しない。
+- 最新accept実logでは音声4558ms/映像4533ms、9571ms/9533msへ差が縮小し主担当は最初の動画完走とautoplay遷移を目視。ただし入力範囲端点5414/9994/11214msでstarved、wall遅延とwindow-published0が残り、正常な連続再生とは扱わない。
+- snapshotの共通拒否を矩形化。別領域のiframe/opacity groupが動画suffix全体を拒否しないよう、既存snapshot内に1paint寿命のclipped危険領域を保持し、候補確定後に実交差判定。probeはcommitted領域offsetへ変換し、OOM/overflow/未知影響は保守的拒否。paint.cの呼出し接続は主担当が所有。
+- 真input-starvedでcommand/lane/output/ownedaheadが一切ないMSEは空FDpollと10ms deadlineを省く。APPEND/KEYS/seek/controlの既存demandで復帰する。MSEのcontrol/video readinessは1回のpollへ集約し、期限・loan・正常handoff・早いcontrol ACK再pollを維持。対象syntax成功、変更後の実連続再生受入は主担当が行う。
+
+## 共通CSS translation: drawer重なりの修理
+
+- Shaka drawerの位置指定をサイト専用処理でなく既存cssprop/style/boxへ実装。`transform`のtranslate/translateX/translateYリスト、2D等価なtranslate3d（zが実length zeroのみ）、individual `translate`の1/2軸、px/%/calc、CSS-wide値を解析。非zero 3D、scale/rotate/skew、補間アニメーションは未対応として拒否する。
+- %はnormal-flow containing blockでなく自身のborder-boxへ解決。normal-flow寸法/box_absは変更せず、共通box_visual経路で祖先translationを一度加算し、paint/hit/clientrect/scrollIntoViewを同じ座標へ接続。inline-flex/grid/table wrapper内側では二重適用しない。
+- noneとidentityを区別し、transformable elementのstacking contextとfixed/absolute containing blockへ接続。非置換inlineは描画変換/transform CBの対象外。overflowは元と変換後のunionを保持し値変更でも再計算、変換で元extentを縮めない。
+- CSSOM serializationは主担当js.cへ契約引渡し済み。裸の非zero数値、calc(number)、不正関数/引数数、z percentageを拒否し、invalid declarationで前のcascade値を破壊しない。
+- 新 `tests/translatetest.c` の1まとまりでnative geometry/raster/real hit/CB/overflowと解析拒否を確認する。対象Cとfixture syntax成功。実guest検証と最新版Shaka表示/入力・YouTube再確認は主担当の全build後受入待ち。以前の成功検査を反復していない。
+- 一次仕様: [CSS Transforms 1 §3](https://www.w3.org/TR/css-transforms-1/#transform-rendering)、[CSS Transforms 2 individual properties](https://www.w3.org/TR/css-transforms-2/#individual-transforms)。2D translationだけのpartial scopeであり、全transform対応とは報告しない。
+
+## 局所CSS/layoutとnative高bitdepth・AC97安全性
+
+- `layout_invalidate`は変更boxと祖先集約だけをdirtyにし、無関係な子孫のintrinsic/layout cacheを破棄しない。実cacheのwidth/cbh/usedh/edges/fontgeneration比較、inherited変更時の子自身の失効、absolute別layout phaseを保持。非absolute line-clamp等の非再利用条件は維持。
+- calc/min/maxとgrid trackはarenaポインタでなく式構造を等値比較。deep式は反復stackで比較し再帰stack overflowを避け、OOMはcache再利用しない安全側へ戻る。display不変flex/gridの構造を保った値変更はrestyle＋reflowへ接続。style retirement時に単調atomic dirty経路を公開し、join後に変更経路と必要なanonymous/text/wrapper借用だけ更新してから旧arenaを回収する。
+- `styleincrementaltest.c`の新dependent cache条件はmixed min、paint旧借用、flex/grid geometry、無関係sibling、forcedfull一致を検証する。syntax成功、guestと実サイト性能は主担当の最新媒体受入待ち。
+- `media.c`既存SSE2 rowを8/10/12/16bitの420/422/444へ拡張。8pixel群を処理しodd幅は最大7pixelのtail。16bit unsigned lumaの符号補正を含め、raw精度でmatrix計算後に初めて8bitへ丸める。従来の先行255/maxCode量子化を除去。BT601/709/FCC/SMPTE240M、full/limited、signed strideとchroma subsamplingを保持。planeの実AVBuffer ownership・stride・extentを検査し無効入力を媒体errorにする。HDR/未実装matrixは明示拒否、AVXや新GPL依存は追加せずNocturneの必須x64 SSE2/FPU-save ABIを使う。
+- 新focused host比較は実product rowを直接includeし、独立64bit scalar参照と6720rows/131520pixelsで完全一致、guard保持、0失敗。host型衝突とPE linkerのunused decoder保持をfixture側ABI隔離・GCC whole-programで解決してから実行した。検査合格を実動画合格へ昇格しない。ソースは `tests/media_yuv_sse_test.c`。
+- AC97のCIV/PICBがdescriptor境界で変わった時は新CIVで1度再確認し、未確認/不正remainingでrefillしない。stream run32上限をASSERTからPCM owner保持と背圧へ変更、nonblocking writeはEAGAIN、tracking不正はEIO。clock underflowを防止しfault streamはmix/idle demandから除外、flushで世代とtrackingを回復しcloseは回収する。既に混合された他stream PCMを勝手に取消・消費扱いしない。
+- 最新native媒体・kernel音声のsyntaxと差分検査は成功。実AC97音声/高bitdepth動画/性能・停止・シークの受入は主担当が最新版媒体で行う。FFmpeg公式[YCbCr係数](https://ffmpeg.org/doxygen/trunk/yuv2rgb_8c_source.html)のrange/matrix式を照合し、既存係数に合わせたnative整数変換である。
+- kernelのstatus EIOはブラウザーへ実native errorとして接続。currentTime getterでは最後に確認済みのPCM消費時刻だけを保持し、loanを解放しない。pumpの安全境界で停止・ahead/PCM回収を行い、AGAIN/PCM/EOFの読出し失敗をwall時計や成功へ置換しない。
+- `nmedia_video_performance`とVIDEO outputの累積`video_measured_frames/video_work_ms`を追加。実video codec send/receiveとARGB変換だけをuptimeで計測し各callの丸め上限+1msを加える。seek prerollを除外し、catch-up破棄の実復号費用は次の実変換へ保守側に合算、破棄画像で測定frame数を増やさない。実出力dimension/pixfmt/matrix/range切替とdecoder reclaimでsampleをreset。demux/ネット/IPC/描画待ちは測定外。wire/nativehistory/MediaCapabilities接続は主担当所有で、このsyntax成功をsmooth実受入へ昇格しない。
+- viewport-fixedの子へmarquee祖先offsetが混入する共通visual位置を修理。translationと同様に実viewport固定境界で祖先寄与を止め、Fullscreen自身の作者individual translateは保持する。
+
+## 実測MediaCapabilities予測の独立修理
+
+- codec名だけでAVC Main/High、VP9 8/10bit等の別構成へ費用を流用する不備を修理。実decoderのprofile/level、AVC avcC compatibility、実pixel depthとdimensionをVIDEOで運び、プロセス内decoder/configuration sample ID、文書generation、MSE slot/revisionで古い観測を失効。未計測outputで旧sampleを保持しない。構造体paddingをmemcmpせず意味のあるfieldsだけ照合。
+- 音声は実codec send/receive・channel matrix・48kHz PCM変換の費用を測定し、実codec/profile/source channels/source rateと換算後frame数をPCM responseへ接続。1秒以上の実観測を要し、音声併用は同media ownerの両signatureを照合して実動画費用と音声費用を合算、50%headroomで予測。固定の音声費用やsupportedからsmoothを真にする代替はない。
+- native Range wire v4: VIDEO96byte/response368byte、MSE wire v7: VIDEO112byte/response272byte。producer/consumer双方とsizeof guardを同時更新。PCM batchは観測ID変更を跨いで連結しない。
+- 既知video bitrateより高いqueryは比率で費用を保守補正。MSE等のbitrate不明は完全一致必須で全観測を無効にせず、profile/depth/dimensionと実費用を根拠に予測する。これは[W3C MediaCapabilities](https://www.w3.org/TR/media-capabilities/)の予測であり、実サイトの連続再生を保証しない。VP9 levelはdecoderが通常返さないため画素費用キーから外すがprofile/depthは必須。HEVC hvcC constraints、AVC Annex-B compatibility、明示VP9 color suffix、未計測profileは未知smooth false。softwareのpowerEfficient falseは維持。
+- JS dictionaryのaudio bitrateは任意として扱い、video alphaはopaque native出力に未対応、WebRTC専用scalability指定はfile/MSEに無効とする。実product MIME matcherの新host限定21条件は全成功、変更後native媒体/wire/browser syntaxと担当diffcheckも成功。変更後実復号cost値・JS API・実サイト受入は主担当の正規再生成/全build後の一括確認待ち。過去の合格を今回へ流用しない。
+
+## integrated guest の局所layout回帰修理
+
+- 主担当の `media-integrated-guest-20261012/test-serial.log` はstyleincremental 125条件中3失敗。成功font直後もlayout/cacheが有効、普通blockのmixed min cache不成立、無関係sibling formatting arena再構築であり、期待値は維持した。
+- 変更box自身のintrinsic_done/layout_dirtyを失効していなかった `layout_invalidate` を修理。子孫一括無効化へ戻さず変更boxと祖先集約に限定。
+- 普通blockは入力共有BFCにfloatが無く、そのsubtreeが同BFCへfloatを登録しない場合に限り既存width/cbh/usedh/edge/font keysでcacheを再利用。既存cache prepareの一走査でfloat exportを集計、独立BFC内floatと外へ寄与するfloatを区別。float入力/登録があると通常reshapeを保つ。
+- 成功fontのmetrics世代変更には `layout_invalidate_fonts` を公開。box linkを反復走査してintrinsic/shaping/cacheを即失効、doc_font_loadedの成功時だけ主担当が接続。失敗srcは既存committed cacheを保持。font再選択の局所cascadeとgeometry readのlayout保証は維持。
+- 元3条件を弱めず、empty/shared BFC cacheとfloat追加/幅変更/forcedfull一致の条件を追加。修理後layout/css/fixtureのnative syntaxと担当diffcheck成功。変更後のguest/実サイト受入は主担当の更新媒体で確認する。

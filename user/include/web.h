@@ -19,6 +19,8 @@
 
 typedef struct web_doc web_doc;
 typedef struct node web_node; /* an element of the document */
+/* The active native embedding chain, never author-selected Window ancestry. */
+web_doc *web_presentation_root(web_doc *);
 bool web_presentation_exit(web_doc *,int kind);
 web_node *web_presentation_element(web_doc *,int kind);
 bool web_avmedia_pip_paint(web_doc *,web_node *,canvas_t *);
@@ -135,7 +137,8 @@ struct web_host {
     bool (*video_present)(void *opaque, web_doc *document,
                           const struct web_video_patch *patch);
     /* Native window transition; no DOM/JS callback, no borrowed media pixels.
-       0 exit fullscreen, 1 enter fullscreen, 2 enter PiP, 3 exit PiP. */
+       0 exit fullscreen, 1 enter fullscreen, 2 enter PiP, 3 exit PiP,
+       4 retire fullscreen: release document pointers even if restore fails. */
     bool (*presentation)(void *opaque,web_doc *document,web_node *element,int mode);
     bool (*history)(void *opaque, int operation, const char *url, const void *state,
                     size_t state_len, int value, struct web_history *out);

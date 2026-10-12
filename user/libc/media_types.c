@@ -124,3 +124,64 @@ const char *nmedia_can_play_type(const char *type) {
     }
     return "probably";
 }
+bool nmedia_performance_codec(const char *type,struct nmedia_video_configuration *out) {
+    if(!out)return false;
+    *out=(struct nmedia_video_configuration){0};
+    if(!type||!nmedia_can_play_type(type)[0]||strlen(type)>=256)return false;
+    char text[256];size_t length=strlen(type);
+    for(size_t i=0;i<=length;i++)text[i]=(char)tolower((unsigned char)type[i]);
+    char *parameter=strchr(text,';');
+    if(!parameter)return false;
+    *parameter++=0;
+    if(strncmp(trim(text),"video/",6))return false;
+    while(parameter&&*parameter){
+        char *next=strchr(parameter,';');if(next)*next++=0;
+        char *name=trim(parameter),*value=strchr(name,'=');
+        if(value){
+            *value++=0;
+            if(!strcmp(trim(name),"codecs")){
+                value=trim(value);size_t size=strlen(value);
+                if(size>=2&&value[0]=='"'&&value[size-1]=='"'){value[size-1]=0;value++;}
+                value=trim(value);
+                if(strchr(value,','))return false;
+                if(!strcmp(value,"vp8")||!strcmp(value,"vp8.0")){*out=(struct nmedia_video_configuration){.codec=NMEDIA_VCODEC_VP8,.depth=8};return true;}
+                /* Legacy VP9 omits profile/depth. It cannot select an exact
+                   observed sample. Explicit HDR/color variants likewise need
+                   their own color-model observation, not a generic VP9 cost. */
+                if(strlen(value)==13&&vp9_8(value)){
+                    *out=(struct nmedia_video_configuration){.codec=NMEDIA_VCODEC_VP9,.profile=(uint32_t)(value[6]-'0'),
+                        .depth=(uint32_t)((value[11]-'0')*10+value[12]-'0')};return true;
+                }
+                if(avc8(value)){
+                    unsigned profile=(unsigned)strtoul(value+5,NULL,16)>>16;
+                    if(profile==66||profile==77||profile==88||profile==100){
+                        unsigned bytes=(unsigned)strtoul(value+5,NULL,16);
+                        *out=(struct nmedia_video_configuration){.codec=NMEDIA_VCODEC_AVC,.profile=profile,.level=bytes&255,.depth=8,.compatibility=(bytes>>8)&255};return true;
+                    }
+                }
+                /* HEVC profile-compatibility and constraint flags require
+                   hvcC-level matching. Do not infer them from decoder name. */
+                return false;
+            }
+        }
+        parameter=next;
+    }
+    return false;
+}
+bool nmedia_performance_audio(const char *type,uint32_t *codec,uint32_t *profile){
+    if(!type||!codec||!profile||strlen(type)>=256||!nmedia_can_play_type(type)[0])return false;
+    char text[256];for(size_t i=0;i<=strlen(type);i++)text[i]=(char)tolower((unsigned char)type[i]);
+    char *parameter=strchr(text,';');if(parameter)*parameter++=0;
+    char *mime=trim(text);if(strncmp(mime,"audio/",6))return false;
+    *profile=0;
+    if(!parameter){if(!strcmp(mime,"audio/mpeg")||!strcmp(mime,"audio/mp3")){*codec=NMEDIA_ACODEC_MP3;return true;}return false;}
+    while(parameter){char *next=strchr(parameter,';');if(next)*next++=0;char *name=trim(parameter),*value=strchr(name,'=');
+        if(value){*value++=0;if(!strcmp(trim(name),"codecs")){value=trim(value);size_t n=strlen(value);if(n>=2&&value[0]=='"'&&value[n-1]=='"'){value[n-1]=0;value++;}value=trim(value);
+            if(!strcmp(value,"opus"))*codec=NMEDIA_ACODEC_OPUS;
+            else if(!strcmp(value,"vorbis"))*codec=NMEDIA_ACODEC_VORBIS;
+            else if(!strcmp(value,"mp3"))*codec=NMEDIA_ACODEC_MP3;
+            else if(aac_lc_he(value)){*codec=NMEDIA_ACODEC_AAC;*profile=!strcmp(value,"mp4a.40.2")?1:!strcmp(value,"mp4a.40.5")?4:28;}
+            else return false;return true;
+        }}parameter=next;
+    }return false;
+}

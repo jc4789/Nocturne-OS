@@ -32,6 +32,9 @@ font_t *font_family(int family, int style);
    and the recommended gap between lines */
 void font_metrics(font_t *f, float px, float *ascent, float *descent, float *line_gap);
 bool font_has(font_t *f, uint32_t codepoint);
+/* The face's own cmap only, without bundled fallback. CSS composite fonts
+   intersect this coverage with each unicode-range descriptor. */
+bool font_has_primary(font_t *f, uint32_t codepoint);
 float font_advance(font_t *f, float px, uint32_t codepoint);
 float font_width(font_t *f, float px, const char *utf8, size_t n);
 /* Read-only identity for the currently opened native faces; 0 disables cache

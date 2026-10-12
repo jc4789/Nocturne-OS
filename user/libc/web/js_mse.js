@@ -115,6 +115,7 @@ const mseBridge = (() => {
                     if(s.epoch!==epoch||s.removed||source(s.parent).node!==node||source(s.parent).generation!==generation)return;
                     try{const state=native('state',p.node);if(state.error)throw state.mseQuotaError?error('QuotaExceededError',state.error):new TypeError(state.error);
                         if(state.msePending){s.timer=host.timer(0,poll,10,[]);return;}
+                        avmediaBridge.changed(node);
                         if(s.mode==='sequence'){const info=native('mseInfo',p.node,s.id);if(Number.isFinite(info.sequenceOffset))s.offset=info.sequenceOffset;}
                         updateDuration(p);completed(object,s,epoch,'update');
                     }catch(e){fail(e);}
@@ -173,7 +174,7 @@ const mseBridge = (() => {
         get sourceBuffers(){return source(this).buffers;}
         get activeSourceBuffers(){return source(this).active;}
         get duration(){return source(this).duration;}
-        set duration(value){const p=source(this),n=+value;idle(p);if(Number.isNaN(n)||n<0)throw new TypeError('Invalid media duration');if(!native('mseDuration',p.node,n))throw error('InvalidStateError','Native duration change failed');p.duration=n;}
+        set duration(value){const p=source(this),n=+value;idle(p);if(Number.isNaN(n)||n<0)throw new TypeError('Invalid media duration');if(!native('mseDuration',p.node,n))throw error('InvalidStateError','Native duration change failed');p.duration=n;avmediaBridge.changed(p.node);}
         addSourceBuffer(value){if(!arguments.length)throw new TypeError('Type required');const p=source(this),type=str(value);if(!type)throw new TypeError('Type is empty');if(!support(type))throw error('NotSupportedError','Unsupported MSE type');if(p.state!=='open')throw error('InvalidStateError','MediaSource is not open');
             if(p.nextId>0xffffffff)throw new RangeError('SourceBuffer id representation');const id=p.nextId++;
             if(!native('mseAdd',p.node,id,type))throw error('QuotaExceededError','Native SourceBuffer could not be created');
@@ -197,10 +198,10 @@ const mseBridge = (() => {
                     const state=native('state',node);if(state.error)return;
                     if(state.msePending){host.timer(0,finish,10,[]);return;}
                     let end=0;for(const sb of p.buffers){if(typeof mediaEme!=='undefined')mediaEme.commit(sb);const s=buffer(sb),a=native('mseRanges',node,s.id);for(let i=0;i<a.length;i++)end=Math.max(end,a[i][1]);}
-                    p.duration=end;native('mseDuration',node,end);
+                    p.duration=end;native('mseDuration',node,end);avmediaBridge.changed(node);
                 };
                 schedule(finish);
-            }p.state='ended';queue(this,'sourceended');
+            }p.state='ended';avmediaBridge.changed(p.node);queue(this,'sourceended');
         }
         setLiveSeekableRange(start,end){const p=source(this);if(p.state!=='open')throw error('InvalidStateError','MediaSource is not open');const a=finite(start),b=finite(end);if(a<0||b<a)throw new TypeError('Invalid live seekable range');p.live=[a,b];}
         clearLiveSeekableRange(){const p=source(this);if(p.state!=='open')throw error('InvalidStateError','MediaSource is not open');p.live=null;}

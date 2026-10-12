@@ -6,6 +6,26 @@
 #include <errno.h>
 #include <quickjs.h>
 #include "../user/libc/web/js_worker.c"
+#ifdef WORKER_BODY_PARENT
+/* Feed the real binary child record to the product dispatcher. Only the host
+ * endpoint is modeled; the requester observes product-owned decoded bytes. */
+bool worker_body_parent_dispatch(JSContext *ctx,const struct njw_header *header,
+                                 const void *bytes,web_worker_requester request,
+                                 web_worker_canceler cancel,void *opaque){
+    web_workers manager={.ctx=ctx,.callback=JS_UNDEFINED,.generation=header->generation,
+        .request=request,.cancel=cancel,.opaque=opaque};
+    struct child child={.owner=&manager,.id=7,.generation=header->generation,.in=-1,.out=-1};
+    manager.children=&child;
+    struct event *event=calloc(1,sizeof *event);if(!event)return false;
+    event->data=malloc(header->bytes);if(!event->data){free(event);return false;}
+    memcpy(event->data,bytes,header->bytes);event->h=*header;event->id=child.id;
+    manager.events=manager.last=event;manager.queued=sizeof *header+header->bytes;
+    bool ok=web_worker_run_one(&manager)&&!child.stopped&&!JS_HasException(ctx);
+    while(child.resources){struct resource *r=child.resources;child.resources=r->next;free(r);}
+    while(child.tx){struct packet *p=child.tx;child.tx=p->next;release_packet(&manager,p);}
+    return ok;
+}
+#else
 int waitpid(int p,int*s,int f){(void)p;(void)s;(void)f;errno=ECHILD;return -1;}
 int kill(int p){(void)p;return 0;}
 int pipe(int*p){(void)p;return -1;}
@@ -39,3 +59,4 @@ int main(void){JSRuntime*rt=JS_NewRuntime();JSContext*a=JS_NewContext(rt),*b=JS_
  web_worker_free(x);check("original-document-navigation-preserves-realm",find(y,id)==c&&c->owner==y&&!c->stopped&&c->generation==generation);check("navigation-detaches-only-original-port",!broker_find(c,p,0)->client&&broker_find(c,p,0)->closed&&broker_find(c,q,0)->client==y&&!broker_find(c,q,0)->closed);check("old-network-owner-cancelled",cancels==1);size_t bytes=c->rx_charge;for(struct packet*t=c->tx;t;t=t->next)bytes+=sizeof t->h+t->h.bytes;for(struct event*t=y->events;t;t=t->next)bytes+=sizeof t->h+t->h.bytes;check("queue-charge-moves-once-with-owner",bytes==y->queued);
  web_worker_free(y);web_worker_free(z);check("last-owner-removes-shared-registry",!shared_children&&!managers);JS_FreeContext(a);JS_FreeContext(b);JS_FreeContext(d);JS_FreeRuntime(rt);printf("RESULT %u checks %u failures\n",checks,failures);return failures?1:0;
 }
+#endif

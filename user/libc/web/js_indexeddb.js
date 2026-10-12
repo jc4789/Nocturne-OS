@@ -7,8 +7,11 @@ const indexedDBBridge=(()=>{
     const native=host.indexedDB,pack=host.pack,unpack=host.unpack;
     if(typeof native!=='function')return null;
     const invoke=Reflect.apply,wmGet=WeakMap.prototype.get,wmSet=WeakMap.prototype.set,wmHas=WeakMap.prototype.has;
+    const setAdd=Set.prototype.add,setClear=Set.prototype.clear,setValues=Set.prototype.values;
+    const setNext=Object.getPrototypeOf(new Set().values()).next;
     const mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapValues=Map.prototype.values,mapClear=Map.prototype.clear;
     const slots=new WeakMap(),connectionSlots=new Map();
+    const activeTasks=new Set();
     const records={get:v=>invoke(wmGet,slots,[v]),set:(v,r)=>invoke(wmSet,slots,[v,r]),has:v=>invoke(wmHas,slots,[v])};
     const connections={get:v=>invoke(mapGet,connectionSlots,[v]),set:(v,r)=>invoke(mapSet,connectionSlots,[v,r]),values:()=>invoke(mapValues,connectionSlots,[]),clear:()=>invoke(mapClear,connectionSlots,[])};
     const later=setTimeout,token={};let watching=false,retired=false;
@@ -38,7 +41,25 @@ const indexedDBBridge=(()=>{
     function keyPath(value){if(value===null)return null;const p=Array.isArray(value)?value.map(strings):strings(value);const valid=x=>x===''||/^[\p{ID_Start}_$][\p{ID_Continue}$\u200c\u200d]*(?:\.[\p{ID_Start}_$][\p{ID_Continue}$\u200c\u200d]*)*$/u.test(x);if(Array.isArray(p)?p.some(x=>!valid(x)):!valid(p))fail('SyntaxError');return p;}
     function inject(value,path,valueKey){if(!value||typeof value!=='object'||!path||Array.isArray(path))fail('DataError');const parts=path.split('.');for(let i=0;i<parts.length-1;i++){const p=parts[i];if(!Object.hasOwn(value,p))Object.defineProperty(value,p,{value:{},writable:true,enumerable:true,configurable:true});value=value[p];if(!value||typeof value!=='object')fail('DataError');}Object.defineProperty(value,parts[parts.length-1],{value:valueKey,writable:true,enumerable:true,configurable:true});}
     function clone(value){return cloneData.deserialize(cloneData.serialize(value),null,true);}
-    function value(record,tx){const a=native('value',get(tx,'IDBTransaction').nativeToken,record[1]);status(a[0]);return cloneData.deserialize(unpack(a[1]),null,true);}
+    async function prefetch(list,tx){
+        const r=get(tx,'IDBTransaction');
+        if(!r.valueCache)r.valueCache=new Map();
+        const references=[...new Set(list.map(record=>record[1]))].filter(ref=>!r.valueCache.has(ref));
+        if(!references.length)return;
+        const a=await native('values',r.nativeToken,references);status(a[0]);
+        if(r.finished)return;
+        if(!Array.isArray(a[1])||a[1].length!==references.length)fail('UnknownError','Invalid IndexedDB value batch');
+        for(let i=0;i<references.length;i++)r.valueCache.set(references[i],a[1][i]);
+    }
+    async function value(record,tx){
+        const r=get(tx,'IDBTransaction');
+        if(r.valueCache?.has(record[1])){
+            const bytes=r.valueCache.get(record[1]);r.valueCache.delete(record[1]);
+            return cloneData.deserialize(unpack(bytes),null,true);
+        }
+        const a=await native('value',r.nativeToken,record[1]);status(a[0]);
+        return cloneData.deserialize(unpack(a[1]),null,true);
+    }
     function status(code){if(code!==0)fail(code===2?'SecurityError':code===4?'QuotaExceededError':'UnknownError','Native IndexedDB operation failed');}
     class IDBKeyRange {
         constructor(t,r){if(t!==token)throw new TypeError('Illegal IDBKeyRange constructor');records.set(this,{kind:'IDBKeyRange',...r});}
@@ -67,31 +88,136 @@ const indexedDBBridge=(()=>{
     class IDBVersionChangeEvent extends Event {constructor(type,init={}){super(type,init);Object.defineProperties(this,{oldVersion:{value:Number(init.oldVersion)||0,enumerable:true},newVersion:{value:init.newVersion==null?null:Number(init.newVersion),enumerable:true}});}}
     function versionEvent(target,type,oldVersion,newVersion){const e=new IDBVersionChangeEvent(type,{oldVersion,newVersion});eventState(e).isTrusted=true;dispatch(target,e);return e;}
     function live(tx,writing=false){const r=get(tx,'IDBTransaction');if(r.finished||r.committing||!r.active)fail('TransactionInactiveError');if(writing&&r.mode==='readonly')fail('ReadOnlyError');return r;}
+    function activate(tx){get(tx,'IDBTransaction').active=true;invoke(setAdd,activeTasks,[tx]);}
+    function taskEnd(){
+        const iterator=invoke(setValues,activeTasks,[]);
+        for(;;){const item=invoke(setNext,iterator,[]);if(item.done)break;get(item.value,'IDBTransaction').active=false;}
+        invoke(setClear,activeTasks,[]);
+    }
     function schema(s){const tx=get(s.tx,'IDBTransaction');const store=(tx.data||tx.dbRecord.schema)?.stores.find(v=>v.name===s.name);if(!store)fail('InvalidStateError');return store;}
     function enqueue(tx,source,operation){const r=live(tx),request=new IDBRequest(token,source,tx);r.queue.push({request,operation});return request;}
-    function closing(db){const r=get(db,'IDBDatabase');if(r.closed&&!r.transactions.size&&r.connection){const code=native('disconnect',r.connection);if(code===1){later(()=>closing(db),5);return;}r.connection=0;}}
-    function watch(){if(watching||retired)return;watching=true;later(function poll(){watching=false;if(retired)return;let active=false;for(const list of connections.values())for(const db of list){const r=get(db,'IDBDatabase');if(r.connection){active=true;const a=native('poll',r.connection);if(a[0]===0&&a[1]!==null)versionEvent(db,'versionchange',r.version,a[1]===0?null:a[1]);}}if(active)watch();},100);}
-    function abort(tx,error){const r=get(tx,'IDBTransaction');if(r.finished)return;r.finished=true;r.active=false;r.error=error||new DOMException('Transaction aborted','AbortError');if(r.nativeToken){native('abort',r.nativeToken);r.nativeToken=0;}r.dbRecord.transactions.delete(tx);if(r.openRequest){r.dbRecord.upgrade=null;r.dbRecord.closed=true;}closing(r.db);for(const q of r.queue){finish(q.request,undefined,new DOMException('Transaction aborted','AbortError'));}r.queue=[];later(()=>{fire(tx,'abort');if(r.openRequest)finish(r.openRequest,undefined,r.error);},0);}
-    function complete(tx){const r=get(tx,'IDBTransaction');if(r.finished)return;
-        try{if(r.openRequest&&!r.dbRecord.connection){const a=native('connect',r.nativeToken,r.data.version);if(a[0]===1){later(()=>complete(tx),5);return;}status(a[0]);r.dbRecord.connection=a[1];watch();}if(r.mode==='readonly')status(native('abort',r.nativeToken));else status(native('commit',r.nativeToken,pack(r.data),r.data.stores.flatMap(s=>s.records.map(v=>v[1])),r.data.version));r.nativeToken=0;r.finished=true;r.active=false;r.dbRecord.version=r.data.version;r.dbRecord.schema=r.data;r.dbRecord.stores=r.data.stores.map(v=>v.name);r.dbRecord.transactions.delete(tx);r.dbRecord.upgrade=null;closing(r.db);fire(tx,'complete');if(r.openRequest){get(r.openRequest,'IDBRequest').transaction=null;finish(r.openRequest,r.db);}}
-        catch(e){abort(tx,e);}
+    async function closing(db){
+        const r=get(db,'IDBDatabase');
+        if(!r.closed||r.transactions.size||!r.connection||r.disconnecting)return;
+        r.disconnecting=true;
+        try{
+            const code=await native('disconnect',r.connection);
+            if(code===1){later(()=>closing(db),5);return;}
+            r.connection=0;
+        }catch(_){r.connection=0;}
+        finally{r.disconnecting=false;}
     }
-    function step(tx){const r=get(tx,'IDBTransaction');if(r.finished)return;
-        if(!r.nativeToken){
-            let a;try{a=native('begin',r.dbRecord.name);if(a[0]===1){later(()=>step(tx),5);return;}status(a[0]);r.nativeToken=a[1];r.data=a[2]===null?{version:0,stores:[]}:unpack(a[2]);if(!r.data||!Array.isArray(r.data.stores)||!Number.isSafeInteger(r.data.version))fail('UnknownError','Invalid IndexedDB snapshot');
-                if(r.mode==='versionchange'){r.data.version=r.upgradeVersion;r.active=true;const request=get(r.openRequest,'IDBRequest');request.done=true;request.result=r.db;request.transaction=tx;versionEvent(r.openRequest,'upgradeneeded',r.oldVersion,r.upgradeVersion);}
-                else {if(r.data.version!==r.dbRecord.version)fail('VersionError','Database schema changed');for(const n of r.scope)if(!r.data.stores.some(s=>s.name===n))fail('NotFoundError');}
-            }catch(e){abort(tx,e);return;}
-        }
+    function watch(){
+        if(watching||retired)return;
+        watching=true;
+        later(async function poll(){
+            let active=false;
+            try{
+                if(retired)return;
+                for(const list of connections.values())for(const db of list){
+                    const r=get(db,'IDBDatabase');
+                    if(!r.connection)continue;
+                    active=true;
+                    const connection=r.connection,a=await native('poll',connection);
+                    if(retired)return;
+                    if(r.connection===connection&&a[0]===0&&a[1]!==null)
+                        versionEvent(db,'versionchange',r.version,a[1]===0?null:a[1]);
+                }
+            }catch(_){/* Broker failure is also delivered to its pending requests. */}
+            finally{watching=false;if(active&&!retired)watch();}
+        },100);
+    }
+    function discard(nativeToken){
+        if(nativeToken)try{Promise.resolve(native('abort',nativeToken)).catch(()=>{});}catch(_){}
+    }
+    function abort(tx,error){
+        const r=get(tx,'IDBTransaction');
         if(r.finished)return;
-        const q=r.queue.shift();if(!q){complete(tx);return;}
-        r.active=true;
-        try{const result=q.operation(r);const e=finish(q.request,result);if(eventState(e).listenerException){abort(tx,new DOMException('Request listener threw','AbortError'));return;}}
-        catch(error){const e=finish(q.request,undefined,error);if(!e.defaultPrevented){abort(tx,error);return;}}
-        later(()=>{r.active=false;step(tx);},0);
+        r.finished=true;r.active=false;r.error=error||new DOMException('Transaction aborted','AbortError');
+        r.valueCache?.clear();
+        discard(r.nativeToken);r.nativeToken=0;
+        r.dbRecord.transactions.delete(tx);
+        if(r.openRequest){r.dbRecord.upgrade=null;r.dbRecord.closed=true;}
+        closing(r.db);
+        const queue=r.executing?[r.executing,...r.queue]:r.queue;
+        r.executing=null;r.queue=[];
+        later(()=>{
+            for(const q of queue)if(q.request)finish(q.request,undefined,new DOMException('Transaction aborted','AbortError'));
+            fire(tx,'abort');if(r.openRequest)finish(r.openRequest,undefined,r.error);
+        },0);
+    }
+    async function complete(tx){
+        const r=get(tx,'IDBTransaction');if(r.finished)return;
+        r.committing=true;r.active=false;
+        try{
+            if(r.openRequest&&!r.dbRecord.connection){
+                const a=await native('connect',r.nativeToken,r.data.version);
+                if(a[0]===1){later(()=>complete(tx),5);return;}
+                status(a[0]);r.dbRecord.connection=a[1];watch();
+            }
+            if(r.finished)return;
+            if(r.mode==='readonly')status(await native('abort',r.nativeToken));
+            else status(await native('commit',r.nativeToken,pack(r.data),r.data.stores.flatMap(s=>s.records.map(v=>v[1])),r.data.version));
+            if(r.finished)return;
+            r.nativeToken=0;r.finished=true;r.dbRecord.version=r.data.version;r.dbRecord.schema=r.data;
+            r.valueCache?.clear();
+            r.dbRecord.stores=r.data.stores.map(v=>v.name);r.dbRecord.transactions.delete(tx);r.dbRecord.upgrade=null;
+            closing(r.db);
+            later(()=>{fire(tx,'complete');if(r.openRequest){get(r.openRequest,'IDBRequest').transaction=null;finish(r.openRequest,r.db);}},0);
+        }catch(e){abort(tx,e);}
+    }
+    async function step(tx){
+        const r=get(tx,'IDBTransaction');if(r.finished||r.stepping)return;
+        r.stepping=true;r.active=false;
+        try{
+            if(!r.nativeToken){
+                const a=await native('begin',r.dbRecord.name);
+                if(r.finished){if(a[0]===0)discard(a[1]);return;}
+                if(a[0]===1){later(()=>step(tx),5);return;}
+                status(a[0]);r.nativeToken=a[1];r.data=a[2]===null?{version:0,stores:[]}:unpack(a[2]);
+                if(!r.data||!Array.isArray(r.data.stores)||!Number.isSafeInteger(r.data.version))fail('UnknownError','Invalid IndexedDB snapshot');
+                if(r.mode==='versionchange'){
+                    r.data.version=r.upgradeVersion;activate(tx);
+                    const request=get(r.openRequest,'IDBRequest');request.done=true;request.result=r.db;request.transaction=tx;
+                    versionEvent(r.openRequest,'upgradeneeded',r.oldVersion,r.upgradeVersion);
+                }else{
+                    if(r.data.version!==r.dbRecord.version)fail('VersionError','Database schema changed');
+                    for(const n of r.scope)if(!r.data.stores.some(s=>s.name===n))fail('NotFoundError');
+                }
+            }
+            if(r.finished)return;
+            const q=r.queue.shift();
+            if(!q){complete(tx);return;}
+            r.executing=q;
+            let result,error;
+            try{result=await q.operation(r);}catch(e){error=e;}
+            if(r.finished)return;
+            later(()=>{
+                if(r.finished)return;
+                r.executing=null;
+                if(q.request){
+                    activate(tx);
+                    const event=finish(q.request,result,error);
+                    if(eventState(event).listenerException){abort(tx,new DOMException('Request listener threw','AbortError'));return;}
+                    if(error&&!event.defaultPrevented){abort(tx,error);return;}
+                }else if(error){abort(tx,error);return;}
+                later(()=>{r.active=false;step(tx);},0);
+            },0);
+        }catch(e){abort(tx,e);}
+        finally{r.stepping=false;}
     }
     class IDBTransaction extends EventTarget {
-        constructor(t,db,scope,mode,options={}){if(t!==token)throw new TypeError('Illegal IDBTransaction constructor');super();const dbRecord=get(db,'IDBDatabase');records.set(this,{kind:'IDBTransaction',db,dbRecord,scope:scope.slice(),mode,durability:options.durability||'default',active:true,finished:false,committing:false,error:null,queue:[],data:null,nativeToken:0,stores:new Map()});dbRecord.transactions.add(this);later(()=>{const r=get(this,'IDBTransaction');r.active=false;step(this);},0);}
+        constructor(t,db,scope,mode,options={}){
+            if(t!==token)throw new TypeError('Illegal IDBTransaction constructor');
+            super();const dbRecord=get(db,'IDBDatabase');
+            records.set(this,{
+                kind:'IDBTransaction',db,dbRecord,scope:scope.slice(),mode,
+                durability:options.durability||'default',active:true,finished:false,
+                committing:false,error:null,queue:[],data:null,nativeToken:0,stores:new Map()
+            });
+            activate(this);dbRecord.transactions.add(this);
+            later(()=>{const r=get(this,'IDBTransaction');r.active=false;step(this);},0);
+        }
         get db(){return get(this,'IDBTransaction').db;}
         get mode(){return get(this,'IDBTransaction').mode;}
         get durability(){return get(this,'IDBTransaction').durability;}
@@ -108,12 +234,26 @@ const indexedDBBridge=(()=>{
     function write(source,v,provided,hasKey,addOnly){const s=get(source,'IDBObjectStore');live(s.tx,true);const detached=clone(v),store=schema(s);let candidate=provided;
         if(store.keyPath!==null){if(hasKey)fail('DataError');candidate=path(detached,store.keyPath);}
         let initial;if(candidate===undefined){if(!store.autoIncrement)fail('DataError');}else initial=key(candidate);
-        return enqueue(s.tx,source,r=>{const st=schema(s);let k=initial;if(k===undefined){if(st.generator>9007199254740992)fail('ConstraintError');k=st.generator;if(st.keyPath!==null)inject(detached,st.keyPath,k);}const at=insertion(st.records,k),exists=at<st.records.length&&!compare(st.records[at][0],k);if(addOnly&&exists)fail('ConstraintError');
+        return enqueue(s.tx,source,async r=>{const st=schema(s);let k=initial;if(k===undefined){if(st.generator>9007199254740992)fail('ConstraintError');k=st.generator;if(st.keyPath!==null)inject(detached,st.keyPath,k);}const at=insertion(st.records,k),exists=at<st.records.length&&!compare(st.records[at][0],k);if(addOnly&&exists)fail('ConstraintError');
             const indexes=[];for(const index of st.indexes){const keys=indexKeys(index,detached);indexes.push([index.name,keys]);if(index.unique)for(const old of st.records){if(!compare(old[0],k))continue;for(const oldKey of old[2]?.find(v=>v[0]===index.name)?.[1]||[])if(keys.some(ik=>!compare(ik,oldKey)))fail('ConstraintError');}}
-            const staged=native('stage',r.nativeToken,pack(cloneData.serialize(detached)));status(staged[0]);const record=[k,staged[1],indexes];if(exists)st.records[at]=record;else st.records.splice(at,0,record);if(st.autoIncrement&&typeof k==='number'&&k>=st.generator)st.generator=Math.floor(k)+1;return clone(k);});
+            const staged=await native('stage',r.nativeToken,pack(cloneData.serialize(detached)));status(staged[0]);if(r.finished)return;const record=[k,staged[1],indexes];if(exists)st.records[at]=record;else st.records.splice(at,0,record);if(st.autoIncrement&&typeof k==='number'&&k>=st.generator)st.generator=Math.floor(k)+1;return clone(k);});
     }
     function query(source,kind,q,count){const s=records.get(source);live(s.tx);const r=range(q,kind!=='get'&&kind!=='getKey');if(count!==undefined){count=Number(count);if(!Number.isInteger(count)||count<0||count>4294967295)throw new TypeError('Invalid count');}
-        return enqueue(s.tx,source,()=>{const list=rows(source,r),n=count===undefined?list.length:Math.min(count,list.length);if(kind==='count')return list.length;if(kind==='get')return list.length?value(list[0].record,s.tx):undefined;if(kind==='getKey')return list.length?clone(list[0].primaryKey):undefined;return list.slice(0,n).map(row=>kind==='getAllKeys'?clone(row.primaryKey):value(row.record,s.tx));});}
+        return enqueue(s.tx,source,async()=>{
+            const list=rows(source,r),n=count===undefined?list.length:Math.min(count,list.length);
+            if(kind==='count')return list.length;
+            if(kind==='get')return list.length?value(list[0].record,s.tx):undefined;
+            if(kind==='getKey')return list.length?clone(list[0].primaryKey):undefined;
+            const result=[];
+            for(let i=0;i<n;i++){
+                if(kind!=='getAllKeys'&&i%32===0)
+                    await prefetch(list.slice(i,Math.min(i+32,n)).map(row=>row.record),s.tx);
+                if(get(s.tx,'IDBTransaction').finished)return;
+                result.push(kind==='getAllKeys'?clone(list[i].primaryKey):await value(list[i].record,s.tx));
+            }
+            return result;
+        });
+    }
     class IDBObjectStore {
         constructor(t,tx,name){if(t!==token)throw new TypeError('Illegal IDBObjectStore constructor');records.set(this,{kind:'IDBObjectStore',tx,name});}
         get name(){return get(this,'IDBObjectStore').name;}
@@ -133,8 +273,22 @@ const indexedDBBridge=(()=>{
         clear(){const s=get(this,'IDBObjectStore');live(s.tx,true);return enqueue(s.tx,this,()=>{schema(s).records=[];});}
         index(name){const s=get(this,'IDBObjectStore');name=strings(name);if(!schema(s).indexes.some(i=>i.name===name))fail('NotFoundError');return new IDBIndex(token,s.tx,s.name,name);}
         createIndex(name,p,options={}){const s=get(this,'IDBObjectStore'),r=live(s.tx,true);if(r.mode!=='versionchange')fail('InvalidStateError');const st=schema(s);name=strings(name);if(st.indexes.some(i=>i.name===name))fail('ConstraintError');p=keyPath(p);if(p===null)throw new TypeError('Key path required');if(Array.isArray(p)&&options.multiEntry)fail('InvalidAccessError');const index={name,keyPath:p,unique:!!options.unique,multiEntry:!!options.multiEntry};
-            const seen=[];for(const record of st.records){const keys=indexKeys(index,value(record,s.tx));if(index.unique)for(const k of keys){if(seen.some(x=>!compare(x,k)))fail('ConstraintError');seen.push(k);}if(!record[2])record[2]=[];record[2].push([name,keys]);}
-            st.indexes.push(index);return new IDBIndex(token,s.tx,s.name,name);}
+            st.indexes.push(index);
+            r.queue.push({request:null,operation:async()=>{
+                if(!st.indexes.includes(index))return;
+                const seen=[];
+                for(let i=0;i<st.records.length;i++){
+                    if(i%32===0)await prefetch(st.records.slice(i,i+32),s.tx);
+                    const record=st.records[i];
+                    const keys=indexKeys(index,await value(record,s.tx));
+                    if(r.finished)return;
+                    if(index.unique)for(const k of keys){if(seen.some(x=>!compare(x,k)))fail('ConstraintError');seen.push(k);}
+                    if(!record[2])record[2]=[];
+                    record[2]=record[2].filter(entry=>entry[0]!==index.name);
+                    record[2].push([index.name,keys]);
+                }
+            }});
+            return new IDBIndex(token,s.tx,s.name,name);}
         deleteIndex(name){const s=get(this,'IDBObjectStore'),r=live(s.tx,true);if(r.mode!=='versionchange')fail('InvalidStateError');const st=schema(s);name=strings(name);const i=st.indexes.findIndex(x=>x.name===name);if(i<0)fail('NotFoundError');st.indexes.splice(i,1);for(const record of st.records)record[2]=record[2].filter(v=>v[0]!==name);}
         openCursor(q,d='next'){return cursor(this,q,d,true);}
         openKeyCursor(q,d='next'){return cursor(this,q,d,false);}
@@ -156,7 +310,30 @@ const indexedDBBridge=(()=>{
         openKeyCursor(q,d='next'){return cursor(this,q,d,false);}
     }
     function cursor(source,q,d,withValue){const s=records.get(source);live(s.tx);d=strings(d);if(!['next','nextunique','prev','prevunique'].includes(d))throw new TypeError('Invalid cursor direction');const query=range(q,true),request=new IDBRequest(token,source,s.tx),object=new(withValue?IDBCursorWithValue:IDBCursor)(token,source,request,d,query);const r=get(object,'IDBCursor');get(s.tx,'IDBTransaction').queue.push({request,operation:()=>move(object,undefined,undefined,1)});return request;}
-    function move(object,to,primary,amount){const r=get(object,'IDBCursor');let list=rows(r.source,r.query);const unique=r.direction.endsWith('unique');if(unique)list=list.filter((v,i)=>!i||compare(v.key,list[i-1].key));if(r.direction.startsWith('prev'))list.reverse();const forward=r.direction.startsWith('next');if(r.position)list=list.filter(v=>{const c=compare(v.key,r.position.key)||(unique?0:compare(v.primaryKey,r.position.primaryKey));return forward?c>0:c<0;});if(to!==undefined)list=list.filter(v=>{const c=compare(v.key,to)||(primary===undefined?0:compare(v.primaryKey,primary));return forward?c>=0:c<=0;});r.position=list[amount-1]||null;r.pending=false;r.value=r.position&&object instanceof IDBCursorWithValue?value(r.position.record,records.get(r.source).tx):undefined;return r.position?object:null;}
+    async function move(object,to,primary,amount){
+        const r=get(object,'IDBCursor');let list=rows(r.source,r.query);
+        const unique=r.direction.endsWith('unique');
+        if(unique)list=list.filter((v,i)=>!i||compare(v.key,list[i-1].key));
+        if(r.direction.startsWith('prev'))list.reverse();
+        const forward=r.direction.startsWith('next');
+        if(r.position)list=list.filter(v=>{
+            const c=compare(v.key,r.position.key)||(unique?0:compare(v.primaryKey,r.position.primaryKey));
+            return forward?c>0:c<0;
+        });
+        if(to!==undefined)list=list.filter(v=>{
+            const c=compare(v.key,to)||(primary===undefined?0:compare(v.primaryKey,primary));
+            return forward?c>=0:c<=0;
+        });
+        r.position=list[amount-1]||null;
+        if(r.position&&object instanceof IDBCursorWithValue){
+            const tx=records.get(r.source).tx;
+            if(!get(tx,'IDBTransaction').valueCache?.has(r.position.record[1]))
+                await prefetch(list.slice(amount-1,amount+31).map(row=>row.record),tx);
+            if(get(tx,'IDBTransaction').finished)return null;
+            r.value=await value(r.position.record,tx);
+        }else r.value=undefined;
+        r.pending=false;return r.position?object:null;
+    }
     class IDBCursor {
         constructor(t,source,request,direction,query){if(t!==token)throw new TypeError('Illegal IDBCursor constructor');records.set(this,{kind:'IDBCursor',source,request,direction,query,position:null,pending:true});}
         get source(){return get(this,'IDBCursor').source;}
@@ -183,22 +360,22 @@ const indexedDBBridge=(()=>{
         deleteObjectStore(name){const r=get(this,'IDBDatabase');if(!r.upgrade)fail('InvalidStateError');const tx=live(r.upgrade,true);name=strings(name);const i=tx.data.stores.findIndex(s=>s.name===name);if(i<0)fail('NotFoundError');tx.data.stores.splice(i,1);tx.scope.splice(tx.scope.indexOf(name),1);}
     }
     function open(name,version,deleting=false){name=strings(name);if(version!==undefined){version=Number(version);if(!Number.isSafeInteger(version)||version<=0)throw new TypeError('Invalid database version');}const request=new IDBOpenDBRequest(token);let blocked=false;
-        function attempt(){let a;try{a=native('begin',name);if(a[0]===1){later(attempt,5);return;}status(a[0]);const data=a[2]===null?{version:0,stores:[]}:unpack(a[2]),wanted=deleting?0:version===undefined?data.version||1:version;
-                if(!deleting&&wanted<data.version){native('abort',a[1]);finish(request,undefined,new DOMException('Requested version is older','VersionError'));return;}
+        async function attempt(){let a;try{a=await native('begin',name);if(retired){if(a[0]===0)discard(a[1]);return;}if(a[0]===1){later(attempt,5);return;}status(a[0]);const data=a[2]===null?{version:0,stores:[]}:unpack(a[2]),wanted=deleting?0:version===undefined?data.version||1:version;
+                if(!deleting&&wanted<data.version){await native('abort',a[1]);finish(request,undefined,new DOMException('Requested version is older','VersionError'));return;}
                 const list=connections.get(name)||[];
-                if(deleting||wanted>data.version){const active=native('connections',a[1],deleting?0:wanted);if(active[0]===1){native('abort',a[1]);later(attempt,5);return;}status(active[0]);if(active[1]){native('abort',a[1]);if(!blocked){blocked=true;versionEvent(request,'blocked',data.version,deleting?null:wanted);}later(attempt,50);return;}}
-                if(deleting){status(native('commit',a[1],pack({version:0,stores:[]}),[],0));finish(request,undefined);return;}
-                let connection=0;if(wanted===data.version){const c=native('connect',a[1],wanted);if(c[0]===1){native('abort',a[1]);later(attempt,5);return;}status(c[0]);connection=c[1];}const db=new IDBDatabase(token,name,data);get(db,'IDBDatabase').connection=connection;list.push(db);connections.set(name,list);watch();
-                if(wanted>data.version){const tx=new IDBTransaction(token,db,data.stores.map(s=>s.name),'versionchange'),r=get(tx,'IDBTransaction');r.nativeToken=a[1];r.data=data;r.oldVersion=data.version;r.upgradeVersion=wanted;r.openRequest=request;get(db,'IDBDatabase').upgrade=tx;r.data.version=wanted;r.active=true;const rr=get(request,'IDBRequest');rr.result=db;rr.done=true;rr.transaction=tx;const e=versionEvent(request,'upgradeneeded',r.oldVersion,wanted);if(eventState(e).listenerException)abort(tx,new DOMException('Upgrade listener threw','AbortError'));}
-                else {status(native('abort',a[1]));finish(request,db);}
-            }catch(e){if(a?.[1])native('abort',a[1]);finish(request,undefined,e);}}
+                if(deleting||wanted>data.version){const active=await native('connections',a[1],deleting?0:wanted);if(active[0]===1){await native('abort',a[1]);later(attempt,5);return;}status(active[0]);if(active[1]){await native('abort',a[1]);if(!blocked){blocked=true;versionEvent(request,'blocked',data.version,deleting?null:wanted);}later(attempt,50);return;}}
+                if(deleting){status(await native('commit',a[1],pack({version:0,stores:[]}),[],0));finish(request,undefined);return;}
+                let connection=0;if(wanted===data.version){const c=await native('connect',a[1],wanted);if(c[0]===1){await native('abort',a[1]);later(attempt,5);return;}status(c[0]);connection=c[1];}const db=new IDBDatabase(token,name,data);get(db,'IDBDatabase').connection=connection;list.push(db);connections.set(name,list);watch();
+                if(wanted>data.version){const tx=new IDBTransaction(token,db,data.stores.map(s=>s.name),'versionchange'),r=get(tx,'IDBTransaction');r.nativeToken=a[1];r.data=data;r.oldVersion=data.version;r.upgradeVersion=wanted;r.openRequest=request;get(db,'IDBDatabase').upgrade=tx;r.data.version=wanted;activate(tx);const rr=get(request,'IDBRequest');rr.result=db;rr.done=true;rr.transaction=tx;const e=versionEvent(request,'upgradeneeded',r.oldVersion,wanted);if(eventState(e).listenerException)abort(tx,new DOMException('Upgrade listener threw','AbortError'));}
+                else {status(await native('abort',a[1]));finish(request,db);}
+            }catch(e){if(a?.[1])discard(a[1]);finish(request,undefined,e);}}
         later(attempt,0);return request;
     }
-    class IDBFactory {constructor(t){if(t!==token)throw new TypeError('Illegal IDBFactory constructor');}open(name,version){if(!arguments.length)throw new TypeError('Database name required');return open(name,version);}deleteDatabase(name){if(!arguments.length)throw new TypeError('Database name required');return open(name,undefined,true);}cmp(a,b){if(arguments.length<2)throw new TypeError('Two keys required');return compare(key(a),key(b));}databases(){return new Promise((resolve,reject)=>{function attempt(){try{const a=native('databases');if(a[0]===1){later(attempt,5);return;}status(a[0]);resolve(a[1]);}catch(e){reject(e);}}later(attempt,0);});}}
+    class IDBFactory {constructor(t){if(t!==token)throw new TypeError('Illegal IDBFactory constructor');}open(name,version){if(!arguments.length)throw new TypeError('Database name required');return open(name,version);}deleteDatabase(name){if(!arguments.length)throw new TypeError('Database name required');return open(name,undefined,true);}cmp(a,b){if(arguments.length<2)throw new TypeError('Two keys required');return compare(key(a),key(b));}databases(){return new Promise((resolve,reject)=>{async function attempt(){try{const a=await native('databases');if(a[0]===1){later(attempt,5);return;}status(a[0]);resolve(a[1]);}catch(e){reject(e);}}later(attempt,0);});}}
     indexedDBHandlerTarget=(v,type)=>{const r=records.get(v);return !!r&&(r.kind==='IDBRequest'&&(['success','error'].includes(type)||v instanceof IDBOpenDBRequest&&['blocked','upgradeneeded'].includes(type))||r.kind==='IDBDatabase'&&['abort','error','versionchange','close'].includes(type)||r.kind==='IDBTransaction'&&['abort','complete','error'].includes(type));};
     for(const [ctor,events]of [[IDBRequest,['success','error']],[IDBOpenDBRequest,['blocked','upgradeneeded']],[IDBDatabase,['abort','error','versionchange','close']],[IDBTransaction,['abort','complete','error']]])installHandlers(ctor.prototype,events);
     for(const ctor of [IDBFactory,IDBRequest,IDBOpenDBRequest,IDBDatabase,IDBTransaction,IDBObjectStore,IDBIndex,IDBCursor,IDBCursorWithValue,IDBKeyRange,IDBVersionChangeEvent]){Object.defineProperty(ctor.prototype,Symbol.toStringTag,{value:ctor.name,configurable:true});Object.defineProperty(globalThis,ctor.name,{value:ctor,writable:true,configurable:true});}
     Object.defineProperty(globalThis,'indexedDB',{value:new IDBFactory(token),configurable:true,enumerable:true});
     cloneData.registerUncloneable(v=>records.has(v),'IndexedDB object');
-    return {retire(){retired=true;for(const list of connections.values())for(const db of list){const r=get(db,'IDBDatabase');r.closed=true;for(const tx of r.transactions)abort(tx);closing(db);}connections.clear();}};
+    return {taskEnd,retire(){retired=true;for(const list of connections.values())for(const db of list){const r=get(db,'IDBDatabase');r.closed=true;for(const tx of r.transactions)abort(tx);closing(db);}connections.clear();invoke(setClear,activeTasks,[]);}};
 })();

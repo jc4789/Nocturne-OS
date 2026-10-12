@@ -324,3 +324,44 @@ function runFormControlCases() {
     upload.type = 'text'; equal(upload.files, null);
     return count;
 }
+
+/* Additional entry-list cases run against the actual native DOM/bootstrap. */
+async function runFormDataEntryCases() {
+    let count=0;
+    const equal=(a,b,label)=>{count++;if(!Object.is(a,b))throw new Error(label+': '+String(a)+' != '+String(b));};
+    const throws=(name,fn)=>{count++;try{fn();}catch(e){if(e.name===name)return;throw e;}throw new Error('Expected '+name);};
+    const form=document.createElement('form');form.id='fd-entry-native';
+    form.innerHTML='<input name="repeat" value="first"><fieldset disabled><legend><input name="legend" value="allowed"></legend><input name="blocked" value="no"><legend><input name="second-legend" value="no"></legend></fieldset>'+
+        '<input name="off" type="checkbox"><input name="on" type="checkbox" checked><input name="radio" type="radio" value="off"><input name="radio" type="radio" value="chosen" checked>'+
+        '<select name="pick" multiple><option value="a" selected>A</option><option value="bad" disabled selected>B</option><optgroup disabled><option value="bad-group" selected>C</option></optgroup><option value="d" selected>D</option></select>'+
+        '<textarea name="text" dirname="direction" dir="rtl">a\nb</textarea><input type="hidden" name="_charset_" value="not-utf8"><input name="repeat" value="last"><input type="file" name="empty"><button name="send" value="yes">go</button><input type="submit" name="default-submit"><input type="image" name="image">';
+    document.body.append(form);
+    try {
+        const data=new FormData(form), rows=[...data], keys=rows.map(row=>row[0]);
+        equal(keys.join(','),'repeat,legend,on,radio,pick,pick,text,direction,_charset_,repeat,empty','successful-control order');
+        equal(data.getAll('repeat').join(','),'first,last','duplicate values');
+        equal(data.get('on'),'on','checkbox default');equal(data.get('radio'),'chosen','radio');
+        equal(data.getAll('pick').join(','),'a,d','disabled selected options');
+        equal(data.get('text'),'a\nb','entry-list raw textarea newline');equal(data.get('direction'),'rtl','dirname');equal(data.get('_charset_'),'UTF-8','charset');
+        const empty=data.get('empty');equal(empty instanceof File,true,'empty File');equal(empty.name,'','empty name');equal(empty.type,'application/octet-stream','empty MIME');equal(empty.size,0,'empty size');equal(await empty.text(),'','empty bytes');
+        const button=form.querySelector('button');equal(new FormData(form,button).get('send'),'yes','submitter inclusion');
+        equal(new FormData(form,form.querySelector('input[type=submit]')).get('default-submit'),'','missing submit value');
+        const image=form.querySelector('input[type=image]');let imageData=new FormData(form,image);
+        equal(imageData.get('image.x'),'0','initial image x');equal(imageData.get('image.y'),'0','initial image y');
+        throws('TypeError',()=>new FormData(form,form.querySelector('textarea')));
+        throws('TypeError',()=>new FormData(document.createElement('div')));
+        const foreign=document.createElement('button');throws('NotFoundError',()=>new FormData(form,foreign));
+        let held=null, events=0;
+        const listener=event=>{events++;equal(event instanceof FormDataEvent,true,'event interface');equal(event.bubbles,true,'event bubbles');equal(event.isTrusted,true,'event trusted');equal(event.target,form,'event target');throws('InvalidStateError',()=>new FormData(form));event.formData.append('event-added','value');held=event.formData;};
+        form.addEventListener('formdata',listener);const changed=new FormData(form);form.removeEventListener('formdata',listener);
+        equal(events,1,'one event');equal(changed.get('event-added'),'value','event mutation copied');held.set('event-added','later');equal(changed.get('event-added'),'value','event list does not alias return');equal(new FormData(form).has('event-added'),false,'guard released');
+        const synthetic=new FormDataEvent('test',{formData:data});equal(synthetic.formData,data,'event value identity');equal(synthetic.isTrusted,false,'constructed event untrusted');throws('TypeError',()=>new FormDataEvent('test',{formData:{}}));throws('TypeError',()=>Object.getOwnPropertyDescriptor(FormDataEvent.prototype,'formData').get.call({}));
+        const order=[];new FormDataEvent({toString(){order.push('type');return 'test';}},{get bubbles(){order.push('bubbles');return false;},get cancelable(){order.push('cancelable');return false;},get composed(){order.push('composed');return false;},get formData(){order.push('formData');return data;}});equal(order.join(','),'type,bubbles,cancelable,composed,formData','WebIDL conversion order');
+        class EntryControl extends HTMLElement {static formAssociated=true;constructor(){super();this.internals=this.attachInternals();}}
+        customElements.define('fd-entry-control',EntryControl);const face=document.createElement('fd-entry-control');face.setAttribute('name','custom');form.append(face);
+        face.internals.setFormValue('native-face');equal(new FormData(form).get('custom'),'native-face','FACE single');
+        const entries=new FormData();entries.append('face-repeat','one');entries.append('face-repeat','two');const faceFile=new File(['actual-face-bytes'],'face.txt',{type:'text/plain',lastModified:1234});entries.append('face-file',faceFile);face.internals.setFormValue(entries);
+        const collected=new FormData(form);equal(collected.getAll('face-repeat').join(','),'one,two','FACE multiple');equal(await collected.get('face-file').text(),'actual-face-bytes','FACE File bytes');equal(collected.get('face-file').lastModified,1234,'FACE File modified');
+    } finally {form.remove();}
+    console.log('FormData native entry checks '+count);return count;
+}

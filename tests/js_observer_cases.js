@@ -39,5 +39,27 @@ globalThis.runObserverCases=async function(){
     thrown=false;try{new IntersectionObserver(()=>{},{rootMargin:'1em'});}catch(e){thrown=e.name==='SyntaxError';}ok(thrown,'margin-syntax');
     thrown=false;try{ro.observe(document);}catch(e){thrown=e instanceof TypeError;}ok(thrown,'target-brand');
     thrown=false;try{ro.observe(box,{box:'wrong'});}catch(e){thrown=e instanceof TypeError;}ok(thrown,'box-enum');
-    root.remove();return count;
+    root.appendChild(box);box.style.cssText='width:20px;height:30px';
+    const frameOrder=[],frameTimes=[];let nestedFrame=false,frameResize=false,cancelFrame;
+    const frameRO=new ResizeObserver(entries=>{
+        frameOrder.push('resize');frameResize=true;
+        ok(entries[0].contentRect.width===77,'render-layout-after-animation');
+    });
+    frameRO.observe(box);
+    requestAnimationFrame(t=>{
+        frameOrder.push('first');frameTimes.push(t);box.style.width='77px';
+        Promise.resolve().then(()=>frameOrder.push('microtask'));
+        cancelAnimationFrame(cancelFrame);
+        requestAnimationFrame(next=>{nestedFrame=true;frameTimes.push(next);});
+    });
+    requestAnimationFrame(t=>{
+        frameOrder.push('second');frameTimes.push(t);
+        ok(!nestedFrame,'new-animation-deferred');
+    });
+    cancelFrame=requestAnimationFrame(()=>frameOrder.push('cancelled'));
+    await until(()=>nestedFrame&&frameResize);
+    ok(frameOrder.slice(0,4).join(',')==='first,microtask,second,resize','animation-microtask-resize-order');
+    ok(frameTimes[0]===frameTimes[1]&&frameTimes[2]>frameTimes[1],'one-timestamp-per-rendering-opportunity');
+    ok(!frameOrder.includes('cancelled'),'animation-cancellation-before-dispatch');
+    frameRO.disconnect();root.remove();return count;
 };

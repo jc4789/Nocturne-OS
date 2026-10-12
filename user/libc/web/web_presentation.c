@@ -1,37 +1,225 @@
 #include "web_presentation.h"
 #include "avmedia.h"
+#include "frame.h"
 #include "nocturne.h"
+#include <stdlib.h>
+#include <ctype.h>
 #include <string.h>
-static bool valid(web_doc *d,node_t *n){return d&&d->live&&!d->inert&&n&&n->owner==d&&n->type==N_ELEM&&doc_node_connected(n);}
+static unsigned feature_bit(int kind){return kind==1?1u:kind==2?2u:0;}
+static const char *feature_name(int kind){return kind==1?"fullscreen":"picture-in-picture";}
+static web_doc *top_document(web_doc *d){while(d&&d->frame_parent)d=d->frame_parent;return d;}
+static bool active(web_doc *d){
+    for(web_doc *at=d;at;at=at->frame_parent){
+        if(!at->live||at->inert||(at->sandbox_flags&SB_SCRIPTS))return false;
+        if(at->frame_parent){struct web_frame *f=web_frame_find(at->frame_parent,at->frame_element);
+            if(!f||f->detached||f->document!=at||!doc_node_connected(f->element))return false;}
+    }return d!=NULL;
+}
+web_doc *web_presentation_root(web_doc *d){return active(d)?top_document(d):NULL;}
+static bool valid(web_doc *d,node_t *n){return active(d)&&n&&n->owner==d&&n->type==N_ELEM&&doc_node_connected(n);}
+static bool origin_is(const char *a,const char *b){return a&&b&&!strcmp(a,b);}
+static char *document_origin(const web_doc *d){char *out=NULL;if(d&&(d->sandbox_flags&SB_ORIGIN)==0&&http_origin_owned(web_effective_url((web_doc *)d),&out)==HTTP_URL_TUPLE)return out;free(out);return NULL;}
+static bool origin_match(const char *text,size_t size,const char *origin,bool pattern){
+    if(!origin)return false;
+    if(pattern&&size==6&&!memcmp(text,"https:",6))return !strncmp(origin,"https:",6);
+    if(pattern&&size==5&&!memcmp(text,"http:",5))return !strncmp(origin,"http:",5)||!strncmp(origin,"https:",6);
+    char *value=malloc(size+1);if(!value)return false;memcpy(value,text,size);value[size]=0;
+    if(!pattern){char *parsed=NULL;bool matched=http_origin_owned(value,&parsed)==HTTP_URL_TUPLE&&origin_is(parsed,origin);free(parsed);free(value);return matched;}
+    char *wild=strstr(value,"://*.");bool domain_wild=wild!=NULL,port_wild=false,matched=false;
+    if(wild){size_t prefix=(size_t)(wild-value)+3;memmove(value+prefix,value+prefix+2,strlen(value+prefix+2)+1);}
+    char *scheme=strstr(value,"://");if(scheme){char *authority=scheme+3,*end=authority;while(*end&&*end!='/'&&*end!='?'&&*end!='#')end++;
+        if(end-authority>=2&&end[-2]==':'&&end[-1]=='*'){port_wild=true;memmove(end-2,end,strlen(end)+1);}}
+    struct url_owned source={0},target={0};
+    if(url_parse_owned_result_n(value,strlen(value),&source)==HTTP_URL_TUPLE&&url_parse_owned_result_n(origin,strlen(origin),&target)==HTTP_URL_TUPLE&&source.path&&!strcmp(source.path,"/")){
+        bool host=!strcmp(source.host,target.host);
+        if(domain_wild){size_t a=strlen(source.host),b=strlen(target.host);host=b>a+1&&target.host[b-a-1]=='.'&&!strcmp(target.host+b-a,source.host);}
+        matched=host&&(!source.tls||target.tls)&&(port_wild||source.port==target.port||(!source.tls&&source.port==80&&target.tls&&target.port==443));
+    }
+    url_owned_free(&source);url_owned_free(&target);
+    free(value);return matched;
+}
+static bool policy_token(const char *text,size_t size,const char *origin,const char *self,const char *src,bool header){
+    if(size==1&&text[0]=='*')return true;
+    if((header&&size==4&&!memcmp(text,"self",4))||(!header&&size==6&&!strncasecmp(text,"'self'",6)))return origin_is(origin,self);
+    if(!header&&size==5&&!strncasecmp(text,"'src'",5))return origin_is(origin,src);
+    if(!header&&size==6&&!strncasecmp(text,"'none'",6))return false;
+    return origin_match(text,size,origin,header);
+}
+/* Parameters do not contribute origins. Consume them without mistaking a
+   parameter's string/token for a second allowlist entry. */
+static bool skip_parameters(const char **cursor,const char *end){
+    const char *p=*cursor;
+    while(p<end&&*p==';'){
+        p++;while(p<end&&*p==' ')p++;
+        if(p==end||!((*p>='a'&&*p<='z')||*p=='*'))return false;
+        do{p++;}while(p<end&&((*p>='a'&&*p<='z')||isdigit((unsigned char)*p)||*p=='_'||*p=='-'||*p=='.'||*p=='*'));
+        if(p<end&&*p=='='){
+            p++;if(p==end)return false;
+            if(*p=='"'){p++;bool closed=false;while(p<end){char c=*p++;if(c=='"'){closed=true;break;}
+                    if(c=='\\'){if(p==end||(*p!='"'&&*p!='\\'))return false;p++;}
+                    else if((unsigned char)c<0x20||(unsigned char)c>0x7e)return false;}
+                if(!closed)return false;
+            }else{const char *start=p;while(p<end&&*p!=';'&&*p!=' '&&*p!='\t'&&*p!=')')p++;
+                if(p==start)return false;}
+        }
+    }
+    *cursor=p;return true;
+}
+/* The supported features use Structured Fields strings/tokens/inner lists.
+   Skip dictionary separators only outside quoted strings and parentheses. */
+static bool header_feature(const char *policy,int kind,const char *origin,const char *self){
+    if(!policy||!*policy)return true;const char *p=policy;bool result=true;size_t feature_size=strlen(feature_name(kind));
+    while(*p){while(*p==' '||*p=='\t'||*p==',')p++;if(!*p)break;const char *start=p;
+        bool quote=false,escape=false;unsigned depth=0;
+        while(*p){char c=*p;if(quote){if(escape)escape=false;else if(c=='\\')escape=true;else if(c=='"')quote=false;}
+            else if(c=='"')quote=true;else if(c=='(')depth++;else if(c==')'){if(!depth)return false;depth--;}
+            else if(c==','&&!depth)break;p++;}
+        if(quote||depth)return false;const char *end=p,*name=start;while(name<end&&(isalnum((unsigned char)*name)||*name=='-'||*name=='_'||*name=='*'))name++;
+        if((size_t)(name-start)!=feature_size||memcmp(start,feature_name(kind),feature_size)){if(*p)p++;continue;}
+        const char *v=name;while(v<end&&(*v==' '||*v=='\t'))v++;if(v==end||*v++!='=')return false;
+        while(v<end&&(*v==' '||*v=='\t'))v++;bool list=v<end&&*v=='(';if(list)v++;
+        bool match=false,closed=!list;
+        while(v<end){while(v<end&&(*v==' '||*v=='\t'))v++;if(v==end)break;if(list&&*v==')'){closed=true;v++;break;}
+            if(!list&&*v==';')break;const char *token=v;size_t n=0;
+            if(*v=='"'){v++;token=v;while(v<end&&*v!='"'&&*v!='\\')v++;if(v==end||*v!='"')return false;n=(size_t)(v-token);v++;
+                match=origin_match(token,n,origin,true)||match;
+            }else{while(v<end&&*v!=' '&&*v!='\t'&&*v!=')'&&*v!=';')v++;n=(size_t)(v-token);if(!n)return false;match=policy_token(token,n,origin,self,NULL,true)||match;}
+            if(!skip_parameters(&v,end))return false;
+            if(!list){closed=true;break;}
+        }
+        if(!closed)return false;if(!skip_parameters(&v,end))return false;
+        while(v<end&&(*v==' '||*v=='\t'))v++;if(v!=end)return false;
+        result=match;if(*p)p++;
+    }return result;
+}
+static bool declared_feature(const web_doc *d,int kind,const char *origin){
+    if(!d||!d->presentation_policy_ready||!(d->presentation_inherited&feature_bit(kind)))return false;
+    char *self=document_origin(d);bool allowed=header_feature(d->presentation_policy,kind,origin,self);free(self);return allowed;
+}
+static bool container_feature(node_t *container,int kind,const char *origin,const char *self,const char *src){
+    if(container->foreign||container->tag!=T_iframe)return kind==2||origin_is(origin,self);
+    const char *allow=node_attr(container,"allow"),*p=allow?allow:"";size_t feature_size=strlen(feature_name(kind));
+    bool declared=false,result=false;
+    while(*p){while(*p&&(*p==';'||isspace((unsigned char)*p)))p++;const char *name=p;while(*p&&*p!=';'&&!isspace((unsigned char)*p))p++;
+        bool found=(size_t)(p-name)==feature_size&&!memcmp(name,feature_name(kind),feature_size),any=false,match=false;
+        while(*p&&*p!=';'){while(*p&&*p!=';'&&isspace((unsigned char)*p))p++;const char *token=p;while(*p&&*p!=';'&&!isspace((unsigned char)*p))p++;
+            if(p!=token){any=true;if(found)match=policy_token(token,(size_t)(p-token),origin,self,src,false)||match;}}
+        /* Each declaration updates the ordered-map entry; a later explicit
+           denial must not be hidden by an earlier permission. */
+        if(found){declared=true;result=any?match:origin_is(origin,src);}
+    }
+    if(declared)return result;
+    if(kind==1&&node_attr(container,"allowfullscreen"))return true;
+    return kind==2||origin_is(origin,self);
+}
+static char *declared_origin(web_doc *parent,node_t *container,const char *self){
+    if(node_attr(container,"srcdoc"))return self?strdup(self):NULL;
+    const char *src=node_attr(container,"src");if(!src||!*src)return self?strdup(self):NULL;
+    char *url=NULL,*origin=NULL;if(web_resolve_url_owned(parent->base,src,&url)==1){
+        if(!strcmp(url,"about:blank")||!strncmp(url,"about:blank#",12))origin=self?strdup(self):NULL;
+        else http_origin_owned(url,&origin);}
+    free(url);return origin;
+}
+bool web_presentation_policy_init(web_doc *d,const char *headers,const web_doc *inherit){
+    if(!d)return false;char *policy=NULL;size_t used=0;
+    if(inherit&&inherit->presentation_policy){policy=strdup(inherit->presentation_policy);if(!policy)return false;used=strlen(policy);}
+    if(headers){for(const char *p=headers;*p;){const char *end=strchr(p,'\n');if(!end)end=p+strlen(p);const char *stop=end;while(stop>p&&(stop[-1]=='\r'||stop[-1]==' '||stop[-1]=='\t'))stop--;
+            const char *colon=memchr(p,':',(size_t)(stop-p));if(colon&&(size_t)(colon-p)==18&&!strncasecmp(p,"Permissions-Policy",18)){
+                const char *value=colon+1;while(value<stop&&(*value==' '||*value=='\t'))value++;size_t n=(size_t)(stop-value);
+                if(n>SIZE_MAX-used-2){free(policy);return false;}char *next=realloc(policy,used+n+2);if(!next){free(policy);return false;}policy=next;if(used)policy[used++]=',';memcpy(policy+used,value,n);used+=n;policy[used]=0;}
+            p=*end?end+1:end;}}
+    unsigned inherited=3;
+    if(d->frame_parent&&d->frame_element){web_doc *parent=d->frame_parent;char *self=document_origin(parent),*origin=document_origin(d),*src=declared_origin(parent,d->frame_element,self);
+        for(int kind=1;kind<=2;kind++)if(!declared_feature(parent,kind,self)||!declared_feature(parent,kind,origin)||!container_feature(d->frame_element,kind,origin,self,src))inherited&=~feature_bit(kind);
+        free(self);free(origin);free(src);}
+    free(d->presentation_policy);d->presentation_policy=policy;d->presentation_inherited=(uint8_t)inherited;d->presentation_policy_ready=true;return true;
+}
+bool web_presentation_enabled(web_doc *d,int kind,const struct web_host *host){
+    if(!feature_bit(kind)||!host||!host->presentation||!active(d))return false;
+    char *origin=document_origin(d);bool enabled=declared_feature(d,kind,origin);free(origin);return enabled;
+}
 static bool contains(node_t *root,node_t *node){for(;node;node=doc_shadow_parent(node))if(root==node)return true;return false;}
+static bool ancestor(web_doc *owner,web_doc *document){for(;owner;owner=owner->frame_parent)if(owner==document)return true;return false;}
+static void events_free(struct web_presentation_event *events){while(events){struct web_presentation_event *event=events;events=event->next;free(event);}}
+static struct web_presentation_event *events_reserve(web_doc *d,node_t *n,int kind,bool chain){
+    struct web_presentation_event *first=NULL,**tail=&first;
+    do{struct web_presentation_event *event=calloc(1,sizeof *event);if(!event){events_free(first);return NULL;}
+        event->document=d;event->node=n;event->kind=kind;event->width=d->pip_width;event->height=d->pip_height;event->session=kind==1?0:d->pip_session;*tail=event;tail=&event->next;
+        n=d->frame_element;d=d->frame_parent;
+    }while(chain&&d);return first;
+}
+static void events_publish(struct web_presentation_event *events){
+    while(events){struct web_presentation_event *event=events;events=event->next;event->next=NULL;web_doc *d=event->document;
+        if(d->presentation_events_tail)d->presentation_events_tail->next=event;else d->presentation_events=event;
+        d->presentation_events_tail=event;}
+}
+const struct web_presentation_event *web_presentation_event_peek(web_doc *d){return d?d->presentation_events:NULL;}
+void web_presentation_event_pop(web_doc *d){if(d&&d->presentation_events){struct web_presentation_event *event=d->presentation_events;d->presentation_events=event->next;if(!d->presentation_events)d->presentation_events_tail=NULL;free(event);}}
 node_t *web_presentation_element(web_doc *d,int kind){
     if(!d)return NULL;node_t *n=kind==1?d->fullscreen_element:d->pip_element;return valid(d,n)?n:NULL;
 }
-void web_presentation_resize(web_doc *d,int w,int h){if(d&&w>0&&h>0){d->pip_width=w;d->pip_height=h;}}
+bool web_presentation_matches(node_t *n){
+    if(!n||n->type!=N_ELEM||!n->owner)return false;
+    node_t *full=n->owner->fullscreen_element;if(full==n)return true;
+    if(!full||!n->shadow_root)return false;
+    /* Retarget only across native shadow roots, not ordinary ancestors. */
+    for(node_t *at=full;at;){node_t *root=doc_node_root(at,false);
+        if(!root||!root->shadow_host)return false;at=root->shadow_host;if(at==n)return true;}
+    return false;
+}
+void web_presentation_resize(web_doc *d,int w,int h){if(d&&w>0&&h>0&&(d->pip_width!=w||d->pip_height!=h)){
+    d->pip_width=w;d->pip_height=h;d->presentation_revision++;
+    if(d->pip_element){struct web_presentation_event *event=d->presentation_events_tail;
+        if(event&&event->kind==4&&event->node==d->pip_element){event->width=w;event->height=h;}
+        else{event=events_reserve(d,d->pip_element,4,false);if(event)events_publish(event);}}
+}}
 void web_presentation_size(web_doc *d,int *w,int *h){if(w)*w=d?d->pip_width:0;if(h)*h=d?d->pip_height:0;}
-static void changed(web_doc *d,node_t *n){d->presentation_revision++;d->dirty=d->paint_dirty=true;if(n)css_mark_dirty(d,n);}
+static void changed(web_doc *d,node_t *n){
+    d->presentation_revision++;d->dirty=d->paint_dirty=true;if(!n)return;css_mark_dirty(d,n);
+    /* Entry and exit change :fullscreen on each retargeted shadow host. The
+       native root walk is proportional to embedding depth, not all nodes. */
+    for(node_t *at=n;at;){node_t *root=doc_node_root(at,false);
+        if(!root||!root->shadow_host)break;at=root->shadow_host;css_mark_dirty(d,at);}
+}
 int web_presentation_request(web_doc *d,node_t *n,int kind,const struct web_host *host){
     if(!valid(d,n))return WEB_PRESENT_INACTIVE;
     if(kind==1&&n->namespace_id!=NS_HTML&&
        !(n->namespace_id==NS_SVG&&n->name&&!strcmp(n->name,"svg"))&&
        !(n->namespace_id==NS_MATHML&&n->name&&!strcmp(n->name,"math")))return WEB_PRESENT_UNSUPPORTED;
-    if((kind!=1&&kind!=2)||d->frame_parent||n->tag==T_dialog||!host||!host->presentation)return WEB_PRESENT_UNSUPPORTED;
-    if(d->sandbox_activation_until<=uptime_ms())return WEB_PRESENT_ACTIVATION;
+    if((kind!=1&&kind!=2)||n->tag==T_dialog||!host||!host->presentation)return WEB_PRESENT_UNSUPPORTED;
+    if(!web_presentation_enabled(d,kind,host))return WEB_PRESENT_POLICY;
     if(kind==2&&(n->foreign||n->tag!=T_video||node_attr(n,"disablepictureinpicture")||!web_avmedia_pip_ready(d,n)))return WEB_PRESENT_MEDIA;
     if(kind==1&&d->fullscreen_element==n)return WEB_PRESENT_OK;
     if(kind==2&&d->pip_element==n)return WEB_PRESENT_OK;
-    if(kind==1&&d->fullscreen_element&&!web_presentation_exit(d,1))return WEB_PRESENT_BACKEND;
-    if(kind==2&&d->pip_element&&!web_presentation_exit(d,2))return WEB_PRESENT_BACKEND;
-    if(!host->presentation(host->opaque,d,n,kind))return WEB_PRESENT_BACKEND;
+    if(kind==2&&d->pip_session==UINT64_MAX)return WEB_PRESENT_BACKEND;
+    bool consume_activation=kind==1||!d->pip_element;
+    if(consume_activation&&d->sandbox_activation_until<=uptime_ms())return WEB_PRESENT_ACTIVATION;
+    web_doc *top=top_document(d),*previous=kind==1?top->fullscreen_owner:top->pip_owner;
+    struct web_presentation_event *events=events_reserve(d,n,kind==1?1:2,kind==1);if(!events)return WEB_PRESENT_BACKEND;
+    if(previous&&!web_presentation_exit(previous,kind)){events_free(events);return WEB_PRESENT_BACKEND;}
+    /* PiP and fullscreen cannot retain simultaneous native presentation of
+       this video. Release the fullscreen lease through its real owner. */
+    if(kind==2&&d->fullscreen_element==n&&!web_presentation_exit(d,1)){events_free(events);return WEB_PRESENT_BACKEND;}
+    if(!active(d)||!valid(d,n)||!web_presentation_enabled(d,kind,host)){events_free(events);return WEB_PRESENT_INACTIVE;}
+    if(!host->presentation(host->opaque,d,n,kind)){events_free(events);return WEB_PRESENT_BACKEND;}
     d->presentation_host=host->presentation;d->presentation_opaque=host->opaque;
-    if(kind==1)d->fullscreen_element=n;else d->pip_element=n;
-    d->sandbox_activation_until=0;changed(d,n);return WEB_PRESENT_OK;
+    if(kind==1){top->fullscreen_owner=d;node_t *element=n;
+        for(web_doc *at=d;at;at=at->frame_parent){at->fullscreen_element=element;changed(at,element);element=at->frame_element;}}
+    else{top->pip_owner=d;d->pip_element=n;events->session=++d->pip_session;events->width=d->pip_width;events->height=d->pip_height;changed(d,n);}
+    events_publish(events);
+    if(consume_activation){top->sandbox_activation_until=0;for(struct web_frame *f=top->frames;f;f=web_frame_walk_next(top,f,true))if(f->document)f->document->sandbox_activation_until=0;}
+    return WEB_PRESENT_OK;
 }
 bool web_presentation_exit(web_doc *d,int kind){
-    if(!d)return false;node_t *n=kind==1?d->fullscreen_element:d->pip_element;
+    if(!d||!feature_bit(kind))return false;web_doc *top=top_document(d),*owner=kind==1?top->fullscreen_owner:top->pip_owner;
+    if(owner&&ancestor(owner,d))d=owner;
+    node_t *n=kind==1?d->fullscreen_element:d->pip_element;
     if(!n)return true;
-    if(d->presentation_host&&!d->presentation_host(d->presentation_opaque,d,n,kind==1?0:3))return false;
-    if(kind==1)d->fullscreen_element=NULL;else d->pip_element=NULL;changed(d,n);return true;
+    struct web_presentation_event *events=events_reserve(d,n,kind==1?1:3,kind==1);if(!events)return false;
+    if(d->presentation_host&&!d->presentation_host(d->presentation_opaque,d,n,kind==1?0:3)){events_free(events);return false;}
+    if(kind==1){top->fullscreen_owner=NULL;for(web_doc *at=d;at;at=at->frame_parent){node_t *element=at->fullscreen_element;at->fullscreen_element=NULL;changed(at,element);}}
+    else{top->pip_owner=NULL;d->pip_element=NULL;changed(d,n);}
+    events_publish(events);return true;
 }
 void web_presentation_sync(web_doc *d){if(!d)return;if(d->fullscreen_element&&!valid(d,d->fullscreen_element))web_presentation_exit(d,1);if(d->pip_element&&!valid(d,d->pip_element))web_presentation_exit(d,2);}
 void web_presentation_removed(web_doc *d,node_t *subtree){
@@ -39,14 +227,34 @@ void web_presentation_removed(web_doc *d,node_t *subtree){
     node_t *full=d->fullscreen_element,*pip=d->pip_element;
     if(full&&contains(subtree,full))web_presentation_exit(d,1);
     if(pip&&contains(subtree,pip))web_presentation_exit(d,2);
+    web_doc *owner=top_document(d)->pip_owner;
+    for(web_doc *at=owner;at&&at->frame_parent;at=at->frame_parent)if(at->frame_parent==d&&contains(subtree,at->frame_element)){web_presentation_exit(owner,2);break;}
 }
-void web_presentation_free(web_doc *d){if(!d)return;web_presentation_exit(d,1);web_presentation_exit(d,2);d->presentation_host=NULL;d->presentation_opaque=NULL;}
+void web_presentation_free(web_doc *d){if(!d)return;
+    /* Teardown must release the native window even when reserving author event
+       records fails. Retired realms cannot receive those events in any case. */
+    web_doc *top=top_document(d);
+    for(int kind=1;kind<=2;kind++){web_doc *owner=kind==1?top->fullscreen_owner:top->pip_owner;
+        if(!web_presentation_exit(d,kind)&&owner&&ancestor(owner,d)&&owner->presentation_host){node_t *n=kind==1?owner->fullscreen_element:owner->pip_element;
+            owner->presentation_host(owner->presentation_opaque,owner,n,kind==1?4:3);}}
+    d->presentation_host=NULL;d->presentation_opaque=NULL;
+    if(top->fullscreen_owner&&ancestor(top->fullscreen_owner,d)){web_doc *owner=top->fullscreen_owner;top->fullscreen_owner=NULL;
+        for(web_doc *at=owner;at;at=at->frame_parent){node_t *element=at->fullscreen_element;at->fullscreen_element=NULL;changed(at,element);}}
+    if(top->pip_owner&&ancestor(top->pip_owner,d)){web_doc *owner=top->pip_owner;node_t *element=owner->pip_element;
+        owner->pip_element=NULL;top->pip_owner=NULL;changed(owner,element);}
+    events_free(d->presentation_events);d->presentation_events=d->presentation_events_tail=NULL;free(d->presentation_policy);d->presentation_policy=NULL;d->presentation_policy_ready=false;
+}
 void web_presentation_style(web_doc *d,node_t *n,style_t *s){
-    if(!d||n!=d->fullscreen_element)return;
+    if(!d||!n||!s||n->owner!=d||!web_presentation_matches(n))return;
+    /* Fullscreen's UA rule excludes :root; root viewport layout is already
+       provided by the host. iframe has its separate border/padding rule. */
+    if(!n->foreign&&n->tag==T_iframe)for(unsigned i=0;i<4;i++){
+        s->border_style[i]=BS_NONE;s->border_width[i]=0;s->padding[i]=(len_t){.kind=LK_LEN};}
+    if(n->parent&&n->parent->type==N_DOC)return;
     if(s->display==D_CONTENTS||s->display==D_INLINE)s->display=D_BLOCK;
     s->position=POS_FIXED;s->float_=FL_NONE;s->box_sizing=1;
     s->width=(len_t){.kind=LK_LEN,.pct=100};s->height=(len_t){.kind=LK_LEN,.pct=100};
     s->min_width=s->min_height=(len_t){.kind=LK_LEN};s->max_width=s->max_height=(len_t){.kind=LK_NONE};
-    for(unsigned i=0;i<4;i++){s->inset[i]=(len_t){.kind=LK_AUTO};s->margin[i]=(len_t){.kind=LK_LEN};}
-    s->inset[0]=s->inset[3]=(len_t){.kind=LK_LEN};
+    s->transform=NULL;
+    for(unsigned i=0;i<4;i++){s->inset[i]=(len_t){.kind=LK_LEN};s->margin[i]=(len_t){.kind=LK_LEN};}
 }

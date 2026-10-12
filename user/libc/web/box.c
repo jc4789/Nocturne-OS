@@ -643,6 +643,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
     style_t *is = ar_alloc(b->a, sizeof *is);
     *is = *st;
     is->filter = NULL; is->opacity = 1; /* the element's outer group composites once */
+    is->transform=NULL;memset(&is->translate,0,sizeof is->translate);
     is->display = inner_kind == B_TABLE ? D_TABLE : inner_kind == B_GRID ? D_GRID : D_FLEX;
     for (int i = 0; i < 4; i++) {
         is->margin[i].kind = LK_LEN;
@@ -981,6 +982,7 @@ static bool restyle_derived(box_t *b, style_t *old) {
     } else {
         next.display=b->kind == B_TABLE ? D_TABLE : b->kind == B_GRID ? D_GRID : D_FLEX;
         next.filter=NULL; next.opacity=1;
+        next.transform=NULL;memset(&next.translate,0,sizeof next.translate);
         for (int i=0;i<4;i++) {
             next.margin[i].kind=LK_LEN; next.margin[i].px=next.margin[i].pct=0;
         }
@@ -989,8 +991,9 @@ static bool restyle_derived(box_t *b, style_t *old) {
     *old=next;
     return true;
 }
-static void restyle_boxes(box_t *b) {
-    if (!b) return;
+static void restyle_boxes(box_t *b,bool inherited_borrow) {
+    if (!b||(!inherited_borrow&&!b->style_sync_dirty)) return;
+    bool own_borrow=b->node&&b->node->style_previous;
     style_t *old = b->st;
     if (restyle_derived(b,old)) {
         /* The stable derived-style slot also updates existing run borrows. */
@@ -1023,9 +1026,10 @@ static void restyle_boxes(box_t *b) {
     }
     b->paint_alpha = b->kind != B_TEXT && b->kind != B_BR && b->st &&
         b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1) < 1;
-    for (box_t *c = b->first; c; c = c->next) { restyle_boxes(c); b->paint_alpha |= c->paint_alpha; }
+    for (box_t *c = b->first; c; c = c->next) { restyle_boxes(c,inherited_borrow||own_borrow); b->paint_alpha |= c->paint_alpha; }
+    b->style_sync_dirty=false;
 }
-void boxes_restyle(web_doc *d) { restyle_boxes(d->root_box); }
+void boxes_restyle(web_doc *d) { restyle_boxes(d->root_box,false); }
 
 bool boxes_update_text(web_doc *d, node_t *n) {
     if (!d || !n || !n->box || n->box->kind != B_TEXT || n->box->node != n) return false;

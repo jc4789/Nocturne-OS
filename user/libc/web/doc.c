@@ -6,6 +6,8 @@
 #include <math.h>
 #include "nocturne.h"
 #include "webi.h"
+#include "web_presentation.h"
+#include <webidb_async.h>
 #include "web_dialog.h"
 #include "form_value.h"
 #include "form_file.h"
@@ -49,12 +51,12 @@ struct pending {
  * still owns its scope/order/media and import traversal; unreferenced entries
  * are reclaimed after the new snapshot is published, not retained forever. */
 struct css_sheet_reuse {
-    struct css_sheet_reuse *next;
+    struct css_sheet_reuse *next, *hash_next;
     const char *css, *base, *media;
     size_t n;
     sheet_t *sheet;
     arena_t arena;
-    uint64_t hash;
+    uint64_t hash, key_hash;
     bool used;
 };
 
@@ -62,6 +64,25 @@ static uint64_t sheet_hash(const char *text,size_t length) {
     uint64_t hash=UINT64_C(14695981039346656037);
     for(size_t i=0;i<length;i++)hash=(hash^(uint8_t)text[i])*UINT64_C(1099511628211);
     return hash;
+}
+static void sheet_reuse_reindex(web_doc *d) {
+    if(!d->css_reuse_capacity)return;
+    memset(d->css_reuse_buckets,0,d->css_reuse_capacity*sizeof *d->css_reuse_buckets);
+    for(struct css_sheet_reuse *c=d->css_reuse;c;c=c->next) {
+        if(!c->sheet)continue;
+        size_t slot=(size_t)c->key_hash&(d->css_reuse_capacity-1);
+        c->hash_next=d->css_reuse_buckets[slot];d->css_reuse_buckets[slot]=c;
+    }
+}
+static void sheet_reuse_grow(web_doc *d) {
+    size_t capacity=d->css_reuse_capacity;
+    if(capacity && (size_t)d->css_reuse_count < capacity-capacity/4)return;
+    size_t next=capacity?capacity*2:16;
+    if(next<=capacity || next>SIZE_MAX/sizeof *d->css_reuse_buckets)return;
+    struct css_sheet_reuse **buckets=calloc(next,sizeof *buckets);
+    if(!buckets)return; /* preserve the existing index, or the linked fallback */
+    free(d->css_reuse_buckets);d->css_reuse_buckets=buckets;d->css_reuse_capacity=next;
+    sheet_reuse_reindex(d);
 }
 static void sheet_reuse_sweep(web_doc *d,bool all) {
     struct css_sheet_reuse **link=&d->css_reuse;
@@ -71,6 +92,8 @@ static void sheet_reuse_sweep(web_doc *d,bool all) {
         *link=c->next;d->css_reuse_count--;d->css_reuse_bytes-=c->n;
         ar_free(&c->arena);free(c);
     }
+    if(!d->css_reuse_count){free(d->css_reuse_buckets);d->css_reuse_buckets=NULL;d->css_reuse_capacity=0;}
+    else sheet_reuse_reindex(d); /* no index pointer may borrow a freed arena */
 }
 
 static struct cached_css *cached_css(web_doc *d, const char *url) {
@@ -262,7 +285,12 @@ static bool sheet_parse(web_doc *d, struct sheet_walk *f, const char *css, size_
         return ast && sheet_instance_imports(d,f,ast,order,media,scope);
     }
     uint64_t hash=sheet_hash(source,n);
-    for (struct css_sheet_reuse *c = d->css_reuse; c; c = c->next) {
+    uint64_t base_hash=sheet_hash(source_base,strlen(source_base));
+    uint64_t key_hash=hash^(base_hash<<1|base_hash>>63);
+    if(d->live)sheet_reuse_grow(d);
+    bool indexed=d->css_reuse_capacity!=0;
+    struct css_sheet_reuse *candidate=indexed?d->css_reuse_buckets[(size_t)key_hash&(d->css_reuse_capacity-1)]:d->css_reuse;
+    for (struct css_sheet_reuse *c = candidate; c; c = indexed?c->hash_next:c->next) {
         if (!c->sheet || hash!=c->hash || n != c->n || strcmp(source_base, c->base) || memcmp(source, c->css, n)) continue;
         c->used=true;
         return sheet_instance_imports(d,f,c->sheet,order,media,scope);
@@ -270,7 +298,7 @@ static bool sheet_parse(web_doc *d, struct sheet_walk *f, const char *css, size_
     if(d->live && d->css_reuse_count<UINT_MAX && n<SIZE_MAX && d->css_reuse_bytes<=SIZE_MAX-n) {
         struct css_sheet_reuse *c=calloc(1,sizeof *c);
         if(!c)return false;
-        c->n=n;c->hash=hash;c->next=d->css_reuse;d->css_reuse=c;
+        c->n=n;c->hash=hash;c->key_hash=key_hash;c->next=d->css_reuse;d->css_reuse=c;
         d->css_reuse_count++;d->css_reuse_bytes+=n;
         /* The document's existing scan trap owns failure recovery. Link first
          * so a cancelled/failed allocation is reclaimed along with its arena. */
@@ -279,6 +307,7 @@ static bool sheet_parse(web_doc *d, struct sheet_walk *f, const char *css, size_
         c->sheet=css_parse_sheet_serviced(d,&c->arena,c->css,n,c->base,0,NULL);
         c->arena.trap=NULL;
         if(!c->sheet || d->native_cancelled)return false;
+        if(d->css_reuse_capacity){size_t slot=(size_t)key_hash&(d->css_reuse_capacity-1);c->hash_next=d->css_reuse_buckets[slot];d->css_reuse_buckets[slot]=c;}
         c->used=true;
         return sheet_instance_imports(d,f,c->sheet,order,media,scope);
     }
@@ -429,40 +458,6 @@ static int add_image_request(web_doc *d, const char *rel, bool retry_failed, int
 }
 static int add_image(web_doc *d, const char *rel) { return add_image_request(d, rel, false, -1,true); }
 
-/* the srcset candidate for a 1x display: an "1x" one, else the first */
-static char *srcset_pick(const char *ss) {
-    const char *best = NULL, *best_e = NULL, *first = NULL, *first_e = NULL;
-    float best_w = 0;
-    const char *p = ss;
-    while (*p) {
-        while (is_space((unsigned char)*p) || *p == ',') p++;
-        if (!*p) break;
-        const char *u = p;
-        while (*p && !is_space((unsigned char)*p)) p++;
-        const char *ue = p;
-        if (ue > u && ue[-1] == ',') ue--;
-        const char *desc = p;
-        while (*p && *p != ',') p++;
-        if (!first) first = u, first_e = ue;
-        float v = (float)atof(desc);
-        while (is_space((unsigned char)*desc)) desc++;
-        const char *unit = desc;
-        while (*unit && (isdigit((unsigned char)*unit) || *unit == '.')) unit++;
-        if (*unit == 'x' && v == 1) {
-            best = u, best_e = ue;
-            break;
-        }
-        if (*unit == 'w' && v >= 600 && (!best || v < best_w)) best = u, best_e = ue, best_w = v;
-    }
-    if (!best) best = first, best_e = first_e;
-    if (!best) return NULL;
-    return strndup(best, (size_t)(best_e - best));
-}
-
-static bool placeholder_src(const char *s) {
-    return !s || !*s || (!strncasecmp(s, "data:image/gif", 14) && strlen(s) < 200) || (!strncasecmp(s, "data:image/svg", 14) && strlen(s) < 200 && strstr(s, "%3C/svg") == NULL);
-}
-
 /* Allocation lists keep their lifetime owner even after DOM adoption. The
  * family contains at most 64 auxiliary documents (doc_inert's existing cap).
  * Resource users must enumerate logical owners, not only d's own arena.
@@ -491,18 +486,15 @@ void doc_image_sync(web_doc *d, node_t *n) {
         if (p->tag == T_template || p->template_host) return;
     }
     const char *src = node_attr(n, "src"), *ss = node_attr(n, "srcset");
-    const char *lazy = node_attr(n, "data-src");
-    if (!lazy) lazy = node_attr(n, "data-lazy-src");
-    if (!lazy) lazy = node_attr(n, "data-original");
     char *pick = NULL;
-    pick=web_image_source_pick(d,n,placeholder_src(src)?NULL:src);
+    /* HTML's source selection uses src/srcset/picture, not a guessed meaning
+       for author data-* attributes or a guessed "placeholder" data URL. */
+    pick=web_image_source_pick(d,n,src);
     if(pick)src=pick;
-    else if (placeholder_src(src) && lazy) src = lazy;
-    else if (placeholder_src(src) && node_attr(n, "data-srcset")) src = pick = srcset_pick(node_attr(n, "data-srcset"));
     bool has_source = src != NULL || ss != NULL;
     /* Keep responsive/CORS images outside this ordinary-image upgrade path.
        In particular, URL deduplication must not promote a blocked imageset. */
-    bool image_upgrade=!ss && !node_attr(n,"data-srcset") && !node_attr(n,"crossorigin") &&
+    bool image_upgrade=!ss && !node_attr(n,"crossorigin") &&
         !(n->parent && !n->parent->foreign && n->parent->tag==T_picture);
     int requested = add_image_request(d, src, n->image_invalidated,
         n->image_initialized && !n->image_invalidated ? n->image_request : -1,image_upgrade);
@@ -851,6 +843,7 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
     if (!d->url) { free((void *)d->inherited_url);free(d); return NULL; }
     snprintf(d->base, sizeof d->base, "%s", web_effective_url(d));
     if(!html_policy_init(d,headers,inherited_origin)){web_free(d);return NULL;}
+    if(!web_presentation_policy_init(d,headers,inherited_origin)){web_free(d);return NULL;}
     char transport_label[64]={0};
     if(headers){
         struct http_resp response_headers={.headers_full=(char *)headers};char type[512]={0};
@@ -879,14 +872,19 @@ static void free_pending(web_doc *d) {
     d->pending_css.n = 0;
 }
 
-static node_t *first_base(node_t *n, uint64_t *visits) {
-    for (node_t *c = n ? n->first : NULL; c; c = c->next) {
+static node_t *first_base(web_doc *d, node_t *root, uint64_t *visits) {
+    for (node_t *c = root ? root->first : NULL; c;) {
         (*visits)++;
-        if (c->type != N_ELEM) continue;
-        if (!c->foreign && c->tag == T_template) continue;
-        if (!c->foreign && c->tag == T_base && node_attr(c, "href")) return c;
-        node_t *found = first_base(c, visits);
-        if (found) return found;
+        if (!web_native_checkpoint(d)) return NULL;
+        if (c->type == N_ELEM && !c->foreign && c->tag == T_base && node_attr(c, "href")) return c;
+        /* Document metadata uses the ordinary tree, not shadow/template trees.
+           Avoid a native recursion frame for each deeply nested element. */
+        if (c->type == N_ELEM && (c->foreign || c->tag != T_template) && c->first) c = c->first;
+        else {
+            while (c && c != root && !c->next) c = c->parent;
+            if (!c || c == root) break;
+            c = c->next;
+        }
     }
     return NULL;
 }
@@ -896,26 +894,33 @@ static node_t *first_base(node_t *n, uint64_t *visits) {
    resources, applies stylesheet changes, and initializes pending controls. */
 void doc_sync_tree(web_doc *d) {
     if (!d) return;
+    /* resources_dirty intentionally survives metadata reads. Its independent
+       snapshot is invalidated by metadata-relevant native DOM hooks, not by
+       every class/text/control mutation in the document. */
+    if (d->metadata_valid) return;
     struct web_profile *profile = &(d->dom_family ? d->dom_family : d)->profile;
     uint64_t start = d->profile_enabled ? uptime_ms() : 0;
     profile->metadata_syncs++;
-    d->html = d->head = d->body = NULL;
+    node_t *html = NULL, *head = NULL, *body = NULL;
     for (node_t *n = d->root ? d->root->first : NULL; n; n = n->next) {
         profile->metadata_visits++;
-        if (n->type == N_ELEM) { d->html = n; break; }
+        if (n->type == N_ELEM) { html = n; break; }
     }
-    for (node_t *n = d->html ? d->html->first : NULL; n; n = n->next) {
+    for (node_t *n = html ? html->first : NULL; n; n = n->next) {
         profile->metadata_visits++;
-        if (!d->head && !n->foreign && n->tag == T_head) d->head = n;
-        if (!d->body && !n->foreign && (n->tag == T_body || n->tag == T_frameset)) d->body = n;
+        if (!head && !n->foreign && n->tag == T_head) head = n;
+        if (!body && !n->foreign && (n->tag == T_body || n->tag == T_frameset)) body = n;
     }
+    node_t *base = first_base(d, d->root, &profile->metadata_visits);
+    if (d->native_cancelled) return; /* never publish a cancelled partial tree */
+    d->html=html;d->head=head;d->body=body;
     snprintf(d->base, sizeof d->base, "%s", web_effective_url(d));
-    node_t *base = first_base(d->root, &profile->metadata_visits);
     if (base) {
         char *url=doc_absolute_url(web_effective_url(d),node_attr(base,"href"));
         if(url)snprintf(d->base,sizeof d->base,"%s",url);
         free(url);
     }
+    d->metadata_revision=d->dom_revision;d->metadata_valid=true;
     if (d->profile_enabled) profile->metadata_ms += uptime_ms() - start;
 }
 
@@ -947,6 +952,7 @@ void doc_rescan(web_doc *d) {
         return;
     }
     uint64_t profile_start = d->profile_enabled ? uptime_ms() : 0;
+    d->metadata_valid = false;
     d->profile.rescans++;
     d->resources_dirty = false;
     d->images_dirty = false;
@@ -1007,6 +1013,7 @@ void doc_rescan(web_doc *d) {
     d->mem.trap = old_mem;
     d->cssmem.trap = old_css;
     d->dirty = d->need_style = true;
+    if(!failed_arena && !d->native_cancelled){d->metadata_revision=d->dom_revision;d->metadata_valid=true;}
     if (d->profile_enabled) d->profile.rescan_ms += uptime_ms() - profile_start;
 }
 
@@ -1036,6 +1043,7 @@ void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const ch
 }
 
 void web_media_background(uint64_t now) {
+    webidb_async_background();
     web_avmedia_background(now);
     web_worker_background();
 }
@@ -1046,17 +1054,33 @@ int64_t web_media_background_deadline(uint64_t now) {
 void web_tick(web_doc *d, uint64_t now) {
     web_media_background(now);
     if (!d || !d->live) return;
+    /* A native-only cancellation preserves author queues, not partial boxes.
+       Rebuild outside every author/media/animation task before any callback
+       can observe geometry. Active parent/author/parser transactions refuse
+       recovery in web_js_native_recover; their queues stay parked here. */
+    if(d->native_recovery_pending){
+        web_layout(d,MAX(1,d->width),MAX(1,d->height));
+        if(d->native_recovery_pending || d->native_cancelled || !d->layout_valid)return;
+    }
     doc_rescan(d);
+    if(d->native_cancelled)return;
     web_avmedia_tick(d, now);
+    if(d->native_cancelled)return;
     css_motion_tick(d,now);
+    if(d->native_cancelled)return;
     web_marquee_tick(d,now);
+    if(d->native_cancelled)return;
     web_js_tick(d, now);
+    if(d->native_cancelled)return;
     doc_rescan(d);
+    if(d->native_cancelled)return;
     /* The child can complete while author JS runs. Refill before GUI paint,
        not one complete browser turn later. Both calls retain their native
        2 ms / 8 packet bounds; there are exactly two opportunities per tick. */
     web_avmedia_tick(d, uptime_ms());
+    if(d->native_cancelled)return;
     web_js_frames_sync(d);
+    if(d->native_cancelled)return;
     web_frames_tick(d,now);
 }
 int64_t web_deadline(web_doc *d) {
@@ -1174,14 +1198,20 @@ void doc_font_loaded(web_doc *d,struct web_font_resource *f,const void *bytes,si
     f->face=bytes && length?font_open_memory(bytes,length):NULL;
     f->loading=false;f->done=true;f->failed=!f->face;
     d->dirty=true;
-    /* Re-select once at the next layout boundary. Only actual users whose
-       selected face changes need a cascade/reshape; unrelated boxes retain
-       their valid layout. Failures merely advance to the next source. */
+    /* A decoded face changes native glyph metrics and fallback coverage.
+       Mark committed formatting stale before selecting it at the next layout
+       boundary; otherwise a geometry getter can reuse the old font's cache.
+       Failed sources merely advance selection and preserve valid metrics. */
+    if(f->face){
+        d->layout_valid=false;
+        layout_invalidate_fonts(d->root_box);
+    }
     d->font_selection_dirty=true;
 }
 
 void web_free(web_doc *d) {
     if (!d) return;
+    web_presentation_free(d);
     doc_active_cancel(d);
     /* Adopted DOM nodes may be allocation-owned by a helper document. Retire
        all published box/scope borrows before freeing that family of owners. */
@@ -1272,6 +1302,7 @@ bool web_set_url(web_doc *d, const char *url) {
     char *copy = strdup(url);
     if (!copy) return false;
     free(d->url); d->url = copy;
+    d->metadata_valid=false;
     if (!d->base_seen) snprintf(d->base, sizeof d->base, "%s", url);
     return true;
 }
@@ -1310,7 +1341,7 @@ const char *web_image_url(web_doc *d, int i) {
 bool web_image_wanted(web_doc *d, int i) {
     if (i < 0 || i >= d->images.n) return false;
     struct web_image *im = d->images.v[i];
-    return !im->done && !im->failed;
+    return !im->done && !im->failed && !im->loading_id;
 }
 
 static void image_decode_service(void *context) { web_native_checkpoint(context); }
@@ -1485,7 +1516,7 @@ reflow:
     d->layout_valid = true;
     if(d->native_recovery_pending){
         d->native_recovery_pending=d->native_recovery_active=false;
-        web_js_console(d,1,"Native view recovered from coherent DOM; author scripts and the aborted parser remain stopped.");
+        web_js_console(d,1,"Native rendering recovered from coherent DOM.");
     }
     layout_clamp_trace_report(d);
     if (d->find_text && *d->find_text && !d->find_revealing) web_find(d, d->find_text, 0);

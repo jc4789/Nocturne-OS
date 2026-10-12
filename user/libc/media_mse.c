@@ -248,6 +248,11 @@ static bool demux(nmedia_mse *m,const uint8_t *body,size_t bytes,int64_t offset,
     AVFormatContext *format=io?avformat_alloc_context():NULL;AVPacket *packet=NULL;
     bool ok=false,need_key=m->video_key;struct mse_configuration *configuration=NULL;nmedia *candidate=NULL;
     struct coded_frame *new_frames=NULL,*new_tail=NULL;size_t new_bytes=0,new_count=0;int64_t shift=offset,first=INT64_MIN;
+    struct nmedia_mse_sample_time *sample_times=NULL;size_t sample_time_count=0;
+    if(bytes&&!m->webm){
+        int parsed=nmedia_mse_fragment_times(body,bytes,m->init_sizes,m->init_size_count,&sample_times,&sample_time_count,m->error,sizeof m->error);
+        if(parsed<0){m->quota_error=parsed==NMEDIA_MSE_PARSE_MEMORY;goto done;}
+    }
     if(!format){bad(m,"MSE demux allocation quota",true);goto done;}
     format->pb=io;format->flags|=AVFMT_FLAG_CUSTOM_IO;format->max_streams=INT_MAX;format->probesize=1024*1024;
     int r=avformat_open_input(&format,NULL,av_find_input_format(m->webm?"matroska":"mov"),NULL);
@@ -281,6 +286,14 @@ static bool demux(nmedia_mse *m,const uint8_t *body,size_t bytes,int64_t offset,
                 if(total!=(uint64_t)packet->size)valid=false;}
             av_encryption_info_free(info);if(!valid){bad(m,"unsupported or malformed CENC packet",false);goto done;}}
         AVStream *stream=format->streams[packet->stream_index];bool video=stream->codecpar->codec_type==AVMEDIA_TYPE_VIDEO;
+        if(packet->duration<=0&&packet->pos>=0&&(uint64_t)packet->pos>=m->init_size&&stream->id>0){
+            size_t position=(size_t)((uint64_t)packet->pos-m->init_size),lo=0,hi=sample_time_count;
+            uint32_t track=(uint32_t)stream->id;
+            while(lo<hi){size_t mid=lo+(hi-lo)/2;const struct nmedia_mse_sample_time *time=&sample_times[mid];
+                if(time->offset<position||(time->offset==position&&time->track_id<track))lo=mid+1;else hi=mid;}
+            if(lo<sample_time_count&&sample_times[lo].offset==position&&sample_times[lo].track_id==track)
+                packet->duration=sample_times[lo].duration;
+        }
         if(stream->codecpar->codec_type!=AVMEDIA_TYPE_AUDIO&&!video){av_packet_unref(packet);continue;}
         int64_t stamp=packet->pts==AV_NOPTS_VALUE?packet->dts:packet->pts;
         if(stamp==AV_NOPTS_VALUE){bad(m,"MSE packet has no timestamp",false);goto done;}
@@ -289,6 +302,14 @@ static bool demux(nmedia_mse *m,const uint8_t *body,size_t bytes,int64_t offset,
         if(first==INT64_MIN){first=pts;if(sequence)shift=(m->sequence_group?m->sequence_start:m->end_ms)-pts;}
         if((shift>0&&pts>INT64_MAX-shift)||(shift<0&&pts<INT64_MIN-shift)){bad(m,"MSE timestamp overflow",false);goto done;}
         pts+=shift;int64_t duration=av_rescale_q(packet->duration,stream->time_base,(AVRational){1,1000});
+        if(packet->duration>0){
+            if(stamp>INT64_MAX-packet->duration){bad(m,"MSE sample end overflow",false);goto done;}
+            int64_t end=av_rescale_q(stamp+packet->duration,stream->time_base,(AVRational){1,1000});
+            if(end< -1000000000000LL||end>1000000000000LL){bad(m,"MSE sample end outside supported range",false);goto done;}
+            /* Round the authored sample end once. Separately rounding PTS and
+               duration manufactured 1ms gaps in otherwise contiguous tracks. */
+            duration=end-(pts-shift);
+        }
         if(duration<=0)duration=video?40:MAX(1,1024*1000/MAX(1,stream->codecpar->sample_rate));
         if(pts< -1000000000000LL||pts>1000000000000LL||duration>1000000){bad(m,"MSE coded frame time limit",false);goto done;}
         /* Matroska Opus codec delay can give the first encoded packet a
@@ -332,7 +353,7 @@ done:
         if(initial)m->cursor=m->frames;else if(replaced)nmedia_mse_seek(m,m->play_ms);
         if(!m->configuration_boundary&&nmedia_packets_resume(m->decoder))m->revision++;
     }else {while(new_frames){struct coded_frame *f=new_frames;new_frames=f->next;av_packet_free(&f->packet);configuration_unref(f->configuration);nmedia_ff_free(f);}}
-    nmedia_close(candidate);configuration_unref(configuration);
+    nmedia_ff_free(sample_times);nmedia_close(candidate);configuration_unref(configuration);
     av_packet_free(&packet);avformat_close_input(&format);if(io){av_freep(&io->buffer);avio_context_free(&io);}else av_free(buffer);
     return ok;
 }

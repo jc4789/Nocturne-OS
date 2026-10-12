@@ -9,6 +9,7 @@
 #include <parallel.h>
 #include "webi.h"
 #include "web_dialog.h"
+#include "web_presentation.h"
 #include "form_validation.h"
 #include "form_value.h"
 #include "avmedia.h"
@@ -101,6 +102,8 @@ struct font_source {const char *url;struct font_source *next;};
 struct font_face {
     const char *family;
     struct font_source *sources;
+    const struct web_font_range *ranges;
+    size_t range_count;
     unsigned weight_lo,weight_hi;
     bool italic;
     const struct mcond *media;
@@ -857,7 +860,7 @@ static bool match_pc(const struct simple *x, node_t *e, node_t *scope) {
     case PC_READ_WRITE: return read_write(e);
     case PC_READ_ONLY: return !read_write(e);
     case PC_MODAL: return web_dialog_is_modal(e->owner,e);
-    case PC_FULLSCREEN: return e->owner&&e->owner->fullscreen_element==e;
+    case PC_FULLSCREEN: return web_presentation_matches(e);
     case PC_OPEN: return (e->tag == T_details || e->tag == T_dialog) && node_attr(e, "open");
     }
     return false;
@@ -1568,6 +1571,50 @@ static struct font_source *font_sources(struct pctx *pc,const char *s,const char
     }
     return first;
 }
+static int font_range_compare(const void *a,const void *b) {
+    const struct web_font_range *x=a,*y=b;
+    return x->first<y->first?-1:x->first>y->first?1:x->last<y->last?-1:x->last>y->last;
+}
+static bool parse_font_ranges(arena_t *a,const char *s,const char *end,
+                              const struct web_font_range **out,size_t *count) {
+    struct web_font_range *ranges=NULL;size_t n=0,capacity=0;
+    for(;;){
+        s=skip_ws(s,end);
+        if(end-s<3 || (*s!='u'&&*s!='U') || s[1]!='+')return false;
+        s+=2;uint32_t lo=0,hi=0;unsigned digits=0,wildcards=0;
+        while(s<end && (isxdigit((unsigned char)*s)||*s=='?')){
+            if(++digits>6)return false;
+            if(*s=='?'){wildcards++;lo<<=4;hi=(hi<<4)|15;}
+            else {if(wildcards)return false;unsigned v=*s>='0'&&*s<='9'?*s-'0':tolower((unsigned char)*s)-'a'+10;lo=(lo<<4)|v;hi=(hi<<4)|v;}
+            s++;
+        }
+        if(!digits)return false;
+        if(s<end&&*s=='-'){
+            if(wildcards)return false;s++;hi=0;unsigned d=0;
+            while(s<end&&isxdigit((unsigned char)*s)){
+                if(++d>6)return false;unsigned v=*s>='0'&&*s<='9'?*s-'0':tolower((unsigned char)*s)-'a'+10;hi=(hi<<4)|v;s++;
+            }
+            if(!d)return false;
+        }
+        if(lo>hi||lo>0x10ffff)return false;hi=MIN(hi,0x10ffffu);
+        if(n==capacity){
+            size_t cap=capacity?capacity*2:8;
+            if(cap<capacity||cap>SIZE_MAX/sizeof *ranges){ar_alloc(a,SIZE_MAX);return false;}
+            struct web_font_range *next=ar_alloc(a,cap*sizeof *next);
+            if(n)memcpy(next,ranges,n*sizeof *next);ranges=next;capacity=cap;
+        }
+        ranges[n++]=(struct web_font_range){lo,hi};s=skip_ws(s,end);
+        if(s==end)break;
+        if(*s++!=',')return false;
+    }
+    qsort(ranges,n,sizeof *ranges,font_range_compare);
+    size_t merged=0;
+    for(size_t i=0;i<n;i++){
+        if(merged&&ranges[i].first<=ranges[merged-1].last+1)ranges[merged-1].last=MAX(ranges[merged-1].last,ranges[i].last);
+        else ranges[merged++]=ranges[i];
+    }
+    *out=ranges;*count=merged;return true;
+}
 static void parse_font_face(struct pctx *pc,const char *s,const char *e,const struct mcond *media) {
     struct font_face *f=ar_alloc(pc->a,sizeof *f);memset(f,0,sizeof *f);
     f->weight_lo=f->weight_hi=400;f->media=media;
@@ -1581,6 +1628,10 @@ static void parse_font_face(struct pctx *pc,const char *s,const char *e,const st
                 const char *cursor=value,*family=css_font_family_next(pc->a,&cursor,ve);
                 if(family && cursor==ve)f->family=family;
             } else if(n==3 && strn_ieq(name,"src",n))f->sources=font_sources(pc,value,ve);
+            else if(n==13 && strn_ieq(name,"unicode-range",n)){
+                const struct web_font_range *ranges;size_t count;
+                if(parse_font_ranges(pc->a,value,ve,&ranges,&count)){f->ranges=ranges;f->range_count=count;}
+            }
             else if(n==10 && strn_ieq(name,"font-style",n))f->italic=(ve-value>=6 && strn_ieq(value,"italic",6)) || (ve-value>=7 && strn_ieq(value,"oblique",7));
             else if(n==11 && strn_ieq(name,"font-weight",n)) {
                 if(ve-value==6 && strn_ieq(value,"normal",6))f->weight_lo=f->weight_hi=400;
@@ -2154,6 +2205,7 @@ static bool container_chain_ok(const struct mcond *mc,node_t *e,bool inclusive) 
 
 struct font_binding {
     const char *names;node_t *scope;unsigned weight;bool italic;font_t *face;
+    const struct web_font_choice *choices;
 };
 static struct font_binding *font_bindings;
 static size_t font_binding_count,font_binding_capacity;
@@ -2175,6 +2227,9 @@ static font_t *select_web_font_uncached(web_doc *d,node_t *node,style_t *style,i
             !strcasecmp(family,"system-ui") || !strcasecmp(family,"cursive") || !strcasecmp(family,"fantasy")))return NULL;
         struct font_face *best=scoped_font_face(d,scope,family,style->font_weight,style->font_style!=0,vw,vh);
         if(!best)continue;
+        /* Restricted faces are selected per character below, never as the
+           metrics/raster face for every character in the entire family. */
+        if(best->range_count)continue;
         for(struct font_source *src=best->sources;src;src=src->next) {
             struct web_font_resource *r=NULL;
             if(css_worker()) { for(r=d->fonts;r && strcmp(r->url,src->url);r=r->next) {} }
@@ -2186,16 +2241,32 @@ static font_t *select_web_font_uncached(web_doc *d,node_t *node,style_t *style,i
     }
     return NULL;
 }
+static const struct web_font_choice *select_font_choices(web_doc *,node_t *,style_t *,int,int,arena_t *);
+static const struct web_font_choice *copy_font_choices(const struct web_font_choice *source,arena_t *a) {
+    struct web_font_choice *first=NULL,**tail=&first;
+    for(;source;source=source->next){
+        struct web_font_choice *choice=ar_alloc(a,sizeof *choice);*choice=*source;choice->next=NULL;
+        if(source->range_count){struct web_font_range *ranges=ar_alloc(a,source->range_count*sizeof *ranges);memcpy(ranges,source->ranges,source->range_count*sizeof *ranges);choice->ranges=ranges;}
+        *tail=choice;tail=&choice->next;
+    }
+    return first;
+}
 static font_t *select_web_font(web_doc *d,node_t *node,style_t *style,int vw,int vh,arena_t *a) {
+    style->font_choices=NULL;
     if(!font_faces_available || !style->font_names)return NULL;
-    if(css_worker())return select_web_font_uncached(d,node,style,vw,vh,a);
+    if(css_worker()){style->font_choices=select_font_choices(d,node,style,vw,vh,a);return select_web_font_uncached(d,node,style,vw,vh,a);}
     node_t *scope=doc_node_root(node,false);unsigned weight=style->font_weight;bool italic=style->font_style!=0;
     for(size_t i=0;i<font_binding_count;i++) {
         const struct font_binding *b=&font_bindings[i];
         if(b->scope==scope && b->weight==weight && b->italic==italic &&
-           (b->names==style->font_names || !strcmp(b->names,style->font_names)))return b->face;
+           (b->names==style->font_names || !strcmp(b->names,style->font_names))){
+            /* Computed styles own separate per-node arenas. A later partial
+               restyle must not retire another node's composite-font list. */
+            style->font_choices=copy_font_choices(b->choices,a);return b->face;
+        }
     }
     font_t *face=select_web_font_uncached(d,node,style,vw,vh,a);
+    style->font_choices=select_font_choices(d,node,style,vw,vh,a);
     if(font_binding_count==font_binding_capacity) {
         size_t cap=font_binding_capacity?font_binding_capacity:16;
         if(cap<=SIZE_MAX/2)cap*=2;
@@ -2206,7 +2277,7 @@ static font_t *select_web_font(web_doc *d,node_t *node,style_t *style,int vw,int
     }
     /* Optional acceleration only: allocator failure never rejects a font. */
     if(font_binding_count<font_binding_capacity)
-        font_bindings[font_binding_count++]=(struct font_binding){style->font_names,scope,weight,italic,face};
+        font_bindings[font_binding_count++]=(struct font_binding){style->font_names,scope,weight,italic,face,style->font_choices};
     return face;
 }
 
@@ -2488,6 +2559,40 @@ static struct font_face *scoped_font_face(web_doc *d,node_t *root,const char *fa
         }
     return best;
 }
+static const struct web_font_choice *select_font_choices(web_doc *d,node_t *node,style_t *style,int vw,int vh,arena_t *a) {
+    if(!style->font_names)return NULL;
+    node_t *root=doc_node_root(node,false);struct css_scope *scope=root?root->style_scope:NULL;
+    const char *cursor=style->font_names,*end=cursor+strlen(cursor);
+    struct web_font_choice *first=NULL,**tail=&first;bool restricted=false;
+    while(cursor<end){
+        const char *token=skip_ws(cursor,end);bool quoted=token<end&&(*token=='"'||*token=='\'');
+        const char *family=css_font_family_next(a,&cursor,end);if(!family||!cursor)break;
+        if(!quoted&&(!strcasecmp(family,"serif")||!strcasecmp(family,"sans-serif")||!strcasecmp(family,"monospace")||
+           !strcasecmp(family,"system-ui")||!strcasecmp(family,"cursive")||!strcasecmp(family,"fantasy")))break;
+        struct font_face *best=scoped_font_face(d,root,family,style->font_weight,style->font_style!=0,vw,vh);
+        if(!best)continue;
+        unsigned distance=style->font_weight<best->weight_lo?best->weight_lo-style->font_weight:style->font_weight>best->weight_hi?style->font_weight-best->weight_hi:0;
+        unsigned score=distance+((style->font_style!=0)!=best->italic?10000u:0u);
+        struct web_font_choice *family_first=NULL;
+        for(struct css_binding *b=scope?scope->first:NULL;b;b=b->next)for(struct font_face *f=b->index->fonts;f;f=f->next){
+            if(strcasecmp(family,f->family)||!font_conditions_ok(f->media,vw,vh,d->sty.index_scripting))continue;
+            unsigned delta=style->font_weight<f->weight_lo?f->weight_lo-style->font_weight:style->font_weight>f->weight_hi?style->font_weight-f->weight_hi:0;
+            if(delta+((style->font_style!=0)!=f->italic?10000u:0u)!=score)continue;
+            for(struct font_source *src=f->sources;src;src=src->next){
+                struct web_font_resource *r;
+                if(css_worker()){for(r=d->fonts;r&&strcmp(r->url,src->url);r=r->next){}}
+                else r=doc_font_resource(d,src->url);
+                if(!r){ar_alloc(a,SIZE_MAX);return NULL;}if(r->failed)continue;
+                struct web_font_choice *choice=ar_alloc(a,sizeof *choice);
+                *choice=(struct web_font_choice){.next=family_first,.resource=r,.face=r->face,.range_count=f->range_count};
+                if(f->range_count){struct web_font_range *ranges=ar_alloc(a,f->range_count*sizeof *ranges);memcpy(ranges,f->ranges,f->range_count*sizeof *ranges);choice->ranges=ranges;restricted=true;}
+                family_first=choice;break;
+            }
+        }
+        if(family_first){*tail=family_first;while(*tail)tail=&(*tail)->next;}
+    }
+    return restricted?first:NULL;
+}
 
 /* Use the same flat tree as the cascade: shadow children and assigned nodes,
    but not unassigned light children or inactive slot fallback content. Unlike
@@ -2526,6 +2631,8 @@ void css_refresh_font_selection(web_doc *d) {
         for(size_t i=0;i<sizeof styles/sizeof *styles;i++)if(styles[i]) {
             font_t *face=select_web_font_uncached(d,n,styles[i],d->styled_w,d->styled_h,scratch);
             if(face!=styles[i]->named_font)changed=true;
+            for(const struct web_font_choice *choice=styles[i]->font_choices;choice;choice=choice->next)
+                if(choice->face!=choice->resource->face || choice->resource->failed)changed=true;
         }
         /* NULL -> NULL still marks the next source wanted, without recascading
            unchanged SVG snapshots or reshaping existing inline formatting. */
@@ -3462,8 +3569,10 @@ void css_mark_dirty(web_doc *d, node_t *n) {
 static bool equal_string(const char *a,const char *b) { return a==b || (a && b && !strcmp(a,b)); }
 static bool equal_tracks(const struct gtemplate *a,const struct gtemplate *b) {
     if(a==b)return true;
-    return a && b && a->n==b->n && a->rep_at==b->rep_at && a->rep_n==b->rep_n && a->rep_fit==b->rep_fit &&
-        (!a->n || !memcmp(a->t,b->t,(size_t)a->n*sizeof *a->t));
+    if(!a||!b||a->n!=b->n||a->rep_at!=b->rep_at||a->rep_n!=b->rep_n||a->rep_fit!=b->rep_fit)return false;
+    for(int i=0;i<a->n;i++)if(a->t[i].min_kind!=b->t[i].min_kind||a->t[i].max_kind!=b->t[i].max_kind||
+        !css_length_equal(&a->t[i].min,&b->t[i].min)||!css_length_equal(&a->t[i].max,&b->t[i].max))return false;
+    return true;
 }
 static bool equal_areas(const struct gareas *a,const struct gareas *b) {
     if(a==b)return true;
@@ -3471,10 +3580,27 @@ static bool equal_areas(const struct gareas *a,const struct gareas *b) {
     for(int i=0;i<a->rows*a->cols;i++)if(!equal_string(a->cell[i],b->cell[i]))return false;
     return true;
 }
+static bool same_translation_length(const len_t *a,const len_t *b){return css_length_equal(a,b);}
+static bool same_translation(const style_t *a,const style_t *b){
+    if(a->translate.active!=b->translate.active)return false;
+    if(a->translate.active)for(unsigned axis=0;axis<2;axis++)if(!same_translation_length(&a->translate.xy[axis],&b->translate.xy[axis]))return false;
+    const struct css_transform *x=a->transform,*y=b->transform;
+    while(x&&y){for(unsigned axis=0;axis<2;axis++)if(!same_translation_length(&x->xy[axis],&y->xy[axis]))return false;x=x->next;y=y->next;}
+    return !x&&!y;
+}
 bool css_style_layout_equal(const style_t *a,const style_t *b) {
     if(a==b)return true;
     if(!a || !b)return false;
+    const struct web_font_choice *fa=a->font_choices,*fb=b->font_choices;
+    for(;fa&&fb;fa=fa->next,fb=fb->next){
+        if(fa->resource!=fb->resource||fa->face!=fb->face||fa->range_count!=fb->range_count||
+           (fa->range_count&&memcmp(fa->ranges,fb->ranges,fa->range_count*sizeof *fa->ranges)))return false;
+    }
+    if(fa||fb)return false;
     if (!!a->filter != !!b->filter) return false; /* containing-block ownership changes */
+    /* Values change scrollable overflow even though normal-flow boxes stay
+       unchanged; identity versus none also changes fixed containing blocks. */
+    if(!same_translation(a,b))return false;
     if ((a->display == D_INLINE || b->display == D_INLINE) && (a->opacity < 1) != (b->opacity < 1)) return false;
     if(!equal_string(a->font_names,b->font_names) || !equal_string(a->content,b->content) ||
         !equal_string(a->motion.name,b->motion.name) ||
@@ -3487,9 +3613,20 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     if(!css_style_layout_equal(a->before,b->before) || !css_style_layout_equal(a->after,b->after) ||
         !css_style_layout_equal(a->backdrop,b->backdrop))return false;
     style_t x=*a,y=*b;
+    /* Equivalent calc/min/max ASTs live in different retirement arenas.
+       Compare their values structurally before removing address identity
+       from the final field comparison. Geometry is not cached by pointers. */
+    len_t *xl[]={&x.line_height,&x.svg_stroke_width,&x.width,&x.height,&x.min_width,&x.max_width,&x.min_height,&x.max_height,&x.text_indent,&x.flex_basis};
+    len_t *yl[]={&y.line_height,&y.svg_stroke_width,&y.width,&y.height,&y.min_width,&y.max_width,&y.min_height,&y.max_height,&y.text_indent,&y.flex_basis};
+    for(size_t i=0;i<sizeof xl/sizeof *xl;i++){if(!css_length_equal(xl[i],yl[i]))return false;xl[i]->expr=yl[i]->expr=NULL;}
+    len_t *xa[]={x.margin,x.padding,x.inset,x.object_pos},*ya[]={y.margin,y.padding,y.inset,y.object_pos};
+    for(unsigned group=0;group<4;group++)for(unsigned i=0;i<(group==3?2:4);i++){
+        if(!css_length_equal(&xa[group][i],&ya[group][i]))return false;xa[group][i].expr=ya[group][i].expr=NULL;
+    }
     x.filter=y.filter=NULL; /* effect amounts are paint-only arena borrows */
-    x.motion.name=y.motion.name=NULL;
-    x.font_names=y.font_names=NULL; x.content=y.content=NULL; x.list_style_string=y.list_style_string=NULL;
+    x.transform=y.transform=NULL;memset(&x.translate,0,sizeof x.translate);memset(&y.translate,0,sizeof y.translate);
+    memset(&x.motion,0,sizeof x.motion);memset(&y.motion,0,sizeof y.motion); /* opacity timing is paint state */
+    x.font_names=y.font_names=NULL;x.font_choices=y.font_choices=NULL; x.content=y.content=NULL; x.list_style_string=y.list_style_string=NULL;
     x.container_names=y.container_names=NULL;
     x.grid_cols=y.grid_cols=x.grid_rows=y.grid_rows=x.grid_auto_cols=y.grid_auto_cols=x.grid_auto_rows=y.grid_auto_rows=NULL;
     x.grid_areas=y.grid_areas=NULL;
@@ -3529,10 +3666,14 @@ static bool style_box_compatible(node_t *e, const style_t *old, const style_t *n
         old->overflow != next->overflow || old->content_visibility != next->content_visibility ||
         old->white_space != next->white_space || old->text_transform != next->text_transform ||
         old->list_style != next->list_style || old->list_style_inside != next->list_style_inside) return false;
-    return old->display == D_BLOCK || old->display == D_FLOW_ROOT || old->display == D_INLINE || old->display == D_NONE;
+    return old->display == D_BLOCK || old->display == D_FLOW_ROOT || old->display == D_INLINE || old->display == D_NONE ||
+        old->display==D_FLEX||old->display==D_INLINE_FLEX||old->display==D_GRID||old->display==D_INLINE_GRID;
 }
 
 static void retire_style(struct cascade *c, node_t *e) {
+    /* Boxes are stable during the parallel cascade; only monotone dirty
+       publication happens here. The supervisor refreshes borrows after join. */
+    for(box_t *b=e->box;b;b=b->parent)__atomic_store_n(&b->style_sync_dirty,true,__ATOMIC_RELAXED);
     e->style_previous = e->style; e->style_previous_mem = e->style_mem;
     memset(&e->style_mem, 0, sizeof e->style_mem);
     e->style_mem.chunk_size = 4096;

@@ -40,6 +40,7 @@ struct webnet {
     struct slot *parked;
     uint64_t serial;
     unsigned count;
+    unsigned next_priority;
     bool debug;
     size_t queued_bytes;
     webcookie_jar *cookies;
@@ -195,6 +196,30 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     r->next = *at; *at = r;
     n->queued_bytes += len; n->count++;
     return r->id;
+}
+static struct request *take_request(webnet *n,unsigned slot){
+    if(!n->queue)return NULL;
+    struct request **chosen=&n->queue;
+    if(slot==0){
+        /* Keep the existing navigation/render-resource lane. */
+        if((*chosen)->priority>=3)return NULL;
+    }else if((*chosen)->priority!=0){
+        /* A continuing stream of scripts or newly queued images must not
+           starve another resource class, including media fetches. FIFO within
+           each class and actual transport concurrency are preserved. */
+        unsigned first=n->next_priority?n->next_priority:1;
+        for(unsigned offset=0;offset<3;offset++){
+            unsigned priority=1+(first-1+offset)%3;
+            struct request **link=&n->queue;
+            while(*link && (*link)->priority<(int)priority)link=&(*link)->next;
+            if(*link && (*link)->priority==(int)priority){
+                chosen=link;n->next_priority=priority==3?1:priority+1;break;
+            }
+        }
+    }
+    struct request *request=*chosen;
+    *chosen=request->next;request->next=NULL;
+    return request;
 }
 static bool start(struct slot *s, struct request *r) {
     int ip[2] = {-1,-1}, op[2] = {-1,-1}, nullfd = -1;
@@ -453,7 +478,7 @@ void webnet_pump(webnet *n,uint64_t now){
     while(*park){struct slot *s=*park;pump_slot(n,s,now);if(!s->rq){*park=s->next;free(s);}else park=&s->next;}
     for(int i=0;i<WORKERS;i++){
         struct slot *s=&n->slots[i];
-        if(!s->rq&&n->queue&&(i!=0||n->queue->priority<3)){struct request *r=n->queue;n->queue=r->next;r->next=NULL;start(s,r);}
+        if(!s->rq){struct request *r=take_request(n,(unsigned)i);if(r)start(s,r);}
         pump_slot(n,s,now);
         if(s->rq&&s->rq->paused&&!s->rq->finishing){
             struct slot *held=malloc(sizeof *held);

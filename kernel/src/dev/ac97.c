@@ -69,12 +69,19 @@ static void ac97_fill(void) {
            the next tick rather than declaring unplayed samples consumed. */
         uint16_t remaining=inw(nabm+PO_PICB);
         uint32_t confirmed=inl(nabm+PO_CIV);
-        if((confirmed&(NBUF-1))==(uint32_t)civ){
+        if((confirmed&(NBUF-1))!=(uint32_t)civ){
+            /* One descriptor crossing is normal at a tick boundary. Retry
+               against the new CIV once; never refill indefinitely while
+               refusing to retire the corresponding physical records. */
+            civ=(int)(confirmed&(NBUF-1));before=(uint16_t)(confirmed>>16);
+            remaining=inw(nabm+PO_PICB);confirmed=inl(nabm+PO_CIV);
+        }
+        if((confirmed&(NBUF-1))==(uint32_t)civ&&remaining<=BUF_FRAMES*2){
             uint64_t pending_frames;
             if((before&(SR_HALTED|SR_CELV))==(SR_HALTED|SR_CELV))pending_frames=0;
-            else pending_frames=(uint64_t)((lvi-civ)&(NBUF-1))*BUF_FRAMES+MIN((unsigned)remaining/2,(unsigned)BUF_FRAMES);
+            else pending_frames=(uint64_t)((lvi-civ)&(NBUF-1))*BUF_FRAMES+((unsigned)remaining+1)/2;
             audio_card_played(submitted_frames>=pending_frames?submitted_frames-pending_frames:0);
-        }
+        }else return; /* no refill against an unverified CIV/PICB owner */
     }
     unsigned filled = 0;
     bool restarted = false;

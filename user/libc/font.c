@@ -14,6 +14,7 @@
 #define font_family font_family_unlocked
 #define font_metrics font_metrics_unlocked
 #define font_has font_has_unlocked
+#define font_has_primary font_has_primary_unlocked
 #define font_advance font_advance_unlocked
 #define font_width font_width_unlocked
 #define font_metrics_generation font_metrics_generation_unlocked
@@ -390,6 +391,7 @@ void font_metrics(font_t *f, float px, float *ascent, float *descent, float *lin
 }
 
 bool font_has(font_t *f, uint32_t cp) { int g; glyph_face(f, cp, &g); return g != 0; }
+bool font_has_primary(font_t *f,uint32_t cp) { return f && glyph_of(f,cp)!=0; }
 
 /* the advance of a missing glyph: an empty box */
 static float tofu_adv(float px) { return px * 0.6f; }
@@ -674,6 +676,7 @@ int font_cell_draw(canvas_t *c, int x, int y, uint32_t cp, uint32_t fg, uint32_t
 #undef font_family
 #undef font_metrics
 #undef font_has
+#undef font_has_primary
 #undef font_advance
 #undef font_width
 #undef font_metrics_generation
@@ -701,6 +704,7 @@ font_t * font_ui(int style) { font_acquire(); font_t * result = font_ui_unlocked
 font_t * font_family(int family, int style) { font_acquire(); font_t * result = font_family_unlocked(family, style); font_release(); return result; }
 void font_metrics(font_t *f, float px, float *ascent, float *descent, float *gap) { font_acquire(); font_metrics_unlocked(f, px, ascent, descent, gap); font_release(); }
 bool font_has(font_t *f, uint32_t cp) { font_acquire(); bool result = font_has_unlocked(f, cp); font_release(); return result; }
+bool font_has_primary(font_t *f,uint32_t cp) { font_acquire();bool result=font_has_primary_unlocked(f,cp);font_release();return result; }
 float font_advance(font_t *f, float px, uint32_t cp) { font_acquire(); float result = font_advance_unlocked(f, px, cp); font_release(); return result; }
 float font_width(font_t *f, float px, const char *s, size_t n) { font_acquire(); float result = font_width_unlocked(f, px, s, n); font_release(); return result; }
 uint64_t font_metrics_generation(void) { font_acquire(); uint64_t result = font_metrics_generation_unlocked(); font_release(); return result; }

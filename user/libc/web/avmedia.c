@@ -39,6 +39,16 @@ struct web_avmedia {
     web_doc *doc;
     node_t *node;
     uint32_t generation;
+    uint32_t performance_generation;
+    int performance_width,performance_height;
+    uint64_t performance_frames,performance_work_ms,performance_at;
+    struct nmedia_video_configuration performance_configuration;
+    uint64_t performance_measurement_id,performance_revision;
+    int performance_slot;
+    struct nmedia_audio_observation performance_audio;
+    uint32_t performance_audio_generation;
+    int performance_audio_slot;
+    uint64_t performance_audio_revision,performance_audio_at;
     nmedia *decoder;
     nmedia_worker *worker;
     /* Idle elements retain metadata/poster, not a 64 MiB child reservation.
@@ -85,6 +95,8 @@ struct web_avmedia {
     int64_t presented_ms,audio_end_ms;
     int64_t audio_end_frame;
     bool audio_written,profile_ended;
+    bool audio_clock_failed,audio_played_valid;
+    int64_t audio_played_ms;
     bool clock_snapshot_enabled,clock_snapshot_valid;
     struct n_audio_status clock_snapshot;
     ssize_t clock_snapshot_bytes;
@@ -160,6 +172,13 @@ static struct web_avmedia *snapshot_candidate;
 static web_doc *snapshot_document;
 static unsigned snapshot_phase;
 static bool snapshot_rejected;
+struct snapshot_region {int64_t x0,y0,x1,y1;};
+static struct snapshot_region *snapshot_regions;
+static size_t snapshot_region_count,snapshot_region_capacity;
+static bool snapshot_region_intersects(const struct snapshot_region *r,const struct web_avmedia *s){
+    return r->x0<(int64_t)s->snapshot.x+s->snapshot.w&&r->x1>s->snapshot.x&&
+        r->y0<(int64_t)s->snapshot.y+s->snapshot.h&&r->y1>s->snapshot.y;
+}
 static void snapshot_clear(struct web_avmedia *s) {
     s->snapshot.valid=false;
     nmedia_ff_free(s->snapshot.storage);memset(&s->snapshot,0,sizeof s->snapshot);
@@ -189,7 +208,7 @@ static struct web_avmedia *find(web_doc *d, node_t *n, bool create) {
     s->doc = d; s->node = n; s->fd = -1;s->mse_pending_slot=-1;s->audio_enabled=s->video_enabled=true; s->volume = s->rate = 1;s->preserve_pitch=true; s->next = streams; streams = s;
     return s;
 }
-static void close_audio(struct web_avmedia *s) { s->clock_snapshot_valid=false;if (s->fd >= 0) { audio_flush(s->fd); close(s->fd); } s->fd = -1;s->audio_written=false;nmedia_rate_close(s->rate_decoder);s->rate_decoder=NULL;s->rate_owned=false; }
+static void close_audio(struct web_avmedia *s) { s->clock_snapshot_valid=false;s->audio_clock_failed=s->audio_played_valid=false;if (s->fd >= 0) { audio_flush(s->fd); close(s->fd); } s->fd = -1;s->audio_written=false;nmedia_rate_close(s->rate_decoder);s->rate_decoder=NULL;s->rate_owned=false; }
 static void clear_ahead(struct web_avmedia *s) {
     s->mse_audio_wait=false;
     while(s->ahead_next){struct web_video_ahead *v=s->ahead_next;s->ahead_next=v->next;nmedia_ff_free((void *)v->output.pixels);nmedia_ff_free(v);}
@@ -215,6 +234,8 @@ static void unload(struct web_avmedia *s) {
     s->audio_enabled=s->video_enabled=true;
     s->base_ms = 0; s->input_size = 0; s->audio_at = 0; s->pending.kind = 0; s->ready = 0; s->error[0] = 0; s->caption[0] = 0;
     s->video_frames=s->dropped_video_frames=0;
+    s->performance_frames=s->performance_work_ms=s->performance_measurement_id=0;
+    memset(&s->performance_audio,0,sizeof s->performance_audio);
     s->presented_frames=s->audio_frames=s->audio_silence_frames=s->profile_at=0;s->presented_ms=s->audio_end_ms=-1;s->audio_end_frame=0;s->audio_written=s->profile_ended=false;
     s->window_frames=0;
     s->profile_pumps=s->profile_services=s->profile_pump_ms=s->profile_pump_at=s->profile_pump_gap=0;
@@ -236,13 +257,31 @@ static int64_t current(struct web_avmedia *s, uint64_t now) {
            and sink replacement invalidate it; author getters outside the
            pump always read current device state. */
         struct n_audio_status status={0};ssize_t bytes;
-        if(s->clock_snapshot_enabled&&s->clock_snapshot_valid){status=s->clock_snapshot;bytes=s->clock_snapshot_bytes;}
+        if(s->audio_clock_failed)bytes=-1;
+        else if(s->clock_snapshot_enabled&&s->clock_snapshot_valid){status=s->clock_snapshot;bytes=s->clock_snapshot_bytes;}
         else {bytes=read(s->fd,&status,sizeof status);if(s->clock_snapshot_enabled){s->clock_snapshot=status;s->clock_snapshot_bytes=bytes;s->clock_snapshot_valid=true;}}
         if(bytes==sizeof status||bytes==sizeof(uint32_t)){uint64_t queued=(uint64_t)status.queued_frames+status.device_pending_frames;
-            int64_t frames=s->audio_end_frame-(int64_t)lround(queued*s->rate);ms=MAX(s->base_ms,frames/SOUND_RATE*1000+(frames%SOUND_RATE)*1000/SOUND_RATE);}
+            int64_t frames=s->audio_end_frame-(int64_t)lround(queued*s->rate);ms=MAX(s->base_ms,frames/SOUND_RATE*1000+(frames%SOUND_RATE)*1000/SOUND_RATE);
+            s->audio_played_ms=ms;s->audio_played_valid=true;
+        }else {
+            /* A failed native sink is not silent-video playback. Retain the
+               last confirmed consumption; cleanup belongs to the pump, not
+               to a geometry/time getter holding a picture/PCM loan. */
+            s->audio_clock_failed=true;ms=s->audio_played_valid?s->audio_played_ms:s->base_ms;
+        }
     }
     if (info && info->duration_ms >= 0 && ms > info->duration_ms) ms = info->duration_ms;
     return ms;
+}
+static void audio_failed(struct web_avmedia *s,uint64_t now){
+    s->audio_clock_failed=true;s->base_ms=current(s,now);s->playing=false;
+    strlcpy(s->error,"native audio consumption status failed",sizeof s->error);
+    s->pending.kind=0;s->audio_at=0;close_audio(s);clear_ahead(s);s->doc->dirty=true;
+}
+static bool audio_queue(struct web_avmedia *s,uint32_t *queued,uint64_t now){
+    *queued=0;if(s->fd<0)return true;
+    if(s->audio_clock_failed||read(s->fd,queued,sizeof *queued)!=sizeof *queued){audio_failed(s,now);return false;}
+    return true;
 }
 static bool audio_target_frame(struct web_avmedia *s,int64_t *target){
     const int factor=SOUND_RATE/1000; /* the native sink is exactly 48 kHz */
@@ -348,7 +387,22 @@ static bool mse_prepare_play(struct web_avmedia *s){
 }
 /* Commit metadata only after display owns a stable picture. Paint is
  * synchronous; snapshots own composed pixels, not a retained display span. */
-static void picture_committed(struct web_avmedia *s,const struct nmedia_output *o){
+static void picture_committed(struct web_avmedia *s,const struct nmedia_output *o,int slot,uint64_t revision){
+    if(o->video_measurement_id&&o->video_measured_frames&&o->video_work_ms>=o->video_measured_frames){
+        if(s->performance_generation!=s->generation||s->performance_width!=o->width||
+           s->performance_height!=o->height||o->video_measured_frames<s->performance_frames||
+           o->video_work_ms<s->performance_work_ms||s->performance_measurement_id!=o->video_measurement_id||
+           !nmedia_video_configuration_equal(&s->performance_configuration,&o->video_configuration)){
+            s->performance_configuration=o->video_configuration;
+            s->performance_measurement_id=o->video_measurement_id;
+            s->performance_width=o->width;s->performance_height=o->height;
+            s->performance_generation=s->generation;
+        }
+        s->performance_configuration.bitrate=o->video_configuration.bitrate;
+        s->performance_slot=slot;s->performance_revision=revision;
+        s->performance_frames=o->video_measured_frames;s->performance_work_ms=o->video_work_ms;
+        s->performance_at=uptime_ms();
+    }else s->performance_frames=s->performance_work_ms=s->performance_measurement_id=0;
     bool size_changed=s->width!=o->width||s->height!=o->height;
     s->width=o->width;s->height=o->height;
     if(size_changed){s->doc->layout_valid=false;s->doc->dirty=true;s->snapshot.valid=false;}else s->doc->paint_dirty=true;
@@ -371,7 +425,7 @@ static bool present(struct web_avmedia *s) {
         if(count>s->pixel_capacity){uint32_t *p=nmedia_ff_realloc(s->pixels,bytes);if(!p){strlcpy(s->error,"video presentation allocation",sizeof s->error);return false;}s->pixels=p;s->pixel_capacity=count;}
         memcpy(s->pixels,o->pixels,bytes);
     }
-    picture_committed(s,o);return true;
+    picture_committed(s,o,s->mse_pending_slot,s->mse_pending_revision);return true;
 }
 static bool hold_video(struct web_avmedia *s) {
     const struct nmedia_output *o=&s->pending;
@@ -421,7 +475,7 @@ static bool present_ahead(struct web_avmedia *s,uint64_t now) {
     uint32_t *previous=s->pixels;size_t capacity=s->pixel_capacity;
     s->pixels=s->ahead_pixels;s->pixel_capacity=s->ahead_capacity;
     s->ahead_pixels=previous;s->ahead_capacity=capacity;s->ahead.pixels=previous;
-    picture_committed(s,&picture);advance_ahead(s);return true;
+    picture_committed(s,&picture,s->ahead_slot,s->ahead_revision);advance_ahead(s);return true;
 }
 /* Called only after taking/owning a VIDEO and before dispatching its next
  * STEP. The child's PTS/BUSY merge has already tried the independent audio
@@ -443,17 +497,44 @@ static bool mse_audio_input_wait(struct web_avmedia *s,uint64_t now){
     /* A future coded audio range, including an intentional timestamp gap,
        keeps demand active so its real PTS can supply PCM/gap completion. */
     if(!audio||!video||horizon<0||s->ahead.pts_ms<horizon)return false;
-    uint32_t queued;if(read(s->fd,&queued,sizeof queued)!=sizeof queued||queued)return false;
+    uint32_t queued;if(!audio_queue(s,&queued,now))return true;if(queued)return false;
     int64_t played=current(s,now);
     if(played!=s->audio_end_ms||s->ahead.pts_ms<=played+5)return false;
     if(!s->starved){s->base_ms=played;s->starved=true;s->ready=1;s->doc->dirty=true;}
     return true;
 }
+static int ready_state(struct web_avmedia *s,uint64_t now) {
+    if(!s || !s->mse_active || s->ready<2)return s?s->ready:0;
+    /* MSE's buffered intersection, not paused or one decoder ACK, determines
+       whether the current position has future data. Never advertise an empty
+       or missing selected track as playable. These are the existing native
+       coded-frame ranges; no synthesized samples or time advance is involved. */
+    int64_t at=current(s,now),end=INT64_MAX;
+    bool active=false;
+    for(size_t i=0;i<s->mse_count;i++)if(s->mse[i].used){
+        const struct nmedia_info *info=nmedia_mse_worker_info(s->mse_worker,(unsigned)i);
+        if(!info)return 1;
+        if(!(info->audio&&s->audio_enabled) && !(info->video&&s->video_enabled))continue;
+        active=true;
+        size_t count;const struct nmedia_time_range *ranges=nmedia_mse_worker_ranges_view(s->mse_worker,(unsigned)i,&count);
+        size_t j=0;while(j<count && !(ranges[j].start_ms<=at && at<ranges[j].end_ms))j++;
+        if(j==count)return s->ended?2:1;
+        end=MIN(end,ranges[j].end_ms);
+    }
+    if(!active || s->ended)return 2;
+    if(end<=at)return 2;
+    /* End-of-stream with the remaining interval buffered cannot gain more
+       data by waiting. Live/partial inputs remain HAVE_FUTURE_DATA: a fixed
+       window is not evidence of uninterrupted playback to the end. */
+    if(s->mse_eos && isfinite(s->mse_duration) &&
+       end/1000.0>=s->mse_duration)return 4;
+    return 3;
+}
 static JSValue state(JSContext *ctx, struct web_avmedia *s) {
     JSValue o=JS_NewObject(ctx);
     uint64_t decoded,dropped;video_counts(s,&decoded,&dropped);
     const struct nmedia_info *info=s?information(s):NULL;
-    JS_SetPropertyStr(ctx,o,"readyState",JS_NewInt32(ctx,s?s->ready:0));
+    JS_SetPropertyStr(ctx,o,"readyState",JS_NewInt32(ctx,ready_state(s,uptime_ms())));
     JS_SetPropertyStr(ctx,o,"duration",JS_NewFloat64(ctx,s&&s->mse_active?s->mse_duration:info&&info->duration_ms>=0?info->duration_ms/1000.0:NAN));
     JS_SetPropertyStr(ctx,o,"currentTime",JS_NewFloat64(ctx,s?current(s,uptime_ms())/1000.0:0));
     JS_SetPropertyStr(ctx,o,"paused",JS_NewBool(ctx,!s||!s->playing));
@@ -496,19 +577,33 @@ completed:
     return r;
 }
 static bool mse_prepare_pump(struct web_avmedia *s,uint64_t until,bool cooperative){
-    if(!s->mse_preparing)return false;
-    /* No sink opening or picture presentation in this phase. ACK alone is
-       insufficient: retain the first real decoded data (or actual EOS). */
+    /* Initial preload and resume share the real decoded-output preparation
+       path. A paused element may commit its first frame without opening the
+       audio sink or advancing its retained playback position. */
+    bool initial=s->mse_active && s->ready<2 && !s->playing &&
+        !s->mse_resume_needed && !s->mse_seeking;
+    if(!s->mse_preparing && !initial)return false;
+    /* Resume does not present a future picture. Initial preload may present
+       its first picture below. ACK alone is insufficient in either case. */
     if(nmedia_mse_worker_seeking(s->mse_worker))return true;
     if(!s->pending.kind){int r=mse_next(s,&s->pending,until,cooperative);s->audio_at=0;
         if(r==NMEDIA_VIDEO)s->video_frames++;
         if(r==NMSW_BUSY||r==NMEDIA_AGAIN)return true;
         if(r==NMEDIA_ERROR){s->mse_preparing=false;s->playing=false;close_audio(s);s->doc->dirty=true;return true;}
     }
-    if(s->pending.kind==NMEDIA_AUDIO||s->pending.kind==NMEDIA_VIDEO||s->pending.kind==NMSW_CLOCK){s->ready=2;s->starved=false;}
+    if(s->pending.kind==NMEDIA_AUDIO||s->pending.kind==NMEDIA_VIDEO||s->pending.kind==NMSW_CLOCK){
+        s->ready=2;s->starved=false;
+        /* Keep initial PCM as the existing decoder loan until playback, with
+           no sink opening, time advance, or silent substitute samples. A real
+           first picture can be committed while the loaded element is paused. */
+        if(initial && s->pending.kind==NMEDIA_VIDEO){
+            if(!present(s)){s->mse_preparing=false;s->doc->dirty=true;return true;}
+            s->pending.kind=0;
+        }
+    }
     s->mse_preparing=false;
     if(cooperative){if(debug_transitions)s->transition_pending="mse-resume-prepared";}
-    else transition(s,"mse-resume-prepared",s->generation);
+    else if(!initial)transition(s,"mse-resume-prepared",s->generation);
     return true;
 }
 static int range_next(struct web_avmedia *s,struct nmedia_output *out,struct nmedia_worker_budget *b){
@@ -571,7 +666,10 @@ static JSValue mse_call(JSContext *ctx,struct web_avmedia *s,const char *op,int 
         double seconds;if(!argc||JS_ToFloat64(ctx,&seconds,argv[0])<0)return JS_EXCEPTION;
         if(isnan(seconds)||seconds<0||(isfinite(seconds)&&seconds>1e9))return JS_ThrowRangeError(ctx,"invalid MSE duration");
         if(isfinite(seconds))for(size_t i=0;i<s->mse_count;i++)if(s->mse[i].used){size_t count;const struct nmedia_time_range *ranges=nmedia_mse_worker_ranges_view(s->mse_worker,(unsigned)i,&count);
-            if(count&&ranges[count-1].end_ms>seconds*1000){JSValue result=mse_queue(ctx,s,NMSW_REMOVE,i,NULL,0,0,(int64_t)(seconds*1000),INT64_MAX,false);if(JS_IsException(result))return result;}}
+            /* Compare in the same seconds representation exposed by buffered.
+               Multiplying that rounded double back into milliseconds could
+               turn an unchanged EOS duration into a spurious 1ms removal. */
+            if(count&&ranges[count-1].end_ms/1000.0>seconds){JSValue result=mse_queue(ctx,s,NMSW_REMOVE,i,NULL,0,0,(int64_t)ceil(seconds*1000.0),INT64_MAX,false);if(JS_IsException(result))return result;}}
         s->mse_duration=seconds;return JS_TRUE;
     }
     if(!strcmp(op,"mseEnd")||!strcmp(op,"mseReopen")){
@@ -658,6 +756,50 @@ static JSValue avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *o
         const char *type=argc?JS_ToCString(ctx,argv[0]):NULL;
         if(!type&&argc)return JS_EXCEPTION;
         JSValue result=JS_NewString(ctx,nmedia_can_play_type(type));JS_FreeCString(ctx,type);return result;
+    }
+    if(!strcmp(op,"decodingPerformance")){
+        if(argc<5)return JS_ThrowTypeError(ctx,"Native decoding configuration required");
+        const char *type=JS_ToCString(ctx,argv[0]);if(!type)return JS_EXCEPTION;
+        double width,height,rate,bitrate;
+        if(JS_ToFloat64(ctx,&width,argv[1])<0||JS_ToFloat64(ctx,&height,argv[2])<0||JS_ToFloat64(ctx,&rate,argv[3])<0||JS_ToFloat64(ctx,&bitrate,argv[4])<0){JS_FreeCString(ctx,type);return JS_EXCEPTION;}
+        struct nmedia_video_configuration configuration;bool known=nmedia_performance_codec(type,&configuration),video_requested=!!*type;
+        if(!isfinite(bitrate)||bitrate<=0||bitrate>9007199254740991.0||floor(bitrate)!=bitrate)known=false;
+        else configuration.bitrate=(uint64_t)bitrate;
+        uint32_t audio_codec=0,audio_profile=0;double channels=0,samplerate=0;bool audio_requested=argc>=8,audio_known=false;
+        if(audio_requested){const char *audio_type=JS_ToCString(ctx,argv[5]);if(!audio_type){JS_FreeCString(ctx,type);return JS_EXCEPTION;}
+            audio_known=nmedia_performance_audio(audio_type,&audio_codec,&audio_profile);JS_FreeCString(ctx,audio_type);
+            if(JS_ToFloat64(ctx,&channels,argv[6])<0||JS_ToFloat64(ctx,&samplerate,argv[7])<0){JS_FreeCString(ctx,type);return JS_EXCEPTION;}
+        }
+        uint64_t now=uptime_ms();bool smooth=false;
+        if(d&&(audio_requested||video_requested)&&(!video_requested||(known&&isfinite(rate)&&rate>0&&isfinite(width)&&isfinite(height)&&width>0&&height>0))){
+            for(struct web_avmedia *sample=streams;sample;sample=sample->next){
+                if(sample->doc!=d)continue;
+                double work=0;
+                if(video_requested){if(sample->performance_generation!=sample->generation||
+                   sample->performance_width!=width||sample->performance_height!=height||
+                   !sample->performance_measurement_id||!nmedia_video_configuration_equal(&sample->performance_configuration,&configuration)||sample->performance_frames<32||
+                   !sample->performance_work_ms||now<sample->performance_at||now-sample->performance_at>60000)continue;
+                if(sample->mse_active&&(sample->performance_slot<0||
+                   sample->performance_revision!=nmedia_mse_worker_revision(sample->mse_worker,(unsigned)sample->performance_slot)))continue;
+                work=(double)sample->performance_work_ms/(double)sample->performance_frames*rate;
+                uint64_t measured_bitrate=sample->performance_configuration.bitrate;
+                if(measured_bitrate&&bitrate>measured_bitrate)work*=bitrate/(double)measured_bitrate;
+                }
+                if(audio_requested){const struct nmedia_audio_observation *a=&sample->performance_audio;
+                    if(!audio_known||sample->performance_audio_generation!=sample->generation||!a->id||a->frames<SOUND_RATE||
+                       a->codec!=audio_codec||a->profile!=audio_profile||a->channels!=channels||a->rate!=samplerate||
+                       !a->work_ms||now<sample->performance_audio_at||now-sample->performance_audio_at>60000)continue;
+                    if(sample->mse_active&&(sample->performance_audio_slot<0||sample->performance_audio_revision!=
+                       nmedia_mse_worker_revision(sample->mse_worker,(unsigned)sample->performance_audio_slot)))continue;
+                    work+=(double)a->work_ms*SOUND_RATE/(double)a->frames;
+                }
+                /* Actual decoder+conversion work, with coarse-clock upper
+                   rounding and 50% headroom for audio/compositor scheduling.
+                   Unknown profiles/resolutions are not inferred as fast. */
+                if(work<=500.0){smooth=true;break;}
+            }
+        }
+        JS_FreeCString(ctx,type);return JS_NewBool(ctx,smooth);
     }
     if(!media_node(n)||!d)return JS_ThrowTypeError(ctx,"HTMLMediaElement receiver required");
     if(n->owner!=d && (!n->owner || n->owner->dom_family!=d))return JS_ThrowTypeError(ctx,"foreign document media receiver");
@@ -796,6 +938,14 @@ JSValue web_avmedia_call(JSContext *ctx,web_doc *d,node_t *n,const char *op,int 
 }
 static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool cooperative){
     if(uptime_ms()>=mse_until)return;
+    if(s->audio_clock_failed){audio_failed(s,now);return;}
+    /* An input-starved MSE child with no command/lane/output is asleep until
+       APPEND/KEYS/seek/control revives demand. Re-reading its three pipes and
+       the empty audio sink cannot produce data, and makes every unrelated
+       author/layout checkpoint pay for the same exhausted packet cursor. */
+    if(s->mse_active&&nmedia_mse_worker_running(s->mse_worker)&&
+       !nmedia_mse_worker_needs_service(s->mse_worker)&&!s->pending.kind&&!s->ahead.kind&&
+       !s->mse_preparing&&!s->mse_seeking)return;
     struct nmedia_worker_budget range_budget={.until=mse_until,.tx_bytes=65536,.nonblocking=cooperative};
     if(s->url_input&&s->error[0]){if(s->worker)range_failed(s,s->error);return;}
     if(!cooperative&&s->url_input&&s->range_waiting&&!s->worker){
@@ -827,7 +977,14 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
                 s->mse[i].revision_seen=revision;
             }s->mse[i].audio_owner=info&&info->audio;
         }
-        if(!s->ready)for(size_t i=0;i<s->mse_count;i++)if(nmedia_mse_worker_info(s->mse_worker,(unsigned)i)){s->ready=1;break;}
+        if(!s->ready){
+            bool initialized=false,complete=true;
+            for(size_t i=0;i<s->mse_count;i++)if(s->mse[i].used){
+                initialized=true;
+                if(!nmedia_mse_worker_info(s->mse_worker,(unsigned)i)){complete=false;break;}
+            }
+            if(initialized&&complete)s->ready=1;
+        }
         /* The SEEK ACK only moves packet cursors. An unbuffered seek still
            needs appended bytes and real decoded output before seeked. */
         if(s->mse_seeking&&nmedia_mse_worker_seeking(s->mse_worker))return;
@@ -835,6 +992,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
         /* A paused loaded element services append/remove/abort ACKs above,
            but must not consume decoder output behind the retained position. */
         if(s->mse_resume_needed&&!s->playing)return;
+        if(!s->playing && s->ready>=2 && !s->mse_seeking)return;
     }
     /* Owned pictures already due on the real media clock do not depend on
        another decoder response. BUSY/AGAIN below can persist after the last
@@ -855,7 +1013,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
         if(r==NMEDIA_ERROR){s->base_ms=current(s,now);s->playing=false;close_audio(s);s->ready=0;s->doc->dirty=true;return;}
         if(r==NMSW_BUSY)return;
         if(r==NMEDIA_AGAIN){
-            uint32_t queued=0;if(s->fd>=0)read(s->fd,&queued,4);
+            uint32_t queued=0;if(!audio_queue(s,&queued,now))return;
             if(!queued&&!s->starved){s->base_ms=current(s,now);s->starved=true;s->ready=1;s->doc->dirty=true;}return;
         }
         if(r==NMEDIA_AUDIO||r==NMEDIA_VIDEO||r==NMSW_CLOCK){
@@ -912,7 +1070,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
         if(!s->pending.kind){int r=s->mse_active?mse_next(s,&s->pending,mse_until,cooperative):s->worker?range_next(s,&s->pending,&range_budget):nmedia_step(s->decoder,&s->pending);s->audio_at=0;s->rate_owned=false;
             if(r==NMEDIA_VIDEO)s->video_frames++;
             if(r==NMSW_BUSY)return;
-            if(r==NMEDIA_AGAIN){if(s->mse_active){uint32_t queued=0;if(s->fd>=0)read(s->fd,&queued,4);if(!queued){s->base_ms=current(s,now);s->starved=true;s->ready=1;s->doc->dirty=true;}}return;}
+            if(r==NMEDIA_AGAIN){if(s->mse_active){uint32_t queued=0;if(!audio_queue(s,&queued,now))return;if(!queued){s->base_ms=current(s,now);s->starved=true;s->ready=1;s->doc->dirty=true;}}return;}
             if(r==NMEDIA_ERROR){if(s->worker){range_failed(s,nmedia_worker_error(s->worker));return;}if(!s->mse_active)strlcpy(s->error,nmedia_error(s->decoder),sizeof s->error);s->base_ms=current(s,now);s->playing=false;close_audio(s);s->doc->dirty=true;return;}
             if(r==NMEDIA_AUDIO||r==NMEDIA_VIDEO)s->ready=s->url_input||s->mse_active?2:4;
         }
@@ -942,12 +1100,19 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
             if(!present(s)){s->base_ms=current(s,now);s->playing=false;close_audio(s);s->doc->dirty=true;return;}
             s->pending.kind=0;
         }else if(s->pending.kind==NMEDIA_AUDIO){
+            if(!s->rate_owned){const struct nmedia_audio_observation *a=&s->pending.audio_observation;
+                if(a->id&&a->frames&&a->work_ms){
+                    if(s->performance_audio.id!=a->id||s->performance_audio.frames!=a->frames)s->performance_audio_at=uptime_ms();
+                    s->performance_audio=*a;s->performance_audio_generation=s->generation;
+                    s->performance_audio_slot=s->mse_pending_slot;s->performance_audio_revision=s->mse_pending_revision;
+                }else memset(&s->performance_audio,0,sizeof s->performance_audio);
+            }
             if(s->rate_decoder&&!s->rate_owned){
                 if(!nmedia_rate_push(s->rate_decoder,&s->pending)){strlcpy(s->error,"native PCM tempo input failed",sizeof s->error);s->playing=false;close_audio(s);return;}
                 s->pending.kind=0;continue;
             }
             if(s->fd<0&&s->pending.pts_ms>current(s,now)+100)return;
-            if(s->fd>=0){uint32_t queued=0;if(read(s->fd,&queued,4)!=4||queued>=WEB_AUDIO_TARGET)return;
+            if(s->fd>=0){uint32_t queued=0;if(!audio_queue(s,&queued,now)||queued>=WEB_AUDIO_TARGET)return;
                 if(s->pending.frames>4096||s->audio_at>s->pending.frames){strlcpy(s->error,"invalid native audio span",sizeof s->error);s->playing=false;close_audio(s);return;}
                 int gap=audio_fill_gap(s,queued);
                 if(gap<0){s->base_ms=current(s,now);s->playing=false;close_audio(s);return;}
@@ -972,7 +1137,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
                 if(result==NMEDIA_ERROR){strlcpy(s->error,"native PCM tempo tail failed",sizeof s->error);s->playing=false;close_audio(s);return;}
                 s->pending.kind=NMEDIA_END;
             }
-            struct n_audio_status status={0};if(s->fd>=0)read(s->fd,&status,sizeof status);if(status.queued_frames||status.device_pending_frames)return;
+            struct n_audio_status status={0};if(s->fd>=0){ssize_t bytes=read(s->fd,&status,sizeof status);if(bytes!=sizeof status&&bytes!=sizeof(uint32_t)){audio_failed(s,now);return;}}if(status.queued_frames||status.device_pending_frames)return;
             s->starved=false; /* Confirmed EOF is not a waiting-for-input gap. */
             if(s->ahead.kind){
                 /* Actual decoder EOF and a drained PCM sink, not starvation:
@@ -1002,6 +1167,7 @@ static void pump(struct web_avmedia *s,uint64_t now,uint64_t until,bool cooperat
     uint64_t start=debug_transitions?uptime_ms():0;
     if(debug_transitions){s->profile_pumps++;s->profile_services+=cooperative;if(s->profile_pump_at&&start>=s->profile_pump_at)s->profile_pump_gap=MAX(s->profile_pump_gap,start-s->profile_pump_at);s->profile_pump_at=start;}
     bool playing=s->playing,preparing=s->mse_preparing;pump_impl(s,now,until,cooperative);
+    if(s->audio_clock_failed)audio_failed(s,now);
     s->clock_snapshot_enabled=false;s->clock_snapshot_valid=false;
     if(debug_transitions)s->profile_pump_ms+=uptime_ms()-start;
     if(playing&&!s->playing)clear_ahead(s);
@@ -1124,6 +1290,7 @@ void web_avmedia_checkpoint(void){
 void web_avmedia_snapshot_begin(web_doc *d) {
     web_avmedia_enter();snapshot_document=d;snapshot_candidate=NULL;
     snapshot_phase=0;snapshot_rejected=false;
+    nmedia_ff_free(snapshot_regions);snapshot_regions=NULL;snapshot_region_count=snapshot_region_capacity=0;
     for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d)s->snapshot.valid=false;
 }
 void web_avmedia_layout_begin(web_doc *d){
@@ -1135,6 +1302,29 @@ void web_avmedia_layout_begin(web_doc *d){
     (void)d;
 }
 void web_avmedia_snapshot_reject(void) {if(snapshot_document)snapshot_rejected=true;}
+void web_avmedia_snapshot_reject_region(const canvas_t *c,int x,int y,int w,int h){
+    if(!snapshot_document||snapshot_rejected||w<=0||h<=0)return;
+    if(!c){snapshot_rejected=true;return;}
+    struct snapshot_region r={MAX((int64_t)x,c->cx0),MAX((int64_t)y,c->cy0),
+        MIN((int64_t)x+w,c->cx1),MIN((int64_t)y+h,c->cy1)};
+    if(r.x0>=r.x1||r.y0>=r.y1)return;
+    if(snapshot_phase){
+        if(!snapshot_candidate){snapshot_rejected=true;return;}
+        r.x0+=snapshot_candidate->snapshot.x;r.x1+=snapshot_candidate->snapshot.x;
+        r.y0+=snapshot_candidate->snapshot.y;r.y1+=snapshot_candidate->snapshot.y;
+    }
+    if(snapshot_candidate){if(snapshot_region_intersects(&r,snapshot_candidate))snapshot_rejected=true;return;}
+    /* A risky layer may precede the video in paint order. Retain only its
+       clipped extent until the candidate is known, not a page-wide rejection
+       or a second DOM tree. Capacity follows actual paint occurrences. */
+    if(snapshot_region_count==snapshot_region_capacity){
+        size_t n=snapshot_region_capacity?snapshot_region_capacity*2:8;
+        if(n<snapshot_region_capacity||n>SIZE_MAX/sizeof *snapshot_regions){snapshot_rejected=true;return;}
+        struct snapshot_region *v=nmedia_ff_realloc(snapshot_regions,n*sizeof *v);
+        if(!v){snapshot_rejected=true;return;}snapshot_regions=v;snapshot_region_capacity=n;
+    }
+    snapshot_regions[snapshot_region_count++]=r;
+}
 bool web_avmedia_snapshot_prepare(web_doc *d,canvas_t *c,canvas_t *probe,
                                  int *x,int *y,int scroll_x,int scroll_y) {
     struct web_avmedia *s=snapshot_candidate;
@@ -1181,11 +1371,17 @@ void web_avmedia_snapshot_finish(void) {
     for(struct web_avmedia *p=streams;p;p=p->next)
         if(p->doc==snapshot_document && (p!=s || !p->snapshot.valid))snapshot_clear(p);
     snapshot_candidate=NULL;snapshot_document=NULL;snapshot_phase=0;web_avmedia_leave();
+    nmedia_ff_free(snapshot_regions);snapshot_regions=NULL;snapshot_region_count=snapshot_region_capacity=0;
 }
 void web_avmedia_background(uint64_t now){nmedia_worker_background(now);nmedia_mse_worker_background(now);}
 int64_t web_avmedia_background_deadline(uint64_t now){int64_t a=nmedia_worker_deadline(now),b=nmedia_mse_worker_deadline(now);return a<0?b:b<0?a:MIN(a,b);}
 int64_t web_avmedia_deadline(web_doc *d,uint64_t now){
-    for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d&&(s->playing||s->range_waiting))return (int64_t)now+10;
+    for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d&&(s->playing||s->range_waiting)){
+        if(s->mse_active&&nmedia_mse_worker_running(s->mse_worker)&&
+           !nmedia_mse_worker_needs_service(s->mse_worker)&&!s->pending.kind&&!s->ahead.kind&&
+           !s->mse_preparing&&!s->mse_seeking)continue;
+        return (int64_t)now+10;
+    }
     return -1;
 }
 void web_avmedia_free(web_doc *d){
@@ -1283,6 +1479,7 @@ bool web_avmedia_paint(web_doc *d,node_t *n,canvas_t *c,int x,int y,int w,int h)
             snapshot_candidate=s;
             s->snapshot.x=(int)x0;s->snapshot.y=(int)y0;s->snapshot.w=(int)(x1-x0);s->snapshot.h=(int)(y1-y0);
             s->snapshot.video_x=x;s->snapshot.video_y=y;s->snapshot.video_w=w;s->snapshot.video_h=h-strip;
+            for(size_t i=0;i<snapshot_region_count;i++)if(snapshot_region_intersects(&snapshot_regions[i],s)){snapshot_rejected=true;break;}
         }
     }
     if(s && s==snapshot_candidate && snapshot_phase)

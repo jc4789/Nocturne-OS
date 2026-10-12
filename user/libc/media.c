@@ -17,6 +17,7 @@
 #include "libavutil/mem.h"
 #include "libavutil/samplefmt.h"
 #include "libavutil/pixfmt.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/dict.h"
 #include "libswresample/swresample.h"
 #include <emmintrin.h>
@@ -40,6 +41,13 @@ struct nmedia {
     int64_t video_loan_pts;
     int64_t video_present_ms;bool video_present_set;
     uint64_t video_decoded,video_dropped;
+    uint64_t video_measured_frames,video_work_ms,video_decode_work,video_late_work;
+    int video_measure_width,video_measure_height,video_measure_format,video_measure_space,video_measure_range;
+    uint64_t video_measurement_id;
+    struct nmedia_video_configuration video_configuration;
+    struct nmedia_video_configuration video_late_configuration;
+    struct nmedia_audio_observation audio_observation;
+    uint64_t audio_decode_work;
     int16_t samples[4096 * 2];
     uint64_t phase, step;
     int frame_audio, source_rate;
@@ -347,8 +355,18 @@ static int audio_mix(nmedia *m, const AVChannelLayout *layout) {
     if (r < 0) return fail(m, "audio channel layout allocation", r);
     m->mix_valid = true; return 0;
 }
+static uint64_t video_work_add(uint64_t,uint64_t);
+static uint64_t video_work_elapsed(uint64_t);
+static uint64_t video_measurement_next(void);
 static int audio_output(nmedia *m, struct nmedia_output *o) {
     AVFrame *f = m->frame;
+    uint32_t codec=m->audio->codec_id==AV_CODEC_ID_OPUS?NMEDIA_ACODEC_OPUS:m->audio->codec_id==AV_CODEC_ID_VORBIS?NMEDIA_ACODEC_VORBIS:
+        m->audio->codec_id==AV_CODEC_ID_MP3?NMEDIA_ACODEC_MP3:m->audio->codec_id==AV_CODEC_ID_AAC?NMEDIA_ACODEC_AAC:NMEDIA_ACODEC_NONE;
+    uint32_t profile=codec==NMEDIA_ACODEC_AAC?(uint32_t)m->audio->profile:0;
+    if(!m->audio_observation.id||m->audio_observation.codec!=codec||m->audio_observation.profile!=profile||
+       m->audio_observation.channels!=(uint32_t)f->ch_layout.nb_channels||m->audio_observation.rate!=(uint32_t)f->sample_rate)
+        m->audio_observation=(struct nmedia_audio_observation){.id=video_measurement_next(),.codec=codec,.profile=profile,.channels=(uint32_t)f->ch_layout.nb_channels,.rate=(uint32_t)f->sample_rate};
+    uint64_t work_start=uptime_ms();
     int n = 0;
     uint64_t end = (uint64_t)f->nb_samples << 32;
     uint64_t start = m->phase;
@@ -370,51 +388,96 @@ static int audio_output(nmedia *m, struct nmedia_output *o) {
     o->kind = NMEDIA_AUDIO; o->samples = m->samples; o->frames = (size_t)n;
     o->duration_ms=(int64_t)n*1000/SOUND_RATE;
     o->pts_ms = m->audio_pts + (int64_t)((start >> 16) * 1000 / ((uint64_t)m->source_rate << 16));
+    if(n){m->audio_observation.frames=video_work_add(m->audio_observation.frames,(uint64_t)n);
+        m->audio_observation.work_ms=video_work_add(m->audio_observation.work_ms,video_work_add(m->audio_decode_work,video_work_elapsed(work_start)));
+        m->audio_decode_work=0;o->audio_observation=m->audio_observation;}
     if (m->phase >= end) { m->phase -= end; m->frame_audio = 0; av_frame_unref(f); }
     return o->kind;
 }
 static unsigned clamp8(int n) { return (unsigned)(n < 0 ? 0 : n > 255 ? 255 : n); }
+struct video_matrix {int yc,rv,gu,gv,bu;};
+static bool video_matrix(enum AVColorSpace space,bool full,struct video_matrix *m){
+    if(space==AVCOL_SPC_BT709)*m=full?(struct video_matrix){256,403,48,120,475}:(struct video_matrix){298,459,55,136,541};
+    else if(space==AVCOL_SPC_FCC)*m=full?(struct video_matrix){256,358,85,182,456}:(struct video_matrix){298,408,97,207,519};
+    else if(space==AVCOL_SPC_SMPTE240M)*m=full?(struct video_matrix){256,403,58,122,467}:(struct video_matrix){298,459,66,139,532};
+    else if(space==AVCOL_SPC_UNSPECIFIED||space==AVCOL_SPC_BT470BG||space==AVCOL_SPC_SMPTE170M)
+        *m=full?(struct video_matrix){256,359,88,183,454}:(struct video_matrix){298,409,100,208,516};
+    else return false;
+    return true;
+}
 static __m128i video_mul4(__m128i value,int coefficient,bool high){
     __m128i zero=_mm_setzero_si128();
     return _mm_madd_epi16(high?_mm_unpackhi_epi16(value,zero):_mm_unpacklo_epi16(value,zero),_mm_set1_epi32(coefficient));
 }
-static __m128i video_channel(__m128i y,__m128i u,__m128i v,int yc,int uc,int vc){
+static __m128i video_channel(__m128i y,__m128i u,__m128i v,int yc,int uc,int vc,int depth){
     __m128i lo=_mm_add_epi32(video_mul4(y,yc,false),_mm_add_epi32(video_mul4(u,uc,false),video_mul4(v,vc,false)));
     __m128i hi=_mm_add_epi32(video_mul4(y,yc,true),_mm_add_epi32(video_mul4(u,uc,true),video_mul4(v,vc,true)));
-    lo=_mm_srai_epi32(_mm_add_epi32(lo,_mm_set1_epi32(128)),8);
-    hi=_mm_srai_epi32(_mm_add_epi32(hi,_mm_set1_epi32(128)),8);
+    if(depth==16){
+        /* pmaddwd treats input words as signed. Restore Y's unsigned high
+           bit without narrowing its precision; centered chroma is signed. */
+        __m128i high=_mm_cmpgt_epi16(_mm_setzero_si128(),y),bias=_mm_set1_epi32(yc*65536);
+        lo=_mm_add_epi32(lo,_mm_and_si128(_mm_unpacklo_epi16(high,high),bias));
+        hi=_mm_add_epi32(hi,_mm_and_si128(_mm_unpackhi_epi16(high,high),bias));
+    }
+    __m128i rounding=_mm_set1_epi32(1<<(depth-1)),shift=_mm_cvtsi32_si128(depth);
+    lo=_mm_sra_epi32(_mm_add_epi32(lo,rounding),shift);
+    hi=_mm_sra_epi32(_mm_add_epi32(hi,rounding),shift);
     return _mm_packus_epi16(_mm_packs_epi32(lo,hi),_mm_setzero_si128());
 }
 /* Baseline x86-64 SSE2, not AVX or an external thread backend. Loads touch
    only complete eight-pixel groups; the existing scalar tail handles width
    and chroma oddities. Signed row strides and all existing color coefficients
    are preserved exactly. */
-static int video_yuv_row(AVFrame *f,int row,int w,int sx,int sy,bool full,bool bt709,uint32_t *out){
+static int video_yuv_row(AVFrame *f,int row,int w,int sx,int sy,int depth,bool full,const struct video_matrix *matrix,uint32_t *out){
     const uint8_t *yp=f->data[0]+(ptrdiff_t)row*f->linesize[0];
     const uint8_t *up=f->data[1]+(ptrdiff_t)(row>>sy)*f->linesize[1];
     const uint8_t *vp=f->data[2]+(ptrdiff_t)(row>>sy)*f->linesize[2];
-    __m128i zero=_mm_setzero_si128(),center=_mm_set1_epi16(128),alpha=_mm_set1_epi8(-1);
-    int yc=full?256:298,rv=full?(bt709?403:359):(bt709?459:409);
-    int gu=full?(bt709?48:88):(bt709?55:100),gv=full?(bt709?120:183):(bt709?136:208);
-    int bu=full?(bt709?475:454):(bt709?541:516),x=0;
+    __m128i zero=_mm_setzero_si128(),center=_mm_set1_epi16(1<<(depth-1)),alpha=_mm_set1_epi8(-1);
+    int yc=matrix->yc,rv=matrix->rv,gu=matrix->gu,gv=matrix->gv,bu=matrix->bu,x=0;
     for(;w-x>=8;x+=8){
-        __m128i y=_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(yp+x)),zero),u,v;
-        if(sx){
+        __m128i y,u,v;
+        if(depth>8){
+            y=_mm_loadu_si128((const __m128i *)(yp+2*(ptrdiff_t)x));
+            if(sx){u=_mm_loadl_epi64((const __m128i *)(up+2*(ptrdiff_t)(x>>sx)));v=_mm_loadl_epi64((const __m128i *)(vp+2*(ptrdiff_t)(x>>sx)));u=_mm_unpacklo_epi16(u,u);v=_mm_unpacklo_epi16(v,v);}
+            else {u=_mm_loadu_si128((const __m128i *)(up+2*(ptrdiff_t)x));v=_mm_loadu_si128((const __m128i *)(vp+2*(ptrdiff_t)x));}
+        }else if(sx){
+            y=_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(yp+x)),zero);
             uint32_t a,b;memcpy(&a,up+(x>>sx),4);memcpy(&b,vp+(x>>sx),4);
             u=_mm_unpacklo_epi8(_mm_cvtsi32_si128((int)a),zero);v=_mm_unpacklo_epi8(_mm_cvtsi32_si128((int)b),zero);
             u=_mm_unpacklo_epi16(u,u);v=_mm_unpacklo_epi16(v,v);
         }else{
+            y=_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(yp+x)),zero);
             u=_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(up+x)),zero);
             v=_mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i *)(vp+x)),zero);
         }
         u=_mm_sub_epi16(u,center);v=_mm_sub_epi16(v,center);
-        if(!full)y=_mm_max_epi16(_mm_sub_epi16(y,_mm_set1_epi16(16)),zero);
-        __m128i r=video_channel(y,u,v,yc,0,rv),g=video_channel(y,u,v,yc,-gu,-gv),b=video_channel(y,u,v,yc,bu,0);
+        if(!full)y=_mm_subs_epu16(y,_mm_set1_epi16(16<<(depth-8)));
+        __m128i r=video_channel(y,u,v,yc,0,rv,depth),g=video_channel(y,u,v,yc,-gu,-gv,depth),b=video_channel(y,u,v,yc,bu,0,depth);
         __m128i bg=_mm_unpacklo_epi8(b,g),ra=_mm_unpacklo_epi8(r,alpha);
         _mm_storeu_si128((__m128i *)(out+x),_mm_unpacklo_epi16(bg,ra));
         _mm_storeu_si128((__m128i *)(out+x+4),_mm_unpackhi_epi16(bg,ra));
     }
+    for(;x<w;x++){
+        int yy,u,v;
+        if(depth>8){uint16_t a,b,c;memcpy(&a,yp+2*(ptrdiff_t)x,2);memcpy(&b,up+2*(ptrdiff_t)(x>>sx),2);memcpy(&c,vp+2*(ptrdiff_t)(x>>sx),2);yy=a;u=(int)b-(1<<(depth-1));v=(int)c-(1<<(depth-1));}
+        else {yy=yp[x];u=(int)up[x>>sx]-128;v=(int)vp[x>>sx]-128;}
+        int c=yc*(full?yy:MAX(yy-(16<<(depth-8)),0)),rounding=1<<(depth-1);
+        int r=(c+rv*v+rounding)>>depth,g=(c-gu*u-gv*v+rounding)>>depth,b=(c+bu*u+rounding)>>depth;
+        out[x]=0xff000000u|clamp8(r)<<16|clamp8(g)<<8|clamp8(b);
+    }
     return x;
+}
+static bool video_plane_valid(AVFrame *f,unsigned plane,int rows,size_t row_bytes){
+    if(!f->data[plane]||rows<=0)return false;
+    int64_t stride=f->linesize[plane],size=stride<0?-stride:stride;
+    if((uint64_t)size<row_bytes||(uint64_t)size>(uint64_t)PTRDIFF_MAX/(unsigned)rows)return false;
+    AVBufferRef *owner=av_frame_get_plane_buffer(f,(int)plane);if(!owner)return false;
+    uintptr_t data=(uintptr_t)f->data[plane],base=(uintptr_t)owner->data;
+    uint64_t extent=(uint64_t)size*(unsigned)(rows-1);uintptr_t low=data,high=data;
+    if(stride<0){if(extent>data)return false;low-=extent;}
+    else {if(extent>UINTPTR_MAX-high)return false;high+=(uintptr_t)extent;}
+    if(row_bytes>UINTPTR_MAX-high||owner->size>UINTPTR_MAX-base)return false;high+=row_bytes;
+    return low>=base&&high<=base+owner->size;
 }
 static int64_t video_stamp(nmedia *m,AVFrame *f){
     AVStream *stream=m->format->streams[m->video_index];
@@ -450,31 +513,22 @@ static int video_output(nmedia *m,AVFrame *f,int64_t pts,struct nmedia_output *o
         m->pixels = p; m->pixel_capacity = count;
     }
     bool full = f->color_range == AVCOL_RANGE_JPEG || format == AV_PIX_FMT_YUVJ420P || format == AV_PIX_FMT_YUVJ422P || format == AV_PIX_FMT_YUVJ444P;
-    bool bt709 = f->colorspace == AVCOL_SPC_BT709;
+    struct video_matrix matrix;
+    if(yuv&&!video_matrix(f->colorspace,full,&matrix))return fail(m,"unsupported YUV color matrix",AVERROR(ENOSYS));
     int sx = high444||format == AV_PIX_FMT_YUV444P || format == AV_PIX_FMT_YUVJ444P ? 0 : 1;
     int sy = high420||format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P ? 1 : 0;
+    unsigned sample_bytes=depth>8?2:1;
+    if(yuv){
+        size_t cw=((size_t)w+(1u<<sx)-1)>>sx;int ch=(h+(1<<sy)-1)>>sy;
+        if(!video_plane_valid(f,0,h,(size_t)w*sample_bytes)||!video_plane_valid(f,1,ch,cw*sample_bytes)||!video_plane_valid(f,2,ch,cw*sample_bytes))
+            return fail(m,"invalid decoded YUV plane ownership/stride",AVERROR(EINVAL));
+    }else {unsigned packed=format==AV_PIX_FMT_GRAY8?1:format==AV_PIX_FMT_RGB24||format==AV_PIX_FMT_BGR24?3:4;
+        if(!video_plane_valid(f,0,h,(size_t)w*packed))return fail(m,"invalid decoded packed plane ownership/stride",AVERROR(EINVAL));}
     for (int y = 0; y < h; y++) {
-      int x=yuv&&depth==8?video_yuv_row(f,y,w,sx,sy,full,bt709,m->pixels+(size_t)y*w):0;
+      int x=yuv?video_yuv_row(f,y,w,sx,sy,depth,full,&matrix,m->pixels+(size_t)y*w):0;
       for (; x < w; x++) {
         int r, g, b;
-        if (yuv) {
-            int yy = f->data[0][(ptrdiff_t)y * f->linesize[0] + x];
-            int u = f->data[1][(ptrdiff_t)(y >> sy) * f->linesize[1] + (x >> sx)] - 128;
-            int v = f->data[2][(ptrdiff_t)(y >> sy) * f->linesize[2] + (x >> sx)] - 128;
-            if(depth>8){
-                uint16_t a,b,c;memcpy(&a,f->data[0]+(ptrdiff_t)y*f->linesize[0]+2*(ptrdiff_t)x,2);
-                memcpy(&b,f->data[1]+(ptrdiff_t)(y>>sy)*f->linesize[1]+2*(ptrdiff_t)(x>>sx),2);
-                memcpy(&c,f->data[2]+(ptrdiff_t)(y>>sy)*f->linesize[2]+2*(ptrdiff_t)(x>>sx),2);
-                /* Full integer range maps to the physical 8-bit surface;
-                   rounding is applied only once, before the existing matrix. */
-                unsigned maximum=(1u<<depth)-1;yy=(int)(((uint32_t)a*255+maximum/2)/maximum);
-                u=(int)(((uint32_t)b*255+maximum/2)/maximum)-128;v=(int)(((uint32_t)c*255+maximum/2)/maximum)-128;
-            }
-            int c = full ? 256 * yy : 298 * MAX(yy - 16, 0);
-            r = (c + (full ? bt709 ? 403 : 359 : bt709 ? 459 : 409) * v + 128) >> 8;
-            g = (c - (full ? bt709 ? 48 : 88 : bt709 ? 55 : 100) * u - (full ? bt709 ? 120 : 183 : bt709 ? 136 : 208) * v + 128) >> 8;
-            b = (c + (full ? bt709 ? 475 : 454 : bt709 ? 541 : 516) * u + 128) >> 8;
-        } else if (format == AV_PIX_FMT_GRAY8) r = g = b = f->data[0][(ptrdiff_t)y * f->linesize[0] + x];
+        if (format == AV_PIX_FMT_GRAY8) r = g = b = f->data[0][(ptrdiff_t)y * f->linesize[0] + x];
         else {
             int bytes = format == AV_PIX_FMT_RGB24 || format == AV_PIX_FMT_BGR24 ? 3 : 4;
             const uint8_t *p = f->data[0] + (ptrdiff_t)y * f->linesize[0] + (ptrdiff_t)x * bytes;
@@ -492,14 +546,63 @@ static int video_output(nmedia *m,AVFrame *f,int64_t pts,struct nmedia_output *o
     if(o->duration_ms<=0){AVRational rate=stream->avg_frame_rate;if(rate.num>0&&rate.den>0)o->duration_ms=av_rescale_q(1,av_inv_q(rate),(AVRational){1,1000});}
     av_frame_unref(f); return o->kind;
 }
-static int video_return(nmedia *m,AVFrame *f,int64_t pts,struct nmedia_output *o){
+static uint64_t video_work_add(uint64_t a,uint64_t b){return b>UINT64_MAX-a?UINT64_MAX:a+b;}
+static uint64_t video_measurement_next(void){static uint64_t serial;return __atomic_add_fetch(&serial,1,__ATOMIC_RELAXED);}
+static struct nmedia_video_configuration video_configuration(nmedia *m,AVFrame *f){
+    struct nmedia_video_configuration c={.profile=UINT32_MAX,.level=UINT32_MAX,.compatibility=UINT32_MAX};
+    const AVPixFmtDescriptor *desc=av_pix_fmt_desc_get(f->format);if(desc)c.depth=desc->comp[0].depth;
+    if(m->video->bit_rate>0)c.bitrate=(uint64_t)m->video->bit_rate;
+    if(m->video->codec_id==AV_CODEC_ID_H264)c.codec=NMEDIA_VCODEC_AVC;
+    else if(m->video->codec_id==AV_CODEC_ID_HEVC)c.codec=NMEDIA_VCODEC_HEVC;
+    else if(m->video->codec_id==AV_CODEC_ID_VP8){c.codec=NMEDIA_VCODEC_VP8;c.profile=c.level=c.compatibility=0;}
+    else if(m->video->codec_id==AV_CODEC_ID_VP9)c.codec=NMEDIA_VCODEC_VP9;
+    if(c.codec!=NMEDIA_VCODEC_VP8){
+        if(m->video->profile>=0)c.profile=(uint32_t)m->video->profile&0xffff;
+        if(m->video->level>=0)c.level=(uint32_t)m->video->level;
+        if(c.codec==NMEDIA_VCODEC_VP9)c.compatibility=c.level=0;
+        if(c.codec==NMEDIA_VCODEC_AVC&&m->video->extradata&&m->video->extradata_size>=4&&m->video->extradata[0]==1)
+            c.compatibility=m->video->extradata[2];
+    }
+    return c;
+}
+static uint64_t video_work_elapsed(uint64_t start){uint64_t now=uptime_ms();return now>=start?video_work_add(now-start,1):UINT64_MAX;}
+static int video_receive(nmedia *m,AVCodecContext *c,AVFrame *f){
+    uint64_t start=uptime_ms();int result=avcodec_receive_frame(c,f);
+    uint64_t *work=c==m->video?&m->video_decode_work:&m->audio_decode_work;
+    *work=video_work_add(*work,video_work_elapsed(start));return result;
+}
+static int video_send(nmedia *m,AVCodecContext *c,const AVPacket *p){
+    uint64_t start=uptime_ms();int result=avcodec_send_packet(c,p);
+    uint64_t *work=c==m->video?&m->video_decode_work:&m->audio_decode_work;
+    *work=video_work_add(*work,video_work_elapsed(start));return result;
+}
+static int video_return(nmedia *m,AVFrame *f,int64_t pts,uint64_t decode_work,struct nmedia_output *o){
+    struct nmedia_video_configuration configuration=f==m->video_late?m->video_late_configuration:video_configuration(m,f);
+    /* A different actual output configuration starts a new prediction sample.
+       No discarded/preroll frame can manufacture a converted-frame count. */
+    if(m->video_measure_width!=f->width||m->video_measure_height!=f->height||m->video_measure_format!=f->format||
+       m->video_measure_space!=f->colorspace||m->video_measure_range!=f->color_range||
+       !m->video_measurement_id||!nmedia_video_configuration_equal(&m->video_configuration,&configuration)){
+        m->video_measured_frames=m->video_work_ms=0;
+        m->video_measure_width=f->width;m->video_measure_height=f->height;m->video_measure_format=f->format;
+        m->video_measure_space=f->colorspace;m->video_measure_range=f->color_range;
+        m->video_configuration=configuration;m->video_measurement_id=video_measurement_next();
+    }
+    m->video_configuration.bitrate=configuration.bitrate;
+    uint64_t start=uptime_ms();
     int result=video_output(m,f,pts,o);
-    if(result==NMEDIA_VIDEO){m->video_seek_ms=-1;m->video_borrowed=true;m->video_loan_pts=pts;}
+    if(result==NMEDIA_VIDEO){
+        m->video_measured_frames=video_work_add(m->video_measured_frames,1);
+        m->video_work_ms=video_work_add(m->video_work_ms,video_work_add(decode_work,video_work_elapsed(start)));
+        o->video_measured_frames=m->video_measured_frames;o->video_work_ms=m->video_work_ms;
+        o->video_measurement_id=m->video_measurement_id;o->video_configuration=m->video_configuration;
+        m->video_seek_ms=-1;m->video_borrowed=true;m->video_loan_pts=pts;
+    }
     return result;
 }
 static int video_candidate(nmedia *m,struct nmedia_output *o){
     if(!m->video_late_set)return NMEDIA_AGAIN;
-    m->video_late_set=false;return video_return(m,m->video_late,m->video_late_pts,o);
+    m->video_late_set=false;return video_return(m,m->video_late,m->video_late_pts,m->video_late_work,o);
 }
 int nmedia_step(nmedia *m, struct nmedia_output *o) {
     if (!m || !o) return NMEDIA_ERROR;
@@ -509,10 +612,11 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
     if (m->frame_audio) return audio_output(m, o);
     for (int budget = 0; budget < 64; budget++) {
         if (m->pending) {
-            int r = avcodec_receive_frame(m->pending, m->frame);
+            int r = video_receive(m,m->pending,m->frame);
             if (r >= 0) {
                 if (m->pending == m->video) {
                     m->video_decoded++;
+                    uint64_t decode_work=m->video_decode_work;m->video_decode_work=0;
                     int64_t pts=video_stamp(m,m->frame);
                     if(m->video_seek_ms>=0&&pts<m->video_seek_ms){av_frame_unref(m->frame);continue;}
                     if(m->video_present_set&&pts<m->video_present_ms){
@@ -522,24 +626,28 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
                         if(!m->video_late_set||pts>m->video_late_pts){
                             if(m->video_late_set)m->video_dropped++;
                             av_frame_unref(m->video_late);av_frame_move_ref(m->video_late,m->frame);
+                            m->video_late_work=video_work_add(decode_work,m->video_late_set?m->video_late_work:0);
                             m->video_late_pts=pts;m->video_late_set=true;
-                        }else{m->video_dropped++;av_frame_unref(m->frame);}
+                            m->video_late_configuration=video_configuration(m,m->video_late);
+                        }else{m->video_late_work=video_work_add(m->video_late_work,decode_work);m->video_dropped++;av_frame_unref(m->frame);}
                         continue;
                     }
-                    if(m->video_late_set){m->video_dropped++;av_frame_unref(m->video_late);m->video_late_set=false;}
-                    return video_return(m,m->frame,pts,o);
+                    if(m->video_late_set){decode_work=video_work_add(decode_work,m->video_late_work);m->video_dropped++;av_frame_unref(m->video_late);m->video_late_set=false;}
+                    return video_return(m,m->frame,pts,decode_work,o);
                 }
                 AVFrame *f = m->frame;
                 if (f->sample_rate < 1000 || f->sample_rate > 384000 || f->ch_layout.nb_channels < 1 || f->ch_layout.nb_channels > 8 || f->nb_samples <= 0 || f->nb_samples > 65536 || av_get_bytes_per_sample((enum AVSampleFormat)f->format) <= 0)
                     return fail(m, "audio frame limits", AVERROR(EINVAL));
-                if (audio_mix(m, &f->ch_layout) < 0) return NMEDIA_ERROR;
+                uint64_t mix_start=uptime_ms();int mix_result=audio_mix(m,&f->ch_layout);
+                m->audio_decode_work=video_work_add(m->audio_decode_work,video_work_elapsed(mix_start));
+                if(mix_result<0)return NMEDIA_ERROR;
                 AVStream *s = m->format->streams[m->audio_index];
                 int64_t stamp = f->best_effort_timestamp;
                 m->audio_pts = stamp == AV_NOPTS_VALUE ? m->audio_clock : av_rescale_q(stamp, s->time_base, (AVRational){1,1000});
                 m->audio_clock = m->audio_pts + (int64_t)f->nb_samples * 1000 / f->sample_rate;
                 if (m->source_rate != f->sample_rate) m->phase = 0;
                 m->source_rate = f->sample_rate; m->step = ((uint64_t)f->sample_rate << 32) / SOUND_RATE;
-                if (m->audio_seek_ms >= 0 && m->audio_clock <= m->audio_seek_ms) { av_frame_unref(f); continue; }
+                if (m->audio_seek_ms >= 0 && m->audio_clock <= m->audio_seek_ms) { m->audio_decode_work=0;av_frame_unref(f); continue; }
                 /* -1 means no seek. Negative pre-roll PTS must not turn that
                  * sentinel into a second trim (Opus -7ms -> lost 288 frames). */
                 if (m->audio_seek_ms >= 0 && m->audio_seek_ms > m->audio_pts) m->phase = (uint64_t)(m->audio_seek_ms - m->audio_pts) * f->sample_rate / 1000 << 32;
@@ -554,7 +662,7 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
             AVCodecContext *c = m->flush == 0 ? m->audio : m->flush == 1 ? m->video : NULL;
             if (m->flush >= 2) {if(m->video_late_set)return video_candidate(m,o);o->kind = NMEDIA_END; return NMEDIA_END; }
             m->flush++;
-            if (c) { int r = avcodec_send_packet(c, NULL); if (r < 0 && r != AVERROR_EOF) return fail(m, "flush", r); m->pending = c; }
+            if (c) { int r = video_send(m,c,NULL); if (r < 0 && r != AVERROR_EOF) return fail(m, "flush", r); m->pending = c; }
             continue;
         }
         int r = m->packet_reader ? m->packet_reader(m->packet_owner,m->packet) : av_read_frame(m->format, m->packet);
@@ -564,7 +672,7 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
         if(m->packet->size<0||m->packet->stream_index<0||(unsigned)m->packet->stream_index>=m->format->nb_streams||
            (m->packet->size&&!m->packet->data)){av_packet_unref(m->packet);return fail(m,"packet representation",AVERROR(EINVAL));}
         AVCodecContext *c = m->packet->stream_index == m->audio_index ? m->audio : m->packet->stream_index == m->video_index ? m->video : NULL;
-        if (c) { r = avcodec_send_packet(c, m->packet); m->pending = c; }
+        if (c) { r = video_send(m,c,m->packet); m->pending = c; }
         av_packet_unref(m->packet);
         if (c && r < 0) return fail(m, "send packet", r);
     }
@@ -572,6 +680,7 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
 }
 void nmedia_video_time(nmedia *m,int64_t ms){if(m){m->video_present_ms=ms;m->video_present_set=ms>=0;}}
 void nmedia_video_stats(const nmedia *m,uint64_t *decoded,uint64_t *dropped){if(decoded)*decoded=m?m->video_decoded:0;if(dropped)*dropped=m?m->video_dropped:0;}
+void nmedia_video_performance(const nmedia *m,uint64_t *frames,uint64_t *work_ms){if(frames)*frames=m?m->video_measured_frames:0;if(work_ms)*work_ms=m?m->video_work_ms:0;}
 bool nmedia_move_video(nmedia *m,const struct nmedia_output *o,uint32_t **pixels,size_t *capacity){
     size_t count;
     if(!m||!o||!pixels||!capacity||m->error[0]||!m->video_borrowed||o->kind!=NMEDIA_VIDEO||
@@ -609,6 +718,8 @@ static bool restart_flac(nmedia *m) {
 bool nmedia_seek(nmedia *m, int64_t ms) {
     if (!m || !m->format || ms < 0 || ms > INT64_MAX / 1000) return false;
     m->video_borrowed=false;m->video_late_set=false;if(m->video_late)av_frame_unref(m->video_late);
+    m->video_decode_work=m->video_late_work=0;
+    m->audio_decode_work=0;
     int r = m->packet_reader ? (m->packet_seeker&&m->packet_seeker(m->packet_owner,ms)?0:AVERROR(EINVAL)) :
         avformat_seek_file(m->format, -1, INT64_MIN, ms * 1000, ms * 1000, 0);
     if (r < 0) {
@@ -631,6 +742,9 @@ bool nmedia_seek(nmedia *m, int64_t ms) {
 bool nmedia_packets_reclaim(nmedia *m) {
     if (!m || !m->packet_reader) return false;
     m->video_borrowed=false;m->video_late_set=false;if(m->video_late)av_frame_unref(m->video_late);
+    m->video_decode_work=m->video_late_work=m->video_measured_frames=m->video_work_ms=0;
+    m->video_measurement_id=0;
+    memset(&m->audio_observation,0,sizeof m->audio_observation);m->audio_decode_work=0;
     m->pending = NULL; m->frame_audio = 0;
     av_frame_unref(m->frame); av_packet_unref(m->packet);
     avcodec_free_context(&m->audio); avcodec_free_context(&m->video);

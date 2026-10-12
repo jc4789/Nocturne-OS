@@ -16,7 +16,7 @@ const avmediaBridge = (() => {
     function get(node) {
         brand(node);
         let s=states.get(node);
-        if(!s){s={generation:0,intent:0,seekIntent:0,currentSrc:'',controller:null,promise:null,network:0,error:null,volume:1,muted:false,rate:1,defaultRate:1,preservePitch:true,last:null,lastTime:0};states.set(node,s);}
+        if(!s){s={generation:0,intent:0,seekIntent:0,currentSrc:'',controller:null,promise:null,network:0,error:null,volume:1,muted:false,rate:1,defaultRate:1,preservePitch:true,last:null,lastTime:0,readyObserved:0,metadataSeen:false,dataSeen:false,durationSeen:NaN};states.set(node,s);}
         return s;
     }
     function snapshot(node) { get(node);return native('state',node); }
@@ -31,6 +31,33 @@ const avmediaBridge = (() => {
     function abortError() { return new DOMException('Media source changed','AbortError'); }
     function current(node,s,generation,url) { return s.generation===generation&&s.currentSrc===url&&source(node)===url; }
     function notify(node,s,generation,url,type) { if(!current(node,s,generation,url))throw abortError();event(node,type);if(!current(node,s,generation,url))throw abortError(); }
+    function queueMediaEvent(node,s,type) {
+        const generation=s.generation,url=s.currentSrc;
+        host.timer(0,()=>{if(current(node,s,generation,url))event(node,type);},0,[]);
+    }
+    function readyEvents(node,s,now) {
+        /* HTML's ready-state transitions are media-element tasks. Metadata is
+           observable before current data; canplay requires future data. Keep
+           the once-per-load flags distinct from transitions back through a
+           buffering gap, and guard queued tasks against source replacement. */
+        const previous=s.readyObserved,ready=now.readyState;
+        s.readyObserved=ready;
+        if(ready>=1){
+            if(!Object.is(s.durationSeen,now.duration)){
+                s.durationSeen=now.duration;queueMediaEvent(node,s,'durationchange');
+            }
+            if(!s.metadataSeen){s.metadataSeen=true;queueMediaEvent(node,s,'loadedmetadata');}
+        }
+        if(ready>=2&&!s.dataSeen){s.dataSeen=true;queueMediaEvent(node,s,'loadeddata');}
+        if(previous<=2&&ready>=3){
+            queueMediaEvent(node,s,'canplay');
+            if(!now.paused)queueMediaEvent(node,s,'playing');
+        }
+        if(previous<4&&ready>=4)queueMediaEvent(node,s,'canplaythrough');
+        if(previous>=3&&ready<=2&&!now.paused&&!now.ended){
+            queueMediaEvent(node,s,'timeupdate');queueMediaEvent(node,s,'waiting');
+        }
+    }
     async function resumeLoop(node,s,generation,url,intent) {
         /* The seek is a child command, not an immediate restart. Every wait
          * may admit pause(), source replacement or loop=false. */
@@ -54,7 +81,7 @@ const avmediaBridge = (() => {
                 if(s.currentSrc&&source(node)!==s.currentSrc){const resume=!now.paused;const p=load(node),intent=s.intent;if(resume)p.then(()=>{if(s.intent===intent)return node.play();}).catch(()=>{});else p.catch(()=>{});continue;}
                 if(now.error&&!now.mseQuotaError&&!s.error){s.error=new MediaError(3,now.error);event(node,'error');}
                 if(s.generation!==generation)continue;
-                if(s.last&&s.last.waiting!==now.waiting){if(now.waiting)event(node,'waiting');else if(!now.paused)event(node,'playing');}
+                readyEvents(node,s,now);
                 if(s.generation!==generation)continue;
                 if(now.keyWaiting&&(!s.last||!s.last.keyWaiting))event(node,'waitingforkey');
                 if(s.generation!==generation)continue;
@@ -83,6 +110,7 @@ const avmediaBridge = (() => {
         mseBridge.detach(node);
         if(s.controller)s.controller.abort();
         s.controller=null;s.generation=(s.generation+1)>>>0;s.intent++;s.seekIntent++;s.promise=null;s.error=null;s.network=0;s.currentSrc='';s.last=null;
+        s.readyObserved=0;s.metadataSeen=s.dataSeen=false;s.durationSeen=NaN;
         native('reset',node,s.generation);textTrackBridge.reset(node);active.delete(node);
         if(s.rate!==s.defaultRate){native('rate',node,s.defaultRate,s.preservePitch);s.rate=s.defaultRate;setTimeout(()=>event(node,'ratechange'),0);}
     }
@@ -102,6 +130,7 @@ const avmediaBridge = (() => {
                     for(;;){
                         if(!current(node,s,generation,url)||controller.signal.aborted)throw abortError();
                         const now=native('state',node);if(now.error&&!now.mseQuotaError)throw new Error(now.error);
+                        readyEvents(node,s,now);
                         if(now.readyState>=2)break;
                         await new Promise(resolve=>setTimeout(resolve,20));
                     }
@@ -113,6 +142,7 @@ const avmediaBridge = (() => {
                         if(!current(node,s,generation,url)||controller.signal.aborted)throw abortError();
                         const now=native('state',node);
                         if(now.error)throw new Error(now.error);
+                        readyEvents(node,s,now);
                         if(now.readyState>=2&&!now.loading)break;
                         /* Metadata progress is not a request timeout. Real
                          * child/network errors and explicit cancellation above
@@ -130,9 +160,11 @@ const avmediaBridge = (() => {
                 if(!current(node,s,generation,url)||controller.signal.aborted)throw abortError();
                 native('volume',node,s.volume,s.muted);
                 s.network=1;s.controller=null;s.last=native('state',node);
-                notify(node,s,generation,url,'durationchange');notify(node,s,generation,url,'loadedmetadata');
-                if(s.last.readyState>=2){notify(node,s,generation,url,'loadeddata');notify(node,s,generation,url,'canplay');}
-                if(s.last.readyState>=4)notify(node,s,generation,url,'canplaythrough');
+                readyEvents(node,s,s.last);
+                /* Let queued metadata/data tasks run before a waiting play
+                   Promise continues. A reentrant load() retires this source. */
+                await new Promise(resolve=>host.timer(0,resolve,0,[]));
+                if(!current(node,s,generation,url))throw abortError();
                 return node;
             }catch(e){
                 if(s.generation!==generation)throw abortError();
@@ -213,10 +245,8 @@ const avmediaBridge = (() => {
                 if(s.intent!==initialIntent||source(this)!==url)throw abortError();
             }
             let pending=null,intent=s.intent;
-            if(s.currentSrc!==url||!snapshot(this).readyState){
-                if(s.promise&&s.currentSrc===url)pending=s.promise;
-                else {intent=s.intent+1;pending=load(this,true);} /* Only load's own reset; a loadstart handler may cancel. */
-            }
+            if(s.promise&&s.currentSrc===url)pending=s.promise;
+            else if(s.currentSrc!==url||!snapshot(this).readyState){intent=s.intent+1;pending=load(this,true);} /* Only load's own reset; a loadstart handler may cancel. */
             if(pending)native('preparePlay',this);
             if(pending)await pending;
             if(s.intent!==intent||source(this)!==s.currentSrc)throw abortError();
@@ -235,7 +265,7 @@ const avmediaBridge = (() => {
             s.last=native('state',this);active.add(this);monitor();
             if(wasPaused){event(this,'play');if(s.intent!==intent||snapshot(this).paused)throw new DOMException('Play was cancelled','AbortError');event(this,'playing');}
         }
-        pause(){const s=get(this),wasPaused=snapshot(this).paused;s.intent++;native('pause',this);s.last=native('state',this);active.delete(this);if(!wasPaused){event(this,'timeupdate');event(this,'pause');}}
+        pause(){const s=get(this),wasPaused=snapshot(this).paused;s.intent++;native('pause',this);s.last=native('state',this);if(s.network===2){active.add(this);monitor();}else active.delete(this);if(!wasPaused){event(this,'timeupdate');event(this,'pause');}}
     }
     for(const name of ['controls','autoplay','loop'])Object.defineProperty(HTMLMediaElement.prototype,name,{configurable:true,enumerable:true,get(){brand(this);return this.hasAttribute(name);},set(v){brand(this);this.toggleAttribute(name,!!v);}});
     for(const [name,value] of Object.entries({NETWORK_EMPTY:0,NETWORK_IDLE:1,NETWORK_LOADING:2,NETWORK_NO_SOURCE:3,HAVE_NOTHING:0,HAVE_METADATA:1,HAVE_CURRENT_DATA:2,HAVE_FUTURE_DATA:3,HAVE_ENOUGH_DATA:4})){
@@ -263,5 +293,5 @@ const avmediaBridge = (() => {
     Audio.prototype=HTMLAudioElement.prototype;
     Object.assign(globalThis,{HTMLMediaElement,HTMLAudioElement,HTMLVideoElement,MediaError,Audio});
     for(const cls of [HTMLMediaElement,HTMLAudioElement,HTMLVideoElement,MediaError])Object.defineProperty(cls.prototype,Symbol.toStringTag,{value:cls.name,configurable:true});
-    return {HTMLMediaElement,HTMLAudioElement,HTMLVideoElement,brand,state:snapshot,generation(node){return get(node).generation;},privateFetch:fetch,activate(node){if(!node||!node.controls)return false;if(node.paused)node.play().catch(report);else node.pause();return true;}};
+    return {HTMLMediaElement,HTMLAudioElement,HTMLVideoElement,brand,state:snapshot,generation(node){return get(node).generation;},privateFetch:fetch,changed(node){if(!node)return;get(node);active.add(node);monitor();},activate(node){if(!node||!node.controls)return false;if(node.paused)node.play().catch(report);else node.pause();return true;}};
 })();

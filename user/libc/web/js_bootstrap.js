@@ -626,8 +626,10 @@
         set defaultSelected(v){reflectedAttr(this,'selected',v?'':null);}
     }
     function htmlElementBrand(node,tag){
-        if(rawDom.get(node,'nodeType')!==1 || rawDom.get(node,'namespaceURI')!=='http://www.w3.org/1999/xhtml' ||
-           rawDom.get(node,'localName')!==tag)throw new TypeError('Illegal '+tag+' receiver');
+        // Native unwrap and HTML namespace validation remain authoritative.
+        // Do not repeat three pipe/native crossings for every reflected IDL
+        // access, or cache a brand across an allocation owner's retirement.
+        if(rawDom.get(node,'htmlElementBrand')!==tag)throw new TypeError('Illegal '+tag+' receiver');
     }
     let elementURL; // Initialized by js_hyperlink after the private URL implementation.
     const formCollections=new WeakMap(), formResetting=new WeakSet();
@@ -1085,9 +1087,11 @@
         };
     }
     return {
+        presentationSync:presentationBridge.sync,
         workerNotify:workerBridge.deliver,
         storageOrigin:storageBridge.origin,
         storageEvent:storageBridge.deliver,
+        indexedDBTaskEnd:indexedDBBridge.taskEnd,
         formNamedProperty:formNameBridge.property,
         formNamedKeys:formNameBridge.keys,
         registerImportMap:importMapsBridge.register,

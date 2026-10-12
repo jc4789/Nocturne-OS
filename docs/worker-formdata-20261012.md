@@ -27,3 +27,11 @@ Worker の Request クラス、stream upload、SRI、default 以外の cache／r
 HTTPS 文書の `Worker(blobURL)` で `subtle`／`isSecureContext` が失われる欠陥を修理した。private START metadata の field 10 に作成時の native `c->origin` snapshot を送り、Worker が所有する `security_url` と private `host.securityURL()` へ接続する。blob の場合だけ crypto の trust 判定が creator origin を使う。通常 Worker は従来の native policy URL、script URL と CSP documentURI は blob のまま維持する。空・opaque・非 trustworthy origin は fail closed、初期化失敗と Worker 終了で snapshot を回収する。作者の location／isSecureContext は読まない。
 
 根拠は [W3C Secure Contexts §1.3–1.4 と §3.1](https://w3c.github.io/webappsec-secure-contexts/#is-origin-trustworthy)。この修理は creator origin の継承であり、文書 ancestor を含めた広い secure-context 判定の完成を主張しない。追加試験停止を守り、実行確認は未実施。
+
+## 後続の検証許可による結果
+
+ユーザーの「十分変更したので今検証する」という最新訂正により、既存 `worker_stream_hosttest.c` に新 `--fetch-body` 経路、既存 `sharedworker_hosttest.c` に実 `web_worker_run_one` の binary-record dispatcher 補助を追加した。実製品 embedded runtime、native encoding、BearSSL crypto と binary requester に限定し、旧成功済 suite は実行していない。
+
+`python -X utf8 tests/crypto_aes_hosttest.py --worker-body` の最終結果は compile 0、runtime `3221226505`（Windows `0xC0000409` fast-fail）。その前の実評価で native START、blob script location の維持、HTTPS native creator の `subtle` 公開の 3 項目が成功したが、本文／暗号／POST／取消の一括確認は中途停止し未達。`build/worker-body-native-20261012.log` と実行ファイルを保全した。初期 harness compile の CRT ssize_t／SYS_OPEN／HTTP header 衝突、MIN macro の漏出、未使用 URL helper link／署名を fixture 側で修正した経緯がある。guest・実 HTTP/CORS・実サイトの成功へは昇格しない。
+
+主担当が実サイト初期化停止修理への即時切替を指示したため、この host-model fast-fail の追加診断は停止。新 VM は起動せず、主担当の実 VM も操作していない。

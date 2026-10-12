@@ -137,7 +137,7 @@ static void completed(nmedia_mse_worker *w){
     bool current_epoch=data?w->head->epoch>=w->slots[r->slot].epoch:w->head->epoch==w->epoch;
     if(r->op==NMSW_STEP&&current_epoch){w->output_ready=true;w->output_slot=(unsigned)r->slot;w->output_revision=nmedia_mse_worker_revision(w,w->output_slot);
         w->starving=r->kind==NMEDIA_AGAIN;
-        w->output=(struct nmedia_output){.kind=r->kind==NMSW_VIDEO_PENDING?NMSW_BUSY:r->kind,.pts_ms=r->pts,.frames=r->frames,.width=r->width,.height=r->height,.samples=(const int16_t *)w->payload,.pixels=(const uint32_t *)w->payload};}
+        w->output=(struct nmedia_output){.kind=r->kind==NMSW_VIDEO_PENDING?NMSW_BUSY:r->kind,.pts_ms=r->pts,.frames=r->frames,.width=r->width,.height=r->height,.samples=(const int16_t *)w->payload,.pixels=(const uint32_t *)w->payload,.audio_observation=r->audio_observation};}
     else if(r->kind!=NMEDIA_ERROR)w->starving=false;
     struct request *old=w->head;w->head=old->next;w->queued_bytes-=old->c.bytes;w->queued_count--;
     if(old->c.op==NMSW_KEYS){volatile uint8_t *wipe=old->bytes;for(size_t i=0;i<old->c.bytes;i++)wipe[i]=0;}
@@ -145,15 +145,14 @@ static void completed(nmedia_mse_worker *w){
     w->tx_pos=w->head_pos=w->meta_pos=w->rx_pos=0;
     if(w->head){w->head->c.sequence=++w->sequence;memset(&w->response,0,sizeof w->response);}
 }
-static void control_io(nmedia_mse_worker *w,uint64_t now,uint64_t until,bool dispatch,bool handoff){
-    nmedia_mse_worker_background(now);if(!w||w->stopping||!w->head)return;
-    if(!w->pid){if(!dispatch)return;if(!spawn_child(w))return;}
+static void control_io(nmedia_mse_worker *w,uint64_t until,bool dispatch,bool handoff,const struct n_pollfd ready[2]){
+    if(!w||w->stopping||!w->head||!w->pid)return;
     /* Queued APPEND/REMOVE can wait behind transfer or author JS work. Their
        decoder resume point must use the real sink clock at dispatch, not the
        old enqueue clock. Never mutate a partially transmitted wire header. */
     if(dispatch&&!w->tx_pos)w->head->c.current=w->current;
     if(!dispatch&&w->tx_pos<sizeof w->head->c+w->head->c.bytes)return;
-    struct n_pollfd p[2]={{w->in,dispatch?N_POLLOUT:0,0},{w->out,N_POLLIN,0}};if(poll(p,2,0)<0){stop(w,"MSE worker poll failed");return;}
+    struct n_pollfd p[2]={ready[0],ready[1]};
     size_t budget=65536,total=sizeof w->head->c+w->head->c.bytes;
     /* Append bytes and decoded pixels both cross a 16 KiB pipe. Cooperatively
      * wake the blocked peer after transfer progress; never wait for decode or
@@ -205,12 +204,10 @@ static bool video_current(const nmedia_mse_worker *w){
     return v->slot<w->slot_count&&w->slots[v->slot].used&&
         v->epoch>=w->slots[v->slot].epoch&&v->revision==w->slots[v->slot].revision;
 }
-static void video_io(nmedia_mse_worker *w,uint64_t until,bool handoff){
+static void video_io(nmedia_mse_worker *w,uint64_t until,bool handoff,short revents){
     if(w->video_fd<0||w->video_ready||w->video_loan)return;
-    struct n_pollfd p={w->video_fd,N_POLLIN,0};
-    if(poll(&p,1,0)<0){stop(w,"MSE VIDEO poll failed");return;}
     bool received=false;unsigned handoffs=0;
-    while(p.revents&(N_POLLIN|N_POLLHUP)){
+    while(revents&(N_POLLIN|N_POLLHUP)){
         if(received&&uptime_ms()>=until)break;received=true;
         bool header=w->video_head_pos<sizeof w->video_header;
         size_t take=header?sizeof w->video_header-w->video_head_pos:w->video_header.bytes-w->video_rx_pos;
@@ -236,12 +233,21 @@ static void video_io(nmedia_mse_worker *w,uint64_t until,bool handoff){
 }
 static void pump_io(nmedia_mse_worker *w,uint64_t now,uint64_t until,bool dispatch,bool handoff){
     if(!w||w->stopping)return;
+    nmedia_mse_worker_background(now);
+    if(!w->pid){if(!dispatch||!w->head||!spawn_child(w))return;}
+    /* Both independent lanes share a single readiness snapshot. Repeating
+       three descriptor checks in separate poll syscalls at every safepoint
+       adds transport overhead without advancing either native owner. */
+    struct n_pollfd ready[3]={{w->in,w->head&&dispatch?N_POLLOUT:0,0},
+        {w->out,w->head?N_POLLIN:0,0},
+        {w->video_fd,!w->video_ready&&!w->video_loan?N_POLLIN:0,0}};
+    if(poll(ready,3,0)<0){stop(w,"MSE worker readiness poll failed");return;}
     until=MIN(until,uptime_ms()+2);
     /* PCM/control first, but each ready lane gets its initial nonblocking
        read. Sustained APPEND/control progress must not suppress already
        delivered VIDEO. Further reads/yields obey the same original end time. */
-    control_io(w,now,until,dispatch,handoff);if(w->stopping)return;
-    video_io(w,until,handoff);
+    control_io(w,until,dispatch,handoff,ready);if(w->stopping)return;
+    video_io(w,until,handoff,ready[2].revents);
 }
 void nmedia_mse_worker_pump_budget(nmedia_mse_worker *w,uint64_t now,uint64_t until){pump_io(w,now,until,true,true);}
 void nmedia_mse_worker_collect(nmedia_mse_worker *w){uint64_t now=uptime_ms();pump_io(w,now,now,false,false);}
@@ -285,7 +291,9 @@ int nmedia_mse_worker_step(nmedia_mse_worker *w,struct nmedia_output *out){
     if(video&&(!data||w->video_header.pts<=w->output.pts_ms)){
         const struct nmsw_video *v=&w->video_header;w->video_ready=false;w->video_loan=true;w->taken_video_lane=true;
         w->taken_slot=v->slot;w->taken_revision=nmedia_mse_worker_revision(w,v->slot);
-        *out=(struct nmedia_output){.kind=NMEDIA_VIDEO,.pts_ms=v->pts,.width=v->width,.height=v->height,.pixels=(const uint32_t *)w->video_pixels};
+        *out=(struct nmedia_output){.kind=NMEDIA_VIDEO,.pts_ms=v->pts,.width=v->width,.height=v->height,.pixels=(const uint32_t *)w->video_pixels,
+            .video_measured_frames=v->video_measured_frames,.video_work_ms=v->video_work_ms,
+            .video_measurement_id=v->video_measurement_id,.video_configuration=v->video_configuration};
         return NMEDIA_VIDEO;
     }
     /* END on the control lane cannot overtake an in-flight final image. */

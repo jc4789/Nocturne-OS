@@ -50,3 +50,38 @@
 WebVTT STYLE stylesheet／作者`::cue` CSS、完全なbidi/shaping・衝突回避・複数ruby分節、region scroll-upの規定アニメーション、in-band字幕抽出、WebVTT全WPTは未達。内部timestampはcue treeとpast/future状態へ反映するが、作者CSSによるkaraoke装飾はSTYLE対応が必要。これらを今回のparser/native描画追加だけで全面対応とは報告しない。
 
 - [WebVTT仕様](https://www.w3.org/TR/webvtt1/)
+
+## 共通DOM／資源走査の追加修理（同日）
+
+主担当のYouTube初期化停止・遅延修理の追加割当に合わせ、`doc.c` の共通境界を修理した。サイト判定はない。
+
+- `doc_sync_tree` はmetadata依存が変わらない間snapshotを再利用し、resources_dirtyを保持する繰り返しbody／baseURI読取りで全DOMのbase探索を反復しない。最初は全DOM revision cacheだったが、主担当実YTの162sync／743558visitsでclass/text変更ごとの無関係な全走査が残ると判明し、既存native DOM hookへ責務dirtyを統合した。parser全forest通知、document／direct html child構造、通常treeのbase[href]を含むsubtree移動・挿入・削除、通常base href変更、`web_set_url`だけで無効化する。shadow／template／detached内部変更はlive metadataに影響しない。base探索は通常treeのiterative traversalでtemplate／shadowを除外し、native checkpoint中断時は部分metadataを公開しない。full resource scanの成功でcacheを公開する。
+- inline stylesheetの既存AST reuseに動的hash indexを追加。異なるsheetの全cache線形探索を避け、最終的なhash／長さ／base／全文比較と元のscope／order／media／import処理は維持。OOMは既存indexまたはlinked fallbackを保持。未完成ASTはindexへ入れず、sweep後にindexを再構築、全回収時はbucketも解放する。
+- 主担当のnative取消からauthor queueを保全する修理を独立確認し、取消済みlayoutの再構築前に `web_tick` が媒体／animation／timerを実行する漏れを指摘した。合意した `web_tick` 共通gateで、author stack外の原viewport再構築が成功するまで作者callbackを待たせ、tick途中の取消後も次責務へ進まない。background媒体serviceだけは維持する。
+
+正規UCFLAGSの `doc.c` 構文確認は成功（既存sandbox unused-function警告2件）。先行2回の構文実行は私のinclude指定不足で失敗し、Makefileのflagsへ訂正した。速度改善の実測や最新実サイト受入は主担当バッチの結果待ちであり、構文成功を性能／表示の合格へ置換しない。
+
+責務dirty変更後の `doc.c`／`dom.c` の正規UCFLAGS構文確認は成功。既存FormData nativeケースへ、32回の実class／control value／text変更でmetadata visitが増えず、base href／先頭挿入／並替え／削除／URL更新で無効化される新nativeケースを追加。原文書を実DOM/bootstrapで開いて確認するが、まだ主担当guest結果は受信していない。
+
+## IndexedDBの非同期永続I/O修理（同日・最新）
+
+上記の同期manifest実装と「増分journal未実装」の記述は、この追加修理前の状態である。
+
+- `webidb_async.c`／`webidb_async.h` の専用transport責務と `browserstorageworker.c` のnative helperを追加。ページthreadはprivate入力を所有queueへ複写し、Nocturne `spawn`／pipeの非blocking IPCだけを扱う。persistent engineのFAT、lease、catalog、stage、commit、回収はhelperで実行する。`pump` は各方向64KiBまで、作者callbackやdisk待ちを実行しない。fork／POSIX互換層は追加していない。
+- `webidb_journal.c` は永続metadata codec/cache責務。checksum付き不変delta frameと小さい二重commit headを使い、旧metadataからの一致spanをCOPYとして保存する。warm beginは小さいheadでcacheの世代を照合する。cold readはchecksum／世代／前frame参照を検証して反復復元する。compactionは二つのcommit headから参照されていないjournal laneだけをtruncateし、現commitを失わない。
+- 新databaseをhash先頭2桁のdirectoryへ、payloadをdatabase内のhash先頭2桁bucketへ分散。既存flat database／payloadは読取りと回収で互換を維持する。変更値だけのstage、旧／新commitからの参照保護、origin隔離、abort、versionchange registryは維持。
+- `js_indexeddb.js` はnative ACKをawaitする。native wait中はtransactionをactiveにせず、request／upgrade callbackと同task microtask中だけactiveにし、private task-end hookで失活する。abort後の遅いBEGIN／値結果は公開せず新tokenを回収する。index作成の既存値populationはordered transaction queueへ統合し、同期disk読取りをしない。getAll／index population／cursorは32値ずつ実native `VALUES` で読み、無制限の全値保持や1値ごとのidle tick待ちを避ける。
+- 主担当の `js.c` 統合を独立確認し、pending resolverをFIFO登録／回収へ修理。broker失敗はIOとして扱い、失敗後に同文書でhelperを再作成して旧connection/tokenを新handleへ誤接続しない。文書退役時にpending／tail／failed／turnを全回収・初期化し、disabled経路のpending-only状態も回収する。未公開BEGIN／CONNECT結果のOOMはABORT／FORGETを送り、orphan ACKは作者へ公開しない。
+- BEGIN／VALUEの実IPC所有バッファはQuickJS ArrayBuffer生成成功時だけ所有移譲する。生成失敗ならnative側が保持・回収する。VALUESは各spanの長さ／末尾一致を検証して正確なcopyを維持する。
+
+### 今回の確認範囲
+
+- 実 `webidb.c`／journal codec／BearSSLを隔離ホストfile・lease adapterで実行。最初45条件成功後、部分head書込みと350世代compactionの新条件を追加し、50条件／失敗0。256KiB metadataの変更commitでwrite量8KiB未満、warm read量1KiB未満、cold replayで全文一致を確認した。これはnative engineの重点証拠であり、実ゲストIPC／実サイトの受入ではない。
+- 新native broker／helper／engine／journalのfreestanding構文・警告確認は成功。最初のhost compileはruntime PATH、fixture bool/include、BearSSL codecリンク不足で失敗し、fixture／実行条件を修理した。期待値の弱化や除外はしていない。
+- `tests/indexeddbguesttest.c` に実DOM／実JS bootstrap／実helperを使う `indexeddb/async-native-storage` を追加。80値のordered write／getAll／cursor、heartbeat、helper process実在、abort、task inactive、既存値からのupgrade index population、close／deleteを確認する経路で、主担当が正規媒体へ統合して実行する。最新guest結果、実Shaka offline保存／再起動後利用、同条件の実サイト性能はまだ未受信。成功として先取りしない。
+
+### 最新の残る限界
+
+metadataの全量メモリpack／比較はhelper側に残り、B-tree化はしていない。書込みrequestは仕様上のrequest順序／key generator／unique error／preventDefaultを守るため個別ACKを維持しており、巨大書込みbatchの速度を証明していない。Worker IndexedDB公開、全WPT、hardware power-loss durabilityは未達。今回の50条件成功は最新 `js.c` FIFO／failed cleanup／zero-copy変更のゲスト実行を代替しない。
+
+- [IndexedDB 3.0 transaction lifecycle](https://www.w3.org/TR/IndexedDB-3/#transaction-lifecycle)

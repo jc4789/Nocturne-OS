@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <math.h>
 #include <limits.h>
+#include <float.h>
 #include <nocturne.h>
 #include <parallel.h>
 #include "webi.h"
@@ -51,7 +52,7 @@ static void layout_media_checkpoint(void) {
 
 /* ---------------------------------------------------------------- fonts */
 wfont style_font(const style_t *st) {
-    wfont f = {NULL, st->font_size, st->font_weight >= 600};
+    wfont f = {.px=st->font_size,.bold=st->font_weight>=600,.choices=st->font_choices};
     int idx = (f.bold ? FONT_BOLD : 0) | (st->font_style ? FONT_ITALIC : 0);
     f.ttf = st->named_font ? st->named_font : font_family(st->font_family, idx);
     if (!f.ttf) f.ttf = font_ui(FONT_REGULAR);
@@ -59,10 +60,31 @@ wfont style_font(const style_t *st) {
 }
 
 static int mono_font(const wfont *f) { return f->px >= 24 ? FONT_LARGE : FONT_SMALL; }
+static font_t *wf_face(const wfont *f,uint32_t cp) {
+    for(const struct web_font_choice *choice=f->choices;choice;choice=choice->next){
+        if(choice->resource->failed)continue;
+        size_t lo=0,hi=choice->range_count;
+        while(lo<hi){size_t mid=lo+(hi-lo)/2;if(cp>choice->ranges[mid].last)lo=mid+1;else hi=mid;}
+        if(choice->range_count&&(lo==choice->range_count||cp<choice->ranges[lo].first))continue;
+        /* Demand only a subset actually used by a text run. The resource and
+           ranges are already owned; worker glyph selection never allocates or
+           submits network work, and snapshot probes stay read-only. */
+        if(!web_avmedia_snapshot_is_probe())__atomic_store_n(&choice->resource->wanted,true,__ATOMIC_RELAXED);
+        font_t *face=choice->resource->face;
+        if(face&&font_has_primary(face,cp))return face;
+    }
+    return f->ttf;
+}
 
 float wf_width(const wfont *f, const char *s, size_t n) {
     if (f->px < 1) return 0;
-    if (f->ttf) return font_width(f->ttf, f->px, s, n);
+    if (f->ttf&&!f->choices) return font_width(f->ttf, f->px, s, n);
+    if(f->choices){
+        float width=0;
+        for(size_t i=0;i<n;){uint32_t cp;int bytes=gfx_utf8_decode(s+i,&cp);if((size_t)bytes>n-i)break;i+=(size_t)bytes;
+            font_t *face=wf_face(f,cp);width+=face?font_advance(face,f->px,cp):gfx_codepoint_width(cp,mono_font(f));}
+        return width;
+    }
     int width = 0;
     for (size_t i = 0; i < n;) {
         uint32_t cp;
@@ -87,7 +109,16 @@ void wf_metrics(const wfont *f, float *asc, float *desc) {
 
 float wf_draw(canvas_t *c, const wfont *f, float x, int baseline, const char *s, size_t n, uint32_t color) {
     if (f->px < 1) return x;
-    if (f->ttf) return font_draw(c, f->ttf, f->px, x, baseline, s, n, color);
+    if (f->ttf&&!f->choices) return font_draw(c, f->ttf, f->px, x, baseline, s, n, color);
+    if(f->choices){
+        for(size_t i=0;i<n;){uint32_t cp;int bytes=gfx_utf8_decode(s+i,&cp);if((size_t)bytes>n-i)break;
+            font_t *face=wf_face(f,cp);
+            if(face)x=font_draw(c,face,f->px,x,baseline,s+i,(size_t)bytes,color);
+            else {int top=baseline-gfx_font_h(mono_font(f))*3/4;x+=gfx_char(c,(int)x,top,cp,color,0,mono_font(f));}
+            i+=(size_t)bytes;
+        }
+        return x;
+    }
     int font = mono_font(f);
     int fh = gfx_font_h(font);
     int top = baseline - (int)(fh * 0.75f);
@@ -264,6 +295,14 @@ void box_scroll_clamp(box_t *b) {
     n->scroll_y = scroll_limit(n->scroll_y, my);
 }
 
+bool css_translation_active(const style_t *s){return s&&(s->transform||s->translate.active);}
+float box_translation_axis(const box_t *b,unsigned axis,unsigned sources){
+    if(!b||!b->st||axis>1||b->kind==B_TEXT||b->kind==B_BR||b->kind==B_INLINE)return 0;
+    float base=axis?b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2]:b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3];
+    double value=(sources&CSS_TRANSLATE_INDIVIDUAL)&&b->st->translate.active?len_resolve(&b->st->translate.xy[axis],base):0;
+    if(sources&CSS_TRANSLATE_TRANSFORM)for(const struct css_transform *t=b->st->transform;t;t=t->next)value+=len_resolve(&t->xy[axis],base);
+    return value>FLT_MAX?FLT_MAX:value< -FLT_MAX? -FLT_MAX:(float)value;
+}
 bool box_filter_containing_block(const box_t *b) {
     const box_t *effect = b;
     /* wrapped() paints an element's effect on the outer box once, but the
@@ -271,8 +310,9 @@ bool box_filter_containing_block(const box_t *b) {
     if (b && (b->kind == B_FLEX || b->kind == B_GRID || b->kind == B_TABLE) &&
         b->parent && b->parent->kind == B_ATOMIC && b->parent->atomic == AT_INLINE_BLOCK &&
         b->node && b->node == b->parent->node) effect = b->parent;
-    return effect && effect->st && effect->st->filter && b->kind != B_TEXT && b->kind != B_BR &&
-        !(b->node && b->node->owner && b->node == b->node->owner->html);
+    return effect && effect->st && b->kind != B_TEXT && b->kind != B_BR &&
+        ((effect->kind!=B_INLINE&&css_translation_active(effect->st))||(effect->st->filter&&
+         !(b->node&&b->node->owner&&b->node==b->node->owner->html)));
 }
 bool box_viewport_fixed(const box_t *b) {
     return b && b->st && b->st->position == POS_FIXED &&
@@ -292,9 +332,12 @@ void box_abs_cb_rect(const box_t *cb, const web_doc *d, float rect[4]) {
 }
 float box_visual_x(const box_t *b) {
     double x = box_abs_x(b);
+    for(const box_t *a=b;a;a=a->parent){x+=box_translation_axis(a,0,CSS_TRANSLATE_INDIVIDUAL|CSS_TRANSLATE_TRANSFORM);if(box_viewport_fixed(a))break;}
     if(b->node && b->node->owner && b->node->owner->marquees.n)
-        for(const box_t *a=b->parent;a;a=a->parent)
-            if(web_marquee_box(a))x+=a->node->marquee_x;
+        for(const box_t *a=b;a;a=a->parent){
+            if(a!=b&&web_marquee_box(a))x+=a->node->marquee_x;
+            if(box_viewport_fixed(a))break;
+        }
     for (const box_t *c = b; c; c = c->cb) {
         if (c != b && c->node && c->node->scroll_x != 0 && box_element_scrollable(c)) x -= c->node->scroll_x;
         if (box_viewport_fixed(c)) {
@@ -310,9 +353,12 @@ float box_visual_x(const box_t *b) {
 
 float box_visual_y(const box_t *b) {
     double y = box_abs_y(b);
+    for(const box_t *a=b;a;a=a->parent){y+=box_translation_axis(a,1,CSS_TRANSLATE_INDIVIDUAL|CSS_TRANSLATE_TRANSFORM);if(box_viewport_fixed(a))break;}
     if(b->node && b->node->owner && b->node->owner->marquees.n)
-        for(const box_t *a=b->parent;a;a=a->parent)
-            if(web_marquee_box(a))y+=a->node->marquee_y;
+        for(const box_t *a=b;a;a=a->parent){
+            if(a!=b&&web_marquee_box(a))y+=a->node->marquee_y;
+            if(box_viewport_fixed(a))break;
+        }
     for (const box_t *c = b; c; c = c->cb) {
         if (c != b && c->node && c->node->scroll_y != 0 && box_element_scrollable(c)) y -= c->node->scroll_y;
         if (box_viewport_fixed(c)) {
@@ -3245,7 +3291,7 @@ static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float
     uint64_t font_generation = font_metrics_generation();
     bool clamping = box_line_clamp(b);
     bool reusable = !layout_current()->clamp_depth && !clamping &&
-        (!f || is_bfc_root(b)) && b->layout_cache_safe && font_generation;
+        (!f || is_bfc_root(b) || (!f->n&&!b->layout_cache_exports_floats)) && b->layout_cache_safe && font_generation;
     if (reusable && b->layout_cache_valid && !b->layout_dirty &&
         b->cached_width == input_width && b->cached_cbh == cbh &&
         b->cached_usedh == usedh && b->cached_font_generation == font_generation &&
@@ -3437,18 +3483,32 @@ void layout_clamp_trace_report(web_doc *d) {
         clamp_trace_report_box(d, d->root_box, replaced_pending);
 }
 
-static void layout_dirty_subtree(box_t *b) {
-    b->layout_dirty = true;
-    b->layout_cache_valid = false;
-    b->intrinsic_done = false;
-    for (box_t *c = b->first; c; c = c->next) layout_dirty_subtree(c);
-}
 void layout_invalidate(box_t *b) {
     if (!b) return;
-    layout_dirty_subtree(b);
+    /* A changed box and ancestor aggregates are dirty. Unchanged siblings
+       and descendants retain their intrinsic/layout results: their actual
+       width/cbh/usedh/edges/font-generation inputs are checked on reuse.
+       Inherited style changes dirty each affected child's own box at the
+       cascade join; parent size changes naturally miss those input keys. */
+    b->layout_cache_valid=false;
+    b->layout_dirty=true;b->intrinsic_done=false;
     for (b = b->parent; b; b = b->parent) {
         b->layout_dirty = true;
         b->intrinsic_done = false;
+    }
+}
+void layout_invalidate_fonts(box_t *b){
+    if(!b)return;
+    /* A successful font load advances the global metrics generation. Existing
+       shaping/min-content borrows are no longer committed measurements, even
+       where selecting that face will be deferred to the next cascade join. */
+    box_t *root=b;
+    for(;;){
+        b->layout_cache_valid=false;b->layout_dirty=true;b->intrinsic_done=false;
+        if(b->first){b=b->first;continue;}
+        while(b!=root&&!b->next)b=b->parent;
+        if(b==root)break;
+        b=b->next;
     }
 }
 
@@ -3457,16 +3517,22 @@ static bool layout_cache_prepare(box_t *b) {
     bool safe = !box_line_clamp(b) && !b->abspos && !(b->node && !b->node->foreign &&
         (b->node->tag == T_frameset || b->node->tag == T_iframe || b->node->tag == T_embed));
     const style_t *s=b->st;
+    bool exports_floats=false;
     bool dependent=b->kind==B_GRID || b->kind==B_TABLE ||
         (b->kind==B_FLEX && (s->flex_direction==FD_COLUMN || s->flex_direction==FD_COLUMN_REVERSE)) ||
         len_has_pct(&s->height) || len_has_pct(&s->flex_basis) ||
         !len_auto(&s->min_height) || s->max_height.kind!=LK_NONE ||
         len_has_pct(&s->inset[0]) || len_has_pct(&s->inset[2]);
     for (box_t *c = b->first; c; c = c->next) {
-        if (!layout_cache_prepare(c)) safe = false;
+        if (!layout_cache_prepare(c)&&!c->abspos) safe = false;
+        /* Reusing a shared, empty BFC must not suppress float registration.
+           Floats inside an independent BFC remain contained by that child;
+           the child being floated itself still contributes to this BFC. */
+        if(!c->abspos&&(c->floated||(!is_bfc_root(c)&&c->layout_cache_exports_floats)))exports_floats=true;
         if (c->stretch_height_dependent) dependent=true;
     }
     b->layout_cache_safe = safe;
+    b->layout_cache_exports_floats=exports_floats;
     b->stretch_height_dependent=dependent;
     return safe;
 }
@@ -3661,6 +3727,11 @@ static void scroll_area_publish(box_t *b) {
        coordinates also avoid losing small offsets beside a huge ancestor. */
     float right = b->x + b->rel_dx - b->p[3] + bw + b->b[1] + b->m[1] + cb->p[3] + cb->p[1];
     float bottom = b->y + b->rel_dy + cb->content_dy - b->p[0] + bh + b->b[2] + b->m[2] + cb->p[0] + cb->p[2];
+    /* CSS transforms extend, never shrink, the union of original and visual
+       overflow. Descendant overflow has already propagated into b; add only
+       b's own translation here, not its ancestors a second time. */
+    right+=fmaxf_(0,box_translation_axis(b,0,CSS_TRANSLATE_INDIVIDUAL|CSS_TRANSLATE_TRANSFORM));
+    bottom+=fmaxf_(0,box_translation_axis(b,1,CSS_TRANSLATE_INDIVIDUAL|CSS_TRANSLATE_TRANSFORM));
     cb->scroll_w = fmaxf_(cb->scroll_w, scroll_extent(right));
     cb->scroll_h = fmaxf_(cb->scroll_h, scroll_extent(bottom));
 }
