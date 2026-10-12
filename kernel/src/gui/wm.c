@@ -52,8 +52,9 @@ struct window {
     size_t pages;
     uint64_t uaddr;
     int flags;
-    bool shown, minimized, maximized, dead;
+    bool shown, minimized, maximized, dead,fullscreen;
     struct rect restore;
+    struct rect fullscreen_restore;
     char title[64];
     struct gui_event ev[EVQ];
     int ev_head, ev_tail, ev_count;
@@ -95,6 +96,7 @@ static void wm_unlock(void) {
 static struct window *zorder[MAX_WIN]; /* bottom .. top */
 static int nwin;
 static int next_win_id = 1;
+static struct window *focus_owner;
 
 static int mx, my, mbuttons;
 
@@ -185,7 +187,7 @@ static void damage_all(void) { damage_rect(0, 0, sw, sh); }
 static void wake_compositor(void) { wq_wake_all(&wm_wq); }
 
 /* ---- window geometry ---- */
-static bool decorated(struct window *w) { return !(w->flags & WIN_NO_DECOR); }
+static bool decorated(struct window *w) { return !w->fullscreen&&!(w->flags & WIN_NO_DECOR); }
 static int frame_w(struct window *w) { return decorated(w) ? w->cw + 2 * BORDER : w->cw; }
 static int frame_h(struct window *w) { return decorated(w) ? w->ch + TITLE_H + BORDER : w->ch; }
 static int client_x(struct window *w) { return decorated(w) ? w->x + BORDER : w->x; }
@@ -203,6 +205,7 @@ static void damage_window(struct window *w) {
 static bool visible(struct window *w) { return w && !w->dead && w->shown && !w->minimized; }
 
 static struct window *focused(void) {
+    if(visible(focus_owner))return focus_owner;
     for (int i = nwin - 1; i >= 0; i--)
         if (visible(zorder[i])) return zorder[i];
     return NULL;
@@ -237,7 +240,7 @@ static struct window *window_at(int x, int y) {
 }
 
 static bool in_resize_grip(struct window *w, int x, int y) {
-    if (!(w->flags & WIN_RESIZABLE) || w->maximized) return false;
+    if (!(w->flags & WIN_RESIZABLE) || w->maximized || w->fullscreen) return false;
     int fx1 = w->x + frame_w(w), fy1 = w->y + frame_h(w);
     return x >= fx1 - 14 && y >= fy1 - 14 && x < fx1 && y < fy1;
 }
@@ -307,7 +310,10 @@ static void raise_window(struct window *w) {
     int i = zindex(w);
     if (i < 0) return;
     for (; i < nwin - 1; i++) zorder[i] = zorder[i + 1];
-    zorder[nwin - 1] = w;
+    int destination=nwin-1;
+    if(!(w->flags&WIN_ALWAYS_ON_TOP))for(int j=0;j<nwin-1;j++)if(zorder[j]->flags&WIN_ALWAYS_ON_TOP){destination=j;break;}
+    for(int j=nwin-1;j>destination;j--)zorder[j]=zorder[j-1];
+    zorder[destination] = w;focus_owner=w;
     w->minimized = false;
     damage_window(w);
     damage_taskbar();
@@ -315,16 +321,19 @@ static void raise_window(struct window *w) {
 }
 
 static void lower_to_bottom(struct window *w) {
+    if(w->flags&WIN_ALWAYS_ON_TOP)return;
     int i = zindex(w);
     if (i < 0) return;
     for (; i > 0; i--) zorder[i] = zorder[i - 1];
     zorder[0] = w;
+    if(focus_owner==w)focus_owner=NULL;
     damage_window(w);
     update_focus();
 }
 
 static void minimize_window(struct window *w) {
     w->minimized = true;
+    if(focus_owner==w)focus_owner=NULL;
     damage_window(w);
     damage_taskbar();
     update_focus();
@@ -339,6 +348,7 @@ static void unmap_user(struct window *w) {
 
 static void win_destroy_locked(struct window *w) {
     if (w->dead) return;
+    if(focus_owner==w)focus_owner=NULL;
     if (w->shown) damage_window(w);
     damage_taskbar(); /* its button goes away even when focus does not change */
     unmap_user(w);
@@ -893,7 +903,7 @@ static bool capture_layer(struct draw_layer *l, struct window *w, bool focus) {
     int64_t x1 = (int64_t)w->x + fw + SHADOW, y1 = (int64_t)w->y + fh + SHADOW;
     if (x1 <= 0 || y1 <= 0 || x0 >= sw || y0 >= sh || !w->buf) return false;
     *l = (struct draw_layer){.x=w->x, .y=w->y, .cw=w->cw, .ch=w->ch,
-        .fw=fw, .fh=fh, .cx=client_x(w), .cy=client_y(w), .flags=w->flags,
+        .fw=fw, .fh=fh, .cx=client_x(w), .cy=client_y(w), .flags=w->flags|(w->fullscreen?WIN_NO_DECOR:0),
         .hover=hover_win==w ? hover_btn : 0, .focus=focus,
         .maximized=w->maximized, .pixels=w->buf, .client_raw_overwrite=true,
         .bounds={MAX(0,x0),MAX(0,y0),MIN(sw,x1)-MAX(0,x0),MIN(sh,y1)-MAX(0,y0)}};
@@ -1352,7 +1362,7 @@ static void composite_rect(struct rect r) {
         gfx_rect(c, o.x, o.y, o.w, o.h, RGB(180, 160, 255));
         gfx_rect(c, o.x + 1, o.y + 1, o.w - 2, o.h - 2, RGB(90, 70, 200));
     }
-    if (r.y + r.h > sh - TASKBAR_H) draw_taskbar(c);
+    if (r.y + r.h > sh - TASKBAR_H&&(!focused()||!focused()->fullscreen||menu_open||vol_open)) draw_taskbar(c);
     if (menu_open) draw_menu(c);
     if (vol_open) draw_volume_panel(c);
     if (toast_until) draw_toast(c);
@@ -1482,6 +1492,7 @@ static void mouse_sink(const struct mouse_event *e) {
 }
 
 static void toggle_maximize(struct window *w) {
+    if(w->fullscreen)return;
     if (!(w->flags & WIN_RESIZABLE)) return;
     damage_window(w);
     struct gui_event e = {0};
@@ -1633,7 +1644,7 @@ static void left_press(void) {
         set_menu(false);
         if (my >= sh - TASKBAR_H && mx < TB_START_W) return; /* clicking start again closes */
     }
-    if (my >= sh - TASKBAR_H) {
+    if (my >= sh - TASKBAR_H&&(!focused()||!focused()->fullscreen)) {
         if (mx < TB_START_W) {
             set_menu(true);
             return;
@@ -1966,6 +1977,9 @@ static bool set_screen_size(int w, int h) {
     resize_visible = false;
     for (int i = 0; i < nwin; i++) {
         struct window *win = zorder[i];
+        if (win->fullscreen) {
+            struct gui_event e={.type=EV_RESIZE,.x=sw,.y=sh};win->x=win->y=0;push_event(win,&e);continue;
+        }
         if (win->maximized) {
             struct gui_event e = {0};
             e.type = EV_RESIZE;
@@ -2194,7 +2208,16 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         struct window *w=fd_window(file);
         if(!w)return -EBADF;
         if(w->pml4!=current_task->pml4)return -EPERM;
-        return (visible(w)?WIN_STATE_VISIBLE:0) | (focused()==w?WIN_STATE_FOCUSED:0);
+        return (visible(w)?WIN_STATE_VISIBLE:0) | (focused()==w?WIN_STATE_FOCUSED:0) | (w->fullscreen?WIN_STATE_FULLSCREEN:0);
+    }
+    case SYS_WIN_PRESENTATION: {
+        struct window *w=fd_window(file);if(!w)return -EBADF;
+        if(w->pml4!=current_task->pml4)return -EPERM;if(b>1)return -EINVAL;
+        if(w->fullscreen==!!b)return 0;
+        damage_window(w);struct gui_event resize={.type=EV_RESIZE};
+        if(b){w->fullscreen_restore=(struct rect){w->x,w->y,w->cw,w->ch};w->fullscreen=true;w->x=w->y=0;resize.x=sw;resize.y=sh;}
+        else{w->fullscreen=false;w->x=w->fullscreen_restore.x;w->y=w->fullscreen_restore.y;resize.x=w->fullscreen_restore.w;resize.y=w->fullscreen_restore.h;}
+        push_event(w,&resize);damage_window(w);damage_taskbar();wake_compositor();return 0;
     }
     case SYS_WIN_PRESENT: {
         struct window *w = fd_window(file);
@@ -2317,7 +2340,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
 int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
     if (num == SYS_GUI_LAUNCH) return wm_syscall_locked(num,a,b,c,d,e,NULL);
     struct file *file = NULL;
-    if (num == SYS_WIN_MAP || num == SYS_WIN_STATE || num == SYS_WIN_PRESENT ||
+    if (num == SYS_WIN_MAP || num == SYS_WIN_STATE || num == SYS_WIN_PRESENTATION || num == SYS_WIN_PRESENT ||
         num == SYS_WIN_SET_TITLE || num == SYS_WIN_MOVE || num == SYS_WIN_RESIZE) {
         uint64_t flags = irq_save();
         int fd = (int)a;

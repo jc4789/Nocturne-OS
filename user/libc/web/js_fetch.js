@@ -50,6 +50,54 @@ const fetchBridge = (() => {
     const forbidden=/^(accept-charset|accept-encoding|access-control-request-headers|access-control-request-method|connection|content-length|cookie2?|date|dnt|expect|host|keep-alive|origin|referer|set-cookie|te|trailer|transfer-encoding|upgrade|via)$|^(proxy-|sec-)/i;
     const nullStatuses=new Set([101,103,204,205,304]);
     const cacheModes=['default','no-store','reload','no-cache','force-cache','only-if-cached'];
+    const sriCode=String.prototype.charCodeAt, sriIndex=String.prototype.indexOf, sriSlice=String.prototype.slice;
+    const sriDigest=host.cryptoDigest, sriAlphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+    /* W3C SRI 3.3.2--3.3.4 and Fetch main-fetch integrity handling.
+       A malformed supported stronger hash must not downgrade to a matching
+       weaker one. Unknown algorithms/options are ignored as specified. */
+    function integrityMetadata(text) {
+        let strength=0,algorithm='',values=setPrototype([],null);
+        const space=c=>c===9||c===10||c===12||c===13||c===32;
+        for(let i=0;i<text.length;) {
+            if(space(apply(sriCode,text,[i]))){i++;continue;}
+            const start=i;while(i<text.length&&!space(apply(sriCode,text,[i])))i++;
+            const item=apply(sriSlice,text,[start,i]),option=apply(sriIndex,item,['?']);
+            const expression=option<0?item:apply(sriSlice,item,[0,option]);
+            const dash=apply(sriIndex,expression,['-']),name=dash<0?expression:apply(sriSlice,expression,[0,dash]);
+            const rank=name==='sha256'?1:name==='sha384'?2:name==='sha512'?3:0;
+            if(!rank||rank<strength)continue;
+            if(rank>strength){strength=rank;algorithm=rank===1?'SHA-256':rank===2?'SHA-384':'SHA-512';values=setPrototype([],null);}
+            const next=dash<0?-1:apply(sriIndex,expression,['-',dash+1]);
+            values[values.length]=dash<0?'':apply(sriSlice,expression,[dash+1,next<0?expression.length:next]);
+        }
+        return {strength,algorithm,values};
+    }
+    function verifyIntegrity(response,metadata,signal) {
+        if(!metadata)return response;
+        const meta=slot(responseSlots,response,'Response'),body=slot(bodySlots,response,'Body');
+        /* Even unrecognized nonempty metadata cannot turn an opaque response
+           into integrity-eligible bytes or reveal its internal body. */
+        if(meta.type==='opaque'||meta.type==='opaqueredirect'||meta.type==='error')
+            throw new TypeError('Response is not eligible for integrity verification');
+        const sig=signalSlots.get(signal);if(sig.aborted)throw sig.reason;
+        if(!metadata.strength)return response;
+        if(body.stream)throw new TypeError('Integrity response was published before buffering completed');
+        const bytes=body.bytes===null?new AB(0):body.bytes;
+        const digest=apply(sriDigest,host,[metadata.algorithm,bytes]),size=apply(abLength,digest,[]);
+        if(size!==(metadata.strength===1?32:metadata.strength===2?48:64))throw new TypeError('Invalid integrity digest');
+        const hash=new U8(digest);let encoded='';
+        for(let i=0;i<size;i+=3) {
+            const a=hash[i],b=i+1<size?hash[i+1]:0,c=i+2<size?hash[i+2]:0;
+            encoded+=sriAlphabet[a>>>2]+sriAlphabet[((a&3)<<4)|(b>>>4)]+
+                (i+1<size?sriAlphabet[((b&15)<<2)|(c>>>6)]:'=')+(i+2<size?sriAlphabet[c&63]:'=');
+        }
+        if(sig.aborted)throw sig.reason;
+        for(let i=0;i<metadata.values.length;i++)if(encoded===metadata.values[i])return response;
+        /* The response has never escaped to author code. Release its exclusive
+           bytes on failure; an integrity error is a Fetch network TypeError. */
+        body.bytes=null;body.used=true;
+        throw new TypeError('Subresource integrity mismatch');
+    }
     let NativeURL, Params, paramsString, Encoder, encode, Decoder, decode;
     let blobAPI,formDataAPI,objectURLAPI,streams;
     const str=v=>{if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol to string');return String(v);};
@@ -196,6 +244,11 @@ const fetchBridge = (() => {
                     const s=requestSlots.get(object)||responseSlots.get(object);
                     resolve(blobAPI.fromBytes(bytes,headerValue(headerSlots.get(s.headers),'content-type')||''));
                 }
+                else if(kind==='formData'){
+                    const s=requestSlots.get(object)||responseSlots.get(object);
+                    if(!formDataAPI)throw notSupported('FormData is not initialized');
+                    resolve(formDataAPI.parse(bytes,headerValue(headerSlots.get(s.headers),'content-type')||''));
+                }
                 else {const text=apply(decode,new Decoder(),[bytes]);resolve(kind==='json'?parse(text):text);}
             }catch(e){reject(e);}};
             if(stream){
@@ -210,8 +263,7 @@ const fetchBridge = (() => {
     function installBody(proto) {
         define(proto,'bodyUsed',{configurable:true,enumerable:true,get(){const b=slot(bodySlots,this,'Body');return b.used||!!(b.stream&&streams.disturbed(b.stream));}});
         define(proto,'body',{configurable:true,enumerable:true,get(){return bodyStream(slot(bodySlots,this,'Body'));}});
-        for(const name of ['text','json','arrayBuffer','bytes','blob'])define(proto,name,{configurable:true,enumerable:true,writable:true,value:function(){return consume(this,name);}});
-        define(proto,'formData',{configurable:true,enumerable:true,writable:true,value:function(){try{slot(bodySlots,this,'Body');}catch(e){return reject(e);}return reject(notSupported('formData is not supported'));}});
+        for(const name of ['text','json','arrayBuffer','bytes','blob','formData'])define(proto,name,{configurable:true,enumerable:true,writable:true,value:function(){return consume(this,name);}});
     }
     const signalToken={};
     function newSignal(){return new AbortSignal(signalToken);}
@@ -377,13 +429,13 @@ const fetchBridge = (() => {
     for(const name of ['type','url','redirected','status','statusText','headers'])define(Response.prototype,name,{configurable:true,enumerable:true,get(){return slot(responseSlots,this,'Response')[name];}});
     installBody(Request.prototype);installBody(Response.prototype);
     function fetchCore(input,init,observer,forcePreflight=false) {
-        let r,s,b;
+        let r,s,b,integrity;
         try {
             r=new Request(input,init);s=requestSlots.get(r);b=bodySlots.get(r);
             const signal=signalSlots.get(s.signal);if(signal.aborted)return reject(signal.reason);
             if(s.mode==='no-cors'&&!host.noCorsFetch)throw notSupported('This native context has no no-cors transport');
             if(s.redirect==='manual')throw notSupported('Opaque manual redirect responses are not supported');
-            if(s.integrity)throw notSupported('Subresource integrity is not supported by fetch');
+            integrity=s.integrity?integrityMetadata(s.integrity):null;
             // These overrides really request the native host's existing
             // no-referrer behavior. Do not reject them as missing transport.
             const noReferrer=s.referrer===''||s.referrerPolicy==='no-referrer';
@@ -394,13 +446,17 @@ const fetchBridge = (() => {
             if(s.cache==='only-if-cached')throw new TypeError('No cached response is available');
             if(objectURLAPI&&s.url.startsWith('blob:')){
                 const local=objectURLAPI.fetch(s.url,s.method,headerValue(headerSlots.get(s.headers),'range')),fields={'content-type':local.type,'content-length':String(local.size)};if(local.range)fields['content-range']=local.range;const headers=makeHeaders(fields,'immutable');
-                return new NativePromise(resolve=>resolve(responseObject({status:local.status,statusText:local.status===206?'Partial Content':'OK',url:s.url.split('#')[0],headers,redirected:false,type:'basic'},{bytes:local.bytes,used:false,abort:s.signal})));
+                const response=responseObject({status:local.status,statusText:local.status===206?'Partial Content':'OK',url:s.url.split('#')[0],headers,redirected:false,type:'basic'},{bytes:s.method==='HEAD'?null:local.bytes,used:false,abort:s.signal});
+                return new NativePromise(resolve=>resolve(verifyIntegrity(response,integrity,s.signal)));
             }
             let raw='';for(const [name,value]of sortedHeaders(headerSlots.get(s.headers)))raw+=name+': '+value+'\r\n';
             let pair,channel,channelRef,waiting,transportId=0,done=false,hasBody=false,finishStream=()=>{};
             const liveChannel=()=>channel||(channelRef&&apply(deref,channelRef,[]));
             const resume=()=>{if(!done&&transportId)host.resumeFetch(transportId);};
-            if(host.streamingFetch&&streams){
+            /* Integrity responses must be fully verified before either their
+               headers/Response or body stream is exposed. Requests without
+               metadata retain the existing native streaming flow control. */
+            if(host.streamingFetch&&streams&&!integrity){
                 channel=streams.network(()=>new NativePromise(resolve=>{waiting=resolve;resume();}),reason=>{
                     if(done)return;done=true;finishStream();host.cancel(transportId);
                     if(waiting){const resolve=waiting;waiting=null;resolve();}
@@ -450,7 +506,7 @@ const fetchBridge = (() => {
                         try {
                             const state=slot(bodySlots,response,'Body');state.abort=s.signal;
                             if(s.method==='HEAD')state.bytes=null;
-                            resolve(response);
+                            resolve(verifyIntegrity(response,integrity,s.signal));
                         }catch(e){reject(e);}
                     },error=>{if(finished)return;finished=true;done=true;cleanup();reject(error);}]);
                 }catch(e){finished=true;done=true;cleanup();const active=liveChannel();if(active)active.error(e);host.cancel(transportId);pendingReject=null;reject(e);}

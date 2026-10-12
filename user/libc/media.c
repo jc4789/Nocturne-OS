@@ -39,6 +39,7 @@ struct nmedia {
     bool video_borrowed;
     int64_t video_loan_pts;
     int64_t video_present_ms;bool video_present_set;
+    uint64_t video_decoded,video_dropped;
     int16_t samples[4096 * 2];
     uint64_t phase, step;
     int frame_audio, source_rate;
@@ -108,7 +109,7 @@ static AVCodecContext *open_decoder(nmedia *m, int stream) {
     /* Decoder-side pre-skip/discard adjusts frame PTS in packet time units. */
     c->pkt_timebase = s->time_base;
     int r = avcodec_parameters_to_context(c, s->codecpar);
-    if (r >= 0 && c->codec_id == AV_CODEC_ID_VP9 && c->profile != AV_PROFILE_UNKNOWN && c->profile != 0)
+    if (r >= 0 && c->codec_id == AV_CODEC_ID_VP9 && c->profile != AV_PROFILE_UNKNOWN && (c->profile < 0 || c->profile > 3))
         r = AVERROR(ENOSYS);
     if (r >= 0) r = avcodec_open2(c, codec, NULL);
     if (r < 0) { fail(m, "open decoder", r); avcodec_free_context(&c); return NULL; }
@@ -367,6 +368,7 @@ static int audio_output(nmedia *m, struct nmedia_output *o) {
         n++; m->phase += m->step;
     }
     o->kind = NMEDIA_AUDIO; o->samples = m->samples; o->frames = (size_t)n;
+    o->duration_ms=(int64_t)n*1000/SOUND_RATE;
     o->pts_ms = m->audio_pts + (int64_t)((start >> 16) * 1000 / ((uint64_t)m->source_rate << 16));
     if (m->phase >= end) { m->phase -= end; m->frame_audio = 0; av_frame_unref(f); }
     return o->kind;
@@ -427,16 +429,19 @@ static int video_output(nmedia *m,AVFrame *f,int64_t pts,struct nmedia_output *o
     size_t count,bytes;
     if (!nmedia_video_size(w,h,&count,&bytes)) return fail(m, "video dimensions/byte representation", AVERROR(EINVAL));
     enum AVPixelFormat format = (enum AVPixelFormat)f->format;
-    /* Upstream also compiles 10/12-bit VP9 DSP, but that is not a promise
-     * that our native ARGB output can render those profiles or HDR. */
-    if (m->video->codec_id == AV_CODEC_ID_VP9 &&
-        (m->video->profile != 0 || format != AV_PIX_FMT_YUV420P ||
-         (f->colorspace != AVCOL_SPC_UNSPECIFIED && f->colorspace != AVCOL_SPC_BT709 &&
-          f->colorspace != AVCOL_SPC_BT470BG && f->colorspace != AVCOL_SPC_SMPTE170M) ||
-         (f->color_trc != AVCOL_TRC_UNSPECIFIED && f->color_trc != AVCOL_TRC_BT709 &&
-          f->color_trc != AVCOL_TRC_GAMMA22 && f->color_trc != AVCOL_TRC_GAMMA28 && f->color_trc != AVCOL_TRC_SMPTE170M)))
-        return fail(m, "unsupported VP9 output profile/color", AVERROR(ENOSYS));
-    bool yuv = format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P || format == AV_PIX_FMT_YUV422P || format == AV_PIX_FMT_YUVJ422P || format == AV_PIX_FMT_YUV444P || format == AV_PIX_FMT_YUVJ444P;
+    /* Native surfaces remain SDR sRGB. Refuse an HDR transfer/BT2020 gamut
+       rather than silently rendering it as washed-out 8-bit BT709. */
+    if(f->colorspace==AVCOL_SPC_BT2020_NCL||f->colorspace==AVCOL_SPC_BT2020_CL||
+       f->color_trc==AVCOL_TRC_SMPTE2084||f->color_trc==AVCOL_TRC_ARIB_STD_B67)
+        return fail(m,"HDR requires native tone mapping/display support",AVERROR(ENOSYS));
+    int depth=8;
+    bool high420=format==AV_PIX_FMT_YUV420P10LE||format==AV_PIX_FMT_YUV420P12LE||format==AV_PIX_FMT_YUV420P16LE;
+    bool high422=format==AV_PIX_FMT_YUV422P10LE||format==AV_PIX_FMT_YUV422P12LE||format==AV_PIX_FMT_YUV422P16LE;
+    bool high444=format==AV_PIX_FMT_YUV444P10LE||format==AV_PIX_FMT_YUV444P12LE||format==AV_PIX_FMT_YUV444P16LE;
+    if(format==AV_PIX_FMT_YUV420P10LE||format==AV_PIX_FMT_YUV422P10LE||format==AV_PIX_FMT_YUV444P10LE)depth=10;
+    else if(format==AV_PIX_FMT_YUV420P12LE||format==AV_PIX_FMT_YUV422P12LE||format==AV_PIX_FMT_YUV444P12LE)depth=12;
+    else if(high420||high422||high444)depth=16;
+    bool yuv = high420||high422||high444||format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P || format == AV_PIX_FMT_YUV422P || format == AV_PIX_FMT_YUVJ422P || format == AV_PIX_FMT_YUV444P || format == AV_PIX_FMT_YUVJ444P;
     bool rgb = format == AV_PIX_FMT_RGB24 || format == AV_PIX_FMT_BGR24 || format == AV_PIX_FMT_BGRA || format == AV_PIX_FMT_RGBA || format == AV_PIX_FMT_BGR0 || format == AV_PIX_FMT_RGB0;
     if (!yuv && !rgb && format != AV_PIX_FMT_GRAY8) return fail(m, "unsupported decoded pixel format", AVERROR(ENOSYS));
     if (count > m->pixel_capacity) {
@@ -446,16 +451,25 @@ static int video_output(nmedia *m,AVFrame *f,int64_t pts,struct nmedia_output *o
     }
     bool full = f->color_range == AVCOL_RANGE_JPEG || format == AV_PIX_FMT_YUVJ420P || format == AV_PIX_FMT_YUVJ422P || format == AV_PIX_FMT_YUVJ444P;
     bool bt709 = f->colorspace == AVCOL_SPC_BT709;
-    int sx = format == AV_PIX_FMT_YUV444P || format == AV_PIX_FMT_YUVJ444P ? 0 : 1;
-    int sy = format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P ? 1 : 0;
+    int sx = high444||format == AV_PIX_FMT_YUV444P || format == AV_PIX_FMT_YUVJ444P ? 0 : 1;
+    int sy = high420||format == AV_PIX_FMT_YUV420P || format == AV_PIX_FMT_YUVJ420P ? 1 : 0;
     for (int y = 0; y < h; y++) {
-      int x=yuv?video_yuv_row(f,y,w,sx,sy,full,bt709,m->pixels+(size_t)y*w):0;
+      int x=yuv&&depth==8?video_yuv_row(f,y,w,sx,sy,full,bt709,m->pixels+(size_t)y*w):0;
       for (; x < w; x++) {
         int r, g, b;
         if (yuv) {
             int yy = f->data[0][(ptrdiff_t)y * f->linesize[0] + x];
             int u = f->data[1][(ptrdiff_t)(y >> sy) * f->linesize[1] + (x >> sx)] - 128;
             int v = f->data[2][(ptrdiff_t)(y >> sy) * f->linesize[2] + (x >> sx)] - 128;
+            if(depth>8){
+                uint16_t a,b,c;memcpy(&a,f->data[0]+(ptrdiff_t)y*f->linesize[0]+2*(ptrdiff_t)x,2);
+                memcpy(&b,f->data[1]+(ptrdiff_t)(y>>sy)*f->linesize[1]+2*(ptrdiff_t)(x>>sx),2);
+                memcpy(&c,f->data[2]+(ptrdiff_t)(y>>sy)*f->linesize[2]+2*(ptrdiff_t)(x>>sx),2);
+                /* Full integer range maps to the physical 8-bit surface;
+                   rounding is applied only once, before the existing matrix. */
+                unsigned maximum=(1u<<depth)-1;yy=(int)(((uint32_t)a*255+maximum/2)/maximum);
+                u=(int)(((uint32_t)b*255+maximum/2)/maximum)-128;v=(int)(((uint32_t)c*255+maximum/2)/maximum)-128;
+            }
             int c = full ? 256 * yy : 298 * MAX(yy - 16, 0);
             r = (c + (full ? bt709 ? 403 : 359 : bt709 ? 459 : 409) * v + 128) >> 8;
             g = (c - (full ? bt709 ? 48 : 88 : bt709 ? 55 : 100) * u - (full ? bt709 ? 120 : 183 : bt709 ? 136 : 208) * v + 128) >> 8;
@@ -473,6 +487,9 @@ static int video_output(nmedia *m,AVFrame *f,int64_t pts,struct nmedia_output *o
     m->info.width = w; m->info.height = h;
     o->kind = NMEDIA_VIDEO; o->pixels = m->pixels; o->width = w; o->height = h;
     o->pts_ms=pts;
+    AVStream *stream=m->format->streams[m->video_index];
+    o->duration_ms=f->duration>0?av_rescale_q(f->duration,stream->time_base,(AVRational){1,1000}):0;
+    if(o->duration_ms<=0){AVRational rate=stream->avg_frame_rate;if(rate.num>0&&rate.den>0)o->duration_ms=av_rescale_q(1,av_inv_q(rate),(AVRational){1,1000});}
     av_frame_unref(f); return o->kind;
 }
 static int video_return(nmedia *m,AVFrame *f,int64_t pts,struct nmedia_output *o){
@@ -495,6 +512,7 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
             int r = avcodec_receive_frame(m->pending, m->frame);
             if (r >= 0) {
                 if (m->pending == m->video) {
+                    m->video_decoded++;
                     int64_t pts=video_stamp(m,m->frame);
                     if(m->video_seek_ms>=0&&pts<m->video_seek_ms){av_frame_unref(m->frame);continue;}
                     if(m->video_present_set&&pts<m->video_present_ms){
@@ -502,12 +520,13 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
                            a newer real frame exists, never by a clock value. */
                         if(!m->video_late){m->video_late=av_frame_alloc();if(!m->video_late)return fail(m,"video catch-up ownership",AVERROR(ENOMEM));}
                         if(!m->video_late_set||pts>m->video_late_pts){
+                            if(m->video_late_set)m->video_dropped++;
                             av_frame_unref(m->video_late);av_frame_move_ref(m->video_late,m->frame);
                             m->video_late_pts=pts;m->video_late_set=true;
-                        }else av_frame_unref(m->frame);
+                        }else{m->video_dropped++;av_frame_unref(m->frame);}
                         continue;
                     }
-                    if(m->video_late_set){av_frame_unref(m->video_late);m->video_late_set=false;}
+                    if(m->video_late_set){m->video_dropped++;av_frame_unref(m->video_late);m->video_late_set=false;}
                     return video_return(m,m->frame,pts,o);
                 }
                 AVFrame *f = m->frame;
@@ -552,6 +571,7 @@ int nmedia_step(nmedia *m, struct nmedia_output *o) {
     return video_candidate(m,o);
 }
 void nmedia_video_time(nmedia *m,int64_t ms){if(m){m->video_present_ms=ms;m->video_present_set=ms>=0;}}
+void nmedia_video_stats(const nmedia *m,uint64_t *decoded,uint64_t *dropped){if(decoded)*decoded=m?m->video_decoded:0;if(dropped)*dropped=m?m->video_dropped:0;}
 bool nmedia_move_video(nmedia *m,const struct nmedia_output *o,uint32_t **pixels,size_t *capacity){
     size_t count;
     if(!m||!o||!pixels||!capacity||m->error[0]||!m->video_borrowed||o->kind!=NMEDIA_VIDEO||

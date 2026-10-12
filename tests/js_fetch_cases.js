@@ -120,8 +120,18 @@ async function runFetchCases() {
     assert(!firstChunk.done&&firstChunk.value instanceof Uint8Array&&new TextDecoder().decode(firstChunk.value)==='bytes','response stream contains real bytes');
     assert((await bodyReader.read()).done&&streamed.bodyUsed,'stream EOF and disturbance');bodyReader.releaseLock();
     await rejects(streamed.text(),'TypeError','stream reader consumes the body');
-    const unsupported=new Response('keep');assert((await new Response('keep').blob()).size===4,'Blob contains real body bytes');await rejects(unsupported.formData(),'NotSupportedError','FormData explicitly unsupported');
-    assert(!unsupported.bodyUsed&&await unsupported.text()==='keep','unsupported reader does not falsely consume');
+    const unsupported=new Response('keep');assert((await new Response('keep').blob()).size===4,'Blob contains real body bytes');await rejects(unsupported.formData(),'TypeError','formData requires a supported MIME type');
+    assert(unsupported.bodyUsed,'failed form parsing still consumes the body');
+    await rejects(unsupported.text(),'TypeError','consumed form body cannot be reused');
+    const encoded=new Response('a=1&a=2&name=%E6%9C%88+%F0%9F%8C%99&bad=%zz&=empty&&',{headers:{'Content-Type':'application/x-www-form-urlencoded;charset=shift_jis'}});
+    const fields=await encoded.formData();assert(fields instanceof FormData&&fields.getAll('a').join(',')==='1,2','formData preserves duplicate entry order');
+    assert(fields.get('name')==='月 🌙'&&fields.get('bad')==='%zz'&&fields.get('')==='empty','URL-encoded forms use UTF-8 plus and forgiving percent decoding');
+    const multipart=new FormData();multipart.append('field','月');multipart.append('field','two');multipart.append('file',new File([new Uint8Array([0,255,13,10,128])],'binary.dat',{type:'application/octet-stream'}));
+    const reconstructed=await new Response(multipart).formData(),file=reconstructed.get('file');
+    assert(reconstructed.getAll('field').join(',')==='月,two','real multipart entry list roundtrip');
+    assert(file instanceof File&&file.name==='binary.dat'&&file.type==='application/octet-stream','multipart File metadata');
+    assert(Array.from(new Uint8Array(await file.arrayBuffer())).join(',')==='0,255,13,10,128','multipart File bytes are not text decoded');
+    await rejects(new Response('--missing',{headers:{'Content-Type':'multipart/form-data'}}).formData(),'TypeError','missing multipart boundary rejected');
 
     const controller=new AbortController(),signal=controller.signal;
     assert(signal===controller.signal&&!signal.aborted&&signal.reason===undefined,'signal defaults');
@@ -148,8 +158,18 @@ async function runFetchCases() {
     let sync=false,bad;try{bad=fetch('api/json',{headers:{'bad name':'x'}});}catch(_){sync=true;}
     assert(!sync&&bad instanceof Promise,'validation failure is promise');await rejects(bad,'TypeError','validation rejection');
     await rejects(fetch('file:///data/secret'),'TypeError','network local scheme rejected');
-    for(const init of [{redirect:'manual'},{integrity:'sha256-test'},{referrerPolicy:'origin'}])
+    for(const init of [{redirect:'manual'},{referrerPolicy:'origin'}])
         await rejects(fetch('api/json',init),'NotSupportedError','unsupported transport options explicit');
+    await rejects(fetch('api/json',{integrity:'sha256-test'}),'TypeError','integrity mismatch is a network error');
+    const integrityURL=URL.createObjectURL(new Blob(['hello']));
+    try {
+        const digest='sha256-LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=';
+        const verified=await fetch(integrityURL,{integrity:digest});
+        assert(!verified.bodyUsed&&await verified.text()==='hello','integrity verifies real bytes before exposing an unused body');
+        await rejects(fetch(integrityURL,{integrity:digest+' sha512-invalid'}),'TypeError','supported stronger mismatch cannot downgrade');
+        const alternate=await fetch(integrityURL,{integrity:'sha256-invalid '+digest+'?future-option'});
+        assert(await alternate.text()==='hello','matching strongest alternative and ignored future option');
+    } finally { URL.revokeObjectURL(integrityURL); }
     // This focused host intentionally has no release_request callback. Product
     // browser keepalive support must not be confused with this host boundary.
     await rejects(fetch('api/json',{keepalive:true}),'TypeError','host without keepalive retirement rejects explicitly');

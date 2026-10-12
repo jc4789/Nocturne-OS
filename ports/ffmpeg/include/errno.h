@@ -16,5 +16,9 @@
 #define ENODATA 61
 #define EOVERFLOW 75
 #define EILSEQ 84
+#ifndef ENOTSUP
 #define ENOTSUP 95
+#endif
+#ifndef EOPNOTSUPP
 #define EOPNOTSUPP ENOTSUP
+#endif

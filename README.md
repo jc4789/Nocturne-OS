@@ -425,6 +425,7 @@ hyperv.ps1   Hyper-V VM setup
 - [GNU Unifont Japanese](https://unifoundry.com/unifont/index.html) のカーネル用ビットマップ（18.0.01、SIL Open Font License 1.1）。提供BDF原本・許諾・変換内容は `third_party/unifont/`、起動イメージ内の許諾は `/usr/share/licenses/unifont/`。`python -X utf8 scripts/build.py bitmap-fonts` で再生成できます。
 - [BearSSL](https://bearssl.org/) TLS library (MIT)
 - [TinyCC](https://bellard.org/tcc/) C compiler (LGPL-2.1, source in `third_party/tinycc`)
+- [FreeType](https://freetype.org/) 2.14.3はFreeType Project License（FTL）を選択。Nocturneの一部はFreeTypeチームの成果に基づきます。代替GPLv2ではなくFTLを使用し、原文・著作権表示・変更記録を保持します。
 - QuickJS JavaScript エンジン（MIT、ソースとライセンスは `third_party/quickjs`）
 - [Inter](https://rsms.me/inter/) typeface by Rasmus Andersson (SIL Open Font License 1.1, see `rootfs/usr/share/fonts/Inter-LICENSE.txt`)
 - Maple Mono（ユーザー提供の未改変TTF、SIL Open Font License 1.1）。ライセンス・各ファイルのSHA-256・収録文字の確認結果は `rootfs/usr/share/fonts/MapleMono-LICENSE.txt` と `MapleMono-manifest.json` に同梱。

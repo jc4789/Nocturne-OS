@@ -1,0 +1,9 @@
+Nocturne は FreeType 2.14.3 を FreeType Project License (FTL) の条件で使用します。
+代替の GPLv2 ライセンスは選択しません。上流の二重許諾文書と著作権表示、
+FTL.TXT 原文は保持します。GPLv2.TXT の同梱をGPLv2採用とは扱いません。
+
+Portions of this software are copyright (C) 1996-2026 The FreeType
+Project (https://freetype.org). All rights reserved.
+
+Nocturne の一部は FreeType チームの成果に基づいています。
+出典とローカル変更は third_party/freetype/README.nocturne.md に記録しています。

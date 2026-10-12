@@ -38,8 +38,11 @@
     let avmediaHandlerTarget = () => false;
     let blobHandlerTarget = () => false;
     let mseHandlerTarget = () => false;
+    let emeHandlerTarget = () => false;
+    let indexedDBHandlerTarget = () => false;
+    let presentationHandlerTarget = () => false;
     let textTrackHandlerTarget = () => false;
-    const globalHandlerTypes = new Set(('abort beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
+    const globalHandlerTypes = new Set(('abort beforeinput beforematch beforetoggle blur cancel change click close dblclick error focus focusin focusout formdata input invalid keydown keypress keyup load mousedown mouseenter mouseleave mousemove mouseout mouseover mouseup reset resize scroll select slotchange submit toggle wheel').split(' '));
     const windowHandlerTypes = new Set(('afterprint beforeprint beforeunload hashchange languagechange message messageerror offline online pageswap pagehide pagereveal pageshow popstate rejectionhandled storage unhandledrejection unload').split(' '));
     const bodyWindowTypes=new Set([...windowHandlerTypes,'blur','error','focus','load','resize','scroll']);
     const bodyWindowBrands=new WeakMap();
@@ -202,7 +205,7 @@
     }
     function handlerTarget(target,type) {
         return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document || svgHandlerTarget(target))) ||
-            (windowHandlerTypes.has(type) && target===globalThis) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || textTrackHandlerTarget(target,type);
+            (windowHandlerTypes.has(type) && target===globalThis) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type);
     }
     function bodyWindowHandler(target,type){
         if(!bodyWindowTypes.has(type) || target===globalThis)return false;
@@ -308,7 +311,7 @@
             try {
                 if (typeof x.callback === 'function') x.callback.call(target,event);
                 else x.callback.handleEvent(event);
-            } catch (e) { report(e); }
+            } catch (e) { s.listenerException=true;report(e); }
             s.passive=false;
             if(s.immediate)break;
         }
@@ -322,14 +325,14 @@
                     let x = cache.get(s.type);
                     if (!x || x.text !== text) {
                         try { x = {text, fn:host.inline(text)}; cache.set(s.type,x); }
-                        catch (e) { report(e); x = {text,fn:null}; cache.set(s.type,x); }
+                        catch (e) { s.listenerException=true;report(e); x = {text,fn:null}; cache.set(s.type,x); }
                     }
                     fn = x.fn;
                 }
             }
             if (typeof fn === 'function') {
                 try { if (fn.call(target,event) === false) event.preventDefault(); }
-                catch (e) { report(e); }
+                catch (e) { s.listenerException=true;report(e); }
             }
         }
     }
@@ -982,8 +985,11 @@
     /* @include js_object_url.js */
     fetchBridge.initializeObjectURLs(objectURLBridge);
     /* @include js_clone.js */
+    cloneData.registerUncloneable(formDataBridge.brand,'FormData');
+    cloneData.registerUncloneable(formDataBridge.eventBrand,'FormDataEvent');
     /* @include js_worker.js */
     /* @include js_storage.js */
+    /* @include js_indexeddb.js */
     /* @include js_messaging.js */
     /* @include js_css_supports.js */
     /* @include js_performance.js */
@@ -1016,6 +1022,8 @@
     /* @include js_canvas.js */
     /* @include js_mse.js */
     /* @include js_avmedia.js */
+    /* @include js_eme.js */
+    /* @include js_presentation.js */
     /* @include js_texttracks.js */
     /* @include js_sanitizer_constants.js */
     /* @include js_html_safety.js */

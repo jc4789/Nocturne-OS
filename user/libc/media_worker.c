@@ -176,7 +176,7 @@ static void control_io(nmedia_worker *w,uint64_t now,struct nmedia_worker_budget
         if(!take){completed(w);break;}
         void *dest=head?(unsigned char *)&w->response+w->head_pos:w->payload+w->rx_pos;
         ssize_t n=read(w->out,dest,take);
-        if(n<0&&errno==EAGAIN&&dispatch&&(w->head_pos||w->rx_pos)&&b->handoffs<16&&uptime_ms()<b->until) {
+        if(n<0&&errno==EAGAIN&&dispatch&&!b->nonblocking&&(w->head_pos||w->rx_pos)&&b->handoffs<16&&uptime_ms()<b->until) {
             if(!w->rx_pos)w->stats.header_waits++;
             b->handoffs++;w->stats.handoffs++;yield();
             if(uptime_ms()>=b->until)break;
@@ -213,7 +213,7 @@ static void video_io(nmedia_worker *w,struct nmedia_worker_budget *b,bool dispat
         size_t take=header?sizeof w->video_header-w->video_head_pos:w->video_header.bytes-w->video_rx_pos;
         void *dest=header?(uint8_t *)&w->video_header+w->video_head_pos:w->video_pixels+w->video_rx_pos;
         ssize_t n=read(w->video_fd,dest,take);
-        if(n<0&&errno==EAGAIN&&dispatch&&(w->video_head_pos||w->video_rx_pos)&&uptime_ms()<b->until){b->handoffs++;w->stats.handoffs++;yield();continue;}
+        if(n<0&&errno==EAGAIN&&dispatch&&!b->nonblocking&&(w->video_head_pos||w->video_rx_pos)&&uptime_ms()<b->until){b->handoffs++;w->stats.handoffs++;yield();continue;}
         if(n<0&&(errno==EAGAIN||errno==EINTR))break;if(n<=0){stop(w,"Range VIDEO pipe ended early");return;}
         w->stats.rx_bytes+=(size_t)n;
         if(header){w->video_head_pos+=(size_t)n;if(w->video_head_pos==sizeof w->video_header){

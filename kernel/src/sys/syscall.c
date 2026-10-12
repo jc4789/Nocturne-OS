@@ -481,10 +481,10 @@ static int64_t sys_sysinfo(struct n_sysinfo *si) {
 }
 
 static int64_t sys_fcntl(int fd, int cmd, int arg) {
-    if (cmd == F_NLOCK || cmd == F_NUNLOCK) {
+    if (cmd == F_NLOCK || cmd == F_NUNLOCK || cmd == F_NTRYLOCK) {
         struct file *owned = getfd_ref(fd);
         if (!owned) return -EBADF;
-        int result = vfs_lease(owned, cmd == F_NLOCK);
+        int result = cmd == F_NTRYLOCK ? vfs_try_lease(owned) : vfs_lease(owned, cmd == F_NLOCK);
         vfs_close(owned);
         return result;
     }

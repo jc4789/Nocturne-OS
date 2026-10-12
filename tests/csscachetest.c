@@ -107,6 +107,30 @@ int main(void){
         check(parsed_bytes()==before&&value->box&&near(value->box->w,80)&&near(value->box->h,20),
             "viewport reactivates import and independent link media without parse");
     }
+    char *inline_css=large_css(".inline_value{width:63px;height:11px}");
+    node_t *inline_sheet=element(d,"style",d->head,NULL);
+    node_t *inline_text=doc_node_create(d,N_TEXT,NULL,inline_css,inline_css?40000:0);
+    node_t *inline_value=element(d,"div",d->body,"inline_value");
+    if(inline_sheet&&inline_text)doc_node_move(d,inline_sheet,inline_text,NULL);
+    before=parsed_bytes();web_layout(d,800,600);
+    check(inline_css&&inline_value&&inline_value->box&&near(inline_value->box->w,63)&&parsed_bytes()-before==40000,
+        "large inline AST initially parsed once");
+    before=parsed_bytes();rescan(d,800);
+    check(parsed_bytes()==before,"inline AST survives conservative resource rescan");
+    node_t *inline_shadow=element(d,"style",shadow,NULL);
+    node_t *shadow_text=doc_node_create(d,N_TEXT,NULL,inline_css,inline_css?40000:0);
+    node_t *inline_shadow_value=element(d,"div",shadow,"inline_value");
+    if(inline_shadow&&shadow_text)doc_node_move(d,inline_shadow,shadow_text,NULL);
+    web_layout(d,800,600);
+    check(parsed_bytes()==before&&inline_shadow_value&&inline_shadow_value->box&&near(inline_shadow_value->box->w,63),
+        "identical inline source shares AST with independent shadow scope");
+    unsigned cached=d->css_reuse_count;
+    if(inline_sheet)doc_node_remove(d,inline_sheet);
+    if(inline_shadow)doc_node_remove(d,inline_shadow);
+    web_layout(d,800,600);
+    check(d->css_reuse_count+1==cached&&inline_value->box&&!near(inline_value->box->w,63),
+        "last inline owner removal retires shared cache without stale styles");
+    free(inline_css);
     free(parent_css);free(child_css);free(one_css);free(two_css);
     web_free(d);
 done:

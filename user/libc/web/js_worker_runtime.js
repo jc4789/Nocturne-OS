@@ -7,7 +7,7 @@
     /* @include js_dom_exception.js */
     const DOMException=domExceptionBridge.DOMException;
     const eventStates=new WeakMap(),listeners=new WeakMap(),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set;
-    const eventDefine=Object.defineProperty,eventMapGet=Map.prototype.get,eventMapSet=Map.prototype.set,eventSlice=Array.prototype.slice;
+    const eventDefine=Object.defineProperty,eventCreate=Object.create,eventMapGet=Map.prototype.get,eventMapSet=Map.prototype.set,eventSlice=Array.prototype.slice;
     const EventMap=Map,EventString=String,eventIndexOf=Array.prototype.indexOf,eventSplice=Array.prototype.splice;
     const eventString=value=>{if(typeof value==='symbol')throw new TypeError('Symbol is not a DOMString');return EventString(value);};
     function eventState(event){const s=apply(eventGet,eventStates,[event]);if(!s)throw new TypeError('Illegal Event receiver');return s;}
@@ -83,10 +83,27 @@
     }
     function dispatchNativeWorkerEvent(object,event){eventState(event).isTrusted=true;return dispatchWorkerEvent(object,event);}
     Object.assign(globalThis,{DOMException,Event,ErrorEvent,EventTarget});
+    const progressSlots=new WeakMap();
+    class ProgressEvent extends Event{
+        constructor(type,init={}){init=init==null?{}:Object(init);super(type,init);const number=v=>{const n=Number(v)||0;return Number.isFinite(n)?Number(BigInt(Math.trunc(n))&18446744073709551615n):0;};apply(eventSet,progressSlots,[this,{lengthComputable:!!init.lengthComputable,loaded:number(init.loaded),total:number(init.total)}]);}
+        get lengthComputable(){const s=apply(eventGet,progressSlots,[this]);if(!s)throw new TypeError('Illegal ProgressEvent receiver');return s.lengthComputable;}
+        get loaded(){const s=apply(eventGet,progressSlots,[this]);if(!s)throw new TypeError('Illegal ProgressEvent receiver');return s.loaded;}
+        get total(){const s=apply(eventGet,progressSlots,[this]);if(!s)throw new TypeError('Illegal ProgressEvent receiver');return s.total;}
+    }
+    Object.defineProperty(globalThis,'ProgressEvent',{value:ProgressEvent,writable:true,configurable:true});
+    let blobHandlerTarget=()=>false;
+    const fileHandlers=new WeakMap();
+    const dispatch=dispatchNativeWorkerEvent;
+    function installHandlers(prototype,types){for(const type of types)eventDefine(prototype,'on'+type,{enumerable:true,configurable:true,
+        get(){if(!blobHandlerTarget(this,type))throw new TypeError('Illegal event handler receiver');return apply(eventGet,fileHandlers,[this])?.[type]||null;},
+        set(value){if(!blobHandlerTarget(this,type))throw new TypeError('Illegal event handler receiver');let map=apply(eventGet,fileHandlers,[this]);if(!map){map=eventCreate(null);apply(eventSet,fileHandlers,[this,map]);}map[type]=typeof value==='function'?value:null;}});}
     /* @include js_navigator.js */
     const {navigator,Interface:WorkerNavigator}=navigatorBridge.create(true);
     /* @include js_encoding.js */
     /* @include js_url.js */
+    /* @include js_streams.js */
+    host.timer=(_,fn,ms,args)=>timer(fn,ms,args,false);host.clear=clearTimer;
+    /* @include js_blob.js */
     /* @include js_clone.js */
     /* @include js_worker_messaging.js */
     /* @include js_sanitizer_constants.js */
@@ -94,11 +111,20 @@
     const {MessageEvent,MessagePort,MessageChannel}=workerMessagingBridge;
     Object.assign(globalThis,{MessageEvent,MessagePort,MessageChannel});
     const target=new EventTarget(),timers=new Map(),timerHeap=[],fetches=new Map();let nextTimer=0,timerOrder=0,closed=false,address='',workerName='',workerCanCancel=false,reporting=false,lastPortTask=false,shared=false;
+    let formDataBridge;
+    function initializeWorkerFormData(){
+        // START's native policy URL is now established. No author script runs
+        // until the same crypto and form algorithms as Window are installed.
+        /* @include js_crypto.js */
+        /* @include js_formdata.js */
+        cloneData.registerUncloneable(value=>formDataBridge.brand(value));
+        return formDataBridge;
+    }
     const errorPayload=e=>({message:String(e?.message||e),filename:address,lineno:0,stack:String(e?.stack||'')});
     function report(e){const info=errorPayload(e);if(reporting){host.send(4,0,info);return;}reporting=true;try{const event=new ErrorEvent('error',{...info,error:e,cancelable:true});if(dispatchNativeWorkerEvent(target,event))host.send(4,0,info);}finally{reporting=false;}}
     function evalSource(text,url){return host.eval(String(text),String(url));}
     function postMessage(value,options){if(closed)return;const list=Array.isArray(options)?options:options?.transfer,prepared=workerMessagingBridge.prepareExternal(value,cloneData.transferList(list));try{host.portSend(2,0,0,prepared.packet,prepared.plan);}catch(error){workerMessagingBridge.abortExternal(prepared);throw error;}}
-    function close(){if(closed)return;closed=true;timers.clear();timerHeap.length=0;workerMessagingBridge.close();host.close();}
+    function close(){if(closed)return;closed=true;for(const p of fetches.values()){p.cleanup();p.reject(new DOMException('Worker closed','AbortError'));}fetches.clear();timers.clear();timerHeap.length=0;workerMessagingBridge.close();host.close();}
     const timerBefore=(a,b)=>a.due<b.due||(a.due===b.due&&a.order<b.order);
     function timerSwap(a,b){const t=timerHeap[a];timerHeap[a]=timerHeap[b];timerHeap[b]=t;timerHeap[a].index=a;timerHeap[b].index=b;}
     function timerFix(index){
@@ -165,49 +191,87 @@
             Buffer=ArrayBuffer,isView=ArrayBuffer.isView,Bytes=Uint8Array,Encoder=TextEncoder,Decoder=TextDecoder,NativeMap=Map,
             entries=Object.entries,isArray=Array.isArray,NativePromise=Promise,rejectPromise=Promise.reject,headerSlots=new WeakMap(),responseSlots=new WeakMap();
         const text=v=>{if(typeof v==='symbol')throw new TypeError('Symbol is not a DOMString');return string(v);};
+        const descriptor=(p,k)=>Object.getOwnPropertyDescriptor(p,k).get,typed=Object.getPrototypeOf(Bytes.prototype);
+        const abSize=descriptor(Buffer.prototype,'byteLength'),taBuffer=descriptor(typed,'buffer'),taOffset=descriptor(typed,'byteOffset'),taSize=descriptor(typed,'byteLength'),taTag=descriptor(typed,Symbol.toStringTag);
+        const dvBuffer=descriptor(DataView.prototype,'buffer'),dvOffset=descriptor(DataView.prototype,'byteOffset'),dvSize=descriptor(DataView.prototype,'byteLength');
+        const encode=Encoder.prototype.encode,decode=Decoder.prototype.decode,paramsString=URLSearchParams.prototype.toString;
         const hstate=h=>{const s=apply(get,headerSlots,[h]);if(!s)throw new TypeError('Illegal Headers invocation');return s;};
         const rstate=r=>{const s=apply(get,responseSlots,[r]);if(!s)throw new TypeError('Illegal Response invocation');return s;};
         const name=k=>{k=text(k).toLowerCase();if(!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(k))throw new TypeError('Invalid header name');return k;};
         const value=v=>{v=text(v).replace(/^[\t\r\n ]+|[\t\r\n ]+$/g,'');if(/[\0\r\n\u0100-\uffff]/.test(v))throw new TypeError('Invalid header value');return v;};
-        function writable(s,k){if(s.guard==='immutable')throw new TypeError('Headers are immutable');return s.guard!=='response'||!/^set-cookie2?$/.test(k);}
-        function append(h,k,v){const s=hstate(h);k=name(k);v=value(v);if(!writable(s,k))return;const old=apply(mapGet,s.map,[k]);apply(mapSet,s.map,[k,old===undefined?v:old+', '+v]);}
+        const forbidden=new Set(['accept-charset','accept-encoding','access-control-request-headers','access-control-request-method','connection','content-length','cookie','cookie2','date','dnt','expect','host','keep-alive','origin','referer','set-cookie','te','trailer','transfer-encoding','upgrade','via']);
+        function unsafe(v){return /[\x00-\x08\x0a-\x1f\x7f"():<>?@\[\\\]{}]/.test(v);}
+        function safelisted(k,v){if(v.length>128)return false;if(k==='accept')return !unsafe(v);
+            if(k==='accept-language'||k==='content-language')return /^[0-9A-Za-z *,.;=-]*$/.test(v);
+            if(k==='content-type')return !unsafe(v)&&['application/x-www-form-urlencoded','multipart/form-data','text/plain'].includes(v.split(';',1)[0].trim().toLowerCase());
+            return k==='range'&&/^bytes=[0-9]+-[0-9]*$/.test(v);
+        }
+        function writable(s,k,v=''){if(s.guard==='immutable')throw new TypeError('Headers are immutable');if(s.guard==='response')return !/^set-cookie2?$/.test(k);
+            if(s.guard==='request'||s.guard==='request-no-cors'){
+                if(forbidden.has(k)||/^(sec-|proxy-)/.test(k)||/^x-http-method(?:-override)?$|^x-method-override$/.test(k)&&v.split(',').some(m=>/^(CONNECT|TRACE|TRACK)$/i.test(m.trim())))return false;
+                if(s.guard==='request-no-cors'&&!safelisted(k,v))return false;
+            }return true;
+        }
+        function append(h,k,v){const s=hstate(h);k=name(k);v=value(v);const old=apply(mapGet,s.map,[k]),next=old===undefined?v:old+', '+v;if(!writable(s,k,next))return;apply(mapSet,s.map,[k,next]);}
         function fill(h,input){if(input===undefined)return;const source=apply(get,headerSlots,[input]);if(source){for(const pair of apply(mapEntries,source.map,[]))append(h,pair[0],pair[1]);return;}if(input===null||(typeof input!=='object'&&typeof input!=='function'))throw new TypeError('HeadersInit requires an object');if(isArray(input)||input[Symbol.iterator]){for(const pair of input){const parts=[...pair];if(parts.length!==2)throw new TypeError('Header pair requires two entries');append(h,parts[0],parts[1]);}}else for(const pair of entries(input))append(h,pair[0],pair[1]);}
         class Headers{
             constructor(input){apply(set,headerSlots,[this,{map:new NativeMap(),guard:'none'}]);fill(this,input);}
             append(k,v){append(this,k,v);}get(k){return apply(mapGet,hstate(this).map,[name(k)])??null;}has(k){return apply(mapHas,hstate(this).map,[name(k)]);}
-            set(k,v){const s=hstate(this);k=name(k);v=value(v);if(writable(s,k))apply(mapSet,s.map,[k,v]);}
-            delete(k){const s=hstate(this);k=name(k);if(writable(s,k))apply(mapDelete,s.map,[k]);}
+            set(k,v){const s=hstate(this);k=name(k);v=value(v);if(writable(s,k,v))apply(mapSet,s.map,[k,v]);}
+            delete(k){const s=hstate(this);k=name(k);if(writable(s,k,apply(mapGet,s.map,[k])||''))apply(mapDelete,s.map,[k]);}
             entries(){return apply(mapEntries,hstate(this).map,[]);}keys(){return apply(mapKeys,hstate(this).map,[]);}values(){return apply(mapValues,hstate(this).map,[]);}
             forEach(fn,thisArg){if(typeof fn!=='function')throw new TypeError('Callback required');for(const [k,v]of apply(mapEntries,hstate(this).map,[]))apply(fn,thisArg,[v,k,this]);}
             [Symbol.iterator](){return apply(mapEntries,hstate(this).map,[]);}
         }
         function headers(input,guard){const h=create(Headers.prototype);apply(set,headerSlots,[h,{map:new NativeMap(),guard:guard==='immutable'?'response':guard}]);fill(h,input);hstate(h).guard=guard;return h;}
         const copy=b=>b===null?null:apply(slice,b,[0]);
-        function response(bytes,info){const r=create(Response.prototype);apply(set,responseSlots,[r,{...info,bytes,used:false}]);if(bytes===null)define(r,'body',{value:null,enumerable:true,configurable:true});return r;}
-        function consume(r){const s=rstate(r);if(s.used)throw new TypeError('Body already consumed');if(s.bytes===null)return new Buffer(0);if(s.abort){const signal=workerAbortBridge.state(s.abort);if(signal.aborted)throw signal.reason;}s.used=true;return copy(s.bytes);}
+        function extract(body){
+            if(body==null)return {bytes:null,type:null};
+            if(formDataBridge&&formDataBridge.brand(body)){const encoded=formDataBridge.multipart(body);return {bytes:encoded.bytes,type:encoded.type};}
+            if(blobBridge.brand(body))return {bytes:blobBridge.bytes(body),type:blobBridge.type(body)||null};
+            if(streamBridge.brand(body)){if(streamBridge.locked(body)||streamBridge.disturbed(body))throw new TypeError('Body stream is unusable');return {stream:body,type:null};}
+            if(isView(body)){const typed=apply(taTag,body,[])!==undefined,b=apply(typed?taBuffer:dvBuffer,body,[]),at=apply(typed?taOffset:dvOffset,body,[]),n=apply(typed?taSize:dvSize,body,[]);
+                return {bytes:new Bytes(new Bytes(b,at,n)).buffer,type:null};}
+            let buffer=false;try{apply(abSize,body,[]);buffer=true;}catch(_){}if(buffer)return {bytes:copy(body),type:null};
+            let encoded;try{encoded=apply(paramsString,body,[]);}catch(_){}
+            return {bytes:apply(encode,new Encoder(),[encoded===undefined?text(body):encoded]).buffer,type:encoded===undefined?'text/plain;charset=UTF-8':'application/x-www-form-urlencoded;charset=UTF-8'};
+        }
+        function aborted(s){if(s.abort){const signal=workerAbortBridge.state(s.abort);if(signal.aborted)throw signal.reason;}}
+        function bodyUsed(s){return !!s.stream&&(s.used||streamBridge.disturbed(s.stream));}
+        function unusable(s){return bodyUsed(s)||(s.stream&&streamBridge.locked(s.stream));}
+        function response(bytes,info,stream=undefined){const r=create(Response.prototype),s={...info,used:false,stream:null};
+            s.stream=stream!==undefined?stream:bytes===null?null:streamBridge.fromBytes(bytes,()=>aborted(s));apply(set,responseSlots,[r,s]);return r;}
+        async function consume(r){const s=rstate(r);if(unusable(s))throw new TypeError('Body is disturbed or locked');aborted(s);if(s.stream===null)return new Buffer(0);s.used=true;const bytes=await streamBridge.collect(s.stream);aborted(s);return bytes;}
         class Response{
             constructor(body=null,init={}){
                 init=init??{};const status=init.status===undefined?200:(+init.status>>>0)&65535,statusText=init.statusText===undefined?'':text(init.statusText);
                 if(status<200||status>599)throw new RangeError('Invalid Response status');if(/[^\t\x20-\x7e\x80-\xff]/.test(statusText))throw new TypeError('Invalid status text');
                 if(body!==null&&[204,205,304].includes(status))throw new TypeError('Null-body status cannot have a body');
-                let bytes=null;if(body!==null){if(body instanceof Buffer)bytes=copy(body);else if(isView(body))bytes=new Bytes(new Bytes(body.buffer,body.byteOffset,body.byteLength)).buffer;else bytes=new Encoder().encode(text(body)).buffer;}
-                const h=headers(init.headers,'response');if(body!==null&&!(body instanceof Buffer)&&!isView(body)&&!apply(mapHas,hstate(h).map,['content-type']))append(h,'content-type','text/plain;charset=UTF-8');
-                apply(set,responseSlots,[this,{status,statusText,headers:h,url:'',redirected:false,type:'default',bytes,used:false,abort:null}]);if(bytes===null)define(this,'body',{value:null,enumerable:true,configurable:true});
+                const data=extract(body),h=headers(init.headers,'response');if(data.type&&!apply(mapHas,hstate(h).map,['content-type']))append(h,'content-type',data.type);
+                const s={status,statusText,headers:h,url:'',redirected:false,type:'default',used:false,abort:null,stream:null};s.stream=data.stream??(data.bytes===null?null:streamBridge.fromBytes(data.bytes));apply(set,responseSlots,[this,s]);
             }
             get status(){return rstate(this).status;}get statusText(){return rstate(this).statusText;}get headers(){return rstate(this).headers;}get url(){return rstate(this).url;}get redirected(){return rstate(this).redirected;}get type(){return rstate(this).type;}
-            get ok(){const s=rstate(this);return s.status>=200&&s.status<300;}get bodyUsed(){return rstate(this).used;}
+            get ok(){const s=rstate(this);return s.status>=200&&s.status<300;}get bodyUsed(){return bodyUsed(rstate(this));}get body(){return rstate(this).stream;}
             async arrayBuffer(){return consume(this);}
-            async text(){return new Decoder().decode(consume(this));}async json(){return JSON.parse(new Decoder().decode(consume(this)));}
-            clone(){const s=rstate(this);if(s.used)throw new TypeError('Body already consumed');return response(copy(s.bytes),{status:s.status,statusText:s.statusText,headers:headers(s.headers,hstate(s.headers).guard),url:s.url,redirected:s.redirected,type:s.type,abort:s.abort});}
+            async text(){return apply(decode,new Decoder(),[await consume(this)]);}async json(){return JSON.parse(apply(decode,new Decoder(),[await consume(this)]));}
+            async formData(){const data=await consume(this),s=rstate(this);return formDataBridge.parse(data,apply(mapGet,hstate(s.headers).map,['content-type'])||'');}
+            async blob(){const data=await consume(this),s=rstate(this);return blobBridge.fromBytes(data,apply(mapGet,hstate(s.headers).map,['content-type'])||'');}
+            clone(){const s=rstate(this);if(unusable(s))throw new TypeError('Body is disturbed or locked');let branch=null;if(s.stream!==null){const tee=streamBridge.tee(s.stream);s.stream=tee[0];branch=tee[1];}
+                return response(null,{status:s.status,statusText:s.statusText,headers:headers(s.headers,hstate(s.headers).guard),url:s.url,redirected:s.redirected,type:s.type,abort:s.abort},branch);}
         }
-        function networkResponse(r,flags,signal){
+        function networkResponse(r,flags,signal,method){
             if(flags&4)return response(null,{status:0,statusText:'',headers:headers(undefined,'immutable'),url:'',redirected:false,type:'opaque',abort:null});
             /* Native transport has already applied CORS exposure and cookie
                filtering, including redirect taint. Do not filter it twice. */
             const pairs=[];let statusText='';for(const line of text(r[2]).split(/\r?\n/)){if(line.startsWith('HTTP/1.1 ')){const at=line.indexOf(' ',9);if(at>=0)statusText=line.slice(at+1);continue;}const at=line.indexOf(':');if(at>0)pairs.push([line.slice(0,at),line.slice(at+1)]);}
-            return response([204,205,304].includes(r[0])?null:copy(r[3]),{status:r[0],statusText,headers:headers(pairs,'immutable'),url:r[1],redirected:!!(flags&2),type:flags&1?'cors':'basic',abort:signal});
+            return response(method==='HEAD'||[204,205,304].includes(r[0])?null:r[3],{status:r[0],statusText,headers:headers(pairs,'immutable'),url:r[1],redirected:!!(flags&2),type:flags&1?'cors':'basic',abort:signal});
         }
-        return {Headers,Response,NativePromise,reject:error=>apply(rejectPromise,NativePromise,[error]),text,networkResponse,remember:(id,p)=>apply(mapSet,fetches,[id,p]),take:id=>{const p=apply(mapGet,fetches,[id]);apply(mapDelete,fetches,[id]);return p;}};
+        function prepare(body,headerInit,method,noCors){if(body!=null&&(method==='GET'||method==='HEAD'))throw new TypeError('GET and HEAD cannot have a body');
+            const data=extract(body);if(data.stream)throw new DOMException('Worker streaming uploads are not implemented','NotSupportedError');
+            const h=headers(headerInit,noCors?'request-no-cors':'request');if(data.type&&!apply(mapHas,hstate(h).map,['content-type']))append(h,'content-type',data.type);
+            let lines='';for(const pair of apply(mapEntries,hstate(h).map,[]))lines+=pair[0]+': '+pair[1]+'\r\n';return {bytes:data.bytes,headers:lines};
+        }
+        return {Headers,Response,NativePromise,reject:error=>apply(rejectPromise,NativePromise,[error]),text,prepare,networkResponse,remember:(id,p)=>apply(mapSet,fetches,[id,p]),take:id=>{const p=apply(mapGet,fetches,[id]);apply(mapDelete,fetches,[id]);return p;}};
     })();
     const {Headers,Response}=workerFetchBridge,workerFetchURL=URL;
     function fetch(input,options={}){
@@ -219,17 +283,22 @@
                 integrity=options.integrity,keepalive=options.keepalive,method=options.method,mode=options.mode,
                 redirect=options.redirect,referrer=options.referrer,policy=options.referrerPolicy,signal=options.signal,
                 requestMode=mode===undefined?'cors':text(mode),ref=referrer===undefined?'about:client':text(referrer),refPolicy=policy===undefined?'':text(policy);
+            let requestMethod=method===undefined?'GET':text(method);if(!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(requestMethod))throw new TypeError('Invalid request method');
+            const upper=requestMethod.toUpperCase();if(['CONNECT','TRACE','TRACK'].includes(upper))throw new TypeError('Forbidden request method');
+            if(['DELETE','GET','HEAD','OPTIONS','POST','PUT'].includes(upper))requestMethod=upper;
             if(url.username||url.password)throw new TypeError('Fetch URL cannot contain credentials');
             if(!['cors','no-cors','same-origin','navigate'].includes(requestMode))throw new TypeError('Invalid request mode');
             if(!['','no-referrer','no-referrer-when-downgrade','same-origin','origin','strict-origin','origin-when-cross-origin','strict-origin-when-cross-origin','unsafe-url'].includes(refPolicy))throw new TypeError('Invalid referrer policy');
             if(ref!==''&&ref!=='about:client')new workerFetchURL(ref,address);
             const noReferrer=ref===''||refPolicy==='no-referrer';
             if(signal!=null&&!workerAbortBridge.brand(signal))throw new TypeError('Expected AbortSignal');
-            if((method!==undefined&&text(method).toUpperCase()!=='GET')||body!=null||headerInit!=null||(credentials!==undefined&&text(credentials)!=='same-origin')||(requestMode!=='cors'&&requestMode!=='no-cors')||(redirect!==undefined&&text(redirect)!=='follow')||(cache!==undefined&&text(cache)!=='default')||(integrity!==undefined&&text(integrity)!=='')||keepalive||(!noReferrer&&(ref!=='about:client'||refPolicy!=='')))throw new DOMException('Worker Fetch currently supports GET, cors/no-cors, same-origin credentials, follow redirects, and no-referrer/default referrer','NotSupportedError');
+            if((credentials!==undefined&&text(credentials)!=='same-origin')||(requestMode!=='cors'&&requestMode!=='no-cors')||(redirect!==undefined&&text(redirect)!=='follow')||(cache!==undefined&&text(cache)!=='default')||(integrity!==undefined&&text(integrity)!=='')||keepalive||(!noReferrer&&(ref!=='about:client'||refPolicy!=='')))throw new DOMException('Worker Fetch currently supports cors/no-cors, same-origin credentials, follow redirects, and no-referrer/default referrer','NotSupportedError');
+            const noCors=requestMode==='no-cors';if(noCors&&!['GET','HEAD','POST'].includes(requestMethod))throw new TypeError('Method is not CORS-safelisted');
+            const prepared=workerFetchBridge.prepare(body,headerInit,requestMethod,noCors);
             const requestURL=url.href;if(closed)throw new TypeError('Worker closed');
             if(signal!=null&&workerAbortBridge.state(signal).aborted)throw workerAbortBridge.state(signal).reason;
             if(signal!=null&&!workerCanCancel)throw new DOMException('This Worker host has no native Fetch cancellation','NotSupportedError');
-            return new workerFetchBridge.NativePromise((resolve,reject)=>{const id=host.request(requestURL,requestMode==='no-cors',noReferrer),p={resolve,reject,noCors:requestMode==='no-cors',signal,cleanup:()=>{}};workerFetchBridge.remember(id,p);if(signal!=null)p.cleanup=workerAbortBridge.subscribe(signal,reason=>{if(!workerFetchBridge.take(id))return;p.cleanup();try{host.cancel(id);}finally{reject(reason);}});});
+            return new workerFetchBridge.NativePromise((resolve,reject)=>{const id=host.request(requestURL,noCors,noReferrer,requestMethod,prepared.headers,prepared.bytes),p={resolve,reject,noCors,signal,method:requestMethod,cleanup:()=>{}};workerFetchBridge.remember(id,p);if(signal!=null)p.cleanup=workerAbortBridge.subscribe(signal,reason=>{if(!workerFetchBridge.take(id))return;p.cleanup();try{host.cancel(id);}finally{reject(reason);}});});
         }catch(error){return workerFetchBridge.reject(error);}
     }
     Object.assign(globalThis,{self:globalThis,navigator,WorkerNavigator,postMessage,close,importScripts,Headers,Response,AbortSignal,AbortController,fetch,
@@ -243,9 +312,9 @@
         safetyCheck:htmlSafetyBridge.check,
         safetyDynamicCode:htmlSafetyBridge.dynamicCode,
         safetyViolation(init){if(!closed)dispatchNativeWorkerEvent(target,htmlSafetyBridge.violationEvent(init));},
-        start(r){address=r[1];workerName=String(r[5]||"");workerCanCancel=r[6]===true;shared=r[9]===true;if(shared)delete globalThis.postMessage;if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker source failed','NetworkError');const locationURL=new URL(address);Object.defineProperty(globalThis,'location',{value:Object.freeze({href:address,origin:locationURL.origin,protocol:locationURL.protocol,host:locationURL.host,hostname:locationURL.hostname,port:locationURL.port,pathname:locationURL.pathname,search:locationURL.search,hash:locationURL.hash,toString(){return address;}}),configurable:true});evalSource(new TextDecoder().decode(r[3]),address);},
+        start(r){address=r[1];workerName=String(r[5]||"");workerCanCancel=r[6]===true;shared=r[9]===true;if(shared)delete globalThis.postMessage;if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker source failed','NetworkError');const locationURL=new URL(address);Object.defineProperty(globalThis,'location',{value:Object.freeze({href:address,origin:locationURL.origin,protocol:locationURL.protocol,host:locationURL.host,hostname:locationURL.hostname,port:locationURL.port,pathname:locationURL.pathname,search:locationURL.search,hash:locationURL.hash,toString(){return address;}}),configurable:true});if(!formDataBridge)formDataBridge=initializeWorkerFormData();evalSource(new TextDecoder().decode(r[3]),address);},
         receive(packet,op=2,id=0,kind=0){try{if(op===8||op===9||op===10){workerMessagingBridge.receivePort(id,kind,packet,op!==8);return;}const payload=kind===3?workerMessagingBridge.importExternal(packet):{data:cloneData.deserialize(packet),ports:[]};if(!closed){if(op===13){if(!shared||payload.ports.length!==1)throw new TypeError('Invalid shared worker connection');dispatchNativeWorkerEvent(target,new MessageEvent('connect',{data:'',source:payload.ports[0],ports:payload.ports}));}else dispatchNativeWorkerEvent(target,new MessageEvent('message',{data:payload.data,ports:payload.ports}));}}catch(e){if(!closed)dispatchNativeWorkerEvent(target,new MessageEvent('messageerror'));}},
-        loaded(id,r,flags=0){const p=workerFetchBridge.take(id);if(!p||closed)return;p.cleanup();if(r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!p.noCors)){p.reject(new TypeError(r[4]||'Worker fetch failed'));return;}try{p.resolve(workerFetchBridge.networkResponse(r,flags,p.signal));}catch(error){p.reject(error);}},
+        loaded(id,r,flags=0){const p=workerFetchBridge.take(id);if(!p||closed)return;p.cleanup();if(r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!p.noCors)){p.reject(new TypeError(r[4]||'Worker fetch failed'));return;}try{p.resolve(workerFetchBridge.networkResponse(r,flags,p.signal,p.method));}catch(error){p.reject(error);}},
         tick(now){if(closed)return false;const ports=workerMessagingBridge.ready();if(ports&&!lastPortTask){lastPortTask=true;return workerMessagingBridge.runOne();}const t=timerHeap[0];if(t&&t.due<=now){lastPortTask=false;if(t.repeat){t.due=now+t.delay;timerFix(0);}else clearTimer(t.id);try{t.fn(...t.args);}catch(e){report(e);}return true;}lastPortTask=ports;return ports?workerMessagingBridge.runOne():false;},
         deadline(){if(workerMessagingBridge.ready())return host.now();return timerHeap.length?timerHeap[0].due:-1;},report
     };

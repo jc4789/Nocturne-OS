@@ -13,8 +13,13 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavcodec/aacpsdsp_float.c \
     third_party/ffmpeg/libavcodec/aacsbr.c \
     third_party/ffmpeg/libavcodec/aactab.c \
+    third_party/ffmpeg/libavcodec/ac3.c \
     third_party/ffmpeg/libavcodec/ac3_channel_layout_tab.c \
     third_party/ffmpeg/libavcodec/ac3_parser.c \
+    third_party/ffmpeg/libavcodec/ac3dec_data.c \
+    third_party/ffmpeg/libavcodec/ac3dec_float.c \
+    third_party/ffmpeg/libavcodec/ac3dsp.c \
+    third_party/ffmpeg/libavcodec/ac3tab.c \
     third_party/ffmpeg/libavcodec/adts_header.c \
     third_party/ffmpeg/libavcodec/adts_parser.c \
     third_party/ffmpeg/libavcodec/allcodecs.c \
@@ -45,6 +50,7 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavcodec/dovi_rpudec.c \
     third_party/ffmpeg/libavcodec/dv_profile.c \
     third_party/ffmpeg/libavcodec/dynamic_hdr_vivid.c \
+    third_party/ffmpeg/libavcodec/eac3_data.c \
     third_party/ffmpeg/libavcodec/encode.c \
     third_party/ffmpeg/libavcodec/error_resilience.c \
     third_party/ffmpeg/libavcodec/exif.c \
@@ -56,6 +62,7 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavcodec/flacdata.c \
     third_party/ffmpeg/libavcodec/flacdec.c \
     third_party/ffmpeg/libavcodec/flacdsp.c \
+    third_party/ffmpeg/libavcodec/fmtconvert.c \
     third_party/ffmpeg/libavcodec/get_buffer.c \
     third_party/ffmpeg/libavcodec/golomb.c \
     third_party/ffmpeg/libavcodec/h2645_parse.c \
@@ -82,6 +89,18 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavcodec/h264pred.c \
     third_party/ffmpeg/libavcodec/h264qpel.c \
     third_party/ffmpeg/libavcodec/h274.c \
+    third_party/ffmpeg/libavcodec/hevc/cabac.c \
+    third_party/ffmpeg/libavcodec/hevc/data.c \
+    third_party/ffmpeg/libavcodec/hevc/dsp.c \
+    third_party/ffmpeg/libavcodec/hevc/filter.c \
+    third_party/ffmpeg/libavcodec/hevc/hevcdec.c \
+    third_party/ffmpeg/libavcodec/hevc/mvs.c \
+    third_party/ffmpeg/libavcodec/hevc/parse.c \
+    third_party/ffmpeg/libavcodec/hevc/parser.c \
+    third_party/ffmpeg/libavcodec/hevc/pred.c \
+    third_party/ffmpeg/libavcodec/hevc/ps.c \
+    third_party/ffmpeg/libavcodec/hevc/refs.c \
+    third_party/ffmpeg/libavcodec/hevc/sei.c \
     third_party/ffmpeg/libavcodec/idctdsp.c \
     third_party/ffmpeg/libavcodec/imgconvert.c \
     third_party/ffmpeg/libavcodec/itut35.c \
@@ -166,6 +185,23 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavcodec/vp9recon.c \
     third_party/ffmpeg/libavcodec/vpx_rac.c \
     third_party/ffmpeg/libavcodec/xiph.c \
+    third_party/ffmpeg/libavfilter/af_atempo.c \
+    third_party/ffmpeg/libavfilter/allfilters.c \
+    third_party/ffmpeg/libavfilter/audio.c \
+    third_party/ffmpeg/libavfilter/avfilter.c \
+    third_party/ffmpeg/libavfilter/avfiltergraph.c \
+    third_party/ffmpeg/libavfilter/buffersink.c \
+    third_party/ffmpeg/libavfilter/buffersrc.c \
+    third_party/ffmpeg/libavfilter/ccfifo.c \
+    third_party/ffmpeg/libavfilter/colorspace.c \
+    third_party/ffmpeg/libavfilter/drawutils.c \
+    third_party/ffmpeg/libavfilter/formats.c \
+    third_party/ffmpeg/libavfilter/framepool.c \
+    third_party/ffmpeg/libavfilter/framequeue.c \
+    third_party/ffmpeg/libavfilter/graphdump.c \
+    third_party/ffmpeg/libavfilter/graphparser.c \
+    third_party/ffmpeg/libavfilter/version.c \
+    third_party/ffmpeg/libavfilter/video.c \
     third_party/ffmpeg/libavformat/aacdec.c \
     third_party/ffmpeg/libavformat/allformats.c \
     third_party/ffmpeg/libavformat/apetag.c \

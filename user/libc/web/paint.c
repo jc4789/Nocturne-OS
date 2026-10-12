@@ -1314,6 +1314,12 @@ static void walk(struct pctx *P) {
     P->vx1 = P->c->cx1, P->vy1 = P->c->cy1;
     if (P->d->root_box) paint_box(P, P->d->root_box, true);
     float ox=P->ox,oy=P->oy,hx=P->hx,hy=P->hy;
+    node_t *fullscreen=P->d->fullscreen_element;
+    if(fullscreen&&fullscreen->box){
+        if(P->mode==M_HIT){memset(P->hit,0,sizeof *P->hit);P->hit_any=false;}
+        else if(P->mode==M_PAINT)gfx_fill(P->c,P->vx0,P->vy0,P->vx1-P->vx0,P->vy1-P->vy0,RGB(0,0,0));
+        P->top_root=fullscreen->box;paint_box(P,fullscreen->box,true);
+    }
     for(int i=0;i<web_dialog_count(P->d);i++) {
         node_t *n=web_dialog_at(P->d,i); if(!n || !n->box)continue;
         if(P->mode==M_HIT) {

@@ -2,11 +2,11 @@
 #include "media_mse_private.h"
 /* A native child owns a dynamic SourceBuffer registry. Wire has no pointers,
  * size_t, file paths or page-chosen protocols. */
-#define NMSW_MAGIC 0x4e4d5333u /* v3; split VIDEO lane, reject older children */
+#define NMSW_MAGIC 0x4e4d5335u /* v5; truthful frame decode/drop deltas */
 #define NMSW_BUSY 4
 #define NMSW_CLOCK 5 /* Decoded disabled tracks: time only, never fake AV data. */
 #define NMSW_VIDEO_PENDING 6 /* STEP ACK: one VIDEO packet on its own lane. */
-enum { NMSW_ADD=1,NMSW_APPEND,NMSW_REMOVE,NMSW_ABORT,NMSW_DROP,NMSW_END,NMSW_SEEK,NMSW_CHANGE,NMSW_STEP,NMSW_SELECT };
+enum { NMSW_ADD=1,NMSW_APPEND,NMSW_REMOVE,NMSW_ABORT,NMSW_DROP,NMSW_END,NMSW_SEEK,NMSW_CHANGE,NMSW_STEP,NMSW_SELECT,NMSW_KEYS };
 struct nmsw_command {
     uint32_t magic,op,generation,sequence,slot,flags,bytes,reserved;
     int64_t offset,start,end,current;
@@ -19,15 +19,16 @@ struct nmsw_info {
     char audio_codec[32],video_codec[32],container[32];
 };
 struct nmsw_response {
-    uint32_t magic,op,generation,sequence,quota_error,payload_bytes,frames,reserved;
+    uint32_t magic,op,generation,sequence,quota_error,payload_bytes,frames,decoded_frames;
     int32_t kind,width,height,slot;
     int64_t pts;
     uint32_t metadata_bytes,metadata_count;
+    uint32_t dropped_frames;
     char error[160];
 };
 /* Each record is followed by count ranges. Records are ordered by slot. */
 struct nmsw_metadata {
-    uint32_t slot,count,parsing,reserved;
+    uint32_t slot,count,parsing,key_waiting;
     uint64_t revision;int64_t group_end;
     struct nmsw_info info;
 };
@@ -43,7 +44,7 @@ struct nmsw_video {
 _Static_assert(sizeof(struct nmsw_command)==72,"MSE command wire v3");
 _Static_assert(sizeof(struct nmsw_video)==56,"MSE VIDEO wire v3");
 _Static_assert(sizeof(struct nmsw_info)==128,"MSE info wire");
-_Static_assert(sizeof(struct nmsw_response)==224,"MSE response wire v2");
+_Static_assert(sizeof(struct nmsw_response)==232,"MSE response wire v5");
 _Static_assert(sizeof(struct nmsw_metadata)==160,"MSE metadata wire v2");
 typedef struct nmedia_mse_worker nmedia_mse_worker;
 nmedia_mse_worker *nmedia_mse_worker_open(uint32_t,char *,size_t);
@@ -53,6 +54,11 @@ void nmedia_mse_worker_pump(nmedia_mse_worker *,uint64_t);
 void nmedia_mse_worker_pump_budget(nmedia_mse_worker *,uint64_t,uint64_t);
 /* One nonblocking receive pass only: never spawn, send, or yield. */
 void nmedia_mse_worker_collect(nmedia_mse_worker *);
+/* Native hotloop service: never spawn or hand off to a blocked peer. */
+void nmedia_mse_worker_service(nmedia_mse_worker *,uint64_t,uint64_t);
+bool nmedia_mse_worker_needs_service(const nmedia_mse_worker *);
+bool nmedia_mse_worker_service_due(const nmedia_mse_worker *,uint64_t);
+void nmedia_mse_worker_video_stats(const nmedia_mse_worker *,uint64_t *decoded,uint64_t *dropped);
 void nmedia_mse_worker_background(uint64_t);
 int64_t nmedia_mse_worker_deadline(uint64_t);
 bool nmedia_mse_worker_pending(const nmedia_mse_worker *);
@@ -74,11 +80,13 @@ bool nmedia_mse_worker_move_video(nmedia_mse_worker *,const struct nmedia_output
 /* Consume/copy the previously returned span before this call: its storage may
  * be reused. At most one STEP, sharing the current native burst end time. */
 void nmedia_mse_worker_prefetch(nmedia_mse_worker *,uint64_t);
+void nmedia_mse_worker_prefetch_service(nmedia_mse_worker *,uint64_t);
 void nmedia_mse_worker_close(nmedia_mse_worker *);
 
 bool nmedia_mse_worker_seeking(const nmedia_mse_worker *);
 uint64_t nmedia_mse_worker_revision(const nmedia_mse_worker *,unsigned);
 unsigned nmedia_mse_worker_output_slot(const nmedia_mse_worker *);
 bool nmedia_mse_worker_parsing(const nmedia_mse_worker *,unsigned);
+bool nmedia_mse_worker_key_waiting(const nmedia_mse_worker *);
 int64_t nmedia_mse_worker_group_end(const nmedia_mse_worker *,unsigned);
 void nmedia_mse_worker_time(nmedia_mse_worker *,int64_t);

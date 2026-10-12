@@ -70,7 +70,10 @@ static void memory_cases(void){
         CHECK(r==NMEDIA_AUDIO&&out.pts_ms==0);nmedia_close(m);
     }
     const uint8_t tiny[4]={0};
-    CHECK(nmedia_open_memory(tiny,NMEDIA_MAX_BYTES+1,error,sizeof error)==NULL);
+    /* The API now grows within real allocation/representation limits. A
+       4-byte pointer claiming 32 MiB was not valid memory; testing the retired
+       quota by that pointer caused a real out-of-bounds read in the caller. */
+    CHECK(nmedia_open_memory(tiny,SIZE_MAX,error,sizeof error)==NULL);
     CHECK(nmedia_open_memory(tiny,0,error,sizeof error)==NULL);
     CHECK(nmedia_open_memory(tiny,sizeof tiny,error,sizeof error)==NULL);
     CHECK(nmedia_open("/data/tests/media-fixtures/invalid.mp4",error,sizeof error)==NULL);
@@ -82,9 +85,9 @@ static void capabilities(void){
     CHECK(!strcmp(nmedia_can_play_type("audio/mpeg; codecs=mp3"),"probably"));
     CHECK(!strcmp(nmedia_can_play_type("video/mp4; codecs=\"avc1.42e01e, mp4a.40.2\""),"probably"));
     CHECK(!strcmp(nmedia_can_play_type("audio/flac; codecs=flac"),"probably"));
-    CHECK(!*nmedia_can_play_type("video/mp4; codecs=\"avc1.6e001e\""));
+    CHECK(!strcmp(nmedia_can_play_type("video/mp4; codecs=\"avc1.6e001e\""),"probably"));
     CHECK(!strcmp(nmedia_can_play_type("video/webm; codecs=vp9"),"probably"));
-    CHECK(!*nmedia_can_play_type("application/vnd.apple.mpegurl"));
+    CHECK(!strcmp(nmedia_can_play_type("application/vnd.apple.mpegurl"),"maybe"));
     CHECK(!*nmedia_can_play_type("video/mp4; codecs=\"avc1.42e01e,\""));
     CHECK(!*nmedia_can_play_type("audio/mp4; codecs=avc1.42e01e"));
     CHECK(!*nmedia_can_play_type("audio/wav; codecs=99"));

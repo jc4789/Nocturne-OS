@@ -9,6 +9,7 @@
 #include <limits.h>
 #include <webnet.h>
 #include "../libc/web/js_encoding.h"
+#include "../libc/web/js_crypto.h"
 #include "../libc/web/js_worker_transfer.h"
 #include "../libc/web/js_worker_port_lifetime.h"
 #include "../libc/web/js_worker_runtime.inc"
@@ -20,7 +21,7 @@ struct pending_load {struct pending_load*next;uint32_t id;struct client*client;}
 struct deferred {struct deferred *next;struct njw_header h;uint8_t *data;struct client*client;bool normalized;};
 struct outgoing {struct outgoing *next;struct njw_header h;size_t at;uint8_t *data;struct client*client;};
 struct policy_violation {struct policy_violation *next;JSValue init;struct web_html_policy_rule *rule;};
-struct worker {JSRuntime *rt;JSContext *ctx;JSValue hooks;uint32_t generation,request,interrupt_ticks,next_shared_port;uint64_t until;bool closed,established,output_failed,policy_initialized,shared,had_client,need_start;struct deferred *head,*tail,*before_start,*before_start_tail;struct outgoing *output,*last_output;size_t queued,output_bytes,in_flight;uint32_t next_lease;struct broker_lease *leases;struct broker_pair *ports;struct client*clients,*current_client,*network_client;struct pending_load*loads;struct n_pollfd*pollfds;struct client**pollclients;size_t pollcapacity;const char*script_url;web_doc policy_doc;struct policy_violation *violations,*last_violation;int policy_status;};
+struct worker {JSRuntime *rt;JSContext *ctx;JSValue hooks;uint32_t generation,request,interrupt_ticks,next_shared_port;uint64_t until;bool closed,established,output_failed,policy_initialized,shared,had_client,need_start;struct deferred *head,*tail,*before_start,*before_start_tail;struct outgoing *output,*last_output;size_t queued,output_bytes,in_flight;uint32_t next_lease;struct broker_lease *leases;struct broker_pair *ports;struct client*clients,*current_client,*network_client;struct pending_load*loads;struct n_pollfd*pollfds;struct client**pollclients;size_t pollcapacity;const char*script_url;char*security_url;web_doc policy_doc;struct policy_violation *violations,*last_violation;int policy_status;};
 struct output_publication {struct worker *worker;struct outgoing *packet;struct broker_pair *ports,*close_pair,*ack_pair;};
 static void output_link(void *opaque,void *packet){struct worker*w=opaque;struct outgoing*p=packet;size_t charge=sizeof p->h+p->h.bytes;if(p->client)p->client->in_flight+=charge;else w->in_flight+=charge;if(w->last_output)w->last_output->next=p;else w->output=p;w->last_output=p;}
 static void output_packet_free(struct worker*w,void *opaque){struct outgoing*p=opaque;if(p){if(p->client)p->client->references--;js_free(w->ctx,p->data);free(p);}}
@@ -266,24 +267,29 @@ static JSValue native_safety(JSContext *ctx,JSValueConst self,int argc,JSValueCo
 }
 static bool worker_policy_start(struct worker *w,JSValueConst start){
     JSContext *ctx=w->ctx;if(w->policy_initialized){JS_ThrowTypeError(ctx,"Worker policy already initialized");return false;}
-    JSValue inherit=JS_GetPropertyUint32(ctx,start,NJW_START_INHERIT_POLICY),headers=JS_UNDEFINED,url=JS_UNDEFINED,status=JS_UNDEFINED;
+    JSValue inherit=JS_GetPropertyUint32(ctx,start,NJW_START_INHERIT_POLICY),headers=JS_UNDEFINED,url=JS_UNDEFINED,status=JS_UNDEFINED,origin=JS_UNDEFINED;
     bool ok=false;if(!JS_IsBool(inherit)){JS_ThrowTypeError(ctx,"Missing native Worker policy metadata");goto done;}
     headers=JS_GetPropertyUint32(ctx,start,JS_ToBool(ctx,inherit)?NJW_START_CREATOR_POLICY:2);
-    url=JS_GetPropertyUint32(ctx,start,1);status=JS_GetPropertyUint32(ctx,start,0);
-    if(!JS_IsString(headers)||!JS_IsString(url)){JS_ThrowTypeError(ctx,"Invalid native Worker policy metadata");goto done;}
+    url=JS_GetPropertyUint32(ctx,start,1);status=JS_GetPropertyUint32(ctx,start,0);origin=JS_GetPropertyUint32(ctx,start,NJW_START_CREATOR_ORIGIN);
+    if(!JS_IsString(headers)||!JS_IsString(url)||!JS_IsString(origin)){JS_ThrowTypeError(ctx,"Invalid native Worker policy metadata");goto done;}
     if(JS_ToInt32(ctx,&w->policy_status,status)<0)goto done;
-    const char *text=JS_ToCString(ctx,headers),*address=JS_ToCString(ctx,url);
-    if(!text||!address){JS_FreeCString(ctx,text);JS_FreeCString(ctx,address);goto done;}
+    size_t origin_size=0;const char *text=JS_ToCString(ctx,headers),*address=JS_ToCString(ctx,url),*creator=JS_ToCStringLen(ctx,&origin_size,origin);
+    if(!text||!address||!creator){JS_FreeCString(ctx,text);JS_FreeCString(ctx,address);JS_FreeCString(ctx,creator);goto done;}
+    if(memchr(creator,0,origin_size)){JS_ThrowTypeError(ctx,"Invalid native Worker creator origin");JS_FreeCString(ctx,text);JS_FreeCString(ctx,address);JS_FreeCString(ctx,creator);goto done;}
+    /* Blob's authority is the parent's immutable creator-origin snapshot, not
+       an origin parsed out of author URL text. Keep script/CSP URLs unchanged. */
+    bool blob=!strncasecmp(address,"blob:",5);char *security=NULL;
+    if(blob){security=origin_size==SIZE_MAX?NULL:malloc(origin_size+1);if(security)memcpy(security,creator,origin_size+1);}
     size_t n=strlen(address);char *copy=n==SIZE_MAX?NULL:malloc(n+1);if(copy)memcpy(copy,address,n+1);
-    if(!copy)JS_ThrowOutOfMemory(ctx);
+    if(!copy||(blob&&!security)){free(copy);free(security);JS_ThrowOutOfMemory(ctx);}
     else{
         w->policy_doc.url=copy;
         bool loaded=JS_ToBool(ctx,inherit)?html_policy_snapshot_init(&w->policy_doc,text):html_policy_init(&w->policy_doc,text,NULL);
-        if(!loaded){free(copy);w->policy_doc.url=NULL;html_policy_free(&w->policy_doc);JS_ThrowOutOfMemory(ctx);}
-        else w->policy_initialized=ok=true;
+        if(!loaded){free(copy);free(security);w->policy_doc.url=NULL;html_policy_free(&w->policy_doc);JS_ThrowOutOfMemory(ctx);}
+        else{w->security_url=security;w->policy_initialized=ok=true;}
     }
-    JS_FreeCString(ctx,text);JS_FreeCString(ctx,address);
-done:JS_FreeValue(ctx,inherit);JS_FreeValue(ctx,headers);JS_FreeValue(ctx,url);JS_FreeValue(ctx,status);return ok;
+    JS_FreeCString(ctx,text);JS_FreeCString(ctx,address);JS_FreeCString(ctx,creator);
+done:JS_FreeValue(ctx,inherit);JS_FreeValue(ctx,headers);JS_FreeValue(ctx,url);JS_FreeValue(ctx,status);JS_FreeValue(ctx,origin);return ok;
 }
 static JSValue worker_code_check(JSContext *ctx,JSValueConst value,int kind,int argc,JSValueConst *argv,void *opaque){
     struct worker *w=opaque;
@@ -367,9 +373,24 @@ static JSValue native_request(JSContext *ctx,JSValueConst thisv,int argc,JSValue
     if(argc>1&&JS_ToBool(ctx,argv[1]))kind|=NJW_LOAD_NO_CORS;
     if(argc>2&&JS_ToBool(ctx,argv[2]))kind|=NJW_LOAD_NO_REFERRER;
     uint32_t id=++w->request;
-    if(!send_value(w,NJW_LOAD,id,kind,argv[0]))return JS_ThrowTypeError(ctx,"Worker fetch IPC failed");
+    JSValue packet=JS_NewArray(ctx);if(JS_IsException(packet))return packet;
+    bool ok=true;
+    for(unsigned i=0;i<4&&ok;i++){
+        JSValue value=i==0?JS_DupValue(ctx,argv[0]):i==1?argc>3?JS_DupValue(ctx,argv[3]):JS_NewString(ctx,"GET"):
+            i==2?argc>4?JS_DupValue(ctx,argv[4]):JS_NewString(ctx,""):argc>5?JS_DupValue(ctx,argv[5]):JS_NULL;
+        if(JS_IsException(value)||JS_DefinePropertyValueUint32(ctx,packet,i,value,JS_PROP_C_W_E)<0)ok=false;
+    }
+    if(ok)ok=send_value(w,NJW_LOAD,id,kind,packet);JS_FreeValue(ctx,packet);
+    if(!ok)return JS_HasException(ctx)?JS_EXCEPTION:JS_ThrowTypeError(ctx,"Worker fetch IPC failed");
     output_flush(w);
     return JS_NewUint32(ctx,id);
+}
+static JSValue native_context_url(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){
+    (void)self;(void)argc;(void)argv;struct worker*w=state(ctx);return JS_NewString(ctx,w->policy_doc.url?w->policy_doc.url:"");
+}
+static JSValue native_security_url(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){
+    (void)self;(void)argc;(void)argv;struct worker*w=state(ctx);
+    return JS_NewString(ctx,w->policy_initialized?(w->security_url?w->security_url:w->policy_doc.url):"");
 }
 static JSValue native_cancel(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
     (void)thisv;struct worker *w=state(ctx);uint32_t id;
@@ -437,7 +458,16 @@ static void policy_task(struct worker *w){
 int main(int argc,char**argv){
     struct worker w={0};w.shared=argc>1&&!strcmp(argv[1],"--shared-server");w.script_url=argc>2?argv[2]:"";w.hooks=JS_UNDEFINED;w.rt=JS_NewRuntime();if(!w.rt)return 1;JS_SetMemoryLimit(w.rt,NJW_HEAP_BYTES);JS_SetMaxStackSize(w.rt,512u*1024u);JS_SetCanBlock(w.rt,false);JS_SetInterruptHandler(w.rt,interrupt,&w);w.ctx=JS_NewContext(w.rt);if(!w.ctx){JS_FreeRuntime(w.rt);return 1;}JS_SetContextOpaque(w.ctx,&w);w.until=uptime_ms()+10000;
     if(trusted_native_init(w.ctx)<0)goto shutdown;
-    JSValue global=JS_GetGlobalObject(w.ctx),host=JS_NewObject(w.ctx);const JSCFunctionListEntry funcs[]={JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),JS_CFUNC_DEF("safetyRequired",1,native_safety_required),JS_CFUNC_DEF("send",3,native_send),JS_CFUNC_DEF("classID",1,native_class),JS_CFUNC_DEF("detach",1,native_detach),JS_CFUNC_DEF("transferCommit",1,native_transfer_commit),JS_CFUNC_DEF("portSend",6,native_port_send),JS_CFUNC_DEF("portLease",3,native_port_lease),JS_CFUNC_DEF("now",0,native_now),JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",3,native_request),JS_CFUNC_DEF("cancel",1,native_cancel),JS_CFUNC_DEF("import",1,native_import),JS_CFUNC_DEF("eval",2,native_eval)};JS_SetPropertyFunctionList(w.ctx,host,funcs,sizeof funcs/sizeof funcs[0]);web_js_encoding_init_isolated(w.ctx,host);web_js_navigator_init(w.ctx,host);JS_SetPropertyStr(w.ctx,global,"__workerHost",host);JS_FreeValue(w.ctx,global);
+    JSValue global=JS_GetGlobalObject(w.ctx),host=JS_NewObject(w.ctx);
+    const JSCFunctionListEntry funcs[]={JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),
+        JS_CFUNC_DEF("safetyRequired",1,native_safety_required),JS_CFUNC_DEF("send",3,native_send),JS_CFUNC_DEF("classID",1,native_class),
+        JS_CFUNC_DEF("detach",1,native_detach),JS_CFUNC_DEF("transferCommit",1,native_transfer_commit),JS_CFUNC_DEF("portSend",6,native_port_send),
+        JS_CFUNC_DEF("portLease",3,native_port_lease),JS_CFUNC_DEF("now",0,native_now),JS_CFUNC_DEF("url",0,native_context_url),JS_CFUNC_DEF("securityURL",0,native_security_url),
+        JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",6,native_request),JS_CFUNC_DEF("cancel",1,native_cancel),
+        JS_CFUNC_DEF("import",1,native_import),JS_CFUNC_DEF("eval",2,native_eval)};
+    JS_SetPropertyFunctionList(w.ctx,host,funcs,sizeof funcs/sizeof funcs[0]);
+    web_js_encoding_init_isolated(w.ctx,host);web_js_navigator_init(w.ctx,host);web_js_crypto_init(w.ctx,host);
+    JS_SetPropertyStr(w.ctx,global,"__workerHost",host);JS_FreeValue(w.ctx,global);
     w.hooks=JS_Eval(w.ctx,js_worker_runtime,sizeof js_worker_runtime-1,"<worker-bootstrap>",JS_EVAL_TYPE_GLOBAL);if(JS_IsException(w.hooks))goto shutdown;
     JS_SetDynamicCodeCheck(w.ctx,worker_code_check,&w);
     if(!w.shared&&fcntl(1,F_SETFL,O_NONBLOCK)<0)goto shutdown;
@@ -467,7 +497,7 @@ int main(int argc,char**argv){
     }
 shutdown:
     while(w.violations){struct policy_violation *v=w.violations;w.violations=v->next;JS_FreeValue(w.ctx,v->init);js_free(w.ctx,v);}
-    html_policy_free(&w.policy_doc);free(w.policy_doc.url);
+    html_policy_free(&w.policy_doc);free(w.policy_doc.url);free(w.security_url);
     while(w.output){struct outgoing*p=w.output;w.output=p->next;output_packet_free(&w,p);}
     while(w.head){struct deferred*d=w.head;w.head=d->next;deferred_free(d);}while(w.before_start){struct deferred*d=w.before_start;w.before_start=d->next;deferred_free(d);}output_ports_free(&w,w.ports);while(w.leases){struct broker_lease*l=w.leases;w.leases=l->next;free(l);}while(w.loads){struct pending_load*p=w.loads;w.loads=p->next;if(p->client)p->client->references--;free(p);}while(w.clients){struct client*c=w.clients;w.clients=c->next;if(c->active)close(c->fd);free(c->data);free(c);}free(w.pollfds);free(w.pollclients);JS_FreeValue(w.ctx,w.hooks);JS_FreeContext(w.ctx);JS_FreeRuntime(w.rt);return 0;
 }

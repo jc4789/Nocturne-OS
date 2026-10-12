@@ -16,7 +16,8 @@ enum { NJW_START=1,NJW_MESSAGE,NJW_LOADED,NJW_ERROR,NJW_LOAD,NJW_CLOSE,NJW_CONSO
 #define NJW_TRANSPORT_WINDOW 65536u
 /* Additional private START array fields; the 24-byte record ABI is unchanged.
  * Only the trusted parent chooses policy authority, never author JS. */
-enum { NJW_START_CREATOR_POLICY=7, NJW_START_INHERIT_POLICY=8, NJW_START_SHARED=9 };
+enum { NJW_START_CREATOR_POLICY=7, NJW_START_INHERIT_POLICY=8, NJW_START_SHARED=9,
+       NJW_START_CREATOR_ORIGIN=10 };
 #define NJW_WITH_PORTS 3u
 /* LOAD policy belongs to the private transport, not URL/header author data.
    Import scripts cannot opt out of their existing origin policy. */

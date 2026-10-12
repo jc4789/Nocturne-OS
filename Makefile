@@ -112,6 +112,7 @@ $(BUILD)/ffmpeg/%.o: %.c
 $(BUILD)/u/user/libc/media.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
 $(BUILD)/u/user/libc/media_adaptive.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
 $(BUILD)/u/user/libc/media_mse.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
+$(BUILD)/u/user/libc/media_rate.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
 
 # プロセス単位の生存メディア割当。既定は固定quotaなし、実OSmalloc失敗で判定。
 # FF原文は維持し、allocator/entropyの3接点だけをprivate familyへ接続。
@@ -182,7 +183,7 @@ user/libc/web/js_bootstrap.inc user/libc/web/js_form_url.inc &: $(wildcard user/
 	@$(PY) user/libc/web/js_embed.py
 $(BUILD)/u/user/libc/web/js.o: user/libc/web/js_bootstrap.inc
 $(BUILD)/u/user/libc/web/form_validation.o: user/libc/web/js_form_url.inc
-user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_error_event.js user/libc/web/js_clone.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_worker_embed.py
+user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_error_event.js user/libc/web/js_clone.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
 	@$(PY) user/libc/web/js_worker_embed.py
 $(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc user/libc/web/js_worker_transfer.h user/libc/web/js_worker_port_lifetime.h
 $(BUILD)/u/user/libc/web/js_worker.o: user/libc/web/js_worker.h user/include/js_worker_wire.h user/libc/web/js_worker_port_lifetime.h
@@ -206,6 +207,12 @@ $(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $
 	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
 
 # C++ is an additional host cross-build path; C/TinyCC keep their own flags.
+$(BUILD)/u/tests/media_cenc_test.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
+$(BUILD)/u/tests/media_cenc_test.o: user/libc/media_mse.c
+$(BUILD)/tests/media_cenc_test: $(BUILD)/u/tests/media_cenc_test.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
+	@mkdir -p $(dir $@)
+	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
+
 CXX_HEADERS := $(shell find user/include -type f) common/abi.h common/gfx.h
 $(BUILD)/cxx/libc++.a: scripts/build_cxx.py $(CXX_HEADERS)
 	@$(PY) scripts/build_cxx.py library

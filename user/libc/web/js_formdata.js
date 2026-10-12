@@ -2,14 +2,15 @@
  * Include after js_blob.js/js_crypto.js, before any author script runs.
  * https://xhr.spec.whatwg.org/#interface-formdata
  * https://html.spec.whatwg.org/multipage/form-control-infrastructure.html#multipart/form-data-encoding-algorithm
- * Native successful-control collection is not an entry-list bridge yet:
- * FormData(form) fails explicitly, rather than submitting an incomplete list. */
+ * Window constructors collect typed entries through the native form owner;
+ * body parsing/serialization remains shared with Worker realms. */
 const formDataBridge = (() => {
     'use strict';
     const apply=Reflect.apply, define=Object.defineProperty, create=Object.create;
     const setPrototype=Object.setPrototypeOf, names=Object.getOwnPropertyNames;
     const descriptor=Object.getOwnPropertyDescriptor, get=WeakMap.prototype.get, put=WeakMap.prototype.set;
     const slots=new WeakMap(), iteratorSlots=new WeakMap();
+    const eventSlots=new WeakMap(),windowForms=typeof htmlElementBrand==='function'&&typeof rawDom==='object'&&typeof dom==='function';
     const TypeErr=TypeError, DomErr=DOMException, StringImpl=String;
     const wellFormed=String.prototype.toWellFormed, slice=String.prototype.slice;
     const code=String.prototype.charCodeAt, Encoder=TextEncoder, encode=TextEncoder.prototype.encode;
@@ -20,7 +21,12 @@ const formDataBridge = (() => {
     const cryptoImpl=globalThis.crypto, random=cryptoImpl.getRandomValues;
     const U8=Uint8Array, typed=Object.getPrototypeOf(U8.prototype);
     const buffer=descriptor(typed,'buffer').get, byteLength=descriptor(typed,'byteLength').get;
-    const setBytes=U8.prototype.set, LIMIT=16*1024*1024;
+    // QuickJS's actual ArrayBuffer constructor stores an INT32_MAX byte span.
+    // This is representability, not a multipart/page quota; allocation may fail.
+    const setBytes=U8.prototype.set, LIMIT=0x7fffffff;
+    const Decoder=TextDecoder,decode=TextDecoder.prototype.decode;
+    const U32=Uint32Array;
+    const trim=String.prototype.trim,lower=String.prototype.toLowerCase;
     const iteratorProto=create(Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())));
     function list(){return setPrototype([],null);}
     function state(value){const s=apply(get,slots,[value]);if(!s)throw new TypeErr('Illegal FormData receiver');return s;}
@@ -75,13 +81,33 @@ const formDataBridge = (() => {
     define(iteratorProto,Symbol.toStringTag,{value:'FormData Iterator',configurable:true});
     class FormData {
         constructor(form=undefined,submitter=null){
-            if(form!==undefined)htmlElementBrand(form,'form');
+            if(form!==undefined){if(!windowForms)throw new TypeErr('HTMLFormElement is not available in this realm');htmlElementBrand(form,'form');}
             if(submitter!=null){
+                if(!windowForms)throw new TypeErr('HTMLElement is not available in this realm');
                 rawDom.get(submitter,'elementBrand');
                 if(rawDom.get(submitter,'namespaceURI')!=='http://www.w3.org/1999/xhtml')throw new TypeErr('Submitter must be an HTMLElement');
             }
-            if(form!==undefined)throw new DomErr('Native FormData(form) entry collection is not implemented','NotSupportedError');
-            apply(put,slots,[this,list()]);
+            if(form===undefined){apply(put,slots,[this,list()]);return;}
+            if(submitter!==null){
+                if(!dom('validation',submitter,'submitButton'))throw new TypeErr('Submitter must be a submit button');
+                const tag=rawDom.get(submitter,'localName');if(rawDom.get(submitter,'form:'+tag)!==form)throw new DomErr('Submitter belongs to another form','NotFoundError');
+            }
+            const packet=dom('formValue',form,'entriesBegin',submitter);
+            if(packet===null)throw new DomErr('Form entry list construction is already active','InvalidStateError');
+            try{
+                const collected=list();for(let i=0;i<packet.length;i++){const row=packet[i];let value;
+                    if(row[2]===null)value=scalar(row[1]);
+                    else if(row[6])value=formControlBridge.file(row[6],row[7]);
+                    else {const bits=create(null),options=create(null);options.type=row[3];if(!row[5])options.lastModified=row[4];bits[Symbol.iterator]=()=>{let done=false;const iterator=create(null);iterator.next=()=>done?{done:true}:(done=true,{done:false,value:row[1]});return iterator;};value=new NativeFile(bits,row[2],options);}
+                    const item=create(null);item.name=scalar(row[0]);item.value=value;collected[collected.length]=item;
+                }
+                // The event owns the construction list. The returned object
+                // gets its shallow clone only after handlers finish, as HTML
+                // requires; retaining event.formData cannot mutate it later.
+                const eventData=new FormData();apply(put,slots,[eventData,collected]);
+                const event=new NativeFormDataEvent('formdata',{bubbles:true,formData:eventData});eventState(event).isTrusted=true;dispatch(form,event);
+                const result=list();for(let i=0;i<collected.length;i++){const item=create(null);item.name=collected[i].name;item.value=collected[i].value;result[result.length]=item;}apply(put,slots,[this,result]);
+            }finally{dom('formValue',form,'entriesEnd');}
         }
         append(name,value,filename=undefined){const entries=state(this);required(arguments.length,2);const item=entry(name,value,filename,arguments.length);entries[entries.length]=item;}
         set(name,value,filename=undefined){const entries=state(this);required(arguments.length,2);const item=entry(name,value,filename,arguments.length);remove(entries,item.name,item);}
@@ -98,8 +124,19 @@ const formDataBridge = (() => {
     define(FormData.prototype,Symbol.toStringTag,{value:'FormData',configurable:true});
     for(const key of names(FormData.prototype))if(key!=='constructor'){const d=descriptor(FormData.prototype,key);d.enumerable=true;define(FormData.prototype,key,d);}
     define(globalThis,'FormData',{value:FormData,writable:true,configurable:true});
+    let NativeFormDataEvent=null;
+    if(windowForms){
+        const EventImpl=Event;
+        NativeFormDataEvent=class FormDataEvent extends EventImpl {
+            constructor(type,init){if(arguments.length<2)throw new TypeErr('FormDataEvent requires two arguments');if(typeof type==='symbol')throw new TypeErr('Cannot convert Symbol to DOMString');const eventType=StringImpl(type);if(init==null||typeof init!=='object'&&typeof init!=='function')throw new TypeErr('FormDataEvent requires a dictionary');const settings=create(null);settings.bubbles=!!init.bubbles;settings.cancelable=!!init.cancelable;settings.composed=!!init.composed;const value=init.formData;state(value);super(eventType,settings);apply(put,eventSlots,[this,value]);}
+            get formData(){const value=apply(get,eventSlots,[this]);if(value===undefined)throw new TypeErr('Illegal FormDataEvent receiver');return value;}
+        };
+        define(NativeFormDataEvent.prototype,Symbol.toStringTag,{value:'FormDataEvent',configurable:true});
+        const getter=descriptor(NativeFormDataEvent.prototype,'formData');getter.enumerable=true;define(NativeFormDataEvent.prototype,'formData',getter);
+        define(globalThis,'FormDataEvent',{value:NativeFormDataEvent,writable:true,configurable:true});
+    }
 
-    function quota(){throw new DomErr('Multipart body exceeds the 16 MiB limit','QuotaExceededError');}
+    function quota(){throw new RangeError('Multipart byte length is not representable by ArrayBuffer');}
     // Count the transformed UTF-8 bytes BEFORE creating normalized strings or
     // encoding buffers. Lone surrogates have already become U+FFFD at entry creation.
     function textSize(text,normalize,escape,available){
@@ -167,6 +204,119 @@ const formDataBridge = (() => {
         return {bytes:apply(buffer,bytes,[]),type:'multipart/form-data; boundary='+boundary};
     }
 
+    /* Body.formData consumes the real byte sequence. Binary parts never pass
+     * through a JS string, and delimiter search is linear even for hostile
+     * repeated prefixes. There is no alternate submission or DOM overlay. */
+    function parameters(text){
+        const result=create(null);let at=0;
+        while(at<text.length&&text[at]!==';')at++;
+        result.essence=apply(lower,apply(trim,apply(slice,text,[0,at]),[]),[]);
+        result.values=create(null);
+        while(at<text.length){
+            at++;while(text[at]===' '||text[at]==='\t')at++;
+            const start=at;while(at<text.length&&text[at]!=='='&&text[at]!==';')at++;
+            const name=apply(lower,apply(trim,apply(slice,text,[start,at]),[]),[]);
+            if(text[at]!=='=')continue;at++;
+            while(text[at]===' '||text[at]==='\t')at++;
+            let value='';
+            if(text[at]==='"'){
+                at++;let closed=false;
+                while(at<text.length){const ch=text[at++];if(ch==='"'){closed=true;break;}
+                    if(ch==='\\'&&at<text.length)value+=text[at++];else value+=ch;}
+                if(!closed)throw new TypeErr('Unterminated MIME parameter');
+                while(at<text.length&&text[at]!==';')at++;
+            }else {const begin=at;while(at<text.length&&text[at]!==';')at++;value=apply(trim,apply(slice,text,[begin,at]),[]);}
+            if(name&&!(name in result.values))result.values[name]=value;
+        }
+        return result;
+    }
+    function finder(pattern){
+        const count=apply(byteLength,pattern,[]),failure=new U32(count);
+        for(let i=1,j=0;i<count;i++){while(j&&pattern[i]!==pattern[j])j=failure[j-1];if(pattern[i]===pattern[j])j++;failure[i]=j;}
+        return (bytes,start,end=apply(byteLength,bytes,[]))=>{
+            for(let i=start,j=0;i<end;i++){while(j&&bytes[i]!==pattern[j])j=failure[j-1];if(bytes[i]===pattern[j])j++;if(j===count)return i+1-j;}
+            return -1;
+        };
+    }
+    function bodyMime(text){
+        /* Headers may combine several Content-Type values. Split only outside
+         * quoted parameters, then retain the last syntactically valid MIME. */
+        let start=0,quoted=false,escaped=false,result=null;
+        const valid=/^[!#$%&'*+.^_`|~0-9a-z-]+\/[!#$%&'*+.^_`|~0-9a-z-]+$/;
+        for(let i=0;i<=text.length;i++){
+            const ch=text[i];
+            if(i<text.length&&quoted){if(escaped)escaped=false;else if(ch==='\\')escaped=true;else if(ch==='"')quoted=false;continue;}
+            if(ch==='"'){quoted=true;continue;}
+            if(i===text.length||ch===','){
+                try{const candidate=parameters(apply(slice,text,[start,i]));if(valid.test(candidate.essence)&&candidate.essence!=='*/*')result=candidate;}catch(_){}
+                start=i+1;
+            }
+        }
+        if(!result)throw new TypeErr('Invalid form MIME type');return result;
+    }
+    function utf8(bytes,start,end){return apply(decode,new Decoder('utf-8',{ignoreBOM:true}),[new U8(apply(buffer,bytes,[]),start,end-start)]);}
+    function urlValue(bytes,start,end){
+        const output=new U8(end-start);let used=0;
+        const hex=c=>c>=48&&c<=57?c-48:c>=65&&c<=70?c-55:c>=97&&c<=102?c-87:-1;
+        for(let i=start;i<end;i++){let c=bytes[i];if(c===43)c=32;
+            else if(c===37&&i+2<end){const hi=hex(bytes[i+1]),lo=hex(bytes[i+2]);if(hi>=0&&lo>=0){c=hi*16+lo;i+=2;}}
+            output[used++]=c;
+        }
+        return utf8(output,0,used);
+    }
+    function parseBody(bufferValue,contentType){
+        const bytes=new U8(bufferValue),length=apply(byteLength,bytes,[]),mime=bodyMime(contentType),result=new FormData(),entries=state(result);
+        function add(name,value){const item=create(null);item.name=name;item.value=value;entries[entries.length]=item;}
+        if(mime.essence==='application/x-www-form-urlencoded'){
+            for(let start=0;start<length;){let end=start,equal=-1;
+                while(end<length&&bytes[end]!==38){if(bytes[end]===61&&equal<0)equal=end;end++;}
+                if(end>start)add(urlValue(bytes,start,equal<0?end:equal),urlValue(bytes,equal<0?end:equal+1,end));
+                start=end+1;
+            }
+            return result;
+        }
+        if(mime.essence!=='multipart/form-data')throw new TypeErr('Body is not form data');
+        const boundary=mime.values.boundary;
+        if(!boundary||/[\r\n\0]/.test(boundary))throw new TypeErr('Missing or invalid multipart boundary');
+        const marker=apply(encode,new Encoder(),['--'+boundary]),delimiter=apply(encode,new Encoder(),['\r\n--'+boundary]);
+        const markerSize=apply(byteLength,marker,[]),delimiterSize=apply(byteLength,delimiter,[]);
+        const findBoundary=finder(delimiter),findHeaders=finder(new U8([13,10,13,10]));
+        function closing(at){if(bytes[at]!==45||bytes[at+1]!==45)return false;let end=at+2;while(bytes[end]===32||bytes[end]===9)end++;
+            return end===length||(bytes[end]===13&&bytes[end+1]===10);}
+        let at=bytes[0]===13&&bytes[1]===10?2:0;
+        if(markerSize>length-at)throw new TypeErr('Missing multipart delimiter');
+        let opening=true;for(let i=0;i<markerSize;i++)if(bytes[at+i]!==marker[i]){opening=false;break;}
+        if(!opening){const preamble=findBoundary(bytes,0);if(preamble<0)throw new TypeErr('Invalid multipart opening');at=preamble+2;}
+        at+=markerSize;
+        for(;;){
+            if(closing(at))return result;
+            if(bytes[at]!==13||bytes[at+1]!==10)throw new TypeErr('Invalid multipart delimiter');
+            at+=2;const headerEnd=findHeaders(bytes,at);
+            if(headerEnd<0)throw new TypeErr('Incomplete multipart headers');
+            const headers=create(null);let line=at;
+            while(line<headerEnd){let end=line;while(end<headerEnd&&!(bytes[end]===13&&bytes[end+1]===10))end++;
+                let colon=line;while(colon<end&&bytes[colon]!==58)colon++;
+                if(colon===end)throw new TypeErr('Invalid multipart header');
+                const name=apply(lower,utf8(bytes,line,colon),[]),value=apply(trim,utf8(bytes,colon+1,end),[]);
+                if(!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(name)||name in headers)throw new TypeErr('Invalid duplicate multipart header');
+                headers[name]=value;line=end+2;
+            }
+            const disposition=parameters(headers['content-disposition']||'');
+            if(disposition.essence!=='form-data'||!('name' in disposition.values))throw new TypeErr('Missing form-data name');
+            const begin=headerEnd+4;let end=findBoundary(bytes,begin);
+            while(end>=0){const after=end+delimiterSize;if((bytes[after]===13&&bytes[after+1]===10)||closing(after))break;end=findBoundary(bytes,end+delimiterSize);}
+            if(end<0)throw new TypeErr('Incomplete multipart body');
+            let value;
+            if('filename' in disposition.values){
+                const part=new U8(apply(buffer,bytes,[]),begin,end-begin),bits=create(null),options=create(null);
+                bits[Symbol.iterator]=()=>{let done=false;const iterator=create(null);iterator.next=()=>done?{done:true}:(done=true,{done:false,value:part});return iterator;};
+                options.type=headers['content-type']||'text/plain';
+                value=new NativeFile(bits,disposition.values.filename,options);
+            }else value=utf8(bytes,begin,end);
+            add(disposition.values.name,value);at=end+delimiterSize;
+        }
+    }
+
     function faceValue(value){
         if(value===null)return null;
         const source=apply(get,slots,[value]),single=source===undefined,out=list();
@@ -182,5 +332,5 @@ const formDataBridge = (() => {
         if(single)add('',value);else for(let i=0;i<source.length;i++)add(source[i].name,source[i].value);
         const packet=list();packet[0]=single;packet[1]=out;return packet;
     }
-    return {brand:value=>apply(get,slots,[value])!==undefined,multipart,faceValue};
+    return {brand:value=>apply(get,slots,[value])!==undefined,eventBrand:value=>apply(get,eventSlots,[value])!==undefined,multipart,parse:parseBody,faceValue};
 })();

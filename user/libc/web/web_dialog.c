@@ -1,4 +1,5 @@
 #include "web_dialog.h"
+#include "web_presentation.h"
 #include "form_value.h"
 #include "form_validation.h"
 #include <limits.h>
@@ -50,6 +51,7 @@ void web_dialog_set_backdrop(web_doc *d, node_t *n, box_t *box) {
     int i = index_of(d, n); if (i >= 0) d->dialogs->stack[i].backdrop = box;
 }
 bool web_dialog_layer_box(web_doc *d, box_t *box) {
+    if(box&&box->node&&d&&box->node==d->fullscreen_element&&box==box->node->box)return true;
     return box && box->node && web_dialog_is_modal(d, box->node) &&
            (box->node->box == box || web_dialog_backdrop(d, box->node) == box);
 }
@@ -68,6 +70,7 @@ node_t *web_dialog_leave(web_doc *d, node_t *n) {
     return previous;
 }
 void web_dialog_sync(web_doc *d) {
+    web_presentation_sync(d);
     struct web_dialog_state *s = d ? d->dialogs : NULL;
     for (int i = 0; s && i < s->count;) {
         node_t *n = s->stack[i].node;
@@ -77,6 +80,7 @@ void web_dialog_sync(web_doc *d) {
     }
 }
 void web_dialog_removed(web_doc *d, node_t *subtree) {
+    web_presentation_removed(d,subtree);
     struct web_dialog_state *s = d ? d->dialogs : NULL;
     for (int i = 0; s && i < s->count;) {
         node_t *n = s->stack[i].node;
@@ -98,7 +102,7 @@ bool web_dialog_enter(web_doc *d, node_t *n) {
     d->dirty = d->need_style = true; d->layout_valid = false;
     return true;
 }
-void web_dialog_free(web_doc *d) { if (d) { if (d->dialogs) free(d->dialogs->stack); free(d->dialogs); d->dialogs = NULL; } }
+void web_dialog_free(web_doc *d) { if (d) { web_presentation_free(d);if (d->dialogs) free(d->dialogs->stack); free(d->dialogs); d->dialogs = NULL; } }
 bool web_dialog_inert(web_doc *d, node_t *n) {
     node_t *top = web_dialog_top(d);
     if (top && !under(n, top, true)) return true;
@@ -113,6 +117,7 @@ bool web_dialog_inert(web_doc *d, node_t *n) {
 bool web_node_inert(web_doc *d, web_node *n) { return web_dialog_inert(d,n); }
 bool web_modal_active(web_doc *d) { return web_dialog_top(d) != NULL; }
 void web_dialog_style(web_doc *d, node_t *n, style_t *st) {
+    web_presentation_style(d,n,st);
     if (!web_dialog_is_modal(d, n)) return;
     if (st->display == D_CONTENTS) st->display = D_BLOCK;
     if (st->position != POS_FIXED && st->position != POS_ABSOLUTE) st->position = POS_ABSOLUTE;

@@ -8,9 +8,11 @@
 #include <http.h>
 #include <webnet.h>
 #include <parallel.h>
+#include <webidb.h>
 #include <quickjs.h>
 #include "webi.h"
 #include "web_dialog.h"
+#include "web_presentation.h"
 #include "html_serialize.h"
 #include "html_lexbor.h"
 #include "html_policy.h"
@@ -191,6 +193,7 @@ struct web_js_state {
     unsigned ignore_destructive_writes_counter;
     uint64_t storage_source, storage_poll_due;
     char *storage_origin;
+    webidb *indexed_db;
     bool storage_subscribed[2];
     bool storage_event_turn;
     unsigned storage_event_kind;
@@ -2078,13 +2081,53 @@ static JSValue attribute_native_changed(struct web_js_state *s, node_t *n, const
     }
     return JS_UNDEFINED;
 }
+struct js_form_entry_sink {JSContext *ctx;JSValue rows;uint32_t count;struct web_js_state *state;};
+static bool form_entry_to_js(void *opaque,const struct web_face_entry *entry,bool empty_file,node_t *file_control,unsigned file_index){
+    struct js_form_entry_sink *sink=opaque;JSContext *ctx=sink->ctx;
+    if(sink->count==UINT32_MAX){JS_ThrowRangeError(ctx,"Form entry list representation overflow");return false;}
+    JSValue row=JS_NewArray(ctx);if(JS_IsException(row))return false;
+    /* Define own properties: inherited author Array setters must not execute
+       inside native collection or obtain borrowed native file storage. */
+    JSValue values[8]={JS_NewStringLen(ctx,entry->name,entry->name_length),
+        file_control?JS_NULL:entry->file?JS_NewArrayBufferCopy(ctx,entry->bytes,entry->size):JS_NewStringLen(ctx,(const char *)entry->bytes,entry->size),
+        entry->file?JS_NewStringLen(ctx,entry->filename?entry->filename:"",entry->filename_length):JS_NULL,
+        JS_NewString(ctx,entry->mime?entry->mime:""),JS_NewInt64(ctx,entry->last_modified),JS_NewBool(ctx,empty_file),
+        file_control?wrap(sink->state,file_control):JS_NULL,JS_NewUint32(ctx,file_index)};
+    for(unsigned i=0;i<8;i++)if(JS_IsException(values[i])){
+        for(unsigned j=0;j<8;j++)JS_FreeValue(ctx,values[j]);JS_FreeValue(ctx,row);return false;
+    }
+    for(unsigned i=0;i<8;i++)if(JS_DefinePropertyValueUint32(ctx,row,i,values[i],JS_PROP_C_W_E)<0){
+        for(unsigned j=i+1;j<8;j++)JS_FreeValue(ctx,values[j]);JS_FreeValue(ctx,row);return false;
+    }
+    if(JS_DefinePropertyValueUint32(ctx,sink->rows,sink->count,row,JS_PROP_C_W_E)<0)return false;
+    sink->count++;return true;
+}
 static JSValue form_value_dom(struct web_js_state *s, node_t *n, int argc, JSValueConst *argv) {
     JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
-    if (n->type != N_ELEM || n->foreign || n->tag != T_input || argc < 3)
-        return JS_ThrowTypeError(ctx, "HTMLInputElement receiver required");
+    if (n->type != N_ELEM || n->foreign || argc < 3)
+        return JS_ThrowTypeError(ctx, "Native form control receiver required");
     const char *op = JS_ToCString(ctx, argv[2]); if (!op) return JS_EXCEPTION;
     JSValue result;
-    if (!strcmp(op,"type")) result = JS_NewString(ctx,web_input_type_name(web_input_type(n)));
+    if(!strcmp(op,"entriesBegin")||!strcmp(op,"entriesEnd")){
+        if(n->tag!=T_form)result=JS_ThrowTypeError(ctx,"HTMLFormElement receiver required");
+        else if(!strcmp(op,"entriesEnd")){n->constructing_form_entries=false;result=JS_UNDEFINED;}
+        else if(n->constructing_form_entries)result=JS_NULL;
+        else{
+            node_t *submitter=argc>3&&!JS_IsNull(argv[3])&&!JS_IsUndefined(argv[3])?unwrap(ctx,argv[3]):NULL;
+            if(argc>3&&!JS_IsNull(argv[3])&&!JS_IsUndefined(argv[3])&&
+               (!submitter||!web_control_submit_button(submitter)||web_form_owner(d,submitter)!=n))
+                result=JS_ThrowTypeError(ctx,"Invalid form submitter");
+            else{
+                struct js_form_entry_sink sink={ctx,JS_NewArray(ctx),0,s};
+                n->constructing_form_entries=true;
+                bool ok=!JS_IsException(sink.rows)&&web_form_collect_entries(d,n,submitter,form_entry_to_js,&sink);
+                if(ok)result=sink.rows; /* JS finally releases the guard after formdata dispatch. */
+                else{JS_FreeValue(ctx,sink.rows);n->constructing_form_entries=false;
+                    result=JS_HasException(ctx)?JS_EXCEPTION:JS_ThrowInternalError(ctx,"Native form entry collection failed");}
+            }
+        }
+    }else if(n->tag!=T_input)result=JS_ThrowTypeError(ctx,"HTMLInputElement receiver required");
+    else if (!strcmp(op,"type")) result = JS_NewString(ctx,web_input_type_name(web_input_type(n)));
     else if (!strcmp(op,"number")) result = JS_NewFloat64(ctx,web_input_value_number(d,n));
     else if (!strcmp(op,"date")) result = JS_NewFloat64(ctx,web_input_value_date(d,n));
     else if (!strcmp(op,"setNumber") || !strcmp(op,"setDate")) {
@@ -3555,6 +3598,34 @@ static JSValue native_media(JSContext *ctx, JSValueConst this_val, int argc, JSV
     JS_SetPropertyStr(ctx, result, "matches", JS_NewBool(ctx, matches));
     JS_SetPropertyStr(ctx, result, "media", JS_NewString(ctx, text)); js_free(ctx, text); return result;
 }
+static JSValue native_presentation(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
+    struct web_js_state *s=state(ctx);
+    if(!s || !argc)return JS_ThrowTypeError(ctx,"Presentation operation required");
+    const char *op=JS_ToCString(ctx,argv[0]);if(!op)return JS_EXCEPTION;
+    JSValue result;
+    if(!strcmp(op,"enabled"))result=JS_NewBool(ctx,s->host.presentation!=NULL && !s->doc->frame_parent);
+    else if(!strcmp(op,"fullscreenElement") || !strcmp(op,"pipElement"))
+        result=wrap(s,web_presentation_element(s->doc,!strcmp(op,"fullscreenElement")?1:2));
+    else if(!strcmp(op,"pipSize")) {
+        int width=0,height=0;web_presentation_size(s->doc,&width,&height);
+        result=JS_NewArray(ctx);
+        if(!JS_IsException(result) &&
+           (JS_DefinePropertyValueUint32(ctx,result,0,JS_NewInt32(ctx,width),JS_PROP_C_W_E)<0 ||
+            JS_DefinePropertyValueUint32(ctx,result,1,JS_NewInt32(ctx,height),JS_PROP_C_W_E)<0)) {
+            JS_FreeValue(ctx,result);result=JS_EXCEPTION;
+        }
+    }
+    else if(!task_context_active(s) || sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))
+        result=history_security_error(ctx,"Inactive presentation authority");
+    else if(!strcmp(op,"fullscreen") || !strcmp(op,"pip")) {
+        node_t *node=argc>1?unwrap(ctx,argv[1]):NULL;
+        if(!node)result=JS_ThrowTypeError(ctx,"Presentation Element required");
+        else result=JS_NewInt32(ctx,web_presentation_request(s->doc,node,!strcmp(op,"fullscreen")?1:2,&s->host));
+    } else if(!strcmp(op,"exitFullscreen") || !strcmp(op,"exitPip"))
+        result=JS_NewBool(ctx,web_presentation_exit(s->doc,!strcmp(op,"exitFullscreen")?1:2));
+    else result=JS_ThrowTypeError(ctx,"Invalid presentation operation");
+    JS_FreeCString(ctx,op);return result;
+}
 static JSValue native_pointer_capture_pending(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
     int pending=argc?JS_ToBool(ctx,argv[0]):0;
@@ -3682,6 +3753,7 @@ static void storage_subscribe_document(struct web_js_state *s) {
     s->storage_poll_due=uptime_ms()+100;
 }
 static void storage_release_document(struct web_js_state *s) {
+    webidb_free(s->indexed_db);s->indexed_db=NULL;
     if(s->storage_source && s->host.storage_events && s->host.storage){
         struct web_storage_request request={.operation=WEB_STORAGE_RELEASE,.source=s->storage_source};
         struct web_storage_result out={0};s->host.storage(s->host.opaque,NULL,&request,&out);webstorage_result_free(&out);
@@ -3724,6 +3796,164 @@ static JSValue native_storage(JSContext *ctx, JSValueConst this_val, int argc, J
     JSValue result=native_storage_impl(ctx,this_val,argc,argv);
     p->depth--;if(outer)p->inclusive_ms+=uptime_ms()-start;
     return result;
+}
+/* Private persistence bridge: origin and lifetime come from the native realm,
+ * never from a caller-selected path. Busy leases are retried by JS tasks. */
+static JSValue indexed_db_result(JSContext *ctx,int status,JSValue first,JSValue second,int count) {
+    JSValue result=JS_NewArray(ctx);
+    if(JS_IsException(result) || JS_IsException(first) || JS_IsException(second))goto failed;
+    if(JS_DefinePropertyValueUint32(ctx,result,0,JS_NewInt32(ctx,status),JS_PROP_C_W_E)<0)goto failed;
+    JSValue value=first;first=JS_UNDEFINED;
+    if(JS_DefinePropertyValueUint32(ctx,result,1,value,JS_PROP_C_W_E)<0)goto failed;
+    if(count==3){value=second;second=JS_UNDEFINED;
+        if(JS_DefinePropertyValueUint32(ctx,result,2,value,JS_PROP_C_W_E)<0)goto failed;}
+    JS_FreeValue(ctx,second);return result;
+failed:
+    JS_FreeValue(ctx,result);JS_FreeValue(ctx,first);JS_FreeValue(ctx,second);return JS_EXCEPTION;
+}
+static bool indexed_db_buffer(JSContext *ctx,JSValueConst value,uint8_t **bytes,size_t *length) {
+    /* GetArrayBuffer reports wrong brands/detachment, but an empty owned
+     * buffer may legitimately have a NULL backing pointer. */
+    *bytes=JS_GetArrayBuffer(ctx,length,value);
+    if(*bytes)return true;
+    return !JS_HasException(ctx);
+}
+static const char *indexed_db_origin(JSContext *ctx,struct web_js_state *s) {
+    JSValue fn=JS_GetPropertyStr(ctx,s->hooks,"storageOrigin");
+    if(JS_IsException(fn))return NULL;
+    if(!JS_IsFunction(ctx,fn)){JS_FreeValue(ctx,fn);JS_ThrowInternalError(ctx,"Missing private origin parser");return NULL;}
+    JSValue url=JS_NewString(ctx,web_effective_url(s->doc));
+    JSValue value=JS_IsException(url)?JS_EXCEPTION:JS_Call(ctx,fn,s->hooks,1,&url);
+    JS_FreeValue(ctx,fn);JS_FreeValue(ctx,url);
+    const char *origin=JS_IsException(value)||JS_IsNull(value)?NULL:JS_ToCString(ctx,value);
+    JS_FreeValue(ctx,value);return origin;
+}
+static JSValue native_indexed_db(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s=state(ctx);
+    if(!s || !task_context_active(s) || sandbox_borrowed(s) ||
+       (sandbox_authority(s)&(SB_SCRIPTS|SB_ORIGIN)))
+        return history_security_error(ctx,"Sandbox or inactive IndexedDB authority");
+    if(argc<1)return JS_ThrowTypeError(ctx,"IndexedDB operation required");
+    const char *op=JS_ToCString(ctx,argv[0]);
+    if(!op)return JS_EXCEPTION;
+    JSValue result=JS_EXCEPTION;
+    uint32_t token=0;
+    int status=WEB_IDB_SECURITY;
+    if(!strcmp(op,"databases")) {
+        const char *origin=indexed_db_origin(ctx,s);
+        if(JS_HasException(ctx))goto done;
+        struct webidb_database *items=NULL;size_t count=0;
+        if(origin){if(!s->indexed_db)s->indexed_db=webidb_create();
+            status=s->indexed_db?webidb_databases(s->indexed_db,origin,&items,&count):WEB_IDB_MEMORY;}
+        JS_FreeCString(ctx,origin);
+        JSValue list=JS_NewArray(ctx);
+        if(!JS_IsException(list))for(size_t i=0;i<count;i++) {
+            if(i>UINT32_MAX){JS_ThrowOutOfMemory(ctx);JS_FreeValue(ctx,list);list=JS_EXCEPTION;break;}
+            JSValue item=JS_NewObject(ctx);
+            if(JS_IsException(item) ||
+               JS_DefinePropertyValueStr(ctx,item,"name",JS_NewStringLen(ctx,items[i].name,items[i].name_length),JS_PROP_C_W_E)<0 ||
+               JS_DefinePropertyValueStr(ctx,item,"version",JS_NewFloat64(ctx,(double)items[i].version),JS_PROP_C_W_E)<0) {
+                JS_FreeValue(ctx,item);JS_FreeValue(ctx,list);list=JS_EXCEPTION;break;
+            }
+            if(JS_DefinePropertyValueUint32(ctx,list,(uint32_t)i,item,JS_PROP_C_W_E)<0){JS_FreeValue(ctx,list);list=JS_EXCEPTION;break;}
+        }
+        webidb_databases_free(items,count);
+        result=indexed_db_result(ctx,status,list,JS_UNDEFINED,2);
+    } else if(argc<2) result=JS_ThrowTypeError(ctx,"IndexedDB operation argument required");
+    else if(!strcmp(op,"begin")) {
+        size_t name_length=0;
+        const char *name=JS_ToCStringLen(ctx,&name_length,argv[1]);
+        if(!name)goto done;
+        JSValue fn=JS_GetPropertyStr(ctx,s->hooks,"storageOrigin");
+        JSValue url=JS_NewString(ctx,web_effective_url(s->doc));
+        JSValue origin_value=JS_EXCEPTION;
+        if(!JS_IsException(fn) && !JS_IsException(url) && JS_IsFunction(ctx,fn))
+            origin_value=JS_Call(ctx,fn,s->hooks,1,&url);
+        else if(!JS_IsException(fn) && !JS_IsException(url))
+            JS_ThrowInternalError(ctx,"Missing private origin parser");
+        JS_FreeValue(ctx,fn);JS_FreeValue(ctx,url);
+        if(JS_IsException(origin_value)){JS_FreeCString(ctx,name);goto done;}
+        const char *origin=JS_IsNull(origin_value)?NULL:JS_ToCString(ctx,origin_value);
+        if(!JS_IsNull(origin_value) && !origin){JS_FreeValue(ctx,origin_value);JS_FreeCString(ctx,name);goto done;}
+        uint8_t *bytes=NULL;size_t length=0;
+        if(origin && task_context_active(s) && !sandbox_borrowed(s) &&
+           !(sandbox_authority(s)&(SB_SCRIPTS|SB_ORIGIN))) {
+            if(!s->indexed_db)s->indexed_db=webidb_create();
+            status=s->indexed_db?webidb_begin(s->indexed_db,origin,name,name_length,&token,&bytes,&length):WEB_IDB_MEMORY;
+        }
+        JS_FreeCString(ctx,origin);JS_FreeValue(ctx,origin_value);JS_FreeCString(ctx,name);
+        result=indexed_db_result(ctx,status,JS_NewUint32(ctx,token),bytes?JS_NewArrayBufferCopy(ctx,bytes,length):JS_NULL,3);
+        if(JS_IsException(result) && token)webidb_abort(s->indexed_db,token);
+        free(bytes);
+    } else {
+        if(JS_ToUint32(ctx,&token,argv[1])<0)goto done;
+        if(!s->indexed_db){result=JS_NewInt32(ctx,status);goto done;}
+        if(!strcmp(op,"connections") || !strcmp(op,"connect")) {
+            double version=0;
+            if(argc<3){JS_ThrowTypeError(ctx,"IndexedDB version required");goto done;}
+            if(JS_ToFloat64(ctx,&version,argv[2])<0)goto done;
+            if(!isfinite(version) || version<0 || version>9007199254740991.0 || floor(version)!=version) {
+                JS_ThrowTypeError(ctx,"Invalid IndexedDB version");goto done;
+            }
+            size_t count=0;uint32_t connection=0;
+            status=!strcmp(op,"connections")?
+                webidb_connections(s->indexed_db,token,(uint64_t)version,&count):
+                webidb_connect(s->indexed_db,token,(uint64_t)version,&connection);
+            result=indexed_db_result(ctx,status,!strcmp(op,"connections")?JS_NewFloat64(ctx,(double)count):JS_NewUint32(ctx,connection),JS_UNDEFINED,2);
+            if(JS_IsException(result) && connection)webidb_forget_connection(s->indexed_db,connection);
+        } else if(!strcmp(op,"poll")) {
+            int pending=0;uint64_t version=0;
+            status=webidb_poll(s->indexed_db,token,&pending,&version);
+            result=indexed_db_result(ctx,status,pending?JS_NewFloat64(ctx,(double)version):JS_NULL,JS_UNDEFINED,2);
+        } else if(!strcmp(op,"disconnect")) result=JS_NewInt32(ctx,webidb_disconnect(s->indexed_db,token));
+        else if(!strcmp(op,"abort")) result=JS_NewInt32(ctx,webidb_abort(s->indexed_db,token));
+        else if(!strcmp(op,"stage")) {
+            if(argc<3){JS_ThrowTypeError(ctx,"IndexedDB payload required");goto done;}
+            size_t length=0;uint8_t *bytes=NULL;
+            if(!indexed_db_buffer(ctx,argv[2],&bytes,&length))goto done;
+            char reference[65]={0};status=webidb_stage(s->indexed_db,token,bytes,length,reference);
+            result=indexed_db_result(ctx,status,JS_NewString(ctx,reference),JS_UNDEFINED,2);
+        } else if(!strcmp(op,"value")) {
+            if(argc<3){JS_ThrowTypeError(ctx,"IndexedDB reference required");goto done;}
+            const char *reference=JS_ToCString(ctx,argv[2]);if(!reference)goto done;
+            uint8_t *bytes=NULL;size_t length=0;
+            status=webidb_value(s->indexed_db,token,reference,&bytes,&length);
+            JS_FreeCString(ctx,reference);
+            result=indexed_db_result(ctx,status,status==WEB_IDB_OK?JS_NewArrayBufferCopy(ctx,bytes,length):JS_NULL,JS_UNDEFINED,2);
+            free(bytes);
+        } else if(!strcmp(op,"commit")) {
+            if(argc<5){JS_ThrowTypeError(ctx,"IndexedDB manifest and version required");goto done;}
+            double version=0;
+            if(JS_ToFloat64(ctx,&version,argv[4])<0)goto done;
+            if(!isfinite(version)||version<0||version>9007199254740991.0||floor(version)!=version){JS_ThrowTypeError(ctx,"Invalid IndexedDB version");goto done;}
+            JSValue count_value=JS_GetPropertyStr(ctx,argv[3],"length");uint32_t count=0;
+            int failed=JS_IsException(count_value)?-1:JS_ToUint32(ctx,&count,count_value);
+            JS_FreeValue(ctx,count_value);if(failed<0)goto done;
+            if((size_t)count>SIZE_MAX/sizeof(char*)){JS_ThrowOutOfMemory(ctx);goto done;}
+            const char **references=count?js_mallocz(ctx,(size_t)count*sizeof *references):NULL;
+            if(count && !references)goto done;
+            uint32_t acquired=0;
+            for(;acquired<count;acquired++) {
+                JSValue value=JS_GetPropertyUint32(ctx,argv[3],acquired);
+                if(JS_IsException(value)){JS_FreeValue(ctx,value);break;}
+                references[acquired]=JS_ToCString(ctx,value);JS_FreeValue(ctx,value);
+                if(!references[acquired])break;
+            }
+            if(acquired==count) {
+                size_t length=0;uint8_t *bytes=NULL;
+                if(indexed_db_buffer(ctx,argv[2],&bytes,&length)) {
+                    if(task_context_active(s) && s->indexed_db && !sandbox_borrowed(s) &&
+                       !(sandbox_authority(s)&(SB_SCRIPTS|SB_ORIGIN)))
+                        result=JS_NewInt32(ctx,webidb_commit(s->indexed_db,token,bytes,length,references,count,(uint64_t)version));
+                    else result=history_security_error(ctx,"Inactive IndexedDB commit authority");
+                }
+            }
+            for(uint32_t i=0;i<acquired;i++)JS_FreeCString(ctx,references[i]);
+            js_free(ctx,references);
+        } else result=JS_ThrowTypeError(ctx,"Invalid IndexedDB operation");
+    }
+done:
+    JS_FreeCString(ctx,op);return result;
 }
 static JSValue native_scroll(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); int x = 0, y = 0;
@@ -4179,13 +4409,18 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
 #include "frame_native.h"
 /* Children have no networking/file host. Parent transport owns cookies, CORS,
    redirects and generation cancellation; completions only queue native bytes. */
-static bool worker_load(void *opaque, uint32_t worker, uint32_t request,
-                        const char *url, int kind) {
+static bool worker_request(void *opaque, uint32_t worker, uint32_t request,
+                        const char *url, int kind,const char *method,const char *headers,
+                        const void *body,size_t body_len) {
     struct web_js_state *s = opaque;
     if (!s || s->disabled || kind < 0 ||
         (kind != 0 && !njw_load_kind_valid((uint32_t)kind))) return false;
     const uint32_t policy = (uint32_t)kind & NJW_LOAD_POLICY_FLAGS;
     kind = (int)((uint32_t)kind & ~NJW_LOAD_POLICY_FLAGS);
+    if(!url||!method||!webnet_method_valid(method)||body_len>WEBNET_BODY_LIMIT||
+       (!body&&body_len)||strlen(method)>UINT32_MAX||(headers&&strlen(headers)>UINT32_MAX)||
+       ((!strcmp(method,"GET")||!strcmp(method,"HEAD"))&&body)||
+       (kind!=2&&(strcmp(method,"GET")||body||body_len)))return false;
     struct js_pending *p = pending_new(s, P_WORKER, url);
     if (!p) {
         /* Loader rejection is reported over Worker IPC. Do not leave an OOM
@@ -4222,13 +4457,17 @@ static bool worker_load(void *opaque, uint32_t worker, uint32_t request,
         /* Worker settings inherit the creating realm's origin, including
            about:blank/srcdoc children. Never let the shared host substitute
            the top-level document as the initiator of startup/import/fetch. */
-        .url=p->url, .origin=web_effective_url(s->doc), .method="GET",
+        .url=p->url, .origin=web_effective_url(s->doc), .method=method,
+        .headers=headers,.body=body,.body_len=body_len,
         .credentials=1, .same_origin=kind == 0,
         .no_cors=(policy & NJW_LOAD_NO_CORS)!=0,
         .no_referrer=(policy & NJW_LOAD_NO_REFERRER)!=0};
     if (!s->host.request || !s->host.request(s->host.opaque,&r))
         pending_error(p,"The browser rejected the Worker resource request");
     return true;
+}
+static bool worker_load(void *opaque,uint32_t worker,uint32_t request,const char *url,int kind){
+    return worker_request(opaque,worker,request,url,kind,"GET",NULL,NULL,0);
 }
 static void worker_cancel(void *opaque,uint32_t worker,uint32_t request) {
     struct web_js_state *s=opaque;if(!s)return;
@@ -4267,6 +4506,7 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
         static uint32_t generation;
         if (!++generation) ++generation;
         s->workers = web_worker_new(ctx,generation,worker_load,s);
+        if(s->workers)web_worker_set_requester(s->workers,worker_request);
         if (!s->workers) return oom(ctx);
         web_worker_set_canceler(s->workers,s->host.cancel?worker_cancel:NULL);
         web_worker_set_reporter(s->workers,js_policy_worker_report,s);
@@ -6090,7 +6330,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
     struct web_js_state *s = d ? d->js : NULL;
     if (!s || s->running) return;
     prune_stream_scripts(s);
-    if(s->disabled && s->storage_source)storage_release_document(s);
+    if(s->disabled && (s->storage_source || s->indexed_db))storage_release_document(s);
     web_worker_pump(s->workers,now);
     /* Expired idle requests are ordinary watchdog-bounded tasks, not idle
        periods. Alternate with other task sources so even continuous fetch,
@@ -6397,6 +6637,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("canvas", 2, native_canvas),
         JS_CFUNC_DEF("imageBitmap", 5, native_image_bitmap),
         JS_CFUNC_DEF("avmedia", 4, native_avmedia),
+        JS_CFUNC_DEF("presentation", 2, native_presentation),
         JS_CFUNC_DEF("observers", 1, native_observers),
         JS_CFUNC_DEF("pointerCapturePending", 1, native_pointer_capture_pending),
         JS_CFUNC_DEF("resolve", 1, native_resolve), JS_CFUNC_DEF("ready", 0, native_ready), JS_CFUNC_DEF("current", 0, native_current),
@@ -6412,6 +6653,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("worker", 3, native_worker),
         JS_CFUNC_DEF("cssSupports", 2, native_css_supports),
         JS_CFUNC_DEF("storage", 5, native_storage),
+        JS_CFUNC_DEF("indexedDB", 5, native_indexed_db),
         JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("cancel", 1, native_cancel),
         JS_CFUNC_DEF("resumeFetch", 1, native_resume_fetch)
     };

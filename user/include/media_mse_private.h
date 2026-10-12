@@ -1,6 +1,11 @@
 #pragma once
 #include "media.h"
 typedef struct nmedia_mse nmedia_mse;
+/* ClearKey CENC key snapshot: packed {16-byte KID,16-byte AES key} records.
+ * Replaces all keys atomically; an empty snapshot revokes every key. */
+bool nmedia_mse_keys(nmedia_mse *, const void *, size_t);
+bool nmedia_mse_key_waiting(const nmedia_mse *);
+void nmedia_mse_video_stats(const nmedia_mse *,uint64_t *decoded,uint64_t *dropped);
 struct nmedia_time_range { int64_t start_ms,end_ms; };
 bool nmedia_mse_type(const char *);
 nmedia_mse *nmedia_mse_create(const char *,char *,size_t);

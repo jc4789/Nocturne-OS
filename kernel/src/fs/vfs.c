@@ -207,13 +207,14 @@ int64_t vfs_seek(struct file *f, int64_t off, int whence) {
     return n < 0 ? -EINVAL : n;
 }
 
-int vfs_lease(struct file *f, bool acquire) {
+static int vfs_lease_mode(struct file *f, bool acquire, bool blocking) {
     struct vnode *v = f->vn;
     if (v->type != VT_FILE) return -EINVAL;
     uint64_t flags = irq_save();
     if (acquire) {
         while (v->lease_owner && v->lease_owner != f) {
             if (current_task->killed) { irq_restore(flags); return -EINTR; }
+            if (!blocking) { irq_restore(flags); return -EAGAIN; }
             wq_wait(&v->lease_wait);
         }
         if (current_task->killed) { irq_restore(flags); return -EINTR; }
@@ -227,6 +228,14 @@ int vfs_lease(struct file *f, bool acquire) {
     }
     irq_restore(flags);
     return 0;
+}
+
+int vfs_lease(struct file *f, bool acquire) {
+    return vfs_lease_mode(f, acquire, true);
+}
+
+int vfs_try_lease(struct file *f) {
+    return vfs_lease_mode(f, true, false);
 }
 
 void vfs_close(struct file *f) {

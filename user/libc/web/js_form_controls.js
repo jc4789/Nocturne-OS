@@ -340,40 +340,40 @@ const formControlBridge = (() => {
     for (const C of extraInterfaces) { define(C.prototype, Symbol.toStringTag, {value:C.name, configurable:true}); globalThis[C.name] = C; }
 
     const fileLists = new WeakMap(), fileListSlots = new WeakMap();
+    const fileGet=WeakMap.prototype.get,filePut=WeakMap.prototype.set;
     class FileList {
         constructor() { throw new TypeError('Illegal FileList constructor'); }
-        get length() { const files = fileListSlots.get(this); if (!files) throw new TypeError('Illegal FileList receiver'); return files.length; }
-        item(index) { const files = fileListSlots.get(this); if (!files) throw new TypeError('Illegal FileList receiver'); if (!arguments.length) throw new TypeError('Index required'); return files[numeric(index) >>> 0] || null; }
-        *[Symbol.iterator]() { const files = fileListSlots.get(this); if (!files) throw new TypeError('Illegal FileList receiver'); yield* files; }
+        get length() { const files = call(fileGet,fileListSlots,[this]); if (!files) throw new TypeError('Illegal FileList receiver'); return files.length; }
+        item(index) { const files = call(fileGet,fileListSlots,[this]); if (!files) throw new TypeError('Illegal FileList receiver'); if (!arguments.length) throw new TypeError('Index required'); return files[numeric(index) >>> 0] || null; }
+        *[Symbol.iterator]() { const files = call(fileGet,fileListSlots,[this]); if (!files) throw new TypeError('Illegal FileList receiver'); for(let i=0;i<files.length;i++)yield files[i]; }
     }
     function fileList(files) {
         const object = Object.create(FileList.prototype);
         for (let index = 0; index < files.length; index++) define(object, '' + index, {value:files[index], enumerable:true});
-        fileListSlots.set(object, files); return object;
+        call(filePut,fileListSlots,[object,files]); return object;
     }
     define(FileList.prototype, Symbol.toStringTag, {value:'FileList', configurable:true});
     globalThis.FileList = FileList;
+    function inputFiles(node){
+        brand(node);if(type(node)!=='file')return null;
+        const revision=rawDom.get(node,'filesRevision');let stored=call(fileGet,fileLists,[node]);
+        if(!stored||stored.revision!==revision){const snapshots=rawDom.get(node,'filesSnapshot'),files=[];for(let i=0;i<snapshots.length;i++)define(files,i,{value:blobBridge.nativeFile(snapshots[i]),writable:true,enumerable:true,configurable:true});stored={revision,list:fileList(files)};call(filePut,fileLists,[node,stored]);}return stored.list;
+    }
     define(HTMLInputElement.prototype, 'files', {configurable:true, enumerable:true,
         get() {
-            brand(this); if (type(this) !== 'file') return null;
-            const revision = rawDom.get(this, 'filesRevision');
-            let stored = fileLists.get(this);
-            if (!stored || stored.revision !== revision) {
-                const files = rawDom.get(this, 'filesSnapshot').map(snapshot => blobBridge.nativeFile(snapshot));
-                stored = {revision, list:fileList(files)}; fileLists.set(this, stored);
-            }
-            return stored.list;
+            return inputFiles(this);
         },
         set(value) {
             brand(this); if (value === null) return;
-            const files = fileListSlots.get(value); if (!files) throw new TypeError('FileList required');
+            const files = call(fileGet,fileListSlots,[value]); if (!files) throw new TypeError('FileList required');
             if (type(this) !== 'file') return;
-            dom('filesSet', this, files.map(file => blobBridge.snapshot(file)));
+            const packet=[];for(let i=0;i<files.length;i++)define(packet,i,{value:blobBridge.snapshot(files[i]),writable:true,enumerable:true,configurable:true});
+            dom('filesSet',this,packet);call(filePut,fileLists,[this,{revision:rawDom.get(this,'filesRevision'),list:value}]);
         }});
     reflectedString(HTMLInputElement, 'input', 'accept');
     define(HTMLInputElement.prototype, 'webkitdirectory', {configurable:true, enumerable:true,
         get() { brand(this); return reflect(this, 'webkitdirectory') !== null; },
         set(value) { brand(this); reflect(this, 'webkitdirectory', value ? '' : null); }});
 
-    return {type,nodeProtos:extraInterfaces.map(C=>C.prototype)};
+    return {type,file(node,index){const list=inputFiles(node);if(!list)throw new TypeError('File input required');const files=call(fileGet,fileListSlots,[list]);if(index>=files.length)throw new DOMException('Selected file changed during form entry collection','InvalidStateError');return files[index];},nodeProtos:extraInterfaces.map(C=>C.prototype)};
 })();

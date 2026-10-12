@@ -9,13 +9,16 @@
 struct request {struct request *next;struct nmsw_command c;uint8_t *bytes;uint64_t epoch;};
 struct slot_state {
     uint64_t revision,epoch;uint32_t parsing;int64_t group_end;
-    struct nmedia_info info;bool metadata,used;
+    struct nmedia_info info;bool metadata,used,key_waiting;
     size_t count,capacity;struct nmedia_time_range *ranges;
 };
 struct nmedia_mse_worker {
     struct nmedia_mse_worker *next;
     int pid,in,out,video_fd;uint32_t generation,sequence,completed_sequence;
     bool reserved,stopping,output_ready,quota_error,starving,video_taken;
+    uint64_t decoded_frames,dropped_frames;
+    uint64_t service_at,service_progress;
+    unsigned service_idle_ms;
     struct request *head,*tail;
     size_t queued_bytes,queued_count,tx_pos,head_pos,meta_pos,meta_capacity,rx_pos,capacity;
     uint8_t *payload;int64_t current;
@@ -38,7 +41,7 @@ static bool reserve_slots(nmedia_mse_worker *w,size_t count){
         memset(slots+w->slot_capacity,0,(capacity-w->slot_capacity)*sizeof *slots);w->slots=slots;w->slot_capacity=capacity;
     }if(count>w->slot_count)w->slot_count=count;return true;
 }
-static void clear_queue(nmedia_mse_worker *w){while(w->head){struct request *r=w->head;w->head=r->next;nmedia_ff_free(r->bytes);nmedia_ff_free(r);}w->tail=NULL;w->queued_bytes=w->queued_count=0;}
+static void clear_queue(nmedia_mse_worker *w){while(w->head){struct request *r=w->head;w->head=r->next;if(r->c.op==NMSW_KEYS){volatile uint8_t *wipe=r->bytes;for(size_t i=0;i<r->c.bytes;i++)wipe[i]=0;}nmedia_ff_free(r->bytes);nmedia_ff_free(r);}w->tail=NULL;w->queued_bytes=w->queued_count=0;}
 static void stop(nmedia_mse_worker *w,const char *error){
     if(error&&!w->error[0])strlcpy(w->error,error,sizeof w->error);
     if(w->stopping)return;w->stopping=true;w->output_ready=w->video_taken=w->video_ready=w->video_loan=false;
@@ -69,7 +72,8 @@ nmedia_mse_worker *nmedia_mse_worker_open(uint32_t generation,char *error,size_t
     w->in=w->out=w->video_fd=-1;w->generation=generation;w->next=live;live=w;if(error&&size)*error=0;return w;
 }
 bool nmedia_mse_worker_command(nmedia_mse_worker *w,unsigned op,unsigned slot,const void *bytes,size_t size,int64_t offset,int64_t start,int64_t end,bool flag){
-    if(!w||w->stopping||slot>INT32_MAX||op<NMSW_ADD||op>NMSW_SELECT||size>UINT32_MAX||(!bytes&&size)||w->queued_count==SIZE_MAX||size>SIZE_MAX-w->queued_bytes)return false;
+    if(!w||w->stopping||slot>INT32_MAX||op<NMSW_ADD||op>NMSW_KEYS||size>UINT32_MAX||(!bytes&&size)||w->queued_count==SIZE_MAX||size>SIZE_MAX-w->queued_bytes)return false;
+    if(op==NMSW_KEYS&&size%32)return false;
     bool local=op==NMSW_ADD||op==NMSW_APPEND||op==NMSW_REMOVE||op==NMSW_ABORT||op==NMSW_DROP||op==NMSW_CHANGE;
     if(op==NMSW_SELECT&&slot>1)return false; /* audio/video kind, not a buffer count */
     if(local&&op!=NMSW_ADD&&(slot>=w->slot_count||!w->slots[slot].used))return false;
@@ -82,12 +86,13 @@ bool nmedia_mse_worker_command(nmedia_mse_worker *w,unsigned op,unsigned slot,co
     w->video_taken=false;r->epoch=w->epoch;
     r->c=(struct nmsw_command){.magic=NMSW_MAGIC,.op=op,.generation=w->generation,.slot=slot,.flags=flag,.bytes=(uint32_t)size,.offset=offset,.start=start,.end=end,.current=w->current,.epoch=r->epoch};
     if(w->tail)w->tail->next=r;else w->head=r;w->tail=r;w->queued_bytes+=size;w->queued_count++;
+    if(op!=NMSW_STEP){w->service_at=0;w->service_idle_ms=0;}
     if(op!=NMSW_STEP){if(op==NMSW_ABORT){w->error[0]=0;w->quota_error=false;}}
     if(w->head==r){r->c.sequence=++w->sequence;w->tx_pos=w->head_pos=w->meta_pos=w->rx_pos=0;memset(&w->response,0,sizeof w->response);}return true;
 }
 static bool valid(nmedia_mse_worker *w){
     const struct nmsw_response *r=&w->response;const struct nmsw_command *c=&w->head->c;
-    if(r->magic!=NMSW_MAGIC||r->op!=c->op||r->generation!=w->generation||r->sequence!=c->sequence||r->reserved||r->slot<0||r->quota_error>1||!memchr(r->error,0,sizeof r->error)||
+    if(r->magic!=NMSW_MAGIC||r->op!=c->op||r->generation!=w->generation||r->sequence!=c->sequence||r->slot<0||r->quota_error>1||!memchr(r->error,0,sizeof r->error)||
        r->metadata_count>w->slot_count||r->metadata_count>r->metadata_bytes/sizeof(struct nmsw_metadata))return false;
     if((r->kind==NMEDIA_AUDIO||r->kind==NMEDIA_VIDEO||r->kind==NMSW_CLOCK)&&(size_t)r->slot>=w->slot_count)return false;
     if(r->kind==NMEDIA_AUDIO)return r->op==NMSW_STEP&&r->frames>0&&r->frames<=4096&&r->payload_bytes==r->frames*4;
@@ -100,7 +105,7 @@ static bool metadata_valid(nmedia_mse_worker *w){
     for(uint32_t i=0;i<w->response.metadata_count;i++){
         if(sizeof(struct nmsw_metadata)>w->response.metadata_bytes-at)return false;
         const struct nmsw_metadata *m=(const void *)(w->meta+at);at+=sizeof *m;const struct nmsw_info *n=&m->info;
-        if(m->slot>=w->slot_count||(i&&m->slot<=previous)||m->reserved||m->parsing>1||m->group_end<0||m->group_end>1000001000000LL||
+        if(m->slot>=w->slot_count||(i&&m->slot<=previous)||m->key_waiting>1||m->parsing>1||m->group_end<0||m->group_end>1000001000000LL||
            n->duration< -1||n->duration>1000000000000LL||n->audio>1||n->video>1||n->channels>8||n->sample_rate>384000||!nmedia_video_dimensions(n->width,n->height)||
            !memchr(n->audio_codec,0,32)||!memchr(n->video_codec,0,32)||!memchr(n->container,0,32)||m->count>(w->response.metadata_bytes-at)/sizeof(struct nmedia_time_range))return false;
         const struct nmedia_time_range *ranges=(const void *)(w->meta+at);
@@ -109,8 +114,14 @@ static bool metadata_valid(nmedia_mse_worker *w){
     }return at==w->response.metadata_bytes;
 }
 static void completed(nmedia_mse_worker *w){
+    /* Empty STEP acknowledgements are flow-control state, not useful supply
+       progress. They must not keep DOM safepoints polling an idle child. */
+    if(w->response.op!=NMSW_STEP||
+       (w->response.kind!=NMSW_BUSY&&w->response.kind!=NMEDIA_AGAIN)||
+       w->response.decoded_frames||w->response.dropped_frames)w->service_progress++;
     struct nmsw_response *r=&w->response;
     w->completed_sequence=r->sequence;
+    w->decoded_frames+=r->decoded_frames;w->dropped_frames+=r->dropped_frames;
     if(r->kind==NMSW_VIDEO_PENDING)w->video_expected_sequence=r->sequence;
     size_t at=0;
     for(uint32_t i=0;i<r->metadata_count;i++){const struct nmsw_metadata *m=(const void *)(w->meta+at);at+=sizeof *m;const struct nmedia_time_range *ranges=(const void *)(w->meta+at);at+=(size_t)m->count*sizeof *ranges;
@@ -118,7 +129,7 @@ static void completed(nmedia_mse_worker *w){
         if(m->count>s->capacity){struct nmedia_time_range *v=nmedia_ff_realloc(s->ranges,(size_t)m->count*sizeof *v);if(!v){stop(w,"MSE range allocation failed");return;}s->ranges=v;s->capacity=m->count;}
         s->metadata=a->audio||a->video;s->info=(struct nmedia_info){.audio=a->audio,.video=a->video,.channels=(int)a->channels,.sample_rate=(int)a->sample_rate,.width=a->width,.height=a->height,.duration_ms=a->duration};
         strlcpy(s->info.audio_codec,a->audio_codec,32);strlcpy(s->info.video_codec,a->video_codec,32);strlcpy(s->info.container,a->container,32);
-        s->revision=m->revision;s->parsing=m->parsing;s->group_end=m->group_end;s->count=m->count;if(s->count)memcpy(s->ranges,ranges,s->count*sizeof *ranges);}
+        s->revision=m->revision;s->parsing=m->parsing;s->key_waiting=!!m->key_waiting;s->group_end=m->group_end;s->count=m->count;if(s->count)memcpy(s->ranges,ranges,s->count*sizeof *ranges);}
     if(r->kind==NMEDIA_ERROR){strlcpy(w->error,r->error[0]?r->error:"native MSE worker failed",sizeof w->error);w->quota_error=r->quota_error;}
     else if(r->op==NMSW_ABORT||w->quota_error){w->error[0]=0;w->quota_error=false;if(w->output.kind==NMEDIA_ERROR)w->output_ready=false;}
     if(w->output_ready&&nmedia_mse_worker_revision(w,w->output_slot)!=w->output_revision)w->output_ready=false;
@@ -128,11 +139,13 @@ static void completed(nmedia_mse_worker *w){
         w->starving=r->kind==NMEDIA_AGAIN;
         w->output=(struct nmedia_output){.kind=r->kind==NMSW_VIDEO_PENDING?NMSW_BUSY:r->kind,.pts_ms=r->pts,.frames=r->frames,.width=r->width,.height=r->height,.samples=(const int16_t *)w->payload,.pixels=(const uint32_t *)w->payload};}
     else if(r->kind!=NMEDIA_ERROR)w->starving=false;
-    struct request *old=w->head;w->head=old->next;w->queued_bytes-=old->c.bytes;w->queued_count--;nmedia_ff_free(old->bytes);nmedia_ff_free(old);if(!w->head)w->tail=NULL;
+    struct request *old=w->head;w->head=old->next;w->queued_bytes-=old->c.bytes;w->queued_count--;
+    if(old->c.op==NMSW_KEYS){volatile uint8_t *wipe=old->bytes;for(size_t i=0;i<old->c.bytes;i++)wipe[i]=0;}
+    nmedia_ff_free(old->bytes);nmedia_ff_free(old);if(!w->head)w->tail=NULL;
     w->tx_pos=w->head_pos=w->meta_pos=w->rx_pos=0;
     if(w->head){w->head->c.sequence=++w->sequence;memset(&w->response,0,sizeof w->response);}
 }
-static void control_io(nmedia_mse_worker *w,uint64_t now,uint64_t until,bool dispatch){
+static void control_io(nmedia_mse_worker *w,uint64_t now,uint64_t until,bool dispatch,bool handoff){
     nmedia_mse_worker_background(now);if(!w||w->stopping||!w->head)return;
     if(!w->pid){if(!dispatch)return;if(!spawn_child(w))return;}
     /* Queued APPEND/REMOVE can wait behind transfer or author JS work. Their
@@ -149,7 +162,7 @@ static void control_io(nmedia_mse_worker *w,uint64_t now,uint64_t until,bool dis
     while(dispatch&&w->tx_pos<total&&budget&&(p[0].revents&N_POLLOUT)){
         bool header=w->tx_pos<sizeof w->head->c;const uint8_t *src=header?(const uint8_t *)&w->head->c+w->tx_pos:w->head->bytes+w->tx_pos-sizeof w->head->c;
         size_t take=MIN(budget,header?sizeof w->head->c-w->tx_pos:total-w->tx_pos);ssize_t n=write(w->in,src,take);
-        if(n<0&&errno==EAGAIN&&w->tx_pos>sizeof w->head->c&&budget&&handoffs<16&&uptime_ms()<transfer_end){
+        if(n<0&&errno==EAGAIN&&handoff&&w->tx_pos>sizeof w->head->c&&budget&&handoffs<16&&uptime_ms()<transfer_end){
             handoffs++;yield();if(uptime_ms()>=transfer_end)break;continue;
         }
         if(n<0&&(errno==EAGAIN||errno==EINTR))break;if(n<=0){stop(w,"MSE worker command pipe failed");return;}w->tx_pos+=(size_t)n;budget-=(size_t)n;
@@ -169,7 +182,7 @@ static void control_io(nmedia_mse_worker *w,uint64_t now,uint64_t until,bool dis
         bool header=w->head_pos<sizeof w->response,metadata=!header&&w->meta_pos<w->response.metadata_bytes;
         size_t take=header?sizeof w->response-w->head_pos:metadata?w->response.metadata_bytes-w->meta_pos:w->response.payload_bytes-w->rx_pos;
         if(!take){if(!metadata_valid(w)){stop(w,"invalid MSE metadata wire");return;}completed(w);break;}void *dest=header?(uint8_t *)&w->response+w->head_pos:metadata?w->meta+w->meta_pos:w->payload+w->rx_pos;ssize_t n=read(w->out,dest,take);
-        if(n<0&&errno==EAGAIN&&(w->head_pos||w->meta_pos||w->rx_pos)&&handoffs<16&&uptime_ms()<transfer_end){
+        if(n<0&&errno==EAGAIN&&handoff&&(w->head_pos||w->meta_pos||w->rx_pos)&&handoffs<16&&uptime_ms()<transfer_end){
             handoffs++;yield();if(uptime_ms()>=transfer_end)break;continue;
         }
         if(n<0&&(errno==EAGAIN||errno==EINTR))break;if(n<=0){stop(w,"MSE worker response ended early");return;}
@@ -192,7 +205,7 @@ static bool video_current(const nmedia_mse_worker *w){
     return v->slot<w->slot_count&&w->slots[v->slot].used&&
         v->epoch>=w->slots[v->slot].epoch&&v->revision==w->slots[v->slot].revision;
 }
-static void video_io(nmedia_mse_worker *w,uint64_t until){
+static void video_io(nmedia_mse_worker *w,uint64_t until,bool handoff){
     if(w->video_fd<0||w->video_ready||w->video_loan)return;
     struct n_pollfd p={w->video_fd,N_POLLIN,0};
     if(poll(&p,1,0)<0){stop(w,"MSE VIDEO poll failed");return;}
@@ -203,7 +216,7 @@ static void video_io(nmedia_mse_worker *w,uint64_t until){
         size_t take=header?sizeof w->video_header-w->video_head_pos:w->video_header.bytes-w->video_rx_pos;
         void *dest=header?(uint8_t *)&w->video_header+w->video_head_pos:w->video_pixels+w->video_rx_pos;
         ssize_t n=read(w->video_fd,dest,take);
-        if(n<0&&errno==EAGAIN&&(w->video_head_pos||w->video_rx_pos)&&handoffs<16&&uptime_ms()<until){handoffs++;yield();continue;}
+        if(n<0&&errno==EAGAIN&&handoff&&(w->video_head_pos||w->video_rx_pos)&&handoffs<16&&uptime_ms()<until){handoffs++;yield();continue;}
         if(n<0&&(errno==EAGAIN||errno==EINTR))break;
         if(n<=0){stop(w,"MSE VIDEO pipe ended early");return;}
         if(header){w->video_head_pos+=(size_t)n;
@@ -215,22 +228,43 @@ static void video_io(nmedia_mse_worker *w,uint64_t until){
                     w->video_pixels=nmedia_ff_malloc(bytes);if(!w->video_pixels){stop(w,"MSE VIDEO receive allocation failed");return;}w->video_capacity=bytes;}
             }
         }else w->video_rx_pos+=(size_t)n;
+        w->service_progress++;
         if(w->video_head_pos==sizeof w->video_header&&w->video_rx_pos==w->video_header.bytes){
             w->video_sequence=w->video_header.sequence;w->video_ready=true;break;
         }
     }
 }
-static void pump_io(nmedia_mse_worker *w,uint64_t now,uint64_t until,bool dispatch){
+static void pump_io(nmedia_mse_worker *w,uint64_t now,uint64_t until,bool dispatch,bool handoff){
     if(!w||w->stopping)return;
     until=MIN(until,uptime_ms()+2);
     /* PCM/control first, but each ready lane gets its initial nonblocking
        read. Sustained APPEND/control progress must not suppress already
        delivered VIDEO. Further reads/yields obey the same original end time. */
-    control_io(w,now,until,dispatch);if(w->stopping)return;
-    video_io(w,until);
+    control_io(w,now,until,dispatch,handoff);if(w->stopping)return;
+    video_io(w,until,handoff);
 }
-void nmedia_mse_worker_pump_budget(nmedia_mse_worker *w,uint64_t now,uint64_t until){pump_io(w,now,until,true);}
-void nmedia_mse_worker_collect(nmedia_mse_worker *w){uint64_t now=uptime_ms();pump_io(w,now,now,false);}
+void nmedia_mse_worker_pump_budget(nmedia_mse_worker *w,uint64_t now,uint64_t until){pump_io(w,now,until,true,true);}
+void nmedia_mse_worker_collect(nmedia_mse_worker *w){uint64_t now=uptime_ms();pump_io(w,now,now,false,false);}
+bool nmedia_mse_worker_service_due(const nmedia_mse_worker *w,uint64_t now){
+    return w&&w->pid>0&&!w->stopping&&
+        (w->video_ready||(w->output_ready&&w->output.kind!=NMSW_BUSY)||now>=w->service_at);
+}
+void nmedia_mse_worker_service(nmedia_mse_worker *w,uint64_t now,uint64_t until){
+    if(!nmedia_mse_worker_service_due(w,now))return;
+    uint64_t progress=w->service_progress;pump_io(w,now,until,true,false);
+    if(w->service_progress!=progress){w->service_idle_ms=0;w->service_at=0;}
+    else{
+        /* No sleep/yield: reserve the next readiness probe instead of paying
+           several syscalls at every layout safepoint for the same empty lane.
+           16 ms is below one 48 kHz 1024-sample packet and the native PCM ring
+           headroom. New APPEND/key/control work immediately clears this wait. */
+        w->service_idle_ms=w->service_idle_ms?MIN(w->service_idle_ms*2,16u):1;
+        w->service_at=uptime_ms()+w->service_idle_ms;
+    }
+}
+bool nmedia_mse_worker_needs_service(const nmedia_mse_worker *w){return w&&w->pid>0&&!w->stopping&&
+    (w->head||w->output_ready||w->video_ready||w->video_head_pos||w->video_expected_sequence>w->video_sequence||!w->starving);}
+void nmedia_mse_worker_video_stats(const nmedia_mse_worker *w,uint64_t *decoded,uint64_t *dropped){if(decoded)*decoded=w?w->decoded_frames:0;if(dropped)*dropped=w?w->dropped_frames:0;}
 void nmedia_mse_worker_pump(nmedia_mse_worker *w,uint64_t now){nmedia_mse_worker_pump_budget(w,now,uptime_ms()+2);}
 bool nmedia_mse_worker_pending(const nmedia_mse_worker *w){if(!w)return false;for(struct request *r=w->head;r;r=r->next)if(r->c.op!=NMSW_STEP&&r->c.op!=NMSW_SEEK)return true;return false;}
 bool nmedia_mse_worker_running(const nmedia_mse_worker *w){return w&&w->pid>0&&!w->stopping;}
@@ -292,7 +326,7 @@ bool nmedia_mse_worker_move_video(nmedia_mse_worker *w,const struct nmedia_outpu
        borrowed pointer after the allocation has moved to display/lookahead. */
     w->output.pixels=NULL;w->output.samples=NULL;*pixels=completed;*capacity=available;return true;
 }
-void nmedia_mse_worker_prefetch(nmedia_mse_worker *w,uint64_t until){
+static void prefetch(nmedia_mse_worker *w,uint64_t until,bool cooperative){
     if(w&&w->video_loan)video_release(w);
     if(!w||w->stopping||w->error[0]||w->head||w->output_ready||w->starving)return;
     int kind=w->output.kind;
@@ -301,8 +335,10 @@ void nmedia_mse_worker_prefetch(nmedia_mse_worker *w,uint64_t until){
      * payload, dispatch exactly one STEP, and overlap decode with GUI/JS work.
      * No queue growth, extra frame buffer, wait, or new burst deadline. */
     if(!nmedia_mse_worker_command(w,NMSW_STEP,0,NULL,0,0,0,0,false)){stop(w,"MSE STEP queue allocation/size failure");return;}
-    nmedia_mse_worker_pump_budget(w,uptime_ms(),until);
+    if(cooperative)nmedia_mse_worker_service(w,uptime_ms(),until);else nmedia_mse_worker_pump_budget(w,uptime_ms(),until);
 }
+void nmedia_mse_worker_prefetch(nmedia_mse_worker *w,uint64_t until){prefetch(w,until,false);}
+void nmedia_mse_worker_prefetch_service(nmedia_mse_worker *w,uint64_t until){prefetch(w,until,true);}
 void nmedia_mse_worker_close(nmedia_mse_worker *w){if(!w)return;nmedia_mse_worker **p=&live;while(*p&&*p!=w)p=&(*p)->next;if(!*p)return;*p=w->next;stop(w,NULL);
     if(reap(w))destroy(w);else{w->next=retired;retired=w;}}
 int64_t nmedia_mse_worker_deadline(uint64_t now){
@@ -311,6 +347,7 @@ int64_t nmedia_mse_worker_deadline(uint64_t now){
 }
 
 bool nmedia_mse_worker_seeking(const nmedia_mse_worker *w){if(!w)return false;for(struct request *r=w->head;r;r=r->next)if(r->c.op==NMSW_SEEK)return true;return false;}
+bool nmedia_mse_worker_key_waiting(const nmedia_mse_worker *w){if(w)for(size_t i=0;i<w->slot_count;i++)if(w->slots[i].used&&w->slots[i].key_waiting)return true;return false;}
 uint64_t nmedia_mse_worker_revision(const nmedia_mse_worker *w,unsigned slot){return w&&slot<w->slot_count?(w->slots[slot].epoch<<32)^w->slots[slot].revision:0;}
 unsigned nmedia_mse_worker_output_slot(const nmedia_mse_worker *w){return w?w->taken_slot:0;}
 bool nmedia_mse_worker_parsing(const nmedia_mse_worker *w,unsigned slot){return w&&slot<w->slot_count&&w->slots[slot].parsing;}

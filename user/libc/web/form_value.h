@@ -63,3 +63,8 @@ int web_meter_quality(const node_t *n);
 bool web_textarea_submission(node_t *n, sbuf *out);
 const char *web_control_direction(node_t *control);
 bool web_radio_same_group(web_doc *d, node_t *a, node_t *b);
+struct web_face_entry;
+typedef bool (*web_form_entry_sink)(void *opaque,const struct web_face_entry *entry,bool empty_file,node_t *file_control,unsigned file_index);
+/* A borrowed, typed successful-control entry is consumed synchronously. The
+ * sink must copy/retain bytes before returning; false rejects the entire list. */
+bool web_form_collect_entries(web_doc *d,node_t *form,node_t *submitter,web_form_entry_sink sink,void *opaque);

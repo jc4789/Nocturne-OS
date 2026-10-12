@@ -8,6 +8,8 @@
 #include "media_worker_private.h"
 #include "media_mse_private.h"
 #include "media_mse_worker_private.h"
+#include "media_rate_private.h"
+#include "web_presentation.h"
 #include "../media_http_private.h"
 #include "nocturne.h"
 #include <errno.h>
@@ -16,7 +18,16 @@
 #include <string.h>
 #include <math.h>
 #include <limits.h>
+#include <stddef.h>
 struct web_mse_slot {uint32_t id;bool used,audio_owner;uint64_t revision_seen;};
+struct caption_span {char *text,*ruby;uint32_t flags,color;};
+struct caption_cue {
+    struct caption_span *spans;size_t count;
+    double line,position,size,width,region_x,region_y,viewport_x,viewport_y;
+    uint32_t region_lines;bool snap,region,scroll;int vertical,align,line_align,position_align;
+    uint64_t region_id;size_t region_group;
+};
+static void caption_cues_free(struct caption_cue *cues,size_t count){for(size_t i=0;i<count;i++){for(size_t j=0;j<cues[i].count;j++){nmedia_ff_free(cues[i].spans[j].text);nmedia_ff_free(cues[i].spans[j].ruby);}nmedia_ff_free(cues[i].spans);}nmedia_ff_free(cues);}
 struct web_video_ahead {
     struct web_video_ahead *next;
     struct nmedia_output output;
@@ -62,7 +73,10 @@ struct web_avmedia {
     int width, height, fd;
     bool playing, ended, muted, url_input,audio_enabled,video_enabled;
     int ready;
-    double volume;
+    double volume,rate;
+    bool preserve_pitch,rate_owned;
+    nmedia_rate *rate_decoder;
+    uint8_t *eme_keys;size_t eme_key_bytes;
     int64_t base_ms;
     uint64_t started;
     uint64_t video_frames,dropped_video_frames;
@@ -71,10 +85,16 @@ struct web_avmedia {
     int64_t presented_ms,audio_end_ms;
     int64_t audio_end_frame;
     bool audio_written,profile_ended;
+    bool clock_snapshot_enabled,clock_snapshot_valid;
+    struct n_audio_status clock_snapshot;
+    ssize_t clock_snapshot_bytes;
     uint64_t profile_pumps,profile_services,profile_pump_ms,profile_pump_at,profile_pump_gap;
     char error[160];
     /* Private, bounded plain-text caption surface; owned with this media node. */
     char caption[2049];
+    struct caption_cue *caption_cues;size_t caption_count;
+    int *caption_flow;
+    uint64_t caption_revision;
     /* Resolved from the last ordinary paint: no box/style/node is read when
      * composing a new frame. Storage is charged to the existing media budget. */
     struct {
@@ -101,8 +121,15 @@ static unsigned native_depth;
 static bool service_running,service_clock_set;
 static uint64_t service_at;
 static bool debug_transitions;
+/* Leave a device period of headroom in the 8192-frame native ring. The
+ * actual consumed-frame clock, not this lookahead, drives video and cues. */
+#define WEB_AUDIO_TARGET 7200u
 void web_avmedia_debug(bool enabled){debug_transitions=enabled;}
 static int64_t current(struct web_avmedia *,uint64_t);
+static void video_counts(struct web_avmedia *s,uint64_t *decoded,uint64_t *dropped){
+    *decoded=s?s->video_frames:0;*dropped=s?s->dropped_video_frames:0;
+    if(s&&s->mse_active){uint64_t native_decoded,native_dropped;nmedia_mse_worker_video_stats(s->mse_worker,&native_decoded,&native_dropped);*decoded=native_decoded;*dropped+=native_dropped;}
+}
 static void transition(struct web_avmedia *s,const char *reason,uint32_t target){
     if(!debug_transitions)return;
     if(s->transition_pending){const char *pending=s->transition_pending;s->transition_pending=NULL;transition(s,pending,s->generation);}
@@ -159,10 +186,10 @@ static struct web_avmedia *find(web_doc *d, node_t *n, bool create) {
     if (!create) return NULL;
     struct web_avmedia *s = nmedia_ff_mallocz(sizeof *s);
     if (!s) return NULL;
-    s->doc = d; s->node = n; s->fd = -1;s->mse_pending_slot=-1;s->audio_enabled=s->video_enabled=true; s->volume = 1; s->next = streams; streams = s;
+    s->doc = d; s->node = n; s->fd = -1;s->mse_pending_slot=-1;s->audio_enabled=s->video_enabled=true; s->volume = s->rate = 1;s->preserve_pitch=true; s->next = streams; streams = s;
     return s;
 }
-static void close_audio(struct web_avmedia *s) { if (s->fd >= 0) { audio_flush(s->fd); close(s->fd); } s->fd = -1;s->audio_written=false; }
+static void close_audio(struct web_avmedia *s) { s->clock_snapshot_valid=false;if (s->fd >= 0) { audio_flush(s->fd); close(s->fd); } s->fd = -1;s->audio_written=false;nmedia_rate_close(s->rate_decoder);s->rate_decoder=NULL;s->rate_owned=false; }
 static void clear_ahead(struct web_avmedia *s) {
     s->mse_audio_wait=false;
     while(s->ahead_next){struct web_video_ahead *v=s->ahead_next;s->ahead_next=v->next;nmedia_ff_free((void *)v->output.pixels);nmedia_ff_free(v);}
@@ -170,7 +197,10 @@ static void clear_ahead(struct web_avmedia *s) {
     nmedia_ff_free(s->ahead_pixels);s->ahead_pixels=NULL;s->ahead_capacity=0;s->ahead.kind=0;
 }
 static void unload(struct web_avmedia *s) {
+    if(s->doc&&s->doc->pip_element==s->node)web_presentation_exit(s->doc,2);
     snapshot_clear(s);
+    caption_cues_free(s->caption_cues,s->caption_count);s->caption_cues=NULL;s->caption_count=0;
+    nmedia_ff_free(s->caption_flow);s->caption_flow=NULL;
     clear_ahead(s);
     close_audio(s); nmedia_close(s->decoder); s->decoder = NULL;
     nmedia_worker_close(s->worker);s->worker=NULL;
@@ -190,25 +220,36 @@ static void unload(struct web_avmedia *s) {
     s->profile_pumps=s->profile_services=s->profile_pump_ms=s->profile_pump_at=s->profile_pump_gap=0;
 }
 static int64_t current(struct web_avmedia *s, uint64_t now) {
-    int64_t ms = s->base_ms + (s->playing && !s->starved && !nmedia_worker_seeking(s->worker) && now >= s->started ? (int64_t)(now - s->started) : 0);
+    const struct nmedia_info *info = information(s);
+    int64_t ms = s->base_ms + (s->playing && !s->starved && !nmedia_worker_seeking(s->worker) && now >= s->started ? (int64_t)((now - s->started)*s->rate) : 0);
+    /* An enabled audio track has not started until real PCM is submitted.
+       Preroll/backend readiness must not advance a silent wall clock and
+       cause video to be discarded before the first audible sample. */
+    if(s->playing&&s->audio_enabled&&s->fd>=0&&!s->audio_written&&info&&info->audio)ms=s->base_ms;
     /* Wall time is not audible progress while JS/paint delays PCM supply.
      * Use this stream's consumed PCM timeline once a write establishes it.
      * Empty software queue freezes at the last supplied sample, not at a
      * fictitious future wall position. Silent/disabled tracks keep wall time. */
     if(s->playing&&s->audio_enabled&&s->fd>=0&&s->audio_written){
-        uint32_t queued=0;
-        if(read(s->fd,&queued,sizeof queued)==sizeof queued){int64_t frames=s->audio_end_frame-(int64_t)queued;ms=MAX(s->base_ms,frames/SOUND_RATE*1000+(frames%SOUND_RATE)*1000/SOUND_RATE);}
+        /* One bounded native pump uses one device-consumption snapshot, not
+           a read syscall for every video candidate comparison. PCM writes
+           and sink replacement invalidate it; author getters outside the
+           pump always read current device state. */
+        struct n_audio_status status={0};ssize_t bytes;
+        if(s->clock_snapshot_enabled&&s->clock_snapshot_valid){status=s->clock_snapshot;bytes=s->clock_snapshot_bytes;}
+        else {bytes=read(s->fd,&status,sizeof status);if(s->clock_snapshot_enabled){s->clock_snapshot=status;s->clock_snapshot_bytes=bytes;s->clock_snapshot_valid=true;}}
+        if(bytes==sizeof status||bytes==sizeof(uint32_t)){uint64_t queued=(uint64_t)status.queued_frames+status.device_pending_frames;
+            int64_t frames=s->audio_end_frame-(int64_t)lround(queued*s->rate);ms=MAX(s->base_ms,frames/SOUND_RATE*1000+(frames%SOUND_RATE)*1000/SOUND_RATE);}
     }
-    const struct nmedia_info *info = information(s);
     if (info && info->duration_ms >= 0 && ms > info->duration_ms) ms = info->duration_ms;
     return ms;
 }
 static bool audio_target_frame(struct web_avmedia *s,int64_t *target){
     const int factor=SOUND_RATE/1000; /* the native sink is exactly 48 kHz */
     int64_t pts=s->pending.pts_ms;
-    if(pts>INT64_MAX/factor||pts<INT64_MIN/factor||s->audio_at>INT64_MAX||
-       pts*factor>INT64_MAX-(int64_t)s->audio_at){strlcpy(s->error,"native audio timebase overflow",sizeof s->error);return false;}
-    *target=pts*factor+(int64_t)s->audio_at;return true;
+    int64_t consumed=(int64_t)lround(s->audio_at*s->rate);
+    if(pts>INT64_MAX/factor||pts<INT64_MIN/factor||pts*factor>INT64_MAX-consumed){strlcpy(s->error,"native audio timebase overflow",sizeof s->error);return false;}
+    *target=pts*factor+consumed;return true;
 }
 /* 0: PCM starts here/overlaps, 1: silence committed, 2: await sink room,
  * -1: real write/size failure. Fill only the positive authored PTS gap, never
@@ -221,12 +262,13 @@ static int audio_fill_gap(struct web_avmedia *s,uint32_t queued){
     }
     if(target<=s->audio_end_frame)return 0;
     if(s->audio_end_frame<0&&target>INT64_MAX+s->audio_end_frame){strlcpy(s->error,"native audio gap overflow",sizeof s->error);return -1;}
-    if(queued>=4800)return 2;
-    size_t frames=(size_t)MIN(MIN(target-s->audio_end_frame,(int64_t)(4800-queued)),4096);
+    if(queued>=WEB_AUDIO_TARGET)return 2;
+    size_t frames=(size_t)MIN(MIN((int64_t)ceil((target-s->audio_end_frame)/s->rate),(int64_t)(WEB_AUDIO_TARGET-queued)),4096);
     memset(s->scaled,0,frames*4);ssize_t n=write(s->fd,s->scaled,frames*4);
+    s->clock_snapshot_valid=false;
     if(n<0&&errno==EAGAIN)return 2;
     if(n<=0||(n&3)||(size_t)n>frames*4){strlcpy(s->error,"native audio gap write failed",sizeof s->error);return -1;}
-    s->audio_end_frame+=(int64_t)n/4;s->audio_end_ms=s->audio_end_frame/SOUND_RATE*1000+(s->audio_end_frame%SOUND_RATE)*1000/SOUND_RATE;
+    s->audio_end_frame+=(int64_t)lround((n/4)*s->rate);s->audio_end_ms=s->audio_end_frame/SOUND_RATE*1000+(s->audio_end_frame%SOUND_RATE)*1000/SOUND_RATE;
     s->audio_frames+=(size_t)n/4;s->audio_silence_frames+=(size_t)n/4;s->audio_written=true;return 1;
 }
 static bool audio_open(struct web_avmedia *s) {
@@ -409,6 +451,7 @@ static bool mse_audio_input_wait(struct web_avmedia *s,uint64_t now){
 }
 static JSValue state(JSContext *ctx, struct web_avmedia *s) {
     JSValue o=JS_NewObject(ctx);
+    uint64_t decoded,dropped;video_counts(s,&decoded,&dropped);
     const struct nmedia_info *info=s?information(s):NULL;
     JS_SetPropertyStr(ctx,o,"readyState",JS_NewInt32(ctx,s?s->ready:0));
     JS_SetPropertyStr(ctx,o,"duration",JS_NewFloat64(ctx,s&&s->mse_active?s->mse_duration:info&&info->duration_ms>=0?info->duration_ms/1000.0:NAN));
@@ -417,8 +460,8 @@ static JSValue state(JSContext *ctx, struct web_avmedia *s) {
     JS_SetPropertyStr(ctx,o,"ended",JS_NewBool(ctx,s&&s->ended));
     JS_SetPropertyStr(ctx,o,"videoWidth",JS_NewInt32(ctx,info?info->width:0));
     JS_SetPropertyStr(ctx,o,"videoHeight",JS_NewInt32(ctx,info?info->height:0));
-    JS_SetPropertyStr(ctx,o,"totalVideoFrames",JS_NewFloat64(ctx,s?(double)s->video_frames:0));
-    JS_SetPropertyStr(ctx,o,"droppedVideoFrames",JS_NewFloat64(ctx,s?(double)s->dropped_video_frames:0));
+    JS_SetPropertyStr(ctx,o,"totalVideoFrames",JS_NewFloat64(ctx,(double)decoded));
+    JS_SetPropertyStr(ctx,o,"droppedVideoFrames",JS_NewFloat64(ctx,(double)dropped));
     JS_SetPropertyStr(ctx,o,"error",s&&s->error[0]?JS_NewString(ctx,s->error):JS_NULL);
     JS_SetPropertyStr(ctx,o,"rangeInput",JS_NewBool(ctx,s&&s->url_input));
     JS_SetPropertyStr(ctx,o,"queued",JS_NewBool(ctx,s&&s->range_waiting&&!s->worker));
@@ -428,10 +471,12 @@ static JSValue state(JSContext *ctx, struct web_avmedia *s) {
     JS_SetPropertyStr(ctx,o,"msePending",JS_NewBool(ctx,s&&nmedia_mse_worker_pending(s->mse_worker)));
     JS_SetPropertyStr(ctx,o,"mseQuotaError",JS_NewBool(ctx,s&&(s->mse_quota_error||nmedia_mse_worker_quota_error(s->mse_worker))));
     JS_SetPropertyStr(ctx,o,"waiting",JS_NewBool(ctx,s&&s->starved));
+    JS_SetPropertyStr(ctx,o,"keyWaiting",JS_NewBool(ctx,s&&nmedia_mse_worker_key_waiting(s->mse_worker)));
     return o;
 }
-static int mse_next(struct web_avmedia *s,struct nmedia_output *out,uint64_t until){
+static int mse_next(struct web_avmedia *s,struct nmedia_output *out,uint64_t until,bool cooperative){
     int r=nmedia_mse_worker_step(s->mse_worker,out);
+    if(cooperative){if(r==NMSW_BUSY){nmedia_mse_worker_service(s->mse_worker,uptime_ms(),until);r=nmedia_mse_worker_step(s->mse_worker,out);}goto completed;}
     /* STEP is local buffered decode, not author JS or network. Sending and
      * collecting several packets within one finite native burst avoids a
      * complete JS/CSS/paint pass between every 20 ms PCM packet. */
@@ -445,6 +490,7 @@ static int mse_next(struct web_avmedia *s,struct nmedia_output *out,uint64_t unt
      * produces PCM. Collect an already-readable response once, with the
      * expired/shared deadline: no additional yield or blocking wait. */
     if(r==NMSW_BUSY){nmedia_mse_worker_collect(s->mse_worker);r=nmedia_mse_worker_step(s->mse_worker,out);}
+completed:
     if(r==NMEDIA_ERROR)strlcpy(s->error,nmedia_mse_worker_error(s->mse_worker),sizeof s->error);
     if(r==NMEDIA_AUDIO||r==NMEDIA_VIDEO||r==NMSW_CLOCK){s->mse_pending_slot=(int)nmedia_mse_worker_output_slot(s->mse_worker);s->mse_pending_revision=nmedia_mse_worker_revision(s->mse_worker,(unsigned)s->mse_pending_slot);}
     return r;
@@ -454,7 +500,7 @@ static bool mse_prepare_pump(struct web_avmedia *s,uint64_t until,bool cooperati
     /* No sink opening or picture presentation in this phase. ACK alone is
        insufficient: retain the first real decoded data (or actual EOS). */
     if(nmedia_mse_worker_seeking(s->mse_worker))return true;
-    if(!s->pending.kind){int r=mse_next(s,&s->pending,until);s->audio_at=0;
+    if(!s->pending.kind){int r=mse_next(s,&s->pending,until,cooperative);s->audio_at=0;
         if(r==NMEDIA_VIDEO)s->video_frames++;
         if(r==NMSW_BUSY||r==NMEDIA_AGAIN)return true;
         if(r==NMEDIA_ERROR){s->mse_preparing=false;s->playing=false;close_audio(s);s->doc->dirty=true;return true;}
@@ -471,6 +517,7 @@ static int range_next(struct web_avmedia *s,struct nmedia_output *out,struct nme
     nmedia_worker_step(s->worker);
     /* Decode/network runs in the existing child. Only finite nonblocking
      * dispatch/reap and scheduler handoffs run here; no new burst allowance. */
+    if(b->nonblocking){nmedia_worker_pump_budget(s->worker,uptime_ms(),b,false);return nmedia_worker_take(s->worker,out);}
     while(nmedia_worker_pending(s->worker)&&uptime_ms()<b->until){
         nmedia_worker_pump_budget(s->worker,uptime_ms(),b,false);
         r=nmedia_worker_take(s->worker,out);
@@ -516,6 +563,7 @@ static JSValue mse_call(JSContext *ctx,struct web_avmedia *s,const char *op,int 
     if(!strcmp(op,"mseCreate")){
         uint32_t generation;if(!argc||JS_ToUint32(ctx,&generation,argv[0])<0)return JS_EXCEPTION;
         if(s->generation!=generation)return JS_FALSE;transition(s,"mse-create",generation);unload(s);s->generation=generation;s->mse_worker=nmedia_mse_worker_open(generation,s->error,sizeof s->error);
+        if(s->mse_worker&&s->eme_key_bytes&&!nmedia_mse_worker_command(s->mse_worker,NMSW_KEYS,0,s->eme_keys,s->eme_key_bytes,0,0,0,false))return JS_ThrowOutOfMemory(ctx);
         if(!s->mse_worker)return JS_FALSE;s->mse_active=true;s->starved=true;s->mse_duration=NAN;return JS_TRUE;
     }
     if(!s->mse_active)return JS_FALSE;
@@ -577,6 +625,31 @@ static bool range_node(web_doc *d,node_t *n,const char *url) {
     return n->owner==d&&!d->inert&&(!credentials||strcasecmp(credentials,"use-credentials"))&&
         nmedia_http_browser_url(url,d->url);
 }
+static bool caption_number(JSContext *ctx,JSValueConst object,const char *name,double *out,bool automatic){JSValue v=JS_GetPropertyStr(ctx,object,name);if(JS_IsException(v))return false;if(automatic&&JS_IsString(v)){const char *s=JS_ToCString(ctx,v);bool ok=s&&!strcmp(s,"auto");JS_FreeCString(ctx,s);JS_FreeValue(ctx,v);if(ok){*out=NAN;return true;}JS_ThrowTypeError(ctx,"Invalid caption automatic value");return false;}int status=JS_ToFloat64(ctx,out,v);JS_FreeValue(ctx,v);if(status<0)return false;if(!isfinite(*out)){JS_ThrowTypeError(ctx,"Nonfinite caption layout");return false;}return true;}
+static bool caption_enum(JSContext *ctx,JSValueConst object,const char *name,const char *const *names,int *out){JSValue v=JS_GetPropertyStr(ctx,object,name);if(JS_IsException(v))return false;const char *text=JS_ToCString(ctx,v);JS_FreeValue(ctx,v);if(!text)return false;for(int i=0;names[i];i++)if(!strcmp(text,names[i])){*out=i;JS_FreeCString(ctx,text);return true;}JS_FreeCString(ctx,text);JS_ThrowTypeError(ctx,"Invalid caption enum");return false;}
+static bool caption_string(JSContext *ctx,JSValueConst object,const char *name,char **out,size_t *total){JSValue v=JS_GetPropertyStr(ctx,object,name);if(JS_IsException(v))return false;size_t size;const char *text=JS_ToCStringLen(ctx,&size,v);JS_FreeValue(ctx,v);if(!text)return false;if(size>2048-*total||memchr(text,0,size)){JS_FreeCString(ctx,text);JS_ThrowRangeError(ctx,"Caption glyph bytes exceed surface budget");return false;}char *copy=nmedia_ff_malloc(size+1);if(!copy){JS_FreeCString(ctx,text);JS_ThrowOutOfMemory(ctx);return false;}memcpy(copy,text,size+1);JS_FreeCString(ctx,text);*total+=size;*out=copy;return true;}
+static bool caption_length(JSContext *ctx,JSValueConst array,uint32_t *length){if(JS_IsArray(ctx,array)!=1){JS_ThrowTypeError(ctx,"Caption sequence required");return false;}JSValue v=JS_GetPropertyStr(ctx,array,"length");int r=JS_ToUint32(ctx,length,v);JS_FreeValue(ctx,v);return r>=0;}
+static bool captions_equal(const struct caption_cue *a,const struct caption_cue *b,size_t count){for(size_t i=0;i<count;i++){if(a[i].count!=b[i].count||memcmp(&a[i].line,&b[i].line,offsetof(struct caption_cue,region_group)-offsetof(struct caption_cue,line)))return false;for(size_t j=0;j<a[i].count;j++){const struct caption_span *x=&a[i].spans[j],*y=&b[i].spans[j];if(x->flags!=y->flags||x->color!=y->color||strcmp(x->text,y->text)||strcmp(x->ruby,y->ruby))return false;}}return true;}
+static int caption_id_compare(const void *a,const void *b){uint64_t x=*(const uint64_t*)a,y=*(const uint64_t*)b;return x<y?-1:x>y?1:0;}
+static JSValue caption_receive(JSContext *ctx,web_doc *d,struct web_avmedia *s,JSValueConst input){
+    static const char *const vertical[]={"","rl","lr",NULL},*const align[]={"start","center","end","left","right",NULL},*const line_align[]={"start","center","end",NULL},*const position_align[]={"auto","line-left","center","line-right",NULL};
+    uint32_t count;if(!caption_length(ctx,input,&count))return JS_EXCEPTION;size_t cue_bytes=(size_t)count*sizeof(struct caption_cue);if(count&&cue_bytes/count!=sizeof(struct caption_cue))return JS_ThrowRangeError(ctx,"Caption sequence allocation overflow");
+    struct caption_cue *cues=count?nmedia_ff_mallocz((size_t)count*sizeof *cues):NULL;if(count&&!cues)return JS_ThrowOutOfMemory(ctx);size_t total=0;uint32_t generation=s->generation;
+    for(uint32_t i=0;i<count;i++){struct caption_cue *c=&cues[i];JSValue object=JS_GetPropertyUint32(ctx,input,i),spans=JS_GetPropertyStr(ctx,object,"spans"),region=JS_GetPropertyStr(ctx,object,"region");bool ok=!JS_IsException(object)&&!JS_IsException(spans)&&!JS_IsException(region);uint32_t length=0;
+        if(ok)ok=caption_length(ctx,spans,&length)&&caption_number(ctx,object,"line",&c->line,true)&&caption_number(ctx,object,"position",&c->position,true)&&caption_number(ctx,object,"size",&c->size,false)&&caption_enum(ctx,object,"vertical",vertical,&c->vertical)&&caption_enum(ctx,object,"align",align,&c->align)&&caption_enum(ctx,object,"lineAlign",line_align,&c->line_align)&&caption_enum(ctx,object,"positionAlign",position_align,&c->position_align);
+        JSValue snap=JS_GetPropertyStr(ctx,object,"snapToLines");int truth=JS_ToBool(ctx,snap);JS_FreeValue(ctx,snap);if(truth<0)ok=false;c->snap=truth>0;
+        if(ok&&(c->size<0||c->size>100||(isfinite(c->position)&&(c->position<0||c->position>100)))){JS_ThrowRangeError(ctx,"Invalid caption percentage");ok=false;}
+        size_t span_bytes=(size_t)length*sizeof(struct caption_span);if(ok&&length&&span_bytes/length!=sizeof(struct caption_span)){JS_ThrowRangeError(ctx,"Caption spans allocation overflow");ok=false;}
+        if(ok){c->spans=length?nmedia_ff_mallocz((size_t)length*sizeof *c->spans):NULL;c->count=length;if(length&&!c->spans){c->count=0;JS_ThrowOutOfMemory(ctx);ok=false;}}
+        for(uint32_t j=0;ok&&j<length;j++){JSValue span=JS_GetPropertyUint32(ctx,spans,j),flags=JS_GetPropertyStr(ctx,span,"flags"),color=JS_GetPropertyStr(ctx,span,"color");ok=!JS_IsException(span)&&caption_string(ctx,span,"text",&c->spans[j].text,&total)&&caption_string(ctx,span,"ruby",&c->spans[j].ruby,&total)&&JS_ToUint32(ctx,&c->spans[j].flags,flags)>=0&&JS_ToUint32(ctx,&c->spans[j].color,color)>=0;JS_FreeValue(ctx,color);JS_FreeValue(ctx,flags);JS_FreeValue(ctx,span);}
+        if(ok&&!JS_IsNull(region)){c->region=true;double identity=0;ok=caption_number(ctx,region,"serial",&identity,false)&&identity>=0&&identity<=9007199254740991.0&&caption_number(ctx,region,"width",&c->width,false)&&caption_number(ctx,region,"regionAnchorX",&c->region_x,false)&&caption_number(ctx,region,"regionAnchorY",&c->region_y,false)&&caption_number(ctx,region,"viewportAnchorX",&c->viewport_x,false)&&caption_number(ctx,region,"viewportAnchorY",&c->viewport_y,false);c->region_id=(uint64_t)identity;JSValue lines=JS_GetPropertyStr(ctx,region,"lines"),scroll=JS_GetPropertyStr(ctx,region,"scroll");if(JS_ToUint32(ctx,&c->region_lines,lines)<0)ok=false;const char *text=JS_ToCString(ctx,scroll);if(!text)ok=false;else{c->scroll=!strcmp(text,"up");if(text[0]&&!c->scroll){JS_ThrowTypeError(ctx,"Invalid region scroll");ok=false;}}JS_FreeCString(ctx,text);JS_FreeValue(ctx,lines);JS_FreeValue(ctx,scroll);if(ok&&(c->width<0||c->width>100||c->region_x<0||c->region_x>100||c->region_y<0||c->region_y>100||c->viewport_x<0||c->viewport_x>100||c->viewport_y<0||c->viewport_y>100)){JS_ThrowRangeError(ctx,"Invalid region percentage");ok=false;}}
+        JS_FreeValue(ctx,region);JS_FreeValue(ctx,spans);JS_FreeValue(ctx,object);if(!ok){caption_cues_free(cues,count);return JS_EXCEPTION;}
+    }
+    if(!d->live||s->generation!=generation){caption_cues_free(cues,count);return JS_ThrowTypeError(ctx,"Caption document changed during conversion");}
+    if(s->caption_count==count&&!s->caption[0]&&captions_equal(cues,s->caption_cues,count)){caption_cues_free(cues,count);return JS_UNDEFINED;}
+    int *flow=count?nmedia_ff_mallocz((size_t)count*sizeof *flow):NULL;uint64_t *ids=count?nmedia_ff_malloc((size_t)count*sizeof *ids):NULL;if(count&&(!flow||!ids)){nmedia_ff_free(flow);nmedia_ff_free(ids);caption_cues_free(cues,count);return JS_ThrowOutOfMemory(ctx);}for(uint32_t i=0;i<count;i++)ids[i]=cues[i].region_id;if(count)qsort(ids,count,sizeof *ids,caption_id_compare);for(uint32_t i=0;i<count;i++){size_t lo=0,hi=count;while(lo<hi){size_t at=lo+(hi-lo)/2;if(ids[at]<cues[i].region_id)lo=at+1;else hi=at;}cues[i].region_group=lo;}nmedia_ff_free(ids);
+    caption_cues_free(s->caption_cues,s->caption_count);nmedia_ff_free(s->caption_flow);s->caption_cues=cues;s->caption_count=count;s->caption_flow=flow;s->caption[0]=0;s->caption_revision++;s->snapshot.valid=false;d->paint_dirty=true;return JS_UNDEFINED;
+}
 static JSValue avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *op, int argc, JSValueConst *argv) {
     if(!strcmp(op,"mseType")){
         const char *type=argc?JS_ToCString(ctx,argv[0]):NULL;if(argc&&!type)return JS_EXCEPTION;bool supported=nmedia_mse_type(type);JS_FreeCString(ctx,type);return JS_NewBool(ctx,supported);
@@ -598,13 +671,24 @@ static JSValue avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *o
     if(!s)return !strcmp(op,"state")?state(ctx,NULL):JS_ThrowRangeError(ctx,"native media state allocation failed");
     uint64_t now=uptime_ms();
     if(!strcmp(op,"state"))return state(ctx,s);
+    if(!strcmp(op,"emeKeys")){
+        if(!argc)return JS_ThrowTypeError(ctx,"native ClearKey snapshot required");
+        size_t size=0;uint8_t *bytes=JS_GetArrayBuffer(ctx,&size,argv[0]);
+        if(!bytes&&JS_HasException(ctx))return JS_EXCEPTION;
+        if(size%32||size>UINT32_MAX)return JS_ThrowTypeError(ctx,"invalid native ClearKey snapshot");
+        uint8_t *copy=size?nmedia_ff_malloc(size):NULL;if(size&&!copy)return JS_ThrowOutOfMemory(ctx);if(size)memcpy(copy,bytes,size);
+        if(s->mse_worker&&!nmedia_mse_worker_command(s->mse_worker,NMSW_KEYS,0,copy,size,0,0,0,false)){if(copy){volatile uint8_t *wipe=copy;for(size_t i=0;i<size;i++)wipe[i]=0;nmedia_ff_free(copy);}return JS_ThrowOutOfMemory(ctx);}
+        volatile uint8_t *old=s->eme_keys;for(size_t i=0;i<s->eme_key_bytes;i++)old[i]=0;nmedia_ff_free(s->eme_keys);s->eme_keys=copy;s->eme_key_bytes=size;return JS_TRUE;
+    }
     if(!strcmp(op,"captionText")){
         if(!argc)return JS_ThrowTypeError(ctx,"caption text required");
         size_t length;const char *text=JS_ToCStringLen(ctx,&length,argv[0]);if(!text)return JS_EXCEPTION;
         if(length>sizeof(s->caption)-1||memchr(text,0,length)){JS_FreeCString(ctx,text);return JS_ThrowRangeError(ctx,"caption text exceeds bounded plain-text surface");}
-        if(strlen(s->caption)!=length||memcmp(s->caption,text,length)){s->snapshot.valid=false;memcpy(s->caption,text,length);s->caption[length]=0;d->dirty=true;}
+        bool rich=s->caption_count>0;caption_cues_free(s->caption_cues,s->caption_count);nmedia_ff_free(s->caption_flow);s->caption_flow=NULL;s->caption_cues=NULL;s->caption_count=0;
+        if(rich||strlen(s->caption)!=length||memcmp(s->caption,text,length)){s->snapshot.valid=false;memcpy(s->caption,text,length);s->caption[length]=0;s->caption_revision++;d->paint_dirty=true;}
         JS_FreeCString(ctx,text);return JS_UNDEFINED;
     }
+    if(!strcmp(op,"captionCues")){if(!argc)return JS_ThrowTypeError(ctx,"Caption cue sequence required");return caption_receive(ctx,d,s,argv[0]);}
     if(!strncmp(op,"mse",3))return mse_call(ctx,s,op,argc,argv,now);
     if(!strcmp(op,"reset")){
         uint32_t generation;if(!argc||JS_ToUint32(ctx,&generation,argv[0])<0)return JS_EXCEPTION;
@@ -686,6 +770,19 @@ static JSValue avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *o
         if(!isfinite(seconds)||seconds<0||seconds>1e9)return JS_ThrowRangeError(ctx,"invalid media time");
         return JS_NewBool(ctx,seek(s,(int64_t)(seconds*1000),now));
     }
+    if(!strcmp(op,"rate")){
+        double rate;if(argc<2||JS_ToFloat64(ctx,&rate,argv[0])<0)return JS_EXCEPTION;
+        int pitch=JS_ToBool(ctx,argv[1]);if(pitch<0)return JS_EXCEPTION;
+        if(!isfinite(rate)||(rate!=0&&(rate<0.25||rate>4)))return JS_ThrowRangeError(ctx,"unsupported playback rate");
+        if(s->rate==rate&&s->preserve_pitch==!!pitch)return JS_TRUE;
+        /* Flush old-speed device samples and resume at the consumed media
+           position. SourceBuffer ownership and buffered packets are retained. */
+        int64_t position=current(s,now);
+        if(s->ready&&!seek(s,position,now))return JS_FALSE;
+        close_audio(s);s->base_ms=position;s->started=now;s->rate=rate;s->preserve_pitch=!!pitch;
+        if(s->playing&&rate&&!nmedia_worker_seeking(s->worker)&&!s->mse_seeking&&!audio_open(s))return JS_FALSE;
+        return JS_TRUE;
+    }
     if(!strcmp(op,"volume")){
         double v;if(argc<2||JS_ToFloat64(ctx,&v,argv[0])<0)return JS_EXCEPTION;
         int muted=JS_ToBool(ctx,argv[1]);if(muted<0)return JS_EXCEPTION;
@@ -699,7 +796,7 @@ JSValue web_avmedia_call(JSContext *ctx,web_doc *d,node_t *n,const char *op,int 
 }
 static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool cooperative){
     if(uptime_ms()>=mse_until)return;
-    struct nmedia_worker_budget range_budget={.until=mse_until,.tx_bytes=65536};
+    struct nmedia_worker_budget range_budget={.until=mse_until,.tx_bytes=65536,.nonblocking=cooperative};
     if(s->url_input&&s->error[0]){if(s->worker)range_failed(s,s->error);return;}
     if(!cooperative&&s->url_input&&s->range_waiting&&!s->worker){
         /* Revalidate after an idle element is resumed. An adopted/removed
@@ -714,7 +811,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
     }
     if(s->mse_worker){
         nmedia_mse_worker_time(s->mse_worker,current(s,now));
-        nmedia_mse_worker_pump_budget(s->mse_worker,now,mse_until);
+        if(cooperative)nmedia_mse_worker_service(s->mse_worker,now,mse_until);else nmedia_mse_worker_pump_budget(s->mse_worker,now,mse_until);
         const char *error=nmedia_mse_worker_error(s->mse_worker);if(*error){strlcpy(s->error,error,sizeof s->error);s->mse_quota_error=nmedia_mse_worker_quota_error(s->mse_worker);s->mse_preparing=false;if(!s->mse_quota_error){s->mse_resume_needed=false;s->base_ms=current(s,now);s->playing=false;close_audio(s);}s->doc->dirty=true;return;}
         if(s->mse_quota_error){s->mse_quota_error=false;s->error[0]=0;}
         if(s->mse_eos&&!s->mse_eos_duration&&!nmedia_mse_worker_pending(s->mse_worker)){
@@ -739,11 +836,21 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
            but must not consume decoder output behind the retained position. */
         if(s->mse_resume_needed&&!s->playing)return;
     }
+    /* Owned pictures already due on the real media clock do not depend on
+       another decoder response. BUSY/AGAIN below can persist after the last
+       input packet, so returning there first stranded the final lookahead
+       images (including pictures older than the drained audio clock).
+       Retain authored PTS and all revision/seek guards; never advance time
+       merely to make a future image due. */
+    if(s->playing&&!s->mse_seeking&&!s->range_resume&&!nmedia_worker_seeking(s->worker)&&
+       !present_ahead(s,now)){
+        s->base_ms=current(s,now);s->playing=false;close_audio(s);clear_ahead(s);s->doc->dirty=true;return;
+    }
     /* Append/control transfer and metadata ACK above never stop. Only new
        decode demand waits; new audio ranges or seek/EOS release the wait. */
     if(s->mse_audio_wait){if(mse_audio_input_wait(s,now))return;s->mse_audio_wait=false;}
     if(s->mse_active&&!s->error[0]&&!s->pending.kind){
-        int r=mse_next(s,&s->pending,mse_until);s->audio_at=0;
+        int r=mse_next(s,&s->pending,mse_until,cooperative);s->audio_at=0;
         if(r==NMEDIA_VIDEO)s->video_frames++;
         if(r==NMEDIA_ERROR){s->base_ms=current(s,now);s->playing=false;close_audio(s);s->ready=0;s->doc->dirty=true;return;}
         if(r==NMSW_BUSY)return;
@@ -787,16 +894,22 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
             }
         }
     }
-    if((!s->decoder&&!s->worker&&!s->mse_active)||!s->playing)return;
+    if((!s->decoder&&!s->worker&&!s->mse_active)||!s->playing||!s->rate)return;
+    const struct nmedia_info *rate_info=information(s);
+    if(s->rate!=1&&s->audio_enabled&&rate_info&&rate_info->audio&&!s->rate_decoder){
+        s->rate_decoder=nmedia_rate_create(s->rate,s->preserve_pitch);
+        if(!s->rate_decoder){strlcpy(s->error,"native PCM tempo allocation/configuration failed",sizeof s->error);s->playing=false;return;}
+    }
     for(int budget=0;budget<8;budget++){
         if(!present_ahead(s,now)){s->base_ms=current(s,now);s->playing=false;close_audio(s);clear_ahead(s);s->doc->dirty=true;return;}
         /* Release borrowed storage only after presentation, snapshot, drop or
          * complete PCM write. Dispatch before the cap return so the child can
          * decode while the browser performs its next JS/paint phase. */
-        if(budget&&s->mse_active&&!s->pending.kind)nmedia_mse_worker_prefetch(s->mse_worker,mse_until);
+        if(budget&&s->mse_active&&!s->pending.kind){if(cooperative)nmedia_mse_worker_prefetch_service(s->mse_worker,mse_until);else nmedia_mse_worker_prefetch(s->mse_worker,mse_until);}
         if(budget&&s->worker&&!s->pending.kind)nmedia_worker_prefetch(s->worker,&range_budget);
         if((s->mse_active||s->worker)&&budget&&uptime_ms()>=mse_until)return;
-        if(!s->pending.kind){int r=s->mse_active?mse_next(s,&s->pending,mse_until):s->worker?range_next(s,&s->pending,&range_budget):nmedia_step(s->decoder,&s->pending);s->audio_at=0;
+        if(!s->pending.kind&&s->rate_decoder){int r=nmedia_rate_pull(s->rate_decoder,&s->pending);s->rate_owned=r==NMEDIA_AUDIO;s->audio_at=0;if(r==NMEDIA_ERROR){strlcpy(s->error,"native PCM tempo output failed",sizeof s->error);s->playing=false;close_audio(s);return;}if(r!=NMEDIA_AUDIO)s->pending.kind=0;}
+        if(!s->pending.kind){int r=s->mse_active?mse_next(s,&s->pending,mse_until,cooperative):s->worker?range_next(s,&s->pending,&range_budget):nmedia_step(s->decoder,&s->pending);s->audio_at=0;s->rate_owned=false;
             if(r==NMEDIA_VIDEO)s->video_frames++;
             if(r==NMSW_BUSY)return;
             if(r==NMEDIA_AGAIN){if(s->mse_active){uint32_t queued=0;if(s->fd>=0)read(s->fd,&queued,4);if(!queued){s->base_ms=current(s,now);s->starved=true;s->ready=1;s->doc->dirty=true;}}return;}
@@ -805,7 +918,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
         }
         if(s->pending.kind==NMSW_CLOCK){if(s->pending.pts_ms>current(s,now)+5)return;s->pending.kind=0;
         }else if(s->pending.kind==NMEDIA_VIDEO){
-            if(s->ahead.kind&&(s->mse_active||s->worker)&&s->fd>=0){
+            if(s->ahead.kind&&s->fd>=0){
                 if(!hold_video(s)){s->base_ms=current(s,now);s->playing=false;close_audio(s);clear_ahead(s);s->doc->dirty=true;return;}
                 s->pending.kind=0;
                 if(mse_audio_input_wait(s,now)){s->mse_audio_wait=true;return;}
@@ -817,7 +930,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
                  * Privately owned pictures keep their authored PTS, never
                  * eager-display/drop or fabricate clock progress. Every
                  * record is charged; the 2 ms / 8 packet burst bounds work. */
-                if((s->mse_active||s->worker)&&s->fd>=0){
+                if(s->fd>=0){
                     if(!hold_video(s)){s->base_ms=current(s,now);s->playing=false;close_audio(s);clear_ahead(s);s->doc->dirty=true;return;}
                     s->pending.kind=0;
                     if(mse_audio_input_wait(s,now)){s->mse_audio_wait=true;return;}
@@ -829,16 +942,21 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
             if(!present(s)){s->base_ms=current(s,now);s->playing=false;close_audio(s);s->doc->dirty=true;return;}
             s->pending.kind=0;
         }else if(s->pending.kind==NMEDIA_AUDIO){
+            if(s->rate_decoder&&!s->rate_owned){
+                if(!nmedia_rate_push(s->rate_decoder,&s->pending)){strlcpy(s->error,"native PCM tempo input failed",sizeof s->error);s->playing=false;close_audio(s);return;}
+                s->pending.kind=0;continue;
+            }
             if(s->fd<0&&s->pending.pts_ms>current(s,now)+100)return;
-            if(s->fd>=0){uint32_t queued=0;if(read(s->fd,&queued,4)!=4||queued>=4800)return;
+            if(s->fd>=0){uint32_t queued=0;if(read(s->fd,&queued,4)!=4||queued>=WEB_AUDIO_TARGET)return;
                 if(s->pending.frames>4096||s->audio_at>s->pending.frames){strlcpy(s->error,"invalid native audio span",sizeof s->error);s->playing=false;close_audio(s);return;}
                 int gap=audio_fill_gap(s,queued);
                 if(gap<0){s->base_ms=current(s,now);s->playing=false;close_audio(s);return;}
                 if(gap==2)return;if(gap==1)continue;
-                size_t frames=MIN(MIN(s->pending.frames-s->audio_at,(size_t)(4800-queued)),(size_t)4096);
+                size_t frames=MIN(MIN(s->pending.frames-s->audio_at,(size_t)(WEB_AUDIO_TARGET-queued)),(size_t)4096);
                 double gain=s->muted?0:s->volume;
                 for(size_t i=0;i<frames*2;i++)s->scaled[i]=(int16_t)(s->pending.samples[s->audio_at*2+i]*gain);
                 ssize_t n=write(s->fd,s->scaled,frames*4);
+                s->clock_snapshot_valid=false;
                 if(n<0&&errno==EAGAIN)return;
                 if(n<=0||(n&3)||(size_t)n>frames*4){strlcpy(s->error,"native audio write failed",sizeof s->error);s->base_ms=current(s,now);s->playing=false;close_audio(s);return;}
                 s->audio_at+=(size_t)n/4;s->audio_frames+=(size_t)n/4;s->audio_written=true;
@@ -847,7 +965,14 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
                 if(s->audio_at<s->pending.frames)return;
             }s->pending.kind=0;
         }else if(s->pending.kind==NMEDIA_END){
-            uint32_t queued=0;if(s->fd>=0)read(s->fd,&queued,4);if(queued)return;
+            if(s->rate_decoder){
+                if(!nmedia_rate_end(s->rate_decoder)){strlcpy(s->error,"native PCM tempo drain failed",sizeof s->error);s->playing=false;close_audio(s);return;}
+                int result=nmedia_rate_pull(s->rate_decoder,&s->pending);
+                if(result==NMEDIA_AUDIO){s->rate_owned=true;s->audio_at=0;continue;}
+                if(result==NMEDIA_ERROR){strlcpy(s->error,"native PCM tempo tail failed",sizeof s->error);s->playing=false;close_audio(s);return;}
+                s->pending.kind=NMEDIA_END;
+            }
+            struct n_audio_status status={0};if(s->fd>=0)read(s->fd,&status,sizeof status);if(status.queued_frames||status.device_pending_frames)return;
             s->starved=false; /* Confirmed EOF is not a waiting-for-input gap. */
             if(s->ahead.kind){
                 /* Actual decoder EOF and a drained PCM sink, not starvation:
@@ -869,13 +994,15 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
             s->doc->dirty=true;return;
         }
     }
-    if(s->mse_active&&!s->pending.kind)nmedia_mse_worker_prefetch(s->mse_worker,mse_until);
+    if(s->mse_active&&!s->pending.kind){if(cooperative)nmedia_mse_worker_prefetch_service(s->mse_worker,mse_until);else nmedia_mse_worker_prefetch(s->mse_worker,mse_until);}
     if(s->worker&&!s->pending.kind)nmedia_worker_prefetch(s->worker,&range_budget);
 }
 static void pump(struct web_avmedia *s,uint64_t now,uint64_t until,bool cooperative){
+    s->clock_snapshot_enabled=true;s->clock_snapshot_valid=false;
     uint64_t start=debug_transitions?uptime_ms():0;
     if(debug_transitions){s->profile_pumps++;s->profile_services+=cooperative;if(s->profile_pump_at&&start>=s->profile_pump_at)s->profile_pump_gap=MAX(s->profile_pump_gap,start-s->profile_pump_at);s->profile_pump_at=start;}
     bool playing=s->playing,preparing=s->mse_preparing;pump_impl(s,now,until,cooperative);
+    s->clock_snapshot_enabled=false;s->clock_snapshot_valid=false;
     if(debug_transitions)s->profile_pump_ms+=uptime_ms()-start;
     if(playing&&!s->playing)clear_ahead(s);
     if(debug_transitions&&((playing&&!s->playing)||(preparing&&!s->mse_preparing&&s->error[0])))s->transition_pending=s->error[0]?"native-error-stop":s->ended?"native-eos-stop":"native-stop";
@@ -886,6 +1013,8 @@ static void pump(struct web_avmedia *s,uint64_t now,uint64_t until,bool cooperat
 /* This path uses only native stream pixels and an immutable resolved suffix.
  * The host performs its own current-window guard before touching UI memory. */
 static void snapshot_publish(struct web_avmedia *s) {
+    if(s->snapshot.valid&&(!s->doc||!s->doc->live||!s->node||!s->node->owner||
+       (s->node->owner!=s->doc&&s->node->owner->dom_family!=s->doc)||!doc_node_connected(s->node))){snapshot_clear(s);return;}
     if(!s->snapshot.valid || !s->doc || !s->doc->live || !s->playing ||
        s->mse_seeking || s->range_resume || nmedia_worker_seeking(s->worker) ||
        !s->pixels || s->generation!=s->snapshot.generation ||
@@ -909,17 +1038,24 @@ static void snapshot_publish(struct web_avmedia *s) {
 static void timing_profile(struct web_avmedia *s,uint64_t now){
     if((!s->playing&&(!s->ended||s->profile_ended))||(s->playing&&now-s->profile_at<2000))return;
     s->profile_at=now;s->profile_ended=s->ended;
-    uint32_t queued=0;bool audio=s->fd>=0&&read(s->fd,&queued,sizeof queued)==sizeof queued;
-    int64_t played=s->audio_written&&audio?s->audio_end_ms-(int64_t)queued*1000/SOUND_RATE:-1;
+    struct n_audio_status status={0};ssize_t status_bytes=s->fd>=0?read(s->fd,&status,sizeof status):-1;
+    bool audio=status_bytes==sizeof status||status_bytes==sizeof(uint32_t);
+    uint32_t queued=status.queued_frames+status.device_pending_frames;
+    int64_t played=s->audio_written&&audio?s->audio_end_ms-(int64_t)(queued*s->rate*1000/SOUND_RATE):-1;
     char message[512];
+    uint64_t decoded,dropped;video_counts(s,&decoded,&dropped);
     snprintf(message,sizeof message,"Native media timing: generation %u, input %s, clock %lld ms, presented %llu at %lld ms, decoded %llu/drop %llu, window-published %llu; audio %s, queued %u frames, written %llu/silence %llu frames, end %lld/played-estimate %lld ms, pending %d at %lld ms/ahead %zu at %lld ms, starved %u/ended %u",
         s->generation,s->mse_active?"MSE":s->url_input?"Range":"buffer",(long long)current(s,now),
-        (unsigned long long)s->presented_frames,(long long)s->presented_ms,(unsigned long long)s->video_frames,(unsigned long long)s->dropped_video_frames,(unsigned long long)s->window_frames,
+        (unsigned long long)s->presented_frames,(long long)s->presented_ms,(unsigned long long)decoded,(unsigned long long)dropped,(unsigned long long)s->window_frames,
         audio?"open":"closed",queued,(unsigned long long)s->audio_frames,(unsigned long long)s->audio_silence_frames,(long long)s->audio_end_ms,(long long)played,
         s->pending.kind,(long long)s->pending.pts_ms,s->ahead_count,(long long)(s->ahead.kind?s->ahead.pts_ms:-1),s->starved,s->ended);
-    /* queued covers this stream's software ring, not the hardware mix queue. */
+    /* queued includes only this stream's measured DMA contribution, not other
+       streams' samples. Remote flags retain server-estimate semantics. */
     web_js_console(s->doc,0,message);
     if(debug_transitions){
+        snprintf(message,sizeof message,"Native audio sink: generation %u, software %u/device %u frames, consumed %llu/committed %llu, clock-flags %u, rate %.3f/pitch %u",
+            status.generation,status.queued_frames,status.device_pending_frames,(unsigned long long)status.played_frames,(unsigned long long)status.committed_frames,status.flags,s->rate,s->preserve_pitch);
+        web_js_console(s->doc,0,message);
         struct nmedia_worker_stats stats;nmedia_worker_snapshot(s->worker,&stats);
         snprintf(message,sizeof message,"Native media supply: generation %u, pumps %llu/cooperative %llu/time %llu ms/max-gap %llu ms; Range IPC requests %llu/responses %llu/request-time %llu/max %llu ms, tx %llu/rx %llu bytes, handoffs %llu/header-waits %llu, receiving %zu/%zu bytes/header %zu/waiting %u; video %dx%d",
             s->generation,(unsigned long long)s->profile_pumps,(unsigned long long)s->profile_services,(unsigned long long)s->profile_pump_ms,(unsigned long long)s->profile_pump_gap,
@@ -944,8 +1080,21 @@ void web_avmedia_tick(web_doc *d,uint64_t now){
 }
 void web_avmedia_service(uint64_t now){
     if(!streams||native_depth||service_running)return;
+    /* Most safepoints arrive within the same millisecond. Reject those before
+       even querying a stream FD or scanning its pending metadata. */
+    if(service_clock_set&&now>=service_at&&now-service_at<1)return;
     uint64_t start=uptime_ms();
-    if(service_clock_set&&start>=service_at&&start-service_at<10)return;
+    /* A pending native lane/low PCM supply needs frequent bounded collection.
+       A fixed 10ms throttle multiplied every STEP/metadata/video component
+       round trip and could starve the ring despite readily decoded input. */
+    uint64_t interval=5;
+    for(struct web_avmedia *p=streams;p;p=p->next)if(p->playing&&p->rate&&(!p->mse_active||p->pending.kind||p->ahead.kind||nmedia_mse_worker_needs_service(p->mse_worker))&&(!p->mse_audio_wait||nmedia_mse_worker_pending(p->mse_worker))){
+        uint32_t queued=0;
+        if((p->fd>=0&&read(p->fd,&queued,4)==4&&queued<1440)||p->pending.kind||nmedia_mse_worker_pending(p->mse_worker)){
+            interval=1;break;
+        }
+    }
+    if(service_clock_set&&start>=service_at&&start-service_at<interval)return;
     service_at=start;service_clock_set=true;service_running=true;
     /* Shared across every context: one existing live MSE/Range child, not one new
      * 2ms allowance per iframe. Candidate scanning visits at most one real
@@ -959,8 +1108,9 @@ void web_avmedia_service(uint64_t now){
         service_cursor=s;
         if((s->playing||s->mse_preparing)&&s->doc&&s->doc->live&&s->node&&
            (s->node->owner==s->doc||(s->node->owner&&s->node->owner->dom_family==s->doc))&&
-           ((s->mse_active&&nmedia_mse_worker_running(s->mse_worker))||
-            (s->url_input&&nmedia_worker_running(s->worker)))){
+           ((s->mse_active&&(s->pending.kind||s->ahead.kind||nmedia_mse_worker_needs_service(s->mse_worker))&&(!s->mse_audio_wait||nmedia_mse_worker_pending(s->mse_worker)))||
+            (s->url_input&&nmedia_worker_running(s->worker)))&&
+           (!s->mse_active||s->pending.kind||nmedia_mse_worker_service_due(s->mse_worker,now))){
             pump(s,now,until,true);snapshot_publish(s);break;
         }
         s=s->next?s->next:streams;if(s==first)break;
@@ -977,7 +1127,12 @@ void web_avmedia_snapshot_begin(web_doc *d) {
     for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d)s->snapshot.valid=false;
 }
 void web_avmedia_layout_begin(web_doc *d){
-    for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d)s->snapshot.valid=false;
+    /* Layout mutates boxes, not the previously committed screen. The raster
+       suffix owns its coordinates, mask and pixels independently; publishing
+       it never consults the new boxes. Keep it until actual paint begins.
+       Generation/source/connected-node guards plus the host's canvas, viewport
+       and scroll guards reject retired, removed or relocated screen owners. */
+    (void)d;
 }
 void web_avmedia_snapshot_reject(void) {if(snapshot_document)snapshot_rejected=true;}
 bool web_avmedia_snapshot_prepare(web_doc *d,canvas_t *c,canvas_t *probe,
@@ -1036,12 +1191,48 @@ int64_t web_avmedia_deadline(web_doc *d,uint64_t now){
 void web_avmedia_free(web_doc *d){
     web_avmedia_enter();
     struct web_avmedia **link=&streams;
-    while(*link){struct web_avmedia *s=*link;if(s->doc!=d){link=&s->next;continue;}*link=s->next;if(service_cursor==s)service_cursor=NULL;transition(s,"document-free",s->generation);unload(s);nmedia_ff_free(s);}
+    while(*link){struct web_avmedia *s=*link;if(s->doc!=d){link=&s->next;continue;}*link=s->next;if(service_cursor==s)service_cursor=NULL;transition(s,"document-free",s->generation);unload(s);volatile uint8_t *keys=s->eme_keys;for(size_t i=0;i<s->eme_key_bytes;i++)keys[i]=0;nmedia_ff_free(s->eme_keys);nmedia_ff_free(s);}
     web_avmedia_leave();
 }
-/* Finite plain-text WebVTT surface, not the WebVTT region/style layout engine.
- * Wrap on complete UTF-8 scalars and clip to the real media rectangle. */
+/* Cue text never enters the document HTML parser. Styled glyphs share the
+ * native video surface (including PiP); all pixels obey its clip rectangle. */
+static int caption_advance(uint32_t cp,int vertical){char text[5];int bytes=0;if(cp<0x80)text[bytes++]=(char)cp;else if(cp<0x800){text[bytes++]=(char)(0xc0|(cp>>6));text[bytes++]=(char)(0x80|(cp&63));}else if(cp<0x10000){text[bytes++]=(char)(0xe0|(cp>>12));text[bytes++]=(char)(0x80|((cp>>6)&63));text[bytes++]=(char)(0x80|(cp&63));}else{ text[bytes++]=(char)(0xf0|(cp>>18));text[bytes++]=(char)(0x80|((cp>>12)&63));text[bytes++]=(char)(0x80|((cp>>6)&63));text[bytes++]=(char)(0x80|(cp&63));}text[bytes]=0;return vertical&&cp>=0x100?gfx_font_h(FONT_SMALL):gfx_text_width(text,FONT_SMALL);}
+static void caption_glyph(canvas_t *target,int x,int y,uint32_t cp,uint32_t color,uint32_t flags,bool vertical,bool half){
+    int height=gfx_font_h(FONT_SMALL),width=caption_advance(cp,0)+2,shear=(flags&2)?height/4:0;
+    if(!half&&!vertical&&!(flags&2)){gfx_char(target,x,y,cp,color,TRANSPARENT,FONT_SMALL);if(flags&1)gfx_char(target,x+1,y,cp,color,TRANSPARENT,FONT_SMALL);if(flags&4)gfx_line(target,x,y+height-1,x+width-2,y+height-1,color);return;}
+    width+=shear;if(width<=0||height<=0||width>64||height>64)return;uint32_t pixels[64*64];memset(pixels,0,(size_t)width*height*sizeof *pixels);canvas_t glyph;gfx_init(&glyph,pixels,width,height,width);gfx_char(&glyph,0,0,cp,color,TRANSPARENT,FONT_SMALL);if(flags&1)gfx_char(&glyph,1,0,cp,color,TRANSPARENT,FONT_SMALL);
+    if(flags&4)gfx_line(&glyph,0,height-1,width-shear-2,height-1,color);
+    for(int row=0;row<height;row++)for(int col=0;col<width-shear;col++){uint32_t pixel=pixels[(size_t)row*width+col];if(!(pixel>>24))continue;int shifted=col+((flags&2)?(height-1-row)/4:0),dx=shifted,dy=row;if(vertical&&cp<0x100){dx=height-1-row;dy=shifted;}if(half){dx/=2;dy/=2;}gfx_fill(target,x+dx,y+dy,1,1,pixel);}
+}
+static int caption_measure(const struct caption_cue *cue,int limit,bool vertical,int *widest,int *widths){int rows=1,at=0;*widest=0;for(size_t i=0;i<cue->count;i++)for(const char *text=cue->spans[i].text;*text;){uint32_t cp;int bytes=gfx_utf8_decode(text,&cp);text+=bytes;if(cp=='\n'){*widest=MAX(*widest,at);if(widths)widths[rows-1]=at;at=0;rows++;continue;}int step=caption_advance(cp,vertical);if(at&&at+step>limit){*widest=MAX(*widest,at);if(widths)widths[rows-1]=at;at=0;rows++;}at+=step;}*widest=MAX(*widest,at);if(widths)widths[rows-1]=at;return rows;}
+static int caption_coordinate(double value,int minimum,int maximum){if(value<minimum)return minimum;if(value>maximum)return maximum;return (int)lround(value);}
+static void paint_rich_captions(struct web_avmedia *s,canvas_t *target,int x,int y,int w,int h){
+    int ruby_height=0;for(size_t i=0;i<s->caption_count;i++)for(size_t j=0;j<s->caption_cues[i].count;j++)if(s->caption_cues[i].spans[j].ruby[0])ruby_height=gfx_font_h(FONT_SMALL)/2;
+    int line_height=gfx_font_h(FONT_SMALL)+ruby_height+6,default_flow=0;canvas_t media=*target;gfx_clip(&media,x,y,w,h);
+    memset(s->caption_flow,0,s->caption_count*sizeof *s->caption_flow);
+    for(size_t i=0;i<s->caption_count;i++){const struct caption_cue *cue=&s->caption_cues[i];if(cue->count&&cue->region&&!cue->scroll&&!cue->vertical&&!isfinite(cue->line)&&cue->size==100){int widest,limit=MAX(1,(int)lround(w*cue->width/100)-16);s->caption_flow[cue->region_group]+=caption_measure(cue,limit,false,&widest,NULL)*line_height;}}
+    for(size_t reverse=s->caption_count;reverse>0;reverse--){const struct caption_cue *cue=&s->caption_cues[reverse-1];if(!cue->count)continue;bool vertical=cue->vertical!=0,region=cue->region&&!vertical&&!isfinite(cue->line)&&cue->size==100;int region_w=w,region_h=h,region_x=x,region_y=y,flow=0;
+        if(region){region_w=MAX(0,(int)lround(w*cue->width/100));region_h=MIN(h,(int)MIN((uint64_t)h,(uint64_t)cue->region_lines*line_height));region_x=caption_coordinate(x+w*cue->viewport_x/100-region_w*cue->region_x/100,x-region_w,x+w);region_y=caption_coordinate(y+h*cue->viewport_y/100-region_h*cue->region_y/100,y-region_h,y+h);
+            flow=s->caption_flow[cue->region_group];
+        }
+        int row_widths[2049],limit=MAX(1,(int)lround((vertical?h:region_w)*cue->size/100)-16),widest=0,rows=caption_measure(cue,limit,vertical,&widest,row_widths),extent=rows*line_height;
+        if(region){if(cue->scroll)s->caption_flow[cue->region_group]+=extent;else {s->caption_flow[cue->region_group]-=extent;flow=s->caption_flow[cue->region_group];}}
+        double position=isfinite(cue->position)?cue->position:cue->align==0||cue->align==3?0:cue->align==2||cue->align==4?100:50;int alignment=cue->position_align==0?(cue->align==0||cue->align==3?1:cue->align==2||cue->align==4?3:2):cue->position_align;double anchor=alignment==1?0:alignment==3?1:.5;
+        int left=x,top=y,box_w=vertical?extent:MIN(region_w,limit+16),box_h=vertical?MIN(h,limit+16):extent;
+        if(!vertical){left=caption_coordinate(region_x+region_w*position/100-box_w*anchor,region_x,region_x+MAX(0,region_w-box_w));if(region)top=cue->scroll?region_y+region_h-extent-flow:region_y+flow;else if(!isfinite(cue->line)){top=y+h-extent-default_flow;default_flow+=extent;}else if(cue->snap)top=caption_coordinate(cue->line>=0?y+cue->line*line_height:y+h+cue->line*line_height-extent+line_height,y-extent,y+h);else top=caption_coordinate(y+h*cue->line/100-(cue->line_align==1?extent/2.0:cue->line_align==2?extent:0),y-extent,y+h);}
+        else {top=caption_coordinate(y+h*position/100-box_h*anchor,y,y+MAX(0,h-box_h));if(!isfinite(cue->line))left=cue->vertical==1?x+w-extent-default_flow:x+default_flow;else if(cue->snap)left=caption_coordinate(cue->vertical==1?x+w-extent-cue->line*line_height:x+cue->line*line_height,x-extent,x+w);else left=caption_coordinate(x+w*cue->line/100-(cue->line_align==1?extent/2.0:cue->line_align==2?extent:0),x-extent,x+w);if(!isfinite(cue->line))default_flow+=extent;}
+        canvas_t box=media;if(region)gfx_clip(&box,region_x,region_y,region_w,region_h);gfx_clip(&box,left,top,box_w,box_h);if(box.cx0>=box.cx1||box.cy0>=box.cy1)continue;gfx_fill(&box,left,top,box_w,box_h,RGB(20,20,24));
+        int inline_at=0,row=0;for(size_t i=0;i<cue->count;i++){const struct caption_span *span=&cue->spans[i];if(span->ruby&&span->ruby[0]){int ruby_width=(gfx_text_width(span->ruby,FONT_SMALL)+1)/2,base_width=gfx_text_width(span->text,FONT_SMALL);int rx=vertical?left+extent-row*line_height: left+8+inline_at+(base_width-ruby_width)/2,ry=vertical?top+8+inline_at:top+row*line_height+1;canvas_t ruby=media;if(region)gfx_clip(&ruby,region_x,region_y,region_w,region_h);for(const char *rt=span->ruby;*rt;){uint32_t cp;rt+=gfx_utf8_decode(rt,&cp);caption_glyph(&ruby,rx,ry,cp,span->color,0,false,true);rx+=(caption_advance(cp,0)+1)/2;}}
+            for(const char *text=span->text;*text;){uint32_t cp;text+=gfx_utf8_decode(text,&cp);if(cp=='\n'){inline_at=0;row++;continue;}int step=caption_advance(cp,vertical);if(inline_at&&inline_at+step>limit){inline_at=0;row++;}int tx=vertical?left+(cue->vertical==1?rows-row-1:row)*line_height+2:left+8+inline_at,ty=vertical?top+8+inline_at:top+row*line_height+ruby_height+3;
+                if(!vertical&&cue->align!=0&&cue->align!=3){int adjust=MAX(0,limit-row_widths[row]);tx+=cue->align==2||cue->align==4?adjust:adjust/2;}
+                caption_glyph(&box,tx,ty,cp,span->color,span->flags,vertical,false);inline_at+=step;
+            }
+        }
+    }
+}
+/* Legacy plain-text callers continue to use the same native surface. */
 static void paint_caption(struct web_avmedia *s,canvas_t *c,int x,int y,int w,int h){
+    if(s&&s->caption_count&&w>16&&h>0){paint_rich_captions(s,c,x,y,w,h);return;}
     if(!s||!s->caption[0]||w<=16||h<=0)return;
     const char *at=s->caption,*starts[4];size_t lengths[4];int widths[4],count=0;
     int line_height=gfx_font_h(FONT_SMALL)+4,limit=MIN(4,h/line_height);
@@ -1068,6 +1259,12 @@ static void paint_caption(struct web_avmedia *s,canvas_t *c,int x,int y,int w,in
         int64_t tx=(int64_t)x+MAX(8,(w-widths[i])/2),ty=top+i*line_height+2;
         if(tx>=INT_MIN&&tx<=INT_MAX&&ty>=INT_MIN&&ty<=INT_MAX)gfx_text(c,(int)tx,(int)ty,line,RGB(255,255,255),TRANSPARENT,FONT_SMALL);
     }
+}
+bool web_avmedia_pip_ready(web_doc *d,node_t *n){struct web_avmedia *s=find(d,n,false);const struct nmedia_info *info=s?information(s):NULL;return media_node(n)&&n->tag==T_video&&s&&s->ready>=1&&info&&info->video&&info->width>0&&info->height>0&&!s->error[0];}
+uint64_t web_avmedia_pip_revision(web_doc *d,node_t *n){struct web_avmedia *s=find(d,n,false);return s?((uint64_t)s->generation<<32)+s->presented_frames+(s->caption_revision<<16):0;}
+bool web_avmedia_pip_paint(web_doc *d,node_t *n,canvas_t *c){
+    struct web_avmedia *s=find(d,n,false);if(!s||!media_node(n)||n->tag!=T_video)return false;
+    gfx_fill(c,0,0,c->w,c->h,RGB(0,0,0));if(s->pixels)nmedia_draw(c,s->pixels,s->width,s->height,0,0,c->w,c->h);paint_caption(s,c,0,0,c->w,c->h);return true;
 }
 bool web_avmedia_paint(web_doc *d,node_t *n,canvas_t *c,int x,int y,int w,int h){
     struct web_avmedia *s=find(d,n,false);

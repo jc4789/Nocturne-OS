@@ -1,5 +1,5 @@
-/* 有界で実バイトを所有する File API。OSファイル選択と
- * ReadableStream は未実装。object URL は js_object_url.js が所有する。
+/* 実バイトを所有する File API。ArrayBuffer の表現可能長と確保失敗を
+ * 守り、stream() は共通 Streams へ接続する。object URL は js_object_url.js が所有する。
  * https://w3c.github.io/FileAPI/ (2026-10-08) */
 const blobBridge = (() => {
     'use strict';
@@ -15,7 +15,9 @@ const blobBridge = (() => {
     const dvBuffer=getter(DataView.prototype,'buffer'),dvOffset=getter(DataView.prototype,'byteOffset');
     const dvLength=getter(DataView.prototype,'byteLength'),set=U8.prototype.set;
     const str=String, wellFormed=String.prototype.toWellFormed, dateNow=Date.now,fromCode=String.fromCharCode,push=Array.prototype.push;
-    const LIMIT=16*1024*1024, token={};
+    // The engine's real ArrayBuffer constructor uses an INT32_MAX byte length,
+    // not an arbitrary per-Blob quota. Backing allocation remains authoritative.
+    const LIMIT=0x7fffffff, token={};
     const state=v=>{const s=apply(get,slots,[v]);if(!s)throw new TypeError('Illegal Blob receiver');return s;};
     const dictionary=v=>{if(v==null)return {};if(typeof v!=='object'&&typeof v!=='function')throw new TypeError('Expected dictionary');return v;};
     const string=v=>{if(typeof v==='symbol')throw new TypeError('Cannot convert Symbol to string');return str(v);};
@@ -45,7 +47,7 @@ const blobBridge = (() => {
                 else {let text=apply(wellFormed,string(part),[]);if(options.endings==='native')text=text.replace(/\r\n|\r/g,'\n');chunk=apply(encode,new Encoder(),[text]);}
             }
             const n=apply(length,chunk,[]);
-            if(n>LIMIT-total)throw new DOMException('Blob exceeds the 16 MiB limit','QuotaExceededError');
+            if(n>LIMIT-total)throw new RangeError('Blob byte length is not representable by ArrayBuffer');
             /* 入力iteratorの次の呼出しによる変更/transferより前にsnapshotを取る。 */
             apply(push,chunks,[copy(chunk)]);total+=n;
         }
@@ -57,7 +59,7 @@ const blobBridge = (() => {
         if(endings!=='transparent'&&endings!=='native')throw new TypeError('Invalid line ending mode');
         const t=o.type;return {endings,type:t===undefined?'':mime(t)};
     }
-    function make(bytes,type){if(apply(length,bytes,[])>LIMIT)throw new DOMException('Blob exceeds the 16 MiB limit','QuotaExceededError');const result=create(Blob.prototype);apply(put,slots,[result,{bytes:copy(bytes),type}]);return result;}
+    function make(bytes,type){if(apply(length,bytes,[])>LIMIT)throw new RangeError('Blob byte length is not representable by ArrayBuffer');const result=create(Blob.prototype);apply(put,slots,[result,{bytes:copy(bytes),type}]);return result;}
     function base64(bytes){
         const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/',n=apply(length,bytes,[]);let out='';
         for(let i=0;i<n;i+=3){const a=bytes[i],b=i+1<n?bytes[i+1]:0,c=i+2<n?bytes[i+2]:0;
@@ -156,7 +158,7 @@ const blobBridge = (() => {
     return {brand:value=>apply(get,slots,[value])!==undefined,readerBrand:value=>apply(get,readers,[value])!==undefined,
         bytes:value=>apply(buffer,copy(state(value).bytes),[]),type:value=>state(value).type,
         fromBytes:(bytes,type)=>make(view(bytes),mime(type)),
-        nativeFile(data){const file=new File([data[0]],data[2],{type:data[1],lastModified:data[3]});apply(get,files,[file]).relativePath=data[4]||'';return file;},
+        nativeFile(data){const bits=create(null),options=create(null);options.type=data[1];options.lastModified=data[3];bits[Symbol.iterator]=()=>{let done=false;const iterator=create(null);iterator.next=()=>done?{done:true}:(done=true,{done:false,value:data[0]});return iterator;};const file=new File(bits,data[2],options);apply(get,files,[file]).relativePath=data[4]||'';return file;},
         snapshot(value){const s=state(value),f=apply(get,files,[value]);return [apply(buffer,copy(s.bytes),[]),s.type,f?f.name:null,f?f.lastModified:0,f?f.relativePath||'':''];},
         restore(data){if(data[2]===null)return make(view(data[0]),data[1]);const file=new File([data[0]],data[2],{type:data[1],lastModified:data[3]});apply(get,files,[file]).relativePath=data[4]||'';return file;}};
 })();

@@ -33,6 +33,12 @@ python ports/ffmpeg/prepare.py --source "D:/Programes/cloned repos/ffmpeg-9.0.2"
 
 追加 WebM/Ogg 入力は `ports/ffmpeg/make-webm-fixtures.py` で生成し、専用 `tests/media-fixtures/webm-manifest.json` に引数・codec/profile・hash・host参照PCM数を残す。旧 fixture と旧 manifest は変更しない。能力宣言は `user/libc/media_types.c` の限定 allow-list と実 native/browser 試験を照合する。`vp09` の profile/bitdepth/color suffix は [WebM公式の定義](https://www.webmproject.org/vp9/mp4/) に従い、未対応 profile/HDR は拒否する。旧 `vp9`/`vp9.0` と WebM の Opus/Vorbis 記法は [公式 container guideline](https://www.webmproject.org/docs/container/) を参照する。
 
+## 2026-10-12 browser profile拡張
+
+`--profile browser` はadaptiveにHEVC Main/Main10、AC3/EAC3と限定PCM filter（abuffer/abuffersink/atempo）を追加する。正規compile閉包は374 C。MP4 Opus/VP9の既存decoder/demuxerをnative能力宣言と整合し、planar 10/12/16bit SDRをphysical 8bit surfaceへ変換する。上記の旧8bit限定記録はこの拡張前の検証範囲であり、追加codecの実guest確認は`docs/media-timing-20261012.md`と主担当記録で判断する。AV1のsoftware decoderとHDR tone mappingは未対応で、HDR transfer/gamutを偽ってSDRとして出力しない。
+
+PCM速度変更はGUI/packet decoderとは別のnative媒体責務で、pitch維持はatempo WSOLA、pitch変更はresamplerを用いる。decoder handleをthread-safeに変えたという意味ではない。通常1xは新filterを通さない。追加ソースはLGPL構成、CONFIG_GPL=0。既存許諾文書を削除していない。
+
 ## ライセンス
 
 この構成の configure 判定は LGPL-2.1-or-later。元ライセンス・著作者ヘッダーを保持し、同梱 `COPYING.LGPLv2.1` と `LICENSE.md` に従う。静的配布では対応ソース、変更、再リンクに必要な Nocturne object/build 手順も利用者が取得できるようにする。`sources.mk` を lazy static link へ含め、実体の不要なアプリへ decoder を丸ごと入れない。

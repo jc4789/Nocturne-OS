@@ -19,6 +19,11 @@
 
 typedef struct web_doc web_doc;
 typedef struct node web_node; /* an element of the document */
+bool web_presentation_exit(web_doc *,int kind);
+web_node *web_presentation_element(web_doc *,int kind);
+bool web_avmedia_pip_paint(web_doc *,web_node *,canvas_t *);
+uint64_t web_avmedia_pip_revision(web_doc *,web_node *);
+void web_presentation_resize(web_doc *,int width,int height);
 struct web_hit;
 
 /* charset: from the Content-Type header, or NULL (a <meta charset> or UTF-8 is used) */
@@ -129,6 +134,9 @@ struct web_host {
     bool (*navigation_pending)(void *opaque);
     bool (*video_present)(void *opaque, web_doc *document,
                           const struct web_video_patch *patch);
+    /* Native window transition; no DOM/JS callback, no borrowed media pixels.
+       0 exit fullscreen, 1 enter fullscreen, 2 enter PiP, 3 exit PiP. */
+    bool (*presentation)(void *opaque,web_doc *document,web_node *element,int mode);
     bool (*history)(void *opaque, int operation, const char *url, const void *state,
                     size_t state_len, int value, struct web_history *out);
     /* The host owns the cookie jar; returned text is malloc'd, never HttpOnly. */

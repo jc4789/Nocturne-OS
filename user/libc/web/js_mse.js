@@ -92,6 +92,7 @@ const mseBridge = (() => {
     function completed(bufferObject,s,epoch,kind){
         if(s.epoch!==epoch||s.removed)return;
         s.updating=false;s.timer=0;
+        if(kind==='update'&&typeof mediaEme!=='undefined')mediaEme.commit(bufferObject);
         queue(bufferObject,kind);queue(bufferObject,'updateend');
     }
     function updateDuration(p){
@@ -121,6 +122,7 @@ const mseBridge = (() => {
                 poll();
             }catch(e){fail(e);}
             function fail(e){if(s.epoch!==epoch||s.removed)return;
+                if(typeof mediaEme!=='undefined')mediaEme.reset(object);
                 try{native('mseAbort',p.node,s.id);}catch(_){}
                 completed(object,s,epoch,'error');p.lastError=e;
                 if(e.name!=='QuotaExceededError'&&e.name!=='RangeError'){try{native('mseEnd',p.node,'decode');}catch(_){}p.state='ended';queue(p.object,'sourceended');}
@@ -147,18 +149,20 @@ const mseBridge = (() => {
             if(!arguments.length)throw new TypeError('BufferSource required');const s=buffer(this),p=mutable(s);
             if(native('state',p.node).error)throw error('InvalidStateError','Media element has an error');
             const data=bytes(value);
-            operation(this,s,parent=>native('mseAppend',parent.node,s.id,data,s.offset,s.start,s.end,s.mode==='sequence'));
+            const object=this;
+            operation(this,s,parent=>{const result=native('mseAppend',parent.node,s.id,data,s.offset,s.start,s.end,s.mode==='sequence');
+                if(result&&typeof mediaEme!=='undefined')mediaEme.inspect(data,parent.node,object,parent.generation);return result;});
         }
         abort(){const s=buffer(this),p=live(s);if(p.state!=='open')throw error('InvalidStateError','MediaSource is not open');
             if(s.updating){++s.epoch;if(s.timer)host.clear(s.timer);s.timer=0;s.updating=false;queue(this,'abort');queue(this,'updateend');}
-            native('mseAbort',p.node,s.id);s.start=0;s.end=Infinity;
+            native('mseAbort',p.node,s.id);if(typeof mediaEme!=='undefined')mediaEme.reset(this);s.start=0;s.end=Infinity;
         }
         remove(start,end){if(arguments.length<2)throw new TypeError('Range required');const s=buffer(this),p=mutable(s),a=finite(start),b=+end;
             if(a<0||a>p.duration||Number.isNaN(p.duration)||Number.isNaN(b)||b<=a)throw new TypeError('Invalid removal range');
             operation(this,s,parent=>native('mseRemove',parent.node,s.id,a,b));
         }
         changeType(value){if(!arguments.length)throw new TypeError('Type required');const s=buffer(this),p=mutable(s),type=str(value);if(!type)throw new TypeError('Type is empty');if(!support(type))throw error('NotSupportedError','Unsupported MSE type');reopen(p);
-            if(!native('mseChangeType',p.node,s.id,type))throw error('NotSupportedError','Media type change failed');s.type=type;
+            if(!native('mseChangeType',p.node,s.id,type))throw error('NotSupportedError','Media type change failed');if(typeof mediaEme!=='undefined')mediaEme.reset(this);s.type=type;
         }
     }
     class MediaSource extends EventTarget {
@@ -177,10 +181,11 @@ const mseBridge = (() => {
         }
         removeSourceBuffer(value){const p=source(this),s=apply(get,buffers,[value]);if(!s||s.parent!==this||s.removed)throw error('NotFoundError','SourceBuffer not found');
             if(s.updating){++s.epoch;if(s.timer)host.clear(s.timer);s.timer=0;s.updating=false;queue(value,'abort');queue(value,'updateend');}
-            native('mseDrop',p.node,s.id);s.removed=true;remove(p.active,value);remove(p.buffers,value);refreshTracks(p);
+            native('mseDrop',p.node,s.id);if(typeof mediaEme!=='undefined')mediaEme.reset(value);s.removed=true;remove(p.active,value);remove(p.buffers,value);refreshTracks(p);
         }
         endOfStream(reason=undefined){const p=source(this);idle(p);const type=reason===undefined?'':str(reason);if(type!==''&&type!=='network'&&type!=='decode')throw new TypeError('Invalid end of stream error');
             if(!native('mseEnd',p.node,type))throw error('InvalidStateError','Cannot end native media stream');
+            if(typeof mediaEme!=='undefined')for(const sb of p.buffers){if(type)mediaEme.reset(sb);else mediaEme.finish(sb);}
             let highest=0;for(const sb of p.buffers){const s=buffer(sb),a=native('mseRanges',p.node,s.id);for(let i=0;i<a.length;i++)highest=Math.max(highest,a[i][1]);}
             if(!type){
                 p.duration=highest;
@@ -191,7 +196,7 @@ const mseBridge = (() => {
                     if(p.node!==node||p.generation!==generation||p.state!=='ended')return;
                     const state=native('state',node);if(state.error)return;
                     if(state.msePending){host.timer(0,finish,10,[]);return;}
-                    let end=0;for(const sb of p.buffers){const s=buffer(sb),a=native('mseRanges',node,s.id);for(let i=0;i<a.length;i++)end=Math.max(end,a[i][1]);}
+                    let end=0;for(const sb of p.buffers){if(typeof mediaEme!=='undefined')mediaEme.commit(sb);const s=buffer(sb),a=native('mseRanges',node,s.id);for(let i=0;i<a.length;i++)end=Math.max(end,a[i][1]);}
                     p.duration=end;native('mseDuration',node,end);
                 };
                 schedule(finish);
@@ -209,7 +214,7 @@ const mseBridge = (() => {
     }
     function detach(node){
         const value=apply(get,attachments,[node]);if(!value)return;const p=source(value);apply(del,attachments,[node]);
-        for(const sb of p.buffers){const s=buffer(sb);++s.epoch;if(s.timer)host.clear(s.timer);s.timer=0;s.updating=false;s.removed=true;}
+        for(const sb of p.buffers){const s=buffer(sb);if(typeof mediaEme!=='undefined')mediaEme.reset(sb);++s.epoch;if(s.timer)host.clear(s.timer);s.timer=0;s.updating=false;s.removed=true;}
         const all=read(lists,p.buffers,'SourceBufferList'),active=read(lists,p.active,'SourceBufferList');all.items=[];active.items=[];refreshList(p.buffers);refreshList(p.active);
         p.node=null;p.state='closed';p.duration=NaN;p.live=null;p.generation++;queue(value,'sourceclose');
         const nodeLists=apply(get,nodeTrackLists,[node]);if(nodeLists){replaceTracks(nodeLists.audio,[]);replaceTracks(nodeLists.video,[]);}

@@ -890,7 +890,7 @@ const char *web_control_direction(node_t *control) {
 
 /* This request owns every exported byte until free. Native transport receives
    body_len and content_type, not a guessed strlen or a form-data placeholder. */
-struct form_encoding { sbuf body; const char *kind; char boundary[96]; bool collision, failed; };
+struct form_encoding { sbuf body; const char *kind; char boundary[96]; bool collision, failed; web_form_entry_sink entries;void *entry_opaque; };
 static bool submission_contains(const void *bytes, size_t length, const char *needle) {
     size_t count = strlen(needle); const unsigned char *data = bytes;
     if (count > length) return false;
@@ -928,6 +928,7 @@ static void multipart_name(sbuf *out, const char *name) {
 }
 static void submission_pair(struct form_encoding *encoding, const char *name, const char *text) {
     if (encoding->failed) return;
+    if(encoding->entries){struct web_face_entry entry={.name=(char*)name,.name_length=strlen(name),.bytes=(unsigned char*)(text?text:""),.size=strlen(text?text:"")};if(!encoding->entries(encoding->entry_opaque,&entry,false,NULL,0))encoding->failed=true;return;}
     sbuf normalized_name = {0}, normalized_value = {0};
     if (!submission_newlines(&normalized_name, name) || !submission_newlines(&normalized_value, text)) {
         encoding->failed = true; sb_free(&normalized_name); sb_free(&normalized_value); return;
@@ -982,6 +983,7 @@ static void face_encoded(sbuf *out,const sbuf *text,bool name){
 }
 static void submission_face(struct form_encoding *encoding,const struct web_face_entry *entry,const char *single_name){
     if(encoding->failed)return;
+    if(encoding->entries){struct web_face_entry value=*entry;if(single_name){value.name=(char*)single_name;value.name_length=strlen(single_name);}if(!encoding->entries(encoding->entry_opaque,&value,false,NULL,0))encoding->failed=true;return;}
     const char *name=single_name?single_name:entry->name;size_t name_length=single_name?strlen(single_name):entry->name_length;
     bool multipart=!strcmp(encoding->kind,"multipart/form-data"),plain=!strcmp(encoding->kind,"text/plain");
     sbuf normal_name={0},normal_value={0};
@@ -1024,9 +1026,15 @@ static void submission_face(struct form_encoding *encoding,const struct web_face
 static bool dirname_applicable(node_t *n) {
     return html_tag(n, T_textarea) || (html_tag(n, T_input) && (web_input_type(n) <= WEB_INPUT_URL || web_input_type(n) == WEB_INPUT_EMAIL));
 }
+static node_t *submission_next(node_t *scope,node_t *node){
+    bool omit=node->type==N_ELEM&&!node->foreign&&(node->tag==T_template||node->tag==T_datalist);
+    if(node->first&&!omit)return node->first;
+    while(node!=scope&&!node->next)node=node->parent;
+    return node==scope?NULL:node->next;
+}
 static void submission_collect(web_doc *d, node_t *form, node_t *scope, node_t *submitter, struct form_encoding *encoding) {
     if (encoding->failed) return;
-    for (node_t *n = scope->first; n; n = n->next) {
+    for (node_t *n = scope->first; n; n = submission_next(scope,n)) {
         if (n->type != N_ELEM || n->foreign || n->tag == T_template || n->tag == T_datalist) continue;
         const char *name = node_attr(n, "name");
         if (web_form_owner(d, n) == form && !web_control_disabled(n)) {
@@ -1040,19 +1048,21 @@ static void submission_collect(web_doc *d, node_t *form, node_t *scope, node_t *
                 size_t coord_length;
                 if (!SUBMISSION_SUM(coord_length,name ? strlen(name) : 0,2) || !submission_capacity(&coord,coord_length)) { encoding->failed = true; return; }
                 if (name && *name) { sb_puts(&coord, name); sb_putc(&coord, '.'); } sb_putc(&coord, 'x');
-                submission_pair(encoding, sb_cstr(&coord), "0"); coord.n--; sb_putc(&coord, 'y'); submission_pair(encoding, sb_cstr(&coord), "0"); sb_free(&coord);
+                char x[32],y[32];snprintf(x,sizeof x,"%d",n->image_submit_x);snprintf(y,sizeof y,"%d",n->image_submit_y);
+                submission_pair(encoding, sb_cstr(&coord), x); coord.n--; sb_putc(&coord, 'y'); submission_pair(encoding, sb_cstr(&coord), y); sb_free(&coord);
             } else if (name && *name) {
                 if (n->tag == T_input) {
                     enum web_input_kind kind = web_input_type(n);
                     if (kind == WEB_INPUT_CHECKBOX || kind == WEB_INPUT_RADIO) {
                         if (n->checked) { const char *value = node_attr(n, "value"); submission_pair(encoding, name, value ? value : "on"); }
-                    } else if (kind == WEB_INPUT_SUBMIT) { if (n == submitter) { const char *value = node_attr(n, "value"); submission_pair(encoding, name, value ? value : "Submit"); } }
+                    } else if (kind == WEB_INPUT_SUBMIT) { if (n == submitter) { const char *value = node_attr(n, "value"); submission_pair(encoding, name, value ? value : ""); } }
                     else if (kind == WEB_INPUT_FILE) {
                         unsigned count = n->files ? n->files->count : 0;
                         for (unsigned index = 0; index < (count ? count : 1); index++) {
                             const struct web_form_file *file = count ? &n->files->files[index] : NULL;
                             const char *filename = file ? file->name : "";
-                            if (strcmp(encoding->kind, "multipart/form-data")) submission_pair(encoding, name, filename);
+                            if(encoding->entries){struct web_face_entry entry={.name=(char*)name,.name_length=strlen(name),.file=true,.filename=(char*)filename,.filename_length=strlen(filename),.mime=(char*)(file?file->type:"application/octet-stream"),.bytes=file?file->bytes:NULL,.size=file?file->size:0,.last_modified=file?file->last_modified:0};if(!encoding->entries(encoding->entry_opaque,&entry,!file,file?n:NULL,index))encoding->failed=true;}
+                            else if (strcmp(encoding->kind, "multipart/form-data")) submission_pair(encoding, name, filename);
                             else {
                                 sbuf *body = &encoding->body;
                                 if (encoding->failed) break;
@@ -1074,12 +1084,15 @@ static void submission_collect(web_doc *d, node_t *form, node_t *scope, node_t *
                                 sb_free(&part_name); sb_free(&part_filename);
                             }
                         }
-                    } else if (kind < WEB_INPUT_SUBMIT) submission_pair(encoding, name, n->value ? n->value : "");
+                    } else if (kind < WEB_INPUT_SUBMIT) submission_pair(encoding, name, kind==WEB_INPUT_HIDDEN&&str_ieq(name,"_charset_")?"UTF-8":n->value?n->value:"");
                 } else if (n->tag == T_textarea) {
+                    if(encoding->entries){submission_pair(encoding,name,n->value?n->value:"");}
+                    else {
                     sbuf wrapped = {0};
                     if (web_textarea_submission(n, &wrapped)) submission_pair(encoding, name, wrapped.p ? sb_cstr(&wrapped) : "");
                     else encoding->failed = true;
                     sb_free(&wrapped);
+                    }
                 } else if (n->tag == T_select) {
                     for (node_t *option = web_select_next_option(n, NULL); option; option = web_select_next_option(n, option)) {
                         if (!option->checked || web_option_disabled(option)) continue;
@@ -1102,8 +1115,15 @@ static void submission_collect(web_doc *d, node_t *form, node_t *scope, node_t *
             }
         }
         if (encoding->failed) return;
-        submission_collect(d, form, n, submitter, encoding);
     }
+}
+bool web_form_collect_entries(web_doc *d,node_t *form,node_t *submitter,web_form_entry_sink sink,void *opaque){
+    if(!d||!html_tag(form,T_form)||form->owner!=d||!sink)return false;
+    if(submitter&&(!web_control_submit_button(submitter)||web_form_owner(d,submitter)!=form))return false;
+    node_t *scope=doc_node_root(form,false);if(!scope)return false;
+    struct form_encoding encoding={.kind="entry-list",.entries=sink,.entry_opaque=opaque};
+    if(!(scope->type==N_ELEM&&!scope->foreign&&scope->tag==T_datalist))submission_collect(d,form,scope,submitter,&encoding);
+    return !encoding.failed;
 }
 void web_submit_request_free(struct web_form_request *request) {
     if (!request) return;
@@ -1119,7 +1139,7 @@ bool web_submit_request(web_doc *d, web_node *submitter, struct web_form_request
     memset(request, 0, sizeof *request);
     if (!d || !submitter || submitter->owner != d || submitter->type != N_ELEM || submitter->foreign || !web_sandbox_forms_allowed(d)) return false;
     node_t *form = html_tag(submitter, T_form) ? submitter : web_form_owner(d, submitter);
-    if (!html_tag(form, T_form)) return false;
+    if (!html_tag(form, T_form)||form->constructing_form_entries) return false;
     const char *action = submit_attribute(form, submitter, "formaction", "action");
     const char *method = submit_attribute(form, submitter, "formmethod", "method");
     if (method && str_ieq(method, "dialog")) return false; // handled by the native dialog owner, never GET

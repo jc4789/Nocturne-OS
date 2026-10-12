@@ -11,6 +11,7 @@ static void frame_retire_document(web_doc *d) {
     struct web_js_state *s=d?d->js:NULL;if(!s)return;
     s->disabled=true;
     storage_release_document(s);
+    web_presentation_free(d);
     release_document_tasks(s);
     history_forget(s);
     broadcast_free(s);

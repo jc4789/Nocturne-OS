@@ -1,0 +1,207 @@
+{
+  "generator": "ffmpeg version 8.1.1-full_build-www.gyan.dev Copyright (c) 2000-2026 the FFmpeg developers",
+  "authorship": "self-authored synthetic tone/pattern; host encoder is not a runtime dependency",
+  "fixtures": [
+    {
+      "path": "mp4-opus.mp4",
+      "bytes": 5021,
+      "sha256": "0f21ae9c8c35db7cf10882c408fd1fab6593591cde76ebdcc911eac93b6dbed6",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "96k",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof"
+      ],
+      "streams": [
+        {
+          "codec_name": "opus",
+          "profile": null,
+          "codec_type": "audio",
+          "sample_rate": "48000",
+          "channels": 2,
+          "width": null,
+          "height": null,
+          "pix_fmt": null
+        }
+      ],
+      "host_reference_frames": 10248
+    },
+    {
+      "path": "mp4-ac3-delayed.mp4",
+      "bytes": 6305,
+      "sha256": "25b28e01f527b2f7819ab1905dbbf4319aef80a82948ef6d3ea8a5321aa59385",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:a",
+        "ac3",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof+delay_moov"
+      ],
+      "streams": [
+        {
+          "codec_name": "ac3",
+          "profile": null,
+          "codec_type": "audio",
+          "sample_rate": "48000",
+          "channels": 2,
+          "width": null,
+          "height": null,
+          "pix_fmt": null
+        }
+      ],
+      "host_reference_frames": 10752
+    },
+    {
+      "path": "mp4-eac3-delayed.mp4",
+      "bytes": 6307,
+      "sha256": "c289094eaf95f356dc93291d440b37a7f3ce4b5f8386921136abc7c81370fcad",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "aevalsrc=0.3*sin(2*PI*440*t)|0.3*sin(2*PI*660*t):s=48000:d=0.2",
+        "-c:a",
+        "eac3",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof+delay_moov"
+      ],
+      "streams": [
+        {
+          "codec_name": "eac3",
+          "profile": null,
+          "codec_type": "audio",
+          "sample_rate": "48000",
+          "channels": 2,
+          "width": null,
+          "height": null,
+          "pix_fmt": null
+        }
+      ],
+      "host_reference_frames": 10752
+    },
+    {
+      "path": "mp4-vp9.mp4",
+      "bytes": 3680,
+      "sha256": "73b43a573e58851698fba866564af83c9945a57f8bb5b88c7f0a2f4367fe8fbd",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=96x64:rate=10:duration=0.4",
+        "-an",
+        "-c:v",
+        "libvpx-vp9",
+        "-pix_fmt",
+        "yuv420p",
+        "-threads",
+        "1",
+        "-deadline",
+        "good",
+        "-cpu-used",
+        "4",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof"
+      ],
+      "streams": [
+        {
+          "codec_name": "vp9",
+          "profile": "Profile 0",
+          "codec_type": "video",
+          "sample_rate": null,
+          "channels": null,
+          "width": 96,
+          "height": 64,
+          "pix_fmt": "yuv420p"
+        }
+      ],
+      "host_reference_pictures": 4
+    },
+    {
+      "path": "mp4-hevc.mp4",
+      "bytes": 5296,
+      "sha256": "7e1a713421fd9f515544d3db326801257d7fe55025af93438a91872e33082636",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=96x64:rate=10:duration=0.4",
+        "-an",
+        "-c:v",
+        "libx265",
+        "-threads",
+        "1",
+        "-x265-params",
+        "pools=none:frame-threads=1:log-level=error",
+        "-tag:v",
+        "hvc1",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof"
+      ],
+      "streams": [
+        {
+          "codec_name": "hevc",
+          "profile": "Main",
+          "codec_type": "video",
+          "sample_rate": null,
+          "channels": null,
+          "width": 96,
+          "height": 64,
+          "pix_fmt": "yuv420p"
+        }
+      ],
+      "host_reference_pictures": 4
+    },
+    {
+      "path": "mp4-hevc10.mp4",
+      "bytes": 5251,
+      "sha256": "154873da371b76c257e7e1011f2fe2992a096b510ea0b8eefe6b2ef3816b0325",
+      "arguments": [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=96x64:rate=10:duration=0.4",
+        "-an",
+        "-c:v",
+        "libx265",
+        "-threads",
+        "1",
+        "-x265-params",
+        "pools=none:frame-threads=1:log-level=error",
+        "-tag:v",
+        "hvc1",
+        "-pix_fmt",
+        "yuv420p10le",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof"
+      ],
+      "streams": [
+        {
+          "codec_name": "hevc",
+          "profile": "Main 10",
+          "codec_type": "video",
+          "sample_rate": null,
+          "channels": null,
+          "width": 96,
+          "height": 64,
+          "pix_fmt": "yuv420p10le"
+        }
+      ],
+      "host_reference_pictures": 4
+    }
+  ]
+}

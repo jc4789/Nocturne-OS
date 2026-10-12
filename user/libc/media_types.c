@@ -21,7 +21,7 @@ static bool avc8(const char *s) {
     if (strlen(s) != 11) return false;
     for (int i = 5; i < 11; i++) if (!isxdigit((unsigned char)s[i])) return false;
     unsigned profile = (unsigned)strtoul(s+5,NULL,16) >> 16;
-    return profile == 66 || profile == 77 || profile == 88 || profile == 100;
+    return profile == 66 || profile == 77 || profile == 88 || profile == 100 || profile == 110 || profile == 122 || profile == 244;
 }
 static bool aac_lc_he(const char *s) {
     /* The configured floating-point AAC decoder includes SBR and Parametric
@@ -32,21 +32,37 @@ static bool aac_lc_he(const char *s) {
 static bool vp9_8(const char *s) {
     if (!strcmp(s,"vp9") || !strcmp(s,"vp9.0")) return true;
     /* WebM legacy spelling, or the standardized all-or-none color suffix.
-     * Profile 0, 8-bit 4:2:0 SDR only; no HDR/10-bit capability inflation. */
+     * Native planar 8/10/12-bit SDR conversion; HDR suffixes remain rejected. */
     size_t n = strlen(s);
     if ((n != 13 && n != 28) || strncmp(s,"vp09.",5)) return false;
     for (size_t i=5; i<n; i+=3) {
         if (!isdigit((unsigned char)s[i]) || !isdigit((unsigned char)s[i+1])) return false;
         if (i+2<n && s[i+2]!='.') return false;
     }
-    if (s[5]!='0' || s[6]!='0' || s[11]!='0' || s[12]!='8') return false;
+    if (s[5]!='0' || s[6]<'0' || s[6]>'3') return false;
+    int depth=(s[11]-'0')*10+s[12]-'0';
+    if(depth!=8&&depth!=10&&depth!=12)return false;
+    if((s[6]<'2')!=(depth==8))return false;
     int level=(s[8]-'0')*10+s[9]-'0';
     if (level!=10 && level!=11 && level!=20 && level!=21 && level!=30 && level!=31 &&
         level!=40 && level!=41 && level!=50 && level!=51 && level!=52 && level!=60 && level!=61 && level!=62) return false;
     if (n==28) {
-        if (s[14]!='0' || (s[15]!='0' && s[15]!='1') || s[26]!='0' || (s[27]!='0' && s[27]!='1')) return false;
+        if (s[14]!='0' || s[15]<'0' || s[15]>'3' || s[26]!='0' || (s[27]!='0' && s[27]!='1')) return false;
+        if((s[6]=='0'||s[6]=='2')&&s[15]>'1')return false;
         if (strncmp(s+17,"01.01.01.",9) && strncmp(s+17,"05.06.05.",9) && strncmp(s+17,"06.06.06.",9)) return false;
     }
+    return true;
+}
+static bool hevc_main(const char *s){
+    if(strncmp(s,"hvc1.",5)&&strncmp(s,"hev1.",5))return false;
+    /* ISO BMFF HEVC Main/Main10. Profile compatibility/constraint fields are
+       hexadecimal, tier is L/H and level is decimal. Unknown profiles stay
+       unsupported even though the compiled decoder knows more profiles. */
+    const char *p=s+5;if((*p!='1'&&*p!='2')||p[1]!='.')return false;p+=2;
+    const char *start=p;while(isxdigit((unsigned char)*p))p++;if(p==start||p-start>8||*p++!='.')return false;
+    if(*p!='l'&&*p!='h')return false;p++;start=p;while(isdigit((unsigned char)*p))p++;
+    if(p==start||p-start>3)return false;
+    while(*p){if(*p++!='.')return false;start=p;while(isxdigit((unsigned char)*p))p++;if(p==start||p-start>2)return false;}
     return true;
 }
 const char *nmedia_can_play_type(const char *type) {
@@ -95,13 +111,14 @@ const char *nmedia_can_play_type(const char *type) {
         else if (container == FLAC) ok = !strcmp(codec,"flac");
         else if (container == WAV) ok = !strcmp(codec,"1") || !strcmp(codec,"3") || !strcmp(codec,"pcm");
         else if (container == AAC) ok = aac_lc_he(codec);
-        else if (container == MP4) ok = aac_lc_he(codec) || (strncmp(mime,"audio/",6) && avc8(codec));
+        else if (container == MP4) ok = aac_lc_he(codec) || !strcmp(codec,"opus") || !strcmp(codec,"ac-3") || !strcmp(codec,"ec-3") ||
+            (strncmp(mime,"audio/",6) && (avc8(codec)||vp9_8(codec)||hevc_main(codec)));
         else if (container == AVI) ok = !strcmp(codec,"mjpeg") || !strcmp(codec,"mp3") || !strcmp(codec,"pcm");
         else if (container == WEBM) ok = !strcmp(codec,"opus") || !strcmp(codec,"vorbis") ||
             (strncmp(mime,"audio/",6) && (!strcmp(codec,"vp8") || !strcmp(codec,"vp8.0") || vp9_8(codec)));
         else if (container == OGG) ok = !strcmp(codec,"opus") || !strcmp(codec,"vorbis");
         else if (container == TS || container == HLS || container == DASH)
-            ok = aac_lc_he(codec) || avc8(codec);
+            ok = aac_lc_he(codec) || avc8(codec) || hevc_main(codec) || !strcmp(codec,"ac-3") || !strcmp(codec,"ec-3");
         if (!ok || (next && !*next)) return "";
         p = next;
     }

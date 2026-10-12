@@ -17,7 +17,7 @@ enum {
     SYS_CHANNEL_LISTEN, SYS_CHANNEL_CONNECT, SYS_CHANNEL_ACCEPT,
     SYS_WIN_CREATE = 64, SYS_WIN_MAP, SYS_WIN_PRESENT, SYS_WIN_SET_TITLE, SYS_SCREEN_INFO,
     SYS_WIN_MOVE, SYS_CLIPBOARD_SET, SYS_CLIPBOARD_GET, SYS_WIN_RESIZE, SYS_GUI_LAUNCH,
-    SYS_SCREEN_GRAB, SYS_WIN_STATE,
+    SYS_SCREEN_GRAB, SYS_WIN_STATE, SYS_WIN_PRESENTATION,
     SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
     SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
     SYS_MAX = 128
@@ -118,6 +118,21 @@ struct n_pciinfo {
 #define F_SETTTY 100 /* mark a pipe as a terminal (the terminal emulator does this), so isatty() is true */
 #define F_NLOCK 1024   /* Nocturne: wait for a vnode lease owned by this open file */
 #define F_NUNLOCK 1025 /* release that lease; the last close also releases it */
+#define F_NTRYLOCK 1026 /* Nocturne: acquire the vnode lease without sleeping; busy is EAGAIN */
+
+/* Extended /dev/audio read snapshot; a four-byte read retains the original
+ * software queue count. Device time counts this stream's consumed PCM only. */
+struct n_audio_status {
+    uint32_t queued_frames;
+    uint32_t device_pending_frames;
+    uint64_t played_frames;
+    uint64_t committed_frames;
+    uint32_t generation;
+    uint32_t flags;
+};
+#define N_AUDIO_CLOCK_DEVICE 1u
+#define N_AUDIO_CLOCK_ESTIMATED 2u
+#define N_AUDIO_CLOCK_REMOTE 4u
 
 /* ---- GUI ---- */
 enum {
@@ -140,8 +155,10 @@ struct gui_event {
 #define WIN_NO_DECOR 2
 #define WIN_CENTER 4
 #define WIN_START_MAXIMIZED 8
+#define WIN_ALWAYS_ON_TOP 16
 #define WIN_STATE_VISIBLE 1
 #define WIN_STATE_FOCUSED 2
+#define WIN_STATE_FULLSCREEN 4
 
 struct screen_info {
     uint32_t width, height;

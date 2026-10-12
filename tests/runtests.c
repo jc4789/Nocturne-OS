@@ -112,6 +112,12 @@ static const struct test tests[] = {
      {"media_webmtest: ", ", 0 failed"}, "FAIL", 180, false, true},
     {"media", "browser-webm-ogg-lifetime", "tcc -run /data/tests/avmediawebmtest.c", 0,
      {"avmediawebmtest: ", ", 0 failed"}, "FAIL", 120, false, true},
+    {"media", "native-playback-rate", "tcc -run /data/tests/mediaratetest.c", 0,
+     {"mediaratetest: ", ", 0 failures"}, "FAIL", 120, false, true},
+    {"media", "bmff-codecs", "tcc -run /data/tests/media_bmfftest.c", 0,
+     {"media_bmfftest: ", ", 0 failures"}, "FAIL", 180, false, true},
+    {"cenc", "native-packet-owner", "/data/tests/media_cenc_test", 0,
+     {"media_cenc_test: 11 checks, 0 failures"}, "CENC_FAIL", 120, false, true},
 
     /* sound (scripts/test.py records the AC'97 output and checks the tones in it) */
     {"audio", "card", "dmesg | grep audio:", 0, {"AC'97"}},
@@ -134,7 +140,7 @@ static const struct test tests[] = {
     {"styleincremental", "native-scoped-incremental-style", "tcc -I/data/tests -o /home/styleincrementaltest /data/tests/styleincrementaltest.c && /home/styleincrementaltest", 0,
      {"styleincremental: ", ", 0 failures"}, "FAIL", 120, false, true},
     {"csscache", "completed-external-ast", "tcc -I/data/tests -o /home/csscachetest /data/tests/csscachetest.c && /home/csscachetest", 0,
-     {"csscache: 23 checks, 0 failures"}, "FAIL", 120, false, true},
+     {"csscache: 27 checks, 0 failures"}, "FAIL", 120, false, true},
     {"paralleljs", "native-dom-hooks", "tcc -I/data/tests -o /home/paralleljstest /data/tests/paralleljstest.c && /home/paralleljstest", 0,
      {"paralleljstest: ", ", 0 failed"}, "FAIL", 120, false, true},
     {"currentscript", "classic-checkpoint", "tcc -I/data/tests -o /home/currentscripttest /data/tests/currentscripttest.c && /home/currentscripttest", 0,

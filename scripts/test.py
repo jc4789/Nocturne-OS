@@ -170,6 +170,11 @@ def make_disk(a, tcp_port, web_ports):
     srcs += [os.path.join(source_root, "user", "libc", "web", name) for name in
              ("form_value.h", "form_validation.h", "elements.h", "frame.h", "html_lexbor.h", "html_policy.h", "html_pi.h", "sandbox.h")]
     srcs += sorted(glob.glob(os.path.join(source_root, "tests", "*.h")))
+    cenc = os.path.join(CORE_BUILD, "tests", "media_cenc_test")
+    if "cenc" in a.groups or "cenc/native-packet-owner" in a.groups:
+        if a.source_tree or not os.path.isfile(cenc):
+            sys.exit("test: build the matching native CENC test before selecting cenc")
+        srcs.append(cenc)
     mtools("mcopy", "-i", PART, *srcs, "::/tests/")
     mtools("mcopy", "-i", PART, "-s", os.path.join(source_root, "tests", "media-fixtures"), "::/tests/")
     if a.full:

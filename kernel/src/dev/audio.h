@@ -14,13 +14,19 @@ void audio_init(void);
 void audio_tick(void); /* from the timer interrupt, every millisecond */
 
 struct file;
-/* Drop only this stream's not-yet-mixed PCM. Already submitted card/remote
- * sink buffers are outside this queue; ordinary close still drains. */
+/* Drop this stream's not-yet-mixed PCM and retire its old clock generation.
+ * Already mixed card/remote samples cannot be unmixed here, but they never
+ * become the new generation's played samples. Ordinary close drains DMA too. */
 int audio_flush_file(struct file *file);
 
 /* Mix `frames` frames from every stream into out (NULL: just consume them). Returns false, with
    silence in out, when no stream had anything to play. */
 bool audio_mix(int16_t *out, int frames);
+/* Card-only ownership: record each stream's actual contribution, then retire
+ * it when the cached DMA consumption ordinal advances. Ordinary remote mix
+ * does not pretend that a server packet is an audible device completion. */
+bool audio_card_mix(int16_t *out, int frames);
+void audio_card_played(uint64_t ordinal);
 bool audio_pending(void); /* some stream has frames waiting */
 
 /* A sound card: fill() tops up its buffers with audio_mix(); it is called from audio_tick().

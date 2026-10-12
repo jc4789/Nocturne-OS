@@ -3,11 +3,11 @@
  * origin in C and checks every response/preflight; it never follows redirects.
  * No page can pass a local path or an origin grant to the decoder.
  * MSE uses the private packet-buffer bridge. DRM, native live manifest loading,
- * autoplay and non-1x playback are not advertised. */
+ * autoplay is not advertised. PCM tempo remains native and single-owner. */
 const avmediaBridge = (() => {
     const native = host.avmedia, states = new WeakMap(), active = new Set();
     let timer = 0;
-    const mediaEvents = ['loadstart','loadedmetadata','loadeddata','canplay','canplaythrough','play','playing','pause','timeupdate','ended','error','emptied','seeking','seeked','volumechange','durationchange','abort','waiting','stalled','progress'];
+    const mediaEvents = ['loadstart','loadedmetadata','loadeddata','canplay','canplaythrough','play','playing','pause','timeupdate','ended','error','emptied','seeking','seeked','volumechange','ratechange','durationchange','abort','waiting','stalled','progress','encrypted','waitingforkey'];
     function event(node,type) { const e=new Event(type);eventState(e).isTrusted=true;dispatch(node,e); }
     function brand(node) {
         if (!node || (node.localName !== 'audio' && node.localName !== 'video') || node.namespaceURI !== 'http://www.w3.org/1999/xhtml') throw new TypeError('HTMLMediaElement receiver required');
@@ -16,7 +16,7 @@ const avmediaBridge = (() => {
     function get(node) {
         brand(node);
         let s=states.get(node);
-        if(!s){s={generation:0,intent:0,seekIntent:0,currentSrc:'',controller:null,promise:null,network:0,error:null,volume:1,muted:false,last:null,lastTime:0};states.set(node,s);}
+        if(!s){s={generation:0,intent:0,seekIntent:0,currentSrc:'',controller:null,promise:null,network:0,error:null,volume:1,muted:false,rate:1,defaultRate:1,preservePitch:true,last:null,lastTime:0};states.set(node,s);}
         return s;
     }
     function snapshot(node) { get(node);return native('state',node); }
@@ -56,6 +56,8 @@ const avmediaBridge = (() => {
                 if(s.generation!==generation)continue;
                 if(s.last&&s.last.waiting!==now.waiting){if(now.waiting)event(node,'waiting');else if(!now.paused)event(node,'playing');}
                 if(s.generation!==generation)continue;
+                if(now.keyWaiting&&(!s.last||!s.last.keyWaiting))event(node,'waitingforkey');
+                if(s.generation!==generation)continue;
                 if(s.last&&!s.last.ended&&now.ended){
                     const intent=s.intent;
                     event(node,'timeupdate');
@@ -82,6 +84,7 @@ const avmediaBridge = (() => {
         if(s.controller)s.controller.abort();
         s.controller=null;s.generation=(s.generation+1)>>>0;s.intent++;s.seekIntent++;s.promise=null;s.error=null;s.network=0;s.currentSrc='';s.last=null;
         native('reset',node,s.generation);textTrackBridge.reset(node);active.delete(node);
+        if(s.rate!==s.defaultRate){native('rate',node,s.defaultRate,s.preservePitch);s.rate=s.defaultRate;setTimeout(()=>event(node,'ratechange'),0);}
     }
     async function load(node,forPlay=false) {
         const s=get(node);reset(node,s);const generation=s.generation,loadIntent=s.intent;
@@ -189,10 +192,12 @@ const avmediaBridge = (() => {
         set preload(v){brand(this);this.setAttribute('preload',String(v));}
         get crossOrigin(){brand(this);const v=this.getAttribute('crossorigin');return v===null?null:v.toLowerCase()==='use-credentials'?'use-credentials':'anonymous';}
         set crossOrigin(v){brand(this);if(v===null)this.removeAttribute('crossorigin');else this.setAttribute('crossorigin',String(v));}
-        get playbackRate(){brand(this);return 1;}
-        set playbackRate(v){brand(this);if(Number(v)!==1)throw new DOMException('Only 1x playback is supported','NotSupportedError');}
-        get defaultPlaybackRate(){return this.playbackRate;}
-        set defaultPlaybackRate(v){this.playbackRate=v;}
+        get playbackRate(){return get(this).rate;}
+        set playbackRate(value){const s=get(this),v=Number(value);if(!Number.isFinite(v))throw new TypeError('Invalid playback rate');if(v!==0&&(v<0.25||v>4))throw new DOMException('Unsupported playback rate','NotSupportedError');if(v===s.rate)return;if(!native('rate',this,v,s.preservePitch))throw new DOMException('Cannot change playback rate','NotSupportedError');s.rate=v;setTimeout(()=>event(this,'ratechange'),0);}
+        get defaultPlaybackRate(){return get(this).defaultRate;}
+        set defaultPlaybackRate(value){const s=get(this),v=Number(value);if(!Number.isFinite(v))throw new TypeError('Invalid default playback rate');if(v!==0&&(v<0.25||v>4))throw new DOMException('Unsupported playback rate','NotSupportedError');if(v!==s.defaultRate){s.defaultRate=v;setTimeout(()=>event(this,'ratechange'),0);}}
+        get preservesPitch(){return get(this).preservePitch;}
+        set preservesPitch(value){const s=get(this),v=!!value;if(v===s.preservePitch)return;if(!native('rate',this,s.rate,v))throw new DOMException('Cannot change pitch preservation','NotSupportedError');s.preservePitch=v;}
         canPlayType(type){get(this);if(!arguments.length)throw new TypeError('Media type is required');return native('type',null,String(type));}
         load(){get(this);load(this).catch(()=>{});}
         async play(){

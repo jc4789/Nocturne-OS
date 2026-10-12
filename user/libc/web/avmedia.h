@@ -26,6 +26,8 @@ void web_avmedia_background(uint64_t now_ms);
 int64_t web_avmedia_background_deadline(uint64_t now_ms);
 bool web_avmedia_paint(web_doc *doc, node_t *node, canvas_t *canvas, int x, int y, int w, int h);
 bool web_avmedia_size(node_t *node, int *width, int *height);
+bool web_avmedia_pip_ready(web_doc *,node_t *);
+bool web_avmedia_pip_paint(web_doc *,node_t *,canvas_t *);
 /* Called only within ordinary top-document paint. Probes are clipped to the
  * visible video span and never run from service/interrupts. Snapshot capacity
  * follows that actual canvas span; 13 bytes/pixel are charged to the existing

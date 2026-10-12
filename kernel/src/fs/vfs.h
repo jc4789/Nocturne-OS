@@ -93,6 +93,7 @@ int64_t vfs_write(struct file *f, const void *buf, size_t n);
 int64_t vfs_seek(struct file *f, int64_t off, int whence);
 void vfs_close(struct file *f);
 int vfs_lease(struct file *f, bool acquire);
+int vfs_try_lease(struct file *f);
 struct file *vfs_dup(struct file *f);
 int vfs_readdir(struct file *f, uint64_t idx, struct dirent *out);
 int vfs_stat(const char *abspath, struct kstat *st);

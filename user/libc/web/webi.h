@@ -201,6 +201,8 @@ typedef struct node {
     size_t custom_validity_length;
     bool checked, selected_set;
     bool click_in_progress;
+    bool constructing_form_entries; /* entry-list construction and formdata event reentry guard */
+    int image_submit_x,image_submit_y; /* selected image CSS point, initially 0,0; non-pointer activation preserves it */
     bool indeterminate; /* native checkbox display state, independent of checkedness */
     struct web_form_files *files;
     uint64_t file_revision;
@@ -758,7 +760,7 @@ struct web_doc {
     struct web_js_state *js;
     bool live, dirty, paint_dirty, resources_dirty, images_dirty;
     pvec css_cache;
-    struct css_sheet_reuse *css_reuse; /* current CSS arena only, no DOM ownership */
+    struct css_sheet_reuse *css_reuse; /* immutable live inline ASTs, no DOM ownership */
     size_t css_reuse_bytes;
     unsigned css_reuse_count;
     size_t css_bytes;
@@ -803,6 +805,11 @@ struct web_doc {
     node_t *active_target; /* native primary-button press, independent of hover/events */
     web_doc *active_leaf; /* top document's pressed context; native arenas remain owned */
     struct web_dialog_state *dialogs; /* native modal/top-layer ownership */
+    node_t *fullscreen_element,*pip_element;
+    uint64_t presentation_revision;
+    int pip_width,pip_height;
+    bool (*presentation_host)(void *,web_doc *,web_node *,int);
+    void *presentation_opaque;
     int view_x, view_y; /* last native viewport scroll; fixed top-layer coordinates */
     node_t *validation_target;
     bool validation_report_pending;

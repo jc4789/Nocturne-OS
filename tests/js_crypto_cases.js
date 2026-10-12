@@ -111,8 +111,8 @@ globalThis.runCryptoCases = async function runCryptoCases() {
     throws(() => crypto.getRandomValues(new Uint8Array(buffer)), 'TypeError', 'resizable random');
     await rejects(() => crypto.subtle.digest('SHA-256', buffer), 'TypeError', 'resizable digest');
   }
-  for (const name of ['encrypt','decrypt','sign','verify','generateKey','deriveKey',
-    'deriveBits','importKey','exportKey','wrapKey','unwrapKey'])
+  // AES now has native implementations; the other algorithms still reject.
+  for (const name of ['sign','verify','deriveKey','deriveBits','wrapKey','unwrapKey'])
     await rejects(() => crypto.subtle[name](), 'NotSupportedError', name + ' explicit unsupported');
   return checks;
 };

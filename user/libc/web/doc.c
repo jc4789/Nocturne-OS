@@ -45,15 +45,33 @@ struct pending {
     node_t *scope; /* stylesheet owner shadow root, NULL for document */
 };
 
-/* Repeated shadow <style> blocks need separate scope/order wrappers, not a
-   fresh expanded AST per component. This memo is local to one arena snapshot.
-   Imported sheets are excluded: their request order is not interchangeable. */
+/* Immutable inline ASTs survive resource snapshots. Each cascade instance
+ * still owns its scope/order/media and import traversal; unreferenced entries
+ * are reclaimed after the new snapshot is published, not retained forever. */
 struct css_sheet_reuse {
     struct css_sheet_reuse *next;
     const char *css, *base, *media;
     size_t n;
     sheet_t *sheet;
+    arena_t arena;
+    uint64_t hash;
+    bool used;
 };
+
+static uint64_t sheet_hash(const char *text,size_t length) {
+    uint64_t hash=UINT64_C(14695981039346656037);
+    for(size_t i=0;i<length;i++)hash=(hash^(uint8_t)text[i])*UINT64_C(1099511628211);
+    return hash;
+}
+static void sheet_reuse_sweep(web_doc *d,bool all) {
+    struct css_sheet_reuse **link=&d->css_reuse;
+    while(*link) {
+        struct css_sheet_reuse *c=*link;
+        if(!all && c->used){link=&c->next;continue;}
+        *link=c->next;d->css_reuse_count--;d->css_reuse_bytes-=c->n;
+        ar_free(&c->arena);free(c);
+    }
+}
 
 static struct cached_css *cached_css(web_doc *d, const char *url) {
     for (int i = 0; i < d->css_cache.n; i++) {
@@ -236,17 +254,33 @@ static sheet_t *cached_sheet_ast(web_doc *d, struct cached_css *c) {
 static bool sheet_parse(web_doc *d, struct sheet_walk *f, const char *css, size_t n,
                         const char *base, double order, const char *media, node_t *scope) {
     arena_t *arena = d->live ? &d->cssmem : &d->mem;
-    const char *source = css ? css : "", *source_base = base ? base : "", *source_media = media ? media : "";
+    const char *source = css ? css : "", *source_base = base ? base : "";
     for(int i=0;d->live && i<d->css_cache.n;i++) {
         struct cached_css *c=d->css_cache.v[i];
         if(!c->done || c->body!=css || c->n!=n || strcmp(c->base,source_base))continue;
         sheet_t *ast=cached_sheet_ast(d,c);
         return ast && sheet_instance_imports(d,f,ast,order,media,scope);
     }
+    uint64_t hash=sheet_hash(source,n);
     for (struct css_sheet_reuse *c = d->css_reuse; c; c = c->next) {
-        if (n != c->n || strcmp(source_base, c->base) || strcmp(source_media, c->media) || memcmp(source, c->css, n)) continue;
-        f->sheet = css_sheet_instance(arena, c->sheet, order, scope);
-        return true;
+        if (!c->sheet || hash!=c->hash || n != c->n || strcmp(source_base, c->base) || memcmp(source, c->css, n)) continue;
+        c->used=true;
+        return sheet_instance_imports(d,f,c->sheet,order,media,scope);
+    }
+    if(d->live && d->css_reuse_count<UINT_MAX && n<SIZE_MAX && d->css_reuse_bytes<=SIZE_MAX-n) {
+        struct css_sheet_reuse *c=calloc(1,sizeof *c);
+        if(!c)return false;
+        c->n=n;c->hash=hash;c->next=d->css_reuse;d->css_reuse=c;
+        d->css_reuse_count++;d->css_reuse_bytes+=n;
+        /* The document's existing scan trap owns failure recovery. Link first
+         * so a cancelled/failed allocation is reclaimed along with its arena. */
+        c->arena.trap=arena->trap;
+        c->css=ar_strndup(&c->arena,source,n);c->base=ar_strdup(&c->arena,source_base);
+        c->sheet=css_parse_sheet_serviced(d,&c->arena,c->css,n,c->base,0,NULL);
+        c->arena.trap=NULL;
+        if(!c->sheet || d->native_cancelled)return false;
+        c->used=true;
+        return sheet_instance_imports(d,f,c->sheet,order,media,scope);
     }
     sheet_t *sh;
     if (media && *media) {
@@ -258,13 +292,6 @@ static bool sheet_parse(web_doc *d, struct sheet_walk *f, const char *css, size_
     } else sh = css_parse_sheet_serviced(d,arena, source, n, source_base, order, &f->imports);
     css_sheet_scope(sh, scope);
     f->sheet = sh;
-    if (!f->imports.n && d->css_reuse_count < UINT_MAX && n < SIZE_MAX && d->css_reuse_bytes <= SIZE_MAX - n) {
-        struct css_sheet_reuse *c = ar_alloc(arena, sizeof *c);
-        c->css = ar_strndup(arena, source, n); c->n = n;
-        c->base = ar_strdup(arena, source_base); c->media = ar_strdup(arena, source_media);
-        c->sheet = sh; c->next = d->css_reuse; d->css_reuse = c;
-        d->css_reuse_count++; d->css_reuse_bytes += n;
-    }
     return true;
 }
 
@@ -926,7 +953,7 @@ void doc_rescan(web_doc *d) {
     d->marquees.n=0;
     css_styling_free(&d->sty);
     ar_free(&d->cssmem);
-    d->css_reuse = NULL; d->css_reuse_count = 0; d->css_reuse_bytes = 0;
+    for(struct css_sheet_reuse *c=d->css_reuse;c;c=c->next)c->used=false;
     free_pending(d);
     d->next_sheet_order = 0;
     d->base_seen = false;
@@ -973,9 +1000,10 @@ void doc_rescan(web_doc *d) {
         /* Incomplete authored sheet snapshots must never outlive their arena. */
         css_styling_free(&d->sty);
         ar_free(&d->cssmem);
-        d->css_reuse = NULL; d->css_reuse_count = 0; d->css_reuse_bytes = 0;
+        sheet_reuse_sweep(d,true);
         free_pending(d);
     }
+    if(!failed_arena)sheet_reuse_sweep(d,false);
     d->mem.trap = old_mem;
     d->cssmem.trap = old_css;
     d->dirty = d->need_style = true;
@@ -1081,7 +1109,37 @@ bool web_paint_dirty(web_doc *d) {
 }
 bool web_script_running(web_doc *d) { return d && d->live && web_js_running(d); }
 bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
-    return !d || !d->live || web_js_dispatch(d, target, e);
+    if(!d||!d->live)return true;
+    /* WHATWG image-button activation: capture the selected point in the
+       displayed image before click listeners can replace layout or reparent
+       it. Only an uncanceled explicit coordinate selection updates it;
+       keyboard/script activation retains the initially-zero selected point.
+       Padding/border clicks may yield negative CSS coordinates, not 0-clamped
+       bitmap pixels. No extra layout flush or mutable author getter is used. */
+    web_doc *owner=target?target->owner:NULL;bool image_point=false;int selected_x=0,selected_y=0;
+    if(e&&e->type&&!strcmp(e->type,"click")&&!e->synthetic&&!e->keyboard_activation&&
+       target&&target->type==N_ELEM&&!target->foreign&&target->tag==T_input&&
+       web_input_type(target)==WEB_INPUT_IMAGE&&owner&&owner->live&&target->box&&
+       target->image>=0&&target->image<owner->images.n){
+        struct web_image *image=owner->images.v[target->image];int x,y,w,h;
+        if(image&&!image->failed&&(image->img||image->svg)&&web_node_rect(d,target,&x,&y,&w,&h)){
+            box_t *box=target->box;
+            double px=(double)e->x+d->view_x-x-box->p[3]-box->b[3];
+            double py=(double)e->y+d->view_y-y-box->p[0]-box->b[0];
+            double left=ceil(-(double)box->p[3]-box->b[3]),right=floor((double)box->w+box->p[1]+box->b[1]);
+            double top=ceil(-(double)box->p[0]-box->b[0]),bottom=floor((double)box->h+box->p[2]+box->b[2]);
+            if(isfinite(px)&&isfinite(py)&&left<=right&&top<=bottom){
+                px=MAX(left,MIN(floor(px),right));py=MAX(top,MIN(floor(py),bottom));
+                if(px>=INT_MIN&&px<=INT_MAX&&py>=INT_MIN&&py<=INT_MAX){selected_x=(int)px;selected_y=(int)py;image_point=true;}
+            }
+        }
+    }
+    bool allowed=web_js_dispatch(d,target,e);
+    if(allowed&&image_point&&target->owner==owner&&owner->live&&
+       web_input_type(target)==WEB_INPUT_IMAGE&&web_form_owner(owner,target)){
+        target->image_submit_x=selected_x;target->image_submit_y=selected_y;
+    }
+    return allowed;
 }
 
 static void free_values(node_t *n) {
@@ -1198,6 +1256,7 @@ void web_free(web_doc *d) {
     ar_free(&d->smem);
     ar_free(&d->lmem);
     ar_free(&d->cssmem);
+    sheet_reuse_sweep(d,true);
     free(d->url);
     free(d->resolved_link);
     free(d->find_text);
@@ -1357,8 +1416,10 @@ int web_layout(web_doc *d, int width, int height) {
        result until DOM/style, viewport, or image intrinsic dimensions change. */
     if (d->layout_valid && !d->need_style && !d->need_boxes && d->root_box &&
         d->width == width && d->height == height) { d->native_layout_depth--; return d->doc_h; }
-    /* No independent patch may publish a previously committed video span
-       while geometry is incomplete. Native PCM/transport supply continues. */
+    /* Layout changes the next paint, not the raster already on screen.
+       Native video snapshots own committed pixels/geometry independently;
+       actual paint, canvas/scroll changes and media retirement invalidate
+       them without borrowing these mutable layout boxes. */
     web_avmedia_layout_begin(d);
     if(d->width!=width||d->height!=height){
         invalidate_layout_tree(d->root_box);

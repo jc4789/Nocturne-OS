@@ -18,6 +18,11 @@ void web_worker_abort(web_worker_publication *);
  * same-origin/CORS/cookie/security policy; child has no direct network API.
  * Completion may queue bytes only, never execute author JS. */
 typedef bool (*web_worker_loader)(void *,uint32_t,uint32_t,const char *,int);
+/* Binary Fetch request snapshots are borrowed only for this call. The browser
+ * transport copies them before returning and retains the native initiator. */
+typedef bool (*web_worker_requester)(void *,uint32_t,uint32_t,const char *,int,
+                                    const char *,const char *,const void *,size_t);
+void web_worker_set_requester(web_workers *,web_worker_requester);
 /* Request zero retires all outstanding resources of this real child owner. */
 typedef void (*web_worker_canceler)(void *,uint32_t,uint32_t);
 web_workers *web_worker_new(JSContext *,uint32_t,web_worker_loader,void *);

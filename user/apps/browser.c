@@ -13,14 +13,19 @@
 #include "webstorage.h"
 #include <parallel.h>
 
-#define TB 40   /* toolbar */
-#define SB 24   /* status / find bar */
-#define SCRW 10 /* scrollbar */
+#define TB (browser_fullscreen?0:40)   /* native fullscreen has no chrome */
+#define SB (browser_fullscreen?0:24)
+#define SCRW (browser_fullscreen?0:10)
 #define LINE 48
 #define HOME "about:home"
 #define SEARCH "https://lite.duckduckgo.com/lite/?q="
 
 static window_t *w;
+static bool browser_fullscreen;
+static web_doc *fullscreen_doc,*pip_doc;
+static web_node *pip_node;
+static window_t *pip_window;
+static uint64_t pip_revision;
 static web_doc *doc;
 static int scroll_x, scroll_y, doc_w, doc_h;
 struct url_text { char *p; size_t capacity; };
@@ -157,7 +162,7 @@ static bool scroll_event_pending;
 #include "browser_events.h"
 
 static int page_w(void) { return MAX(w->w - SCRW, 50); }
-static int console_h(void) { return console_open ? MIN(220, MAX(80, (w->h - TB - SB) / 3)) : 0; }
+static int console_h(void) { return console_open&&!browser_fullscreen ? MIN(220, MAX(80, (w->h - TB - SB) / 3)) : 0; }
 static int page_h(void) { return MAX(w->h - TB - SB - console_h(), 20); }
 static int max_scroll(void) { return MAX(doc_h - page_h(), 0); }
 static int max_scroll_x(void) { return MAX(doc_w - page_w(), 0); }
@@ -250,6 +255,7 @@ static int btn_x(int i) { return 6 + i * 32; }
 #define ADDR_X (btn_x(NBTN) + 6)
 
 static void draw_toolbar(void) {
+    if(browser_fullscreen)return;
     canvas_t *c = &w->c;
     int W = w->w;
     gfx_gradient_v(c, 0, 0, W, TB, RGB(46, 42, 80), RGB(36, 32, 64));
@@ -285,6 +291,7 @@ static void draw_toolbar(void) {
 }
 
 static void draw_status(void) {
+    if(browser_fullscreen)return;
     canvas_t *c = &w->c;
     int W = w->w, y = w->h - SB;
     gfx_fill(c, 0, y, W, SB, RGB(28, 26, 46));
@@ -331,6 +338,7 @@ static void draw_page(void) {
 }
 
 static void draw_console(void) {
+    if(browser_fullscreen)return;
     if (console_open) {
         canvas_t *c = &w->c;
         int top = TB + page_h(), h = console_h();
@@ -1007,10 +1015,41 @@ static void host_scroll_to(void *opaque, int x, int y) {
     scroll_to_xy(x,y);
     need_paint = true;
 }
+static void presentation_service(void){
+    if(!pip_window)return;
+    struct gui_event event;bool resized=false;
+    while(win_event(pip_window,&event,0)>0){
+        if(event.type==EV_CLOSE){web_presentation_exit(pip_doc,2);return;}
+        if(event.type==EV_RESIZE){resized=true;web_presentation_resize(pip_doc,pip_window->w,pip_window->h);}
+    }
+    if(!pip_doc||web_presentation_element(pip_doc,2)!=pip_node){web_presentation_exit(pip_doc,2);return;}
+    uint64_t revision=web_avmedia_pip_revision(pip_doc,pip_node);
+    if(resized||revision!=pip_revision){if(web_avmedia_pip_paint(pip_doc,pip_node,&pip_window->c)){win_update(pip_window);pip_revision=revision;}}
+}
+static bool host_presentation(void *opaque,web_doc *document,web_node *element,int mode){
+    (void)opaque;
+    if(mode==0){if(fullscreen_doc!=document)return true;if(win_fullscreen(w,false)<0)return false;browser_fullscreen=false;fullscreen_doc=NULL;need_layout=need_paint=true;return true;}
+    if(mode==3){if(pip_doc!=document)return true;if(pip_window)win_close(pip_window);pip_window=NULL;pip_doc=NULL;pip_node=NULL;pip_revision=0;return true;}
+    if(!w||document!=doc||quit||loading||pending_navigation)return false;
+    if(mode==1){if(win_fullscreen(w,true)<0)return false;browser_fullscreen=true;fullscreen_doc=document;focus=F_PAGE;need_layout=need_paint=true;return true;}
+    if(mode==2){
+        if(pip_window)return false;
+        window_t *window=win_open(420,236,"Nocturne — Picture in Picture",WIN_RESIZABLE|WIN_ALWAYS_ON_TOP);if(!window)return false;
+        pip_window=window;pip_doc=document;pip_node=element;pip_revision=UINT64_MAX;
+        web_presentation_resize(document,window->w,window->h);
+        web_avmedia_pip_paint(document,element,&window->c);win_update(window);return true;
+    }return false;
+}
 static bool host_video_present(void *opaque, web_doc *document, const struct web_video_patch *patch) {
     (void)opaque;
-    if (!w || !patch || document != doc || quit || native_wait || loading || pending_navigation ||
-        need_layout || need_paint || sel_node || !patch->pixels || patch->w <= 0 || patch->h <= 0 ||
+    presentation_service();
+    /* Pending DOM/layout work does not replace the committed window raster.
+       A snapshot owns that old surface's geometry and overlay pixels, not
+       mutable layout boxes. Keep it moving until real paint replaces it;
+       document, canvas, viewport, scroll and native-overlay checks below
+       reject an obsolete surface without re-entering DOM or layout here. */
+    if (!w || !patch || document != doc || quit || native_wait || pending_navigation ||
+        sel_node || !patch->pixels || patch->w <= 0 || patch->h <= 0 ||
         patch->pitch < patch->w ||
         patch->canvas.px != w->c.px || patch->canvas.w != w->c.w ||
         patch->canvas.h != w->c.h || patch->canvas.pitch != w->c.pitch ||
@@ -1256,6 +1295,7 @@ static const struct web_host browser_host = {
     .navigation_pending=host_navigation_pending,
     .script_checkpoint=host_script_checkpoint,
     .video_present=host_video_present,
+    .presentation=host_presentation,
     .cookie_get = host_cookie_get, .cookie_set = host_cookie_set,
     .cookie_enabled = host_cookie_enabled
     , .navigate_mode = host_navigate_mode
@@ -1961,6 +2001,9 @@ static bool page_clipboard_key(web_node *target, const struct gui_event *e) {
 }
 
 static void key(const struct gui_event *e) {
+    if(e->pressed&&browser_fullscreen&&(e->key==NKEY_ESC||((e->mods&NMOD_CTRL)&&(e->key=='l'||e->key=='L')))){
+        web_presentation_exit(fullscreen_doc,1);if(e->key==NKEY_ESC)return;
+    }
     bool ctrl = e->mods & NMOD_CTRL, alt = e->mods & NMOD_ALT;
     uint32_t k = e->key;
     if (k >= 'A' && k <= 'Z' && (ctrl || alt)) k += 32;
@@ -2312,7 +2355,7 @@ static void handle_native_wait(const struct gui_event *e) {
     if (e->type == EV_KEY && e->pressed) {
         uint32_t k = e->key;
         if (k >= 'A' && k <= 'Z') k += 32;
-        if (e->key == NKEY_ESC) { sync_stopped = true; return; }
+        if (e->key == NKEY_ESC) { if(browser_fullscreen)web_presentation_exit(fullscreen_doc,1);else sync_stopped = true; return; }
         if (e->key == NKEY_F12) {
             console_open = !console_open;
             if (console_open) focus = F_CONSOLE; else if (focus == F_CONSOLE) focus = F_PAGE;
@@ -2348,6 +2391,7 @@ static void handle_native_wait(const struct gui_event *e) {
 }
 
 static void document_step(uint64_t now) {
+    presentation_service();
     if (!doc || quit) { web_media_background(now); return; }
     if (scroll_event_pending && !native_wait && !web_script_running(doc)) {
         scroll_event_pending = false;

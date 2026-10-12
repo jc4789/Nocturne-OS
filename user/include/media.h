@@ -20,6 +20,7 @@ struct nmedia_info {
 struct nmedia_output {
     int kind;
     int64_t pts_ms;
+    int64_t duration_ms; /* actual decoded frame span; zero if unknown */
     const int16_t *samples;
     size_t frames; /* SOUND_RATE interleaved stereo frames */
     const uint32_t *pixels; /* opaque ARGB, row-major, valid until the next step */

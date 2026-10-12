@@ -10,7 +10,11 @@ async function runAvmediaCases() {
     check(new Audio() instanceof HTMLAudioElement,'Audio constructor');
     check(v.canPlayType('video/mp4; codecs="avc1.42e01e, mp4a.40.2"')==='probably','real codecs');
     check(v.canPlayType('video/webm; codecs=vp8')==='probably','native VP8 codec');
-    check(typeof MediaSource==='function'&&typeof MediaSource.isTypeSupported==='function'&&!('requestMediaKeySystemAccess' in navigator),'native MSE, no DRM');
+    check(typeof MediaSource==='function'&&typeof MediaSource.isTypeSupported==='function'&&typeof navigator.requestMediaKeySystemAccess==='function'&&typeof MediaKeys==='function','native MSE and ClearKey API');
+    let unsupported=false;
+    try{await navigator.requestMediaKeySystemAccess('unsupported.test.keysystem',[{initDataTypes:['cenc'],videoCapabilities:[{contentType:'video/mp4; codecs="avc1.42e01e"'}]}]);}
+    catch(e){unsupported=e.name==='NotSupportedError';}
+    check(unsupported,'unsupported DRM is rejected rather than advertised');
     let throws=false;try{HTMLMediaElement.prototype.canPlayType.call({localName:'video',namespaceURI:'http://www.w3.org/1999/xhtml'},'video/mp4');}catch(e){throws=true;}
     check(throws,'native brand');
     const pending=v.play();v.pause();

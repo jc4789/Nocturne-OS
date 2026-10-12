@@ -13,6 +13,8 @@
 #include <limits.h>
 #include <errno.h>
 #include "libavutil/dict.h"
+#include "libavutil/encryption_info.h"
+#include <bearssl_block.h>
 
 struct mse_configuration {
     nmedia_mse *owner;
@@ -32,12 +34,15 @@ struct nmedia_mse {
     struct coded_frame *frames,*tail,*cursor;
     struct coded_frame *seek_key;
     uint8_t *init,*staging;
+    struct nmedia_mse_track_size *init_sizes;size_t init_size_count;
+    uint8_t *keys;size_t key_bytes;
     size_t init_size,staged,capacity,packet_bytes,frame_count,configuration_count,configuration_bytes;
     int64_t end_ms,play_ms,offset,window0,window1,sequence_start,init_duration;
     int64_t seek_target;
-    bool webm,ended,quota_error,video_key,sequence,sequence_group,configuration_boundary,retain_cursor,input_waiting;
+    bool webm,ended,quota_error,video_key,sequence,sequence_group,configuration_boundary,retain_cursor,input_waiting,key_waiting;
     char mime[256],error[160];
     uint64_t revision;
+    uint64_t video_decoded,video_dropped;
 };
 static bool bad(nmedia_mse *m,const char *message,bool quota){
     strlcpy(m->error,message,sizeof m->error);m->quota_error=quota;return false;
@@ -98,20 +103,70 @@ static int64_t fragment_seek(void *opaque,int64_t offset,int whence){
     int64_t base=whence==SEEK_SET?0:whence==SEEK_CUR?(int64_t)p->at:whence==SEEK_END?size:-1;
     if(base<0||offset< -base||offset>size-base)return AVERROR(EINVAL);p->at=(size_t)(base+offset);return (int64_t)p->at;
 }
+static void cenc_counter_add(uint8_t iv[16],uint64_t blocks){
+    for(int i=15;i>=0&&blocks;--i){unsigned sum=iv[i]+(unsigned)(blocks&255);iv[i]=(uint8_t)sum;blocks=(blocks>>8)+(sum>>8);}
+}
 static int packet_read(void *opaque,AVPacket *out){
-    nmedia_mse *m=opaque;m->input_waiting=false;
+    nmedia_mse *m=opaque;m->input_waiting=false;m->key_waiting=false;
     while(m->cursor){struct coded_frame *f=m->cursor;
         if(m->seek_key&&f->video&&f!=m->seek_key){m->cursor=f->next;continue;}
         /* EOF here drains delayed frames using their old extradata. Decoder
          * replacement happens only after nmedia_step returns END, never from
          * inside an active decoder's packet callback. The sample stays owned. */
         if(f->configuration!=m->decode_configuration){m->configuration_boundary=true;return AVERROR_EOF;}
+        size_t encryption_size=0;
+        const uint8_t *encryption=av_packet_get_side_data(f->packet,AV_PKT_DATA_ENCRYPTION_INFO,&encryption_size);
+        if(encryption){
+            AVEncryptionInfo *info=av_encryption_info_get_side_data(encryption,encryption_size);
+            if(!info)return AVERROR_INVALIDDATA;
+            if(info->scheme!=0x63656e63u||info->key_id_size!=16||info->iv_size!=16||info->crypt_byte_block||info->skip_byte_block){av_encryption_info_free(info);return AVERROR_INVALIDDATA;}
+            uint64_t total=0;
+            for(uint32_t i=0;i<info->subsample_count;i++){
+                total+=(uint64_t)info->subsamples[i].bytes_of_clear_data+info->subsamples[i].bytes_of_protected_data;
+                if(total>(uint64_t)f->packet->size){av_encryption_info_free(info);return AVERROR_INVALIDDATA;}
+            }
+            if(info->subsample_count&&total!=(uint64_t)f->packet->size){av_encryption_info_free(info);return AVERROR_INVALIDDATA;}
+            const uint8_t *key=NULL;
+            for(size_t at=0;at<m->key_bytes;at+=32)if(!memcmp(m->keys+at,info->key_id,16)){key=m->keys+at+16;break;}
+            if(!key){av_encryption_info_free(info);m->input_waiting=m->key_waiting=true;return AVERROR(EAGAIN);}
+            if(av_packet_ref(out,f->packet)<0||av_packet_make_writable(out)<0){
+                av_encryption_info_free(info);av_packet_unref(out);return AVERROR_INVALIDDATA;
+            }
+            br_aes_ct64_ctr_keys aes;br_aes_ct64_ctr_init(&aes,key,16);
+            uint8_t iv[16],stream[16];memcpy(iv,info->iv,16);size_t stream_at=16,at=0;
+            uint32_t parts=info->subsample_count?info->subsample_count:1;
+            for(uint32_t i=0;i<parts;i++){
+                if(info->subsample_count)at+=info->subsamples[i].bytes_of_clear_data;
+                size_t protected=info->subsample_count?info->subsamples[i].bytes_of_protected_data:(size_t)out->size;
+                while(protected){
+                    if(stream_at==16&&protected>=16){
+                        uint32_t low=((uint32_t)iv[12]<<24)|((uint32_t)iv[13]<<16)|((uint32_t)iv[14]<<8)|iv[15];
+                        size_t chunk=protected&~(size_t)15;uint64_t limit=((uint64_t)UINT32_MAX-low+1)*16;
+                        if((uint64_t)chunk>limit)chunk=(size_t)limit;
+                        br_aes_ct64_ctr_run(&aes,iv,low,out->data+at,chunk);cenc_counter_add(iv,chunk/16);
+                        at+=chunk;protected-=chunk;continue;
+                    }
+                    if(stream_at==16){
+                        memset(stream,0,sizeof stream);
+                        uint32_t low=((uint32_t)iv[12]<<24)|((uint32_t)iv[13]<<16)|((uint32_t)iv[14]<<8)|iv[15];
+                        br_aes_ct64_ctr_run(&aes,iv,low,stream,16);stream_at=0;
+                        cenc_counter_add(iv,1);
+                    }
+                    size_t chunk=MIN(protected,16-stream_at);
+                    for(size_t j=0;j<chunk;j++)out->data[at+j]^=stream[stream_at+j];
+                    at+=chunk;stream_at+=chunk;protected-=chunk;
+                }
+            }
+            av_packet_side_data_remove(out->side_data,&out->side_data_elems,AV_PKT_DATA_ENCRYPTION_INFO);
+            volatile uint8_t *wipe=(volatile uint8_t *)&aes;for(size_t i=0;i<sizeof aes;i++)wipe[i]=0;
+            av_encryption_info_free(info);
+        }else if(av_packet_ref(out,f->packet)<0)return AVERROR(ENOMEM);
         m->cursor=f->next;
-        if(f==m->seek_key)m->seek_key=NULL;m->play_ms=f->start;return av_packet_ref(out,f->packet);
+        if(f==m->seek_key)m->seek_key=NULL;m->play_ms=f->start;return 0;
     }m->input_waiting=!m->ended;return m->ended?AVERROR_EOF:AVERROR(EAGAIN);
 }
 static bool packet_seek(void *opaque,int64_t ms){
-    nmedia_mse *m=opaque;if(m->retain_cursor)return true;struct coded_frame *start=NULL;
+    nmedia_mse *m=opaque;m->key_waiting=false;if(m->retain_cursor)return true;struct coded_frame *start=NULL;
     bool video=nmedia_mse_info(m)&&nmedia_mse_info(m)->video;
     for(struct coded_frame *f=m->frames;f;f=f->next){
         if(f->start<=ms&&(!video||(f->video&&f->key))&&(!start||f->start>=start->start))start=f;
@@ -137,14 +192,6 @@ static void insert_frame(nmedia_mse *m,struct coded_frame *f){
     if(f->dts>=m->tail->dts){m->tail->next=f;m->tail=f;if(!m->cursor)m->cursor=f;return;}
     struct coded_frame **p=&m->frames;while(*p&&(*p)->dts<=f->dts)p=&(*p)->next;
     f->next=*p;*p=f;if((!m->cursor||f->dts<m->cursor->dts)&&f->start>=m->play_ms)m->cursor=f;
-}
-static bool encrypted(const AVFormatContext *format){
-    for(unsigned i=0;i<format->nb_streams;i++){
-        AVStream *s=format->streams[i];
-        if(av_dict_get(s->metadata,"enc_key_id",NULL,0))return true;
-        AVCodecParameters *p=s->codecpar;
-        for(int j=0;j<p->nb_coded_side_data;j++)if(p->coded_side_data[j].type==AV_PKT_DATA_ENCRYPTION_INIT_INFO||p->coded_side_data[j].type==AV_PKT_DATA_ENCRYPTION_INFO)return true;
-    }return false;
 }
 /* Track identity is invariant; codec parameters, dimensions and timescales
  * belong to the initialization which authored each sample, not to append's
@@ -206,7 +253,6 @@ static bool demux(nmedia_mse *m,const uint8_t *body,size_t bytes,int64_t offset,
     int r=avformat_open_input(&format,NULL,av_find_input_format(m->webm?"matroska":"mov"),NULL);
     if(r<0){demux_error(m,"initialization/fragment",r);goto done;}
     if(!format||!format->nb_streams||format->nb_streams>(unsigned)INT_MAX){bad(m,"invalid MSE initialization/fragment",false);goto done;}
-    if(encrypted(format)){bad(m,"encrypted MSE media is unsupported",false);goto done;}
     unsigned audio_tracks=0,video_tracks=0;
     for(unsigned i=0;i<format->nb_streams;i++){audio_tracks+=format->streams[i]->codecpar->codec_type==AVMEDIA_TYPE_AUDIO;video_tracks+=format->streams[i]->codecpar->codec_type==AVMEDIA_TYPE_VIDEO;}
     if(audio_tracks>1||video_tracks>1||audio_tracks+video_tracks!=format->nb_streams){bad(m,"unsupported MSE duplicate/non-AV tracks",false);goto done;}
@@ -226,7 +272,14 @@ static bool demux(nmedia_mse *m,const uint8_t *body,size_t bytes,int64_t offset,
         r=av_read_frame(format,packet);if(r==AVERROR_EOF){ok=true;break;}
         if(r<0){demux_error(m,"fragment packet",r);goto done;}
         if(packet->stream_index<0||(unsigned)packet->stream_index>=format->nb_streams||packet->size<0){bad(m,"invalid MSE packet representation",false);goto done;}
-        if(av_packet_get_side_data(packet,AV_PKT_DATA_ENCRYPTION_INFO,NULL)||av_packet_get_side_data(packet,AV_PKT_DATA_ENCRYPTION_INIT_INFO,NULL)){bad(m,"encrypted MSE packet is unsupported",false);goto done;}
+        size_t encryption_size=0;const uint8_t *encryption=av_packet_get_side_data(packet,AV_PKT_DATA_ENCRYPTION_INFO,&encryption_size);
+        if(encryption){AVEncryptionInfo *info=av_encryption_info_get_side_data(encryption,encryption_size);
+            bool valid=info&&info->scheme==0x63656e63u&&info->key_id_size==16&&info->iv_size==16&&!info->crypt_byte_block&&!info->skip_byte_block;
+            uint64_t total=0;if(valid&&info->subsample_count){for(uint32_t i=0;i<info->subsample_count;i++){
+                total+=(uint64_t)info->subsamples[i].bytes_of_clear_data+info->subsamples[i].bytes_of_protected_data;
+                if(total>(uint64_t)packet->size){valid=false;break;}}
+                if(total!=(uint64_t)packet->size)valid=false;}
+            av_encryption_info_free(info);if(!valid){bad(m,"unsupported or malformed CENC packet",false);goto done;}}
         AVStream *stream=format->streams[packet->stream_index];bool video=stream->codecpar->codec_type==AVMEDIA_TYPE_VIDEO;
         if(stream->codecpar->codec_type!=AVMEDIA_TYPE_AUDIO&&!video){av_packet_unref(packet);continue;}
         int64_t stamp=packet->pts==AV_NOPTS_VALUE?packet->dts:packet->pts;
@@ -285,13 +338,17 @@ done:
 }
 static bool process(nmedia_mse *m,int64_t offset,int64_t window0,int64_t window1,bool sequence,bool eos){
     for(;;){
-        size_t init=0,end=0;int r=nmedia_mse_boundary(m->staging,m->staged,m->webm,m->init!=NULL,eos,&init,&end,m->error,sizeof m->error);
+        size_t init=0,end=0;int r=nmedia_mse_boundary_sizes(m->staging,m->staged,m->webm,m->init!=NULL,eos,&init,&end,m->error,sizeof m->error,m->init_sizes,m->init_size_count);
         if(r<0){if(r==NMEDIA_MSE_PARSE_MEMORY)m->quota_error=true;return false;}if(!r)return true;
         if(init){if(init>m->staged)return bad(m,"MSE initialization boundary",false);
             uint8_t *candidate=nmedia_ff_malloc(init);if(!candidate)return bad(m,"MSE initialization quota",true);
-            memcpy(candidate,m->staging,init);uint8_t *old=m->init;size_t old_size=m->init_size;m->init=candidate;m->init_size=init;
+            memcpy(candidate,m->staging,init);struct nmedia_mse_track_size *sizes=NULL;size_t size_count=0;
+            if(!m->webm){int defaults=nmedia_mse_init_sizes(candidate,init,&sizes,&size_count,m->error,sizeof m->error);
+                if(defaults<0){nmedia_ff_free(candidate);m->quota_error=defaults==NMEDIA_MSE_PARSE_MEMORY;return false;}}
+            uint8_t *old=m->init;size_t old_size=m->init_size;m->init=candidate;m->init_size=init;
             size_t staged=m->staged;m->staged-=init;bool ok=demux(m,NULL,0,offset,window0,window1,false);m->staged=staged;
-            if(!ok){nmedia_ff_free(candidate);m->init=old;m->init_size=old_size;return false;}nmedia_ff_free(old);
+            if(!ok){nmedia_ff_free(candidate);nmedia_ff_free(sizes);m->init=old;m->init_size=old_size;return false;}nmedia_ff_free(old);
+            nmedia_ff_free(m->init_sizes);m->init_sizes=sizes;m->init_size_count=size_count;
             m->init_duration=nmedia_mse_init_duration(m->init,m->init_size,m->webm);
             memmove(m->staging,m->staging+init,m->staged-init);m->staged-=init;continue;}
         if(!end||end>m->staged)return bad(m,"invalid MSE parser boundary",false);
@@ -346,7 +403,9 @@ int nmedia_mse_step_at(nmedia_mse *m,struct nmedia_output *out,int64_t video_ms)
     if(!m->decoder){memset(out,0,sizeof *out);m->input_waiting=!m->ended;return m->ended?NMEDIA_END:NMEDIA_AGAIN;}
     for(unsigned budget=0;budget<2;budget++){
         nmedia_video_time(m->decoder,video_ms);
+        uint64_t decoded0,dropped0,decoded1,dropped1;nmedia_video_stats(m->decoder,&decoded0,&dropped0);
         int r=nmedia_step(m->decoder,out);if(r==NMEDIA_ERROR)strlcpy(m->error,nmedia_error(m->decoder),sizeof m->error);
+        nmedia_video_stats(m->decoder,&decoded1,&dropped1);m->video_decoded+=decoded1-decoded0;m->video_dropped+=dropped1-dropped0;
         if(r==NMEDIA_END&&m->configuration_boundary){
             m->configuration_boundary=false;
             if(!m->cursor)return m->ended?NMEDIA_END:NMEDIA_AGAIN;
@@ -361,6 +420,8 @@ int nmedia_mse_step_at(nmedia_mse *m,struct nmedia_output *out,int64_t video_ms)
 }
 int nmedia_mse_step(nmedia_mse *m,struct nmedia_output *out){return nmedia_mse_step_at(m,out,-1);}
 bool nmedia_mse_waiting_for_input(const nmedia_mse *m){return !m||!m->decoder||m->input_waiting;}
+bool nmedia_mse_key_waiting(const nmedia_mse *m){return m&&m->key_waiting;}
+void nmedia_mse_video_stats(const nmedia_mse *m,uint64_t *decoded,uint64_t *dropped){if(decoded)*decoded=m?m->video_decoded:0;if(dropped)*dropped=m?m->video_dropped:0;}
 bool nmedia_mse_move_video(nmedia_mse *m,const struct nmedia_output *o,uint32_t **pixels,size_t *capacity){
     return m&&!m->error[0]&&nmedia_move_video(m->decoder,o,pixels,capacity);
 }
@@ -388,7 +449,7 @@ bool nmedia_mse_remove(nmedia_mse *m,int64_t start,int64_t end){
     }
     if(m->quota_error){m->error[0]=0;m->quota_error=false;}return true;
 }
-void nmedia_mse_abort(nmedia_mse *m){if(!m)return;m->staged=0;release_empty_staging(m);m->error[0]=0;m->quota_error=false;m->video_key=true;if(m->decoder)nmedia_mse_seek(m,m->play_ms);}
+void nmedia_mse_abort(nmedia_mse *m){if(!m)return;m->staged=0;release_empty_staging(m);m->error[0]=0;m->quota_error=false;m->video_key=true;m->key_waiting=false;if(m->decoder)nmedia_mse_seek(m,m->play_ms);}
 bool nmedia_mse_end(nmedia_mse *m,bool ended){
     if(!m)return false;m->error[0]=0;m->quota_error=false;
     if(ended){if(!process(m,m->offset,m->window0,m->window1,m->sequence,true))return false;
@@ -401,6 +462,7 @@ bool nmedia_mse_change_type(nmedia_mse *m,const char *type){
     if(m->frames)return bad(m,"remove retained coded frames before changing MSE codec",false);
     nmedia_close(m->decoder);m->decoder=NULL;configuration_unref(m->decode_configuration);m->decode_configuration=NULL;configuration_unref(m->configuration);m->configuration=NULL;
     nmedia_ff_free(m->init);m->init=NULL;m->init_size=0;m->staged=0;release_empty_staging(m);m->init_duration=-1;m->seek_target=-1;m->configuration_boundary=false;m->revision++;
+    nmedia_ff_free(m->init_sizes);m->init_sizes=NULL;m->init_size_count=0;
     strlcpy(m->mime,type,sizeof m->mime);m->webm=!strncasecmp(type,"video/webm",10)||!strncasecmp(type,"audio/webm",10);m->error[0]=0;m->video_key=true;return true;
 }
 static size_t track_ranges(nmedia_mse *m,bool video,struct nmedia_time_range *out,size_t maximum){
@@ -423,4 +485,13 @@ size_t nmedia_mse_ranges(nmedia_mse *m,struct nmedia_time_range *out,size_t maxi
     while(i<na&&j<nv&&n<maximum){int64_t lo=MAX(a[i].start_ms,v[j].start_ms),hi=MIN(a[i].end_ms,v[j].end_ms);if(hi>lo)out[n++]=(struct nmedia_time_range){lo,hi};if(a[i].end_ms<v[j].end_ms)i++;else j++;}nmedia_ff_free(a);return n;
 }
 size_t nmedia_mse_range_capacity(const nmedia_mse *m){return m?m->frame_count:0;}
-void nmedia_mse_close(nmedia_mse *m){if(!m)return;nmedia_close(m->decoder);configuration_unref(m->decode_configuration);while(m->frames){struct coded_frame *f=m->frames;m->frames=f->next;release_frame(m,f);}configuration_unref(m->configuration);nmedia_ff_free(m->init);nmedia_ff_free(m->staging);nmedia_ff_free(m);}
+bool nmedia_mse_keys(nmedia_mse *m,const void *bytes,size_t size){
+    if(!m||size%32||(!bytes&&size))return false;
+    uint8_t *copy=size?nmedia_ff_malloc(size):NULL;if(size&&!copy)return false;
+    if(size)memcpy(copy,bytes,size);
+    volatile uint8_t *wipe=m->keys;for(size_t i=0;i<m->key_bytes;i++)wipe[i]=0;
+    nmedia_ff_free(m->keys);m->keys=copy;m->key_bytes=size;m->input_waiting=m->key_waiting=false;
+    if(m->decoder)nmedia_packets_resume(m->decoder);
+    return true;
+}
+void nmedia_mse_close(nmedia_mse *m){if(!m)return;nmedia_close(m->decoder);m->decoder=NULL;configuration_unref(m->decode_configuration);while(m->frames){struct coded_frame *f=m->frames;m->frames=f->next;release_frame(m,f);}configuration_unref(m->configuration);nmedia_ff_free(m->init);nmedia_ff_free(m->init_sizes);nmedia_ff_free(m->staging);nmedia_mse_keys(m,NULL,0);nmedia_ff_free(m);}

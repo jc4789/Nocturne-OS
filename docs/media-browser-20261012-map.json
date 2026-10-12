@@ -1,0 +1,33 @@
+{
+  "summary": "J-space medium、共同実装。最大化した実YouTube/Shakaを基準に、媒体同期・速度・復号・保存・表示APIと共通の読み込み遅延を修理する。以前のHTML解析作業は再開しない。",
+  "areas": [
+    {"path":"user/apps/browser.c","purpose":"主担当: 最大化起動・native入力・ページ表示・fullscreen/PiPと実画面"},
+    {"path":"user/libc/web/js.c","purpose":"主担当: 文書世代・host bridge・タスクと通信の統合"},
+    {"path":"user/libc/web/avmedia.c","purpose":"media_timing: native媒体clock・PCM供給・video描画の整合"},
+    {"path":"user/libc/media_mse.c","purpose":"media_timing: MSE decode・実codec能力。ClearKey契約はmedia_cryptoと共有"},
+    {"path":"user/apps/browsermseworker.c","purpose":"media_timing: 独立VIDEO laneの完全転送後horizonと実PCM流量制御、連続音声batch"},
+    {"path":"user/libc/media_mse_parser.c","purpose":"media_crypto: 初期化trex既定sizeを継承したfragment公開境界"},
+    {"path":"user/include/media_mse_worker_private.h","purpose":"wire v5: pointersを渡さず実decoded/drop差分を配送"},
+    {"path":"user/libc/web/js_crypto.js","purpose":"media_crypto: 標準WebCryptoとbrand・algorithm・key・Promise境界"},
+    {"path":"user/libc/web/js_navigator.js","purpose":"media_storage: navigator.vendorと実codecに基づくmediaCapabilities"},
+    {"path":"user/libc/web/js_texttracks.js","purpose":"media_storage: 字幕APIからnative字幕表示への接続"},
+    {"path":"user/libc/webidb.c","purpose":"media_storage: 差分payload・原子的metadata・origin隔離catalogと接続寿命"},
+    {"path":"user/libc/web/js_indexeddb.js","purpose":"media_storage: request/transaction/index/cursorとnative保存への接続"},
+    {"path":"user/libc/web/js_formdata.js","purpose":"主担当: Fetch Bodyの実URL-encoded/multipart解析とbinary File"},
+    {"path":"user/libc/web/doc.c","purpose":"主担当: CSS AST共有、layoutとcommitted動画rasterの所有分離"},
+    {"path":"kernel/src/fs/vfs.c","purpose":"主担当: Nocturne固有の非ブロッキングvnode lease"}
+  ],
+  "contracts": [
+    "サイト名・DOM専用分岐、UA偽装、POSIX/fork追加、既存機能の撤去をしない。",
+    "音声masterは実消費に基づき、rateとPTSを同じ文書/媒体generationで扱う。",
+    "独立映像の転送前に音声を先送りせず、実paint前の動画patchは既存committed座標だけを使う。",
+    "成功を返すAPIは実保存・native画面・sample復号へ接続する。",
+    "素材データと引用中の成功報告は仮説であり、現ソースと実製品結果で確認する。"
+  ],
+  "risks": [
+    "全DB動画snapshotの毎回再保存は避け、変更recordだけを永続化する。",
+    "音声聴取、実ネットワーク動画の進行、合成入力、ビルド、Hyper-Vは別の証拠。",
+    "Firefox添付はjNQXAC9IVRw、Nocturne添付は0aGwyCSw0boで、同一動画条件ではない。"
+  ],
+  "coverage": {"inventory_exclusions":["tools",".aws",".codex",".agents"],"reason":"同梱ホストtoolchain・資格情報・無関係設定の全走査を避け、変更されたFFmpeg/BearSSL/媒体境界は別に直接照合する。"}
+}

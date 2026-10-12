@@ -8,7 +8,8 @@
 #define LIMIT ((size_t)INT64_MAX)
 #define TAG(a,b,c,d) (((uint32_t)(a)<<24)|((uint32_t)(b)<<16)|((uint32_t)(c)<<8)|(uint32_t)(d))
 
-struct parser { const uint8_t *b; size_t n,count; char *error; size_t error_size; };
+struct parser { const uint8_t *b; size_t n,count; char *error; size_t error_size;
+    const struct nmedia_mse_track_size *sizes;size_t size_count; };
 struct box { uint32_t type; size_t start, body, end; };
 struct run { size_t first, last; bool known, covered; };
 struct fragment { struct run *runs; size_t count, capacity, trafs; bool unknown, explicit_base; };
@@ -63,29 +64,24 @@ static int box_at(struct parser *p, size_t at, size_t end, bool closed, struct b
     b->body = at + header; b->end = at + (size_t)size;
     return count(p);
 }
-static bool encrypted_box(uint32_t t) {
-    return t == TAG('p','s','s','h') || t == TAG('s','e','n','c') ||
-           t == TAG('s','i','n','f') || t == TAG('t','e','n','c') ||
-           t == TAG('e','n','c','v') || t == TAG('e','n','c','a') ||
-           t == TAG('s','a','i','z') || t == TAG('s','a','i','o');
-}
 static bool container_box(uint32_t t) {
     return t == TAG('m','o','o','v') || t == TAG('t','r','a','k') ||
            t == TAG('m','d','i','a') || t == TAG('m','i','n','f') ||
            t == TAG('s','t','b','l') || t == TAG('m','v','e','x') ||
            t == TAG('e','d','t','s') || t == TAG('d','i','n','f') ||
-           t == TAG('m','o','o','f') || t == TAG('t','r','a','f');
+           t == TAG('m','o','o','f') || t == TAG('t','r','a','f') ||
+           t == TAG('s','i','n','f') || t == TAG('s','c','h','i');
 }
 static bool visual_entry(uint32_t t) {
     return t == TAG('a','v','c','1') || t == TAG('a','v','c','3') ||
            t == TAG('h','v','c','1') || t == TAG('h','e','v','1') ||
            t == TAG('a','v','0','1') || t == TAG('v','p','0','8') ||
-           t == TAG('v','p','0','9') || t == TAG('m','p','4','v');
+           t == TAG('v','p','0','9') || t == TAG('m','p','4','v') || t == TAG('e','n','c','v');
 }
 static bool audio_entry(uint32_t t) {
     return t == TAG('m','p','4','a') || t == TAG('O','p','u','s') ||
            t == TAG('f','L','a','C') || t == TAG('a','c','-','3') ||
-           t == TAG('e','c','-','3') || t == TAG('a','l','a','c');
+           t == TAG('e','c','-','3') || t == TAG('a','l','a','c') || t == TAG('e','n','c','a');
 }
 struct box_scope {size_t at,end;uint32_t entries;bool init,samples;};
 static int inspect_boxes(struct parser *p,size_t at,size_t end,bool init){
@@ -103,7 +99,6 @@ static int inspect_boxes(struct parser *p,size_t at,size_t end,bool init){
         struct box b;int r=box_at(p,scope->at,scope->end,true,&b);
         if(r<=0){result=r<0?r:fail(p,scope->samples?"Truncated sample description":"Truncated nested MP4 box");goto done;}
         scope->at=b.end;
-        if(encrypted_box(b.type)){result=fail(p,"Encrypted media is unsupported");goto done;}
         bool descend=false;struct box_scope child={0};
         if(scope->samples){
             scope->entries--;
@@ -121,9 +116,17 @@ static int inspect_boxes(struct parser *p,size_t at,size_t end,bool init){
             child=(struct box_scope){.at=b.body+fixed,.end=b.end,.init=true};descend=true;
         }else{
             if(b.type==TAG('u','u','i','d')){result=fail(p,"Unsupported UUID media extension");goto done;}
+            /* Box framing remains strict; FFmpeg owns tenc/senc/saiz/saio
+               interpretation and publishes validated packet side data. Only
+               AES-CTR cenc is implemented, never silently accept cbcs/cens. */
+            if(b.type==TAG('s','c','h','m')){
+                if(b.end-b.body<12||be32(p->b+b.body+4)!=TAG('c','e','n','c')){
+                    result=fail(p,"Unsupported media encryption scheme");goto done;
+                }
+            }
             if(b.type==TAG('s','g','p','d')||b.type==TAG('s','b','g','p')){
                 if(b.end-b.body<8){result=fail(p,"Truncated sample grouping");goto done;}
-                if(be32(p->b+b.body+4)==TAG('s','e','i','g')){result=fail(p,"Encrypted media is unsupported");goto done;}
+                if(be32(p->b+b.body+4)==TAG('s','e','i','g')){result=fail(p,"Encryption key rotation groups are unsupported");goto done;}
             }
             if(scope->init&&(b.type==TAG('s','t','t','s')||b.type==TAG('s','t','s','c')||b.type==TAG('s','t','c','o')||b.type==TAG('c','o','6','4'))){
                 if(b.end-b.body!=8||be32(p->b+b.body+4)){result=fail(p,"Non-fragmented MP4 initialization");goto done;}
@@ -176,7 +179,11 @@ static int validate_traf(struct parser *p, const struct box *traf, size_t moof,
             tfhd = true;
             uint32_t flags = be32(p->b+b.body)&0xffffff;
             if (flags & ~0x03003bu || flags & 1u) return fail(p, "External MP4 base offset is unsupported");
-            if (!be32(p->b+b.body+4)) return fail(p, "Invalid track ID");
+            uint32_t track_id=be32(p->b+b.body+4);
+            if (!track_id) return fail(p, "Invalid track ID");
+            size_t low=0,high=p->size_count;
+            while(low<high){size_t mid=low+(high-low)/2;if(p->sizes[mid].track_id<track_id)low=mid+1;else high=mid;}
+            if(low<p->size_count&&p->sizes[low].track_id==track_id){default_size=p->sizes[low].sample_size;default_known=true;}
             base_is_moof = (flags&0x020000u) != 0;
             size_t off = b.body+8;
             if (flags&2) off += 4;
@@ -285,8 +292,8 @@ static int mp4_boundary_impl(struct parser *p, bool have_init, bool eos, size_t 
             if (*init_end) return 1;
             return more(p, eos);
         }
-        if (encrypted_box(b.type) || b.type == TAG('u','u','i','d'))
-            return fail(p, "Encrypted or unsupported MP4 extension");
+        if (b.type == TAG('u','u','i','d'))
+            return fail(p, "Unsupported MP4 extension");
         /* A subsequent ftyp/moov is another initialization, not media bytes.
          * Publish it separately; the track buffer validates identity and owns
          * the corresponding codec configuration for every retained sample. */
@@ -304,7 +311,7 @@ static int mp4_boundary_impl(struct parser *p, bool have_init, bool eos, size_t 
                 r = validate_init(p, &b); if (r < 0) return r;
                 *init_end = b.end; return 1;
             } else if (b.type != TAG('f','r','e','e') && b.type != TAG('s','k','i','p') &&
-                       b.type != TAG('p','d','i','n') && b.type != TAG('s','i','d','x'))
+                       b.type != TAG('p','d','i','n') && b.type != TAG('s','i','d','x') && b.type != TAG('p','s','s','h'))
                 return fail(p, "Missing MP4 initialization segment");
         } else if (b.type == TAG('m','o','o','f')) {
             if (moof) {
@@ -591,10 +598,11 @@ static int webm_boundary(struct parser *p, bool have_init, bool eos, size_t *ini
     if (eos && at && have_init) { *segment_end = at; return 1; }
     return *init_end ? 1 : more(p, eos);
 }
-int nmedia_mse_boundary(const uint8_t *bytes, size_t length, bool webm,
+int nmedia_mse_boundary_sizes(const uint8_t *bytes, size_t length, bool webm,
                         bool have_init, bool eos, size_t *init_end,
-                        size_t *segment_end, char *error, size_t error_size) {
-    struct parser p = { bytes, length, 0, error, error_size };
+                        size_t *segment_end, char *error, size_t error_size,
+                        const struct nmedia_mse_track_size *sizes,size_t size_count) {
+    struct parser p = {.b=bytes,.n=length,.error=error,.error_size=error_size,.sizes=sizes,.size_count=size_count};
     if (error && error_size) error[0] = 0;
     if (!init_end || !segment_end) return fail(&p, "Missing media span output");
     *init_end = 0; *segment_end = 0;
@@ -604,6 +612,36 @@ int nmedia_mse_boundary(const uint8_t *bytes, size_t length, bool webm,
                    mp4_boundary(&p, have_init, eos, init_end, segment_end);
     if (r < 0) { *init_end = 0; *segment_end = 0; }
     return r;
+}
+int nmedia_mse_boundary(const uint8_t *bytes,size_t length,bool webm,bool have_init,bool eos,
+                        size_t *init_end,size_t *segment_end,char *error,size_t error_size){
+    return nmedia_mse_boundary_sizes(bytes,length,webm,have_init,eos,init_end,segment_end,error,error_size,NULL,0);
+}
+int nmedia_mse_init_sizes(const uint8_t *bytes,size_t length,struct nmedia_mse_track_size **out,
+                         size_t *out_count,char *error,size_t error_size){
+    struct parser p={.b=bytes,.n=length,.error=error,.error_size=error_size};
+    if(!out||!out_count)return fail(&p,"Missing initialization defaults output");
+    *out=NULL;*out_count=0;struct nmedia_mse_track_size *sizes=NULL;size_t used=0,capacity=0;
+    if((!bytes&&length)||length>LIMIT)return fail(&p,"Invalid initialization defaults input");
+    for(size_t at=0;at<length;){struct box top;int r=box_at(&p,at,length,true,&top);if(r<=0)goto invalid;
+        at=top.end;if(top.type!=TAG('m','o','o','v'))continue;
+        for(size_t child=top.body;child<top.end;){struct box mvex;r=box_at(&p,child,top.end,true,&mvex);if(r<=0)goto invalid;child=mvex.end;
+            if(mvex.type!=TAG('m','v','e','x'))continue;
+            for(size_t pos=mvex.body;pos<mvex.end;){struct box trex;r=box_at(&p,pos,mvex.end,true,&trex);if(r<=0)goto invalid;pos=trex.end;
+                if(trex.type!=TAG('t','r','e','x'))continue;
+                if(trex.end-trex.body!=24||be32(bytes+trex.body)||!be32(bytes+trex.body+4))goto invalid;
+                uint32_t id=be32(bytes+trex.body+4);size_t index=0;while(index<used&&sizes[index].track_id<id)index++;
+                if(index<used&&sizes[index].track_id==id)goto invalid;
+                if(used==SIZE_MAX)goto invalid;
+                struct nmedia_mse_track_size *next=grow_records(&p,sizes,&capacity,used+1,sizeof *sizes);
+                if(!next){nmedia_ff_free(sizes);return NMEDIA_MSE_PARSE_MEMORY;}sizes=next;
+                for(size_t i=used;i>index;i--)sizes[i]=sizes[i-1];
+                sizes[index]=(struct nmedia_mse_track_size){id,be32(bytes+trex.body+16)};used++;
+            }
+        }
+    }
+    *out=sizes;*out_count=used;return 1;
+invalid:nmedia_ff_free(sizes);return fail(&p,"Invalid or duplicate initialization track defaults");
 }
 
 static int64_t duration_ms(uint64_t units, uint32_t scale) {
@@ -687,6 +725,6 @@ static int64_t webm_init_duration(struct parser *p) {
 }
 int64_t nmedia_mse_init_duration(const uint8_t *bytes, size_t length, bool webm) {
     if (!bytes || !length || length>LIMIT) return -1;
-    struct parser p={bytes,length,0,NULL,0};
+    struct parser p={.b=bytes,.n=length};
     return webm?webm_init_duration(&p):mp4_init_duration(&p);
 }

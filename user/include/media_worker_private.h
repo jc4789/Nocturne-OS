@@ -46,6 +46,7 @@ struct nmedia_worker_budget {
     uint64_t until;
     size_t tx_bytes;
     unsigned handoffs;
+    bool nonblocking; /* native hotloop: never yield for producer/network */
 };
 void nmedia_worker_pump_budget(nmedia_worker *,uint64_t now_ms,
                               struct nmedia_worker_budget *,bool allow_spawn);

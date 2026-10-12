@@ -10,6 +10,7 @@ bool nmedia_move_video(struct nmedia *,const struct nmedia_output *,uint32_t **,
 /* Native presentation playhead, not a seek or a synthetic clock. Reference
  * frames are fully decoded, but obsolete output need not become ARGB/IPC. */
 void nmedia_video_time(struct nmedia *,int64_t);
+void nmedia_video_stats(const struct nmedia *,uint64_t *decoded,uint64_t *dropped);
 
 /* ARGB storage follows actual dimensions, not a configured pixel quota.
  * Pointer offsets and allocation bytes must remain representable. Metadata

@@ -4,6 +4,7 @@
 #include "fs/vfs.h"
 #include "mm/heap.h"
 #include "sys/sched.h"
+#include "abi.h"
 
 #define MAX_STREAMS 8
 #define RING_BYTES  (8192 * AUDIO_FRAME) /* 170 ms: what a writer may be ahead of the sink */
@@ -15,7 +16,15 @@
 struct stream {
     uint8_t *ring;
     volatile uint32_t head, tail;
+    uint64_t committed_bytes;
+    uint32_t generation;
+    /* At most the actual 32 AC97 descriptors can own outstanding runs. No
+       stream/task pointer escapes into the DMA ring; close/reuse is safe. */
+    struct {uint64_t start;uint32_t frames;} issued[32];
+    unsigned issued_head,issued_count;
+    uint32_t device_pending;
 };
+static uint64_t card_submitted,card_consumed;
 
 /* the last slot is the system's own stream, which no file owns */
 static struct stream *streams[MAX_STREAMS + 1];
@@ -102,7 +111,7 @@ static void trace_commit(struct stream *s, uint32_t bytes) {
     irq_restore(f);
 }
 
-bool audio_mix(int16_t *out, int frames) {
+static bool mix(int16_t *out, int frames,bool card) {
     uint64_t f = irq_save();
     bool any = false;
     if (out) memset(out, 0, (size_t)frames * AUDIO_FRAME);
@@ -118,6 +127,19 @@ bool audio_mix(int16_t *out, int frames) {
         }
         if (!n) continue;
         any = true;
+        if(card){
+            unsigned last=(s->issued_head+s->issued_count-1)&31;
+            if(s->issued_count&&s->issued[last].start+s->issued[last].frames==card_submitted)
+                s->issued[last].frames+=(uint32_t)n;
+            else{
+                /* AC97 retires its cached CIV/PICB before submitting another
+                   descriptor; 32 covers the complete physical ring. */
+                ASSERT(s->issued_count<ARRAY_SIZE(s->issued));
+                unsigned next=(s->issued_head+s->issued_count)&31;
+                s->issued[next].start=card_submitted;s->issued[next].frames=(uint32_t)n;s->issued_count++;
+            }
+            s->device_pending+=(uint32_t)n;
+        }
         if (out) {
             for (int k = 0; k < n; k++) {
                 const int16_t *in = (const int16_t *)(s->ring + (s->tail + (uint32_t)k * AUDIO_FRAME) % RING_BYTES);
@@ -129,12 +151,34 @@ bool audio_mix(int16_t *out, int frames) {
         }
         s->tail += (uint32_t)n * AUDIO_FRAME;
     }
+    if(card&&any)card_submitted+=(uint32_t)frames;
     if (any) {
         wq_wake_all(&audio_wq);
         poll_notify();
     }
     irq_restore(f);
     return any;
+}
+bool audio_mix(int16_t *out,int frames){return mix(out,frames,false);}
+bool audio_card_mix(int16_t *out,int frames){return mix(out,frames,true);}
+void audio_card_played(uint64_t ordinal){
+    uint64_t f=irq_save();ordinal=MIN(ordinal,card_submitted);
+    if(ordinal>card_consumed){
+        card_consumed=ordinal;
+        for(unsigned i=0;i<=MAX_STREAMS;i++){
+            struct stream *s=streams[i];if(!s)continue;
+            while(s->issued_count){
+                unsigned at=s->issued_head;uint64_t start=s->issued[at].start;
+                if(start>=ordinal)break;
+                uint32_t consumed=(uint32_t)MIN(ordinal-start,(uint64_t)s->issued[at].frames);
+                s->device_pending-=consumed;s->issued[at].start+=consumed;s->issued[at].frames-=consumed;
+                if(s->issued[at].frames)break;
+                s->issued_head=(at+1)&31;s->issued_count--;
+            }
+        }
+        wq_wake_all(&audio_wq);poll_notify();
+    }
+    irq_restore(f);
 }
 
 bool audio_pending(void) {
@@ -267,6 +311,7 @@ static int64_t audio_write(struct vnode *v, struct file *f, const void *buf, uin
         memcpy(s->ring, p + done + first, c - first);
         __sync_synchronize();
         s->head += c;
+        s->committed_bytes+=c;
         trace_commit(s, c);
         done += c;
     }
@@ -279,6 +324,17 @@ static int64_t audio_read(struct vnode *v, struct file *f, void *buf, uint64_t o
     struct stream *s = stream_of(f, &err);
     if (!s) return err;
     if (n < 4) return -EINVAL;
+    if(n>=sizeof(struct n_audio_status)){
+        uint64_t fl=irq_save();
+        uint32_t software=(s->head-s->tail)/AUDIO_FRAME;
+        uint32_t hardware=remote_users?0:s->device_pending;
+        uint64_t committed=s->committed_bytes/AUDIO_FRAME;
+        uint64_t remaining=(uint64_t)software+hardware;
+        struct n_audio_status status={.queued_frames=software,.device_pending_frames=hardware,
+            .played_frames=committed>=remaining?committed-remaining:0,.committed_frames=committed,
+            .generation=s->generation,.flags=remote_users?N_AUDIO_CLOCK_ESTIMATED|N_AUDIO_CLOCK_REMOTE:card_fill?N_AUDIO_CLOCK_DEVICE:N_AUDIO_CLOCK_ESTIMATED};
+        irq_restore(fl);memcpy(buf,&status,sizeof status);return sizeof status;
+    }
     uint32_t q = (s->head - s->tail) / AUDIO_FRAME;
     memcpy(buf, &q, 4);
     return 4;
@@ -297,7 +353,7 @@ static void audio_close(struct vnode *v, struct file *f) {
     struct stream *s = stream_of(f, &err);
     if (!s) return;
     uint64_t give_up = uptime_ms() + 1000;
-    while (!current_task->killed && s->head - s->tail >= AUDIO_FRAME && uptime_ms() < give_up) {
+    while (!current_task->killed && (s->head - s->tail >= AUDIO_FRAME||s->device_pending) && uptime_ms() < give_up) {
         uint64_t fl = irq_save();
         wq_wait_timeout(&audio_wq, 20);
         irq_restore(fl);
@@ -323,6 +379,7 @@ int audio_flush_file(struct file *f) {
     if (!s) return (int)err;
     uint64_t fl = irq_save();
     s->tail = s->head;
+    s->committed_bytes=0;s->issued_head=s->issued_count=0;s->device_pending=0;s->generation++;
     if (audio_trace_active) for (int i = 0; i < MAX_STREAMS; i++)
         if (streams[i] == s) trace.stream[i].flushes++;
     wq_wake_all(&audio_wq);

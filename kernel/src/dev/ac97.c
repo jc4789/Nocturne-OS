@@ -21,6 +21,7 @@
 #define PO_CIV    0x14
 #define PO_LVI    0x15
 #define PO_SR     0x16
+#define PO_PICB   0x18 /* remaining 16-bit samples in current descriptor */
 #define PO_CR     0x1B
 #define GLOB_CNT  0x2C
 #define GLOB_STA  0x30
@@ -45,6 +46,7 @@ static uint16_t nam, nabm;
 static int16_t *bufs;
 static int lvi;
 static bool dma_live; /* RUN set; issued descriptors may still belong to the device */
+static uint64_t submitted_frames;
 
 static void spin_ms(uint64_t ms) { /* early in boot: no sleeping yet */
     uint64_t until = uptime_ms() + ms + 1;
@@ -61,6 +63,19 @@ static void ac97_fill(void) {
     uint32_t state = dma_live ? inl(nabm + PO_CIV) : 0;
     uint16_t before = (uint16_t)(state >> 16);
     int civ = (int)(state & (NBUF - 1));
+    if(dma_live){
+        /* PICB and CIV are separate registers. Confirm the current descriptor
+           once after PICB; a boundary crossing is conservatively deferred to
+           the next tick rather than declaring unplayed samples consumed. */
+        uint16_t remaining=inw(nabm+PO_PICB);
+        uint32_t confirmed=inl(nabm+PO_CIV);
+        if((confirmed&(NBUF-1))==(uint32_t)civ){
+            uint64_t pending_frames;
+            if((before&(SR_HALTED|SR_CELV))==(SR_HALTED|SR_CELV))pending_frames=0;
+            else pending_frames=(uint64_t)((lvi-civ)&(NBUF-1))*BUF_FRAMES+MIN((unsigned)remaining/2,(unsigned)BUF_FRAMES);
+            audio_card_played(submitted_frames>=pending_frames?submitted_frames-pending_frames:0);
+        }
+    }
     unsigned filled = 0;
     bool restarted = false;
     if (dma_live && !pending && civ == lvi &&
@@ -78,7 +93,8 @@ static void ac97_fill(void) {
     int room = dma_live ? AHEAD - ((lvi - civ) & (NBUF - 1)) : AHEAD;
     while (!remote && room-- > 0 && audio_pending()) {
         int next = (lvi + 1) & (NBUF - 1);
-        if (!audio_mix(bufs + next * BUF_FRAMES * 2, BUF_FRAMES)) break;
+        if (!audio_card_mix(bufs + next * BUF_FRAMES * 2, BUF_FRAMES)) break;
+        submitted_frames+=BUF_FRAMES;
         lvi = next;
         filled++;
     }

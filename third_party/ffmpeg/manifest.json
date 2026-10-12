@@ -1,7 +1,7 @@
 {
   "release": "9.0.2",
   "license": "LGPL-2.1-or-later",
-  "compiled_sources": 338,
+  "compiled_sources": 374,
   "files": [
     {
       "path": "compat/va_copy.h",
@@ -10,12 +10,12 @@
     },
     {
       "path": "config.h",
-      "sha256": "7208217dd1e2cbf1358897fd622a55e30071680d1801233eb50c0bd22fe8ef95",
+      "sha256": "d6a72fdb02ad28f6e55d592c1da2c130242d5b2297950e35a4ef6bcb0d43bd16",
       "origin": "configure-generated"
     },
     {
       "path": "config_components.h",
-      "sha256": "e5272f921e50cdb1295ecc032aac5decbf4ba638849d7f2957a366d5fa3c4e26",
+      "sha256": "b3d4db95d52cd638d6577e957775d2137dccdb6cf98eeca7dc0a0d7fba211d9e",
       "origin": "configure-generated"
     },
     {
@@ -204,6 +204,16 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavcodec/ac3.c",
+      "sha256": "9d55cc7fc14451f442fc20fa7d189786340134ed49e20b540bc21ed2bfe45bb1",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/ac3.h",
+      "sha256": "9ce77ef29f8d748f4895719356a63c6d5409816b1248b6a2836f2324ea828775",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavcodec/ac3_channel_layout_tab.c",
       "sha256": "9cafd9e17b0e9a7342e8729f7dd26570e4f4ae3e26e3e74b72bf59b3b0e6a0b3",
       "origin": "upstream-unmodified"
@@ -229,8 +239,48 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavcodec/ac3dec.c",
+      "sha256": "bb3f4e682bbe2f6b8eb5e307aada74fb3d64a898b82e0863fbf98746f4fd6123",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/ac3dec.h",
+      "sha256": "aace54c3f7b9778fc74afb79f451ef9700e0359d732aa5c30a661d39aa0e1c9c",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/ac3dec_data.c",
+      "sha256": "a73248572495d6b1d3c751f26534bc0292a81155d40d29f88ea15db471844862",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/ac3dec_data.h",
+      "sha256": "134664b53f550298cc53a0b2c102ec212c80ff43152ae4293fed7614354cffd8",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/ac3dec_float.c",
+      "sha256": "31dbd565b0f5af1a404ce9e7d9257394d655665d8a2b53d85e1b991b8d96d1ac",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavcodec/ac3defs.h",
       "sha256": "0e731a62a166cfdc9982cafd0842b0ffdc12661493014d5cc2a80415593c3fea",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/ac3dsp.c",
+      "sha256": "1ef4157d7ee164ca7e11fcb4e1079d0550a923ecd5b00104af3875f97b7a8bce",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/ac3dsp.h",
+      "sha256": "1a2aa1cc2e9a8ed0edfb0db63c4680cb586c16d6a5dac7f7969c1fcce67940c1",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/ac3tab.c",
+      "sha256": "e3be2308bba65c3f0b86215e0bec58bd2ac9c0211d797cc8a69bcca485c22fc3",
       "origin": "upstream-unmodified"
     },
     {
@@ -490,7 +540,7 @@
     },
     {
       "path": "libavcodec/codec_list.c",
-      "sha256": "939ff69ed79abb54da9844ecb16342c33f0879a4dd95c3b01e21825acebf5b7a",
+      "sha256": "6a696a7f190316eea8b3778e37cda7e03d316fa25bdd1c8eced611f451243bb9",
       "origin": "configure-generated"
     },
     {
@@ -609,6 +659,21 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavcodec/eac3_data.c",
+      "sha256": "8d27f012cfbce48e252dabc161d57bd70b1d9a16a1faa7936f906548bea1fcc6",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/eac3_data.h",
+      "sha256": "49f5dbb106d011097114ece578415dcb1c90221f662ca4b75c24c3e49db6866a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/eac3dec.c",
+      "sha256": "cc542aa77330e849e6cf59659d356897411b7b1ee0f8015e6095adec917e89f8",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavcodec/encode.c",
       "sha256": "90db8ca6ab24c9b8be8b3a0cd566bb7e43aacdf64f91c9b4b19aa604466d4afa",
       "origin": "upstream-unmodified"
@@ -721,6 +786,16 @@
     {
       "path": "libavcodec/flacdsp_template.c",
       "sha256": "235694b88b4b2297c30cf6bff2cde4f3eab81baa13601db96ae292c47e7bcb3b",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/fmtconvert.c",
+      "sha256": "0ebcb57541820723a32e868f5b4ccfffc82883db4bcc7bdfea2835eadbce1a30",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/fmtconvert.h",
+      "sha256": "718eb14d14c39f1edb99b2b70fb90d07aafb0507aa00e56a893e8c29610541fc",
       "origin": "upstream-unmodified"
     },
     {
@@ -989,6 +1064,21 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavcodec/h26x/h2656_deblock_template.c",
+      "sha256": "ac53e6ca018187aa7e70bcc77678249973789ac207f684f9eaf7291a8a48c38e",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/h26x/h2656_inter_template.c",
+      "sha256": "ce8e47d45d1cf55c1dea4bb43b6a9675cf49760dd4dc530c4ee35dbe0ec1df27",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/h26x/h2656_sao_template.c",
+      "sha256": "6a3f1ba79a8ada282ffb9b17d9d92e0fcec713e9582c47f2238289ba606d7f3d",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavcodec/h274.c",
       "sha256": "d6033f6bdab7a85708995fa03498c764ff1befe960a77a250721ac08cddf2052",
       "origin": "upstream-unmodified"
@@ -999,8 +1089,113 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavcodec/hevc/cabac.c",
+      "sha256": "3c61400de61fe8283886d12f09afd8bb4d473265306f0103406021b48f1dd79d",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/data.c",
+      "sha256": "bf01a0bb88a25383eba3ab87e0f1ff7efa49a8433a71c960664ab5e70359f59b",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/data.h",
+      "sha256": "d5f47f304539e7a8c7e5bea9e829b995b743eebe185b8be5505ab53402222e91",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/dsp.c",
+      "sha256": "af6aba392f82f537ade0d1879755207aff12e691aae2ef759aa8bb8976ca2985",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/dsp.h",
+      "sha256": "6542d4c06ae20af1de53c4123f8f60a8ffb25cc0943f7c425c161797cb8a1b34",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/dsp_template.c",
+      "sha256": "beb2f5951647b066f8543ec816df129de511b2679456b10fc261a1fd7fd2ef98",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/filter.c",
+      "sha256": "26bdfa7a87cfdaf7bd3f7c342bf88610fd0734848e49cff60bf798cda6534492",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavcodec/hevc/hevc.h",
       "sha256": "9d1e603585c4086cb3090e8894338d9ed4d7bd00f434df1b560f7acf68db1893",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/hevcdec.c",
+      "sha256": "8bedbfeffb2ca42a32d4d2f231ec1b14d27ab1e607975369dbe7ec654baa9b74",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/hevcdec.h",
+      "sha256": "54adf767befa6a8d3c398c8447300bea3f8ab8ec88e8fbc582efc0ced930542e",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/mvs.c",
+      "sha256": "5d1de8a68a0e9635a577d04a31a51aae337e7f17c7cd59f919d5bbd058ab625d",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/parse.c",
+      "sha256": "e328058cf9b791d317becead9df1c2464d406cf4a201fc3affa6f6d13cfaf263",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/parse.h",
+      "sha256": "fdef4ff416b98b53359eb80ea420d5e068406248ee7a6b928bd5b7893e45f2b5",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/parser.c",
+      "sha256": "0876fd1038b5e91130b9f15fe834e4d3db212ee4985fcd35b6b227faaba1dc3d",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/pred.c",
+      "sha256": "d12ff6c38f9b67baa9c89024bc3b0c23db7513e8704bc6f73e33e3723f1a0b04",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/pred.h",
+      "sha256": "3da507dd0bddeb05084f39c2ff494fd92c84fd3a7ae84f7ab46a4743fa3afa5c",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/pred_template.c",
+      "sha256": "62e3c1752dac1fe99cb21b8d0b6bcbb76d9bb46abf7ed17072367d1faa4feae9",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/ps.c",
+      "sha256": "f81eeb1536b4a7209ae914adc609853090bf0a18df5cc1793e2510688892fb99",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/ps.h",
+      "sha256": "7d3277c34aae6572b7abf92721e9a57b3cb212bd389627a350079b8910e8a75f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/refs.c",
+      "sha256": "9f31686986b528abd579d41d7380fb6344955d2ef574372e9e83d1cb8cdf0dd2",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/sei.c",
+      "sha256": "62c4bfbca01e110826f5c8056be20e855e8edd5cab154ec345e7e6678b5e70d0",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/hevc/sei.h",
+      "sha256": "8d1651ac16a656dd34cf1f6f680c60a9e05dd69ba427767bc02024e9b7ab3d19",
       "origin": "upstream-unmodified"
     },
     {
@@ -1515,7 +1710,7 @@
     },
     {
       "path": "libavcodec/parser_list.c",
-      "sha256": "55b85aca41ca80d64f394b1e7cb26626742670b427a65c635b280ff8fb4e93e5",
+      "sha256": "cd756a1458e61e140ec75a5375c7afa4a344571b7ebef255645382423d8033ba",
       "origin": "configure-generated"
     },
     {
@@ -1996,6 +2191,171 @@
     {
       "path": "libavcodec/xvididct.h",
       "sha256": "bdf440918cdf08e29d2c0bcf3b19da1a92f070f7204de3754ad07483b0a6e2ad",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/af_atempo.c",
+      "sha256": "96b40923aa3d12da6a8a0b093faf36f58c5b9f011a960acb6c6907fe67b7a1b0",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/allfilters.c",
+      "sha256": "f81836f7ff3b69dd0efbc769b04e777cfbe705727d1d9c3e826295292ae19588",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/audio.c",
+      "sha256": "14b3eca3411d49fefbcc443777daf1d26a682436f0c1e6a3d27d550193e78421",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/audio.h",
+      "sha256": "31f58b63cfa0006d69c24a467fad5c68840c77b080fef70e903f571d667cca6d",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/avfilter.c",
+      "sha256": "27b56fafb1db7d75dc5e98ce14ce6a04471aa0583a2e1b3bee6cc43b06646915",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/avfilter.h",
+      "sha256": "c80d2ee378b654c9bafbd466a762201fd894093420005ec24effe6b145debbac",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/avfilter_internal.h",
+      "sha256": "f2a32f1fc64a797734cdf55e1b2dc0b553fa0126d9831f79e75dc8160b7cda81",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/avfiltergraph.c",
+      "sha256": "b96376f112e8f30db618def2ea56eb466cf1ca4b9602714273d8cd5e55e53407",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/buffersink.c",
+      "sha256": "cc90e5774000ebaf37e5a0068ac0e9ece3834cbcd80b9123c4c6a2e020213df9",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/buffersink.h",
+      "sha256": "72c8ae2993837c280cfdf176db13cf7dfaec6b0aec3fb81a899037083c62e2be",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/buffersrc.c",
+      "sha256": "3754feaa897aa3c87289240f8e7dc4724fee51b36eb287646c6e16687b18e6cf",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/buffersrc.h",
+      "sha256": "8f4131e9c38aff4ef8c0dd6b736a47f7601adeaf49344d48effa41c02b5f9745",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/ccfifo.c",
+      "sha256": "fad770d02cd097e9a3c3cb94132d419ad59a4555613c209d74f82a84a42e3405",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/ccfifo.h",
+      "sha256": "700a57d4da34cbcf79fd406582a89e9daff946bd82cc78f78c77d8a5b1f879aa",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/colorspace.c",
+      "sha256": "8044cf543eb1f010119490b5ca78e94c0d0b5c9e295de60b23a0ae18302f9a4a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/colorspace.h",
+      "sha256": "ae3b976b6037e6e512bd61e351df808f2d17317b331ac4f80ae6d5590ec64abe",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/drawutils.c",
+      "sha256": "7ac30ac079dd3aa52b7ff3ebc421a8fc7aba41a24ded7c0ae762f4e4a9d70ca2",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/drawutils.h",
+      "sha256": "3ce46b51022f111e095514ac31a733ea1afcc36e462ea3e64f81994ea13b149d",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/filter_list.c",
+      "sha256": "4a248bd8e11a363f3afd7db0b7c4da60daab1c0a944de21052b26a2a524d7a49",
+      "origin": "configure-generated"
+    },
+    {
+      "path": "libavfilter/filters.h",
+      "sha256": "f787754bd261b8ae9f9a19d63be0e37fb6541855a6b5ff86b63f6b222f31c70c",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/formats.c",
+      "sha256": "f76d80f5304a33688b256c22a09c5ff3d772b1231c4b72d6a9575d6007e68c4b",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/formats.h",
+      "sha256": "0f8e80501f1a287d9c7e2d190904596d11225b74177ec6307508b30e1c51e7c2",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/framepool.c",
+      "sha256": "f66c08d941f054fbd1cb3025547c204019fd22c50c176da806a5ee496b8c7d54",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/framepool.h",
+      "sha256": "728d61ddfb3c36ba8aec84d4462b3f754d03f88aac8c881d2b2e1fbba86826f1",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/framequeue.c",
+      "sha256": "f971718fc262e0e0d7a94798af843ccb4344dcdeaad7c158d9d31b628e99ac8c",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/framequeue.h",
+      "sha256": "101b7b97199a753b73c7b0c6ecd43bae4de53663b5338b960b2f71b2e51c21dd",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/graphdump.c",
+      "sha256": "5b49f84c09b78699cdc1b800403e17c3941ce0c3bdff43eacd5fca4d21143de6",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/graphparser.c",
+      "sha256": "59d70103a55dabc2b36fef605ef4d391f5988ceb007a540ce1e9a4eda1c5a3e5",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/version.c",
+      "sha256": "5cb6948856b7d01d3c31002b93c0d595ad42d52e56aba0dbc43cbdc261877a06",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/version.h",
+      "sha256": "669a42c6e0d3caf894dd22cb417537e7b689e2cc2b16456ae8369a99d653125c",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/version_major.h",
+      "sha256": "1e25372ff02d13346c534159d48d965e67cee1caa63400dc5074e76fe0bdb222",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/video.c",
+      "sha256": "c1f5b3d2c83315eac6ab389be626771b3e2a1917bcfef2313405ff367bee5177",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavfilter/video.h",
+      "sha256": "a8375ab7a0b021790f11d3769bd4b6d055f9bbba1df2dfb7d33bef3f450407eb",
       "origin": "upstream-unmodified"
     },
     {
@@ -2670,7 +3030,7 @@
     },
     {
       "path": "libavutil/avconfig.h",
-      "sha256": "6d78a911a2128e926262114c9904209209674e3bc1a18c208c850ecbfc3393ec",
+      "sha256": "975611ad5eba15212d9e1d5fca9d4fdf0daec6d2269b2fcab8e29af8667164bc",
       "origin": "configure-generated"
     },
     {
@@ -3799,7 +4159,7 @@
       "origin": "upstream-unmodified"
     }
   ],
-  "configuration": "freestanding x86_64 target-os=none; network/protocols/devices/filters/encoders/threads/asm disabled",
+  "configuration": "freestanding x86_64 target-os=none; network/protocols/devices/encoders/threads/asm disabled; filters limited to configured native PCM transforms",
   "effective_overrides": {
     "HAVE_MMAP": 0,
     "HAVE_FCNTL": 0,
@@ -3809,12 +4169,16 @@
     "libavutil",
     "libavcodec",
     "libavformat",
-    "libswresample"
+    "libswresample",
+    "libavfilter"
   ],
   "decoders": [
     "aac",
+    "ac3",
+    "eac3",
     "flac",
     "h264",
+    "hevc",
     "mjpeg",
     "mp3",
     "opus",
@@ -3841,8 +4205,10 @@
   ],
   "parsers": [
     "aac",
+    "ac3",
     "flac",
     "h264",
+    "hevc",
     "mjpeg",
     "mpegaudio",
     "opus",

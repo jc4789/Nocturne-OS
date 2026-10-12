@@ -54,7 +54,7 @@ enum { PC_FIRST_CHILD, PC_LAST_CHILD, PC_ONLY_CHILD, PC_NTH_CHILD, PC_NTH_LAST_C
        PC_LAST_OF_TYPE, PC_ONLY_OF_TYPE, PC_NTH_OF_TYPE, PC_NTH_LAST_OF_TYPE, PC_NOT, PC_IS, PC_NEVER,
        PC_ALWAYS, PC_LINK, PC_CHECKED, PC_DISABLED, PC_ENABLED, PC_ROOT, PC_EMPTY, PC_REQUIRED, PC_OPTIONAL,
        PC_LANG, PC_PLACEHOLDER_SHOWN, PC_READ_WRITE, PC_READ_ONLY, PC_OPEN, PC_HOST, PC_FOCUS, PC_FOCUS_WITHIN, PC_HOVER, PC_ACTIVE,
-       PC_VALID, PC_INVALID, PC_IN_RANGE, PC_OUT_OF_RANGE, PC_INDETERMINATE, PC_MODAL };
+       PC_VALID, PC_INVALID, PC_IN_RANGE, PC_OUT_OF_RANGE, PC_INDETERMINATE, PC_MODAL,PC_FULLSCREEN };
 
 struct sellist;
 struct simple {
@@ -403,7 +403,7 @@ static const struct {
     {"visited", PC_NEVER}, {"hover", PC_HOVER}, {"active", PC_ACTIVE}, {"focus", PC_FOCUS},
     {"focus-within", PC_FOCUS_WITHIN}, {"focus-visible", PC_NEVER}, {"target", PC_NEVER}, {"target-within", PC_NEVER},
     {"indeterminate", PC_INDETERMINATE}, {"invalid", PC_INVALID}, {"valid", PC_VALID}, {"user-invalid", PC_NEVER},
-    {"user-valid", PC_NEVER}, {"default", PC_NEVER}, {"fullscreen", PC_NEVER}, {"modal", PC_MODAL},
+    {"user-valid", PC_NEVER}, {"default", PC_NEVER}, {"fullscreen", PC_FULLSCREEN}, {"modal", PC_MODAL},
     {"popover-open", PC_NEVER}, {"autofill", PC_NEVER}, {"in-range", PC_IN_RANGE}, {"out-of-range", PC_OUT_OF_RANGE},
     {"playing", PC_NEVER}, {"paused", PC_NEVER}, {"current", PC_NEVER}, {"past", PC_NEVER}, {"future", PC_NEVER},
     {"first", PC_NEVER}, {"left", PC_NEVER}, {"right", PC_NEVER}, {"blank", PC_NEVER}, {"local-link", PC_NEVER},
@@ -857,6 +857,7 @@ static bool match_pc(const struct simple *x, node_t *e, node_t *scope) {
     case PC_READ_WRITE: return read_write(e);
     case PC_READ_ONLY: return !read_write(e);
     case PC_MODAL: return web_dialog_is_modal(e->owner,e);
+    case PC_FULLSCREEN: return e->owner&&e->owner->fullscreen_element==e;
     case PC_OPEN: return (e->tag == T_details || e->tag == T_dialog) && node_attr(e, "open");
     }
     return false;

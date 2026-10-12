@@ -13,6 +13,7 @@ static const struct fixture {const char *name,*audio_codec;bool video;int frames
     {"vorbis.webm","vorbis",false,9600},{"vp9.webm",NULL,true,0},
     {"vp9-opus.webm","opus",true,9600},{"vp9-vorbis.webm","vorbis",true,9600},
     {"unsupported.webm",NULL,true,0,"vp8"}, /* Original VP8 fixture bytes retained. */
+    {"vp9-high10.webm",NULL,true,0,"vp9"},
 };
 static uint8_t *read_fixture(const char *name,size_t *size){
     char path[256];snprintf(path,sizeof path,"/data/tests/media-fixtures/%s",name);
@@ -79,22 +80,23 @@ static void capabilities(void){
         "video/webm; codecs=vp8","video/webm; codecs=vp8.0","video/webm; codecs=\"vp8, vorbis\"",
         "video/webm; codecs=\"vp09.00.10.08, opus\"","video/webm; codecs=\"vp9, vorbis\"",
         "video/webm; codecs=vp09.00.41.08.01.01.01.01.00",
+        "video/webm; codecs=vp09.02.10.10","video/webm; codecs=vp09.01.10.08",
         "audio/webm; codecs=opus","audio/webm; codecs=vorbis","audio/ogg; codecs=opus","audio/ogg; codecs=vorbis"};
     const char *negative[]={"audio/webm; codecs=vp8","video/webm; codecs=vp8.1","video/webm; codecs=av01.0.04M.08",
-        "video/webm; codecs=vp09.02.10.10","video/webm; codecs=vp09.01.10.08",
         "video/webm; codecs=vp09.00.99.08","video/webm; codecs=vp09.00.10.08.01",
         "video/webm; codecs=vp09.00.10.08.01.09.16.09.01","video/webm; codecs=vp09.00.10.08junk",
         "video/webm; codecs=\"vp9,\"","audio/webm; codecs=vp9","video/ogg; codecs=theora",
         "audio/ogg; codecs=speex","audio/ogg; codecs=\"opus\"; codecs=vorbis",
-        "application/vnd.apple.mpegurl","video/mp4; codecs=av01.0.04M.08"};
+        "video/mp4; codecs=av01.0.04M.08"};
     for(size_t i=0;i<sizeof positive/sizeof *positive;i++)CHECK(!strcmp(nmedia_can_play_type(positive[i]),"probably"));
     for(size_t i=0;i<sizeof negative/sizeof *negative;i++)CHECK(!*nmedia_can_play_type(negative[i]));
     CHECK(!strcmp(nmedia_can_play_type("audio/webm"),"maybe"));CHECK(!strcmp(nmedia_can_play_type("audio/ogg"),"maybe"));
+    CHECK(!strcmp(nmedia_can_play_type("application/vnd.apple.mpegurl"),"maybe"));
     CHECK(nmedia_audio_extension("SONG.OPUS")&&nmedia_audio_extension("song.ogg")&&!nmedia_audio_extension("movie.webm"));
 }
 int main(void){
     for(size_t i=0;i<sizeof fixtures/sizeof *fixtures;i++){decode(&fixtures[i],false);decode(&fixtures[i],true);}
-    reject("vp9-high10.webm");reject("unsupported-av1.webm");
+    reject("unsupported-av1.webm");
     size_t n=0;uint8_t *p=read_fixture("vp9-opus.webm",&n);if(p){char error[160];CHECK(nmedia_open_memory(p,16,error,sizeof error)==NULL);free(p);}
     capabilities();printf("media_webmtest: %d checks, %d failed\n",checks,failed);return failed!=0;
 }

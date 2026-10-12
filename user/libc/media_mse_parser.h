@@ -18,6 +18,13 @@
  * Unknown-size WebM Clusters wait for the next Cluster/init header or EOS.
  * The caller owns staging allocation and checks its size_t/AVIO arithmetic. */
 #define NMEDIA_MSE_PARSE_MEMORY (-2)
+struct nmedia_mse_track_size {uint32_t track_id,sample_size;};
+/* Sorted immutable trex defaults extracted once per validated init. The caller
+ * owns the media-allocator array. Missing defaults retain conservative framing. */
+int nmedia_mse_init_sizes(const uint8_t *,size_t,struct nmedia_mse_track_size **,
+                         size_t *,char *,size_t);
+int nmedia_mse_boundary_sizes(const uint8_t *,size_t,bool,bool,bool,size_t *,size_t *,
+                             char *,size_t,const struct nmedia_mse_track_size *,size_t);
 int nmedia_mse_boundary(const uint8_t *bytes, size_t length, bool webm,
                         bool have_init, bool eos, size_t *init_end,
                         size_t *segment_end, char *error, size_t error_size);
