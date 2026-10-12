@@ -25,6 +25,10 @@
 #include "font.h"
 #include "stb_truetype.h"
 #include "font_sfnt.h"
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include FT_TRUETYPE_TABLES_H
+#include FT_FONT_FORMATS_H
 static unsigned font_probe_depth;
 static bool font_probe_failed;
 
@@ -36,15 +40,17 @@ struct font {
     uint64_t id;
     int ascent, descent, line_gap; /* font units; descent is negative */
     float unit_scale;              /* pixels per font unit at 1 px/em */
-    int16_t *adv;                  /* advance width per glyph in font units, INT16_MIN = not looked up */
+    int32_t *adv;                  /* full unsigned hmtx width; INT32_MIN = not looked up */
     uint16_t lo_glyph[0x250];      /* glyph index for code points below 0x250, 0xFFFF = not looked up */
     uint8_t fallback;             /* font_open は単一 face、family/Web face は欠字を補完する */
     bool merged_metrics;         /* 統合版の巨大な全字形 hhea を通常本文の行箱に使わない */
     bool web_face;               /* validated TTF; explicit-stack composite renderer */
+    FT_Face outline;             /* bounded OpenType CFF/CFF2 fallback only */
 };
 
 static uint64_t next_font_id = 1;
 static uint64_t font_metrics_epoch = 1;
+static FT_Library web_font_library;
 
 uint64_t font_metrics_generation(void) { return font_metrics_epoch; }
 
@@ -64,9 +70,9 @@ static font_t *font_adopt(unsigned char *data, bool web_face) {
     if (web_face) f->fallback = FALLBACK_SANS;
     stbtt_GetFontVMetrics(&f->info, &f->ascent, &f->descent, &f->line_gap);
     f->unit_scale = stbtt_ScaleForMappingEmToPixels(&f->info, 1.0f);
-    f->adv = malloc(sizeof(int16_t) * (size_t)(f->info.numGlyphs > 0 ? f->info.numGlyphs : 1));
+    f->adv = malloc(sizeof *f->adv * (size_t)(f->info.numGlyphs > 0 ? f->info.numGlyphs : 1));
     if (!f->adv) { free(f->data); free(f); return NULL; }
-    for (int i = 0; i < f->info.numGlyphs; i++) f->adv[i] = INT16_MIN;
+    for (int i = 0; i < f->info.numGlyphs; i++) f->adv[i] = INT32_MIN;
     memset(f->lo_glyph, 0xFF, sizeof f->lo_glyph);
     /* A successful lazy fallback changes the available measurement backend.
      * Unsigned wrap disables reuse permanently rather than creating an ABA. */
@@ -85,9 +91,60 @@ font_t *font_open(const char *path) {
 
 font_t *font_open_memory(const void *data,size_t length) {
     if(font_probe_depth){font_probe_failed=true;return NULL;}
-    if(!data || !font_sfnt_valid(data,length))return NULL;
+    if(!data || !length || length>INT_MAX)return NULL;
+    const unsigned char *input=data;
+    /* EOT-Lite is only a container around SFNT. Do not misinterpret compressed
+     * MicroType Express/EUDC packages as raw outlines. WOFF is preferred by CSS.
+     * XOR, when declared, belongs solely to the owned FontData bytes. */
+    bool xor_eot=false;
+    if(length>=82 && input[34]==0x4c && input[35]==0x50) {
+        uint32_t total=sf_le32(input),font_size=sf_le32(input+4),version=sf_le32(input+8),flags=sf_le32(input+12);
+        if(total!=length || font_size>length-82 || !font_size ||
+           (version!=0x10000 && version!=0x20001 && version!=0x20002) || (flags&0x24))return NULL;
+        xor_eot=(flags&0x10000000)!=0;input+=length-font_size;length=font_size;
+    }
     unsigned char *copy=malloc(length);if(!copy)return NULL;
-    memcpy(copy,data,length);return font_adopt(copy,true);
+    memcpy(copy,input,length);
+    if(xor_eot)for(size_t i=0;i<length;i++)copy[i]^=0x50;
+    /* Keep the established TrueType raster/metrics exactly unchanged. Other
+     * containers are opened by FreeType's byte-bounded SFNT parsers and native
+     * Brotli/zlib decoder, never by an external helper or a site exception. */
+    if(font_sfnt_valid(copy,length))return font_adopt(copy,true);
+    uint32_t signature=length>=4?sf_u32(copy):0;
+    if(signature!=0x774f4646 && signature!=0x774f4632 && signature!=0x4f54544f) {free(copy);return NULL;}
+    if(!web_font_library && FT_Init_FreeType(&web_font_library)) {free(copy);return NULL;}
+    FT_Face outline=NULL;
+    if(FT_New_Memory_Face(web_font_library,copy,(FT_Long)length,0,&outline) ||
+       !outline || !FT_IS_SCALABLE(outline) || outline->num_glyphs<=0 || outline->num_glyphs>INT_MAX ||
+       !outline->units_per_EM || FT_Select_Charmap(outline,FT_ENCODING_UNICODE)) {
+        if(outline)FT_Done_Face(outline);free(copy);return NULL;
+    }
+    const char *format=FT_Get_Font_Format(outline);
+    if(format && !strcmp(format,"TrueType")) {
+        /* FreeType replaces WOFF/WOFF2's stream with reconstructed SFNT. Reuse
+         * the strict native glyph gate and existing composite rasterizer after
+         * expansion; compressed input never bypasses our rendering checks. */
+        FT_ULong bytes=0;
+        unsigned char *sfnt=NULL;
+        if(!FT_Load_Sfnt_Table(outline,0,0,NULL,&bytes) && bytes && bytes<=INT_MAX) {
+            sfnt=malloc(bytes);
+            if(sfnt && (FT_Load_Sfnt_Table(outline,0,0,sfnt,&bytes) || !font_sfnt_valid(sfnt,bytes))) {free(sfnt);sfnt=NULL;}
+        }
+        FT_Done_Face(outline);free(copy);
+        return sfnt?font_adopt(sfnt,true):NULL;
+    }
+    if(!format || strcmp(format,"CFF") || !next_font_id) {FT_Done_Face(outline);free(copy);return NULL;}
+    font_t *f=calloc(1,sizeof *f);
+    if(!f){FT_Done_Face(outline);free(copy);return NULL;}
+    f->adv=malloc(sizeof *f->adv*(size_t)outline->num_glyphs);
+    if(!f->adv){FT_Done_Face(outline);free(copy);free(f);return NULL;}
+    f->data=copy;f->outline=outline;f->web_face=true;f->fallback=FALLBACK_SANS;f->id=next_font_id++;
+    f->info.numGlyphs=(int)outline->num_glyphs;f->ascent=outline->ascender;f->descent=outline->descender;
+    f->line_gap=outline->height-f->ascent+f->descent;f->unit_scale=1.0f/outline->units_per_EM;
+    for(int i=0;i<f->info.numGlyphs;i++)f->adv[i]=INT32_MIN;
+    memset(f->lo_glyph,0xff,sizeof f->lo_glyph);
+    if(font_metrics_epoch)font_metrics_epoch++;
+    return f;
 }
 
 static font_t *open_bundled(const char *name) {
@@ -159,6 +216,7 @@ font_t *font_family(int family, int style) {
 }
 
 static int glyph_of(font_t *f, uint32_t cp) {
+    if(f->outline)return (int)FT_Get_Char_Index(f->outline,cp);
     if(f->web_face) {
         /* Use the validated mapping. In format 4 idDelta also applies to a
          * nonzero glyphIdArray entry (the bundled stb path omits that case). */
@@ -297,11 +355,16 @@ static font_t *glyph_face(font_t *f, uint32_t cp, int *glyph) {
 
 static int glyph_adv(font_t *f, int g) {
     if (g < 0 || g >= f->info.numGlyphs) return 0;
-    if (f->adv[g] == INT16_MIN) {
+    if (f->adv[g] == INT32_MIN) {
         if(font_probe_depth){font_probe_failed=true;return 0;}
         int a, lsb;
-        stbtt_GetGlyphHMetrics(&f->info, g, &a, &lsb);
-        f->adv[g] = (int16_t)a;
+        if(f->outline) {
+            if(FT_Load_Glyph(f->outline,(FT_UInt)g,FT_LOAD_NO_SCALE|FT_LOAD_NO_HINTING|FT_LOAD_NO_BITMAP))return 0;
+            FT_Pos advance=f->outline->glyph->metrics.horiAdvance;
+            if(advance<=INT32_MIN || advance>INT32_MAX)return 0;
+            a=(int)advance;
+        } else stbtt_GetGlyphHMetrics(&f->info, g, &a, &lsb);
+        f->adv[g] = a;
     }
     return f->adv[g];
 }
@@ -384,6 +447,7 @@ void font_close(font_t *f) {
     for(unsigned i=0;i<FACE_CACHE_SETS;i++)for(unsigned j=0;j<FACE_CACHE_WAYS;j++)
         if(face_cache[i][j].font==f->id || face_cache[i][j].face==f)memset(&face_cache[i][j],0,sizeof face_cache[i][j]);
     if(gc)gc_flush();
+    if(f->outline)FT_Done_Face(f->outline);
     free(f->adv);free(f->data);free(f);
     if(font_metrics_epoch)font_metrics_epoch++;
 }
@@ -452,6 +516,29 @@ static int web_glyph_shape(font_t *f,unsigned glyph,stbtt_vertex **vertices) {
 bad:free(stack);free(out);return -1;
 }
 
+static bool outline_bitmap(font_t *f,int glyph,unsigned size4,int phase,struct gent *e) {
+    FT_Vector offset={(FT_Pos)phase*16,0};
+    if(FT_Set_Char_Size(f->outline,0,(FT_F26Dot6)size4*16,72,72))return false;
+    FT_Set_Transform(f->outline,NULL,&offset);
+    if(FT_Load_Glyph(f->outline,(FT_UInt)glyph,FT_LOAD_NO_HINTING|FT_LOAD_NO_BITMAP) ||
+       FT_Render_Glyph(f->outline->glyph,FT_RENDER_MODE_NORMAL))return false;
+    FT_GlyphSlot slot=f->outline->glyph;FT_Bitmap *b=&slot->bitmap;
+    if(b->pixel_mode!=FT_PIXEL_MODE_GRAY || b->width>UINT16_MAX || b->rows>UINT16_MAX ||
+       slot->bitmap_left<INT16_MIN || slot->bitmap_left>INT16_MAX ||
+       slot->bitmap_top< -INT16_MAX || slot->bitmap_top>32768)return false;
+    e->x0=(int16_t)slot->bitmap_left;e->y0=(int16_t)-slot->bitmap_top;
+    e->w=(uint16_t)b->width;e->h=(uint16_t)b->rows;
+    if(e->w && e->h) {
+        e->bmp=malloc((size_t)e->w*e->h);if(!e->bmp)return false;
+        for(unsigned y=0;y<e->h;y++) {
+            const unsigned char *row=b->pitch>=0?b->buffer+(size_t)y*b->pitch:
+                b->buffer+(size_t)(e->h-y-1)*(size_t)(-(int64_t)b->pitch);
+            memcpy(e->bmp+(size_t)y*e->w,row,e->w);
+        }
+    }
+    return true;
+}
+
 static struct gent *gc_get(font_t *f, int g, float px, int phase) {
     if (!gc) {
         if(font_probe_depth){font_probe_failed=true;return NULL;}
@@ -469,6 +556,11 @@ static struct gent *gc_get(font_t *f, int g, float px, int phase) {
             if (gc_count >= GC_MAX) {
                 gc_flush();
                 return gc_get(f, g, px, phase);
+            }
+            if(f->outline) {
+                if(!outline_bitmap(f,g,size4,phase,e)){free(e->bmp);memset(e,0,sizeof *e);return NULL;}
+                e->font=f->id;e->glyph=g;e->size4=size4;e->phase=(uint8_t)phase;e->used=1;
+                gc_count++;return e;
             }
             float scale = f->unit_scale * size4 / 4.0f, shift = phase / 4.0f;
             int x0, y0, x1, y1;

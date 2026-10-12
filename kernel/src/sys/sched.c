@@ -14,6 +14,7 @@ static struct task *cpu_current[CPU_MAX_COUNT];
 static volatile bool cpu_resched[CPU_MAX_COUNT];
 struct task *task_list;
 struct wait_queue poll_wq;
+uint64_t poll_generation;
 
 struct task **sched_current_slot(void) { return &cpu_current[cpu_current_index()]; }
 volatile bool *sched_resched_slot(void) { return &cpu_resched[cpu_current_index()]; }
@@ -316,6 +317,7 @@ void sched_pin_space(uint64_t pml4) {
 
 void sched_init(void) {
     idle_task = kzalloc(sizeof(struct task));
+    idle_task->fds=idle_task->initial_fds;idle_task->fd_capacity=MAX_FDS;
     idle_task->pid = next_pid++;
     strlcpy(idle_task->name, "idle", sizeof idle_task->name);
     idle_task->state = TASK_RUNNING;
@@ -333,6 +335,7 @@ void sched_init(void) {
 struct task *task_alloc(const char *name) {
     struct task *t = kzalloc(sizeof(struct task));
     if (!t) return NULL;
+    t->fds=t->initial_fds;t->fd_capacity=MAX_FDS;
     t->kstack = vmalloc(KSTACK_PAGES);
     if (!t->kstack) {
         kfree(t);
@@ -417,7 +420,29 @@ static void free_task(struct task *t) {
     if (t->is_thread && t->user_stack && t->pml4 != kernel_pml4)
         vmm_user_free(t->pml4, t->user_stack, t->user_stack_size);
     vfree(t->kstack, KSTACK_PAGES);
+    if(t->fds!=t->initial_fds)kfree(t->fds);
     kfree(t);
+}
+
+int task_fd_reserve(struct task *owner,size_t minimum) {
+    const size_t limit=(size_t)INT32_MAX+1;
+    if(minimum>limit || minimum>SIZE_MAX/sizeof *owner->fds)return -EMFILE;
+    if(minimum<=owner->fd_capacity)return 0;
+    size_t capacity=owner->fd_capacity;
+    while(capacity<minimum){if(capacity>limit/2){capacity=minimum;break;}capacity*=2;}
+    struct file **fds=kzalloc(capacity*sizeof *fds);if(!fds)return -ENOMEM;
+    memcpy(fds,owner->fds,owner->fd_capacity*sizeof *fds);
+    if(owner->fds!=owner->initial_fds)kfree(owner->fds);
+    owner->fds=fds;owner->fd_capacity=capacity;return 0;
+}
+int task_fd_find(struct task *owner) {
+    for(size_t i=owner->fd_hint;i<owner->fd_capacity;i++)if(!owner->fds[i])return (int)i;
+    size_t index=owner->fd_capacity;
+    int e=task_fd_reserve(owner,index+1);return e?e:(int)index;
+}
+int task_fd_alloc(struct task *owner,struct file *file) {
+    int fd=task_fd_find(owner);if(fd<0)return fd;
+    owner->fds[fd]=file;owner->fd_hint=(size_t)fd+1;return fd;
 }
 
 static void reap_dead(void) {
@@ -757,7 +782,7 @@ NORETURN void task_exit(int code) {
         else wq_wait(&t->child_wait);
     }
     sti();
-    for (int i = 0; i < MAX_FDS; i++) {
+    for (size_t i = 0; i < t->fd_capacity; i++) {
         if (t->fds[i]) {
             vfs_close(t->fds[i]);
             t->fds[i] = NULL;
@@ -860,7 +885,7 @@ void task_printf_stderr(struct task *t, const char *fmt, ...) {
     if (n > (int)sizeof buf - 1) n = sizeof buf - 1;
     struct task *owner = t->process ? t->process : t;
     uint64_t flags = irq_save();
-    struct file *file = owner->fds[2] ? vfs_dup(owner->fds[2]) : NULL;
+    struct file *file = owner->fd_capacity>2 && owner->fds[2] ? vfs_dup(owner->fds[2]) : NULL;
     irq_restore(flags);
     if (file) { vfs_write(file, buf, n); vfs_close(file); }
 }

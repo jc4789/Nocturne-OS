@@ -2143,10 +2143,11 @@ STBTT_DEF void stbtt_GetGlyphHMetrics(const stbtt_fontinfo *info, int glyph_inde
 {
    stbtt_uint16 numOfLongHorMetrics = ttUSHORT(info->data+info->hhea + 34);
    if (glyph_index < numOfLongHorMetrics) {
-      if (advanceWidth)     *advanceWidth    = ttSHORT(info->data + info->hmtx + 4*glyph_index);
+      // OpenType hmtx advanceWidth is UFWORD; only the side bearing is signed.
+      if (advanceWidth)     *advanceWidth    = ttUSHORT(info->data + info->hmtx + 4*glyph_index);
       if (leftSideBearing)  *leftSideBearing = ttSHORT(info->data + info->hmtx + 4*glyph_index + 2);
    } else {
-      if (advanceWidth)     *advanceWidth    = ttSHORT(info->data + info->hmtx + 4*(numOfLongHorMetrics-1));
+      if (advanceWidth)     *advanceWidth    = ttUSHORT(info->data + info->hmtx + 4*(numOfLongHorMetrics-1));
       if (leftSideBearing)  *leftSideBearing = ttSHORT(info->data + info->hmtx + 4*numOfLongHorMetrics + 2*(glyph_index - numOfLongHorMetrics));
    }
 }

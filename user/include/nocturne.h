@@ -50,6 +50,14 @@ int msleep(unsigned ms);
 unsigned sleep(unsigned s);
 uint64_t uptime_ms(void);
 int pipe(int fds[2]);
+/* Native named rendezvous, not a filesystem or Unix socket namespace.
+ * Listen atomically owns key until its last duplicated fd closes (EEXIST).
+ * Connect/accept return nonblocking duplex read/write/poll fds; accept with
+ * no pending peer fails with EAGAIN. Closing the peer yields EOF/EPIPE/HUP.
+ * Key bytes are matched in full; callers must encode their own identity. */
+int n_channel_listen(const char *key);
+int n_channel_connect(const char *key);
+int n_channel_accept(int listener_fd);
 int dup(int fd);
 int dup2(int fd, int newfd);
 int poll(struct n_pollfd *fds, int n, int timeout_ms);

@@ -124,6 +124,11 @@ static bool pipe_can_write(struct vnode *v, struct file *f) {
     return p->count < SIZE_MAX || p->readers == 0;
 }
 
+static bool pipe_hangup(struct vnode *v,struct file *f) {
+    struct pipe *p=v->priv;
+    return (f->flags&O_ACCMODE)==O_RDONLY?p->writers==0:p->readers==0;
+}
+
 static void pipe_close(struct vnode *v, struct file *f) {
     struct pipe *p = v->priv;
     uint64_t fl = irq_save();
@@ -147,6 +152,7 @@ static struct vnode_ops pipe_ops = {
     .write = pipe_write,
     .can_read = pipe_can_read,
     .can_write = pipe_can_write,
+    .hangup = pipe_hangup,
     .close = pipe_close,
     .release = pipe_release,
 };
@@ -173,4 +179,137 @@ int pipe_create(struct file **rd, struct file **wr) {
     *wr = vfs_open_vnode(v, O_WRONLY);
     if(!*wr){vfs_close(*rd);*rd=NULL;return -ENOMEM;}
     return 0;
+}
+
+/* Named native rendezvous. Only the registry/index is new: each duplex end
+ * owns the existing dynamically segmented pipe directions. No path lookup,
+ * network socket family, fixed client capacity or parent-process dependency. */
+struct channel_end {struct file *rx,*tx;};
+struct channel_pending {struct channel_pending *next;struct file *server;};
+struct channel_listener {
+    struct channel_listener *next;
+    struct channel_pending *head,*tail;
+    uint64_t hash;
+    size_t key_length;
+    bool published;
+    char key[];
+};
+enum {CHANNEL_BUCKETS=64};
+static struct channel_listener *channel_names[CHANNEL_BUCKETS];
+
+static uint64_t channel_hash(const char *key,size_t length) {
+    uint64_t h=14695981039346656037ull;
+    for(size_t i=0;i<length;i++)h=(h^(unsigned char)key[i])*1099511628211ull;
+    return h;
+}
+static struct channel_listener *channel_find(const char *key,size_t length,uint64_t hash) {
+    for(struct channel_listener *l=channel_names[hash&(CHANNEL_BUCKETS-1)];l;l=l->next)
+        if(l->hash==hash && l->key_length==length && !memcmp(l->key,key,length))return l;
+    return NULL;
+}
+static int64_t channel_read(struct vnode *v,struct file *f,void *buffer,uint64_t offset,size_t n) {
+    struct channel_end *end=v->priv;
+    return pipe_read(end->rx->vn,f,buffer,offset,n);
+}
+static int64_t channel_write(struct vnode *v,struct file *f,const void *buffer,uint64_t offset,size_t n) {
+    struct channel_end *end=v->priv;
+    return pipe_write(end->tx->vn,f,buffer,offset,n);
+}
+static bool channel_can_read(struct vnode *v,struct file *f) {
+    struct channel_end *end=v->priv;return pipe_can_read(end->rx->vn,f);
+}
+static bool channel_can_write(struct vnode *v,struct file *f) {
+    struct channel_end *end=v->priv;return pipe_can_write(end->tx->vn,f);
+}
+static bool channel_hangup(struct vnode *v,struct file *f) {
+    (void)f;struct channel_end *end=v->priv;
+    struct pipe *rx=end->rx->vn->priv,*tx=end->tx->vn->priv;
+    return rx->writers==0 || tx->readers==0;
+}
+static void channel_close(struct vnode *v,struct file *f) {
+    (void)f;struct channel_end *end=v->priv;
+    vfs_close(end->rx);vfs_close(end->tx);
+}
+static void channel_release(struct vnode *v) {kfree(v->priv);kfree(v);}
+static struct vnode_ops channel_ops={
+    .read=channel_read,.write=channel_write,.can_read=channel_can_read,
+    .can_write=channel_can_write,.hangup=channel_hangup,.close=channel_close,.release=channel_release,
+};
+/* Transfers the two pipe references only on success. */
+static struct file *channel_end_new(struct file *rx,struct file *tx) {
+    struct vnode *v=kzalloc(sizeof *v);struct channel_end *end=kmalloc(sizeof *end);
+    if(!v || !end){kfree(v);kfree(end);return NULL;}
+    *end=(struct channel_end){rx,tx};v->type=VT_CHANNEL;v->ops=&channel_ops;v->priv=end;v->unlinked=true;
+    strlcpy(v->name,"channel",sizeof v->name);
+    struct file *f=vfs_open_vnode(v,O_RDWR|O_NONBLOCK);
+    if(!f){kfree(end);kfree(v);}return f;
+}
+static int channel_pair(struct file **client,struct file **server) {
+    struct file *r0,*w0,*r1,*w1;int e=pipe_create(&r0,&w0);
+    if(e)return e;
+    e=pipe_create(&r1,&w1);
+    if(e){vfs_close(r0);vfs_close(w0);return e;}
+    *client=channel_end_new(r1,w0);
+    if(!*client){vfs_close(r0);vfs_close(w0);vfs_close(r1);vfs_close(w1);return -ENOMEM;}
+    *server=channel_end_new(r0,w1);
+    if(!*server){vfs_close(*client);*client=NULL;vfs_close(r0);vfs_close(w1);return -ENOMEM;}
+    return 0;
+}
+static bool listener_can_read(struct vnode *v,struct file *f) {
+    (void)f;struct channel_listener *l=v->priv;return l->head!=NULL;
+}
+static bool listener_can_write(struct vnode *v,struct file *f) {(void)v;(void)f;return false;}
+static void listener_close(struct vnode *v,struct file *f) {
+    (void)f;struct channel_listener *l=v->priv;uint64_t flags=irq_save();
+    if(l->published) {
+        struct channel_listener **at=&channel_names[l->hash&(CHANNEL_BUCKETS-1)];
+        while(*at && *at!=l)at=&(*at)->next;
+        if(*at==l)*at=l->next;l->published=false;
+    }
+    struct channel_pending *pending=l->head;l->head=l->tail=NULL;
+    poll_notify();irq_restore(flags);
+    /* A pending server reference is an ordinary owner. Closing it propagates
+     * both directional EOF/EPIPE and wakes clients, even after owner death. */
+    while(pending){struct channel_pending *next=pending->next;vfs_close(pending->server);kfree(pending);pending=next;}
+}
+static struct vnode_ops listener_ops={
+    .can_read=listener_can_read,.can_write=listener_can_write,.close=listener_close,.release=channel_release,
+};
+int channel_listen(const char *key,size_t length,struct file **listener) {
+    if(!length || length>SIZE_MAX-sizeof(struct channel_listener))return -EINVAL;
+    uint64_t hash=channel_hash(key,length);
+    struct vnode *v=kzalloc(sizeof *v);
+    struct channel_listener *l=kzalloc(sizeof *l+length);
+    if(!v || !l){kfree(v);kfree(l);return -ENOMEM;}
+    l->hash=hash;l->key_length=length;memcpy(l->key,key,length);
+    v->type=VT_CHANNEL;v->ops=&listener_ops;v->priv=l;v->unlinked=true;
+    strlcpy(v->name,"channel-listener",sizeof v->name);
+    struct file *f=vfs_open_vnode(v,O_RDWR|O_NONBLOCK);
+    if(!f){kfree(l);kfree(v);return -ENOMEM;}
+    uint64_t flags=irq_save();
+    if(channel_find(key,length,hash)){irq_restore(flags);vfs_close(f);return -EEXIST;}
+    unsigned bucket=hash&(CHANNEL_BUCKETS-1);
+    l->next=channel_names[bucket];channel_names[bucket]=l;l->published=true;
+    irq_restore(flags);*listener=f;return 0;
+}
+int channel_connect(const char *key,size_t length,struct file **client) {
+    if(!length)return -EINVAL;
+    uint64_t hash=channel_hash(key,length);uint64_t flags=irq_save();
+    struct channel_listener *l=channel_find(key,length,hash);
+    if(!l){irq_restore(flags);return -ENOENT;}
+    struct channel_pending *pending=kmalloc(sizeof *pending);
+    if(!pending){irq_restore(flags);return -ENOMEM;}
+    struct file *server;int e=channel_pair(client,&server);
+    if(e){kfree(pending);irq_restore(flags);return e;}
+    pending->next=NULL;pending->server=server;
+    if(l->tail)l->tail->next=pending;else l->head=pending;l->tail=pending;
+    poll_notify();irq_restore(flags);return 0;
+}
+int channel_accept(struct file *listener,struct file **server) {
+    if(!listener || listener->vn->ops!=&listener_ops)return -EINVAL;
+    struct channel_listener *l=listener->vn->priv;uint64_t flags=irq_save();
+    struct channel_pending *pending=l->head;
+    if(!pending){irq_restore(flags);return -EAGAIN;}
+    l->head=pending->next;if(!l->head)l->tail=NULL;
+    *server=pending->server;kfree(pending);irq_restore(flags);return 0;
 }

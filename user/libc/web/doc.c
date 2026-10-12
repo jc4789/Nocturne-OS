@@ -1116,14 +1116,10 @@ void doc_font_loaded(web_doc *d,struct web_font_resource *f,const void *bytes,si
     f->face=bytes && length?font_open_memory(bytes,length):NULL;
     f->loading=false;f->done=true;f->failed=!f->face;
     d->dirty=true;
-    if(f->face) {
-        d->need_style=true;d->layout_valid=false;d->paint_dirty=true;
-        invalidate_layout_tree(d->root_box);
-    } else {
-        /* Advance failed src candidates together at the next layout boundary.
-           A failure alone introduces no new metrics or changed glyphs. */
-        d->font_selection_dirty=true;
-    }
+    /* Re-select once at the next layout boundary. Only actual users whose
+       selected face changes need a cascade/reshape; unrelated boxes retain
+       their valid layout. Failures merely advance to the next source. */
+    d->font_selection_dirty=true;
 }
 
 void web_free(web_doc *d) {

@@ -58,6 +58,34 @@ BRFLAGS  := $(filter-out -W% -MMD -MP,$(UCFLAGS)) -w -Ithird_party/bearssl/inc -
 UCFLAGS  += -Ithird_party/bearssl/inc -Ithird_party/img
 UCFLAGS  += -Ithird_party/quickjs
 UCFLAGS  += -Ithird_party/lexbor/source -Iports/lexbor/include
+UCFLAGS  += -Ithird_party/freetype/include
+
+# Memory-only WOFF/WOFF2/OpenType decoder. Upstream filesystem ports, CLI,
+# encoders and unrelated font drivers are deliberately not linked.
+FT_C := $(addprefix third_party/freetype/src/,base/ftbase.c base/ftinit.c base/ftdebug.c base/ftmm.c base/ftbitmap.c \
+        truetype/truetype.c cff/cff.c psaux/psaux.c psnames/psnames.c \
+        pshinter/pshinter.c sfnt/sfnt.c smooth/smooth.c gzip/ftgzip.c)
+BROTLI_C := $(wildcard third_party/brotli/c/common/*.c third_party/brotli/c/dec/*.c)
+FT_OBJ := $(patsubst %.c,$(BUILD)/font/%.o,$(FT_C) $(BROTLI_C))
+FTFLAGS := $(filter-out -W%,$(UCFLAGS)) -w -Iports/freetype -Ithird_party/brotli/c/include \
+           -DFT2_BUILD_LIBRARY -DFT_CONFIG_OPTIONS_H='"nocturne-ftoption.h"' \
+           -DFT_CONFIG_MODULES_H='"nocturne-ftmodule.h"' -DBROTLI_BUILD_PORTABLE
+$(BUILD)/font/%.o: %.c ports/freetype/nocturne-ftoption.h ports/freetype/nocturne-ftmodule.h
+	@mkdir -p $(dir $@)
+	@echo "  FONT $<"
+	@$(CC) $(FTFLAGS) -c $< -o $@
+$(BUILD)/u/user/libc/third_party_ttf.o: UCFLAGS += $(filter -Iports/freetype -DFT%,$(FTFLAGS))
+.PHONY: font-decoders
+font-decoders: $(FT_OBJ) $(BUILD)/u/user/libc/font.o $(BUILD)/u/user/libc/third_party_ttf.o
+FONT_VENDOR_INPUTS := $(wildcard third_party/freetype/src/*/*.c third_party/freetype/src/*/*.h \
+    third_party/freetype/src/*/*/*.c third_party/freetype/src/*/*/*.h \
+    third_party/freetype/include/freetype/*.h third_party/freetype/include/freetype/*/*.h \
+    third_party/brotli/c/common/*.h third_party/brotli/c/dec/*.h third_party/brotli/c/include/brotli/*.h)
+$(BUILD)/font-container-native.exe: tests/font_container_native.c tests/font_container_native_host.h user/libc/font.c user/libc/font_sfnt.h user/libc/third_party_ttf.c third_party/img/stb_truetype.h $(FT_C) $(BROTLI_C) $(FONT_VENDOR_INPUTS) ports/freetype/nocturne-ftoption.h ports/freetype/nocturne-ftmodule.h
+	@$(CC) -O2 -std=gnu11 -w -D_SSIZE_T_DEFINED=1 -idirafter user/include -Icommon -Ithird_party/img -Ithird_party/freetype/include \
+	    -Iports/freetype -Ithird_party/brotli/c/include -DFT2_BUILD_LIBRARY -include tests/font_container_native_host.h \
+	    -DFT_CONFIG_OPTIONS_H='"nocturne-ftoption.h"' -DFT_CONFIG_MODULES_H='"nocturne-ftmodule.h"' \
+	    -DBROTLI_BUILD_PORTABLE tests/font_container_native.c user/libc/font.c user/libc/third_party_ttf.c $(FT_C) $(BROTLI_C) -o $@
 
 # Lexbor's parsing/DOM modules use only native libc. Do not build upstream
 # POSIX/Windows filesystem or performance ports, CLI, or unfinished layout.
@@ -165,7 +193,7 @@ $(BUILD)/u/%.asm.o: %.asm
 	@$(NASM) -f elf64 -g $< -o $@
 
 # no archiver in the toolchain: lld's --start-lib gives archive semantics to plain objects
-LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ)
+LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(FT_OBJ)
 LIBC_RSP := $(BUILD)/libc-objects.list
 
 # Windowsのコマンド長上限を超えないよう、lldとsysrootに同じobject一覧を渡す。

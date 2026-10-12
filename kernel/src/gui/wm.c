@@ -2156,14 +2156,8 @@ static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
         vfree(w->user_buf, w->pages);
         kfree(w); kfree(v); return -ENOMEM;
     }
-    int fd = -EMFILE;
     uint64_t irq = irq_save();
-    for (int i = 0; i < MAX_FDS; i++)
-        if (!task_process()->fds[i]) {
-            task_process()->fds[i] = f;
-            fd = i;
-            break;
-        }
+    int fd=task_fd_alloc(task_process(),f);
     irq_restore(irq);
     if (fd < 0) {
         vfs_close(f); /* destroys the window and frees everything */
@@ -2327,7 +2321,7 @@ int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint
         num == SYS_WIN_SET_TITLE || num == SYS_WIN_MOVE || num == SYS_WIN_RESIZE) {
         uint64_t flags = irq_save();
         int fd = (int)a;
-        if (fd >= 0 && fd < MAX_FDS && task_process()->fds[fd])
+        if (fd >= 0 && (size_t)fd < task_process()->fd_capacity && task_process()->fds[fd])
             file = vfs_dup(task_process()->fds[fd]);
         irq_restore(flags);
     }

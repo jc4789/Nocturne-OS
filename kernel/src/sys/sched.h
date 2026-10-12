@@ -5,7 +5,7 @@
 struct regs;
 struct file;
 
-#define MAX_FDS 32
+#define MAX_FDS 32 /* initial inline capacity, never a descriptor limit */
 #define KSTACK_PAGES 8
 
 enum task_state { TASK_READY, TASK_RUNNING, TASK_BLOCKED, TASK_ZOMBIE };
@@ -37,7 +37,9 @@ struct task {
     uint64_t ksp;
     uint8_t *kstack;
     uint64_t pml4;
-    struct file *fds[MAX_FDS];
+    struct file *initial_fds[MAX_FDS];
+    struct file **fds;
+    size_t fd_capacity,fd_hint;
     char cwd[256];
     struct task *parent;
     int exit_code;
@@ -92,6 +94,12 @@ struct task *task_find(int pid);
 int task_kill(int pid);
 int task_wait(int pid, int *status, bool nohang);
 void task_printf_stderr(struct task *t, const char *fmt, ...);
+/* Descriptor representation helpers; caller holds a BSP IRQ guard. File
+ * references transfer only on successful installation. Explicit indices may
+ * grow to the int ABI's representable boundary, subject to real allocation. */
+int task_fd_reserve(struct task *owner,size_t minimum);
+int task_fd_find(struct task *owner);
+int task_fd_alloc(struct task *owner,struct file *file);
 
 /* wait queues; call with interrupts disabled for race-free condition checks */
 void wq_wait(struct wait_queue *wq);
@@ -101,4 +109,5 @@ void sleep_ms(uint64_t ms);
 
 /* a global "something changed" queue used by poll() */
 extern struct wait_queue poll_wq;
-static inline void poll_notify(void) { wq_wake_all(&poll_wq); }
+extern uint64_t poll_generation;
+static inline void poll_notify(void) { poll_generation++;wq_wake_all(&poll_wq); }

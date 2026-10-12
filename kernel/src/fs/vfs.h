@@ -1,9 +1,8 @@
 #pragma once
 #include "kernel.h"
 #include "sys/sched.h"
-#include "sys/sched.h"
 
-enum { VT_FILE = 1, VT_DIR = 2, VT_CHAR = 3, VT_PIPE = 4, VT_WINDOW = 5 };
+enum { VT_FILE = 1, VT_DIR = 2, VT_CHAR = 3, VT_PIPE = 4, VT_WINDOW = 5, VT_CHANNEL = 6 };
 
 #define O_RDONLY    0x0
 #define O_WRONLY    0x1
@@ -45,6 +44,7 @@ struct vnode_ops {
     int (*truncate)(struct vnode *v, uint64_t size);
     bool (*can_read)(struct vnode *v, struct file *f);
     bool (*can_write)(struct vnode *v, struct file *f);
+    bool (*hangup)(struct vnode *v, struct file *f);
     void (*open)(struct vnode *v, struct file *f);
     void (*close)(struct vnode *v, struct file *f);
     void (*release)(struct vnode *v); /* last reference dropped after unlink */
@@ -119,6 +119,9 @@ void console_input_str(const char *s);
 
 /* pipes */
 int pipe_create(struct file **rd, struct file **wr);
+int channel_listen(const char *key,size_t length,struct file **listener);
+int channel_connect(const char *key,size_t length,struct file **client);
+int channel_accept(struct file *listener,struct file **server);
 
 /* initrd */
 void initrd_load(void *data, uint64_t size);

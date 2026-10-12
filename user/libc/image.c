@@ -102,9 +102,153 @@ image_t *image_decode_svg(const char *svg, size_t n, int w, int h) {
 
 bool image_is_svg(const void *data, size_t n) { return data && looks_like_svg(data, n); }
 
+static uint16_t image_le16(const uint8_t *p) { return p[0] | (uint16_t)p[1] << 8; }
+static uint32_t image_le32(const uint8_t *p) {
+    return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* ICO embeds either a complete PNG or an uncompressed DIB whose height
+ * includes the monochrome transparency mask. It is not a standalone BMP. */
+static image_t *decode_icon_dib(const uint8_t *d, size_t n, int w, int h) {
+    if (n < 12) return NULL;
+    uint32_t header = image_le32(d), compression = 0, palette_count = 0;
+    uint32_t masks[3] = {0, 0, 0};
+    unsigned bits, palette_stride;
+    bool top_down = false;
+    size_t offset;
+    if (header == 12) {
+        if (image_le16(d + 4) != w || image_le16(d + 6) != h * 2 || image_le16(d + 8) != 1) return NULL;
+        bits = image_le16(d + 10); palette_stride = 3; offset = 12;
+    } else {
+        if (header < 40 || header > n) return NULL;
+        int32_t dw = (int32_t)image_le32(d + 4), dh = (int32_t)image_le32(d + 8);
+        if (dw != w || (dh != h * 2 && dh != -h * 2) || image_le16(d + 12) != 1) return NULL;
+        top_down = dh < 0;
+        bits = image_le16(d + 14); compression = image_le32(d + 16);
+        palette_count = image_le32(d + 32); palette_stride = 4; offset = header;
+        if (compression == 3 && (bits == 16 || bits == 32)) {
+            if (header == 40) {
+                if (n - offset < 12) return NULL;
+                for (int i = 0; i < 3; i++) masks[i] = image_le32(d + offset + i * 4);
+                offset += 12;
+            } else {
+                if (header < 52) return NULL;
+                for (int i = 0; i < 3; i++) masks[i] = image_le32(d + 40 + i * 4);
+            }
+        } else if (compression != 0) return NULL;
+    }
+    if (bits != 1 && bits != 4 && bits != 8 && bits != 16 && bits != 24 && bits != 32) return NULL;
+    if (bits <= 8) {
+        if (!palette_count) palette_count = 1u << bits;
+        if (palette_count > (1u << bits) || palette_count > (n - offset) / palette_stride) return NULL;
+    } else palette_count = 0;
+    const uint8_t *palette = d + offset;
+    offset += (size_t)palette_count * palette_stride;
+    size_t stride = ((size_t)w * bits + 31) / 32 * 4;
+    size_t mask_stride = ((size_t)w + 31) / 32 * 4;
+    if ((size_t)h > (n - offset) / stride) return NULL;
+    const uint8_t *pixels = d + offset;
+    offset += stride * h;
+    bool has_mask = (size_t)h <= (n - offset) / mask_stride;
+    if (!has_mask && bits != 32) return NULL;
+    if (bits == 16 && !compression) { masks[0] = 0x7c00; masks[1] = 0x3e0; masks[2] = 0x1f; }
+    unsigned shifts[3] = {0, 0, 0};
+    uint32_t maxima[3] = {0, 0, 0};
+    if (bits == 16 || compression == 3) {
+        for (int i = 0; i < 3; i++) {
+            uint32_t mask = masks[i];
+            if (!mask || (bits == 16 && mask > 0xffff)) return NULL;
+            while (!(mask & 1)) { shifts[i]++; mask >>= 1; }
+            if ((mask & (mask + 1)) || (masks[i] & masks[(i + 1) % 3])) return NULL;
+            maxima[i] = mask;
+        }
+    }
+    image_t *img = image_new(w, h);
+    if (!img) return NULL;
+    bool has_alpha = false;
+    for (int y = 0; y < h; y++) {
+        const uint8_t *row = pixels + (size_t)(top_down ? y : h - 1 - y) * stride;
+        for (int x = 0; x < w; x++) {
+            uint32_t p;
+            if (bits <= 8) {
+                unsigned index = bits == 8 ? row[x] : bits == 4 ? (row[x / 2] >> (x % 2 ? 0 : 4)) & 15 : (row[x / 8] >> (7 - x % 8)) & 1;
+                if (index >= palette_count) { image_free(img); return NULL; }
+                const uint8_t *entry = palette + index * palette_stride;
+                p = 0xff000000u | (uint32_t)entry[2] << 16 | (uint32_t)entry[1] << 8 | entry[0];
+            } else if (bits == 16 || compression == 3) {
+                uint32_t v = bits == 16 ? image_le16(row + x * 2) : image_le32(row + x * 4);
+                p = 0xff000000u;
+                for (int i = 0; i < 3; i++) {
+                    uint32_t component = (v & masks[i]) >> shifts[i];
+                    p |= (uint32_t)(((uint64_t)component * 255 + maxima[i] / 2) / maxima[i]) << (16 - i * 8);
+                }
+            } else {
+                const uint8_t *v = row + x * (bits / 8);
+                uint32_t a = bits == 32 ? v[3] : 255;
+                has_alpha |= bits == 32 && a != 0;
+                p = a << 24 | (uint32_t)v[2] << 16 | (uint32_t)v[1] << 8 | v[0];
+            }
+            img->px[(size_t)y * w + x] = p;
+        }
+    }
+    /* Legacy 32-bit icons often leave every alpha byte zero. In that case,
+     * use the AND bitmap just as for palette/24-bit icons; real alpha wins. */
+    if (!has_alpha || bits != 32 || compression == 3) {
+        if (!has_mask) { image_free(img); return NULL; }
+        for (int y = 0; y < h; y++) {
+            const uint8_t *mask = d + offset + (size_t)(top_down ? y : h - 1 - y) * mask_stride;
+            for (int x = 0; x < w; x++) {
+                uint32_t *p = img->px + (size_t)y * w + x;
+                *p = mask[x / 8] & (0x80 >> (x % 8)) ? 0 : *p | 0xff000000u;
+            }
+        }
+    }
+    return img;
+}
+
+static image_t *decode_icon(const uint8_t *d, size_t n) {
+    unsigned count = image_le16(d + 4);
+    if (!count || count > (n - 6) / 16) return NULL;
+    size_t directory_end = 6 + (size_t)count * 16;
+    unsigned first = 0, first_score = 0;
+    /* Prefer the best representation before decoding: usual ICO directories
+     * list small images first. Do not decompress all of them just to discard
+     * each previous image. A broken preferred entry still allows fallback. */
+    for (unsigned i = 0; i < count; i++) {
+        const uint8_t *entry = d + 6 + (size_t)i * 16;
+        unsigned w = entry[0] ? entry[0] : 256, h = entry[1] ? entry[1] : 256;
+        unsigned depth = image_le16(entry + 6);
+        unsigned score = w * h * 33 + (depth > 32 ? 32 : depth);
+        size_t size = image_le32(entry + 8), offset = image_le32(entry + 12);
+        if (offset < directory_end || offset > n || size > n - offset || size < 12) continue;
+        if (score > first_score) { first = i; first_score = score; }
+    }
+    if (!first_score) return NULL;
+    image_t *best = NULL;
+    unsigned best_score = 0;
+    for (unsigned pass = 0; pass <= count; pass++) {
+        unsigned i = pass ? pass - 1 : first;
+        if (pass && i == first) continue;
+        const uint8_t *entry = d + 6 + (size_t)i * 16;
+        int w = entry[0] ? entry[0] : 256, h = entry[1] ? entry[1] : 256;
+        unsigned depth = image_le16(entry + 6);
+        unsigned score = (unsigned)w * h * 33 + (depth > 32 ? 32 : depth);
+        size_t size = image_le32(entry + 8), offset = image_le32(entry + 12);
+        if (score <= best_score || offset < directory_end || offset > n || size > n - offset || size < 12) continue;
+        image_t *img = NULL;
+        if (!memcmp(d + offset, "\x89PNG\r\n\x1a\n", 8)) img = image_decode(d + offset, size);
+        else img = decode_icon_dib(d + offset, size, w, h);
+        if (!img) continue;
+        if (img->w != w || img->h != h) { image_free(img); continue; }
+        image_free(best); best = img; best_score = score;
+    }
+    return best;
+}
+
 image_t *image_decode(const void *data, size_t n) {
     const uint8_t *d = data;
     if (!data || n < 8 || n > 0x7FFFFFFF) return NULL;
+    if (!memcmp(d, "\0\0\1\0", 4)) return decode_icon(d, n);
     if (n >= 12 && !memcmp(d, "RIFF", 4) && !memcmp(d + 8, "WEBP", 4)) {
         jebp_image_t ji;
         if (jebp_decode_size(&ji, n, data) != JEBP_OK || (long)ji.width * ji.height > IMAGE_MAX_PIXELS) return NULL;

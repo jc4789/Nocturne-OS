@@ -1,4 +1,4 @@
-/* Image decoding (libc/image.c): PNG, JPEG, GIF (first frame) and BMP through stb_image, WebP
+/* Image decoding (libc/image.c): ICO (PNG/DIB), PNG, JPEG, GIF (first frame) and BMP through stb_image, WebP
    through jebp and SVG through nanosvg. Pixels are 0xAARRGGBB with straight (not premultiplied)
    alpha. */
 #pragma once

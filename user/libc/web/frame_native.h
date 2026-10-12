@@ -139,48 +139,19 @@ void web_js_frames_sync(web_doc *d) {
         frame_cancel(s,f);f->detached=true;f->window_token=NULL;web_frame_retire(f);
     }
 }
-static bool frame_response_allowed(struct web_js_state *s,const struct web_response *r,const char *url) {
-    const char *headers=web_response_headers(r);
-    for(const char *p=headers;*p;) {
-        const char *end=strchr(p,'\n');if(!end)end=p+strlen(p);
-        const char *colon=memchr(p,':',(size_t)(end-p));
-        if(colon && (size_t)(colon-p)==15 && !strncasecmp(p,"X-Frame-Options",15)){
-            const char *v=colon+1;while(v<end && is_space(*v))v++;
-            if((size_t)(end-v)>=4 && !strncasecmp(v,"DENY",4))return false;
-            if((size_t)(end-v)>=10 && !strncasecmp(v,"SAMEORIGIN",10)){
-                web_doc *probe=calloc(1,sizeof *probe);if(!probe)return false;probe->url=(char *)url;
-                bool same=true;
-                for(web_doc *ancestor=s->doc;ancestor;ancestor=ancestor->frame_parent)
-                    if(!web_frame_same_origin(ancestor,probe)){same=false;break;}
-                free(probe);if(!same)return false;
-            }else return false;
-        }
-        if(colon && (size_t)(colon-p)==23 && !strncasecmp(p,"Content-Security-Policy",23)){
-            for(const char *q=colon+1;q<end;) {
-                while(q<end && (is_space(*q) || *q==';' || *q==','))q++;
-                const char *word=q;while(q<end && !is_space(*q) && *q!=';' && *q!=',')q++;
-                if(q-word==7 && !strncasecmp(word,"sandbox",7))return false; /* CSP union is not implemented; fail closed */
-                while(q<end && *q!=';' && *q!=',')q++;
-            }
-            for(const char *q=colon+1;q+15<=end;q++)if(!strncasecmp(q,"frame-ancestors",15))return false;
-        }
-        p=*end?end+1:end;
-    }
-    return true;
-}
 static void frame_response(struct web_js_state *s,struct js_pending *p,bool ok) {
     struct web_frame *f=p->frame;
     if(!f || f->request!=p->id || !connected(s,f->element) || f->element->owner!=s->doc)return;
     f->request=0;
     const char *url=web_response_url(&p->response)[0]?web_response_url(&p->response):p->url;
-    if(ok && permitted_url(s,url,false) && frame_response_allowed(s,&p->response,url) &&
+    if(ok && permitted_url(s,url,false) &&
        web_sandbox_document_allowed(f,url,false)) {
         char charset[64]={0},content_type[256]={0};
         struct http_resp response_headers={.headers_full=(char *)web_response_headers(&p->response)};
         http_header(&response_headers,"Content-Type",content_type,sizeof content_type);
         html_transport_label(content_type,charset,sizeof charset);
         if(web_frame_commit_response(f,p->response.body,p->response.body_len,url,charset,web_response_headers(&p->response),&s->host,false))return;
-        log_text(s,2,"Frame document allocation failed");
+        log_text(s,1,"Frame document commit failed: embedding/sandbox policy or allocation failure");
     }else log_text(s,1,"Frame document navigation failed or was blocked by its embedding policy");
     f->failed=true;f->notified=true;script_event(s,f->element,true);
 }
@@ -410,6 +381,17 @@ static JSValue frame_message_send(JSContext *ctx,struct web_js_state *s,struct w
     JS_FreeValue(ctx,sender_origin);return result;
 }
 
+static bool frame_navigation_authorized(struct web_js_state *caller,web_doc *target) {
+    if(!task_context_active(caller) || !target || !task_context_active(target->js))return false;
+    bool activated=caller->doc->sandbox_activation_until>uptime_ms();
+    if(!web_sandbox_navigation_allowed(caller->doc,target,activated))return false;
+    if(web_frame_same_origin(caller->doc,target) || caller->doc==target->frame_parent)return true;
+    /* Cross-origin ancestor escape is confined to the top-level target and
+       native trusted activation. An unrelated/sibling Window never qualifies. */
+    if(target->frame_element || !activated)return false;
+    for(web_doc *p=caller->doc->frame_parent;p;p=p->frame_parent)if(p==target)return true;
+    return false;
+}
 static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
     struct web_js_state *caller=sandbox_actor(s);
@@ -477,20 +459,27 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
         if(!strcmp(op,"length"))result=JS_NewUint32(ctx,count);
     }else if(!strcmp(op,"frameElement"))result=target && target->frame_parent && web_frame_same_origin(caller->doc,target->frame_parent)?wrap(s,target->frame_element):JS_NULL;
     else if(!strcmp(op,"navigate")) {
-        if(!target){result=history_security_error(ctx,"Inactive navigation target");goto out;}
-        bool activated=caller->doc->sandbox_activation_until>uptime_ms();
-        if(!web_sandbox_navigation_allowed(caller->doc,target,activated)){result=history_security_error(ctx,"Sandbox denied Window navigation destination");goto out;}
-        if(!target->frame_element){result=JS_ThrowTypeError(ctx,"Top-level proxy navigation is not implemented");goto out;}
-        if(!web_frame_same_origin(caller->doc,target) && caller->doc!=target->frame_parent){result=frame_security_error(ctx);goto out;}
+        if(!task_context_active(s) || !frame_navigation_authorized(caller,target)){
+            result=history_security_error(ctx,"Inactive or unauthorized Window navigation destination");goto out;
+        }
         const char *value=argc>2?JS_ToCString(ctx,argv[2]):NULL;
-        struct web_frame *f=web_frame_find(target->frame_parent,target->frame_element);
+        int32_t mode=0;
+        if(argc>3 && JS_ToInt32(ctx,&mode,argv[3])){JS_FreeCString(ctx,value);result=JS_EXCEPTION;goto out;}
         if(!value)result=JS_EXCEPTION;
         else {
             char *url=js_resolve_owned(ctx,caller->doc->base,value);
             if(!url)result=JS_EXCEPTION;
             else if(!permitted_url(caller,url,false))result=JS_ThrowTypeError(ctx,"Child navigation URL is not permitted");
-            else if(!task_context_active(caller) || frame_window_document(token)!=target || !web_sandbox_navigation_allowed(caller->doc,target,caller->doc->sandbox_activation_until>uptime_ms()))result=history_security_error(ctx,"Navigation target or authority retired during conversion");
-            else if(!web_frame_set_navigation(f,url,caller->doc))result=oom(ctx);
+            else if(!task_context_active(s) || frame_window_document(token)!=target || !frame_navigation_authorized(caller,target))
+                result=history_security_error(ctx,"Navigation target or authority retired during conversion");
+            else if(target->frame_element) {
+                struct web_frame *f=web_frame_find(target->frame_parent,target->frame_element);
+                if(!f || f->document!=target || f->detached)result=history_security_error(ctx,"Child navigation target has no active frame metadata");
+                else if(!web_frame_set_navigation(f,url,caller->doc))result=oom(ctx);
+            }
+            else if(target->js->host.navigate_mode)target->js->host.navigate_mode(target->js->host.opaque,url,mode==2?2:0);
+            else if(target->js->host.navigate)target->js->host.navigate(target->js->host.opaque,url,NULL);
+            else result=JS_ThrowTypeError(ctx,"Top-level navigation requires a native window host");
             js_free(ctx,url);
         }
         JS_FreeCString(ctx,value);

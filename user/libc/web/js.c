@@ -4247,7 +4247,7 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
     if (!argc || JS_ToInt32(ctx,&op,argv[0])) return JS_EXCEPTION;
     if((sandbox_authority(s)&SB_SCRIPTS) || sandbox_borrowed(s))return history_security_error(ctx,"Sandbox denied Worker authority");
     if(s->disabled)return op==2?JS_UNDEFINED:JS_ThrowTypeError(ctx,"Worker belongs to an inactive browsing context");
-    if (op == 0) {
+    if (op == 0 || op == 5) {
         struct node *generation = s->doc->root;
         const char *url = argc > 2 ? JS_ToCString(ctx,argv[2]) : NULL;
         if (!url) return JS_EXCEPTION;
@@ -4263,7 +4263,7 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
         if (!allowed) return JS_ThrowTypeError(ctx,"SecurityError: Worker source must be same-origin");
     }
     if (!s->workers) {
-        if (op != 0) return JS_UNDEFINED;
+        if (op != 0 && op != 5) return JS_UNDEFINED;
         static uint32_t generation;
         if (!++generation) ++generation;
         s->workers = web_worker_new(ctx,generation,worker_load,s);
@@ -4274,7 +4274,13 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
         if (JS_IsException(fn)) return fn;
         web_worker_set_callback(s->workers,fn); JS_FreeValue(ctx,fn);
     }
-    if(op==0){
+    if(op==0 || op==5){
+        char *origin=NULL;
+        enum http_url_result parsed=make_origin(web_effective_url(s->doc),&origin);
+        if(parsed==HTTP_URL_OOM)return oom(ctx);
+        if(op==5 && parsed!=HTTP_URL_TUPLE){free(origin);return history_security_error(ctx,"SharedWorker requires a non-opaque document origin");}
+        bool origin_ok=web_worker_set_origin(s->workers,origin?origin:"");free(origin);
+        if(!origin_ok)return oom(ctx);
         char *policy=html_policy_snapshot(s->doc);
         if(!policy)return oom(ctx);
         const char *address=argc>2?JS_ToCString(ctx,argv[2]):NULL;
@@ -4297,12 +4303,12 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
         if(!task_context_active(s))return JS_ThrowTypeError(ctx,"Worker capture context is inactive");
         return web_worker_capture(s->workers,id,port,creator);
     }
-    if(op==3||op==6||op==7){
+    if(op==3||op==6||op==7||op==10){
         if(argc<4||!task_context_active(s))return JS_ThrowTypeError(ctx,"Worker transfer context is inactive");
         uint32_t id=0,port=0,creator=0;if(JS_ToUint32(ctx,&id,argv[1])<0)return JS_EXCEPTION;
-        if(op!=3&&(argc<6||JS_ToUint32(ctx,&port,argv[4])<0||JS_ToUint32(ctx,&creator,argv[5])<0))return JS_EXCEPTION;
+        if(op!=3&&op!=10&&(argc<6||JS_ToUint32(ctx,&port,argv[4])<0||JS_ToUint32(ctx,&creator,argv[5])<0))return JS_EXCEPTION;
         uint32_t capture=0;if(argc>6&&JS_ToUint32(ctx,&capture,argv[6])<0)return JS_EXCEPTION;
-        web_worker_publication *publication=web_worker_prepare_captured(s->workers,id,op==3?NJW_MESSAGE:op==6?NJW_PORT_MESSAGE:NJW_PORT_CLOSE,port,op==3?NJW_WITH_PORTS:creator,argv[2],capture);
+        web_worker_publication *publication=web_worker_prepare_captured(s->workers,id,op==3?NJW_MESSAGE:op==10?NJW_CONNECT:op==6?NJW_PORT_MESSAGE:NJW_PORT_CLOSE,port,(op==3||op==10)?NJW_WITH_PORTS:creator,argv[2],capture);
         if(!publication)return JS_EXCEPTION;
         JSValue result=frame_transfer_commit(ctx,s,argv[3]);
         if(JS_IsException(result)){web_worker_abort(publication);return result;}
@@ -5374,7 +5380,7 @@ static bool process_pending(struct web_js_state *s) {
         } else if (p->kind == P_CSS) doc_css_loaded(s->doc, p->url, web_response_url(&p->response)[0] ? web_response_url(&p->response) : p->url, ok ? p->response.body : NULL, ok ? p->response.body_len : 0);
         else if(p->kind==P_FONT) {
             doc_font_loaded(s->doc,p->font,ok?p->response.body:NULL,ok?p->response.body_len:0);
-            if(ok && p->font && p->font->failed)diagnostic_resource(s,p,"Font decode failed: malformed/unsupported SFNT or allocation failure; native CFF/WOFF/WOFF2 decoding is unavailable");
+            if(ok && p->font && p->font->failed)diagnostic_resource(s,p,"Font decode failed: malformed or unsupported outline container, or native allocation failure");
         }
         else if (p->kind == P_IMAGE) {
             web_image_loaded(s->doc, p->image, ok ? p->response.body : NULL, ok ? p->response.body_len : 0);

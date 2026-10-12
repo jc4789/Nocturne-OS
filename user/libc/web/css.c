@@ -1514,13 +1514,40 @@ static struct css_rule_info *cssom_record(struct pctx *pc, uint32_t type, const 
     pc->sh->cssom_last = info; pc->sh->cssom_count++; return info;
 }
 
+static bool font_source_hints(struct pctx *pc,const char *s,const char *e) {
+    bool format_seen=false;
+    while((s=skip_ws(s,e))<e) {
+        const char *name=read_ident(pc->a,&s,e,true);
+        if(!name || s==e || *s!='(')return false;
+        const char *value=skip_ws(s+1,e),*end=scan_to(value,e,")");
+        if(end==e)return false;
+        /* Unsupported technology must skip this item before any download;
+           accepting a font container does not implement shaping/variations. */
+        if(strcmp(name,"format") || format_seen)return false;
+        format_seen=true;
+        const char *finish=end;trim_r(value,&finish);
+        const char *format=NULL;
+        if(finish-value>=2 && (*value=='"' || *value=='\'') && finish[-1]==*value) {
+            sbuf b={0};css_unescape(&b,value+1,(size_t)(finish-value-2));
+            format=ar_strndup(pc->a,b.p?b.p:"",b.n);sb_free(&b);
+        }else {
+            const char *cursor=value;format=read_ident(pc->a,&cursor,finish,true);
+            if(!format || skip_ws(cursor,finish)!=finish)return false;
+        }
+        if(strcmp(format,"truetype") && strcmp(format,"opentype") &&
+           strcmp(format,"woff") && strcmp(format,"woff2") &&
+           strcmp(format,"embedded-opentype"))return false;
+        s=end+1;
+    }
+    return true;
+}
 static struct font_source *font_sources(struct pctx *pc,const char *s,const char *e) {
     struct font_source *first=NULL,**tail=&first;
     while(s<e) {
         const char *end=scan_to(s,e,",");s=skip_ws(s,end);
         if(end-s>=4 && strn_ieq(s,"url(",4)) {
             const char *a=skip_ws(s+4,end),*z=scan_to(a,end,")");
-            if(z<end) {
+            if(z<end && font_source_hints(pc,z+1,end)) {
                 const char *finish=z;trim_r(a,&finish);
                 if(finish-a>=2 && (*a=='"' || *a=='\'') && finish[-1]==*a){a++;finish--;}
                 sbuf decoded={0};css_unescape(&decoded,a,(size_t)(finish-a));
@@ -1534,8 +1561,8 @@ static struct font_source *font_sources(struct pctx *pc,const char *s,const char
                 free(absolute);sb_free(&decoded);
             }
         }
-        /* local() is not falsely resolved to a class-substitute font. Unknown
-           binary formats are decoded only by the actual native resource gate. */
+        /* local() is not falsely resolved to a class-substitute font. With no
+           format hint, the byte-bounded native decoder is authoritative. */
         s=end<e?end+1:e;
     }
     return first;

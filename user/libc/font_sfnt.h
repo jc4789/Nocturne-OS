@@ -8,6 +8,7 @@ struct sf_span { const unsigned char *p; size_t n; };
 static uint16_t sf_u16(const unsigned char *p) { return (uint16_t)((p[0]<<8)|p[1]); }
 static int16_t sf_i16(const unsigned char *p) { return (int16_t)sf_u16(p); }
 static uint32_t sf_u32(const unsigned char *p) { return (uint32_t)p[0]<<24|(uint32_t)p[1]<<16|(uint32_t)p[2]<<8|p[3]; }
+static uint32_t sf_le32(const unsigned char *p) { return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24; }
 static bool sf_has(struct sf_span s,size_t at,size_t n) { return at<=s.n && n<=s.n-at; }
 static bool sf_table(struct sf_span file,const char *tag,struct sf_span *out) {
     unsigned count=sf_u16(file.p+4); bool found=false;

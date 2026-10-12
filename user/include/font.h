@@ -13,8 +13,9 @@ enum { FONT_REGULAR = 0, FONT_BOLD = 1, FONT_ITALIC = 2, FONT_BOLD_ITALIC = 3 };
 enum { FONT_FAMILY_SANS = 0, FONT_FAMILY_SERIF = 1, FONT_FAMILY_MONO = 2 };
 
 font_t *font_open(const char *path); /* NULL if the file is missing or not a TrueType font */
-/* Copies a byte-bounded, validated SFNT TrueType face. CFF/WOFF/WOFF2 and
-   malformed outlines fail, not an empty successful face. Caller owns it. */
+/* Copies a byte-bounded SFNT/WOFF/WOFF2 outline face, including OpenType CFF.
+   Non-MicroType EOT wrappers are decoded too. Malformed or unsupported data
+   fails rather than returning an empty successful face. Caller owns it. */
 font_t *font_open_memory(const void *data, size_t length);
 void font_close(font_t *font); /* only caller-owned faces, never bundled caches */
 font_t *font_ui(int style);          /* Maple Mono; loaded once. NULL if the files are missing */

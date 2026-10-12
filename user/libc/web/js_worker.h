@@ -24,6 +24,8 @@ web_workers *web_worker_new(JSContext *,uint32_t,web_worker_loader,void *);
 /* Private native creator policy snapshot, copied when each child is created.
  * Local-script workers inherit it; HTTP workers use their response policy. */
 bool web_worker_set_policy(web_workers *,const char *);
+/* Native document authority, never supplied by the author's constructor. */
+bool web_worker_set_origin(web_workers *,const char *);
 typedef void (*web_worker_reporter)(void *,JSValueConst);
 void web_worker_set_reporter(web_workers *,web_worker_reporter,void *);
 void web_worker_set_canceler(web_workers *,web_worker_canceler);

@@ -1,6 +1,7 @@
 /* Trusted Types CSP directives are native document policy, not JS properties.
    Each header field/list policy is retained separately for intersection. */
 #include "html_policy.h"
+#include "frame.h"
 #include <stdio.h>
 bool html_policy_requires_script(const web_doc *d) {
     for(const struct web_html_policy_rule *r=d && d->html_policy?d->html_policy->first:NULL;r;r=r->next)
@@ -33,6 +34,133 @@ static bool token(const char *begin,const char *end,const char *name) {
     return (size_t)(end-begin)==strlen(name) && !memcmp(begin,name,end-begin);
 }
 static char *copy_text(const char *begin,const char *end){size_t n=end-begin;char *s=malloc(n+1);if(s){memcpy(s,begin,n);s[n]=0;}return s;}
+/* frame-ancestors matches the serialized ancestor origin, not its document
+ * path. The native URL parser supplies canonical hosts and effective ports. */
+static bool ancestor_source(const char *p,const char *end,const struct url_owned *ancestor,const struct url_owned *self) {
+    if(named(p,end,"'self'"))return !strcasecmp(ancestor->host,self->host) &&
+        (ancestor->port==self->port || (ancestor->port==(ancestor->tls?443:80) && self->port==(self->tls?443:80))) &&
+        (ancestor->tls || !self->tls);
+    if(token(p,end,"*"))return true; /* Both parsed origins are HTTP(S). */
+    if(named(p,end,"http:"))return true;
+    if(named(p,end,"https:"))return ancestor->tls;
+    const char *host=p,*scheme_end=NULL;
+    for(const char *q=p;end-q>=3;q++)if(q[0]==':' && q[1]=='/' && q[2]=='/'){scheme_end=q;host=q+3;break;}
+    bool secure=self->tls;
+    if(scheme_end){
+        if(named(p,scheme_end,"https"))secure=true;
+        else if(named(p,scheme_end,"http"))secure=false;
+        else return false;
+    }
+    if(secure && !ancestor->tls)return false;
+    const char *host_end=host;while(host_end<end && *host_end!=':' && *host_end!='/')host_end++;
+    size_t hn=host_end-host,an=strlen(ancestor->host);
+    if(!hn)return false;
+    bool wildcard=hn>=2 && host[0]=='*' && host[1]=='.';
+    const char *domain=host+(wildcard?2:0);bool numeric=true;
+    for(const char *q=domain;q<host_end;q++){
+        unsigned char c=(unsigned char)*q;
+        if(!((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='-'||c=='.')){
+            if(!(hn==1 && c=='*'))return false;
+        }
+        if((c<'0'||c>'9') && c!='.')numeric=false;
+    }
+    bool ancestor_numeric=true;
+    for(const char *q=ancestor->host;*q;q++)if((*q<'0'||*q>'9') && *q!='.')ancestor_numeric=false;
+    if(numeric || ancestor_numeric)return false; /* CSP host-part requires a domain. */
+    if(!(hn==1 && *host=='*')){
+        if(wildcard){if(an<hn || strncasecmp(ancestor->host+an-(hn-1),host+1,hn-1))return false;}
+        else if(an!=hn || strncasecmp(ancestor->host,host,hn))return false;
+    }
+    const char *path=host_end;
+    if(path<end && *path==':'){
+        const char *port=++path;while(path<end && *path!='/')path++;
+        if(!token(port,path,"*")){
+            unsigned value=0;if(port==path)return false;
+            for(const char *q=port;q<path;q++){
+                if(*q<'0'||*q>'9'||value>(65535u-(unsigned)(*q-'0'))/10)return false;
+                value=value*10+(unsigned)(*q-'0');
+            }
+            if(value!=ancestor->port)return false;
+        }
+    }else if(ancestor->port!=(ancestor->tls?443:80))return false;
+    return path==end || token(path,end,"/");
+}
+static bool ancestor_list(web_doc *parent,const char *p,const char *end,const char *url) {
+    struct url_owned self;
+    if(url_parse_owned_result_n(url,url?strlen(url):0,&self)!=HTTP_URL_TUPLE)return false;
+    bool allowed=true;
+    for(web_doc *d=parent;d;d=d->frame_parent){
+        struct url_owned ancestor;const char *raw=web_effective_url(d);
+        if((d->sandbox_flags&SB_ORIGIN) || url_parse_owned_result_n(raw,strlen(raw),&ancestor)!=HTTP_URL_TUPLE){allowed=false;break;}
+        bool matched=false;
+        for(const char *q=p;q<end;){
+            while(q<end && is_space((unsigned char)*q))q++;
+            const char *start=q;while(q<end && !is_space((unsigned char)*q))q++;
+            if(ancestor_source(start,q,&ancestor,&self)){matched=true;break;}
+        }
+        url_owned_free(&ancestor);if(!matched){allowed=false;break;}
+    }
+    url_owned_free(&self);return allowed;
+}
+bool html_policy_embedding_allowed(web_doc *parent,const char *headers,const char *url,uint32_t *sandbox) {
+    uint32_t restrictions=0;bool has_ancestors=false;
+    bool deny=false,same=false,allowall=false,other=false;
+    for(const char *p=headers?headers:"";*p;){
+        const char *end=p;while(*end && *end!='\r' && *end!='\n')end++;
+        const char *colon=memchr(p,':',end-p);
+        if(colon && named(p,colon,"Content-Security-Policy")){
+            const char *policy=colon+1;
+            while(policy<end){
+                const char *policy_end=policy;while(policy_end<end && *policy_end!=',')policy_end++;
+                bool seen_ancestors=false,seen_sandbox=false;
+                for(const char *q=policy;q<policy_end;){
+                    while(q<policy_end && (is_space((unsigned char)*q)||*q==';'))q++;
+                    const char *name=q;while(q<policy_end && !is_space((unsigned char)*q)&&*q!=';')q++;
+                    const char *name_end=q,*value=q;while(q<policy_end && *q!=';')q++;
+                    if(!seen_ancestors && named(name,name_end,"frame-ancestors")){
+                        seen_ancestors=has_ancestors=true;
+                        if(parent && !ancestor_list(parent,value,q,url))return false;
+                    }
+                    if(!seen_sandbox && named(name,name_end,"sandbox")){
+                        seen_sandbox=true;char *text=copy_text(value,q);if(!text)return false;
+                        restrictions|=sandbox_parse(text,NULL,0);free(text);
+                    }
+                }
+                policy=policy_end<end?policy_end+1:end;
+            }
+        }else if(colon && named(p,colon,"X-Frame-Options")){
+            const char *value=colon+1;
+            for(;;){
+                const char *next=value;while(next<end && *next!=',')next++;
+                const char *start=value,*stop=next;
+                while(start<stop && is_space((unsigned char)*start))start++;
+                while(stop>start && is_space((unsigned char)stop[-1]))stop--;
+                if(named(start,stop,"deny"))deny=true;
+                else if(named(start,stop,"sameorigin"))same=true;
+                else if(named(start,stop,"allowall"))allowall=true;
+                else other=true;
+                if(next==end)break;value=next+1;
+            }
+        }
+        p=end;while(*p=='\r'||*p=='\n')p++;
+    }
+    /* Enforced frame-ancestors takes precedence over XFO. Unknown XFO values
+     * are ignored alone, but conflicting recognized/invalid lists are denied. */
+    if(parent && !has_ancestors){
+        if(deny || (same && (allowall||other)) || (allowall&&other))return false;
+        if(same){
+            char *origin=NULL;if(http_origin_owned(url,&origin)!=HTTP_URL_TUPLE)return false;
+            for(web_doc *d=parent;d;d=d->frame_parent){
+                char *ancestor=NULL;
+                bool match=!(d->sandbox_flags&SB_ORIGIN) && http_origin_owned(web_effective_url(d),&ancestor)==HTTP_URL_TUPLE && !strcmp(origin,ancestor);
+                free(ancestor);if(!match){free(origin);return false;}
+            }
+            free(origin);
+        }
+    }
+    if(sandbox)*sandbox=restrictions;
+    return true;
+}
 static bool policy_name(const char *begin,const char *end){
     if(token(begin,end,"*"))return true;if(begin==end)return false;
     for(const char *p=begin;p<end;p++)if(!((*p>='a'&&*p<='z')||(*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||strchr("-#=_/@.%",*p)))return false;

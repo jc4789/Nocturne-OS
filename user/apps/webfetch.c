@@ -795,6 +795,19 @@ static bool run_http(struct job *j) {
         size_t body_limit = webnet_wire_response_limit(j->wire.kind, j->wire.user_navigation);
         const struct http_stream_hooks hooks = {response_start, stream_upload};
         int result = http_request_stream(&q, &r, body_limit, &hooks);
+        /* A transport reset before any response is not an HTTP rejection.
+           Replay only bodyless idempotent reads, once, within the same native
+           deadline. Never retry published stream data, cookies, POST or 4xx. */
+        if(result<0 && !r.status && !j->body_len && !j->stream_headers_sent &&
+           j->cookie_len==cookie_start && !j->error[0] && !q.body &&
+           (!strcmp(method,"GET") || !strcmp(method,"HEAD")) &&
+           strstr(r.error,"connection reset")) {
+            int retry_left=remaining(j);
+            if(retry_left) {
+                http_resp_free(&r);q.timeout_ms=retry_left;
+                result=http_request_stream(&q,&r,body_limit,&hooks);
+            }
+        }
         if (result < 0) { j->cookie_len=j->stream_headers_sent?0:cookie_start; if (!j->error[0]) fail(j, r.error); http_resp_free(&r); return false; }
         bool redirect = !j->stream_final && (r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308);
         if (redirect) {

@@ -309,8 +309,13 @@ while you read, laying the page out again as they arrive. Redirects, `<meta http
 ブラウザーの制約: QuickJS の JavaScript 実行と、現代のサイトが要求する Web API・描画の対応は別です。
 未実装 API による例外で実サイトの初期化が停止します。単体試験の成功は実サイトの動作保証ではありません。
 Cookie jarは実装されていますが、実サイトへのログイン動作は検証済みではありません。
-Webフォントの取得とOpenTypeの合字処理は未実装で、アイコンフォントは文字名や欠落字形になる場合があります。
-同梱Maple Monoの追加は、このWebフォント対応やJavaScriptの未実装部分を解決するものではありません。
+Webフォントは `@font-face` の取得・順序付きsrcフォールバックと、TrueType／OpenType CFF／WOFF／WOFF2の復号・描画に対応します。
+非圧縮EOTも復号しますが、MicroType圧縮EOTとSVG fontは未対応です。未対応のformat／tech指定は取得前に除外します。
+OpenTypeの完全な合字・複雑文字shapingやvariation軸の選択は別の未対応部分です。同梱UI／カーネルフォントは変更しません。
+検索結果のICO画像は、内部PNGおよびDIBの色深度・透過を処理します。HTTP404を復号成功にはしません。
+classic SharedWorkerは文書・別ブラウザー窓からネイティブ共有taskへ接続し、MessagePortで通信します。
+共有taskはNocturne固有の名前付き双方向channelを使い、最後のclient終了で回収します。module／nested workerは未対応です。
+専用Workerも独立taskを維持し、timer deadlineはheap、WorkerLocationはURL属性を公開します。
 Flexbox and grid cover the common cases, not every corner of the
 specs, and there are no transforms, animations or `position: sticky`.
 

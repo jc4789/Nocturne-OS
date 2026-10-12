@@ -25,7 +25,7 @@
             let location=locationProxies.get(token);if(location)return location;
             location=new Proxy(Object.create(null),{
                 get(_,key){
-                    if(key==='assign'||key==='replace')return value=>access('navigate',token,String(value));
+                    if(key==='assign'||key==='replace')return value=>access('navigate',token,String(value),key==='replace'?2:0);
                     if(key==='href'||key==='toString'){
                         const target=access('get',token,'location');return key==='href'?target.href:()=>String(target);
                     }

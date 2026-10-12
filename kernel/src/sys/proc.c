@@ -131,6 +131,7 @@ fail:
         if (*pp) *pp = t->all_next;
         irq_restore(f);
         vfree(t->kstack, KSTACK_PAGES);
+        if(t->fds!=t->initial_fds)kfree(t->fds);
         kfree(t);
     }
     return -ENOEXEC;

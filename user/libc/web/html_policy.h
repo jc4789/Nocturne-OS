@@ -17,3 +17,7 @@ char *html_policy_headers(const web_doc *document);
 char *html_policy_snapshot(const web_doc *document);
 bool html_policy_snapshot_init(web_doc *document,const char *snapshot);
 void html_policy_rewind(web_doc *document,struct web_html_policy_rule *tail);
+/* Response-only embedding directives. Every ancestor must match every
+ * enforced frame-ancestors policy; report-only/meta cannot grant or deny.
+ * On success sandbox receives CSP restrictions to union before realm creation. */
+bool html_policy_embedding_allowed(web_doc *parent,const char *headers,const char *url,uint32_t *sandbox);

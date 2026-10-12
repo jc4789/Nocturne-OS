@@ -447,13 +447,15 @@ static const char *request_head(const struct http_req *rq, struct http_scratch *
     if (rq->body || !strcmp(method, "POST") || !strcmp(method, "PUT"))
         snprintf(content_length, sizeof content_length, "Content-Length: %zu\r\n", rq->body_len);
     const char *parts[] = {method, " ", u->path, " HTTP/1.1\r\nHost: ", u->host, port,
-        "\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\nConnection: close\r\n", content_length};
+        "\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\nConnection: close\r\n", content_length,
+        rq->headers ? rq->headers : "", "\r\n"};
     size_t length = 0;
     for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) {
         size_t n = strlen(parts[i]);
         if (n > SIZE_MAX - length - 1) return "HTTP request-line allocation size overflow";
         length += n;
     }
+    if(length>(size_t)LONG_MAX)return "HTTP request header write size overflow";
     char *head = malloc(length + 1);
     if (!head) return "out of memory preparing HTTP request line";
     size_t at = 0;
@@ -480,12 +482,13 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     net_stream *s = ns_open(u->host, u->port, u->tls, timeout, rs->error, sizeof rs->error);
     if (!s) return -1;
 
-    bool ok = ns_write(s, work->head, work->head_length) >= 0 && (!rq->headers || ns_write(s, rq->headers, strlen(rq->headers)) >= 0) &&
-              ns_write(s, "\r\n", 2) >= 0;
+    /* One complete header block avoids a flush/TLS record and TCP send for
+       each fragment. A short write must never be treated as a sent request. */
+    bool ok = ns_write(s, work->head, work->head_length) == (long)work->head_length;
     for (size_t sent = 0; ok && sent < rq->body_len;) {
         size_t count = rq->body_len - sent;
         if (count > 65536u) count = 65536u;
-        ok = ns_write(s, (const char *)rq->body + sent, count) >= 0;
+        ok = ns_write(s, (const char *)rq->body + sent, count) == (long)count;
         sent += count;
         if (ok && hooks && hooks->upload) ok = hooks->upload(rq->ctx, sent, rq->body_len) >= 0;
     }

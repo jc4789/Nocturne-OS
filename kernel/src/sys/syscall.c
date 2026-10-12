@@ -79,7 +79,7 @@ static int user_path(const char *upath, char *out) {
 /* Raw lookup is allowed only inside a BSP IRQ guard. Never carry this
    borrowed pointer across validation, preemption or a blocking operation. */
 static struct file *getfd(int fd) {
-    if (fd < 0 || fd >= MAX_FDS) return NULL;
+    if (fd < 0 || (size_t)fd >= task_process()->fd_capacity) return NULL;
     return task_process()->fds[fd];
 }
 
@@ -92,13 +92,7 @@ static struct file *getfd_ref(int fd) {
 }
 
 static int allocfd_locked(struct file *f) {
-    for (int i = 0; i < MAX_FDS; i++) {
-        if (!task_process()->fds[i]) {
-            task_process()->fds[i] = f;
-            return i;
-        }
-    }
-    return -EMFILE;
+    return task_fd_alloc(task_process(),f);
 }
 
 /* Consumes the caller's reference only on successful publication. */
@@ -146,6 +140,7 @@ static int64_t sys_close(int fd) {
     struct file *f = getfd(fd);
     if (!f) { irq_restore(flags); return -EBADF; }
     task_process()->fds[fd] = NULL;
+    if((size_t)fd<task_process()->fd_hint)task_process()->fd_hint=(size_t)fd;
     irq_restore(flags);
     /* Final audio close may sleep. The detached slot's reference owns f. */
     vfs_close(f);
@@ -324,30 +319,56 @@ static int64_t sys_pipe(int *ufds) {
     int e = pipe_create(&r, &w);
     if (e < 0) return e;
     uint64_t flags = irq_save();
-    int a = -1, b = -1;
-    for (int i = 0; i < MAX_FDS; i++) if (!task_process()->fds[i]) {
-        if (a < 0) a = i;
-        else { b = i; break; }
-    }
-    if (b < 0) {
+    int a=allocfd_locked(r),b=a<0?a:allocfd_locked(w);
+    int output_error=b<0?b:!user_ok_w(ufds,8)?-EFAULT:0;
+    if (output_error) {
+        if(b>=0)task_process()->fds[b]=NULL;
+        if(a>=0){task_process()->fds[a]=NULL;task_process()->fd_hint=(size_t)a;}
         irq_restore(flags);
         vfs_close(r);
         vfs_close(w);
-        return -EMFILE;
+        return output_error;
     }
-    task_process()->fds[a] = r;
-    task_process()->fds[b] = w;
     ufds[0] = a;
     ufds[1] = b;
     irq_restore(flags);
     return 0;
 }
 
+/* Snapshot the explicit native key length once; never rescan mutable user
+ * strings in the registry, and never constrain identity to a guessed path cap. */
+static int64_t sys_channel_named(const char *ukey,size_t length,bool listen) {
+    if(!length || length>SIZE_MAX-sizeof(struct file))return -EINVAL;
+    char *key=kmalloc(length);if(!key)return -ENOMEM;
+    struct file *file=NULL;uint64_t flags=irq_save();
+    if(!user_ok(ukey,length)){irq_restore(flags);kfree(key);return -EFAULT;}
+    memcpy(key,ukey,length);
+    int slot=task_fd_find(task_process());
+    int result=slot>=0?(listen?channel_listen(key,length,&file):channel_connect(key,length,&file)):slot;
+    if(!result)result=allocfd_locked(file);
+    irq_restore(flags);kfree(key);
+    /* The slot was checked and published in one BSP IRQ guard. If that
+     * invariant changes, closing the unpublished reference remains safe. */
+    if(result<0 && file)vfs_close(file);
+    return result;
+}
+static int64_t sys_channel_accept(int fd) {
+    struct file *listener=getfd_ref(fd);if(!listener)return -EBADF;
+    struct file *server=NULL;uint64_t flags=irq_save();int slot=task_fd_find(task_process());
+    int result=slot>=0?channel_accept(listener,&server):slot;
+    if(!result)result=allocfd_locked(server);
+    irq_restore(flags);vfs_close(listener);
+    if(result<0 && server)vfs_close(server);
+    return result;
+}
+
 static int64_t sys_dup2(int oldfd, int newfd) {
     uint64_t flags = irq_save();
     struct file *f = getfd(oldfd);
-    if (!f || newfd < 0 || newfd >= MAX_FDS) { irq_restore(flags); return -EBADF; }
+    if (!f || newfd < 0) { irq_restore(flags); return -EBADF; }
     if (oldfd == newfd) { irq_restore(flags); return newfd; }
+    int error=task_fd_reserve(task_process(),(size_t)newfd+1);
+    if(error){irq_restore(flags);return error;}
     struct file *previous = task_process()->fds[newfd];
     task_process()->fds[newfd] = vfs_dup(f);
     irq_restore(flags);
@@ -364,40 +385,59 @@ static int64_t sys_dup(int oldfd) {
 }
 
 static int64_t sys_poll(struct n_pollfd *ufds, int n, int timeout) {
-    if (n < 0 || n > 64) return -EINVAL;
-    if (!user_ok_w(ufds, n * sizeof(struct n_pollfd))) return -EFAULT;
+    if (n < 0 || (size_t)n>SIZE_MAX/sizeof(struct n_pollfd)) return -EINVAL;
+    size_t bytes=(size_t)n*sizeof(struct n_pollfd);
+    struct n_pollfd local[64],*fds=n<=64?local:kmalloc(bytes);
+    if(!fds)return -ENOMEM;
+    uint64_t snapshot_flags=irq_save();
+    if(!user_ok_w(ufds,bytes)){irq_restore(snapshot_flags);if(fds!=local)kfree(fds);return -EFAULT;}
+    memcpy(fds,ufds,bytes);irq_restore(snapshot_flags);
     uint64_t deadline = timeout >= 0 ? uptime_ms() + timeout : 0;
+    int result=0;
     for (;;) {
         uint64_t fl = irq_save();
+        uint64_t generation=poll_generation;
         int ready = 0;
         for (int i = 0; i < n; i++) {
-            ufds[i].revents = 0;
-            struct file *f = getfd(ufds[i].fd);
-            if (!f) continue;
-            if ((ufds[i].events & N_POLLIN) && vfs_can_read(f)) ufds[i].revents |= N_POLLIN;
-            if ((ufds[i].events & N_POLLOUT) && vfs_can_write(f)) ufds[i].revents |= N_POLLOUT;
-            if (ufds[i].revents) ready++;
+            fds[i].revents = 0;
+            struct file *f = getfd(fds[i].fd);
+            if(f) {
+                if ((fds[i].events & N_POLLIN) && vfs_can_read(f)) fds[i].revents |= N_POLLIN;
+                if ((fds[i].events & N_POLLOUT) && vfs_can_write(f)) fds[i].revents |= N_POLLOUT;
+                if (f->vn->ops && f->vn->ops->hangup && f->vn->ops->hangup(f->vn,f)) fds[i].revents |= N_POLLHUP;
+                if (fds[i].revents) ready++;
+            }
+            /* Preserve atomic per-descriptor checks without letting a large
+             * valid client list become one non-preemptible kernel operation. */
+            if((i&63)==63 && i+1<n){irq_restore(fl);fl=irq_save();}
         }
-        if (ready || timeout == 0) {
+        bool expired=timeout>0 && uptime_ms()>=deadline;
+        if (ready || timeout == 0 || expired) {
+            result=ready;
+            /* A sibling may have unmapped the original array while this
+             * syscall slept/scanned; no kernel copy targets stale user pages. */
+            if(!user_ok_w(ufds,bytes))result=-EFAULT;
+            else memcpy(ufds,fds,bytes);
             irq_restore(fl);
-            return ready;
+            break;
         }
         if (current_task->killed) {
             irq_restore(fl);
-            return -EINTR;
+            result=-EINTR;break;
         }
+        /* Closing/enqueuing during a released scan quantum cannot be lost
+         * between readiness and wait enrollment. Retry only for a new event. */
+        if(generation!=poll_generation){irq_restore(fl);continue;}
         if (timeout > 0) {
             uint64_t now = uptime_ms();
-            if (now >= deadline) {
-                irq_restore(fl);
-                return 0;
-            }
-            wq_wait_timeout(&poll_wq, deadline - now);
+            if(now<deadline)wq_wait_timeout(&poll_wq, deadline - now);
         } else {
             wq_wait(&poll_wq);
         }
         irq_restore(fl);
     }
+    if(fds!=local)kfree(fds);
+    return result;
 }
 
 static int64_t sys_proclist(struct n_procinfo *out, int max) {
@@ -587,6 +627,9 @@ void syscall_dispatch(struct regs *r) {
     case SYS_UPTIME: ret = uptime_ms(); break;
     case SYS_TIME: ret = time_now(); break;
     case SYS_PIPE: ret = sys_pipe((int *)a); break;
+    case SYS_CHANNEL_LISTEN: ret = sys_channel_named((const char *)a,b,true); break;
+    case SYS_CHANNEL_CONNECT: ret = sys_channel_named((const char *)a,b,false); break;
+    case SYS_CHANNEL_ACCEPT: ret = sys_channel_accept((int)a); break;
     case SYS_DUP2: ret = sys_dup2((int)a, (int)b); break;
     case SYS_DUP: ret = sys_dup((int)a); break;
     case SYS_POLL: ret = sys_poll((struct n_pollfd *)a, (int)b, (int)c); break;

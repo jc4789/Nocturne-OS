@@ -9,10 +9,13 @@
 #include <quickjs.h>
 struct broker_pair {
     struct broker_pair *next;
-    uint32_t id,creator;
+    uint32_t id,creator,client_id;
     size_t pins;
     bool closed,sealed,close_sent,ack_sent;
     void *held_close,*held_ack;
+    /* Native routing authority. Shared server maps its internal id back to
+     * this client's original id; it is never exposed as an author object. */
+    void *client;
 };
 struct broker_lease {struct broker_lease *next;uint32_t id,child,port,creator;};
 static uint32_t worker_port_next_lease(struct broker_lease *list,uint32_t cursor){

@@ -5,11 +5,6 @@
 #define STORAGE_CONTROL_BYTES 256u
 #define STORAGE_READER_BYTES 48u
 #define STORAGE_EVENT_BYTES (2u * STORAGE_WINDOW_BYTES)
-struct storage_control {
-    uint64_t serial, epoch, revision, end, checkpoint_revision, persisted;
-    uint64_t generation, dirty_since, changed_at;
-    int checkpoint_slot, slot;
-};
 struct storage_notification {
     struct storage_notification *next;
     struct web_storage_result data;
@@ -52,18 +47,36 @@ static bool storage_control_unpack(uint8_t b[128],struct storage_control *h) {
         h->persisted<=h->revision && h->checkpoint_slot>=0 && h->checkpoint_slot<=1 && h->slot>=-1 && h->slot<=1;
 }
 static int storage_control_read(struct storage_area *a,struct storage_control *h) {
-    struct n_stat st;if(fstat(a->shared_fd,&st)<0)return -1;
-    if(!st.size)return 0;
-    uint8_t b[128];struct storage_control other;bool found=false;
-    for(unsigned i=0;i<2;i++)if(st.size>=(i+1u)*128 && storage_io_at(a->shared_fd,i*128,b,128,false) && storage_control_unpack(b,&other)){
+    uint8_t bytes[STORAGE_CONTROL_BYTES]={0};size_t done=0;
+    if(lseek(a->shared_fd,0,SEEK_SET)<0)goto failed;
+    while(done<sizeof bytes){
+        ssize_t size=read(a->shared_fd,bytes+done,sizeof bytes-done);
+        if(size<0 && errno==EINTR)continue;
+        if(size<0 || (size_t)size>sizeof bytes-done)goto failed;
+        if(!size)break;
+        done+=(size_t)size;
+    }
+    if(!done){a->shared_control_cached=false;return 0;}
+    if(a->shared_control_cached && !memcmp(bytes,a->shared_control_bytes,sizeof bytes)){
+        *h=a->shared_control;return 1;
+    }
+    struct storage_control other;bool found=false;
+    for(unsigned i=0;i<2;i++)if(done>=(i+1u)*128 && storage_control_unpack(bytes+i*128,&other)){
         if(!found || other.serial>h->serial)*h=other;found=true;
     }
-    return found?1:-1;
+    if(!found)goto failed;
+    memcpy(a->shared_control_bytes,bytes,sizeof bytes);a->shared_control=*h;a->shared_control_cached=true;
+    return 1;
+failed:
+    a->shared_control_cached=false;return -1;
 }
 static bool storage_control_commit(struct storage_area *a,struct storage_control *h) {
     if(h->serial==UINT64_MAX)return false;
     h->serial++;uint8_t b[128];storage_control_pack(h,b);
-    return storage_io_at(a->shared_fd,(h->serial&1u)*128,b,128,true);
+    size_t offset=(h->serial&1u)*128;
+    if(!storage_io_at(a->shared_fd,offset,b,128,true)){a->shared_control_cached=false;return false;}
+    if(a->shared_control_cached){memcpy(a->shared_control_bytes+offset,b,128);a->shared_control=*h;}
+    return true;
 }
 static struct n_procinfo *storage_processes(int *count) {
     int capacity=32;
@@ -379,6 +392,12 @@ int webstorage_access(webstorage *s,const char *origin,const struct web_storage_
         (r->key_len>STORAGE_FILE_MAX || !storage_units(r->key,r->key_len,&ku)))return WEB_STORAGE_QUOTA;
     if(r->operation==WEB_STORAGE_SET && (r->value_len>STORAGE_FILE_MAX || !storage_units(r->value,r->value_len,&vu)))return WEB_STORAGE_QUOTA;
     struct storage_area *a=NULL;int result=storage_get_area(s,origin,r->kind,&a);if(result)return result;
+    /* A Window getter checks storage eligibility, not the current key map.
+     * After its first successful registration, repeated getters need neither
+     * a shared lease nor a disk/head read. Actual reads, mutations and event
+     * polls below still synchronize every time, including within one task. */
+    if(r->operation==WEB_STORAGE_CHECK && (a->kind==WEB_STORAGE_SESSION || a->shared_holder) &&
+       (!r->source || storage_source_find(s,a,r->source)))return WEB_STORAGE_OK;
     struct storage_control h={0};bool locked=a->kind==WEB_STORAGE_LOCAL;
     if(locked){result=storage_shared_lock(s,a,&h);if(result)return result;result=storage_shared_sync(s,a,&h);if(result)goto done;}
     result=storage_source_add(s,a,r->source,&h);if(result)goto done;

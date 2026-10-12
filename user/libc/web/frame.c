@@ -1,4 +1,5 @@
 #include "frame.h"
+#include "html_policy.h"
 #include <nocturne.h>
 #include <math.h>
 #include <limits.h>
@@ -133,7 +134,9 @@ bool web_frame_commit_response(struct web_frame *f,const char *html,size_t n,con
                       const char *headers,const struct web_host *host,bool inherited) {
     web_doc *parent=f?f->element->owner:NULL;
     if(!parent)return false;
-    f->pending_sandbox_flags|=parent->sandbox_flags;
+    uint32_t csp_sandbox=0;
+    if(!html_policy_embedding_allowed(parent,headers,url,&csp_sandbox))return false;
+    f->pending_sandbox_flags|=parent->sandbox_flags|csp_sandbox;
     if(!web_sandbox_document_allowed(f,url,inherited))return false;
     if(!f->window_token) {
         f->window_token=doc_node_create(parent,N_FRAGMENT,NULL,"",0);

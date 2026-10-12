@@ -219,6 +219,15 @@ time_t time(time_t *t) {
     return v;
 }
 int pipe(int fds[2]) { return (int)ret(SC1(SYS_PIPE, fds)); }
+int n_channel_listen(const char *key) {
+    if(!key || !*key){errno=EINVAL;return -1;}
+    return (int)ret(SC2(SYS_CHANNEL_LISTEN,key,strlen(key)));
+}
+int n_channel_connect(const char *key) {
+    if(!key || !*key){errno=EINVAL;return -1;}
+    return (int)ret(SC2(SYS_CHANNEL_CONNECT,key,strlen(key)));
+}
+int n_channel_accept(int listener_fd) { return (int)ret(SC1(SYS_CHANNEL_ACCEPT,listener_fd)); }
 int dup(int fd) { return (int)ret(SC1(SYS_DUP, fd)); }
 int dup2(int fd, int newfd) { return (int)ret(SC2(SYS_DUP2, fd, newfd)); }
 int poll(struct n_pollfd *fds, int n, int timeout) { return (int)ret(SC3(SYS_POLL, fds, n, timeout)); }

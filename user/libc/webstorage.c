@@ -32,6 +32,11 @@ struct storage_entry {
     char *key, *value;
     size_t kn, vn, units;
 };
+struct storage_control {
+    uint64_t serial, epoch, revision, end, checkpoint_revision, persisted;
+    uint64_t generation, dirty_since, changed_at;
+    int checkpoint_slot, slot;
+};
 struct storage_area {
     struct storage_area *next;
     struct storage_entry *entries;
@@ -46,6 +51,11 @@ struct storage_area {
     int shared_fd, shared_log_fd;
     uint64_t shared_epoch, shared_cursor;
     bool shared_holder;
+    /* Compared with freshly read RAM-root bytes under the native lease.
+     * Reusing validated headers never replaces observing other windows. */
+    bool shared_control_cached;
+    uint8_t shared_control_bytes[256];
+    struct storage_control shared_control;
 };
 struct storage_source;
 struct webstorage { struct storage_area *areas; struct storage_source *sources; unsigned count; size_t units, event_bytes; uint64_t identity; };
