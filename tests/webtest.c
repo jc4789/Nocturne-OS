@@ -244,6 +244,164 @@ static void test_item_z_order(void) {
 }
 
 /* ---------------------------------------------------------------- links and forms */
+static void test_abs_flex_position(void) {
+    static const struct {
+        const char *name, *container, *child;
+        int x, y;
+        bool shadow;
+    } cases[] = {
+        {"abs-flex-start", "", "", 100, 0, false},
+        {"abs-flex-center", "justify-content:center;align-items:center", "", 140, 30, false},
+        {"abs-flex-self-end", "justify-content:flex-end", "align-self:flex-end", 180, 60, false},
+        {"abs-flex-row-reverse", "flex-direction:row-reverse;align-items:center", "", 180, 30, false},
+        {"abs-flex-reverse-end", "flex-direction:row-reverse;justify-content:flex-end", "", 100, 0, false},
+        {"abs-flex-column", "flex-direction:column;justify-content:center;align-items:flex-end", "", 180, 30, false},
+        {"abs-flex-column-reverse", "flex-direction:column-reverse", "", 100, 60, false},
+        {"abs-flex-wrap-reverse", "flex-wrap:wrap-reverse", "", 100, 60, false},
+        {"abs-inline-flex-cb-chain", "display:inline-flex;justify-content:center;align-items:center", "", 140, 30, false},
+        {"abs-shadow-contents-flex", "justify-content:center;align-items:center", "", 140, 30, true},
+        {"abs-explicit-insets-preserved", "justify-content:center;align-items:center", "left:7px;top:9px", 7, 9, false},
+        {"abs-one-static-axis", "justify-content:center;align-items:center", "left:7px", 7, 30, false},
+        {"abs-static-margin-box", "justify-content:center;align-items:center", "margin:4px 15px 6px 5px", 135, 29, false},
+        {"abs-both-auto-margins", "", "left:10px;right:30px;top:0;margin-left:auto;margin-right:auto", 130, 0, false},
+        {"abs-single-left-auto", "", "left:10px;right:30px;top:0;margin-left:auto;margin-right:5px", 245, 0, false},
+        {"abs-single-right-auto", "", "left:10px;right:30px;top:0;margin-left:5px;margin-right:auto", 15, 0, false},
+        {"abs-vertical-auto-margins", "", "left:0;top:5px;bottom:15px;margin-top:auto;margin-bottom:auto", 0, 35, false},
+        {"abs-single-top-auto", "", "left:0;top:5px;bottom:15px;margin-top:auto;margin-bottom:10px", 0, 55, false},
+        {"abs-negative-horizontal-auto", "", "left:10px;right:290px;top:0;margin-left:auto;margin-right:auto", 10, 0, false},
+        {"abs-negative-vertical-auto", "", "left:0;top:10px;bottom:90px;margin-top:auto;margin-bottom:auto", 0, 0, false}
+    };
+    for (size_t i=0;i<sizeof cases/sizeof cases[0];i++) {
+        char html[1536];
+        const char *tag=cases[i].shadow?"x-flex":"div";
+        snprintf(html,sizeof html,"<!doctype html><body style=margin:0><div style='position:relative;width:300px;height:100px;font-size:0;line-height:0'>"
+            "<%s style='display:flex;width:100px;height:80px;margin-left:100px;%s'>%s"
+            "<div style=display:contents><a href=/placed style='position:absolute;width:20px;height:20px;background:blue;%s'></a></div>"
+            "%s</%s></div>",tag,cases[i].container,cases[i].shadow?"<template shadowrootmode=open>":"",
+            cases[i].child,cases[i].shadow?"</template>":"",tag);
+        web_doc *d=load(html);
+        web_node *target=web_node_at(d,cases[i].x+1,cases[i].y+1);
+        int x=0,y=0,w=0,h=0;
+        total++;
+        if(!target||!web_node_rect(d,target,&x,&y,&w,&h)||x!=cases[i].x||y!=cases[i].y||w!=20||h!=20)
+            fail(cases[i].name,"position %d / %d",x,y);
+        paint(d,0);color_is(cases[i].name,cases[i].x+1,cases[i].y+1,0x0000ff,0);
+        struct web_hit hit;total++;
+        if(!web_node_action(d,target,&hit)||hit.kind!=WEB_HIT_LINK||!hit.href||strcmp(hit.href,"http://h.test/placed"))
+            fail(cases[i].name,"positioned link hit missing",0,0);
+        web_free(d);
+    }
+}
+
+static void test_filter_groups(void) {
+    /* Overlapping children must be flattened once, not faded separately. The
+       same backend includes negative overflow and native inline line groups. */
+    static const struct {const char *name,*html;int x,y,x2,y2;uint32_t color,color2;bool link;} cases[]={
+        {"filter-group-overlap","<div style='width:40px;height:20px;background:red;filter:opacity(.5)'>"
+            "<a href=/effect style='position:absolute;left:10px;top:0;width:20px;height:20px;background:blue'></a></div>",
+            15,5,5,5,0x7f7fff,0xff7f7f,true},
+        {"filter-negative-overflow","<div style=height:10px></div><div style='margin-left:30px;width:10px;height:10px;background:red;filter:opacity(.5)'>"
+            "<a href=/effect style='position:absolute;left:-20px;top:20px;width:10px;height:10px;background:blue'></a></div>",
+            11,31,31,11,0x7f7fff,0xff7f7f,true},
+        {"filter-nested-plus-opacity","<div style='filter:opacity(.5)'><div style='filter:opacity(50%);opacity:.5'>"
+            "<a href=/effect style='display:block;width:20px;height:20px;background:blue'></a></div></div>",
+            5,5,30,5,0xdfdfff,0xffffff,true},
+        {"filter-multiple-functions","<a href=/effect style='display:block;width:20px;height:20px;background:blue;filter:opacity(.5) opacity(50%)'></a>",
+            5,5,30,5,0xbfbfff,0xffffff,true},
+        {"filter-above-range-used-clamp","<a href=/effect style='display:block;width:20px;height:20px;background:blue;filter:opacity(200%) opacity(2)'></a>",
+            5,5,30,5,0x0000ff,0xffffff,true},
+        {"filter-none-with-property-opacity","<a href=/effect style='display:block;width:20px;height:20px;background:blue;filter:none;opacity:.5'></a>",
+            5,5,30,5,0x7f7fff,0xffffff,true},
+        {"filter-zero-still-hit-tests","<a href=/effect style='display:block;width:20px;height:20px;background:blue;filter:opacity(0)'></a>",
+            5,5,30,5,0xffffff,0xffffff,true},
+        {"filter-inline-overlapping-subtree","<span style='filter:opacity(.5)'>"
+            "<a href=/effect style='display:inline-block;vertical-align:top;width:20px;height:20px;background:blue'></a>"
+            "<a href=/effect style='position:absolute;left:0;top:0;width:20px;height:20px;background:blue'></a></span>",
+            5,5,30,5,0x7f7fff,0xffffff,true},
+        {"filter-inline-nested-groups","<span style='filter:opacity(.5)'><span style='filter:opacity(.5)'>"
+            "<a href=/effect style='display:inline-block;vertical-align:top;width:20px;height:20px;background:blue'></a>"
+            "</span></span>",5,5,30,5,0xbfbfff,0xffffff,true},
+        {"filter-inline-flex-composites-once","<span style='display:inline-flex;vertical-align:top;width:20px;height:20px;filter:opacity(.5)'>"
+            "<a href=/effect style='width:20px;height:20px;background:blue'></a></span>",5,5,30,5,0x7f7fff,0xffffff,true},
+        {"filter-inline-grid-composites-once","<span style='display:inline-grid;vertical-align:top;width:20px;height:20px;filter:opacity(.5)'>"
+            "<a href=/effect style='width:20px;height:20px;background:blue'></a></span>",5,5,30,5,0x7f7fff,0xffffff,true},
+        {"filter-inline-table-composites-once","<table style='display:inline-table;vertical-align:top;border-spacing:0;filter:opacity(.5)'>"
+            "<tr><td style='padding:0'><a href=/effect style='display:block;width:20px;height:20px;background:blue'></a></td></tr></table>",
+            5,5,30,5,0x7f7fff,0xffffff,true},
+        {"filter-boxless-contents","<span style='display:contents;filter:opacity(.5)'>"
+            "<a href=/effect style='display:block;width:20px;height:20px;background:blue'></a></span>",5,5,30,5,0x0000ff,0xffffff,true},
+        {"filter-atomic-svg-root","<svg width=20 height=20 style='filter:opacity(.5);vertical-align:top'><rect width=20 height=20 fill=blue /></svg>",
+            5,5,30,5,0x7f7fff,0xffffff,false},
+        {"filter-root-canvas-group","<style>html{filter:opacity(.5)}body{background:blue}</style>",
+            5,5,100,90,0x7f7fff,0x7f7fff,false},
+        {"filter-document-root-not-fixed-cb","<style>html{filter:opacity(1);margin-left:30px;padding-left:10px}</style>"
+            "<a href=/effect style='position:fixed;left:5px;top:5px;width:20px;height:20px;background:blue'></a>",
+            6,6,30,5,0x0000ff,0xffffff,true},
+        {"filter-clipped-descendant","<div style='width:10px;height:10px;overflow:hidden;filter:opacity(.5)'>"
+            "<a href=/effect style='position:fixed;left:15px;top:0;width:10px;height:10px;background:blue'></a></div>",
+            16,5,5,5,0xffffff,0xffffff,false}
+    };
+    for(size_t i=0;i<sizeof cases/sizeof *cases;i++) {
+        char html[1536];snprintf(html,sizeof html,"<!doctype html><body style='margin:0;font-size:0;line-height:0'>%s",cases[i].html);
+        web_doc *d=load(html);paint(d,0);
+        color_is(cases[i].name,cases[i].x,cases[i].y,cases[i].color,1);
+        color_is(cases[i].name,cases[i].x2,cases[i].y2,cases[i].color2,1);
+        struct web_hit hit={0};bool link=web_hit_test(d,cases[i].x,cases[i].y,&hit)&&hit.kind==WEB_HIT_LINK&&
+            hit.href&&!strcmp(hit.href,"http://h.test/effect");total++;
+        if(link!=cases[i].link)fail(cases[i].name,"link hit %d expected %d",link,cases[i].link);
+        web_free(d);
+    }
+    y_is("filter-inline-preserves-wrapping","<!doctype html><body style='margin:0;font-size:0;line-height:0'><div style=width:30px>"
+        "<span style='filter:opacity(.5)'><span style='display:inline-block;width:20px;height:20px;vertical-align:top'></span>"
+        "<span style='display:inline-block;width:20px;height:20px;vertical-align:top'></span></span></div><div id=t></div>",40);
+    static const struct {const char *name,*filter,*position;bool shadow;int x,y,visual_y;} cb_cases[]={
+        {"filter-static-absolute-cb","opacity(1)","absolute",false,40,30,20},
+        {"filter-static-fixed-cb","opacity(1)","fixed",false,40,30,20},
+        {"filter-multiple-fixed-cb","opacity(50%) opacity(200%)","fixed",false,40,30,20},
+        {"filter-none-absolute-viewport","none","absolute",false,5,5,-5},
+        {"filter-none-fixed-viewport","none","fixed",false,5,5,5},
+        {"filter-shadow-fixed-cb","opacity(1)","fixed",true,40,30,20}
+    };
+    for(size_t i=0;i<sizeof cb_cases/sizeof *cb_cases;i++) {
+        char html[1536];const char *tag=cb_cases[i].shadow?"x-filter":"div";
+        snprintf(html,sizeof html,"<!doctype html><body style='margin:0;font-size:0;line-height:0'><div style=height:20px></div>"
+            "<%s style='margin-left:30px;padding:10px;border:5px solid transparent;width:100px;height:60px;filter:%s'>%s"
+            "<a href=/effect style='position:%s;left:5px;top:5px;width:10px;height:20px;background:blue'></a>%s</%s>",
+            tag,cb_cases[i].filter,cb_cases[i].shadow?"<template shadowrootmode=open>":"",cb_cases[i].position,
+            cb_cases[i].shadow?"</template>":"",tag);
+        web_doc *d=load(html);web_node *n=web_node_at(d,cb_cases[i].x+1,cb_cases[i].y+6);
+        int x=0,y=0,w=0,h=0;total++;
+        if(!n||!web_node_rect(d,n,&x,&y,&w,&h)||x!=cb_cases[i].x||y!=cb_cases[i].y||w!=10||h!=20)
+            fail(cb_cases[i].name,"CB position %d / %d",x,y);
+        uint32_t color=!strcmp(cb_cases[i].filter,"opacity(50%) opacity(200%)")?0x7f7fff:0x0000ff;
+        paint(d,0);color_is(cb_cases[i].name,cb_cases[i].x+1,cb_cases[i].y+6,color,1);
+        paint(d,10);color_is(cb_cases[i].name,cb_cases[i].x+1,cb_cases[i].visual_y+6,color,1);
+        struct web_hit hit={0};total++;
+        if(!web_hit_test(d,cb_cases[i].x+1,cb_cases[i].visual_y+16,&hit)||hit.kind!=WEB_HIT_LINK)
+            fail(cb_cases[i].name,"scrolling effect link missing",0,0);
+        web_free(d);
+    }
+    const char *wrapped[]={"inline-flex","inline-grid","inline-table"};
+    const char *positions[]={"absolute","fixed"};
+    for(size_t k=0;k<sizeof wrapped/sizeof *wrapped;k++)for(size_t p=0;p<sizeof positions/sizeof *positions;p++) {
+        char html[2048];snprintf(html,sizeof html,"<!doctype html><body style='margin:0;font-size:0;line-height:0'><div style=height:20px></div>"
+            "<div style='display:%s;vertical-align:top;margin-left:30px;padding:4px;border:3px solid transparent;"
+            "width:80px;height:40px;filter:opacity(1);overflow:hidden'>"
+            "<a href=/effect style='position:%s;left:25%%;top:5px;width:50%%;height:10px;background:blue'></a>"
+            "<a href=/outside style='position:%s;left:-10px;top:5px;width:10px;height:10px;background:red'></a></div>",
+            wrapped[k],positions[p],positions[p]);
+        web_doc *d=load(html);web_node *n=web_node_at(d,56,29);int x=0,y=0,w=0,h=0;total++;
+        if(!n||!web_node_rect(d,n,&x,&y,&w,&h)||x!=55||y!=28||w!=44||h!=10)
+            fail("wrapped-filter-padding-percent-CB","CB position %d / %d",x,y);
+        paint(d,0);color_is("wrapped-filter-padding-CB-paint",56,29,0x0000ff,0);
+        color_is("wrapped-filter-fixed-overflow-clip",31,29,0xffffff,0);
+        struct web_hit hit={0};total++;
+        if(web_hit_test(d,31,29,&hit)&&hit.kind==WEB_HIT_LINK)
+            fail("wrapped-filter-overflow-clip-hit","outside child unexpectedly hit",0,0);
+        web_free(d);
+    }
+}
+
 static web_node *node_at(web_doc *d, int x, int y, int kind, const char *name) {
     struct web_hit h;
     total++;
@@ -344,6 +502,118 @@ static const unsigned char blue_png[] = {
     0x00, 0x03, 0x00, 0x00, 0x00, 0x05, 0x08, 0x02, 0x00, 0x00, 0x00, 0x0f, 0x13, 0xc1, 0xf5, 0x00, 0x00, 0x00,
     0x0f, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0x60, 0x60, 0xf8, 0x0f, 0x43, 0xc4, 0xb1, 0x00, 0x66, 0xd9,
     0x0e, 0xf2, 0x89, 0x1a, 0x34, 0xe3, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82};
+
+static void test_replaced_flow(void) {
+    /* Real decoded natural dimensions (3x5), never a synthetic image box.
+       Contents and anonymous wrappers must not lose percentage references;
+       min constraints transfer the natural ratio only into automatic axes. */
+    static const struct {
+        const char *name, *parent, *before, *image;
+        int width, height;
+    } cases[] = {
+        {"contents-image-auto", "width:60px", "", "width:100%", 60, 100},
+        {"contents-image-indefinite-percent", "width:60px", "", "width:100%;height:100%", 60, 100},
+        {"contents-image-definite-percent", "width:60px;height:80px", "", "width:100%;height:100%", 60, 80},
+        {"anonymous-image-definite-percent", "width:60px;height:80px", "<div style=height:0></div>",
+            "width:100%;height:100%", 60, 80},
+        {"anonymous-image-indefinite-percent", "width:60px", "<div style=height:0></div>",
+            "width:100%;height:100%", 60, 100},
+        {"image-min-width-ratio", "width:60px", "", "min-width:30px", 30, 50},
+        {"image-min-height-ratio", "width:60px", "", "min-height:50px", 30, 50},
+        {"image-definite-axis-preserved", "width:60px", "", "width:12px;height:20px;min-width:30px", 30, 20},
+        {"image-conflicting-limits", "width:60px", "", "min-width:30px;max-height:10px", 30, 10}
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        char html[768];
+        snprintf(html, sizeof html, "<!doctype html><body style=margin:0><div style='font-size:0;line-height:0;%s'>%s"
+            "<picture style=display:contents><img src=i.png style='display:inline-block;vertical-align:top;%s'></picture>"
+            "</div><div id=t></div>", cases[i].parent, cases[i].before, cases[i].image);
+        web_doc *d = load(html);
+        total++;
+        if (web_image_count(d) != 1) {
+            fail(cases[i].name, "image count %d, expected %d", web_image_count(d), 1);
+            web_free(d); continue;
+        }
+        web_image_loaded(d, 0, blue_png, sizeof blue_png);
+        web_layout(d, VW, VH);
+        web_node *image = web_node_at(d, 1, 1);
+        int x = 0, y = 0, w = 0, h = 0;
+        total++;
+        if (!image || !web_node_rect(d, image, &x, &y, &w, &h) ||
+            x != 0 || y != 0 || w != cases[i].width || h != cases[i].height)
+            fail(cases[i].name, "image size %d x %d", w, h);
+        total++;
+        if (web_anchor_y(d, "t") != cases[i].height)
+            fail(cases[i].name, "flow height %d, expected %d", web_anchor_y(d, "t"), cases[i].height);
+        paint(d, 0);
+        color_is(cases[i].name, 1, 1, 0x0000ff, 0);
+        web_free(d);
+    }
+    /* Explicit zero is intentional; never manufacture a natural minimum. */
+    web_doc *d = load("<!doctype html><body style=margin:0><div style='font-size:0;line-height:0'>"
+        "<picture style=display:contents><img src=i.png style='display:inline-block;width:60px;height:0'></picture>"
+        "</div><div id=t></div>");
+    web_image_loaded(d, 0, blue_png, sizeof blue_png);
+    web_layout(d, VW, VH);
+    total++;
+    if (web_anchor_y(d, "t") != 0) fail("image-explicit-zero", "flow height %d, expected %d", web_anchor_y(d, "t"), 0);
+    web_free(d);
+}
+
+static void test_float_percent_heights(void) {
+    static const struct {
+        const char *name, *parent, *content;
+        int image_count, y, height, flow_height, probe_y;
+    } cases[] = {
+        {"float-block-definite-percent", "height:80px",
+            "<div style='float:left;width:60px;height:100%'><picture style=display:contents>"
+            "<img src=i.png style='display:inline-block;width:100%;height:100%;vertical-align:top'></picture></div>",
+            1, 0, 80, 80, 1},
+        {"float-replaced-definite-percent", "height:80px",
+            "<img src=i.png style='float:left;width:60px;height:100%'>", 1, 0, 80, 80, 1},
+        {"inline-float-definite-percent", "height:80px",
+            "<span><img src=i.png style='float:left;width:60px;height:100%'></span>", 1, 0, 80, 80, 1},
+        {"deferred-float-definite-percent", "height:80px",
+            "<span style='display:inline-block;width:1px;height:5px;vertical-align:top'></span>"
+            "<img src=i.png style='float:left;width:60px;height:100%'>", 1, 5, 80, 85, 6},
+        {"split-inline-float-percent", "height:80px",
+            "<div style='float:left;width:60px;height:100%'>"
+            "<span style='height:200px;min-height:300px;max-height:400px'><div style='width:100%;height:100%'>"
+            "<picture style=display:contents><img src=i.png style='display:inline-block;width:100%;height:100%;vertical-align:top'>"
+            "</picture></div></span></div>", 1, 0, 80, 80, 1},
+        {"float-table-definite-percent", "height:80px",
+            "<table style='float:left;width:60px;height:100%;border-spacing:0;background:blue'><tr><td style=padding:0>"
+            "<div style='width:60px;height:1px'></div></td></tr></table>", 0, 0, 80, 80, 10},
+        {"float-replaced-indefinite-percent", "height:auto;overflow:hidden",
+            "<img src=i.png style='float:left;width:60px;height:100%'>", 1, 0, 100, 100, 1}
+    };
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        char html[1024];
+        snprintf(html, sizeof html, "<!doctype html><body style=margin:0>"
+            "<div style='width:100px;font-size:0;line-height:0;%s'>%s</div><div id=t style=clear:both></div>",
+            cases[i].parent, cases[i].content);
+        web_doc *d = load(html);
+        total++;
+        if (web_image_count(d) != cases[i].image_count) {
+            fail(cases[i].name, "image count %d, expected %d", web_image_count(d), cases[i].image_count);
+            web_free(d); continue;
+        }
+        if (cases[i].image_count) web_image_loaded(d, 0, blue_png, sizeof blue_png);
+        web_layout(d, VW, VH);
+        web_node *target = web_node_at(d, 1, cases[i].probe_y);
+        int x = 0, y = 0, w = 0, h = 0;
+        total++;
+        if (!target || !web_node_rect(d, target, &x, &y, &w, &h) ||
+            x != 0 || y != cases[i].y || w != 60 || h != cases[i].height)
+            fail(cases[i].name, "target size %d x %d", w, h);
+        total++;
+        if (web_anchor_y(d, "t") != cases[i].flow_height)
+            fail(cases[i].name, "flow height %d, expected %d", web_anchor_y(d, "t"), cases[i].flow_height);
+        paint(d, 0);
+        color_is(cases[i].name, 1, cases[i].probe_y, 0x0000ff, 0);
+        web_free(d);
+    }
+}
 
 static void test_text(void) {
     title_is("title-entities", "<title>a &amp; b &lt;&#x263A;&hellip;</title>", NULL, "a & b <\xe2\x98\xba\xe2\x80\xa6");
@@ -449,12 +719,20 @@ int main(void) {
     test_paint();
     printf("WEB-STAGE test_item_z_order\n");fflush(stdout);
     test_item_z_order();
+    printf("WEB-STAGE test_abs_flex_position\n");fflush(stdout);
+    test_abs_flex_position();
+    printf("WEB-STAGE test_filter_groups\n");fflush(stdout);
+    test_filter_groups();
     printf("WEB-STAGE test_forms\n");fflush(stdout);
     test_forms();
     printf("WEB-STAGE form-validation\n");fflush(stdout);
     run_native_form_validation_cases(&total,&failed);
     printf("WEB-STAGE test_text\n");fflush(stdout);
     test_text();
+    printf("WEB-STAGE test_replaced_flow\n");fflush(stdout);
+    test_replaced_flow();
+    printf("WEB-STAGE test_float_percent_heights\n");fflush(stdout);
+    test_float_percent_heights();
     printf("WEB-STAGE test_hostile\n");fflush(stdout);
     test_hostile();
     printf("webtest: %d checks, %d failed\n", total, failed);

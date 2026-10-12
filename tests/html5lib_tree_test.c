@@ -119,7 +119,9 @@ static node_t *parse_case(web_doc *family,const struct html5lib_case *test) {
     family->inert=true;
     struct html_parser *parser=html_begin_string(family,test->data,test->data_length,true,false);
     if(!parser)return NULL;
-    node_t *ignored=NULL;int result=html_resume(parser,&ignored);html_finish(parser);
+    node_t *ignored=NULL;int result;
+    do{result=html_resume(parser,&ignored);}while(result==HTML_PARSE_YIELD);
+    html_finish(parser);
     return result==0?family->root:NULL;
 }
 int main(int argc,char **argv) {

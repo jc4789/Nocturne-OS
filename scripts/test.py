@@ -150,25 +150,28 @@ def start_web_servers():
 
 
 def make_disk(a, tcp_port, web_ports):
+    # A preserved source snapshot keeps native struct layouts and expectations
+    # paired with the baseline boot image while the checkout is being repaired.
+    source_root = a.source_tree or ROOT
     if os.path.exists(IMG):
         os.remove(IMG)
     env = dict(os.environ, PATH=BIN + os.pathsep + USR_BIN + os.pathsep + os.environ.get("PATH", ""))
     subprocess.run([BASH, "scripts/mkdata.sh", os.path.relpath(IMG, ROOT).replace("\\", "/"), "256"], cwd=ROOT, env=env, check=True,
                    stdout=subprocess.DEVNULL)
     mtools("mmd", "-i", PART, "::/tests")
-    srcs = sorted(glob.glob(os.path.join(ROOT, "tests", "*.c")))
-    srcs += sorted(glob.glob(os.path.join(ROOT, "tests", "js_*_cases.js")))
+    srcs = sorted(glob.glob(os.path.join(source_root, "tests", "*.c")))
+    srcs += sorted(glob.glob(os.path.join(source_root, "tests", "js_*_cases.js")))
     # Internal metadata regression reads diagnostic counters from the real DOM.
-    srcs.append(os.path.join(ROOT, "user", "libc", "web", "webi.h"))
-    srcs.append(os.path.join(ROOT, "user", "libc", "web", "cssom.h"))
-    srcs.append(os.path.join(ROOT, "user", "libc", "web", "js_canvas.h"))
-    srcs.append(os.path.join(ROOT, "third_party", "quickjs", "quickjs.h"))
-    srcs.append(os.path.join(ROOT, "user", "apps", "browser_events.h"))
-    srcs += [os.path.join(ROOT, "user", "libc", "web", name) for name in
+    srcs.append(os.path.join(source_root, "user", "libc", "web", "webi.h"))
+    srcs.append(os.path.join(source_root, "user", "libc", "web", "cssom.h"))
+    srcs.append(os.path.join(source_root, "user", "libc", "web", "js_canvas.h"))
+    srcs.append(os.path.join(source_root, "third_party", "quickjs", "quickjs.h"))
+    srcs.append(os.path.join(source_root, "user", "apps", "browser_events.h"))
+    srcs += [os.path.join(source_root, "user", "libc", "web", name) for name in
              ("form_value.h", "form_validation.h", "elements.h", "frame.h", "html_lexbor.h", "html_policy.h", "html_pi.h", "sandbox.h")]
-    srcs += sorted(glob.glob(os.path.join(ROOT, "tests", "*.h")))
+    srcs += sorted(glob.glob(os.path.join(source_root, "tests", "*.h")))
     mtools("mcopy", "-i", PART, *srcs, "::/tests/")
-    mtools("mcopy", "-i", PART, "-s", os.path.join(ROOT, "tests", "media-fixtures"), "::/tests/")
+    mtools("mcopy", "-i", PART, "-s", os.path.join(source_root, "tests", "media-fixtures"), "::/tests/")
     if a.full:
         tcc = os.path.join(ROOT, "third_party", "tinycc")
         files = sorted(glob.glob(os.path.join(tcc, "*.c")) + glob.glob(os.path.join(tcc, "*.h")) +
@@ -268,9 +271,11 @@ def run_vm(a, tcp_port, web_ports, processes):
         mtools("mcopy", "-o", "-i", os.path.relpath(boot, ROOT).replace("\\", "/") + "@@1048576",
                "::/boot/" + name, os.path.relpath(extracted, ROOT).replace("\\", "/"))
         actual = file_sha256(extracted)
-        expected = file_sha256(os.path.join(CORE_BUILD, name))
+        expected = (a.baseline_payload[name] if a.baseline_payload else
+                    file_sha256(os.path.join(CORE_BUILD, name)))
         if actual != expected:
-            sys.exit("test: boot payload differs from current build: " + name)
+            sys.exit("test: boot payload differs from " +
+                     ("preserved baseline: " if a.baseline_payload else "current build: ") + name)
         payload[name] = actual
     make_disk(a, tcp_port, web_ports)
     image_hash = file_sha256(boot)
@@ -292,6 +297,8 @@ def run_vm(a, tcp_port, web_ports, processes):
     processes.append(q)
     metadata = {"pid": q.pid, "arguments": cmd, "boot_sha256": image_hash,
                 "boot_source": a.boot_image, "boot_payload_sha256": payload, "user_data_attached": False,
+                "test_source_tree": a.source_tree or ROOT,
+                "baseline_metadata": a.baseline_metadata,
                 "requested_resolution": a.resolution}
     metadata_path = os.path.join(BUILD, "test-metadata.json")
     with open(metadata_path, "w", encoding="utf-8") as f:
@@ -390,8 +397,14 @@ def main():
     ap.add_argument("--gpu", choices=("none", "virgl"), default="none", help="Optional secondary virgl GPU; requires host GL")
     ap.add_argument("--boot-image", default=os.path.join(CORE_BUILD, "nocturne.img"), help="Boot input; internal payload must match current build")
     ap.add_argument("--output-dir", help="New, unused directory under build/; preserve earlier test evidence")
+    ap.add_argument("--source-tree", help="Preserved test/header source tree for the matching baseline image")
+    ap.add_argument("--baseline-metadata", help="Preserved run metadata; strictly verify its boot hash and payload for --source-tree")
     ap.add_argument("groups", nargs="*")
     a = ap.parse_args()
+    if a.source_tree:
+        a.source_tree = os.path.abspath(a.source_tree)
+        if not os.path.isfile(os.path.join(a.source_tree, "tests", "runtests.c")):
+            ap.error("--source-tree must contain tests/runtests.c")
     if a.resolution and not re.fullmatch(r"[1-9][0-9]{0,4}x[1-9][0-9]{0,4}x32", a.resolution):
         ap.error("--resolution requires positive widthxheightx32")
     if a.memory < 256:
@@ -403,6 +416,22 @@ def main():
     a.boot_image = os.path.abspath(a.boot_image)
     if not os.path.isfile(a.boot_image):
         sys.exit("test: build first with the bundled toolchain")
+    a.baseline_payload = None
+    if a.baseline_metadata:
+        if not a.source_tree:
+            ap.error("--baseline-metadata requires the preserved --source-tree")
+        a.baseline_metadata = os.path.abspath(a.baseline_metadata)
+        with open(a.baseline_metadata, encoding="utf-8") as f:
+            baseline = json.load(f)
+        payload = baseline.get("boot_payload_sha256", {})
+        valid_hash = lambda value: isinstance(value, str) and bool(re.fullmatch("[0-9a-f]{64}", value))
+        if (baseline.get("process_stopped") is not True or baseline.get("user_data_attached") is not False or
+                not valid_hash(baseline.get("boot_sha256")) or
+                any(not valid_hash(payload.get(name)) for name in ("kernel.elf", "initrd.tar"))):
+            ap.error("baseline metadata must identify a stopped isolated run and both complete payload hashes")
+        if file_sha256(a.boot_image) != baseline["boot_sha256"]:
+            ap.error("baseline boot image does not match the preserved run hash")
+        a.baseline_payload = payload
     if a.output_dir:
         output = os.path.realpath(a.output_dir)
         core = os.path.realpath(CORE_BUILD)

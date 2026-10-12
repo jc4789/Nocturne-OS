@@ -115,7 +115,7 @@ typedef struct node {
     struct node *shadow_dirty_next, *shadow_slots, *shadow_slot_next;
     bool shadow_dirty;
     bool shadow_closed, shadow_delegates_focus, shadow_clonable, shadow_serializable;
-    bool shadow_manual, shadow_declarative;
+    bool shadow_manual, shadow_declarative, shadow_keep_registry_null;
     /* Native assignment snapshots/lists: these are not child/parent links. */
     struct node *assigned_slot, *assigned_next;
     struct node *pending_assigned_slot, *pending_assigned_next;
@@ -233,6 +233,7 @@ typedef struct node {
     struct cssom_sheet **adopted_sheets;
     uint32_t adopted_count;
     uint64_t resource_revision;
+    void *html_bindings; /* private active parser subscriptions, identity-owned */
     const char *option_label;
     uint64_t option_label_revision;
     struct web_paint_diagnostic *paint_diagnostic; /* debug-only, allocation owner frees */
@@ -253,6 +254,14 @@ typedef struct len {
     struct cexpr *expr;
 } len_t;
 float len_resolve(const len_t *l, float base); /* LK_AUTO/LK_NONE resolve to 0 */
+bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d); /* fallible/cancellable computed value; append/NUL or restore */
+struct css_filter_step { float value; bool percentage; };
+struct css_filter {
+    size_t count;
+    float opacity; /* product of used, range-clamped steps; not the computed list */
+    struct css_filter_step steps[];
+};
+bool css_filter_serialize(const struct css_filter *filter, sbuf *out, web_doc *d);
 static inline bool len_auto(const len_t *l) { return l->kind == LK_AUTO; }
 static inline bool len_none(const len_t *l) { return l->kind == LK_NONE; }
 static inline bool len_has_pct(const len_t *l) { return l->kind == LK_EXPR || (l->kind == LK_LEN && l->pct != 0); }
@@ -386,6 +395,7 @@ typedef struct style {
     float letter_spacing, word_spacing;
     float border_spacing;
     float opacity;
+    const struct css_filter *filter; /* NULL: none; identity effects still establish a context */
     struct css_motion motion; /* native opacity animation subset; not inherited */
     int z_index, order;
     const char *content; /* ::before / ::after text, NULL = none */
@@ -415,6 +425,15 @@ typedef struct style {
 
 /* ---------------------------------------------------------------- stylesheets */
 typedef struct sheet sheet_t;
+struct cached_css {
+    char *url, *base, *body;
+    size_t n;
+    bool done;
+    /* A completed fetch is immutable. Keep its parser ownership independent
+       of resource-scan snapshots; only scope/order/media instances are rebuilt. */
+    arena_t ast_mem;
+    sheet_t *ast;
+};
 typedef struct css_ctx css_ctx;
 /* Parser-owned CSSOM metadata points at the SAME native cascade AST. */
 struct css_rule_info {
@@ -544,6 +563,14 @@ typedef struct box {
     struct box *static_cb;
     uint32_t gen;           /* layout pass that listed it */
     struct box *cb;         /* the block box these coordinates are relative to */
+    struct box *inline_paint_owner, *inline_paint_source;
+    int inline_run_first, inline_run_last, inline_deco_first, inline_deco_last;
+    bool inline_cb_valid;
+    float inline_cb_left, inline_cb_top, inline_cb_right, inline_cb_bottom;
+    uint64_t paint_bounds_generation;
+    float paint_bounds[4]; /* document-space conservative subtree bounds, one paint only */
+    bool paint_bounds_valid;
+    bool paint_alpha; /* existing build/restyle traversal aggregates real subtree alpha effects */
     /* inline formatting results (block containers with inline content) */
     struct run *runs;
     int nruns;
@@ -606,6 +633,8 @@ struct run {
     box_t *atomic; /* or an atomic inline box at (x, y = its top) */
     bool highlight;
     node_t *node; /* original text/atomic node, for generic DOM event targeting */
+    box_t *paint_owner; /* filtered inline group; private layout-arena dependency */
+    int paint_next;
 };
 
 struct deco {
@@ -613,6 +642,8 @@ struct deco {
     style_t *st;
     bool first, last; /* the inline box starts / ends on this line */
     node_t *node;
+    box_t *paint_owner;
+    int paint_next;
 };
 
 node_t *doc_element_at(web_doc *d,int x,int y); /* hit retargeted to this Document's frame boundary */
@@ -632,6 +663,9 @@ float box_abs_y(const box_t *b);
 /* Paint/hit/DOMRect positions; box_abs remains unscrolled offset geometry. */
 float box_visual_x(const box_t *b);
 float box_visual_y(const box_t *b);
+bool box_filter_containing_block(const box_t *b); /* excludes the document root and boxless contents */
+bool box_viewport_fixed(const box_t *b); /* actual layout CB, not merely position:fixed */
+void box_abs_cb_rect(const box_t *cb, const web_doc *d, float rect[4]); /* x/y/w/h of padding CB in its content coordinates */
 void web_paint_debug_node_free(node_t *node);
 bool box_element_scrollable(const box_t *b);
 void box_scroll_clamp(box_t *b);
@@ -671,6 +705,8 @@ struct web_profile {
     uint64_t style_visits, style_rule_checks, style_index_entries, style_parallel_nodes;
 };
 struct web_doc {
+    uint64_t paint_bounds_generation;
+    bool paint_effect_failure_reported;
     struct css_motion_state *css_motions;
     uint64_t css_motion_now; /* supervisor snapshot; immutable during AP cascade */
     web_doc *frame_parent;
@@ -688,6 +724,8 @@ struct web_doc {
     struct web_profile profile;
     bool profile_enabled; /* debug_js only; diagnostic counters remain cheap */
     uint8_t clamp_trace_reported; /* at most four numeric diagnostics per document */
+    uint8_t replaced_trace_reported; /* debug only: at most two degenerate image diagnostics */
+    bool replaced_trace_pending; /* successful image update: consume at one coherent layout only */
     web_doc *dom_family, *dom_docs, *dom_next;
     bool js_nodes_dirty; /* structural/Attr ownership changed; not text/style */
     bool inert; /* independent DOM only: no window, loader, style/resource scan */
@@ -698,6 +736,8 @@ struct web_doc {
     node_t *shadow_dirty_first, *shadow_dirty_last;
     bool shadow_flushing;
     bool native_cancelled;
+    bool native_recovery_pending, native_recovery_active;
+    unsigned native_layout_depth; /* native work must unwind before recovery */
     uint32_t native_checkpoint_count;
     node_t *details_toggle_first, *details_toggle_last;
     web_doc *template_doc;
@@ -796,10 +836,23 @@ struct web_font_resource {
 struct web_font_resource *doc_font_resource(web_doc *d, const char *url);
 void doc_font_loaded(web_doc *d, struct web_font_resource *font, const void *bytes, size_t length);
 
-/* Incremental parser: 1 script boundary, 0 complete, -1 allocation failure.
+enum html_parse_result {
+    HTML_PARSE_CANCELLED = -2, HTML_PARSE_FAILED = -1,
+    HTML_PARSE_DONE = 0, HTML_PARSE_SCRIPT = 1,
+    HTML_PARSE_INPUT_WAIT = 2, HTML_PARSE_YIELD = 3
+};
+enum html_scripting_mode {
+    HTML_SCRIPTING_NORMAL, HTML_SCRIPTING_DISABLED,
+    HTML_SCRIPTING_INERT, HTML_SCRIPTING_FRAGMENT
+};
+/* YIELD publishes a coherent native tree without consuming following input.
+   Synchronous APIs pump YIELD immediately, without running general author
+   tasks. CANCELLED never represents successful EOF or DOM readiness.
    web_parse remains a scripting-disabled, fully parsed document. */
 struct html_parser *html_begin(web_doc *d, const char *html, size_t n, const char *charset, bool scripting);
 struct html_parser *html_begin_string(web_doc *d, const char *html, size_t n, bool scripting, bool allow_shadow);
+struct html_parser *html_begin_mode(web_doc *d, const char *html, size_t n, const char *charset, enum html_scripting_mode mode);
+struct html_parser *html_begin_string_mode(web_doc *d, const char *html, size_t n, enum html_scripting_mode mode, bool allow_shadow);
 struct html_parser *html_open(web_doc *d);
 void html_close(struct html_parser *parser);
 int html_resume(struct html_parser *p, node_t **script);
@@ -813,6 +866,7 @@ void html_finish(struct html_parser *p);
 node_t *html_fragment(web_doc *d, node_t *context, const char *html, size_t n);
 node_t *html_contextual_fragment(web_doc *d, node_t *context, const char *html, size_t n);
 node_t *html_fragment_ex(web_doc *d, node_t *context, const char *html, size_t n, bool allow_shadow, bool run_scripts);
+node_t *html_fragment_mode(web_doc *d, node_t *target, node_t *context, const char *html, size_t n, bool allow_shadow, enum html_scripting_mode mode);
 /* CSS overflow propagated from html/body belongs to the viewport, not a
    scrolled element-sized clipping rectangle. Computed styles stay intact. */
 bool doc_viewport_overflow_box(const web_doc *d, const box_t *b);
@@ -846,6 +900,7 @@ void doc_shadow_reassign(web_doc *d);
 void doc_shadow_dirty(node_t *root);
 void doc_shadow_flush(web_doc *d);
 bool web_native_checkpoint(web_doc *d);
+bool web_js_native_recover(web_doc *d); /* internal outer-stack/join barrier */
 void doc_slot_signal(node_t *slot);
 bool doc_slot_nodes(node_t *slot, bool flatten, pvec *out);
 bool doc_slot_assign(node_t *slot, node_t **nodes, int count);
@@ -864,6 +919,9 @@ bool doc_attr_remove(web_doc *d, node_t *element, int index);
 bool doc_attr_value(web_doc *d, node_t *attribute, const char *value);
 void doc_attrs_publish(node_t *element, struct attr *attrs, int count);
 bool doc_node_move(web_doc *d, node_t *parent, node_t *child, node_t *before);
+enum { HTML_BRIDGE_FIELDS=1, HTML_BRIDGE_LINKS=2, HTML_BRIDGE_CHILDREN=4 };
+void html_bridge_native_changed(node_t *node, unsigned flags);
+void html_bridge_native_retire(node_t *node); /* before allocation ownership ends */
 bool doc_node_replace(web_doc *d, node_t *parent, node_t *child, node_t *old);
 bool doc_node_replace_all(web_doc *d,node_t *parent,node_t *child);
 void doc_node_remove(web_doc *d, node_t *node);
@@ -886,6 +944,7 @@ bool doc_form_reset(web_doc *d, node_t *form);
 node_t *doc_select_option(node_t *select, int index);
 bool doc_option_selected(node_t *option);
 node_t *doc_node_clone(web_doc *d, node_t *node, bool deep);
+node_t *doc_node_clone_registry(web_doc *d, node_t *node, bool deep, int32_t fallback_registry, void *fallback_realm);
 void doc_mutated(web_doc *d, node_t *node);
 void doc_rescan(web_doc *d);
 void web_marquee_register(web_doc *d, node_t *node);

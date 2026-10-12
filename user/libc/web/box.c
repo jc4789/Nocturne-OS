@@ -21,6 +21,7 @@ static box_t *nbox(struct bctx *b, int kind, node_t *n, style_t *st) {
     x->kind = (uint8_t)kind;
     x->node = n;
     x->st = st;
+    x->paint_alpha = kind != B_TEXT && kind != B_BR && st && st->opacity * (st->filter ? st->filter->opacity : 1) < 1;
     x->baseline = -1;
     x->colspan = x->rowspan = 1;
     return x;
@@ -32,6 +33,7 @@ static void append(box_t *p, box_t *c) {
     if (p->last) p->last->next = c;
     else p->first = c;
     p->last = c;
+    p->paint_alpha |= c->paint_alpha;
 }
 
 static style_t *anon_style(struct bctx *b, const style_t *parent, int display) {
@@ -640,6 +642,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
     ws->height.kind = LK_AUTO;
     style_t *is = ar_alloc(b->a, sizeof *is);
     *is = *st;
+    is->filter = NULL; is->opacity = 1; /* the element's outer group composites once */
     is->display = inner_kind == B_TABLE ? D_TABLE : inner_kind == B_GRID ? D_GRID : D_FLEX;
     for (int i = 0; i < 4; i++) {
         is->margin[i].kind = LK_LEN;
@@ -977,6 +980,7 @@ static bool restyle_derived(box_t *b, style_t *old) {
         next.width.kind=next.height.kind=LK_AUTO;
     } else {
         next.display=b->kind == B_TABLE ? D_TABLE : b->kind == B_GRID ? D_GRID : D_FLEX;
+        next.filter=NULL; next.opacity=1;
         for (int i=0;i<4;i++) {
             next.margin[i].kind=LK_LEN; next.margin[i].px=next.margin[i].pct=0;
         }
@@ -1017,7 +1021,9 @@ static void restyle_boxes(box_t *b) {
         struct deco *deco=&b->decos[i];
         deco->st=replacement_style(deco->node?deco->node:fallback,deco->st);
     }
-    for (box_t *c = b->first; c; c = c->next) restyle_boxes(c);
+    b->paint_alpha = b->kind != B_TEXT && b->kind != B_BR && b->st &&
+        b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1) < 1;
+    for (box_t *c = b->first; c; c = c->next) { restyle_boxes(c); b->paint_alpha |= c->paint_alpha; }
 }
 void boxes_restyle(web_doc *d) { restyle_boxes(d->root_box); }
 

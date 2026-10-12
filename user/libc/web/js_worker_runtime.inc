@@ -27987,7 +27987,7 @@ static const char js_worker_runtime[] =
 "        // mutation-observer path for ordinary legacy insertion.\n"
 "        if(legacy&&!c&&!o.runScripts&&originalSetter)return apply(originalSetter,node,[values.html]);\n"
 "        const priorShadow=get(node,'shadowRoot');\n"
-"        const fragment=rawDom.parseFragment(node,values.html,false,{allowShadow,runScripts:!safe&&!!o.runScripts,sanitizing:!!c});sanitize(fragment,c,safe);\n"
+"        const fragment=rawDom.parseFragment(into,values.html,false,{allowShadow,runScripts:!safe&&!!o.runScripts,sanitizing:!!c});sanitize(fragment,c,safe);\n"
 "        const addedShadow=get(node,'shadowRoot');\n"
 "        if(addedShadow&&addedShadow!==priorShadow)sanitize(addedShadow,c,safe);\n"
 "        customElementsBridge.reactions(()=>{while(get(into,'firstChild'))dom('remove',get(into,'firstChild'));dom('insert',into,fragment,null);});\n"

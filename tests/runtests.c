@@ -144,7 +144,7 @@ static const struct test tests[] = {
     {"svggeometry", "native-viewbox-path-ctm", "tcc -I/data/tests -o /home/svggeometrytest /data/tests/svggeometrytest.c && /home/svggeometrytest", 0,
      {"svggeometrytest: 109 checks, 0 failed"}, "FAIL", 120, false, true},
     {"parserdedup", "native-transaction-delta", "tcc -I/data/tests -o /home/parserdeduptest /data/tests/parserdeduptest.c && /home/parserdeduptest", 0,
-     {"parserdedup: 37 checks, 0 failures"}, "FAIL", 120, false, true},
+     {"parserdedup: 78 checks, 0 failures"}, "FAIL", 120, false, true},
     {"htmlparser", "modern-native-tree", "tcc -I/data/tests -o /home/html_modern_tree_test /data/tests/html_modern_tree_test.c && /home/html_modern_tree_test", 0,
      {"html_modern_tree_test: ", ", 0 failures"}, "FAIL", 120, false, true},
     {"htmlparser", "native-input", "tcc -I/data/tests -o /home/html_input_test /data/tests/html_input_test.c && /home/html_input_test", 0,
@@ -369,12 +369,22 @@ static void run(const struct test *t) {
 
 int main(int argc, char **argv) {
     bool quick = false, nonet = false;
-    const char *only[16];
+    const char **only = malloc((size_t)argc * sizeof *only);
+    if (!only) { printf("TESTS ERROR selector allocation failed\n"); return 1; }
     int nonly = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-quick")) quick = true;
         else if (!strcmp(argv[i], "-nonet")) nonet = true;
-        else if (nonly < 16) only[nonly++] = argv[i];
+        else {
+            bool known = false;
+            for (size_t j = 0; j < sizeof tests / sizeof *tests; j++) {
+                char qualified[128];
+                snprintf(qualified, sizeof qualified, "%s/%s", tests[j].group, tests[j].name);
+                if (!strcmp(argv[i], tests[j].group) || !strcmp(argv[i], qualified)) { known = true; break; }
+            }
+            if (!known) { printf("TESTS ERROR unknown selector: %s\n", argv[i]); free(only); return 1; }
+            only[nonly++] = argv[i];
+        }
     }
     struct n_stat st;
     bool have_tcc_src = stat("/data/tests/tcc/tcc.c", &st) == 0;
@@ -405,6 +415,7 @@ int main(int argc, char **argv) {
         }
         run(t);
     }
+    free(only);
     printf("TESTS DONE pass=%d fail=%d skip=%d (%lu s)\n", npass, nfail, nskip, (unsigned long)((uptime_ms() - t0) / 1000));
     return nfail != 0;
 }

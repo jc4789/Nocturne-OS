@@ -434,7 +434,7 @@ const fetchBridge = (() => {
                 }
                 return false;
             }:undefined;
-            pair=host.fetch(s.url,s.method,raw,b.bytes===null?'':b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),forcePreflight,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache),s.keepalive,s.mode==='no-cors',noReferrer,notify);
+            pair=host.fetch(s.url,s.method,raw,b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),forcePreflight,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache),s.keepalive,s.mode==='no-cors',noReferrer,notify);
             transportId=pair.id;const transportPromise=pair.promise;pair=null;
             if(b.bytes!==null)b.used=true;
             return new NativePromise((resolve,reject)=>{

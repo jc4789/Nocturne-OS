@@ -104,8 +104,7 @@ static JSValue native_safety(JSContext *ctx,JSValueConst this_value,int argc,JSV
             pvec stack={0};pv_push(&stack,node);
             while(stack.n){node_t *n=stack.v[--stack.n];
                 if(n->type==N_ELEM && !n->foreign && n->tag==T_template)continue;
-                if(n->tag==T_script && n->script_parse_eligible && !n->script_started && connected(s,n)){n->script_parse_eligible=false;
-                    if(!web_js_script_parser_capture(n->owner,n)){result=JS_ThrowOutOfMemory(ctx);break;}
+                if(n->tag==T_script && n->script_parse_eligible && !n->script_started && connected(s,n)){
                     struct js_script *script=queue_script(s,n,true);
                     if(script && script->ready && !script->asynchronous)run_script(s,script);
                 }

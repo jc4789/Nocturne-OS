@@ -441,7 +441,10 @@ static const char *request_head(const struct http_req *rq, struct http_scratch *
     struct url_owned *u = &work->url;
     char port[8] = "", content_length[64] = "";
     if (u->port != (u->tls ? 443 : 80)) snprintf(port, sizeof port, ":%u", u->port);
-    if (rq->body || strcmp(method, "GET"))
+    if (rq->body_len && !rq->body) return "missing HTTP request body storage";
+    /* Fetch HTTP-network-or-cache: absent POST/PUT body generates zero;
+       other absent bodies must not become an allocated empty-body request. */
+    if (rq->body || !strcmp(method, "POST") || !strcmp(method, "PUT"))
         snprintf(content_length, sizeof content_length, "Content-Length: %zu\r\n", rq->body_len);
     const char *parts[] = {method, " ", u->path, " HTTP/1.1\r\nHost: ", u->host, port,
         "\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\nConnection: close\r\n", content_length};

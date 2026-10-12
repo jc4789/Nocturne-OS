@@ -115,6 +115,7 @@ const svgBridge = (() => {
         }
     }
     class SVGPathElement extends SVGGeometryElement {constructor(){throw new TypeErrorImpl('Illegal SVGPathElement constructor');}}
+    class SVGGElement extends SVGGraphicsElement {constructor(){throw new TypeErrorImpl('Illegal SVGGElement constructor');}}
     class SVGSVGElement extends SVGGraphicsElement {
         constructor(){throw new TypeErrorImpl('Illegal SVGSVGElement constructor');}
         get viewBox(){
@@ -135,10 +136,10 @@ const svgBridge = (() => {
             return rawDom.id(this,string(id));
         }
     }
-    const exports={SVGElement,SVGSVGElement,SVGAnimatedString,SVGAnimatedRect,SVGGraphicsElement,SVGGeometryElement,SVGPathElement};
+    const exports={SVGElement,SVGSVGElement,SVGAnimatedString,SVGAnimatedRect,SVGGraphicsElement,SVGGeometryElement,SVGPathElement,SVGGElement};
     for(const name of Object.keys(exports))define(exports[name].prototype,Symbol.toStringTag,{configurable:true,value:name});
     svgHandlerTarget = node => { try{return rawDom.get(node,'svgBrand')===true;}catch(_){return false;} };
     installHandlers(SVGElement.prototype,globalHandlerTypes);
     Object.assign(globalThis,exports);
-    return {nodeProtos:[SVGElement.prototype,SVGSVGElement.prototype],geometryNodeProtos:[SVGGraphicsElement.prototype,SVGPathElement.prototype]};
+    return {nodeProtos:[SVGElement.prototype,SVGSVGElement.prototype],geometryNodeProtos:[SVGGraphicsElement.prototype,SVGPathElement.prototype],groupProto:SVGGElement.prototype};
 })();

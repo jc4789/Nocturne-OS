@@ -132,6 +132,99 @@ static void http_tests(void) {
     check(same, "fragmented request pipe and binary POST ownership");
     release(&r);
 }
+static void debug_transport_tests(void) {
+    /* 製品workerのprivate診断除去を確認。サイト受入ではない。
+       隔離jarで、任意本文・Cookie・header値は試験ログへ出力しない。 */
+    webnet *saved = net;
+    net = webnet_create();
+    check(net != NULL, "数値診断の隔離通信jar確保");
+    if (!net) { net = saved; return; }
+    webnet_debug(net, true);
+    struct result r = {0};
+    const size_t length = 196613;
+    uint64_t id = request(&r, 0, "/api/pattern?n=196613", WEBNET_RESOURCE, "GET", NULL, NULL, 0, 309);
+    bool done = id && wait_result(&r, 40000);
+    bool same = done && success(&r) && r.length == length;
+    for (size_t i = 0; same && i < length; i++) same = (unsigned char)r.body[i] == (unsigned char)(i * 37 + 11);
+    check(same && !strstr(r.headers, "HTTP/Nocturne-Request"),
+          "数値診断除去後も分割binary body全byteとHTTP状態を保全");
+    check(done && success(&r) && r.id == id && r.generation == 309 &&
+          strstr(r.headers, "HTTP/1.1 200 ") && strstr(r.headers, "HTTP/Nocturne-Meta cors=0 redirected=0") &&
+          strstr(r.headers, "Content-Type: application/octet-stream\r\n"),
+          "数値診断だけをcallback前に除去し既存statusとheaderを保全");
+    if (!done) webnet_cancel_generation(net, 309);
+    release(&r);
+
+    char url[WEBNET_URL_MAX], visible[256];
+    snprintf(url, sizeof url,
+        "http://10.0.2.2:%d/api/cookie?set=diagnosticcookie%%3Dreceived%%3B%%20Path%%3D%%2F%%3B%%20HttpOnly", ports[0]);
+    struct webnet_request q = {.kind = WEBNET_RESOURCE, .generation = 310, .url = url, .origin = document,
+        .method = "GET", .credentials = WEBNET_CREDENTIALS_INCLUDE};
+    id = webnet_submit(net, &q, completed, &r); done = id && wait_result(&r, 40000);
+    static const char empty_cookie_body[] =
+        "{\"cookie\": \"\", \"origin\": \"\", \"preflight_cookie\": \"\", \"preflight_count\": 0}";
+    check(done && success(&r) && r.length == sizeof empty_cookie_body - 1 &&
+          !memcmp(r.body, empty_cookie_body, sizeof empty_cookie_body - 1) &&
+          !strstr(r.headers, "HTTP/Nocturne-Request") && !strstr(r.headers, "Set-Cookie") &&
+          !strstr(r.headers, "set-cookie") && webnet_cookie_get(net, document, visible, sizeof visible) == 0,
+          "数値診断除去で本文offsetと特権Cookie処理およびHttpOnly非露出を保全");
+    if (!done) webnet_cancel_generation(net, 310);
+    release(&r);
+    webnet_debug(net, false);
+    snprintf(url, sizeof url, "http://10.0.2.2:%d/api/cookie", ports[0]);
+    id = webnet_submit(net, &q, completed, &r); done = id && wait_result(&r, 40000);
+    check(done && success(&r) && strstr(r.body, "\"cookie\": \"diagnosticcookie=received\"") &&
+          !strstr(r.headers, "HTTP/Nocturne-Request") &&
+          webnet_cookie_get(net, document, visible, sizeof visible) == 0,
+          "元のCookie record offsetを保持し診断無効化後の要求へ正しく引継ぐ");
+    if (!done) webnet_cancel_generation(net, 310);
+    release(&r);
+    webnet_free(net); net = saved;
+}
+static void body_presence_tests(void) {
+    /* 固定fixtureが実際に受信したCLの数値/有無を確認する。
+       NULLをmalloc(1)の空bodyへ変えず、空の実bodyも消さない。 */
+    static const char *const methods[] = {"GET", "PATCH", "DELETE", "OPTIONS", "POST", "PUT"};
+    struct result r = {0};
+    char path[512], label[160], expected_method[64];
+    for (size_t i = 0; i < sizeof methods / sizeof *methods; i++) {
+        snprintf(path, sizeof path, "/api/request-info?probe=null-body-%s", methods[i]);
+        uint64_t id = request(&r, 0, path, i ? WEBNET_FETCH : WEBNET_RESOURCE, methods[i], NULL, NULL, 0, 311);
+        bool done = id && wait_result(&r, 40000);
+        snprintf(expected_method, sizeof expected_method, "\"method\": \"%s\"", methods[i]);
+        snprintf(label, sizeof label, "NULL %s bodyの実CL生成規則と空本文を保全", methods[i]);
+        check(done && success(&r) && strstr(r.body, expected_method) && strstr(r.body, "\"body_length\": 0") &&
+              strstr(r.body, i >= 4 ? "\"content_length\": 0" : "\"content_length\": null"), label);
+        if (!done) webnet_cancel_generation(net, 311);
+        release(&r);
+    }
+    static const char *const empty_methods[] = {"PATCH", "DELETE"};
+    for (size_t i = 0; i < sizeof empty_methods / sizeof *empty_methods; i++) {
+        snprintf(path, sizeof path, "/api/request-info?probe=empty-body-%s", empty_methods[i]);
+        uint64_t id = request(&r, 0, path, WEBNET_FETCH, empty_methods[i], NULL, "", 0, 312);
+        bool done = id && wait_result(&r, 40000);
+        snprintf(expected_method, sizeof expected_method, "\"method\": \"%s\"", empty_methods[i]);
+        snprintf(label, sizeof label, "空の実%s bodyをNULLへ消さずCL0で転送", empty_methods[i]);
+        check(done && success(&r) && strstr(r.body, expected_method) &&
+              strstr(r.body, "\"body_length\": 0") && strstr(r.body, "\"content_length\": 0"), label);
+        if (!done) webnet_cancel_generation(net, 312);
+        release(&r);
+    }
+    static const unsigned statuses[] = {303, 307};
+    for (size_t i = 0; i < sizeof statuses / sizeof *statuses; i++) {
+        snprintf(path, sizeof path,
+            "/api/redirect?status=%u&url=/api/request-info%%3Fprobe%%3Dempty-redirect-%u", statuses[i], statuses[i]);
+        uint64_t id = request(&r, 0, path, WEBNET_FETCH, "POST", "Content-Type: text/plain\r\n", "", 0, 313);
+        bool done = id && wait_result(&r, 40000);
+        snprintf(label, sizeof label, "HTTP%uで空bodyと関連headerのdrop/retainを保全", statuses[i]);
+        check(done && success(&r) && strstr(r.body, "\"body_length\": 0") &&
+              strstr(r.body, i ? "\"method\": \"POST\"" : "\"method\": \"GET\"") &&
+              strstr(r.body, i ? "\"content_length\": 0" : "\"content_length\": null") &&
+              strstr(r.body, i ? "\"content_type\": \"text/plain\"" : "\"content_type\": \"\""), label);
+        if (!done) webnet_cancel_generation(net, 313);
+        release(&r);
+    }
+}
 /* URL-encode the exact target path, including its query. The fixture records
    actual requests separately from OPTIONS, so an error alone is not evidence
    that a rejected operation refrained from contacting its target endpoint. */
@@ -806,7 +899,7 @@ int main(int argc, char **argv) {
     snprintf(document, sizeof document, "http://10.0.2.2:%d/index.html", ports[0]);
     net = webnet_create();
     if (!net) { puts("FAIL webnet allocation"); return 1; }
-    http_tests(); fetch_contract_tests(); cache_tests(); concurrency_tests(); cors_tests(); redirect_tests(); long_url_tests(); file_tests(); cookie_tests(); header_block_tests(); cors_boundary_regression_tests(); limit_tests();
+    http_tests(); debug_transport_tests(); body_presence_tests(); fetch_contract_tests(); cache_tests(); concurrency_tests(); cors_tests(); redirect_tests(); long_url_tests(); file_tests(); cookie_tests(); header_block_tests(); cors_boundary_regression_tests(); limit_tests();
     webnet_free(net);
     printf("webnettest: %d failed\n", failed);
     return failed != 0;

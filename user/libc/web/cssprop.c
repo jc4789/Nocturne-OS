@@ -161,11 +161,60 @@ static bool parse_number(const char **ps, const char *e, float *out) {
         s++;
         int es = 1, ev = 0;
         if (*s == '-' || *s == '+') es = *s++ == '-' ? -1 : 1;
-        while (s < e && *s >= '0' && *s <= '9') ev = ev * 10 + (*s++ - '0');
+        while (s < e && *s >= '0' && *s <= '9') {
+            /* A huge exponent is still a number token, not signed-int UB. */
+            if (ev < 10000) ev = ev * 10 + (*s - '0');
+            s++;
+        }
         v *= pow(10, es * ev);
     }
     *out = (float)(sign * v);
     *ps = s;
+    return true;
+}
+
+/* The implemented filter backend is a real opacity function list. Preserve
+   computed numbers/percentages (including values above one), while clipping
+   only their used amounts. Unknown effects invalidate the whole declaration. */
+static bool parse_filter(const char *v, size_t n, struct cx *cx, const struct css_filter **out) {
+    if (ident_is(v, n, "none")) { *out = NULL; return true; }
+    size_t count = 0;
+    const char *end = v + n;
+    struct css_filter *result = NULL;
+    for (unsigned pass = 0; pass < 2; pass++) {
+        const char *q = v;
+        size_t i = 0;
+        float used = 1;
+        while (q < end) {
+            while (q < end && is_space((unsigned char)*q)) q++;
+            if (q == end) break;
+            if ((size_t)(end - q) < 8 || !strn_ieq(q, "opacity", 7) || q[7] != '(') return false;
+            q += 8;
+            while (q < end && is_space((unsigned char)*q)) q++;
+            float value = 1;
+            bool percentage = false;
+            if (q == end) return false;
+            if (*q != ')') {
+                if (!parse_number(&q, end, &value) || !isfinite(value) || value < 0) return false;
+                if (q < end && *q == '%') { percentage = true; q++; }
+                while (q < end && is_space((unsigned char)*q)) q++;
+            }
+            if (q == end || *q++ != ')') return false;
+            if (i == SIZE_MAX) return false;
+            if (pass) result->steps[i] = (struct css_filter_step){value, percentage};
+            i++;
+            float amount = percentage ? value / 100 : value;
+            used *= amount > 1 ? 1 : amount;
+            if (!(i & 63) && !cx->supports_probe && cx->node && !web_native_checkpoint(cx->node->owner)) return false;
+        }
+        if (!i) return false;
+        if (!pass) {
+            count = i;
+            if (count > (SIZE_MAX - sizeof *result) / sizeof *result->steps) return false;
+            result = ar_alloc(cx->a, sizeof *result + count * sizeof *result->steps);
+        } else { result->count = count; result->opacity = used; }
+    }
+    *out = result;
     return true;
 }
 
@@ -434,6 +483,128 @@ float len_resolve(const len_t *l, float base) {
     case LK_EXPR: return len_clamp(ceval(l->expr, base));
     }
     return 0;
+}
+
+/* CSSOM must preserve unresolved percentages and comparison expressions,
+   not turn opaque calculation nodes into a fabricated zero. Keep this next
+   to the native calculation representation; callers never mirror cexpr.
+   Unlike the general sb_put API, this author-readable path reports OOM. */
+static bool length_append(sbuf *out, const char *text, size_t length) {
+    if (out->n == SIZE_MAX || length > SIZE_MAX - out->n - 1) return false;
+    size_t need = out->n + length + 1;
+    if (need > out->cap) {
+        size_t capacity = out->cap ? out->cap : 64;
+        while (capacity < need) {
+            if (capacity > SIZE_MAX / 2) { capacity = need; break; }
+            capacity *= 2;
+        }
+        char *p = realloc(out->p, capacity);
+        if (!p) return false;
+        out->p = p; out->cap = capacity;
+    }
+    memcpy(out->p + out->n, text, length);
+    out->n += length; out->p[out->n] = 0;
+    return true;
+}
+static bool length_number(sbuf *out, float value, const char *unit) {
+    if (!isfinite(value)) return false;
+    if (value == 0) value = 0; /* CSS serialization has no negative zero. */
+    char number[64];
+    int n = snprintf(number, sizeof number, "%.9g%s", (double)value, unit);
+    return n > 0 && (size_t)n < sizeof number && length_append(out, number, (size_t)n);
+}
+bool css_filter_serialize(const struct css_filter *filter, sbuf *out, web_doc *d) {
+    size_t original = out->n;
+    bool success = false;
+    if (!filter) success = length_append(out, "none", 4);
+    else if (filter->count) {
+        success = true;
+        for (size_t i = 0; i < filter->count; i++) {
+            if (!(i & 63) && d && !web_native_checkpoint(d)) { success = false; break; }
+            const struct css_filter_step *step = &filter->steps[i];
+            if (step->value < 0 || (i && !length_append(out, " ", 1)) ||
+                !length_append(out, "opacity(", 8) || !length_number(out, step->value, step->percentage ? "%" : "") ||
+                !length_append(out, ")", 1)) { success = false; break; }
+        }
+    }
+    if (!success) {
+        out->n = original;
+        if (out->p && original < out->cap) out->p[original] = 0;
+    }
+    return success;
+}
+static bool length_coefficients(sbuf *out, float px, float pct, bool number) {
+    if (!isfinite(px) || !isfinite(pct)) return false;
+    if (number) return pct == 0 && length_number(out, px, "");
+    if (pct == 0) return length_number(out, px, "px");
+    if (px == 0) return length_number(out, pct, "%");
+    return length_append(out, "calc(", 5) && length_number(out, px, "px") &&
+        length_append(out, pct < 0 ? " - " : " + ", 3) && length_number(out, fabsf(pct), "%") &&
+        length_append(out, ")", 1);
+}
+struct length_frame { const struct cexpr *node; unsigned phase; };
+static bool length_expression(sbuf *out, const struct cexpr *expression, web_doc *d) {
+    struct length_frame local[32], *stack = local;
+    size_t capacity = sizeof local / sizeof local[0], count = 1;
+    local[0] = (struct length_frame){expression, 0};
+    bool success = false;
+    unsigned work = 0;
+    while (count) {
+        struct length_frame *frame = &stack[count - 1];
+        const struct cexpr *x = frame->node, *child = NULL;
+        if (!x) goto done;
+        if (frame->phase == 0 && d && !(++work & 63) && !web_native_checkpoint(d)) goto done;
+        if (x->op == 'v') {
+            if (!length_coefficients(out, x->px, x->pct, x->num)) goto done;
+            count--; continue;
+        }
+        bool comparison = x->op == 'm' || x->op == 'M';
+        if (!comparison && x->op != '+' && x->op != '-' && x->op != '*' && x->op != '/') goto done;
+        if (!x->a || !x->b) goto done;
+        if (frame->phase == 0) {
+            const char *open = comparison ? (x->op == 'm' ? "min(" : "max(") : count == 1 ? "calc(" : "(";
+            if (!length_append(out, open, strlen(open))) goto done;
+            frame->phase = 1; child = x->a;
+        } else if (frame->phase == 1) {
+            char op[3] = {' ', x->op, ' '};
+            if (!length_append(out, comparison ? ", " : op, comparison ? 2 : sizeof op)) goto done;
+            frame->phase = 2; child = x->b;
+        } else {
+            if (!length_append(out, ")", 1)) goto done;
+            count--; continue;
+        }
+        if (count == capacity) {
+            if (capacity > SIZE_MAX / 2 / sizeof *stack) goto done;
+            size_t next = capacity * 2;
+            struct length_frame *grown = stack == local ? malloc(next * sizeof *stack) : realloc(stack, next * sizeof *stack);
+            if (!grown) goto done;
+            if (stack == local) memcpy(grown, local, count * sizeof *stack);
+            stack = grown; capacity = next;
+        }
+        stack[count++] = (struct length_frame){child, 0};
+    }
+    success = true;
+done:
+    if (stack != local) free(stack);
+    return success;
+}
+bool css_length_serialize(const len_t *l, sbuf *out, web_doc *d) {
+    if (!l || !out || out->n > out->cap || (!out->p && (out->n || out->cap))) return false;
+    size_t begin = out->n;
+    bool success = false;
+    switch (l->kind) {
+    case LK_AUTO: success = length_append(out, "auto", 4); break;
+    case LK_NONE: success = length_append(out, "none", 4); break;
+    case LK_NORMAL: success = length_append(out, "normal", 6); break;
+    case LK_NUMBER: success = length_coefficients(out, l->px, l->pct, true); break;
+    case LK_LEN: success = length_coefficients(out, l->px, l->pct, false); break;
+    case LK_EXPR: success = length_expression(out, l->expr, d); break;
+    }
+    if (!success) {
+        out->n = begin;
+        if (out->p && begin < out->cap) out->p[begin] = 0;
+    }
+    return success;
 }
 
 static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int flags) {
@@ -771,7 +942,7 @@ struct kw {
 
 enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_FONT_SIZE, PT_FONT_WEIGHT,
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
-       PT_OVERFLOW, PT_OPACITY, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
+       PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
        PT_MOTION_NAME, PT_MOTION_TIME, PT_MOTION_ITERATIONS, PT_MOTION_EASING };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
@@ -945,6 +1116,7 @@ static struct propdef props[] = {
     {"float", PT_KW, 0, false, O(float_), kw_float, 0},
     {"fill", PT_SVG_PAINT, 0, true, O(svg_fill), NULL, 0},
     {"fill-opacity", PT_OPACITY, 0, true, O(svg_fill_opacity), NULL, 0},
+    {"filter", PT_FILTER, 0, false, O(filter), NULL, 0},
     {"fill-rule", PT_KW, 0, true, O(svg_fill_rule), kw_svg_fill_rule, 0},
     SH("font", SH_FONT),
     {"font-family", PT_FONT_FAMILY, 0, true, O(font_family), NULL, 0},
@@ -2101,6 +2273,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         *(float *)field = x;
         return true;
     }
+    case PT_FILTER: return parse_filter(v, n, cx, &s->filter);
     case PT_OPACITY: {
         const char *q = v;
         float x;

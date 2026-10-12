@@ -12,6 +12,8 @@
 <ol id="results"></ol>
 <script>
 globalThis.fixtureOrder = [];
+globalThis.moduleStarted = globalThis.moduleRan = globalThis.fixtureDCL = false;
+globalThis.fixtureModuleGate = new Promise(resolve => globalThis.releaseFixtureModule = resolve);
 globalThis.record = function (name, ok, detail) {
     const row = document.createElement('li');
     row.textContent = (ok ? 'PASS: ' : 'FAIL: ') + name + (detail ? ' — ' + detail : '');
@@ -82,9 +84,27 @@ document.getElementById('fetch-button').addEventListener('click',async()=>{
     }catch(e){out.textContent='failed: '+e.message;record('fetch operation',false,e.message);}
 });
 document.addEventListener('DOMContentLoaded',()=>{
-    record('defer / module precede DOMContentLoaded',globalThis.deferRan===true&&globalThis.moduleRan===true);
+    fixtureOrder.push('dom-ready');globalThis.fixtureDCL=true;
+    record('defer and module start precede DOMContentLoaded without waiting for top-level await',globalThis.deferRan===true&&globalThis.moduleStarted===true&&globalThis.moduleRan===false);
+    releaseFixtureModule();
     record('written nodes exist',document.getElementById('written').nextSibling===document.getElementById('written-second'));
-    try{document.write('MUST NOT WRITE');record('late document.write rejected',false);}catch(e){record('late document.write rejected',true);}
+    // A completed HTML document opens a new stream on write. Use an independent
+    // browsing context so this destructive contract cannot erase the controls.
+    const mainResults=document.getElementById('results'),frame=document.createElement('iframe');frame.hidden=true;document.body.appendChild(frame);
+    const fresh=frame.contentDocument;
+    fresh.open();
+    fresh.addEventListener('DOMContentLoaded',()=>{
+        const previousRoot=fresh.documentElement,retained=fresh.createElement('span');
+        try{
+            fresh.write('<!doctype html><p id="replacement">late write</p>');
+            record('late document.write opens a new stream',frame.contentDocument===fresh&&fresh.documentElement!==previousRoot&&fresh.getElementById('previous')===null&&fresh.getElementById('replacement').textContent==='late write'&&fresh.readyState==='loading');
+            record('late write preserves Document and retained node owners',previousRoot.ownerDocument===fresh&&retained.ownerDocument===fresh&&!retained.isConnected);
+            fresh.close();
+            record('destructive write leaves the main interactive document intact',document.getElementById('results')===mainResults&&document.getElementById('counter')!==null&&document.getElementById('fetch-button')!==null);
+        }catch(e){record('late document.write opens a new stream',false,e.message);}
+        finally{setTimeout(()=>frame.remove(),0);}
+    },{once:true});
+    fresh.write('<!doctype html><p id="previous">initial fresh document</p>');fresh.close();
     document.getElementById('status').textContent='DOM ready. Click the counter and fetch buttons.';
 });
 window.addEventListener('load',()=>record('window load follows DOMContentLoaded',document.readyState==='complete'));

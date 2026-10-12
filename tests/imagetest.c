@@ -5,6 +5,31 @@
 #include <string.h>
 #include "nocturne.h"
 #include "web.h"
+#include "image.h"
+/* A valid transparent palette image exposed the browser's divide fault.
+ * Also exercise non-byte-aligned widths through the real image decoder. */
+static int codec_regressions(void) {
+    static const unsigned char webp[] = {
+        0x52,0x49,0x46,0x46,0x1a,0,0,0,0x57,0x45,0x42,0x50,
+        0x56,0x50,0x38,0x4c,0x0d,0,0,0,0x2f,0,0,0,0x10,
+        0x07,0x10,0x11,0x11,0x88,0x88,0xfe,0x07,0
+    };
+    const int widths[] = {1,3,5,9};
+    int failures=0;
+    for (unsigned i=0;i<sizeof widths/sizeof widths[0];i++) {
+        unsigned char data[sizeof webp];memcpy(data,webp,sizeof data);
+        data[21]=(unsigned char)(widths[i]-1);
+        image_t *img=image_decode(data,sizeof data);
+        bool ok=img&&img->w==widths[i]&&img->h==1;
+        for (int x=0;ok&&x<widths[i];x++) ok=img->px[x]==0;
+        printf("%s WebP palette width=%d transparent pixels\n",ok?"OK":"FAIL",widths[i]);
+        failures+=!ok;image_free(img);
+    }
+    image_t *truncated=image_decode(webp,sizeof webp-6);
+    printf("%s truncated WebP rejected\n",truncated?"FAIL":"OK");
+    failures+=truncated!=NULL;image_free(truncated);
+    return failures;
+}
 struct queued { uint64_t id,due; char url[2048]; bool used; };
 static struct { web_doc *doc; struct queued pending[16]; int errors,failures,requests,images,completions; bool done; } state;
 static const char one[]="<svg xmlns='http://www.w3.org/2000/svg' width='2' height='3'><rect width='2' height='3' fill='red'/></svg>";
@@ -34,7 +59,10 @@ static void deliver(void){
         web_resource_loaded(state.doc,q.id,&r);memset(r.body,'!',r.body_len);free(r.body);state.completions++;
     }
 }
-int main(void){
+int main(int argc,char **argv){
+    int codec_failures=codec_regressions();
+    if(argc>1&&!strcmp(argv[1],"--codec-only"))return codec_failures!=0;
+    state.failures+=codec_failures;
     FILE *file=fopen("/data/tests/js_image_cases.js","rb");if(!file){puts("FAIL Image test source missing");return 1;}
     fseek(file,0,SEEK_END);long length=ftell(file);rewind(file);
     if(length<0||length>65536){fclose(file);puts("FAIL Image test source length");return 1;}

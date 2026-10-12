@@ -7,7 +7,7 @@ function runSVGGeometryCases(){
     const NS='http://www.w3.org/2000/svg',make=name=>document.createElementNS(NS,name);
     const svg=document.querySelector('#geometry-root'),g=svg.querySelector('g'),path=g.querySelector('path');
     check('svg-root-graphics-prototype',svg instanceof SVGSVGElement&&svg instanceof SVGGraphicsElement);
-    check('svg-group-graphics-prototype',Object.getPrototypeOf(g)===SVGGraphicsElement.prototype&&g instanceof SVGElement);
+    check('svg-group-graphics-prototype',Object.getPrototypeOf(g)===SVGGElement.prototype&&Object.getPrototypeOf(SVGGElement.prototype)===SVGGraphicsElement.prototype&&g instanceof SVGGElement&&g instanceof SVGGraphicsElement&&g instanceof SVGElement&&g instanceof Element&&g instanceof Node&&!(g instanceof SVGSVGElement)&&!(g instanceof HTMLElement));
     check('svg-path-geometry-prototype',Object.getPrototypeOf(path)===SVGPathElement.prototype&&path instanceof SVGGeometryElement&&path instanceof SVGGraphicsElement);
     for(const C of [SVGElement,SVGSVGElement,SVGGraphicsElement,SVGGeometryElement,SVGPathElement,SVGAnimatedRect])illegal('svg-illegal-'+C.name,()=>new C());
     const animated=svg.viewBox,base=animated.baseVal,anim=animated.animVal;

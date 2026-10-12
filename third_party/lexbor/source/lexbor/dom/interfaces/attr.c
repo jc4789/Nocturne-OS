@@ -233,6 +233,9 @@ lxb_dom_attr_set_value(lxb_dom_attr_t *attr,
     new_value->data[value_len] = 0x00;
     new_value->length = value_len;
 
+    if (attr->owner != NULL)
+        lxb_dom_node_parser_changed(&attr->owner->node, LXB_DOM_NODE_PARSER_FIELDS);
+
     if (!(lxb_dom_document_opt(doc) & LXB_DOM_DOCUMENT_OPT_WO_EVENTS)
         && doc->attr_mutation->change != NULL && attr->owner != NULL)
     {
@@ -264,6 +267,9 @@ lxb_dom_attr_set_value_wo_copy(lxb_dom_attr_t *attr,
 
     attr->value->data = value;
     attr->value->length = value_len;
+
+    if (attr->owner != NULL)
+        lxb_dom_node_parser_changed(&attr->owner->node, LXB_DOM_NODE_PARSER_FIELDS);
 
     return LXB_STATUS_OK;
 }
@@ -362,6 +368,8 @@ lxb_dom_attr_remove(lxb_dom_attr_t *attr)
     attr->next = NULL;
     attr->prev = NULL;
     attr->owner = NULL;
+
+    lxb_dom_node_parser_changed(&element->node, LXB_DOM_NODE_PARSER_FIELDS);
 
     if (!(lxb_dom_document_opt(doc) & LXB_DOM_DOCUMENT_OPT_WO_EVENTS)
         && doc->attr_mutation->remove != NULL)

@@ -264,6 +264,32 @@ void box_scroll_clamp(box_t *b) {
     n->scroll_y = scroll_limit(n->scroll_y, my);
 }
 
+bool box_filter_containing_block(const box_t *b) {
+    const box_t *effect = b;
+    /* wrapped() paints an element's effect on the outer box once, but the
+       inner box owns its real padding/border containing-block geometry. */
+    if (b && (b->kind == B_FLEX || b->kind == B_GRID || b->kind == B_TABLE) &&
+        b->parent && b->parent->kind == B_ATOMIC && b->parent->atomic == AT_INLINE_BLOCK &&
+        b->node && b->node == b->parent->node) effect = b->parent;
+    return effect && effect->st && effect->st->filter && b->kind != B_TEXT && b->kind != B_BR &&
+        !(b->node && b->node->owner && b->node == b->node->owner->html);
+}
+bool box_viewport_fixed(const box_t *b) {
+    return b && b->st && b->st->position == POS_FIXED &&
+        (!b->cb || !b->cb->parent);
+}
+void box_abs_cb_rect(const box_t *cb, const web_doc *d, float rect[4]) {
+    if (!cb || cb == d->root_box) {
+        rect[0] = rect[1] = 0; rect[2] = (float)d->width; rect[3] = (float)d->height;
+    } else if (cb->kind == B_INLINE && cb->inline_cb_valid) {
+        rect[0] = cb->inline_cb_left; rect[1] = cb->inline_cb_top;
+        rect[2] = fmaxf_(0, cb->inline_cb_right - cb->inline_cb_left);
+        rect[3] = fmaxf_(0, cb->inline_cb_bottom - cb->inline_cb_top);
+    } else {
+        rect[0] = -cb->p[3]; rect[1] = -cb->p[0];
+        rect[2] = cb->w + cb->p[1] + cb->p[3]; rect[3] = cb->h + cb->p[0] + cb->p[2];
+    }
+}
 float box_visual_x(const box_t *b) {
     double x = box_abs_x(b);
     if(b->node && b->node->owner && b->node->owner->marquees.n)
@@ -271,7 +297,7 @@ float box_visual_x(const box_t *b) {
             if(web_marquee_box(a))x+=a->node->marquee_x;
     for (const box_t *c = b; c; c = c->cb) {
         if (c != b && c->node && c->node->scroll_x != 0 && box_element_scrollable(c)) x -= c->node->scroll_x;
-        if (c->st && c->st->position == POS_FIXED) {
+        if (box_viewport_fixed(c)) {
             /* Visual coordinates are document coordinates. Layout keeps the
                fixed containing block in viewport coordinates, so publish the
                real viewport offset once, also for every fixed descendant. */
@@ -289,7 +315,7 @@ float box_visual_y(const box_t *b) {
             if(web_marquee_box(a))y+=a->node->marquee_y;
     for (const box_t *c = b; c; c = c->cb) {
         if (c != b && c->node && c->node->scroll_y != 0 && box_element_scrollable(c)) y -= c->node->scroll_y;
-        if (c->st && c->st->position == POS_FIXED) {
+        if (box_viewport_fixed(c)) {
             if (c->node && c->node->owner) y += c->node->owner->view_y;
             break;
         }
@@ -390,7 +416,7 @@ const char *web_button_label(node_t *n) {
     return "";
 }
 
-static void replaced_natural(box_t *c, float *iw, float *ih, float *ratio) {
+static void replaced_natural(box_t *c, float *iw, float *ih, double *ratio) {
     node_t *n = c->node;
     *iw = *ih = *ratio = 0;
     switch (c->atomic) {
@@ -399,7 +425,7 @@ static void replaced_natural(box_t *c, float *iw, float *ih, float *ratio) {
         if (im && im->img) {
             *iw = (float)im->img->w;
             *ih = (float)im->img->h;
-            *ratio = *ih > 0 ? *iw / *ih : 0;
+            *ratio = *ih > 0 ? (double)*iw / *ih : 0;
         } else if (!im || im->failed) {
             const char *alt = node_attr(n, "alt");
             if (alt && *alt) {
@@ -417,8 +443,8 @@ static void replaced_natural(box_t *c, float *iw, float *ih, float *ratio) {
            absolute computed lengths are intrinsic dimensions (not %/auto). */
         *iw = spec_w(c, &c->st->width, -1);
         *ih = spec_h(c, &c->st->height, -1);
-        if (*iw > 0 && *ih > 0) *ratio = *iw / *ih;
-        else if (view == 1) *ratio = vb[2] / vb[3];
+        if (*iw > 0 && *ih > 0) *ratio = (double)*iw / *ih;
+        else if (view == 1) *ratio = (double)vb[2] / vb[3];
         if (*iw < 0 && *ih < 0) {
             /* No intrinsic dimensions: contain the ratio in the default
                300x150 object rectangle; viewBox is not a pixel size. */
@@ -440,13 +466,17 @@ static void replaced_natural(box_t *c, float *iw, float *ih, float *ratio) {
         else if (n->tag == T_meter || n->tag == T_progress) *iw = 80, *ih = 16;
         else if (str_ieq(n->name, "input")) *iw = 129, *ih = 16; /* range */
         else *iw = 300, *ih = 150;
-        *ratio = *ih>0 ? *iw / *ih : 0;
+        *ratio = *ih>0 ? (double)*iw / *ih : 0;
         break;
     }
 }
 
 static void size_replaced(box_t *c, float cbw, float cbh) {
-    float iw, ih, ratio;
+    float iw, ih;
+    /* Round only the final used dimension to the layout float. A float ratio
+       such as 3/5 makes 60/(3/5) fall just below 100 before CSSOM/pixel integer
+       conversion, losing a pixel of image and subsequent flow geometry. */
+    double ratio;
     replaced_natural(c, &iw, &ih, &ratio);
     if(size_container(c)) {
         iw=0;ratio=0;
@@ -480,7 +510,7 @@ static void size_replaced(box_t *c, float cbw, float cbh) {
         if (ratio > 0 && derive_w) w = mxh * ratio;
         h = mxh;
     }
-    if (c->atomic == AT_SVG && ratio > 0 && !size_container(c)) {
+    if (ratio > 0 && !size_container(c)) {
         /* Transfer min constraints too when the opposite axis is automatic.
            The final independent clamps retain both author limits when those
            limits cannot be satisfied at the same aspect ratio. */
@@ -611,6 +641,8 @@ struct ibuild {
     bool last_space;
     node_t *link;
     float shift;
+    box_t *paint_owner;
+    bool collect_paint;
 };
 
 static float va_shift(const style_t *st) {
@@ -728,6 +760,7 @@ static void build_items(box_t *parent, struct ibuild *s) {
     for (box_t *c = parent->first; c; c = c->next) {
         if (!layout_checkpoint()) break;
         layout_media_checkpoint();
+        if (s->collect_paint) c->inline_paint_owner = s->paint_owner;
         if (c->abspos) {
             ipush(s->v, IT_ABS)->box = c;
             continue;
@@ -748,6 +781,13 @@ static void build_items(box_t *parent, struct ibuild *s) {
             break;
         }
         case B_INLINE: {
+            box_t *saved_owner = s->paint_owner;
+            if (c->st->filter || c->st->opacity < 1) s->paint_owner = c;
+            if (s->collect_paint) {
+                c->inline_paint_owner = s->paint_owner;
+                c->inline_run_first = c->inline_run_last = c->inline_deco_first = c->inline_deco_last = -1;
+                c->inline_paint_source = NULL; c->inline_cb_valid = false;
+            }
             node_t *save_link = s->link;
             float save_shift = s->shift;
             if (c->node && c->node->tag == T_a && node_attr(c->node, "href")) s->link = c->node;
@@ -769,6 +809,7 @@ static void build_items(box_t *parent, struct ibuild *s) {
             it->shift = s->shift;
             s->link = save_link;
             s->shift = save_shift;
+            s->paint_owner = saved_owner;
             break;
         }
         default: {
@@ -807,7 +848,7 @@ struct open_box {
 struct iline {
     box_t *blk;
     struct bfc *f;
-    float ox, oy;
+    float ox, oy, cbh;
     struct ivec *items;
     sbuf runs, decos, lines;
     struct open_box *open;
@@ -821,7 +862,7 @@ struct iline {
     int npending;
 };
 
-static void place_float(box_t *c, box_t *parent, struct bfc *f, float ox, float oy, float y_rel);
+static void place_float(box_t *c, box_t *parent, struct bfc *f, float ox, float oy, float y_rel, float cbh);
 
 static void line_space(struct iline *L) {
     box_t *b = L->blk;
@@ -850,6 +891,16 @@ static void add_deco(struct iline *L, box_t *ib, float x0, float x1, float basel
     d.first = first;
     d.last = last;
     d.node = ib->node;
+    d.paint_owner = ib->inline_paint_owner; d.paint_next = -1;
+    /* Keep the first/last line padding-edge rectangle for an inline filter
+       containing block without making the inline an atomic flow box. */
+    ib->cb = L->blk;
+    if (!ib->inline_cb_valid) {
+        ib->inline_cb_left = d.x + ib->b[3]; ib->inline_cb_top = d.y + ib->b[0];
+        ib->inline_cb_valid = true;
+    }
+    ib->inline_cb_right = d.x + d.w - ib->b[1];
+    ib->inline_cb_bottom = d.y + d.h - ib->b[2];
     sb_put(&L->decos, (const char *)&d, sizeof d);
 }
 
@@ -998,7 +1049,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
                 while (n > 0 && it->s[n - 1] == ' ') n--;
             }
             struct run r = {x, baseline - it->shift, w, it->s, n, it->st, it->link, NULL, false,
-                            it->box ? it->box->node : NULL};
+                            it->box ? it->box->node : NULL, it->box ? it->box->inline_paint_owner : NULL, -1};
             if (n > 0) sb_put(&L->runs, (const char *)&r, sizeof r);
             x += w;
             if (it->space_end && i != last_text) x += extra_space;
@@ -1016,7 +1067,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
             c->cb = b;
             c->x = x + c->m[3] + c->b[3] + c->p[3];
             c->y = top + c->m[0] + c->b[0] + c->p[0];
-            struct run r = {x, top, it->w, NULL, 0, it->st, it->link, c, false, c->node};
+            struct run r = {x, top, it->w, NULL, 0, it->st, it->link, c, false, c->node, c->inline_paint_owner, -1};
             sb_put(&L->runs, (const char *)&r, sizeof r);
             x += it->w;
             break;
@@ -1046,7 +1097,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
     }
     L->y += lh;
     /* floats that did not fit on the line just finished */
-    for (int k = 0; k < L->npending; k++) place_float(v[L->pending_floats[k]].box, b, L->f, L->ox, L->oy, L->y);
+    for (int k = 0; k < L->npending; k++) place_float(v[L->pending_floats[k]].box, b, L->f, L->ox, L->oy, L->y, L->cbh);
     L->npending = 0;
     line_space(L);
 }
@@ -1100,7 +1151,7 @@ static node_t *inline_link_ancestor(const box_t *b) {
 }
 static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh) {
     struct ivec iv = {0};
-    struct ibuild bs = {&iv, true, NULL, 0};
+    struct ibuild bs = {&iv, true, NULL, 0, NULL, true};
     bs.link=inline_link_ancestor(b);
     build_items(b, &bs);
     /* widths of inline box edges and atomic inlines */
@@ -1138,6 +1189,7 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
     L.f = f;
     L.ox = ox;
     L.oy = oy;
+    L.cbh = cbh;
     L.items = &iv;
     L.first_line = true;
     L.first_bl = L.last_bl = -1;
@@ -1150,7 +1202,7 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
         if (it->kind == IT_FLOAT) {
             box_t *c = it->box;
             if (line_w == 0 && chunk_w == 0) {
-                place_float(c, b, f, ox, oy, L.y);
+                place_float(c, b, f, ox, oy, L.y, cbh);
                 line_space(&L);
             } else L.pending_floats[L.npending++] = i;
             continue;
@@ -1225,6 +1277,24 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
         b->decos = ar_alloc(&b->layout_mem, L.decos.n);
         memcpy(b->decos, L.decos.p, L.decos.n);
     }
+    /* Link only this group's existing flat line results. Nested groups own
+       their own lists; paint never scans the whole formatting root per inline. */
+    for (int i = 0; i < b->nruns; i++) {
+        struct run *r = &b->runs[i]; box_t *owner = r->paint_owner;
+        if (!owner) continue;
+        owner->inline_paint_source = b;
+        if (owner->inline_run_last >= 0) b->runs[owner->inline_run_last].paint_next = i;
+        else owner->inline_run_first = i;
+        owner->inline_run_last = i;
+    }
+    for (int i = 0; i < b->ndecos; i++) {
+        struct deco *r = &b->decos[i]; box_t *owner = r->paint_owner;
+        if (!owner) continue;
+        owner->inline_paint_source = b;
+        if (owner->inline_deco_last >= 0) b->decos[owner->inline_deco_last].paint_next = i;
+        else owner->inline_deco_first = i;
+        owner->inline_deco_last = i;
+    }
     b->nlines = (int)(L.lines.n / sizeof(struct line_fragment));
     b->lines = NULL;
     if (b->nlines) {
@@ -1241,19 +1311,22 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
 }
 
 /* ---------------------------------------------------------------- floats */
-static void place_float(box_t *c, box_t *parent, struct bfc *f, float ox, float oy, float y_rel) {
+static void place_float(box_t *c, box_t *parent, struct bfc *f, float ox, float oy, float y_rel, float cbh) {
     float cw = parent->w;
     resolve_edges(c, cw);
     c->cb = parent;
-    if (c->kind == B_ATOMIC && c->atomic != AT_INLINE_BLOCK) size_atomic(c, cw, -1);
+    /* Floating establishes an independent formatting context, not an
+       indefinite containing-block height. Preserve the reference supplied
+       by block/inline layout, including deferred placement after a line. */
+    if (c->kind == B_ATOMIC && c->atomic != AT_INLINE_BLOCK) size_atomic(c, cw, cbh);
     else if (c->kind == B_TABLE) {
         table_width(c, cw);
-        layout_inner(c, NULL, 0, 0, -1);
+        layout_inner(c, NULL, 0, 0, cbh);
     } else {
         float w = spec_w(c, &c->st->width, cw);
         if (w < 0) w = stf_width(c, cw);
         c->w = clamp_w(c, w, cw);
-        layout_inner(c, NULL, 0, 0, -1);
+        layout_inner(c, NULL, 0, 0, cbh);
     }
     float mw = c->w + hext(c) + c->m[1] + c->m[3];
     float mh = c->h + vext(c) + c->m[0] + c->m[2];
@@ -1359,7 +1432,7 @@ static void layout_blocks(box_t *b, struct bfc *f, float ox, float oy, float cbh
             continue;
         }
         if (c->floated) {
-            place_float(c, b, f, ox, oy, cursor + (pend > 0 ? pend : 0));
+            place_float(c, b, f, ox, oy, cursor + (pend > 0 ? pend : 0), cbh);
             continue;
         }
         resolve_edges(c, cw);
@@ -2770,7 +2843,7 @@ static void layout_grid(box_t *b, float defh) {
 /* ---------------------------------------------------------------- intrinsic sizes */
 static void inline_intrinsic(box_t *b, float *mn, float *mx) {
     struct ivec iv = {0};
-    struct ibuild bs = {&iv, true, NULL, 0};
+    struct ibuild bs = {&iv, true, NULL, 0, NULL, false};
     build_items(b, &bs);
     float line = 0, chunk = 0;
     *mn = *mx = 0;
@@ -3133,7 +3206,7 @@ static void clamp_apply(box_t *root) {
     struct run *runs = ar_alloc(&b->layout_mem, ((size_t)end + 1) * sizeof *runs);
     if (end) memcpy(runs, b->runs, (size_t)end * sizeof *runs);
     runs[end] = (struct run){x, line->baseline, ellipsis_width, clamp_ellipsis,
-        sizeof clamp_ellipsis - 1, b->st, NULL, NULL, false, NULL};
+        sizeof clamp_ellipsis - 1, b->st, NULL, NULL, false, NULL, NULL, -1};
     b->layout_mem.trap = previous_trap;
     b->runs = runs; b->nruns++; line->end_run = b->nruns;
     for (int i = line->first_deco; i < b->ndecos; i++) {
@@ -3205,8 +3278,13 @@ static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float
         f = &own;
         ox = oy = 0;
     }
-    float sh = usedh >= 0 ? usedh : resolved_content_height(b, cbh);
-    if(sh<0 && size_container(b) && b->st->container_type==CT_SIZE)sh=0;
+    /* box.c represents an inline split around block children by a block
+       proxy retaining display:inline. That proxy is not a block container
+       element for percentage heights, and height/min/max-height do not
+       apply to the original non-replaced inline (CSS 2.2 9.2.1.1, 10.5). */
+    bool split_inline = b->kind == B_BLOCK && b->st->display == D_INLINE;
+    float sh = split_inline ? -1 : usedh >= 0 ? usedh : resolved_content_height(b, cbh);
+    if(!split_inline && sh<0 && size_container(b) && b->st->container_type==CT_SIZE)sh=0;
     if (b->clamp_trace) b->clamp_trace->sh = sh;
     /* The anonymous initial containing block supplies the viewport height,
        even though its own auto height follows document content. Otherwise
@@ -3215,6 +3293,13 @@ static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float
        normal-flow auto heights (including min-height-only boxes) remain
        indefinite. Inset-constrained absolute heights are already definite. */
     float child_cbh = b == D->root_box ? VH : sh >= 0 ? clamp_h(b, sh, cbh) : -1;
+    /* Anonymous wrappers around mixed inline/block content do not establish
+       a percentage-height reference (CSS 2.2 9.2.1.1). Keep their own height
+       content-sized, but let inline descendants see the non-anonymous
+       container's definite or indefinite height. Explicit flex/grid used
+       heights, when supplied, still define that item's sizing reference. */
+    if (split_inline || (b->anon && !b->node && b->kind == B_BLOCK && b->inline_ctx && usedh < 0 && b != D->root_box))
+        child_cbh = cbh;
     b->baseline = b->last_baseline = -1;
     b->nruns = b->ndecos = 0;
     b->nlines = 0; b->lines = NULL; b->clamp_truncated = false;
@@ -3248,7 +3333,7 @@ static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float
     }
     if (b->kind != B_TABLE) {
         if (sh >= 0) b->h = sh;
-        b->h = clamp_h(b, b->h, cbh);
+        if (!split_inline) b->h = clamp_h(b, b->h, cbh);
     }
     if (b->clamp_trace) b->clamp_trace->post_h = b->h;
     if (root) bfc_free(&own);
@@ -3272,10 +3357,49 @@ static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float
 /* Called only by the supervisor after every helper joined and container
  * settling finished. No author strings, node IDs, URLs or script callbacks.
  * With debug_js off neither the extra traversal nor console call occurs. */
-static void clamp_trace_report_box(web_doc *d, box_t *b) {
-    if (!b || d->clamp_trace_reported >= 4) return;
+static void replaced_trace_report_box(web_doc *d, box_t *b) {
+    if (d->replaced_trace_reported >= 2 || b->kind != B_ATOMIC || b->atomic != AT_IMG ||
+        !b->node || !b->st || b->st->visibility || b->clamp_hidden || !(b->w > 0) || b->h != 0)
+        return;
+    int image = b->node->image;
+    struct web_image *im = image >= 0 && image < d->images.n ? d->images.v[image] : NULL;
+    if (!im || !im->img || im->img->w <= 0 || im->img->h <= 0) return;
+    unsigned trace = ++d->replaced_trace_reported;
+    char message[1280];
+    snprintf(message, sizeof message, "Native replaced size trace: #%u image=%d natural=%u/%u used=%.3f/%.3f",
+        trace, image, (unsigned)im->img->w, (unsigned)im->img->h, b->w, b->h);
+    web_js_console(d, 0, message);
+    unsigned depth = 0;
+    for (box_t *a = b; a && depth < 10; a = a->parent, depth++) {
+        const style_t *s = a->st;
+        if (!s) break;
+        snprintf(message, sizeof message,
+            "Native replaced size trace: #%u depth=%u kind=%u atomic=%u tag=%u anon=%u inline_ctx=%u "
+            "display=%u position=%u box_sizing=%u overflow=%u visibility=%u "
+            "used=%.3f/%.3f xy=%.3f/%.3f width=%u/%.3f/%.3f height=%u/%.3f/%.3f "
+            "minw=%u/%.3f/%.3f maxw=%u/%.3f/%.3f minh=%u/%.3f/%.3f maxh=%u/%.3f/%.3f "
+            "padding=%.3f/%.3f/%.3f/%.3f cache_valid=%u cache_width=%.3f cbh=%.3f usedh=%.3f "
+            "cb_kind=%d cb_h=%.3f",
+            trace, depth, (unsigned)a->kind, (unsigned)a->atomic, a->node ? (unsigned)a->node->tag : 0,
+            a->anon, a->inline_ctx, (unsigned)s->display, (unsigned)s->position, s->box_sizing,
+            (unsigned)s->overflow, s->visibility, a->w, a->h, a->x, a->y,
+            (unsigned)s->width.kind, s->width.px, s->width.pct,
+            (unsigned)s->height.kind, s->height.px, s->height.pct,
+            (unsigned)s->min_width.kind, s->min_width.px, s->min_width.pct,
+            (unsigned)s->max_width.kind, s->max_width.px, s->max_width.pct,
+            (unsigned)s->min_height.kind, s->min_height.px, s->min_height.pct,
+            (unsigned)s->max_height.kind, s->max_height.px, s->max_height.pct,
+            a->p[0], a->p[1], a->p[2], a->p[3], a->layout_cache_valid,
+            a->cached_width, a->cached_cbh, a->cached_usedh,
+            a->cb ? (int)a->cb->kind : -1, a->cb ? a->cb->h : -1);
+        web_js_console(d, 0, message);
+    }
+}
+static void clamp_trace_report_box(web_doc *d, box_t *b, bool replaced_pending) {
+    if (!b || (d->clamp_trace_reported >= 4 && (!replaced_pending || d->replaced_trace_reported >= 2))) return;
+    if (replaced_pending) replaced_trace_report_box(d, b);
     const struct clamp_trace *t = b->clamp_trace;
-    if (t && !b->clamp_hidden && (t->applied ||
+    if (d->clamp_trace_reported < 4 && t && !b->clamp_hidden && (t->applied ||
         t->full_h > line_height_px(b->st) * (float)t->limit)) {
         const style_t *s = b->st;
         box_t *p = b->parent;
@@ -3298,12 +3422,19 @@ static void clamp_trace_report_box(web_doc *d, box_t *b) {
             b->y + b->h + b->p[2] + b->b[2], b->next ? b->next->y : -1);
         web_js_console(d, 0, message);
     }
-    for (box_t *c = b->first; c && d->clamp_trace_reported < 4; c = c->next)
-        clamp_trace_report_box(d, c);
+    for (box_t *c = b->first; c && (d->clamp_trace_reported < 4 ||
+            (replaced_pending && d->replaced_trace_reported < 2)); c = c->next)
+        clamp_trace_report_box(d, c, replaced_pending);
 }
 void layout_clamp_trace_report(web_doc *d) {
-    if (d && d->profile_enabled && d->js && d->clamp_trace_reported < 4)
-        clamp_trace_report_box(d, d->root_box);
+    if (!d || !d->profile_enabled || !d->js) return;
+    /* A missing symptom must not keep this diagnostic alive on every layout.
+       Image completion arms one post-layout inspection; both a hit and a
+       miss consume it. Do not force geometry work merely to produce a log. */
+    bool replaced_pending = d->replaced_trace_pending && d->replaced_trace_reported < 2;
+    d->replaced_trace_pending = false;
+    if (d->clamp_trace_reported < 4 || replaced_pending)
+        clamp_trace_report_box(d, d->root_box, replaced_pending);
 }
 
 static void layout_dirty_subtree(box_t *b) {
@@ -3396,19 +3527,48 @@ static void relative_offsets(box_t *b) {
 
 /* ---------------------------------------------------------------- absolute positioning */
 static box_t *abs_containing_block(box_t *a) {
-    if (a->st->position == POS_FIXED || web_dialog_layer_box(D,a)) return D->root_box;
+    if (web_dialog_layer_box(D,a)) return D->root_box;
     for (box_t *p = a->parent; p; p = p->parent)
-        if (p->st && p->st->position != POS_STATIC && p->kind != B_INLINE && p->kind != B_TEXT) return p;
+        if (box_filter_containing_block(p) ||
+            (a->st->position != POS_FIXED && p->st && p->st->position != POS_STATIC && p->kind != B_INLINE && p->kind != B_TEXT)) return p;
     return D->root_box;
+}
+
+static void abs_flex_static_position(const box_t *a, float *x, float *y) {
+    const box_t *f = a->static_cb;
+    if (!f || f->kind != B_FLEX || !f->st) return;
+    const style_t *s = f->st;
+    bool column = s->flex_direction == FD_COLUMN || s->flex_direction == FD_COLUMN_REVERSE;
+    bool reverse = s->flex_direction == FD_ROW_REVERSE || s->flex_direction == FD_COLUMN_REVERSE;
+    float mw = a->w + hext(a) + a->m[1] + a->m[3];
+    float mh = a->h + vext(a) + a->m[0] + a->m[2];
+    float main_space = column ? f->h - mh : f->w - mw;
+    float cross_space = column ? f->w - mw : f->h - mh;
+    /* CSS Flexbox 4.1: an abspos child's static rectangle uses its sole-item
+       margin position in the main axis and the container's content edges in
+       the cross axis. Size it first, after flex layout, rather than treating
+       it as a zero-sized item or letting siblings participate in placement. */
+    float main = 0;
+    switch (s->justify_content) {
+    case JC_END: main = main_space; break;
+    case JC_CENTER: main = main_space / 2; break;
+    case JC_AROUND: case JC_EVENLY:
+        main = main_space >= 0 ? main_space / 2 : reverse ? main_space : 0; break;
+    }
+    if (reverse) main = main_space - main;
+    int align = a->st->align_self == 255 ? s->align_items : a->st->align_self;
+    float cross = align == AI_END ? cross_space : align == AI_CENTER ? cross_space / 2 : 0;
+    if (s->flex_wrap == FW_WRAP_REVERSE) cross = cross_space - cross;
+    *x += column ? cross : main;
+    *y += column ? main : cross;
 }
 
 static void layout_abs(box_t *a) {
     if (a->clamp_hidden) return;
     box_t *cb = abs_containing_block(a);
     bool icb = cb == D->root_box;
-    float pl = icb ? 0 : cb->p[3], pt = icb ? 0 : cb->p[0];
-    float cbw = icb ? VW : cb->w + cb->p[1] + cb->p[3];
-    float cbh = icb ? VH : cb->h + cb->p[0] + cb->p[2];
+    float rect[4]; box_abs_cb_rect(cb, D, rect);
+    float pl = -rect[0], pt = -rect[1], cbw = rect[2], cbh = rect[3];
     resolve_edges(a, cbw);
     const len_t *in = a->st->inset;
     bool la = len_auto(&in[3]), ra = len_auto(&in[1]), ta = len_auto(&in[0]), ba = len_auto(&in[2]);
@@ -3432,26 +3592,41 @@ static void layout_abs(box_t *a) {
         layout_inner(a, NULL, 0, 0, cbh);
         if (sh >= 0 && a->kind != B_TABLE) a->h = clamp_h(a, sh, cbh);
     }
+    /* Publish used auto margins, not just an adjusted paint position. With
+       both insets definite the abspos constraint determines either auto
+       margin; the horizontal negative-remainder rule follows our LTR layout
+       direction, while two vertical auto margins remain equal. */
+    if (!la && !ra) {
+        bool ml = len_auto(&a->st->margin[3]), mr = len_auto(&a->st->margin[1]);
+        float remaining = cbw - l - r - (a->w + ext);
+        if (ml && mr) { a->m[3] = remaining >= 0 ? remaining / 2 : 0; a->m[1] = remaining - a->m[3]; }
+        else if (ml) a->m[3] = remaining - a->m[1];
+        else if (mr) a->m[1] = remaining - a->m[3];
+    }
+    if (!ta && !ba) {
+        bool mt = len_auto(&a->st->margin[0]), mb = len_auto(&a->st->margin[2]);
+        float remaining = cbh - t - bo - (a->h + vext(a));
+        if (mt && mb) a->m[0] = a->m[2] = remaining / 2;
+        else if (mt) a->m[0] = remaining - a->m[2];
+        else if (mb) a->m[2] = remaining - a->m[0];
+    }
     /* the static position, in the containing block's coordinates */
     float sx = 0, sy = 0;
     if (a->static_cb) {
         sx = box_abs_x(a->static_cb) + a->static_x - (icb ? 0 : box_abs_x(cb));
         sy = box_abs_y(a->static_cb) + a->static_y - (icb ? 0 : box_abs_y(cb) + cb->content_dy);
+        abs_flex_static_position(a, &sx, &sy);
     }
     float mw = a->w + ext + a->m[1] + a->m[3];
     float x;
     if (!la) x = -pl + l + a->m[3];
     else if (!ra) x = -pl + cbw - r - mw + a->m[3];
     else x = sx + a->m[3];
-    if (!la && !ra && len_auto(&a->st->margin[3]) && len_auto(&a->st->margin[1]))
-        x = -pl + l + (cbw - l - r - (a->w + ext)) / 2;
     float mh = a->h + vext(a) + a->m[0] + a->m[2];
     float y;
     if (!ta) y = -pt + t + a->m[0];
     else if (!ba) y = -pt + cbh - bo - mh + a->m[0];
     else y = sy + a->m[0];
-    if (!ta && !ba && len_auto(&a->st->margin[0]) && len_auto(&a->st->margin[2]))
-        y = -pt + t + (cbh - t - bo - (a->h + vext(a))) / 2;
     a->x = x + a->b[3] + a->p[3];
     a->y = y + a->b[0] + a->p[0];
 }
@@ -3475,8 +3650,8 @@ static int document_extent(float value) {
 
 static void scroll_area_publish(box_t *b) {
     box_t *cb = b->cb;
-    if (b->clamp_hidden || !cb || b->kind == B_INLINE || b->kind == B_TEXT || b->kind == B_BR ||
-        (b->st && b->st->position == POS_FIXED) || web_dialog_layer_box(D, b)) return;
+    if (b->clamp_hidden || !cb || (b->kind == B_INLINE && !box_filter_containing_block(b)) || b->kind == B_TEXT || b->kind == B_BR ||
+        box_viewport_fixed(b) || web_dialog_layer_box(D, b)) return;
     bool clipped = b->clamp_truncated || (b->st && b->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(D, b));
     float bw = clipped ? b->w + b->p[1] + b->p[3] : b->scroll_w;
     float bh = clipped ? b->h + b->p[0] + b->p[2] : b->scroll_h;
@@ -3572,7 +3747,7 @@ void layout_doc(web_doc *d, int width, int height) {
     float h = fmaxf_(root->h, max_bottom(root, 0));
     for (int i = 0; i < d->abs_boxes.n; i++) {
         box_t *a = d->abs_boxes.v[i];
-        if (a->clamp_hidden || a->st->position == POS_FIXED) continue;
+        if (a->clamp_hidden || box_viewport_fixed(a)) continue;
         float ay = box_abs_y(a);
         h = fmaxf_(h, ay + a->h + a->p[2] + a->b[2]);
     }

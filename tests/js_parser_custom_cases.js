@@ -8,6 +8,14 @@ async function runParserCustomElementCases(){
     const root=document.createElement('div');document.body.appendChild(root);
     try{
         equal(document.customElementRegistry,customElements);
+        // Exercise the metadata-only clone fast path before any definition.
+        const emptyRegistry=new CustomElementRegistry(),emptyName=name();
+        const emptySource=document.createElement(emptyName,{customElementRegistry:emptyRegistry});
+        const emptyDocument=Document.parseHTMLUnsafe('<p>empty registry</p>');
+        const emptyImported=emptyDocument.importNode(emptySource,true);emptyDocument.body.appendChild(emptyImported);
+        class EmptyImported extends HTMLElement{constructor(){super();this.fastImported=13;}}
+        equal(emptyImported instanceof EmptyImported,false);emptyRegistry.define(emptyName,EmptyImported);
+        equal(emptyImported instanceof EmptyImported,true);equal(emptyImported.fastImported,13);
         const first=new CustomElementRegistry(),second=new CustomElementRegistry(),shared=name();
         class One extends HTMLElement{constructor(){super();this.registryToken=1;}}
         class Two extends HTMLElement{constructor(){super();this.registryToken=2;}}
@@ -76,16 +84,111 @@ async function runParserCustomElementCases(){
         second.initialize(fragment);equal(nullElement instanceof Initialized,true);
         throws(()=>customElements.initialize(document),'NotSupportedError');
 
+        // Template parsing stays inert; importing its contents supplies the
+        // destination registry before the clone's normal upgrade reactions.
+        const importName=name();let importedConstructors=0;
+        class Imported extends HTMLElement{constructor(){super();importedConstructors++;}reposition(){return 7;}}
+        customElements.define(importName,Imported);
+        const template=document.createElement('template');template.innerHTML='<'+importName+'><b>child</b></'+importName+'>';
+        equal(template.content.firstChild instanceof Imported,false);equal(importedConstructors,0);
+        const inertClone=template.content.cloneNode(true);
+        equal(inertClone.firstChild instanceof Imported,false);equal(importedConstructors,0);
+        const imported=document.importNode(template.content,true);
+        equal(imported.firstChild instanceof Imported,true);equal(imported.firstChild.reposition(),7);
+        equal(imported.firstChild.ownerDocument,document);equal(imported.firstChild.firstChild.textContent,'child');
+        equal(importedConstructors,1);equal(imported.firstChild.isConnected,false);
+        const templateCopy=document.importNode(template,true);
+        equal(templateCopy.content.firstChild instanceof Imported,false);
+        equal(templateCopy.content.firstChild.ownerDocument,templateCopy.content.ownerDocument);
+        equal(templateCopy.content.ownerDocument===document,false);equal(importedConstructors,1);
+        const deepTemplate=document.createElement('template');
+        deepTemplate.innerHTML='<div>'.repeat(24)+'<'+importName+'></'+importName+'>'+'</div>'.repeat(24);
+        equal(document.importNode(deepTemplate.content,true).querySelector(importName) instanceof Imported,true);
+        equal(deepTemplate.content.cloneNode(true).querySelector(importName) instanceof Imported,false);
+        equal(document.importNode(a,true) instanceof One,true);
+        const inertDocument=Document.parseHTMLUnsafe('<p>inert</p>');
+        equal(inertDocument.customElementRegistry,null);
+        const beforeInertImport=importedConstructors,inertImported=inertDocument.importNode(imported.firstChild,true);
+        equal(inertImported instanceof Imported,false);equal(inertImported.ownerDocument,inertDocument);
+        equal(inertImported.firstChild.ownerDocument,inertDocument);equal(importedConstructors,beforeInertImport);
+        equal(inertDocument.createElement(importName) instanceof Imported,false);
+        // A null-registry template clone stays inert while detached, then the
+        // cross-document adopting steps choose the active effective global.
+        const adoptedClone=template.content.firstChild.cloneNode(true),beforeAdopt=importedConstructors;
+        equal(adoptedClone instanceof Imported,false);customElements.upgrade(adoptedClone);equal(importedConstructors,beforeAdopt);
+        root.appendChild(adoptedClone);
+        equal(adoptedClone instanceof Imported,true);equal(adoptedClone.reposition(),7);
+        equal(adoptedClone.ownerDocument,document);equal(adoptedClone.firstChild.ownerDocument,document);
+        equal(importedConstructors,beforeAdopt+1);equal(template.content.firstChild instanceof Imported,false);
+        adoptedClone.remove();
+        const sameDocumentNull=document.createElement(importName,{customElementRegistry:null}),beforeSameDocument=importedConstructors;
+        document.adoptNode(sameDocumentNull);root.appendChild(sameDocumentNull);
+        customElements.upgrade(sameDocumentNull);equal(importedConstructors,beforeSameDocument);equal(sameDocumentNull instanceof Imported,false);sameDocumentNull.remove();
+        const imperativeHost=inertDocument.createElement('div'),imperativeRoot=imperativeHost.attachShadow({mode:'open',customElementRegistry:null});
+        const imperativeChild=inertDocument.createElement(importName,{customElementRegistry:null});imperativeRoot.appendChild(imperativeChild);
+        root.appendChild(imperativeHost);
+        equal(imperativeRoot.customElementRegistry,customElements);equal(imperativeChild instanceof Imported,true);
+        equal(imperativeChild.ownerDocument,document);imperativeHost.remove();
+        const declarativeDocument=Document.parseHTMLUnsafe('<div><template shadowrootmode="open" shadowrootcustomelementregistry><'+importName+'></'+importName+'></template></div>');
+        const declarativeHost=declarativeDocument.body.firstChild,declarativeRoot=declarativeHost.shadowRoot;
+        root.appendChild(declarativeHost);
+        equal(declarativeRoot.customElementRegistry,null);equal(declarativeRoot.firstChild instanceof Imported,false);
+        equal(declarativeRoot.firstChild.ownerDocument,document);declarativeHost.remove();
+        const scopedParentName=name(),scopedParent=inertDocument.createElement(scopedParentName,{customElementRegistry:first}),nullDescendant=inertDocument.createElement(shared,{customElementRegistry:null});
+        class GlobalParent extends HTMLElement{}class ScopedParent extends HTMLElement{parentToken(){return 19;}}
+        class GlobalShared extends HTMLElement{}
+        customElements.define(scopedParentName,GlobalParent);customElements.define(shared,GlobalShared);
+        scopedParent.appendChild(nullDescendant);root.appendChild(scopedParent);
+        equal(scopedParent instanceof GlobalParent,false);first.define(scopedParentName,ScopedParent);
+        equal(scopedParent instanceof ScopedParent&&scopedParent.parentToken()===19,true);
+        first.upgrade(nullDescendant);customElements.upgrade(nullDescendant);
+        equal(nullDescendant instanceof One||nullDescendant instanceof GlobalShared,false);equal(nullDescendant.ownerDocument,document);scopedParent.remove();
+        const lateImportedName=name(),lateImportedSource=document.createElement(lateImportedName,{customElementRegistry:first});
+        const lateImported=inertDocument.importNode(lateImportedSource,true);inertDocument.body.appendChild(lateImported);
+        class LateImported extends HTMLElement{constructor(){super();this.importedToken=11;}}
+        equal(lateImported instanceof LateImported,false);first.define(lateImportedName,LateImported);
+        equal(lateImported instanceof LateImported,true);equal(lateImported.importedToken,11);
+
+        // Clonable shadow children intentionally receive no import fallback,
+        // even though ordinary null-registry descendants use it.
+        const cloneHost=document.createElement('div');
+        const cloneShadow=cloneHost.attachShadow({mode:'open',clonable:true,customElementRegistry:null});
+        cloneShadow.appendChild(document.createElement(importName,{customElementRegistry:null}));
+        const importedHost=document.importNode(cloneHost,true);
+        equal(importedHost.shadowRoot.customElementRegistry,null);
+        equal(importedHost.shadowRoot.firstChild instanceof Imported,false);
+        equal(importedHost.shadowRoot.firstChild.ownerDocument,document);
+        const scopedCloneHost=document.createElement('div');
+        const scopedCloneShadow=scopedCloneHost.attachShadow({mode:'open',clonable:true,customElementRegistry:first});
+        scopedCloneShadow.appendChild(document.createElement(shared,{customElementRegistry:null}));
+        const importedScopedHost=document.importNode(scopedCloneHost,true);
+        equal(importedScopedHost.shadowRoot.customElementRegistry,first);
+        equal(importedScopedHost.shadowRoot.firstChild instanceof One,false);
+        first.initialize(importedScopedHost.shadowRoot);
+        equal(importedScopedHost.shadowRoot.firstChild instanceof One,true);
+
         const host=document.createElement('div');root.appendChild(host);
         const shadow=host.attachShadow({mode:'open',customElementRegistry:first});
         equal(shadow.customElementRegistry,first);equal(shadow.host,host);
         shadow.innerHTML='<'+shared+'></'+shared+'>';
         equal(shadow.firstChild instanceof One,true);equal(shadow.firstChild.registryToken,1);
+        shadow.setHTML('<'+shared+'></'+shared+'>',{sanitizer:{}});
+        equal(shadow.firstChild instanceof One,true);equal(shadow.firstChild.registryToken,1);
+        equal(shadow.firstChild.ownerDocument,document);equal(shadow.customElementRegistry,first);
+        shadow.setHTMLUnsafe('<'+shared+'></'+shared+'>');
+        equal(shadow.firstChild instanceof One,true);equal(shadow.firstChild.registryToken,1);
+        equal(shadow.firstChild.ownerDocument,document);equal(shadow.customElementRegistry,first);
         const nullHost=document.createElement('div');root.appendChild(nullHost);
         const nullShadow=nullHost.attachShadow({mode:'closed',customElementRegistry:null});
         equal(nullShadow.customElementRegistry,null);equal(nullHost.shadowRoot,null);
         nullShadow.innerHTML='<'+nullName+'></'+nullName+'>';
         equal(nullShadow.firstChild instanceof Initialized,false);
+        nullShadow.setHTML('<'+nullName+'></'+nullName+'>',{sanitizer:{}});
+        equal(nullShadow.firstChild instanceof Initialized,false);equal(nullShadow.customElementRegistry,null);
+        equal(nullShadow.firstChild.ownerDocument,document);
+        nullShadow.setHTMLUnsafe('<'+nullName+'></'+nullName+'>');
+        equal(nullShadow.firstChild instanceof Initialized,false);equal(nullShadow.customElementRegistry,null);
+        equal(nullShadow.firstChild.ownerDocument,document);
         first.initialize(nullShadow);equal(nullShadow.customElementRegistry,first);equal(nullShadow.firstChild instanceof Initialized,true);
         const globalHost=document.createElement('div');root.appendChild(globalHost);
         equal(globalHost.attachShadow({mode:'open'}).customElementRegistry,customElements);

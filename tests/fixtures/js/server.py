@@ -391,6 +391,7 @@ class Handler(SimpleHTTPRequestHandler):
                 "content_language": self.headers.get("Content-Language", ""),
                 "content_location": self.headers.get("Content-Location", ""),
                 "body_length": len(data),
+                "content_length": length if "Content-Length" in self.headers else None,
             },
             cors=path != "/api/no-cors",
             cache=path == "/api/cache",

@@ -110,6 +110,15 @@ struct lxb_dom_node {
 LXB_API lxb_dom_node_t *
 lxb_dom_node_interface_create(lxb_dom_document_t *document);
 
+enum {
+    LXB_DOM_NODE_PARSER_FIELDS = 1,
+    LXB_DOM_NODE_PARSER_LINKS = 2,
+    LXB_DOM_NODE_PARSER_CHILDREN = 4
+};
+
+LXB_API void
+lxb_dom_node_parser_changed(lxb_dom_node_t *node, unsigned flags);
+
 LXB_API lxb_dom_node_t *
 lxb_dom_node_interface_clone(lxb_dom_document_t *document,
                              const lxb_dom_node_t *node, bool is_attr);

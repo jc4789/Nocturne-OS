@@ -22,6 +22,7 @@ static void parse_case(const char *name,const char *meta,const char *body,const 
     struct html_parser *p=string_input?html_begin_string(d,bytes,length,false,false):html_begin(d,bytes,length,transport,false);free(bytes);
     check(p!=NULL,"parser starts");if(!p){web_free(d);return;}node_t *identity=d->root,*ignored=NULL;
     check(html_resume(p,&ignored)==0,"parser completes");check(d->root==identity,"Document identity retained");
+    check(d->document_mode==0&&!d->quirks,"DOCTYPE survives encoding restart in no-quirks mode");
     check(d->encoding_certain,"accepted encoding confidence");check(!strcasecmp(d->encoding,encoding),"canonical encoding");
     check(text_is(by_id(d->root,"target"),expected),name);html_finish(p);web_free(d);
 }

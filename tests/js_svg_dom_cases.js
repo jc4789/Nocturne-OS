@@ -60,7 +60,7 @@ function runSVGDOMCases() {
     const TypeErrorImpl=TypeError;
     const illegal=(fn,label)=>{checks++;try{fn();}catch(e){if(e instanceof TypeErrorImpl)return;throw e;}throw new Error('SVG DOM expected TypeError: '+label);};
     const NS='http://www.w3.org/2000/svg', HTML='http://www.w3.org/1999/xhtml', MATH='http://www.w3.org/1998/Math/MathML';
-    const SVG=SVGElement, Root=SVGSVGElement, Animated=SVGAnimatedString;
+    const SVG=SVGElement, Root=SVGSVGElement, Group=SVGGElement, Animated=SVGAnimatedString;
     const getClass=Object.getOwnPropertyDescriptor(SVG.prototype,'className').get;
     const getOwner=Object.getOwnPropertyDescriptor(SVG.prototype,'ownerSVGElement').get;
     const getViewport=Object.getOwnPropertyDescriptor(SVG.prototype,'viewportElement').get;
@@ -70,7 +70,11 @@ function runSVGDOMCases() {
     illegal(()=>new SVG(),'constructor');illegal(()=>new Root(),'root constructor');illegal(()=>new Animated(),'animated constructor');
     const root=document.createElementNS(NS,'svg'), group=document.createElementNS(NS,'g'), rect=document.createElementNS(NS,'rect');
     equal(Object.getPrototypeOf(root),Root.prototype,'native root prototype');equal(root instanceof SVG,true);equal(root instanceof Element,true);equal(root instanceof HTMLElement,false);
-    equal(Object.getPrototypeOf(group),SVGGraphicsElement.prototype,'native generic prototype');equal(group instanceof Root,false);equal(group.namespaceURI,NS);equal(group.localName,'g');equal(group.tagName,'g');
+    equal(Object.getPrototypeOf(group),Group.prototype,'native group prototype');equal(group instanceof Root,false);equal(group.namespaceURI,NS);equal(group.localName,'g');equal(group.tagName,'g');
+    equal(Object.getPrototypeOf(Group.prototype),SVGGraphicsElement.prototype);equal(group instanceof SVGGraphicsElement,true);
+    equal(typeof group.getCTM,'function');equal(typeof group.getScreenCTM,'function');
+    equal(group.getCTM(),null,'detached native group CTM');equal(group.getScreenCTM(),null,'detached native group screen CTM');
+    illegal(()=>new Group(),'group constructor');equal(Object.getPrototypeOf(group.cloneNode(true)),Group.prototype);
     equal(root.ownerSVGElement,null);equal(root.viewportElement,null);equal(group.ownerSVGElement,null);
     root.appendChild(group);group.appendChild(rect);equal(group.ownerSVGElement,root);equal(rect.ownerSVGElement,root);equal(rect.viewportElement,root);
     const nested=document.createElementNS(NS,'svg');group.appendChild(nested);nested.appendChild(rect);

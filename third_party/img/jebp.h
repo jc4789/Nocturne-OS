@@ -2942,7 +2942,12 @@ static jebp_error_t jebp__read_vp8l_image(jebp_image_t *image,
                                           jebp__colcache_t *colcache,
                                           jebp__subimage_t *huffman_image,
                                           jebp_int real_width) {
-    jebp_error_t err;
+    jebp_error_t err = JEBP_OK;
+    /* Palette bundling must retain the final partial byte. Reject invalid
+       internal dimensions before allocation, indexing or row division. */
+    if (image->width <= 0 || image->height <= 0 || real_width < image->width) {
+        return JEBP_ERROR_INVDATA;
+    }
     jebp_int nb_groups = 1;
     jebp__huffman_group_t *groups = &(jebp__huffman_group_t){0};
     if (huffman_image != NULL) {
@@ -3010,6 +3015,9 @@ static jebp_error_t jebp__read_vp8l_image(jebp_image_t *image,
             }
 
             jebp_int main = jebp__read_symbol(group->main, bits, &err);
+            if (err != JEBP_OK) {
+                break;
+            }
             if (main < JEBP__NB_COLOR_SYMBOLS) {
                 pixel->g = main;
                 pixel->r = jebp__read_symbol(group->red, bits, &err);
@@ -3025,6 +3033,9 @@ static jebp_error_t jebp__read_vp8l_image(jebp_image_t *image,
                     bits, main - JEBP__NB_COLOR_SYMBOLS, &err);
                 jebp_int dist = jebp__read_symbol(group->dist, bits, &err);
                 dist = jebp__read_vp8l_extrabits(bits, dist, &err);
+                if (err != JEBP_OK) {
+                    break;
+                }
                 if (dist > JEBP__NB_VP8L_OFFSETS) {
                     dist -= JEBP__NB_VP8L_OFFSETS;
                 } else {
@@ -3044,6 +3055,9 @@ static jebp_error_t jebp__read_vp8l_image(jebp_image_t *image,
                 x += length;
             }
         } while (x < image->width);
+        if (err != JEBP_OK) {
+            break;
+        }
         y += x / image->width;
         x %= image->width;
     }
@@ -3108,15 +3122,15 @@ static jebp_error_t jebp__read_palette(jebp__subimage_t *subimage,
         px1->r += px0.r;
         px1->g += px0.g;
         px1->b += px0.b;
-        px1->a = 255;
+        px1->a += px0.a;
         px0 = *px1;
     }
     if (len <= 2) {
-        image->width = JEBP__RSHIFT(image->width, 3);
+        image->width = JEBP__CSHIFT(image->width, 3);
     } else if (len <= 4) {
-        image->width = JEBP__RSHIFT(image->width, 2);
+        image->width = JEBP__CSHIFT(image->width, 2);
     } else if (len <= 16) {
-        image->width = JEBP__RSHIFT(image->width, 1);
+        image->width = JEBP__CSHIFT(image->width, 1);
     }
 free_colcache:
     jebp__free_colcache(&colcache);

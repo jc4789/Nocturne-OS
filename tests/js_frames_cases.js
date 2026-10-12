@@ -62,9 +62,22 @@ async function runFrameCases(){
     equal(cancelledIdle,0);
     // Instrumentation may replace Window methods and call the saved original.
     // The original delegate must capture the function, not re-read its name.
-    const heldTimer=window.setTimeout,heldIdle=window.requestIdleCallback;
-    equal(window.setTimeout,heldTimer);equal(window.requestIdleCallback,heldIdle);
+    const heldTimer=window.setTimeout,heldInterval=window.setInterval,heldIdle=window.requestIdleCallback;
+    equal(window.setTimeout,heldTimer);equal(window.setInterval,heldInterval);equal(window.requestIdleCallback,heldIdle);
     equal(window.cancelIdleCallback,window.cancelIdleCallback);
+    const timerPolicy=window.trustedTypes.createPolicy('frame-saved-timer',{createScript:value=>value});
+    for(const repeat of [false,true]){
+        await new Promise((resolve,reject)=>{
+            const timeout=setTimeout(()=>reject(new Error('Trusted Window timer missing')),1000);
+            let interval;
+            child.addEventListener('approved-timer',()=>{
+                if(repeat)window.clearInterval(interval);
+                equal(child._approvedTimer,17);clearTimeout(timeout);resolve();
+            },{once:true});
+            const approved=timerPolicy.createScript('document._approvedTimer=17;document.dispatchEvent(new Event("approved-timer"));');
+            if(repeat)interval=heldInterval(approved,4);else heldTimer(approved,0);
+        });
+    }
     let timerWrappers=0,idleWrappers=0,timerRuns=0,idleRuns=0;
     function wrappedTimer(){timerWrappers++;return heldTimer.apply(this,arguments);}
     function wrappedIdle(){idleWrappers++;return heldIdle.apply(this,arguments);}
@@ -103,29 +116,29 @@ async function runFrameCases(){
     equal(window.document.defaultView,window);equal(retainedView,window);
     equal(window.document.URL,'about:srcdoc');equal(window.srcdocValue,42);
     equal(window.document.baseURI,document.baseURI);equal(document.getElementById('srcdoc-child'),null);
-    throws(()=>heldTimer(()=>{},0),'TypeError');throws(()=>heldIdle(()=>{}, {timeout:1}),'TypeError');
-    const sameOriginTimer=window.setTimeout;equal(window.setTimeout,sameOriginTimer);equal(sameOriginTimer===heldTimer,false);
+    throws(()=>heldTimer(()=>{},0),'TypeError');throws(()=>heldInterval(()=>{},4),'TypeError');throws(()=>heldIdle(()=>{}, {timeout:1}),'TypeError');
+    const sameOriginTimer=window.setTimeout,sameOriginInterval=window.setInterval;equal(window.setTimeout,sameOriginTimer);equal(sameOriginTimer===heldTimer,false);
     await loaded(frame,()=>{frame.removeAttribute('srcdoc');frame.src='http://other.test/frame-cross.html';});
     equal(frame.contentDocument,null);equal(frame.contentWindow,window);
     count++;try{void window.document;throw new Error('Cross-origin document leaked');}catch(error){if(error.name!=='SecurityError')throw error;}
     count++;try{window.stolen=1;throw new Error('Cross-origin Window write leaked');}catch(error){if(error.name!=='SecurityError')throw error;}
     count++;try{void window.requestIdleCallback;throw new Error('Cross-origin idle method lookup leaked');}catch(error){if(error.name!=='SecurityError')throw error;}
     count++;try{void retainedView.document;throw new Error('Retained defaultView bypassed WindowProxy guard');}catch(error){if(error.name!=='SecurityError')throw error;}
-    throws(()=>sameOriginTimer(()=>{},0),'SecurityError');throws(()=>heldIdle(()=>{}, {timeout:1}),'SecurityError');
+    throws(()=>sameOriginTimer(()=>{},0),'SecurityError');throws(()=>sameOriginInterval(()=>{},4),'SecurityError');throws(()=>heldIdle(()=>{}, {timeout:1}),'SecurityError');
     console.log('OK frame-saved-method-navigation-guard');
     equal(window.closed,false);equal(window.parent.document,document);
     await new Promise(resolve=>setTimeout(resolve,20));equal(crossMessages,1);parentChannel.close();
     await loaded(frame,()=>{frame.src='about:blank';});
     equal(window.document.URL,'about:blank');equal(window.document!==child,true);
-    const activeTimer=window.setTimeout;
+    const activeTimer=window.setTimeout,activeInterval=window.setInterval;
     const before=document.createElement('iframe');document.body.insertBefore(before,frame);void before.contentWindow;
     equal(globalThis.frames[0],before.contentWindow);equal(globalThis.frames[1],frame.contentWindow);equal(globalThis.length,2);
     before.remove();equal(before.contentWindow,null);
     frame.remove();equal(frame.contentWindow,null);equal(window.closed,true);equal(oldNode.textContent,'retained');
-    throws(()=>activeTimer(()=>{},0),'TypeError');
+    throws(()=>activeTimer(()=>{},0),'TypeError');throws(()=>activeInterval(()=>{},4),'TypeError');
     document.body.appendChild(frame);const replacement=frame.contentWindow;
     equal(replacement===window,false);equal(window.closed,true);equal(replacement.closed,false);
-    throws(()=>activeTimer(()=>{},0),'TypeError');console.log('OK frame-saved-method-detach-guard');frame.remove();
+    throws(()=>activeTimer(()=>{},0),'TypeError');throws(()=>activeInterval(()=>{},4),'TypeError');console.log('OK frame-saved-method-detach-guard');frame.remove();
     // The detached context must not be able to keep timers alive.
     const detached=document.createElement('iframe');document.body.appendChild(detached);
     detached.contentWindow.setTimeout(()=>{throw new Error('Retired frame timer ran');},20);detached.remove();

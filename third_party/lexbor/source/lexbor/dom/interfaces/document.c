@@ -122,6 +122,8 @@ lxb_dom_document_init(lxb_dom_document_t *document, lxb_dom_document_t *owner,
         document->css = owner->css;
         document->mutation = owner->mutation;
         document->attr_mutation = owner->attr_mutation;
+        document->parser_changed = owner->parser_changed;
+        document->parser_changed_context = owner->parser_changed_context;
         document->options = owner->options;
 
         document->tags_inherited = true;

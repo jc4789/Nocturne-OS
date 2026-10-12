@@ -838,6 +838,8 @@ lxb_html_tree_insert_character_for_data(lxb_html_tree_t *tree,
             return LXB_STATUS_ERROR_MEMORY_ALLOCATION;
         }
 
+        lxb_dom_node_parser_changed(&chrs->node, LXB_DOM_NODE_PARSER_FIELDS);
+
         goto destroy_str;
     }
 

@@ -24,11 +24,11 @@ static const struct asset assets[] = {
         "globalThis.classicRan=true;", 0},
     {"/dir/defer.js", "globalThis.deferRan=true;check('defer-after-parser',document.getElementById('future')!==null);", 0},
     {"/dir/async.js", "globalThis.asyncRan=true;mark('async-loaded');", 0},
-    {"/dir/main.mjs", "import {cycle} from './a.mjs';check('module-cycle',cycle()==='AB');"
+    {"/dir/main.mjs", "import {cycle} from './a.mjs';globalThis.moduleStarted=true;check('module-cycle',cycle()==='AB');"
         "check('module-current-script',document.currentScript===null);"
         "check('module-import-meta',import.meta.url==='http://fixture.test/dir/main.mjs');"
         "const value=await import('./dynamic.mjs');check('dynamic-import',value.answer===42);"
-        "await new Promise(resolve=>setTimeout(resolve,4));globalThis.moduleRan=true;mark('module-top-level-await');", 0},
+        "await globalThis.moduleGate;await new Promise(resolve=>setTimeout(resolve,4));globalThis.moduleRan=true;check('module-top-level-await',globalThis.domContentObserved===true);", 0},
     {"/dir/a.mjs", "import {b} from './b.mjs';export function a(){return 'A';}export function cycle(){return a()+b();}", 0},
     {"/dir/b.mjs", "import {a} from './a.mjs';export function b(){return a()==='A'?'B':'?';}", 0},
     {"/dir/dynamic.mjs", "globalThis.dynamicEvaluations=(globalThis.dynamicEvaluations||0)+1;export const answer=42;", 0},
@@ -44,7 +44,7 @@ static const struct asset assets[] = {
 };
 
 struct queued {
-    bool used, no_cors, no_referrer;
+    bool used, no_cors, no_referrer, body_present;
     uint64_t id, due, transport_id;
     int kind;
     char url[2048], method[16], headers[1024], body[4096];
@@ -175,6 +175,7 @@ static bool request(void *opaque, const struct web_request *r) {
         snprintf(q->method, sizeof q->method, "%s", r->method ? r->method : "GET");
         snprintf(q->headers, sizeof q->headers, "%s", r->headers ? r->headers : "");
         q->body_len = r->body_len;
+        q->body_present = r->body != NULL;
         q->cache_mode = r->cache_mode;
         q->no_cors = r->no_cors; q->no_referrer = r->no_referrer;
         if (r->kind == WEB_RESOURCE_FETCH) f->fetch_requests++;
@@ -313,6 +314,14 @@ static void deliver(struct fixture *f) {
                 q.no_cors ? "true" : "false", q.no_referrer ? "true" : "false");
             free(r.body); r.body=strdup(metadata); r.body_len=strlen(metadata); r.status=200;
         }
+        if (!strcmp(q.url, "http://fixture.test/dir/api/body-presence")) {
+            char metadata[96];
+            snprintf(metadata,sizeof metadata,"{\"present\":%d,\"bytes\":%lu}",
+                q.body_present?1:0,(unsigned long)q.body_len);
+            free(r.body);r.body=strdup(metadata);r.body_len=strlen(metadata);r.status=200;
+            snprintf(r.headers,sizeof r.headers,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Fixture: yes\r\nX-Body-Present: %d\r\nX-Body-Bytes: %lu\r\n\r\n",
+                q.body_present?1:0,(unsigned long)q.body_len);
+        }
         if (q.no_cors) {
             /* This in-memory transport serves same-origin responses. Like the
                production HTTP host, affirm filtering through the private
@@ -396,9 +405,9 @@ static void close_case(void) {
     /* Some callers inspect assertion marks after closing the document. Keep
        them until the next fixture reset or final process cleanup. */
 }
-static char *script_page(const char *source) {
+static char *script_page_after(const char *source,const char *after) {
     const char *a = START "</head><body style='margin:0'><div id=target style='height:20px'></div><div id=sentinel></div><script>";
-    const char *b = "</script></body></html>";
+    const char *b = "</script>",*end="</body></html>";
     /* API files contain literal HTML strings. An inline HTML script is not
        JavaScript-aware: escape its end-tag spelling without changing strings. */
     size_t escapes=0,length=strlen(source);
@@ -408,12 +417,13 @@ static char *script_page(const char *source) {
         safe[at++]=source[i];if(source[i]=='<' && i+8<=length && !strncasecmp(source+i,"</script",8))safe[at++]='\\';
     }
     safe[at]=0;
-    size_t n = strlen(a) + at + strlen(b) + 1+(case_meta_policy?strlen(case_meta_policy):0);
+    size_t n = strlen(a) + at + strlen(b) + strlen(after) + strlen(end) + 1+(case_meta_policy?strlen(case_meta_policy):0);
     char *page = malloc(n);
-    if (page){if(case_meta_policy){const char *script=strstr(a,"<script>");snprintf(page,n,"%.*s%s%s%s%s",(int)(script-a),a,case_meta_policy,script,safe,b);}else snprintf(page, n, "%s%s%s", a, safe, b);}
+    if (page){if(case_meta_policy){const char *script=strstr(a,"<script>");snprintf(page,n,"%.*s%s%s%s%s%s%s",(int)(script-a),a,case_meta_policy,script,safe,b,after,end);}else snprintf(page, n, "%s%s%s%s%s", a, safe, b, after, end);}
     free(safe);
     return page;
 }
+static char *script_page(const char *source) { return script_page_after(source,""); }
 
 /* Isolated API regressions supplement, never replace, public-site GUI checks. */
 static void external_case_expected(const char *file, const char *tail, const char *url, int expected_errors) {
@@ -580,7 +590,7 @@ static void test_lexbor(void) {
     external_case("js_lexbor_cases.js", ";const r=runLexborCases();check('lexbor-probe-count',r.checks===62&&r.legacyTotal===1&&r.unsupportedAPITotal===0);mark('api-done');", BASE);
 }
 static void test_cssom(void) {
-    external_case("js_cssom_cases.js", ";check('cssom-count',runCSSOMCases()===28);mark('api-done');", BASE);
+    external_case("js_cssom_cases.js", ";check('cssom-count',runCSSOMCases()===54);mark('api-done');", BASE);
 }
 static void test_fetch_api(void) {
     external_case("js_fetch_cases.js", ";runFetchCases().then(n=>{console.log('Fetch API checks '+n);check('fetch-api-count',n>100);mark('api-done');},e=>{console.log('FAIL fetch-api '+e+' '+e.stack);mark('api-done');});", BASE);
@@ -609,7 +619,7 @@ static void test_platform(void) {
     external_case("js_collator_cases.js", ";runCollatorCases().then(n=>{console.log('Collator API checks '+n);check('collator-count',n>7000);mark('api-done');},e=>{console.log('FAIL collator '+e+' '+e.stack);mark('api-done');});", BASE);
     external_case("js_history_cases.js", ";runHistoryCases().then(()=>mark('api-done'),e=>{console.log('FAIL history '+e);mark('api-done');});", BASE);
     test_check("location-reentrant-native-navigation",!strcmp(fixture.navigation,"http://fixture.test/dir/index.html?cache=5#outside"));
-    external_case("js_geometry_cases.js", ";check('geometry-count',runGeometryCases()===15);mark('api-done');", BASE);
+    external_case("js_geometry_cases.js", ";check('geometry-count',runGeometryCases()===34);mark('api-done');", BASE);
     external_case("js_dom_compare_cases.js", ";check('node-compare-count',runDOMCompareCases()===14);mark('api-done');", BASE);
     external_case("js_event_handler_cases.js", ";check('event-handler-count',runEventHandlerCases()===18);mark('api-done');", BASE);
     external_case("js_observer_cases.js", ";runObserverCases().then(n=>{check('observer-count',n>=40);mark('api-done');},e=>{console.log('FAIL observer '+e);mark('api-done');});", BASE);
@@ -722,15 +732,16 @@ static void test_script_mime(void) {
 
 static void test_dom_and_scripts(void) {
     const char *html = START
+        "<script>globalThis.moduleStarted=globalThis.moduleRan=false;globalThis.moduleGate=new Promise(resolve=>globalThis.moduleRelease=resolve);</script>"
         "<link rel=stylesheet href=style.css><script defer src=defer.js></script><script async src=async.js></script>"
         "<script type=module src=main.mjs></script></head><body style='margin:0'>"
         "<div id=target></div><div id=sentinel></div><script>"
         "check('parser-boundary',document.getElementById('future')===null);"
         "check('classic-current-script',document.currentScript&&document.currentScript.localName==='script');"
         "document.write('<span id=written>one</span>');document.write('<span id=written2>two</span>');"
-        "document.addEventListener('DOMContentLoaded',()=>{check('dom-content-order',deferRan&&moduleRan&&classicRan);"
+        "document.addEventListener('DOMContentLoaded',()=>{globalThis.domContentObserved=true;check('dom-content-order',deferRan&&moduleStarted&&!moduleRan&&classicRan);"
         "check('document-write-order',document.getElementById('written').nextSibling===document.getElementById('written2'));"
-        "try{document.write('late');check('late-write-rejected',false);}catch(e){check('late-write-rejected',true);}mark('dom-ready');});"
+        "moduleRelease();mark('dom-ready');});"
         "window.addEventListener('load',()=>{check('window-load-order',document.readyState==='complete');mark('page-loaded');});"
         "</script><div id=future></div><script src=classic.js></script><script>"
         "const target=document.getElementById('target');target.style.height='37px';target.className='one two';"
@@ -751,7 +762,7 @@ static void test_dom_and_scripts(void) {
         "check('dom-fragment-interface',Object.getPrototypeOf(fragment)===DocumentFragment.prototype&&fragment instanceof Node&&!(fragment instanceof Element)&&fragment.className===undefined&&typeof fragment.querySelector==='function');"
         "const textNode=document.createTextNode('text'),commentNode=document.createComment('comment');"
         "check('dom-character-interfaces',Object.getPrototypeOf(textNode)===Text.prototype&&textNode instanceof CharacterData&&textNode instanceof Node&&commentNode instanceof Comment&&commentNode instanceof CharacterData&&textNode.className===undefined&&textNode.getAttribute===undefined);"
-        "const foreign=document.createElementNS('http://www.w3.org/2000/svg','svg'),foreignGroup=document.createElementNS('http://www.w3.org/2000/svg','g');check('dom-foreign-interface',foreign instanceof SVGSVGElement&&foreign instanceof SVGElement&&foreign instanceof Element&&foreign instanceof Node&&!(foreign instanceof HTMLElement)&&Object.getPrototypeOf(foreign)===SVGSVGElement.prototype&&foreignGroup instanceof SVGElement&&foreignGroup instanceof Element&&!(foreignGroup instanceof SVGSVGElement)&&!(foreignGroup instanceof HTMLElement)&&Object.getPrototypeOf(foreignGroup)===SVGElement.prototype);"
+        "const foreign=document.createElementNS('http://www.w3.org/2000/svg','svg'),foreignGroup=document.createElementNS('http://www.w3.org/2000/svg','g');check('dom-foreign-interface',foreign instanceof SVGSVGElement&&foreign instanceof SVGElement&&foreign instanceof Element&&foreign instanceof Node&&!(foreign instanceof HTMLElement)&&Object.getPrototypeOf(foreign)===SVGSVGElement.prototype&&foreignGroup instanceof SVGGElement&&foreignGroup instanceof SVGGraphicsElement&&foreignGroup instanceof SVGElement&&foreignGroup instanceof Element&&!(foreignGroup instanceof SVGSVGElement)&&!(foreignGroup instanceof HTMLElement)&&Object.getPrototypeOf(foreignGroup)===SVGGElement.prototype);"
         "const clone=child.cloneNode(true);check('dom-clone',clone!==child&&clone.textContent===child.textContent);"
         "check('dom-clone-interface',Object.getPrototypeOf(clone)===HTMLSpanElement.prototype&&clone instanceof HTMLSpanElement&&clone instanceof HTMLElement&&clone.firstChild instanceof Text);"
         "const inert=document.createElement('div');globalThis.inertRan=false;inert.innerHTML='<span class=inner>parsed</span><script>inertRan=true;<\\/script>';target.appendChild(inert);"
@@ -786,7 +797,7 @@ static void test_dom_and_scripts(void) {
     if (!open_case(html, false)) return;
     test_check("dom-script-finished", pump("page-loaded", 8000));
     test_check("dom-jobs-drained", pump(NULL, 4000));
-    static const char *const names[] = {"parser-boundary","classic-current-script","external-classic","blocking-css","defer-after-parser","async-loaded","module-cycle","module-current-script","module-import-meta","dynamic-import","module-top-level-await","dom-content-order","document-write-order","late-write-rejected","window-load-order","dom-node-identity","dom-selector","dom-class-cache","dom-attribute-case","dom-detached","dom-reattach","dom-fragment","dom-clone","inner-html-inert","dynamic-inline","dynamic-empty-then-text","cloned-script-inert","dom-geometry","dynamic-external-order","module-cache","polymer-async-isolation","anchor-url-reflection","anchor-pathname-setter","form-interface-properties","form-method-default","form-elements-sameobject","form-action-document-url","form-action-empty-document-url","anchor-private-url","anchor-conversion-error","anchor-native-brand","anchor-usvstring","characterdata-utf16","characterdata-comment","characterdata-conversion","characterdata-brand","template-inert-image"};
+    static const char *const names[] = {"parser-boundary","classic-current-script","external-classic","blocking-css","defer-after-parser","async-loaded","module-cycle","module-current-script","module-import-meta","dynamic-import","module-top-level-await","dom-content-order","document-write-order","window-load-order","dom-node-identity","dom-selector","dom-class-cache","dom-attribute-case","dom-detached","dom-reattach","dom-fragment","dom-clone","inner-html-inert","dynamic-inline","dynamic-empty-then-text","cloned-script-inert","dom-geometry","dynamic-external-order","module-cache","polymer-async-isolation","anchor-url-reflection","anchor-pathname-setter","form-interface-properties","form-method-default","form-elements-sameobject","form-action-document-url","form-action-empty-document-url","anchor-private-url","anchor-conversion-error","anchor-native-brand","anchor-usvstring","characterdata-utf16","characterdata-comment","characterdata-conversion","characterdata-brand","template-inert-image"};
     require_marks(names, sizeof names / sizeof *names);
     static const char *const interfaces[] = {"dom-prototype-hierarchy","dom-document-interface","dom-element-prototype-method","dom-no-fake-instanceof","dom-created-interface","dom-fragment-interface","dom-character-interfaces","dom-foreign-interface","dom-clone-interface"};
     require_marks(interfaces, sizeof interfaces / sizeof *interfaces);
@@ -797,6 +808,18 @@ static void test_dom_and_scripts(void) {
     test_check("sync-module-loader-used", fixture.sync_loads >= 3);
     test_check("dom-no-exceptions", fixture.errors == 0);
     close_case();
+    const char *late=START "</head><body><p id=previous>old</p><script>"
+        "const savedDocument=document,oldRoot=document.documentElement,retained=document.createElement('span');"
+        "document.addEventListener('DOMContentLoaded',()=>{document.write('<!doctype html><title>Replacement</title><p id=late>late</p>');"
+        "check('late-write-opens',document===savedDocument&&document.documentElement!==oldRoot&&document.getElementById('previous')===null&&document.getElementById('late').textContent==='late'&&document.readyState==='loading');"
+        "check('late-write-owner',retained.ownerDocument===document&&retained.isConnected===false&&oldRoot.ownerDocument===document);"
+        "document.close();mark('late-write-done');});</script></body>";
+    if(open_case(late,false)){
+        test_check("late-write-finished",pump("late-write-done",5000));
+        test_check("late-write-opens",has_mark(&fixture,"late-write-opens"));
+        test_check("late-write-owner",has_mark(&fixture,"late-write-owner"));
+        test_check("late-write-no-errors",fixture.errors==0&&fixture.js_failures==0);close_case();
+    }
 }
 
 static void test_events_and_forms(void) {
@@ -991,24 +1014,30 @@ static void test_fetch_and_cancel(void) {
 }
 
 static void test_execution_budget(const char *name, const char *source) {
-    const char *tail = "</script><div id=afterbudget style='height:18px'>Native UI survives</div><script>mark('must-not-run');";
-    size_t n = strlen(source) + strlen(tail) + 1;
-    char *combined = malloc(n);
-    test_check("budget-source-allocation", combined != NULL);
-    if (!combined) return;
-    snprintf(combined, n, "%s%s", source, tail);
-    char *page = script_page(combined); free(combined);
+    const char *tail = "<div id=afterbudget style='height:18px'>Native UI survives</div><script>mark('must-not-run');</script>";
+    size_t n = strlen(source) + 1;
+    char *prepared = malloc(n);
+    test_check("budget-source-allocation", prepared != NULL);
+    if (!prepared) return;
+    memcpy(prepared,source,n);
+    /* Escape JavaScript's literal end tags, never the actual document boundary
+       or native UI suffix. Otherwise the intended runaway is a syntax error. */
+    char *page = script_page_after(prepared,tail); free(prepared);
     test_check("budget-page-allocation", page != NULL);
     if (!page) return;
     if (open_watchdog_case(page)) {
         uint64_t start = uptime_ms();
-        test_check(name, pump(NULL, 10000));
+        bool stopped=pump(NULL,10000);
         uint64_t elapsed = uptime_ms() - start;
+        int64_t deadline=web_deadline(fixture.doc);
+        printf("BUDGET-TIME %s elapsed_ms=%lu settled=%d deadline=%lld\n",name,(unsigned long)elapsed,stopped?1:0,(long long)deadline);
+        test_check(name,stopped);
         test_check("budget-stopped-within-bound", elapsed >= 4900 && elapsed < 9000);
         test_check("budget-reported", fixture.errors > 0 && strstr(fixture.last_error, "5 second") != NULL);
         test_check("budget-not-running", !web_script_running(fixture.doc));
         test_check("budget-further-js-disabled", !has_mark(&fixture, "must-not-run"));
         test_check("budget-parser-native-survives", web_anchor_y(fixture.doc, "afterbudget") >= 0);
+        test_check("budget-native-idle",deadline<0&&queued_count(&fixture)==0);
         struct web_event e = {.type="click",.cancelable=true};
         test_check("budget-native-ui-survives", web_dispatch(fixture.doc, NULL, &e));
         close_case();
@@ -1183,6 +1212,8 @@ static void test_html_parser(void){
     external_case("js_pi_cases.js",";runProcessingInstructionCases().then(n=>{console.log('PI API checks '+n);check('pi-count',n>=30);mark('api-done');},e=>{console.log('FAIL PI '+e+' '+e.stack);mark('api-done');});",BASE);
     case_response_headers="Content-Security-Policy: require-trusted-types-for 'script'; trusted-types script-snapshot-test default\r\n";
     external_case_expected("js_html_script_safety_cases.js",";try{check('script-safety-count',runHTMLScriptSafetyCases()===10);}catch(e){console.log('FAIL script safety '+e+' '+e.stack);}mark('api-done');",BASE,3);
+    external_case_expected("js_html_script_safety_cases.js",";runHTMLScriptGenerationCases().then(n=>{check('script-generation-count',n===6);mark('api-done');},e=>{console.log('FAIL script generation '+e+' '+e.stack);mark('api-done');});",BASE,0);
+    external_case_expected("js_html_script_safety_cases.js",";runHTMLStreamEventCases().then(n=>{check('stream-event-count',n===6);mark('api-done');},e=>{console.log('FAIL stream events '+e+' '+e.stack);mark('api-done');});",BASE,0);
     case_response_headers=NULL;
     const char *source=START "</head><body><script>"
         "globalThis.order=[];document.write('<p id=written>now</p>');"
@@ -1213,6 +1244,33 @@ static void test_html_parser(void){
         "check('open-top-level-identity',document===originalDoc&&openPreserved===42);document.write('<p id=stream-now>now</p>');"
         "check('open-write-immediate',document.getElementById('stream-now').textContent==='now');document.close();mark('stream-done');},{once:true});");
     if(stream&&open_case(stream,false)){test_check("top-level-open-stream",pump("stream-done",5000));test_check("top-level-stream-no-errors",fixture.errors==0&&fixture.js_failures==0);close_case();}free(stream);
+    char *fragment=script_page(
+        "globalThis.dynamicOrder=[];globalThis.fragmentInline=0;const r=document.createRange();r.selectNodeContents(document.body);"
+        "const f=r.createContextualFragment('<script async defer src=order-one.js></script><script async defer src=order-two.js></script>"
+        "<script async defer>fragmentInline++;</script>');f.querySelectorAll('script')[1].onload=()=>{"
+        "check('fragment-attributes-ignore-order',dynamicOrder.join(',')==='1,2');mark('fragment-order-done');};document.body.appendChild(f);"
+        "check('fragment-inline-insertion',fragmentInline===1);const unfinished=r.createContextualFragment('<script>fragmentInline=99;');"
+        "document.body.appendChild(unfinished);check('fragment-eof-script-inert',fragmentInline===1);"
+        "document.body.appendChild(r.createContextualFragment('<svg><script>fragmentInline++;</script></svg>'));check('fragment-svg-script-insertion',fragmentInline===2);"
+        "document.body.appendChild(r.createContextualFragment('<svg><script>fragmentInline=98;'));check('fragment-svg-eof-inert',fragmentInline===2);");
+    if(fragment&&open_case(fragment,false)){test_check("fragment-script-order",pump("fragment-order-done",5000));test_check("fragment-script-no-errors",fixture.errors==0&&fixture.js_failures==0);close_case();}free(fragment);
+    char *unsafe=script_page(
+        "globalThis.dynamicOrder=[];globalThis.unsafeInline=0;const host=document.createElement('div');document.body.appendChild(host);"
+        "host.setHTMLUnsafe('<script async defer src=order-one.js></script><script async defer src=order-two.js></script>"
+        "<script>unsafeInline++;</script>',{runScripts:true});check('unsafe-inline-insertion',unsafeInline===1);"
+        "host.querySelectorAll('script')[1].onload=()=>{check('unsafe-fragment-external-order',dynamicOrder.join(',')==='1,2');mark('unsafe-order-done');};");
+    if(unsafe&&open_case(unsafe,false)){test_check("unsafe-fragment-script-order",pump("unsafe-order-done",5000));test_check("unsafe-fragment-no-errors",fixture.errors==0&&fixture.js_failures==0);close_case();}free(unsafe);
+    char *written=script_page(
+        "globalThis.writeSheetRan=false;document.getElementById('target').removeAttribute('style');document.write('<link rel=stylesheet href=style.css><script>writeSheetRan=true;"
+        "check(\"write-script-sees-sheet\",getComputedStyle(document.getElementById(\"target\")).height===\"7px\");</script>');"
+        "check('write-script-waits-for-sheet',!writeSheetRan);setTimeout(()=>{check('write-sheet-script-resumes',writeSheetRan);mark('write-sheet-done');},100);");
+    if(written&&open_case(written,false)){test_check("write-stylesheet-wait",pump("write-sheet-done",5000));test_check("write-stylesheet-no-errors",fixture.errors==0&&fixture.js_failures==0);close_case();}free(written);
+    char *replaced=script_page(
+        "globalThis.dynamicOrder=[];const retained=document.getElementById('target'),old=document.createElement('script');old.src='order-one.js';document.head.appendChild(old);"
+        "setTimeout(()=>{const same=document;document.open();document.write('<!doctype html><p id=new-stream>replacement</p>');document.close();"
+        "check('stream-document-and-node-retained',document===same&&retained.ownerDocument===same&&!retained.isConnected);"
+        "setTimeout(()=>{check('stream-old-resource-cancelled',dynamicOrder.length===0&&!!document.getElementById('new-stream'));mark('stream-resource-done');},100);},0);");
+    if(replaced&&open_case(replaced,false)){test_check("stream-resource-generation",pump("stream-resource-done",5000));test_check("stream-resource-no-errors",fixture.errors==0&&fixture.js_failures==0);close_case();}free(replaced);
 }
 static void test_network_stream(void){
     FILE *ports=fopen("/data/tests/webports","r");unsigned first=0,second=0;char text[96],origin[128];

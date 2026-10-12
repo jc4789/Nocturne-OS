@@ -1020,6 +1020,7 @@
     /* @include js_sanitizer_constants.js */
     /* @include js_html_safety.js */
     /* @include js_pi.js */
+    frameBridge.finalizeMethods();
     customElementsReady = true;
     /* Private native-input state, never reachable from page JS. C supplies the
        hit target's complete ancestry BEFORE any event handler can change it.
@@ -1119,7 +1120,7 @@
         customElementBefore(...args){
             const reactionArgs=args[0]==='adopt' && args[2] && rawDom.get(args[2],'nodeType')!==2?['remove',args[2]]:args;
             const reactionNode=customElementsBridge.active()?(args[0]==='adopt' && args[2] && rawDom.get(args[2],'nodeType')===2?rawDom.get(args[2],'attrOwner'):reactionArgs[1]):null;
-            const ceActive=customElementsBridge.active()&&(reactionNode && rawDom.get(reactionNode,'scripting') || args[0]==='adopt' && rawDom.get(args[1],'scripting'));
+            const ceActive=customElementsBridge.active()&&(['clone','import'].includes(args[0]) || reactionNode && rawDom.get(reactionNode,'scripting') || args[0]==='adopt' && rawDom.get(args[1],'scripting'));
             const ce=ceActive?customElementsBridge.before(...args):null;
             let mutationArgs=reactionArgs;
             if(args[0]==='set' && args[2]==='innerHTML' && args[1] instanceof HTMLTemplateElement)
@@ -1128,7 +1129,8 @@
             const range=rangeBridge.active()?rangeBridge.before(...mutationArgs):null;
             return ce||mutation||range?{ce,mutation,range,op:args[0]}:null;
         },
-        customElementAfter(token,result){rangeBridge.after(token.range);if(!mutationBridge.native)mutationBridge.after(token.mutation);if(!['clone','import'].includes(token.op) || !result || rawDom.get(result,'scripting'))customElementsBridge.after(token.ce,result);},
+        customElementAfter(token,result){rangeBridge.after(token.range);if(!mutationBridge.native)mutationBridge.after(token.mutation);customElementsBridge.after(token.ce,result);},
+        customElementCloneDocuments:customElementsBridge.cloneDocuments,
         mutationFlush(){mutationBridge.flush();},
         customElementScan(){customElementsBridge.upgradeTree(document);customElementsBridge.formRefresh();},
         customElementParserCandidate:customElementsBridge.parserCandidate,
@@ -1158,7 +1160,7 @@
             HTMLModElement.prototype,HTMLUListElement.prototype,HTMLDListElement.prototype,HTMLDirectoryElement.prototype,
             HTMLLegendElement.prototype,HTMLOptGroupElement.prototype,HTMLMapElement.prototype,HTMLEmbedElement.prototype,
             HTMLParamElement.prototype,HTMLFontElement.prototype,HTMLFrameSetElement.prototype,HTMLMarqueeElement.prototype,
-            ...htmlTablesBridge.nodeProtos],
+            ...htmlTablesBridge.nodeProtos,svgBridge.groupProto],
         dispatch:nativeDispatch,
         response(...args){return fetchBridge.response(...args);},
         reject(message,abort){return abort?new DOMException(message,'AbortError'):new TypeError(message);}

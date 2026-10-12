@@ -112,5 +112,7 @@ lxb_dom_character_data_replace(lxb_dom_character_data_t *ch_data,
     ch_data->data.data[len] = 0x00;
     ch_data->data.length = len;
 
+    lxb_dom_node_parser_changed(&ch_data->node, LXB_DOM_NODE_PARSER_FIELDS);
+
     return LXB_STATUS_OK;
 }

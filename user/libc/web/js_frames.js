@@ -5,6 +5,15 @@
         const methodNames=['addEventListener','removeEventListener','dispatchEvent','getComputedStyle','matchMedia','setTimeout','setInterval','clearTimeout','clearInterval','requestAnimationFrame','cancelAnimationFrame','requestIdleCallback','cancelIdleCallback','queueMicrotask'];
         const originalMethods=Object.create(null);
         for(const key of methodNames)originalMethods[key]=globalThis[key];
+        let methodsFinalized=false;
+        function finalizeMethods(){
+            if(methodsFinalized)return;
+            // Platform wrappers installed later in bootstrap are still native
+            // delegates. Freeze their identities before any author execution;
+            // subsequent author replacements remain ordinary property values.
+            for(const key of methodNames)originalMethods[key]=globalThis[key];
+            methodsFinalized=true;
+        }
         function security(){throw new DOMException('Cross-origin Window access is forbidden','SecurityError');}
         function access(op,token,...args){
             try{return host.frame(op,token,...args);}catch(error){
@@ -93,5 +102,5 @@
             frames:{configurable:true,get(){return windowProxy(selfToken);}},
             length:{configurable:true,get(){return access('length',selfToken);}}
         });
-        return {windowProxy,methodOriginal:key=>originalMethods[key]};
+        return {windowProxy,methodOriginal:key=>originalMethods[key],finalizeMethods};
     })();

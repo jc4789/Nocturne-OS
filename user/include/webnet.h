@@ -96,6 +96,8 @@ typedef void (*webnet_callback)(webnet *, uint64_t id, uint64_t generation,
                                const struct webnet_response *, void *opaque);
 
 webnet *webnet_create(void);
+/* Trusted host diagnostics only; no author fields or response bytes are logged. */
+void webnet_debug(webnet *, bool enabled);
 void webnet_free(webnet *net);
 /* Browser-owned session jar. Native host entry points for document.cookie.
    get returns bytes excluding NUL, out=NULL queries length; -1 on failure.

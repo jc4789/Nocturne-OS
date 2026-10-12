@@ -75,7 +75,8 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
         if(!web_frame_initial_create(f,&s->host)){
             log_text(s,2,"Frame initial about:blank context could not be created");return;
         }
-        node_t *ignored=NULL;html_resume(f->document->parser,&ignored);
+        node_t *ignored=NULL;int result;
+        do{result=html_resume(f->document->parser,&ignored);}while(result==HTML_PARSE_YIELD);
     }
     if(srcdoc && !f->navigation){
         if(!web_frame_commit(f,srcdoc,strlen(srcdoc),"about:srcdoc","utf-8",&s->host,true))
@@ -583,8 +584,8 @@ static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int a
         s->handler_body=NULL;
         html_finish(s->doc->parser);s->doc->parser=NULL;
         while(s->doc->root->first)doc_node_remove(s->doc,s->doc->root->first);
-        for(struct js_script *script=s->scripts;script;script=script->next)script->executed=script->parser_released=true;
-        s->blocker=NULL;s->parsing_done=s->domcontent_sent=s->load_sent=false;
+        document_stream_reset(s);
+        s->blocker=NULL;s->parsing_done=s->parsing_cancelled=s->domcontent_sent=s->load_sent=false;
         s->doc->parser=html_open(s->doc);
         if(!s->doc->parser)return oom(ctx);
         s->document_open=s->document_waiting=true;
@@ -601,19 +602,30 @@ static JSValue native_document_stream(JSContext *ctx,JSValueConst this_val,int a
 }
 static bool frame_stream_pump(struct web_js_state *s) {
     if(s->blocker && !s->blocker->executed)return true;
-    for(unsigned step=0;step<128 && s->doc->parser;step++){
-        node_t *node=NULL;int result=html_resume(s->doc->parser,&node);
-        if(result<0 || html_import_changed(s->doc->parser))s->doc->dirty=s->doc->resources_dirty=true;
-        if(result<0)return false;
+    while(s->doc->parser && !s->disabled){
+        struct html_parser *parser=s->doc->parser;
+        uint64_t generation=s->stream_generation;
+        node_t *node=NULL;int result=html_resume(parser,&node);
+        if(s->doc->parser!=parser || s->stream_generation!=generation)return true;
+        if(result<0 || html_import_changed(parser))s->doc->dirty=s->doc->resources_dirty=true;
+        if(result==HTML_PARSE_FAILED)return false;
+        if(result==HTML_PARSE_CANCELLED){html_finish(parser);s->doc->parser=NULL;s->parsing_done=s->parsing_cancelled=true;s->document_waiting=false;return true;}
         sync_parser_body_handlers(s);
-        if(result==2){s->document_waiting=true;return true;}
-        if(!result){html_finish(s->doc->parser);s->doc->parser=NULL;s->parsing_done=true;return true;}
-        if(node && node->tag==T_script){
+        if(s->doc->parser!=parser || s->stream_generation!=generation)return true;
+        if(result==HTML_PARSE_INPUT_WAIT){s->document_waiting=true;return true;}
+        if(result==HTML_PARSE_YIELD)continue;
+        if(result==HTML_PARSE_DONE){html_finish(parser);s->doc->parser=NULL;s->parsing_done=true;return true;}
+        if(result==HTML_PARSE_SCRIPT && node && node->tag==T_script){
             struct js_script *script=queue_script(s,node,false);
+            if(s->doc->parser!=parser || s->stream_generation!=generation)return true;
             if(script && !script->deferred && !script->asynchronous){
-                if(!script->ready){s->blocker=script;return true;}
+                request_styles(s);
+                if(!parser_script_ready(s,script)){s->blocker=script;return true;}
                 struct js_script *previous=s->blocker;s->blocker=script;
-                run_script(s,script);s->blocker=previous;
+                run_script(s,script);
+                if(s->doc->parser!=parser || s->stream_generation!=generation)return true;
+                if(s->blocker==script)s->blocker=previous;
+                else return true;
                 if(s->disabled)return false;
             }
         }
@@ -625,18 +637,26 @@ static bool frame_stream_pump(struct web_js_state *s) {
    timer, or pump the general event loop while the outer author call is live. */
 static bool parser_write_pump(struct web_js_state *s,void *boundary) {
     struct html_parser *parser=s->doc->parser;
+    uint64_t generation=s->stream_generation;
     struct js_script *outer=s->blocker;
-    while(parser && s->doc->parser==parser && !s->disabled){
+    while(parser && s->doc->parser==parser && s->stream_generation==generation && !s->disabled){
         node_t *node=NULL;int result=html_resume_written(parser,&node,boundary);
+        if(s->doc->parser!=parser || s->stream_generation!=generation)return true;
         if(result<0 || html_import_changed(parser))s->doc->dirty=s->doc->resources_dirty=true;
-        if(result<0)return false;
+        if(result==HTML_PARSE_FAILED)return false;
+        if(result==HTML_PARSE_CANCELLED){html_finish(parser);s->doc->parser=NULL;s->parsing_done=s->parsing_cancelled=true;s->document_waiting=false;return true;}
         sync_parser_body_handlers(s);
-        if(result==2 || !result)break;
-        if(node && node->tag==T_script){
+        if(s->doc->parser!=parser || s->stream_generation!=generation)return true;
+        if(result==HTML_PARSE_YIELD)continue;
+        if(result==HTML_PARSE_INPUT_WAIT || result==HTML_PARSE_DONE)break;
+        if(result==HTML_PARSE_SCRIPT && node && node->tag==T_script){
             struct js_script *script=queue_script(s,node,false);
+            if(s->doc->parser!=parser || s->stream_generation!=generation)return true;
             if(script && !script->deferred && !script->asynchronous){
-                if(!script->ready){s->blocker=script;return true;}
+                request_styles(s);
+                if(!parser_script_ready(s,script)){s->blocker=script;return true;}
                 s->blocker=script;run_script(s,script);
+                if(s->doc->parser!=parser || s->stream_generation!=generation)return true;
                 if(s->blocker==script)s->blocker=outer;
                 else return true; /* a nested external script remains blocked */
             }

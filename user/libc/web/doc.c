@@ -45,16 +45,6 @@ struct pending {
     node_t *scope; /* stylesheet owner shadow root, NULL for document */
 };
 
-struct cached_css {
-    char *url, *base, *body;
-    size_t n;
-    bool done;
-    /* A completed fetch is immutable. Keep its parser ownership independent
-       of resource-scan snapshots; only scope/order/media instances are rebuilt. */
-    arena_t ast_mem;
-    sheet_t *ast;
-};
-
 /* Repeated shadow <style> blocks need separate scope/order wrappers, not a
    fresh expanded AST per component. This memo is local to one arena snapshot.
    Imported sheets are excluded: their request order is not interchangeable. */
@@ -766,7 +756,7 @@ web_doc *doc_inert_ex(web_doc *family, const char *html, size_t n, const char *u
     family = family->dom_family ? family->dom_family : family;
     web_doc *d = calloc(1, sizeof *d);
     if (!d) return NULL;
-    d->inert = true; d->dom_family = family;
+    d->inert = true; d->custom_registry_id = -1; d->dom_family = family;
     d->url = strdup(url && *url ? url : "about:blank");
     if (!d->url) { free(d); return NULL; }
     snprintf(d->base, sizeof d->base, "%s", d->url);
@@ -1156,15 +1146,17 @@ void web_free(web_doc *d) {
         font_close(f->face);free(f->url);free(f);
     }
     web_form_validation_free(d);
+    /* Parser subscriptions can borrow allocation-owned nodes in helper docs. */
+    html_finish(d->parser);
+    d->parser = NULL;
     while (d->dom_docs) {
         web_doc *child = d->dom_docs;
         d->dom_docs = child->dom_next; child->dom_next = NULL;
         web_free(child);
     }
-    html_finish(d->parser);
-    d->parser = NULL;
     if (d->owned_nodes) {
         for (node_t *n = d->owned_nodes; n; n = n->owned_next) {
+            html_bridge_native_retire(n);
             free(n->container_names);n->container_names=NULL;
             css_node_style_free(n);
             cssom_style_free(n);
@@ -1293,10 +1285,10 @@ void web_image_loaded(web_doc *d, int i, const void *data, size_t n) {
             }
             if (!in_template) node->image = i;
         }
-        if (node->image != i) continue;
+        if (node->image != i || doc_node_root(node, true) != d->root) continue;
+        if (d->profile_enabled && d->replaced_trace_reported < 2 && im->img && node->tag == T_img) d->replaced_trace_pending = true;
         box_t *box = node->box;
-        if (!box || box->node != node || box->kind != B_ATOMIC || box->atomic != AT_IMG ||
-            doc_node_root(node, true) != d->root) continue;
+        if (!box || box->node != node || box->kind != B_ATOMIC || box->atomic != AT_IMG) continue;
         const style_t *style = box->st;
         /* Image availability/natural size never changes the author's CSS.
            Both definite absolute axes make replaced sizing independent of
@@ -1345,7 +1337,15 @@ static void invalidate_layout_tree(box_t *b) {
 
 int web_layout(web_doc *d, int width, int height) {
     unsigned container_pass=0;
-    if (d->native_cancelled) return d->doc_h;
+    if (d->native_cancelled) {
+        if(!web_js_native_recover(d)){
+            if(d->native_recovery_pending)d->dirty=true;
+            return d->doc_h;
+        }
+        d->layout_valid=false;d->need_style=d->need_boxes=d->style_full_dirty=true;
+        d->resources_dirty=true;
+    }
+    d->native_layout_depth++;
     doc_shadow_flush(d);
     if (width < 1) width = 1;
     if (height < 1) height = 1;
@@ -1360,7 +1360,7 @@ int web_layout(web_doc *d, int width, int height) {
     /* Geometry reads may flush layout repeatedly within one script. Reuse the
        result until DOM/style, viewport, or image intrinsic dimensions change. */
     if (d->layout_valid && !d->need_style && !d->need_boxes && d->root_box &&
-        d->width == width && d->height == height) return d->doc_h;
+        d->width == width && d->height == height) { d->native_layout_depth--; return d->doc_h; }
     /* No independent patch may publish a previously committed video span
        while geometry is incomplete. Native PCM/transport supply continues. */
     web_avmedia_layout_begin(d);
@@ -1421,12 +1421,18 @@ reflow:
         if(++container_pass<8)goto reflow;
         d->layout_revision++;
         d->layout_valid=false;d->dirty=true;
+        d->native_layout_depth--;
         return d->doc_h;
     }
     d->layout_revision++;
     d->layout_valid = true;
+    if(d->native_recovery_pending){
+        d->native_recovery_pending=d->native_recovery_active=false;
+        web_js_console(d,1,"Native view recovered from coherent DOM; author scripts and the aborted parser remain stopped.");
+    }
     layout_clamp_trace_report(d);
     if (d->find_text && *d->find_text && !d->find_revealing) web_find(d, d->find_text, 0);
+    d->native_layout_depth--;
     return d->doc_h;
 cancelled:
     /* Never paint/hit-test a half-built tree or label it a valid layout. */
@@ -1434,7 +1440,9 @@ cancelled:
     boxes_discard(d);
     css_node_style_unpublish(d->root);
     css_styles_release(d);
-    d->layout_valid = false; d->dirty = false;
+    d->layout_valid = false; d->dirty = d->native_recovery_pending;
+    d->native_recovery_active=false;
+    d->native_layout_depth--;
     return d->doc_h;
 }
 

@@ -371,8 +371,21 @@ lxb_dom_node_name(lxb_dom_node_t *node, size_t *len)
 }
 
 void
+lxb_dom_node_parser_changed(lxb_dom_node_t *node, unsigned flags)
+{
+    if (node != NULL && node->owner_document != NULL
+        && node->owner_document->parser_changed != NULL)
+    {
+        node->owner_document->parser_changed(node, flags,
+                              node->owner_document->parser_changed_context);
+    }
+}
+
+void
 lxb_dom_node_insert_child_wo_events(lxb_dom_node_t *to, lxb_dom_node_t *node)
 {
+    lxb_dom_node_parser_changed(to, LXB_DOM_NODE_PARSER_CHILDREN);
+    lxb_dom_node_parser_changed(to->last_child, LXB_DOM_NODE_PARSER_LINKS);
     if (to->last_child != NULL) {
         to->last_child->next = node;
     }
@@ -385,6 +398,7 @@ lxb_dom_node_insert_child_wo_events(lxb_dom_node_t *to, lxb_dom_node_t *node)
     node->prev = to->last_child;
 
     to->last_child = node;
+    lxb_dom_node_parser_changed(node, LXB_DOM_NODE_PARSER_LINKS);
 }
 
 void
@@ -405,6 +419,9 @@ lxb_dom_node_insert_child(lxb_dom_node_t *to, lxb_dom_node_t *node)
 void
 lxb_dom_node_insert_before_wo_events(lxb_dom_node_t *to, lxb_dom_node_t *node)
 {
+    lxb_dom_node_parser_changed(to->parent, LXB_DOM_NODE_PARSER_CHILDREN);
+    lxb_dom_node_parser_changed(to->prev, LXB_DOM_NODE_PARSER_LINKS);
+    lxb_dom_node_parser_changed(to, LXB_DOM_NODE_PARSER_LINKS);
     if (to->prev != NULL) {
         to->prev->next = node;
     }
@@ -419,6 +436,7 @@ lxb_dom_node_insert_before_wo_events(lxb_dom_node_t *to, lxb_dom_node_t *node)
     node->prev = to->prev;
 
     to->prev = node;
+    lxb_dom_node_parser_changed(node, LXB_DOM_NODE_PARSER_LINKS);
 }
 
 void
@@ -439,6 +457,9 @@ lxb_dom_node_insert_before(lxb_dom_node_t *to, lxb_dom_node_t *node)
 void
 lxb_dom_node_insert_after_wo_events(lxb_dom_node_t *to, lxb_dom_node_t *node)
 {
+    lxb_dom_node_parser_changed(to->parent, LXB_DOM_NODE_PARSER_CHILDREN);
+    lxb_dom_node_parser_changed(to->next, LXB_DOM_NODE_PARSER_LINKS);
+    lxb_dom_node_parser_changed(to, LXB_DOM_NODE_PARSER_LINKS);
     if (to->next != NULL) {
         to->next->prev = node;
     }
@@ -452,6 +473,7 @@ lxb_dom_node_insert_after_wo_events(lxb_dom_node_t *to, lxb_dom_node_t *node)
     node->next = to->next;
     node->prev = to;
     to->next = node;
+    lxb_dom_node_parser_changed(node, LXB_DOM_NODE_PARSER_LINKS);
 }
 
 void
@@ -858,6 +880,9 @@ lxb_dom_node_remove_spec(lxb_dom_node_t *node, bool suppress_observers)
 void
 lxb_dom_node_remove_wo_events(lxb_dom_node_t *node)
 {
+    lxb_dom_node_parser_changed(node->parent, LXB_DOM_NODE_PARSER_CHILDREN);
+    lxb_dom_node_parser_changed(node->next, LXB_DOM_NODE_PARSER_LINKS);
+    lxb_dom_node_parser_changed(node->prev, LXB_DOM_NODE_PARSER_LINKS);
     if (node->parent != NULL) {
         if (node->parent->first_child == node) {
             node->parent->first_child = node->next;
@@ -879,6 +904,7 @@ lxb_dom_node_remove_wo_events(lxb_dom_node_t *node)
     node->parent = NULL;
     node->next = NULL;
     node->prev = NULL;
+    lxb_dom_node_parser_changed(node, LXB_DOM_NODE_PARSER_LINKS);
 }
 
 void

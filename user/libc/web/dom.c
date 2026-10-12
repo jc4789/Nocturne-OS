@@ -371,7 +371,10 @@ static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recasca
     if (!d) return;
     d->dom_revision++;
     if (d->js_nodes_dirty) { d->js_nodes_dirty = false; web_js_nodes_changed(d); }
-    if (n) n->resource_revision++;
+    if (n) {
+        n->resource_revision++;
+        html_bridge_native_changed(n, HTML_BRIDGE_FIELDS);
+    }
     /* Detached forests are often prepared between geometry reads (jQuery,
        consent banners, ads). They cannot change the live cascade.
        Preserve DOM/reaction revisions; insertion/removal notifies the live
@@ -442,6 +445,7 @@ static bool resource_ancestor(node_t *n) {
     return false;
 }
 static void structure_changed_lifetime(web_doc *d, node_t *parent, node_t *subtree, bool lifetime_changed) {
+    html_bridge_native_changed(parent, HTML_BRIDGE_CHILDREN);
     cssom_style_text_changed(parent);
     if (lifetime_changed) cssom_style_lifecycle(subtree);
     if (d && lifetime_changed) d->js_nodes_dirty = true;
@@ -903,6 +907,10 @@ static void stylesheet_detach(node_t *root) {
 static void detach(node_t *n) {
     node_t *p = n->parent;
     if (!p) return;
+    html_bridge_native_changed(p, HTML_BRIDGE_CHILDREN);
+    html_bridge_native_changed(n->prev, HTML_BRIDGE_LINKS);
+    html_bridge_native_changed(n->next, HTML_BRIDGE_LINKS);
+    html_bridge_native_changed(n, HTML_BRIDGE_LINKS);
     stylesheet_detach(n);
     if (n->prev) n->prev->next = n->next; else p->first = n->next;
     if (n->next) n->next->prev = n->prev; else p->last = n->prev;
@@ -983,6 +991,7 @@ int doc_node_replace_all_validity(node_t *p,node_t *c) {
 
 void doc_parser_form_set(node_t *node,node_t *form){
     if(!node || node->parser_form_owner==form)return;
+    html_bridge_native_changed(node, HTML_BRIDGE_FIELDS);
     web_doc *d=node->owner;if(!d)return;
     if(node->parser_form_owner){
         node_t **link=&d->parser_form_nodes;
@@ -1037,6 +1046,9 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
     c->prev = before ? before->prev : p->last;
     if (c->prev) c->prev->next = c; else p->first = c;
     if (before) before->prev = c; else p->last = c;
+    html_bridge_native_changed(c, HTML_BRIDGE_LINKS);
+    html_bridge_native_changed(c->prev, HTML_BRIDGE_LINKS);
+    html_bridge_native_changed(c->next, HTML_BRIDGE_LINKS);
     indices(p);
     reset_parser_forms(c);
     if (is_slot(p) && !p->slot_assigned_first && doc_node_root(p, false)->shadow_host)
@@ -1089,6 +1101,26 @@ bool doc_node_replace_all(web_doc *d,node_t *p,node_t *c) {
     return !c||doc_node_move(d,p,c,NULL);
 }
 
+static int32_t clone_document_registry(web_doc *d) {
+    return d->custom_registry_id!=-2?d->custom_registry_id:web_js_enabled(d)?0:-1;
+}
+static void adopt_registry(web_doc *document,node_t *node) {
+    if(node->type!=N_ELEM && !node->shadow_host)return;
+    int32_t registry=node->custom_registry_id;
+    if(registry==-2)registry=clone_document_registry(node->owner);
+    if(registry>0)return; /* A scoped registry keeps its identity. */
+    if(node->shadow_host && registry==-1 && node->shadow_keep_registry_null)return;
+    int32_t destination=clone_document_registry(document);
+    if(!node->shadow_host && registry==-1 && node->parent &&
+       !(node->parent->type==N_FRAGMENT && !node->parent->shadow_host)){
+        node_t *parent=node->parent;
+        destination=parent->custom_registry_id==-2?clone_document_registry(parent->owner):parent->custom_registry_id;
+    }
+    /* Adoption chooses only the effective global registry of the document or
+       parent; it must not accidentally opt a null element into a scoped one. */
+    node->custom_registry_id=destination==0?0:-1;
+    node->custom_registry_realm=destination==0?document->custom_registry_realm:NULL;
+}
 static void adopt_subtree(web_doc *d, node_t *root) {
   for (node_t *n = root; n; n = tree_next(n, root, true, true, true)) {
     web_doc *owner = d;
@@ -1103,8 +1135,9 @@ static void adopt_subtree(web_doc *d, node_t *root) {
     if (n->owner != owner && n->adopted_count) {
         free(n->adopted_sheets); n->adopted_sheets = NULL; n->adopted_count = 0;
     }
-    if(n->owner!=owner)n->style_scope=NULL;
+    if(n->owner!=owner){adopt_registry(owner,n);n->style_scope=NULL;}
     doc_parser_form_set(n,NULL);n->owner = owner;
+    html_bridge_native_changed(n, HTML_BRIDGE_FIELDS | HTML_BRIDGE_LINKS);
     for (int i = 0; i < n->nattrs; i++) if (n->attrs[i].node) n->attrs[i].node->owner = owner;
     n->style = n->animation_base_style = NULL; n->box = n->anchor_block = NULL;
     n->image = -1; n->image_request = -1; n->image_initialized = false;
@@ -1244,16 +1277,18 @@ bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
 
 bool doc_node_html(web_doc *d, node_t *n, const char *html, size_t len) {
     if (!d || !n || (n->type != N_ELEM && n->type != N_FRAGMENT) || len == SIZE_MAX || (len && !html)) return false;
-    /* Fragment parsing needs the actual ShadowRoot registry, while its HTML
-       element context is selected by the parser without losing that root. */
-    node_t *context = n;
+    /* The insertion target owns the fragment, but the host/context document
+       supplies scripting and compatibility (not the inert template owner). */
+    node_t *context = n->shadow_host?n->shadow_host:n->template_host?n->template_host:n;
     if (n->type == N_ELEM && !n->foreign && n->tag == T_template) {
         n = doc_template_content(d, n);
         if (!n) return false;
         d = n->owner;
     }
     doc_dom_budget(d);
-    node_t *fragment = html_fragment(d, context, html, len);
+    web_doc *context_document=context->owner?context->owner:d;
+    enum html_scripting_mode mode=web_js_enabled(context_document)?HTML_SCRIPTING_INERT:HTML_SCRIPTING_DISABLED;
+    node_t *fragment = html_fragment_mode(d,n,context,html,len,false,mode);
     if (!fragment) return false;
     for (node_t *c = fragment->first; c; c = c->next) if (!may_insert(n, c)) return false;
     while (n->first) doc_node_remove(d, n->first);
@@ -1347,7 +1382,25 @@ static bool clone_attributes(web_doc *d, node_t *copy, const node_t *source) {
     return true;
 }
 
-static node_t *clone_one(web_doc *d, node_t *n) {
+static void clone_registry(web_doc *d,node_t *copy,const node_t *source,int32_t fallback,void *fallback_realm) {
+    int32_t registry=source->custom_registry_id;
+    void *realm=source->custom_registry_realm;
+    if(registry==-2 && source->owner){
+        registry=clone_document_registry(source->owner);
+        realm=source->owner->custom_registry_realm;
+    }
+    if(registry==-1 || registry==-2){registry=fallback;realm=fallback_realm;}
+    if(registry==0){
+        /* A global registry is never borrowed from another Document. Scoped
+           registries retain their identity; the destination's effective
+           global registry is null when its registry is scoped or null. */
+        registry=clone_document_registry(d)==0?0:-1;
+        realm=registry==0?d->custom_registry_realm:NULL;
+    }
+    copy->custom_registry_id=registry;
+    copy->custom_registry_realm=realm;
+}
+static node_t *clone_one(web_doc *d, node_t *n, int32_t fallback, void *fallback_realm) {
     if (!d || !n || n->type == N_DOC || n->shadow_host) return NULL;
     if (n->type == N_ATTR) {
         struct attr *a = n->attribute;
@@ -1357,8 +1410,7 @@ static node_t *clone_one(web_doc *d, node_t *n) {
     if (!c) return NULL;
     c->foreign = n->foreign;
     c->namespace_id = n->namespace_id;
-    c->custom_registry_id = n->custom_registry_id;
-    c->custom_registry_realm = n->custom_registry_realm;
+    clone_registry(d,c,n,fallback,fallback_realm);
     if (n->custom_is) {
         jmp_buf trap; jmp_buf *old = d->mem.trap; d->mem.trap = &trap;
         if (setjmp(trap)) { d->mem.trap = old; return NULL; }
@@ -1400,16 +1452,21 @@ static node_t *clone_one(web_doc *d, node_t *n) {
    never turns DOM depth into C stack depth. Partial clones remain unescaped. */
 struct clone_walk {
     node_t *source, *copy, *attach, *target, *next;
+    int32_t fallback_registry;
+    void *fallback_realm;
     unsigned stage;
     bool deep;
 };
-node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
-    node_t *root = clone_one(d, n);
+node_t *doc_node_clone_registry(web_doc *d, node_t *n, bool deep, int32_t fallback_registry, void *fallback_realm) {
+    if(!d)return NULL;
+    if(fallback_registry==-2){fallback_registry=clone_document_registry(d);fallback_realm=d->custom_registry_realm;}
+    node_t *root = clone_one(d, n, fallback_registry, fallback_realm);
     if (!root || n->type == N_ATTR) return root;
     size_t capacity = 16, used = 1;
     struct clone_walk *stack = malloc(capacity * sizeof *stack);
     if (!stack) return NULL;
-    stack[0] = (struct clone_walk){.source=n, .copy=root, .deep=deep};
+    stack[0] = (struct clone_walk){.source=n, .copy=root, .deep=deep,
+        .fallback_registry=fallback_registry, .fallback_realm=fallback_realm};
     while (used) {
         struct clone_walk *at = &stack[used - 1];
         node_t *source = at->source, *copy = at->copy;
@@ -1431,8 +1488,8 @@ node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
                     shadow->shadow_delegates_focus, true, shadow->shadow_serializable, shadow->shadow_manual);
                 if (!at->target) { free(stack); return NULL; }
                 at->target->shadow_declarative = shadow->shadow_declarative;
-                at->target->custom_registry_id = shadow->custom_registry_id;
-                at->target->custom_registry_realm = shadow->custom_registry_realm;
+                at->target->shadow_keep_registry_null = shadow->shadow_keep_registry_null;
+                clone_registry(copy->owner,at->target,shadow,-1,NULL);
                 at->next = shadow->first;
             }
         }
@@ -1443,6 +1500,11 @@ node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
         }
         node_t *child = at->next, *target = at->target;
         at->next = child->next;
+        /* HTML template cloning uses its contents owner and no fallback.
+           DOM's clonable-shadow steps likewise deliberately omit fallback.
+           Snapshot before growth; realloc can retire the current walk slot. */
+        int32_t child_registry=at->stage==2?at->fallback_registry:-1;
+        void *child_realm=at->stage==2?at->fallback_realm:NULL;
         if (used == capacity) {
             size_t max = SIZE_MAX / sizeof *stack;
             if (capacity == max) { free(stack); return NULL; }
@@ -1451,9 +1513,13 @@ node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
             if (!grown) { free(stack); return NULL; }
             stack = grown; capacity = next;
         }
-        node_t *made = clone_one(target->owner, child);
+        node_t *made = clone_one(target->owner, child, child_registry, child_realm);
         if (!made) { free(stack); return NULL; }
-        stack[used++] = (struct clone_walk){.source=child, .copy=made, .attach=target, .deep=true};
+        stack[used++] = (struct clone_walk){.source=child, .copy=made, .attach=target, .deep=true,
+            .fallback_registry=child_registry, .fallback_realm=child_realm};
     }
     free(stack); return root;
+}
+node_t *doc_node_clone(web_doc *d, node_t *n, bool deep) {
+    return doc_node_clone_registry(d,n,deep,-1,NULL);
 }

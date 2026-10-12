@@ -9,6 +9,7 @@
 #include <nocturne.h>
 #include <parallel.h>
 #include "webi.h"
+#include <limits.h>
 #include "frame.h"
 #include "web_dialog.h"
 #include "js_canvas.h"
@@ -17,7 +18,7 @@
 #include "form_value.h"
 #include "form_validation.h"
 
-enum { M_PAINT, M_HIT };
+enum { M_PAINT, M_HIT, M_BOUNDS };
 
 struct pctx {
     web_doc *d;
@@ -31,6 +32,12 @@ struct pctx {
     node_t *target;
     box_t *top_root;
     uint32_t canvas_bg_from; /* 1: html's background was used for the canvas, 2: body's */
+    uint32_t canvas_bg;
+    bool canvas_group;
+    uint64_t bounds_generation;
+    unsigned bounds_work;
+    float bounds[4];
+    bool bounds_valid, failed;
 };
 #include "paint_media_debug.h"
 
@@ -44,7 +51,9 @@ static bool positioned(const box_t *b) {
 }
 
 static bool stacking_context(const box_t *b) {
-    if (!b->st || b->kind == B_INLINE || b->kind == B_TEXT) return false;
+    if (!b->st || b->kind == B_TEXT || b->kind == B_BR) return false;
+    if (b->st->filter || b->st->opacity < 1) return true;
+    if (b->kind == B_INLINE) return false;
     /* Opacity groups are atomic even in normal flow. Fixed/sticky boxes also
        establish a context with auto z-index; their descendants cannot escape
        into the outer context's global sort after author layout hydration. */
@@ -1002,21 +1011,46 @@ static int layer_z(const box_t *b) {
     return b->st->z_auto || (!positioned(b) && b->st->position != POS_STICKY) ? 0 : b->st->z_index;
 }
 
-static void collect_layers(web_doc *d, pvec *layers, box_t *b) {
+static bool layer_push(pvec *layers, box_t *box) {
+    if (layers->n == layers->cap) {
+        int capacity = layers->cap ? layers->cap > INT_MAX / 2 ? INT_MAX : layers->cap * 2 : 16;
+        if (capacity <= layers->cap || (size_t)capacity > SIZE_MAX / sizeof *layers->v) return false;
+        void **v = realloc(layers->v, (size_t)capacity * sizeof *v);
+        if (!v) return false;
+        layers->v = v; layers->cap = capacity;
+    }
+    layers->v[layers->n++] = box;
+    return true;
+}
+static bool collect_layers(web_doc *d, pvec *layers, box_t *b) {
     for (box_t *c = b->first; c; c = c->next) {
         if (c->clamp_hidden || (c->st && c->st->display == D_NONE) || web_dialog_layer_box(d,c)) continue;
-        if (paint_box_layer(c)) pv_push(layers, c);
-        if (!stacking_context(c)) collect_layers(d, layers, c);
+        if (paint_box_layer(c) && !layer_push(layers, c)) return false;
+        if (!stacking_context(c) && !collect_layers(d, layers, c)) return false;
     }
+    return true;
 }
 
 /* the atomic inlines and floats inside an inline formatting context, in tree order */
+static void bounds_rect(struct pctx *P, float x, float y, float w, float h) {
+    if (!(w > 0 && h > 0) || !isfinite(x) || !isfinite(y) || !isfinite(x + w) || !isfinite(y + h)) return;
+    if (!P->bounds_valid) {
+        P->bounds[0] = x; P->bounds[1] = y; P->bounds[2] = x + w; P->bounds[3] = y + h;
+        P->bounds_valid = true;
+    } else {
+        if (x < P->bounds[0]) P->bounds[0] = x;
+        if (y < P->bounds[1]) P->bounds[1] = y;
+        if (x + w > P->bounds[2]) P->bounds[2] = x + w;
+        if (y + h > P->bounds[3]) P->bounds[3] = y + h;
+    }
+}
 static void inline_children(struct pctx *P, box_t *b, bool floats) {
     for (box_t *c = b->first; c; c = c->next) {
         if (c->clamp_hidden) continue;
-        if (paint_box_layer(c)) continue;
+        if (P->mode != M_BOUNDS && paint_box_layer(c)) continue;
         if (c->kind == B_INLINE) {
-            inline_children(P, c, floats);
+            if (P->mode == M_BOUNDS && floats) paint_box(P, c, true);
+            else if (P->mode != M_BOUNDS) inline_children(P, c, floats);
             continue;
         }
         if (c->kind == B_TEXT || c->kind == B_BR) continue;
@@ -1024,7 +1058,7 @@ static void inline_children(struct pctx *P, box_t *b, bool floats) {
     }
 }
 
-static void paint_runs(struct pctx *P, box_t *b) {
+static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
     float bx = box_visual_x(b), by = cy(b);
     if(web_marquee_box(b)){bx+=b->node->marquee_x;by+=b->node->marquee_y;}
     if (box_element_scrollable(b)) {
@@ -1032,10 +1066,14 @@ static void paint_runs(struct pctx *P, box_t *b) {
         by -= (float)b->node->scroll_y;
     }
     /* inline box backgrounds */
-    for (int i = 0; i < b->ndecos; i++) {
+    for (int i = scope ? scope->inline_deco_first : 0; i >= 0 && i < b->ndecos;
+         i = scope ? b->decos[i].paint_next : i + 1) {
         struct deco *d = &b->decos[i];
+        if (scope && d->paint_owner != scope) continue;
+        if (!scope && P->mode != M_BOUNDS && d->paint_owner) continue;
         const style_t *st = d->st;
         if (st->visibility) continue;
+        if (P->mode == M_BOUNDS) { bounds_rect(P, bx + d->x, by + d->y, d->w, d->h); continue; }
         if (P->mode == M_HIT) {
             if (hit_style(st) && d->node && inside(P, bx + d->x, by + d->y, d->w, d->h)) hit_target(P,d->node);
             continue;
@@ -1049,8 +1087,11 @@ static void paint_runs(struct pctx *P, box_t *b) {
         if (y > P->c->cy1 || y + d->h < P->c->cy0) continue;
         paint_bg_border(P, st, x, y, d->w, d->h, bw, false, !d->first, !d->last);
     }
-    for (int i = 0; i < b->nruns; i++) {
+    for (int i = scope ? scope->inline_run_first : 0; i >= 0 && i < b->nruns;
+         i = scope ? b->runs[i].paint_next : i + 1) {
         struct run *r = &b->runs[i];
+        if (scope && r->paint_owner != scope) continue;
+        if (!scope && P->mode != M_BOUNDS && r->paint_owner) continue;
         if (r->atomic) {
             if (P->mode == M_HIT) {
                 box_t *a = r->atomic;
@@ -1072,21 +1113,40 @@ static void paint_runs(struct pctx *P, box_t *b) {
             }
             continue;
         }
-        paint_run_text(P, r, bx, by);
+        if (P->mode == M_BOUNDS) {
+            if (r->st->visibility) continue;
+            wfont f = style_font(r->st); float asc, desc;
+            wf_metrics(&f, &asc, &desc);
+            /* Include glyph overhang/decoration coverage, not only advance. */
+            bounds_rect(P, bx + r->x - r->st->font_size, by + r->y - asc - 1,
+                r->w + 2 * r->st->font_size, asc + desc + 2);
+        } else paint_run_text(P, r, bx, by);
     }
 }
 
 static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
+    if (P->failed) return;
     if (b->clamp_hidden || !b->st || b->st->display == D_NONE) return;
     if (web_dialog_layer_box(P->d,b) && b != P->top_root) return;
     if (P->mode == M_HIT && b->node && web_dialog_inert(P->d,b->node)) return;
-    if (paint_box_layer(b) && !layer_root) return; /* painted with the layers */
+    if (P->mode != M_BOUNDS && paint_box_layer(b) && !layer_root) return; /* painted with the layers */
     const style_t *st = b->st;
+    float group_opacity = st->opacity * (st->filter ? st->filter->opacity : 1);
     /* Transparent auto boxes still participate in hit testing. */
-    if (P->mode == M_PAINT && st->opacity <= 0.001f) return;
+    if (P->mode != M_HIT && group_opacity <= 0) return;
+    float parent_bounds[4]; bool parent_valid = P->bounds_valid;
+    if (P->mode == M_BOUNDS) {
+        if (!(++P->bounds_work & 63) && !web_native_checkpoint(P->d)) { P->failed = true; return; }
+        if (b->paint_bounds_generation == P->bounds_generation) {
+            if (b->paint_bounds_valid) bounds_rect(P, b->paint_bounds[0], b->paint_bounds[1],
+                b->paint_bounds[2] - b->paint_bounds[0], b->paint_bounds[3] - b->paint_bounds[1]);
+            return;
+        }
+        memcpy(parent_bounds, P->bounds, sizeof parent_bounds); P->bounds_valid = false;
+    }
     pvec layers = {0};
-    if (b == P->d->root_box || b == P->top_root || stacking_context(b)) {
-        collect_layers(P->d, &layers, b);
+    if (P->mode != M_BOUNDS && (b == P->d->root_box || b == P->top_root || stacking_context(b))) {
+        if (!collect_layers(P->d, &layers, b)) { P->failed = true; pv_free(&layers); return; }
         /* Stable ordering preserves tree order for equal z-index values. */
         for (int i = 1; i < layers.n; i++)
             for (int j = i; j > 0 && layer_z(layers.v[j - 1]) > layer_z(layers.v[j]); j--) {
@@ -1098,6 +1158,13 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     float bx = x - b->p[3] - b->b[3], by = y - b->p[0] - b->b[0];
     float bw = b->w + b->p[1] + b->p[3] + b->b[1] + b->b[3];
     float bh = b->h + b->p[0] + b->p[2] + b->b[0] + b->b[2];
+    bool canvas_group = P->canvas_group && b->node && b->node == P->d->html;
+    if (P->mode == M_BOUNDS && canvas_group)
+        bounds_rect(P, P->vx0 - P->ox, P->vy0 - P->oy, P->vx1 - P->vx0, P->vy1 - P->vy0);
+    if (P->mode == M_BOUNDS && !st->visibility && b->kind != B_INLINE && b->kind != B_TEXT && b->kind != B_BR) {
+        bounds_rect(P, bx, by, bw, bh);
+        if (b->marker || b->marker_shape) bounds_rect(P, bx - st->font_size * 2, by, st->font_size * 2, bh);
+    }
     if (P->mode == M_HIT && hit_style(st) && b->node &&
         b->kind != B_TEXT && inside(P, bx, by, bw, bh))
         hit_target(P,b->node->type == N_ELEM ? b->node : doc_flat_parent(b->node));
@@ -1113,23 +1180,33 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     }
     bool clip = (web_marquee_box(b) || b->clamp_truncated || st->overflow != OV_VISIBLE) && b->kind != B_INLINE && b->parent && !doc_viewport_overflow_box(P->d,b);
     /* Off-screen contexts can still contain viewport-fixed descendants. */
-    if (clip && !layers.n && (P->oy + by > c->cy1 || P->oy + by + bh < c->cy0)) { pv_free(&layers); return; }
+    if (P->mode != M_BOUNDS && clip && !layers.n && (P->oy + by > c->cy1 || P->oy + by + bh < c->cy0)) { pv_free(&layers); return; }
     /* group opacity: paint, then blend the result with what was there */
     uint32_t *saved = NULL;
     int gx = 0, gy = 0, gw = 0, gh = 0;
-    if (P->mode == M_PAINT && st->opacity < 0.999f && b->kind != B_TEXT) {
+    if (P->mode == M_PAINT && group_opacity < 1 && b->kind != B_TEXT) {
         web_avmedia_snapshot_reject();
-        gx = (int)floorf(P->ox + bx);
-        gy = (int)floorf(P->oy + by);
-        gw = (int)ceilf(bw) + 1;
-        gh = (int)ceilf(bh) + 1;
-        if (gx < c->cx0) gw -= c->cx0 - gx, gx = c->cx0;
-        if (gy < c->cy0) gh -= c->cy0 - gy, gy = c->cy0;
-        if (gx + gw > c->cx1) gw = c->cx1 - gx;
-        if (gy + gh > c->cy1) gh = c->cy1 - gy;
-        if (gw > 0 && gh > 0 && (saved = malloc(sizeof(uint32_t) * (size_t)gw * (size_t)gh)))
-            for (int j = 0; j < gh; j++) memcpy(saved + (size_t)j * gw, c->px + (size_t)(gy + j) * c->pitch + gx, sizeof(uint32_t) * (size_t)gw);
+        struct pctx measure = *P; measure.mode = M_BOUNDS; measure.bounds_valid = false;
+        paint_box(&measure, b, true);
+        if (measure.failed) { P->failed = true; pv_free(&layers); return; }
+        if (measure.bounds_valid) {
+            double left = floor((double)P->ox + measure.bounds[0]), top = floor((double)P->oy + measure.bounds[1]);
+            double right = ceil((double)P->ox + measure.bounds[2]), bottom = ceil((double)P->oy + measure.bounds[3]);
+            if (left < P->vx0) left = P->vx0; if (top < P->vy0) top = P->vy0;
+            if (right > P->vx1) right = P->vx1; if (bottom > P->vy1) bottom = P->vy1;
+            if (right > left && bottom > top) {
+                gx = (int)left; gy = (int)top; gw = (int)(right - left); gh = (int)(bottom - top);
+                if ((size_t)gw > SIZE_MAX / sizeof *saved / (size_t)gh ||
+                    !(saved = malloc(sizeof *saved * (size_t)gw * (size_t)gh))) {
+                    P->failed = true; pv_free(&layers); return; /* never paint an unfiltered substitute */
+                }
+                for (int j = 0; j < gh; j++)
+                    memcpy(saved + (size_t)j * gw, c->px + (size_t)(gy + j) * c->pitch + gx, sizeof *saved * (size_t)gw);
+            }
+        }
     }
+    if (P->mode == M_PAINT && canvas_group)
+        gfx_fill_blend(c, P->vx0, P->vy0, P->vx1 - P->vx0, P->vy1 - P->vy0, P->canvas_bg);
     bool visible = !st->visibility;
     if (b->kind != B_INLINE && b->kind != B_TEXT && b->kind != B_BR && b->kind != B_ROW && b->kind != B_ROW_GROUP) {
         if (P->mode == M_PAINT && visible) {
@@ -1154,7 +1231,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     }
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
     bool contents = true;
-    if (clip) {
+    if (clip && P->mode != M_BOUNDS) {
         float px = P->ox + bx + b->b[3], py = P->oy + by + b->b[0];
         gfx_clip(c, (int)floorf(px), (int)floorf(py), (int)ceilf(bw - b->b[1] - b->b[3]), (int)ceilf(bh - b->b[0] - b->b[2]));
         if (P->mode == M_HIT && !inside(P, bx + b->b[3], by + b->b[0], bw - b->b[1] - b->b[3], bh - b->b[0] - b->b[2])) {
@@ -1166,7 +1243,11 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         paint_stacked_layer(P, layers.v[layer]);
     if (contents && b->inline_ctx) {
         inline_children(P, b, true);
-        paint_runs(P, b);
+        paint_runs(P, b, NULL);
+        inline_children(P, b, false);
+    } else if (contents && b->kind == B_INLINE) {
+        inline_children(P, b, true);
+        if (b->inline_paint_source) paint_runs(P, b->inline_paint_source, b);
         inline_children(P, b, false);
     } else if (contents) {
         for (box_t *ch = b->first; ch; ch = ch->next)
@@ -1179,12 +1260,24 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
 done:
     pv_free(&layers);
     if (saved) {
-        int a = (int)(st->opacity * 255 + 0.5f);
-        for (int j = 0; j < gh; j++) {
+        int a = (int)(group_opacity * 255 + 0.5f);
+        for (int j = 0; !P->failed && j < gh; j++) {
+            if (!(j & 63) && !web_native_checkpoint(P->d)) { P->failed = true; break; }
             uint32_t *row = c->px + (size_t)(gy + j) * c->pitch + gx, *old = saved + (size_t)j * gw;
             for (int i = 0; i < gw; i++) row[i] = gfx_mix(old[i], row[i], a);
         }
+        if (P->failed)
+            for (int j = 0; j < gh; j++) memcpy(c->px + (size_t)(gy + j) * c->pitch + gx,
+                saved + (size_t)j * gw, sizeof *saved * (size_t)gw);
         free(saved);
+    }
+    if (P->mode == M_BOUNDS) {
+        b->paint_bounds_generation = P->bounds_generation;
+        b->paint_bounds_valid = P->bounds_valid;
+        if (P->bounds_valid) memcpy(b->paint_bounds, P->bounds, sizeof b->paint_bounds);
+        memcpy(P->bounds, parent_bounds, sizeof parent_bounds); P->bounds_valid = parent_valid;
+        if (b->paint_bounds_valid) bounds_rect(P, b->paint_bounds[0], b->paint_bounds[1],
+            b->paint_bounds[2] - b->paint_bounds[0], b->paint_bounds[3] - b->paint_bounds[1]);
     }
 }
 
@@ -1196,18 +1289,18 @@ static void paint_stacked_layer(struct pctx *P, box_t *l) {
     canvas_t *c = P->c;
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
     c->cx0 = P->vx0, c->cy0 = P->vy0, c->cx1 = P->vx1, c->cy1 = P->vy1;
-    bool skip = false, reached = l->st->position != POS_ABSOLUTE;
-    bool fixed_escape=l->st->position==POS_FIXED;
+    bool skip = false, reached = l->st->position != POS_ABSOLUTE && l->st->position != POS_FIXED;
+    bool fixed_escape=box_viewport_fixed(l);
     for (box_t *a = l->parent; a && a->parent; a = a->parent) {
         if (a->clamp_hidden || (a->st && a->st->display == D_NONE)) skip = true;
-        if (a->st && a->kind != B_INLINE && a->st->position != POS_STATIC) reached = true;
+        if (a == l->cb) reached = true;
         if (a->st && (web_marquee_box(a) || ((a->clamp_truncated || a->st->overflow != OV_VISIBLE) && reached && !fixed_escape)) && !doc_viewport_overflow_box(P->d,a) && a->kind != B_INLINE) {
             float ax = box_visual_x(a) - a->p[3], ay = box_visual_y(a) - a->p[0];
             gfx_clip(c, (int)(P->ox + ax), (int)(P->oy + ay), (int)(a->w + a->p[1] + a->p[3]), (int)(a->h + a->p[0] + a->p[2]));
         }
         /* Internal overflow still clips, but a viewport-fixed ancestor and
            its descendants escape ancestors outside that containing block. */
-        if (a->st && a->st->position == POS_FIXED) {
+        if (box_viewport_fixed(a)) {
             if(!P->d->marquees.n)break;
             fixed_escape=true;
         }
@@ -1255,6 +1348,10 @@ uint32_t doc_canvas_bg(web_doc *d, int *from) {
 }
 
 void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y) {
+    /* The window still owns the last coherent pixels. Never replace them
+       with a white canvas while a cancelled native transaction is retired
+       or rebuilt; real scrolling resumes only after layout publication. */
+    if(d->native_cancelled || d->native_recovery_pending || d->native_recovery_active)return;
     paint_debug_begin(d);
     d->view_x=doc_x; d->view_y=doc_y; /* frame crops use this paint's real scroll */
     bool snapshot_root=!d->frame_parent;
@@ -1267,17 +1364,44 @@ void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, i
     P.ox = (float)(x - doc_x);
     P.oy = (float)(y - doc_y);
     P.mode = M_PAINT;
+    P.bounds_generation = ++d->paint_bounds_generation;
+    /* Only real alpha groups need a paint transaction. Its extent is the
+       already clipped viewport, never the unbounded document or CSS sizes.
+       Existing build/restyle aggregation also covers native opacity samples. */
+    uint32_t *frame_saved = NULL;
+    int fx = c->cx0, fy = c->cy0, fw = c->cx1 - fx, fh = c->cy1 - fy;
+    if (d->root_box && d->root_box->paint_alpha && fw > 0 && fh > 0) {
+        if (!c->px || fx < 0 || fy < 0 || c->cx1 > c->w || c->cy1 > c->h || c->pitch < c->w ||
+            (size_t)fw > SIZE_MAX / sizeof *frame_saved / (size_t)fh ||
+            (size_t)c->pitch > SIZE_MAX / sizeof *frame_saved / (size_t)c->h ||
+            !(frame_saved = malloc(sizeof *frame_saved * (size_t)fw * (size_t)fh))) P.failed = true;
+        else for (int row = 0; row < fh; row++)
+            memcpy(frame_saved + (size_t)row * fw, c->px + (size_t)(fy + row) * c->pitch + fx, sizeof *frame_saved * (size_t)fw);
+    }
     int from;
     uint32_t bg = doc_canvas_bg(d, &from);
+    P.canvas_bg = bg;
+    P.canvas_group = d->html && d->html->style && (d->html->style->filter || d->html->style->opacity < 1);
     /* a translucent canvas background is drawn over white */
-    gfx_fill(c, x, y, w, h, RGB(255, 255, 255));
-    gfx_fill_blend(c, x, y, w, h, bg);
+    if (!P.failed) {
+        gfx_fill(c, x, y, w, h, RGB(255, 255, 255));
+        if (!P.canvas_group) gfx_fill_blend(c, x, y, w, h, bg);
+    }
     P.canvas_bg_from = (uint32_t)from;
     walk(&P);
+    if (P.failed && frame_saved)
+        for (int row = 0; row < fh; row++) memcpy(c->px + (size_t)(fy + row) * c->pitch + fx,
+            frame_saved + (size_t)row * fw, sizeof *frame_saved * (size_t)fw);
+    free(frame_saved);
+    if (P.failed && !d->paint_effect_failure_reported) {
+        d->paint_effect_failure_reported = true;
+        web_js_console(d, 1, "Native filter/opacity composition stopped; no unfiltered replacement was drawn.");
+    }
+    if (P.failed) d->paint_dirty = true;
     paint_debug_finish(d);
     if(snapshot_root) {
         canvas_t probe;int px,py;
-        if(web_avmedia_snapshot_prepare(d,c,&probe,&px,&py,doc_x,doc_y)) {
+        if(!P.failed && web_avmedia_snapshot_prepare(d,c,&probe,&px,&py,doc_x,doc_y)) {
             /* Only normal paint examines the committed tree. The small probe
              * canvas changes neither document view offsets nor the real UI. */
             struct pctx Q=P;Q.c=&probe;Q.ox-=px;Q.oy-=py;
@@ -1286,7 +1410,7 @@ void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, i
                 web_avmedia_snapshot_probe(phase);
                 gfx_noclip(&probe);
                 gfx_fill(&probe,0,0,probe.w,probe.h,RGB(255,255,255));
-                gfx_fill_blend(&probe,x-px,y-py,w,h,bg);
+                if (!Q.canvas_group) gfx_fill_blend(&probe,x-px,y-py,w,h,bg);
                 walk(&Q);
             }
             if(!font_probe_end())web_avmedia_snapshot_reject();
@@ -1299,6 +1423,7 @@ void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, i
 
 bool web_hit_test(web_doc *d, int x, int y, struct web_hit *hit) {
     memset(hit, 0, sizeof *hit);
+    if(!d || d->native_cancelled || d->native_recovery_pending || d->native_recovery_active)return false;
     struct pctx P = {0};
     canvas_t dummy = {0};
     dummy.cx0 = dummy.cy0 = -1000000000;
@@ -1310,6 +1435,7 @@ bool web_hit_test(web_doc *d, int x, int y, struct web_hit *hit) {
     P.hy = (float)y;
     P.hit = hit;
     walk(&P);
+    if (P.failed) { memset(hit, 0, sizeof *hit); return false; }
     finish_disclosure_hit(&P);
     /* A later noninteractive overlay is still a hit-test target. Never keep
        an earlier link/control merely because the overlay has no activation. */
@@ -1322,8 +1448,9 @@ bool web_hit_test(web_doc *d, int x, int y, struct web_hit *hit) {
 }
 
 web_node *web_node_at(web_doc *d, int x, int y) {
+    if(!d || d->native_cancelled || d->native_recovery_pending || d->native_recovery_active)return NULL;
     node_t *fallback=NULL;
-    while(d && d->root_box) {
+    while(d && !d->native_cancelled && !d->native_recovery_pending && !d->native_recovery_active && d->root_box) {
     struct pctx P = {0};
     struct web_hit hit = {0};
     canvas_t dummy = {0};
@@ -1336,6 +1463,7 @@ web_node *web_node_at(web_doc *d, int x, int y) {
     P.hy = (float)y;
     P.hit = &hit;
     walk(&P);
+    if (P.failed) return NULL;
     if(P.target && web_frame_element(P.target)){
         struct web_frame *frame=web_frame_find(d,P.target);box_t *box=P.target->box;
         if(frame && frame->document && !frame->detached && box){

@@ -200,6 +200,18 @@ async function runFetchCases() {
     const echoed=await fetch(form);assert(form.bodyUsed&&await echoed.text()==='message=a+b&unicode=%E8%AA%9E','URLSearchParams native bytes');
     const upload=new Uint8Array([99,0,128,255,100]),binary=new Request('api/echo',{method:'POST',body:new DataView(upload.buffer,1,3)});upload[1]=7;
     const echoedBinary=await fetch(binary);assert(numbers(await echoedBinary.arrayBuffer())==='0,128,255','binary native upload not stringified');
+    for(const method of ['GET','HEAD','PATCH','DELETE']){
+        const result=await fetch('api/body-presence',{method});
+        assert(result.headers.get('x-body-present')==='0'&&result.headers.get('x-body-bytes')==='0','native null body presence '+method);
+    }
+    for(const method of ['PATCH','DELETE']){
+        for(const body of ['',new ArrayBuffer(0)]){
+            const result=await (await fetch('api/body-presence',{method,body})).json();
+            assert(result.present===1&&result.bytes===0,'native empty real body presence '+method);
+        }
+    }
+    await rejects(fetch('api/body-presence',{method:'GET',body:new ArrayBuffer(0)}),'TypeError','fetch empty GET body forbidden');
+    await rejects(fetch('api/body-presence',{method:'HEAD',body:''}),'TypeError','fetch empty HEAD body forbidden');
     const original=new Request('api/echo',{method:'POST',headers:{'x-test':'old'},body:'original'}),overridden=await fetch(original,{headers:{'x-test':'new'},body:'override'});
     assert(!original.bodyUsed&&await overridden.text()==='override','fetch Request init body override');
     for(const method of ['PUT','PATCH','DELETE','OPTIONS']){const r=await fetch('api/echo',{method,body:'method '+method});assert(await r.text()==='method '+method,'native method '+method);}

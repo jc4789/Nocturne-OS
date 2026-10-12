@@ -262,7 +262,7 @@ const htmlSafetyBridge=(()=>{
         // mutation-observer path for ordinary legacy insertion.
         if(legacy&&!c&&!o.runScripts&&originalSetter)return apply(originalSetter,node,[values.html]);
         const priorShadow=get(node,'shadowRoot');
-        const fragment=rawDom.parseFragment(node,values.html,false,{allowShadow,runScripts:!safe&&!!o.runScripts,sanitizing:!!c});sanitize(fragment,c,safe);
+        const fragment=rawDom.parseFragment(into,values.html,false,{allowShadow,runScripts:!safe&&!!o.runScripts,sanitizing:!!c});sanitize(fragment,c,safe);
         const addedShadow=get(node,'shadowRoot');
         if(addedShadow&&addedShadow!==priorShadow)sanitize(addedShadow,c,safe);
         customElementsBridge.reactions(()=>{while(get(into,'firstChild'))dom('remove',get(into,'firstChild'));dom('insert',into,fragment,null);});

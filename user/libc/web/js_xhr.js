@@ -268,7 +268,7 @@
                 nativeApply(nativeThen,s.transport.promise,[()=>{},()=>queue(this,s,epoch,()=>error(this,s,epoch,'error'))]);
                 return;
             }
-            try{pair=s.url.startsWith('blob:')?{id:0,promise:fetchBridge.fetch(s.url,{method:s.method,headers:Object.fromEntries(s.headers),body})}:host.fetch(s.url,s.method,raw,body??'',false,s.credentials?2:1,s.uploadListener);}
+            try{pair=s.url.startsWith('blob:')?{id:0,promise:fetchBridge.fetch(s.url,{method:s.method,headers:Object.fromEntries(s.headers),body})}:host.fetch(s.url,s.method,raw,body,false,s.credentials?2:1,s.uploadListener);}
             catch(_){queue(this,s,epoch,()=>error(this,s,epoch,'error'));return;}
             s.id=pair.id;
             // Native promises settle at the host checkpoint. XHR notifications

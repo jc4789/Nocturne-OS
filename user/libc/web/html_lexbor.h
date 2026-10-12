@@ -28,10 +28,12 @@ struct html_parser {
     /* Contextual fragments may run eligible scripts only after insertion;
        ordinary innerHTML fragments remain inert. Neither mode yields scripts
        during parsing, and scripting-disabled documents cannot enable it. */
-    bool scripting, fragment, contextual_fragment, finished, failed, yielded, stream_open;
+    enum html_scripting_mode scripting_mode;
+    bool scripting, fragment, contextual_fragment, finished, failed, cancelled, yielded, stream_open;
     bool import_changed; /* actual transaction published by the latest resume */
     bool allow_declarative_shadow;
     node_t *context_node;
+    node_t *target_node; /* root insertion target/DSD host, not tokenizer context */
     unsigned callback_depth; /* author reactions inside an unfinished Lexbor token */
     char *raw_bytes,*initial_base;size_t raw_length;
     char restart_encoding[32];
@@ -42,6 +44,7 @@ bool html_bridge_init(struct html_parser *p);
 bool html_bridge_import(struct html_parser *p);
 bool html_bridge_export(struct html_parser *p);
 node_t *html_bridge_native(struct html_parser *p, lxb_dom_node_t *node);
+lxb_dom_node_t *html_bridge_lex(struct html_parser *p, node_t *node);
 void html_bridge_destroy(struct html_parser *p);
 /* Called only after a real HTML meta element was created by tree insertion.
  * Requests a restart; never destroys Lexbor inside its token callback. */

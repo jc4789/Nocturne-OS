@@ -2476,6 +2476,7 @@ int main(int argc, char **argv) {
                  WIN_RESIZABLE | (start_maximized ? WIN_START_MAXIMIZED : 0));
     if (!w) return 1;
     network = webnet_create();
+    webnet_debug(network, debug_js);
     if (!network) { win_close(w); return 1; }
     storage = webstorage_create(); /* lazily touches local disk only on storage access */
     redraw();

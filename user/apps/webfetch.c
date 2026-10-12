@@ -10,6 +10,7 @@
 #include <errno.h>
 #include <time.h>
 #include <limits.h>
+#include "browser_identity.h"
 
 struct header_buffer { char *p; size_t length, capacity; };
 struct job {
@@ -33,6 +34,8 @@ struct job {
     bool stream_headers_sent, stream_final, upload_finished;
     size_t cookie_start;
     const char *hop_method;
+    bool debug_request_measured, debug_cookie, debug_content_length;
+    uint64_t debug_header_bytes, debug_ctl, debug_non_ascii;
 };
 static bool read_all(int fd, void *p, size_t n) {
     while (n) {
@@ -418,6 +421,28 @@ static void remove_body_headers(char *headers) {
     remove_request_header(headers, "Content-Location");
     remove_request_header(headers, "Content-Type");
 }
+/* One first-hop observation, only after trusted debug negotiation. Never
+   retain/log names, values, bodies, URLs, or hashes of credential material. */
+static void observe_request(struct job *j, const struct http_req *q) {
+    if (!(j->wire.user_navigation & WEBNET_WIRE_DEBUG_REQUEST) || j->debug_request_measured) return;
+    j->debug_request_measured = true;
+    j->debug_cookie = field_exists(j->outgoing.p, "Cookie");
+    j->debug_content_length = q->body || !strcmp(q->method, "POST") || !strcmp(q->method, "PUT");
+    const char *authority = strstr(q->url, "://") + 3;
+    const char *path = strchr(authority, '/');
+    size_t authority_len = path ? (size_t)(path - authority) : strlen(authority);
+    char length[64] = "";
+    if (j->debug_content_length) snprintf(length, sizeof length, "Content-Length: %zu\r\n", q->body_len);
+    j->debug_header_bytes = (uint64_t)j->outgoing.length + authority_len +
+        sizeof("Host: \r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\nConnection: close\r\n\r\n") - 1 + strlen(length);
+    for (size_t i = 0; i < j->outgoing.length; i++) {
+        unsigned char c = (unsigned char)j->outgoing.p[i];
+        if (c >= 128) j->debug_non_ascii++;
+        if ((c < 32 && c != '\t' &&
+             !(c == '\r' && i + 1 < j->outgoing.length && j->outgoing.p[i + 1] == '\n') &&
+             !(c == '\n' && i && j->outgoing.p[i - 1] == '\r')) || c == 127) j->debug_ctl++;
+    }
+}
 static bool cors_allowed(struct job *j, const struct http_resp *r) {
     const char *headers = http_response_headers(r);
     const char *allow; size_t length;
@@ -620,9 +645,17 @@ static bool response_headers(struct job *j, const struct http_resp *r, bool cros
     if (j->wire.user_navigation & WEBNET_WIRE_STATUS_LINE) {
         const char *reason = http_response_status_text(r);
         size_t reason_len = strlen(reason);
-        char start[32], end[96];
+        char start[32], end[320];
         int a = snprintf(start, sizeof start, "HTTP/1.1 %d ", r->status);
         int b = snprintf(end, sizeof end, "\r\nHTTP/Nocturne-Meta cors=%d redirected=%d%s\r\n", j->cors_tainted, j->redirected,j->opaque_tainted?" opaque=1":"");
+        if (b >= 0 && (size_t)b < sizeof end && j->debug_request_measured) {
+            int c = snprintf(end + b, sizeof end - (size_t)b,
+                "HTTP/Nocturne-Request bytes=%lu ctl=%lu nonascii=%lu cookie=%u content_length=%u\r\n",
+                (unsigned long)j->debug_header_bytes, (unsigned long)j->debug_ctl,
+                (unsigned long)j->debug_non_ascii, (unsigned)j->debug_cookie, (unsigned)j->debug_content_length);
+            if (c < 0 || (size_t)c >= sizeof end - (size_t)b) return fail(j, "Request diagnostic metadata length overflow");
+            b += c;
+        }
         if (a < 0 || b < 0 || (size_t)a >= sizeof start || (size_t)b >= sizeof end ||
             reason_len > SIZE_MAX - (size_t)a - (size_t)b - 1) return fail(j, "Response metadata length overflow");
         prefix_len = (size_t)a + reason_len + (size_t)b;
@@ -752,8 +785,11 @@ static bool run_http(struct job *j) {
         int left = remaining(j); if (!left) return false;
         free(j->body); j->body = NULL; j->body_len = j->body_cap = 0;
         struct http_req q = {method, current, j->outgoing.p,
-                             drop_body ? NULL : j->request_body, drop_body ? 0 : j->wire.body_len,
+                             !drop_body && (j->wire.body_len || (j->wire.user_navigation & WEBNET_WIRE_BODY_PRESENT)) ?
+                                 j->request_body : NULL,
+                             drop_body ? 0 : j->wire.body_len,
                              left, body_cb, j, cookie_header};
+        observe_request(j, &q);
         struct http_resp r;
         size_t cookie_start=j->cookie_len; j->cookie_start = cookie_start; j->stream_final = false; j->hop_method = method;
         size_t body_limit = webnet_wire_response_limit(j->wire.kind, j->wire.user_navigation);
@@ -838,6 +874,8 @@ int main(void) {
         WEBNET_WIRE_CACHE_MODE(w->user_navigation) > WEBNET_CACHE_ONLY_IF_CACHED ||
         (w->kind != WEBNET_FETCH && (WEBNET_WIRE_CACHE_MODE(w->user_navigation) != WEBNET_CACHE_DEFAULT || (w->user_navigation & (WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER)))) ||
         ((w->user_navigation & WEBNET_WIRE_NO_CORS) && (w->user_navigation & (WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_FORCE_PREFLIGHT))) ||
+        ((w->user_navigation & WEBNET_WIRE_DEBUG_REQUEST) &&
+         (w->kind != WEBNET_RESOURCE || !(w->user_navigation & WEBNET_WIRE_STATUS_LINE))) ||
         ((w->user_navigation & WEBNET_WIRE_STREAM) && w->kind != WEBNET_FETCH)) { free(j); return 1; }
     j->url = read_string(w->url_len, false); j->document = read_string(w->origin_len, false);
     j->method = read_string(w->method_len, false); j->headers = read_string(w->headers_len, false);

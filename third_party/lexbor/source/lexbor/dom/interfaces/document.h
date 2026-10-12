@@ -77,6 +77,11 @@ struct lxb_dom_document {
     const lxb_dom_document_mutation_cb_t      *mutation;
     const lxb_dom_document_attr_mutation_cb_t *attr_mutation;
 
+    /* Private parser snapshot tracking, including *_wo_events operations.
+     * This is not an author-visible DOM mutation callback. */
+    void (*parser_changed)(lxb_dom_node_t *, unsigned, void *);
+    void *parser_changed_context;
+
     lexbor_mraw_t                             *mraw;
     lexbor_mraw_t                             *text;
     lexbor_hash_t                             *tags;

@@ -75,6 +75,16 @@ async function runXHRCases() {
     const pp=settle(post);post.send('Nocturne request body');await pp;
     assert(post.responseText==='Nocturne request body' && post.status===200,'POST bytes');
     assert(uploaded.join(',')==='loadstart,progress,load,loadend','upload events');
+    for(const method of ['GET','HEAD','PATCH','DELETE']){
+        const ignored=method==='GET'||method==='HEAD';
+        const bodies=ignored?[new ArrayBuffer(0),{toString(){throw Error('ignored XHR body converted');}}]:[null,'',new ArrayBuffer(0)];
+        for(const body of bodies){
+            const presence=new XMLHttpRequest();presence.open(method,'api/body-presence');
+            const done=settle(presence);presence.send(body);await done;
+            assert(presence.status===200 && presence.getResponseHeader('x-body-present')===(ignored||body===null?'0':'1') &&
+                presence.getResponseHeader('x-body-bytes')==='0','native null/empty body presence '+method);
+        }
+    }
     const slow=new XMLHttpRequest();slow.open('GET','api/slow');slow.timeout=3;
     const errors=[];for(const t of ['timeout','error','abort','load','loadend'])slow.addEventListener(t,()=>errors.push(t));
     const sp=settle(slow);slow.send();await sp;

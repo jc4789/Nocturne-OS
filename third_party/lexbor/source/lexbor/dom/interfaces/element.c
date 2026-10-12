@@ -391,6 +391,8 @@ done:
 
     attr->owner = element;
 
+    lxb_dom_node_parser_changed(&element->node, LXB_DOM_NODE_PARSER_FIELDS);
+
     if (!(lxb_dom_document_opt(doc) & LXB_DOM_DOCUMENT_OPT_WO_EVENTS)
         && doc->attr_mutation->append != NULL)
     {

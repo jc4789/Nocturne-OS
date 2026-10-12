@@ -30,3 +30,66 @@ globalThis.runHTMLScriptSafetyCases=function(){
     delete globalThis.__htmlScriptSafety;
     return count;
 };
+
+/* A separate fresh policy realm exercises reentry while a script is still
+ * native preparation state, before it has entered the runnable script queue. */
+globalThis.runHTMLScriptGenerationCases=async function(){
+    let count=0,converted=false;
+    const check=(name,value)=>{count++;if(!value)throw new Error('HTML script generation '+name);};
+    const original=document,retained=document.body;
+    globalThis.__streamStaleExecuted=false;
+    globalThis.__streamSiblingExecuted=false;
+    const policy=trustedTypes.createPolicy('script-snapshot-test',{createHTML:value=>value,createScript:value=>value});
+    trustedTypes.createPolicy('default',{createScript:input=>{
+        converted=true;
+        document.open();document.write(policy.createHTML('<!doctype html><p id=policy-stream>new stream</p>'));document.close();
+        return 'globalThis.__streamStaleExecuted=true;';
+    }});
+    if(document.readyState==='loading')await new Promise(resolve=>document.addEventListener('DOMContentLoaded',resolve,{once:true}));
+    const stale=document.createElement('script');stale.appendChild(document.createTextNode('globalThis.__streamStaleExecuted=true;'));
+    const sibling=document.createElement('script');sibling.text=policy.createScript('globalThis.__streamSiblingExecuted=true;');
+    const fragment=document.createDocumentFragment();fragment.appendChild(stale);fragment.appendChild(sibling);
+    document.body.appendChild(fragment);
+    check('default policy replaced stream during prepare',converted&&!!document.getElementById('policy-stream'));
+    check('Document and retained node keep identity',document===original&&retained.ownerDocument===original&&!retained.isConnected);
+    check('unpublished old script does not run inline',!__streamStaleExecuted);
+    check('old detached sibling is not prepared in new stream',!__streamSiblingExecuted&&!sibling.isConnected);
+    await new Promise(resolve=>setTimeout(resolve,0));
+    check('unpublished old script is not later runnable',!__streamStaleExecuted);
+    check('old detached sibling is not later runnable',!__streamSiblingExecuted);
+    delete globalThis.__streamStaleExecuted;
+    delete globalThis.__streamSiblingExecuted;
+    return count;
+};
+
+/* The native lifecycle calls must not publish an old event or its ending
+ * timestamp after an event/focus callback has replaced the stream. */
+globalThis.runHTMLStreamEventCases=async function(){
+    let count=0,loads=0,focusReplaced=false;
+    const check=(name,value)=>{count++;if(!value)throw new Error('HTML stream events '+name);};
+    const policy=trustedTypes.createPolicy('script-snapshot-test',{createHTML:value=>value});
+    check('fresh document awaits initial DOMContentLoaded',document.readyState==='loading');
+    await new Promise(resolve=>document.addEventListener('DOMContentLoaded',()=>{
+        document.open();document.write(policy.createHTML('<!doctype html><input id=stream-focus autofocus>'));
+        resolve();
+    },{once:true}));
+    await new Promise(resolve=>setTimeout(resolve,0));
+    check('old DOMContentLoaded end not recorded in replacement',performance.timing.domContentLoadedEventEnd===0&&document.readyState==='loading');
+    const input=document.getElementById('stream-focus');
+    const focused=new Promise(resolve=>input.addEventListener('focus',()=>{
+        focusReplaced=true;
+        document.open();document.write(policy.createHTML('<!doctype html><p id=focus-stream>new focus stream</p>'));
+        addEventListener('load',()=>{loads++;});
+        resolve();
+    },{once:true}));
+    document.close();
+    await focused;
+    await new Promise(resolve=>setTimeout(resolve,0));
+    check('autofocus replaced stream',focusReplaced&&!!document.getElementById('focus-stream')&&!input.isConnected);
+    check('old load not sent to new open stream',loads===0&&document.readyState==='loading');
+    check('old load timestamps not recorded',performance.timing.loadEventStart===0&&performance.timing.loadEventEnd===0);
+    const loaded=new Promise(resolve=>addEventListener('load',resolve,{once:true}));
+    document.close();await loaded;
+    check('replacement has exactly its own load',loads===1&&document.readyState==='complete');
+    return count;
+};

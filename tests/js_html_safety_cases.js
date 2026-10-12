@@ -85,6 +85,16 @@ globalThis.runHTMLSafetyCases=function(){
     check('safe custom permissive URL still removed',!node.querySelector('a').hasAttribute('href')&&!node.querySelector('button').hasAttribute('formaction'));
     node.setHTML('<template><img onerror="bad()" src=x><script>bad()</script></template>',{sanitizer:{}});
     check('template recursion',!node.querySelector('template').content.querySelector('script')&&!node.querySelector('template').content.querySelector('img').hasAttribute('onerror'));
+    const template=document.createElement('template'),templateMarkup='<noscript><b>fallback</b></noscript><p>after</p>';
+    const templateState=label=>{
+        const content=template.content,noscript=content.firstChild;
+        check(label+' template context scripting',noscript.localName==='noscript'&&noscript.firstChild.nodeType===3&&noscript.textContent==='<b>fallback</b>');
+        check(label+' template allocation owner',content.ownerDocument!==document&&noscript.ownerDocument===content.ownerDocument&&content.lastChild.ownerDocument===content.ownerDocument);
+        check(label+' template target only',template.childNodes.length===0&&content.lastChild.localName==='p'&&content.lastChild.textContent==='after');
+    };
+    template.innerHTML=templateMarkup;templateState('legacy');
+    template.setHTML(templateMarkup,{sanitizer:{}});templateState('safe');
+    template.setHTMLUnsafe(templateMarkup);templateState('unsafe');
     node.setHTMLUnsafe('<div><b id=gone>b</b><i title=kept>i</i></div><!--keep--><?patch name="x">',{sanitizer:{replaceWithChildrenElements:['div'],removeElements:['b'],removeAttributes:['id']}});
     check('unwrap keeps children',node.firstElementChild.localName==='i'&&node.firstElementChild.getAttribute('title')==='kept');
     check('permissive comments PI',Array.from(node.childNodes).some(n=>n.nodeType===8)&&Array.from(node.childNodes).some(n=>n.nodeType===7));
@@ -97,6 +107,10 @@ globalThis.runHTMLSafetyCases=function(){
     check('static safe native document',parsed.nodeType===9&&parsed.body.textContent==='hello'&&!parsed.querySelector('script'));
     const unsafe=Document.parseHTMLUnsafe('<p onclick=bad()>hello</p><script>__safetyExecuted++</script>');
     check('static unsafe retains inert',unsafe.querySelector('script')!==null&&unsafe.querySelector('p').hasAttribute('onclick')&&__safetyExecuted===0);
+    const inertTemplate=unsafe.createElement('template');
+    inertTemplate.setHTMLUnsafe(templateMarkup);
+    check('inert template context fallback',inertTemplate.content.firstChild.firstChild.localName==='b'&&inertTemplate.content.firstChild.textContent==='fallback');
+    check('inert template allocation owner',inertTemplate.content.firstChild.ownerDocument===inertTemplate.content.ownerDocument&&inertTemplate.content.lastChild.ownerDocument===inertTemplate.content.ownerDocument);
     const policy=trustedTypes.createPolicy('html-safety-test',{createHTML:(s,prefix='')=>prefix+s,createScript:s=>s,createScriptURL:s=>s,createParserOptions:o=>o});
     check('policy name',policy.name==='html-safety-test');
     const html=policy.createHTML('<b>trusted</b>'),code=policy.createScript('7+5'),url=policy.createScriptURL('/safe.js');
@@ -152,11 +166,14 @@ globalThis.runHTMLSafetyCases=function(){
     const declarative=document.createElement('div');
     declarative.setHTML('<template shadowrootmode="open"><p onclick=bad()>declarative</p><script>bad()</script></template>',{sanitizer:{}});
     check('declarative context shadow sanitized',declarative.shadowRoot!==null&&!declarative.shadowRoot.querySelector('script')&&!declarative.shadowRoot.querySelector('p').hasAttribute('onclick'));
+    check('declarative external host ownership',declarative.shadowRoot.ownerDocument===document&&declarative.shadowRoot.querySelector('p').ownerDocument===document);
     check('getHTML without shadow',shadowHost.getHTML()==='');
     check('getHTML selected closed shadow',shadowHost.getHTML({shadowRoots:[shadow]}).includes('shadowrootmode="closed"'));
     check('getHTML serializable shadow',shadowHost.getHTML({serializableShadowRoots:true}).includes('shadow'));
     throws('getHTML invalid shadow list',()=>shadowHost.getHTML({shadowRoots:[node]}));
     const fastMeta=document.createElement('meta');fastMeta.setAttribute('http-equiv','Content-Security-Policy');fastMeta.setAttribute('content',"require-trusted-types-for 'script'");document.head.appendChild(fastMeta);
+    template.innerHTML=policy.createHTML(templateMarkup);templateState('trusted legacy');
+    template.setHTMLUnsafe(policy.createHTML(templateMarkup));templateState('trusted unsafe');
     throws('fast string observes later meta',()=>{fastNode.innerHTML='<u>blocked</u>';});check('later meta failure retains HTML',fastNode.firstChild.localName==='i');
     throws('fast eval observes later meta',()=>eval('1+1'));
     throws('fast script setter observes later meta',()=>{document.createElement('script').textContent='1';});

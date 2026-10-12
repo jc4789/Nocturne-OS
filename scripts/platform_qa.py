@@ -208,6 +208,7 @@ def main():
     ap.add_argument('--mouse-position-marker', help='native mousemove の「接頭辞 x y」で加速・coalescingのずれを補正')
     ap.add_argument('--native-pointer-marker', help='browser native受信の「接頭辞 seq x y」。DOM callback待ちを位置ackにしない')
     ap.add_argument('--mouse-confirm-marker', help='実trusted hover後の読取observerが「接頭辞 id x y」で最終targetを確認')
+    ap.add_argument('--mouse-click-marker', help='実click後の読取observerが同形式でfocus到達を確認してからキー入力する')
     ap.add_argument('--scroll-pages', type=int, default=0, help='実ページをクリックしてから結果一覧を順に下へ送り画面を保存')
     ap.add_argument('--scroll-interval', type=int, default=6, help='実ページ送りの間隔、1～60秒。クリック対象の確認期限は変更しない')
     ap.add_argument('--no-focus-click', action='store_true', help='既にactiveなbrowserへPgDnだけ送る。ページ中央のselect等を誤操作しない')
@@ -249,10 +250,12 @@ def main():
     if a.mouse_position_marker and not re.fullmatch('[a-zA-Z0-9_]+', a.mouse_position_marker):
         ap.error('不正なマウス位置markerです')
     if any(marker and not re.fullmatch('[a-zA-Z0-9_]+', marker)
-           for marker in (a.native_pointer_marker, a.mouse_confirm_marker)):
+           for marker in (a.native_pointer_marker, a.mouse_confirm_marker, a.mouse_click_marker)):
         ap.error('不正なnative pointer/target確認markerです')
     if a.mouse_confirm_marker and not a.native_pointer_marker:
         ap.error('最終target確認にはnative pointer受信が必要です')
+    if a.mouse_click_marker and not a.mouse_marker:
+        ap.error('click後の確認には実mouse click markerが必要です')
     origin = re.fullmatch(r'([0-9]{1,5}):([0-9]{1,5})', a.mouse_origin)
     if not origin:
         ap.error('マウス原点は x:y です')
@@ -484,6 +487,15 @@ def main():
                         mon.cmd('mouse_button 1')
                         time.sleep(.1)
                         mon.cmd('mouse_button 0')
+                        if a.mouse_click_marker:
+                            try:
+                                confirm_native_target(serial, a.mouse_click_marker, ident, int(x), int(y),
+                                                      min(deadline, time.monotonic()+12))
+                            except RuntimeError as input_error:
+                                action.update(stage='refused-keys', error=str(input_error))
+                                (here/'mouse-actions.json').write_text(json.dumps(mouse_actions, indent=2), encoding='utf-8')
+                                shot(mon, 'mouse-refused-keys-'+ident)
+                                continue
                         for key in mouse_keys:
                             mon.cmd('sendkey '+key)
                             time.sleep(.2)

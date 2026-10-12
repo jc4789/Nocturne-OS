@@ -3446,6 +3446,8 @@ static bool equal_areas(const struct gareas *a,const struct gareas *b) {
 bool css_style_layout_equal(const style_t *a,const style_t *b) {
     if(a==b)return true;
     if(!a || !b)return false;
+    if (!!a->filter != !!b->filter) return false; /* containing-block ownership changes */
+    if ((a->display == D_INLINE || b->display == D_INLINE) && (a->opacity < 1) != (b->opacity < 1)) return false;
     if(!equal_string(a->font_names,b->font_names) || !equal_string(a->content,b->content) ||
         !equal_string(a->motion.name,b->motion.name) ||
         !equal_string(a->container_names,b->container_names) ||
@@ -3457,6 +3459,7 @@ bool css_style_layout_equal(const style_t *a,const style_t *b) {
     if(!css_style_layout_equal(a->before,b->before) || !css_style_layout_equal(a->after,b->after) ||
         !css_style_layout_equal(a->backdrop,b->backdrop))return false;
     style_t x=*a,y=*b;
+    x.filter=y.filter=NULL; /* effect amounts are paint-only arena borrows */
     x.motion.name=y.motion.name=NULL;
     x.font_names=y.font_names=NULL; x.content=y.content=NULL; x.list_style_string=y.list_style_string=NULL;
     x.container_names=y.container_names=NULL;
@@ -3492,6 +3495,8 @@ static bool style_box_compatible(node_t *e, const style_t *old, const style_t *n
         e->tag == T_canvas || e->tag == T_video || e->tag == T_iframe || e->tag == T_frameset ||
         old->before || old->after || old->backdrop || next->before || next->after || next->backdrop) return false;
     if (old->display != next->display || old->position != next->position || old->float_ != next->float_ ||
+        !!old->filter != !!next->filter ||
+        ((old->display == D_INLINE || next->display == D_INLINE) && (old->opacity < 1) != (next->opacity < 1)) ||
         old->container_type != next->container_type ||
         old->overflow != next->overflow || old->content_visibility != next->content_visibility ||
         old->white_space != next->white_space || old->text_transform != next->text_transform ||

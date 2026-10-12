@@ -96,14 +96,17 @@ static web_doc *begin_document(const char *html, bool scripting) {
 }
 static node_t *resume_script(web_doc *doc, const char *id) {
     node_t *script = NULL;
-    int result = html_resume(doc->parser, &script);
+    int result;
+    do { result = html_resume(doc->parser, &script); } while (result == HTML_PARSE_YIELD);
     check("script 境界で停止", result == 1 && script && script->type == N_ELEM && script->tag == T_script);
     string_is("停止した script の識別子", script ? node_attr(script, "id") : NULL, id);
     return result == 1 ? script : NULL;
 }
 static void complete_document(web_doc *doc) {
     node_t *script = (node_t *)doc;
-    check("解析完了・script 出力クリア", html_resume(doc->parser, &script) == 0 && !script);
+    int result;
+    do { result = html_resume(doc->parser, &script); } while (result == HTML_PARSE_YIELD);
+    check("解析完了・script 出力クリア", result == 0 && !script);
     script = (node_t *)doc;
     check("完了後の再開は冪等", html_resume(doc->parser, &script) == 0 && !script);
     check("完了後 html_write を拒否", !html_write(doc->parser, "<b>late</b>", 11));
@@ -419,6 +422,82 @@ static void test_script_tokenizer(void) {
 /* suspended parser の binding はネイティブ DOM の所有文書・生存期間・
    編集済み control 値を上書きしてはならない。独立 Lexbor API は使わない。 */
 static void test_bridge_lifetimes(void) {
+    web_doc *registry_doc = parse_document("<!doctype html><body><div id=host></div><template id=template></template>");
+    if (registry_doc) {
+        node_t *host = find_id(registry_doc->root, "host"), *template = find_id(registry_doc->root, "template");
+        node_t *shadow = host ? doc_shadow_attach(registry_doc, host, false, false, false, false, false) : NULL;
+        node_t *table_context = doc_node_create(registry_doc, N_ELEM, "table", NULL, 0);
+        check("registry試験のShadowRootと別table文脈", shadow && table_context && template);
+        if (shadow && table_context && template) {
+            const char *markup = "<tr><td id=cell>content</td></tr>";
+            shadow->custom_registry_id = 17;
+            shadow->custom_registry_realm = NULL;
+            node_t *fragment = html_fragment_mode(registry_doc, shadow, table_context, markup, strlen(markup), false, HTML_SCRIPTING_DISABLED);
+            node_t *cell = find_id(fragment, "cell");
+            check("fragmentはtargetのscoped registryを継承", fragment && fragment->custom_registry_id == 17 &&
+                  !fragment->custom_registry_realm && cell && cell->custom_registry_id == 17);
+            check("targetと分離したtable文脈で木構築", fragment && fragment->first && fragment->first->tag == T_tbody &&
+                  cell && cell->parent && cell->parent->tag == T_tr);
+            shadow->custom_registry_id = -1;
+            fragment = html_fragment_mode(registry_doc, shadow, table_context, markup, strlen(markup), false, HTML_SCRIPTING_DISABLED);
+            cell = find_id(fragment, "cell");
+            check("null registryをhost/globalへ置換しない", fragment && fragment->custom_registry_id == -1 &&
+                  !fragment->custom_registry_realm && cell && cell->custom_registry_id == -1);
+            node_t *content = template->template_content;
+            fragment = content ? html_fragment_mode(content->owner, content, host, "<b>inert</b>", 12, false, HTML_SCRIPTING_DISABLED) : NULL;
+            check("template content targetのnull registry規則を維持", fragment && fragment->custom_registry_id == -1 &&
+                  !fragment->custom_registry_realm && fragment->first && fragment->first->custom_registry_id == -1);
+            shadow->custom_registry_id = 23;
+            fragment = html_fragment_mode(registry_doc, NULL, shadow, "<b>fallback</b>", 15, false, HTML_SCRIPTING_DISABLED);
+            check("target未指定の互換経路はcontext registryを継承", fragment && fragment->custom_registry_id == 23 &&
+                  fragment->first && fragment->first->custom_registry_id == 23);
+            node_t *external = doc_node_create(registry_doc, N_ELEM, "div", NULL, 0);
+            const char *declarative = "<template shadowrootmode=open><b id=dsd>native</b></template>";
+            fragment = external ? html_fragment_mode(registry_doc, external, external, declarative, strlen(declarative),
+                                                     true, HTML_SCRIPTING_INERT) : NULL;
+            node_t *dsd = external && external->shadow_root ? find_id(external->shadow_root, "dsd") : NULL;
+            check("断片解析木にbindされない実target hostへのDSDを許可", fragment && external->shadow_root && dsd &&
+                  external->shadow_root->owner == registry_doc && dsd->owner == registry_doc &&
+                  dsd->parent == external->shadow_root);
+        }
+        web_free(registry_doc);
+    }
+    web_doc *merged = begin_document("<!doctype html><body><div id=host>before<script id=first>first</script>"
+                                    "after</div><script id=second>second</script><p id=tail>tail</p>", true);
+    if (merged) {
+        node_t *first = resume_script(merged, "first"), *host = find_id(merged->root, "host");
+        node_t *text = host ? host->first : NULL;
+        check("同期差分の文字ノードを取得", text && text->type == N_TEXT && first);
+        if (text && first) {
+            check("実native文字更新", doc_node_text(merged, text, "edited", 6));
+            doc_node_remove(merged, first);
+            resume_script(merged, "second");
+            check("WO-events文字併合でもnative identityを維持", host->first == text && host->last == text && !first->parent);
+            text_is("既存文字への解析追記を差分同期", host, "editedafter");
+            complete_document(merged);
+        }
+        web_free(merged);
+    }
+    web_doc *reordered = begin_document("<!doctype html><body><div id=host><i id=a></i><i id=b></i>"
+        "<i id=c></i><i id=d></i></div><script id=pause>pause</script><p id=tail>tail</p>", true);
+    if (reordered) {
+        resume_script(reordered, "pause");
+        node_t *host = find_id(reordered->root, "host"), *a = find_id(host, "a"), *b = find_id(host, "b");
+        node_t *c = find_id(host, "c"), *d = find_id(host, "d");
+        node_t *plain = doc_node_create(reordered, N_ELEM, "MiXeD", NULL, 0);
+        if (plain) { plain->namespace_id = NS_NONE; plain->foreign = true; }
+        check("先頭末尾を保った中間順序変更", a && b && c && d && doc_node_move(reordered, host, b, d) &&
+              host->first == a && host->last == d && a->next == c && c->next == b);
+        check("null名前空間の作者ノードを同じ解析文書へ追加", plain && doc_node_move(reordered, host, plain, NULL));
+        complete_document(reordered);
+        check("差分export後も中間順序を保持", a && a->next == c && c->next == b && b->next == d && d->next == plain);
+        namespace_is("null名前空間の往復保全", plain, NS_NONE);
+        string_is("null名前空間の原表記を保全", plain ? plain->raw_name : NULL, "MiXeD");
+        node_t *fragment = html_fragment(reordered, host, "<b>fragment</b>", 15);
+        check("fragmentを一時Lexbor文書へ接続しない", fragment && !fragment->parent && !fragment->prev && !fragment->next);
+        if (fragment) links_valid(fragment, 0);
+        web_free(reordered);
+    }
     web_doc *moving = begin_document("<!doctype html><body><div id=moving a=1 b=2></div>"
                                     "<script id=pause>pause</script><p id=tail>tail</p>", true);
     if (moving) {

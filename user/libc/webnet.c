@@ -23,7 +23,7 @@ struct request {
     struct webnet_wire_response head;
     size_t head_pos;
     bool cancelled, finishing;
-    bool streaming, paused, headers_seen;
+    bool streaming, paused, headers_seen, debug_request, debug_reported;
     char *cookie_site;
     enum webnet_credentials credentials;
     bool top_level;
@@ -40,6 +40,7 @@ struct webnet {
     struct slot *parked;
     uint64_t serial;
     unsigned count;
+    bool debug;
     size_t queued_bytes;
     webcookie_jar *cookies;
 };
@@ -74,6 +75,7 @@ webnet *webnet_create(void) {
     }
     return n;
 }
+void webnet_debug(webnet *n, bool enabled) { if (n) n->debug = enabled; }
 void webnet_free(webnet *n) {
     if (!n) return;
     for (int i = 0; i < WORKERS; i++) {
@@ -156,6 +158,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     r->keepalive = q->keepalive; r->fetch_group = q->fetch_group;
     r->image_upgrade = q->image_upgrade;
     r->streaming = q->stream_response;
+    r->debug_request = n->debug && q->kind == WEBNET_RESOURCE;
     r->keepalive_bytes = q->keepalive ? q->body_len : 0;
     r->response_limit = webnet_response_limit(q->kind);
     r->deadline = uptime_ms() + WEBNET_TIMEOUT_MS;
@@ -175,6 +178,8 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     if (q->no_cors) h.user_navigation |= WEBNET_WIRE_NO_CORS;
     if (q->no_referrer) h.user_navigation |= WEBNET_WIRE_NO_REFERRER;
     if (q->stream_response) h.user_navigation |= WEBNET_WIRE_STREAM;
+    if (r->debug_request) h.user_navigation |= WEBNET_WIRE_DEBUG_REQUEST;
+    if (q->body) h.user_navigation |= WEBNET_WIRE_BODY_PRESENT;
     h.credentials = q->credentials; h.cookie_len = (uint32_t)cookie_len;
     h.id = r->id; h.generation = r->generation; h.deadline = r->deadline;
     h.url_len = ul; h.origin_len = ol; h.method_len = ml; h.headers_len = hl; h.body_len = q->body_len;
@@ -283,6 +288,41 @@ static void complete(webnet *n, struct slot *s) {
     }
     request_free(r);
 }
+static bool diagnostic_number(const char **cursor, const char *field, uint64_t *value) {
+    size_t n = strlen(field);
+    if (strncmp(*cursor, field, n)) return false;
+    const char *p = *cursor + n;
+    if (*p < '0' || *p > '9') return false;
+    uint64_t v = 0;
+    do {
+        unsigned digit = (unsigned)(*p++ - '0');
+        if (v > (UINT64_MAX - digit) / 10) return false;
+        v = v * 10 + digit;
+    } while (*p >= '0' && *p <= '9');
+    *cursor = p; *value = v; return true;
+}
+/* Private worker-only non-field metadata is stripped before any native
+   callback/author Fetch or XHR sees headers. Server-field filtering cannot
+   produce this no-colon line, and numeric validation precedes diagnostic use. */
+static bool consume_request_diagnostic(struct request *r, char *headers) {
+    if (!r->debug_request) return true;
+    char *line = strstr(headers, "\r\nHTTP/Nocturne-Request ");
+    if (!line) return true;
+    const char *p = line + sizeof("\r\nHTTP/Nocturne-Request ") - 1;
+    uint64_t bytes, ctl, non_ascii, cookie, content_length;
+    bool valid = diagnostic_number(&p, "bytes=", &bytes) &&
+        diagnostic_number(&p, " ctl=", &ctl) && diagnostic_number(&p, " nonascii=", &non_ascii) &&
+        diagnostic_number(&p, " cookie=", &cookie) && diagnostic_number(&p, " content_length=", &content_length) &&
+        p[0] == '\r' && p[1] == '\n' && ctl <= bytes && non_ascii <= bytes && cookie <= 1 && content_length <= 1;
+    if (!valid || r->debug_reported) return false;
+    memmove(line + 2, p + 2, strlen(p + 2) + 1);
+    if (strstr(headers, "\r\nHTTP/Nocturne-Request ")) return false;
+    r->debug_reported = true;
+    fprintf(stderr, "[web-net:request] id=%lu generation=%lu status=%u header_bytes=%lu ctl=%lu nonascii=%lu cookie=%lu content_length=%lu\n",
+        (unsigned long)r->id, (unsigned long)r->generation, r->head.status, (unsigned long)bytes,
+        (unsigned long)ctl, (unsigned long)non_ascii, (unsigned long)cookie, (unsigned long)content_length);
+    return true;
+}
 /* Wire data has no terminators; insert them after the complete payload has arrived. */
 static bool unpack(struct request *r) {
     const struct webnet_wire_response *h = &r->head;
@@ -302,6 +342,7 @@ static bool unpack(struct request *r) {
         src += sizes[i]; dst += sizes[i] + 1;
     }
     memcpy(out+dst,r->rx+src,h->cookie_len);
+    if (!consume_request_diagnostic(r, (char *)out + (size_t)h->url_len + 1)) { free(out); return false; }
     free(r->rx); r->rx = out;
     return true;
 }

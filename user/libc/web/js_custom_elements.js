@@ -77,7 +77,13 @@ const customElementsBridge = (() => {
         const type=get(node,'nodeType');
         if(type!==1 && type!==9 && !(type===11 && get(node,'shadowHost')))return null;
         const id=rawDom.customData(node,'registry');
-        if(id!==-2)return id===-1?null:registries.get(id)||null;
+        if(id!==-2){
+            const value=id===-1?null:registries.get(id)||null;
+            // Native clone/import preserves scoped identities. Associate its
+            // destination too, so a later definition upgrades imported nodes.
+            if(value!==null){const rs=registryState(value);if(rs.scoped)rs.documents.add(type===9?node:get(node,'ownerDocument'));}
+            return value;
+        }
         // Older/native callers may leave the slot unassigned. Resolve once;
         // subsequent moves never replace an element's established registry.
         const value=type===9?(get(node,'scripting')?registry:null):registryFor(get(node,'ownerDocument'));
@@ -146,6 +152,11 @@ const customElementsBridge = (() => {
     function upgradeTree(root) {
         if (!definitionCount) return;
         for (const element of elements(root)) tryUpgrade(element);
+    }
+    function cloneDocuments(root) {
+        // A scoped identity can be imported before its first definition. No
+        // constructor runs here; record its destination for define's lookup.
+        for(const element of elements(root))if(rawDom.customData(element,'registry')>0)registryFor(element);
     }
     function upgrade(element, d) {
         const s = stateFor(element);
@@ -487,6 +498,6 @@ const customElementsBridge = (() => {
     function parserCandidate(name,is=null){return parserNames.has(name) || is!==null && !!parserBuiltins.get(name)?.has(is);}
     function allowShadow(element){const d=lookup(element);return !d || !d.disableShadow;}
     return {construct,create,reactions,inserted,removed,attributeChanged,upgradeTree,before,after,allowShadow,internalsInfo,
-        formRefresh,formReset,registryFor,registryOption,setRegistry,parserCreate,parserFinish,parserInserted,parserCandidate,
+        formRefresh,formReset,registryFor,registryOption,setRegistry,cloneDocuments,parserCreate,parserFinish,parserInserted,parserCandidate,
         active:()=>definitionCount!==0,constructing:()=>constructionDepth>0};
 })();

@@ -13,13 +13,20 @@ static char callback_body[128];
 static size_t callback_len;
 static size_t cookie_header_len;
 static int header_result;
+static char sent_request[1024];
+static size_t sent_request_len;
 #define CHECK(c) do { checks++; if (!(c)) { printf("FAIL httptest:%d: %s\n", __LINE__, #c); failed++; } } while (0)
 
 net_stream *ns_open(const char *host, uint16_t port, bool tls, int timeout, char *error, size_t n) {
     (void)host; (void)port; (void)tls; (void)timeout; (void)error; (void)n;
-    stream.position = 0; return &stream;
+    stream.position = 0; sent_request_len = 0; sent_request[0] = 0; return &stream;
 }
-long ns_write(net_stream *s, const void *data, size_t n) { (void)s; (void)data; return (long)n; }
+long ns_write(net_stream *s, const void *data, size_t n) {
+    (void)s;
+    if (n > sizeof sent_request - sent_request_len - 1) return -1;
+    memcpy(sent_request + sent_request_len, data, n); sent_request_len += n;
+    sent_request[sent_request_len] = 0; return (long)n;
+}
 long ns_read(net_stream *s, void *data, size_t n) {
     size_t available = s->length - s->position;
     if (!available) return s->fail ? -1 : 0;
@@ -62,6 +69,26 @@ static void response(const void *wire, size_t n, size_t split, bool io_error,
 static void text_response(const char *wire, bool ok, const char *body) {
     response(wire, strlen(wire), 1, false, false, ok, body);
 }
+static void request_framing(const char *method, const void *body, size_t length, bool has_length) {
+    static const unsigned char reply[] = "HTTP/1.1 204 No Content\r\n\r\n";
+    stream = (struct net_stream){.wire = reply, .length = sizeof reply - 1};
+    struct http_req q = {.url = "https://transport.test/request?source=fixture", .method = method,
+        .headers = "X-Fixture: retained\r\n", .body = body, .body_len = length};
+    struct http_resp r;
+    CHECK(http_request(&q, &r) == 0 && r.status == 204);
+    char start[128], field[64];
+    snprintf(start, sizeof start, "%s /request?source=fixture HTTP/1.1\r\n", method);
+    snprintf(field, sizeof field, "Content-Length: %zu\r\n", length);
+    const char *found = strstr(sent_request, "\r\nContent-Length:");
+    CHECK(!strncmp(sent_request, start, strlen(start)) &&
+          (has_length ? found && !strncmp(found + 2, field, strlen(field)) &&
+                        !strstr(found + 2 + strlen(field), "Content-Length:") : !found));
+    const char *separator = strstr(sent_request, "X-Fixture: retained\r\n\r\n");
+    size_t header_end = separator ? (size_t)(separator - sent_request) + strlen("X-Fixture: retained\r\n\r\n") : 0;
+    CHECK(header_end && sent_request_len == header_end + length &&
+          (!length || !memcmp(sent_request + header_end, body, length)));
+    http_resp_free(&r);
+}
 
 static void encoded(const unsigned char *gzip, size_t n, bool chunked, bool cb, bool ok, const char *body) {
     char *wire = malloc(n + 256);
@@ -99,6 +126,18 @@ static const unsigned short gzip_limit_runs[][2] = {
 
 
 int main(void) {
+    static const char *const absent_methods[] = {"GET", "HEAD", "PATCH", "DELETE", "OPTIONS", "POST", "PUT"};
+    for (size_t i = 0; i < sizeof absent_methods / sizeof *absent_methods; i++)
+        request_framing(absent_methods[i], NULL, 0, i >= 5);
+    request_framing("PATCH", "", 0, true);
+    request_framing("DELETE", "", 0, true);
+    const unsigned char binary_body[] = {0, 0xff, '\r', '\n'};
+    request_framing("POST", binary_body, sizeof binary_body, true);
+    struct http_req missing = {.url = "https://transport.test/", .method = "POST", .body_len = 1};
+    struct http_resp missing_response;
+    sent_request_len = 0;
+    CHECK(http_request(&missing, &missing_response) < 0 && missing_response.error[0] && !sent_request_len);
+    http_resp_free(&missing_response);
     /* Reserved DEFLATE block: neither a NULL nor a stale stb reason is usable. */
     extern int http_inflate(char *, int, const char *, int, int *);
     const char reserved_block[9] = {7}; char inflated[128]; int consumed = 0;

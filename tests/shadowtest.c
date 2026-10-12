@@ -218,6 +218,22 @@ static void css_expansion_console(void *opaque, int level, const char *message) 
     struct css_expansion_host *host = opaque;
     css_failure_console(&host->log,level,message);
 }
+static bool css_ast_allocated(web_doc *d,size_t *allocated) {
+    if(!d || !allocated || d->css_cache.n<0)return false;
+    /* Called only after web_layout joined its workers. The scope/order/media
+       snapshot lives in cssmem; immutable external ASTs live in cache arenas
+       until web_free. Count owners, not each sheet instance using shared AST. */
+    size_t total=d->cssmem.allocated;
+    for(int i=0;i<d->css_cache.n;i++){
+        struct cached_css *cache=d->css_cache.v[i];if(!cache)return false;
+        bool counted=false;
+        for(int j=0;j<i;j++)if(d->css_cache.v[j]==cache){counted=true;break;}
+        if(counted)continue;
+        if(cache->ast_mem.allocated>SIZE_MAX-total)return false;
+        total+=cache->ast_mem.allocated;
+    }
+    *allocated=total;return true;
+}
 static void css_ast_expansion(void) {
     const char *html = "<!doctype html><head><link rel=stylesheet href='/expanded-doc.css'></head>"
         "<body><div id=outer class=probe></div><div id=host></div></body>";
@@ -269,9 +285,10 @@ static void css_ast_expansion(void) {
     check(d->css_bytes == document_n + shadow_n && d->css_bytes < (8u << 20),
           "expanded CSS uses the unchanged shared 8 MiB source budget");
     web_layout(d,VW,VH);
-    printf("shadow expanded CSS: source=%zu AST=%zu limit=%zu sheets=%d requests=%d errors=%d\n",
-           d->css_bytes,d->cssmem.allocated,d->cssmem.limit,d->sty.sheets.n,fixture.requests,fixture.log.errors);
-    check(d->cssmem.allocated > (16u << 20) && d->cssmem.allocated <= (32u << 20) && d->sty.sheets.n == 2 && !fixture.log.errors,
+    size_t ast_bytes=0;bool accounted=css_ast_allocated(d,&ast_bytes);
+    printf("shadow expanded CSS: source=%zu AST=%zu snapshot=%zu accounting=%s limit=%zu sheets=%d requests=%d errors=%d\n",
+           d->css_bytes,ast_bytes,d->cssmem.allocated,accounted?"valid":"overflow/invalid",d->cssmem.limit,d->sty.sheets.n,fixture.requests,fixture.log.errors);
+    check(accounted && ast_bytes > (16u << 20) && ast_bytes <= (32u << 20) && d->sty.sheets.n == 2 && !fixture.log.errors,
           "document and shadow sheets share a valid AST above 16 MiB within 32 MiB");
     check(outside->style && outside->style->bg_color == RGB(255,0,0) &&
           inside->style && inside->style->bg_color == RGB(0,255,0),
