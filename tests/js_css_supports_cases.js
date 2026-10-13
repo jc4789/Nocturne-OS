@@ -30,7 +30,10 @@
     check('bad-url-var', !CSS.supports('background-image', 'url(var(--x))'));
     check('custom-bad-url', !CSS.supports('--test', 'url(var(--x))'));
     check('selector', CSS.supports('selector(div > .item)'));
-    check('selector-not-implemented', !CSS.supports('selector(:has(div))'));
+    check('selector-has-native', CSS.supports('selector(:has(div))'));
+    check('selector-has-relative-native', CSS.supports('selector(:has(> div + span))'));
+    check('selector-has-nested-invalid', !CSS.supports('selector(:has(:has(div)))'));
+    check('selector-has-pseudo-invalid', !CSS.supports('selector(:has(div::before))'));
     check('selector-not-a-list', !CSS.supports('selector(div,span)'));
     check('comments', CSS.supports('not/**/(color:nonsense)'));
     check('unclosed-comment', !CSS.supports('(color:red) /*'));

@@ -23,7 +23,45 @@ static const struct original originals[] = {
     {"/resources/testharness.js",
      "7a108d7cfa98ac413ddb38f82fd509fb2037dfcc25ccf466567520cbb6bdf1fa",198420,0},
     {"/resources/testharnessreport.js",
-     "3777176fc736b0a78cf7617b9613b220f635daae7536ec7ebb99c61dbb525aae",1231,0}
+     "3777176fc736b0a78cf7617b9613b220f635daae7536ec7ebb99c61dbb525aae",1231,0},
+    {"/css/selectors/has-matches-to-uninserted-elements.html",
+     "1198912c925ce51de32d4770919160294bd86d246cbdd92475354ccd0c8ad442",1520,12},
+    {"/css/css-conditional/js/CSS-supports-L3.html",
+     "f3b5839f9adca36bd068bbf9f5fb949e911a2dcb2c87e17d7ec1b6599e82387f",3088,17},
+    {"/css/css-conditional/js/CSS-supports-L4.html",
+     "6cc549b9894a5a6847791c1dca7fb9f436a7c763878e205d4363e73641440c92",2977,18},
+    {"/preload/modulepreload-sri.html",
+     "4458a0c2e93a44996a272de5f18a12abfcb6d0ae65129cce54068ae34552ea74",1584,1},
+    {"/intersection-observer/inline-client-rect.html",
+     "747f1ecba0b57919bca5f6a0a4ca11021c73ad75cf8a915bef59377cb4635361",2732,3},
+    {"/intersection-observer/slotted-target.html",
+     "417830718d7ec888d56b8c4d9894494a9b2d87768f6835bc3f76b95aa2abfdc2",1091,1},
+    {"/intersection-observer/resources/intersection-observer-test-utils.js",
+     "8454449710342c998b8cc02e426a9fd8f02d1ced15cac233364932a278c73120",8182,0},
+    {"/css/css-flexbox/parsing/flex-invalid.html",
+     "a8435252ba1160cc68745196a545ce664a69bb8d5ab11bd1a109d8502829543e",894,6},
+    {"/css/support/parsing-testcommon.js",
+     "ac482e1e1908e9b98f8f1c4b2c457ec77ae5ad2baa074205c4b0f7812f4024b5",7476,0},
+    {"/css/css-backgrounds/parsing/border-radius-valid.html",
+     "c9741a4430568903ce0db1bce7c65ea456adbb16c8e01f4551cda66f38729533",1926,23},
+    {"/css/css-backgrounds/parsing/border-radius-invalid.html",
+     "64a471cba88003a253feeadafc2c0ce9fb17c20adf3e697c4eb8663fda22f0c9",1179,11},
+    {"/css/css-backgrounds/parsing/border-radius-computed.html",
+     "e749eb2b261af965dcaaf06d408fa6a583f3ab9c8c14b2b685e660309dc2bbc4",1633,14},
+    {"/css/support/computed-testcommon.js",
+     "20bd767e8a8bd9e4857a29aecfd52cad305ed4af1cf73a5064916a8a1d38ab01",7812,0},
+    {"/css/css-cascade/layer-basic.html",
+     "03af0e7afcc5b1b7a39657f61e49fd9f898b3e60bfd8760bec22a7bf50cb1b75",12555,34},
+    {"/css/css-cascade/layer-important.html",
+     "10bf97f54563b7db36c600c3ad6e18243dba0a9204b60b4a10fda5e9de2b0096",3332,9},
+    {"/css/css-cascade/layer-vs-inline-style.html",
+     "3d6d5789b9d017c7c4b6a5625eed7393c7393713ff24435437a192b60c478984",1750,4},
+    {"/css/css-cascade/layer-media-query.html",
+     "97e59964ac39b3c8474bb4d91d2ddad5ecd20ff99b4ecf6e25cef694c41b55a2",4490,8},
+    {"/css/css-flexbox/text-overflow-on-flexbox-001.html",
+     "a77f83de64246658a59bcce5286c7c00d606abe65be0d71dd1f847fe1f3b7ffb",750,0},
+    {"/css/css-flexbox/reference/text-overflow-on-flexbox-001-ref.html",
+     "65fc001d21d2598fd7ee324632d03a0848f98cd6dacd7f2c662833480d389b91",411,0}
 };
 struct run;
 struct pending {
@@ -42,6 +80,7 @@ struct run {
     bool navigation_done, observer_ready, complete;
     unsigned infrastructure, result_count, failed;
     int harness_status, scroll_x, scroll_y;
+    uint64_t deadline;
     uint32_t *pixels;
 };
 
@@ -60,6 +99,10 @@ static const char observer[] =
     "console.log('NOCTURNE_WPT_COMPLETE '+status.status+' '+tests.length+' '+bad);});"
     "console.log('NOCTURNE_WPT_OBSERVER_READY');}"
     "window.addEventListener('load',attach,true);attach();})();";
+/* Original reftest has no script or external dependencies. This observes only
+   native load readiness; it never alters the original DOM, CSS or paint. */
+static const char reference_observer[] =
+    "window.addEventListener('load',function(){console.log('NOCTURNE_WPT_REF_LOADED');},{once:true});";
 
 static bool unchanged(const struct original *o,const struct webnet_response *r) {
     if(!o)return true;
@@ -111,6 +154,13 @@ static bool request(void *opaque,const struct web_request *in) {
     p->run=r;p->native_id=in->id;
     if(!strcmp(in->url,r->harness_url))p->original=&originals[3];
     else if(!strcmp(in->url,r->report_url))p->original=&originals[4];
+    else for(unsigned i=9;i<sizeof originals/sizeof *originals;i++) {
+        if(originals[i].tests)continue;
+        char *url=NULL;
+        if(web_resolve_url_owned(web_response_url(&r->navigation),originals[i].path,&url)==1 &&
+           !strcmp(in->url,url))p->original=&originals[i];
+        free(url);if(p->original)break;
+    }
     struct webnet_request out={.kind=kind(in->kind),.generation=1,.url=in->url,.origin=in->origin,
         .method=in->method,.headers=in->headers,.body=in->body,.body_len=in->body_len,
         .credentials=(enum webnet_credentials)in->credentials,.force_preflight=in->force_preflight,
@@ -132,6 +182,35 @@ static void resume(void *opaque,uint64_t id) {
         webnet_resume(r->net,p->transport_id);return;
     }
 }
+/* The standalone runner supplies the same native-only module transport seam
+   as the browser, instead of refusing every synchronous dependency import. */
+static bool wait_request(void *opaque,uint64_t id,const bool *complete) {
+    struct run *r=opaque;
+    while(!*complete && uptime_ms()<r->deadline) {
+        bool found=false;
+        for(struct pending *p=r->pending;p;p=p->next)if(p->native_id==id){found=true;break;}
+        if(!found)return false;
+        webnet_pump(r->net,uptime_ms());if(!*complete)msleep(1);
+    }
+    return *complete;
+}
+struct sync_module {bool done,valid;struct web_response response;};
+static void sync_complete(webnet *net,uint64_t id,uint64_t generation,
+                          const struct webnet_response *response,void *opaque) {
+    (void)net;(void)id;(void)generation;
+    struct sync_module *m=opaque;m->valid=copy_response(&m->response,response);m->done=true;
+}
+static bool sync_request(void *opaque,const struct web_request *in,struct web_response *out) {
+    struct run *r=opaque;struct sync_module m={0};memset(out,0,sizeof *out);
+    struct webnet_request request={.kind=WEBNET_MODULE,.generation=1,.url=in->url,.origin=in->origin,
+        .method="GET",.credentials=(enum webnet_credentials)in->credentials,
+        .same_origin=in->same_origin,.redirect_error=in->redirect_error,.cache_mode=(enum webnet_cache)in->cache_mode};
+    uint64_t id=webnet_submit(r->net,&request,sync_complete,&m);
+    if(!id)return false;
+    while(!m.done && uptime_ms()<r->deadline){webnet_pump(r->net,uptime_ms());if(!m.done)msleep(1);}
+    if(!m.done||!m.valid){webnet_cancel(r->net,id);web_response_free(&m.response);return false;}
+    *out=m.response;return !out->error[0]&&out->status>=200&&out->status<300;
+}
 static void navigation_complete(webnet *net,uint64_t id,uint64_t generation,
                                 const struct webnet_response *response,void *opaque) {
     (void)net;(void)id;(void)generation;struct run *r=opaque;
@@ -143,6 +222,7 @@ static void console(void *opaque,int level,const char *message) {
     struct run *r=opaque;if(!message)return;
     printf("%s\n",message);fflush(stdout);
     if(!strcmp(message,"NOCTURNE_WPT_OBSERVER_READY"))r->observer_ready=true;
+    else if(!strcmp(message,"NOCTURNE_WPT_REF_LOADED")){r->observer_ready=true;r->complete=true;}
     else if(!strncmp(message,"NOCTURNE_WPT_COMPLETE ",22)){
         int status=-1;unsigned count=0,bad=0;char tail;
         if(r->complete||sscanf(message+22,"%d %u %u %c",&status,&count,&bad,&tail)!=3||bad>count){
@@ -183,7 +263,9 @@ static bool run_case(const char *base,const struct original *original,unsigned *
     if(!webnet_submit(r.net,&nav,navigation_complete,&r))goto end;
     while(!r.navigation_done&&uptime_ms()-begin<CASE_MS){webnet_pump(r.net,uptime_ms());msleep(1);}
     if(!r.navigation_done||r.infrastructure)goto end;
+    r.deadline=begin+CASE_MS;
     struct web_host host={.opaque=&r,.request=request,.cancel=cancel,.release_request=cancel,
+        .sync_request=sync_request,.wait_request=wait_request,
         .resume_request=resume,.console=console,.scroll=scroll_position,.scroll_to=scroll_to,
         .window_state=window_state,.js_task_budget_ms=CASE_MS};
     r.doc=web_live_response(r.navigation.body,r.navigation.body_len,
@@ -210,11 +292,80 @@ end:
         (unsigned long)(uptime_ms()-begin),ok?"PASS":"FAIL");fflush(stdout);
     close_run(&r);free(url);return ok;
 }
+static bool render_reference(const char *base,const struct original *original,uint32_t **pixels) {
+    struct run r={.original=original,.harness_status=-1};char *url=NULL;
+    uint64_t begin=uptime_ms();bool ok=false;unsigned settled=0;
+    if(web_resolve_url_owned(base,original->path,&url)!=1||
+       web_resolve_url_owned(base,originals[3].path,&r.harness_url)!=1||
+       web_resolve_url_owned(base,originals[4].path,&r.report_url)!=1)goto end;
+    printf("WPT 画像開始 %s viewport %dx%d\n",url,VIEW_W,VIEW_H);fflush(stdout);
+    r.net=webnet_create();if(!r.net)goto end;
+    struct webnet_request nav={.kind=WEBNET_NAVIGATION,.generation=1,.url=url,.origin=url,
+        .method="GET",.user_navigation=true,.credentials=WEBNET_CREDENTIALS_SAME_ORIGIN};
+    if(!webnet_submit(r.net,&nav,navigation_complete,&r))goto end;
+    while(!r.navigation_done&&uptime_ms()-begin<CASE_MS){webnet_pump(r.net,uptime_ms());msleep(1);}
+    if(!r.navigation_done||r.infrastructure)goto end;
+    r.deadline=begin+CASE_MS;
+    struct web_host host={.opaque=&r,.request=request,.cancel=cancel,.release_request=cancel,
+        .sync_request=sync_request,.wait_request=wait_request,.resume_request=resume,
+        .console=console,.scroll=scroll_position,.scroll_to=scroll_to,
+        .window_state=window_state,.js_task_budget_ms=CASE_MS};
+    r.doc=web_live_response(r.navigation.body,r.navigation.body_len,
+        web_response_url(&r.navigation),"utf-8",web_response_headers(&r.navigation),&host);
+    if(!r.doc)goto end;
+    r.pixels=calloc((size_t)VIEW_W*VIEW_H,sizeof *r.pixels);if(!r.pixels)goto end;
+    if(!web_console_eval(r.doc,reference_observer,sizeof reference_observer-1))goto end;
+    while(settled<2&&!r.infrastructure&&uptime_ms()-begin<CASE_MS){
+        uint64_t now=uptime_ms();webnet_pump(r.net,now);web_tick(r.doc,now);
+        if(web_dirty(r.doc))web_layout(r.doc,VIEW_W,VIEW_H);
+        if(r.complete&&!r.pending&&!web_render_blocked(r.doc)){
+            canvas_t canvas;gfx_init(&canvas,r.pixels,VIEW_W,VIEW_H,VIEW_W);
+            web_paint(r.doc,&canvas,0,0,VIEW_W,VIEW_H,0,0);
+            if(!web_dirty(r.doc)&&!web_paint_dirty(r.doc))settled++;else settled=0;
+        }else settled=0;
+        if(settled<2)msleep(1);
+    }
+    ok=r.complete&&r.observer_ready&&settled==2&&!r.infrastructure;
+    if(ok){*pixels=r.pixels;r.pixels=NULL;}
+end:
+    printf("WPT 画像終了 %s load %d settled %u 実行基盤失敗 %u elapsed %lu ms %s\n",
+        original->path,r.complete,settled,r.infrastructure,
+        (unsigned long)(uptime_ms()-begin),ok?"PASS":"FAIL");fflush(stdout);
+    close_run(&r);free(url);return ok;
+}
+static int reference_case(const char *base) {
+    uint32_t *test=NULL,*reference=NULL;unsigned infrastructure=0,mismatches=0;
+    /* Both unmodified originals use the same native font state and viewport.
+       No fuzzy threshold, cropping or expected-pixel exclusion is permitted. */
+    if(!render_reference(base,&originals[22],&test))infrastructure++;
+    if(!render_reference(base,&originals[23],&reference))infrastructure++;
+    if(!infrastructure)for(size_t i=0;i<(size_t)VIEW_W*VIEW_H;i++){
+        if(test[i]==reference[i])continue;
+        if(!mismatches)printf("WPT 最初の画素差 %zu,%zu actual %08x reference %08x\n",i%VIEW_W,i/VIEW_W,test[i],reference[i]);
+        mismatches++;
+    }
+    printf("限定WPT画像 1 組 %u 不一致画素 %u 実行基盤失敗\n",mismatches,infrastructure);
+    free(test);free(reference);return infrastructure||mismatches?1:0;
+}
 int main(int argc,char **argv) {
-    if(argc>2){printf("使用方法: wptperformancetest [WPT checkout の HTTP origin]\n");return 2;}
-    const char *base=argc==2?argv[1]:"http://10.0.2.2:8766/";
+    bool compat=argc>1&&!strcmp(argv[1],"--compat");
+    bool module=argc>1&&!strcmp(argv[1],"--modulepreload");
+    bool geometry=argc>1&&!strcmp(argv[1],"--observer-geometry");
+    bool inline_rect=argc>1&&!strcmp(argv[1],"--observer-inline");
+    bool flex=argc>1&&!strcmp(argv[1],"--flex-invalid");
+    bool radius=argc>1&&!strcmp(argv[1],"--radius");
+    bool radius_computed=argc>1&&!strcmp(argv[1],"--radius-computed");
+    bool layers=argc>1&&!strcmp(argv[1],"--layers");
+    bool layers_failed=argc>1&&!strcmp(argv[1],"--layers-failed");
+    bool ellipsis=argc>1&&!strcmp(argv[1],"--text-overflow-ref");
+    bool mode=compat||module||geometry||inline_rect||flex||radius||radius_computed||layers||layers_failed||ellipsis;
+    if(argc>(mode?3:2)){printf("使用方法: wptperformancetest [--compat|--modulepreload|--observer-geometry|--observer-inline|--flex-invalid|--radius|--radius-computed|--layers|--layers-failed|--text-overflow-ref] [WPT checkout の HTTP origin]\n");return 2;}
+    const char *base=argc>(mode?2:1)?argv[mode?2:1]:"http://10.0.2.2:8766/";
+    if(ellipsis)return reference_case(base);
     unsigned results=0,failed=0,page_failures=0;
-    for(unsigned i=0;i<3;i++)if(!run_case(base,&originals[i],&results,&failed))page_failures++;
-    printf("限定WPT 3 ページ %u 原ケース %u 失敗 %u ページ失敗\n",results,failed,page_failures);
+    unsigned start=layers_failed?20:layers?18:radius_computed?16:radius?14:flex?12:geometry||inline_rect?9:module?8:compat?5:0;
+    unsigned count=layers_failed?2:layers?4:radius_computed?1:radius?3:flex||inline_rect?1:geometry?2:module?1:compat?4:3;
+    for(unsigned i=start;i<start+count;i++)if(!run_case(base,&originals[i],&results,&failed))page_failures++;
+    printf("限定WPT %u ページ %u 原ケース %u 失敗 %u ページ失敗\n",count,results,failed,page_failures);
     return page_failures?1:0;
 }

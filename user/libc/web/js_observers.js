@@ -118,7 +118,42 @@ const observerBridge=(()=>{
             return {value:Number(m[1]),unit:m[2]};});
         return [a[0],a[1]||a[0],a[2]||a[0],a[3]||a[1]||a[0]];
     }
-    class IntersectionObserverEntry {constructor(){throw new TypeError('Illegal constructor');}}
+    const ioEntrySlots=new WeakMap(),ioFinite=Number.isFinite;
+    function intersectionEntryRecord(value){
+        const record=rectApply(rectGet,ioEntrySlots,[value]);
+        if(!record)throw new rectTypeError('Illegal IntersectionObserverEntry receiver');
+        return record;
+    }
+    class IntersectionObserverEntry {
+        constructor(init){
+            if(init===null || (typeof init!=='object' && typeof init!=='function'))
+                throw new rectTypeError('Expected IntersectionObserverEntryInit dictionary');
+            const required=name=>{const v=init[name];if(v===undefined)
+                throw new rectTypeError('Missing IntersectionObserverEntryInit '+name);return v;};
+            const finite=name=>{const value=+required(name);if(!ioFinite(value))
+                throw new rectTypeError('Non-finite IntersectionObserverEntryInit '+name);return value;};
+            // Convert dictionary members once, in Web IDL lexicographic order.
+            const boundingClientRect=new DOMRectReadOnly(...rectDictionary(required('boundingClientRect')));
+            const intersectionRatio=finite('intersectionRatio');
+            const intersectionRect=new DOMRectReadOnly(...rectDictionary(required('intersectionRect')));
+            const isIntersecting=!!required('isIntersecting');
+            const root=required('rootBounds'),rootBounds=root===null?null:new DOMRectReadOnly(...rectDictionary(root));
+            const target=required('target');element(target);
+            const time=finite('time');
+            rectApply(rectSet,ioEntrySlots,[this,{boundingClientRect,intersectionRatio,intersectionRect,
+                isIntersecting,rootBounds,target,time}]);
+        }
+        get time(){return intersectionEntryRecord(this).time;}
+        get rootBounds(){return intersectionEntryRecord(this).rootBounds;}
+        get boundingClientRect(){return intersectionEntryRecord(this).boundingClientRect;}
+        get intersectionRect(){return intersectionEntryRecord(this).intersectionRect;}
+        get isIntersecting(){return intersectionEntryRecord(this).isIntersecting;}
+        get intersectionRatio(){return intersectionEntryRecord(this).intersectionRatio;}
+        get target(){return intersectionEntryRecord(this).target;}
+    }
+    for(const name of ['time','rootBounds','boundingClientRect','intersectionRect','isIntersecting',
+        'intersectionRatio','target'])rectDefine(IntersectionObserverEntry.prototype,name,{enumerable:true});
+    rectDefine(IntersectionObserverEntry.prototype,Symbol.toStringTag,{value:'IntersectionObserverEntry',configurable:true});
     class IntersectionObserver {
         constructor(callback,options={}){
             if(typeof callback!=='function')throw new TypeError('Callback is required');options=options??{};
@@ -157,8 +192,9 @@ const observerBridge=(()=>{
                 if(index!==old.index || inside!==old.inside){
                     old.index=index;old.inside=inside;
                     const entry=Object.create(IntersectionObserverEntry.prototype);
-                    s.pending.push(readonly(entry,{target,time:host.now(),rootBounds:rect(bounds),boundingClientRect:rect(g.rect),
-                        intersectionRect:rect(ir),isIntersecting:inside,intersectionRatio:ratio}));
+                    rectApply(rectSet,ioEntrySlots,[entry,{target,time:host.now(),rootBounds:rect(bounds),boundingClientRect:rect(g.rect),
+                        intersectionRect:rect(ir),isIntersecting:inside,intersectionRatio:ratio}]);
+                    s.pending.push(entry);
                 }
             }
             if(s.pending.length && !s.queued){s.queued=true;setTimeout(()=>{

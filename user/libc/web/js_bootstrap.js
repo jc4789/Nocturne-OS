@@ -28,6 +28,7 @@
     const apply = Reflect.apply;
     const eventSlice = Array.prototype.slice, mouseAssign = Object.assign;
     const listenerMap = new WeakMap(), inlineMap = new WeakMap();
+    const inputWindow=globalThis;
     const handlerMap = new WeakMap();
     const eventPaths = new WeakMap();
     let xhrHandlerTarget = () => false;
@@ -139,9 +140,20 @@
             ctrlKey:false, shiftKey:false, altKey:false, metaKey:false, repeat:false};
             o=o==null?{}:Object(o);for(const key of Object.keys(defaults))this[key]=o[key]===undefined?defaults[key]:o[key]; }
     }
+    function inputListenerChange(target,entry,delta) {
+        if(entry.type!=='wheel' || entry.passive)return;
+        if(target===inputWindow)host.inputListener(null,delta);
+        else if(rawDom.isNode(null,target))host.inputListener(target,delta);
+    }
+    function defaultPassive(target,type) {
+        if(type!=='wheel' && type!=='mousewheel' && type!=='touchstart' && type!=='touchmove')return false;
+        if(target===inputWindow)return host.inputListener(null,0);
+        return rawDom.isNode(null,target)?host.inputListener(target,0):false;
+    }
     function removeListener(target, entry) {
         if (entry.removed) return;
         entry.removed = true;
+        inputListenerChange(target,entry,-1);
         const a = listenerMap.get(target), i = a ? a.indexOf(entry) : -1;
         if (i >= 0) {
             a.splice(i, 1);
@@ -182,7 +194,10 @@
             if (!a) listenerMap.set(this, a = []);
             if (a.some(x => x.type === type && x.callback === callback && x.capture === !!o.capture)) return;
             if (o.signal && o.signal.aborted) return;
-            const x = {type, callback, capture:!!o.capture, once:!!o.once, passive:!!o.passive, removed:false, signal:null, abort:null};
+            const passive=o.passive;
+            const x = {type, callback, capture:!!o.capture, once:!!o.once,
+                passive:passive===undefined?defaultPassive(this,type):!!passive, removed:false, signal:null, abort:null};
+            inputListenerChange(this,x,1);
             a.push(x);
             if (o.signal) {
                 x.signal = o.signal; x.abort = () => removeListener(this, x);
@@ -229,6 +244,7 @@
                     if(fn.call(target,event.message,event.filename,event.lineno,event.colno,event.error)===true)event.preventDefault();
                 }else if(fn.call(target,event)===false)event.preventDefault();
             }};
+        inputListenerChange(target,r.entry,1);
         a.push(r.entry);
     }
     function handlerRecord(target,type) {
@@ -894,20 +910,63 @@
         eventState(e).initialized=false;return e;
     };
     function cssName(k){return k==='cssFloat'?'float':String(k).replace(/[A-Z]/g,c=>'-'+c.toLowerCase());}
+    const styleToken={},styleRecords=new WeakMap(),cssPropertyMetadata=host.cssProperties();
+    const computedLonghands=cssPropertyMetadata.filter(p=>p[1]).map(p=>p[0]).sort((a,b)=>a.startsWith('-')!==b.startsWith('-')?(a.startsWith('-')?1:-1):a<b?-1:a>b?1:0);
+    function styleRecord(value){const record=styleRecords.get(value);if(!record)throw new TypeError('Invalid CSSStyleDeclaration receiver');return record;}
+    function styleProperty(name){name=String(name);return name.startsWith('--')?name:name.toLowerCase();}
+    function styleNames(value){
+        const record=styleRecord(value);
+        if(!record.computed)return (reflectedAttr(record.node,'style')||'').split(';').filter(x=>x.includes(':')).map(x=>x.split(':')[0].trim());
+        const custom=host.cssProperties(record.node,record.pseudo);if(custom===null)return [];
+        const names=[],seen=new Set();for(const [name,valid] of custom){if(seen.has(name))continue;seen.add(name);if(valid)names.push(name);}
+        return computedLonghands.concat(names);
+    }
+    function styleRead(value,name){const record=styleRecord(value);return record.computed?
+        dom('computed',record.node,styleProperty(name),record.pseudo):dom('style',record.node,styleProperty(name));}
+    function styleWrite(value,name,text,priority=''){
+        name=styleProperty(name);text=text==null?'':String(text);priority=String(priority);
+        const record=styleRecord(value);if(record.computed)throw new DOMException('Computed style is read-only','NoModificationAllowedError');
+        dom('style',record.node,name,text,priority);
+    }
+    function styleIndex(key){return typeof key==='string'&&/^(0|[1-9][0-9]*)$/.test(key)?Number(key):-1;}
     function inlineStyle(node){
         if(!rawDom.isNode(null,node)||rawDom.get(node,'nodeType')!==1)throw new TypeError('Expected an Element');
-        let s=state.get(node);if(!s)state.set(node,s={});return s.style||(s.style=new StyleDeclaration(node));
+        let s=state.get(node);if(!s)state.set(node,s={});return s.style||(s.style=new CSSStyleProperties(node,false,styleToken));
     }
-    class StyleDeclaration {
-        constructor(node){this.node=node;return new Proxy(this,{get(t,k){if(k in t||typeof k==='symbol')return Reflect.get(t,k);return t.getPropertyValue(cssName(k));},set(t,k,v){if(k in t)return Reflect.set(t,k,v);t.setProperty(cssName(k),v);return true;}});}
-        get cssText(){return reflectedAttr(this.node,'style')||'';}set cssText(v){reflectedAttr(this.node,'style',String(v));}
-        getPropertyValue(name){return dom('style',this.node,String(name));}
-        getPropertyPriority(name){return dom('stylePriority',this.node,String(name));}
-        setProperty(name,value,priority=''){dom('style',this.node,String(name),String(value),String(priority));}
-        removeProperty(name){const old=this.getPropertyValue(name);this.setProperty(name,'');return old;}
-        get length(){return this.cssText.split(';').filter(x=>x.includes(':')).length;}
-        item(i){const a=this.cssText.split(';').filter(x=>x.includes(':'));return a[i]?a[i].split(':')[0].trim():'';}
+    class CSSStyleDeclaration {
+        constructor(node,computed,token,pseudo=null){
+            if(token!==styleToken)throw new TypeError('Illegal constructor');
+            if(!rawDom.isNode(null,node)||rawDom.get(node,'nodeType')!==1)throw new TypeError('Expected an Element');
+            const record={node,computed:!!computed,pseudo:computed&&pseudo!=null?String(pseudo):''};styleRecords.set(this,record);
+            const proxy=new Proxy(this,{
+                get(t,k,r){const i=styleIndex(k);return i>=0?styleNames(t)[i]:Reflect.get(t,k,r);},
+                set(t,k,v,r){if(styleIndex(k)>=0)return false;return Reflect.set(t,k,v,r);},
+                has(t,k){const i=styleIndex(k);return i>=0?i<styleNames(t).length:Reflect.has(t,k);},
+                ownKeys(t){return Array.from(new Set(styleNames(t).map((_,i)=>String(i)).concat(Reflect.ownKeys(t))));},
+                getOwnPropertyDescriptor(t,k){const i=styleIndex(k);if(i>=0){const name=styleNames(t)[i];return name===undefined?undefined:{value:name,writable:false,enumerable:true,configurable:true};}return Reflect.getOwnPropertyDescriptor(t,k);}
+            });styleRecords.set(proxy,record);return proxy;
+        }
+        get cssText(){const r=styleRecord(this);return r.computed?'':reflectedAttr(r.node,'style')||'';}
+        set cssText(v){v=v==null?'':String(v);const r=styleRecord(this);if(r.computed)throw new DOMException('Computed style is read-only','NoModificationAllowedError');reflectedAttr(r.node,'style',v);}
+        get parentRule(){styleRecord(this);return null;}
+        getPropertyValue(name){return styleRead(this,name);}
+        getPropertyPriority(name){name=styleProperty(name);const r=styleRecord(this);return r.computed?'':dom('stylePriority',r.node,name);}
+        setProperty(name,value,priority=''){styleWrite(this,name,value,priority);}
+        removeProperty(name){name=styleProperty(name);const old=styleRead(this,name);styleWrite(this,name,'');return old;}
+        get length(){return styleNames(this).length;}
+        item(i){return styleNames(this)[Number(i)>>>0]||'';}
+        *[Symbol.iterator](){for(let i=0;i<styleNames(this).length;i++)yield styleNames(this)[i];}
     }
+    class CSSStyleProperties extends CSSStyleDeclaration {}
+    /* Expose only the native engine's real properties, not a permissive `has`
+       trap. Each named accessor reads/writes the same declaration as methods. */
+    for(const [name] of cssPropertyMetadata){
+        const camel=name==='float'?'cssFloat':name.replace(/-([a-z])/g,(_,c)=>c.toUpperCase());
+        const names=new Set([name,camel]);if(name.startsWith('-webkit-'))names.add(camel[0].toLowerCase()+camel.slice(1));
+        for(const key of names)Object.defineProperty(CSSStyleProperties.prototype,key,{configurable:true,enumerable:true,get(){return styleRead(this,name);},set(value){styleWrite(this,name,value);}});
+    }
+    Object.defineProperty(CSSStyleDeclaration.prototype,Symbol.toStringTag,{value:'CSSStyleDeclaration',configurable:true});
+    Object.defineProperty(CSSStyleProperties.prototype,Symbol.toStringTag,{value:'CSSStyleProperties',configurable:true});
     for(const name of ['name','type','src','href','rel','action','method','placeholder','lang','dir','title'])
         Object.defineProperty(HTMLElement.prototype,name,{configurable:true,get(){const s=reflectedAttr(this,name)||'';if(['src','href','action'].includes(name)&&s){try{return new URL(s,this.baseURI).href;}catch(_){return s;}}return s;},set(v){reflectedAttr(this,name,String(v));}});
     const CSS={escape(s){return Array.from(String(s)).map((c,i)=>/[a-zA-Z_\-]/.test(c)||(/[0-9]/.test(c)&&i>0)?c:'\\'+c.codePointAt(0).toString(16)+' ').join('');}};
@@ -936,7 +995,8 @@
         Document,HTMLDocument,HTMLTemplateElement,DocumentType,CharacterData,Text,CDATASection,Comment,ProcessingInstruction,DocumentFragment,
         Event,ErrorEvent,CustomEvent,UIEvent,InputEvent,FocusEvent,MouseEvent,WheelEvent,PointerEvent,KeyboardEvent,EventTarget,DOMTokenList,CSS,Headers,Request,Response,DOMException,AbortController,AbortSignal,
         fetch,setTimeout,setInterval,clearTimeout,clearInterval,requestAnimationFrame,cancelAnimationFrame,queueMicrotask,
-        performance:{now:()=>host.now()},getComputedStyle:n=>new Proxy({getPropertyValue:k=>dom('computed',n,String(k))},{get(t,k){return k in t?t[k]:t.getPropertyValue(cssName(k));}})});
+        CSSStyleDeclaration,CSSStyleProperties,
+        performance:{now:()=>host.now()},getComputedStyle:(n,pseudo=null)=>new CSSStyleProperties(n,true,styleToken,pseudo)});
     Object.defineProperty(globalThis,'location',{configurable:true,get(){return location;},set(v){host.navigate(String(v));}});
     globalThis.window=globalThis;globalThis.self=globalThis;globalThis.top=globalThis;globalThis.parent=globalThis;
     for(const n of ['addEventListener','removeEventListener','dispatchEvent']) {
@@ -1097,6 +1157,7 @@
         registerImportMap:importMapsBridge.register,
         resolveModule:importMapsBridge.resolve,
         moduleURL:importMapsBridge.url,
+        moduleIntegrity:fetchBridge.moduleIntegrity,
         blobScript(url){
             const blob=objectURLBridge.blob(url);
             if(!blob)throw new TypeError('Blob script URL is revoked or unavailable in this document');

@@ -40,13 +40,26 @@ static node_t *tree_next(node_t *n, node_t *root, bool shadow, bool templates, b
     }
     return NULL;
 }
+/* GC ownership spans shadow and template forests, not just ordinary children.
+   Share the native non-recursive walker with wrapper lifetime publication. */
+node_t *doc_forest_next(node_t *n,node_t *root) {
+    return n && root ? tree_next(n,root,true,true,true) : NULL;
+}
 
-static void indices(node_t *p) {
+/* Only an element insertion/removal changes the element sibling positions.
+   The prefix before first remains coherent, including a parser-published
+   prefix. Appends therefore do not revisit every previous child. */
+static void indices(node_t *p, node_t *first) {
+    if (!first) return;
     web_doc *d = p->owner;
     if (d && d->dom_family) d = d->dom_family;
     uint64_t start = d && d->profile_enabled ? uptime_ms() : 0, visited = 0;
     int i = 0;
-    for (node_t *c = p->first; c; c = c->next) {
+    for (node_t *c = first->prev; c; c = c->prev) {
+        visited++;
+        if (c->type == N_ELEM) { i = c->elem_index; break; }
+    }
+    for (node_t *c = first; c; c = c->next) {
         visited++;
         if (c->type == N_ELEM) c->elem_index = ++i;
     }
@@ -367,9 +380,11 @@ static void textarea_changed(node_t *n) {
         if (n->type == N_ELEM && !n->foreign && n->tag == T_textarea && !n->value_dirty) n->control_ready = false;
 }
 
-static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recascade, bool boxes) {
+static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recascade, bool boxes,node_t *child_list) {
     if (!d) return;
     d->dom_revision++;
+    /* Window の名前表はdocument-tree構造だけを追う。style/rAFやshadow内部は無効化しない。 */
+    if(!n || (child_list && doc_node_root(n,false)==d->root))web_js_window_names_changed(d);
     if (d->js_nodes_dirty) { d->js_nodes_dirty = false; web_js_nodes_changed(d); }
     if (n) {
         n->resource_revision++;
@@ -386,7 +401,7 @@ static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recasca
         textarea_changed(n); return;
     }
     d->dirty = true;
-    if(recascade)css_mark_dirty(d,n);
+    if(recascade){if(child_list)css_mark_child_list_dirty(d,n,child_list);else css_mark_dirty(d,n);}
     if(boxes){d->need_boxes=true;d->layout_valid=false;}
     if (resources) d->resources_dirty = d->style_full_dirty = true;
     if (recascade || boxes) {
@@ -405,7 +420,7 @@ static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recasca
        boxes_build has stopped borrowing the old cache pointers. */
 }
 static void changed(web_doc *d,node_t *n,bool resources) {
-    changed_geometry(d,n,resources,true,false);
+    changed_geometry(d,n,resources,true,false,NULL);
 }
 void doc_mutated(web_doc *d, node_t *n) {
     if (d && !n) { d->js_nodes_dirty = true; d->need_boxes = true; d->metadata_valid=false; }
@@ -453,7 +468,7 @@ static void structure_changed_lifetime(web_doc *d, node_t *parent, node_t *subtr
     html_bridge_native_changed(parent, HTML_BRIDGE_CHILDREN);
     cssom_style_text_changed(parent);
     if (lifetime_changed) cssom_style_lifecycle(subtree);
-    if (d && lifetime_changed) d->js_nodes_dirty = true;
+    if (d && lifetime_changed) web_js_nodes_reparented(d,subtree);
     /* documentElement/head/body identities and the first ordinary-tree base
        are metadata dependencies. Class/text/control/ARIA and shadow/template
        mutations are not. Inspect the moved subtree even after detach: the
@@ -463,7 +478,7 @@ static void structure_changed_lifetime(web_doc *d, node_t *parent, node_t *subtr
        (parent->type==N_DOC || parent==d->html || metadata_subtree(subtree)))
         d->metadata_valid=false;
     if (d && doc_node_root(parent, true) == d->root) d->need_boxes = true;
-    changed(d, parent, parent->type==N_DOC || resource_ancestor(parent) || resource_subtree(subtree));
+    changed_geometry(d,parent,parent->type==N_DOC || resource_ancestor(parent) || resource_subtree(subtree),true,false,subtree);
 }
 static void structure_changed(web_doc *d, node_t *parent, node_t *subtree) {
     structure_changed_lifetime(d, parent, subtree, true);
@@ -807,6 +822,9 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
        of authored sheets. Re-parsing every external CSS sheet here made geometry
        reads after classList updates needlessly rebuild all sheet snapshots. */
     changed(d, n, resources);
+    if(!ns && (!strcmp(low,"id") || !strcmp(low,"name")) && doc_node_root(n,false)==d->root)
+        web_js_window_names_changed(d);
+    if(ordinary&&n->tag==T_link&&(!strcmp(low,"rel")||!strcmp(low,"href")))web_js_link_changed(d);
     /* These native HTML semantics are consumed while building boxes rather
        than encoded in computed CSS. Equal styles therefore do not imply the
        old marker text, suppressed descendants, or atomic kind is reusable. */
@@ -927,8 +945,9 @@ static void detach(node_t *n) {
     stylesheet_detach(n);
     if (n->prev) n->prev->next = n->next; else p->first = n->next;
     if (n->next) n->next->prev = n->prev; else p->last = n->prev;
+    node_t *next = n->next;
     n->parent = n->prev = n->next = NULL;
-    indices(p);
+    if (n->type == N_ELEM) { n->elem_index = 0; indices(p, next); }
     textarea_changed(p);
 }
 
@@ -1015,15 +1034,34 @@ void doc_parser_form_set(node_t *node,node_t *form){
     if(form){node->parser_form_next=d->parser_form_nodes;d->parser_form_nodes=node;}
 }
 static void reset_parser_forms(node_t *root) {
-    if(!root->owner || !root->owner->parser_form_nodes)return;
-    for (node_t *n=root;n;n=tree_next(n,root,true,true,true)) if(n->parser_form_owner)doc_parser_form_set(n,NULL);
-    /* A moved form may own foster-parented controls outside its subtree. */
     web_doc *d=root->owner;
-    if (!d) return;
-    for (node_t *n=d->parser_form_nodes,*next;n;n=next) {
-        next=n->parser_form_next;
-        node_t *f=n->parser_form_owner;
-        if (doc_node_root(n,false)!=doc_node_root(f,false)) doc_parser_form_set(n,NULL);
+    if (!d || !d->parser_form_nodes) return;
+    /* An unassociated leaf cannot move a control or its parser-owned form.
+       A leaf form is the exception: it can own foster-parented controls. */
+    if (!root->first && !root->shadow_root && !root->template_content && !root->parser_form_owner &&
+        (root->type != N_ELEM || root->foreign || root->tag != T_form)) return;
+    /* Only registered parser associations can need this reset. Do not walk a
+       large moved ordinary subtree once per insertion merely because another
+       control elsewhere in its document was parser-associated. Templates have
+       a separate inert owner, so include that owner's registrations as well.
+       Removing through the current list link avoids a second head-to-node
+       search for every cleared association. */
+    web_doc *owners[2] = {d, d->template_owner ? NULL : d->template_doc};
+    for (unsigned owner = 0; owner < 2; owner++) {
+        web_doc *document = owners[owner];
+        if (!document) continue;
+        for (node_t **link = &document->parser_form_nodes; *link;) {
+            node_t *n = *link, *f = n->parser_form_owner, *ancestor = n;
+            while (ancestor && ancestor != root)
+                ancestor = ancestor->parent ? ancestor->parent : ancestor->shadow_host ? ancestor->shadow_host : ancestor->template_host;
+            /* A moved form may own foster-parented controls outside its
+               subtree. Preserve the ordinary-root separation check. */
+            if (ancestor == root || doc_node_root(n,false) != doc_node_root(f,false)) {
+                html_bridge_native_changed(n, HTML_BRIDGE_FIELDS);
+                *link = n->parser_form_next;
+                n->parser_form_owner = n->parser_form_next = NULL;
+            } else link = &n->parser_form_next;
+        }
     }
 }
 bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
@@ -1062,7 +1100,7 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
     html_bridge_native_changed(c, HTML_BRIDGE_LINKS);
     html_bridge_native_changed(c->prev, HTML_BRIDGE_LINKS);
     html_bridge_native_changed(c->next, HTML_BRIDGE_LINKS);
-    indices(p);
+    if (c->type == N_ELEM) indices(p, c);
     reset_parser_forms(c);
     if (is_slot(p) && !p->slot_assigned_first && doc_node_root(p, false)->shadow_host)
         doc_slot_signal(p);
@@ -1194,7 +1232,7 @@ bool doc_node_adopt(web_doc *d, node_t *n) {
     }
     if (n->owner) doc_shadow_flush(n->owner); /* drain the source-family queue before owner migration */
     adopt_subtree(d, n);
-    web_js_nodes_changed(d);
+    web_js_nodes_reparented(d,n);
     return true;
 }
 
@@ -1284,7 +1322,7 @@ bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
         if(keep_style){d->need_style=was_need_style;rebuild_boxes=true;}
     }
     cssom_style_text_changed(n);
-    changed_geometry(d,n,resources,!keep_style,rebuild_boxes);
+    changed_geometry(d,n,resources,!keep_style,rebuild_boxes,NULL);
     return true;
 }
 

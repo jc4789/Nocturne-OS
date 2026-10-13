@@ -63,6 +63,8 @@ net_stream *ns_open(const char *host,uint16_t port,bool tls,int timeout,char *er
     (void)err;(void)n;CHECK(!strcmp(host,"cdn.test")&&port==80&&!tls&&timeout==5000);
     opened++;memset(&stream,0,sizeof stream);return &stream;
 }
+net_stream *ns_open_timed(const char *h,uint16_t p,bool tls,int t,char *e,size_t n,struct http_transport_timing *m){memset(m,0,sizeof *m);return ns_open(h,p,tls,t,e,n);}
+uint64_t uptime_ms(void){return 0;}
 long ns_write(net_stream *s,const void *bytes,size_t n) {
     if(n>=sizeof s->request-s->used)return -1;
     memcpy(s->request+s->used,bytes,n);s->used+=n;s->request[s->used]=0;return (long)n;

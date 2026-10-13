@@ -32,6 +32,10 @@ static const struct asset assets[] = {
     {"/dir/a.mjs", "import {b} from './b.mjs';export function a(){return 'A';}export function cycle(){return a()+b();}", 0},
     {"/dir/b.mjs", "import {a} from './a.mjs';export function b(){return a()==='A'?'B':'?';}", 0},
     {"/dir/dynamic.mjs", "globalThis.dynamicEvaluations=(globalThis.dynamicEvaluations||0)+1;export const answer=42;", 0},
+    {"/dir/preload.mjs", "globalThis.preloadEvaluations=(globalThis.preloadEvaluations||0)+1;export const answer=42;", 10},
+    {"/dir/preload.mjs?sri", "globalThis.preloadEvaluations=(globalThis.preloadEvaluations||0)+1;export const answer=42;", 10},
+    {"/dir/preload-root.mjs", "import {value} from './preload-child.mjs';check('preload-joined-value',value===42);mark('preload-graph-done');", 0},
+    {"/dir/preload-child.mjs", "export const value=42;", 1000},
     {"/dir/mime.mjs", "import {value} from './mimedep.mjs';check('mime-import',value===42);mark('mime-module');", 0},
     {"/dir/mimedep.mjs", "export const value=42;", 0},
     {"/dir/order-one.js", "globalThis.dynamicOrder.push(1);", 15},
@@ -59,6 +63,8 @@ struct fixture {
     size_t nmarks, mark_capacity;
     bool mark_allocation_failed;
     int js_failures, errors, requests, cancellations, completions, sync_loads;
+    bool native_wait;
+    int preload_requests, preload_joins;
     int fetch_requests;
     int policy_report_requests, policy_report_completed, policy_report_bad;
     int outside_running, navigations;
@@ -77,6 +83,8 @@ static struct fixture fixture;
 static const char *case_response_headers;
 static const char *case_meta_policy;
 static bool case_real_network;
+static bool case_input_checkpoint;
+static unsigned input_ready_checkpoints, input_blocked_checkpoints;
 static int total, failed;
 static uint32_t pixels[VW * VH];
 
@@ -179,6 +187,7 @@ static bool request(void *opaque, const struct web_request *r) {
         q->cache_mode = r->cache_mode;
         q->no_cors = r->no_cors; q->no_referrer = r->no_referrer;
         if (r->kind == WEB_RESOURCE_FETCH) f->fetch_requests++;
+        if(r->kind==WEB_RESOURCE_MODULE&&strstr(r->url,"/preload"))f->preload_requests++;
         size_t n = r->body_len < sizeof q->body - 1 ? r->body_len : sizeof q->body - 1;
         if (n) memcpy(q->body, r->body, n);
         q->body[n] = 0;
@@ -334,23 +343,43 @@ static void deliver(struct fixture *f) {
             snprintf(r.error, sizeof r.error, "Invalid POST request in the fixture");
         }
         size_t marks = f->nmarks;
-        if (web_script_running(f->doc)) f->outside_running++;
+        if (!f->native_wait&&web_script_running(f->doc)) f->outside_running++;
         web_resource_loaded(f->doc, q.id, &r);
-        if (f->nmarks != marks || web_script_running(f->doc)) f->outside_running++;
+        if (f->nmarks != marks || (!f->native_wait&&web_script_running(f->doc))) f->outside_running++;
         /* Completion has to copy: borrowed body and full headers die immediately. */
         if (r.body) memset(r.body, '!', r.body_len);
         if (r.headers_full) memset(r.headers_full, '!', strlen(r.headers_full));
         web_response_free(&r); f->completions++;
     }
 }
+static bool wait_request(void *opaque,uint64_t id,const bool *completed) {
+    struct fixture *f=opaque;
+    if(f->native_wait||!completed)return false;
+    bool found=false;
+    for(int i=0;i<SLOTS;i++)if(f->queue[i].used&&f->queue[i].id==id)found=true;
+    if(!found)return *completed;
+    uint64_t end=uptime_ms()+5000;
+    f->native_wait=true;f->preload_joins++;
+    while(!*completed&&uptime_ms()<end){deliver(f);msleep(1);}
+    f->native_wait=false;return *completed;
+}
 static void close_case(void);
+static bool input_fixture_checkpoint(void *opaque) {
+    struct fixture *f=opaque;
+    if(f->doc) {
+        if(web_native_input_ready(f->doc,false))input_ready_checkpoints++;
+        else input_blocked_checkpoints++;
+    }
+    return true;
+}
 static web_doc *open_case_url_budget(const char *html, bool expected_errors, const char *url, uint32_t task_budget_ms) {
     close_case();free_marks(&fixture);
     memset(&fixture, 0, sizeof fixture); fixture.expected_errors = expected_errors;
     if(case_real_network)fixture.net=webnet_create();
-    struct web_host host = {.opaque=&fixture, .request=request, .cancel=cancel, .sync_load=sync_load,
+    struct web_host host = {.opaque=&fixture, .request=request, .cancel=cancel, .sync_load=sync_load,.wait_request=wait_request,
                             .navigate=navigate, .console=receive_log, .scroll=scroll_position,.history=history_host,
-                            .js_task_budget_ms=task_budget_ms};
+                            .js_task_budget_ms=task_budget_ms,
+                            .script_checkpoint=case_input_checkpoint?input_fixture_checkpoint:NULL};
     if(case_real_network)host.resume_request=resume_request;
     fixture.history_length = 1; fixture.history_serial = 1;
     fixture.history[0].url = strdup(url); fixture.history[0].entry = 1;
@@ -591,6 +620,9 @@ static void test_lexbor(void) {
 }
 static void test_cssom(void) {
     external_case("js_cssom_cases.js", ";check('cssom-count',runCSSOMCases()===54);mark('api-done');", BASE);
+}
+static void test_computed_declaration(void) {
+    external_case("js_cssom_cases.js", ";check('computed-declaration-count',runComputedStyleDeclarationCases()===24);check('placeholder-computed-count',runPlaceholderComputedStyleCases()===20);mark('api-done');", BASE);
 }
 static void test_fetch_api(void) {
     external_case("js_fetch_cases.js", ";runFetchCases().then(n=>{console.log('Fetch API checks '+n);check('fetch-api-count',n>100);mark('api-done');},e=>{console.log('FAIL fetch-api '+e+' '+e.stack);mark('api-done');});", BASE);
@@ -1304,11 +1336,129 @@ static void test_html_csp(void){
         case_response_headers=case_meta_policy=NULL;
     }
 }
+static void test_modulepreload_api(void) {
+    char *page=script_page(
+        "const attach=(node)=>new Promise((resolve,reject)=>{node.onload=resolve;node.onerror=reject;document.head.appendChild(node);});"
+        "const preload=(suffix)=>{const node=document.createElement('link');node.rel='modulepreload';node.href='preload.mjs'+suffix;return node;};"
+        "const module=(suffix)=>{const node=document.createElement('script');node.type='module';node.src='preload.mjs'+suffix;return node;};"
+        "(async()=>{check('modulepreload-native-token',document.createElement('link').relList.supports('modulepreload'));"
+        "await Promise.all([attach(preload('')),attach(preload(''))]);check('preload-not-evaluated',globalThis.preloadEvaluations===undefined);"
+        "await attach(module(''));await attach(module(''));check('preload-one-evaluation',preloadEvaluations===1);"
+        "const changed=preload('');changed.rel='nofollow';const ready=attach(changed);changed.rel='modulepreload';await ready;"
+        "check('preload-rel-mutation',preloadEvaluations===1);"
+        "const failed=preload('?sri');failed.integrity='sha384-invalid';await new Promise((resolve,reject)=>{failed.onload=()=>reject(new Error('SRI unexpectedly loaded'));failed.onerror=resolve;document.head.appendChild(failed);});"
+        "await attach(module('?sri'));check('preload-sri-failure-retry',preloadEvaluations===2);mark('preload-api-done');"
+        "})().catch(e=>{check('preload-unexpected-error',false);console.log(String(e));mark('preload-api-done');});");
+    if(page&&open_case(page,true)){
+        test_check("preload-api-completed",pump("preload-api-done",6000));
+        test_check("preload-api-no-assertion-failures",fixture.js_failures==0);
+        test_check("preload-url-sharing-and-failed-retry",fixture.preload_requests==3);
+        test_check("preload-completion-native-only",fixture.outside_running==0);
+        close_case();
+    }
+    free(page);
+}
+static void test_modulepreload(void) {
+    test_modulepreload_api();
+    char *root_only=script_page(
+        "const root=document.createElement('link');root.rel='modulepreload';root.href='preload-root.mjs';"
+        "root.onload=()=>{check('preload-root-no-evaluation',globalThis.preloadEvaluations===undefined);mark('preload-root-only-done');};"
+        "root.onerror=()=>{check('preload-root-error',false);mark('preload-root-only-done');};document.head.appendChild(root);");
+    if(root_only&&open_case(root_only,false)){
+        test_check("preload-root-parsed-without-graph",pump("preload-root-only-done",6000));
+        test_check("preload-root-no-dependency-fetch",fixture.preload_requests==1&&fixture.sync_loads==0);
+        test_check("preload-root-no-errors",fixture.errors==0&&fixture.js_failures==0);
+        close_case();
+    }
+    free(root_only);
+    const char *graph=START
+        "<link rel=modulepreload href=preload-child.mjs><script type=module src=preload-root.mjs></script>"
+        "</head><body><p>Module preload join</p></body></html>";
+    if(open_case(graph,false)){
+        test_check("preload-native-graph-completed",pump("preload-graph-done",6000));
+        test_check("preload-graph-no-errors",fixture.errors==0&&fixture.js_failures==0);
+        test_check("preload-graph-no-duplicate-fetch",fixture.preload_requests==2&&fixture.sync_loads==0);
+        test_check("preload-graph-needed-request-joined",fixture.preload_joins==1);
+        test_check("preload-join-no-author-callback",fixture.outside_running==0);
+        close_case();
+    }
+}
+static void input_probe(web_node *target,const char *source,bool allowed,const char *name) {
+    test_check("input-author-operation",web_console_eval(fixture.doc,source,strlen(source)));
+    web_layout(fixture.doc,VW,VH);
+    struct web_input_target captured={0};
+    test_check(name,web_native_wheel_target(fixture.doc,target,&captured,false)==allowed);
+}
+
+static void test_input_snapshot(void) {
+    case_input_checkpoint=true;
+    const char *html=START "</head><body style='margin:0'><div id=wheel style='height:100px'>wheel</div>"
+        "<script>globalThis.w=document.getElementById('wheel');globalThis.cancelWheel=e=>e.preventDefault();mark('input-ready');</script></body>";
+    if(!open_case(html,false)){case_input_checkpoint=false;return;}
+    test_check("input-initial-script",pump("input-ready",3000));
+    web_layout(fixture.doc,VW,VH);
+    web_node *target=web_node_at(fixture.doc,4,4);
+    test_check("input-target",target!=NULL);
+    input_probe(target,"void 0",true,"input-no-listener");
+    input_probe(target,"w.addEventListener('wheel',cancelWheel,{passive:true})",true,"input-passive");
+    input_probe(target,"w.addEventListener('wheel',cancelWheel,{passive:false})",true,"input-duplicate-keeps-passive");
+    input_probe(target,"w.removeEventListener('wheel',cancelWheel);w.addEventListener('wheel',cancelWheel,{passive:false})",false,"input-nonpassive");
+    struct web_event event={.type="wheel",.bubbles=true,.cancelable=true,.delta_y=30};
+    test_check("input-author-prevent-default",!web_dispatch(fixture.doc,target,&event));
+    input_probe(target,"w.removeEventListener('wheel',cancelWheel)",true,"input-remove");
+    input_probe(target,"w.addEventListener('wheel',cancelWheel,{once:true,passive:false})",false,"input-once-before");
+    test_check("input-once-cancels",!web_dispatch(fixture.doc,target,&event));
+    input_probe(target,"void 0",true,"input-once-after");
+    input_probe(target,"globalThis.wheelAbort=new AbortController();w.addEventListener('wheel',cancelWheel,{signal:wheelAbort.signal,passive:false})",false,"input-abort-before");
+    input_probe(target,"wheelAbort.abort()",true,"input-abort-after");
+    input_probe(target,"document.addEventListener('wheel',cancelWheel)",true,"input-document-default-passive");
+    test_check("input-default-passive-cannot-cancel",web_dispatch(fixture.doc,target,&event));
+    input_probe(target,"document.removeEventListener('wheel',cancelWheel);document.addEventListener('wheel',cancelWheel,{passive:false})",false,"input-document-explicit-nonpassive");
+    input_probe(target,"document.removeEventListener('wheel',cancelWheel);document.body.addEventListener('wheel',cancelWheel);addEventListener('wheel',cancelWheel)",true,"input-body-window-default-passive");
+    input_probe(target,"removeEventListener('wheel',cancelWheel);addEventListener('wheel',cancelWheel,{passive:false})",false,"input-window-explicit-nonpassive");
+    input_probe(target,"removeEventListener('wheel',cancelWheel);document.body.removeEventListener('wheel',cancelWheel);w.onwheel=()=>false",false,"input-inline-property");
+    test_check("input-inline-cancels",!web_dispatch(fixture.doc,target,&event));
+    input_probe(target,"w.onwheel=null",true,"input-inline-property-remove");
+    input_probe(target,"w.setAttribute('onwheel','return false')",false,"input-inline-attribute");
+    input_probe(target,"w.removeAttribute('onwheel')",true,"input-inline-attribute-remove");
+    input_ready_checkpoints=input_blocked_checkpoints=0;
+    const char *loop="let inputSum=0;for(let i=0;i<1000000;i++)inputSum+=i;";
+    test_check("input-pure-js-loop",web_console_eval(fixture.doc,loop,strlen(loop)));
+    test_check("input-pure-js-committed-snapshot",input_ready_checkpoints>0);
+    struct web_input_target old={0};test_check("input-capture-owner",web_input_capture(fixture.doc,target,&old));
+    test_check("input-current-owner",web_input_target_valid(fixture.doc,&old));
+    const char *replace="document.open();document.write('<p>replacement</p>');document.close();";
+    test_check("input-open",web_console_eval(fixture.doc,replace,strlen(replace)));
+    test_check("input-open-invalidates-old-epoch",!web_input_target_valid(fixture.doc,&old));
+    test_check("input-no-errors",fixture.errors==0&&fixture.js_failures==0);
+    close_case();case_input_checkpoint=false;
+}
+
 int main(int argc, char **argv) {
     uint64_t start = uptime_ms();
     /* Optional selectors make a failing feature reproducible in the real OS. */
 #define RUN(name, fn) do { if (argc == 1 || !strcmp(argv[1], name)) { printf("jstest: %s\n", name); fflush(stdout); fn(); } } while (0)
     RUN("language", test_language);
+    if(argc>1&&!strcmp(argv[1],"input-snapshot")){
+        printf("jstest: input-snapshot\n");fflush(stdout);test_input_snapshot();
+    }
+    RUN("modulepreload",test_modulepreload);
+    if(argc>1&&!strcmp(argv[1],"modulepreload-api")){
+        printf("jstest: modulepreload-api\n");fflush(stdout);
+        test_modulepreload_api();
+    }
+    if(argc>1&&!strcmp(argv[1],"intersection-inline")){
+        printf("jstest: intersection-inline\n");fflush(stdout);
+        external_case("js_observer_cases.js",";runIntersectionInlineCases().then(n=>{check('intersection-inline-count',n===10);mark('api-done');},e=>{console.log('FAIL intersection-inline '+e);mark('api-done');});",BASE);
+    }
+    if(argc>1&&!strcmp(argv[1],"intersection-entry")){
+        printf("jstest: intersection-entry\n");fflush(stdout);
+        external_case("js_observer_cases.js",";runIntersectionEntryCases().then(n=>{check('intersection-entry-count',n===10);mark('api-done');},e=>{console.log('FAIL intersection-entry '+e);mark('api-done');});",BASE);
+    }
+    if(argc>1&&!strcmp(argv[1],"window-named")){
+        printf("jstest: window-named\n");fflush(stdout);
+        external_case("js_frames_cases.js",";try{check('window-named-count',runWindowNamedCases()===42);}catch(e){console.log('FAIL window-named '+e);}mark('api-done');",BASE);
+    }
     RUN("html-parser", test_html_parser);
     RUN("html-worker", test_html_worker);
     RUN("html-csp", test_html_csp);
@@ -1342,6 +1492,7 @@ int main(int argc, char **argv) {
     RUN("frames", test_frames);
     RUN("node-position", test_node_position);
     RUN("cssom", test_cssom);
+    RUN("computed-style-declaration", test_computed_declaration);
     /* Already included in platform above; selecting lexbor runs only its probes. */
     if (argc > 1 && !strcmp(argv[1], "lexbor")) { printf("jstest: lexbor\n"); fflush(stdout); test_lexbor(); }
     RUN("xhr", test_xhr);

@@ -544,7 +544,12 @@ static int atomic_kind(node_t *n) {
         return AT_INPUT;
     case T_select: return AT_SELECT;
     case T_textarea: return AT_TEXTAREA;
-    case T_button: return AT_INLINE_BLOCK;
+    case T_button:
+        /* Button layout preserves an author's flex/grid formatting context.
+           Native activation belongs to the element, not to a forced flow box. */
+        if(n->style && (n->style->display==D_FLEX || n->style->display==D_INLINE_FLEX ||
+                       n->style->display==D_GRID || n->style->display==D_INLINE_GRID))return AT_NONE;
+        return AT_INLINE_BLOCK;
     case T_svg: return n->parent && n->parent->foreign ? AT_NONE : AT_SVG;
     /* No object resource renderer is installed. Resource-less and unsupported
        objects therefore render their fallback children in ordinary CSS flow,
@@ -556,6 +561,13 @@ static int atomic_kind(node_t *n) {
     case T_audio: return node_attr(n, "controls") ? AT_PLACEHOLDER : AT_NONE;
     }
     return AT_NONE;
+}
+bool box_pseudo_generated(node_t *node, const style_t *origin, const style_t *pseudo) {
+    if (!node || !origin || !pseudo || origin->display == D_NONE ||
+        pseudo->display == D_NONE || !pseudo->content) return false;
+    if (node->tag == T_br || node->tag == T_wbr || node->tag == T_hr || node->tag == T_frameset) return false;
+    int atomic = atomic_kind(node);
+    return atomic == AT_NONE || atomic == AT_INLINE_BLOCK;
 }
 
 static void gen(struct bctx *b, box_t *pb, node_t *n, style_t *pst);
@@ -593,7 +605,7 @@ static void children(struct bctx *b, box_t *pb, node_t *e, style_t *st) {
     /* Keep the principal box/background/border, but not the skipped contents.
        The flat DOM and its computed styles remain available to find-in-page. */
     if(st->content_visibility==CV_HIDDEN)return;
-    if (st->before) pseudo_box(b, pb, e, st->before);
+    if (st->before_generated && st->before) pseudo_box(b, pb, e, st->before);
     pvec list = {0};
     doc_flat_children(e, &list);
     bool details = !e->foreign && e->tag == T_details;
@@ -621,7 +633,7 @@ static void children(struct bctx *b, box_t *pb, node_t *e, style_t *st) {
         gen(b, pb, child, st);
     }
     pv_free(&list);
-    if (st->after) pseudo_box(b, pb, e, st->after);
+    if (st->after_generated && st->after) pseudo_box(b, pb, e, st->after);
 }
 
 /* inline-table, inline-flex and inline-grid: an atomic inline box around the table, flex or grid box. The wrapper
@@ -638,6 +650,8 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
     ws->bg_image = NULL;
     ws->has_grad = false;
     ws->gradient = NULL;
+    ws->box_shadow = NULL; /* background decorations belong to the inner border box */
+    ws->border_radius=0;memset(ws->corner_radius,0,sizeof ws->corner_radius);
     ws->width.kind = LK_AUTO;
     ws->height.kind = LK_AUTO;
     style_t *is = ar_alloc(b->a, sizeof *is);
@@ -927,6 +941,12 @@ static void clear_boxes(node_t *n) {
 static void unpublish_boxes(box_t *b) {
     if(!b)return;
     pv_free(&b->paint_layers);
+    web_shadow_cache_free(&b->shadow_cache);
+    for(int i=0;i<3;i++)web_radius_cache_free(&b->radius_clip[i]);
+    for (int i = 0; i < b->ndecos; i++) {
+        web_shadow_cache_free(&b->decos[i].shadow_cache);
+        for(int j=0;j<2;j++)web_radius_cache_free(&b->decos[i].radius_clip[j]);
+    }
     ar_free(&b->layout_mem);
     ar_free(&b->text_mem);
     if(b->node && b->node->box==b){b->node->box=NULL;b->node->anchor_block=NULL;}
@@ -981,6 +1001,8 @@ static bool restyle_derived(box_t *b, style_t *old) {
             next.padding[i].kind=LK_LEN; next.padding[i].px=next.padding[i].pct=0;
         }
         next.bg_color=0; next.bg_image=NULL; next.has_grad=false; next.gradient=NULL;
+        next.box_shadow=NULL;
+        next.border_radius=0;memset(next.corner_radius,0,sizeof next.corner_radius);
         next.width.kind=next.height.kind=LK_AUTO;
     } else {
         next.display=b->kind == B_TABLE ? D_TABLE : b->kind == B_GRID ? D_GRID : D_FLEX;

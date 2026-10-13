@@ -5,6 +5,7 @@ This does not validate browser rendering or real-site acceptance.
 from pathlib import Path
 import subprocess
 import hashlib
+import sys
 
 dom = Path('user/libc/web/dom.c').read_text(encoding='utf-8')
 html = Path('user/libc/web/html.c').read_text(encoding='utf-8')
@@ -13,6 +14,110 @@ header = Path('user/libc/web/webi.h').read_text(encoding='utf-8')
 def part(text, start, end):
     at = text.index(start)
     return text[at:text.index(end, at)]
+
+if '--indices' in sys.argv:
+    # Exact production numbering/detach/form-reset functions, with only their
+    # unrelated lifecycle and parser notification consumers shimmed. This is
+    # supporting evidence, not a real-site or OS performance measurement.
+    def function(signature):
+        at = dom.index(signature)
+        return dom[at:dom.index('\n}', at)+2]+'\n'
+    prefix = r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdint.h>
+enum {N_DOC,N_ELEM,N_TEXT,N_COMMENT,N_FRAGMENT};
+enum {T_div,T_form,T_input,T_template};
+enum {HTML_BRIDGE_CHILDREN,HTML_BRIDGE_LINKS,HTML_BRIDGE_FIELDS};
+typedef struct web_doc web_doc;
+typedef struct node {web_doc *owner;int type,tag,elem_index;bool foreign;
+    struct node *parent,*first,*last,*prev,*next,*shadow_root,*shadow_host,*template_content,*template_host;
+    struct node *parser_form_owner,*parser_form_next;
+} node_t;
+struct web_doc {web_doc *dom_family,*template_doc;node_t *parser_form_nodes;bool profile_enabled,template_owner;
+    struct {uint64_t index_visits,index_ms;} profile;};
+static unsigned notices,checks,failed;
+static uint64_t uptime_ms(void){return 0;}
+static void html_bridge_native_changed(node_t*n,int flags){(void)n;(void)flags;notices++;}
+static void stylesheet_detach(node_t*n){(void)n;}
+static void textarea_changed(node_t*n){(void)n;}
+static void check(bool value,const char *name){checks++;if(!value){failed++;printf("FAIL %s\n",name);}}
+'''
+    product = ''.join(function(signature) for signature in (
+        'static void indices(', 'node_t *doc_shadow_parent(', 'node_t *doc_node_root(',
+        'static void detach(', 'void doc_parser_form_set(', 'static void reset_parser_forms('))
+    cases = r'''
+static void insert(node_t*p,node_t*n,node_t*before){
+    n->parent=p;n->next=before;n->prev=before?before->prev:p->last;
+    if(n->prev)n->prev->next=n;else p->first=n;
+    if(before)before->prev=n;else p->last=n;
+    if(n->type==N_ELEM)indices(p,n);
+}
+static bool positions(node_t*p){int index=0;for(node_t*n=p->first;n;n=n->next)if(n->type==N_ELEM&&n->elem_index!=++index)return false;return true;}
+int main(void){
+    web_doc d={.profile_enabled=true};node_t parent={.owner=&d,.type=N_ELEM};
+    enum {COUNT=10000};node_t *items=calloc(COUNT,sizeof *items);
+    for(int i=0;i<COUNT;i++){items[i].owner=&d;items[i].type=N_ELEM;insert(&parent,&items[i],NULL);}
+    check(positions(&parent)&&items[COUNT-1].elem_index==COUNT,"append positions remain exact");
+    check(d.profile.index_visits==2*COUNT-1,"10000 appends visit only current element and preceding element");
+    node_t text={.owner=&d,.type=N_TEXT},comment={.owner=&d,.type=N_COMMENT};
+    uint64_t visits=d.profile.index_visits;
+    insert(&parent,&text,&items[COUNT/2]);insert(&parent,&comment,&items[COUNT/2]);
+    check(d.profile.index_visits==visits&&positions(&parent),"text and comment insertion do not renumber elements");
+    node_t middle={.owner=&d,.type=N_ELEM};
+    insert(&parent,&middle,&items[COUNT/2]);
+    check(middle.elem_index==COUNT/2+1&&items[COUNT/2].elem_index==COUNT/2+2&&positions(&parent),"middle insert skips mixed non-element siblings");
+    check(items[COUNT/2-1].elem_index==COUNT/2,"unaffected prefix retains parser-published positions");
+    visits=d.profile.index_visits;detach(&text);detach(&comment);
+    check(d.profile.index_visits==visits&&positions(&parent),"text and comment removal do not renumber elements");
+    detach(&middle);check(!middle.parent&&middle.elem_index==0&&positions(&parent),"element removal clears detached position and repairs suffix");
+    visits=d.profile.index_visits;detach(&items[COUNT-1]);
+    check(d.profile.index_visits==visits&&positions(&parent),"last element removal does not visit the prefix");
+    detach(&items[COUNT/2]);insert(&parent,&items[COUNT/2],parent.first);
+    check(items[COUNT/2].elem_index==1&&positions(&parent),"same-parent reorder keeps all positions coherent");
+    node_t fragment={.owner=&d,.type=N_FRAGMENT};
+    detach(&items[0]);detach(&items[1]);insert(&fragment,&items[0],NULL);insert(&fragment,&text,NULL);insert(&fragment,&items[1],NULL);
+    while(fragment.first){node_t*n=fragment.first;detach(n);insert(&parent,n,NULL);check(positions(&fragment)&&positions(&parent),"mixed fragment child transfer preserves positions at each boundary");}
+    /* Parser form associations only: source list and actual reset/unlink code. */
+    node_t document={.owner=&d,.type=N_DOC},form={.owner=&d,.type=N_ELEM,.tag=T_form};
+    node_t otherform={.owner=&d,.type=N_ELEM,.tag=T_form},outside={.owner=&d,.type=N_ELEM,.tag=T_input};
+    node_t retained={.owner=&d,.type=N_ELEM,.tag=T_input},moved={.owner=&d,.type=N_ELEM,.tag=T_div};
+    node_t control={.owner=&d,.type=N_ELEM,.tag=T_input};
+    insert(&document,&form,NULL);insert(&document,&otherform,NULL);insert(&document,&outside,NULL);insert(&otherform,&retained,NULL);insert(&moved,&control,NULL);
+    doc_parser_form_set(&outside,&form);doc_parser_form_set(&retained,&otherform);doc_parser_form_set(&control,&form);
+    reset_parser_forms(&moved);
+    check(!control.parser_form_owner&&!control.parser_form_next,"moved subtree control association resets");
+    check(outside.parser_form_owner==&form&&retained.parser_form_owner==&otherform,"unrelated connected parser controls retain associations");
+    detach(&form);reset_parser_forms(&form);
+    check(!outside.parser_form_owner&&retained.parser_form_owner==&otherform,"leaf form removal resets outside foster-parented control only");
+    node_t leaf={.owner=&d,.type=N_ELEM,.tag=T_div};unsigned oldnotices=notices;
+    reset_parser_forms(&leaf);check(notices==oldnotices&&retained.parser_form_owner==&otherform,"ordinary leaf insertion leaves unrelated association alone");
+    web_doc inert={.template_owner=true};d.template_doc=&inert;
+    node_t templ={.owner=&d,.type=N_ELEM,.tag=T_template},content={.owner=&inert,.type=N_FRAGMENT,.template_host=&templ};
+    node_t inertform={.owner=&inert,.type=N_ELEM,.tag=T_form},inertcontrol={.owner=&inert,.type=N_ELEM,.tag=T_input};
+    templ.template_content=&content;insert(&content,&inertform,NULL);insert(&inertform,&inertcontrol,NULL);doc_parser_form_set(&inertcontrol,&inertform);
+    reset_parser_forms(&templ);check(!inertcontrol.parser_form_owner&&!inert.parser_form_nodes,"template descendants reset through their own inert registration list");
+    node_t host={.owner=&d,.type=N_ELEM},shadow={.owner=&d,.type=N_FRAGMENT,.shadow_host=&host},shadowform={.owner=&d,.type=N_ELEM,.tag=T_form},shadowcontrol={.owner=&d,.type=N_ELEM,.tag=T_input};
+    host.shadow_root=&shadow;insert(&shadow,&shadowform,NULL);insert(&shadowform,&shadowcontrol,NULL);doc_parser_form_set(&shadowcontrol,&shadowform);
+    reset_parser_forms(&host);check(!shadowcontrol.parser_form_owner&&retained.parser_form_owner==&otherform,"shadow forest descendants reset without clearing unrelated control");
+    node_t bulk={.owner=&d,.type=N_ELEM},bulkform={.owner=&d,.type=N_ELEM,.tag=T_form};
+    node_t *controls=calloc(COUNT,sizeof *controls);insert(&bulk,&bulkform,NULL);
+    for(int i=0;i<COUNT;i++){controls[i].owner=&d;controls[i].type=N_ELEM;controls[i].tag=T_input;insert(&bulkform,&controls[i],NULL);doc_parser_form_set(&controls[i],&bulkform);}
+    oldnotices=notices;reset_parser_forms(&bulk);
+    check(notices-oldnotices==COUNT&&d.parser_form_nodes==&retained,"10000 related registrations unlink once each and preserve unrelated tail");
+    check(!controls[0].parser_form_owner&&!controls[COUNT-1].parser_form_next,"first and last reset associations both clear");
+    printf("DOM localized indices/forms: %u checks, %u failed; append index visits=%u\n",checks,failed,2*COUNT-1);
+    free(controls);free(items);return failed?1:0;
+}
+'''
+    out = Path('build/goal-20261009/dom-indices-host.c')
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(prefix+product+cases,encoding='utf-8',newline='\n')
+    exe='build/goal-20261009/dom-indices-host.exe'
+    subprocess.run(['tools/msys64/ucrt64/bin/clang.exe','-std=gnu11','-O2',str(out),'-o',exe],check=True)
+    subprocess.run([exe],check=True)
+    sys.exit(0)
 
 prefix = r'''
 #include <stdio.h>

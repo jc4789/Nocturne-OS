@@ -19,6 +19,19 @@ CSSOM `PutForwards=cssText` を実装するために利用した。
 
 上流の著作権・ライセンスは変更しない。
 
+## modulepreload の構文解析と依存解決の分離
+
+上流の `JS_EVAL_FLAG_COMPILE_ONLY` は module の依存も同期で解決するため、
+未使用の preload から依存取得を開始し、HTML の root preload 完了を待たせていた。
+`JS_EVAL_FLAG_MODULE_PARSE_ONLY` を局所追加し、module と compile-only の両方を
+指定した場合だけ root の構文解析で返す。他の eval の動作は変更しない。
+
+ブラウザーの module map が返された module 参照を保持し、実際に import／script が
+必要になった時点で既存 `JS_ResolveModule` を呼ぶ。preload だけでは作者コードを
+評価せず、必要になった取得中の依存はネイティブ要求へ join する。root の構文エラー、
+後の依存解決エラー、URL／redirect base、文書破棄時の参照解放はブラウザー側が扱う。
+関連する限定回帰は `tests/jstest.c` の `modulepreload` 条件群。
+
 ## RegExp の旧式静的キャプチャー
 
 実 Baidu の公開 ESL loader が `extReg.test(source)` の直後に

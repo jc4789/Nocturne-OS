@@ -34,6 +34,7 @@ static uint64_t uptime_ms(void){return 100;}
 struct net_stream {int unused;};
 net_stream *ns_open(const char*a,uint16_t b,bool c,int d,char*e,size_t f){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;return NULL;}
 long ns_write(net_stream*a,const void*b,size_t c){(void)a;(void)b;(void)c;return -1;}
+net_stream *ns_open_timed(const char *h,uint16_t p,bool tls,int t,char *e,size_t n,struct http_transport_timing *m){memset(m,0,sizeof *m);return ns_open(h,p,tls,t,e,n);}
 long ns_read(net_stream*a,void*b,size_t c){(void)a;(void)b;(void)c;return -1;}
 const char *ns_error(net_stream*a){(void)a;return "unused stream";}
 void ns_close(net_stream*a){(void)a;}

@@ -1,0 +1,15 @@
+# DOM挿入・削除の局所更新：別境界からの第二考察
+
+## 反例による確認
+
+1. 前方の `elem_index` が正しくなければ後方の再番号付けも壊れる。通常DOM挿入・削除では常に変更後続を更新し、Lexbor bridgeはリンクのcommit時にそのparentのelement位置をまとめて公開する既存境界を保っている。parserの途中から未公開prefixを流用する処理は追加していない。clone/fragment/同parent移動も通常の挿入経路を通る。
+2. 非要素の追加・削除はchildNodes/MutationObserver/Rangeの変化を止めてはいけない。変更したのはCSSの要素兄弟位置の再番号付けだけであり、html bridge通知、detach、resource・geometry invalidation、JS寿命公開は既存のままである。`:nth-child` のcached位置消費は `css.c`、他の構造selector経路を置き換えていない。
+3. form自体に子が無くても外部foster-parented controlを所有できるため、一般leafの早期終了からformを明示的に除外した。移動controlの祖先判定だけではこの反例を処理できないので、既存のordinary-root分離判定を保全した。
+4. 登録listの現在linkから解除することで、先頭・末尾・連続する複数解除で次候補を落とさず、解除済nodeのnext/ownerを残さない。parserへのfield変更通知も従来と同じ解除nodeに発行する。templateのallocation ownerと主documentの登録listを混同しない。
+
+## 残る境界
+
+- 中間・先頭への大量挿入は、実際に変化する後続要素位置を更新するため依然として線形処理が必要。10000追加を示したhost訪問数を、すべてのDOM編集や実サイトの同倍率高速化へ拡大して解釈しない。
+- 長いprefix末尾にText/Commentが続く場合、直前のelementを見つける後方走査は残る。新parent要素数ABIや遅延位置公開を導入していない。
+- parser associationが多い文書の非leaf移動では登録control群の祖先/root照合が残る。表示・フォーム意味を保つための境界であり、不要な全DOM走査と解除ごとのlist再検索だけを除去した。
+- 関連hook、MutationObserver、custom element反応、Rangeの実製品統合は今回のhost shimの外。主担当のnative DOM群と同条件の実サイトを受入境界にする。未測定のロード・scroll性能を改善済みとはしない。

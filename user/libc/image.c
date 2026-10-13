@@ -382,6 +382,22 @@ void image_draw(canvas_t *c, const image_t *img, int x, int y) {
 
     int width = (int)(x1 - x0);
     size_t sx = (size_t)(x0 - (int64_t)x);
+    if(c->mask_clip) {
+        /* Browser rounded/ancestor clips are immutable borrowed A8 geometry.
+           Keep the original direct-row path unchanged when no mask is active. */
+        for(int py=(int)y0;py<(int)y1;py++) {
+            struct gfx_clip_span span;if(!gfx_clip_row(c,py,(int)x0,(int)x1,&span))continue;
+            const uint32_t *src=img->px+(size_t)((int64_t)py-y)*img->w+sx;
+            for(int px=span.x0;px<span.opaque0;px++)gfx_blend_pixel(c,px,py,src[px-(int)x0]);
+            uint32_t *dst=c->px+(size_t)py*c->pitch;
+            for(int px=span.opaque0;px<span.opaque1;px++) {
+                uint32_t p=src[px-(int)x0],a=p>>24;
+                if(a==255)dst[px]=p;else if(a)dst[px]=gfx_mix(dst[px],p,(int)a);
+            }
+            for(int px=span.opaque1;px<span.x1;px++)gfx_blend_pixel(c,px,py,src[px-(int)x0]);
+        }
+        return;
+    }
     for (int py = (int)y0; py < (int)y1; py++) {
         const uint32_t *src = img->px + (size_t)((int64_t)py - y) * img->w + sx;
         uint32_t *dst = c->px + (size_t)py * c->pitch + (size_t)x0;

@@ -10,10 +10,12 @@ void gfx_init(canvas_t *c, uint32_t *px, int w, int h, int pitch) {
     c->w = w;
     c->h = h;
     c->pitch = pitch;
+    c->mask_clip = NULL;
     gfx_noclip(c);
 }
 
 void gfx_noclip(canvas_t *c) {
+    c->mask_clip = NULL;
     c->cx0 = 0;
     c->cy0 = 0;
     c->cx1 = c->w;
@@ -39,15 +41,48 @@ static inline int clip_rect(const canvas_t *c, int *x, int *y, int *w, int *h) {
     *x = x0; *y = y0; *w = x1 - x0; *h = y1 - y0;
     return 1;
 }
+uint8_t gfx_clip_alpha(const canvas_t *c,int x,int y) {
+    unsigned alpha=255;
+    for(const struct gfx_mask_clip *mask=c->mask_clip;mask;mask=mask->next) {
+        int64_t dx=(int64_t)x-mask->x,dy=(int64_t)y-mask->y;
+        if(dx<0||dy<0||dx>=mask->w||dy>=mask->h||!mask->alpha)return 0;
+        alpha=(alpha*mask->alpha[(size_t)dy*mask->pitch+(size_t)dx]+127)/255;
+        if(!alpha)return 0;
+    }
+    return (uint8_t)alpha;
+}
+int gfx_clip_row(const canvas_t *c,int y,int x0,int x1,struct gfx_clip_span *out) {
+    if(y<c->cy0||y>=c->cy1)return 0;
+    int64_t left=x0>c->cx0?x0:c->cx0,right=x1<c->cx1?x1:c->cx1;
+    int64_t solid_left=left,solid_right=right;int solid=1;
+    for(const struct gfx_mask_clip *mask=c->mask_clip;mask;mask=mask->next) {
+        int64_t row=(int64_t)y-mask->y;
+        if(row<0||row>=mask->h||mask->w<=0||!mask->alpha)return 0;
+        if(left<mask->x)left=mask->x;
+        int64_t end=(int64_t)mask->x+mask->w;if(right>end)right=end;
+        if(mask->opaque) {
+            const struct gfx_mask_span *span=&mask->opaque[row];
+            int64_t a=(int64_t)mask->x+span->x0,b=(int64_t)mask->x+span->x1;
+            if(solid_left<a)solid_left=a;if(solid_right>b)solid_right=b;
+        }else solid=0; /* unknown arbitrary masks retain exact pixel fallback */
+    }
+    if(right<=left)return 0;
+    if(solid_left<left)solid_left=left;if(solid_right>right)solid_right=right;
+    if(!solid||solid_right<=solid_left)solid_left=solid_right=left;
+    out->x0=(int)left;out->x1=(int)right;out->opaque0=(int)solid_left;out->opaque1=(int)solid_right;
+    return 1;
+}
 
 void gfx_pixel(canvas_t *c, int x, int y, uint32_t col) {
     if (x < c->cx0 || y < c->cy0 || x >= c->cx1 || y >= c->cy1) return;
+    if(c->mask_clip){unsigned a=gfx_clip_alpha(c,x,y);if(a<255){if(a){uint32_t *p=&c->px[y*c->pitch+x];*p=gfx_mix(*p,col,a);}return;}}
     c->px[y * c->pitch + x] = col;
 }
 
 void gfx_blend_pixel(canvas_t *c, int x, int y, uint32_t argb) {
     if (x < c->cx0 || y < c->cy0 || x >= c->cx1 || y >= c->cy1) return;
     uint32_t a = argb >> 24;
+    if(c->mask_clip)a=(a*gfx_clip_alpha(c,x,y)+127)/255;
     uint32_t *p = &c->px[y * c->pitch + x];
     if (a == 255) *p = argb;
     else if (a) *p = gfx_mix(*p, argb, a);
@@ -55,6 +90,15 @@ void gfx_blend_pixel(canvas_t *c, int x, int y, uint32_t argb) {
 
 void gfx_fill(canvas_t *c, int x, int y, int w, int h, uint32_t col) {
     if (!clip_rect(c, &x, &y, &w, &h)) return;
+    if(c->mask_clip){
+        for(int j=0;j<h;j++) {
+            struct gfx_clip_span span;if(!gfx_clip_row(c,y+j,x,x+w,&span))continue;
+            for(int i=span.x0;i<span.opaque0;i++)gfx_pixel(c,i,y+j,col);
+            uint32_t *row=c->px+(size_t)(y+j)*c->pitch;
+            for(int i=span.opaque0;i<span.opaque1;i++)row[i]=col;
+            for(int i=span.opaque1;i<span.x1;i++)gfx_pixel(c,i,y+j,col);
+        }return;
+    }
     for (int j = 0; j < h; j++) {
         uint32_t *row = &c->px[(y + j) * c->pitch + x];
         for (int i = 0; i < w; i++) row[i] = col;
@@ -66,6 +110,15 @@ void gfx_fill_blend(canvas_t *c, int x, int y, int w, int h, uint32_t argb) {
     if (a == 255) { gfx_fill(c, x, y, w, h, argb); return; }
     if (a == 0) return;
     if (!clip_rect(c, &x, &y, &w, &h)) return;
+    if(c->mask_clip){
+        for(int j=0;j<h;j++) {
+            struct gfx_clip_span span;if(!gfx_clip_row(c,y+j,x,x+w,&span))continue;
+            for(int i=span.x0;i<span.opaque0;i++)gfx_blend_pixel(c,i,y+j,argb);
+            uint32_t *row=c->px+(size_t)(y+j)*c->pitch;
+            for(int i=span.opaque0;i<span.opaque1;i++)row[i]=gfx_mix(row[i],argb,a);
+            for(int i=span.opaque1;i<span.x1;i++)gfx_blend_pixel(c,i,y+j,argb);
+        }return;
+    }
     for (int j = 0; j < h; j++) {
         uint32_t *row = &c->px[(y + j) * c->pitch + x];
         for (int i = 0; i < w; i++) row[i] = gfx_mix(row[i], argb, a);
@@ -148,6 +201,15 @@ void gfx_blit(canvas_t *dst, int dx, int dy, const canvas_t *src, int sx, int sy
     if (sx + w > src->w) w = src->w - sx;
     if (sy + h > src->h) h = src->h - sy;
     if (w <= 0 || h <= 0) return;
+    if(dst->mask_clip){
+        for(int j=0;j<h;j++) {
+            struct gfx_clip_span span;if(!gfx_clip_row(dst,dy+j,dx,dx+w,&span))continue;
+            const uint32_t *row=src->px+(size_t)(sy+j)*src->pitch+sx;
+            for(int i=span.x0;i<span.opaque0;i++)gfx_pixel(dst,i,dy+j,row[i-dx]);
+            memcpy(dst->px+(size_t)(dy+j)*dst->pitch+span.opaque0,row+span.opaque0-dx,(size_t)(span.opaque1-span.opaque0)*sizeof *row);
+            for(int i=span.opaque1;i<span.x1;i++)gfx_pixel(dst,i,dy+j,row[i-dx]);
+        }return;
+    }
     for (int j = 0; j < h; j++) {
         memcpy(&dst->px[(dy + j) * dst->pitch + dx], &src->px[(sy + j) * src->pitch + sx], (size_t)w * 4);
     }
@@ -162,6 +224,19 @@ void gfx_blit_alpha(canvas_t *dst, int dx, int dy, const canvas_t *src, int sx, 
     if (sy < 0) { dy -= sy; h += sy; sy = 0; }
     if (sx + w > src->w) w = src->w - sx;
     if (sy + h > src->h) h = src->h - sy;
+    if(dst->mask_clip){
+        for(int j=0;j<h;j++) {
+            struct gfx_clip_span span;if(!gfx_clip_row(dst,dy+j,dx,dx+w,&span))continue;
+            const uint32_t *row=src->px+(size_t)(sy+j)*src->pitch+sx;
+            for(int i=span.x0;i<span.opaque0;i++)gfx_blend_pixel(dst,i,dy+j,row[i-dx]);
+            uint32_t *d=dst->px+(size_t)(dy+j)*dst->pitch;
+            for(int i=span.opaque0;i<span.opaque1;i++) {
+                uint32_t pixel=row[i-dx],a=pixel>>24;
+                if(a==255)d[i]=pixel;else if(a)d[i]=gfx_mix(d[i],pixel,a);
+            }
+            for(int i=span.opaque1;i<span.x1;i++)gfx_blend_pixel(dst,i,dy+j,row[i-dx]);
+        }return;
+    }
     for (int j = 0; j < h; j++) {
         uint32_t *d = &dst->px[(dy + j) * dst->pitch + dx];
         const uint32_t *s = &src->px[(sy + j) * src->pitch + sx];
@@ -252,8 +327,8 @@ int gfx_char(canvas_t *c, int x, int y, uint32_t cp, uint32_t fg, uint32_t bg, i
         for (int i = 0; i < fw; i++) {
             int xx = x + i;
             if (xx < c->cx0 || xx >= c->cx1) continue;
-            if (bits & (0x8000u >> (i / scale))) row[xx] = fg;
-            else if (bgop) row[xx] = bg;
+            if (bits & (0x8000u >> (i / scale))) {if(c->mask_clip)gfx_pixel(c,xx,yy,fg);else row[xx] = fg;}
+            else if (bgop) {if(c->mask_clip)gfx_pixel(c,xx,yy,bg);else row[xx] = bg;}
         }
     }
     return fw;

@@ -36,6 +36,8 @@ struct job {
     const char *hop_method;
     bool debug_request_measured, debug_cookie, debug_content_length;
     uint64_t debug_header_bytes, debug_ctl, debug_non_ascii;
+    struct http_transport_timing debug_timing;
+    unsigned debug_attempts;
 };
 static bool read_all(int fd, void *p, size_t n) {
     while (n) {
@@ -383,6 +385,12 @@ static bool prepare_outgoing(struct job *j, const char *current, const char *met
     if ((cors_kind(j) || j->wire.kind==WEBNET_REPORT || (no_cors(j) && strcmp(method,"GET") && strcmp(method,"HEAD"))) && !(header_text(j, &j->outgoing, "Origin: ") &&
         header_text(j, &j->outgoing, no_cors(j) && (j->wire.user_navigation & WEBNET_WIRE_NO_REFERRER)?"null":request_origin(j)) && header_text(j, &j->outgoing, "\r\n"))) return false;
     if (!cache_headers(j)) return false;
+    /* Fetch's network layer owns content-coding negotiation, after author
+       headers have been classified for CORS. Advertise only our real decoder;
+       byte ranges must keep their representation offsets (Fetch step 19). */
+    if (!field_exists(j->headers,"Accept-Encoding") &&
+        !header_text(j,&j->outgoing,field_exists(j->headers,"Range") ?
+            "Accept-Encoding: identity\r\n" : "Accept-Encoding: gzip\r\n")) return false;
     j->hop_cookies = j->wire.credentials == WEBNET_CREDENTIALS_INCLUDE ||
         (j->wire.credentials == WEBNET_CREDENTIALS_SAME_ORIGIN && !cross && !j->cors_tainted);
     if (j->hop_cookies) {
@@ -794,7 +802,16 @@ static bool run_http(struct job *j) {
         size_t cookie_start=j->cookie_len; j->cookie_start = cookie_start; j->stream_final = false; j->hop_method = method;
         size_t body_limit = webnet_wire_response_limit(j->wire.kind, j->wire.user_navigation);
         const struct http_stream_hooks hooks = {response_start, stream_upload};
-        int result = http_request_stream(&q, &r, body_limit, &hooks);
+        struct http_transport_timing timing={0};
+        bool timed=(j->wire.user_navigation&WEBNET_WIRE_DEBUG_REQUEST)!=0;
+        int result = timed?http_request_stream_timed(&q,&r,body_limit,&hooks,&timing):
+            http_request_stream(&q, &r, body_limit, &hooks);
+        if(timed){
+            j->debug_attempts++;j->debug_timing.phase=timing.phase;
+            j->debug_timing.resolve_ms+=timing.resolve_ms;j->debug_timing.connect_ms+=timing.connect_ms;
+            j->debug_timing.tls_ms+=timing.tls_ms;j->debug_timing.first_header_ms+=timing.first_header_ms;
+            j->debug_timing.header_ms+=timing.header_ms;j->debug_timing.body_ms+=timing.body_ms;
+        }
         /* A transport reset before any response is not an HTTP rejection.
            Replay only bodyless idempotent reads, once, within the same native
            deadline. Never retry published stream data, cookies, POST or 4xx. */
@@ -805,7 +822,14 @@ static bool run_http(struct job *j) {
             int retry_left=remaining(j);
             if(retry_left) {
                 http_resp_free(&r);q.timeout_ms=retry_left;
-                result=http_request_stream(&q,&r,body_limit,&hooks);
+                result=timed?http_request_stream_timed(&q,&r,body_limit,&hooks,&timing):
+                    http_request_stream(&q,&r,body_limit,&hooks);
+                if(timed){
+                    j->debug_attempts++;j->debug_timing.phase=timing.phase;
+                    j->debug_timing.resolve_ms+=timing.resolve_ms;j->debug_timing.connect_ms+=timing.connect_ms;
+                    j->debug_timing.tls_ms+=timing.tls_ms;j->debug_timing.first_header_ms+=timing.first_header_ms;
+                    j->debug_timing.header_ms+=timing.header_ms;j->debug_timing.body_ms+=timing.body_ms;
+                }
             }
         }
         if (result < 0) { j->cookie_len=j->stream_headers_sent?0:cookie_start; if (!j->error[0]) fail(j, r.error); http_resp_free(&r); return false; }
@@ -888,7 +912,8 @@ int main(void) {
         (w->kind != WEBNET_FETCH && (WEBNET_WIRE_CACHE_MODE(w->user_navigation) != WEBNET_CACHE_DEFAULT || (w->user_navigation & (WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER)))) ||
         ((w->user_navigation & WEBNET_WIRE_NO_CORS) && (w->user_navigation & (WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_FORCE_PREFLIGHT))) ||
         ((w->user_navigation & WEBNET_WIRE_DEBUG_REQUEST) &&
-         (w->kind != WEBNET_RESOURCE || !(w->user_navigation & WEBNET_WIRE_STATUS_LINE))) ||
+         ((w->kind != WEBNET_RESOURCE && w->kind != WEBNET_CLASSIC && w->kind != WEBNET_MODULE &&
+           w->kind != WEBNET_NAVIGATION) || !(w->user_navigation & WEBNET_WIRE_STATUS_LINE))) ||
         ((w->user_navigation & WEBNET_WIRE_STREAM) && w->kind != WEBNET_FETCH)) { free(j); return 1; }
     j->url = read_string(w->url_len, false); j->document = read_string(w->origin_len, false);
     j->method = read_string(w->method_len, false); j->headers = read_string(w->headers_len, false);
@@ -934,6 +959,21 @@ int main(void) {
     if (j->error[0]) {
         free(j->body); j->body = NULL; j->body_len = 0; j->status = 0;
         free(j->response_headers); j->response_headers = NULL; j->response_headers_len = 0;
+    }
+    if((w->user_navigation&WEBNET_WIRE_DEBUG_REQUEST)&&j->debug_attempts) {
+        char line[384];
+        int length=snprintf(line,sizeof line,
+            "\r\nHTTP/Nocturne-Transport phase=%u attempts=%u resolve=%lu connect=%lu tls=%lu first_header=%lu headers=%lu body=%lu\r\n",
+            (unsigned)j->debug_timing.phase,j->debug_attempts,(unsigned long)j->debug_timing.resolve_ms,
+            (unsigned long)j->debug_timing.connect_ms,(unsigned long)j->debug_timing.tls_ms,
+            (unsigned long)j->debug_timing.first_header_ms,(unsigned long)j->debug_timing.header_ms,
+            (unsigned long)j->debug_timing.body_ms);
+        size_t old=j->response_headers_len;
+        if(length>0&&(size_t)length<sizeof line&&old<=SIZE_MAX-(size_t)length-1) {
+            char *grown=realloc(j->response_headers,old+(size_t)length+1);
+            if(grown){j->response_headers=grown;memcpy(grown+old,line,(size_t)length+1);
+                j->response_headers_len=old+(size_t)length;}
+        }
     }
     struct webnet_wire_response out = {0};
     bool streaming = (w->user_navigation & WEBNET_WIRE_STREAM) != 0;

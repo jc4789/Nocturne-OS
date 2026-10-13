@@ -76,6 +76,9 @@ struct web_frame *web_frame_ensure(web_doc *d,node_t *n) {
     if(f)return f;
     if(!d || !web_frame_element(n))return NULL;
     f=calloc(1,sizeof *f);if(!f)return NULL;
+    const char *name=node_attr(n,"name");if(!name)name="";
+    f->target_name=strdup(name);f->name_attribute=strdup(name);
+    if(!f->target_name || !f->name_attribute){free(f->target_name);free(f->name_attribute);free(f);return NULL;}
     f->owner=d;f->element=n;f->dom_order=UINT32_MAX;f->next=d->frames;d->frames=f;
     return f;
 }
@@ -147,6 +150,7 @@ bool web_frame_commit_response(struct web_frame *f,const char *html,size_t n,con
     if(!made)return false;
     made->frame_container=f;
     web_frame_retire(f);f->document=made;f->failed=false;f->initial_failed=false;f->detached=false;f->notified=false;f->paint_failed=false;
+    web_frames_commit_viewports(parent);
     parent->dirty=true;return true;
 }
 /* Opaque origins and same-origin ancestor authored realms are deliberately
@@ -269,7 +273,7 @@ void web_frames_free(web_doc *d) {
             struct web_frame *f=current->frames;current->frames=f->next;
             if(f->document){f->document->frame_free_next=pending;pending=f->document;}
             while(f->retired){web_doc *old=f->retired;f->retired=old->frame_retired_next;old->frame_free_next=pending;pending=old;}
-            free(f->paint.px);free(f->source);free(f->srcdoc);free(f->navigation);free(f->navigation_origin);free(f->sandbox);free(f);
+            free(f->paint.px);free(f->source);free(f->srcdoc);free(f->navigation);free(f->navigation_origin);free(f->sandbox);free(f->target_name);free(f->name_attribute);free(f);
         }
         if(current!=d){current->frame_free_next=finished;finished=current;}
     }
@@ -277,18 +281,33 @@ void web_frames_free(web_doc *d) {
      * its realm/cache finalizers have completed. All frame lists are empty. */
     while(finished){web_doc *old=finished;finished=old->frame_free_next;old->frame_free_next=NULL;web_free(old);}
 }
+static bool frame_viewport_commit(struct web_frame *f) {
+    box_t *b=f->element?f->element->box:NULL;
+    if(!f->document || !f->document->live || f->detached || !f->owner ||
+       !f->owner->layout_valid || f->owner->need_style || f->owner->need_boxes ||
+       !b || !b->st || b->st->display==D_NONE ||
+       !isfinite(b->w) || !isfinite(b->h) || b->w<0.5f || b->h<0.5f ||
+       (double)b->w>(double)INT_MAX-1 || (double)b->h>(double)INT_MAX-1)return false;
+    f->viewport_w=(int)roundf(b->w);f->viewport_h=(int)roundf(b->h);
+    f->document->view_x=f->scroll_x;f->document->view_y=f->scroll_y;
+    doc_viewport_update(f->document,f->viewport_w,f->viewport_h);
+    return true;
+}
+void web_frames_commit_viewports(web_doc *d) {
+    /* Only direct child viewports depend on these committed content boxes.
+       Descendant layouts are still flushed iteratively by their own owners. */
+    for(struct web_frame *f=d?d->frames:NULL;f;f=f->next)frame_viewport_commit(f);
+}
 static bool frame_surface_prepare(struct web_frame *f) {
     box_t *b=f->element?f->element->box:NULL;
     /* An old publication must not be overwritten by gfx_init (or reused after
        the element becomes unrendered). Ownership is independent of the crop. */
     free(f->paint.px);memset(&f->paint,0,sizeof f->paint);f->paint_visible=false;
-    if(!f->document || f->detached || !b || !b->st || b->st->display==D_NONE ||
+    if(!frame_viewport_commit(f) || !b || !b->st ||
        b->st->visibility || b->st->content_visibility==CV_HIDDEN ||
        !isfinite(b->w) || !isfinite(b->h) || b->w<0.5f || b->h<0.5f ||
        (double)b->w>(double)INT_MAX-1 || (double)b->h>(double)INT_MAX-1)return false;
-    int w=(int)roundf(b->w),h=(int)roundf(b->h);
-    f->viewport_w=w;f->viewport_h=h;
-    f->document->view_x=f->scroll_x;f->document->view_y=f->scroll_y;
+    int w=f->viewport_w,h=f->viewport_h;
     web_layout(f->document,w,h);
     web_doc *owner=f->owner;struct web_frame *container=owner->frame_container;
     double left=owner->view_x,top=owner->view_y;
@@ -366,7 +385,7 @@ bool web_frame_paint(node_t *n,canvas_t *c,int x,int y,int w,int h) {
 }
 static web_doc *named_frame(web_doc *d,const char *name) {
     for(struct web_frame *f=d?d->frames:NULL;f;f=web_frame_walk_next(d,f,true))if(f->document && !f->detached){
-        const char *own=node_attr(f->element,"name");if(own && !strcmp(own,name))return f->document;
+        const char *own=f->target_name;if(own && !strcmp(own,name))return f->document;
     }
     return NULL;
 }

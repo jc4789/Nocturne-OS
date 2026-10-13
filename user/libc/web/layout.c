@@ -76,6 +76,105 @@ static font_t *wf_face(const wfont *f,uint32_t cp) {
     return f->ttf;
 }
 
+/* ---------------------------------------------------------------- grapheme boundaries */
+#include "unicode_grapheme_data.h"
+
+static uint8_t wf_grapheme_properties(uint32_t cp) {
+    /* ASCII の通常textは UCD の探索や allocation を必要としない。 */
+    if (cp < 0x80) {
+        if (cp == '\r') return WF_GCB_CR;
+        if (cp == '\n') return WF_GCB_LF;
+        return cp < 0x20 || cp == 0x7F ? WF_GCB_CONTROL : WF_GCB_OTHER;
+    }
+    if (cp >= 0xAC00 && cp <= 0xD7A3)
+        return (cp - 0xAC00) % 28 ? WF_GCB_LVT : WF_GCB_LV;
+    size_t lo = 0, hi = sizeof(wf_grapheme_ranges) / sizeof(*wf_grapheme_ranges);
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (cp > wf_grapheme_ranges[mid].last) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < sizeof(wf_grapheme_ranges) / sizeof(*wf_grapheme_ranges) &&
+        cp >= wf_grapheme_ranges[lo].first ? wf_grapheme_ranges[lo].properties : WF_GCB_OTHER;
+}
+
+size_t wf_grapheme_decode(const char *s, size_t n, uint32_t *cp) {
+    if (!n) return 0;
+    const uint8_t *p = (const uint8_t *)s;
+    if (p[0] < 0x80) { *cp = p[0]; return 1; }
+    unsigned length;
+    uint32_t value, minimum;
+    if (p[0] >= 0xC2 && p[0] <= 0xDF) { length = 2; value = p[0] & 31; minimum = 0x80; }
+    else if (p[0] >= 0xE0 && p[0] <= 0xEF) { length = 3; value = p[0] & 15; minimum = 0x800; }
+    else if (p[0] >= 0xF0 && p[0] <= 0xF4) { length = 4; value = p[0] & 7; minimum = 0x10000; }
+    else goto malformed;
+    if (length > n) goto malformed;
+    for (unsigned i = 1; i < length; ++i) {
+        if ((p[i] & 0xC0) != 0x80) goto malformed;
+        value = (value << 6) | (p[i] & 63);
+    }
+    if (value < minimum || value > 0x10FFFF || (value >= 0xD800 && value <= 0xDFFF)) goto malformed;
+    *cp = value;
+    return length;
+malformed:
+    *cp = 0xFFFD;
+    return 1;
+}
+
+bool wf_grapheme_break(wf_grapheme_state *state, uint32_t cp) {
+    uint8_t properties = wf_grapheme_properties(cp);
+    uint8_t current = properties & 15, previous = state->previous;
+    uint8_t incb = properties & 48;
+    bool boundary = true;
+    /* UAX #29 revision 49、extended GB1..GB999。規則の順序を保つ。 */
+    if (!state->have_previous) boundary = true;                                       /* GB1 */
+    else if (previous == WF_GCB_CR && current == WF_GCB_LF) boundary = false;           /* GB3 */
+    else if (previous == WF_GCB_CR || previous == WF_GCB_LF || previous == WF_GCB_CONTROL ||
+             current == WF_GCB_CR || current == WF_GCB_LF || current == WF_GCB_CONTROL) boundary = true; /* GB4/5 */
+    else if (previous == WF_GCB_L && (current == WF_GCB_L || current == WF_GCB_V ||
+             current == WF_GCB_LV || current == WF_GCB_LVT)) boundary = false;          /* GB6 */
+    else if ((previous == WF_GCB_LV || previous == WF_GCB_V) &&
+             (current == WF_GCB_V || current == WF_GCB_T)) boundary = false;            /* GB7 */
+    else if ((previous == WF_GCB_LVT || previous == WF_GCB_T) && current == WF_GCB_T) boundary = false; /* GB8 */
+    else if (current == WF_GCB_EXTEND || current == WF_GCB_ZWJ || current == WF_GCB_SPACINGMARK) boundary = false; /* GB9/9a */
+    else if (previous == WF_GCB_PREPEND) boundary = false;                              /* GB9b */
+    else if (state->indic_linker && incb == WF_INCB_CONSONANT) boundary = false;         /* GB9c (18.0) */
+    else if (state->pictograph_zwj && (properties & WF_EXTENDED_PICTOGRAPHIC)) boundary = false; /* GB11 */
+    else if (previous == WF_GCB_REGIONAL_INDICATOR && current == WF_GCB_REGIONAL_INDICATOR &&
+             state->ri_odd) boundary = false;                                         /* GB12/13 */
+
+    state->pictograph_zwj = current == WF_GCB_ZWJ && state->pictograph_extend;
+    state->pictograph_extend = (properties & WF_EXTENDED_PICTOGRAPHIC) ||
+        (current == WF_GCB_EXTEND && state->pictograph_extend);
+    state->indic_linker = incb == WF_INCB_LINKER ||
+        (incb == WF_INCB_EXTEND && state->indic_linker);
+    state->ri_odd = current == WF_GCB_REGIONAL_INDICATOR &&
+        (previous != WF_GCB_REGIONAL_INDICATOR || !state->ri_odd);
+    state->previous = current;
+    state->have_previous = true;
+    return boundary;
+}
+
+size_t wf_grapheme_next(const char *s, size_t n, size_t at) {
+    if (at >= n) return n;
+    uint8_t first = (uint8_t)s[at];
+    if (first < 0x80) {
+        if (first == '\r' && n - at > 1 && s[at + 1] == '\n') return at + 2;
+        if (first < 0x20 || first == 0x7F || n - at == 1 || (uint8_t)s[at + 1] < 0x80)
+            return at + 1;
+    }
+    wf_grapheme_state state = {0};
+    uint32_t cp;
+    size_t length = wf_grapheme_decode(s + at, n - at, &cp);
+    wf_grapheme_break(&state, cp);
+    for (size_t next = at + length; next < n;) {
+        length = wf_grapheme_decode(s + next, n - next, &cp);
+        if (wf_grapheme_break(&state, cp)) return next;
+        next += length;
+    }
+    return n;
+}
+
 float wf_width(const wfont *f, const char *s, size_t n) {
     if (f->px < 1) return 0;
     if (f->ttf&&!f->choices) return font_width(f->ttf, f->px, s, n);
@@ -162,6 +261,11 @@ static float text_width_uncached(const style_t *st, const wfont *f, const char *
         }
     }
     return w;
+}
+
+float style_text_width(const style_t *st, const char *s, size_t n) {
+    wfont f = style_font(st);
+    return text_width_uncached(st, &f, s, n);
 }
 
 #include "layout_text_cache.h"
@@ -935,7 +1039,7 @@ static void add_deco(struct iline *L, box_t *ib, float x0, float x1, float basel
     wfont f = style_font(st);
     float asc, desc;
     wf_metrics(&f, &asc, &desc);
-    struct deco d;
+    struct deco d = {0};
     d.x = x0;
     d.w = x1 - x0;
     d.y = baseline - asc - ib->p[0] - ib->b[0];
@@ -1142,7 +1246,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
         if (L->first_bl < 0) L->first_bl = baseline;
         L->last_bl = baseline;
         L->first_line = false;
-        if (layout_current()->clamp_depth) {
+        if (layout_current()->clamp_depth || b->st->text_overflow == TO_ELLIPSIS) {
             struct line_fragment line = {first_run, (int)(L->runs.n / sizeof(struct run)),
                 first_deco, (int)(L->decos.n / sizeof(struct deco)),
                 L->y, L->y + lh, baseline, L->left, L->right};
@@ -1450,10 +1554,16 @@ static void block_width(box_t *c, float cw, float cbh) {
     } else {
         w = spec_w(c, &s->width, cw);
         if (w < 0) {
+            if(c->node && c->node->tag==T_button) {
+                /* HTML button layout's auto inline size is fit-content even
+                   for a block-level flex/grid button. */
+                w=clamp_w(c,stf_width(c,cw),cw);
+            } else {
             /* auto width fills the line; auto margins only matter if max-width made it narrower */
             float avail = cw - c->m[1] - c->m[3] - ext;
             w = clamp_w(c, avail, cw);
             if (w >= avail - 0.01f) mla = mra = false;
+            }
         } else w = clamp_w(c, w, cw);
     }
     float rem = cw - w - ext - c->m[1] - c->m[3];
@@ -1521,7 +1631,8 @@ static void layout_blocks(box_t *b, struct bfc *f, float ox, float oy, float cbh
             l -= ox;
             r -= ox;
             if (l > 0 || r < cw) {
-                if (len_auto(&c->st->width) && c->kind != B_ATOMIC && c->kind != B_TABLE) {
+                if (len_auto(&c->st->width) && c->kind != B_ATOMIC && c->kind != B_TABLE &&
+                    !(c->node&&c->node->tag==T_button)) {
                     c->w = clamp_w(c, r - l - hext(c) - c->m[1] - c->m[3], cw);
                     c->x = l + c->m[3] + c->b[3] + c->p[3];
                 } else if (c->x - c->m[3] - c->b[3] - c->p[3] < l) c->x = l + c->m[3] + c->b[3] + c->p[3];
@@ -1570,6 +1681,7 @@ struct tgrid {
     float *mn, *mx, *pct, *w;
     bool *fixed;
     float spacing;
+    pvec columns; /* flat-tree column declarations, borrowed immutable styles */
 };
 
 static void grid_free(struct tgrid *g) {
@@ -1581,6 +1693,41 @@ static void grid_free(struct tgrid *g) {
     free(g->pct);
     free(g->w);
     free(g->fixed);
+    pv_free(&g->columns);
+}
+static unsigned table_column_span(const node_t *n) {
+    /* HTML col/colgroup span is a positive integer limited by HTML to 1000.
+       CSS column boxes without an HTML span represent one column. */
+    if(!n || (n->tag!=T_col && n->tag!=T_colgroup))return 1;
+    const char *v=node_attr(n,"span");if(!v)return 1;
+    while(is_space((unsigned char)*v))v++;if(*v=='+')v++;
+    unsigned value=0;bool digit=false;
+    for(;*v>='0'&&*v<='9';v++){digit=true;if(value<=1000)value=value*10+(unsigned)(*v-'0');}
+    return !digit||!value?1:value>1000?1000:value;
+}
+static void table_columns(box_t *t,pvec *out) {
+    if(!t->node)return;
+    pvec children={0};doc_flat_children(t->node,&children);
+    for(int i=0;i<children.n;i++) {
+        node_t *n=children.v[i];if(!n->style)continue;
+        if(n->style->display==D_TABLE_COLUMN) {
+            for(unsigned j=0;j<table_column_span(n);j++)pv_push(out,(void *)n->style);
+        }else if(n->style->display==D_TABLE_COLUMN_GROUP) {
+            pvec cols={0};doc_flat_children(n,&cols);bool found=false;
+            for(int j=0;j<cols.n;j++) {
+                node_t *c=cols.v[j];if(!c->style || c->style->display!=D_TABLE_COLUMN)continue;
+                found=true;
+                const style_t *s=len_auto(&c->style->width)?n->style:c->style;
+                for(unsigned k=0;k<table_column_span(c);k++)pv_push(out,(void *)s);
+            }
+            if(!found)for(unsigned j=0;j<table_column_span(n);j++)pv_push(out,(void *)n->style);
+            pv_free(&cols);
+        }
+    }
+    pv_free(&children);
+}
+static bool table_fixed(const box_t *t) {
+    return t->st->table_layout && !len_auto(&t->st->width);
 }
 
 static void grid_build(box_t *t, struct tgrid *g) {
@@ -1646,6 +1793,8 @@ static void grid_build(box_t *t, struct tgrid *g) {
             if (busy[k] > 0) busy[k]--;
     }
     free(busy);
+    table_columns(t,&g->columns);
+    if(g->columns.n>maxc)maxc=g->columns.n;
     g->ncols = maxc;
     int n = maxc ? maxc : 1;
     g->mn = calloc((size_t)n, sizeof(float));
@@ -1653,6 +1802,12 @@ static void grid_build(box_t *t, struct tgrid *g) {
     g->pct = calloc((size_t)n, sizeof(float));
     g->w = calloc((size_t)n, sizeof(float));
     g->fixed = calloc((size_t)n, sizeof(bool));
+    if(table_fixed(t))return; /* fixed tracks never inspect later cell content */
+    for(int j=0;j<g->columns.n;j++) {
+        const style_t *s=g->columns.v[j];const len_t *w=&s->width;
+        if(w->kind==LK_LEN && !w->pct){g->mn[j]=g->mx[j]=fmaxf_(0,w->px);g->fixed[j]=true;}
+        else if(w->kind==LK_LEN && w->pct>0 && !w->px)g->pct[j]=w->pct;
+    }
     /* column minimum and maximum widths */
     for (int pass = 0; pass < 2; pass++)
         for (int i = 0; i < g->ncells; i++) {
@@ -1668,7 +1823,10 @@ static void grid_build(box_t *t, struct tgrid *g) {
             float fixed = -1, pct = 0;
             if (wl->kind == LK_LEN && wl->pct == 0) fixed = wl->px + (c->st->box_sizing ? 0 : ext);
             else if (wl->kind == LK_LEN && wl->pct > 0 && wl->px == 0) pct = wl->pct;
-            if (fixed >= 0) mx = fmaxf_(mn, fixed);
+            /* A nonpercentage cell width raises its minimum contribution;
+               it cannot be squeezed to zero by a neighbouring 100% column.
+               Retain intrinsic max-content rather than replacing it with W. */
+            if(fixed>=0){mn=fmaxf_(mn,fixed);mx=fmaxf_(mx,mn);}
             int c0 = g->cells[i].col, span = c->colspan;
             if (c0 + span > g->ncols) span = g->ncols - c0;
             if (span <= 1) {
@@ -1719,10 +1877,11 @@ static void table_intrinsic(box_t *t, float *mn, float *mx) {
 /* the table's content width for an available width */
 static void table_width(box_t *t, float cw) {
     resolve_edges(t, cw);
+    float sw = spec_w(t, &t->st->width, cw);
+    if(table_fixed(t) && sw>=0){t->w=clamp_w(t,sw,cw);return;}
     float mn, mx;
     table_intrinsic(t, &mn, &mx);
     float ext = hext(t);
-    float sw = spec_w(t, &t->st->width, cw);
     float w;
     if (sw >= 0) w = fmaxf_(sw, mn);
     else {
@@ -1734,7 +1893,90 @@ static void table_width(box_t *t, float cw) {
     t->w = clamp_w(t, w, cw);
     if (t->w < mn) t->w = mn;
 }
+static void table_fixed_tracks(box_t *t,struct tgrid *g) {
+    float space=g->spacing*(float)(g->ncols+1),available=fmaxf_(0,t->w-space);
+    for(int j=0;j<g->ncols;j++)g->w[j]=-1;
+    for(int j=0;j<g->columns.n;j++) {
+        const style_t *s=g->columns.v[j];
+        if(!len_auto(&s->width)){float w=len_resolve(&s->width,t->w);if(w>=0)g->w[j]=w;}
+    }
+    /* Explicit columns precede first-row cells. A spanning first-row width
+       supplies only columns still unspecified; later rows cannot resize them. */
+    for(int i=0;i<g->ncells;i++) {
+        struct tcell *cell=&g->cells[i];if(cell->row)continue;
+        box_t *c=cell->b;resolve_edges(c,t->w);
+        float w=spec_w(c,&c->st->width,t->w);if(w<0)continue;
+        w+=hext(c);int span=c->colspan,start=cell->col;
+        if(span>g->ncols-start)span=g->ncols-start;
+        float known=g->spacing*(float)(span-1);int missing=0;
+        for(int j=start;j<start+span;j++)if(g->w[j]<0)missing++;else known+=g->w[j];
+        if(missing){float each=fmaxf_(0,w-known)/(float)missing;
+            for(int j=start;j<start+span;j++)if(g->w[j]<0)g->w[j]=each;}
+    }
+    float used=0;int missing=0;
+    for(int j=0;j<g->ncols;j++)if(g->w[j]<0)missing++;else used+=g->w[j];
+    float extra=fmaxf_(0,available-used);
+    for(int j=0;j<g->ncols;j++) {
+        if(g->w[j]<0)g->w[j]=missing?extra/(float)missing:0;
+        else if(!missing && g->ncols)g->w[j]+=extra/(float)g->ncols;
+    }
+}
 
+/* CSS Tables 3 3.9.3: interpolate consecutive intrinsic sizing guesses.
+   A percent track is preferred, not permission to consume the whole table
+   in addition to the other tracks' required minimum widths. */
+static bool table_auto_tracks(struct tgrid *g,float available) {
+    double sums[4]={0},percent=0;
+    for(int j=0;j<g->ncols;j++) {
+        if(!(j&63)&&!layout_checkpoint())return false;
+        g->pct[j]=fmaxf_(0,fminf_(g->pct[j],(float)(100-percent)));
+        percent+=g->pct[j];
+        double mn=g->mn[j],preferred=fmax(mn,g->pct[j]*(double)available/100);
+        sums[0]+=mn;sums[1]+=g->pct[j]>0?preferred:mn;
+        sums[2]+=g->pct[j]>0?preferred:g->fixed[j]?g->mx[j]:mn;
+        sums[3]+=g->pct[j]>0?preferred:g->mx[j];
+    }
+    int lo=0,hi=0;double weight=0;
+    if(available>=sums[3])lo=hi=3;
+    else if(available>sums[0]) {
+        hi=1;while(hi<3 && available>sums[hi])hi++;
+        lo=hi-1;
+        if(sums[hi]>sums[lo])weight=(available-sums[lo])/(sums[hi]-sums[lo]);
+    }
+    double excess=fmax(0,(double)available-sums[3]),basis=0;int growth=0;
+    if(excess>0) {
+        /* Ordered excess rules: non-constrained nonpercent, then constrained
+           nonpercent, then percentage, then truly empty tracks. */
+        for(int j=0;j<g->ncols;j++)if(!g->fixed[j]&&!g->pct[j]&&g->mx[j]>0)basis+=g->mx[j];
+        if(basis>0)growth=1;
+        else {
+            for(int j=0;j<g->ncols;j++)if(!g->fixed[j]&&!g->pct[j])basis++;
+            if(basis>0)growth=2;
+            else {
+                for(int j=0;j<g->ncols;j++)if(g->fixed[j]&&!g->pct[j]&&g->mx[j]>0)basis+=g->mx[j];
+                if(basis>0)growth=3;
+                else if(percent>0){growth=4;basis=percent;}
+                else {growth=5;basis=g->ncols;}
+            }
+        }
+    }
+    for(int j=0;j<g->ncols;j++) {
+        if(!(j&63)&&!layout_checkpoint())return false;
+        double mn=g->mn[j],preferred=fmax(mn,g->pct[j]*(double)available/100);
+        double guess[4]={mn,g->pct[j]>0?preferred:mn,
+            g->pct[j]>0?preferred:g->fixed[j]?g->mx[j]:mn,
+            g->pct[j]>0?preferred:g->mx[j]};
+        double w=guess[lo]+(guess[hi]-guess[lo])*weight,share=0;
+        if(growth==1 && !g->fixed[j]&&!g->pct[j])share=g->mx[j];
+        else if(growth==2 && !g->fixed[j]&&!g->pct[j])share=1;
+        else if(growth==3 && g->fixed[j]&&!g->pct[j])share=g->mx[j];
+        else if(growth==4)share=g->pct[j];
+        else if(growth==5)share=1;
+        if(basis>0)w+=excess*share/basis;
+        g->w[j]=(float)w;
+    }
+    return true;
+}
 static void layout_table(box_t *t, float cbh) {
     struct tgrid g;
     grid_build(t, &g);
@@ -1743,30 +1985,8 @@ static void layout_table(box_t *t, float cbh) {
     float avail = t->w - sp * (float)(nc + 1);
     if (avail < 0) avail = 0;
     /* column widths */
-    float used = 0, smn = 0, smx = 0, auto_mx = 0;
-    for (int j = 0; j < nc; j++) {
-        if (g.pct[j] > 0) {
-            g.w[j] = fmaxf_(g.mn[j], g.pct[j] * avail / 100);
-            used += g.w[j];
-        } else {
-            smn += g.mn[j];
-            smx += g.mx[j];
-            if (!g.fixed[j]) auto_mx += g.mx[j];
-        }
-    }
-    float rem = avail - used;
-    int nauto = 0;
-    for (int j = 0; j < nc; j++)
-        if (g.pct[j] == 0 && !g.fixed[j]) nauto++;
-    for (int j = 0; j < nc; j++) {
-        if (g.pct[j] > 0) continue;
-        if (rem >= smx) {
-            float extra = rem - smx;
-            if (g.fixed[j]) g.w[j] = g.mx[j] + (nauto ? 0 : extra * (smx > 0 ? g.mx[j] / smx : 1.0f / (float)nc));
-            else g.w[j] = g.mx[j] + (auto_mx > 0 ? extra * g.mx[j] / auto_mx : extra / (float)nauto);
-        } else if (rem >= smn && smx > smn) g.w[j] = g.mn[j] + (g.mx[j] - g.mn[j]) * (rem - smn) / (smx - smn);
-        else g.w[j] = g.mn[j];
-    }
+    if(table_fixed(t))table_fixed_tracks(t,&g);
+    else if(!table_auto_tracks(&g,avail)){grid_free(&g);return;}
     float *cx = calloc((size_t)nc + 1, sizeof(float));
     float x = sp;
     for (int j = 0; j < nc; j++) {
@@ -1953,11 +2173,62 @@ struct fitem {
     box_t *b;
     float base, hypo, mn, mx, ext, size, cross;
     int align;
+    bool frozen;
+    double violation;
 };
 struct fline {
     int first, end;
     float cross, ascent, descent;
 };
+
+/* CSS Flexbox 9.7: clamped items leave the flexible pool, and their unused
+   share is redistributed. A one-pass clamp loses that share and can overflow
+   even when the remaining item has ample shrink capacity. */
+static bool flex_resolve_row(struct fitem *it,int first,int end,float available,float gap) {
+    double gaps=(double)gap*(end-first-1),hypothetical=gaps;
+    for(int i=first;i<end;i++)hypothetical+=it[i].hypo+it[i].ext;
+    bool growing=hypothetical<available;
+    size_t remaining=0;
+    for(int i=first;i<end;i++) {
+        double factor=growing?it[i].b->st->flex_grow:it[i].b->st->flex_shrink;
+        it[i].frozen=factor==0 || (growing?it[i].base>it[i].hypo:it[i].base<it[i].hypo);
+        it[i].size=it[i].frozen?it[i].hypo:it[i].base;
+        if(!it[i].frozen)remaining++;
+    }
+    double initial=available-gaps;
+    for(int i=first;i<end;i++)initial-=it[i].size+it[i].ext;
+    while(remaining) {
+        if(!layout_checkpoint())return false;
+        double free_space=available-gaps,factors=0,scaled=0;
+        for(int i=first;i<end;i++) {
+            free_space-=(it[i].frozen?it[i].size:it[i].base)+it[i].ext;
+            if(!it[i].frozen) {
+                factors+=growing?it[i].b->st->flex_grow:it[i].b->st->flex_shrink;
+                scaled+=(double)it[i].b->st->flex_shrink*it[i].base;
+            }
+        }
+        if(factors<1 && fabs(initial*factors)<fabs(free_space))free_space=initial*factors;
+        double violation=0;
+        for(int i=first;i<end;i++)if(!it[i].frozen) {
+            if(!(i&63)&&!layout_checkpoint())return false;
+            double target=it[i].base;
+            if(growing&&factors>0)target+=free_space*it[i].b->st->flex_grow/factors;
+            else if(!growing&&scaled>0)target-=fabs(free_space)*(double)it[i].b->st->flex_shrink*it[i].base/scaled;
+            double clamped=fmin(fmax(fmax(target,0),it[i].mn),it[i].mx);
+            it[i].size=(float)clamped;it[i].violation=clamped-target;violation+=it[i].violation;
+        }
+        size_t frozen=0;
+        for(int i=first;i<end;i++)if(!it[i].frozen &&
+            (violation==0 || (violation>0?it[i].violation>0:it[i].violation<0))) {
+            it[i].frozen=true;frozen++;
+        }
+        /* IEEE cancellation may leave a tiny sum although individual
+           violations are all zero; the already-clamped targets are final. */
+        if(!frozen)for(int i=first;i<end;i++)if(!it[i].frozen){it[i].frozen=true;frozen++;}
+        remaining-=frozen;
+    }
+    return true;
+}
 
 static bool stretches_height(const box_t *b, int align) {
     return align == AI_STRETCH && len_auto(&b->st->height) &&
@@ -2234,23 +2505,7 @@ static void layout_flex(box_t *b, float defh) {
                 i1++;
             }
         }
-        used = 0;
-        float grow = 0, shrink_w = 0;
-        for (int i = i0; i < i1; i++) {
-            used += it[i].hypo + it[i].ext + (i > i0 ? gap_main : 0);
-            grow += it[i].b->st->flex_grow;
-            shrink_w += it[i].b->st->flex_shrink * it[i].base;
-        }
-        float free_space = cw - used;
-        for (int i = i0; i < i1; i++) {
-            float s = it[i].hypo;
-            if (free_space > 0 && grow > 0) {
-                float share = grow < 1 ? free_space * grow : free_space;
-                s += share * it[i].b->st->flex_grow / grow;
-            } else if (free_space < 0 && shrink_w > 0)
-                s += free_space * it[i].b->st->flex_shrink * it[i].base / shrink_w;
-            it[i].size = fminf_(fmaxf_(s, it[i].mn), it[i].mx);
-        }
+        if(!flex_resolve_row(it,i0,i1,cw,gap_main)){free(lines);free(it);return;}
         /* lay out the items at their sizes */
         struct fline *line = &lines[line_count++];
         *line = (struct fline){.first=i0, .end=i1};
@@ -3136,6 +3391,15 @@ static void clamp_visibility_reset(box_t *b) {
     b->clamp_hidden = false;
     for (box_t *c = b->first; c; c = c->next) clamp_visibility_reset(c);
 }
+static void truncate_decos(box_t *b, int count) {
+    /* Truncation changes the published count, so retirement cannot discover
+       discarded fragments later. Release their owned masks before hiding them. */
+    for (int i=count;i<b->ndecos;i++) {
+        web_shadow_cache_free(&b->decos[i].shadow_cache);
+        for(int j=0;j<2;j++)web_radius_cache_free(&b->decos[i].radius_clip[j]);
+    }
+    b->ndecos=count;
+}
 static void clamp_scan(struct clamp_state *state, box_t *b) {
     if (b->clamp_hidden || !layout_checkpoint()) return;
     if (state->truncated) { clamp_hide(b); return; }
@@ -3164,7 +3428,7 @@ static void clamp_scan(struct clamp_state *state, box_t *b) {
             if (!keep) clamp_hide(b);
             else {
                 b->nruns = b->lines[keep - 1].end_run;
-                b->ndecos = b->lines[keep - 1].end_deco;
+                truncate_decos(b,b->lines[keep - 1].end_deco);
                 b->nlines = keep;
             }
         }
@@ -3238,7 +3502,7 @@ static void clamp_apply(box_t *root) {
     if (!state.truncated || !state.last || !layout_checkpoint()) return;
     box_t *b = state.last;
     struct line_fragment *line = &b->lines[state.last_line];
-    b->nruns = line->end_run; b->ndecos = line->end_deco; b->nlines = state.last_line + 1;
+    b->nruns = line->end_run; truncate_decos(b,line->end_deco); b->nlines = state.last_line + 1;
     wfont font = style_font(b->st);
     float ellipsis_width = text_width_uncached(b->st, &font, clamp_ellipsis, sizeof clamp_ellipsis - 1);
     float edge = fmaxf_(line->left, line->right - ellipsis_width), x = line->left;
@@ -3316,7 +3580,12 @@ static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float
         return;
     }
     b->layout_post_valid = false;
+    for(int i=0;i<b->ndecos;i++) {
+        web_shadow_cache_free(&b->decos[i].shadow_cache);
+        for(int j=0;j<2;j++)web_radius_cache_free(&b->decos[i].radius_clip[j]);
+    }
     ar_free(&b->layout_mem);
+    b->decos=NULL;b->ndecos=0; /* including early-return frameset layout */
     b->layout_mem.chunk_size = 4096;
     b->layout_mem.trap = layout_scratch()->trap;
     b->clamp_trace = NULL;

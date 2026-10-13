@@ -8,9 +8,11 @@ source=(root / "user/libc/web/js.c").read_text(encoding="utf-8")
 types=source[source.index("#define JS_NODE_BUCKETS"):source.index("struct js_timer")]
 brand=source[source.index("static node_t *unwrap("):source.index("static bool unknown_html_interface(")]
 lookup=source[source.index("static unsigned node_bucket("):source.index('#include "js_nodes.h"')]
+dom=(root / "user/libc/web/dom.c").read_text(encoding="utf-8")
+forest=dom[dom.index("static node_t *tree_next("):dom.index("static void indices(")]
 cases=(root / "tests/node_cache_native_cases.c").read_text(encoding="utf-8")
 c=out / "node-cache-native-generated.c"
-c.write_text(cases.replace("/* PRODUCT_CACHE_TYPES */",types).replace("/* PRODUCT_BRAND_HELPERS */",brand).replace("/* PRODUCT_CACHE_LOOKUP */",lookup),encoding="utf-8")
+c.write_text(cases.replace("/* PRODUCT_CACHE_TYPES */",types).replace("/* PRODUCT_BRAND_HELPERS */",brand).replace("/* PRODUCT_CACHE_LOOKUP */",lookup).replace("/* PRODUCT_FOREST_TRAVERSAL */",forest),encoding="utf-8")
 cc=root / "tools/msys64/ucrt64/bin/clang.exe"
 env=dict(os.environ,PATH=str(cc.parent)+os.pathsep+os.environ.get("PATH",""))
 exe=out / "node-cache-native.exe"

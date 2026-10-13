@@ -74,8 +74,11 @@ static const struct cond_case conditions[] = {
     {"not(color:red)",false}, {"(color:red)and(display:flex)",false},
     {"(color:red]",false}, {"(color:red) /*",false},
     {"(color:red !bad)",false}, {"future(unknown)",false},
-    {"selector(div,span)",false}, {"selector(:has(div))",false},
-    {"selector(:hover)",true}, {"selector(:scope)",false}, {"selector(:defined)",false},
+    {"selector(div,span)",false}, {"selector(:has(div))",true},
+    {"selector(:has(> div + span))",true}, {"selector(:has(+ .a .b))",true},
+    {"selector(:has(:has(div)))",false}, {"selector(:has(div::before))",false},
+    {"selector(:has(div,))",false}, {"selector(:has(:unknown))",false},
+    {"selector(:hover)",true}, {"selector(:scope)",true}, {"selector(:defined)",false},
     {"selector(div::unknown)",false}, {"selector(:is(div,:unknown))",false},
     {"selector(:is(div,))",false}, {"selector(:nth-child(2n of .item))",false},
     {"selector(div >)",false}, {"selector(a|div)",false}, {"selector(**)",false},
@@ -257,17 +260,27 @@ static void test_filter_cancel(void) {
     uint32_t previous[32*32];memcpy(previous,filter_pixels,sizeof previous);
     pvec nodes={0};node_t *child=NULL;
     if(css_select(d,d->root,"#child",&nodes)&&nodes.n==1)child=nodes.v[0];pv_free(&nodes);
-    if(child)doc_node_attr(d,child,"style","display:block;width:20px;height:20px;background:red");
+    check("filter cancellation has parsed real child",child!=NULL,true);
+    if(!child){web_free(d);return;}
+    doc_node_attr(d,child,"style","display:block;width:20px;height:20px;background:red");
     web_layout(d,800,600);state.stop=true;d->native_checkpoint_count=63;
     filter_paint(d,&canvas);
     check("filter blend respects native stop",d->native_cancelled&&d->native_recovery_pending,true);
     check("cancelled group/frame restores last coherent pixels",!memcmp(previous,filter_pixels,sizeof previous),true);
     check("cancelled group restores graphics clip",canvas.cx0==0&&canvas.cy0==0&&canvas.cx1==32&&canvas.cy1==32,true);
     state.stop=false;
-    check("cancelled group retires through outer recovery",web_js_native_recover(d)&&!d->native_cancelled&&!d->native_recovery_pending,true);
+    /* Recovery only starts a new native transaction. The actual browser's
+       outer layout path rebuilds and commits it before pending/active can be
+       cleared and the painter can safely overwrite the last bitmap. */
+    web_layout(d,800,600);
+    check("cancelled group retires through outer recovery",!d->native_cancelled&&!d->native_recovery_pending&&
+          !d->native_recovery_active&&d->layout_valid&&d->root_box,true);
     filter_paint(d,&canvas);
     check("recovery draws current native DOM instead of old bitmap",(filter_pixels[5*32+5]&0xffffff)==0xff7f7f,true);
     web_free(d);
+}
+static void test_filter_layer_vectors(void) {
+    canvas_t canvas;web_doc *d;
     char many[8192];size_t length=(size_t)snprintf(many,sizeof many,"<!doctype html><body style=margin:0><div style='filter:opacity(.5)'>");
     for(int i=0;i<40;i++)length+=(size_t)snprintf(many+length,sizeof many-length,
         "<span style='display:block;filter:opacity(1);width:20px;height:1px;background:blue'></span>");
@@ -310,7 +323,12 @@ static void test_hover_support(void) {
     check("hover support after exit",css_supports_condition("selector(:hover)",16,false),true);
     web_free(d);
 }
-int main(void) {
+int main(int argc,char **argv) {
+    if(argc>1&&!strcmp(argv[1],"--filter-cancel")) {
+        test_filter_cancel();
+        printf("csssupportstest-filter-cancel: %d checks, %d failures\n",checks,failures);
+        return failures != 0;
+    }
     for (size_t i=0;i<sizeof declarations/sizeof *declarations;i++) {
         const struct decl_case *c=&declarations[i];
         check(c->value,css_supports_declaration(c->property,strlen(c->property),c->value,strlen(c->value)),c->expected);
@@ -342,6 +360,7 @@ int main(void) {
     test_filter_values();
     test_filter_borrows();
     test_filter_cancel();
+    test_filter_layer_vectors();
     test_hover_support();
     printf("csssupportstest: %d checks, %d failures\n",checks,failures);
     return failures != 0;

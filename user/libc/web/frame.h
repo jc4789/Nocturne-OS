@@ -11,6 +11,7 @@ struct web_frame {
     web_doc *retired;
     web_doc *navigation_owner;
     char *source, *srcdoc, *navigation, *navigation_origin, *sandbox;
+    char *target_name, *name_attribute; /* navigable名と最後のHTML name属性を別所有 */
     uint64_t request;
     unsigned dom_order;
     bool notified, detached, failed, initial_failed;
@@ -28,6 +29,7 @@ node_t *web_frame_dom_next(node_t *root,node_t *node);
 /* 1 ancestor match, 0 distinct, -1 allocation failure. */
 int web_frame_ancestor_url(web_doc *parent,const char *url);
 void web_frames_prepare_paint(web_doc *root);
+void web_frames_commit_viewports(web_doc *document); /* committed parent content boxes, independent of paint */
 void web_frames_finish_paint(web_doc *root);
 struct web_frame *web_frame_find(web_doc *document, node_t *element);
 struct web_frame *web_frame_ensure(web_doc *document, node_t *element);

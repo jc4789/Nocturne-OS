@@ -8,6 +8,7 @@
 #include "webi.h"
 #include "web_presentation.h"
 #include <webidb_async.h>
+#include <parallel.h>
 #include "web_dialog.h"
 #include "form_value.h"
 #include "form_file.h"
@@ -20,6 +21,7 @@
 #include "frame.h"
 #include "html_policy.h"
 #include "html_encoding.h"
+#include "html_lexbor.h"
 #include "cssom.h"
 #include <limits.h>
 
@@ -250,7 +252,7 @@ static bool sheet_instance_imports(web_doc *d, struct sheet_walk *f, sheet_t *as
     for(struct css_rule_info *r=css_sheet_rules(ast,NULL);r;r=r->next)if(r->import_url) {
         struct css_import *im=calloc(1,sizeof *im);
         if(!im)return false;
-        im->url=strdup(r->import_url);im->order=order;
+        im->url=strdup(r->import_url);im->order=order;im->owner=r;
         if(!im->url || !sheet_push(&f->imports,im)){free(im->url);free(im);return false;}
     }
     return true;
@@ -325,11 +327,14 @@ static bool sheet_parse(web_doc *d, struct sheet_walk *f, const char *css, size_
     return true;
 }
 
-static void add_sheet_ast(web_doc *d, const char *css, size_t n, const char *base, double order, const char *media, node_t *scope, sheet_t *native_ast) {
+/* Return whether this root has no outstanding critical import fetches. The
+   ordinary parser/OOM diagnostics remain separate from resource load state;
+   unrelated root sheets must not become this owner's completion barrier. */
+static bool add_sheet_ast(web_doc *d, const char *css, size_t n, const char *base, double order, const char *media, node_t *scope, sheet_t *native_ast) {
     struct sheet_walk *volatile active = calloc(1, sizeof(struct sheet_walk));
     if (!active) {
         web_js_console(d, 2, "Stylesheet import traversal allocation failed");
-        return;
+        return true;
     }
     /* Inline sheets use their document URL for resolution, but are not an
        imported ancestor of every stylesheet fetched from that document URL. */
@@ -338,6 +343,7 @@ static void add_sheet_ast(web_doc *d, const char *css, size_t n, const char *bas
         if (c->body == css && c->n == n) { active->url = c->url; active->base = c->base; break; }
     }
     arena_t *arena = d->live ? &d->cssmem : &d->mem;
+    volatile bool pending_import=false;
     jmp_buf trap;
     jmp_buf *outer_trap = arena->trap;
     arena->trap = &trap;
@@ -349,7 +355,7 @@ static void add_sheet_ast(web_doc *d, const char *css, size_t n, const char *bas
         if (outer_trap) longjmp(*outer_trap, arena_failed);
         web_js_console(d, 2, "Stylesheet arena allocation failed during import traversal");
         d->need_style = true;
-        return;
+        return !pending_import;
     }
     if (native_ast) {
         if(!sheet_instance_imports(d,active,native_ast,order,media,scope))failed=true;
@@ -378,13 +384,16 @@ static void add_sheet_ast(web_doc *d, const char *css, size_t n, const char *bas
                 struct sheet_walk *child = calloc(1, sizeof *child);
                 if (!child) { failed = true; break; }
                 child->parent = f; child->url = cached->url; child->base = cached->base;
+                const struct css_rule_info *import_owner=im->owner;
                 f->next++; free(im->url); free(im);
                 active = child;
                 if (!sheet_parse(d, child, cached->body, cached->n, cached->base, order, media, scope)) failed = true;
+                if(!failed)css_sheet_import_context(child->sheet,f->sheet,import_owner);
             } else { f->next++; free(im->url); free(im); }
             continue;
         }
         if (d->live && css_queued(d, im->url)) {
+            pending_import=true;
             f->next++; free(im->url); free(im);
             continue;
         }
@@ -395,15 +404,17 @@ static void add_sheet_ast(web_doc *d, const char *css, size_t n, const char *bas
         if ((media && *media && !p->media) || !sheet_push(&d->pending_css, p)) {
             free(p->media); free(p); failed = true; break;
         }
+        pending_import=true;
         f->next++; free(im); /* URL ownership has moved to pending_css. */
     }
     sheet_walk_free(active);
     arena->trap = outer_trap;
     d->need_style = true;
     if (failed) web_js_console(d, 2, "Stylesheet import traversal allocation or index representation failed");
+    return !pending_import;
 }
-static void add_sheet(web_doc *d,const char *css,size_t n,const char *base,double order,const char *media,node_t *scope) {
-    add_sheet_ast(d,css,n,base,order,media,scope,NULL);
+static bool add_sheet(web_doc *d,const char *css,size_t n,const char *base,double order,const char *media,node_t *scope) {
+    return add_sheet_ast(d,css,n,base,order,media,scope,NULL);
 }
 
 void doc_add_stylesheet_text(web_doc *d, const char *css, size_t n, const char *base) {
@@ -554,6 +565,24 @@ static bool link_sheet_applies(node_t *n) {
     }
     return true;
 }
+/* HTML's initial render-blocking mechanism. A short paint fallback cannot
+   abort a fetch, suppress an error, or limit the size/lifetime of the page.
+   Inactive/alternate/disabled sheets, body images and author Fetch promises
+   are not blockers. After first paint, resource updates remain progressive. */
+bool web_render_blocked(web_doc *d) {
+    if (!d || !d->live || d->inert || d->initial_render_done ||
+        uptime_ms() >= d->initial_render_deadline) return false;
+    if (!d->body && d->parser) return true;
+    for (int i=0; i<d->pending_css.n; i++) {
+        const struct pending *p=d->pending_css.v[i];
+        if (p->scope || p->order >= d->render_head_order) continue;
+        if (p->media && *p->media && !css_media_evaluate(p->media,
+            MAX(1,d->width),MAX(1,d->height),!(d->sandbox_flags&SB_SCRIPTS),NULL,0)) continue;
+        const struct cached_css *c=cached_css(d,p->url);
+        if (!c || !c->done) return true;
+    }
+    return false;
+}
 /* Borrow only a completed native resource, never a fabricated empty sheet.
    URL/data scratch is caller-owned; cache text/base survives the document. */
 int doc_cssom_link_source(web_doc *d,node_t *n,struct cssom_link_source *source) {
@@ -675,14 +704,15 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             }
             struct cached_css *cached = d->live ? cached_css(d, abs) : NULL;
             if (cached && cached->done) {
+                bool complete=true;
                 if (cached->body && link_sheet_applies(c)) {
                     if(c->cssom_current) {
                         int error;struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                        if(sheet)add_sheet_ast(d,sheet->source,sheet->length,sheet->base,d->next_sheet_order++,media,scope,sheet->ast);
+                        if(sheet)complete=add_sheet_ast(d,sheet->source,sheet->length,sheet->base,d->next_sheet_order++,media,scope,sheet->ast);
                         else if(error==CSSOM_OOM)web_js_console(d,2,"Native link style sheet allocation failed");
-                    }else add_sheet(d,cached->body,cached->n,cached->base,d->next_sheet_order++,media,scope);
+                    }else complete=add_sheet(d,cached->body,cached->n,cached->base,d->next_sheet_order++,media,scope);
                 }
-                link_stylesheet_complete(d,c,!cached->body);
+                if(complete)link_stylesheet_complete(d,c,!cached->body);
                 free(abs);
                 break;
             }
@@ -697,14 +727,15 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             if (!strncasecmp(abs, "data:", 5)) {
                 size_t dn;
                 char *css = data_url(abs, &dn);
+                bool complete=true;
                 if (css && link_sheet_applies(c)) {
                     if(c->cssom_current) {
                         int error;struct cssom_sheet *sheet=cssom_style_sheet(d,c,&error);
-                        if(sheet)add_sheet_ast(d,sheet->source,sheet->length,sheet->base,pd->order,pd->media,scope,sheet->ast);
+                        if(sheet)complete=add_sheet_ast(d,sheet->source,sheet->length,sheet->base,pd->order,pd->media,scope,sheet->ast);
                         else if(error==CSSOM_OOM)web_js_console(d,2,"Native link style sheet allocation failed");
-                    }else add_sheet(d,css,dn,d->base,pd->order,pd->media,scope);
+                    }else complete=add_sheet(d,css,dn,d->base,pd->order,pd->media,scope);
                 }
-                link_stylesheet_complete(d,c,!css);
+                if(complete)link_stylesheet_complete(d,c,!css);
                 free(css);
                 free(pd->url);
                 free(pd->media);
@@ -748,6 +779,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             if (c->shadow_root) scan(d, c->shadow_root, c->shadow_root);
         }
     }
+    if (n == d->head && !scope) d->render_head_order=d->next_sheet_order;
     /* Adopted sheets follow tree-owned sheets in this scope. Their persistent
        native AST is instantiated, never reparsed for each component root. */
     if (n == d->root || n->shadow_host) {
@@ -826,6 +858,9 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
     web_doc *d = calloc(1, sizeof *d);
     if (!d) return NULL;
     d->live = true;
+    static uint64_t input_serial;
+    d->input_identity=__atomic_add_fetch(&input_serial,1,__ATOMIC_RELAXED);
+    d->initial_render_deadline=uptime_ms()+3000;
     d->frame_parent=parent;d->frame_element=frame;
     if(parent && frame){
         struct web_frame *f=web_frame_find(parent,frame);d->window_token=f?f->window_token:NULL;
@@ -963,6 +998,7 @@ void doc_rescan(web_doc *d) {
     for(struct css_sheet_reuse *c=d->css_reuse;c;c=c->next)c->used=false;
     free_pending(d);
     d->next_sheet_order = 0;
+    d->render_head_order = 0;
     d->base_seen = false;
     d->scan_title_seen = false;
     d->refresh_url = NULL;
@@ -1018,20 +1054,46 @@ void doc_rescan(web_doc *d) {
     if (d->profile_enabled) d->profile.rescan_ms += uptime_ms() - profile_start;
 }
 
+static struct cached_css *css_resource(web_doc *d,const char *url) {
+    struct cached_css *c = cached_css(d, url);
+    if(c)return c;
+    c=calloc(1,sizeof *c);
+    if(!c)return NULL;
+    c->url=strdup(url);c->base=strdup(url);
+    if(!c->url || !c->base || !sheet_push(&d->css_cache,c)) {
+        free(c->url);free(c->base);free(c);return NULL;
+    }
+    return c;
+}
+struct cached_css *doc_css_request_next(web_doc *d,size_t *cursor) {
+    if(!d || !cursor || !d->live)return NULL;
+    while(*cursor<(size_t)d->pending_css.n) {
+        struct pending *pending=d->pending_css.v[(*cursor)++];
+        struct cached_css *c=css_resource(d,pending->url);
+        if(!c){
+            d->dirty=true;
+            web_js_console(d,2,"Stylesheet request identity allocation failed in the OS allocator");
+            return NULL;
+        }
+        if(!c->done&&!c->loading_id)return c;
+    }
+    return NULL;
+}
 void doc_css_loaded(web_doc *d, const char *url, const char *final_url, const char *css, size_t n) {
     if (!d || !url) return;
-    struct cached_css *c = cached_css(d, url);
-    if (!c) {
-        c = calloc(1, sizeof *c);
-        if (!c) return;
-        c->url = strdup(url);
-        c->base = strdup(final_url && *final_url ? final_url : url);
-        if (!c->url || !c->base) { free(c->url); free(c->base); free(c); return; }
-        pv_push(&d->css_cache, c);
-    }
+    struct cached_css *c=css_resource(d,url);
+    if(!c)return;
     if (c->done) return;
+    /* Claims are allocated at dispatch, before redirects are known. Relative
+       imports use the final response URL, while request/dedup identity keeps
+       the originally requested URL. Never publish bytes with a stale base. */
+    const char *base=final_url&&*final_url?final_url:url;
+    char *redirect_base=strcmp(c->base,base)?strdup(base):NULL;
+    bool base_ok=!strcmp(c->base,base)||redirect_base;
+    if(redirect_base){free(c->base);c->base=redirect_base;}
+    if(!base_ok)web_js_console(d,2,"Stylesheet redirect base allocation failed in the OS allocator");
     c->done = true;
-    if (css && n < SIZE_MAX && d->css_bytes <= SIZE_MAX - n) {
+    if (base_ok && css && n < SIZE_MAX && d->css_bytes <= SIZE_MAX - n) {
         c->body = malloc(n + 1);
         if (c->body) {
             memcpy(c->body, css, n);
@@ -1055,6 +1117,12 @@ int64_t web_media_background_deadline(uint64_t now) {
 void web_tick(web_doc *d, uint64_t now) {
     web_media_background(now);
     if (!d || !d->live) return;
+    if(!d->initial_render_done && d->initial_render_deadline && now >= d->initial_render_deadline) {
+        /* A hidden frame may never paint. Its fallback is a one-shot wake,
+           not a perpetual full-page damage source on every subsequent tick. */
+        d->initial_render_deadline=0;
+        doc_paint_full(d);
+    }
     /* A native-only cancellation preserves author queues, not partial boxes.
        Rebuild outside every author/media/animation task before any callback
        can observe geometry. Active parent/author/parser transactions refuse
@@ -1088,8 +1156,11 @@ int64_t web_deadline(web_doc *d) {
     uint64_t now = uptime_ms();
     int64_t background = web_media_background_deadline(now);
     if (!d || !d->live) return background;
+    int64_t render = !d->initial_render_done && now < d->initial_render_deadline ?
+        (int64_t)d->initial_render_deadline : -1;
     int64_t js = web_js_deadline(d), media = web_avmedia_deadline(d, now);
     int64_t deadline = js < 0 ? media : media < 0 ? js : MIN(js, media);
+    if(render>=0 && (deadline<0 || render<deadline))deadline=render;
     int64_t motion=css_motion_deadline(d,now);
     if(motion>=0 && (deadline<0 || motion<deadline))deadline=motion;
     int64_t marquee=web_marquee_deadline(d,now);
@@ -1420,8 +1491,8 @@ static void register_bg(web_doc *d, node_t *n) {
     for (node_t *c = n->first; c; c = c->next) {
         if (c->type != N_ELEM || !c->style) continue;
         bg_images(d, c->style);
-        bg_images(d, c->style->before);
-        bg_images(d, c->style->after);
+        if (c->style->before_generated) bg_images(d, c->style->before);
+        if (c->style->after_generated) bg_images(d, c->style->after);
         register_bg(d, c);
         if (c->shadow_root) register_bg(d, c->shadow_root);
     }
@@ -1432,6 +1503,18 @@ static void invalidate_layout_tree(box_t *b) {
     b->intrinsic_done = false;
     b->layout_dirty = true; b->layout_cache_valid = false;
     for (box_t *c = b->first; c; c = c->next) invalidate_layout_tree(c);
+}
+
+void doc_viewport_update(web_doc *d,int width,int height) {
+    width=MAX(1,width);height=MAX(1,height);
+    if(!d || (d->width==width&&d->height==height))return;
+    /* The viewport exists even before the next raster is painted. Preserve
+       the ordinary resize invalidation and source-selection path for both
+       top-level windows and embedded documents, without invoking author JS. */
+    invalidate_layout_tree(d->root_box);
+    d->width=width;d->height=height;d->layout_valid=false;
+    d->need_style=d->style_full_dirty=d->dirty=true;
+    for(node_t *image=doc_image_node_next(d,NULL);image;image=doc_image_node_next(d,image))doc_image_sync(d,image);
 }
 
 int web_layout(web_doc *d, int width, int height) {
@@ -1465,11 +1548,7 @@ int web_layout(web_doc *d, int width, int height) {
        actual paint, canvas/scroll changes and media retirement invalidate
        them without borrowing these mutable layout boxes. */
     web_avmedia_layout_begin(d);
-    if(d->width!=width||d->height!=height){
-        invalidate_layout_tree(d->root_box);
-        d->width=width;d->height=height;
-        for(node_t *image=doc_image_node_next(d,NULL);image;image=doc_image_node_next(d,image))doc_image_sync(d,image);
-    }
+    doc_viewport_update(d,width,height);
 reflow:
     if (d->need_style || d->styled_w != width || d->styled_h != height || !d->root_box) {
         css_cascade(d, width, height);
@@ -1527,6 +1606,7 @@ reflow:
     }
     d->layout_revision++;
     d->layout_valid = true;
+    web_frames_commit_viewports(d);
     if(d->native_recovery_pending){
         d->native_recovery_pending=d->native_recovery_active=false;
         web_js_console(d,1,"Native rendering recovered from coherent DOM.");
@@ -1652,6 +1732,57 @@ static bool scroll_input_coherent(web_doc *d) {
         !family->shadow_slots_pending && !family->shadow_dirty_first &&
         !d->native_cancelled && !d->native_recovery_pending && !d->native_recovery_active &&
         !d->native_layout_depth;
+}
+
+bool web_native_input_ready(web_doc *d,bool prepared_wait) {
+    if (!scroll_input_coherent(d) || d->native_checkpoint_depth || parallel_active() ||
+        (!prepared_wait && (d->native_input_depth || (d->parser && d->parser->callback_depth)))) return false;
+    /* Painting can enter child surfaces too. Do not read a child's half-built
+       boxes just because the containing document is currently coherent. */
+    for (struct web_frame *f=d->frames; f; f=f->next)
+        if (!f->detached && f->document && !web_native_input_ready(f->document,prepared_wait)) return false;
+    return true;
+}
+
+static web_doc *input_document(web_doc *d,uint64_t identity) {
+    if (!d || !d->live) return NULL;
+    if (d->input_identity==identity) return d;
+    for (struct web_frame *f=d->frames; f; f=f->next) {
+        web_doc *found=!f->detached?input_document(f->document,identity):NULL;
+        if (found) return found;
+    }
+    return NULL;
+}
+
+bool web_input_target_valid(web_doc *d,const struct web_input_target *target) {
+    if (!target) return false;
+    web_doc *owner=input_document(d,target->document);
+    /* Find the live owner by identity BEFORE dereferencing a target whose
+       child document may already have navigated and freed its native arena. */
+    return owner && target->stream==web_js_input_stream(owner) &&
+        (!target->node || (target->node->owner==owner &&
+                          doc_node_root(target->node,true)==owner->root));
+}
+
+bool web_input_capture(web_doc *d,web_node *target,struct web_input_target *out) {
+    if (!out || !d || !d->live) return false;
+    web_doc *owner=target?target->owner:d;
+    if (!owner || input_document(d,owner->input_identity)!=owner ||
+        (target && doc_node_root(target,true)!=owner->root)) return false;
+    *out=(struct web_input_target){target,owner->input_identity,web_js_input_stream(owner)};
+    return true;
+}
+
+bool web_native_wheel_target(web_doc *d,web_node *target,struct web_input_target *out,bool prepared_wait) {
+    if (!web_native_input_ready(d,prepared_wait) || !web_input_capture(d,target,out)) return false;
+    web_doc *owner=target?target->owner:d;
+    if (owner->wheel_window_blocking) return false;
+    /* Composed wheel ancestors follow the already-published slot assignment.
+       No doc_flat_parent/shadow flush, attribute handler compilation or JS. */
+    for (node_t *at=target?target:owner->root; at;
+         at=at->assigned_slot?at->assigned_slot:at->parent?at->parent:at->shadow_host)
+        if (at->wheel_blocking || node_attr(at,"onwheel")) return false;
+    return true;
 }
 
 static struct web_frame *scroll_input_frame(web_doc *child) {

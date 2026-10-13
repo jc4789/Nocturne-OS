@@ -108,3 +108,72 @@ function runCSSOMCases() {
     console.log('CSSOM_DONE '+count);
     return count;
 }
+/* New CSSOM property-publication/read-only/image boundary checks are separate
+   from the earlier 54-case suite so unchanged successes are not repeated. */
+function runComputedStyleDeclarationCases() {
+    let count=0;
+    function equal(name,actual,expected){count++;if(actual!==expected)throw new Error(name+': '+JSON.stringify(actual)+' != '+JSON.stringify(expected));}
+    function raises(name,fn,expected){let error='';try{fn();}catch(e){error=e.name;}equal(name,error,expected);}
+    const node=document.createElement('div');node.style.cssText='font-size:40px;border-radius:50%;--Case:7px;--bad:var(--bad)';document.body.appendChild(node);
+    const style=getComputedStyle(node);
+    equal('native-declaration-brand',style instanceof CSSStyleDeclaration,true);
+    equal('native-style-properties-brand',style instanceof CSSStyleProperties,true);
+    equal('computed-camel-property-exists','borderRadius' in style,true);
+    equal('computed-hyphen-property-exists','border-radius' in style,true);
+    equal('computed-longhand-exists','border-top-left-radius' in style,true);
+    equal('unimplemented-property-not-fabricated','nocturne-unimplemented-property' in style,false);
+    equal('computed-percentage-axes',style.borderRadius,'50%');
+    equal('computed-longhand-axes',style.borderTopLeftRadius,'50%');
+    raises('computed-property-is-read-only',()=>{style.borderRadius='0px';},'NoModificationAllowedError');
+    raises('computed-setProperty-is-read-only',()=>style.setProperty('border-radius','0px'),'NoModificationAllowedError');
+    raises('computed-removeProperty-is-read-only',()=>style.removeProperty('border-radius'),'NoModificationAllowedError');
+    raises('computed-cssText-is-read-only',()=>{style.cssText='border-radius:0px';},'NoModificationAllowedError');
+    node.style.borderRadius='1em';equal('computed-object-remains-live',style.borderRadius,'40px');
+    equal('indexed-name-and-item-use-same-list',style[0],style.item(0));
+    equal('computed-longhand-list-is-not-empty',style.length>0,true);
+    const names=[...style].filter(name=>!name.startsWith('--'));
+    const sorted=names.slice().sort((a,b)=>a.startsWith('-')!==b.startsWith('-')?(a.startsWith('-')?1:-1):a<b?-1:a>b?1:0);
+    equal('computed-list-vendor-last-lexicographic-order',JSON.stringify(names),JSON.stringify(sorted));
+    equal('computed-custom-property-uses-resolved-native-value',style.getPropertyValue('--Case'),'7px');
+    equal('valid-custom-name-is-listed',[...style].includes('--Case'),true);
+    equal('guaranteed-invalid-custom-value-is-not-listed',[...style].includes('--bad'),false);
+    node.style.setProperty('--Case','8px');equal('custom-value-remains-live',style.getPropertyValue('--Case'),'8px');
+    raises('declaration-method-checks-real-brand',()=>CSSStyleDeclaration.prototype.getPropertyValue.call({},'border-radius'),'TypeError');
+    raises('public-constructor-does-not-fabricate-declarations',()=>new CSSStyleDeclaration(),'TypeError');
+    node.remove();equal('detached-computed-list-is-empty',style.length,0);
+    equal('detached-computed-value-is-empty',style.borderRadius,'');
+    return count;
+}
+
+function runPlaceholderComputedStyleCases() {
+    let count=0;
+    const equal=(name,actual,expected)=>{count++;if(actual!==expected)throw new Error(name+': '+JSON.stringify(actual)+' != '+JSON.stringify(expected));};
+    const sheet=document.createElement('style');
+    sheet.textContent='.computed-hint::placeholder{color:rgba(23,45,67,.5);font-size:17px;opacity:.4;--Hint:blue}.computed-hint::before{content:"";color:rgb(11,22,33)}.computed-hint::after{content:"";color:rgb(33,22,11)}';
+    document.head.appendChild(sheet);
+    const input=document.createElement('input');input.placeholder='hint';input.style.cssText='color:rgb(100,50,25);font-size:22px;width:120px';document.body.appendChild(input);
+    const hint=getComputedStyle(input,'::placeholder');
+    equal('UA-placeholder-color',hint.color,'rgb(117, 117, 117)');
+    equal('UA-placeholder-font-inherits',hint.fontSize,'22px');
+    equal('UA-placeholder-opacity-not-group-opacity',hint.opacity,'1');
+    input.className='computed-hint';
+    equal('authored-placeholder-color',hint.color,'rgba(23, 45, 67, 0.5)');
+    equal('authored-placeholder-font',hint.fontSize,'17px');
+    equal('authored-placeholder-opacity',hint.opacity,'0.4');
+    equal('pseudo-custom-property',hint.getPropertyValue('--Hint'),'blue');
+    equal('pseudo-custom-property-enumeration',[...hint].includes('--Hint'),true);
+    equal('placeholder-does-not-use-input-width',hint.width,'auto');
+    equal('before-computed-body',getComputedStyle(input,'::before').color,'rgb(11, 22, 33)');
+    equal('after-computed-body',getComputedStyle(input,'::after').color,'rgb(33, 22, 11)');
+    equal('legacy-before-alias',getComputedStyle(input,':before').color,'rgb(11, 22, 33)');
+    equal('null-pseudo-is-origin',getComputedStyle(input,null).color,'rgb(100, 50, 25)');
+    const invalid=getComputedStyle(input,'::unknown');equal('unknown-pseudo-empty-list',invalid.length,0);
+    equal('unknown-pseudo-empty-value',invalid.color,'');
+    equal('non-colon-pseudo-is-origin',getComputedStyle(input,'not-a-pseudo').color,'rgb(100, 50, 25)');
+    input.className='';equal('pseudo-object-live-to-UA',hint.color,'rgb(117, 117, 117)');
+    input.className='computed-hint';equal('pseudo-object-live-to-author',hint.fontSize,'17px');
+    let readonly=false;try{hint.color='red';}catch(error){readonly=error.name==='NoModificationAllowedError';}
+    equal('pseudo-declaration-readonly',readonly,true);
+    input.remove();equal('detached-pseudo-empty-value',hint.color,'');sheet.remove();
+    return count;
+}

@@ -192,7 +192,186 @@ static void allocation_failures(void) {
     }
     declarations_free(slot);free(slot); ar_free(&failure);
 }
+static void font_sources_native(void) {
+    struct source_case { const char *value; const char *first; const char *second; };
+    static const struct source_case cases[]={
+        {"url(a.eot) format('embedded-opentype'),url(a.woff2) format('woff2'),url(a.woff) format('woff')","a.woff2","a.woff"},
+        {"url(a.eot) format(embedded-opentype),url(a.woff2) format(woff2)","a.woff2",NULL},
+        {"url(a.eot)","a.eot",NULL},
+        {"url(a.woff2) format(woff2) tech(variations),url(b.woff2) format(woff2)","b.woff2",NULL},
+        {"url(a.woff2) format(),url(b.ttf)","b.ttf",NULL},
+        {"url(a.woff2) format(unknown),url(b.ttf)","b.ttf",NULL},
+        {"url(a.ttf) format('truetype'),url(b.otf) format(opentype)","a.ttf","b.otf"},
+        {"url(a.eot) format(embedded-opentype)",NULL,NULL},
+        {"url(a.svg) format(svg)",NULL,NULL},
+        {"url(a.woff2) format(woff2) dummy()",NULL,NULL},
+        {"url(a.ttf) format(opentype,truetype)",NULL,NULL},
+        {"url(a.ttf) format(unknown),url(b.ttf) tech(broken)",NULL,NULL},
+    };
+    arena_t memory={0};struct pctx pc={.a=&memory,.base="https://font.test/path/style.css"};
+    for(size_t i=0;i<sizeof cases/sizeof *cases;i++) {
+        struct font_source *sources=font_sources(&pc,cases[i].value,cases[i].value+strlen(cases[i].value));
+        char expected[100];bool ok;
+        if(cases[i].first){snprintf(expected,sizeof expected,"https://font.test/path/%s",cases[i].first);ok=sources&&!strcmp(sources->url,expected);}
+        else ok=sources==NULL;
+        check(ok,cases[i].value);
+        if(cases[i].second){snprintf(expected,sizeof expected,"https://font.test/path/%s",cases[i].second);check(sources&&sources->next&&!strcmp(sources->next->url,expected)&&!sources->next->next,"font source authored fallback order");}
+        else check(!sources||!sources->next,"font source no spurious unsupported item");
+        ar_free(&memory);
+    }
+    const char *bodies[]={
+        "font-family:Example;src:url(a.woff2) format(woff2);src:url(a.eot) format(embedded-opentype)",
+        "font-family:Example;src:url(a.eot);src:url(a.eot) format(embedded-opentype),url(b.woff2) format(woff2)",
+    };
+    for(size_t i=0;i<2;i++) {
+        struct sheet sheet={0};pc.sh=&sheet;
+        parse_font_face(&pc,bodies[i],bodies[i]+strlen(bodies[i]),NULL);
+        const char *want=i?"https://font.test/path/b.woff2":"https://font.test/path/a.woff2";
+        check(sheet.fonts&&sheet.fonts->sources&&!strcmp(sheet.fonts->sources->url,want),
+              i?"later supported src replaces earlier source":"all unsupported src is ignored, not empty override");
+        ar_free(&memory);
+    }
+}
+#include "cssmediacalc_cases.h"
+static void flex_shorthand_cases(void) {
+    static const struct { const char *value; float grow, shrink, px, pct; bool valid; } cases[]={
+        {"1 1 0",1,1,0,0,true}, {"2 3 0",2,3,0,0,true},
+        {"0 0 0",0,0,0,0,true}, {"1",1,1,0,0,true},
+        {"2 3",2,3,0,0,true}, {"6px 4 5",4,5,6,0,true},
+        {"6px 4",4,1,6,0,true}, {"7% 8",8,1,0,7,true},
+        {"1 1 calc(10px - 10px)",1,1,0,0,true},
+        {"2 3 4",0,0,0,0,false}, {"1 auto 2",0,0,0,0,false},
+        {"1 2 0 4",0,0,0,0,false}, {"5px 7%",0,0,0,0,false},
+        {"9 none",0,0,0,0,false}, {"-1 1 0",0,0,0,0,false},
+        {"1 -1 0",0,0,0,0,false}, {"1 2 calc(0)",0,0,0,0,false},
+        {"1 2 calc(3 - 3)",0,0,0,0,false},
+    };
+    const struct propdef *p=css_prop_lookup("flex",4);
+    for(size_t i=0;i<sizeof cases/sizeof *cases;i++) {
+        arena_t arena={0}; style_t style; css_style_init(&style,NULL);
+        style.flex_grow=7; style.flex_shrink=8; style.flex_basis=(len_t){.kind=LK_LEN,.px=9};
+        uint8_t *set=calloc((size_t)css_prop_count(),1);
+        struct cx cx={.a=&arena,.s=&style,.set=set,.em=16,.rem=16,.vw=1920,.vh=1080};
+        bool ok=css_apply(p,cases[i].value,strlen(cases[i].value),&cx);
+        check(ok==cases[i].valid,cases[i].value);
+        check(css_value_supported(p,cases[i].value,strlen(cases[i].value))==cases[i].valid,
+              "supports and cascade share flex grammar");
+        if(ok) check(style.flex_grow==cases[i].grow && style.flex_shrink==cases[i].shrink &&
+                     style.flex_basis.kind==LK_LEN && style.flex_basis.px==cases[i].px &&
+                     style.flex_basis.pct==cases[i].pct,"all flex components published");
+        else check(style.flex_grow==7 && style.flex_shrink==8 && style.flex_basis.px==9,
+                   "invalid shorthand preserves all prior components");
+        free(set); ar_free(&arena);
+    }
+}
+static void font_shorthand_cases(void) {
+    static const char *const values[]={
+        "600 1rem/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",\"Noto Sans\",Helvetica,Arial,sans-serif,\"Apple Color Emoji\",\"Segoe UI Emoji\"",
+        "600 1rem / 1.5 sans-serif", "600 1rem/ 1.5 sans-serif",
+        "600 1rem /1.5 sans-serif", "normal 1rem/1.5 sans-serif"
+    };
+    const struct propdef *p=css_prop_lookup("font",4);
+    for(size_t i=0;i<sizeof values/sizeof *values;i++) {
+        arena_t arena={0};style_t parent,style;css_style_init(&parent,NULL);parent.font_size=14;
+        css_style_init(&style,&parent);uint8_t *set=calloc((size_t)css_prop_count(),1);
+        struct cx cx={.a=&arena,.s=&style,.parent=&parent,.set=set,.em=14,.rem=16,.vw=1920,.vh=1080,.font_pass=true};
+        bool size=css_apply(p,values[i],strlen(values[i]),&cx);cx.font_pass=false;cx.em=style.font_size;
+        bool rest=css_apply(p,values[i],strlen(values[i]),&cx);
+        printf("font shorthand: %s size_ok=%d rest_ok=%d size=%.3f weight=%u family=%s\n",
+            values[i],size,rest,style.font_size,style.font_weight,style.font_names?style.font_names:"(none)");
+        check(size&&rest&&style.font_size==16&&style.font_weight==(i==4?400:600),"font shorthand two-pass computed components");
+        check(css_value_supported(p,values[i],strlen(values[i])),"font shorthand feature query uses same grammar");
+        free(set);ar_free(&arena);
+    }
+}
+static void text_overflow_cases(void) {
+    static const struct {const char *value;bool valid;uint8_t computed;} cases[]={
+        {"clip",true,TO_CLIP},{"ellipsis",true,TO_ELLIPSIS},{"ELLIPSIS",true,TO_ELLIPSIS},
+        {"initial",true,TO_CLIP},{"unset",true,TO_CLIP},{"inherit",true,TO_ELLIPSIS},
+        {"clip ellipsis",false,0},{"\"...\"",false,0},{"fade",false,0},{"",false,0}
+    };
+    const struct propdef *p=css_prop_lookup("text-overflow",13);
+    for(size_t i=0;i<sizeof cases/sizeof *cases;i++) {
+        arena_t a={0};style_t parent,style;css_style_init(&parent,NULL);parent.text_overflow=TO_ELLIPSIS;
+        css_style_init(&style,&parent);check(style.text_overflow==TO_CLIP,"text-overflow is not inherited by default");
+        style.text_overflow=TO_ELLIPSIS;uint8_t *set=calloc((size_t)css_prop_count(),1);
+        struct cx cx={.s=&style,.parent=&parent,.a=&a,.set=set,.em=16,.rem=16,.vw=1920,.vh=1080};
+        bool applied=css_apply(p,cases[i].value,strlen(cases[i].value),&cx);
+        check(applied==cases[i].valid, cases[i].value);
+        check(css_value_supported(p,cases[i].value,strlen(cases[i].value))==cases[i].valid,"Overflow3 grammar matches feature query");
+        check(style.text_overflow==(applied?cases[i].computed:TO_ELLIPSIS),"valid publishes or invalid preserves previous overflow marker");
+        free(set);ar_free(&a);
+    }
+}
+static void placeholder_cases(void) {
+    check(PE_PLACEHOLDER!=PE_SLOTTED,"placeholder is not the internal assigned-element selector marker");
+    static const char *const selectors[]={"input::placeholder", "textarea::placeholder", ".hint:focus::placeholder"};
+    arena_t a={0};struct pctx pc={.a=&a};
+    for(unsigned i=0;i<sizeof selectors/sizeof *selectors;i++) {
+        struct sellist *list=parse_sellist(&pc,selectors[i],selectors[i]+strlen(selectors[i]),false);
+        check(list&&list->n==1&&list->v[0]->pseudo==PE_PLACEHOLDER,"placeholder selector retains real pseudo kind");
+    }
+    pc.supports_probe=true;
+    const char *valid="input::placeholder",*invalid="input::placeholder(foo)";
+    check(parse_sellist(&pc,valid,valid+strlen(valid),false)!=NULL,"supports selector accepts implemented placeholder");
+    check(parse_sellist(&pc,invalid,invalid+strlen(invalid),false)==NULL,"placeholder function syntax rejected");
+    style_t parent,child,pseudo;css_style_init(&parent,NULL);css_style_init(&pseudo,&parent);
+    parent.placeholder=&pseudo;parent.color=RGB(10,20,30);pseudo.color=0;pseudo.opacity=1;
+    css_style_init(&child,&parent);
+    check(!child.placeholder,"placeholder pointer is not inherited by children");
+    check(control_text_color(&parent,false)==parent.color,"nonempty input value uses originating control colour");
+    check(control_text_color(&parent,true)==0,"author transparent placeholder suppresses native text");
+    pseudo.color=RGB(50,60,70);pseudo.opacity=0;
+    check(control_text_color(&parent,true)==0,"author opacity zero suppresses only placeholder text");
+    pseudo.opacity=.5f;
+    check(control_text_color(&parent,true)==0x80323c46u,"placeholder opacity multiplies colour alpha once");
+    parent.placeholder=NULL;
+    check(control_text_color(&parent,true)==RGB(117,117,117),"no authored pseudo retains UA grey colour");
+    web_doc d={0};node_t node={0};new_pool(&d);
+    node.style=fresh_style(&d,&node,NULL);
+    node.style->placeholder=fresh_style(&d,&node,node.style);
+    style_t *old=node.style;struct cascade cascade={.d=&d};retire_style(&cascade,&node);
+    node.style=fresh_style(&d,&node,NULL);node.style->placeholder=fresh_style(&d,&node,node.style);
+    check(d.style_pool->live==4&&old->placeholder,"placeholder old generation stays alive until publication join");
+    css_styles_release(&d);
+    check(d.style_pool->live==2&&!node.style_previous_slots,"joined generation returns old placeholder slot");
+    css_node_style_free(&node);check(d.style_pool->live==0,"originating node cleanup returns placeholder slot");
+    css_style_doc_free(&d);
+    style_t origin,body,descendant;css_style_init(&origin,NULL);css_style_init(&body,&origin);
+    node_t element={.type=N_ELEM,.tag=T_div,.style=&origin};
+    body.content="";
+    check(box_pseudo_generated(&element,&origin,&body),"empty content generates a real pseudo box");
+    body.content=NULL;
+    check(!box_pseudo_generated(&element,&origin,&body),"content none retains only computed body");
+    body.content="hint";body.display=D_NONE;
+    check(!box_pseudo_generated(&element,&origin,&body),"display none body does not generate");
+    body.display=D_INLINE;origin.display=D_NONE;
+    check(!box_pseudo_generated(&element,&origin,&body),"hidden origin does not generate pseudo boxes");
+    origin.display=D_BLOCK;element.tag=T_input;
+    check(!box_pseudo_generated(&element,&origin,&body),"replaced input does not generate before or after");
+    element.tag=T_button;
+    check(box_pseudo_generated(&element,&origin,&body),"native button preserves pseudo children");
+    origin.display=D_FLEX;
+    check(box_pseudo_generated(&element,&origin,&body),"flex button preserves pseudo children");
+    element.tag=T_object;
+    check(box_pseudo_generated(&element,&origin,&body),"object fallback preserves pseudo children");
+    origin.before_generated=origin.after_generated=true;css_style_init(&descendant,&origin);
+    check(!descendant.before_generated&&!descendant.after_generated,"pseudo generation flags do not inherit");
+    ar_free(&a);
+}
 int main(int argc, char **argv) {
+    if(argc>1 && !strcmp(argv[1],"placeholder"))placeholder_cases();
+    else
+    if(argc>1 && !strcmp(argv[1],"text-overflow"))text_overflow_cases();
+    else
+    if(argc>1 && !strcmp(argv[1],"font-shorthand"))font_shorthand_cases();
+    else
+    if(argc>1 && !strcmp(argv[1],"flex"))flex_shorthand_cases();
+    else
+    if(argc>1 && !strcmp(argv[1],"media-calc"))media_query_cases();
+    else
+    if(argc>1 && !strcmp(argv[1],"fonts"))font_sources_native();
+    else
     if (argc>1 && !strcmp(argv[1],"second")) { pseudo_generations(); cancelled_tail(); allocation_failures(); }
     else { fixed_styles(); adopted_style(); declaration_cache(); }
     printf("cssperformance: %d checks, %d failures\n", checks, failed); return failed ? 1 : 0;

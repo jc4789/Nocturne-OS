@@ -45,6 +45,23 @@ int main(void){
     canvas_t c={.px=storage+1,.w=16,.h=16,.pitch=32,.cx0=0,.cy0=0,.cx1=16,.cy1=16};
     nmedia_draw(&c,source,16,16,0,0,16,16);
     for(int yy=0;yy<16;yy++)for(int xx=0;xx<16;xx++)CHECK(c.px[yy*32+xx]==source[yy*16+xx]);
+    uint8_t mask_alpha[32*23];struct gfx_mask_span opaque_rows[23];
+    for(int yy=0;yy<23;yy++) {
+        opaque_rows[yy]=(struct gfx_mask_span){10,20};
+        for(int xx=0;xx<32;xx++)mask_alpha[yy*32+xx]=xx>=10&&xx<20?255:xx==9||xx==20?192:xx==8||xx==21?128:0;
+    }
+    struct gfx_mask_clip mask={.alpha=mask_alpha,.x=0,.y=0,.w=32,.h=23,.pitch=32};
+    uint32_t reference_pixels[32*23];
+    for(int offset=-11;offset<12;offset+=11)for(int sized=0;sized<2;sized++) {
+        for(unsigned i=0;i<32*23+2;i++)storage[i]=0x159753bdu;
+        c=(canvas_t){.px=storage+1,.w=29,.h=23,.pitch=32,.cx0=3,.cy0=2,.cx1=26,.cy1=21,.mask_clip=&mask};mask.opaque=NULL;
+        nmedia_draw(&c,source,sized?16:64,sized?16:48,offset,offset,sized?16:31,sized?16:25);
+        memcpy(reference_pixels,c.px,sizeof reference_pixels);
+        for(unsigned i=0;i<32*23+2;i++)storage[i]=0x159753bdu;mask.opaque=opaque_rows;
+        nmedia_draw(&c,source,sized?16:64,sized?16:48,offset,offset,sized?16:31,sized?16:25);
+        CHECK(!memcmp(reference_pixels,c.px,sizeof reference_pixels));
+        CHECK(storage[0]==0x159753bdu&&storage[32*23+1]==0x159753bdu);
+    }
     uint32_t *frame=malloc(480u*270u*4),*screen=malloc(1920u*1080u*4);
     if(frame&&screen){
         for(unsigned i=0;i<480u*270u;i++)frame[i]=source[i%(64*48)];

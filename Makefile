@@ -183,6 +183,10 @@ user/libc/web/js_bootstrap.inc user/libc/web/js_form_url.inc &: $(wildcard user/
 	@$(PY) user/libc/web/js_embed.py
 $(BUILD)/u/user/libc/web/js.o: user/libc/web/js_bootstrap.inc
 $(BUILD)/u/user/libc/web/form_validation.o: user/libc/web/js_form_url.inc
+# 原UCD／generator変更時に表を正規再生成。guest内linkは保全された表を使う。
+user/libc/web/unicode_grapheme_data.h: scripts/unicode_grapheme.py third_party/unicode/18.0.0/GraphemeBreakProperty.txt third_party/unicode/18.0.0/DerivedCoreProperties.txt third_party/unicode/18.0.0/emoji-data.txt
+	@$(PY) scripts/unicode_grapheme.py
+$(BUILD)/u/user/libc/web/layout.o: user/libc/web/unicode_grapheme_data.h
 user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_error_event.js user/libc/web/js_clone.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
 	@$(PY) user/libc/web/js_worker_embed.py
 $(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc user/libc/web/js_worker_transfer.h user/libc/web/js_worker_port_lifetime.h

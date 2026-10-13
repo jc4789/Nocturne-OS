@@ -3,9 +3,31 @@ from pathlib import Path
 import hashlib
 import os
 import subprocess
+import sys
 root=Path(__file__).resolve().parent.parent
 out=root / 'build/goal-20261009'
 source=(root / 'user/libc/web/js.c').read_text(encoding='utf-8')
+if '--insertion-only' in sys.argv:
+    out.mkdir(parents=True,exist_ok=True)
+    capture=source[source.index('/* Shadow-including preorder,'):source.index('static bool equal_nodes(')]
+    prepare=source[source.index('static void dynamic_prepare_node('):source.index('static struct js_resource_event *script_event(',source.index('static void dynamic_prepare_node('))]
+    types=source[source.index('struct js_inserted_roots {'):source.index('struct web_js_state {')]
+    prefix=(root / 'tests/scriptlifecycletest.c').read_text(encoding='utf-8')
+    c=out / 'script-insertion-host-generated.c'
+    c.write_text(prefix.replace('/* PRODUCT_INSERTED_ROOTS_TYPE */',types).replace('/* PRODUCT_DYNAMIC_INSERTION */',capture+prepare),encoding='utf-8')
+    cc=root / 'tools/msys64/ucrt64/bin/clang.exe'
+    env=dict(os.environ,PATH=str(cc.parent)+os.pathsep+os.environ.get('PATH',''))
+    exe=out / 'script-insertion-host.exe'
+    log=out / 'script-insertion-host.log'
+    with log.open('w',encoding='utf-8') as f:
+        f.write('product js.c SHA256 '+hashlib.sha256(source.encode('utf-8')).hexdigest()+'\n')
+        f.write('generated SHA256 '+hashlib.sha256(c.read_bytes()).hexdigest()+'\n');f.flush()
+        result=subprocess.run([str(cc),'-std=gnu11','-O1','-DSCRIPT_INSERTION_HOST',str(c),'-o',str(exe)],cwd=root,env=env,stdout=f,stderr=subprocess.STDOUT)
+        if result.returncode==0:
+            result=subprocess.run([str(exe)],cwd=root,env=env,stdout=f,stderr=subprocess.STDOUT,timeout=30)
+        f.write('exit '+str(result.returncode)+'\n')
+    print(log.read_text(encoding='utf-8'))
+    sys.exit(result.returncode)
 helpers=source[source.index('static void release_timer('):source.index('static JSValue native_css_supports(')]
 helpers+=source[source.index('static JSValue native_clear('):source.index('static JSValue microtask_job(')]
 helpers+=source[source.index('static struct js_pending *pending_new('):source.index('static void pending_error(')]

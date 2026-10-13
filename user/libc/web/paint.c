@@ -10,6 +10,7 @@
 #include <parallel.h>
 #include "webi.h"
 #include <limits.h>
+#include <float.h>
 #include "frame.h"
 #include "web_dialog.h"
 #include "js_canvas.h"
@@ -28,6 +29,9 @@ struct hit_primitive {
     node_t *target, *node;
     size_t order;
     int kind;
+    box_t *box;
+    const struct radius_cache *radius;
+    float radius_x,radius_y;
 };
 struct hit_branch {
     float rect[4];
@@ -62,6 +66,9 @@ struct pctx {
     bool bounds_valid, failed;
     struct web_hit_index *index_build;
     float hit_rect[4];
+    const struct radius_cache *hit_radius;
+    float hit_shape_x,hit_shape_y;
+    const struct gfx_mask_clip *viewport_mask;
 };
 #include "paint_media_debug.h"
 
@@ -111,6 +118,101 @@ static uint32_t with_alpha(uint32_t col, float a) {
     int al = (int)((float)(col >> 24) * a + 0.5f);
     if (al <= 0) return 0;
     return ((uint32_t)al << 24) | (col & 0xFFFFFF);
+}
+struct border_radii { float x[4],y[4]; };
+static void radii_normalize(struct border_radii *r,float w,float h) {
+    double factor=1;
+    for(int side=0;side<4;side++) {
+        double sum=side==0?r->x[0]+(double)r->x[1]:side==1?r->y[1]+(double)r->y[2]:
+                   side==2?r->x[2]+(double)r->x[3]:r->y[3]+(double)r->y[0];
+        double extent=(side&1)?h:w;if(sum>extent&&sum>0)factor=fmin(factor,extent/sum);
+    }
+    for(int i=0;i<4;i++){r->x[i]*=(float)factor;r->y[i]*=(float)factor;if(r->x[i]<=0||r->y[i]<=0)r->x[i]=r->y[i]=0;}
+}
+static struct border_radii used_radii(const style_t *st,float w,float h) {
+    struct border_radii r={0};
+    bool specified=false;for(int i=0;i<4;i++)for(int axis=0;axis<2;axis++)specified|=st->corner_radius[i].axis[axis].kind!=LK_AUTO;
+    for(int i=0;i<4;i++) {
+        if(specified){r.x[i]=fmaxf(0,len_resolve(&st->corner_radius[i].axis[0],w));r.y[i]=fmaxf(0,len_resolve(&st->corner_radius[i].axis[1],h));}
+        else if(st->border_radius>=0)r.x[i]=r.y[i]=st->border_radius;
+        else{r.x[i]=-st->border_radius*w*.01f;r.y[i]=-st->border_radius*h*.01f;}
+        if(!isfinite(r.x[i]))r.x[i]=FLT_MAX/8;if(!isfinite(r.y[i]))r.y[i]=FLT_MAX/8;
+    }
+    radii_normalize(&r,w,h);return r;
+}
+static struct border_radii inset_radii(struct border_radii r,const float *edges,float w,float h) {
+    static const int xs[4]={3,1,1,3},ys[4]={0,0,2,2};
+    for(int i=0;i<4;i++){r.x[i]=fmaxf(0,r.x[i]-edges[xs[i]]);r.y[i]=fmaxf(0,r.y[i]-edges[ys[i]]);}
+    radii_normalize(&r,w,h);return r;
+}
+static bool radii_any(const struct border_radii *r){for(int i=0;i<4;i++)if(r->x[i]>0&&r->y[i]>0)return true;return false;}
+/* Signed-distance linearization is used only at the anti-aliased elliptical
+   boundary. The rectangular middle takes no divisions or square roots. */
+static float corners_coverage(float px,float py,float x,float y,float w,float h,const struct border_radii *r) {
+    bool circular=r->x[0]==r->y[0];
+    for(int i=1;i<4&&circular;i++)circular=r->x[i]==r->x[0]&&r->y[i]==r->y[0];
+    if(circular)return coverage(sdf_rrect(px,py,x,y,w,h,r->x[0])); /* preserve established circle AA exactly */
+    float cover=fminf(fminf(px-x+.5f,x+w-px+.5f),fminf(py-y+.5f,y+h-py+.5f));
+    if(cover<=0)return 0;cover=fminf(1,cover);
+    for(int i=0;i<4;i++) {
+        float rx=r->x[i],ry=r->y[i];if(rx<=0||ry<=0)continue;
+        bool right=i==1||i==2,bottom=i>=2;
+        float cx=right?x+w-rx:x+rx,cy=bottom?y+h-ry:y+ry;
+        if((right?px<cx:px>cx)||(bottom?py<cy:py>cy))continue;
+        float dx=fabsf(px-cx)/rx,dy=fabsf(py-cy)/ry;
+        float norm=sqrtf(dx*dx+dy*dy);if(norm==0)continue;
+        float gradient=sqrtf((dx/rx)*(dx/rx)+(dy/ry)*(dy/ry));
+        if(gradient>0)cover=fminf(cover,coverage((norm-1)/gradient));
+    }
+    return cover;
+}
+struct radius_cache {
+    float x,y,w,h;struct border_radii radii;
+    int left,top,width,height;bool clipped;
+    int view_x,view_y,view_w,view_h;
+    uint8_t *alpha;
+    struct gfx_mask_span *opaque;
+};
+void web_radius_cache_free(struct radius_cache **slot){struct radius_cache *cache=*slot;*slot=NULL;if(cache){free(cache->alpha);free(cache->opaque);free(cache);}}
+static bool radius_cache_prepare(web_doc *doc,struct radius_cache **slot,float x,float y,float w,float h,struct border_radii radii) {
+    if(!radii_any(&radii)||w<=0||h<=0){web_radius_cache_free(slot);return true;}
+    if(!web_native_checkpoint(doc))return false; /* empty/offscreen slices still cancel before publication */
+    struct radius_cache *old=*slot;
+    if(old&&old->x==x&&old->y==y&&old->w==w&&old->h==h&&!memcmp(&old->radii,&radii,sizeof radii)&&
+        (!old->clipped||(old->view_x==doc->view_x&&old->view_y==doc->view_y&&old->view_w==doc->width&&old->view_h==doc->height))){doc->paint_shadow_crop|=old->clipped;return true;}
+    double vx1=(double)doc->view_x+doc->width,vy1=(double)doc->view_y+doc->height;
+    double left=fmin(vx1,fmax(floor((double)x),doc->view_x)),top=fmin(vy1,fmax(floor((double)y),doc->view_y));
+    double right=fmax(doc->view_x,fmin(ceil((double)x+w),vx1)),bottom=fmax(doc->view_y,fmin(ceil((double)y+h),vy1));
+    if(!isfinite(left)||!isfinite(top)||left<INT_MIN||top<INT_MIN||left>INT_MAX||top>INT_MAX)return false;
+    double width=fmax(0,right-left),height=fmax(0,bottom-top);
+    if(width>INT_MAX||height>INT_MAX||(height>0&&(size_t)width>SIZE_MAX/(size_t)height))return false;
+    struct radius_cache *next=calloc(1,sizeof *next);if(!next)return false;
+    next->x=x;next->y=y;next->w=w;next->h=h;next->radii=radii;next->left=(int)left;next->top=(int)top;next->width=(int)width;next->height=(int)height;
+    next->clipped=left!=floor((double)x)||top!=floor((double)y)||right!=ceil((double)x+w)||bottom!=ceil((double)y+h);
+    next->view_x=doc->view_x;next->view_y=doc->view_y;next->view_w=doc->width;next->view_h=doc->height;
+    size_t pixels=(size_t)next->width*next->height;
+    if(pixels&&((size_t)next->height>SIZE_MAX/sizeof *next->opaque||
+        !(next->alpha=malloc(pixels))||!(next->opaque=calloc((size_t)next->height,sizeof *next->opaque)))){web_radius_cache_free(&next);return false;}
+    for(int py=0;py<next->height;py++) {
+        if(!(py&31)&&!web_native_checkpoint(doc)){web_radius_cache_free(&next);return false;}
+        int first=-1,last=0;
+        for(int px=0;px<next->width;px++) {
+            uint8_t alpha=(uint8_t)(255*corners_coverage(next->left+px+.5f,next->top+py+.5f,x,y,w,h,&radii)+.5f);
+            next->alpha[(size_t)py*next->width+px]=alpha;
+            if(alpha==255){if(first<0)first=px;last=px+1;}
+        }
+        if(next->opaque)next->opaque[py]=(struct gfx_mask_span){first<0?0:first,last};
+    }
+    doc->paint_shadow_crop|=next->clipped;web_radius_cache_free(slot);*slot=next;return true;
+}
+static bool radius_clip_push(struct pctx *P,const struct radius_cache *cache,struct gfx_mask_clip *clip,float x,float y) {
+    if(!cache)return false;
+    double left=cache->left+((double)x-cache->x),top=cache->top+((double)y-cache->y);
+    if(!isfinite(left)||!isfinite(top)||left<INT_MIN||top<INT_MIN||left>INT_MAX||top>INT_MAX){P->failed=true;return false;}
+    *clip=(struct gfx_mask_clip){.next=P->c->mask_clip,.alpha=cache->alpha,.x=(int)lround(left),.y=(int)lround(top),.w=cache->width,.h=cache->height,.pitch=cache->width,.opaque=cache->opaque};
+    P->c->mask_clip=clip;
+    web_avmedia_snapshot_reject_region(P->c,clip->x,clip->y,clip->w,clip->h);
+    return true;
 }
 
 static uint32_t lerp_col(uint32_t a, uint32_t b, float t) {
@@ -190,6 +292,191 @@ static void ring_rrect_serial(canvas_t *c, float x, float y, float w, float h, f
             if (a <= 0) continue;
             uint32_t cc = band ? rowcol : fx < x + w / 2 ? col[3] : col[1];
             gfx_blend_pixel(c, px, py, with_alpha(cc, a));
+        }
+    }
+}
+
+/* Shadow geometry is cached with its box, independently of computed-style
+   arena addresses/colors. Gaussian construction happens before canvas writes;
+   ordinary repaint only composites the retained alpha mask. */
+static float used_radius(const style_t *, float, float);
+struct shadow_mask {
+    struct css_box_shadow value;
+    uint8_t *alpha;
+    int left, top, width, height;
+};
+struct shadow_cache {
+    float width, height, fx, fy, borders[4];
+    struct border_radii radii;
+    float viewport[4];
+    bool clipped;
+    size_t count;
+    struct shadow_mask masks[];
+};
+void web_shadow_cache_free(struct shadow_cache **slot) {
+    struct shadow_cache *cache = *slot; *slot = NULL;
+    if (!cache) return;
+    for (size_t i = 0; i < cache->count; i++) free(cache->masks[i].alpha);
+    free(cache);
+}
+static float shadow_spread_radius(float radius, float spread) {
+    if (radius <= 0) return 0;
+    if (spread > radius) {
+        float ratio = 1 - radius / spread;
+        return radius + spread * (1 - ratio * ratio * ratio);
+    }
+    return fmaxf(0, radius + spread);
+}
+struct shadow_blur_job {
+    const uint8_t *source;
+    uint8_t *target;
+    const float *kernel;
+    int width, height, radius;
+    bool vertical;
+};
+static void shadow_blur_rows(size_t tile, void *opaque) {
+    const struct shadow_blur_job *job = opaque;
+    int y0 = (int)tile * 32, y1 = MIN(y0 + 32, job->height);
+    for (int y = y0; y < y1; y++) for (int x = 0; x < job->width; x++) {
+        float sum = 0; int position = job->vertical ? y : x, limit = job->vertical ? job->height : job->width;
+        int first = MAX(-job->radius, -position), last = MIN(job->radius, limit - position - 1);
+        for (int k = first; k <= last; k++) {
+            size_t at = job->vertical ? (size_t)(y+k)*job->width+x : (size_t)y*job->width+x+k;
+            sum += job->source[at] * job->kernel[k + job->radius];
+        }
+        job->target[(size_t)y*job->width+x] = (uint8_t)fminf(255, floorf(sum + .5f));
+    }
+    parallel_record_work(PARALLEL_RASTER, (uint64_t)job->width * (y1-y0));
+}
+static void shadow_service(void *opaque) { web_native_checkpoint(opaque); }
+static bool shadow_mask_build(web_doc *doc, struct shadow_cache *cache, struct shadow_mask *mask) {
+    const struct css_box_shadow *shadow = &mask->value;
+    if (!(shadow->color >> 24)) return true;
+    float spread = shadow->inset ? -shadow->spread : shadow->spread;
+    float x = cache->fx + shadow->x, y = cache->fy + shadow->y, w = cache->width, h = cache->height;
+    struct border_radii radii=cache->radii;
+    if (shadow->inset) {
+        x += cache->borders[3]; y += cache->borders[0];
+        w -= cache->borders[1] + cache->borders[3]; h -= cache->borders[0] + cache->borders[2];
+        radii=inset_radii(radii,cache->borders,w,h);
+    }
+    x -= spread; y -= spread; w += spread*2; h += spread*2;
+    for(int i=0;i<4;i++){radii.x[i]=shadow_spread_radius(radii.x[i],spread);radii.y[i]=shadow_spread_radius(radii.y[i],spread);}
+    radii_normalize(&radii,w,h);
+    if (w <= 0 || h <= 0) return true; /* empty outset / solid inset */
+    double halo = ceil((double)shadow->blur * 1.5), left = floor(x)-halo-1, top = floor(y)-halo-1;
+    double right=ceil(x+w)+halo+1,bottom=ceil(y+h)+halo+1;
+    /* Only a convolution halo around the requested viewport is necessary.
+       A million-pixel-tall author box does not allocate a million-pixel mask.
+       When scrolling exposes a new slice the cache is rebuilt, not skipped. */
+    double clipped_left=fmax(left,floor(cache->viewport[0])-halo-1),clipped_top=fmax(top,floor(cache->viewport[1])-halo-1);
+    double clipped_right=fmin(right,ceil(cache->viewport[2])+halo+1),clipped_bottom=fmin(bottom,ceil(cache->viewport[3])+halo+1);
+    cache->clipped|=clipped_left!=left||clipped_top!=top||clipped_right!=right||clipped_bottom!=bottom;
+    left=clipped_left;top=clipped_top;right=clipped_right;bottom=clipped_bottom;
+    double width=right-left,height=bottom-top;
+    if(width<=0||height<=0)return true;
+    if (!isfinite(width) || !isfinite(height) || left < INT_MIN || left > INT_MAX || top < INT_MIN || top > INT_MAX ||
+        width <= 0 || height <= 0 || width > INT_MAX || height > INT_MAX || halo > (INT_MAX-1)/2) return false;
+    mask->left = (int)left; mask->top = (int)top; mask->width = (int)width; mask->height = (int)height;
+    if((size_t)mask->width>SIZE_MAX/(size_t)mask->height)return false;
+    size_t pixels = (size_t)mask->width * mask->height;
+    mask->alpha = calloc(pixels, 1); if (!mask->alpha) return false;
+    float sx = x - mask->left, sy = y - mask->top;
+    for (int py = 0; py < mask->height; py++) {
+        if (!(py & 31) && !web_native_checkpoint(doc)) return false;
+        float fy = py + .5f;
+        if (fy < sy-.5f || fy > sy+h+.5f) continue;
+        int first = (int)fmaxf(0,fminf(mask->width,floorf(sx)));
+        int last = (int)fmaxf(0,fminf(mask->width,ceilf(sx+w)));
+        for (int px = first; px < last; px++)
+            mask->alpha[(size_t)py*mask->width+px] = (uint8_t)(corners_coverage(px+.5f,fy,sx,sy,w,h,&radii)*255+.5f);
+    }
+    if (shadow->blur <= 0) return true;
+    int extent = (int)halo; size_t kernel_count = (size_t)extent*2+1;
+    if (kernel_count > SIZE_MAX / sizeof(float)) return false;
+    float *kernel = malloc(kernel_count*sizeof *kernel); uint8_t *temporary = malloc(pixels);
+    if (!kernel || !temporary) { free(kernel); free(temporary); return false; }
+    double sigma = shadow->blur / 2.0, inverse = -.5 / (sigma*sigma), sum = 0;
+    for (int i = -extent; i <= extent; i++) { kernel[i+extent] = (float)exp((double)i*i*inverse); sum += kernel[i+extent]; }
+    float normalize = (float)(1/sum); for (size_t i = 0; i < kernel_count; i++) kernel[i] *= normalize;
+    struct shadow_blur_job job = {mask->alpha,temporary,kernel,mask->width,mask->height,extent,false};
+    size_t rows = ((size_t)mask->height+31)/32;
+    parallel_for_stage(PARALLEL_RASTER, rows, shadow_blur_rows, &job, shadow_service, doc);
+    bool success = !__atomic_load_n(&doc->native_cancelled,__ATOMIC_ACQUIRE);
+    if (success) {
+        job.source = temporary; job.target = mask->alpha; job.vertical = true;
+        parallel_for_stage(PARALLEL_RASTER, rows, shadow_blur_rows, &job, shadow_service, doc);
+        success = !__atomic_load_n(&doc->native_cancelled,__ATOMIC_ACQUIRE);
+    }
+    free(kernel); free(temporary); return success;
+}
+static bool shadow_cache_prepare_radii(web_doc *doc, struct shadow_cache **slot, const style_t *style,
+                                 float x, float y, float w, float h, const float *borders,struct border_radii radii) {
+    const struct css_box_shadow *shadow = style->box_shadow;
+    if (!shadow) { web_shadow_cache_free(slot); return true; }
+    float fx = x-floorf(x), fy = y-floorf(y); size_t count = 0;
+    for (const struct css_box_shadow *s = shadow; s; s=s->next) {
+        if(!(count&63)&&!web_native_checkpoint(doc))return false;
+        if (count == (SIZE_MAX-sizeof(struct shadow_cache))/sizeof(struct shadow_mask)) return false; count++;
+    }
+    struct shadow_cache *old = *slot;
+    float viewport[4]={doc->view_x-floorf(x),doc->view_y-floorf(y),doc->view_x+doc->width-floorf(x),doc->view_y+doc->height-floorf(y)};
+    bool same = old && old->count==count && old->width==w && old->height==h && !memcmp(&old->radii,&radii,sizeof radii) && old->fx==fx && old->fy==fy &&
+        !memcmp(old->borders,borders,sizeof old->borders) && (!old->clipped||!memcmp(old->viewport,viewport,sizeof viewport));
+    for (size_t i=0; same && i<count; i++,shadow=shadow->next) {
+        const struct css_box_shadow *a=&old->masks[i].value;
+        same = a->x==shadow->x && a->y==shadow->y && a->blur==shadow->blur && a->spread==shadow->spread && a->inset==shadow->inset &&
+            (!!(a->color>>24)==!!(shadow->color>>24));
+    }
+    if (same) {
+        shadow=style->box_shadow; for(size_t i=0;i<count;i++,shadow=shadow->next)old->masks[i].value.color=shadow->color;
+        doc->paint_shadow_crop|=old->clipped;
+        return true;
+    }
+    struct shadow_cache *next=calloc(1,sizeof *next+count*sizeof *next->masks); if(!next)return false;
+    next->width=w;next->height=h;next->radii=radii;next->fx=fx;next->fy=fy;next->count=count;memcpy(next->borders,borders,sizeof next->borders);
+    memcpy(next->viewport,viewport,sizeof viewport);
+    shadow=style->box_shadow;
+    for(size_t i=0;i<count;i++,shadow=shadow->next){
+        if(!(i&63)&&!web_native_checkpoint(doc)){web_shadow_cache_free(&next);return false;}
+        next->masks[i].value=*shadow;next->masks[i].value.next=NULL;
+        if(!shadow_mask_build(doc,next,&next->masks[i])){web_shadow_cache_free(&next);return false;}
+    }
+    doc->paint_shadow_crop|=next->clipped;web_shadow_cache_free(slot);*slot=next;return true;
+}
+static bool shadow_cache_prepare(web_doc *doc,struct shadow_cache **slot,const style_t *style,
+                                 float x,float y,float w,float h,const float *borders) {
+    return shadow_cache_prepare_radii(doc,slot,style,x,y,w,h,borders,used_radii(style,w,h));
+}
+static void paint_shadows(struct pctx *P,const struct shadow_cache *cache,float x,float y,bool inset) {
+    if(!cache)return;canvas_t *canvas=P->c;
+    for(size_t i=cache->count;i>0;i--){
+        const struct shadow_mask *mask=&cache->masks[i-1];const struct css_box_shadow *shadow=&mask->value;
+        if(shadow->inset!=inset || !(shadow->color>>24))continue;
+        float bx=inset?x+cache->borders[3]:x,by=inset?y+cache->borders[0]:y;
+        float bw=inset?cache->width-cache->borders[1]-cache->borders[3]:cache->width;
+        float bh=inset?cache->height-cache->borders[0]-cache->borders[2]:cache->height;
+        struct border_radii radii=inset?inset_radii(cache->radii,cache->borders,bw,bh):cache->radii;
+        if(!inset&&!mask->alpha)continue;
+        double mx=floor((double)x)+mask->left,my=floor((double)y)+mask->top;
+        double left=inset?floor((double)bx):mx,top=inset?floor((double)by):my;
+        double right=inset?ceil((double)bx+bw):mx+mask->width,bottom=inset?ceil((double)by+bh):my+mask->height;
+        int x0=(int)fmax(canvas->cx0,fmin(canvas->cx1,left)),y0=(int)fmax(canvas->cy0,fmin(canvas->cy1,top));
+        int x1=(int)fmax(canvas->cx0,fmin(canvas->cx1,right)),y1=(int)fmax(canvas->cy0,fmin(canvas->cy1,bottom));
+        /* Masks, allocation, Gaussian work and cancellation are completed in
+           preflight. Do not introduce a new halfway-cancelled canvas write:
+           ordinary (non-alpha-group) paint has no viewport rollback buffer. */
+        for(int py=y0;py<y1;py++) {
+            for(int px=x0;px<x1;px++) {
+                float cover=corners_coverage(px+.5f,py+.5f,bx,by,bw,bh,&radii);
+                if(!inset)cover=1-cover;if(cover<=0)continue;
+                unsigned alpha=0;
+                if(mask->alpha&&px>=mx&&py>=my&&px-mx<mask->width&&py-my<mask->height)
+                    alpha=mask->alpha[(size_t)(py-my)*mask->width+(size_t)(px-mx)];
+                if(inset)alpha=255-alpha;
+                uint32_t color=with_alpha(shadow->color,cover*(float)alpha*(1.0f/255));
+                if(color>>24)gfx_blend_pixel(canvas,px,py,color);
+            }
         }
     }
 }
@@ -540,31 +827,64 @@ static void fill_gradient(canvas_t *c, float x, float y, float w, float h, float
     raster_draw(c,x,y,w,h,raster_gradient,&geometry);
 }
 
+static unsigned radius_alpha(const struct radius_cache *cache,int x,int y,float shape_x,float shape_y) {
+    int64_t px=(int64_t)x-(int64_t)lround((double)cache->left+((double)shape_x-cache->x)),py=(int64_t)y-(int64_t)lround((double)cache->top+((double)shape_y-cache->y));
+    return px>=0&&py>=0&&px<cache->width&&py<cache->height&&cache->alpha?cache->alpha[(size_t)py*cache->width+(size_t)px]:0;
+}
+static void paint_corner_border(struct pctx *P,float x,float y,float w,float h,const float *widths,const uint32_t *colors,
+                                const struct radius_cache *outer,const struct radius_cache *inner) {
+    canvas_t *c=P->c;
+    int x0=(int)fmax(c->cx0,fmin(c->cx1,floor((double)x))),y0=(int)fmax(c->cy0,fmin(c->cy1,floor((double)y)));
+    int x1=(int)fmax(c->cx0,fmin(c->cx1,ceil((double)x+w))),y1=(int)fmax(c->cy0,fmin(c->cy1,ceil((double)y+h)));
+    for(int py=y0;py<y1;py++)for(int px=x0;px<x1;px++) {
+        unsigned outside=radius_alpha(outer,px,py,x,y);if(!outside)continue;
+        unsigned inside=inner?radius_alpha(inner,px,py,x+widths[3],y+widths[0]):
+            (px+.5f>=x+widths[3]&&px+.5f<x+w-widths[1]&&py+.5f>=y+widths[0]&&py+.5f<y+h-widths[2]?255:0);
+        float cover=outside*(255-inside)*(1.f/(255*255));if(cover<=0)continue;
+        float distance[4]={py+.5f-y,x+w-px-.5f,y+h-py-.5f,px+.5f-x};int side=-1;
+        for(int i=0;i<4;i++)if(widths[i]>0&&(side<0||distance[i]*widths[side]<distance[side]*widths[i]))side=i;
+        if(side>=0)gfx_blend_pixel(c,px,py,with_alpha(colors[side],cover));
+    }
+}
 static void paint_bg_border(struct pctx *P, const style_t *st, float x, float y, float w, float h, const float *bw,
-                            bool skip_bg, bool open_l, bool open_r) {
+                            bool skip_bg, bool open_l, bool open_r, const struct shadow_cache *shadows,struct radius_cache *const *rounded) {
     canvas_t *c = P->c;
     /* Culling the primitive, not the subtree: visible-overflow and fixed
      * descendants must still be walked, and offscreen resources stay wanted. */
+    paint_shadows(P,shadows,x,y,false);
+    if(P->failed)return;
     if (x >= c->cx1 || y >= c->cy1 || x + w <= c->cx0 || y + h <= c->cy0) return;
     float r = used_radius(st, w, h);
+    const struct gfx_mask_clip *previous=c->mask_clip;struct gfx_mask_clip boundary;
+    if(rounded)radius_clip_push(P,rounded[0],&boundary,x,y);
     if (st->mask_img) { /* an icon: the background colour through the mask, nothing else */
         uint32_t col = st->has_grad ? st->grad[0] : st->bg_color;
         if (!skip_bg && (col >> 24))
             paint_layer(P, st->mask_img, st->mask_size_kind, st->mask_size, st->mask_pos, st->mask_repeat, col, x, y, w,
                         h, bw);
-        return;
+        c->mask_clip=previous;return;
     }
     if (!skip_bg) {
-        if (st->bg_color >> 24) fill_rrect(c, x, y, w, h, r, st->bg_color, st->bg_color);
-        if (st->has_grad && st->gradient) fill_gradient(c, x, y, w, h, r, st->gradient, st->color);
+        if (st->bg_color >> 24) {
+            if(rounded&&rounded[0])gfx_fill_blend(c,(int)floorf(x),(int)floorf(y),(int)ceilf(x+w)-(int)floorf(x),(int)ceilf(y+h)-(int)floorf(y),st->bg_color);
+            else fill_rrect(c, x, y, w, h, r, st->bg_color, st->bg_color);
+        }
+        if (st->has_grad && st->gradient) fill_gradient(c, x, y, w, h, rounded&&rounded[0]?0:r, st->gradient, st->color);
     }
     if (st->bg_img)
         paint_layer(P, st->bg_img, st->bg_size_kind, st->bg_size, st->bg_pos, st->bg_repeat, 0, x, y, w, h, bw);
+    c->mask_clip=previous;
+    paint_shadows(P,shadows,x,y,true);
+    if(P->failed)return;
     const uint32_t *bc = st->border_color;
     bool any = false;
     for (int i = 0; i < 4; i++)
         if (bw[i] > 0 && (bc[i] >> 24) && st->border_style[i] > BS_HIDDEN) any = true;
     if (!any) return;
+    if(rounded&&rounded[0]) {
+        float widths[4];uint32_t colors[4];for(int i=0;i<4;i++){widths[i]=bw[i];colors[i]=st->border_style[i]>BS_HIDDEN?bc[i]:0;}
+        paint_corner_border(P,x,y,w,h,widths,colors,rounded[0],rounded[1]);return;
+    }
     if (r >= 1) {
         float bws[4];
         uint32_t cols[4];
@@ -659,6 +979,10 @@ static size_t password_offset(const char *text, size_t byte) {
     for (size_t i = 0; i < byte && text[i]; i++) if (((unsigned char)text[i] & 0xc0) != 0x80) bullets++;
     return bullets * 3;
 }
+static uint32_t control_text_color(const style_t *style, bool placeholder) {
+    if (!placeholder) return style->color;
+    return style->placeholder ? with_alpha(style->placeholder->color, style->placeholder->opacity) : RGB(117, 117, 117);
+}
 
 static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     /* x, y: content box on the canvas */
@@ -674,12 +998,15 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
         bool placeholder = !*v;
         if (placeholder) v = node_attr(n, "placeholder");
         if (!v) v = "";
+        const style_t *text_style = placeholder && st->placeholder ? st->placeholder : st;
+        if (placeholder && st->placeholder) f = style_font(text_style);
         int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
         /* like browsers, clip to the padding box: descenders may hang below a short content box */
         gfx_clip(c, (int)(x - b->p[3]), (int)(y - b->p[0]), (int)ceilf(w + b->p[1] + b->p[3]) + 1, (int)ceilf(h + b->p[0] + b->p[2]) + 1);
         const char *t = node_attr(n, "type");
         bool pw = t && str_ieq(t, "password") && !placeholder;
-        uint32_t col = placeholder ? RGB(117, 117, 117) : st->color;
+        uint32_t col = control_text_color(st, placeholder);
+        if (placeholder && !(col >> 24)) v = ""; /* keep editing/caret geometry, avoid invisible glyph work */
         size_t selection_start = !placeholder ? doc_utf16_to_byte(v, n->selection_start, false) : 0;
         size_t selection_end = !placeholder ? doc_utf16_to_byte(v, n->selection_end, true) : 0;
         bool selected = focused && !placeholder && n->selection_start != n->selection_end;
@@ -708,7 +1035,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
                 right = x - scroll + wf_width(&f, txt, end);
                 gfx_fill(c, (int)floorf(left), (int)y, (int)ceilf(right - left), (int)ceilf(h), RGB(0, 117, 255));
             }
-            text_in(P, st, x - scroll, y, h, txt, col);
+            text_in(P, text_style, x - scroll, y, h, txt, col);
             if (selected) {
                 int cx0 = c->cx0, cy0 = c->cy0, cx1 = c->cx1, cy1 = c->cy1;
                 gfx_clip(c, (int)floorf(left), (int)y, (int)ceilf(right - left), (int)ceilf(h));
@@ -721,7 +1048,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
             wfont ff = f;
             float asc, desc;
             wf_metrics(&ff, &asc, &desc);
-            float lh = st->font_size * 1.2f;
+            float lh = text_style->font_size * 1.2f;
             float ly = y;
             const char *p = v;
             int caret = focused ? P->d->caret : -1;
@@ -737,7 +1064,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
                 bool line_selected = selected && selection_start <= offset + len && selection_end > offset;
                 if (line_selected && e && selection_end > offset + len) right += wf_width(&ff, " ", 1);
                 if (line_selected) gfx_fill(c, (int)floorf(left), (int)ly, (int)ceilf(right - left), (int)ceilf(lh), RGB(0, 117, 255));
-                draw_text(P, st, x, ly + (lh - asc - desc) / 2 + asc, p, (int)len, col);
+                draw_text(P, text_style, x, ly + (lh - asc - desc) / 2 + asc, p, (int)len, col);
                 if (line_selected) {
                     int cx0 = c->cx0, cy0 = c->cy0, cx1 = c->cx1, cy1 = c->cy1;
                     gfx_clip(c, (int)floorf(left), (int)ly, (int)ceilf(right - left), (int)ceilf(lh));
@@ -972,6 +1299,7 @@ static void paint_marker(struct pctx *P, box_t *b) {
 
 /* ---------------------------------------------------------------- hit testing helpers */
 static bool inside(struct pctx *P, float x, float y, float w, float h) {
+    P->hit_shape_x=x;P->hit_shape_y=y;
     if (P->index_build) {
         float left = fmaxf(x, P->c->cx0 - P->ox), top = fmaxf(y, P->c->cy0 - P->oy);
         float right = fminf(x + w, P->c->cx1 - P->ox), bottom = fminf(y + h, P->c->cy1 - P->oy);
@@ -987,6 +1315,8 @@ static bool inside(struct pctx *P, float x, float y, float w, float h) {
 }
 
 static int control_hit(box_t *b) {
+    if(b->node && b->node->tag==T_button)
+        return web_control_submit_button(b->node)?WEB_HIT_SUBMIT:WEB_HIT_BUTTON;
     switch (b->atomic) {
     case AT_INPUT: return web_input_type(b->node) == WEB_INPUT_FILE ? WEB_HIT_FILE : WEB_HIT_TEXT_INPUT;
     case AT_TEXTAREA: return WEB_HIT_TEXTAREA;
@@ -1013,7 +1343,10 @@ static bool hit_style(const style_t *st) {
     return st && !st->visibility && !st->pointer_events;
 }
 
-static void hit_target(struct pctx *P,node_t *target) {
+static bool hit_target(struct pctx *P,node_t *target) {
+    box_t *box=target?target->box:NULL;
+    const struct radius_cache *radius=P->hit_radius?P->hit_radius:box?box->radius_clip[0]:NULL;
+    if(!P->index_build&&radius&&corners_coverage(P->hx,P->hy,P->hit_shape_x,P->hit_shape_y,radius->w,radius->h,&radius->radii)<.5f)return false;
     P->target=target;
     P->hit_any=false;
     memset(P->hit,0,sizeof *P->hit);
@@ -1021,20 +1354,22 @@ static void hit_target(struct pctx *P,node_t *target) {
         struct web_hit_index *index = P->index_build;
         if (index->count == index->capacity) {
             size_t capacity = index->capacity ? index->capacity * 2 : 128;
-            if (capacity <= index->capacity || capacity > SIZE_MAX / sizeof *index->items) { P->failed = true; return; }
+            if (capacity <= index->capacity || capacity > SIZE_MAX / sizeof *index->items) { P->failed = true; return false; }
             void *items = realloc(index->items, capacity * sizeof *index->items);
-            if (!items) { P->failed = true; return; }
+            if (!items) { P->failed = true; return false; }
             index->items = items; index->capacity = capacity;
         }
         struct hit_primitive *item = &index->items[index->count];
         *item = (struct hit_primitive){.target=target,.order=index->count,.kind=WEB_HIT_NONE};
+        item->box=box;item->radius=radius;item->radius_x=P->hit_shape_x;item->radius_y=P->hit_shape_y;
         memcpy(item->rect,P->hit_rect,sizeof item->rect);
         index->count++;
         if (!(index->count & 63) && !web_native_checkpoint(P->d)) P->failed=true;
     }
+    return !P->failed;
 }
 static void set_hit(struct pctx *P, int kind, node_t *n, node_t *link) {
-    if (n) hit_target(P,n);
+    if (n) {if(!hit_target(P,n))return;}
     else if (link && P->index_build) hit_target(P,P->target);
     P->hit_any = true;
     P->hit->kind = kind;
@@ -1133,19 +1468,177 @@ static bool prepare_layer_cache(web_doc *d,box_t *b){
     if(!collect_layers(d,&b->paint_layers,b)||!sort_layers(d,&b->paint_layers)){b->paint_layers.n=0;return false;}
     b->paint_layers_layout=d->layout_revision;b->paint_layers_dom=d->dom_revision;b->paint_layers_valid=true;return true;
 }
+
+static const char overflow_ellipsis[] = "\xe2\x80\xa6";
+
+static size_t ellipsis_next(web_doc *d,const char *s,size_t n,size_t at,bool *ok) {
+    wf_grapheme_state state={0};unsigned work=0;
+    for(size_t i=at;i<n;) {
+        uint32_t cp;size_t used=wf_grapheme_decode(s+i,n-i,&cp);
+        if(wf_grapheme_break(&state,cp)&&i>at)return i;
+        i+=used;
+        if(!(++work&63)&&!web_native_checkpoint(d)){*ok=false;return n;}
+        if(i==n)return n;
+    }
+    return n;
+}
+
+/* Find a complete-grapheme prefix using the same font/spacing measurement as
+   layout. This is cached per committed line/scroll position, not per paint.
+   Checkpoints keep a very long unbroken run cancelable without a clock syscall
+   for each character. No logical run is shortened. */
+static int ellipsis_prefix(web_doc *d,const struct run *r,float available,float *width,bool *ok) {
+    size_t at=0,count=0;
+    while(at<(size_t)r->n) {
+        at=ellipsis_next(d,r->s,(size_t)r->n,at,ok);if(!*ok)return 0;count++;
+        if(!(count&63)&&!web_native_checkpoint(d)){*ok=false;return 0;}
+    }
+    size_t low=0,high=count;
+    while(low<high) {
+        size_t middle=low+(high-low+1)/2,bytes=0;
+        for(size_t i=0;i<middle;i++) {
+            bytes=ellipsis_next(d,r->s,(size_t)r->n,bytes,ok);if(!*ok)return 0;
+            if(!(i&63)&&!web_native_checkpoint(d)){*ok=false;return 0;}
+        }
+        float w=style_text_width(r->st,r->s,bytes);
+        if(w<=available)low=middle;else high=middle-1;
+    }
+    at=0;for(size_t i=0;i<low;i++){at=ellipsis_next(d,r->s,(size_t)r->n,at,ok);if(!*ok)return 0;}
+    *width=style_text_width(r->st,r->s,at);return (int)at;
+}
+struct overflow_boundary { int run,bytes; };
+static void overflow_boundary_record(struct overflow_boundary point,struct overflow_boundary target,
+                                      struct overflow_boundary *first,struct overflow_boundary *floor) {
+    if(first->run<0)*first=point;
+    if(point.run<target.run || (point.run==target.run&&point.bytes<=target.bytes))*floor=point;
+}
+/* Styled DOM text runs are not Unicode segmentation boundaries. Reconcile
+   the measured prefix with the whole line so an accent, flag or ZWJ emoji
+   cannot be separated just because a span changes its font/color. */
+static bool ellipsis_line_boundary(web_doc *d,box_t *b,const struct line_fragment *line,
+                                   int *last,int *bytes,float *width,float *x) {
+    struct overflow_boundary target={*last,*bytes},first={-1,0},floor={-1,0};
+    wf_grapheme_state state={0};bool seen=false;unsigned work=0;
+    for(int i=line->first_run;i<line->end_run;i++) {
+        struct run *r=&b->runs[i];
+        if(r->atomic) {
+            if(seen&&i>line->first_run)overflow_boundary_record(
+                (struct overflow_boundary){i-1,b->runs[i-1].n},target,&first,&floor);
+            overflow_boundary_record((struct overflow_boundary){i,0},target,&first,&floor);
+            state=(wf_grapheme_state){0};seen=true;continue;
+        }
+        for(size_t at=0;at<(size_t)r->n;) {
+            uint32_t cp;size_t used=wf_grapheme_decode(r->s+at,(size_t)r->n-at,&cp);
+            if(wf_grapheme_break(&state,cp)&&seen) {
+                struct overflow_boundary point=at?(struct overflow_boundary){i,(int)at}:
+                    (struct overflow_boundary){i-1,b->runs[i-1].n};
+                overflow_boundary_record(point,target,&first,&floor);
+            }
+            at+=used;seen=true;
+            if(!(++work&63)&&!web_native_checkpoint(d))return false;
+        }
+    }
+    if(seen)overflow_boundary_record((struct overflow_boundary){line->end_run-1,b->runs[line->end_run-1].n},target,&first,&floor);
+    struct overflow_boundary point=floor.run>=0?floor:first;
+    if(point.run<0)return true;
+    *last=point.run;*bytes=point.bytes;
+    struct run *r=&b->runs[*last];
+    *width=r->atomic?r->w:style_text_width(r->st,r->s,(size_t)*bytes);
+    *x=r->x+*width;return true;
+}
+static bool prepare_text_overflow(web_doc *d,box_t *b) {
+    float scroll=box_element_scrollable(b)?(float)b->node->scroll_x:0;
+    if(b->ellipsis_layout_revision==d->layout_revision && b->ellipsis_scroll_x==scroll)return true;
+    b->ellipsis_layout_revision=0;
+    for(int i=0;i<b->nruns;i++)if(b->runs[i].atomic)b->runs[i].atomic->ellipsis_hidden=false;
+    bool enabled=b->st && b->st->text_overflow==TO_ELLIPSIS && b->st->overflow!=OV_VISIBLE &&
+        !(b->anon&&b->parent&&(b->parent->kind==B_FLEX||b->parent->kind==B_GRID));
+    float marker=enabled?style_text_width(b->st,overflow_ellipsis,sizeof overflow_ellipsis-1):0;
+    for(int k=0;k<b->nlines;k++) {
+        struct line_fragment *line=&b->lines[k];line->ellipsis_active=false;
+        if(!enabled||line->end_run<=line->first_run)continue;
+        float edge=line->right+scroll,extent=line->left;
+        for(int i=line->first_run;i<line->end_run;i++)extent=fmaxf(extent,b->runs[i].x+b->runs[i].w);
+        if(extent<=edge)continue;
+        float cut=edge-marker,x=line->left;
+        int last=line->first_run-1,bytes=0;float width=0;
+        for(int i=line->first_run;i<line->end_run;i++) {
+            if(!(i&63)&&!web_native_checkpoint(d))return false;
+            struct run *r=&b->runs[i];
+            if(r->x+r->w<=cut){last=i;bytes=r->n;width=r->w;x=r->x+r->w;continue;}
+            if(r->atomic) {
+                /* The first atomic on the line is clipped, never removed. */
+                if(i==line->first_run){last=i;bytes=0;width=r->w;x=r->x+r->w;}
+                break;
+            }
+            bool ok=true;
+            float prefix_width=0;
+            int prefix=ellipsis_prefix(d,r,cut-r->x,&prefix_width,&ok);if(!ok)return false;
+            if(i==line->first_run && !prefix && r->n>0) {
+                prefix=(int)ellipsis_next(d,r->s,(size_t)r->n,0,&ok);if(!ok)return false;
+                prefix_width=style_text_width(r->st,r->s,(size_t)prefix);
+            }
+            if(prefix){last=i;bytes=prefix;width=prefix_width;x=r->x+width;}
+            break;
+        }
+        if(!ellipsis_line_boundary(d,b,line,&last,&bytes,&width,&x))return false;
+        line->ellipsis_active=true;line->ellipsis_run=last;line->ellipsis_bytes=bytes;
+        line->ellipsis_run_width=width;line->ellipsis_x=x;line->ellipsis_width=marker;
+        for(int i=last+1;i<line->end_run;i++)if(b->runs[i].atomic){
+            b->runs[i].atomic->ellipsis_hidden=true;b->runs[i].atomic->ellipsis_hidden_revision=d->layout_revision;
+        }
+    }
+    b->ellipsis_scroll_x=scroll;b->ellipsis_layout_revision=d->layout_revision;return true;
+}
 static bool prepare_paint_tree(web_doc *d,box_t *b){
     if(!b)return true;
     if(!web_native_checkpoint(d))return false;
+    if(b->inline_ctx&&!prepare_text_overflow(d,b))return false;
     if((b==d->root_box||stacking_context(b)||web_dialog_layer_box(d,b)||
         (b->node&&b->node==d->fullscreen_element))&&!prepare_layer_cache(d,b))return false;
+    if(b->st && b->kind!=B_INLINE && b->kind!=B_TEXT && b->kind!=B_BR) {
+        float x=box_visual_x(b),y=box_visual_y(b);
+        bool row=b->kind==B_ROW||b->kind==B_ROW_GROUP;float zero[4]={0};
+        float left=row?x:x-b->p[3]-b->b[3],top=row?y:y-b->p[0]-b->b[0];
+        float w=row?b->w:b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3],h=row?b->h:b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2];
+        if(!shadow_cache_prepare(d,&b->shadow_cache,b->st,left,top,w,h,row?zero:b->b))return false;
+        struct border_radii radii=used_radii(b->st,w,h);const float *border=row?zero:b->b;
+        if(!radius_cache_prepare(d,&b->radius_clip[0],left,top,w,h,radii))return false;
+        float pw=w-border[1]-border[3],ph=h-border[0]-border[2];
+        struct border_radii padding=inset_radii(radii,border,pw,ph);
+        if(!radius_cache_prepare(d,&b->radius_clip[1],left+border[3],top+border[0],pw,ph,padding))return false;
+        float edges[4];for(int i=0;i<4;i++)edges[i]=border[i]+b->p[i];
+        struct border_radii content=inset_radii(radii,edges,b->w,b->h);
+        if(b->kind==B_ATOMIC&&b->atomic!=AT_INLINE_BLOCK) {
+            if(!radius_cache_prepare(d,&b->radius_clip[2],x,cy(b),b->w,b->h,content))return false;
+        } else web_radius_cache_free(&b->radius_clip[2]);
+    }
+    float ix=box_visual_x(b),iy=cy(b);
+    if(web_marquee_box(b)){ix+=b->node->marquee_x;iy+=b->node->marquee_y;}
+    if(box_element_scrollable(b)){ix-=b->node->scroll_x;iy-=b->node->scroll_y;}
+    for(int i=0;i<b->ndecos;i++) {
+        struct deco *deco=&b->decos[i];float borders[4];memcpy(borders,deco->st->border_width,sizeof borders);
+        if(!deco->first)borders[3]=0;if(!deco->last)borders[1]=0;
+        struct border_radii radii=used_radii(deco->st,deco->w,deco->h);
+        if(!deco->first)radii.x[0]=radii.y[0]=radii.x[3]=radii.y[3]=0;
+        if(!deco->last)radii.x[1]=radii.y[1]=radii.x[2]=radii.y[2]=0;
+        if(!shadow_cache_prepare_radii(d,&deco->shadow_cache,deco->st,ix+deco->x,iy+deco->y,deco->w,deco->h,borders,radii))return false;
+        if(!radius_cache_prepare(d,&deco->radius_clip[0],ix+deco->x,iy+deco->y,deco->w,deco->h,radii))return false;
+        float pw=deco->w-borders[1]-borders[3],ph=deco->h-borders[0]-borders[2];
+        if(!radius_cache_prepare(d,&deco->radius_clip[1],ix+deco->x+borders[3],iy+deco->y+borders[0],pw,ph,inset_radii(radii,borders,pw,ph)))return false;
+    }
     for(box_t *c=b->first;c;c=c->next)if(!prepare_paint_tree(d,c))return false;
     return true;
 }
 static bool prepare_paint_order(web_doc *d){
-    if(d->paint_order_valid&&d->paint_order_layout==d->layout_revision&&d->paint_order_dom==d->dom_revision)return true;
+    if(d->paint_order_valid&&d->paint_order_layout==d->layout_revision&&d->paint_order_dom==d->dom_revision&&
+       d->paint_order_visual==d->visual_revision&&(!d->paint_shadow_crop||
+       (d->paint_shadow_view_x==d->view_x&&d->paint_shadow_view_y==d->view_y)))return true;
     d->paint_order_valid=false;
+    d->paint_shadow_crop=false;
     if(!prepare_paint_tree(d,d->root_box))return false;
-    d->paint_order_layout=d->layout_revision;d->paint_order_dom=d->dom_revision;d->paint_order_valid=true;return true;
+    d->paint_order_layout=d->layout_revision;d->paint_order_dom=d->dom_revision;d->paint_order_visual=d->visual_revision;
+    d->paint_shadow_view_x=d->view_x;d->paint_shadow_view_y=d->view_y;d->paint_order_valid=true;return true;
 }
 static void release_layers(pvec *layers,bool borrowed){if(!borrowed)pv_free(layers);}
 
@@ -1162,6 +1655,18 @@ static void bounds_rect(struct pctx *P, float x, float y, float w, float h) {
         if (y + h > P->bounds[3]) P->bounds[3] = y + h;
     }
 }
+static void shadow_ink_bounds(const style_t *style,float x,float y,float w,float h,float *rect) {
+    for(const struct css_box_shadow *shadow=style->box_shadow;shadow;shadow=shadow->next) {
+        if(shadow->inset || !(shadow->color>>24) || w+2*shadow->spread<=0 || h+2*shadow->spread<=0)continue;
+        float extent=shadow->spread+ceilf(shadow->blur*1.5f)+1;
+        rect[0]=fminf(rect[0],x+shadow->x-extent);rect[1]=fminf(rect[1],y+shadow->y-extent);
+        rect[2]=fmaxf(rect[2],x+w+shadow->x+extent);rect[3]=fmaxf(rect[3],y+h+shadow->y+extent);
+    }
+}
+static void bounds_decoration(struct pctx *P,const style_t *style,float x,float y,float w,float h) {
+    float rect[4]={x,y,x+w,y+h};shadow_ink_bounds(style,x,y,w,h,rect);
+    bounds_rect(P,rect[0],rect[1],rect[2]-rect[0],rect[3]-rect[1]);
+}
 static void inline_children(struct pctx *P, box_t *b, bool floats) {
     for (box_t *c = b->first; c; c = c->next) {
         if (c->clamp_hidden) continue;
@@ -1176,6 +1681,11 @@ static void inline_children(struct pctx *P, box_t *b, bool floats) {
     }
 }
 
+static struct line_fragment *overflow_line(box_t *b,int run) {
+    int low=0,high=b->nlines;
+    while(low<high){int mid=low+(high-low)/2;if(b->lines[mid].end_run<=run)low=mid+1;else high=mid;}
+    return low<b->nlines && b->lines[low].first_run<=run && b->lines[low].ellipsis_active?&b->lines[low]:NULL;
+}
 static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
     float bx = box_visual_x(b), by = cy(b);
     if(web_marquee_box(b)){bx+=b->node->marquee_x;by+=b->node->marquee_y;}
@@ -1191,9 +1701,11 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
         if (!scope && P->mode != M_BOUNDS && d->paint_owner) continue;
         const style_t *st = d->st;
         if (st->visibility) continue;
-        if (P->mode == M_BOUNDS) { bounds_rect(P, bx + d->x, by + d->y, d->w, d->h); continue; }
+        if (P->mode == M_BOUNDS) { bounds_decoration(P,st,bx + d->x, by + d->y, d->w, d->h); continue; }
         if (P->mode == M_HIT) {
+            P->hit_radius=d->radius_clip[0];
             if (hit_style(st) && d->node && inside(P, bx + d->x, by + d->y, d->w, d->h)) hit_target(P,d->node);
+            P->hit_radius=NULL;
             continue;
         }
         float l = d->first ? 0 : 0;
@@ -1202,8 +1714,7 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
         if (!d->first) bw[3] = 0;
         if (!d->last) bw[1] = 0;
         float x = P->ox + bx + d->x, y = P->oy + by + d->y;
-        if (y > P->c->cy1 || y + d->h < P->c->cy0) continue;
-        paint_bg_border(P, st, x, y, d->w, d->h, bw, false, !d->first, !d->last);
+        paint_bg_border(P, st, x, y, d->w, d->h, bw, false, !d->first, !d->last,d->shadow_cache,d->radius_clip);
     }
     for (int i = scope ? scope->inline_run_first : 0; i >= 0 && i < b->nruns;
          i = scope ? b->runs[i].paint_next : i + 1) {
@@ -1238,12 +1749,30 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
             /* Include glyph overhang/decoration coverage, not only advance. */
             bounds_rect(P, bx + r->x - r->st->font_size, by + r->y - asc - 1,
                 r->w + 2 * r->st->font_size, asc + desc + 2);
-        } else paint_run_text(P, r, bx, by);
+        } else {
+            struct line_fragment *line=overflow_line(b,i);
+            if(line && i>line->ellipsis_run)continue;
+            if(line && i==line->ellipsis_run && line->ellipsis_bytes<r->n) {
+                struct run visible=*r;visible.n=line->ellipsis_bytes;visible.w=line->ellipsis_run_width;
+                canvas_t saved=*P->c;
+                int right=(int)floorf(P->ox+bx+line->ellipsis_x);
+                if(right<P->c->cx1)P->c->cx1=MAX(right,P->c->cx0);
+                if(visible.n)paint_run_text(P,&visible,bx,by);
+                *P->c=saved;
+            } else paint_run_text(P,r,bx,by);
+        }
+    }
+    if(P->mode==M_PAINT&&!scope)for(int k=0;k<b->nlines;k++) {
+        struct line_fragment *line=&b->lines[k];if(!line->ellipsis_active)continue;
+        struct run marker={.x=line->ellipsis_x,.y=line->baseline,.w=line->ellipsis_width,
+            .s=overflow_ellipsis,.n=sizeof overflow_ellipsis-1,.st=b->st};
+        paint_run_text(P,&marker,bx,by);
     }
 }
 
 static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (P->failed) return;
+    if (P->mode==M_PAINT && b->ellipsis_hidden && b->ellipsis_hidden_revision==P->d->layout_revision) return;
     if (b->clamp_hidden || !b->st || b->st->display == D_NONE) return;
     if (web_dialog_layer_box(P->d,b) && b != P->top_root) return;
     if (P->mode == M_HIT && b->node && web_dialog_inert(P->d,b->node)) return;
@@ -1283,7 +1812,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     if (P->mode == M_BOUNDS && canvas_group)
         bounds_rect(P, P->vx0 - P->ox, P->vy0 - P->oy, P->vx1 - P->vx0, P->vy1 - P->vy0);
     if (P->mode == M_BOUNDS && !st->visibility && b->kind != B_INLINE && b->kind != B_TEXT && b->kind != B_BR) {
-        bounds_rect(P, bx, by, bw, bh);
+        bounds_decoration(P,st,bx,by,bw,bh);
         if (b->marker || b->marker_shape) bounds_rect(P, bx - st->font_size * 2, by, st->font_size * 2, bh);
     }
     if (P->mode == M_HIT && hit_style(st) && b->node &&
@@ -1339,17 +1868,21 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         if (P->mode == M_PAINT && visible) {
             bool skip_bg = (P->canvas_bg_from == 1 && b->node == P->d->html && b->node) ||
                            (P->canvas_bg_from == 2 && b->node == P->d->body && b->node);
-            paint_bg_border(P, st, P->ox + bx, P->oy + by, bw, bh, b->b, skip_bg, false, false);
-        } else if (P->mode == M_HIT && hit_style(st) && st->content_visibility!=CV_HIDDEN && b->kind == B_ATOMIC && inside(P, bx, by, bw, bh)) {
+            paint_bg_border(P, st, P->ox + bx, P->oy + by, bw, bh, b->b, skip_bg, false, false,b->shadow_cache,b->radius_clip);
+        } else if (P->mode == M_HIT && hit_style(st) && st->content_visibility!=CV_HIDDEN &&
+                   (b->kind == B_ATOMIC || (b->node&&b->node->tag==T_button)) && inside(P, bx, by, bw, bh)) {
             int k = control_hit(b);
             if (k != WEB_HIT_NONE) set_hit(P, k, b->node, NULL);
         }
     } else if ((b->kind == B_ROW || b->kind == B_ROW_GROUP) && P->mode == M_PAINT && visible && (st->bg_color >> 24)) {
         float z[4] = {0, 0, 0, 0};
-        paint_bg_border(P, st, P->ox + x, P->oy + y, b->w, b->h, z, false, false, false);
+        paint_bg_border(P, st, P->ox + x, P->oy + y, b->w, b->h, z, false, false, false,b->shadow_cache,b->radius_clip);
     }
     if (b->kind == B_ATOMIC && b->atomic != AT_INLINE_BLOCK) {
-        if (P->mode == M_PAINT && visible && st->content_visibility!=CV_HIDDEN) paint_replaced(P, b);
+        if (P->mode == M_PAINT && visible && st->content_visibility!=CV_HIDDEN) {
+            const struct gfx_mask_clip *prior=c->mask_clip;struct gfx_mask_clip replacement;
+            radius_clip_push(P,b->radius_clip[2],&replacement,P->ox+x,P->oy+cy(b));paint_replaced(P, b);c->mask_clip=prior;
+        }
         goto done;
     }
     if(st->content_visibility==CV_HIDDEN)goto done;
@@ -1357,12 +1890,19 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         if (P->mode == M_PAINT) paint_marker(P, b);
     }
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+    const struct gfx_mask_clip *previous_mask=c->mask_clip;struct gfx_mask_clip overflow_mask;
     bool contents = true;
     if (clip && P->mode != M_BOUNDS) {
         float px = P->ox + bx + b->b[3], py = P->oy + by + b->b[0];
         gfx_clip(c, (int)floorf(px), (int)floorf(py), (int)ceilf(bw - b->b[1] - b->b[3]), (int)ceilf(bh - b->b[0] - b->b[2]));
+        if(P->mode==M_PAINT)radius_clip_push(P,b->radius_clip[1],&overflow_mask,px,py);
         if (P->mode == M_HIT && !inside(P, bx + b->b[3], by + b->b[0], bw - b->b[1] - b->b[3], bh - b->b[0] - b->b[2])) {
             contents = false;
+        }
+        if(P->mode==M_HIT&&!P->index_build) {
+            struct border_radii radii=used_radii(st,bw,bh);
+            radii=inset_radii(radii,b->b,bw-b->b[1]-b->b[3],bh-b->b[0]-b->b[2]);
+            if(corners_coverage(P->hx,P->hy,bx+b->b[3],by+b->b[0],bw-b->b[1]-b->b[3],bh-b->b[0]-b->b[2],&radii)<.5f)contents=false;
         }
     }
     int layer = 0;
@@ -1384,6 +1924,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     }
     for (; layer < layers.n; layer++) paint_stacked_layer(P, layers.v[layer]);
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
+    c->mask_clip=previous_mask;
 done:
     release_layers(&layers,layers_borrowed);
     if (saved) {
@@ -1408,6 +1949,30 @@ done:
     }
 }
 
+static void stacked_ancestor_clips(struct pctx *P,box_t *layer,box_t *ancestor,bool reached,bool fixed_escape,bool skip) {
+    if(!ancestor||!ancestor->parent){if(!skip)paint_box(P,layer,true);return;}
+    canvas_t *canvas=P->c;const struct gfx_mask_clip *previous=canvas->mask_clip;struct gfx_mask_clip boundary;
+    if(ancestor->clamp_hidden||(ancestor->st&&ancestor->st->display==D_NONE))skip=true;
+    if(ancestor==layer->cb)reached=true;
+    if(ancestor->st&&(web_marquee_box(ancestor)||((ancestor->clamp_truncated||ancestor->st->overflow!=OV_VISIBLE)&&reached&&!fixed_escape))&&
+        !doc_viewport_overflow_box(P->d,ancestor)&&ancestor->kind!=B_INLINE) {
+        float x=box_visual_x(ancestor)-ancestor->p[3],y=box_visual_y(ancestor)-ancestor->p[0];
+        gfx_clip(canvas,(int)(P->ox+x),(int)(P->oy+y),(int)(ancestor->w+ancestor->p[1]+ancestor->p[3]),(int)(ancestor->h+ancestor->p[0]+ancestor->p[2]));
+        if(P->mode==M_PAINT)radius_clip_push(P,ancestor->radius_clip[1],&boundary,P->ox+x,P->oy+y);
+        else if(P->mode==M_HIT&&!P->index_build) {
+            float w=ancestor->w+ancestor->p[1]+ancestor->p[3],h=ancestor->h+ancestor->p[0]+ancestor->p[2];
+            struct border_radii radii=used_radii(ancestor->st,w+ancestor->b[1]+ancestor->b[3],h+ancestor->b[0]+ancestor->b[2]);
+            radii=inset_radii(radii,ancestor->b,w,h);
+            if(corners_coverage(P->hx,P->hy,x,y,w,h,&radii)<.5f)skip=true;
+        }
+    }
+    if(box_viewport_fixed(ancestor)) {
+        if(!P->d->marquees.n){if(!skip)paint_box(P,layer,true);canvas->mask_clip=previous;return;}
+        fixed_escape=true;
+    }
+    stacked_ancestor_clips(P,layer,ancestor->parent,reached,fixed_escape,skip);
+    canvas->mask_clip=previous;
+}
 static void paint_stacked_layer(struct pctx *P, box_t *l) {
     /* Stacking order and containing-block clipping are independent. Rebuild
        this layer's clip from the viewport, not its paint context's clip:
@@ -1415,31 +1980,18 @@ static void paint_stacked_layer(struct pctx *P, box_t *l) {
        below their containing block. This also works across nested contexts. */
     canvas_t *c = P->c;
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
+    const struct gfx_mask_clip *previous=c->mask_clip;c->mask_clip=P->viewport_mask;
     c->cx0 = P->vx0, c->cy0 = P->vy0, c->cx1 = P->vx1, c->cy1 = P->vy1;
-    bool skip = false, reached = l->st->position != POS_ABSOLUTE && l->st->position != POS_FIXED;
-    bool fixed_escape=box_viewport_fixed(l);
-    for (box_t *a = l->parent; a && a->parent; a = a->parent) {
-        if (a->clamp_hidden || (a->st && a->st->display == D_NONE)) skip = true;
-        if (a == l->cb) reached = true;
-        if (a->st && (web_marquee_box(a) || ((a->clamp_truncated || a->st->overflow != OV_VISIBLE) && reached && !fixed_escape)) && !doc_viewport_overflow_box(P->d,a) && a->kind != B_INLINE) {
-            float ax = box_visual_x(a) - a->p[3], ay = box_visual_y(a) - a->p[0];
-            gfx_clip(c, (int)(P->ox + ax), (int)(P->oy + ay), (int)(a->w + a->p[1] + a->p[3]), (int)(a->h + a->p[0] + a->p[2]));
-        }
-        /* Internal overflow still clips, but a viewport-fixed ancestor and
-           its descendants escape ancestors outside that containing block. */
-        if (box_viewport_fixed(a)) {
-            if(!P->d->marquees.n)break;
-            fixed_escape=true;
-        }
-    }
-    if (!skip) paint_box(P, l, true);
+    stacked_ancestor_clips(P,l,l->parent,l->st->position!=POS_ABSOLUTE&&l->st->position!=POS_FIXED,box_viewport_fixed(l),false);
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
+    c->mask_clip=previous;
 }
 
 static void walk(struct pctx *P) {
     if(P->mode!=M_BOUNDS&&!prepare_paint_order(P->d)){P->failed=true;return;}
     P->vx0 = P->c->cx0, P->vy0 = P->c->cy0;
     P->vx1 = P->c->cx1, P->vy1 = P->c->cy1;
+    P->viewport_mask=P->c->mask_clip;
     if (P->d->root_box) paint_box(P, P->d->root_box, true);
     float ox=P->ox,oy=P->oy,hx=P->hx,hy=P->hy;
     node_t *fullscreen=P->d->fullscreen_element;
@@ -1482,13 +2034,19 @@ uint32_t doc_canvas_bg(web_doc *d, int *from) {
 }
 
 void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y) {
+    if(web_render_blocked(d)) {
+        gfx_fill(c,x,y,w,h,RGB(255,255,255));
+        return;
+    }
     /* The window still owns the last coherent pixels. Never replace them
        with a white canvas while a cancelled native transaction is retired
        or rebuilt; real scrolling resumes only after layout publication. */
     if(d->native_cancelled || d->native_recovery_pending || d->native_recovery_active)return;
     /* Sorting/cancellation finishes before any committed window pixels are
        overwritten. A cancelled cache build cannot leave a white viewport. */
+    d->view_x=doc_x;d->view_y=doc_y;
     if(!prepare_paint_order(d)){doc_paint_full(d);return;}
+    d->initial_render_done=true;
     paint_debug_begin(d);
     d->view_x=doc_x; d->view_y=doc_y; /* frame crops use this paint's real scroll */
     bool snapshot_root=!d->frame_parent;
@@ -1573,6 +2131,9 @@ void doc_paint_damage(web_doc *d,node_t *node){
     float x=box_visual_x(box)-box->p[3]-box->b[3]-2,y=box_visual_y(box)-box->p[0]-box->b[0]-2;
     float right=x+box->w+box->p[1]+box->p[3]+box->b[1]+box->b[3]+4;
     float bottom=y+box->h+box->p[0]+box->p[2]+box->b[0]+box->b[2]+4;
+    float ink[4]={x,y,right,bottom};
+    if(box->st)shadow_ink_bounds(box->st,x+2,y+2,right-x-4,bottom-y-4,ink);
+    x=ink[0];y=ink[1];right=ink[2];bottom=ink[3];
     if(!isfinite(x)||!isfinite(y)||!isfinite(right)||!isfinite(bottom)){d->paint_damage_full=true;return;}
     if(!d->paint_damage_valid){d->paint_damage[0]=x;d->paint_damage[1]=y;d->paint_damage[2]=right;d->paint_damage[3]=bottom;d->paint_damage_valid=true;}
     else{d->paint_damage[0]=fminf(d->paint_damage[0],x);d->paint_damage[1]=fminf(d->paint_damage[1],y);
@@ -1640,6 +2201,22 @@ static size_t hit_partition(web_doc *d,struct web_hit_index *index,struct hit_pr
     return id;
 }
 static bool hit_rect_contains(const float rect[4],float x,float y){return x>=rect[0]&&y>=rect[1]&&x<rect[2]&&y<rect[3];}
+static bool hit_corner_contains(const struct hit_primitive *item,float x,float y) {
+    if(item->radius&&corners_coverage(x,y,item->radius_x,item->radius_y,item->radius->w,item->radius->h,&item->radius->radii)<.5f)return false;
+    box_t *box=item->box;if(!box)return true;
+    web_doc *doc=item->target?item->target->owner:NULL;if(!doc)return true;
+    bool reached=!box->abspos,fixed=box_viewport_fixed(box);
+    for(box_t *a=box->parent;a&&a->parent;a=a->parent) {
+        if(a==box->cb)reached=true;
+        if(a->st&&(web_marquee_box(a)||((a->clamp_truncated||a->st->overflow!=OV_VISIBLE)&&reached&&!fixed))&&a->kind!=B_INLINE&&
+            !doc_viewport_overflow_box(doc,a)&&a->radius_clip[1]) {
+            const struct radius_cache *radius=a->radius_clip[1];float px=box_visual_x(a)-a->p[3],py=box_visual_y(a)-a->p[0];
+            if(corners_coverage(x,y,px,py,radius->w,radius->h,&radius->radii)<.5f)return false;
+        }
+        if(box_viewport_fixed(a)){if(!doc->marquees.n)break;fixed=true;}
+    }
+    return true;
+}
 static const struct hit_primitive *hit_query(const struct web_hit_index *index,size_t id,float x,float y,
                                             const struct hit_primitive *best){
     const struct hit_branch *branch=&index->branches[id];
@@ -1647,7 +2224,7 @@ static const struct hit_primitive *hit_query(const struct web_hit_index *index,s
     if(branch->left==SIZE_MAX){
         for(size_t i=branch->first;i<branch->first+branch->count;i++){
             const struct hit_primitive *item=&index->items[i];
-            if((!best||item->order>best->order)&&hit_rect_contains(item->rect,x,y))best=item;
+            if((!best||item->order>best->order)&&hit_rect_contains(item->rect,x,y)&&hit_corner_contains(item,x,y))best=item;
         }
         return best;
     }

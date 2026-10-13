@@ -29,7 +29,7 @@ struct request {
     bool streaming, paused, headers_seen, debug_request, debug_reported;
     char *cookie_site;
     char *transport_origin;
-    uint64_t queued_at;
+    uint64_t queued_at,started_at;
     enum webnet_credentials credentials;
     bool top_level;
     bool keepalive;
@@ -191,7 +191,8 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     r->keepalive = q->keepalive; r->fetch_group = q->fetch_group;
     r->image_upgrade = q->image_upgrade;
     r->streaming = q->stream_response;
-    r->debug_request = n->debug && q->kind == WEBNET_RESOURCE;
+    r->debug_request = n->debug && (q->kind==WEBNET_RESOURCE||q->kind==WEBNET_CLASSIC||
+        q->kind==WEBNET_MODULE||q->kind==WEBNET_NAVIGATION);
     r->keepalive_bytes = q->keepalive ? q->body_len : 0;
     r->response_limit = webnet_response_limit(q->kind);
     r->deadline = uptime_ms() + WEBNET_TIMEOUT_MS;
@@ -358,6 +359,16 @@ static void complete(webnet *n, struct slot *s) {
     struct request *r = s->rq;
     s->rq = NULL; s->pid = 0; slot_close(s); n->count--;
     if (r->tx) n->queued_bytes -= r->tx_len;
+    if(n->debug){
+        uint64_t done=uptime_ms();
+        /* These are caller-visible completion intervals, including TLS,
+           pipe pumping, a busy GUI/native task and helper reaping. They are
+           not server latency, download speed, or summed worker CPU time. */
+        fprintf(stderr,"[webnet] complete id=%lu class=%d queued-to-complete=%lu ms dispatch-to-complete=%lu ms decoded-frame-bytes=%lu stream=%u cancelled=%u\n",
+            (unsigned long)r->id,r->priority,(unsigned long)(done>=r->queued_at?done-r->queued_at:0),
+            (unsigned long)(r->started_at&&done>=r->started_at?done-r->started_at:0),
+            (unsigned long)r->head.body_len,r->streaming,r->cancelled);
+    }
     if (!r->cancelled) {
         if (!r->streaming && !r->error[0] && r->rx && !cookie_events(n,r)) snprintf(r->error,sizeof r->error,"Invalid cookie update or out of memory");
         struct webnet_response response = {0};
@@ -410,6 +421,23 @@ static bool consume_request_diagnostic(struct request *r, char *headers) {
         (unsigned long)ctl, (unsigned long)non_ascii, (unsigned long)cookie, (unsigned long)content_length);
     return true;
 }
+static bool consume_transport_diagnostic(struct request *r,char *headers) {
+    if(!r->debug_request)return true;
+    char *line=strstr(headers,"\r\nHTTP/Nocturne-Transport ");if(!line)return true;
+    const char *p=line+sizeof("\r\nHTTP/Nocturne-Transport ")-1;
+    uint64_t phase,attempts,resolve,connect,tls,first,head,body;
+    if(!diagnostic_number(&p,"phase=",&phase)||!diagnostic_number(&p," attempts=",&attempts)||
+       !diagnostic_number(&p," resolve=",&resolve)||!diagnostic_number(&p," connect=",&connect)||
+       !diagnostic_number(&p," tls=",&tls)||!diagnostic_number(&p," first_header=",&first)||
+       !diagnostic_number(&p," headers=",&head)||!diagnostic_number(&p," body=",&body)||
+       p[0]!='\r'||p[1]!='\n'||phase>HTTP_PHASE_DONE||!attempts||attempts>42)return false;
+    memmove(line,p+2,strlen(p+2)+1);
+    if(strstr(headers,"HTTP/Nocturne-Transport "))return false;
+    fprintf(stderr,"[webnet] transport id=%lu phase=%lu attempts=%lu resolve=%lu ms connect=%lu ms tls=%lu ms first-header=%lu ms headers=%lu ms body=%lu ms\n",
+        (unsigned long)r->id,(unsigned long)phase,(unsigned long)attempts,(unsigned long)resolve,
+        (unsigned long)connect,(unsigned long)tls,(unsigned long)first,(unsigned long)head,(unsigned long)body);
+    return true;
+}
 /* Wire data has no terminators; insert them after the complete payload has arrived. */
 static bool unpack(struct request *r) {
     const struct webnet_wire_response *h = &r->head;
@@ -430,6 +458,7 @@ static bool unpack(struct request *r) {
     }
     memcpy(out+dst,r->rx+src,h->cookie_len);
     if (!consume_request_diagnostic(r, (char *)out + (size_t)h->url_len + 1)) { free(out); return false; }
+    if (!consume_transport_diagnostic(r, (char *)out + (size_t)h->url_len + 1)) { free(out); return false; }
     free(r->rx); r->rx = out;
     return true;
 }
@@ -545,6 +574,7 @@ void webnet_pump(webnet *n,uint64_t now){
     for(int i=0;i<WORKERS;i++){
         struct slot *s=&n->slots[i];
         if(!s->rq&&(unsigned)i<n->worker_limit){struct request *r=take_request(n,(unsigned)i);if(r){
+            r->started_at=now;
             if(n->debug)fprintf(stderr,"[webnet] dispatch id=%lu class=%d queued=%lu ms budget=%u\n",
                 (unsigned long)r->id,r->priority,(unsigned long)(now>=r->queued_at?now-r->queued_at:0),n->worker_limit);
             start(s,r);

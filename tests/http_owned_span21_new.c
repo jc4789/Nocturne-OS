@@ -26,6 +26,8 @@ static char *expected_path;
 static unsigned requested,exact_path,checks,failed;
 net_stream *ns_open(const char *h,uint16_t p,bool tls,int t,char *e,size_t n){(void)t;(void)e;(void)n;if(strcmp(h,"long.test")||p!=443||!tls)return NULL;stream.received=0;requested++;return &stream;}
 long ns_write(net_stream *s,const void *b,size_t n){(void)s;const char *p=b;size_t pn=strlen(expected_path);if(n>=pn+15&&!memcmp(p,"GET ",4)&&!memcmp(p+4,expected_path,pn)&&!memcmp(p+4+pn," HTTP/1.1\r\n",11))exact_path++;return (long)n;}
+net_stream *ns_open_timed(const char *h,uint16_t p,bool tls,int t,char *e,size_t n,struct http_transport_timing *m){memset(m,0,sizeof *m);return ns_open(h,p,tls,t,e,n);}
+uint64_t uptime_ms(void){return 0;}
 long ns_read(net_stream *s,void *b,size_t n){size_t left=sizeof response-1-s->received;if(n>left)n=left;memcpy(b,response+s->received,n);s->received+=n;return (long)n;}
 void ns_set_timeout(net_stream *s,int t){(void)s;(void)t;}
 const char *ns_error(net_stream *s){(void)s;return "";}

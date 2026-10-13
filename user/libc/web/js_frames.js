@@ -90,6 +90,68 @@
         };
         document.close=function(){host.documentStream(1);};
         const selfToken=host.frame('self',null);
+        /* WebIDLのnamed-properties object。普通のglobal own propertyへidを
+           固定配置せず、作者var/代入・prototype built-inの優先を保全する。 */
+        const namedGetOwn=Reflect.getOwnPropertyDescriptor,namedGetPrototype=Reflect.getPrototypeOf,
+              namedGet=Reflect.get,namedHas=Reflect.has,namedSet=Reflect.set,namedOwnKeys=Reflect.ownKeys,
+              namedDefine=Object.defineProperty,namedApply=Reflect.apply;
+        const NamesMap=Map,mapGet=Map.prototype.get,mapSet=Map.prototype.set;
+        const lookup=(map,key)=>namedApply(mapGet,map,[key]);
+        const store=(map,key,value)=>namedApply(mapSet,map,[key,value]);
+        let namedOwner=null,namedRevision=null,namedElements=new NamesMap(),namedChildren=new NamesMap();
+        function refreshNames(){
+            const version=host.frame('namedVersion',selfToken);
+            if(version[0]===namedOwner&&version[1]===namedRevision)return;
+            const rows=host.frame('namedElements',selfToken),elements=new NamesMap(),children=new NamesMap();
+            const add=(name,node)=>{if(!name)return;let a=lookup(elements,name);if(!a)store(elements,name,a=[]);
+                namedDefine(a,a.length,{value:node,writable:true,enumerable:true,configurable:true});};
+            for(let i=0;i<rows.length;i++){
+                const row=rows[i];add(row[1],row[0]);if(row[2]!==row[1])add(row[2],row[0]);
+                if(row[3]&&!lookup(children,row[3]))store(children,row[3],row[0]);
+            }
+            namedOwner=version[0];namedRevision=version[1];namedElements=elements;namedChildren=children;
+        }
+        function namedValue(key){
+            if(typeof key!=='string'||!key)return undefined;
+            refreshNames();
+            const matches=lookup(namedElements,key),child=lookup(namedChildren,key);
+            if(child){const record=host.frame('namedChild',child);
+                // supported-name生成は最初の同名childだけを判定。後のchildで
+                // cross-origin最初のchildを隠して名前を復活させない。
+                if(record[0]&&((matches&&matches.length)||record[1]))return windowProxy(record[0]);}
+            if(!matches||!matches.length)return undefined;
+            if(matches.length===1)return matches[0];
+            // 保持されたcollectionは0/1要素へ変わってもDocumentへ根を持ち続ける。
+            return collectionBridge.html(()=>{refreshNames();return lookup(namedElements,key)||[];});
+        }
+        let namedObject;
+        function visibleName(key){
+            if(typeof key!=='string'||namedGetOwn(globalThis,key))return false;
+            for(let p=namedGetPrototype(globalThis);p;p=namedGetPrototype(p))
+                if(p!==namedObject&&namedGetOwn(p,key))return false;
+            return true;
+        }
+        const namedTarget=Object.create(EventTarget.prototype);
+        namedDefine(namedTarget,Symbol.toStringTag,{value:'WindowProperties',configurable:true});
+        namedObject=new Proxy(namedTarget,{
+            get(t,key,receiver){if(visibleName(key)){const value=namedValue(key);if(value!==undefined)return value;}
+                return namedGet(t,key,receiver);},
+            has(t,key){return visibleName(key)&&namedValue(key)!==undefined||namedHas(t,key);},
+            getOwnPropertyDescriptor(t,key){if(visibleName(key)){const value=namedValue(key);if(value!==undefined)
+                return {value,writable:true,enumerable:false,configurable:true};}return namedGetOwn(t,key);},
+            ownKeys(t){return namedOwnKeys(t);},
+            set(t,key,value,receiver){return namedSet(t,key,value,receiver);},
+            defineProperty(){return false;},deleteProperty(){return false;},
+            setPrototypeOf(t,proto){return proto===namedGetPrototype(t);},preventExtensions(){return false;}
+        });
+        class Window extends EventTarget {constructor(){throw new TypeError('Illegal Window constructor');}}
+        Object.setPrototypeOf(Window.prototype,namedObject);
+        namedDefine(Window.prototype,Symbol.toStringTag,{value:'Window',configurable:true});
+        namedDefine(globalThis,'Window',{value:Window,writable:true,configurable:true});
+        Object.setPrototypeOf(globalThis,Window.prototype);
+        // QuickJS creates a generic own "global" tag. Browser globals inherit
+        // the WebIDL Window class string instead of shadowing that prototype.
+        delete globalThis[Symbol.toStringTag];
         Object.defineProperty(document,'defaultView',{configurable:true,get(){return host.frame('top',selfToken)===selfToken?globalThis:windowProxy(selfToken);}});
         Object.defineProperty(Document.prototype,'defaultView',{configurable:true,get(){if(rawDom.get(this,'nodeType')!==9)throw new TypeError('Document receiver required');return this===document?document.defaultView:null;}});
         Object.defineProperties(globalThis,{
@@ -100,7 +162,10 @@
             top:{configurable:true,get(){const token=host.frame('top',selfToken);return token===selfToken?globalThis:windowProxy(token);}},
             frameElement:{configurable:true,get(){return access('frameElement',selfToken);}},
             frames:{configurable:true,get(){return windowProxy(selfToken);}},
-            length:{configurable:true,get(){return access('length',selfToken);}}
+            length:{configurable:true,get(){return access('length',selfToken);}},
+            name:{configurable:true,enumerable:true,
+                get(){if(this!==globalThis)throw new TypeError('Illegal Window receiver');return access('name',selfToken);},
+                set(value){if(this!==globalThis)throw new TypeError('Illegal Window receiver');access('name',selfToken,String(value));}}
         });
         return {windowProxy,methodOriginal:key=>originalMethods[key],finalizeMethods};
     })();

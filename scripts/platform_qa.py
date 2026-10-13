@@ -402,6 +402,35 @@ def main():
                             if not isinstance(key, str) or not re.fullmatch(r'[a-zA-Z0-9_-]+', key):
                                 raise ValueError('不正なnative keyです')
                             mon.cmd('sendkey '+key)
+                        elif action == 'wheel':
+                            delta = request['delta']
+                            if type(delta) is not int or not -32 <= delta <= 32 or not delta:
+                                raise ValueError('wheelは非ゼロのnative PS/2移動量（-32〜32）です')
+                            mon.cmd('mouse_move 0 0 '+str(delta))
+                        elif action == 'text':
+                            # Real key input into the focused native field. It
+                            # never evaluates a script or changes guest DOM.
+                            value = request['text']
+                            if not isinstance(value,str) or len(value)>16384:
+                                raise ValueError('native text操作は16KiB以内です')
+                            plain = {' ':'spc','\n':'ret','.':'dot',',':'comma','/':'slash',
+                                '-':'minus','=':'equal',';':'semicolon',"'":'apostrophe',
+                                '[':'bracket_left',']':'bracket_right','\\':'backslash','`':'grave_accent'}
+                            shifted = dict(zip('!@#$%^&*()_+{}:"<>?|~',
+                                ['1','2','3','4','5','6','7','8','9','0','minus','equal',
+                                 'bracket_left','bracket_right','semicolon','apostrophe',
+                                 'comma','dot','slash','backslash','grave_accent']))
+                            keys=[]
+                            for char in value:
+                                if 'a'<=char<='z' or '0'<=char<='9': key=char
+                                elif 'A'<=char<='Z': key='shift-'+char.lower()
+                                elif char in plain: key=plain[char]
+                                elif char in shifted: key='shift-'+shifted[char]
+                                else: raise ValueError('native textはASCIIキーのみです')
+                                keys.append(key)
+                            for key in keys:
+                                mon.cmd('sendkey '+key+' 10')
+                                time.sleep(.02)
                         elif action == 'click':
                             mon.cmd('mouse_button 1');mon.cmd('mouse_button 0')
                         elif action == 'shot':

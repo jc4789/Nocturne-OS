@@ -5,6 +5,7 @@
 #include <string.h>
 #include "nocturne.h"
 #include "web.h"
+#include "webi.h"
 #include "web_form_validation_cases.h"
 
 #define BASE "http://h.test/dir/page.html"
@@ -712,7 +713,199 @@ static void test_hostile(void) {
     free(s);
 }
 
-int main(void) {
+static int test_flex_zero_basis(void) {
+    const char *html="<!doctype html><html><head><style>body{margin:0}"
+        ".row{display:flex;flex-wrap:wrap;width:1280px}"
+        ".main{display:flex;flex-direction:column;flex:1 1 0;width:100%;min-width:1px;height:40px}"
+        ".pane{display:flex;width:328px;height:60px;flex-shrink:0}"
+        "</style></head><body><div class=row><div class=main></div><div class=pane id=t></div></div></body></html>";
+    web_doc *d=web_live(html,strlen(html),BASE,"utf-8",NULL);
+    if(!d){fail("flex-zero-basis","document failed %d %d",0,0);return 1;}
+    uint64_t start=uptime_ms();
+    while(d->parser && uptime_ms()-start<5000)web_tick(d,uptime_ms());
+    total++;
+    if(d->parser || !d->body)fail("flex-zero-basis-parser","unfinished %d expected %d",1,0);
+    web_layout(d,VW,VH);total++;
+    int y=web_anchor_y(d,"t");
+    if(y!=0)fail("flex-zero-basis-row","pane y=%d expected %d",y,0);
+    web_free(d);
+    printf("webtest-flex-zero: %d checks, %d failed\n",total,failed);return failed!=0;
+}
+static int test_flex_freeze(void) {
+    static const struct { const char *row,*a,*b;int aw,bw,bx; } cases[]={
+        {"width:1000px","flex:0 1 400px;min-width:400px","flex:0 1 1000px;min-width:0",400,600,400},
+        {"width:300px","flex:1 1 0;max-width:50px","flex:1 1 0",50,250,50},
+        {"width:300px","flex:.25 1 0","flex:.25 1 0",75,75,75},
+        {"width:300px","flex:0 .25 200px","flex:0 .25 200px",175,175,175},
+        {"width:300px;gap:10px","flex:0 1 200px;min-width:180px;margin-right:10px","flex:0 1 200px;min-width:0",180,100,200},
+        {"width:300px;flex-direction:row-reverse","flex:1 1 0;max-width:50px","flex:1 1 0",50,250,0},
+        {"width:300px","flex:0 0 200px","flex:0 1 200px;min-width:0",200,100,200}
+    };
+    for(size_t i=0;i<sizeof cases/sizeof cases[0];i++) {
+        char html[1024];snprintf(html,sizeof html,"<!doctype html><style>body{margin:0}.row{display:flex;%s}"
+            "#a{height:20px;%s}#b{height:20px;%s}</style><div class=row><div id=a></div><div id=b></div></div>",
+            cases[i].row,cases[i].a,cases[i].b);
+        web_doc *d=load(html);
+        if(!d){total++;fail("flex-freeze-document","case %d failed %d",(int)i,1);continue;}
+        const char *ids[]={"#a","#b"};int rects[2][4]={{0}};
+        for(int k=0;k<2;k++) {
+            pvec v={0};css_select(d,d->root,ids[k],&v);total++;
+            if(!v.n||!web_node_rect(d,v.v[0],&rects[k][0],&rects[k][1],&rects[k][2],&rects[k][3]))
+                fail("flex-freeze-geometry","case %d item %d",(int)i,k);
+            pv_free(&v);
+        }
+        total++;if(rects[0][2]!=cases[i].aw)fail("flex-freeze-first-size","width %d expected %d",rects[0][2],cases[i].aw);
+        total++;if(rects[1][2]!=cases[i].bw)fail("flex-freeze-second-size","width %d expected %d",rects[1][2],cases[i].bw);
+        total++;if(rects[1][0]!=cases[i].bx)fail("flex-freeze-second-position","x %d expected %d",rects[1][0],cases[i].bx);
+        web_free(d);
+    }
+    printf("webtest-flex-freeze: %d checks, %d failed\n",total,failed);return failed!=0;
+}
+static int test_auto_table_percent(void) {
+    static const struct { const char *cells;int widths[3],columns; } cases[]={
+        {"<td id=a style=width:100%></td><td id=b style=width:100px></td>",{200,100,0},2},
+        {"<td id=a style=width:50%></td><td id=b style=width:50%></td><td id=c style=width:100px></td>",{100,100,100},3},
+        {"<td id=a style=width:80%></td><td id=b style=width:80%></td>",{240,60,0},2},
+        {"<td id=a style=width:100px></td><td id=b></td>",{100,200,0},2},
+        {"<td id=a></td><td id=b></td><td id=c></td>",{100,100,100},3},
+        {"<td id=a style='width:100%;max-width:0'></td><td id=b style=width:200px></td>",{100,200,0},2}
+    };
+    for(size_t i=0;i<sizeof cases/sizeof cases[0];i++) {
+        char html[1536];snprintf(html,sizeof html,"<!doctype html><style>body{margin:0}table{width:300px;border-spacing:0}td{padding:0;height:10px}</style><table id=t><tr>%s</tr></table>",cases[i].cells);
+        web_doc *d=load(html);total++;if(!d){fail("auto-table-percent-document","case %d failed %d",(int)i,1);continue;}
+        const char *ids[]={"#a","#b","#c"};int right=0;
+        for(int j=0;j<cases[i].columns;j++) {
+            pvec v={0};css_select(d,d->root,ids[j],&v);int x=0,y=0,w=0,h=0;total++;
+            if(!v.n||!web_node_rect(d,v.v[0],&x,&y,&w,&h))fail("auto-table-percent-cell","case %d column %d",(int)i,j);
+            total++;if(w!=cases[i].widths[j])fail("auto-table-percent-size","width %d expected %d",w,cases[i].widths[j]);
+            total++;if(x!=right)fail("auto-table-percent-position","x %d expected %d",x,right);
+            right=x+w;pv_free(&v);
+        }
+        total++;if(right!=300)fail("auto-table-percent-sum","right %d expected %d",right,300);
+        web_free(d);
+    }
+    printf("webtest-auto-table-percent: %d checks, %d failed\n",total,failed);return failed!=0;
+}
+static int test_fixed_table(void) {
+    static const struct { const char *columns,*rows;int widths[3],table; } cases[]={
+        {"","<tr><td id=a>first</td><td id=b>row</td><td id=c>three</td></tr>"
+             "<tr><td style='width:1000px;white-space:nowrap'>averylongunbrokencontentmustnotsetfixedtracks</td><td></td><td></td></tr>",{100,100,100},300},
+        {"<colgroup><col style='width:100px'><col><col></colgroup>",
+             "<tr><td id=a></td><td id=b></td><td id=c></td></tr>",{100,100,100},300},
+        {"","<tr><td id=a style='width:60px'></td><td id=b></td><td id=c></td></tr>",{60,120,120},300},
+        {"<colgroup><col span=2 style='width:60px'><col></colgroup>",
+             "<tr><td id=a></td><td id=b></td><td id=c></td></tr>",{60,60,180},300},
+        {"<colgroup><col style='width:120px'><col style='width:120px'><col style='width:120px'></colgroup>",
+             "<tr><td id=a></td><td id=b></td><td id=c></td></tr>",{120,120,120},360},
+        {"","<tr><td id=a colspan=2 style='width:120px'></td><td id=c></td></tr>",{120,0,180},300},
+    };
+    for(size_t i=0;i<sizeof cases/sizeof *cases;i++) {
+        sbuf html={0};sb_puts(&html,"<!doctype html><html><head><style>body{margin:0}table{table-layout:fixed;width:300px;border-spacing:0;border:0}td{padding:0;border:0}</style></head><body><table id=t>");
+        sb_puts(&html,cases[i].columns);sb_puts(&html,cases[i].rows);sb_puts(&html,"</table></body></html>");
+        web_doc *d=web_live(sb_cstr(&html),html.n,BASE,"utf-8",NULL);sb_free(&html);
+        if(!d){total++;fail("fixed-table-create","case %d failed %d",(int)i,1);continue;}
+        uint64_t start=uptime_ms();while(d->parser&&uptime_ms()-start<5000)web_tick(d,uptime_ms());web_layout(d,VW,VH);
+        const char *ids[]={"#a","#b","#c","#t"};
+        for(int j=0;j<4;j++) {
+            if(j<3&&!cases[i].widths[j])continue;
+            pvec nodes={0};css_select(d,d->root,ids[j],&nodes);
+            int x=0,y=0,w=-1,h=0;total++;
+            bool ok=nodes.n && web_node_rect(d,nodes.v[0],&x,&y,&w,&h);
+            int expected=j==3?cases[i].table:cases[i].widths[j];
+            if(!ok || w!=expected)fail("fixed-table-track","width %d expected %d",w,expected);
+            pv_free(&nodes);
+        }
+        web_free(d);
+    }
+    printf("webtest-fixed-table: %d checks, %d failed\n",total,failed);return failed!=0;
+}
+static web_doc *overflow_document(const char *text,float width,const char *extra) {
+    char html[4096];
+    snprintf(html,sizeof html,"<!doctype html><html><head><style>body{margin:0}"
+        "#t{font:16px/20px monospace;width:%.4fpx;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;%s}"
+        "a{color:red;text-decoration:none}</style></head><body><div id=t>%s</div></body></html>",width,extra,text);
+    web_doc *d=web_live(html,strlen(html),BASE,"utf-8",NULL);
+    if(d){uint64_t start=uptime_ms();while(d->parser&&uptime_ms()-start<5000)web_tick(d,uptime_ms());web_layout(d,VW,VH);}
+    return d;
+}
+static box_t *overflow_box(web_doc *d) {
+    pvec v={0};css_select(d,d->root,"#t",&v);box_t *b=v.n?((node_t*)v.v[0])->box:NULL;pv_free(&v);return b;
+}
+static void overflow_check(bool condition,const char *name) {
+    total++;if(!condition)fail(name,"condition %d expected %d",0,1);
+}
+static int test_text_overflow(void) {
+    web_doc *probe=overflow_document("XXXXXXXXXX",200,"");
+    overflow_check(probe!=NULL,"ellipsis-document");if(!probe)return 1;
+    box_t *p=overflow_box(probe);
+    overflow_check(p&&p->nruns==1,"ellipsis-real-inline-layout");if(!p){web_free(probe);return 1;}
+    float prefix=style_text_width(p->st,"XXX",3),marker=style_text_width(p->st,"\xe2\x80\xa6",3);
+    float width=prefix+marker+.1f;
+    web_free(probe);
+    web_doc *d=overflow_document("<a id=l href=x>XXXXXXXXXX</a>",width,"");
+    web_doc *reference=overflow_document("<a href=x>XXX</a>\xe2\x80\xa6",width,"text-overflow:clip");
+    overflow_check(d&&reference,"ellipsis-reference-documents");if(!d||!reference){web_free(d);web_free(reference);return 1;}
+    p=overflow_box(d);float original_width=p->runs[0].w,original_scroll=p->scroll_w;
+    paint(d,0);uint32_t *actual=malloc(sizeof px);overflow_check(actual!=NULL,"ellipsis-pixel-storage");
+    if(actual){memcpy(actual,px,sizeof px);paint(reference,0);overflow_check(!memcmp(actual,px,sizeof px),"ellipsis-real-glyph-and-owner-color-reference");free(actual);}
+    overflow_check(p->runs[0].n==10&&p->runs[0].w==original_width&&p->scroll_w==original_scroll,"ellipsis-retains-logical-text-and-scroll-width");
+    overflow_check(p->nlines==1&&p->lines[0].ellipsis_active&&p->lines[0].ellipsis_bytes==3,"ellipsis-complete-prefix-metadata");
+    struct web_hit hit;web_hit_test(d,(int)(prefix+marker/2),10,&hit);
+    overflow_check(hit.href!=NULL,"ellipsis-hit-target-is-original-elided-link");
+    node_t *n=p->node;overflow_check(doc_element_scroll(d,n,10000,0),"ellipsis-native-scroll-to-end");paint(d,0);
+    overflow_check(!p->lines[0].ellipsis_active&&p->runs[0].n==10,"ellipsis-disappears-at-content-end-without-changing-text");
+    web_free(d);web_free(reference);
+    d=overflow_document("XX",200,"");paint(d,0);p=overflow_box(d);
+    overflow_check(!p->lines[0].ellipsis_active,"ellipsis-no-marker-for-fitting-text");web_free(d);
+    d=overflow_document("XXXXXXXXXX",width,"overflow:visible");paint(d,0);p=overflow_box(d);
+    overflow_check(!p->lines[0].ellipsis_active,"ellipsis-does-not-enable-clipping");web_free(d);
+    d=overflow_document("<span style='display:inline-block;width:30px;height:10px;background:blue'></span>XXXXXXXXXX",10,"");
+    paint(d,0);p=overflow_box(d);
+    overflow_check(p->nruns&&p->runs[0].atomic&&!p->runs[0].atomic->ellipsis_hidden,"ellipsis-first-atomic-is-clipped-not-hidden");web_free(d);
+    d=overflow_document("XXX<span style='display:inline-block;width:80px;height:10px;background:blue'></span>",width,"");
+    paint(d,0);p=overflow_box(d);
+    overflow_check(p->nruns>1&&p->runs[1].atomic&&p->runs[1].atomic->ellipsis_hidden,"ellipsis-hides-whole-later-atomic");web_free(d);
+    d=overflow_document("X<span>\xcc\x81</span>YYYYYYYYYY",marker+prefix/3+.1f,"");
+    paint(d,0);p=overflow_box(d);
+    overflow_check(p->nlines&&p->lines[0].ellipsis_active&&p->lines[0].ellipsis_run>=1,"ellipsis-never-separates-combining-mark-across-style-runs");web_free(d);
+    printf("webtest-text-overflow: %d checks, %d failed\n",total,failed);return failed!=0;
+}
+static int test_button_formatting(void) {
+    const char *displays[]={"flex","inline-flex","grid","inline-grid"};
+    for(int i=0;i<4;i++) {
+        char html[2048];snprintf(html,sizeof html,"<!doctype html><html><head><style>body{margin:0}"
+            "button{display:%s;align-items:center;gap:4px;font:16px/20px monospace;height:40px;padding:0;border:0;"
+            "grid-template-columns:max-content 16px}svg{display:block;width:16px;height:16px}"
+            "</style></head><body><button id=t type=button><span id=label>Label</span>"
+            "<svg id=icon xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><path d='M0 0H16V16H0Z'/></svg></button></body></html>",displays[i]);
+        web_doc *d=web_live(html,strlen(html),BASE,"utf-8",NULL);
+        overflow_check(d!=NULL,"button-formatting-document");if(!d)continue;
+        uint64_t start=uptime_ms();while(d->parser&&uptime_ms()-start<5000)web_tick(d,uptime_ms());web_layout(d,VW,VH);
+        box_t *b=overflow_box(d);
+        overflow_check(b && (i&1?b->kind==B_ATOMIC:b->kind==(i<2?B_FLEX:B_GRID)),"button-preserves-author-display-formatting");
+        int rect[2][4]={{0}};const char *ids[]={"#label","#icon"};
+        for(int k=0;k<2;k++) {
+            pvec v={0};css_select(d,d->root,ids[k],&v);
+            overflow_check(v.n&&web_node_rect(d,v.v[0],&rect[k][0],&rect[k][1],&rect[k][2],&rect[k][3]),"button-child-real-geometry");pv_free(&v);
+        }
+        overflow_check(rect[1][0]>=rect[0][0]+rect[0][2]+3,"button-icon-inline-after-label");
+        overflow_check(abs((2*rect[0][1]+rect[0][3])-(2*rect[1][1]+rect[1][3]))<=2,"button-label-and-icon-center-aligned");
+        overflow_check(b&&b->w<200,"button-auto-width-is-fit-content-not-viewport-width");
+        struct web_hit hit;paint(d,0);web_hit_test(d,rect[1][0]+8,rect[1][1]+8,&hit);
+        struct web_hit action;
+        overflow_check(b&&web_node_action(d,b->node,&action)&&action.kind==WEB_HIT_BUTTON,"button-native-activation-survives-flex-or-grid");
+        overflow_check(hit.node!=NULL,"button-descendant-hit-remains-live");
+        web_free(d);
+    }
+    printf("webtest-button-formatting: %d checks, %d failed\n",total,failed);return failed!=0;
+}
+int main(int argc,char **argv) {
+    if(argc>1 && !strcmp(argv[1],"--auto-table-percent"))return test_auto_table_percent();
+    if(argc>1 && !strcmp(argv[1],"--flex-freeze"))return test_flex_freeze();
+    if(argc>1 && !strcmp(argv[1],"--text-overflow"))return test_text_overflow();
+    if(argc>1 && !strcmp(argv[1],"--button-formatting"))return test_button_formatting();
+    if(argc>1 && !strcmp(argv[1],"--flex-zero"))return test_flex_zero_basis();
+    if(argc>1 && !strcmp(argv[1],"--fixed-table"))return test_fixed_table();
     printf("WEB-STAGE layout\n");fflush(stdout);
     test_layout();
     printf("WEB-STAGE test_paint\n");fflush(stdout);

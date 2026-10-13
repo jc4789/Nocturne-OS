@@ -45,6 +45,13 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
     if(!web_frame_element(n) || !connected(s,n) || n->owner!=s->doc)return;
     struct web_frame *f=web_frame_ensure(s->doc,n);
     if(!f){if(!s->doc->frame_allocation_reported){s->doc->frame_allocation_reported=true;log_text(s,2,"Frame metadata allocation failed");}return;}
+    const char *name=node_attr(n,"name");if(!name)name="";
+    if(!f->name_attribute || strcmp(f->name_attribute,name)){
+        char *attribute=strdup(name),*target=strdup(name);
+        if(!attribute || !target){free(attribute);free(target);log_text(s,2,"Frame target name allocation failed");return;}
+        free(f->name_attribute);free(f->target_name);f->name_attribute=attribute;f->target_name=target;
+        web_js_window_names_changed(s->doc);
+    }
     const char *src=node_attr(n,"src"),*srcdoc=n->tag==T_iframe?node_attr(n,"srcdoc"):NULL,*sandbox=node_attr(n,"sandbox");
     if(!src)src="";
     if(web_frame_initial_blocked(f,src,srcdoc))return;
@@ -393,11 +400,90 @@ static bool frame_navigation_authorized(struct web_js_state *caller,web_doc *tar
     for(web_doc *p=caller->doc->frame_parent;p;p=p->frame_parent)if(p==target)return true;
     return false;
 }
+/* Window names see the ordinary document tree, never shadow/template forests. */
+static node_t *window_named_next(node_t *root,node_t *n) {
+    if(n->first && !(n->type==N_ELEM && !n->foreign && n->tag==T_template))return n->first;
+    while(n && n!=root){if(n->next)return n->next;n=n->parent;}
+    return NULL;
+}
+static JSValue window_named_elements(struct web_js_state *s) {
+    JSContext *ctx=s->ctx;JSValue result=JS_NewArray(ctx);
+    if(JS_IsException(result))return result;
+    uint32_t index=0;unsigned work=0;
+    for(node_t *n=s->doc->root;n;n=window_named_next(s->doc->root,n)) {
+        if(!(++work&127) && !web_native_checkpoint(s->doc)){JS_FreeValue(ctx,result);return JS_ThrowInternalError(ctx,"Window named traversal cancelled");}
+        if(n->type!=N_ELEM)continue;
+        const char *id=n->id?n->id:"",*name="",*child="";
+        if(n->namespace_id==NS_HTML && (n->tag==T_embed || n->tag==T_form || n->tag==T_img || n->tag==T_object)){
+            const char *attribute=node_attr(n,"name");if(attribute)name=attribute;
+        }
+        if(web_frame_element(n)){
+            frame_sync(s,n);struct web_frame *f=web_frame_find(s->doc,n);
+            if(f && f->document && !f->detached)child=f->target_name?f->target_name:"";
+        }
+        if(!*id && !*name && !*child)continue;
+        if(index==UINT32_MAX){JS_FreeValue(ctx,result);return JS_ThrowRangeError(ctx,"Window named result cannot be represented");}
+        JSValue row=JS_NewArray(ctx),values[]={wrap(s,n),JS_NewString(ctx,id),JS_NewString(ctx,name),JS_NewString(ctx,child)};
+        bool ok=!JS_IsException(row);
+        for(unsigned i=0;i<4;i++){
+            if(JS_IsException(values[i]))ok=false;
+            if(ok){if(JS_DefinePropertyValueUint32(ctx,row,i,values[i],JS_PROP_C_W_E)<0)ok=false;values[i]=JS_UNDEFINED;}
+        }
+        for(unsigned i=0;i<4;i++)JS_FreeValue(ctx,values[i]);
+        if(!ok){JS_FreeValue(ctx,row);JS_FreeValue(ctx,result);return JS_EXCEPTION;}
+        if(JS_DefinePropertyValueUint32(ctx,result,index++,row,JS_PROP_C_W_E)<0){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
+    }
+    return result;
+}
 static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
     struct web_js_state *caller=sandbox_actor(s);
     if(!s->starting && (sandbox_authority(s)&SB_SCRIPTS))return history_security_error(ctx,"Sandbox disallows scripted Window access");
     const char *op=argc?JS_ToCString(ctx,argv[0]):NULL;if(!op)return JS_EXCEPTION;
+    if(!strcmp(op,"namedVersion") || !strcmp(op,"namedElements") || !strcmp(op,"namedChild") || !strcmp(op,"name")){
+        if(!s->starting && (s->disabled || !s->doc->live)){
+            JS_FreeCString(ctx,op);return JS_ThrowTypeError(ctx,"Window document is inactive");
+        }
+        JSValue result=JS_UNDEFINED;
+        if(!strcmp(op,"namedVersion")){
+            result=JS_NewArray(ctx);
+            if(!JS_IsException(result) && (JS_DefinePropertyValueUint32(ctx,result,0,wrap(s,s->doc->root),JS_PROP_C_W_E)<0 ||
+                JS_DefinePropertyValueUint32(ctx,result,1,JS_NewBigUint64(ctx,s->window_named_revision),JS_PROP_C_W_E)<0)){
+                JS_FreeValue(ctx,result);result=JS_EXCEPTION;
+            }
+        }else if(!strcmp(op,"namedElements"))result=window_named_elements(s);
+        else if(!strcmp(op,"namedChild")){
+            node_t *n=argc>1?unwrap(ctx,argv[1]):NULL;
+            if(!n || n->owner!=s->doc || !web_frame_element(n) || doc_node_root(n,false)!=s->doc->root)result=JS_NULL;
+            else{
+                frame_sync(s,n);struct web_frame *f=web_frame_find(s->doc,n);
+                result=JS_NewArray(ctx);
+                if(!JS_IsException(result) && (JS_DefinePropertyValueUint32(ctx,result,0,wrap(s,f&&!f->detached?f->window_token:NULL),JS_PROP_C_W_E)<0 ||
+                   JS_DefinePropertyValueUint32(ctx,result,1,JS_NewBool(ctx,f&&f->document&&!f->detached&&web_frame_same_origin(s->doc,f->document)),JS_PROP_C_W_E)<0)){
+                    JS_FreeValue(ctx,result);result=JS_EXCEPTION;
+                }
+            }
+        }else{
+            struct web_frame *f=s->doc->frame_container;
+            const char *current=f?f->target_name:s->window_name;
+            if(argc<3)result=JS_NewString(ctx,current?current:"");
+            else{
+                const char *value=JS_ToCString(ctx,argv[2]);
+                if(!value)result=JS_EXCEPTION;
+                else if(f){
+                    char *copy=strdup(value);
+                    if(!copy)result=oom(ctx);
+                    else{free(f->target_name);f->target_name=copy;web_js_window_names_changed(f->owner);}
+                }else{
+                    char *copy=js_strdup(ctx,value);
+                    if(!copy)result=JS_EXCEPTION;
+                    else{js_free(ctx,s->window_name);s->window_name=copy;}
+                }
+                JS_FreeCString(ctx,value);
+            }
+        }
+        JS_FreeCString(ctx,op);return result;
+    }
     if(!strcmp(op,"transferGeneration")||!strcmp(op,"transferCommit")){
         JSValue result=!strcmp(op,"transferGeneration")?wrap(s,s->doc->root):
             argc>1?frame_transfer_commit(ctx,s,argv[1]):JS_ThrowTypeError(ctx,"Private transfer plan required");

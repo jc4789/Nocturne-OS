@@ -47,6 +47,7 @@ static ssize_t fixture_write(int fd,const void *p,size_t n){(void)fd;(void)p;ret
 #undef write
 struct net_stream {int unused;};
 net_stream *ns_open(const char *h,uint16_t p,bool tls,int t,char *e,size_t n){(void)h;(void)p;(void)tls;(void)t;(void)e;(void)n;return NULL;}
+net_stream *ns_open_timed(const char *h,uint16_t p,bool tls,int t,char *e,size_t n,struct http_transport_timing *m){memset(m,0,sizeof *m);return ns_open(h,p,tls,t,e,n);}
 long ns_read(net_stream *s,void *p,size_t n){(void)s;(void)p;(void)n;return -1;}
 long ns_write(net_stream *s,const void *p,size_t n){(void)s;(void)p;(void)n;return -1;}
 const char *ns_error(net_stream *s){(void)s;return "unused protocol stream";}

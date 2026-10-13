@@ -19,6 +19,8 @@ def function(signature):
 production = css[:css.index("/* ---------------------------------------------------------------- matching */")]
 production += css[css.index("/* ---------------------------------------------------------------- feature queries"):
                   css.index("struct sheet_parse_job {")]
+production += css[css.index("/* ---------------------------------------------------------------- media queries"):
+                  css.index("static bool media_chain_ok(")]
 production = production.replace("#include <nocturne.h>\n", "")
 faults = """#include <stdlib.h>
 static unsigned fail_style_malloc, fail_cache_calloc;
@@ -29,12 +31,20 @@ static void *cache_fault_calloc(size_t n,size_t size){if(fail_cache_calloc && !-
 """
 production = faults + "void *thread_local_get(unsigned slot);\n#define MIN(a,b) ((a)<(b)?(a):(b))\n#define MAX(a,b) ((a)>(b)?(a):(b))\n" + production
 production += css[css.index("struct css_animation {"):css.index("static void css_motion_reset(")]
-production += css[css.index("struct cascade {"):css.index("static void apply_decl(")]
+production += css[css.index("struct cascade {"):css.index("struct css_rollback {")]
 for name in ("static void css_motion_reset(", "int css_animation_set(", "void css_animation_free(",
              "void css_node_style_free(", "void css_node_style_unpublish(", "void css_styles_release(", "static void retire_style("):
     production += function(name)
 cases = (root / "tests/cssperformancetest.c").read_text(encoding="utf-8")
 cases = cases[cases.index("static int checks, failed;"):]
+paint = (root / "user/libc/web/paint.c").read_text(encoding="utf-8")
+for signature in ("static uint32_t with_alpha(", "static uint32_t control_text_color("):
+    start = paint.index(signature)
+    production += paint[start:paint.index("\n}", start) + 2] + "\n"
+box = (root / "user/libc/web/box.c").read_text(encoding="utf-8")
+for signature in ("static int atomic_kind(", "bool box_pseudo_generated("):
+    start = box.index(signature)
+    production += box[start:box.index("\n}", start) + 2] + "\n"
 native = out / "native.c"
 native.write_text(production + "\nbool web_native_checkpoint(web_doc *d){(void)d;return true;}\n" + cases,
                   encoding="utf-8")
@@ -50,7 +60,7 @@ env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH",
 exe = out / "native.exe"
 command = [str(cc), "-std=gnu11", "-O1", "-ffunction-sections", "-fdata-sections", "-Wl,--gc-sections",
            "-Wno-incompatible-library-redeclaration", "-I" + str(abi), "-Iuser/include", "-Icommon",
-           "-Iuser/libc/web", "-Ithird_party/quickjs", str(native), "user/libc/web/cssprop.c",
+           "-Iuser/libc/web", "-Itests", "-Ithird_party/quickjs", str(native), "user/libc/web/cssprop.c",
            "user/libc/web/util.c", "user/libc/web/html.c", str(urls), "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
-subprocess.run([str(exe)] + (["second"] if "--second" in sys.argv else []), cwd=root, env=env, check=True, timeout=30)
+subprocess.run([str(exe)] + (["placeholder"] if "--placeholder" in sys.argv else ["text-overflow"] if "--text-overflow" in sys.argv else ["font-shorthand"] if "--font-shorthand" in sys.argv else ["flex"] if "--flex" in sys.argv else ["media-calc"] if "--media-calc" in sys.argv else ["fonts"] if "--fonts" in sys.argv else ["second"] if "--second" in sys.argv else []), cwd=root, env=env, check=True, timeout=30)

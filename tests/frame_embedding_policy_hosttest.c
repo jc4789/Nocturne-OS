@@ -8,6 +8,8 @@ const char *web_effective_url(web_doc *d) { return d && d->inherited_url ? d->in
  * translation unit is linked whole to use its actual owned URL parser. */
 net_stream *ns_open(const char *host,uint16_t port,bool tls,int timeout,char *error,size_t cap){abort();}
 long ns_write(net_stream *s,const void *data,size_t n){abort();}
+net_stream *ns_open_timed(const char *h,uint16_t p,bool tls,int t,char *e,size_t n,struct http_transport_timing *m){memset(m,0,sizeof *m);return ns_open(h,p,tls,t,e,n);}
+uint64_t uptime_ms(void){return 0;}
 long ns_read(net_stream *s,void *data,size_t n){abort();}
 const char *ns_error(net_stream *s){abort();}
 void ns_close(net_stream *s){abort();}

@@ -380,7 +380,56 @@ static int scroll_extents(void){
     web_free(d);
     printf("paintperformance scroll-extent: %d checks, %d failed\n",checks,failed);return failed?1:0;
 }
+static void placeholder_paint(web_doc *d, uint32_t *target) {
+    canvas_t canvas;gfx_init(&canvas,target,320,200,320);
+    web_layout(d,320,200);web_paint(d,&canvas,0,0,320,200,0,0);
+}
+static int placeholders(void) {
+    const char *html="<!doctype html><style>html,body{margin:0;background:white}"
+        "input,textarea{position:absolute;left:4px;top:4px;width:180px;height:26px;"
+        "border:0;padding:0;margin:0;background:white;color:black;font:16px monospace}"
+        "textarea{top:40px;height:50px}.hide::placeholder{color:transparent}"
+        ".zero::placeholder{opacity:0}.red::placeholder{color:red;font-size:20px}"
+        "</style><input id=single type=search placeholder=Hint><textarea id=multi placeholder=Hint></textarea>";
+    struct web_host host={.script_checkpoint=checkpoint};
+    web_doc *d=web_live(html,strlen(html),"https://paint.test/placeholders","utf-8",&host);
+    check(d!=NULL,"placeholder native document");if(!d)return 1;
+    for(unsigned i=0;i<8;i++)web_tick(d,uptime_ms());web_layout(d,320,200);
+    node_t *single=by_id(d->root,"single"),*multi=by_id(d->root,"multi");
+    check(single&&multi&&single->style&&multi->style,"both input and textarea have styles");
+    if(!single||!multi||!single->style||!multi->style){web_free(d);return 1;}
+    check(!single->style->placeholder&&!multi->style->placeholder,"UA-only controls allocate no extra pseudo style");
+    placeholder_paint(d,pixels);
+    doc_node_attr(d,single,"placeholder","");doc_node_attr(d,multi,"placeholder","");
+    placeholder_paint(d,reference);
+    check(memcmp(pixels,reference,sizeof pixels)!=0,"UA hint text is actually painted");
+    doc_node_attr(d,single,"placeholder","Hint");doc_node_attr(d,multi,"placeholder","Hint");
+    doc_node_attr(d,single,"class","hide");doc_node_attr(d,multi,"class","hide");
+    placeholder_paint(d,pixels);
+    check(single->style->placeholder&&multi->style->placeholder,"authored input and textarea pseudo bodies cached");
+    check(single->style->placeholder&&single->style->placeholder->color==0,"transparent declaration wins real cascade");
+    check(!memcmp(pixels,reference,sizeof pixels),"transparent hints paint identical to no hint without hiding controls");
+    doc_node_attr(d,single,"class","zero");doc_node_attr(d,multi,"class","zero");
+    placeholder_paint(d,pixels);
+    check(single->style->placeholder&&single->style->placeholder->opacity==0,"placeholder opacity reaches cached body");
+    check(!memcmp(pixels,reference,sizeof pixels),"opacity zero also hides input and textarea hints");
+    doc_node_attr(d,single,"class","red");doc_node_attr(d,multi,"class","red");
+    placeholder_paint(d,pixels);
+    check(single->style->placeholder&&single->style->placeholder->color==RGB(255,0,0)&&
+        single->style->placeholder->font_size==20,"author colour and font reach pseudo body");
+    bool red=false;for(unsigned i=0;i<sizeof pixels/sizeof *pixels;i++)
+        if(((pixels[i]>>16)&255)>(pixels[i]&255)+30)red=true;
+    check(red,"red authored placeholder glyph pixels present");
+    doc_node_value(d,single,"value",5);doc_node_value(d,multi,"value",5);
+    placeholder_paint(d,reference);
+    doc_node_attr(d,single,"class","hide");doc_node_attr(d,multi,"class","hide");
+    placeholder_paint(d,pixels);
+    check(!memcmp(pixels,reference,sizeof pixels),"nonempty input and textarea values ignore placeholder paint rules");
+    web_free(d);
+    printf("paintperformance placeholder: %d checks, %d failed\n",checks,failed);return failed?1:0;
+}
 int main(int argc,char **argv){
+    if(argc>1&&!strcmp(argv[1],"--placeholder"))return placeholders();
     if(argc>1&&!strcmp(argv[1],"--scroll-extent"))return scroll_extents();
     if(argc>1&&!strcmp(argv[1],"--scroll-input"))return scroll_inputs();
     if(argc>1&&!strcmp(argv[1],"--boundaries"))return boundaries();

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 struct result {
     int calls, status;
@@ -148,7 +149,7 @@ static void debug_transport_tests(void) {
     bool done = id && wait_result(&r, 40000);
     bool same = done && success(&r) && r.length == length;
     for (size_t i = 0; same && i < length; i++) same = (unsigned char)r.body[i] == (unsigned char)(i * 37 + 11);
-    check(same && !strstr(r.headers, "HTTP/Nocturne-Request"),
+    check(same && !strstr(r.headers, "HTTP/Nocturne-Request") && !strstr(r.headers,"HTTP/Nocturne-Transport"),
           "数値診断除去後も分割binary body全byteとHTTP状態を保全");
     check(done && success(&r) && r.id == id && r.generation == 309 &&
           strstr(r.headers, "HTTP/1.1 200 ") && strstr(r.headers, "HTTP/Nocturne-Meta cors=0 redirected=0") &&
@@ -921,10 +922,89 @@ static void callback_cancel_test(void){
     check(drained&&callback_cancel_calls==1&&callback_cancel_borrow&&children()==0,
           "stream callback generation cancellation retains its borrowed response and reaps without reentry");
 }
+static volatile bool udp_wait_started;
+static int udp_wait_handle,udp_wait_result,udp_wait_errno;
+static void udp_wait_closed(void *unused) {
+    (void)unused;char byte;udp_wait_started=true;
+    udp_wait_result=udp_recvfrom(udp_wait_handle,&byte,1,3000,NULL);
+    udp_wait_errno=errno;
+}
+static int udp_capacity_test(void) {
+    if(!net_wait_up(20000)){puts("FAIL UDP network did not come up");return 1;}
+    int sockets[64];for(size_t i=0;i<64;i++)sockets[i]=-1;
+    unsigned opened=0;
+    for(size_t i=0;i<64;i++){sockets[i]=udp_socket(0);if(sockets[i]<0)break;opened++;}
+    check(opened==64,"UDP concurrent live sockets are not rejected at the former global eight-slot limit");
+    uint32_t ip=0;
+    check(net_resolve("example.com",&ip)==0&&ip!=0,"DNS has its own live queue while all user sockets remain open");
+    for(size_t i=0;i<64;i++)if(sockets[i]>=0)check(udp_close(sockets[i])==0,"release live UDP queue");
+    int first=udp_socket(49152);
+    check(first>=0,"explicit UDP port allocates after queue release");
+    int duplicate=udp_socket(49152);
+    check(duplicate<0,"explicit live UDP port still excludes duplicate binding");
+    if(duplicate>=0)udp_close(duplicate);
+    if(first>=0){check(udp_close(first)==0,"close explicit UDP port");check(udp_close(first)<0,"closed UDP handle is invalid");}
+    first=udp_socket(49152);check(first>=0,"released UDP port is reusable");if(first>=0)udp_close(first);
+    udp_wait_handle=udp_socket(0);
+    int tid=udp_wait_handle>=0?thread_create(udp_wait_closed,NULL):-1;
+    check(tid>=0,"native UDP blocked receive thread starts");
+    if(tid>=0) {
+        while(!udp_wait_started)msleep(1);
+        msleep(30);udp_close(udp_wait_handle);
+        int replacement=udp_socket(0);
+        check(replacement==udp_wait_handle,"closed slot can be reused while its old receive is sleeping");
+        thread_join(tid);
+        check(udp_wait_result==-1&&udp_wait_errno==EBADF,"blocked receive never consumes a replacement socket generation");
+        if(replacement>=0)udp_close(replacement);
+    } else if(udp_wait_handle>=0)udp_close(udp_wait_handle);
+    printf("webnet-udp-capacity: %d failed\n",failed);return failed!=0;
+}
+static volatile bool tcp_wait_started,tcp_wait_finished;
+static int tcp_wait_handle,tcp_wait_result,tcp_wait_errno;
+static void tcp_wait_closed(void *unused) {
+    (void)unused;char byte;tcp_wait_started=true;
+    tcp_wait_result=tcp_recv(tcp_wait_handle,&byte,1,3000);
+    tcp_wait_errno=errno;tcp_wait_finished=true;
+}
+static int tcp_capacity_test(void) {
+    int sockets[24];
+    for(int round=0;round<2;round++) {
+        unsigned opened=0;
+        for(size_t i=0;i<24;i++)sockets[i]=-1;
+        for(size_t i=0;i<24;i++) {
+            sockets[i]=tcp_connect(0x0a000202,(uint16_t)ports[0],5000);
+            if(sockets[i]<0)break;
+            opened++;
+        }
+        check(opened==24,round?"TCP closing tuples do not block the next concurrent group":"TCP live connections are not limited to sixteen global slots");
+        for(size_t i=0;i<24;i++)if(sockets[i]>=0)check(tcp_close(sockets[i])==0,"release TCP ownership without stealing its closing tuple");
+    }
+    /* A socket-local wait queue must wake its blocked sibling on close,
+       without publishing bytes from a fresh connection into the old receive. */
+    tcp_wait_handle=tcp_connect(0x0a000202,(uint16_t)ports[0],5000);
+    tcp_wait_started=tcp_wait_finished=false;
+    int tid=tcp_wait_handle>=0?thread_create(tcp_wait_closed,NULL):-1;
+    check(tid>=0,"native TCP socket-local blocked receive starts");
+    if(tid>=0) {
+        while(!tcp_wait_started)msleep(1);
+        msleep(30);
+        check(!tcp_wait_finished,"idle TCP receive remains pending before close");
+        check(tcp_close(tcp_wait_handle)==0,"close wakes the socket-local receive queue");
+        int replacement=tcp_connect(0x0a000202,(uint16_t)ports[0],5000);
+        check(replacement>=0,"fresh TCP connection progresses while old receive resumes");
+        thread_join(tid);
+        check(tcp_wait_finished&&tcp_wait_result==-1&&tcp_wait_errno==EBADF,
+              "blocked TCP receive retains its closed connection generation");
+        if(replacement>=0)tcp_close(replacement);
+    } else if(tcp_wait_handle>=0)tcp_close(tcp_wait_handle);
+    printf("webnet-tcp-capacity: %d failed\n",failed);return failed!=0;
+}
 int main(int argc, char **argv) {
+    if(argc==2&&!strcmp(argv[1],"--udp-capacity"))return udp_capacity_test();
     bool tls = argc == 2 && !strcmp(argv[1], "--tls");
     bool boundaries=argc==2&&!strcmp(argv[1],"--performance-boundaries");
-    if (argc > 1 && !tls&&!boundaries) { puts("usage: webnettest [--tls|--performance-boundaries]"); return 1; }
+    bool tcp_capacity=argc==2&&!strcmp(argv[1],"--tcp-capacity");
+    if (argc > 1 && !tls&&!boundaries&&!tcp_capacity) { puts("usage: webnettest [--tls|--performance-boundaries|--udp-capacity|--tcp-capacity]"); return 1; }
     if (tls) {
         if (!net_wait_up(20000)) { puts("FAIL webnet network did not come up"); return 1; }
         net = webnet_create();
@@ -943,6 +1023,7 @@ int main(int argc, char **argv) {
     }
     fclose(f);
     if (!net_wait_up(20000)) { puts("FAIL webnet network did not come up"); return 1; }
+    if(tcp_capacity)return tcp_capacity_test();
     snprintf(document, sizeof document, "http://10.0.2.2:%d/index.html", ports[0]);
     net = webnet_create();
     if (!net) { puts("FAIL webnet allocation"); return 1; }

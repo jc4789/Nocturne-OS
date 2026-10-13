@@ -5,14 +5,15 @@ const source=fs.readFileSync('user/libc/web/js_bootstrap.js','utf8');
 function slice(start,end){const a=source.indexOf(start),b=source.indexOf(end,a);assert(a>=0&&b>a);return source.slice(a,b);}
 const eventSource=slice('    const eventStates=', '    /* @include js_error_event.js */');
 const targetSource=slice('    class EventTarget {','    function handlerTarget(');
+const inputSource=slice('    function inputListenerChange(', '    function removeListener(');
 const dispatchSource=slice('    function invoke(target, event, capture) {','    class Node extends EventTarget {');
 const init=new Function(`
-    const apply=Reflect.apply,eventSlice=Array.prototype.slice,eventPaths=new WeakMap(),focusData=new WeakMap(),listenerMap=new WeakMap(),inlineMap=new WeakMap();
-    const host={now:()=>1},report=e=>{throw e;},options=o=>typeof o==='boolean'?{capture:o}:o||{};
+    const apply=Reflect.apply,eventSlice=Array.prototype.slice,eventPaths=new WeakMap(),focusData=new WeakMap(),listenerMap=new WeakMap(),inlineMap=new WeakMap(),inputWindow=globalThis;
+    const host={now:()=>1},rawDom={isNode:()=>false},report=e=>{throw e;},options=o=>typeof o==='boolean'?{capture:o}:o||{};
     const handlerRecord=()=>null,handlerTarget=()=>false;
     function removeListener(target,entry){entry.removed=true;const a=listenerMap.get(target),i=a.indexOf(entry);if(i>=0)a.splice(i,1);}
     const shadowBridge={path(target,event){const nodes=[target];if(target.parent)nodes.push(target.parent);return {entries:nodes.map(node=>({node,target,related:null,visible:nodes,atTarget:node===target})),finalTarget:target,finalRelated:null};}};
-    ${eventSource}${targetSource}${dispatchSource}
+    ${eventSource}${inputSource}${targetSource}${dispatchSource}
     class Node extends EventTarget {}
     return {Event,EventTarget,state:eventState};
 `);

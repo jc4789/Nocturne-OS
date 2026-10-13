@@ -1,6 +1,7 @@
 /* Nocturne network stack: Ethernet, ARP, IPv4, ICMP, UDP, DHCP, DNS and a small TCP client.
    Received frames are queued from the NIC interrupt and processed by the "net" kernel thread.
-   System calls run in the calling task and block on net_wq until the thread reports progress.
+   System calls run in the calling task and block on their socket's progress queue
+   (or net_wq for shared link/UDP state) until the thread reports progress.
    The kernel is non-preemptive, so stack state needs no locks besides the IRQ-fed queue. */
 #include "kernel.h"
 #include "abi.h"
@@ -16,7 +17,7 @@ static struct netif *nif;
 static uint32_t my_ip, my_mask, my_gw, my_dns;
 static bool configured;
 static uint64_t rx_packets, tx_packets;
-static struct wait_queue net_wq; /* progress for blocked system calls */
+static struct wait_queue net_wq; /* shared link/ARP/DNS/UDP progress */
 static struct wait_queue rxq_wq; /* the net thread sleeps here */
 
 static uint16_t htons(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
@@ -305,16 +306,18 @@ static int64_t sys_ping(uint32_t dst, int seq, int timeout_ms) {
     uint64_t t0 = uptime_ms(), until = t0 + (uint64_t)(timeout_ms > 0 ? timeout_ms : 1000);
     ip_output(dst, mac, 1, 40);
     int64_t ret = -ETIMEDOUT;
-    while (uptime_ms() < until) {
+    for (;;) {
+        uint64_t now=uptime_ms();
+        if(now>=until)break;
         if (w->done) {
-            ret = (int64_t)(uptime_ms() - t0);
+            ret = (int64_t)(now - t0);
             break;
         }
         if (current_task->killed) {
             ret = -EINTR;
             break;
         }
-        wq_wait_timeout(&net_wq, until - uptime_ms());
+        wq_wait_timeout(&net_wq, until - now);
     }
     if (w->done) ret = (int64_t)(uptime_ms() - t0);
     w->used = false;
@@ -323,20 +326,32 @@ static int64_t sys_ping(uint32_t dst, int seq, int timeout_ms) {
 
 /* ---------------------------------------------------------------- UDP */
 
-#define UDP_N 8
+#define UDP_INITIAL 8
 #define UDP_Q 8
 struct udp_dgram {
     uint32_t src;
     uint16_t sport, len;
     uint8_t data[1472];
 };
-static struct udp_sock {
-    bool used;
+struct udp_sock {
+    bool used, internal;
     int pid;
     uint16_t port;
-    struct udp_dgram q[UDP_Q];
+    uint64_t generation;
+    struct udp_dgram *q;
     int qh, qt;
-} udp_socks[UDP_N];
+};
+/* Socket metadata must stay at a stable address across a blocking receive.
+   The pointer table grows, while queues exist only for live sockets. The
+   initial capacity is not a global concurrency limit for DNS or user UDP. */
+static struct udp_sock udp_initial[UDP_INITIAL];
+static struct udp_sock *udp_initial_slots[UDP_INITIAL]={
+    &udp_initial[0],&udp_initial[1],&udp_initial[2],&udp_initial[3],
+    &udp_initial[4],&udp_initial[5],&udp_initial[6],&udp_initial[7]
+};
+static struct udp_sock **udp_socks=udp_initial_slots;
+static size_t udp_capacity=UDP_INITIAL;
+static uint64_t udp_generation;
 static uint16_t next_port = 49152;
 
 static uint16_t ephemeral_port(void) {
@@ -371,9 +386,9 @@ static void udp_input(uint32_t src, uint32_t dst, const uint8_t *p, size_t len) 
         dhcp_input(p + 8, ulen - 8);
         return;
     }
-    for (int i = 0; i < UDP_N; i++) {
-        struct udp_sock *s = &udp_socks[i];
-        if (!s->used || s->port != dport) continue;
+    for (size_t i = 0; i < udp_capacity; i++) {
+        struct udp_sock *s = udp_socks[i];
+        if (!s || !s->used || s->port != dport) continue;
         int next = (s->qh + 1) % UDP_Q;
         if (next == s->qt || ulen - 8 > sizeof s->q[0].data) return;
         struct udp_dgram *d = &s->q[s->qh];
@@ -388,26 +403,60 @@ static void udp_input(uint32_t src, uint32_t dst, const uint8_t *p, size_t len) 
     }
 }
 
+static bool udp_port_used(uint16_t port) {
+    for(size_t i=0;i<udp_capacity;i++)
+        if(udp_socks[i] && udp_socks[i]->used && udp_socks[i]->port==port)return true;
+    return false;
+}
+static void udp_release(struct udp_sock *s) {
+    if(!s || !s->used)return;
+    s->used=false;kfree(s->q);s->q=NULL;s->qh=s->qt=0;
+    wq_wake_all(&net_wq);poll_notify();
+}
 static int udp_alloc(uint16_t port, int pid) {
-    if (!port) port = ephemeral_port();
-    for (int i = 0; i < UDP_N; i++)
-        if (udp_socks[i].used && udp_socks[i].port == port) return -EADDRINUSE;
-    for (int i = 0; i < UDP_N; i++)
-        if (!udp_socks[i].used) {
-            memset(&udp_socks[i], 0, sizeof udp_socks[i]);
-            udp_socks[i].used = true;
-            udp_socks[i].pid = pid;
-            udp_socks[i].port = port;
-            return i;
-        }
-    return -EMFILE;
+    if(port) {if(udp_port_used(port))return -EADDRINUSE;}
+    else {
+        /* There are exactly 16384 ephemeral UDP ports, not eight sockets. */
+        unsigned attempts=0;
+        do {port=ephemeral_port();if(!udp_port_used(port))break;}while(++attempts<16384);
+        if(attempts==16384)return -EADDRINUSE;
+    }
+    size_t slot=0;
+    while(slot<udp_capacity && udp_socks[slot] && udp_socks[slot]->used)slot++;
+    if(slot==udp_capacity) {
+        /* Handles use the syscall signed-int ABI. Reject only arithmetic or
+           allocation failure, never a small scheduling-derived count. */
+        size_t next=udp_capacity<=((size_t)0x7fffffff+1)/2?udp_capacity*2:(size_t)0x7fffffff+1;
+        if(next<=udp_capacity || next>SIZE_MAX/sizeof *udp_socks)return -ENOMEM;
+        struct udp_sock **grown=kmalloc(next*sizeof *grown);
+        if(!grown)return -ENOMEM;
+        memcpy(grown,udp_socks,udp_capacity*sizeof *grown);
+        memset(grown+udp_capacity,0,(next-udp_capacity)*sizeof *grown);
+        if(udp_socks!=udp_initial_slots)kfree(udp_socks);
+        udp_socks=grown;udp_capacity=next;
+    }
+    struct udp_sock *s=udp_socks[slot];
+    if(!s) {
+        s=kmalloc(sizeof *s);if(!s)return -ENOMEM;
+        memset(s,0,sizeof *s);udp_socks[slot]=s;
+    }
+    struct udp_dgram *queue=kmalloc(UDP_Q*sizeof *queue);
+    if(!queue)return -ENOMEM;
+    memset(s,0,sizeof *s);s->q=queue;s->used=true;s->pid=pid;s->port=port;
+    if(++udp_generation==0)++udp_generation;
+    s->generation=udp_generation;
+    return (int)slot;
 }
 
 /* wait for a datagram on socket i; returns pointer or NULL on timeout (and sets *err) */
 static struct udp_dgram *udp_wait(int i, int timeout_ms, int *err) {
-    struct udp_sock *s = &udp_socks[i];
+    struct udp_sock *s = udp_socks[i];
+    uint64_t generation=s->generation;
     uint64_t until = uptime_ms() + (uint64_t)(timeout_ms < 0 ? 0 : timeout_ms);
     for (;;) {
+        /* A sibling thread can close/reuse this handle while we sleep. Never
+           consume another socket generation or touch its freed queue. */
+        if(!s->used || s->generation!=generation){*err=-EBADF;return NULL;}
         if (s->qt != s->qh) {
             struct udp_dgram *d = &s->q[s->qt];
             s->qt = (s->qt + 1) % UDP_Q;
@@ -417,17 +466,19 @@ static struct udp_dgram *udp_wait(int i, int timeout_ms, int *err) {
             *err = -EINTR;
             return NULL;
         }
-        if (timeout_ms >= 0 && uptime_ms() >= until) {
+        uint64_t now=uptime_ms();
+        if (timeout_ms >= 0 && now >= until) {
             *err = -EAGAIN;
             return NULL;
         }
-        wq_wait_timeout(&net_wq, timeout_ms < 0 ? 1000 : until - uptime_ms());
+        wq_wait_timeout(&net_wq, timeout_ms < 0 ? 1000 : until - now);
     }
 }
 
 static struct udp_sock *user_udp(int h) {
-    if (h < 0 || h >= UDP_N || !udp_socks[h].used || udp_socks[h].pid != task_process()->pid) return NULL;
-    return &udp_socks[h];
+    if(h<0 || (size_t)h>=udp_capacity)return NULL;
+    struct udp_sock *s=udp_socks[h];
+    return s && s->used && !s->internal && s->pid==task_process()->pid?s:NULL;
 }
 
 /* ---------------------------------------------------------------- DHCP */
@@ -636,17 +687,21 @@ static int64_t dns_query(const char *name, uint32_t *out) {
     uint8_t mac[6];
     int r = arp_resolve(my_dns, mac);
     if (r < 0) return r;
-    int sock = udp_alloc(0, 0);
+    int sock = udp_alloc(0, task_process()->pid);
     if (sock < 0) return sock;
+    udp_socks[sock]->internal=true;
+    uint64_t generation=udp_socks[sock]->generation;
     int64_t ret = -ETIMEDOUT;
     for (int tries = 0; tries < 3 && ret == -ETIMEDOUT; tries++) {
-        udp_output(udp_socks[sock].port, my_dns, 53, mac, q, n);
+        udp_output(udp_socks[sock]->port, my_dns, 53, mac, q, n);
         uint64_t until = uptime_ms() + 2000;
-        while (uptime_ms() < until) {
+        for (;;) {
+            uint64_t now=uptime_ms();
+            if(now>=until)break;
             int err = 0;
-            struct udp_dgram *d = udp_wait(sock, (int)(until - uptime_ms()), &err);
+            struct udp_dgram *d = udp_wait(sock, (int)(until - now), &err);
             if (!d) {
-                if (err == -EINTR) ret = -EINTR;
+                if(err && err!=-EAGAIN)ret=err;
                 break;
             }
             const uint8_t *p = d->data;
@@ -688,13 +743,13 @@ static int64_t dns_query(const char *name, uint32_t *out) {
             break;
         }
     }
-    udp_socks[sock].used = false;
+    if(udp_socks[sock]->generation==generation)udp_release(udp_socks[sock]);
     return ret;
 }
 
 /* ---------------------------------------------------------------- TCP */
 
-#define TCP_N     16
+#define TCP_INITIAL 16
 #define TCP_RXBUF 65536
 #define TCP_TXBUF 32768
 #define F_FIN 0x01
@@ -711,8 +766,11 @@ enum { T_FREE, T_SYN_SENT, T_ESTABLISHED, T_FIN_WAIT1, T_FIN_WAIT2, T_CLOSE_WAIT
 #define RTO_MAX   16000
 #define CWND_MAX  (1u << 20)
 
-static struct tcb {
+struct tcb {
     int state, err, pid;
+    /* Stable metadata owns its progress waiters. One socket's ACK/data must
+       not reschedule every DNS/TCP helper that is waiting on another socket. */
+    struct wait_queue progress;
     bool user_open, fin_pending, fin_sent, rx_fin;
     uint32_t rip;
     uint16_t lport, rport, mss;
@@ -736,8 +794,15 @@ static struct tcb {
     uint8_t *rx, *tx;
     uint32_t rx_head, rx_len, tx_len;
     uint64_t rto_at, linger_until;
+    uint64_t generation;
     int rto, retries;
-} tcbs[TCP_N];
+};
+/* Closed-but-lingering tuples remain valid until TCP releases them. They
+   must not occupy a fixed sixteen-slot pool and serialize unrelated fetches. */
+static struct tcb *tcp_initial_slots[TCP_INITIAL];
+static struct tcb **tcbs=tcp_initial_slots;
+static size_t tcp_capacity=TCP_INITIAL;
+static uint64_t tcp_generation;
 
 static struct n_tcpstats tcp_stats;
 
@@ -755,12 +820,12 @@ static bool fault_hit(uint16_t per_mille) { return per_mille && rnd() % 1000 < p
 #define SEQ_LEQ(a, b) ((int32_t)((a) - (b)) <= 0)
 
 static void tcp_free(struct tcb *t) {
+    /* Detach sleeping tasks before clearing the stable slot; their generation
+       checks reject a closed/reused connection when they next run. */
+    wq_wake_all(&t->progress);
     kfree(t->rx);
     kfree(t->tx);
     memset(t, 0, sizeof *t);
-    /* A closing/TIME_WAIT connection holds a global TCB, not a file descriptor.
-       Wake cooperative connect waiters only after the entire slot is reusable. */
-    wq_wake_all(&net_wq);
 }
 
 static uint32_t tcp_window(struct tcb *t) { return MIN(TCP_RXBUF - t->rx_len, 65535u); }
@@ -912,7 +977,7 @@ static void tcp_reset(struct tcb *t, int err) {
     t->state = T_CLOSED;
     t->err = err;
     t->rto_at = 0;
-    wq_wake_all(&net_wq);
+    wq_wake_all(&t->progress);
 }
 
 static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len);
@@ -925,9 +990,9 @@ static void tcp_input(uint32_t src, const uint8_t *p, size_t len) {
     if (hl < 20 || hl > len) return;
     uint16_t sport = ntohs(h->sport), dport = ntohs(h->dport);
     struct tcb *t = NULL;
-    for (int i = 0; i < TCP_N; i++)
-        if (tcbs[i].state != T_FREE && tcbs[i].rip == src && tcbs[i].rport == sport && tcbs[i].lport == dport)
-            t = &tcbs[i];
+    for(size_t i=0;i<tcp_capacity;i++)
+        if(tcbs[i] && tcbs[i]->state!=T_FREE && tcbs[i]->rip==src && tcbs[i]->rport==sport && tcbs[i]->lport==dport)
+            t=tcbs[i];
     if (!t || t->state == T_CLOSED) return;
     tcp_stats.segs_in++;
     if (t->pid == fault_pid && len > hl && t->state != T_SYN_SENT) {
@@ -972,7 +1037,7 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
             t->err = -ECONNRESET;
         }
         t->rto_at = 0;
-        wq_wake_all(&net_wq);
+        wq_wake_all(&t->progress);
         return;
     }
 
@@ -1001,7 +1066,7 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
         t->snd_max = t->snd_nxt;
         tcp_cc_init(t);
         tcp_output(t, F_ACK, t->snd_nxt, NULL, 0);
-        wq_wake_all(&net_wq);
+        wq_wake_all(&t->progress);
         tcp_push(t, false);
         return;
     }
@@ -1047,7 +1112,7 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
                     t->linger_until = uptime_ms() + 2000;
                 } else if (t->state == T_LAST_ACK) t->state = T_CLOSED;
             }
-            wq_wake_all(&net_wq);
+            wq_wake_all(&t->progress);
         } else if (ack == t->snd_una && t->snd_una != t->snd_max && dlen == 0 && !(fl & (F_SYN | F_FIN)) &&
                    ntohs(h->win) == t->snd_wnd) {
             /* duplicate ack: a segment after snd_una arrived, so (probably) snd_una's was lost */
@@ -1091,8 +1156,7 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
                     t->rcv_nxt += n;
                     tcp_ooo_pull(t);
                     in_order = true;
-                    wq_wake_all(&net_wq);
-                    poll_notify();
+                    wq_wake_all(&t->progress);
                 } else {
                     tcp_ooo_add(t, seq, seq + n);
                     tcp_stats.ooo_in++;
@@ -1110,8 +1174,7 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
             t->state = T_TIME_WAIT;
             t->linger_until = uptime_ms() + 2000;
         }
-        wq_wake_all(&net_wq);
-        poll_notify();
+        wq_wake_all(&t->progress);
     }
     if (need_ack) tcp_output(t, F_ACK, t->snd_nxt, NULL, 0);
     tcp_push(t, false);
@@ -1119,9 +1182,9 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
 
 static void tcp_tick(void) {
     uint64_t now = uptime_ms();
-    for (int i = 0; i < TCP_N; i++) {
-        struct tcb *t = &tcbs[i];
-        if (t->state == T_FREE) continue;
+    for(size_t i=0;i<tcp_capacity;i++) {
+        struct tcb *t=tcbs[i];
+        if(!t || t->state==T_FREE)continue;
         if (t->state == T_TIME_WAIT && now >= t->linger_until) t->state = T_CLOSED;
         if (!t->user_open && (t->state == T_CLOSED || now >= t->linger_until)) {
             if (t->state != T_CLOSED) tcp_reset(t, -ECONNRESET);
@@ -1170,18 +1233,46 @@ static void tcp_input_held(size_t n) {
     static uint8_t seg[sizeof fault_held];
     memcpy(seg, fault_held, n);
     const struct tcp_hdr *h = (const struct tcp_hdr *)seg;
-    for (int i = 0; i < TCP_N; i++)
-        if (tcbs[i].state != T_FREE && tcbs[i].state != T_CLOSED && tcbs[i].rip == fault_held_src &&
-            tcbs[i].rport == ntohs(h->sport) && tcbs[i].lport == ntohs(h->dport)) {
-            tcp_segment(&tcbs[i], seg, n);
+    for(size_t i=0;i<tcp_capacity;i++)
+        if(tcbs[i] && tcbs[i]->state!=T_FREE && tcbs[i]->state!=T_CLOSED && tcbs[i]->rip==fault_held_src &&
+           tcbs[i]->rport==ntohs(h->sport) && tcbs[i]->lport==ntohs(h->dport)) {
+            tcp_segment(tcbs[i],seg,n);
             return;
         }
 }
 
 static struct tcb *user_tcb(int h) {
-    if (h < 0 || h >= TCP_N || tcbs[h].state == T_FREE || !tcbs[h].user_open || tcbs[h].pid != task_process()->pid)
-        return NULL;
-    return &tcbs[h];
+    if(h<0 || (size_t)h>=tcp_capacity)return NULL;
+    struct tcb *t=tcbs[h];
+    return t && t->state!=T_FREE && t->user_open && t->pid==task_process()->pid?t:NULL;
+}
+static int tcp_alloc_slot(void) {
+    size_t slot=0;
+    while(slot<tcp_capacity && tcbs[slot] && tcbs[slot]->state!=T_FREE)slot++;
+    if(slot==tcp_capacity) {
+        size_t next=tcp_capacity<=((size_t)0x7fffffff+1)/2?tcp_capacity*2:(size_t)0x7fffffff+1;
+        if(next<=tcp_capacity || next>SIZE_MAX/sizeof *tcbs)return -ENOMEM;
+        struct tcb **grown=kmalloc(next*sizeof *grown);if(!grown)return -ENOMEM;
+        memcpy(grown,tcbs,tcp_capacity*sizeof *grown);
+        memset(grown+tcp_capacity,0,(next-tcp_capacity)*sizeof *grown);
+        if(tcbs!=tcp_initial_slots)kfree(tcbs);
+        tcbs=grown;tcp_capacity=next;
+    }
+    if(!tcbs[slot]) {
+        struct tcb *t=kmalloc(sizeof *t);if(!t)return -ENOMEM;
+        memset(t,0,sizeof *t);tcbs[slot]=t;
+    }
+    return (int)slot;
+}
+static uint16_t tcp_local_port(uint32_t ip,uint16_t remote) {
+    for(unsigned attempt=0;attempt<16384;attempt++) {
+        uint16_t port=ephemeral_port();bool occupied=false;
+        for(size_t i=0;i<tcp_capacity;i++)
+            if(tcbs[i] && tcbs[i]->state!=T_FREE && tcbs[i]->rip==ip &&
+               tcbs[i]->rport==remote && tcbs[i]->lport==port){occupied=true;break;}
+        if(!occupied)return port;
+    }
+    return 0;
 }
 
 static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
@@ -1189,25 +1280,12 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     uint8_t mac[6];
     int r = arp_resolve_until(ip, mac, until);
     if (r < 0) return r;
-    int h = -1;
-    while (h < 0) {
-        if (current_task->killed) return -EINTR;
-        uint64_t now = uptime_ms();
-        if (now >= until) return -ETIMEDOUT;
-        for (int i = 0; i < TCP_N; i++)
-            if (tcbs[i].state == T_FREE) {
-                h = i;
-                break;
-            }
-        if (h < 0) {
-            /* Ordinary HTTP completion can leave a FIN/TIME_WAIT control block
-               occupied after the worker exits. Do not turn that transient global
-               pressure into a permanent module/resource failure, or steal a live
-               TCP tuple. Allocation and handshake share the original deadline. */
-            wq_wait_timeout(&net_wq, until - now);
-        }
-    }
-    struct tcb *t = &tcbs[h];
+    if(current_task->killed)return -EINTR;
+    if(uptime_ms()>=until)return -ETIMEDOUT;
+    uint16_t local=tcp_local_port(ip,port);
+    if(!local)return -EADDRINUSE;
+    int h=tcp_alloc_slot();if(h<0)return h;
+    struct tcb *t=tcbs[h];
     memset(t, 0, sizeof *t);
     t->rx = kmalloc(TCP_RXBUF);
     t->tx = kmalloc(TCP_TXBUF);
@@ -1216,10 +1294,12 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
         return -ENOMEM;
     }
     t->pid = task_process()->pid;
+    if(++tcp_generation==0)++tcp_generation;
+    t->generation=tcp_generation;
     t->user_open = true;
     t->rip = ip;
     t->rport = port;
-    t->lport = ephemeral_port();
+    t->lport=local;
     memcpy(t->mac, mac, 6);
     t->iss = rnd();
     t->snd_una = t->iss;
@@ -1229,15 +1309,18 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     t->state = T_SYN_SENT;
     tcp_output(t, F_SYN, t->iss, NULL, 0);
     tcp_arm(t);
+    uint64_t generation=t->generation;
     while (t->state == T_SYN_SENT) {
+        if(t->generation!=generation || !t->user_open)return -EBADF;
         uint64_t now = uptime_ms();
         if (current_task->killed || now >= until) {
             t->state = T_CLOSED;
             t->err = current_task->killed ? -EINTR : -ETIMEDOUT;
             break;
         }
-        wq_wait_timeout(&net_wq, until - now);
+        wq_wait_timeout(&t->progress, until - now);
     }
+    if(t->generation!=generation || !t->user_open)return -EBADF;
     if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT) {
         int err = t->err ? t->err : -ECONNREFUSED;
         tcp_free(t);
@@ -1250,14 +1333,16 @@ static int64_t sys_tcp_send(int h, const uint8_t *buf, size_t len) {
     struct tcb *t = user_tcb(h);
     if (!t) return -EBADF;
     if (!user_ok(buf, len)) return -EFAULT;
+    uint64_t generation=t->generation;
     size_t done = 0;
     while (done < len) {
+        if(t->generation!=generation || !t->user_open)return done?(int64_t)done:-EBADF;
         if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT) return done ? (int64_t)done : (t->err ? t->err : -EPIPE);
         if (t->fin_pending) return -EPIPE;
         uint32_t space = TCP_TXBUF - t->tx_len;
         if (!space) {
             if (current_task->killed) return done ? (int64_t)done : -EINTR;
-            wq_wait_timeout(&net_wq, 1000);
+            wq_wait_timeout(&t->progress, 1000);
             continue;
         }
         uint32_t n = (uint32_t)MIN(len - done, space);
@@ -1273,14 +1358,18 @@ static int64_t sys_tcp_recv(int h, uint8_t *buf, size_t len, int timeout_ms) {
     struct tcb *t = user_tcb(h);
     if (!t) return -EBADF;
     if (!user_ok_w(buf, len)) return -EFAULT;
+    uint64_t generation=t->generation;
     uint64_t until = uptime_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0);
     while (t->rx_len == 0) {
+        if(t->generation!=generation || !t->user_open)return -EBADF;
         if (t->rx_fin) return 0;
         if (t->state == T_CLOSED) return t->err ? t->err : 0;
         if (current_task->killed) return -EINTR;
-        if (timeout_ms >= 0 && uptime_ms() >= until) return -EAGAIN;
-        wq_wait_timeout(&net_wq, timeout_ms < 0 ? 1000 : until - uptime_ms());
+        uint64_t now=uptime_ms();
+        if (timeout_ms >= 0 && now >= until) return -EAGAIN;
+        wq_wait_timeout(&t->progress, timeout_ms < 0 ? 1000 : until - now);
     }
+    if(t->generation!=generation || !t->user_open)return -EBADF;
     uint32_t n = (uint32_t)MIN(len, t->rx_len);
     for (uint32_t i = 0; i < n; i++) buf[i] = t->rx[(t->rx_head + i) % TCP_RXBUF];
     t->rx_head = (t->rx_head + n) % TCP_RXBUF;
@@ -1292,6 +1381,10 @@ static int64_t sys_tcp_recv(int h, uint8_t *buf, size_t len, int timeout_ms) {
 
 static void tcp_close(struct tcb *t) {
     t->user_open = false;
+    /* Native TCP handles are not VFS descriptors. The helper's subsequent
+       pipe write/close publishes poll readiness; a network packet itself
+       must not wake every GUI/pipe poller before any fd can have changed. */
+    wq_wake_all(&t->progress);
     t->linger_until = uptime_ms() + 20000;
     if (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT) {
         t->fin_pending = true;
@@ -1360,10 +1453,10 @@ void net_init(void) {
 
 void net_process_exit(int pid) {
     if (pid == fault_pid) fault_pid = 0;
-    for (int i = 0; i < UDP_N; i++)
-        if (udp_socks[i].used && udp_socks[i].pid == pid) udp_socks[i].used = false;
-    for (int i = 0; i < TCP_N; i++)
-        if (tcbs[i].state != T_FREE && tcbs[i].user_open && tcbs[i].pid == pid) tcp_close(&tcbs[i]);
+    for(size_t i=0;i<udp_capacity;i++)
+        if(udp_socks[i] && udp_socks[i]->used && udp_socks[i]->pid==pid)udp_release(udp_socks[i]);
+    for(size_t i=0;i<tcp_capacity;i++)
+        if(tcbs[i] && tcbs[i]->state!=T_FREE && tcbs[i]->user_open && tcbs[i]->pid==pid)tcp_close(tcbs[i]);
 }
 
 bool net_config(uint8_t mac[6], uint32_t *ip, uint32_t *mask, uint32_t *gw, uint32_t *dns) {
@@ -1418,8 +1511,10 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
         if (e > 1472) return -EINVAL;
         if (!user_ok((void *)d, e)) return -EFAULT;
         uint8_t mac[6];
+        uint64_t generation=s->generation;
         int r = arp_resolve((uint32_t)b, mac);
         if (r < 0) return r;
+        if(!s->used || s->generation!=generation)return -EBADF;
         uint8_t tmp[1472];
         memcpy(tmp, (void *)d, e);
         r = udp_output(s->port, (uint32_t)b, (uint16_t)c, mac, tmp, e);
@@ -1445,7 +1540,7 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
     case SYS_UDP_CLOSE: {
         struct udp_sock *s = user_udp((int)a);
         if (!s) return -EBADF;
-        s->used = false;
+        udp_release(s);
         return 0;
     }
     case SYS_TCP_CONNECT:

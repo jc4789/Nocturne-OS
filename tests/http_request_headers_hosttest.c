@@ -46,9 +46,31 @@ static char *large_header(size_t name,size_t value) {
     char*p=malloc(name+value+5);memset(p,'x',name);p[name]=':';p[name+1]=' ';
     memset(p+name+2,'v',value);memcpy(p+name+2+value,"\r\n",3);return p;
 }
-int main(void) {
+static int content_coding(void) {
+    struct job j={.wire={.kind=WEBNET_FETCH,.credentials=WEBNET_CREDENTIALS_OMIT},
+        .document="https://request.test/",.origin="https://request.test",.headers=""};
+    CHECK(validate_headers(&j)&&(!j.non_simple||!j.non_simple[0]));
+    CHECK(prepare_outgoing(&j,"https://request.test/","GET",false)&&
+        strstr(j.outgoing.p,"Accept-Encoding: gzip\r\n")&&!strstr(j.outgoing.p,"deflate")&&!strstr(j.outgoing.p," br"));
+    close_job(&j);
+    j.headers="rAnGe: bytes=1-2\r\n";
+    CHECK(prepare_outgoing(&j,"https://request.test/","GET",false)&&
+        strstr(j.outgoing.p,"Accept-Encoding: identity\r\n")&&!strstr(j.outgoing.p,"Accept-Encoding: gzip"));
+    close_job(&j);
+    /* Native callers may already select a supported representation. */
+    j.headers="Accept-Encoding: identity\r\n";
+    CHECK(prepare_outgoing(&j,"https://request.test/","GET",false)&&
+        strstr(j.outgoing.p,"Accept-Encoding: identity\r\n")&&!strstr(j.outgoing.p,"Accept-Encoding: gzip"));
+    close_job(&j);
+    /* An author cannot acquire control of the browser's negotiation header. */
+    CHECK(!validate_headers(&j));close_job(&j);
+    CHECK(live==0);
+    printf("request content coding: %u checks / %u failed\n",checks,failed);return failed!=0;
+}
+int main(int argc,char **argv) {
+    if(argc>1&&!strcmp(argv[1],"--content-coding"))return content_coding();
     struct job j={.wire={.kind=WEBNET_FETCH,.credentials=WEBNET_CREDENTIALS_OMIT},.document="https://request.test/"};
-    strcpy(j.origin,"https://request.test");
+    j.origin="https://request.test";
     char *raw=large_header(300,12000);j.headers=raw;
     CHECK(validate_headers(&j)&&strlen(j.non_simple)==300);
     CHECK(prepare_outgoing(&j,"https://other.test/","POST",true)&&j.outgoing.length>12300&&strstr(j.outgoing.p,"Origin: https://request.test\r\n"));

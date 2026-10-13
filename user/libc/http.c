@@ -7,6 +7,7 @@
 #include <limits.h>
 #include "http.h"
 #include "browser_identity.h"
+extern uint64_t uptime_ms(void);
 
 bool url_parse(const char *s, struct url *u) {
     if (!s || !u || strlen(s) >= HTTP_URL_MAX) return false;
@@ -466,7 +467,8 @@ static const char *request_head(const struct http_req *rq, struct http_scratch *
     return NULL;
 }
 static int request_inner(const struct http_req *rq, struct http_resp *rs, struct http_scratch *work, size_t body_limit,
-                         const struct http_stream_hooks *hooks) {
+                         const struct http_stream_hooks *hooks,struct http_transport_timing *timing,
+                         uint64_t *phase_started) {
     memset(rs, 0, sizeof *rs);
     struct url_owned *u = &work->url;
     if (!url_parse_owned(rq->url, u)) {
@@ -479,8 +481,10 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     /* This legacy API accepts signed int durations. Its default is the
        representation maximum, not an independent 60-second resource quota. */
     int timeout = rq->timeout_ms ? rq->timeout_ms : INT_MAX;
-    net_stream *s = ns_open(u->host, u->port, u->tls, timeout, rs->error, sizeof rs->error);
+    net_stream *s = timing?ns_open_timed(u->host,u->port,u->tls,timeout,rs->error,sizeof rs->error,timing):
+        ns_open(u->host, u->port, u->tls, timeout, rs->error, sizeof rs->error);
     if (!s) return -1;
+    if(timing){timing->phase=HTTP_PHASE_HEADER;*phase_started=uptime_ms();}
 
     /* One complete header block avoids a flush/TLS record and TCP send for
        each fragment. A short write must never be treated as a sent request. */
@@ -537,6 +541,7 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
             }
         }
     } while (status == 100);
+    if(timing)timing->first_header_ms=uptime_ms()-*phase_started;
     rs->status = status;
     const char *reason = strchr(line, ' ');
     if (reason) {
@@ -612,6 +617,8 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     }
     rs->headers_len = hl;
     if (rs->headers_full) rs->headers[0] = 0;
+    if(timing){uint64_t now=uptime_ms();timing->header_ms=now-*phase_started;
+        *phase_started=now;timing->phase=HTTP_PHASE_BODY;}
     if (hooks && hooks->headers) {
         int decision = hooks->headers(rq->ctx, rs);
         if (decision) {
@@ -684,21 +691,28 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
 }
 
 static int request_with_limit(const struct http_req *rq, struct http_resp *rs, size_t body_limit,
-                              const struct http_stream_hooks *hooks) {
+                              const struct http_stream_hooks *hooks,struct http_transport_timing *timing) {
+    if(timing)memset(timing,0,sizeof *timing);
     struct http_scratch *work = calloc(1, sizeof *work);
     if (!work) {
         memset(rs, 0, sizeof *rs);
         snprintf(rs->error, sizeof rs->error, "out of memory");
         return -1;
     }
-    int result = request_inner(rq, rs, work, body_limit, hooks);
+    uint64_t phase_started=0;
+    int result = request_inner(rq, rs, work, body_limit, hooks,timing,&phase_started);
+    if(timing){
+        if(timing->phase==HTTP_PHASE_HEADER)timing->header_ms=uptime_ms()-phase_started;
+        else if(timing->phase==HTTP_PHASE_BODY)timing->body_ms=uptime_ms()-phase_started;
+        if(result==0)timing->phase=HTTP_PHASE_DONE;
+    }
     free(work->head);
     url_owned_free(&work->url);
     free(work);
     return result;
 }
 int http_request(const struct http_req *rq, struct http_resp *rs) {
-    return request_with_limit(rq, rs, 0, NULL);
+    return request_with_limit(rq, rs, 0, NULL,NULL);
 }
 int http_request_limited(const struct http_req *rq, struct http_resp *rs, size_t body_limit) {
     if (!body_limit || body_limit > HTTP_RESPONSE_BODY_MAX) {
@@ -706,11 +720,15 @@ int http_request_limited(const struct http_req *rq, struct http_resp *rs, size_t
         snprintf(rs->error, sizeof rs->error, "invalid finite response size limit");
         return -1;
     }
-    return request_with_limit(rq, rs, body_limit, NULL);
+    return request_with_limit(rq, rs, body_limit, NULL,NULL);
 }
 int http_request_stream(const struct http_req *rq, struct http_resp *rs, size_t limit,
                         const struct http_stream_hooks *hooks) {
-    return request_with_limit(rq, rs, limit, hooks);
+    return request_with_limit(rq, rs, limit, hooks,NULL);
+}
+int http_request_stream_timed(const struct http_req *rq,struct http_resp *rs,size_t limit,
+                              const struct http_stream_hooks *hooks,struct http_transport_timing *timing) {
+    return request_with_limit(rq,rs,limit,hooks,timing);
 }
 
 void http_resp_free(struct http_resp *resp) {

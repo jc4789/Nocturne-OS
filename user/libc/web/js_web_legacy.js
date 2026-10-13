@@ -12,17 +12,9 @@
     const hostnameGet = Object.getOwnPropertyDescriptor(URLImpl.prototype, 'hostname').get;
     const documentBrand = documentBridge.brand;
     const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    // The sole native browsing-context global is an actual Window/EventTarget,
-    // not a duck-typed stand-in. Preserve its own native properties and event
-    // wrappers, while making the inherited interface available to libraries
-    // which distinguish Window from Document targets (for example loaders).
-    // No WindowProxy, child browsing context, or cross-origin access is added.
-    class Window extends EventTarget {
-        constructor() { throw new TypeErrorImpl('Illegal Window constructor'); }
-    }
-    define(Window.prototype, Symbol.toStringTag, { value: 'Window', configurable: true });
-    Object.setPrototypeOf(global, Window.prototype);
-    define(global, 'Window', { value: Window, configurable: true, writable: true });
+    // frameBridge owns the actual Window interface and its native-backed
+    // named-properties prototype. Replacing that prototype here would sever
+    // every inherited id/name lookup after the complete bootstrap has loaded.
     // Do not leave Window's own captured-method wrappers bypassing later
     // EventTarget prototype instrumentation. Preserve bare global calls and
     // captured original functions, but let ordinary member lookups inherit.

@@ -1021,9 +1021,16 @@ void web_canvas_paint(node_t *n,canvas_t *dst,int x,int y,int w,int h) {
     struct web_canvas *c=n?n->canvas:NULL;
     if (!c || !c->pixels || !c->w || !c->h || w<=0 || h<=0) return;
     int x0=MAX(x,dst->cx0),y0=MAX(y,dst->cy0),x1=MIN((int64_t)x+w,dst->cx1),y1=MIN((int64_t)y+h,dst->cy1);
-    for (int yy=y0;yy<y1;yy++) for (int xx=x0;xx<x1;xx++) {
-        unsigned sx=(unsigned)((uint64_t)(xx-x)*c->w/(unsigned)w),sy=(unsigned)((uint64_t)(yy-y)*c->h/(unsigned)h);
-        uint32_t *p=&dst->px[(size_t)yy*dst->pitch+xx]; *p=over(*p,c->pixels[(size_t)sy*c->w+sx]);
+    for (int yy=y0;yy<y1;yy++) {
+        struct gfx_clip_span span={x0,x1,x0,x1};
+        if(dst->mask_clip&&!gfx_clip_row(dst,yy,x0,x1,&span))continue;
+        unsigned sy=(unsigned)((uint64_t)(yy-y)*c->h/(unsigned)h);
+        for(int xx=span.x0;xx<span.x1;xx++) {
+            unsigned sx=(unsigned)((uint64_t)(xx-x)*c->w/(unsigned)w);
+            uint32_t source=c->pixels[(size_t)sy*c->w+sx];
+            if(dst->mask_clip&&(xx<span.opaque0||xx>=span.opaque1))source=(((source>>24)*gfx_clip_alpha(dst,xx,yy)+127)/255)<<24|(source&0xffffffu);
+            uint32_t *p=&dst->px[(size_t)yy*dst->pitch+xx]; *p=over(*p,source);
+        }
     }
 }
 JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) {

@@ -21,6 +21,10 @@ static void node_tree_unlink(JSRuntime *rt, struct js_node_ref *r) {
 static void node_finalizer(JSRuntime *rt, JSValue object) {
     struct js_node_ref *r = JS_GetOpaque(object, node_class);
     if (!r) return;
+    if(r->wheel_blocking) {
+        r->node->wheel_blocking-=MIN(r->node->wheel_blocking,r->wheel_blocking);
+        r->wheel_blocking=0;
+    }
     /* Unpublish first; releasing edges can cascade native finalizers. */
     JS_SetOpaque(object, NULL); node_cache_unlink(r);
     node_tree_unlink(rt, r);
@@ -127,6 +131,7 @@ static void node_cache_release(struct web_js_state *s) {
 static void node_cache_changed(struct web_js_state *s) {
     if (!s || !s->ctx || s->node_cache_syncing) return;
     s->node_cache_syncing = true; node_cache_hold(s);
+    bool complete=true;
     /* Pin without allocation before creating a root. Failed post-mutation
        allocation retains old lifetime edges, never discards author state. */
     for (struct js_node_ref *r = s->nodes; r; r = r->next) {
@@ -134,7 +139,7 @@ static void node_cache_changed(struct web_js_state *s) {
         if (!node_retree(s, r, r->hold)) {
             JSValue error = JS_GetException(s->ctx); JS_FreeValue(s->ctx, error);
             if (!s->node_cache_failed) log_text(s, 2, "DOM wrapper root update failed; previous lifetime edges retained");
-            s->node_cache_failed = true; break;
+            s->node_cache_failed = true; complete=false; break;
         }
         node_t *owner = r->node->owner ? r->node->owner->root : NULL;
         if (owner && owner != r->node && node_opaque(r->owner_object) != owner) {
@@ -142,14 +147,67 @@ static void node_cache_changed(struct web_js_state *s) {
             if (JS_IsException(value)) {
                 JSValue error = JS_GetException(s->ctx); JS_FreeValue(s->ctx, error);
                 if (!s->node_cache_failed) log_text(s, 2, "DOM wrapper owner update failed; previous lifetime edges retained");
-                s->node_cache_failed = true; break;
+                s->node_cache_failed = true; complete=false; break;
             }
             JSValue old = r->owner_object; r->owner_object = value; JS_FreeValue(s->ctx, old);
         }
     }
     node_cache_release(s); s->node_cache_syncing = false;
+    if(complete)s->node_cache_failed=false;
+}
+static void node_cache_hold_one(struct web_js_state *s,node_t *node,struct js_node_ref **work) {
+    struct js_node_ref *r=node_ref(s,node);
+    if(!r)return;
+    r->hold=JS_GetWeakRefValue(s->ctx,r->object);
+    if(JS_IsUndefined(r->hold))return;
+    r->update_next=*work;*work=r;
+}
+static bool node_cache_reparent_one(struct web_js_state *s,struct js_node_ref *r) {
+    node_t *node=r->node;
+    bool okay=node_retree(s,r,r->hold);
+    node_t *owner=node->owner?node->owner->root:NULL;
+    if(okay && owner && owner!=node && node_opaque(r->owner_object)!=owner) {
+        JSValue value=wrap_local(s,owner);
+        if(JS_IsException(value))okay=false;
+        else {JSValue old=r->owner_object;r->owner_object=value;JS_FreeValue(s->ctx,old);}
+    }
+    if(!okay) {
+        JSValue error=JS_GetException(s->ctx);JS_FreeValue(s->ctx,error);
+        if(!s->node_cache_failed)log_text(s,2,"DOM subtree wrapper update failed; previous lifetime edges retained");
+        s->node_cache_failed=true;
+    }
+    return okay;
+}
+void web_js_nodes_reparented(web_doc *d,node_t *subtree) {
+    if(!d || !subtree){if(d)web_js_nodes_changed(d);return;}
+    if(d->js)d->js->preload_scan_valid=false;
+    /* An inserted leaf must not regroup every escaped wrapper in every
+       document. Update exactly the moved native forest, including Attr,
+       shadow and template ownership, before CE/Range/MO callbacks can run. */
+    for(struct web_js_state *s=node_cache_states;s;s=s->node_cache_next) {
+        if(s->node_cache_syncing)continue;
+        if(s->node_cache_failed){node_cache_changed(s);if(s->node_cache_failed)continue;}
+        s->node_cache_syncing=true;
+        /* Pin the affected wrappers before changing any GC edges. A native
+           remove-all has no JS argument holding each removed root. Reversing
+           this list also publishes descendants before their moved root. */
+        struct js_node_ref *work=NULL;
+        for(node_t *n=subtree;n;n=doc_forest_next(n,subtree)) {
+            node_cache_hold_one(s,n,&work);
+            for(int i=0;i<n->nattrs;i++)
+                if(n->attrs[i].node)node_cache_hold_one(s,n->attrs[i].node,&work);
+        }
+        for(struct js_node_ref *r=work;r;r=r->update_next)
+            if(!node_cache_reparent_one(s,r))break;
+        while(work) {
+            struct js_node_ref *r=work;work=r->update_next;r->update_next=NULL;
+            JSValue hold=r->hold;r->hold=JS_UNDEFINED;JS_FreeValue(s->ctx,hold);
+        }
+        s->node_cache_syncing=false;
+    }
 }
 void web_js_nodes_changed(web_doc *d) {
+    if(d&&d->js)d->js->preload_scan_valid=false;
     if (!d) return;
     /* Inert/template documents and adopted nodes can have wrappers in another
        context. This native registry owns no JS values or context references. */

@@ -207,36 +207,40 @@ static int replace(struct cssom_sheet *s, const char *text, size_t length, uint3
     struct cssom_sheet *candidate = calloc(1,sizeof *candidate);
     if (!candidate) return CSSOM_OOM;
     int error = CSSOM_OK;
+    bool layer_statement=false;
     struct css_rule_info *removed=NULL;
     if (!insertion) {
         struct css_rule_info *r=css_sheet_rules(s->ast,NULL);
         for(uint32_t i=0;i<index;i++)r=r->next;
         removed=calloc(1,sizeof *removed);
         if (!removed) { free(candidate);return CSSOM_OOM; }
-        removed->id=r->id;removed->type=r->type;
+        removed->id=r->id;removed->type=r->type;removed->layer_kind=r->layer_kind;
         removed->text=strdup(r->text);removed->selector=r->selector ? strdup(r->selector) : NULL;
         if (!removed->text || (r->selector&&!removed->selector)) { free((void*)removed->text);free((void*)removed->selector);free(removed);free(candidate);return CSSOM_OOM; }
     }
     if (insertion) {
         error=parse(s->document,candidate,text,length,s->base);
-        if (!error && !css_sheet_single_style(candidate->ast,text,length)) {
+        if (!error && !css_sheet_single_rule(candidate->ast,text,length)) {
             uint32_t rule_count;struct css_rule_info*r=css_sheet_rules(candidate->ast,&rule_count);
             error=rule_count==1&&r->type!=1 ? CSSOM_UNSUPPORTED : CSSOM_SYNTAX;
         }
+        if(!error){struct css_rule_info *info=css_sheet_rules(candidate->ast,NULL);layer_statement=info&&info->layer_kind==1;}
         discard_parse(candidate); memset(candidate,0,sizeof *candidate);
         if (error) { free(candidate); return error; }
         uint32_t i=0;
         for(struct css_rule_info*r=css_sheet_rules(s->ast,NULL);r;r=r->next,i++) {
-            if(i>=index&&(r->type==3||r->type==10)){free(candidate);return CSSOM_HIERARCHY;}
+            if(!layer_statement&&i>=index&&(r->type==3||r->type==10)){free(candidate);return CSSOM_HIERARCHY;}
         }
     }
     char *source=NULL; size_t used=0,cap=0; uint32_t at=0;
     struct css_rule_info *old=css_sheet_rules(s->ast,NULL);
     for (struct css_rule_info *r=old;;r=r?r->next:NULL,at++) {
-        if (insertion && at==index && (!append_text(&source,&used,&cap,text,length) || !append_text(&source,&used,&cap,"\n",1))) { error=CSSOM_OOM; break; }
+        if (insertion && at==index && (!append_text(&source,&used,&cap,text,length) ||
+            (layer_statement&&!append_text(&source,&used,&cap,";",1)) || !append_text(&source,&used,&cap,"\n",1))) { error=CSSOM_OOM; break; }
         if (!r) break;
         if (!insertion && at==index) continue;
-        if (!append_text(&source,&used,&cap,r->text,strlen(r->text)) || !append_text(&source,&used,&cap,"\n",1)) { error=CSSOM_OOM; break; }
+        if (!append_text(&source,&used,&cap,r->text,strlen(r->text)) ||
+            (r->layer_kind==1&&!append_text(&source,&used,&cap,";",1)) || !append_text(&source,&used,&cap,"\n",1)) { error=CSSOM_OOM; break; }
     }
     if (!error) error=parse(s->document,candidate,source ? source : "",used,s->base);
     free(source);

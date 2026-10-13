@@ -37,6 +37,18 @@ static uint32_t raster(font_t *font) {
 }
 static void le32(unsigned char *p,uint32_t n) {for(unsigned i=0;i<4;i++)p[i]=(unsigned char)(n>>(8*i));}
 int main(int argc,char **argv) {
+    if(argc==3 && !strcmp(argv[1],"--font")) {
+        size_t length=0;unsigned char *bytes=read_bytes(argv[2],&length);
+        font_t *face=bytes?font_open_memory(bytes,length):NULL;
+        check(face!=NULL,"original resource decodes");
+        if(face) {
+            check(font_has_primary(face,'A'),"original primary glyph exists");
+            printf("original font raster=%08x bytes=%zu\n",raster(face),length);
+        }
+        font_close(face);free(bytes);
+        printf("font-container-native: %d checks, %d failures\n",checks,failures);
+        return failures!=0;
+    }
     if(argc!=6)return 2;
     size_t n[5];unsigned char *p[5];font_t *f[5];uint32_t hashes[5]={0};
     for(unsigned i=0;i<5;i++) {

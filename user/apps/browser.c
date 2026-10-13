@@ -43,9 +43,9 @@ static bool debug_js;
 /* Debug-only inclusive phase totals, with no page data or per-frame logging. */
 static struct {
     uint64_t since, tick_ms, tick_max_ms, layout_ms, draw_ms, update_ms, net_ms, wait_ms;
-    uint64_t partial_ms, partial_update_ms, video_present_ms;
+    uint64_t partial_ms, partial_update_ms, video_present_ms, console_ms, console_update_ms;
     unsigned ticks, layouts, draws;
-    unsigned partial_draws, video_patches;
+    unsigned partial_draws, video_patches, console_draws;
 } loop_profile;
 /* Browser pages need more time than small custom web_live hosts. The native
    command line can select a finite limit, never an unlimited watchdog. */
@@ -155,12 +155,21 @@ static int hot_btn = -1;
 static bool drag_sb;
 static int drag_off;
 
-/* events that arrived while an image was downloading and could not be handled there */
-static struct gui_event *evq;
-static int evq_n, evq_capacity;
+/* Native scroll and later author notification are separate phases. The
+   document epochs keep queued input out of a replacement page/frame. */
+struct deferred_input {
+    struct gui_event event;
+    struct web_input_target document, target;
+    uint64_t generation;
+    bool scrolled;
+};
+static struct deferred_input *evq;
+static int evq_first, evq_n, evq_capacity, evq_scroll_at;
 static bool evq_failure_logged;
 static bool evq_hover_tail_valid;
 static bool scroll_event_pending;
+static bool native_wait_snapshot;
+static bool native_scroll_active;
 #include "browser_events.h"
 
 static int page_w(void) { return MAX(w->w - SCRW, 50); }
@@ -442,6 +451,23 @@ static void redraw_status(void) {
     win_update_rect(w, 0, w->h - SB, w->w, SB);
 }
 
+/* Log/input changes do not invalidate author content. In particular the
+   profiling console must not make its own next sample rasterize the page.
+   Opening/closing or resizing it still follows the layout/full-paint path. */
+static void redraw_console(void) {
+    if (!w || !console_dirty || !console_open || browser_fullscreen) return;
+    uint64_t start = debug_js ? uptime_ms() : 0;
+    int top = TB + page_h(), height = console_h();
+    draw_console();
+    uint64_t drawn = debug_js ? uptime_ms() : 0;
+    win_update_rect(w, 0, top, w->w, height);
+    if (debug_js) {
+        loop_profile.console_draws++;
+        loop_profile.console_ms += drawn - start;
+        loop_profile.console_update_ms += uptime_ms() - drawn;
+    }
+}
+
 static void set_status(const char *s) {
     strlcpy(status, s, sizeof status);
     if (!hover[0] && !find_open) redraw_status();
@@ -495,20 +521,77 @@ static bool scroll_key(const struct gui_event *e) {
 }
 
 /* an event that only scrolls the page can be handled even while something is loading */
-static bool try_scroll_event(const struct gui_event *e) {
+static bool try_scroll_event(const struct gui_event *e,struct web_input_target *target_out) {
     if (e->type == EV_WHEEL) {
-        if (sel_node) return false;
-        web_node *target=hover_node;
-        if(doc&&!native_wait&&!web_script_running(doc))target=e->x>=0&&e->x<page_w()&&e->y>=TB&&e->y<TB+page_h()?
-            web_node_at(doc,document_x(e->x),e->y-TB+scroll_y):NULL;
+        if (!doc || sel_node || need_layout || e->x<0 || e->x>=page_w() ||
+            e->y<TB || e->y>=TB+page_h() || !web_native_input_ready(doc,native_wait&&native_wait_snapshot)) return false;
+        web_node *target=web_node_at(doc,document_x(e->x),e->y-TB+scroll_y);
+        /* Hit-index construction can run a cancellation checkpoint. Chrome
+           may have resized the viewport or queued navigation in that call. */
+        if(quit || pending_navigation || need_layout)return false;
+        if(!web_native_wheel_target(doc,target,target_out,native_wait&&native_wait_snapshot))return false;
+        doc_w=web_doc_width(doc);doc_h=web_doc_height(doc);
         if (e->mods & NMOD_SHIFT) scroll_input(target,e->wheel*LINE,0,0);
         else scroll_input(target,0,e->wheel*LINE,0);
         return true;
     }
-    if (e->type == EV_KEY && e->pressed && focus == F_PAGE && !sel_node && !(e->mods & (NMOD_CTRL | NMOD_ALT)) &&
-        !(doc && web_focused(doc)))
-        return scroll_key(e);
+    /* Key defaults remain behind cancelable keydown delivery. Unlike a wheel
+       proven passive, a queued PageDown cannot silently bypass preventDefault. */
     return false;
+}
+
+static bool defer_native_event(const struct gui_event *e) {
+    if(evq_n && browser_coalesce_hover(&evq[evq_first+evq_n-1].event,1,e,evq_hover_tail_valid))return true;
+    if(evq_first+evq_n==evq_capacity) {
+        if(evq_first) {
+            evq_scroll_at=MAX(0,evq_scroll_at-evq_first);
+            memmove(evq,evq+evq_first,(size_t)evq_n*sizeof *evq);
+            evq_first=0;
+        }else {
+            int capacity=evq_capacity?(evq_capacity>INT_MAX/2?INT_MAX:evq_capacity*2):64;
+            void *grown=evq_n<INT_MAX && (size_t)capacity<=SIZE_MAX/sizeof *evq?
+                realloc(evq,(size_t)capacity*sizeof *evq):NULL;
+            if(!grown) {
+                if(!evq_failure_logged){console_add("error","Deferred native event storage allocation failed");evq_failure_logged=true;}
+                return false;
+            }
+            evq=grown;evq_capacity=capacity;
+        }
+    }
+    struct deferred_input *entry=&evq[evq_first+evq_n++];
+    *entry=(struct deferred_input){.event=*e,.generation=generation};
+    (void)web_input_capture(doc,NULL,&entry->document);
+    evq_hover_tail_valid=browser_hover_tail(e);
+    return true;
+}
+
+/* This is also called at a pure-JS checkpoint after a C operation unwinds.
+   Never re-layout a dirty document here. Blocking wheels and earlier keys/
+   buttons remain FIFO-owned by the ordinary cancelable event dispatcher. */
+static void native_scroll_queue(void) {
+    if(native_scroll_active || !doc || !evq_n || !web_native_input_ready(doc,native_wait&&native_wait_snapshot))return;
+    native_scroll_active=true;
+    bool painted=false;
+    evq_scroll_at=MAX(evq_scroll_at,evq_first);
+    while(evq_scroll_at<evq_first+evq_n) {
+        int offset=evq_scroll_at-evq_first;
+        struct deferred_input entry=evq[evq_scroll_at];
+        if(entry.event.type==EV_MOUSE_MOVE && !entry.event.buttons){evq_scroll_at++;continue;}
+        if(entry.event.type!=EV_WHEEL)break;
+        if(entry.scrolled){evq_scroll_at++;continue;}
+        if(entry.generation!=generation || !web_input_target_valid(doc,&entry.document))break;
+        if(!try_scroll_event(&entry.event,&entry.target))break;
+        /* A nested hit-test/paint checkpoint can append input, grow/compact
+           the FIFO, or repaint chrome. Keep no queue-storage pointer across
+           native calls; its logical offset survives those tail-only changes. */
+        int index=evq_first+offset;
+        evq[index].target=entry.target;evq[index].scrolled=true;
+        painted=true;evq_scroll_at=index+1;
+        /* Painting is itself native work; one presentation per drained batch
+           avoids a full viewport raster for each wheel packet. */
+    }
+    if(painted && !quit)redraw();
+    native_scroll_active=false;
 }
 
 /* ---------------------------------------------------------------- fetching */
@@ -1169,6 +1252,9 @@ static bool host_script_checkpoint(void *opaque) {
         if(event<0){quit=true;return false;}
         if(!event)break;
         if(e.type==EV_CLOSE){quit=true;return false;}
+        if(e.type==EV_WHEEL && console_open && e.y>=TB+page_h() && e.y<w->h-SB) {
+            console_scroll(-e.wheel*3);redraw_console();continue;
+        }
         /* Escape in native chrome/fullscreen is an ordinary UI command, not
            permission to permanently abort the page's author execution. Keep
            it queued for the normal owner rather than swallowing it here. */
@@ -1186,20 +1272,10 @@ static bool host_script_checkpoint(void *opaque) {
             win_update(w);
             continue;
         }
-        if(browser_coalesce_hover(evq,evq_n,&e,evq_hover_tail_valid))continue;
-        if(evq_n==evq_capacity) {
-            int capacity=evq_capacity?(evq_capacity>INT_MAX/2?INT_MAX:evq_capacity*2):64;
-            void *grown=evq_n<INT_MAX && (size_t)capacity<=SIZE_MAX/sizeof *evq?
-                realloc(evq,(size_t)capacity*sizeof *evq):NULL;
-            if(!grown){
-                if(!evq_failure_logged){console_add("error","Deferred native event storage allocation failed");evq_failure_logged=true;}
-                return false;
-            }
-            evq=grown;evq_capacity=capacity;
-        }
-        evq[evq_n++]=e;evq_hover_tail_valid=browser_hover_tail(&e);
+        if(!defer_native_event(&e))return false;
         if(native_navigation_command(&e))return false;
     }
+    native_scroll_queue();
     return !quit;
 }
 static unsigned host_window_state(void *opaque) {
@@ -1266,6 +1342,42 @@ static bool host_history(void *opaque, int operation, const char *url, const voi
 }
 
 static void handle_native_wait(const struct gui_event *e);
+/* Join a request already owned by the document (modulepreload), without a
+   duplicate fetch or re-entering author tasks. The caller owns completed
+   throughout this native pump and postpones document/pending retirement. */
+static bool host_wait_request(void *opaque, uint64_t resource_id, const bool *completed) {
+    (void)opaque;
+    if (!completed || !doc || native_wait || quit || pending_navigation) return false;
+    web_doc *document = doc;
+    uint64_t owner_generation = generation;
+    native_wait = true;
+    native_wait_snapshot=false;
+    sync_stopped = false;
+    prepare_native_snapshot(false);
+    native_wait_snapshot=web_native_input_ready(doc,true);
+    if(native_wait_snapshot && need_paint && !quit)redraw();
+    while (!*completed && !quit && !sync_stopped && !pending_navigation &&
+           doc == document && generation == owner_generation) {
+        bool present = false;
+        for (struct transfer *t = transfers; t; t = t->next)
+            if (!t->detached && t->generation == owner_generation &&
+                t->resource_id == resource_id) { present = true; break; }
+        if (!present) break;
+        uint64_t now = uptime_ms();
+        webnet_pump(network, now);
+        if (*completed) break;
+        struct gui_event e;
+        int timeout = webnet_timeout(network, now);
+        int event = browser_event(&e, timeout < 0 ? 10 : MIN(timeout, 10));
+        if (event < 0) { quit = true; break; }
+        if (event) handle_native_wait(&e);
+        redraw_console();
+    }
+    native_wait = false;
+    native_wait_snapshot=false;
+    return *completed && !quit && !sync_stopped && !pending_navigation &&
+           doc == document && generation == owner_generation;
+}
 struct synchronous_load { bool ready; enum webnet_kind kind; web_doc *document; uint64_t generation; struct web_response response; };
 static void synchronous_completed(webnet *net, uint64_t id, uint64_t gen,
                                   const struct webnet_response *r, void *opaque) {
@@ -1296,9 +1408,11 @@ static bool host_sync_request(void *opaque, const struct web_request *request, s
     uint64_t id = webnet_submit(network, &r, synchronous_completed, s);
     if (!id) { free(s); strcpy(response->error, "module request could not be started"); return false; }
     native_wait = true;
+    native_wait_snapshot=false;
     sync_stopped = false;
     prepare_native_snapshot(false);
-    if (need_paint && !quit) redraw();
+    native_wait_snapshot=web_native_input_ready(doc,true);
+    if (native_wait_snapshot && need_paint && !quit) redraw();
     uint64_t started = uptime_ms();
     while (!s->ready && !quit && !sync_stopped && !pending_navigation &&
            doc == s->document && generation == s->generation) {
@@ -1311,9 +1425,10 @@ static bool host_sync_request(void *opaque, const struct web_request *request, s
         int event = browser_event(&e, timeout < 0 ? 10 : MIN(timeout, 10));
         if (event < 0) { quit = true; break; }
         if (event) handle_native_wait(&e);
-        if (console_dirty && console_open) redraw();
+        redraw_console();
     }
     native_wait = false;
+    native_wait_snapshot=false;
     if (!s->ready || quit || sync_stopped || pending_navigation || doc != s->document || generation != s->generation) {
         webnet_cancel(network, id);
         web_response_free(&s->response);
@@ -1333,6 +1448,7 @@ static bool host_sync_load(void *opaque, const char *url, int kind, struct web_r
 static const struct web_host browser_host = {
     .request = host_request, .cancel = host_cancel, .release_request = host_release_request, .resume_request = host_resume_request, .sync_load = host_sync_load,
     .sync_request = host_sync_request,
+    .wait_request = host_wait_request,
     .navigate = host_navigate, .console = host_console, .scroll = host_scroll,
     .navigate_form = host_navigate_form,
     .scroll_to = host_scroll_to, .history = host_history,
@@ -1434,7 +1550,7 @@ static void finish_navigation(void) {
     if (doc) web_free(doc);
     doc = nd;
     generation = navigation_generation;
-    evq_n = 0;evq_hover_tail_valid=false;
+    evq_first=evq_n=evq_scroll_at=0;evq_hover_tail_valid=false;
     url_pair_commit(current, address);
     if (navigation_mode == NAV_PUSH) hist_push(cur_url);
     else if (hpos >= 0) {
@@ -2325,6 +2441,9 @@ static void mouse_move(const struct gui_event *e) {
 }
 
 static void handle(const struct gui_event *e) {
+    bool console_only=console_open &&
+        ((e->type==EV_KEY && focus==F_CONSOLE) ||
+         (e->type==EV_WHEEL && e->y>=TB+page_h() && e->y<w->h-SB));
     switch (e->type) {
     case EV_CLOSE: quit = true; return;
     case EV_UNFOCUS: web_pointer_cancel(doc);web_active_release(doc);pressed_node=NULL;break;
@@ -2387,6 +2506,11 @@ static void handle(const struct gui_event *e) {
     default: return;
     }
     flush_dom_layout();
+    if(console_only && !need_layout && !need_paint &&
+       (e->type==EV_WHEEL || focus==F_CONSOLE)) {
+        if(!quit)redraw_console();
+        return;
+    }
     if (need_layout) relayout();
     if (!quit) redraw();
 }
@@ -2394,9 +2518,11 @@ static void handle(const struct gui_event *e) {
 /* This pump intentionally does not dispatch DOM events, run JS, or destroy a document.
    QuickJS's synchronous module loader can be on the C stack while it is used. */
 static void handle_native_wait(const struct gui_event *e) {
-    bool moved = false;
     if (e->type == EV_CLOSE) { quit = true; sync_stopped = true; return; }
-    if (e->type == EV_RESIZE) { prepare_native_snapshot(true); redraw(); return; }
+    if (e->type == EV_RESIZE) {
+        prepare_native_snapshot(true);native_wait_snapshot=web_native_input_ready(doc,true);
+        if(native_wait_snapshot)redraw();return;
+    }
     if (e->type == EV_KEY && e->pressed) {
         uint32_t k = e->key;
         if (k >= 'A' && k <= 'Z') k += 32;
@@ -2404,7 +2530,10 @@ static void handle_native_wait(const struct gui_event *e) {
         if (e->key == NKEY_F12) {
             console_open = !console_open;
             if (console_open) focus = F_CONSOLE; else if (focus == F_CONSOLE) focus = F_PAGE;
-            prepare_native_snapshot(true); redraw(); return;
+            prepare_native_snapshot(true);native_wait_snapshot=web_native_input_ready(doc,true);
+            if(native_wait_snapshot)redraw();
+            else if(console_open){draw_console();win_update_rect(w,0,TB+page_h(),w->w,console_h());}
+            return;
         }
         if ((e->mods & NMOD_CTRL) && k == 'l') { addr_focus(); redraw(); return; }
         if (focus == F_ADDR) { addr_key(e); redraw(); return; }
@@ -2421,18 +2550,26 @@ static void handle_native_wait(const struct gui_event *e) {
     }
     if (e->type == EV_MOUSE_MOVE && drag_sb) { scrollbar_drag(e->y); redraw(); return; }
     if (e->type == EV_MOUSE_UP && drag_sb) { drag_sb = false; redraw(); return; }
-    if (try_scroll_event(e)) moved = true;
-    else if (!browser_coalesce_hover(evq,evq_n,e,evq_hover_tail_valid)) {
-        if (evq_n == evq_capacity) {
-            int capacity = evq_capacity ? (evq_capacity > INT_MAX / 2 ? INT_MAX : evq_capacity * 2) : 64;
-            void *grown = evq_n < INT_MAX && (size_t)capacity <= SIZE_MAX / sizeof *evq ?
-                realloc(evq, (size_t)capacity * sizeof *evq) : NULL;
-            if (grown) { evq = grown; evq_capacity = capacity; }
-            else if (!evq_failure_logged) { console_add("error", "Deferred native event storage allocation failed"); evq_failure_logged = true; }
-        }
-        if (evq_n < evq_capacity) {evq[evq_n++] = *e;evq_hover_tail_valid=browser_hover_tail(e);}
+    if(e->type==EV_WHEEL && console_open && e->y>=TB+page_h() && e->y<w->h-SB) {
+        console_scroll(-e->wheel*3);redraw_console();return;
     }
-    if (moved) redraw();
+    if(!defer_native_event(e)){sync_stopped=true;return;}
+    native_scroll_queue();
+}
+
+static void handle_deferred_input(void) {
+    struct deferred_input entry=evq[evq_first++];
+    if(!--evq_n){evq_first=evq_scroll_at=0;evq_failure_logged=false;evq_hover_tail_valid=false;}
+    if(entry.event.type==EV_WHEEL && entry.document.document &&
+       (entry.generation!=generation || !web_input_target_valid(doc,&entry.document)))return;
+    if(!entry.scrolled){handle(&entry.event);return;}
+    if(!web_input_target_valid(doc,&entry.target))return;
+    /* The absence of non-passive listeners was established at native scroll
+       commit. Later listeners cannot retroactively cancel that physical input.
+       Notification still runs once, on the original surviving target. */
+    dispatch_native("wheel",entry.target.node,&entry.event,false);
+    if(need_layout)relayout();
+    if(need_paint && !quit)redraw();
 }
 
 static void document_step(uint64_t now) {
@@ -2465,8 +2602,9 @@ static void document_step(uint64_t now) {
         }
         set_title();
         redraw();
-    } else if (need_paint || (console_dirty && console_open)) redraw();
+    } else if (need_paint) redraw();
     else if(media_paint)redraw_damage();
+    redraw_console();
     flush_dom_layout();
     if (!refresh_seen && !loading) {
         int delay;
@@ -2495,10 +2633,15 @@ static void report_loop_profile(uint64_t now) {
              (unsigned long)loop_profile.update_ms, (unsigned long)loop_profile.net_ms,
              (unsigned long)loop_profile.wait_ms, (unsigned long)parallel_jobs());
     unsigned partial=loop_profile.partial_draws,patches=loop_profile.video_patches;
+    unsigned consoles=loop_profile.console_draws;
+    uint64_t console_ms=loop_profile.console_ms,console_update=loop_profile.console_update_ms;
     uint64_t partial_ms=loop_profile.partial_ms,partial_update=loop_profile.partial_update_ms,video_ms=loop_profile.video_present_ms;
     memset(&loop_profile, 0, sizeof loop_profile);
     loop_profile.since = now;
     host_console(NULL, 0, message);
+    if(consoles){snprintf(message,sizeof message,
+        "Browser console profile: rect draw %u/%lu ms, rect present %lu ms (no author page paint)",
+        consoles,(unsigned long)console_ms,(unsigned long)console_update);host_console(NULL,0,message);}
     if(partial||patches){snprintf(message,sizeof message,
         "Browser damage profile: partial draw %u/%lu ms, partial present %lu ms, video patch %u/%lu ms (copy/present only; scale/overlay belongs to media supply)",
         partial,(unsigned long)partial_ms,(unsigned long)partial_update,patches,(unsigned long)video_ms);host_console(NULL,0,message);}
@@ -2595,6 +2738,14 @@ int main(int argc, char **argv) {
         apply_pending_history();
         apply_pending_navigation();
         finish_navigation();
+        /* Give input already collected by a long task its turn before starting
+           the next timer/resource task, rather than repeatedly starving it. */
+        if(evq_n){
+            /* A long C mutation can leave every collected wheel uncommitted.
+               Publish its completed layout once, then batch passive defaults;
+               do not rasterize/replay one default for each queued packet. */
+            flush_dom_layout();native_scroll_queue();handle_deferred_input();continue;
+        }
         /* Native window state is sampled only between script tasks. Queries
            remain live during scripts, but visibility/focus callbacks cannot
            re-enter a module loader or a page callback on the C stack. */
@@ -2624,10 +2775,7 @@ int main(int argc, char **argv) {
         now = uptime_ms();
         struct gui_event e;
         if (evq_n) {
-            e = evq[0];
-            memmove(evq, evq + 1, sizeof evq[0] * (size_t)--evq_n);
-            if (!evq_n) {evq_failure_logged=false;evq_hover_tail_valid=false;}
-            handle(&e);
+            flush_dom_layout();native_scroll_queue();handle_deferred_input();
             continue;
         }
         int timeout = webnet_timeout(network, now);

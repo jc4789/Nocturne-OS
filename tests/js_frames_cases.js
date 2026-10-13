@@ -145,3 +145,44 @@ async function runFrameCases(){
     await new Promise(resolve=>setTimeout(resolve,35));
     return count;
 }
+
+/* Window named propertyの共通境界のみ。既存frame全群を反復しない。 */
+function runWindowNamedCases(){
+    let count=0;
+    const equal=(a,b)=>{count++;if(!Object.is(a,b))throw new Error('Window named check '+count);};
+    const node=document.createElement('div');node.id='namedBareProbe';document.body.append(node);
+    equal(window.namedBareProbe,node);equal(eval('namedBareProbe'),node);
+    equal('namedBareProbe' in window,true);equal(Object.hasOwn(window,'namedBareProbe'),false);
+    window.namedBareProbe=17;equal(eval('namedBareProbe'),17);delete window.namedBareProbe;
+    equal(window.namedBareProbe,node);
+    Window.prototype.namedBareProbe='prototype';equal(window.namedBareProbe,'prototype');
+    delete Window.prototype.namedBareProbe;equal(window.namedBareProbe,node);
+    const namedObject=Object.getPrototypeOf(Window.prototype),descriptor=Object.getOwnPropertyDescriptor(namedObject,'namedBareProbe');
+    equal(descriptor.value,node);equal(descriptor.writable,true);equal(descriptor.enumerable,false);
+    equal(descriptor.configurable,true);equal(Reflect.ownKeys(namedObject).includes('namedBareProbe'),false);
+    equal(Reflect.defineProperty(namedObject,'extra',{value:1}),false);equal(Reflect.deleteProperty(namedObject,'namedBareProbe'),false);
+    equal(window instanceof Window,true);equal(Object.prototype.toString.call(window),'[object Window]');
+    const image=document.createElement('img');image.id='namedBothProbe';image.name='namedBothProbe';document.body.append(image);
+    equal(window.namedBothProbe,image);
+    const second=document.createElement('span');second.id='namedBothProbe';document.body.append(second);
+    const retained=window.namedBothProbe;equal(retained instanceof HTMLCollection,true);equal(retained.length,2);
+    equal(retained[0],image);equal(retained[1],second);image.remove();equal(retained.length,1);equal(retained[0],second);
+    second.remove();equal(retained.length,0);
+    const third=document.createElement('p');third.id='namedBothProbe';document.body.append(third);
+    equal(retained.length,1);equal(retained[0],third);third.remove();
+    const svg=document.createElementNS('http://www.w3.org/2000/svg','g');svg.id='namedForeignProbe';svg.setAttribute('name','invalidForeignName');document.body.append(svg);
+    equal(window.namedForeignProbe,svg);equal(window.invalidForeignName,undefined);svg.remove();
+    const host=document.createElement('div');host.attachShadow({mode:'open'}).innerHTML='<div id="namedHiddenProbe"></div>';
+    document.body.append(host);equal(window.namedHiddenProbe,undefined);host.remove();
+    const detached=document.createElement('div');detached.id='namedDetachedProbe';equal(window.namedDetachedProbe,undefined);
+    node.id='renamedBareProbe';equal(window.namedBareProbe,undefined);equal(window.renamedBareProbe,node);node.remove();
+    equal(window.renamedBareProbe,undefined);
+    const frame=document.createElement('iframe');frame.setAttribute('name','namedChildProbe');document.body.append(frame);
+    const child=frame.contentWindow;equal(window.namedChildProbe,child);equal(child.name,'namedChildProbe');
+    child.name='renamedChildProbe';equal(window.namedChildProbe,undefined);equal(window.renamedChildProbe,child);
+    frame.setAttribute('name','attributeChildProbe');equal(window.renamedChildProbe,undefined);equal(window.attributeChildProbe,child);
+    frame.remove();equal(window.attributeChildProbe,undefined);
+    const nameGetter=Object.getOwnPropertyDescriptor(window,'name').get;
+    let illegal=false;try{nameGetter.call({});}catch(e){illegal=e.name==='TypeError';}equal(illegal,true);
+    return count;
+}

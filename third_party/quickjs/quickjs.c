@@ -37705,7 +37705,9 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     /* Could add a flag to avoid resolution if necessary */
     if (m) {
         m->func_obj = fun_obj;
-        if (js_resolve_module(ctx, m) < 0)
+        if (!((flags & JS_EVAL_FLAG_COMPILE_ONLY) &&
+              (flags & JS_EVAL_FLAG_MODULE_PARSE_ONLY)) &&
+            js_resolve_module(ctx, m) < 0)
             goto fail1;
         fun_obj = JS_NewModuleValue(ctx, m);
     }

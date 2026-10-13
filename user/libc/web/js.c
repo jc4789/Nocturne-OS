@@ -34,6 +34,7 @@
 #include "js_worker_wire.h"
 #include "frame.h"
 #include <limits.h>
+#include "js_dom_opcodes.h"
 #include "js_bootstrap.inc"
 
 /* Runtime storage grows on demand. There is no arbitrary per-page heap quota. */
@@ -64,7 +65,8 @@ struct js_node_ref {
     /* These are real, gc_mark-visible DOM graph edges, not cache roots. */
     JSValue root_object, tree_object, owner_object, hold;
     struct js_node_ref *tree_root, *members, *member_next, **member_prev;
-    struct js_node_ref *next, **prev, *hash_next, **hash_prev;
+    struct js_node_ref *next, **prev, *hash_next, **hash_prev, *update_next;
+    uint64_t wheel_blocking;
 };
 struct js_timer { uint32_t id; int kind; uint64_t due, interval, order; JSValue fn, args; };
 struct js_policy_violation {struct js_policy_violation *next;JSValue init;struct web_html_policy_rule *rule;};
@@ -80,7 +82,7 @@ struct js_script {
     uint64_t request, stream_generation;
     struct js_script *next;
 };
-enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE, P_WORKER, P_FRAME, P_FONT, P_POLICY_REPORT };
+enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE, P_WORKER, P_FRAME, P_FONT, P_POLICY_REPORT, P_MODULE };
 struct js_pending {
     uint64_t id, deadline, stream_generation;
     int kind, credentials, cache_mode;
@@ -88,16 +90,27 @@ struct js_pending {
     uint32_t worker, worker_request;
     int worker_kind;
     struct js_script *script;
+    struct js_module *module;
     struct web_frame *frame;
     struct web_font_resource *font;
+    struct cached_css *css;
     JSValue resolve, reject, stream_callback;
-    char *url,*origin;
+    char *url,*origin,*integrity;
     bool done, aborted, force_preflight, redirect_error, same_origin, keepalive, no_cors, no_referrer;
     bool streaming, headers_delivered;
     struct web_response response;
     struct js_pending *next;
 };
-struct js_module { char *url, *base, *source; size_t len; JSValue compiled, error; struct js_module *next; };
+struct js_module {
+    char *url, *base, *source; size_t len; JSValue compiled, error;
+    uint64_t request; size_t users; bool fetching, fetch_failed, linked, resolving;
+    struct js_module *next;
+};
+struct js_preload {
+    node_t *node; char *href; struct js_module *module;
+    uint64_t stream_generation, resource_revision; bool connected, notified, seen;
+    struct js_preload *next;
+};
 struct js_frame_proxy {struct js_frame_proxy *next;node_t *token;JSValue proxy;};
 struct js_rejection { JSValue promise, reason; struct js_rejection *next; };
 struct js_resource_event { node_t *node; bool failed, image, selection, stylesheet; uint64_t generation; struct js_resource_event *next; };
@@ -129,6 +142,11 @@ struct js_idb_pending {
     unsigned operation;
     JSValue resolve, reject;
 };
+struct js_inserted_roots {
+    node_t *local[8], **nodes;
+    size_t count, capacity;
+    bool changed;
+};
 struct web_js_state {
     struct js_alloc_diagnostics allocation;
     web_doc *doc;
@@ -145,10 +163,14 @@ struct web_js_state {
     bool node_cache_syncing, node_cache_failed;
     struct web_js_state *node_cache_next, **node_cache_prev;
     struct js_script *scripts, *last_script, *blocker;
+    uint64_t dynamic_scan_revision;
+    bool dynamic_scan_valid;
     struct js_pending *pending;
     web_workers *workers;
     bool worker_turn;
     struct js_module *modules;
+    struct js_preload *preloads[256];
+    bool preload_scan_valid;
     const char *module_entry_url;
     struct js_timer *timers;
     unsigned timer_capacity;
@@ -173,6 +195,8 @@ struct web_js_state {
     struct js_image_decode *image_decodes, *last_image_decode;
     uint64_t next_request, task_deadline, now, stream_generation;
     uint64_t fetch_group;
+    uint64_t window_named_revision;
+    char *window_name;
     uint64_t task_started_ms, task_native_wait_ms, diagnostic_task_id;
     const char *diagnostic_task;
     uint32_t task_budget_ms;
@@ -184,6 +208,8 @@ struct web_js_state {
     bool compile_timed_out;
     unsigned task_layout_flushes;
     unsigned profile_dom_depth;
+    uint32_t profile_dom_sampling;
+    struct { uint64_t calls, ms, samples; } profile_dom_ops[DOM_OPCODE_COUNT];
     struct js_storage_profile storage_profile;
     bool ce_hooks_active, range_hooks_active, face_hooks_active;
     struct js_mutation_registration *mutation_registrations;
@@ -227,6 +253,8 @@ static uint8_t *bindings_bytecode;
 static size_t bindings_bytecode_len;
 static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dynamic);
 static void dynamic_scripts(struct web_js_state *s, node_t *n);
+static void dynamic_inserted(struct web_js_state *s,node_t *parent,
+    struct js_inserted_roots *inserted,uint64_t generation);
 static void run_script(struct web_js_state *s, struct js_script *script);
 static void sync_parser_body_handlers(struct web_js_state *s);
 static struct js_resource_event *script_event(struct web_js_state *s, node_t *n, bool failed);
@@ -532,8 +560,10 @@ bool web_native_checkpoint(web_doc *d) {
     struct web_js_state *s = d->js;
     if (!s || s->starting) return true;
     if(!s->running&&s->indexed_db)webidb_async_pump(s->indexed_db);
+    d->native_checkpoint_depth++;
     bool stopped = s->running && !s->disabled ? interrupt(s->rt, s) != 0 :
         s->host.script_checkpoint && !s->host.script_checkpoint(s->host.opaque);
+    d->native_checkpoint_depth--;
     if (stopped) {
         bool first=!d->native_recovery_pending;
         d->native_recovery_pending=true;d->dirty=true;
@@ -573,6 +603,7 @@ static void begin_task(struct web_js_state *s) {
         s->task_compile_ms = 0; s->compile_timed_out = false;
         s->task_microtask_ms = 0; s->task_timed_out = false;
         memset(&s->storage_profile,0,sizeof s->storage_profile);
+        if(s->host.debug_js)memset(s->profile_dom_ops,0,sizeof s->profile_dom_ops);
     }
     s->running++;
 }
@@ -655,7 +686,29 @@ static void end_task(struct web_js_state *s) {
                      s->starting ? "Browser API initialization exceeded its 10 second startup budget." : message);
             s->timed_out = false;
         }
-        if (s->task_timed_out || uptime_ms()-s->task_started_ms>=250)storage_profile_report(s);
+        if (s->task_timed_out || uptime_ms()-s->task_started_ms>=250) {
+            storage_profile_report(s);
+            if(s->host.debug_js) {
+                /* Reuse the existing randomized timing samples; never add a
+                   clock syscall to every DOM read. Only operation names, not
+                   selectors, attribute values or author text are logged. */
+                bool shown[DOM_OPCODE_COUNT]={0};
+                for(int rank=0;rank<6;rank++) {
+                    int best=-1;
+                    for(int op=0;op<DOM_OPCODE_COUNT;op++)
+                        if(!shown[op]&&s->profile_dom_ops[op].calls&&
+                           (best<0||s->profile_dom_ops[op].ms>s->profile_dom_ops[best].ms||
+                            (s->profile_dom_ops[op].ms==s->profile_dom_ops[best].ms&&
+                             s->profile_dom_ops[op].calls>s->profile_dom_ops[best].calls)))best=op;
+                    if(best<0)break;shown[best]=true;
+                    char message[192];
+                    snprintf(message,sizeof message,"Task DOM operation profile: %s calls %lu, sampled-native-estimate %lu ms, samples %lu",
+                        dom_opcode_names[best],(unsigned long)s->profile_dom_ops[best].calls,
+                        (unsigned long)s->profile_dom_ops[best].ms,(unsigned long)s->profile_dom_ops[best].samples);
+                    log_text(s,0,message);
+                }
+            }
+        }
         if (s->doc->resources_dirty || s->doc->images_dirty) doc_rescan(s->doc);
     }
     if (s->running) s->running--;
@@ -836,6 +889,56 @@ static JSValue oom(JSContext *ctx) { return JS_ThrowOutOfMemory(ctx); }
 static JSValue str_or_null(JSContext *ctx, const char *p) { return p ? JS_NewString(ctx, p) : JS_NULL; }
 static bool connected(struct web_js_state *s, node_t *n) {
     return n && doc_node_root(n, true) == s->doc->root;
+}
+/* Shadow-including preorder, without recursion or entry into template content.
+   This walk never executes author code; post-connection work uses its static
+   candidate list even if an earlier script moves or removes a later sibling. */
+static node_t *dynamic_scan_next(node_t *root,node_t *node) {
+    if(!(node->type==N_ELEM && node->tag==T_template)){
+        if(node->shadow_root)return node->shadow_root;
+        if(node->first)return node->first;
+    }
+    while(node!=root){
+        if(node->parent){if(node->next)return node->next;node=node->parent;}
+        else if(node->shadow_host){node=node->shadow_host;if(node->first)return node->first;}
+        else return NULL;
+    }
+    return NULL;
+}
+/* A fragment empties during insertion. Retain only the post-connection
+   candidates from its actual inserted forest before that happens, not the
+   destination's accumulated children. Ordinary leaves allocate nothing. */
+static bool inserted_roots_capture(struct web_js_state *s,node_t *node,struct js_inserted_roots *roots) {
+    roots->nodes=roots->local;roots->count=0;roots->capacity=sizeof roots->local/sizeof *roots->local;
+    roots->changed=node && (node->type!=N_FRAGMENT || node->first);
+    if(!node)return true;
+    size_t visits=0;
+    if(s->host.debug_js)s->doc->profile.script_scans++;
+    for(node_t *candidate=node;candidate;candidate=dynamic_scan_next(node,candidate)){
+        if(!(visits++&63u)&&!web_native_checkpoint(s->doc)){
+            JS_ThrowInternalError(s->ctx,"DOM insertion interrupted");return false;
+        }
+        if(s->host.debug_js)s->doc->profile.script_visits++;
+        if(candidate->type!=N_ELEM ||
+           !((candidate->tag==T_script && !candidate->script_started) ||
+             (!candidate->foreign && candidate->tag==T_meta && !candidate->html_policy_processed) ||
+             web_frame_element(candidate)))continue;
+        if(roots->count==roots->capacity){
+            size_t maximum=SIZE_MAX/sizeof *roots->nodes;
+            if(roots->capacity==maximum){JS_ThrowOutOfMemory(s->ctx);return false;}
+            size_t capacity=roots->capacity>maximum/2?maximum:roots->capacity*2;
+            node_t **nodes=js_malloc(s->ctx,capacity*sizeof *nodes);
+            if(!nodes)return false;
+            memcpy(nodes,roots->nodes,roots->count*sizeof *nodes);
+            if(roots->nodes!=roots->local)js_free(s->ctx,roots->nodes);
+            roots->nodes=nodes;roots->capacity=capacity;
+        }
+        roots->nodes[roots->count++]=candidate;
+    }
+    return true;
+}
+static void inserted_roots_release(struct web_js_state *s,struct js_inserted_roots *roots) {
+    if(roots->nodes&&roots->nodes!=roots->local)js_free(s->ctx,roots->nodes);
 }
 static bool equal_nodes(const node_t *a, const node_t *b) {
     if (a == b) return true;
@@ -1262,7 +1365,6 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     return JS_UNDEFINED;
 }
 
-#include "js_dom_opcodes.h"
 #include "js_mutations.h"
 static JSValue set_dom(struct web_js_state *s, node_t *n, const char *p, JSValueConst value,int argc,JSValueConst *argv) {
     JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
@@ -1393,6 +1495,20 @@ static bool css_style_priority(const char *begin, const char **end) {
 }
 static JSValue css_style_value(JSContext *ctx, const char *property,
                                const char *begin, const char *end) {
+    if(!strcasecmp(property,"border-radius")||!strcasecmp(property,"border-top-left-radius")||!strcasecmp(property,"border-top-right-radius")||
+       !strcasecmp(property,"border-bottom-right-radius")||!strcasecmp(property,"border-bottom-left-radius")) {
+        sbuf text={0};
+        if(css_radius_specified(property,begin,(size_t)(end-begin),&text)){JSValue value=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return value;}
+        sb_free(&text);
+    }
+    if (!strcasecmp(property,"box-shadow")) {
+        sbuf serialized={0};
+        if (css_shadow_specified(begin,(size_t)(end-begin),&serialized)) {
+            JSValue value=JS_NewStringLen(ctx,serialized.p?serialized.p:"",serialized.n);
+            sb_free(&serialized);return value;
+        }
+        sb_free(&serialized); /* CSS-wide keywords / unresolved var() stay authored. */
+    }
     /* Normalize supported numeric opacity, not arbitrary/custom values.
        Preserve var()/calc() token streams unchanged. */
     if (!strcasecmp(property, "opacity") && end - begin > 0 && end - begin < 64) {
@@ -1467,6 +1583,12 @@ static JSValue style_access(struct web_js_state *s, node_t *n, const char *prope
                css_separator(v, value_end, ';') != value_end)) {
         JS_FreeCString(ctx, v); JS_FreeCString(ctx, prio); sb_free(&b); return JS_UNDEFINED;
     }
+    /* CSSOM setProperty parses before changing the declaration block. Keep
+       syntactically valid but not-yet-rendered values separate from @supports
+       capability reporting; both use the real property grammar and var rules. */
+    if (*v && !css_valid_declaration(property,strlen(property),v,(size_t)(value_end-v))) {
+        JS_FreeCString(ctx,v);JS_FreeCString(ctx,prio);sb_free(&b);return JS_UNDEFINED;
+    }
     if (*v) {
         if (b.n && b.p[b.n - 1] != ';') sb_putc(&b, ';');
         sb_puts(&b, property); sb_putc(&b, ':'); sb_puts(&b, v);
@@ -1478,22 +1600,47 @@ static JSValue style_access(struct web_js_state *s, node_t *n, const char *prope
 }
 static void flush_layout(struct web_js_state *s) {
     web_doc *d = s->doc;
-    if (d->width < 1) return;
+    if (d->width < 1 && !d->frame_parent) return;
     web_avmedia_service(uptime_ms());
     uint64_t start = s->host.debug_js?uptime_ms():0;
-    uint64_t revision = d->layout_revision;
-    web_layout(d, d->width, d->height);
-    if(s->host.debug_js){s->task_layout_ms += uptime_ms() - start;
-        if (d->layout_revision != revision) s->task_layout_flushes++;}
+    /* CSSOM geometry can read a child directly from its parent realm. Flush
+       the embedding chain from outside in, not only the child at its stale
+       pre-paint size. Small normal chains need no heap or recursive C stack. */
+    web_doc *local[8],**chain=local;size_t count=0;
+    for(web_doc *p=d;p;p=p->frame_parent)count++;
+    if(count>sizeof local/sizeof *local)chain=count<=SIZE_MAX/sizeof *chain?malloc(count*sizeof *chain):NULL;
+    if(chain){
+        size_t i=0;for(web_doc *p=d;p;p=p->frame_parent)chain[i++]=p;
+        while(i){web_doc *p=chain[--i];if(!p->live || p->native_cancelled || p->native_layout_depth)break;
+            uint64_t revision=p->layout_revision;
+            if(p->width>0)web_layout(p,p->width,p->height);
+            if(s->host.debug_js&&p->layout_revision!=revision)s->task_layout_flushes++;
+        }
+        if(chain!=local)free(chain);
+    }else{
+        /* Real OOM does not turn a valid deep document into false geometry.
+           This slower allocation-free traversal remains cancellable. */
+        for(size_t level=count;level;level--){web_doc *p=d;
+            for(size_t i=1;i<level;i++){if(!(i&63)&&!web_native_checkpoint(d))goto flushed;p=p->frame_parent;}
+            if(!p->live || p->native_cancelled || p->native_layout_depth)break;
+            uint64_t revision=p->layout_revision;
+            if(p->width>0)web_layout(p,p->width,p->height);
+            if(s->host.debug_js&&p->layout_revision!=revision)s->task_layout_flushes++;
+        }
+    }
+flushed:
+    if(s->host.debug_js)s->task_layout_ms += uptime_ms() - start;
     web_avmedia_service(uptime_ms());
 }
-static JSValue rect_array(JSContext *ctx, float x, float y, float w, float h) {
+static JSValue rect_array(JSContext *ctx, double x, double y, double w, double h) {
     JSValue a = JS_NewArray(ctx);
-    const float values[] = {x,y,w,h};
+    const double values[] = {x,y,w,h};
     for (int i=0;i<4;i++) JS_SetPropertyUint32(ctx,a,i,JS_NewFloat64(ctx,values[i]));
     return a;
 }
 static void viewport_scroll_position(struct web_js_state *s,int *x,int *y);
+static bool client_bounding_rect(JSContext *ctx,node_t *n,int sx,int sy,double rect[4],bool *present);
+static bool element_offset_metrics(node_t *n,double first[4],double bounds[4]);
 #include "js_svg_native.h"
 static JSValue observer_geometry(struct web_js_state *s, node_t *n, node_t *root) {
     JSContext *ctx=s->ctx; web_doc *d=s->doc;
@@ -1504,9 +1651,13 @@ static JSValue observer_geometry(struct web_js_state *s, node_t *n, node_t *root
     box_t *b=visible?n->box:NULL;
     int sx,sy;viewport_scroll_position(s,&sx,&sy);
     JSValue out=JS_NewObject(ctx),clips=JS_NewArray(ctx);
-    float x=0,y=0,w=0,h=0;
-    if(b){x=box_visual_x(b)-b->p[3]-b->b[3]-sx;y=box_visual_y(b)-b->p[0]-b->b[0]-sy;
-        w=b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3];h=b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2];}
+    double bounds[4]={0};bool present=false;
+    /* IO boundingClientRect is CSSOM View's real fragment union, not the
+       layout-only inline wrapper. Inline lazy-loader targets can otherwise
+       appear at (0,0) outside their actual explicit root. */
+    if(visible&&!client_bounding_rect(ctx,n,sx,sy,bounds,&present))return JS_EXCEPTION;
+    visible=visible&&present;
+    double x=bounds[0],y=bounds[1],w=bounds[2],h=bounds[3];
     JS_SetPropertyStr(ctx,out,"rect",rect_array(ctx,x,y,w,h));
     bool resizable=b && (b->kind!=B_INLINE || b->kind==B_ATOMIC);
     JS_SetPropertyStr(ctx,out,"content",rect_array(ctx,b?b->p[3]:0,b?b->p[0]:0,resizable?b->w:0,resizable?b->h:0));
@@ -1524,7 +1675,10 @@ static JSValue observer_geometry(struct web_js_state *s, node_t *n, node_t *root
             ry=box_visual_y(r)-r->p[0]-(clip?0:r->b[0])-sy;
             rw=r->w+r->p[1]+r->p[3]+(clip?0:r->b[1]+r->b[3]);
             rh=r->h+r->p[0]+r->p[2]+(clip?0:r->b[0]+r->b[2]);
-            for(node_t *p=n->parent;p;p=p->parent)if(p==root){root_ok=true;break;}
+            /* Eligibility follows the CSS containing-block chain. An ordinary
+               DOM ancestor is neither necessary (slotted shadow content) nor
+               sufficient (viewport-fixed descendants) for an explicit root. */
+            for(box_t *p=b?b->cb:NULL;p;p=p->cb)if(p==r||p->node==root){root_ok=true;break;}
         }else rw=rh=0;
     }
     unsigned count=0;
@@ -1650,28 +1804,34 @@ static JSValue geometry(struct web_js_state *s, node_t *n, const char *property)
     node_t *parent = b ? offset_parent(owner,n) : NULL;
     if (!strcmp(property, "offsetParent")) return wrap(s, parent);
     box_t *principal = b ? geometry_principal_box(n) : NULL;
-    float value = 0;
+    double value = 0;
     if ((!strcmp(property, "clientWidth") || !strcmp(property, "clientHeight")) &&
         (n == d->html || (d->quirks && n == d->body)))
         value = !strcmp(property, "clientWidth") ? d->width : d->height;
     else if (b) {
-        if (!strcmp(property, "offsetWidth")) value = b->w + b->p[1] + b->p[3] + b->b[1] + b->b[3];
-        else if (!strcmp(property, "offsetHeight")) value = b->h + b->p[0] + b->p[2] + b->b[0] + b->b[2];
+        if (!strcmp(property,"offsetWidth") || !strcmp(property,"offsetHeight") ||
+            !strcmp(property,"offsetLeft") || !strcmp(property,"offsetTop")) {
+            double first[4],bounds[4];
+            if(element_offset_metrics(n,first,bounds)) {
+                if(!strcmp(property,"offsetWidth"))value=bounds[2]-bounds[0];
+                else if(!strcmp(property,"offsetHeight"))value=bounds[3]-bounds[1];
+                else if(n!=d->body) {
+                    bool horizontal=!strcmp(property,"offsetLeft");
+                    unsigned axis=horizontal?0:1;value=first[axis];
+                    double origin[4],extent[4];
+                    if(parent && element_offset_metrics(parent,origin,extent)) {
+                        box_t *p=geometry_principal_box(parent);
+                        value-=origin[axis]+(horizontal?p->b[3]:p->b[0]);
+                    }
+                }
+            }
+        }
         else if (!strcmp(property, "clientWidth")) value = principal->kind == B_INLINE ? 0 : principal->w + principal->p[1] + principal->p[3];
         else if (!strcmp(property, "clientHeight")) value = principal->kind == B_INLINE ? 0 : principal->h + principal->p[0] + principal->p[2];
         else if (!strcmp(property, "clientLeft")) value = principal->kind == B_INLINE ? 0 : principal->b[3];
         else if (!strcmp(property, "clientTop")) value = principal->kind == B_INLINE ? 0 : principal->b[0];
-        else if (!strcmp(property, "offsetLeft")) {
-            value = box_abs_x(b) - b->p[3] - b->b[3];
-            if (parent) value -= box_abs_x(parent->box) - parent->box->p[3];
-            if (n == d->body) value = 0;
-        } else if (!strcmp(property, "offsetTop")) {
-            value = box_abs_y(b) - b->p[0] - b->b[0];
-            if (parent) value -= box_abs_y(parent->box) - parent->box->p[0];
-            if (n == d->body) value = 0;
-        }
     }
-    return JS_NewInt32(ctx, (int32_t)roundf(value));
+    return JS_NewInt32(ctx,(int32_t)MIN(MAX(round(value),INT32_MIN),INT32_MAX));
 }
 static JSValue computed_length(JSContext *ctx, const len_t *length, web_doc *d) {
     sbuf text = {0};
@@ -1742,7 +1902,44 @@ static JSValue computed_inset(struct web_js_state *s, JSContext *ctx, node_t *n,
     char text[64]; snprintf(text, sizeof text, "%gpx", (double)(value == 0 ? 0 : value));
     return JS_NewString(ctx, text);
 }
-static JSValue computed(struct web_js_state *s, node_t *n, const char *property) {
+static void computed_color_text(char *out,size_t capacity,uint32_t color) {
+    unsigned alpha=color>>24;
+    /* CSS Color legacy CSS serialization omits alpha when it is opaque. */
+    if(alpha==255)snprintf(out,capacity,"rgb(%u, %u, %u)",(color>>16)&255,(color>>8)&255,color&255);
+    else {
+        /* CSS Color's legacy 8-bit alpha algorithm preserves integer-percent
+           round trips. Use exact integer rounding, including the 50% midpoint,
+           rather than exposing the quantized channel as 0.501961. */
+        unsigned percent=(alpha*100+127)/255;
+        double value=(percent*255+50)/100==alpha?(double)percent/100:
+            (double)((alpha*1000+127)/255)/1000;
+        snprintf(out,capacity,"rgba(%u, %u, %u, %g)",(color>>16)&255,(color>>8)&255,color&255,value);
+    }
+}
+static int computed_pseudo(const char *pseudo) {
+    /* CSSOM ignores a non-colon argument; an unknown pseudo has an empty
+       declaration instead of returning the originating element's style. */
+    if(!pseudo || *pseudo!=':')return PE_NONE;
+    if(str_ieq(pseudo,"::before")||str_ieq(pseudo,":before"))return PE_BEFORE;
+    if(str_ieq(pseudo,"::after")||str_ieq(pseudo,":after"))return PE_AFTER;
+    if(str_ieq(pseudo,"::placeholder"))return PE_PLACEHOLDER;
+    return -1;
+}
+static style_t *computed_pseudo_style(node_t *n,int pseudo,style_t *fallback) {
+    style_t *base=n?n->style:NULL;
+    if(!base || pseudo<0)return NULL;
+    if(pseudo==PE_NONE)return base;
+    if(pseudo==PE_BEFORE && base->before)return base->before;
+    if(pseudo==PE_AFTER && base->after)return base->after;
+    if(pseudo==PE_PLACEHOLDER) {
+        if(n->foreign || (n->tag!=T_textarea && (n->tag!=T_input || web_input_type(n)>WEB_INPUT_PASSWORD)))return NULL;
+        if(base->placeholder)return base->placeholder;
+    }
+    css_style_init(fallback,base);
+    if(pseudo==PE_PLACEHOLDER)fallback->color=RGB(117,117,117);
+    return fallback;
+}
+static JSValue computed(struct web_js_state *s, node_t *n, const char *property,int pseudo) {
     JSContext *ctx = s->ctx;
     if (!n || n->type != N_ELEM) return JS_ThrowTypeError(ctx, "Computed style requires an element");
     struct web_js_state *owner = n->owner ? geometry_owner(s, n->owner) : NULL;
@@ -1750,20 +1947,38 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property)
     web_doc *d = owner->doc;
     if (d->resources_dirty) doc_rescan(d);
     flush_layout(owner);
-    style_t *st = n->style; char out[128]; out[0] = 0;
+    style_t fallback;
+    style_t *st = computed_pseudo_style(n,pseudo,&fallback); char out[128]; out[0] = 0;
     if (!st) return JS_NewString(ctx, "");
-    if (!strcmp(property,"filter")) {
+    if(property[0]=='-'&&property[1]=='-') {
+        unsigned work=0;
+        for(const struct custom_prop *p=st->vars;p;p=p->next) {
+            if(!(work++&63)&&!web_native_checkpoint(d))return JS_ThrowInternalError(ctx,"Computed custom property interrupted");
+            if(!strcmp(p->name,property))return JS_NewString(ctx,p->value?p->value:"");
+        }
+        return JS_NewString(ctx,"");
+    }
+    static const char *const radius_names[]={"border-top-left-radius","border-top-right-radius","border-bottom-right-radius","border-bottom-left-radius"};
+    int radius_corner=-2;if(!strcmp(property,"border-radius"))radius_corner=-1;
+    for(int i=0;i<4;i++)if(!strcmp(property,radius_names[i]))radius_corner=i;
+    if(radius_corner!=-2) {
+        sbuf text={0};if(!css_radius_serialize(st,radius_corner,&text,d)){sb_free(&text);return JS_ThrowInternalError(ctx,"CSS radius serialization failed");}
+        JSValue result=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return result;
+    }
+    if (!strcmp(property,"filter") || !strcmp(property,"box-shadow")) {
         sbuf text={0};
-        if (!css_filter_serialize(st->filter,&text,d)) {
-            sb_free(&text);return JS_ThrowInternalError(ctx,"CSS filter serialization failed");
+        bool serialized = !strcmp(property,"filter") ? css_filter_serialize(st->filter,&text,d) :
+            css_shadow_serialize(st->box_shadow,&text,d);
+        if (!serialized) {
+            sb_free(&text);return JS_ThrowInternalError(ctx,"CSS effect serialization failed");
         }
         JSValue result=JS_NewStringLen(ctx,text.p?text.p:"",text.n);
         sb_free(&text);return result;
     }
     static const char *const inset_names[] = {"top", "right", "bottom", "left"};
     for (unsigned side = 0; side < 4; side++) if (!strcmp(property, inset_names[side]))
-        return computed_inset(owner, ctx, n, side);
-    box_t *principal = geometry_principal_box(n);
+        return pseudo==PE_NONE?computed_inset(owner,ctx,n,side):computed_length(ctx,&st->inset[side],n->owner);
+    box_t *principal = pseudo==PE_NONE?geometry_principal_box(n):NULL;
     if(!strcmp(property,"transform")||!strcmp(property,"translate"))
         return computed_translation(ctx,d,st,principal,!strcmp(property,"translate"));
     if (!strcmp(property, "fill") || !strcmp(property, "stroke")) {
@@ -1778,7 +1993,7 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property)
             free(absolute); sb_free(&value); return result;
         }
         uint32_t c = paint->color == COLOR_CURRENT ? st->color : paint->color;
-        snprintf(out, sizeof out, "rgba(%u, %u, %u, %g)", (c >> 16) & 255, (c >> 8) & 255, c & 255, (double)(c >> 24) / 255);
+        computed_color_text(out,sizeof out,c);
         return JS_NewString(ctx, out);
     }
     uint32_t color = 0; bool is_color = false; float px = 0; bool is_px = false;
@@ -1826,6 +2041,7 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property)
     else if (!strcmp(property,"container-name")) return JS_NewString(ctx,st->container_names?st->container_names:"none");
     else if (!strcmp(property,"-webkit-box-orient")) snprintf(out,sizeof out,"%s",st->box_orient==BO_VERTICAL?"vertical":"horizontal");
     else if (!strcmp(property,"-webkit-line-clamp")) {if(st->line_clamp)snprintf(out,sizeof out,"%u",st->line_clamp);else snprintf(out,sizeof out,"none");}
+    else if (!strcmp(property,"text-overflow")) snprintf(out,sizeof out,"%s",st->text_overflow==TO_ELLIPSIS?"ellipsis":"clip");
     else if (!strcmp(property,"white-space")) {
         static const char *const names[]={"normal","pre","nowrap","pre-wrap","pre-line","break-spaces"};
         snprintf(out,sizeof out,"%s",names[st->white_space<6?st->white_space:0]);
@@ -1874,7 +2090,7 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property)
             char key[32];
             snprintf(key, sizeof key, "margin-%s", sides[i]);
             if (!strcmp(property, key)) {
-                if (!n->box) return computed_length(ctx, &st->margin[i], n->owner);
+                if (pseudo!=PE_NONE || !n->box) return computed_length(ctx, &st->margin[i], n->owner);
                 px = n->box->m[i]; is_px = true;
             }
             snprintf(key, sizeof key, "padding-%s", sides[i]);
@@ -1889,7 +2105,7 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property)
             }
         }
     }
-    if (is_color) snprintf(out, sizeof out, "rgba(%u, %u, %u, %g)", (color >> 16) & 255, (color >> 8) & 255, color & 255, (double)((color >> 24) & 255) / 255);
+    if (is_color) computed_color_text(out,sizeof out,color);
     if (is_px) snprintf(out, sizeof out, "%gpx", (double)px);
     return JS_NewString(ctx, out);
 }
@@ -1968,7 +2184,7 @@ static JSValue animation_dom(struct web_js_state *s, node_t *n, bool read, int a
                     px = len_resolve(length, base); numeric = true;
                 }
             }
-            if (is_color) snprintf(out, sizeof out, "rgba(%u, %u, %u, %g)", (color >> 16) & 255, (color >> 8) & 255, color & 255, (double)(color >> 24) / 255);
+            if (is_color) computed_color_text(out,sizeof out,color);
             if (numeric) snprintf(out, sizeof out, "%gpx", (double)px);
         }
         JS_FreeCString(ctx, p); return JS_NewString(ctx, out);
@@ -2516,6 +2732,7 @@ struct client_rect_output {
     JSValueConst list;
     uint32_t count;
     bool first_seen, extent_seen, area_seen;
+    bool untransformed, all_fragments;
     double first[4], bounds[4]; /* left, top, right, bottom */
 };
 static bool client_rect_append(struct client_rect_output *out,
@@ -2527,7 +2744,7 @@ static bool client_rect_append(struct client_rect_output *out,
             out->first_seen=true;
         }
         if (w && h) out->area_seen=true;
-        if (w || h) {
+        if (w || h || out->all_fragments) {
             if (!out->extent_seen) {
                 out->bounds[0]=x;out->bounds[1]=y;out->bounds[2]=x+w;out->bounds[3]=y+h;
                 out->extent_seen=true;
@@ -2551,8 +2768,8 @@ static bool client_rect_append(struct client_rect_output *out,
 }
 static bool client_rect_box(struct client_rect_output *out,
                             const box_t *b,int sx,int sy) {
-    return client_rect_append(out,box_visual_x(b)-b->p[3]-b->b[3]-sx,
-        box_visual_y(b)-b->p[0]-b->b[0]-sy,
+    return client_rect_append(out,(out->untransformed?box_abs_x(b):box_visual_x(b))-b->p[3]-b->b[3]-sx,
+        (out->untransformed?box_abs_y(b):box_visual_y(b))-b->p[0]-b->b[0]-sy,
         b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3],
         b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2]);
 }
@@ -2562,8 +2779,9 @@ static bool collect_client_rects(struct client_rect_output *out,node_t *n,int sx
     if(b->kind==B_INLINE){
         box_t *a=n->anchor_block;
         if(a){
-            double x=box_visual_x(a)-sx,y=box_visual_y(a)+a->content_dy-sy;
-            if(box_element_scrollable(a)){x-=a->node->scroll_x;y-=a->node->scroll_y;}
+            double x=(out->untransformed?box_abs_x(a):box_visual_x(a))-sx;
+            double y=(out->untransformed?box_abs_y(a):box_visual_y(a))+a->content_dy-sy;
+            if(!out->untransformed && box_element_scrollable(a)){x-=a->node->scroll_x;y-=a->node->scroll_y;}
             for(int i=0;i<a->ndecos;i++){
                 const struct deco *span=&a->decos[i];
                 if(span->node==n && !client_rect_append(out,x+span->x,y+span->y,span->w,span->h))return false;
@@ -2572,9 +2790,17 @@ static bool collect_client_rects(struct client_rect_output *out,node_t *n,int sx
     }else{
         b=geometry_principal_box(n);
         if(!client_rect_box(out,b,sx,sy))return false;
-        if(b->kind==B_TABLE)for(box_t *c=b->first;c;c=c->next)
+        if(!out->untransformed && b->kind==B_TABLE)for(box_t *c=b->first;c;c=c->next)
             if(c->kind==B_CAPTION && !client_rect_box(out,c,sx,sy))return false;
     }
+    return true;
+}
+static bool element_offset_metrics(node_t *n,double first[4],double bounds[4]) {
+    /* offsetLeft/Top use the first border fragment; offsetWidth/Height use all
+       principal fragments. Neither transforms nor scrolling affect offsets. */
+    struct client_rect_output out={.list=JS_UNDEFINED,.untransformed=true,.all_fragments=true};
+    if(!collect_client_rects(&out,n,0,0) || !out.first_seen)return false;
+    memcpy(first,out.first,sizeof out.first);memcpy(bounds,out.bounds,sizeof out.bounds);
     return true;
 }
 static JSValue element_client_rects(JSContext *ctx,node_t *n,int sx,int sy) {
@@ -2582,6 +2808,15 @@ static JSValue element_client_rects(JSContext *ctx,node_t *n,int sx,int sy) {
     struct client_rect_output out={.ctx=ctx,.list=list};
     if(!collect_client_rects(&out,n,sx,sy)){JS_FreeValue(ctx,list);return JS_EXCEPTION;}
     return list;
+}
+static bool client_bounding_rect(JSContext *ctx,node_t *n,int sx,int sy,double rect[4],bool *present) {
+    struct client_rect_output out={.ctx=ctx,.list=JS_UNDEFINED};
+    if(!collect_client_rects(&out,n,sx,sy))return false;
+    const double *r=out.area_seen?out.bounds:out.first;
+    *present=out.first_seen;
+    rect[0]=out.first_seen?r[0]:0;rect[1]=out.first_seen?r[1]:0;
+    rect[2]=out.first_seen?r[2]-r[0]:0;rect[3]=out.first_seen?r[3]-r[1]:0;
+    return true;
 }
 static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int opcode) {
     struct web_js_state *s = state(ctx); web_doc *d = s->doc;
@@ -2608,6 +2843,8 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     JSValue result = JS_UNDEFINED;
     const char *p = NULL;
     node_t *attribute_target = NULL;
+    struct js_inserted_roots inserted={0};
+    uint64_t insertion_generation=s->stream_generation;
     const char *attribute_name = NULL;
     bool old_attribute_present = false;
     char *created_attribute_name = NULL;
@@ -2645,6 +2882,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     case DOM_replaceAll: {
         node_t *child=argc>2?unwrap(ctx,argv[2]):NULL;
         if(doc_node_replace_all_validity(n,child))result=JS_ThrowTypeError(ctx,"Invalid native replace-all");
+        else if(!inserted_roots_capture(s,child,&inserted))result=JS_EXCEPTION;
         else result=doc_node_replace_all(d,n,child)?JS_UNDEFINED:oom(ctx);
     } break;
     case DOM_animationStyle: case DOM_animationComputed: {
@@ -2815,7 +3053,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         }
 
     } break;
-    case DOM_viewport: { int32_t axis = 0; if (argc > 2) JS_ToInt32(ctx, &axis, argv[2]); result = JS_NewInt32(ctx, axis ? d->height : d->width);
+    case DOM_viewport: { int32_t axis = 0; if (argc > 2) JS_ToInt32(ctx, &axis, argv[2]); if(d->frame_parent)flush_layout(s);result = JS_NewInt32(ctx, axis ? d->height : d->width);
     } break;
     case DOM_focus: case DOM_blur: {
         node_t *old = d->focus;
@@ -3032,7 +3270,9 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         else if (before && before->parent != n) result = JS_ThrowTypeError(ctx, "NotFoundError");
         else {
             bool cycle = false; for (node_t *a = n; a; a = a->parent ? a->parent : a->shadow_host ? a->shadow_host : a->template_host) if (a == child) cycle = true;
-            result = cycle ? JS_ThrowTypeError(ctx, "HierarchyRequestError") : doc_node_move(d, n, child, before) ? JS_UNDEFINED : oom(ctx);
+            if(cycle)result=JS_ThrowTypeError(ctx,"HierarchyRequestError");
+            else if(!inserted_roots_capture(s,child,&inserted))result=JS_EXCEPTION;
+            else result=doc_node_move(d,n,child,before)?JS_UNDEFINED:oom(ctx);
         }
 
     } break;
@@ -3040,6 +3280,7 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         node_t *child=argc>2?unwrap(ctx,argv[2]):NULL,*old=argc>3?unwrap(ctx,argv[3]):NULL;
         if(!n || !child || !old)result=JS_ThrowTypeError(ctx,"Node arguments are required");
         else if(doc_node_replace_validity(n,child,old))result=JS_ThrowTypeError(ctx,"Invalid native replacement");
+        else if(!inserted_roots_capture(s,child,&inserted))result=JS_EXCEPTION;
         else result=doc_node_replace(d,n,child,old)?JS_UNDEFINED:oom(ctx);
 
     } break;
@@ -3143,11 +3384,9 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         /* Share the actual fragment walk with getClientRects. The GUI hit
            rectangle has integer coordinates; CSSOM snapshots must not lose
            subpixels or include a layout-only inline wrapper. */
-        struct client_rect_output out={.ctx=ctx,.list=JS_UNDEFINED};
-        if(visible && !collect_client_rects(&out,n,sx,sy)){result=JS_EXCEPTION;break;}
-        const double *r=out.area_seen?out.bounds:out.first;
-        double left=out.first_seen?r[0]:0,top=out.first_seen?r[1]:0;
-        double w=out.first_seen?r[2]-r[0]:0,h=out.first_seen?r[3]-r[1]:0;
+        double r[4]={0};bool present=false;
+        if(visible && !client_bounding_rect(ctx,n,sx,sy,r,&present)){result=JS_EXCEPTION;break;}
+        double left=r[0],top=r[1],w=r[2],h=r[3];
         result = JS_NewObject(ctx);
         JS_SetPropertyStr(ctx, result, "x", JS_NewFloat64(ctx, left)); JS_SetPropertyStr(ctx, result, "y", JS_NewFloat64(ctx, top));
         JS_SetPropertyStr(ctx, result, "left", JS_NewFloat64(ctx, left)); JS_SetPropertyStr(ctx, result, "top", JS_NewFloat64(ctx, top));
@@ -3207,7 +3446,11 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
     } break;
     case DOM_style: case DOM_stylePriority: {result = style_access(s, n, p, argc > 3, argc > 3 ? argv[3] : JS_UNDEFINED, argc > 4 ? argv[4] : JS_UNDEFINED, opcode == DOM_stylePriority);
     } break;
-    case DOM_computed: {result = computed(s, n, p);
+    case DOM_computed: {
+        const char *pseudo=argc>3&&!JS_IsNull(argv[3])&&!JS_IsUndefined(argv[3])?JS_ToCString(ctx,argv[3]):NULL;
+        if(argc>3&&!JS_IsNull(argv[3])&&!JS_IsUndefined(argv[3])&&!pseudo)result=JS_EXCEPTION;
+        else result=computed(s,n,p,computed_pseudo(pseudo));
+        JS_FreeCString(ctx,pseudo);
     } break;
     case DOM_geometry: {result = geometry(s, n, p);
     } break;
@@ -3233,11 +3476,8 @@ mutation_after(s,&observed,!JS_IsException(result));
     }
     JS_FreeValue(ctx, ce_token);
     if (!JS_IsException(result) && mutation) signal_slots(s);
-    if (!JS_IsException(result) && n && (opcode == DOM_insert || opcode == DOM_replace || opcode == DOM_replaceAll) && connected(s, n)) {
-        dynamic_scripts(s, n);
-        for (struct js_script *script = s->scripts; script; script = script->next)
-            if (script->dynamic && script->ready && !script->executed && !script->module && !node_attr(script->node, "src")) run_script(s, script);
-    }
+    if(!JS_IsException(result) && inserted.nodes && n)
+        dynamic_inserted(s,n,&inserted,insertion_generation);
     if (!JS_IsException(result) && n && n->tag == T_script && !n->script_started && connected(s, n) && (opcode == DOM_attr || opcode == DOM_set)) {
         struct js_script *script = queue_script(s, n, true);
         if (script && script->ready && !script->module && !node_attr(n, "src")) run_script(s, script);
@@ -3246,6 +3486,7 @@ mutation_after(s,&observed,!JS_IsException(result));
         struct js_script *script = queue_script(s, attribute_target, true);
         if (script && script->ready && !script->module && !node_attr(attribute_target, "src")) run_script(s, script);
     }
+    inserted_roots_release(s,&inserted);
     free(created_attribute_name);
     JS_FreeCString(ctx, p); return result;
 }
@@ -3258,11 +3499,32 @@ static JSValue native_dom_magic(JSContext *ctx, JSValueConst this_val, int argc,
     for(int i=0;i<argc;i++)args[i+1]=argv[i];
     bool profiling=s->host.debug_js;
     bool outer=profiling && s->profile_dom_depth++==0;
-    uint64_t start=outer?uptime_ms():0;
-    if(profiling)s->doc->profile.native_calls++;
+    /* Diagnostic timing must not add two potentially kernel-backed clock
+       reads to every property access. Randomized 1/64 outer-call sampling
+       avoids aliasing a page's repeating getter pattern; invocation counts
+       remain exact. This estimates inclusive native time, not a precise sum. */
+    bool sample=false;
+    if(outer) {
+        uint32_t random=s->profile_dom_sampling?s->profile_dom_sampling:0x9e3779b9u;
+        random^=random<<13;random^=random>>17;random^=random<<5;
+        s->profile_dom_sampling=random;sample=(random&63u)==0;
+    }
+    uint64_t start=sample?uptime_ms():0;
+    if(profiling){s->doc->profile.native_calls++;s->profile_dom_ops[opcode].calls++;}
+    s->doc->native_input_depth++;
     JSValue result=native_dom_impl(ctx,this_val,argc+1,args,opcode);
+    s->doc->native_input_depth--;
     if(profiling)s->profile_dom_depth--;
-    if(outer)s->doc->profile.native_ms+=uptime_ms()-start;
+    if(sample) {
+        uint64_t end=uptime_ms(),elapsed=end>=start?end-start:0;
+        uint64_t estimate=elapsed>UINT64_MAX/64?UINT64_MAX:elapsed*64;
+        uint64_t previous=s->doc->profile.native_ms;
+        s->doc->profile.native_ms=estimate>UINT64_MAX-previous?UINT64_MAX:previous+estimate;
+        s->doc->profile.native_samples++;
+        previous=s->profile_dom_ops[opcode].ms;
+        s->profile_dom_ops[opcode].ms=estimate>UINT64_MAX-previous?UINT64_MAX:previous+estimate;
+        s->profile_dom_ops[opcode].samples++;
+    }
     if(args!=local)js_free(ctx,args);
     return result;
 }
@@ -3274,6 +3536,46 @@ static JSValue native_dom(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     int opcode=dom_opcode(name);JS_FreeCString(ctx,name);
     if(opcode<0)return JS_ThrowTypeError(ctx,"Unknown DOM operation");
     return native_dom_magic(ctx,this_val,argc-1,argv+1,opcode);
+}
+
+/* Listener registration mirrors only cancellation eligibility. It never
+   retains a callback, runs one, or changes the actual EventTarget list. */
+static JSValue native_input_listener(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
+    (void)this_val;
+    struct web_js_state *s=state(ctx);int32_t delta=0;
+    if(argc<2 || JS_ToInt32(ctx,&delta,argv[1])<0)return JS_EXCEPTION;
+    if(delta!=1 && delta!=-1 && delta!=0)return JS_ThrowTypeError(ctx,"Invalid input listener change");
+    uint64_t *count=&s->doc->wheel_window_blocking;
+    struct js_node_ref *ref=NULL;
+    if(!JS_IsNull(argv[0])) {
+        ref=JS_GetOpaque2(ctx,argv[0],node_class);
+        if(!ref)return JS_EXCEPTION;
+        count=&ref->node->wheel_blocking;
+    }
+    if(!delta) {
+        if(!ref)return JS_TRUE; /* the actual realm Window */
+        node_t *n=ref->node;web_doc *owner=n->owner;
+        if(!owner)return JS_FALSE;
+        if(n==owner->root)return JS_TRUE;
+        if(n->type!=N_ELEM || n->foreign || (n->tag!=T_html && n->tag!=T_body && n->tag!=T_frameset))return JS_FALSE;
+        doc_sync_tree(owner);
+        return JS_NewBool(ctx,n==owner->html || n==owner->body);
+    }
+    if(delta>0) {
+        /* Each entry requires real memory, so reaching the integer capacity
+           cannot be a legitimate page rejected by a small browser quota. */
+        if(*count==UINT64_MAX || (ref && ref->wheel_blocking==UINT64_MAX))
+            return JS_ThrowOutOfMemory(ctx);
+        ++*count;if(ref)++ref->wheel_blocking;
+    }else if(!ref || ref->wheel_blocking) {
+        if(*count)--*count;
+        if(ref)--ref->wheel_blocking;
+    }
+    return JS_UNDEFINED;
+}
+
+uint64_t web_js_input_stream(web_doc *d) {
+    return d && d->js ? d->js->stream_generation : 0;
 }
 
 static enum http_url_result make_origin(const char *url, char **out) {
@@ -3663,6 +3965,7 @@ static JSValue native_media(JSContext *ctx, JSValueConst this_val, int argc, JSV
     if (serialize && len > (SIZE_MAX - 16) / 9) { JS_FreeCString(ctx, query); return JS_ThrowRangeError(ctx, "Media query serialization length is not representable"); }
     size_t cap = serialize ? len * 9 + 16 : 0; char *text = serialize ? js_malloc(ctx, cap) : NULL;
     if (serialize && !text) { JS_FreeCString(ctx, query); return JS_EXCEPTION; }
+    if(s->doc->frame_parent)flush_layout(s);
     bool matches = css_media_evaluate(query, s->doc->width, s->doc->height, web_js_enabled(s->doc), text, cap);
     JS_FreeCString(ctx, query);
     if (!serialize) return JS_NewBool(ctx, matches);
@@ -4571,6 +4874,44 @@ static JSValue native_css_supports(JSContext *ctx, JSValueConst this_val, int ar
     JS_FreeCString(ctx, a); if (b) JS_FreeCString(ctx, b);
     return JS_NewBool(ctx, result);
 }
+static JSValue native_css_properties(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
+    (void)this_val;JSValue result=JS_NewArray(ctx);if(JS_IsException(result))return result;
+    if(argc) {
+        node_t *node=unwrap(ctx,argv[0]);
+        if(!node||node->type!=N_ELEM){JS_FreeValue(ctx,result);return JS_ThrowTypeError(ctx,"Computed style requires an element");}
+        struct web_js_state *owner=node->owner?geometry_owner(state(ctx),node->owner):NULL;
+        if(!owner||!connected(owner,node)){JS_FreeValue(ctx,result);return JS_NULL;}
+        if(owner->doc->resources_dirty)doc_rescan(owner->doc);flush_layout(owner);
+        const char *pseudo=argc>1&&!JS_IsNull(argv[1])&&!JS_IsUndefined(argv[1])?JS_ToCString(ctx,argv[1]):NULL;
+        if(argc>1&&!JS_IsNull(argv[1])&&!JS_IsUndefined(argv[1])&&!pseudo){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
+        style_t fallback;style_t *style=computed_pseudo_style(node,computed_pseudo(pseudo),&fallback);
+        JS_FreeCString(ctx,pseudo);
+        if(!style){JS_FreeValue(ctx,result);return JS_NULL;}
+        uint32_t index=0;unsigned work=0;
+        for(const struct custom_prop *p=style->vars;p;p=p->next) {
+            if(!(work++&63)&&!web_native_checkpoint(owner->doc)){JS_FreeValue(ctx,result);return JS_ThrowInternalError(ctx,"Computed style enumeration interrupted");}
+            if(index==UINT32_MAX){JS_FreeValue(ctx,result);return JS_ThrowRangeError(ctx,"Computed CSS property index overflow");}
+            JSValue entry=JS_NewArray(ctx);
+            if(JS_IsException(entry)){JS_FreeValue(ctx,result);return entry;}
+            if(JS_SetPropertyUint32(ctx,entry,0,JS_NewString(ctx,p->name))<0||
+               JS_SetPropertyUint32(ctx,entry,1,JS_NewBool(ctx,p->value!=NULL))<0) {
+                JS_FreeValue(ctx,entry);JS_FreeValue(ctx,result);return JS_EXCEPTION;
+            }
+            if(JS_SetPropertyUint32(ctx,result,index++,entry)<0){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
+        }
+        return result;
+    }
+    for(int i=0;i<css_prop_count();i++) {
+        bool longhand;const char *name=css_prop_name(i,&longhand);JSValue entry=JS_NewArray(ctx);
+        if(JS_IsException(entry)){JS_FreeValue(ctx,result);return entry;}
+        if(JS_SetPropertyUint32(ctx,entry,0,JS_NewString(ctx,name))<0||
+           JS_SetPropertyUint32(ctx,entry,1,JS_NewBool(ctx,longhand))<0) {
+            JS_FreeValue(ctx,entry);JS_FreeValue(ctx,result);return JS_EXCEPTION;
+        }
+        if(JS_SetPropertyUint32(ctx,result,(uint32_t)i,entry)<0){JS_FreeValue(ctx,result);return JS_EXCEPTION;}
+    }
+    return result;
+}
 static JSValue native_clear(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     uint32_t id = 0; if (argc && JS_ToUint32(ctx, &id, argv[0])) return JS_EXCEPTION;
     struct web_js_state *s = state(ctx);
@@ -4610,14 +4951,14 @@ static void release_pending_request(struct web_js_state *s, struct js_pending *p
 static bool send_request(struct web_js_state *s, struct js_pending *p, int kind, const char *method,
                          const char *headers, const void *body, size_t len) {
     if(s->disabled){pending_error(p,"Browsing context is inactive");return false;}
-    if ((p->kind==P_SCRIPT || p->kind==P_FONT) && (!strncasecmp(p->url,"data:",5) || !strncasecmp(p->url,"blob:",5))) {
+    if ((p->kind==P_SCRIPT || p->kind==P_MODULE || p->kind==P_FONT || p->kind==P_CSS) && (!strncasecmp(p->url,"data:",5) || !strncasecmp(p->url,"blob:",5))) {
         char mime[128];
         p->response.body=!strncasecmp(p->url,"data:",5)
             ? script_data_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime)
             : script_blob_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime);
         if (!p->response.body) {
             if (JS_HasException(s->ctx)) exception(s);
-            pending_error(p,"Unavailable local script URL or invalid JavaScript MIME type"); return false;
+            pending_error(p,"Unavailable local resource URL or invalid MIME type"); return false;
         }
         p->response.status=200;
         /* No redirect occurred. The complete URL already belongs to the
@@ -4628,7 +4969,7 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
     }
     struct web_request r = {.id=p->id, .kind=kind, .url=p->url, .method=method, .headers=headers, .body=body, .body_len=len,
         .origin=p->origin?p->origin:web_effective_url(s->doc),
-        .credentials=(kind == WEB_RESOURCE_FETCH || kind == WEB_RESOURCE_REPORT) ? p->credentials : kind == WEB_RESOURCE_MODULE ? 1 : 2,
+        .credentials=(kind == WEB_RESOURCE_FETCH || kind == WEB_RESOURCE_REPORT || p->kind==P_MODULE) ? p->credentials : kind == WEB_RESOURCE_MODULE ? 1 : 2,
         .force_preflight=p->force_preflight, .redirect_error=p->redirect_error, .same_origin=p->same_origin,
         .no_cors=p->no_cors, .no_referrer=p->no_referrer,
         .cache_mode=p->cache_mode, .keepalive=p->keepalive, .fetch_group=p->keepalive?s->fetch_group:0,
@@ -5158,12 +5499,86 @@ static void set_import_meta(JSContext *ctx, JSValueConst module, const char *url
     JS_FreeValue(ctx, meta);
 }
 static struct js_module *cache_module(struct web_js_state *s, const char *url, const char *source, size_t len, const char *base) {
-    for (struct js_module *m = s->modules; m; m = m->next) if (!strcmp(m->url, url)) return m;
+    for (struct js_module *m = s->modules; m; m = m->next) if (!m->fetch_failed&&!strcmp(m->url, url)) return m;
     struct js_module *m = js_mallocz(s->ctx, sizeof *m); if (!m) return NULL;
     m->compiled = m->error = JS_UNDEFINED;
     m->url = js_strdup(s->ctx, url); m->base = js_strdup(s->ctx, base ? base : url); m->source = js_strndup(s->ctx, source ? source : "", len);
     if (!m->url || !m->base || !m->source) { js_free(s->ctx, m->url); js_free(s->ctx, m->base); js_free(s->ctx, m->source); js_free(s->ctx, m); return NULL; }
     m->len = len; m->next = s->modules; s->modules = m; return m;
+}
+static struct js_module *find_module(struct web_js_state *s,const char *url) {
+    /* A network/SRI failure is not stored in HTML's module map. Keep its
+       retired record for current waiters, but allow a later import to retry. */
+    for(struct js_module *m=s->modules;m;m=m->next)if(!m->fetch_failed&&!strcmp(m->url,url))return m;
+    return NULL;
+}
+static void release_module_user(struct web_js_state *s,struct js_module *m) {
+    if(!m)return;
+    if(m->users)m->users--;
+    if(!m->fetch_failed||m->users)return;
+    struct js_module **link=&s->modules;while(*link&&*link!=m)link=&(*link)->next;
+    if(!*link)return;
+    *link=m->next;JS_FreeValue(s->ctx,m->compiled);JS_FreeValue(s->ctx,m->error);
+    js_free(s->ctx,m->url);js_free(s->ctx,m->base);js_free(s->ctx,m->source);js_free(s->ctx,m);
+}
+static bool module_integrity(struct web_js_state *s,const char *metadata,const char *bytes,size_t length) {
+    if(!metadata || !*metadata)return true;
+    JSValue args[]={JS_NewArrayBufferCopy(s->ctx,(const uint8_t *)bytes,length),JS_NewString(s->ctx,metadata)};
+    JSValue value=JS_IsException(args[0])||JS_IsException(args[1])?JS_EXCEPTION:
+        custom_element_hook(s,"moduleIntegrity",2,args);
+    bool ok=!JS_IsException(value)&&JS_ToBool(s->ctx,value)>0;
+    for(unsigned i=0;i<2;i++)JS_FreeValue(s->ctx,args[i]);
+    if(JS_IsException(value))exception(s);
+    JS_FreeValue(s->ctx,value);return ok;
+}
+/* Publish fetched bytes once. A native-only join can call this while p is
+   still on s->pending; ordinary completion later only queues element tasks. */
+static void module_received(struct web_js_state *s,struct js_pending *p) {
+    struct js_module *m=p->module;
+    if(!m || !m->fetching || !p->done)return;
+    bool ok=!p->response.error[0] && p->response.status>=200 && p->response.status<300 &&
+        (!p->response.body_len||p->response.body) &&
+        (!strncasecmp(p->url,"file://",7)||javascript_mime(web_response_headers(&p->response))) &&
+        (!web_response_url(&p->response)[0]||permitted_url(s,web_response_url(&p->response),false));
+    if(ok)ok=module_integrity(s,p->integrity,p->response.body,p->response.body_len);
+    if(ok) {
+        char *base=web_response_url(&p->response)[0]?module_url(s,"moduleURL",web_response_url(&p->response),p->url):js_strdup(s->ctx,p->url);
+        if(!base)ok=false;
+        else {
+            js_free(s->ctx,m->base);m->base=base;
+            js_free(s->ctx,m->source);m->source=p->response.body;p->response.body=NULL;m->len=p->response.body_len;
+            /* COMPILE_ONLY parses the root but neither resolves imports nor
+               evaluates it. Link load does not wait for optional dependencies. */
+            JSValue compiled=compile_source(s,m->source?m->source:"",m->len,m->url,
+                JS_EVAL_TYPE_MODULE|JS_EVAL_FLAG_MODULE_PARSE_ONLY);
+            if(JS_IsException(compiled))m->error=JS_GetException(s->ctx);
+            else {set_import_meta(s->ctx,compiled,m->base);m->compiled=compiled;}
+        }
+    }
+    m->fetching=false;m->fetch_failed=!ok;
+    if(!ok && !p->response.error[0])diagnostic_resource(s,p,"module response rejected (MIME, URL or integrity)");
+}
+static struct js_module *request_module(struct web_js_state *s,const char *url,int credentials,const char *integrity) {
+    struct js_module *m=find_module(s,url);if(m)return m;
+    m=cache_module(s,url,"",0,url);if(!m)return NULL;
+    struct js_pending *p=pending_new(s,P_MODULE,url);
+    if(!p){m->fetch_failed=true;return m;}
+    p->module=m;m->users++;p->credentials=credentials;
+    p->integrity=integrity&&*integrity?js_strdup(s->ctx,integrity):NULL;
+    m->request=p->id;m->fetching=true;
+    if(integrity&&*integrity&&!p->integrity)pending_error(p,"Module integrity metadata allocation failed");
+    else send_request(s,p,WEB_RESOURCE_MODULE,"GET",NULL,NULL,0);
+    return m;
+}
+static bool module_script_source(struct web_js_state *s,struct js_script *script,struct js_module *m) {
+    if(!m || m->fetching)return false;
+    script->ready=true;script->failed=m->fetch_failed;
+    if(!script->failed){
+        script->source=js_strndup(s->ctx,m->source?m->source:"",m->len);script->len=m->len;
+        js_free(s->ctx,script->base);script->base=js_strdup(s->ctx,m->base);
+        if(!script->source||!script->base)script->failed=true;
+    }
+    return true;
 }
 /* A native-only host wait cannot enter author JS or free these arenas. Still
    revalidate the actual child/ancestor navigables before publishing its bytes:
@@ -5187,7 +5602,25 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
     if (interrupt(s->rt, s)) { JS_ThrowInternalError(ctx, "JavaScript execution was stopped"); return NULL; }
     if (!permitted_script_url(s, url)) { JS_ThrowReferenceError(ctx, "Module URL is not permitted"); return NULL; }
     struct js_module *m = NULL;
-    for (m = s->modules; m; m = m->next) if (!strcmp(m->url, url)) break;
+    m=find_module(s,url);
+    if(m && m->fetching){
+        struct js_pending *pending=NULL;
+        for(struct js_pending *p=s->pending;p;p=p->next)if(p->kind==P_MODULE&&p->module==m){pending=p;break;}
+        /* p remains owned by this realm until the author task unwinds. The
+           wait callback must not enter web_tick/process_pending or retire it. */
+        uint64_t before=uptime_ms();
+        bool joined=pending&&(pending->done || (s->host.wait_request &&
+            s->host.wait_request(s->host.opaque,pending->id,&pending->done)));
+        uint64_t waited=uptime_ms()-before;
+        for(struct web_js_state *active=s;active;active=active->runtime_previous)
+            if(active->running){active->task_deadline+=waited;active->task_native_wait_ms+=waited;}
+        if(s->compiling)s->compile_wait_ms+=waited;
+        if(!joined || !module_context_current(s,document_root)){
+            JS_ThrowTypeError(ctx,"Pending module fetch could not be joined in its browsing context");return NULL;
+        }
+        module_received(s,pending);
+    }
+    if(m && m->fetch_failed){JS_ThrowReferenceError(ctx,"Module fetch failed: %s",url);return NULL;}
     if (!m && (!strncasecmp(url,"data:",5) || !strncasecmp(url,"blob:",5))) {
         size_t length; char mime[128];
         char *source=!strncasecmp(url,"data:",5)
@@ -5250,6 +5683,16 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
             m->error = JS_GetException(ctx); JS_Throw(ctx, JS_DupValue(ctx, m->error)); return NULL;
         }
         set_import_meta(ctx, compiled, m->base); m->compiled = compiled;
+        m->linked=true; /* ordinary COMPILE_ONLY already resolves imports */
+    }
+    if(!m->linked&&!m->resolving){
+        /* Retain every parsed module as a GC-visible JSValue before resolving
+           the graph. A cycle can return this in-progress module to its loader. */
+        m->resolving=true;
+        int linked=JS_ResolveModule(ctx,m->compiled);
+        m->resolving=false;
+        if(linked<0){m->error=JS_GetException(ctx);JS_Throw(ctx,JS_DupValue(ctx,m->error));return NULL;}
+        m->linked=true;
     }
     return JS_VALUE_GET_PTR(m->compiled);
 }
@@ -5373,9 +5816,16 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
                 snprintf(message,sizeof message,"Script URL warning: dynamic src already contains literal 'undefined' before URL resolution; author src=%s; resolved=%s (URL left unchanged)",author,resolved);
                 log_text(s,1,message);
             }
-            struct js_pending *p = pending_new(s, P_SCRIPT, script->url);
-            if (!p) script->ready = script->failed = true;
-            else { p->script = script; script->request = p->id; send_request(s, p, module ? WEB_RESOURCE_MODULE : WEB_RESOURCE_SCRIPT, "GET", NULL, NULL, 0); }
+            if(module){
+                const char *cors=node_attr(n,"crossorigin");
+                struct js_module *m=request_module(s,script->url,cors&&str_ieq(cors,"use-credentials")?2:1,node_attr(n,"integrity"));
+                if(!m)script->ready=script->failed=true;
+                else {script->request=m->request;module_script_source(s,script,m);}
+            }else{
+                struct js_pending *p = pending_new(s, P_SCRIPT, script->url);
+                if (!p) script->ready = script->failed = true;
+                else { p->script = script; script->request = p->id; send_request(s, p, WEB_RESOURCE_SCRIPT, "GET", NULL, NULL, 0); }
+            }
         }
     } else {
         size_t capacity = strlen(s->doc->url) + 64;
@@ -5396,7 +5846,7 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
         script->ready = true; if (!script->source) script->failed = true;
     }
     if (module && script->url && !script->failed) {
-        begin_task(s); script->base = module_url(s, "moduleURL", src && *src ? script->url : s->doc->base, s->doc->base);
+        begin_task(s); if(!script->base)script->base = module_url(s, "moduleURL", src && *src ? script->url : s->doc->base, s->doc->base);
         if (!script->base) { script->ready = script->failed = true; exception(s); }
         end_task(s);
     }
@@ -5412,9 +5862,122 @@ static struct js_script *queue_script(struct web_js_state *s, node_t *n, bool dy
     s->last_script = script; s->script_count++;
     return script;
 }
-static void dynamic_scripts_walk(struct web_js_state *s, node_t *n, uint64_t generation) {
-    if(s->stream_generation!=generation || s->disabled)return;
-    if(n->type==N_ELEM && !n->foreign && n->tag==T_meta && !n->html_policy_processed && connected(s,n)){
+static bool modulepreload_relation(node_t *node) {
+    const char *rel=node_attr(node,"rel");
+    while(rel&&*rel){
+        while(is_space((unsigned char)*rel))rel++;
+        const char *end=rel;while(*end&&!is_space((unsigned char)*end))end++;
+        if(end-rel==13&&strn_ieq(rel,"modulepreload",13))return true;
+        rel=end;
+    }
+    return false;
+}
+static void queue_modulepreload(struct web_js_state *s,node_t *node) {
+    const char *href=node_attr(node,"href");if(!href||!*href||!modulepreload_relation(node))return;
+    size_t bucket=((uintptr_t)node>>4)&255;
+    struct js_preload *link=s->preloads[bucket];
+    for(;link&&link->node!=node;link=link->next){}
+    if(!link){
+        link=js_mallocz(s->ctx,sizeof *link);if(!link)return;
+        link->node=node;link->next=s->preloads[bucket];s->preloads[bucket]=link;
+    }
+    link->seen=true;
+    link->resource_revision=node->resource_revision;
+    if(link->connected&&link->stream_generation==s->stream_generation&&link->href&&!strcmp(link->href,href))return;
+    char *saved=js_strdup(s->ctx,href);if(!saved)return;
+    js_free(s->ctx,link->href);link->href=saved;link->stream_generation=s->stream_generation;
+    link->connected=true;link->notified=false;
+    release_module_user(s,link->module);link->module=NULL;
+    const char *as=node_attr(node,"as");
+    /* This module engine implements JavaScript modules, not import-attribute
+       JSON/CSS/text modules. Do not advertise or fabricate those destinations. */
+    bool recognized_as=false;
+    const char *const destinations[]={"audio","audioworklet","document","embed","fetch","font","frame","iframe","image","manifest","object","paintworklet","report","script","serviceworker","sharedworker","track","video","worker","xslt","json","style","text"};
+    for(unsigned i=0;as&&i<sizeof destinations/sizeof destinations[0];i++)if(str_ieq(as,destinations[i])){recognized_as=true;break;}
+    if(recognized_as&&!str_ieq(as,"script")){
+        script_event(s,node,true);link->notified=true;return;
+    }
+    char *url=module_url(s,"moduleURL",href,s->doc->base);
+    if(!url){if(JS_HasException(s->ctx))exception(s);link->notified=true;return;}
+    const char *cors=node_attr(node,"crossorigin");
+    link->module=request_module(s,url,cors&&str_ieq(cors,"use-credentials")?2:1,node_attr(node,"integrity"));
+    if(link->module)link->module->users++;
+    js_free(s->ctx,url);
+    if(!link->module){script_event(s,node,true);link->notified=true;}
+}
+static node_t *modulepreload_next(node_t *n,node_t *root) {
+    if(n->type!=N_ELEM||n->foreign||n->tag!=T_template){
+        if(n->first)return n->first;
+        if(n->shadow_root)return n->shadow_root;
+    }
+    while(n!=root){
+        if(n->parent){
+            if(n->next)return n->next;
+            node_t *parent=n->parent;
+            if(parent->shadow_root)return parent->shadow_root;
+            n=parent;
+        }else if(n->shadow_host)n=n->shadow_host;
+        else return NULL;
+    }
+    return NULL;
+}
+static void modulepreloads(struct web_js_state *s) {
+    if(s->disabled||s->doc->sandbox_flags&SB_SCRIPTS)return;
+    uint64_t generation=s->stream_generation;
+    if(!s->preload_scan_valid){
+        for(unsigned i=0;i<256;i++)for(struct js_preload *p=s->preloads[i];p;p=p->next)p->seen=false;
+        node_t *root=s->doc->root;size_t visits=0;
+        for(node_t *n=root;n;n=modulepreload_next(n,root)){
+            if(!(visits++&63)&&!web_native_checkpoint(s->doc))return;
+            if(n->type==N_ELEM&&!n->foreign&&n->tag==T_link)queue_modulepreload(s,n);
+            if(s->stream_generation!=generation||s->disabled)return;
+        }
+        for(unsigned i=0;i<256;i++)for(struct js_preload *p=s->preloads[i];p;p=p->next)if(!p->seen)p->connected=false;
+        s->preload_scan_valid=true;
+    }
+    /* Ordinary style/text/control edits cannot create modulepreload links.
+       Structural native changes invalidate the index; known link attribute
+       changes use its exact resource revision, not a whole-DOM per-rAF walk. */
+    for(unsigned i=0;i<256;i++)for(struct js_preload *p=s->preloads[i];p;p=p->next)
+        if(p->connected&&p->resource_revision!=p->node->resource_revision){
+            if(!modulepreload_relation(p->node)||!node_attr(p->node,"href")||!*node_attr(p->node,"href"))p->connected=false;
+            else queue_modulepreload(s,p->node);
+        }
+    /* Modulepreload never delays document load. Its own load/error task runs
+       after root fetch/parse, before any optional graph resolution. */
+    for(unsigned i=0;i<256;i++)for(struct js_preload *p=s->preloads[i];p;p=p->next)
+        if(!p->notified&&p->stream_generation==s->stream_generation&&p->node->owner==s->doc&&p->module&&!p->module->fetching){
+            if(script_event(s,p->node,p->module->fetch_failed)){
+                p->notified=true;release_module_user(s,p->module);p->module=NULL;
+            }
+        }
+}
+static void free_modulepreloads(struct web_js_state *s) {
+    for(unsigned i=0;i<256;i++)while(s->preloads[i]){
+        struct js_preload *p=s->preloads[i];s->preloads[i]=p->next;
+        release_module_user(s,p->module);js_free(s->ctx,p->href);js_free(s->ctx,p);
+    }
+    s->preload_scan_valid=false;
+}
+void web_js_link_changed(web_doc *d) {
+    if(d&&d->js)d->js->preload_scan_valid=false;
+}
+void web_js_window_names_changed(web_doc *d) {
+    if(d && d->js)d->js->window_named_revision++;
+}
+static void dynamic_prepare_node(struct web_js_state *s,node_t *n,uint64_t generation,bool synchronous) {
+    if(s->stream_generation!=generation || s->disabled || !connected(s,n))return;
+    if(n->type==N_ELEM && n->tag==T_script && !n->script_started){
+        struct js_script *script=queue_script(s,n,true);
+        /* A classic inline script's post-connection step executes before the
+           next candidate's preparation. Reentry gets its own static list;
+           unrelated prepared siblings are not run by that nested insertion. */
+        if(synchronous && script && s->stream_generation==generation && !s->disabled &&
+           script->ready && !script->executed && !script->module && !script->external)
+            run_script(s,script);
+        return;
+    }
+    if(n->type==N_ELEM && !n->foreign && n->tag==T_meta && !n->html_policy_processed){
         web_doc *owner=n->owner;
         if(owner->resources_dirty)doc_sync_tree(owner);
         if(node_ancestor(n,T_head)==owner->head){
@@ -5425,25 +5988,27 @@ static void dynamic_scripts_walk(struct web_js_state *s, node_t *n, uint64_t gen
             }
         }
     }
-    if(web_frame_element(n) && connected(s,n))frame_sync(s,n);
-    if(s->stream_generation!=generation || s->disabled)return;
-    if (n->shadow_root) dynamic_scripts_walk(s, n->shadow_root, generation);
-    for (node_t *c = n->first; c; c = c->next) {
-        if(s->stream_generation!=generation || s->disabled)return;
-        if(s->host.debug_js)s->doc->profile.script_visits++;
-        if (c->type != N_ELEM || c->tag == T_template) continue;
-        /* This scan runs after insertion. A preparation policy may detach a
-           following sibling or replace the stream; neither makes that old
-           sibling an eligible script in the new Document input stream. */
-        if (c->tag == T_script && !c->script_started && connected(s,c)) queue_script(s, c, true);
-        if(s->stream_generation!=generation || s->disabled)return;
-        dynamic_scripts_walk(s, c, generation);
-    }
+    if(s->stream_generation==generation && !s->disabled && web_frame_element(n))frame_sync(s,n);
+}
+static void dynamic_inserted(struct web_js_state *s,node_t *parent,
+    struct js_inserted_roots *inserted,uint64_t generation) {
+    if(!inserted->changed || s->stream_generation!=generation || s->disabled || !connected(s,parent))return;
+    /* Appending/replacing child text in a connected script is also its
+       children-changed preparation boundary, even if no Element was inserted. */
+    if(parent->type==N_ELEM && parent->tag==T_script)
+        dynamic_prepare_node(s,parent,generation,true);
+    for(size_t i=0;i<inserted->count && s->stream_generation==generation && !s->disabled;i++)
+        dynamic_prepare_node(s,inserted->nodes[i],generation,true);
 }
 static void dynamic_scripts(struct web_js_state *s, node_t *n) {
     uint64_t start = s->host.debug_js?uptime_ms():0;
-    if(s->host.debug_js)s->doc->profile.script_scans++;
-    dynamic_scripts_walk(s, n, s->stream_generation);
+    uint64_t generation=s->stream_generation;
+    struct js_inserted_roots candidates={0};
+    if(inserted_roots_capture(s,n,&candidates)){
+        for(size_t i=0;i<candidates.count && s->stream_generation==generation && !s->disabled;i++)
+            dynamic_prepare_node(s,candidates.nodes[i],generation,false);
+    }else exception(s);
+    inserted_roots_release(s,&candidates);
     if(s->host.debug_js)s->doc->profile.script_ms += uptime_ms() - start;
 }
 static struct js_resource_event *script_event(struct web_js_state *s, node_t *n, bool failed) {
@@ -5537,17 +6102,19 @@ static void run_script(struct web_js_state *s, struct js_script *script) {
     js_free(s->ctx, script->source); script->source = NULL;
 }
 static void pending_free(struct web_js_state *s, struct js_pending *p) {
+    if(p->kind==P_CSS&&p->css&&p->css->loading_id==p->id)p->css->loading_id=0;
     if(p->kind==P_FONT && p->font)p->font->loading=false;
     if(p->kind==P_IMAGE && p->image>=0 && p->image<s->doc->images.n){
         struct web_image *image=s->doc->images.v[p->image];
         if(image->loading_id==p->id)image->loading_id=0;
     }
     JS_FreeValue(s->ctx, p->resolve); JS_FreeValue(s->ctx, p->reject); JS_FreeValue(s->ctx, p->stream_callback);
-    js_free(s->ctx, p->url);js_free(s->ctx,p->origin); js_free(s->ctx, p->response.body); js_free(s->ctx, p->response.headers_full); js_free(s->ctx,p->response.url_full);
+    release_module_user(s,p->module);
+    js_free(s->ctx, p->url);js_free(s->ctx,p->origin);js_free(s->ctx,p->integrity); js_free(s->ctx, p->response.body); js_free(s->ctx, p->response.headers_full); js_free(s->ctx,p->response.url_full);
     js_free(s->ctx, p); s->pending_count--;
 }
 static bool document_resource_kind(int kind) {
-    return kind==P_SCRIPT || kind==P_CSS || kind==P_IMAGE || kind==P_FRAME || kind==P_FONT;
+    return kind==P_SCRIPT || kind==P_MODULE || kind==P_CSS || kind==P_IMAGE || kind==P_FRAME || kind==P_FONT;
 }
 bool web_js_native_recover(web_doc *d) {
     struct web_js_state *s=d?d->js:NULL;
@@ -5574,8 +6141,9 @@ bool web_js_native_recover(web_doc *d) {
     }
     for(struct js_script *script=s->scripts;script;script=script->next)
         script->executed=script->parser_released=script->notified=true;
-    for(struct js_pending *p=s->pending;p;p=p->next)if(p->kind==P_SCRIPT){
+    for(struct js_pending *p=s->pending;p;p=p->next)if(p->kind==P_SCRIPT||p->kind==P_MODULE){
         if(!p->done)release_pending_request(s,p);
+        if(p->module){p->module->fetching=false;p->module->fetch_failed=true;}
         p->aborted=true;p->script=NULL;pending_error(p,"Author execution stopped");
     }
     /* Keep scripts disabled and the aborted parser retired. This is a new
@@ -5587,6 +6155,7 @@ bool web_js_native_recover(web_doc *d) {
 static void document_stream_reset(struct web_js_state *s) {
     if(!++s->stream_generation)++s->stream_generation;
     s->scripts_prune_needed=true;
+    s->dynamic_scan_valid=false;
     /* Keep the currently executing script's native record alive until its
        author stack returns. Old resource completions are retired before they
        can address the new stream's CSS/image/frame arrays. Fetch, timers and
@@ -5595,8 +6164,10 @@ static void document_stream_reset(struct web_js_state *s) {
         script->executed=script->parser_released=script->notified=true;
     for(struct js_pending *p=s->pending;p;p=p->next)if(document_resource_kind(p->kind)){
         if(!p->done)release_pending_request(s,p);
+        if(p->module){p->module->fetching=false;p->module->fetch_failed=true;}
         p->aborted=true;p->script=NULL;pending_error(p,"Document input stream replaced");
     }
+    free_modulepreloads(s);
     while(s->events){struct js_resource_event *event=s->events;s->events=event->next;js_free(s->ctx,event);}
     s->last_event=NULL;
 }
@@ -5616,9 +6187,11 @@ bool web_js_encoding_restart(web_doc *document){
     struct web_js_state *s=document?document->js:NULL;
     if(!s)return true;
     if(document->encoding_certain || s->current_script)return false;
+    s->dynamic_scan_valid=false;
+    free_modulepreloads(s);
     struct js_pending **link=&s->pending;
     while(*link){struct js_pending *p=*link;
-        if(p->kind!=P_SCRIPT){link=&p->next;continue;}
+        if(p->kind!=P_SCRIPT&&p->kind!=P_MODULE){link=&p->next;continue;}
         *link=p->next;release_pending_request(s,p);pending_free(s,p);
     }
     while(s->scripts){struct js_script *p=s->scripts;s->scripts=p->next;
@@ -5654,7 +6227,7 @@ void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *response)
                 pending_error(p, "Resource headers exceeded the JavaScript heap limit"); return;
             }
         }
-        size_t limit = p->kind == P_SCRIPT ? JS_SOURCE_LIMIT : JS_BODY_LIMIT;
+        size_t limit = p->kind == P_SCRIPT || p->kind==P_MODULE ? JS_SOURCE_LIMIT : JS_BODY_LIMIT;
         if (response->body_len > limit || (response->body_len && !response->body))
             pending_error(p, "Resource body is invalid or its length is not representable");
         else {
@@ -5713,10 +6286,11 @@ static void diagnostic_resource(struct web_js_state *s, struct js_pending *p, co
         }
         h=*end?end+1:end;
     }
-    static const char *const kinds[]={"script","fetch","stylesheet","image","worker","frame","font"};
+    static const char *const kinds[]={"script","fetch","stylesheet","image","worker","frame","font","policy-report","module"};
+    const char *kind=p->kind<sizeof kinds/sizeof *kinds?kinds[p->kind]:"unknown";
     uint64_t started=p->deadline>=WEBNET_TIMEOUT_MS?p->deadline-WEBNET_TIMEOUT_MS:0;
     snprintf(message,sizeof message,"Resource #%lu %s: HTTP %d, %lu bytes, MIME %s, elapsed %lu ms, %s; %s",
-        (unsigned long)p->id,kinds[p->kind],p->response.status,(unsigned long)p->response.body_len,mime,
+        (unsigned long)p->id,kind,p->response.status,(unsigned long)p->response.body_len,mime,
         (unsigned long)(uptime_ms()-started),reason,url);
     log_text(s,p->kind==P_SCRIPT?2:1,message);
 }
@@ -5814,6 +6388,15 @@ static bool process_pending(struct web_js_state *s) {
         if (!ok && (p->kind != P_FETCH || p->response.error[0] || p->response.status >= 400))
             diagnostic_resource(s,p,p->aborted?"aborted":p->response.error[0]?p->response.error:"unsuccessful HTTP response");
         if(p->kind==P_FRAME)frame_response(s,p,ok);
+        else if(p->kind==P_MODULE){
+            begin_named_task(s,"module preload preparation",p->id);
+            module_received(s,p);
+            for(struct js_script *script=s->scripts;script;script=script->next)
+                if(script->module&&!script->ready&&script->request==p->id&&script->stream_generation==s->stream_generation){
+                    module_script_source(s,script,p->module);prepare_module_script(s,script);
+                }
+            end_task(s);
+        }
         else if (p->kind == P_SCRIPT) {
             struct js_script *script = p->script;
             if (script) {
@@ -5862,7 +6445,11 @@ static bool process_pending(struct web_js_state *s) {
             }
             web_worker_loaded(s->workers,p->worker,p->worker_request,p->response.status,final,
                 web_response_headers(&p->response),p->response.body,p->response.body_len,p->response.error);
-        } else if (p->kind == P_CSS) doc_css_loaded(s->doc, p->url, web_response_url(&p->response)[0] ? web_response_url(&p->response) : p->url, ok ? p->response.body : NULL, ok ? p->response.body_len : 0);
+        } else if (p->kind == P_CSS) {
+            if(p->css&&p->css->loading_id==p->id)
+                doc_css_loaded(s->doc,p->url,web_response_url(&p->response)[0]?web_response_url(&p->response):p->url,
+                               ok?p->response.body:NULL,ok?p->response.body_len:0);
+        }
         else if(p->kind==P_FONT) {
             doc_font_loaded(s->doc,p->font,ok?p->response.body:NULL,ok?p->response.body_len:0);
             if(ok && p->font && p->font->failed)diagnostic_resource(s,p,"Font decode failed: malformed or unsupported outline container, or native allocation failure");
@@ -5919,10 +6506,9 @@ static bool pending_kind(struct web_js_state *s, int kind) {
 }
 static bool dispatch_resource_event(struct web_js_state *s) {
     struct js_resource_event **link = &s->events, *previous = NULL;
-    /* Import fetches must finish before a stylesheet completes. Unrelated
-       script/image events are not stalled behind that stylesheet task. */
-    bool css_busy = pending_kind(s,P_CSS) || web_pending_stylesheet(s->doc);
-    while (*link && (*link)->stylesheet && css_busy) { previous = *link; link = &(*link)->next; }
+    /* The document import walk queues a stylesheet event only after that
+       root's critical imports settle. Never join unrelated CSS downloads:
+       a load listener may itself supply another root's required chunk. */
     struct js_resource_event *e = *link;
     if (!e) return false;
     *link = e->next; if (s->last_event == e) s->last_event = previous;
@@ -5988,14 +6574,23 @@ static bool dispatch_image_decode(struct web_js_state *s) {
 static void request_styles(struct web_js_state *s) {
     if (!s->ctx) return;
     if (s->doc->resources_dirty) doc_rescan(s->doc);
-    const char *url = web_pending_stylesheet(s->doc);
-    if (!url || pending_kind(s, P_CSS)) return;
-    struct js_pending *p = pending_new(s, P_CSS, url);
-    if (!p) {
-        JSValue e=JS_GetException(s->ctx);JS_FreeValue(s->ctx,e);doc_css_loaded(s->doc,url,url,NULL,0);
-        return;
+    size_t cursor=0;uint64_t generation=s->stream_generation;
+    struct cached_css *css;
+    while((css=doc_css_request_next(s->doc,&cursor))) {
+        if((cursor&31)==0&&!web_native_checkpoint(s->doc))return;
+        struct js_pending *p=pending_new(s,P_CSS,css->url);
+        if(!p) {
+            JSValue error=JS_GetException(s->ctx);JS_FreeValue(s->ctx,error);
+            doc_css_loaded(s->doc,css->url,css->url,NULL,0);
+            continue;
+        }
+        /* The cache record, unlike pending_css, survives every rescan. Claim
+           before dispatch (even a synchronous host completion) so neither a
+           duplicate link/import nor the next tick sends the same request. */
+        p->css=css;css->loading_id=p->id;
+        send_request(s,p,WEB_RESOURCE_CSS,"GET",NULL,NULL,0);
+        if(s->stream_generation!=generation)return;
     }
-    send_request(s, p, WEB_RESOURCE_CSS, "GET", NULL, NULL, 0);
 }
 static void request_fonts(struct web_js_state *s) {
     if(!s->ctx)return;
@@ -6093,12 +6688,13 @@ static bool run_timer_index(struct web_js_state *s, unsigned timer_index, uint64
         log_text(s, 0, message);
         const struct web_profile *p = &s->doc->profile;
         snprintf(message, sizeof message,
-                 "Timer native profile: calls %lu/%lu ms, inserts %lu, indices %lu visits/%lu ms, scripts %lu scans/%lu visits/%lu ms, resources %lu scans/%lu ms (times inclusive)",
+                 "Timer native profile: calls %lu/%lu ms, inserts %lu, indices %lu visits/%lu ms, scripts %lu scans/%lu visits/%lu ms, resources %lu scans/%lu ms (native time sampled estimate, ~1/64, %lu samples; other times inclusive)",
                  (unsigned long)(p->native_calls-before.native_calls), (unsigned long)(p->native_ms-before.native_ms),
                  (unsigned long)(p->inserts-before.inserts), (unsigned long)(p->index_visits-before.index_visits),
                  (unsigned long)(p->index_ms-before.index_ms), (unsigned long)(p->script_scans-before.script_scans),
                  (unsigned long)(p->script_visits-before.script_visits), (unsigned long)(p->script_ms-before.script_ms),
-                 (unsigned long)(p->rescans-before.rescans), (unsigned long)(p->rescan_ms-before.rescan_ms));
+                 (unsigned long)(p->rescans-before.rescans), (unsigned long)(p->rescan_ms-before.rescan_ms),
+                 (unsigned long)(p->native_samples-before.native_samples));
         log_text(s, 0, message);
         snprintf(message, sizeof message,
                  "Timer metadata profile: %lu syncs/%lu visits/%lu ms (inclusive)",
@@ -6136,12 +6732,13 @@ static bool run_posted_task(struct web_js_state *s) {
     if (s->host.debug_js&&(elapsed >= 250 || s->task_timed_out)) {
         char message[320];
         snprintf(message, sizeof message,
-                 "Posted task profile: total %lu ms, microtasks-inclusive %lu ms, native %lu calls/%lu ms, resources %lu scans/%lu ms",
+                 "Posted task profile: total %lu ms, microtasks-inclusive %lu ms, native %lu calls/%lu ms, resources %lu scans/%lu ms (native time sampled estimate, ~1/64, %lu samples)",
                  (unsigned long)elapsed, (unsigned long)s->task_microtask_ms,
                  (unsigned long)(s->doc->profile.native_calls-before.native_calls),
                  (unsigned long)(s->doc->profile.native_ms-before.native_ms),
                  (unsigned long)(s->doc->profile.rescans-before.rescans),
-                 (unsigned long)(s->doc->profile.rescan_ms-before.rescan_ms));
+                 (unsigned long)(s->doc->profile.rescan_ms-before.rescan_ms),
+                 (unsigned long)(s->doc->profile.native_samples-before.native_samples));
         log_text(s, 0, message);
         snprintf(message, sizeof message,
                  "Posted metadata profile: %lu syncs/%lu visits/%lu ms (inclusive)",
@@ -6722,6 +7319,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
         end_task(s);ran=true;
     }
     request_styles(s);
+    begin_task(s);modulepreloads(s);end_task(s);
     if (s->blocker && (s->blocker->executed || s->disabled)) s->blocker = NULL;
     /* A tick executes at most one JavaScript task plus its microtask checkpoint.
        Parsing and native completions may progress without invoking callbacks. */
@@ -6770,7 +7368,17 @@ void web_js_tick(web_doc *d, uint64_t now) {
             end_task(s);
         }
     }
-    if (s->parsing_done && !s->parsing_cancelled && !s->disabled) dynamic_scripts(s, d->root);
+    if (s->parsing_done && !s->parsing_cancelled && !s->disabled &&
+        (!s->dynamic_scan_valid || s->dynamic_scan_revision!=d->dom_revision)) {
+        /* Parser/native callers can insert outside the JS DOM bridge. Keep
+           that fallback, but an idle timer/rAF tick cannot create new eligible
+           scripts or frames without a native DOM mutation revision. */
+        uint64_t revision=d->dom_revision,generation=s->stream_generation;
+        dynamic_scripts(s,d->root);
+        if(!s->disabled && s->stream_generation==generation && d->dom_revision==revision){
+            s->dynamic_scan_revision=revision;s->dynamic_scan_valid=true;
+        }else s->dynamic_scan_valid=false;
+    }
     web_doc *family = d->dom_family ? d->dom_family : d;
     if (!s->disabled && !ran && (family->shadow_slots_pending || family->shadow_dirty_first)) {
         /* Native/parser assignment changes also queue the mutation checkpoint,
@@ -6815,7 +7423,9 @@ void web_js_tick(web_doc *d, uint64_t now) {
         }
     }
     if (s->disabled) for (struct js_script *p = s->scripts; p; p = p->next) { p->executed = p->parser_released = true; JS_FreeValue(s->ctx, p->evaluation); p->evaluation = JS_UNDEFINED; }
-    request_styles(s); request_fonts(s); request_images(s);
+    request_styles(s);
+    begin_task(s);modulepreloads(s);end_task(s);
+    request_fonts(s); request_images(s);
     if (!ran) ran = run_document_event(s);
     if(!s->disabled && run_rendering(s,uptime_ms()))ran=true;
     if (ran) s->idle_period_stopped = true;
@@ -6995,6 +7605,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("dom", 2, native_dom), JS_CFUNC_DEF("log", 1, native_log),
         JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),JS_CFUNC_DEF("safetyRequired",1,native_safety_required),
         JS_CFUNC_DEF("domHooks",2,native_dom_hooks),
+        JS_CFUNC_DEF("inputListener",2,native_input_listener),
         JS_CFUNC_DEF("sandboxFlags",1,native_sandbox_flags),
         JS_CFUNC_DEF("svgGeometry",2,native_svg_geometry),
         JS_CFUNC_DEF("mutationObserve",4,native_mutation_control),
@@ -7026,6 +7637,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("idle", 2, native_idle), JS_CFUNC_DEF("cancelIdle", 1, native_cancel_idle),
         JS_CFUNC_DEF("worker", 3, native_worker),
         JS_CFUNC_DEF("cssSupports", 2, native_css_supports),
+        JS_CFUNC_DEF("cssProperties", 1, native_css_properties),
         JS_CFUNC_DEF("storage", 5, native_storage),
         JS_CFUNC_DEF("indexedDB", 5, native_indexed_db),
         JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("cancel", 1, native_cancel),
@@ -7114,11 +7726,13 @@ void web_js_free(web_doc *d) {
         JS_SetDynamicCodeCheck(s->ctx,NULL,NULL);
         while (s->pending) { struct js_pending *p = s->pending; s->pending = p->next; release_pending_request(s, p); pending_free(s, p); }
         while (s->scripts) { struct js_script *p = s->scripts; s->scripts = p->next; JS_FreeValue(s->ctx, p->evaluation); js_free(s->ctx, p->url); js_free(s->ctx, p->base); js_free(s->ctx, p->source); js_free(s->ctx, p); }
+        free_modulepreloads(s);
         while (s->modules) { struct js_module *m = s->modules; s->modules = m->next; JS_FreeValue(s->ctx, m->compiled); JS_FreeValue(s->ctx, m->error); js_free(s->ctx, m->url); js_free(s->ctx, m->base); js_free(s->ctx, m->source); js_free(s->ctx, m); }
         while(s->rejections){struct js_rejection *p=s->rejections;s->rejections=p->next;
             JS_FreeValue(s->ctx,p->promise);JS_FreeValue(s->ctx,p->reason);js_free(s->ctx,p);}
         s->last_rejection=NULL;
         node_cache_free(s);
+        js_free(s->ctx,s->window_name);s->window_name=NULL;
         JS_FreeValue(s->ctx, s->hooks); JS_FreeValue(s->ctx, s->dispatch); JS_FreeValue(s->ctx, s->response); JS_FreeValue(s->ctx, s->reject);
         for (int i = 0; i < NP_COUNT; i++) JS_FreeValue(s->ctx, s->node_protos[i]);
         JS_SetContextOpaque(s->ctx,NULL); /* queued host jobs must reject retired realms */

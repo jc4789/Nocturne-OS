@@ -1,0 +1,11 @@
+# 子文書viewport同期：独立の第二考察
+
+第一報の最弱前提は「iframe.width setterだけchild widthを更新すればよい」である。iframeのcontent boxは親CSS、百分率、ancestor幅、flex/grid、padding/border等で決まる。属性値を直接childへコピーせず、親layout後のcontent boxを共通のviewport publicationへ接続した。別のCSS-only fixtureで親幅を変え、属性限定の修理を反証する。
+
+childだけ再cascadeしても親geometryが古ければ媒体条件は300pxのままになる。逆にchild文書の全量再描画だけ強制しても、paint前の同期resolved styleは間違う。外側→内側のlayout commitとCSS/media invalidationを分離し、paintを同期寸法の必須条件にしない。
+
+無関係なframeを寸法getterごとに全走査する設計や深いframeでC再帰を増やす設計は、先行性能修理を退行させる。getterは対象のnative ancestor chainだけを使い、成功layout commitは直下frameのviewportだけを公開する。静かな読み取りは既存layout cacheを再利用し、新native条件で親子revision不変を確認する予定である。
+
+viewportの変更は見た目のdamageだけではない。media/layer encounter順、vw/vh、layout cache、画像source selectionを無効化するため、既存top-level resize処理を共用した。borderやpaint cropの幅をchild CSS viewportに混ぜない。visibility非表示とCSS viewport更新も分ける。
+
+原8失敗は第二assertまで実行されており、色直列化の旧failureとは別の確定故障である。成功43原ケースや新native27条件を再反復せず、修理後の原8と別担当のinline4だけを実行する。host構文成功を原WPT合格・4site表示・入力回帰なしへ昇格しない。shared source合流と全媒体一致は主担当の責務として残る。

@@ -63,3 +63,90 @@ globalThis.runObserverCases=async function(){
     ok(!frameOrder.includes('cancelled'),'animation-cancellation-before-dispatch');
     frameRO.disconnect();root.remove();return count;
 };
+
+/* Focused native regression for lazy-loading targets using inline fragments
+   and slotted containing blocks. It is independently selectable in jstest. */
+async function runIntersectionInlineCases(){
+    let count=0;
+    const ok=(v,n)=>{count++;check('intersection-inline-'+n,!!v);if(!v)throw new Error(n);};
+    const until=async fn=>{const end=performance.now()+3000;while(!fn()){if(performance.now()>end)throw new Error('observer timeout');await new Promise(r=>setTimeout(r,1));}};
+    const sameRect=(actual,expected)=>['x','y','width','height'].every(k=>Math.abs(actual[k]-expected[k])<.0001);
+    const port=document.createElement('div');
+    port.style.cssText='position:absolute;left:200px;top:120px;width:120px;height:100px;overflow:hidden';
+    const inline=document.createElement('span');inline.textContent='inline fragment';inline.style.fontSize='16px';
+    port.appendChild(inline);document.body.appendChild(port);
+    const seen=[];const io=new IntersectionObserver(entries=>seen.push(...entries),{root:port});
+    io.observe(inline);ok(seen.length===0,'asynchronous');await until(()=>seen.length);
+    let rect=inline.getBoundingClientRect(),entry=seen.at(-1);
+    ok(rect.x>=200&&rect.y>=120&&rect.width>0&&rect.height>0,'real-fragment-position');
+    ok(sameRect(entry.boundingClientRect,rect),'same-cssom-view-rectangle');
+    ok(entry.isIntersecting&&entry.intersectionRatio>0,'inline-inside-explicit-root');
+    inline.style.display='none';await until(()=>!seen.at(-1).isIntersecting);
+    ok(seen.at(-1).boundingClientRect.width===0&&seen.at(-1).boundingClientRect.height===0,'hidden-not-visible');
+    io.disconnect();port.remove();
+
+    const host=document.createElement('div');
+    host.style.cssText='position:absolute;left:350px;top:120px;width:120px;height:100px';
+    const light=document.createElement('span');light.textContent='slotted fragment';host.appendChild(light);
+    const shadow=host.attachShadow({mode:'open'});
+    shadow.innerHTML='<div id="port" style="width:120px;height:100px;overflow:hidden"><slot></slot></div>';
+    document.body.appendChild(host);const root=shadow.getElementById('port');
+    const slotted=[];const sio=new IntersectionObserver(entries=>slotted.push(...entries),{root});
+    sio.observe(light);await until(()=>slotted.length);entry=slotted.at(-1);
+    ok(light.parentNode===host&&light.assignedSlot!==null,'logical-and-assigned-parents');
+    ok(entry.isIntersecting,'actual-shadow-containing-block');
+    ok(sameRect(entry.boundingClientRect,light.getBoundingClientRect()),'slotted-cssom-view-rectangle');
+    const fixed=document.createElement('span');fixed.textContent='fixed';
+    fixed.style.cssText='display:block;position:fixed;left:350px;top:120px;width:10px;height:10px';host.appendChild(fixed);
+    sio.observe(fixed);await until(()=>slotted.some(e=>e.target===fixed));
+    ok(!slotted.find(e=>e.target===fixed).isIntersecting,'fixed-not-in-explicit-containing-chain');
+    const zero=document.createElement('span');zero.style.cssText='display:block;width:0;height:0';host.appendChild(zero);
+    sio.observe(zero);await until(()=>slotted.some(e=>e.target===zero));entry=slotted.find(e=>e.target===zero);
+    ok(entry.isIntersecting&&entry.intersectionRatio===1,'zero-area-inside');
+    sio.disconnect();host.remove();return count;
+}
+
+/* Prototype feature detection must reach the same branded records as native
+   notifications, not a presence-only shim or mutable own-property snapshot. */
+async function runIntersectionEntryCases(){
+    let count=0;
+    const ok=(v,n)=>{count++;check('intersection-entry-'+n,!!v);if(!v)throw new Error(n);};
+    const names=['time','rootBounds','boundingClientRect','intersectionRect','isIntersecting','intersectionRatio','target'];
+    const descriptors=names.map(n=>Object.getOwnPropertyDescriptor(IntersectionObserverEntry.prototype,n));
+    ok(descriptors.every(d=>d&&typeof d.get==='function'&&!d.set&&d.enumerable&&d.configurable)&&
+        !('isVisible' in IntersectionObserverEntry.prototype),'prototype-readonly-accessors-no-unimplemented-v2');
+    const getRatio=Object.getOwnPropertyDescriptor(IntersectionObserverEntry.prototype,'intersectionRatio').get;
+    let rejected=false;try{getRatio.call({});}catch(e){rejected=e instanceof TypeError;}
+    ok(rejected,'getter-brand');
+    const target=document.createElement('div');
+    target.style.cssText='position:absolute;left:240px;top:100px;width:20px;height:10px';
+    document.body.appendChild(target);
+    const source=new DOMRect(1.25,2.5,20,10);
+    const init={time:12.5,rootBounds:null,boundingClientRect:source,intersectionRect:source,
+        isIntersecting:true,intersectionRatio:.75,target};
+    const copy=new IntersectionObserverEntry(init);
+    ok(copy instanceof IntersectionObserverEntry&&copy.target===target&&copy.time===12.5&&
+        copy.rootBounds===null&&copy.isIntersecting&&copy.intersectionRatio===.75,'constructor-values');
+    source.x=500;
+    ok(copy.boundingClientRect.x===1.25&&copy.intersectionRect.x===1.25&&
+        copy.boundingClientRect instanceof DOMRectReadOnly,'constructor-rectangle-copy');
+    rejected=false;try{new IntersectionObserverEntry({...init,time:Infinity});}catch(e){rejected=e instanceof TypeError;}
+    ok(rejected,'finite-double-conversion');
+    rejected=false;try{new IntersectionObserverEntry({...init,target:undefined});}catch(e){rejected=e instanceof TypeError;}
+    ok(rejected,'required-member');
+    rejected=false;try{new IntersectionObserverEntry({...init,target:{}});}catch(e){rejected=e instanceof TypeError;}
+    ok(rejected,'element-conversion');
+    const entries=[];const observer=new IntersectionObserver(values=>entries.push(...values));
+    try{
+        observer.observe(target);
+        const end=performance.now()+3000;
+        while(!entries.length){if(performance.now()>end)throw new Error('observer timeout');await new Promise(r=>setTimeout(r,1));}
+        const entry=entries[0];
+        ok(entry instanceof IntersectionObserverEntry&&getRatio.call(entry)===1&&entry.target===target,'native-record-getter');
+        ok(!Object.hasOwn(entry,'intersectionRatio')&&!Object.hasOwn(entry,'target')&&
+            Object.prototype.toString.call(entry)==='[object IntersectionObserverEntry]','native-prototype-shape');
+        target.style.width='10px';target.getBoundingClientRect();
+        ok(entry.boundingClientRect.width===20&&entry.intersectionRect.width===20,'native-immutable-snapshot');
+    }finally{observer.disconnect();target.remove();}
+    return count;
+}

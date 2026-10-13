@@ -33,6 +33,8 @@ static unsigned opens,closes,checks,failed;
 static bool send_failure;
 net_stream *ns_open(const char*host,uint16_t port,bool tls,int timeout,char*error,size_t n){(void)host;(void)port;(void)tls;(void)timeout;(void)error;(void)n;opens++;stream.read_at=0;return &stream;}
 long ns_write(net_stream*s,const void*data,size_t n){(void)s;if(send_failure)return -1;if(sent_length+n+1>sent_capacity){sent_capacity=sent_length+n+1;sent=realloc(sent,sent_capacity);}memcpy(sent+sent_length,data,n);sent_length+=n;sent[sent_length]=0;return (long)n;}
+net_stream *ns_open_timed(const char *h,uint16_t p,bool tls,int t,char *e,size_t n,struct http_transport_timing *m){memset(m,0,sizeof *m);return ns_open(h,p,tls,t,e,n);}
+uint64_t uptime_ms(void){return 0;}
 long ns_read(net_stream*s,void*data,size_t n){const char *response="HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";size_t left=strlen(response)-s->read_at;if(n>left)n=left;memcpy(data,response+s->read_at,n);s->read_at+=n;return (long)n;}
 const char *ns_error(net_stream*s){(void)s;return "fixture stream error";}
 void ns_close(net_stream*s){(void)s;closes++;}

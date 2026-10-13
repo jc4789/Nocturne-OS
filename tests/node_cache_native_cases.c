@@ -4,18 +4,22 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "quickjs.h"
+#define MIN(a,b) ((a)<(b)?(a):(b))
 enum { N_DOC=1, N_ELEM=2, N_ATTR=9, NP_NODE=0, NP_COUNT=1 };
 typedef struct web_doc web_doc;
 typedef struct node {
     web_doc *owner;
     struct node *parent,*shadow_host,*template_host,*attr_owner;
-    int type;
+    struct node *first,*next,*shadow_root,*template_content;
+    struct {struct node *node;} *attrs;
+    int type,nattrs;
+    uint64_t wheel_blocking;
 } node_t;
 /* PRODUCT_CACHE_TYPES */
 struct web_js_state {
     web_doc *doc; JSRuntime *rt; JSContext *ctx; JSValue node_protos[NP_COUNT];
     struct js_node_ref *nodes, *node_buckets[JS_NODE_BUCKETS];
-    bool node_cache_syncing,node_cache_failed;
+    bool node_cache_syncing,node_cache_failed,preload_scan_valid;
     struct web_js_state *node_cache_next, **node_cache_prev;
 };
 struct web_doc { node_t *root; struct web_js_state *js; };
@@ -25,6 +29,8 @@ static bool web_frame_same_origin(web_doc *a,web_doc *b){return true;}
 static void log_text(struct web_js_state *s,int level,const char *message){printf("diagnostic: %s\n",message);}
 /* PRODUCT_BRAND_HELPERS */
 /* PRODUCT_CACHE_LOOKUP */
+/* PRODUCT_FOREST_TRAVERSAL */
+void web_js_nodes_changed(web_doc *d);
 static bool fail_cache_alloc;
 static void *cache_alloc(JSContext *ctx,size_t size){if(fail_cache_alloc){fail_cache_alloc=false;JS_ThrowOutOfMemory(ctx);return NULL;}return js_mallocz(ctx,size);}
 #define js_mallocz cache_alloc
@@ -69,6 +75,26 @@ int main(void){
     CHECK("template native root",node_ref(&s,&content)->tree_root==node_ref(&s,&live));
     JS_FreeValue(ctx,object);JS_FreeValue(ctx,second);JS_FreeValue(ctx,template);JS_FreeValue(ctx,ancestor);JS_RunGC(rt);JS_RunGC(rt);
     CHECK("extended forest collected",!node_ref(&s,&shadow)&&!node_ref(&s,&attr)&&!node_ref(&s,&content)&&!node_ref(&s,&live));
+    /* Structural publication pins only this forest. An unheld removed root
+       must keep its expando while an escaped descendant can reach it. */
+    live.shadow_root=&shadow;live.template_content=&content;
+    struct {node_t *node;} attrs[]={{&attr}};live.attrs=(void *)attrs;live.nattrs=1;
+    ancestor=wrap(&s,&live);object=wrap(&s,&shadow);second=wrap(&s,&attr);template=wrap(&s,&content);
+    JS_SetPropertyStr(ctx,ancestor,"rootState",JS_NewInt32(ctx,81));
+    live.parent=&root;web_js_nodes_reparented(&doc,&live);
+    CHECK("subtree shadow attach",node_ref(&s,&shadow)->tree_root->node==&root);
+    CHECK("subtree attr attach",node_ref(&s,&attr)->tree_root->node==&root);
+    CHECK("subtree template attach",node_ref(&s,&content)->tree_root->node==&root);
+    JS_FreeValue(ctx,ancestor);JS_RunGC(rt);
+    live.parent=NULL;web_js_nodes_reparented(&doc,&live);JS_RunGC(rt);
+    CHECK("subtree shadow detach",node_ref(&s,&shadow)->tree_root->node==&live);
+    CHECK("subtree attr detach",node_ref(&s,&attr)->tree_root->node==&live);
+    CHECK("subtree template detach",node_ref(&s,&content)->tree_root->node==&live);
+    ancestor=wrap(&s,&live);value=JS_GetPropertyStr(ctx,ancestor,"rootState");JS_ToInt32(ctx,&number,value);JS_FreeValue(ctx,value);
+    CHECK("subtree unheld root state retained",number==81);
+    JS_FreeValue(ctx,ancestor);JS_FreeValue(ctx,object);JS_FreeValue(ctx,second);JS_FreeValue(ctx,template);JS_RunGC(rt);JS_RunGC(rt);
+    CHECK("subtree unreachable cycles collected",!node_ref(&s,&shadow)&&!node_ref(&s,&attr)&&!node_ref(&s,&content)&&!node_ref(&s,&live));
+    live.shadow_root=live.template_content=NULL;live.attrs=NULL;live.nattrs=0;
     /* Force root creation failure after native mutation. Existing listener state
        must remain owned by the old document graph until a later update succeeds. */
     live.parent=&root;object=wrap(&s,&live);JS_SetPropertyStr(ctx,object,"kept",JS_NewInt32(ctx,99));JS_FreeValue(ctx,object);
@@ -76,6 +102,7 @@ int main(void){
     CHECK("failed regroup retained old edges",node_ref(&s,&live)&&node_ref(&s,&live)->tree_root==node_ref(&s,&root));
     web_js_nodes_changed(&doc);object=wrap(&s,&live);value=JS_GetPropertyStr(ctx,object,"kept");JS_ToInt32(ctx,&number,value);JS_FreeValue(ctx,value);
     CHECK("regroup retry preserves state",number==99&&node_ref(&s,&live)->tree_root==node_ref(&s,&newroot));JS_FreeValue(ctx,object);
+    CHECK("regroup retry clears recovery flag",!s.node_cache_failed);
     JS_RunGC(rt);JS_RunGC(rt);CHECK("retry forest collected",!node_ref(&s,&live)&&!node_ref(&s,&newroot));
     JSContext *other_ctx=JS_NewContext(rt);struct web_js_state other;web_doc other_doc={0};node_t other_root={.owner=&other_doc,.type=N_DOC};other_doc.root=&other_root;state_init(&other,rt,other_ctx,&other_doc);
     JSValue other_document=wrap(&other,&other_root);global(other_ctx,"document",JS_DupValue(other_ctx,other_document));

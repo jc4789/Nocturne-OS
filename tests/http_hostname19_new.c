@@ -43,6 +43,8 @@ static unsigned opens,closes,checks,failed;
 static bool open_failure,send_failure;
 net_stream *ns_open(const char*h,uint16_t p,bool tls,int t,char*err,size_t n){(void)p;(void)tls;(void)t;opens++;snprintf(opened_host,sizeof opened_host,"%s",h);stream.at=0;if(open_failure){snprintf(err,n,"fixture open failure");return NULL;}return &stream;}
 long ns_write(net_stream*s,const void*p,size_t n){(void)s;if(send_failure)return -1;if(n>sizeof sent-sent_length-1)return -1;memcpy(sent+sent_length,p,n);sent_length+=n;sent[sent_length]=0;return(long)n;}
+net_stream *ns_open_timed(const char *h,uint16_t p,bool tls,int t,char *e,size_t n,struct http_transport_timing *m){memset(m,0,sizeof *m);return ns_open(h,p,tls,t,e,n);}
+uint64_t uptime_ms(void){return 0;}
 long ns_read(net_stream*s,void*p,size_t n){const char*r="HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";size_t left=strlen(r)-s->at;if(n>left)n=left;memcpy(p,r+s->at,n);s->at+=n;return(long)n;}
 const char *ns_error(net_stream*s){(void)s;return "fixture I/O failure";}
 void ns_close(net_stream*s){(void)s;closes++;}

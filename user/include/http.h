@@ -6,8 +6,18 @@
 
 /* ---- streams: plain TCP or TLS 1.2 (BearSSL, verified against the built-in Mozilla roots) ---- */
 typedef struct net_stream net_stream;
+/* Opt-in native diagnostics; no request/hook/response layout changes. Times
+   include native scheduling, not just server latency. Never expose as fields. */
+enum http_transport_phase { HTTP_PHASE_NONE, HTTP_PHASE_RESOLVE, HTTP_PHASE_CONNECT,
+    HTTP_PHASE_TLS, HTTP_PHASE_HEADER, HTTP_PHASE_BODY, HTTP_PHASE_DONE };
+struct http_transport_timing {
+    uint64_t resolve_ms, connect_ms, tls_ms, first_header_ms, header_ms, body_ms;
+    enum http_transport_phase phase;
+};
 /* connect to host:port; on failure returns NULL and writes a message into err */
 net_stream *ns_open(const char *host, uint16_t port, bool tls, int timeout_ms, char *err, size_t errlen);
+net_stream *ns_open_timed(const char *host, uint16_t port, bool tls, int timeout_ms,
+                          char *err, size_t errlen, struct http_transport_timing *timing);
 long ns_write(net_stream *s, const void *buf, size_t n); /* all or -1 */
 long ns_read(net_stream *s, void *buf, size_t n);        /* >0 bytes, 0 = end of stream, -1 = error */
 void ns_set_timeout(net_stream *s, int timeout_ms);      /* per read; -1 waits forever */
@@ -105,6 +115,8 @@ struct http_stream_hooks {
 };
 int http_request_stream(const struct http_req *, struct http_resp *, size_t,
                         const struct http_stream_hooks *);
+int http_request_stream_timed(const struct http_req *, struct http_resp *, size_t,
+                              const struct http_stream_hooks *, struct http_transport_timing *);
 /* Both successful and failed responses may be freed. Do not free a borrowed
    headers_full used solely to adapt an existing header block for lookup. */
 void http_resp_free(struct http_resp *resp);

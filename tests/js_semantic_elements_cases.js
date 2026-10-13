@@ -29,8 +29,8 @@ async function runSemanticElementCases() {
         eq(document.createElement('x-semantic-fixture') instanceof HTMLUnknownElement,false,'custom-candidate-not-unknown');
         rejects(()=>new HTMLUnknownElement(),'unknown-constructor');
         const marker=document.createElement('mark');fixture.appendChild(marker);marker.textContent='highlight';
-        eq(getComputedStyle(marker).backgroundColor,'rgba(255, 255, 0, 1)','mark-real-highlight');
-        eq(getComputedStyle(marker).color,'rgba(0, 0, 0, 1)','mark-real-foreground');marker.remove();
+        eq(getComputedStyle(marker).backgroundColor,'rgb(255, 255, 0)','mark-real-highlight');
+        eq(getComputedStyle(marker).color,'rgb(0, 0, 0)','mark-real-foreground');marker.remove();
         const interfaces=[['time',HTMLTimeElement],['data',HTMLDataElement],['details',HTMLDetailsElement],
             ['ol',HTMLOListElement],['li',HTMLLIElement]];
         const parsed=new DOMParser().parseFromString('<time datetime="2026-10-07">today</time><data value="7">seven</data>'+

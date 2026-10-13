@@ -18,7 +18,7 @@
 #define waitpid test_waitpid
 #define uptime_ms test_uptime_ms
 #include "../user/libc/webnet.c"
-int errno;
+int *__errno_location(void){static int value;return &value;}
 static uint64_t now=100;
 static int descriptor=10, process=100, spawned, checks, failed, callbacks;
 struct webcookie_jar { int unused; };
@@ -57,6 +57,39 @@ static uint64_t submit(webnet *n,enum webnet_kind kind,uint64_t generation) {
         .origin="https://mail.google.com/",.method="GET",.credentials=WEBNET_CREDENTIALS_OMIT};
     uint64_t id=webnet_submit(n,&q,completed,NULL);CHECK(id!=0);return id;
 }
+#if defined(WEBNET_DIAGNOSTIC_HOST_TEST)
+/* Link-only native boundaries for this diagnostic-only mode. No requests,
+   sockets, scheduler budget or origin lookup are exercised by its checks. */
+#include <stdarg.h>
+FILE *stderr;
+int fprintf(FILE *stream,const char *format,...){(void)stream;va_list args;
+    va_start(args,format);int n=vprintf(format,args);va_end(args);return n;}
+int cpu_info(struct n_cpuinfo *cpu){memset(cpu,0,sizeof *cpu);cpu->online_cpus=4;return 0;}
+int sysinfo(struct n_sysinfo *memory){memset(memory,0,sizeof *memory);memory->free_mem=2ull<<30;return 0;}
+bool url_parse_owned(const char *raw,struct url_owned *out){(void)raw;memset(out,0,sizeof *out);return false;}
+void url_owned_free(struct url_owned *out){(void)out;}
+enum http_url_result http_origin_owned(const char *raw,char **out){(void)raw;*out=NULL;return HTTP_URL_OPAQUE;}
+int main(void) {
+    struct request r={.debug_request=true};
+    char headers[512]="HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nHTTP/Nocturne-Transport phase=6 attempts=2 resolve=3 connect=4 tls=5 first_header=7 headers=8 body=9\r\n";
+    CHECK(consume_transport_diagnostic(&r,headers));
+    CHECK(!strcmp(headers,"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"));
+    strcpy(headers,"\r\nHTTP/Nocturne-Transport phase=3 attempts=1 resolve=0 connect=2 tls=20000 first_header=0 headers=0 body=0\r\n");
+    CHECK(consume_transport_diagnostic(&r,headers)&&!headers[0]);
+    strcpy(headers,"\r\nHTTP/Nocturne-Transport phase=99 attempts=1 resolve=0 connect=0 tls=0 first_header=0 headers=0 body=0\r\n");
+    CHECK(!consume_transport_diagnostic(&r,headers));
+    strcpy(headers,"\r\nHTTP/Nocturne-Transport phase=6 attempts=0 resolve=0 connect=0 tls=0 first_header=0 headers=0 body=0\r\n");
+    CHECK(!consume_transport_diagnostic(&r,headers));
+    strcpy(headers,"\r\nHTTP/Nocturne-Transport phase=6 attempts=1 resolve=18446744073709551616 connect=0 tls=0 first_header=0 headers=0 body=0\r\n");
+    CHECK(!consume_transport_diagnostic(&r,headers));
+    const char *head="\r\nHTTP/Nocturne-Transport phase=6 attempts=1 resolve=3 connect=4 tls=5 first_header=7 headers=8 body=9\r\n";
+    r.head=(struct webnet_wire_response){.headers_len=strlen(head),.body_len=3};
+    r.rx=malloc(strlen(head)+3);memcpy(r.rx,head,strlen(head));memcpy(r.rx+strlen(head),"abc",3);
+    CHECK(unpack(&r));CHECK(r.rx[1]==0);
+    CHECK(!memcmp(r.rx+1+r.head.headers_len+1,"abc",3));free(r.rx);
+    printf("webnet-private-timing: %d checks, %d failed\n",checks,failed);return failed!=0;
+}
+#else
 int main(void) {
     /* New clients opt in by native script kind, never by response MIME or an
        author-controlled header; non-script/request body limits remain legacy. */
@@ -93,3 +126,4 @@ int main(void) {
     webnet_cancel_generation(n,6);CHECK(!webnet_busy(n));webnet_free(n);
     printf("network_scheduler_hosttest: %d checks, %d failed\n",checks,failed);return failed!=0;
 }
+#endif

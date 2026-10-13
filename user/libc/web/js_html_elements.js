@@ -405,7 +405,7 @@ const htmlElementsBridge = (() => {
     enumerated(HTMLLinkElement,'link','fetchPriority','fetchpriority',['high','low','auto'],'auto');
     // supports() advertises native processing, never merely reflected strings:
     // stylesheet is supported; preload/modulepreload/icon/render blocking are not.
-    tokenAttribute(HTMLLinkElement,'link','relList','rel',['stylesheet']);
+    tokenAttribute(HTMLLinkElement,'link','relList','rel',['stylesheet','modulepreload']);
     tokenAttribute(HTMLLinkElement,'link','sizes');
     tokenAttribute(HTMLLinkElement,'link','blocking','blocking',[]);
     define(HTMLLinkElement.prototype,'disabled',{configurable:true,enumerable:true,

@@ -401,12 +401,13 @@ static struct cexpr *calc_product(const char **s, const char *e, struct cx *cx) 
     struct cexpr *x = calc_value(s, e, cx);
     for (;;) {
         if (!x) return NULL;
+        const char *before_space = *s;
         cskip(s, e);
         if (*s < e && (**s == '*' || **s == '/')) {
             char op = *(*s)++;
             x = cnode(cx, op, x, calc_value(s, e, cx));
             if (!x->b) return NULL;
-        } else return x;
+        } else { *s = before_space; return x; }
     }
 }
 
@@ -414,8 +415,12 @@ static struct cexpr *calc_sum(const char **s, const char *e, struct cx *cx) {
     struct cexpr *x = calc_product(s, e, cx);
     for (;;) {
         if (!x) return NULL;
+        const char *before_space = *s;
         cskip(s, e);
         if (*s < e && (**s == '+' || **s == '-')) {
+            /* CSS calc-sum requires whitespace on both sides. Product does
+               not consume that whitespace when it returns its final value. */
+            if (*s == before_space || *s + 1 == e || !is_space((unsigned char)(*s)[1])) return NULL;
             char op = *(*s)++;
             x = cnode(cx, op, x, calc_product(s, e, cx));
             if (!x->b) return NULL;
@@ -536,6 +541,25 @@ static bool length_number(sbuf *out, float value, const char *unit) {
     int n = snprintf(number, sizeof number, "%.9g%s", (double)value, unit);
     return n > 0 && (size_t)n < sizeof number && length_append(out, number, (size_t)n);
 }
+bool css_shadow_serialize(const struct css_box_shadow *shadow, sbuf *out, web_doc *d) {
+    size_t original = out->n; bool success = true;
+    if (!shadow) success = length_append(out, "none", 4);
+    size_t count = 0;
+    for (; shadow && success; shadow = shadow->next, count++) {
+        if (!(count & 63) && d && !web_native_checkpoint(d)) { success = false; break; }
+        char color[96]; unsigned a = shadow->color >> 24;
+        int n = a == 255 ? snprintf(color, sizeof color, "rgb(%u, %u, %u) ", (shadow->color >> 16) & 255,
+            (shadow->color >> 8) & 255, shadow->color & 255) : snprintf(color, sizeof color, "rgba(%u, %u, %u, %.9g) ",
+            (shadow->color >> 16) & 255, (shadow->color >> 8) & 255, shadow->color & 255, (double)a / 255);
+        success = n > 0 && (size_t)n < sizeof color && (!count || length_append(out, ", ", 2)) &&
+            length_append(out, color, (size_t)n) &&
+            length_number(out, shadow->x, "px") && length_append(out, " ", 1) && length_number(out, shadow->y, "px") &&
+            length_append(out, " ", 1) && length_number(out, shadow->blur, "px") && length_append(out, " ", 1) &&
+            length_number(out, shadow->spread, "px") && (!shadow->inset || length_append(out, " inset", 6));
+    }
+    if (!success) { out->n = original; if (out->p && original < out->cap) out->p[original] = 0; }
+    return success;
+}
 bool css_filter_serialize(const struct css_filter *filter, sbuf *out, web_doc *d) {
     size_t original = out->n;
     bool success = false;
@@ -636,6 +660,23 @@ static bool calc_dimension(const struct cexpr *x,bool *number){
     if(x->op=='*'){if(!a&&!b)return false;*number=a&&b;return true;}
     if(x->op=='/'){if(!b)return false;*number=a;return true;}
     if(a!=b)return false;*number=a;return true;
+}
+/* Media feature lengths have no percentage basis or property range clamp.
+   Share the actual CSS arithmetic grammar/type checker instead of using a
+   permissive strtod prefix or rewriting calc() in the media-query parser. */
+bool css_query_length(const char *text, size_t length, float em, float rem, float vw, float vh, double *value) {
+    if (!text || !value || memchr(text, '%', length)) return false;
+    arena_t *arena = calloc(1, sizeof *arena); if (!arena) return false;
+    jmp_buf trap; arena->trap = &trap;
+    if (setjmp(trap)) { ar_free(arena); free(arena); return false; }
+    struct cx context = {.a = arena, .em = em, .rem = rem, .vw = vw, .vh = vh};
+    const char *cursor = text, *end = text + length;
+    struct cexpr *expression = calc_value(&cursor, end, &context); cskip(&cursor, end);
+    bool number; float px, percentage; bool success = expression && cursor == end &&
+        calc_dimension(expression, &number) && !number && cfold(expression, &number, &px, &percentage) &&
+        !number && percentage == 0 && isfinite(px);
+    if (success) *value = px;
+    ar_free(arena); free(arena); return success;
 }
 static bool parse_len(const char *s, size_t n, struct cx *cx, len_t *out, int flags) {
     trim(&s, &n);
@@ -972,15 +1013,150 @@ struct kw {
     uint8_t v;
 };
 
+static bool shadow_specified_length(sbuf *out, const char *token, size_t size) {
+    /* Preserve authored calculation/relative-unit expressions: this is a
+       specified value, not a computed pixel value. Unitless zero is a length. */
+    const char *p = token; float number;
+    if (parse_number(&p, token + size, &number) && p == token + size && number == 0)
+        return length_append(out, "0px", 3);
+    return length_append(out, token, size);
+}
+static bool parse_box_shadows(const char *value, size_t length, struct cx *cx, const struct css_box_shadow **out,
+                              sbuf *specified) {
+    if (ident_is(value, length, "none")) { *out = NULL; return !specified || length_append(specified,"none",4); }
+    const char *cursor = value, *end = value + length;
+    struct css_box_shadow *first = NULL, **tail = &first;
+    while (cursor < end) {
+        const char *stop = cursor; size_t depth = 0;
+        for (; stop < end; stop++) {
+            if (*stop == '(') depth++;
+            else if (*stop == ')') { if (!depth) return false; depth--; }
+            else if (*stop == ',' && !depth) break;
+        }
+        if (depth) return false;
+        const char *tokens[6]; size_t sizes[6];
+        int count = split_checked(cursor, (size_t)(stop - cursor), tokens, sizes, 6, ' ', cx);
+        if (count < 2) return false;
+        const char *consumed = tokens[count-1] + sizes[count-1];
+        while (consumed < stop && is_space((unsigned char)*consumed)) consumed++;
+        if (consumed != stop) return false; /* strict in cascade and CSSOM too */
+        struct css_box_shadow shadow = {.color = COLOR_CURRENT};
+        bool color = false, inset = false, lengths_closed = false; unsigned lengths = 0;
+        float dimensions[4] = {0};
+        int color_token = -1, length_tokens[4];
+        for (int i = 0; i < count; i++) {
+            uint32_t candidate;
+            if (ident_is(tokens[i], sizes[i], "inset")) {
+                if (inset) return false; inset = shadow.inset = true; lengths_closed |= lengths != 0;
+            } else if (css_color_checked(tokens[i], sizes[i], &candidate, cx)) {
+                if (color) return false; color = true; shadow.color = candidate; color_token=i; lengths_closed |= lengths != 0;
+            } else {
+                if (lengths_closed || lengths == 4 || memchr(tokens[i], '%', sizes[i])) return false;
+                len_t dimension;
+                unsigned flags = LF_NOPCT | LF_LENGTH | (lengths == 2 ? 0 : LF_NEG);
+                if (!parse_len(tokens[i], sizes[i], cx, &dimension, flags) || dimension.kind != LK_LEN || dimension.pct ||
+                    !isfinite(dimension.px)) return false;
+                length_tokens[lengths] = i; dimensions[lengths++] = dimension.px;
+            }
+        }
+        if (lengths < 2) return false;
+        if (specified) {
+            if (first && !length_append(specified,", ",2)) return false;
+            if (color_token >= 0 && (!length_append(specified,tokens[color_token],sizes[color_token]) ||
+                !length_append(specified," ",1))) return false;
+            for (unsigned i=0;i<lengths;i++) {
+                int token=length_tokens[i];
+                if ((i && !length_append(specified," ",1)) ||
+                    !shadow_specified_length(specified,tokens[token],sizes[token])) return false;
+            }
+            if (inset && !length_append(specified," inset",6)) return false;
+        }
+        shadow.x = dimensions[0]; shadow.y = dimensions[1]; shadow.blur = dimensions[2]; shadow.spread = dimensions[3];
+        struct css_box_shadow *node = ar_alloc(cx->a, sizeof *node); *node = shadow; *tail = node; tail = &node->next;
+        if (stop == end) break;
+        cursor = stop + 1;
+        const char *remaining = cursor; size_t n = (size_t)(end - cursor); trim(&remaining, &n); if (!n) return false;
+    }
+    if (!first) return false; *out = first; return true;
+}
+bool css_shadow_specified(const char *value, size_t size, sbuf *out) {
+    size_t original=out->n;
+    arena_t *arena=calloc(1,sizeof *arena);if(!arena)return false;
+    jmp_buf trap;arena->trap=&trap;
+    bool success=false;
+    if (!setjmp(trap)) {
+        struct cx cx={.em=16,.rem=16,.vw=800,.vh=600,.a=arena};
+        const struct css_box_shadow *ignored;
+        trim(&value,&size);
+        success=parse_box_shadows(value,size,&cx,&ignored,out);
+    }
+    ar_free(arena);free(arena);
+    if(!success){out->n=original;if(out->p&&original<out->cap)out->p[original]=0;}
+    return success;
+}
+bool css_radius_serialize(const style_t *style,int corner,sbuf *out,web_doc *doc) {
+    size_t original=out->n;bool ok=true;len_t lengths[2][4];
+    for(int i=0;i<4;i++)for(int axis=0;axis<2;axis++) {
+        if(style->corner_radius[i].axis[axis].kind!=LK_AUTO)lengths[axis][i]=style->corner_radius[i].axis[axis];
+        else lengths[axis][i]=(len_t){.kind=LK_LEN,.px=style->border_radius>=0?style->border_radius:0,.pct=style->border_radius<0?-style->border_radius:0};
+    }
+    if(corner>=0&&corner<4) {
+        ok=css_length_serialize(&lengths[0][corner],out,doc);
+        if(ok&&!css_length_equal(&lengths[0][corner],&lengths[1][corner]))ok=length_append(out," ",1)&&css_length_serialize(&lengths[1][corner],out,doc);
+    } else {
+        bool equal=true;for(int i=0;i<4;i++)equal&=css_length_equal(&lengths[0][i],&lengths[1][i]);
+        for(int axis=0;axis<(equal?1:2)&&ok;axis++) {
+            int count=4;if(css_length_equal(&lengths[axis][1],&lengths[axis][3])){count=3;if(css_length_equal(&lengths[axis][0],&lengths[axis][2])){count=2;if(css_length_equal(&lengths[axis][0],&lengths[axis][1]))count=1;}}
+            if(axis)ok=length_append(out," / ",3);
+            for(int i=0;i<count&&ok;i++)ok=(!i||length_append(out," ",1))&&css_length_serialize(&lengths[axis][i],out,doc);
+        }
+    }
+    if(!ok){out->n=original;if(out->p&&original<out->cap)out->p[original]=0;}return ok;
+}
+bool css_radius_specified(const char *property,const char *value,size_t size,sbuf *out) {
+    if(!css_valid_declaration(property,strlen(property),value,size))return false;
+    if(memchr(value,'\\',size))return false;
+    for(size_t i=0;i+4<=size;i++)if(strn_ieq(value+i,"var(",4))return false;
+    bool shorthand=!strcasecmp(property,"border-radius");size_t original=out->n;
+    struct cx cx={0};const char *axes[3];size_t axis_n[3];
+    int count=shorthand?split_checked(value,size,axes,axis_n,3,'/',&cx):1;
+    if(!shorthand){axes[0]=value;axis_n[0]=size;}
+    if(count<1||count>2)return false;
+    const char *tokens[2][5];size_t token_n[2][5];int lengths[2];
+    for(int axis=0;axis<count;axis++) {
+        lengths[axis]=split_checked(axes[axis],axis_n[axis],tokens[axis],token_n[axis],5,' ',&cx);
+        if(lengths[axis]<1||lengths[axis]>(shorthand?4:2))return false;
+    }
+    if(shorthand&&count==2) {
+        static const int pick[5][4]={{0},{0,0,0,0},{0,1,0,1},{0,1,2,1},{0,1,2,3}};bool equal=true;
+        for(int i=0;i<4;i++){int x=pick[lengths[0]][i],y=pick[lengths[1]][i];equal&=token_n[0][x]==token_n[1][y]&&!memcmp(tokens[0][x],tokens[1][y],token_n[0][x]);}
+        if(equal)count=1;
+    }
+    bool ok=true;
+    for(int axis=0;axis<count&&ok;axis++) {
+        int n=lengths[axis];
+        if(shorthand) {
+            while(n>1) {
+                int other=n==4?1:n==3?0:0;
+                if(token_n[axis][n-1]!=token_n[axis][other]||memcmp(tokens[axis][n-1],tokens[axis][other],token_n[axis][other]))break;
+                n--;
+            }
+        } else if(n==2&&token_n[axis][0]==token_n[axis][1]&&!memcmp(tokens[axis][0],tokens[axis][1],token_n[axis][0]))n=1;
+        if(axis)ok=length_append(out," / ",3);
+        for(int i=0;i<n&&ok;i++)ok=(!i||length_append(out," ",1))&&shadow_specified_length(out,tokens[axis][i],token_n[axis][i]);
+    }
+    if(!ok){out->n=original;if(out->p&&original<out->cap)out->p[original]=0;}return ok;
+}
+
 enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_FONT_SIZE, PT_FONT_WEIGHT,
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
-       PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
+       PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_BOX_SHADOW, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
        PT_MOTION_NAME, PT_MOTION_TIME, PT_MOTION_ITERATIONS, PT_MOTION_EASING, PT_TRANSFORM, PT_TRANSLATE };
 
-enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
+enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
        SH_MARGIN_INLINE, SH_MARGIN_BLOCK, SH_PADDING_INLINE, SH_PADDING_BLOCK, SH_INSET_INLINE, SH_INSET_BLOCK,
-       SH_LIST_STYLE, SH_FONT, SH_BACKGROUND, SH_FLEX, SH_FLEX_FLOW, SH_GAP, SH_OVERFLOW, SH_TEXT_DECORATION,
+       SH_LIST_STYLE, SH_FONT, SH_BACKGROUND, SH_FLEX, SH_FLEX_FLOW, SH_GAP, SH_OVERFLOW, SH_TEXT_DECORATION, SH_ALL,
        SH_PLACE_ITEMS, SH_PLACE_SELF, SH_PLACE_CONTENT, SH_GRID_AREA, SH_GRID_ROW, SH_GRID_COLUMN,
        SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION };
 
@@ -1011,6 +1187,7 @@ static const struct kw kw_ws[] = {{"normal", WS_NORMAL}, {"pre", WS_PRE}, {"nowr
                                   {"break-spaces", WS_PRE_WRAP}, {"-moz-pre-wrap", WS_PRE_WRAP}, {0}};
 static const struct kw kw_textwrap[] = {{"wrap", WS_NORMAL}, {"nowrap", WS_NOWRAP}, {"balance", WS_NORMAL},
                                         {"pretty", WS_NORMAL}, {"stable", WS_NORMAL}, {0}};
+static const struct kw kw_text_overflow[] = {{"clip",TO_CLIP},{"ellipsis",TO_ELLIPSIS},{0}};
 static const struct kw kw_talign[] = {{"left", TA_LEFT}, {"right", TA_RIGHT}, {"center", TA_CENTER},
                                       {"justify", TA_JUSTIFY}, {"start", TA_LEFT}, {"end", TA_RIGHT},
                                       {"-webkit-center", TA_WCENTER}, {"-moz-center", TA_WCENTER},
@@ -1098,12 +1275,15 @@ static struct propdef props[] = {
     SH("background", SH_BACKGROUND),
     {"background-color", PT_COLOR, 0, false, O(bg_color), NULL, 0},
     {"background-image", PT_BG_IMAGE, 0, false, O(bg_image), NULL, 0},
+    {"box-shadow", PT_BOX_SHADOW, 0, false, O(box_shadow), NULL, 0},
     {"background-repeat", PT_KW, 0, false, O(bg_repeat), kw_bg_repeat, 0},
     {"background-position", PT_BG_POS, 0, false, O(bg_pos), NULL, 0},
     {"background-size", PT_BG_SIZE, 0, false, O(bg_size), NULL, 0},
     SH("border", SH_BORDER),
     SH("border-block", SH_BORDER_BLOCK),
     SH("border-bottom", SH_BORDER_BOTTOM),
+    {"border-bottom-left-radius", PT_RADIUS, 0, false, O(corner_radius[3]), NULL, 0},
+    {"border-bottom-right-radius", PT_RADIUS, 0, false, O(corner_radius[2]), NULL, 0},
     {"border-bottom-color", PT_COLOR, 0, false, O(border_color[2]), NULL, 0},
     {"border-bottom-style", PT_KW, 0, false, O(border_style[2]), kw_bstyle, 0},
     {"border-bottom-width", PT_PX, LF_NOPCT, false, O(border_width[2]), kw_bwidth, 0},
@@ -1114,7 +1294,7 @@ static struct propdef props[] = {
     {"border-left-color", PT_COLOR, 0, false, O(border_color[3]), NULL, 0},
     {"border-left-style", PT_KW, 0, false, O(border_style[3]), kw_bstyle, 0},
     {"border-left-width", PT_PX, LF_NOPCT, false, O(border_width[3]), kw_bwidth, 0},
-    {"border-radius", PT_RADIUS, 0, false, O(border_radius), NULL, 0},
+    SH("border-radius", SH_BORDER_RADIUS),
     SH("border-right", SH_BORDER_RIGHT),
     {"border-right-color", PT_COLOR, 0, false, O(border_color[1]), NULL, 0},
     {"border-right-style", PT_KW, 0, false, O(border_style[1]), kw_bstyle, 0},
@@ -1122,6 +1302,8 @@ static struct propdef props[] = {
     {"border-spacing", PT_PX, LF_NOPCT, true, O(border_spacing), NULL, 0},
     SH("border-style", SH_BORDER_STYLE),
     SH("border-top", SH_BORDER_TOP),
+    {"border-top-left-radius", PT_RADIUS, 0, false, O(corner_radius[0]), NULL, 0},
+    {"border-top-right-radius", PT_RADIUS, 0, false, O(corner_radius[1]), NULL, 0},
     {"border-top-color", PT_COLOR, 0, false, O(border_color[0]), NULL, 0},
     {"border-top-style", PT_KW, 0, false, O(border_style[0]), kw_bstyle, 0},
     {"border-top-width", PT_PX, LF_NOPCT, false, O(border_width[0]), kw_bwidth, 0},
@@ -1139,7 +1321,7 @@ static struct propdef props[] = {
     {"container-type", PT_KW, 0, false, O(container_type), kw_container_type, 0},
     {"display", PT_DISPLAY, 0, false, O(display), NULL, 0},
     SH("flex", SH_FLEX),
-    {"flex-basis", PT_LEN, LF_AUTO, false, O(flex_basis), NULL, 0},
+    {"flex-basis", PT_LEN, LF_AUTO | LF_LENGTH, false, O(flex_basis), NULL, 0},
     {"flex-direction", PT_KW, 0, false, O(flex_direction), kw_fdir, 0},
     SH("flex-flow", SH_FLEX_FLOW),
     {"flex-grow", PT_NUM, 0, false, O(flex_grow), NULL, 0},
@@ -1151,6 +1333,7 @@ static struct propdef props[] = {
     {"filter", PT_FILTER, 0, false, O(filter), NULL, 0},
     {"fill-rule", PT_KW, 0, true, O(svg_fill_rule), kw_svg_fill_rule, 0},
     SH("font", SH_FONT),
+    SH("all", SH_ALL),
     {"font-family", PT_FONT_FAMILY, 0, true, O(font_family), NULL, 0},
     {"font-size", PT_FONT_SIZE, 0, true, O(font_size), NULL, 0},
     {"font-style", PT_KW, 0, true, O(font_style), kw_fstyle, 0},
@@ -1229,6 +1412,7 @@ static struct propdef props[] = {
     {"stop-opacity", PT_OPACITY, 0, false, O(svg_stop_opacity), NULL, 0},
     {"table-layout", PT_KW, 0, false, O(table_layout), kw_tlayout, 0},
     {"text-align", PT_KW, 0, true, O(text_align), kw_talign, 0},
+    {"text-overflow",PT_KW,0,false,O(text_overflow),kw_text_overflow,0},
     SH("text-decoration", SH_TEXT_DECORATION),
     {"text-decoration-line", PT_TEXT_DECO, 0, true, O(text_decoration), NULL, 0},
     {"text-indent", PT_LEN, LF_NEG, true, O(text_indent), NULL, 0},
@@ -1353,9 +1537,14 @@ const struct propdef *css_prop_lookup(const char *name, size_t n) {
 }
 
 int css_prop_count(void) { return NPROPS; }
+const char *css_prop_name(int index,bool *longhand) {
+    if(index<0||index>=NPROPS)return NULL;
+    if(longhand)*longhand=props[index].type!=PT_SHORT;
+    return props[index].name;
+}
 int css_prop_index(const struct propdef *p) { return (int)(p - props); }
 bool css_prop_is_font(const struct propdef *p) {
-    return (p->type == PT_FONT_SIZE) || (p->type == PT_SHORT && p->sh == SH_FONT);
+    return (p->type == PT_FONT_SIZE) || (p->type == PT_SHORT && (p->sh == SH_FONT || p->sh == SH_ALL));
 }
 bool css_prop_is_motion(const struct propdef *p) {
     return p && (!strcmp(p->name,"animation") || !strncmp(p->name,"animation-",10));
@@ -1664,6 +1853,7 @@ static bool parse_bg_size(const char *s, size_t n, struct cx *cx, len_t *size, u
 static bool parse_mask_image(const char *s, size_t n, struct cx *cx) {
     if (ident_is(s, n, "none")) {
         cx->s->mask_image = NULL;
+        cx->s->mask_img = 0;
         return true;
     }
     const char *t[8];
@@ -1674,6 +1864,7 @@ static bool parse_mask_image(const char *s, size_t n, struct cx *cx) {
         const char *u = parse_url(t[i], tl[i], cx->a);
         if (u) {
             cx->s->mask_image = u;
+            cx->s->mask_img = 0;
             return true;
         }
     }
@@ -1779,6 +1970,7 @@ static bool parse_bg_image(const char *s, size_t n, struct cx *cx) {
     style_t *st = cx->s;
     if (ident_is(s, n, "none")) {
         st->bg_image = NULL;
+        st->bg_img = 0;
         st->has_grad = false;
         st->gradient = NULL;
         return true;
@@ -1792,10 +1984,12 @@ static bool parse_bg_image(const char *s, size_t n, struct cx *cx) {
         const char *u = parse_url(t[i], tl[i], cx->a);
         if (u) {
             st->bg_image = u;
+            st->bg_img = 0;st->has_grad=false;st->gradient=NULL;
             return true;
         }
         const struct gradient *g = parse_gradient(t[i], tl[i], cx);
         if (g) {
+            st->bg_image=NULL;st->bg_img=0;
             st->gradient = g;
             st->grad[0] = g->col[0];
             st->grad[1] = g->col[g->n - 1];
@@ -2142,11 +2336,13 @@ static void copy_prop(const struct propdef *p, style_t *dst, const style_t *src)
     case PT_VALIGN: dst->vertical_align_px = src->vertical_align_px; break;
     case PT_LIST_TYPE: dst->list_style_string = src->list_style_string; break;
     case PT_BG_IMAGE:
+        dst->bg_img = src->bg_img;
         dst->has_grad = src->has_grad;
         dst->gradient = src->gradient;
         dst->grad[0] = src->grad[0];
         dst->grad[1] = src->grad[1];
         break;
+    case PT_MASK_IMAGE: dst->mask_img=src->mask_img;break;
     case PT_ZINDEX: dst->z_auto = src->z_auto; break;
     case PT_BG_SIZE: dst->bg_size_kind = src->bg_size_kind; break;
     case PT_MASK_SIZE: dst->mask_size_kind = src->mask_size_kind; break;
@@ -2277,20 +2473,13 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         return true;
     }
     case PT_RADIUS: {
-        const char *t[4];
-        size_t tl[4];
-        char buf[128];
-        size_t bn = n < sizeof buf - 1 ? n : sizeof buf - 1;
-        if (cx->supports_probe && (bn != n || memchr(v, '/', n))) return false;
-        memcpy(buf, v, bn);
-        for (size_t i = 0; i < bn; i++)
-            if (buf[i] == '/') buf[i] = ' ';
-        int count = split_checked(buf, bn, t, tl, 4, ' ', cx);
-        if (count < 1 || (cx->supports_probe && count != 1)) return false; /* elliptical radii are not stored */
-        len_t l;
-        if (!parse_len(t[0], tl[0], cx, &l, 0)) return false;
-        /* a percentage is stored negated and resolved against the box at paint time */
-        *(float *)field = l.kind == LK_LEN && l.pct ? -l.pct : len_resolve(&l, 0);
+        const char *t[3];size_t tl[3];int count=split_checked(v,n,t,tl,3,' ',cx);
+        if(count<1||count>2||t[count-1]+tl[count-1]!=v+n)return false;
+        struct css_corner_radius parsed;
+        if(!parse_len(t[0],tl[0],cx,&parsed.axis[0],LF_LENGTH))return false;
+        parsed.axis[1]=parsed.axis[0];
+        if(count==2&&!parse_len(t[1],tl[1],cx,&parsed.axis[1],LF_LENGTH))return false;
+        *(struct css_corner_radius *)field=parsed;
         return true;
     }
     case PT_COLOR: {
@@ -2342,6 +2531,7 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
         return true;
     }
     case PT_FILTER: return parse_filter(v, n, cx, &s->filter);
+    case PT_BOX_SHADOW: return parse_box_shadows(v, n, cx, &s->box_shadow, NULL);
     case PT_OPACITY: {
         const char *q = v;
         float x;
@@ -2646,9 +2836,10 @@ static bool set_background(const char *v, size_t n, struct cx *cx) {
 }
 
 static bool set_flex(const char *v, size_t n, struct cx *cx) {
-    const char *t[3];
-    size_t tl[3];
-    int k = split_checked(v, n, t, tl, 3, ' ', cx);
+    const char *t[4];
+    size_t tl[4];
+    int k = split_checked(v, n, t, tl, 4, ' ', cx);
+    if (k < 1 || k > 3) return false;
     if (k == 1 && ident_is(t[0], tl[0], "none"))
         return set_long("flex-grow", "0", 1, cx), set_long("flex-shrink", "0", 1, cx),
                set_long("flex-basis", "auto", 4, cx);
@@ -2657,23 +2848,39 @@ static bool set_flex(const char *v, size_t n, struct cx *cx) {
                set_long("flex-basis", "auto", 4, cx);
     const char *g = "1", *sh = "1", *b = "0%";
     size_t gl = 1, shl = 1, bl = 2;
-    int nums = 0;
+    int nums = 0, first_number = -1;
     bool basis = false;
     for (int i = 0; i < k; i++) {
         const char *q = t[i];
         float x;
         if (parse_number(&q, t[i] + tl[i], &x) && q == t[i] + tl[i]) {
-            if (nums == 0) g = t[i], gl = tl[i];
-            else if (nums == 1) sh = t[i], shl = tl[i];
-            else return false;
-            nums++;
-        } else { if (cx->supports_probe && basis) return false; basis = true; b = t[i]; bl = tl[i]; }
+            if (!isfinite(x) || x < 0) return false;
+            /* A unitless zero is a factor until both factors are supplied.
+               The third zero is then the definite zero-length basis, not an
+               illegal third factor (Flexbox 7.1). */
+            if (nums == 2) {
+                if (basis || x != 0) return false;
+                basis = true; b = t[i]; bl = tl[i];
+            } else {
+                if (nums == 0) { g = t[i]; gl = tl[i]; first_number = i; }
+                else {
+                    if (i != first_number + 1) return false;
+                    sh = t[i]; shl = tl[i];
+                }
+                nums++;
+            }
+        } else {
+            if (basis) return false;
+            basis = true; b = t[i]; bl = tl[i];
+        }
     }
     if (!nums) g = "1", gl = 1;
-    set_long("flex-grow", g, gl, cx);
-    set_long("flex-shrink", sh, shl, cx);
-    set_long("flex-basis", b, bl, cx);
-    return true;
+    /* Validate before publishing any longhand: an invalid basis must not
+       overwrite the grow/shrink of an earlier valid declaration. */
+    len_t parsed;
+    if (!parse_len(b, bl, cx, &parsed, LF_AUTO | LF_LENGTH)) return false;
+    return set_long("flex-grow", g, gl, cx) && set_long("flex-shrink", sh, shl, cx) &&
+           set_long("flex-basis", b, bl, cx);
 }
 
 static bool apply_short(const struct propdef *p, const char *v, size_t n, struct cx *cx) {
@@ -2681,6 +2888,12 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
     bool global = ident_is(v, n, "inherit") || ident_is(v, n, "initial") || ident_is(v, n, "unset") ||
                   ident_is(v, n, "revert") || ident_is(v, n, "revert-layer");
     switch (p->sh) {
+    case SH_ALL: {
+        if(!global)return false;
+        for(int i=0;i<NPROPS;i++)if(props[i].type!=PT_SHORT && strcmp(props[i].name,"direction") &&
+            strcmp(props[i].name,"unicode-bidi"))set_long(props[i].name,v,n,cx);
+        return true;
+    }
     case SH_ANIMATION: {
         static const char *const names[]={"animation-name","animation-duration","animation-delay",
             "animation-timing-function","animation-iteration-count","animation-direction",
@@ -2722,6 +2935,29 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
             !kw_find(kw_container_type,type,tn,&dummy)) return false;
         set_long("container-name",names,nn,cx);
         set_long("container-type",type,tn,cx);
+        return true;
+    }
+    case SH_BORDER_RADIUS: {
+        static const char *const names[]={"border-top-left-radius","border-top-right-radius","border-bottom-right-radius","border-bottom-left-radius"};
+        if(global){bool ok=true;for(int i=0;i<4;i++)ok&=set_long(names[i],v,n,cx);return ok;}
+        const char *axes[3];size_t sizes[3];int count=split_checked(v,n,axes,sizes,3,'/',cx);
+        if(count<1||count>2||!sizes[0]||(count==2&&!sizes[1]))return false;
+        const char *consumed=axes[count-1]+sizes[count-1];while(consumed<v+n&&is_space((unsigned char)*consumed))consumed++;
+        if(consumed!=v+n)return false;
+        len_t lengths[2][4];
+        static const int pick[5][4]={{0},{0,0,0,0},{0,1,0,1},{0,1,2,1},{0,1,2,3}};
+        for(int axis=0;axis<count;axis++) {
+            const char *tokens[5];size_t lengths_n[5];int k=split_checked(axes[axis],sizes[axis],tokens,lengths_n,5,' ',cx);
+            if(k<1||k>4)return false;
+            len_t values[4];for(int i=0;i<k;i++)if(!parse_len(tokens[i],lengths_n[i],cx,&values[i],LF_LENGTH))return false;
+            for(int i=0;i<4;i++)lengths[axis][i]=values[pick[k][i]];
+        }
+        if(count==1)memcpy(lengths[1],lengths[0],sizeof lengths[0]);
+        for(int i=0;i<4;i++) {
+            const struct propdef *corner=css_prop_lookup(names[i],strlen(names[i]));int index=css_prop_index(corner);
+            if(cx->set[index])continue;
+            cx->s->corner_radius[i].axis[0]=lengths[0][i];cx->s->corner_radius[i].axis[1]=lengths[1][i];cx->set[index]=1;
+        }
         return true;
     }
     case SH_MARGIN: return set_box("margin-%s", v, n, cx, all, 4);
@@ -3014,11 +3250,11 @@ bool css_apply(const struct propdef *p, const char *v, size_t n, struct cx *cx) 
     return true;
 }
 
-bool css_value_supported(const struct propdef *p, const char *v, size_t n) {
-    if (!p || !v || n > 65536) return false;
+static bool value_parse(const struct propdef *p, const char *v, size_t n, bool probe) {
+    if (!p || !v || n == SIZE_MAX) return false;
     arena_t *a = calloc(1, sizeof *a);
     if (!a) return false;
-    a->limit = 1u << 20;
+    if(probe)a->limit = 1u << 20;
     jmp_buf trap;
     a->trap = &trap;
     if (setjmp(trap)) { ar_free(a); free(a); return false; }
@@ -3027,11 +3263,17 @@ bool css_value_supported(const struct propdef *p, const char *v, size_t n) {
     css_style_init(&style, &parent);
     uint8_t *set = ar_alloc(a, (size_t)css_prop_count());
     struct cx cx = {.s=&style, .parent=&parent, .em=16, .rem=16, .vw=800, .vh=600,
-                    .a=a, .set=set, .supports_probe=true};
+                    .a=a, .set=set, .supports_probe=probe};
     bool result = css_apply(p, v, n, &cx) && !cx.invalid;
     ar_free(a);
     free(a);
     return result;
+}
+bool css_value_supported(const struct propdef *p,const char *v,size_t n) {
+    return n <= 65536 && value_parse(p,v,n,true);
+}
+bool css_value_valid(const struct propdef *p,const char *v,size_t n) {
+    return value_parse(p,v,n,false);
 }
 
 void css_style_init(style_t *s, const style_t *parent) {
@@ -3041,14 +3283,18 @@ void css_style_init(style_t *s, const style_t *parent) {
         return;
     }
     *s = *parent;
+    s->border_radius=0; /* legacy native-only radius is not inherited */
     for (int i = 0; i < NPROPS; i++)
         if (props[i].type != PT_SHORT && !props[i].inherited) copy_prop(&props[i], s, &initial);
-    s->before = s->after = s->backdrop = NULL;
+    s->before = s->after = s->backdrop = s->placeholder = NULL;
+    s->before_generated = s->after_generated = false;
 }
 
 void css_style_finish(style_t *s, const style_t *parent, bool root) {
     if (s->color == COLOR_CURRENT) s->color = parent ? parent->color : 0xFF000000u;
     if (s->bg_color == COLOR_CURRENT) s->bg_color = s->color;
+    for (struct css_box_shadow *shadow = (struct css_box_shadow *)s->box_shadow; shadow; shadow = shadow->next)
+        if (shadow->color == COLOR_CURRENT) shadow->color = s->color;
     for (int i = 0; i < 4; i++) {
         if (s->border_color[i] == COLOR_CURRENT) s->border_color[i] = s->color;
         if (s->border_style[i] == BS_NONE || s->border_style[i] == BS_HIDDEN) s->border_width[i] = 0;

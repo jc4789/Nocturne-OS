@@ -599,13 +599,16 @@ static void blit_glyph(canvas_t *c, const struct gent *e, int x, int y, uint32_t
     for (int j = 0; j < e->h; j++) {
         int py = y + e->y0 + j;
         if (py < c->cy0 || py >= c->cy1) continue;
+        struct gfx_clip_span span={0};
+        if(c->mask_clip&&!gfx_clip_row(c,py,c->cx0,c->cx1,&span))continue;
         const uint8_t *row = e->bmp + (size_t)j * e->w;
         uint32_t *dst = c->px + (size_t)py * c->pitch;
         for (int i = 0; i < e->w; i++) {
             int px = x + e->x0 + i;
             if (!row[i] || px < c->cx0 || px >= c->cx1) continue;
             int a = gamma_tab[row[i]] * alpha / 255;
-            dst[px] = a >= 255 ? (color | 0xFF000000u) : gfx_mix(dst[px], color, a);
+            if(c->mask_clip&&(px<span.opaque0||px>=span.opaque1))gfx_blend_pixel(c,px,py,((uint32_t)a<<24)|(color&0xffffffu));
+            else dst[px] = a >= 255 ? (color | 0xFF000000u) : gfx_mix(dst[px], color, a);
         }
     }
 }

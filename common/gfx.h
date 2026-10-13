@@ -5,11 +5,24 @@
 extern "C" {
 #endif
 
+/* Immutable during a raster job. Stack links are borrowed for the draw call;
+   alpha storage belongs to the caller's retained geometry cache. */
+struct gfx_mask_span { int x0,x1; }; /* retained all-255 interval, half-open */
+struct gfx_clip_span { int x0,x1,opaque0,opaque1; };
+struct gfx_mask_clip {
+    const struct gfx_mask_clip *next;
+    const uint8_t *alpha;
+    int x,y,w,h,pitch;
+    const struct gfx_mask_span *opaque; /* optional per-row proof, same owner as alpha */
+};
 typedef struct {
     uint32_t *px;
     int w, h, pitch;                 /* pitch in pixels */
     int cx0, cy0, cx1, cy1;          /* clip rectangle [cx0,cx1) x [cy0,cy1) */
+    const struct gfx_mask_clip *mask_clip;
 } canvas_t;
+uint8_t gfx_clip_alpha(const canvas_t *,int,int);
+int gfx_clip_row(const canvas_t *,int y,int x0,int x1,struct gfx_clip_span *);
 
 #define RGB(r, g, b)     (0xFF000000u | ((uint32_t)(r) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(b))
 #define ARGB(a, r, g, b) (((uint32_t)(a) << 24) | ((uint32_t)(r) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(b))

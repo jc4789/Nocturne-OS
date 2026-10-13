@@ -123,6 +123,11 @@ struct web_host {
        callback; origin/credentials are native initiating-realm values. Same
        native-only wait/response ownership contract as sync_load applies. */
     bool (*sync_request)(void *opaque, const struct web_request *request, struct web_response *response);
+    /* Join an already submitted module request without another HTTP fetch.
+       completed is borrowed from a pinned native pending record. This callback
+       may pump native network/UI only: no author JS, document replacement or
+       pending-record destruction. Return false on navigation/cancellation. */
+    bool (*wait_request)(void *opaque, uint64_t id, const bool *completed);
     void (*navigate)(void *opaque, const char *url, const char *post);
     /* Native form bytes are not a NUL-terminated urlencoded substitute.
        The host must copy transient data before returning to the JS task. */
@@ -162,8 +167,10 @@ struct web_host {
        maximum. Page code cannot reset it. */
     uint32_t js_task_budget_ms;
     /* Optional native-only cancellation checkpoint. NEVER dispatch JS/DOM,
-       layout, document paint, navigation or free a document here. Chrome-only
-       console painting is safe. False stops native style/layout as well as JS
+       layout, navigation or free a document here. Document paint/scroll is
+       allowed ONLY after web_native_input_ready confirms a committed snapshot;
+       a C style/layout/parser checkpoint never grants that permission.
+       Chrome-only console painting is safe. False stops native style/layout as well as JS
        task after a user close/stop request, not after a page-count quota. */
     bool (*script_checkpoint)(void *opaque);
     bool debug_js; /* native profiling is off unless the host explicitly opts in */
@@ -188,7 +195,19 @@ int64_t web_deadline(web_doc *d);
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *response);
 bool web_dirty(web_doc *d); /* consumes the legacy layout/paint notification */
 bool web_paint_dirty(web_doc *d); /* consumes a paint-only media notification */
+bool web_render_blocked(web_doc *d); /* initial head CSS only, not all resource loading */
 bool web_script_running(web_doc *d);
+/* Native scroll never invokes a listener or flushes DOM/layout. A deferred
+   notification keeps the original target and document epoch, not a raw node
+   borrowed from a possibly retired frame. */
+struct web_input_target { web_node *node; uint64_t document, stream; };
+/* prepared_wait is host permission only: author/native DOM is suspended at a
+   synchronous resource wait AFTER explicit native snapshot preparation. It
+   never permits painting from a native C checkpoint or an active layout. */
+bool web_native_input_ready(web_doc *d,bool prepared_wait);
+bool web_input_capture(web_doc *d,web_node *target,struct web_input_target *out);
+bool web_native_wheel_target(web_doc *d,web_node *target,struct web_input_target *out,bool prepared_wait);
+bool web_input_target_valid(web_doc *d,const struct web_input_target *target);
 /* Explicit developer-console input only. It runs in the active page realm,
  * under the ordinary JS watchdog, and grants no native module/file access. */
 bool web_console_eval(web_doc *d, const char *source, size_t length);

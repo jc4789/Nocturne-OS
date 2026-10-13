@@ -83,6 +83,16 @@ const fetchBridge = (() => {
         if(!metadata.strength)return response;
         if(body.stream)throw new TypeError('Integrity response was published before buffering completed');
         const bytes=body.bytes===null?new AB(0):body.bytes;
+        const matches=integrityBytes(bytes,metadata);
+        if(sig.aborted)throw sig.reason;
+        if(matches)return response;
+        /* The response has never escaped to author code. Release its exclusive
+           bytes on failure; an integrity error is a Fetch network TypeError. */
+        body.bytes=null;body.used=true;
+        throw new TypeError('Subresource integrity mismatch');
+    }
+    function integrityBytes(bytes,metadata) {
+        if(!metadata.strength)return true;
         const digest=apply(sriDigest,host,[metadata.algorithm,bytes]),size=apply(abLength,digest,[]);
         if(size!==(metadata.strength===1?32:metadata.strength===2?48:64))throw new TypeError('Invalid integrity digest');
         const hash=new U8(digest);let encoded='';
@@ -91,12 +101,8 @@ const fetchBridge = (() => {
             encoded+=sriAlphabet[a>>>2]+sriAlphabet[((a&3)<<4)|(b>>>4)]+
                 (i+1<size?sriAlphabet[((b&15)<<2)|(c>>>6)]:'=')+(i+2<size?sriAlphabet[c&63]:'=');
         }
-        if(sig.aborted)throw sig.reason;
-        for(let i=0;i<metadata.values.length;i++)if(encoded===metadata.values[i])return response;
-        /* The response has never escaped to author code. Release its exclusive
-           bytes on failure; an integrity error is a Fetch network TypeError. */
-        body.bytes=null;body.used=true;
-        throw new TypeError('Subresource integrity mismatch');
+        for(let i=0;i<metadata.values.length;i++)if(encoded===metadata.values[i])return true;
+        return false;
     }
     let NativeURL, Params, paramsString, Encoder, encode, Decoder, decode;
     let blobAPI,formDataAPI,objectURLAPI,streams;
@@ -521,6 +527,7 @@ const fetchBridge = (() => {
     }
     return {
         Headers,Request,Response,AbortSignal,AbortController,fetch,
+        moduleIntegrity(bytes,metadata){return integrityBytes(bytes,integrityMetadata(metadata));},
         initialize(){NativeURL=globalThis.URL;Params=globalThis.URLSearchParams;paramsString=Params.prototype.toString;Encoder=globalThis.TextEncoder;encode=Encoder.prototype.encode;Decoder=globalThis.TextDecoder;decode=Decoder.prototype.decode;},
         initializeBlobs(api){blobAPI=api;},
         initializeFormData(api){formDataAPI=api;},

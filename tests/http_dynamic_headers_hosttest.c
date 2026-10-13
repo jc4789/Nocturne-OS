@@ -15,6 +15,8 @@ struct net_stream {const char*p;size_t n,at,split;};
 static struct net_stream wire;
 net_stream *ns_open(const char*h,uint16_t port,bool tls,int timeout,char*error,size_t cap){(void)h;(void)port;(void)tls;(void)timeout;(void)error;(void)cap;wire.at=0;return &wire;}
 long ns_write(net_stream*s,const void*p,size_t n){(void)s;(void)p;return (long)n;}
+net_stream *ns_open_timed(const char *h,uint16_t p,bool tls,int t,char *e,size_t n,struct http_transport_timing *m){memset(m,0,sizeof *m);return ns_open(h,p,tls,t,e,n);}
+uint64_t uptime_ms(void){return 0;}
 long ns_read(net_stream*s,void*p,size_t n){size_t left=s->n-s->at;if(n>left)n=left;if(n>s->split)n=s->split;memcpy(p,s->p+s->at,n);s->at+=n;return (long)n;}
 const char *ns_error(net_stream*s){(void)s;return "";}
 void ns_close(net_stream*s){(void)s;}
