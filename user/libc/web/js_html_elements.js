@@ -527,7 +527,7 @@ const htmlElementsBridge = (() => {
     const extraExports={HTMLHeadingElement,HTMLPictureElement,HTMLSourceElement,HTMLMenuElement,HTMLDialogElement,HTMLDivElement};
     for(const C of [...Object.values(exports),...Object.values(extraExports)])define(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
     Object.assign(globalThis,exports,extraExports);
-    return {revealHidden,nodeProtos:Object.values(exports).map(C=>C.prototype),extraNodeProtos:Object.values(extraExports).map(C=>C.prototype),exports:{...exports,...extraExports,...interfaces},
+    return {revealHidden,queueElementScroll,nodeProtos:Object.values(exports).map(C=>C.prototype),extraNodeProtos:Object.values(extraExports).map(C=>C.prototype),exports:{...exports,...extraExports,...interfaces},
         initializeDialogs(C){if(ToggleEventImpl)throw new TypeErrorImpl('Dialog events already initialized');ToggleEventImpl=C;},
         requestClose(node){dialogState(node);call(requestCloseDialog,node,[]);},
         submit(node,result){

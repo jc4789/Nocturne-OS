@@ -73,7 +73,7 @@ const char *nmedia_can_play_type(const char *type);
    profiles/depth. A decoder name alone cannot identify a cost sample. */
 bool nmedia_performance_codec(const char *type,struct nmedia_video_configuration *);
 bool nmedia_performance_audio(const char *type,uint32_t *codec,uint32_t *profile);
-/* Aspect-fit nearest sampling. Destination clip and physical canvas bounds are
+/* Aspect-fit bilinear sampling. Destination clip and physical canvas bounds are
  * both enforced, including extreme/offscreen destination rectangles. */
 void nmedia_draw(canvas_t *canvas, const uint32_t *pixels, int source_width, int source_height,
                  int x, int y, int width, int height);

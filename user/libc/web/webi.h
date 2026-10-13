@@ -152,8 +152,10 @@ typedef struct node {
     int elem_index; /* 1-based position among element siblings */
     /* cascade and layout */
     struct style *style;
-    arena_t style_mem; /* element-owned computed values; descendants borrow inherited values */
+    arena_t style_mem; /* lazy variable tail; fixed styles live in document slabs */
     arena_t style_previous_mem;
+    struct css_style_slot *style_slots, *style_previous_slots;
+    struct css_declarations *style_declarations; /* immutable inline declaration snapshot */
     struct style *style_previous;
     struct node *style_retired_next;
     bool style_dirty, style_children_dirty;
@@ -176,6 +178,10 @@ typedef struct node {
     /* Persistent CSSOM element scroll position; box/layout arenas are rebuilt.
        Only the element's principal box consumes these offsets. */
     double scroll_x, scroll_y;
+    /* Native input notifications only. A detached dispatch batch has its own
+       link so callback-time input/adoption cannot overwrite that batch. */
+    struct web_doc *scroll_input_owner;
+    struct node *scroll_input_next, *scroll_dispatch_next;
     /* Marquee motion belongs to the native element, not CSSOM scroll state.
        Retained across detach/adopt and box reconstruction. */
     float marquee_x, marquee_y, marquee_progress;
@@ -482,6 +488,7 @@ bool css_containers_update(web_doc *d); /* supervisor, after layout; changed que
 bool css_container_names_valid(const char *s, size_t n);
 void css_mark_dirty(web_doc *d, node_t *n);
 void css_node_style_free(node_t *n);
+void css_style_doc_free(web_doc *d);
 void css_node_style_unpublish(node_t *n);
 void css_styles_release(web_doc *d);
 bool css_style_layout_equal(const style_t *a, const style_t *b);
@@ -581,6 +588,9 @@ typedef struct box {
     float paint_bounds[4]; /* document-space conservative subtree bounds, one paint only */
     bool paint_bounds_valid;
     bool paint_alpha; /* existing build/restyle traversal aggregates real subtree alpha effects */
+    pvec paint_layers; /* stable stacking order; owned until box retirement */
+    uint64_t paint_layers_layout, paint_layers_dom;
+    bool paint_layers_valid;
     bool style_sync_dirty; /* retirement join: this subtree has changed style borrows */
     /* inline formatting results (block containers with inline content) */
     struct run *runs;
@@ -594,8 +604,11 @@ typedef struct box {
     /* intrinsic widths cache */
     float min_cw, max_cw;
     bool intrinsic_done;
+    uint64_t intrinsic_font_generation;
     arena_t layout_mem, text_mem;
     bool layout_dirty, layout_cache_valid, layout_cache_safe,layout_cache_exports_floats;
+    bool layout_prepare_valid, layout_post_valid, layout_post_safe;
+    float layout_post_w, layout_post_h, layout_post_content_dy, layout_bottom;
     bool stretch_height_dependent;
     float cached_width, cached_cbh, cached_usedh;
     float cached_height, cached_baseline, cached_last_baseline, cached_content_dy;
@@ -646,6 +659,7 @@ struct run {
     node_t *node; /* original text/atomic node, for generic DOM event targeting */
     box_t *paint_owner; /* filtered inline group; private layout-arena dependency */
     int paint_next;
+    float descent; /* measured with the line; overflow does not query fonts again */
 };
 
 struct deco {
@@ -667,6 +681,7 @@ void boxes_restyle(web_doc *d);
 bool boxes_update_text(web_doc *d, node_t *n);
 void boxes_discard(web_doc *d); /* unpublish node/top-layer borrowers, then bmem */
 void layout_doc(web_doc *d, int width, int height);
+void layout_cache_free(web_doc *d);
 void layout_clamp_trace_report(web_doc *d);
 void layout_invalidate(box_t *b);
 void layout_invalidate_fonts(box_t *b);
@@ -682,6 +697,9 @@ float box_translation_axis(const box_t *b,unsigned axis,unsigned sources);
 bool box_viewport_fixed(const box_t *b); /* actual layout CB, not merely position:fixed */
 void box_abs_cb_rect(const box_t *cb, const web_doc *d, float rect[4]); /* x/y/w/h of padding CB in its content coordinates */
 void web_paint_debug_node_free(node_t *node);
+void web_hit_index_free(web_doc *d);
+void doc_paint_damage(web_doc *d, node_t *node);
+void doc_paint_full(web_doc *d); /* unclassified visual change, including frame composites */
 bool box_element_scrollable(const box_t *b);
 void box_scroll_clamp(box_t *b);
 
@@ -757,11 +775,15 @@ struct web_doc {
     unsigned native_layout_depth; /* native work must unwind before recovery */
     uint32_t native_checkpoint_count;
     node_t *details_toggle_first, *details_toggle_last;
+    node_t *scroll_input_first, *scroll_input_last;
+    bool scroll_viewport_pending; /* native child viewport input, normal tick only */
     web_doc *template_doc;
     arena_t mem;    /* DOM, stylesheets */
     arena_t smem;   /* computed styles: retained across text-only box rebuilds */
+    struct css_style_pool *style_pool; /* current/retired fixed computed-style slots */
     arena_t bmem;   /* box/anonymous-style ownership, never the computed styles */
     arena_t lmem;   /* layout results */
+    struct layout_text_cache *layout_text_cache; /* owned, generation-keyed measurements */
     arena_t cssmem; /* authored sheets: replaced on a DOM stylesheet mutation */
     node_t *owned_nodes;
     node_t *parser_form_nodes;
@@ -773,6 +795,12 @@ struct web_doc {
     uint64_t metadata_revision;
     bool metadata_valid;
     uint64_t layout_revision;
+    struct web_hit_index *hit_index; /* paint-order spatial index, no DOM ownership */
+    uint64_t paint_order_layout, paint_order_dom;
+    bool paint_order_valid;
+    uint64_t visual_revision; /* element scrolling/marquee geometry, not video pixels */
+    float paint_damage[4];
+    bool paint_damage_valid, paint_damage_full;
     struct html_parser *parser;
     struct web_js_state *js;
     bool live, dirty, paint_dirty, resources_dirty, images_dirty;

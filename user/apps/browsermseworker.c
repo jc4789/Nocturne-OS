@@ -8,28 +8,83 @@
 #include <stdio.h>
 #include <limits.h>
 #include <errno.h>
+#include <sys/mman.h>
 static bool exact(int fd,void *bytes,size_t size,bool writing){
     size_t at=0;while(at<size){ssize_t n=writing?write(fd,(uint8_t *)bytes+at,size-at):read(fd,(uint8_t *)bytes+at,size-at);
         if(n<0&&errno==EINTR)continue;if(n<=0)return false;at+=(size_t)n;}return true;
 }
 
 struct child_slot {nmedia_mse *buffer;struct nmedia_output pending;uint64_t published_revision,reported_decoded,reported_dropped;struct nmedia_info published_info;bool published,published_key_waiting;};
-/* Converted pixels are detached from the decoder before any subsequent
- * command. APPEND/seek/drop can therefore run while this owner is in flight. */
+struct video_storage {
+    struct video_storage *next;
+    struct nmsw_shared_video *shared;
+    size_t bytes;uint32_t capacity;int fd;uint64_t id;
+};
+/* Shared slots own snapshots, not decoder loans. Busy old geometry remains
+ * alive until the receiver returns it, even across APPEND/seek/drop. */
 struct video_tx {
     struct nmsw_video header;
-    uint32_t *pixels;size_t capacity,position;
+    struct video_storage *storage,*retired;uint64_t storage_id;size_t position;
     bool pending,horizon_valid;
     int64_t horizon_pts;
 };
 static int video_fd=-1;
+static unsigned video_storage_used(const struct video_storage *s){
+    unsigned used=0;
+    if(s)for(unsigned i=0;i<NMSW_VIDEO_SLOTS;i++)used+=__atomic_load_n(&s->shared->occupied[i],__ATOMIC_ACQUIRE)!=0;
+    return used;
+}
+static bool video_storage_busy(const struct video_storage *s){
+    return video_storage_used(s)!=0;
+}
+static bool video_full(const struct video_tx *v){
+    if(v->pending)return true;
+    unsigned used=video_storage_used(v->storage);
+    if(used>=NMSW_VIDEO_SLOTS)return true;
+    /* Resize must not turn a two-frame transfer window into an unbounded
+       succession of busy old rings. This is backpressure, not frame loss. */
+    for(const struct video_storage *s=v->retired;s;s=s->next){
+        used+=video_storage_used(s);if(used>=NMSW_VIDEO_SLOTS)return true;
+    }return false;
+}
+static void video_storage_free(struct video_storage *s){
+    if(!s)return;if(s->shared)munmap(s->shared,s->bytes);if(s->fd>=0)close(s->fd);nmedia_ff_free(s);
+}
+static void video_collect(struct video_tx *v){
+    struct video_storage **link=&v->retired;
+    while(*link){struct video_storage *s=*link;if(video_storage_busy(s)){link=&s->next;continue;}
+        *link=s->next;video_storage_free(s);
+    }
+}
+static bool video_publish(struct video_tx *v,const struct nmedia_output *o,uint32_t bytes){
+    if(v->pending||!o->pixels)return false;
+    if(!v->storage || v->storage->capacity<bytes){
+        if(bytes>UINT32_MAX-63 || v->storage_id==UINT64_MAX)return false;
+        uint32_t capacity=(bytes+63u)&~63u;size_t total;
+        if(!nmsw_shared_size(capacity,&total))return false;
+        struct video_storage *s=nmedia_ff_mallocz(sizeof *s);if(!s)return false;
+        s->fd=n_shared_create(total);s->bytes=total;s->capacity=capacity;s->id=++v->storage_id;
+        if(s->fd<0 || !(s->shared=n_shared_map(0,s->fd,total,N_PROT_WRITE))){video_storage_free(s);return false;}
+        s->shared->id=s->id; /* immutable backing identity, not only wire state */
+        if(v->storage){v->storage->next=v->retired;v->retired=v->storage;}
+        v->storage=s;
+    }
+    struct video_storage *s=v->storage;
+    for(unsigned slot=0;slot<NMSW_VIDEO_SLOTS;slot++){
+        if(__atomic_load_n(&s->shared->occupied[slot],__ATOMIC_ACQUIRE))continue;
+        uint8_t *pixels=(uint8_t *)(s->shared+1)+(size_t)slot*s->capacity;
+        memcpy(pixels,o->pixels,bytes);
+        __atomic_store_n(&s->shared->occupied[slot],1,__ATOMIC_RELEASE);
+        v->header.shared_fd=s->fd;v->header.buffer_slot=slot;
+        v->header.shared_capacity=s->capacity;v->header.shared_id=s->id;
+        v->pending=true;v->position=0;return true;
+    }return false;
+}
 static bool video_send(struct video_tx *v){
     while(v->pending){
-        bool header=v->position<sizeof v->header;
-        size_t total=sizeof v->header+(size_t)v->header.bytes;
-        const uint8_t *src=header?(const uint8_t *)&v->header+v->position:
-            (const uint8_t *)v->pixels+v->position-sizeof v->header;
-        size_t nbytes=header?sizeof v->header-v->position:total-v->position;
+        size_t total=sizeof v->header;
+        const uint8_t *src=(const uint8_t *)&v->header+v->position;
+        size_t nbytes=total-v->position;
         ssize_t n=write(video_fd,src,nbytes);
         if(n<0&&errno==EINTR)continue;
         if(n<0&&errno==EAGAIN)return true;
@@ -42,7 +97,7 @@ static bool command_wait(struct video_tx *v){
     while(v->pending){
         struct n_pollfd p[2]={{0,N_POLLIN,0},{video_fd,N_POLLOUT,0}};
         if(poll(p,2,-1)<0){if(errno==EINTR)continue;return false;}
-        /* Control/input demand wins over a large VIDEO write. */
+        /* Control/input demand wins over a backpressured header write. */
         if(p[0].revents&N_POLLIN)return true;
         if(p[0].revents&N_POLLHUP)return false;
         if(p[1].revents&N_POLLHUP)return false;
@@ -109,9 +164,10 @@ int main(void){
     int16_t pcm_batch[4096*2];
     for(;;){
         if(!command_wait(&video))break;
-        /* Commit the image horizon only after its complete owned raster has
-           crossed the VIDEO lane. A long-duration in-flight image must not
-           release seconds of PCM while the receiver still lacks its pixels. */
+        video_collect(&video);
+        /* Commit the image horizon only after a complete shared-slot header
+           is available to the receiver. Its immutable raster was published
+           first; a partially written header cannot release seconds of PCM. */
         if(!video.pending&&video.horizon_valid){video_delivered=true;video_delivered_pts=video.horizon_pts;video.horizon_valid=false;}
         struct nmsw_command c;if(!exact(0,&c,sizeof c,false))break;
         if(c.magic!=NMSW_MAGIC||c.reserved||c.slot>INT32_MAX||c.flags>1||c.op<NMSW_ADD||c.op>NMSW_KEYS||c.current<0||c.current>1000000000000LL||
@@ -157,7 +213,7 @@ int main(void){
         else if(c.op==NMSW_STEP){
             bool busy=false;int selected=-1;size_t active=0,ended=0;
             bool independent_video=false,video_ended=false;
-            /* The VIDEO lane can be backpressured while PCM's small control
+            /* The shared VIDEO ring can be backpressured while PCM's control
                messages are writable. An independent audio decoder must not
                run seconds past the last completely transferred image.
                This is output flow control, not clock forgery: retain its PCM
@@ -169,12 +225,10 @@ int main(void){
             for(size_t i=0;i<count;i++)if(slots[i].buffer){
                 const struct nmedia_info *info=nmedia_mse_info(slots[i].buffer);if(!info)continue;
                 bool needed=(!enabled[0]&&!enabled[1])||(info->audio&&enabled[0])||(info->video&&enabled[1]);if(needed)active++;
-                /* A detached VIDEO does not borrow the decoder's storage.
-                   Independent video buffers can wait for the lane; a muxed
-                   decoder may still yield PCM behind the detached image.
-                   If it yields the next image, retain that decoder loan and
-                   stop advancing it until the existing lane packet drains. */
-                if(video.pending&&info->video&&!info->audio&&enabled[1])continue;
+                /* Shared VIDEO does not borrow the decoder's storage. A muxed
+                   decoder can yield PCM while the ring holds earlier images.
+                   Retain the next decoder loan only when every slot is busy. */
+                if(video_full(&video)&&info->video&&!info->audio&&enabled[1])continue;
                 for(int budget=0;budget<16;budget++){
                     if(!slots[i].pending.kind){int result=nmedia_mse_step_at(slots[i].buffer,&slots[i].pending,c.current);if(result==NMEDIA_ERROR){m=slots[i].buffer;ok=false;break;}if(result==NMEDIA_AGAIN){if(needed&&!nmedia_mse_waiting_for_input(slots[i].buffer))busy=true;break;}}
                     if((slots[i].pending.kind==NMEDIA_AUDIO&&!enabled[0])||(slots[i].pending.kind==NMEDIA_VIDEO&&!enabled[1])){
@@ -183,17 +237,17 @@ int main(void){
                 }
                 if(!ok)break;if(!needed)continue;
                 if(slots[i].pending.kind==NMEDIA_END){ended++;continue;}if(!slots[i].pending.kind)continue;
-                if(video.pending&&slots[i].pending.kind==NMEDIA_VIDEO)continue;
+                if(video_full(&video)&&slots[i].pending.kind==NMEDIA_VIDEO)continue;
             }
             /* Scan candidates after every decoder has advanced: actual video
                EOF permits a legitimately longer audio tail, input/key waiting
-               does not. Only a completely transferred image establishes the
-               PCM horizon; an in-flight raster still belongs to this child. */
+               does not. Only a completely published shared image establishes
+               the PCM horizon; an unpublished header still belongs here. */
             if(independent_video)for(size_t i=0;i<count;i++)if(slots[i].buffer){const struct nmedia_info *info=nmedia_mse_info(slots[i].buffer);if(info&&info->video&&!info->audio)video_ended=slots[i].pending.kind==NMEDIA_END;}
             for(size_t i=0;i<count;i++)if(slots[i].buffer&&slots[i].pending.kind&&slots[i].pending.kind!=NMEDIA_END){
                 const struct nmedia_info *info=nmedia_mse_info(slots[i].buffer);if(!info)continue;
                 bool needed=(!enabled[0]&&!enabled[1])||(info->audio&&enabled[0])||(info->video&&enabled[1]);if(!needed)continue;
-                if(video.pending&&slots[i].pending.kind==NMEDIA_VIDEO)continue;
+                if(video_full(&video)&&slots[i].pending.kind==NMEDIA_VIDEO)continue;
                 if(independent_video&&!video_ended&&slots[i].pending.kind==NMEDIA_AUDIO&&
                    (!video_delivered||slots[i].pending.pts_ms>video_delivered_pts))continue;
                 if(selected<0||slots[i].pending.pts_ms<slots[selected].pending.pts_ms)selected=(int)i;
@@ -226,20 +280,23 @@ int main(void){
                 else if(output.kind==NMEDIA_VIDEO){
                     if(!nmedia_video_wire_bytes(output.width,output.height,&r.payload_bytes)){r.kind=NMEDIA_ERROR;strlcpy(r.error,"MSE video payload length is not representable",sizeof r.error);}
                     else {
-                            if(video.pending||!nmedia_mse_move_video(slots[selected].buffer,&output,&video.pixels,&video.capacity)){
+                            if(video_full(&video)){
                                 r.kind=NMEDIA_ERROR;r.payload_bytes=0;strlcpy(r.error,"MSE VIDEO owner transfer failed",sizeof r.error);
                             }else{
                                 video.header=(struct nmsw_video){.magic=NMSW_MAGIC,.generation=generation,.sequence=sequence,.slot=(uint32_t)selected,
                                     .bytes=r.payload_bytes,.epoch=c.epoch,.revision=nmedia_mse_revision(slots[selected].buffer),.pts=output.pts_ms,.width=output.width,.height=output.height,
                                     .video_measured_frames=output.video_measured_frames,.video_work_ms=output.video_work_ms,
                                     .video_measurement_id=output.video_measurement_id,.video_configuration=output.video_configuration};
-                                video.pending=true;video.position=0;r.kind=NMSW_VIDEO_PENDING;r.payload_bytes=0;
+                                if(!video_publish(&video,&output,r.payload_bytes)){
+                                    r.kind=NMEDIA_ERROR;r.payload_bytes=0;strlcpy(r.error,"MSE shared VIDEO allocation/publication failed",sizeof r.error);
+                                }else{r.kind=NMSW_VIDEO_PENDING;r.payload_bytes=0;
                                 /* A single coded image may intentionally span
                                    seconds. Use its real duration, not a fixed
                                    assumed frame rate or synthetic clock. */
                                 int64_t duration=MAX((int64_t)1,output.duration_ms);
                                 video.horizon_valid=true;
                                 video.horizon_pts=output.pts_ms<=INT64_MAX-duration?output.pts_ms+duration:INT64_MAX;
+                                }
                             }
                     }
                 }}
@@ -265,5 +322,7 @@ response:
     }
 shutdown:
     {volatile uint8_t *wipe=keys;for(size_t i=0;i<key_bytes;i++)wipe[i]=0;}nmedia_ff_free(keys);
-    for(size_t i=0;i<count;i++)nmedia_mse_close(slots[i].buffer);nmedia_ff_free(slots);nmedia_ff_free(meta);nmedia_ff_free(video.pixels);if(video_fd>=0)close(video_fd);return 0;
+    for(size_t i=0;i<count;i++)nmedia_mse_close(slots[i].buffer);nmedia_ff_free(slots);nmedia_ff_free(meta);
+    video_storage_free(video.storage);while(video.retired){struct video_storage *s=video.retired;video.retired=s->next;video_storage_free(s);}
+    if(video_fd>=0)close(video_fd);return 0;
 }

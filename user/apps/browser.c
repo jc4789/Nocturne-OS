@@ -43,7 +43,9 @@ static bool debug_js;
 /* Debug-only inclusive phase totals, with no page data or per-frame logging. */
 static struct {
     uint64_t since, tick_ms, tick_max_ms, layout_ms, draw_ms, update_ms, net_ms, wait_ms;
+    uint64_t partial_ms, partial_update_ms, video_present_ms;
     unsigned ticks, layouts, draws;
+    unsigned partial_draws, video_patches;
 } loop_profile;
 /* Browser pages need more time than small custom web_live hosts. The native
    command line can select a finite limit, never an unlimited watchdog. */
@@ -409,6 +411,7 @@ static void console_add(const char *level, const char *message) {
 }
 
 static void redraw(void) {
+    if(doc){int x,y,width,height;(void)web_take_paint_damage(doc,&x,&y,&width,&height);}
     uint64_t start = debug_js ? uptime_ms() : 0;
     draw();
     uint64_t drawn = debug_js ? uptime_ms() : 0;
@@ -419,6 +422,19 @@ static void redraw(void) {
         loop_profile.draws++;
     }
     need_paint = false;
+}
+static void redraw_damage(void){
+    int x,y,width,height;
+    if(!doc||need_paint||sel_node||!web_take_paint_damage(doc,&x,&y,&width,&height)){redraw();return;}
+    if(width<=0||height<=0)return;
+    uint64_t start=debug_js?uptime_ms():0;
+    canvas_t original=w->c;
+    gfx_clip(&w->c,x,TB+y,width,height);
+    draw_page();w->c=original;
+    uint64_t drawn=debug_js?uptime_ms():0;
+    win_update_rect(w,x,TB+y,width,height);
+    if(debug_js){loop_profile.partial_draws++;loop_profile.partial_ms+=drawn-start;
+        loop_profile.partial_update_ms+=uptime_ms()-drawn;}
 }
 
 static void redraw_status(void) {
@@ -444,19 +460,36 @@ static void scroll_to_xy(int x, int y) {
 }
 static void scroll_to(int y) { scroll_to_xy(scroll_x,y); }
 
+/* Native presentation changes only: no author callback or forced layout while
+   a script/native wait is active. Residual input chains to the viewport. */
+static void scroll_input(web_node *target,int dx,int dy,int edge){
+    bool handled=doc&&web_scroll_input(doc,target,&dx,&dy,edge);
+    if(edge){if(!handled)scroll_to(edge<0?0:max_scroll());}
+    else if(dx||dy){
+        int64_t x=(int64_t)scroll_x+dx,y=(int64_t)scroll_y+dy;
+        scroll_to_xy((int)MAX((int64_t)0,MIN(x,(int64_t)max_scroll_x())),
+                     (int)MAX((int64_t)0,MIN(y,(int64_t)max_scroll())));
+    }
+}
+static web_node *key_scroll_target(void){
+    web_node *target=doc?web_focused(doc):NULL;
+    return target?target:hover_node;
+}
+
 /* scrolling keys for the page; true if the event was one */
 static bool scroll_key(const struct gui_event *e) {
     int ph = page_h();
+    web_node *target=key_scroll_target();
     switch (e->key) {
-    case NKEY_LEFT: scroll_to_xy(scroll_x - LINE,scroll_y); return true;
-    case NKEY_RIGHT: scroll_to_xy(scroll_x + LINE,scroll_y); return true;
-    case NKEY_UP: scroll_to(scroll_y - LINE); return true;
-    case NKEY_DOWN: scroll_to(scroll_y + LINE); return true;
-    case NKEY_PGUP: scroll_to(scroll_y - (ph - LINE)); return true;
-    case NKEY_PGDN: scroll_to(scroll_y + (ph - LINE)); return true;
-    case NKEY_HOME: scroll_to(0); return true;
-    case NKEY_END: scroll_to(max_scroll()); return true;
-    case ' ': scroll_to(scroll_y + (e->mods & NMOD_SHIFT ? -1 : 1) * (ph - LINE)); return true;
+    case NKEY_LEFT: scroll_input(target,-LINE,0,0); return true;
+    case NKEY_RIGHT: scroll_input(target,LINE,0,0); return true;
+    case NKEY_UP: scroll_input(target,0,-LINE,0); return true;
+    case NKEY_DOWN: scroll_input(target,0,LINE,0); return true;
+    case NKEY_PGUP: scroll_input(target,0,-(ph-LINE),0); return true;
+    case NKEY_PGDN: scroll_input(target,0,ph-LINE,0); return true;
+    case NKEY_HOME: scroll_input(target,0,0,-1); return true;
+    case NKEY_END: scroll_input(target,0,0,1); return true;
+    case ' ': scroll_input(target,0,(e->mods & NMOD_SHIFT?-1:1)*(ph-LINE),0); return true;
     }
     return false;
 }
@@ -465,8 +498,11 @@ static bool scroll_key(const struct gui_event *e) {
 static bool try_scroll_event(const struct gui_event *e) {
     if (e->type == EV_WHEEL) {
         if (sel_node) return false;
-        if (e->mods & NMOD_SHIFT) scroll_to_xy(scroll_x + e->wheel * LINE,scroll_y);
-        else scroll_to(scroll_y + e->wheel * LINE);
+        web_node *target=hover_node;
+        if(doc&&!native_wait&&!web_script_running(doc))target=e->x>=0&&e->x<page_w()&&e->y>=TB&&e->y<TB+page_h()?
+            web_node_at(doc,document_x(e->x),e->y-TB+scroll_y):NULL;
+        if (e->mods & NMOD_SHIFT) scroll_input(target,e->wheel*LINE,0,0);
+        else scroll_input(target,0,e->wheel*LINE,0);
         return true;
     }
     if (e->type == EV_KEY && e->pressed && focus == F_PAGE && !sel_node && !(e->mods & (NMOD_CTRL | NMOD_ALT)) &&
@@ -1062,11 +1098,13 @@ static bool host_video_present(void *opaque, web_doc *document, const struct web
         w->c.pitch < w->c.w || w->c.h <= 0 ||
         (size_t)patch->pitch > SIZE_MAX / sizeof(uint32_t) / (size_t)patch->h ||
         (size_t)w->c.pitch > SIZE_MAX / sizeof(uint32_t) / (size_t)w->c.h) return false;
+    uint64_t start=debug_js?uptime_ms():0;
     for (int row = 0; row < patch->h; row++)
         memcpy(w->c.px + (size_t)(patch->y + row) * w->c.pitch + patch->x,
                patch->pixels + (size_t)row * patch->pitch, (size_t)patch->w * sizeof(uint32_t));
     __sync_synchronize();
     win_update_rect(w,patch->x,patch->y,patch->w,patch->h);
+    if(debug_js){loop_profile.video_patches++;loop_profile.video_present_ms+=uptime_ms()-start;}
     return true;
 }
 static bool host_navigation_pending(void *opaque) {
@@ -2336,8 +2374,8 @@ static void handle(const struct gui_event *e) {
             web_node *target = doc && e->y >= TB && e->y < TB + page_h() ?
                                web_node_at(doc, document_x(e->x), e->y - TB + scroll_y) : NULL;
             if (dispatch_native("wheel", target, e, true)) {
-                if (e->mods & NMOD_SHIFT) scroll_to_xy(scroll_x + e->wheel * LINE,scroll_y);
-                else scroll_to(scroll_y + e->wheel * LINE);
+                if (e->mods & NMOD_SHIFT) scroll_input(target,e->wheel*LINE,0,0);
+                else scroll_input(target,0,e->wheel*LINE,0);
             }
         }
         break;
@@ -2427,7 +2465,8 @@ static void document_step(uint64_t now) {
         }
         set_title();
         redraw();
-    } else if (media_paint || need_paint || (console_dirty && console_open)) redraw();
+    } else if (need_paint || (console_dirty && console_open)) redraw();
+    else if(media_paint)redraw_damage();
     flush_dom_layout();
     if (!refresh_seen && !loading) {
         int delay;
@@ -2455,9 +2494,14 @@ static void report_loop_profile(uint64_t now) {
              loop_profile.draws, (unsigned long)loop_profile.draw_ms,
              (unsigned long)loop_profile.update_ms, (unsigned long)loop_profile.net_ms,
              (unsigned long)loop_profile.wait_ms, (unsigned long)parallel_jobs());
+    unsigned partial=loop_profile.partial_draws,patches=loop_profile.video_patches;
+    uint64_t partial_ms=loop_profile.partial_ms,partial_update=loop_profile.partial_update_ms,video_ms=loop_profile.video_present_ms;
     memset(&loop_profile, 0, sizeof loop_profile);
     loop_profile.since = now;
     host_console(NULL, 0, message);
+    if(partial||patches){snprintf(message,sizeof message,
+        "Browser damage profile: partial draw %u/%lu ms, partial present %lu ms, video patch %u/%lu ms (copy/present only; scale/overlay belongs to media supply)",
+        partial,(unsigned long)partial_ms,(unsigned long)partial_update,patches,(unsigned long)video_ms);host_console(NULL,0,message);}
     static uint64_t reported_batches[PARALLEL_STAGE_COUNT];
     for (int stage = 1; stage < PARALLEL_STAGE_COUNT; stage++) {
         struct parallel_stats s;

@@ -20,6 +20,28 @@
 
 enum { M_PAINT, M_HIT, M_BOUNDS };
 
+/* Exact hit primitives are collected through the same walk, clips and stable
+ * stacking order as painting. A BVH only selects the last primitive; default
+ * actions and dynamic link resolution still use the ordinary native path. */
+struct hit_primitive {
+    float rect[4];
+    node_t *target, *node;
+    size_t order;
+    int kind;
+};
+struct hit_branch {
+    float rect[4];
+    size_t first, count, left, right, last_order;
+};
+struct web_hit_index {
+    struct hit_primitive *items;
+    struct hit_branch *branches;
+    size_t count, capacity, branch_count, branch_capacity;
+    uint64_t layout, dom, visual, fonts;
+    int view_x, view_y;
+    bool valid;
+};
+
 struct pctx {
     web_doc *d;
     canvas_t *c;
@@ -38,6 +60,8 @@ struct pctx {
     unsigned bounds_work;
     float bounds[4];
     bool bounds_valid, failed;
+    struct web_hit_index *index_build;
+    float hit_rect[4];
 };
 #include "paint_media_debug.h"
 
@@ -519,6 +543,9 @@ static void fill_gradient(canvas_t *c, float x, float y, float w, float h, float
 static void paint_bg_border(struct pctx *P, const style_t *st, float x, float y, float w, float h, const float *bw,
                             bool skip_bg, bool open_l, bool open_r) {
     canvas_t *c = P->c;
+    /* Culling the primitive, not the subtree: visible-overflow and fixed
+     * descendants must still be walked, and offscreen resources stay wanted. */
+    if (x >= c->cx1 || y >= c->cy1 || x + w <= c->cx0 || y + h <= c->cy0) return;
     float r = used_radius(st, w, h);
     if (st->mask_img) { /* an icon: the background colour through the mask, nothing else */
         uint32_t col = st->has_grad ? st->grad[0] : st->bg_color;
@@ -945,6 +972,15 @@ static void paint_marker(struct pctx *P, box_t *b) {
 
 /* ---------------------------------------------------------------- hit testing helpers */
 static bool inside(struct pctx *P, float x, float y, float w, float h) {
+    if (P->index_build) {
+        float left = fmaxf(x, P->c->cx0 - P->ox), top = fmaxf(y, P->c->cy0 - P->oy);
+        float right = fminf(x + w, P->c->cx1 - P->ox), bottom = fminf(y + h, P->c->cy1 - P->oy);
+        if (!(right > left && bottom > top) || !isfinite(left) || !isfinite(top) ||
+            !isfinite(right) || !isfinite(bottom)) return false;
+        P->hit_rect[0] = left; P->hit_rect[1] = top;
+        P->hit_rect[2] = right; P->hit_rect[3] = bottom;
+        return true;
+    }
     return P->hx >= x && P->hx < x + w && P->hy >= y && P->hy < y + h &&
            P->hx + P->ox >= P->c->cx0 && P->hx + P->ox < P->c->cx1 &&
            P->hy + P->oy >= P->c->cy0 && P->hy + P->oy < P->c->cy1;
@@ -981,19 +1017,39 @@ static void hit_target(struct pctx *P,node_t *target) {
     P->target=target;
     P->hit_any=false;
     memset(P->hit,0,sizeof *P->hit);
+    if (P->index_build && !P->failed) {
+        struct web_hit_index *index = P->index_build;
+        if (index->count == index->capacity) {
+            size_t capacity = index->capacity ? index->capacity * 2 : 128;
+            if (capacity <= index->capacity || capacity > SIZE_MAX / sizeof *index->items) { P->failed = true; return; }
+            void *items = realloc(index->items, capacity * sizeof *index->items);
+            if (!items) { P->failed = true; return; }
+            index->items = items; index->capacity = capacity;
+        }
+        struct hit_primitive *item = &index->items[index->count];
+        *item = (struct hit_primitive){.target=target,.order=index->count,.kind=WEB_HIT_NONE};
+        memcpy(item->rect,P->hit_rect,sizeof item->rect);
+        index->count++;
+        if (!(index->count & 63) && !web_native_checkpoint(P->d)) P->failed=true;
+    }
 }
 static void set_hit(struct pctx *P, int kind, node_t *n, node_t *link) {
     if (n) hit_target(P,n);
+    else if (link && P->index_build) hit_target(P,P->target);
     P->hit_any = true;
     P->hit->kind = kind;
     P->hit->node = n;
     P->hit->href = NULL;
     if (link) {
-        P->hit->href = doc_link_href(P->d, link);
+        if (!P->index_build) P->hit->href = doc_link_href(P->d, link);
         if (kind == WEB_HIT_NONE) {
             P->hit->kind = WEB_HIT_LINK;
             P->hit->node = link;
         }
+    }
+    if (P->index_build && P->index_build->count) {
+        struct hit_primitive *item = &P->index_build->items[P->index_build->count-1];
+        item->kind = P->hit->kind; item->node = P->hit->node;
     }
 }
 
@@ -1003,6 +1059,8 @@ static void set_disclosure_hit(struct pctx *P, node_t *details) {
     node_t *target = P->target;
     set_hit(P, WEB_HIT_DETAILS, details, NULL);
     P->target = target;
+    if (P->index_build && P->index_build->count)
+        P->index_build->items[P->index_build->count-1].target = target;
 }
 
 static void finish_disclosure_hit(struct pctx *P) {
@@ -1040,12 +1098,56 @@ static bool layer_push(pvec *layers, box_t *box) {
 }
 static bool collect_layers(web_doc *d, pvec *layers, box_t *b) {
     for (box_t *c = b->first; c; c = c->next) {
+        if(!web_native_checkpoint(d))return false;
         if (c->clamp_hidden || (c->st && c->st->display == D_NONE) || web_dialog_layer_box(d,c)) continue;
         if (paint_box_layer(c) && !layer_push(layers, c)) return false;
         if (!stacking_context(c) && !collect_layers(d, layers, c)) return false;
     }
     return true;
 }
+static bool sort_layers(web_doc *d,pvec *layers) {
+    if (layers->n < 2) return true;
+    size_t count=(size_t)layers->n;
+    void **scratch=malloc(count*sizeof *scratch);
+    if(!scratch)return false;
+    unsigned work=0;
+    for(size_t width=1;width<count;){
+        for(size_t first=0;first<count;first+=MIN(width*2,count-first)){
+            size_t middle=first+MIN(width,count-first),end=middle+MIN(width,count-middle);
+            size_t left=first,right=middle,out=first;
+            while(left<middle||right<end){
+                if(!(++work&255)&&!web_native_checkpoint(d)){free(scratch);return false;}
+                scratch[out++]=right==end||(left<middle&&layer_z(layers->v[left])<=layer_z(layers->v[right]))?
+                    layers->v[left++]:layers->v[right++];
+            }
+        }
+        memcpy(layers->v,scratch,count*sizeof *scratch);
+        if(width>count/2)break;
+        width*=2;
+    }
+    free(scratch);return true;
+}
+static bool prepare_layer_cache(web_doc *d,box_t *b){
+    if(b->paint_layers_valid&&b->paint_layers_layout==d->layout_revision&&b->paint_layers_dom==d->dom_revision)return true;
+    b->paint_layers_valid=false;b->paint_layers.n=0;
+    if(!collect_layers(d,&b->paint_layers,b)||!sort_layers(d,&b->paint_layers)){b->paint_layers.n=0;return false;}
+    b->paint_layers_layout=d->layout_revision;b->paint_layers_dom=d->dom_revision;b->paint_layers_valid=true;return true;
+}
+static bool prepare_paint_tree(web_doc *d,box_t *b){
+    if(!b)return true;
+    if(!web_native_checkpoint(d))return false;
+    if((b==d->root_box||stacking_context(b)||web_dialog_layer_box(d,b)||
+        (b->node&&b->node==d->fullscreen_element))&&!prepare_layer_cache(d,b))return false;
+    for(box_t *c=b->first;c;c=c->next)if(!prepare_paint_tree(d,c))return false;
+    return true;
+}
+static bool prepare_paint_order(web_doc *d){
+    if(d->paint_order_valid&&d->paint_order_layout==d->layout_revision&&d->paint_order_dom==d->dom_revision)return true;
+    d->paint_order_valid=false;
+    if(!prepare_paint_tree(d,d->root_box))return false;
+    d->paint_order_layout=d->layout_revision;d->paint_order_dom=d->dom_revision;d->paint_order_valid=true;return true;
+}
+static void release_layers(pvec *layers,bool borrowed){if(!borrowed)pv_free(layers);}
 
 /* the atomic inlines and floats inside an inline formatting context, in tree order */
 static void bounds_rect(struct pctx *P, float x, float y, float w, float h) {
@@ -1160,14 +1262,17 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
         }
         memcpy(parent_bounds, P->bounds, sizeof parent_bounds); P->bounds_valid = false;
     }
-    pvec layers = {0};
+    pvec layers = {0}; bool layers_borrowed=false;
     if (P->mode != M_BOUNDS && (b == P->d->root_box || b == P->top_root || stacking_context(b))) {
-        if (!collect_layers(P->d, &layers, b)) { P->failed = true; pv_free(&layers); return; }
-        /* Stable ordering preserves tree order for equal z-index values. */
-        for (int i = 1; i < layers.n; i++)
-            for (int j = i; j > 0 && layer_z(layers.v[j - 1]) > layer_z(layers.v[j]); j--) {
-                void *t = layers.v[j]; layers.v[j] = layers.v[j - 1]; layers.v[j - 1] = t;
+        if(!b->paint_layers_valid||b->paint_layers_layout!=P->d->layout_revision||b->paint_layers_dom!=P->d->dom_revision){
+            b->paint_layers_valid=false;b->paint_layers.n=0;
+            if(!collect_layers(P->d,&b->paint_layers,b)||!sort_layers(P->d,&b->paint_layers)){
+                b->paint_layers.n=0;P->failed=true;return;
             }
+            b->paint_layers_layout=P->d->layout_revision;b->paint_layers_dom=P->d->dom_revision;
+            b->paint_layers_valid=true;
+        }
+        layers=b->paint_layers;layers_borrowed=true;
     }
     canvas_t *c = P->c;
     float x = box_visual_x(b), y = box_visual_y(b);
@@ -1194,16 +1299,22 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             set_disclosure_hit(P, details);
         }
     }
+    if(P->index_build&&hit_style(st)&&b->node&&!b->node->foreign&&(b->marker||b->marker_shape)&&
+       inside(P,bx-st->font_size*2,by,st->font_size*2,bh)){
+        node_t *details=b->node->tag==T_summary?doc_details_activation(b->node):
+            b->anon&&b->node->tag==T_details&&!doc_details_summary(b->node)?b->node:NULL;
+        if(details){hit_target(P,b->node);set_disclosure_hit(P,details);}
+    }
     bool clip = (web_marquee_box(b) || b->clamp_truncated || st->overflow != OV_VISIBLE) && b->kind != B_INLINE && b->parent && !doc_viewport_overflow_box(P->d,b);
     /* Off-screen contexts can still contain viewport-fixed descendants. */
-    if (P->mode != M_BOUNDS && clip && !layers.n && (P->oy + by > c->cy1 || P->oy + by + bh < c->cy0)) { pv_free(&layers); return; }
+    if (P->mode != M_BOUNDS && clip && !layers.n && (P->oy + by > c->cy1 || P->oy + by + bh < c->cy0)) { release_layers(&layers,layers_borrowed); return; }
     /* group opacity: paint, then blend the result with what was there */
     uint32_t *saved = NULL;
     int gx = 0, gy = 0, gw = 0, gh = 0;
     if (P->mode == M_PAINT && group_opacity < 1 && b->kind != B_TEXT) {
         struct pctx measure = *P; measure.mode = M_BOUNDS; measure.bounds_valid = false;
         paint_box(&measure, b, true);
-        if (measure.failed) { P->failed = true; pv_free(&layers); return; }
+        if (measure.failed) { P->failed = true; release_layers(&layers,layers_borrowed); return; }
         if (measure.bounds_valid) {
             double left = floor((double)P->ox + measure.bounds[0]), top = floor((double)P->oy + measure.bounds[1]);
             double right = ceil((double)P->ox + measure.bounds[2]), bottom = ceil((double)P->oy + measure.bounds[3]);
@@ -1214,7 +1325,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
                 web_avmedia_snapshot_reject_region(c,gx,gy,gw,gh);
                 if ((size_t)gw > SIZE_MAX / sizeof *saved / (size_t)gh ||
                     !(saved = malloc(sizeof *saved * (size_t)gw * (size_t)gh))) {
-                    P->failed = true; pv_free(&layers); return; /* never paint an unfiltered substitute */
+                    P->failed = true; release_layers(&layers,layers_borrowed); return; /* never paint an unfiltered substitute */
                 }
                 for (int j = 0; j < gh; j++)
                     memcpy(saved + (size_t)j * gw, c->px + (size_t)(gy + j) * c->pitch + gx, sizeof *saved * (size_t)gw);
@@ -1274,7 +1385,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     for (; layer < layers.n; layer++) paint_stacked_layer(P, layers.v[layer]);
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
 done:
-    pv_free(&layers);
+    release_layers(&layers,layers_borrowed);
     if (saved) {
         int a = (int)(group_opacity * 255 + 0.5f);
         for (int j = 0; !P->failed && j < gh; j++) {
@@ -1326,6 +1437,7 @@ static void paint_stacked_layer(struct pctx *P, box_t *l) {
 }
 
 static void walk(struct pctx *P) {
+    if(P->mode!=M_BOUNDS&&!prepare_paint_order(P->d)){P->failed=true;return;}
     P->vx0 = P->c->cx0, P->vy0 = P->c->cy0;
     P->vx1 = P->c->cx1, P->vy1 = P->c->cy1;
     if (P->d->root_box) paint_box(P, P->d->root_box, true);
@@ -1374,6 +1486,9 @@ void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, i
        with a white canvas while a cancelled native transaction is retired
        or rebuilt; real scrolling resumes only after layout publication. */
     if(d->native_cancelled || d->native_recovery_pending || d->native_recovery_active)return;
+    /* Sorting/cancellation finishes before any committed window pixels are
+       overwritten. A cancelled cache build cannot leave a white viewport. */
+    if(!prepare_paint_order(d)){doc_paint_full(d);return;}
     paint_debug_begin(d);
     d->view_x=doc_x; d->view_y=doc_y; /* frame crops use this paint's real scroll */
     bool snapshot_root=!d->frame_parent;
@@ -1419,7 +1534,7 @@ void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, i
         d->paint_effect_failure_reported = true;
         web_js_console(d, 1, "Native filter/opacity composition stopped; no unfiltered replacement was drawn.");
     }
-    if (P.failed) d->paint_dirty = true;
+    if (P.failed) doc_paint_full(d);
     paint_debug_finish(d);
     if(snapshot_root) {
         canvas_t probe;int px,py;
@@ -1443,6 +1558,141 @@ void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, i
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
 }
 
+void web_hit_index_free(web_doc *d) {
+    if(!d||!d->hit_index)return;
+    free(d->hit_index->items);free(d->hit_index->branches);free(d->hit_index);d->hit_index=NULL;
+}
+void doc_paint_damage(web_doc *d,node_t *node){
+    if(!d)return;
+    /* An unclassified notification already pending cannot be downgraded to
+       a small rectangle by a later known node. Layout damage is always full. */
+    if(d->paint_dirty&&!d->paint_damage_valid)d->paint_damage_full=true;
+    d->paint_dirty=true;
+    box_t *box=node&&node->owner==d?node->box:NULL;
+    if(!d->layout_valid||d->need_style||d->need_boxes||!box||box->kind!=B_ATOMIC){d->paint_damage_full=true;return;}
+    float x=box_visual_x(box)-box->p[3]-box->b[3]-2,y=box_visual_y(box)-box->p[0]-box->b[0]-2;
+    float right=x+box->w+box->p[1]+box->p[3]+box->b[1]+box->b[3]+4;
+    float bottom=y+box->h+box->p[0]+box->p[2]+box->b[0]+box->b[2]+4;
+    if(!isfinite(x)||!isfinite(y)||!isfinite(right)||!isfinite(bottom)){d->paint_damage_full=true;return;}
+    if(!d->paint_damage_valid){d->paint_damage[0]=x;d->paint_damage[1]=y;d->paint_damage[2]=right;d->paint_damage[3]=bottom;d->paint_damage_valid=true;}
+    else{d->paint_damage[0]=fminf(d->paint_damage[0],x);d->paint_damage[1]=fminf(d->paint_damage[1],y);
+        d->paint_damage[2]=fmaxf(d->paint_damage[2],right);d->paint_damage[3]=fmaxf(d->paint_damage[3],bottom);}
+}
+bool web_take_paint_damage(web_doc *d,int *x,int *y,int *w,int *h){
+    if(!d)return false;
+    bool valid=d->paint_damage_valid&&!d->paint_damage_full&&d->layout_valid&&!d->need_style&&!d->need_boxes;
+    if(valid){
+        double vw=MAX(d->width,0),vh=MAX(d->height,0);
+        double left=fmin(vw,fmax(0,floor(d->paint_damage[0])-d->view_x)),top=fmin(vh,fmax(0,floor(d->paint_damage[1])-d->view_y));
+        double right=fmax(0,fmin(vw,ceil(d->paint_damage[2])-d->view_x)),bottom=fmax(0,fmin(vh,ceil(d->paint_damage[3])-d->view_y));
+        *x=(int)left;*y=(int)top;*w=right>left?(int)(right-left):0;*h=bottom>top?(int)(bottom-top):0;
+    }
+    d->paint_damage_valid=d->paint_damage_full=false;return valid;
+}
+static int hit_compare_x(const void *av,const void *bv){
+    const struct hit_primitive *a=av,*b=bv;
+    float x=a->rect[0]*.5f+a->rect[2]*.5f,y=b->rect[0]*.5f+b->rect[2]*.5f;
+    return x<y?-1:x>y?1:a->order<b->order?-1:a->order>b->order;
+}
+static int hit_compare_y(const void *av,const void *bv){
+    const struct hit_primitive *a=av,*b=bv;
+    float x=a->rect[1]*.5f+a->rect[3]*.5f,y=b->rect[1]*.5f+b->rect[3]*.5f;
+    return x<y?-1:x>y?1:a->order<b->order?-1:a->order>b->order;
+}
+static bool hit_sort(web_doc *d,struct web_hit_index *index,struct hit_primitive *scratch,size_t first,size_t count,
+                     int (*compare)(const void *,const void *)){
+    unsigned work=0;
+    for(size_t width=1;width<count;){
+        for(size_t begin=0;begin<count;begin+=MIN(width*2,count-begin)){
+            size_t left=begin,middle=begin+MIN(width,count-begin),right=middle,end=middle+MIN(width,count-middle),out=begin;
+            while(left<middle||right<end){
+                if(!(++work&255)&&!web_native_checkpoint(d))return false;
+                scratch[first+out++]=right==end||(left<middle&&compare(&index->items[first+left],&index->items[first+right])<=0)?
+                    index->items[first+left++]:index->items[first+right++];
+            }
+        }
+        memcpy(index->items+first,scratch+first,count*sizeof *scratch);
+        if(width>count/2)break;width*=2;
+    }
+    return true;
+}
+static size_t hit_partition(web_doc *d,struct web_hit_index *index,struct hit_primitive *scratch,size_t first,size_t count){
+    if(!web_native_checkpoint(d))return SIZE_MAX;
+    size_t id=index->branch_count++;struct hit_branch *branch=&index->branches[id];
+    *branch=(struct hit_branch){.first=first,.count=count,.left=SIZE_MAX,.right=SIZE_MAX};
+    memcpy(branch->rect,index->items[first].rect,sizeof branch->rect);
+    for(size_t i=first;i<first+count;i++){
+        if(!((i-first)&255)&&!web_native_checkpoint(d))return SIZE_MAX;
+        const struct hit_primitive *item=&index->items[i];
+        branch->rect[0]=fminf(branch->rect[0],item->rect[0]);branch->rect[1]=fminf(branch->rect[1],item->rect[1]);
+        branch->rect[2]=fmaxf(branch->rect[2],item->rect[2]);branch->rect[3]=fmaxf(branch->rect[3],item->rect[3]);
+        branch->last_order=MAX(branch->last_order,item->order);
+    }
+    if(count>8){
+        if(!hit_sort(d,index,scratch,first,count,
+            branch->rect[2]-branch->rect[0]>=branch->rect[3]-branch->rect[1]?hit_compare_x:hit_compare_y))return SIZE_MAX;
+        size_t middle=count/2;
+        branch->left=hit_partition(d,index,scratch,first,middle);
+        if(branch->left==SIZE_MAX)return SIZE_MAX;
+        branch->right=hit_partition(d,index,scratch,first+middle,count-middle);
+        if(branch->right==SIZE_MAX)return SIZE_MAX;
+    }
+    return id;
+}
+static bool hit_rect_contains(const float rect[4],float x,float y){return x>=rect[0]&&y>=rect[1]&&x<rect[2]&&y<rect[3];}
+static const struct hit_primitive *hit_query(const struct web_hit_index *index,size_t id,float x,float y,
+                                            const struct hit_primitive *best){
+    const struct hit_branch *branch=&index->branches[id];
+    if((best&&best->order>=branch->last_order)||!hit_rect_contains(branch->rect,x,y))return best;
+    if(branch->left==SIZE_MAX){
+        for(size_t i=branch->first;i<branch->first+branch->count;i++){
+            const struct hit_primitive *item=&index->items[i];
+            if((!best||item->order>best->order)&&hit_rect_contains(item->rect,x,y))best=item;
+        }
+        return best;
+    }
+    size_t first=branch->left,second=branch->right;
+    if(index->branches[first].last_order<index->branches[second].last_order){size_t swap=first;first=second;second=swap;}
+    best=hit_query(index,first,x,y,best);return hit_query(index,second,x,y,best);
+}
+/* Returns false only when the optimization is unavailable. Top-layer forced
+ * targets retain the exact walk until their backdrop index contract is needed. */
+static bool hit_index_lookup(struct pctx *P){
+    web_doc *d=P->d;
+    if(!d->layout_valid||d->need_boxes||d->need_style||d->fullscreen_element||web_dialog_count(d))return false;
+    struct web_hit_index *index=d->hit_index;
+    if(!index){index=calloc(1,sizeof *index);if(!index)return false;d->hit_index=index;}
+    uint64_t fonts=font_metrics_generation();
+    if(!index->valid||index->layout!=d->layout_revision||index->dom!=d->dom_revision||index->visual!=d->visual_revision||
+       index->view_x!=d->view_x||index->view_y!=d->view_y||index->fonts!=fonts||!fonts){
+        index->valid=false;index->count=index->branch_count=0;
+        struct pctx build=*P;struct web_hit ignored={0};build.hit=&ignored;build.index_build=index;
+        walk(&build);
+        if(build.failed||font_metrics_generation()!=fonts||!fonts){
+            if(d->native_cancelled||d->native_recovery_pending||d->native_recovery_active){P->failed=true;return true;}
+            return false;
+        }
+        if(index->count){
+            if(index->count>SIZE_MAX/2/sizeof *index->branches)return false;
+            size_t capacity=index->count*2;
+            if(capacity>index->branch_capacity){
+                void *branches=realloc(index->branches,capacity*sizeof *index->branches);
+                if(!branches)return false;
+                index->branches=branches;index->branch_capacity=capacity;
+            }
+            struct hit_primitive *scratch=malloc(index->count*sizeof *scratch);
+            if(!scratch)return false;
+            size_t root=hit_partition(d,index,scratch,0,index->count);free(scratch);
+            if(root==SIZE_MAX){P->failed=true;return true;}
+        }
+        index->layout=d->layout_revision;index->dom=d->dom_revision;index->visual=d->visual_revision;
+        index->view_x=d->view_x;index->view_y=d->view_y;index->fonts=fonts;index->valid=true;
+    }
+    const struct hit_primitive *item=index->count?hit_query(index,0,P->hx,P->hy,NULL):NULL;
+    if(item){P->target=item->target;P->hit->kind=item->kind;P->hit->node=item->node;}
+    return true;
+}
+
 bool web_hit_test(web_doc *d, int x, int y, struct web_hit *hit) {
     memset(hit, 0, sizeof *hit);
     if(!d || d->native_cancelled || d->native_recovery_pending || d->native_recovery_active)return false;
@@ -1456,7 +1706,7 @@ bool web_hit_test(web_doc *d, int x, int y, struct web_hit *hit) {
     P.hx = (float)x;
     P.hy = (float)y;
     P.hit = hit;
-    walk(&P);
+    if(!hit_index_lookup(&P))walk(&P);
     if (P.failed) { memset(hit, 0, sizeof *hit); return false; }
     finish_disclosure_hit(&P);
     /* A later noninteractive overlay is still a hit-test target. Never keep
@@ -1484,7 +1734,7 @@ web_node *web_node_at(web_doc *d, int x, int y) {
     P.hx = (float)x;
     P.hy = (float)y;
     P.hit = &hit;
-    walk(&P);
+    if(!hit_index_lookup(&P))walk(&P);
     if (P.failed) return NULL;
     if(P.target && web_frame_element(P.target)){
         struct web_frame *frame=web_frame_find(d,P.target);box_t *box=P.target->box;

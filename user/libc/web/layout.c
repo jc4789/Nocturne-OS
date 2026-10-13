@@ -166,6 +166,12 @@ static float text_width_uncached(const style_t *st, const wfont *f, const char *
 
 #include "layout_text_cache.h"
 
+void layout_cache_free(web_doc *d) {
+    if (!d) return;
+    layout_text_cache_free(d->layout_text_cache);
+    d->layout_text_cache = NULL;
+}
+
 /* ---------------------------------------------------------------- geometry helpers */
 static float hext(const box_t *b) { return b->p[1] + b->p[3] + b->b[1] + b->b[3]; }
 static float vext(const box_t *b) { return b->p[0] + b->p[2] + b->b[0] + b->b[2]; }
@@ -664,6 +670,7 @@ struct item {
     style_t *st;
     node_t *link;
     float shift; /* baseline shift upwards */
+    float descent; /* native font metric collected during line sizing */
 };
 
 struct ivec {
@@ -951,7 +958,7 @@ static void add_deco(struct iline *L, box_t *ib, float x0, float x1, float basel
 }
 
 /* vertical extent of an item above and below the baseline */
-static void item_vext(const struct item *it, float *above, float *below) {
+static void item_vext(struct item *it, float *above, float *below) {
     if (it->kind == IT_ATOMIC) {
         box_t *c = it->box;
         float h = c->h + vext(c) + c->m[0] + c->m[2];
@@ -975,6 +982,7 @@ static void item_vext(const struct item *it, float *above, float *below) {
     wfont f = style_font(st);
     float asc, desc;
     wf_metrics(&f, &asc, &desc);
+    it->descent = desc;
     float lh = line_height_px(st);
     float half = (lh - (asc + desc)) / 2;
     *above = asc + half + it->shift;
@@ -1095,7 +1103,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
                 while (n > 0 && it->s[n - 1] == ' ') n--;
             }
             struct run r = {x, baseline - it->shift, w, it->s, n, it->st, it->link, NULL, false,
-                            it->box ? it->box->node : NULL, it->box ? it->box->inline_paint_owner : NULL, -1};
+                            it->box ? it->box->node : NULL, it->box ? it->box->inline_paint_owner : NULL, -1, it->descent};
             if (n > 0) sb_put(&L->runs, (const char *)&r, sizeof r);
             x += w;
             if (it->space_end && i != last_text) x += extra_space;
@@ -1113,7 +1121,7 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
             c->cb = b;
             c->x = x + c->m[3] + c->b[3] + c->p[3];
             c->y = top + c->m[0] + c->b[0] + c->p[0];
-            struct run r = {x, top, it->w, NULL, 0, it->st, it->link, c, false, c->node, c->inline_paint_owner, -1};
+            struct run r = {x, top, it->w, NULL, 0, it->st, it->link, c, false, c->node, c->inline_paint_owner, -1, 0};
             sb_put(&L->runs, (const char *)&r, sizeof r);
             x += it->w;
             break;
@@ -2951,7 +2959,8 @@ static void inline_intrinsic(box_t *b, float *mn, float *mx) {
 
 static void intrinsic(box_t *b, float *mn, float *mx) {
     parallel_record_work(PARALLEL_INTRINSIC, 1);
-    if (b->intrinsic_done) {
+    uint64_t generation = font_metrics_generation();
+    if (b->intrinsic_done && generation && b->intrinsic_font_generation == generation) {
         *mn = b->min_cw;
         *mx = b->max_cw;
         return;
@@ -3009,7 +3018,8 @@ static void intrinsic(box_t *b, float *mn, float *mx) {
     if (z < a) z = a;
     b->min_cw = a;
     b->max_cw = z;
-    b->intrinsic_done = true;
+    b->intrinsic_font_generation = font_metrics_generation();
+    b->intrinsic_done = generation && generation == b->intrinsic_font_generation;
     *mn = a;
     *mx = z;
 }
@@ -3252,7 +3262,9 @@ static void clamp_apply(box_t *root) {
     struct run *runs = ar_alloc(&b->layout_mem, ((size_t)end + 1) * sizeof *runs);
     if (end) memcpy(runs, b->runs, (size_t)end * sizeof *runs);
     runs[end] = (struct run){x, line->baseline, ellipsis_width, clamp_ellipsis,
-        sizeof clamp_ellipsis - 1, b->st, NULL, NULL, false, NULL, NULL, -1};
+        sizeof clamp_ellipsis - 1, b->st, NULL, NULL, false, NULL, NULL, -1, 0};
+    float ellipsis_ascent;
+    wf_metrics(&font, &ellipsis_ascent, &runs[end].descent);
     b->layout_mem.trap = previous_trap;
     b->runs = runs; b->nruns++; line->end_run = b->nruns;
     for (int i = line->first_deco; i < b->ndecos; i++) {
@@ -3303,6 +3315,7 @@ static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float
         b->content_dy = b->cached_content_dy;
         return;
     }
+    b->layout_post_valid = false;
     ar_free(&b->layout_mem);
     b->layout_mem.chunk_size = 4096;
     b->layout_mem.trap = layout_scratch()->trap;
@@ -3491,9 +3504,11 @@ void layout_invalidate(box_t *b) {
        Inherited style changes dirty each affected child's own box at the
        cascade join; parent size changes naturally miss those input keys. */
     b->layout_cache_valid=false;
+    b->layout_prepare_valid = b->layout_post_valid = false;
     b->layout_dirty=true;b->intrinsic_done=false;
     for (b = b->parent; b; b = b->parent) {
         b->layout_dirty = true;
+        b->layout_prepare_valid = b->layout_post_valid = false;
         b->intrinsic_done = false;
     }
 }
@@ -3505,6 +3520,7 @@ void layout_invalidate_fonts(box_t *b){
     box_t *root=b;
     for(;;){
         b->layout_cache_valid=false;b->layout_dirty=true;b->intrinsic_done=false;
+        b->layout_prepare_valid = b->layout_post_valid = false;
         if(b->first){b=b->first;continue;}
         while(b!=root&&!b->next)b=b->parent;
         if(b==root)break;
@@ -3513,6 +3529,9 @@ void layout_invalidate_fonts(box_t *b){
 }
 
 static bool layout_cache_prepare(box_t *b) {
+    if (b->layout_prepare_valid && !b->layout_dirty) return b->layout_cache_safe;
+    b->layout_prepare_valid = false;
+    if (!layout_checkpoint()) return false;
     b->clamp_hidden = false;
     bool safe = !box_line_clamp(b) && !b->abspos && !(b->node && !b->node->foreign &&
         (b->node->tag == T_frameset || b->node->tag == T_iframe || b->node->tag == T_embed));
@@ -3524,7 +3543,9 @@ static bool layout_cache_prepare(box_t *b) {
         !len_auto(&s->min_height) || s->max_height.kind!=LK_NONE ||
         len_has_pct(&s->inset[0]) || len_has_pct(&s->inset[2]);
     for (box_t *c = b->first; c; c = c->next) {
-        if (!layout_cache_prepare(c)&&!c->abspos) safe = false;
+        /* A cached parent must not suppress list_abs/static-position work.
+           Its unaffected sibling formatting contexts can still be reused. */
+        if (!layout_cache_prepare(c)) safe = false;
         /* Reusing a shared, empty BFC must not suppress float registration.
            Floats inside an independent BFC remain contained by that child;
            the child being floated itself still contributes to this BFC. */
@@ -3534,6 +3555,7 @@ static bool layout_cache_prepare(box_t *b) {
     b->layout_cache_safe = safe;
     b->layout_cache_exports_floats=exports_floats;
     b->stretch_height_dependent=dependent;
+    b->layout_prepare_valid = true;
     return safe;
 }
 
@@ -3559,8 +3581,12 @@ static void intrinsic_job_run(size_t i, void *context) {
 }
 static void intrinsic_service(void *context) { web_native_checkpoint(context); }
 static void intrinsic_collect(box_t *b, pvec *jobs) {
+    if (b->layout_post_valid && !b->layout_dirty &&
+        b->cached_font_generation == font_metrics_generation()) return;
+    if (!layout_checkpoint()) return;
     for (box_t *c = b->first; c; c = c->next) {
-        if ((b->kind == B_FLEX || b->kind == B_GRID) && !c->intrinsic_done && intrinsic_parallel_safe(c))
+        if ((b->kind == B_FLEX || b->kind == B_GRID) &&
+            (!c->intrinsic_done || c->intrinsic_font_generation != font_metrics_generation()) && intrinsic_parallel_safe(c))
             pv_push(jobs, c);
         else intrinsic_collect(c, jobs);
     }
@@ -3577,16 +3603,25 @@ static void intrinsic_parallel_prepare(box_t *root) {
 
 /* relative positioning offsets, now that containing blocks have their sizes */
 static void relative_offsets(box_t *b) {
-    for (box_t *c = b->first; c; c = c->next) {
-        c->rel_dx = c->rel_dy = 0;
-        if (c->st && c->st->position == POS_RELATIVE && c->kind != B_INLINE && c->kind != B_TEXT) {
-            const len_t *in = c->st->inset;
-            float cw = c->cb ? c->cb->w : VW, ch = c->cb ? c->cb->h : VH;
-            if (!len_auto(&in[3])) c->rel_dx = len_resolve(&in[3], cw);
-            else if (!len_auto(&in[1])) c->rel_dx = -len_resolve(&in[1], cw);
-            if (!len_auto(&in[0])) c->rel_dy = len_has_pct(&in[0]) && !c->cb ? 0 : len_resolve(&in[0], ch);
-            else if (!len_auto(&in[2])) c->rel_dy = -len_resolve(&in[2], ch);
+    /* Placement in the parent may change while this box's inner layout is
+       reused. Refresh its own percentage inset against its actual cb first;
+       descendant offsets depend only on the unchanged inner dimensions. */
+    if (b->parent) {
+        b->rel_dx = b->rel_dy = 0;
+        if (b->st && b->st->position == POS_RELATIVE && b->kind != B_INLINE && b->kind != B_TEXT) {
+            const len_t *in = b->st->inset;
+            float cw = b->cb ? b->cb->w : VW, ch = b->cb ? b->cb->h : VH;
+            if (!len_auto(&in[3])) b->rel_dx = len_resolve(&in[3], cw);
+            else if (!len_auto(&in[1])) b->rel_dx = -len_resolve(&in[1], cw);
+            if (!len_auto(&in[0])) b->rel_dy = len_has_pct(&in[0]) && !b->cb ? 0 : len_resolve(&in[0], ch);
+            else if (!len_auto(&in[2])) b->rel_dy = -len_resolve(&in[2], ch);
         }
+    }
+    if (b->layout_post_valid && b->layout_cache_valid && b->layout_cache_safe &&
+        b->layout_post_w == b->w && b->layout_post_h == b->h &&
+        b->layout_post_content_dy == b->content_dy) return;
+    if (!layout_checkpoint()) return;
+    for (box_t *c = b->first; c; c = c->next) {
         relative_offsets(c);
     }
 }
@@ -3737,43 +3772,62 @@ static void scroll_area_publish(box_t *b) {
 }
 
 static void scroll_areas(box_t *b) {
-    if (b->clamp_hidden) { b->scroll_w = b->scroll_h = 0; return; }
+    if (b->layout_post_valid && b->layout_post_safe && b->layout_cache_valid &&
+        b->layout_post_w == b->w && b->layout_post_h == b->h &&
+        b->layout_post_content_dy == b->content_dy) {
+        /* Cached bounds are local, so publish the box's new placement into
+           the recomputed parent; do not add an old global union twice. */
+        box_scroll_clamp(b); scroll_area_publish(b); return;
+    }
+    b->layout_post_valid = false;
+    if (!layout_checkpoint()) return;
+    if (b->clamp_hidden) {
+        b->scroll_w = b->scroll_h = b->layout_bottom = 0;
+        b->layout_post_valid = false; return;
+    }
     b->scroll_w = scroll_extent(b->w + b->p[1] + b->p[3]);
     b->scroll_h = scroll_extent(b->h + b->p[0] + b->p[2]);
     for (int i = 0; i < b->nruns; i++) {
+        if (!(i & 63) && !layout_checkpoint()) return;
         const struct run *r = &b->runs[i];
         if (r->atomic) continue; /* its native box contributes below */
-        wfont font = style_font(r->st);
-        float asc, desc;
-        wf_metrics(&font, &asc, &desc);
         b->scroll_w = fmaxf_(b->scroll_w, scroll_extent(b->p[3] + r->x + r->w + b->p[1]));
-        b->scroll_h = fmaxf_(b->scroll_h, scroll_extent(b->p[0] + b->content_dy + r->y + desc + b->p[2]));
+        b->scroll_h = fmaxf_(b->scroll_h, scroll_extent(b->p[0] + b->content_dy + r->y + r->descent + b->p[2]));
     }
     for (int i = 0; i < b->ndecos; i++) {
+        if (!(i & 63) && !layout_checkpoint()) return;
         const struct deco *r = &b->decos[i];
         b->scroll_w = fmaxf_(b->scroll_w, scroll_extent(b->p[3] + r->x + r->w + b->p[1]));
         b->scroll_h = fmaxf_(b->scroll_h, scroll_extent(b->p[0] + b->content_dy + r->y + r->h + b->p[2]));
     }
-    for (box_t *c = b->first; c; c = c->next) scroll_areas(c);
+    /* Document bottom and overflow consume the same final geometry. Compute
+       both on this postorder walk rather than a second max_bottom tree walk. */
+    b->layout_bottom = b->h + b->p[2] + b->b[2];
+    bool clipped = b->clamp_truncated || (b->st && b->st->overflow != OV_VISIBLE &&
+        b->kind != B_TEXT && !doc_viewport_overflow_box(D, b));
+    for (box_t *c = b->first; c; c = c->next) {
+        scroll_areas(c);
+        if (clipped || c->abspos || c->kind == B_TEXT || c->kind == B_INLINE ||
+            c->kind == B_BR || c->cb != b) continue;
+        float bottom = b->content_dy;
+        if (!c->clamp_hidden) bottom += c->y + c->rel_dy + c->layout_bottom;
+        b->layout_bottom = fmaxf_(b->layout_bottom, bottom);
+    }
     if (b->clamp_truncated) {
         b->scroll_w = scroll_extent(b->w + b->p[1] + b->p[3]);
         b->scroll_h = scroll_extent(b->h + b->p[0] + b->p[2]);
     }
     box_scroll_clamp(b);
     scroll_area_publish(b);
+    b->layout_post_w = b->w; b->layout_post_h = b->h;
+    b->layout_post_content_dy = b->content_dy;
+    b->layout_post_safe = b->layout_cache_safe;
+    b->layout_post_valid = !D->native_cancelled;
 }
 
 static float max_bottom(box_t *b, float base) {
     if (b->clamp_hidden) return base;
-    float y = base + b->y + b->rel_dy;
-    float bottom = y + b->h + b->p[2] + b->b[2];
-    if (b->clamp_truncated || (b->st && b->st->overflow != OV_VISIBLE && b->kind != B_TEXT && !doc_viewport_overflow_box(D,b))) return bottom;
-    for (box_t *c = b->first; c; c = c->next) {
-        if (c->abspos || c->kind == B_TEXT || c->kind == B_INLINE || c->kind == B_BR) continue;
-        if (c->cb != b) continue;
-        bottom = fmaxf_(bottom, max_bottom(c, y + b->content_dy));
-    }
-    return bottom;
+    return base + b->y + b->rel_dy + b->layout_bottom;
 }
 
 void layout_doc(web_doc *d, int width, int height) {
@@ -3787,9 +3841,13 @@ void layout_doc(web_doc *d, int width, int height) {
     d->abs_boxes.n = 0;
     box_t *root = d->root_box;
     if (!root) { thread_local_set(1, previous_context); return; }
-    /* Heap state survives arena longjmp without indeterminate automatic
-     * locals. A nested layout gets its own table, even when calloc fails. */
-    struct layout_text_cache *cache = calloc(1, sizeof *cache);
+    /* A document keeps owned measurements between layouts. Same-document
+       reentrancy must not age/change the active outer cache; its temporary
+       table follows the old per-invocation lifetime, including longjmp. */
+    bool temporary_cache = d->layout_text_cache && d->layout_text_cache->busy;
+    struct layout_text_cache *cache = temporary_cache ? calloc(1, sizeof *cache) : d->layout_text_cache;
+    if (!temporary_cache && !cache) cache = d->layout_text_cache = calloc(1, sizeof *cache);
+    layout_text_begin(cache);
     struct layout_text_cache *previous_cache = layout_text_active;
     jmp_buf cleanup_trap;
     jmp_buf *outer_trap = d->lmem.trap;
@@ -3798,7 +3856,8 @@ void layout_doc(web_doc *d, int width, int height) {
     int arena_failed = setjmp(cleanup_trap);
     if (arena_failed) {
         layout_text_active = previous_cache;
-        layout_text_cache_free(cache);
+        if (cache) cache->busy = false;
+        if (temporary_cache) layout_text_cache_free(cache);
         d->lmem.trap = outer_trap;
         thread_local_set(1, previous_context);
         if (outer_trap) longjmp(*outer_trap, arena_failed);
@@ -3814,19 +3873,20 @@ void layout_doc(web_doc *d, int width, int height) {
     if (d->native_cancelled) goto finished;
     for (int i = 0; i < d->abs_boxes.n; i++) layout_abs(d->abs_boxes.v[i]);
     relative_offsets(root);
+    if (d->native_cancelled) goto finished;
     scroll_areas(root);
+    if (d->native_cancelled) goto finished;
     float h = fmaxf_(root->h, max_bottom(root, 0));
-    for (int i = 0; i < d->abs_boxes.n; i++) {
-        box_t *a = d->abs_boxes.v[i];
-        if (a->clamp_hidden || box_viewport_fixed(a)) continue;
-        float ay = box_abs_y(a);
-        h = fmaxf_(h, ay + a->h + a->p[2] + a->b[2]);
-    }
+    /* The containing-block overflow union already includes escaping absolute
+       descendants, borders, margins and transforms. A second global absolute
+       union leaks a private scrollport's clipped contents into root scrolling. */
+    h = fmaxf_(h, root->scroll_h);
     d->doc_h = document_extent(h);
     d->doc_w = width;
 finished:
     layout_text_active = previous_cache;
-    layout_text_cache_free(cache);
+    if (cache) cache->busy = false;
+    if (temporary_cache) layout_text_cache_free(cache);
     d->lmem.trap = outer_trap;
     thread_local_set(1, previous_context);
 }

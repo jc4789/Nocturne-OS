@@ -371,12 +371,52 @@ def main():
 
     failure = None
     mon = None
+    control_sequence = None
     try:
         mon = Monitor(p, port)
         print('隔離QEMU 起動:', p.pid, here, flush=True)
         next_shot, index, scroll_at, scroll_count = 15, 0, 45, 0
         startup_shot, startup_index = 15, 0
         while time.monotonic() < deadline and p.poll() is None:
+            # One monitor owner also serves interactive native operations.
+            # No competing HMP connection or author DOM mutation is needed.
+            control = here / 'control.json'
+            if control.is_file():
+                try:
+                    request = json.loads(control.read_text(encoding='utf-8'))
+                    sequence = request['sequence']
+                    if not isinstance(sequence, int) or sequence < 0:
+                        raise ValueError('操作sequenceは非負整数です')
+                    if sequence != control_sequence:
+                        control_sequence = sequence
+                        action = request['action']
+                        result = {'sequence': sequence, 'action': action}
+                        if action == 'pointer':
+                            x, y = request['x'], request['y']
+                            if type(x) is not int or type(y) is not int:
+                                raise ValueError('pointerはnative client座標です')
+                            result['native'] = move_native_pointer(mon, serial, 'NATIVE_POINTER', x, y,
+                                                                  min(deadline, time.monotonic()+20))
+                        elif action == 'key':
+                            key = request['key']
+                            if not isinstance(key, str) or not re.fullmatch(r'[a-zA-Z0-9_-]+', key):
+                                raise ValueError('不正なnative keyです')
+                            mon.cmd('sendkey '+key)
+                        elif action == 'click':
+                            mon.cmd('mouse_button 1');mon.cmd('mouse_button 0')
+                        elif action == 'shot':
+                            name = request['name']
+                            if not isinstance(name, str) or not re.fullmatch(r'[a-zA-Z0-9_-]+', name):
+                                raise ValueError('不正な撮影名です')
+                            shot(mon, name)
+                            result['image'] = str(here / (name+'.png'))
+                        elif action == 'stop':
+                            deadline = time.monotonic()
+                        else:
+                            raise ValueError('未知のnative操作です')
+                        (here / 'control-result.json').write_text(json.dumps(result, ensure_ascii=False), encoding='utf-8')
+                except (ValueError, KeyError, TypeError, RuntimeError) as error:
+                    (here / 'control-result.json').write_text(json.dumps({'sequence':control_sequence,'error':str(error)}, ensure_ascii=False), encoding='utf-8')
             if ready_at is None:
                 if serial.exists() and a.ready_marker in serial.read_text(encoding='utf-8', errors='replace'):
                     ready_at = time.monotonic()

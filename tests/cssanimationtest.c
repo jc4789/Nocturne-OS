@@ -49,7 +49,7 @@ static void parsing(void) {
     check("multiple animations rejected",!supports("animation","a 1s, b 2s"));
     check("multiple names rejected",!supports("animation-name","a,b"));
     check("steps not falsely supported",!supports("animation-timing-function","steps(3,end)"));
-    check("transform not falsely supported",!supports("transform","translateX(10px)"));
+    check("translation supported without falsely supporting rotation",supports("transform","translateX(10px)")&&!supports("transform","rotate(10deg)"));
 }
 static void sampling(void) {
     web_doc *d=load("html,body{margin:0}@keyframes fade{to{opacity:.8}}"
@@ -202,7 +202,7 @@ static void computed_style(void) {
         "t('delay',s.animationDelay==='-0.5s');t('iterations',s.animationIterationCount==='3');"
         "t('direction',s.animationDirection==='alternate');t('fill',s.animationFillMode==='both');"
         "t('paused',s.animationPlayState==='paused');t('easing',s.animationTimingFunction==='linear');"
-        "t('opacity',Math.abs(Number(s.opacity)-.25)<.006);t('transform',s.transform===''&&!CSS.supports('transform','translateX(1px)'));})()";
+        "t('opacity',Math.abs(Number(s.opacity)-.25)<.006);t('transform',s.transform==='none'&&CSS.supports('transform','translateX(1px)')&&!CSS.supports('transform','rotate(1deg)'));})()";
     check("computedStyle evaluation",web_console_eval(d,script,strlen(script)));
     check("computedStyle ten authored assertions",js_checks==10);
     web_free(d);

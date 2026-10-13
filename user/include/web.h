@@ -269,8 +269,15 @@ int web_doc_height(web_doc *d);
 int web_doc_width(web_doc *d);
 /* Native viewport position only: no layout, event dispatch or painting. */
 void web_viewport_position(web_doc *d, int x, int y);
+/* Consume native input in committed nested scrollports, without layout or JS.
+ * Remaining integer deltas belong to the caller's root viewport. edge is
+ * -1 (Home), 0 (delta), +1 (End); a vertical inner edge consumes the command. */
+bool web_scroll_input(web_doc *d, web_node *target, int *dx, int *dy, int edge);
 /* paint the document rectangle at (doc_x, doc_y) into the canvas rectangle (x, y, w, h) */
 void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y);
+/* Consume known paint-only damage in viewport coordinates. False means full
+ * repaint; true with empty dimensions means damage is outside the viewport. */
+bool web_take_paint_damage(web_doc *d,int *x,int *y,int *w,int *h);
 /* Debug-only native video geometry/paint transitions; no page state changes. */
 void web_paint_debug(bool enabled);
 

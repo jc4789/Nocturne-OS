@@ -219,6 +219,11 @@ time_t time(time_t *t) {
     return v;
 }
 int pipe(int fds[2]) { return (int)ret(SC1(SYS_PIPE, fds)); }
+int n_shared_create(size_t bytes) { return (int)ret(SC1(SYS_SHARED_CREATE,bytes)); }
+void *n_shared_map(int owner_pid,int fd,size_t bytes,int prot) {
+    long r=ret(SC4(SYS_SHARED_MAP,owner_pid,fd,bytes,prot));
+    return r<0 ? NULL : (void *)r;
+}
 int n_channel_listen(const char *key) {
     if(!key || !*key){errno=EINVAL;return -1;}
     return (int)ret(SC2(SYS_CHANNEL_LISTEN,key,strlen(key)));

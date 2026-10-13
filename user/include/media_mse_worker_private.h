@@ -2,7 +2,7 @@
 #include "media_mse_private.h"
 /* A native child owns a dynamic SourceBuffer registry. Wire has no pointers,
  * size_t, file paths or page-chosen protocols. */
-#define NMSW_MAGIC 0x4e4d5337u /* v7; exact VIDEO observation configuration */
+#define NMSW_MAGIC 0x4e4d5338u /* v8; VIDEO shared-page double buffer */
 #define NMSW_BUSY 4
 #define NMSW_CLOCK 5 /* Decoded disabled tracks: time only, never fake AV data. */
 #define NMSW_VIDEO_PENDING 6 /* STEP ACK: one VIDEO packet on its own lane. */
@@ -33,9 +33,18 @@ struct nmsw_metadata {
     uint64_t revision;int64_t group_end;
     struct nmsw_info info;
 };
-/* Dedicated VIDEO fd: complete header then exactly bytes ARGB. No text,
- * control metadata or PCM ever appears on this lane. Epoch/revision reject
- * old slot/seek images without abandoning a partially received packet. */
+/* Dedicated VIDEO fd carries headers only. Raster bytes reside in a native
+ * FD-backed double buffer, imported only by the direct parent. Release/acquire
+ * occupied flags preserve decoder/receiver ownership across seek and resize.
+ * Epoch/revision reject old images without reusing their borrowed storage. */
+#define NMSW_VIDEO_SLOTS 2u
+struct nmsw_shared_video {uint32_t occupied[NMSW_VIDEO_SLOTS];uint64_t id;};
+static inline bool nmsw_shared_size(uint32_t capacity,size_t *bytes){
+    if(!capacity || capacity%64)return false;
+    size_t raster=(size_t)capacity*NMSW_VIDEO_SLOTS;
+    if(raster/NMSW_VIDEO_SLOTS!=capacity || raster>SIZE_MAX-sizeof(struct nmsw_shared_video))return false;
+    *bytes=sizeof(struct nmsw_shared_video)+raster;return true;
+}
 struct nmsw_video {
     uint32_t magic,generation,sequence,slot,bytes,reserved;
     uint64_t epoch,revision;
@@ -44,9 +53,16 @@ struct nmsw_video {
     uint64_t video_measured_frames,video_work_ms;
     uint64_t video_measurement_id;
     struct nmedia_video_configuration video_configuration;
+    int32_t shared_fd;
+    uint32_t buffer_slot,shared_capacity,shared_reserved;
+    uint64_t shared_id;
 };
+static inline bool nmsw_shared_matches(const struct nmsw_shared_video *s,const struct nmsw_video *v){
+    return s&&v&&v->buffer_slot<NMSW_VIDEO_SLOTS&&v->shared_id&&
+        __atomic_load_n(&s->occupied[v->buffer_slot],__ATOMIC_ACQUIRE)==1&&s->id==v->shared_id;
+}
 _Static_assert(sizeof(struct nmsw_command)==72,"MSE command wire v3");
-_Static_assert(sizeof(struct nmsw_video)==112,"MSE VIDEO wire v7");
+_Static_assert(sizeof(struct nmsw_video)==136,"MSE VIDEO wire v8");
 _Static_assert(sizeof(struct nmsw_info)==128,"MSE info wire");
 _Static_assert(sizeof(struct nmsw_response)==272,"MSE response wire v7");
 _Static_assert(sizeof(struct nmsw_metadata)==160,"MSE metadata wire v2");
@@ -77,8 +93,8 @@ int nmedia_mse_worker_step(nmedia_mse_worker *,struct nmedia_output *);
 /* Taken, current-generation/revision VIDEO only. Both independent and muxed
  * decoder VIDEO use the separate lane; its owner permits a queued successor.
  * The retained control-payload compatibility path requires no successor.
- * Swap its completed owner for the caller's exclusively owned spare; capacity
- * is pixels, not bytes. No copy, wait, allocation or JS. */
+ * Copy its shared slot to the caller's exclusively owned display/lookahead
+ * spare, then release the slot. Capacity is pixels, not bytes. Never wait/JS. */
 bool nmedia_mse_worker_move_video(nmedia_mse_worker *,const struct nmedia_output *,
     uint32_t generation,unsigned slot,uint64_t revision,uint32_t **pixels,size_t *capacity);
 /* Consume/copy the previously returned span before this call: its storage may

@@ -405,7 +405,8 @@ static void picture_committed(struct web_avmedia *s,const struct nmedia_output *
     }else s->performance_frames=s->performance_work_ms=s->performance_measurement_id=0;
     bool size_changed=s->width!=o->width||s->height!=o->height;
     s->width=o->width;s->height=o->height;
-    if(size_changed){s->doc->layout_valid=false;s->doc->dirty=true;s->snapshot.valid=false;}else s->doc->paint_dirty=true;
+    if(size_changed){if(s->node&&s->node->box)layout_invalidate(s->node->box);s->doc->layout_valid=false;s->doc->dirty=true;s->snapshot.valid=false;}
+    else if(!s->snapshot.valid||s->generation!=s->snapshot.generation)doc_paint_damage(s->doc,s->node);
     s->presented_frames++;s->presented_ms=o->pts_ms;
 }
 /* Both isolated transports can exchange a complete taken VIDEO owner before
@@ -746,7 +747,7 @@ static JSValue caption_receive(JSContext *ctx,web_doc *d,struct web_avmedia *s,J
     if(!d->live||s->generation!=generation){caption_cues_free(cues,count);return JS_ThrowTypeError(ctx,"Caption document changed during conversion");}
     if(s->caption_count==count&&!s->caption[0]&&captions_equal(cues,s->caption_cues,count)){caption_cues_free(cues,count);return JS_UNDEFINED;}
     int *flow=count?nmedia_ff_mallocz((size_t)count*sizeof *flow):NULL;uint64_t *ids=count?nmedia_ff_malloc((size_t)count*sizeof *ids):NULL;if(count&&(!flow||!ids)){nmedia_ff_free(flow);nmedia_ff_free(ids);caption_cues_free(cues,count);return JS_ThrowOutOfMemory(ctx);}for(uint32_t i=0;i<count;i++)ids[i]=cues[i].region_id;if(count)qsort(ids,count,sizeof *ids,caption_id_compare);for(uint32_t i=0;i<count;i++){size_t lo=0,hi=count;while(lo<hi){size_t at=lo+(hi-lo)/2;if(ids[at]<cues[i].region_id)lo=at+1;else hi=at;}cues[i].region_group=lo;}nmedia_ff_free(ids);
-    caption_cues_free(s->caption_cues,s->caption_count);nmedia_ff_free(s->caption_flow);s->caption_cues=cues;s->caption_count=count;s->caption_flow=flow;s->caption[0]=0;s->caption_revision++;s->snapshot.valid=false;d->paint_dirty=true;return JS_UNDEFINED;
+    caption_cues_free(s->caption_cues,s->caption_count);nmedia_ff_free(s->caption_flow);s->caption_cues=cues;s->caption_count=count;s->caption_flow=flow;s->caption[0]=0;s->caption_revision++;s->snapshot.valid=false;doc_paint_full(d);return JS_UNDEFINED;
 }
 static JSValue avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *op, int argc, JSValueConst *argv) {
     if(!strcmp(op,"mseType")){
@@ -827,7 +828,7 @@ static JSValue avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *o
         size_t length;const char *text=JS_ToCStringLen(ctx,&length,argv[0]);if(!text)return JS_EXCEPTION;
         if(length>sizeof(s->caption)-1||memchr(text,0,length)){JS_FreeCString(ctx,text);return JS_ThrowRangeError(ctx,"caption text exceeds bounded plain-text surface");}
         bool rich=s->caption_count>0;caption_cues_free(s->caption_cues,s->caption_count);nmedia_ff_free(s->caption_flow);s->caption_flow=NULL;s->caption_cues=NULL;s->caption_count=0;
-        if(rich||strlen(s->caption)!=length||memcmp(s->caption,text,length)){s->snapshot.valid=false;memcpy(s->caption,text,length);s->caption[length]=0;s->caption_revision++;d->paint_dirty=true;}
+        if(rich||strlen(s->caption)!=length||memcmp(s->caption,text,length)){s->snapshot.valid=false;memcpy(s->caption,text,length);s->caption[length]=0;s->caption_revision++;doc_paint_full(d);}
         JS_FreeCString(ctx,text);return JS_UNDEFINED;
     }
     if(!strcmp(op,"captionCues")){if(!argc)return JS_ThrowTypeError(ctx,"Caption cue sequence required");return caption_receive(ctx,d,s,argv[0]);}
@@ -1179,13 +1180,17 @@ static void pump(struct web_avmedia *s,uint64_t now,uint64_t until,bool cooperat
 /* This path uses only native stream pixels and an immutable resolved suffix.
  * The host performs its own current-window guard before touching UI memory. */
 static void snapshot_publish(struct web_avmedia *s) {
+    bool unpublished=s->snapshot.delivered!=s->presented_frames;
     if(s->snapshot.valid&&(!s->doc||!s->doc->live||!s->node||!s->node->owner||
        (s->node->owner!=s->doc&&s->node->owner->dom_family!=s->doc)||!doc_node_connected(s->node))){snapshot_clear(s);return;}
     if(!s->snapshot.valid || !s->doc || !s->doc->live || !s->playing ||
        s->mse_seeking || s->range_resume || nmedia_worker_seeking(s->worker) ||
        !s->pixels || s->generation!=s->snapshot.generation ||
        s->width!=s->snapshot.source_w || s->height!=s->snapshot.source_h ||
-       s->snapshot.delivered==s->presented_frames)return;
+       !unpublished){
+        if(unpublished&&s->doc&&s->doc->live)doc_paint_damage(s->doc,s->node);
+        return;
+    }
     canvas_t patch;
     gfx_init(&patch,s->snapshot.output,s->snapshot.w,s->snapshot.h,s->snapshot.w);
     gfx_fill(&patch,0,0,patch.w,patch.h,RGB(0,0,0));
@@ -1199,7 +1204,7 @@ static void snapshot_publish(struct web_avmedia *s) {
         .pitch=s->snapshot.w,.pixels=s->snapshot.output};
     if(web_js_video_present(s->doc,&update)) {
         s->snapshot.delivered=s->presented_frames;s->window_frames++;
-    } else snapshot_clear(s);
+    } else {snapshot_clear(s);doc_paint_damage(s->doc,s->node);}
 }
 static void timing_profile(struct web_avmedia *s,uint64_t now){
     if((!s->playing&&(!s->ended||s->profile_ended))||(s->playing&&now-s->profile_at<2000))return;
@@ -1240,7 +1245,7 @@ void web_avmedia_tick(web_doc *d,uint64_t now){
     for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d){
         if(s==prepared)continue;
         if(s->node->owner!=d&&(!s->node->owner||s->node->owner->dom_family!=d)){transition(s,"owner-detach",s->generation);unload(s);}
-        else {pump(s,now,uptime_ms()+2,false);timing_profile(s,now);}
+        else {pump(s,now,uptime_ms()+2,false);snapshot_publish(s);timing_profile(s,now);}
     }
     web_avmedia_leave();
 }
@@ -1376,13 +1381,40 @@ void web_avmedia_snapshot_finish(void) {
 void web_avmedia_background(uint64_t now){nmedia_worker_background(now);nmedia_mse_worker_background(now);}
 int64_t web_avmedia_background_deadline(uint64_t now){int64_t a=nmedia_worker_deadline(now),b=nmedia_mse_worker_deadline(now);return a<0?b:b<0?a:MIN(a,b);}
 int64_t web_avmedia_deadline(web_doc *d,uint64_t now){
+    int64_t next=-1;
     for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d&&(s->playing||s->range_waiting)){
         if(s->mse_active&&nmedia_mse_worker_running(s->mse_worker)&&
            !nmedia_mse_worker_needs_service(s->mse_worker)&&!s->pending.kind&&!s->ahead.kind&&
            !s->mse_preparing&&!s->mse_seeking)continue;
-        return (int64_t)now+10;
+        int64_t due=-1;
+        /* Presentation wakes at the next authored PTS, converted using the
+           actual per-stream DMA clock/rate. A future video no longer acquires
+           a fixed ten-ms polling interval; multiple streams take the minimum. */
+        int64_t pts=-1;
+        if(s->ahead.kind==NMEDIA_VIDEO)pts=s->ahead.pts_ms;
+        if((s->pending.kind==NMEDIA_VIDEO||s->pending.kind==NMSW_CLOCK)&&
+           (pts<0||s->pending.pts_ms<pts))pts=s->pending.pts_ms;
+        if(pts>=0&&s->playing&&s->rate>0&&!s->starved){
+            int64_t delta=pts-current(s,now);
+            double wait=delta>0?ceil(delta/s->rate):0;
+            int64_t ms=wait>INT32_MAX?INT32_MAX:(int64_t)wait;
+            due=(int64_t)now+ms;
+        }
+        /* Audio refill and native transport have independent deadlines. Do
+           not sleep until a video PTS while a PCM queue is draining. Reading
+           one tiny native status here is not a made-up presentation clock. */
+        if(s->playing&&s->fd>=0&&s->audio_enabled){
+            struct n_audio_status status={0};ssize_t bytes=read(s->fd,&status,sizeof status);
+            uint64_t queued=(uint64_t)status.queued_frames+status.device_pending_frames;
+            int64_t refill=(int64_t)now+1;
+            if((bytes==sizeof status||bytes==sizeof(uint32_t))&&queued>WEB_AUDIO_TARGET/2)
+                refill=(int64_t)now+(int64_t)((queued-WEB_AUDIO_TARGET/2)*1000/SOUND_RATE);
+            if(due<0||refill<due)due=refill;
+        }
+        if(due<0)due=(int64_t)now+1; /* input/decoder/preroll progress */
+        if(next<0||due<next)next=due;
     }
-    return -1;
+    return next;
 }
 void web_avmedia_free(web_doc *d){
     web_avmedia_enter();

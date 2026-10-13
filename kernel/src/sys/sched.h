@@ -53,6 +53,7 @@ struct task {
     struct wait_queue child_wait;
     uint64_t brk_base, brk;
     uint64_t mmap_next;
+    struct shared_mapping *shared_mappings; /* native FD-backed page references */
     uint64_t cpu_ms;
     uint64_t start_ms;
     unsigned sched_level;     /* 0=interactive, 3=CPU-bound; ready/wait policy is BSP-owned */

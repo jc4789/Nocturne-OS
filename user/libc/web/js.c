@@ -164,6 +164,8 @@ struct web_js_state {
     uint32_t next_idle;
     uint64_t idle_period_end;
     bool idle_timeout_turn, idle_period_stopped;
+    bool scroll_input_turn;
+    bool scroll_viewport_turn;
     struct js_rejection *rejections,*last_rejection;
     bool rejection_oom;
     struct js_resource_event *events, *last_event;
@@ -1604,7 +1606,10 @@ static bool viewport_scroll_to(struct web_js_state *s,double x,double y) {
     int b=(int)MIN(MAX(y,0),MIN((double)INT_MAX,(double)MAX(0,d->doc_h-d->height)));
     struct web_frame *f=d->frame_element?web_frame_find(d->frame_parent,d->frame_element):NULL;
     int old_x,old_y;viewport_scroll_position(s,&old_x,&old_y);
-    if(f){if(f->scroll_x!=a || f->scroll_y!=b){f->scroll_x=a;f->scroll_y=b;d->paint_dirty=true;}}
+    if(f){if(f->scroll_x!=a || f->scroll_y!=b){
+        f->scroll_x=a;f->scroll_y=b;d->view_x=a;d->view_y=b;
+        d->visual_revision++;doc_paint_full(d);
+    }}
     else if(s->host.scroll_to)s->host.scroll_to(s->host.opaque,a,b);
     int new_x,new_y;viewport_scroll_position(s,&new_x,&new_y);
     return old_x!=new_x || old_y!=new_y;
@@ -6617,9 +6622,53 @@ static bool run_idle_period(struct web_js_state *s, uint64_t now) {
     uint32_t id = s->idle_runnable->id; s->idle_period_callbacks++;
     return invoke_idle(s, id, s->idle_period_end, false);
 }
+static bool run_native_scroll_notifications(struct web_js_state *s) {
+    web_doc *d = s->doc;
+    if (d->scroll_viewport_pending &&
+        (s->disabled || s->scroll_viewport_turn || !d->scroll_input_first)) {
+        /* Clear before dispatch: callback-time native scrolling is a new
+           notification for a later ordinary tick, not synchronous recursion. */
+        d->scroll_viewport_pending = false; s->scroll_viewport_turn = false;
+        if (!s->disabled && d->live && !d->inert) {
+            web_document_scroll(d); return true;
+        }
+    }
+    s->scroll_viewport_turn = true;
+    node_t *batch = d->scroll_input_first;
+    if (!batch) return false;
+    d->scroll_input_first = d->scroll_input_last = NULL;
+    /* Finish detaching every intrusive link before calling even a private
+       hook: patched built-ins can invoke authors, who may adopt/requeue any
+       later node. New native input then uses only the independent FIFO link. */
+    for (node_t *n = batch; n;) {
+        node_t *next = n->scroll_input_next;
+        n->scroll_dispatch_next = next;
+        n->scroll_input_next = NULL; n->scroll_input_owner = NULL;
+        n = next;
+    }
+    bool ran = !s->disabled && d->live && !d->inert;
+    if (ran) begin_named_task(s, "native element scroll notifications", d->visual_revision);
+    for (node_t *n = batch; n;) {
+        node_t *next = n->scroll_dispatch_next;
+        n->scroll_dispatch_next = NULL;
+        if (ran && !s->disabled && d->live && n->owner == d &&
+            n->type == N_ELEM && doc_node_root(n, true) == d->root) {
+            JSValue arg = wrap(s, n);
+            JSValue result = JS_IsException(arg) ? JS_EXCEPTION :
+                custom_element_hook(s, "queueNativeElementScroll", 1, &arg);
+            if (JS_IsException(result)) exception(s); else JS_FreeValue(s->ctx, result);
+            JS_FreeValue(s->ctx, arg);
+        }
+        n = next;
+    }
+    if (ran) end_task(s);
+    return ran;
+}
+
 void web_js_tick(web_doc *d, uint64_t now) {
     struct web_js_state *s = d ? d->js : NULL;
     if (!s || s->running) return;
+    if (s->disabled) run_native_scroll_notifications(s);
     prune_stream_scripts(s);
     if(s->disabled && (s->storage_source || s->indexed_db || s->indexed_db_pending || s->indexed_db_failed))storage_release_document(s);
     if(s->indexed_db)webidb_async_pump(s->indexed_db);
@@ -6636,7 +6685,17 @@ void web_js_tick(web_doc *d, uint64_t now) {
     }
     s->idle_timeout_turn = true;
     bool ran=false;
-    if(!s->disabled&&web_presentation_event_peek(d)){
+    /* Alternate with ordinary posted tasks: those tasks dispatch the existing
+       deduplicated trusted scroll event. A continuous native input stream must
+       not keep queuing forever without letting that event run. Never borrow an
+       active sibling/parent realm to deliver a native notification. */
+    if (!s->disabled && s->scroll_input_turn &&
+        (d->scroll_input_first || d->scroll_viewport_pending) &&
+        (!s->runtime_owner || !s->runtime_owner->runtime_active ||
+         !s->runtime_owner->runtime_active->running)) {
+        ran = run_native_scroll_notifications(s); s->scroll_input_turn = false;
+    } else s->scroll_input_turn = true;
+    if(!ran&&!s->disabled&&web_presentation_event_peek(d)){
         begin_named_task(s,"presentation events",d->presentation_revision);
         JSValue notified=custom_element_hook(s,"presentationSync",0,NULL);
         if(JS_IsException(notified))exception(s);
@@ -6768,6 +6827,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
 int64_t web_js_deadline(web_doc *d) {
     struct web_js_state *s = d ? d->js : NULL; if (!s) return -1;
     uint64_t deadline = UINT64_MAX, now = uptime_ms();
+    if (d->scroll_input_first || d->scroll_viewport_pending) return (int64_t)now;
     int64_t worker_deadline = web_worker_deadline(s->workers,now);
     if (worker_deadline >= 0) deadline = (uint64_t)worker_deadline;
     if (!s->parsing_done && !s->document_waiting && (!s->blocker || s->blocker->executed || s->disabled)) return (int64_t)now;

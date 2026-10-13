@@ -926,6 +926,7 @@ static void clear_boxes(node_t *n) {
 
 static void unpublish_boxes(box_t *b) {
     if(!b)return;
+    pv_free(&b->paint_layers);
     ar_free(&b->layout_mem);
     ar_free(&b->text_mem);
     if(b->node && b->node->box==b){b->node->box=NULL;b->node->anchor_block=NULL;}
@@ -933,6 +934,8 @@ static void unpublish_boxes(box_t *b) {
 }
 void boxes_discard(web_doc *d) {
     if(!d)return;
+    web_hit_index_free(d);
+    d->paint_order_valid=false;
     /* Walk the OLD published tree too: a removed/adopted node need not occur
        in the current DOM, but may still borrow this document's prior box. */
     unpublish_boxes(d->root_box);d->root_box=NULL;d->abs_boxes.n=0;

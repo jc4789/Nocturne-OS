@@ -1,10 +1,12 @@
-"""新しい同一layout文字測定cacheの境界だけを一度実行する補助。"""
+"""製品の文書寿命文字計測cacheを実コードで調べる限定ホスト試験。"""
 from pathlib import Path
 import os
 import subprocess
+import sys
 
 root = Path(__file__).resolve().parent.parent
-out = root / "build/goal-20261009"
+out = root / "build/browser-performance-layout"
+out.mkdir(parents=True, exist_ok=True)
 layout = (root / "user/libc/web/layout.c").read_text(encoding="utf-8")
 font = (root / "user/libc/font.c").read_text(encoding="utf-8")
 
@@ -18,11 +20,17 @@ prefix = r'''
 #include <limits.h>
 #include "webi.h"
 static unsigned checks, failures, measured, live_allocations;
-static size_t fail_at, allocation_attempts;
+static size_t fail_at, allocation_attempts, allocation_bytes;
 static bool change_backend;
+static bool snapshot_probe;
+bool web_avmedia_snapshot_is_probe(void){return snapshot_probe;}
+static void *test_tls;
+void *thread_local_get(unsigned slot){(void)slot;return test_tls;}
+void thread_local_set(unsigned slot,void *value){(void)slot;test_tls=value;}
+int gfx_utf8_decode(const char *s,uint32_t *cp){*cp=(unsigned char)*s;return 1;}
 static void check(bool ok,const char *name){checks++;if(!ok){failures++;printf("FAIL %s\n",name);}}
-static void *memo_malloc(size_t n){allocation_attempts++;if(fail_at==allocation_attempts)return NULL;void *p=malloc(n);if(p)live_allocations++;return p;}
-static void *memo_calloc(size_t n,size_t m){allocation_attempts++;if(fail_at==allocation_attempts)return NULL;void *p=calloc(n,m);if(p)live_allocations++;return p;}
+static void *memo_malloc(size_t n){allocation_attempts++;if(fail_at==allocation_attempts)return NULL;void *p=malloc(n);if(p){live_allocations++;allocation_bytes+=n;}return p;}
+static void *memo_calloc(size_t n,size_t m){allocation_attempts++;if(fail_at==allocation_attempts)return NULL;void *p=calloc(n,m);if(p){live_allocations++;allocation_bytes+=n*m;}return p;}
 static void memo_free(void *p){if(p){live_allocations--;free(p);}}
 static uint64_t font_metrics_epoch = 1;
 '''
@@ -33,6 +41,8 @@ prefix += r'''
    backend exposes duplicate dispatch and key/ownership errors. */
 float wf_width(const wfont *f,const char *s,size_t n){
     measured++;float w=(f->ttf?(float)((uintptr_t)f->ttf&15):0)+(f->bold?1:0);
+    for(const struct web_font_choice *p=f->choices;p;p=p->next)
+        w+=(float)((uintptr_t)p->resource->face&15)+(p->resource->failed?100:0);
     for(size_t i=0;i<n;i++)w+=(unsigned char)s[i]*f->px;
     if(change_backend){font_metrics_epoch++;change_backend=false;}
     return w;
@@ -41,12 +51,11 @@ float wf_width(const wfont *f,const char *s,size_t n){
 #define calloc memo_calloc
 #define free memo_free
 '''
-pieces = fn(layout, "static float text_width_uncached(")
+pieces = layout[layout.index("struct layout_text_cache;"):layout.index("static arena_t *layout_scratch(")]
+pieces += fn(layout, "static float text_width_uncached(")
 pieces += '#include "layout_text_cache.h"\n'
+pieces += fn(layout, "void layout_cache_free(")
 pieces += r'''
-static web_doc *D;
-static float VW,VH;
-static uint32_t GEN;
 static unsigned scope_mode, scope_depth;
 static style_t test_style;
 static wfont test_font={NULL,1,false};
@@ -58,14 +67,18 @@ static void layout_abs(box_t *b){(void)b;}
 static void relative_offsets(box_t *b){(void)b;}
 static void scroll_areas(box_t *b){(void)b;}
 static float max_bottom(box_t *b,float y){return b->h+y;}
+bool box_viewport_fixed(const box_t *b){(void)b;return false;}
+static void layout_cache_prepare(box_t *b){(void)b;}
+static void intrinsic_parallel_prepare(box_t *b){(void)b;}
 float box_abs_y(const box_t *b){return b->y;}
 static void layout_inner(box_t *b,void *f,float x,float y,float h){
     (void)f;(void)x;(void)y;(void)h;b->h=10;
     float a=text_width(&test_style,&test_font,"scope",5);
     float z=text_width(&test_style,&test_font,"scope",5);
     check(a==z,"scope real value");
-    if(scope_mode==1&&!scope_depth){
-        scope_depth++;layout_doc(&nested_doc,80,90);scope_depth--;
+    if((scope_mode==1||scope_mode==3)&&!scope_depth){
+        web_doc *target=scope_mode==3?D:&nested_doc;
+        scope_depth++;layout_doc(target,80,90);scope_depth--;
         check(text_width(&test_style,&test_font,"scope",5)==a,"outer cache restored");
     }
     if(scope_mode==2)longjmp(*D->lmem.trap,3);
@@ -84,4 +97,4 @@ env = dict(os.environ, PATH=str(cc.parent) + os.pathsep + os.environ.get("PATH",
 exe = out / "layout-text26-native.exe"
 subprocess.run([str(cc), "-std=gnu11", "-O1", "-I" + str(abi), "-Iuser/include", "-Icommon", "-Iuser/libc/web",
                 str(generated), "-o", str(exe)], cwd=root, env=env, check=True)
-subprocess.run([str(exe)], cwd=root, env=env, check=True, timeout=30)
+subprocess.run([str(exe)] + (["--round2"] if "--round2" in sys.argv else []), cwd=root, env=env, check=True, timeout=30)

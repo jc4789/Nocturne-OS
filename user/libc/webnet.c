@@ -9,7 +9,10 @@
 #include <time.h>
 #include <limits.h>
 
-#define WORKERS 4
+/* HTTP/1.x sockets have no multiplexing. Bound resource fan-out separately
+ * from per-origin connections, and adapt the active budget to native memory. */
+#define WORKERS 32
+#define ORIGIN_WORKERS 6
 #define PUMP_BYTES (256u * 1024u)
 struct request {
     struct request *next;
@@ -22,9 +25,11 @@ struct request {
     size_t response_limit;
     struct webnet_wire_response head;
     size_t head_pos;
-    bool cancelled, finishing;
+    bool cancelled, finishing, in_callback;
     bool streaming, paused, headers_seen, debug_request, debug_reported;
     char *cookie_site;
+    char *transport_origin;
+    uint64_t queued_at;
     enum webnet_credentials credentials;
     bool top_level;
     bool keepalive;
@@ -41,12 +46,24 @@ struct webnet {
     uint64_t serial;
     unsigned count;
     unsigned next_priority;
-    bool debug;
+    unsigned worker_limit;
+    uint64_t budget_at;
+    bool debug, pumping;
     size_t queued_bytes;
     webcookie_jar *cookies;
 };
 
-static void request_free(struct request *r) { if(!r)return;free(r->tx); free(r->rx); free(r->cookie_site); free(r); }
+static void request_free(struct request *r) { if(!r)return;free(r->tx); free(r->rx); free(r->cookie_site);free(r->transport_origin); free(r); }
+static unsigned worker_budget(void){
+    struct n_cpuinfo cpu={0};struct n_sysinfo memory={0};
+    unsigned online=cpu_info(&cpu)>=0&&cpu.online_cpus?cpu.online_cpus:1;
+    unsigned budget=online>WORKERS/4?WORKERS:MAX(8u,online*4u);
+    /* Keep half the currently free pages for DOM/media and decoder growth.
+       32 MiB headroom per active TLS/helper is a scheduling reserve, not a
+       response-size quota. Existing requests drain even when budget shrinks. */
+    if(sysinfo(&memory)>=0){uint64_t affordable=memory.free_mem/(64u*1024u*1024u);budget=MIN(budget,MAX(affordable,1u));}
+    return MIN(budget,WORKERS);
+}
 static void load_cookie_psl(webcookie_jar *jar) {
     FILE *f = fopen("/usr/share/browser/public_suffix_list.dat", "r");
     if (!f) return; /* Jar falls back to host-only, not a guessed suffix table. */
@@ -72,6 +89,7 @@ webnet *webnet_create(void) {
         n->cookies = webcookie_create();
         if (!n->cookies) { free(n); return NULL; }
         load_cookie_psl(n->cookies);
+        n->worker_limit=worker_budget();
         for (int i = 0; i < WORKERS; i++) n->slots[i].in = n->slots[i].out = -1;
     }
     return n;
@@ -152,6 +170,20 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     if (!r->tx) { free(r); return 0; }
     r->cookie_site = strdup(origin);
     if (!r->cookie_site) { request_free(r); return 0; }
+    struct url_owned destination={0};
+    if(url_parse_owned(q->url,&destination)){
+        size_t host_length=strlen(destination.host);
+        if(host_length>SIZE_MAX-32){url_owned_free(&destination);request_free(r);return 0;}
+        r->transport_origin=malloc(host_length+32);
+        if(r->transport_origin)snprintf(r->transport_origin,host_length+32,"%u:%u:%s",destination.tls,destination.port,destination.host);
+        if(r->transport_origin)for(char *c=r->transport_origin;*c;c++)if(*c>='A'&&*c<='Z')*c+=32;
+        url_owned_free(&destination);
+        if(!r->transport_origin){request_free(r);return 0;}
+    }
+    /* Origin bookkeeping is not admission policy. Native local navigation
+       and malformed URLs still reach the worker's existing intent/error
+       checks and deliver their ordinary asynchronous completion. */
+    r->queued_at=uptime_ms();
     r->credentials = q->credentials; r->top_level = q->kind == WEBNET_NAVIGATION && q->user_navigation;
     r->id = ++n->serial;
     if (!r->id) r->id = ++n->serial;
@@ -197,26 +229,56 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     n->queued_bytes += len; n->count++;
     return r->id;
 }
+static bool origin_available(const webnet *n,const struct request *request){
+    if(!request->transport_origin)return true;
+    unsigned busy=0;
+    for(unsigned i=0;i<WORKERS;i++){
+        const struct request *active=n->slots[i].rq;
+        if(active&&!active->cancelled&&active->transport_origin&&!strcmp(active->transport_origin,request->transport_origin))busy++;
+    }
+    for(const struct slot *s=n->parked;s;s=s->next){const struct request *active=s->rq;
+        if(active&&!active->cancelled&&active->transport_origin&&!strcmp(active->transport_origin,request->transport_origin))busy++;
+    }
+    /* Reserve the final HTTP/1 connection for document dependencies too,
+       not just a global slot: same-origin long polls cannot starve a script. */
+    return busy<(request->priority>=3?ORIGIN_WORKERS-1:ORIGIN_WORKERS);
+}
+static unsigned live_workers(const webnet *n){
+    unsigned live=0;
+    for(unsigned i=0;i<WORKERS;i++)if(n->slots[i].rq&&n->slots[i].pid>0)live++;
+    for(const struct slot *s=n->parked;s;s=s->next)if(s->rq&&s->pid>0)live++;
+    return live;
+}
+static struct request **available_class(webnet *n,unsigned priority){
+    unsigned live=live_workers(n);
+    if(live>=n->worker_limit)return NULL;
+    if(priority==3&&n->worker_limit>1&&!n->slots[0].rq&&live>=n->worker_limit-1)return NULL;
+    struct request **link=&n->queue;
+    while(*link&&(*link)->priority<(int)priority)link=&(*link)->next;
+    while(*link&&(*link)->priority==(int)priority){if(origin_available(n,*link))return link;link=&(*link)->next;}
+    return NULL;
+}
 static struct request *take_request(webnet *n,unsigned slot){
     if(!n->queue)return NULL;
-    struct request **chosen=&n->queue;
-    if(slot==0){
+    struct request **chosen=available_class(n,0);
+    if(slot==0&&n->worker_limit>1){
         /* Keep the existing navigation/render-resource lane. */
-        if((*chosen)->priority>=3)return NULL;
-    }else if((*chosen)->priority!=0){
+        if(!chosen)chosen=available_class(n,1);
+        if(!chosen)chosen=available_class(n,2);
+    }else if(!chosen){
         /* A continuing stream of scripts or newly queued images must not
            starve another resource class, including media fetches. FIFO within
            each class and actual transport concurrency are preserved. */
         unsigned first=n->next_priority?n->next_priority:1;
         for(unsigned offset=0;offset<3;offset++){
             unsigned priority=1+(first-1+offset)%3;
-            struct request **link=&n->queue;
-            while(*link && (*link)->priority<(int)priority)link=&(*link)->next;
-            if(*link && (*link)->priority==(int)priority){
+            struct request **link=available_class(n,priority);
+            if(link){
                 chosen=link;n->next_priority=priority==3?1:priority+1;break;
             }
         }
     }
+    if(!chosen)return NULL;
     struct request *request=*chosen;
     *chosen=request->next;request->next=NULL;
     return request;
@@ -399,14 +461,16 @@ static bool dispatch_stream_frame(webnet *n, struct request *r) {
     response.uploaded = r->head.magic == WEBNET_STREAM_UPLOAD ? r->head.status : 0;
     if (response.event == WEBNET_HEADERS) r->headers_seen = true;
     r->paused = true;
+    r->in_callback=true;
     r->callback(n, r->id, r->generation, &response, r->opaque);
+    r->in_callback=false;
     free(r->rx); r->rx = NULL; r->rx_len = r->rx_pos = r->head_pos = 0;
     memset(&r->head, 0, sizeof r->head);
     return true;
 }
 static void pump_slot(webnet *n,struct slot *s,uint64_t now){
         struct request *r = s->rq;
-        if (!r) return;
+        if (!r||r->in_callback) return;
         if (!r->finishing && now >= r->deadline) slot_stop(s, "Request deadline exceeded");
         if (!r->finishing&&!r->paused) {
             struct n_pollfd pf[2] = {{s->out, N_POLLIN, 0}, {s->in, N_POLLOUT, 0}};
@@ -469,7 +533,9 @@ static void pump_slot(webnet *n,struct slot *s,uint64_t now){
         }
 }
 void webnet_pump(webnet *n,uint64_t now){
-    if(!n)return;
+    if(!n||n->pumping)return;
+    n->pumping=true;
+    if(!n->budget_at||now>=n->budget_at){n->worker_limit=worker_budget();n->budget_at=now+1000;}
     struct request **qp=&n->queue;
     while(*qp){struct request *r=*qp;if(now<r->deadline){qp=&r->next;continue;}*qp=r->next;r->next=NULL;struct slot temp={r,0,-1,-1,NULL};snprintf(r->error,sizeof r->error,"Request deadline exceeded");complete(n,&temp);qp=&n->queue;}
     /* Paused pipes retain their process and bounded pipe storage, but do not
@@ -478,7 +544,11 @@ void webnet_pump(webnet *n,uint64_t now){
     while(*park){struct slot *s=*park;pump_slot(n,s,now);if(!s->rq){*park=s->next;free(s);}else park=&s->next;}
     for(int i=0;i<WORKERS;i++){
         struct slot *s=&n->slots[i];
-        if(!s->rq){struct request *r=take_request(n,(unsigned)i);if(r)start(s,r);}
+        if(!s->rq&&(unsigned)i<n->worker_limit){struct request *r=take_request(n,(unsigned)i);if(r){
+            if(n->debug)fprintf(stderr,"[webnet] dispatch id=%lu class=%d queued=%lu ms budget=%u\n",
+                (unsigned long)r->id,r->priority,(unsigned long)(now>=r->queued_at?now-r->queued_at:0),n->worker_limit);
+            start(s,r);
+        }}
         pump_slot(n,s,now);
         if(s->rq&&s->rq->paused&&!s->rq->finishing){
             struct slot *held=malloc(sizeof *held);
@@ -486,6 +556,7 @@ void webnet_pump(webnet *n,uint64_t now){
             *held=*s;held->next=n->parked;n->parked=held;memset(s,0,sizeof *s);s->in=s->out=-1;
         }
     }
+    n->pumping=false;
 }
 bool webnet_busy(const webnet *n) { return n && n->count != 0; }
 int webnet_timeout(const webnet *n, uint64_t now) {
@@ -526,10 +597,14 @@ static void cancel(webnet *n, uint64_t key, bool generation) {
         for (int i = 0; i < WORKERS; i++) {
             struct slot *s = &n->slots[i];
             if (!s->rq || s->rq->generation != key || s->rq->keepalive) continue;
-            if (s->pid > 0) waitpid(s->pid, NULL, 0);
+            if (s->pid > 0) {waitpid(s->pid, NULL, 0);s->pid=0;}
+            if(s->rq->in_callback)continue; /* borrowed response lives through callback return */
             complete(n, s); /* cancelled requests never invoke their callback */
         }
-        for(struct slot *s=n->parked;s;s=s->next)if(s->rq&&s->rq->generation==key&&!s->rq->keepalive){if(s->pid>0)waitpid(s->pid,NULL,0);complete(n,s);}
+        for(struct slot *s=n->parked;s;s=s->next)if(s->rq&&s->rq->generation==key&&!s->rq->keepalive){
+            if(s->pid>0){waitpid(s->pid,NULL,0);s->pid=0;}
+            if(!s->rq->in_callback)complete(n,s);
+        }
     }
 }
 void webnet_cancel(webnet *n, uint64_t id) { cancel(n, id, false); }

@@ -197,8 +197,7 @@ class Handler(SimpleHTTPRequestHandler):
                     pass
             return True
         if path == "/api/headers":
-            # Large complete blocks, not an oversized individual line. The
-            # worker's 16 KiB line bound is independent of its block bound.
+            # Large complete blocks exercise owned native header storage.
             try:
                 size = min(128 * 1024, max(0, int(query.get("bytes", ["6000"])[0])))
             except ValueError:
@@ -208,7 +207,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain")
             self.send_header("Content-Length", str(len(body)))
             self.cors(credentials=True)
-            # Queue a cookie before the overflowing block. A failed response
+            # Queue a cookie before a optionally malformed late field. A failed response
             # must roll back its privileged cookie events, not partially apply.
             if query.get("cookie") == ["yes"]:
                 self.send_header("Set-Cookie", "headeroverflow=not-applied; Path=/")
@@ -219,6 +218,8 @@ class Handler(SimpleHTTPRequestHandler):
                                  chr(ord("a") + index % 26) * min(6000, size - offset))
             self.send_header("X-Header-End", "complete-after-padding")
             self.send_header("Set-Cookie2", "legacysecret=not-visible")
+            if query.get("invalid") == ["yes"]:
+                self.send_header("Content-Length", "conflicting-length")
             self.end_headers()
             if self.command != "HEAD":
                 try:

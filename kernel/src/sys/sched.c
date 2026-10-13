@@ -3,6 +3,7 @@
 #include "arch/cpu.h"
 #include "arch/smp.h"
 #include "sys/sched.h"
+#include "sys/syscall.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
 #include "fs/vfs.h"
@@ -792,6 +793,7 @@ NORETURN void task_exit(int code) {
     net_process_exit(t->pid);
     cli();
     if (t->is_user && t->pml4 != kernel_pml4) {
+        sys_shared_cleanup(t);
         uint64_t old = t->pml4;
         t->pml4 = kernel_pml4;
         vmm_switch(kernel_pml4);

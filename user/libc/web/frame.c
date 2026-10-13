@@ -225,7 +225,7 @@ void web_frames_tick(web_doc *d,uint64_t now) {
         child=f->document;
         if(child && !f->detached) {
             if(web_dirty(child))f->owner->dirty=true;
-            if(web_paint_dirty(child))f->owner->paint_dirty=true;
+            if(web_paint_dirty(child))doc_paint_full(f->owner);
         }
         if(child && !f->detached && !f->request && !f->notified && web_js_complete(child)) {
             f->notified=true;

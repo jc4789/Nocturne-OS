@@ -531,6 +531,71 @@ static int64_t sys_killtree(int pid, int include_self) {
     return killed;
 }
 
+/* FD-backed native shared pages. A descriptor and every mapped address space
+ * hold independent file references: closing/killing either peer cannot free
+ * pages which the other still reads. No global names or untrusted pointers. */
+struct shared_pages {size_t count;uint64_t pages[];};
+struct shared_mapping {struct shared_mapping *next;struct file *file;uint64_t va;size_t bytes;};
+static void shared_release(struct vnode *v) {
+    struct shared_pages *p=v->priv;
+    if(p){for(size_t i=0;i<p->count;i++)pmm_free(p->pages[i]);kfree(p);}
+    kfree(v);
+}
+static struct vnode_ops shared_ops={.release=shared_release};
+static int64_t sys_shared_create(size_t bytes) {
+    if(!bytes || bytes>SIZE_MAX-(PAGE_SIZE-1))return -EINVAL;
+    bytes=ALIGN_UP(bytes,PAGE_SIZE);size_t count=bytes/PAGE_SIZE;
+    if(count>(SIZE_MAX-sizeof(struct shared_pages))/sizeof(uint64_t))return -EINVAL;
+    if(count>pmm_free_pages())return -ENOMEM;
+    struct vnode *v=kzalloc(sizeof *v);if(!v)return -ENOMEM;
+    struct shared_pages *p=kzalloc(sizeof *p+count*sizeof(uint64_t));
+    if(!p){kfree(v);return -ENOMEM;}
+    v->type=VT_SHARED;v->size=bytes;v->unlinked=true;v->ops=&shared_ops;v->priv=p;
+    for(;p->count<count;p->count++){
+        p->pages[p->count]=pmm_alloc_zeroed();
+        if(!p->pages[p->count]){shared_release(v);return -ENOMEM;}
+    }
+    struct file *f=vfs_open_vnode(v,O_RDWR);
+    if(!f){shared_release(v);return -ENOMEM;}
+    int fd=allocfd(f);if(fd<0)vfs_close(f);return fd;
+}
+static int64_t sys_shared_map(int pid,int fd,size_t bytes,int prot) {
+    if(!bytes || bytes>SIZE_MAX-(PAGE_SIZE-1) || (prot&~N_PROT_WRITE))return -EINVAL;
+    struct task *owner=task_process();struct file *f=NULL;
+    uint64_t irq=irq_save();struct task *peer=pid?task_find(pid):owner;
+    if(peer && !peer->is_thread && peer->is_user && !peer->exiting &&
+       (peer==owner || peer->parent==owner || owner->parent==peer) &&
+       fd>=0 && (size_t)fd<peer->fd_capacity && peer->fds[fd] &&
+       peer->fds[fd]->vn->type==VT_SHARED)f=vfs_dup(peer->fds[fd]);
+    irq_restore(irq);if(!f)return -EBADF;
+    bytes=ALIGN_UP(bytes,PAGE_SIZE);
+    if(bytes!=f->vn->size){vfs_close(f);return -EINVAL;}
+    struct shared_mapping *m=kzalloc(sizeof *m);
+    if(!m){vfs_close(f);return -ENOMEM;}
+    /* Reserve the VA range before publishing any PTE. No blocking handoff is
+       made in this page loop, but the short BSP guard also keeps future thread
+       mmap/clock/stack reservations from choosing this partially mapped span. */
+    irq=irq_save();uint64_t va=owner->mmap_next;
+    if(va>=USER_STACK_TOP-USER_STACK_MAX || bytes+PAGE_SIZE<bytes ||
+       bytes+PAGE_SIZE>USER_STACK_TOP-USER_STACK_MAX-va){irq_restore(irq);vfs_close(f);kfree(m);return -ENOMEM;}
+    uint64_t reserved_end=va+bytes+PAGE_SIZE;owner->mmap_next=reserved_end;irq_restore(irq);
+    struct shared_pages *p=f->vn->priv;size_t mapped=0;
+    uint64_t flags=PTE_U|PTE_SHARED|pte_nx|(prot&N_PROT_WRITE?PTE_W:PTE_SHARED_RO);
+    for(;mapped<p->count;mapped++)if(!vmm_map_page(owner->pml4,va+mapped*PAGE_SIZE,p->pages[mapped],flags))break;
+    if(mapped!=p->count){vmm_user_free(owner->pml4,va,mapped*PAGE_SIZE);
+        irq=irq_save();if(owner->mmap_next==reserved_end)owner->mmap_next=va;irq_restore(irq);
+        vfs_close(f);kfree(m);return -ENOMEM;
+    }
+    irq=irq_save();*m=(struct shared_mapping){.next=owner->shared_mappings,.file=f,.va=va,.bytes=bytes};
+    owner->shared_mappings=m;irq_restore(irq);return (int64_t)va;
+}
+void sys_shared_cleanup(struct task *owner) {
+    while(owner->shared_mappings){struct shared_mapping *m=owner->shared_mappings;
+        owner->shared_mappings=m->next;
+        vmm_user_free(owner->pml4,m->va,m->bytes);vfs_close(m->file);kfree(m);
+    }
+}
+
 /* anonymous memory in its own region above the heap (window buffers live there too) */
 static int64_t sys_mmap_locked(size_t len, int prot) {
     struct task *t = task_process();
@@ -551,6 +616,15 @@ static int64_t sys_mmap_locked(size_t len, int prot) {
 static int64_t sys_munmap_locked(uint64_t va, size_t len) {
     struct task *t = task_process();
     if (va & (PAGE_SIZE - 1) || va < USER_MMAP_BASE || va + len > t->mmap_next || va + len < va) return -EINVAL;
+    if(len>SIZE_MAX-(PAGE_SIZE-1))return -EINVAL;
+    len=ALIGN_UP(len,PAGE_SIZE);
+    struct shared_mapping **link=&t->shared_mappings;
+    while(*link){struct shared_mapping *m=*link;
+        if(va<m->va+m->bytes && m->va<va+len){
+            if(va!=m->va || len!=m->bytes)return -EINVAL;
+            *link=m->next;vmm_user_free(t->pml4,va,len);vfs_close(m->file);kfree(m);return 0;
+        }link=&m->next;
+    }
     for (uint64_t a = va; a < va + len; a += PAGE_SIZE)
         if (vmm_get_pte(t->pml4, a) & PTE_SHARED) return -EINVAL; /* a window buffer */
     vmm_user_free(t->pml4, va, len);
@@ -627,6 +701,8 @@ void syscall_dispatch(struct regs *r) {
     case SYS_UPTIME: ret = uptime_ms(); break;
     case SYS_TIME: ret = time_now(); break;
     case SYS_PIPE: ret = sys_pipe((int *)a); break;
+    case SYS_SHARED_CREATE: ret = sys_shared_create(a); break;
+    case SYS_SHARED_MAP: ret = sys_shared_map((int)a,(int)b,c,(int)d); break;
     case SYS_CHANNEL_LISTEN: ret = sys_channel_named((const char *)a,b,true); break;
     case SYS_CHANNEL_CONNECT: ret = sys_channel_named((const char *)a,b,false); break;
     case SYS_CHANNEL_ACCEPT: ret = sys_channel_accept((int)a); break;

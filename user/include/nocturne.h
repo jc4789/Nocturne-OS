@@ -50,6 +50,11 @@ int msleep(unsigned ms);
 unsigned sleep(unsigned s);
 uint64_t uptime_ms(void);
 int pipe(int fds[2]);
+/* Native shared-page object. Descriptors are private capabilities; importing
+ * another process's descriptor is permitted only between direct parent/child.
+ * A mapping retains the object after close and is released by whole munmap. */
+int n_shared_create(size_t bytes);
+void *n_shared_map(int owner_pid,int fd,size_t bytes,int prot);
 /* Native named rendezvous, not a filesystem or Unix socket namespace.
  * Listen atomically owns key until its last duplicated fd closes (EEXIST).
  * Connect/accept return nonblocking duplex read/write/poll fds; accept with

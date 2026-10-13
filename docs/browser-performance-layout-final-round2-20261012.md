@@ -1,0 +1,16 @@
+# レイアウト・通信独立担当 最終参照更新 第2報
+
+第1報の参照更新後、現共有定義で「viewport全失効がpostフラグを直接消さない」「CSS slot退役後の測定キー」「callback取消後のqueue admission」という弱点を追加で静的確認した。新試験・VM・製品編集はしていない。
+
+## 失効と回収の再考
+
+1. `doc.c` のviewport失効は各boxのlayout_dirtyを立て、layout_cache_valid/intrinsic_doneを落とす。prepareの再用条件はdirty無し、postの再用条件はinner cache有効であり、古いprepare/postフラグが残ってもこの経路から再用しない。inner再計算はpost_validも落とすため、親cbの寸法変化を旧post結果へ昇格させない。
+2. 相対position自身は実cbの幅/高さから毎回更新してから安全な内側を再用する。post範囲は文書絶対unionではなくlocal範囲なので、cached子の新配置を親へpublishして以前の遠い範囲を残さない。table content_dyもpost keyに含む。abs登録が必要な祖先はunsafeとして省略しない。
+3. fontchoice interningの所有はserialized値だけ。CSS slot/arenaポインタを参照し続けず、CSS値比較とbox借用更新がlayoutと描画の保全を別々に行う。fontkey refはLRU・entry OOM rollback・文書freeから落とし、最後の参照で共有尾部/空tableを回収する。`web_free` のfont resource解放より先にcache freeがあるため、破棄でdangling resourceをdereferenceしない。
+4. `webnet.c` のgeneration取消はin_callbackのrequest/responseをloan終了まで保持し、PIDのみ先にreapする。帰還後にbufferを解放し、finishing requestを外側pumpが回収する。pumping guardは同じcallbackからのnested pumpを再入させない。live_workersは未reapPIDを数え、callback loan用のPID0殻を実child数へ誤算入しない。
+
+## 判定
+
+確認した共有定義・失効・所有権の境界では新しい反例は見つからなかった。現参照は最終第1報のhashと一致し、schedulerの26host境界証拠のwebnet.c hashも同一。過去の79件を再実行・現在全体の合格へ昇格させていない。
+
+独立guest/実サイト/媒体速度の受入は主担当の証拠が必要。本担当が実際に実行したのは保存済み限定host境界のみで、今回の最終参照更新はソース再読と記録・fresh report bindingである。

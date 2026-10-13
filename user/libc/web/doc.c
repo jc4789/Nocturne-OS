@@ -25,6 +25,7 @@
 
 /* Document arenas and stylesheet storage grow through the OS allocator. */
 static void invalidate_layout_tree(box_t *b);
+static void element_scroll_input_unqueue(node_t *n);
 
 bool doc_viewport_overflow_box(const web_doc *d,const box_t *b) {
     if(!d || !b || !b->node || !d->html || !d->html->style || d->html->style->display==D_NONE)return false;
@@ -1167,6 +1168,7 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
 }
 
 static void free_values(node_t *n) {
+    element_scroll_input_unqueue(n);
     free(n->container_names);n->container_names=NULL;
     css_node_style_free(n);
     cssom_style_free(n);
@@ -1211,11 +1213,18 @@ void doc_font_loaded(web_doc *d,struct web_font_resource *f,const void *bytes,si
 
 void web_free(web_doc *d) {
     if (!d) return;
+    while (d->scroll_input_first) {
+        node_t *n = d->scroll_input_first;
+        d->scroll_input_first = n->scroll_input_next;
+        n->scroll_input_owner = NULL; n->scroll_input_next = NULL;
+    }
+    d->scroll_input_last = NULL;
     web_presentation_free(d);
     doc_active_cancel(d);
     /* Adopted DOM nodes may be allocation-owned by a helper document. Retire
        all published box/scope borrows before freeing that family of owners. */
     boxes_discard(d);
+    layout_cache_free(d);
     css_styles_release(d);
     css_styling_free(&d->sty);
     web_dialog_free(d);
@@ -1240,6 +1249,9 @@ void web_free(web_doc *d) {
     }
     if (d->owned_nodes) {
         for (node_t *n = d->owned_nodes; n; n = n->owned_next) {
+            /* Allocation ownership differs from DOM ownership after adoption.
+               A sibling document may still queue this allocation-owned node. */
+            element_scroll_input_unqueue(n);
             html_bridge_native_retire(n);
             free(n->container_names);n->container_names=NULL;
             css_node_style_free(n);
@@ -1253,6 +1265,7 @@ void web_free(web_doc *d) {
             free(n->input_edit);
         }
     } else if (d->root) free_values(d->root);
+    css_style_doc_free(d);
     free_pending(d);
     pv_free(&d->pending_css);
     for (int i = 0; i < d->css_cache.n; i++) {
@@ -1387,7 +1400,7 @@ void web_image_loaded(web_doc *d, int i, const void *data, size_t n) {
             style->height.kind != LK_LEN || style->height.pct != 0)
             { intrinsic_changed = true; layout_invalidate(box); }
     }
-    d->paint_dirty = true;
+    doc_paint_full(d);
     if (intrinsic_changed) { d->layout_valid = false; d->dirty = true; }
 }
 
@@ -1561,20 +1574,182 @@ bool doc_element_scroll_metrics(web_doc *d, node_t *n, float *width, float *heig
     return true;
 }
 
-bool doc_element_scroll(web_doc *d, node_t *n, double x, double y) {
-    float width, height;
-    if (!doc_element_scroll_metrics(d, n, &width, &height) || !box_element_scrollable(n->box) ||
-        n == d->html) return false;
-    box_t *b = n->box;
-    double max_x = (double)width - b->w - b->p[1] - b->p[3];
-    double max_y = (double)height - b->h - b->p[0] - b->p[2];
+static double element_scroll_limit(box_t *b, int axis) {
+    double limit = axis ? (double)b->scroll_h - b->h - b->p[0] - b->p[2] :
+                          (double)b->scroll_w - b->w - b->p[1] - b->p[3];
+    return isfinite(limit) && limit > 0 ? limit : 0;
+}
+
+void doc_paint_full(web_doc *d) {
+    for (; d; d = d->frame_parent) {
+        d->paint_dirty = true;
+        /* A prior video/control rectangle cannot describe shifted content or
+           a changed child composite. Never downgrade this geometry damage. */
+        d->paint_damage_full = true;
+    }
+}
+
+/* Shared CSSOM/native commit: never flushes layout or invokes authors. */
+static bool element_scroll_commit(web_doc *d, node_t *n, box_t *b, double x, double y) {
+    double max_x = element_scroll_limit(b, 0), max_y = element_scroll_limit(b, 1);
     x = !isfinite(x) || !isfinite(max_x) || x < 0 || max_x <= 0 ? 0 : x > max_x ? max_x : x;
     y = !isfinite(y) || !isfinite(max_y) || y < 0 || max_y <= 0 ? 0 : y > max_y ? max_y : y;
     if (n->scroll_x == x && n->scroll_y == y) return false;
     n->scroll_x = x;
     n->scroll_y = y;
-    d->paint_dirty = true; /* scrolling changes presentation, not CSS/layout */
+    d->visual_revision++;
+    doc_paint_full(d); /* scrolling changes presentation, not CSS/layout */
     return true;
+}
+
+bool doc_element_scroll(web_doc *d, node_t *n, double x, double y) {
+    if (!doc_element_scroll_metrics(d, n, NULL, NULL) || !box_element_scrollable(n->box) ||
+        n == d->html) return false;
+    return element_scroll_commit(d, n, n->box, x, y);
+}
+
+static void element_scroll_input_unqueue(node_t *n) {
+    web_doc *old = n->scroll_input_owner;
+    if (old) {
+        node_t *previous = NULL, *at = old->scroll_input_first;
+        while (at && at != n) { previous = at; at = at->scroll_input_next; }
+        if (at) {
+            if (previous) previous->scroll_input_next = n->scroll_input_next;
+            else old->scroll_input_first = n->scroll_input_next;
+            if (old->scroll_input_last == n) old->scroll_input_last = previous;
+        }
+    }
+    n->scroll_input_owner = NULL; n->scroll_input_next = NULL;
+}
+
+static void element_scroll_input_queue(web_doc *d, node_t *n) {
+    if (!d->js || n->scroll_input_owner == d) return;
+    /* Adoption can move an allocation-owned node while an old owner still has
+       a pending notification. Unlink that queue, not the whole DOM forest. */
+    element_scroll_input_unqueue(n);
+    n->scroll_input_owner = d; n->scroll_input_next = NULL;
+    if (d->scroll_input_last) d->scroll_input_last->scroll_input_next = n;
+    else d->scroll_input_first = n;
+    d->scroll_input_last = n;
+}
+
+/* Integer GUI deltas may meet a fractional CSSOM offset. Round the residual
+   towards zero, keeping its sign and never forwarding a consumed fraction as
+   an additional pixel to the root. This loses at most a subpixel at a boundary. */
+static int element_scroll_remaining(int requested, double consumed) {
+    double rest = (double)requested - consumed;
+    if (requested > 0) return rest <= 0 ? 0 : rest >= requested ? requested : (int)rest;
+    return rest >= 0 ? 0 : rest <= requested ? requested : (int)rest;
+}
+
+static bool scroll_input_coherent(web_doc *d) {
+    if (!d) return false;
+    web_doc *family = d->dom_family ? d->dom_family : d;
+    return d->live && !d->inert && d->layout_valid &&
+        d->root_box && !d->root_box->layout_dirty && d->root_box->layout_post_valid &&
+        !d->need_style && !d->need_boxes && !d->style_pending_dirty &&
+        !d->font_selection_dirty && !d->shadow_slots_pending && !d->shadow_dirty_first &&
+        !family->shadow_slots_pending && !family->shadow_dirty_first &&
+        !d->native_cancelled && !d->native_recovery_pending && !d->native_recovery_active &&
+        !d->native_layout_depth;
+}
+
+static struct web_frame *scroll_input_frame(web_doc *child) {
+    struct web_frame *f = child->frame_container;
+    web_doc *parent = child->frame_parent;
+    node_t *element = child->frame_element;
+    if (!f || !parent || !element || f->document != child || f->owner != parent ||
+        f->element != element || f->detached || element->owner != parent ||
+        doc_node_root(element, true) != parent->root || !element->box ||
+        !element->box->st || element->box->st->display == D_NONE ||
+        f->viewport_w <= 0 || f->viewport_h <= 0 ||
+        child->width != f->viewport_w || child->height != f->viewport_h ||
+        !isfinite(element->box->w) || !isfinite(element->box->h) ||
+        round((double)element->box->w) != f->viewport_w ||
+        round((double)element->box->h) != f->viewport_h) return NULL;
+    return f;
+}
+
+static box_t *scroll_input_box(node_t *n, web_doc *d) {
+    box_t *b = NULL;
+    /* Assignment snapshots are coherent above. doc_flat_parent would flush
+       Shadow DOM here, potentially running reactions during an active task. */
+    for (node_t *at = n; at && !b;) {
+        b = at->box ? at->box : at->anchor_block;
+        if (at->assigned_slot) at = at->assigned_slot;
+        else at = at->parent ? at->parent : at->shadow_host;
+    }
+    if (!b) return NULL;
+    box_t *root = b;
+    while (root->parent) root = root->parent;
+    return root == d->root_box ? b : NULL;
+}
+
+bool web_scroll_input(web_doc *d, web_node *target, int *dx, int *dy, int edge) {
+    node_t *n = target;
+    if (!d || !n || !n->owner || !dx || !dy || edge < -1 || edge > 1 ||
+        doc_node_root(n, true) != n->owner->root) return false;
+    /* Validate the complete attached browsing-context chain before committing
+       any offset. Native input crosses origins, never JS wrappers/authority. */
+    web_doc *owner = n->owner;
+    for (web_doc *at = owner;; at = at->frame_parent) {
+        if (!scroll_input_coherent(at)) return false;
+        if (at == d) break;
+        if (!scroll_input_frame(at)) return false;
+    }
+    box_t *b = scroll_input_box(n, owner);
+    if (!b) return false;
+    bool handled = false;
+    for (;;) {
+      for (; b; b = b->parent) {
+        node_t *element = b->node;
+        if (!box_element_scrollable(b) || !element || element->owner != owner ||
+            element == owner->html || doc_viewport_overflow_box(owner, b) ||
+            (b->st->overflow != OV_AUTO && b->st->overflow != OV_SCROLL)) continue;
+        double x = element->scroll_x, y = element->scroll_y;
+        if (!isfinite(x) || !isfinite(y)) continue;
+        if (edge) {
+            double max_y = element_scroll_limit(b, 1);
+            if (max_y <= 0) continue;
+            if (element_scroll_commit(owner, element, b, x, edge < 0 ? 0 : max_y)) {
+                element_scroll_input_queue(owner, element);
+            }
+            *dy = 0; return true; /* also consume Home/End already at its edge */
+        }
+        if (element_scroll_commit(owner, element, b, x + *dx, y + *dy)) {
+            *dx = element_scroll_remaining(*dx, element->scroll_x - x);
+            *dy = element_scroll_remaining(*dy, element->scroll_y - y);
+            element_scroll_input_queue(owner, element); handled = true;
+        }
+        if (!*dx && !*dy) return handled;
+      }
+      if (owner == d) return handled;
+      struct web_frame *f = scroll_input_frame(owner); /* no callbacks above */
+      int mx = MAX(0, web_doc_width(owner) - f->viewport_w);
+      int my = MAX(0, owner->doc_h - f->viewport_h);
+      int x = f->scroll_x, y = f->scroll_y;
+      int64_t wanted_x = (int64_t)x + *dx;
+      int64_t wanted_y = edge ? (edge < 0 ? 0 : my) : (int64_t)y + *dy;
+      bool edge_handled = edge && my > 0;
+      if (!edge || edge_handled) {
+        f->scroll_x = wanted_x < 0 ? 0 : wanted_x > mx ? mx : (int)wanted_x;
+        f->scroll_y = wanted_y < 0 ? 0 : wanted_y > my ? my : (int)wanted_y;
+        if (f->scroll_x != x || f->scroll_y != y) {
+            owner->view_x = f->scroll_x; owner->view_y = f->scroll_y;
+            owner->visual_revision++; doc_paint_full(owner);
+            if (owner->js) owner->scroll_viewport_pending = true;
+            /* Preserve normal frame-tick propagation, including intermediate
+               composites if another native wait occurs before that tick. */
+            handled = true;
+        }
+        if (edge_handled) { *dy = 0; return true; }
+        *dx = element_scroll_remaining(*dx, (double)f->scroll_x - x);
+        *dy = element_scroll_remaining(*dy, (double)f->scroll_y - y);
+        if (!*dx && !*dy) return handled;
+      }
+      b = f->element->box->parent;
+      owner = f->owner;
+    }
 }
 
 /* Physical horizontal-LTR alignment. nearest deliberately leaves an oversized
@@ -1957,7 +2132,7 @@ void doc_control_selection(web_doc *d, node_t *n, uint32_t start, uint32_t end, 
     n->selection_start = start; n->selection_end = end; n->selection_direction = direction;
     n->selection_set = true;
     doc_control_caret(d, n);
-    if (changed) { d->dirty = true; web_js_selection_changed(d, n); }
+    if (changed) { doc_paint_damage(d,n); web_js_selection_changed(d, n); }
 }
 static void control_surrogate(sbuf *b, uint32_t cp) {
     char enc[] = {(char)(0xe0 | (cp >> 12)), (char)(0x80 | ((cp >> 6) & 63)), (char)(0x80 | (cp & 63))};

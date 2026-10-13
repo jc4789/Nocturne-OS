@@ -29,7 +29,7 @@ void web_marquee_set(node_t *n,bool running) {
     n->marquee_off=!running;
     /* Resume from the frozen position; stopped time is not accumulated. */
     n->marquee_last=uptime_ms();
-    if(n->owner)n->owner->paint_dirty=true;
+    if(n->owner)doc_paint_full(n->owner);
 }
 static long integer_attr(node_t *n,const char *key,long fallback) {
     const char *s=node_attr(n,key);if(!s)return fallback;
@@ -114,7 +114,7 @@ void web_marquee_tick(web_doc *d,uint64_t now) {
         if(!n->marquee_initialized || n->marquee_direction!=dir || n->marquee_behavior!=mode) {
             n->marquee_initialized=true;n->marquee_direction=dir;n->marquee_behavior=mode;
             n->marquee_progress=0;n->marquee_reverse=false;n->marquee_loops=0;n->marquee_last=now;
-            position(n,b,content_extent(b,dir>=2));d->paint_dirty=true;continue;
+            position(n,b,content_extent(b,dir>=2));doc_paint_full(d);d->visual_revision++;continue;
         }
         uint64_t delay=interval(n);
         if(now<n->marquee_last || now-n->marquee_last<delay)continue;
@@ -149,7 +149,7 @@ void web_marquee_tick(web_doc *d,uint64_t now) {
             }
         } else n->marquee_progress=(float)progress;
         float oldx=n->marquee_x,oldy=n->marquee_y;position(n,b,content);
-        if(oldx!=n->marquee_x || oldy!=n->marquee_y)d->paint_dirty=true;
+        if(oldx!=n->marquee_x || oldy!=n->marquee_y){doc_paint_full(d);d->visual_revision++;}
     }
 }
 int64_t web_marquee_deadline(web_doc *d,uint64_t now) {

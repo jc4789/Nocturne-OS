@@ -6,6 +6,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <sys/mman.h>
 struct request {struct request *next;struct nmsw_command c;uint8_t *bytes;uint64_t epoch;};
 struct slot_state {
     uint64_t revision,epoch;uint32_t parsing;int64_t group_end;
@@ -26,13 +27,14 @@ struct nmedia_mse_worker {
     struct nmedia_output output;unsigned output_slot;uint64_t output_revision;
     struct nmsw_video video_header;
     uint8_t *video_pixels;size_t video_head_pos,video_rx_pos,video_capacity;
+    struct nmsw_shared_video *shared_video;size_t video_shared_bytes;uint64_t video_shared_id;
     bool video_ready,video_loan;uint32_t video_sequence,video_expected_sequence;
     unsigned taken_slot;uint64_t taken_revision;bool taken_video_lane;
     uint8_t *meta;struct slot_state *slots;size_t slot_count,slot_capacity;uint64_t epoch;
     char error[160];
 };
 static nmedia_mse_worker *live,*retired;
-static void destroy(nmedia_mse_worker *w){for(size_t i=0;i<w->slot_count;i++)nmedia_ff_free(w->slots[i].ranges);nmedia_ff_free(w->slots);nmedia_ff_free(w->meta);nmedia_ff_free(w->payload);nmedia_ff_free(w->video_pixels);nmedia_ff_free(w);}
+static void destroy(nmedia_mse_worker *w){for(size_t i=0;i<w->slot_count;i++)nmedia_ff_free(w->slots[i].ranges);nmedia_ff_free(w->slots);nmedia_ff_free(w->meta);nmedia_ff_free(w->payload);if(w->shared_video)munmap(w->shared_video,w->video_shared_bytes);nmedia_ff_free(w);}
 static bool reserve_slots(nmedia_mse_worker *w,size_t count){
     if(count>w->slot_capacity){size_t capacity=w->slot_capacity?w->slot_capacity:4;
         while(capacity<count){if(capacity>SIZE_MAX/sizeof *w->slots/2){capacity=count;break;}capacity*=2;}
@@ -197,7 +199,10 @@ static void control_io(nmedia_mse_worker *w,uint64_t until,bool dispatch,bool ha
     }
 }
 static void video_release(nmedia_mse_worker *w){
+    if((w->video_ready||w->video_loan)&&w->shared_video)
+        __atomic_store_n(&w->shared_video->occupied[w->video_header.buffer_slot],0,__ATOMIC_RELEASE);
     w->video_ready=w->video_loan=false;w->video_head_pos=w->video_rx_pos=0;
+    w->video_pixels=NULL;
 }
 static bool video_current(const nmedia_mse_worker *w){
     const struct nmsw_video *v=&w->video_header;
@@ -209,22 +214,30 @@ static void video_io(nmedia_mse_worker *w,uint64_t until,bool handoff,short reve
     bool received=false;unsigned handoffs=0;
     while(revents&(N_POLLIN|N_POLLHUP)){
         if(received&&uptime_ms()>=until)break;received=true;
-        bool header=w->video_head_pos<sizeof w->video_header;
-        size_t take=header?sizeof w->video_header-w->video_head_pos:w->video_header.bytes-w->video_rx_pos;
-        void *dest=header?(uint8_t *)&w->video_header+w->video_head_pos:w->video_pixels+w->video_rx_pos;
+        size_t take=sizeof w->video_header-w->video_head_pos;
+        void *dest=(uint8_t *)&w->video_header+w->video_head_pos;
         ssize_t n=read(w->video_fd,dest,take);
         if(n<0&&errno==EAGAIN&&handoff&&(w->video_head_pos||w->video_rx_pos)&&handoffs<16&&uptime_ms()<until){handoffs++;yield();continue;}
         if(n<0&&(errno==EAGAIN||errno==EINTR))break;
         if(n<=0){stop(w,"MSE VIDEO pipe ended early");return;}
-        if(header){w->video_head_pos+=(size_t)n;
+        {w->video_head_pos+=(size_t)n;
             if(w->video_head_pos==sizeof w->video_header){
-                const struct nmsw_video *v=&w->video_header;uint32_t bytes;
+                const struct nmsw_video *v=&w->video_header;uint32_t bytes;size_t shared_bytes;
                 if(v->magic!=NMSW_MAGIC||v->generation!=w->generation||!v->sequence||v->sequence<=w->video_sequence||v->sequence>w->sequence||
-                   v->slot>=w->slot_count||v->reserved||!nmedia_video_wire_bytes(v->width,v->height,&bytes)||bytes!=v->bytes){stop(w,"invalid MSE VIDEO wire");return;}
-                if(bytes>w->video_capacity){nmedia_ff_free(w->video_pixels);w->video_pixels=NULL;w->video_capacity=0;
-                    w->video_pixels=nmedia_ff_malloc(bytes);if(!w->video_pixels){stop(w,"MSE VIDEO receive allocation failed");return;}w->video_capacity=bytes;}
+                   v->slot>=w->slot_count||v->reserved||v->shared_reserved||v->shared_fd<0||!v->shared_id||v->buffer_slot>=NMSW_VIDEO_SLOTS||
+                   !nmedia_video_wire_bytes(v->width,v->height,&bytes)||bytes!=v->bytes||bytes>v->shared_capacity||
+                   !nmsw_shared_size(v->shared_capacity,&shared_bytes)){stop(w,"invalid MSE VIDEO wire");return;}
+                if(v->shared_id!=w->video_shared_id){
+                    struct nmsw_shared_video *shared=n_shared_map(w->pid,v->shared_fd,shared_bytes,N_PROT_WRITE);
+                    if(!shared){stop(w,"MSE shared VIDEO import failed");return;}
+                    if(w->shared_video)munmap(w->shared_video,w->video_shared_bytes);
+                    w->shared_video=shared;w->video_shared_bytes=shared_bytes;w->video_shared_id=v->shared_id;
+                }else if(shared_bytes!=w->video_shared_bytes){stop(w,"MSE shared VIDEO geometry changed without a new owner");return;}
+                if(!nmsw_shared_matches(w->shared_video,v)){stop(w,"MSE shared VIDEO identity/slot is not owned");return;}
+                w->video_pixels=(uint8_t *)(w->shared_video+1)+(size_t)v->buffer_slot*v->shared_capacity;
+                w->video_capacity=v->shared_capacity;w->video_rx_pos=bytes;
             }
-        }else w->video_rx_pos+=(size_t)n;
+        }
         w->service_progress++;
         if(w->video_head_pos==sizeof w->video_header&&w->video_rx_pos==w->video_header.bytes){
             w->video_sequence=w->video_header.sequence;w->video_ready=true;break;
@@ -317,9 +330,11 @@ bool nmedia_mse_worker_move_video(nmedia_mse_worker *w,const struct nmedia_outpu
            o->kind!=NMEDIA_VIDEO||o->pixels!=(const uint32_t *)w->video_pixels||o->width!=v->width||o->height!=v->height||o->pts_ms!=v->pts||
            !nmedia_video_wire_bytes(o->width,o->height,&bytes)||w->video_capacity<bytes||
            *capacity>SIZE_MAX/sizeof(uint32_t)||(!*pixels&&*capacity)||*pixels==(uint32_t *)w->video_pixels)return false;
-        uint32_t *completed=(uint32_t *)w->video_pixels;size_t available=w->video_capacity/sizeof(uint32_t);
-        w->video_pixels=(uint8_t *)*pixels;w->video_capacity=*capacity*sizeof(uint32_t);video_release(w);w->taken_video_lane=false;
-        *pixels=completed;*capacity=available;return true;
+        /* The display/lookahead owns ordinary allocations. Copy directly from
+           the shared slot once, then return it; never free a mapping as heap. */
+        size_t count=bytes/sizeof(uint32_t);
+        if(*capacity<count){uint32_t *p=nmedia_ff_realloc(*pixels,bytes);if(!p)return false;*pixels=p;*capacity=count;}
+        memcpy(*pixels,w->video_pixels,bytes);video_release(w);w->taken_video_lane=false;return true;
     }
     if(!w||!o||!pixels||!capacity||w->stopping||w->error[0]||w->head||w->output_ready||!w->video_taken||
        generation!=w->generation||slot!=w->output_slot||slot>=w->slot_count||!w->slots[slot].used||
@@ -350,8 +365,15 @@ void nmedia_mse_worker_prefetch_service(nmedia_mse_worker *w,uint64_t until){pre
 void nmedia_mse_worker_close(nmedia_mse_worker *w){if(!w)return;nmedia_mse_worker **p=&live;while(*p&&*p!=w)p=&(*p)->next;if(!*p)return;*p=w->next;stop(w,NULL);
     if(reap(w))destroy(w);else{w->next=retired;retired=w;}}
 int64_t nmedia_mse_worker_deadline(uint64_t now){
-    bool stopping=retired!=NULL;for(nmedia_mse_worker *w=live;w;w=w->next){if((w->head||w->video_head_pos)&&!w->stopping)return (int64_t)now+1;if(w->stopping&&w->pid>0)stopping=true;}
-    return stopping?(int64_t)now+10:-1;
+    bool stopping=retired!=NULL;int64_t next=-1;
+    for(nmedia_mse_worker *w=live;w;w=w->next){
+        if((w->head||w->video_head_pos||w->video_expected_sequence>w->video_sequence)&&!w->stopping){
+            int64_t due=w->service_at>now?(int64_t)w->service_at:(int64_t)now+1;
+            if(next<0||due<next)next=due;
+        }if(w->stopping&&w->pid>0)stopping=true;
+    }
+    if(stopping&&(next<0||next>(int64_t)now+10))next=(int64_t)now+10;
+    return next;
 }
 
 bool nmedia_mse_worker_seeking(const nmedia_mse_worker *w){if(!w)return false;for(struct request *r=w->head;r;r=r->next)if(r->c.op==NMSW_SEEK)return true;return false;}

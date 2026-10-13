@@ -55,8 +55,9 @@ static void incremental(void) {
     }
     web_layout(d,800,600);
     check(values[10]->style && values[10]->box,"initial cascade/boxes");
-    check(values[10]->style_mem.chunk_size==4096 && values[10]->style_mem.allocated<8192,
-        "node computed arena uses small chunks");
+    check(values[10]->style_slots && values[10]->style_mem.allocated==0 &&
+        !values[10]->style_previous_slots,
+        "fixed computed body shares slabs and plain values allocate no tail");
     check(d->profile.style_parallel_nodes>0,"actual helper threads compute styles");
     box_t *root=d->root_box,*leaf=values[10]->box,*other=values[40]->box;
     uint64_t visits=d->profile.style_visits,rescans=d->profile.rescans;
@@ -162,6 +163,43 @@ static void derived_styles(void) {
     check(legend && legend->st->color==0xff0000ffu && legend->st->font_names==details->style->font_names &&
         legend->st->vars==details->style->vars && legend->st->list_style==LS_STRING,
         "default legend refreshes inheritance and keeps marker overrides");
+    web_free(d);
+}
+static void declaration_generation_paths(void) {
+    web_doc *d=load();check(d!=NULL,"declaration generation document");if(!d)return;
+    struct cssom_sheet *s=sheet(d,".owner::before,.owner::after{content:var(--word);color:var(--shade)}");
+    check(s&&cssom_adopt(d->root,&s,1)==CSSOM_OK,"declaration generation sheet");
+    if(!s){web_free(d);return;}
+    node_t *owner=element(d,"div",d->body,"owner"),*child=element(d,"span",owner,NULL);
+    doc_node_attr(d,owner,"style","--word:'first';--shade:red;color:var(--shade)");
+    web_layout(d,800,600);
+    check(owner->style&&owner->style->before&&owner->style->after&&child->style&&
+        !strcmp(owner->style->before->content,"first")&&child->style->color==0xffff0000u,
+        "native initial pseudo and child inherit cached inline variables");
+    struct css_declarations *initial=owner->style_declarations;
+    css_mark_dirty(d,owner);web_layout(d,800,600);
+    check(owner->style_declarations==initial&&!owner->style_previous_slots&&
+        owner->style->after&&!strcmp(owner->style->after->content,"first"),
+        "unchanged native cascade reuses declarations and retires all pseudo slots");
+    doc_node_attr(d,owner,"style","--word:'second';--shade:blue;color:var(--shade)");
+    web_layout(d,800,600);
+    check(owner->style->before&&owner->style->after&&
+        !strcmp(owner->style->before->content,"second")&&!strcmp(owner->style->after->content,"second")&&
+        child->style&&child->style->color==0xff0000ffu,
+        "cache replacement recomputes child and both pseudo variable borrows");
+    check(css_animation_set(owner,PE_BEFORE,11,"color:lime")==1,"pseudo animation sample");
+    css_mark_dirty(d,owner);web_layout(d,800,600);
+    check(owner->style->before&&owner->style->before->color==0xff00ff00u&&
+        owner->animation_base_style&&owner->animation_base_style->before&&
+        owner->animation_base_style->before->color==0xff0000ffu&&child->style->color==0xff0000ffu,
+        "pseudo animated and underlying bodies have separate current ownership");
+    struct css_declarations *current=owner->style_declarations;
+    doc_node_remove(d,owner);web_layout(d,800,600);
+    check(!owner->style&&!child->style,"detach unpublishes ancestor-dependent styles");
+    doc_node_move(d,d->body,owner,NULL);web_layout(d,800,600);
+    check(owner->style_declarations==current&&owner->style&&owner->style->before&&child->style&&
+        !strcmp(owner->style->before->content,"second")&&child->style->color==0xff0000ffu,
+        "reinsert retains immutable declarations and refreshes inherited variable tails");
     web_free(d);
 }
 static void percentage_padding_cache(void) {
@@ -618,7 +656,7 @@ static void font_unicode_ranges(void) {
     web_free(d);
 }
 int main(void) {
-    incremental();scopes();derived_styles();percentage_padding_cache();parallel_form_selectors();cssom_container_roundtrip();container_queries();font_completion();font_flat_retry();dependent_cache_updates();shared_bfc_caches();font_unicode_ranges();
+    incremental();scopes();derived_styles();declaration_generation_paths();percentage_padding_cache();parallel_form_selectors();cssom_container_roundtrip();container_queries();font_completion();font_flat_retry();dependent_cache_updates();shared_bfc_caches();font_unicode_ranges();
     printf("styleincremental: %d checks, %d failures\n",checks,failed);
     return failed?1:0;
 }

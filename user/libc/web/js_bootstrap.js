@@ -1154,6 +1154,7 @@
         slotChanges(){mutationBridge.signalSlots();},
         dialogRequestClose(node){htmlElementsBridge.requestClose(node);},
         revealHidden:htmlElementsBridge.revealHidden,
+        queueNativeElementScroll:htmlElementsBridge.queueElementScroll,
         dialogSubmit(node,result){return htmlElementsBridge.submit(node,result);},
         detailsToggle(target,oldOpen,newOpen){semanticElementsBridge.toggle(target,oldOpen,newOpen);},
         historyEvent(oldURL,popstate){historyEvent(oldURL,popstate);},

@@ -11,6 +11,7 @@ struct result {
     uint64_t id, generation;
     char *body;
     size_t length;
+    size_t final_url_length, response_headers_length;
     char url[WEBNET_URL_MAX], headers[WEBNET_RESPONSE_HEADERS_MAX], error[160];
 };
 static webnet *net;
@@ -26,6 +27,7 @@ static void completed(webnet *n, uint64_t id, uint64_t generation,
     (void)n;
     struct result *r = opaque;
     r->calls++; r->id = id; r->generation = generation; r->status = response->status;
+    r->final_url_length=strlen(response->final_url);r->response_headers_length=strlen(response->headers);
     snprintf(r->url, sizeof r->url, "%s", response->final_url);
     snprintf(r->headers, sizeof r->headers, "%s", response->headers);
     snprintf(r->error, sizeof r->error, "%s", response->error);
@@ -491,6 +493,22 @@ static void cache_tests(void) {
           "native submission validates cache metadata before enqueueing");
 }
 static void concurrency_tests(void) {
+    /* Different HTTP origins can use the adaptive budget concurrently; the
+       old four-slot ceiling is not an expectation of the transport contract. */
+    static struct result burst[8];
+    bool submitted=true;
+    for(int i=0;i<8;i++)submitted&=request(&burst[i],i%2,"/api/slow?ms=1200",WEBNET_FETCH,"GET",NULL,NULL,0,19)!=0;
+    webnet_pump(net,uptime_ms());
+    int started=children();
+    struct n_sysinfo memory={0};sysinfo(&memory);
+    uint64_t affordable=memory.free_mem/(64u*1024u*1024u);
+    int expected=affordable>1?(int)MIN(7u,affordable-1):1;
+    check(submitted&&started>=expected,
+          "adaptive worker budget admits a multi-origin burst beyond four when native memory permits");
+    bool drained=wait_idle(12000);
+    for(int i=0;i<8;i++)drained&=success(&burst[i]);
+    check(drained&&children()==0,"adaptive burst preserves every response and reaps every child");
+    webnet_cancel_generation(net,19);for(int i=0;i<8;i++)release(&burst[i]);
     static struct result r[3]; /* large bounded response storage is not stack scratch */
     uint64_t ids[3];
     for (int i = 0; i < 3; i++) ids[i] = request(&r[i], 0, "/api/slow?ms=800", WEBNET_FETCH, "GET", NULL, NULL, 0, 20);
@@ -625,10 +643,13 @@ static void long_url_tests(void) {
     check(id&&wait_result(&r,40000)&&success(&r)&&!strcmp(r.url,url),
           "6000-byte Location survives the production redirect resolver with the complete final URL");
     release(&r);
-    strcpy(url,"http://10.0.2.2/");prefix=strlen(url);
+    snprintf(url,WEBNET_URL_MAX+1,"http://10.0.2.2:%d/api/json?pad=",ports[0]);prefix=strlen(url);
     memset(url+prefix,'x',WEBNET_URL_MAX-prefix);url[WEBNET_URL_MAX]=0;
     struct webnet_request q={.kind=WEBNET_FETCH,.generation=43,.url=url,.origin=document,.method="GET",.credentials=WEBNET_CREDENTIALS_OMIT};
-    check(!webnet_submit(net,&q,completed,&r)&&!r.calls,"URL at the shared storage bound is rejected before creating a worker");
+    id=webnet_submit(net,&q,completed,&r);
+    check(id&&wait_result(&r,40000)&&success(&r)&&r.final_url_length==WEBNET_URL_MAX,
+          "owned URL at the old inline bound reaches the actual worker without truncation");
+    release(&r);
     webnet_cancel_generation(net,43);
 }
 static void file_request(const char *url, const char *origin, enum webnet_kind kind, bool user, bool allow,
@@ -662,16 +683,18 @@ static void limit_tests(void) {
     struct result r = {0};
     uint64_t id = request(&r, 0, "/api/oversize", WEBNET_FETCH, "GET", NULL, NULL, 0, 59);
     bool done = id && wait_result(&r, 35000);
-    check(done && strstr(r.error, "16 MiB") && r.length == 0, "response larger than 16 MiB is rejected before delivery");
+    bool intact=done&&r.status==200&&!r.error[0]&&r.length==16u*1024u*1024u+1;
+    if(intact)for(size_t i=0;i<r.length;i++)if(r.body[i]!='x'){intact=false;break;}
+    check(intact, "response beyond the removed 16 MiB quota is delivered completely");
     if (!done) webnet_cancel_generation(net, 59);
     release(&r);
     uint64_t started = uptime_ms();
     id = request(&r, 0, "/api/slow?ms=35000", WEBNET_FETCH, "GET", NULL, NULL, 0, 60);
-    done = id && wait_result(&r, 35000);
+    done = id && wait_result(&r, 45000);
     uint64_t elapsed = uptime_ms() - started;
-    check(done && r.error[0] && strstr(r.error, "deadline") && elapsed >= 29500 && elapsed < 34000,
-          "30-second total deadline kills and reaps a stalled request");
-    check(!webnet_busy(net) && children() == 0, "deadline leaves no worker or pending request");
+    check(done && success(&r) && elapsed >= 34500 && elapsed < 44000 && WEBNET_TIMEOUT_MS==UINT32_MAX,
+          "a legitimate 35-second response survives the removed 30-second deadline");
+    check(!webnet_busy(net) && children() == 0, "long response completion leaves no worker or pending request");
     if (!done) webnet_cancel_generation(net, 60);
     release(&r);
 }
@@ -764,14 +787,19 @@ static void header_block_tests(void) {
     }
     /* 65537 value bytes in several 6000-byte lines exceed the 65536-byte raw
        block bound without exceeding the independent 16383-byte line bound. */
-    snprintf(url,sizeof url,"http://10.0.2.2:%d/api/headers?bytes=65537&cookie=yes",ports[0]);
+    snprintf(url,sizeof url,"http://10.0.2.2:%d/api/headers?bytes=65537",ports[0]);
     struct webnet_request q={.kind=WEBNET_FETCH,.generation=95,.url=url,.origin=document,
         .method="GET",.credentials=WEBNET_CREDENTIALS_INCLUDE};
     uint64_t id=webnet_submit(net,&q,completed,&r);bool done=id&&wait_result(&r,40000);
-    check(done&&r.status==0&&strstr(r.error,"response headers exceed 64 KiB limit")&&r.length==0&&!r.headers[0],
-          "multiple bounded lines exceeding the response block limit explicitly fail without partial delivery");
+    check(done&&success(&r)&&r.response_headers_length>65537,
+          "complete valid headers beyond the removed inline block bound reach the native receiver");
+    release(&r);
+    snprintf(url,sizeof url,"http://10.0.2.2:%d/api/headers?bytes=65537&cookie=yes&invalid=yes",ports[0]);
+    id=webnet_submit(net,&q,completed,&r);done=id&&wait_result(&r,40000);
+    check(done&&r.status==0&&strstr(r.error,"invalid Content-Length")&&r.length==0&&!r.headers[0],
+          "a malformed late field in a large response rejects the entire response");
     check(done&&webnet_cookie_get(net,document,visible,sizeof visible)>=0&&!strstr(visible,"headeroverflow="),
-          "response block overflow rolls back the earlier privileged Set-Cookie event");
+          "malformed late response rolls back the earlier privileged Set-Cookie event");
     if(!done)webnet_cancel_generation(net,95);
     release(&r);
 }
@@ -875,9 +903,28 @@ static void cors_boundary_regression_tests(void) {
     check(webnet_cookie_set(net,document,"returnprobe=; Path=/; Max-Age=0")==1&&
           webnet_cookie_set(net,document,"returnnotallowed=; Path=/; Max-Age=0")==1,"remove redirect-return cookie controls");
 }
+static unsigned callback_cancel_calls;
+static bool callback_cancel_borrow;
+static void cancel_from_callback(webnet *n,uint64_t id,uint64_t generation,const struct webnet_response *response,void *opaque){
+    (void)id;(void)opaque;callback_cancel_calls++;
+    char original[512];strlcpy(original,response->final_url,sizeof original);
+    webnet_cancel_generation(n,generation);
+    webnet_pump(n,uptime_ms()); /* reentry must not free the borrowed response */
+    callback_cancel_borrow=!strcmp(original,response->final_url)&&response->headers!=NULL;
+}
+static void callback_cancel_test(void){
+    char url[256];snprintf(url,sizeof url,"http://10.0.2.2:%d/api/json",ports[0]);
+    struct webnet_request q={.kind=WEBNET_FETCH,.generation=111,.url=url,.origin=document,
+        .method="GET",.credentials=WEBNET_CREDENTIALS_OMIT,.stream_response=true};
+    uint64_t id=webnet_submit(net,&q,cancel_from_callback,NULL);
+    bool drained=id&&wait_idle(5000);
+    check(drained&&callback_cancel_calls==1&&callback_cancel_borrow&&children()==0,
+          "stream callback generation cancellation retains its borrowed response and reaps without reentry");
+}
 int main(int argc, char **argv) {
     bool tls = argc == 2 && !strcmp(argv[1], "--tls");
-    if (argc > 1 && !tls) { puts("usage: webnettest [--tls]"); return 1; }
+    bool boundaries=argc==2&&!strcmp(argv[1],"--performance-boundaries");
+    if (argc > 1 && !tls&&!boundaries) { puts("usage: webnettest [--tls|--performance-boundaries]"); return 1; }
     if (tls) {
         if (!net_wait_up(20000)) { puts("FAIL webnet network did not come up"); return 1; }
         net = webnet_create();
@@ -899,7 +946,8 @@ int main(int argc, char **argv) {
     snprintf(document, sizeof document, "http://10.0.2.2:%d/index.html", ports[0]);
     net = webnet_create();
     if (!net) { puts("FAIL webnet allocation"); return 1; }
-    http_tests(); debug_transport_tests(); body_presence_tests(); fetch_contract_tests(); cache_tests(); concurrency_tests(); cors_tests(); redirect_tests(); long_url_tests(); file_tests(); cookie_tests(); header_block_tests(); cors_boundary_regression_tests(); limit_tests();
+    if(boundaries){concurrency_tests();callback_cancel_test();}
+    else {http_tests(); debug_transport_tests(); body_presence_tests(); fetch_contract_tests(); cache_tests(); concurrency_tests(); cors_tests(); redirect_tests(); long_url_tests(); file_tests(); cookie_tests(); header_block_tests(); cors_boundary_regression_tests(); limit_tests();}
     webnet_free(net);
     printf("webnettest: %d failed\n", failed);
     return failed != 0;

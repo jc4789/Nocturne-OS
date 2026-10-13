@@ -90,6 +90,91 @@ struct decl {
     bool important;
 };
 
+/* One immutable parsed block per live inline style/effect, not one per
+   cascade. Compare owned bytes as well as length: DOM/CSSOM may reuse an
+   address, and a changed document base changes relative URL resolution. */
+struct css_declarations {
+    arena_t arena;
+    const char *text, *base;
+    size_t length;
+    struct decl *values;
+    int count;
+};
+
+/* Fixed computed styles share slabs. Only variable values use node arenas.
+   Slot ownership follows the cascade document, not DOM allocation ownership;
+   an adopted/detached node can outlive that document, so orphaned pools stay
+   alive until their last current/retired slot has been returned. */
+struct css_style_slot {
+    style_t style;
+    struct css_style_slot *next;
+    struct css_style_pool *pool;
+};
+enum { CSS_STYLE_SLAB_SLOTS = 64 };
+struct css_style_slab {
+    struct css_style_slab *next;
+    struct css_style_slot slots[CSS_STYLE_SLAB_SLOTS];
+};
+struct css_style_pool {
+    struct css_style_slab *slabs;
+    struct css_style_slot *free;
+    size_t live;
+    unsigned lock;
+    bool owned;
+};
+static void style_pool_lock(struct css_style_pool *p) {
+    while (__atomic_exchange_n(&p->lock, 1, __ATOMIC_ACQUIRE)) __asm__ volatile("pause");
+}
+static void style_pool_unlock(struct css_style_pool *p) {
+    __atomic_store_n(&p->lock, 0, __ATOMIC_RELEASE);
+}
+static void style_pool_destroy(struct css_style_pool *p) {
+    while (p->slabs) {
+        struct css_style_slab *slab = p->slabs; p->slabs = slab->next; free(slab);
+    }
+    free(p);
+}
+static style_t *style_slot_alloc(web_doc *d, node_t *n, arena_t *tail) {
+    struct css_style_pool *p = d->style_pool;
+    style_pool_lock(p);
+    if (!p->free) {
+        struct css_style_slab *slab = malloc(sizeof *slab);
+        if (!slab) { style_pool_unlock(p); ar_alloc(tail, SIZE_MAX); return NULL; }
+        slab->next = p->slabs; p->slabs = slab;
+        for (size_t i = 0; i < CSS_STYLE_SLAB_SLOTS; i++) {
+            slab->slots[i].pool = p;
+            slab->slots[i].next = p->free; p->free = &slab->slots[i];
+        }
+    }
+    struct css_style_slot *slot = p->free; p->free = slot->next; p->live++;
+    style_pool_unlock(p);
+    slot->next = n->style_slots; n->style_slots = slot;
+    return &slot->style; /* css_style_init resets the complete POD body */
+}
+static void style_slots_free(struct css_style_slot **head) {
+    while (*head) {
+        struct css_style_slot *slot = *head; *head = slot->next;
+        struct css_style_pool *p = slot->pool;
+        style_pool_lock(p);
+        slot->next = p->free; p->free = slot; p->live--;
+        bool destroy = !p->owned && !p->live;
+        style_pool_unlock(p);
+        if (destroy) style_pool_destroy(p);
+    }
+}
+void css_style_doc_free(web_doc *d) {
+    struct css_style_pool *p = d->style_pool; d->style_pool = NULL;
+    if (!p) return;
+    style_pool_lock(p); p->owned = false;
+    bool destroy = !p->live;
+    style_pool_unlock(p);
+    if (destroy) style_pool_destroy(p);
+}
+static void declarations_free(struct css_declarations **slot) {
+    struct css_declarations *cache = *slot; *slot = NULL;
+    if (cache) { ar_free(&cache->arena); free(cache); }
+}
+
 struct mcond {
     const char *q;
     const struct mcond *up;
@@ -1483,6 +1568,29 @@ static void parse_body(struct pctx *pc, const char *s, const char *e, const char
     sb_free(&d);
 }
 
+static struct css_declarations *declarations_get(struct css_declarations **slot,
+                                                const char *text, const char *base, arena_t *failure) {
+    text = text ? text : ""; base = base ? base : "about:blank";
+    size_t length = strlen(text);
+    struct css_declarations *old = *slot;
+    if (old && old->length == length && !memcmp(old->text, text, length) && !strcmp(old->base, base)) return old;
+    if (!length) { declarations_free(slot); return NULL; }
+    struct css_declarations *next = calloc(1, sizeof *next);
+    if (!next) { ar_alloc(failure, SIZE_MAX); return NULL; }
+    jmp_buf trap; next->arena.trap = &trap; next->arena.chunk_size = 512;
+    if (setjmp(trap)) {
+        ar_free(&next->arena); free(next); ar_alloc(failure, SIZE_MAX); return NULL;
+    }
+    next->length = length;
+    next->text = ar_strndup(&next->arena, text, length);
+    next->base = ar_strdup(&next->arena, base);
+    struct pctx pc = {.a=&next->arena, .base=next->base};
+    parse_body(&pc, next->text, next->text + length, NULL, NULL, &next->values, &next->count);
+    next->arena.trap = NULL;
+    declarations_free(slot); *slot = next;
+    return next;
+}
+
 static void parse_style_rule(struct pctx *pc, const char *ps, const char *pe, const char *bs, const char *be,
                              const struct mcond *media, const char *parent) {
     const char *sel_text;
@@ -2833,6 +2941,7 @@ struct css_animation {
     uint32_t id;
     uint8_t pseudo;
     char *text;
+    struct css_declarations *declarations;
 };
 /* Playback owns only a name/time/identity, never an AST or computed-style
    pointer. The supervisor ticks after joins; workers publish disjoint nodes
@@ -2885,7 +2994,7 @@ int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text) 
     struct css_animation *old = *slot;
     if (!text || !*text) {
         if (!old) return 0;
-        *slot = old->next; free(old->text); free(old); return 1;
+        *slot = old->next; declarations_free(&old->declarations); free(old->text); free(old); return 1;
     }
     if (old && !strcmp(old->text, text)) return 0;
     char *copy = strdup(text);
@@ -2893,7 +3002,7 @@ int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text) 
     if (old) { free(old->text); old->text = copy; return 1; }
     struct css_animation *a = malloc(sizeof *a);
     if (!a) { free(copy); return -1; }
-    *a = (struct css_animation){NULL, id, pseudo, copy};
+    *a = (struct css_animation){.id=id, .pseudo=pseudo, .text=copy};
     *slot = a; return 1;
 }
 void css_animation_free(node_t *n) {
@@ -2901,7 +3010,7 @@ void css_animation_free(node_t *n) {
     while (n->animations) {
         struct css_animation *a = n->animations;
         n->animations = a->next;
-        free(a->text); free(a);
+        declarations_free(&a->declarations); free(a->text); free(a);
     }
 }
 struct dent {
@@ -3315,7 +3424,7 @@ static void apply_decl(struct cascade *c, struct cx *cx, const struct decl *d) {
 
 static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uint8_t pseudo, bool underlying) {
     web_doc *d = c->d;
-    style_t *s = ar_alloc(c->a, sizeof *s);
+    style_t *s = style_slot_alloc(d, e, c->a);
     css_style_init(s, parent);
     /* custom properties: the most important declaration of each name */
     const struct custom_prop *inherited = s->vars;
@@ -3328,8 +3437,11 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
             if (!strcmp(m->name, x->name)) dup = true;
         if (dup) continue;
         struct custom_prop *cp = ar_alloc(c->a, sizeof *cp);
-        cp->name = x->name;
-        cp->value = x->value;
+        /* Parsed inline/effect blocks may be replaced before the next
+           cascade. Computed variable chains own their bytes, and inherited
+           borrows still retire with the existing node-generation protocol. */
+        cp->name = ar_strdup(c->a, x->name);
+        cp->value = ar_strdup(c->a, x->value);
         cp->next = mine;
         mine = cp;
     }
@@ -3506,6 +3618,8 @@ void css_node_style_free(node_t *n) {
     if (!n) return;
     css_motion_reset(n);
     ar_free(&n->style_mem); ar_free(&n->style_previous_mem);
+    style_slots_free(&n->style_slots); style_slots_free(&n->style_previous_slots);
+    declarations_free(&n->style_declarations);
     n->style = n->animation_base_style = n->style_previous = NULL;
 }
 
@@ -3532,6 +3646,7 @@ void css_styles_release(web_doc *d) {
         if(n->style==n->style_previous)n->style=NULL;
         n->style_mem.trap=NULL;
         ar_free(&n->style_previous_mem); n->style_previous = NULL; n->style_retired_next = NULL;
+        style_slots_free(&n->style_previous_slots);
         n = next;
     }
 }
@@ -3675,8 +3790,9 @@ static void retire_style(struct cascade *c, node_t *e) {
        publication happens here. The supervisor refreshes borrows after join. */
     for(box_t *b=e->box;b;b=b->parent)__atomic_store_n(&b->style_sync_dirty,true,__ATOMIC_RELAXED);
     e->style_previous = e->style; e->style_previous_mem = e->style_mem;
+    e->style_previous_slots = e->style_slots; e->style_slots = NULL;
     memset(&e->style_mem, 0, sizeof e->style_mem);
-    e->style_mem.chunk_size = 4096;
+    e->style_mem.chunk_size = 512; /* allocated only if a computed value needs a tail */
     e->style_mem.trap = c->trap;
     node_t *head;
     do { head = __atomic_load_n(&c->d->style_retired_first, __ATOMIC_RELAXED); e->style_retired_next = head; }
@@ -3771,11 +3887,9 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     int depth = scope_depth(doc_node_root(e, false));
     for (int i = 0; i < h.n; i++) add_dent(&h.d[i], 1ull << 62, PE_NONE, depth);
     const char *sa = node_attr(e, "style");
-    if (sa && *sa) {
-        struct pctx pc = {c->a, NULL, d->base, NULL, 0, false, 0};
-        struct decl *ds;
-        int nd;
-        parse_body(&pc, sa, sa + strlen(sa), NULL, NULL, &ds, &nd);
+    struct css_declarations *inline_block = declarations_get(&e->style_declarations, sa, d->base, c->a);
+    if (inline_block) {
+        struct decl *ds = inline_block->values; int nd = inline_block->count;
         for(int i=0;i<nd;i++)if(container_units_used(ds[i].value))
             __atomic_store_n(&((struct css_ctx *)d->sty.ctx)->containers,true,__ATOMIC_RELEASE);
         for (int i = 0; i < nd; i++) add_dent(&ds[i], 1ull << 62 | (uint64_t)0x3FFFFFFF << 32 | (uint64_t)(i < 255 ? i : 255), PE_NONE, depth);
@@ -3798,9 +3912,8 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
         add_dent(sample,0,PE_NONE,0);dents[ndents-1].animation=true;
     }
     for (struct css_animation *a = e->animations; a; a = a->next) {
-        struct pctx pc = {c->a, NULL, d->base, NULL, 0, false, 0};
-        struct decl *ds; int nd;
-        parse_body(&pc, a->text, a->text + strlen(a->text), NULL, NULL, &ds, &nd);
+        struct css_declarations *block = declarations_get(&a->declarations, a->text, d->base, c->a);
+        struct decl *ds = block->values; int nd = block->count;
         for(int i=0;i<nd;i++)if(container_units_used(ds[i].value))
             __atomic_store_n(&((struct css_ctx *)d->sty.ctx)->containers,true,__ATOMIC_RELEASE);
         for (int i = 0; i < nd; i++) {
@@ -3927,6 +4040,12 @@ static void cascade_frontier_run(struct cascade *c, node_t *root) {
 }
 
 void css_cascade(web_doc *d, int vw, int vh) {
+    /* Publish pool ownership before spawning disjoint subtree jobs. */
+    if (!d->style_pool) {
+        d->style_pool = calloc(1, sizeof *d->style_pool);
+        if (!d->style_pool) { ar_alloc(&d->smem, SIZE_MAX); return; }
+        d->style_pool->owned = true;
+    }
     d->css_motion_now=uptime_ms(); /* exactly one supervisor snapshot per cascade */
     /* Direct native callers may recascade without the document publication
        helper. Do not overwrite a prior retirement generation while boxes
