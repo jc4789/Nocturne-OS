@@ -87,6 +87,10 @@ int main(void) {
     r.rx=malloc(strlen(head)+3);memcpy(r.rx,head,strlen(head));memcpy(r.rx+strlen(head),"abc",3);
     CHECK(unpack(&r));CHECK(r.rx[1]==0);
     CHECK(!memcmp(r.rx+1+r.head.headers_len+1,"abc",3));free(r.rx);
+    strcpy(headers,"\r\nHTTP/Nocturne-Transport phase=3 attempts=1 resolve=0 connect=3 tls=11 first_header=0 headers=0 body=0 tls_io=7 tls_other=4\r\n");
+    CHECK(consume_transport_diagnostic(&r,headers)&&!headers[0]);
+    strcpy(headers,"\r\nHTTP/Nocturne-Transport phase=3 attempts=1 resolve=0 connect=3 tls=11 first_header=0 headers=0 body=0 tls_io=7 tls_other=5\r\n");
+    CHECK(!consume_transport_diagnostic(&r,headers));
     printf("webnet-private-timing: %d checks, %d failed\n",checks,failed);return failed!=0;
 }
 #else

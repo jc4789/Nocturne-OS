@@ -1018,6 +1018,7 @@ static bool restyle_derived(box_t *b, style_t *old) {
 }
 static void restyle_boxes(box_t *b,bool inherited_borrow) {
     if (!b||(!inherited_borrow&&!b->style_sync_dirty)) return;
+    b->paint_layers_valid=false; /* paint-only effects can change stacking without new geometry */
     bool own_borrow=b->node&&b->node->style_previous;
     style_t *old = b->st;
     if (restyle_derived(b,old)) {
@@ -1054,7 +1055,12 @@ static void restyle_boxes(box_t *b,bool inherited_borrow) {
     for (box_t *c = b->first; c; c = c->next) { restyle_boxes(c,inherited_borrow||own_borrow); b->paint_alpha |= c->paint_alpha; }
     b->style_sync_dirty=false;
 }
-void boxes_restyle(web_doc *d) { restyle_boxes(d->root_box,false); }
+void boxes_restyle(web_doc *d) {
+    restyle_boxes(d->root_box,false);
+    /* Geometry reuse does not mean hit/paint reuse: opacity, visibility and
+       pointer-events can change with a native effect and no DOM revision. */
+    d->visual_revision++;d->paint_order_valid=false;
+}
 
 bool boxes_update_text(web_doc *d, node_t *n) {
     if (!d || !n || !n->box || n->box->kind != B_TEXT || n->box->node != n) return false;

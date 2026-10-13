@@ -139,7 +139,7 @@ static void receive_log(void *opaque, int level, const char *message) {
         save_mark(f,message+3);
     } else if (!strncmp(message, "FAIL ", 5)) {
         printf("%s\n", message); fflush(stdout); f->js_failures++; failed++; total++;
-    } else if (!strncmp(message, "NATIVE-SELECTION ", 17) || !strncmp(message, "XHR checks ", 11) || !strncmp(message, "Document checks ", 16) || !strncmp(message, "Document limit mode ", 20) || !strncmp(message, "Lexbor ", 7) || strstr(message, " API checks ")) {
+    } else if (!strncmp(message, "NATIVE-SELECTION ", 17) || !strncmp(message, "XHR checks ", 11) || !strncmp(message, "Document checks ", 16) || !strncmp(message, "XMLSerializer checks ", 21) || !strncmp(message, "Document limit mode ", 20) || !strncmp(message, "Lexbor ", 7) || strstr(message, " API checks ")) {
         printf("%s\n", message);
     } else if (level == 2) {
         /* One exception can have Diagnostic/Source continuation messages.
@@ -676,6 +676,11 @@ static void test_documents(void) {
     test_check("inert-document-no-navigation",fixture.navigations==0);
     external_case("js_document_cases.js", ";try{check('document-count-capacity',runDocumentCapacityCases('count')>=10);}catch(e){console.log('FAIL document count capacity '+e+' '+e.stack);}mark('api-done');", BASE);
     external_case("js_document_cases.js", ";try{check('document-arena-capacity',runDocumentCapacityCases('arena')>=10);}catch(e){console.log('FAIL document arena capacity '+e+' '+e.stack);}mark('api-done');", BASE);
+}
+static void test_xml_serialization(void) {
+    external_case("js_document_cases.js", ";try{const n=runXMLSerializerCases();console.log('XMLSerializer checks '+n);check('xml-serialization-count',n===53);}catch(e){console.log('FAIL XMLSerializer '+e+' '+e.stack);}mark('api-done');", BASE);
+    test_check("xml-serialization-no-network",fixture.requests==0);
+    test_check("xml-serialization-no-navigation",fixture.navigations==0);
 }
 
 static void test_language(void) {
@@ -1497,6 +1502,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "lexbor")) { printf("jstest: lexbor\n"); fflush(stdout); test_lexbor(); }
     RUN("xhr", test_xhr);
     RUN("documents", test_documents);
+    RUN("xml-serialization", test_xml_serialization);
     RUN("dom", test_dom_and_scripts);
     RUN("mime", test_script_mime);
     RUN("events", test_events_and_forms);

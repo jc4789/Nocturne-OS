@@ -12,6 +12,7 @@ enum http_transport_phase { HTTP_PHASE_NONE, HTTP_PHASE_RESOLVE, HTTP_PHASE_CONN
     HTTP_PHASE_TLS, HTTP_PHASE_HEADER, HTTP_PHASE_BODY, HTTP_PHASE_DONE };
 struct http_transport_timing {
     uint64_t resolve_ms, connect_ms, tls_ms, first_header_ms, header_ms, body_ms;
+    uint64_t tls_io_ms, tls_other_ms; /* callback wall versus all other wall, not crypto CPU */
     enum http_transport_phase phase;
 };
 /* connect to host:port; on failure returns NULL and writes a message into err */

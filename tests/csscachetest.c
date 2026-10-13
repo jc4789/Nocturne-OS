@@ -388,6 +388,19 @@ static node_t *selected_node(web_doc *d,const char *selector) {
     if(css_select(d,d->root,selector,&nodes)&&nodes.n)result=nodes.v[0];
     pv_free(&nodes);return result;
 }
+static void pseudo_geometry_diagnostic(web_doc *d,node_t *origin,const char *phase) {
+    box_t *root=d->root_box;
+    printf("pseudo geometry %s: root=%p revision=%llu valid=%d style=%d boxes=%d changed=%d recovery=%d viewport=%d,%d font=%llu\n",
+        phase,(void *)root,(unsigned long long)d->layout_revision,d->layout_valid,d->need_style,d->need_boxes,
+        d->style_boxes_changed,d->native_recovery_pending,d->width,d->height,(unsigned long long)font_metrics_generation());
+    if(root)printf("pseudo geometry %s root: dirty=%d cache=%d safe=%d post=%d font=%llu size=%.3f,%.3f post-size=%.3f,%.3f content=%.3f/%.3f\n",
+        phase,root->layout_dirty,root->layout_cache_valid,root->layout_cache_safe,root->layout_post_valid,
+        (unsigned long long)root->cached_font_generation,(double)root->w,(double)root->h,
+        (double)root->layout_post_w,(double)root->layout_post_h,(double)root->content_dy,(double)root->layout_post_content_dy);
+    if(origin&&origin->box)printf("pseudo geometry %s origin: kind=%u dirty=%d cache=%d post=%d before=%d after=%d\n",
+        phase,origin->box->kind,origin->box->layout_dirty,origin->box->layout_cache_valid,origin->box->layout_post_valid,
+        origin->style->before_generated,origin->style->after_generated);
+}
 static int pseudo_bodies_integration(void) {
     const char *html="<!doctype html><style>"
         "@font-face{font-family:UnusedPseudo;src:url(unused-pseudo.ttf)}"
@@ -422,9 +435,26 @@ static int pseudo_bodies_integration(void) {
     for(struct web_font_resource *font=d->fonts;font;font=font->next)if(font->wanted)fonts_unused=false;
     check(fonts_unused,"font refresh also ignores nongenerated pseudo bodies");
     box_t *root=d->root_box;uint64_t revision=d->layout_revision;
-    doc_node_attr(d,plain,"class","none other");web_layout(d,800,600);
+    pseudo_geometry_diagnostic(d,plain,"before-colour");
+    doc_node_attr(d,plain,"class","none other");
+    pseudo_geometry_diagnostic(d,plain,"mutated-colour");
+    web_layout(d,800,600);
+    pseudo_geometry_diagnostic(d,plain,"after-colour");
     check(plain->style->before&&plain->style->before->color==RGB(0,255,0),"nongenerated author colour updates through real cascade");
     check(root==d->root_box&&revision==d->layout_revision,"nongenerated pseudo colour change preserves published geometry");
+    revision=d->layout_revision;
+    doc_node_attr(d,plain,"style","width:123px");web_layout(d,800,600);
+    check(plain->box&&near(plain->box->w,123)&&d->layout_revision>revision,
+        "real width mutation still remeasures published geometry");
+    revision=d->layout_revision;web_layout(d,900,600);
+    check(d->width==900&&d->layout_revision>revision,"viewport mutation still remeasures geometry");
+    revision=d->layout_revision;doc_node_attr(d,plain,"class","none real");web_layout(d,900,600);
+    check(plain->style->before_generated&&d->layout_revision>revision,
+        "newly generated pseudo still rebuilds geometry");
+    check(d->images.n==1,"newly generated pseudo registers its real background resource");
+    bool font_used=false;for(struct web_font_resource *font=d->fonts;font;font=font->next)
+        if(font->wanted)font_used=true;
+    check(font_used,"newly generated pseudo selects its real font resource");
     web_free(d);
 done:
     printf("csscache-pseudo-bodies: %d checks, %d failures\n",checks,failed);return failed?1:0;

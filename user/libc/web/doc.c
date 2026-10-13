@@ -1587,6 +1587,18 @@ reflow:
         if(d->native_cancelled)goto cancelled;
         if(d->need_style)goto reflow;
     }
+    /* A class/effect change first invalidates the document conservatively.
+       After cascade publication, unchanged box geometry is still committed:
+       paint-only or nongenerated pseudo styles must not age the layout epoch
+       or rerun layout/overflow merely because their computed bodies changed.
+       Real box/font/intrinsic/viewport changes dirty the root via the existing
+       invalidation path; a newly built root has no completed post-layout. */
+    if (d->root_box && d->root_box->layout_post_valid && d->root_box->layout_cache_valid &&
+        !d->root_box->layout_dirty && d->root_box->cached_font_generation==font_metrics_generation() &&
+        d->root_box->layout_post_w==d->root_box->w && d->root_box->layout_post_h==d->root_box->h &&
+        d->root_box->layout_post_content_dy==d->root_box->content_dy &&
+        d->width == width && d->height == height && !d->native_recovery_pending)
+        goto geometry_committed;
     d->width = width;
     d->height = height;
     layout_doc(d, width, height);
@@ -1605,6 +1617,7 @@ reflow:
         return d->doc_h;
     }
     d->layout_revision++;
+geometry_committed:
     d->layout_valid = true;
     web_frames_commit_viewports(d);
     if(d->native_recovery_pending){

@@ -1,6 +1,6 @@
     /* Independent native HTML documents. No second JS DOM and no active loader. */
     const documentBridge = (() => {
-        const parserBrands=new WeakSet(), implementations=new WeakMap(), implementationBrands=new WeakMap();
+        const parserBrands=new WeakSet(), serializerBrands=new WeakSet(), implementations=new WeakMap(), implementationBrands=new WeakMap();
         const formCollections=new WeakMap(), treeCollections=new WeakMap(), weakGet=WeakMap.prototype.get, weakSet=WeakMap.prototype.set;
         const filter=Array.prototype.filter, createObject=Object.create;
         const nodeTypeGetter=Object.getOwnPropertyDescriptor(Node.prototype,'nodeType').get;
@@ -25,6 +25,20 @@
                 return rawDom.parseDocument(null,input,false);
             }
         }
+        const serializerHas=WeakSet.prototype.has,serializerAdd=WeakSet.prototype.add;
+        class XMLSerializer {
+            constructor(){apply(serializerAdd,serializerBrands,[this]);}
+            serializeToString(root){
+                if(!apply(serializerHas,serializerBrands,[this]))throw new TypeError('Illegal XMLSerializer receiver');
+                if(!arguments.length)throw new TypeError('serializeToString requires a Node');
+                apply(nodeTypeGetter,root,[]); // Native Node brand, including another document's nodes.
+                const serialized=rawDom.get(root,'xmlSerialization');
+                if(serialized===null)throw new DOMException('The node cannot be serialized as XML','InvalidStateError');
+                return serialized;
+            }
+        }
+        Object.defineProperty(XMLSerializer.prototype,'serializeToString',{enumerable:true});
+        Object.defineProperty(XMLSerializer.prototype,Symbol.toStringTag,{value:'XMLSerializer',configurable:true});
         class DOMImplementation {
             constructor(){throw new TypeError('Illegal DOMImplementation constructor');}
             createHTMLDocument(title){
@@ -125,6 +139,6 @@
         });
         Document.prototype.createEvent=function(...args){brand(this);return apply(createEvent,this,args);};
         for(const method of ['write','writeln'])Document.prototype[method]=function(){brand(this);throw new DOMException('Writing to an inactive document is not implemented','NotSupportedError');};
-        Object.assign(globalThis,{DOMParser,DOMImplementation});
+        Object.assign(globalThis,{DOMParser,XMLSerializer,DOMImplementation});
         return {brand};
     })();

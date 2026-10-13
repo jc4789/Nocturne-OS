@@ -20,6 +20,7 @@ struct net_stream {
     bool io_limited, handshaking, closing, transport_eof;
     int transport_errno;
     uint64_t io_deadline;
+    struct http_transport_timing *timing;
     char err[128];
     br_ssl_client_context cc;
     br_x509_minimal_context xc;
@@ -51,11 +52,17 @@ static int io_timeout(net_stream *s, int *timeout) {
 }
 static int sock_read(void *ctx, unsigned char *buf, size_t len) {
     net_stream *s = ctx;
+    uint64_t callback_started=s->handshaking&&s->timing?uptime_ms():0;
     int timeout;
-    if(io_timeout(s,&timeout)<0)return -1;
+    if(io_timeout(s,&timeout)<0){
+        if(s->handshaking&&s->timing)s->timing->tls_io_ms+=uptime_ms()-callback_started;
+        return -1;
+    }
     long r = tcp_recv(s->sock, buf, len, timeout);
+    int cause=r<0?errno:0;
+    if(s->handshaking&&s->timing)s->timing->tls_io_ms+=uptime_ms()-callback_started;
     if (r > 0) return (int)r;
-    s->transport_errno=r<0?errno:0;s->transport_eof=r==0;
+    s->transport_errno=cause;s->transport_eof=r==0;
     if(r==0)snprintf(s->err,sizeof s->err,"peer closed connection%s",
                      s->handshaking?" during TLS handshake":"");
     else snprintf(s->err,sizeof s->err,"%s%s",
@@ -66,11 +73,17 @@ static int sock_read(void *ctx, unsigned char *buf, size_t len) {
 
 static int sock_write(void *ctx, const unsigned char *buf, size_t len) {
     net_stream *s = ctx;
+    uint64_t callback_started=s->handshaking&&s->timing?uptime_ms():0;
     int timeout;
-    if(io_timeout(s,&timeout)<0)return -1;
+    if(io_timeout(s,&timeout)<0){
+        if(s->handshaking&&s->timing)s->timing->tls_io_ms+=uptime_ms()-callback_started;
+        return -1;
+    }
     long r = tcp_send(s->sock, buf, len);
+    int cause=r<0?errno:0;
+    if(s->handshaking&&s->timing)s->timing->tls_io_ms+=uptime_ms()-callback_started;
     if (r > 0) return (int)r;
-    s->transport_errno=r<0?errno:0;s->transport_eof=r==0;
+    s->transport_errno=cause;s->transport_eof=r==0;
     snprintf(s->err,sizeof s->err,"%s",r==0?"connection closed while sending":strerror(s->transport_errno));
     return -1;
 }
@@ -121,12 +134,11 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
         snprintf(err, errlen, "%s: %s", host, cause == ENOENT ? "host not found" : strerror(cause));
         return NULL;
     }
-    /* TCP plus TLS are one connection-establishment operation. The long
-       application-read allowance (an LLM may think for minutes) does not
-       apply to a handshake, and partial TLS records cannot restart it. */
+    /* Preserve the established TCP-only connect policy. TLS has always used
+       the caller's read allowance; spending TCP time must not silently reduce
+       that allowance or reject a previously supported slower handshake. */
     int connect_ms=timeout_ms>0&&timeout_ms<20000?timeout_ms:20000;
-    uint64_t connect_started=uptime_ms(),connect_until=(uint64_t)connect_ms>UINT64_MAX-connect_started?
-        UINT64_MAX:connect_started+(uint64_t)connect_ms;
+    uint64_t connect_started=uptime_ms();
     if(timing){timing->resolve_ms=connect_started-resolve_started;timing->phase=HTTP_PHASE_CONNECT;}
     int sock = tcp_connect(ip, port, connect_ms);
     int connect_error=sock<0?errno:0;
@@ -146,7 +158,7 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
     s->timeout_ms = timeout_ms < 0 ? -1 : timeout_ms > 0 ? timeout_ms : 60000;
     if (!tls) return s;
     if(timing)timing->phase=HTTP_PHASE_TLS;
-    s->handshaking=true;s->io_limited=true;s->io_deadline=connect_until;
+    s->handshaking=true;s->timing=timing;io_begin(s,s->timeout_ms);
 
     br_ssl_client_init_full(&s->cc, &s->xc, tls_trust_anchors, tls_trust_anchors_num);
     br_ssl_engine_set_buffer(&s->cc.eng, s->iobuf, sizeof s->iobuf, 1);
@@ -163,11 +175,13 @@ static net_stream *open_stream(const char *host, uint16_t port, bool tls, int ti
         if (!s->err[0]) snprintf(s->err, sizeof s->err, "TLS handshake failed");
         goto fail;
     }
-    if(timing)timing->tls_ms=uptime_ms()-tls_started;
-    s->handshaking=false;s->io_limited=false;
+    if(timing){timing->tls_ms=uptime_ms()-tls_started;
+        timing->tls_other_ms=timing->tls_ms>=timing->tls_io_ms?timing->tls_ms-timing->tls_io_ms:0;}
+    s->handshaking=false;s->io_limited=false;s->timing=NULL;
     return s;
 fail:
-    if(timing)timing->tls_ms=uptime_ms()-tls_started;
+    if(timing){timing->tls_ms=uptime_ms()-tls_started;
+        timing->tls_other_ms=timing->tls_ms>=timing->tls_io_ms?timing->tls_ms-timing->tls_io_ms:0;}
     snprintf(err, errlen, "%s", s->err);
     tcp_close(sock);
     free(s);

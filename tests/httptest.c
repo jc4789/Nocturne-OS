@@ -47,12 +47,19 @@ static void setup(unsigned connect,unsigned delay,unsigned records){
     application_reads=1;close_reads=0;failure_mode=0;closed=read_count=0;engine_closed=false;
     memset(last_timeouts,0,sizeof last_timeouts);}
 int main(void){char error[160],byte;net_stream *s;
-    setup(500,6000,4);s=ns_open("transport.invalid",443,true,INT_MAX,error,sizeof error);
-    CHECK(!s&&clock_ms==20100&&closed==1);
-    CHECK(read_count==4&&last_timeouts[0]==19500&&last_timeouts[1]==13500&&last_timeouts[2]==7500&&last_timeouts[3]==1500);
+    /* A legitimate slow TLS handshake must not inherit TCP's spent 20s cap. */
+    setup(500,6000,4);s=ns_open("transport.invalid",443,true,0,error,sizeof error);
+    CHECK(s&&clock_ms==24600);
+    CHECK(read_count==4&&last_timeouts[0]==60000&&last_timeouts[1]==54000&&last_timeouts[2]==48000&&last_timeouts[3]==42000);
+    if(s)ns_close(s);CHECK(closed==1);
+    setup(100,100,3);s=ns_open("transport.invalid",443,true,250,error,sizeof error);
+    CHECK(!s&&clock_ms==450&&last_timeouts[0]==250&&last_timeouts[1]==150&&last_timeouts[2]==50&&closed==1);
     CHECK(strstr(error,"TLS handshake")&&strstr(error,"timed out")&&strstr(error,"transport=")&&strstr(error,"TLS="));
-    setup(100,100,2);s=ns_open("transport.invalid",443,true,250,error,sizeof error);
-    CHECK(!s&&clock_ms==350&&last_timeouts[0]==150&&last_timeouts[1]==50&&closed==1);
+    struct http_transport_timing timing;
+    setup(15000,3000,2);s=ns_open_timed("transport.invalid",443,true,60000,error,sizeof error,&timing);
+    CHECK(s&&clock_ms==21100&&timing.connect_ms==15000&&timing.tls_ms==6000);
+    CHECK(timing.tls_io_ms==6000&&timing.tls_other_ms==0);
+    if(s)ns_close(s);CHECK(closed==1);
     setup(250,1000,3);s=ns_open("transport.invalid",443,true,180000,error,sizeof error);CHECK(s!=NULL);
     if(s){read_delay=90000;CHECK(ns_read(s,&byte,1)==1&&last_timeouts[3]==180000);
         CHECK(ns_read(s,&byte,1)==1&&last_timeouts[4]==180000);

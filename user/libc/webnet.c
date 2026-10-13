@@ -425,17 +425,21 @@ static bool consume_transport_diagnostic(struct request *r,char *headers) {
     if(!r->debug_request)return true;
     char *line=strstr(headers,"\r\nHTTP/Nocturne-Transport ");if(!line)return true;
     const char *p=line+sizeof("\r\nHTTP/Nocturne-Transport ")-1;
-    uint64_t phase,attempts,resolve,connect,tls,first,head,body;
+    uint64_t phase,attempts,resolve,connect,tls,first,head,body,io=0,other=0;
     if(!diagnostic_number(&p,"phase=",&phase)||!diagnostic_number(&p," attempts=",&attempts)||
        !diagnostic_number(&p," resolve=",&resolve)||!diagnostic_number(&p," connect=",&connect)||
        !diagnostic_number(&p," tls=",&tls)||!diagnostic_number(&p," first_header=",&first)||
-       !diagnostic_number(&p," headers=",&head)||!diagnostic_number(&p," body=",&body)||
-       p[0]!='\r'||p[1]!='\n'||phase>HTTP_PHASE_DONE||!attempts||attempts>42)return false;
+       !diagnostic_number(&p," headers=",&head)||!diagnostic_number(&p," body=",&body))return false;
+    bool split=!strncmp(p," tls_io=",8);
+    if(split&&(!diagnostic_number(&p," tls_io=",&io)||!diagnostic_number(&p," tls_other=",&other)||
+       io>tls||other>tls||io>UINT64_MAX-other||io+other!=tls))return false;
+    if(p[0]!='\r'||p[1]!='\n'||phase>HTTP_PHASE_DONE||!attempts||attempts>42)return false;
     memmove(line,p+2,strlen(p+2)+1);
     if(strstr(headers,"HTTP/Nocturne-Transport "))return false;
-    fprintf(stderr,"[webnet] transport id=%lu phase=%lu attempts=%lu resolve=%lu ms connect=%lu ms tls=%lu ms first-header=%lu ms headers=%lu ms body=%lu ms\n",
+    fprintf(stderr,"[webnet] transport id=%lu phase=%lu attempts=%lu resolve=%lu ms connect=%lu ms tls=%lu ms first-header=%lu ms headers=%lu ms body=%lu ms tls-split=%u tls-io=%lu ms tls-other=%lu ms\n",
         (unsigned long)r->id,(unsigned long)phase,(unsigned long)attempts,(unsigned long)resolve,
-        (unsigned long)connect,(unsigned long)tls,(unsigned long)first,(unsigned long)head,(unsigned long)body);
+        (unsigned long)connect,(unsigned long)tls,(unsigned long)first,(unsigned long)head,(unsigned long)body,
+        split,(unsigned long)io,(unsigned long)other);
     return true;
 }
 /* Wire data has no terminators; insert them after the complete payload has arrived. */

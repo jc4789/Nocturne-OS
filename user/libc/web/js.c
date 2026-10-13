@@ -1260,6 +1260,14 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
         if (n->type == N_TEXT || n->type == N_COMMENT || n->type == N_PI) return JS_NewStringLen(ctx, n->text ? n->text : "", n->textlen);
         sbuf b = {0}; node_text_content(n, &b); JSValue v = JS_NewStringLen(ctx, b.p ? b.p : "", b.n); sb_free(&b); return v;
     }
+    if (!strcmp(p, "xmlSerialization")) {
+        sbuf b = {0};
+        enum xml_serialization_result status=xml_serialize_node(n,&b,false);
+        JSValue value=status==XML_SERIALIZED?JS_NewStringLen(ctx,b.p?b.p:"",b.n):
+            status==XML_SERIALIZE_OOM?oom(ctx):status==XML_SERIALIZE_CANCELLED?
+            JS_ThrowInternalError(ctx,"XML serialization interrupted"):JS_NULL;
+        sb_free(&b);return value;
+    }
     if (!strcmp(p, "innerHTML") || !strcmp(p, "outerHTML")) {
         sbuf b = {0};
         if (!strcmp(p, "outerHTML")) html_serialize_node(n, &b);

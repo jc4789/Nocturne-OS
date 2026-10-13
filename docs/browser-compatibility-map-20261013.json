@@ -17,11 +17,13 @@
     {"path":"user/libc/tls.c","purpose":"TCP/TLS確立の共有期限、record反復と本文/closeの操作期限・認証"},
     {"path":"user/libc/http.c","purpose":"既存HTTP parser/stream共有とopt-in処理位相時間"},
     {"path":"user/libc/web/js_bootstrap.js","purpose":"CSSStylePropertiesのlive疑似要素読取と生成bindingの正規入力"},
+    {"path":"user/libc/web/js_document.js","purpose":"既存native文書とXMLSerializerのWebIDL接続、独立Nodeブランドと寿命"},
+    {"path":"user/libc/web/html_serialize.c","purpose":"既存HTML serialization保全と非再帰XML namespace/出力/取消の共通責務"},
     {"path":"kernel/src/net/net.c","purpose":"動的UDP/TCP slot・生存queue・接続tupleと待機世代の所有、TCPごとのprogress待機と期限境界"},
     {"path":"user/apps/webfetch.c","purpose":"実incremental gzip decoderと正規content-coding交渉"},
     {"path":"common/gfx.c","purpose":"実A8不透明区間の行高速処理と境界の正確なclip合成"},
     {"path":"user/libc/web/frame.c","purpose":"paint非依存のchild viewport commitとframe寿命"}
   ],
-  "contracts":["サイト名・特定DOM専用処理は禁止。人工的容量制限やUINT32_MAX化で解決しない。","主担当が同条件WHPX/4CPU/4096MiB/1920x1080の指定4サイト・百度2画面の原画を見て入力・上下scrollを確認。","生成bindingは生成元から正規再生成、前回commit0519429の性能実装と既存ユーザー変更は保全。","CSS資源のloading claimと文書世代を保持し、返却順に依存しないcascadeを維持。初期描画待ちの期限は資源取得を取消さず、一回だけ消費する。"],
+  "contracts":["サイト名・特定DOM専用処理は禁止。人工的容量制限やUINT32_MAX化で解決しない。","主担当が同条件WHPX/4CPU/4096MiB/1920x1080の指定4サイト・百度2画面の原画を見て入力・上下scrollを確認。","生成bindingは生成元から正規再生成、前回commit0519429の性能実装と既存ユーザー変更は保全。","CSS資源のloading claimと文書世代を保持し、返却順に依存しないcascadeを維持。初期描画待ちの期限は資源取得を取消さず、一回だけ消費する。","TCP+TLS共有20秒は正当な旧成功取得を拒否する回帰で撤回。TCP予算と既存TLS caller予算を区別する。callback内外wallをCPU時間と誤読しない。","非生成疑似bodyとgeometryは分離、paint/hit別世代を保つ。新原12 geometry条件の失敗を製品修理し、17条件の最新native確認中。","Redditの正MIME200後の実XMLSerializer欠落を共通APIへ実装。XML parser/CDATA/任意namespace作成は別の未対応範囲、API追加だけで左欄成功としない。"],
   "unknowns":["百度home再読込中の実wheel上下・放置後の自走なし・hero画像維持は先行媒体で確認。記事25秒posted DOM入力停滞を実再現。wrapper寿命局所修理後の同条件task実時間28.4→5.0秒は支持比較のみ。後続TLS前媒体はchallenge scriptが122秒TLSエラー、home本体script4MBの成功取得も101.8秒かかり、全ページ性能回帰は未達。","DOM部分木GC publication・新indices/form・script挿入再入順序・TCP接続別waitは統合native3群成功。TLS操作期限と処理位相のhost37/12/9は支持証拠。初placeholder nativeはPE値衝突で失敗。共有enum修理後paint12成功、CSSOMはinput::before条件で失敗。computed bodyと生成flagの共通修理後に再検証中。","DDGの検索欄・影・フィルターinline・丸avatarを主担当の後続batch-current原画で確認。最終媒体での実検索・上下scrollと細部一致は未受入。","Reddit左sidebarは取得開始とHTTP200正MIME後のTypeError: not a function(xr→br→_renderContent)へ絞った。lazy IO未起動とは言わない。共通fragment挿入APIはまだ未特定。共有PE値修理後のcompat-tls-phase-reddit原画で二重placeholder解消・実PageDownを主担当確認、PageUp前に期限終了。左欄空と次feed読み込みerrorは残る。","GitHub About/table重なりなし・実省略glyph・nav inline・右上Sign in/Sign up収まり、実PgDn/PgUpをcompat-layout-final-githubで目視受入。最新TLS/placeholder媒体での影響確認は未実施。","console-only更新では実GitHub/DDG idle本文draw0/0msを確認。後続Reddit/DDG batchもidle本文draw0。unstyled百度記事のidle反復は未解消。累積rasterと区間work、1/64native推定と実task時間を混同しない。","HTML5testの5＋がmain内に収まり、実PgDn/PgUpと＋menuをcompat-layout-final-html5testで目視。auto table native54条件成功。最新媒体で影響確認は未実施。","原WPTのradius computed14、layer basic34/important9、修理後inline4/media8、Window named原4条件は成功。modulepreload原SRI・IO支持条件は過去支持証拠、原inline client rect2FAILは未変更。"]
 }

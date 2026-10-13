@@ -811,6 +811,7 @@ static bool run_http(struct job *j) {
             j->debug_timing.resolve_ms+=timing.resolve_ms;j->debug_timing.connect_ms+=timing.connect_ms;
             j->debug_timing.tls_ms+=timing.tls_ms;j->debug_timing.first_header_ms+=timing.first_header_ms;
             j->debug_timing.header_ms+=timing.header_ms;j->debug_timing.body_ms+=timing.body_ms;
+            j->debug_timing.tls_io_ms+=timing.tls_io_ms;j->debug_timing.tls_other_ms+=timing.tls_other_ms;
         }
         /* A transport reset before any response is not an HTTP rejection.
            Replay only bodyless idempotent reads, once, within the same native
@@ -829,6 +830,7 @@ static bool run_http(struct job *j) {
                     j->debug_timing.resolve_ms+=timing.resolve_ms;j->debug_timing.connect_ms+=timing.connect_ms;
                     j->debug_timing.tls_ms+=timing.tls_ms;j->debug_timing.first_header_ms+=timing.first_header_ms;
                     j->debug_timing.header_ms+=timing.header_ms;j->debug_timing.body_ms+=timing.body_ms;
+                    j->debug_timing.tls_io_ms+=timing.tls_io_ms;j->debug_timing.tls_other_ms+=timing.tls_other_ms;
                 }
             }
         }
@@ -963,11 +965,12 @@ int main(void) {
     if((w->user_navigation&WEBNET_WIRE_DEBUG_REQUEST)&&j->debug_attempts) {
         char line[384];
         int length=snprintf(line,sizeof line,
-            "\r\nHTTP/Nocturne-Transport phase=%u attempts=%u resolve=%lu connect=%lu tls=%lu first_header=%lu headers=%lu body=%lu\r\n",
+            "\r\nHTTP/Nocturne-Transport phase=%u attempts=%u resolve=%lu connect=%lu tls=%lu first_header=%lu headers=%lu body=%lu tls_io=%lu tls_other=%lu\r\n",
             (unsigned)j->debug_timing.phase,j->debug_attempts,(unsigned long)j->debug_timing.resolve_ms,
             (unsigned long)j->debug_timing.connect_ms,(unsigned long)j->debug_timing.tls_ms,
             (unsigned long)j->debug_timing.first_header_ms,(unsigned long)j->debug_timing.header_ms,
-            (unsigned long)j->debug_timing.body_ms);
+            (unsigned long)j->debug_timing.body_ms,(unsigned long)j->debug_timing.tls_io_ms,
+            (unsigned long)j->debug_timing.tls_other_ms);
         size_t old=j->response_headers_len;
         if(length>0&&(size_t)length<sizeof line&&old<=SIZE_MAX-(size_t)length-1) {
             char *grown=realloc(j->response_headers,old+(size_t)length+1);

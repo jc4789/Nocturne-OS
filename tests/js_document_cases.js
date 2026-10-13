@@ -109,3 +109,69 @@ globalThis.runDocumentCapacityCases=function(mode){
     safe.adoptNode(control);eq(control.value,'OK','adopt back after allocation');
     return count;
 };
+
+/* XMLSerializer uses the native tree and a separate XML namespace/escape path.
+   XML document parsing and CDATA creation are separate, still unsupported APIs. */
+globalThis.runXMLSerializerCases=function(){
+    let count=0;
+    function eq(actual,expected,label){count++;if(actual!==expected)throw Error('XMLSerializer: '+label+' '+String(actual)+' != '+String(expected));}
+    function raises(fn,name,label){let error;try{fn();}catch(e){error=e;}eq(error&&error.name,name,label);}
+    const serializer=new XMLSerializer(),serialize=node=>serializer.serializeToString(node);
+    const htmlNS='http://www.w3.org/1999/xhtml',svgNS='http://www.w3.org/2000/svg';
+    eq(Object.prototype.toString.call(serializer),'[object XMLSerializer]','interface tag');
+    eq(XMLSerializer.length,0,'constructor arity');eq(serializer.serializeToString.length,1,'method arity');
+    const method=Object.getOwnPropertyDescriptor(XMLSerializer.prototype,'serializeToString');
+    eq(method.enumerable,true,'method enumerable');eq(method.writable,true,'method writable');eq(method.configurable,true,'method configurable');
+    raises(()=>XMLSerializer(),'TypeError','constructor requires new');
+    raises(()=>XMLSerializer.prototype.serializeToString.call({},document),'TypeError','serializer receiver brand');
+    raises(()=>serializer.serializeToString(),'TypeError','required argument');
+    for(const invalid of [null,undefined,1,'html',{},Object.create(Node.prototype),{nodeType:1,outerHTML:'<fake/>'}])raises(()=>serialize(invalid),'TypeError','native Node brand');
+    const div=document.createElement('div'),br=document.createElement('br');
+    eq(serialize(div),'<div xmlns="'+htmlNS+'"></div>','HTML paired empty element');
+    eq(serialize(br),'<br xmlns="'+htmlNS+'" />','HTML void XML syntax');
+    eq(div.outerHTML,'<div></div>','HTML serializer unchanged');eq(br.outerHTML,'<br>','HTML void serializer unchanged');
+    const text=document.createTextNode('<&>\u00a0');
+    eq(serialize(text),'&lt;&amp;&gt;\u00a0','XML text escape and NBSP');eq(text.data,'<&>\u00a0','input data not mutated');
+    const comment=document.createComment('bad--comment');eq(serialize(comment),'<!--bad--comment-->','false require-wellformed flag');
+    const pi=document.createProcessingInstruction('target','a="1"');eq(serialize(pi),'<?target a="1"?>','PI actual data');
+    const attr=document.createAttribute('detached');attr.value='payload';eq(serialize(attr),'','standalone Attr empty result');
+    div.setAttribute('v','\t\n\r<&>"\u00a0');
+    eq(serialize(div),'<div xmlns="'+htmlNS+'" v="&#9;&#xA;&#xD;&lt;&amp;&gt;&quot;\u00a0"></div>','attribute whitespace and escape');
+    div.removeAttribute('v');div.setAttributeNS('urn:example:attribute','chosen:value','data');
+    eq(serialize(div),'<div xmlns="'+htmlNS+'" xmlns:chosen="urn:example:attribute" chosen:value="data"></div>','native attribute namespace');
+    div.removeAttributeNS('urn:example:attribute','value');
+    div.setAttributeNS('http://www.w3.org/XML/1998/namespace','xml:lang','ja');
+    eq(serialize(div),'<div xmlns="'+htmlNS+'" xml:lang="ja"></div>','reserved xml namespace implicit');div.removeAttributeNS('http://www.w3.org/XML/1998/namespace','lang');
+    const svg=document.createElementNS(svgNS,'svg'),g=document.createElementNS(svgNS,'g');svg.appendChild(g);div.appendChild(svg);
+    eq(serialize(div),'<div xmlns="'+htmlNS+'"><svg xmlns="'+svgNS+'"><g/></svg></div>','HTML/foreign namespace boundary');
+    eq(svg.namespaceURI,svgNS,'foreign identity kept');eq(svg.firstChild,g,'foreign children kept');
+    const fragment=document.createDocumentFragment();fragment.append(document.createElement('i'),document.createElementNS(svgNS,'path'));
+    eq(serialize(fragment),'<i xmlns="'+htmlNS+'"></i><path xmlns="'+svgNS+'"/>','fragment sibling namespace contexts');
+    eq(fragment.childNodes.length,2,'fragment serialization does not consume nodes');
+    const template=document.createElement('template');template.innerHTML='<span>nested</span><br>';
+    eq(serialize(template),'<template xmlns="'+htmlNS+'"><span>nested</span><br /></template>','native template contents');
+    eq(template.childNodes.length,0,'template separation retained');eq(template.content.childNodes.length,2,'template content retained');
+    const hostElement=document.createElement('section');hostElement.attachShadow({mode:'open'}).innerHTML='<strong>secret</strong>';
+    hostElement.appendChild(document.createElement('p'));eq(serialize(hostElement),'<section xmlns="'+htmlNS+'"><p></p></section>','no shadow leakage');
+    const inactive=new DOMParser().parseFromString('<!doctype html><html><head></head><body><article id="kept">A &amp; B</article></body></html>','text/html');
+    eq(serialize(inactive),'<!DOCTYPE html><html xmlns="'+htmlNS+'"><head></head><body><article id="kept">A &amp; B</article></body></html>','independent native Document');
+    const article=inactive.getElementById('kept');eq(serialize(article),'<article xmlns="'+htmlNS+'" id="kept">A &amp; B</article>','inert owner native node');
+    document.adoptNode(article);eq(serialize(article),'<article xmlns="'+htmlNS+'" id="kept">A &amp; B</article>','native serializer after adoption');
+    eq(article.ownerDocument,document,'adopted owner kept');eq(article.parentNode,null,'serialization leaves detached state');
+    inactive.adoptNode(article);article.id='changed';eq(serialize(article).includes('id="changed"'),true,'fresh native attributes after cross-arena update');
+    const target=document.createElement('main');target.insertAdjacentHTML('beforeend',serialize(template));
+    eq(target.firstChild.localName,'template','XML string parsed by ordinary HTML fragment API');
+    eq(target.firstChild.content.firstChild.textContent,'nested','native serialization/parser roundtrip content');
+    const script=document.createElement('script');script.textContent='if (a < b && c > d) {x="&";}';
+    eq(serialize(script),'<script xmlns="'+htmlNS+'">if (a &lt; b &amp;&amp; c &gt; d) {x="&amp;";}</script>','XML script escapes');
+    eq(script.outerHTML,'<script>if (a < b && c > d) {x="&";}</script>','HTML rawtext unchanged');
+    const oldType=Object.getOwnPropertyDescriptor(Node.prototype,'nodeType');
+    Object.defineProperty(text,'nodeType',{get(){throw Error('author nodeType should not be read');},configurable:true});
+    eq(serialize(text),'&lt;&amp;&gt;\u00a0','captured intrinsic brand avoids author getter');delete text.nodeType;
+    eq(Object.getOwnPropertyDescriptor(Node.prototype,'nodeType').get,oldType.get,'native descriptor preserved');
+    raises(()=>document.createCDATASection('x'),'NotSupportedError','HTML CDATA rejection preserved');
+    const doctype=document.implementation.createDocumentType('html','pub','sys');eq(serialize(doctype),'<!DOCTYPE html PUBLIC "pub" "sys">','doctype identifiers');
+    const empty=inactive.cloneNode(false);eq(serialize(empty),'','false flag allows empty Document');
+    eq(document.body.localName,'body','live document preserved');
+    return count;
+};
