@@ -7,17 +7,25 @@ const eventSource=slice('    const eventStates=', '    /* @include js_error_even
 const targetSource=slice('    class EventTarget {','    function handlerTarget(');
 const inputSource=slice('    function inputListenerChange(', '    function removeListener(');
 const dispatchSource=slice('    function invoke(target, event, capture) {','    class Node extends EventTarget {');
+const uiSource=slice('    class UIEvent extends Event {','    function inputListenerChange(').replace('    /* @include js_input_event.js */','');
+const pointerSource=fs.readFileSync('user/libc/web/js_pointer_events.js','utf8');
 const init=new Function(`
-    const apply=Reflect.apply,eventSlice=Array.prototype.slice,eventPaths=new WeakMap(),focusData=new WeakMap(),listenerMap=new WeakMap(),inlineMap=new WeakMap(),inputWindow=globalThis;
-    const host={now:()=>1},rawDom={isNode:()=>false},report=e=>{throw e;},options=o=>typeof o==='boolean'?{capture:o}:o||{};
+    const apply=Reflect.apply,eventSlice=Array.prototype.slice,mouseAssign=Object.assign,eventPaths=new WeakMap(),listenerMap=new WeakMap(),inlineMap=new WeakMap(),inputWindow=globalThis;
+    const host={now:()=>1,scroll:()=>0,pointerCapturePending:()=>{}},report=e=>{throw e;},options=o=>typeof o==='boolean'?{capture:o}:o||{};
+    const document={},globalHandlerTypes=new Set();
+    function rawDom(op,target,key){if(key==='elementBrand'){if(!(target instanceof Element))throw new TypeError('Element required');return true;}return key==='isConnected'?true:key==='ownerDocument'?document:undefined;}
+    rawDom.isNode=()=>false;
     const handlerRecord=()=>null,handlerTarget=()=>false;
     function removeListener(target,entry){entry.removed=true;const a=listenerMap.get(target),i=a.indexOf(entry);if(i>=0)a.splice(i,1);}
     const shadowBridge={path(target,event){const nodes=[target];if(target.parent)nodes.push(target.parent);return {entries:nodes.map(node=>({node,target,related:null,visible:nodes,atTarget:node===target})),finalTarget:target,finalRelated:null};}};
-    ${eventSource}${inputSource}${targetSource}${dispatchSource}
+    ${eventSource}${uiSource}${inputSource}${targetSource}${dispatchSource}
     class Node extends EventTarget {}
-    return {Event,EventTarget,state:eventState};
+    class Element extends Node {}
+    const formValidationBridge={SubmitEvent:Event};
+    ${pointerSource}
+    return {Event,EventTarget,Element,state:eventState,native:nativeDispatch,pointer:pointerCaptureBridge};
 `);
-const {Event,EventTarget,state}=init();let checks=0;
+const {Event,EventTarget,Element,state,native:nativeMouse,pointer}=init();let checks=0;
 function ok(value,label){checks++;assert(value,label);}
 const parent=new EventTarget(),target=new EventTarget();target.parent=parent;
 const order=[];
@@ -35,6 +43,33 @@ const passive=new Event('passive',{cancelable:true});target.addEventListener('pa
 const nested=new Event('nested');target.addEventListener('nested',e=>{e._dispatching=false;assert.throws(()=>target.dispatchEvent(e),{name:'InvalidStateError'});checks++;});target.dispatchEvent(nested);
 const old=new Event('old');state(old).initialized=false;assert.throws(()=>target.dispatchEvent(old),{name:'InvalidStateError'});checks++;old.initEvent('new',true,true);ok(old.type==='new'&&old.bubbles&&old.cancelable,'legacy initialization preserved');
 console.log('event internal state host: '+checks+' checks, 0 failed');
+let pointerChecks=0;
+function pok(value,label){pointerChecks++;assert(value,label);}
+const control=new Element(),down={bubbles:true,cancelable:true,buttons:1,button:0},up={...down,buttons:0};
+let pointerDown=0,mouseDown=0,mouseUp=0,clicks=0;
+const cancelPointer=e=>{pointerDown++;e.preventDefault();};
+control.addEventListener('pointerdown',cancelPointer);
+control.addEventListener('mousedown',()=>mouseDown++);
+control.addEventListener('mouseup',()=>mouseUp++);
+control.addEventListener('click',e=>{clicks++;pok(e.isTrusted,'native click remains trusted');});
+pok(!nativeMouse(control,'mousedown',down),'canceled pointerdown blocks mouse focus default');
+pok(pointerDown===1&&mouseDown===0,'canceled pointerdown suppresses compatibility mousedown');
+pok(nativeMouse(control,'mouseup',up)&&mouseUp===0,'suppression preserves native release without mouseup');
+pok(nativeMouse(control,'click',up)&&clicks===1,'pointerdown cancellation does not cancel independent click');
+control.removeEventListener('pointerdown',cancelPointer);
+pok(nativeMouse(control,'mousedown',down)&&mouseDown===1,'next primary press resets compatibility suppression');
+pok(nativeMouse(control,'mouseup',up)&&mouseUp===1,'next release delivers compatibility mouseup');
+const cancelMouse=e=>e.preventDefault();control.addEventListener('mousedown',cancelMouse);
+pok(!nativeMouse(control,'mousedown',down)&&mouseDown===2,'canceled mousedown blocks focus default');
+nativeMouse(control,'mouseup',up);control.removeEventListener('mousedown',cancelMouse);
+control.addEventListener('pointerdown',cancelPointer,{passive:true});
+pok(nativeMouse(control,'mousedown',down)&&mouseDown===3,'passive pointer listener cannot suppress focus default');
+nativeMouse(control,'mouseup',up);control.removeEventListener('pointerdown',cancelPointer);
+const oldPointerDown=pointerDown;
+pok(nativeMouse(control,'mousedown',{...down,isTrusted:false})&&mouseDown===4,'synthetic compatibility event does not activate native pointer');
+pok(pointerDown===oldPointerDown,'synthetic event does not dispatch pointerdown');
+pointer.reset();
+console.log('native pointer cancellation host: '+pointerChecks+' checks, 0 failed');
 const workerSource=fs.readFileSync('user/libc/web/js_worker_runtime.js','utf8');
 const workerStart=workerSource.indexOf('    const eventStates='),workerEnd=workerSource.indexOf('    Object.assign(globalThis,{DOMException,Event,ErrorEvent,EventTarget});',workerStart);
 assert(workerStart>=0&&workerEnd>workerStart);

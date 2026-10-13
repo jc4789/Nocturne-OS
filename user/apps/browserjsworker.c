@@ -286,7 +286,15 @@ static bool worker_policy_start(struct worker *w,JSValueConst start){
         w->policy_doc.url=copy;
         bool loaded=JS_ToBool(ctx,inherit)?html_policy_snapshot_init(&w->policy_doc,text):html_policy_init(&w->policy_doc,text,NULL);
         if(!loaded){free(copy);free(security);w->policy_doc.url=NULL;html_policy_free(&w->policy_doc);JS_ThrowOutOfMemory(ctx);}
-        else{w->security_url=security;w->policy_initialized=ok=true;}
+        else{
+            if(JS_ToBool(ctx,inherit)){
+                JSValue policy=JS_GetPropertyUint32(ctx,start,NJW_START_CREATOR_REFERRER_POLICY);int32_t value=0;
+                bool valid=JS_IsUndefined(policy)||(JS_IsNumber(policy)&&JS_ToInt32(ctx,&value,policy)>=0&&value>=0&&value<=WEBNET_REFERRER_UNSAFE);JS_FreeValue(ctx,policy);
+                if(!valid){free(copy);free(security);w->policy_doc.url=NULL;html_policy_free(&w->policy_doc);JS_ThrowTypeError(ctx,"Invalid Worker referrer policy");goto done;}
+                w->policy_doc.referrer_policy=value;
+            }else w->policy_doc.referrer_policy=webnet_referrer_policy_header(text,WEBNET_REFERRER_DEFAULT);
+            w->security_url=security;w->policy_initialized=ok=true;
+        }
     }
     JS_FreeCString(ctx,text);JS_FreeCString(ctx,address);JS_FreeCString(ctx,creator);
 done:JS_FreeValue(ctx,inherit);JS_FreeValue(ctx,headers);JS_FreeValue(ctx,url);JS_FreeValue(ctx,status);JS_FreeValue(ctx,origin);return ok;
@@ -375,9 +383,11 @@ static JSValue native_request(JSContext *ctx,JSValueConst thisv,int argc,JSValue
     uint32_t id=++w->request;
     JSValue packet=JS_NewArray(ctx);if(JS_IsException(packet))return packet;
     bool ok=true;
-    for(unsigned i=0;i<4&&ok;i++){
+    for(unsigned i=0;i<6&&ok;i++){
         JSValue value=i==0?JS_DupValue(ctx,argv[0]):i==1?argc>3?JS_DupValue(ctx,argv[3]):JS_NewString(ctx,"GET"):
-            i==2?argc>4?JS_DupValue(ctx,argv[4]):JS_NewString(ctx,""):argc>5?JS_DupValue(ctx,argv[5]):JS_NULL;
+            i==2?argc>4?JS_DupValue(ctx,argv[4]):JS_NewString(ctx,""):i==3?argc>5?JS_DupValue(ctx,argv[5]):JS_NULL:
+            i==4?argc>6?JS_DupValue(ctx,argv[6]):JS_NewString(ctx,w->policy_doc.url?w->policy_doc.url:""):
+            argc>7?JS_DupValue(ctx,argv[7]):JS_NewInt32(ctx,w->policy_doc.referrer_policy);
         if(JS_IsException(value)||JS_DefinePropertyValueUint32(ctx,packet,i,value,JS_PROP_C_W_E)<0)ok=false;
     }
     if(ok)ok=send_value(w,NJW_LOAD,id,kind,packet);JS_FreeValue(ctx,packet);
@@ -402,6 +412,7 @@ static JSValue native_cancel(JSContext *ctx,JSValueConst thisv,int argc,JSValueC
     output_flush(w);
     return JS_UNDEFINED;
 }
+static JSValue native_referrer_policy(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){(void)self;(void)argc;(void)argv;return JS_NewInt32(ctx,state(ctx)->policy_doc.referrer_policy);}
 static JSValue native_import(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
     (void)thisv;struct worker *w=state(ctx);if(!argc)return JS_ThrowTypeError(ctx,"URL required");if(w->request==UINT32_MAX)return JS_ThrowRangeError(ctx,"Worker request identifier space exhausted");uint32_t id=++w->request;if(!send_value(w,NJW_LOAD,id,1,argv[0]))return JS_ThrowTypeError(ctx,"Worker import IPC failed");
     uint64_t wait_start=uptime_ms(),deadline=wait_start+WEBNET_TIMEOUT_MS;
@@ -462,7 +473,7 @@ int main(int argc,char**argv){
     const JSCFunctionListEntry funcs[]={JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),
         JS_CFUNC_DEF("safetyRequired",1,native_safety_required),JS_CFUNC_DEF("send",3,native_send),JS_CFUNC_DEF("classID",1,native_class),
         JS_CFUNC_DEF("detach",1,native_detach),JS_CFUNC_DEF("transferCommit",1,native_transfer_commit),JS_CFUNC_DEF("portSend",6,native_port_send),
-        JS_CFUNC_DEF("portLease",3,native_port_lease),JS_CFUNC_DEF("now",0,native_now),JS_CFUNC_DEF("url",0,native_context_url),JS_CFUNC_DEF("securityURL",0,native_security_url),
+        JS_CFUNC_DEF("portLease",3,native_port_lease),JS_CFUNC_DEF("now",0,native_now),JS_CFUNC_DEF("url",0,native_context_url),JS_CFUNC_DEF("securityURL",0,native_security_url),JS_CFUNC_DEF("referrerPolicy",0,native_referrer_policy),
         JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",6,native_request),JS_CFUNC_DEF("cancel",1,native_cancel),
         JS_CFUNC_DEF("import",1,native_import),JS_CFUNC_DEF("eval",2,native_eval)};
     JS_SetPropertyFunctionList(w.ctx,host,funcs,sizeof funcs/sizeof funcs[0]);

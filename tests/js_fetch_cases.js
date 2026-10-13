@@ -158,7 +158,7 @@ async function runFetchCases() {
     let sync=false,bad;try{bad=fetch('api/json',{headers:{'bad name':'x'}});}catch(_){sync=true;}
     assert(!sync&&bad instanceof Promise,'validation failure is promise');await rejects(bad,'TypeError','validation rejection');
     await rejects(fetch('file:///data/secret'),'TypeError','network local scheme rejected');
-    for(const init of [{redirect:'manual'},{referrerPolicy:'origin'}])
+    for(const init of [{redirect:'manual'}])
         await rejects(fetch('api/json',init),'NotSupportedError','unsupported transport options explicit');
     await rejects(fetch('api/json',{integrity:'sha256-test'}),'TypeError','integrity mismatch is a network error');
     const integrityURL=URL.createObjectURL(new Blob(['hello']));
@@ -178,7 +178,27 @@ async function runFetchCases() {
     for(const init of [{referrer:''},{referrerPolicy:'no-referrer'}]) {
         const policy=await (await fetch('api/fetch-policy',init)).json();
         assert(policy.no_referrer&&!policy.no_cors,'no-referrer override reaches native policy');
+        assert(policy.referrer==='','no-referrer carries an explicit empty native source');
     }
+    const policies=['','no-referrer','no-referrer-when-downgrade','same-origin','origin','strict-origin','origin-when-cross-origin','strict-origin-when-cross-origin','unsafe-url'];
+    const parserDefault=await (await fetch('api/fetch-policy')).json();
+    assert(parserDefault.referrer_policy===3,'parser meta overrides response policy before blocking script Fetch');
+    for(let i=1;i<policies.length;i++){
+        const value=await (await fetch('api/fetch-policy',{referrerPolicy:policies[i]})).json();
+        assert(value.referrer_policy===i,'referrer policy reaches private native metadata '+policies[i]);
+    }
+    const source=new URL('https://name:secret@fixture.test/from#fragment');
+    // A different-origin override becomes client, never an attacker-selected Referer.
+    assert(new Request('api/json',{referrer:source.href}).referrer==='about:client','cross-origin override becomes client');
+    const sameSource=new URL('http://name:secret@fixture.test/from#fragment');
+    const sanitized=await (await fetch('api/fetch-policy',{referrer:sameSource.href,referrerPolicy:'unsafe-url',headers:{Referer:'http://forged.invalid/'}})).json();
+    assert(sanitized.referrer==='http://fixture.test/from'&&sanitized.referrer_policy===8,'private native referrer strips credentials and fragment');
+    const meta=document.createElement('meta');meta.name='referrer';meta.content='same-origin';document.head.appendChild(meta);
+    assert((await (await fetch('api/fetch-policy')).json()).referrer_policy===3,'connected meta updates default policy');
+    meta.content='no-referrer';assert((await (await fetch('api/fetch-policy')).json()).referrer_policy===1,'meta content change updates policy locally');
+    meta.remove();assert((await (await fetch('api/fetch-policy')).json()).referrer_policy===1,'meta removal does not restore an older policy');
+    const reset=document.createElement('meta');reset.name='referrer';reset.content='strict-origin-when-cross-origin';document.head.appendChild(reset);
+    assert((await (await fetch('api/fetch-policy')).json()).referrer_policy===7,'new meta changes retained policy');reset.remove();
     let aborted;try{await fetch('api/json',{signal});}catch(e){aborted=e;}assert(aborted===reason,'preaborted exact reason');
     let cacheAborted;try{await fetch('api/json',{cache:'only-if-cached',mode:'same-origin',signal});}catch(e){cacheAborted=e;}
     assert(cacheAborted===reason,'preaborted cache-only fetch retains exact reason');

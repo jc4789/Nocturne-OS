@@ -51,9 +51,9 @@ struct queued {
     bool used, no_cors, no_referrer, body_present;
     uint64_t id, due, transport_id;
     int kind;
-    char url[2048], method[16], headers[1024], body[4096];
+    char url[2048], method[16], headers[1024], body[4096],referrer[2048];
     size_t body_len;
-    int cache_mode;
+    int cache_mode,referrer_policy;
 };
 struct fixture {
     web_doc *doc;
@@ -186,6 +186,8 @@ static bool request(void *opaque, const struct web_request *r) {
         q->body_present = r->body != NULL;
         q->cache_mode = r->cache_mode;
         q->no_cors = r->no_cors; q->no_referrer = r->no_referrer;
+        q->referrer_policy=r->referrer_policy;
+        snprintf(q->referrer,sizeof q->referrer,"%s",r->referrer?r->referrer:"");
         if (r->kind == WEB_RESOURCE_FETCH) f->fetch_requests++;
         if(r->kind==WEB_RESOURCE_MODULE&&strstr(r->url,"/preload"))f->preload_requests++;
         size_t n = r->body_len < sizeof q->body - 1 ? r->body_len : sizeof q->body - 1;
@@ -318,9 +320,9 @@ static void deliver(struct fixture *f) {
             free(r.body); r.body = strdup(metadata); r.body_len = strlen(metadata); r.status = 200;
         }
         if (!strcmp(q.url, "http://fixture.test/dir/api/fetch-policy")) {
-            char metadata[96];
-            snprintf(metadata,sizeof metadata,"{\"no_cors\":%s,\"no_referrer\":%s}",
-                q.no_cors ? "true" : "false", q.no_referrer ? "true" : "false");
+            char metadata[2300];
+            snprintf(metadata,sizeof metadata,"{\"no_cors\":%s,\"no_referrer\":%s,\"referrer\":\"%s\",\"referrer_policy\":%d}",
+                q.no_cors ? "true" : "false", q.no_referrer ? "true" : "false",q.referrer,q.referrer_policy);
             free(r.body); r.body=strdup(metadata); r.body_len=strlen(metadata); r.status=200;
         }
         if (!strcmp(q.url, "http://fixture.test/dir/api/body-presence")) {
@@ -625,7 +627,11 @@ static void test_computed_declaration(void) {
     external_case("js_cssom_cases.js", ";check('computed-declaration-count',runComputedStyleDeclarationCases()===24);check('placeholder-computed-count',runPlaceholderComputedStyleCases()===20);mark('api-done');", BASE);
 }
 static void test_fetch_api(void) {
+    const char *old_headers=case_response_headers,*old_meta=case_meta_policy;
+    case_response_headers="Referrer-Policy: origin\r\n";
+    case_meta_policy="<meta name=\"referrer\" content=\"same-origin\">";
     external_case("js_fetch_cases.js", ";runFetchCases().then(n=>{console.log('Fetch API checks '+n);check('fetch-api-count',n>100);mark('api-done');},e=>{console.log('FAIL fetch-api '+e+' '+e.stack);mark('api-done');});", BASE);
+    case_response_headers=old_headers;case_meta_policy=old_meta;
 }
 static void test_platform(void) {
     test_cssom();

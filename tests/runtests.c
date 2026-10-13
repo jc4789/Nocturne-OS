@@ -257,6 +257,8 @@ static const struct test tests[] = {
      {"semanticstest: ", ", 0 failures"}, "FAIL", 120, false, true},
     {"web", "form-control-values", "tcc -I/data/tests -o /home/js_form_controls_native /data/tests/js_form_controls_native.c && /home/js_form_controls_native", 0,
      {"js_form_controls_native: ", ", 0 failed"}, "FAIL", 180, false, true},
+    {"pointerfocus", "native-area-and-textarea-scroll", "tcc -I/data/tests -o /home/js_form_controls_native /data/tests/js_form_controls_native.c && /home/js_form_controls_native pointer-focus", 0,
+     {"Textarea native scroll API checks 27", "js_form_controls_native/pointer-focus: ", ", 0 failed"}, "FAIL", 180, false, true},
     {"web", "formdata-entries", "tcc -I/data/tests -o /home/js_form_controls_native /data/tests/js_form_controls_native.c && /home/js_form_controls_native formdata-entries", 0,
      {"js_form_controls_native/formdata-entries: ", ", 0 failed"}, "FAIL", 180, false, true},
     {"web", "shadow-dom-render", "tcc -I/data/tests -o /home/shadowtest /data/tests/shadowtest.c && /home/shadowtest", 0,

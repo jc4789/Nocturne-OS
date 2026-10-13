@@ -8,6 +8,7 @@
 #include "webi.h"
 #include "web_presentation.h"
 #include <webidb_async.h>
+#include <webnet.h>
 #include <parallel.h>
 #include "web_dialog.h"
 #include "form_value.h"
@@ -28,6 +29,7 @@
 /* Document arenas and stylesheet storage grow through the OS allocator. */
 static void invalidate_layout_tree(box_t *b);
 static void element_scroll_input_unqueue(node_t *n);
+static bool scroll_input_coherent(web_doc *d);
 
 bool doc_viewport_overflow_box(const web_doc *d,const box_t *b) {
     if(!d || !b || !b->node || !d->html || !d->html->style || d->html->style->display==D_NONE)return false;
@@ -659,6 +661,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             break;
         case T_meta: {
             if (scope) break;
+            if(!c->referrer_meta_processed)doc_referrer_meta(d,c);
             const char *he = node_attr(c, "http-equiv"), *ct = node_attr(c, "content");
             if (he && ct && str_ieq(he, "refresh") && !d->refresh_url) {
                 d->refresh_delay = atoi(ct);
@@ -792,6 +795,24 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
 }
 
 /* ---------------------------------------------------------------- documents */
+void doc_referrer_meta(web_doc *d,node_t *n) {
+    if(!d||!n||n->type!=N_ELEM||n->foreign||n->tag!=T_meta||doc_node_root(n,false)!=d->root||node_ancestor(n,T_template))return;
+    const char *name=node_attr(n,"name"),*content=node_attr(n,"content");
+    if(!name||!content||!str_ieq(name,"referrer"))return;
+    n->referrer_meta_processed=true;
+    size_t length=strlen(content);char token[40];
+    while(length&&is_space((unsigned char)*content))content++,length--;
+    while(length&&is_space((unsigned char)content[length-1]))length--;
+    if(length>=sizeof token)return;
+    for(size_t i=0;i<length;i++)token[i]=(char)lower((unsigned char)content[i]);token[length]=0;
+    int policy=webnet_referrer_policy_token(token,length);
+    /* HTML's legacy-token mode applies to meta, never HTTP policy fields. */
+    if(!policy){if(!strcmp(token,"never"))policy=WEBNET_REFERRER_NONE;
+        else if(!strcmp(token,"default"))policy=WEBNET_REFERRER_DOWNGRADE;
+        else if(!strcmp(token,"always"))policy=WEBNET_REFERRER_UNSAFE;
+        else if(!strcmp(token,"origin-when-crossorigin"))policy=WEBNET_REFERRER_ORIGIN_CROSS;}
+    if(policy)d->referrer_policy=policy;
+}
 size_t doc_dom_remaining(web_doc *d) {
     /* Accounting headroom, not a promise of physically available RAM. */
     if (!d || d->control_bytes > SIZE_MAX - d->mem.allocated) return 0;
@@ -805,10 +826,12 @@ web_doc *doc_inert(web_doc *family, const char *html, size_t n, const char *url)
 }
 web_doc *doc_inert_ex(web_doc *family, const char *html, size_t n, const char *url, bool allow_shadow) {
     if (!family || n == SIZE_MAX || (n && !html)) return NULL;
+    int referrer_policy=family->referrer_policy;
     family = family->dom_family ? family->dom_family : family;
     web_doc *d = calloc(1, sizeof *d);
     if (!d) return NULL;
     d->inert = true; d->custom_registry_id = -1; d->dom_family = family;
+    d->referrer_policy=referrer_policy;
     d->url = strdup(url && *url ? url : "about:blank");
     if (!d->url) { free(d); return NULL; }
     snprintf(d->base, sizeof d->base, "%s", d->url);
@@ -880,6 +903,7 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
     snprintf(d->base, sizeof d->base, "%s", web_effective_url(d));
     if(!html_policy_init(d,headers,inherited_origin)){web_free(d);return NULL;}
     if(!web_presentation_policy_init(d,headers,inherited_origin)){web_free(d);return NULL;}
+    d->referrer_policy=webnet_referrer_policy_header(headers,inherited_origin?inherited_origin->referrer_policy:WEBNET_REFERRER_DEFAULT);
     char transport_label[64]={0};
     if(headers){
         struct http_resp response_headers={.headers_full=(char *)headers};char type[512]={0};
@@ -1230,7 +1254,17 @@ bool web_dispatch(web_doc *d, web_node *target, const struct web_event *e) {
             }
         }
     }
+    bool trace_wheel=d->profile_enabled && e && e->type && !strcmp(e->type,"wheel");
+    unsigned target_tag=trace_wheel&&target?target->tag:0;
+    uint64_t window_blocking=trace_wheel?(target&&target->owner?target->owner:d)->wheel_window_blocking:0;
     bool allowed=web_js_dispatch(d,target,e);
+    if(trace_wheel) {
+        char message[256];snprintf(message,sizeof message,
+            "Native wheel default: allowed %d, cancelable %d, delta %.0f, tag %u, window-blocking %llu, coherent %d/ready %d, viewport %d/%d, view %d, style %d/boxes %d",
+            allowed,e->cancelable,(double)e->delta_y,target_tag,(unsigned long long)window_blocking,
+            scroll_input_coherent(d),web_native_input_ready(d,false),d->doc_h,d->height,d->view_y,d->need_style,d->need_boxes);
+        web_js_console(d,1,message);
+    }
     if(allowed&&image_point&&target->owner==owner&&owner->live&&
        web_input_type(target)==WEB_INPUT_IMAGE&&web_form_owner(owner,target)){
         target->image_submit_x=selected_x;target->image_submit_y=selected_y;
@@ -1517,6 +1551,14 @@ void doc_viewport_update(web_doc *d,int width,int height) {
     for(node_t *image=doc_image_node_next(d,NULL);image;image=doc_image_node_next(d,image))doc_image_sync(d,image);
 }
 
+static bool committed_geometry_current(const web_doc *d,int width,int height,uint64_t font_generation) {
+    const box_t *root=d?d->root_box:NULL;
+    return root && root->layout_post_valid && !root->layout_dirty &&
+        root->cached_font_generation==font_generation &&
+        root->layout_post_w==root->w && root->layout_post_h==root->h &&
+        root->layout_post_content_dy==root->content_dy &&
+        d->width==width && d->height==height && !d->native_recovery_pending;
+}
 int web_layout(web_doc *d, int width, int height) {
     unsigned container_pass=0;
     if (d->native_cancelled) {
@@ -1555,11 +1597,18 @@ reflow:
         if (d->native_cancelled) goto cancelled;
         if (d->root) register_bg(d, d->root);
         if (!d->root_box || d->style_boxes_changed || d->need_boxes) {
-            boxes_discard(d);
-            css_styles_release(d);
-            d->bmem.trap=d->smem.trap;
-            boxes_build(d, &d->bmem);
-            d->bmem.trap=NULL;
+            bool local=false;
+            if(d->root_box && !d->style_existing_boxes_changed){
+                boxes_restyle(d); /* refresh existing arena borrows before branch publication */
+                local=boxes_rebuild_local(d);
+            }
+            if(!local){
+                boxes_discard(d);
+                css_styles_release(d);
+                d->bmem.trap=d->smem.trap;
+                boxes_build(d, &d->bmem);
+                d->bmem.trap=NULL;
+            }else css_styles_release(d);
         } else {
             /* Topology is unchanged. Update computed-style borrows before
                reclaiming old element arenas; dirty boxes drive local layout. */
@@ -1593,11 +1642,12 @@ reflow:
        or rerun layout/overflow merely because their computed bodies changed.
        Real box/font/intrinsic/viewport changes dirty the root via the existing
        invalidation path; a newly built root has no completed post-layout. */
-    if (d->root_box && d->root_box->layout_post_valid && d->root_box->layout_cache_valid &&
-        !d->root_box->layout_dirty && d->root_box->cached_font_generation==font_metrics_generation() &&
-        d->root_box->layout_post_w==d->root_box->w && d->root_box->layout_post_h==d->root_box->h &&
-        d->root_box->layout_post_content_dy==d->root_box->content_dy &&
-        d->width == width && d->height == height && !d->native_recovery_pending)
+    /* layout_cache_valid is permission to reuse an inner formatting pass under
+       its input key, not validity of already-published post-layout geometry.
+       In particular, first-use font initialization can disable that inner
+       cache even though the completed post pass and final font epoch remain
+       the document's committed geometry. */
+    if (committed_geometry_current(d,width,height,font_metrics_generation()))
         goto geometry_committed;
     d->width = width;
     d->height = height;
@@ -1618,6 +1668,7 @@ reflow:
     }
     d->layout_revision++;
 geometry_committed:
+    boxes_changes_clear(d);
     d->layout_valid = true;
     web_frames_commit_viewports(d);
     if(d->native_recovery_pending){
@@ -1789,12 +1840,22 @@ bool web_input_capture(web_doc *d,web_node *target,struct web_input_target *out)
 bool web_native_wheel_target(web_doc *d,web_node *target,struct web_input_target *out,bool prepared_wait) {
     if (!web_native_input_ready(d,prepared_wait) || !web_input_capture(d,target,out)) return false;
     web_doc *owner=target?target->owner:d;
-    if (owner->wheel_window_blocking) return false;
+    if (owner->wheel_window_blocking) {
+        if(d->profile_enabled)web_js_console(d,1,"Native wheel fast: window cancellation listener requires dispatch");
+        return false;
+    }
     /* Composed wheel ancestors follow the already-published slot assignment.
        No doc_flat_parent/shadow flush, attribute handler compilation or JS. */
     for (node_t *at=target?target:owner->root; at;
          at=at->assigned_slot?at->assigned_slot:at->parent?at->parent:at->shadow_host)
-        if (at->wheel_blocking || node_attr(at,"onwheel")) return false;
+        if (at->wheel_blocking || node_attr(at,"onwheel")) {
+            if(d->profile_enabled) {
+                char message[160];snprintf(message,sizeof message,"Native wheel fast: ancestor tag %u cancellation listeners %llu/handler %d require dispatch",
+                    (unsigned)at->tag,(unsigned long long)at->wheel_blocking,node_attr(at,"onwheel")!=NULL);
+                web_js_console(d,1,message);
+            }
+            return false;
+        }
     return true;
 }
 
@@ -1828,6 +1889,15 @@ static box_t *scroll_input_box(node_t *n, web_doc *d) {
     while (root->parent) root = root->parent;
     return root == d->root_box ? b : NULL;
 }
+static bool scroll_input_result(web_doc *d,bool handled,int x,int y,int requested_x,int requested_y) {
+    if(d->profile_enabled) {
+        char message[192];snprintf(message,sizeof message,
+            "Native scroll chain: handled %d, request %d,%d residual %d,%d, extent %d/%d, view %d",
+            handled,requested_x,requested_y,x,y,d->doc_h,d->height,d->view_y);
+        web_js_console(d,1,message);
+    }
+    return handled;
+}
 
 bool web_scroll_input(web_doc *d, web_node *target, int *dx, int *dy, int edge) {
     node_t *n = target;
@@ -1837,12 +1907,20 @@ bool web_scroll_input(web_doc *d, web_node *target, int *dx, int *dy, int edge) 
        any offset. Native input crosses origins, never JS wrappers/authority. */
     web_doc *owner = n->owner;
     for (web_doc *at = owner;; at = at->frame_parent) {
-        if (!scroll_input_coherent(at)) return false;
+        if (!scroll_input_coherent(at)) {
+            if(d->profile_enabled) {
+                char message[192];snprintf(message,sizeof message,"Native scroll chain: incoherent owner, valid %d/style %d/boxes %d, checkpoint %u/layout %u, viewport %d/%d",
+                    at->layout_valid,at->need_style,at->need_boxes,(unsigned)at->native_checkpoint_depth,(unsigned)at->native_layout_depth,at->doc_h,at->height);
+                web_js_console(d,1,message);
+            }
+            return false;
+        }
         if (at == d) break;
         if (!scroll_input_frame(at)) return false;
     }
     box_t *b = scroll_input_box(n, owner);
     if (!b) return false;
+    int requested_x=*dx,requested_y=*dy;
     bool handled = false;
     for (;;) {
       for (; b; b = b->parent) {
@@ -1858,16 +1936,16 @@ bool web_scroll_input(web_doc *d, web_node *target, int *dx, int *dy, int edge) 
             if (element_scroll_commit(owner, element, b, x, edge < 0 ? 0 : max_y)) {
                 element_scroll_input_queue(owner, element);
             }
-            *dy = 0; return true; /* also consume Home/End already at its edge */
+            *dy = 0; return scroll_input_result(d,true,*dx,*dy,requested_x,requested_y); /* also consume Home/End already at its edge */
         }
         if (element_scroll_commit(owner, element, b, x + *dx, y + *dy)) {
             *dx = element_scroll_remaining(*dx, element->scroll_x - x);
             *dy = element_scroll_remaining(*dy, element->scroll_y - y);
             element_scroll_input_queue(owner, element); handled = true;
         }
-        if (!*dx && !*dy) return handled;
+        if (!*dx && !*dy) return scroll_input_result(d,handled,*dx,*dy,requested_x,requested_y);
       }
-      if (owner == d) return handled;
+      if (owner == d) return scroll_input_result(d,handled,*dx,*dy,requested_x,requested_y);
       struct web_frame *f = scroll_input_frame(owner); /* no callbacks above */
       int mx = MAX(0, web_doc_width(owner) - f->viewport_w);
       int my = MAX(0, owner->doc_h - f->viewport_h);
@@ -1886,10 +1964,10 @@ bool web_scroll_input(web_doc *d, web_node *target, int *dx, int *dy, int edge) 
                composites if another native wait occurs before that tick. */
             handled = true;
         }
-        if (edge_handled) { *dy = 0; return true; }
+        if (edge_handled) { *dy = 0; return scroll_input_result(d,true,*dx,*dy,requested_x,requested_y); }
         *dx = element_scroll_remaining(*dx, (double)f->scroll_x - x);
         *dy = element_scroll_remaining(*dy, (double)f->scroll_y - y);
-        if (!*dx && !*dy) return handled;
+        if (!*dx && !*dy) return scroll_input_result(d,handled,*dx,*dy,requested_x,requested_y);
       }
       b = f->element->box->parent;
       owner = f->owner;
@@ -2341,6 +2419,24 @@ static node_t *focus_area(web_doc *d, node_t *n) {
     return focusable ? n : NULL;
 }
 node_t *web_focus_candidate(web_doc *d, node_t *n) { return focus_area(d,n); }
+bool web_pointer_focus_target(web_doc *d, node_t *target, node_t **area) {
+    if (!area) return false;
+    *area = NULL;
+    if (!d || !d->live || d->inert) return false;
+    if (!target) return true;
+    web_doc *leaf = target->owner;
+    if (!leaf || leaf->inert || !active_target_valid(d, leaf, target)) return false;
+    web_layout(leaf, leaf->width > 0 ? leaf->width : 800, leaf->height > 0 ? leaf->height : 600);
+    /* An inline/SVG child of a control is the event target, not necessarily
+       the focusable area. Follow the rendered (slot/shadow) ancestry only;
+       do not search the document or cross into a sibling browsing context. */
+    for (node_t *n = target; n; n = doc_flat_parent(n)) {
+        if (web_control_disabled(n)) return false;
+        node_t *candidate = focus_area(leaf, n);
+        if (candidate) { *area = candidate; return true; }
+    }
+    return true;
+}
 static node_t *focus_descendants(web_doc *d, node_t *parent, bool autofocus) {
     for (node_t *n = parent->first; n; n = n->next) {
         if (n->type != N_ELEM || !n->style || n->style->display == D_NONE || node_attr(n, "inert")) continue;

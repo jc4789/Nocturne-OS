@@ -9,10 +9,10 @@
 struct packet {struct packet *next;struct njw_header h;size_t at;uint8_t *data;};
 struct resource {struct resource *next;uint32_t id;};
 #include "js_worker_port_lifetime.h"
-struct child {struct child *next,*shared_next;web_workers *owner;char *name,*creator_policy,*url,*origin;size_t name_len;uint32_t id,generation,parent_port;int pid,in,out;bool started,stopped,closing,inherit_policy,shared;struct packet *tx,*tail;struct broker_pair *ports;struct resource *resources;struct njw_header rx;size_t head_at,data_at,rx_charge;uint8_t *data;};
+struct child {struct child *next,*shared_next;web_workers *owner;char *name,*creator_policy,*url,*origin;size_t name_len;uint32_t id,generation,parent_port;int pid,in,out,creator_referrer_policy;bool started,stopped,closing,inherit_policy,shared;struct packet *tx,*tail;struct broker_pair *ports;struct resource *resources;struct njw_header rx;size_t head_at,data_at,rx_charge;uint8_t *data;};
 struct shared_ref {struct shared_ref *next;struct child *child;};
 struct event {struct event *next;uint32_t id;struct njw_header h;uint8_t *data;bool from_child;};
-struct web_workers {struct web_workers *next;JSContext *ctx;JSValue callback;uint32_t generation;web_worker_loader load;web_worker_requester request;web_worker_canceler cancel;void *opaque;char *creator_policy,*origin;web_worker_reporter reporter;void *report_opaque;struct child *children;struct shared_ref *shared;struct event *events,*last;size_t queued;uint32_t next_lease;struct broker_lease *leases;};
+struct web_workers {struct web_workers *next;JSContext *ctx;JSValue callback;uint32_t generation;web_worker_loader load;web_worker_requester request;web_worker_canceler cancel;void *opaque;char *creator_policy,*origin;int creator_referrer_policy;web_worker_reporter reporter;void *report_opaque;struct child *children;struct shared_ref *shared;struct event *events,*last;size_t queued;uint32_t next_lease;struct broker_lease *leases;};
 static struct child *shared_children;
 static web_workers *managers;
 static uint32_t next_worker_id;
@@ -148,7 +148,7 @@ static bool shared_transport(web_workers*w,struct child*c,bool*created){
     return true;
 }
 web_workers *web_worker_new(JSContext *ctx,uint32_t generation,web_worker_loader load,void *opaque){web_workers *w=calloc(1,sizeof *w);if(!w)return NULL;w->ctx=ctx;w->generation=generation;w->callback=JS_UNDEFINED;w->load=load;w->opaque=opaque;w->next=managers;managers=w;return w;}
-bool web_worker_set_policy(web_workers *w,const char *headers){if(!w)return false;char *copy=policy_copy(headers);if(!copy)return false;free(w->creator_policy);w->creator_policy=copy;return true;}
+bool web_worker_set_policy(web_workers *w,const char *headers,int referrer_policy){if(!w||referrer_policy<0||referrer_policy>8)return false;char *copy=policy_copy(headers);if(!copy)return false;free(w->creator_policy);w->creator_policy=copy;w->creator_referrer_policy=referrer_policy;return true;}
 bool web_worker_set_origin(web_workers*w,const char*origin){if(!w)return false;char*copy=policy_copy(origin);if(!copy)return false;free(w->origin);w->origin=copy;return true;}
 void web_worker_set_reporter(web_workers *w,web_worker_reporter reporter,void *opaque){if(w){w->reporter=reporter;w->report_opaque=opaque;}}
 void web_worker_set_canceler(web_workers *w,web_worker_canceler cancel){if(w)w->cancel=cancel;}
@@ -176,6 +176,7 @@ JSValue web_worker_native(web_workers *w,int argc,JSValueConst *argv){
         if(c->name){memcpy(c->name,name,name_len);c->name[name_len]=0;c->name_len=name_len;}
         if(argc>3)JS_FreeCString(ctx,name);
         c->creator_policy=policy_copy(w->creator_policy);c->url=policy_copy(url);c->origin=policy_copy(w->origin);
+        c->creator_referrer_policy=w->creator_referrer_policy;
         if(!c->name||!c->creator_policy||!c->url||!c->origin){JS_FreeCString(ctx,url);free(ref);child_free(c);return JS_ThrowOutOfMemory(ctx);}
         c->shared=op==5;c->owner=w;c->generation=w->generation;c->inherit_policy=!strncasecmp(url,"blob:",5)||!strncasecmp(url,"data:",5)||!strncasecmp(url,"about:",6);c->id=++next_worker_id;c->in=c->out=-1;c->next=w->children;w->children=c;
         if(c->shared){*ref=(struct shared_ref){w->shared,c};w->shared=ref;c->shared_next=shared_children;shared_children=c;}
@@ -218,7 +219,8 @@ void web_worker_loaded(web_workers *w,uint32_t id,uint32_t request,int status,co
     bool first=request==0;
     if(first)filled=filled && resource_field(ctx,a,NJW_START_CREATOR_POLICY,JS_NewString(ctx,c->creator_policy?c->creator_policy:"")) &&
         resource_field(ctx,a,NJW_START_INHERIT_POLICY,JS_NewBool(ctx,c->inherit_policy)) && resource_field(ctx,a,NJW_START_SHARED,JS_NewBool(ctx,c->shared)) &&
-        resource_field(ctx,a,NJW_START_CREATOR_ORIGIN,JS_NewString(ctx,c->origin?c->origin:""));
+        resource_field(ctx,a,NJW_START_CREATOR_ORIGIN,JS_NewString(ctx,c->origin?c->origin:"")) &&
+        resource_field(ctx,a,NJW_START_CREATOR_REFERRER_POLICY,JS_NewInt32(ctx,c->creator_referrer_policy));
     bool ok=filled && serialized(w,c,first?NJW_START:NJW_LOADED,request,kind,a,first);JS_FreeValue(ctx,a);if(!ok){fail(w,c,"Worker resource allocation, representation or transport failed");return;}if(first)c->started=true;
 }
 void web_worker_pump(web_workers *w,uint64_t now){
@@ -292,13 +294,15 @@ bool web_worker_run_one(web_workers *w){
             bool initial=c->shared&&!e->h.request&&!e->h.kind,ok=false;
             if(JS_IsString(v)){const char *url=JS_ToCString(ctx,v);ok=(r||initial)&&url&&w->load&&w->load(w->opaque,c->id,e->h.request,url,e->h.kind);JS_FreeCString(ctx,url);}
             else if(r&&((e->h.kind&~NJW_LOAD_POLICY_FLAGS)==2)&&JS_IsArray(ctx,v)){
-                JSValue fields[4];for(unsigned i=0;i<4;i++)fields[i]=JS_GetPropertyUint32(ctx,v,i);
-                JSValue count_value=JS_GetPropertyStr(ctx,v,"length");uint32_t count=0;bool valid=JS_ToUint32(ctx,&count,count_value)>=0&&count==4;JS_FreeValue(ctx,count_value);
+                JSValue fields[6];for(unsigned i=0;i<6;i++)fields[i]=JS_GetPropertyUint32(ctx,v,i);
+                JSValue count_value=JS_GetPropertyStr(ctx,v,"length");uint32_t count=0;bool valid=JS_ToUint32(ctx,&count,count_value)>=0&&(count==4||count==6);JS_FreeValue(ctx,count_value);
                 size_t lengths[3]={0};const char *strings[3]={0};
                 for(unsigned i=0;i<3&&valid;i++){valid=JS_IsString(fields[i]);if(valid){strings[i]=JS_ToCStringLen(ctx,&lengths[i],fields[i]);valid=strings[i]&&!memchr(strings[i],0,lengths[i]);}}
                 uint8_t empty_body=0;size_t bytes=0;uint8_t *body=NULL;if(valid&&!JS_IsNull(fields[3])){body=JS_GetArrayBuffer(ctx,&bytes,fields[3]);valid=body||!JS_HasException(ctx);if(valid&&!body)body=&empty_body;}
-                if(valid)ok=w->request&&w->request(w->opaque,c->id,e->h.request,strings[0],e->h.kind,strings[1],strings[2],body,bytes);
-                for(unsigned i=0;i<3;i++)JS_FreeCString(ctx,strings[i]);for(unsigned i=0;i<4;i++)JS_FreeValue(ctx,fields[i]);
+                const char *referrer=NULL;size_t referrer_len=0;int32_t referrer_policy=0;
+                if(valid&&count==6){valid=JS_IsString(fields[4])&&JS_IsNumber(fields[5]);if(valid){referrer=JS_ToCStringLen(ctx,&referrer_len,fields[4]);valid=referrer&&!memchr(referrer,0,referrer_len)&&JS_ToInt32(ctx,&referrer_policy,fields[5])>=0&&referrer_policy>=0&&referrer_policy<=8;}}
+                if(valid)ok=w->request&&w->request(w->opaque,c->id,e->h.request,strings[0],e->h.kind,strings[1],strings[2],body,bytes,referrer,referrer_policy);
+                JS_FreeCString(ctx,referrer);for(unsigned i=0;i<3;i++)JS_FreeCString(ctx,strings[i]);for(unsigned i=0;i<6;i++)JS_FreeValue(ctx,fields[i]);
             }
             if(!ok){if(JS_HasException(ctx)){JSValue error=JS_GetException(ctx);JS_FreeValue(ctx,error);}web_worker_loaded(w,c->id,e->h.request,0,"","",NULL,0,"Worker resource request rejected or allocation failed");}
         }

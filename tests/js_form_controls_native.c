@@ -100,6 +100,50 @@ static void native_key_case(void) {
     close_case();
 }
 
+static void native_pointer_focus_cases(void) {
+    const char *html = START "</head><body><input id=initial><button type=button><span>label</span><svg width=10 height=10><path d='M0 0L10 10'/></svg></button>"
+        "<button disabled><span>disabled</span></button><div inert><button>inert</button></div>"
+        "<div tabindex=-1><span>tabindex</span></div><details><summary><span>summary</span></summary><summary>later</summary></details>"
+        "<div id=shadow></div><div id=delegate></div><div id=background>plain</div>"
+        "<script>document.getElementById('initial').focus();mark('pointer-focus-ready');</script></body>";
+    if (!open_case(html, false)) return;
+    test_check("pointer-focus-ready", pump("pointer-focus-ready", 5000));
+    web_doc *d = fixture.doc;
+    node_t *initial=d->body->first,*button=initial->next,*disabled=button->next,*inert=disabled->next,
+        *tab=inert->next,*details=tab->next,*shadow=details->next,*delegate=shadow->next,*background=delegate->next;
+    node_t *area=NULL;
+    test_check("pointer-focus-button",web_pointer_focus_target(d,button,&area)&&area==button);
+    test_check("pointer-focus-inline-child",web_pointer_focus_target(d,button->first,&area)&&area==button);
+    test_check("pointer-focus-svg-child",web_pointer_focus_target(d,button->first->next->first,&area)&&area==button);
+    test_check("pointer-focus-disabled-child",!web_pointer_focus_target(d,disabled->first,&area)&&!area);
+    test_check("pointer-focus-inert-child",!web_pointer_focus_target(d,inert->first,&area)&&!area);
+    test_check("pointer-focus-negative-tabindex",web_pointer_focus_target(d,tab->first,&area)&&area==tab);
+    test_check("pointer-focus-first-summary",web_pointer_focus_target(d,details->first->first,&area)&&area==details->first);
+    test_check("pointer-focus-later-summary",web_pointer_focus_target(d,details->first->next,&area)&&!area);
+    test_check("pointer-focus-background",web_pointer_focus_target(d,background,&area)&&!area);
+    test_check("pointer-focus-viewport",web_pointer_focus_target(d,NULL,&area)&&!area);
+    test_check("pointer-focus-query-preserves-focus",web_focused(d)==initial);
+    node_t *root=doc_shadow_attach(d,shadow,false,false,false,false,false),
+        *shadow_button=doc_node_create(d,N_ELEM,"button",NULL,0),*slot=doc_node_create(d,N_ELEM,"slot",NULL,0),
+        *assigned=doc_node_create(d,N_ELEM,"span",NULL,0);
+    bool attached=root&&shadow_button&&slot&&assigned&&doc_node_move(d,root,shadow_button,NULL)&&
+        doc_node_move(d,shadow_button,slot,NULL)&&doc_node_move(d,shadow,assigned,NULL);
+    test_check("pointer-focus-flat-fixture",attached);
+    if(attached)test_check("pointer-focus-assigned-through-slot",web_pointer_focus_target(d,assigned,&area)&&area==shadow_button);
+    node_t *delegate_root=doc_shadow_attach(d,delegate,false,true,false,false,false),
+        *delegate_input=doc_node_create(d,N_ELEM,"input",NULL,0);
+    bool delegated=delegate_root&&delegate_input&&doc_node_move(d,delegate_root,delegate_input,NULL);
+    test_check("pointer-focus-delegate-fixture",delegated);
+    if(delegated)test_check("pointer-focus-shadow-delegate",web_pointer_focus_target(d,delegate,&area)&&area==delegate_input);
+    node_t *removed=button->first;doc_node_remove(d,removed);
+    test_check("pointer-focus-detached-target",!web_pointer_focus_target(d,removed,&area)&&!area);
+    web_doc *other=web_parse("<button>other</button>",22,BASE,"utf-8");
+    test_check("pointer-focus-other-document",other&&!web_pointer_focus_target(d,other->body->first,&area)&&!area);
+    if(other)web_free(other);
+    test_check("pointer-focus-no-js-errors",fixture.errors==0&&fixture.js_failures==0);
+    close_case();
+}
+
 static void native_select_cases(void) {
     const char html[] = "<!doctype html><html><head></head><body><form method='post'>"
         "<select name='pick' multiple><option value='a' selected>Alpha</option><option value='b' selected>Beta</option>"
@@ -226,6 +270,11 @@ static void native_metadata_dependency_case(void) {
 }
 
 int main(int argc, char **argv) {
+    if(argc>1&&!strcmp(argv[1],"pointer-focus")){
+        native_pointer_focus_cases();
+        external_case("js_element_scroll_cases.js",";try{const n=runTextareaScrollCases();console.log('Textarea native scroll API checks '+n);check('textarea-scroll-count',n===27);}catch(e){console.log('FAIL textarea scroll '+e+' '+e.stack);}mark('api-done');",BASE);
+        printf("js_form_controls_native/pointer-focus: %d checks, %d failed\n",total,failed);return failed!=0;
+    }
     if(argc>1&&!strcmp(argv[1],"formdata-entries")){
         external_case("js_form_controls_cases.js",";runFormDataEntryCases().then(n=>{check('fd-entry-case-count',n>=35);mark('api-done');},e=>{console.log('FAIL formdata entries '+e+' '+e.stack);mark('api-done');});",BASE);
         native_formdata_selected_case();
@@ -234,7 +283,7 @@ int main(int argc, char **argv) {
     }
     (void)argc; (void)argv;
     external_case("js_form_controls_cases.js", ";try{const n=runFormControlCases();console.log('Input value checks '+n);check('input-value-count',n>300);}catch(e){console.log('FAIL input-value '+e+' '+e.stack);}mark('api-done');", BASE);
-    native_value_cases(); native_key_case(); native_select_cases(); native_parser_select_case();
+    native_value_cases(); native_key_case(); native_pointer_focus_cases(); native_select_cases(); native_parser_select_case();
     printf("js_form_controls_native: %d checks, %d failed\n", total, failed);
     return failed != 0;
 }

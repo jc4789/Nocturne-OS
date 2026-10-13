@@ -134,7 +134,12 @@ function nativeDispatch(target,type,init) {
         const allowed=dispatch(target,pointer);
         if(type==='mousedown')suppressCompatibilityMouse=!allowed;
         if(type==='mouseup')pointerCaptureBridge.release(init);
-        if(suppressCompatibilityMouse){if(type==='mouseup')suppressCompatibilityMouse=false;return true;}
+        if(suppressCompatibilityMouse){
+            if(type==='mouseup')suppressCompatibilityMouse=false;
+            /* No compatibility mousedown means no native mouse focusing
+               default action. The later click remains an independent event. */
+            return type!=='mousedown';
+        }
     }
     const focus=/^(?:focus|blur|focusin|focusout)$/.test(type);
     const C=type==='submit'?formValidationBridge.SubmitEvent:focus?FocusEvent:type==='wheel'?WheelEvent:/^(key)/.test(type)?KeyboardEvent:/^(pointer|click$)/.test(type)?PointerEvent:/^(mouse|dblclick)/.test(type)?MouseEvent:Event;

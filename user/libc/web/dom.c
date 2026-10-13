@@ -479,6 +479,7 @@ static void structure_changed_lifetime(web_doc *d, node_t *parent, node_t *subtr
         d->metadata_valid=false;
     if (d && doc_node_root(parent, true) == d->root) d->need_boxes = true;
     changed_geometry(d,parent,parent->type==N_DOC || resource_ancestor(parent) || resource_subtree(subtree),true,false,subtree);
+    if (d && doc_node_root(parent,true)==d->root) boxes_note_child_list(d,parent,subtree);
 }
 static void structure_changed(web_doc *d, node_t *parent, node_t *subtree) {
     structure_changed_lifetime(d, parent, subtree, true);
@@ -767,6 +768,7 @@ static bool attribute_change_normalized(web_doc *d, node_t *n, int found, const 
     n->nclasses = temp.nclasses;
     d->mem.trap = old;
     bool ordinary = !ns && !n->foreign && !strcmp(name, low);
+    if(!ns&&!n->foreign&&n->tag==T_meta&&(!strcmp(low,"name")||!strcmp(low,"content")))doc_referrer_meta(d,n);
     if(!ns&&!n->foreign&&n->tag==T_base&&!strcmp(low,"href")&&doc_node_root(n,false)==d->root&&
        !node_ancestor(n,T_template))d->metadata_valid=false;
     if (ordinary && !strcmp(low,"form")) doc_parser_form_set(n,NULL);

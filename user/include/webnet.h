@@ -60,6 +60,36 @@ static inline size_t webnet_response_limit(enum webnet_kind kind) {
 enum webnet_credentials { WEBNET_CREDENTIALS_OMIT, WEBNET_CREDENTIALS_SAME_ORIGIN, WEBNET_CREDENTIALS_INCLUDE };
 enum webnet_cache { WEBNET_CACHE_DEFAULT, WEBNET_CACHE_NO_STORE, WEBNET_CACHE_RELOAD,
                     WEBNET_CACHE_NO_CACHE, WEBNET_CACHE_FORCE_CACHE, WEBNET_CACHE_ONLY_IF_CACHED };
+/* Private Fetch policy metadata, never an author Referer header. Zero resolves
+   to the environment's default, strict-origin-when-cross-origin. */
+enum webnet_referrer_policy { WEBNET_REFERRER_DEFAULT, WEBNET_REFERRER_NONE,
+    WEBNET_REFERRER_DOWNGRADE, WEBNET_REFERRER_SAME_ORIGIN, WEBNET_REFERRER_ORIGIN,
+    WEBNET_REFERRER_STRICT_ORIGIN, WEBNET_REFERRER_ORIGIN_CROSS,
+    WEBNET_REFERRER_STRICT_ORIGIN_CROSS, WEBNET_REFERRER_UNSAFE };
+static inline int webnet_referrer_policy_token(const char *value,size_t length) {
+    static const char *const names[]={"","no-referrer","no-referrer-when-downgrade","same-origin","origin",
+        "strict-origin","origin-when-cross-origin","strict-origin-when-cross-origin","unsafe-url"};
+    while(length&&(value[0]==' '||value[0]=='\t'))value++,length--;
+    while(length&&(value[length-1]==' '||value[length-1]=='\t'))length--;
+    for(int i=1;i<=WEBNET_REFERRER_UNSAFE;i++)if(strlen(names[i])==length&&!memcmp(names[i],value,length))return i;
+    return WEBNET_REFERRER_DEFAULT;
+}
+static inline int webnet_referrer_policy_header(const char *headers,int previous) {
+    for(const char *line=headers?headers:"";*line;){
+        const char *end=strchr(line,'\n');if(!end)end=line+strlen(line);
+        const char *colon=memchr(line,':',(size_t)(end-line));
+        if(colon&&colon-line==15){
+            static const char field[]="referrer-policy";bool matches=true;
+            for(int i=0;i<15;i++){unsigned char c=(unsigned char)line[i];if(c>='A'&&c<='Z')c+=32;matches&=c==(unsigned char)field[i];}
+            if(matches){const char *p=colon+1,*last=end;if(last>p&&last[-1]=='\r')last--;
+                while(p<last){const char *comma=memchr(p,',',(size_t)(last-p));const char *finish=comma?comma:last;
+                    int policy=webnet_referrer_policy_token(p,(size_t)(finish-p));if(policy)previous=policy;p=comma?comma+1:last;}
+            }
+        }
+        line=*end?end+1:end;
+    }
+    return previous;
+}
 struct webnet_request {
     enum webnet_kind kind;
     uint64_t generation;
@@ -75,6 +105,8 @@ struct webnet_request {
     bool redirect_error; /* Refuse a redirect before issuing its target request. */
     bool same_origin; /* Enforced on every redirect hop, not just the initial URL. */
     bool no_cors, no_referrer; /* Safelisted Fetch; opaque response after cross-origin hop. */
+    const char *referrer; /* NULL legacy/no source; empty means explicitly no-referrer. */
+    int referrer_policy; /* enum webnet_referrer_policy, copied into private transport. */
     bool keepalive; /* Fetch survives generation retirement; explicit cancel still aborts. */
     bool image_upgrade; /* Trusted ordinary non-CORS, non-imageset image only; RESOURCE. */
     uint64_t fetch_group; /* Distinct environment settings object, including child documents. */
@@ -112,8 +144,9 @@ void webnet_pump(webnet *, uint64_t now_ms);
 int webnet_timeout(const webnet *, uint64_t now_ms); /* -1 idle, otherwise <=10 ms */
 bool webnet_busy(const webnet *);
 void webnet_cancel(webnet *, uint64_t id); /* cancellation does not invoke the callback */
-/* One-frame demand gate. No reads while paused: the child's pipe applies
-   backpressure all the way to its network body callback. */
+/* One-frame demand gate: no response reads or callbacks while paused. A helper
+   may finish into its owned dynamic pipe; retirement does not consume that
+   retained response or release its request before resume/cancellation. */
 void webnet_resume(webnet *, uint64_t id);
 /* Document teardown: kills/reaps non-keepalive children; keepalive callbacks and
    copied request policy remain owned by net until completion or explicit cancel. */

@@ -2678,6 +2678,8 @@ struct css_index {
     bool containers;
     struct css_index *relational; /* subject-key index; never collected as style declarations */
     struct css_index *child_list_subjects; /* parent state can affect its outer siblings */
+    struct css_index *child_list_parents; /* own state changed by a child-list mutation */
+    struct css_index *child_list_siblings; /* position, sibling combinator or sibling :has witness */
     bool relational_siblings;
     struct css_index *next;
 };
@@ -2950,15 +2952,20 @@ static bool compound_has_siblings(const struct compound *c) {
     }
     return false;
 }
-static bool index_child_list_subjects_inner(arena_t *a,struct css_index *index,const struct compound *part,bool publish) {
-    bool sensitive=false;
+enum subject_dependency { SUBJECT_RELATIONAL, SUBJECT_CHILD_OUTER, SUBJECT_CHILD_PARENT, SUBJECT_CHILD_SIBLING };
+static bool index_child_list_subjects_inner(arena_t *a,struct css_index *index,const struct compound *part,bool publish,enum subject_dependency dependency) {
+    bool sibling=dependency==SUBJECT_CHILD_SIBLING;
+    bool sensitive=sibling&&(part->comb=='+' || part->comb=='~' || compound_has_siblings(part));
     for(int i=0;i<part->n;i++) {
         const struct simple *s=&part->s[i];
         if(s->kind==SK_PC) switch(s->pc) {
         case PC_EMPTY: case PC_FOCUS_WITHIN: case PC_HOVER: case PC_ACTIVE:
         case PC_CHECKED: case PC_DISABLED: case PC_ENABLED: case PC_VALID: case PC_INVALID:
         case PC_IN_RANGE: case PC_OUT_OF_RANGE: case PC_INDETERMINATE: case PC_PLACEHOLDER_SHOWN:
-            sensitive=true;break;
+            sensitive|=!sibling;break;
+        case PC_FIRST_CHILD: case PC_LAST_CHILD: case PC_ONLY_CHILD: case PC_NTH_CHILD: case PC_NTH_LAST_CHILD:
+        case PC_FIRST_OF_TYPE: case PC_LAST_OF_TYPE: case PC_ONLY_OF_TYPE: case PC_NTH_OF_TYPE: case PC_NTH_LAST_OF_TYPE:
+            sensitive|=sibling;break;
         default:break;
         }
         /* :has() has its own ancestor/witness invalidator. Logical selector
@@ -2971,24 +2978,26 @@ static bool index_child_list_subjects_inner(arena_t *a,struct css_index *index,c
                promote every unrelated mutation to its grandparent again.
                Left compounds describe other nodes, so retain their own keys
                for complex logical alternatives. */
-            sensitive|=index_child_list_subjects_inner(a,index,nested,false);
+            sensitive|=index_child_list_subjects_inner(a,index,nested,false,dependency);
             for(nested=nested->left;nested;nested=nested->left)
-                index_child_list_subjects_inner(a,index,nested,true);
+                index_child_list_subjects_inner(a,index,nested,true,dependency);
         }
     }
     if(!sensitive||!publish)return sensitive;
-    if(!index->child_list_subjects) {
-        index->child_list_subjects=ar_alloc(a,sizeof *index->child_list_subjects);
-        ht_init(a,&index->child_list_subjects->ids,16);
-        ht_init(a,&index->child_list_subjects->classes,32);
-        ht_init(a,&index->child_list_subjects->tags,16);
+    struct css_index **target=dependency==SUBJECT_CHILD_OUTER?&index->child_list_subjects:
+        dependency==SUBJECT_CHILD_PARENT?&index->child_list_parents:&index->child_list_siblings;
+    if(!*target) {
+        *target=ar_alloc(a,sizeof **target);
+        ht_init(a,&(*target)->ids,16);
+        ht_init(a,&(*target)->classes,32);
+        ht_init(a,&(*target)->tags,16);
     }
     struct selector *subject=ar_alloc(a,sizeof *subject);subject->right=(struct compound *)part;
-    index_rule(a,index->child_list_subjects,NULL,subject,0,false);
+    index_rule(a,*target,NULL,subject,0,false);
     return true;
 }
 static void index_child_list_subjects(arena_t *a,struct css_index *index,const struct compound *part) {
-    index_child_list_subjects_inner(a,index,part,true);
+    index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_OUTER);
 }
 
 static struct css_ctx *build_index(web_doc *d, int vw, int vh) {
@@ -3060,6 +3069,10 @@ static struct css_ctx *build_index(web_doc *d, int vw, int vh) {
                         x->siblings=true;
                         for(const struct compound *part=r->sel->v[k]->right;part;part=part->left)
                             index_child_list_subjects(&x->a,index,part);
+                    }
+                    for(const struct compound *part=r->sel->v[k]->right;part;part=part->left) {
+                        index_child_list_subjects_inner(&x->a,index,part,true,SUBJECT_CHILD_PARENT);
+                        index_child_list_subjects_inner(&x->a,index,part,true,SUBJECT_CHILD_SIBLING);
                     }
                     index_rule(&x->a, index, r, r->sel->v[k], index->rules, s->ua);
                     if(d->profile_enabled)d->profile.style_index_entries++;
@@ -3279,6 +3292,10 @@ static void pres_hints(node_t *e, struct hints *h) {
     char b[64];
     const char *v;
     int t = e->tag;
+    /* HTML's legacy wrap=off is a presentational hint, below author CSS.
+       The native control consumes this computed value, not the attribute. */
+    if (!e->foreign && t == T_textarea && (v = node_attr(e,"wrap")) && str_ieq(v,"off"))
+        hint_value(h,"white-space","pre");
     if ((v = node_attr(e, "align"))) {
         bool block_align = t == T_div || t == T_p || (t >= T_h1 && t <= T_h6) || t == T_caption || t == T_td ||
                            t == T_th || t == T_tr || t == T_thead || t == T_tbody || t == T_tfoot || t == T_legend;
@@ -4183,13 +4200,21 @@ static void mark_style_subject(web_doc *d, node_t *n) {
 static bool relational_candidate(const struct compound *compound, node_t *node) {
     /* Stable outer subject keys prune unrelated ancestors/siblings. Dynamic
        pseudo-classes are deliberately not consulted: a removed witness must
-       invalidate the OLD match too. Logical alternatives require no unsafe
-       rightmost-key extraction. */
+       invalidate the OLD match too. Positive logical alternatives contribute
+       only necessary stable subject keys, never their dynamic match state. */
     for (int i = 0; i < compound->n; i++) {
         const struct simple *s = &compound->s[i];
         if (s->kind == SK_TAG && (s->tag ? node->tag != s->tag : strcmp(node->name, s->name))) return false;
         if (s->kind == SK_ID && (!node->id || strcmp(node->id, s->name))) return false;
         if (s->kind == SK_CLASS && !node_has_class(node, s->name)) return false;
+        /* Positive logical alternatives still require one alternative's stable
+           subject keys. Never evaluate its dynamic pseudo or left ancestors;
+           :not()/:has() cannot safely impose those keys on this subject. */
+        if(s->kind==SK_PC && s->pc==PC_IS && s->args){
+            bool candidate=false;
+            for(int k=0;k<s->args->n;k++)if(relational_candidate(s->args->v[k]->right,node)){candidate=true;break;}
+            if(!candidate)return false;
+        }
     }
     return true;
 }
@@ -4197,9 +4222,11 @@ static bool relational_bucket_candidate(const struct ient *list, node_t *node) {
     for (; list; list = list->next) if (relational_candidate(list->sel->right, node)) return true;
     return false;
 }
-static bool subject_bindings_candidate(node_t *node,struct css_binding *bindings,bool child_list) {
+static bool subject_bindings_candidate(node_t *node,struct css_binding *bindings,enum subject_dependency dependency) {
     for (struct css_binding *binding = bindings; binding; binding = binding->next) {
-        struct css_index *index = child_list?binding->index->child_list_subjects:binding->index->relational;
+        struct css_index *index = dependency==SUBJECT_CHILD_OUTER?binding->index->child_list_subjects:
+            dependency==SUBJECT_CHILD_PARENT?binding->index->child_list_parents:
+            dependency==SUBJECT_CHILD_SIBLING?binding->index->child_list_siblings:binding->index->relational;
         if (!index) continue;
         if (node->id) {
             struct ient **list = ht_slot(NULL, &index->ids, node->id, false);
@@ -4215,7 +4242,7 @@ static bool subject_bindings_candidate(node_t *node,struct css_binding *bindings
     return false;
 }
 static bool relational_scope_candidate(node_t *node,struct css_scope *scope) {
-    return subject_bindings_candidate(node,scope?scope->first:NULL,false);
+    return subject_bindings_candidate(node,scope?scope->first:NULL,SUBJECT_RELATIONAL);
 }
 static bool relational_node_candidate(node_t *node) {
     node_t *root = doc_node_root(node, false);
@@ -4238,6 +4265,7 @@ static void mark_relational_dirty(web_doc *d, node_t *node) {
 }
 void css_mark_dirty(web_doc *d, node_t *n) {
     if (!d) return;
+    boxes_require_full(d);
     d->need_style = true;
     if (!n || !d->sty.ctx) { d->style_full_dirty = true; return; }
     if (n->type != N_ELEM) n = dirty_flat_parent(n);
@@ -4259,6 +4287,7 @@ void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree) {
        and unrelated forests on every insert-and-measure loop. Keep special
        flat-tree/shadow transactions on the existing conservative path. */
     if(!parent || !subtree || subtree->type==N_FRAGMENT || parent->type!=N_ELEM || parent->foreign || parent->shadow_root ||
+       parent->tag==T_fieldset || parent->tag==T_select || parent->tag==T_optgroup ||
        parent->assigned_slot || parent->tag==T_slot || (root&&root->shadow_host) || !d->sty.ctx) {
         css_mark_dirty(d,parent);return;
     }
@@ -4274,13 +4303,27 @@ void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree) {
     if(d->sty.ctx->relational)mark_relational_dirty(d,parent);
     struct css_scope *scope=root?root->style_scope:NULL;
     bool outer_state=d->sty.ctx->siblings &&
-        (subject_bindings_candidate(parent,scope?scope->first:NULL,true) ||
-         subject_bindings_candidate(parent,d->sty.ctx->ua,true));
+        (subject_bindings_candidate(parent,scope?scope->first:NULL,SUBJECT_CHILD_OUTER) ||
+         subject_bindings_candidate(parent,d->sty.ctx->ua,SUBJECT_CHILD_OUTER));
     node_t *boundary=outer_state?dirty_flat_parent(parent):NULL;
-    mark_style_subject(d,boundary&&boundary->type==N_ELEM?boundary:parent);
-    /* cascade_node still recomputes ALL descendants of this parent: ordinary
-       inheritance, explicit inherit on noninherited properties, custom vars,
-       positional selectors and ancestor combinators retain their guarantees. */
+    if((boundary&&boundary->type==N_ELEM) ||
+       subject_bindings_candidate(parent,scope?scope->first:NULL,SUBJECT_CHILD_PARENT) ||
+       subject_bindings_candidate(parent,d->sty.ctx->ua,SUBJECT_CHILD_PARENT)) {
+        /* Parent state can affect even descendants with no inherited changes
+           (for example .parent:empty + .next .child). Keep that full boundary. */
+        mark_style_subject(d,boundary&&boundary->type==N_ELEM?boundary:parent);return;
+    }
+    /* Insertion does not itself change a parent's inherited/custom values.
+       Publish the ancestor dirty path without turning it into a full subtree
+       cascade. A moved/new connected subtree still receives the new parent;
+       removal must not recascade the detached former child. */
+    d->style_pending_dirty=true;
+    for(node_t *p=parent;p;p=dirty_flat_parent(p))p->style_children_dirty=true;
+    if(subtree->parent==parent && subtree->type==N_ELEM)mark_style_subject(d,subtree);
+    for(node_t *child=parent->first;child;child=child->next)if(child->type==N_ELEM &&
+        (subject_bindings_candidate(child,scope?scope->first:NULL,SUBJECT_CHILD_SIBLING) ||
+         subject_bindings_candidate(child,d->sty.ctx->ua,SUBJECT_CHILD_SIBLING)))
+        mark_style_subject(d,child);
 }
 
 static bool equal_string(const char *a,const char *b) { return a==b || (a && b && !strcmp(a,b)); }
@@ -4564,8 +4607,10 @@ static void cascade_node(struct cascade *c, node_t *e, const style_t *parent) {
     if (has_after) s->after = compute(c, e, s, PE_AFTER, false);
     s->before_generated=box_pseudo_generated(e,s,s->before);
     s->after_generated=box_pseudo_generated(e,s,s->after);
-    if (!style_box_compatible(e, e->style_previous, s))
+    if (!style_box_compatible(e, e->style_previous, s)) {
         __atomic_store_n(&d->style_boxes_changed, true, __ATOMIC_RELAXED);
+        if(e->style_previous)__atomic_store_n(&d->style_existing_boxes_changed,true,__ATOMIC_RELAXED);
+    }
     e->style_mem.trap = NULL;
 descend:
     e->style_dirty = e->style_children_dirty = false;
@@ -4698,9 +4743,11 @@ void css_cascade(web_doc *d, int vw, int vh) {
     }
     if (!setbits) { setbits = malloc((size_t)css_prop_count()); if(!setbits)ar_alloc(&d->smem,SIZE_MAX); }
     bool full = d->style_full_dirty || !d->style_pending_dirty || !d->html || !d->html->style;
+    if(full)boxes_require_full(d);
     if(full && (d->need_boxes || !d->root_box) && d->root)
         clear_styles(d->root); /* retire styles of nodes no longer in the flat tree */
     d->style_boxes_changed = false;
+    d->style_existing_boxes_changed = false;
     struct cascade c = {.d=d, .rem=d->html && d->html->style ? d->html->style->font_size : 16,
         .vw=vw, .vh=vh, .a=&d->smem, .full=full, .trap=d->smem.trap};
     if (d->html) {

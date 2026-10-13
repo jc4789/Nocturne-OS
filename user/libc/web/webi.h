@@ -138,6 +138,7 @@ typedef struct node {
     const char *public_id, *system_id;
     size_t public_id_len, system_id_len;
     bool doctype_identifiers_sized;
+    bool referrer_meta_processed; /* Removal does not restore an earlier policy. */
     struct attr *attrs;
     int nattrs;
     struct attr *attribute; /* N_ATTR: the canonical current record, attached or detached. */
@@ -598,6 +599,7 @@ typedef struct box {
     node_t *node; /* NULL for anonymous boxes */
     style_t *st;
     struct box *parent, *first, *last, *next;
+    arena_t *branch_mem; /* only a locally generated independent out-of-flow root owns this arena */
     /* text boxes: the white-space-processed text */
     const char *text;
     size_t len;
@@ -725,6 +727,10 @@ node_t *doc_active_target(web_doc *document); /* validates live native press and
 
 void boxes_build(web_doc *d, arena_t *a);
 void boxes_restyle(web_doc *d);
+void boxes_note_child_list(web_doc *d,node_t *parent,node_t *subtree);
+void boxes_require_full(web_doc *d); /* records non-structural topology uncertainty, without forcing geometry */
+bool boxes_rebuild_local(web_doc *d);
+void boxes_changes_clear(web_doc *d);
 bool box_pseudo_generated(node_t *node, const style_t *origin, const style_t *pseudo);
 bool boxes_update_text(web_doc *d, node_t *n);
 void boxes_discard(web_doc *d); /* unpublish node/top-layer borrowers, then bmem */
@@ -773,6 +779,17 @@ void wf_metrics(const wfont *f, float *ascent, float *descent);
 float wf_draw(canvas_t *c, const wfont *f, float x, int baseline, const char *s, size_t n, uint32_t color);
 float style_line_height(const style_t *st); /* used line-height in px */
 float style_text_width(const style_t *st, const char *s, size_t n);
+/* Native textarea value layout, shared by scroll-area measurement and paint.
+   Byte spans never split a grapheme; next skips only a hard line break. */
+struct control_text_line {
+    size_t first, length, next;
+    float width, top, height;
+    bool hard_break;
+};
+typedef void (*control_text_line_fn)(const struct control_text_line *, void *);
+float control_text_width(const style_t *st, const char *s, size_t n);
+bool control_text_lines(const box_t *b, const style_t *st, const char *text,
+                        control_text_line_fn visit, void *opaque, float *width, float *height);
 const char *web_button_label(node_t *n);   /* the text on an <input> button */
 uint32_t doc_canvas_bg(web_doc *d, int *from); /* 1: from <html>, 2: from <body>, 0: white */
 
@@ -810,6 +827,7 @@ struct web_doc {
     node_t *address_frame; /* native chrome selection; resolves the current child generation */
     struct web_frame *frames;
     const char *inherited_url; /* about:blank/srcdoc base and origin, never an author property */
+    int referrer_policy; /* Policy container, not Document.referrer's navigation value. */
     web_doc *origin_owner; /* inherited opaque origins retain native identity */
     node_t *window_token; /* stable for navigation, distinct after removal */
     struct web_frame *frame_container;
@@ -904,12 +922,15 @@ struct web_doc {
     pvec svgs;        /* struct svg_cache* */
     box_t *root_box;
     pvec abs_boxes;   /* absolutely positioned boxes, painted last */
+    pvec box_changes; /* parent/subtree pairs retained until coherent box publication */
+    bool box_changes_full;
     int width, height, doc_h, doc_w;
     int styled_w, styled_h; /* viewport the cascade ran for */
     bool need_style, need_boxes, layout_valid;
     bool style_full_dirty, style_pending_dirty;
     bool font_selection_dirty; /* coalesced failed-font completion; no metrics changed yet */
     bool style_boxes_changed;
+    bool style_existing_boxes_changed; /* new nodes alone can be generated in independent branch arenas */
     float container_rem; /* immutable root font size of the layout snapshot */
     node_t *style_retired_first;
     node_t *focus;
@@ -1042,6 +1063,7 @@ bool doc_slot_assign(node_t *slot, node_t **nodes, int count);
 void doc_flat_children(node_t *node, pvec *out);
 node_t *doc_flat_parent(node_t *node);
 bool doc_pi_target_valid(const char *target, size_t len);
+void doc_referrer_meta(web_doc *d,node_t *node);
 bool doc_node_attr(web_doc *d, node_t *node, const char *name, const char *value);
 int doc_attr_index(node_t *node, const char *namespace_uri, const char *name, bool namespaced);
 node_t *doc_attr_node(web_doc *d, node_t *element, int index);

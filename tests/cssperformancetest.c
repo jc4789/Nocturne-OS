@@ -357,9 +357,57 @@ static void placeholder_cases(void) {
     check(box_pseudo_generated(&element,&origin,&body),"object fallback preserves pseudo children");
     origin.before_generated=origin.after_generated=true;css_style_init(&descendant,&origin);
     check(!descendant.before_generated&&!descendant.after_generated,"pseudo generation flags do not inherit");
+    box_t root={.w=800,.h=400,.content_dy=3,.layout_post_valid=true,.cached_font_generation=3,
+        .layout_post_w=800,.layout_post_h=400,.layout_post_content_dy=3};
+    web_doc document={.root_box=&root,.width=800,.height=600};
+    check(committed_geometry_current(&document,800,600,3),"published post geometry survives absent inner formatting cache");
+    root.layout_dirty=true;check(!committed_geometry_current(&document,800,600,3),"dirty geometry cannot be republished by style-only join");root.layout_dirty=false;
+    root.layout_post_valid=false;check(!committed_geometry_current(&document,800,600,3),"new or incomplete box cannot reuse post geometry");root.layout_post_valid=true;
+    check(!committed_geometry_current(&document,800,600,4),"font metric generation change requires geometry");
+    check(!committed_geometry_current(&document,900,600,3),"viewport width change requires geometry");
+    check(!committed_geometry_current(&document,800,700,3),"viewport height change requires geometry");
+    root.w++;check(!committed_geometry_current(&document,800,600,3),"post width mismatch cannot reuse geometry");root.w--;
+    root.h++;check(!committed_geometry_current(&document,800,600,3),"post height mismatch cannot reuse geometry");root.h--;
+    root.content_dy++;check(!committed_geometry_current(&document,800,600,3),"post content shift mismatch requires geometry");root.content_dy--;
+    document.native_recovery_pending=true;check(!committed_geometry_current(&document,800,600,3),"recovery cannot short circuit coherent geometry reconstruction");
     ar_free(&a);
 }
+static void local_box_cases(void){
+    style_t style;css_style_init(&style,NULL);css_style_finish(&style,NULL,false);style.display=D_BLOCK;
+    check(local_plain_style(&style),"plain initialized style permits independent branch boundary");
+    style.width.kind=LK_LEN;style.width.pct=50;check(!local_plain_style(&style),"percentage geometry retains full generation");style.width.kind=LK_AUTO;style.width.pct=0;
+    style.width.expr=(struct cexpr *)1;check(!local_plain_style(&style),"math geometry retains full generation");style.width.expr=NULL;
+    style.before_generated=true;check(!local_plain_style(&style),"generated pseudo content retains full generation");style.before_generated=false;
+    style_t pseudo={0};style.before=&pseudo;check(local_plain_style(&style),"nongenerated computed pseudo body does not change branch topology");style.before=NULL;
+    style.container_type=1;check(!local_plain_style(&style),"container boundary retains full generation");style.container_type=0;
+    style.content_visibility=CV_HIDDEN;check(!local_plain_style(&style),"skipped-content boundary retains full generation");style.content_visibility=CV_VISIBLE;
+    web_doc d={0};node_t document={.type=N_DOC,.owner=&d},parent={.type=N_ELEM,.tag=T_div,.owner=&d,.parent=&document,.style=&style};
+    d.root=&document;
+    box_t root={.kind=B_BLOCK},body={.kind=B_BLOCK,.node=&parent,.st=&style,.parent=&root,.layout_post_valid=true};parent.box=&body;
+    struct local_box_subject subjects[16]={0};
+    check(local_plain_parent(&d,&parent,subjects,15),"published plain block parent retains local boundary");
+    body.inline_ctx=true;check(!local_plain_parent(&d,&parent,subjects,15),"inline formatting parent retains whole generation");body.inline_ctx=false;
+    body.layout_post_valid=false;check(!local_plain_parent(&d,&parent,subjects,15),"unpublished parent cannot be patched");body.layout_post_valid=true;
+    root.kind=B_FLEX;check(!local_plain_parent(&d,&parent,subjects,15),"intrinsic flex ancestor retains whole generation");root.kind=B_BLOCK;
+    style.overflow=OV_AUTO;check(!local_plain_parent(&d,&parent,subjects,15),"scroll-container parent retains whole generation");style.overflow=OV_VISIBLE;
+    node_t fresh={.type=N_ELEM,.tag=T_span,.owner=&d,.style=&style};
+    check(local_plain_subtree(&d,&fresh),"fresh plain subtree is independently owned");
+    fresh.box=&root;check(!local_plain_subtree(&d,&fresh),"existing box borrow cannot be staged as fresh");fresh.box=NULL;
+    fresh.shadow_root=&document;check(!local_plain_subtree(&d,&fresh),"shadow subtree retains full topology transaction");fresh.shadow_root=NULL;
+    fresh.tag=T_button;check(!local_plain_subtree(&d,&fresh),"native button atomic semantics retain original generation");fresh.tag=T_span;
+    fresh.owner=NULL;check(!local_plain_subtree(&d,&fresh),"foreign document owner cannot enter independent arena");fresh.owner=&d;
+    box_t removed={.kind=B_BLOCK,.node=&fresh,.parent=&body};body.first=&removed;
+    check(!local_plain_parent(&d,&parent,subjects,15),"unrecorded detached box cannot survive local publication");
+    struct local_box_subject *pending=local_subject(subjects,15,&fresh);pending->recorded=true;pending->change_parent=&parent;
+    check(local_plain_parent(&d,&parent,subjects,15),"recorded removal remains valid until branch unpublication");
+    node_t keys[256]={0};struct local_box_subject many[1024]={0};bool stable=true;
+    for(unsigned i=0;i<256;i++){struct local_box_subject *entry=local_subject(many,1023,&keys[i]);entry->recorded=true;entry->change_parent=&parent;}
+    for(unsigned i=0;i<256;i++){struct local_box_subject *entry=local_subject(many,1023,&keys[i]);stable&=entry->node==&keys[i]&&entry->recorded&&entry->change_parent==&parent;}
+    check(stable,"dynamic pointer index retains colliding subject identity without queue rescans");
+}
 int main(int argc, char **argv) {
+    if(argc>1 && !strcmp(argv[1],"local-boxes"))local_box_cases();
+    else
     if(argc>1 && !strcmp(argv[1],"placeholder"))placeholder_cases();
     else
     if(argc>1 && !strcmp(argv[1],"text-overflow"))text_overflow_cases();

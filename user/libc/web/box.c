@@ -3,6 +3,7 @@
    need, list items get markers, ::before/::after become boxes, and replaced elements (images,
    form controls, inline SVG) become atomic boxes. */
 #include <stdio.h>
+#include <limits.h>
 #include <nocturne.h>
 #include "webi.h"
 #include "web_dialog.h"
@@ -950,7 +951,181 @@ static void unpublish_boxes(box_t *b) {
     ar_free(&b->layout_mem);
     ar_free(&b->text_mem);
     if(b->node && b->node->box==b){b->node->box=NULL;b->node->anchor_block=NULL;}
-    for(box_t *child=b->first;child;child=child->next)unpublish_boxes(child);
+    for(box_t *child=b->first,*next;child;child=next){next=child->next;unpublish_boxes(child);}
+    arena_t *branch=b->branch_mem;
+    if(branch){ar_free(branch);free(branch);} /* b itself belonged to this last-released arena */
+}
+void boxes_changes_clear(web_doc *d){if(d){d->box_changes.n=0;d->box_changes_full=false;}}
+void boxes_require_full(web_doc *d){if(d){d->box_changes.n=0;d->box_changes_full=true;}}
+void boxes_note_child_list(web_doc *d,node_t *parent,node_t *subtree){
+    if(!d || !d->root_box || d->box_changes_full)return;
+    if(d->style_full_dirty || d->resources_dirty || !parent || !subtree || parent->owner!=d ||
+       parent->type!=N_ELEM || subtree->type!=N_ELEM || parent->foreign || parent->shadow_root ||
+       parent->assigned_slot || parent->tag==T_slot || !parent->box){boxes_require_full(d);return;}
+    pvec *p=&d->box_changes;
+    if(p->n>INT_MAX-2){boxes_require_full(d);return;}
+    if(p->n+2>p->cap){
+        int capacity=p->cap && p->cap<=INT_MAX/2?p->cap*2: p->cap?INT_MAX:16;
+        if((size_t)capacity>SIZE_MAX/sizeof *p->v){boxes_require_full(d);return;}
+        void **values=realloc(p->v,(size_t)capacity*sizeof *p->v);
+        if(!values){boxes_require_full(d);return;}
+        p->v=values;p->cap=capacity;
+    }
+    p->v[p->n++]=parent;p->v[p->n++]=subtree;
+}
+static bool local_plain_length(const len_t *length){
+    return (length->kind==LK_AUTO || length->kind==LK_NONE || length->kind==LK_LEN) &&
+        !length->expr && !length->pct;
+}
+static bool local_plain_style(const style_t *s){
+    if(!s || s->before_generated || s->after_generated || s->backdrop || s->container_type ||
+       s->container_names || s->content || s->content_visibility!=CV_VISIBLE || s->float_!=FL_NONE)return false;
+    if(!local_plain_length(&s->width)||!local_plain_length(&s->height)||
+       !local_plain_length(&s->min_width)||!local_plain_length(&s->max_width)||
+       !local_plain_length(&s->min_height)||!local_plain_length(&s->max_height))return false;
+    for(unsigned i=0;i<4;i++)if(!local_plain_length(&s->margin[i])||!local_plain_length(&s->padding[i])||
+        !local_plain_length(&s->inset[i]))return false;
+    return true;
+}
+static bool local_plain_subtree(web_doc *d,node_t *root){
+    size_t visited=0;
+    for(node_t *n=root;n;){
+        if(!(++visited&63)){if(!web_native_checkpoint(d))return false;web_avmedia_checkpoint();}
+        if(n->owner!=d || n->box || n->shadow_root || n->assigned_slot || n->foreign)return false;
+        if(n->type==N_ELEM){
+            if(atomic_kind(n) || n->tag==T_li || n->tag==T_ol || n->tag==T_ul || n->tag==T_details ||
+               !local_plain_style(n->style) ||
+               (n->style->display!=D_BLOCK && n->style->display!=D_FLOW_ROOT && n->style->display!=D_INLINE &&
+                n->style->display!=D_INLINE_BLOCK) ||
+               (n!=root && n->style->position!=POS_STATIC))return false;
+        }else if(n->type!=N_TEXT && n->type!=N_COMMENT)return false;
+        if(n->first){n=n->first;continue;}
+        while(n!=root&&!n->next)n=n->parent;
+        if(n==root)break;n=n->next;
+    }
+    return true;
+}
+struct local_box_subject {node_t *node,*change_parent;bool recorded,parent_checked,parent_safe,parent_committed;};
+static struct local_box_subject *local_subject(struct local_box_subject *subjects,size_t mask,node_t *node){
+    size_t slot=((uintptr_t)node>>4)*2654435761u&mask;
+    while(subjects[slot].node&&subjects[slot].node!=node)slot=(slot+1)&mask;
+    subjects[slot].node=node;return &subjects[slot];
+}
+static bool local_plain_parent(web_doc *d,node_t *n,struct local_box_subject *subjects,size_t mask){
+    box_t *p=n?n->box:NULL;
+    if(!p || p->node!=n || p->kind!=B_BLOCK || p->inline_ctx || !p->layout_post_valid ||
+       !local_plain_style(n->style) || n->shadow_root || n->assigned_slot ||
+       n->style->overflow!=OV_VISIBLE || n->style->filter || n->style->transform || n->style->translate.active ||
+       doc_node_root(n,false)!=d->root)return false;
+    /* In-flow intrinsic sizing of a flex/grid/table/inline ancestor is outside
+       this independent formatting boundary. Keep its ordinary full rebuild. */
+    for(box_t *a=p->parent;a;a=a->parent)if(a->kind!=B_BLOCK || a->inline_ctx)return false;
+    size_t visited=0;
+    for(box_t *c=p->first;c;c=c->next){
+        if(!(++visited&63)){if(!web_native_checkpoint(d))return false;web_avmedia_checkpoint();}
+        if(c->anon || !c->node)return false;
+        if(c->node->parent!=n){
+            struct local_box_subject *subject=local_subject(subjects,mask,c->node);
+            if(c->node->parent || !subject->recorded || subject->change_parent!=n)return false;
+        }
+    }
+    return true;
+}
+struct local_box_change {node_t *node;box_t *parent,*old,*replacement;arena_t *arena;};
+static void restyle_boxes(box_t *b,bool inherited_borrow);
+bool boxes_rebuild_local(web_doc *d){
+    if(!d || d->box_changes_full || !d->box_changes.n || !d->root_box ||
+       !d->root_box->layout_post_valid || d->style_existing_boxes_changed)return false;
+    size_t count=(size_t)d->box_changes.n/2;
+    struct local_box_change *changes=calloc(count,sizeof *changes);if(!changes)return false;
+    size_t capacity=16;
+    if(count>SIZE_MAX/4){free(changes);return false;}
+    while(capacity<count*4){if(capacity>SIZE_MAX/2){free(changes);return false;}capacity*=2;}
+    if(capacity>SIZE_MAX/sizeof(struct local_box_subject)){free(changes);return false;}
+    struct local_box_subject *subjects=calloc(capacity,sizeof *subjects);
+    if(!subjects){free(changes);return false;}
+    bool safe=true;
+    for(size_t i=0;i<count;i++){
+        if(!web_native_checkpoint(d)){safe=false;break;}
+        node_t *node=d->box_changes.v[2*i+1];
+        if(!node){safe=false;break;}
+        struct local_box_subject *subject=local_subject(subjects,capacity-1,node);
+        if(subject->recorded){safe=false;break;}
+        subject->recorded=true;subject->change_parent=d->box_changes.v[2*i];
+    }
+    for(size_t i=0;i<count&&safe;i++){
+        if(!web_native_checkpoint(d)){safe=false;break;}
+        if(!(i&63))web_avmedia_checkpoint();
+        node_t *parent=d->box_changes.v[2*i],*n=d->box_changes.v[2*i+1];
+        if(!parent || !n || n->owner!=d){safe=false;break;}
+        struct local_box_subject *parent_subject=local_subject(subjects,capacity-1,parent);
+        if(parent_subject->recorded){safe=false;break;}
+        if(!parent_subject->parent_checked){
+            parent_subject->parent_checked=true;
+            parent_subject->parent_safe=local_plain_parent(d,parent,subjects,capacity-1);
+        }
+        if(!parent_subject->parent_safe){safe=false;break;}
+        struct local_box_change *change=&changes[i];change->node=n;change->parent=parent->box;
+        if(n->parent==parent){
+            style_t *s=n->style;
+            if(!s || (s->position!=POS_ABSOLUTE && s->position!=POS_FIXED) ||
+               (s->display!=D_BLOCK && s->display!=D_FLOW_ROOT) ||
+               s->inset[0].kind!=LK_LEN || s->inset[3].kind!=LK_LEN || !local_plain_subtree(d,n))safe=false;
+        }else{
+            box_t *old=n->box;
+            if(n->parent || !old || old->node!=n || old->parent!=change->parent ||
+               old->kind!=B_BLOCK || !old->abspos || !local_plain_style(old->st))safe=false;
+            else change->old=old;
+        }
+    }
+    if(!safe){free(subjects);free(changes);return false;}
+    /* Stage new independent branches before changing the published topology.
+       A failed allocation discards only fresh borrows and falls back to the
+       existing full build, whose normal trap/cancellation path remains owner. */
+    jmp_buf trap;
+    if(setjmp(trap)){safe=false;goto staged;}
+    for(size_t i=0;i<count;i++)if(!changes[i].old){
+        struct local_box_change *change=&changes[i];
+        change->arena=calloc(1,sizeof *change->arena);if(!change->arena){safe=false;break;}
+        change->arena->chunk_size=4096;change->arena->trap=&trap;
+        struct bctx context={.d=d,.a=change->arena};box_t holder={.st=change->parent->st};
+        gen(&context,&holder,change->node,change->parent->st);
+        change->replacement=holder.first;change->arena->trap=NULL;
+        if(d->native_cancelled || !change->replacement || change->replacement->next){safe=false;break;}
+    }
+    if(safe&&!web_native_checkpoint(d))safe=false;
+staged:
+    if(!safe){
+        for(size_t i=0;i<count;i++)if(changes[i].arena){
+            if(changes[i].replacement)unpublish_boxes(changes[i].replacement);
+            else {changes[i].node->box=NULL;changes[i].node->anchor_block=NULL;clear_boxes(changes[i].node);}
+            ar_free(changes[i].arena);free(changes[i].arena);
+        }
+        free(subjects);free(changes);return false;
+    }
+    web_hit_index_free(d);d->paint_order_valid=false;d->abs_boxes.n=0;d->visual_revision++;
+    for(size_t i=0;i<count;i++)if(!changes[i].old){
+        changes[i].replacement->branch_mem=changes[i].arena;changes[i].arena=NULL;
+        changes[i].replacement->parent=changes[i].parent;
+    }
+    /* Merge the current direct DOM child order once per parent. Repeated
+       predecessor searches for every append/removal turn a legitimate large
+       batch into quadratic work even though generation itself is local. */
+    for(size_t i=0;i<count;i++){
+        box_t *parent=changes[i].parent;node_t *node=parent->node;
+        struct local_box_subject *subject=local_subject(subjects,capacity-1,node);
+        if(subject->parent_committed)continue;subject->parent_committed=true;
+        parent->first=parent->last=NULL;
+        for(node_t *n=node->first;n;n=n->next)if(n->box&&n->box->parent==parent)append(parent,n->box);
+        layout_invalidate(parent);
+        for(box_t *p=parent;p;p=p->parent){
+            if(!p->style_sync_dirty){p->paint_layers_valid=false;pv_free(&p->paint_layers);}
+            p->style_sync_dirty=true;
+        }
+    }
+    for(size_t i=0;i<count;i++)if(changes[i].old)unpublish_boxes(changes[i].old);
+    restyle_boxes(d->root_box,false); /* one dirty-path join also recomputes ancestor paint_alpha */
+    free(subjects);free(changes);boxes_changes_clear(d);return true;
 }
 void boxes_discard(web_doc *d) {
     if(!d)return;
@@ -962,6 +1137,7 @@ void boxes_discard(web_doc *d) {
     if(d->root)clear_boxes(d->root); /* also clears an unpublished failed rebuild */
     for(int i=0;i<web_dialog_count(d);i++)web_dialog_set_backdrop(d,web_dialog_at(d,i),NULL);
     ar_free(&d->bmem);
+    pv_free(&d->box_changes);d->box_changes_full=false;
 }
 
 static style_t *replacement_style(node_t *n, style_t *old) {

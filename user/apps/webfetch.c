@@ -17,6 +17,8 @@ struct job {
     struct webnet_wire_request wire;
     char *url, *document, *method, *headers, *request_body;
     char *origin, *target_origin;
+    char *referrer,*referrer_origin;
+    int referrer_policy;
     char *final_url;
     char error[160];
     struct header_buffer outgoing;
@@ -115,6 +117,70 @@ static enum http_url_result http_url(const char *raw, char **canonical, char **o
 }
 static bool url_failure(struct job *j, enum http_url_result result, const char *invalid) {
     return fail(j, result == HTTP_URL_OOM ? "Out of memory preparing canonical URL or origin" : invalid);
+}
+/* Strip credentials/fragment through the existing canonical URL boundary.
+   Non-HTTP sources have no network referrer; malformed metadata fails closed. */
+static bool prepare_referrer(struct job *j) {
+    if(!j->referrer||!*j->referrer)return true;
+    const char *raw=j->referrer,*scheme=strstr(raw,"://");
+    if(!scheme){free(j->referrer);j->referrer=NULL;return true;}
+    const char *authority=scheme+3,*end=authority+strcspn(authority,"/?#"),*at=NULL;
+    for(const char *p=authority;p<end;p++)if(*p=='@')at=p;
+    char *clean=NULL;
+    if(at){size_t prefix=(size_t)(authority-raw),tail=strlen(at+1);if(prefix>SIZE_MAX-tail-1)return fail(j,"Referrer allocation overflow");
+        clean=malloc(prefix+tail+1);if(!clean)return fail(j,"Out of memory preparing referrer");memcpy(clean,raw,prefix);memcpy(clean+prefix,at+1,tail+1);raw=clean;}
+    char *next=NULL,*origin=NULL;
+    enum http_url_result result=http_canonical_owned_n(raw,strlen(raw),&next,&origin);free(clean);
+    if(result==HTTP_URL_OPAQUE){free(j->referrer);j->referrer=NULL;return true;}
+    if(result!=HTTP_URL_TUPLE)return url_failure(j,result,"Invalid private referrer URL");
+    size_t length=strlen(origin);char *origin_url=malloc(length+2);
+    if(!origin_url){free(next);free(origin);return fail(j,"Out of memory preparing referrer origin");}
+    memcpy(origin_url,origin,length);origin_url[length]='/';origin_url[length+1]=0;free(origin);
+    if(strlen(next)>4096){free(next);next=strdup(origin_url);if(!next){free(origin_url);return fail(j,"Out of memory reducing referrer");}}
+    free(j->referrer);j->referrer=next;j->referrer_origin=origin_url;return true;
+}
+static bool referrer_trustworthy(const char *url) {
+    if(!strncmp(url,"https://",8))return true;
+    if(strncmp(url,"http://",7))return false;
+    const char *host=url+7;
+    if(*host=='['){const char *end=strchr(host,']');return end&&end-host==4&&!memcmp(host,"[::1]",5);}
+    size_t length=strcspn(host,":/");
+    /* The native resolver guarantees exact localhost, not *.localhost.
+       127/8 means an IPv4 literal, never a DNS name like 127.evil.test. */
+    if(length==9&&!memcmp(host,"localhost",9))return true;
+    size_t at=0;
+    for(unsigned part=0;part<4;part++){
+        unsigned value=0,digits=0;
+        while(at<length&&host[at]>='0'&&host[at]<='9'){if(++digits>3)return false;value=value*10+(unsigned)(host[at++]-'0');}
+        if(!digits||value>255||(part==0&&value!=127))return false;
+        if(part==3)return at==length;
+        if(at==length||host[at++]!='.')return false;
+    }
+    return false;
+}
+static bool append_referrer(struct job *j,const char *current) {
+    if(!j->referrer||!*j->referrer)return true;
+    bool same=j->referrer_origin&&strlen(j->referrer_origin)==strlen(j->target_origin)+1&&
+        !memcmp(j->referrer_origin,j->target_origin,strlen(j->target_origin));
+    bool downgrade=referrer_trustworthy(j->referrer)&&!referrer_trustworthy(current);
+    int policy=j->referrer_policy?j->referrer_policy:WEBNET_REFERRER_STRICT_ORIGIN_CROSS;
+    const char *value=j->referrer;
+    if(j->wire.user_navigation&WEBNET_WIRE_NO_REFERRER)policy=WEBNET_REFERRER_NONE;
+    switch(policy){
+    case WEBNET_REFERRER_NONE:value="";break;
+    case WEBNET_REFERRER_DOWNGRADE:if(downgrade)value="";break;
+    case WEBNET_REFERRER_SAME_ORIGIN:if(!same)value="";break;
+    case WEBNET_REFERRER_ORIGIN:value=j->referrer_origin;break;
+    case WEBNET_REFERRER_STRICT_ORIGIN:value=downgrade?"":j->referrer_origin;break;
+    case WEBNET_REFERRER_ORIGIN_CROSS:if(!same)value=j->referrer_origin;break;
+    case WEBNET_REFERRER_STRICT_ORIGIN_CROSS:if(!same)value=downgrade?"":j->referrer_origin;break;
+    case WEBNET_REFERRER_UNSAFE:break;
+    default:return fail(j,"Invalid private referrer policy");
+    }
+    if(*value&&(!header_text(j,&j->outgoing,"Referer: ")||!header_text(j,&j->outgoing,value)||!header_text(j,&j->outgoing,"\r\n")))return false;
+    /* A redirect must not resurrect a path/header reduced by an earlier hop. */
+    if(value!=j->referrer){char *next=strdup(value);if(!next)return fail(j,"Out of memory updating referrer");free(j->referrer);j->referrer=next;}
+    return true;
 }
 /* WHATWG host parsing uses the final nonempty label to detect possible IPv4:
    decimal, shortened/integer, hexadecimal and octal variants must not be
@@ -382,9 +448,18 @@ static bool cache_headers(struct job *j) {
 static bool prepare_outgoing(struct job *j, const char *current, const char *method, bool cross) {
     j->outgoing.length = 0;
     if (!header_text(j, &j->outgoing, j->headers)) return false;
+    const char *serialized_origin=request_origin(j);
+    if(no_cors(j)){
+        int policy=j->referrer_policy?j->referrer_policy:WEBNET_REFERRER_STRICT_ORIGIN_CROSS;
+        bool downgrade=j->origin&&referrer_trustworthy(j->origin)&&!referrer_trustworthy(current);
+        if((j->wire.user_navigation&WEBNET_WIRE_NO_REFERRER)||policy==WEBNET_REFERRER_NONE ||
+           (policy==WEBNET_REFERRER_SAME_ORIGIN&&cross) ||
+           ((policy==WEBNET_REFERRER_DOWNGRADE||policy==WEBNET_REFERRER_STRICT_ORIGIN||policy==WEBNET_REFERRER_STRICT_ORIGIN_CROSS)&&downgrade))serialized_origin="null";
+    }
     if ((cors_kind(j) || j->wire.kind==WEBNET_REPORT || (no_cors(j) && strcmp(method,"GET") && strcmp(method,"HEAD"))) && !(header_text(j, &j->outgoing, "Origin: ") &&
-        header_text(j, &j->outgoing, no_cors(j) && (j->wire.user_navigation & WEBNET_WIRE_NO_REFERRER)?"null":request_origin(j)) && header_text(j, &j->outgoing, "\r\n"))) return false;
+        header_text(j, &j->outgoing,serialized_origin) && header_text(j, &j->outgoing, "\r\n"))) return false;
     if (!cache_headers(j)) return false;
+    if(!append_referrer(j,current))return false;
     /* Fetch's network layer owns content-coding negotiation, after author
        headers have been classified for CORS. Advertise only our real decoder;
        byte ranges must keep their representation offsets (Fetch step 19). */
@@ -764,6 +839,7 @@ static bool run_http(struct job *j) {
     parsed = image_http_url(j, j->url, &j->final_url, &j->target_origin);
     if (parsed != HTTP_URL_TUPLE) return url_failure(j, parsed, "Invalid HTTP(S) URL");
     if (!validate_headers(j)) return false;
+    if(!prepare_referrer(j))return false;
     if(no_cors(j) && strcmp(j->method,"GET") && strcmp(j->method,"HEAD") && strcmp(j->method,"POST"))return fail(j,"No-cors request requires a safelisted method");
     if (WEBNET_WIRE_CACHE_MODE(j->wire.user_navigation) == WEBNET_CACHE_ONLY_IF_CACHED) {
         if (!(j->wire.user_navigation & WEBNET_WIRE_SAME_ORIGIN))
@@ -837,6 +913,7 @@ static bool run_http(struct job *j) {
         if (result < 0) { j->cookie_len=j->stream_headers_sent?0:cookie_start; if (!j->error[0]) fail(j, r.error); http_resp_free(&r); return false; }
         bool redirect = !j->stream_final && (r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308);
         if (redirect) {
+            j->referrer_policy=webnet_referrer_policy_header(http_response_headers(&r),j->referrer_policy);
             if (hop == 20) { http_resp_free(&r); return fail(j, "Fetch redirect count exceeded"); }
             if (j->wire.user_navigation & WEBNET_WIRE_REDIRECT_ERROR) {
                 http_resp_free(&r); return fail(j, "Redirect forbidden by redirect mode");
@@ -916,8 +993,15 @@ int main(void) {
         ((w->user_navigation & WEBNET_WIRE_DEBUG_REQUEST) &&
          ((w->kind != WEBNET_RESOURCE && w->kind != WEBNET_CLASSIC && w->kind != WEBNET_MODULE &&
            w->kind != WEBNET_NAVIGATION) || !(w->user_navigation & WEBNET_WIRE_STATUS_LINE))) ||
-        ((w->user_navigation & WEBNET_WIRE_STREAM) && w->kind != WEBNET_FETCH)) { free(j); return 1; }
+        ((w->user_navigation & (WEBNET_WIRE_STREAM|WEBNET_WIRE_REFERRER)) && w->kind != WEBNET_FETCH)) { free(j); return 1; }
+    struct webnet_wire_referrer ref={0};
+    if(w->user_navigation&WEBNET_WIRE_REFERRER){
+        if(!read_all(0,&ref,sizeof ref)||ref.policy>WEBNET_REFERRER_UNSAFE||ref.length>webnet_wire_url_limit(w->user_navigation)||
+           (uint64_t)payload_size+ref.length+sizeof ref>SIZE_MAX-7){free(j);return 1;}
+        j->referrer_policy=(int)ref.policy;
+    }
     j->url = read_string(w->url_len, false); j->document = read_string(w->origin_len, false);
+    if(w->user_navigation&WEBNET_WIRE_REFERRER)j->referrer=read_string(ref.length,false);
     j->method = read_string(w->method_len, false); j->headers = read_string(w->headers_len, false);
     j->request_body = read_string(w->body_len, true);
     /* Private transport diagnostics contain no cookie fields or metadata. */
@@ -951,7 +1035,7 @@ int main(void) {
         snprintf(j->error,sizeof j->error,"Cookie snapshot rejected or allocation failed (%s)",cookie_psl_error?cookie_psl_error:"PSL ready");
     }
     free(cookie_snapshot);
-    if (!j->url || !j->document || !j->method || !j->headers || !j->request_body) fail(j, "Invalid request or out of memory");
+    if (!j->url || !j->document || !j->method || !j->headers || !j->request_body || ((w->user_navigation&WEBNET_WIRE_REFERRER)&&!j->referrer)) fail(j, "Invalid request or out of memory");
     else if(w->kind==WEBNET_REPORT && (!w->body_len || !webnet_report_fields_valid(j->method,j->headers)))fail(j,"Invalid native CSP report request");
     else if (!webnet_method_valid(j->method) || ((!strcmp(j->method, "GET") || !strcmp(j->method, "HEAD")) && w->body_len)) fail(j, "Invalid HTTP method or body");
     else if (!j->error[0] && remaining(j)) {
@@ -989,7 +1073,7 @@ int main(void) {
     bool ok = write_all(1, &out, sizeof out) && write_all(1, final_url, out.url_len) &&
               write_all(1, j->response_headers, out.headers_len) && write_all(1, j->body, out.body_len) && write_all(1, j->error, out.error_len) &&
               write_all(1,j->cookie_events,out.cookie_len);
-    free(j->origin); free(j->target_origin);free(j->final_url);
+    free(j->origin); free(j->target_origin);free(j->final_url);free(j->referrer);free(j->referrer_origin);
     free(j->url); free(j->document); free(j->method); free(j->headers); free(j->request_body); free(j->body); free(j->response_headers); free(j->cookie_events); free(j->non_simple); free(j->outgoing.p); webcookie_free(j->cookies); free(j);
     return ok ? 0 : 1;
 }

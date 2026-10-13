@@ -37,3 +37,48 @@ async function runElementScrollCases(){
     s.scrollBy(0,0);await new Promise(resolve=>setTimeout(resolve,20));ok('unchanged-no-event',events===1);
     s.remove();return count;
 }
+
+/* Real native value/line layout, not the host coordinate shim. */
+function runTextareaScrollCases(){
+    let count=0;const ok=(name,value)=>{count++;check('textarea-scroll-'+name,!!value);};
+    const t=document.createElement('textarea');
+    t.style.cssText='display:block;box-sizing:content-box;width:80px;height:0;padding:3px 4px;border:2px solid black;font:16px monospace;line-height:20px;white-space:pre-wrap;overflow:auto';
+    document.body.appendChild(t);
+    ok('empty-line',t.scrollHeight===26);
+    ok('zero-content-height',t.getBoundingClientRect().height===10);
+    t.value='a\nb\n';ok('final-empty-line',t.scrollHeight===66);
+    t.value='a\r\nb\r';ok('normalized-line-breaks',t.value==='a\nb\n'&&t.scrollHeight===66);
+    t.value='M'.repeat(40);const wrapped=t.scrollHeight;
+    ok('soft-wrap',wrapped>26);
+    t.style.whiteSpace='';t.wrap='off';ok('wrap-off',t.scrollHeight===26&&t.scrollWidth>88);
+    t.style.whiteSpace='pre-wrap';ok('author-overrides-wrap-hint',t.scrollHeight===wrapped);
+    t.wrap='soft';ok('wrap-restored',t.scrollHeight===wrapped);
+    t.style.whiteSpace='pre';ok('css-nowrap',t.scrollHeight===26);
+    t.style.whiteSpace='pre-wrap';ok('css-wrap-restored',t.scrollHeight===wrapped);
+    t.style.width='0px';
+    for(const [name,value] of [['combining','e\u0301'],['emoji-zwj','\ud83d\udc69\u200d\ud83d\udcbb'],['regional-pair','\ud83c\uddef\ud83c\uddf5']]){
+        t.value=value;ok('whole-grapheme-'+name,t.scrollHeight===26);
+    }
+    t.value='ab';ok('zero-width-progress',t.scrollHeight===46);
+    t.style.width='80px';t.value='a\nb\nc\nd';t.style.height='20px';
+    t.setSelectionRange(2,5,'backward');t.scrollTop=40;
+    ok('native-scroll-range',t.scrollTop===40);
+    ok('selection-preserved',t.selectionStart===2&&t.selectionEnd===5&&t.selectionDirection==='backward');
+    t.scrollTop=1e6;ok('native-scroll-clamp',t.scrollTop===60);
+    t.value='one';ok('value-change-remeasures',t.scrollHeight===26&&t.scrollTop===0);
+    t.style.height='0px';t.value='one\ntwo';const measured=t.scrollHeight;
+    t.style.height=(measured-6)+'px';ok('author-autosize',t.clientHeight===measured&&t.scrollHeight===measured);
+    t.style.display='none';ok('display-none',t.scrollHeight===0);
+    t.style.display='block';ok('display-restored',t.scrollHeight===measured);
+    t.remove();ok('detached',t.scrollHeight===0);document.body.appendChild(t);ok('reconnected',t.scrollHeight===measured);
+    t.value='';t.placeholder='first\nsecond';t.style.height='0px';ok('placeholder-lines',t.scrollHeight===46);
+    const host=document.createElement('div'),root=host.attachShadow({mode:'open'}),inner=document.createElement('textarea');
+    inner.style.cssText=t.style.cssText;inner.value='shadow\nvalue';root.appendChild(inner);document.body.appendChild(host);
+    ok('shadow-native-value',inner.scrollHeight===46);
+    const outer=document.createElement('div');outer.style.cssText='width:150px;height:20px;overflow:auto';
+    t.style.cssText='display:block;width:80px;height:0;padding:0;border:0;margin:0;font:16px monospace;line-height:20px;overflow:visible';
+    t.placeholder='';t.value='M'.repeat(160);outer.appendChild(t);document.body.appendChild(outer);
+    ok('private-native-scroll-area',t.scrollHeight>20);
+    ok('private-content-does-not-enlarge-parent',outer.scrollHeight===20);
+    outer.remove();host.remove();return count;
+}

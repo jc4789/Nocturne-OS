@@ -340,6 +340,7 @@ const fetchBridge = (() => {
         return out;
     }
     function enumValue(v,allowed,label){v=str(v);if(!allowed.includes(v))throw new TypeError('Invalid '+label);return v;}
+    const referrerPolicies=['','no-referrer','no-referrer-when-downgrade','same-origin','origin','strict-origin','origin-when-cross-origin','strict-origin-when-cross-origin','unsafe-url'];
     function makeURL(value){return new NativeURL(usv(value),rawDom.get(document,'baseURI'));}
     function methodValue(value){const method=byteString(value),upper=method.toUpperCase();if(!token.test(method)||['CONNECT','TRACE','TRACK'].includes(upper))throw new TypeError('Invalid or forbidden HTTP method');return ['DELETE','GET','HEAD','OPTIONS','POST','PUT'].includes(upper)?upper:method;}
     function cloneBody(b){if(unusable(b))throw new TypeError('Body already consumed or locked');let stream;
@@ -367,11 +368,11 @@ const fetchBridge = (() => {
             if(i.duplex!==undefined)enumValue(i.duplex,['half'],'duplex mode');
             if(i.integrity!==undefined)s.integrity=str(i.integrity);
             if(i.keepalive!==undefined)s.keepalive=!!i.keepalive;
-            if(i.referrerPolicy!==undefined)s.referrerPolicy=enumValue(i.referrerPolicy,['','no-referrer','no-referrer-when-downgrade','same-origin','origin','strict-origin','origin-when-cross-origin','strict-origin-when-cross-origin','unsafe-url'],'referrer policy');
+            if(i.referrerPolicy!==undefined)s.referrerPolicy=enumValue(i.referrerPolicy,referrerPolicies,'referrer policy');
             if(i.referrer!==undefined) {
                 const referrer=usv(i.referrer);
                 if(referrer==='')s.referrer='';
-                else {const u=makeURL(referrer);s.referrer=u.protocol==='about:'&&u.pathname==='client'||u.origin!==new NativeURL(host.url()).origin?'about:client':u.href;}
+                else {const u=makeURL(referrer);s.referrer=u.protocol==='about:'&&u.pathname==='client'||u.origin!==rawDom.get(document,'fetchOrigin')?'about:client':u.href;}
             }
             if(s.mode==='no-cors'&&!['GET','HEAD','POST'].includes(s.method))throw new TypeError('no-cors requires a safelisted method');
             const signal=i.signal!==undefined?i.signal:old?old.signal:null;
@@ -442,10 +443,12 @@ const fetchBridge = (() => {
             if(s.mode==='no-cors'&&!host.noCorsFetch)throw notSupported('This native context has no no-cors transport');
             if(s.redirect==='manual')throw notSupported('Opaque manual redirect responses are not supported');
             integrity=s.integrity?integrityMetadata(s.integrity):null;
-            // These overrides really request the native host's existing
-            // no-referrer behavior. Do not reject them as missing transport.
+            // Referrer policy/source are private native metadata, never part
+            // of author headers or CORS preflight header classification.
             const noReferrer=s.referrer===''||s.referrerPolicy==='no-referrer';
-            if(!noReferrer&&(s.referrer!=='about:client'||s.referrerPolicy))throw notSupported('Fetch referrer overrides requiring a Referer header are not supported');
+            let referrer=noReferrer?'':s.referrer==='about:client'?rawDom.get(document,'fetchClientReferrer'):s.referrer;
+            if(referrer){const source=new NativeURL(referrer);source.username='';source.password='';source.hash='';referrer=source.href;}
+            const referrerPolicy=s.referrerPolicy?referrerPolicies.indexOf(s.referrerPolicy):rawDom.get(document,'referrerPolicy');
             // This host has no stored HTTP responses. A cache-only miss is a
             // Fetch network error (TypeError), not a synthetic HTTP 504, and
             // cannot reach host.fetch even for a cross-origin target URL.
@@ -496,7 +499,7 @@ const fetchBridge = (() => {
                 }
                 return false;
             }:undefined;
-            pair=host.fetch(s.url,s.method,raw,b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),forcePreflight,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache),s.keepalive,s.mode==='no-cors',noReferrer,notify);
+            pair=host.fetch(s.url,s.method,raw,b.bytes,s.mode==='same-origin',['omit','same-origin','include'].indexOf(s.credentials),forcePreflight,s.redirect==='error'?1:0,cacheModes.indexOf(s.cache),s.keepalive,s.mode==='no-cors',noReferrer,notify,referrer,referrerPolicy);
             transportId=pair.id;const transportPromise=pair.promise;pair=null;
             if(b.bytes!==null)b.used=true;
             return new NativePromise((resolve,reject)=>{

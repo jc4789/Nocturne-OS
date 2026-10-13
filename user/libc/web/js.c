@@ -85,7 +85,7 @@ struct js_script {
 enum { P_SCRIPT, P_FETCH, P_CSS, P_IMAGE, P_WORKER, P_FRAME, P_FONT, P_POLICY_REPORT, P_MODULE };
 struct js_pending {
     uint64_t id, deadline, stream_generation;
-    int kind, credentials, cache_mode;
+    int kind, credentials, cache_mode, referrer_policy;
     int image;
     uint32_t worker, worker_request;
     int worker_kind;
@@ -95,9 +95,9 @@ struct js_pending {
     struct web_font_resource *font;
     struct cached_css *css;
     JSValue resolve, reject, stream_callback;
-    char *url,*origin,*integrity;
+    char *url,*origin,*integrity,*referrer;
     bool done, aborted, force_preflight, redirect_error, same_origin, keepalive, no_cors, no_referrer;
-    bool streaming, headers_delivered;
+    bool streaming, headers_delivered, host_accepted;
     struct web_response response;
     struct js_pending *next;
 };
@@ -223,6 +223,7 @@ struct web_js_state {
     unsigned pending_count;
     int running;
     unsigned long diagnostic_sequence;
+    bool fetch_abort_diagnostic;
     unsigned resource_failures;
     unsigned suspicious_script_urls;
     bool document_open,document_waiting;
@@ -505,7 +506,7 @@ static void diagnostic_excerpt(struct web_js_state *s, const char *stack) {
         frame = *end ? end + 1 : NULL;
     }
 }
-static void diagnostic_context(struct web_js_state *s) {
+static void diagnostic_context(struct web_js_state *s, bool fetch_abort) {
     char message[512];
     uint64_t now=uptime_ms(), wall=now>=s->task_started_ms?now-s->task_started_ms:0;
     uint64_t allowance=s->task_native_wait_ms+s->task_compile_ms;
@@ -519,6 +520,23 @@ static void diagnostic_context(struct web_js_state *s) {
              (unsigned long)s->task_layout_ms,s->task_layout_flushes,(unsigned long)s->doc->dom_revision,
              s->load_sent?"complete":s->domcontent_sent?"interactive":"loading");
     log_text(s,2,message);
+    /* One opt-in snapshot at an observed AbortError, never a polling walk or
+       an author accessor. Pending id is the native resource id, not webnet's
+       separately owned wire id. Acceptance means queued by the host, not a
+       completed HTTP exchange. No URLs, headers, bodies or signal reasons. */
+    if(fetch_abort && s->host.debug_js && !s->fetch_abort_diagnostic) {
+        s->fetch_abort_diagnostic=true;
+        unsigned count=0;
+        for(struct js_pending *p=s->pending;p;p=p->next)if(p->kind==P_FETCH) {
+            count++;
+            snprintf(message,sizeof message,"Fetch abort snapshot: resource-id=%lu host-accepted=%u done=%u aborted=%u streaming=%u headers-published=%u response-event=%d deadline=%lu now=%lu",
+                (unsigned long)p->id,p->host_accepted,p->done,p->aborted,p->streaming,p->headers_delivered,
+                p->response.event,(unsigned long)p->deadline,(unsigned long)now);
+            log_text(s,2,message);
+        }
+        snprintf(message,sizeof message,"Fetch abort snapshot: fetch-pending=%u; one snapshot per document, native wire ids not inferred",count);
+        log_text(s,2,message);
+    }
     storage_profile_report(s);
 }
 static void exception(struct web_js_state *s) {
@@ -531,7 +549,7 @@ static void exception(struct web_js_state *s) {
     sbuf text = {0}; sb_puts(&text, a ? a : "JavaScript exception");
     if (b && *b && (!a || strcmp(a, b))) { sb_putc(&text, '\n'); sb_puts(&text, b); }
     log_text(s, 2, sb_cstr(&text)); sb_free(&text);
-    diagnostic_context(s);
+    diagnostic_context(s,a && !strncmp(a,"AbortError:",11));
     diagnostic_excerpt(s,b);
     JS_FreeCString(s->ctx, a); JS_FreeCString(s->ctx, b);
     JS_FreeValue(s->ctx, stack); JS_FreeValue(s->ctx, e);
@@ -671,7 +689,7 @@ static void end_task(struct web_js_state *s) {
                 }
                 JS_FreeAtom(s->ctx, atom);
             }
-            log_text(s, 2, sb_cstr(&b)); diagnostic_context(s);
+            log_text(s, 2, sb_cstr(&b)); diagnostic_context(s,false);
             diagnostic_excerpt(s,sb_cstr(&b)); sb_free(&b);
             JS_FreeCString(s->ctx, p);
             JS_FreeValue(s->ctx,record->promise);JS_FreeValue(s->ctx,record->reason);js_free(s->ctx,record);
@@ -1057,6 +1075,18 @@ static JSValue option_value(JSContext *ctx, node_t *option) {
     JSValue result = JS_NewStringLen(ctx, b.p ? b.p : "", b.n); sb_free(&b); return result;
 }
 static bool html_image(const node_t *n) { return n && n->type == N_ELEM && !n->foreign && n->tag == T_img; }
+static const char *fetch_client_referrer_source(web_doc *document) {
+    if(!document||(document->sandbox_flags&SB_ORIGIN))return "";
+    const char *effective=web_effective_url(document);
+    if(strncasecmp(effective,"http://",7)&&strncasecmp(effective,"https://",8))return "";
+    /* Window client origin must not be opaque. For srcdoc, Referrer Policy
+       walks container documents; never return an opaque ancestor's URL. */
+    while(document&&document->url&&!strcmp(document->url,"about:srcdoc")){
+        if(document->sandbox_flags&SB_ORIGIN)return "";
+        document=document->frame_parent;
+    }
+    return document&&!(document->sandbox_flags&SB_ORIGIN)&&document->url?document->url:"";
+}
 static JSValue get_image(struct web_js_state *s, node_t *n, const char *p) {
     JSContext *ctx = s->ctx; web_doc *d = n->owner ? n->owner : s->doc;
     if (!html_image(n)) return JS_ThrowTypeError(ctx, "HTMLImageElement receiver required");
@@ -1191,6 +1221,14 @@ static JSValue get_dom(struct web_js_state *s, node_t *n, const char *p) {
     /* Nocturne currently sends no navigation referrer. Expose the standard
        empty DOMString, not undefined (and never invent a previous URL). */
     if (!strcmp(p, "referrer")) return JS_NewString(ctx, "");
+    if(!strcmp(p,"referrerPolicy"))return JS_NewInt32(ctx,d->referrer_policy);
+    if(!strcmp(p,"fetchClientReferrer"))return JS_NewString(ctx,fetch_client_referrer_source(d));
+    if(!strcmp(p,"fetchOrigin")){
+        if(d->sandbox_flags&SB_ORIGIN)return JS_NewString(ctx,"null");
+        char *origin=NULL;enum http_url_result status=http_origin_owned(web_effective_url(d),&origin);
+        if(status==HTTP_URL_OOM)return oom(ctx);
+        JSValue value=JS_NewString(ctx,status==HTTP_URL_TUPLE?origin:"null");free(origin);return value;
+    }
     if (!strcmp(p, "contentType")) return JS_NewString(ctx, "text/html");
     if (!strcmp(p, "characterSet")) return JS_NewString(ctx, d->encoding[0] ? d->encoding : "UTF-8");
     if (!strcmp(p, "compatMode")) return JS_NewString(ctx, d->quirks ? "BackCompat" : "CSS1Compat");
@@ -3657,11 +3695,12 @@ static bool console_text_render(sbuf *text, const char *bytes, size_t length) {
 static JSValue native_log(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     struct web_js_state *s = state(ctx); int32_t level = 0;
     if (argc && JS_ToInt32(ctx, &level, argv[0]) < 0) return JS_EXCEPTION;
-    sbuf text = {0}; JSValue first_stack=JS_UNDEFINED;
+    sbuf text = {0}; JSValue first_stack=JS_UNDEFINED; bool fetch_abort=false;
     for (int i = 1; i < argc; i++) {
         size_t length = 0;
         const char *p = JS_ToCStringLen(ctx, &length, argv[i]);
         if (!p) { JS_FreeValue(ctx,first_stack); sb_free(&text); return JS_EXCEPTION; }
+        if(JS_IsError(ctx,argv[i]) && length>=11 && !memcmp(p,"AbortError:",11))fetch_abort=true;
         bool ok = (i <= 1 || console_text_append(&text, " ", 1)) &&
                   console_text_render(&text, p, length);
         JS_FreeCString(ctx, p);
@@ -3684,7 +3723,7 @@ static JSValue native_log(JSContext *ctx, JSValueConst this_val, int argc, JSVal
     }
     log_text(s, level, text.p ? text.p : ""); sb_free(&text);
     if(level>=2 && JS_IsString(first_stack)) {
-        diagnostic_context(s); const char *where=JS_ToCString(ctx,first_stack);
+        diagnostic_context(s,fetch_abort); const char *where=JS_ToCString(ctx,first_stack);
         if(where){diagnostic_excerpt(s,where);JS_FreeCString(ctx,where);}
         else if(JS_HasException(ctx)){JSValue error=JS_GetException(ctx);JS_FreeValue(ctx,error);}
     }
@@ -4980,11 +5019,13 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
         .credentials=(kind == WEB_RESOURCE_FETCH || kind == WEB_RESOURCE_REPORT || p->kind==P_MODULE) ? p->credentials : kind == WEB_RESOURCE_MODULE ? 1 : 2,
         .force_preflight=p->force_preflight, .redirect_error=p->redirect_error, .same_origin=p->same_origin,
         .no_cors=p->no_cors, .no_referrer=p->no_referrer,
+        .referrer=p->referrer,.referrer_policy=p->referrer_policy,
         .cache_mode=p->cache_mode, .keepalive=p->keepalive, .fetch_group=p->keepalive?s->fetch_group:0,
         .stream_response=p->streaming};
     if(kind==WEB_RESOURCE_IMAGE && p->kind==P_IMAGE && p->image>=0 && p->image<s->doc->images.n)
         r.image_upgrade=((struct web_image *)s->doc->images.v[p->image])->image_upgrade;
     bool ok = s->host.request && s->host.request(s->host.opaque, &r);
+    if(ok)p->host_accepted=true;
     if (!ok) pending_error(p, "The browser rejected the resource request");
     return ok;
 }
@@ -4994,7 +5035,7 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
    redirects and generation cancellation; completions only queue native bytes. */
 static bool worker_request(void *opaque, uint32_t worker, uint32_t request,
                         const char *url, int kind,const char *method,const char *headers,
-                        const void *body,size_t body_len) {
+                        const void *body,size_t body_len,const char *referrer,int referrer_policy) {
     struct web_js_state *s = opaque;
     if (!s || s->disabled || kind < 0 ||
         (kind != 0 && !njw_load_kind_valid((uint32_t)kind))) return false;
@@ -5003,7 +5044,7 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request,
     if(!url||!method||!webnet_method_valid(method)||body_len>WEBNET_BODY_LIMIT||
        (!body&&body_len)||strlen(method)>UINT32_MAX||(headers&&strlen(headers)>UINT32_MAX)||
        ((!strcmp(method,"GET")||!strcmp(method,"HEAD"))&&body)||
-       (kind!=2&&(strcmp(method,"GET")||body||body_len)))return false;
+       (kind!=2&&(strcmp(method,"GET")||body||body_len||referrer||referrer_policy))||referrer_policy<0||referrer_policy>WEBNET_REFERRER_UNSAFE)return false;
     struct js_pending *p = pending_new(s, P_WORKER, url);
     if (!p) {
         /* Loader rejection is reported over Worker IPC. Do not leave an OOM
@@ -5044,13 +5085,14 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request,
         .headers=headers,.body=body,.body_len=body_len,
         .credentials=1, .same_origin=kind == 0,
         .no_cors=(policy & NJW_LOAD_NO_CORS)!=0,
+        .referrer=referrer,.referrer_policy=referrer_policy,
         .no_referrer=(policy & NJW_LOAD_NO_REFERRER)!=0};
     if (!s->host.request || !s->host.request(s->host.opaque,&r))
         pending_error(p,"The browser rejected the Worker resource request");
     return true;
 }
 static bool worker_load(void *opaque,uint32_t worker,uint32_t request,const char *url,int kind){
-    return worker_request(opaque,worker,request,url,kind,"GET",NULL,NULL,0);
+    return worker_request(opaque,worker,request,url,kind,"GET",NULL,NULL,0,NULL,0);
 }
 static void worker_cancel(void *opaque,uint32_t worker,uint32_t request) {
     struct web_js_state *s=opaque;if(!s)return;
@@ -5115,7 +5157,7 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
             JS_FreeCString(ctx,headers);JS_FreeValue(ctx,snapshot);free(policy);policy=copy;
             if(!policy)return oom(ctx);
         }
-        bool ok=web_worker_set_policy(s->workers,policy);free(policy);
+        bool ok=web_worker_set_policy(s->workers,policy,s->doc->referrer_policy);free(policy);
         if(!ok)return oom(ctx);
     }
     if(op==8||op==9){
@@ -5162,7 +5204,8 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     if (argc < 4) return JS_ThrowTypeError(ctx, "Invalid fetch request");
     if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "Fetch browsing context is inactive");
     struct node *generation = s->doc->root;
-    size_t header_length = 0, method_length = 0;
+    size_t header_length = 0, method_length = 0,referrer_length=0;
+    const char *referrer=argc>13?JS_ToCStringLen(ctx,&referrer_length,argv[13]):NULL;
     const char *rel = JS_ToCString(ctx, argv[0]), *method = JS_ToCStringLen(ctx, &method_length, argv[1]), *headers = JS_ToCStringLen(ctx, &header_length, argv[2]);
     size_t n = 0; const char *body_string = NULL;
     static const uint8_t empty_body = 0;
@@ -5178,7 +5221,8 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     }
     char *url = NULL;
     JSValue result = JS_EXCEPTION;
-    if (!rel || !method || !headers || (!body && JS_HasException(ctx))) goto out;
+    if (!rel || !method || !headers || (argc>13&&!referrer) || (!body && JS_HasException(ctx))) goto out;
+    if(referrer_length>UINT32_MAX||(referrer&&memchr(referrer,0,referrer_length))){result=JS_ThrowTypeError(ctx,"Invalid private referrer URL");goto out;}
     if (!task_context_active(s) || s->doc->root != generation) { result = JS_ThrowTypeError(ctx, "Fetch browsing context retired during conversion"); goto out; }
     if (s->doc->resources_dirty) doc_sync_tree(s->doc);
     url = js_resolve_owned(ctx, s->doc->base, rel); if (!url) goto out;
@@ -5194,10 +5238,11 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
                 JS_ThrowTypeError(ctx, "Cross-origin fetch is forbidden by same-origin mode"); goto out;
         }
     }
-    int32_t credentials = 1, redirect = 0, cache_mode = WEBNET_CACHE_DEFAULT;
+    int32_t credentials = 1, redirect = 0, cache_mode = WEBNET_CACHE_DEFAULT,referrer_policy=WEBNET_REFERRER_DEFAULT;
     if ((argc > 5 && (JS_ToInt32(ctx, &credentials, argv[5]) || credentials < 0 || credentials > 2)) ||
         (argc > 7 && (JS_ToInt32(ctx, &redirect, argv[7]) || redirect < 0 || redirect > 1)) ||
-        (argc > 8 && (JS_ToInt32(ctx, &cache_mode, argv[8]) || cache_mode < WEBNET_CACHE_DEFAULT || cache_mode > WEBNET_CACHE_ONLY_IF_CACHED))) {
+        (argc > 8 && (JS_ToInt32(ctx, &cache_mode, argv[8]) || cache_mode < WEBNET_CACHE_DEFAULT || cache_mode > WEBNET_CACHE_ONLY_IF_CACHED)) ||
+        (argc > 14 && (JS_ToInt32(ctx,&referrer_policy,argv[14]) || referrer_policy<WEBNET_REFERRER_DEFAULT || referrer_policy>WEBNET_REFERRER_UNSAFE))) {
         result = JS_ThrowTypeError(ctx, "Invalid fetch policy"); goto out;
     }
     if (!task_context_active(s) || s->doc->root != generation) { result = JS_ThrowTypeError(ctx, "Fetch browsing context retired during conversion"); goto out; }
@@ -5234,6 +5279,8 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     p->force_preflight = argc > 6 && JS_ToBool(ctx, argv[6]) > 0;
     p->no_cors = argc > 10 && JS_ToBool(ctx, argv[10]) > 0;
     p->no_referrer = argc > 11 && JS_ToBool(ctx, argv[11]) > 0;
+    p->referrer_policy=referrer_policy;
+    if(referrer){p->referrer=js_strndup(ctx,referrer,referrer_length);if(!p->referrer){pending_error(p,"Out of memory preparing referrer policy");result=oom(ctx);goto out;}}
     p->streaming = argc > 12 && JS_IsFunction(ctx, argv[12]) && s->host.resume_request;
     if (p->streaming) p->stream_callback = JS_DupValue(ctx, argv[12]);
     JSValue funcs[2]; JSValue promise = JS_NewPromiseCapability(ctx, funcs);
@@ -5251,7 +5298,7 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     }
     send_request(s, p, WEB_RESOURCE_FETCH, method, headers, body, n);
 out:
-    js_free(ctx, url); JS_FreeCString(ctx, rel); JS_FreeCString(ctx, method); JS_FreeCString(ctx, headers); JS_FreeCString(ctx, body_string); return result;
+    js_free(ctx, url);JS_FreeCString(ctx,referrer); JS_FreeCString(ctx, rel); JS_FreeCString(ctx, method); JS_FreeCString(ctx, headers); JS_FreeCString(ctx, body_string); return result;
 }
 static JSValue native_cancel(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     int64_t id; if (!argc || JS_ToInt64(ctx, &id, argv[0])) return JS_EXCEPTION;
@@ -5985,6 +6032,7 @@ static void dynamic_prepare_node(struct web_js_state *s,node_t *n,uint64_t gener
             run_script(s,script);
         return;
     }
+    if(n->type==N_ELEM&&!n->foreign&&n->tag==T_meta)doc_referrer_meta(n->owner,n);
     if(n->type==N_ELEM && !n->foreign && n->tag==T_meta && !n->html_policy_processed){
         web_doc *owner=n->owner;
         if(owner->resources_dirty)doc_sync_tree(owner);
@@ -6118,7 +6166,7 @@ static void pending_free(struct web_js_state *s, struct js_pending *p) {
     }
     JS_FreeValue(s->ctx, p->resolve); JS_FreeValue(s->ctx, p->reject); JS_FreeValue(s->ctx, p->stream_callback);
     release_module_user(s,p->module);
-    js_free(s->ctx, p->url);js_free(s->ctx,p->origin);js_free(s->ctx,p->integrity); js_free(s->ctx, p->response.body); js_free(s->ctx, p->response.headers_full); js_free(s->ctx,p->response.url_full);
+    js_free(s->ctx, p->url);js_free(s->ctx,p->origin);js_free(s->ctx,p->integrity);js_free(s->ctx,p->referrer); js_free(s->ctx, p->response.body); js_free(s->ctx, p->response.headers_full); js_free(s->ctx,p->response.url_full);
     js_free(s->ctx, p); s->pending_count--;
 }
 static bool document_resource_kind(int kind) {

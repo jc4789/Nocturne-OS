@@ -76,12 +76,30 @@ static void slot_close(struct slot *s) {
     if (s->out >= 0) close(s->out);
     s->in = s->out = -1;
 }
+static bool slot_reap(struct slot *s) {
+    if (s->pid <= 0) return true;
+    int pid = s->pid;
+    int got = waitpid(pid, NULL, WNOHANG);
+    /* A transient wait error is not proof that this owned child exited. */
+    if (got == pid || (got < 0 && errno == ECHILD)) s->pid = 0;
+    return s->pid <= 0;
+}
 static void slot_stop(struct slot *s, const char *error) {
     if (s->rq->finishing) return;
     if (error) snprintf(s->rq->error, sizeof s->rq->error, "%s", error);
     s->rq->finishing = true;
     slot_close(s);
     if (s->pid > 0) kill(s->pid);
+}
+static void reap_paused_stream(struct slot *s) {
+    const struct request *r = s->rq;
+    if (!r || !r->streaming || !r->paused || r->finishing || s->pid <= 0) return;
+    struct n_pollfd peer = {s->out, 0, 0};
+    if (poll(&peer, 1, 0) < 0) slot_stop(s, "Worker poll failed");
+    else if (peer.revents & N_POLLHUP) slot_reap(s);
+    /* Reaping releases only the live transport. The dynamic pipe, request and
+       partially received frame remain owned until pull/resume or cancellation;
+       do not consume bytes, deliver a callback or manufacture END here. */
 }
 webnet *webnet_create(void) {
     webnet *n = calloc(1, sizeof *n);
@@ -122,6 +140,8 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
         q->credentials < WEBNET_CREDENTIALS_OMIT || q->credentials > WEBNET_CREDENTIALS_INCLUDE ||
         q->cache_mode < WEBNET_CACHE_DEFAULT || q->cache_mode > WEBNET_CACHE_ONLY_IF_CACHED ||
         (q->kind != WEBNET_FETCH && q->cache_mode != WEBNET_CACHE_DEFAULT) ||
+        q->referrer_policy<WEBNET_REFERRER_DEFAULT || q->referrer_policy>WEBNET_REFERRER_UNSAFE ||
+        ((q->referrer||q->referrer_policy) && q->kind!=WEBNET_FETCH) ||
         ((q->no_cors || q->no_referrer) && q->kind != WEBNET_FETCH) ||
         (q->no_cors && (q->same_origin || q->force_preflight)) ||
         (q->keepalive && (q->kind != WEBNET_FETCH || !q->fetch_group)) ||
@@ -154,14 +174,17 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     const char *origin = q->origin ? q->origin : "";
     const char *method = q->method ? q->method : "GET";
     const char *headers = q->headers ? q->headers : "";
-    size_t ul = strlen(q->url), ol = strlen(origin), ml = strlen(method), hl = strlen(headers);
-    if (!ul || ul > UINT32_MAX || ol > UINT32_MAX || ul == SIZE_MAX || ol == SIZE_MAX || ml > UINT32_MAX || !webnet_method_valid(method) || hl > UINT32_MAX ||
+    bool referrer_extension=q->referrer!=NULL||q->referrer_policy!=WEBNET_REFERRER_DEFAULT;
+    const char *referrer=q->referrer?q->referrer:"";
+    size_t ul = strlen(q->url), ol = strlen(origin), ml = strlen(method), hl = strlen(headers),rl=strlen(referrer);
+    if (!ul || ul > UINT32_MAX || ol > UINT32_MAX || ul == SIZE_MAX || ol == SIZE_MAX || ml > UINT32_MAX || !webnet_method_valid(method) || hl > UINT32_MAX ||rl>UINT32_MAX||
         ((!strcmp(method, "GET") || !strcmp(method, "HEAD")) && q->body_len)) return 0;
     int64_t cookie_now=time(NULL);
     long cookie_len = q->credentials == WEBNET_CREDENTIALS_OMIT ? 0 : webcookie_export(n->cookies, NULL, 0, cookie_now);
     if (cookie_len < 0) return 0;
     if ((uint64_t)cookie_len > UINT32_MAX) return 0;
-    uint64_t total = sizeof(struct webnet_wire_request) + (uint64_t)ul + ol + ml + hl + q->body_len + (uint64_t)cookie_len;
+    uint64_t total = sizeof(struct webnet_wire_request) + (uint64_t)ul + ol + ml + hl + q->body_len + (uint64_t)cookie_len+
+        (referrer_extension?sizeof(struct webnet_wire_referrer)+(uint64_t)rl:0);
     if (total > SIZE_MAX || total > SIZE_MAX - n->queued_bytes) return 0;
     size_t len = (size_t)total;
     struct request *r = calloc(1, sizeof *r);
@@ -211,6 +234,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     if (q->image_upgrade) h.user_navigation |= WEBNET_WIRE_IMAGE_UPGRADE;
     if (q->no_cors) h.user_navigation |= WEBNET_WIRE_NO_CORS;
     if (q->no_referrer) h.user_navigation |= WEBNET_WIRE_NO_REFERRER;
+    if (referrer_extension)h.user_navigation|=WEBNET_WIRE_REFERRER;
     if (q->stream_response) h.user_navigation |= WEBNET_WIRE_STREAM;
     if (r->debug_request) h.user_navigation |= WEBNET_WIRE_DEBUG_REQUEST;
     if (q->body) h.user_navigation |= WEBNET_WIRE_BODY_PRESENT;
@@ -219,7 +243,9 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     h.url_len = ul; h.origin_len = ol; h.method_len = ml; h.headers_len = hl; h.body_len = q->body_len;
     memcpy(r->tx, &h, sizeof h);
     unsigned char *p = r->tx + sizeof h;
+    if(referrer_extension){struct webnet_wire_referrer ref={(uint32_t)rl,(uint32_t)q->referrer_policy};memcpy(p,&ref,sizeof ref);p+=sizeof ref;}
     memcpy(p, q->url, ul); p += ul; memcpy(p, origin, ol); p += ol;
+    if(referrer_extension){memcpy(p,referrer,rl);p+=rl;}
     memcpy(p, method, ml); p += ml; memcpy(p, headers, hl); p += hl;
     if (q->body_len) memcpy(p, q->body, q->body_len);
     p += q->body_len;
@@ -235,10 +261,10 @@ static bool origin_available(const webnet *n,const struct request *request){
     unsigned busy=0;
     for(unsigned i=0;i<WORKERS;i++){
         const struct request *active=n->slots[i].rq;
-        if(active&&!active->cancelled&&active->transport_origin&&!strcmp(active->transport_origin,request->transport_origin))busy++;
+        if(n->slots[i].pid>0&&active&&!active->cancelled&&active->transport_origin&&!strcmp(active->transport_origin,request->transport_origin))busy++;
     }
     for(const struct slot *s=n->parked;s;s=s->next){const struct request *active=s->rq;
-        if(active&&!active->cancelled&&active->transport_origin&&!strcmp(active->transport_origin,request->transport_origin))busy++;
+        if(s->pid>0&&active&&!active->cancelled&&active->transport_origin&&!strcmp(active->transport_origin,request->transport_origin))busy++;
     }
     /* Reserve the final HTTP/1 connection for document dependencies too,
        not just a global slot: same-origin long polls cannot starve a script. */
@@ -505,6 +531,7 @@ static void pump_slot(webnet *n,struct slot *s,uint64_t now){
         struct request *r = s->rq;
         if (!r||r->in_callback) return;
         if (!r->finishing && now >= r->deadline) slot_stop(s, "Request deadline exceeded");
+        reap_paused_stream(s);
         if (!r->finishing&&!r->paused) {
             struct n_pollfd pf[2] = {{s->out, N_POLLIN, 0}, {s->in, N_POLLOUT, 0}};
             if (poll(pf, s->in >= 0 ? 2 : 1, 0) < 0) slot_stop(s, "Worker poll failed");
@@ -560,9 +587,7 @@ static void pump_slot(webnet *n,struct slot *s,uint64_t now){
         if (r->finishing) {
             /* Even a child that produced its frame must not hold a slot past the deadline. */
             if (s->pid > 0 && now >= r->deadline) kill(s->pid);
-            int status = 0;
-            int reaped = s->pid > 0 ? waitpid(s->pid, &status, WNOHANG) : -1;
-            if (reaped != 0) complete(n, s);
+            if (slot_reap(s)) complete(n, s);
         }
 }
 void webnet_pump(webnet *n,uint64_t now){
@@ -571,8 +596,8 @@ void webnet_pump(webnet *n,uint64_t now){
     if(!n->budget_at||now>=n->budget_at){n->worker_limit=worker_budget();n->budget_at=now+1000;}
     struct request **qp=&n->queue;
     while(*qp){struct request *r=*qp;if(now<r->deadline){qp=&r->next;continue;}*qp=r->next;r->next=NULL;struct slot temp={r,0,-1,-1,NULL};snprintf(r->error,sizeof r->error,"Request deadline exceeded");complete(n,&temp);qp=&n->queue;}
-    /* Paused pipes retain their process and bounded pipe storage, but do not
-       occupy a scheduling slot. Resumed readers consume one frame per pump. */
+    /* Paused responses retain their pipe and request, not an exited process's
+       transport budget. Resumed readers consume one frame per pump. */
     struct slot **park=&n->parked;
     while(*park){struct slot *s=*park;pump_slot(n,s,now);if(!s->rq){*park=s->next;free(s);}else park=&s->next;}
     for(int i=0;i<WORKERS;i++){

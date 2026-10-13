@@ -13,6 +13,7 @@
 #include <parallel.h>
 #include "webi.h"
 #include "web_dialog.h"
+#include "form_value.h"
 #include "js_canvas.h"
 #include "avmedia.h"
 #include "svg_geometry.h"
@@ -859,6 +860,70 @@ static bool no_break_before(uint32_t c) {
 static bool east_asian_break(uint32_t left,uint32_t right) {
     return (east_asian_letter(left) || east_asian_letter(right)) &&
            !no_break_after(left) && !no_break_before(right);
+}
+
+static float control_tab_width(const style_t *st, const wfont *font, float x) {
+    float stop = 8 * text_width_uncached(st, font, " ", 1);
+    return stop > 0 ? stop - fmodf(fmaxf_(0, x), stop) : 0;
+}
+float control_text_width(const style_t *st, const char *s, size_t n) {
+    wfont font = style_font(st);
+    float width = 0;
+    size_t first = 0;
+    for (size_t at = 0; at < n; at++) if (s[at] == '\t') {
+        width += text_width_uncached(st, &font, s + first, at - first);
+        width += control_tab_width(st, &font, width); first = at + 1;
+    }
+    return width + text_width_uncached(st, &font, s + first, n - first);
+}
+bool control_text_lines(const box_t *b, const style_t *st, const char *text,
+                        control_text_line_fn visit, void *opaque, float *width, float *height) {
+    if (!b || !st || !text || !width || !height) return false;
+    bool soft = st->white_space != WS_PRE && st->white_space != WS_NOWRAP;
+    wfont font = style_font(st);
+    float limit = fmaxf_(0, b->w), lh = style_line_height(st), top = 0, widest = 0;
+    size_t length = strlen(text), first = 0, work = 0;
+    for (;;) {
+        size_t at = first, end = first, next = first, opportunity = first;
+        float used = 0, opportunity_width = 0;
+        uint32_t previous = 0;
+        bool hard = false;
+        while (at < length) {
+            if (!(work++ & 63) && b->node) {
+                /* Pure AP layout helpers may only observe cancellation;
+                   paint/ordinary layout retain the owner's safe checkpoint. */
+                struct layout_context *context = thread_local_get(1);
+                if (!(context ? layout_checkpoint() : web_native_checkpoint(b->node->owner))) return false;
+            }
+            size_t after = wf_grapheme_next(text, length, at);
+            uint32_t cp; wf_grapheme_decode(text + at, after - at, &cp);
+            if (cp == '\n' || cp == '\r') { end = at; next = after; hard = true; break; }
+            if (soft && at > first && east_asian_break(previous, cp)) {
+                opportunity = at; opportunity_width = used;
+            }
+            float advance = cp == '\t' ? control_tab_width(st, &font, used) :
+                text_width_uncached(st, &font, text + at, after - at);
+            /* Preserve a word where possible; an oversized word wraps only
+               at extended grapheme boundaries. Every emitted line advances,
+               even when CSS gives the control a zero content width. */
+            if (soft && at > first && used + advance > limit) {
+                end = next = opportunity > first ? opportunity : at;
+                if (opportunity > first) used = opportunity_width;
+                break;
+            }
+            used += advance; at = after; end = next = at; previous = cp;
+            if (soft && (cp == ' ' || cp == '\t' || cp == '-')) {
+                opportunity = at; opportunity_width = used;
+            }
+        }
+        if (!isfinite(used) || !isfinite(top + lh)) return false;
+        struct control_text_line line = {first, end - first, next, used, top, lh, hard};
+        if (visit) visit(&line, opaque);
+        widest = fmaxf_(widest, used); top += lh;
+        if (!hard && next == length) break;
+        first = next; /* a final LF contributes the following empty line */
+    }
+    *width = widest; *height = top; return true;
 }
 
 static void text_items(box_t *t, struct ibuild *s) {
@@ -4022,7 +4087,11 @@ static void scroll_area_publish(box_t *b) {
     box_t *cb = b->cb;
     if (b->clamp_hidden || !cb || (b->kind == B_INLINE && !box_filter_containing_block(b)) || b->kind == B_TEXT || b->kind == B_BR ||
         box_viewport_fixed(b) || web_dialog_layer_box(D, b)) return;
-    bool clipped = b->clamp_truncated || (b->st && b->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(D, b));
+    /* Native multiline text is confined to the control's padding clip, not
+       an outer CSS child box. Its private scroll area must not enlarge an
+       ancestor even if the author changes the outer overflow property. */
+    bool clipped = b->clamp_truncated || b->atomic == AT_TEXTAREA ||
+        (b->st && b->st->overflow != OV_VISIBLE && !doc_viewport_overflow_box(D, b));
     float bw = clipped ? b->w + b->p[1] + b->p[3] : b->scroll_w;
     float bh = clipped ? b->h + b->p[0] + b->p[2] : b->scroll_h;
     /* cb is b's actual coordinate parent. The shared cb chain cancels:
@@ -4056,6 +4125,16 @@ static void scroll_areas(box_t *b) {
     }
     b->scroll_w = scroll_extent(b->w + b->p[1] + b->p[3]);
     b->scroll_h = scroll_extent(b->h + b->p[0] + b->p[2]);
+    if (b->atomic == AT_TEXTAREA && b->node) {
+        const char *text = web_input_edit_text(b->node);
+        const style_t *st = b->st;
+        if (!*text) { text = node_attr(b->node, "placeholder"); if (st->placeholder) st = st->placeholder; }
+        if (!text) text = "";
+        float width, height;
+        if (!control_text_lines(b, st, text, NULL, NULL, &width, &height)) return;
+        b->scroll_w = fmaxf_(b->scroll_w, scroll_extent(b->p[3] + width + b->p[1]));
+        b->scroll_h = fmaxf_(b->scroll_h, scroll_extent(b->p[0] + height + b->p[2]));
+    }
     for (int i = 0; i < b->nruns; i++) {
         if (!(i & 63) && !layout_checkpoint()) return;
         const struct run *r = &b->runs[i];

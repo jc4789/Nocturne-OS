@@ -289,16 +289,19 @@
             if(url.username||url.password)throw new TypeError('Fetch URL cannot contain credentials');
             if(!['cors','no-cors','same-origin','navigate'].includes(requestMode))throw new TypeError('Invalid request mode');
             if(!['','no-referrer','no-referrer-when-downgrade','same-origin','origin','strict-origin','origin-when-cross-origin','strict-origin-when-cross-origin','unsafe-url'].includes(refPolicy))throw new TypeError('Invalid referrer policy');
-            if(ref!==''&&ref!=='about:client')new workerFetchURL(ref,address);
+            let referrerURL=address;
+            if(ref!==''&&ref!=='about:client'){const source=new workerFetchURL(ref,address);referrerURL=source.protocol==='about:'&&source.pathname==='client'||source.origin!==new workerFetchURL(host.securityURL()).origin?address:source.href;}
             const noReferrer=ref===''||refPolicy==='no-referrer';
             if(signal!=null&&!workerAbortBridge.brand(signal))throw new TypeError('Expected AbortSignal');
-            if((credentials!==undefined&&text(credentials)!=='same-origin')||(requestMode!=='cors'&&requestMode!=='no-cors')||(redirect!==undefined&&text(redirect)!=='follow')||(cache!==undefined&&text(cache)!=='default')||(integrity!==undefined&&text(integrity)!=='')||keepalive||(!noReferrer&&(ref!=='about:client'||refPolicy!=='')))throw new DOMException('Worker Fetch currently supports cors/no-cors, same-origin credentials, follow redirects, and no-referrer/default referrer','NotSupportedError');
+            if((credentials!==undefined&&text(credentials)!=='same-origin')||(requestMode!=='cors'&&requestMode!=='no-cors')||(redirect!==undefined&&text(redirect)!=='follow')||(cache!==undefined&&text(cache)!=='default')||(integrity!==undefined&&text(integrity)!=='')||keepalive)throw new DOMException('Worker Fetch currently supports cors/no-cors, same-origin credentials, and follow redirects','NotSupportedError');
+            if(noReferrer)referrerURL='';else {const source=new workerFetchURL(referrerURL);source.username='';source.password='';source.hash='';referrerURL=source.href;}
+            const referrerPolicy=refPolicy?['','no-referrer','no-referrer-when-downgrade','same-origin','origin','strict-origin','origin-when-cross-origin','strict-origin-when-cross-origin','unsafe-url'].indexOf(refPolicy):host.referrerPolicy();
             const noCors=requestMode==='no-cors';if(noCors&&!['GET','HEAD','POST'].includes(requestMethod))throw new TypeError('Method is not CORS-safelisted');
             const prepared=workerFetchBridge.prepare(body,headerInit,requestMethod,noCors);
             const requestURL=url.href;if(closed)throw new TypeError('Worker closed');
             if(signal!=null&&workerAbortBridge.state(signal).aborted)throw workerAbortBridge.state(signal).reason;
             if(signal!=null&&!workerCanCancel)throw new DOMException('This Worker host has no native Fetch cancellation','NotSupportedError');
-            return new workerFetchBridge.NativePromise((resolve,reject)=>{const id=host.request(requestURL,noCors,noReferrer,requestMethod,prepared.headers,prepared.bytes),p={resolve,reject,noCors,signal,method:requestMethod,cleanup:()=>{}};workerFetchBridge.remember(id,p);if(signal!=null)p.cleanup=workerAbortBridge.subscribe(signal,reason=>{if(!workerFetchBridge.take(id))return;p.cleanup();try{host.cancel(id);}finally{reject(reason);}});});
+            return new workerFetchBridge.NativePromise((resolve,reject)=>{const id=host.request(requestURL,noCors,noReferrer,requestMethod,prepared.headers,prepared.bytes,referrerURL,referrerPolicy),p={resolve,reject,noCors,signal,method:requestMethod,cleanup:()=>{}};workerFetchBridge.remember(id,p);if(signal!=null)p.cleanup=workerAbortBridge.subscribe(signal,reason=>{if(!workerFetchBridge.take(id))return;p.cleanup();try{host.cancel(id);}finally{reject(reason);}});});
         }catch(error){return workerFetchBridge.reject(error);}
     }
     Object.assign(globalThis,{self:globalThis,navigator,WorkerNavigator,postMessage,close,importScripts,Headers,Response,AbortSignal,AbortController,fetch,

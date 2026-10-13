@@ -21,14 +21,14 @@ typedef bool (*web_worker_loader)(void *,uint32_t,uint32_t,const char *,int);
 /* Binary Fetch request snapshots are borrowed only for this call. The browser
  * transport copies them before returning and retains the native initiator. */
 typedef bool (*web_worker_requester)(void *,uint32_t,uint32_t,const char *,int,
-                                    const char *,const char *,const void *,size_t);
+                                    const char *,const char *,const void *,size_t,const char *,int);
 void web_worker_set_requester(web_workers *,web_worker_requester);
 /* Request zero retires all outstanding resources of this real child owner. */
 typedef void (*web_worker_canceler)(void *,uint32_t,uint32_t);
 web_workers *web_worker_new(JSContext *,uint32_t,web_worker_loader,void *);
 /* Private native creator policy snapshot, copied when each child is created.
  * Local-script workers inherit it; HTTP workers use their response policy. */
-bool web_worker_set_policy(web_workers *,const char *);
+bool web_worker_set_policy(web_workers *,const char *,int);
 /* Native document authority, never supplied by the author's constructor. */
 bool web_worker_set_origin(web_workers *,const char *);
 typedef void (*web_worker_reporter)(void *,JSValueConst);

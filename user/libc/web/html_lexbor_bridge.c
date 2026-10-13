@@ -950,6 +950,10 @@ bool html_bridge_import(struct html_parser *p) {
        A root's children can occur later than its host in this binding forest. */
     for(struct binding *v = b->lex_first; v; v = v->lex_next) if(v->changed) {
         node_t *n=v->native;
+        /* Publish policy at the same coherent boundary as parser mutations,
+           before parser scripts run. No Fetch-time DOM synchronization. */
+        if(n->type==N_ELEM&&!n->foreign&&n->tag==T_meta&&
+           (!n->referrer_meta_processed||(v->publish_flags&HTML_BRIDGE_FIELDS)))doc_referrer_meta(n->owner,n);
         n->resource_revision++;
         /* Every field and link is now coherent. Publish only actual changes to
            other suspended parsers sharing this native identity. Self import is

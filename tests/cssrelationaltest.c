@@ -172,10 +172,16 @@ static int child_list_dirty(bool locality_only) {
         ".left+.right{color:blue}#box>i:first-child{color:red}#box>i+i{color:blue}"
         ".empty:empty+.after{height:31px}.empty:not(:empty)+.after{height:37px}"
         ".witness:has(>.flag)+.effect{width:43px}"
+        "#positioned>i:last-child{width:17px}#positioned>i:nth-last-child(2){width:23px}"
+        ".relative:has(+.tail .flag){height:47px}"
+        "#logical>:is(i:first-child){color:red}#logical>i+i{color:blue}"
         "</style><main><div id=box><i id=first>A</i></div><section id=unrelated>");
     for(unsigned i=0;i<200;i++)sb_puts(&html,"<p>Unrelated style forest</p>");
     sb_puts(&html,"</section><div class=empty id=empty></div><div class=after id=after></div>"
-        "<div class=witness id=witness></div><div class=effect id=effect></div></main>");
+        "<div class=witness id=witness></div><div class=effect id=effect></div></main>"
+        "<div id=positioned><i id=position-first></i></div>"
+        "<div id=relative-parent><div class=relative id=relative></div></div>"
+        "<div id=logical><i id=logical-first></i></div>");
     struct web_host host={.script_checkpoint=checkpoint};
     web_doc *doc=web_live(html.p,html.n,"https://child-list.test/","utf-8",&host);sb_free(&html);
     if(!locality_only)check(doc!=NULL,"child-list live document");if(!doc)return 1;
@@ -196,6 +202,79 @@ static int child_list_dirty(bool locality_only) {
     check(unrelated->style==held&&unrelated->first->style==held_child&&doc->profile.style_visits-before<20,
           "global sibling selector does not restyle unrelated grandparent forest");
     if(locality_only){web_free(doc);printf("cssrelational-child-locality: %d checks, %d failed\n",checks,failed);return failed!=0;}
+    /* This changes the document body's children, not a small nested wrapper.
+       Parent-first broad recascade used to retire the entire existing forest
+       for each synchronous insert-and-measure iteration. */
+    held=unrelated->style;held_child=unrelated->first->style;before=doc->profile.style_visits;
+    node_t *measured=element(doc,doc->body,"div",NULL);web_layout(doc,1000,600);
+    check(measured&&measured->style&&measured->box&&unrelated->style==held&&unrelated->first->style==held_child&&
+          doc->profile.style_visits-before<20,"body child insertion preserves unrelated published style forest");
+    if(measured)doc_node_remove(doc,measured);before=doc->profile.style_visits;web_layout(doc,1000,600);
+    check(unrelated->style==held&&unrelated->first->style==held_child&&doc->profile.style_visits-before<20,
+          "body child removal preserves unrelated published style forest");
+    box_t *root_held=doc->root_box,*unrelated_box=unrelated->box;
+    int extent_before=doc->doc_h;
+    node_t *outflow=element(doc,NULL,"span",NULL);
+    if(outflow)doc_node_attr(doc,outflow,"style","position:absolute;left:10px;top:50000px;width:20px;height:10px");
+    if(outflow)doc_node_move(doc,doc->body,outflow,NULL);web_layout(doc,1000,600);
+    check(outflow&&outflow->box&&outflow->box->branch_mem&&doc->root_box==root_held&&unrelated->box==unrelated_box&&
+          outflow->box->w==20&&outflow->box->h==10,"independent out-of-flow insertion retains committed sibling boxes and real dimensions");
+    check(doc->doc_h>extent_before+10000,"local out-of-flow publication updates document scroll extent");
+    if(outflow)doc_node_remove(doc,outflow);web_layout(doc,1000,600);
+    check(outflow&&!outflow->box&&doc->root_box==root_held&&unrelated->box==unrelated_box&&doc->doc_h==extent_before,
+          "local out-of-flow removal unpublishes branch and restores overflow");
+    node_t *unsafe=element(doc,NULL,"span",NULL);
+    if(unsafe)doc_node_attr(doc,unsafe,"style","position:absolute;left:10px;width:20px;height:10px");
+    if(unsafe)doc_node_move(doc,doc->body,unsafe,NULL);web_layout(doc,1000,600);
+    check(unsafe&&unsafe->box&&!unsafe->box->branch_mem&&unsafe->box->w==20,
+          "auto static-position inset falls back to ordinary complete box generation");
+    if(unsafe)doc_node_remove(doc,unsafe);web_layout(doc,1000,600);
+    node_t *percent=element(doc,NULL,"span",NULL);
+    if(percent)doc_node_attr(doc,percent,"style","position:absolute;left:10px;top:10px;width:50%;height:10px");
+    if(percent)doc_node_move(doc,doc->body,percent,NULL);web_layout(doc,1000,600);
+    check(percent&&percent->box&&!percent->box->branch_mem&&percent->box->w==500,
+          "percentage-dependent branch retains initial-containing-block layout fallback");
+    if(percent)doc_node_remove(doc,percent);web_layout(doc,1000,600);
+    node_t *batch[32]={0};root_held=doc->root_box;extent_before=doc->doc_h;
+    for(unsigned i=0;i<32;i++){
+        batch[i]=element(doc,NULL,"span",NULL);
+        if(batch[i])doc_node_attr(doc,batch[i],"style","position:absolute;left:10px;top:10px;width:20px;height:10px");
+        if(batch[i])doc_node_move(doc,doc->body,batch[i],NULL);
+    }
+    web_layout(doc,1000,600);bool all_branches=true;
+    for(unsigned i=0;i<32;i++)all_branches&=batch[i]&&batch[i]->box&&batch[i]->box->branch_mem;
+    check(all_branches&&doc->root_box==root_held,"one large structural batch publishes independent arenas in DOM order");
+    node_t *replacement=element(doc,NULL,"span",NULL);
+    if(replacement)doc_node_attr(doc,replacement,"style","position:absolute;left:10px;top:10px;width:20px;height:10px");
+    if(batch[0])doc_node_remove(doc,batch[0]);
+    if(replacement)doc_node_move(doc,doc->body,replacement,NULL);web_layout(doc,1000,600);
+    check(replacement&&replacement->box&&replacement->box->branch_mem&&batch[0]&&!batch[0]->box&&doc->root_box==root_held,
+          "same flush removal and insertion joins one coherent topology transaction");
+    for(unsigned i=1;i<32;i++)if(batch[i])doc_node_remove(doc,batch[i]);
+    if(replacement)doc_node_remove(doc,replacement);web_layout(doc,1000,600);
+    bool all_removed=replacement&&!replacement->box;
+    for(unsigned i=0;i<32;i++)all_removed&=batch[i]&&!batch[i]->box;
+    check(all_removed&&doc->root_box==root_held&&doc->doc_h==extent_before,
+          "batched arena removal clears all node borrows and preserves sibling geometry");
+    node_t *positioned=id(doc,"positioned"),*position_first=id(doc,"position-first");
+    node_t *position_last=element(doc,positioned,"i",NULL);web_layout(doc,1000,600);
+    check(position_last&&position_last->style->width.px==17&&position_first->style->width.px==23,
+          "last and nth-last child dependencies update existing siblings");
+    if(position_last)doc_node_remove(doc,position_last);web_layout(doc,1000,600);
+    check(position_first->style->width.px==17,"removing last child restores previous positional sibling");
+    node_t *relative_parent=id(doc,"relative-parent"),*relative=id(doc,"relative");
+    node_t *tail=element(doc,NULL,"div","tail");
+    node_t *tail_flag=tail?element(doc,tail,"span","flag"):NULL;
+    if(tail)doc_node_move(doc,relative_parent,tail,NULL);web_layout(doc,1000,600);
+    check(tail_flag&&relative->style->height.kind==LK_LEN&&relative->style->height.px==47,
+          "new following child invalidates sibling has witness");
+    if(tail)doc_node_remove(doc,tail);web_layout(doc,1000,600);
+    check(relative->style->height.kind!=LK_LEN||relative->style->height.px!=47,
+          "removed following child clears sibling has witness");
+    node_t *logical=id(doc,"logical"),*logical_first=id(doc,"logical-first");
+    node_t *logical_last=element(doc,logical,"i",NULL);web_layout(doc,1000,600);
+    check(logical_last&&logical_first->style->color==0xffff0000u&&logical_last->style->color==0xff0000ffu,
+          "logical positional dependency retains stable outer subject keys");
     check(after->style->height.kind==LK_LEN&&after->style->height.px==31,"empty outer sibling starts matched");
     node_t *child=element(doc,empty,"span",NULL);web_layout(doc,1000,600);
     check(child&&after->style->height.px==37,"parent empty state updates its outer sibling after insertion");

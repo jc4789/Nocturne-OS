@@ -45,8 +45,22 @@ box = (root / "user/libc/web/box.c").read_text(encoding="utf-8")
 for signature in ("static int atomic_kind(", "bool box_pseudo_generated("):
     start = box.index(signature)
     production += box[start:box.index("\n}", start) + 2] + "\n"
+start = box.index("struct local_box_subject {")
+production += box[start:box.index("\n", start)+1]
+for signature in ("static bool local_plain_length(", "static bool local_plain_style(",
+                  "static bool local_plain_subtree(", "static struct local_box_subject *local_subject(",
+                  "static bool local_plain_parent("):
+    start = box.index(signature)
+    production += box[start:box.index("\n}", start) + 2] + "\n"
+dom = (root / "user/libc/web/dom.c").read_text(encoding="utf-8")
+for signature in ("node_t *doc_shadow_parent(", "node_t *doc_node_root("):
+    start = dom.index(signature)
+    production += dom[start:dom.index("\n}", start) + 2] + "\n"
+document = (root / "user/libc/web/doc.c").read_text(encoding="utf-8")
+start = document.index("static bool committed_geometry_current(")
+production += document[start:document.index("\n}", start) + 2] + "\n"
 native = out / "native.c"
-native.write_text(production + "\nbool web_native_checkpoint(web_doc *d){(void)d;return true;}\n" + cases,
+native.write_text(production + "\nbool web_native_checkpoint(web_doc *d){(void)d;return true;}\nvoid web_avmedia_checkpoint(void){}\n" + cases,
                   encoding="utf-8")
 cc = root / "tools/msys64/ucrt64/bin/clang.exe"
 abi = out / "host-abi"
@@ -63,4 +77,4 @@ command = [str(cc), "-std=gnu11", "-O1", "-ffunction-sections", "-fdata-sections
            "-Iuser/libc/web", "-Itests", "-Ithird_party/quickjs", str(native), "user/libc/web/cssprop.c",
            "user/libc/web/util.c", "user/libc/web/html.c", str(urls), "-o", str(exe)]
 subprocess.run(command, cwd=root, env=env, check=True)
-subprocess.run([str(exe)] + (["placeholder"] if "--placeholder" in sys.argv else ["text-overflow"] if "--text-overflow" in sys.argv else ["font-shorthand"] if "--font-shorthand" in sys.argv else ["flex"] if "--flex" in sys.argv else ["media-calc"] if "--media-calc" in sys.argv else ["fonts"] if "--fonts" in sys.argv else ["second"] if "--second" in sys.argv else []), cwd=root, env=env, check=True, timeout=30)
+subprocess.run([str(exe)] + (["local-boxes"] if "--local-boxes" in sys.argv else ["placeholder"] if "--placeholder" in sys.argv else ["text-overflow"] if "--text-overflow" in sys.argv else ["font-shorthand"] if "--font-shorthand" in sys.argv else ["flex"] if "--flex" in sys.argv else ["media-calc"] if "--media-calc" in sys.argv else ["fonts"] if "--fonts" in sys.argv else ["second"] if "--second" in sys.argv else []), cwd=root, env=env, check=True, timeout=30)

@@ -54,6 +54,8 @@ struct web_request {
     bool force_preflight; /* XHR upload listeners require CORS preflight even with safe headers. */
     bool redirect_error, same_origin;
     bool no_cors, no_referrer; /* Private Fetch policy, never author headers. */
+    const char *referrer; /* Private source URL; transport strips credentials/fragment. */
+    int referrer_policy;
     bool image_upgrade; /* Native ordinary-image destination, never imageset/Fetch/script. */
     bool keepalive; /* Buffered Fetch may outlive this document, not the browser process. */
     uint64_t fetch_group; /* Native per-environment identity; not supplied by page headers. */
@@ -314,6 +316,10 @@ int web_anchor_y(web_doc *d, const char *fragment); /* y of the element with tha
 /* form controls */
 void web_focus(web_doc *d, web_node *n); /* NULL: nothing focused */
 web_node *web_focused(web_doc *d);
+/* After an uncanceled native primary mousedown, resolve the click-focusable
+   area without changing the event target. false preserves focus (inactive,
+   detached, disabled or inert target); true with NULL selects the viewport. */
+bool web_pointer_focus_target(web_doc *d, web_node *target, web_node **area);
 bool web_node_inert(web_doc *d, web_node *n); /* native author/modal flat-tree inertness */
 bool web_modal_active(web_doc *d);
 const char *web_control_value(web_node *control);

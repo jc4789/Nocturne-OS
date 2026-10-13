@@ -18,19 +18,30 @@ prefix = r'''
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "errno.h"
 #include "webnet.h"
 #include "webnet_wire.h"
 #include "abi.h"
+#define WNOHANG 1 /* native syscall ABI flag; do not import native ssize_t into the Windows CRT */
 #define MIN(a,b) ((a)<(b)?(a):(b))
 #define MAX(a,b) ((a)>(b)?(a):(b))
 static struct n_cpuinfo test_cpu;
 static struct n_sysinfo test_memory;
 static bool fail_cpu, fail_memory;
+static int test_errno, wait_result, wait_error, waited_pid, wait_calls, wait_flags;
+static int poll_result, poll_events, poll_calls, poll_requested, closed_fds, killed_pid;
+int *__errno_location(void){return &test_errno;}
+int waitpid(int pid,int *status,int flags){(void)status;wait_calls++;waited_pid=pid;wait_flags=flags;test_errno=wait_error;return wait_result;}
+int poll(struct n_pollfd *fds,int count,int timeout){(void)timeout;poll_calls++;poll_requested=fds[0].events;
+    if(count!=1)abort();fds[0].revents=poll_events;return poll_result;}
+int close(int fd){(void)fd;closed_fds++;return 0;}
+int kill(int pid){killed_pid=pid;return 0;}
 int cpu_info(struct n_cpuinfo *info){*info=test_cpu;return fail_cpu?-1:0;}
 int sysinfo(struct n_sysinfo *info){*info=test_memory;return fail_memory?-1:0;}
 '''
 types = source[source.index("#define WORKERS"):source.index("static void request_free(")]
-signatures = ["static unsigned worker_budget(", "static bool origin_available(",
+signatures = ["static void slot_close(", "static bool slot_reap(", "static void slot_stop(",
+              "static void reap_paused_stream(", "static unsigned worker_budget(", "static bool origin_available(",
               "static unsigned live_workers(", "static struct request **available_class(",
               "static struct request *take_request("]
 extracted = types + "".join(function(s) for s in signatures)

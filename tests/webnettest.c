@@ -922,6 +922,59 @@ static void callback_cancel_test(void){
     check(drained&&callback_cancel_calls==1&&callback_cancel_borrow&&children()==0,
           "stream callback generation cancellation retains its borrowed response and reaps without reentry");
 }
+struct paused_stream_result {unsigned headers,chunks,ends;unsigned char *body;size_t length;bool failed;};
+static void paused_stream_received(webnet *n,uint64_t id,uint64_t generation,const struct webnet_response *response,void *opaque){
+    (void)generation;struct paused_stream_result *r=opaque;
+    if(response->error&&*response->error)r->failed=true;
+    if(response->event==WEBNET_UPLOAD){
+        /* The existing transport reports the bodyless request's 0/0 upload
+           before HEADERS. This test pauses received bodies, not that phase. */
+        if(r->headers || r->chunks || r->ends || response->uploaded)r->failed=true;
+        webnet_resume(n,id);
+    }else if(response->event==WEBNET_HEADERS){
+        if(r->headers++ || r->chunks || r->ends || response->status!=200)r->failed=true;
+    }else if(response->event==WEBNET_CHUNK){
+        if(r->headers!=1 || r->ends || response->body_len>SIZE_MAX-r->length-1){r->failed=true;return;}
+        unsigned char *body=realloc(r->body,r->length+response->body_len+1);
+        if(!body){r->failed=true;return;}r->body=body;
+        memcpy(body+r->length,response->body,response->body_len);r->length+=response->body_len;body[r->length]=0;r->chunks++;
+    }else if(response->event==WEBNET_END){if(r->headers!=1 || r->ends++)r->failed=true;}
+    else r->failed=true;
+}
+static void paused_stream_transport_test(void){
+    struct paused_stream_result results[6]={0};uint64_t ids[6]={0};
+    /* Use the existing immutable response. /api/json intentionally includes
+       an actual-request counter and cannot be compared byte-for-byte across
+       separate requests. Keep the full-byte comparison, not a JSON subset. */
+    char url[256];snprintf(url,sizeof url,"http://10.0.2.2:%d/index.html",ports[0]);
+    struct webnet_request q={.kind=WEBNET_FETCH,.generation=112,.url=url,.origin=document,
+        .method="GET",.credentials=WEBNET_CREDENTIALS_OMIT,.stream_response=true};
+    bool submitted=true;for(unsigned i=0;i<5;i++){ids[i]=webnet_submit(net,&q,paused_stream_received,&results[i]);submitted&=ids[i]!=0;}
+    uint64_t until=uptime_ms()+5000;unsigned headers=0;
+    do{webnet_pump(net,uptime_ms());headers=0;for(unsigned i=0;i<5;i++)headers+=results[i].headers;
+        if(headers==5&&!children())break;msleep(5);
+    }while(uptime_ms()<until);
+    check(submitted&&headers==5&&children()==0,"native paused response writers are reaped while their unread pipes remain owned");
+    bool unread=webnet_busy(net);for(unsigned i=0;i<5;i++)unread&=!results[i].chunks&&!results[i].ends&&!results[i].failed;
+    check(unread,"native transport retirement does not publish unread chunks or a fabricated END");
+    ids[5]=webnet_submit(net,&q,paused_stream_received,&results[5]);until=uptime_ms()+5000;
+    while(!results[5].headers&&uptime_ms()<until){webnet_pump(net,uptime_ms());msleep(5);}
+    check(ids[5]&&results[5].headers==1&&!results[5].failed,"sixth same-origin Fetch progresses while five response bodies remain paused");
+    until=uptime_ms()+5000;
+    while(webnet_busy(net)&&uptime_ms()<until){for(unsigned i=0;i<6;i++)if(ids[i])webnet_resume(net,ids[i]);webnet_pump(net,uptime_ms());msleep(5);}
+    bool drained=!webnet_busy(net)&&children()==0;
+    for(unsigned i=0;i<6;i++)drained&=results[i].headers==1&&results[i].chunks>0&&results[i].ends==1&&!results[i].failed;
+    check(drained,"native resume preserves ordered headers/chunks/END and reaps all transport owners");
+    static struct result reference;
+    uint64_t reference_id=request(&reference,0,"/index.html",WEBNET_FETCH,"GET",NULL,NULL,0,113);
+    bool exact=reference_id&&wait_result(&reference,5000)&&success(&reference);
+    for(unsigned i=0;i<6;i++)exact&=results[i].length==reference.length&&results[i].body&&reference.body&&
+        !memcmp(results[i].body,reference.body,results[i].length);
+    check(exact,"every byte of a native retained paused response survives transport reaping");
+    webnet_cancel_generation(net,112);webnet_cancel_generation(net,113);
+    for(unsigned i=0;i<6;i++)free(results[i].body);release(&reference);
+    check(!webnet_busy(net)&&children()==0,"native paused response teardown leaves no helper or request owner");
+}
 static volatile bool udp_wait_started;
 static int udp_wait_handle,udp_wait_result,udp_wait_errno;
 static void udp_wait_closed(void *unused) {
@@ -1027,7 +1080,7 @@ int main(int argc, char **argv) {
     snprintf(document, sizeof document, "http://10.0.2.2:%d/index.html", ports[0]);
     net = webnet_create();
     if (!net) { puts("FAIL webnet allocation"); return 1; }
-    if(boundaries){concurrency_tests();callback_cancel_test();}
+    if(boundaries){concurrency_tests();callback_cancel_test();paused_stream_transport_test();}
     else {http_tests(); debug_transport_tests(); body_presence_tests(); fetch_contract_tests(); cache_tests(); concurrency_tests(); cors_tests(); redirect_tests(); long_url_tests(); file_tests(); cookie_tests(); header_block_tests(); cors_boundary_regression_tests(); limit_tests();}
     webnet_free(net);
     printf("webnettest: %d failed\n", failed);

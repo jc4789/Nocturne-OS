@@ -984,6 +984,59 @@ static uint32_t control_text_color(const style_t *style, bool placeholder) {
     return style->placeholder ? with_alpha(style->placeholder->color, style->placeholder->opacity) : RGB(117, 117, 117);
 }
 
+static void control_line_text(struct pctx *P, const style_t *st, float x, float baseline,
+                              const char *text, size_t length, uint32_t color) {
+    if (!(color >> 24)) return;
+    size_t first = 0;
+    float offset = 0, stop = control_text_width(st,"\t",1);
+    for (size_t at = 0; at < length; at++) if (text[at] == '\t') {
+        draw_text(P, st, x + offset, baseline, text + first, (int)(at - first), color);
+        offset += style_text_width(st,text + first,at - first);
+        if (stop > 0) offset += stop - fmodf(fmaxf(0,offset),stop);
+        first = at + 1;
+    }
+    draw_text(P, st, x + offset, baseline, text + first, (int)(length - first), color);
+}
+struct control_line_paint {
+    struct pctx *P;
+    const style_t *style, *base;
+    const char *text;
+    size_t length, selection_start, selection_end;
+    float x, y, ascent, descent;
+    int caret;
+    uint32_t color;
+    bool selected, focused;
+};
+static void paint_control_line(const struct control_text_line *line, void *opaque) {
+    struct control_line_paint *p = opaque;
+    canvas_t *c = p->P->c;
+    float ly = p->y + line->top, lh = line->height;
+    if (!(lh > 0) || ly + lh < c->cy0 || ly > c->cy1) return;
+    const char *text = p->text + line->first;
+    size_t len = line->length, start = p->selection_start > line->first ? p->selection_start - line->first : 0,
+        end = p->selection_end > line->first ? p->selection_end - line->first : 0;
+    if (start > len) start = len;
+    if (end > len) end = len;
+    float left = p->x + control_text_width(p->style, text, start), right = p->x + control_text_width(p->style, text, end);
+    bool selected = p->selected && p->selection_start <= line->first + len && p->selection_end > line->first;
+    if (selected && line->hard_break && p->selection_end > line->first + len) right += control_text_width(p->style, " ", 1);
+    float baseline = ly + (lh - p->ascent - p->descent) / 2 + p->ascent;
+    if (selected) gfx_fill(c, (int)floorf(left), (int)ly, (int)ceilf(right-left), (int)ceilf(lh), RGB(0,117,255));
+    control_line_text(p->P, p->style, p->x, baseline, text, len, p->color);
+    if (selected) {
+        int cx0=c->cx0,cy0=c->cy0,cx1=c->cx1,cy1=c->cy1;
+        gfx_clip(c,(int)floorf(left),(int)ly,(int)ceilf(right-left),(int)ceilf(lh));
+        control_line_text(p->P,p->base,p->x,baseline,text,len,RGB(255,255,255));
+        c->cx0=cx0;c->cy0=cy0;c->cx1=cx1;c->cy1=cy1;
+    }
+    if (p->focused && !p->selected && p->caret >= 0 && (size_t)p->caret >= line->first &&
+        (size_t)p->caret <= line->first + len &&
+        ((size_t)p->caret < line->first + len || line->hard_break || line->next == p->length)) {
+        float cx = p->x + control_text_width(p->style,text,(size_t)p->caret-line->first);
+        gfx_fill(c,(int)cx,(int)ly+2,1,(int)fmaxf(1,lh-4),p->base->color);
+    }
+}
+
 static void paint_control(struct pctx *P, box_t *b, float x, float y) {
     /* x, y: content box on the canvas */
     canvas_t *c = P->c;
@@ -1006,7 +1059,7 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
         const char *t = node_attr(n, "type");
         bool pw = t && str_ieq(t, "password") && !placeholder;
         uint32_t col = control_text_color(st, placeholder);
-        if (placeholder && !(col >> 24)) v = ""; /* keep editing/caret geometry, avoid invisible glyph work */
+        if (placeholder && !(col >> 24) && b->atomic == AT_INPUT) v = "";
         size_t selection_start = !placeholder ? doc_utf16_to_byte(v, n->selection_start, false) : 0;
         size_t selection_end = !placeholder ? doc_utf16_to_byte(v, n->selection_end, true) : 0;
         bool selected = focused && !placeholder && n->selection_start != n->selection_end;
@@ -1045,41 +1098,13 @@ static void paint_control(struct pctx *P, box_t *b, float x, float y) {
             caret_x = x - scroll + caret_w;
             sb_free(&s);
         } else {
-            wfont ff = f;
-            float asc, desc;
-            wf_metrics(&ff, &asc, &desc);
-            float lh = text_style->font_size * 1.2f;
-            float ly = y;
-            const char *p = v;
-            int caret = focused ? P->d->caret : -1;
-            float cx_ = x, cy_ = y;
-            for (;;) {
-                const char *e = strchr(p, '\n');
-                size_t len = e ? (size_t)(e - p) : strlen(p);
-                size_t offset = (size_t)(p - v), start = selection_start > offset ? selection_start - offset : 0;
-                size_t end = selection_end > offset ? selection_end - offset : 0;
-                if (start > len) start = len;
-                if (end > len) end = len;
-                float left = x + wf_width(&ff, p, start), right = x + wf_width(&ff, p, end);
-                bool line_selected = selected && selection_start <= offset + len && selection_end > offset;
-                if (line_selected && e && selection_end > offset + len) right += wf_width(&ff, " ", 1);
-                if (line_selected) gfx_fill(c, (int)floorf(left), (int)ly, (int)ceilf(right - left), (int)ceilf(lh), RGB(0, 117, 255));
-                draw_text(P, text_style, x, ly + (lh - asc - desc) / 2 + asc, p, (int)len, col);
-                if (line_selected) {
-                    int cx0 = c->cx0, cy0 = c->cy0, cx1 = c->cx1, cy1 = c->cy1;
-                    gfx_clip(c, (int)floorf(left), (int)ly, (int)ceilf(right - left), (int)ceilf(lh));
-                    draw_text(P, st, x, ly + (lh - asc - desc) / 2 + asc, p, (int)len, RGB(255, 255, 255));
-                    c->cx0 = cx0; c->cy0 = cy0; c->cx1 = cx1; c->cy1 = cy1;
-                }
-                if (caret >= p - v && caret <= (int)(p - v + (long)len)) {
-                    cx_ = x + wf_width(&ff, p, (size_t)(caret - (p - v)));
-                    cy_ = ly;
-                }
-                ly += lh;
-                if (!e) break;
-                p = e + 1;
-            }
-            if (focused && !selected) gfx_fill(c, (int)cx_, (int)cy_ + 2, 1, (int)lh - 4, st->color);
+            struct control_line_paint lines = {.P=P,.style=text_style,.base=st,.text=v,.length=strlen(v),
+                .selection_start=selection_start,.selection_end=selection_end,.x=x,.y=y,
+                .caret=focused?P->d->caret:-1,.color=col,.selected=selected,.focused=focused};
+            wf_metrics(&f,&lines.ascent,&lines.descent);
+            if (box_element_scrollable(b)) { lines.x-=(float)n->scroll_x; lines.y-=(float)n->scroll_y; }
+            float text_width, text_height;
+            if (!control_text_lines(b,text_style,v,paint_control_line,&lines,&text_width,&text_height)) P->failed=true;
         }
         if (focused && !selected && b->atomic == AT_INPUT) gfx_fill(c, (int)caret_x, (int)y + 1, 1, (int)h - 2, st->color);
         c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;

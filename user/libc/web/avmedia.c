@@ -1286,6 +1286,11 @@ void web_avmedia_service(uint64_t now){
         }
         s=s->next?s->next:streams;if(s==first)break;
     }
+    /* Count the supply interval from completion. A nonblocking wire copy or
+       committed video patch may itself consume the interval; dating it from
+       start then lets every following native-layout safepoint pump again and
+       starves the caller despite each individual pump having a budget. */
+    service_at=uptime_ms();
     service_running=false;
 }
 void web_avmedia_checkpoint(void){

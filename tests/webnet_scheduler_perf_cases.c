@@ -76,7 +76,56 @@ static void test_initial_origin_and_fifo_bypass(void){
     struct request opaque=request(2,4,NULL);
     check(origin_available(&n,&opaque),"opaque or local request bookkeeping is not URL admission policy");
 }
+static void test_reap_predicate(void){
+    static const int returned[]={0,-1,-1,999,71,-1};
+    static const int errors[]={0,EINTR,EIO,0,0,ECHILD};
+    for(unsigned i=0;i<sizeof returned/sizeof *returned;i++){
+        struct request r={.paused=true,.streaming=true};struct slot s={.pid=71,.in=4,.out=5,.rq=&r};
+        wait_result=returned[i];wait_error=errors[i];wait_calls=0;
+        bool reaped=slot_reap(&s),expected=i>=4;
+        check(reaped==expected&&s.pid==(expected?0:71),"only owned PID or ECHILD proves transport retirement");
+        check(wait_calls==1&&waited_pid==71&&wait_flags==WNOHANG&&s.rq==&r&&s.in==4&&s.out==5,
+              "reap is nonblocking and retains owned unread response descriptors");
+    }
+    struct slot retired={0};wait_calls=0;
+    check(slot_reap(&retired)&&!wait_calls,"already retired transport is not waited or reused");
+}
+static void test_paused_reap_and_admission(void){
+    webnet n={.worker_limit=16};struct slot held[5];struct request responses[5];
+    unsigned char unread[]={1,2,3,4};
+    for(unsigned i=0;i<5;i++){
+        responses[i]=request(3,i+10,"paused-origin");responses[i].paused=responses[i].streaming=true;
+        responses[i].rx=unread;responses[i].rx_len=sizeof unread;responses[i].rx_pos=2;responses[i].head_pos=3;
+        held[i]=(struct slot){.rq=&responses[i],.pid=(int)i+80,.in=-1,.out=(int)i+20,.next=i+1<5?&held[i+1]:NULL};
+    }
+    n.parked=held;struct request next=request(3,1,"paused-origin");queue(&n,&next);
+    check(!origin_available(&n,&next)&&!take_request(&n,1),"five genuinely live paused transports retain origin backpressure");
+    poll_result=0;poll_events=0;poll_calls=wait_calls=closed_fds=killed_pid=0;
+    reap_paused_stream(&held[0]);
+    check(poll_calls==1&&!poll_requested&&!wait_calls&&held[0].pid==80,"open paused pipe is only polled for hangup, not drained or waited");
+    poll_result=1;poll_events=N_POLLHUP|N_POLLIN;wait_result=80;wait_error=0;
+    struct request before=responses[0];reap_paused_stream(&held[0]);
+    check(!held[0].pid&&held[0].out==20&&held[0].in==-1&&held[0].rq==&responses[0]&&!closed_fds&&!killed_pid,
+          "closed writer releases live transport but preserves its unread dynamic pipe");
+    check(!memcmp(&before,&responses[0],sizeof before)&&!memcmp(unread,(unsigned char[]){1,2,3,4},4),
+          "reaping does not consume partial frame, change pause, or publish callback/END");
+    check(live_workers(&n)==4&&origin_available(&n,&next)&&take_request(&n,1)==&next,
+          "retired paused response no longer permanently starves same-origin Fetch admission");
+    wait_calls=0;reap_paused_stream(&held[0]);
+    check(!wait_calls,"retained response never waits a recycled transport PID");
+    slot_stop(&held[0],NULL);
+    check(responses[0].finishing&&held[0].out==-1&&!killed_pid,"later cancellation closes retained pipe without killing retired PID");
+    struct request inactive={.streaming=true,.paused=false};struct slot active={.pid=88,.out=8,.rq=&inactive};
+    poll_calls=0;reap_paused_stream(&active);inactive.paused=true;inactive.finishing=true;reap_paused_stream(&active);
+    inactive.finishing=false;inactive.streaming=false;reap_paused_stream(&active);
+    check(!poll_calls&&active.pid==88,"paused reap cannot replace active receive or finishing validation");
+    inactive.streaming=true;poll_result=-1;poll_events=0;killed_pid=0;
+    reap_paused_stream(&active);
+    check(inactive.finishing&&strstr(inactive.error,"Worker poll failed")&&killed_pid==88,
+          "invalid pipe follows existing failed-worker cancellation, never fabricated success");
+}
 int main(void){
     test_budget_values();test_shrink_live_slots();test_parked_total_and_reservation();test_mixed_single_worker_fifo();test_initial_origin_and_fifo_bypass();
+    test_reap_predicate();test_paused_reap_and_admission();
     printf("webnet-scheduler-perf: %u checks, %u failures\n",checks,failures);return failures!=0;
 }

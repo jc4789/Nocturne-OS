@@ -489,6 +489,7 @@ static void scroll_to(int y) { scroll_to_xy(scroll_x,y); }
 /* Native presentation changes only: no author callback or forced layout while
    a script/native wait is active. Residual input chains to the viewport. */
 static void scroll_input(web_node *target,int dx,int dy,int edge){
+    int old_x=scroll_x,old_y=scroll_y,input_dx=dx,input_dy=dy;
     bool handled=doc&&web_scroll_input(doc,target,&dx,&dy,edge);
     if(edge){if(!handled)scroll_to(edge<0?0:max_scroll());}
     else if(dx||dy){
@@ -496,6 +497,8 @@ static void scroll_input(web_node *target,int dx,int dy,int edge){
         scroll_to_xy((int)MAX((int64_t)0,MIN(x,(int64_t)max_scroll_x())),
                      (int)MAX((int64_t)0,MIN(y,(int64_t)max_scroll())));
     }
+    if(debug_js)fprintf(stderr,"[web-input:scroll] input=%d,%d edge=%d handled=%d residual=%d,%d viewport=%d,%d->%d,%d max=%d,%d layout=%d\n",
+        input_dx,input_dy,edge,handled,dx,dy,old_x,old_y,scroll_x,scroll_y,max_scroll_x(),max_scroll(),need_layout);
 }
 static web_node *key_scroll_target(void){
     web_node *target=doc?web_focused(doc):NULL;
@@ -1012,6 +1015,7 @@ static bool host_request(void *opaque, const struct web_request *request) {
         .credentials = request->credentials, .force_preflight = request->force_preflight,
         .redirect_error = request->redirect_error, .same_origin = request->same_origin,
         .no_cors = request->no_cors, .no_referrer = request->no_referrer,
+        .referrer=request->referrer,.referrer_policy=request->referrer_policy,
         .image_upgrade = request->kind == WEB_RESOURCE_IMAGE && request->image_upgrade,
         .cache_mode = request->cache_mode, .keepalive = request->keepalive,
         .fetch_group = request->fetch_group
@@ -1859,6 +1863,7 @@ static web_node *native_capture_target(const struct gui_event *e) {
 static void page_focus(web_node *node) {
     if (!doc) return;
     web_node *old = web_focused(doc);
+    if (node && old == node) return;
     web_focus(doc,node);
     node=web_focused(doc);
     if (old == node) return;
@@ -2265,7 +2270,7 @@ static void page_click(web_node *target, int x, int y, bool keyboard) {
     bool allowed = dispatch_native_mode("click", target, &native, true, keyboard);
     bool input_events = web_control_activation_end(doc, &activation, allowed);
     if (!allowed) { flush_dom_layout(); return; }
-    if (!anchor && web_media_activate(doc,target)) { page_focus(target); flush_dom_layout(); return; }
+    if (!anchor && web_media_activate(doc,target)) { flush_dom_layout(); return; }
     web_node *label_control = anchor ? NULL : web_label_activation(target);
     if (label_control) { page_focus(label_control); page_click(label_control, x, y, keyboard); return; }
     struct web_hit hit = {0};
@@ -2286,14 +2291,12 @@ static void page_click(web_node *target, int x, int y, bool keyboard) {
                 set_status("A remote page cannot open a local file");
                 return;
             }
-            page_focus(NULL);
             if (!web_frame_navigate(doc, anchor, hit.href)) queue_navigation(hit.href, NULL, NAV_PUSH);
         }
         return;
     case WEB_HIT_TEXT_INPUT:
-    case WEB_HIT_TEXTAREA: page_focus(hit.node); break;
+    case WEB_HIT_TEXTAREA: break; /* focusing belongs to the preceding mousedown */
     case WEB_HIT_FILE:
-        page_focus(hit.node);
         if (web_input_choose_files(doc, hit.node)) {
             dispatch_native("input", hit.node, &native, false);
             dispatch_native("change", hit.node, &native, false);
@@ -2303,18 +2306,16 @@ static void page_click(web_node *target, int x, int y, bool keyboard) {
         break;
     case WEB_HIT_CHECKBOX:
     case WEB_HIT_RADIO:
-        if (!keyboard) page_focus(hit.node);
         if (input_events) { dispatch_native("input", hit.node, &native, false); dispatch_native("change", hit.node, &native, false); }
         break;
     case WEB_HIT_SUBMIT: submit(hit.node); return;
     case WEB_HIT_BUTTON: web_reset(doc,hit.node); flush_dom_layout(); break;
     case WEB_HIT_DETAILS:
-        page_focus(web_disclosure_focus(hit.node)); web_toggle(doc,hit.node); flush_dom_layout(); break;
+        web_toggle(doc,hit.node); flush_dom_layout(); break;
     case WEB_HIT_SELECT:
-        page_focus(NULL);
         open_select(hit.node);
         break;
-    default: page_focus(NULL); break;
+    default: break;
     }
 }
 
@@ -2395,7 +2396,13 @@ static void mouse_down(const struct gui_event *e) {
         pressed_node = web_node_at(doc, document_x(x), y - TB + scroll_y);
         web_active_press(doc,pressed_node);
         web_frame_address_select(doc, pressed_node); need_paint = true;
-        dispatch_native("mousedown", pressed_node, e, true);
+        /* Dispatch may cancel the compatibility mouse event, remove the
+           control or change its frame. Resolve the current focus area after
+           it, before mouseup/click handlers observe activeElement. */
+        if (dispatch_native("mousedown", pressed_node, e, true)) {
+            web_node *area = NULL;
+            if (web_pointer_focus_target(doc, pressed_node, &area)) page_focus(area);
+        }
     }
 }
 
