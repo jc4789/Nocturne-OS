@@ -715,13 +715,13 @@ static void draw_menu(canvas_t *c) {
     gfx_fill_round(c, m.x + 1, m.y + 1, m.w - 2, m.h - 2, 9, RGB(22, 20, 44));
     /* header */
     if (canvas_hits(c, m.x, m.y, m.w, MENU_HEAD)) {
-    for (int j = 0; j < MENU_HEAD - 6; j++) {
-        int in = corner_inset(j, 9);
-        gfx_hline(c, m.x + 1 + in, m.y + 1 + j, m.w - 2 - 2 * in,
-                  gfx_mix(RGB(64, 44, 130), RGB(30, 26, 70), j * 255 / (MENU_HEAD - 6)));
-    }
-    draw_crescent(c, m.x + 30, m.y + 26, 13, RGB(246, 236, 196));
-    gfx_text(c, m.x + 54, m.y + 10, OS_NAME, RGB(255, 255, 255), TRANSPARENT, FONT_LARGE);
+        for (int j = 0; j < MENU_HEAD - 6; j++) {
+            int in = corner_inset(j, 9);
+            gfx_hline(c, m.x + 1 + in, m.y + 1 + j, m.w - 2 - 2 * in,
+                      gfx_mix(RGB(64, 44, 130), RGB(30, 26, 70), j * 255 / (MENU_HEAD - 6)));
+        }
+        draw_crescent(c, m.x + 30, m.y + 26, 13, RGB(246, 236, 196));
+        gfx_text(c, m.x + 54, m.y + 10, OS_NAME, RGB(255, 255, 255), TRANSPARENT, FONT_LARGE);
     }
     for (int i = 0; i < NAPPS; i++) {
         int ix, iy;
@@ -871,10 +871,10 @@ static void draw_taskbar(canvas_t *c) {
     gfx_hline(c, 0, y, sw, RGB(90, 76, 160));
     /* start button */
     if (canvas_hits(c, 0, y, TB_START_W, TASKBAR_H)) {
-    uint32_t sb = menu_open ? RGB(84, 68, 170) : RGB(44, 38, 90);
-    gfx_fill_round(c, 6, y + 5, TB_START_W - 6, TASKBAR_H - 10, 8, sb);
-    draw_crescent(c, 24, y + TASKBAR_H / 2, 9, RGB(246, 236, 196));
-    gfx_text(c, 42, y + 12, OS_NAME, RGB(240, 240, 255), TRANSPARENT, FONT_SMALL);
+        uint32_t sb = menu_open ? RGB(84, 68, 170) : RGB(44, 38, 90);
+        gfx_fill_round(c, 6, y + 5, TB_START_W - 6, TASKBAR_H - 10, 8, sb);
+        draw_crescent(c, 24, y + TASKBAR_H / 2, 9, RGB(246, 236, 196));
+        gfx_text(c, 42, y + 12, OS_NAME, RGB(240, 240, 255), TRANSPARENT, FONT_SMALL);
     }
 
     struct window *list[MAX_WIN];
@@ -2442,7 +2442,6 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         uint32_t *ouser = w->user_buf;
         size_t opages = w->pages;
         int ocw = w->cw, och = w->ch;
-        bool was_mapped = w->uaddr != 0;
         bool was_pending = w->pending_index >= 0;
         if (!alloc_buffer(w, ncw, nch)) {
             w->buf = obuf;
@@ -2455,13 +2454,11 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
             memcpy(&w->user_buf[y * ncw], &ouser[y * ocw], MIN(ocw, ncw) * 4);
         }
         /* unmap the old buffer from the owner */
-        if (was_mapped) {
+        if (w->uaddr)
             for (size_t i = 0; i < opages; i++) vmm_unmap_page(w->pml4, w->uaddr + i * PAGE_SIZE);
-            if (w->second_uaddr)
-                for (size_t i = 0; i < opages; i++) vmm_unmap_page(w->pml4, w->second_uaddr + i * PAGE_SIZE);
-            w->uaddr = 0;
-            w->second_uaddr = 0;
-        }
+        if (w->second_uaddr)
+            for (size_t i = 0; i < opages; i++) vmm_unmap_page(w->pml4, w->second_uaddr + i * PAGE_SIZE);
+        w->uaddr = w->second_uaddr = 0;
         if (was_pending) pending_frames--;
         wq_wake_all(&w->wq);
         vfree(obuf, opages);

@@ -50,6 +50,34 @@ int main(int argc,char **argv) {
             goto done;
         }
     }
+    /* The library reallocates both mappings on EV_RESIZE and must not hand
+       the caller a batched release belonging to the retired surfaces. */
+    for (unsigned restored=0;restored<2;restored++) {
+        if (win_fullscreen(win,!restored)<0) goto done;
+        struct gui_event event;
+        do {
+            if (win_event(win,&event,-1)<=0 || event.type==EV_CLOSE) goto done;
+        } while (event.type!=EV_RESIZE);
+        if (win_begin_frame(win)<0) goto done;
+        unsigned submitted=win->buffer_index;
+        uint32_t color=restored?RGB(24,96,180):RGB(180,96,24);
+        gfx_fill(&win->c,0,0,win->w,win->h,color);
+        win_update(win);
+        if (!wait_frame(win,submitted) || screen_grab(screen,(size_t)gw*gh*sizeof *screen,&gw,&gh)<0) goto done;
+        int x=restored?sw/4+1+win->w/3:gw/3;
+        int y=restored?sh/4+28+win->h/3:gh/3;
+        if (screen[(size_t)y*gw+x]!=color) goto done;
+    }
+    printf("wmframetest: PASS fullscreen-resize-restore mappings=both\n");
+    /* MAP index one is legal before index zero: its alias must also retire
+       when resize allocates replacement surfaces. */
+    long fd=__syscall(SYS_WIN_CREATE,sw/4,sh/4,(long)"副バッファ先行割当",WIN_DOUBLE_BUFFER|WIN_NO_DECOR,0);
+    if (fd<0) goto done;
+    long second=__syscall(SYS_WIN_MAP,fd,1,0,0,0);
+    long resized=second>0?__syscall(SYS_WIN_RESIZE,fd,sw/3,sh/3,0,0):-1;
+    close((int)fd);
+    if (resized<0) goto done;
+    printf("wmframetest: PASS second-only-map resize destroy\n");
     printf("wmframetest: PASS frames=%lu elapsed_ms=%lu indexed-copy-free=1 releases=checked other-buffer=isolated screen-grab=correct\n",frames,(unsigned long)(uptime_ms()-start));
     printf("wmframetest: READY visual hold_ms=%lu\n",hold);
     msleep(hold);

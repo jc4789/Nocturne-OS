@@ -122,6 +122,12 @@ int win_event(window_t *win, struct gui_event *e, int timeout_ms) {
             win->buffer_index = 0;
             win->frame_acquired = true;
             if (win->flags & WIN_DOUBLE_BUFFER) {
+                /* fetch may have batched a completion for the OLD surfaces
+                   behind this resize. Preserve input, discard stale releases. */
+                int kept = win->qi;
+                for (int i = win->qi; i < win->qn; i++)
+                    if (win->q[i].type != EV_FRAME) win->q[kept++] = win->q[i];
+                win->qn = kept;
                 long other = __syscall(SYS_WIN_MAP, win->fd, 1, 0, 0, 0);
                 if (other < 0 && other > -4096) { win->closed = true; return -1; }
                 win->buffers[1] = (uint32_t *)other;
