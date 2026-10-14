@@ -133,6 +133,9 @@ typedef struct window {
     struct gui_event q[32];
     int qn, qi;
     bool closed;
+    uint32_t *buffers[WIN_BUFFER_COUNT];
+    unsigned buffer_index;
+    bool frame_acquired;
 } window_t;
 
 bool gui_available(void);
@@ -141,6 +144,10 @@ window_t *win_open(int w, int h, const char *title, int flags);
 void win_close(window_t *win);
 void win_update(window_t *win);
 void win_update_rect(window_t *win, int x, int y, int w, int h);
+/* WIN_DOUBLE_BUFFER only: acquire a writable canvas before drawing a complete
+   frame. No retained/partial drawing across submissions; update invalidates c.
+   Returns zero or a negative error. Completion is also reported as EV_FRAME. */
+int win_begin_frame(window_t *win);
 void win_set_title(window_t *win, const char *title);
 void win_move(window_t *win, int x, int y);
 int win_state(window_t *win); /* WIN_STATE_* bitmask, negative on failure */

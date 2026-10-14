@@ -290,11 +290,14 @@ def main():
         config = (ROOT / 'boot/limine.conf').read_text(encoding='utf-8')
         needle = '    path: boot():/boot/kernel.elf'
         first_entry = config.split('\n/')[1].split('\n/')[0] if '\n/' in config else ''
-        if needle not in first_entry or 'cmdline:' in first_entry:
+        if needle not in first_entry:
             raise RuntimeError('予期しないLimine構成です')
         updated = first_entry
         if a.cmdline:
-            updated = updated.replace(needle, needle+'\n    cmdline: '+a.cmdline, 1)
+            if re.search(r'(?m)^    cmdline: ', updated):
+                updated = re.sub(r'(?m)^(    cmdline: [^\n]*)$', lambda m: m[1]+' '+a.cmdline, updated, count=1)
+            else:
+                updated = updated.replace(needle, needle+'\n    cmdline: '+a.cmdline, 1)
         if a.resolution:
             updated, replacements = re.subn(r'(?m)^    resolution: [^\n]+$', '    resolution: '+a.resolution, updated)
             if replacements != 1:

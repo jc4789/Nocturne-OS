@@ -30,6 +30,7 @@ void power_off(void);
 void power_reboot(void);
 
 #define TITLE_H   28
+#define TITLE_RADIUS 8 /* existing rounded title geometry; shared by shadow culling */
 #define BORDER    1
 #define TASKBAR_H 40
 #define SHADOW    10
@@ -48,9 +49,13 @@ struct window {
     int x, y;   /* outer frame position */
     int cw, ch; /* client size */
     uint32_t *buf;
-    uint32_t *user_buf; /* mapped producer pixels; compositor reads buf snapshot only */
+    uint32_t *user_buf; /* legacy producer, or second indexed full-frame surface */
     size_t pages;
     uint64_t uaddr;
+    uint64_t second_uaddr;
+    int front_index, pending_index;
+    bool frame_ready;
+    struct gui_event frame_event; /* durable mailbox, not a droppable input event */
     int flags;
     bool shown, minimized, maximized, dead,fullscreen;
     struct rect restore;
@@ -67,6 +72,10 @@ static bool running;
 static int sw, sh;
 static canvas_t back, wall;
 static struct wait_queue wm_wq;
+static unsigned pending_frames;
+static uint64_t frame_period_ms, frame_started_ms;
+static bool presenting_back;
+static struct wait_queue present_wait;
 
 /* BSP kernel continuations can be timer-preempted too. Serialize borrowed
    window/frame state without masking interrupts during allocation or copies.
@@ -162,6 +171,10 @@ static bool in_rect(int x, int y, int rx, int ry, int rw, int rh) {
     return x >= rx && y >= ry && x < rx + rw && y < ry + rh;
 }
 
+static bool canvas_hits(const canvas_t *c, int x, int y, int w, int h) {
+    return x < c->cx1 && y < c->cy1 && (int64_t)x + w > c->cx0 && (int64_t)y + h > c->cy0;
+}
+
 static void damage_rect(int x, int y, int w, int h) {
     struct rect r = {x, y, w, h};
     if (!rect_clip(&r)) return;
@@ -249,6 +262,13 @@ static bool in_resize_grip(struct window *w, int x, int y) {
 static void push_event(struct window *w, const struct gui_event *e) {
     uint64_t flags = irq_save();
     if (!w || w->dead) { irq_restore(flags); return; }
+    if (e->type == EV_FRAME) {
+        w->frame_event = *e;
+        w->frame_ready = true;
+        wq_wake_all(&w->wq);
+        poll_notify();
+        irq_restore(flags); return;
+    }
     if (e->type == EV_MOUSE_MOVE && w->ev_count) {
         int last = (w->ev_head + EVQ - 1) % EVQ;
         if (w->ev[last].type == EV_MOUSE_MOVE) {
@@ -341,13 +361,18 @@ static void minimize_window(struct window *w) {
 
 /* ---- window lifetime ---- */
 static void unmap_user(struct window *w) {
-    if (!w->uaddr || !w->pml4) return;
-    for (size_t i = 0; i < w->pages; i++) vmm_unmap_page(w->pml4, w->uaddr + i * PAGE_SIZE);
+    if (!w->pml4) return;
+    if (w->uaddr)
+        for (size_t i = 0; i < w->pages; i++) vmm_unmap_page(w->pml4, w->uaddr + i * PAGE_SIZE);
+    if (w->second_uaddr)
+        for (size_t i = 0; i < w->pages; i++) vmm_unmap_page(w->pml4, w->second_uaddr + i * PAGE_SIZE);
     w->uaddr = 0;
+    w->second_uaddr = 0;
 }
 
 static void win_destroy_locked(struct window *w) {
     if (w->dead) return;
+    if (w->pending_index >= 0) { pending_frames--; w->pending_index = -1; }
     if(focus_owner==w)focus_owner=NULL;
     if (w->shown) damage_window(w);
     damage_taskbar(); /* its button goes away even when focus does not change */
@@ -388,13 +413,17 @@ static int64_t win_read(struct vnode *v, struct file *f, void *buf, uint64_t off
     if (max == 0) return -EINVAL;
     for (;;) {
         uint64_t fl = irq_save();
-        if (w->ev_count) {
+        if (w->ev_count || w->frame_ready) {
             struct gui_event *out = buf;
             size_t got = 0;
             while (got < max && w->ev_count) {
                 out[got++] = w->ev[w->ev_tail];
                 w->ev_tail = (w->ev_tail + 1) % EVQ;
                 w->ev_count--;
+            }
+            if (got < max && w->frame_ready) {
+                out[got++] = w->frame_event;
+                w->frame_ready = false;
             }
             irq_restore(fl);
             return got * sizeof(struct gui_event);
@@ -418,7 +447,7 @@ static int64_t win_read(struct vnode *v, struct file *f, void *buf, uint64_t off
 
 static bool win_can_read(struct vnode *v, struct file *f) {
     struct window *w = v->priv;
-    return w->ev_count > 0 || w->dead;
+    return w->ev_count > 0 || w->frame_ready || w->dead;
 }
 
 static void win_close(struct vnode *v, struct file *f) { win_destroy(v->priv); }
@@ -442,10 +471,12 @@ static bool alloc_buffer(struct window *w, int cw, int ch) {
     w->pages = pages;
     w->cw = cw;
     w->ch = ch;
+    w->front_index = w->pending_index = -1;
+    w->frame_ready = false;
     return true;
 }
 
-static uint64_t map_user(struct window *w, struct task *t) {
+static uint64_t map_user(struct window *w, struct task *t, unsigned index) {
     uint64_t flags = irq_save();
     uint64_t va = t->mmap_next;
     uint64_t bytes = (w->pages + 1) * PAGE_SIZE;
@@ -456,13 +487,15 @@ static uint64_t map_user(struct window *w, struct task *t) {
     t->mmap_next = va + bytes; /* reserve before an IRQ-enabled page loop */
     irq_restore(flags);
     for (size_t i = 0; i < w->pages; i++) {
-        uint64_t pa = vmm_translate(kernel_pml4, (uint64_t)w->user_buf + i * PAGE_SIZE);
+        uint32_t *pixels = w->flags & WIN_DOUBLE_BUFFER ? (index ? w->user_buf : w->buf) : w->user_buf;
+        uint64_t pa = vmm_translate(kernel_pml4, (uint64_t)pixels + i * PAGE_SIZE);
         if (!vmm_map_page(t->pml4, va + i * PAGE_SIZE, pa, PTE_P | PTE_W | PTE_U | PTE_SHARED | pte_nx)) {
             while (i) vmm_unmap_page(t->pml4, va + --i * PAGE_SIZE);
             return 0;
         }
     }
-    w->uaddr = va;
+    if (index) w->second_uaddr = va;
+    else w->uaddr = va;
     w->pml4 = t->pml4;
     return va;
 }
@@ -501,6 +534,7 @@ static void draw_crescent(canvas_t *c, int cx, int cy, int r, uint32_t col) {
 }
 
 static void text_trunc(canvas_t *c, int x, int y, const char *s, int maxw, uint32_t col) {
+    if (!canvas_hits(c, x, y, maxw, gfx_font_h(FONT_SMALL))) return;
     char tmp[96];
     if (maxw <= 0) return;
     int i = 0, width = 0;
@@ -675,10 +709,12 @@ static void draw_shadow(canvas_t *c, int x, int y, int w, int h) {
 
 static void draw_menu(canvas_t *c) {
     struct rect m = menu_rect();
+    if (!canvas_hits(c, m.x-SHADOW, m.y-SHADOW, m.w+2*SHADOW, m.h+2*SHADOW)) return;
     draw_shadow(c, m.x, m.y, m.w, m.h);
     gfx_fill_round(c, m.x, m.y, m.w, m.h, 10, RGB(70, 60, 120));
     gfx_fill_round(c, m.x + 1, m.y + 1, m.w - 2, m.h - 2, 9, RGB(22, 20, 44));
     /* header */
+    if (canvas_hits(c, m.x, m.y, m.w, MENU_HEAD)) {
     for (int j = 0; j < MENU_HEAD - 6; j++) {
         int in = corner_inset(j, 9);
         gfx_hline(c, m.x + 1 + in, m.y + 1 + j, m.w - 2 - 2 * in,
@@ -686,9 +722,12 @@ static void draw_menu(canvas_t *c) {
     }
     draw_crescent(c, m.x + 30, m.y + 26, 13, RGB(246, 236, 196));
     gfx_text(c, m.x + 54, m.y + 10, OS_NAME, RGB(255, 255, 255), TRANSPARENT, FONT_LARGE);
+    }
     for (int i = 0; i < NAPPS; i++) {
         int ix, iy;
         menu_item_pos(i, &ix, &iy);
+        /* Include the separator row above this item. */
+        if (!canvas_hits(c, ix, iy-1, MENU_W, MENU_ITEM_H+1)) continue;
         if (i == NAPPS - 2 && iy > m.y + MENU_HEAD) gfx_hline(c, ix + 12, iy - 1, MENU_W - 24, RGB(60, 56, 100));
         if (i == menu_sel) gfx_fill_round(c, ix + 6, iy + 1, MENU_W - 12, MENU_ITEM_H - 2, 6, RGB(76, 64, 150));
         desktop_draw_icon(c, ix + 12, iy + 2, apps[i].icon);
@@ -831,10 +870,12 @@ static void draw_taskbar(canvas_t *c) {
     gfx_fill_blend(c, 0, y, sw, TASKBAR_H, ARGB(220, 14, 12, 32));
     gfx_hline(c, 0, y, sw, RGB(90, 76, 160));
     /* start button */
+    if (canvas_hits(c, 0, y, TB_START_W, TASKBAR_H)) {
     uint32_t sb = menu_open ? RGB(84, 68, 170) : RGB(44, 38, 90);
     gfx_fill_round(c, 6, y + 5, TB_START_W - 6, TASKBAR_H - 10, 8, sb);
     draw_crescent(c, 24, y + TASKBAR_H / 2, 9, RGB(246, 236, 196));
     gfx_text(c, 42, y + 12, OS_NAME, RGB(240, 240, 255), TRANSPARENT, FONT_SMALL);
+    }
 
     struct window *list[MAX_WIN];
     int n = taskbar_buttons(list, MAX_WIN);
@@ -842,6 +883,7 @@ static void draw_taskbar(canvas_t *c) {
     for (int i = 0; i < n; i++) {
         int bx, bw;
         taskbar_button_geom(n, i, &bx, &bw);
+        if (!canvas_hits(c, bx, y, bw, TASKBAR_H)) continue;
         uint32_t col = list[i] == f ? RGB(70, 62, 140) : list[i]->minimized ? RGB(26, 24, 48) : RGB(40, 36, 78);
         gfx_fill_round(c, bx, y + 5, bw, TASKBAR_H - 10, 6, col);
         if (list[i] == f) gfx_hline(c, bx + 8, y + TASKBAR_H - 6, bw - 16, RGB(170, 150, 255));
@@ -849,9 +891,10 @@ static void draw_taskbar(canvas_t *c) {
                    list[i]->minimized ? RGB(140, 140, 170) : RGB(235, 235, 250));
     }
 
-    draw_volume_button(c, y);
+    if (canvas_hits(c, sw-TB_CLOCK_W-TB_VOL_W, y, TB_VOL_W, TASKBAR_H)) draw_volume_button(c, y);
 
     /* clock */
+    if (!canvas_hits(c, sw-TB_CLOCK_W, y, TB_CLOCK_W, TASKBAR_H)) return;
     struct tm_parts tp;
     time_to_parts(time_now(), &tp);
     static const char *wd[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
@@ -905,21 +948,25 @@ static bool capture_layer(struct draw_layer *l, struct window *w, bool focus) {
     *l = (struct draw_layer){.x=w->x, .y=w->y, .cw=w->cw, .ch=w->ch,
         .fw=fw, .fh=fh, .cx=client_x(w), .cy=client_y(w), .flags=w->flags|(w->fullscreen?WIN_NO_DECOR:0),
         .hover=hover_win==w ? hover_btn : 0, .focus=focus,
-        .maximized=w->maximized, .pixels=w->buf, .client_raw_overwrite=true,
+        .maximized=w->maximized,
+        .pixels=(w->flags & WIN_DOUBLE_BUFFER) &&
+                (w->pending_index >= 0 ? w->pending_index : w->front_index) == 1 ? w->user_buf : w->buf,
+        .client_raw_overwrite=true,
         .bounds={MAX(0,x0),MAX(0,y0),MIN(sw,x1)-MAX(0,x0),MIN(sh,y1)-MAX(0,y0)}};
     memcpy(l->title, w->title, sizeof l->title);
     l->title[sizeof l->title - 1] = 0;
     return true;
 }
 
-/* 自身clientを後でraw上書きするlayerだけ。generic shadowは無変更。 */
+/* Omit only pixels proved to be overwritten later in this layer. Rounded
+   title corners remain translucent and must retain every original pass. */
 static void draw_layer_shadow_candidate(canvas_t *c, const struct draw_layer *w) {
     if (!w->client_raw_overwrite) {
         draw_shadow(c, w->x, w->y, w->fw, w->fh);
         return;
     }
-    int64_t hx0 = w->cx, hy0 = w->cy;
-    int64_t hx1 = hx0 + w->cw, hy1 = hy0 + w->ch;
+    int64_t hx0 = w->x, hy0 = w->y;
+    int64_t hx1 = hx0 + w->fw, hy1 = hy0 + w->fh;
     for (int i = SHADOW; i > 0; i -= 2) {
         int64_t x0 = MAX((int64_t)w->x - i + 2, (int64_t)c->cx0);
         int64_t y0 = MAX((int64_t)w->y - i + 4, (int64_t)c->cy0);
@@ -941,6 +988,16 @@ static void draw_layer_shadow_candidate(canvas_t *c, const struct draw_layer *w)
             gfx_fill_blend(c, (int)x0, (int)iy0, (int)(ix0-x0), (int)(iy1-iy0), col);
         if (x1 > ix1)
             gfx_fill_blend(c, (int)ix1, (int)iy0, (int)(x1-ix1), (int)(iy1-iy0), col);
+        if (!(w->flags & WIN_NO_DECOR)) {
+            for (int j = 0; j < TITLE_RADIUS; j++) {
+                int64_t y = hy0 + j;
+                if (y < iy0 || y >= iy1) continue;
+                int inset = corner_inset(j, TITLE_RADIUS);
+                int64_t left = MIN(ix1, hx0 + inset), right = MAX(ix0, hx1 - inset);
+                if (left > ix0) gfx_fill_blend(c, (int)ix0, (int)y, (int)(left-ix0), 1, col);
+                if (right < ix1) gfx_fill_blend(c, (int)right, (int)y, (int)(ix1-right), 1, col);
+            }
+        }
     }
 }
 
@@ -954,7 +1011,7 @@ static void draw_layer(canvas_t *c, const struct draw_layer *w, bool shadow_stri
         uint32_t edge = focus ? RGB(110, 96, 200) : RGB(60, 60, 84);
         uint32_t top = focus ? RGB(66, 52, 140) : RGB(44, 44, 62);
         uint32_t bot = focus ? RGB(38, 32, 88) : RGB(34, 34, 48);
-        const int R = 8;
+        const int R = TITLE_RADIUS;
         for (int j = 0; j < TITLE_H; j++) {
             int in = corner_inset(j, R);
             if (j == 0) {
@@ -1368,7 +1425,6 @@ static void composite_rect(struct rect r) {
     if (toast_until) draw_toast(c);
     /* a remote viewer draws the pointer itself; keep it out of the picture it is sent */
     if (!remote_users) desktop_draw_cursor(c, mx, my, cursor_shape);
-    fb_present(back.px, back.pitch, r.x, r.y, r.w, r.h);
     if (remote_users) {
         if (nrdamage == MAX_RDAMAGE) {
             for (int i = 1; i < nrdamage; i++) rdamage[0] = rect_union(rdamage[0], rdamage[i]);
@@ -1387,6 +1443,33 @@ static void composite(void) {
     memcpy(list, damage, n * sizeof(struct rect));
     ndamage = 0;
     for (int i = 0; i < n; i++) composite_rect(list[i]);
+    /* Includes hidden/offscreen windows: no outstanding reads exist for those
+       either. The new front stays immutable until the NEXT frame completes,
+       since expose/move damage can reread it between client submissions. */
+    for (int i = 0; i < nwin; i++) {
+        struct window *w = zorder[i];
+        if (w->pending_index < 0) continue;
+        w->front_index = w->pending_index;
+        w->pending_index = -1;
+        pending_frames--;
+        struct gui_event event = {.type=EV_FRAME, .key=w->front_index, .x=w->front_index ^ 1};
+        push_event(w, &event);
+    }
+    if (n) {
+        /* Raster jobs and all window reads have already joined. Only the
+           compositor writes this RAM canvas; resize waits for this borrow.
+           GUI syscalls may now destroy/resize/present windows without sleeping
+           behind the write-combined VRAM transfer. No window pixel pin is
+           needed because fb_present reads back, never a window surface. */
+        canvas_t frame = back;
+        presenting_back = true;
+        wm_unlock();
+        for (int i = 0; i < n; i++)
+            fb_present(frame.px, frame.pitch, list[i].x, list[i].y, list[i].w, list[i].h);
+        wm_lock();
+        presenting_back = false;
+        wq_wake_all(&present_wait);
+    }
 }
 
 static void damage_cursor(void) { damage_rect(mx - 8, my - 8, 26, 30); }
@@ -1854,9 +1937,12 @@ static void wm_thread(void *arg) {
     for (;;) {
         bool waited=false; uint64_t waiting=0;
         uint64_t fl = irq_save();
-        if (in_head == in_tail && ndamage == 0) {
+        uint64_t now = uptime_ms();
+        bool work = ndamage || pending_frames;
+        uint64_t elapsed = now - frame_started_ms;
+        if (in_head == in_tail && (!work || elapsed < frame_period_ms)) {
             if (trace_active) { waited=true; waiting=rdtsc(); wt.waits++; }
-            wq_wait_timeout(&wm_wq, 250);
+            wq_wait_timeout(&wm_wq, work ? frame_period_ms - elapsed : 250);
             if (waiting) { uint64_t ticks=rdtsc()-waiting; wt.wait_ticks+=ticks; wt.max_wait=MAX(wt.max_wait,ticks); }
         }
         irq_restore(fl);
@@ -1887,11 +1973,16 @@ static void wm_thread(void *arg) {
             struct rect t = toast_rect();
             damage_rect(t.x, t.y, t.w, t.h);
         }
-        if (trace_active) {
+        now = uptime_ms();
+        bool render = (ndamage || pending_frames) && now - frame_started_ms >= frame_period_ms;
+        if (trace_active && render) {
             frame.rects=ndamage; frame.jobs=cpu_parallel_jobs();
             for (int i=0;i<ndamage;i++) frame.area+=(uint64_t)damage[i].w*damage[i].h;
         }
-        composite();
+        if (render) {
+            frame_started_ms = now;
+            composite();
+        }
         trace_frame_end(&frame);
         wm_unlock();
         /* 全join/presentと借用終了後だけ譲る。合成中のkernel preemptionではない。 */
@@ -1951,6 +2042,14 @@ char *wm_clipboard_snapshot(size_t *len) {
 static bool set_screen_size(int w, int h) {
     cpu_require_bsp();
     if (w == sw && h == sh) return true;
+    while (presenting_back) {
+        uint64_t flags = irq_save();
+        wm_unlock();
+        if (presenting_back) wq_wait(&present_wait);
+        irq_restore(flags);
+        wm_lock();
+        if (w == sw && h == sh) return true;
+    }
     size_t pages = ALIGN_UP((uint64_t)w * h * 4, PAGE_SIZE) / PAGE_SIZE;
     size_t old = ALIGN_UP((uint64_t)sw * sh * 4, PAGE_SIZE) / PAGE_SIZE;
     uint32_t *bb = vmalloc(pages), *wp = vmalloc(pages);
@@ -2012,7 +2111,13 @@ bool wm_remote_attach(int *w, int *h) {
     wm_lock();
     if (!running) { wm_unlock(); return false; }
     remote_users++;
-    wm_remote_resize(w, h);
+    /* Do not nest WM ownership: set_screen_size may release it while waiting
+       for the compositor's VRAM borrow of the previous backbuffer. */
+    if (*w > 0 && *h > 0) set_screen_size(MAX(640, MIN(*w, 3840)), MAX(480, MIN(*h, 2160)));
+    *w = sw;
+    *h = sh;
+    damage_all();
+    wake_compositor();
     wm_unlock();
     return true;
 }
@@ -2055,6 +2160,25 @@ void wm_init(void) {
     gpu_init();
     sw = fb.width;
     sh = fb.height;
+    /* Limine's framebuffer ABI has no refresh rate/vblank signal. Cadence is
+       deployment policy, not an invented hardware rate: boot configuration
+       supplies wmrefresh=<Hz>. Zero/absent keeps the unpaced diagnostic path.
+       Round UP to the scheduler's millisecond resolution, never exceed it. */
+    extern const char *kernel_cmdline;
+    const char prefix[] = "wmrefresh=";
+    for (const char *p = kernel_cmdline; *p; p++) {
+        if ((p != kernel_cmdline && p[-1] != ' ') || strncmp(p, prefix, sizeof prefix - 1)) continue;
+        const char *q = p + sizeof prefix - 1;
+        uint64_t hz = 0;
+        bool valid = *q >= '0' && *q <= '9';
+        while (*q >= '0' && *q <= '9') {
+            unsigned digit = *q++ - '0';
+            if (hz > (UINT64_MAX - digit) / 10) valid = false;
+            if (valid) hz = hz * 10 + digit;
+        }
+        if (valid && (!*q || *q == ' ')) frame_period_ms = hz ? 1000 / hz + (1000 % hz != 0) : 0;
+    }
+    kprintf("wm: configured frame period %lu ms (0=unpaced, no vblank signal)\n", frame_period_ms);
     size_t pages = ALIGN_UP((uint64_t)sw * sh * 4, PAGE_SIZE) / PAGE_SIZE;
     uint32_t *bb = vmalloc(pages), *wp = vmalloc(pages);
     if (!bb || !wp) {
@@ -2200,8 +2324,21 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         struct window *w = fd_window(file);
         if (!w) return -EBADF;
         if (w->pml4 != current_task->pml4) return -EPERM;
-        if (w->uaddr) return (int64_t)w->uaddr;
-        uint64_t va = map_user(w, task_process());
+        if (b >= ((w->flags & WIN_DOUBLE_BUFFER) ? WIN_BUFFER_COUNT : 1) || c > WIN_MAP_ACQUIRE) return -EINVAL;
+        if (c && !(w->flags & WIN_DOUBLE_BUFFER)) return -EINVAL;
+        while (c && (w->pending_index >= 0 || w->front_index == (int)b)) {
+            uint64_t flags = irq_save();
+            wm_unlock();
+            if (!w->dead && !current_task->killed &&
+                (w->pending_index >= 0 || w->front_index == (int)b)) wq_wait(&w->wq);
+            irq_restore(flags);
+            wm_lock();
+            if (w->dead) return -EBADF;
+            if (current_task->killed) return -EINTR;
+        }
+        uint64_t va = b ? w->second_uaddr : w->uaddr;
+        if (va) return (int64_t)va;
+        va = map_user(w, task_process(), (unsigned)b);
         return va ? (int64_t)va : -ENOMEM;
     }
     case SYS_WIN_STATE: {
@@ -2222,6 +2359,20 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     case SYS_WIN_PRESENT: {
         struct window *w = fd_window(file);
         if (!w) return -EBADF;
+        if (w->pml4 != current_task->pml4) return -EPERM;
+        if (w->flags & WIN_DOUBLE_BUFFER) {
+            if (!e || e > WIN_BUFFER_COUNT || b || c || d) return -EINVAL;
+            int index = (int)e - 1;
+            if (w->pending_index >= 0 || w->front_index == index) return -EBUSY;
+            if (!(index ? w->second_uaddr : w->uaddr)) return -EINVAL;
+            w->pending_index = index;
+            pending_frames++;
+            if (!w->shown) show_if_needed(w);
+            else if (visible(w)) damage_rect(client_x(w), client_y(w), w->cw, w->ch);
+            wake_compositor();
+            return 0;
+        }
+        if (e) return -EINVAL;
         int x = (int)b, y = (int)c, rw = (int)(d >> 32), rh = (int)(d & 0xFFFFFFFF);
         if (rw <= 0 || rh <= 0) {
             x = y = 0;
@@ -2292,6 +2443,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         size_t opages = w->pages;
         int ocw = w->cw, och = w->ch;
         bool was_mapped = w->uaddr != 0;
+        bool was_pending = w->pending_index >= 0;
         if (!alloc_buffer(w, ncw, nch)) {
             w->buf = obuf;
             w->user_buf = ouser;
@@ -2305,13 +2457,18 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         /* unmap the old buffer from the owner */
         if (was_mapped) {
             for (size_t i = 0; i < opages; i++) vmm_unmap_page(w->pml4, w->uaddr + i * PAGE_SIZE);
+            if (w->second_uaddr)
+                for (size_t i = 0; i < opages; i++) vmm_unmap_page(w->pml4, w->second_uaddr + i * PAGE_SIZE);
             w->uaddr = 0;
+            w->second_uaddr = 0;
         }
+        if (was_pending) pending_frames--;
+        wq_wake_all(&w->wq);
         vfree(obuf, opages);
         vfree(ouser, opages);
         damage_window(w);
         wake_compositor();
-        uint64_t va = map_user(w, task_process());
+        uint64_t va = map_user(w, task_process(), 0);
         return va ? (int64_t)va : -ENOMEM;
     }
     case SYS_SCREEN_GRAB: {

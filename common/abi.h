@@ -139,7 +139,7 @@ struct n_audio_status {
 /* ---- GUI ---- */
 enum {
     EV_NONE = 0, EV_KEY, EV_MOUSE_MOVE, EV_MOUSE_DOWN, EV_MOUSE_UP, EV_CLOSE, EV_FOCUS, EV_UNFOCUS,
-    EV_WHEEL, EV_RESIZE,
+    EV_WHEEL, EV_RESIZE, EV_FRAME,
 };
 
 struct gui_event {
@@ -158,6 +158,15 @@ struct gui_event {
 #define WIN_CENTER 4
 #define WIN_START_MAXIMIZED 8
 #define WIN_ALWAYS_ON_TOP 16
+/* Opt-in full-frame protocol. MAP(fd, index, WIN_MAP_ACQUIRE) waits until
+   the compositor releases that buffer. PRESENT's final argument is index+1.
+   No writes are allowed between submission and acquisition. Legacy calls
+   (final argument zero) retain their rectangle snapshot semantics. */
+#define WIN_DOUBLE_BUFFER 32
+#define WIN_BUFFER_COUNT 2
+#define WIN_MAP_ACQUIRE 1
+/* EV_FRAME: key = completed index, x = reusable index; completion means all
+   compositor reads have joined, not hardware vblank or physical scanout. */
 #define WIN_STATE_VISIBLE 1
 #define WIN_STATE_FOCUSED 2
 #define WIN_STATE_FULLSCREEN 4

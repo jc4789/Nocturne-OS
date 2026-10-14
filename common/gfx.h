@@ -61,13 +61,18 @@ uint32_t gfx_glyph_for(uint32_t codepoint);
 int gfx_utf8_decode(const char *s, uint32_t *cp);
 
 static inline uint32_t gfx_mix(uint32_t a, uint32_t b, int t /* 0..255 weight of b */) {
-    /* The weights sum to 255, not 256. Round independent channels so both
-       endpoints and equal colors are exact (including an unchanged 255). */
+    /* 8-bit RGB lanes, weights summing to 255. R/B have independent 16-bit
+       products: each is <=255*255+127, so neither the rounding correction nor
+       the shift can carry into its neighbour. For n in [0, 255*255+127],
+       floor(n/255) == (n + 1 + (n >> 8)) >> 8. This preserves the previous
+       rounded /255 result exactly; /256 blending would darken equal colors. */
     uint32_t w = (uint32_t)t, inv = 255 - w;
-    uint32_t r = (((a >> 16) & 255) * inv + ((b >> 16) & 255) * w + 127) / 255;
-    uint32_t g = (((a >> 8) & 255) * inv + ((b >> 8) & 255) * w + 127) / 255;
-    uint32_t blue = ((a & 255) * inv + (b & 255) * w + 127) / 255;
-    return 0xFF000000u | (r << 16) | (g << 8) | blue;
+    const uint32_t rb_mask = 0x00FF00FFu;
+    uint32_t rb = (a & rb_mask) * inv + (b & rb_mask) * w + 0x007F007Fu;
+    rb = (rb + 0x00010001u + ((rb >> 8) & rb_mask)) >> 8;
+    uint32_t g = ((a >> 8) & 255) * inv + ((b >> 8) & 255) * w + 127;
+    g = (g + 1 + (g >> 8)) >> 8;
+    return 0xFF000000u | (rb & rb_mask) | (g << 8);
 }
 #ifdef __cplusplus
 }

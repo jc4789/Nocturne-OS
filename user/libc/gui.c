@@ -30,10 +30,20 @@ window_t *win_open(int w, int h, const char *title, int flags) {
         return NULL;
     }
     window_t *win = calloc(1, sizeof *win);
+    if (!win) { close((int)fd); errno = ENOMEM; return NULL; }
     win->fd = (int)fd;
     win->w = w;
     win->h = h;
     win->flags = flags;
+    win->buffers[0] = (uint32_t *)addr;
+    win->frame_acquired = true;
+    if (flags & WIN_DOUBLE_BUFFER) {
+        long other = __syscall(SYS_WIN_MAP, fd, 1, 0, 0, 0);
+        if (other < 0 && other > -4096) {
+            close((int)fd); free(win); errno = (int)-other; return NULL;
+        }
+        win->buffers[1] = (uint32_t *)other;
+    }
     gfx_init(&win->c, (uint32_t *)addr, w, h, w);
     return win;
 }
@@ -44,10 +54,33 @@ void win_close(window_t *win) {
     free(win);
 }
 
-void win_update(window_t *win) { __syscall(SYS_WIN_PRESENT, win->fd, 0, 0, 0, 0); }
+int win_begin_frame(window_t *win) {
+    if (!win || win->closed) return -EBADF;
+    if (!(win->flags & WIN_DOUBLE_BUFFER) || win->frame_acquired) return 0;
+    long address = __syscall(SYS_WIN_MAP, win->fd, win->buffer_index, WIN_MAP_ACQUIRE, 0, 0);
+    if (address < 0 && address > -4096) { errno = (int)-address; return (int)address; }
+    win->buffers[win->buffer_index] = (uint32_t *)address;
+    gfx_init(&win->c, (uint32_t *)address, win->w, win->h, win->w);
+    win->frame_acquired = true;
+    return 0;
+}
+
+void win_update(window_t *win) {
+    if (!win || win->closed) return;
+    if (!(win->flags & WIN_DOUBLE_BUFFER)) {
+        __syscall(SYS_WIN_PRESENT, win->fd, 0, 0, 0, 0); return;
+    }
+    if (!win->frame_acquired) { errno = EBUSY; return; }
+    long result = __syscall(SYS_WIN_PRESENT, win->fd, 0, 0, 0, win->buffer_index + 1);
+    if (result < 0) { errno = (int)-result; return; }
+    win->buffer_index ^= 1;
+    win->frame_acquired = false;
+    win->c.px = NULL; /* a submitted surface is no longer a writable canvas */
+}
 
 void win_update_rect(window_t *win, int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
+    if (win->flags & WIN_DOUBLE_BUFFER) { win_update(win); return; }
     __syscall(SYS_WIN_PRESENT, win->fd, x, y, ((long)w << 32) | (unsigned)h, 0);
 }
 
@@ -85,6 +118,14 @@ int win_event(window_t *win, struct gui_event *e, int timeout_ms) {
             win->w = e->x;
             win->h = e->y;
             gfx_init(&win->c, (uint32_t *)addr, e->x, e->y, e->x);
+            win->buffers[0] = (uint32_t *)addr;
+            win->buffer_index = 0;
+            win->frame_acquired = true;
+            if (win->flags & WIN_DOUBLE_BUFFER) {
+                long other = __syscall(SYS_WIN_MAP, win->fd, 1, 0, 0, 0);
+                if (other < 0 && other > -4096) { win->closed = true; return -1; }
+                win->buffers[1] = (uint32_t *)other;
+            }
         }
     }
     return 1;

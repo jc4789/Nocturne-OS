@@ -59,6 +59,7 @@ static void clock_text(char *s, int64_t ms) {
     snprintf(s,16,"%u:%02u",(unsigned)(ms/60000),(unsigned)(ms/1000%60));
 }
 static void draw(void) {
+    if (win_begin_frame(win) < 0) return;
     canvas_t *c = &win->c;
     gfx_fill(c,0,0,WIDTH,HEIGHT,UI_BG);
     gfx_fill(c,12,12,WIDTH-24,408,RGB(0,0,0));
@@ -132,7 +133,7 @@ static bool pump(void) {
     return changed;
 }
 int main(int argc,char **argv) {
-    win=win_open(WIDTH,HEIGHT,"Media Player",0);
+    win=win_open(WIDTH,HEIGHT,"Media Player",WIN_DOUBLE_BUFFER);
     if (!win) return 1;
     if (argc>1) {
         if(strlen(argv[1])>=sizeof path)strlcpy(error,"Media path/URL is too long; nothing was opened.",sizeof error);
