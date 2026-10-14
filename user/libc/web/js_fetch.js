@@ -17,6 +17,7 @@ const fetchBridge = (() => {
     const headerSlots=new WeakMap(), requestSlots=new WeakMap(), responseSlots=new WeakMap();
     const bodySlots=new WeakMap(), signalSlots=new WeakMap(), controllerSlots=new WeakMap(),networkSlots=new WeakMap();
     const NativePromise=Promise, then=Promise.prototype.then, apply=Reflect.apply;
+    const dataURL=host.dataURL, nativeTimer=host.timer, nativeClear=host.clear;
     const NativeWeakRef=WeakRef, deref=WeakRef.prototype.deref;
     const registerFinalizer=FinalizationRegistry.prototype.register,unregisterFinalizer=FinalizationRegistry.prototype.unregister;
     const dependentFinalizer=new FinalizationRegistry(cleanups=>{for(const [s,fn]of cleanups)s.algorithms.delete(fn);});
@@ -435,14 +436,49 @@ const fetchBridge = (() => {
     }
     for(const name of ['type','url','redirected','status','statusText','headers'])define(Response.prototype,name,{configurable:true,enumerable:true,get(){return slot(responseSlots,this,'Response')[name];}});
     installBody(Request.prototype);installBody(Response.prototype);
+    function dataFetch(s,body,integrity,observer) {
+        if(body.bytes!==null)body.used=true;
+        return new NativePromise((resolve,reject)=>{
+            const sig=signalSlots.get(s.signal);let done=false,task=0;
+            const cleanup=()=>sig.algorithms.delete(abort);
+            const fail=reason=>{
+                if(done)return;done=true;cleanup();
+                if(task){apply(nativeClear,host,[task]);task=0;}
+                reject(reason);if(observer)observer('end',reason,()=>{});
+            };
+            const abort=reason=>fail(reason);
+            const schedule=fn=>{task=apply(nativeTimer,host,[0,()=>{task=0;if(done)return;try{fn();}catch(e){fail(e);}},0,[]]);};
+            // The transport's observer owns flow control. Resume at most once,
+            // and on a new task, just as native headers/chunks/end are queued.
+            const resume=fn=>{let used=false;return ()=>{if(used||done)return;used=true;try{schedule(fn);}catch(e){fail(e);}};};
+            sig.algorithms.add(abort);
+            try {
+                schedule(()=>{
+                    const local=apply(dataURL,host,[s.url]),bytes=s.method==='HEAD'?null:local[0];
+                    const response=responseObject({status:200,statusText:'OK',url:s.url.split('#')[0],
+                        headers:makeHeaders({'content-type':local[1]},'immutable'),redirected:false,type:'basic'},
+                        {bytes,used:false,abort:s.signal});
+                    verifyIntegrity(response,integrity,s.signal);
+                    if(!observer){done=true;cleanup();resolve(response);return;}
+                    const end=()=>{if(done)return;done=true;cleanup();observer('end',undefined,()=>{});};
+                    const chunk=()=>{if(bytes!==null&&apply(abLength,bytes,[])!==0)observer('chunk',bytes,resume(end));else end();};
+                    const publish=()=>{observer('headers',response,resume(chunk));resolve(response);};
+                    if(body.bytes!==null)observer('upload',apply(abLength,body.bytes,[]),resume(publish));else publish();
+                });
+            }catch(e){fail(e);}
+            if(sig.aborted)abort(sig.reason);
+        });
+    }
     function fetchCore(input,init,observer,forcePreflight=false) {
         let r,s,b,integrity;
         try {
             r=new Request(input,init);s=requestSlots.get(r);b=bodySlots.get(r);
             const signal=signalSlots.get(s.signal);if(signal.aborted)return reject(signal.reason);
-            if(s.mode==='no-cors'&&!host.noCorsFetch)throw notSupported('This native context has no no-cors transport');
-            if(s.redirect==='manual')throw notSupported('Opaque manual redirect responses are not supported');
             integrity=s.integrity?integrityMetadata(s.integrity):null;
+            // Fetch main fetch selects data before same-origin/no-cors/CORS
+            // checks. Local data has a basic response and no HTTP transport,
+            // redirect, cache miss, preflight, cookie, or request-header wire.
+            if(s.url.startsWith('data:'))return dataFetch(s,b,integrity,observer);
             // Referrer policy/source are private native metadata, never part
             // of author headers or CORS preflight header classification.
             const noReferrer=s.referrer===''||s.referrerPolicy==='no-referrer';
@@ -452,12 +488,14 @@ const fetchBridge = (() => {
             // This host has no stored HTTP responses. A cache-only miss is a
             // Fetch network error (TypeError), not a synthetic HTTP 504, and
             // cannot reach host.fetch even for a cross-origin target URL.
-            if(s.cache==='only-if-cached')throw new TypeError('No cached response is available');
             if(objectURLAPI&&s.url.startsWith('blob:')){
                 const local=objectURLAPI.fetch(s.url,s.method,headerValue(headerSlots.get(s.headers),'range')),fields={'content-type':local.type,'content-length':String(local.size)};if(local.range)fields['content-range']=local.range;const headers=makeHeaders(fields,'immutable');
                 const response=responseObject({status:local.status,statusText:local.status===206?'Partial Content':'OK',url:s.url.split('#')[0],headers,redirected:false,type:'basic'},{bytes:s.method==='HEAD'?null:local.bytes,used:false,abort:s.signal});
                 return new NativePromise(resolve=>resolve(verifyIntegrity(response,integrity,s.signal)));
             }
+            if(s.mode==='no-cors'&&!host.noCorsFetch)throw notSupported('This native context has no no-cors transport');
+            if(s.redirect==='manual')throw notSupported('Opaque manual redirect responses are not supported');
+            if(s.cache==='only-if-cached')throw new TypeError('No cached response is available');
             let raw='';for(const [name,value]of sortedHeaders(headerSlots.get(s.headers)))raw+=name+': '+value+'\r\n';
             let pair,channel,channelRef,waiting,transportId=0,done=false,hasBody=false,finishStream=()=>{};
             const liveChannel=()=>channel||(channelRef&&apply(deref,channelRef,[]));

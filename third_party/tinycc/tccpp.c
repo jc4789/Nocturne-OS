@@ -56,6 +56,21 @@ static void next_nomacro(void);
 static void parse_number(const char *p);
 static void parse_string(const char *p, int len);
 
+/* Cooperative host polling is work-based, not a source-size restriction.
+   Reuse the preprocessor's input-buffer quantum, without a clock syscall on
+   every token. Only throw while tcc_compile's C recovery target is active. */
+ST_FUNC void tcc_poll_interrupt(void)
+{
+    TCCState *s = tcc_state;
+    if (!s->interrupt_func || !s->error_set_jmp_enabled)
+        return;
+    if (++s->interrupt_work < IO_BUF_SIZE)
+        return;
+    s->interrupt_work = 0;
+    if (s->interrupt_func(s->interrupt_opaque))
+        tcc_error("compilation interrupted");
+}
+
 static struct TinyAlloc *toksym_alloc;
 static struct TinyAlloc *tokstr_alloc;
 
@@ -187,6 +202,7 @@ static TinyAlloc *tal_new(TinyAlloc **pal, unsigned size)
 static void tal_delete(TinyAlloc **pal)
 {
     TinyAlloc *al = *pal, *next;
+    if (!al) return;
 
 #if TAL_INFO
     fprintf(stderr, "tal_delete (&tok%s_alloc):\n", pal == &toksym_alloc ? "sym" : "str");
@@ -400,6 +416,7 @@ ST_FUNC void cstr_new(CString *cstr)
 ST_FUNC void cstr_free(CString *cstr)
 {
     tcc_free(cstr->data);
+    memset(cstr, 0, sizeof *cstr);
 }
 
 /* reset string to empty */
@@ -2546,6 +2563,8 @@ static void next_nomacro(void)
     uint8_t *p, *p1;
     unsigned int h;
 
+    tcc_poll_interrupt();
+
     p = file->buf_ptr;
  redo_no_start:
     c = *p;
@@ -3470,6 +3489,7 @@ static int macro_subst(
 ST_FUNC void next(void)
 {
     int t;
+    tcc_poll_interrupt();
     while (macro_ptr) {
 redo:
         t = *macro_ptr;
@@ -3690,6 +3710,13 @@ ST_FUNC void tccpp_new(TCCState *s)
     int i, c;
     const char *p, *r;
 
+    /* Establish cleanup-safe state before the first fallible allocation. */
+    tok_ident = TOK_IDENT;
+    cstr_new(&tokcstr);
+    cstr_new(&cstr_buf);
+    tok_str_new(&unget_buf);
+    tok_str_new(&tokstr_buf);
+
     /* init isid table */
     for(i = CH_EOF; i<128; i++)
         set_idnum(i,
@@ -3708,15 +3735,10 @@ ST_FUNC void tccpp_new(TCCState *s)
     memset(hash_ident, 0, TOK_HASH_SIZE * sizeof(TokenSym *));
     memset(s->cached_includes_hash, 0, sizeof s->cached_includes_hash);
 
-    cstr_new(&tokcstr);
-    cstr_new(&cstr_buf);
     cstr_realloc(&cstr_buf, STRING_MAX_SIZE);
-    tok_str_new(&unget_buf);
     tok_str_realloc(&unget_buf, TOKSTR_MAX_SIZE);
-    tok_str_new(&tokstr_buf);
     tok_str_realloc(&tokstr_buf, TOKSTR_MAX_SIZE);
 
-    tok_ident = TOK_IDENT;
     p = tcc_keywords;
     while (*p) {
         r = p;
@@ -3752,12 +3774,15 @@ ST_FUNC void tccpp_delete(TCCState *s)
         tal_free(&toksym_alloc, table_ident[i]);
     tcc_free(table_ident);
     table_ident = NULL;
+    tok_ident = TOK_IDENT;
 
     /* free static buffers */
     cstr_free(&tokcstr);
     cstr_free(&cstr_buf);
     tok_str_free_str(tokstr_buf.str);
     tok_str_free_str(unget_buf.str);
+    tok_str_new(&tokstr_buf);
+    tok_str_new(&unget_buf);
 
     /* free allocators */
     tal_delete(&toksym_alloc);

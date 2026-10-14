@@ -16,6 +16,7 @@
 #include "dev/audio.h"
 #include "gui/wm.h"
 #include "abi.h"
+_Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
 
 _Static_assert(sizeof(struct n_dirent) == sizeof(struct dirent), "dirent ABI");
 _Static_assert(sizeof(struct n_stat) == sizeof(struct kstat), "stat ABI");
@@ -780,6 +781,18 @@ void syscall_dispatch(struct regs *r) {
         if (!user_ok_w((void *)a, b) || b < 16 || b > PAGE_SIZE) ret = -EFAULT;
         else { current_task->tls_base = a; wrmsr(0xC0000100, a); ret = 0; }
         break;
+    case SYS_THREAD_STACK_BOUNDS: {
+        if (!user_ok_w((void *)a, sizeof(uintptr_t)) || !user_ok_w((void *)b, sizeof(uintptr_t))) {
+            ret = -EFAULT; break;
+        }
+        /* Main stacks grow on demand within the VM's reserved interval.
+           Native threads instead own their scheduler-allocated mapping. */
+        uintptr_t low = current_task->user_stack_size ? current_task->user_stack : USER_STACK_TOP - USER_STACK_MAX;
+        uintptr_t high = current_task->user_stack_size ? current_task->user_stack + current_task->user_stack_size : USER_STACK_TOP;
+        memcpy((void *)a, &low, sizeof low);
+        memcpy((void *)b, &high, sizeof high);
+        ret = 0; break;
+    }
     case SYS_WAIT_ADDRESS:
         if ((a & 3) || !user_ok((void *)a, sizeof(uint32_t))) ret = -EFAULT;
         else ret = task_wait_address((volatile uint32_t *)a, (uint32_t)b, (unsigned)c);

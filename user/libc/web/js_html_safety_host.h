@@ -135,7 +135,12 @@ static JSValue native_safety(JSContext *ctx,JSValueConst this_value,int argc,JSV
                 JS_FreeCString(ctx,directive);
                 if(ok)ok=JS_DefinePropertyValueStr(ctx,event->init,"originalPolicy",JS_NewString(ctx,event->rule?event->rule->original_policy:""),JS_PROP_C_W_E)>=0;
                 if(!ok){JS_FreeValue(ctx,event->init);js_free(ctx,event);result=JS_EXCEPTION;}
-                else{if(s->last_policy_violation)s->last_policy_violation->next=event;else s->policy_violations=event;s->last_policy_violation=event;}
+                else{
+                    /* Parser rewind can release meta rules before this task.
+                     * Their report endpoints are ignored; init owns the text. */
+                    if(event->rule && event->rule->from_meta)event->rule=NULL;
+                    if(s->last_policy_violation)s->last_policy_violation->next=event;else s->policy_violations=event;s->last_policy_violation=event;
+                }
             }
         }
     }else result=JS_ThrowTypeError(ctx,"Unknown HTML safety operation");
@@ -151,4 +156,22 @@ static JSValue trusted_code_check(JSContext *ctx,JSValueConst value,int kind,int
     JSValue args[]={JS_DupValue(ctx,value),JS_NewInt32(ctx,kind),args_array};
     JSValue result=custom_element_hook(s,"safetyDynamicCode",3,args);
     for(unsigned i=0;i<3;i++)JS_FreeValue(ctx,args[i]);return result;
+}
+static int wasm_can_compile(JSContext *ctx){
+    struct web_js_state *s=state(ctx);
+    if(!s || s->disabled)return 0;
+    bool allowed=true;
+    for(struct web_html_policy_rule *rule=s->doc->html_policy?s->doc->html_policy->first:NULL;rule;rule=rule->next){
+        if(html_policy_wasm_allowed(rule))continue;
+        if(!rule->report_only)allowed=false;
+        struct js_policy_violation *event=js_mallocz(ctx,sizeof *event);
+        if(!event)return -1;
+        event->init=wasm_policy_violation_init(ctx,rule,s->doc->url,0);
+        if(JS_IsException(event->init)){js_free(ctx,event);return -1;}
+        event->rule=rule->from_meta?NULL:rule;
+        if(s->last_policy_violation)s->last_policy_violation->next=event;else s->policy_violations=event;
+        s->last_policy_violation=event;
+        log_text(s,1,rule->report_only?"CSP report-only: WebAssembly compilation violates script-src":"CSP: WebAssembly compilation blocked by script-src");
+    }
+    return allowed;
 }

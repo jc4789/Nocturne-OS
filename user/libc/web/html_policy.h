@@ -6,10 +6,14 @@ struct web_html_policy_rule {
     char *original_policy, *base_url, *report_to;
     char **report_uris; size_t report_uri_count;
     bool require_script, has_names, allow_duplicates, report_only;
+    bool has_wasm_policy, wasm_allowed;
     bool from_meta;
 };
 struct web_html_policy { struct web_html_policy_rule *first, *last; };
 bool html_policy_requires_script(const web_doc *document);
+/* Source-list decision only. Callers must report every denied rule and block
+ * only enforcing rules; report-only must not be hidden by this predicate. */
+bool html_policy_wasm_allowed(const struct web_html_policy_rule *rule);
 bool html_policy_init(web_doc *document,const char *headers,const web_doc *inherit);
 bool html_policy_meta(web_doc *document,const char *content,size_t length);
 void html_policy_free(web_doc *document);

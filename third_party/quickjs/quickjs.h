@@ -380,12 +380,28 @@ void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size);
 /* should be called when changing thread to update the stack top value
    used to check stack overflow. */
 void JS_UpdateStackTop(JSRuntime *rt);
+/* Same-thread, stackful native continuations. The inactive record owns its
+   exception value; no JavaScript frame may remain on a suspended native stack. */
+typedef struct JSExecutionStackState {
+    uintptr_t stack_top, stack_limit;
+    void *stack_frame;
+    JSValue exception;
+    JS_BOOL exception_uncatchable;
+} JSExecutionStackState;
+void JS_InitExecutionStackState(JSRuntime *rt, JSExecutionStackState *state,
+                                uintptr_t low, uintptr_t high);
+void JS_SwapExecutionStackState(JSRuntime *rt, JSExecutionStackState *state);
+void JS_FreeExecutionStackState(JSRuntime *rt, JSExecutionStackState *state);
+JS_BOOL JS_HasActiveJSFrames(JSRuntime *rt);
+int JS_RebaseExecutionStack(JSRuntime *rt, uintptr_t low, uintptr_t high);
 JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque);
 void JS_FreeRuntime(JSRuntime *rt);
 void *JS_GetRuntimeOpaque(JSRuntime *rt);
 void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque);
 typedef void JS_MarkFunc(JSRuntime *rt, JSGCObjectHeader *gp);
 void JS_MarkValue(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func);
+/* Account for an embedding object's matching JS_DupContext reference. */
+void JS_MarkContextRef(JSRuntime *rt, JSContext *ctx, JS_MarkFunc *mark_func);
 void JS_RunGC(JSRuntime *rt);
 JS_BOOL JS_IsLiveObject(JSRuntime *rt, JSValueConst obj);
 /* Native weak identity handles. They do not keep their target alive. Values
@@ -897,6 +913,10 @@ JSValue JS_NewArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len,
                           JS_BOOL is_shared);
 JSValue JS_NewArrayBufferCopy(JSContext *ctx, const uint8_t *buf, size_t len);
 void JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj);
+/* Host-owned buffers may forbid author transfer while remaining detachable
+   by their native owner (for example WebAssembly memory.grow). */
+int JS_SetArrayBufferTransferable(JSContext *ctx, JSValueConst obj, JS_BOOL allowed);
+int JS_IsArrayBufferTransferable(JSContext *ctx, JSValueConst obj);
 uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst obj);
 
 typedef enum JSTypedArrayEnum {
@@ -936,6 +956,11 @@ typedef enum JSPromiseStateEnum {
 } JSPromiseStateEnum;
 
 JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs);
+/* Embedding equivalent of PromiseResolve(%Promise%, value) and the reactions
+   used by Await. Never reads an author's global Promise or Promise.then. */
+JSValue JS_PromiseResolveIntrinsic(JSContext *ctx, JSValueConst value);
+int JS_PromiseAddReactions(JSContext *ctx, JSValueConst promise,
+                          JSValueConst on_fulfilled, JSValueConst on_rejected);
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValue promise);
 JSValue JS_PromiseResult(JSContext *ctx, JSValue promise);
 

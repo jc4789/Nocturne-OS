@@ -10,6 +10,7 @@
 #include <webnet.h>
 #include "../libc/web/js_encoding.h"
 #include "../libc/web/js_crypto.h"
+#include "../libc/web/js_wasm.h"
 #include "../libc/web/js_worker_transfer.h"
 #include "../libc/web/js_worker_port_lifetime.h"
 #include "../libc/web/js_worker_runtime.inc"
@@ -262,7 +263,7 @@ static JSValue native_safety(JSContext *ctx,JSValueConst self,int argc,JSValueCo
         policy_field(ctx,v->init,"blockedURI",JS_NewString(ctx,!strcmp(directive,"trusted-types")?"trusted-types-policy":"trusted-types-sink"))&&
         policy_field(ctx,v->init,"statusCode",JS_NewInt32(ctx,w->policy_status));JS_FreeCString(ctx,directive);
     if(!ok){JS_FreeValue(ctx,v->init);js_free(ctx,v);return JS_EXCEPTION;}
-    v->rule=rule;
+    v->rule=rule->from_meta?NULL:rule;
     if(w->last_violation)w->last_violation->next=v;else w->violations=v;w->last_violation=v;return JS_UNDEFINED;
 }
 static bool worker_policy_start(struct worker *w,JSValueConst start){
@@ -364,7 +365,8 @@ static bool native_port_receive(struct worker*w,const struct njw_header*h,JSValu
 static JSValue native_transfer_commit(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;if(!argc)return JS_ThrowTypeError(ctx,"Worker transfer plan required");return worker_transfer_commit(ctx,argv[0],!state(ctx)->closed);}
 static JSValue native_send(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;struct worker *w=state(ctx);uint32_t op=0,request=0;if(argc<3||JS_ToUint32(ctx,&op,argv[0])<0||JS_ToUint32(ctx,&request,argv[1])<0)return JS_EXCEPTION;if(op!=NJW_MESSAGE&&op!=NJW_ERROR&&op!=NJW_CONSOLE)return JS_ThrowTypeError(ctx,"Invalid worker send");if(!send_value(w,op,request,0,argv[2]))return JS_ThrowRangeError(ctx,"Worker send quota/transport failed");bool ok=true;if(w->shared){for(struct client*c=w->clients;c&&ok;c=c->next)if(c->active&&c->established)ok=output_wait(w,c,0);}else ok=output_wait(w,NULL,0);if(!ok)return JS_ThrowTypeError(ctx,"Worker transport ended or its task deadline expired");return JS_UNDEFINED;}
 static JSValue native_class(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;return JS_NewUint32(ctx,argc?JS_GetClassID(argv[0]):0);}
-static JSValue native_detach(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;if(argc)JS_DetachArrayBuffer(ctx,argv[0]);return JS_UNDEFINED;}
+static JSValue native_detach(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;if(argc&&!JS_IsArrayBufferTransferable(ctx,argv[0]))return JS_ThrowTypeError(ctx,"ArrayBuffer cannot be transferred");if(argc)JS_DetachArrayBuffer(ctx,argv[0]);return JS_UNDEFINED;}
+static JSValue native_buffer_transferable(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;return JS_NewBool(ctx,argc&&JS_IsArrayBufferTransferable(ctx,argv[0]));}
 static JSValue native_now(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;return JS_NewFloat64(ctx,(double)uptime_ms());}
 static JSValue native_close(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;struct worker *w=state(ctx);send_value(w,NJW_CLOSE,0,0,JS_NULL);w->closed=true;if(w->shared)close(0);return JS_UNDEFINED;}
 static JSValue native_eval(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
@@ -439,12 +441,28 @@ static int interrupt(JSRuntime *rt,void *opaque){
     return uptime_ms()>=w->until;
 }
 static JSValue hook(struct worker *w,const char *name,int argc,JSValueConst *argv){JSValue fn=JS_GetPropertyStr(w->ctx,w->hooks,name);JSValue r=JS_Call(w->ctx,fn,JS_UNDEFINED,argc,argv);JS_FreeValue(w->ctx,fn);port_capture_cancel(w);return r;}
+static int wasm_poll(JSContext *ctx){struct worker*w=JS_GetContextOpaque(ctx);return !w||interrupt(JS_GetRuntime(ctx),w);}
+static JSValue native_data_url(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){(void)self;return web_js_data_url(ctx,argc?argv[0]:JS_UNDEFINED,wasm_poll,false);}
+static int wasm_can_compile(JSContext *ctx){
+    struct worker *w=state(ctx);if(!w||w->closed)return 0;
+    bool allowed=true;
+    for(struct web_html_policy_rule *rule=w->policy_doc.html_policy?w->policy_doc.html_policy->first:NULL;rule;rule=rule->next){
+        if(html_policy_wasm_allowed(rule))continue;
+        if(!rule->report_only)allowed=false;
+        struct policy_violation *v=js_mallocz(ctx,sizeof *v);if(!v)return -1;
+        v->init=wasm_policy_violation_init(ctx,rule,w->policy_doc.url,w->policy_status);
+        if(JS_IsException(v->init)){js_free(ctx,v);return -1;}
+        v->rule=rule->from_meta?NULL:rule;
+        if(w->last_violation)w->last_violation->next=v;else w->violations=v;w->last_violation=v;
+    }
+    return allowed;
+}
 static void exception(struct worker *w){JSValue ex=JS_GetException(w->ctx);w->until=uptime_ms()+NJW_TASK_MS;JSValue r=hook(w,"report",1,&ex);if(JS_IsException(r)){JSValue ignored=JS_GetException(w->ctx);JS_FreeValue(w->ctx,ignored);}JS_FreeValue(w->ctx,r);JS_FreeValue(w->ctx,ex);}
-static void jobs(struct worker *w){for(unsigned i=0;i<256&&!w->closed&&JS_IsJobPending(w->rt);i++){JSContext *ctx=NULL;int n=JS_ExecutePendingJob(w->rt,&ctx);port_capture_cancel(w);if(n<0){exception(w);break;}if(!n)break;}}
+static void jobs(struct worker *w){for(unsigned i=0;i<256&&!w->closed&&JS_IsJobPending(w->rt);i++){JSContext *ctx=NULL;int n=JS_ExecutePendingJob(w->rt,&ctx);port_capture_cancel(w);if(n<0){exception(w);break;}if(!n)break;}web_js_wasm_collect(w->ctx);}
 static void policy_task(struct worker *w){
     struct policy_violation *v=w->violations;w->violations=v->next;if(!w->violations)w->last_violation=NULL;
     struct web_html_policy_rule *rule=v->rule;
-    if(!rule->from_meta&&(rule->report_uri_count||rule->report_to)){
+    if(rule&&!rule->from_meta&&(rule->report_uri_count||rule->report_to)){
         JSContext *ctx=w->ctx;JSValue report=JS_NewObjectProto(ctx,JS_NULL),endpoints=JS_NewArray(ctx);
         bool ok=!JS_IsException(report)&&!JS_IsException(endpoints)&&JS_SetPrototype(ctx,endpoints,JS_NULL)>=0;
         /* report-to takes precedence. Reporting API delivery is not a legacy
@@ -462,19 +480,21 @@ static void policy_task(struct worker *w){
         JS_FreeValue(ctx,endpoints);JS_FreeValue(ctx,report);
     }
     JSValue log=JS_NewObject(w->ctx);
-    if(!JS_IsException(log)){JS_DefinePropertyValueStr(w->ctx,log,"message",JS_NewString(w->ctx,"Trusted Types CSP violation in Worker"),JS_PROP_C_W_E);send_value(w,NJW_CONSOLE,0,0,log);}
+    if(!JS_IsException(log)){JS_DefinePropertyValueStr(w->ctx,log,"message",JS_NewString(w->ctx,"Content Security Policy violation in Worker"),JS_PROP_C_W_E);send_value(w,NJW_CONSOLE,0,0,log);}
     else{JSValue ignored=JS_GetException(w->ctx);JS_FreeValue(w->ctx,ignored);}JS_FreeValue(w->ctx,log);
     JSValue r=hook(w,"safetyViolation",1,&v->init);if(JS_IsException(r))exception(w);JS_FreeValue(w->ctx,r);JS_FreeValue(w->ctx,v->init);js_free(w->ctx,v);
 }
 int main(int argc,char**argv){
     struct worker w={0};w.shared=argc>1&&!strcmp(argv[1],"--shared-server");w.script_url=argc>2?argv[2]:"";w.hooks=JS_UNDEFINED;w.rt=JS_NewRuntime();if(!w.rt)return 1;JS_SetMemoryLimit(w.rt,NJW_HEAP_BYTES);JS_SetMaxStackSize(w.rt,512u*1024u);JS_SetCanBlock(w.rt,false);JS_SetInterruptHandler(w.rt,interrupt,&w);w.ctx=JS_NewContext(w.rt);if(!w.ctx){JS_FreeRuntime(w.rt);return 1;}JS_SetContextOpaque(w.ctx,&w);w.until=uptime_ms()+10000;
     if(trusted_native_init(w.ctx)<0)goto shutdown;
+    if(web_js_wasm_init(w.ctx,wasm_poll,wasm_can_compile)<0)goto shutdown;
     JSValue global=JS_GetGlobalObject(w.ctx),host=JS_NewObject(w.ctx);
     const JSCFunctionListEntry funcs[]={JS_CFUNC_DEF("trusted",4,native_trusted),JS_CFUNC_DEF("safety",6,native_safety),
         JS_CFUNC_DEF("safetyRequired",1,native_safety_required),JS_CFUNC_DEF("send",3,native_send),JS_CFUNC_DEF("classID",1,native_class),
         JS_CFUNC_DEF("detach",1,native_detach),JS_CFUNC_DEF("transferCommit",1,native_transfer_commit),JS_CFUNC_DEF("portSend",6,native_port_send),
+        JS_CFUNC_DEF("bufferTransferable",1,native_buffer_transferable),
         JS_CFUNC_DEF("portLease",3,native_port_lease),JS_CFUNC_DEF("now",0,native_now),JS_CFUNC_DEF("url",0,native_context_url),JS_CFUNC_DEF("securityURL",0,native_security_url),JS_CFUNC_DEF("referrerPolicy",0,native_referrer_policy),
-        JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",6,native_request),JS_CFUNC_DEF("cancel",1,native_cancel),
+        JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",6,native_request),JS_CFUNC_DEF("dataURL",1,native_data_url),JS_CFUNC_DEF("cancel",1,native_cancel),
         JS_CFUNC_DEF("import",1,native_import),JS_CFUNC_DEF("eval",2,native_eval)};
     JS_SetPropertyFunctionList(w.ctx,host,funcs,sizeof funcs/sizeof funcs[0]);
     web_js_encoding_init_isolated(w.ctx,host);web_js_navigator_init(w.ctx,host);web_js_crypto_init(w.ctx,host);
@@ -510,5 +530,6 @@ shutdown:
     while(w.violations){struct policy_violation *v=w.violations;w.violations=v->next;JS_FreeValue(w.ctx,v->init);js_free(w.ctx,v);}
     html_policy_free(&w.policy_doc);free(w.policy_doc.url);free(w.security_url);
     while(w.output){struct outgoing*p=w.output;w.output=p->next;output_packet_free(&w,p);}
+    web_js_wasm_cancel(w.ctx);
     while(w.head){struct deferred*d=w.head;w.head=d->next;deferred_free(d);}while(w.before_start){struct deferred*d=w.before_start;w.before_start=d->next;deferred_free(d);}output_ports_free(&w,w.ports);while(w.leases){struct broker_lease*l=w.leases;w.leases=l->next;free(l);}while(w.loads){struct pending_load*p=w.loads;w.loads=p->next;if(p->client)p->client->references--;free(p);}while(w.clients){struct client*c=w.clients;w.clients=c->next;if(c->active)close(c->fd);free(c->data);free(c);}free(w.pollfds);free(w.pollclients);JS_FreeValue(w.ctx,w.hooks);JS_FreeContext(w.ctx);JS_FreeRuntime(w.rt);return 0;
 }

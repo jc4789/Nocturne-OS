@@ -10,6 +10,7 @@ general-purpose OS: see [Limits](#limits). A few borrowed pieces of code are inc
 - Limine loads the kernel and the initial ramdisk.
 - BearSSL provides TLS.
 - Lexbor が HTML の字句解析・木構築を、QuickJS が JavaScript 言語の実行を担当します。ブラウザー API と描画は Nocturne 側の実装です。
+- WebAssembly は WABT の検証器と Store を基盤に、wasm2c の生成 C を Nocturne 内の TCC でコンパイルし、Window／Worker のブラウザー内でネイティブ実行します。変換未対応の命令は理由を記録してインタープリターへ戻します。Module／Instance／Memory／Table／Global、Promise／buffered streaming API、本物の JSPI（Suspending／promising の中断・再開・取消）を接続し、`/bin/wasm2c` と C ランタイムも同梱しています。Core 3.0 全体への適合、共有メモリ／Atomics、Module の Worker 転送、GC／文字列組込みの全面対応は意味しません。Puter の Firefox Wasm は Launch 実クリックまで確認しましたが、Atomics.waitAsync 不足で Firefox 本体の起動は未達です。
 - TinyCC is the C compiler that runs inside the OS.
 - 限定したFFmpeg 9.0.2のC decoderを、Nocturne固有のIO・音声・動画表示に移植しています。
 - stb_truetype, stb_image, JebP and NanoSVG read fonts and images for the web browser, which draws text in Inter.

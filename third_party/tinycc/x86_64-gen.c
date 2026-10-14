@@ -156,6 +156,7 @@ ST_DATA const int reg_classes[NB_REGS] = {
 };
 
 static unsigned long func_sub_sp_offset;
+static unsigned long func_stack_guard_immediate;
 static int func_ret_sub;
 
 #if defined(CONFIG_TCC_BCHECK)
@@ -620,10 +621,64 @@ void store(int r, SValue *v)
     gen_modrm_impl(opc, ll, r, fr, v->sym, fc);
 }
 
+/* Nocturne's explicit Wasm profile reserves R15 for a run-local descriptor
+ * and R12 as scratch. Neither is in TinyCC's allocated integer register set.
+ * Check before changing RSP or writing below it; failure restores a safe C
+ * trap anchor without pushing even a return address on the exhausted stack. */
+static int nocturne_stack_guard_enabled(void)
+{
+    return tcc_state->nocturne_stack_guard && !nocode_wanted;
+}
+
+static void nocturne_stack_guard_finish(int underflow, unsigned alignment)
+{
+    int done;
+    if (alignment > 1) {
+        o(0xe48149); /* and $-alignment,%r12 */
+        gen_le32(-(int)alignment);
+    }
+    o(0xa73b4d); /* cmp low(%r15),%r12 */
+    gen_le32(tcc_state->stack_low_offset);
+    done = oad(0x830f, 0); /* jae checked */
+    gsym_addr(underflow, ind);
+    o(0xa78b49); /* mov recovery_sp(%r15),%rsp */
+    gen_le32(tcc_state->stack_recovery_offset);
+    o(0xa7ff41); /* jmp *exhausted(%r15) */
+    gen_le32(tcc_state->stack_handler_offset);
+    gsym_addr(done, ind);
+}
+
+/* Return the immediate position so the function's actual frame can be
+ * patched when its local allocation size is known in gfunc_epilog. */
+static unsigned long nocturne_stack_guard(unsigned bytes, unsigned alignment)
+{
+    unsigned long immediate;
+    int underflow;
+    if (!nocturne_stack_guard_enabled()) return 0;
+    if (bytes > INT_MAX) tcc_error("native stack adjustment exceeds signed x86-64 immediate");
+    o(0xe48949); /* mov %rsp,%r12 */
+    immediate = oad(0xec8149, bytes); /* sub $bytes,%r12 */
+    underflow = oad(0x820f, 0); /* jb exhausted (unsigned subtraction wrap) */
+    nocturne_stack_guard_finish(underflow, alignment);
+    return immediate;
+}
+
+static void nocturne_stack_guard_register(int reg, unsigned alignment)
+{
+    int underflow;
+    if (!nocturne_stack_guard_enabled()) return;
+    o(0xe48949); /* mov %rsp,%r12 */
+    g(0x49 | (REX_BASE(reg) << 2));
+    g(0x29); g(0xc4 | (REG_VALUE(reg) << 3)); /* sub reg,%r12 */
+    underflow = oad(0x820f, 0);
+    nocturne_stack_guard_finish(underflow, alignment);
+}
+
 /* 'is_jmp' is '1' if it is a jump */
 static void gcall_or_jmp(int is_jmp)
 {
     int r;
+    if (!is_jmp) nocturne_stack_guard(PTR_SIZE, 0);
     if ((vtop->r & (VT_VALMASK | VT_LVAL)) == VT_CONST &&
 	((vtop->r & VT_SYM) && (vtop->c.i-4) == (int)(vtop->c.i-4))) {
         /* constant symbolic case -> simple relocation */
@@ -1282,6 +1337,7 @@ void gfunc_call(int nb_args)
 	       (stack grows down), so the adjustment needs to happen _after_
 	       an argument that requires it.  */
             if (stack_adjust) {
+	        nocturne_stack_guard(PTR_SIZE, 0);
 	        o(0x50); /* push %rax; aka sub $8,%rsp */
                 args_size += 8;
 	        stack_adjust = 0;
@@ -1295,6 +1351,7 @@ void gfunc_call(int nb_args)
 	switch (vtop->type.t & VT_BTYPE) {
 	    case VT_STRUCT:
 		/* allocate the necessary size on stack */
+		nocturne_stack_guard(size, 0);
 		o(0x48);
 		oad(0xec81, size); /* sub $xxx, %rsp */
 		/* generate structure store */
@@ -1304,9 +1361,12 @@ void gfunc_call(int nb_args)
 		vset(&vtop->type, r | VT_LVAL, 0);
 		vswap();
 		/* keep stack aligned for (__bound_)memmove call */
+		nocturne_stack_guard(16, 16);
 		o(0x10ec8348); /* sub $16,%rsp */
 		o(0xf0e48348); /* and $-16,%rsp */
+		nocturne_stack_guard(PTR_SIZE, 0);
 		orex(0,r,0,0x50 + REG_VALUE(r)); /* push r (last %rsp) */
+		nocturne_stack_guard(PTR_SIZE, 0);
 		o(0x08ec8348); /* sub $8,%rsp */
 		vstore();
 		o(0x08c48348); /* add $8,%rsp */
@@ -1315,6 +1375,7 @@ void gfunc_call(int nb_args)
 
 	    case VT_LDOUBLE:
                 gv(RC_ST0);
+                nocturne_stack_guard(size, 0);
                 oad(0xec8148, size); /* sub $xxx, %rsp */
                 o(0x7cdb); /* fstpt 0(%rsp) */
                 g(0x24);
@@ -1325,6 +1386,7 @@ void gfunc_call(int nb_args)
 	    case VT_DOUBLE:
 		assert(mode == x86_64_mode_sse);
 		r = gv(RC_FLOAT);
+		nocturne_stack_guard(PTR_SIZE, 0);
 		o(0x50); /* push $rax */
 		/* movq %xmmN, (%rsp) */
 		o(0xd60f66);
@@ -1337,6 +1399,7 @@ void gfunc_call(int nb_args)
 		/* simple type */
 		/* XXX: implicit cast ? */
 		r = gv(RC_INT);
+		nocturne_stack_guard(PTR_SIZE, 0);
 		orex(0,r,0,0x50 + REG_VALUE(r)); /* push r */
 		break;
 	}
@@ -1434,6 +1497,7 @@ void gfunc_prolog(Sym *func_sym)
     sym = func_type->ref;
     addr = PTR_SIZE * 2;
     loc = 0;
+    func_stack_guard_immediate = nocturne_stack_guard(0, 0);
     ind += FUNC_PROLOG_SIZE;
     func_sub_sp_offset = ind;
     func_ret_sub = 0;
@@ -1592,6 +1656,12 @@ void gfunc_epilog(void)
     }
     /* align local size to word & save local variables */
     v = (-loc + 15) & -16;
+    if (func_stack_guard_immediate) {
+        if (v < 0 || (unsigned)v > INT_MAX - PTR_SIZE)
+            tcc_error("native frame exceeds signed x86-64 stack adjustment");
+        /* The frame's saved RBP is a real stack write as well. */
+        write32le(cur_text_section->data + func_stack_guard_immediate, v + PTR_SIZE);
+    }
     saved_ind = ind;
     ind = func_sub_sp_offset - FUNC_PROLOG_SIZE;
     o(0xe5894855);  /* push %rbp, mov %rsp, %rbp */
@@ -2018,12 +2088,14 @@ void gen_cvt_itof(int t)
         if ((vtop->type.t & VT_BTYPE) == VT_LLONG) {
             /* signed long long to float/double/long double (unsigned case
                is handled generically) */
+            nocturne_stack_guard(PTR_SIZE, 0);
             o(0x50 + (vtop->r & VT_VALMASK)); /* push r */
             o(0x242cdf); /* fildll (%rsp) */
             o(0x08c48348); /* add $8, %rsp */
         } else if ((vtop->type.t & (VT_BTYPE | VT_UNSIGNED)) ==
                    (VT_INT | VT_UNSIGNED)) {
             /* unsigned int to float/double/long double */
+            nocturne_stack_guard(2 * PTR_SIZE, 0);
             o(0x6a); /* push $0 */
             g(0x00);
             o(0x50 + (vtop->r & VT_VALMASK)); /* push r */
@@ -2031,6 +2103,7 @@ void gen_cvt_itof(int t)
             o(0x10c48348); /* add $16, %rsp */
         } else {
             /* int to float/double/long double */
+            nocturne_stack_guard(PTR_SIZE, 0);
             o(0x50 + (vtop->r & VT_VALMASK)); /* push r */
             o(0x2404db); /* fildl (%rsp) */
             o(0x08c48348); /* add $8, %rsp */
@@ -2069,6 +2142,7 @@ void gen_cvt_ftof(int t)
             o(0xc0 + REG_VALUE(vtop->r)*9);
         } else if (tbt == VT_LDOUBLE) {
             save_reg(RC_ST0);
+            nocturne_stack_guard(16, 0); /* actual -0x10(%rsp) scratch below */
             /* movss %xmm0,-0x10(%rsp) */
             o(0x110ff3);
             o(0x44 + REG_VALUE(vtop->r)*8);
@@ -2085,6 +2159,7 @@ void gen_cvt_ftof(int t)
             o(0xc0 + REG_VALUE(vtop->r)*9);
         } else if (tbt == VT_LDOUBLE) {
             save_reg(RC_ST0);
+            nocturne_stack_guard(16, 0);
             /* movsd %xmm0,-0x10(%rsp) */
             o(0x110ff2);
             o(0x44 + REG_VALUE(vtop->r)*8);
@@ -2096,6 +2171,7 @@ void gen_cvt_ftof(int t)
         int r;
         gv(RC_ST0);
         r = get_reg(RC_FLOAT);
+        nocturne_stack_guard(16, 0);
         if (tbt == VT_DOUBLE) {
             o(0xf0245cdd); /* fstpl -0x10(%rsp) */
             /* movsd -0x10(%rsp),%xmm0 */
@@ -2230,6 +2306,7 @@ ST_FUNC void gen_vla_alloc(CType *type, int align) {
     else {
         int r;
         r = gv(RC_INT); /* allocation size */
+        nocturne_stack_guard_register(r, 16);
         /* sub r,%rsp */
         o(0x2b48);
         o(0xe0 | REG_VALUE(r));

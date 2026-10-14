@@ -17,6 +17,27 @@ static int trusted_native_init(JSContext *ctx) {
     JSClassDef def={.class_name="TrustedType",.finalizer=trusted_value_finalizer,.gc_mark=trusted_value_mark};
     return JS_NewClass(rt,trusted_value_class,&def);
 }
+/* Shared native CSP record for Window and Worker. These fields never come
+ * from writable author globals or an author-provided policy dictionary. */
+static JSValue wasm_policy_violation_init(JSContext *ctx,const struct web_html_policy_rule *rule,
+                                           const char *url,int status) {
+    JSValue init=JS_NewObjectProto(ctx,JS_NULL);
+    if(JS_IsException(init))return init;
+    const char *keys[]={"effectiveDirective","violatedDirective","blockedURI","sample",
+        "disposition","originalPolicy","documentURI","sourceFile","referrer"};
+    const char *values[]={"script-src","script-src","wasm-eval","",
+        rule->report_only?"report":"enforce",rule->original_policy?rule->original_policy:"",
+        url?url:"",url?url:"",""};
+    for(size_t i=0;i<sizeof keys/sizeof *keys;i++){
+        JSValue value=JS_NewString(ctx,values[i]);
+        if(JS_IsException(value)||JS_DefinePropertyValueStr(ctx,init,keys[i],value,JS_PROP_C_W_E)<0)goto fail;
+    }
+    if(JS_DefinePropertyValueStr(ctx,init,"statusCode",JS_NewInt32(ctx,status),JS_PROP_C_W_E)<0 ||
+       JS_DefinePropertyValueStr(ctx,init,"lineNumber",JS_NewInt32(ctx,0),JS_PROP_C_W_E)<0 ||
+       JS_DefinePropertyValueStr(ctx,init,"columnNumber",JS_NewInt32(ctx,0),JS_PROP_C_W_E)<0)goto fail;
+    return init;
+fail:JS_FreeValue(ctx,init);return JS_EXCEPTION;
+}
 static JSValue native_trusted(JSContext *ctx,JSValueConst this_value,int argc,JSValueConst *argv) {
     (void)this_value;
     if(argc<1)return JS_ThrowTypeError(ctx,"Trusted Type operation required");

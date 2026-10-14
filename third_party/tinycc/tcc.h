@@ -851,8 +851,16 @@ struct TCCState {
     /* error handling */
     void *error_opaque;
     void (*error_func)(void *opaque, const char *msg);
+    void *interrupt_opaque;
+    int (*interrupt_func)(void *opaque);
+    unsigned interrupt_work;
     int error_set_jmp_enabled;
     jmp_buf error_jmp_buf;
+    int api_guard_enabled;
+    jmp_buf api_jmp_buf;
+    int memory_error;
+    unsigned nocturne_stack_guard;
+    unsigned stack_low_offset, stack_recovery_offset, stack_handler_offset;
     int nb_errors;
 
     /* output file for preprocessing (-E) */
@@ -1397,6 +1405,7 @@ ST_FUNC void parse_define(void);
 ST_FUNC void skip_to_eol(int warn);
 ST_FUNC void preprocess(int is_bof);
 ST_FUNC void next(void);
+ST_FUNC void tcc_poll_interrupt(void);
 ST_INLN void unget_tok(int last_tok);
 ST_FUNC void preprocess_start(TCCState *s1, int filetype);
 ST_FUNC void preprocess_end(TCCState *s1);
@@ -1927,7 +1936,19 @@ dwarf_read_sleb128(unsigned char **ln, unsigned char *end)
 
 /********************************************************/
 #if CONFIG_TCC_SEMLOCK
-#if defined _WIN32
+#if CONFIG_TCC_NOCTURNE
+#include <limits.h>
+#include <nocturne.h>
+typedef struct { volatile uint32_t held; } TCCSem;
+static inline void wait_sem(TCCSem *p) {
+    while (__atomic_exchange_n(&p->held, 1, __ATOMIC_ACQUIRE))
+        wait_on_address(&p->held, 1, UINT_MAX);
+}
+static inline void post_sem(TCCSem *p) {
+    __atomic_store_n(&p->held, 0, __ATOMIC_RELEASE);
+    wake_address(&p->held, 1);
+}
+#elif defined _WIN32
 typedef struct { volatile LONG init; CRITICAL_SECTION cs; } TCCSem;
 static inline void wait_sem(TCCSem *p) {
     if (InterlockedCompareExchange(&p->init, 1, 0) == 0) {

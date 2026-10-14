@@ -91,6 +91,8 @@ float atanf(float x);
 float fmodf(float x, float y);
 long double fabsl(long double x);
 long lrint(double x);
+double nearbyint(double x);
+float nearbyintf(float x);
 double expm1(double x);
 double log1p(double x);
 double acosh(double x);

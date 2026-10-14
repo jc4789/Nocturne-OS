@@ -195,6 +195,7 @@
         const abSize=descriptor(Buffer.prototype,'byteLength'),taBuffer=descriptor(typed,'buffer'),taOffset=descriptor(typed,'byteOffset'),taSize=descriptor(typed,'byteLength'),taTag=descriptor(typed,Symbol.toStringTag);
         const dvBuffer=descriptor(DataView.prototype,'buffer'),dvOffset=descriptor(DataView.prototype,'byteOffset'),dvSize=descriptor(DataView.prototype,'byteLength');
         const encode=Encoder.prototype.encode,decode=Decoder.prototype.decode,paramsString=URLSearchParams.prototype.toString;
+        const nativeDataURL=host.dataURL;
         const hstate=h=>{const s=apply(get,headerSlots,[h]);if(!s)throw new TypeError('Illegal Headers invocation');return s;};
         const rstate=r=>{const s=apply(get,responseSlots,[r]);if(!s)throw new TypeError('Illegal Response invocation');return s;};
         const name=k=>{k=text(k).toLowerCase();if(!/^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(k))throw new TypeError('Invalid header name');return k;};
@@ -271,7 +272,23 @@
             const h=headers(headerInit,noCors?'request-no-cors':'request');if(data.type&&!apply(mapHas,hstate(h).map,['content-type']))append(h,'content-type',data.type);
             let lines='';for(const pair of apply(mapEntries,hstate(h).map,[]))lines+=pair[0]+': '+pair[1]+'\r\n';return {bytes:data.bytes,headers:lines};
         }
-        return {Headers,Response,NativePromise,reject:error=>apply(rejectPromise,NativePromise,[error]),text,prepare,networkResponse,remember:(id,p)=>apply(mapSet,fetches,[id,p]),take:id=>{const p=apply(mapGet,fetches,[id]);apply(mapDelete,fetches,[id]);return p;}};
+        function dataFetch(url,method,signal){
+            return new NativePromise((resolve,reject)=>{
+                let done=false,id=0,cleanup=()=>{};
+                const fail=reason=>{if(done)return;done=true;cleanup();if(id)clearTimer(id);reject(reason);};
+                if(signal!=null)cleanup=workerAbortBridge.subscribe(signal,fail);
+                try{id=timer(()=>{
+                    id=0;if(done)return;
+                    try{
+                        const local=apply(nativeDataURL,host,[url]);
+                        const result=response(method==='HEAD'?null:local[0],{status:200,statusText:'OK',headers:headers({'content-type':local[1]},'immutable'),url:url.split('#')[0],redirected:false,type:'basic',abort:signal});
+                        done=true;cleanup();resolve(result);
+                    }catch(error){fail(error);}
+                },0,[],false);}catch(error){fail(error);}
+                if(signal!=null&&workerAbortBridge.state(signal).aborted)fail(workerAbortBridge.state(signal).reason);
+            });
+        }
+        return {Headers,Response,NativePromise,reject:error=>apply(rejectPromise,NativePromise,[error]),text,prepare,networkResponse,dataFetch,remember:(id,p)=>apply(mapSet,fetches,[id,p]),take:id=>{const p=apply(mapGet,fetches,[id]);apply(mapDelete,fetches,[id]);return p;}};
     })();
     const {Headers,Response}=workerFetchBridge,workerFetchURL=URL;
     function fetch(input,options={}){
@@ -293,13 +310,21 @@
             if(ref!==''&&ref!=='about:client'){const source=new workerFetchURL(ref,address);referrerURL=source.protocol==='about:'&&source.pathname==='client'||source.origin!==new workerFetchURL(host.securityURL()).origin?address:source.href;}
             const noReferrer=ref===''||refPolicy==='no-referrer';
             if(signal!=null&&!workerAbortBridge.brand(signal))throw new TypeError('Expected AbortSignal');
-            if((credentials!==undefined&&text(credentials)!=='same-origin')||(requestMode!=='cors'&&requestMode!=='no-cors')||(redirect!==undefined&&text(redirect)!=='follow')||(cache!==undefined&&text(cache)!=='default')||(integrity!==undefined&&text(integrity)!=='')||keepalive)throw new DOMException('Worker Fetch currently supports cors/no-cors, same-origin credentials, and follow redirects','NotSupportedError');
+            const credentialMode=credentials===undefined?'same-origin':text(credentials),redirectMode=redirect===undefined?'follow':text(redirect),cacheMode=cache===undefined?'default':text(cache);
+            if(!['omit','same-origin','include'].includes(credentialMode)||!['follow','error','manual'].includes(redirectMode)||!['default','no-store','reload','no-cache','force-cache','only-if-cached'].includes(cacheMode))throw new TypeError('Invalid Fetch policy');
+            if(requestMode==='navigate')throw new TypeError('Cannot construct navigate request');
+            if(cacheMode==='only-if-cached'&&requestMode!=='same-origin')throw new TypeError('only-if-cached requires same-origin mode');
+            // Integrity remains an explicit existing Worker Fetch limitation;
+            // local data must not silently drop a supplied digest.
+            if(integrity!==undefined&&text(integrity)!=='')throw new DOMException('Worker Fetch integrity is not supported','NotSupportedError');
             if(noReferrer)referrerURL='';else {const source=new workerFetchURL(referrerURL);source.username='';source.password='';source.hash='';referrerURL=source.href;}
             const referrerPolicy=refPolicy?['','no-referrer','no-referrer-when-downgrade','same-origin','origin','strict-origin','origin-when-cross-origin','strict-origin-when-cross-origin','unsafe-url'].indexOf(refPolicy):host.referrerPolicy();
             const noCors=requestMode==='no-cors';if(noCors&&!['GET','HEAD','POST'].includes(requestMethod))throw new TypeError('Method is not CORS-safelisted');
             const prepared=workerFetchBridge.prepare(body,headerInit,requestMethod,noCors);
             const requestURL=url.href;if(closed)throw new TypeError('Worker closed');
             if(signal!=null&&workerAbortBridge.state(signal).aborted)throw workerAbortBridge.state(signal).reason;
+            if(url.protocol==='data:')return workerFetchBridge.dataFetch(requestURL,requestMethod,signal);
+            if(credentialMode!=='same-origin'||(requestMode!=='cors'&&requestMode!=='no-cors')||redirectMode!=='follow'||cacheMode!=='default'||keepalive)throw new DOMException('Worker Fetch currently supports cors/no-cors, same-origin credentials, and follow redirects','NotSupportedError');
             if(signal!=null&&!workerCanCancel)throw new DOMException('This Worker host has no native Fetch cancellation','NotSupportedError');
             return new workerFetchBridge.NativePromise((resolve,reject)=>{const id=host.request(requestURL,noCors,noReferrer,requestMethod,prepared.headers,prepared.bytes,referrerURL,referrerPolicy),p={resolve,reject,noCors,signal,method:requestMethod,cleanup:()=>{}};workerFetchBridge.remember(id,p);if(signal!=null)p.cleanup=workerAbortBridge.subscribe(signal,reason=>{if(!workerFetchBridge.take(id))return;p.cleanup();try{host.cancel(id);}finally{reject(reason);}});});
         }catch(error){return workerFetchBridge.reject(error);}
@@ -310,6 +335,7 @@
         queueMicrotask:fn=>{if(typeof fn!=='function')throw new TypeError('Callback required');Promise.resolve().then(fn).catch(report);},
         performance:{now:()=>host.now()},console:Object.fromEntries(['log','warn','error','info','debug'].map(k=>[k,(...args)=>host.send(7,0,{message:args.map(String).join(' '),filename:address})])),
         addEventListener:target.addEventListener.bind(target),removeEventListener:target.removeEventListener.bind(target),dispatchEvent:target.dispatchEvent.bind(target)});
+    /* @include js_wasm.js */
     Object.defineProperties(globalThis,{name:{get:()=>workerName},onconnect:{get:()=>target.onconnect,set:fn=>target.onconnect=fn},onmessage:{get:()=>target.onmessage,set:fn=>target.onmessage=fn},onmessageerror:{get:()=>target.onmessageerror,set:fn=>target.onmessageerror=fn},onerror:{get:()=>target.onerror,set:fn=>target.onerror=fn},onsecuritypolicyviolation:{get:()=>target.onsecuritypolicyviolation,set:fn=>target.onsecuritypolicyviolation=fn}});
     return {
         safetyCheck:htmlSafetyBridge.check,

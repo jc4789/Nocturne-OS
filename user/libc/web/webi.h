@@ -1161,3 +1161,11 @@ void web_js_selection_changed(web_doc *d, node_t *node);
 /* URL helpers (util.c) */
 bool url_resolve(const char *base, const char *rel, char *out, size_t n);
 void url_encode_form(sbuf *b, const char *s); /* application/x-www-form-urlencoded */
+/* Fetch's data URL processor. Input is a serialized URL; outputs are malloc
+ * owned, binary body is length-delimited (and also NUL terminated). Return 1
+ * on success, 0 for malformed input, -1 for allocation/size failure, -2 when
+ * the optional native checkpoint cancels. No payload or MIME length quota. */
+struct web_data_url { unsigned char *body; size_t length; char *mime; };
+int web_data_url_process(const char *url, struct web_data_url *out,
+                         bool (*checkpoint)(void *), void *opaque);
+void web_data_url_free(struct web_data_url *data);

@@ -29,6 +29,19 @@ LIBTCCAPI void tcc_set_lib_path(TCCState *s, const char *path);
 /* set error/warning callback (optional) */
 typedef void TCCErrorFunc(void *opaque, const char *msg);
 LIBTCCAPI void tcc_set_error_func(TCCState *s, void *error_opaque, TCCErrorFunc *error_func);
+/* Optional cooperative cancellation. Nonzero aborts the active compilation
+   through its ordinary C error recovery, after this callback has returned. */
+LIBTCCAPI void tcc_set_interrupt_func(TCCState *s, int (*callback)(void *), void *opaque);
+/* A C-only operation boundary for embedding. The callback must not contain
+   C++ automatic objects: compiler failures can longjmp to this C frame.
+   Returns the operation's result, -1 for an error, or -2 on allocation failure. */
+LIBTCCAPI int tcc_run_guarded(TCCState *s, int (*operation)(TCCState *, void *), void *opaque);
+LIBTCCAPI int tcc_had_memory_error(TCCState *s);
+/* Explicit Nocturne Wasm profile; ordinary C/ELF compilation never enables
+   the R15 descriptor/R12 scratch calling convention. */
+LIBTCCAPI int tcc_set_nocturne_stack_guard(TCCState *s, unsigned low_offset,
+                                          unsigned recovery_offset,
+                                          unsigned handler_offset);
 
 /* set options as from command line (multiple supported) */
 LIBTCCAPI int tcc_set_options(TCCState *s, const char *str);

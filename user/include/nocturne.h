@@ -77,8 +77,11 @@ NOCTURNE_NORETURN void thread_exit(void);
 int thread_id(void);
 unsigned cpu_index(void);
 /* Eight process-library TLS slots, independent of errno and thread identity. */
+#define N_TLS_WASM_RUNTIME 3 /* Slots 0/1/2 are parallel, layout and CSS. */
 void *thread_local_get(unsigned slot);
 void thread_local_set(unsigned slot, void *value);
+/* Actual reserved stack interval of the calling native task. */
+int thread_stack_bounds(uintptr_t *low, uintptr_t *high);
 /* timeout_ms == UINT32_MAX waits indefinitely; count == 0 wakes all. */
 int wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms);
 int wake_address(volatile uint32_t *address, unsigned count);

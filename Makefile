@@ -187,7 +187,7 @@ $(BUILD)/u/user/libc/web/form_validation.o: user/libc/web/js_form_url.inc
 user/libc/web/unicode_grapheme_data.h: scripts/unicode_grapheme.py third_party/unicode/18.0.0/GraphemeBreakProperty.txt third_party/unicode/18.0.0/DerivedCoreProperties.txt third_party/unicode/18.0.0/emoji-data.txt
 	@$(PY) scripts/unicode_grapheme.py
 $(BUILD)/u/user/libc/web/layout.o: user/libc/web/unicode_grapheme_data.h
-user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_error_event.js user/libc/web/js_clone.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
+user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_error_event.js user/libc/web/js_clone.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js user/libc/web/js_wasm.js user/libc/web/js_wasm.h third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
 	@$(PY) user/libc/web/js_worker_embed.py
 $(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc user/libc/web/js_worker_transfer.h user/libc/web/js_worker_port_lifetime.h
 $(BUILD)/u/user/libc/web/js_worker.o: user/libc/web/js_worker.h user/include/js_worker_wire.h user/libc/web/js_worker_port_lifetime.h
@@ -198,7 +198,22 @@ $(BUILD)/u/%.asm.o: %.asm
 	@$(NASM) -f elf64 -g $< -o $@
 
 # no archiver in the toolchain: lld's --start-lib gives archive semantics to plain objects
-LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(FT_OBJ)
+# Keep C++/WABT as individual lazy archive members, including in the in-OS
+# sysroot. A C application or TinyCC itself does not pull the interpreter or
+# C++ ABI unless a reachable browser/JS object references it.
+WABT_SOURCES := $(shell $(PY) scripts/build_cxx.py wabt-sources)
+WABT_SRC := $(addprefix third_party/wabt/src/,$(WABT_SOURCES))
+WABT_OBJ := $(addprefix $(BUILD)/wabt/,$(addsuffix .o,$(WABT_SOURCES)))
+WASM2C_SOURCES := $(shell $(PY) scripts/build_cxx.py wasm2c-sources)
+WASM2C_SRC := $(addprefix third_party/wabt/src/,$(WASM2C_SOURCES))
+WASM2C_OBJ := $(addprefix $(BUILD)/wabt/,$(addsuffix .o,$(WASM2C_SOURCES)))
+WASM_RT_SRC := third_party/wabt/wasm2c/wasm-rt-impl.c third_party/wabt/wasm2c/wasm-rt-mem-impl.c ports/wabt/wasm_rt_nocturne.c
+WASM_RT_OBJ := $(patsubst %.c,$(BUILD)/u/%.o,$(WASM_RT_SRC))
+WASM_RT_INPUTS := $(wildcard third_party/wabt/wasm2c/* ports/wabt/include/*.h)
+CXX_RUNTIME_OBJ := $(addprefix $(BUILD)/cxx/libcxx/,algorithm.o hash.o memory.o string.o vector.o verbose_abort.o)
+WASM_BRIDGE := $(BUILD)/u/user/libc/web/js_wasm.cpp.o
+WASM_LINK := $(WASM_BRIDGE) $(BUILD)/u/user/libc/cxxabi.cpp.o $(WABT_OBJ) $(WASM2C_OBJ) $(CXX_RUNTIME_OBJ) $(BUILD)/tcc/libtcc.o $(WASM_RT_OBJ) $(BUILD)/u/ports/wabt/wasm_rt_symbols.o
+LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(FT_OBJ) $(WASM_LINK)
 LIBC_RSP := $(BUILD)/libc-objects.list
 
 # Windowsのコマンド長上限を超えないよう、lldとsysrootに同じobject一覧を渡す。
@@ -208,7 +223,7 @@ $(LIBC_RSP): $(LIBC_LINK) Makefile
 $(BUILD)/root/bin/%: $(BUILD)/u/user/apps/%.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
-	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
+	@$(LD) $(ULDFLAGS) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
 
 # C++ is an additional host cross-build path; C/TinyCC keep their own flags.
 $(BUILD)/u/tests/media_cenc_test.o: UCFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg $(UCFLAGS)
@@ -218,12 +233,43 @@ $(BUILD)/tests/media_cenc_test: $(BUILD)/u/tests/media_cenc_test.o $(LIBC_OBJ) $
 	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
 
 CXX_HEADERS := $(shell find user/include -type f) common/abi.h common/gfx.h
-$(BUILD)/cxx/libc++.a: scripts/build_cxx.py $(CXX_HEADERS)
+# One producer owns the archive and all generated members. A missing member
+# re-enters the incremental builder once even when its archive still exists.
+$(BUILD)/cxx/libc++.a $(CXX_RUNTIME_OBJ) &: scripts/build_cxx.py $(CXX_HEADERS)
 	@$(PY) scripts/build_cxx.py library
+
+WABT_INPUTS := $(WABT_SRC) $(wildcard third_party/wabt/include/wabt/* third_party/wabt/include/wabt/interp/* ports/wabt/include/wabt/*) third_party/wabt/UPSTREAM.json
+$(BUILD)/wabt/libwabt.a $(WABT_OBJ) &: scripts/build_cxx.py $(WABT_INPUTS) $(BUILD)/cxx/libc++.a
+	@$(PY) scripts/build_cxx.py wabt
+
+$(BUILD)/wabt/libwasm2c.a $(WASM2C_OBJ) &: scripts/build_cxx.py $(WASM2C_SRC) $(wildcard third_party/wabt/src/template/*) third_party/wabt/scripts/gen-wasm2c-templates.cmake $(WABT_INPUTS) $(BUILD)/cxx/libc++.a
+	@$(PY) scripts/build_cxx.py wasm2c
+
+$(WASM_RT_OBJ) $(BUILD)/u/ports/wabt/wasm_rt_symbols.o: UCFLAGS += -Iports/wabt/include -Ithird_party/wabt/wasm2c -Ithird_party/tinycc
+$(WASM_RT_OBJ) $(BUILD)/u/ports/wabt/wasm_rt_symbols.o: $(WASM_RT_INPUTS)
+$(BUILD)/wabt/libwasm-rt.a: $(WASM_RT_OBJ)
+	@$(PY) scripts/build_cxx.py archive $@ $^
+
+$(WASM_BRIDGE): user/libc/web/js_wasm.cpp $(BUILD)/wabt/libwabt.a $(CXX_HEADERS) third_party/quickjs/quickjs.h
+	@echo "  CXX  $<"
+	@$(PY) scripts/build_cxx.py compile $< -o $@ -I ports/wabt/include -I third_party/wabt/include -I third_party/quickjs -I third_party/tinycc -I third_party/wabt/wasm2c
+
+$(BUILD)/u/third_party/wabt/src/tools/wasm2c.cc.o: third_party/wabt/src/tools/wasm2c.cc $(BUILD)/wabt/libwasm2c.a $(BUILD)/wabt/libwabt.a
+	@$(PY) scripts/build_cxx.py compile $< -o $@ -I ports/wabt/include -I third_party/wabt/include
+
+APP_BINS += $(BUILD)/root/bin/wasm2c
+$(BUILD)/root/bin/wasm2c: $(BUILD)/u/third_party/wabt/src/tools/wasm2c.cc.o $(LIBC_RSP) $(BUILD)/u/user/libc/crt0.asm.o user/cxx.ld user/user.ld
+	@mkdir -p $(dir $@)
+	@echo "  LD++ $@"
+	@$(LD) $(patsubst user/user.ld,user/cxx.ld,$(ULDFLAGS)) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
 
 $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT: $(BUILD)/cxx/libc++.a
 	@mkdir -p $(dir $@)
 	@cp $(BUILD)/cxx/LICENSE.libc++.txt $@
+
+$(BUILD)/root/usr/share/licenses/wabt/LICENSE: third_party/wabt/LICENSE third_party/wabt/UPSTREAM.json
+	@mkdir -p $(dir $@)
+	@cp third_party/wabt/LICENSE third_party/wabt/UPSTREAM.json $(dir $@)
 
 $(BUILD)/u/%.cpp.o: %.cpp $(BUILD)/cxx/libc++.a $(CXX_HEADERS)
 	@echo "  CXX  $<"
@@ -254,10 +300,15 @@ $(BUILD)/tcc/tcc.o: $(wildcard $(TCC_DIR)/*.c $(TCC_DIR)/*.h) ports/tcc/config.h
 	@echo "  CC   $(TCC_DIR)/tcc.c"
 	@$(CC) $(TCC_CFLAGS) -c $(TCC_DIR)/tcc.c -o $@
 
+$(BUILD)/tcc/libtcc.o: $(wildcard $(TCC_DIR)/*.c $(TCC_DIR)/*.h) ports/tcc/config.h $(BUILD)/tcc/tccdefs_.h
+	@mkdir -p $(dir $@)
+	@echo "  CC   $(TCC_DIR)/libtcc.c"
+	@$(CC) $(TCC_CFLAGS) -c $(TCC_DIR)/libtcc.c -o $@
+
 $(BUILD)/root/bin/tcc: $(BUILD)/tcc/tcc.o $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(LIBC_RSP) user/user.ld
 	@mkdir -p $(dir $@)
 	@echo "  LD   $@"
-	@$(LD) $(ULDFLAGS) $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
+	@$(LD) $(ULDFLAGS) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
 
 $(BUILD)/tccrt/%.c.o: $(TCC_DIR)/lib/%.c
 	@mkdir -p $(dir $@)
@@ -278,7 +329,7 @@ $(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(
 		third_party/unifont/OFL-1.1.txt third_party/unifont/NOTICE.txt third_party/unifont/manifest.json \
 		common/abi.h common/gfx.h common/gpu_abi.h $(wildcard user/apps/*.c)
 	@echo "  SYSROOT"
-	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ)
+	@bash scripts/mksysroot.sh $(BUILD)/sysroot $(BUILD)/u/user/libc/crt0.asm.o @$(LIBC_RSP) -- $(TCCRT_OBJ) --wasmrt $(WASM_RT_OBJ)
 	@touch $@
 
 # ---------------------------------------------------------------- images
@@ -291,7 +342,7 @@ user: $(APP_BINS) $(BUILD)/root/bin/tcc
 cxx: $(CPP_BINS) $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT
 lexbor: $(LXB_OBJ)
 
-$(BUILD)/initrd.tar: $(APP_BINS) $(BUILD)/root/bin/tcc $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
+$(BUILD)/initrd.tar: $(APP_BINS) $(BUILD)/root/bin/tcc $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT $(BUILD)/root/usr/share/licenses/wabt/LICENSE $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
 	@echo "  TAR  $@"
 	@$(PY) scripts/mkinitrd.py $@ rootfs $(BUILD)/sounds $(BUILD)/root $(BUILD)/sysroot
 

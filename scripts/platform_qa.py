@@ -181,6 +181,7 @@ def main():
     ap.add_argument('--url')
     ap.add_argument('--command', action='append', default=[])
     ap.add_argument('--guest-file', action='append', default=[], help='明示したconsole入力を隔離dataの/testsへコピー（サイトfixture用ではない）')
+    ap.add_argument('--guest-executable', action='append', default=[], help='クロスコンパイルしたELFを隔離dataの/testsへ配置（通常の配布媒体は変更しない）')
     ap.add_argument('--cmdline', default='')
     ap.add_argument('--resolution', help='隔離bootの通常entryだけに渡す幅x高さx32。元boot設定は変更しない')
     ap.add_argument('--seconds', type=float, default=60)
@@ -316,6 +317,16 @@ def main():
             ap.error('console入力は16KiB以内の通常ファイルです')
         run(BIN / 'mcopy.exe','-o','-i',part,local,'::/tests/'+local.name)
         guest_hashes[local.name] = digest(local)
+    executable_hashes = {}
+    for name in a.guest_executable:
+        local = Path(name)
+        if not local.is_file():
+            ap.error('guest-executableは実在するELFファイルです')
+        with local.open('rb') as executable:
+            if executable.read(len(b'\x7fELF')) != b'\x7fELF':
+                ap.error('guest-executableはELFファイルである必要があります')
+        run(BIN / 'mcopy.exe','-o','-i',part,local,'::/tests/'+local.name)
+        executable_hashes[local.name] = digest(local)
     commands = ['free', 'ps', *a.command]
     if a.url:
         commands += ['browser --debug-js '+a.url]
@@ -347,7 +358,8 @@ def main():
                 'requested_resolution': a.resolution,
                 'requested_scroll_interval': a.scroll_interval,
                 'expected_serial': a.expect, 'rejected_serial': a.reject,
-                'guest_console_sha256': guest_hashes, 'guest_autorun_sha256': digest(script)}
+                'guest_console_sha256': guest_hashes, 'guest_executable_sha256': executable_hashes,
+                'guest_autorun_sha256': digest(script)}
     err = (here / 'qemu-stderr.log').open('wb')
     child_env = dict(ENV)
     if a.virgl_disable_mt:

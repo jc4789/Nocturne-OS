@@ -88,6 +88,9 @@ static void exit_racer(void *arg) {
 static void worker(void *arg) {
     unsigned id = (unsigned)(uintptr_t)arg;
     seen_tid[id] = thread_id();
+    uintptr_t stack_low,stack_high,stack_marker=(uintptr_t)&stack_low;
+    if(thread_stack_bounds(&stack_low,&stack_high) || stack_low>=stack_high ||
+       stack_marker<stack_low || stack_marker>=stack_high)failed();
     thread_local_set(7, (void *)(uintptr_t)(id + 1));
     add(&entered, 1);
     wake_address(&entered, 0);
@@ -290,6 +293,12 @@ int main(int argc, char **argv) {
     struct n_cpuinfo info;
     struct n_clockinfo clock;
     int bad = 0;
+    uintptr_t stack_low,stack_high,stack_marker=(uintptr_t)&stack_low;
+    if(thread_stack_bounds(&stack_low,&stack_high) || stack_low>=stack_high ||
+       stack_marker<stack_low || stack_marker>=stack_high)bad++;
+    uintptr_t unchanged=stack_marker;
+    errno=0;
+    if(thread_stack_bounds(&unchanged,NULL)!=-1 || errno!=EFAULT || unchanged!=stack_marker)bad++;
     if (cpu_info(&info) || clock_info(&clock)) return 1;
     printf("threadtest: scheduler=%u online=%u clock_flags=%u\n", info.scheduler_cpus, info.online_cpus, clock.flags);
     shared_fd = open("/data/threadtest-shared.tmp", O_RDWR | O_CREAT | O_TRUNC);

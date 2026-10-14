@@ -137,7 +137,7 @@ PUB_FUNC int tcc_fclose(FILE *f) {
 
 PUB_FUNC void tcc_enter_state(TCCState *s1)
 {
-    if (s1->error_set_jmp_enabled)
+    if (s1->error_set_jmp_enabled || s1->api_guard_enabled)
         return;
     WAIT_SEM(&tcc_compile_sem);
     tcc_state = s1;
@@ -145,10 +145,48 @@ PUB_FUNC void tcc_enter_state(TCCState *s1)
 
 PUB_FUNC void tcc_exit_state(TCCState *s1)
 {
-    if (s1->error_set_jmp_enabled)
+    if (s1->error_set_jmp_enabled || s1->api_guard_enabled)
         return;
     tcc_state = NULL;
     POST_SEM(&tcc_compile_sem);
+}
+
+LIBTCCAPI int tcc_run_guarded(TCCState *s, int (*operation)(TCCState *, void *), void *opaque)
+{
+    int result = -1;
+    if (s->api_guard_enabled)
+        return operation(s, opaque);
+    tcc_enter_state(s);
+    s->api_guard_enabled = 1;
+    s->memory_error = 0;
+    if (!setjmp(s->api_jmp_buf))
+        result = operation(s, opaque);
+    s->api_guard_enabled = 0;
+    tcc_exit_state(s);
+    return s->memory_error ? -2 : result;
+}
+
+LIBTCCAPI int tcc_had_memory_error(TCCState *s)
+{
+    return s->memory_error;
+}
+
+LIBTCCAPI int tcc_set_nocturne_stack_guard(TCCState *s, unsigned low_offset,
+                                          unsigned recovery_offset,
+                                          unsigned handler_offset)
+{
+#if CONFIG_TCC_NOCTURNE && defined(TCC_TARGET_X86_64)
+    /* x86-64 descriptor operands use signed disp32 addressing. */
+    if (low_offset > INT_MAX || recovery_offset > INT_MAX || handler_offset > INT_MAX)
+        return -1;
+    s->nocturne_stack_guard = 1;
+    s->stack_low_offset = low_offset;
+    s->stack_recovery_offset = recovery_offset;
+    s->stack_handler_offset = handler_offset;
+    return 0;
+#else
+    return -1;
+#endif
 }
 
 /********************************************************/
@@ -251,10 +289,6 @@ static void *default_reallocator(void *ptr, unsigned long size)
     }
     else {
         ptr1 = realloc(ptr, size);
-        if (!ptr1) {
-            fprintf(stderr, "tcc: memory full\n");
-            exit (1);
-        }
     }
     return ptr1;
 }
@@ -290,12 +324,28 @@ PUB_FUNC void tcc_free(void *ptr)
 
 PUB_FUNC void *tcc_malloc(unsigned long size)
 {
-    return reallocator(0, size);
+    return tcc_realloc(NULL, size);
 }
 
 PUB_FUNC void *tcc_realloc(void *ptr, unsigned long size)
 {
-    return reallocator(ptr, size);
+    void *result = reallocator(ptr, size);
+    if (size && !result) {
+        TCCState *s = tcc_state;
+        if (s && s->api_guard_enabled) {
+            s->memory_error = 1;
+            ++s->nb_errors;
+            if (s->error_set_jmp_enabled) {
+                while (nb_stk_data)
+                    tcc_free(*(void**)stk_data[--nb_stk_data]);
+                longjmp(s->error_jmp_buf, 1);
+            }
+            longjmp(s->api_jmp_buf, 1);
+        }
+        fprintf(stderr, "tcc: memory full\n");
+        exit(1);
+    }
+    return result;
 }
 
 PUB_FUNC void *tcc_mallocz(unsigned long size)
@@ -696,12 +746,21 @@ static void error1(int mode, const char *fmt, va_list ap)
             tcc_free(*(void**)stk_data[--nb_stk_data]);
         longjmp(s1->error_jmp_buf, 1);
     }
+    if (mode == ERROR_ERROR && s1->api_guard_enabled)
+        longjmp(s1->api_jmp_buf, 1);
 }
 
 LIBTCCAPI void tcc_set_error_func(TCCState *s, void *error_opaque, TCCErrorFunc *error_func)
 {
     s->error_opaque = error_opaque;
     s->error_func = error_func;
+}
+
+LIBTCCAPI void tcc_set_interrupt_func(TCCState *s, int (*callback)(void *), void *opaque)
+{
+    s->interrupt_func = callback;
+    s->interrupt_opaque = opaque;
+    s->interrupt_work = 0;
 }
 
 /* error without aborting current compilation */
@@ -800,6 +859,14 @@ ST_FUNC int tcc_open(TCCState *s1, const char *filename)
 /* compile the file opened in 'file'. Return non zero if errors. */
 static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
 {
+    /* An entry cancellation has no parser state to unwind. In particular,
+       do not run the previous compilation's scratch cleanup again. */
+    if (s1->interrupt_func && s1->interrupt_func(s1->interrupt_opaque)) {
+        ++s1->nb_errors;
+        if (s1->error_func)
+            s1->error_func(s1->error_opaque, "compilation interrupted");
+        return -1;
+    }
     /* Here we enter the code section where we use the global variables for
        parsing and code generation (tccpp.c, tccgen.c, <target>-gen.c).
        Other threads need to wait until we're done.
@@ -811,6 +878,7 @@ static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
     s1->error_set_jmp_enabled = 1;
 
     if (setjmp(s1->error_jmp_buf) == 0) {
+        s1->interrupt_work = 0;
 
         if (fd == -1) {
             int len = strlen(str);
@@ -866,14 +934,9 @@ LIBTCCAPI void tcc_undefine_symbol(TCCState *s1, const char *sym)
 }
 
 
-LIBTCCAPI TCCState *tcc_new(void)
+static int tcc_initialize(TCCState *s, void *opaque)
 {
-    TCCState *s;
-
-    s = tcc_mallocz(sizeof(TCCState));
-#ifdef MEM_DEBUG
-    tcc_memcheck(1);
-#endif
+    (void)opaque;
 
 #undef gnu_ext
     s->gnu_ext = 1;
@@ -913,11 +976,31 @@ LIBTCCAPI TCCState *tcc_new(void)
 #ifdef CONFIG_TCC_SWITCHES /* predefined options */
     tcc_set_options(s, CONFIG_TCC_SWITCHES);
 #endif
+    return s->nb_errors ? -1 : 0;
+}
+
+LIBTCCAPI TCCState *tcc_new(void)
+{
+    TCCState *s;
+#ifdef MEM_DEBUG
+    s = tcc_mallocz(sizeof(TCCState));
+    tcc_memcheck(1);
+#else
+    /* No state exists yet to own a recovery target. */
+    s = reallocator(NULL, sizeof(TCCState));
+    if (!s) return NULL;
+    memset(s, 0, sizeof(TCCState));
+#endif
+    if (tcc_run_guarded(s, tcc_initialize, NULL) < 0) {
+        tcc_delete(s);
+        return NULL;
+    }
     return s;
 }
 
-LIBTCCAPI void tcc_delete(TCCState *s1)
+static int tcc_release(TCCState *s1, void *opaque)
 {
+    (void)opaque;
     /* free sections */
     tccelf_delete(s1);
 
@@ -956,6 +1039,13 @@ LIBTCCAPI void tcc_delete(TCCState *s1)
 #endif
     /* free loaded dlls array */
     dynarray_reset(&s1->loaded_dlls, &s1->nb_loaded_dlls);
+    return 0;
+}
+
+LIBTCCAPI void tcc_delete(TCCState *s1)
+{
+    if (!s1) return;
+    tcc_run_guarded(s1, tcc_release, NULL);
     tcc_free(s1);
 #ifdef MEM_DEBUG
     tcc_memcheck(-1);

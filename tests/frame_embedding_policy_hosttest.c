@@ -16,6 +16,79 @@ void ns_close(net_stream *s){abort();}
 int http_inflate(char *out,int cap,const char *in,int len,int *consumed){abort();}
 static unsigned checks,failed;
 static void check(bool ok,const char *name){checks++;if(!ok){failed++;printf("FAIL %s\n",name);}}
+static bool wasm_allowed(const web_doc *d,size_t *violations,size_t *reports){
+    bool allowed=true;*violations=*reports=0;
+    for(const struct web_html_policy_rule *r=d&&d->html_policy?d->html_policy->first:NULL;r;r=r->next){
+        if(html_policy_wasm_allowed(r))continue;
+        (*violations)++;if(r->report_only)(*reports)++;else allowed=false;
+    }
+    return allowed;
+}
+static void wasm_policy_cases(void){
+    /* Expected values derive from CSP3 4.5.1: only script-src/default-src
+     * affect byte compilation; report-only still produces a violation. */
+    static const struct {const char *headers;bool allowed;size_t violations,reports;} cases[]={
+        {"",true,0,0},
+        {"Content-Security-Policy: object-src 'none'\r\n",true,0,0},
+        {"Content-Security-Policy: script-src 'self'\r\n",false,1,0},
+        {"Content-Security-Policy: default-src 'none'\r\n",false,1,0},
+        {"Content-Security-Policy: script-src 'self' 'wasm-unsafe-eval'\r\n",true,0,0},
+        {"Content-Security-Policy: script-src 'unsafe-eval'\r\n",true,0,0},
+        {"Content-Security-Policy: SCRIPT-SRC 'UNSAFE-EVAL'\r\n",true,0,0},
+        {"Content-Security-Policy: script-src 'WASM-UNSAFE-EVAL'\r\n",true,0,0},
+        {"Content-Security-Policy: default-src 'wasm-unsafe-eval';script-src 'none'\r\n",false,1,0},
+        {"Content-Security-Policy: default-src 'none';script-src 'wasm-unsafe-eval'\r\n",true,0,0},
+        {"Content-Security-Policy: script-src 'wasm-unsafe-eval';default-src 'none'\r\n",true,0,0},
+        {"Content-Security-Policy: default-src 'wasm-unsafe-eval';script-src\r\n",false,1,0},
+        {"Content-Security-Policy: script-src;script-src 'wasm-unsafe-eval'\r\n",false,1,0},
+        {"Content-Security-Policy: script-src 'wasm-unsafe-eval';script-src 'none'\r\n",true,0,0},
+        {"Content-Security-Policy: default-src 'none';default-src 'wasm-unsafe-eval'\r\n",false,1,0},
+        {"Content-Security-Policy: script-src-elem 'none';default-src 'wasm-unsafe-eval'\r\n",true,0,0},
+        {"Content-Security-Policy: script-src-attr 'wasm-unsafe-eval';default-src 'none'\r\n",false,1,0},
+        {"Content-Security-Policy: script-src https://source.test/'wasm-unsafe-eval'\r\n",false,1,0},
+        {"Content-Security-Policy: script-src 'wasm-unsafe-eval-suffix'\r\n",false,1,0},
+        {"Content-Security-Policy: script-src wasm-unsafe-eval\r\n",false,1,0},
+        {"Content-Security-Policy: script-src 'wasm-unsafe-eval'\v\r\n",false,1,0},
+        {"Content-Security-Policy-Report-Only: script-src 'self'\r\n",true,1,1},
+        {"Content-Security-Policy: script-src 'wasm-unsafe-eval'\r\nContent-Security-Policy-Report-Only: script-src 'none'\r\n",true,1,1},
+        {"Content-Security-Policy: script-src 'none'\r\nContent-Security-Policy-Report-Only: script-src 'wasm-unsafe-eval'\r\n",false,1,0},
+        {"Content-Security-Policy: script-src 'wasm-unsafe-eval',script-src 'none'\r\n",false,1,0},
+        {"Content-Security-Policy: script-src 'none',default-src 'none'\r\n",false,2,0},
+        {"Content-Security-Policy: script-src 'wasm-unsafe-eval'\r\nContent-Security-Policy: default-src 'unsafe-eval'\r\n",true,0,0},
+        {"Content-Security-Policy: default-src 'none';script-src \xc3\xa9 'wasm-unsafe-eval'\r\n",false,1,0},
+        {"Content-Security-Policy: default-src 'none';script-src \xc3\xa9;script-src 'wasm-unsafe-eval'\r\n",true,0,0}
+    };
+    check(html_policy_wasm_allowed(NULL),"missing Wasm rule imposes no restriction");
+    for(size_t i=0;i<sizeof cases/sizeof *cases;i++){
+        web_doc d={.url="https://policy.test/document"},inherited={.url="about:blank"},restored={.url="https://policy.test/worker"};
+        size_t violations,reports;
+        check(html_policy_init(&d,cases[i].headers,NULL),"Wasm policy parse allocation");
+        bool allowed=wasm_allowed(&d,&violations,&reports);
+        if(allowed!=cases[i].allowed||violations!=cases[i].violations||reports!=cases[i].reports)printf("Wasm policy case %zu: %s\n",i,cases[i].headers);
+        check(allowed==cases[i].allowed&&violations==cases[i].violations&&reports==cases[i].reports,"Wasm source selection, report disposition and intersection");
+        check(!html_policy_requires_script(&d),"Wasm policy does not become a Trusted Types requirement");
+        check(html_policy_init(&inherited,NULL,&d),"Wasm inherited policy allocation");
+        check(wasm_allowed(&inherited,&violations,&reports)==cases[i].allowed&&violations==cases[i].violations&&reports==cases[i].reports,"Wasm policy inheritance preserves all rules");
+        char *snapshot=html_policy_snapshot(&d);check(snapshot!=NULL,"Wasm policy snapshot allocation");
+        if(snapshot){
+            check(html_policy_snapshot_init(&restored,snapshot),"Wasm policy snapshot parse");
+            check(wasm_allowed(&restored,&violations,&reports)==cases[i].allowed&&violations==cases[i].violations&&reports==cases[i].reports,"Wasm Worker snapshot preserves decisions and disposition");
+            free(snapshot);
+        }
+        html_policy_free(&restored);html_policy_free(&inherited);html_policy_free(&d);
+    }
+    web_doc meta={.url="https://policy.test/meta"},restored={.url="https://policy.test/worker"};size_t violations,reports;
+    check(html_policy_init(&meta,"Content-Security-Policy: script-src 'wasm-unsafe-eval'\r\n",NULL),"Wasm header retained without Trusted Types");
+    struct web_html_policy_rule *tail=meta.html_policy?meta.html_policy->last:NULL;
+    const char *content="script-src 'none';report-uri /ignored";
+    check(html_policy_meta(&meta,content,strlen(content)),"Wasm meta policy parsed");
+    check(!wasm_allowed(&meta,&violations,&reports)&&violations==1&&reports==0&&meta.html_policy->last->from_meta&&meta.html_policy->last->report_uri_count==0,"Wasm meta restricts and ignores report-uri");
+    char *snapshot=html_policy_snapshot(&meta);
+    check(snapshot&&html_policy_snapshot_init(&restored,snapshot)&&!wasm_allowed(&restored,&violations,&reports)&&restored.html_policy->last->from_meta,"Wasm snapshot preserves meta policy provenance");
+    free(snapshot);html_policy_free(&restored);html_policy_rewind(&meta,tail);
+    check(wasm_allowed(&meta,&violations,&reports)&&violations==0,"parser rewind removes only appended Wasm meta policy");
+    html_policy_free(&meta);
+}
 int main(int argc,char **argv){
     web_doc parent={.url="https://embed.test/page"},top={.url="https://other.test/root"};uint32_t flags=0;
     const char *url="https://embed.test/frame";
@@ -61,5 +134,6 @@ int main(int argc,char **argv){
             if(headers && fread(headers,1,(size_t)n,f)==(size_t)n){headers[n]=0;parent.url=argv[2];url=argv[3];check(ALLOW(headers),"real response embedding policy");}
             else check(false,"real response headers readable");free(headers);fclose(f);}
     }
+    wasm_policy_cases();
     printf("frame embedding policy: %u checks, %u failures\n",checks,failed);return failed!=0;
 }

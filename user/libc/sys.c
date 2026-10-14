@@ -199,6 +199,9 @@ int thread_id(void) {
     return t ? t->tid : (int)SC0(SYS_THREAD_ID);
 }
 unsigned cpu_index(void) { return (unsigned)SC0(SYS_CPU_INDEX); }
+int thread_stack_bounds(uintptr_t *low, uintptr_t *high) {
+    return (int)ret(SC2(SYS_THREAD_STACK_BOUNDS, low, high));
+}
 void *thread_local_get(unsigned slot) {
     struct libc_thread *t = libc_thread_current();
     return t && slot < 8 ? t->slots[slot] : NULL;

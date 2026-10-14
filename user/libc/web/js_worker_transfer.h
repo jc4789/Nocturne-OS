@@ -49,6 +49,7 @@ static JSValue worker_transfer_commit_publish(JSContext *ctx,JSValueConst plan,b
         if(JS_IsException(value))goto out;
         if(JS_GetClassID(value)!=buffer_class){JS_FreeValue(ctx,value);JS_ThrowTypeError(ctx,"Invalid worker transfer buffer");goto out;}
         JS_GetArrayBuffer(ctx,&size,value);if(JS_HasException(ctx)){JS_FreeValue(ctx,value);goto out;}
+        if(!JS_IsArrayBufferTransferable(ctx,value)){JS_FreeValue(ctx,value);JS_ThrowTypeError(ctx,"Native-owned buffer cannot be transferred");goto out;}
         buffers[held++]=value;
     }
     for(uint32_t i=0;i<nw;i++){

@@ -10,6 +10,7 @@ static void frame_cancel(struct web_js_state *s,struct web_frame *f) {
 static void frame_retire_document(web_doc *d) {
     struct web_js_state *s=d?d->js:NULL;if(!s)return;
     s->disabled=true;
+    web_js_wasm_cancel(s->ctx);
     storage_release_document(s);
     web_presentation_free(d);
     release_document_tasks(s);
@@ -235,6 +236,7 @@ static JSValue frame_transfer_commit(JSContext *ctx,struct web_js_state *s,JSVal
         if(JS_GetClassID(value)!=buffer_class){JS_FreeValue(ctx,value);JS_ThrowTypeError(ctx,"Invalid transfer buffer");goto out;}
         JS_GetArrayBuffer(ctx,&size,value);
         if(JS_HasException(ctx)){JS_FreeValue(ctx,value);goto out;}
+        if(!JS_IsArrayBufferTransferable(ctx,value)){JS_FreeValue(ctx,value);JS_ThrowTypeError(ctx,"Native-owned buffer cannot be transferred");goto out;}
         buffers[held++]=value;
     }
     for(uint32_t i=0;i<nw;i++){

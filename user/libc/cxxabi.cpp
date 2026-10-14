@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <new>
+#include <exception>
 
 extern "C" {
 void *malloc(size_t);
@@ -52,6 +53,8 @@ void free_aligned(void *pointer) {
 
 /* libc++ deliberately puts allocation ABI types/functions in unversioned std. */
 namespace std {
+exception::~exception() noexcept = default;
+const char *exception::what() const noexcept { return "std::exception"; }
 const nothrow_t nothrow{};
 new_handler set_new_handler(new_handler handler) noexcept {
     return __atomic_exchange_n(&allocation_handler, handler, __ATOMIC_ACQ_REL);

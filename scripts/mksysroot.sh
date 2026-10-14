@@ -21,7 +21,7 @@ for target in "$S" "$W"; do
     esac
 done
 rm -rf "$S" "$W"
-mkdir -p "$S/usr/include/sys" "$S/usr/lib/tcc/include" "$W/libc" "$W/rt"
+mkdir -p "$S/usr/include/sys" "$S/usr/lib/tcc/include" "$W/libc" "$W/rt" "$W/wasmrt"
 
 cp user/include/*.h "$S/usr/include/"
 cp user/include/sys/*.h "$S/usr/include/sys/"
@@ -29,6 +29,15 @@ cp common/abi.h common/gfx.h common/gpu_abi.h "$S/usr/include/"
 cp ports/tcc/include/*.h "$S/usr/include/"
 cp third_party/bearssl/inc/*.h "$S/usr/include/"
 cp ports/lexbor/include/*.h "$S/usr/include/"
+# wasm2c's regular-memory runtime uses Nocturne-native trap/TLS/stack handling.
+# Its compiler-host symbol binder is not a member of the standalone runtime.
+cp third_party/wabt/wasm2c/wasm-rt.h third_party/wabt/wasm2c/wasm-rt-impl.h "$S/usr/include/"
+cp ports/wabt/include/wasm-rt-nocturne.h ports/wabt/include/wasm-rt-host.h "$S/usr/include/"
+mkdir -p "$S/usr/src/wasm2c" "$S/usr/share/licenses/wabt"
+cp third_party/wabt/wasm2c/wasm-rt-impl.c third_party/wabt/wasm2c/wasm-rt-mem-impl.c \
+   third_party/wabt/wasm2c/wasm-rt-mem-impl-helper.inc third_party/wabt/wasm2c/wasm-rt-impl-tableops.inc \
+   ports/wabt/wasm_rt_nocturne.c "$S/usr/src/wasm2c/"
+cp third_party/wabt/LICENSE third_party/wabt/UPSTREAM.json "$S/usr/share/licenses/wabt/"
 # Preserve Lexbor's include tree, but do not stage its C sources in /usr/include.
 while IFS= read -r h; do
     relative=${h#third_party/lexbor/source/}
@@ -62,6 +71,7 @@ for argument in "$@"; do
 done
 for o in "${objects[@]}"; do
     if [ "$o" = "--" ]; then dest=rt; continue; fi
+    if [ "$o" = "--wasmrt" ]; then dest=wasmrt; continue; fi
     case "$o" in
         *crt0.asm.o) crt0=$o; continue ;;
     esac
@@ -81,6 +91,8 @@ cp "$S/usr/lib/crti.o" "$S/usr/lib/crtn.o"
 
 (cd "$W/libc" && ar rcs ../libc.a *.o)
 mv "$W/libc.a" "$S/usr/lib/libc.a"
+(cd "$W/wasmrt" && ar rcs ../libwasm-rt.a *.o)
+mv "$W/libwasm-rt.a" "$S/usr/lib/libwasm-rt.a"
 mv "$W/rt/runmain.o" "$S/usr/lib/tcc/runmain.o"
 (cd "$W/rt" && ar rcs ../libtcc1.a *.o)
 mv "$W/libtcc1.a" "$S/usr/lib/tcc/libtcc1.a"

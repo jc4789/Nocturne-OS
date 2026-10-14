@@ -784,6 +784,7 @@ typedef struct JSArrayBuffer {
     int max_byte_length; /* -1 if not resizable; >= byte_length otherwise */
     uint8_t detached;
     uint8_t shared; /* if shared, the array buffer cannot be detached */
+    uint8_t transfer_locked; /* native detach key is not author-accessible */
     uint8_t *data; /* NULL if detached */
     struct list_head array_list;
     void *opaque;
@@ -2959,6 +2960,66 @@ void JS_UpdateStackTop(JSRuntime *rt)
 {
     rt->stack_top = js_get_stack_pointer();
     update_stack_limit(rt);
+}
+
+static uintptr_t execution_stack_limit(JSRuntime *rt, uintptr_t low, uintptr_t top)
+{
+    size_t available = top >= low ? top - low : 0;
+    return rt->stack_size && rt->stack_size < available ? top - rt->stack_size : low;
+}
+
+void JS_InitExecutionStackState(JSRuntime *rt, JSExecutionStackState *state,
+                                uintptr_t low, uintptr_t high)
+{
+    state->stack_top = high;
+    state->stack_limit = execution_stack_limit(rt, low, high);
+    state->stack_frame = NULL;
+    state->exception = JS_UNINITIALIZED;
+    state->exception_uncatchable = FALSE;
+}
+
+void JS_SwapExecutionStackState(JSRuntime *rt, JSExecutionStackState *state)
+{
+    JSExecutionStackState previous = {
+        rt->stack_top, rt->stack_limit, rt->current_stack_frame,
+        rt->current_exception, rt->current_exception_is_uncatchable
+    };
+    rt->stack_top = state->stack_top;
+    rt->stack_limit = state->stack_limit;
+    rt->current_stack_frame = state->stack_frame;
+    rt->current_exception = state->exception;
+    rt->current_exception_is_uncatchable = state->exception_uncatchable;
+    *state = previous;
+}
+
+void JS_FreeExecutionStackState(JSRuntime *rt, JSExecutionStackState *state)
+{
+    /* A live frame must be resumed/unwound by its owner, never freed here. */
+    assert(state->stack_frame == NULL);
+    JS_FreeValueRT(rt, state->exception);
+    state->exception = JS_UNINITIALIZED;
+}
+
+JS_BOOL JS_HasActiveJSFrames(JSRuntime *rt)
+{
+    return rt->current_stack_frame != NULL;
+}
+
+int JS_RebaseExecutionStack(JSRuntime *rt, uintptr_t low, uintptr_t high)
+{
+    uintptr_t top = js_get_stack_pointer();
+    if (top < low || top >= high)
+        return -1;
+    /* A JS -> Wasm -> JS re-entry must not reset the existing JS recursion
+       budget. Only the first callback on a purely native stack gets a base. */
+    if (rt->current_stack_frame) {
+        if (rt->stack_limit < low)
+            rt->stack_limit = low;
+        return 0;
+    }
+    rt->stack_top = top;
+    rt->stack_limit = execution_stack_limit(rt, low, top);
+    return 0;
 }
 
 static inline BOOL is_strict_mode(JSContext *ctx)
@@ -6687,6 +6748,12 @@ static void gc_mark_symbol(JSString *p, JS_MarkFunc *mark_func)
     } else if (mark_func == gc_scan_incref_child || mark_func == gc_scan_incref_child2) {
         js_rc(p)->ref_count++;
     }
+}
+
+void JS_MarkContextRef(JSRuntime *rt, JSContext *ctx, JS_MarkFunc *mark_func)
+{
+    if (ctx)
+        mark_func(rt, &ctx->header);
 }
 
 void JS_MarkValue(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
@@ -54473,6 +54540,21 @@ static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
     return result_promise;
 }
 
+JSValue JS_PromiseResolveIntrinsic(JSContext *ctx, JSValueConst value)
+{
+    return js_promise_resolve(ctx, ctx->promise_ctor, 1, &value, 0);
+}
+
+int JS_PromiseAddReactions(JSContext *ctx, JSValueConst promise,
+                          JSValueConst on_fulfilled, JSValueConst on_rejected)
+{
+    JSValueConst handlers[2] = { on_fulfilled, on_rejected };
+    JSValueConst resolving[2] = { JS_UNDEFINED, JS_UNDEFINED };
+    if (!JS_GetOpaque2(ctx, promise, JS_CLASS_PROMISE))
+        return -1;
+    return perform_promise_then(ctx, promise, handlers, resolving);
+}
+
 static JSValue js_promise_withResolvers(JSContext *ctx,
                                         JSValueConst this_val,
                                         int argc, JSValueConst *argv)
@@ -57544,6 +57626,7 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
     init_list_head(&abuf->array_list);
     abuf->detached = FALSE;
     abuf->shared = (class_id == JS_CLASS_SHARED_ARRAY_BUFFER);
+    abuf->transfer_locked = FALSE;
     abuf->opaque = opaque;
     abuf->free_func = free_func;
     if (alloc_flag && buf)
@@ -57819,6 +57902,21 @@ void JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj)
     js_array_buffer_update_typed_arrays(abuf);
 }
 
+int JS_SetArrayBufferTransferable(JSContext *ctx, JSValueConst obj, JS_BOOL allowed)
+{
+    JSArrayBuffer *abuf = JS_GetOpaque2(ctx, obj, JS_CLASS_ARRAY_BUFFER);
+    if (!abuf) return -1;
+    abuf->transfer_locked = !allowed;
+    return 0;
+}
+
+int JS_IsArrayBufferTransferable(JSContext *ctx, JSValueConst obj)
+{
+    JSArrayBuffer *abuf = JS_GetOpaque(obj, JS_CLASS_ARRAY_BUFFER);
+    (void)ctx;
+    return abuf && !abuf->shared && !abuf->detached && !abuf->transfer_locked;
+}
+
 /* get an ArrayBuffer or SharedArrayBuffer */
 static JSArrayBuffer *js_get_array_buffer(JSContext *ctx, JSValueConst obj)
 {
@@ -57879,6 +57977,8 @@ static JSValue js_array_buffer_transfer(JSContext *ctx,
         return JS_EXCEPTION;
     if (abuf->detached)
         return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
+    if (abuf->transfer_locked)
+        return JS_ThrowTypeError(ctx, "ArrayBuffer is not transferable by its native owner");
     pmax_len = NULL;
     if (!transfer_to_fixed_length) {
         if (array_buffer_is_resizable(abuf)) { // carry over maxByteLength

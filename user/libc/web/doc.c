@@ -116,63 +116,12 @@ static bool css_queued(web_doc *d, const char *url) {
 }
 
 /* ---------------------------------------------------------------- data: URLs */
-static int b64(int c) {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+' || c == '-') return 62;
-    if (c == '/' || c == '_') return 63;
-    return -1;
-}
-
-static int hexv(int c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    c = lower(c);
-    return c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
-}
-
 /* decode a data: URL into a malloc'd buffer */
-static char *data_url(const char *u, size_t *out_n) {
-    if (strncasecmp(u, "data:", 5)) return NULL;
-    const char *comma = strchr(u, ',');
-    if (!comma) return NULL;
-    bool base64 = false;
-    for (const char *p = u + 5; p + 7 <= comma; p++)
-        if (!strncasecmp(p, ";base64", 7)) base64 = true;
-    const char *s = comma + 1;
-    size_t n = strlen(s);
-    char *o = malloc(n + 1);
-    if(!o)return NULL;
-    size_t k = 0;
-    if (base64) {
-        uint32_t acc = 0;
-        int bits = 0;
-        for (size_t i = 0; i < n; i++) {
-            int c = (unsigned char)s[i];
-            if (c == '%' && i + 2 < n && hexv(s[i + 1]) >= 0 && hexv(s[i + 2]) >= 0) {
-                c = hexv(s[i + 1]) * 16 + hexv(s[i + 2]);
-                i += 2;
-            }
-            int v = b64(c);
-            if (v < 0) continue;
-            acc = acc << 6 | (uint32_t)v;
-            bits += 6;
-            if (bits >= 8) {
-                bits -= 8;
-                o[k++] = (char)(acc >> bits);
-            }
-        }
-    } else {
-        for (size_t i = 0; i < n; i++) {
-            if (s[i] == '%' && i + 2 < n && hexv(s[i + 1]) >= 0 && hexv(s[i + 2]) >= 0) {
-                o[k++] = (char)(hexv(s[i + 1]) * 16 + hexv(s[i + 2]));
-                i += 2;
-            } else o[k++] = s[i];
-        }
-    }
-    o[k] = 0;
-    *out_n = k;
-    return o;
+static bool data_url_checkpoint(void *opaque){return web_native_checkpoint(opaque);}
+static char *data_url(web_doc *d,const char *u,size_t *out_n,int *status) {
+    *out_n=0;struct web_data_url data;int result=web_data_url_process(u,&data,data_url_checkpoint,d);
+    if(status)*status=result;if(result!=1)return NULL;
+    char *body=(char *)data.body;*out_n=data.length;data.body=NULL;web_data_url_free(&data);return body;
 }
 
 /* ---------------------------------------------------------------- collecting resources */
@@ -458,7 +407,7 @@ static int add_image_url(web_doc *d,const char *abs,bool retry_failed,int prefer
     int idx = d->images.n - 1;
     if (!strncasecmp(abs, "data:", 5)) {
         size_t n;
-        char *data = data_url(abs, &n);
+        char *data = data_url(d,abs,&n,NULL);
         web_image_loaded(d, idx, data, n);
         free(data);
     }
@@ -595,8 +544,8 @@ int doc_cssom_link_source(web_doc *d,node_t *n,struct cssom_link_source *source)
     int resolved=web_resolve_url_owned(d->base,href,&source->url);
     if(resolved!=1)return resolved<0?CSSOM_OOM:CSSOM_INACTIVE;
     if(!strncasecmp(source->url,"data:",5)) {
-        source->owned_text=data_url(source->url,&source->length);
-        if(!source->owned_text){bool malformed=!strchr(source->url,',');free(source->url);memset(source,0,sizeof *source);return malformed?CSSOM_INACTIVE:CSSOM_OOM;}
+        int result;source->owned_text=data_url(d,source->url,&source->length,&result);
+        if(!source->owned_text){free(source->url);memset(source,0,sizeof *source);return result==-1?CSSOM_OOM:CSSOM_INACTIVE;}
         source->text=source->owned_text;source->base=d->base;return CSSOM_OK;
     }
     struct cached_css *cached=cached_css(d,source->url);
@@ -729,7 +678,7 @@ static void scan(web_doc *d, node_t *n, node_t *scope) {
             pd->scope = scope;
             if (!strncasecmp(abs, "data:", 5)) {
                 size_t dn;
-                char *css = data_url(abs, &dn);
+                char *css = data_url(d,abs,&dn,NULL);
                 bool complete=true;
                 if (css && link_sheet_applies(c)) {
                     if(c->cssom_current) {
@@ -2119,6 +2068,13 @@ static node_t *find_anchor(node_t *root, const char *frag, bool named) {
         c = c->next;
     }
     return NULL;
+}
+
+/* Fragment percent-decoding also uses a hex digit conversion. Keep this
+ * document-navigation helper independent of Fetch's private data decoder. */
+static int hexv(int c) {
+    if(c>='0'&&c<='9')return c-'0';
+    c=lower(c);return c>='a'&&c<='f'?c-'a'+10:-1;
 }
 
 int web_anchor_y(web_doc *d, const char *fragment) {

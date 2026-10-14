@@ -1,4 +1,4 @@
-/* Trusted Types CSP directives are native document policy, not JS properties.
+/* Trusted Types and Wasm compilation CSP are native policy, not JS properties.
    Each header field/list policy is retained separately for intersection. */
 #include "html_policy.h"
 #include "frame.h"
@@ -7,6 +7,9 @@ bool html_policy_requires_script(const web_doc *d) {
     for(const struct web_html_policy_rule *r=d && d->html_policy?d->html_policy->first:NULL;r;r=r->next)
         if(r->require_script)return true;
     return false;
+}
+bool html_policy_wasm_allowed(const struct web_html_policy_rule *r) {
+    return !r || !r->has_wasm_policy || r->wasm_allowed;
 }
 static void rule_free(struct web_html_policy_rule *rule) {
     for(size_t i=0;i<rule->count;i++)free(rule->names[i]);
@@ -183,21 +186,33 @@ static bool append(web_doc *d,const char *begin,const char *end,bool report,bool
     r->original_policy=copy_text(begin,end);base=base?base:d->url?d->url:"";r->base_url=copy_text(base,base+strlen(base));
     if(!r->original_policy||!r->base_url){rule_free(r);return false;}
     r->report_only=report;r->from_meta=meta;bool seen_require=false,seen_names=false,seen_uri=false,seen_to=false;
+    bool seen_script=false,seen_default=false,script_allowed=false,default_allowed=false;
     while(begin<end){
         while(begin<end && (is_space((unsigned char)*begin)||*begin==';'))begin++;
         const char *name=begin;while(begin<end && !is_space((unsigned char)*begin)&&*begin!=';')begin++;
         const char *name_end=begin,*value=begin;while(begin<end && *begin!=';')begin++;
+        /* CSP3 2.2.1 ignores a non-ASCII directive before duplicate handling.
+         * In particular, an invalid script-src must not suppress default-src. */
+        bool ascii=true;for(const char *q=name;q<begin;q++)if((unsigned char)*q>0x7f){ascii=false;break;}
+        bool script=ascii && !seen_script && named(name,name_end,"script-src");
+        bool fallback=ascii && !seen_default && named(name,name_end,"default-src");
         bool require=!seen_require && named(name,name_end,"require-trusted-types-for");
         bool names=!seen_names && named(name,name_end,"trusted-types");
         bool uri=!seen_uri && named(name,name_end,"report-uri"),to=!seen_to && named(name,name_end,"report-to");
         if(require)seen_require=true;
         if(names){seen_names=true;r->has_names=true;}
         if(uri)seen_uri=true;if(to)seen_to=true;
-        while((require||names||uri||to) && value<begin){
+        if(script)seen_script=true;if(fallback)seen_default=true;
+        while((require||names||uri||to||script||fallback) && value<begin){
             while(value<begin && is_space((unsigned char)*value))value++;
             const char *t=value;while(value<begin && !is_space((unsigned char)*value))value++;
             if(t==value)break;
             if(require && token(t,value,"'script'"))r->require_script=true;
+            /* CSP3 4.5.1 checks these complete source expressions with ASCII
+             * case-insensitivity, not URL hosts, prefixes or script-src-elem. */
+            if((script||fallback) && (named(t,value,"'unsafe-eval'")||named(t,value,"'wasm-unsafe-eval'"))){
+                if(script)script_allowed=true;else default_allowed=true;
+            }
             if(names){
                 if(token(t,value,"'allow-duplicates'")){r->allow_duplicates=true;continue;}
                 if(token(t,value,"'none'"))continue;
@@ -212,7 +227,9 @@ static bool append(web_doc *d,const char *begin,const char *end,bool report,bool
             if(to&&!meta&&!r->report_to){r->report_to=copy_text(t,value);if(!r->report_to){rule_free(r);return false;}}
         }
     }
-    if(!r->has_names && !r->require_script){rule_free(r);return true;}
+    r->has_wasm_policy=seen_script||seen_default;
+    r->wasm_allowed=!r->has_wasm_policy || (seen_script?script_allowed:default_allowed);
+    if(!r->has_names && !r->require_script && !r->has_wasm_policy){rule_free(r);return true;}
     if(!d->html_policy){d->html_policy=calloc(1,sizeof *d->html_policy);if(!d->html_policy){rule_free(r);return false;}}
     if(d->html_policy->last)d->html_policy->last->next=r;else d->html_policy->first=r;
     d->html_policy->last=r;return true;

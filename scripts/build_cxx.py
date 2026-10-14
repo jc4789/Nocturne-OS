@@ -13,7 +13,24 @@ BUILD = ROOT / 'build' / 'cxx'
 # Match the supplied Windows LLVM compiler; never modify the external checkout.
 UPSTREAM_REF = 'llvmorg-18.1.8'
 UPSTREAM_COMMIT = '3b5b5c1ec4a3095ab096dd780e84d7ab81f3d7ff'
-LIBRARY_SOURCES = ('algorithm.cpp', 'string.cpp', 'vector.cpp', 'verbose_abort.cpp')
+LIBRARY_SOURCES = ('algorithm.cpp', 'hash.cpp', 'memory.cpp', 'string.cpp', 'vector.cpp', 'verbose_abort.cpp')
+WABT_COMMIT = '1e9fffd80efa901b3e4708d4ba1f0df972e63518'
+WABT_SOURCES = ('binary-reader.cc', 'binary-reader-logging.cc', 'binary.cc',
+                'common.cc', 'config.cc', 'feature.cc', 'ir.cc', 'binding-hash.cc', 'leb128.cc',
+                'opcode.cc', 'opcode-code-table.c', 'shared-validator.cc',
+                'stream.cc', 'type-checker.cc', 'utf8.cc',
+                'interp/binary-reader-interp.cc', 'interp/interp.cc',
+                'interp/istream.cc')
+WASM2C_SOURCES = ('apply-names.cc', 'binary-reader-ir.cc', 'c-writer.cc',
+                 'color.cc', 'error-formatter.cc', 'expr-visitor.cc',
+                 'filenames.cc', 'generate-names.cc', 'ir-util.cc',
+                 'lexer-source-line-finder.cc', 'lexer-source.cc', 'literal.cc',
+                 'option-parser.cc', 'sha256.cc', 'validator.cc',
+                 'prebuilt/wasm2c_header_top.cc', 'prebuilt/wasm2c_header_bottom.cc',
+                 'prebuilt/wasm2c_source_includes.cc',
+                 'prebuilt/wasm2c_source_declarations.cc',
+                 'prebuilt/wasm2c_simd_source_declarations.cc',
+                 'prebuilt/wasm2c_atomicops_source_declarations.cc')
 
 
 def tool(name):
@@ -74,9 +91,15 @@ def build_path(path):
         return absolute.as_posix()
 
 
-def compile_source(source, output, upstream):
+def compile_source(source, output, upstream, extra=()):
     output.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run([tool('clang++'), *flags(upstream), '-MMD', '-MP', '-c',
+    compiler = 'clang++'
+    options = flags(upstream)
+    if source.suffix == '.c':
+        compiler = 'clang'
+        options = [option for option in options if option not in ('-std=c++20', '-nostdinc++')]
+        options += ['-std=c11']
+    subprocess.run([tool(compiler), *options, *extra, '-MMD', '-MP', '-c',
                     build_path(source), '-o', build_path(output)], check=True, cwd=ROOT)
     dependency = output.with_suffix('.d')
     # Windows clang normalizes prerequisites back to '\\' even for slash inputs.
@@ -106,19 +129,122 @@ def library(upstream):
     shutil.copyfile(upstream / 'LICENSE.TXT', license_file)
 
 
+def prepare_wabt():
+    """固定revisionの必要sourceのみ取り込む。外部checkoutは変更しない。"""
+    destination = ROOT / 'third_party' / 'wabt'
+    sources = (*WABT_SOURCES, *WASM2C_SOURCES, 'tools/wasm2c.cc')
+    if all((destination / 'src' / name).is_file() for name in sources) and (destination / 'wasm2c' / 'wasm-rt.h').is_file():
+        return destination
+    source = Path(os.environ.get('NOCTURNE_WABT_SOURCE',
+                                 'D:/Programes/cloned repos/wabt'))
+    commit = subprocess.check_output(['git', '-C', str(source), 'rev-parse',
+                                     WABT_COMMIT + '^{commit}'], text=True).strip()
+    if commit != WABT_COMMIT:
+        raise RuntimeError('WABTのcommitが期待値と一致しません。')
+    archive = subprocess.check_output(['git', '-C', str(source), 'archive',
+                                      WABT_COMMIT, 'LICENSE', 'include/wabt',
+                                      *('src/' + name for name in sources),
+                                      'wasm2c', 'src/template',
+                                      'scripts/gen-wasm2c-templates.cmake'])
+    destination.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(archive), mode='r:') as tar:
+        for member in tar.getmembers():
+            relative = Path(member.name)
+            if relative.is_absolute() or '..' in relative.parts or member.issym() or member.islnk():
+                raise RuntimeError('WABT archiveに不正なパスがあります。')
+        # Preserve the reviewed Nocturne embedding changes on later imports.
+        tar.extractall(destination, members=[member for member in tar.getmembers()
+                                            if not (destination / member.name).exists()])
+    return destination
+
+
+def wabt_library(upstream, translator=False):
+    source_root = prepare_wabt()
+    if translator:
+        # Use WABT's real generator after any template edits; never hand-edit
+        # the prebuilt C++ string literals used by the C writer.
+        cmake = shutil.which('cmake')
+        if not cmake:
+            configured_cmake = Path(os.environ.get('NOCTURNE_CMAKE', 'C:/Program Files/CMake/bin/cmake.exe'))
+            if configured_cmake.is_file():
+                cmake = str(configured_cmake)
+        if not cmake:
+            raise RuntimeError('wasm2cテンプレート生成にはCMakeが必要です。')
+        templates = (
+            ('wasm2c_header_top', 'wasm2c.top.h', 's_header_top'),
+            ('wasm2c_header_bottom', 'wasm2c.bottom.h', 's_header_bottom'),
+            ('wasm2c_source_includes', 'wasm2c.includes.c', 's_source_includes'),
+            ('wasm2c_source_declarations', 'wasm2c.declarations.c', 's_source_declarations'),
+            ('wasm2c_simd_source_declarations', 'wasm2c_simd.declarations.c', 's_simd_source_declarations'),
+            ('wasm2c_atomicops_source_declarations', 'wasm2c_atomicops.declarations.c', 's_atomicops_source_declarations'))
+        for name, template, symbol in templates:
+            source = source_root / 'src' / 'template' / template
+            output = ROOT / 'build' / 'wabt' / 'generated' / (name + '.cc')
+            generator = source_root / 'scripts' / 'gen-wasm2c-templates.cmake'
+            if not output.is_file() or output.stat().st_mtime_ns < max(source.stat().st_mtime_ns, generator.stat().st_mtime_ns):
+                output.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run([cmake, '-Dout=' + str(output), '-Din=' + str(source),
+                                '-Dsymbol=' + symbol, '-P', str(generator)], check=True)
+    extra = ['-Iports/wabt/include', '-Ithird_party/wabt/include',
+             '-Ithird_party/bearssl/inc', '-Wno-unused-private-field']
+    headers = [*source_root.rglob('*.h'), *source_root.rglob('*.def'),
+               *source_root.rglob('*.inc'), *(ROOT / 'ports' / 'wabt').rglob('*.h'),
+               Path(__file__)]
+    newest_header = max(max(path.stat().st_mtime_ns for path in headers),
+                        (BUILD / 'libc++.a').stat().st_mtime_ns)
+    objects = []
+    for name in WASM2C_SOURCES if translator else WABT_SOURCES:
+        source = source_root / 'src' / name
+        if name.startswith('prebuilt/'):
+            source = ROOT / 'build' / 'wabt' / 'generated' / Path(name).name
+        output = ROOT / 'build' / 'wabt' / (name + '.o')
+        if not output.is_file() or output.stat().st_mtime_ns < max(newest_header, source.stat().st_mtime_ns):
+            print('  CXX  wabt/' + name, flush=True)
+            compile_source(source, output, upstream, extra)
+        objects.append(output)
+    archive = ROOT / 'build' / 'wabt' / ('libwasm2c.a' if translator else 'libwabt.a')
+    if not archive.is_file() or any(obj.stat().st_mtime_ns > archive.stat().st_mtime_ns for obj in objects):
+        subprocess.run([tool('llvm-ar'), 'rcs', str(archive), *map(str, objects)], check=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest='action', required=True)
     actions.add_parser('library')
+    actions.add_parser('wabt')
+    actions.add_parser('vendor-wabt')
+    actions.add_parser('wabt-sources')
+    actions.add_parser('wasm2c')
+    actions.add_parser('wasm2c-sources')
     compile_parser = actions.add_parser('compile')
     compile_parser.add_argument('source', type=Path)
     compile_parser.add_argument('-o', '--output', required=True, type=Path)
+    compile_parser.add_argument('-I', '--include', action='append', default=[])
+    archive_parser = actions.add_parser('archive')
+    archive_parser.add_argument('output', type=Path)
+    archive_parser.add_argument('objects', type=Path, nargs='+')
     args = parser.parse_args()
+    if args.action == 'archive':
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run([tool('llvm-ar'), 'rcs', str(args.output), *map(str, args.objects)], check=True)
+        return
+    if args.action in ('wabt-sources', 'wasm2c-sources'):
+        print(' '.join(WABT_SOURCES if args.action == 'wabt-sources' else WASM2C_SOURCES))
+        return
     upstream = prepare()
     if args.action == 'library':
         library(upstream)
+    elif args.action == 'wabt':
+        library(upstream)
+        wabt_library(upstream)
+    elif args.action == 'vendor-wabt':
+        prepare_wabt()
+    elif args.action == 'wasm2c':
+        library(upstream)
+        wabt_library(upstream, translator=True)
     else:
-        compile_source(args.source, args.output, upstream)
+        compile_source(args.source, args.output, upstream,
+                       ['-I' + path for path in args.include])
 
 
 if __name__ == '__main__':

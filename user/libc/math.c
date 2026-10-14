@@ -55,6 +55,39 @@ static long double x87_rint(long double x) {
     __asm__("frndint" : "=t"(r) : "0"(x));
     return r;
 }
+/* IEEE-754 binary64 rounding without floating-point arithmetic on the
+ * discarded fraction: nearbyint must not raise the inexact exception.
+ * Nocturne's scalar rounding mode is the x87 control-word RC field. */
+double nearbyint(double x) {
+    enum { FRACTION_BITS = 52, EXPONENT_BIAS = 1023, RC_SHIFT = 10 };
+    union { double d; uint64_t u; } v = {x};
+    const uint64_t sign = UINT64_C(1) << 63;
+    unsigned exponent = (unsigned)((v.u >> FRACTION_BITS) & 0x7ff);
+    int e = (int)exponent - EXPONENT_BIAS;
+    if (exponent == 0x7ff) return x + x; /* Quiet signaling NaNs normally. */
+    if (e >= FRACTION_BITS || !(v.u & ~sign)) return x;
+    unsigned short control;
+    __asm__ volatile("fnstcw %0" : "=m"(control));
+    unsigned mode = (control >> RC_SHIFT) & 3;
+    bool negative = (v.u & sign) != 0, increment;
+    if (e < 0) {
+        union { double d; uint64_t u; } half = {0.5}, one = {1.0};
+        increment = mode == 0 ? (v.u & ~sign) > half.u :
+                    mode == 1 ? negative : mode == 2 ? !negative : false;
+        v.u = (v.u & sign) | (increment ? one.u : 0);
+        return v.d;
+    }
+    unsigned shift = FRACTION_BITS - (unsigned)e;
+    uint64_t unit = UINT64_C(1) << shift, mask = unit - 1, fraction = v.u & mask;
+    if (!fraction) return x;
+    increment = mode == 0 ? (fraction > (unit >> 1) ||
+                (fraction == (unit >> 1) && (v.u & unit))) :
+                mode == 1 ? negative : mode == 2 ? !negative : false;
+    v.u &= ~mask;
+    if (increment) v.u += unit;
+    return v.d;
+}
+float nearbyintf(float x) { return (float)nearbyint((double)x); }
 static long double x87_f2xm1(long double x) { /* 2^x - 1 for |x| <= 1 */
     long double r;
     __asm__("f2xm1" : "=t"(r) : "0"(x));

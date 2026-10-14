@@ -3,7 +3,7 @@
    HTTP worker/header/preflight checks live in webnettest; this fixture does
    not itself perform HTTP. Site/GUI acceptance remains a separate step. */
 async function runFetchCases() {
-    let count=0;
+    let count=await runDataFetchCases();
     const assert=(v,label)=>{count++;if(!v)throw Error('fetch '+label);};
     const throws=(fn,name,label)=>{let e;try{fn();}catch(x){e=x;}assert(e&&e.name===name,label);};
     const rejects=async(p,name,label)=>{let e;try{await p;}catch(x){e=x;}assert(e&&e.name===name,label);};
@@ -268,5 +268,74 @@ async function runFetchCases() {
     try {speciesBytes=await new Response(new Uint8Array([1,0,2])).clone().arrayBuffer();}
     finally {Object.defineProperty(ArrayBuffer.prototype,'constructor',speciesDescriptor);}
     assert(numbers(speciesBytes)==='1,0,2'&&leaked===0,'byte copy does not invoke species');
+    return count;
+}
+
+/* Real fetch -> private production data URL decoder -> Response consumption.
+ * This is called by the existing guest Fetch group, not injected into sites. */
+async function runDataFetchCases() {
+    let count=0;
+    const assert=(ok,label)=>{count++;if(!ok)throw new Error('data fetch '+label);};
+    const rejects=async(p,name,label)=>{let error;try{await p;}catch(e){error=e;}assert(error&&error.name===name,label);};
+    const numbers=b=>Array.from(new Uint8Array(b)).join(',');
+    const binary=await fetch('data:,%00A%FF%2B+%25%G0#lost');
+    assert(binary.status===200&&binary.statusText==='OK'&&binary.ok&&!binary.redirected&&binary.type==='basic','response metadata');
+    assert(binary.url==='data:,%00A%FF%2B+%25%G0'&&binary.headers.get('content-type')==='text/plain;charset=US-ASCII','URL fragment and default MIME');
+    assert(binary.headers.get('content-length')===null,'no fabricated HTTP content length');
+    let immutable;try{binary.headers.set('x-test','bad');}catch(e){immutable=e;}
+    assert(immutable&&immutable.name==='TypeError','immutable response headers');
+    const clone=binary.clone();assert(!binary.bodyUsed&&!clone.bodyUsed,'unused independent clone');
+    assert(numbers(await binary.arrayBuffer())==='0,65,255,43,43,37,37,71,48','binary percent decode does not stringify');
+    assert(numbers(await clone.arrayBuffer())==='0,65,255,43,43,37,37,71,48','binary clone');
+    assert(binary.bodyUsed&&clone.bodyUsed,'body consumed');
+    await rejects(binary.arrayBuffer(),'TypeError','consumption is single use');
+    const cases=[
+        ['data:,%23keep#drop','text/plain;charset=US-ASCII','#keep'],
+        ['data:application%2Fwasm,abc','text/plain;charset=US-ASCII','abc'],
+        ['data:text/plain; BaSe64,YR','text/plain','a'],
+        ['data:;base64,YQ','text/plain;charset=US-ASCII','a'],
+        ['data:;base64,Y Q==','text/plain;charset=US-ASCII','a'],
+        ['data:;base64,YQ%0C==','text/plain;charset=US-ASCII','a'],
+        ['data:text/plain;%09base64,YQ==','text/plain','YQ=='],
+        ['data:;charset=utf-8,x','text/plain;charset=utf-8','x'],
+        ['data:TEXT/PLAIN;CHARSET="utf-8";charset=bad,x','text/plain;charset=utf-8','x'],
+        ['data:application/wasm;,x','application/wasm','x'],
+        ['data:text/plain;a="x;y";b="";a=bad,x','text/plain;a="x;y";b=""','x'],
+        ['data:,\u0000x','text/plain;charset=US-ASCII','\u0000x'],
+        ['data:text/plain,é','text/plain','é'],
+        ['data:,a\\b','text/plain;charset=US-ASCII','a\\b']
+    ];
+    for(const [url,mime,text]of cases){const response=await fetch(url);assert(response.headers.get('content-type')===mime&&await response.text()===text,'MIME/body '+url);}
+    for(const url of ['data:','data:text/plain#missing,comma','data:;base64,YQ=','data:;base64,YQ===','data:;base64,=YQ=','data:;base64,YQ==%00evil','data:;base64,YQ-_','data:;base64,YQ%0B=='])await rejects(fetch(url),'TypeError','malformed '+url);
+    for(const mode of ['cors','same-origin','no-cors']){const response=await fetch('data:,modes',{mode,redirect:'manual'});assert(response.type==='basic'&&await response.text()==='modes','basic local mode '+mode);}
+    const cache=await fetch('data:,cached',{cache:'only-if-cached',mode:'same-origin',keepalive:true});assert(await cache.text()==='cached','local data is not an HTTP cache miss or keepalive transport');
+    const ranged=await fetch('data:,range',{headers:{Range:'bytes=1-2'}});assert(ranged.status===200&&await ranged.text()==='range','data scheme ignores Range');
+    const post=new Request('data:,answer',{method:'POST',body:'ignored request bytes'}),posted=await fetch(post);assert(post.bodyUsed&&await posted.text()==='answer','POST allowed and consumes Request body');
+    const extension=await fetch('data:,extension',{method:'PATCH',body:'ignored'});assert(await extension.text()==='extension','extension method not GET-only');
+    const head=await fetch('data:,head',{method:'HEAD'});assert(head.status===200&&head.body===null&&await head.text()===''&&!head.bodyUsed,'HEAD has null response body');
+    await rejects(fetch('data:,x',{method:'GET',body:''}),'TypeError','GET body validation retained');
+    const reason={dataAbort:true},pre=new AbortController();pre.abort(reason);let preReason;try{await fetch('data:,x',{signal:pre.signal});}catch(e){preReason=e;}assert(preReason===reason,'preabort reason identity');
+    const pending=new AbortController(),promise=fetch('data:,x',{signal:pending.signal});pending.abort(reason);let pendingReason;try{await promise;}catch(e){pendingReason=e;}assert(pendingReason===reason,'pending task abort reason identity');
+    const micro=new AbortController(),microPromise=fetch('data:,x',{signal:micro.signal});await Promise.resolve();micro.abort(reason);let microReason;try{await microPromise;}catch(e){microReason=e;}assert(microReason===reason,'microtask abort precedes response task');
+    const late=new AbortController(),lateResponse=await fetch('data:,late',{signal:late.signal}),lateClone=lateResponse.clone();late.abort(reason);
+    for(const r of [lateResponse,lateClone]){let error;try{await r.text();}catch(e){error=e;}assert(error===reason,'abort after headers reaches body and clone');}
+    const mime='text/plain;x='+('a'.repeat(4096)),long=await fetch('data:'+mime+',long');assert(long.headers.get('content-type')===mime&&await long.text()==='long','dynamic MIME is not loader-sized');
+    const integrity='sha256-LPJNul+wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ=';
+    assert(await (await fetch('data:,hello',{integrity})).text()==='hello','integrity before publication');
+    await rejects(fetch('data:,different',{integrity}),'TypeError','integrity mismatch');
+    await rejects(fetch('data:,hello',{integrity:integrity+' sha512-invalid'}),'TypeError','stronger integrity cannot downgrade');
+    const xhr=await new Promise((resolve,reject)=>{
+        const request=new XMLHttpRequest();request.open('GET','data:application/octet-stream,%00%FFx#gone');request.responseType='arraybuffer';
+        request.addEventListener('load',()=>resolve(request));request.addEventListener('error',()=>reject(new Error('data XHR error')));request.send();
+    });
+    assert(xhr.status===200&&xhr.statusText==='OK'&&xhr.readyState===4&&xhr.responseURL==='data:application/octet-stream,%00%FFx','XHR local data completion metadata');
+    assert(numbers(xhr.response)==='0,255,120'&&xhr.getResponseHeader('content-type')==='application/octet-stream','XHR local data bytes through existing Fetch boundary');
+    const uploaded=[];
+    const postedXHR=await new Promise((resolve,reject)=>{
+        const request=new XMLHttpRequest();request.open('POST','data:,post-response');request.upload.addEventListener('loadend',()=>uploaded.push('upload-end'));
+        request.addEventListener('load',()=>{uploaded.push('response-load');resolve(request);});request.addEventListener('error',()=>reject(new Error('data POST XHR error')));request.send('request-body');
+    });
+    assert(postedXHR.status===200&&postedXHR.responseText==='post-response','XHR local POST response');
+    assert(uploaded.join(',')==='upload-end,response-load','XHR data request body completes before response in both transport modes');
     return count;
 }

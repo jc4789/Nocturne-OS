@@ -400,6 +400,22 @@ class Handler(SimpleHTTPRequestHandler):
         return True
 
     def do_GET(self):
+        wasm_path = urlsplit(self.path).path
+        wasm_policies = {
+            "/workers/wasm-policy-deny.js": ("Content-Security-Policy", "script-src 'self'"),
+            "/workers/wasm-policy-allow.js": ("Content-Security-Policy", "script-src 'self' 'wasm-unsafe-eval'"),
+            "/workers/wasm-policy-report.js": ("Content-Security-Policy-Report-Only", "default-src 'none'"),
+        }
+        if wasm_path == "/workers/wasm.js" or wasm_path in wasm_policies:
+            body = (Path(__file__).resolve().parents[2] / "js_wasm_worker_cases.js").read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/javascript")
+            self.send_header("Content-Length", str(len(body)))
+            if wasm_path in wasm_policies:
+                self.send_header(*wasm_policies[wasm_path])
+            self.end_headers()
+            self.wfile.write(body)
+            return
         path = urlsplit(self.path).path
         if path.startswith("/workers/parser-safety-"):
             variant = path.removeprefix("/workers/parser-safety-")

@@ -14,7 +14,7 @@ const cloneData = (() => {
     // assembling a transaction, especially after its final validation pass.
     const add=(array,value)=>define(array,array.length,{value,writable:true,enumerable:true,configurable:true});
     const field=(record,key,value)=>define(record,key,{value,writable:true,enumerable:true,configurable:true});
-    const kinds=new M(),constructors=new M(),classID=host.classID,detach=host.detach,uncloneable=[],uncloneableNames=[],transferTypes=[];
+    const kinds=new M(),constructors=new M(),classID=host.classID,detach=host.detach,bufferTransferable=host.bufferTransferable,uncloneable=[],uncloneableNames=[],transferTypes=[];
     const workerDiagnostics=typeof host.frame!=='function'&&typeof host.transferCommit==='function';
     const exceptionBridge=domExceptionBridge;
     const blobSnapshotBridge=typeof blobBridge==='undefined'?null:blobBridge;
@@ -79,7 +79,8 @@ const cloneData = (() => {
                 // Workers use boolean external=true and must keep rejecting
                 // ports: only the private Window/endpoint path opts in.
                 if(external&&(external==='worker'?!handler.prepareWorker:(external!=='ports'||!handler.prepareExternal)))reject('external-transfer-unsupported',item,handlerName(handler));
-            }else {try{new U8(item,0,0);}catch(_){reject('detached-transfer-buffer',item);}}
+            }else {try{new U8(item,0,0);}catch(_){reject('detached-transfer-buffer',item);}
+                if(typeof bufferTransferable==='function'&&!bufferTransferable(item))reject('native-owned-transfer-buffer',item);}
             add(handlers,handler);put(seen,item,records.length);add(records,[handler?'Transferred':'ArrayBuffer',null]);
         }
         function visit(value) {

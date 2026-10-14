@@ -1034,6 +1034,7 @@
     /* @include js_html_tables.js */
     /* @include js_xhr.js */
     /* @include js_blob.js */
+    /* @include js_wasm.js */
     fetchBridge.initializeBlobs(blobBridge);
     /* @include js_screen.js */
     /* @include js_intl.js */

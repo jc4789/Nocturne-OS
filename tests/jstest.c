@@ -139,7 +139,7 @@ static void receive_log(void *opaque, int level, const char *message) {
         save_mark(f,message+3);
     } else if (!strncmp(message, "FAIL ", 5)) {
         printf("%s\n", message); fflush(stdout); f->js_failures++; failed++; total++;
-    } else if (!strncmp(message, "NATIVE-SELECTION ", 17) || !strncmp(message, "XHR checks ", 11) || !strncmp(message, "Document checks ", 16) || !strncmp(message, "XMLSerializer checks ", 21) || !strncmp(message, "Document limit mode ", 20) || !strncmp(message, "Lexbor ", 7) || strstr(message, " API checks ")) {
+    } else if (!strncmp(message, "NATIVE-SELECTION ", 17) || !strncmp(message, "XHR checks ", 11) || !strncmp(message, "Document checks ", 16) || !strncmp(message, "XMLSerializer checks ", 21) || !strncmp(message, "Document limit mode ", 20) || !strncmp(message, "Lexbor ", 7) || !strncmp(message,"WebAssembly ",sizeof("WebAssembly ")-1) || strstr(message, " API checks ")) {
         printf("%s\n", message);
     } else if (level == 2) {
         /* One exception can have Diagnostic/Source continuation messages.
@@ -1450,6 +1450,54 @@ int main(int argc, char **argv) {
     /* Optional selectors make a failing feature reproducible in the real OS. */
 #define RUN(name, fn) do { if (argc == 1 || !strcmp(argv[1], name)) { printf("jstest: %s\n", name); fflush(stdout); fn(); } } while (0)
     RUN("language", test_language);
+    if(argc==1 || !strcmp(argv[1],"wasm")){
+        printf("jstest: wasm\n");fflush(stdout);
+        external_case("js_wasm_cases.js",";runWasmCases().then(n=>{console.log('WebAssembly checks '+n);mark('api-done');},e=>{check('wasm-unexpected-error',false);console.log('FAIL wasm '+e+' '+e.stack);mark('api-done');});",BASE);
+    }
+    if(argc>1 && !strcmp(argv[1],"wasm-boundary")){
+        printf("jstest: wasm-boundary\n");fflush(stdout);
+        external_case("js_wasm_cases.js",";runWasmNativeBoundaryCases().then(n=>{console.log('WebAssembly boundary checks '+n);mark('api-done');},e=>{check('wasm-boundary-unexpected-error',false);console.log('FAIL wasm-boundary '+e+' '+e.stack);mark('api-done');});",BASE);
+    }
+    if(argc>1 && !strcmp(argv[1],"wasm-jspi")){
+        printf("jstest: wasm-jspi\n");fflush(stdout);
+        external_case("js_wasm_cases.js",";runWasmJspiCases().then(n=>{console.log('WebAssembly JSPI checks '+n);mark('api-done');},e=>{check('wasm-jspi-unexpected-error',false);console.log('FAIL wasm-jspi '+e+' '+e.stack);mark('api-done');});",BASE);
+    }
+    if(argc>1 && !strcmp(argv[1],"wasm-worker")){
+        FILE *ports=fopen("/data/tests/webports","r");unsigned first=0,second=0;char port_text[96],origin[128],tail[512];
+        test_check("wasm-worker-fixture-ports",ports&&fgets(port_text,sizeof port_text,ports)&&sscanf(port_text,"%u %u",&first,&second)==2&&first);
+        if(ports)fclose(ports);
+        if(first){
+            snprintf(origin,sizeof origin,"http://10.0.2.2:%u/",first);
+            snprintf(tail,sizeof tail,";runWasmWorkerCases('%sworkers/wasm.js').then(n=>{console.log('WebAssembly worker checks '+n);mark('api-done');},e=>{check('wasm-worker-unexpected-error',false);console.log('FAIL wasm-worker '+e+' '+e.stack);mark('api-done');});",origin);
+            case_real_network=true;external_case("js_wasm_cases.js",tail,origin);case_real_network=false;
+        }
+    }
+    if(argc>1 && !strcmp(argv[1],"wasm-policy")){
+        const char *policies[]={"Content-Security-Policy: script-src 'self'\r\n",
+            "Content-Security-Policy: default-src 'none';script-src 'wasm-unsafe-eval'\r\n",
+            "Content-Security-Policy-Report-Only: default-src 'none'\r\n",NULL};
+        const char *tails[]={";runWasmPolicyCases(false,5)",";runWasmPolicyCases(true,0)",";runWasmPolicyCases(true,5)",";runWasmPolicyCases(false,5)"};
+        const char suffix[]=".then(n=>{console.log('WebAssembly policy checks '+n);mark('api-done');},e=>{check('wasm-policy-error',false);console.log('FAIL wasm-policy '+e+' '+e.stack);mark('api-done');});";
+        for(size_t i=0;i<sizeof policies/sizeof *policies;i++){
+            char tail[sizeof ";runWasmPolicyCases(false,5)"+sizeof suffix];snprintf(tail,sizeof tail,"%s%s",tails[i],suffix);
+            case_response_headers=policies[i];
+            case_meta_policy=policies[i]?NULL:"<meta http-equiv=Content-Security-Policy content=\"script-src 'none'\">";
+            external_case("js_wasm_cases.js",tail,BASE);case_response_headers=case_meta_policy=NULL;
+        }
+    }
+    if(argc>1 && !strcmp(argv[1],"wasm-worker-policy")){
+        FILE *ports=fopen("/data/tests/webports","r");unsigned first=0,second=0;
+        char port_text[sizeof "65535 65535\n"],origin[sizeof "http://10.0.2.2:65535/"];
+        const char suffix[]="').then(n=>{console.log('WebAssembly worker policy checks '+n);mark('api-done');},e=>{check('wasm-worker-policy-error',false);console.log('FAIL wasm-worker-policy '+e+' '+e.stack);mark('api-done');});";
+        char tail[sizeof ";runWasmWorkerPolicyCases('"+sizeof origin+sizeof suffix];
+        test_check("wasm-policy-worker-ports",ports&&fgets(port_text,sizeof port_text,ports)&&sscanf(port_text,"%u %u",&first,&second)==2&&first);
+        if(ports)fclose(ports);
+        if(first){
+            snprintf(origin,sizeof origin,"http://10.0.2.2:%u/",first);
+            snprintf(tail,sizeof tail,";runWasmWorkerPolicyCases('%s%s",origin,suffix);
+            case_real_network=true;external_case("js_wasm_cases.js",tail,origin);case_real_network=false;
+        }
+    }
     if(argc>1&&!strcmp(argv[1],"input-snapshot")){
         printf("jstest: input-snapshot\n");fflush(stdout);test_input_snapshot();
     }
