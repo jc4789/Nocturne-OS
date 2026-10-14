@@ -33,10 +33,21 @@ struct kstat {
 
 struct vnode;
 struct file;
+struct poll_entry;
+struct poll_wait {
+    struct wait_queue wq;
+    uint64_t generation;
+    struct poll_entry *entries;
+    int error;
+};
 
 struct vnode_ops {
     int64_t (*read)(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n);
     int64_t (*write)(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n);
+    /* User variants validate the actual transfer after readiness/length is
+       known. Kernel callers continue to use read/write without user checks. */
+    int64_t (*read_user)(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n);
+    int64_t (*write_user)(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n);
     int (*readdir)(struct vnode *v, uint64_t idx, struct dirent *out);
     struct vnode *(*lookup)(struct vnode *dir, const char *name);
     int (*create)(struct vnode *dir, const char *name, int type, struct vnode **out);
@@ -45,6 +56,7 @@ struct vnode_ops {
     bool (*can_read)(struct vnode *v, struct file *f);
     bool (*can_write)(struct vnode *v, struct file *f);
     bool (*hangup)(struct vnode *v, struct file *f);
+    void (*poll_register)(struct vnode *v, struct file *f, struct poll_wait *wait);
     void (*open)(struct vnode *v, struct file *f);
     void (*close)(struct vnode *v, struct file *f);
     void (*release)(struct vnode *v); /* last reference dropped after unlink */
@@ -69,6 +81,7 @@ struct vnode {
     uint64_t cap;
     struct file *lease_owner;
     struct wait_queue lease_wait;
+    struct poll_entry *pollers;
 };
 
 struct file {
@@ -90,6 +103,8 @@ int vfs_open(const char *abspath, int flags, struct file **out);
 struct file *vfs_open_vnode(struct vnode *v, int flags);
 int64_t vfs_read(struct file *f, void *buf, size_t n);
 int64_t vfs_write(struct file *f, const void *buf, size_t n);
+int64_t vfs_read_user(struct file *f, void *buf, size_t n);
+int64_t vfs_write_user(struct file *f, const void *buf, size_t n);
 int64_t vfs_seek(struct file *f, int64_t off, int whence);
 void vfs_close(struct file *f);
 int vfs_lease(struct file *f, bool acquire);
@@ -102,6 +117,12 @@ int vfs_unlink(const char *abspath);
 int vfs_mount(const char *abspath, struct vnode *root);
 bool vfs_can_read(struct file *f);
 bool vfs_can_write(struct file *f);
+/* Registration and notification are BSP-owned. Each registration pins only
+   the vnode, not an open file: a sibling close must still produce EOF/HUP. */
+void vfs_poll_register(struct poll_wait *wait, struct vnode *v);
+void vfs_poll_file(struct poll_wait *wait, struct file *f);
+void vfs_poll_notify(struct vnode *v);
+void vfs_poll_cleanup(struct poll_wait *wait);
 int vfs_read_whole(const char *abspath, uint8_t **data, uint64_t *size);
 int vfs_write_whole(const char *abspath, const void *data, uint64_t size);
 void vnode_ref(struct vnode *v);

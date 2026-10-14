@@ -3,8 +3,59 @@
 #include "mm/heap.h"
 #include "arch/cpu.h"
 #include "dev/timer.h"
+#include "sys/syscall.h"
 
 struct vnode *vfs_root;
+
+struct poll_entry {
+    struct poll_entry *wait_next, *source_next;
+    struct poll_entry **source_prev;
+    struct poll_wait *wait;
+    struct vnode *v;
+};
+
+void vfs_poll_register(struct poll_wait *wait, struct vnode *v) {
+    if (wait->error || !v) return;
+    struct poll_entry *entry = kmalloc(sizeof *entry);
+    if (!entry) { wait->error = -ENOMEM; return; }
+    uint64_t flags = irq_save();
+    vnode_ref(v);
+    *entry = (struct poll_entry){.wait_next=wait->entries,
+        .source_next=v->pollers, .source_prev=&v->pollers, .wait=wait, .v=v};
+    if (entry->source_next) entry->source_next->source_prev = &entry->source_next;
+    v->pollers = entry;
+    wait->entries = entry;
+    irq_restore(flags);
+}
+
+void vfs_poll_file(struct poll_wait *wait, struct file *f) {
+    vfs_poll_register(wait, f->vn);
+    if (f->vn->ops && f->vn->ops->poll_register)
+        f->vn->ops->poll_register(f->vn, f, wait);
+}
+
+void vfs_poll_notify(struct vnode *v) {
+    if (!v) return;
+    uint64_t flags = irq_save();
+    for (struct poll_entry *entry = v->pollers; entry; entry = entry->source_next) {
+        entry->wait->generation++;
+        wq_wake_all(&entry->wait->wq);
+    }
+    irq_restore(flags);
+}
+
+void vfs_poll_cleanup(struct poll_wait *wait) {
+    while (wait->entries) {
+        uint64_t flags = irq_save();
+        struct poll_entry *entry = wait->entries;
+        wait->entries = entry->wait_next;
+        *entry->source_prev = entry->source_next;
+        if (entry->source_next) entry->source_next->source_prev = entry->source_prev;
+        irq_restore(flags);
+        vnode_unref(entry->v);
+        kfree(entry);
+    }
+}
 
 void vnode_ref(struct vnode *v) {
     uint64_t flags = irq_save();
@@ -167,27 +218,38 @@ static void file_io_end(struct file *f) {
     irq_restore(flags);
 }
 
-int64_t vfs_read(struct file *f, void *buf, size_t n) {
+static int64_t file_read(struct file *f, void *buf, size_t n, bool user) {
     struct vnode *v = f->vn;
     if ((f->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
     if (v->type == VT_DIR) return -EISDIR;
     if (!v->ops->read) return -EINVAL;
     int error = file_io_begin(f);
     if (error) return error;
-    int64_t r = v->ops->read(v, f, buf, f->off, n);
+    int64_t r;
+    if (user && v->ops->read_user) r = v->ops->read_user(v, f, buf, f->off, n);
+    else {
+        /* Cap the request at the current EOF under the shared-offset
+           reservation; even a later size change cannot enlarge this request. */
+        if (user && v->type == VT_FILE) n = f->off < v->size ? MIN(n, v->size - f->off) : 0;
+        r = user && !user_ok_w(buf, n) ? -EFAULT : v->ops->read(v, f, buf, f->off, n);
+    }
     if (r > 0 && (v->type == VT_FILE)) f->off += r;
     file_io_end(f);
     return r;
 }
 
-int64_t vfs_write(struct file *f, const void *buf, size_t n) {
+int64_t vfs_read(struct file *f, void *buf, size_t n) { return file_read(f, buf, n, false); }
+int64_t vfs_read_user(struct file *f, void *buf, size_t n) { return file_read(f, buf, n, true); }
+
+static int64_t file_write(struct file *f, const void *buf, size_t n, bool user) {
     struct vnode *v = f->vn;
     if ((f->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
     if (!v->ops->write) return -EINVAL;
     int error = file_io_begin(f);
     if (error) return error;
     if ((f->flags & O_APPEND) && v->type == VT_FILE) f->off = v->size;
-    int64_t r = v->ops->write(v, f, buf, f->off, n);
+    int64_t r = user && v->ops->write_user ? v->ops->write_user(v, f, buf, f->off, n) :
+        user && !user_ok(buf, n) ? -EFAULT : v->ops->write(v, f, buf, f->off, n);
     if (r > 0 && v->type == VT_FILE) {
         f->off += r;
         v->mtime = time_now();
@@ -195,6 +257,9 @@ int64_t vfs_write(struct file *f, const void *buf, size_t n) {
     file_io_end(f);
     return r;
 }
+
+int64_t vfs_write(struct file *f, const void *buf, size_t n) { return file_write(f, buf, n, false); }
+int64_t vfs_write_user(struct file *f, const void *buf, size_t n) { return file_write(f, buf, n, true); }
 
 int64_t vfs_seek(struct file *f, int64_t off, int whence) {
     if (f->vn->type != VT_FILE) return -ESPIPE;

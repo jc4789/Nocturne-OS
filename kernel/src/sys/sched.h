@@ -1,6 +1,7 @@
 #pragma once
 #include "kernel.h"
 #include "arch/fpu.h"
+#include "arch/smp.h"
 
 struct regs;
 struct file;
@@ -63,9 +64,18 @@ struct task {
     uint64_t sched_epoch;     /* lazy boost for blocked and AP-owned tasks */
 };
 
-struct task **sched_current_slot(void);
-volatile bool *sched_resched_slot(void);
-#define current_task (*sched_current_slot())
+static inline struct task *sched_current(void) {
+    struct task *task;
+    __asm__ volatile("movq %%gs:%c1, %0" : "=r"(task)
+                     : "i"(__builtin_offsetof(struct cpu_local, task)));
+    return task;
+}
+static inline void sched_set_current(struct task *task) {
+    __asm__ volatile("movq %0, %%gs:%c1" : : "r"(task),
+                     "i"(__builtin_offsetof(struct cpu_local, task)) : "memory");
+}
+static inline volatile bool *sched_resched_slot(void) { return &cpu_local_get()->resched; }
+#define current_task sched_current()
 #define need_resched (*sched_resched_slot())
 extern struct task *task_list;
 static inline struct task *task_process(void) {
@@ -107,8 +117,3 @@ void wq_wait(struct wait_queue *wq);
 bool wq_wait_timeout(struct wait_queue *wq, uint64_t ms); /* returns false on timeout */
 void wq_wake_all(struct wait_queue *wq);
 void sleep_ms(uint64_t ms);
-
-/* a global "something changed" queue used by poll() */
-extern struct wait_queue poll_wq;
-extern uint64_t poll_generation;
-static inline void poll_notify(void) { poll_generation++;wq_wake_all(&poll_wq); }

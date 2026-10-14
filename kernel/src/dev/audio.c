@@ -1,5 +1,6 @@
 /* Sound: /dev/audio streams, the mixer and the clock that drives the sink (see audio.h). */
 #include "dev/audio.h"
+#include "sys/syscall.h"
 #include "arch/cpu.h"
 #include "fs/vfs.h"
 #include "mm/heap.h"
@@ -30,6 +31,7 @@ static uint64_t card_submitted,card_consumed;
 /* the last slot is the system's own stream, which no file owns */
 static struct stream *streams[MAX_STREAMS + 1];
 static struct wait_queue audio_wq; /* writers waiting for room, closers waiting to drain */
+static struct vnode *audio_vnode;
 static int volume = 80;            /* percent */
 static bool muted;
 static int32_t gain = 80 * 80 * 65536 / 10000; /* volume squared, 16.16: loudness feels linear */
@@ -163,7 +165,7 @@ static bool mix(int16_t *out, int frames,bool card) {
     if(card&&any)card_submitted+=(uint32_t)frames;
     if (any||error) {
         wq_wake_all(&audio_wq);
-        poll_notify();
+        vfs_poll_notify(audio_vnode);
     }
     irq_restore(f);
     return any;
@@ -187,7 +189,7 @@ void audio_card_played(uint64_t ordinal){
                 s->issued_head=(at+1)&31;s->issued_count--;
             }
         }
-        wq_wake_all(&audio_wq);poll_notify();
+        wq_wake_all(&audio_wq);vfs_poll_notify(audio_vnode);
     }
     irq_restore(f);
 }
@@ -299,7 +301,7 @@ static struct stream *stream_of(struct file *f, int64_t *err) {
     return NULL;
 }
 
-static int64_t audio_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
+static int64_t audio_write_common(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n, bool user) {
     int64_t err;
     struct stream *s = stream_of(f, &err);
     if (!s) return err;
@@ -321,6 +323,7 @@ static int64_t audio_write(struct vnode *v, struct file *f, const void *buf, uin
         }
         /* copy outside the lock: only this task writes past head, and user memory may fault */
         uint32_t c = (uint32_t)MIN((size_t)room, n - done);
+        if (user && !user_ok(p + done, c)) return done ? (int64_t)done : -EFAULT;
         uint32_t at = s->head % RING_BYTES, first = MIN(c, RING_BYTES - at);
         memcpy(s->ring + at, p + done, first);
         memcpy(s->ring, p + done + first, c - first);
@@ -332,14 +335,22 @@ static int64_t audio_write(struct vnode *v, struct file *f, const void *buf, uin
     }
     return (int64_t)done;
 }
+static int64_t audio_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
+    return audio_write_common(v, f, buf, off, n, false);
+}
+static int64_t audio_write_user(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
+    return audio_write_common(v, f, buf, off, n, true);
+}
 
 /* Reading a stream tells how far ahead of the sink it is: a uint32_t, in frames. */
-static int64_t audio_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
+static int64_t audio_read_common(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n, bool user) {
     int64_t err;
     struct stream *s = stream_of(f, &err);
     if (!s) return err;
     if(s->clock_error||s->head-s->tail>RING_BYTES||s->issued_head>=ARRAY_SIZE(s->issued)||s->issued_count>ARRAY_SIZE(s->issued))return -EIO;
     if (n < 4) return -EINVAL;
+    size_t bytes = n >= sizeof(struct n_audio_status) ? sizeof(struct n_audio_status) : sizeof(uint32_t);
+    if (user && !user_ok_w(buf, bytes)) return -EFAULT;
     if(n>=sizeof(struct n_audio_status)){
         uint64_t fl=irq_save();
         uint32_t software=(s->head-s->tail)/AUDIO_FRAME;
@@ -354,6 +365,12 @@ static int64_t audio_read(struct vnode *v, struct file *f, void *buf, uint64_t o
     uint32_t q = (s->head - s->tail) / AUDIO_FRAME;
     memcpy(buf, &q, 4);
     return 4;
+}
+static int64_t audio_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
+    return audio_read_common(v, f, buf, off, n, false);
+}
+static int64_t audio_read_user(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
+    return audio_read_common(v, f, buf, off, n, true);
 }
 
 static bool audio_can_write(struct vnode *v, struct file *f) {
@@ -386,7 +403,8 @@ static void audio_close(struct vnode *v, struct file *f) {
 }
 
 static struct vnode_ops audio_ops = {.open = audio_open, .close = audio_close, .write = audio_write,
-                                     .read = audio_read, .can_write = audio_can_write};
+                                     .read = audio_read, .read_user = audio_read_user,
+                                     .write_user = audio_write_user, .can_write = audio_can_write};
 
 int audio_flush_file(struct file *f) {
     if (!f || !f->vn || f->vn->ops != &audio_ops) return -EINVAL;
@@ -399,7 +417,7 @@ int audio_flush_file(struct file *f) {
     if (audio_trace_active) for (int i = 0; i < MAX_STREAMS; i++)
         if (streams[i] == s) trace.stream[i].flushes++;
     wq_wake_all(&audio_wq);
-    poll_notify();
+    vfs_poll_notify(f->vn);
     irq_restore(fl);
     return 0;
 }
@@ -431,6 +449,7 @@ void audio_init(void) {
     struct vnode *dev = vfs_lookup("/dev");
     struct vnode *a = ramfs_new_node("audio", VT_CHAR), *vol = ramfs_new_node("volume", VT_CHAR);
     a->ops = &audio_ops;
+    audio_vnode = a;
     a->mode = 0666;
     vol->ops = &volume_ops;
     vol->mode = 0666;

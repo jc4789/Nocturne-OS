@@ -6,7 +6,7 @@
 
 #define SAMPLES 40
 struct sample { unsigned long begin, end; unsigned cpu_begin, cpu_end; };
-struct report { unsigned magic, count, xstate, stack; unsigned long value; struct sample s[SAMPLES]; };
+struct report { unsigned magic, count, xstate, stack, gs_tls; unsigned long value; struct sample s[SAMPLES]; };
 static unsigned long ticks(void) {
     unsigned a, d;
     __asm__ volatile("rdtsc" : "=a"(a), "=d"(d));
@@ -16,6 +16,29 @@ static unsigned apic_id(void) {
     unsigned a, b, c, d;
     __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0u));
     return b >> 24;
+}
+static int gs_tls_probe(const struct n_cpuinfo *info, unsigned seed) {
+    unsigned short saved;
+    __asm__ volatile("movw %%gs, %0" : "=r"(saved));
+    void *previous = thread_local_get(7);
+    void *sentinel = (void *)(uintptr_t)(seed + 1);
+    int pid = getpid(), tid = thread_id(), ok = 1;
+    thread_local_set(7, sentinel);
+    /* User code can reload GS independently of the kernel base. Both selectors
+       are valid zero-base user states; FS must still carry this task's TLS. */
+    static const unsigned short selectors[] = {0, 0x1B};
+    for (unsigned i = 0; i < sizeof selectors / sizeof selectors[0]; i++) {
+        __asm__ volatile("movw %0, %%gs" : : "r"(selectors[i]) : "memory");
+        if (getpid() != pid || thread_id() != tid || cpu_index() >= info->detected_cpus ||
+            thread_local_get(7) != sentinel) ok = 0;
+        /* Unlike the AP's read-only identity calls, sleep retires the AP user
+           context and executes the syscall continuation on the BSP. */
+        if (msleep(1) || getpid() != pid || thread_id() != tid ||
+            cpu_index() >= info->detected_cpus || thread_local_get(7) != sentinel) ok = 0;
+    }
+    __asm__ volatile("movw %0, %%gs" : : "r"(saved) : "memory");
+    thread_local_set(7, previous);
+    return ok;
 }
 static __attribute__((noinline)) int stack_probe(void) {
     volatile unsigned char buffer[96 * 1024];
@@ -36,6 +59,7 @@ static int child(unsigned long start, unsigned seed) {
     memset(&r, 0, sizeof r);
     struct n_cpuinfo info;
     if (cpu_info(&info)) return 2;
+    r.gs_tls = gs_tls_probe(&info, seed);
     r.stack = stack_probe(); /* top64KiB外の本物user page faultをBSPへ移す */
     r.xstate = 1;
     for (unsigned round = 0; round < 4; round++) {
@@ -65,7 +89,7 @@ static int child(unsigned long start, unsigned seed) {
         r.count++;
     }
     r.value = value;
-    return write(1, &r, sizeof r) == (ssize_t)sizeof r && r.stack && r.xstate ? 0 : 2;
+    return write(1, &r, sizeof r) == (ssize_t)sizeof r && r.stack && r.xstate && r.gs_tls ? 0 : 2;
 }
 static int read_all(int fd, void *p, size_t n) {
     unsigned char *b = p;
@@ -109,7 +133,7 @@ int main(int argc, char **argv) {
         if (!read_all(p[i][0], &r[i], sizeof r[i])) ok = 0;
         close(p[i][0]);
         if (waitpid(pid[i], &status, 0) != pid[i] || status) ok = 0;
-        if (r[i].magic != 0x534d5031 || r[i].count != SAMPLES || !r[i].stack || !r[i].xstate) ok = 0;
+        if (r[i].magic != 0x534d5031 || r[i].count != SAMPLES || !r[i].stack || !r[i].xstate || !r[i].gs_tls) ok = 0;
     }
     unsigned overlap = 0, cpu_a = 0, cpu_b = 0;
     unsigned first_a = 0, first_b = 0;
@@ -127,6 +151,7 @@ int main(int argc, char **argv) {
     if (info.scheduler_cpus == 1 && overlap) ok = 0;
     printf("smptest: user2 scheduler=%u apic=%u/%u overlap=%u XSTATE/stack=%s\n", info.scheduler_cpus,
            cpu_a, cpu_b, overlap, ok ? "PASS" : "FAIL");
+    printf("smptest: GS-selector/FS-TLS/CPU-index %s\n", r[0].gs_tls && r[1].gs_tls ? "PASS" : "FAIL");
     if (overlap) printf("smptest: raw overlap cpu%u [%lu,%lu] cpu%u [%lu,%lu]\n",
         r[0].s[first_a].cpu_begin, r[0].s[first_a].begin, r[0].s[first_a].end,
         r[1].s[first_b].cpu_begin, r[1].s[first_b].begin, r[1].s[first_b].end);

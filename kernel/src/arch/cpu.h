@@ -77,6 +77,10 @@ struct regs {
 #define USER_CS   0x23
 #define TSS_SEL   0x28
 
+#define MSR_GS_BASE        0xC0000101u
+#define MSR_KERNEL_GS_BASE 0xC0000102u
+#define CR4_FSGSBASE       (1ULL << 16)
+
 void gdt_init(void);
 void gdt_init_cpu(unsigned index);
 void tss_set_rsp0(uint64_t rsp0);

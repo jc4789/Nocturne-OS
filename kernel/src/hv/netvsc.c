@@ -99,7 +99,7 @@ static struct {
     uint32_t rndis_wait_id, next_req_id;
     uint8_t rndis_reply[128];
     bool link_up;
-    uint64_t tx_drops;
+    uint64_t tx_backpressure;
 } nv;
 
 static struct netif nif = {.driver = "netvsc"};
@@ -108,6 +108,10 @@ static struct netif nif = {.driver = "netvsc"};
 
 static uint32_t section_alloc(void) {
     uint64_t f = irq_save();
+    if (!nv.section_used) {
+        irq_restore(f);
+        return INVALID_SECTION;
+    }
     for (uint32_t i = 0; i < nv.sections; i++) {
         if (!(nv.section_used[i / 64] & (1ull << (i % 64)))) {
             nv.section_used[i / 64] |= 1ull << (i % 64);
@@ -119,11 +123,13 @@ static uint32_t section_alloc(void) {
     return INVALID_SECTION;
 }
 
-static void section_free(uint32_t i) {
-    if (i >= nv.sections) return;
+static bool section_free(uint32_t i) {
+    if (i >= nv.sections || !nv.section_used) return false;
     uint64_t f = irq_save();
+    bool used = (nv.section_used[i / 64] & (1ull << (i % 64))) != 0;
     nv.section_used[i / 64] &= ~(1ull << (i % 64));
     irq_restore(f);
+    return used;
 }
 
 /* Hand the RNDIS message in section `sec` to the host. */
@@ -215,7 +221,12 @@ static void netvsc_callback(struct vmbus_channel *ch) {
         uint32_t *m = vmpacket_data(pkt);
         if (dlen < 4) continue;
         if (m[0] == NVSP_SEND_RNDIS_PKT_COMPLETE) {
-            if (d->trans_id >= TX_TID_BASE) section_free((uint32_t)(d->trans_id - TX_TID_BASE));
+            if (d->trans_id >= TX_TID_BASE && d->trans_id - TX_TID_BASE < nv.sections) {
+                /* Only host completion signals progress. Returning a section
+                   after a failed vmbus_send is not progress and must not wake
+                   a retry loop that would immediately fail again. */
+                if (section_free((uint32_t)(d->trans_id - TX_TID_BASE))) net_rx_notify();
+            }
         } else if (m[0] == nv.nvsp_wait_type && !nv.nvsp_done) {
             memset(nv.nvsp_reply, 0, sizeof nv.nvsp_reply);
             memcpy(nv.nvsp_reply, m, MIN(dlen, sizeof nv.nvsp_reply));
@@ -294,8 +305,9 @@ static bool setup_buffers(void) {
     }
     nv.section_size = r[2];
     nv.sections = SEND_BUF_PAGES * PAGE_SIZE / nv.section_size;
+    if (!nv.sections) return false;
     nv.section_used = kzalloc((nv.sections + 63) / 64 * 8);
-    return true;
+    return nv.section_used != NULL;
 }
 
 /* Send an RNDIS control message (its req_id at offset 8) and wait for the matching completion. */
@@ -334,10 +346,10 @@ static bool rndis_set(uint32_t oid, const void *val, uint32_t len) {
 }
 
 static int netvsc_send(const void *frame, size_t len) {
-    if (len > 1514) return -EINVAL;
+    if (len > 1514 || sizeof(struct rndis_packet) + len > nv.section_size) return -EINVAL;
     uint32_t sec = section_alloc();
     if (sec == INVALID_SECTION) {
-        nv.tx_drops++;
+        nv.tx_backpressure++;
         return -EAGAIN;
     }
     uint8_t *p = nv.send_buf + (size_t)sec * nv.section_size;
@@ -351,7 +363,7 @@ static int netvsc_send(const void *frame, size_t len) {
     int r = send_section(sec, rp->h.len, false);
     if (r) {
         section_free(sec);
-        nv.tx_drops++;
+        if (r == -EAGAIN) nv.tx_backpressure++;
     }
     return r;
 }

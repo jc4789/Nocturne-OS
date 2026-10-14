@@ -11,14 +11,7 @@
 #include "net/net.h"
 #include "abi.h"
 
-static struct task *cpu_current[CPU_MAX_COUNT];
-static volatile bool cpu_resched[CPU_MAX_COUNT];
 struct task *task_list;
-struct wait_queue poll_wq;
-uint64_t poll_generation;
-
-struct task **sched_current_slot(void) { return &cpu_current[cpu_current_index()]; }
-volatile bool *sched_resched_slot(void) { return &cpu_resched[cpu_current_index()]; }
 
 static struct task *idle_task;
 #define MLFQ_LEVELS 4
@@ -162,6 +155,15 @@ static struct runner_mailbox {
     unsigned ticks;           /* only fallback clock when no calibrated TSC */
 } runner_mails[CPU_MAX_COUNT];
 static uint64_t runner_idle_sp[CPU_MAX_COUNT];
+static unsigned runner_return_pending;
+
+static void runner_returned(struct runner_mailbox *mail) {
+    /* The task stack/XSTATE must be saved and left before the BSP can own it.
+       One outstanding doorbell covers all returned mailboxes. */
+    __atomic_store_n(&mail->phase, RUN_RETURNED, __ATOMIC_RELEASE);
+    if (!__atomic_exchange_n(&runner_return_pending, 1, __ATOMIC_ACQ_REL))
+        cpu_bsp_wake();
+}
 
 static void request_priority_preemption(void) {
     unsigned ready = rq_highest();
@@ -180,7 +182,8 @@ static void request_priority_preemption(void) {
     }
 }
 
-static void collect_runner(void) {
+static bool collect_runner(void) {
+    bool collected = false;
     cpu_runner_check();
     for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
     struct runner_mailbox *mail = &runner_mails[cpu];
@@ -193,14 +196,30 @@ static void collect_runner(void) {
     __atomic_store_n(&mail->stop, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&mail->phase, RUN_EMPTY, __ATOMIC_RELEASE);
     sched_make_ready(t);
+    collected = true;
     }
+    return collected;
+}
+
+static void runner_return_irq(struct regs *r) {
+    (void)r;
+    cpu_require_bsp();
+    /* Clear before scanning: a retire racing with or following the scan must
+       send a fresh IPI rather than disappear behind the consumed doorbell. */
+    /* An exchange also orders the subsequent loads after clearing the flag.
+       A release store alone permits store/load reordering: an AP could still
+       see pending=1 after our scan missed its newly published mailbox. */
+    (void)__atomic_exchange_n(&runner_return_pending, 0, __ATOMIC_ACQ_REL);
+    if (collect_runner()) need_resched = true;
+    /* Do not schedule inside a kernel IRQ: existing kernel continuations are
+       non-preemptive. User return and idle's HLT return are safe switch points. */
 }
 
 void sched_post_switch(void) {
     if (cpu_is_runner()) {
         struct runner_mailbox *mail = &runner_mails[cpu_current_index()];
         if (__atomic_load_n(&mail->phase, __ATOMIC_RELAXED) == RUN_RETIRING)
-            __atomic_store_n(&mail->phase, RUN_RETURNED, __ATOMIC_RELEASE);
+            runner_returned(mail);
     } else if (cpu_current_index() == 0) {
         /* context_switchが旧taskのkspを書き、BSPが別stackへ移った後。 */
         for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
@@ -214,7 +233,7 @@ void sched_post_switch(void) {
 
 NORETURN void sched_ap_loop(void) {
     cli();
-    current_task = NULL;
+    sched_set_current(NULL);
     unsigned cpu = cpu_current_index();
     struct runner_mailbox *mail = &runner_mails[cpu];
     cpu_runner_started();
@@ -229,11 +248,11 @@ NORETURN void sched_ap_loop(void) {
         vmm_switch(kernel_pml4);
         vmm_flush_all();
         if (__atomic_load_n(&mail->stop, __ATOMIC_ACQUIRE)) {
-            __atomic_store_n(&mail->phase, RUN_RETURNED, __ATOMIC_RELEASE);
+            runner_returned(mail);
             continue; /* user stackは一度も使用していない */
         }
         struct task *t = mail->task;
-        current_task = t;
+        sched_set_current(t);
         tss_set_rsp0((uint64_t)t->kstack + KSTACK_PAGES * PAGE_SIZE);
         vmm_switch(t->pml4);
         wrmsr(0xC0000100, t->tls_base);
@@ -275,7 +294,7 @@ void sched_ap_interrupt(struct regs *r) {
     fpu_save(&t->fpu);
     vmm_switch(kernel_pml4);
     vmm_flush_all();
-    current_task = NULL;
+    sched_set_current(NULL);
     __atomic_store_n(&mail->phase, RUN_RETIRING, __ATOMIC_RELAXED);
     context_switch(&t->ksp, runner_idle_sp[cpu]);
     /* このcontinuationはretire ACK→BSP ready queue→scheduleでBSPだけに戻す。 */
@@ -317,6 +336,7 @@ void sched_pin_space(uint64_t pml4) {
 }
 
 void sched_init(void) {
+    vector_register(VEC_USER_RETURN, runner_return_irq);
     idle_task = kzalloc(sizeof(struct task));
     idle_task->fds=idle_task->initial_fds;idle_task->fd_capacity=MAX_FDS;
     idle_task->pid = next_pid++;
@@ -325,7 +345,7 @@ void sched_init(void) {
     idle_task->pml4 = kernel_pml4;
     strlcpy(idle_task->cwd, "/", sizeof idle_task->cwd);
     fpu_state_init(&idle_task->fpu);
-    current_task = idle_task;
+    sched_set_current(idle_task);
     task_list = idle_task;
     boost_at = uptime_ms();
     bsp_stamp = run_stamp();
@@ -485,7 +505,7 @@ void schedule(void) {
         return;
     }
     next->state = TASK_RUNNING;
-    current_task = next;
+    sched_set_current(next);
     bsp_stamp = run_stamp();
     tss_set_rsp0((uint64_t)next->kstack + KSTACK_PAGES * PAGE_SIZE);
     vmm_switch(next->pml4);
@@ -816,7 +836,6 @@ NORETURN void task_exit(int code) {
         t->rq_next = dead_list;
         dead_list = t;
     }
-    poll_notify();
     schedule();
     panic("zombie task %d was scheduled", t->pid);
 }

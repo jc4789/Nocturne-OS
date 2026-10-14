@@ -19,6 +19,8 @@ static bool configured;
 static uint64_t rx_packets, tx_packets;
 static struct wait_queue net_wq; /* shared link/ARP/DNS/UDP progress */
 static struct wait_queue rxq_wq; /* the net thread sleeps here */
+static volatile bool net_work_pending; /* IRQ wake latch, including TX resource returns */
+static bool receive_batch;
 
 static uint16_t htons(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
 #define ntohs htons
@@ -50,13 +52,32 @@ void net_delay_ms(uint64_t ms) {
 
 static uint32_t csum_add(uint32_t sum, const void *data, size_t len) {
     const uint8_t *p = data;
-    while (len > 1) {
-        sum += (uint32_t)(p[0] << 8 | p[1]);
-        p += 2;
-        len -= 2;
+    uint64_t wide = sum;
+    /* RFC 1071: associative one's-complement addition. memcpy permits an
+       unaligned, alias-safe machine-word load; network order is restored
+       before adding independent pairs. No per-word carry-fold is needed. */
+    while (len >= sizeof(uint64_t)) {
+        uint64_t word;
+        memcpy(&word, p, sizeof word);
+        word = __builtin_bswap64(word);
+        const uint64_t pair_mask = 0x0000ffff0000ffffULL;
+        uint64_t pairs = (word & pair_mask) + ((word >> 16) & pair_mask);
+        wide += (uint32_t)pairs + (pairs >> 32);
+        p += sizeof word;
+        len -= sizeof word;
     }
-    if (len) sum += (uint32_t)p[0] << 8;
-    return sum;
+    if (len >= sizeof(uint32_t)) {
+        uint32_t word;
+        memcpy(&word, p, sizeof word);
+        word = __builtin_bswap32(word);
+        wide += (word & UINT16_MAX) + (word >> 16);
+        p += sizeof word;
+        len -= sizeof word;
+    }
+    if (len >= sizeof(uint16_t)) { wide += (uint32_t)p[0] << 8 | p[1]; p += 2; len -= 2; }
+    if (len) wide += (uint32_t)p[0] << 8;
+    while (wide >> 32) wide = (wide & UINT32_MAX) + (wide >> 32);
+    return (uint32_t)wide;
 }
 static uint16_t csum_fold(uint32_t s) {
     while (s >> 16) s = (s & 0xFFFF) + (s >> 16);
@@ -111,6 +132,11 @@ static uint8_t rxq_buf[RXQ][1536];
 static uint16_t rxq_len[RXQ];
 static volatile int rxq_head, rxq_tail;
 
+void net_rx_notify(void) {
+    net_work_pending = true;
+    wq_wake_all(&rxq_wq);
+}
+
 void net_rx(const void *frame, size_t len) {
     if (len < 14 || len > 1536) return;
     int next = (rxq_head + 1) % RXQ;
@@ -118,7 +144,7 @@ void net_rx(const void *frame, size_t len) {
     memcpy(rxq_buf[rxq_head], frame, len);
     rxq_len[rxq_head] = (uint16_t)len;
     rxq_head = next;
-    wq_wake_all(&rxq_wq);
+    net_rx_notify();
 }
 
 /* ---------------------------------------------------------------- output */
@@ -138,8 +164,9 @@ static int eth_output(const uint8_t dst[6], uint16_t type, size_t len) {
         memset(frame + total, 0, 60 - total);
         total = 60;
     }
-    tx_packets++;
-    return nif->send(frame, total);
+    int result = nif->send(frame, total);
+    if (!result) tx_packets++;
+    return result;
 }
 
 static int ip_output(uint32_t dst, const uint8_t mac[6], uint8_t proto, size_t len) {
@@ -398,7 +425,6 @@ static void udp_input(uint32_t src, uint32_t dst, const uint8_t *p, size_t len) 
         memcpy(d->data, p + 8, ulen - 8);
         s->qh = next;
         wq_wake_all(&net_wq);
-        poll_notify();
         return;
     }
 }
@@ -411,7 +437,7 @@ static bool udp_port_used(uint16_t port) {
 static void udp_release(struct udp_sock *s) {
     if(!s || !s->used)return;
     s->used=false;kfree(s->q);s->q=NULL;s->qh=s->qt=0;
-    wq_wake_all(&net_wq);poll_notify();
+    wq_wake_all(&net_wq);
 }
 static int udp_alloc(uint16_t port, int pid) {
     if(port) {if(udp_port_used(port))return -EADDRINUSE;}
@@ -750,8 +776,14 @@ static int64_t dns_query(const char *name, uint32_t *out) {
 /* ---------------------------------------------------------------- TCP */
 
 #define TCP_INITIAL 16
-#define TCP_RXBUF 65536
-#define TCP_TXBUF 32768
+/* Requested default storage target, NOT a limit on a transfer or connection
+   count. Actual capacity is allocated per socket, can be configured at boot,
+   and falls back under memory pressure before negotiation. */
+#define TCP_BUFFER_DEFAULT (1u << 20)
+#define TCP_WINDOW_SHIFT_MAX 14 /* RFC 7323 sequence/window arithmetic bound */
+#define TCP_WINDOW_MAX ((uint32_t)UINT16_MAX << TCP_WINDOW_SHIFT_MAX)
+#define TCP_MSS (1500u - 20u - 20u) /* interface IPv4 MTU minus IP/TCP headers */
+static uint32_t tcp_rx_target = TCP_BUFFER_DEFAULT, tcp_tx_target = TCP_BUFFER_DEFAULT;
 #define F_FIN 0x01
 #define F_SYN 0x02
 #define F_RST 0x04
@@ -764,7 +796,6 @@ enum { T_FREE, T_SYN_SENT, T_ESTABLISHED, T_FIN_WAIT1, T_FIN_WAIT2, T_CLOSE_WAIT
 #define TCP_OOO   8    /* out-of-order ranges remembered per connection */
 #define RTO_MIN   200  /* ms */
 #define RTO_MAX   16000
-#define CWND_MAX  (1u << 20)
 
 struct tcb {
     int state, err, pid;
@@ -772,12 +803,15 @@ struct tcb {
        not reschedule every DNS/TCP helper that is waiting on another socket. */
     struct wait_queue progress;
     bool user_open, fin_pending, fin_sent, rx_fin;
+    bool window_scaled, ack_pending, progress_pending, tx_retry, probe_pending, resend_pending;
+    uint8_t rx_shift, tx_shift;
+    unsigned ack_segments;
     uint32_t rip;
     uint16_t lport, rport, mss;
     uint8_t mac[6];
-    /* send side. tx[0] is the byte at snd_una; snd_nxt is the next byte to (re)send, snd_max the
+    /* send side. tx[tx_head] is the byte at snd_una; snd_nxt is the next byte to (re)send, snd_max the
        highest ever sent (they differ after a timeout, when we go back to snd_una) */
-    uint32_t iss, snd_una, snd_nxt, snd_max, snd_wnd, fin_seq;
+    uint32_t iss, snd_una, snd_nxt, snd_max, snd_wnd, snd_wl1, snd_wl2, fin_seq;
     /* congestion control: NewReno (RFC 5681 / 6582) */
     uint32_t cwnd, ssthresh, recover;
     int dupacks;
@@ -789,10 +823,10 @@ struct tcb {
     /* receive side. rx is a ring: rx_len bytes are in order and readable; segments that arrive
        ahead of rcv_nxt are stored at their place behind them, and ooo[] remembers which ranges */
     uint32_t rcv_nxt, adv_wnd;
-    struct { uint32_t start, end; } ooo[TCP_OOO];
-    int nooo;
+    struct tcp_range { uint32_t start, end; } *ooo;
+    size_t nooo, ooo_capacity;
     uint8_t *rx, *tx;
-    uint32_t rx_head, rx_len, tx_len;
+    uint32_t rx_head, rx_len, tx_head, tx_len, rx_capacity, tx_capacity;
     uint64_t rto_at, linger_until;
     uint64_t generation;
     int rto, retries;
@@ -825,38 +859,86 @@ static void tcp_free(struct tcb *t) {
     wq_wake_all(&t->progress);
     kfree(t->rx);
     kfree(t->tx);
+    kfree(t->ooo);
     memset(t, 0, sizeof *t);
 }
 
-static uint32_t tcp_window(struct tcb *t) { return MIN(TCP_RXBUF - t->rx_len, 65535u); }
+static void tcp_progress(struct tcb *t) {
+    if (receive_batch) t->progress_pending = true;
+    else wq_wake_all(&t->progress);
+}
 
-static void tcp_output(struct tcb *t, uint8_t flags, uint32_t seq, const uint8_t *data, size_t len) {
-    tcp_stats.segs_out++;
+static void tcp_ring_write(uint8_t *ring, uint32_t capacity, uint32_t at, const void *src, uint32_t n) {
+    at %= capacity;
+    uint32_t first = MIN(n, capacity-at);
+    memcpy(ring+at, src, first);
+    if (n>first) memcpy(ring, (const uint8_t *)src+first, n-first);
+}
+
+static void tcp_ring_read(void *dst, const uint8_t *ring, uint32_t capacity, uint32_t at, uint32_t n) {
+    at %= capacity;
+    uint32_t first = MIN(n, capacity-at);
+    memcpy(dst, ring+at, first);
+    if (n>first) memcpy((uint8_t *)dst+first, ring, n-first);
+}
+
+static uint32_t tcp_window(struct tcb *t) {
+    return MIN(t->rx_capacity-t->rx_len, (uint32_t)UINT16_MAX << (t->window_scaled?t->rx_shift:0));
+}
+
+static uint32_t tcp_peer_window(struct tcb *t, const struct tcp_hdr *h) {
+    return (uint32_t)ntohs(h->win) << ((t->window_scaled && !(h->flags&F_SYN))?t->tx_shift:0);
+}
+
+/* Payload, if any, is borrowed directly from the send ring at seq-snd_una. */
+static int tcp_output(struct tcb *t, uint8_t flags, uint32_t seq, size_t len) {
     if (len && t->pid == fault_pid && fault_hit(fault.tx_drop)) {
+        tcp_stats.segs_out++;
         tcp_stats.faults_dropped++;
-        return; /* "lost" on the wire */
+        return 0; /* accepted, then intentionally "lost" on the test wire */
     }
     struct tcp_hdr *h = (struct tcp_hdr *)L4;
-    size_t hl = (flags & F_SYN) ? 24 : 20;
+    size_t hl = (flags & F_SYN) ? 28 : 20; /* MSS, NOP and 3-byte WS, word aligned */
     h->sport = htons(t->lport);
     h->dport = htons(t->rport);
     h->seq = htonl(seq);
     h->ack = htonl((flags & F_ACK) ? t->rcv_nxt : 0);
     h->off = (uint8_t)((hl / 4) << 4);
     h->flags = flags;
-    t->adv_wnd = tcp_window(t);
-    h->win = htons((uint16_t)t->adv_wnd);
+    unsigned shift = t->window_scaled && !(flags&F_SYN) ? t->rx_shift : 0;
+    uint16_t advertised = (uint16_t)MIN(tcp_window(t)>>shift, (uint32_t)UINT16_MAX);
+    h->win = htons(advertised); /* SYN windows are never scaled */
     h->csum = 0;
     h->urg = 0;
     if (flags & F_SYN) {
         L4[20] = 2; /* MSS option */
         L4[21] = 4;
-        L4[22] = 1460 >> 8;
-        L4[23] = 1460 & 255;
+        L4[22] = TCP_MSS >> 8;
+        L4[23] = TCP_MSS & 255;
+        L4[24] = 1; /* NOP aligns the following option */
+        L4[25] = 3; /* RFC 7323 Window Scale */
+        L4[26] = 3;
+        L4[27] = t->rx_shift;
     }
-    if (len) memcpy(L4 + hl, data, len);
+    if (len) tcp_ring_read(L4+hl,t->tx,t->tx_capacity,t->tx_head+(seq-t->snd_una),(uint32_t)len);
     h->csum = htons(l4_csum(my_ip, t->rip, 6, L4, hl + len));
-    ip_output(t->rip, t->mac, 6, hl + len);
+    int result = ip_output(t->rip, t->mac, 6, hl+len);
+    if (result == -EAGAIN || result == -EBUSY) {
+        t->tx_retry = true;
+        if (flags&F_ACK) t->ack_pending = true;
+        return result; /* no sequence advance, retransmit timer or cwnd loss */
+    }
+    if (result < 0) {
+        t->state = T_CLOSED;
+        t->err = result;
+        t->rto_at = 0;
+        tcp_progress(t);
+        return result;
+    }
+    tcp_stats.segs_out++;
+    t->adv_wnd = (uint32_t)advertised << shift;
+    if (flags&F_ACK) { t->ack_pending = false; t->ack_segments = 0; }
+    return 0;
 }
 
 static void tcp_arm(struct tcb *t) {
@@ -881,38 +963,43 @@ static void tcp_push(struct tcb *t, bool force) {
         return;
     uint32_t wnd = MIN(t->snd_wnd, t->cwnd);
     if (force && wnd == 0) wnd = 1;
+    t->tx_retry = false;
+    t->probe_pending = force;
     for (;;) {
         uint32_t off = t->snd_nxt - t->snd_una; /* = bytes in flight, and the offset into tx */
         if (off < t->tx_len) {
             if (off >= wnd) break;
             uint32_t n = MIN(t->tx_len - off, MIN((uint32_t)t->mss, wnd - off));
-            tcp_output(t, F_ACK | F_PSH, t->snd_nxt, t->tx + off, n);
+            if (tcp_output(t, F_ACK | F_PSH, t->snd_nxt, n)<0) break;
             tcp_sent(t, n);
             continue;
         }
         if (t->fin_pending && off == t->tx_len && (!t->fin_sent || t->snd_nxt == t->fin_seq)) {
+            if (tcp_output(t, F_FIN | F_ACK, t->snd_nxt, 0)<0) break;
             if (!t->fin_sent) {
                 t->fin_sent = true;
                 t->fin_seq = t->snd_nxt;
                 if (t->state == T_ESTABLISHED) t->state = T_FIN_WAIT1;
                 else if (t->state == T_CLOSE_WAIT) t->state = T_LAST_ACK;
             }
-            tcp_output(t, F_FIN | F_ACK, t->snd_nxt, NULL, 0);
             tcp_sent(t, 1);
         }
         break;
     }
     /* data waiting behind a zero window: probe it from the retransmit timer */
-    if (t->tx_len && t->snd_una == t->snd_max && t->snd_wnd == 0) tcp_arm(t);
+    if (t->tx_len && t->snd_una == t->snd_max && t->snd_wnd == 0 && !t->tx_retry) tcp_arm(t);
+    if (!t->tx_retry) t->probe_pending = false;
 }
 
 /* retransmit the oldest unacknowledged segment */
 static void tcp_resend_first(struct tcb *t) {
     uint32_t n = MIN(t->tx_len, (uint32_t)t->mss);
-    if (n) tcp_output(t, F_ACK | F_PSH, t->snd_una, t->tx, n);
-    else if (t->fin_sent && t->snd_una == t->fin_seq) tcp_output(t, F_FIN | F_ACK, t->fin_seq, NULL, 0);
+    int result = 0;
+    if (n) result = tcp_output(t, F_ACK | F_PSH, t->snd_una, n);
+    else if (t->fin_sent && t->snd_una == t->fin_seq) result = tcp_output(t, F_FIN | F_ACK, t->fin_seq, 0);
     t->rtt_at = 0;
-    tcp_stats.retransmits++;
+    t->resend_pending = result<0;
+    if (!result && (n || (t->fin_sent && t->snd_una==t->fin_seq))) tcp_stats.retransmits++;
 }
 
 static void tcp_rtt_sample(struct tcb *t, int r) {
@@ -931,14 +1018,14 @@ static void tcp_rtt_sample(struct tcb *t, int r) {
 /* the congestion window starts at RFC 3390's initial window */
 static void tcp_cc_init(struct tcb *t) {
     t->cwnd = MIN(4u * t->mss, MAX(2u * t->mss, 4380u));
-    t->ssthresh = 65535;
+    t->ssthresh = t->tx_capacity;
     t->recover = t->snd_una;
 }
 
-/* merge [s, e) into the out-of-order list; if it is full, the data is simply not remembered
-   (the sender will retransmit it) */
+/* Grow metadata with actual gaps, not a fixed eight-range rejection. If memory
+   is exhausted, do not advance rcv_nxt for unremembered data; the peer retries. */
 static void tcp_ooo_add(struct tcb *t, uint32_t s, uint32_t e) {
-    for (int i = 0; i < t->nooo;) {
+    for (size_t i = 0; i < t->nooo;) {
         if (SEQ_LEQ(t->ooo[i].start, e) && SEQ_LEQ(s, t->ooo[i].end)) { /* overlaps or touches */
             if (SEQ_LT(t->ooo[i].start, s)) s = t->ooo[i].start;
             if (SEQ_LT(e, t->ooo[i].end)) e = t->ooo[i].end;
@@ -948,16 +1035,20 @@ static void tcp_ooo_add(struct tcb *t, uint32_t s, uint32_t e) {
             i++;
         }
     }
-    if (t->nooo < TCP_OOO) {
-        t->ooo[t->nooo].start = s;
-        t->ooo[t->nooo].end = e;
-        t->nooo++;
+    if (t->nooo==t->ooo_capacity) {
+        size_t next = t->ooo_capacity ? t->ooo_capacity*2 : TCP_OOO;
+        if (next<=t->ooo_capacity || next>SIZE_MAX/sizeof *t->ooo) return;
+        struct tcp_range *grown = krealloc(t->ooo,next*sizeof *grown);
+        if (!grown) return;
+        t->ooo = grown;
+        t->ooo_capacity = next;
     }
+    t->ooo[t->nooo++] = (struct tcp_range){s,e};
 }
 
 /* after rcv_nxt moved: take in every stored range that now continues the in-order data */
 static void tcp_ooo_pull(struct tcb *t) {
-    for (int i = 0; i < t->nooo;) {
+    for (size_t i = 0; i < t->nooo;) {
         if (SEQ_LEQ(t->ooo[i].start, t->rcv_nxt)) {
             if (SEQ_LT(t->rcv_nxt, t->ooo[i].end)) {
                 t->rx_len += t->ooo[i].end - t->rcv_nxt;
@@ -973,11 +1064,11 @@ static void tcp_ooo_pull(struct tcb *t) {
 
 static void tcp_reset(struct tcb *t, int err) {
     if (t->state != T_SYN_SENT && t->state != T_CLOSED && t->state != T_FREE)
-        tcp_output(t, F_RST | F_ACK, t->snd_nxt, NULL, 0);
+        tcp_output(t, F_RST | F_ACK, t->snd_nxt, 0);
     t->state = T_CLOSED;
     t->err = err;
     t->rto_at = 0;
-    wq_wake_all(&t->progress);
+    tcp_progress(t);
 }
 
 static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len);
@@ -1037,7 +1128,7 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
             t->err = -ECONNRESET;
         }
         t->rto_at = 0;
-        wq_wake_all(&t->progress);
+        tcp_progress(t);
         return;
     }
 
@@ -1045,18 +1136,28 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
         if ((fl & (F_SYN | F_ACK)) != (F_SYN | F_ACK) || ack != t->iss + 1) return;
         t->rcv_nxt = seq + 1;
         t->snd_una = ack;
-        t->snd_wnd = ntohs(h->win);
+        t->snd_wnd = ntohs(h->win); /* SYN-ACK is NEVER shifted */
+        t->snd_wl1 = seq;
+        t->snd_wl2 = ack;
         t->mss = 536;
-        for (size_t o = 20; o + 1 < hl;) {
+        for (size_t o = 20; o < hl;) {
             uint8_t kind = p[o];
             if (kind == 0) break;
             if (kind == 1) {
                 o++;
                 continue;
             }
+            if (hl-o < 2) break;
             uint8_t l = p[o + 1];
-            if (l < 2) break;
-            if (kind == 2 && l == 4 && o + 4 <= hl) t->mss = (uint16_t)MIN(p[o + 2] << 8 | p[o + 3], 1460);
+            if (l < 2 || l > hl-o) break;
+            if (kind == 2 && l == 4) {
+                unsigned mss = (unsigned)p[o+2] << 8 | p[o+3];
+                if (mss) t->mss = (uint16_t)MIN(mss,TCP_MSS);
+            }
+            if (kind == 3 && l == 3 && !t->window_scaled) {
+                t->window_scaled = true;
+                t->tx_shift = MIN(p[o+2],TCP_WINDOW_SHIFT_MAX);
+            }
             o += l;
         }
         t->state = T_ESTABLISHED;
@@ -1065,20 +1166,25 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
         t->rto = 1000;
         t->snd_max = t->snd_nxt;
         tcp_cc_init(t);
-        tcp_output(t, F_ACK, t->snd_nxt, NULL, 0);
-        wq_wake_all(&t->progress);
+        tcp_output(t, F_ACK, t->snd_nxt, 0);
+        tcp_progress(t);
         tcp_push(t, false);
         return;
     }
 
-    bool need_ack = false;
+    bool need_ack = false, immediate_ack = false;
+    uint32_t peer_window = tcp_peer_window(t,h);
     if (fl & F_ACK) {
+        if (SEQ_LT(t->snd_max,ack)) {
+            tcp_output(t,F_ACK,t->snd_nxt,0);
+            return; /* a peer must not acknowledge bytes never submitted */
+        }
         if (SEQ_LT(t->snd_una, ack) && SEQ_LEQ(ack, t->snd_max)) {
             uint32_t acked = ack - t->snd_una;
             bool fin_acked = t->fin_sent && ack == t->fin_seq + 1;
             uint32_t data_acked = acked - (fin_acked ? 1 : 0);
             if (data_acked > t->tx_len) data_acked = t->tx_len;
-            memmove(t->tx, t->tx + data_acked, t->tx_len - data_acked);
+            t->tx_head = (t->tx_head+data_acked)%t->tx_capacity;
             t->tx_len -= data_acked;
             t->snd_una = ack;
             if (SEQ_LT(t->snd_nxt, ack)) t->snd_nxt = ack; /* the peer had kept what we were resending */
@@ -1102,7 +1208,7 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
             } else {
                 t->cwnd += MAX((uint32_t)t->mss * t->mss / t->cwnd, 1u); /* congestion avoidance */
             }
-            t->cwnd = MIN(t->cwnd, CWND_MAX);
+            t->cwnd = MIN(t->cwnd, t->tx_capacity);
             t->dupacks = 0;
             if (t->snd_una != t->snd_max) tcp_arm(t);
             if (fin_acked) {
@@ -1112,9 +1218,9 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
                     t->linger_until = uptime_ms() + 2000;
                 } else if (t->state == T_LAST_ACK) t->state = T_CLOSED;
             }
-            wq_wake_all(&t->progress);
+            tcp_progress(t);
         } else if (ack == t->snd_una && t->snd_una != t->snd_max && dlen == 0 && !(fl & (F_SYN | F_FIN)) &&
-                   ntohs(h->win) == t->snd_wnd) {
+                   peer_window == t->snd_wnd) {
             /* duplicate ack: a segment after snd_una arrived, so (probably) snd_una's was lost */
             tcp_stats.dupacks_in++;
             if (++t->dupacks == 3 && !t->in_recovery && SEQ_LT(t->recover, ack)) {
@@ -1125,16 +1231,22 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
                 t->cwnd = t->ssthresh + 3u * t->mss;
                 t->in_recovery = true;
             } else if (t->in_recovery) {
-                t->cwnd = MIN(t->cwnd + t->mss, CWND_MAX); /* each dup ack means one segment left the network */
+                t->cwnd = MIN(t->cwnd + t->mss, t->tx_capacity); /* storage-backed flight window */
             }
         }
-        if (SEQ_LEQ(t->snd_una, ack)) t->snd_wnd = ntohs(h->win);
+        if (SEQ_LEQ(t->snd_una,ack) && (SEQ_LT(t->snd_wl1,seq) ||
+            (t->snd_wl1==seq && SEQ_LEQ(t->snd_wl2,ack)))) {
+            t->snd_wnd = peer_window;
+            t->snd_wl1 = seq;
+            t->snd_wl2 = ack;
+        }
     }
 
     /* data: trim what we already have, store the rest at its place in the ring (it may be ahead of
        rcv_nxt, after a lost or reordered segment), then move rcv_nxt over everything contiguous */
     if (dlen) {
-        need_ack = true; /* an out-of-order segment gets an immediate duplicate ack */
+        need_ack = true;
+        immediate_ack = seq!=t->rcv_nxt || t->nooo!=0;
         if (SEQ_LT(seq, t->rcv_nxt)) {
             uint32_t old = t->rcv_nxt - seq;
             if (old >= dlen) old = dlen;
@@ -1146,17 +1258,18 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
     bool in_order = seq == t->rcv_nxt;
     if (dlen) {
         if (!t->rx_fin && (t->state == T_ESTABLISHED || t->state == T_FIN_WAIT1 || t->state == T_FIN_WAIT2)) {
-            uint32_t space = TCP_RXBUF - t->rx_len, off = seq - t->rcv_nxt;
+            uint32_t space = t->rx_capacity - t->rx_len, off = seq - t->rcv_nxt;
             if (off < space) {
                 uint32_t n = MIN(dlen, space - off), at = t->rx_head + t->rx_len + off;
-                for (uint32_t i = 0; i < n; i++) t->rx[(at + i) % TCP_RXBUF] = data[i];
+                tcp_ring_write(t->rx,t->rx_capacity,at,data,n);
                 dlen = n;
                 if (off == 0) {
                     t->rx_len += n;
                     t->rcv_nxt += n;
                     tcp_ooo_pull(t);
                     in_order = true;
-                    wq_wake_all(&t->progress);
+                    if (n>=TCP_MSS) t->ack_segments++;
+                    tcp_progress(t);
                 } else {
                     tcp_ooo_add(t, seq, seq + n);
                     tcp_stats.ooo_in++;
@@ -1167,16 +1280,23 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
     if ((fl & F_FIN) && in_order && seq + dlen == t->rcv_nxt && !t->rx_fin) {
         t->rcv_nxt++;
         t->rx_fin = true;
-        need_ack = true;
+        need_ack = immediate_ack = true;
         if (t->state == T_ESTABLISHED) t->state = T_CLOSE_WAIT;
         else if (t->state == T_FIN_WAIT1) t->state = T_CLOSING;
         else if (t->state == T_FIN_WAIT2) {
             t->state = T_TIME_WAIT;
             t->linger_until = uptime_ms() + 2000;
         }
-        wq_wake_all(&t->progress);
+        tcp_progress(t);
     }
-    if (need_ack) tcp_output(t, F_ACK, t->snd_nxt, NULL, 0);
+    if (need_ack) {
+        t->ack_pending = true;
+        /* RFC 5681: at least every second full-sized segment, immediately
+           for gaps/duplicates/FIN. The remaining ACK is flushed before the
+           drain ends, not held behind an arbitrary delayed-ACK timer. */
+        if (immediate_ack || t->ack_segments>=2 || !receive_batch)
+            tcp_output(t, F_ACK, t->snd_nxt, 0);
+    }
     tcp_push(t, false);
 }
 
@@ -1200,8 +1320,10 @@ static void tcp_tick(void) {
             }
             t->rto = MIN(t->rto * 2, RTO_MAX);
             if (t->state == T_SYN_SENT) {
-                tcp_output(t, F_SYN, t->iss, NULL, 0);
-                tcp_arm(t);
+                if (!tcp_output(t, F_SYN, t->iss, 0)) {
+                    t->snd_nxt = t->snd_max = t->iss+1;
+                    tcp_arm(t);
+                }
             } else {
                 if (!probe) {
                     /* a timeout is a strong congestion signal: back to one segment (RFC 5681) */
@@ -1216,8 +1338,9 @@ static void tcp_tick(void) {
                 }
                 /* go back to the oldest unacknowledged byte */
                 t->snd_nxt = t->snd_una;
+                t->resend_pending = false;
                 tcp_push(t, true);
-                if (t->snd_una != t->snd_max) tcp_arm(t);
+                if (t->snd_una != t->snd_max && !t->tx_retry) tcp_arm(t);
             }
         }
     }
@@ -1287,8 +1410,12 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     int h=tcp_alloc_slot();if(h<0)return h;
     struct tcb *t=tcbs[h];
     memset(t, 0, sizeof *t);
-    t->rx = kmalloc(TCP_RXBUF);
-    t->tx = kmalloc(TCP_TXBUF);
+    t->rx_capacity = tcp_rx_target;
+    t->tx_capacity = tcp_tx_target;
+    /* Buffer size is real backing storage, not a transfer rejection. Allow
+       a connection under memory pressure, negotiating its actual capacity. */
+    while (!(t->rx=kmalloc(t->rx_capacity)) && t->rx_capacity>PAGE_SIZE) t->rx_capacity/=2;
+    while (!(t->tx=kmalloc(t->tx_capacity)) && t->tx_capacity>PAGE_SIZE) t->tx_capacity/=2;
     if (!t->rx || !t->tx) {
         tcp_free(t);
         return -ENOMEM;
@@ -1297,18 +1424,21 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     if(++tcp_generation==0)++tcp_generation;
     t->generation=tcp_generation;
     t->user_open = true;
+    while ((t->rx_capacity-1)>>t->rx_shift > UINT16_MAX) t->rx_shift++;
     t->rip = ip;
     t->rport = port;
     t->lport=local;
     memcpy(t->mac, mac, 6);
     t->iss = rnd();
     t->snd_una = t->iss;
-    t->snd_nxt = t->snd_max = t->iss + 1;
+    t->snd_nxt = t->snd_max = t->iss;
     t->mss = 536;
     t->rto = 1000;
     t->state = T_SYN_SENT;
-    tcp_output(t, F_SYN, t->iss, NULL, 0);
-    tcp_arm(t);
+    if (!tcp_output(t, F_SYN, t->iss, 0)) {
+        t->snd_nxt = t->snd_max = t->iss+1;
+        tcp_arm(t);
+    }
     uint64_t generation=t->generation;
     while (t->state == T_SYN_SENT) {
         if(t->generation!=generation || !t->user_open)return -EBADF;
@@ -1332,21 +1462,24 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
 static int64_t sys_tcp_send(int h, const uint8_t *buf, size_t len) {
     struct tcb *t = user_tcb(h);
     if (!t) return -EBADF;
-    if (!user_ok(buf, len)) return -EFAULT;
     uint64_t generation=t->generation;
     size_t done = 0;
     while (done < len) {
         if(t->generation!=generation || !t->user_open)return done?(int64_t)done:-EBADF;
         if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT) return done ? (int64_t)done : (t->err ? t->err : -EPIPE);
         if (t->fin_pending) return -EPIPE;
-        uint32_t space = TCP_TXBUF - t->tx_len;
+        uint32_t space = t->tx_capacity - t->tx_len;
         if (!space) {
             if (current_task->killed) return done ? (int64_t)done : -EINTR;
             wq_wait_timeout(&t->progress, 1000);
             continue;
         }
         uint32_t n = (uint32_t)MIN(len - done, space);
-        memcpy(t->tx + t->tx_len, buf + done, n);
+        /* Validate exactly the chunk we will enqueue, not the entire request
+           on every iteration. A late fault preserves the completed prefix. */
+        if ((uint64_t)buf>UINT64_MAX-done || !user_ok((const void *)((uint64_t)buf+done),n))
+            return done?(int64_t)done:-EFAULT;
+        tcp_ring_write(t->tx,t->tx_capacity,t->tx_head+t->tx_len,buf+done,n);
         t->tx_len += n;
         done += n;
         tcp_push(t, false);
@@ -1357,7 +1490,7 @@ static int64_t sys_tcp_send(int h, const uint8_t *buf, size_t len) {
 static int64_t sys_tcp_recv(int h, uint8_t *buf, size_t len, int timeout_ms) {
     struct tcb *t = user_tcb(h);
     if (!t) return -EBADF;
-    if (!user_ok_w(buf, len)) return -EFAULT;
+    if (!len) return 0;
     uint64_t generation=t->generation;
     uint64_t until = uptime_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0);
     while (t->rx_len == 0) {
@@ -1371,11 +1504,18 @@ static int64_t sys_tcp_recv(int h, uint8_t *buf, size_t len, int timeout_ms) {
     }
     if(t->generation!=generation || !t->user_open)return -EBADF;
     uint32_t n = (uint32_t)MIN(len, t->rx_len);
-    for (uint32_t i = 0; i < n; i++) buf[i] = t->rx[(t->rx_head + i) % TCP_RXBUF];
-    t->rx_head = (t->rx_head + n) % TCP_RXBUF;
+    if (!user_ok_w(buf,n)) return -EFAULT;
+    tcp_ring_read(buf,t->rx,t->rx_capacity,t->rx_head,n);
+    t->rx_head = (t->rx_head + n) % t->rx_capacity;
     t->rx_len -= n;
     /* window update if we had been squeezing the sender */
-    if (t->adv_wnd < 16384 && tcp_window(t) >= 16384 && t->state != T_CLOSED) tcp_output(t, F_ACK, t->snd_nxt, NULL, 0);
+    uint32_t available = tcp_window(t);
+    /* RFC 1122 receiver SWS avoidance: reopen at half the actual receive
+       storage or one full segment, whichever is smaller. */
+    uint32_t threshold = MIN(t->rx_capacity/2,TCP_MSS);
+    if (t->state != T_CLOSED && available>t->adv_wnd &&
+        (t->adv_wnd==0 || available-t->adv_wnd>=threshold))
+        tcp_output(t, F_ACK, t->snd_nxt, 0);
     return n;
 }
 
@@ -1396,7 +1536,9 @@ static void tcp_close(struct tcb *t) {
 
 /* ---------------------------------------------------------------- input dispatch, thread, syscalls */
 
-static void eth_input(const uint8_t *p, size_t len) {
+static void eth_input(const void *packet, size_t len) {
+    const uint8_t *p = packet;
+    if (len<sizeof(struct eth_hdr)) return;
     const struct eth_hdr *e = (const struct eth_hdr *)p;
     if (memcmp(e->dst, nif->mac, 6) != 0 && !(e->dst[0] & 1)) return; /* not for us (promiscuous NICs) */
     rx_packets++;
@@ -1424,11 +1566,38 @@ static void net_thread(void *arg) {
     uint64_t last_tick = 0;
     for (;;) {
         uint64_t f = irq_save();
-        if (rxq_tail == rxq_head) wq_wait_timeout(&rxq_wq, 50);
+        if (rxq_tail == rxq_head && !net_work_pending && (!nif->rx_pending || !nif->rx_pending()))
+            wq_wait_timeout(&rxq_wq, 50);
+        net_work_pending = false;
         irq_restore(f);
+        receive_batch = true;
+        if (nif->poll_rx) nif->poll_rx(eth_input);
         while (rxq_tail != rxq_head) {
             eth_input(rxq_buf[rxq_tail], rxq_len[rxq_tail]);
             rxq_tail = (rxq_tail + 1) % RXQ;
+        }
+        /* End-of-drain ACK and per-socket readiness, once per connection.
+           Resource-blocked sends retry on NIC completion, not a fictitious
+           packet loss/retransmission timeout. */
+        for (size_t i=0;i<tcp_capacity;i++) {
+            struct tcb *t = tcbs[i];
+            if (!t || t->state==T_FREE || t->state==T_CLOSED) continue;
+            if (t->state==T_SYN_SENT && t->tx_retry) {
+                if (!tcp_output(t,F_SYN,t->iss,0)) {
+                    t->snd_nxt = t->snd_max = t->iss+1;
+                    t->tx_retry = false;
+                    tcp_arm(t);
+                }
+            } else {
+                if (t->ack_pending) tcp_output(t,F_ACK,t->snd_nxt,0);
+                if (t->resend_pending) tcp_resend_first(t);
+                if (t->tx_retry && !t->resend_pending) tcp_push(t,t->probe_pending);
+            }
+        }
+        receive_batch = false;
+        for (size_t i=0;i<tcp_capacity;i++) {
+            struct tcb *t = tcbs[i];
+            if (t && t->progress_pending) { t->progress_pending=false; wq_wake_all(&t->progress); }
         }
         if (uptime_ms() - last_tick >= 50) {
             last_tick = uptime_ms();
@@ -1442,7 +1611,34 @@ void net_register(struct netif *n) {
     if (!nif) nif = n;
 }
 
+static void tcp_buffer_configure(void) {
+    extern const char *kernel_cmdline;
+    const char *names[] = {"tcp-rx-bytes=","tcp-tx-bytes="};
+    uint32_t *targets[] = {&tcp_rx_target,&tcp_tx_target};
+    for (size_t option=0;option<ARRAY_SIZE(names);option++) {
+        size_t prefix = strlen(names[option]);
+        for (const char *p=kernel_cmdline;*p;p++) {
+            if ((p!=kernel_cmdline && p[-1]!=' ') || strncmp(p,names[option],prefix)) continue;
+            const char *q=p+prefix;
+            uint64_t bytes=0;
+            bool valid=*q>='0' && *q<='9';
+            while (*q>='0' && *q<='9') {
+                unsigned digit=*q++-'0';
+                if (bytes>(UINT64_MAX-digit)/10) valid=false;
+                if (valid) bytes=bytes*10+digit;
+            }
+            /* Physical allocation rounds to pages. RFC 7323's maximum window
+               is also the sequence-space bound, not an invented fetch limit. */
+            if (valid && (!*q || *q==' ') && bytes && bytes<=TCP_WINDOW_MAX) {
+                *targets[option] = (uint32_t)ALIGN_UP(bytes,PAGE_SIZE);
+            } else kprintf("net: invalid %s buffer configuration\n",names[option]);
+        }
+    }
+    kprintf("net: TCP storage targets rx=%u tx=%u bytes (allocation-backed, WS negotiated)\n",tcp_rx_target,tcp_tx_target);
+}
+
 void net_init(void) {
+    tcp_buffer_configure();
     if (!netvsc_probe() && !e1000_probe() && !tulip_probe()) {
         kprintf("net: no supported network card\n");
         return;

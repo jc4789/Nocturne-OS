@@ -56,10 +56,19 @@ bool user_ok(const void *p, size_t n) { return user_access(p, n, false); }
 bool user_ok_w(void *p, size_t n) { return user_access(p, n, true); }
 
 int user_str(char *dst, const char *src, size_t max) {
-    for (size_t i = 0; i < max; i++) {
-        if (!user_ok(src + i, 1)) return -EFAULT;
-        dst[i] = src[i];
-        if (!dst[i]) return (int)i;
+    if (!max) return -ENAMETOOLONG;
+    size_t i = 0;
+    while (i < max) {
+        uint64_t address = (uint64_t)src + i;
+        if (address < (uint64_t)src || !user_ok((const void *)address, 1)) return -EFAULT;
+        size_t end = i + MIN(max - i, PAGE_SIZE - (address & (PAGE_SIZE - 1)));
+        /* Permission is page-granular. Do not touch the next page until its
+           PTE has been checked, even if the string terminates at this edge. */
+        while (i < end) {
+            char c = *(const char *)((uint64_t)src + i);
+            dst[i++] = c;
+            if (!c) return (int)(i - 1);
+        }
     }
     dst[max - 1] = 0;
     return -ENAMETOOLONG;
@@ -108,8 +117,7 @@ static int allocfd(struct file *f) {
 static int64_t sys_read(int fd, void *buf, size_t n) {
     struct file *f = getfd_ref(fd);
     if (!f) return -EBADF;
-    if (!user_ok_w(buf, n)) { vfs_close(f); return -EFAULT; }
-    int64_t result = vfs_read(f, buf, n);
+    int64_t result = vfs_read_user(f, buf, n);
     vfs_close(f);
     return result;
 }
@@ -117,8 +125,7 @@ static int64_t sys_read(int fd, void *buf, size_t n) {
 static int64_t sys_write(int fd, const void *buf, size_t n) {
     struct file *f = getfd_ref(fd);
     if (!f) return -EBADF;
-    if (!user_ok(buf, n)) { vfs_close(f); return -EFAULT; }
-    int64_t result = vfs_write(f, buf, n);
+    int64_t result = vfs_write_user(f, buf, n);
     vfs_close(f);
     return result;
 }
@@ -140,6 +147,7 @@ static int64_t sys_close(int fd) {
     struct file *f = getfd(fd);
     if (!f) { irq_restore(flags); return -EBADF; }
     task_process()->fds[fd] = NULL;
+    vfs_poll_notify(f->vn);
     if((size_t)fd<task_process()->fd_hint)task_process()->fd_hint=(size_t)fd;
     irq_restore(flags);
     /* Final audio close may sleep. The detached slot's reference owns f. */
@@ -371,6 +379,7 @@ static int64_t sys_dup2(int oldfd, int newfd) {
     if(error){irq_restore(flags);return error;}
     struct file *previous = task_process()->fds[newfd];
     task_process()->fds[newfd] = vfs_dup(f);
+    if (previous) vfs_poll_notify(previous->vn);
     irq_restore(flags);
     vfs_close(previous);
     return newfd;
@@ -393,10 +402,11 @@ static int64_t sys_poll(struct n_pollfd *ufds, int n, int timeout) {
     if(!user_ok_w(ufds,bytes)){irq_restore(snapshot_flags);if(fds!=local)kfree(fds);return -EFAULT;}
     memcpy(fds,ufds,bytes);irq_restore(snapshot_flags);
     uint64_t deadline = timeout >= 0 ? uptime_ms() + timeout : 0;
+    struct poll_wait wait = {0};
     int result=0;
     for (;;) {
         uint64_t fl = irq_save();
-        uint64_t generation=poll_generation;
+        uint64_t generation=wait.generation;
         int ready = 0;
         for (int i = 0; i < n; i++) {
             fds[i].revents = 0;
@@ -406,14 +416,17 @@ static int64_t sys_poll(struct n_pollfd *ufds, int n, int timeout) {
                 if ((fds[i].events & N_POLLOUT) && vfs_can_write(f)) fds[i].revents |= N_POLLOUT;
                 if (f->vn->ops && f->vn->ops->hangup && f->vn->ops->hangup(f->vn,f)) fds[i].revents |= N_POLLHUP;
                 if (fds[i].revents) ready++;
+                /* Checking and enrollment share the same IRQ guard. Avoid
+                   allocating listeners for an already-ready descriptor. */
+                else if (timeout != 0) vfs_poll_file(&wait, f);
             }
             /* Preserve atomic per-descriptor checks without letting a large
              * valid client list become one non-preemptible kernel operation. */
-            if((i&63)==63 && i+1<n){irq_restore(fl);fl=irq_save();}
+            irq_restore(fl);fl=irq_save();
         }
         bool expired=timeout>0 && uptime_ms()>=deadline;
-        if (ready || timeout == 0 || expired) {
-            result=ready;
+        if (ready || timeout == 0 || expired || wait.error) {
+            result=ready ? ready : wait.error ? wait.error : 0;
             /* A sibling may have unmapped the original array while this
              * syscall slept/scanned; no kernel copy targets stale user pages. */
             if(!user_ok_w(ufds,bytes))result=-EFAULT;
@@ -427,15 +440,17 @@ static int64_t sys_poll(struct n_pollfd *ufds, int n, int timeout) {
         }
         /* Closing/enqueuing during a released scan quantum cannot be lost
          * between readiness and wait enrollment. Retry only for a new event. */
-        if(generation!=poll_generation){irq_restore(fl);continue;}
+        if(generation!=wait.generation){irq_restore(fl);vfs_poll_cleanup(&wait);continue;}
         if (timeout > 0) {
             uint64_t now = uptime_ms();
-            if(now<deadline)wq_wait_timeout(&poll_wq, deadline - now);
+            if(now<deadline)wq_wait_timeout(&wait.wq, deadline - now);
         } else {
-            wq_wait(&poll_wq);
+            wq_wait(&wait.wq);
         }
         irq_restore(fl);
+        vfs_poll_cleanup(&wait);
     }
+    vfs_poll_cleanup(&wait);
     if(fds!=local)kfree(fds);
     return result;
 }

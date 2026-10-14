@@ -61,6 +61,7 @@ void gdt_init_cpu(unsigned index) {
         "movw $0x28, %%ax\n"
         "ltr %%ax\n"
         : : "m"(g) : "rax", "memory");
+    cpu_local_init(index);
 }
 
 void cpu_get_brand(char *out) {

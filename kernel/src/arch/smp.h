@@ -6,6 +6,23 @@
 #define CPU_MAX_COUNT 16
 #define VEC_SMP_WAKE 0x32
 #define VEC_USER_STOP 0x33
+#define VEC_USER_RETURN 0x34
+
+struct task;
+/* GS is kernel-owned; user TLS remains in FS. The self pointer makes current
+   task/reschedule access independent of APIC registers and CPU enumeration. */
+struct cpu_local {
+    struct cpu_local *self;
+    unsigned index;
+    struct task *task;
+    volatile bool resched;
+} __attribute__((aligned(64)));
+static inline struct cpu_local *cpu_local_get(void) {
+    struct cpu_local *local;
+    __asm__ volatile("movq %%gs:0, %0" : "=r"(local));
+    return local;
+}
+void cpu_local_init(unsigned index); /* after loading this CPU's GDT, before IDT */
 
 struct limine_mp_response;
 struct regs;
@@ -37,6 +54,7 @@ bool cpu_runner_ready_at(unsigned index);
 void cpu_runner_started(void); /* AP固定idle stack初期化後のready publication */
 void cpu_runner_wake(void);
 void cpu_runner_wake_at(unsigned index);
+void cpu_bsp_wake(void); /* AP: a published retire ACK is ready for collection */
 bool cpu_worker_poll(void); /* AP idle stack only: execute a published bounded job */
 void cpu_runner_check(void); /* BSP: failed APはcontextを保持してpanic */
 bool cpu_jobs_active(void);

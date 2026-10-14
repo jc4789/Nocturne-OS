@@ -9,6 +9,7 @@
 #define REG_CTRL   0x0000
 #define REG_EERD   0x0014
 #define REG_ICR    0x00C0
+#define REG_ITR    0x00C4
 #define REG_IMS    0x00D0
 #define REG_IMC    0x00D8
 #define REG_RCTL   0x0100
@@ -19,6 +20,8 @@
 #define REG_RDLEN  0x2808
 #define REG_RDH    0x2810
 #define REG_RDT    0x2818
+#define REG_RDTR   0x2820
+#define REG_RADV   0x282C
 #define REG_TDBAL  0x3800
 #define REG_TDBAH  0x3804
 #define REG_TDLEN  0x3808
@@ -28,9 +31,17 @@
 #define REG_RAL    0x5400
 #define REG_RAH    0x5404
 
-#define NRX   32
-#define NTX   16
 #define BUFSZ 2048
+#define ICR_TXDW   (1u << 0)
+#define ICR_LSC    (1u << 2)
+#define ICR_RXDMT0 (1u << 4)
+#define ICR_RXO    (1u << 6)
+#define ICR_RXT0   (1u << 7)
+#define RX_IRQS (ICR_RXDMT0 | ICR_RXO | ICR_RXT0)
+#define DESC_DD  1u
+#define RX_EOP   2u
+#define ITR_TICK_NS 256u /* 8254x ITR, manual section 13.4.18 */
+#define ITR_DEFAULT_TICKS 651u /* low end of Intel's suggested 651..5580 range */
 
 struct rx_desc {
     uint64_t addr;
@@ -46,11 +57,21 @@ struct tx_desc {
     uint16_t special;
 } PACKED;
 
+/* Each descriptor ring owns one physical page: 256 legacy descriptors. This
+   satisfies the hardware's 16-byte base and 128-byte ring-length alignment;
+   packet buffering is backed by these DMA descriptors, not another RX queue. */
+#define NRX (PAGE_SIZE / sizeof(struct rx_desc))
+#define NTX (PAGE_SIZE / sizeof(struct tx_desc))
+#define BUFS_PER_PAGE (PAGE_SIZE / BUFSZ)
+_Static_assert(sizeof(struct rx_desc) == 16 && sizeof(struct tx_desc) == 16, "e1000 descriptor ABI");
+_Static_assert(PAGE_SIZE % 128 == 0 && PAGE_SIZE % BUFSZ == 0, "e1000 DMA alignment");
+
 static volatile uint8_t *mmio;
 static volatile struct rx_desc *rx;
 static volatile struct tx_desc *tx;
 static uint8_t *rxbuf[NRX], *txbuf[NTX];
-static int rx_cur, tx_cur;
+static int rx_cur, tx_cur, tx_clean;
+static volatile bool rx_irq_pending;
 static bool new_eerd; /* 82574-style EERD layout */
 static struct netif nif = {.driver = "e1000"};
 
@@ -73,26 +94,107 @@ static void e1000_irq(struct regs *r) {
     (void)r;
     uint32_t icr = rd(REG_ICR); /* reading acknowledges */
     if (!icr) return;
-    while (rx[rx_cur].status & 1) {
-        if ((rx[rx_cur].status & 2) && !rx[rx_cur].errors) net_rx(rxbuf[rx_cur], rx[rx_cur].len);
+    /* DMA ownership remains with the driver until the net thread has consumed
+       the frame. Suppress RX interrupts while that thread drains the ring. */
+    if (icr & RX_IRQS) wr(REG_IMC, RX_IRQS);
+    rx_irq_pending = true;
+    net_rx_notify();
+}
+
+static bool e1000_rx_pending(void) {
+    return rx_irq_pending || (rx[rx_cur].status & DESC_DD);
+}
+
+static size_t e1000_poll_rx(void (*input)(const void *, size_t)) {
+    wr(REG_IMC, RX_IRQS);
+    size_t consumed = 0;
+    int returned = -1;
+    while (rx[rx_cur].status & DESC_DD) {
+        /* x86 coherent DMA writes the packet before DD. Prevent the compiler
+           from moving the packet read ahead of the volatile ownership check. */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        uint16_t len = rx[rx_cur].len;
+        if ((rx[rx_cur].status & RX_EOP) && !rx[rx_cur].errors && len <= BUFSZ)
+            input(rxbuf[rx_cur], len);
         rx[rx_cur].status = 0;
-        wr(REG_RDT, rx_cur);
+        returned = rx_cur;
         rx_cur = (rx_cur + 1) % NRX;
+        consumed++;
     }
+    uint64_t flags = irq_save();
+    rx_irq_pending = false;
+    if (returned >= 0) {
+        __atomic_thread_fence(__ATOMIC_RELEASE);
+        wr(REG_RDT, (uint32_t)returned); /* one tail write for the whole drain */
+    }
+    wr(REG_IMS, RX_IRQS);
+    /* A packet may arrive between the empty check and rearming. Never wait
+       for a fresh edge if its descriptor is already visible. */
+    if (rx[rx_cur].status & DESC_DD) {
+        wr(REG_IMC, RX_IRQS);
+        rx_irq_pending = true;
+        net_rx_notify();
+    }
+    irq_restore(flags);
+    return consumed;
 }
 
 static int e1000_send(const void *frame, size_t len) {
     if (len > BUFSZ) return -EINVAL;
+    uint64_t flags = irq_save();
+    while (tx_clean != tx_cur && (tx[tx_clean].status & DESC_DD))
+        tx_clean = (tx_clean + 1) % NTX;
+    int next = (tx_cur + 1) % NTX;
     volatile struct tx_desc *d = &tx[tx_cur];
-    for (int i = 0; i < 1000000 && !(d->status & 1); i++) pause();
-    if (!(d->status & 1)) return -EBUSY;
+    /* TDH == TDT denotes an empty hardware ring, so retain one descriptor to
+       distinguish full from empty even before DMA has completed any send. */
+    if (next == tx_clean || !(d->status & DESC_DD)) {
+        irq_restore(flags);
+        return -EAGAIN; /* local backpressure, not a packet lost on the wire */
+    }
     memcpy(txbuf[tx_cur], frame, len);
     d->len = (uint16_t)len;
     d->cmd = 0x0B; /* EOP | IFCS | RS */
     d->status = 0;
-    tx_cur = (tx_cur + 1) % NTX;
+    tx_cur = next;
+    __atomic_thread_fence(__ATOMIC_RELEASE);
     wr(REG_TDT, tx_cur);
+    irq_restore(flags);
     return 0;
+}
+
+static uint32_t e1000_itr_ticks(void) {
+    extern const char *kernel_cmdline;
+    const char prefix[] = "e1000-itr-us=";
+    uint32_t ticks = ITR_DEFAULT_TICKS;
+    if (!kernel_cmdline) return ticks;
+    for (const char *p = kernel_cmdline; *p; p++) {
+        if ((p != kernel_cmdline && p[-1] != ' ') || strncmp(p, prefix, sizeof prefix - 1)) continue;
+        const char *q = p + sizeof prefix - 1;
+        uint64_t us = 0;
+        bool valid = *q >= '0' && *q <= '9';
+        while (*q >= '0' && *q <= '9') {
+            unsigned digit = *q++ - '0';
+            if (us > (UINT64_MAX - digit) / 10) valid = false;
+            if (valid) us = us * 10 + digit;
+        }
+        if (!valid || (*q && *q != ' ') || us > (uint64_t)UINT16_MAX * ITR_TICK_NS / 1000) continue;
+        ticks = (uint32_t)((us * 1000 + ITR_TICK_NS - 1) / ITR_TICK_NS);
+    }
+    return ticks;
+}
+
+static void e1000_free_dma(uint64_t rx_ring, uint64_t tx_ring) {
+    for (size_t i = 0; i < NRX; i += BUFS_PER_PAGE)
+        if (rxbuf[i]) pmm_free(hhdm_virt_to_phys(rxbuf[i]));
+    for (size_t i = 0; i < NTX; i += BUFS_PER_PAGE)
+        if (txbuf[i]) pmm_free(hhdm_virt_to_phys(txbuf[i]));
+    if (rx_ring) pmm_free(rx_ring);
+    if (tx_ring) pmm_free(tx_ring);
+    memset(rxbuf, 0, sizeof rxbuf);
+    memset(txbuf, 0, sizeof txbuf);
+    rx = NULL;
+    tx = NULL;
 }
 
 bool e1000_probe(void) {
@@ -135,47 +237,66 @@ bool e1000_probe(void) {
     for (int i = 0; i < 128; i++) wr(REG_MTA + i * 4, 0);
 
     /* descriptor rings and buffers */
-    uint64_t ring = pmm_alloc_zeroed();
-    rx = phys_to_virt(ring);
-    tx = (void *)((uint8_t *)phys_to_virt(ring) + 2048);
-    for (int i = 0; i < NRX; i += 2) {
+    uint64_t rx_ring = pmm_alloc_zeroed(), tx_ring = pmm_alloc_zeroed();
+    if (!rx_ring || !tx_ring) goto no_dma;
+    rx = phys_to_virt(rx_ring);
+    tx = phys_to_virt(tx_ring);
+    for (size_t i = 0; i < NRX; i += BUFS_PER_PAGE) {
         uint64_t p = pmm_alloc();
-        for (int k = 0; k < 2; k++) {
+        if (!p) goto no_dma;
+        for (size_t k = 0; k < BUFS_PER_PAGE; k++) {
             rxbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * BUFSZ;
             rx[i + k].addr = p + k * BUFSZ;
             rx[i + k].status = 0;
         }
     }
-    for (int i = 0; i < NTX; i += 2) {
+    for (size_t i = 0; i < NTX; i += BUFS_PER_PAGE) {
         uint64_t p = pmm_alloc();
-        for (int k = 0; k < 2; k++) {
+        if (!p) goto no_dma;
+        for (size_t k = 0; k < BUFS_PER_PAGE; k++) {
             txbuf[i + k] = (uint8_t *)phys_to_virt(p) + k * BUFSZ;
             tx[i + k].addr = p + k * BUFSZ;
             tx[i + k].status = 1; /* DD: free */
             tx[i + k].cmd = 0;
         }
     }
-    wr(REG_RDBAL, (uint32_t)ring);
-    wr(REG_RDBAH, (uint32_t)(ring >> 32));
-    wr(REG_RDLEN, NRX * 16);
+    wr(REG_RDBAL, (uint32_t)rx_ring);
+    wr(REG_RDBAH, (uint32_t)(rx_ring >> 32));
+    wr(REG_RDLEN, NRX * sizeof *rx);
     wr(REG_RDH, 0);
     wr(REG_RDT, NRX - 1);
     wr(REG_RCTL, (1u << 1) | (1u << 15) | (1u << 26)); /* EN, BAM, SECRC; 2048-byte buffers */
-    wr(REG_TDBAL, (uint32_t)(ring + 2048));
-    wr(REG_TDBAH, (uint32_t)((ring + 2048) >> 32));
-    wr(REG_TDLEN, NTX * 16);
+    wr(REG_TDBAL, (uint32_t)tx_ring);
+    wr(REG_TDBAH, (uint32_t)(tx_ring >> 32));
+    wr(REG_TDLEN, NTX * sizeof *tx);
     wr(REG_TDH, 0);
     wr(REG_TDT, 0);
     wr(REG_TCTL, (1u << 1) | (1u << 3) | (15u << 4) | (64u << 12)); /* EN, PSP, CT, COLD */
     wr(REG_TIPG, 10 | (8 << 10) | (6 << 20));
 
+    /* Intel explicitly recommends ITR instead of RDTR/RADV (receive-delay
+       errata). ITR is not implemented by the 82544GC/EI, device 0x100C. */
+    wr(REG_RDTR, 0);
+    if (d->device != 0x100C) {
+        wr(REG_RADV, 0);
+        uint32_t itr = e1000_itr_ticks();
+        wr(REG_ITR, itr);
+        kprintf("net: e1000 ITR %u x %u ns (e1000-itr-us=0 disables)\n", itr, ITR_TICK_NS);
+    }
+
+    nif.send = e1000_send;
+    nif.rx_pending = e1000_rx_pending;
+    nif.poll_rx = e1000_poll_rx;
+    net_register(&nif);
     irq_register(d->irq, e1000_irq);
     pic_unmask(d->irq);
-    wr(REG_IMS, (1u << 2) | (1u << 4) | (1u << 6) | (1u << 7)); /* LSC, RXDMT0, RXO, RXT0 */
     rd(REG_ICR);
-    nif.send = e1000_send;
+    wr(REG_IMS, ICR_TXDW | ICR_LSC | RX_IRQS);
     kprintf("net: e1000 (%04x) irq %d mac %02x:%02x:%02x:%02x:%02x:%02x\n", d->device, d->irq, nif.mac[0],
             nif.mac[1], nif.mac[2], nif.mac[3], nif.mac[4], nif.mac[5]);
-    net_register(&nif);
     return true;
+no_dma:
+    e1000_free_dma(rx_ring, tx_ring);
+    kprintf("net: e1000 DMA allocation failed\n");
+    return false;
 }

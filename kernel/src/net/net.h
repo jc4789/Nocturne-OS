@@ -8,11 +8,19 @@ struct netif {
     const char *driver;
     uint8_t mac[6];
     int (*send)(const void *frame, size_t len); /* frame without FCS, >= 60 bytes */
+    /* Optional DMA receive path. Called only by the net thread; input must
+       consume the borrowed frame synchronously, before poll_rx returns it to
+       the NIC. rx_pending is also safe with interrupts disabled. */
+    bool (*rx_pending)(void);
+    size_t (*poll_rx)(void (*input)(const void *frame, size_t len));
 };
 
 void net_register(struct netif *nif);
 /* hand a received frame (without FCS) to the stack; safe to call from IRQ context */
 void net_rx(const void *frame, size_t len);
+/* Wake the net thread without copying a packet; safe from interrupt context.
+   Also used for TX completion so a resource-blocked sender can retry. */
+void net_rx_notify(void);
 
 bool e1000_probe(void);
 bool tulip_probe(void);

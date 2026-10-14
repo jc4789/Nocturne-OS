@@ -2,6 +2,7 @@
 #include "fs/vfs.h"
 #include "mm/heap.h"
 #include "arch/cpu.h"
+#include "sys/syscall.h"
 
 #define PIPE_SEGMENT_SIZE 16384 /* allocation/copy granularity, not a capacity ceiling */
 
@@ -24,7 +25,7 @@ static struct pipe_segment *pipe_segment_new(void){
     return s;
 }
 
-static int64_t pipe_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
+static int64_t pipe_read_common(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n, bool user) {
     struct pipe *p = v->priv;
     uint8_t *out = buf;
     size_t done=0;
@@ -35,6 +36,9 @@ static int64_t pipe_read(struct vnode *v, struct file *f, void *buf, uint64_t of
             struct pipe_segment *s=p->head;
             size_t available=s->write_at-s->read_at;
             size_t got = n-done < available ? n-done : available;
+            if (user && !user_ok_w(out+done, got)) {
+                irq_restore(fl); return done ? (int64_t)done : -EFAULT;
+            }
             memcpy(out+done,s->bytes+s->read_at,got);
             s->read_at+=got;
             p->count -= got;
@@ -44,7 +48,7 @@ static int64_t pipe_read(struct vnode *v, struct file *f, void *buf, uint64_t of
                 else s->read_at=s->write_at=0; /* reuse the empty final owner */
             }
             wq_wake_all(&p->wq);
-            poll_notify();
+            vfs_poll_notify(v);
             irq_restore(fl);
             if(done==n)return (int64_t)done;
             continue;
@@ -67,7 +71,14 @@ static int64_t pipe_read(struct vnode *v, struct file *f, void *buf, uint64_t of
     }
 }
 
-static int64_t pipe_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
+static int64_t pipe_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
+    return pipe_read_common(v, f, buf, off, n, false);
+}
+static int64_t pipe_read_user(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
+    return pipe_read_common(v, f, buf, off, n, true);
+}
+
+static int64_t pipe_write_common(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n, bool user) {
     struct pipe *p = v->priv;
     const uint8_t *in = buf;
     size_t done = 0;
@@ -95,6 +106,7 @@ static int64_t pipe_write(struct vnode *v, struct file *f, const void *buf, uint
                 s->next=next;p->tail=s=next;
             }
             size_t put=MIN(n-done,MIN(PIPE_SEGMENT_SIZE-s->write_at,PIPE_SEGMENT_SIZE-committed));
+            if (user && !user_ok(in+done, put)) { error=-EFAULT; break; }
             memcpy(s->bytes+s->write_at,in+done,put);
             s->write_at+=put;
             p->count += put;
@@ -103,12 +115,19 @@ static int64_t pipe_write(struct vnode *v, struct file *f, const void *buf, uint
         }
         if(committed){
             wq_wake_all(&p->rq);
-            poll_notify();
+            vfs_poll_notify(v);
         }
         irq_restore(fl);
         if(error)return done?(int64_t)done:error;
     }
     return done;
+}
+
+static int64_t pipe_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
+    return pipe_write_common(v, f, buf, off, n, false);
+}
+static int64_t pipe_write_user(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
+    return pipe_write_common(v, f, buf, off, n, true);
 }
 
 static bool pipe_can_read(struct vnode *v, struct file *f) {
@@ -136,7 +155,7 @@ static void pipe_close(struct vnode *v, struct file *f) {
     else p->writers--;
     wq_wake_all(&p->rq);
     wq_wake_all(&p->wq);
-    poll_notify();
+    vfs_poll_notify(v);
     irq_restore(fl);
 }
 
@@ -150,6 +169,8 @@ static void pipe_release(struct vnode *v) {
 static struct vnode_ops pipe_ops = {
     .read = pipe_read,
     .write = pipe_write,
+    .read_user = pipe_read_user,
+    .write_user = pipe_write_user,
     .can_read = pipe_can_read,
     .can_write = pipe_can_write,
     .hangup = pipe_hangup,
@@ -192,6 +213,7 @@ struct channel_listener {
     uint64_t hash;
     size_t key_length;
     bool published;
+    struct vnode *vn;
     char key[];
 };
 enum {CHANNEL_BUCKETS=64};
@@ -215,6 +237,20 @@ static int64_t channel_write(struct vnode *v,struct file *f,const void *buffer,u
     struct channel_end *end=v->priv;
     return pipe_write(end->tx->vn,f,buffer,offset,n);
 }
+static int64_t channel_read_user(struct vnode *v,struct file *f,void *buffer,uint64_t offset,size_t n) {
+    struct channel_end *end=v->priv;
+    return pipe_read_user(end->rx->vn,f,buffer,offset,n);
+}
+static int64_t channel_write_user(struct vnode *v,struct file *f,const void *buffer,uint64_t offset,size_t n) {
+    struct channel_end *end=v->priv;
+    return pipe_write_user(end->tx->vn,f,buffer,offset,n);
+}
+static void channel_poll_register(struct vnode *v,struct file *f,struct poll_wait *wait) {
+    (void)f;struct channel_end *end=v->priv;
+    /* Either directional peer can hang up, independently of requested IN/OUT. */
+    vfs_poll_register(wait,end->rx->vn);
+    vfs_poll_register(wait,end->tx->vn);
+}
 static bool channel_can_read(struct vnode *v,struct file *f) {
     struct channel_end *end=v->priv;return pipe_can_read(end->rx->vn,f);
 }
@@ -233,6 +269,7 @@ static void channel_close(struct vnode *v,struct file *f) {
 static void channel_release(struct vnode *v) {kfree(v->priv);kfree(v);}
 static struct vnode_ops channel_ops={
     .read=channel_read,.write=channel_write,.can_read=channel_can_read,
+    .read_user=channel_read_user,.write_user=channel_write_user,.poll_register=channel_poll_register,
     .can_write=channel_can_write,.hangup=channel_hangup,.close=channel_close,.release=channel_release,
 };
 /* Transfers the two pipe references only on success. */
@@ -267,7 +304,7 @@ static void listener_close(struct vnode *v,struct file *f) {
         if(*at==l)*at=l->next;l->published=false;
     }
     struct channel_pending *pending=l->head;l->head=l->tail=NULL;
-    poll_notify();irq_restore(flags);
+    vfs_poll_notify(v);irq_restore(flags);
     /* A pending server reference is an ordinary owner. Closing it propagates
      * both directional EOF/EPIPE and wakes clients, even after owner death. */
     while(pending){struct channel_pending *next=pending->next;vfs_close(pending->server);kfree(pending);pending=next;}
@@ -281,7 +318,7 @@ int channel_listen(const char *key,size_t length,struct file **listener) {
     struct vnode *v=kzalloc(sizeof *v);
     struct channel_listener *l=kzalloc(sizeof *l+length);
     if(!v || !l){kfree(v);kfree(l);return -ENOMEM;}
-    l->hash=hash;l->key_length=length;memcpy(l->key,key,length);
+    l->hash=hash;l->key_length=length;l->vn=v;memcpy(l->key,key,length);
     v->type=VT_CHANNEL;v->ops=&listener_ops;v->priv=l;v->unlinked=true;
     strlcpy(v->name,"channel-listener",sizeof v->name);
     struct file *f=vfs_open_vnode(v,O_RDWR|O_NONBLOCK);
@@ -303,7 +340,7 @@ int channel_connect(const char *key,size_t length,struct file **client) {
     if(e){kfree(pending);irq_restore(flags);return e;}
     pending->next=NULL;pending->server=server;
     if(l->tail)l->tail->next=pending;else l->head=pending;l->tail=pending;
-    poll_notify();irq_restore(flags);return 0;
+    vfs_poll_notify(l->vn);irq_restore(flags);return 0;
 }
 int channel_accept(struct file *listener,struct file **server) {
     if(!listener || listener->vn->ops!=&listener_ops)return -EINVAL;

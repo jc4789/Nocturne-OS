@@ -4,6 +4,13 @@ section .text
 
 extern isr_dispatch
 
+; Keep the public struct regs layout unchanged. A private word below it records
+; whether this entry exchanged GS. Derive frame offsets from the saved GPRs.
+%define REGS_GPRS 15
+%define REGS_VECTOR (REGS_GPRS * 8)
+%define REGS_CS ((REGS_GPRS + 3) * 8)
+%define MSR_GS_BASE 0xC0000101
+
 %macro ISR_NOERR 1
 isr%1:
     push qword 0
@@ -44,10 +51,37 @@ isr_common:
     push r14
     push r15
     cld
-    mov rdi, rsp
+    push qword 0
+    test byte [rsp + 8 + REGS_CS], 3
+    jnz .user_gs
+    ; Maskable IRQs cannot enter the interrupt-gate swapgs/iret window (IF=0).
+    ; Kernel-origin exceptions, including NMI/#DB/#MC, can. Inspect the actual
+    ; base for these entries rather than trusting the saved CS. FSGSBASE is
+    ; disabled and user GDT descriptors have zero base; a high base is ours.
+    cmp qword [rsp + 8 + REGS_VECTOR], 32
+    jae .kernel_gs
+    mov ecx, MSR_GS_BASE
+    rdmsr
+    test edx, edx
+    js .kernel_gs
+.user_gs:
+    swapgs
+    mov qword [rsp], 1
+.kernel_gs:
+    ; Do not let speculative GS-relative kernel loads cross the base decision.
+    lfence
+    lea rdi, [rsp + 8]
+    mov rbx, rsp
+    and rsp, -16
     call isr_dispatch
+    mov rsp, rbx
 global isr_exit
 isr_exit:
+    cmp qword [rsp], 0
+    lea rsp, [rsp + 8]
+    je .restore
+    swapgs
+.restore:
     pop r15
     pop r14
     pop r13
@@ -116,6 +150,10 @@ kthread_trampoline:
 global user_trampoline
 extern sched_user_return
 user_trampoline:
-    mov rdi, rsp
+    push qword 1
+    lea rdi, [rsp + 8]
+    mov rbx, rsp
+    and rsp, -16
     call sched_user_return
+    mov rsp, rbx
     jmp isr_exit

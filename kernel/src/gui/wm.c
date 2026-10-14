@@ -266,7 +266,7 @@ static void push_event(struct window *w, const struct gui_event *e) {
         w->frame_event = *e;
         w->frame_ready = true;
         wq_wake_all(&w->wq);
-        poll_notify();
+        vfs_poll_notify(w->vn);
         irq_restore(flags); return;
     }
     if (e->type == EV_MOUSE_MOVE && w->ev_count) {
@@ -281,7 +281,7 @@ static void push_event(struct window *w, const struct gui_event *e) {
     w->ev_head = (w->ev_head + 1) % EVQ;
     w->ev_count++;
     wq_wake_all(&w->wq);
-    poll_notify();
+    vfs_poll_notify(w->vn);
     irq_restore(flags);
 }
 
@@ -397,7 +397,7 @@ static void win_destroy_locked(struct window *w) {
     if (last_focus == w) last_focus = NULL;
     update_focus();
     wq_wake_all(&w->wq);
-    poll_notify();
+    vfs_poll_notify(w->vn);
     wake_compositor();
 }
 
@@ -407,13 +407,16 @@ static void win_destroy(struct window *w) {
     wm_unlock();
 }
 
-static int64_t win_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
+static int64_t win_read_common(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n, bool user) {
     struct window *w = v->priv;
     size_t max = n / sizeof(struct gui_event);
     if (max == 0) return -EINVAL;
     for (;;) {
         uint64_t fl = irq_save();
         if (w->ev_count || w->frame_ready) {
+            size_t available = (size_t)w->ev_count + (w->frame_ready ? 1u : 0u);
+            size_t bytes = MIN(max, available) * sizeof(struct gui_event);
+            if (user && !user_ok_w(buf, bytes)) { irq_restore(fl); return -EFAULT; }
             struct gui_event *out = buf;
             size_t got = 0;
             while (got < max && w->ev_count) {
@@ -445,6 +448,13 @@ static int64_t win_read(struct vnode *v, struct file *f, void *buf, uint64_t off
     }
 }
 
+static int64_t win_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
+    return win_read_common(v, f, buf, off, n, false);
+}
+static int64_t win_read_user(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
+    return win_read_common(v, f, buf, off, n, true);
+}
+
 static bool win_can_read(struct vnode *v, struct file *f) {
     struct window *w = v->priv;
     return w->ev_count > 0 || w->frame_ready || w->dead;
@@ -458,7 +468,7 @@ static void win_release(struct vnode *v) {
 }
 
 static struct vnode_ops win_ops = {
-    .read = win_read, .can_read = win_can_read, .close = win_close, .release = win_release};
+    .read = win_read, .read_user = win_read_user, .can_read = win_can_read, .close = win_close, .release = win_release};
 
 static bool alloc_buffer(struct window *w, int cw, int ch) {
     size_t pages = ALIGN_UP((uint64_t)cw * ch * 4, PAGE_SIZE) / PAGE_SIZE;

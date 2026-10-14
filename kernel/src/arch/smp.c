@@ -27,10 +27,11 @@ struct cpu_worker {
 } __attribute__((aligned(64)));
 
 static struct cpu_worker workers[CPU_MAX_COUNT];
+static struct cpu_local cpu_locals[CPU_MAX_COUNT];
 static unsigned slots = 1, online = 1;
 static unsigned detected = 1;
 static uint32_t bsp_apic_id;
-static bool started, busy;
+static bool busy;
 static uint64_t next_epoch, jobs;
 static uint64_t max_job_ticks;
 static uint64_t bsp_pat;
@@ -38,6 +39,18 @@ static bool have_pat;
 static uint32_t runner_mask;
 
 extern NORETURN void smp_switch_stack(uint64_t top, void (*entry)(void *), void *argument);
+
+void cpu_local_init(unsigned index) {
+    ASSERT(index < ARRAY_SIZE(cpu_locals));
+    struct cpu_local *local = &cpu_locals[index];
+    local->self = local;
+    local->index = index;
+    /* Users can load a GS selector (all user descriptors have base zero), but
+       must not use WRGSBASE to impersonate the high-half kernel GS base. */
+    write_cr4(read_cr4() & ~CR4_FSGSBASE);
+    wrmsr(MSR_GS_BASE, (uint64_t)local);
+    wrmsr(MSR_KERNEL_GS_BASE, 0);
+}
 
 unsigned cpu_online_count(void) { return online; }
 uint64_t cpu_parallel_jobs(void) { return jobs; }
@@ -94,6 +107,12 @@ void cpu_runner_wake_at(unsigned i) {
     if (i && i < slots && !lapic_send_ipi(workers[i].apic_id, VEC_USER_STOP))
         panic("smp: user runner IPI failed; context retained");
 }
+void cpu_bsp_wake(void) {
+    /* Only publication failures use this AP fault path; never enter BSP-owned
+       logging/allocator/panic code on an AP. The mailbox remains retained. */
+    if (!lapic_send_ipi(bsp_apic_id, VEC_USER_RETURN))
+        __asm__ volatile("ud2" : : : "memory");
+}
 void cpu_runner_check(void) {
     for (unsigned i = 1; i < slots; i++) if (cpu_runner_ready_at(i) && __atomic_load_n(&workers[i].failed, __ATOMIC_ACQUIRE)) {
         struct cpu_worker *w = &workers[i];
@@ -103,10 +122,11 @@ void cpu_runner_check(void) {
 }
 
 unsigned cpu_current_index(void) {
-    if (!started) return 0;
-    uint32_t id = lapic_current_id();
-    for (unsigned i = 0; i < slots; i++) if (workers[i].apic_id == id) return i;
-    return 0;
+    if (slots == 1) return 0;
+    unsigned index;
+    __asm__ volatile("movl %%gs:%c1, %0" : "=r"(index)
+                     : "i"(__builtin_offsetof(struct cpu_local, index)));
+    return index;
 }
 
 NORETURN void cpu_worker_fault(struct regs *r) {
@@ -378,7 +398,6 @@ void smp_init(struct limine_mp_response *response) {
         w->index = slots++;
         w->apic_id = info->lapic_id;
     }
-    started = true;
     for (unsigned i = 1; i < slots; i++) {
         struct cpu_worker *w = &workers[i];
         struct limine_mp_info *info = NULL;
