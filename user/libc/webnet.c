@@ -9,11 +9,12 @@
 #include <time.h>
 #include <limits.h>
 
-/* HTTP/1.x sockets have no multiplexing. Bound resource fan-out separately
- * from per-origin connections, and adapt the active budget to native memory. */
+/* Request concurrency is separate from pooled HTTP connection concurrency. */
 #define WORKERS 32
 #define ORIGIN_WORKERS 6
-#define PUMP_BYTES (256u * 1024u)
+#define PUMP_BYTES (32u * 1024u)
+#define PUMP_TOTAL_BYTES (1024u * 1024u)
+#define PUMP_TIME_MS 3u
 struct request {
     struct request *next;
     uint64_t id, generation, deadline;
@@ -23,11 +24,13 @@ struct request {
     unsigned char *tx, *rx;
     size_t tx_len, tx_pos, rx_len, rx_pos;
     size_t response_limit;
+    size_t credit_due, credit_pos, tx_credit;
+    struct webnet_wire_credit credit;
     struct webnet_wire_response head;
     size_t head_pos;
     bool cancelled, finishing, in_callback;
-    bool streaming, paused, headers_seen, debug_request, debug_reported;
-    char *cookie_site;
+    bool streaming, paused, headers_seen, debug_request, debug_reported, frame_ready, credit_closed;
+    char *cookie_site, *cookie_origin;
     char *transport_origin;
     uint64_t queued_at,started_at;
     enum webnet_credentials credentials;
@@ -38,7 +41,7 @@ struct request {
     size_t keepalive_bytes;
     char error[160];
 };
-struct slot { struct request *rq; int pid, in, out; struct slot *next; };
+struct slot { struct request *rq; int pid, in, out; struct slot *next; bool shared; };
 struct webnet {
     struct request *queue;
     struct slot slots[WORKERS];
@@ -47,13 +50,16 @@ struct webnet {
     unsigned count;
     unsigned next_priority;
     unsigned worker_limit;
+    unsigned pump_cursor;
     uint64_t budget_at;
-    bool debug, pumping;
+    int service_pid, service_listener;
+    char service_key[96];
+    bool debug, pumping, parked_first;
     size_t queued_bytes;
     webcookie_jar *cookies;
 };
 
-static void request_free(struct request *r) { if(!r)return;free(r->tx); free(r->rx); free(r->cookie_site);free(r->transport_origin); free(r); }
+static void request_free(struct request *r) { if(!r)return;free(r->tx); free(r->rx); free(r->cookie_site);free(r->cookie_origin);free(r->transport_origin); free(r); }
 static unsigned worker_budget(void){
     struct n_cpuinfo cpu={0};struct n_sysinfo memory={0};
     unsigned online=cpu_info(&cpu)>=0&&cpu.online_cpus?cpu.online_cpus:1;
@@ -73,10 +79,11 @@ static void load_cookie_psl(webcookie_jar *jar) {
 }
 static void slot_close(struct slot *s) {
     if (s->in >= 0) close(s->in);
-    if (s->out >= 0) close(s->out);
+    if (s->out >= 0 && s->out != s->in) close(s->out);
     s->in = s->out = -1;
 }
 static bool slot_reap(struct slot *s) {
+    if (s->shared) { s->pid=0; return true; }
     if (s->pid <= 0) return true;
     int pid = s->pid;
     int got = waitpid(pid, NULL, WNOHANG);
@@ -89,7 +96,7 @@ static void slot_stop(struct slot *s, const char *error) {
     if (error) snprintf(s->rq->error, sizeof s->rq->error, "%s", error);
     s->rq->finishing = true;
     slot_close(s);
-    if (s->pid > 0) kill(s->pid);
+    if (s->pid > 0 && !s->shared) kill(s->pid);
 }
 static void reap_paused_stream(struct slot *s) {
     const struct request *r = s->rq;
@@ -104,6 +111,7 @@ static void reap_paused_stream(struct slot *s) {
 webnet *webnet_create(void) {
     webnet *n = calloc(1, sizeof *n);
     if (n) {
+        n->service_listener=-1;
         n->cookies = webcookie_create();
         if (!n->cookies) { free(n); return NULL; }
         load_cookie_psl(n->cookies);
@@ -119,21 +127,25 @@ void webnet_free(webnet *n) {
         struct slot *s = &n->slots[i];
         if (!s->rq) continue;
         slot_close(s);
-        if (s->pid > 0) { kill(s->pid); waitpid(s->pid, NULL, 0); }
+        if (s->pid > 0 && !s->shared) { kill(s->pid); waitpid(s->pid, NULL, 0); }
         request_free(s->rq);
     }
-    while(n->parked){struct slot *s=n->parked;n->parked=s->next;slot_close(s);if(s->pid>0){kill(s->pid);waitpid(s->pid,NULL,0);}request_free(s->rq);free(s);}
+    while(n->parked){struct slot *s=n->parked;n->parked=s->next;slot_close(s);if(s->pid>0&&!s->shared){kill(s->pid);waitpid(s->pid,NULL,0);}request_free(s->rq);free(s);}
+    if(n->service_pid>0){kill(n->service_pid);waitpid(n->service_pid,NULL,0);}
+    if(n->service_listener>=0)close(n->service_listener);
     while (n->queue) { struct request *r = n->queue; n->queue = r->next; request_free(r); }
     webcookie_free(n->cookies); free(n);
 }
-long webnet_cookie_get(webnet *n, const char *url, char *out, size_t cap) {
-    struct webcookie_context c = {url, url, "GET", false, false, false};
+long webnet_cookie_get_site(webnet *n,const char *url,const char *top_level_url,char *out,size_t cap) {
+    struct webcookie_context c = {url, top_level_url?top_level_url:url, "GET", false, false, false};
     return n ? webcookie_get(n->cookies, &c, out, cap, time(NULL)) : -1;
 }
-int webnet_cookie_set(webnet *n, const char *url, const char *value) {
-    struct webcookie_context c = {url, url, "GET", false, false, false};
+int webnet_cookie_set_site(webnet *n,const char *url,const char *top_level_url,const char *value) {
+    struct webcookie_context c = {url, top_level_url?top_level_url:url, "GET", false, false, false};
     return n && value ? webcookie_set(n->cookies, &c, value, strlen(value), time(NULL)) : -1;
 }
+long webnet_cookie_get(webnet *n,const char *url,char *out,size_t cap){return webnet_cookie_get_site(n,url,NULL,out,cap);}
+int webnet_cookie_set(webnet *n,const char *url,const char *value){return webnet_cookie_set_site(n,url,NULL,value);}
 uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callback cb, void *opaque) {
     if (!n || !q || !q->url || !cb || n->count == UINT_MAX || q->kind > WEBNET_REPORT ||
         q->kind < WEBNET_NAVIGATION || q->body_len > WEBNET_BODY_LIMIT || (q->body_len && !q->body) ||
@@ -174,25 +186,28 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     const char *origin = q->origin ? q->origin : "";
     const char *method = q->method ? q->method : "GET";
     const char *headers = q->headers ? q->headers : "";
+    bool top_extension=q->top_level_url!=NULL;
+    const char *top_level_url=q->top_level_url?q->top_level_url:origin;
     bool referrer_extension=q->referrer!=NULL||q->referrer_policy!=WEBNET_REFERRER_DEFAULT;
     const char *referrer=q->referrer?q->referrer:"";
-    size_t ul = strlen(q->url), ol = strlen(origin), ml = strlen(method), hl = strlen(headers),rl=strlen(referrer);
-    if (!ul || ul > UINT32_MAX || ol > UINT32_MAX || ul == SIZE_MAX || ol == SIZE_MAX || ml > UINT32_MAX || !webnet_method_valid(method) || hl > UINT32_MAX ||rl>UINT32_MAX||
+    size_t ul = strlen(q->url), ol = strlen(origin), ml = strlen(method), hl = strlen(headers),rl=strlen(referrer),tl=strlen(top_level_url);
+    if (!ul || ul > UINT32_MAX || ol > UINT32_MAX || ul == SIZE_MAX || ol == SIZE_MAX || ml > UINT32_MAX || !webnet_method_valid(method) || hl > UINT32_MAX ||rl>UINT32_MAX||tl>UINT32_MAX||
         ((!strcmp(method, "GET") || !strcmp(method, "HEAD")) && q->body_len)) return 0;
     int64_t cookie_now=time(NULL);
     long cookie_len = q->credentials == WEBNET_CREDENTIALS_OMIT ? 0 : webcookie_export(n->cookies, NULL, 0, cookie_now);
     if (cookie_len < 0) return 0;
     if ((uint64_t)cookie_len > UINT32_MAX) return 0;
     uint64_t total = sizeof(struct webnet_wire_request) + (uint64_t)ul + ol + ml + hl + q->body_len + (uint64_t)cookie_len+
-        (referrer_extension?sizeof(struct webnet_wire_referrer)+(uint64_t)rl:0);
+        (referrer_extension?sizeof(struct webnet_wire_referrer)+(uint64_t)rl:0)+
+        (top_extension?sizeof(struct webnet_wire_top_level)+(uint64_t)tl:0);
     if (total > SIZE_MAX || total > SIZE_MAX - n->queued_bytes) return 0;
     size_t len = (size_t)total;
     struct request *r = calloc(1, sizeof *r);
     if (!r) return 0;
     r->tx = malloc(len);
     if (!r->tx) { free(r); return 0; }
-    r->cookie_site = strdup(origin);
-    if (!r->cookie_site) { request_free(r); return 0; }
+    r->cookie_site = strdup(top_level_url);r->cookie_origin=strdup(origin);
+    if (!r->cookie_site||!r->cookie_origin) { request_free(r); return 0; }
     struct url_owned destination={0};
     if(url_parse_owned(q->url,&destination)){
         size_t host_length=strlen(destination.host);
@@ -220,6 +235,7 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     r->response_limit = webnet_response_limit(q->kind);
     r->deadline = uptime_ms() + WEBNET_TIMEOUT_MS;
     r->callback = cb; r->opaque = opaque; r->tx_len = len;
+    r->tx_credit=WEBNET_SERVICE_WINDOW;
     r->priority = q->kind == WEBNET_NAVIGATION ? 0 :
                   (q->kind == WEBNET_CLASSIC || q->kind == WEBNET_MODULE) ? 1 :
                   (q->kind == WEBNET_FETCH || q->kind == WEBNET_REPORT) ? 3 : 2;
@@ -228,13 +244,14 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     h.user_navigation = (q->user_navigation ? WEBNET_WIRE_USER_NAVIGATION : 0) |
                         (q->force_preflight ? WEBNET_WIRE_FORCE_PREFLIGHT : 0) |
                         (q->redirect_error ? WEBNET_WIRE_REDIRECT_ERROR : 0) |
-                        (q->same_origin ? WEBNET_WIRE_SAME_ORIGIN : 0) | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_DYNAMIC_BODY | WEBNET_WIRE_DYNAMIC_HEADERS | WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS | WEBNET_WIRE_DYNAMIC_URL |
+                        (q->same_origin ? WEBNET_WIRE_SAME_ORIGIN : 0) | WEBNET_WIRE_SERVICE | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_DYNAMIC_BODY | WEBNET_WIRE_DYNAMIC_HEADERS | WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS | WEBNET_WIRE_DYNAMIC_URL |
                         ((uint32_t)q->cache_mode << WEBNET_WIRE_CACHE_SHIFT);
     if (q->kind == WEBNET_CLASSIC || q->kind == WEBNET_MODULE) h.user_navigation |= WEBNET_WIRE_LARGE_SCRIPT;
     if (q->image_upgrade) h.user_navigation |= WEBNET_WIRE_IMAGE_UPGRADE;
     if (q->no_cors) h.user_navigation |= WEBNET_WIRE_NO_CORS;
     if (q->no_referrer) h.user_navigation |= WEBNET_WIRE_NO_REFERRER;
     if (referrer_extension)h.user_navigation|=WEBNET_WIRE_REFERRER;
+    if (top_extension)h.user_navigation|=WEBNET_WIRE_TOP_LEVEL;
     if (q->stream_response) h.user_navigation |= WEBNET_WIRE_STREAM;
     if (r->debug_request) h.user_navigation |= WEBNET_WIRE_DEBUG_REQUEST;
     if (q->body) h.user_navigation |= WEBNET_WIRE_BODY_PRESENT;
@@ -244,8 +261,10 @@ uint64_t webnet_submit(webnet *n, const struct webnet_request *q, webnet_callbac
     memcpy(r->tx, &h, sizeof h);
     unsigned char *p = r->tx + sizeof h;
     if(referrer_extension){struct webnet_wire_referrer ref={(uint32_t)rl,(uint32_t)q->referrer_policy};memcpy(p,&ref,sizeof ref);p+=sizeof ref;}
+    if(top_extension){struct webnet_wire_top_level top={(uint32_t)tl,0};memcpy(p,&top,sizeof top);p+=sizeof top;}
     memcpy(p, q->url, ul); p += ul; memcpy(p, origin, ol); p += ol;
     if(referrer_extension){memcpy(p,referrer,rl);p+=rl;}
+    if(top_extension){memcpy(p,top_level_url,tl);p+=tl;}
     memcpy(p, method, ml); p += ml; memcpy(p, headers, hl); p += hl;
     if (q->body_len) memcpy(p, q->body, q->body_len);
     p += q->body_len;
@@ -310,34 +329,41 @@ static struct request *take_request(webnet *n,unsigned slot){
     *chosen=request->next;request->next=NULL;
     return request;
 }
-static bool start(struct slot *s, struct request *r) {
-    int ip[2] = {-1,-1}, op[2] = {-1,-1}, nullfd = -1;
-    const char *stage = "request pipe";
-    int saved_errno;
-    if (pipe(ip) < 0) goto fail;
-    stage = "response pipe";
-    if (pipe(op) < 0) goto fail;
-    stage = "stderr descriptor";
-    if ((nullfd = open("/dev/null", O_WRONLY)) < 0) goto fail;
-    int map[3] = {ip[0], op[1], nullfd};
-    char *argv[] = {"webfetch", NULL};
-    stage = "spawn";
-    s->pid = spawn("/bin/webfetch", argv, map, 0);
-    saved_errno = errno;
-    close(ip[0]); ip[0] = -1; close(op[1]); op[1] = -1; close(nullfd); nullfd = -1;
-    if (s->pid < 0) { errno = saved_errno; goto fail; }
-    s->in = ip[1]; s->out = op[0]; s->rq = r;
-    if (fcntl(s->in, F_SETFL, O_NONBLOCK) < 0 || fcntl(s->out, F_SETFL, O_NONBLOCK) < 0) {
-        slot_stop(s, "Cannot make worker pipes nonblocking");
+static bool service_start(webnet *n) {
+    if(n->service_pid>0){
+        int got=waitpid(n->service_pid,NULL,WNOHANG);
+        if(!got || (got<0 && errno!=ECHILD))return true;
+        n->service_pid=0;
+        close(n->service_listener);n->service_listener=-1;
     }
+    /* The native rendezvous key is an unguessable browser-owned capability.
+       A different browser cannot join this process's cache/security partition. */
+    uint64_t nonce[2];int random=open("/dev/urandom",O_RDONLY);
+    if(random<0)return false;
+    size_t pos=0;
+    while(pos<sizeof nonce){ssize_t got=read(random,(char *)nonce+pos,sizeof nonce-pos);
+        if(got<0&&errno==EINTR)continue;if(got<=0){close(random);return false;}pos+=(size_t)got;}
+    close(random);
+    snprintf(n->service_key,sizeof n->service_key,"webfetch:%d:%016lx%016lx",getpid(),(unsigned long)nonce[0],(unsigned long)nonce[1]);
+    n->service_listener=n_channel_listen(n->service_key);
+    if(n->service_listener<0)return false;
+    int nullfd=open("/dev/null",O_WRONLY);
+    if(nullfd<0){close(n->service_listener);n->service_listener=-1;return false;}
+    int map[3]={n->service_listener,nullfd,nullfd};
+    char *argv[]={"webfetch","--service",NULL};
+    n->service_pid=spawn("/bin/webfetch",argv,map,0);
+    int saved=errno;close(nullfd);
+    if(n->service_pid<=0){close(n->service_listener);n->service_listener=-1;n->service_pid=0;errno=saved;return false;}
     return true;
-fail:
-    saved_errno = errno;
-    for (int i = 0; i < 2; i++) { if (ip[i] >= 0) close(ip[i]); if (op[i] >= 0) close(op[i]); }
-    if (nullfd >= 0) close(nullfd);
-    s->pid = 0; s->rq = r; s->in = s->out = -1;
-    r->finishing = true;
-    snprintf(r->error, sizeof r->error, "Cannot start /bin/webfetch: %s (errno %d)", stage, saved_errno);
+}
+static bool start(webnet *n,struct slot *s,struct request *r) {
+    s->rq=r;s->shared=true;s->pid=0;s->in=s->out=-1;
+    if(service_start(n)){
+        int fd=n_channel_connect(n->service_key);
+        if(fd>=0){s->in=s->out=fd;s->pid=n->service_pid;return true;}
+    }
+    int saved=errno;r->finishing=true;
+    snprintf(r->error,sizeof r->error,"Cannot connect /bin/webfetch service (errno %d)",saved);
     return false;
 }
 struct cookie_scratch { char *url, *site_origin; };
@@ -375,7 +401,7 @@ static bool cookie_events(webnet *n, struct request *r) {
     if (!r->head.cookie_len) return true;
     struct cookie_scratch *work = calloc(1,sizeof *work);
     if (!work) return false;
-    bool ok=r->credentials!=WEBNET_CREDENTIALS_SAME_ORIGIN||http_origin_owned(r->cookie_site,&work->site_origin)==HTTP_URL_TUPLE;
+    bool ok=r->credentials!=WEBNET_CREDENTIALS_SAME_ORIGIN||http_origin_owned(r->cookie_origin,&work->site_origin)==HTTP_URL_TUPLE;
     if(ok)ok = cookie_events_inner(n, r, work);
     free(work->url);free(work->site_origin);
     free(work);
@@ -475,7 +501,7 @@ static bool unpack(struct request *r) {
     if (!webnet_wire_payload_size(h, &wire_len)) return false;
     /* A successful retained upgrade-class request from HTTPS cannot publish
        an insecure final response, even if a worker violates the hop policy. */
-    if (r->image_upgrade && !strncasecmp(r->cookie_site, "https://", 8) && h->status &&
+    if (r->image_upgrade && !strncasecmp(r->cookie_origin, "https://", 8) && h->status &&
         (h->url_len < 8 || strncasecmp((const char *)r->rx, "https://", 8))) return false;
     unsigned char *out = malloc(wire_len + 4);
     if (!out) return false;
@@ -527,28 +553,68 @@ static bool dispatch_stream_frame(webnet *n, struct request *r) {
     memset(&r->head, 0, sizeof r->head);
     return true;
 }
-static void pump_slot(webnet *n,struct slot *s,uint64_t now){
+struct pump_budget {size_t bytes;uint64_t until;bool callbacks;};
+static bool pump_room(const struct pump_budget *budget){
+    return budget->bytes && uptime_ms()<budget->until;
+}
+static void credit_flush(struct slot *s) {
+    struct request *r=s->rq;
+    if(!s->shared || r->tx || r->paused || r->credit_closed || s->in<0)return;
+    if(!r->credit_pos && !r->credit.bytes){
+        if(r->credit_due<WEBNET_SERVICE_CREDIT_STEP)return;
+        r->credit=(struct webnet_wire_credit){WEBNET_CREDIT_MAGIC,(uint32_t)r->credit_due,r->id};
+        r->credit_due=0;
+    }
+    while(r->credit.bytes){
+        ssize_t got=write(s->in,(char *)&r->credit+r->credit_pos,sizeof r->credit-r->credit_pos);
+        if(got<0&&(errno==EAGAIN||errno==EINTR))return;
+        /* A response that fits the ahead window may already have retired its
+           writer. Its buffered bytes still belong to this request: a credit
+           EPIPE is not premature response EOF and must not discard them. */
+        if(got<0&&errno==EPIPE){r->credit_closed=true;r->credit_due=r->credit_pos=0;memset(&r->credit,0,sizeof r->credit);return;}
+        if(got<=0){slot_stop(s,"Worker credit channel closed");return;}
+        r->credit_pos+=(size_t)got;
+        if(r->credit_pos==sizeof r->credit){r->credit_pos=0;memset(&r->credit,0,sizeof r->credit);}
+    }
+}
+/* Dispatch is separate from transport service: native JS checkpoints may
+   drain one bounded frame into request-owned memory, never reenter author JS. */
+static bool frame_dispatch(webnet *n,struct slot *s,struct pump_budget *budget){
+    struct request *r=s->rq;
+    if(!r->frame_ready || !budget->callbacks)return false;
+    r->frame_ready=false;
+    bool terminal=!r->streaming || r->head.magic==WEBNET_STREAM_END;
+    if(r->streaming){if(!dispatch_stream_frame(n,r)){slot_stop(s,"Invalid stream response or out of memory");return false;}}
+    else if(!unpack(r)){slot_stop(s,"Invalid response or out of memory");return false;}
+    if(terminal){r->finishing=true;slot_close(s);}
+    return true;
+}
+static void pump_slot(webnet *n,struct slot *s,uint64_t now,struct pump_budget *global){
         struct request *r = s->rq;
         if (!r||r->in_callback) return;
         if (!r->finishing && now >= r->deadline) slot_stop(s, "Request deadline exceeded");
         reap_paused_stream(s);
-        if (!r->finishing&&!r->paused) {
+        if(!r->finishing&&r->frame_ready&&!r->paused)frame_dispatch(n,s,global);
+        if (!r->finishing&&!r->paused&&!r->frame_ready&&pump_room(global)) {
             struct n_pollfd pf[2] = {{s->out, N_POLLIN, 0}, {s->in, N_POLLOUT, 0}};
-            if (poll(pf, s->in >= 0 ? 2 : 1, 0) < 0) slot_stop(s, "Worker poll failed");
-            size_t budget = PUMP_BYTES;
-            while (!r->finishing && s->in >= 0 && budget && (pf[1].revents & N_POLLOUT)) {
+            if (poll(pf, r->tx&&r->tx_credit&&s->in>=0 ? 2 : 1, 0) < 0) slot_stop(s, "Worker poll failed");
+            size_t budget = MIN(PUMP_BYTES,global->bytes);
+            while (!r->finishing && r->tx && (!s->shared||r->tx_credit) && s->in >= 0 && budget && (pf[1].revents & N_POLLOUT)) {
                 size_t take = MIN(r->tx_len - r->tx_pos, budget);
+                if(s->shared)take=MIN(take,r->tx_credit);
                 ssize_t k = write(s->in, r->tx + r->tx_pos, take);
                 if (k < 0 && (errno == EAGAIN || errno == EINTR)) break;
                 if (k <= 0) { slot_stop(s, "Worker request pipe closed"); break; }
-                r->tx_pos += k; budget -= k;
+                r->tx_pos += k; budget -= k;global->bytes-=k;
+                if(s->shared)r->tx_credit-=(size_t)k;
                 if (r->tx_pos == r->tx_len) {
-                    close(s->in); s->in = -1;
+                    if(!s->shared){close(s->in);s->in=-1;}
                     n->queued_bytes -= r->tx_len; free(r->tx); r->tx = NULL;
                 }
             }
-            budget = PUMP_BYTES;
-            while (!r->finishing && !r->paused && budget && (pf[0].revents & (N_POLLIN | N_POLLHUP))) {
+            credit_flush(s);
+            budget = MIN(PUMP_BYTES,global->bytes);
+            while (!r->finishing && !r->paused && !r->frame_ready && budget && pump_room(global) && (pf[0].revents & (N_POLLIN | N_POLLHUP))) {
                 void *dest; size_t take;
                 if (r->head_pos < sizeof r->head) {
                     dest = (unsigned char *)&r->head + r->head_pos; take = sizeof r->head - r->head_pos;
@@ -557,11 +623,17 @@ static void pump_slot(webnet *n,struct slot *s,uint64_t now){
                 ssize_t k = read(s->out, dest, take);
                 if (k < 0 && (errno == EAGAIN || errno == EINTR)) break;
                 if (k <= 0) { slot_stop(s, "Worker response ended early"); break; }
-                budget -= k;
+                budget -= k;global->bytes-=k;
                 if (r->head_pos < sizeof r->head) {
                     r->head_pos += k;
                     if (r->head_pos == sizeof r->head) {
                         struct webnet_wire_response *h = &r->head;
+                        if(s->shared && h->magic==WEBNET_STREAM_REQUEST_CREDIT){
+                            if(h->id!=r->id||h->generation!=r->generation||!h->status||h->status>WEBNET_SERVICE_WINDOW-r->tx_credit||
+                               h->url_len||h->headers_len||h->body_len||h->error_len||h->cookie_len){slot_stop(s,"Invalid worker upload credit");break;}
+                            r->tx_credit+=h->status;r->head_pos=0;memset(h,0,sizeof *h);continue;
+                        }
+                        if(s->shared)r->credit_due+=sizeof r->head;
                         if ((!r->streaming && h->magic != WEBNET_MAGIC) || (r->streaming && !stream_frame_valid(r)) || h->id != r->id || h->generation != r->generation ||
                             h->headers_len > webnet_wire_header_limit(WEBNET_WIRE_DYNAMIC_HEADERS) ||
                             h->body_len > r->response_limit || h->error_len >= sizeof r->error || (!r->streaming && h->status > 999) ||
@@ -569,69 +641,122 @@ static void pump_slot(webnet *n,struct slot *s,uint64_t now){
                             slot_stop(s, "Invalid worker response"); break;
                         }
                         if (!webnet_wire_payload_size(h, &r->rx_len)) { slot_stop(s, "Worker response size overflow"); break; }
+                        /* Reject a frame only on actual memory affordability;
+                           byte credit bounds all unread pipe storage separately. */
+                        struct n_sysinfo memory={0};
+                        if(r->rx_len>WEBNET_SERVICE_WINDOW && sysinfo(&memory)>=0 && r->rx_len>memory.free_mem/2){slot_stop(s,"Response exceeds available receive memory");break;}
                         r->rx = malloc(r->rx_len + 1);
                         if (!r->rx) { slot_stop(s, "Out of memory reading response"); break; }
                     }
-                } else r->rx_pos += k;
+                } else {r->rx_pos += k;if(s->shared)r->credit_due+=(size_t)k;}
                 if (r->head_pos == sizeof r->head && r->rx_pos == r->rx_len) {
-                    if (r->streaming) {
-                        bool terminal = r->head.magic == WEBNET_STREAM_END;
-                        if (!dispatch_stream_frame(n, r)) { slot_stop(s, "Invalid stream response or out of memory"); break; }
-                        if (!terminal) break; /* one bounded frame per worker per pump */
-                    } else
-                    if (!unpack(r)) { slot_stop(s, "Invalid response or out of memory"); break; }
-                    r->finishing = true; slot_close(s);
+                    r->frame_ready=true;
+                    frame_dispatch(n,s,global);
                 }
+                if(!r->finishing)credit_flush(s);
             }
         }
-        if (r->finishing) {
+        if (r->finishing && global->callbacks) {
             /* Even a child that produced its frame must not hold a slot past the deadline. */
-            if (s->pid > 0 && now >= r->deadline) kill(s->pid);
+            if (s->pid > 0 && !s->shared && now >= r->deadline) kill(s->pid);
             if (slot_reap(s)) complete(n, s);
         }
 }
-void webnet_pump(webnet *n,uint64_t now){
+static void pump_parked(webnet *n,uint64_t now,struct pump_budget *budget){
+    struct slot **at=&n->parked,*last=NULL;
+    while(*at){
+        struct slot *s=*at;
+        bool room=pump_room(budget);
+        pump_slot(n,s,now,budget);
+        if(!s->rq){*at=s->next;free(s);}
+        else {if(room)last=s;at=&s->next;}
+    }
+    /* Rotate the serviced prefix instead of always favouring the newest
+       parked stream. Requests remain discoverable by callbacks throughout. */
+    if(last&&last->next){struct slot *rest=last->next,*tail=rest;while(tail->next)tail=tail->next;
+        tail->next=n->parked;last->next=NULL;n->parked=rest;}
+}
+static void pump(webnet *n,uint64_t now,bool callbacks){
     if(!n||n->pumping)return;
     n->pumping=true;
+    struct pump_budget budget={PUMP_TOTAL_BYTES,uptime_ms()+PUMP_TIME_MS,callbacks};
     if(!n->budget_at||now>=n->budget_at){n->worker_limit=worker_budget();n->budget_at=now+1000;}
     struct request **qp=&n->queue;
-    while(*qp){struct request *r=*qp;if(now<r->deadline){qp=&r->next;continue;}*qp=r->next;r->next=NULL;struct slot temp={r,0,-1,-1,NULL};snprintf(r->error,sizeof r->error,"Request deadline exceeded");complete(n,&temp);qp=&n->queue;}
-    /* Paused responses retain their pipe and request, not an exited process's
-       transport budget. Resumed readers consume one frame per pump. */
-    struct slot **park=&n->parked;
-    while(*park){struct slot *s=*park;pump_slot(n,s,now);if(!s->rq){*park=s->next;free(s);}else park=&s->next;}
-    for(int i=0;i<WORKERS;i++){
+    while(callbacks&&*qp){struct request *r=*qp;if(now<r->deadline){qp=&r->next;continue;}*qp=r->next;r->next=NULL;struct slot temp={r,0,-1,-1,NULL,false};snprintf(r->error,sizeof r->error,"Request deadline exceeded");complete(n,&temp);qp=&n->queue;}
+    /* Alternate active and resumed retained streams. Both groups receive a
+       turn even when another callback uses the rest of this bounded slice. */
+    bool parked_first=n->parked_first;n->parked_first=!parked_first;
+    if(parked_first)pump_parked(n,now,&budget);
+    unsigned first=n->pump_cursor;
+    for(unsigned step=0;step<WORKERS;step++){
+        unsigned i=(first+step)%WORKERS;
         struct slot *s=&n->slots[i];
-        if(!s->rq&&(unsigned)i<n->worker_limit){struct request *r=take_request(n,(unsigned)i);if(r){
+        if(!s->rq&&(unsigned)i<n->worker_limit&&pump_room(&budget)){struct request *r=take_request(n,(unsigned)i);if(r){
             r->started_at=now;
             if(n->debug)fprintf(stderr,"[webnet] dispatch id=%lu class=%d queued=%lu ms budget=%u\n",
                 (unsigned long)r->id,r->priority,(unsigned long)(now>=r->queued_at?now-r->queued_at:0),n->worker_limit);
-            start(s,r);
+            start(n,s,r);
         }}
-        pump_slot(n,s,now);
+        if(pump_room(&budget))n->pump_cursor=(i+1)%WORKERS;
+        pump_slot(n,s,now,&budget);
         if(s->rq&&s->rq->paused&&!s->rq->finishing){
             struct slot *held=malloc(sizeof *held);
             if(!held){slot_stop(s,"Out of memory retaining stream transport");continue;}
             *held=*s;held->next=n->parked;n->parked=held;memset(s,0,sizeof *s);s->in=s->out=-1;
         }
     }
+    if(!parked_first)pump_parked(n,now,&budget);
     n->pumping=false;
 }
+void webnet_pump(webnet *n,uint64_t now){pump(n,now,true);}
+void webnet_service(webnet *n,uint64_t now){pump(n,now,false);}
 bool webnet_busy(const webnet *n) { return n && n->count != 0; }
+unsigned webnet_inflight(const webnet *n){return n?live_workers(n):0;}
 int webnet_timeout(const webnet *n, uint64_t now) {
     if (!webnet_busy(n)) return -1;
-    int ms = 10;
+    int ms = INT_MAX;
     for (const struct request *r = n->queue; r; r = r->next) {
         if (now >= r->deadline) return 0;
         if (r->deadline - now < (uint64_t)ms) ms = (int)(r->deadline - now);
     }
     for (int i = 0; i < WORKERS; i++) if (n->slots[i].rq) {
         const struct request *r = n->slots[i].rq;
-        if (r->finishing || now >= r->deadline) return 0;
+        if (r->finishing || (!r->paused&&r->frame_ready) || now >= r->deadline) return 0;
         if (r->deadline - now < (uint64_t)ms) ms = (int)(r->deadline - now);
     }
-    for(const struct slot *s=n->parked;s;s=s->next)if(s->rq){const struct request *r=s->rq;if(r->finishing||now>=r->deadline)return 0;if(r->deadline-now<(uint64_t)ms)ms=(int)(r->deadline-now);}
+    for(const struct slot *s=n->parked;s;s=s->next)if(s->rq){const struct request *r=s->rq;if(r->finishing||(!r->paused&&r->frame_ready)||now>=r->deadline)return 0;if(r->deadline-now<(uint64_t)ms)ms=(int)(r->deadline-now);}
+    /* Unadmitted work must be reconsidered after the service has retired a
+       paused peer. Other live requests wake through their own channel. */
+    if(n->queue && !live_workers(n))return 0;
     return ms;
+}
+static void wait_slot(struct n_pollfd *fds,unsigned *count,const struct slot *s){
+    const struct request *r=s->rq;
+    if(!r||r->finishing||r->frame_ready||s->out<0)return;
+    /* A small paused response may finish inside its byte window. Observe only
+       peer retirement so its concurrency slot can admit queued dependencies;
+       unread body data itself must never wake a paused consumer. */
+    if(r->paused){if(s->pid>0)fds[(*count)++]=(struct n_pollfd){s->out,0,0};return;}
+    short events=N_POLLIN;
+    if((r->tx&&r->tx_credit)||(!r->credit_closed&&(r->credit.bytes||r->credit_due>=WEBNET_SERVICE_CREDIT_STEP)))events|=N_POLLOUT;
+    fds[(*count)++]=(struct n_pollfd){s->out,events,0};
+}
+int webnet_wait(webnet *n,int event_fd,int timeout_ms){
+    /* Only live native workers can have an unpaused transport. Closed parked
+       response shells are already buffered and never enter this poll set. */
+    unsigned count=event_fd>=0?1u:0u;
+    struct n_pollfd fds[WORKERS*2+1];
+    if(event_fd>=0)fds[0]=(struct n_pollfd){event_fd,N_POLLIN,0};
+    if(n){
+        int due=webnet_timeout(n,uptime_ms());
+        if(due>=0&&(timeout_ms<0||due<timeout_ms))timeout_ms=due;
+        for(unsigned i=0;i<WORKERS;i++)wait_slot(fds,&count,&n->slots[i]);
+        for(const struct slot *s=n->parked;s;s=s->next){
+            if(count==sizeof fds/sizeof *fds){timeout_ms=0;break;}
+            wait_slot(fds,&count,s);
+        }
+    }
+    return poll(fds,(int)count,timeout_ms);
 }
 static void cancel(webnet *n, uint64_t key, bool generation) {
     if (!n) return;
@@ -645,7 +770,7 @@ static void cancel(webnet *n, uint64_t key, bool generation) {
         struct slot *s = &n->slots[i];
         if (s->rq && (generation ? s->rq->generation : s->rq->id) == key && !(generation && s->rq->keepalive)) {
             s->rq->cancelled = true; slot_stop(s, NULL);
-            if (s->pid > 0) kill(s->pid);
+            if (s->pid > 0 && !s->shared) kill(s->pid);
         }
     }
     for(struct slot *s=n->parked;s;s=s->next)if(s->rq&&(generation?s->rq->generation:s->rq->id)==key&&!(generation&&s->rq->keepalive)){s->rq->cancelled=true;slot_stop(s,NULL);}
@@ -656,12 +781,12 @@ static void cancel(webnet *n, uint64_t key, bool generation) {
         for (int i = 0; i < WORKERS; i++) {
             struct slot *s = &n->slots[i];
             if (!s->rq || s->rq->generation != key || s->rq->keepalive) continue;
-            if (s->pid > 0) {waitpid(s->pid, NULL, 0);s->pid=0;}
+            if (s->pid > 0 && !s->shared) {waitpid(s->pid, NULL, 0);s->pid=0;}
             if(s->rq->in_callback)continue; /* borrowed response lives through callback return */
             complete(n, s); /* cancelled requests never invoke their callback */
         }
         for(struct slot *s=n->parked;s;s=s->next)if(s->rq&&s->rq->generation==key&&!s->rq->keepalive){
-            if(s->pid>0){waitpid(s->pid,NULL,0);s->pid=0;}
+            if(s->pid>0&&!s->shared){waitpid(s->pid,NULL,0);s->pid=0;}
             if(!s->rq->in_callback)complete(n,s);
         }
     }

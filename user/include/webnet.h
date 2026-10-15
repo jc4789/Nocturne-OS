@@ -1,4 +1,5 @@
-/* Nocturne browser requests. All work happens in isolated /bin/webfetch children. */
+/* Nocturne browser requests. A browser-owned isolated /bin/webfetch service
+   shares its connection pool/cache across request-specific native channels. */
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -110,8 +111,12 @@ struct webnet_request {
     bool keepalive; /* Fetch survives generation retirement; explicit cancel still aborts. */
     bool image_upgrade; /* Trusted ordinary non-CORS, non-imageset image only; RESOURCE. */
     uint64_t fetch_group; /* Distinct environment settings object, including child documents. */
-    enum webnet_cache cache_mode; /* Cacheless host: network misses, or cache-only failure; never stored responses. */
+    enum webnet_cache cache_mode;
     bool stream_response; /* Fetch lifecycle frames; other destinations remain buffered. */
+    /* Trusted enclosing top document URL, separate from the initiating frame.
+       NULL retains legacy initiator-derived partition/site policy; "" denotes
+       an opaque top context. Never supplied through an author HTTP header. */
+    const char *top_level_url;
 };
 enum webnet_event { WEBNET_COMPLETE, WEBNET_HEADERS, WEBNET_CHUNK, WEBNET_END, WEBNET_UPLOAD };
 struct webnet_response {
@@ -136,18 +141,31 @@ void webnet_free(webnet *net);
    set: 1 accepted/deleted, 0 ignored by cookie policy, -1 resource failure. */
 long webnet_cookie_get(webnet *, const char *url, char *out, size_t cap);
 int webnet_cookie_set(webnet *, const char *url, const char *value);
+/* Browser host supplies its trusted top document URL. NULL retains the legacy
+   same-site caller policy; an explicit empty URL denotes an opaque top site. */
+long webnet_cookie_get_site(webnet *,const char *url,const char *top_level_url,char *out,size_t cap);
+int webnet_cookie_set_site(webnet *,const char *url,const char *top_level_url,const char *value);
 /* Copies all request data; 0 means invalid request, queue full, or allocation failure. */
 uint64_t webnet_submit(webnet *, const struct webnet_request *, webnet_callback, void *opaque);
 /* Dispatches completions only here. Response pointers remain valid until callback returns.
    Callbacks may submit/cancel requests, but must not free net or recursively pump it. */
 void webnet_pump(webnet *, uint64_t now_ms);
-int webnet_timeout(const webnet *, uint64_t now_ms); /* -1 idle, otherwise <=10 ms */
+/* Bounded native transport progress with all author callbacks deferred until
+   webnet_pump. Safe at an author's native checkpoint; never recursively pumps. */
+void webnet_service(webnet *,uint64_t now_ms);
+int webnet_timeout(const webnet *, uint64_t now_ms); /* -1 idle, otherwise next deadline */
+/* Wait on native GUI readiness and all unpaused request channels in one poll.
+   No callbacks, no DOM access. Caller consumes queued GUI events beforehand. */
+int webnet_wait(webnet *,int event_fd,int timeout_ms);
 bool webnet_busy(const webnet *);
+/* Diagnostics: live request transports, excluding queued/retained responses.
+   The persistent worker itself is owned until webnet_free. */
+unsigned webnet_inflight(const webnet *);
 void webnet_cancel(webnet *, uint64_t id); /* cancellation does not invoke the callback */
-/* One-frame demand gate: no response reads or callbacks while paused. A helper
-   may finish into its owned dynamic pipe; retirement does not consume that
-   retained response or release its request before resume/cancellation. */
+/* Demand gate: no response reads, credit replenishment or callbacks while
+   paused. Byte credit bounds unread pipe storage. Worker retirement does not
+   release retained response bytes or its request before resume/cancellation. */
 void webnet_resume(webnet *, uint64_t id);
-/* Document teardown: kills/reaps non-keepalive children; keepalive callbacks and
+/* Document teardown: closes non-keepalive request channels; keepalive callbacks and
    copied request policy remain owned by net until completion or explicit cancel. */
 void webnet_cancel_generation(webnet *, uint64_t generation);

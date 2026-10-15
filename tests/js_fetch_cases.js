@@ -209,12 +209,14 @@ async function runFetchCases() {
     await rejects(fetch(cacheOnly),'TypeError','cache-only observed miss');
     await rejects(fetch('http://other.fixture.test/api/json',{cache:'only-if-cached',mode:'same-origin'}),'TypeError','cache-only observed cross-origin miss');
     const afterCacheOnly=await (await fetch('api/cache-policy')).json();
-    assert(afterCacheOnly.fetch_requests===beforeCacheOnly.fetch_requests+1,'cache-only misses never call native host');
+    assert(afterCacheOnly.fetch_requests===beforeCacheOnly.fetch_requests+2,'cache-only consults the native cache; cross-origin requests fail before host dispatch');
+    const cacheHit=await fetch('api/cache-hit',{cache:'only-if-cached',mode:'same-origin'});
+    assert(cacheHit.status===200&&(await cacheHit.json()).cached===true,'native cache-only hit becomes an ordinary complete Response');
     const networkCacheModes=['default','no-store','reload','no-cache','force-cache'];
     for(const cache of networkCacheModes) {
         const cached=new Request('api/json',{cache,headers:{'cache-control':'custom-cache','pragma':'custom-pragma'}});
         const result=await fetch(cached);
-        assert(result.status===200&&(await result.json()).value===42,'cacheless host fetch '+cache);
+        assert(result.status===200&&(await result.json()).value===42,'native cache policy fetch '+cache);
         assert(cached.cache===cache&&cached.headers.get('cache-control')==='custom-cache'&&cached.headers.get('pragma')==='custom-pragma','author cache headers unchanged '+cache);
         const policy=await (await fetch('api/cache-policy',{cache})).json();
         assert(policy.cache_mode===networkCacheModes.indexOf(cache),'native cache policy '+cache);
@@ -223,7 +225,7 @@ async function runFetchCases() {
     const policyHeaders=new Request('api/cache-policy',{cache:'no-store',headers:{'cache-control':'custom','pragma':'custom'}});
     const headerPolicy=await (await fetch(policyHeaders)).json();
     assert(headerPolicy.has_cache_control&&headerPolicy.has_pragma&&policyHeaders.headers.get('cache-control')==='custom','author cache fields remain author fields');
-    await rejects(fetch(cacheOnly),'TypeError','successful fetches do not fabricate cache entries');
+    await rejects(fetch(cacheOnly),'TypeError','native host cache miss remains a network error after unrelated successful fetches');
     const network=await fetch(new Request('api/json',{credentials:'omit'}));
     assert(network.status===200&&network.statusText==='OK'&&network.type==='basic'&&network.url==='http://fixture.test/dir/api/json','native metadata');
     assert(network.headers.get('set-cookie')===null&&network.headers.get('x-fixture')==='yes','native headers');

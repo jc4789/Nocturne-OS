@@ -49,13 +49,29 @@
 /* Opt-in private referrer extension immediately after the unchanged 64-byte
    prefix. Legacy persisted applications send no extension and keep layout. */
 #define WEBNET_WIRE_REFERRER 1048576u
+/* Private native service transport. Each request has its own duplex channel;
+   responses start with this byte credit and replenish only after host reads.
+   Legacy persisted /bin/webfetch stdin/stdout callers do not opt into credit. */
+#define WEBNET_WIRE_SERVICE 2097152u
+/* Trusted top-document metadata. The 8-byte extension follows the optional
+   referrer extension; its URL bytes follow optional referrer URL bytes in the
+   payload. The existing 64-byte prefix and six lengths remain unchanged. */
+#define WEBNET_WIRE_TOP_LEVEL 4194304u
+#define WEBNET_SERVICE_WINDOW (256u * 1024u)
+#define WEBNET_SERVICE_CREDIT_STEP (64u * 1024u)
+#define WEBNET_CREDIT_MAGIC 0x574e4301u
+struct webnet_wire_credit { uint32_t magic, bytes; uint64_t id; };
+_Static_assert(sizeof(struct webnet_wire_credit)==16,"webfetch byte credit framing");
 struct webnet_wire_referrer {uint32_t length,policy;};
+struct webnet_wire_top_level {uint32_t length,reserved;};
+_Static_assert(sizeof(struct webnet_wire_top_level)==8,"webfetch top document extension");
 #define WEBNET_STREAM_HEADERS 0x574e5301u
 #define WEBNET_STREAM_CHUNK   0x574e5302u
 #define WEBNET_STREAM_END     0x574e5303u
 #define WEBNET_STREAM_UPLOAD  0x574e5304u
+#define WEBNET_STREAM_REQUEST_CREDIT 0x574e5305u
 #define WEBNET_STREAM_CHUNK_MAX 65536u
-#define WEBNET_WIRE_REQUEST_FLAGS (WEBNET_WIRE_USER_NAVIGATION | WEBNET_WIRE_FORCE_PREFLIGHT | WEBNET_WIRE_REDIRECT_ERROR | WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_CACHE_MASK | WEBNET_WIRE_LARGE_SCRIPT | WEBNET_WIRE_DYNAMIC_BODY | WEBNET_WIRE_DYNAMIC_HEADERS | WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS | WEBNET_WIRE_IMAGE_UPGRADE | WEBNET_WIRE_DYNAMIC_URL | WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER | WEBNET_WIRE_STREAM | WEBNET_WIRE_DEBUG_REQUEST | WEBNET_WIRE_BODY_PRESENT | WEBNET_WIRE_REFERRER)
+#define WEBNET_WIRE_REQUEST_FLAGS (WEBNET_WIRE_USER_NAVIGATION | WEBNET_WIRE_FORCE_PREFLIGHT | WEBNET_WIRE_REDIRECT_ERROR | WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_CACHE_MASK | WEBNET_WIRE_LARGE_SCRIPT | WEBNET_WIRE_DYNAMIC_BODY | WEBNET_WIRE_DYNAMIC_HEADERS | WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS | WEBNET_WIRE_IMAGE_UPGRADE | WEBNET_WIRE_DYNAMIC_URL | WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER | WEBNET_WIRE_STREAM | WEBNET_WIRE_DEBUG_REQUEST | WEBNET_WIRE_BODY_PRESENT | WEBNET_WIRE_REFERRER | WEBNET_WIRE_SERVICE | WEBNET_WIRE_TOP_LEVEL)
 static inline size_t webnet_wire_url_limit(uint32_t flags) {
     return flags & WEBNET_WIRE_DYNAMIC_URL ? (size_t)UINT32_MAX : WEBNET_URL_MAX - 1u;
 }

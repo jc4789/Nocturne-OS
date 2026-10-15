@@ -53,6 +53,9 @@ long ns_write(net_stream *s,const void *p,size_t n){(void)s;(void)p;(void)n;retu
 const char *ns_error(net_stream *s){(void)s;return "unused protocol stream";}
 void ns_close(net_stream *s){(void)s;}
 void ns_set_timeout(net_stream *s,int t){(void)s;(void)t;}
+#define HTTP_MOCK_HAS_TIMEOUT
+#define HTTP_MOCK_NO_ISOLATION
+#include "http_mock_lifecycle.h"
 int http_inflate(char *o,int c,const char *i,int n,int *used){(void)o;(void)c;(void)i;(void)n;(void)used;return -1;}
 static char *initial,*creator,*location,*expected;
 static unsigned requests,callbacks,checks,failed;

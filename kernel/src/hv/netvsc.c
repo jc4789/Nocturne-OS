@@ -5,11 +5,13 @@
    which we must complete so it can reuse the space); we copy ones we send into a section of the
    send buffer and tell the host which section (it completes that packet when done with it). */
 #include "kernel.h"
+#include "abi.h"
 #include "arch/cpu.h"
 #include "hv/vmbus.h"
 #include "mm/heap.h"
 #include "mm/pmm.h"
 #include "net/net.h"
+#include "sys/sched.h"
 
 static const struct guid net_guid =
     GUID_INIT(0xf8615163, 0xdf3e, 0x46c5, 0x91, 0x3f, 0xf2, 0xd2, 0xf9, 0x65, 0xed, 0x0e);
@@ -35,6 +37,11 @@ enum {
 #define RECV_BUF_PAGES 256 /* 1 MiB */
 #define SEND_BUF_PAGES 256
 #define TX_TID_BASE 0x5E000000ull /* trans_id of a data send = base + its section */
+/* These limit one turn of the net thread, not the accepted transfer size.
+   A cursor and host-owned receive credit survive a budget boundary. */
+#define RX_MESSAGE_BUDGET 128
+#define RX_BYTE_BUDGET (128 * 1024)
+#define RX_TIME_BUDGET_MS 2
 
 enum {
     RNDIS_PACKET = 1,
@@ -83,10 +90,23 @@ struct xfer_page_header {
     struct xfer_range range[];
 } PACKED;
 
+struct setup_frame {
+    struct setup_frame *next;
+    uint32_t len;
+    uint8_t data[];
+};
+
+struct keepalive_reply {
+    struct keepalive_reply *next;
+    uint32_t request;
+};
+
 static struct {
     struct vmbus_channel *ch;
     uint32_t nvsp_version;
     uint8_t *recv_buf, *send_buf;
+    uint32_t recv_gpadl, send_gpadl;
+    bool recv_shared, send_shared;
     uint32_t recv_size;
     uint32_t section_size, sections;
     uint64_t *section_used; /* bitmap */
@@ -100,6 +120,17 @@ static struct {
     uint8_t rndis_reply[128];
     bool link_up;
     uint64_t tx_backpressure;
+    /* The callback only publishes notification. The BSP net thread (or the
+       probe's synchronous wait before registration) is the sole ring reader. */
+    volatile bool event_pending, detaching;
+    uint8_t *rx_packet;
+    uint32_t rx_capacity, rx_len, rx_range, rx_position;
+    bool rx_borrowed, completion_wait;
+    struct setup_frame *setup_first, *setup_last;
+    struct keepalive_reply *keepalive_first, *keepalive_last;
+    size_t deferred_bytes;
+    uint64_t rx_dropped, rx_invalid, rx_budget_yields;
+    uint64_t rx_completion_retries, rx_completion_cancelled, rx_ring_high_water;
 } nv;
 
 static struct netif nif = {.driver = "netvsc"};
@@ -149,23 +180,49 @@ static int send_rndis(const void *msg, uint32_t len, bool control) {
     return r;
 }
 
-/* ---- receive path (interrupt context) ---- */
+/* ---- receive path (BSP thread context) ---- */
 
-static void rndis_receive(const uint8_t *p, uint32_t len) {
-    if (len < sizeof(struct rndis_hdr)) return;
+static void receive_frame(const void *frame, uint32_t len, void (*input)(const void *, size_t)) {
+    if (input) {
+        /* The stack consumes this borrow before returning. Do not return the
+           transfer's host credit until every frame in it has been consumed. */
+        input(frame, len);
+        return;
+    }
+    /* The packet filter can become active just before its setup reply. Keep
+       those early frames until the net thread starts, rather than putting a
+       startup burst through the old 63-frame IRQ staging queue. */
+    size_t allocation = sizeof(struct setup_frame) + len;
+    /* Probe-only staging and control replies share a memory budget backed by
+       the actual receive buffer, rather than growing an unbounded heap queue.
+       Normal data reception allocates nothing and retains the host credit. */
+    struct setup_frame *saved = allocation <= nv.recv_size - nv.deferred_bytes ? kmalloc(allocation) : NULL;
+    if (!saved) { nv.rx_dropped++; return; }
+    nv.deferred_bytes += allocation;
+    saved->next = NULL;
+    saved->len = len;
+    memcpy(saved->data, frame, len);
+    if (nv.setup_last) nv.setup_last->next = saved;
+    else nv.setup_first = saved;
+    nv.setup_last = saved;
+}
+
+static void rndis_receive(const uint8_t *p, uint32_t len, void (*input)(const void *, size_t)) {
+    if (len < sizeof(struct rndis_hdr)) { nv.rx_invalid++; return; }
     const struct rndis_hdr *h = (const void *)p;
-    if (h->len > len) return;
+    if (h->len < sizeof *h || h->len > len) { nv.rx_invalid++; return; }
     switch (h->type) {
     case RNDIS_PACKET: {
         const struct rndis_packet *rp = (const void *)p;
-        if (h->len < sizeof *rp) return;
+        if (h->len < sizeof *rp) { nv.rx_invalid++; return; }
         uint64_t end = 8ull + rp->data_offset + rp->data_len;
-        if (end > h->len) return;
-        net_rx(p + 8 + rp->data_offset, rp->data_len);
+        if (rp->data_offset < sizeof *rp - 8 || end > h->len ||
+            rp->data_len < 14 || rp->data_len > 1536) { nv.rx_invalid++; return; }
+        receive_frame(p + 8 + rp->data_offset, rp->data_len, input);
         break;
     }
     case RNDIS_INDICATE: {
-        uint32_t status = len >= 12 ? ((const uint32_t *)p)[2] : 0;
+        uint32_t status = h->len >= 12 ? ((const uint32_t *)p)[2] : 0;
         if (status == RNDIS_STATUS_MEDIA_CONNECT) nv.link_up = true;
         if (status == RNDIS_STATUS_MEDIA_DISCONNECT) nv.link_up = false;
         if (status == RNDIS_STATUS_MEDIA_CONNECT || status == RNDIS_STATUS_MEDIA_DISCONNECT)
@@ -173,59 +230,238 @@ static void rndis_receive(const uint8_t *p, uint32_t len) {
         break;
     }
     case RNDIS_KEEPALIVE: {
-        if (len < 12) return;
-        uint32_t reply[4] = {RNDIS_KEEPALIVE | RNDIS_COMPLETION, 16, ((const uint32_t *)p)[2], 0};
-        send_rndis(reply, sizeof reply, true);
+        if (h->len < 12) { nv.rx_invalid++; return; }
+        struct keepalive_reply *reply = sizeof *reply <= nv.recv_size - nv.deferred_bytes ?
+            kmalloc(sizeof *reply) : NULL;
+        if (!reply) { nv.rx_dropped++; return; }
+        nv.deferred_bytes += sizeof *reply;
+        reply->next = NULL;
+        reply->request = ((const uint32_t *)p)[2];
+        if (nv.keepalive_last) nv.keepalive_last->next = reply;
+        else nv.keepalive_first = reply;
+        nv.keepalive_last = reply;
         break;
     }
     default:
-        if ((h->type & RNDIS_COMPLETION) && len >= 12 && ((const uint32_t *)p)[2] == nv.rndis_wait_id &&
+        if ((h->type & RNDIS_COMPLETION) && h->len >= 16 && ((const uint32_t *)p)[2] == nv.rndis_wait_id &&
             !nv.rndis_done) {
-            memcpy(nv.rndis_reply, p, MIN(len, sizeof nv.rndis_reply));
+            memset(nv.rndis_reply, 0, sizeof nv.rndis_reply);
+            memcpy(nv.rndis_reply, p, MIN(h->len, sizeof nv.rndis_reply));
             nv.rndis_done = true;
         }
         break;
     }
 }
 
-static void receive_xfer(uint8_t *pkt, uint32_t plen) {
-    struct xfer_page_header *x = (void *)pkt;
-    if (plen < sizeof *x || x->pageset_id != RECV_BUF_ID ||
-        sizeof *x + (uint64_t)x->range_count * sizeof(struct xfer_range) > plen)
-        goto done;
-    for (uint32_t i = 0; i < x->range_count; i++) {
-        struct xfer_range *r = &x->range[i];
-        if ((uint64_t)r->offset + r->len > nv.recv_size) continue;
-        rndis_receive(nv.recv_buf + r->offset, r->len);
-    }
-done:;
-    /* give the space back to the host */
+static bool complete_receive(void) {
+    if (!nv.rx_borrowed || !nv.completion_wait) return true;
+    const struct vmpacket_desc *d = (const void *)nv.rx_packet;
     uint32_t m[NVSP_MSG_SIZE / 4] = {NVSP_SEND_RNDIS_PKT_COMPLETE, NVSP_STATUS_SUCCESS};
-    for (int tries = 0; vmbus_send(nv.ch, VM_PKT_COMP, 0, m, sizeof m, x->d.trans_id) == -EAGAIN && tries < 1000;
-         tries++)
-        pause();
+    int result = vmbus_send(nv.ch, VM_PKT_COMP, 0, m, sizeof m, d->trans_id);
+    if (result) {
+        if (result == -EAGAIN) nv.rx_completion_retries++;
+        /* Keep both the exact transaction ID and ownership on every failure.
+           Only successful enqueue, or channel teardown, retires this borrow. */
+        return false;
+    }
+    nv.rx_borrowed = nv.completion_wait = false;
+    return true;
 }
 
 static void netvsc_callback(struct vmbus_channel *ch) {
-    static uint8_t pkt[4096]; /* interrupt context, one channel: a static buffer is fine */
-    int n;
-    while ((n = vmbus_recv(ch, pkt, sizeof pkt)) != 0) {
-        if (n < 0) continue;
-        struct vmpacket_desc *d = (void *)pkt;
+    if (ch != nv.ch || ch->rescinded) return;
+    ch->in->interrupt_mask = 1;
+    nv.event_pending = true;
+    net_rx_notify();
+}
+
+static void netvsc_rescind(struct vmbus_channel *ch) {
+    if (ch != nv.ch) return;
+    nv.detaching = true;
+    nv.link_up = false;
+    net_rx_notify();
+}
+
+static void free_buffer(uint8_t *buffer, uint32_t pages) {
+    if (!buffer) return;
+    uint64_t pa = hhdm_virt_to_phys(buffer);
+    for (uint32_t i = 0; i < pages; i++) pmm_free(pa + (uint64_t)i * PAGE_SIZE);
+}
+
+static void netvsc_shutdown(void) {
+    struct vmbus_channel *ch = nv.ch;
+    if (!ch) return;
+    /* No callback can consume a descriptor or free memory. Closing this
+       claimed channel is done by its BSP owner, after any input borrow has
+       returned. A rescind invalidates pending IDs; they are never sent to a
+       later channel with a potentially reused relid. */
+    nv.link_up = false;
+    if (nv.rx_borrowed) nv.rx_completion_cancelled++;
+    nv.rx_borrowed = nv.completion_wait = false;
+    vmbus_close_confirmed(ch);
+    /* Rescind retires channel transactions, but is not a GPADL teardown ACK.
+       Preserve shared backing on that path: a late host write must never hit
+       reallocated memory. Normal shutdown can reclaim after explicit ACKs. */
+    bool recv_safe = !nv.recv_shared;
+    bool send_safe = !nv.send_shared;
+    if (!ch->rescinded) {
+        if (!recv_safe && nv.recv_gpadl) recv_safe = vmbus_gpadl_teardown(ch, nv.recv_gpadl);
+        if (!send_safe && nv.send_gpadl) send_safe = vmbus_gpadl_teardown(ch, nv.send_gpadl);
+    }
+    if (recv_safe) free_buffer(nv.recv_buf, RECV_BUF_PAGES);
+    else kprintf("netvsc: preserving receive pages: host mapping not retired\n");
+    if (send_safe) free_buffer(nv.send_buf, SEND_BUF_PAGES);
+    else kprintf("netvsc: preserving send pages: host mapping not retired\n");
+    nv.recv_buf = nv.send_buf = NULL;
+    nv.recv_gpadl = nv.send_gpadl = 0;
+    nv.recv_shared = nv.send_shared = false;
+    kfree(nv.section_used);
+    nv.section_used = NULL;
+    nv.sections = 0;
+    kfree(nv.rx_packet);
+    nv.rx_packet = NULL;
+    while (nv.setup_first) {
+        struct setup_frame *saved = nv.setup_first;
+        nv.setup_first = saved->next;
+        nv.rx_dropped++;
+        kfree(saved);
+    }
+    nv.setup_last = NULL;
+    while (nv.keepalive_first) {
+        struct keepalive_reply *reply = nv.keepalive_first;
+        nv.keepalive_first = reply->next;
+        kfree(reply);
+    }
+    nv.keepalive_last = NULL;
+    nv.deferred_bytes = 0;
+    uint64_t flags = irq_save();
+    nv.ch = NULL;
+    nv.event_pending = nv.detaching = false;
+    vmbus_release(ch);
+    irq_restore(flags);
+}
+
+static bool netvsc_rx_pending(void) {
+    if (nv.detaching) return true;
+    if (!nv.ch || nv.ch->rescinded) return false;
+    if (nv.event_pending || nv.setup_first) return true;
+    if (nv.completion_wait)
+        return vmbus_write_ready(nv.ch, sizeof(struct vmpacket_desc) + NVSP_MSG_SIZE);
+    if (nv.rx_borrowed || vmbus_rx_pending(nv.ch)) return true;
+    /* A keepalive can also wait for a send-buffer section, whose host
+       completion arrives on the input ring. Do not busy-poll a full ring. */
+    if (nv.keepalive_first && vmbus_write_ready(nv.ch, sizeof(struct vmpacket_desc) + NVSP_MSG_SIZE)) {
+        for (uint32_t i = 0; i < nv.sections; i++)
+            if (!(nv.section_used[i / 64] & (1ull << (i % 64)))) return true;
+    }
+    return false;
+}
+
+static size_t netvsc_poll_rx(void (*input)(const void *, size_t)) {
+    if (nv.detaching || (nv.ch && nv.ch->rescinded)) { netvsc_shutdown(); return 0; }
+    if (!nv.ch || !nv.rx_packet) return 0;
+    uint64_t started = uptime_ms();
+    uint32_t messages = 0, bytes = 0;
+    size_t frames = 0;
+    bool completion_blocked = false;
+    bool keepalive_blocked = false;
+    bool budget_exhausted = false;
+    nv.ch->in->interrupt_mask = 1;
+    nv.event_pending = false;
+    while (messages < RX_MESSAGE_BUDGET && bytes < RX_BYTE_BUDGET) {
+        if ((messages & 7) == 0 && uptime_ms() - started >= RX_TIME_BUDGET_MS) {
+            budget_exhausted = true;
+            break;
+        }
+        if (nv.detaching || nv.ch->rescinded) break;
+        if (nv.completion_wait && !complete_receive()) { completion_blocked = true; break; }
+        if (input && nv.setup_first) {
+            struct setup_frame *saved = nv.setup_first;
+            nv.setup_first = saved->next;
+            if (!nv.setup_first) nv.setup_last = NULL;
+            input(saved->data, saved->len);
+            bytes += saved->len;
+            frames++;
+            messages++;
+            nv.deferred_bytes -= sizeof *saved + saved->len;
+            kfree(saved);
+            continue;
+        }
+        if (nv.keepalive_first && !keepalive_blocked) {
+            struct keepalive_reply *reply = nv.keepalive_first;
+            uint32_t m[4] = {RNDIS_KEEPALIVE | RNDIS_COMPLETION, 16, reply->request, 0};
+            if (!send_rndis(m, sizeof m, true)) {
+                nv.keepalive_first = reply->next;
+                if (!nv.keepalive_first) nv.keepalive_last = NULL;
+                nv.deferred_bytes -= sizeof *reply;
+                kfree(reply);
+                messages++;
+                continue;
+            }
+            keepalive_blocked = true;
+        }
+        if (nv.rx_borrowed) {
+            struct xfer_page_header *x = (void *)nv.rx_packet;
+            if (nv.rx_range == x->range_count) { nv.completion_wait = true; continue; }
+            const struct xfer_range *r = &x->range[nv.rx_range];
+            if ((uint64_t)r->offset + r->len > nv.recv_size || !nv.recv_buf) {
+                nv.rx_invalid++;
+                nv.rx_range++;
+                nv.rx_position = 0;
+                messages++;
+                continue;
+            }
+            if (nv.rx_position == r->len) { nv.rx_range++; nv.rx_position = 0; messages++; continue; }
+            uint32_t remaining = r->len - nv.rx_position;
+            const uint8_t *p = nv.recv_buf + r->offset + nv.rx_position;
+            const struct rndis_hdr *h = (const void *)p;
+            if (remaining < sizeof *h || h->len < sizeof *h || h->len > remaining) {
+                nv.rx_invalid++;
+                nv.rx_range++;
+                nv.rx_position = 0;
+                messages++;
+                continue;
+            }
+            uint32_t len = h->len;
+            if (h->type == RNDIS_PACKET) frames++;
+            rndis_receive(p, len, input);
+            nv.rx_position += len;
+            bytes += len;
+            messages++;
+            continue;
+        }
+        uint32_t r = nv.ch->in->read_index, w = nv.ch->in->write_index;
+        uint32_t used = w >= r ? w - r : nv.ch->in_size - r + w;
+        nv.rx_ring_high_water = MAX(nv.rx_ring_high_water, used);
+        int n = vmbus_recv(nv.ch, nv.rx_packet, nv.rx_capacity);
+        if (!n) break;
+        messages++;
+        if (n < 0) { nv.rx_invalid++; continue; }
+        struct vmpacket_desc *d = (void *)nv.rx_packet;
         if (d->type == VM_PKT_DATA_XFER_PAGES) {
-            receive_xfer(pkt, (uint32_t)n);
+            /* The descriptor allocation is as large as the entire input
+               ring. No accepted transfer ID is lost to a 4 KiB scratch cap. */
+            nv.rx_len = (uint32_t)n;
+            nv.rx_range = nv.rx_position = 0;
+            nv.rx_borrowed = true;
+            struct xfer_page_header *x = (void *)nv.rx_packet;
+            nv.completion_wait = nv.rx_len < sizeof *x || x->pageset_id != RECV_BUF_ID ||
+                d->offset8 > d->len8 ||
+                sizeof *x + (uint64_t)x->range_count * sizeof(struct xfer_range) > (uint32_t)d->offset8 * 8;
+            if (nv.completion_wait) nv.rx_invalid++;
             continue;
         }
         if (d->type != VM_PKT_COMP) continue;
-        uint32_t dlen = vmpacket_datalen(pkt);
-        uint32_t *m = vmpacket_data(pkt);
-        if (dlen < 4) continue;
+        if (d->offset8 < sizeof *d / 8 || d->offset8 > d->len8) { nv.rx_invalid++; continue; }
+        uint32_t dlen = vmpacket_datalen(nv.rx_packet);
+        uint32_t *m = vmpacket_data(nv.rx_packet);
+        if (dlen < 4) { nv.rx_invalid++; continue; }
         if (m[0] == NVSP_SEND_RNDIS_PKT_COMPLETE) {
             if (d->trans_id >= TX_TID_BASE && d->trans_id - TX_TID_BASE < nv.sections) {
-                /* Only host completion signals progress. Returning a section
-                   after a failed vmbus_send is not progress and must not wake
-                   a retry loop that would immediately fail again. */
-                if (section_free((uint32_t)(d->trans_id - TX_TID_BASE))) net_rx_notify();
+                if (section_free((uint32_t)(d->trans_id - TX_TID_BASE))) {
+                    keepalive_blocked = false;
+                    net_rx_notify();
+                }
             }
         } else if (m[0] == nv.nvsp_wait_type && !nv.nvsp_done) {
             memset(nv.nvsp_reply, 0, sizeof nv.nvsp_reply);
@@ -233,6 +469,55 @@ static void netvsc_callback(struct vmbus_channel *ch) {
             nv.nvsp_done = true;
         }
     }
+    budget_exhausted |= messages >= RX_MESSAGE_BUDGET || bytes >= RX_BYTE_BUDGET;
+    if (nv.detaching || nv.ch->rescinded) { netvsc_shutdown(); return frames; }
+    /* Return the last transfer promptly, even when its final packet exactly
+       exhausted the processing budget. A full ring keeps the borrow intact. */
+    if (nv.rx_borrowed && !nv.completion_wait) {
+        struct xfer_page_header *x = (void *)nv.rx_packet;
+        if (nv.rx_range == x->range_count ||
+            (nv.rx_range + 1 == x->range_count && nv.rx_position == x->range[nv.rx_range].len))
+            nv.completion_wait = true;
+    }
+    if (nv.completion_wait && !completion_blocked) complete_receive();
+    uint64_t flags = irq_save();
+    nv.ch->in->interrupt_mask = 0;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    /* Rearm before the final readiness check; an arrival crossing the empty
+       check cannot be lost. A blocked completion waits for host progress. */
+    bool pending = netvsc_rx_pending();
+    if (pending) {
+        if (budget_exhausted) nv.rx_budget_yields++;
+        net_rx_notify();
+    }
+    irq_restore(flags);
+    return frames;
+}
+
+static void netvsc_get_stats(struct n_netstats *stats) {
+    stats->rx_dropped = nv.rx_dropped;
+    stats->rx_invalid = nv.rx_invalid;
+    stats->rx_budget_yields = nv.rx_budget_yields;
+    stats->rx_completion_pending = nv.rx_borrowed ? 1 : 0;
+    stats->rx_completion_retries = nv.rx_completion_retries;
+    stats->rx_completion_cancelled = nv.rx_completion_cancelled;
+    stats->rx_ring_high_water = nv.rx_ring_high_water;
+}
+
+static bool netvsc_wait(volatile bool *flag, uint64_t ms) {
+    uint64_t started = uptime_ms();
+    while (!*flag) {
+        if (!nv.ch || nv.ch->rescinded || uptime_ms() - started >= ms) return false;
+        netvsc_poll_rx(NULL);
+        if (*flag) return nv.ch && !nv.detaching && !nv.ch->rescinded;
+        /* No IRQ-side parsing, and no pause-loop on a blocked completion.
+           The timer provides a fallback on hosts without ring-space events. */
+        if ((nv.rx_borrowed && !nv.completion_wait) || vmbus_rx_pending(nv.ch) ||
+            (nv.completion_wait && vmbus_write_ready(nv.ch, sizeof(struct vmpacket_desc) + NVSP_MSG_SIZE)))
+            sched_yield();
+        else sleep_ms(1);
+    }
+    return nv.ch && !nv.detaching && !nv.ch->rescinded;
 }
 
 /* ---- setup ---- */
@@ -244,7 +529,7 @@ static bool nvsp_request(const void *msg, uint32_t reply) {
     nv.nvsp_done = false;
     nv.nvsp_wait_type = reply;
     if (vmbus_send(nv.ch, VM_PKT_DATA_INBAND, VMBUS_FLAG_COMPLETION_REQUESTED, m, sizeof m, 1)) return false;
-    if (!vmbus_wait(&nv.nvsp_done, 5000)) {
+    if (!netvsc_wait(&nv.nvsp_done, 5000)) {
         kprintf("netvsc: no reply to NVSP message %u\n", *(uint32_t *)m);
         return false;
     }
@@ -268,7 +553,7 @@ static bool nvsp_negotiate(void) {
 
 static bool setup_buffers(void) {
     if (nv.nvsp_version >= 0x2) {
-        /* mtu + ethernet header, then the capability bits: just 802.1q, like Linux */
+        /* mtu + ethernet header, then the capability bits: 802.1q */
         uint32_t m[NVSP_MSG_SIZE / 4] = {NVSP_SEND_NDIS_CONFIG, 1514, 0, 1u << 3, 0};
         if (vmbus_send(nv.ch, VM_PKT_DATA_INBAND, 0, m, sizeof m, 0)) return false;
     }
@@ -281,7 +566,8 @@ static bool setup_buffers(void) {
     nv.recv_buf = phys_to_virt(pa);
     nv.recv_size = RECV_BUF_PAGES * PAGE_SIZE;
     memset(nv.recv_buf, 0, nv.recv_size);
-    uint32_t g = vmbus_gpadl_create(nv.ch, pa, RECV_BUF_PAGES);
+    nv.recv_shared = true; /* a timeout must not make shared pages reusable */
+    uint32_t g = nv.recv_gpadl = vmbus_gpadl_create(nv.ch, pa, RECV_BUF_PAGES);
     if (!g) return false;
     uint32_t rb[NVSP_MSG_SIZE / 4] = {NVSP_SEND_RECV_BUF, g, RECV_BUF_ID};
     if (!nvsp_request(rb, NVSP_SEND_RECV_BUF_COMPLETE)) return false;
@@ -294,7 +580,8 @@ static bool setup_buffers(void) {
     if (!pa) return false;
     nv.send_buf = phys_to_virt(pa);
     memset(nv.send_buf, 0, SEND_BUF_PAGES * PAGE_SIZE);
-    g = vmbus_gpadl_create(nv.ch, pa, SEND_BUF_PAGES);
+    nv.send_shared = true;
+    g = nv.send_gpadl = vmbus_gpadl_create(nv.ch, pa, SEND_BUF_PAGES);
     if (!g) return false;
     uint32_t sb[NVSP_MSG_SIZE / 4] = {NVSP_SEND_SEND_BUF, g, SEND_BUF_ID};
     if (!nvsp_request(sb, NVSP_SEND_SEND_BUF_COMPLETE)) return false;
@@ -317,7 +604,7 @@ static bool rndis_request(void *msg, uint32_t len) {
     nv.rndis_done = false;
     nv.rndis_wait_id = m[2];
     if (send_rndis(msg, len, true)) return false;
-    if (!vmbus_wait(&nv.rndis_done, 5000)) {
+    if (!netvsc_wait(&nv.rndis_done, 5000)) {
         kprintf("netvsc: no reply to RNDIS message %u\n", m[0]);
         return false;
     }
@@ -346,6 +633,7 @@ static bool rndis_set(uint32_t oid, const void *val, uint32_t len) {
 }
 
 static int netvsc_send(const void *frame, size_t len) {
+    if (!nv.ch || nv.detaching || nv.ch->rescinded) return -ENETDOWN;
     if (len > 1514 || sizeof(struct rndis_packet) + len > nv.section_size) return -EINVAL;
     uint32_t sec = section_alloc();
     if (sec == INVALID_SECTION) {
@@ -373,8 +661,12 @@ bool netvsc_probe(void) {
     struct vmbus_channel *ch = vmbus_find(&net_guid, 0);
     if (!ch) return false;
     nv.ch = ch;
-    if (vmbus_open(ch, 128 * 1024, 128 * 1024, netvsc_callback, NULL)) return false;
-    if (!nvsp_negotiate() || !setup_buffers()) return false;
+    ch->claimed = true;
+    ch->on_rescind = netvsc_rescind;
+    if (vmbus_open(ch, 128 * 1024, 128 * 1024, netvsc_callback, NULL)) goto failed;
+    nv.rx_capacity = ch->in_size;
+    nv.rx_packet = kmalloc(nv.rx_capacity);
+    if (!nv.rx_packet || !nvsp_negotiate() || !setup_buffers()) goto failed;
 
     struct {
         struct rndis_hdr h;
@@ -382,23 +674,29 @@ bool netvsc_probe(void) {
     } PACKED init = {{RNDIS_INIT, sizeof init}, 0, 1, 0, 0x4000};
     if (!rndis_request(&init, sizeof init)) {
         kprintf("netvsc: RNDIS initialisation failed\n");
-        return false;
+        goto failed;
     }
     if (rndis_query(OID_802_3_PERMANENT_ADDRESS, nif.mac, 6) != 6) {
         kprintf("netvsc: could not read the MAC address\n");
-        return false;
+        goto failed;
     }
     uint32_t media = 1;
     if (rndis_query(OID_GEN_MEDIA_CONNECT_STATUS, &media, 4) == 4) nv.link_up = media == 0;
     uint32_t filter = PACKET_FILTER;
     if (!rndis_set(OID_GEN_CURRENT_PACKET_FILTER, &filter, 4)) {
         kprintf("netvsc: could not set the packet filter\n");
-        return false;
+        goto failed;
     }
     nif.send = netvsc_send;
+    nif.rx_pending = netvsc_rx_pending;
+    nif.poll_rx = netvsc_poll_rx;
+    nif.get_stats = netvsc_get_stats;
     kprintf("net: netvsc (NVSP %x.%x, %u send sections of %u) mac %02x:%02x:%02x:%02x:%02x:%02x, link %s\n",
             nv.nvsp_version >> 16, nv.nvsp_version & 0xFFFF, nv.sections, nv.section_size, nif.mac[0],
             nif.mac[1], nif.mac[2], nif.mac[3], nif.mac[4], nif.mac[5], nv.link_up ? "up" : "down");
     net_register(&nif);
     return true;
+failed:
+    netvsc_shutdown();
+    return false;
 }

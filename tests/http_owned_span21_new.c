@@ -33,6 +33,8 @@ void ns_set_timeout(net_stream *s,int t){(void)s;(void)t;}
 const char *ns_error(net_stream *s){(void)s;return "";}
 void ns_close(net_stream *s){(void)s;}
 int http_inflate(char *o,int c,const char *i,int n,int *used){(void)o;(void)c;(void)i;(void)n;(void)used;return -1;}
+#define HTTP_MOCK_HAS_TIMEOUT
+#include "http_mock_lifecycle.h"
 #define CHECK(name,ok) do{checks++;if(!(ok)){failed++;printf("FAIL %s\n",name);}}while(0)
 int main(void){
     const char prefix[]="HTTPS://LONG.test:443/?p=";

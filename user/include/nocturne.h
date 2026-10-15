@@ -113,6 +113,13 @@ int readline(const char *prompt, char *buf, size_t size, int flags);
 int net_info(struct n_netinfo *ni);
 int net_ping(uint32_t ip, int seq, int timeout_ms); /* round-trip time in ms */
 int net_resolve(const char *name, uint32_t *ip);    /* DNS lookup or dotted quad */
+int net_resolve_all(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result);
+int net_resolve_at(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result,
+                   const struct n_sockaddr *resolver);
+int net_stats(struct n_netstats *stats);
+/* Calling thread only: abort DNS/ARP/connect if this request channel's peer
+   closes. fd=-1 clears the context. Established/shared TCP I/O is unaffected. */
+int net_set_setup_cancel_channel(int fd);
 bool ip_parse(const char *s, uint32_t *ip);
 char *ip_format(uint32_t ip, char *buf); /* buf: at least 16 bytes */
 int udp_socket(uint16_t port);           /* 0 picks an ephemeral port */
@@ -121,6 +128,12 @@ int udp_recvfrom(int s, void *buf, size_t len, int timeout_ms, struct n_sockaddr
 int udp_close(int s);
 int tcp_connect(uint32_t ip, uint16_t port, int timeout_ms);
 long tcp_send(int s, const void *buf, size_t len);
+/* Absolute uptime_ms deadline; zero waits without a deadline. A positive
+   result is the accepted prefix, never a claim that the peer acknowledged it. */
+long tcp_send_until(int s, const void *buf, size_t len, uint64_t deadline_ms);
+long tcp_send_some(int s, const void *buf, size_t len); /* prefix or EAGAIN, never waits for space */
+/* Abort the connection, waking send/receive waiters with ECANCELED. */
+int tcp_cancel(int s);
 long tcp_recv(int s, void *buf, size_t len, int timeout_ms); /* 0 = connection closed */
 int tcp_close(int s);
 /* simulated packet loss/reordering on this process's TCP connections, and TCP counters (either may be NULL) */

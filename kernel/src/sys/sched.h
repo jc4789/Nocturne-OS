@@ -40,6 +40,7 @@ struct task {
     uint64_t pml4;
     struct file *initial_fds[MAX_FDS];
     struct file **fds;
+    struct file *net_setup_cancel_file; /* thread-owned strong ref; never inherited */
     size_t fd_capacity,fd_hint;
     char cwd[256];
     struct task *parent;

@@ -40,6 +40,8 @@ const char *ns_error(net_stream*s){(void)s;return "fixture stream error";}
 void ns_close(net_stream*s){(void)s;closes++;}
 void ns_set_timeout(net_stream*s,int timeout){(void)s;(void)timeout;}
 int http_inflate(char*out,int cap,const char*in,int n,int*consumed){(void)out;(void)cap;(void)in;(void)n;(void)consumed;return -1;}
+#define HTTP_MOCK_HAS_TIMEOUT
+#include "http_mock_lifecycle.h"
 #define CHECK(name,test) do{checks++;if(!(test)){failed++;printf("FAIL %s\n",name);}}while(0)
 static void reset(void){free(sent);sent=NULL;sent_capacity=sent_length=0;opens=closes=0;send_failure=false;}
 int main(void){

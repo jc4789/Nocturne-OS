@@ -2,7 +2,8 @@
    Received frames are queued from the NIC interrupt and processed by the "net" kernel thread.
    System calls run in the calling task and block on their socket's progress queue
    (or net_wq for shared link/UDP state) until the thread reports progress.
-   The kernel is non-preemptive, so stack state needs no locks besides the IRQ-fed queue. */
+   Protocol control, timers, allocation and NIC output are BSP-owned. APs may
+   copy bounded TCP ring prefixes while the BSP gate is open. */
 #include "kernel.h"
 #include "abi.h"
 #include "net.h"
@@ -11,16 +12,111 @@
 #include "../mm/heap.h"
 #include "../sys/sched.h"
 #include "../sys/syscall.h"
+#include "../mm/vmm.h"
+#include "../fs/vfs.h"
 #include "dns_name.h"
 
 static struct netif *nif;
 static uint32_t my_ip, my_mask, my_gw, my_dns;
+static struct n_sockaddr dns_boot_resolver;
+static int dns_boot_setting; /* 0=DHCP, 1=explicit, negative=rejected boot setting */
+static struct n_sockaddr dns_default_resolver(void);
 static bool configured;
 static uint64_t rx_packets, tx_packets;
+/* BSP-owned wire work, used only at cooperative batch boundaries. */
+static uint64_t net_service_bytes;
 static struct wait_queue net_wq; /* shared link/ARP/DNS/UDP progress */
 static struct wait_queue rxq_wq; /* the net thread sleeps here */
 static volatile bool net_work_pending; /* IRQ wake latch, including TX resource returns */
 static bool receive_batch;
+/* BSP closes the gate before touching socket metadata. AP sections are at
+   most 64 KiB and never wait or allocate. The active count pins the registry,
+   rings and generations until BSP close has joined all preceding readers. */
+/* Keep the ownership gate, AP join count, producer mailbox and consumer wait
+   arm on separate cache lines. Their independent BSP/AP writers must not
+   invalidate the other controls merely by updating an adjacent word. The
+   full-size objects also exclude unrelated globals from their cache lines. */
+struct net_shared_word { unsigned value; } __attribute__((aligned(64)));
+_Static_assert(sizeof(struct net_shared_word)==64,"network control cache line");
+static struct net_shared_word net_gate_closed, net_ap_active, net_ap_pending;
+static struct net_shared_word net_ap_sleeping; /* consumer has armed its BSP wait boundary */
+static unsigned net_guard_depth; /* BSP-only nesting */
+static struct n_netstats net_counters;
+/* Temporary handoff diagnosis; disable after the controlled comparison. No
+   per-packet clock reads or automatic logs. SYS_NET_STATS emits one snapshot. */
+#define NET_HANDOFF_DIAG 0
+#if NET_HANDOFF_DIAG
+enum { ND_GATE,ND_GATE_RACE,ND_OWNER,ND_LEGACY_LARGE,ND_LEGACY_SPACE,ND_TX_FULL,ND_TX_MAP,ND_RX_WAIT,ND_RX_MAP,ND_REASONS };
+static struct {
+    uint64_t fallback[CPU_MAX_COUNT][ND_REASONS];
+    uint64_t gate_joins,gate_ticks,gate_max;
+    uint64_t handoffs,handoff_ticks,handoff_max,handoff_no_output;
+    uint64_t yields,yield_resched,yield_pending,yield_idle,yield_level[4];
+    uint64_t pushes[3],push_bytes[3]; /* caller, net thread, other kernel */
+} net_diag;
+static struct task *net_diag_thread;
+static void net_diag_fallback(unsigned cpu,unsigned reason) {
+    /* One writer per CPU; atomic load/store avoids adding a locked RMW to
+       the path being measured. Snapshot readers use the same atomic width. */
+    uint64_t *value=&net_diag.fallback[cpu][reason];
+    __atomic_store_n(value,__atomic_load_n(value,__ATOMIC_RELAXED)+1,__ATOMIC_RELAXED);
+}
+#define ND_FALLBACK(cpu,reason) net_diag_fallback(cpu,reason)
+#else
+#define ND_FALLBACK(cpu,reason) ((void)0)
+#endif
+static void net_bsp_enter(void) {
+    if (net_guard_depth++) return;
+    __atomic_store_n(&net_gate_closed.value, 1, __ATOMIC_SEQ_CST);
+#if NET_HANDOFF_DIAG
+    uint64_t began=0;
+    while (__atomic_load_n(&net_ap_active.value, __ATOMIC_SEQ_CST)) {
+        if(!began)began=rdtsc();
+        pause();
+    }
+    if(began) {
+        uint64_t ticks=rdtsc()-began;
+        net_diag.gate_joins++;net_diag.gate_ticks+=ticks;net_diag.gate_max=MAX(net_diag.gate_max,ticks);
+    }
+#else
+    while (__atomic_load_n(&net_ap_active.value, __ATOMIC_SEQ_CST)) pause();
+#endif
+}
+static void net_bsp_leave(void) {
+    ASSERT(net_guard_depth);
+    if (!--net_guard_depth) __atomic_store_n(&net_gate_closed.value, 0, __ATOMIC_RELEASE);
+}
+/* Wait queues and allocations remain BSP-only. Release the data-plane gate
+   while sleeping so another CPU can use an unrelated ready connection. */
+static bool net_wait_timeout(struct wait_queue *queue, uint64_t ms) {
+    unsigned depth = net_guard_depth;
+    while (net_guard_depth) net_bsp_leave();
+    bool ready = wq_wait_timeout(queue, ms);
+    for (unsigned i=0;i<depth;i++) net_bsp_enter();
+    return ready;
+}
+/* The retained file identifies an endpoint, independently of descriptor reuse.
+   Only setup paths consult it: a cancelled HTTP/2 stream must never abort a
+   shared established TCP connection while pumping another stream's records. */
+static bool net_setup_cancelled(void) {
+    struct file *file=current_task->net_setup_cancel_file;
+    if(!file)return false;
+    uint64_t flags=irq_save();
+    bool closed=file->vn->ops && file->vn->ops->hangup && file->vn->ops->hangup(file->vn,file);
+    irq_restore(flags);
+    return closed;
+}
+static bool net_setup_wait_timeout(struct wait_queue *queue,uint64_t ms) {
+    /* Task wait queues remain BSP-owned. Bound only the setup context's
+       sleep; normal TCP/UDP waits retain their existing progress semantics. */
+    if(current_task->net_setup_cancel_file && ms>50)ms=50;
+    return net_wait_timeout(queue,ms);
+}
+void net_task_exit(struct task *task) {
+    struct file *file=task->net_setup_cancel_file;
+    task->net_setup_cancel_file=NULL;
+    if(file)vfs_close(file);
+}
 
 static uint16_t htons(uint16_t v) { return (uint16_t)((v << 8) | (v >> 8)); }
 #define ntohs htons
@@ -53,12 +149,13 @@ void net_delay_ms(uint64_t ms) {
 static uint32_t csum_add(uint32_t sum, const void *data, size_t len) {
     const uint8_t *p = data;
     uint64_t wide = sum;
-    /* RFC 1071: associative one's-complement addition. memcpy permits an
+    /* RFC 1071: associative one's-complement addition. Builtin memcpy permits an
        unaligned, alias-safe machine-word load; network order is restored
-       before adding independent pairs. No per-word carry-fold is needed. */
+       before adding independent pairs. Explicit builtins retain native loads
+       under -ffreestanding. No per-word carry-fold is needed. */
     while (len >= sizeof(uint64_t)) {
         uint64_t word;
-        memcpy(&word, p, sizeof word);
+        __builtin_memcpy(&word, p, sizeof word);
         word = __builtin_bswap64(word);
         const uint64_t pair_mask = 0x0000ffff0000ffffULL;
         uint64_t pairs = (word & pair_mask) + ((word >> 16) & pair_mask);
@@ -68,7 +165,7 @@ static uint32_t csum_add(uint32_t sum, const void *data, size_t len) {
     }
     if (len >= sizeof(uint32_t)) {
         uint32_t word;
-        memcpy(&word, p, sizeof word);
+        __builtin_memcpy(&word, p, sizeof word);
         word = __builtin_bswap32(word);
         wide += (word & UINT16_MAX) + (word >> 16);
         p += sizeof word;
@@ -138,12 +235,14 @@ void net_rx_notify(void) {
 }
 
 void net_rx(const void *frame, size_t len) {
-    if (len < 14 || len > 1536) return;
+    if (len < 14 || len > 1536) {net_counters.rx_invalid++;return;}
     int next = (rxq_head + 1) % RXQ;
-    if (next == rxq_tail) return; /* full: drop */
+    if (next == rxq_tail) {net_counters.rx_dropped++;return;}
     memcpy(rxq_buf[rxq_head], frame, len);
     rxq_len[rxq_head] = (uint16_t)len;
     rxq_head = next;
+    uint64_t queued=(uint64_t)((rxq_head-rxq_tail+RXQ)%RXQ);
+    net_counters.rx_ring_high_water=MAX(net_counters.rx_ring_high_water,queued);
     net_rx_notify();
 }
 
@@ -165,7 +264,7 @@ static int eth_output(const uint8_t dst[6], uint16_t type, size_t len) {
         total = 60;
     }
     int result = nif->send(frame, total);
-    if (!result) tx_packets++;
+    if (!result) {tx_packets++;net_service_bytes+=total;}
     return result;
 }
 
@@ -253,6 +352,7 @@ static uint32_t next_hop(uint32_t dst) { return ((dst ^ my_ip) & my_mask) == 0 ?
    deadline shares TCP's connect budget; zero preserves ordinary ARP retries. */
 static int arp_resolve_until(uint32_t dst, uint8_t mac[6], uint64_t deadline) {
     if (!nif) return -ENETDOWN;
+    if(net_setup_cancelled())return -ECANCELED;
     if (dst == 0xFFFFFFFF || dst == (my_ip | ~my_mask)) {
         memcpy(mac, bcast_mac, 6);
         return 0;
@@ -262,6 +362,7 @@ static int arp_resolve_until(uint32_t dst, uint8_t mac[6], uint64_t deadline) {
     if (!hop) return -EHOSTUNREACH;
     for (int tries = 0; tries < 3; tries++) {
         if (current_task->killed) return -EINTR;
+        if(net_setup_cancelled())return -ECANCELED;
         uint64_t now = uptime_ms();
         if (deadline && now >= deadline) return -ETIMEDOUT;
         if (arp_lookup(hop, mac)) return 0;
@@ -270,11 +371,12 @@ static int arp_resolve_until(uint32_t dst, uint8_t mac[6], uint64_t deadline) {
         if (deadline && deadline < until) until = deadline;
         for (;;) {
             if (current_task->killed) return -EINTR;
+            if(net_setup_cancelled())return -ECANCELED;
             now = uptime_ms();
             if (deadline && now >= deadline) return -ETIMEDOUT;
             if (arp_lookup(hop, mac)) return 0;
             if (now >= until) break;
-            wq_wait_timeout(&net_wq, until - now);
+            net_setup_wait_timeout(&net_wq, until - now);
         }
     }
     return -EHOSTUNREACH;
@@ -344,7 +446,7 @@ static int64_t sys_ping(uint32_t dst, int seq, int timeout_ms) {
             ret = -EINTR;
             break;
         }
-        wq_wait_timeout(&net_wq, until - now);
+        net_wait_timeout(&net_wq, until - now);
     }
     if (w->done) ret = (int64_t)(uptime_ms() - t0);
     w->used = false;
@@ -483,6 +585,7 @@ static struct udp_dgram *udp_wait(int i, int timeout_ms, int *err) {
         /* A sibling thread can close/reuse this handle while we sleep. Never
            consume another socket generation or touch its freed queue. */
         if(!s->used || s->generation!=generation){*err=-EBADF;return NULL;}
+        if(s->internal && net_setup_cancelled()){*err=-ECANCELED;return NULL;}
         if (s->qt != s->qh) {
             struct udp_dgram *d = &s->q[s->qt];
             s->qt = (s->qt + 1) % UDP_Q;
@@ -497,7 +600,8 @@ static struct udp_dgram *udp_wait(int i, int timeout_ms, int *err) {
             *err = -EAGAIN;
             return NULL;
         }
-        wq_wait_timeout(&net_wq, timeout_ms < 0 ? 1000 : until - now);
+        if(s->internal)net_setup_wait_timeout(&net_wq, timeout_ms < 0 ? 1000 : until - now);
+        else net_wait_timeout(&net_wq, timeout_ms < 0 ? 1000 : until - now);
     }
 }
 
@@ -615,10 +719,11 @@ static void dhcp_input(const uint8_t *p, size_t len) {
         dhcp_state = DHCP_BOUND;
         if (lease < 60) lease = 60;
         dhcp_next = uptime_ms() + (uint64_t)lease * 500; /* renew at half the lease */
-        kprintf("net: %u.%u.%u.%u/%d gateway %u.%u.%u.%u dns %u.%u.%u.%u (DHCP)\n", my_ip >> 24, (my_ip >> 16) & 255,
+        struct n_sockaddr resolver=dns_default_resolver();
+        kprintf("net: %u.%u.%u.%u/%d gateway %u.%u.%u.%u dns %u.%u.%u.%u:%u (DHCP)\n", my_ip >> 24, (my_ip >> 16) & 255,
                 (my_ip >> 8) & 255, my_ip & 255, __builtin_popcount(my_mask), my_gw >> 24, (my_gw >> 16) & 255,
-                (my_gw >> 8) & 255, my_gw & 255, my_dns >> 24, (my_dns >> 16) & 255, (my_dns >> 8) & 255,
-                my_dns & 255);
+                (my_gw >> 8) & 255, my_gw & 255, resolver.ip >> 24, (resolver.ip >> 16) & 255, (resolver.ip >> 8) & 255,
+                resolver.ip & 255, resolver.port);
         wq_wake_all(&net_wq);
     } else if (type == 6) {
         dhcp_start();
@@ -664,113 +769,272 @@ static bool parse_ip(const char *s, uint32_t *out) {
     return true;
 }
 
-#define DNS_CACHE 8
-static struct {
-    char name[64];
-    uint32_t ip;
-    uint64_t expires;
-} dns_cache[DNS_CACHE];
-static int dns_cache_next;
-
-/* skip a (possibly compressed) DNS name; returns new offset or 0 on error */
-static size_t dns_skip_name(const uint8_t *p, size_t len, size_t o) {
-    while (o < len) {
-        uint8_t l = p[o];
-        if (l == 0) return o + 1;
-        if ((l & 0xC0) == 0xC0) return o + 2;
-        o += 1 + l;
+static bool dns_cmd_space(char c) {return c==' ' || c=='\t' || c=='\r' || c=='\n';}
+static bool dns_parse_resolver_endpoint(const char *at,const char *end,struct n_sockaddr *out) {
+    uint32_t ip=0;
+    for(unsigned part=0;part<4;part++) {
+        if(at==end || *at<'0' || *at>'9')return false;
+        unsigned octet=0;
+        do {
+            octet=octet*10+(unsigned)(*at++-'0');
+            if(octet>255)return false;
+        } while(at!=end && *at>='0' && *at<='9');
+        ip=(ip<<8)|octet;
+        if(at==end || *at++!=(part==3?':':'.'))return false;
     }
-    return 0;
+    if(at==end || *at<'0' || *at>'9')return false;
+    unsigned port=0;
+    do {
+        port=port*10+(unsigned)(*at++-'0');
+        if(port>UINT16_MAX)return false;
+    } while(at!=end && *at>='0' && *at<='9');
+    if(at!=end || !port)return false;
+    *out=(struct n_sockaddr){.ip=ip,.port=(uint16_t)port};
+    return true;
 }
 
-static int64_t dns_query(const char *name, uint32_t *out) {
-    if (parse_ip(name, out)) return 0;
-    if (!strcmp(name, "localhost")) {
-        *out = 0x7F000001;
-        return 0;
+/* Parse one native dns-server=<decimal IPv4>:<decimal port> token. Absence
+   retains DHCP; malformed or repeated settings disable the default resolver
+   rather than silently sending queries to a different DHCP-supplied server.
+   An explicit per-call resolver is independent of this boot preference. */
+static int dns_parse_boot_resolver(const char *command,struct n_sockaddr *out) {
+    const char key[]="dns-server";
+    struct n_sockaddr selected={0};bool seen=false;
+    *out=selected;
+    for(const char *at=command;*at;) {
+        while(dns_cmd_space(*at))at++;
+        const char *begin=at;
+        while(*at && !dns_cmd_space(*at))at++;
+        size_t length=(size_t)(at-begin),key_length=sizeof key-1;
+        if(length<key_length || strncmp(begin,key,key_length) ||
+           (length>key_length && begin[key_length]!='='))continue;
+        if(seen || length==key_length || !dns_parse_resolver_endpoint(begin+key_length+1,at,&selected))return -EINVAL;
+        seen=true;
     }
-    for (int i = 0; i < DNS_CACHE; i++)
-        if (dns_cache[i].expires > uptime_ms() && !strcmp(dns_cache[i].name, name)) {
-            *out = dns_cache[i].ip;
-            return 0;
+    *out=selected;
+    return seen?1:0;
+}
+static struct n_sockaddr dns_default_resolver(void) {
+    if(dns_boot_setting<0)return (struct n_sockaddr){0};
+    if(dns_boot_setting)return dns_boot_resolver;
+    return (struct n_sockaddr){.ip=my_dns,.port=53};
+}
+static void dns_configure(void) {
+    extern const char *kernel_cmdline;
+    dns_boot_setting=dns_parse_boot_resolver(kernel_cmdline,&dns_boot_resolver);
+    if(dns_boot_setting<0)kprintf("net: invalid or duplicate dns-server setting; default DNS disabled\n");
+    else if(dns_boot_setting)kprintf("net: default DNS %u.%u.%u.%u:%u (boot setting)\n",
+        dns_boot_resolver.ip>>24,(dns_boot_resolver.ip>>16)&255,(dns_boot_resolver.ip>>8)&255,
+        dns_boot_resolver.ip&255,dns_boot_resolver.port);
+}
+
+/* The cache has a byte budget and exact-size names/candidate vectors. Its
+   capacity is not a hostname length or answer-count restriction. */
+#define DNS_CACHE_BYTES (256u*1024u)
+struct dns_cache_entry {
+    struct dns_cache_entry *next;
+    uint64_t expires, used;
+    size_t bytes;
+    uint32_t count, resolver;
+    uint16_t port;
+    char *name;
+    uint32_t *ips;
+};
+static struct dns_cache_entry *dns_cache;
+static size_t dns_cache_bytes;
+struct dns_answer { uint32_t *ips, count, ttl, status; };
+static int dns_tcp_exchange(uint32_t resolver,uint16_t port,uint64_t deadline,
+                            const uint8_t *query,size_t query_len,uint8_t **reply,size_t *reply_len);
+
+static uint32_t dns_hash(const char *s) {
+    uint32_t hash=2166136261u;
+    while (*s) { hash^=(uint8_t)*s++; hash*=16777619u; }
+    return hash;
+}
+static int dns_failure(struct dns_answer *answer, unsigned status) {
+    answer->status=status;
+    answer->count=answer->ttl=0;
+    switch(status) {
+    case N_DNS_NXDOMAIN: case N_DNS_NODATA: return -ENOENT;
+    case N_DNS_SERVFAIL: return -EAGAIN;
+    case N_DNS_REFUSED: return -ECONNREFUSED;
+    case N_DNS_TIMEOUT: return -ETIMEDOUT;
+    case N_DNS_CANCELLED: return -EINTR;
+    case N_DNS_UNREACHABLE: return -EHOSTUNREACH;
+    case N_DNS_RESOURCE: return -ENOMEM;
+    default: return -EPROTO;
+    }
+}
+static unsigned dns_error_status(int error) {
+    return error==-ENOMEM?N_DNS_RESOURCE:error==-ETIMEDOUT||error==-EAGAIN?N_DNS_TIMEOUT:
+           error==-EINTR||error==-ECANCELED?N_DNS_CANCELLED:error==-EPROTO?N_DNS_FORMAT:N_DNS_UNREACHABLE;
+}
+static void dns_cache_store(const char *name,uint32_t resolver,uint16_t port,const struct dns_answer *answer) {
+    size_t namesz=strlen(name)+1, name_storage=(size_t)ALIGN_UP(namesz,sizeof(uint32_t));
+    size_t bytes=sizeof(struct dns_cache_entry)+name_storage+(size_t)answer->count*4;
+    if (!answer->ttl || bytes>DNS_CACHE_BYTES) return;
+    while (dns_cache && dns_cache_bytes+bytes>DNS_CACHE_BYTES) {
+        struct dns_cache_entry **oldest=&dns_cache;
+        for (struct dns_cache_entry **at=&dns_cache;*at;at=&(*at)->next)
+            if ((*at)->used<(*oldest)->used) oldest=at;
+        struct dns_cache_entry *old=*oldest;
+        *oldest=old->next; dns_cache_bytes-=old->bytes; kfree(old);
+    }
+    struct dns_cache_entry *entry=kmalloc(bytes);
+    if (!entry) return; /* cache allocation never fails an already valid answer */
+    entry->name=(char *)(entry+1);
+    entry->ips=(uint32_t *)((uint8_t *)(entry+1)+name_storage);
+    memcpy(entry->name,name,namesz); memcpy(entry->ips,answer->ips,(size_t)answer->count*4);
+    entry->count=answer->count; entry->bytes=bytes; entry->used=uptime_ms();
+    entry->resolver=resolver;entry->port=port;
+    uint64_t duration=(uint64_t)answer->ttl*1000;
+    entry->expires=duration>UINT64_MAX-entry->used?UINT64_MAX:entry->used+duration;
+    entry->next=dns_cache; dns_cache=entry; dns_cache_bytes+=bytes;
+}
+
+/* Hash each answer owner once. Following a CNAME chain then visits only the
+   matching owners; unrelated additional A records cannot redirect a query. */
+static int dns_parse_reply(const uint8_t *p,size_t len,const char *name,struct dns_answer *answer) {
+    if (len<12 || !(p[2]&0x80) || (p[2]&0x7a) || p[4] || p[5]!=1) return dns_failure(answer,N_DNS_FORMAT);
+    char decoded[DNS_NAME_TEXT_BYTES+1];
+    size_t offset=dns_name_decode(p,len,12,decoded);
+    if (!offset || offset+4>len || strcmp(decoded,name) || p[offset] || p[offset+1]!=1 || p[offset+2] || p[offset+3]!=1)
+        return dns_failure(answer,N_DNS_FORMAT);
+    offset+=4;
+    switch (p[3]&15) {
+    case 0: break;
+    case 2: return dns_failure(answer,N_DNS_SERVFAIL);
+    case 3: return dns_failure(answer,N_DNS_NXDOMAIN);
+    case 5: return dns_failure(answer,N_DNS_REFUSED);
+    default: return dns_failure(answer,N_DNS_FORMAT);
+    }
+    size_t an=((size_t)p[6]<<8)|p[7];
+    if (an>(len-offset)/11) return dns_failure(answer,N_DNS_FORMAT);
+    if (!an) return dns_failure(answer,N_DNS_NODATA);
+    struct dns_record { char owner[DNS_NAME_TEXT_BYTES+1], target[DNS_NAME_TEXT_BYTES+1]; uint32_t ip,ttl,next; uint16_t type; };
+    struct dns_record *records=kmalloc(MAX(an,1)*sizeof *records);
+    size_t buckets=1;
+    while (buckets<an*2+1) buckets*=2;
+    uint32_t *heads=kmalloc(buckets*sizeof *heads);
+    uint32_t *ips=kmalloc(MAX(an,1)*sizeof *ips);
+    if (!records || !heads || !ips) { kfree(records);kfree(heads);kfree(ips);return dns_failure(answer,N_DNS_RESOURCE); }
+    memset(heads,0,buckets*sizeof *heads);
+    size_t count=0;
+    int result=-EPROTO;
+    for (size_t i=0;i<an;i++) {
+        offset=dns_name_decode(p,len,offset,decoded);
+        if (!offset || offset+10>len) goto malformed;
+        unsigned type=(unsigned)p[offset]<<8|p[offset+1], cls=(unsigned)p[offset+2]<<8|p[offset+3];
+        uint32_t ttl=ip_get(p+offset+4);
+        size_t bytes=(size_t)p[offset+8]<<8|p[offset+9]; offset+=10;
+        if (bytes>len-offset) goto malformed;
+        if (cls==1 && (type==1 || type==5)) {
+            struct dns_record *rr=&records[count];
+            strcpy(rr->owner,decoded); rr->type=(uint16_t)type; rr->ttl=ttl;
+            if (type==1) { if (bytes!=4) goto malformed; rr->ip=ip_get(p+offset); }
+            else if (dns_name_decode(p,len,offset,rr->target)!=offset+bytes) goto malformed;
+            uint32_t bucket=dns_hash(rr->owner)&(buckets-1);
+            rr->next=heads[bucket]; heads[bucket]=(uint32_t)++count;
         }
-    if (!configured || !my_dns) return -ENETDOWN;
-    uint8_t q[300];
-    size_t n = 12;
-    uint16_t id = (uint16_t)rnd();
-    memset(q, 0, 12);
-    q[0] = (uint8_t)(id >> 8);
-    q[1] = (uint8_t)id;
-    q[2] = 0x01; /* recursion desired */
-    q[5] = 1;    /* one question */
-    size_t name_bytes = 0;
-    if (!dns_name_encode(name, strlen(name), q + n, sizeof q - n - 4, &name_bytes)) return -EINVAL;
-    n += name_bytes;
-    q[n++] = 0;
-    q[n++] = 1; /* A */
-    q[n++] = 0;
-    q[n++] = 1; /* IN */
-    uint8_t mac[6];
-    int r = arp_resolve(my_dns, mac);
-    if (r < 0) return r;
-    int sock = udp_alloc(0, task_process()->pid);
-    if (sock < 0) return sock;
-    udp_socks[sock]->internal=true;
-    uint64_t generation=udp_socks[sock]->generation;
-    int64_t ret = -ETIMEDOUT;
-    for (int tries = 0; tries < 3 && ret == -ETIMEDOUT; tries++) {
-        udp_output(udp_socks[sock]->port, my_dns, 53, mac, q, n);
-        uint64_t until = uptime_ms() + 2000;
-        for (;;) {
-            uint64_t now=uptime_ms();
-            if(now>=until)break;
-            int err = 0;
-            struct udp_dgram *d = udp_wait(sock, (int)(until - now), &err);
-            if (!d) {
-                if(err && err!=-EAGAIN)ret=err;
-                break;
+        offset+=bytes;
+    }
+    strcpy(decoded,name);
+    answer->ttl=UINT32_MAX;
+    for (size_t steps=0;steps<=count;steps++) {
+        const char *target=NULL;
+        for (uint32_t index=heads[dns_hash(decoded)&(buckets-1)];index;index=records[index-1].next) {
+            struct dns_record *rr=&records[index-1];
+            if (strcmp(rr->owner,decoded)) continue;
+            answer->ttl=MIN(answer->ttl,rr->ttl);
+            if (rr->type==1) {
+                bool duplicate=false;
+                for (uint32_t i=0;i<answer->count;i++) if (ips[i]==rr->ip) {duplicate=true;break;}
+                if (!duplicate) ips[answer->count++]=rr->ip;
+            } else {
+                if (target && strcmp(target,rr->target)) goto malformed;
+                target=rr->target;
             }
-            const uint8_t *p = d->data;
-            size_t len = d->len;
-            if (len < 12 || p[0] != q[0] || p[1] != q[1] || !(p[2] & 0x80)) continue;
-            if ((p[3] & 15) != 0) {
-                ret = -ENOENT;
-                break;
+        }
+        if (answer->count) {
+            if (target) goto malformed; /* CNAME cannot coexist with A */
+            answer->ips=ips;ips=NULL;answer->status=N_DNS_OK;result=0;goto done;
+        }
+        if (!target) { result=dns_failure(answer,N_DNS_NODATA);goto done; }
+        strcpy(decoded,target);
+    }
+malformed:
+    result=dns_failure(answer,N_DNS_FORMAT);
+done:
+    kfree(records);kfree(heads);kfree(ips);return result;
+}
+
+static int dns_query(const char *source,uint32_t resolver,uint16_t port,struct dns_answer *answer) {
+    memset(answer,0,sizeof *answer);
+    answer->status=N_DNS_FORMAT;
+    if(net_setup_cancelled()){dns_failure(answer,N_DNS_CANCELLED);return -ECANCELED;}
+    uint32_t literal;
+    char name[DNS_NAME_TEXT_BYTES+1];
+    size_t textlen=strlen(source);
+    if (textlen>DNS_NAME_TEXT_BYTES) return -ENAMETOOLONG;
+    uint8_t validation[DNS_NAME_WIRE_BYTES];size_t encoded=0;
+    if(!dns_name_encode(source,textlen,validation,sizeof validation,&encoded)) return dns_failure(answer,N_DNS_FORMAT);
+    for (size_t i=0;i<=textlen;i++) name[i]=(char)tolower((uint8_t)source[i]);
+    if (textlen && name[textlen-1]=='.') name[--textlen]=0;
+    if (parse_ip(name,&literal) || (!strcmp(name,"localhost") && (literal=0x7f000001))) {
+        answer->ips=kmalloc(4);if (!answer->ips) return dns_failure(answer,N_DNS_RESOURCE);
+        answer->ips[0]=literal;answer->count=1;answer->status=N_DNS_OK;return 0;
+    }
+    uint64_t now=uptime_ms();
+    for (struct dns_cache_entry **at=&dns_cache;*at;) {
+        struct dns_cache_entry *entry=*at;
+        if (entry->expires<=now) { *at=entry->next;dns_cache_bytes-=entry->bytes;kfree(entry);continue; }
+        if (entry->resolver==resolver && entry->port==port && !strcmp(entry->name,name)) {
+            answer->ips=kmalloc((size_t)entry->count*4);if (!answer->ips) return dns_failure(answer,N_DNS_RESOURCE);
+            memcpy(answer->ips,entry->ips,(size_t)entry->count*4);answer->count=entry->count;
+            answer->ttl=(uint32_t)((entry->expires-now+999)/1000);answer->status=N_DNS_OK;entry->used=now;return 0;
+        }
+        at=&entry->next;
+    }
+    if (!configured || !resolver || !port) return dns_failure(answer,N_DNS_UNREACHABLE);
+    uint8_t query[12+DNS_NAME_WIRE_BYTES+4];
+    memset(query,0,12);uint16_t id=(uint16_t)rnd();
+    query[0]=(uint8_t)(id>>8);query[1]=(uint8_t)id;query[2]=1;query[5]=1;
+    size_t bytes=0;
+    if (!dns_name_encode(name,textlen,query+12,sizeof query-16,&bytes)) return dns_failure(answer,N_DNS_FORMAT);
+    size_t query_len=12+bytes;query[query_len++]=0;query[query_len++]=1;query[query_len++]=0;query[query_len++]=1;
+    uint8_t mac[6];int result=arp_resolve(resolver,mac);
+    if (result<0) {dns_failure(answer,dns_error_status(result));return result;}
+    int sock=udp_alloc(0,task_process()->pid);if (sock<0) {dns_failure(answer,sock==-ENOMEM?N_DNS_RESOURCE:N_DNS_UNREACHABLE);return sock;}
+    udp_socks[sock]->internal=true;uint64_t generation=udp_socks[sock]->generation;
+    result=dns_failure(answer,N_DNS_TIMEOUT);
+    for (unsigned attempt=0;attempt<3 && result==-ETIMEDOUT;attempt++) {
+        if(net_setup_cancelled()){result=-ECANCELED;dns_failure(answer,N_DNS_CANCELLED);break;}
+        int sent=udp_output(udp_socks[sock]->port,resolver,port,mac,query,query_len);
+        if (sent<0) {result=sent;dns_failure(answer,N_DNS_UNREACHABLE);break;}
+        uint64_t until=uptime_ms()+2000;
+        while (uptime_ms()<until) {
+            int err=0;uint64_t tick=uptime_ms();if(tick>=until)break;uint64_t remain=until-tick;
+            struct udp_dgram *packet=udp_wait(sock,(int)remain,&err);
+            if (!packet) {if (err && err!=-EAGAIN) {result=err;dns_failure(answer,dns_error_status(err));}break;}
+            const uint8_t *p=packet->data;size_t length=packet->len;
+            if (packet->src!=resolver || packet->sport!=port || length<12 || !(p[2]&0x80) || p[0]!=query[0] || p[1]!=query[1]) continue;
+            uint8_t *tcp_reply=NULL;
+            if (p[2]&2) {
+                result=dns_tcp_exchange(resolver,port,until,query,query_len,&tcp_reply,&length);
+                if (result<0) {dns_failure(answer,dns_error_status(result));break;}
+                p=tcp_reply;
+                if (length<12 || p[0]!=query[0] || p[1]!=query[1] || (p[2]&2)) {kfree(tcp_reply);result=dns_failure(answer,N_DNS_FORMAT);break;}
             }
-            int qd = p[4] << 8 | p[5], an = p[6] << 8 | p[7];
-            size_t o = 12;
-            for (int i = 0; i < qd && o; i++) {
-                o = dns_skip_name(p, len, o);
-                if (o) o += 4;
-            }
-            ret = -ENOENT;
-            for (int i = 0; i < an && o && o < len; i++) {
-                o = dns_skip_name(p, len, o);
-                if (!o || o + 10 > len) break;
-                int type = p[o] << 8 | p[o + 1];
-                uint32_t ttl = ip_get(p + o + 4);
-                int rdlen = p[o + 8] << 8 | p[o + 9];
-                o += 10;
-                if (type == 1 && rdlen == 4 && o + 4 <= len) {
-                    *out = ip_get(p + o);
-                    /* Never cache a truncated prefix as a different hostname.
-                       Long valid names still resolve; cache size is scheduling. */
-                    if (strlen(name) < sizeof dns_cache[0].name) {
-                        int c = dns_cache_next++ % DNS_CACHE;
-                        strcpy(dns_cache[c].name, name);
-                        dns_cache[c].ip = *out;
-                        dns_cache[c].expires = uptime_ms() + (uint64_t)MIN(ttl, 3600u) * 1000;
-                    }
-                    ret = 0;
-                    break;
-                }
-                o += rdlen;
-            }
-            break;
+            if(net_setup_cancelled()){result=-ECANCELED;dns_failure(answer,N_DNS_CANCELLED);}
+            else result=dns_parse_reply(p,length,name,answer);
+            kfree(tcp_reply);
+            goto finished;
         }
     }
-    if(udp_socks[sock]->generation==generation)udp_release(udp_socks[sock]);
-    return ret;
+finished:
+    if (udp_socks[sock]->generation==generation) udp_release(udp_socks[sock]);
+    if (!result) dns_cache_store(name,resolver,port,answer);
+    return result;
 }
 
 /* ---------------------------------------------------------------- TCP */
@@ -799,11 +1063,13 @@ enum { T_FREE, T_SYN_SENT, T_ESTABLISHED, T_FIN_WAIT1, T_FIN_WAIT2, T_CLOSE_WAIT
 
 struct tcb {
     int state, err, pid;
+    unsigned io_owner; /* 0=idle, CPU index+1 owns a bounded AP ring operation */
     /* Stable metadata owns its progress waiters. One socket's ACK/data must
        not reschedule every DNS/TCP helper that is waiting on another socket. */
     struct wait_queue progress;
     bool user_open, fin_pending, fin_sent, rx_fin;
     bool window_scaled, ack_pending, progress_pending, tx_retry, probe_pending, resend_pending;
+    bool ap_output_pending; /* AP copy/window update awaiting BSP protocol output */
     uint8_t rx_shift, tx_shift;
     unsigned ack_segments;
     uint32_t rip;
@@ -830,6 +1096,9 @@ struct tcb {
     uint64_t rto_at, linger_until;
     uint64_t generation;
     int rto, retries;
+#if NET_HANDOFF_DIAG
+    uint64_t ap_enqueue_at;
+#endif
 };
 /* Closed-but-lingering tuples remain valid until TCP releases them. They
    must not occupy a fixed sixteen-slot pool and serialize unrelated fetches. */
@@ -955,26 +1224,55 @@ static void tcp_sent(struct tcb *t, uint32_t n) {
     tcp_arm(t);
 }
 
+/* Optional cooperative prefix budget, shared across the pre-RX output
+   handoff. Charge attempts, including local backpressure, to bound work. */
+struct tcp_output_budget { unsigned frames; size_t bytes; };
+static bool tcp_take_output_budget(struct tcp_output_budget *budget,uint8_t flags,size_t payload) {
+    if(!budget)return true;
+    size_t bytes=MAX((size_t)60,14+20+((flags&F_SYN)?28:20)+payload);
+    if(!budget->frames || bytes>budget->bytes)return false;
+    budget->frames--;budget->bytes-=bytes;
+    return true;
+}
+
 /* send whatever data (and FIN) the send and congestion windows allow, from snd_nxt on;
    force sends one byte into a zero window (a window probe) */
-static void tcp_push(struct tcb *t, bool force) {
+static void tcp_push_with_budget(struct tcb *t, bool force,struct tcp_output_budget *budget) {
     if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT && t->state != T_FIN_WAIT1 &&
         t->state != T_LAST_ACK && t->state != T_CLOSING)
         return;
+#if NET_HANDOFF_DIAG
+    bool handoff=t->ap_enqueue_at!=0;
+    if(handoff) {
+        uint64_t ticks=rdtsc()-t->ap_enqueue_at;t->ap_enqueue_at=0;
+        net_diag.handoffs++;net_diag.handoff_ticks+=ticks;net_diag.handoff_max=MAX(net_diag.handoff_max,ticks);
+    }
+    unsigned owner=current_task==net_diag_thread?1:current_task->is_user?0:2;
+    uint32_t submitted=0;
+#endif
     uint32_t wnd = MIN(t->snd_wnd, t->cwnd);
     if (force && wnd == 0) wnd = 1;
     t->tx_retry = false;
     t->probe_pending = force;
+    /* BSP ownership keeps tx_len, snd_una and wnd stable during this call.
+       Every successful data output advances snd_nxt by a nonzero MSS-bounded
+       prefix; storage/window exhaustion or NIC backpressure ends the loop.
+       There are no waits here, and at most one FIN follows the finite data. */
     for (;;) {
         uint32_t off = t->snd_nxt - t->snd_una; /* = bytes in flight, and the offset into tx */
         if (off < t->tx_len) {
             if (off >= wnd) break;
             uint32_t n = MIN(t->tx_len - off, MIN((uint32_t)t->mss, wnd - off));
+            if(!tcp_take_output_budget(budget,F_ACK|F_PSH,n)) {t->tx_retry=true;break;}
             if (tcp_output(t, F_ACK | F_PSH, t->snd_nxt, n)<0) break;
             tcp_sent(t, n);
+#if NET_HANDOFF_DIAG
+            submitted+=n;
+#endif
             continue;
         }
         if (t->fin_pending && off == t->tx_len && (!t->fin_sent || t->snd_nxt == t->fin_seq)) {
+            if(!tcp_take_output_budget(budget,F_FIN|F_ACK,0)) {t->tx_retry=true;break;}
             if (tcp_output(t, F_FIN | F_ACK, t->snd_nxt, 0)<0) break;
             if (!t->fin_sent) {
                 t->fin_sent = true;
@@ -989,7 +1287,12 @@ static void tcp_push(struct tcb *t, bool force) {
     /* data waiting behind a zero window: probe it from the retransmit timer */
     if (t->tx_len && t->snd_una == t->snd_max && t->snd_wnd == 0 && !t->tx_retry) tcp_arm(t);
     if (!t->tx_retry) t->probe_pending = false;
+#if NET_HANDOFF_DIAG
+    net_diag.pushes[owner]++;net_diag.push_bytes[owner]+=submitted;
+    if(handoff && !submitted)net_diag.handoff_no_output++;
+#endif
 }
+static void tcp_push(struct tcb *t,bool force) {tcp_push_with_budget(t,force,NULL);}
 
 /* retransmit the oldest unacknowledged segment */
 static void tcp_resend_first(struct tcb *t) {
@@ -1369,6 +1672,119 @@ static struct tcb *user_tcb(int h) {
     struct tcb *t=tcbs[h];
     return t && t->state!=T_FREE && t->user_open && t->pid==task_process()->pid?t:NULL;
 }
+
+/* No stack growth or demand allocation on an AP. VMM revocation already
+   retires that address space's AP runner before changing its page tables. */
+static bool ap_user_mapped(const void *pointer, size_t length, bool write) {
+    uint64_t address = (uint64_t)pointer;
+    if (address >= USER_TOP || length > USER_TOP-address) return false;
+    for (uint64_t at=ALIGN_DOWN(address,PAGE_SIZE); at<address+length; at+=PAGE_SIZE) {
+        uint64_t pte = vmm_get_pte(current_task->pml4, at);
+        if ((pte & (PTE_P|PTE_U)) != (PTE_P|PTE_U) || (write && !(pte&PTE_W))) return false;
+    }
+    return true;
+}
+
+/* Each AP owns only its own CPU-indexed counters. The DPL3 interrupt gate
+   enters with IRQs disabled; this bounded path neither enables them nor
+   waits/yields, and runner retirement/preemption happens after it returns.
+   No BSP/NMI path writes these slots. Atomic snapshot readers may race with
+   this single writer, so aligned relaxed loads/stores suffice without a
+   locked read-modify-write on every syscall, including early fallbacks. */
+static void net_ap_counter_add(uint64_t *counter,uint64_t amount) {
+    __atomic_store_n(counter,__atomic_load_n(counter,__ATOMIC_RELAXED)+amount,__ATOMIC_RELAXED);
+}
+
+bool net_ap_syscall(struct regs *regs) {
+    unsigned cpu = cpu_current_index();
+    bool send = regs->rax == SYS_TCP_SEND || regs->rax == SYS_TCP_SEND_UNTIL;
+    if (!cpu || (!send && regs->rax != SYS_TCP_RECV)) return false;
+    if (current_task->killed) return false; /* BSP performs process exit */
+    net_ap_counter_add(&net_counters.ap_calls[cpu],1);
+    if (__atomic_load_n(&net_gate_closed.value, __ATOMIC_SEQ_CST)) {ND_FALLBACK(cpu,ND_GATE);goto fallback;}
+    __atomic_fetch_add(&net_ap_active.value, 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&net_gate_closed.value, __ATOMIC_SEQ_CST)) {
+        __atomic_fetch_sub(&net_ap_active.value, 1, __ATOMIC_SEQ_CST);
+        ND_FALLBACK(cpu,ND_GATE_RACE);
+        goto fallback;
+    }
+    struct tcb *t = user_tcb((int)regs->rdi);
+    int64_t result = -EBADF;
+    bool handled = true, notify = false;
+    if (!t) goto release_gate;
+    unsigned expected = 0;
+    if (!__atomic_compare_exchange_n(&t->io_owner, &expected, cpu+1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        ND_FALLBACK(cpu,ND_OWNER);
+        handled = false; goto release_gate;
+    }
+    size_t wanted = regs->rdx;
+    if (send && regs->rax==SYS_TCP_SEND_UNTIL && (regs->r8&~(uint64_t)N_TCP_SEND_NONBLOCK)) {
+        result=-EINVAL;goto release_socket;
+    }
+    if (!wanted) { result=0; goto release_socket; }
+    if (send) {
+        bool nonblock=regs->rax==SYS_TCP_SEND_UNTIL && (regs->r8&N_TCP_SEND_NONBLOCK);
+        if (t->state!=T_ESTABLISHED && t->state!=T_CLOSE_WAIT) { result=t->err?t->err:-EPIPE; goto release_socket; }
+        if (t->fin_pending) { result=-EPIPE; goto release_socket; }
+        if (regs->rax==SYS_TCP_SEND_UNTIL && regs->r10 && uptime_ms()>=regs->r10) {
+            result=-ETIMEDOUT; goto release_socket;
+        }
+        /* Preserve the legacy send syscall's full enqueue on success. */
+        if (regs->rax==SYS_TCP_SEND && (wanted>65536 || wanted>t->tx_capacity-t->tx_len)) {
+            ND_FALLBACK(cpu,wanted>65536?ND_LEGACY_LARGE:ND_LEGACY_SPACE);handled=false;goto release_socket;
+        }
+        uint32_t n = (uint32_t)MIN(MIN(wanted, (size_t)65536), t->tx_capacity-t->tx_len);
+        if (!n) { if(nonblock)result=-EAGAIN;else {ND_FALLBACK(cpu,ND_TX_FULL);handled=false;} goto release_socket; }
+        if (!ap_user_mapped((void *)regs->rsi,n,false)) { ND_FALLBACK(cpu,ND_TX_MAP);handled=false; goto release_socket; }
+        tcp_ring_write(t->tx,t->tx_capacity,t->tx_head+t->tx_len,(void *)regs->rsi,n);
+        t->tx_len+=n;
+#if NET_HANDOFF_DIAG
+        if(!t->ap_enqueue_at)t->ap_enqueue_at=rdtsc();
+#endif
+        t->tx_retry=true; /* BSP owns segment construction, timers and NIC */
+        t->ap_output_pending=true;
+        net_ap_counter_add(&net_counters.ap_send_bytes[cpu],n);
+        result=n; notify=true;
+    } else {
+        if (!t->rx_len) {
+            if (t->rx_fin) result=0;
+            else if (t->state==T_CLOSED) result=t->err?t->err:0;
+            else if ((int)regs->r10==0) result=-EAGAIN;
+            else {ND_FALLBACK(cpu,ND_RX_WAIT);handled=false;}
+            goto release_socket;
+        }
+        uint32_t n = (uint32_t)MIN(MIN(wanted,(size_t)65536),t->rx_len);
+        if (!ap_user_mapped((void *)regs->rsi,n,true)) { ND_FALLBACK(cpu,ND_RX_MAP);handled=false; goto release_socket; }
+        tcp_ring_read((void *)regs->rsi,t->rx,t->rx_capacity,t->rx_head,n);
+        t->rx_head=(t->rx_head+n)%t->rx_capacity;
+        t->rx_len-=n;
+        uint32_t available=tcp_window(t), threshold=MIN(t->rx_capacity/2,TCP_MSS);
+        if (t->state!=T_CLOSED && available>t->adv_wnd &&
+            (!t->adv_wnd || available-t->adv_wnd>=threshold)) {
+            t->ack_pending=true;
+            t->ap_output_pending=true;
+            notify=true;
+        }
+        net_ap_counter_add(&net_counters.ap_recv_bytes[cpu],n);
+        result=n;
+    }
+release_socket:
+    __atomic_store_n(&t->io_owner,0,__ATOMIC_RELEASE);
+release_gate:
+    __atomic_fetch_sub(&net_ap_active.value,1,__ATOMIC_SEQ_CST);
+    if (!handled) goto fallback;
+    regs->rax=(uint64_t)result;
+    if (notify && !__atomic_fetch_or(&net_ap_pending.value,1u<<cpu,__ATOMIC_SEQ_CST) &&
+        __atomic_load_n(&net_ap_sleeping.value,__ATOMIC_SEQ_CST)) cpu_bsp_wake();
+    return true;
+fallback:
+    net_ap_counter_add(&net_counters.ap_fallbacks[cpu],1);
+    return false;
+}
+
+void net_ap_notify_bsp(void) {
+    if (__atomic_load_n(&net_ap_pending.value,__ATOMIC_ACQUIRE)) net_rx_notify();
+}
 static int tcp_alloc_slot(void) {
     size_t slot=0;
     while(slot<tcp_capacity && tcbs[slot] && tcbs[slot]->state!=T_FREE)slot++;
@@ -1399,11 +1815,13 @@ static uint16_t tcp_local_port(uint32_t ip,uint16_t remote) {
 }
 
 static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
+    if(net_setup_cancelled())return -ECANCELED;
     uint64_t until = uptime_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 15000);
     uint8_t mac[6];
     int r = arp_resolve_until(ip, mac, until);
     if (r < 0) return r;
     if(current_task->killed)return -EINTR;
+    if(net_setup_cancelled())return -ECANCELED;
     if(uptime_ms()>=until)return -ETIMEDOUT;
     uint16_t local=tcp_local_port(ip,port);
     if(!local)return -EADDRINUSE;
@@ -1443,14 +1861,18 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     while (t->state == T_SYN_SENT) {
         if(t->generation!=generation || !t->user_open)return -EBADF;
         uint64_t now = uptime_ms();
-        if (current_task->killed || now >= until) {
+        bool cancelled=net_setup_cancelled();
+        if (current_task->killed || cancelled || now >= until) {
             t->state = T_CLOSED;
-            t->err = current_task->killed ? -EINTR : -ETIMEDOUT;
+            t->err = current_task->killed ? -EINTR : cancelled ? -ECANCELED : -ETIMEDOUT;
             break;
         }
-        wq_wait_timeout(&t->progress, until - now);
+        net_setup_wait_timeout(&t->progress, until - now);
     }
     if(t->generation!=generation || !t->user_open)return -EBADF;
+    if(net_setup_cancelled()) {
+        tcp_reset(t,-ECANCELED);tcp_free(t);return -ECANCELED;
+    }
     if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT) {
         int err = t->err ? t->err : -ECONNREFUSED;
         tcp_free(t);
@@ -1459,52 +1881,62 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     return h;
 }
 
-static int64_t sys_tcp_send(int h, const uint8_t *buf, size_t len) {
+static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t deadline, bool user, bool nonblock) {
     struct tcb *t = user_tcb(h);
     if (!t) return -EBADF;
     uint64_t generation=t->generation;
     size_t done = 0;
     while (done < len) {
         if(t->generation!=generation || !t->user_open)return done?(int64_t)done:-EBADF;
+        if(!user && net_setup_cancelled())return done?(int64_t)done:-ECANCELED;
         if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT) return done ? (int64_t)done : (t->err ? t->err : -EPIPE);
-        if (t->fin_pending) return -EPIPE;
+        if (t->fin_pending) return done ? (int64_t)done : -EPIPE;
+        uint64_t now = uptime_ms();
+        if (current_task->killed) return done ? (int64_t)done : -EINTR;
+        if (deadline && now >= deadline) return done ? (int64_t)done : -ETIMEDOUT;
         uint32_t space = t->tx_capacity - t->tx_len;
         if (!space) {
-            if (current_task->killed) return done ? (int64_t)done : -EINTR;
-            wq_wait_timeout(&t->progress, 1000);
+            if(nonblock)return done?(int64_t)done:-EAGAIN;
+            if(!user)net_setup_wait_timeout(&t->progress, deadline ? deadline-now : 1000);
+            else net_wait_timeout(&t->progress, deadline ? deadline-now : 1000);
             continue;
         }
         uint32_t n = (uint32_t)MIN(len - done, space);
+        if(nonblock)n=MIN(n,65536u); /* bounded immediate ring enqueue */
         /* Validate exactly the chunk we will enqueue, not the entire request
            on every iteration. A late fault preserves the completed prefix. */
-        if ((uint64_t)buf>UINT64_MAX-done || !user_ok((const void *)((uint64_t)buf+done),n))
+        if ((uint64_t)buf>UINT64_MAX-done || (user && !user_ok((const void *)((uint64_t)buf+done),n)))
             return done?(int64_t)done:-EFAULT;
         tcp_ring_write(t->tx,t->tx_capacity,t->tx_head+t->tx_len,buf+done,n);
         t->tx_len += n;
         done += n;
         tcp_push(t, false);
+        if(nonblock)return (int64_t)done;
     }
     return (int64_t)done;
 }
 
-static int64_t sys_tcp_recv(int h, uint8_t *buf, size_t len, int timeout_ms) {
+static int64_t tcp_recv_data(int h, uint8_t *buf, size_t len, int timeout_ms, bool user) {
     struct tcb *t = user_tcb(h);
     if (!t) return -EBADF;
     if (!len) return 0;
     uint64_t generation=t->generation;
     uint64_t until = uptime_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0);
+    if(!user && net_setup_cancelled())return -ECANCELED;
     while (t->rx_len == 0) {
         if(t->generation!=generation || !t->user_open)return -EBADF;
+        if(!user && net_setup_cancelled())return -ECANCELED;
         if (t->rx_fin) return 0;
         if (t->state == T_CLOSED) return t->err ? t->err : 0;
         if (current_task->killed) return -EINTR;
         uint64_t now=uptime_ms();
         if (timeout_ms >= 0 && now >= until) return -EAGAIN;
-        wq_wait_timeout(&t->progress, timeout_ms < 0 ? 1000 : until - now);
+        if(!user)net_setup_wait_timeout(&t->progress, timeout_ms < 0 ? 1000 : until - now);
+        else net_wait_timeout(&t->progress, timeout_ms < 0 ? 1000 : until - now);
     }
     if(t->generation!=generation || !t->user_open)return -EBADF;
     uint32_t n = (uint32_t)MIN(len, t->rx_len);
-    if (!user_ok_w(buf,n)) return -EFAULT;
+    if (user && !user_ok_w(buf,n)) return -EFAULT;
     tcp_ring_read(buf,t->rx,t->rx_capacity,t->rx_head,n);
     t->rx_head = (t->rx_head + n) % t->rx_capacity;
     t->rx_len -= n;
@@ -1534,6 +1966,42 @@ static void tcp_close(struct tcb *t) {
     }
 }
 
+/* RFC 1035 TCP framing: two-byte length followed by exactly that many bytes.
+   Both prefix and payload share one budget; short reads are ordinary TCP. */
+static int dns_tcp_exchange(uint32_t resolver,uint16_t port,uint64_t deadline,
+                            const uint8_t *query,size_t query_len,uint8_t **reply,size_t *reply_len) {
+    *reply=NULL;*reply_len=0;
+    uint64_t now=uptime_ms();if(now>=deadline)return -ETIMEDOUT;
+    int handle=(int)sys_tcp_connect(resolver,port,(int)(deadline-now));
+    if (handle<0) return handle;
+    uint8_t prefix[2]={(uint8_t)(query_len>>8),(uint8_t)query_len};
+    int result=0;
+    long n=tcp_send_data(handle,prefix,2,deadline,false,false);
+    if (n!=2) {result=n<0?(int)n:net_setup_cancelled()?-ECANCELED:-ETIMEDOUT;goto close;}
+    n=tcp_send_data(handle,query,query_len,deadline,false,false);
+    if (n!=(long)query_len) {result=n<0?(int)n:net_setup_cancelled()?-ECANCELED:-ETIMEDOUT;goto close;}
+    size_t done=0;
+    while (done<2) {
+        uint64_t now=uptime_ms();if (now>=deadline) {result=-ETIMEDOUT;goto close;}
+        n=tcp_recv_data(handle,prefix+done,2-done,(int)(deadline-now),false);
+        if (n<=0) {result=n<0?(int)n:-EPROTO;goto close;} done+=(size_t)n;
+    }
+    size_t length=(size_t)prefix[0]<<8|prefix[1];
+    if (length<12) {result=-EPROTO;goto close;}
+    uint8_t *response=kmalloc(length);if (!response) {result=-ENOMEM;goto close;}
+    done=0;
+    while (done<length) {
+        uint64_t now=uptime_ms();if (now>=deadline) {result=-ETIMEDOUT;break;}
+        n=tcp_recv_data(handle,response+done,length-done,(int)(deadline-now),false);
+        if (n<=0) {result=n<0?(int)n:-EPROTO;break;} done+=(size_t)n;
+    }
+    if (!result) {*reply=response;*reply_len=length;} else kfree(response);
+close:
+    if (result) tcp_reset(tcbs[handle],result);
+    tcp_close(tcbs[handle]);
+    return result;
+}
+
 /* ---------------------------------------------------------------- input dispatch, thread, syscalls */
 
 static void eth_input(const void *packet, size_t len) {
@@ -1542,6 +2010,7 @@ static void eth_input(const void *packet, size_t len) {
     const struct eth_hdr *e = (const struct eth_hdr *)p;
     if (memcmp(e->dst, nif->mac, 6) != 0 && !(e->dst[0] & 1)) return; /* not for us (promiscuous NICs) */
     rx_packets++;
+    net_service_bytes+=len;
     uint16_t type = ntohs(e->type);
     if (type == 0x0806) arp_input(p + 14, len - 14);
     else if (type == 0x0800) {
@@ -1561,16 +2030,88 @@ static void eth_input(const void *packet, size_t len) {
     }
 }
 
+/* BSP-owned protocol output. APs only mark pending state while holding the
+   data-plane gate; they never call the NIC or mutate protocol timers. */
+static void tcp_flush_pending(bool ap_only) {
+    struct tcp_output_budget prefix={64,128u*1024u};
+    struct tcp_output_budget *budget=ap_only?&prefix:NULL;
+    for (size_t i=0;i<tcp_capacity;i++) {
+        struct tcb *t = tcbs[i];
+        if (!t || t->state==T_FREE || t->state==T_CLOSED) continue;
+        if(ap_only && !t->ap_output_pending)continue;
+        /* A prefix yield leaves all remaining state for the ordinary flush
+           after RX; the optional early pass never drains every stream's
+           whole storage/window before making receive progress. */
+        if(budget && !budget->frames)break;
+        t->ap_output_pending=false;
+        if (t->state==T_SYN_SENT && t->tx_retry) {
+            if(!tcp_take_output_budget(budget,F_SYN,0))break;
+            if (!tcp_output(t,F_SYN,t->iss,0)) {
+                t->snd_nxt = t->snd_max = t->iss+1;
+                t->tx_retry = false;
+                tcp_arm(t);
+            }
+        } else {
+            if (t->ack_pending) {
+                if(!tcp_take_output_budget(budget,F_ACK,0))break;
+                tcp_output(t,F_ACK,t->snd_nxt,0);
+            }
+            if (t->resend_pending) {
+                size_t n=MIN(t->tx_len,(uint32_t)t->mss);
+                if(!tcp_take_output_budget(budget,F_ACK,n))break;
+                tcp_resend_first(t);
+            }
+            if (t->tx_retry && !t->resend_pending) tcp_push_with_budget(t,t->probe_pending,budget);
+        }
+    }
+}
+
 static void net_thread(void *arg) {
     (void)arg;
     uint64_t last_tick = 0;
+    /* Several short NIC batches may share one bounded service window. A
+       no-work wait is already a scheduler boundary; do not first requeue the
+       net task only to run it again and block immediately afterwards. */
+    uint64_t service_started=0,service_start_bytes=0;
+    bool serviced=false;
     for (;;) {
         uint64_t f = irq_save();
-        if (rxq_tail == rxq_head && !net_work_pending && (!nif->rx_pending || !nif->rx_pending()))
+        /* SC arm -> pending recheck pairs with AP publish -> armed recheck:
+           both sides cannot observe zero. IRQs stay off from this condition
+           through wq enrollment, so an AP doorbell delivered after the check
+           wakes an enrolled consumer. A runnable consumer needs no new IPI. */
+        __atomic_store_n(&net_ap_sleeping.value,1,__ATOMIC_SEQ_CST);
+        bool rx_ready=rxq_tail!=rxq_head || (nif->rx_pending && nif->rx_pending());
+        bool ready=rx_ready || net_work_pending || __atomic_load_n(&net_ap_pending.value,__ATOMIC_SEQ_CST);
+        bool waited=!ready;
+        if (!ready)
             wq_wait_timeout(&rxq_wq, 50);
+        __atomic_store_n(&net_ap_sleeping.value,0,__ATOMIC_SEQ_CST);
         net_work_pending = false;
         irq_restore(f);
+        uint64_t now=uptime_ms(); /* one clock read per bounded NIC batch */
+        if(waited || !serviced) {
+            service_started=now;service_start_bytes=net_service_bytes;serviced=false;
+        } else if(now-service_started>=2 || net_service_bytes-service_start_bytes>=256u*1024u) {
+            /* Honor timer/priority rescheduling at this maximum 2ms service
+               window (or earlier byte boundary). Each NIC poll is bounded,
+               and the AP gate is open before scheduling another task. */
+#if NET_HANDOFF_DIAG
+            net_diag.yields++;if(need_resched)net_diag.yield_resched++;if(rx_ready)net_diag.yield_pending++;
+            if(!ready)net_diag.yield_idle++;
+            if(current_task->sched_level<4)net_diag.yield_level[current_task->sched_level]++;
+#endif
+            sched_yield();
+            service_started=uptime_ms();service_start_bytes=net_service_bytes;serviced=false;
+        }
+        net_bsp_enter();
+        uint32_t ap_pending=__atomic_exchange_n(&net_ap_pending.value, 0, __ATOMIC_SEQ_CST);
         receive_batch = true;
+        /* A completed AP copy/window update should reach the BSP-owned wire
+           before draining an unrelated RX batch. Ordinary NIC-only turns do
+           not pay another connection scan. RX may create new pending output,
+           so retain the shared end-of-drain flush below. */
+        if(ap_pending)tcp_flush_pending(true);
         if (nif->poll_rx) nif->poll_rx(eth_input);
         while (rxq_tail != rxq_head) {
             eth_input(rxq_buf[rxq_tail], rxq_len[rxq_tail]);
@@ -1579,21 +2120,7 @@ static void net_thread(void *arg) {
         /* End-of-drain ACK and per-socket readiness, once per connection.
            Resource-blocked sends retry on NIC completion, not a fictitious
            packet loss/retransmission timeout. */
-        for (size_t i=0;i<tcp_capacity;i++) {
-            struct tcb *t = tcbs[i];
-            if (!t || t->state==T_FREE || t->state==T_CLOSED) continue;
-            if (t->state==T_SYN_SENT && t->tx_retry) {
-                if (!tcp_output(t,F_SYN,t->iss,0)) {
-                    t->snd_nxt = t->snd_max = t->iss+1;
-                    t->tx_retry = false;
-                    tcp_arm(t);
-                }
-            } else {
-                if (t->ack_pending) tcp_output(t,F_ACK,t->snd_nxt,0);
-                if (t->resend_pending) tcp_resend_first(t);
-                if (t->tx_retry && !t->resend_pending) tcp_push(t,t->probe_pending);
-            }
-        }
+        tcp_flush_pending(false);
         receive_batch = false;
         for (size_t i=0;i<tcp_capacity;i++) {
             struct tcb *t = tcbs[i];
@@ -1604,6 +2131,8 @@ static void net_thread(void *arg) {
             dhcp_tick();
             tcp_tick();
         }
+        net_bsp_leave();
+        serviced=true;
     }
 }
 
@@ -1638,21 +2167,28 @@ static void tcp_buffer_configure(void) {
 }
 
 void net_init(void) {
+    dns_configure();
     tcp_buffer_configure();
     if (!netvsc_probe() && !e1000_probe() && !tulip_probe()) {
         kprintf("net: no supported network card\n");
         return;
     }
+#if NET_HANDOFF_DIAG
+    net_diag_thread=kthread_create("net", net_thread, NULL);
+#else
     kthread_create("net", net_thread, NULL);
+#endif
     dhcp_start();
 }
 
 void net_process_exit(int pid) {
+    net_bsp_enter();
     if (pid == fault_pid) fault_pid = 0;
     for(size_t i=0;i<udp_capacity;i++)
         if(udp_socks[i] && udp_socks[i]->used && udp_socks[i]->pid==pid)udp_release(udp_socks[i]);
     for(size_t i=0;i<tcp_capacity;i++)
         if(tcbs[i] && tcbs[i]->state!=T_FREE && tcbs[i]->user_open && tcbs[i]->pid==pid)tcp_close(tcbs[i]);
+    net_bsp_leave();
 }
 
 bool net_config(uint8_t mac[6], uint32_t *ip, uint32_t *mask, uint32_t *gw, uint32_t *dns) {
@@ -1661,12 +2197,29 @@ bool net_config(uint8_t mac[6], uint32_t *ip, uint32_t *mask, uint32_t *gw, uint
     *ip = my_ip;
     *mask = my_mask;
     *gw = my_gw;
-    *dns = my_dns;
+    *dns = dns_default_resolver().ip;
     return configured;
 }
 
-int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
+static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
     switch (num) {
+    case SYS_NET_SETUP_CANCEL_CHANNEL: {
+        int fd=(int)a;
+        if(fd < -1)return -EINVAL;
+        struct file *file=NULL;
+        if(fd>=0) {
+            uint64_t flags=irq_save();
+            struct task *owner=task_process();
+            if((size_t)fd<owner->fd_capacity)file=owner->fds[fd];
+            if(!file){irq_restore(flags);return -EBADF;}
+            if(file->vn->type!=VT_CHANNEL || !file->vn->ops || !file->vn->ops->hangup){irq_restore(flags);return -EINVAL;}
+            vfs_dup(file);irq_restore(flags);
+        }
+        struct file *old=current_task->net_setup_cancel_file;
+        current_task->net_setup_cancel_file=file;
+        if(old)vfs_close(old);
+        return 0;
+    }
     case SYS_NET_INFO: {
         struct n_netinfo *ni = (struct n_netinfo *)a;
         if (!user_ok_w(ni, sizeof *ni)) return -EFAULT;
@@ -1678,7 +2231,7 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
         ip_put(ni->ip, my_ip);
         ip_put(ni->mask, my_mask);
         ip_put(ni->gateway, my_gw);
-        ip_put(ni->dns, my_dns);
+        ip_put(ni->dns, dns_default_resolver().ip);
         ni->rx_packets = rx_packets;
         ni->tx_packets = tx_packets;
         strlcpy(ni->driver, nif->driver, sizeof ni->driver);
@@ -1692,11 +2245,35 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
         char *name = NULL;
         int r = dns_user_name_copy((const char *)a, &name);
         if (r < 0) return r;
-        uint32_t ip = 0;
-        int64_t ret = dns_query(name, &ip);
+        struct dns_answer answer;
+        struct n_sockaddr resolver=dns_default_resolver();
+        int64_t ret = dns_query(name, resolver.ip, resolver.port, &answer);
         kfree(name);
-        if (ret == 0) *(uint32_t *)b = ip;
+        if (ret == 0) {
+            if (!user_ok_w((void *)b,4)) ret=-EFAULT;
+            else *(uint32_t *)b = answer.ips[0];
+        }
+        kfree(answer.ips);
         return ret;
+    }
+    case SYS_NET_DNS_ALL: {
+        struct n_dns_result *out=(struct n_dns_result *)d;
+        if (!user_ok_w(out,sizeof *out) || c>SIZE_MAX/sizeof(uint32_t) || !user_ok_w((void *)b,c*sizeof(uint32_t))) return -EFAULT;
+        *out=(struct n_dns_result){.version=1,.status=N_DNS_FORMAT};
+        char *name=NULL;int result=dns_user_name_copy((const char *)a,&name);
+        if (result<0) return result;
+        struct n_sockaddr resolver=dns_default_resolver();
+        if (e) {
+            if (!user_ok((void *)e,sizeof resolver)) {kfree(name);return -EFAULT;}
+            resolver=*(const struct n_sockaddr *)e;
+        }
+        struct dns_answer answer;
+        result=dns_query(name,resolver.ip,resolver.port,&answer);kfree(name);
+        /* A sibling may revoke user pages while resolution blocks. */
+        if (!user_ok_w(out,sizeof *out) || !user_ok_w((void *)b,MIN(c,(size_t)answer.count)*sizeof(uint32_t))) {kfree(answer.ips);return -EFAULT;}
+        *out=(struct n_dns_result){.version=1,.status=answer.status,.count=answer.count,.ttl=answer.ttl};
+        if (!result && c) memcpy((void *)b,answer.ips,MIN(c,(size_t)answer.count)*sizeof(uint32_t));
+        kfree(answer.ips);return result;
     }
     case SYS_UDP_SOCKET:
         if (!nif) return -ENETDOWN;
@@ -1742,8 +2319,48 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
     case SYS_TCP_CONNECT:
         if (!nif) return -ENETDOWN;
         return sys_tcp_connect((uint32_t)a, (uint16_t)b, (int)c);
-    case SYS_TCP_SEND: return sys_tcp_send((int)a, (const uint8_t *)b, c);
-    case SYS_TCP_RECV: return sys_tcp_recv((int)a, (uint8_t *)b, c, (int)d);
+    case SYS_TCP_SEND: return tcp_send_data((int)a, (const uint8_t *)b, c, 0, true, false);
+    case SYS_TCP_SEND_UNTIL:
+        if(e&~(uint64_t)N_TCP_SEND_NONBLOCK)return -EINVAL;
+        return tcp_send_data((int)a, (const uint8_t *)b, c, d, true, (e&N_TCP_SEND_NONBLOCK)!=0);
+    case SYS_TCP_CANCEL: {
+        struct tcb *t = user_tcb((int)a);
+        if (!t) return -EBADF;
+        tcp_reset(t, -ECANCELED);
+        /* Aborted bytes are never exposed by a later receive and unsent
+           prefixes are never emitted after cancellation. */
+        t->rx_len=t->tx_len=0;t->nooo=0;
+        return 0;
+    }
+    case SYS_NET_STATS: {
+        struct n_netstats *out = (struct n_netstats *)a;
+        if (!user_ok_w(out, sizeof *out)) return -EFAULT;
+        memset(out,0,sizeof *out);
+        out->rx_dropped=net_counters.rx_dropped;
+        out->rx_invalid=net_counters.rx_invalid;
+        out->rx_ring_high_water=net_counters.rx_ring_high_water;
+        for (unsigned cpu=1;cpu<CPU_MAX_COUNT;cpu++) {
+            out->ap_send_bytes[cpu]=__atomic_load_n(&net_counters.ap_send_bytes[cpu],__ATOMIC_RELAXED);
+            out->ap_recv_bytes[cpu]=__atomic_load_n(&net_counters.ap_recv_bytes[cpu],__ATOMIC_RELAXED);
+            out->ap_calls[cpu]=__atomic_load_n(&net_counters.ap_calls[cpu],__ATOMIC_RELAXED);
+            out->ap_fallbacks[cpu]=__atomic_load_n(&net_counters.ap_fallbacks[cpu],__ATOMIC_RELAXED);
+        }
+        if (nif && nif->get_stats) nif->get_stats(out);
+#if NET_HANDOFF_DIAG
+        uint64_t fallback[ND_REASONS]={0};
+        for(unsigned cpu=1;cpu<CPU_MAX_COUNT;cpu++)for(unsigned reason=0;reason<ND_REASONS;reason++)
+            fallback[reason]+=__atomic_load_n(&net_diag.fallback[cpu][reason],__ATOMIC_RELAXED);
+        kprintf("NETDIAG hz=%lu fb=%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu/%lu gate=%lu/%lu/%lu handoff=%lu/%lu/%lu/noout%lu yield=%lu/resched%lu/pending%lu/idle%lu level=%lu/%lu/%lu/%lu push=%lu/%lu/%lu bytes=%lu/%lu/%lu\n",
+                tsc_hz,fallback[0],fallback[1],fallback[2],fallback[3],fallback[4],fallback[5],fallback[6],fallback[7],fallback[8],
+                net_diag.gate_joins,net_diag.gate_ticks,net_diag.gate_max,
+                net_diag.handoffs,net_diag.handoff_ticks,net_diag.handoff_max,net_diag.handoff_no_output,
+                net_diag.yields,net_diag.yield_resched,net_diag.yield_pending,net_diag.yield_idle,
+                net_diag.yield_level[0],net_diag.yield_level[1],net_diag.yield_level[2],net_diag.yield_level[3],
+                net_diag.pushes[0],net_diag.pushes[1],net_diag.pushes[2],net_diag.push_bytes[0],net_diag.push_bytes[1],net_diag.push_bytes[2]);
+#endif
+        return 0;
+    }
+    case SYS_TCP_RECV: return tcp_recv_data((int)a, (uint8_t *)b, c, (int)d, true);
     case SYS_NET_TEST: {
         /* a: fault settings for this process's TCP connections (or NULL); b: counters out (or NULL) */
         if (a) {
@@ -1765,4 +2382,11 @@ int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uin
     }
     }
     return -ENOSYS;
+}
+
+int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
+    net_bsp_enter();
+    int64_t result = net_syscall_inner(num, a, b, c, d, e);
+    net_bsp_leave();
+    return result;
 }

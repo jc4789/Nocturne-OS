@@ -13,6 +13,7 @@ uint64_t uptime_ms(void){return 0;}
 long ns_read(net_stream *s,void *data,size_t n){abort();}
 const char *ns_error(net_stream *s){abort();}
 void ns_close(net_stream *s){abort();}
+#include "http_mock_lifecycle.h"
 int http_inflate(char *out,int cap,const char *in,int len,int *consumed){abort();}
 static unsigned checks,failed;
 static void check(bool ok,const char *name){checks++;if(!ok){failed++;printf("FAIL %s\n",name);}}

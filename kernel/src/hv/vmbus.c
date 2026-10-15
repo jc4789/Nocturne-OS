@@ -426,18 +426,21 @@ int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, 
     return 0;
 }
 
-void vmbus_gpadl_teardown(struct vmbus_channel *ch, uint32_t gpadl) {
+bool vmbus_gpadl_teardown(struct vmbus_channel *ch, uint32_t gpadl) {
     uint32_t m[2 + 2] = {CHMSG_GPADL_TEARDOWN, 0, ch->relid, gpadl};
-    if (!request(m, sizeof m, CHMSG_GPADL_TORNDOWN, gpadl, 3000))
+    if (!request(m, sizeof m, CHMSG_GPADL_TORNDOWN, gpadl, 3000)) {
         kprintf("vmbus: GPADL %x teardown timed out\n", gpadl);
+        return false;
+    }
+    return true;
 }
 
-void vmbus_close(struct vmbus_channel *ch) {
-    if (!ch->opened) return;
+static bool close_channel(struct vmbus_channel *ch, bool require_ack) {
+    if (!ch->opened) return false;
     uint64_t f = irq_save();
     ch->opened = false; /* no more callbacks */
     irq_restore(f);
-    bool ok = true;
+    bool ok = !require_ack;
     if (!ch->rescinded) {
         uint32_t m[2 + 1] = {CHMSG_CLOSE, 0, ch->relid};
         post(m, sizeof m);
@@ -445,14 +448,20 @@ void vmbus_close(struct vmbus_channel *ch) {
         ok = request(t, sizeof t, CHMSG_GPADL_TORNDOWN, ch->ring_gpadl, 3000);
         if (!ok) kprintf("vmbus: GPADL %x teardown timed out\n", ch->ring_gpadl);
     }
-    /* if the teardown failed the host may still write there: leak the pages rather than reuse them */
+    /* Drivers with explicit GPADL ownership do not infer a teardown ACK from
+       rescind. Preserve the existing close contract for other drivers. */
     if (ok) {
         uint64_t pa = hhdm_virt_to_phys(ch->ring);
         for (uint32_t i = 0; i < ch->ring_pages_out + ch->ring_pages_in; i++) pmm_free(pa + (uint64_t)i * PAGE_SIZE);
     }
+    else kprintf("vmbus: preserving ring GPADL %x without teardown ACK\n", ch->ring_gpadl);
     ch->ring = NULL;
     ch->ring_gpadl = 0;
+    return ok;
 }
+
+void vmbus_close(struct vmbus_channel *ch) { close_channel(ch, false); }
+bool vmbus_close_confirmed(struct vmbus_channel *ch) { return close_channel(ch, true); }
 
 void vmbus_release(struct vmbus_channel *ch) {
     uint64_t f = irq_save();
@@ -481,16 +490,28 @@ static void ring_copy_in(struct vmbus_channel *ch, uint32_t *pos, const void *sr
 
 static int ring_write(struct vmbus_channel *ch, const void *a, uint32_t alen, const void *b, uint32_t blen) {
     if (!ch->opened || ch->rescinded) return -EIO;
+    if (alen > UINT32_MAX - blen || alen + blen > UINT32_MAX - 15) return -E2BIG;
     uint32_t len = alen + blen;
     uint32_t aligned = (uint32_t)ALIGN_UP(len, 8);
     uint32_t need = aligned + 8;
+    if (need >= ch->out_size) return -E2BIG;
     uint64_t f = irq_save();
     uint32_t w = ch->out->write_index, r = ch->out->read_index;
     uint32_t avail = w >= r ? ch->out_size - (w - r) : r - w;
     if (avail <= need) {
-        irq_restore(f);
-        return -EAGAIN;
+        /* Ask the host for a progress event instead of spinning in the IRQ
+           callback. Publish before rechecking: otherwise a read racing this
+           full check could leave a blocked writer with no subsequent edge. */
+        ch->out->pending_send_sz = MAX(ch->out->pending_send_sz, need);
+        hv_mb();
+        r = ch->out->read_index;
+        avail = w >= r ? ch->out_size - (w - r) : r - w;
+        if (avail <= need) {
+            irq_restore(f);
+            return -EAGAIN;
+        }
     }
+    if (avail > ch->out->pending_send_sz) ch->out->pending_send_sz = 0;
     uint32_t pos = w;
     ring_copy_in(ch, &pos, a, alen);
     if (blen) ring_copy_in(ch, &pos, b, blen);
@@ -558,4 +579,16 @@ int vmbus_recv(struct vmbus_channel *ch, void *buf, uint32_t len) {
     irq_restore(f);
     if (signal) hv_signal_event(ch->conn_id);
     return ret;
+}
+
+bool vmbus_rx_pending(struct vmbus_channel *ch) {
+    return ch && ch->opened && !ch->rescinded && ch->in->read_index != ch->in->write_index;
+}
+
+bool vmbus_write_ready(struct vmbus_channel *ch, uint32_t packet_len) {
+    if (!ch || !ch->opened || ch->rescinded || packet_len > UINT32_MAX - 15) return false;
+    uint32_t need = (uint32_t)ALIGN_UP(packet_len, 8) + 8;
+    uint32_t w = ch->out->write_index, r = ch->out->read_index;
+    uint32_t avail = w >= r ? ch->out_size - (w - r) : r - w;
+    return avail > need;
 }

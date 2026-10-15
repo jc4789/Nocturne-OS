@@ -1,4 +1,4 @@
-/* One browser request per process. DNS, TCP and verified TLS never run on the GUI task. */
+/* Persistent isolated browser transport. DNS, TCP and verified TLS never run on the GUI task. */
 #include "nocturne.h"
 #include "http.h"
 #include "web.h"
@@ -13,10 +13,14 @@
 #include "browser_identity.h"
 
 struct header_buffer { char *p; size_t length, capacity; };
+struct cache_entry;
+static volatile uint32_t service_stopping;
 struct job {
     struct webnet_wire_request wire;
     char *url, *document, *method, *headers, *request_body;
     char *origin, *target_origin;
+    char *top_level_url,*top_origin;
+    bool top_opaque,top_prepared;
     char *referrer,*referrer_origin;
     int referrer_policy;
     char *final_url;
@@ -40,11 +44,32 @@ struct job {
     uint64_t debug_header_bytes, debug_ctl, debug_non_ascii;
     struct http_transport_timing debug_timing;
     unsigned debug_attempts;
+    int input, output;
+    char *partition;
+    struct cache_entry *cached;
+    struct header_buffer cache_body;
+    bool cache_capture, cache_replay;
+    size_t output_credit;
+    size_t input_consumed;
 };
+/* NAVIGATION is also the transport kind for iframe HTML. Only native chrome's
+   explicit top-navigation flag changes the enclosing partition to a new hop. */
+static bool top_level_navigation(const struct job *j) {
+    return j->wire.kind==WEBNET_NAVIGATION&&(j->wire.user_navigation&WEBNET_WIRE_USER_NAVIGATION)!=0;
+}
+static bool cache_context_allowed(const struct job *j) {
+    return top_level_navigation(j)||(j->origin&&!j->top_opaque);
+}
 static bool read_all(int fd, void *p, size_t n) {
     while (n) {
         ssize_t k = read(fd, p, n);
         if (k < 0 && errno == EINTR) continue;
+        if(k<0&&errno==EAGAIN){
+            if(__atomic_load_n(&service_stopping,__ATOMIC_ACQUIRE))return false;
+            struct n_pollfd ready={fd,N_POLLIN,0};
+            if(poll(&ready,1,100)<0||ready.revents&N_POLLHUP)return false;
+            continue;
+        }
         if (k <= 0) return false;
         p = (char *)p + k; n -= k;
     }
@@ -59,11 +84,68 @@ static bool write_all(int fd, const void *p, size_t n) {
     }
     return true;
 }
-static char *read_string(uint32_t len, bool binary) {
+static int request_cancelled(void *opaque) {
+    struct job *j=opaque;
+    if(uptime_ms()>=j->wire.deadline)return 1;
+    if(!(j->wire.user_navigation&WEBNET_WIRE_SERVICE))return 0;
+    if(__atomic_load_n(&service_stopping,__ATOMIC_ACQUIRE))return 1;
+    struct n_pollfd peer={j->input,0,0};
+    return poll(&peer,1,0)<0||(peer.revents&N_POLLHUP)!=0;
+}
+static bool job_write(struct job *j,const void *data,size_t length) {
+    if(!(j->wire.user_navigation&WEBNET_WIRE_SERVICE))return write_all(j->output,data,length);
+    const char *p=data;
+    while(length){
+        if(request_cancelled(j))return false;
+        if(!j->output_credit){
+            struct n_pollfd peer={j->input,N_POLLIN,0};
+            int wait=(int)MIN(j->wire.deadline-uptime_ms(),100u);
+            if(poll(&peer,1,wait)<0)return false;
+            if(peer.revents&N_POLLHUP)return false;
+            if(!(peer.revents&N_POLLIN))continue;
+            struct webnet_wire_credit credit;
+            if(!read_all(j->input,&credit,sizeof credit)||credit.magic!=WEBNET_CREDIT_MAGIC||
+               credit.id!=j->wire.id||!credit.bytes||credit.bytes>WEBNET_SERVICE_WINDOW)return false;
+            j->output_credit=credit.bytes;
+        }
+        size_t count=MIN(length,j->output_credit);
+        if(!write_all(j->output,p,count))return false;
+        p+=count;length-=count;j->output_credit-=count;
+    }
+    return true;
+}
+static bool job_read_all(struct job *j,void *data,size_t length) {
+    char *p=data;
+    while(length){
+        if(request_cancelled(j))return false;
+        if(j->wire.user_navigation&WEBNET_WIRE_SERVICE){
+            struct n_pollfd peer={j->input,N_POLLIN,0};
+            int wait=(int)MIN(j->wire.deadline-uptime_ms(),100u);
+            if(poll(&peer,1,wait)<0||peer.revents&N_POLLHUP)return false;
+            if(!(peer.revents&N_POLLIN))continue;
+        }
+        size_t count=MIN(length,WEBNET_SERVICE_CREDIT_STEP);
+        ssize_t got=read(j->input,p,count);
+        if(got<0&&(errno==EINTR||errno==EAGAIN))continue;
+        if(got<=0)return false;
+        p+=got;length-=(size_t)got;
+        if(j->wire.user_navigation&WEBNET_WIRE_SERVICE){
+            j->input_consumed+=(size_t)got;
+            if(j->input_consumed>=WEBNET_SERVICE_CREDIT_STEP){
+                struct webnet_wire_response frame={0};frame.magic=WEBNET_STREAM_REQUEST_CREDIT;
+                frame.id=j->wire.id;frame.generation=j->wire.generation;frame.status=(uint32_t)j->input_consumed;
+                if(!write_all(j->output,&frame,sizeof frame))return false;
+                j->input_consumed=0;
+            }
+        }
+    }
+    return true;
+}
+static char *read_string(struct job *j, uint32_t len, bool binary) {
     if ((uint64_t)len + 1 > SIZE_MAX) return NULL;
     char *p = malloc((size_t)len + 1);
     if (!p) return NULL;
-    if (!read_all(0, p, len) || (!binary && memchr(p, 0, len))) { free(p); return NULL; }
+    if (!job_read_all(j, p, len) || (!binary && memchr(p, 0, len))) { free(p); return NULL; }
     p[len] = 0; return p;
 }
 static bool fail(struct job *j, const char *message) {
@@ -289,7 +371,7 @@ static bool load_file(struct job *j) {
     char *path=NULL,*document_path=NULL;int parsed=file_path(j->url,&path);bool ok=false;
     if(parsed!=1)return fail(j,parsed<0?"Out of memory preparing local URL":"Invalid local URL");
     if(j->wire.kind==WEBNET_NAVIGATION){
-        if(!(j->wire.user_navigation&WEBNET_WIRE_USER_NAVIGATION)){fail(j,"Only a user navigation may open a local file");goto out;}
+        if(!top_level_navigation(j)){fail(j,"Only a user navigation may open a local file");goto out;}
     }else{
         parsed=file_path(j->document,&document_path);
         if(parsed!=1){fail(j,parsed<0?"Out of memory preparing local document URL":"Remote pages cannot open local files");goto out;}
@@ -364,19 +446,44 @@ static bool field_exists(const char *headers, const char *name) {
     }
     return false;
 }
+/* Iterate every field occurrence in wire order. Values retain their complete
+   bytes after the colon (including OWS); a duplicate is never an absent field.
+   Singleton security lookups below deliberately reject multiple occurrences,
+   while cache identity uses the complete ordered sequence. */
+static bool field_value_next(const char **cursor,const char *name,size_t name_length,
+                             const char **value,size_t *length) {
+    const char *p=*cursor;
+    while(*p){
+        const char *end=strstr(p,"\r\n");if(!end)end=p+strlen(p);
+        const char *next=*end?end+2:end;
+        if((size_t)(end-p)>name_length&&p[name_length]==':'&&!strncasecmp(p,name,name_length)){
+            *cursor=next;*value=p+name_length+1;*length=(size_t)(end-*value);return true;
+        }
+        p=next;
+    }
+    *cursor=p;*value=NULL;*length=0;return false;
+}
+static bool field_values_equal(const char *left,const char *right,const char *name,size_t name_length) {
+    for(;;){
+        const char *a,*b;size_t al,bl;
+        bool ha=field_value_next(&left,name,name_length,&a,&al);
+        bool hb=field_value_next(&right,name,name_length,&b,&bl);
+        if(ha!=hb)return false;
+        if(!ha)return true;
+        if(al!=bl||memcmp(a,b,al))return false;
+    }
+}
 /* Strict response field lookup: security-critical singleton fields cannot be duplicated. */
 static bool field_slice(const char *headers, const char *name, const char **out, size_t *length) {
     size_t nl = strlen(name); bool found = false;
     *out = NULL; *length = 0;
-    for (const char *p = headers; *p;) {
-        const char *end = strstr(p, "\r\n"); if (!end) end = p + strlen(p);
-        if ((size_t)(end - p) > nl && p[nl] == ':' && !strncasecmp(p, name, nl)) {
-            if (found) { *out = NULL; *length = 0; return false; }
-            const char *v = p + nl + 1; while (v < end && (*v == ' ' || *v == '\t')) v++;
-            const char *ve = end; while (ve > v && (ve[-1] == ' ' || ve[-1] == '\t')) ve--;
-            *out = v; *length = (size_t)(ve - v); found = true;
-        }
-        p = *end ? end + 2 : end;
+    const char *v;size_t n;
+    while(field_value_next(&headers,name,nl,&v,&n)){
+        if(found){*out=NULL;*length=0;return false;}
+        const char *end=v+n;
+        while(v<end&&(*v==' '||*v=='\t'))v++;
+        while(end>v&&(end[-1]==' '||end[-1]=='\t'))end--;
+        *out=v;*length=(size_t)(end-v);found=true;
     }
     return found;
 }
@@ -386,6 +493,301 @@ static bool field(const char *headers, const char *name, char *out, size_t cap) 
     out[0] = 0;
     if (!field_slice(headers, name, &value, &length) || length >= cap) return false;
     memcpy(out, value, length); out[length] = 0; return true;
+}
+/* Private HTTP cache shared by the transport's request threads. Entries become
+   visible only after a complete, successful representation. The 16 MiB quota
+   limits retained cache memory, never the response accepted by Fetch. Requests
+   own snapshots: eviction/revalidation cannot invalidate a paused stream. */
+#define FETCH_CACHE_BYTES (16u * 1024u * 1024u)
+#define FETCH_CACHE_OBJECT (2u * 1024u * 1024u)
+struct cache_entry {
+    struct cache_entry *next;
+    char *url, *partition, *request_headers, *headers, *reason, *body;
+    size_t body_len, charge;
+    int status;
+    uint64_t stored_ms, age_seconds, lifetime_seconds;
+    bool no_cache, must_revalidate;
+};
+static struct cache_entry *cache_entries;
+static size_t cache_bytes;
+static volatile uint32_t cache_lock_word;
+static void cache_lock(void) {
+    while (__atomic_exchange_n(&cache_lock_word, 1, __ATOMIC_ACQUIRE))
+        wait_on_address(&cache_lock_word, 1, UINT_MAX);
+}
+static void cache_unlock(void) {
+    __atomic_store_n(&cache_lock_word, 0, __ATOMIC_RELEASE);
+    wake_address(&cache_lock_word, 1);
+}
+static void cache_free(struct cache_entry *e) {
+    if (!e) return;
+    free(e->url);free(e->partition);free(e->request_headers);free(e->headers);
+    free(e->reason);free(e->body);free(e);
+}
+static struct cache_entry *cache_clone(const struct cache_entry *s) {
+    struct cache_entry *e=calloc(1,sizeof *e);if(!e)return NULL;
+    *e=*s;e->next=NULL;
+    e->url=strdup(s->url);e->partition=strdup(s->partition);e->request_headers=strdup(s->request_headers);
+    e->headers=strdup(s->headers);e->reason=strdup(s->reason);e->body=malloc(s->body_len+1);
+    if(!e->url||!e->partition||!e->request_headers||!e->headers||!e->reason||!e->body){cache_free(e);return NULL;}
+    memcpy(e->body,s->body,s->body_len);e->body[s->body_len]=0;return e;
+}
+/* Repeated Cache-Control fields are equivalent to a comma-combined list.
+   Quoted values are supported; malformed/duplicate numeric directives fail
+   conservatively rather than giving an attacker an extended freshness. */
+static bool cache_directive(const char *headers,const char *name,uint64_t *number) {
+    bool found=false;uint64_t result=UINT64_MAX;
+    for(const char *p=headers;*p;){
+        const char *end=strstr(p,"\r\n");if(!end)end=p+strlen(p);
+        const char *colon=memchr(p,':',(size_t)(end-p));
+        if(colon&&field_name_is(p,(size_t)(colon-p),"Cache-Control")){
+            const char *v=colon+1;
+            while(v<end){
+                while(v<end&&(*v==' '||*v=='\t'||*v==','))v++;
+                const char *key=v;while(v<end&&token_char((unsigned char)*v))v++;
+                size_t length=(size_t)(v-key);while(v<end&&(*v==' '||*v=='\t'))v++;
+                bool match=field_name_is(key,length,name);uint64_t value=0;bool valid=true;
+                if(v<end&&*v=='='){
+                    v++;while(v<end&&(*v==' '||*v=='\t'))v++;
+                    bool quoted=v<end&&*v=='"';if(quoted)v++;
+                    const char *digits=v;
+                    while(v<end&&*v>='0'&&*v<='9'){
+                        unsigned d=(unsigned)(*v++-'0');
+                        if(value>(UINT64_MAX-d)/10)valid=false;else value=value*10+d;
+                    }
+                    if(v==digits)valid=false;
+                    if(quoted){if(v==end||*v!='"')valid=false;else v++;}
+                    while(v<end&&(*v==' '||*v=='\t'))v++;
+                    if(v<end&&*v!=',')valid=false;
+                }else if(number){if(!strcasecmp(name,"max-stale"))value=UINT64_MAX;else valid=false;}
+                if(match){if(found&&number)value=0;found=true;result=valid?value:0;}
+                bool quote=false;
+                while(v<end){if(*v=='"')quote=!quote;if(*v++==','&&!quote)break;}
+            }
+        }
+        p=*end?end+2:end;
+    }
+    if(found&&number)*number=result;return found;
+}
+static bool cache_decimal(const char *p,size_t n,uint64_t *out) {
+    if(!n)return false;uint64_t value=0;
+    for(size_t i=0;i<n;i++){unsigned d=(unsigned char)p[i]-'0';if(d>9||value>(UINT64_MAX-d)/10)return false;value=value*10+d;}
+    *out=value;return true;
+}
+static bool cache_date(const char *headers,const char *name,int64_t *out) {
+    const char *p;size_t n;if(!field_slice(headers,name,&p,&n)||n!=29)return false;
+    /* IMF-fixdate is the generated HTTP date format. Reject impossible dates;
+       obsolete server date formats conservatively yield stale entries. */
+    if(p[3]!=','||p[4]!=' '||p[7]!=' '||p[11]!=' '||p[16]!=' '||p[19]!=':'||p[22]!=':'||memcmp(p+25," GMT",4))return false;
+    uint64_t day,year,hour,min,sec;
+    if(!cache_decimal(p+5,2,&day)||!cache_decimal(p+12,4,&year)||!cache_decimal(p+17,2,&hour)||
+       !cache_decimal(p+20,2,&min)||!cache_decimal(p+23,2,&sec)||year<1601||hour>23||min>59||sec>59)return false;
+    const char *months="JanFebMarAprMayJunJulAugSepOctNovDec";unsigned month=0;
+    while(month<12&&memcmp(months+month*3,p+8,3))month++;
+    if(month==12||!day)return false;
+    static const unsigned days[]={31,28,31,30,31,30,31,31,30,31,30,31};
+    bool leap=year%4==0&&(year%100!=0||year%400==0);
+    if(day>days[month]+(month==1&&leap))return false;
+    int64_t y=(int64_t)year-(month<2);unsigned m=month+1;
+    int64_t era=y/400;unsigned yoe=(unsigned)(y-era*400);
+    unsigned doy=(153*(m+(m>2?-3:9))+2)/5+(unsigned)day-1;
+    int64_t total=era*146097+(int64_t)(yoe*365+yoe/4-yoe/100+doy)-719468;
+    *out=total*86400+(int64_t)(hour*3600+min*60+sec);return true;
+}
+static void cache_freshness(struct cache_entry *e) {
+    uint64_t maximum=0,age=0;int64_t date=0,expires=0,modified=0,now=time(NULL);
+    bool dated=cache_date(e->headers,"Date",&date);
+    const char *a;size_t n;
+    if(field_exists(e->headers,"Age")&&(!field_slice(e->headers,"Age",&a,&n)||!cache_decimal(a,n,&age)))age=UINT64_MAX;
+    if(dated&&now>date&&(uint64_t)(now-date)>age)age=(uint64_t)(now-date);
+    e->age_seconds=age;e->stored_ms=uptime_ms();e->lifetime_seconds=0;
+    if(cache_directive(e->headers,"max-age",&maximum))e->lifetime_seconds=maximum;
+    else if(cache_date(e->headers,"Expires",&expires)){
+        int64_t base=dated?date:now;if(expires>base)e->lifetime_seconds=(uint64_t)(expires-base);
+    }else if(cache_date(e->headers,"Last-Modified",&modified)){
+        int64_t base=dated?date:now;
+        if(base>modified)e->lifetime_seconds=MIN((uint64_t)(base-modified)/10,86400u);
+    }
+    e->no_cache=cache_directive(e->headers,"no-cache",NULL);
+    e->must_revalidate=cache_directive(e->headers,"must-revalidate",NULL);
+}
+static uint64_t cache_age(const struct cache_entry *e) {
+    uint64_t elapsed=(uptime_ms()-e->stored_ms)/1000;
+    return elapsed>UINT64_MAX-e->age_seconds?UINT64_MAX:e->age_seconds+elapsed;
+}
+static bool cache_vary(const struct cache_entry *e,const char *request) {
+    for(const char *p=e->headers;*p;){
+        const char *end=strstr(p,"\r\n");if(!end)end=p+strlen(p);
+        const char *colon=memchr(p,':',(size_t)(end-p));
+        if(colon&&field_name_is(p,(size_t)(colon-p),"Vary")){
+            const char *v=colon+1;
+            while(v<end){
+                while(v<end&&(*v==' '||*v=='\t'||*v==','))v++;
+                const char *name=v;while(v<end&&token_char((unsigned char)*v))v++;
+                size_t length=(size_t)(v-name);if(!length||(length==1&&*name=='*'))return false;
+                if(!field_values_equal(e->request_headers,request,name,length))return false;
+                while(v<end&&(*v==' '||*v=='\t'))v++;
+                if(v<end&&*v!=',')return false;
+            }
+        }
+        p=*end?end+2:end;
+    }
+    return true;
+}
+static struct cache_entry *cache_find(struct job *j) {
+    struct cache_entry *snapshot=NULL;cache_lock();
+    struct cache_entry **link=&cache_entries;
+    while(*link){struct cache_entry *e=*link;
+        if(!strcmp(e->url,j->final_url)&&!strcmp(e->partition,j->partition)&&cache_vary(e,j->outgoing.p)){
+            snapshot=cache_clone(e);*link=e->next;e->next=cache_entries;cache_entries=e;break;
+        }link=&e->next;
+    }
+    cache_unlock();return snapshot;
+}
+static void cache_insert(struct cache_entry *e) {
+    e->charge=sizeof *e+e->body_len+1+strlen(e->url)+1+strlen(e->partition)+1+
+        strlen(e->request_headers)+1+strlen(e->headers)+1+strlen(e->reason)+1;
+    if(e->charge>FETCH_CACHE_BYTES){cache_free(e);return;}
+    cache_lock();struct cache_entry **link=&cache_entries;
+    while(*link){struct cache_entry *old=*link;
+        if(!strcmp(old->url,e->url)&&!strcmp(old->partition,e->partition)&&cache_vary(old,e->request_headers)){
+            *link=old->next;cache_bytes-=old->charge;cache_free(old);
+        }else link=&old->next;
+    }
+    while(cache_entries&&cache_bytes>FETCH_CACHE_BYTES-e->charge){
+        link=&cache_entries;while((*link)->next)link=&(*link)->next;
+        struct cache_entry *old=*link;*link=NULL;cache_bytes-=old->charge;cache_free(old);
+    }
+    e->next=cache_entries;cache_entries=e;cache_bytes+=e->charge;cache_unlock();
+}
+static unsigned cache_mode(const struct job *j) {
+    unsigned mode=WEBNET_WIRE_CACHE_MODE(j->wire.user_navigation);
+    if(mode==WEBNET_CACHE_DEFAULT&&(field_exists(j->headers,"If-Modified-Since")||field_exists(j->headers,"If-None-Match")||
+       field_exists(j->headers,"If-Unmodified-Since")||field_exists(j->headers,"If-Match")||field_exists(j->headers,"If-Range")))return WEBNET_CACHE_NO_STORE;
+    return mode;
+}
+static bool prepare_top_level(struct job *j) {
+    if(j->top_prepared)return true;
+    const char *raw=j->top_level_url?j->top_level_url:j->document?j->document:"";
+    char *origin=NULL;
+    enum http_url_result result=*raw?http_origin_owned(raw,&origin):HTTP_URL_OPAQUE;
+    if(result!=HTTP_URL_TUPLE&&result!=HTTP_URL_OPAQUE){
+        free(origin);return url_failure(j,result,"Invalid trusted top document URL");
+    }
+    free(j->top_origin);j->top_origin=origin;j->top_opaque=result!=HTTP_URL_TUPLE;j->top_prepared=true;return true;
+}
+static const char *cookie_site_url(const struct job *j) {
+    if(j->top_level_url)return j->top_level_url;
+    return j->document&&*j->document?j->document:top_level_navigation(j)?NULL:"";
+}
+static bool cache_partition(struct job *j) {
+    /* Separate enclosing top and initiating frame origins, then retain exact
+       credentials. Every HTTP pool/TLS entry receives this same private key. */
+    if(!prepare_top_level(j))return false;
+    struct header_buffer b={0};const char *origin=j->origin?j->origin:j->target_origin;
+    const char *top=top_level_navigation(j)?j->target_origin:j->top_origin?j->top_origin:"";
+    char prefix[96];
+    /* Origins are unbounded; only the numeric prefix uses a fixed buffer. */
+    snprintf(prefix,sizeof prefix,"T%zu:",strlen(top));
+    bool ok=header_text(j,&b,prefix)&&header_text(j,&b,top);
+    snprintf(prefix,sizeof prefix,"%zu:",strlen(origin));
+    ok=ok&&header_text(j,&b,prefix)&&header_text(j,&b,origin);
+    snprintf(prefix,sizeof prefix,"/%u/",j->wire.credentials);ok=ok&&header_text(j,&b,prefix);
+    static const char *names[]={"Cookie","Authorization"};
+    for(unsigned i=0;ok&&i<2;i++){
+        const char *cursor=j->outgoing.p,*value;size_t n;
+        while(ok&&field_value_next(&cursor,names[i],strlen(names[i]),&value,&n)){
+            snprintf(prefix,sizeof prefix,"%zu:",n);
+            ok=header_text(j,&b,prefix)&&header_append(j,&b,value,n);
+        }
+        /* Length-delimited values followed by an explicit field terminator
+           distinguish missing, empty, repeated, and differently ordered fields. */
+        ok=ok&&header_text(j,&b,";");
+    }
+    if((!j->origin||j->top_opaque)&&!top_level_navigation(j)){
+        snprintf(prefix,sizeof prefix,"/opaque/%llu/%llu",(unsigned long long)j->wire.id,(unsigned long long)j->wire.generation);
+        ok=ok&&header_text(j,&b,prefix);
+    }
+    if(!ok){free(b.p);return false;}free(j->partition);j->partition=b.p;return true;
+}
+static bool cache_usable(struct job *j,const struct cache_entry *e) {
+    unsigned mode=cache_mode(j);uint64_t age=cache_age(e),max=0,min=0;
+    if(e->no_cache||mode==WEBNET_CACHE_NO_CACHE||cache_directive(j->headers,"no-cache",NULL))return false;
+    const char *pragma;size_t pragma_length;
+    if(!field_exists(j->headers,"Cache-Control")&&field_slice(j->headers,"Pragma",&pragma,&pragma_length)&&
+       list_has_slice(pragma,pragma+pragma_length,"no-cache",8,true))return false;
+    if(mode==WEBNET_CACHE_FORCE_CACHE||mode==WEBNET_CACHE_ONLY_IF_CACHED)
+        return !e->must_revalidate||age<e->lifetime_seconds;
+    uint64_t lifetime=e->lifetime_seconds;
+    if(cache_directive(j->headers,"max-age",&max)&&max<lifetime)lifetime=max;
+    cache_directive(j->headers,"min-fresh",&min);
+    if(age<lifetime&&min<lifetime-age)return true;
+    if(!e->must_revalidate&&cache_directive(j->headers,"max-stale",NULL)){
+        uint64_t stale=UINT64_MAX;
+        cache_directive(j->headers,"max-stale",&stale);
+        return age>=lifetime&&age-lifetime<=stale;
+    }
+    return false;
+}
+static void cache_invalidate(const char *url) {
+    cache_lock();struct cache_entry **link=&cache_entries;
+    while(*link){struct cache_entry *e=*link;if(!strcmp(e->url,url)){*link=e->next;cache_bytes-=e->charge;cache_free(e);}else link=&e->next;}
+    cache_unlock();
+}
+static bool cache_validator_matches(const struct cache_entry *e,const struct http_resp *r) {
+    const char *old,*next;size_t old_length,next_length;
+    if(!field_exists(http_response_headers(r),"ETag"))return true;
+    if(!field_slice(http_response_headers(r),"ETag",&next,&next_length))return false;
+    if(!field_slice(e->headers,"ETag",&old,&old_length))return true;
+    if(old_length>2&&!memcmp(old,"W/",2)){old+=2;old_length-=2;}
+    if(next_length>2&&!memcmp(next,"W/",2)){next+=2;next_length-=2;}
+    return old_length==next_length&&!memcmp(old,next,old_length);
+}
+static char *cache_clean_headers(const char *headers,const char *updates,bool replay,uint64_t age) {
+    struct job scratch={0};struct header_buffer b={0};
+    for(const char *p=headers;*p;){
+        const char *end=strstr(p,"\r\n");if(!end)end=p+strlen(p);
+        const char *colon=memchr(p,':',(size_t)(end-p));bool keep=colon!=NULL;
+        if(colon){size_t n=(size_t)(colon-p);
+            if(field_name_is(p,n,"Set-Cookie")||field_name_is(p,n,"Set-Cookie2")||
+               ((replay||updates)&&field_name_is(p,n,"Age")))keep=false;
+            if(updates){char *name=malloc(n+1);if(!name){free(b.p);return NULL;}
+                memcpy(name,p,n);name[n]=0;if(field_exists(updates,name)&&!field_name_is(p,n,"Content-Length")&&
+                    !field_name_is(p,n,"Content-Encoding")&&!field_name_is(p,n,"Content-Range"))keep=false;
+                free(name);}
+        }
+        if(keep&&(!header_append(&scratch,&b,p,(size_t)(end-p))||!header_text(&scratch,&b,"\r\n"))){free(b.p);return NULL;}
+        p=*end?end+2:end;
+    }
+    if(updates)for(const char *p=updates;*p;){
+        const char *end=strstr(p,"\r\n");if(!end)end=p+strlen(p);const char *colon=memchr(p,':',(size_t)(end-p));
+        size_t n=colon?(size_t)(colon-p):0;
+        if(colon&&!field_name_is(p,n,"Set-Cookie")&&!field_name_is(p,n,"Set-Cookie2")&&!field_name_is(p,n,"Content-Length")&&
+           !field_name_is(p,n,"Content-Encoding")&&!field_name_is(p,n,"Content-Range")&&!field_name_is(p,n,"Connection")&&
+           !field_name_is(p,n,"Transfer-Encoding")&&(!replay||!field_name_is(p,n,"Age"))&&
+           (!header_append(&scratch,&b,p,(size_t)(end-p))||!header_text(&scratch,&b,"\r\n"))){free(b.p);return NULL;}
+        p=*end?end+2:end;
+    }
+    if(replay){char value[64];snprintf(value,sizeof value,"Age: %llu\r\n",(unsigned long long)age);
+        if(!header_text(&scratch,&b,value)){free(b.p);return NULL;}}
+    if(!b.p)b.p=calloc(1,1);return b.p;
+}
+static void cache_store(struct job *j,const struct http_resp *r) {
+    if(!j->cache_capture||j->error[0]||!remaining(j))return;
+    size_t metadata=sizeof(struct cache_entry)+j->cache_body.length+1;
+    const char *pieces[]={j->final_url,j->partition,j->outgoing.p,http_response_headers(r),http_response_status_text(r)};
+    for(unsigned i=0;i<sizeof pieces/sizeof pieces[0];i++){
+        size_t length=strlen(pieces[i]);
+        if(metadata>=FETCH_CACHE_BYTES||length>=FETCH_CACHE_BYTES-metadata)return;
+        metadata+=length+1;
+    }
+    struct cache_entry source={.url=j->final_url,.partition=j->partition,.request_headers=j->outgoing.p,
+        .headers=(char *)http_response_headers(r),.reason=(char *)http_response_status_text(r),
+        .body=j->cache_body.p?j->cache_body.p:"",.body_len=j->cache_body.length,.status=r->status};
+    struct cache_entry *e=cache_clone(&source);if(!e)return;
+    char *clean=cache_clean_headers(e->headers,NULL,false,0);if(!clean){cache_free(e);return;}
+    free(e->headers);e->headers=clean;cache_freshness(e);
+    if(!cache_vary(e,e->request_headers)){cache_free(e);return;}cache_insert(e);
 }
 static bool validate_headers(struct job *j) {
     struct header_buffer seen = {0}, names = {0};
@@ -426,11 +828,9 @@ static bool validate_headers(struct job *j) {
 out:
     free(name); free(seen.p); free(names.p); return ok;
 }
-/* Fetch HTTP-network-or-cache steps 16-18 (WHATWG, consulted 2026-10-07).
-   This transport has no HTTP response cache: default/force-cache/no-cache
-   have genuine cache-miss network semantics, reload/no-store bypass storage,
-   and only-if-cached fails before network/preflight. Generate these fields
-   after classifying AUTHOR headers for CORS, independently on every hop. */
+/* Browser-generated fields remain separate from author classification. Cache
+   lookup and conditional validation below own their network/storage effects;
+   these fields never contaminate the CORS preflight author-header list. */
 static bool cache_headers(struct job *j) {
     unsigned mode = WEBNET_WIRE_CACHE_MODE(j->wire.user_navigation);
     if (mode == WEBNET_CACHE_DEFAULT &&
@@ -469,8 +869,8 @@ static bool prepare_outgoing(struct job *j, const char *current, const char *met
     j->hop_cookies = j->wire.credentials == WEBNET_CREDENTIALS_INCLUDE ||
         (j->wire.credentials == WEBNET_CREDENTIALS_SAME_ORIGIN && !cross && !j->cors_tainted);
     if (j->hop_cookies) {
-        struct webcookie_context c = {current, *j->document ? j->document : j->wire.kind == WEBNET_NAVIGATION ? NULL : "", method,
-            j->wire.kind == WEBNET_NAVIGATION && (j->wire.user_navigation & WEBNET_WIRE_USER_NAVIGATION), true, j->redirect_cross_site};
+        struct webcookie_context c = {current, cookie_site_url(j), method,
+            top_level_navigation(j), true, j->redirect_cross_site};
         time_t now = time(NULL);
         long size = webcookie_get(j->cookies, &c, NULL, 0, now);
         if (size < 0) return fail(j, "Cannot measure request cookies");
@@ -571,8 +971,8 @@ static bool apply_cookie_events(struct job *j,size_t start,const char *method) {
         struct webnet_wire_cookie e;memcpy(&e,p,sizeof e);p+=sizeof e;
         char *url=malloc((size_t)e.url_len+1);if(!url)return fail(j,"Out of memory applying cookie URL");
         memcpy(url,p,e.url_len);url[e.url_len]=0;p+=e.url_len;
-        struct webcookie_context c={url,*j->document?j->document:j->wire.kind==WEBNET_NAVIGATION?NULL:"",method,
-            j->wire.kind==WEBNET_NAVIGATION && (j->wire.user_navigation & WEBNET_WIRE_USER_NAVIGATION),true,e.redirect_cross_site!=0};
+        struct webcookie_context c={url,cookie_site_url(j),method,
+            top_level_navigation(j),true,e.redirect_cross_site!=0};
         int result=webcookie_set(j->cookies,&c,(const char*)p,e.value_len,e.received);free(url);
         if(result<0)return fail(j,"Out of memory applying cookies");
         p+=e.value_len;
@@ -581,7 +981,19 @@ static bool apply_cookie_events(struct job *j,size_t start,const char *method) {
 }
 static int body_cb(void *opaque, const char *data, size_t n) {
     struct job *j = opaque;
-    if (!remaining(j)) return -1;
+    if (!remaining(j)||request_cancelled(j)) return -1;
+    if(j->cache_capture){
+        struct header_buffer *b=&j->cache_body;
+        if(n>FETCH_CACHE_OBJECT-b->length){free(b->p);*b=(struct header_buffer){0};j->cache_capture=false;}
+        else{
+            size_t need=b->length+n+1;
+            if(need>b->capacity){size_t cap=MAX(need,MIN(b->capacity?b->capacity*2:8192,FETCH_CACHE_OBJECT+1));
+                char *next=realloc(b->p,cap);
+                if(!next){free(b->p);*b=(struct header_buffer){0};j->cache_capture=false;}
+                else{b->p=next;b->capacity=cap;}}
+            if(j->cache_capture){memcpy(b->p+b->length,data,n);b->length+=n;b->p[b->length]=0;}
+        }
+    }
     if(j->opaque_tainted||j->wire.kind==WEBNET_REPORT)return 0; /* Retain no opaque/report response bytes. */
     if (j->wire.user_navigation & WEBNET_WIRE_STREAM) {
         while (n) {
@@ -589,7 +1001,7 @@ static int body_cb(void *opaque, const char *data, size_t n) {
             struct webnet_wire_response frame = {0};
             frame.magic = WEBNET_STREAM_CHUNK; frame.id = j->wire.id; frame.generation = j->wire.generation;
             frame.body_len = (uint32_t)count;
-            if (!write_all(1, &frame, sizeof frame) || !write_all(1, data, count)) return -1;
+            if (!job_write(j, &frame, sizeof frame) || !job_write(j, data, count)) return -1;
             data += count; n -= count;
         }
         return 0;
@@ -612,8 +1024,8 @@ static int body_cb(void *opaque, const char *data, size_t n) {
 static int discard_cb(void *opaque, const char *data, size_t n) {
     (void)data;
     struct job *j = opaque;
-    if (!remaining(j)) return -1;
-    if (j->body_len > WEBNET_BODY_LIMIT || n > WEBNET_BODY_LIMIT - j->body_len) { fail(j, "Preflight response length is not representable"); return -1; }
+    if (!remaining(j)||request_cancelled(j)) return -1;
+    if (j->body_len > HTTP_RESPONSE_BODY_MAX || n > HTTP_RESPONSE_BODY_MAX - j->body_len) { fail(j, "Preflight response length is not representable"); return -1; }
     j->body_len += n; return 0;
 }
 static bool preflight(struct job *j, const char *url, const char *method, const char *names) {
@@ -626,8 +1038,9 @@ static bool preflight(struct job *j, const char *url, const char *method, const 
     if (!left) { free(head.p); return false; }
     struct http_req q = {"OPTIONS", url, head.p, NULL, 0, left, discard_cb, j, NULL};
     struct http_resp r;
+    const struct http_stream_hooks hooks={.cancelled=request_cancelled};
     j->body_len = 0;
-    int result = http_request(&q, &r);
+    int result=http_request_stream_ex(&q,&r,HTTP_RESPONSE_BODY_MAX,&hooks,NULL,j->partition,NULL);
     free(head.p);
     j->body_len = 0;
     if (result < 0) { if (!j->error[0]) fail(j, r.error); http_resp_free(&r); return false; }
@@ -791,11 +1204,14 @@ static int stream_upload(void *opaque, size_t sent, size_t total) {
     frame.magic = WEBNET_STREAM_UPLOAD; frame.id = j->wire.id; frame.generation = j->wire.generation;
     frame.status = (uint32_t)sent;
     if (sent == total) j->upload_finished = true;
-    return write_all(1, &frame, sizeof frame) ? 0 : -1;
+    return job_write(j, &frame, sizeof frame) ? 0 : -1;
 }
 static int response_start(void *opaque, const struct http_resp *response) {
     struct job *j = opaque;
-    if (!apply_cookie_events(j, j->cookie_start, j->hop_method)) return -1;
+    if (!j->cache_replay&&!apply_cookie_events(j, j->cookie_start, j->hop_method)) return -1;
+    /* A 304 is metadata for an owned stored response. Its omitted CORS fields
+       and status must not be published as a new Fetch response. */
+    if(response->status==304&&j->cached)return 1;
     if (j->cors_tainted && !cors_allowed(j, response)) return -1;
     int status = response->status;
     bool redirect = status == 301 || status == 302 || status == 303 || status == 307 || status == 308;
@@ -817,6 +1233,14 @@ static int response_start(void *opaque, const struct http_resp *response) {
         }
     }
     j->stream_final = true;
+    const char *raw=http_response_headers(response);
+    bool default_cacheable=status==200||status==203||status==204||status==300||status==404||status==405||status==410||status==414||status==501;
+    j->cache_capture=!j->cache_replay&&!strcmp(j->hop_method,"GET")&&j->partition&&
+        cache_context_allowed(j)&&j->wire.kind!=WEBNET_REPORT&&
+        cache_mode(j)!=WEBNET_CACHE_NO_STORE&&!cache_directive(j->headers,"no-store",NULL)&&
+        !field_exists(j->headers,"Range")&&!cache_directive(raw,"no-store",NULL)&&
+        (default_cacheable||(status>=200&&status<600&&(field_exists(raw,"Expires")||cache_directive(raw,"max-age",NULL))))&&
+        strlen(raw)<FETCH_CACHE_OBJECT;
     if (!(j->wire.user_navigation & WEBNET_WIRE_STREAM)) return 0;
     if (!response_headers(j, response, j->cors_tainted)) return -1;
     struct webnet_wire_response frame = {0};
@@ -824,12 +1248,35 @@ static int response_start(void *opaque, const struct http_resp *response) {
     frame.id = j->wire.id; frame.generation = j->wire.generation;
     frame.url_len = strlen(j->final_url); frame.headers_len = j->response_headers_len;
     frame.cookie_len = j->cookie_len;
-    if (!write_all(1, &frame, sizeof frame) || !write_all(1, j->final_url, frame.url_len) ||
-        !write_all(1, j->response_headers, frame.headers_len) || !write_all(1, j->cookie_events, frame.cookie_len)) return -1;
+    if (!job_write(j, &frame, sizeof frame) || !job_write(j, j->final_url, frame.url_len) ||
+        !job_write(j, j->response_headers, frame.headers_len) || !job_write(j, j->cookie_events, frame.cookie_len)) return -1;
     j->stream_headers_sent = true;
     /* Native cookies were published with the headers, not deferred until EOF. */
     j->cookie_len = 0;
     return 0;
+}
+static int cache_response(struct job *j,struct cache_entry *e,struct http_resp *r) {
+    memset(r,0,sizeof *r);r->status=e->status;
+    r->headers_full=cache_clean_headers(e->headers,NULL,true,cache_age(e));
+    r->status_text_full=strdup(e->reason);
+    if(!r->headers_full||!r->status_text_full){fail(j,"Out of memory reading cached response");return -1;}
+    r->headers_len=strlen(r->headers_full);j->cache_replay=true;j->cache_capture=false;
+    int result=response_start(j,r);
+    if(result==0&&strcmp(j->hop_method,"HEAD"))result=body_cb(j,e->body,e->body_len);
+    j->cache_replay=false;return result<0?-1:0;
+}
+static bool transport_retry(const struct job *j,const struct http_req *q,const struct http_resp *r,
+                            const struct http_transport_result *transport,size_t cookie_start) {
+    if(r->status||transport->response_bytes_received||j->body_len||j->stream_headers_sent||
+       j->cookie_len!=cookie_start||j->error[0]||request_cancelled((void *)j))return false;
+    switch(transport->error){
+    case HTTP_ERR_DNS_TEMP:case HTTP_ERR_CONNECT:case HTTP_ERR_RESET:case HTTP_ERR_IO:break;
+    default:return false;
+    }
+    /* Before the first byte is sent even a POST can safely try another
+       connection. A partially submitted unsafe operation is never replayed. */
+    if(!transport->request_bytes_sent)return transport->phase<=HTTP_PHASE_HEADER;
+    return !q->body&&(!strcmp(q->method,"GET")||!strcmp(q->method,"HEAD"));
 }
 static bool run_http(struct job *j) {
     enum http_url_result parsed = *j->document ? http_url(j->document, NULL, &j->origin) : HTTP_URL_OPAQUE;
@@ -844,14 +1291,13 @@ static bool run_http(struct job *j) {
     if (WEBNET_WIRE_CACHE_MODE(j->wire.user_navigation) == WEBNET_CACHE_ONLY_IF_CACHED) {
         if (!(j->wire.user_navigation & WEBNET_WIRE_SAME_ORIGIN))
             return fail(j, "only-if-cached requires same-origin mode");
-        return fail(j, "No cached response is available");
     }
     bool drop_body = false;
     for (unsigned hop = 0; hop <= 20; hop++) {
         /* Initial and every redirect hop were fully prepared before publish.
            The current final URL is the single canonical owner, not a copy. */
         const char *current=j->final_url;
-        if ((j->wire.kind != WEBNET_NAVIGATION || !(j->wire.user_navigation & WEBNET_WIRE_USER_NAVIGATION)) && document_http && !strncmp(j->origin, "https://", 8) && !strncmp(current, "http://", 7)) return fail(j, "HTTPS page cannot load insecure content");
+        if (!top_level_navigation(j) && document_http && !strncmp(j->origin, "https://", 8) && !strncmp(current, "http://", 7)) return fail(j, "HTTPS page cannot load insecure content");
         bool cross = !j->origin || strcmp(j->origin, j->target_origin) != 0;
         if (cross && (j->wire.user_navigation & WEBNET_WIRE_SAME_ORIGIN))
             return fail(j, "Cross-origin fetch is forbidden by same-origin mode");
@@ -864,8 +1310,8 @@ static bool run_http(struct job *j) {
         if (!validate_headers(j)) return false;
         const char *names = j->non_simple;
         bool simple_method = !strcmp(method, "GET") || !strcmp(method, "HEAD") || !strcmp(method, "POST");
-        if (j->cors_tainted && (!simple_method || *names || (j->wire.user_navigation & WEBNET_WIRE_FORCE_PREFLIGHT)) && !preflight(j, current, method, names)) return false;
         if (!prepare_outgoing(j, current, method, cross)) return false;
+        if(!cache_partition(j))return false;
         int left = remaining(j); if (!left) return false;
         free(j->body); j->body = NULL; j->body_len = j->body_cap = 0;
         struct http_req q = {method, current, j->outgoing.p,
@@ -874,33 +1320,56 @@ static bool run_http(struct job *j) {
                              drop_body ? 0 : j->wire.body_len,
                              left, body_cb, j, cookie_header};
         observe_request(j, &q);
-        struct http_resp r;
+        struct http_resp r={0};
         size_t cookie_start=j->cookie_len; j->cookie_start = cookie_start; j->stream_final = false; j->hop_method = method;
         size_t body_limit = webnet_wire_response_limit(j->wire.kind, j->wire.user_navigation);
-        const struct http_stream_hooks hooks = {response_start, stream_upload};
+        const struct http_stream_hooks hooks = {response_start, stream_upload, request_cancelled};
         struct http_transport_timing timing={0};
         bool timed=(j->wire.user_navigation&WEBNET_WIRE_DEBUG_REQUEST)!=0;
-        int result = timed?http_request_stream_timed(&q,&r,body_limit,&hooks,&timing):
-            http_request_stream(&q, &r, body_limit, &hooks);
-        if(timed){
+        cache_free(j->cached);j->cached=NULL;free(j->cache_body.p);j->cache_body=(struct header_buffer){0};j->cache_capture=false;
+        unsigned mode=cache_mode(j);
+        bool cache_read=(!strcmp(method,"GET")||!strcmp(method,"HEAD"))&&mode!=WEBNET_CACHE_NO_STORE&&mode!=WEBNET_CACHE_RELOAD&&
+            !field_exists(j->headers,"Range")&&!cache_directive(j->headers,"no-store",NULL)&&
+            cache_context_allowed(j);
+        if(cache_read)j->cached=cache_find(j);
+        bool hit=j->cached&&cache_usable(j,j->cached);
+        if(!hit&&mode==WEBNET_CACHE_ONLY_IF_CACHED)return fail(j,"No usable cached response is available");
+        /* CORS permission belongs to this request's method/author fields, not
+           to the cached representation's Vary key. A hit must not bypass a
+           required preflight, including a redirect hop returning to a cache. */
+        if(request_cancelled(j))return fail(j,"Request was cancelled");
+        if(j->cors_tainted&&(!simple_method||*names||(j->wire.user_navigation&WEBNET_WIRE_FORCE_PREFLIGHT))&&
+           !preflight(j,current,method,names))return false;
+        if(!remaining(j))return false;
+        if(request_cancelled(j))return fail(j,"Request was cancelled");
+        int result;
+        struct http_transport_result transport={0};
+        if(hit)result=cache_response(j,j->cached,&r);
+        else{
+            if(j->cached){
+                const char *value;size_t n;
+                if(field_slice(j->cached->headers,"ETag",&value,&n)){
+                    if(!header_text(j,&j->outgoing,"If-None-Match: ")||!header_append(j,&j->outgoing,value,n)||!header_text(j,&j->outgoing,"\r\n"))return false;
+                }else if(field_slice(j->cached->headers,"Last-Modified",&value,&n)){
+                    if(!header_text(j,&j->outgoing,"If-Modified-Since: ")||!header_append(j,&j->outgoing,value,n)||!header_text(j,&j->outgoing,"\r\n"))return false;
+                }
+                q.headers=j->outgoing.p;
+            }
+            q.timeout_ms=remaining(j);if(!q.timeout_ms)return false;
+            result=http_request_stream_ex(&q,&r,body_limit,&hooks,timed?&timing:NULL,j->partition,&transport);
+        }
+        if(timed&&!hit){
             j->debug_attempts++;j->debug_timing.phase=timing.phase;
             j->debug_timing.resolve_ms+=timing.resolve_ms;j->debug_timing.connect_ms+=timing.connect_ms;
             j->debug_timing.tls_ms+=timing.tls_ms;j->debug_timing.first_header_ms+=timing.first_header_ms;
             j->debug_timing.header_ms+=timing.header_ms;j->debug_timing.body_ms+=timing.body_ms;
             j->debug_timing.tls_io_ms+=timing.tls_io_ms;j->debug_timing.tls_other_ms+=timing.tls_other_ms;
         }
-        /* A transport reset before any response is not an HTTP rejection.
-           Replay only bodyless idempotent reads, once, within the same native
-           deadline. Never retry published stream data, cookies, POST or 4xx. */
-        if(result<0 && !r.status && !j->body_len && !j->stream_headers_sent &&
-           j->cookie_len==cookie_start && !j->error[0] && !q.body &&
-           (!strcmp(method,"GET") || !strcmp(method,"HEAD")) &&
-           strstr(r.error,"connection reset")) {
+        if(result<0&&!hit&&transport_retry(j,&q,&r,&transport,cookie_start)) {
             int retry_left=remaining(j);
             if(retry_left) {
                 http_resp_free(&r);q.timeout_ms=retry_left;
-                result=timed?http_request_stream_timed(&q,&r,body_limit,&hooks,&timing):
-                    http_request_stream(&q,&r,body_limit,&hooks);
+                result=http_request_stream_ex(&q,&r,body_limit,&hooks,timed?&timing:NULL,j->partition,&transport);
                 if(timed){
                     j->debug_attempts++;j->debug_timing.phase=timing.phase;
                     j->debug_timing.resolve_ms+=timing.resolve_ms;j->debug_timing.connect_ms+=timing.connect_ms;
@@ -911,6 +1380,18 @@ static bool run_http(struct job *j) {
             }
         }
         if (result < 0) { j->cookie_len=j->stream_headers_sent?0:cookie_start; if (!j->error[0]) fail(j, r.error); http_resp_free(&r); return false; }
+        if(!hit&&r.status==304&&j->cached){
+            if(!cache_validator_matches(j->cached,&r)){
+                http_resp_free(&r);return fail(j,"Revalidation returned a mismatched entity validator");
+            }
+            char *merged=cache_clean_headers(j->cached->headers,http_response_headers(&r),false,0);
+            if(!merged){http_resp_free(&r);return fail(j,"Out of memory revalidating cached response");}
+            free(j->cached->headers);j->cached->headers=merged;cache_freshness(j->cached);
+            if(cache_directive(merged,"no-store",NULL)||!cache_vary(j->cached,j->outgoing.p))cache_invalidate(current);
+            else{struct cache_entry *updated=cache_clone(j->cached);if(updated)cache_insert(updated);}
+            http_resp_free(&r);result=cache_response(j,j->cached,&r);
+            if(result<0){http_resp_free(&r);return false;}hit=true;
+        }
         bool redirect = !j->stream_final && (r.status == 301 || r.status == 302 || r.status == 303 || r.status == 307 || r.status == 308);
         if (redirect) {
             j->referrer_policy=webnet_referrer_policy_header(http_response_headers(&r),j->referrer_policy);
@@ -968,6 +1449,12 @@ static bool run_http(struct job *j) {
             }
         }
         j->status = r.status;
+        if(!hit){
+            if(cache_directive(http_response_headers(&r),"no-store",NULL))cache_invalidate(current);
+            cache_store(j,&r);
+        }
+        if(strcmp(method,"GET")&&strcmp(method,"HEAD")&&strcmp(method,"OPTIONS")&&strcmp(method,"TRACE")&&r.status>=200&&r.status<400)
+            cache_invalidate(current);
         if (j->wire.user_navigation & WEBNET_WIRE_STREAM) { http_resp_free(&r); return true; }
         bool headers_ok = response_headers(j, &r, j->cors_tainted); http_resp_free(&r);
         if (!headers_ok) return false;
@@ -976,12 +1463,13 @@ static bool run_http(struct job *j) {
     }
     return false;
 }
-int main(void) {
+static int run_one(int input,int output) {
     struct job *j = calloc(1, sizeof *j);
     if (!j) return 1;
+    j->input=input;j->output=output;j->output_credit=WEBNET_SERVICE_WINDOW;
     struct webnet_wire_request *w = &j->wire;
     size_t payload_size;
-    if (!read_all(0, w, sizeof *w) || w->magic != WEBNET_MAGIC || w->kind > WEBNET_REPORT ||
+    if (!read_all(input, w, sizeof *w) || w->magic != WEBNET_MAGIC || w->kind > WEBNET_REPORT ||
         !w->url_len || w->url_len > webnet_wire_url_limit(w->user_navigation) || w->origin_len > webnet_wire_url_limit(w->user_navigation) ||
         !w->method_len || w->headers_len > webnet_wire_request_header_limit(w->user_navigation) || w->body_len > WEBNET_BODY_LIMIT ||
         w->credentials>WEBNET_CREDENTIALS_INCLUDE || (w->user_navigation & ~WEBNET_WIRE_REQUEST_FLAGS) || w->cookie_len>WEBCOOKIE_SNAPSHOT_MAX ||
@@ -993,22 +1481,34 @@ int main(void) {
         ((w->user_navigation & WEBNET_WIRE_DEBUG_REQUEST) &&
          ((w->kind != WEBNET_RESOURCE && w->kind != WEBNET_CLASSIC && w->kind != WEBNET_MODULE &&
            w->kind != WEBNET_NAVIGATION) || !(w->user_navigation & WEBNET_WIRE_STATUS_LINE))) ||
-        ((w->user_navigation & (WEBNET_WIRE_STREAM|WEBNET_WIRE_REFERRER)) && w->kind != WEBNET_FETCH)) { free(j); return 1; }
+        ((w->user_navigation & (WEBNET_WIRE_STREAM|WEBNET_WIRE_REFERRER)) && w->kind != WEBNET_FETCH) ||
+        ((input==output)!=((w->user_navigation&WEBNET_WIRE_SERVICE)!=0))) { free(j); return 1; }
     struct webnet_wire_referrer ref={0};
+    struct webnet_wire_top_level top={0};
+    uint64_t extended_size=payload_size;
     if(w->user_navigation&WEBNET_WIRE_REFERRER){
-        if(!read_all(0,&ref,sizeof ref)||ref.policy>WEBNET_REFERRER_UNSAFE||ref.length>webnet_wire_url_limit(w->user_navigation)||
+        if(!job_read_all(j,&ref,sizeof ref)||ref.policy>WEBNET_REFERRER_UNSAFE||ref.length>webnet_wire_url_limit(w->user_navigation)||
            (uint64_t)payload_size+ref.length+sizeof ref>SIZE_MAX-7){free(j);return 1;}
         j->referrer_policy=(int)ref.policy;
+        extended_size+=(uint64_t)ref.length+sizeof ref;
     }
-    j->url = read_string(w->url_len, false); j->document = read_string(w->origin_len, false);
-    if(w->user_navigation&WEBNET_WIRE_REFERRER)j->referrer=read_string(ref.length,false);
-    j->method = read_string(w->method_len, false); j->headers = read_string(w->headers_len, false);
-    j->request_body = read_string(w->body_len, true);
+    if(w->user_navigation&WEBNET_WIRE_TOP_LEVEL){
+        if(!job_read_all(j,&top,sizeof top)||top.reserved||top.length>webnet_wire_url_limit(w->user_navigation)){
+            free(j);return 1;
+        }
+        extended_size+=(uint64_t)top.length+sizeof top;
+    }
+    if(extended_size>SIZE_MAX-8){free(j);return 1;}
+    j->url = read_string(j,w->url_len, false); j->document = read_string(j,w->origin_len, false);
+    if(w->user_navigation&WEBNET_WIRE_REFERRER)j->referrer=read_string(j,ref.length,false);
+    if(w->user_navigation&WEBNET_WIRE_TOP_LEVEL)j->top_level_url=read_string(j,top.length,false);
+    j->method = read_string(j,w->method_len, false); j->headers = read_string(j,w->headers_len, false);
+    j->request_body = read_string(j,w->body_len, true);
     /* Private transport diagnostics contain no cookie fields or metadata. */
     const char *cookie_snapshot_error=NULL;
     char *cookie_snapshot=malloc((size_t)w->cookie_len+1);
     if(!cookie_snapshot)cookie_snapshot_error="Cookie snapshot allocation failed";
-    else if(!read_all(0,cookie_snapshot,w->cookie_len))cookie_snapshot_error="Cookie snapshot read failed";
+    else if(!job_read_all(j,cookie_snapshot,w->cookie_len))cookie_snapshot_error="Cookie snapshot read failed";
     else cookie_snapshot[w->cookie_len]=0;
     j->cookies=webcookie_create();
     const char *cookie_psl_error="PSL open failed";
@@ -1035,7 +1535,9 @@ int main(void) {
         snprintf(j->error,sizeof j->error,"Cookie snapshot rejected or allocation failed (%s)",cookie_psl_error?cookie_psl_error:"PSL ready");
     }
     free(cookie_snapshot);
-    if (!j->url || !j->document || !j->method || !j->headers || !j->request_body || ((w->user_navigation&WEBNET_WIRE_REFERRER)&&!j->referrer)) fail(j, "Invalid request or out of memory");
+    if (!j->url || !j->document || !j->method || !j->headers || !j->request_body ||
+        ((w->user_navigation&WEBNET_WIRE_REFERRER)&&!j->referrer)||
+        ((w->user_navigation&WEBNET_WIRE_TOP_LEVEL)&&!j->top_level_url)) fail(j, "Invalid request or out of memory");
     else if(w->kind==WEBNET_REPORT && (!w->body_len || !webnet_report_fields_valid(j->method,j->headers)))fail(j,"Invalid native CSP report request");
     else if (!webnet_method_valid(j->method) || ((!strcmp(j->method, "GET") || !strcmp(j->method, "HEAD")) && w->body_len)) fail(j, "Invalid HTTP method or body");
     else if (!j->error[0] && remaining(j)) {
@@ -1070,10 +1572,55 @@ int main(void) {
     out.url_len = streaming ? 0 : strlen(final_url); out.headers_len = streaming ? 0 : j->response_headers_len;
     out.body_len = streaming ? 0 : j->body_len; out.error_len = strlen(j->error);
     out.cookie_len=(uint32_t)j->cookie_len;
-    bool ok = write_all(1, &out, sizeof out) && write_all(1, final_url, out.url_len) &&
-              write_all(1, j->response_headers, out.headers_len) && write_all(1, j->body, out.body_len) && write_all(1, j->error, out.error_len) &&
-              write_all(1,j->cookie_events,out.cookie_len);
+    bool ok = job_write(j, &out, sizeof out) && job_write(j, final_url, out.url_len) &&
+              job_write(j, j->response_headers, out.headers_len) && job_write(j, j->body, out.body_len) && job_write(j, j->error, out.error_len) &&
+              job_write(j,j->cookie_events,out.cookie_len);
     free(j->origin); free(j->target_origin);free(j->final_url);free(j->referrer);free(j->referrer_origin);
-    free(j->url); free(j->document); free(j->method); free(j->headers); free(j->request_body); free(j->body); free(j->response_headers); free(j->cookie_events); free(j->non_simple); free(j->outgoing.p); webcookie_free(j->cookies); free(j);
+    free(j->top_level_url);free(j->top_origin);
+    free(j->url); free(j->document); free(j->method); free(j->headers); free(j->request_body); free(j->body); free(j->response_headers); free(j->cookie_events); free(j->non_simple); free(j->outgoing.p);
+    free(j->partition);free(j->cache_body.p);cache_free(j->cached);webcookie_free(j->cookies); free(j);
     return ok ? 0 : 1;
+}
+/* Each duplex request channel has its own lifetime and byte-credit window.
+   Pausing one stream therefore cannot block another request's completion. */
+#define FETCH_SERVICE_THREADS 32u
+struct service_slot { int tid,fd;volatile uint32_t done; };
+static void service_request(void *opaque) {
+    struct service_slot *s=opaque;
+    /* Setup waits own a thread-local reference to this request channel. Never
+       keep it across slot reuse, including a failed initial registration. */
+    if(net_set_setup_cancel_channel(s->fd)==0)run_one(s->fd,s->fd);
+    net_set_setup_cancel_channel(-1);
+    close(s->fd);
+    __atomic_store_n(&s->done,1,__ATOMIC_RELEASE);wake_address(&s->done,0);
+}
+int main(int argc,char **argv) {
+    if(argc!=2||strcmp(argv[1],"--service"))return run_one(0,1);
+    struct service_slot slots[FETCH_SERVICE_THREADS]={0};
+    for(;;){
+        unsigned free_slot=FETCH_SERVICE_THREADS;
+        for(unsigned i=0;i<FETCH_SERVICE_THREADS;i++){
+            if(slots[i].tid&&__atomic_load_n(&slots[i].done,__ATOMIC_ACQUIRE)){
+                thread_join(slots[i].tid);slots[i]=(struct service_slot){0};
+            }
+            if(!slots[i].tid&&free_slot==FETCH_SERVICE_THREADS)free_slot=i;
+        }
+        if(free_slot==FETCH_SERVICE_THREADS){
+            /* An address wait yields the CPU; it does not hold the cache or
+               connection-pool locks while all request slots are occupied. */
+            wait_on_address(&slots[0].done,0,10);continue;
+        }
+        struct n_pollfd listener={0,N_POLLIN,0};
+        if(poll(&listener,1,100)<0)break;
+        if(listener.revents&N_POLLHUP)break;
+        if(!(listener.revents&N_POLLIN))continue;
+        int fd=n_channel_accept(0);
+        if(fd<0){if(errno==EAGAIN||errno==EINTR)continue;break;}
+        struct service_slot *slot=&slots[free_slot];slot->fd=fd;slot->done=0;
+        slot->tid=thread_create(service_request,slot);
+        if(slot->tid<0){close(fd);*slot=(struct service_slot){0};}
+    }
+    __atomic_store_n(&service_stopping,1,__ATOMIC_RELEASE);
+    for(unsigned i=0;i<FETCH_SERVICE_THREADS;i++)if(slots[i].tid)thread_join(slots[i].tid);
+    return 0;
 }

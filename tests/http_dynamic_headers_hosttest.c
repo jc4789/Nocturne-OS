@@ -33,6 +33,7 @@ static bool fail(struct job*j,const char*s){snprintf(j->error,sizeof j->error,"%
 #undef calloc
 #undef realloc
 #undef free
+#include "http_mock_lifecycle.h"
 static unsigned checks,failed,fields;
 static size_t max_line;
 #define CHECK(c) do{checks++;if(!(c)){failed++;printf("FAIL dynamic HTTP:%d %s\n",__LINE__,#c);}}while(0)

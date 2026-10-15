@@ -13,11 +13,17 @@ static bool engine_closed;
 uint64_t uptime_ms(void){return clock_ms;}
 bool net_wait_up(int timeout){(void)timeout;return true;}
 int net_resolve(const char *host,uint32_t *ip){(void)host;*ip=0x0a000202;return 0;}
+int net_resolve_all(const char *host,uint32_t *ips,size_t capacity,struct n_dns_result *result){
+    *result=(struct n_dns_result){.version=1,.status=N_DNS_OK,.count=1,.ttl=60};
+    uint32_t ip;int code=net_resolve(host,&ip);if(code==0&&capacity)ips[0]=ip;return code;}
+void yield(void){}
 int tcp_connect(uint32_t ip,uint16_t port,int timeout){(void)ip;(void)port;CHECK(timeout<=20000);
     if(connect_delay>=(unsigned)timeout){clock_ms+=timeout;errno=ETIMEDOUT;return -1;}
     clock_ms+=connect_delay;return 7;}
 int tcp_close(int socket){CHECK(socket==7);closed++;return 0;}
 long tcp_send(int socket,const void *data,size_t n){(void)socket;(void)data;return (long)n;}
+long tcp_send_until(int socket,const void *data,size_t n,uint64_t deadline){(void)deadline;return tcp_send(socket,data,n);}
+long tcp_send_some(int socket,const void *data,size_t n){return tcp_send(socket,data,n);}
 long tcp_recv(int socket,void *data,size_t n,int timeout){(void)socket;(void)n;
     if(read_count<32)last_timeouts[read_count]=timeout;read_count++;
     if(failure_mode==1)return 0;
@@ -27,6 +33,9 @@ long tcp_recv(int socket,void *data,size_t n,int timeout){(void)socket;(void)n;
 void br_ssl_client_init_full(br_ssl_client_context *cc,br_x509_minimal_context *xc,
     const br_x509_trust_anchor *anchors,size_t count){(void)xc;(void)anchors;(void)count;memset(cc,0,sizeof *cc);}
 void br_ssl_engine_set_buffer(br_ssl_engine_context *cc,void *buf,size_t len,int bidi){(void)cc;(void)buf;(void)len;(void)bidi;}
+unsigned char *br_ssl_engine_sendapp_buf(const br_ssl_engine_context *cc,size_t *len){(void)cc;(void)len;abort();}
+void br_ssl_engine_sendapp_ack(br_ssl_engine_context *cc,size_t len){(void)cc;(void)len;abort();}
+void br_ssl_engine_flush(br_ssl_engine_context *cc,int force){(void)cc;(void)force;abort();}
 int br_ssl_client_reset(br_ssl_client_context *cc,const char *host,int resume){(void)cc;(void)host;(void)resume;engine_closed=false;return 1;}
 unsigned br_ssl_engine_current_state(const br_ssl_engine_context *cc){return cc->err||engine_closed?BR_SSL_CLOSED:BR_SSL_SENDAPP;}
 void br_sslio_init(br_sslio_context *ctx,br_ssl_engine_context *engine,
@@ -46,6 +55,7 @@ static void setup(unsigned connect,unsigned delay,unsigned records){
     clock_ms=100;connect_delay=connect;read_delay=delay;handshake_reads=records;
     application_reads=1;close_reads=0;failure_mode=0;closed=read_count=0;engine_closed=false;
     memset(last_timeouts,0,sizeof last_timeouts);}
+static int cancel_after_clock(void *ctx){return clock_ms>=*(uint64_t*)ctx;}
 int main(void){char error[160],byte;net_stream *s;
     /* A legitimate slow TLS handshake must not inherit TCP's spent 20s cap. */
     setup(500,6000,4);s=ns_open("transport.invalid",443,true,0,error,sizeof error);
@@ -79,6 +89,14 @@ int main(void){char error[160],byte;net_stream *s;
     if(s){read_delay=90000;CHECK(ns_read(s,&byte,1)==1&&last_timeouts[0]==180000);ns_close(s);CHECK(closed==1);}
     setup(0,1,1);s=ns_open("transport.invalid",443,true,-1,error,sizeof error);CHECK(s!=NULL);
     if(s){read_delay=200000;CHECK(ns_read(s,&byte,1)==1&&last_timeouts[1]==-1);ns_close(s);CHECK(closed==1);}
+    setup(0,1000,1);uint64_t cancel_at=clock_ms+250;
+    s=ns_open_http_cancelled_timed("transport.invalid",443,true,30000,error,sizeof error,NULL,"cancel-test",cancel_after_clock,&cancel_at);
+    CHECK(!s&&errno==ECANCELED&&clock_ms==400&&closed==1&&read_count==3);
+    CHECK(strstr(error,"cancelled")&&last_timeouts[0]==100&&last_timeouts[2]==100);
+    setup(0,1,1);cancel_at=clock_ms+100;
+    s=ns_open_http_cancelled_timed("transport.invalid",443,true,30000,error,sizeof error,NULL,"clear-test",cancel_after_clock,&cancel_at);
+    CHECK(s&&s->cancelled==NULL&&s->cancel_ctx==NULL);
+    if(s){clock_ms+=200;CHECK(ns_read(s,&byte,1)==1);ns_close(s);}
     printf("tls-stream-deadline: %d checks, %d failed\n",checks,failed);return failed!=0;}
 #else
 /* HTTP transport regressions, not website acceptance tests. ns_read is the
@@ -124,6 +142,7 @@ long ns_read(net_stream *s, void *data, size_t n) {
 }
 const char *ns_error(net_stream *s) { return s->fail ? "test read error" : ""; }
 void ns_close(net_stream *s) { (void)s; }
+#include "http_mock_lifecycle.h"
 
 static int callback(void *ctx, const char *data, size_t n) {
     (void)ctx; callbacks++;

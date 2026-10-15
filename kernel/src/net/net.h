@@ -3,6 +3,9 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+struct n_netstats;
+struct regs;
+struct task;
 
 struct netif {
     const char *driver;
@@ -13,6 +16,7 @@ struct netif {
        the NIC. rx_pending is also safe with interrupts disabled. */
     bool (*rx_pending)(void);
     size_t (*poll_rx)(void (*input)(const void *frame, size_t len));
+    void (*get_stats)(struct n_netstats *stats);
 };
 
 void net_register(struct netif *nif);
@@ -33,3 +37,8 @@ bool net_config(uint8_t mac[6], uint32_t *ip, uint32_t *mask, uint32_t *gw, uint
 /* busy-wait helper usable before the scheduler can block us */
 void net_delay_ms(uint64_t ms);
 void net_process_exit(int pid);
+void net_task_exit(struct task *task); /* release per-thread setup cancellation ref */
+/* AP fast path performs only bounded mapped-memory copies. It cannot allocate,
+   block, run protocol output or touch BSP wait queues. false requests BSP. */
+bool net_ap_syscall(struct regs *regs);
+void net_ap_notify_bsp(void);

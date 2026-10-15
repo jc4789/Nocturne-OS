@@ -19,11 +19,36 @@ struct http_transport_timing {
 net_stream *ns_open(const char *host, uint16_t port, bool tls, int timeout_ms, char *err, size_t errlen);
 net_stream *ns_open_timed(const char *host, uint16_t port, bool tls, int timeout_ms,
                           char *err, size_t errlen, struct http_transport_timing *timing);
+/* Read-only connection diagnostics; no resolver or connect policy override.
+   Version 1 records the real resolver count, attempted TCP candidates and the
+   successful peer. Separate from the existing timing structure's native ABI. */
+struct ns_connection_info { uint32_t version, candidates, attempts, peer_ip; };
+int ns_get_connection_info(const net_stream *,struct ns_connection_info *);
 long ns_write(net_stream *s, const void *buf, size_t n); /* all or -1 */
 long ns_read(net_stream *s, void *buf, size_t n);        /* >0 bytes, 0 = end of stream, -1 = error */
 void ns_set_timeout(net_stream *s, int timeout_ms);      /* per read; -1 waits forever */
 const char *ns_error(net_stream *s);                     /* last error, "" if none */
 void ns_close(net_stream *s);
+/* HTTP ALPN is opt-in: non-HTTP users of ns_open keep http/1.1. Session
+   resumption and connection reuse never cross this exact partition key. */
+net_stream *ns_open_http_timed(const char *, uint16_t, bool, int, char *, size_t,
+                              struct http_transport_timing *, const char *partition);
+/* The cancellation hook is borrowed only while opening/handshaking. It is
+   always cleared before publishing a connection to the shared HTTP/2 pool. */
+net_stream *ns_open_http_cancelled_timed(const char *, uint16_t, bool, int, char *, size_t,
+    struct http_transport_timing *, const char *partition, int (*cancelled)(void *), void *);
+const char *ns_protocol(net_stream *s);
+bool ns_session_resumed(net_stream *s); /* authenticated handshake kept ID AND master secret */
+void ns_set_cancel(net_stream *, int (*cancelled)(void *), void *);
+/* Nonblocking application read for the HTTP/2 connection pump. -2 is pending;
+   unlike a failed TLS read, pending does not poison the TLS engine. */
+long ns_try_read(net_stream *, void *, size_t);
+/* Native nonblocking send: accepted prefix, -2 pending, -1 error. n==0
+   drains pending TLS records without consuming application bytes. */
+long ns_try_write(net_stream *, const void *, size_t);
+void ns_abort(net_stream *);
+uint64_t ns_bytes_sent(net_stream *); /* accepted TCP bytes, including TLS records */
+void ns_sessions_clear(void);
 
 /* ---- URLs ---- */
 #define HTTP_URL_MAX 16384u /* legacy fixed struct/url_parse bound, including NUL */
@@ -113,11 +138,38 @@ int http_request_limited(const struct http_req *rq, struct http_resp *resp, size
 struct http_stream_hooks {
     int (*headers)(void *ctx, const struct http_resp *response);
     int (*upload)(void *ctx, size_t transmitted, size_t total);
+    int (*cancelled)(void *ctx);
 };
 int http_request_stream(const struct http_req *, struct http_resp *, size_t,
                         const struct http_stream_hooks *);
 int http_request_stream_timed(const struct http_req *, struct http_resp *, size_t,
                               const struct http_stream_hooks *, struct http_transport_timing *);
+enum http_error_kind { HTTP_ERR_NONE, HTTP_ERR_DNS_TEMP, HTTP_ERR_DNS_NOT_FOUND,
+    HTTP_ERR_CONNECT, HTTP_ERR_TIMEOUT, HTTP_ERR_RESET, HTTP_ERR_PROTOCOL,
+    HTTP_ERR_TLS_VERIFY, HTTP_ERR_CANCELLED, HTTP_ERR_NO_MEMORY, HTTP_ERR_IO,
+    HTTP_ERR_UNPROCESSED };
+struct http_transport_result {
+    enum http_error_kind error;
+    enum http_transport_phase phase;
+    size_t request_bytes_sent, response_bytes_received; /* sent is conservative TCP wire bytes */
+    bool reused;
+    bool request_unprocessed; /* peer explicitly refused it / GOAWAY above last-stream */
+    /* Native observations only; never used to choose transport behavior.
+       Connection identity is process-local and survives pool clear/retire.
+       HTTP/1 uses stream zero; h2 reports its actual wire stream identifier. */
+    uint64_t connection_id;
+    uint32_t stream_id;
+    bool http2;
+};
+int http_request_stream_ex(const struct http_req *, struct http_resp *, size_t,
+                           const struct http_stream_hooks *, struct http_transport_timing *,
+                           const char *partition, struct http_transport_result *);
+/* Native explicit cleartext HTTP/2 prior knowledge (RFC 9113 3.3). HTTPS
+   always uses certificate validation and ALPN through the normal entry. */
+int http_request_h2_prior_knowledge_ex(const struct http_req *, struct http_resp *, size_t,
+    const struct http_stream_hooks *, const char *partition, struct http_transport_result *);
+/* Drop idle connections/session keys at an explicit security-context teardown. */
+void http_pool_clear(void);
 /* Both successful and failed responses may be freed. Do not free a borrowed
    headers_full used solely to adapt an existing header block for lookup. */
 void http_resp_free(struct http_resp *resp);

@@ -1,13 +1,135 @@
-/* HTTP/1.1 client: one request per connection ("Connection: close"), Content-Length, chunked and
-   read-until-close bodies, over plain TCP or TLS. */
+/* HTTP/1.1 persistent connections and ALPN HTTP/2. HTTP semantics and content
+   decoding are shared across both wire protocols. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <limits.h>
-#include "http.h"
+#include <errno.h>
+#include "../include/http.h"
+#include "http2.h"
 #include "browser_identity.h"
 extern uint64_t uptime_ms(void);
+extern void yield(void);
+extern int msleep(unsigned);
+
+/* The pool is process-local. It never coalesces certificate names or origins.
+   Keys include the exact caller partition and credential header bytes; no
+   cookies, authorization values or HPACK state cross that boundary. */
+struct pooled_connection {
+    struct pooled_connection *next;
+    net_stream *stream;
+    struct http2_connection *h2;
+    char *host,*key;
+    uint16_t port;
+    bool tls,prior,opening,retire;
+    unsigned users;
+    uint64_t idle;
+    uint64_t identity;
+};
+static struct pooled_connection *pool;
+static uint32_t pool_lock;
+static unsigned pool_count;
+static uint64_t connection_identity;
+static void pool_enter(void){while(__atomic_exchange_n(&pool_lock,1,__ATOMIC_ACQUIRE))yield();}
+static void pool_leave(void){__atomic_store_n(&pool_lock,0,__ATOMIC_RELEASE);}
+static void pool_destroy(struct pooled_connection *p) {
+    http2_free(p->h2);ns_abort(p->stream);free(p->host);free(p->key);free(p);
+}
+static void pool_unlink(struct pooled_connection *p) {
+    struct pooled_connection **at=&pool;while(*at&&*at!=p)at=&(*at)->next;
+    if(*at){*at=p->next;pool_count--;}
+}
+static char *pool_key(const struct http_req *rq,const char *partition) {
+    const char *headers=rq->headers?rq->headers:"";size_t n=strlen(partition?partition:"");
+    size_t credentials=0;
+    for(const char *p=headers;*p;) {
+        const char *end=strstr(p,"\r\n");if(!end)return NULL;
+        if(!strncasecmp(p,"Authorization:",14)||!strncasecmp(p,"Proxy-Authorization:",20)||!strncasecmp(p,"Cookie:",7))
+            credentials+=(size_t)(end-p)+2;
+        p=end+2;
+    }
+    if(n>SIZE_MAX-credentials-48)return NULL;
+    char *key=malloc(n+credentials+48);if(!key)return NULL;
+    int prefix=snprintf(key,n+credentials+48,"%zu:",n);size_t at=(size_t)prefix;
+    memcpy(key+at,partition?partition:"",n);at+=n;
+    for(const char *p=headers;*p;) {
+        const char *end=strstr(p,"\r\n");
+        if(!strncasecmp(p,"Authorization:",14)||!strncasecmp(p,"Proxy-Authorization:",20)||!strncasecmp(p,"Cookie:",7)) {
+            size_t bytes=(size_t)(end-p)+2;memcpy(key+at,p,bytes);at+=bytes;
+        }
+        p=end+2;
+    }
+    key[at]=0;return key;
+}
+static struct pooled_connection *pool_acquire(const struct http_req *rq,const struct url_owned *u,
+    int timeout,const char *partition,bool prior,const struct http_stream_hooks *hooks,
+    struct http_transport_timing *timing,struct http_transport_result *result,char *error,size_t error_cap) {
+    char *key=pool_key(rq,partition);if(!key){errno=ENOMEM;snprintf(error,error_cap,"out of memory preparing connection key");return NULL;}
+    uint64_t started=uptime_ms();
+    for(;;) {
+        if(hooks&&hooks->cancelled&&hooks->cancelled(rq->ctx)){errno=ECANCELED;snprintf(error,error_cap,"request cancelled");break;}
+        if(timeout>0&&uptime_ms()-started>=(uint64_t)timeout){errno=ETIMEDOUT;snprintf(error,error_cap,"connection pool wait timed out");break;}
+        pool_enter();bool opening=false;
+        struct pooled_connection *oldest=NULL;
+        for(struct pooled_connection *p=pool;p;p=p->next) {
+            if(!p->users&&(!oldest||p->idle<oldest->idle))oldest=p;
+            if(p->retire||p->port!=u->port||p->tls!=u->tls||p->prior!=prior||strcmp(p->host,u->host)||strcmp(p->key,key))continue;
+            if(p->opening){opening=true;continue;}
+            if(!p->users&&uptime_ms()-p->idle>=30000){p->retire=true;continue;}
+            if(p->h2?http2_available(p->h2):!p->users) {
+                p->users++;pool_leave();free(key);
+                if(result){result->reused=true;result->connection_id=p->identity;result->http2=p->h2!=NULL;}
+                if(timing)memset(timing,0,sizeof *timing);
+                if(!p->h2)ns_set_timeout(p->stream,timeout);return p;
+            }
+        }
+        if(opening){pool_leave();msleep(1);continue;}
+        if(oldest&&(oldest->retire||pool_count>=16)) {
+            pool_unlink(oldest);pool_leave();pool_destroy(oldest);continue;
+        }
+        if(pool_count>=16){pool_leave();msleep(1);continue;}
+        struct pooled_connection *p=calloc(1,sizeof *p);
+        if(!p){pool_leave();errno=ENOMEM;break;}
+        size_t host_len=strlen(u->host);p->host=malloc(host_len+1);
+        if(!p->host){free(p);pool_leave();errno=ENOMEM;break;}
+        memcpy(p->host,u->host,host_len+1);
+        p->key=key;p->port=u->port;p->tls=u->tls;p->prior=prior;p->opening=true;p->users=1;
+        p->identity=++connection_identity;
+        p->next=pool;pool=p;pool_count++;pool_leave();
+        p->stream=ns_open_http_cancelled_timed(u->host,u->port,u->tls,timeout,error,error_cap,timing,key,
+            hooks?hooks->cancelled:NULL,rq->ctx);
+        if(p->stream&&(prior||!strcmp(ns_protocol(p->stream),"h2"))) {
+            p->h2=http2_new(p->stream);if(!p->h2){errno=errno?errno:EIO;snprintf(error,error_cap,"HTTP/2 preface failed");}
+        }
+        pool_enter();p->opening=false;
+        if(!p->stream||((prior||!strcmp(ns_protocol(p->stream),"h2"))&&!p->h2)) {
+            pool_unlink(p);pool_leave();pool_destroy(p);return NULL;
+        }
+        if(result){result->connection_id=p->identity;result->http2=p->h2!=NULL;}
+        pool_leave();return p;
+    }
+    free(key);return NULL;
+}
+static void pool_release(struct pooled_connection *p,bool reusable) {
+    if(!p)return;
+    /* h2 cancellation only resets one stream; protocol/transport failures
+       make http2_available false and retire the connection when idle. */
+    pool_enter();if(!reusable&&!p->h2)p->retire=true;
+    if(p->h2&&!http2_reusable(p->h2))p->retire=true;
+    if(!p->h2)ns_set_cancel(p->stream,NULL,NULL);
+    if(p->users)p->users--;p->idle=uptime_ms();
+    bool destroy=!p->users&&p->retire;if(destroy)pool_unlink(p);pool_leave();
+    if(destroy)pool_destroy(p);
+}
+void http_pool_clear(void) {
+    for(;;) {
+        pool_enter();struct pooled_connection *idle=NULL;
+        for(struct pooled_connection *p=pool;p;p=p->next){p->retire=true;if(!p->users){idle=p;break;}}
+        if(idle)pool_unlink(idle);pool_leave();if(!idle)break;pool_destroy(idle);
+    }
+    ns_sessions_clear();
+}
 
 bool url_parse(const char *s, struct url *u) {
     if (!s || !u || strlen(s) >= HTTP_URL_MAX) return false;
@@ -152,6 +274,8 @@ enum http_url_result http_origin_owned(const char *raw, char **origin) {
 /* buffered reader on top of a stream */
 struct rd {
     net_stream *s;
+    struct http2_stream *h2;
+    struct http_transport_result *result;
     char buf[4096];
     size_t pos, len;
     char *line;
@@ -162,7 +286,8 @@ struct rd {
 static bool rd_fill(struct rd *r) {
     if (r->pos < r->len) return true;
     if (r->eof || r->err) return false;
-    long n = ns_read(r->s, r->buf, sizeof r->buf);
+    long n = r->h2?http2_read(r->h2,r->buf,sizeof r->buf):ns_read(r->s, r->buf, sizeof r->buf);
+    if(n>0&&r->result&&!r->h2)r->result->response_bytes_received+=(size_t)n;
     if (n < 0) r->err = true;
     if (n <= 0) {
         r->eof = true;
@@ -222,11 +347,13 @@ static bool sink_plain_put(struct sink *k, const char *data, size_t n) {
     if (n >= (size_t)-1 - k->rs->body_len ||
         (k->limit && (k->rs->body_len > k->limit || n > k->limit - k->rs->body_len))) {
         snprintf(k->rs->error, sizeof k->rs->error, "response exceeds size limit");
+        errno=EFBIG;
         k->aborted = true;
         return false;
     }
     if (k->rq->on_body) {
         if (k->rq->on_body(k->rq->ctx, data, n) < 0) {
+            errno=ECANCELED;
             k->aborted = true;
             return false;
         }
@@ -242,6 +369,7 @@ static bool sink_plain_put(struct sink *k, const char *data, size_t n) {
         if (k->limit && cap > k->limit + 1) cap = k->limit + 1;
         char *nb = realloc(k->rs->body, cap);
         if (!nb) {
+            errno=ENOMEM;
             snprintf(k->rs->error, sizeof k->rs->error, "out of memory");
             k->aborted = true;
             return false;
@@ -430,7 +558,23 @@ struct http_scratch {
     struct url_owned url;
     char *head;
     size_t head_length;
+    struct pooled_connection *connection;
+    struct http2_stream *h2;
+    struct http_transport_result *result;
+    bool reusable;
+    bool request_close;
 };
+static bool has_token(const char *value,const char *token) {
+    size_t n=strlen(token);
+    while(*value) {
+        while(*value==','||*value==' '||*value=='\t')value++;
+        const char *end=value;while(*end&&*end!=',')end++;
+        const char *last=end;while(last>value&&(last[-1]==' '||last[-1]=='\t'))last--;
+        if((size_t)(last-value)==n&&!strncasecmp(value,token,n))return true;
+        value=end;
+    }
+    return false;
+}
 static const char *request_head(const struct http_req *rq, struct http_scratch *work) {
     const char *method = rq->method ? rq->method : "GET";
     if (!*method) return "invalid HTTP method";
@@ -443,12 +587,30 @@ static const char *request_head(const struct http_req *rq, struct http_scratch *
     char port[8] = "", content_length[64] = "";
     if (u->port != (u->tls ? 443 : 80)) snprintf(port, sizeof port, ":%u", u->port);
     if (rq->body_len && !rq->body) return "missing HTTP request body storage";
+    if(rq->headers)for(const char *p=rq->headers;*p;) {
+        const char *end=strstr(p,"\r\n"),*colon=strchr(p,':');
+        if(!end||!colon||colon==p||colon>end)return "invalid request header field";
+        for(const char *q=p;q<colon;q++)if(!isalnum((unsigned char)*q)&&!strchr("!#$%&'*+-.^_`|~",*q))return "invalid request header name";
+        for(const char *q=colon+1;q<end;q++)if((*q<32&&*q!='\t')||(unsigned char)*q==127)return "invalid request header value";
+        size_t name=(size_t)(colon-p);
+        if((name==14&&!strncasecmp(p,"Content-Length",name))||
+           (name==17&&!strncasecmp(p,"Transfer-Encoding",name))||
+           (name==4&&!strncasecmp(p,"Host",name)))return "caller supplied transport framing header";
+        if(name==10&&!strncasecmp(p,"Connection",name)) {
+            const char *v=colon+1;
+            while(v<end){while(v<end&&(*v==','||*v==' '||*v=='\t'))v++;
+                const char *last=v;while(last<end&&*last!=',')last++;const char *trim=last;
+                while(trim>v&&(trim[-1]==' '||trim[-1]=='\t'))trim--;
+                if(trim-v==5&&!strncasecmp(v,"close",5))work->request_close=true;v=last;}
+        }
+        p=end+2;
+    }
     /* Fetch HTTP-network-or-cache: absent POST/PUT body generates zero;
        other absent bodies must not become an allocated empty-body request. */
     if (rq->body || !strcmp(method, "POST") || !strcmp(method, "PUT"))
         snprintf(content_length, sizeof content_length, "Content-Length: %zu\r\n", rq->body_len);
     const char *parts[] = {method, " ", u->path, " HTTP/1.1\r\nHost: ", u->host, port,
-        "\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\nConnection: close\r\n", content_length,
+        "\r\nUser-Agent: " NOCTURNE_USER_AGENT "\r\n", content_length,
         rq->headers ? rq->headers : "", "\r\n"};
     size_t length = 0;
     for (size_t i = 0; i < sizeof parts / sizeof *parts; i++) {
@@ -468,79 +630,96 @@ static const char *request_head(const struct http_req *rq, struct http_scratch *
 }
 static int request_inner(const struct http_req *rq, struct http_resp *rs, struct http_scratch *work, size_t body_limit,
                          const struct http_stream_hooks *hooks,struct http_transport_timing *timing,
-                         uint64_t *phase_started) {
+                         uint64_t *phase_started,const char *partition,bool prior) {
     memset(rs, 0, sizeof *rs);
     struct url_owned *u = &work->url;
     if (!url_parse_owned(rq->url, u)) {
+        errno=EINVAL;
         snprintf(rs->error, sizeof rs->error, "invalid URL or URL allocation failure");
         return -1;
     }
+    if(prior&&u->tls){errno=EINVAL;snprintf(rs->error,sizeof rs->error,"prior-knowledge entry requires an http URL");return -1;}
     const char *method = rq->method ? rq->method : "GET";
     const char *head_error = request_head(rq, work);
-    if (head_error) { snprintf(rs->error, sizeof rs->error, "%s", head_error); return -1; }
+    if (head_error) { errno=EINVAL;snprintf(rs->error, sizeof rs->error, "%s", head_error); return -1; }
     /* This legacy API accepts signed int durations. Its default is the
        representation maximum, not an independent 60-second resource quota. */
     int timeout = rq->timeout_ms ? rq->timeout_ms : INT_MAX;
-    net_stream *s = timing?ns_open_timed(u->host,u->port,u->tls,timeout,rs->error,sizeof rs->error,timing):
-        ns_open(u->host, u->port, u->tls, timeout, rs->error, sizeof rs->error);
-    if (!s) return -1;
+    work->connection=pool_acquire(rq,u,timeout,partition,prior,hooks,timing,work->result,rs->error,sizeof rs->error);
+    if(!work->connection)return -1;
+    net_stream *s=work->connection->stream;
+    if(!work->connection->h2)ns_set_cancel(s,hooks?hooks->cancelled:NULL,rq->ctx);
     if(timing){timing->phase=HTTP_PHASE_HEADER;*phase_started=uptime_ms();}
 
     /* One complete header block avoids a flush/TLS record and TCP send for
        each fragment. A short write must never be treated as a sent request. */
-    bool ok = ns_write(s, work->head, work->head_length) == (long)work->head_length;
-    for (size_t sent = 0; ok && sent < rq->body_len;) {
+    bool ok;
+    if(work->connection->h2) {
+        work->h2=http2_start(work->connection->h2,rq,u,work->head,hooks,work->result,rs->error,sizeof rs->error);
+        ok=work->h2!=NULL;
+    }else {
+        /* A failed TLS write might already have sent a prefix. Record the
+           attempted header bytes conservatively, so POST is never replayed. */
+        uint64_t before=ns_bytes_sent(s);
+        ok = ns_write(s, work->head, work->head_length) == (long)work->head_length;
+        if(work->result)work->result->request_bytes_sent+=(size_t)(ns_bytes_sent(s)-before);
+    }
+    for (size_t sent = 0; ok && !work->h2 && sent < rq->body_len;) {
         size_t count = rq->body_len - sent;
         if (count > 65536u) count = 65536u;
+        uint64_t before=ns_bytes_sent(s);
         ok = ns_write(s, (const char *)rq->body + sent, count) == (long)count;
+        if(work->result)work->result->request_bytes_sent+=(size_t)(ns_bytes_sent(s)-before);
         sent += count;
         if (ok && hooks && hooks->upload) ok = hooks->upload(rq->ctx, sent, rq->body_len) >= 0;
     }
     if (ok && !rq->body_len && hooks && hooks->upload) ok = hooks->upload(rq->ctx, 0, 0) >= 0;
     if (!ok) {
         snprintf(rs->error, sizeof rs->error, "send: %s", ns_error(s));
-        ns_close(s);
         return -1;
     }
 
     struct rd *r = calloc(1, sizeof *r);
     if (!r) {
         snprintf(rs->error, sizeof rs->error, "out of memory");
-        ns_close(s);
         return -1;
     }
-    r->s = s;
+    r->s = s;r->h2=work->h2;r->result=work->result;
     char *line = NULL;
     int status = 0;
-    /* status line, skipping any 100 Continue */
+    int major=0,minor=0;
+    /* All informational responses precede the final response. 101 changes
+       protocols and cannot be handed back as a reusable HTTP connection. */
     do {
-        if (!rd_line(r, &line) || r->line_invalid || sscanf(line, "HTTP/%*d.%*d %d", &status) != 1) {
-            snprintf(rs->error, sizeof rs->error, "no HTTP response (%s)", r->line_oom ? "out of memory reading line" : ns_error(s)[0] ? ns_error(s) : "connection closed");
+        if (!rd_line(r, &line) || r->line_invalid || sscanf(line, "HTTP/%d.%d %d", &major,&minor,&status) != 3 ||
+            major!=1||(minor!=0&&minor!=1)||status<100||status>599||status==101) {
+            if(r->eof&&!r->err)errno=ECONNRESET;else if(!r->err)errno=EPROTO;
+            const char *detail=work->h2?http2_error(work->h2):ns_error(s);
+            snprintf(rs->error, sizeof rs->error, "no HTTP response (%s)", r->line_oom ? "out of memory reading line" : detail[0] ? detail : "connection closed");
             rd_free(r);
-            ns_close(s);
             return -1;
         }
-        if (status == 100) {
+        if (status < 200) {
             size_t interim_len = 0;
             for (;;) {
                 if (!rd_line(r, &line) || r->line_invalid) {
                     snprintf(rs->error, sizeof rs->error, "invalid interim response headers");
-                    rd_free(r); ns_close(s); return -1;
+                    errno=EPROTO;rd_free(r); return -1;
                 }
                 if (!line[0]) break;
                 if (!valid_header_line(line)) {
                     snprintf(rs->error, sizeof rs->error, "invalid interim response header field");
-                    rd_free(r); ns_close(s); return -1;
+                    errno=EPROTO;rd_free(r); return -1;
                 }
                 size_t l = strlen(line);
                 if (interim_len > SIZE_MAX - 2 || l > SIZE_MAX - interim_len - 2) {
                     snprintf(rs->error, sizeof rs->error, "response header length overflow");
-                    rd_free(r); ns_close(s); return -1;
+                    errno=EOVERFLOW;rd_free(r); return -1;
                 }
                 interim_len += l + 2;
             }
         }
-    } while (status == 100);
+    } while (status < 200);
     if(timing)timing->first_header_ms=uptime_ms()-*phase_started;
     rs->status = status;
     const char *reason = strchr(line, ' ');
@@ -553,7 +732,7 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
             rs->status_text_full = malloc(reason_len + 1);
             if (!rs->status_text_full) {
                 snprintf(rs->error, sizeof rs->error, "out of memory storing HTTP reason phrase");
-                rd_free(r); ns_close(s); return -1;
+                errno=ENOMEM;rd_free(r); return -1;
             }
             memcpy(rs->status_text_full, reason, reason_len + 1);
         } else {
@@ -562,6 +741,7 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     }
     size_t hl = 0, headers_cap = sizeof rs->headers, length = 0;
     bool chunked = false, have_length = false, gzip = false, have_encoding = false;
+    bool connection_close=false,connection_keepalive=false;
     const char *header_error = NULL;
     for (;;) {
         if (!rd_line(r, &line)) { header_error = r->line_oom ? "out of memory reading response header" : "incomplete response headers"; break; }
@@ -607,13 +787,16 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
                 header_error = "unsupported or invalid Content-Encoding";
             gzip = !strcasecmp(v, "gzip");
             have_encoding = true;
+        } else if ((v = header_value(line,"Connection"))) {
+            connection_close|=has_token(v,"close");connection_keepalive|=has_token(v,"keep-alive");
         }
         if (header_error) break;
     }
+    if(chunked&&have_length)header_error="ambiguous Transfer-Encoding and Content-Length";
     if (header_error) {
         snprintf(rs->error, sizeof rs->error, "%s", header_error);
         free(rs->headers_full); rs->headers_full = NULL; rs->headers[0] = 0;
-        rd_free(r); ns_close(s); return -1;
+        errno=EPROTO;rd_free(r); return -1;
     }
     rs->headers_len = hl;
     if (rs->headers_full) rs->headers[0] = 0;
@@ -623,7 +806,8 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
         int decision = hooks->headers(rq->ctx, rs);
         if (decision) {
             if (decision < 0 && !rs->error[0]) snprintf(rs->error, sizeof rs->error, "response headers rejected");
-            rd_free(r); ns_close(s); return decision < 0 ? -1 : 0;
+            if(decision<0)errno=ECANCELED;
+            rd_free(r); return decision < 0 ? -1 : 0;
         }
     }
 
@@ -633,7 +817,7 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     size_t decoded_limit = body_limit ? body_limit : HTTP_GZIP_LIMIT;
     bool stream_gzip=gzip&&hooks&&rq->on_body&&!no_body;
     struct sink k = {gzip&&!stream_gzip ? &buffered : rq, rs, 0, false, gzip ? decoded_limit : body_limit,NULL};
-    if(stream_gzip){k.gzip=gzip_create();if(!k.gzip){snprintf(rs->error,sizeof rs->error,"out of memory decoding gzip");rd_free(r);ns_close(s);return -1;}}
+    if(stream_gzip){k.gzip=gzip_create();if(!k.gzip){errno=ENOMEM;snprintf(rs->error,sizeof rs->error,"out of memory decoding gzip");rd_free(r);return -1;}}
     bool body_ok;
     if (no_body) {
         body_ok = true;
@@ -658,6 +842,9 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
         body_ok = copy_body(r, &k, (size_t)-1);
     }
     if(body_ok&&stream_gzip)body_ok=gzip_feed(k.gzip,&k,NULL,0,true);
+    if(body_ok&&work->h2&&http2_finish(work->h2,true,hooks)<0) {
+        body_ok=false;snprintf(rs->error,sizeof rs->error,"%s",http2_error(work->h2));
+    }
     free(k.gzip);k.gzip=NULL;
     if (body_ok && gzip && !stream_gzip && !no_body) {
         body_ok = gunzip_body(rs, decoded_limit);
@@ -678,11 +865,14 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
         if (!rs->error[0]) snprintf(rs->error, sizeof rs->error, "response cut short (%s)", r->line_oom ? "out of memory reading line" : ns_error(s)[0] ? ns_error(s) : "connection closed");
         ret = -1;
     } else if (k.aborted) {
+        if(!errno)errno=ECANCELED;
         if (!rs->error[0]) snprintf(rs->error, sizeof rs->error, "aborted");
         ret = -1;
     }
+    work->reusable=ret==0&&!work->request_close&&!connection_close&&(minor==1||connection_keepalive)&&
+        (no_body||chunked||have_length)&&r->pos==r->len&&!r->err&&!r->eof;
+    if(work->h2)work->reusable=ret==0;
     rd_free(r);
-    ns_close(s);
     if (ret < 0) {
         free(rs->headers_full); rs->headers_full = NULL;
         rs->headers[0] = 0; rs->headers_len = 0;
@@ -691,8 +881,12 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
 }
 
 static int request_with_limit(const struct http_req *rq, struct http_resp *rs, size_t body_limit,
-                              const struct http_stream_hooks *hooks,struct http_transport_timing *timing) {
+                              const struct http_stream_hooks *hooks,struct http_transport_timing *timing,
+                              const char *partition,struct http_transport_result *result,bool prior) {
     if(timing)memset(timing,0,sizeof *timing);
+    struct http_transport_result local_result={0};
+    if(!result)result=&local_result;else memset(result,0,sizeof *result);
+    struct http_transport_timing local_timing={0};if(!timing)timing=&local_timing;
     struct http_scratch *work = calloc(1, sizeof *work);
     if (!work) {
         memset(rs, 0, sizeof *rs);
@@ -700,19 +894,50 @@ static int request_with_limit(const struct http_req *rq, struct http_resp *rs, s
         return -1;
     }
     uint64_t phase_started=0;
-    int result = request_inner(rq, rs, work, body_limit, hooks,timing,&phase_started);
+    work->result=result;errno=0;
+    int code = request_inner(rq, rs, work, body_limit, hooks,timing,&phase_started,partition,prior);
+    int cause=errno;
+    if(work->h2)http2_release(work->h2);
+    pool_release(work->connection,work->reusable);
+    /* An idle peer can close between checkout and the first read. Retry only
+       one idempotent request, before any response byte or callback exists. */
+    const char *method=rq->method?rq->method:"GET";
+    bool idempotent=!strcmp(method,"GET")||!strcmp(method,"HEAD")||!strcmp(method,"OPTIONS")||
+        !strcmp(method,"PUT")||!strcmp(method,"DELETE")||!strcmp(method,"TRACE");
+    if(code<0&&result->reused&&!result->response_bytes_received&&idempotent&&
+        (cause==ECONNRESET||cause==EPIPE||cause==ENOTCONN||cause==EIO||
+         (cause==EAGAIN&&result->request_unprocessed))) {
+        free(work->head);url_owned_free(&work->url);http_resp_free(rs);
+        memset(work,0,sizeof *work);memset(result,0,sizeof *result);work->result=result;errno=0;
+        code=request_inner(rq,rs,work,body_limit,hooks,timing,&phase_started,partition,prior);cause=errno;
+        if(work->h2)http2_release(work->h2);pool_release(work->connection,work->reusable);
+    }
     if(timing){
         if(timing->phase==HTTP_PHASE_HEADER)timing->header_ms=uptime_ms()-phase_started;
         else if(timing->phase==HTTP_PHASE_BODY)timing->body_ms=uptime_ms()-phase_started;
-        if(result==0)timing->phase=HTTP_PHASE_DONE;
+        if(code==0)timing->phase=HTTP_PHASE_DONE;
+    }
+    result->phase=timing->phase;
+    if(code<0) {
+        if(cause==ECANCELED)result->error=HTTP_ERR_CANCELLED;
+        else if(cause==ENOMEM)result->error=HTTP_ERR_NO_MEMORY;
+        else if(cause==EAGAIN&&result->request_unprocessed)result->error=HTTP_ERR_UNPROCESSED;
+        else if(cause==ETIMEDOUT||cause==EAGAIN)result->error=timing->phase==HTTP_PHASE_RESOLVE?HTTP_ERR_DNS_TEMP:HTTP_ERR_TIMEOUT;
+        else if(cause==ENOENT)result->error=HTTP_ERR_DNS_NOT_FOUND;
+        else if(cause==EACCES&&timing->phase==HTTP_PHASE_TLS)result->error=HTTP_ERR_TLS_VERIFY;
+        else if(cause==ECONNRESET||cause==EPIPE||cause==ENOTCONN)result->error=HTTP_ERR_RESET;
+        else if(cause==EPROTO||cause==EINVAL||cause==EOVERFLOW)result->error=HTTP_ERR_PROTOCOL;
+        else if(timing->phase==HTTP_PHASE_CONNECT)result->error=HTTP_ERR_CONNECT;
+        else if(timing->phase==HTTP_PHASE_RESOLVE)result->error=HTTP_ERR_DNS_TEMP;
+        else result->error=HTTP_ERR_IO;
     }
     free(work->head);
     url_owned_free(&work->url);
     free(work);
-    return result;
+    errno=cause;return code;
 }
 int http_request(const struct http_req *rq, struct http_resp *rs) {
-    return request_with_limit(rq, rs, 0, NULL,NULL);
+    return request_with_limit(rq, rs, 0, NULL,NULL,NULL,NULL,false);
 }
 int http_request_limited(const struct http_req *rq, struct http_resp *rs, size_t body_limit) {
     if (!body_limit || body_limit > HTTP_RESPONSE_BODY_MAX) {
@@ -720,15 +945,24 @@ int http_request_limited(const struct http_req *rq, struct http_resp *rs, size_t
         snprintf(rs->error, sizeof rs->error, "invalid finite response size limit");
         return -1;
     }
-    return request_with_limit(rq, rs, body_limit, NULL,NULL);
+    return request_with_limit(rq, rs, body_limit, NULL,NULL,NULL,NULL,false);
 }
 int http_request_stream(const struct http_req *rq, struct http_resp *rs, size_t limit,
                         const struct http_stream_hooks *hooks) {
-    return request_with_limit(rq, rs, limit, hooks,NULL);
+    return request_with_limit(rq, rs, limit, hooks,NULL,NULL,NULL,false);
 }
 int http_request_stream_timed(const struct http_req *rq,struct http_resp *rs,size_t limit,
                               const struct http_stream_hooks *hooks,struct http_transport_timing *timing) {
-    return request_with_limit(rq,rs,limit,hooks,timing);
+    return request_with_limit(rq,rs,limit,hooks,timing,NULL,NULL,false);
+}
+int http_request_stream_ex(const struct http_req *rq,struct http_resp *rs,size_t limit,
+    const struct http_stream_hooks *hooks,struct http_transport_timing *timing,
+    const char *partition,struct http_transport_result *result) {
+    return request_with_limit(rq,rs,limit,hooks,timing,partition,result,false);
+}
+int http_request_h2_prior_knowledge_ex(const struct http_req *rq,struct http_resp *rs,size_t limit,
+    const struct http_stream_hooks *hooks,const char *partition,struct http_transport_result *result) {
+    return request_with_limit(rq,rs,limit,hooks,NULL,partition,result,true);
 }
 
 void http_resp_free(struct http_resp *resp) {

@@ -27,6 +27,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import socketserver
 import subprocess
 import sys
@@ -93,6 +94,12 @@ class TcpTestHandler(socketserver.StreamRequestHandler):
         try:
             op, n, seed = self.rfile.readline().decode().split()
             n, seed = int(n), int(seed)
+            if op == "STALL":
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+                self.wfile.write(b"READY\n")
+                self.wfile.flush()
+                time.sleep(5)
+                return
             want = pattern(n, seed)
             if op == "GET":
                 self.wfile.write(want)
@@ -117,6 +124,39 @@ def start_tcp_server():
             PATTERNS[(n, seed)] = pattern(n, seed)
     threading.Thread(target=precompute, daemon=True).start()
     return srv
+
+
+class SilentTlsHandler(socketserver.BaseRequestHandler):
+    """Consume ClientHello without replying; client cancellation owns shutdown."""
+    def handle(self):
+        self.request.settimeout(10)
+        try:
+            while self.request.recv(16384):
+                pass
+        except OSError:
+            pass
+
+
+def start_silent_tls_server():
+    srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), SilentTlsHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def copy_test_sources(paths):
+    # A preserved baseline has a longer source prefix than the checkout. Keep
+    # each native Windows command below CreateProcess's UTF-16 argument bound;
+    # every source is still copied and mcopy errors remain fatal.
+    batch, length = [], 0
+    for path in paths:
+        cost = len(path) * 2 + 4
+        if batch and length + cost > 20000:
+            mtools("mcopy", "-i", PART, *batch, "::/tests/")
+            batch, length = [], 0
+        batch.append(path)
+        length += cost
+    if batch:
+        mtools("mcopy", "-i", PART, *batch, "::/tests/")
 
 
 def start_web_servers():
@@ -149,6 +189,28 @@ def start_web_servers():
         raise
 
 
+def start_h2_server():
+    """Explicit transport regression fixture; never substitute for ALPN/TLS tests."""
+    fixture = os.path.join(ROOT, "tests", "fixtures", "js", "h2_server.py")
+    spec = importlib.util.spec_from_file_location("nocturne_h2_fixture", fixture)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    server = module.create_server()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def start_dns_servers():
+    fixture = os.path.join(ROOT, "tests", "fixtures", "dns_server.py")
+    spec = importlib.util.spec_from_file_location("nocturne_dns_fixture", fixture)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    servers = module.create_servers(forward_external=True)
+    for server in servers:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    return servers
+
+
 def make_disk(a, tcp_port, web_ports):
     # A preserved source snapshot keeps native struct layouts and expectations
     # paired with the baseline boot image while the checkout is being repaired.
@@ -175,7 +237,22 @@ def make_disk(a, tcp_port, web_ports):
         if a.source_tree or not os.path.isfile(cenc):
             sys.exit("test: build the matching native CENC test before selecting cenc")
         srcs.append(cenc)
-    mtools("mcopy", "-i", PART, *srcs, "::/tests/")
+    copy_test_sources(srcs)
+    if getattr(a, "h2_port", None):
+        port_file = os.path.join(BUILD, "h2port")
+        with open(port_file, "w", encoding="utf-8", newline="\n") as f:
+            f.write(str(a.h2_port) + "\n")
+        mtools("mcopy", "-i", PART, port_file, "::/tests/h2port")
+    if getattr(a, "tls_silent_port", None):
+        port_file = os.path.join(BUILD, "tlssilentport")
+        with open(port_file, "w", encoding="utf-8", newline="\n") as f:
+            f.write(str(a.tls_silent_port) + "\n")
+        mtools("mcopy", "-i", PART, port_file, "::/tests/tlssilentport")
+    if getattr(a, "dns_port", None):
+        port_file = os.path.join(BUILD, "dnsport")
+        with open(port_file, "w", encoding="utf-8", newline="\n") as f:
+            f.write(str(a.dns_port) + "\n")
+        mtools("mcopy", "-i", PART, port_file, "::/tests/dnsport")
     mtools("mcopy", "-i", PART, "-s", os.path.join(source_root, "tests", "media-fixtures"), "::/tests/")
     if a.full:
         tcc = os.path.join(ROOT, "third_party", "tinycc")
@@ -256,7 +333,8 @@ def run_vm(a, tcp_port, web_ports, processes):
     # 起動媒体も専用コピー。検証中の次ビルドと元imageを共有しない。
     boot = os.path.join(BUILD, "test-boot.img")
     shutil.copyfile(a.boot_image, boot)
-    if a.resolution:
+    dns_endpoint = "10.0.2.2:%d" % a.dns_port if getattr(a, "dns_port", None) else None
+    if a.resolution or dns_endpoint:
         conf = os.path.join(BUILD, "test-limine.conf")
         conf_arg = os.path.relpath(conf, ROOT).replace("\\", "/")
         boot_part = os.path.relpath(boot, ROOT).replace("\\", "/") + "@@1048576"
@@ -264,9 +342,20 @@ def run_vm(a, tcp_port, web_ports, processes):
         with open(conf, encoding="utf-8") as f:
             config = f.read()
         first_entry = config.split("\n/", 2)[1]
-        updated, count = re.subn(r"(?m)^    resolution: [^\n]+$", "    resolution: " + a.resolution, first_entry)
-        if count != 1:
-            sys.exit("test: primary boot entry must have exactly one resolution")
+        updated = first_entry
+        if a.resolution:
+            updated, count = re.subn(r"(?m)^    resolution: [^\n]+$", "    resolution: " + a.resolution, updated)
+            if count != 1:
+                sys.exit("test: primary boot entry must have exactly one resolution")
+        if dns_endpoint:
+            def default_dns(match):
+                arguments = match.group(1)
+                if re.search(r"(?:^|\s)dns-server=", arguments):
+                    sys.exit("test: primary boot entry already has a DNS resolver override")
+                return "    cmdline: " + arguments + " dns-server=" + dns_endpoint
+            updated, count = re.subn(r"(?m)^    cmdline: ([^\n]*)$", default_dns, updated)
+            if count != 1:
+                sys.exit("test: primary boot entry must have exactly one command line")
         with open(conf, "w", encoding="utf-8", newline="\n") as f:
             f.write(config.replace(first_entry, updated, 1))
         mtools("mcopy", "-o", "-i", boot_part, conf_arg, "::/boot/limine/limine.conf")
@@ -304,7 +393,7 @@ def run_vm(a, tcp_port, web_ports, processes):
                 "boot_source": a.boot_image, "boot_payload_sha256": payload, "user_data_attached": False,
                 "test_source_tree": a.source_tree or ROOT,
                 "baseline_metadata": a.baseline_metadata,
-                "requested_resolution": a.resolution}
+                "requested_resolution": a.resolution, "native_dns_fixture": dns_endpoint}
     metadata_path = os.path.join(BUILD, "test-metadata.json")
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
@@ -461,6 +550,17 @@ def main():
         servers.append(tcp)
         web = start_web_servers()
         servers.extend(web)
+        if not a.groups or any(group == "transport8" or group.startswith("transport8/") for group in a.groups):
+            h2 = start_h2_server()
+            servers.append(h2)
+            a.h2_port = h2.server_address[1]
+            silent_tls = start_silent_tls_server()
+            servers.append(silent_tls)
+            a.tls_silent_port = silent_tls.server_address[1]
+        if not a.groups or any(group == "nettransport" or group.startswith("nettransport/") for group in a.groups):
+            dns = start_dns_servers()
+            servers.extend(dns)
+            a.dns_port = dns[0].server_address[1]
         return run_vm(a, tcp.server_address[1], [s.server_address[1] for s in web], processes)
     finally:
         # Only processes and servers created by this test run are touched.

@@ -16,6 +16,17 @@ int net_ping(uint32_t ip, int seq, int timeout_ms) {
     return (int)ret(__syscall(SYS_NET_PING, ip, seq, timeout_ms, 0, 0));
 }
 int net_resolve(const char *name, uint32_t *ip) { return (int)ret(__syscall(SYS_NET_DNS, (long)name, (long)ip, 0, 0, 0)); }
+int net_resolve_all(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result) {
+    return (int)ret(__syscall(SYS_NET_DNS_ALL, (long)name, (long)ips, capacity, (long)result, 0));
+}
+int net_resolve_at(const char *name, uint32_t *ips, size_t capacity, struct n_dns_result *result,
+                   const struct n_sockaddr *resolver) {
+    return (int)ret(__syscall(SYS_NET_DNS_ALL, (long)name, (long)ips, capacity, (long)result, (long)resolver));
+}
+int net_stats(struct n_netstats *stats) { return (int)ret(__syscall(SYS_NET_STATS, (long)stats, 0, 0, 0, 0)); }
+int net_set_setup_cancel_channel(int fd) {
+    return (int)ret(__syscall(SYS_NET_SETUP_CANCEL_CHANNEL, fd, 0, 0, 0, 0));
+}
 
 bool ip_parse(const char *s, uint32_t *ip) {
     uint32_t v = 0;
@@ -51,6 +62,13 @@ int tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     return (int)ret(__syscall(SYS_TCP_CONNECT, ip, port, timeout_ms, 0, 0));
 }
 long tcp_send(int s, const void *buf, size_t len) { return ret(__syscall(SYS_TCP_SEND, s, (long)buf, (long)len, 0, 0)); }
+long tcp_send_until(int s, const void *buf, size_t len, uint64_t deadline_ms) {
+    return ret(__syscall(SYS_TCP_SEND_UNTIL, s, (long)buf, len, deadline_ms, 0));
+}
+long tcp_send_some(int s, const void *buf, size_t len) {
+    return ret(__syscall(SYS_TCP_SEND_UNTIL, s, (long)buf, len, 0, N_TCP_SEND_NONBLOCK));
+}
+int tcp_cancel(int s) { return (int)ret(__syscall(SYS_TCP_CANCEL, s, 0, 0, 0, 0)); }
 long tcp_recv(int s, void *buf, size_t len, int timeout_ms) {
     return ret(__syscall(SYS_TCP_RECV, s, (long)buf, (long)len, timeout_ms, 0));
 }

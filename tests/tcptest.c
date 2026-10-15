@@ -108,7 +108,10 @@ static void faults(int rx_drop, int rx_reorder, int tx_drop) {
 }
 
 int main(int argc, char **argv) {
-    if (argc > 1) port = atoi(argv[1]);
+    bool benchmark = argc > 1 && !strcmp(argv[1], "--clean-repeat");
+    int repeats = benchmark && argc > 2 ? atoi(argv[2]) : 0;
+    if (benchmark && (repeats < 2 || repeats > 100)) return 2;
+    if (argc > 1 && !benchmark) port = atoi(argv[1]);
     else {
         FILE *f = fopen("/data/tests/tcpport", "r");
         char line[16] = "";
@@ -122,6 +125,27 @@ int main(int argc, char **argv) {
     if (net_test(NULL, &a) < 0) {
         printf("FAIL net_test syscall\n");
         return 1;
+    }
+
+    if (benchmark) {
+        /* Additional controlled measurement; the ordinary loss regression
+           below remains unchanged. Every sample checks all payload bytes. */
+        faults(0, 0, 0);
+        for (int i = 0; i < repeats; i++) {
+            long down = get(4 << 20, 1), up = put(4 << 20, 2);
+            printf("TCPPERF sample=%d bytes=4194304 download_ms=%ld upload_ms=%ld\n", i + 1, down, up);
+            check(down >= 0 && up >= 0, "clean repeated payload and server validation");
+        }
+#ifdef N_TCP_SEND_NONBLOCK
+        /* Read existing counters after all timed transfers, never in a hot loop. */
+        struct n_netstats counters;
+        if (net_stats(&counters) == 0) for (unsigned cpu = 1; cpu < 16; cpu++)
+            if (counters.ap_calls[cpu]) printf("TCPPERF cpu=%u calls=%lu fallback=%lu tx=%lu rx=%lu\n", cpu,
+                (unsigned long)counters.ap_calls[cpu], (unsigned long)counters.ap_fallbacks[cpu],
+                (unsigned long)counters.ap_send_bytes[cpu], (unsigned long)counters.ap_recv_bytes[cpu]);
+#endif
+        printf("tcptest: %d failed\n", failed);
+        return failed != 0;
     }
 
     report("clean download", 4 << 20, get(4 << 20, 1));

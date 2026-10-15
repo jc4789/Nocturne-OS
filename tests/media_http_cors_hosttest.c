@@ -75,6 +75,7 @@ long ns_read(net_stream *s,void *out,size_t n) {
 }
 const char *ns_error(net_stream *s){(void)s;return "";}
 void ns_close(net_stream *s){(void)s;closed++;}
+#include "http_mock_lifecycle.h"
 int http_inflate(char *out,int cap,const char *in,int len,int *used) {
     (void)out;(void)cap;(void)in;(void)len;(void)used;inflated++;return -1;
 }

@@ -30,6 +30,8 @@ struct n_cpuinfo;
 typedef void (*cpu_job_fn)(size_t index, void *context);
 
 /* 全APはuser実行と独立計算jobを交替で処理。共有kernel/driver/allocatorはBSP専用。
+   例外はnet_ap_syscallの最大64KiB TCP ring copy。allocator/wait queue/NICには触れず、
+   netのBSP gateとsocket io_ownerで寿命/単一所有を保ち、CPU別doorbellで制御を返す。
    user runnerはCPU別mailboxでring3のみ実行し、kernel処理前にBSPへ退避する。
    context と参照先は共有された高位 kernel mapping で、join まで有効であること。
    callback は非重複領域だけを更新し、割当・I/O・syscall・待機・schedule・再入は禁止。

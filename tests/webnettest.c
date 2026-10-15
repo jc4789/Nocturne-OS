@@ -56,6 +56,7 @@ static int children(void) {
     for (int i = 0; i < n; i++) if (p[i].ppid == getpid() && strstr(p[i].name, "webfetch")) count++;
     return count;
 }
+static unsigned transports(void){return webnet_inflight(net);}
 static uint64_t request_options(struct result *r, int port, const char *path, enum webnet_kind kind,
                         const char *method, const char *headers, const void *body, size_t length,
                         uint64_t generation, bool force_preflight, bool redirect_error, bool same_origin) {
@@ -363,7 +364,88 @@ static uint64_t cache_request(struct result *r, int port, const char *path,
         .same_origin=same_origin,.cache_mode=mode};
     return webnet_submit(net,&q,completed,r);
 }
+static void top_partition_tests(void){
+    static const char *const tops[]={"http://top-a.cache.test/document","http://top-b.cache.test/document","http://top-a.cache.test/document"};
+    unsigned long probe=(unsigned long)uptime_ms();char url[512],field[64];static struct result r;
+    struct webnet_request q={.kind=WEBNET_FETCH,.generation=118,.url=url,.origin=document,
+        .method="GET",.credentials=WEBNET_CREDENTIALS_OMIT};
+    uint64_t id;bool done;
+    static const char *const partition_labels[]={
+        "same child origin URL and credentials use separate top A/B cache entries and restore top A's original hit",
+        "iframe navigation retains enclosing top A/B cache partitions and restores top A's hit",
+        "true top navigation uses the destination top partition rather than the previous enclosing top"};
+    for(unsigned destination=0;destination<3;destination++){
+        q.kind=destination?WEBNET_NAVIGATION:WEBNET_FETCH;q.user_navigation=destination==2;
+        q.referrer=destination?NULL:document;q.referrer_policy=destination?WEBNET_REFERRER_DEFAULT:WEBNET_REFERRER_ORIGIN;
+        snprintf(url,sizeof url,"http://10.0.2.2:%d/api/http-cache?key=top-partition-%lu-%u&policy=fresh",ports[0],probe,destination);
+        bool isolated=true;
+        for(unsigned i=0;i<3;i++){
+            q.top_level_url=tops[i];id=webnet_submit(net,&q,completed,&r);
+            done=id&&wait_result(&r,5000);snprintf(field,sizeof field,"\"count\": %u",destination==2?1u:i==1?2u:1u);
+            isolated&=done&&success(&r)&&strstr(r.body,field)!=NULL;
+            if(!done)webnet_cancel_generation(net,118);release(&r);
+        }
+        check(isolated,partition_labels[destination]);
+        snprintf(url,sizeof url,"http://10.0.2.2:%d/api/http-cache-count?key=top-partition-%lu-%u",ports[0],probe,destination);
+        q.top_level_url=tops[0];id=webnet_submit(net,&q,completed,&r);done=id&&wait_result(&r,5000);
+        snprintf(field,sizeof field,"\"count\": %u",destination==2?1u:2u);
+        check(done&&success(&r)&&strstr(r.body,field),"top partition selection preserves the exact real network fetch count");
+        if(!done)webnet_cancel_generation(net,118);release(&r);
+    }
+    /* Cache bypass exposes the same security boundary in the native pool. */
+    snprintf(url,sizeof url,"http://10.0.2.2:%d/api/net8-http?kind=plain",ports[0]);q.kind=WEBNET_FETCH;q.user_navigation=false;q.cache_mode=WEBNET_CACHE_NO_STORE;
+    unsigned connections[3]={0};bool pooled=true;
+    for(unsigned i=0;i<3;i++){
+        q.top_level_url=tops[i];id=webnet_submit(net,&q,completed,&r);done=id&&wait_result(&r,5000);
+        const char *connection=done?strstr(r.headers,"X-Connection-ID: "):NULL;
+        if(connection)sscanf(connection,"X-Connection-ID: %u",&connections[i]);
+        pooled&=done&&success(&r)&&connections[i]!=0;
+        if(!done)webnet_cancel_generation(net,118);release(&r);
+    }
+    check(pooled&&connections[0]!=connections[1]&&connections[0]==connections[2],
+          "same child requests isolate top A/B pooled connections and reuse top A's own connection");
+    bool cookie_set=webnet_cookie_set_site(net,document,document,"top_partition_strict=present; SameSite=Strict; Path=/")==1;
+    snprintf(url,sizeof url,"http://10.0.2.2:%d/api/http-cache?key=top-cookie-%lu&policy=fresh",ports[0],probe);
+    q.credentials=WEBNET_CREDENTIALS_INCLUDE;bool cookie_isolated=cookie_set;
+    for(unsigned i=0;i<2;i++){
+        q.top_level_url=i?tops[0]:document;id=webnet_submit(net,&q,completed,&r);done=id&&wait_result(&r,5000);
+        bool sent=done&&r.body&&strstr(r.body,"top_partition_strict=present")!=NULL;
+        cookie_isolated&=done&&success(&r)&&(sent==(i==0));
+        if(!done)webnet_cancel_generation(net,118);release(&r);
+    }
+    check(cookie_isolated,"native Cookie site context uses the trusted top document rather than the same child initiator");
+    check(webnet_cookie_set_site(net,document,document,"top_partition_strict=; Max-Age=0; Path=/")==1,"remove top partition Cookie control");
+    webnet_cancel_generation(net,118);
+}
+static void cache_preflight_tests(void){
+    static struct result r;char path[512],observation[512],key[128];
+    unsigned long probe=(unsigned long)uptime_ms();
+    for(unsigned denied=0;denied<2;denied++){
+        snprintf(key,sizeof key,"cache-preflight-%lu-%u",probe,denied);
+        snprintf(path,sizeof path,"/api/http-cache?key=%s&policy=fresh&preflight=%s",key,denied?"deny":"allow");
+        uint64_t id=cache_request(&r,1,path,WEBNET_CACHE_DEFAULT,NULL,false);bool done=id&&wait_result(&r,5000);
+        check(done&&success(&r)&&strstr(r.body,"\"count\": 1"),"seed a fresh cross-origin simple GET cache entry before an unsafe-header request");
+        if(!done)webnet_cancel_generation(net,98);release(&r);
+        id=cache_request(&r,1,path,WEBNET_CACHE_DEFAULT,"X-Cache-Guard: required\r\n",false);done=id&&wait_result(&r,5000);
+        if(denied)check(done&&r.status==0&&r.length==0&&r.response_headers_length==0&&r.error[0],
+            "a denied preflight publishes neither cached status nor headers nor body");
+        else check(done&&success(&r)&&strstr(r.body,"\"count\": 1"),
+            "an allowed preflight retains and serves the original fresh cached representation");
+        if(!done)webnet_cancel_generation(net,98);release(&r);
+        id=cache_request(&r,1,path,WEBNET_CACHE_DEFAULT,NULL,false);done=id&&wait_result(&r,5000);
+        check(done&&success(&r)&&strstr(r.body,"\"count\": 1"),
+              "preflight permission or rejection leaves the complete cached simple response intact");
+        if(!done)webnet_cancel_generation(net,98);release(&r);
+        snprintf(observation,sizeof observation,"/api/http-cache-count?key=%s",key);
+        id=request(&r,1,observation,WEBNET_FETCH,"GET",NULL,NULL,0,98);done=id&&wait_result(&r,5000);
+        check(done&&success(&r)&&strstr(r.body,"\"count\": 1")&&strstr(r.body,"\"preflight_count\": 1"),
+              "the cached unsafe-header request performs one real OPTIONS and never refetches GET");
+        if(!done)webnet_cancel_generation(net,98);release(&r);
+    }
+}
 static void cache_tests(void) {
+    top_partition_tests();
+    cache_preflight_tests();
     check(sizeof(struct webnet_wire_request)==64 && WEBNET_WIRE_CACHE_MODE(0)==WEBNET_CACHE_DEFAULT &&
           WEBNET_WIRE_CACHE_MODE(WEBNET_WIRE_USER_NAVIGATION)==WEBNET_CACHE_DEFAULT,
           "cache policy preserves 64-byte framing and legacy zero/one flags");
@@ -389,35 +471,105 @@ static void cache_tests(void) {
         if(!done)webnet_cancel_generation(net,98);
         release(&r);
     }
-    /* A cacheable response does not manufacture a local cache entry. */
+    /* An HTTP cache hit must reuse bytes from the complete previous response. */
     snprintf(path,sizeof path,"/api/cache?probe=%lu&repeat=force",probe);
     for(unsigned attempt=1;attempt<=2;attempt++) {
         uint64_t id=cache_request(&r,0,path,WEBNET_CACHE_FORCE_CACHE,NULL,false);
         bool done=id&&wait_result(&r,40000);
-        snprintf(field,sizeof field,"\"actual_count\": %u",attempt);
+        snprintf(field,sizeof field,"\"actual_count\": %u",1u);
         check(done&&success(&r)&&strstr(r.body,field)&&strstr(r.headers,"Cache-Control: public, max-age=3600"),
-              "force-cache genuinely contacts network again when the host has no stored response");
+              "force-cache stores a complete miss and reuses its original response on the next request");
         if(!done)webnet_cancel_generation(net,98);
         release(&r);
     }
     uint64_t id=cache_request(&r,0,path,WEBNET_CACHE_NO_CACHE,NULL,false);
     bool done=id&&wait_result(&r,40000);
-    check(done&&success(&r)&&strstr(r.body,"\"actual_count\": 3")&&strstr(r.body,"\"if_none_match\": \"\""),
-          "no-cache cannot synthesize a conditional validator from earlier cacheable responses");
+    check(done&&success(&r)&&strstr(r.body,"\"actual_count\": 2")&&strstr(r.body,"fixture-cache"),
+          "no-cache revalidates the stored ETag through a browser-managed conditional field");
     if(!done)webnet_cancel_generation(net,98);
     release(&r);
     id=cache_request(&r,0,path,WEBNET_CACHE_ONLY_IF_CACHED,NULL,true);done=id&&wait_result(&r,40000);
-    check(done&&r.status==0&&strstr(r.error,"No cached response"),"a previous successful fetch does not turn cache-only miss into a hit");
+    check(done&&success(&r)&&strstr(r.body,"\"actual_count\": 2"),"only-if-cached returns the previously completed representation");
     if(!done)webnet_cancel_generation(net,98);
     release(&r);
     char encoded[1536],observation[1600];
     bool encoded_ok=encode_query(path,encoded,sizeof encoded);
     if(encoded_ok)snprintf(observation,sizeof observation,"/api/observations?path=%s",encoded);
     id=encoded_ok?request(&r,0,observation,WEBNET_FETCH,"GET",NULL,NULL,0,98):0;done=id&&wait_result(&r,40000);
-    check(done&&success(&r)&&strstr(r.body,"\"actual_count\": 3")&&strstr(r.body,"\"preflight_count\": 0"),
-          "cache-only miss after successful network responses still adds no actual or OPTIONS request");
+    check(done&&success(&r)&&strstr(r.body,"\"actual_count\": 2")&&strstr(r.body,"\"preflight_count\": 0"),
+          "cache hits and cache-only reuse add no actual or OPTIONS request");
     if(!done)webnet_cancel_generation(net,98);
     release(&r);
+    snprintf(path,sizeof path,"/api/http-cache?key=fresh-%lu&policy=fresh",probe);
+    static const enum webnet_cache sequence[]={WEBNET_CACHE_DEFAULT,WEBNET_CACHE_DEFAULT,WEBNET_CACHE_ONLY_IF_CACHED,
+        WEBNET_CACHE_RELOAD,WEBNET_CACHE_NO_STORE,WEBNET_CACHE_DEFAULT,WEBNET_CACHE_NO_CACHE,WEBNET_CACHE_ONLY_IF_CACHED};
+    static const unsigned sequence_count[]={1,1,1,2,3,2,2,2};
+    for(unsigned step=0;step<sizeof sequence/sizeof sequence[0];step++){
+        id=cache_request(&r,0,path,sequence[step],NULL,sequence[step]==WEBNET_CACHE_ONLY_IF_CACHED);
+        done=id&&wait_result(&r,40000);snprintf(field,sizeof field,"\"count\": %u",sequence_count[step]);
+        snprintf(label,sizeof label,"persistent HTTP cache mode sequence step %u keeps exact stored representation",step);
+        check(done&&success(&r)&&strstr(r.body,field),label);
+        if(!done)webnet_cancel_generation(net,98);release(&r);
+    }
+    snprintf(observation,sizeof observation,"/api/http-cache-count?key=fresh-%lu",probe);
+    id=request(&r,0,observation,WEBNET_FETCH,"GET",NULL,NULL,0,98);done=id&&wait_result(&r,40000);
+    check(done&&success(&r)&&strstr(r.body,"\"count\": 4"),
+          "fresh hits and only-if-cached perform no network; reload no-store and 304 validation perform one request each");
+    if(!done)webnet_cancel_generation(net,98);release(&r);
+    /* Credential material and initiating origin are part of the private key. */
+    static const char *const auth[]={"Authorization: cache-fixture-a\r\n","Authorization: cache-fixture-a\r\n","Authorization: cache-fixture-b\r\n"};
+    for(unsigned step=0;step<3;step++){
+        id=cache_request(&r,0,path,WEBNET_CACHE_DEFAULT,auth[step],false);done=id&&wait_result(&r,40000);
+        snprintf(field,sizeof field,"\"count\": %u",step==2?6u:5u);
+        check(done&&success(&r)&&strstr(r.body,field),"Authorization partitions reuse the same identity and isolate a changed identity");
+        if(!done)webnet_cancel_generation(net,98);release(&r);
+    }
+    char private_url[768];snprintf(private_url,sizeof private_url,"http://10.0.2.2:%d%s",ports[0],path);
+    struct webnet_request private_request={.kind=WEBNET_FETCH,.generation=98,.url=private_url,.origin=document,
+        .method="GET",.credentials=WEBNET_CREDENTIALS_INCLUDE};
+    id=webnet_submit(net,&private_request,completed,&r);done=id&&wait_result(&r,40000);
+    check(done&&success(&r)&&strstr(r.body,"\"count\": 7"),"include credentials cannot consume an omit-credentials cache entry");
+    if(!done)webnet_cancel_generation(net,98);release(&r);
+    check(webnet_cookie_set(net,document,"cachefixture=changed; Path=/")==1,"prepare changed Cookie cache partition");
+    for(unsigned step=0;step<2;step++){
+        id=webnet_submit(net,&private_request,completed,&r);done=id&&wait_result(&r,40000);
+        check(done&&success(&r)&&strstr(r.body,"\"count\": 8")&&strstr(r.body,"cachefixture=changed"),
+              "changed Cookie fetches a separate representation and then reuses only that partition");
+        if(!done)webnet_cancel_generation(net,98);release(&r);
+    }
+    check(webnet_cookie_set(net,document,"cachefixture=; Path=/; Max-Age=0")==1,"remove cache partition Cookie control");
+    snprintf(path,sizeof path,"/api/http-cache?key=vary-%lu&policy=vary",probe);
+    for(unsigned step=0;step<3;step++){
+        const char *variant=step==1?"X-Variant: two\r\n":"X-Variant: one\r\n";
+        id=cache_request(&r,0,path,WEBNET_CACHE_DEFAULT,variant,false);done=id&&wait_result(&r,40000);
+        snprintf(field,sizeof field,"\"count\": %u",step==1?2u:1u);
+        check(done&&success(&r)&&strstr(r.body,field)&&strstr(r.body,step==1?"\"variant\": \"two\"":"\"variant\": \"one\""),
+              "Vary stores both complete request-header variants without mixing their bodies");
+        if(!done)webnet_cancel_generation(net,98);release(&r);
+    }
+    snprintf(path,sizeof path,"/api/http-cache?key=stale-%lu&policy=stale",probe);
+    for(unsigned step=0;step<2;step++){
+        id=cache_request(&r,0,path,WEBNET_CACHE_DEFAULT,NULL,false);done=id&&wait_result(&r,40000);
+        check(done&&success(&r)&&strstr(r.body,"\"count\": 1"),"stale ETag validation merges 304 metadata and retains the original 200 body");
+        if(!done)webnet_cancel_generation(net,98);release(&r);
+    }
+    id=cache_request(&r,0,path,WEBNET_CACHE_ONLY_IF_CACHED,NULL,true);done=id&&wait_result(&r,40000);
+    check(done&&r.status==0&&strstr(r.error,"No usable cached response"),"must-revalidate cannot be served stale by a cache-only request");
+    if(!done)webnet_cancel_generation(net,98);release(&r);
+    snprintf(observation,sizeof observation,"/api/http-cache-count?key=stale-%lu",probe);
+    id=request(&r,0,observation,WEBNET_FETCH,"GET",NULL,NULL,0,98);done=id&&wait_result(&r,40000);
+    check(done&&success(&r)&&strstr(r.body,"\"count\": 2"),"304 validation is one network request and a stale cache-only failure adds none");
+    if(!done)webnet_cancel_generation(net,98);release(&r);
+    snprintf(path,sizeof path,"/api/http-cache?key=nostore-%lu&policy=nostore",probe);
+    for(unsigned step=1;step<=2;step++){
+        id=cache_request(&r,0,path,WEBNET_CACHE_DEFAULT,NULL,false);done=id&&wait_result(&r,40000);
+        snprintf(field,sizeof field,"\"count\": %u",step);
+        check(done&&success(&r)&&strstr(r.body,field),"response no-store never becomes a reusable representation");
+        if(!done)webnet_cancel_generation(net,98);release(&r);
+    }
+    id=cache_request(&r,0,path,WEBNET_CACHE_ONLY_IF_CACHED,NULL,true);done=id&&wait_result(&r,40000);
+    check(done&&r.status==0&&strstr(r.error,"No usable cached response"),"no-store response leaves only-if-cached as a network-free miss");
+    if(!done)webnet_cancel_generation(net,98);release(&r);
     for(unsigned mode=WEBNET_CACHE_NO_STORE;mode<=WEBNET_CACHE_NO_CACHE;mode++) {
         snprintf(path,sizeof path,"/api/cache?probe=%lu&author=%u",probe,mode);
         uint64_t id=cache_request(&r,1,path,(enum webnet_cache)mode,
@@ -472,7 +624,7 @@ static void cache_tests(void) {
     for(unsigned port=0;port<2;port++) {
         snprintf(path,sizeof path,"/api/cache?probe=%lu&only=%u",probe,port);
         id=cache_request(&r,port,path,WEBNET_CACHE_ONLY_IF_CACHED,NULL,true);done=id&&wait_result(&r,40000);
-        check(done&&r.status==0&&strstr(r.error,"No cached response")&&r.length==0,
+        check(done&&r.status==0&&strstr(r.error,port?"Cross-origin fetch":"No usable cached response")&&r.length==0,
               "native cache-only miss is a network error, never a synthetic HTTP response");
         if(!done)webnet_cancel_generation(net,98);
         release(&r);
@@ -500,29 +652,38 @@ static void concurrency_tests(void) {
     bool submitted=true;
     for(int i=0;i<8;i++)submitted&=request(&burst[i],i%2,"/api/slow?ms=1200",WEBNET_FETCH,"GET",NULL,NULL,0,19)!=0;
     webnet_pump(net,uptime_ms());
-    int started=children();
+    int started=(int)transports();
     struct n_sysinfo memory={0};sysinfo(&memory);
     uint64_t affordable=memory.free_mem/(64u*1024u*1024u);
     int expected=affordable>1?(int)MIN(7u,affordable-1):1;
+    /* Admission itself now yields on the GUI time budget. Observe the burst
+       before any 1200ms reply can finish, without demanding one long pump. */
+    uint64_t admitted_until=uptime_ms()+500;
+    while(started<expected&&uptime_ms()<admitted_until){
+        webnet_pump(net,uptime_ms());started=MAX(started,(int)transports());
+        if(started<expected)webnet_wait(net,-1,10);
+    }
     check(submitted&&started>=expected,
           "adaptive worker budget admits a multi-origin burst beyond four when native memory permits");
     bool drained=wait_idle(12000);
     for(int i=0;i<8;i++)drained&=success(&burst[i]);
-    check(drained&&children()==0,"adaptive burst preserves every response and reaps every child");
+    check(drained&&transports()==0&&children()==1,"adaptive burst preserves every response and retains exactly one pooled service");
     webnet_cancel_generation(net,19);for(int i=0;i<8;i++)release(&burst[i]);
     static struct result r[3]; /* large bounded response storage is not stack scratch */
     uint64_t ids[3];
     for (int i = 0; i < 3; i++) ids[i] = request(&r[i], 0, "/api/slow?ms=800", WEBNET_FETCH, "GET", NULL, NULL, 0, 20);
     webnet_pump(net, uptime_ms());
-    check(ids[0] && ids[1] && ids[2] && children() == 3, "three Fetch workers leave one document dependency slot reserved");
+    admitted_until=uptime_ms()+300;
+    while(transports()<3&&uptime_ms()<admitted_until){webnet_pump(net,uptime_ms());webnet_wait(net,-1,10);}
+    check(ids[0] && ids[1] && ids[2] && transports() == 3 && children()==1, "three Fetch channels share one service and leave document dependency admission reserved");
     bool good = true; uint64_t until = uptime_ms() + 6000;
     while (webnet_busy(net) && uptime_ms() < until) {
         webnet_pump(net, uptime_ms());
-        if (children() > 4) good = false;
+        if (transports() > 4 || children()!=1) good = false;
         msleep(5);
     }
     for (int i = 0; i < 3; i++) good = good && success(&r[i]);
-    check(good && !webnet_busy(net) && children() == 0, "queued requests complete and workers are reaped");
+    check(good && !webnet_busy(net) && transports() == 0 && children()==1, "queued requests complete and release all request transports in the pooled service");
     webnet_cancel_generation(net, 20);
     for (int i = 0; i < 3; i++) release(&r[i]);
 
@@ -533,7 +694,7 @@ static void concurrency_tests(void) {
     static struct result dependency;
     uint64_t dependency_id = request(&dependency, 0, "/api/json", WEBNET_RESOURCE, "GET", NULL, NULL, 0, 24);
     check(ids[0] && ids[1] && ids[2] && dependency_id && wait_result(&dependency, 2500) && success(&dependency) &&
-          !r[0].calls && !r[1].calls && !r[2].calls && children() <= 4,
+          !r[0].calls && !r[1].calls && !r[2].calls && transports() <= 4 && children()==1,
           "later document resource completes while three long-lived Fetch channels remain active");
     webnet_cancel_generation(net, 23); webnet_cancel_generation(net, 24);
     for (int i = 0; i < 3; i++) release(&r[i]);
@@ -549,11 +710,11 @@ static void concurrency_tests(void) {
 
     ids[0] = request(&r[0], 0, "/api/slow?ms=5000", WEBNET_FETCH, "GET", NULL, NULL, 0, 21);
     pump_for(100); webnet_cancel(net, ids[0]);
-    check(ids[0] && wait_idle(3000) && !r[0].calls && children() == 0, "single cancellation suppresses callback and asynchronously reaps");
+    check(ids[0] && wait_idle(3000) && !r[0].calls && transports() == 0 && children()==1, "single cancellation suppresses callback and retires its channel while preserving the pooled service");
     release(&r[0]);
     for (int i = 0; i < 2; i++) ids[i] = request(&r[i], 0, "/api/slow?ms=5000", WEBNET_FETCH, "GET", NULL, NULL, 0, 22);
     pump_for(100); webnet_cancel_generation(net, 22);
-    check(ids[0] && ids[1] && !webnet_busy(net) && !r[0].calls && !r[1].calls && children() == 0,
+    check(ids[0] && ids[1] && !webnet_busy(net) && !r[0].calls && !r[1].calls && transports() == 0 && children()==1,
           "document cancellation synchronously kills and reaps both workers");
     release(&r[0]); release(&r[1]);
 }
@@ -695,7 +856,7 @@ static void limit_tests(void) {
     uint64_t elapsed = uptime_ms() - started;
     check(done && success(&r) && elapsed >= 34500 && elapsed < 44000 && WEBNET_TIMEOUT_MS==UINT32_MAX,
           "a legitimate 35-second response survives the removed 30-second deadline");
-    check(!webnet_busy(net) && children() == 0, "long response completion leaves no worker or pending request");
+    check(!webnet_busy(net) && transports() == 0 && children()==1, "long response completion leaves no request transport and retains one pooled service");
     if (!done) webnet_cancel_generation(net, 60);
     release(&r);
 }
@@ -919,7 +1080,7 @@ static void callback_cancel_test(void){
         .method="GET",.credentials=WEBNET_CREDENTIALS_OMIT,.stream_response=true};
     uint64_t id=webnet_submit(net,&q,cancel_from_callback,NULL);
     bool drained=id&&wait_idle(5000);
-    check(drained&&callback_cancel_calls==1&&callback_cancel_borrow&&children()==0,
+    check(drained&&callback_cancel_calls==1&&callback_cancel_borrow&&transports()==0&&children()==1,
           "stream callback generation cancellation retains its borrowed response and reaps without reentry");
 }
 struct paused_stream_result {unsigned headers,chunks,ends;unsigned char *body;size_t length;bool failed;};
@@ -952,9 +1113,9 @@ static void paused_stream_transport_test(void){
     bool submitted=true;for(unsigned i=0;i<5;i++){ids[i]=webnet_submit(net,&q,paused_stream_received,&results[i]);submitted&=ids[i]!=0;}
     uint64_t until=uptime_ms()+5000;unsigned headers=0;
     do{webnet_pump(net,uptime_ms());headers=0;for(unsigned i=0;i<5;i++)headers+=results[i].headers;
-        if(headers==5&&!children())break;msleep(5);
+        if(headers==5&&!transports())break;msleep(5);
     }while(uptime_ms()<until);
-    check(submitted&&headers==5&&children()==0,"native paused response writers are reaped while their unread pipes remain owned");
+    check(submitted&&headers==5&&transports()==0&&children()==1,"native small paused response writers retire while their unread bounded channels remain owned");
     bool unread=webnet_busy(net);for(unsigned i=0;i<5;i++)unread&=!results[i].chunks&&!results[i].ends&&!results[i].failed;
     check(unread,"native transport retirement does not publish unread chunks or a fabricated END");
     ids[5]=webnet_submit(net,&q,paused_stream_received,&results[5]);until=uptime_ms()+5000;
@@ -962,7 +1123,7 @@ static void paused_stream_transport_test(void){
     check(ids[5]&&results[5].headers==1&&!results[5].failed,"sixth same-origin Fetch progresses while five response bodies remain paused");
     until=uptime_ms()+5000;
     while(webnet_busy(net)&&uptime_ms()<until){for(unsigned i=0;i<6;i++)if(ids[i])webnet_resume(net,ids[i]);webnet_pump(net,uptime_ms());msleep(5);}
-    bool drained=!webnet_busy(net)&&children()==0;
+    bool drained=!webnet_busy(net)&&transports()==0&&children()==1;
     for(unsigned i=0;i<6;i++)drained&=results[i].headers==1&&results[i].chunks>0&&results[i].ends==1&&!results[i].failed;
     check(drained,"native resume preserves ordered headers/chunks/END and reaps all transport owners");
     static struct result reference;
@@ -973,7 +1134,115 @@ static void paused_stream_transport_test(void){
     check(exact,"every byte of a native retained paused response survives transport reaping");
     webnet_cancel_generation(net,112);webnet_cancel_generation(net,113);
     for(unsigned i=0;i<6;i++)free(results[i].body);release(&reference);
-    check(!webnet_busy(net)&&children()==0,"native paused response teardown leaves no helper or request owner");
+    check(!webnet_busy(net)&&transports()==0&&children()==1,"native paused response teardown leaves only the reusable service owner");
+}
+struct paced_stream {size_t bytes;unsigned headers,chunks,ends;bool automatic,failed;};
+static void paced_received(webnet *n,uint64_t id,uint64_t generation,const struct webnet_response *response,void *opaque){
+    (void)generation;struct paced_stream *r=opaque;
+    if(response->error&&*response->error)r->failed=true;
+    if(response->event==WEBNET_HEADERS){if(r->headers++||response->status!=200)r->failed=true;}
+    else if(response->event==WEBNET_CHUNK){
+        if(r->headers!=1||r->ends)r->failed=true;
+        const unsigned char *p=response->body;
+        for(size_t i=0;i<response->body_len;i++)if(p[i]!=(unsigned char)((r->bytes+i)*37u+11u))r->failed=true;
+        r->bytes+=response->body_len;r->chunks++;
+    }else if(response->event==WEBNET_END){if(r->headers!=1||r->ends++)r->failed=true;}
+    else if(response->event!=WEBNET_UPLOAD)r->failed=true;
+    if(r->automatic||response->event==WEBNET_UPLOAD)webnet_resume(n,id);
+}
+static int setup_service_pid(void){
+    struct n_procinfo tasks[256];int count=proclist(tasks,256);
+    for(int i=0;i<count;i++)if(tasks[i].ppid==getpid()&&strstr(tasks[i].name,"webfetch"))return tasks[i].pid;
+    return -1;
+}
+static int setup_service_threads(int service_pid,bool blocked_only){
+    struct n_procinfo tasks[256];int count=proclist(tasks,256),live=0;
+    if(count<0)return -1;
+    for(int i=0;i<count;i++)if(tasks[i].ppid==service_pid&&tasks[i].state!=3&&(!blocked_only||tasks[i].state==2))live++;
+    return live;
+}
+static void setup_unexpected_response(webnet *n,uint64_t id,uint64_t generation,const struct webnet_response *response,void *opaque){
+    (void)n;(void)id;(void)generation;(void)response;(*(unsigned *)opaque)++;
+}
+static void setup_cancel_service_test(void){
+    /* Forty-eight entered setups exceed the service's thirty-two slots if
+       closing a request channel cannot interrupt native ARP/connect waits.
+       Distinct ports avoid the per-origin request admission limit. */
+    int service_pid=setup_service_pid();unsigned submitted=0,entered=0,callbacks=0;
+    bool admitted=service_pid>0,reclaimed=true,quiet=true;
+    uint64_t settled=uptime_ms()+150;
+    while(setup_service_threads(service_pid,false)>0&&uptime_ms()<settled)msleep(2);
+    admitted&=setup_service_threads(service_pid,false)==0;
+    for(unsigned batch=0;batch<8;batch++){
+        uint64_t ids[6]={0};int previous=setup_service_threads(service_pid,true);
+        for(unsigned i=0;i<6;i++){
+            char url[128];snprintf(url,sizeof url,"http://10.0.2.250:%u/setup-cancel",49152u+batch*6u+i);
+            struct webnet_request q={.kind=WEBNET_RESOURCE,.generation=116,.url=url,.origin=document,
+                .method="GET",.credentials=WEBNET_CREDENTIALS_OMIT};
+            ids[i]=webnet_submit(net,&q,setup_unexpected_response,&callbacks);submitted+=ids[i]!=0;
+        }
+        uint64_t until=uptime_ms()+500;
+        while(transports()<6&&uptime_ms()<until){webnet_pump(net,uptime_ms());msleep(2);}
+        /* Keep the requests live after sending their prefixes, so cancellation
+           exercises the worker's setup syscall, rather than an unread queue. */
+        pump_for(60);
+        int active=setup_service_threads(service_pid,true);until=uptime_ms()+500;
+        while(active<previous+6&&uptime_ms()<until){webnet_pump(net,uptime_ms());msleep(2);active=setup_service_threads(service_pid,true);}
+        if(previous>=0&&active>=previous+6&&transports()==6)entered+=6;else admitted=false;
+        quiet&=callbacks==0;
+        for(unsigned i=0;i<6;i++)if(ids[i])webnet_cancel(net,ids[i]);
+        until=uptime_ms()+150;
+        do{webnet_pump(net,uptime_ms());active=setup_service_threads(service_pid,false);
+            if(!webnet_busy(net)&&active==0)break;msleep(2);
+        }while(uptime_ms()<until);
+        reclaimed&=!webnet_busy(net)&&transports()==0&&active==0;
+    }
+    check(submitted==48&&entered==48&&admitted&&quiet,
+          "forty-eight unresponsive setup requests enter the real shared service before channel cancellation");
+    check(reclaimed&&callbacks==0,
+          "cancelled native setups promptly retire service threads and never publish a response callback");
+    static struct result healthy;
+    uint64_t begin=uptime_ms();
+    uint64_t id=request(&healthy,0,"/api/json",WEBNET_RESOURCE,"GET",NULL,NULL,0,117);
+    bool done=id&&wait_result(&healthy,2000);uint64_t elapsed=uptime_ms()-begin;
+    check(done&&success(&healthy)&&elapsed<2000&&children()==1&&setup_service_pid()==service_pid,
+          "normal fixture fetch succeeds promptly in the same service after more than thirty-two cancelled setups");
+    printf("network-setup-cancel: submitted=%u entered=%u callbacks=%u live-threads=%d local-ms=%lu service-pid=%d\n",
+        submitted,entered,callbacks,setup_service_threads(service_pid,false),(unsigned long)elapsed,service_pid);
+    webnet_cancel_generation(net,116);webnet_cancel_generation(net,117);release(&healthy);
+}
+static void pacing_tests(void){
+    char url[256];snprintf(url,sizeof url,"http://10.0.2.2:%d/api/pattern?n=1048576",ports[0]);
+    struct webnet_request q={.kind=WEBNET_FETCH,.generation=114,.url=url,.origin=document,
+        .method="GET",.credentials=WEBNET_CREDENTIALS_OMIT,.stream_response=true};
+    struct paced_stream stream={0};uint64_t id=webnet_submit(net,&q,paced_received,&stream);
+    uint64_t until=uptime_ms()+5000;
+    while(id&&!stream.headers&&uptime_ms()<until){webnet_pump(net,uptime_ms());webnet_wait(net,-1,20);}
+    check(id&&stream.headers==1&&!stream.chunks&&!stream.ends&&!stream.failed,
+          "real streaming response pauses after headers without publishing body bytes");
+    /* Let the worker fill its bounded ahead window. A different request must
+       still use the shared process and deliver its terminal response. */
+    pump_for(150);
+    static struct result dependency;
+    uint64_t other=request(&dependency,0,"/api/json",WEBNET_RESOURCE,"GET",NULL,NULL,0,115);
+    check(other&&wait_result(&dependency,5000)&&success(&dependency)&&!stream.chunks&&children()==1,
+          "a paused large stream cannot block another shared worker thread's complete response");
+    release(&dependency);
+    stream.automatic=true;webnet_resume(net,id);unsigned maximum=0,pumps=0;
+    uint64_t begin=uptime_ms();until=begin+12000;
+    while(webnet_busy(net)&&uptime_ms()<until){
+        unsigned before=stream.chunks;webnet_pump(net,uptime_ms());pumps++;
+        maximum=MAX(maximum,stream.chunks-before);
+        if(webnet_busy(net))webnet_wait(net,-1,100);
+    }
+    check(!webnet_busy(net)&&stream.bytes==1048576&&stream.headers==1&&stream.ends==1&&!stream.failed,
+          "real streamed byte credit preserves every pattern byte through pause resume and END");
+    check(maximum>1,"one native pump drains multiple ready 4KiB stream frames without per-frame sleep");
+    printf("network-pacing: bytes=%lu chunks=%u pumps=%u max-chunks-per-pump=%u drain-ms=%lu\n",
+        (unsigned long)stream.bytes,stream.chunks,pumps,maximum,(unsigned long)(uptime_ms()-begin));
+    webnet_cancel_generation(net,114);webnet_cancel_generation(net,115);
+    check(!webnet_busy(net)&&transports()==0&&children()==1,"stream drain retires all channels while retaining one reusable service");
+    setup_cancel_service_test();
 }
 static volatile bool udp_wait_started;
 static int udp_wait_handle,udp_wait_result,udp_wait_errno;
@@ -1057,7 +1326,8 @@ int main(int argc, char **argv) {
     bool tls = argc == 2 && !strcmp(argv[1], "--tls");
     bool boundaries=argc==2&&!strcmp(argv[1],"--performance-boundaries");
     bool tcp_capacity=argc==2&&!strcmp(argv[1],"--tcp-capacity");
-    if (argc > 1 && !tls&&!boundaries&&!tcp_capacity) { puts("usage: webnettest [--tls|--performance-boundaries|--udp-capacity|--tcp-capacity]"); return 1; }
+    bool pacing=argc==2&&!strcmp(argv[1],"--network-pacing");
+    if (argc > 1 && !tls&&!boundaries&&!tcp_capacity&&!pacing) { puts("usage: webnettest [--tls|--performance-boundaries|--udp-capacity|--tcp-capacity|--network-pacing]"); return 1; }
     if (tls) {
         if (!net_wait_up(20000)) { puts("FAIL webnet network did not come up"); return 1; }
         net = webnet_create();
@@ -1080,9 +1350,11 @@ int main(int argc, char **argv) {
     snprintf(document, sizeof document, "http://10.0.2.2:%d/index.html", ports[0]);
     net = webnet_create();
     if (!net) { puts("FAIL webnet allocation"); return 1; }
-    if(boundaries){concurrency_tests();callback_cancel_test();paused_stream_transport_test();}
+    if(pacing){pacing_tests();top_partition_tests();cache_preflight_tests();}
+    else if(boundaries){concurrency_tests();callback_cancel_test();paused_stream_transport_test();}
     else {http_tests(); debug_transport_tests(); body_presence_tests(); fetch_contract_tests(); cache_tests(); concurrency_tests(); cors_tests(); redirect_tests(); long_url_tests(); file_tests(); cookie_tests(); header_block_tests(); cors_boundary_regression_tests(); limit_tests();}
-    webnet_free(net);
+    webnet_free(net);net=NULL;
+    check(children()==0,"destroying webnet reaps its persistent service and all request threads");
     printf("webnettest: %d failed\n", failed);
     return failed != 0;
 }

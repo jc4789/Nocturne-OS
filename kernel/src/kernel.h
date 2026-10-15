@@ -53,6 +53,8 @@
 #define ETIMEDOUT 110
 #define ECONNREFUSED 111
 #define EHOSTUNREACH 113
+#define EPROTO 71
+#define ECANCELED 125
 
 /* lib/string.c */
 void *memcpy(void *dst, const void *src, size_t n);

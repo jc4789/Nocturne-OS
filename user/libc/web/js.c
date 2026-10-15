@@ -5305,9 +5305,11 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
         if (n > JS_BODY_LIMIT) { result = JS_ThrowRangeError(ctx, "Request length is not representable on the native wire"); goto out; }
         if ((!strcmp(method, "GET") || !strcmp(method, "HEAD")) && body) { result = JS_ThrowTypeError(ctx, "Invalid HTTP method or body"); goto out; }
     }
-    /* No HTTP response cache is present. Never turn a cache-only miss into I/O,
-       even if a caller bypasses the bootstrap's early rejection. */
-    if (cache_mode == WEBNET_CACHE_ONLY_IF_CACHED) { result = JS_ThrowTypeError(ctx, "No cached response is available"); goto out; }
+    /* The native HTTP cache decides hit/miss without contacting the network.
+       Preserve policy validation even for callers bypassing the bootstrap. */
+    if (cache_mode == WEBNET_CACHE_ONLY_IF_CACHED && !same_origin) {
+        result = JS_ThrowTypeError(ctx, "only-if-cached requires same-origin mode"); goto out;
+    }
     bool keepalive = argc > 9 && JS_ToBool(ctx, argv[9]) > 0;
     if (keepalive && !s->host.release_request) { result = JS_ThrowTypeError(ctx, "Native host cannot retain keepalive requests across document retirement"); goto out; }
     if (keepalive && !s->fetch_group) {

@@ -109,7 +109,11 @@ static size_t e1000_poll_rx(void (*input)(const void *, size_t)) {
     wr(REG_IMC, RX_IRQS);
     size_t consumed = 0;
     int returned = -1;
-    while (rx[rx_cur].status & DESC_DD) {
+    /* Return ownership only after this drain, so hardware cannot refill the
+       descriptors consumed here until the single RDT write below. One ring
+       is a finite poll bound; the net thread applies its service time/byte
+       budget between polls without extra tail writes for small batches. */
+    while (consumed < NRX && (rx[rx_cur].status & DESC_DD)) {
         /* x86 coherent DMA writes the packet before DD. Prevent the compiler
            from moving the packet read ahead of the volatile ownership check. */
         __atomic_thread_fence(__ATOMIC_ACQUIRE);

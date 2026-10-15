@@ -32,12 +32,17 @@ class Handler(SimpleHTTPRequestHandler):
     actual_origins = {}
     actual_cookies = {}
     preflight_lock = threading.Lock()
+    http_cache_counts = {}
+    http_cache_options = {}
+    http_cache_lock = threading.Lock()
 
     def end_headers(self):
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Connection", "close")
+        if not getattr(self, "native_keepalive", False):
+            self.send_header("Connection", "close")
         super().end_headers()
-        self.close_connection = True
+        if not getattr(self, "native_keepalive", False):
+            self.close_connection = True
 
     def cors(self, credentials=False, wildcard=False, origin=None):
         allowed = self.headers.get("Origin", "*") if origin is None else origin
@@ -82,10 +87,15 @@ class Handler(SimpleHTTPRequestHandler):
             self.preflights[self.path] = self.preflights.get(self.path, 0) + 1
             self.preflight_cookies[self.path] = self.headers.get("Cookie", "")
             self.preflight_headers[self.path] = self.headers.get("Access-Control-Request-Headers", "")
-        self.send_response(204 if path.startswith("/api/") and path != "/api/no-cors" else 403)
+        if path == "/api/http-cache":
+            count_key = (self.server.server_address[1], query.get("key", [""])[0])
+            with self.http_cache_lock:
+                self.http_cache_options[count_key] = self.http_cache_options.get(count_key, 0) + 1
+        denied_cache = path == "/api/http-cache" and query.get("preflight") == ["deny"]
+        self.send_response(204 if path.startswith("/api/") and path != "/api/no-cors" and not denied_cache else 403)
         self.send_header("Content-Length", "0")
         if path != "/api/no-cors":
-            self.cors(credentials=path.startswith("/api/cookie"))
+            self.cors(credentials=path.startswith("/api/cookie") or path == "/api/http-cache")
             if query.get("allow_methods") != ["omit"]:
                 self.send_header("Access-Control-Allow-Methods", query.get("allow_methods", ["GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"])[0])
             allowed = "*" if path == "/api/cors-wildcard" else self.headers.get("Access-Control-Request-Headers", "")
@@ -99,6 +109,72 @@ class Handler(SimpleHTTPRequestHandler):
         if not path.startswith("/api/"):
             return False
         query = parse_qs(parsed.query)
+        if path == "/api/net8-http":
+            kind = query.get("kind", ["plain"])[0]
+            self.native_keepalive = kind not in {"close", "eof"}
+            length = int(self.headers.get("Content-Length", "0"))
+            upload = self.rfile.read(length) if length else b""
+            if kind == "interim":
+                self.send_response_only(103)
+                self.send_header("Link", "</fixture.css>; rel=preload; as=style")
+                self.end_headers()
+                self.send_response_only(100)
+                self.end_headers()
+            body = json.dumps({"connection": self.client_address[1],
+                               "method": self.command, "uploaded": len(upload),
+                               "kind": kind}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("X-Connection-ID", str(self.client_address[1]))
+            if kind == "chunked":
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Trailer", "X-Native-Trailer")
+            elif kind != "eof":
+                self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                if kind == "chunked":
+                    self.wfile.write(("%x\r\n" % len(body)).encode() + body +
+                                     b"\r\n0\r\nX-Native-Trailer: complete\r\n\r\n")
+                else:
+                    self.wfile.write(body)
+                self.wfile.flush()
+            if kind == "stale":
+                # No Connection:close header: the pool must discover stale EOF.
+                self.close_connection = True
+            return True
+        if path in {"/api/http-cache", "/api/http-cache-count"}:
+            key = query.get("key", [""])[0]
+            count_key = (self.server.server_address[1], key)
+            with self.http_cache_lock:
+                if path == "/api/http-cache":
+                    self.http_cache_counts[count_key] = self.http_cache_counts.get(count_key, 0) + 1
+                count = self.http_cache_counts.get(count_key, 0)
+                options = self.http_cache_options.get(count_key, 0)
+            if path == "/api/http-cache-count":
+                self.send_json({"count": count, "preflight_count": options}, cors=True)
+                return True
+            policy = query.get("policy", ["fresh"])[0]
+            variant = self.headers.get("X-Variant", "") if policy == "vary" else ""
+            etag = '"native-cache-' + variant.replace('"', '') + '"'
+            unchanged = self.headers.get("If-None-Match") == etag
+            body = json.dumps({"count": count, "variant": variant,
+                               "cookie": self.headers.get("Cookie", ""),
+                               "authorization": self.headers.get("Authorization", "")}).encode("utf-8")
+            self.send_response(304 if unchanged else 200)
+            self.send_header("Cache-Control", "no-store" if policy == "nostore" else
+                             "max-age=0, must-revalidate" if policy == "stale" else "max-age=3600")
+            self.send_header("ETag", etag)
+            self.send_header("Last-Modified", "Wed, 01 Jan 2020 00:00:00 GMT")
+            if policy == "vary":
+                self.send_header("Vary", "X-Variant")
+            self.send_header("Content-Length", "0" if unchanged else str(len(body)))
+            self.send_header("Content-Type", "application/json")
+            self.cors(credentials=True)
+            self.end_headers()
+            if not unchanged and self.command != "HEAD":
+                self.wfile.write(body)
+            return True
         if path == "/api/stream-release":
             key = query.get("key", [""])[0]
             phase = int(query.get("phase", ["1"])[0])

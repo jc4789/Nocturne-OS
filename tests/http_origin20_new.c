@@ -40,6 +40,9 @@ const char *ns_error(net_stream*a){(void)a;return "unused stream";}
 void ns_close(net_stream*a){(void)a;}
 void ns_set_timeout(net_stream*a,int b){(void)a;(void)b;}
 int http_inflate(char*a,int b,const char*c,int d,int*e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
+#define HTTP_MOCK_HAS_TIMEOUT
+#define HTTP_MOCK_NO_ISOLATION
+#include "http_mock_lifecycle.h"
 long webcookie_get(webcookie_jar*a,const struct webcookie_context*b,char*c,size_t d,int64_t e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 int webcookie_set(webcookie_jar*a,const struct webcookie_context*b,const char*c,size_t d,int64_t e){(void)a;(void)b;(void)c;(void)d;(void)e;return 0;}
 bool webcookie_same_site(const webcookie_jar*a,const char*b,const char*c){(void)a;return !strcmp(b,c);}

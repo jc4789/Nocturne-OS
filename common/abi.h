@@ -24,6 +24,8 @@ enum {
     SYS_SCREEN_GRAB, SYS_WIN_STATE, SYS_WIN_PRESENTATION,
     SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
     SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
+    SYS_NET_DNS_ALL, SYS_TCP_SEND_UNTIL, SYS_TCP_CANCEL, SYS_NET_STATS,
+    SYS_NET_SETUP_CANCEL_CHANNEL,
     SYS_MAX = 128
 };
 
@@ -198,6 +200,19 @@ struct n_netinfo {
     uint8_t ip[4], mask[4], gateway[4], dns[4];
     uint64_t rx_packets, tx_packets;
     char driver[32];
+};
+/* DNS count is the complete candidate count, even when caller capacity is
+   smaller. A second call may retrieve the cached complete result. */
+enum n_dns_status {
+    N_DNS_OK, N_DNS_NXDOMAIN, N_DNS_NODATA, N_DNS_SERVFAIL, N_DNS_REFUSED,
+    N_DNS_FORMAT, N_DNS_TIMEOUT, N_DNS_UNREACHABLE, N_DNS_CANCELLED, N_DNS_RESOURCE,
+};
+struct n_dns_result { uint32_t version, status, count, ttl; };
+#define N_TCP_SEND_NONBLOCK 1u /* SYS_TCP_SEND_UNTIL final flags argument */
+struct n_netstats {
+    uint64_t rx_dropped, rx_invalid, rx_budget_yields;
+    uint64_t rx_completion_pending, rx_completion_retries, rx_completion_cancelled, rx_ring_high_water;
+    uint64_t ap_send_bytes[16], ap_recv_bytes[16], ap_calls[16], ap_fallbacks[16];
 };
 /* SYS_NET_TEST: simulated loss and reordering on the calling process's TCP connections (for tests),
    in per mille of the segments that carry data; all zero turns it off. */

@@ -210,6 +210,7 @@ static void runner_return_irq(struct regs *r) {
        A release store alone permits store/load reordering: an AP could still
        see pending=1 after our scan missed its newly published mailbox. */
     (void)__atomic_exchange_n(&runner_return_pending, 0, __ATOMIC_ACQ_REL);
+    net_ap_notify_bsp();
     if (collect_runner()) need_resched = true;
     /* Do not schedule inside a kernel IRQ: existing kernel continuations are
        non-preemptive. User return and idle's HLT return are safe switch points. */
@@ -285,6 +286,7 @@ void sched_ap_interrupt(struct regs *r) {
                  r->rax == SYS_GETPID ? task_process()->pid : uptime_ms();
         dispatch = false;
     }
+    else if (vector==0x80 && net_ap_syscall(r)) dispatch=false;
     if (!dispatch && !__atomic_load_n(&mail->stop, __ATOMIC_ACQUIRE) &&
         mail->elapsed_us < mail->quantum_us) return;
     struct task *t = current_task;
@@ -434,6 +436,7 @@ static struct task *rq_pop(void) {
 
 static void free_task(struct task *t) {
     ASSERT(!t->owner_cpu);
+    net_task_exit(t);
     /* unlink from the global list */
     struct task **pp = &task_list;
     while (*pp && *pp != t) pp = &(*pp)->all_next;
@@ -774,6 +777,7 @@ NORETURN void task_exit(int code) {
     ASSERT(!t->owner_cpu);
     if (t == idle_task) panic("idle task tried to exit");
     t->exit_code = code;
+    net_task_exit(t);
     if (t->is_thread) {
         /* Do not close shared descriptors, orphan process children or destroy VM. */
         cli();

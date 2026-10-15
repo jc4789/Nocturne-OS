@@ -23,5 +23,17 @@ int main(void) {
         addr("dns", ni.dns);
     }
     printf("  packets   rx %lu  tx %lu\n", (unsigned long)ni.rx_packets, (unsigned long)ni.tx_packets);
+    struct n_netstats stats;
+    if (net_stats(&stats)==0) {
+        printf("  receive   dropped %lu  invalid %lu  budget yields %lu\n",
+               (unsigned long)stats.rx_dropped,(unsigned long)stats.rx_invalid,(unsigned long)stats.rx_budget_yields);
+        printf("  host ack  pending %lu  retries %lu  cancelled %lu\n",
+               (unsigned long)stats.rx_completion_pending,(unsigned long)stats.rx_completion_retries,
+               (unsigned long)stats.rx_completion_cancelled);
+        for(unsigned cpu=1;cpu<16;cpu++) if(stats.ap_calls[cpu])
+            printf("  cpu%-5u TCP rx %lu bytes  tx %lu bytes  calls %lu  deferred %lu\n",cpu,
+                   (unsigned long)stats.ap_recv_bytes[cpu],(unsigned long)stats.ap_send_bytes[cpu],
+                   (unsigned long)stats.ap_calls[cpu],(unsigned long)stats.ap_fallbacks[cpu]);
+    }
     return 0;
 }

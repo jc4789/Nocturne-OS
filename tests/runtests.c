@@ -406,7 +406,28 @@ static const struct test tests[] = {
     {"web", "tcp-capacity-recovery", "tcc -o /home/tcpcapacitytest /data/tests/tcpcapacitytest.c && /home/tcpcapacitytest", 0,
      {"tcpcapacitytest: ", ", 0 failed"}, "FAIL", 180, false, true},
 
+    {"nettransport", "dns-deadline-smp", "tcc -o /home/nettransporttest /data/tests/nettransporttest.c && /home/nettransporttest", 0,
+     {"nettransporttest: 0 failed"}, "FAIL", 120, false, true},
+    {"nettransport", "default-dns-stream", "tcc -o /home/nettransporttest /data/tests/nettransporttest.c && /home/nettransporttest --stream-candidates", 0,
+     {"nettransport stream: 0 failed", "STREAM-CANDIDATES plain candidates=2 attempts=2"}, "FAIL", 30, false, true},
+    {"nettransport", "tls-dns-candidates", "tcc -o /home/nettransporttest /data/tests/nettransporttest.c && /home/nettransporttest --tls-candidates", 0,
+     {"nettransport TLS candidates: 0 failed", "STREAM-CANDIDATES tls=1"}, "FAIL", 90, false, true},
+    {"networkpacing", "pause-fairness-batch", "tcc -o /home/webnettest /data/tests/webnettest.c && /home/webnettest --network-pacing", 0,
+     {"webnettest: 0 failed"}, "FAIL", 120, false, true},
+    {"transport8", "http-pool-h2", "tcc -o /home/transport8 /data/tests/transport8.c && /home/transport8", 0,
+     {"transport8:" , "0 failed"}, "FAIL", 120, false, true},
+    {"transport8", "h2-late-cancel", "tcc -o /home/transport8 /data/tests/transport8.c && /home/transport8 --late-cancel", 0,
+     {"transport8 late-cancel: 5 checks, 0 failed"}, "FAIL", 30, false, true},
+    {"transport8", "h2-header-budget", "tcc -o /home/transport8 /data/tests/transport8.c && /home/transport8 --header-budget", 0,
+     {"transport8 header-budget: 12 checks, 0 failed"}, "FAIL", 60, false, true},
+    {"transport8", "tls-handshake-cancel", "tcc -o /home/transport8 /data/tests/transport8.c && /home/transport8 --tls-cancel", 0,
+     {"transport8 TLS-cancel:" , "0 failed"}, "FAIL", 120, false, true},
+    {"net", "tls-alpn-session-resume", "tcc -o /home/transport8 /data/tests/transport8.c && /home/transport8 --tls", 0,
+     {"transport8 TLS:" , "0 failed"}, "FAIL", 120, false, true},
+
     /* TCP against the host's test server (no internet needed), clean and with simulated loss */
+    {"tcpperf", "clean-repeat", "tcc -o /home/tcptest /data/tests/tcptest.c && /home/tcptest --clean-repeat 5", 0,
+     {"TCPPERF sample=5", "tcptest: 0 failed"}, "FAIL", 120, false, true},
     {"tcp", "bulk-and-loss", "tcc -o /home/tcptest /data/tests/tcptest.c && /home/tcptest", 0, {"tcptest: 0 failed"},
      "FAIL", 300, false, true},
 
@@ -567,7 +588,7 @@ int main(int argc, char **argv) {
             continue;
         }
         static bool net_waited;
-        if (!net_waited && (!strcmp(t->group, "tcp") || !strcmp(t->group, "net") || !strcmp(t->name, "worker-network"))) {
+        if (!net_waited && (!strcmp(t->group, "tcp") || !strcmp(t->group, "tcpperf") || !strcmp(t->group, "net") || !strcmp(t->name, "worker-network"))) {
             net_waited = true;
             if (!net_wait_up(20000)) printf("runtests: the network did not come up\n");
         }

@@ -35,6 +35,8 @@ void ns_close(net_stream *s){(void)s;clock_ms+=13;}
 void ns_set_timeout(net_stream *s,int t){(void)s;(void)t;}
 const char *ns_error(net_stream *s){(void)s;return "synthetic short write";}
 int http_inflate(char *a,int b,const char *c,int d,int *e){(void)a;(void)b;(void)c;(void)d;(void)e;return -1;}
+#define HTTP_MOCK_HAS_TIMEOUT
+#include "http_mock_lifecycle.h"
 #define CHECK(c) do{checks++;if(!(c)){failed++;printf("FAIL HTTP batch line %d\n",__LINE__);}}while(0)
 int main(void) {
     struct http_req q={.url="https://headers.invalid/path?q=1",.headers="X-Test: one\r\n"};
@@ -44,7 +46,8 @@ int main(void) {
     struct http_transport_timing timing={0};
     CHECK(http_request_stream_timed(&q,&r,0,NULL,&timing)==0);
     CHECK(timing.phase==HTTP_PHASE_DONE&&timing.resolve_ms==3&&timing.connect_ms==4&&timing.tls_ms==5);
-    CHECK(timing.first_header_ms==18&&timing.header_ms==18&&timing.body_ms==13);
+    /* A reusable socket has no close_notify wait in the response body phase. */
+    CHECK(timing.first_header_ms==18&&timing.header_ms==18&&timing.body_ms==0);
     http_resp_free(&r);
     CHECK(strstr(sent,"GET /path?q=1 HTTP/1.1\r\nHost: headers.invalid\r\n")!=NULL);
     CHECK(strstr(sent,"X-Test: one\r\n\r\n")!=NULL);http_resp_free(&r);

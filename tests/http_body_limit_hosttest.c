@@ -20,6 +20,7 @@ uint64_t uptime_ms(void){return 0;}
 long ns_read(net_stream *s,void *p,size_t n){size_t left=s->n-s->at;if(n>left)n=left;memcpy(p,s->p+s->at,n);s->at+=n;return (long)n;}
 void ns_close(net_stream *s){(void)s;}
 const char *ns_error(net_stream *s){(void)s;return "";}
+#include "http_mock_lifecycle.h"
 static int count_body(void *ctx,const char *p,size_t n) {
     (void)ctx;callbacks++;delivered+=n;
     CHECK(!n || (p[0]=='x'&&p[n-1]=='x'));return 0;

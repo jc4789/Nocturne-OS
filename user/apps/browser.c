@@ -6,6 +6,7 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <errno.h>
 #include "nocturne.h"
 #include "http.h"
 #include "web.h"
@@ -1019,7 +1020,7 @@ static bool host_request(void *opaque, const struct web_request *request) {
         .image_upgrade = request->kind == WEB_RESOURCE_IMAGE && request->image_upgrade,
         .cache_mode = request->cache_mode, .keepalive = request->keepalive,
         .fetch_group = request->fetch_group
-        , .stream_response = request->stream_response
+        , .stream_response = request->stream_response, .top_level_url=web_url(doc)
     };
     t->network_id = webnet_submit(network, &r, resource_completed, t);
     if (!t->network_id) { free(t); return false; }
@@ -1206,7 +1207,12 @@ static void native_active_event(const struct gui_event *event) {
         web_active_release(doc);
 }
 static int browser_event(struct gui_event *event, int timeout) {
-    int result=win_event(w,event,timeout);
+    int result=win_event(w,event,0);
+    if(!result && timeout!=0){
+        int ready=webnet_wait(network,w->fd,timeout);
+        if(ready<0 && errno!=EINTR)return -1;
+        result=win_event(w,event,0);
+    }
     /* Release/capture cancellation is native state, even while author JS is
        running. Never hit-test, dispatch, or lay out mutable DOM at dequeue. */
     if(result>0){native_active_event(event);browser_hover_boundary(&evq_hover_tail_valid,event);}
@@ -1249,6 +1255,7 @@ static bool host_script_checkpoint(void *opaque) {
     if(quit)return false;
     if(now>=last && now-last<10)return true;
     last=now;
+    webnet_service(network,now);
     uint64_t until=now+2;
     struct gui_event e;
     while(w && uptime_ms()<until) {
@@ -1295,15 +1302,16 @@ static bool host_cookie_enabled(void *opaque) {
 }
 static char *host_cookie_get(void *opaque, const char *url) {
     (void)opaque;
-    long n = webnet_cookie_get(network, url, NULL, 0);
+    const char *top_level_url=doc?web_url(doc):"";
+    long n = webnet_cookie_get_site(network, url, top_level_url, NULL, 0);
     if (n < 0) return NULL;
     char *out = malloc((size_t)n + 1);
-    if (out && webnet_cookie_get(network, url, out, (size_t)n + 1) < 0) { free(out); out = NULL; }
+    if (out && webnet_cookie_get_site(network, url, top_level_url, out, (size_t)n + 1) < 0) { free(out); out = NULL; }
     return out;
 }
 static void host_cookie_set(void *opaque, const char *url, const char *value) {
     (void)opaque;
-    if (webnet_cookie_set(network, url, value) < 0) console_add("error", "Cookie storage allocation failed");
+    if (webnet_cookie_set_site(network, url, doc?web_url(doc):"", value) < 0) console_add("error", "Cookie storage allocation failed");
 }
 static int host_storage(void *opaque, const char *origin, const struct web_storage_request *request,
                         struct web_storage_result *out) {
@@ -1372,7 +1380,7 @@ static bool host_wait_request(void *opaque, uint64_t resource_id, const bool *co
         if (*completed) break;
         struct gui_event e;
         int timeout = webnet_timeout(network, now);
-        int event = browser_event(&e, timeout < 0 ? 10 : MIN(timeout, 10));
+        int event = browser_event(&e, timeout);
         if (event < 0) { quit = true; break; }
         if (event) handle_native_wait(&e);
         redraw_console();
@@ -1407,7 +1415,7 @@ static bool host_sync_request(void *opaque, const struct web_request *request, s
         .kind = s->kind, .generation = s->generation, .url = request->url,
         .origin = request->origin, .method = "GET", .credentials = request->credentials,
         .redirect_error = request->redirect_error, .same_origin = request->same_origin,
-        .cache_mode = request->cache_mode
+        .cache_mode = request->cache_mode, .top_level_url=web_url(doc)
     };
     uint64_t id = webnet_submit(network, &r, synchronous_completed, s);
     if (!id) { free(s); strcpy(response->error, "module request could not be started"); return false; }
@@ -1426,7 +1434,7 @@ static bool host_sync_request(void *opaque, const struct web_request *request, s
         if (s->ready) break;
         struct gui_event e;
         int timeout = webnet_timeout(network, now);
-        int event = browser_event(&e, timeout < 0 ? 10 : MIN(timeout, 10));
+        int event = browser_event(&e, timeout);
         if (event < 0) { quit = true; break; }
         if (event) handle_native_wait(&e);
         redraw_console();
@@ -1665,7 +1673,9 @@ static void navigate_inner(const char *url, const void *post, size_t length, con
         .origin = cur_url, .method = post ? "POST" : "GET",
         .headers = post ? headers : NULL,
         .body = post, .body_len = post ? length : 0, .user_navigation = true,
-        .credentials = WEBNET_CREDENTIALS_INCLUDE
+        /* No document is a browser-initiated navigation (no client), not an
+           opaque one: SameSite=Strict cookies remain eligible. */
+        .credentials = WEBNET_CREDENTIALS_INCLUDE, .top_level_url=doc?web_url(doc):NULL
     };
     navigation_timing.fetch_start_ms = uptime_ms();
     navigation_timing.fetch_valid = true;

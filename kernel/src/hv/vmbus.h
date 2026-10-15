@@ -84,6 +84,10 @@ struct vmbus_channel *vmbus_find(const struct guid *type, int n);
 int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, vmbus_callback_t cb, void *priv);
 /* Close an open channel and free its rings. */
 void vmbus_close(struct vmbus_channel *ch);
+/* Close, but reclaim ring pages only after an explicit GPADL teardown ACK.
+   False means backing was retained, including on rescind; the channel itself
+   is still closed. This does not change the legacy close contract. */
+bool vmbus_close_confirmed(struct vmbus_channel *ch);
 /* Give up a claimed channel: it is freed (and its relid handed back) once the host rescinds it. */
 void vmbus_release(struct vmbus_channel *ch);
 /* Socket channels offered after start-up go to this hook, in interrupt context. It sets
@@ -91,7 +95,8 @@ void vmbus_release(struct vmbus_channel *ch);
 void vmbus_set_socket_hook(void (*hook)(struct vmbus_channel *ch));
 /* Share guest memory with the host: returns a GPADL handle, or 0 on failure. */
 uint32_t vmbus_gpadl_create(struct vmbus_channel *ch, uint64_t pa, uint32_t pages);
-void vmbus_gpadl_teardown(struct vmbus_channel *ch, uint32_t gpadl);
+/* False leaves the memory shared: it must not be freed or reused. */
+bool vmbus_gpadl_teardown(struct vmbus_channel *ch, uint32_t gpadl);
 /* Send an in-band packet. 0, or -EAGAIN when the ring is full. */
 int vmbus_send(struct vmbus_channel *ch, uint16_t type, uint16_t flags, const void *data, uint32_t len,
                uint64_t trans_id);
@@ -100,6 +105,10 @@ int vmbus_send_raw(struct vmbus_channel *ch, const void *hdr, uint32_t hdr_len, 
 /* Copy the next received packet (descriptor and all) into buf. Returns its length, 0 if the ring
    is empty, or -E2BIG (the packet is dropped) if it does not fit. */
 int vmbus_recv(struct vmbus_channel *ch, void *buf, uint32_t len);
+/* Readiness only; both are safe with interrupts disabled. packet_len includes
+   the packet descriptor, but excludes the ring's trailing bookkeeping word. */
+bool vmbus_rx_pending(struct vmbus_channel *ch);
+bool vmbus_write_ready(struct vmbus_channel *ch, uint32_t packet_len);
 /* Wait (with interrupts on) until *flag is set; false on timeout. */
 bool vmbus_wait(volatile bool *flag, uint64_t ms);
 void guid_format(const struct guid *g, char *out); /* 37 bytes */

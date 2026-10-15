@@ -319,6 +319,13 @@ static void deliver(struct fixture *f) {
                 strstr(q.headers, "pragma:") ? "true" : "false");
             free(r.body); r.body = strdup(metadata); r.body_len = strlen(metadata); r.status = 200;
         }
+        if(q.cache_mode==WEBNET_CACHE_ONLY_IF_CACHED){
+            /* Bridge contract only: the real persistent HTTP cache is exercised
+               by webnettest against the counted HTTP server. */
+            if(!strcmp(q.url,"http://fixture.test/dir/api/cache-hit")){
+                free(r.body);r.body=strdup("{\"cached\":true}");r.body_len=r.body?strlen(r.body):0;r.status=200;
+            }else{r.status=0;snprintf(r.error,sizeof r.error,"No usable cached response is available");}
+        }
         if (!strcmp(q.url, "http://fixture.test/dir/api/fetch-policy")) {
             char metadata[2300];
             snprintf(metadata,sizeof metadata,"{\"no_cors\":%s,\"no_referrer\":%s,\"referrer\":\"%s\",\"referrer_policy\":%d}",

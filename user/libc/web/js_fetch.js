@@ -7,9 +7,9 @@
    cross-origin hop; the native worker checks safelists and resource policy.
    Buffered keepalive requests use a native, document-independent transport;
    Fetch's 64 KiB inflight body accounting belongs to that native fetch group.
-   Request cache modes use the cacheless native host's genuine network path;
-   only-if-cached always misses and never sends a network request. No Cache
-   API or stored responses are fabricated. HTTP-generated cache headers belong
+   Request cache modes use the native partitioned HTTP response cache;
+   only-if-cached asks that cache for a stored response without network I/O.
+   HTTP-generated cache headers belong
    after CORS preflight, not in the author's Request.headers.
    https://fetch.spec.whatwg.org/#http-network-or-cache-fetch (2026-10-07).
    Included after DOMException; initialize after js_encoding.js/js_url.js. */
@@ -495,7 +495,6 @@ const fetchBridge = (() => {
             }
             if(s.mode==='no-cors'&&!host.noCorsFetch)throw notSupported('This native context has no no-cors transport');
             if(s.redirect==='manual')throw notSupported('Opaque manual redirect responses are not supported');
-            if(s.cache==='only-if-cached')throw new TypeError('No cached response is available');
             let raw='';for(const [name,value]of sortedHeaders(headerSlots.get(s.headers)))raw+=name+': '+value+'\r\n';
             let pair,channel,channelRef,waiting,transportId=0,done=false,hasBody=false,finishStream=()=>{};
             const liveChannel=()=>channel||(channelRef&&apply(deref,channelRef,[]));
