@@ -120,7 +120,7 @@ static void route_event(web_workers*w,struct child*c,struct event*e){
     }
     if(w->last)w->last->next=e;else w->events=e;w->last=e;
 }
-static void fail(web_workers *w,struct child *c,const char *message){stop(w,c);JSValue v=JS_NewObject(w->ctx);JS_SetPropertyStr(w->ctx,v,"message",JS_NewString(w->ctx,message));JS_SetPropertyStr(w->ctx,v,"terminal",JS_TRUE);event(w,c,NJW_ERROR,v);JS_FreeValue(w->ctx,v);}
+static void fail(web_workers *w,struct child *c,const char *message){stop(w,c);JSValue v=JS_NewObject(w->ctx);JS_DefinePropertyValueStr(w->ctx,v,"message",JS_NewString(w->ctx,message),JS_PROP_C_W_E);JS_DefinePropertyValueStr(w->ctx,v,"terminal",JS_TRUE,JS_PROP_C_W_E);event(w,c,NJW_ERROR,v);JS_FreeValue(w->ctx,v);}
 static bool spawn_child(web_workers *w,struct child *c){
     web_worker_background();if(active_children>=NJW_MAX_WORKERS){fail(w,c,"Native Worker process count is not representable");return false;}
     int ip[2]={-1,-1},op[2]={-1,-1},nullfd=-1;

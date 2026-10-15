@@ -33,6 +33,13 @@ struct request {
     char *cookie_site, *cookie_origin;
     char *transport_origin;
     uint64_t queued_at,started_at;
+    /* Debug stream accounting: delivered frames/bytes and time spent paused
+       waiting for the consumer, separating consumer from transport stalls. */
+    uint64_t stream_frames,stream_bytes,paused_at,paused_ms;
+    /* Consecutive body chunks already received from the worker, delivered to
+       the consumer as one callback instead of one per worker read. */
+    unsigned char *merge;
+    size_t merge_len,merge_cap;
     enum webnet_credentials credentials;
     bool top_level;
     bool keepalive;
@@ -59,7 +66,7 @@ struct webnet {
     webcookie_jar *cookies;
 };
 
-static void request_free(struct request *r) { if(!r)return;free(r->tx); free(r->rx); free(r->cookie_site);free(r->cookie_origin);free(r->transport_origin); free(r); }
+static void request_free(struct request *r) { if(!r)return;free(r->tx); free(r->rx); free(r->merge);free(r->cookie_site);free(r->cookie_origin);free(r->transport_origin); free(r); }
 static unsigned worker_budget(void){
     struct n_cpuinfo cpu={0};struct n_sysinfo memory={0};
     unsigned online=cpu_info(&cpu)>=0&&cpu.online_cpus?cpu.online_cpus:1;
@@ -416,10 +423,13 @@ static void complete(webnet *n, struct slot *s) {
         /* These are caller-visible completion intervals, including TLS,
            pipe pumping, a busy GUI/native task and helper reaping. They are
            not server latency, download speed, or summed worker CPU time. */
-        fprintf(stderr,"[webnet] complete id=%lu class=%d queued-to-complete=%lu ms dispatch-to-complete=%lu ms decoded-frame-bytes=%lu stream=%u cancelled=%u\n",
+        fprintf(stderr,"[webnet] complete id=%lu class=%d queued-to-complete=%lu ms dispatch-to-complete=%lu ms decoded-frame-bytes=%lu stream=%u cancelled=%u",
             (unsigned long)r->id,r->priority,(unsigned long)(done>=r->queued_at?done-r->queued_at:0),
             (unsigned long)(r->started_at&&done>=r->started_at?done-r->started_at:0),
             (unsigned long)r->head.body_len,r->streaming,r->cancelled);
+        if(r->streaming)fprintf(stderr," stream-frames=%lu stream-bytes=%lu consumer-paused=%lu ms",
+            (unsigned long)r->stream_frames,(unsigned long)r->stream_bytes,(unsigned long)r->paused_ms);
+        fputc('\n',stderr);
     }
     if (!r->cancelled) {
         if (!r->streaming && !r->error[0] && r->rx && !cookie_events(n,r)) snprintf(r->error,sizeof r->error,"Invalid cookie update or out of memory");
@@ -530,6 +540,14 @@ static bool stream_frame_valid(struct request *r) {
     return h->magic == WEBNET_STREAM_END && !h->url_len && !h->headers_len && !h->body_len && !h->status &&
         (r->headers_seen || h->error_len);
 }
+/* Every stream event pauses the transport until the consumer resumes it. */
+static void deliver_stream_event(webnet *n, struct request *r, const struct webnet_response *response) {
+    if (n->debug && response->event == WEBNET_CHUNK) { r->stream_frames++; r->stream_bytes += response->body_len; }
+    r->paused = true; if (n->debug) r->paused_at = uptime_ms();
+    r->in_callback=true;
+    r->callback(n, r->id, r->generation, response, r->opaque);
+    r->in_callback=false;
+}
 static bool dispatch_stream_frame(webnet *n, struct request *r) {
     if (!unpack(r)) return false;
     if (!cookie_events(n, r)) return false;
@@ -545,13 +563,37 @@ static bool dispatch_stream_frame(webnet *n, struct request *r) {
         r->head.magic == WEBNET_STREAM_CHUNK ? WEBNET_CHUNK : WEBNET_UPLOAD;
     response.uploaded = r->head.magic == WEBNET_STREAM_UPLOAD ? r->head.status : 0;
     if (response.event == WEBNET_HEADERS) r->headers_seen = true;
-    r->paused = true;
-    r->in_callback=true;
-    r->callback(n, r->id, r->generation, &response, r->opaque);
-    r->in_callback=false;
+    deliver_stream_event(n, r, &response);
     free(r->rx); r->rx = NULL; r->rx_len = r->rx_pos = r->head_pos = 0;
     memset(&r->head, 0, sizeof r->head);
     return true;
+}
+/* Append a complete, validated CHUNK frame to the pending delivery. False
+   leaves the frame for ordinary dispatch: merging is bounded by the same
+   receive window that bounds unread worker bytes. */
+static bool merge_stream_chunk(struct request *r) {
+    size_t n = r->head.body_len;
+    if (r->merge_len > WEBNET_SERVICE_WINDOW - n) return false;
+    if (r->merge_len + n + 1 > r->merge_cap) {
+        size_t cap = MAX(r->merge_len + n + 1, MIN(r->merge_cap ? r->merge_cap * 2 : (size_t)WEBNET_STREAM_CHUNK_MAX, (size_t)WEBNET_SERVICE_WINDOW + 1));
+        unsigned char *next = realloc(r->merge, cap);
+        if (!next) return false;
+        r->merge = next; r->merge_cap = cap;
+    }
+    memcpy(r->merge + r->merge_len, r->rx, n); r->merge_len += n; r->merge[r->merge_len] = 0;
+    free(r->rx); r->rx = NULL; r->rx_len = r->rx_pos = r->head_pos = 0;
+    memset(&r->head, 0, sizeof r->head);
+    return true;
+}
+static void dispatch_merged_chunk(webnet *n, struct request *r) {
+    struct webnet_response response = {0};
+    response.final_url = response.headers = response.error = "";
+    response.body = r->merge; response.body_len = r->merge_len;
+    response.event = WEBNET_CHUNK;
+    deliver_stream_event(n, r, &response);
+    r->merge_len = 0;
+    /* Retained idle streams keep at most one wire chunk of merge storage. */
+    if (r->merge_cap > (size_t)WEBNET_STREAM_CHUNK_MAX + 1) { free(r->merge); r->merge = NULL; r->merge_cap = 0; }
 }
 struct pump_budget {size_t bytes;uint64_t until;bool callbacks;};
 static bool pump_room(const struct pump_budget *budget){
@@ -581,7 +623,10 @@ static void credit_flush(struct slot *s) {
    drain one bounded frame into request-owned memory, never reenter author JS. */
 static bool frame_dispatch(webnet *n,struct slot *s,struct pump_budget *budget){
     struct request *r=s->rq;
-    if(!r->frame_ready || !budget->callbacks)return false;
+    if(!budget->callbacks)return false;
+    /* Merged body bytes precede any frame read after them. */
+    if(r->merge_len){dispatch_merged_chunk(n,r);return true;}
+    if(!r->frame_ready)return false;
     r->frame_ready=false;
     bool terminal=!r->streaming || r->head.magic==WEBNET_STREAM_END;
     if(r->streaming){if(!dispatch_stream_frame(n,r)){slot_stop(s,"Invalid stream response or out of memory");return false;}}
@@ -594,7 +639,7 @@ static void pump_slot(webnet *n,struct slot *s,uint64_t now,struct pump_budget *
         if (!r||r->in_callback) return;
         if (!r->finishing && now >= r->deadline) slot_stop(s, "Request deadline exceeded");
         reap_paused_stream(s);
-        if(!r->finishing&&r->frame_ready&&!r->paused)frame_dispatch(n,s,global);
+        if(!r->finishing&&(r->frame_ready||r->merge_len)&&!r->paused)frame_dispatch(n,s,global);
         if (!r->finishing&&!r->paused&&!r->frame_ready&&pump_room(global)) {
             struct n_pollfd pf[2] = {{s->out, N_POLLIN, 0}, {s->in, N_POLLOUT, 0}};
             if (poll(pf, r->tx&&r->tx_credit&&s->in>=0 ? 2 : 1, 0) < 0) slot_stop(s, "Worker poll failed");
@@ -613,7 +658,15 @@ static void pump_slot(webnet *n,struct slot *s,uint64_t now,struct pump_budget *
                 }
             }
             credit_flush(s);
-            budget = MIN(PUMP_BYTES,global->bytes);
+            /* A streamed body drains into its merge buffer only while the
+               consumer is not paused, so the reader's backpressure (not a
+               fixed per-slot share) bounds it within the slice's bytes and
+               time; the share capped such downloads at one share per browser
+               turn while the worker already held the bytes. Buffered bodies
+               keep the share: draining them at once moved large page scripts
+               ahead of media startup and lengthened playback stalls in
+               measurements, which needs main-thread work first. */
+            budget = r->streaming ? global->bytes : MIN(PUMP_BYTES,global->bytes);
             while (!r->finishing && !r->paused && !r->frame_ready && budget && pump_room(global) && (pf[0].revents & (N_POLLIN | N_POLLHUP))) {
                 void *dest; size_t take;
                 if (r->head_pos < sizeof r->head) {
@@ -650,11 +703,17 @@ static void pump_slot(webnet *n,struct slot *s,uint64_t now,struct pump_budget *
                     }
                 } else {r->rx_pos += k;if(s->shared)r->credit_due+=(size_t)k;}
                 if (r->head_pos == sizeof r->head && r->rx_pos == r->rx_len) {
-                    r->frame_ready=true;
-                    frame_dispatch(n,s,global);
+                    /* Keep draining body chunks that have already arrived;
+                       the consumer gets them together when the pipe is empty
+                       for now, the slice ends, or another frame follows. */
+                    if(!(r->streaming && r->head.magic==WEBNET_STREAM_CHUNK && merge_stream_chunk(r))){
+                        r->frame_ready=true;
+                        frame_dispatch(n,s,global);
+                    }
                 }
                 if(!r->finishing)credit_flush(s);
             }
+            if(!r->finishing&&!r->paused&&r->merge_len)frame_dispatch(n,s,global);
         }
         if (r->finishing && global->callbacks) {
             /* Even a child that produced its frame must not hold a slot past the deadline. */
@@ -721,10 +780,10 @@ int webnet_timeout(const webnet *n, uint64_t now) {
     }
     for (int i = 0; i < WORKERS; i++) if (n->slots[i].rq) {
         const struct request *r = n->slots[i].rq;
-        if (r->finishing || (!r->paused&&r->frame_ready) || now >= r->deadline) return 0;
+        if (r->finishing || (!r->paused&&(r->frame_ready||r->merge_len)) || now >= r->deadline) return 0;
         if (r->deadline - now < (uint64_t)ms) ms = (int)(r->deadline - now);
     }
-    for(const struct slot *s=n->parked;s;s=s->next)if(s->rq){const struct request *r=s->rq;if(r->finishing||(!r->paused&&r->frame_ready)||now>=r->deadline)return 0;if(r->deadline-now<(uint64_t)ms)ms=(int)(r->deadline-now);}
+    for(const struct slot *s=n->parked;s;s=s->next)if(s->rq){const struct request *r=s->rq;if(r->finishing||(!r->paused&&(r->frame_ready||r->merge_len))||now>=r->deadline)return 0;if(r->deadline-now<(uint64_t)ms)ms=(int)(r->deadline-now);}
     /* Unadmitted work must be reconsidered after the service has retired a
        paused peer. Other live requests wake through their own channel. */
     if(n->queue && !live_workers(n))return 0;
@@ -792,12 +851,16 @@ static void cancel(webnet *n, uint64_t key, bool generation) {
     }
 }
 void webnet_cancel(webnet *n, uint64_t id) { cancel(n, id, false); }
+static void resume_request(webnet *n, struct request *r) {
+    if (n->debug && r->paused && r->paused_at) { r->paused_ms += uptime_ms() - r->paused_at; r->paused_at = 0; }
+    r->paused = false;
+}
 void webnet_resume(webnet *n, uint64_t id) {
     if (!n) return;
     for (int i = 0; i < WORKERS; i++) {
         struct request *r = n->slots[i].rq;
-        if (r && r->id == id && r->streaming && !r->cancelled) { r->paused = false; return; }
+        if (r && r->id == id && r->streaming && !r->cancelled) { resume_request(n, r); return; }
     }
-    for(struct slot *s=n->parked;s;s=s->next){struct request *r=s->rq;if(r&&r->id==id&&r->streaming&&!r->cancelled){r->paused=false;return;}}
+    for(struct slot *s=n->parked;s;s=s->next){struct request *r=s->rq;if(r&&r->id==id&&r->streaming&&!r->cancelled){resume_request(n,r);return;}}
 }
 void webnet_cancel_generation(webnet *n, uint64_t generation) { cancel(n, generation, true); }

@@ -518,13 +518,15 @@ const fetchBridge = (() => {
                     state.bytes=null;state.abort=s.signal;
                     if(hasBody&&!observer){state.stream=active.stream;networkSlots.set(active.stream,active);apply(registerFinalizer,networkFinalizer,[active,transportId,active]);channelRef=new NativeWeakRef(active);channel=null;}
                     if(observer){observer('headers',value,resume);return false;}
-                    return !hasBody;
+                    // The body stream's queue has room up to its high-water
+                    // mark: keep the transport flowing until it is full.
+                    return !hasBody||active.wantsMore();
                 }
                 if(event===2){
                     if(observer){if(!hasBody)return true;observer('chunk',value,resume);return false;}
                     if(hasBody)active.enqueue(value);
                     if(waiting){const resolve=waiting;waiting=null;resolve();}
-                    return !hasBody;
+                    return !hasBody||active.wantsMore();
                 }
                 if(event===4){if(observer){observer('upload',value,resume);return false;}return true;}
                 if(event===3){

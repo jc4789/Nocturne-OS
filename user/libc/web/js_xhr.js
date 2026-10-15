@@ -83,6 +83,16 @@
         if(!s.uploadDone){s.uploadDone=true;if(s.uploadListener){fire(s.upload,type);if(s.epoch!==epoch)return;fire(s.upload,'loadend');if(s.epoch!==epoch)return;}}
         fire(x,type);if(s.epoch!==epoch)return;fire(x,'loadend');
     }
+    // Pages see only a bare network error; the console names the transport
+    // reason, as other browsers report failed requests there.
+    function networkFailure(x,s,epoch,reason) {
+        if(!current(s,epoch))return;
+        let text;try{text=reason instanceof Error?reason.name+': '+reason.message:string(reason);}catch(_){text='unknown reason';}
+        // Like resource diagnostics, never copy query/fragment tokens.
+        const cut=s.url.search(/[?#]/),shown=cut<0?s.url:s.url.slice(0,cut)+' [URL suffix omitted]';
+        try{host.log(1,'XMLHttpRequest '+s.method+' '+shown+' failed: '+text);}catch(_){}
+        error(x,s,epoch,'error');
+    }
     function armTimer(x,s,epoch) {
         stopTimer(s);
         if(s.timeout && current(s,epoch))s.timer=host.timer(0,()=>error(x,s,epoch,'timeout'),Math.max(0,s.started+s.timeout-host.now()),[]);
@@ -174,7 +184,7 @@
         fire(x,'progress',s.loaded,s.total,s.total>0);
     }
     function receivedEnd(x,s,epoch,reason) {
-        if(reason!==undefined){error(x,s,epoch,'error');return;}
+        if(reason!==undefined){networkFailure(x,s,epoch,reason);return;}
         prepareDecoder(s);
         if(s.decoder)s.text+=nativeApply(decode,s.decoder,[]);
         else {
@@ -265,11 +275,11 @@
                     });
                 },s.uploadListener);
                 defineProperty(s.transport.promise,'constructor',{value:promiseConstructor});
-                nativeApply(nativeThen,s.transport.promise,[()=>{},()=>queue(this,s,epoch,()=>error(this,s,epoch,'error'))]);
+                nativeApply(nativeThen,s.transport.promise,[()=>{},reason=>queue(this,s,epoch,()=>networkFailure(this,s,epoch,reason))]);
                 return;
             }
             try{pair=s.url.startsWith('blob:')||s.url.startsWith('data:')?{id:0,promise:fetchBridge.fetch(s.url,{method:s.method,headers:Object.fromEntries(s.headers),body})}:host.fetch(s.url,s.method,raw,body,false,s.credentials?2:1,s.uploadListener);}
-            catch(_){queue(this,s,epoch,()=>error(this,s,epoch,'error'));return;}
+            catch(e){queue(this,s,epoch,()=>networkFailure(this,s,epoch,e));return;}
             s.id=pair.id;
             // Native promises settle at the host checkpoint. XHR notifications
             // are tasks; never run them recursively in send() or a page promise.
@@ -279,7 +289,7 @@
                 defineProperty(pair.promise,'constructor',{value:promiseConstructor});
                 nativeApply(nativeThen,pair.promise,[response=>{
                     queue(this,s,epoch,()=>{try{completed(this,s,epoch,response);}catch(e){error(this,s,epoch,'error');report(e);}});
-                },()=>queue(this,s,epoch,()=>error(this,s,epoch,'error'))]);
+                },reason=>queue(this,s,epoch,()=>networkFailure(this,s,epoch,reason))]);
             }catch(e){cancel(s);s.sent=false;s.epoch++;throw e;}
         }
         abort() {

@@ -961,7 +961,13 @@ JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs);
 JSValue JS_PromiseResolveIntrinsic(JSContext *ctx, JSValueConst value);
 int JS_PromiseAddReactions(JSContext *ctx, JSValueConst promise,
                           JSValueConst on_fulfilled, JSValueConst on_rejected);
+/* PerformPromiseThen with a fresh %Promise% capability, as Web IDL "react to
+   a promise" does: no constructor/@@species lookup on the promise. */
+JSValue JS_PromiseThenIntrinsic(JSContext *ctx, JSValueConst promise,
+                                JSValueConst on_fulfilled, JSValueConst on_rejected);
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValue promise);
+/* The promise's [[PromiseIsHandled]] slot, or -1 for a non-promise. */
+int JS_PromiseIsHandled(JSContext *ctx, JSValueConst promise);
 JSValue JS_PromiseResult(JSContext *ctx, JSValue promise);
 
 /* is_handled = TRUE means that the rejection is handled */

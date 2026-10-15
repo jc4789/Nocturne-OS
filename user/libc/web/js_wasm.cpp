@@ -235,7 +235,7 @@ static JSValue wasm_error(JSContext *ctx, State *s, ErrorKind kind,
   JSValue error = JS_NewError(ctx);
   if (JS_IsException(error)) return error;
   JS_SetPrototype(ctx, error, s->errors[kind]);
-  JS_SetPropertyStr(ctx, error, "message", JS_NewString(ctx, message));
+  JS_DefinePropertyValueStr(ctx, error, "message", JS_NewString(ctx, message), JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
   return JS_Throw(ctx, error);
 }
 static JSValue error_ctor(JSContext *ctx, JSValueConst new_target, int argc,
@@ -1151,13 +1151,15 @@ static JSValue module_types(JSContext *ctx, JSValueConst, int argc,
     auto kind = imports ? mod->import_types()[i].type->kind : mod->export_types()[i].type->kind;
     const char *kind_name = wi::GetName(kind);
     if (kind == wi::ExternKind::Func) kind_name = "function";
-    JS_SetPropertyStr(ctx, item, "name", JS_NewStringLen(ctx, name.data(), name.size()));
-    JS_SetPropertyStr(ctx, item, "kind", JS_NewString(ctx, kind_name));
+    // Dictionary-to-JS conversion uses CreateDataProperty: page setters on
+    // Object.prototype or Array.prototype must not intercept these fields.
+    JS_DefinePropertyValueStr(ctx, item, "name", JS_NewStringLen(ctx, name.data(), name.size()), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, item, "kind", JS_NewString(ctx, kind_name), JS_PROP_C_W_E);
     if (imports) {
       const auto &module = mod->import_types()[i].module;
-      JS_SetPropertyStr(ctx, item, "module", JS_NewStringLen(ctx, module.data(), module.size()));
+      JS_DefinePropertyValueStr(ctx, item, "module", JS_NewStringLen(ctx, module.data(), module.size()), JS_PROP_C_W_E);
     }
-    JS_SetPropertyUint32(ctx, array, i, item);
+    JS_DefinePropertyValueUint32(ctx, array, i, item, JS_PROP_C_W_E);
   }
   return array;
 }

@@ -531,29 +531,33 @@ static int ready_state(struct web_avmedia *s,uint64_t now) {
        end/1000.0>=s->mse_duration)return 4;
     return 3;
 }
+/* Own data field: a page setter on Object.prototype cannot intercept it. */
+static void own_field(JSContext *ctx, JSValueConst o, const char *name, JSValue value) {
+    JS_DefinePropertyValueStr(ctx,o,name,value,JS_PROP_C_W_E);
+}
 static JSValue state(JSContext *ctx, struct web_avmedia *s) {
     JSValue o=JS_NewObject(ctx);
     uint64_t decoded,dropped;video_counts(s,&decoded,&dropped);
     const struct nmedia_info *info=s?information(s):NULL;
-    JS_SetPropertyStr(ctx,o,"readyState",JS_NewInt32(ctx,ready_state(s,uptime_ms())));
-    JS_SetPropertyStr(ctx,o,"duration",JS_NewFloat64(ctx,s&&s->mse_active?s->mse_duration:info&&info->duration_ms>=0?info->duration_ms/1000.0:NAN));
-    JS_SetPropertyStr(ctx,o,"currentTime",JS_NewFloat64(ctx,s?current(s,uptime_ms())/1000.0:0));
-    JS_SetPropertyStr(ctx,o,"paused",JS_NewBool(ctx,!s||!s->playing));
-    JS_SetPropertyStr(ctx,o,"ended",JS_NewBool(ctx,s&&s->ended));
-    JS_SetPropertyStr(ctx,o,"videoWidth",JS_NewInt32(ctx,info?info->width:0));
-    JS_SetPropertyStr(ctx,o,"videoHeight",JS_NewInt32(ctx,info?info->height:0));
-    JS_SetPropertyStr(ctx,o,"totalVideoFrames",JS_NewFloat64(ctx,(double)decoded));
-    JS_SetPropertyStr(ctx,o,"droppedVideoFrames",JS_NewFloat64(ctx,(double)dropped));
-    JS_SetPropertyStr(ctx,o,"error",s&&s->error[0]?JS_NewString(ctx,s->error):JS_NULL);
-    JS_SetPropertyStr(ctx,o,"rangeInput",JS_NewBool(ctx,s&&s->url_input));
-    JS_SetPropertyStr(ctx,o,"queued",JS_NewBool(ctx,s&&s->range_waiting&&!s->worker));
-    JS_SetPropertyStr(ctx,o,"loading",JS_NewBool(ctx,s&&(s->range_waiting||nmedia_worker_loading(s->worker))));
-    JS_SetPropertyStr(ctx,o,"seeking",JS_NewBool(ctx,s&&(s->range_resume||s->mse_seeking||nmedia_worker_seeking(s->worker))));
-    JS_SetPropertyStr(ctx,o,"playPreparing",JS_NewBool(ctx,s&&s->mse_preparing));
-    JS_SetPropertyStr(ctx,o,"msePending",JS_NewBool(ctx,s&&nmedia_mse_worker_pending(s->mse_worker)));
-    JS_SetPropertyStr(ctx,o,"mseQuotaError",JS_NewBool(ctx,s&&(s->mse_quota_error||nmedia_mse_worker_quota_error(s->mse_worker))));
-    JS_SetPropertyStr(ctx,o,"waiting",JS_NewBool(ctx,s&&s->starved));
-    JS_SetPropertyStr(ctx,o,"keyWaiting",JS_NewBool(ctx,s&&nmedia_mse_worker_key_waiting(s->mse_worker)));
+    own_field(ctx,o,"readyState",JS_NewInt32(ctx,ready_state(s,uptime_ms())));
+    own_field(ctx,o,"duration",JS_NewFloat64(ctx,s&&s->mse_active?s->mse_duration:info&&info->duration_ms>=0?info->duration_ms/1000.0:NAN));
+    own_field(ctx,o,"currentTime",JS_NewFloat64(ctx,s?current(s,uptime_ms())/1000.0:0));
+    own_field(ctx,o,"paused",JS_NewBool(ctx,!s||!s->playing));
+    own_field(ctx,o,"ended",JS_NewBool(ctx,s&&s->ended));
+    own_field(ctx,o,"videoWidth",JS_NewInt32(ctx,info?info->width:0));
+    own_field(ctx,o,"videoHeight",JS_NewInt32(ctx,info?info->height:0));
+    own_field(ctx,o,"totalVideoFrames",JS_NewFloat64(ctx,(double)decoded));
+    own_field(ctx,o,"droppedVideoFrames",JS_NewFloat64(ctx,(double)dropped));
+    own_field(ctx,o,"error",s&&s->error[0]?JS_NewString(ctx,s->error):JS_NULL);
+    own_field(ctx,o,"rangeInput",JS_NewBool(ctx,s&&s->url_input));
+    own_field(ctx,o,"queued",JS_NewBool(ctx,s&&s->range_waiting&&!s->worker));
+    own_field(ctx,o,"loading",JS_NewBool(ctx,s&&(s->range_waiting||nmedia_worker_loading(s->worker))));
+    own_field(ctx,o,"seeking",JS_NewBool(ctx,s&&(s->range_resume||s->mse_seeking||nmedia_worker_seeking(s->worker))));
+    own_field(ctx,o,"playPreparing",JS_NewBool(ctx,s&&s->mse_preparing));
+    own_field(ctx,o,"msePending",JS_NewBool(ctx,s&&nmedia_mse_worker_pending(s->mse_worker)));
+    own_field(ctx,o,"mseQuotaError",JS_NewBool(ctx,s&&(s->mse_quota_error||nmedia_mse_worker_quota_error(s->mse_worker))));
+    own_field(ctx,o,"waiting",JS_NewBool(ctx,s&&s->starved));
+    own_field(ctx,o,"keyWaiting",JS_NewBool(ctx,s&&nmedia_mse_worker_key_waiting(s->mse_worker)));
     return o;
 }
 static int mse_next(struct web_avmedia *s,struct nmedia_output *out,uint64_t until,bool cooperative){
@@ -626,14 +630,14 @@ static int range_next(struct web_avmedia *s,struct nmedia_output *out,struct nme
 static JSValue mse_info(JSContext *ctx,struct web_avmedia *s,unsigned slot){
     const struct nmedia_info *info=nmedia_mse_worker_info(s->mse_worker,slot);
     JSValue o=JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx,o,"audio",JS_NewBool(ctx,info&&info->audio));JS_SetPropertyStr(ctx,o,"video",JS_NewBool(ctx,info&&info->video));
-    JS_SetPropertyStr(ctx,o,"audioEnabled",JS_NewBool(ctx,s->audio_enabled));JS_SetPropertyStr(ctx,o,"videoSelected",JS_NewBool(ctx,s->video_enabled));
-    JS_SetPropertyStr(ctx,o,"audioCodec",JS_NewString(ctx,info?info->audio_codec:""));JS_SetPropertyStr(ctx,o,"videoCodec",JS_NewString(ctx,info?info->video_codec:""));
-    JS_SetPropertyStr(ctx,o,"width",JS_NewInt32(ctx,info?info->width:0));JS_SetPropertyStr(ctx,o,"height",JS_NewInt32(ctx,info?info->height:0));
-    JS_SetPropertyStr(ctx,o,"parsing",JS_NewBool(ctx,nmedia_mse_worker_parsing(s->mse_worker,slot)));
-    JS_SetPropertyStr(ctx,o,"groupEnd",JS_NewFloat64(ctx,nmedia_mse_worker_group_end(s->mse_worker,slot)/1000.0));
-    JS_SetPropertyStr(ctx,o,"initDuration",JS_NewFloat64(ctx,info&&info->duration_ms>=0?info->duration_ms/1000.0:INFINITY));
-    JS_SetPropertyStr(ctx,o,"sequenceOffset",JS_NewFloat64(ctx,nmedia_mse_worker_group_end(s->mse_worker,slot)/1000.0));return o;
+    own_field(ctx,o,"audio",JS_NewBool(ctx,info&&info->audio));own_field(ctx,o,"video",JS_NewBool(ctx,info&&info->video));
+    own_field(ctx,o,"audioEnabled",JS_NewBool(ctx,s->audio_enabled));own_field(ctx,o,"videoSelected",JS_NewBool(ctx,s->video_enabled));
+    own_field(ctx,o,"audioCodec",JS_NewString(ctx,info?info->audio_codec:""));own_field(ctx,o,"videoCodec",JS_NewString(ctx,info?info->video_codec:""));
+    own_field(ctx,o,"width",JS_NewInt32(ctx,info?info->width:0));own_field(ctx,o,"height",JS_NewInt32(ctx,info?info->height:0));
+    own_field(ctx,o,"parsing",JS_NewBool(ctx,nmedia_mse_worker_parsing(s->mse_worker,slot)));
+    own_field(ctx,o,"groupEnd",JS_NewFloat64(ctx,nmedia_mse_worker_group_end(s->mse_worker,slot)/1000.0));
+    own_field(ctx,o,"initDuration",JS_NewFloat64(ctx,info&&info->duration_ms>=0?info->duration_ms/1000.0:INFINITY));
+    own_field(ctx,o,"sequenceOffset",JS_NewFloat64(ctx,nmedia_mse_worker_group_end(s->mse_worker,slot)/1000.0));return o;
 }
 static bool mse_reserve(struct web_avmedia *s,size_t count){
     if(count<=s->mse_capacity)return true;size_t capacity=s->mse_capacity?s->mse_capacity:4;

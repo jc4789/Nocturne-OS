@@ -191,6 +191,9 @@ struct web_js_state {
     bool scroll_input_turn;
     bool scroll_viewport_turn;
     struct js_rejection *rejections,*last_rejection;
+    /* Rejections handled after their unhandledrejection notification; the
+       page's weak outstanding set decides which fire rejectionhandled. */
+    struct js_rejection *handled_rejections,*last_handled_rejection;
     bool rejection_oom;
     struct js_resource_event *events, *last_event;
     struct js_policy_violation *policy_violations,*last_policy_violation;
@@ -711,6 +714,15 @@ static void end_task(struct web_js_state *s) {
            record owns local roots; newly rejected promises remain queued. */
         while(rejected){
             struct js_rejection *record=rejected;rejected=record->next;
+            /* Fire the cancelable unhandledrejection first; the console report
+               is the default action that preventDefault() suppresses. */
+            JSValue notify[2]={record->promise,record->reason};
+            JSValue fired=custom_element_hook(s,"promiseRejection",2,notify);
+            bool report=true;
+            if(JS_IsException(fired))exception(s);
+            else if(JS_IsBool(fired))report=JS_ToBool(s->ctx,fired)>0;
+            JS_FreeValue(s->ctx,fired);
+            if(!report){JS_FreeValue(s->ctx,record->promise);JS_FreeValue(s->ctx,record->reason);js_free(s->ctx,record);continue;}
             const char *p = JS_ToCString(s->ctx, record->reason);
             sbuf b = {0}; sb_puts(&b, "Unhandled promise rejection: ");
             sb_puts(&b, p ? p : "JavaScript exception");
@@ -733,6 +745,18 @@ static void end_task(struct web_js_state *s) {
             log_text(s, 2, sb_cstr(&b)); diagnostic_context(s,false);
             diagnostic_excerpt(s,sb_cstr(&b)); sb_free(&b);
             JS_FreeCString(s->ctx, p);
+            JS_FreeValue(s->ctx,record->promise);JS_FreeValue(s->ctx,record->reason);js_free(s->ctx,record);
+        }
+        /* Includes promises handled by the unhandledrejection listeners
+           above; those never joined the outstanding set and fire nothing. */
+        struct js_rejection *settled=s->handled_rejections;
+        s->handled_rejections=s->last_handled_rejection=NULL;
+        while(settled){
+            struct js_rejection *record=settled;settled=record->next;
+            JSValue args[2]={record->promise,record->reason};
+            JSValue queued=custom_element_hook(s,"promiseRejectionHandled",2,args);
+            if(JS_IsException(queued))exception(s);
+            JS_FreeValue(s->ctx,queued);
             JS_FreeValue(s->ctx,record->promise);JS_FreeValue(s->ctx,record->reason);js_free(s->ctx,record);
         }
         if (s->timed_out) {
@@ -790,12 +814,17 @@ static void promise_rejection(JSContext *ctx, JSValueConst promise, JSValueConst
             return;
         }previous=p;link=&p->next;
     }
-    if (handled) return;
     /* The rejection tracker cannot throw into its host-hook caller. Preserve
        existing records and report a real allocation failure at task end. */
     struct js_rejection *p=js_malloc_rt(s->rt,sizeof *p);
     if(!p){s->rejection_oom=true;return;}
     p->promise=JS_DupValue(ctx,promise);p->reason=JS_DupValue(ctx,reason);p->next=NULL;
+    /* A handled promise absent from the pending list was already notified
+       (the engine reports handling once, when [[PromiseIsHandled]] flips). */
+    if(handled){
+        if(s->last_handled_rejection)s->last_handled_rejection->next=p;else s->handled_rejections=p;
+        s->last_handled_rejection=p;return;
+    }
     if(s->last_rejection)s->last_rejection->next=p;else s->rejections=p;s->last_rejection=p;
 }
 static node_t *unwrap(JSContext *ctx, JSValueConst v) {
@@ -1746,14 +1775,14 @@ static JSValue observer_geometry(struct web_js_state *s, node_t *n, node_t *root
     if(visible&&!client_bounding_rect(ctx,n,sx,sy,bounds,&present))return JS_EXCEPTION;
     visible=visible&&present;
     double x=bounds[0],y=bounds[1],w=bounds[2],h=bounds[3];
-    JS_SetPropertyStr(ctx,out,"rect",rect_array(ctx,x,y,w,h));
+    JS_DefinePropertyValueStr(ctx,out,"rect",rect_array(ctx,x,y,w,h),JS_PROP_C_W_E);
     bool resizable=b && (b->kind!=B_INLINE || b->kind==B_ATOMIC);
-    JS_SetPropertyStr(ctx,out,"content",rect_array(ctx,b?b->p[3]:0,b?b->p[0]:0,resizable?b->w:0,resizable?b->h:0));
-    JS_SetPropertyStr(ctx,out,"border",rect_array(ctx,0,0,resizable?w:0,resizable?h:0));
+    JS_DefinePropertyValueStr(ctx,out,"content",rect_array(ctx,b?b->p[3]:0,b?b->p[0]:0,resizable?b->w:0,resizable?b->h:0),JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx,out,"border",rect_array(ctx,0,0,resizable?w:0,resizable?h:0),JS_PROP_C_W_E);
     size_t depth=0;
     for(node_t *p=n;p;p=p->assigned_slot?p->assigned_slot:doc_shadow_parent(p))
         if(p->type==N_ELEM)depth++;
-    JS_SetPropertyStr(ctx,out,"depth",JS_NewFloat64(ctx,(double)depth));
+    JS_DefinePropertyValueStr(ctx,out,"depth",JS_NewFloat64(ctx,(double)depth),JS_PROP_C_W_E);
     float rx=0,ry=0,rw=d->width,rh=d->height;
     bool root_ok=!root || root==d->root;
     if(root && root!=d->root) {
@@ -1780,9 +1809,9 @@ static JSValue observer_geometry(struct web_js_state *s, node_t *n, node_t *root
                 box_visual_y(a)-a->p[0]-sy,a->w+a->p[1]+a->p[3],a->h+a->p[0]+a->p[2]));
         if(a->st && a->st->position==POS_FIXED)break;
     }
-    JS_SetPropertyStr(ctx,out,"root",rect_array(ctx,rx,ry,rw,rh));
-    JS_SetPropertyStr(ctx,out,"clips",clips);
-    JS_SetPropertyStr(ctx,out,"intersectsRoot",JS_NewBool(ctx,visible && root_ok));
+    JS_DefinePropertyValueStr(ctx,out,"root",rect_array(ctx,rx,ry,rw,rh),JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx,out,"clips",clips,JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx,out,"intersectsRoot",JS_NewBool(ctx,visible && root_ok),JS_PROP_C_W_E);
     return out;
 }
 static bool geometry_closed_shadow_hidden(node_t *candidate, node_t *reference) {
@@ -3476,10 +3505,10 @@ static JSValue native_dom_impl(JSContext *ctx, JSValueConst this_val, int argc, 
         if(visible && !client_bounding_rect(ctx,n,sx,sy,r,&present)){result=JS_EXCEPTION;break;}
         double left=r[0],top=r[1],w=r[2],h=r[3];
         result = JS_NewObject(ctx);
-        JS_SetPropertyStr(ctx, result, "x", JS_NewFloat64(ctx, left)); JS_SetPropertyStr(ctx, result, "y", JS_NewFloat64(ctx, top));
-        JS_SetPropertyStr(ctx, result, "left", JS_NewFloat64(ctx, left)); JS_SetPropertyStr(ctx, result, "top", JS_NewFloat64(ctx, top));
-        JS_SetPropertyStr(ctx, result, "right", JS_NewFloat64(ctx, left + w)); JS_SetPropertyStr(ctx, result, "bottom", JS_NewFloat64(ctx, top + h));
-        JS_SetPropertyStr(ctx, result, "width", JS_NewFloat64(ctx, w)); JS_SetPropertyStr(ctx, result, "height", JS_NewFloat64(ctx, h));
+        JS_DefinePropertyValueStr(ctx, result, "x", JS_NewFloat64(ctx, left), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "y", JS_NewFloat64(ctx, top), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, result, "left", JS_NewFloat64(ctx, left), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "top", JS_NewFloat64(ctx, top), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, result, "right", JS_NewFloat64(ctx, left + w), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "bottom", JS_NewFloat64(ctx, top + h), JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx, result, "width", JS_NewFloat64(ctx, w), JS_PROP_C_W_E); JS_DefinePropertyValueStr(ctx, result, "height", JS_NewFloat64(ctx, h), JS_PROP_C_W_E);
 
     } break;
     case DOM_submit: {
@@ -3929,9 +3958,9 @@ static JSValue native_history(JSContext *ctx, JSValueConst this_val, int argc, J
     if ((argc && JS_ToInt32(ctx, &op, argv[0])) || (argc > 3 && JS_ToInt32(ctx, &value, argv[3]))) return JS_EXCEPTION;
     if(s->doc->frame_parent){
         if(op!=WEB_HISTORY_INFO)return JS_ThrowTypeError(ctx,"Child session-history mutations are not implemented");
-        JSValue out=JS_NewObject(ctx);JS_SetPropertyStr(ctx,out,"entry",JS_NewInt32(ctx,1));
-        JS_SetPropertyStr(ctx,out,"length",JS_NewInt32(ctx,1));JS_SetPropertyStr(ctx,out,"manual",JS_FALSE);
-        JS_SetPropertyStr(ctx,out,"data",JS_NULL);return out;
+        JSValue out=JS_NewObject(ctx);JS_DefinePropertyValueStr(ctx,out,"entry",JS_NewInt32(ctx,1),JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx,out,"length",JS_NewInt32(ctx,1),JS_PROP_C_W_E);JS_DefinePropertyValueStr(ctx,out,"manual",JS_FALSE,JS_PROP_C_W_E);
+        JS_DefinePropertyValueStr(ctx,out,"data",JS_NULL,JS_PROP_C_W_E);return out;
     }
     if (!s->host.history) return JS_ThrowTypeError(ctx, "Embedder has no session history");
     const char *url = argc > 1 && !JS_IsNull(argv[1]) ? JS_ToCString(ctx, argv[1]) : NULL;
@@ -3946,10 +3975,10 @@ static JSValue native_history(JSContext *ctx, JSValueConst this_val, int argc, J
     JS_FreeCString(ctx, url);
     if (!ok) return JS_ThrowTypeError(ctx, "Session history operation failed");
     JSValue out = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, out, "entry", JS_NewInt64(ctx, result.entry));
-    JS_SetPropertyStr(ctx, out, "length", JS_NewInt32(ctx, result.length));
-    JS_SetPropertyStr(ctx, out, "manual", JS_NewBool(ctx, result.manual_scroll));
-    JS_SetPropertyStr(ctx, out, "data", op == WEB_HISTORY_INFO && value && result.state_len ? JS_NewArrayBufferCopy(ctx, result.state, result.state_len) : JS_NULL);
+    JS_DefinePropertyValueStr(ctx, out, "entry", JS_NewInt64(ctx, result.entry), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, out, "length", JS_NewInt32(ctx, result.length), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, out, "manual", JS_NewBool(ctx, result.manual_scroll), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, out, "data", op == WEB_HISTORY_INFO && value && result.state_len ? JS_NewArrayBufferCopy(ctx, result.state, result.state_len) : JS_NULL, JS_PROP_C_W_E);
     return out;
 }
 static JSValue native_sandbox_flags(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
@@ -4074,8 +4103,8 @@ static JSValue native_media(JSContext *ctx, JSValueConst this_val, int argc, JSV
     JS_FreeCString(ctx, query);
     if (!serialize) return JS_NewBool(ctx, matches);
     JSValue result = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, result, "matches", JS_NewBool(ctx, matches));
-    JS_SetPropertyStr(ctx, result, "media", JS_NewString(ctx, text)); js_free(ctx, text); return result;
+    JS_DefinePropertyValueStr(ctx, result, "matches", JS_NewBool(ctx, matches), JS_PROP_C_W_E);
+    JS_DefinePropertyValueStr(ctx, result, "media", JS_NewString(ctx, text), JS_PROP_C_W_E); js_free(ctx, text); return result;
 }
 static JSValue native_presentation(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
@@ -4813,13 +4842,14 @@ static void release_document_tasks(struct web_js_state *s) {
     unsigned capacity = s->timer_capacity;
     struct js_idle_task *pending = s->idle_pending, *runnable = s->idle_runnable;
     struct js_posted_task *posted = s->posted;
-    struct js_rejection *rejected=s->rejections;
+    struct js_rejection *rejected=s->rejections,*settled=s->handled_rejections;
     s->timers = NULL; s->timer_capacity = 0;
     s->idle_pending = s->last_idle_pending = s->idle_runnable = s->last_idle_runnable = NULL;
     s->idle_count = s->idle_period_callbacks = 0;
     s->idle_period_end = 0; s->idle_period_stopped = true;
     s->posted = s->last_posted = NULL; s->posted_count = 0;
     s->rejections=s->last_rejection=NULL;s->rejection_oom=false;
+    s->handled_rejections=s->last_handled_rejection=NULL;
     for (unsigned i = 0; i < capacity; i++) if (timers[i].id) {
         JS_FreeValue(s->ctx, timers[i].fn); JS_FreeValue(s->ctx, timers[i].args);
     }
@@ -4837,6 +4867,8 @@ static void release_document_tasks(struct web_js_state *s) {
         JS_FreeValue(s->ctx, p->fn); js_free(s->ctx, p);
     }
     while(rejected){struct js_rejection *p=rejected;rejected=p->next;
+        JS_FreeValue(s->ctx,p->promise);JS_FreeValue(s->ctx,p->reason);js_free(s->ctx,p);}
+    while(settled){struct js_rejection *p=settled;settled=p->next;
         JS_FreeValue(s->ctx,p->promise);JS_FreeValue(s->ctx,p->reason);js_free(s->ctx,p);}
 }
 static uint32_t allocate_timer_id(struct web_js_state *s) {
@@ -5347,11 +5379,13 @@ static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSV
     p->resolve = funcs[0]; p->reject = funcs[1];
     result = JS_NewObject(ctx);
     if (JS_IsException(result)) { JS_FreeValue(ctx, promise); pending_error(p, "Out of memory"); goto out; }
-    if (JS_SetPropertyStr(ctx, result, "id", JS_NewInt64(ctx, (int64_t)p->id)) < 0) {
+    /* Own data properties (CreateDataProperty): a page setter or read-only
+       field on Object.prototype must not divert the private transport promise. */
+    if (JS_DefinePropertyValueStr(ctx, result, "id", JS_NewInt64(ctx, (int64_t)p->id), JS_PROP_C_W_E) < 0) {
         JS_FreeValue(ctx,promise); JS_FreeValue(ctx,result); result=JS_EXCEPTION;
         pending_error(p,"Out of memory preparing fetch result"); goto out;
     }
-    if (JS_SetPropertyStr(ctx, result, "promise", promise) < 0) {
+    if (JS_DefinePropertyValueStr(ctx, result, "promise", promise, JS_PROP_C_W_E) < 0) {
         JS_FreeValue(ctx,result); result=JS_EXCEPTION;
         pending_error(p,"Out of memory preparing fetch result"); goto out;
     }
@@ -5378,6 +5412,20 @@ static JSValue native_resume_fetch(JSContext *ctx, JSValueConst this_val, int ar
             break;
         }
     return JS_UNDEFINED;
+}
+
+/* Web IDL promise reactions for private bindings: never consult a page's
+   Promise constructor, @@species, or a replaced prototype chain. */
+static JSValue native_promise_then(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (!argc) return JS_ThrowTypeError(ctx, "promiseThen requires a promise");
+    return JS_PromiseThenIntrinsic(ctx, argv[0], argc > 1 ? argv[1] : JS_UNDEFINED, argc > 2 ? argv[2] : JS_UNDEFINED);
+}
+static JSValue native_promise_is_handled(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    int handled = argc ? JS_PromiseIsHandled(ctx, argv[0]) : -1;
+    if (handled < 0) return JS_ThrowTypeError(ctx, "promiseIsHandled requires a promise");
+    return JS_NewBool(ctx, handled);
 }
 
 static JSValue module_bridge_call(struct web_js_state *s, const char *hook, const char *input, size_t len, const char *base) {
@@ -6330,7 +6378,9 @@ static void diagnostic_url(const char *url, char *out, size_t capacity) {
     if (*end && used+13 < capacity) snprintf(out+used,capacity-used," [URL suffix omitted]");
 }
 static void diagnostic_resource(struct web_js_state *s, struct js_pending *p, const char *reason) {
-    if (s->resource_failures++ >= 64) {
+    /* The page console stays readable on pages with many broken resources;
+       --debug-js keeps every failure for diagnosis. */
+    if (s->resource_failures++ >= 64 && !s->host.debug_js) {
         if (s->resource_failures == 65) log_text(s,1,"Resource diagnostics: further failures suppressed for this document (64 reported)");
         return;
     }
@@ -6393,6 +6443,9 @@ static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
         exception(s); pending_error(p, "Could not construct Fetch stream frame"); terminal = true; value = JS_UNDEFINED;
     }
     if (terminal && (p->response.error[0] || p->aborted)) {
+        /* Streamed Fetch/XHR failures get the same resource diagnostic as
+           buffered ones; otherwise a page sees only a bare network error. */
+        if (p->response.error[0] && !p->aborted) diagnostic_resource(s, p, p->response.error);
         JS_FreeValue(s->ctx, value);
         JSValue args[] = {JS_NewString(s->ctx, p->response.error), JS_NewBool(s->ctx, p->aborted)};
         value = JS_Call(s->ctx, s->reject, JS_UNDEFINED, 2, args);
@@ -7476,7 +7529,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
         else if (s->posted_turn && run_posted_task(s)) { s->posted_turn = false; s->observer_turn = true; ran = true; }
         else if (run_timer(s, now)) { s->posted_turn = true; s->observer_turn = true; ran = true; }
         else if (run_posted_task(s)) { s->posted_turn = false; s->observer_turn = true; ran = true; }
-        else if (JS_IsJobPending(s->rt)||s->rejections||s->rejection_oom) { begin_task(s); end_task(s); ran = true; }
+        else if (JS_IsJobPending(s->rt)||s->rejections||s->handled_rejections||s->rejection_oom) { begin_task(s); end_task(s); ran = true; }
         else if (web_worker_runnable(s->workers)) {
             begin_named_task(s,"Worker message",0); ran = web_worker_run_one(s->workers);
             if (JS_HasException(s->ctx)) exception(s);
@@ -7519,7 +7572,7 @@ int64_t web_js_deadline(web_doc *d) {
         if ((d->dom_family ? d->dom_family : d)->shadow_slots_pending) return (int64_t)now;
         if ((d->dom_family ? d->dom_family : d)->details_toggle_first) return (int64_t)now;
         if (s->media_width != d->width || s->media_height != d->height) return (int64_t)now;
-        if (s->events || s->posted || s->rejections || s->rejection_oom) return (int64_t)now;
+        if (s->events || s->posted || s->rejections || s->handled_rejections || s->rejection_oom) return (int64_t)now;
         for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) return (int64_t)now;
         if (JS_IsJobPending(s->rt)) return (int64_t)now;
         if (observers_dirty(s) && s->rendering_due < deadline) deadline=s->rendering_due;
@@ -7711,7 +7764,9 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("storage", 5, native_storage),
         JS_CFUNC_DEF("indexedDB", 5, native_indexed_db),
         JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_cancel),
-        JS_CFUNC_DEF("resumeFetch", 1, native_resume_fetch)
+        JS_CFUNC_DEF("resumeFetch", 1, native_resume_fetch),
+        JS_CFUNC_DEF("promiseThen", 3, native_promise_then),
+        JS_CFUNC_DEF("promiseIsHandled", 1, native_promise_is_handled)
     };
     JS_SetPropertyFunctionList(s->ctx, api, functions, sizeof functions / sizeof *functions);
     JSValue operations=JS_NewObject(s->ctx);
@@ -7802,6 +7857,9 @@ void web_js_free(web_doc *d) {
         while(s->rejections){struct js_rejection *p=s->rejections;s->rejections=p->next;
             JS_FreeValue(s->ctx,p->promise);JS_FreeValue(s->ctx,p->reason);js_free(s->ctx,p);}
         s->last_rejection=NULL;
+        while(s->handled_rejections){struct js_rejection *p=s->handled_rejections;s->handled_rejections=p->next;
+            JS_FreeValue(s->ctx,p->promise);JS_FreeValue(s->ctx,p->reason);js_free(s->ctx,p);}
+        s->last_handled_rejection=NULL;
         node_cache_free(s);
         js_free(s->ctx,s->window_name);s->window_name=NULL;
         JS_FreeValue(s->ctx, s->hooks); JS_FreeValue(s->ctx, s->dispatch); JS_FreeValue(s->ctx, s->response); JS_FreeValue(s->ctx, s->reject);

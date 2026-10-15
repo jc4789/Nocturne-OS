@@ -368,6 +368,11 @@ static JSValue native_class(JSContext *ctx,JSValueConst thisv,int argc,JSValueCo
 static JSValue native_detach(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;if(argc&&!JS_IsArrayBufferTransferable(ctx,argv[0]))return JS_ThrowTypeError(ctx,"ArrayBuffer cannot be transferred");if(argc)JS_DetachArrayBuffer(ctx,argv[0]);return JS_UNDEFINED;}
 static JSValue native_buffer_transferable(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;return JS_NewBool(ctx,argc&&JS_IsArrayBufferTransferable(ctx,argv[0]));}
 static JSValue native_now(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;return JS_NewFloat64(ctx,(double)uptime_ms());}
+/* Web IDL promise reactions: no page Promise constructor or @@species lookup. */
+static JSValue native_promise_then(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
+    (void)thisv;if(!argc)return JS_ThrowTypeError(ctx,"promiseThen requires a promise");
+    return JS_PromiseThenIntrinsic(ctx,argv[0],argc>1?argv[1]:JS_UNDEFINED,argc>2?argv[2]:JS_UNDEFINED);
+}
 static JSValue native_close(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;struct worker *w=state(ctx);send_value(w,NJW_CLOSE,0,0,JS_NULL);w->closed=true;if(w->shared)close(0);return JS_UNDEFINED;}
 static JSValue native_eval(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
     (void)thisv;struct worker *w=state(ctx);if(argc<2)return JS_ThrowTypeError(ctx,"Worker source/URL required");size_t n;const char *source=JS_ToCStringLen(ctx,&n,argv[0]),*url=JS_ToCString(ctx,argv[1]);if(!source||!url){JS_FreeCString(ctx,source);JS_FreeCString(ctx,url);return JS_EXCEPTION;}
@@ -493,7 +498,7 @@ int main(int argc,char**argv){
         JS_CFUNC_DEF("safetyRequired",1,native_safety_required),JS_CFUNC_DEF("send",3,native_send),JS_CFUNC_DEF("classID",1,native_class),
         JS_CFUNC_DEF("detach",1,native_detach),JS_CFUNC_DEF("transferCommit",1,native_transfer_commit),JS_CFUNC_DEF("portSend",6,native_port_send),
         JS_CFUNC_DEF("bufferTransferable",1,native_buffer_transferable),
-        JS_CFUNC_DEF("portLease",3,native_port_lease),JS_CFUNC_DEF("now",0,native_now),JS_CFUNC_DEF("url",0,native_context_url),JS_CFUNC_DEF("securityURL",0,native_security_url),JS_CFUNC_DEF("referrerPolicy",0,native_referrer_policy),
+        JS_CFUNC_DEF("portLease",3,native_port_lease),JS_CFUNC_DEF("now",0,native_now),JS_CFUNC_DEF("promiseThen",3,native_promise_then),JS_CFUNC_DEF("url",0,native_context_url),JS_CFUNC_DEF("securityURL",0,native_security_url),JS_CFUNC_DEF("referrerPolicy",0,native_referrer_policy),
         JS_CFUNC_DEF("close",0,native_close),JS_CFUNC_DEF("request",6,native_request),JS_CFUNC_DEF("dataURL",1,native_data_url),JS_CFUNC_DEF("cancel",1,native_cancel),
         JS_CFUNC_DEF("import",1,native_import),JS_CFUNC_DEF("eval",2,native_eval)};
     JS_SetPropertyFunctionList(w.ctx,host,funcs,sizeof funcs/sizeof funcs[0]);

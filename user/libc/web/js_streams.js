@@ -3,9 +3,26 @@
  * Fetch's native response frames feed these controllers on demand, preserving
  * locks, backpressure, cancellation and BYOB. */
 const streamBridge=(()=>{
-    const types=(()=>{
-        /* @streams-ponyfill */
+    // The spec's stream algorithms react to promises with PerformPromiseThen.
+    // The ponyfill calls Promise.prototype.then, which looks up @@species
+    // through the promise's prototype chain; a page Promise polyfill that
+    // re-parents the native prototype (core-js does) would make that return a
+    // foreign promise and break every later reaction. Give the ponyfill
+    // native promises and a species-free then.
+    const streamPromise=(()=>{
+        const NativePromise=Promise,resolve=Promise.resolve,reject=Promise.reject,all=Promise.all,react=host.promiseThen;
+        function StreamPromise(executor){return new NativePromise(executor);}
+        Object.defineProperties(StreamPromise,{
+            prototype:{value:Object.freeze({then(onFulfilled,onRejected){return react(this,onFulfilled,onRejected);}})},
+            resolve:{value:value=>Reflect.apply(resolve,NativePromise,[value])},
+            reject:{value:reason=>Reflect.apply(reject,NativePromise,[reason])},
+            all:{value:values=>Reflect.apply(all,NativePromise,[values])}
+        });
+        return Object.freeze(StreamPromise);
     })();
+    const types=(Promise=>{
+        /* @streams-ponyfill */
+    })(streamPromise);
     const {ReadableStream,WritableStream,TransformStream}=types;
     const U8=Uint8Array,AB=ArrayBuffer,P=Promise,apply=Reflect.apply;
     const getter=(p,k)=>Object.getOwnPropertyDescriptor(p,k).get;
@@ -32,11 +49,17 @@ const streamBridge=(()=>{
             }catch(e){source=null;controller.error(e);}
         },cancel(){source=null;}},{highWaterMark:0});
     }
+    // Network bodies buffer ahead of the reader like a receive window (the
+    // kernel TCP buffer is also 1 MiB): the transport keeps flowing while
+    // desiredSize is positive instead of waiting for each read() round trip.
+    const NETWORK_BUFFER=1<<20;
+    const desiredSize=getter(types.ReadableByteStreamController.prototype,'desiredSize');
     function network(pull,cancelSource){
         let controller,ended=false;
-        const stream=new ReadableStream({type:'bytes',start(c){controller=c;},pull(){return pull();},cancel(reason){ended=true;return cancelSource(reason);}},{highWaterMark:0});
+        const stream=new ReadableStream({type:'bytes',start(c){controller=c;},pull(){return pull();},cancel(reason){ended=true;return cancelSource(reason);}},{highWaterMark:NETWORK_BUFFER});
         return Object.freeze({stream,
             enqueue(bytes){if(!ended)apply(enqueue,controller,[new U8(bytes)]);},
+            wantsMore(){if(ended)return false;const size=apply(desiredSize,controller,[]);return size!==null&&size>0;},
             close(){if(!ended){ended=true;apply(close,controller,[]);}},
             error(reason){if(!ended){ended=true;apply(error,controller,[reason]);}}
         });

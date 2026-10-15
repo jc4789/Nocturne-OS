@@ -54079,6 +54079,14 @@ JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValue promise)
     return s->promise_state;
 }
 
+int JS_PromiseIsHandled(JSContext *ctx, JSValueConst promise)
+{
+    JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+    if (!s)
+        return -1;
+    return s->is_handled;
+}
+
 JSValue JS_PromiseResult(JSContext *ctx, JSValue promise)
 {
     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
@@ -54553,6 +54561,27 @@ int JS_PromiseAddReactions(JSContext *ctx, JSValueConst promise,
     if (!JS_GetOpaque2(ctx, promise, JS_CLASS_PROMISE))
         return -1;
     return perform_promise_then(ctx, promise, handlers, resolving);
+}
+
+JSValue JS_PromiseThenIntrinsic(JSContext *ctx, JSValueConst promise,
+                                JSValueConst on_fulfilled, JSValueConst on_rejected)
+{
+    JSValueConst handlers[2] = { on_fulfilled, on_rejected };
+    JSValue resolving[2], result;
+    int ret;
+    if (!JS_GetOpaque2(ctx, promise, JS_CLASS_PROMISE))
+        return JS_EXCEPTION;
+    result = js_new_promise_capability(ctx, resolving, JS_UNDEFINED);
+    if (JS_IsException(result))
+        return result;
+    ret = perform_promise_then(ctx, promise, handlers, (JSValueConst *)resolving);
+    JS_FreeValue(ctx, resolving[0]);
+    JS_FreeValue(ctx, resolving[1]);
+    if (ret) {
+        JS_FreeValue(ctx, result);
+        return JS_EXCEPTION;
+    }
+    return result;
 }
 
 static JSValue js_promise_withResolvers(JSContext *ctx,
