@@ -1705,6 +1705,9 @@ extern "C" int web_js_wasm_init(JSContext *ctx, int (*poll)(JSContext *),
   JSValue symbol_ctor = JS_GetPropertyStr(ctx, global, "Symbol");
   JSValue iterator_symbol = JS_GetPropertyStr(ctx, symbol_ctor, "iterator");
   s->iterator = JS_ValueToAtom(ctx, iterator_symbol);
+  JSValue tag_symbol = JS_GetPropertyStr(ctx, symbol_ctor, "toStringTag");
+  JSAtom tag = JS_ValueToAtom(ctx, tag_symbol);
+  JS_FreeValue(ctx, tag_symbol);
   JS_FreeValue(ctx, iterator_symbol); JS_FreeValue(ctx, symbol_ctor);
   JSValue data_view = JS_GetPropertyStr(ctx, global, "DataView");
   JSValue data_view_proto = JS_GetPropertyStr(ctx, data_view, "prototype");
@@ -1728,7 +1731,7 @@ extern "C" int web_js_wasm_init(JSContext *ctx, int (*poll)(JSContext *),
                             JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE);
     JSValue ctor = constructor(ctx, s, errors[i], error_ctor, 1, i, false);
     JS_SetConstructorBit(ctx, ctor, true); JS_SetConstructor(ctx, ctor, s->errors[i]);
-    JS_SetPropertyStr(ctx, space, errors[i], ctor);
+    JS_DefinePropertyValueStr(ctx, space, errors[i], ctor, JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE);
   }
   JS_FreeValue(ctx, error_proto); JS_FreeValue(ctx, error_global);
   struct Constructor { Kind kind; const char *name; JSCFunctionData *fn; int length; };
@@ -1757,13 +1760,20 @@ extern "C" int web_js_wasm_init(JSContext *ctx, int (*poll)(JSContext *),
     } else if (c.kind == GlobalKind) {
       accessor(ctx, proto, "value", global_get, global_set); method(ctx, proto, "valueOf", global_value_of, 0);
     }
-    JS_SetPropertyStr(ctx, space, c.name, ctor); JS_FreeValue(ctx, proto);
+    // JS API: each interface prototype carries "WebAssembly.<Name>".
+    std::string tag_name = std::string("WebAssembly.") + c.name;
+    JS_DefinePropertyValue(ctx, proto, tag, JS_NewString(ctx, tag_name.c_str()), JS_PROP_CONFIGURABLE);
+    JS_DefinePropertyValueStr(ctx, space, c.name, ctor, JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE);
+    JS_FreeValue(ctx, proto);
   }
+  JS_DefinePropertyValue(ctx, space, tag, JS_NewString(ctx, "WebAssembly"), JS_PROP_CONFIGURABLE);
+  JS_FreeAtom(ctx, tag);
   JS_SetPropertyStr(ctx, space, "validate", JS_NewCFunctionData(ctx, validate, 1, 0, 1, &owner));
   JSValue promise_wrapper = JS_NewCFunctionData(ctx, promising, 1, 0, 1, &owner);
   JS_DefinePropertyValueStr(ctx, promise_wrapper, "name", JS_NewString(ctx, "promising"), JS_PROP_CONFIGURABLE);
   JS_SetPropertyStr(ctx, space, "promising", promise_wrapper);
-  JS_SetPropertyStr(ctx, global, "WebAssembly", space);
+  // Namespace object property: writable and configurable, not enumerable.
+  JS_DefinePropertyValueStr(ctx, global, "WebAssembly", space, JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE);
   states[ctx] = lifetime;
   JS_FreeValue(ctx, owner); JS_FreeValue(ctx, global);
   return JS_HasException(ctx) ? -1 : 0;

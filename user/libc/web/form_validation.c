@@ -76,6 +76,21 @@ bool web_control_submit_button(const node_t *n) {
     return !node_attr(n, "command") && !node_attr(n, "commandfor") &&
            !(html_element(n->parent) && n->parent->tag == T_select);
 }
+/* HTML implicit submission from a field: the form's default button (the first
+   submit button in tree order) is returned for a synthetic click, or nothing
+   when it is disabled. Without one, the field itself submits the form unless
+   more than one field blocks implicit submission. */
+web_node *web_form_implicit_submission(web_doc *d, web_node *field) {
+    node_t *form = web_form_owner(d, field), *root = form ? doc_node_root(form, false) : NULL;
+    if (!html_element(form) || form->tag != T_form || !root) return NULL;
+    int blocking = 0;
+    for (node_t *n = root; n; n = tree_next(root, n)) {
+        if (!html_element(n) || (n->tag != T_input && n->tag != T_button) || web_form_owner(d, n) != form) continue;
+        if (web_control_submit_button(n)) return web_control_disabled(n) ? NULL : n;
+        if (readonly_applies(n)) blocking++;
+    }
+    return blocking > 1 ? NULL : field;
+}
 bool web_control_disabled(const node_t *n) {
     if (!html_element(n)) return false;
     if (n->tag == T_option) {

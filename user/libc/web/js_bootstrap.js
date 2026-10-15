@@ -1008,6 +1008,15 @@
     installHandlers(globalThis,globalHandlerTypes);
     installHandlers(globalThis,windowHandlerTypes);
     Object.defineProperties(globalThis,{innerWidth:{get(){return dom('viewport',null,0);}},innerHeight:{get(){return dom('viewport',null,1);}}});
+    // CSSOM View: the window manager does not expose the window position to
+    // applications, so it is reported as the screen origin. [Replaceable]:
+    // assignment shadows the attribute with an ordinary data property.
+    {const replace=(name,value)=>Object.defineProperty(globalThis,name,{configurable:true,enumerable:true,writable:true,value});
+     Object.defineProperties(globalThis,Object.getOwnPropertyDescriptors({
+        get outerWidth(){return host.windowSize(0);},set outerWidth(v){replace('outerWidth',v);},
+        get outerHeight(){return host.windowSize(1);},set outerHeight(v){replace('outerHeight',v);},
+        get screenX(){return 0;},set screenX(v){replace('screenX',v);},get screenLeft(){return 0;},set screenLeft(v){replace('screenLeft',v);},
+        get screenY(){return 0;},set screenY(v){replace('screenY',v);},get screenTop(){return 0;},set screenTop(v){replace('screenTop',v);}}));}
     Object.defineProperty(Document.prototype,'cookie',{get(){return this===document?host.cookie():'';},set(v){v=String(v);if(this===document)host.cookie(v);}});
     Object.defineProperties(globalThis,{
         scrollX:{get(){return host.scroll(0);}},pageXOffset:{get(){return host.scroll(0);}},

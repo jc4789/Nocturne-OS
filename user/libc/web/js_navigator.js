@@ -24,6 +24,11 @@ const navigatorBridge=(()=>{
         if(!worker)define(Interface.prototype,'cookieEnabled',{configurable:true,enumerable:true,get(){
             requireReceiver(this);return typeof cookieEnabled==='function'&&!!invoke(cookieEnabled,host,[]);
         }});
+        // WebDriver NavigatorAutomationInformation: Window-only; Nocturne has
+        // no remote-control (WebDriver) session, so the flag is never set.
+        if(!worker)define(Interface.prototype,'webdriver',{configurable:true,enumerable:true,get(){
+            requireReceiver(this);return false;
+        }});
         if(!worker&&typeof host.avmedia==='function'){
             const type=host.avmedia;
             class MediaCapabilities {

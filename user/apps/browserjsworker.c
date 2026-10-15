@@ -499,7 +499,10 @@ int main(int argc,char**argv){
     JS_SetPropertyFunctionList(w.ctx,host,funcs,sizeof funcs/sizeof funcs[0]);
     web_js_encoding_init_isolated(w.ctx,host);web_js_navigator_init(w.ctx,host);web_js_crypto_init(w.ctx,host);
     JS_SetPropertyStr(w.ctx,global,"__workerHost",host);JS_FreeValue(w.ctx,global);
-    w.hooks=JS_Eval(w.ctx,js_worker_runtime,sizeof js_worker_runtime-1,"<worker-bootstrap>",JS_EVAL_TYPE_GLOBAL);if(JS_IsException(w.hooks))goto shutdown;
+    /* Worker platform interfaces are built-ins too: no implementation source. */
+    {JSRuntime *rt=JS_GetRuntime(w.ctx);int strip=JS_GetStripInfo(rt);JS_SetStripInfo(rt,strip|JS_STRIP_SOURCE);
+    w.hooks=JS_Eval(w.ctx,js_worker_runtime,sizeof js_worker_runtime-1,"<worker-bootstrap>",JS_EVAL_TYPE_GLOBAL);JS_SetStripInfo(rt,strip);}
+    if(JS_IsException(w.hooks))goto shutdown;
     JS_SetDynamicCodeCheck(w.ctx,worker_code_check,&w);
     if(!w.shared&&fcntl(1,F_SETFL,O_NONBLOCK)<0)goto shutdown;
     while(!w.closed||w.output){

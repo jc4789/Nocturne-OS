@@ -139,6 +139,8 @@ struct web_host {
     void (*scroll)(void *opaque, int *x, int *y);
     void (*scroll_to)(void *opaque, int x, int y);
     unsigned (*window_state)(void *opaque); /* actual host visibility/page focus; optional */
+    /* Browser window size including its own toolbar; optional. */
+    void (*window_size)(void *opaque, int *width, int *height);
     /* Native-only getter: a queued navigation/close cancels stale default edits. */
     bool (*navigation_pending)(void *opaque);
     bool (*video_present)(void *opaque, web_doc *document,
@@ -352,6 +354,7 @@ bool web_submit(web_doc *d, web_node *submitter, char **url, char **body);
 bool web_input_is_file(web_node *input);
 bool web_input_choose_files(web_doc *d, web_node *input);
 web_node *web_form_owner(web_doc *d, web_node *control);
+web_node *web_form_implicit_submission(web_doc *d, web_node *field);
 bool web_control_disabled(const web_node *control);
 bool web_form_submission_validate(web_doc *d, web_node *submitter);
 bool web_take_validation_report(web_doc *d, web_node **control, const char **message, size_t *length);

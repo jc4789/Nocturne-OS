@@ -3788,6 +3788,16 @@ static JSValue native_window_state(JSContext *ctx,JSValueConst this_val,int argc
     struct web_js_state *s=state(ctx);
     return JS_NewUint32(ctx,s->host.window_state?s->host.window_state(s->host.opaque):0);
 }
+/* CSSOM View outerWidth/outerHeight: the browser window, never smaller than
+   the top-level viewport. */
+static JSValue native_window_size(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
+    struct web_js_state *s=state(ctx);int width=0,height=0,axis=0;
+    if(argc&&JS_ToInt32(ctx,&axis,argv[0])<0)return JS_EXCEPTION;
+    if(s->host.window_size)s->host.window_size(s->host.opaque,&width,&height);
+    web_doc *top=s->doc;while(top->frame_parent)top=top->frame_parent;
+    if(width<top->width)width=top->width;if(height<top->height)height=top->height;
+    return JS_NewInt32(ctx,axis?height:width);
+}
 /* Private: null means unobserved. A genuine recorded relative 0 is usable by
    User Timing; the public legacy interface maps null, and only null, to 0. */
 static JSValue native_timing(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
@@ -7591,8 +7601,15 @@ static JSValue load_browser_bindings(JSContext *ctx) {
     if (bindings_bytecode) {
         code = JS_ReadObject(ctx, bindings_bytecode, bindings_bytecode_len, JS_READ_OBJ_BYTECODE);
     } else {
+        /* Platform interfaces are built-in function objects: ECMA-262
+           Function.prototype.toString must give NativeFunction syntax, never
+           their implementation source. Line info stays for stack traces;
+           author scripts compile afterwards with their source retained. */
+        JSRuntime *rt = JS_GetRuntime(ctx); int strip = JS_GetStripInfo(rt);
+        JS_SetStripInfo(rt, strip | JS_STRIP_SOURCE);
         code = JS_Eval(ctx, js_bootstrap, sizeof js_bootstrap - 1, "nocturne:browser-bindings",
                        JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        JS_SetStripInfo(rt, strip);
         if (!JS_IsException(code)) {
             size_t size = 0;
             uint8_t *bytes = JS_WriteObject(ctx, &size, code, JS_WRITE_OBJ_BYTECODE);
@@ -7665,7 +7682,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("frame", 3, native_frame),JS_CFUNC_DEF("documentStream",1,native_document_stream),
         JS_CFUNC_DEF("now", 0, native_now), JS_CFUNC_DEF("timing", 1, native_timing), JS_CFUNC_DEF("url", 0, native_url), JS_CFUNC_DEF("origin", 0, native_origin),
         JS_CFUNC_DEF("screen", 0, native_screen),
-        JS_CFUNC_DEF("windowState",0,native_window_state),
+        JS_CFUNC_DEF("windowState",0,native_window_state),JS_CFUNC_DEF("windowSize",1,native_window_size),
         JS_CFUNC_DEF("cookieEnabled",0,native_cookie_enabled),
         JS_CFUNC_DEF("pack", 1, native_pack), JS_CFUNC_DEF("unpack", 1, native_unpack),
         JS_CFUNC_DEF("classID", 1, native_class_id), JS_CFUNC_DEF("detach", 1, native_detach),

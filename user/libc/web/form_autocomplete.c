@@ -1,4 +1,4 @@
-/* Nocturne search completion: private, opt-in, bounded native storage. The
+/* Nocturne search completion: private, opt-in native storage. The
    page has no history API and receives a past value only after the user chooses
    it. This is not a password manager or personal/contact/payment autofill. */
 #include <stdio.h>
@@ -11,22 +11,38 @@
 
 #define HISTORY_ROOT "/data/browser"
 #define HISTORY_PREF HISTORY_ROOT "/search-history.enabled"
-#define HISTORY_COUNT 64
-#define HISTORY_FIELD_COUNT 8
 #define HISTORY_ORIGIN 192
 #define HISTORY_NAME 64
 #define HISTORY_VALUE 256
 #define HISTORY_HEADER 56
-#define HISTORY_FILE_MAX (HISTORY_HEADER + HISTORY_COUNT * (12 + HISTORY_ORIGIN + HISTORY_NAME + HISTORY_VALUE))
+/* Smallest serialized entry: three sizes plus three non-empty fields. */
+#define HISTORY_ENTRY_MIN (12 + 3)
 struct search_entry { char origin[HISTORY_ORIGIN], name[HISTORY_NAME], value[HISTORY_VALUE]; };
-struct search_history { uint64_t generation; int count, slot; struct search_entry entries[HISTORY_COUNT]; };
+/* Entry count is dynamic (MRU first): storage and memory are the only limits. */
+struct search_history { uint64_t generation; int count, capacity, slot; struct search_entry *entries; };
 static struct {
     web_doc *doc;
     web_node *input;
     char origin[HISTORY_ORIGIN], name[HISTORY_NAME];
-    char values[HISTORY_FIELD_COUNT][HISTORY_VALUE];
-    int count;
+    /* The browser's popup labels point here, so the buffer only grows and is
+       never released while a list may still be painted. */
+    char (*values)[HISTORY_VALUE];
+    int count, capacity;
 } popup;
+static void popup_reset(void) {
+    popup.doc = NULL; popup.input = NULL; popup.count = 0; popup.origin[0] = popup.name[0] = 0;
+}
+static void history_free(struct search_history *history) { if (history) free(history->entries); free(history); }
+static bool history_reserve(struct search_history *history, int count) {
+    if (count <= history->capacity) return true;
+    if (count < 0 || (size_t)count > SIZE_MAX / sizeof *history->entries) return false;
+    int capacity = history->capacity ? history->capacity : 16;
+    while (capacity < count) capacity = capacity > INT32_MAX / 2 ? count : capacity * 2;
+    if ((size_t)capacity > SIZE_MAX / sizeof *history->entries) capacity = count;
+    void *grown = realloc(history->entries, (size_t)capacity * sizeof *history->entries);
+    if (!grown) return false;
+    history->entries = grown; history->capacity = capacity; return true;
+}
 
 static bool history_origin(const char *url, char out[HISTORY_ORIGIN]) {
     /* Native url_parse currently lacks IPv6. Fail closed instead of treating
@@ -154,7 +170,7 @@ static bool history_enabled(void) {
 static int history_read(int slot, struct search_history *out) {
     char path[96]; history_path(slot, path); struct n_stat st;
     if (stat(path, &st) < 0) return errno == ENOENT ? 0 : -1;
-    if (st.type != N_FT_FILE || st.size < HISTORY_HEADER || st.size > HISTORY_FILE_MAX) return -1;
+    if (st.type != N_FT_FILE || st.size < HISTORY_HEADER || (uint64_t)st.size > SIZE_MAX) return -1;
     size_t n = (size_t)st.size; uint8_t *bytes = malloc(n); if (!bytes) return -1;
     int fd = open(path, O_RDONLY); if (fd < 0) { free(bytes); return -1; }
     bool ok = read_all(fd, bytes, n); int closed = close(fd); uint8_t digest[32];
@@ -163,13 +179,14 @@ static int history_read(int slot, struct search_history *out) {
     ok = ok && closed == 0 && !memcmp(bytes, "NSEARCH1", 8) && !memcmp(bytes + 8, digest, 32);
     uint64_t generation = get32(bytes + 40) | (uint64_t)get32(bytes + 44) << 32;
     unsigned count = get32(bytes + 48);
-    ok = ok && generation && count <= HISTORY_COUNT && !get32(bytes + 52);
-    memset(out, 0, sizeof *out); out->generation = generation; out->slot = slot;
+    ok = ok && generation && count <= (n - HISTORY_HEADER) / HISTORY_ENTRY_MIN && count <= INT32_MAX && !get32(bytes + 52);
+    out->count = 0; out->generation = generation; out->slot = slot;
+    if (ok && !history_reserve(out, (int)count)) ok = false;
     size_t at = HISTORY_HEADER;
     for (unsigned i = 0; ok && i < count; i++) {
         if (n - at < 12) { ok = false; break; }
         size_t sizes[3] = {get32(bytes + at), get32(bytes + at + 4), get32(bytes + at + 8)}; at += 12;
-        struct search_entry *entry = &out->entries[i];
+        struct search_entry *entry = &out->entries[i]; memset(entry, 0, sizeof *entry);
         char *fields[3] = {entry->origin, entry->name, entry->value};
         size_t caps[3] = {HISTORY_ORIGIN, HISTORY_NAME, HISTORY_VALUE};
         for (int j = 0; j < 3; j++) {
@@ -180,8 +197,6 @@ static int history_read(int slot, struct search_history *out) {
         char origin[HISTORY_ORIGIN];
         if (ok && (!history_origin(entry->origin, origin) || strcmp(origin, entry->origin) ||
                    !history_name(entry->name) || !history_value(entry->value))) ok = false;
-        for (unsigned j = 0; ok && j < i; j++) if (!strcmp(entry->origin, out->entries[j].origin) &&
-            !strcmp(entry->name, out->entries[j].name) && !strcmp(entry->value, out->entries[j].value)) ok = false;
     }
     ok = ok && at == n; free(bytes);
     if (!ok) return -1; out->count = (int)count; return 1;
@@ -191,10 +206,10 @@ static struct search_history *history_load(void) {
     if (!a || !b) { free(a); free(b); return NULL; }
     int ar = history_read(0, a), br = history_read(1, b);
     if (br == 1 && (ar != 1 || b->generation > a->generation)) { struct search_history *temp = a; a = b; b = temp; ar = 1; }
-    free(b);
+    history_free(b);
     if (ar != 1) {
-        if (ar < 0 || br < 0) { free(a); return NULL; }
-        memset(a, 0, sizeof *a); a->slot = -1;
+        if (ar < 0 || br < 0) { history_free(a); return NULL; }
+        a->count = 0; a->generation = 0; a->slot = -1;
     }
     return a;
 }
@@ -209,7 +224,6 @@ static bool history_save(struct search_history *history) {
     if (history->generation == UINT64_MAX || !history_directory()) return false;
     size_t n = HISTORY_HEADER;
     for (int i = 0; i < history->count; i++) n += 12 + strlen(history->entries[i].origin) + strlen(history->entries[i].name) + strlen(history->entries[i].value);
-    if (n > HISTORY_FILE_MAX) return false;
     uint8_t *bytes = calloc(1, n); if (!bytes) return false;
     uint64_t generation = history->generation + 1;
     memcpy(bytes, "NSEARCH1", 8); put32(bytes + 40, (uint32_t)generation); put32(bytes + 44, (uint32_t)(generation >> 32)); put32(bytes + 48, history->count);
@@ -232,8 +246,9 @@ static bool history_save(struct search_history *history) {
             (void)rename(temp, path);
             struct search_history *check = calloc(1, sizeof *check);
             ok = check && history_read(slot, check) == 1 && check->generation == generation &&
-                check->count == history->count && !memcmp(check->entries, history->entries, sizeof history->entries);
-            free(check);
+                check->count == history->count &&
+                (!history->count || !memcmp(check->entries, history->entries, (size_t)history->count * sizeof *history->entries));
+            history_free(check);
             if (ok) { history->generation = generation; history->slot = slot; }
             else (void)unlink(path);
         }
@@ -242,7 +257,7 @@ static bool history_save(struct search_history *history) {
 }
 static bool history_enable(bool enabled) {
     if (!enabled) {
-        memset(&popup, 0, sizeof popup);
+        popup_reset();
         if (unlink(HISTORY_PREF) < 0 && errno != ENOENT) return false;
         struct n_stat st; return stat(HISTORY_PREF, &st) < 0 && errno == ENOENT;
     }
@@ -298,38 +313,50 @@ void web_autocomplete_record(web_doc *d, web_node *submitter, const char *destin
         const char *name; char current_origin[HISTORY_ORIGIN];
         if (!node->control_user_edited || !history_control(d, node, current_origin, &name) ||
             web_form_owner(d, node) != form || !history_value(node->value)) continue;
-        /* MRU: eight per origin/name, 64 globally; no unbounded input log. */
-        int matches = 0;
+        /* MRU: a repeated search moves to the front instead of duplicating. */
         for (int i = 0; i < history->count; ) {
             struct search_entry *entry = &history->entries[i];
-            bool pair = !strcmp(entry->origin, current_origin) && !strcmp(entry->name, name);
-            if (pair && (!strcmp(entry->value, node->value) || ++matches >= HISTORY_FIELD_COUNT)) {
-                memmove(entry, entry + 1, (history->count - i - 1) * sizeof *entry); history->count--;
+            if (!strcmp(entry->origin, current_origin) && !strcmp(entry->name, name) && !strcmp(entry->value, node->value)) {
+                memmove(entry, entry + 1, (size_t)(history->count - i - 1) * sizeof *entry); history->count--;
             } else i++;
         }
-        if (history->count == HISTORY_COUNT) history->count--;
-        memmove(history->entries + 1, history->entries, history->count * sizeof *history->entries); history->count++;
+        if (history->count == INT32_MAX || !history_reserve(history, history->count + 1)) break;
+        memmove(history->entries + 1, history->entries, (size_t)history->count * sizeof *history->entries); history->count++;
         struct search_entry *entry = history->entries; memset(entry, 0, sizeof *entry);
         strlcpy(entry->origin, current_origin, sizeof entry->origin); strlcpy(entry->name, name, sizeof entry->name);
-        strlcpy(entry->value, node->value, sizeof entry->value);
-        memset(history->entries + history->count, 0, (HISTORY_COUNT - history->count) * sizeof *entry); changed = true;
+        strlcpy(entry->value, node->value, sizeof entry->value); changed = true;
     }
     if (changed && history_enabled()) (void)history_save(history);
-    free(history);
+    history_free(history);
 }
+/* Without labels, returns the number of matching values so the caller can
+   size its list; with labels, fills at most capacity of them (MRU order). */
 int web_autocomplete_options(web_doc *d, web_node *input, const char **labels, int capacity) {
-    memset(&popup, 0, sizeof popup); const char *name; char origin[HISTORY_ORIGIN];
-    if (!labels || capacity <= 0 || !history_enabled() || !history_control(d, input, origin, &name)) return 0;
+    popup_reset(); const char *name; char origin[HISTORY_ORIGIN];
+    if ((labels && capacity <= 0) || !history_enabled() || !history_control(d, input, origin, &name)) return 0;
     struct search_history *history = history_load(); if (!history) return 0;
     const char *prefix = input->value ? input->value : ""; size_t length = strlen(prefix);
-    for (int i = 0; i < history->count && popup.count < HISTORY_FIELD_COUNT && popup.count < capacity; i++) {
+    int matches = 0;
+    for (int i = 0; i < history->count; i++) {
+        struct search_entry *entry = &history->entries[i];
+        if (!strcmp(entry->origin, origin) && !strcmp(entry->name, name) && !strncasecmp(entry->value, prefix, length)) matches++;
+    }
+    if (!labels) { history_free(history); return matches; }
+    if (matches > capacity) matches = capacity;
+    if (matches > popup.capacity) {
+        void *grown = (size_t)matches > SIZE_MAX / sizeof *popup.values ? NULL :
+            realloc(popup.values, (size_t)matches * sizeof *popup.values);
+        if (!grown) { history_free(history); return 0; }
+        popup.values = grown; popup.capacity = matches;
+    }
+    for (int i = 0; i < history->count && popup.count < matches; i++) {
         struct search_entry *entry = &history->entries[i];
         if (strcmp(entry->origin, origin) || strcmp(entry->name, name) || strncasecmp(entry->value, prefix, length)) continue;
         strlcpy(popup.values[popup.count], entry->value, HISTORY_VALUE);
         labels[popup.count] = popup.values[popup.count]; popup.count++;
     }
     popup.doc = d; popup.input = input; strlcpy(popup.origin, origin, sizeof popup.origin); strlcpy(popup.name, name, sizeof popup.name);
-    free(history); return popup.count;
+    history_free(history); return popup.count;
 }
 bool web_autocomplete_choose(web_doc *d, web_node *input, int index) {
     const char *name; char origin[HISTORY_ORIGIN];
@@ -338,10 +365,10 @@ bool web_autocomplete_choose(web_doc *d, web_node *input, int index) {
     struct search_history *history = history_load(); if (!history) return false; bool present = false;
     for (int i = 0; i < history->count; i++) if (!strcmp(history->entries[i].origin, origin) &&
         !strcmp(history->entries[i].name, name) && !strcmp(history->entries[i].value, popup.values[index])) { present = true; break; }
-    free(history);
+    history_free(history);
     bool ok = present && web_input_user_value(d, input, popup.values[index], strlen(popup.values[index]));
     if (ok) { uint32_t end = doc_utf16_length(input->value); doc_control_selection(d, input, end, end, 0); }
-    memset(&popup, 0, sizeof popup); return ok;
+    popup_reset(); return ok;
 }
 void web_autocomplete_settings(void) {
     window_t *window = win_open(600, 244, "Search history privacy", 0); if (!window) return;
@@ -353,7 +380,7 @@ void web_autocomplete_settings(void) {
         gfx_text(c, 16, 14, "Native search completion", UI_FG, TRANSPARENT, FONT_SMALL);
         gfx_text(c, 16, 40, enabled ? "Search history: ENABLED" : "Search history: OFF", UI_ACCENT, TRANSPARENT, FONT_SMALL);
         gfx_text(c, 16, 66, "Stores typed search fields, separated by site and field name.", UI_DIM, TRANSPARENT, FONT_SMALL);
-        gfx_text(c, 16, 88, "64 entries maximum; stored only in /data/browser.", UI_DIM, TRANSPARENT, FONT_SMALL);
+        gfx_text(c, 16, 88, "Stored only in /data/browser; Clear removes every entry.", UI_DIM, TRANSPARENT, FONT_SMALL);
         gfx_text(c, 16, 110, "On a search field: Down opens suggestions; Enter chooses.", UI_DIM, TRANSPARENT, FONT_SMALL);
         gfx_text(c, 16, 132, "Never type secrets in a search. Clear also disables history.", UI_DIM, TRANSPARENT, FONT_SMALL);
         ui_button(c, 16, 164, 170, 30, enabled ? "Disable (D)" : "Enable (E)", false, false);

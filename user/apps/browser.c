@@ -1295,6 +1295,9 @@ static unsigned host_window_state(void *opaque) {
     return ((state&WIN_STATE_VISIBLE)?WEB_WINDOW_VISIBLE:0) |
            ((state&WIN_STATE_FOCUSED) && focus==F_PAGE?WEB_WINDOW_FOCUSED:0);
 }
+static void host_window_size(void *opaque, int *width, int *height) {
+    (void)opaque;*width=w?w->w:0;*height=w?w->h:0;
+}
 static bool host_cookie_enabled(void *opaque) {
     (void)opaque;
     /* webnet_create succeeds only with an actual session cookie jar. */
@@ -1464,7 +1467,7 @@ static const struct web_host browser_host = {
     .navigate = host_navigate, .console = host_console, .scroll = host_scroll,
     .navigate_form = host_navigate_form,
     .scroll_to = host_scroll_to, .history = host_history,
-    .window_state=host_window_state,
+    .window_state=host_window_state,.window_size=host_window_size,
     .navigation_pending=host_navigation_pending,
     .script_checkpoint=host_script_checkpoint,
     .video_present=host_video_present,
@@ -1790,6 +1793,12 @@ static void submit(web_node *n) {
 
 /* ---------------------------------------------------------------- input */
 static void page_click(web_node *target, int x, int y, bool keyboard);
+/* Enter in a field: the default button is clicked, so it is the submitter. */
+static void implicit_submit(web_node *field) {
+    web_node *submitter = web_form_implicit_submission(doc, field);
+    if (submitter && submitter != field) page_click(submitter, 0, 0, true);
+    else if (submitter) submit(field);
+}
 static const char *event_key(uint32_t key, char text[8]) {
     switch (key) {
     case NKEY_ENTER: return "Enter";
@@ -1903,20 +1912,20 @@ static void open_select(web_node *n) {
     int needed = web_select_options(doc, n, NULL, 0, &sel);
     if (!needed) { needed = web_datalist_options(doc, n, NULL, 0); sel_datalist = needed > 0; }
     if (needed < 0) return;
-    int capacity = MAX(needed, 128); /* seed for native saved-value suggestions, not an option ceiling */
+    if (!needed) { needed = web_autocomplete_options(doc, n, NULL, 0); sel_autocomplete = needed > 0; }
+    int capacity = MAX(needed, 1);
     if (capacity > sel_capacity) {
         if ((size_t)capacity > SIZE_MAX / sizeof *sel_labels) return;
         void *grown = realloc(sel_labels, (size_t)capacity * sizeof *sel_labels);
         if (!grown) { console_add("error", "Control option storage allocation failed"); return; }
         sel_labels = grown; sel_capacity = capacity;
     }
-    sel_n = sel_datalist ? web_datalist_options(doc, n, sel_labels, sel_capacity) :
-        web_select_options(doc, n, sel_labels, sel_capacity, &sel);
-    if (!sel_n) {
+    if (sel_autocomplete) {
         sel_n = web_autocomplete_options(doc, n, sel_labels, sel_capacity);
-        sel_autocomplete = sel_datalist = sel_n > 0;
-    }
-    if (sel_n <= 0 || (needed && sel_n != needed)) return;
+        sel_datalist = sel_autocomplete = sel_n > 0;
+    } else sel_n = sel_datalist ? web_datalist_options(doc, n, sel_labels, sel_capacity) :
+        web_select_options(doc, n, sel_labels, sel_capacity, &sel);
+    if (sel_n <= 0 || sel_n != needed) return;
     int x, y, ww, h;
     if (!web_node_rect(doc, n, &x, &y, &ww, &h)) return;
     sel_node = n;
@@ -2254,7 +2263,7 @@ static void key(const struct gui_event *e) {
             return;
         }
         int r = web_key(doc, e);
-        if (r == 2) submit(web_focused(doc));
+        if (r == 2) implicit_submit(web_focused(doc));
         if (r) return;
         if (e->key >= 32 && e->key < 127) return; /* typed into a control that ignored it */
     }
