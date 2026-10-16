@@ -116,6 +116,15 @@ if ($Remove) {
 if (-not (Test-Path $SrcDisk)) {
     throw "$SrcDisk not found. Build first:  powershell -ExecutionPolicy Bypass -File build.ps1"
 }
+# `make qemu-image` refreshes only the raw disk, so the Hyper-V media can be
+# older than the kernel and initrd they should carry. Never hand those to a VM.
+$diskTime = (Get-Item $SrcDisk).LastWriteTime
+foreach ($part in @("build\kernel.elf", "build\initrd.tar")) {
+    $p = Join-Path $Root $part
+    if ((Test-Path $p) -and (Get-Item $p).LastWriteTime -gt $diskTime) {
+        throw "$SrcDisk is older than $part. Rebuild the Hyper-V media first:  powershell -ExecutionPolicy Bypass -File build.ps1"
+    }
+}
 New-Item -ItemType Directory -Force $VmDir | Out-Null
 
 function Copy-Media {

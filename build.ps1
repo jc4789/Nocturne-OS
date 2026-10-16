@@ -6,8 +6,15 @@ param([string]$Target = "all")
 $env:MSYSTEM = "UCRT64"
 $env:CHERE_INVOKING = "1"
 # Keep paths and the requested target out of shell syntax. The caller's working
-# directory must not decide which project gets built.
-$env:NOCTURNE_BUILD_ROOT = $PSScriptRoot -replace '\\', '/'
+# directory must not decide which project gets built: bash starts in this
+# script's folder (CHERE_INVOKING keeps it there). The command line carries no
+# quotes, because Windows PowerShell 5.1 drops embedded quotes from native
+# arguments and the project path contains spaces.
 $env:NOCTURNE_BUILD_TARGET = $Target
-& "$PSScriptRoot\tools\msys64\usr\bin\bash.exe" -lc 'cd "$NOCTURNE_BUILD_ROOT" && make -j8 "$NOCTURNE_BUILD_TARGET"'
-exit $LASTEXITCODE
+Push-Location $PSScriptRoot
+try {
+    & "$PSScriptRoot\tools\msys64\usr\bin\bash.exe" -lc 'make -j8 $NOCTURNE_BUILD_TARGET'
+    $code = $LASTEXITCODE
+}
+finally { Pop-Location }
+exit $code

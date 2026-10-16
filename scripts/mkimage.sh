@@ -57,6 +57,7 @@ if [ "$1" = "--raw-only" ]; then exit 0; fi
 echo "  VHD  $B/nocturne.vhd"
 rm -f $B/nocturne.vhd $B/nocturne.vhdx
 qemu-img convert -f raw -O vpc -o subformat=fixed,force_size=on $IMG $B/nocturne.vhd
+echo "  VHDX $B/nocturne.vhdx"
 qemu-img convert -f raw -O vhdx -o subformat=dynamic $IMG $B/nocturne.vhdx
 
 echo "  ISO  $B/nocturne.iso"
