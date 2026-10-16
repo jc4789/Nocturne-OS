@@ -4,9 +4,6 @@
  * retain crash fallback, and payload GC keeps both committed generations. */
 #include <webidb.h>
 #include <nocturne.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -21,7 +18,8 @@ struct idb_stage {struct idb_stage *next;uint8_t digest[32];};
 struct idb_tx {
     struct idb_tx *next;
     uint32_t token;
-    int lease,slot;
+    n_handle lease;
+    int slot;
     uint64_t generation;
     char path[160];
     char *origin,*name;
@@ -29,14 +27,18 @@ struct idb_tx {
     struct idb_refs current,old;
     struct idb_stage *staged;
 };
-struct idb_client {struct idb_client *next;uint32_t handle;uint64_t identity;size_t offset;int fd;};
+struct idb_client {struct idb_client *next;uint32_t handle;uint64_t identity;size_t offset;n_handle table;};
 struct webidb {struct idb_tx *active;struct idb_client *clients;uint32_t serial;};
 static uint32_t client_serial;
 static void hash(const void *bytes,size_t n,uint8_t out[32]){br_sha256_context h;br_sha256_init(&h);br_sha256_update(&h,bytes,n);br_sha256_out(&h,out);}
 static uint64_t u64(const uint8_t *p){uint64_t v=0;for(unsigned i=0;i<8;i++)v|=(uint64_t)p[i]<<(8*i);return v;}
 static void put64(uint8_t *p,uint64_t v){for(unsigned i=0;i<8;i++)p[i]=(uint8_t)(v>>(8*i));}
-static int directory(const char *path){struct n_stat st;if(!stat(path,&st))return st.type==2;if(errno!=ENOENT)return 0;return !mkdir(path,0)||(!stat(path,&st)&&st.type==2);}
-static int io(int fd,uint8_t *bytes,size_t n,int writing){size_t at=0;while(at<n){size_t step=n-at;if(step>INT_MAX)step=INT_MAX;ssize_t done=writing?write(fd,bytes+at,step):read(fd,bytes+at,step);if(done<=0)return 0;at+=(size_t)done;}return 1;}
+static int directory(const char *path){struct n_entry e;n_result r=n_entry_info(path,&e);if(r>=0)return e.kind==N_KIND_FOLDER;if(r!=-N_ERR_NOT_FOUND)return 0;r=n_folder_create(path);return (r>=0||r==-N_ERR_EXISTS)&&n_entry_info(path,&e)>=0&&e.kind==N_KIND_FOLDER;}
+static int io(n_handle h,uint64_t at,uint8_t *bytes,size_t n,int writing){size_t done=0;while(done<n){n_result r=writing?n_document_write_at(h,at+done,bytes+done,n-done):n_document_read_at(h,at+done,bytes+done,n-done);if(r<=0||(uint64_t)r>n-done)return 0;done+=(size_t)r;}return 1;}
+/* The document at path, created empty when absent, open for reading and writing. */
+static n_handle document(const char *path){n_handle h=n_document_open(path,N_DOCUMENT_EDIT);if(h!=-N_ERR_NOT_FOUND)return h;h=n_document_open(path,N_DOCUMENT_CREATE);return h==-N_ERR_EXISTS?n_document_open(path,N_DOCUMENT_EDIT):h;}
+/* The whole document in a malloc buffer: 0, or a negative n_result. */
+static n_result read_whole(const char *path,uint8_t **out,size_t *length){*out=NULL;*length=0;n_handle h=n_document_open(path,N_DOCUMENT_READ);if(h<0)return h;n_result size=n_document_size(h);uint8_t *data=size>=0&&(uint64_t)size<SIZE_MAX?malloc(size?(size_t)size:1):NULL;if(size>=0&&!data)size=-N_ERR_NO_MEMORY;if(size>=0&&!io(h,0,data,(size_t)size,0))size=-N_ERR_IO;n_handle_close(h);if(size<0){free(data);return size;}*out=data;*length=(size_t)size;return 0;}
 static void hex(const uint8_t digest[32],char text[65]){for(unsigned i=0;i<32;i++)snprintf(text+i*2,3,"%02x",digest[i]);}
 static int unhex(const char *text,uint8_t digest[32]){if(!text||strlen(text)!=64)return 0;for(unsigned i=0;i<32;i++){unsigned v=0;for(unsigned j=0;j<2;j++){char c=text[i*2+j];int n=c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:-1;if(n<0)return 0;v=v*16+(unsigned)n;}digest[i]=(uint8_t)v;}return 1;}
 static struct idb_tx *find(webidb *db,uint32_t token){struct idb_tx *p=db?db->active:NULL;while(p&&p->token!=token)p=p->next;return p;}
@@ -58,8 +60,8 @@ static void collect(struct idb_tx *tx,const struct idb_refs *r,const struct idb_
     for(size_t i=0;i<r->count;i++){
         const uint8_t *digest=r->data+i*32;
         if(contains(a,digest)||contains(b,digest))continue;
-        char path[240];payload_path(tx,digest,path);unlink(path);
-        legacy_payload_path(tx,digest,path);unlink(path);
+        char path[240];payload_path(tx,digest,path);n_entry_remove(path);
+        legacy_payload_path(tx,digest,path);n_entry_remove(path);
     }
 }
 static int load(const char *base,int slot,uint8_t **bytes,size_t *length,uint64_t *generation,struct idb_refs *refs){
@@ -101,24 +103,19 @@ static int load(const char *base,int slot,uint8_t **bytes,size_t *length,uint64_
 }
 static int pending_clear(struct idb_tx *tx){
     char path[176];snprintf(path,sizeof path,"%s.pending",tx->path);
-    struct n_stat st;
-    if(stat(path,&st)<0)return errno==ENOENT?WEB_IDB_OK:WEB_IDB_IO;
-    if(st.size==0)return WEB_IDB_OK;
-    int fd=open(path,O_WRONLY|O_TRUNC);
-    if(fd<0)return WEB_IDB_IO;
-    return close(fd)<0?WEB_IDB_IO:WEB_IDB_OK;
+    n_handle h=n_document_open(path,N_DOCUMENT_EDIT);
+    if(h==-N_ERR_NOT_FOUND)return WEB_IDB_OK;
+    if(h<0)return WEB_IDB_IO;
+    n_result size=n_document_size(h);
+    int ok=size==0||(size>0&&n_document_set_size(h,0)>=0);
+    return n_handle_close(h)<0||!ok?WEB_IDB_IO:WEB_IDB_OK;
 }
 static int pending_recover(struct idb_tx *tx){
     char path[176];snprintf(path,sizeof path,"%s.pending",tx->path);
-    struct n_stat st;
-    if(stat(path,&st)<0)return errno==ENOENT?WEB_IDB_OK:WEB_IDB_IO;
-    if(st.size>SIZE_MAX||st.size>LONG_MAX)return WEB_IDB_IO;
-    size_t n=(size_t)st.size;
-    uint8_t *data=malloc(n?n:1);
-    if(!data)return WEB_IDB_MEMORY;
-    int fd=open(path,O_RDONLY),ok=fd>=0&&io(fd,data,n,0);
-    if(fd>=0)close(fd);
-    if(!ok){free(data);return WEB_IDB_IO;}
+    uint8_t *data;size_t n;
+    n_result loaded=read_whole(path,&data,&n);
+    if(loaded==-N_ERR_NOT_FOUND)return WEB_IDB_OK;
+    if(loaded<0)return loaded==-N_ERR_NO_MEMORY?WEB_IDB_MEMORY:WEB_IDB_IO;
     struct idb_refs pending={data,n/32};
     collect(tx,&pending,&tx->current,&tx->old);
     free(data);
@@ -126,17 +123,13 @@ static int pending_recover(struct idb_tx *tx){
 }
 static int pending_append(struct idb_tx *tx,const uint8_t digest[32]){
     char path[176];snprintf(path,sizeof path,"%s.pending",tx->path);
-    int fd=open(path,O_WRONLY|O_CREAT|O_APPEND);
-    if(fd<0)return WEB_IDB_IO;
-    int ok=io(fd,(uint8_t *)digest,32,1);
-    if(close(fd)<0)ok=0;
-    return ok?WEB_IDB_OK:WEB_IDB_IO;
+    return n_document_append(path,digest,32)>=0?WEB_IDB_OK:WEB_IDB_IO;
 }
 webidb *webidb_create(void){return calloc(1,sizeof(webidb));}
 void webidb_free(webidb *db){
     if(!db)return;
     while(db->active)webidb_abort(db,db->active->token);
-    while(db->clients){struct idb_client *c=db->clients;webidb_forget_connection(db,c->handle);if(db->clients==c){db->clients=c->next;close(c->fd);free(c);}}
+    while(db->clients){struct idb_client *c=db->clients;webidb_forget_connection(db,c->handle);if(db->clients==c){db->clients=c->next;n_handle_close(c->table);free(c);}}
     webidb_journal_forget();free(db);
 }
 int webidb_begin(webidb *db,const char *origin,const char *name,size_t name_length,uint32_t *token,uint8_t **bytes,size_t *length){
@@ -159,8 +152,8 @@ int webidb_begin(webidb *db,const char *origin,const char *name,size_t name_leng
     struct idb_tx *tx=calloc(1,sizeof *tx);if(!tx)return WEB_IDB_MEMORY;
     char text[65],lease[168],legacy[160],probe[168],shard[160];hex(digest,text);
     snprintf(legacy,sizeof legacy,"%s/%s",IDB_ROOT,text);
-    struct n_stat existing;bool old_layout=false;
-    for(unsigned slot=0;slot<2;slot++){snprintf(probe,sizeof probe,"%s.%u",legacy,slot);if(!stat(probe,&existing))old_layout=true;}
+    struct n_entry existing;bool old_layout=false;
+    for(unsigned slot=0;slot<2;slot++){snprintf(probe,sizeof probe,"%s.%u",legacy,slot);if(n_entry_info(probe,&existing)>=0)old_layout=true;}
     if(old_layout)snprintf(tx->path,sizeof tx->path,"%s",legacy);
     else{
         snprintf(shard,sizeof shard,"%s/%.2s",IDB_ROOT,text);
@@ -171,9 +164,9 @@ int webidb_begin(webidb *db,const char *origin,const char *name,size_t name_leng
        transactions inside this broker too, not just between helper processes. */
     for(struct idb_tx *active=db->active;active;active=active->next)
         if(!strcmp(active->path,tx->path)){free(tx);return WEB_IDB_BUSY;}
-    snprintf(lease,sizeof lease,"%s.lock",tx->path);tx->lease=open(lease,O_RDWR|O_CREAT);
+    snprintf(lease,sizeof lease,"%s.lock",tx->path);tx->lease=document(lease);
     if(tx->lease<0){free(tx);return WEB_IDB_IO;}
-    if(fcntl(tx->lease,F_NTRYLOCK)<0){int busy=errno==EAGAIN;close(tx->lease);free(tx);return busy?WEB_IDB_BUSY:WEB_IDB_IO;}
+    {n_result claimed=n_document_claim(tx->lease,false);if(claimed<0){n_handle_close(tx->lease);free(tx);return claimed==-N_ERR_NOT_READY?WEB_IDB_BUSY:WEB_IDB_IO;}}
     uint8_t *a=NULL,*b=NULL;
     size_t an=0,bn=0;
     uint64_t ag=0,bg=0;
@@ -183,7 +176,7 @@ int webidb_begin(webidb *db,const char *origin,const char *name,size_t name_leng
     if(ar==-2||br==-2||((ar<0||br<0)&&ar!=1&&br!=1)){
         free(a);free(b);
         free(arx.data);free(brx.data);
-        close(tx->lease);free(tx);
+        n_handle_close(tx->lease);free(tx);
         return ar==-2||br==-2?WEB_IDB_MEMORY:WEB_IDB_IO;
     }
     if(ar==1&&(br!=1||ag>=bg)){
@@ -208,7 +201,7 @@ int webidb_begin(webidb *db,const char *origin,const char *name,size_t name_leng
         free(*bytes);*bytes=NULL;*length=0;
         free(tx->origin);free(tx->name);
         free(tx->current.data);free(tx->old.data);
-        close(tx->lease);free(tx);
+        n_handle_close(tx->lease);free(tx);
         return recovered;
     }
     do{
@@ -223,13 +216,12 @@ int webidb_begin(webidb *db,const char *origin,const char *name,size_t name_leng
 int webidb_value(webidb *db,uint32_t token,const char *reference,uint8_t **bytes,size_t *length){
     *bytes=NULL;*length=0;struct idb_tx *tx=find(db,token);uint8_t digest[32];if(!tx||!unhex(reference,digest))return WEB_IDB_IO;
     int permitted=contains(&tx->current,digest);for(struct idb_stage *p=tx->staged;!permitted&&p;p=p->next)permitted=!memcmp(p->digest,digest,32);if(!permitted)return WEB_IDB_SECURITY;
-    char path[240];payload_path(tx,digest,path);struct n_stat st;
-    if(stat(path,&st)<0){if(errno!=ENOENT)return WEB_IDB_IO;legacy_payload_path(tx,digest,path);if(stat(path,&st)<0)return WEB_IDB_IO;}
-    if(st.size>SIZE_MAX||st.size>LONG_MAX)return WEB_IDB_IO;
-    size_t n=(size_t)st.size;uint8_t *data=malloc(n?n:1);if(!data)return WEB_IDB_MEMORY;
-    int fd=open(path,O_RDONLY),ok=fd>=0&&io(fd,data,n,0);if(fd>=0)close(fd);
-    uint8_t actual[32];if(ok){hash(data,n,actual);ok=!memcmp(actual,digest,32);}
-    if(!ok){free(data);return WEB_IDB_IO;}*bytes=data;*length=n;return WEB_IDB_OK;
+    char path[240];payload_path(tx,digest,path);uint8_t *data;size_t n;
+    n_result loaded=read_whole(path,&data,&n);
+    if(loaded==-N_ERR_NOT_FOUND){legacy_payload_path(tx,digest,path);loaded=read_whole(path,&data,&n);}
+    if(loaded<0)return loaded==-N_ERR_NO_MEMORY?WEB_IDB_MEMORY:WEB_IDB_IO;
+    uint8_t actual[32];hash(data,n,actual);
+    if(memcmp(actual,digest,32)){free(data);return WEB_IDB_IO;}*bytes=data;*length=n;return WEB_IDB_OK;
 }
 int webidb_stage(webidb *db,uint32_t token,const uint8_t *bytes,size_t length,char reference[65]){
     struct idb_tx *tx=find(db,token);
@@ -243,9 +235,8 @@ int webidb_stage(webidb *db,uint32_t token,const uint8_t *bytes,size_t length,ch
     if(!contains(&tx->old,digest)){
         if(!payload_directory(tx,digest)){free(p);return WEB_IDB_IO;}
         int journal=pending_append(tx,digest);if(journal){free(p);return journal;}
-        int fd=open(path,O_WRONLY|O_CREAT|O_TRUNC),ok=fd>=0&&io(fd,(uint8_t *)bytes,length,1);
-        if(fd>=0&&close(fd)<0)ok=0;
-        if(!ok){unlink(path);free(p);return WEB_IDB_IO;}
+        /* Swapped in whole: a failed save never leaves a torn payload. */
+        if(n_document_save(path,bytes,length)<0){free(p);return WEB_IDB_IO;}
     }
     memcpy(p->digest,digest,32);
     p->next=tx->staged;tx->staged=p;
@@ -262,7 +253,7 @@ int webidb_abort(webidb *db,uint32_t token){
         struct idb_stage *s=tx->staged;
         tx->staged=s->next;
         if(!contains(&tx->current,s->digest)&&!contains(&tx->old,s->digest)){
-            char path[240];payload_path(tx,s->digest,path);unlink(path);
+            char path[240];payload_path(tx,s->digest,path);n_entry_remove(path);
         }
         free(s);
     }
@@ -270,7 +261,7 @@ int webidb_abort(webidb *db,uint32_t token){
     pending_clear(tx);
     free(tx->origin);free(tx->name);
     free(tx->current.data);free(tx->old.data);
-    close(tx->lease);free(tx);
+    n_handle_close(tx->lease);free(tx);
     return WEB_IDB_OK;
 }
 int webidb_commit(webidb *db,uint32_t token,const uint8_t *bytes,size_t length,const char *const *references,size_t count,uint64_t version){
@@ -350,25 +341,25 @@ static int catalog(const char *base,int slot,const char *origin,struct webidb_da
 void webidb_databases_free(struct webidb_database *items,size_t count){for(size_t i=0;i<count;i++)free(items[i].name);free(items);}
 static bool shard_name(const char *name){return strlen(name)==2&&strspn(name,"0123456789abcdef")==2;}
 static int catalog_scan(const char *directory_path,const char *origin,struct webidb_database **items,size_t *count,bool shards){
-    int fd=open(directory_path,O_RDONLY|O_DIRECTORY);if(fd<0)return errno==ENOENT?WEB_IDB_OK:WEB_IDB_IO;
-    struct n_dirent entry;int result=WEB_IDB_OK;
-    for(int index=0;;index++){
-        if(index==INT_MAX){result=WEB_IDB_MEMORY;break;}
-        int found=readdir(fd,index,&entry);if(found<0){result=WEB_IDB_IO;break;}if(!found)break;
-        if(shards&&entry.type==N_FT_DIR&&shard_name(entry.name)){
-            char child[160];snprintf(child,sizeof child,"%s/%s",directory_path,entry.name);
+    struct n_entry *entries=NULL;n_result listed=n_folder_entries(directory_path,&entries);
+    if(listed<0)return listed==-N_ERR_NOT_FOUND?WEB_IDB_OK:listed==-N_ERR_NO_MEMORY?WEB_IDB_MEMORY:WEB_IDB_IO;
+    int result=WEB_IDB_OK;
+    for(n_result index=0;index<listed;index++){
+        const struct n_entry *entry=&entries[index];
+        if(shards&&entry->kind==N_KIND_FOLDER&&shard_name(entry->name)){
+            char child[160];snprintf(child,sizeof child,"%s/%s",directory_path,entry->name);
             result=catalog_scan(child,origin,items,count,false);if(result)break;continue;
         }
-        size_t len=strlen(entry.name);
-        if(len!=66||entry.name[64]!='.'||(entry.name[65]!='0'&&entry.name[65]!='1'))continue;
-        char text[65];memcpy(text,entry.name,64);text[64]=0;uint8_t digest[32];if(!unhex(text,digest))continue;
+        size_t len=strlen(entry->name);
+        if(len!=66||entry->name[64]!='.'||(entry->name[65]!='0'&&entry->name[65]!='1'))continue;
+        char text[65];memcpy(text,entry->name,64);text[64]=0;uint8_t digest[32];if(!unhex(text,digest))continue;
         char base[160],lock[168];snprintf(base,sizeof base,"%s/%s",directory_path,text);snprintf(lock,sizeof lock,"%s.lock",base);
-        int lease=open(lock,O_RDWR|O_CREAT);if(lease<0){result=WEB_IDB_IO;break;}
-        if(fcntl(lease,F_NTRYLOCK)<0){result=errno==EAGAIN?WEB_IDB_BUSY:WEB_IDB_IO;close(lease);break;}
-        struct webidb_database a={0},b={0};uint64_t ag=0,bg=0;int ar=catalog(base,0,origin,&a,&ag),br=catalog(base,1,origin,&b,&bg);close(lease);if(ar==-2||br==-2){free(a.name);free(b.name);result=WEB_IDB_MEMORY;break;}struct webidb_database chosen={0};if(ar==1&&(br!=1||ag>=bg)){chosen=a;free(b.name);}else if(br==1){chosen=b;free(a.name);}else{free(a.name);free(b.name);continue;}if(!chosen.version){free(chosen.name);continue;}int duplicate=0;for(size_t i=0;i<*count;i++)if((*items)[i].name_length==chosen.name_length&&!memcmp((*items)[i].name,chosen.name,chosen.name_length)){duplicate=1;break;}if(duplicate){free(chosen.name);continue;}if(*count>=SIZE_MAX/sizeof **items){free(chosen.name);result=WEB_IDB_MEMORY;break;}struct webidb_database *more=realloc(*items,(*count+1)*sizeof **items);if(!more){free(chosen.name);result=WEB_IDB_MEMORY;break;}*items=more;(*items)[(*count)++]=chosen;
-        if(index==INT_MAX){result=WEB_IDB_MEMORY;break;}
+        n_handle lease=document(lock);if(lease<0){result=WEB_IDB_IO;break;}
+        n_result claimed=n_document_claim(lease,false);
+        if(claimed<0){result=claimed==-N_ERR_NOT_READY?WEB_IDB_BUSY:WEB_IDB_IO;n_handle_close(lease);break;}
+        struct webidb_database a={0},b={0};uint64_t ag=0,bg=0;int ar=catalog(base,0,origin,&a,&ag),br=catalog(base,1,origin,&b,&bg);n_handle_close(lease);if(ar==-2||br==-2){free(a.name);free(b.name);result=WEB_IDB_MEMORY;break;}struct webidb_database chosen={0};if(ar==1&&(br!=1||ag>=bg)){chosen=a;free(b.name);}else if(br==1){chosen=b;free(a.name);}else{free(a.name);free(b.name);continue;}if(!chosen.version){free(chosen.name);continue;}int duplicate=0;for(size_t i=0;i<*count;i++)if((*items)[i].name_length==chosen.name_length&&!memcmp((*items)[i].name,chosen.name,chosen.name_length)){duplicate=1;break;}if(duplicate){free(chosen.name);continue;}if(*count>=SIZE_MAX/sizeof **items){free(chosen.name);result=WEB_IDB_MEMORY;break;}struct webidb_database *more=realloc(*items,(*count+1)*sizeof **items);if(!more){free(chosen.name);result=WEB_IDB_MEMORY;break;}*items=more;(*items)[(*count)++]=chosen;
     }
-    close(fd);if(result){webidb_databases_free(*items,*count);*items=NULL;*count=0;}return result;
+    free(entries);if(result){webidb_databases_free(*items,*count);*items=NULL;*count=0;}return result;
 }
 int webidb_databases(webidb *db,const char *origin,struct webidb_database **items,size_t *count){
     *items=NULL;*count=0;
@@ -380,25 +371,25 @@ int webidb_databases(webidb *db,const char *origin,struct webidb_database **item
  * Process start times prevent PID reuse from resurrecting dead connections. */
 #define CLIENT_BYTES 48u
 struct client_table {uint8_t *rows;size_t count;struct n_procinfo *processes;int process_count;};
-static int clients_open(struct idb_tx *tx){if(!directory("/tmp/browser-indexeddb"))return -1;const char *base=strrchr(tx->path,'/');char path[160];snprintf(path,sizeof path,"/tmp/browser-indexeddb/%s.clients",base?base+1:tx->path);return open(path,O_RDWR|O_CREAT);}
-static int clients_lock(int fd){if(fcntl(fd,F_NTRYLOCK)<0)return errno==EAGAIN?WEB_IDB_BUSY:WEB_IDB_IO;return WEB_IDB_OK;}
+static n_handle clients_open(struct idb_tx *tx){if(!directory("/tmp/browser-indexeddb"))return -1;const char *base=strrchr(tx->path,'/');char path[160];snprintf(path,sizeof path,"/tmp/browser-indexeddb/%s.clients",base?base+1:tx->path);return document(path);}
+static int clients_lock(n_handle table){n_result claimed=n_document_claim(table,false);return claimed>=0?WEB_IDB_OK:claimed==-N_ERR_NOT_READY?WEB_IDB_BUSY:WEB_IDB_IO;}
 static int processes(struct client_table *t){int capacity=32;for(;;){t->processes=malloc((size_t)capacity*sizeof *t->processes);if(!t->processes)return WEB_IDB_MEMORY;int n=proclist(t->processes,capacity);if(n<0){free(t->processes);t->processes=NULL;return WEB_IDB_IO;}if(n<capacity){t->process_count=n;return WEB_IDB_OK;}free(t->processes);t->processes=NULL;if(capacity>INT_MAX/2)return WEB_IDB_MEMORY;capacity*=2;}}
 static int client_alive(struct client_table *t,uint8_t *row){for(int i=0;i<t->process_count;i++)if(t->processes[i].pid==(int)u64(row+8)&&t->processes[i].start_ms==u64(row+16)&&t->processes[i].state!=3)return 1;return 0;}
 static void table_free(struct client_table *t){free(t->rows);free(t->processes);memset(t,0,sizeof *t);}
-static int table_read(int fd,struct client_table *t){struct n_stat st;if(fstat(fd,&st)<0||st.size%CLIENT_BYTES||st.size>SIZE_MAX-CLIENT_BYTES)return WEB_IDB_IO;size_t n=(size_t)st.size;t->rows=calloc(1,n+CLIENT_BYTES);if(!t->rows)return WEB_IDB_MEMORY;t->count=n/CLIENT_BYTES;if(lseek(fd,0,SEEK_SET)<0||!io(fd,t->rows,n,0)){table_free(t);return WEB_IDB_IO;}int status=processes(t);if(status){table_free(t);return status;}for(size_t i=0;i<t->count;i++){uint8_t *row=t->rows+i*CLIENT_BYTES;if(u64(row)&&!client_alive(t,row))memset(row,0,CLIENT_BYTES);}return WEB_IDB_OK;}
-static int table_write(int fd,struct client_table *t){return lseek(fd,0,SEEK_SET)>=0&&io(fd,t->rows,t->count*CLIENT_BYTES,1)?WEB_IDB_OK:WEB_IDB_IO;}
-int webidb_connections(webidb *db,uint32_t token,uint64_t version,size_t *count){*count=0;struct idb_tx *tx=find(db,token);if(!tx)return WEB_IDB_IO;int fd=clients_open(tx);if(fd<0)return WEB_IDB_IO;int status=clients_lock(fd);struct client_table t={0};if(!status)status=table_read(fd,&t);if(!status){for(size_t i=0;i<t.count;i++){uint8_t *row=t.rows+i*CLIENT_BYTES;if(u64(row)){(*count)++;if(!u64(row+40)||u64(row+32)!=version){put64(row+32,version);put64(row+40,1);}}}status=table_write(fd,&t);}table_free(&t);close(fd);return status;}
-int webidb_connect(webidb *db,uint32_t token,uint64_t version,uint32_t *connection){*connection=0;struct idb_tx *tx=find(db,token);if(!tx)return WEB_IDB_IO;int fd=clients_open(tx);if(fd<0)return WEB_IDB_IO;int status=clients_lock(fd);struct client_table t={0};if(!status)status=table_read(fd,&t);struct idb_client *c=NULL;
-    if(!status){c=calloc(1,sizeof *c);if(!c)status=WEB_IDB_MEMORY;else{uint32_t serial=__atomic_add_fetch(&client_serial,1,__ATOMIC_RELAXED);if(!serial)serial=__atomic_add_fetch(&client_serial,1,__ATOMIC_RELAXED);c->handle=serial;c->identity=(uint64_t)(uint32_t)getpid()<<32|serial;c->fd=fd;size_t i=0;while(i<t.count&&u64(t.rows+i*CLIENT_BYTES))i++;if(i==t.count)t.count++;c->offset=i*CLIENT_BYTES;uint8_t *row=t.rows+c->offset;put64(row,c->identity);put64(row+8,(uint32_t)getpid());uint64_t start=0;for(int j=0;j<t.process_count;j++)if(t.processes[j].pid==getpid())start=t.processes[j].start_ms;put64(row+16,start);put64(row+24,version);status=table_write(fd,&t);}}
-    table_free(&t);if(status){if(c)free(c);close(fd);return status;}fcntl(fd,F_NUNLOCK);c->next=db->clients;db->clients=c;*connection=c->handle;return WEB_IDB_OK;
+static int table_read(n_handle table,struct client_table *t){n_result size=n_document_size(table);if(size<0||size%CLIENT_BYTES||(uint64_t)size>SIZE_MAX-CLIENT_BYTES)return WEB_IDB_IO;size_t n=(size_t)size;t->rows=calloc(1,n+CLIENT_BYTES);if(!t->rows)return WEB_IDB_MEMORY;t->count=n/CLIENT_BYTES;if(!io(table,0,t->rows,n,0)){table_free(t);return WEB_IDB_IO;}int status=processes(t);if(status){table_free(t);return status;}for(size_t i=0;i<t->count;i++){uint8_t *row=t->rows+i*CLIENT_BYTES;if(u64(row)&&!client_alive(t,row))memset(row,0,CLIENT_BYTES);}return WEB_IDB_OK;}
+static int table_write(n_handle table,struct client_table *t){return io(table,0,t->rows,t->count*CLIENT_BYTES,1)?WEB_IDB_OK:WEB_IDB_IO;}
+int webidb_connections(webidb *db,uint32_t token,uint64_t version,size_t *count){*count=0;struct idb_tx *tx=find(db,token);if(!tx)return WEB_IDB_IO;n_handle table=clients_open(tx);if(table<0)return WEB_IDB_IO;int status=clients_lock(table);struct client_table t={0};if(!status)status=table_read(table,&t);if(!status){for(size_t i=0;i<t.count;i++){uint8_t *row=t.rows+i*CLIENT_BYTES;if(u64(row)){(*count)++;if(!u64(row+40)||u64(row+32)!=version){put64(row+32,version);put64(row+40,1);}}}status=table_write(table,&t);}table_free(&t);n_handle_close(table);return status;}
+int webidb_connect(webidb *db,uint32_t token,uint64_t version,uint32_t *connection){*connection=0;struct idb_tx *tx=find(db,token);if(!tx)return WEB_IDB_IO;n_handle table=clients_open(tx);if(table<0)return WEB_IDB_IO;int status=clients_lock(table);struct client_table t={0};if(!status)status=table_read(table,&t);struct idb_client *c=NULL;
+    if(!status){c=calloc(1,sizeof *c);if(!c)status=WEB_IDB_MEMORY;else{uint32_t serial=__atomic_add_fetch(&client_serial,1,__ATOMIC_RELAXED);if(!serial)serial=__atomic_add_fetch(&client_serial,1,__ATOMIC_RELAXED);c->handle=serial;c->identity=(uint64_t)(uint32_t)n_app_self()<<32|serial;c->table=table;size_t i=0;while(i<t.count&&u64(t.rows+i*CLIENT_BYTES))i++;if(i==t.count)t.count++;c->offset=i*CLIENT_BYTES;uint8_t *row=t.rows+c->offset;put64(row,c->identity);put64(row+8,(uint32_t)n_app_self());uint64_t start=0;for(int j=0;j<t.process_count;j++)if(t.processes[j].pid==(int)n_app_self())start=t.processes[j].start_ms;put64(row+16,start);put64(row+24,version);status=table_write(table,&t);}}
+    table_free(&t);if(status){if(c)free(c);n_handle_close(table);return status;}n_document_release(table);c->next=db->clients;db->clients=c;*connection=c->handle;return WEB_IDB_OK;
 }
-int webidb_poll(webidb *db,uint32_t connection,int *pending,uint64_t *version){*pending=0;*version=0;struct idb_client *c=db?db->clients:NULL;while(c&&c->handle!=connection)c=c->next;if(!c)return WEB_IDB_IO;int status=clients_lock(c->fd);if(status)return status;uint8_t row[CLIENT_BYTES];if(lseek(c->fd,c->offset,SEEK_SET)<0||!io(c->fd,row,sizeof row,0)||u64(row)!=c->identity)status=WEB_IDB_IO;else if(u64(row+40)==1){*pending=1;*version=u64(row+32);put64(row+40,2);if(lseek(c->fd,c->offset,SEEK_SET)<0||!io(c->fd,row,sizeof row,1))status=WEB_IDB_IO;}fcntl(c->fd,F_NUNLOCK);return status;}
-int webidb_disconnect(webidb *db,uint32_t connection){if(!db)return WEB_IDB_IO;struct idb_client **p=&db->clients;while(*p&&(*p)->handle!=connection)p=&(*p)->next;if(!*p)return WEB_IDB_IO;struct idb_client *c=*p;int status=clients_lock(c->fd);if(status)return status;uint8_t row[CLIENT_BYTES];if(lseek(c->fd,c->offset,SEEK_SET)<0||!io(c->fd,row,sizeof row,0)||u64(row)!=c->identity)status=WEB_IDB_IO;else{memset(row,0,sizeof row);if(lseek(c->fd,c->offset,SEEK_SET)<0||!io(c->fd,row,sizeof row,1))status=WEB_IDB_IO;}fcntl(c->fd,F_NUNLOCK);*p=c->next;close(c->fd);free(c);return status;}
+int webidb_poll(webidb *db,uint32_t connection,int *pending,uint64_t *version){*pending=0;*version=0;struct idb_client *c=db?db->clients:NULL;while(c&&c->handle!=connection)c=c->next;if(!c)return WEB_IDB_IO;int status=clients_lock(c->table);if(status)return status;uint8_t row[CLIENT_BYTES];if(!io(c->table,c->offset,row,sizeof row,0)||u64(row)!=c->identity)status=WEB_IDB_IO;else if(u64(row+40)==1){*pending=1;*version=u64(row+32);put64(row+40,2);if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}n_document_release(c->table);return status;}
+int webidb_disconnect(webidb *db,uint32_t connection){if(!db)return WEB_IDB_IO;struct idb_client **p=&db->clients;while(*p&&(*p)->handle!=connection)p=&(*p)->next;if(!*p)return WEB_IDB_IO;struct idb_client *c=*p;int status=clients_lock(c->table);if(status)return status;uint8_t row[CLIENT_BYTES];if(!io(c->table,c->offset,row,sizeof row,0)||u64(row)!=c->identity)status=WEB_IDB_IO;else{memset(row,0,sizeof row);if(!io(c->table,c->offset,row,sizeof row,1))status=WEB_IDB_IO;}n_document_release(c->table);*p=c->next;n_handle_close(c->table);free(c);return status;}
 int webidb_forget_connection(webidb *db,uint32_t connection){
     int result=webidb_disconnect(db,connection);if(result!=WEB_IDB_BUSY)return result;
     struct idb_client *c=db?db->clients:NULL;while(c&&c->handle!=connection)c=c->next;if(!c)return WEB_IDB_IO;
     /* This lease covers RAM-root row I/O only, never author code or a
      * transaction. An unpublished OOM connection cannot be left for JS to close. */
-    if(fcntl(c->fd,F_NLOCK)<0)return WEB_IDB_IO;
+    if(n_document_claim(c->table,true)<0)return WEB_IDB_IO;
     return webidb_disconnect(db,connection);
 }

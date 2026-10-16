@@ -201,8 +201,8 @@ static int mtx_acquire(mtx_t *mtx, const struct timespec *timeout) {
         }
         unsigned wait = timeout ? deadline_ms(timeout) : UINT32_MAX;
         if (timeout && !wait) return thrd_timedout;
-        if (wait_on_address(&mtx->state, 2, wait) < 0 && errno != EAGAIN && errno != ETIMEDOUT && errno != EINTR)
-            return thrd_error;
+        n_result r = wait_on_address(&mtx->state, 2, wait);
+        if (r < 0 && r != -N_ERR_NOT_READY && r != -N_ERR_TIMEOUT) return thrd_error;
     }
 }
 int mtx_lock(mtx_t *mtx) { return mtx_acquire(mtx, NULL); }
@@ -250,7 +250,7 @@ static int cnd_wait_until(cnd_t *cond, mtx_t *mtx, const struct timespec *ts) {
     int result = thrd_success;
     unsigned wait = ts ? deadline_ms(ts) : UINT32_MAX;
     if (ts && !wait) result = thrd_timedout;
-    else if (wait_on_address(&cond->sequence, sequence, wait) < 0 && errno == ETIMEDOUT && ts && !deadline_ms(ts))
+    else if (wait_on_address(&cond->sequence, sequence, wait) == -N_ERR_TIMEOUT && ts && !deadline_ms(ts))
         result = thrd_timedout;
     if (mtx_lock(mtx) != thrd_success) return thrd_error;
     if (depth) mtx->depth = depth;

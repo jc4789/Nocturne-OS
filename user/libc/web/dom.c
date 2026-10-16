@@ -119,10 +119,12 @@ node_t *doc_assigned_slot(node_t *n, bool open_only) {
 }
 /* Keep assignment snapshots as intrusive native lists, without arena churn or
    a parallel JS DOM. All comparisons happen before rewriting any next link. */
-static void compare_slot(node_t *slot) {
+static bool compare_slot(node_t *slot) {
     node_t *old = slot->slot_assigned_first, *wanted = slot->slot_wanted_first;
     while (old && wanted && old == wanted) { old = old->assigned_next; wanted = wanted->pending_assigned_next; }
-    if (old || wanted) doc_slot_signal(slot);
+    if (!old && !wanted) return false;
+    doc_slot_signal(slot);
+    return true;
 }
 static size_t slot_hash(const char *name) {
     size_t hash = 2166136261u;
@@ -168,21 +170,30 @@ static bool shadow_wanted(node_t *root, web_doc *family) {
     }
     free(names); return true;
 }
-static void compare_shadow_slots(node_t *root) {
+static bool compare_shadow_slots(node_t *root) {
+    bool changed = false;
     for (node_t *n = root->first; n; n = tree_next(n, root, false, false, true)) {
-        if (is_slot(n)) compare_slot(n);
+        if (is_slot(n) && compare_slot(n)) changed = true;
     }
+    return changed;
+}
+/* Slot reassignment can change fallback visibility and inherited parents
+ * without touching those elements directly, so a changed assignment must not
+ * reuse a stale flat-tree style/box topology. An unchanged assignment leaves
+ * the flat tree as the mutation itself left it, and that mutation already
+ * invalidated its own boundary: an ordinary insert into a shadow tree is not a
+ * whole-document recascade. */
+static void shadow_assignment_changed(node_t *root) {
+    web_doc *d = root->owner;
+    if (!d || !root->shadow_host || !d->live || d->inert || doc_node_root(root->shadow_host, true) != d->root) return;
+    d->need_style = d->style_full_dirty = d->need_boxes = true;
+    d->layout_valid = false;
 }
 void doc_shadow_dirty(node_t *root) {
     if (!root || !root->shadow_host) return;
     web_doc *d = root->owner, *family = d->dom_family ? d->dom_family : d;
-    /* Slot reassignment can change fallback visibility and inherited parents
-     * without touching those elements directly. Preserve deferred assignment,
-     * but do not reuse a stale flat-tree style/box topology after publication. */
-    if(d->live && !d->inert && doc_node_root(root->shadow_host,true)==d->root) {
-        d->need_style=d->style_full_dirty=d->need_boxes=true;
-        d->layout_valid=false;
-    }
+    /* The next geometry read or paint flushes assignment before using it. */
+    if(d->live && !d->inert && doc_node_root(root->shadow_host,true)==d->root) d->layout_valid=false;
     if(root->shadow_dirty)return;
     root->shadow_dirty = true; root->shadow_dirty_next = NULL;
     if (family->shadow_dirty_last) family->shadow_dirty_last->shadow_dirty_next = root;
@@ -200,11 +211,13 @@ void doc_shadow_flush(web_doc *d) {
        A slot can move between two roots in the same transaction. */
     for (node_t *r = family->shadow_dirty_first; r; r = r->shadow_dirty_next) {
         family->profile.shadow_reassigns++;
-        compare_shadow_slots(r);
+        bool changed = compare_shadow_slots(r);
         for (node_t *s = r->shadow_slots; s; s = s->shadow_slot_next)
             if (!doc_node_root(s, false)->shadow_host) {
-                s->slot_wanted_first = s->slot_wanted_last = NULL; compare_slot(s);
+                s->slot_wanted_first = s->slot_wanted_last = NULL;
+                if (compare_slot(s)) changed = true;
             }
+        if (changed) shadow_assignment_changed(r);
     }
     for (node_t *r = family->shadow_dirty_first; r; r = r->shadow_dirty_next) {
         for (node_t *s = r->shadow_slots; s; s = s->shadow_slot_next) {
@@ -380,7 +393,7 @@ static void textarea_changed(node_t *n) {
         if (n->type == N_ELEM && !n->foreign && n->tag == T_textarea && !n->value_dirty) n->control_ready = false;
 }
 
-static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recascade, bool boxes,node_t *child_list) {
+static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recascade, bool boxes,node_t *child_list,bool inserted) {
     if (!d) return;
     d->dom_revision++;
     /* Window の名前表はdocument-tree構造だけを追う。style/rAFやshadow内部は無効化しない。 */
@@ -401,7 +414,7 @@ static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recasca
         textarea_changed(n); return;
     }
     d->dirty = true;
-    if(recascade){if(child_list)css_mark_child_list_dirty(d,n,child_list);else css_mark_dirty(d,n);}
+    if(recascade){if(child_list)css_mark_child_list_dirty(d,n,child_list,inserted);else css_mark_dirty(d,n);}
     if(boxes){d->need_boxes=true;d->layout_valid=false;}
     if (resources) d->resources_dirty = d->style_full_dirty = true;
     if (recascade || boxes) {
@@ -420,7 +433,7 @@ static void changed_geometry(web_doc *d, node_t *n, bool resources, bool recasca
        boxes_build has stopped borrowing the old cache pointers. */
 }
 static void changed(web_doc *d,node_t *n,bool resources) {
-    changed_geometry(d,n,resources,true,false,NULL);
+    changed_geometry(d,n,resources,true,false,NULL,false);
 }
 void doc_mutated(web_doc *d, node_t *n) {
     if (d && !n) { d->js_nodes_dirty = true; d->need_boxes = true; d->metadata_valid=false; }
@@ -435,24 +448,31 @@ void doc_mutated(web_doc *d, node_t *n) {
    not the authored sheet set. Preserve the scan for every node kind consumed
    by doc.c scan(), image candidates, and document identity. In particular a
    text edit inside style/title/control ancestors still needs that scan. */
-static bool resource_subtree(node_t *root) {
-    if (!root) return true;
+enum { SUBTREE_RESOURCES = 1, SUBTREE_IMAGES = 2 };
+/* Images need only their requests synced (doc_rescan's images_dirty path, the
+   same doc_image_sync a full scan does for them). They never add or remove an
+   authored sheet, so they must not discard the rule index and recascade the
+   whole document on every inserted thumbnail. */
+static unsigned resource_subtree(node_t *root) {
+    if (!root) return SUBTREE_RESOURCES;
+    unsigned found = 0;
     for (node_t *n = root; n;) {
       bool descend = true;
       if (n->type == N_ELEM && !n->foreign) {
         switch (n->tag) {
         case T_html: case T_head: case T_body: case T_frameset:
         case T_base: case T_title: case T_meta: case T_link: case T_style:
-        case T_img: case T_input: case T_textarea: case T_select: case T_option:
-        case T_picture: case T_source:
-            return true;
+        case T_input: case T_textarea: case T_select: case T_option:
+            return SUBTREE_RESOURCES;
+        case T_img: case T_picture: case T_source:
+            found |= SUBTREE_IMAGES; break;
         default: break;
         }
         if (n->tag == T_template) descend = false; /* inert template content */
       }
       n = tree_next(n, root, true, false, descend);
     }
-    return false;
+    return found;
 }
 static bool resource_ancestor(node_t *n) {
     for (; n; n = n->parent) if (!n->foreign && n->type == N_ELEM &&
@@ -464,7 +484,7 @@ static bool metadata_subtree(node_t *root) {
         if(n->type==N_ELEM&&!n->foreign&&n->tag==T_base&&node_attr(n,"href"))return true;
     return false;
 }
-static void structure_changed_lifetime(web_doc *d, node_t *parent, node_t *subtree, bool lifetime_changed) {
+static void structure_changed_lifetime(web_doc *d, node_t *parent, node_t *subtree, bool lifetime_changed, bool inserted) {
     html_bridge_native_changed(parent, HTML_BRIDGE_CHILDREN);
     cssom_style_text_changed(parent);
     if (lifetime_changed) cssom_style_lifecycle(subtree);
@@ -478,11 +498,16 @@ static void structure_changed_lifetime(web_doc *d, node_t *parent, node_t *subtr
        (parent->type==N_DOC || parent==d->html || metadata_subtree(subtree)))
         d->metadata_valid=false;
     if (d && doc_node_root(parent, true) == d->root) d->need_boxes = true;
-    changed_geometry(d,parent,parent->type==N_DOC || resource_ancestor(parent) || resource_subtree(subtree),true,false,subtree);
+    bool resources = parent->type==N_DOC || resource_ancestor(parent);
+    unsigned kind = resources ? 0 : resource_subtree(subtree);
+    resources = resources || (kind & SUBTREE_RESOURCES);
+    changed_geometry(d,parent,resources,true,false,subtree,inserted);
+    if (d && !resources && (kind & SUBTREE_IMAGES) && doc_node_root(parent,true)==d->root)
+        d->images_dirty = d->dirty = true;
     if (d && doc_node_root(parent,true)==d->root) boxes_note_child_list(d,parent,subtree);
 }
 static void structure_changed(web_doc *d, node_t *parent, node_t *subtree) {
-    structure_changed_lifetime(d, parent, subtree, true);
+    structure_changed_lifetime(d, parent, subtree, true, false);
 }
 
 /* XML 1.0 Name, required by the DOM PI creation APIs. HTML tokenization has
@@ -1107,8 +1132,9 @@ bool doc_node_move(web_doc *d, node_t *p, node_t *c, node_t *before) {
     if (is_slot(p) && !p->slot_assigned_first && doc_node_root(p, false)->shadow_host)
         doc_slot_signal(p);
     /* A move into a detached forest still removes content from the live tree. */
-    if (old_parent && old_parent != p) structure_changed_lifetime(d, old_parent, c, !same_lifetime_forest);
-    structure_changed_lifetime(d, p, c, !same_lifetime_forest);
+    if (old_parent && old_parent != p) structure_changed_lifetime(d, old_parent, c, !same_lifetime_forest, false);
+    /* A reorder within p also changed the former position: not an insertion. */
+    structure_changed_lifetime(d, p, c, !same_lifetime_forest, old_parent != p);
     doc_details_inserted(c);
     node_t *new_select = node_ancestor(p, T_select);
     web_select_inserted(d, c, old_parent);
@@ -1324,7 +1350,7 @@ bool doc_node_text(web_doc *d, node_t *n, const char *text, size_t len) {
         if(keep_style){d->need_style=was_need_style;rebuild_boxes=true;}
     }
     cssom_style_text_changed(n);
-    changed_geometry(d,n,resources,!keep_style,rebuild_boxes,NULL);
+    changed_geometry(d,n,resources,!keep_style,rebuild_boxes,NULL,false);
     return true;
 }
 

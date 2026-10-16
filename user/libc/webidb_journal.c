@@ -4,9 +4,6 @@
  * immutable journal ancestry. Compaction only truncates an unreferenced lane. */
 #include "webidb_journal.h"
 #include <nocturne.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -32,10 +29,20 @@ static struct snapshot cache[2];
 static uint64_t get64(const uint8_t *p){uint64_t n=0;for(unsigned i=0;i<8;i++)n|=(uint64_t)p[i]<<(i*8);return n;}
 static void put64(uint8_t *p,uint64_t n){for(unsigned i=0;i<8;i++)p[i]=(uint8_t)(n>>(i*8));}
 static void hash(const uint8_t *p,size_t n,uint8_t out[32]){br_sha256_context h;br_sha256_init(&h);br_sha256_update(&h,p,n);br_sha256_out(&h,out);}
-static bool exact(int fd,uint8_t *bytes,size_t length,bool writing){
+static bool exact(n_handle h,uint64_t offset,uint8_t *bytes,size_t length,bool writing){
     size_t at=0;
-    while(at<length){size_t step=length-at;if(step>INT_MAX)step=INT_MAX;ssize_t n=writing?write(fd,bytes+at,step):read(fd,bytes+at,step);if(n<=0)return false;at+=(size_t)n;}
+    while(at<length){
+        n_result n=writing?n_document_write_at(h,offset+at,bytes+at,length-at):n_document_read_at(h,offset+at,bytes+at,length-at);
+        if(n<=0||(uint64_t)n>length-at)return false;
+        at+=(size_t)n;
+    }
     return true;
+}
+/* The document at path, created empty when absent, open for reading and writing. */
+static n_handle document(const char *path){
+    n_handle h=n_document_open(path,N_DOCUMENT_EDIT);if(h!=-N_ERR_NOT_FOUND)return h;
+    h=n_document_open(path,N_DOCUMENT_CREATE);
+    return h==-N_ERR_EXISTS?n_document_open(path,N_DOCUMENT_EDIT):h;
 }
 static void clear_snapshot(struct snapshot *s){free(s->bytes);memset(s,0,sizeof *s);}
 void webidb_journal_forget(void){clear_snapshot(&cache[0]);clear_snapshot(&cache[1]);cache_base[0]=0;}
@@ -128,14 +135,14 @@ malformed:
 struct frame {uint8_t *bytes;size_t length;};
 static int reconstruct(const char *base,const uint8_t *head,uint8_t **result,size_t *length){
     unsigned journal=(unsigned)get64(head+72);char path[224];snprintf(path,sizeof path,"%s.journal%u",base,journal);
-    int fd=open(path,O_RDONLY);if(fd<0)return -1;
-    struct n_stat st;if(fstat(fd,&st)<0){close(fd);return -1;}
+    n_handle h=n_document_open(path,N_DOCUMENT_READ);if(h<0)return -1;
+    n_result size=n_document_size(h);if(size<0){n_handle_close(h);return -1;}
     uint64_t offset=get64(head+80),n=get64(head+88);uint8_t expected[32];memcpy(expected,head+104,32);
     struct frame *frames=NULL;size_t count=0,capacity=0;uint64_t generation=get64(head+40);int status=1;
     for(;;){
-        if(n<FRAME_HEAD||n>SIZE_MAX||n>LONG_MAX||offset>st.size||n>st.size-offset){status=-1;break;}
+        if(n<FRAME_HEAD||n>SIZE_MAX||offset>(uint64_t)size||n>(uint64_t)size-offset){status=-1;break;}
         uint8_t *bytes=malloc((size_t)n);if(!bytes){status=-2;break;}
-        if(offset>LONG_MAX||lseek(fd,(long)offset,SEEK_SET)<0||!exact(fd,bytes,(size_t)n,false)){free(bytes);status=-1;break;}
+        if(!exact(h,offset,bytes,(size_t)n,false)){free(bytes);status=-1;break;}
         uint8_t digest[32];hash(bytes+40,(size_t)n-40,digest);
         if(memcmp(bytes,"NIDJ0001",8)||memcmp(digest,bytes+8,32)||memcmp(digest,expected,32)||
            get64(bytes+40)!=generation||get64(bytes+96)>SIZE_MAX||get64(bytes+104)!=(size_t)n-FRAME_HEAD){free(bytes);status=-1;break;}
@@ -154,7 +161,7 @@ static int reconstruct(const char *base,const uint8_t *head,uint8_t **result,siz
         if(!generation||previous_offset>=offset||previous_length>offset-previous_offset){status=-1;break;}
         generation--;offset=previous_offset;n=previous_length;memcpy(expected,bytes+64,32);
     }
-    close(fd);
+    n_handle_close(h);
     uint8_t *current=NULL;size_t current_length=0;
     for(size_t i=count;status==1&&i;i--){
         const struct frame *f=&frames[i-1];uint8_t *next=NULL;size_t next_length=(size_t)get64(f->bytes+96);
@@ -167,38 +174,41 @@ static int reconstruct(const char *base,const uint8_t *head,uint8_t **result,siz
 }
 int webidb_journal_read(const char *base,int slot,uint8_t **bytes,size_t *length){
     *bytes=NULL;*length=0;if(slot<0||slot>1)return -1;select_base(base);
-    char path[208];snprintf(path,sizeof path,"%s.%d",base,slot);struct n_stat st;
-    if(stat(path,&st)<0){clear_snapshot(&cache[slot]);return errno==ENOENT?0:-1;}
-    if(st.size<64||st.size>SIZE_MAX||st.size>LONG_MAX)return -1;
-    int fd=open(path,O_RDONLY);if(fd<0)return -1;
-    uint8_t prefix[COMMIT_HEAD];size_t prefix_length=st.size<sizeof prefix?(size_t)st.size:sizeof prefix;
-    if(!exact(fd,prefix,prefix_length,false)){close(fd);return -1;}
+    char path[208];snprintf(path,sizeof path,"%s.%d",base,slot);
+    n_handle h=n_document_open(path,N_DOCUMENT_READ);
+    if(h==-N_ERR_NOT_FOUND){clear_snapshot(&cache[slot]);return 0;}
+    if(h<0)return -1;
+    n_result whole=n_document_size(h);
+    if(whole<64||(uint64_t)whole>SIZE_MAX){n_handle_close(h);return -1;}
+    size_t size=(size_t)whole;
+    uint8_t prefix[COMMIT_HEAD];size_t prefix_length=size<sizeof prefix?size:sizeof prefix;
+    if(!exact(h,0,prefix,prefix_length,false)){n_handle_close(h);return -1;}
     bool journalled=!memcmp(prefix,"NIDB0004",8);
     uint8_t signature[32];
     if(journalled){
-        if(st.size<COMMIT_HEAD||get64(prefix+72)>1||get64(prefix+56)>st.size-COMMIT_HEAD||
-           get64(prefix+64)!=st.size-COMMIT_HEAD-get64(prefix+56)){close(fd);return -1;}
+        if(size<COMMIT_HEAD||get64(prefix+72)>1||get64(prefix+56)>size-COMMIT_HEAD||
+           get64(prefix+64)!=size-COMMIT_HEAD-get64(prefix+56)){n_handle_close(h);return -1;}
         memcpy(signature,prefix+8,32);
     }else{
         /* Legacy heads already carry a full-manifest content digest. */
-        if(memcmp(prefix,"NIDB0003",8)&&memcmp(prefix,"NIDB0002",8)){close(fd);return -1;}
+        if(memcmp(prefix,"NIDB0003",8)&&memcmp(prefix,"NIDB0002",8)){n_handle_close(h);return -1;}
         memcpy(signature,prefix+8,32);
     }
     struct snapshot *cached=&cache[slot];
     if(cached->valid&&cached->journalled==journalled&&!memcmp(cached->signature,signature,32)){
-        close(fd);uint8_t *copy=malloc(cached->length?cached->length:1);if(!copy)return -2;
+        n_handle_close(h);uint8_t *copy=malloc(cached->length?cached->length:1);if(!copy)return -2;
         memcpy(copy,cached->bytes,cached->length);*bytes=copy;*length=cached->length;return 1;
     }
-    uint8_t *head=malloc((size_t)st.size);if(!head){close(fd);return -2;}
+    uint8_t *head=malloc(size);if(!head){n_handle_close(h);return -2;}
     memcpy(head,prefix,prefix_length);
-    if(!exact(fd,head+prefix_length,(size_t)st.size-prefix_length,false)){close(fd);free(head);return -1;}
-    close(fd);
+    if(!exact(h,prefix_length,head+prefix_length,size-prefix_length,false)){n_handle_close(h);free(head);return -1;}
+    n_handle_close(h);
     uint8_t *raw=NULL;size_t raw_length=0;
     if(journalled){
-        uint8_t actual[32];hash(head+40,(size_t)st.size-40,actual);
+        uint8_t actual[32];hash(head+40,size-40,actual);
         if(memcmp(actual,head+8,32)){free(head);return -1;}
         int status=reconstruct(base,head,&raw,&raw_length);if(status!=1){free(head);return status;}
-    }else {raw=head;head=NULL;raw_length=(size_t)st.size;}
+    }else {raw=head;head=NULL;raw_length=size;}
     clear_snapshot(cached);
     cached->bytes=malloc(raw_length?raw_length:1);
     if(cached->bytes){
@@ -235,12 +245,13 @@ int webidb_journal_write(const char *base,int slot,const uint8_t *bytes,size_t l
         free(patch.bytes);memset(&patch,0,sizeof patch);
         if(!operation(&patch,1,0,bytes,length)){free(patch.bytes);return -2;}
     }
-    if(patch.length>SIZE_MAX-FRAME_HEAD||patch.length>(size_t)LONG_MAX-FRAME_HEAD){free(patch.bytes);return -2;}
+    if(patch.length>SIZE_MAX-FRAME_HEAD){free(patch.bytes);return -2;}
     char journal_path[224];snprintf(journal_path,sizeof journal_path,"%s.journal%u",base,journal);
-    int fd=open(journal_path,O_RDWR|O_CREAT|(truncate?O_TRUNC:O_APPEND));
-    if(fd<0){free(patch.bytes);return -1;}
-    struct n_stat st;if(fstat(fd,&st)<0||st.size>LONG_MAX){close(fd);free(patch.bytes);return -1;}
-    uint64_t offset=st.size;
+    n_handle lane=document(journal_path);
+    if(lane<0){free(patch.bytes);return -1;}
+    if(truncate&&n_document_set_size(lane,0)<0){n_handle_close(lane);free(patch.bytes);return -1;}
+    n_result end=n_document_size(lane);if(end<0){n_handle_close(lane);free(patch.bytes);return -1;}
+    uint64_t offset=(uint64_t)end;
     uint8_t frame[FRAME_HEAD]={0};memcpy(frame,"NIDJ0001",8);put64(frame+40,generation);
     if(!full){put64(frame+48,previous->offset);put64(frame+56,previous->frame_length);memcpy(frame+64,previous->frame_hash,32);}
     put64(frame+96,length);put64(frame+104,patch.length);
@@ -249,8 +260,8 @@ int webidb_journal_write(const char *base,int slot,const uint8_t *bytes,size_t l
     br_sha256_update(&digest,frame+40,sizeof frame-40);
     br_sha256_update(&digest,patch.bytes,patch.length);
     br_sha256_out(&digest,frame+8);
-    bool ok=exact(fd,frame,sizeof frame,true)&&exact(fd,patch.bytes,patch.length,true);
-    if(close(fd)<0)ok=false;
+    bool ok=exact(lane,offset,frame,sizeof frame,true)&&exact(lane,offset+sizeof frame,patch.bytes,patch.length,true);
+    if(n_handle_close(lane)<0)ok=false;
     free(patch.bytes);
     if(!ok)return -1;
     uint64_t on=get64(bytes+96),nn=get64(bytes+104);
@@ -272,10 +283,8 @@ int webidb_journal_write(const char *base,int slot,const uint8_t *bytes,size_t l
     memcpy(head+COMMIT_HEAD,bytes+120,(size_t)on+(size_t)nn);
     hash(head+40,head_length-40,head+8);
     char head_path[208];snprintf(head_path,sizeof head_path,"%s.%d",base,slot);
-    fd=open(head_path,O_WRONLY|O_CREAT|O_TRUNC);
-    ok=fd>=0&&exact(fd,head,head_length,true);
-    if(fd>=0&&close(fd)<0)ok=false;
-    if(!ok){unlink(head_path);free(head);return -1;}
+    /* The head is swapped in whole: a failed save leaves the previous head. */
+    if(n_document_save(head_path,head,head_length)<0){free(head);return -1;}
     clear_snapshot(&cache[slot]);
     struct snapshot *published=&cache[slot];
     published->bytes=malloc(length);

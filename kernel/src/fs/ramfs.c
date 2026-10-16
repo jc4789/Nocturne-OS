@@ -155,6 +155,12 @@ static struct vnode_ops replace_ops = {
     .truncate = ram_truncate,
     .release = replace_release,
 };
+/* A staging document after its commit: a duplicated handle closing later
+   must not commit again, which would replace the document with nothing. */
+static struct vnode_ops replaced_ops = {
+    .read = ram_read,
+    .release = replace_release,
+};
 
 struct vnode *ramfs_replace_new(const char *path) {
     struct vnode *v = kzalloc(sizeof *v);
@@ -174,10 +180,12 @@ bool ramfs_is_replace(struct vnode *v) { return v->ops == &replace_ops; }
 
 int ramfs_replace_commit(struct vnode *v) {
     uint64_t flags = irq_save();
+    if (v->ops != &replace_ops) { irq_restore(flags); return 0; }
     uint8_t *data = v->data;
     uint64_t size = v->size;
     v->data = NULL;
     v->size = v->cap = 0;
+    v->ops = &replaced_ops;
     irq_restore(flags);
     return vfs_replace(v->priv, data, size);
 }

@@ -17,14 +17,10 @@
 /* Slot 2 is reserved for CSS. The supervisor and each subtree worker own
    independent declaration/variable scratch; rule indexes and DOM are frozen. */
 struct dent;
-struct var_index_entry;
 struct css_scratch {
     struct dent *declarations;
     int declaration_count, declaration_capacity;
     uint8_t *properties;
-    const struct custom_prop *variable_head;
-    struct var_index_entry *variables;
-    size_t variable_capacity;
     arena_t *arena;
     bool worker;
     bool form_snapshot;
@@ -42,9 +38,6 @@ static bool css_can_service(void) { return !css_worker() || parallel_worker_inde
 #define ndents (css_scratch_get()->declaration_count)
 #define capdents (css_scratch_get()->declaration_capacity)
 #define setbits (css_scratch_get()->properties)
-#define var_index_head (css_scratch_get()->variable_head)
-#define var_index (css_scratch_get()->variables)
-#define var_index_capacity (css_scratch_get()->variable_capacity)
 
 /* ---------------------------------------------------------------- data structures */
 enum { SK_TAG, SK_ID, SK_CLASS, SK_ATTR, SK_PC, SK_SLOTTED, SK_ANCHOR };
@@ -2679,7 +2672,7 @@ struct css_index {
     struct css_index *relational; /* subject-key index; never collected as style declarations */
     struct css_index *child_list_subjects; /* parent state can affect its outer siblings */
     struct css_index *child_list_parents; /* own state changed by a child-list mutation */
-    struct css_index *child_list_siblings; /* position, sibling combinator or sibling :has witness */
+    struct css_index *child_list_siblings[4]; /* position, sibling combinator or sibling :has witness, by enum sibling_reach bit */
     bool relational_siblings;
     struct css_index *next;
 };
@@ -2953,19 +2946,30 @@ static bool compound_has_siblings(const struct compound *c) {
     return false;
 }
 enum subject_dependency { SUBJECT_RELATIONAL, SUBJECT_CHILD_OUTER, SUBJECT_CHILD_PARENT, SUBJECT_CHILD_SIBLING };
-static bool index_child_list_subjects_inner(arena_t *a,struct css_index *index,const struct compound *part,bool publish,enum subject_dependency dependency) {
+/* Which siblings of an inserted element can change a positional subject's
+   match: the nearest following/preceding element (and nearest one of the
+   inserted element's type), or every following/preceding element. */
+enum sibling_reach { SIBLING_NEXT = 1, SIBLING_FOLLOWING = 2, SIBLING_PREVIOUS = 4, SIBLING_PRECEDING = 8 };
+static unsigned index_child_list_subjects_inner(arena_t *a,struct css_index *index,const struct compound *part,bool publish,enum subject_dependency dependency) {
     bool sibling=dependency==SUBJECT_CHILD_SIBLING;
-    bool sensitive=sibling&&(part->comb=='+' || part->comb=='~' || compound_has_siblings(part));
+    unsigned sensitive=0;
+    if(sibling) {
+        if(part->comb=='+')sensitive|=SIBLING_NEXT;
+        if(part->comb=='~')sensitive|=SIBLING_FOLLOWING;
+        if(compound_has_siblings(part))sensitive|=SIBLING_FOLLOWING|SIBLING_PRECEDING;
+    }
     for(int i=0;i<part->n;i++) {
         const struct simple *s=&part->s[i];
         if(s->kind==SK_PC) switch(s->pc) {
         case PC_EMPTY: case PC_FOCUS_WITHIN: case PC_HOVER: case PC_ACTIVE:
         case PC_CHECKED: case PC_DISABLED: case PC_ENABLED: case PC_VALID: case PC_INVALID:
         case PC_IN_RANGE: case PC_OUT_OF_RANGE: case PC_INDETERMINATE: case PC_PLACEHOLDER_SHOWN:
-            sensitive|=!sibling;break;
-        case PC_FIRST_CHILD: case PC_LAST_CHILD: case PC_ONLY_CHILD: case PC_NTH_CHILD: case PC_NTH_LAST_CHILD:
-        case PC_FIRST_OF_TYPE: case PC_LAST_OF_TYPE: case PC_ONLY_OF_TYPE: case PC_NTH_OF_TYPE: case PC_NTH_LAST_OF_TYPE:
-            sensitive|=sibling;break;
+            if(!sibling)sensitive|=1;break;
+        case PC_FIRST_CHILD: case PC_FIRST_OF_TYPE: if(sibling)sensitive|=SIBLING_NEXT;break;
+        case PC_LAST_CHILD: case PC_LAST_OF_TYPE: if(sibling)sensitive|=SIBLING_PREVIOUS;break;
+        case PC_ONLY_CHILD: case PC_ONLY_OF_TYPE: if(sibling)sensitive|=SIBLING_NEXT|SIBLING_PREVIOUS;break;
+        case PC_NTH_CHILD: case PC_NTH_OF_TYPE: if(sibling)sensitive|=SIBLING_FOLLOWING;break;
+        case PC_NTH_LAST_CHILD: case PC_NTH_LAST_OF_TYPE: if(sibling)sensitive|=SIBLING_PRECEDING;break;
         default:break;
         }
         /* :has() has its own ancestor/witness invalidator. Logical selector
@@ -2984,17 +2988,21 @@ static bool index_child_list_subjects_inner(arena_t *a,struct css_index *index,c
         }
     }
     if(!sensitive||!publish)return sensitive;
-    struct css_index **target=dependency==SUBJECT_CHILD_OUTER?&index->child_list_subjects:
-        dependency==SUBJECT_CHILD_PARENT?&index->child_list_parents:&index->child_list_siblings;
-    if(!*target) {
-        *target=ar_alloc(a,sizeof **target);
-        ht_init(a,&(*target)->ids,16);
-        ht_init(a,&(*target)->classes,32);
-        ht_init(a,&(*target)->tags,16);
-    }
     struct selector *subject=ar_alloc(a,sizeof *subject);subject->right=(struct compound *)part;
-    index_rule(a,*target,NULL,subject,0,false);
-    return true;
+    for(unsigned k=0;k<4;k++) {
+        if(sibling&&!(sensitive&1u<<k))continue;
+        struct css_index **target=dependency==SUBJECT_CHILD_OUTER?&index->child_list_subjects:
+            dependency==SUBJECT_CHILD_PARENT?&index->child_list_parents:&index->child_list_siblings[k];
+        if(!*target) {
+            *target=ar_alloc(a,sizeof **target);
+            ht_init(a,&(*target)->ids,16);
+            ht_init(a,&(*target)->classes,32);
+            ht_init(a,&(*target)->tags,16);
+        }
+        index_rule(a,*target,NULL,subject,0,false);
+        if(!sibling)break;
+    }
+    return sensitive;
 }
 static void index_child_list_subjects(arena_t *a,struct css_index *index,const struct compound *part) {
     index_child_list_subjects_inner(a,index,part,true,SUBJECT_CHILD_OUTER);
@@ -3592,76 +3600,59 @@ static int cmp_dent(const void *a, const void *b) {
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
-struct var_index_entry {
-    const struct custom_prop *property;
-    size_t length;
-    uint32_t hash;
-};
-
-static void var_index_clear(void) {
-    free(var_index);
-    var_index = NULL;
-    var_index_head = NULL;
-    var_index_capacity = 0;
-}
+/* Name tables for custom properties. A page may declare thousands of them on
+   one element and reference them from every descendant: duplicate checks,
+   cycle detection and var() lookup must not scan or rehash those chains. */
+#define VAR_SEGMENT_INDEX_MIN 16
+struct var_slot { const char *name; size_t length; uint32_t hash; void *value; };
+struct var_segment { const struct custom_prop *end; size_t capacity; struct var_slot slots[]; };
 
 static uint32_t var_name_hash(const char *name, size_t n) {
     uint32_t hash = 2166136261u;
     for (size_t i = 0; i < n; i++) hash = (hash ^ (unsigned char)name[i]) * 16777619u;
     return hash;
 }
-
-static void var_index_prepare(const struct custom_prop *head) {
-    if (head == var_index_head) return;
-    var_index_clear();
-    var_index_head = head;
-    size_t count = 0, capacity = 1;
-    for (const struct custom_prop *v = head; v; v = v->next) {
-        if (count == SIZE_MAX / 2) return;
-        count++;
+static size_t var_slot_capacity(size_t count) {
+    size_t capacity = 32;
+    while (capacity < count * 2) capacity *= 2;
+    return capacity;
+}
+/* The capacity is at least twice the insertion count, so a free slot exists.
+   The first value stored under a name is kept. */
+static void var_slot_put(struct var_slot *slots, size_t capacity, const char *name, size_t length, void *value) {
+    uint32_t hash = var_name_hash(name, length);
+    for (size_t slot = hash & (capacity - 1);; slot = (slot + 1) & (capacity - 1)) {
+        struct var_slot *s = &slots[slot];
+        if (!s->name) { *s = (struct var_slot){name, length, hash, value}; return; }
+        if (s->hash == hash && s->length == length && !memcmp(s->name, name, length)) return;
     }
-    if (!count) return;
-    while (capacity < count * 2) {
-        if (capacity > SIZE_MAX / 2) return;
-        capacity *= 2;
+}
+static void *var_slot_get(const struct var_slot *slots, size_t capacity, const char *name, size_t length) {
+    uint32_t hash = var_name_hash(name, length);
+    for (size_t slot = hash & (capacity - 1); slots[slot].name; slot = (slot + 1) & (capacity - 1)) {
+        const struct var_slot *s = &slots[slot];
+        if (s->hash == hash && s->length == length && !memcmp(s->name, name, length)) return s->value;
     }
-    if (capacity > SIZE_MAX / sizeof *var_index) return;
-    struct var_index_entry *entries = calloc(capacity, sizeof *entries);
-    if (!entries) return; /* An optional accelerator, not a style/OOM policy. */
-    for (const struct custom_prop *v = head; v; v = v->next) {
-        size_t length = strlen(v->name);
-        uint32_t hash = var_name_hash(v->name, length);
-        size_t slot = hash & (capacity - 1);
-        while (entries[slot].property) {
-            if (entries[slot].hash == hash && entries[slot].length == length &&
-                !memcmp(entries[slot].property->name, v->name, length)) break;
-            slot = (slot + 1) & (capacity - 1);
-        }
-        /* The first property in the immutable inheritance list wins. Values
-           may resolve in place, so retain the property, not a value snapshot. */
-        if (!entries[slot].property)
-            entries[slot] = (struct var_index_entry){v, length, hash};
-    }
-    var_index = entries;
-    var_index_capacity = capacity;
+    return NULL;
 }
 
+/* The chain is one segment per declaring ancestor, nearest first. Indexed
+   segments are immutable once published, so workers share them unlocked. */
 static const struct custom_prop *find_var(const struct custom_prop *v, const char *name, size_t n) {
-    var_index_prepare(v);
-    if (var_index) {
-        uint32_t hash = var_name_hash(name, n);
-        size_t slot = hash & (var_index_capacity - 1);
-        while (var_index[slot].property) {
-            const struct var_index_entry *entry = &var_index[slot];
-            if (entry->hash == hash && entry->length == n &&
-                !memcmp(entry->property->name, name, n)) return entry->property;
-            slot = (slot + 1) & (var_index_capacity - 1);
+    while (v) {
+        if (v->segment) {
+            const struct custom_prop *found = var_slot_get(v->segment->slots, v->segment->capacity, name, n);
+            if (found) return found;
+            v = v->segment->end;
+            continue;
         }
-        return NULL;
-    }
-    for (; v; v = v->next)
         if (strlen(v->name) == n && !memcmp(v->name, name, n)) return v;
+        v = v->next;
+    }
     return NULL;
+}
+const struct custom_prop *css_custom_property(const style_t *s, const char *name) {
+    return s && name ? find_var(s->vars, name, strlen(name)) : NULL;
 }
 
 static bool subst_put(sbuf *b, const char *s, size_t n) {
@@ -3754,16 +3745,19 @@ struct var_walk {
     size_t index, low;
     bool seen, on_stack, self_edge;
 };
+/* This element's declarations as graph vertices; indexed when numerous. */
+struct var_walks { struct var_walk *all; struct var_slot *slots; size_t capacity; };
 
-static struct var_walk *var_lookup(struct var_walk *v, const char *name, size_t n) {
-    for (; v; v = v->next)
+static struct var_walk *var_lookup(const struct var_walks *walks, const char *name, size_t n) {
+    if (walks->slots) return var_slot_get(walks->slots, walks->capacity, name, n);
+    for (struct var_walk *v = walks->all; v; v = v->next)
         if (strlen(v->property->name) == n && !memcmp(v->property->name, name, n)) return v;
     return NULL;
 }
 
 /* Iterate every var() token, including references in an unused fallback.
    Strings and hash/at-keywords are not variable function tokens. */
-static struct var_walk *var_dependency(struct var_walk *f, struct var_walk *all) {
+static struct var_walk *var_dependency(struct var_walk *f, const struct var_walks *all) {
     const char *s = f->s, *e = f->e;
     while (s < e) {
         if (*s == '"' || *s == '\'') {
@@ -3819,10 +3813,17 @@ static void resolve_vars(web_doc *d, arena_t *a, struct custom_prop *mine, const
         for (struct custom_prop *m=mine;m!=inherited;m=m->next) m->value=NULL;
         web_js_console(d,2,"Custom property graph/value allocation failed"); return;
     }
-    struct var_walk *all=NULL;
+    struct var_walk *all=NULL;size_t count=0;
     for (struct custom_prop *m=mine;m!=inherited;m=m->next) {
         struct var_walk *v=ar_alloc(&work->arena,sizeof *v);
-        v->property=m;v->s=m->value?m->value:"";v->e=v->s+strlen(v->s);v->next=all;all=v;
+        v->property=m;v->s=m->value?m->value:"";v->e=v->s+strlen(v->s);v->next=all;all=v;count++;
+    }
+    struct var_walks walks={all,NULL,0};
+    if (count>=VAR_SEGMENT_INDEX_MIN) {
+        walks.capacity=var_slot_capacity(count);
+        walks.slots=ar_alloc(&work->arena,walks.capacity*sizeof *walks.slots);
+        for (struct var_walk *v=all;v;v=v->next)
+            var_slot_put(walks.slots,walks.capacity,v->property->name,strlen(v->property->name),v);
     }
     size_t index=0;
     struct var_walk *components=NULL;
@@ -3835,7 +3836,7 @@ static void resolve_vars(web_doc *d, arena_t *a, struct custom_prop *mine, const
                 f->seen=f->on_stack=true;f->index=f->low=++index;
                 f->component=components;components=f;
             }
-            struct var_walk *dep=var_dependency(f,all);
+            struct var_walk *dep=var_dependency(f,&walks);
             if (dep) {
                 if (dep==f) f->self_edge=true;
                 if (!dep->seen) { dep->parent=f;f=dep;continue; }
@@ -3934,11 +3935,21 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
     const struct custom_prop *inherited = s->vars;
     struct custom_prop *mine = NULL;
     struct custom_rollback {const char *name;struct css_rollback state;struct custom_rollback *next;} *custom_rollbacks=NULL;
+    size_t own = 0;
+    for (int i = 0; i < ndents; i++)
+        if (dents[i].pseudo == pseudo && !dents[i].d->p && !(underlying && dents[i].animation)) own++;
+    struct var_segment *segment = NULL;
+    if (own >= VAR_SEGMENT_INDEX_MIN) {
+        size_t capacity = var_slot_capacity(own);
+        segment = ar_alloc(c->a, sizeof *segment + capacity * sizeof *segment->slots);
+        segment->end = inherited; segment->capacity = capacity;
+    }
     for (int i = 0; i < ndents; i++) {
         const struct decl *x = dents[i].d;
         if (dents[i].pseudo != pseudo || x->p || (underlying && dents[i].animation)) continue;
         bool dup = false;
-        for (struct custom_prop *m = mine; m; m = m->next)
+        if (segment) dup = var_slot_get(segment->slots, segment->capacity, x->name, strlen(x->name)) != NULL;
+        else for (struct custom_prop *m = mine; m; m = m->next)
             if (!strcmp(m->name, x->name)) dup = true;
         if (dup) continue;
         struct custom_rollback *rolled=custom_rollbacks;
@@ -3957,11 +3968,13 @@ static style_t *compute(struct cascade *c, node_t *e, const style_t *parent, uin
         cp->value = ar_strdup(c->a, x->value);
         cp->next = mine;
         mine = cp;
+        if (segment) var_slot_put(segment->slots, segment->capacity, cp->name, strlen(cp->name), cp);
     }
     if (mine) {
         struct custom_prop *last = mine;
         while (last->next) last = last->next;
         last->next = (struct custom_prop *)inherited;
+        mine->segment = segment;
         s->vars = mine;
         resolve_vars(d,c->a,mine,inherited);
     }
@@ -4222,22 +4235,34 @@ static bool relational_bucket_candidate(const struct ient *list, node_t *node) {
     for (; list; list = list->next) if (relational_candidate(list->sel->right, node)) return true;
     return false;
 }
+static bool index_subject_candidate(struct css_index *index,node_t *node) {
+    if (!index) return false;
+    if (node->id) {
+        struct ient **list = ht_slot(NULL, &index->ids, node->id, false);
+        if (list && relational_bucket_candidate(*list, node)) return true;
+    }
+    for (int i = 0; i < node->nclasses; i++) {
+        struct ient **list = ht_slot(NULL, &index->classes, node->classes[i], false);
+        if (list && relational_bucket_candidate(*list, node)) return true;
+    }
+    struct ient **list = ht_slot(NULL, &index->tags, node->name, false);
+    return (list && relational_bucket_candidate(*list, node)) || relational_bucket_candidate(index->univ, node);
+}
+/* enum sibling_reach bits for which this element is a positional subject. */
+static unsigned sibling_bindings_reach(node_t *node,struct css_binding *bindings,unsigned wanted) {
+    unsigned reach = 0;
+    for (struct css_binding *binding = bindings; binding && (reach & wanted) != wanted; binding = binding->next)
+        for (unsigned k = 0; k < 4; k++)
+            if ((wanted & ~reach & 1u << k) && index_subject_candidate(binding->index->child_list_siblings[k], node))
+                reach |= 1u << k;
+    return reach;
+}
 static bool subject_bindings_candidate(node_t *node,struct css_binding *bindings,enum subject_dependency dependency) {
+    if (dependency == SUBJECT_CHILD_SIBLING) return sibling_bindings_reach(node, bindings, 15) != 0;
     for (struct css_binding *binding = bindings; binding; binding = binding->next) {
         struct css_index *index = dependency==SUBJECT_CHILD_OUTER?binding->index->child_list_subjects:
-            dependency==SUBJECT_CHILD_PARENT?binding->index->child_list_parents:
-            dependency==SUBJECT_CHILD_SIBLING?binding->index->child_list_siblings:binding->index->relational;
-        if (!index) continue;
-        if (node->id) {
-            struct ient **list = ht_slot(NULL, &index->ids, node->id, false);
-            if (list && relational_bucket_candidate(*list, node)) return true;
-        }
-        for (int i = 0; i < node->nclasses; i++) {
-            struct ient **list = ht_slot(NULL, &index->classes, node->classes[i], false);
-            if (list && relational_bucket_candidate(*list, node)) return true;
-        }
-        struct ient **list = ht_slot(NULL, &index->tags, node->name, false);
-        if ((list && relational_bucket_candidate(*list, node)) || relational_bucket_candidate(index->univ, node)) return true;
+            dependency==SUBJECT_CHILD_PARENT?binding->index->child_list_parents:binding->index->relational;
+        if (index_subject_candidate(index, node)) return true;
     }
     return false;
 }
@@ -4279,7 +4304,7 @@ static bool child_list_contains(node_t *subtree,node_t *node) {
     for(;node;node=node->parent?node->parent:node->shadow_host)if(node==subtree)return true;
     return false;
 }
-void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree) {
+void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree,bool inserted) {
     if(!d)return;
     node_t *root=parent?doc_node_root(parent,false):NULL;
     /* Child-list callers already name the sibling set's parent. Promoting it
@@ -4320,10 +4345,36 @@ void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree) {
     d->style_pending_dirty=true;
     for(node_t *p=parent;p;p=dirty_flat_parent(p))p->style_children_dirty=true;
     if(subtree->parent==parent && subtree->type==N_ELEM)mark_style_subject(d,subtree);
-    for(node_t *child=parent->first;child;child=child->next)if(child->type==N_ELEM &&
-        (subject_bindings_candidate(child,scope?scope->first:NULL,SUBJECT_CHILD_SIBLING) ||
-         subject_bindings_candidate(child,d->sty.ctx->ua,SUBJECT_CHILD_SIBLING)))
-        mark_style_subject(d,child);
+    struct css_binding *authored=scope?scope->first:NULL,*ua=d->sty.ctx->ua;
+    if(!inserted || subtree->parent!=parent) {
+        /* Removal and reordering lost the former position: any positional
+           subject among the remaining children may have changed. */
+        for(node_t *child=parent->first;child;child=child->next)if(child->type==N_ELEM &&
+            (sibling_bindings_reach(child,authored,15) || sibling_bindings_reach(child,ua,15)))
+            mark_style_subject(d,child);
+        return;
+    }
+    /* Positional pseudo-classes and sibling combinators count elements only. */
+    if(subtree->type!=N_ELEM)return;
+    /* An insertion changes only the element counts on each side of it. An
+       append must not restyle every earlier sibling (list growth would be
+       quadratic): :first-child/+ reach only the nearest following element,
+       :last-child the nearest preceding one, nth/~ the whole side. */
+    node_t *next=next_elem(subtree),*prev=prev_elem(subtree),*next_type=next,*prev_type=prev;
+    while(next_type && strcmp(next_type->name,subtree->name))next_type=next_elem(next_type);
+    while(prev_type && strcmp(prev_type->name,subtree->name))prev_type=prev_elem(prev_type);
+    for(node_t *child=next;child;child=next_elem(child)) {
+        bool near=child==next || child==next_type;
+        unsigned wanted=near?SIBLING_NEXT|SIBLING_FOLLOWING:SIBLING_FOLLOWING;
+        if(sibling_bindings_reach(child,authored,wanted) || sibling_bindings_reach(child,ua,wanted))
+            mark_style_subject(d,child);
+    }
+    for(node_t *child=prev;child;child=prev_elem(child)) {
+        bool near=child==prev || child==prev_type;
+        unsigned wanted=near?SIBLING_PREVIOUS|SIBLING_PRECEDING:SIBLING_PRECEDING;
+        if(sibling_bindings_reach(child,authored,wanted) || sibling_bindings_reach(child,ua,wanted))
+            mark_style_subject(d,child);
+    }
 }
 
 static bool equal_string(const char *a,const char *b) { return a==b || (a && b && !strcmp(a,b)); }
@@ -4482,7 +4533,7 @@ static void cascade_worker(size_t i, void *context) {
         if (!setbits) __atomic_store_n(&c.d->native_cancelled, true, __ATOMIC_RELEASE);
         else cascade_node(&c, e, job->parent);
     }
-    var_index_clear(); free(dents); free(setbits); sb_free(&c.vbuf);
+    free(dents); free(setbits); sb_free(&c.vbuf);
     thread_local_set(2, previous);
 }
 static void cascade_service(void *context) {
@@ -4716,7 +4767,6 @@ void css_cascade(web_doc *d, int vw, int vh) {
     }
     /* Keys borrow computed-style names. Never carry a previous document or
        style-arena generation into this cascade; release on normal exit too. */
-    var_index_clear();
     font_bindings_clear();font_faces_available=false;
     for(int i=0;i<d->sty.sheets.n;i++)if(((sheet_t *)d->sty.sheets.v[i])->fonts){font_faces_available=true;break;}
     for(struct web_font_resource *f=d->fonts;f;f=f->next)f->wanted=false;
@@ -4754,7 +4804,6 @@ void css_cascade(web_doc *d, int vw, int vh) {
         if (full) cascade_frontier_run(&c, d->html);
         else cascade_node(&c, d->html, NULL);
     }
-    var_index_clear();
     font_bindings_clear();
     sb_free(&c.vbuf);
     d->styled_w = vw;

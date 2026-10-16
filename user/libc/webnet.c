@@ -1034,6 +1034,16 @@ static void pump_parked(webnet *n,uint64_t now,struct pump_budget *budget){
     if(last&&last->next){struct slot *rest=last->next,*tail=rest;while(tail->next)tail=tail->next;
         tail->next=n->parked;last->next=NULL;n->parked=rest;}
 }
+/* Give a free slot the next queued request it may take; without a budget the
+   pump slice does not limit admission. */
+static void admit(webnet *n,struct slot *s,unsigned i,uint64_t now,struct pump_budget *budget){
+    if(s->rq||i>=n->worker_limit||!n->queue||(budget&&!pump_room(budget)))return;
+    struct request *r=take_request(n,i);if(!r)return;
+    r->started_at=now;
+    if(n->debug)fprintf(stderr,"[webnet] dispatch id=%lu class=%d queued=%lu ms budget=%u\n",
+        (unsigned long)r->id,r->priority,(unsigned long)(now>=r->queued_at?now-r->queued_at:0),n->worker_limit);
+    start(n,s,r);
+}
 static void pump(webnet *n,uint64_t now,bool callbacks){
     if(!n||n->pumping)return;
     n->pumping=true;
@@ -1050,12 +1060,7 @@ static void pump(webnet *n,uint64_t now,bool callbacks){
     for(unsigned step=0;step<WORKERS;step++){
         unsigned i=(first+step)%WORKERS;
         struct slot *s=&n->slots[i];
-        if(!s->rq&&(unsigned)i<n->worker_limit&&pump_room(&budget)){struct request *r=take_request(n,(unsigned)i);if(r){
-            r->started_at=now;
-            if(n->debug)fprintf(stderr,"[webnet] dispatch id=%lu class=%d queued=%lu ms budget=%u\n",
-                (unsigned long)r->id,r->priority,(unsigned long)(now>=r->queued_at?now-r->queued_at:0),n->worker_limit);
-            start(n,s,r);
-        }}
+        admit(n,s,i,now,&budget);
         if(pump_room(&budget))n->pump_cursor=(i+1)%WORKERS;
         pump_slot(n,s,now,&budget);
         if(s->rq&&s->rq->paused&&!s->rq->finishing){
@@ -1063,8 +1068,16 @@ static void pump(webnet *n,uint64_t now,bool callbacks){
             if(!held){slot_stop(s,"Out of memory retaining stream transport");continue;}
             *held=*s;held->next=n->parked;n->parked=held;*s=(struct slot){.channel=-1};
         }
+        /* A slot this pump completed or parked takes queued work now: a
+           queued request is not a wake source while other transports live,
+           so leaving it for the next pump could leave it waiting on an
+           unrelated event. */
+        admit(n,s,i,now,&budget);
     }
     if(!parked_first)pump_parked(n,now,&budget);
+    /* A retained stream that finished above may have freed its origin's
+       share of the concurrency the queue was waiting for. */
+    for(unsigned i=0;i<WORKERS&&n->queue;i++)admit(n,&n->slots[i],i,now,NULL);
     sockets_pump(n,callbacks);
     n->pumping=false;
 }

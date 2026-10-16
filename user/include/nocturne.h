@@ -191,11 +191,14 @@ void *thread_local_get(unsigned slot);
 void thread_local_set(unsigned slot, void *value);
 /* Actual reserved stack interval of the calling native task. */
 int thread_stack_bounds(uintptr_t *low, uintptr_t *high);
-/* timeout_ms == UINT32_MAX waits indefinitely; count == 0 wakes all. */
-int wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms);
+/* timeout_ms == UINT32_MAX waits indefinitely; count == 0 wakes all.
+ * The wait returns 0 when woken, -N_ERR_NOT_READY when *address no longer
+ * holds expected, -N_ERR_TIMEOUT or -N_ERR_STOPPED; wake returns how many
+ * waiters it woke.  errno is left alone. */
+n_result wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms);
 /* The 8-byte form; wake_address on the same address wakes it. */
-int wait_on_address64(volatile uint64_t *address, uint64_t expected, unsigned timeout_ms);
-int wake_address(volatile uint32_t *address, unsigned count);
+n_result wait_on_address64(volatile uint64_t *address, uint64_t expected, unsigned timeout_ms);
+n_result wake_address(volatile uint32_t *address, unsigned count);
 void yield(void);
 int poweroff(void);
 int reboot(void);

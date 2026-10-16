@@ -2100,12 +2100,8 @@ static JSValue computed(struct web_js_state *s, node_t *n, const char *property,
     style_t *st = computed_pseudo_style(n,pseudo,&fallback); char out[128]; out[0] = 0;
     if (!st) return JS_NewString(ctx, "");
     if(property[0]=='-'&&property[1]=='-') {
-        unsigned work=0;
-        for(const struct custom_prop *p=st->vars;p;p=p->next) {
-            if(!(work++&63)&&!web_native_checkpoint(d))return JS_ThrowInternalError(ctx,"Computed custom property interrupted");
-            if(!strcmp(p->name,property))return JS_NewString(ctx,p->value?p->value:"");
-        }
-        return JS_NewString(ctx,"");
+        const struct custom_prop *p=css_custom_property(st,property);
+        return JS_NewString(ctx,p&&p->value?p->value:"");
     }
     static const char *const radius_names[]={"border-top-left-radius","border-top-right-radius","border-bottom-right-radius","border-bottom-left-radius"};
     int radius_corner=-2;if(!strcmp(property,"border-radius"))radius_corner=-1;
@@ -7533,6 +7529,12 @@ static bool run_idle_timeout(struct web_js_state *s, uint64_t now) {
     s->idle_period_stopped = true;
     return invoke_idle(s, id, now, true);
 }
+/* An animation-frame callback is registered with due=now but runs only at
+   the next rendering opportunity; a continuously re-armed rAF loop (any
+   playing video UI) is not an always-overdue task that forbids idle periods. */
+static uint64_t timer_task_due(const struct web_js_state *s, const struct js_timer *t) {
+    return t->kind == 2 && t->due < s->rendering_due ? s->rendering_due : t->due;
+}
 static bool idle_eligible(struct web_js_state *s, uint64_t now) {
     web_doc *d = s->doc, *family = d->dom_family ? d->dom_family : d;
     struct js_script *script;
@@ -7544,19 +7546,20 @@ static bool idle_eligible(struct web_js_state *s, uint64_t now) {
     int64_t atomics = web_atomics_deadline(s->ctx, now);
     if (atomics >= 0 && (uint64_t)atomics <= now) return false;
     for (struct js_pending *p = s->pending; p; p = p->next) if (p->done || p->deadline <= now) return false;
-    for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && s->timers[i].due <= now) return false;
+    for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && timer_task_due(s, &s->timers[i]) <= now) return false;
     for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) return false;
     return true;
 }
 static uint64_t idle_period_deadline(struct web_js_state *s, uint64_t now) {
     uint64_t end = now + JS_IDLE_PERIOD_MS;
-    /* Animation/observer/media and already scheduled resource/timer wakeups
-       shorten a quiet 50ms period to their actual native frame/task budget. */
-    for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && s->timers[i].due < end) end = s->timers[i].due;
+    /* Animation/observer and already scheduled resource/timer wakeups shorten
+       a quiet 50ms period to their actual task budget. Media supply is not a
+       task: PCM refill and frame presentation run at the native safepoints of
+       any author callback (interrupt/layout flush), so its 1ms polling wakeups
+       must not shrink every idle period of a playing page to nothing. */
+    for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && timer_task_due(s, &s->timers[i]) < end) end = timer_task_due(s, &s->timers[i]);
     for (struct js_pending *p = s->pending; p; p = p->next) if (p->deadline < end) end = p->deadline;
     if (observers_dirty(s) && s->observer_due < end) end = s->observer_due;
-    int64_t media = web_avmedia_deadline(s->doc, now);
-    if (media >= 0 && (uint64_t)media < end) end = (uint64_t)media;
     int64_t worker = web_worker_deadline(s->workers,now);
     if (worker >= 0 && (uint64_t)worker < end) end = (uint64_t)worker;
     int64_t atomics = web_atomics_deadline(s->ctx, now);
@@ -7841,8 +7844,7 @@ int64_t web_js_deadline(web_doc *d) {
         }
         struct js_script *ready; if (ready_script(s, &ready)) return (int64_t)now;
         for (unsigned i = 0; i < s->timer_capacity; i++)if(s->timers[i].id){
-            uint64_t due=s->timers[i].due;
-            if(s->timers[i].kind==2 && due<s->rendering_due)due=s->rendering_due;
+            uint64_t due=timer_task_due(s,&s->timers[i]);
             if(due<deadline)deadline=due;
         }
         for (struct js_script *p = s->scripts; p; p = p->next) if (p->module && p->parser_released && !p->notified) return (int64_t)now;

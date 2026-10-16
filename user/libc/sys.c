@@ -257,15 +257,6 @@ void thread_local_set(unsigned slot, void *value) {
     struct libc_thread *t = libc_thread_current();
     if (t && slot < N_TLS_SLOTS) t->slots[slot] = value;
 }
-int wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms) {
-    return (int)ret(SC3(SYS_WAIT_ADDRESS, address, expected, timeout_ms));
-}
-int wait_on_address64(volatile uint64_t *address, uint64_t expected, unsigned timeout_ms) {
-    return (int)ret(SC3(SYS_WAIT_ADDRESS64, address, expected, timeout_ms));
-}
-int wake_address(volatile uint32_t *address, unsigned count) {
-    return (int)ret(SC2(SYS_WAKE_ADDRESS, address, count));
-}
 time_t time(time_t *t) {
     time_t v = n_clock_wall();
     if (t) *t = v;
@@ -288,6 +279,15 @@ int n_address_unwatch(int queue,uint64_t token) { return (int)ret(SC2(SYS_ADDRES
 
 /* ---- native ABI: results come back as they are, errno is left alone ---- */
 #define NC5(n, a, b, c, d, e) __syscall(n, (long)(a), (long)(b), (long)(c), (long)(d), (long)(e))
+n_result wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms) {
+    return NC5(SYS_WAIT_ADDRESS, address, expected, timeout_ms, 0, 0);
+}
+n_result wait_on_address64(volatile uint64_t *address, uint64_t expected, unsigned timeout_ms) {
+    return NC5(SYS_WAIT_ADDRESS64, address, expected, timeout_ms, 0, 0);
+}
+n_result wake_address(volatile uint32_t *address, unsigned count) {
+    return NC5(SYS_WAKE_ADDRESS, address, count, 0, 0, 0);
+}
 const char *n_result_text(n_result r) { return strerror((int)(r < 0 ? -r : r)); }
 n_result n_handle_close(n_handle h) { return NC5(SYS_HANDLE_CLOSE, h, 0, 0, 0, 0); }
 n_result n_handle_kind(n_handle h) { return NC5(SYS_HANDLE_KIND, h, 0, 0, 0, 0); }

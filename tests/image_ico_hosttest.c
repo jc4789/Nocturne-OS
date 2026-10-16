@@ -6,6 +6,7 @@
 #include <string.h>
 #include "image.h"
 #include "parallel.h"
+#include "nocturne.h"
 void parallel_record_work(enum parallel_stage stage, uint64_t units) { (void)stage; (void)units; }
 bool parallel_for_stage(enum parallel_stage stage, size_t count, parallel_fn fn, void *context,
                         parallel_service_fn service, void *service_context) {
@@ -17,10 +18,10 @@ bool parallel_call_stage(enum parallel_stage stage, parallel_fn fn, void *contex
                          parallel_service_fn service, void *service_context) {
     return parallel_for_stage(stage, 1, fn, context, service, service_context);
 }
-int wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout) {
+n_result wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout) {
     (void)address; (void)expected; (void)timeout; abort();
 }
-int wake_address(volatile uint32_t *address, unsigned count) { (void)address; (void)count; return 0; }
+n_result wake_address(volatile uint32_t *address, unsigned count) { (void)address; (void)count; return 0; }
 static int failures, checks;
 static void check(bool ok, const char *name) {
     checks++; if (!ok) { failures++; printf("FAIL %s\n", name); }

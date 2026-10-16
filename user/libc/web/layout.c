@@ -441,7 +441,44 @@ void box_abs_cb_rect(const box_t *cb, const web_doc *d, float rect[4]) {
         rect[2] = cb->w + cb->p[1] + cb->p[3]; rect[3] = cb->h + cb->p[0] + cb->p[2];
     }
 }
+/* Nonzero only inside a paint. Paint visits every box several times and each
+   visual coordinate walks its containing-block and parent chains, so a deep
+   tree repainted every frame paid O(boxes x depth) repeatedly. Parallel
+   raster workers may memoize concurrently; they store identical values and
+   publish the generation after the value. */
+static uint32_t visual_memo_generation, visual_memo_counter;
+uint32_t box_visual_memo_begin(void) {
+    uint32_t previous = visual_memo_generation;
+    if (++visual_memo_counter == 0) ++visual_memo_counter;
+    __atomic_store_n(&visual_memo_generation, visual_memo_counter, __ATOMIC_RELEASE);
+    return previous;
+}
+void box_visual_memo_end(uint32_t previous) {
+    __atomic_store_n(&visual_memo_generation, previous, __ATOMIC_RELEASE);
+}
+static float box_visual_x_compute(const box_t *b);
+static float box_visual_y_compute(const box_t *b);
 float box_visual_x(const box_t *b) {
+    uint32_t generation = __atomic_load_n(&visual_memo_generation, __ATOMIC_ACQUIRE);
+    if (!generation) return box_visual_x_compute(b);
+    box_t *memo = (box_t *)b;
+    if (__atomic_load_n(&memo->visual_memo_x, __ATOMIC_ACQUIRE) == generation) return memo->visual_x;
+    float x = box_visual_x_compute(b);
+    memo->visual_x = x;
+    __atomic_store_n(&memo->visual_memo_x, generation, __ATOMIC_RELEASE);
+    return x;
+}
+float box_visual_y(const box_t *b) {
+    uint32_t generation = __atomic_load_n(&visual_memo_generation, __ATOMIC_ACQUIRE);
+    if (!generation) return box_visual_y_compute(b);
+    box_t *memo = (box_t *)b;
+    if (__atomic_load_n(&memo->visual_memo_y, __ATOMIC_ACQUIRE) == generation) return memo->visual_y;
+    float y = box_visual_y_compute(b);
+    memo->visual_y = y;
+    __atomic_store_n(&memo->visual_memo_y, generation, __ATOMIC_RELEASE);
+    return y;
+}
+static float box_visual_x_compute(const box_t *b) {
     double x = box_abs_x(b);
     for(const box_t *a=b;a;a=a->parent){x+=box_translation_axis(a,0,CSS_TRANSLATE_INDIVIDUAL|CSS_TRANSLATE_TRANSFORM);if(box_viewport_fixed(a))break;}
     if(b->node && b->node->owner && b->node->owner->marquees.n)
@@ -462,7 +499,7 @@ float box_visual_x(const box_t *b) {
     return (float)x;
 }
 
-float box_visual_y(const box_t *b) {
+static float box_visual_y_compute(const box_t *b) {
     double y = box_abs_y(b);
     for(const box_t *a=b;a;a=a->parent){y+=box_translation_axis(a,1,CSS_TRANSLATE_INDIVIDUAL|CSS_TRANSLATE_TRANSFORM);if(box_viewport_fixed(a))break;}
     if(b->node && b->node->owner && b->node->owner->marquees.n)

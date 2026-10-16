@@ -9,8 +9,8 @@
 #include FT_FREETYPE_H
 #include FT_TRUETYPE_TABLES_H
 #include "../user/libc/font_sfnt.h"
-int wait_on_address(volatile uint32_t *p,uint32_t value,unsigned timeout) {(void)p;(void)value;(void)timeout;return 0;}
-int wake_address(volatile uint32_t *p,unsigned count) {(void)p;(void)count;return 0;}
+n_result wait_on_address(volatile uint32_t *p,uint32_t value,unsigned timeout) {(void)p;(void)value;(void)timeout;return 0;}
+n_result wake_address(volatile uint32_t *p,unsigned count) {(void)p;(void)count;return 0;}
 int gfx_utf8_decode(const char *p,uint32_t *cp) {*cp=(unsigned char)*p;return 1;}
 void gfx_fill(canvas_t *c,int x,int y,int w,int h,uint32_t color) {
     for(int j=y;j<y+h;j++)for(int i=x;i<x+w;i++)

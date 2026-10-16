@@ -226,6 +226,8 @@ n_handle web_wait_queue(void);
 void web_wait_events(const struct n_event *events, size_t count);
 /* Debug summary of the realm waits behind web_wait_queue; 0 when none. */
 int web_wait_report(char *out, size_t size);
+/* Debug summary of web_paint time since the previous report; 0 when none. */
+int web_paint_report(char *out, size_t size);
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *response);
 bool web_dirty(web_doc *d); /* consumes the legacy layout/paint notification */
 bool web_paint_dirty(web_doc *d); /* consumes a paint-only media notification */

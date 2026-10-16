@@ -16,6 +16,11 @@ struct parallel_worker {
     int tid;
     unsigned index;
     volatile uint32_t epoch, done;
+    /* epoch*2 offered, epoch*2+1 taken by the helper, 0 withdrawn by the
+     * caller. A helper that has not woken by the time every job is claimed
+     * is withdrawn instead of joined: its wake goes through the scheduler and
+     * may wait out a busy CPU's quantum, which a short stage must not pay. */
+    volatile uint64_t gate;
     struct parallel_work *work;
     uint64_t items, units, elapsed_ms, cpu_mask;
 };
@@ -51,13 +56,18 @@ unsigned parallel_worker_index(void) {
 }
 uint64_t parallel_jobs(void) { return __atomic_load_n(&jobs, __ATOMIC_RELAXED); }
 
+/* 0 free, 1 held, 2 held with a possible sleeper: an uncontended stage costs
+ * no wake system call. */
 static void pool_acquire(void) {
-    while (__atomic_exchange_n(&pool_lock, 1, __ATOMIC_ACQUIRE))
-        wait_on_address(&pool_lock, 1, 10);
+    uint32_t expected = 0;
+    if (__atomic_compare_exchange_n(&pool_lock, &expected, 1, false,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    while (__atomic_exchange_n(&pool_lock, 2, __ATOMIC_ACQUIRE))
+        wait_on_address(&pool_lock, 2, 10);
 }
 static void pool_release(void) {
-    __atomic_store_n(&pool_lock, 0, __ATOMIC_RELEASE);
-    wake_address(&pool_lock, 1);
+    if (__atomic_exchange_n(&pool_lock, 0, __ATOMIC_RELEASE) == 2)
+        wake_address(&pool_lock, 1);
 }
 /* One claim per independent job avoids equal-count partitions when subtree
  * sizes differ. The bounded CAS cannot wrap even for SIZE_MAX jobs. */
@@ -110,8 +120,11 @@ static void worker_main(void *context) {
         uint32_t now = __atomic_load_n(&w->epoch, __ATOMIC_ACQUIRE);
         if (__atomic_load_n(&stopping, __ATOMIC_ACQUIRE)) break;
         if (now == seen) { wait_on_address(&w->epoch, seen, UINT_MAX); continue; }
-        run_jobs(w, NULL, NULL);
         seen = now;
+        uint64_t offered = (uint64_t)now * 2;
+        if (!__atomic_compare_exchange_n(&w->gate, &offered, offered + 1, false,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) continue;
+        run_jobs(w, NULL, NULL);
         __atomic_store_n(&w->done, now, __ATOMIC_RELEASE);
         wake_address(&w->done, 1);
     }
@@ -166,6 +179,8 @@ static bool dispatch(enum parallel_stage stage, size_t count, parallel_fn fn, vo
         for (unsigned i = 0; i < helpers; i++) {
             struct parallel_worker *w = &workers[i];
             w->work = &work;
+            w->items = w->units = w->elapsed_ms = w->cpu_mask = 0;
+            __atomic_store_n(&w->gate, (uint64_t)epoch * 2, __ATOMIC_RELEASE);
             __atomic_store_n(&w->epoch, epoch, __ATOMIC_RELEASE);
             wake_address(&w->epoch, 1);
         }
@@ -175,6 +190,11 @@ static bool dispatch(enum parallel_stage stage, size_t count, parallel_fn fn, vo
     if (!offload || !helpers) run_jobs(&caller, service, service_context);
     for (unsigned i = 0; i < helpers; i++) {
         struct parallel_worker *w = &workers[i];
+        /* Every job is claimed once the caller's run_jobs returns. An offload
+         * job is the helper's alone and is always joined. */
+        uint64_t offered = (uint64_t)epoch * 2;
+        if (!offload && __atomic_compare_exchange_n(&w->gate, &offered, 0, false,
+                                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
         while (__atomic_load_n(&w->done, __ATOMIC_ACQUIRE) != epoch) {
             uint32_t value = __atomic_load_n(&w->done, __ATOMIC_RELAXED);
             if (value == epoch) break;

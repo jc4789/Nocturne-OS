@@ -20,7 +20,6 @@
 #define MIN_BLK  32
 #define GROW_MIN (256 * 1024)
 #define GROW_MAX (8 * 1024 * 1024)
-#define TRIM_KEEP GROW_MIN
 #define TRIM_MIN  GROW_MIN
 #define PAGE     4096u
 
@@ -56,6 +55,18 @@ static void heap_lock(void) {
     uint32_t expected = 0;
     if (__atomic_compare_exchange_n(&allocator_lock, &expected, 1, false,
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    /* Critical sections are a few hundred instructions, while a wait and its
+       wake are system calls the BSP services for every CPU. Spin briefly
+       first, or parallel workers allocating at once serialize on the BSP. A
+       sleeper re-marks the lock contended when it wakes, so taking it
+       uncontended here never loses that sleeper's wake. */
+    for (unsigned spin = 0; spin < 256; spin++) {
+        __asm__ volatile("pause");
+        expected = 0;
+        if (!__atomic_load_n(&allocator_lock, __ATOMIC_RELAXED) &&
+            __atomic_compare_exchange_n(&allocator_lock, &expected, 1, false,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    }
     while (__atomic_exchange_n(&allocator_lock, 2, __ATOMIC_ACQUIRE)) {
 #ifndef MALLOCTRIM_MODEL
         wait_on_address(&allocator_lock, 2, UINT32_MAX);
@@ -148,6 +159,14 @@ static blk *coalesce(blk *b) {
 
 static bool is_end(blk *b) { return b->size == USED; }
 
+/* The size grow() reserves next: regions grow with the heap. */
+static size_t grow_step(void) {
+    size_t step = heap_total / 16;
+    if (step < GROW_MIN) step = GROW_MIN;
+    if (step > GROW_MAX) step = GROW_MAX;
+    return step;
+}
+
 /* Give pages back after free block b, which is not on a free list yet.
    Returns true when b's whole region went back (b is gone). Interior and
    small frees make no system call; a live block after b is never touched. */
@@ -166,9 +185,11 @@ static bool trim(blk *b) {
         errno = saved_errno;
         return false;
     }
-    /* Keep one growth quantum warm in the newest region; elsewhere keep only
-       what the block's own tags need. */
-    size_t keep = end == newest_end ? TRIM_KEEP : MIN_BLK;
+    /* Keep one growth quantum warm in the newest region: the one grow() would
+       reserve next, so freeing and reallocating a block of up to that size never
+       releases and re-reserves the region's tail. Elsewhere keep only what the
+       block's own tags need. */
+    size_t keep = end == newest_end ? grow_step() : MIN_BLK;
     if (size < keep + TRIM_MIN) return false;
     uintptr_t kept_end = ((uintptr_t)b + keep + HDR + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
     uintptr_t old_end = (uintptr_t)end + HDR;
@@ -191,9 +212,7 @@ static bool trim(blk *b) {
    large heap is not split into thousands of small ones; pages are committed
    when reserved, so the growth stays a small part of what is in use. */
 static int grow(size_t need) {
-    size_t step = heap_total / 16;
-    if (step < GROW_MIN) step = GROW_MIN;
-    if (step > GROW_MAX) step = GROW_MAX;
+    size_t step = grow_step();
     size_t n = need + HDR > step ? need + HDR : step;
     n = (n + PAGE - 1) & ~(size_t)(PAGE - 1);
     blk *b = n_memory_reserve(n, N_MEMORY_READ_WRITE);

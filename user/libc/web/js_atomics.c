@@ -2,11 +2,9 @@
  * settlement for the QuickJS realms of one process. */
 #include "js_atomics.h"
 #include "nocturne.h"
-#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/mman.h>
 
 /* One mapping of a shared-page object. Every SharedArrayBuffer object over it
    holds a reference; the last one unmaps it and closes the descriptor. */
@@ -34,15 +32,15 @@ static struct shared_region *region_find(const void *data) {
 static void region_unlink(struct shared_region *region) {
     for (struct shared_region **link = &regions; *link; link = &(*link)->next)
         if (*link == region) { *link = region->next; break; }
-    munmap(region->data, region->bytes);
-    close(region->fd);
+    n_memory_release(region->data, region->bytes);
+    n_handle_close(region->fd);
     free(region);
 }
 static struct shared_region *region_map(int fd, size_t bytes, int prot) {
     struct shared_region *region = calloc(1, sizeof *region);
-    if (!region) { close(fd); return NULL; }
+    if (!region) { n_handle_close(fd); return NULL; }
     region->data = n_shared_map(0, fd, bytes, prot);
-    if (!region->data) { close(fd); free(region); return NULL; }
+    if (!region->data) { n_handle_close(fd); free(region); return NULL; }
     region->bytes = bytes; region->fd = fd;
     region->next = regions; regions = region;
     return region;
@@ -96,7 +94,7 @@ static JSValue region_export(JSContext *ctx, struct shared_region *region, size_
     if (ticket < 0) return JS_ThrowRangeError(ctx, "Shared memory could not be offered to the receiving agent");
     JSValue record = JS_NewArray(ctx);
     if (JS_IsException(record)) return record;
-    JS_SetPropertyUint32(ctx, record, 0, JS_NewInt32(ctx, getpid()));
+    JS_SetPropertyUint32(ctx, record, 0, JS_NewInt32(ctx, (int32_t)n_app_self()));
     JS_SetPropertyUint32(ctx, record, 1, JS_NewFloat64(ctx, (double)ticket));
     JS_SetPropertyUint32(ctx, record, 2, JS_NewFloat64(ctx, (double)region->bytes));
     JS_SetPropertyUint32(ctx, record, 3, JS_NewFloat64(ctx, (double)offset));
@@ -233,28 +231,28 @@ int web_atomics_memory_wait(void *address, uint64_t expected, bool wide, int64_t
     uint64_t deadline = 0;
     if (timeout_ns >= 0) {
         uint64_t ms = (uint64_t)timeout_ns / 1000000u + ((uint64_t)timeout_ns % 1000000u != 0);
-        uint64_t now = uptime_ms();
+        uint64_t now = n_clock_uptime_ms();
         deadline = ms > UINT64_MAX - now ? UINT64_MAX : now + ms;
     }
     for (;;) {
         unsigned slice = UINT32_MAX;
         if (timeout_ns >= 0) {
-            uint64_t now = uptime_ms();
+            uint64_t now = n_clock_uptime_ms();
             uint64_t left = deadline > now ? deadline - now : 0;
             slice = left >= UINT32_MAX ? UINT32_MAX - 1 : (unsigned)left;
         }
-        int r = wide ? wait_on_address64(address, expected, slice)
-                     : wait_on_address(address, (uint32_t)expected, slice);
+        n_result r = wide ? wait_on_address64(address, expected, slice)
+                          : wait_on_address(address, (uint32_t)expected, slice);
         if (r == 0) return 0;
-        if (errno == EAGAIN) return 1;
-        if (errno != ETIMEDOUT) return 2; /* killed: the agent is terminating */
-        if (timeout_ns >= 0 && uptime_ms() >= deadline) return 2;
+        if (r == -N_ERR_NOT_READY) return 1;
+        if (r != -N_ERR_TIMEOUT) return 2; /* killed: the agent is terminating */
+        if (timeout_ns >= 0 && n_clock_uptime_ms() >= deadline) return 2;
     }
 }
 uint32_t web_atomics_memory_notify(void *address, uint32_t count) {
     /* The kernel reads a zero count as "every waiter". */
     if (!count) return 0;
-    int woken = wake_address(address, count == UINT32_MAX ? 0 : count);
+    n_result woken = wake_address(address, count == UINT32_MAX ? 0 : count);
     return woken > 0 ? (uint32_t)woken : 0;
 }
 
@@ -312,7 +310,7 @@ static int wait_async(JSContext *ctx, void *opaque, void *address, uint32_t expe
         JS_ThrowRangeError(ctx, "Atomics.waitAsync waiter could not be enrolled");
         return -1;
     }
-    uint64_t now = uptime_ms();
+    uint64_t now = n_clock_uptime_ms();
     w->deadline = isfinite(timeout_ms) && timeout_ms < (double)(UINT64_MAX - now) ?
         now + (uint64_t)ceil(timeout_ms) : UINT64_MAX;
     w->ctx = ctx;

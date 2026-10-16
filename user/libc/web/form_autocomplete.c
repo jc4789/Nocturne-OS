@@ -2,8 +2,6 @@
    page has no history API and receives a past value only after the user chooses
    it. This is not a password manager or personal/contact/payment autofill. */
 #include <stdio.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <nocturne.h>
 #include <bearssl_hash.h>
 #include "form_autocomplete.h"
@@ -136,47 +134,26 @@ static void history_hash(const void *bytes, size_t n, uint8_t digest[32]) {
 static uint32_t get32(const uint8_t *p) { return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
 static void put32(uint8_t *p, uint32_t value) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(value >> (8 * i)); }
 static void history_path(int slot, char path[96]) { snprintf(path, 96, HISTORY_ROOT "/search-history.%d", slot); }
-static bool read_all(int fd, uint8_t *bytes, size_t n) {
-    size_t done = 0;
-    while (done < n) {
-        ssize_t count = read(fd, bytes + done, n - done);
-        if (count < 0 && errno == EINTR) continue;
-        if (count <= 0 || (size_t)count > n - done) return false;
-        done += (size_t)count;
-    }
-    return true;
-}
-static bool write_all(int fd, const uint8_t *bytes, size_t n) {
-    size_t done = 0;
-    while (done < n) {
-        ssize_t count = write(fd, bytes + done, n - done);
-        if (count < 0 && errno == EINTR) continue;
-        if (count <= 0 || (size_t)count > n - done) return false;
-        done += (size_t)count;
-    }
-    return true;
-}
 static bool history_enabled(void) {
     /* Re-read for every native operation: disabling in another browser window
        must not leave an enabled process cache. Missing/invalid/I/O means off. */
-    struct n_stat st; static const char marker[] = "Nocturne search history opt-in v1\n";
-    if (stat(HISTORY_PREF, &st) < 0 || st.type != N_FT_FILE || st.size != sizeof marker - 1) return false;
-    int fd = open(HISTORY_PREF, O_RDONLY); if (fd < 0) return false;
-    char bytes[sizeof marker]; bool ok = read_all(fd, (uint8_t *)bytes, sizeof marker - 1);
-    int closed = close(fd);
-    return ok && closed == 0 && !memcmp(bytes, marker, sizeof marker - 1);
+    static const char marker[] = "Nocturne search history opt-in v1\n";
+    char bytes[sizeof marker];
+    n_handle h = n_document_open(HISTORY_PREF, N_DOCUMENT_READ); if (h < 0) return false;
+    bool ok = n_document_size(h) == (n_result)(sizeof marker - 1) &&
+        n_document_read_at(h, 0, bytes, sizeof marker - 1) == (n_result)(sizeof marker - 1);
+    n_handle_close(h);
+    return ok && !memcmp(bytes, marker, sizeof marker - 1);
 }
 /* 0 missing, 1 valid, -1 invalid/I/O. No unchecked raw struct serialization. */
 static int history_read(int slot, struct search_history *out) {
-    char path[96]; history_path(slot, path); struct n_stat st;
-    if (stat(path, &st) < 0) return errno == ENOENT ? 0 : -1;
-    if (st.type != N_FT_FILE || st.size < HISTORY_HEADER || (uint64_t)st.size > SIZE_MAX) return -1;
-    size_t n = (size_t)st.size; uint8_t *bytes = malloc(n); if (!bytes) return -1;
-    int fd = open(path, O_RDONLY); if (fd < 0) { free(bytes); return -1; }
-    bool ok = read_all(fd, bytes, n); int closed = close(fd); uint8_t digest[32];
-    if (!ok || closed < 0) { free(bytes); return -1; }
+    char path[96]; history_path(slot, path); void *data; size_t n;
+    n_result loaded = n_document_load(path, &data, &n);
+    if (loaded < 0) return loaded == -N_ERR_NOT_FOUND ? 0 : -1;
+    uint8_t *bytes = data; uint8_t digest[32];
+    if (n < HISTORY_HEADER) { if (data) n_memory_release(data, n); return -1; }
     history_hash(bytes + 40, n - 40, digest);
-    ok = ok && closed == 0 && !memcmp(bytes, "NSEARCH1", 8) && !memcmp(bytes + 8, digest, 32);
+    bool ok = !memcmp(bytes, "NSEARCH1", 8) && !memcmp(bytes + 8, digest, 32);
     uint64_t generation = get32(bytes + 40) | (uint64_t)get32(bytes + 44) << 32;
     unsigned count = get32(bytes + 48);
     ok = ok && generation && count <= (n - HISTORY_HEADER) / HISTORY_ENTRY_MIN && count <= INT32_MAX && !get32(bytes + 52);
@@ -198,7 +175,7 @@ static int history_read(int slot, struct search_history *out) {
         if (ok && (!history_origin(entry->origin, origin) || strcmp(origin, entry->origin) ||
                    !history_name(entry->name) || !history_value(entry->value))) ok = false;
     }
-    ok = ok && at == n; free(bytes);
+    ok = ok && at == n; n_memory_release(data, n);
     if (!ok) return -1; out->count = (int)count; return 1;
 }
 static struct search_history *history_load(void) {
@@ -214,11 +191,14 @@ static struct search_history *history_load(void) {
     return a;
 }
 static bool history_directory(void) {
-    struct n_stat st;
-    if (stat(HISTORY_ROOT, &st) == 0) return st.type == N_FT_DIR;
-    if (errno != ENOENT || (mkdir(HISTORY_ROOT) < 0 && errno != EEXIST)) return false;
+    struct n_entry entry;
+    n_result found = n_entry_info(HISTORY_ROOT, &entry);
+    if (found >= 0) return entry.kind == N_KIND_FOLDER;
+    if (found != -N_ERR_NOT_FOUND) return false;
+    n_result made = n_folder_create(HISTORY_ROOT);
+    if (made < 0 && made != -N_ERR_EXISTS) return false;
     /* /data itself is never manufactured; it is the native persistent volume. */
-    return stat(HISTORY_ROOT, &st) == 0 && st.type == N_FT_DIR;
+    return n_entry_info(HISTORY_ROOT, &entry) >= 0 && entry.kind == N_KIND_FOLDER;
 }
 static bool history_save(struct search_history *history) {
     if (history->generation == UINT64_MAX || !history_directory()) return false;
@@ -235,38 +215,24 @@ static bool history_save(struct search_history *history) {
         for (int j = 0; j < 3; j++) { memcpy(bytes + at, fields[j], sizes[j]); at += sizes[j]; }
     }
     history_hash(bytes + 40, n - 40, bytes + 8);
-    int slot = history->slot == 0 ? 1 : 0; char path[96], temp[128]; history_path(slot, path);
-    snprintf(temp, sizeof temp, "%s.tmp-%d", path, getpid());
-    int fd = open(temp, O_WRONLY | O_CREAT | O_TRUNC); bool ok = false;
-    if (fd >= 0) {
-        ok = write_all(fd, bytes, n); int closed = close(fd); ok = ok && closed == 0;
-        if (ok) {
-            /* Native rename copies then unlinks, not POSIX atomic rename. The
-               older checksum snapshot is left intact; readback proves publish. */
-            (void)rename(temp, path);
-            struct search_history *check = calloc(1, sizeof *check);
-            ok = check && history_read(slot, check) == 1 && check->generation == generation &&
-                check->count == history->count &&
-                (!history->count || !memcmp(check->entries, history->entries, (size_t)history->count * sizeof *history->entries));
-            history_free(check);
-            if (ok) { history->generation = generation; history->slot = slot; }
-            else (void)unlink(path);
-        }
-    }
-    (void)unlink(temp); free(bytes); return ok;
+    int slot = history->slot == 0 ? 1 : 0; char path[96]; history_path(slot, path);
+    /* The inactive slot is swapped in whole; a failed save leaves its older
+       checksum snapshot, and the other slot stays the recovery copy. */
+    bool ok = n_document_save(path, bytes, n) >= 0;
+    if (ok) { history->generation = generation; history->slot = slot; }
+    free(bytes); return ok;
+}
+/* Removed, or already absent. */
+static bool history_remove(const char *path) {
+    n_result removed = n_entry_remove(path);
+    return removed >= 0 || removed == -N_ERR_NOT_FOUND;
 }
 static bool history_enable(bool enabled) {
-    if (!enabled) {
-        popup_reset();
-        if (unlink(HISTORY_PREF) < 0 && errno != ENOENT) return false;
-        struct n_stat st; return stat(HISTORY_PREF, &st) < 0 && errno == ENOENT;
-    }
+    if (!enabled) { popup_reset(); return history_remove(HISTORY_PREF); }
     if (!history_directory()) return false;
     static const char marker[] = "Nocturne search history opt-in v1\n";
-    int fd = open(HISTORY_PREF, O_WRONLY | O_CREAT | O_TRUNC); if (fd < 0) return false;
-    bool ok = write_all(fd, (const uint8_t *)marker, sizeof marker - 1); int closed = close(fd);
-    ok = ok && closed == 0 && history_enabled();
-    if (!ok) (void)unlink(HISTORY_PREF); return ok;
+    bool ok = n_document_save(HISTORY_PREF, marker, sizeof marker - 1) >= 0 && history_enabled();
+    if (!ok) (void)history_remove(HISTORY_PREF); return ok;
 }
 static bool history_clear(void) {
     /* Disable first so other browser windows cannot offer old popup snapshots.
@@ -276,26 +242,25 @@ static bool history_clear(void) {
     bool ok = true; char path[96];
     for (int slot = 0; slot < 2; slot++) {
         history_path(slot, path);
-        if (unlink(path) < 0 && errno != ENOENT) ok = false;
-        struct n_stat st; if (stat(path, &st) == 0 || errno != ENOENT) ok = false;
+        if (!history_remove(path)) ok = false;
     }
-    int fd = open(HISTORY_ROOT, O_RDONLY);
-    if (fd < 0) return ok && errno == ENOENT;
-    struct n_dirent entry; int index = 0, count = 0, attempts = 0;
-    while (attempts++ < 2048 && (count = readdir(fd, index++, &entry)) > 0) {
-        /* Only this module's interrupted native writes, never another store. */
-        const char *tail = !strncmp(entry.name, "search-history.0.tmp-", 21) ||
-            !strncmp(entry.name, "search-history.1.tmp-", 21) ? entry.name + 21 : NULL;
+    struct n_entry *entries = NULL;
+    n_result count = n_folder_entries(HISTORY_ROOT, &entries);
+    if (count < 0) return ok && count == -N_ERR_NOT_FOUND;
+    for (n_result i = 0; i < count; i++) {
+        /* Earlier builds staged snapshots under these names; a confirmed clear
+           removes their values too. Never another store's entries. */
+        const char *name = entries[i].name;
+        const char *tail = !strncmp(name, "search-history.0.tmp-", 21) ||
+            !strncmp(name, "search-history.1.tmp-", 21) ? name + 21 : NULL;
         if (!tail || !*tail) continue;
         bool digits = true;
         for (const char *p = tail; *p; p++) if (*p < '0' || *p > '9') digits = false;
         if (!digits) continue;
-        char temporary[384]; snprintf(temporary, sizeof temporary, HISTORY_ROOT "/%s", entry.name);
-        if (unlink(temporary) == 0) index = 0;
-        else if (errno != ENOENT) ok = false;
+        char temporary[384]; snprintf(temporary, sizeof temporary, HISTORY_ROOT "/%s", name);
+        if (!history_remove(temporary)) ok = false;
     }
-    if (count < 0 || attempts > 2048) ok = false;
-    if (close(fd) < 0) ok = false;
+    free(entries);
     return ok;
 }
 void web_autocomplete_record(web_doc *d, web_node *submitter, const char *destination) {

@@ -175,6 +175,10 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   領域の大きさはヒープの1/16（256KiB〜8MiB）。最新の領域だけ末尾の空きを一つ分温存し、
   それ以外の領域の末尾の空きはページ単位で返し、全部空いた古い領域は丸ごと返す。
   1MiB以上のブロックは専用の領域で、解放すれば即座に返る。
+- アドレス待ち：`wait_on_address(addr, expected, ms)`／`wait_on_address64` は起こされると0、
+  語が `expected` でなければ `-N_ERR_NOT_READY`、期限で `-N_ERR_TIMEOUT`、アプリ停止中は
+  `-N_ERR_STOPPED` を直接返す（`errno` は触らない）。`wake_address(addr, count)` は起こした数
+  （`count == 0` は全員）。`ms == UINT32_MAX` は無期限。共有ページ上でもアプリをまたいで働く。
 
 ## 8. 時間
 

@@ -61867,7 +61867,7 @@ static JSValue js_atomics_wait(JSContext *ctx,
                                int argc, JSValueConst *argv)
 {
     void *ptr;
-    int size_log2, r;
+    int size_log2;
     int64_t v;
     double timeout;
     uint64_t deadline = 0;
@@ -61880,7 +61880,7 @@ static JSValue js_atomics_wait(JSContext *ctx,
     if (js_atomics_wait_load(ptr, size_log2) != v)
         return JS_AtomToString(ctx, JS_ATOM_not_equal);
     if (isfinite(timeout))
-        deadline = uptime_ms() + (uint64_t)ceil(timeout);
+        deadline = n_clock_uptime_ms() + (uint64_t)ceil(timeout);
     /* The kernel re-checks the word while enrolling. A BigInt64 element was
        compared in full above and enrolls on its low word. A finite wait longer
        than one kernel call re-enrolls with the word's current value: the agent
@@ -61891,24 +61891,24 @@ static JSValue js_atomics_wait(JSContext *ctx,
         if (!isfinite(timeout)) {
             ms = UINT32_MAX;
         } else {
-            uint64_t now = uptime_ms();
+            uint64_t now = n_clock_uptime_ms();
             if (now >= deadline)
                 return JS_AtomToString(ctx, JS_ATOM_timed_out);
             ms = deadline - now < UINT32_MAX ? (unsigned)(deadline - now) : UINT32_MAX - 1;
         }
-        r = wait_on_address((volatile uint32_t *)ptr, expected, ms);
-        if (r >= 0)
+        n_result waited = wait_on_address((volatile uint32_t *)ptr, expected, ms);
+        if (waited >= 0)
             return JS_AtomToString(ctx, JS_ATOM_ok);
         /* The first enrollment is the comparison of the spec's critical section. */
-        if (errno == EAGAIN && !enrolled)
+        if (waited == -N_ERR_NOT_READY && !enrolled)
             return JS_AtomToString(ctx, JS_ATOM_not_equal);
-        if (errno == EAGAIN) {
+        if (waited == -N_ERR_NOT_READY) {
             expected = atomic_load((_Atomic(uint32_t) *)ptr);
             continue;
         }
-        if (errno == ETIMEDOUT && isfinite(timeout))
+        if (waited == -N_ERR_TIMEOUT && isfinite(timeout))
             continue;
-        /* EINTR: the process is being stopped; the wait cannot complete. */
+        /* N_ERR_STOPPED: the app is being stopped; the wait cannot complete. */
         return JS_AtomToString(ctx, JS_ATOM_timed_out);
     }
 }

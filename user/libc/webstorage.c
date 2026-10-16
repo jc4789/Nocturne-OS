@@ -7,8 +7,6 @@
  * between windows; persistent snapshots remain debounced. */
 #include <webstorage.h>
 #include <nocturne.h>
-#include <fcntl.h>
-#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,7 +46,7 @@ struct storage_area {
     bool unavailable; /* inactive snapshot invalidation failed; retry, RAM wins */
     bool dirty;
     uint64_t dirty_since, changed_at, retry_at;
-    int shared_fd, shared_log_fd;
+    n_handle shared, shared_log; /* leased control and delta documents, or -1 */
     uint64_t shared_epoch, shared_cursor;
     bool shared_holder;
     /* Compared with freshly read RAM-root bytes under the native lease.
@@ -97,12 +95,12 @@ static void storage_entries_free(struct storage_entry *e) {
     while (e) { struct storage_entry *next = e->next; free(e->key); free(e->value); free(e); e = next; }
 }
 static void storage_area_free(struct storage_area *a) {
-    if (a) { if(a->shared_fd>=0)close(a->shared_fd);if(a->shared_log_fd>=0)close(a->shared_log_fd); storage_entries_free(a->entries); free(a->origin); free(a); }
+    if (a) { if(a->shared>=0)n_handle_close(a->shared);if(a->shared_log>=0)n_handle_close(a->shared_log); storage_entries_free(a->entries); free(a->origin); free(a); }
 }
 static uint32_t storage_serial;
 webstorage *webstorage_create(void) {
     webstorage *s=calloc(1,sizeof *s);
-    if(s)s->identity=(uint64_t)(uint32_t)getpid()<<32 | __atomic_add_fetch(&storage_serial,1,__ATOMIC_RELAXED);
+    if(s)s->identity=(uint64_t)(uint32_t)n_app_self()<<32 | __atomic_add_fetch(&storage_serial,1,__ATOMIC_RELAXED);
     return s;
 }
 void webstorage_free(webstorage *s) {
@@ -129,7 +127,6 @@ static void storage_path_at(const char *root,const char *origin, int slot, char 
     name[64] = 0;
     snprintf(path, 160, "%s/%s.%d", root, name, slot);
 }
-static void storage_path(const char *origin,int slot,char path[160]){storage_path_at(WEBSTORAGE_ROOT,origin,slot,path);}
 static uint32_t storage_u32(const uint8_t *p) {
     return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
 }
@@ -141,22 +138,18 @@ static void storage_put64(uint8_t *p, uint64_t v) { storage_put32(p,(uint32_t)v)
  * reset to an empty map. A valid other slot can recover an interrupted write. */
 static int storage_read_at(const char *root,const char *origin, int slot, struct storage_area **out) {
     char path[160]; storage_path_at(root,origin, slot, path);
-    struct n_stat st;
-    if (stat(path, &st) < 0) return errno == ENOENT ? 0 : -1;
-    if (st.type != 1 || st.size < 56 || st.size > STORAGE_FILE_MAX) return -1;
-    size_t n = (size_t)st.size, done = 0;
+    struct n_entry entry;
+    n_result found = n_entry_info(path, &entry);
+    if (found < 0) return found == -N_ERR_NOT_FOUND ? 0 : -1;
+    if (entry.kind != N_KIND_DOCUMENT || entry.size < 56 || entry.size > STORAGE_FILE_MAX) return -1;
+    size_t n = (size_t)entry.size;
     uint8_t *bytes = malloc(n);
     if (!bytes) return -1;
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) { free(bytes); return -1; }
-    while (done < n) {
-        ssize_t nr = read(fd, bytes + done, n - done);
-        if (nr < 0 && errno == EINTR) continue;
-        if (nr <= 0 || (size_t)nr > n - done) break;
-        done += (size_t)nr;
-    }
-    int closed = close(fd);
-    if (done != n || closed < 0) { free(bytes); return -1; }
+    n_handle h = n_document_open(path, N_DOCUMENT_READ);
+    if (h < 0) { free(bytes); return -1; }
+    n_result got = n_document_read_at(h, 0, bytes, n);
+    n_handle_close(h);
+    if (got != (n_result)n) { free(bytes); return -1; }
     uint8_t digest[32]; storage_hash(bytes + 40, n - 40, digest);
     if (memcmp(bytes,"NWEBST1",8) || memcmp(bytes+8,digest,32)) { free(bytes); return -1; }
     uint64_t generation = storage_u64(bytes + 40);
@@ -164,7 +157,7 @@ static int storage_read_at(const char *root,const char *origin, int slot, struct
     if (!generation || on != strlen(origin) || on > n - 56 || count > STORAGE_MAX_KEYS || memcmp(bytes+56,origin,on)) { free(bytes); return -1; }
     struct storage_area *a = calloc(1, sizeof *a);
     if (!a) { free(bytes); return -1; }
-    a->shared_fd=a->shared_log_fd=-1;
+    a->shared=a->shared_log=-1;
     a->origin = storage_copy(origin,on); a->kind=WEB_STORAGE_LOCAL; a->slot=slot; a->generation=generation;
     if (!a->origin) { storage_area_free(a); free(bytes); return -1; }
     size_t at=56+on; struct storage_entry **tail=&a->entries; bool ok=true;
@@ -187,11 +180,13 @@ static int storage_read_at(const char *root,const char *origin, int slot, struct
 }
 static int storage_read(const char *origin,int slot,struct storage_area **out){return storage_read_at(WEBSTORAGE_ROOT,origin,slot,out);}
 static bool storage_directory(const char *path) {
-    struct n_stat st;
-    if (stat(path,&st)==0) return st.type==2;
-    if (errno!=ENOENT) return false;
-    if (mkdir(path)<0 && errno!=EEXIST) return false;
-    return stat(path,&st)==0 && st.type==2;
+    struct n_entry entry;
+    n_result found=n_entry_info(path,&entry);
+    if (found>=0) return entry.kind==N_KIND_FOLDER;
+    if (found!=-N_ERR_NOT_FOUND) return false;
+    n_result made=n_folder_create(path);
+    if (made<0 && made!=-N_ERR_EXISTS) return false;
+    return n_entry_info(path,&entry)>=0 && entry.kind==N_KIND_FOLDER;
 }
 static bool storage_dirs_at(const char *root) {
     /* Paths are native constants only. Do not create /data itself when absent. */
@@ -216,30 +211,12 @@ static int storage_save_at(const char *root,struct storage_area *a, struct web_s
     storage_hash(bytes+40,n-40,bytes+8);
     int slot=a->slot==0?1:0;
     char path[160]; storage_path_at(root,a->origin,slot,path);
-    int fd=open(path,O_WRONLY|O_CREAT|O_TRUNC), result=WEB_STORAGE_IO;
-    if (fd>=0) {
-        size_t done=0;
-        while (done<n) {
-            ssize_t nw=write(fd,bytes+done,n-done);
-            if (nw<0 && errno==EINTR) continue;
-            if (nw<=0 || (size_t)nw>n-done) break;
-            done+=(size_t)nw;
-        }
-        int closed=close(fd);
-        if (done==n && closed==0) {
-            /* The native API reports short writes and close failure. Reopening
-             * and rehashing this exact snapshot adds synchronous storvsc I/O,
-             * but not durability. Keep the other completed slot for recovery. */
-            result=WEB_STORAGE_OK; a->generation++; a->slot=slot;
-        }
-    }
-    if (result!=WEB_STORAGE_OK) {
-        /* Even a failed open may have truncated the candidate before failing
-         * to allocate a file handle. Remove only this inactive slot on every
-         * unsuccessful write/close. Uncertain invalidation makes the
-         * area unavailable; never report success or silently serve stale RAM. */
-        if (unlink(path)<0 && errno!=ENOENT) a->unavailable=true;
-    }
+    /* The inactive slot is swapped in whole: a failed save leaves its older,
+     * lower-generation snapshot, never a torn one, and the other completed
+     * slot stays the recovery copy. Reopening and rehashing would add
+     * synchronous storvsc I/O, but not durability. */
+    int result=WEB_STORAGE_IO;
+    if (n_document_save(path,bytes,n)>=0) { result=WEB_STORAGE_OK; a->generation++; a->slot=slot; }
     free(bytes); return result;
 }
 static int storage_save(struct storage_area *a,struct web_storage_result *out){return storage_save_at(WEBSTORAGE_ROOT,a,out);}
@@ -272,7 +249,7 @@ static int storage_get_area(webstorage *s, const char *origin, int kind, struct 
     struct storage_area *a=NULL;
     if (!a) {
         a=calloc(1,sizeof *a); if (!a) return WEB_STORAGE_QUOTA;
-        a->shared_fd=a->shared_log_fd=-1;
+        a->shared=a->shared_log=-1;
         a->origin=storage_copy(origin,strlen(origin)); a->kind=kind; a->slot=-1;
         if (!a->origin) { storage_area_free(a); return WEB_STORAGE_QUOTA; }
     }

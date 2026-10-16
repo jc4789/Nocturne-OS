@@ -4,14 +4,11 @@
 #include "http.h"
 #include "nocturne.h"
 #include <bearssl_hash.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #define OPFS_ROOT "/data/browser/opfs"
 #define OPFS_PATH 512 /* the kernel's path limit, including the terminator */
@@ -27,27 +24,27 @@ enum {
 struct opfs_access {
     struct opfs_access *next;
     JSContext *ctx;
-    int fd;
+    n_handle document; /* holds the file's exclusive claim */
 };
 static struct opfs_access *accesses;
 static const char *(*context_url)(JSContext *ctx);
 
-static int opfs_errno(int error) {
-    switch (error) {
-    case ENOENT: return OPFS_NOT_FOUND;
-    case ENOTDIR: case EISDIR: return OPFS_TYPE_MISMATCH;
-    case ENOTEMPTY: return OPFS_NOT_EMPTY;
-    case EAGAIN: return OPFS_LOCKED;
-    case ENOSPC: return OPFS_QUOTA;
-    case ENOMEM: return OPFS_MEMORY;
+static int opfs_error(n_result error) {
+    switch (-error) {
+    case N_ERR_NOT_FOUND: return OPFS_NOT_FOUND;
+    case N_ERR_NOT_FOLDER: case N_ERR_IS_FOLDER: case N_ERR_WRONG_KIND: return OPFS_TYPE_MISMATCH;
+    case N_ERR_NOT_EMPTY: return OPFS_NOT_EMPTY;
+    case N_ERR_NOT_READY: case N_ERR_BUSY: return OPFS_LOCKED;
+    case N_ERR_NO_SPACE: return OPFS_QUOTA;
+    case N_ERR_NO_MEMORY: return OPFS_MEMORY;
     default: return OPFS_IO;
     }
 }
 
 static bool ensure_directory(const char *path) {
-    struct n_stat st;
-    if (!stat(path, &st)) return st.type == N_FT_DIR;
-    return !mkdir(path, 0) || (!stat(path, &st) && st.type == N_FT_DIR);
+    struct n_entry e;
+    if (n_entry_info(path, &e) >= 0) return e.kind == N_KIND_FOLDER;
+    return n_folder_create(path) >= 0 || (n_entry_info(path, &e) >= 0 && e.kind == N_KIND_FOLDER);
 }
 
 /* The origin's directory. Storage keys are tuple origins of HTTP(S) URLs;
@@ -169,26 +166,24 @@ static int opfs_path(JSContext *ctx, JSValueConst parts, char *out, size_t size)
 }
 
 static int kind_of(const char *path) {
-    struct n_stat st;
-    if (stat(path, &st)) return errno == ENOENT ? 0 : opfs_errno(errno);
-    return st.type == N_FT_DIR ? 2 : st.type == N_FT_FILE ? 1 : OPFS_TYPE_MISMATCH;
+    struct n_entry e;
+    n_result r = n_entry_info(path, &e);
+    if (r < 0) return r == -N_ERR_NOT_FOUND ? 0 : opfs_error(r);
+    return e.kind == N_KIND_FOLDER ? 2 : e.kind == N_KIND_DOCUMENT ? 1 : OPFS_TYPE_MISMATCH;
 }
 
 /* Entry names of a directory, encoded, one after another with terminators. */
 static int list_raw(const char *path, char **names, size_t *bytes) {
     *names = NULL;
     *bytes = 0;
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return opfs_errno(errno);
+    struct n_entry *entries = NULL;
+    n_result count = n_folder_entries(path, &entries);
+    if (count < 0) return opfs_error(count);
     size_t capacity = 0;
     int r = 0;
-    for (int index = 0;; index++) {
-        struct n_dirent d;
-        int got = readdir(fd, index, &d);
-        if (got < 0) { r = opfs_errno(errno); break; }
-        if (!got) break;
-        if (!strcmp(d.name, ".") || !strcmp(d.name, "..")) continue;
-        size_t n = strlen(d.name) + 1;
+    for (n_result index = 0; index < count; index++) {
+        const struct n_entry *d = &entries[index];
+        size_t n = strlen(d->name) + 1;
         if (*bytes + n > capacity) {
             size_t next = capacity ? capacity * 2 : 1024;
             while (next < *bytes + n) next *= 2;
@@ -197,22 +192,28 @@ static int list_raw(const char *path, char **names, size_t *bytes) {
             *names = grown;
             capacity = next;
         }
-        memcpy(*names + *bytes, d.name, n);
+        memcpy(*names + *bytes, d->name, n);
         *bytes += n;
     }
-    close(fd);
+    free(entries);
     if (r) { free(*names); *names = NULL; *bytes = 0; }
     return r;
 }
 
-/* Exclusive-lease probe: a sync access handle of any process holds it. */
+/* Exclusive-claim probe: a sync access handle of any app holds it. */
 static int file_free(const char *path) {
-    int fd = open(path, O_RDWR);
-    if (fd < 0) return opfs_errno(errno);
-    int r = fcntl(fd, F_NTRYLOCK) < 0 ? opfs_errno(errno) : 0;
-    if (!r) fcntl(fd, F_NUNLOCK);
-    close(fd);
-    return r;
+    n_handle h = n_document_open(path, N_DOCUMENT_EDIT);
+    if (h < 0) return opfs_error(h);
+    n_result claimed = n_document_claim(h, false);
+    if (claimed >= 0) n_document_release(h);
+    n_handle_close(h);
+    return claimed < 0 ? opfs_error(claimed) : 0;
+}
+
+/* Remove an entry; 0 or an OPFS result. */
+static int remove_entry(const char *path) {
+    n_result r = n_entry_remove(path);
+    return r < 0 ? opfs_error(r) : 0;
 }
 
 static int remove_tree(char *path, size_t size, bool recursive) {
@@ -222,7 +223,7 @@ static int remove_tree(char *path, size_t size, bool recursive) {
     if (kind == 1) {
         int r = file_free(path);
         if (r) return r;
-        return unlink(path) ? opfs_errno(errno) : 0;
+        return remove_entry(path);
     }
     char *names;
     size_t bytes;
@@ -240,10 +241,11 @@ static int remove_tree(char *path, size_t size, bool recursive) {
     }
     free(names);
     if (r) return r;
-    return unlink(path) ? opfs_errno(errno) : 0;
+    return remove_entry(path);
 }
 
-/* Move a file or directory tree; the kernel's rename moves files only. */
+/* Move a file or directory tree, one document at a time: a folder move
+ * across volumes is not offered by n_entry_move, which never replaces. */
 static int move_tree(char *from, char *to, size_t size) {
     int kind = kind_of(from);
     if (kind < 0) return kind;
@@ -254,13 +256,14 @@ static int move_tree(char *from, char *to, size_t size) {
         int existing = kind_of(to);
         if (existing < 0) return existing;
         if (existing == 2) return OPFS_TYPE_MISMATCH;
-        if (existing == 1 && (r = file_free(to))) return r;
-        return rename(from, to) ? opfs_errno(errno) : 0;
+        if (existing == 1 && ((r = file_free(to)) || (r = remove_entry(to)))) return r;
+        n_result moved = n_entry_move(from, to);
+        return moved < 0 ? opfs_error(moved) : 0;
     }
     int existing = kind_of(to);
     if (existing < 0) return existing;
     if (existing == 1) return OPFS_TYPE_MISMATCH;
-    if (!existing && mkdir(to, 0)) return opfs_errno(errno);
+    if (!existing) { n_result made = n_folder_create(to); if (made < 0) return opfs_error(made); }
     char *names;
     size_t bytes;
     int r = list_raw(from, &names, &bytes);
@@ -279,13 +282,14 @@ static int move_tree(char *from, char *to, size_t size) {
     }
     free(names);
     if (r) return r;
-    return unlink(from) ? opfs_errno(errno) : 0;
+    return remove_entry(from);
 }
 
 static int64_t tree_usage(char *path, size_t size) {
-    struct n_stat st;
-    if (stat(path, &st)) return opfs_errno(errno);
-    if (st.type != N_FT_DIR) return (int64_t)st.size;
+    struct n_entry e;
+    n_result found = n_entry_info(path, &e);
+    if (found < 0) return opfs_error(found);
+    if (e.kind != N_KIND_FOLDER) return (int64_t)e.size;
     char *names;
     size_t bytes;
     int r = list_raw(path, &names, &bytes);
@@ -306,11 +310,12 @@ static int64_t tree_usage(char *path, size_t size) {
     return total;
 }
 
-static int full_io(int fd, void *data, size_t n, bool write_mode, size_t *done) {
+static int full_io(n_handle h, uint64_t at, void *data, size_t n, bool write_mode, size_t *done) {
     *done = 0;
     while (*done < n) {
-        long r = write_mode ? write(fd, (const uint8_t *)data + *done, n - *done) : read(fd, (uint8_t *)data + *done, n - *done);
-        if (r < 0) return opfs_errno(errno);
+        n_result r = write_mode ? n_document_write_at(h, at + *done, (const uint8_t *)data + *done, n - *done) :
+                                  n_document_read_at(h, at + *done, (uint8_t *)data + *done, n - *done);
+        if (r < 0) return opfs_error(r);
         if (!r) break;
         *done += (size_t)r;
     }
@@ -357,11 +362,9 @@ static JSValue opfs_ensure(JSContext *ctx, JSValueConst self, int argc, JSValueC
     if (kind < 0) return opfs_result(ctx, kind);
     if (kind) return opfs_result(ctx, kind == want ? 0 : OPFS_TYPE_MISMATCH);
     if (!JS_ToBool(ctx, argv[2])) return opfs_result(ctx, OPFS_NOT_FOUND);
-    if (want == 2) r = mkdir(path, 0) ? opfs_errno(errno) : 0;
-    else {
-        int fd = open(path, O_RDWR | O_CREAT);
-        r = fd < 0 ? opfs_errno(errno) : (close(fd), 0);
-    }
+    n_result made = want == 2 ? n_folder_create(path) : n_document_open(path, N_DOCUMENT_CREATE);
+    if (want != 2 && made >= 0) n_handle_close((n_handle)made);
+    r = made < 0 ? opfs_error(made) : 0;
     return opfs_result(ctx, r);
 }
 
@@ -415,17 +418,20 @@ static JSValue opfs_read(JSContext *ctx, JSValueConst self, int argc, JSValueCon
     char path[OPFS_PATH];
     int r = opfs_path(ctx, argv[0], path, sizeof path);
     if (r) return opfs_result(ctx, r);
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return opfs_result(ctx, opfs_errno(errno));
-    struct n_stat st;
-    if (fstat(fd, &st)) { r = opfs_errno(errno); close(fd); return opfs_result(ctx, r); }
-    if (st.type != N_FT_FILE) { close(fd); return opfs_result(ctx, OPFS_TYPE_MISMATCH); }
-    if (st.size > SIZE_MAX) { close(fd); return opfs_result(ctx, OPFS_MEMORY); }
-    uint8_t *data = malloc(st.size ? (size_t)st.size : 1);
-    if (!data) { close(fd); return opfs_result(ctx, OPFS_MEMORY); }
+    struct n_entry st;
+    n_result found = n_entry_info(path, &st);
+    if (found < 0) return opfs_result(ctx, opfs_error(found));
+    if (st.kind != N_KIND_DOCUMENT) return opfs_result(ctx, OPFS_TYPE_MISMATCH);
+    n_handle h = n_document_open(path, N_DOCUMENT_READ);
+    if (h < 0) return opfs_result(ctx, opfs_error(h));
+    n_result size = n_document_size(h);
+    if (size < 0) { n_handle_close(h); return opfs_result(ctx, opfs_error(size)); }
+    if ((uint64_t)size > SIZE_MAX) { n_handle_close(h); return opfs_result(ctx, OPFS_MEMORY); }
+    uint8_t *data = malloc(size ? (size_t)size : 1);
+    if (!data) { n_handle_close(h); return opfs_result(ctx, OPFS_MEMORY); }
     size_t done;
-    r = full_io(fd, data, (size_t)st.size, false, &done);
-    close(fd);
+    r = full_io(h, 0, data, (size_t)size, false, &done);
+    n_handle_close(h);
     if (r) { free(data); return opfs_result(ctx, r); }
     JSValue buffer = JS_NewArrayBufferCopy(ctx, data, done);
     free(data);
@@ -433,7 +439,7 @@ static JSValue opfs_read(JSContext *ctx, JSValueConst self, int argc, JSValueCon
     JSValue out = JS_NewArray(ctx);
     if (JS_IsException(out)) { JS_FreeValue(ctx, buffer); return out; }
     if (JS_SetPropertyUint32(ctx, out, 0, buffer) < 0 ||
-        JS_SetPropertyUint32(ctx, out, 1, JS_NewFloat64(ctx, (double)st.mtime * 1000.0)) < 0) {
+        JS_SetPropertyUint32(ctx, out, 1, JS_NewFloat64(ctx, (double)st.modified * 1000.0)) < 0) {
         JS_FreeValue(ctx, out);
         return JS_EXCEPTION;
     }
@@ -451,14 +457,16 @@ static JSValue opfs_replace(JSContext *ctx, JSValueConst self, int argc, JSValue
     uint8_t *data = buffer_range(ctx, argv[1], argv[2], argv[3], &n);
     if (!data) return JS_EXCEPTION;
     if ((r = kind_of(path)) != 1) return opfs_result(ctx, r < 0 ? r : r ? OPFS_TYPE_MISMATCH : OPFS_NOT_FOUND);
-    int fd = open(path, O_RDWR);
-    if (fd < 0) return opfs_result(ctx, opfs_errno(errno));
-    if (fcntl(fd, F_NTRYLOCK) < 0) { r = opfs_errno(errno); close(fd); return opfs_result(ctx, r); }
+    n_handle h = n_document_open(path, N_DOCUMENT_EDIT);
+    if (h < 0) return opfs_result(ctx, opfs_error(h));
+    n_result claimed = n_document_claim(h, false);
+    if (claimed < 0) { n_handle_close(h); return opfs_result(ctx, opfs_error(claimed)); }
     size_t done = 0;
-    if (ftruncate(fd, 0) < 0) r = opfs_errno(errno);
-    else if (!(r = full_io(fd, data, n, true, &done)) && done != n) r = OPFS_IO;
-    fcntl(fd, F_NUNLOCK);
-    close(fd);
+    n_result emptied = n_document_set_size(h, 0);
+    if (emptied < 0) r = opfs_error(emptied);
+    else if (!(r = full_io(h, 0, data, n, true, &done)) && done != n) r = OPFS_IO;
+    n_document_release(h);
+    n_handle_close(h);
     return opfs_result(ctx, r);
 }
 
@@ -498,14 +506,15 @@ static JSValue opfs_open(JSContext *ctx, JSValueConst self, int argc, JSValueCon
     if ((r = kind_of(path)) != 1) return opfs_result(ctx, r < 0 ? r : r ? OPFS_TYPE_MISMATCH : OPFS_NOT_FOUND);
     struct opfs_access *a = calloc(1, sizeof *a);
     if (!a) return opfs_result(ctx, OPFS_MEMORY);
-    int fd = open(path, O_RDWR);
-    if (fd < 0) { free(a); return opfs_result(ctx, opfs_errno(errno)); }
-    if (fcntl(fd, F_NTRYLOCK) < 0) { r = opfs_errno(errno); close(fd); free(a); return opfs_result(ctx, r); }
+    n_handle h = n_document_open(path, N_DOCUMENT_EDIT);
+    if (h < 0) { free(a); return opfs_result(ctx, opfs_error(h)); }
+    n_result claimed = n_document_claim(h, false);
+    if (claimed < 0) { n_handle_close(h); free(a); return opfs_result(ctx, opfs_error(claimed)); }
     a->ctx = ctx;
-    a->fd = fd;
+    a->document = h;
     a->next = accesses;
     accesses = a;
-    return JS_NewInt32(ctx, fd);
+    return JS_NewInt32(ctx, h);
 }
 
 /* host.opfsAccess(op, id, buffer, offset, length, at): 0 read, 1 write,
@@ -515,9 +524,9 @@ static JSValue opfs_access(JSContext *ctx, JSValueConst self, int argc, JSValueC
     int32_t op = 0, id = -1;
     if (JS_ToInt32(ctx, &op, argv[0]) || JS_ToInt32(ctx, &id, argv[1])) return JS_EXCEPTION;
     struct opfs_access **link = &accesses;
-    while (*link && ((*link)->ctx != ctx || (*link)->fd != id)) link = &(*link)->next;
+    while (*link && ((*link)->ctx != ctx || (*link)->document != id)) link = &(*link)->next;
     if (!*link) return opfs_result(ctx, OPFS_STATE);
-    int fd = id;
+    n_handle h = id;
     int64_t at = 0;
     if ((op <= 2) && argc > 5 && JS_ToInt64(ctx, &at, argv[5])) return JS_EXCEPTION;
     if (at < 0) return opfs_result(ctx, OPFS_STATE);
@@ -526,16 +535,17 @@ static JSValue opfs_access(JSContext *ctx, JSValueConst self, int argc, JSValueC
         size_t n;
         uint8_t *data = buffer_range(ctx, argv[2], argv[3], argv[4], &n);
         if (!data) return JS_EXCEPTION;
-        if (lseek(fd, (long)at, SEEK_SET) < 0) return opfs_result(ctx, opfs_errno(errno));
         size_t done;
-        int r = full_io(fd, data, n, op == 1, &done);
+        int r = full_io(h, (uint64_t)at, data, n, op == 1, &done);
         return r && !done ? opfs_result(ctx, r) : JS_NewInt64(ctx, (int64_t)done);
     }
-    case 2:
-        return opfs_result(ctx, ftruncate(fd, (long)at) < 0 ? opfs_errno(errno) : 0);
+    case 2: {
+        n_result sized = n_document_set_size(h, (uint64_t)at);
+        return opfs_result(ctx, sized < 0 ? opfs_error(sized) : 0);
+    }
     case 3: {
-        struct n_stat st;
-        return opfs_result(ctx, fstat(fd, &st) ? opfs_errno(errno) : (int64_t)st.size);
+        n_result size = n_document_size(h);
+        return opfs_result(ctx, size < 0 ? opfs_error(size) : size);
     }
     case 4:
         /* Every write reaches the volume before it returns. */
@@ -543,8 +553,8 @@ static JSValue opfs_access(JSContext *ctx, JSValueConst self, int argc, JSValueC
     case 5: {
         struct opfs_access *a = *link;
         *link = a->next;
-        fcntl(fd, F_NUNLOCK);
-        close(fd);
+        n_document_release(h);
+        n_handle_close(h);
         free(a);
         return JS_NewInt32(ctx, 0);
     }
@@ -583,8 +593,8 @@ void web_opfs_release(JSContext *ctx) {
         struct opfs_access *a = *link;
         if (a->ctx != ctx) { link = &a->next; continue; }
         *link = a->next;
-        fcntl(a->fd, F_NUNLOCK);
-        close(a->fd);
+        n_document_release(a->document);
+        n_handle_close(a->document);
         free(a);
     }
 }

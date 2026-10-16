@@ -71,6 +71,9 @@ struct pctx {
     const struct gfx_mask_clip *viewport_mask;
 };
 #include "paint_media_debug.h"
+/* debug_js only: where top-level paint time goes between profile reports. */
+static struct { uint64_t paints, order_ms, frames_ms, walk_ms, probe_ms, total_ms, groups, group_pixels,
+    order_builds, layer_builds, radius_builds, radius_pixels, radius_moves; } paint_profile;
 
 static bool positioned(const box_t *b) {
     if (!b->st || b->kind == B_INLINE || b->kind == B_TEXT) return false;
@@ -186,15 +189,40 @@ static bool radius_cache_prepare(web_doc *doc,struct radius_cache **slot,float x
     if(!isfinite(left)||!isfinite(top)||left<INT_MIN||top<INT_MIN||left>INT_MAX||top>INT_MAX)return false;
     double width=fmax(0,right-left),height=fmax(0,bottom-top);
     if(width>INT_MAX||height>INT_MAX||(height>0&&(size_t)width>SIZE_MAX/(size_t)height))return false;
+    bool clipped=left!=floor((double)x)||top!=floor((double)y)||right!=ceil((double)x+w)||bottom!=ceil((double)y+h);
+    /* Coverage depends only on the pixel offset from the box, so an unclipped
+       mask moved by whole pixels (content shifted by layout) is the same mask. */
+    if(old&&!old->clipped&&!clipped&&old->w==w&&old->h==h&&!memcmp(&old->radii,&radii,sizeof radii)&&
+       x-floorf(x)==old->x-floorf(old->x)&&y-floorf(y)==old->y-floorf(old->y)&&
+       old->width==(int)width&&old->height==(int)height){
+        old->x=x;old->y=y;old->left=(int)left;old->top=(int)top;
+        old->view_x=doc->view_x;old->view_y=doc->view_y;old->view_w=doc->width;old->view_h=doc->height;
+        if(doc->profile_enabled)paint_profile.radius_moves++;
+        return true;
+    }
     struct radius_cache *next=calloc(1,sizeof *next);if(!next)return false;
     next->x=x;next->y=y;next->w=w;next->h=h;next->radii=radii;next->left=(int)left;next->top=(int)top;next->width=(int)width;next->height=(int)height;
-    next->clipped=left!=floor((double)x)||top!=floor((double)y)||right!=ceil((double)x+w)||bottom!=ceil((double)y+h);
+    next->clipped=clipped;
     next->view_x=doc->view_x;next->view_y=doc->view_y;next->view_w=doc->width;next->view_h=doc->height;
     size_t pixels=(size_t)next->width*next->height;
     if(pixels&&((size_t)next->height>SIZE_MAX/sizeof *next->opaque||
         !(next->alpha=malloc(pixels))||!(next->opaque=calloc((size_t)next->height,sizeof *next->opaque)))){web_radius_cache_free(&next);return false;}
+    if(doc->profile_enabled){paint_profile.radius_builds++;paint_profile.radius_pixels+=pixels;}
+    /* Rows clear of every corner and of the top/bottom anti-aliased edge have
+       coverage that depends on x alone (both the circular SDF and the
+       elliptical path): compute one such row and copy it. */
+    float top_reach=fmaxf(fmaxf(radii.x[0],radii.y[0]),fmaxf(radii.x[1],radii.y[1]))+2;
+    float bottom_reach=fmaxf(fmaxf(radii.x[2],radii.y[2]),fmaxf(radii.x[3],radii.y[3]))+2;
+    int middle=-1;
     for(int py=0;py<next->height;py++) {
         if(!(py&31)&&!web_native_checkpoint(doc)){web_radius_cache_free(&next);return false;}
+        float center=next->top+py+.5f;
+        bool plain=center-y>=top_reach&&y+h-center>=bottom_reach;
+        if(plain&&middle>=0&&next->alpha){
+            memcpy(next->alpha+(size_t)py*next->width,next->alpha+(size_t)middle*next->width,(size_t)next->width);
+            next->opaque[py]=next->opaque[middle];continue;
+        }
+        if(plain)middle=py;
         int first=-1,last=0;
         for(int px=0;px<next->width;px++) {
             uint8_t alpha=(uint8_t)(255*corners_coverage(next->left+px+.5f,next->top+py+.5f,x,y,w,h,&radii)+.5f);
@@ -1488,10 +1516,11 @@ static bool sort_layers(web_doc *d,pvec *layers) {
     free(scratch);return true;
 }
 static bool prepare_layer_cache(web_doc *d,box_t *b){
-    if(b->paint_layers_valid&&b->paint_layers_layout==d->layout_revision&&b->paint_layers_dom==d->dom_revision)return true;
+    if(b->paint_layers_valid&&b->paint_layers_layout==d->layout_revision&&b->paint_layers_style==d->style_revision)return true;
     b->paint_layers_valid=false;b->paint_layers.n=0;
+    if(d->profile_enabled)paint_profile.layer_builds++;
     if(!collect_layers(d,&b->paint_layers,b)||!sort_layers(d,&b->paint_layers)){b->paint_layers.n=0;return false;}
-    b->paint_layers_layout=d->layout_revision;b->paint_layers_dom=d->dom_revision;b->paint_layers_valid=true;return true;
+    b->paint_layers_layout=d->layout_revision;b->paint_layers_style=d->style_revision;b->paint_layers_valid=true;return true;
 }
 
 static const char overflow_ellipsis[] = "\xe2\x80\xa6";
@@ -1656,13 +1685,14 @@ static bool prepare_paint_tree(web_doc *d,box_t *b){
     return true;
 }
 static bool prepare_paint_order(web_doc *d){
-    if(d->paint_order_valid&&d->paint_order_layout==d->layout_revision&&d->paint_order_dom==d->dom_revision&&
+    if(d->paint_order_valid&&d->paint_order_layout==d->layout_revision&&
        d->paint_order_visual==d->visual_revision&&(!d->paint_shadow_crop||
        (d->paint_shadow_view_x==d->view_x&&d->paint_shadow_view_y==d->view_y)))return true;
     d->paint_order_valid=false;
     d->paint_shadow_crop=false;
+    if(d->profile_enabled)paint_profile.order_builds++;
     if(!prepare_paint_tree(d,d->root_box))return false;
-    d->paint_order_layout=d->layout_revision;d->paint_order_dom=d->dom_revision;d->paint_order_visual=d->visual_revision;
+    d->paint_order_layout=d->layout_revision;d->paint_order_visual=d->visual_revision;
     d->paint_shadow_view_x=d->view_x;d->paint_shadow_view_y=d->view_y;d->paint_order_valid=true;return true;
 }
 static void release_layers(pvec *layers,bool borrowed){if(!borrowed)pv_free(layers);}
@@ -1818,12 +1848,12 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     }
     pvec layers = {0}; bool layers_borrowed=false;
     if (P->mode != M_BOUNDS && (b == P->d->root_box || b == P->top_root || stacking_context(b))) {
-        if(!b->paint_layers_valid||b->paint_layers_layout!=P->d->layout_revision||b->paint_layers_dom!=P->d->dom_revision){
+        if(!b->paint_layers_valid||b->paint_layers_layout!=P->d->layout_revision||b->paint_layers_style!=P->d->style_revision){
             b->paint_layers_valid=false;b->paint_layers.n=0;
             if(!collect_layers(P->d,&b->paint_layers,b)||!sort_layers(P->d,&b->paint_layers)){
                 b->paint_layers.n=0;P->failed=true;return;
             }
-            b->paint_layers_layout=P->d->layout_revision;b->paint_layers_dom=P->d->dom_revision;
+            b->paint_layers_layout=P->d->layout_revision;b->paint_layers_style=P->d->style_revision;
             b->paint_layers_valid=true;
         }
         layers=b->paint_layers;layers_borrowed=true;
@@ -1877,6 +1907,7 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             if (right > left && bottom > top) {
                 gx = (int)left; gy = (int)top; gw = (int)(right - left); gh = (int)(bottom - top);
                 web_avmedia_snapshot_reject_region(c,gx,gy,gw,gh);
+                if(P->d->profile_enabled){paint_profile.groups++;paint_profile.group_pixels+=(uint64_t)gw*(uint64_t)gh;}
                 if ((size_t)gw > SIZE_MAX / sizeof *saved / (size_t)gh ||
                     !(saved = malloc(sizeof *saved * (size_t)gw * (size_t)gh))) {
                     P->failed = true; release_layers(&layers,layers_borrowed); return; /* never paint an unfiltered substitute */
@@ -2058,7 +2089,27 @@ uint32_t doc_canvas_bg(web_doc *d, int *from) {
     return RGB(255, 255, 255);
 }
 
+int web_paint_report(char *out, size_t size) {
+    if(!paint_profile.paints)return 0;
+    int n=snprintf(out,size,"Native paint profile: paints %lu/%lu ms, order %lu ms (%lu builds, %lu layer sorts, radius masks %lu/%lu kpx built, %lu moved), frames %lu ms, walk %lu ms, video probe %lu ms, opacity groups %lu/%lu kpx (inclusive)",
+        (unsigned long)paint_profile.paints,(unsigned long)paint_profile.total_ms,(unsigned long)paint_profile.order_ms,
+        (unsigned long)paint_profile.order_builds,(unsigned long)paint_profile.layer_builds,(unsigned long)paint_profile.radius_builds,
+        (unsigned long)(paint_profile.radius_pixels/1000),(unsigned long)paint_profile.radius_moves,
+        (unsigned long)paint_profile.frames_ms,(unsigned long)paint_profile.walk_ms,(unsigned long)paint_profile.probe_ms,
+        (unsigned long)paint_profile.groups,(unsigned long)(paint_profile.group_pixels/1000));
+    memset(&paint_profile,0,sizeof paint_profile);
+    return n;
+}
+static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y);
 void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y) {
+    uint32_t memo=box_visual_memo_begin();
+    bool profile=d && d->profile_enabled && !d->frame_parent;
+    uint64_t start=profile?uptime_ms():0;
+    paint_document(d,c,x,y,w,h,doc_x,doc_y);
+    if(profile){paint_profile.paints++;paint_profile.total_ms+=uptime_ms()-start;}
+    box_visual_memo_end(memo);
+}
+static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, int doc_y) {
     if(web_render_blocked(d)) {
         gfx_fill(c,x,y,w,h,RGB(255,255,255));
         return;
@@ -2070,12 +2121,16 @@ void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, i
     /* Sorting/cancellation finishes before any committed window pixels are
        overwritten. A cancelled cache build cannot leave a white viewport. */
     d->view_x=doc_x;d->view_y=doc_y;
+    bool profile=d->profile_enabled && !d->frame_parent;
+    uint64_t mark=profile?uptime_ms():0;
     if(!prepare_paint_order(d)){doc_paint_full(d);return;}
+    if(profile){uint64_t now=uptime_ms();paint_profile.order_ms+=now-mark;mark=now;}
     d->initial_render_done=true;
     paint_debug_begin(d);
     d->view_x=doc_x; d->view_y=doc_y; /* frame crops use this paint's real scroll */
     bool snapshot_root=!d->frame_parent;
     if(snapshot_root){web_frames_prepare_paint(d);web_avmedia_snapshot_begin(d);}
+    if(profile){uint64_t now=uptime_ms();paint_profile.frames_ms+=now-mark;mark=now;}
     int sx0 = c->cx0, sy0 = c->cy0, sx1 = c->cx1, sy1 = c->cy1;
     gfx_clip(c, x, y, w, h);
     struct pctx P = {0};
@@ -2119,6 +2174,7 @@ void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, i
     }
     if (P.failed) doc_paint_full(d);
     paint_debug_finish(d);
+    if(profile){uint64_t now=uptime_ms();paint_profile.walk_ms+=now-mark;mark=now;}
     if(snapshot_root) {
         canvas_t probe;int px,py;
         if(!P.failed && web_avmedia_snapshot_prepare(d,c,&probe,&px,&py,doc_x,doc_y)) {
@@ -2137,6 +2193,7 @@ void web_paint(web_doc *d, canvas_t *c, int x, int y, int w, int h, int doc_x, i
         }
         web_avmedia_snapshot_finish();
         web_frames_finish_paint(d);
+        if(profile)paint_profile.probe_ms+=uptime_ms()-mark;
     }
     c->cx0 = sx0, c->cy0 = sy0, c->cx1 = sx1, c->cy1 = sy1;
 }

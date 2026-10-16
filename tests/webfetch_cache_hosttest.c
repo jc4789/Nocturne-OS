@@ -26,8 +26,8 @@ static unsigned order_options,order_gets;
 #define CHECK(c) do{checks++;if(!(c)){failed++;printf("FAIL cache:%d %s\n",__LINE__,#c);}}while(0)
 uint64_t uptime_ms(void){return clock_ms;}
 time_t cache_test_time(time_t *out){time_t now=784111777;if(out)*out=now;return now;}
-int wait_on_address(volatile uint32_t *p,uint32_t expected,unsigned timeout){(void)p;(void)expected;(void)timeout;return 0;}
-int wake_address(volatile uint32_t *p,unsigned count){(void)p;(void)count;return 0;}
+n_result wait_on_address(volatile uint32_t *p,uint32_t expected,unsigned timeout){(void)p;(void)expected;(void)timeout;return 0;}
+n_result wake_address(volatile uint32_t *p,unsigned count){(void)p;(void)count;return 0;}
 long cache_test_read(int fd,void *data,size_t bytes){(void)fd;(void)data;(void)bytes;read_calls++;return 0;}
 int cache_test_close(int fd){(void)fd;CHECK(setup_calls==2&&setup_fds[1]==-1);close_calls++;return 0;}
 int net_set_setup_cancel_channel(int fd){

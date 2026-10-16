@@ -16,16 +16,22 @@ struct storage_source {
     uint64_t token, reader, cursor;
     struct storage_notification *events, *tail;
 };
-static bool storage_io_at(int fd,uint64_t at,void *bytes,size_t n,bool writing) {
-    if(at>LONG_MAX || lseek(fd,(long)at,SEEK_SET)<0)return false;
+static bool storage_io_at(n_handle h,uint64_t at,void *bytes,size_t n,bool writing) {
     size_t done=0;
     while(done<n){
-        ssize_t size=writing?write(fd,(char *)bytes+done,n-done):read(fd,(char *)bytes+done,n-done);
-        if(size<0 && errno==EINTR)continue;
-        if(size<=0 || (size_t)size>n-done)return false;
+        n_result size=writing?n_document_write_at(h,at+done,(char *)bytes+done,n-done):
+                              n_document_read_at(h,at+done,(char *)bytes+done,n-done);
+        if(size<=0 || (uint64_t)size>n-done)return false;
         done+=(size_t)size;
     }
     return true;
+}
+/* The document at path, created empty when absent, open for reading and writing. */
+static n_handle storage_document(const char *path) {
+    n_handle h=n_document_open(path,N_DOCUMENT_EDIT);
+    if(h!=-N_ERR_NOT_FOUND)return h;
+    h=n_document_open(path,N_DOCUMENT_CREATE);
+    return h==-N_ERR_EXISTS?n_document_open(path,N_DOCUMENT_EDIT):h;
 }
 static void storage_control_pack(struct storage_control *h,uint8_t b[128]) {
     memset(b,0,128);memcpy(b,"NWSHARE1",8);
@@ -48,11 +54,9 @@ static bool storage_control_unpack(uint8_t b[128],struct storage_control *h) {
 }
 static int storage_control_read(struct storage_area *a,struct storage_control *h) {
     uint8_t bytes[STORAGE_CONTROL_BYTES]={0};size_t done=0;
-    if(lseek(a->shared_fd,0,SEEK_SET)<0)goto failed;
     while(done<sizeof bytes){
-        ssize_t size=read(a->shared_fd,bytes+done,sizeof bytes-done);
-        if(size<0 && errno==EINTR)continue;
-        if(size<0 || (size_t)size>sizeof bytes-done)goto failed;
+        n_result size=n_document_read_at(a->shared,done,bytes+done,sizeof bytes-done);
+        if(size<0 || (uint64_t)size>sizeof bytes-done)goto failed;
         if(!size)break;
         done+=(size_t)size;
     }
@@ -74,7 +78,7 @@ static bool storage_control_commit(struct storage_area *a,struct storage_control
     if(h->serial==UINT64_MAX)return false;
     h->serial++;uint8_t b[128];storage_control_pack(h,b);
     size_t offset=(h->serial&1u)*128;
-    if(!storage_io_at(a->shared_fd,offset,b,128,true)){a->shared_control_cached=false;return false;}
+    if(!storage_io_at(a->shared,offset,b,128,true)){a->shared_control_cached=false;return false;}
     if(a->shared_control_cached){memcpy(a->shared_control_bytes+offset,b,128);a->shared_control=*h;}
     return true;
 }
@@ -90,7 +94,7 @@ static struct n_procinfo *storage_processes(int *count) {
 }
 static uint64_t storage_process_start(void) {
     int count=0;struct n_procinfo *list=storage_processes(&count);uint64_t start=0;
-    for(int i=0;list && i<count;i++)if(list[i].pid==getpid()){start=list[i].start_ms;break;}
+    for(int i=0;list && i<count;i++)if(list[i].pid==(int)n_app_self()){start=list[i].start_ms;break;}
     free(list);return start;
 }
 static bool storage_reader_alive(const uint8_t row[48],struct n_procinfo *list,int count) {
@@ -98,57 +102,57 @@ static bool storage_reader_alive(const uint8_t row[48],struct n_procinfo *list,i
         list[i].start_ms==storage_u64(row+16) && list[i].state!=3)return true;
     return false;
 }
-static int storage_readers_open(struct storage_area *a) {
+static n_handle storage_readers_open(struct storage_area *a) {
     char path[160];storage_path_at(WEBSTORAGE_SHARED_ROOT,a->origin,3,path);
-    return open(path,O_RDWR|O_CREAT);
+    return storage_document(path);
 }
 static bool storage_reader_register(struct storage_area *a,uint64_t token,bool holder,
                                     const struct storage_control *h,uint64_t *offset) {
-    int fd=storage_readers_open(a);if(fd<0)return false;
-    struct n_stat st;bool ok=fstat(fd,&st)==0 && st.size%STORAGE_READER_BYTES==0;
+    n_handle readers=storage_readers_open(a);if(readers<0)return false;
+    n_result size=n_document_size(readers);bool ok=size>=0 && size%STORAGE_READER_BYTES==0;
     int count=0;struct n_procinfo *list=ok?storage_processes(&count):NULL;
     if(!list)ok=false;
     uint64_t vacant=UINT64_MAX;uint8_t row[48];bool found=false;
-    for(uint64_t at=0;ok && at<st.size;at+=48){
-        if(!storage_io_at(fd,at,row,48,false)){ok=false;break;}
+    for(uint64_t at=0;ok && at<(uint64_t)size;at+=48){
+        if(!storage_io_at(readers,at,row,48,false)){ok=false;break;}
         if(storage_u64(row) && !storage_reader_alive(row,list,count)){
-            memset(row,0,48);if(!storage_io_at(fd,at,row,48,true)){ok=false;break;}
+            memset(row,0,48);if(!storage_io_at(readers,at,row,48,true)){ok=false;break;}
         }
         if(storage_u64(row)==token && storage_u64(row+40)==(uint64_t)holder){*offset=at;found=true;break;}
         if(!storage_u64(row) && vacant==UINT64_MAX)vacant=at;
     }
     if(ok && !found){
-        *offset=vacant==UINT64_MAX?st.size:vacant;memset(row,0,48);
-        storage_put64(row,token);storage_put64(row+8,(uint32_t)getpid());storage_put64(row+16,storage_process_start());
+        *offset=vacant==UINT64_MAX?(uint64_t)size:vacant;memset(row,0,48);
+        storage_put64(row,token);storage_put64(row+8,(uint32_t)n_app_self());storage_put64(row+16,storage_process_start());
         storage_put64(row+24,h->epoch);storage_put64(row+32,h->end);storage_put64(row+40,holder);
-        ok=storage_io_at(fd,*offset,row,48,true);
+        ok=storage_io_at(readers,*offset,row,48,true);
     }
-    free(list);if(close(fd)<0)ok=false;return ok;
+    free(list);if(n_handle_close(readers)<0)ok=false;return ok;
 }
 static bool storage_reader_update(struct storage_area *a,uint64_t offset,uint64_t token,
                                   uint64_t epoch,uint64_t cursor,bool remove) {
-    int fd=storage_readers_open(a);if(fd<0)return false;uint8_t row[48];
-    bool ok=storage_io_at(fd,offset,row,48,false) && storage_u64(row)==token && !storage_u64(row+40);
+    n_handle readers=storage_readers_open(a);if(readers<0)return false;uint8_t row[48];
+    bool ok=storage_io_at(readers,offset,row,48,false) && storage_u64(row)==token && !storage_u64(row+40);
     if(ok){
         if(remove)memset(row,0,48);else{storage_put64(row+24,epoch);storage_put64(row+32,cursor);}
-        ok=storage_io_at(fd,offset,row,48,true);
+        ok=storage_io_at(readers,offset,row,48,true);
     }
-    if(close(fd)<0)ok=false;return ok;
+    if(n_handle_close(readers)<0)ok=false;return ok;
 }
 static bool storage_checkpoint_allowed(struct storage_area *a,const struct storage_control *h) {
-    int fd=storage_readers_open(a);if(fd<0)return false;struct n_stat st;
-    bool ok=fstat(fd,&st)==0 && st.size%48==0;int count=0;
+    n_handle readers=storage_readers_open(a);if(readers<0)return false;
+    n_result size=n_document_size(readers);bool ok=size>=0 && size%48==0;int count=0;
     struct n_procinfo *list=ok?storage_processes(&count):NULL;if(!list)ok=false;
     uint8_t row[48];
-    for(uint64_t at=0;ok && at<st.size;at+=48){
-        if(!storage_io_at(fd,at,row,48,false)){ok=false;break;}
+    for(uint64_t at=0;ok && at<(uint64_t)size;at+=48){
+        if(!storage_io_at(readers,at,row,48,false)){ok=false;break;}
         if(!storage_u64(row))continue;
         if(!storage_reader_alive(row,list,count)){
-            memset(row,0,48);if(!storage_io_at(fd,at,row,48,true))ok=false;continue;
+            memset(row,0,48);if(!storage_io_at(readers,at,row,48,true))ok=false;continue;
         }
         if(!storage_u64(row+40) && (storage_u64(row+24)!=h->epoch || storage_u64(row+32)<h->end))ok=false;
     }
-    free(list);if(close(fd)<0)ok=false;return ok;
+    free(list);if(n_handle_close(readers)<0)ok=false;return ok;
 }
 static int storage_checkpoint(struct storage_area *a,struct storage_control *h) {
     if(h->epoch==UINT64_MAX || h->revision==UINT64_MAX)return WEB_STORAGE_IO;
@@ -159,24 +163,22 @@ static int storage_checkpoint(struct storage_area *a,struct storage_control *h) 
     if(!storage_control_commit(a,h))return WEB_STORAGE_IO;
     a->shared_epoch=h->epoch;a->shared_cursor=h->end;
     /* The committed checkpoint is sufficient for recovery. Truncate only
-     * the delta vnode, retaining the lease inode and all existing descriptors.
+     * the delta document, retaining the leased control and every open handle.
      * A crash before truncation leaves an ignored tail; after it, the committed
      * checkpoint is complete. Every operation owns the same control lease. */
-    char path[160];storage_path_at(WEBSTORAGE_SHARED_ROOT,a->origin,4,path);
-    int fd=open(path,O_WRONLY|O_CREAT|O_TRUNC);if(fd<0)return WEB_STORAGE_IO;
-    return close(fd)==0?WEB_STORAGE_OK:WEB_STORAGE_IO;
+    return n_document_set_size(a->shared_log,0)>=0?WEB_STORAGE_OK:WEB_STORAGE_IO;
 }
 static int storage_shared_lock(webstorage *s,struct storage_area *a,struct storage_control *h) {
-    if(a->shared_fd<0){
+    if(a->shared<0){
         if(!storage_dirs_at(WEBSTORAGE_SHARED_ROOT))return WEB_STORAGE_IO;
         char path[160];storage_path_at(WEBSTORAGE_SHARED_ROOT,a->origin,2,path);
-        a->shared_fd=open(path,O_RDWR|O_CREAT);if(a->shared_fd<0)return WEB_STORAGE_IO;
+        a->shared=storage_document(path);if(a->shared<0)return WEB_STORAGE_IO;
     }
-    if(a->shared_log_fd<0){
+    if(a->shared_log<0){
         char path[160];storage_path_at(WEBSTORAGE_SHARED_ROOT,a->origin,4,path);
-        a->shared_log_fd=open(path,O_RDWR|O_CREAT);if(a->shared_log_fd<0)return WEB_STORAGE_IO;
+        a->shared_log=storage_document(path);if(a->shared_log<0)return WEB_STORAGE_IO;
     }
-    if(fcntl(a->shared_fd,F_NLOCK)<0)return WEB_STORAGE_IO;
+    if(n_document_claim(a->shared,true)<0)return WEB_STORAGE_IO;
     memset(h,0,sizeof *h);int present=storage_control_read(a,h),result=WEB_STORAGE_OK;
     if(present<0)result=WEB_STORAGE_IO;
     else if(!present){
@@ -201,15 +203,15 @@ static int storage_shared_lock(webstorage *s,struct storage_area *a,struct stora
         if(!storage_reader_register(a,s->identity,true,h,&holder))result=WEB_STORAGE_IO;
         else a->shared_holder=true;
     }
-    if(result)fcntl(a->shared_fd,F_NUNLOCK);
+    if(result)n_document_release(a->shared);
     return result;
 }
 static int storage_record_read(struct storage_area *a,uint64_t at,uint64_t end,uint8_t **out) {
-    uint8_t header[48];if(at<STORAGE_CONTROL_BYTES || end-at<48 || !storage_io_at(a->shared_log_fd,at-STORAGE_CONTROL_BYTES,header,48,false))return WEB_STORAGE_IO;
+    uint8_t header[48];if(at<STORAGE_CONTROL_BYTES || end-at<48 || !storage_io_at(a->shared_log,at-STORAGE_CONTROL_BYTES,header,48,false))return WEB_STORAGE_IO;
     uint32_t n=storage_u32(header),op=storage_u32(header+4),kn=storage_u32(header+24),old=storage_u32(header+28),value=storage_u32(header+32),url=storage_u32(header+36);
     if(n<48 || n>end-at || (uint64_t)kn+old+value+url!=n-48 || op<WEB_STORAGE_SET || op>WEB_STORAGE_CLEAR)return WEB_STORAGE_IO;
     uint8_t *bytes=malloc(n);if(!bytes)return WEB_STORAGE_QUOTA;
-    memcpy(bytes,header,48);if(!storage_io_at(a->shared_log_fd,at+48-STORAGE_CONTROL_BYTES,bytes+48,n-48,false)){free(bytes);return WEB_STORAGE_IO;}
+    memcpy(bytes,header,48);if(!storage_io_at(a->shared_log,at+48-STORAGE_CONTROL_BYTES,bytes+48,n-48,false)){free(bytes);return WEB_STORAGE_IO;}
     *out=bytes;return WEB_STORAGE_OK;
 }
 static int storage_shared_sync(webstorage *s,struct storage_area *a,const struct storage_control *h) {
@@ -260,9 +262,9 @@ static int storage_event_decode(const uint8_t *record,struct web_storage_result 
 }
 static int storage_event_poll(struct storage_area *a,struct storage_source *p,const struct storage_control *h,
                               const struct web_storage_request *r,struct web_storage_result *out) {
-    int fd=storage_readers_open(a);uint8_t row[48];
-    bool ok=fd>=0 && storage_io_at(fd,p->reader,row,48,false) && storage_u64(row)==p->token;
-    if(fd>=0)close(fd);if(!ok)return WEB_STORAGE_IO;
+    n_handle readers=storage_readers_open(a);uint8_t row[48];
+    bool ok=readers>=0 && storage_io_at(readers,p->reader,row,48,false) && storage_u64(row)==p->token;
+    if(readers>=0)n_handle_close(readers);if(!ok)return WEB_STORAGE_IO;
     uint64_t epoch=storage_u64(row+24),cursor=storage_u64(row+32);
     if(epoch!=h->epoch){epoch=h->epoch;cursor=STORAGE_CONTROL_BYTES;}
     if(r->operation==WEB_STORAGE_ACK){
@@ -341,8 +343,8 @@ static int storage_delta_publish(struct storage_area *a,struct storage_control *
     storage_put32(record+40,(r->operation!=WEB_STORAGE_CLEAR?1:0)|(existed?2:0)|(r->operation==WEB_STORAGE_SET?4:0));
     size_t at=48;if(kn){memcpy(record+at,r->key,kn);at+=kn;}if(old_len){memcpy(record+at,old,old_len);at+=old_len;}
     if(vn){memcpy(record+at,r->value,vn);at+=vn;}if(url_len)memcpy(record+at,r->url,url_len);
-    bool ok=storage_io_at(a->shared_log_fd,h->end-STORAGE_CONTROL_BYTES,record,n,true);free(record);if(!ok)return WEB_STORAGE_IO;
-    if(h->revision==h->persisted)h->dirty_since=uptime_ms();h->changed_at=uptime_ms();h->revision++;h->end+=n;
+    bool ok=storage_io_at(a->shared_log,h->end-STORAGE_CONTROL_BYTES,record,n,true);free(record);if(!ok)return WEB_STORAGE_IO;
+    if(h->revision==h->persisted)h->dirty_since=n_clock_uptime_ms();h->changed_at=n_clock_uptime_ms();h->revision++;h->end+=n;
     if(!storage_control_commit(a,h))return WEB_STORAGE_IO;
     a->shared_epoch=h->epoch;a->shared_cursor=h->end;return WEB_STORAGE_OK;
 }
@@ -355,27 +357,27 @@ static int storage_shared_flush(webstorage *s,struct storage_area *a,struct web_
         if(!result){h.persisted=h.revision;h.generation=a->generation;h.slot=a->slot;
             if(!storage_control_commit(a,&h))result=WEB_STORAGE_IO;}
     }
-    fcntl(a->shared_fd,F_NUNLOCK);return result;
+    n_document_release(a->shared);return result;
 }
 static void storage_source_drop(webstorage *s,struct storage_source **link) {
     struct storage_source *p=*link;
     if(p->area->kind==WEB_STORAGE_LOCAL){struct storage_control h;
-        if(!storage_shared_lock(s,p->area,&h)){storage_reader_update(p->area,p->reader,p->token,0,0,true);fcntl(p->area->shared_fd,F_NUNLOCK);}}
+        if(!storage_shared_lock(s,p->area,&h)){storage_reader_update(p->area,p->reader,p->token,0,0,true);n_document_release(p->area->shared);}}
     while(p->events){struct storage_notification *e=p->events;p->events=e->next;s->event_bytes-=e->bytes;webstorage_result_free(&e->data);free(e);}
     *link=p->next;free(p);
 }
 static void storage_sources_free(webstorage *s) {
     while(s->sources)storage_source_drop(s,&s->sources);
     /* Holder rows are reclaimed at the next open/checkpoint if a process exits.
-       No path is unlinked while another process can still hold its vnode. */
-    for(struct storage_area *a=s->areas;a;a=a->next)if(a->shared_fd>=0){
+       No path is removed while another app can still hold it open. */
+    for(struct storage_area *a=s->areas;a;a=a->next)if(a->shared>=0){
         struct storage_control h;if(storage_shared_lock(s,a,&h))continue;
-        int fd=storage_readers_open(a);struct n_stat st;uint8_t row[48];
-        if(fd>=0 && fstat(fd,&st)==0)for(uint64_t at=0;at<st.size;at+=48)
-            if(storage_io_at(fd,at,row,48,false) && storage_u64(row)==s->identity && storage_u64(row+40)){
-                memset(row,0,48);storage_io_at(fd,at,row,48,true);break;
+        n_handle readers=storage_readers_open(a);n_result size=readers>=0?n_document_size(readers):-1;uint8_t row[48];
+        for(n_result at=0;at+48<=size;at+=48)
+            if(storage_io_at(readers,at,row,48,false) && storage_u64(row)==s->identity && storage_u64(row+40)){
+                memset(row,0,48);storage_io_at(readers,at,row,48,true);break;
             }
-        if(fd>=0)close(fd);fcntl(a->shared_fd,F_NUNLOCK);
+        if(readers>=0)n_handle_close(readers);n_document_release(a->shared);
     }
 }
 int webstorage_access(webstorage *s,const char *origin,const struct web_storage_request *r,struct web_storage_result *out) {
@@ -441,6 +443,6 @@ int webstorage_access(webstorage *s,const char *origin,const struct web_storage_
 mutation_done:
     storage_entries_free(prepared);storage_session_discard(pending);
 done:
-    if(locked)fcntl(a->shared_fd,F_NUNLOCK);
+    if(locked)n_document_release(a->shared);
     return result;
 }

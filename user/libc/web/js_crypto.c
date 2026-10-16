@@ -2,11 +2,9 @@
 #include <bearssl_hash.h>
 #include <bearssl_block.h>
 #include <bearssl_aead.h>
-#include <errno.h>
 #include <stdbool.h>
-#include <fcntl.h>
 #include <string.h>
-#include <unistd.h>
+#include <nocturne.h>
 
 static void crypto_wipe(void *p,size_t length){volatile uint8_t *v=p;while(length--)*v++=0;}
 static void crypto_counter_add(uint8_t counter[16],int bits,uint64_t blocks){
@@ -32,24 +30,11 @@ static JSValue crypto_random(JSContext *ctx, JSValueConst self, int argc, JSValu
     if (!length) return JS_NewArrayBufferCopy(ctx, NULL, 0);
     uint8_t *bytes = js_malloc(ctx, (size_t)length);
     if (!bytes) return JS_EXCEPTION;
-    int fd = open("/dev/random", O_RDONLY);
-    if (fd < 0) {
+    if (n_random(bytes, (size_t)length) != (n_result)length) {
+        memset(bytes, 0, (size_t)length);
         js_free(ctx, bytes);
-        return JS_ThrowInternalError(ctx, "System random source is unavailable");
+        return JS_ThrowInternalError(ctx, "System random source could not fill the request");
     }
-    size_t done = 0;
-    while (done < length) {
-        ssize_t n = read(fd, bytes + done, (size_t)length - done);
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0 || (size_t)n > (size_t)length - done) {
-            close(fd);
-            memset(bytes, 0, (size_t)length);
-            js_free(ctx, bytes);
-            return JS_ThrowInternalError(ctx, "System random source could not fill the request");
-        }
-        done += (size_t)n;
-    }
-    close(fd);
     JSValue result = JS_NewArrayBuffer(ctx, bytes, (size_t)length, crypto_buffer_free, NULL, 0);
     /* JS_NewArrayBuffer does not take ownership on allocation failure. */
     if (JS_IsException(result)) {

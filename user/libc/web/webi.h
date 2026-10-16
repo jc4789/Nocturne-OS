@@ -352,9 +352,13 @@ enum { CV_VISIBLE, CV_AUTO, CV_HIDDEN };
 enum { CT_NORMAL, CT_INLINE_SIZE, CT_SIZE };
 enum { BO_HORIZONTAL, BO_VERTICAL };
 
+struct var_segment;
 struct custom_prop {
     const char *name, *value;
     struct custom_prop *next;
+    /* Only on the first of one element's own declarations: a name index of
+       that element's declarations and the inherited chain after them. */
+    const struct var_segment *segment;
 };
 
 /* linear-gradient() and radial-gradient(): colour stops along a line, or out from a centre */
@@ -518,12 +522,13 @@ void css_refresh_font_selection(web_doc *d);
 bool css_containers_update(web_doc *d); /* supervisor, after layout; changed query inputs */
 bool css_container_names_valid(const char *s, size_t n);
 void css_mark_dirty(web_doc *d, node_t *n);
-void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree);
+void css_mark_child_list_dirty(web_doc *d,node_t *parent,node_t *subtree,bool inserted);
 void css_node_style_free(node_t *n);
 void css_style_doc_free(web_doc *d);
 void css_node_style_unpublish(node_t *n);
 void css_styles_release(web_doc *d);
 bool css_style_layout_equal(const style_t *a, const style_t *b);
+const struct custom_prop *css_custom_property(const style_t *s, const char *name); /* computed --name, or NULL */
 int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text);
 void css_animation_free(node_t *n);
 void css_motion_tick(web_doc *d, uint64_t now);
@@ -622,10 +627,12 @@ typedef struct box {
     float inline_cb_left, inline_cb_top, inline_cb_right, inline_cb_bottom;
     uint64_t paint_bounds_generation;
     float paint_bounds[4]; /* document-space conservative subtree bounds, one paint only */
+    uint32_t visual_memo_x, visual_memo_y; /* box_visual_memo generation of the memoized coordinate below */
+    float visual_x, visual_y;
     bool paint_bounds_valid;
     bool paint_alpha; /* existing build/restyle traversal aggregates real subtree alpha effects */
     pvec paint_layers; /* stable stacking order; owned until box retirement */
-    uint64_t paint_layers_layout, paint_layers_dom;
+    uint64_t paint_layers_layout, paint_layers_style; /* box tree layout + published styles (stacking contexts) */
     bool paint_layers_valid;
     struct shadow_cache *shadow_cache; /* geometry-only Gaussian masks; box lifetime */
     struct radius_cache *radius_clip[3]; /* border, padding, replaced-content clip masks */
@@ -744,6 +751,10 @@ float box_abs_y(const box_t *b);
 /* Paint/hit/DOMRect positions; box_abs remains unscrolled offset geometry. */
 float box_visual_x(const box_t *b);
 float box_visual_y(const box_t *b);
+/* Within one paint scroll/translation inputs are fixed: memoize visual
+   coordinates until box_visual_memo_end restores the previous generation. */
+uint32_t box_visual_memo_begin(void);
+void box_visual_memo_end(uint32_t previous);
 bool box_filter_containing_block(const box_t *b); /* filters/transforms establish descendant containing blocks */
 bool css_translation_active(const style_t *s);
 enum { CSS_TRANSLATE_INDIVIDUAL=1,CSS_TRANSLATE_TRANSFORM=2 };
@@ -876,12 +887,13 @@ struct web_doc {
     bool metadata_valid;
     uint64_t layout_revision;
     struct web_hit_index *hit_index; /* paint-order spatial index, no DOM ownership */
-    uint64_t paint_order_layout, paint_order_dom;
+    uint64_t paint_order_layout;
     uint64_t paint_order_visual; /* fractional scroll/translation invalidates shadow mask alignment */
     bool paint_shadow_crop;
     int paint_shadow_view_x, paint_shadow_view_y;
     bool paint_order_valid;
     uint64_t visual_revision; /* element scrolling/marquee geometry, not video pixels */
+    uint64_t style_revision; /* published box styles: opacity/filter/z-index decide stacking contexts */
     float paint_damage[4];
     bool paint_damage_valid, paint_damage_full;
     struct html_parser *parser;

@@ -19,12 +19,22 @@ static struct block *head, *tail;
 static uint64_t heap_end = KHEAP_BASE;
 static uint64_t heap_used;
 
+/* All or nothing: pages mapped before a failure go back, so heap_end never
+   covers pages that no block accounts for. */
 static bool grow(uint64_t bytes) {
     bytes = ALIGN_UP(bytes, PAGE_SIZE);
+    uint64_t start = heap_end;
     for (uint64_t off = 0; off < bytes; off += PAGE_SIZE) {
         uint64_t p = pmm_alloc();
-        if (!p) return false;
-        vmm_map_page(kernel_pml4, heap_end, p, PTE_W | pte_nx);
+        if (!p || !vmm_map_page(kernel_pml4, heap_end, p, PTE_W | pte_nx)) {
+            if (p) pmm_free(p);
+            while (heap_end > start) {
+                heap_end -= PAGE_SIZE;
+                uint64_t old = vmm_unmap_page(kernel_pml4, heap_end);
+                if (old & PTE_P) pmm_free(old & PTE_ADDR);
+            }
+            return false;
+        }
         heap_end += PAGE_SIZE;
     }
     return true;
@@ -48,6 +58,9 @@ static void split(struct block *b, size_t size) {
 void *kmalloc(size_t size) {
     cpu_require_bsp();
     if (size == 0) size = 1;
+    /* A size from user space (a channel message, a document) must not wrap
+       the alignment or the block header arithmetic into a tiny block. */
+    if (size > (uint64_t)1 << 40) return NULL;
     size = ALIGN_UP(size, 16);
     uint64_t f = irq_save();
     for (struct block *b = head; b; b = b->next) {

@@ -1103,7 +1103,7 @@ staged:
         }
         free(subjects);free(changes);return false;
     }
-    web_hit_index_free(d);d->paint_order_valid=false;d->abs_boxes.n=0;d->visual_revision++;
+    web_hit_index_free(d);d->paint_order_valid=false;d->abs_boxes.n=0;d->visual_revision++;d->style_revision++;
     for(size_t i=0;i<count;i++)if(!changes[i].old){
         changes[i].replacement->branch_mem=changes[i].arena;changes[i].arena=NULL;
         changes[i].replacement->parent=changes[i].parent;
@@ -1235,7 +1235,7 @@ void boxes_restyle(web_doc *d) {
     restyle_boxes(d->root_box,false);
     /* Geometry reuse does not mean hit/paint reuse: opacity, visibility and
        pointer-events can change with a native effect and no DOM revision. */
-    d->visual_revision++;d->paint_order_valid=false;
+    d->visual_revision++;d->style_revision++;d->paint_order_valid=false;
 }
 
 bool boxes_update_text(web_doc *d, node_t *n) {

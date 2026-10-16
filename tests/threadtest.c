@@ -329,9 +329,9 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < 16; i++) if (cpu_mask & (1u << i)) active++;
     if (info.scheduler_cpus > 1 && active < 2) bad++;
     volatile uint32_t timeout_word = 0;
-    if (wait_on_address(&timeout_word, 0, 2) != -1 || errno != ETIMEDOUT) bad++;
+    if (wait_on_address(&timeout_word, 0, 2) != -N_ERR_TIMEOUT) bad++;
     timeout_word = 1;
-    if (wait_on_address(&timeout_word, 0, 1000) != -1 || errno != EAGAIN) bad++;
+    if (wait_on_address(&timeout_word, 0, 1000) != -N_ERR_NOT_READY) bad++;
     uint64_t previous = uptime_ms();
     for (unsigned i = 0; i < 20000; i++) {
         uint64_t now = uptime_ms();
