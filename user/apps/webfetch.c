@@ -1312,6 +1312,22 @@ static bool transport_retry(const struct job *j,const struct http_req *q,const s
     return !q->body&&(!strcmp(q->method,"GET")||!strcmp(q->method,"HEAD"));
 }
 static bool run_http(struct job *j) {
+    if (top_level_navigation(j)) {
+        /* Native chrome navigations have no client document. The previous
+           page (an error page for an address the user mistyped) is only
+           context; an unparsable one makes the request browser-initiated. */
+        char *context[2] = {j->document, j->top_level_url};
+        for (int i = 0; i < 2; i++) {
+            if (!context[i] || !*context[i]) continue;
+            char *origin = NULL;
+            enum http_url_result result = http_url(context[i], NULL, &origin);
+            free(origin);
+            if (result == HTTP_URL_OOM) return url_failure(j, result, "");
+            if (result == HTTP_URL_TUPLE || result == HTTP_URL_OPAQUE) continue;
+            if (i) { free(j->top_level_url); j->top_level_url = NULL; }
+            else j->document[0] = 0;
+        }
+    }
     enum http_url_result parsed = *j->document ? http_url(j->document, NULL, &j->origin) : HTTP_URL_OPAQUE;
     if (parsed != HTTP_URL_TUPLE && parsed != HTTP_URL_OPAQUE)
         return url_failure(j, parsed, "Invalid initiating document URL");

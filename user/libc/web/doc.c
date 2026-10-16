@@ -835,10 +835,16 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
     d->input_identity=__atomic_add_fetch(&input_serial,1,__ATOMIC_RELAXED);
     d->initial_render_deadline=uptime_ms()+3000;
     d->frame_parent=parent;d->frame_element=frame;
+    /* A frame whose own policy disables scripting but keeps its origin
+       (sandbox="allow-same-origin" without allow-scripts) still has a Window
+       realm the same-origin embedder may use; its own scripts, handlers and
+       script-initiated tasks stay refused by the SB_SCRIPTS checks. */
+    bool realm_only=false;
     if(parent && frame){
         struct web_frame *f=web_frame_find(parent,frame);d->window_token=f?f->window_token:NULL;
         d->sandbox_flags=f?f->pending_sandbox_flags:parent->sandbox_flags;
         if(f && f->sandbox_initial && d->sandbox_flags)d->sandbox_flags|=SB_SCRIPTS;
+        realm_only=f && (f->pending_sandbox_flags&SB_SCRIPTS) && !(d->sandbox_flags&(SB_ORIGIN|SB_UNSUPPORTED));
     }
     if(inherited_origin && parent){
         d->origin_owner=inherited_origin->origin_owner?inherited_origin->origin_owner:inherited_origin;
@@ -866,10 +872,11 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
     d->parser = d->html_srcdoc?html_begin_string(d,html?html:"",html?len:0,!(d->sandbox_flags&SB_SCRIPTS),true):
         html_begin(d, html ? html : "", html ? len : 0, charset, !(d->sandbox_flags&SB_SCRIPTS));
     if (!d->parser) { web_free(d); return NULL; }
-    /* The restricted initial blank exposes only a native WindowProxy token.
-       Do not create a QuickJS realm whose raw Function/eval could bypass
-       disabled task dispatch when borrowed by the embedding document. */
-    if(!(d->sandbox_flags&SB_SCRIPTS))web_js_start(d, host);
+    /* The restricted initial blank of a scripted sandbox exposes only a native
+       WindowProxy token. Do not create a QuickJS realm whose raw Function/eval
+       could bypass disabled task dispatch when borrowed by the embedding
+       document. A realm-only frame's natives refuse every task authority. */
+    if(!(d->sandbox_flags&SB_SCRIPTS) || realm_only)web_js_start(d, host);
     return d;
 }
 

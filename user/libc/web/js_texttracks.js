@@ -13,7 +13,7 @@ const textTrackBridge = (() => {
     const schedule=fn=>host.timer(0,fn,0,[]), encoder=new TextEncoder(), encode=TextEncoder.prototype.encode;
     const decoder=new TextDecoder('utf-8',{fatal:true}), decode=TextDecoder.prototype.decode;
     const Abort=fetchBridge.AbortController, bodyBytes=fetchBridge.Response.prototype.arrayBuffer;
-    const refs=new Set(), MAX_MEDIA=16, MAX_TRACKS=16, MAX_CUES=4096, MAX_TEXT=2048, MAX_SOURCE=524288, MAX_TOTAL=1048576;
+    const refs=new Set();
     let pollTimer=0, sequence=0;
     const lookup=(map,value,name)=>{const s=apply(mapGet,map,[value]);if(!s)throw new TypeError('Illegal '+name+' receiver');return s;};
     const cue=v=>lookup(cueSlots,v,'TextTrackCue'), track=v=>lookup(trackSlots,v,'TextTrack');
@@ -24,7 +24,7 @@ const textTrackBridge = (() => {
     const unsupported=message=>new DOMException(message,'NotSupportedError');
     const size=text=>apply(encode,encoder,[text]).byteLength;
     function plain(value){const text=string(value);if(text.includes('\0'))throw new TypeError('Cue contains NUL');
-        if(size(text)>MAX_TEXT)throw quota('Cue text exceeds 2 KiB');return text;}
+        return text;}
     const defaults=()=>({region:null,vertical:'',snapToLines:true,line:'auto',lineAlign:'start',position:'auto',positionAlign:'auto',size:100,align:'center'});
     function percent(value){const n=finite(value);if(n<0||n>100)throw new DOMException('Percentage is outside 0..100','IndexSizeError');return n;}
     class VTTRegion {
@@ -80,7 +80,6 @@ const textTrackBridge = (() => {
             const value=plain(text);put(cueSlots,this,{id:'',start:finite(start),end:finite(end),text:value,tree:null,bytes:size(value),pause:false,track:null,order:++sequence,active:false,...defaults()});}
         get text(){return cue(this).text;}
         set text(v){const s=cue(this),value=plain(v),bytes=size(value),t=s.track?track(s.track):null,delta=bytes-s.bytes;
-            if(t&&(t.bytes+delta>MAX_TOTAL||t.owner&&t.owner.bytes+delta>MAX_TOTAL))throw quota('Text track text quota');
             if(t){t.bytes+=delta;if(t.owner)t.owner.bytes+=delta;}s.text=value;s.tree=null;s.bytes=bytes;if(t)changed(t);}
         get region(){return cue(this).region;}
         set region(v){const s=cue(this);if(v!==null)lookup(regionSlots,v,'VTTRegion');s.region=v;if(s.track)changed(track(s.track));}
@@ -103,7 +102,6 @@ const textTrackBridge = (() => {
         get cues(){const s=track(this);return s.mode==='disabled'?null:s.cues;}
         get activeCues(){const s=track(this);if(s.owner)update(s.owner);return s.mode==='disabled'?null:s.active;}
         addCue(value){const s=track(this),c=cue(value);if(s.items.includes(value))return;
-            if(s.items.length>=MAX_CUES||s.bytes+c.bytes>MAX_TOTAL||s.owner&&(s.owner.bytes+c.bytes>MAX_TOTAL||s.owner.cueCount>=MAX_CUES))throw quota('Text track cue quota');
             if(c.track)c.track.removeCue(value);c.track=this;s.items.push(value);s.bytes+=c.bytes;if(s.owner){s.owner.bytes+=c.bytes;s.owner.cueCount++;}sortCues(s);changed(s);}
         removeCue(value){const s=track(this),c=cue(value),i=s.items.indexOf(value);if(i<0)throw new DOMException('Cue is not in this track','NotFoundError');
             s.items.splice(i,1);s.bytes-=c.bytes;if(s.owner){s.owner.bytes-=c.bytes;s.owner.cueCount--;}c.track=null;sortCues(s);changed(s);}
@@ -132,7 +130,7 @@ const textTrackBridge = (() => {
     for(const [k,v]of [['NONE',0],['LOADING',1],['LOADED',2],['ERROR',3]]){define(HTMLTrackElement,k,{value:v,enumerable:true});define(HTMLTrackElement.prototype,k,{value:v,enumerable:true});}
     function timestamp(value){const m=/^(?:(\d{2,}):)?(\d{2}):(\d{2})\.(\d{3})$/.exec(value);
         if(!m||+m[2]>59||+m[3]>59)throw new TypeError('Invalid WebVTT timestamp');
-        const n=(+(m[1]||0)*3600 + +m[2]*60 + +m[3])+ +m[4]/1000;if(n>1e9)throw quota('WebVTT time limit');return n;}
+        const n=(+(m[1]||0)*3600 + +m[2]*60 + +m[3])+ +m[4]/1000;return n;}
     function decodeEntities(text){return text.replace(/&(?:amp|lt|gt|nbsp|lrm|rlm);/g,v=>({'&amp;':'&','&lt;':'<','&gt;':'>','&nbsp;':'\u00a0','&lrm;':'\u200e','&rlm;':'\u200f'}[v]));}
     function settings(text,regions){const result=defaults(),seen=new Set();for(const setting of text.trim().split(/[ \t]+/)){const colon=setting.indexOf(':');if(colon<1)continue;const name=setting.slice(0,colon),value=setting.slice(colon+1);if(seen.has(name))continue;let valid=false;
             if(name==='region'&&regions.has(value)){result.region=regions.get(value);valid=true;}
@@ -149,21 +147,21 @@ const textTrackBridge = (() => {
     function parseVTT(text){if(text.charCodeAt(0)===0xfeff)text=text.slice(1);text=text.replace(/\r\n?/g,'\n');
         if(text.includes('\0'))throw new TypeError('WebVTT contains NUL');const lines=text.split('\n');
         if(!/^WEBVTT(?:[ \t].*)?$/.test(lines[0])||lines[0].includes('-->'))throw new TypeError('Invalid WebVTT signature');
-        let i=1,total=0,last=-Infinity;const result=[],regions=new Map();
-        while(i<lines.length&&lines[i]!==''){if(lines[i].trim())throw unsupported('WebVTT header extensions are unsupported');i++;}
+        let i=1;const result=[],regions=new Map();
+        while(i<lines.length&&lines[i]!=='')i++; /* header lines after WEBVTT carry no cues */
         if(i===lines.length&&lines.length>1)throw new TypeError('WebVTT header requires a blank line');
         while(i<lines.length){while(i<lines.length&&!lines[i])i++;if(i>=lines.length)break;
             const block=[];while(i<lines.length&&lines[i])block.push(lines[i++]);
             if(/^NOTE(?:[ \t]|$)/.test(block[0]))continue;
             if(/^REGION(?:[ \t]|$)/.test(block[0])){const region=parseRegion(block);if(region.id)regions.set(region.id,region);continue;}
-            if(/^STYLE(?:[ \t]|$)/.test(block[0]))throw unsupported('WebVTT STYLE stylesheet blocks are unsupported');
+            if(/^STYLE(?:[ \t]|$)/.test(block[0]))continue; /* cue stylesheets are not applied; the cues still are */
             let id='',at=0;if(!block[0].includes('-->')){id=block[0];at++;}
-            if(at>=block.length)throw new TypeError('WebVTT cue has no timing line');
+            if(at>=block.length)continue;
             const timing=/^([^ \t]+)[ \t]+-->[ \t]+([^ \t]+)(.*)$/.exec(block[at++]);
-            if(!timing)throw new TypeError('Invalid WebVTT cue timing');const layout=settings(timing[3],regions);
-            const start=timestamp(timing[1]),end=timestamp(timing[2]);if(end<=start||start<last)throw new TypeError('Invalid WebVTT cue order/duration');last=start;
-            const raw=block.slice(at).join('\n');if(size(raw)>MAX_TEXT)throw quota('WebVTT cue text exceeds 2 KiB');total+=size(raw);
-            if(total>MAX_TOTAL||result.length>=MAX_CUES)throw quota('WebVTT cue quota');result.push({id,start,end,text:raw,layout});
+            if(!timing)continue;const layout=settings(timing[3],regions);
+            let start,end;try{start=timestamp(timing[1]);end=timestamp(timing[2]);}catch(_){continue;}if(end<=start)continue;
+            const raw=block.slice(at).join('\n');
+            result.push({id,start,end,text:raw,layout});
         }return result;}
     function abortTrack(s){s.epoch++;if(s.controller)s.controller.abort();s.controller=null;s.signature=null;}
     function loadTrack(s,url,signature){if(s.mode==='disabled'||s.signature===signature)return;
@@ -175,10 +173,8 @@ const textTrackBridge = (() => {
             const response=await privateFetch(url,{signal:controller.signal,mode:cross===null?'same-origin':'cors',
                 credentials:cross==='use-credentials'?'include':'same-origin',redirect:'error'});
             if(!current())return;if(!response.ok)throw new Error('Text track HTTP status '+response.status);
-            const length=Number(response.headers.get('content-length'));if(Number.isFinite(length)&&length>MAX_SOURCE)throw quota('WebVTT source exceeds 512 KiB');
-            const bytes=await apply(bodyBytes,response,[]);if(!current())return;if(bytes.byteLength>MAX_SOURCE)throw quota('WebVTT source exceeds 512 KiB');
-            const parsed=parseVTT(apply(decode,decoder,[new Uint8Array(bytes)]));let total=0;for(const c of parsed)total+=size(c.text);
-            if(o.bytes+total>MAX_TOTAL||o.cueCount+parsed.length>MAX_CUES)throw quota('Media text track aggregate quota');
+            const bytes=await apply(bodyBytes,response,[]);if(!current())return;
+            const parsed=parseVTT(apply(decode,decoder,[new Uint8Array(bytes)]));
             /* Raw cue markup stays raw; entity decoding happens once in the
              * cue text tokenizer, never through the document HTML parser. */
             for(const c of parsed){const value=new VTTCue(c.start,c.end,c.text);const v=cue(value);Object.assign(v,c.layout);v.id=c.id;v.track=s.object;s.items.push(value);s.bytes+=v.bytes;o.bytes+=v.bytes;o.cueCount++;}
@@ -190,10 +186,9 @@ const textTrackBridge = (() => {
         for(const c of s.activeItems)cue(c).active=false;s.activeItems=[];indexed(s.active,[]);queue(o.list,'removetrack',{track:t});}
     function sync(o){if(o.syncing)return;o.syncing=true;try{
         const elements=[];for(const node of o.node.children)if(node.namespaceURI===HTML&&node.localName==='track')elements.push(node);
-        if(elements.length+o.items.filter(t=>!track(t).element).length>MAX_TRACKS)throw quota('At most 16 text tracks per media');
         for(const t of o.items.slice())if(track(t).element&&!elements.includes(track(t).element))removeTrack(o,t);
         for(const element of elements){let t=apply(mapGet,elementSlots,[element]);if(!t){t=new TextTrack(token,null,'subtitles','','',element);put(elementSlots,element,t);}const s=track(t);
-            if(s.owner!==o){if(o.bytes+s.bytes>MAX_TOTAL||o.cueCount+s.items.length>MAX_CUES)throw quota('Media text track aggregate quota');if(s.owner)removeTrack(s.owner,t);s.owner=o;o.items.push(t);o.bytes+=s.bytes;o.cueCount+=s.items.length;queue(o.list,'addtrack',{track:t});}
+            if(s.owner!==o){if(s.owner)removeTrack(s.owner,t);s.owner=o;o.items.push(t);o.bytes+=s.bytes;o.cueCount+=s.items.length;queue(o.list,'addtrack',{track:t});}
             const kind=(element.getAttribute('kind')||'subtitles').toLowerCase();s.kind=KINDS.includes(kind)?kind:'metadata';s.label=element.getAttribute('label')||'';s.language=element.getAttribute('srclang')||'';s.id=element.id;
             if(!s.explicitMode&&element.hasAttribute('default')&&!o.items.some(x=>x!==t&&track(x).mode==='showing'&&['captions','subtitles'].includes(track(x).kind)))s.mode='showing';
             const raw=element.getAttribute('src');let url='',urlError=null;try{if(raw)url=new URL(raw,element.baseURI).href;}catch(e){urlError=e;}
@@ -207,7 +202,7 @@ const textTrackBridge = (() => {
     function update(o,seeking=false){if(o.busy)return;o.busy=true;try{
         const state=mediaState(o.node),gen=generation(o.node),time=state.currentTime,oldTime=o.time;
         if(gen!==o.generation){o.generation=gen;o.time=null;seeking=true;}seeking=seeking||state.seeking;
-        const parts=[];let pause=false,renderedBytes=0,displayOverflow=false;
+        const parts=[];let pause=false;
         for(const t of o.items){const s=track(t),before=s.activeItems,after=s.mode==='disabled'||state.readyState<1?[]:s.items.filter(c=>{const v=cue(c);return v.start<=time&&time<v.end;});
             const current=()=>s.owner===o&&generation(o.node)===gen;
             const exits=before.filter(c=>!after.includes(c)),enters=after.filter(c=>!before.includes(c));
@@ -216,16 +211,16 @@ const textTrackBridge = (() => {
             let missed=false;if(!seeking&&!state.paused&&oldTime!==null&&time>oldTime&&s.mode!=='disabled'&&state.readyState>=1)
                 for(const c of s.items){const v=cue(c);if(v.start>oldTime&&v.end<=time&&!before.includes(c)&&!after.includes(c)){queue(c,'enter',null,current);queue(c,'exit',null,current);missed=true;if(v.pause)pause=true;}}
             s.activeItems=after;indexed(s.active,after);if(exits.length||enters.length||missed){queue(t,'cuechange',null,current);if(s.element)queue(s.element,'cuechange',null,current);}
-            if(s.mode==='showing'&&['subtitles','captions'].includes(s.kind))for(const c of after){const v=cue(c);renderedBytes+=v.bytes+(parts.length?1:0);if(renderedBytes>MAX_TEXT)displayOverflow=true;else {const region=v.region?{...lookup(regionSlots,v.region,'VTTRegion')}:null;parts.push({spans:cueRuns(v.tree||(v.tree=parseText(v.text,v.start,v.end)),time),vertical:v.vertical,snapToLines:v.snapToLines,line:v.line,lineAlign:v.lineAlign,position:v.position,positionAlign:v.positionAlign,size:v.size,align:v.align,region});}}
+            if(s.mode==='showing'&&['subtitles','captions'].includes(s.kind))for(const c of after){const v=cue(c);{const region=v.region?{...lookup(regionSlots,v.region,'VTTRegion')}:null;parts.push({spans:cueRuns(v.tree||(v.tree=parseText(v.text,v.start,v.end)),time),vertical:v.vertical,snapToLines:v.snapToLines,line:v.line,lineAlign:v.lineAlign,position:v.position,positionAlign:v.positionAlign,size:v.size,align:v.align,region});}}
         }
-        o.time=time;const visible=displayOverflow?[]:parts,caption=JSON.stringify(visible);if(displayOverflow){if(!o.displayError){o.displayError=true;host.log(2,'TextTrack: active caption text exceeds 2 KiB');}}else o.displayError=false;
-        if(caption!==o.caption){native('captionCues',o.node,visible);o.caption=caption;}
+        o.time=time;const caption=JSON.stringify(parts);
+        if(caption!==o.caption){native('captionCues',o.node,parts);o.caption=caption;}
         if(pause&&!state.paused)o.node.pause();if(!state.paused&&o.items.some(t=>track(t).mode!=='disabled'))poll();
     }finally{o.busy=false;}}
     function poll(){if(pollTimer)return;pollTimer=host.timer(0,()=>{pollTimer=0;for(const ref of Array.from(refs)){const o=ref.deref();if(!o){refs.delete(ref);continue;}update(o);}},40,[]);}
     function owner(node){brandMedia(node);let o=apply(mapGet,mediaSlots,[node]);if(o)return o;
-        for(const ref of Array.from(refs))if(!ref.deref())refs.delete(ref);if(refs.size>=MAX_MEDIA)throw quota('Text track media limit');
-        o={node,list:new TextTrackList(token),items:[],bytes:0,cueCount:0,time:null,generation:generation(node),caption:'',displayError:false,busy:false,syncing:false};put(mediaSlots,node,o);refs.add(new WeakRef(o));
+        for(const ref of Array.from(refs))if(!ref.deref())refs.delete(ref);
+        o={node,list:new TextTrackList(token),items:[],bytes:0,cueCount:0,time:null,generation:generation(node),caption:'',busy:false,syncing:false};put(mediaSlots,node,o);refs.add(new WeakRef(o));
         lookup(listSlots,o.list,'TextTrackList').owner=o;
         const listener=e=>{try{sync(o);update(o,e.type==='seeking'||e.type==='seeked'||e.type==='emptied'||e.type==='loadstart');}catch(error){report(error);}};
         for(const type of ['timeupdate','seeking','seeked','play','pause','loadedmetadata','emptied','loadstart'])node.addEventListener(type,listener);
@@ -233,7 +228,7 @@ const textTrackBridge = (() => {
     }
     function manage(node){const o=owner(node);sync(o);update(o);return o.list;}
     function addTextTrack(node,kind,label='',language=''){const o=owner(node),k=string(kind);if(!KINDS.includes(k))throw new TypeError('Invalid TextTrack kind');
-        sync(o);if(o.items.length>=MAX_TRACKS)throw quota('At most 16 text tracks per media');const t=new TextTrack(token,o,k,string(label),string(language),null);
+        sync(o);const t=new TextTrack(token,o,k,string(label),string(language),null);
         o.items.push(t);indexed(o.list,o.items);queue(o.list,'addtrack',{track:t});update(o);return t;}
     function reset(node){const o=apply(mapGet,mediaSlots,[node]);if(!o)return;o.time=null;
         for(const t of o.items){const s=track(t);if(s.element){abortTrack(s);clearCues(s);s.ready=0;}for(const c of s.activeItems)cue(c).active=false;s.activeItems=[];indexed(s.active,[]);}
@@ -247,7 +242,10 @@ const textTrackBridge = (() => {
     /* Native parser-created media/track elements also work without author
      * touching textTracks. DOM mutations trigger bounded rescan. */
     let discoverPending=false;
-    function discover(){if(discoverPending)return;discoverPending=true;schedule(()=>{discoverPending=false;try{for(const node of document.querySelectorAll('video,audio'))manage(node);}catch(e){report(e);}});}
+    function discover(){if(discoverPending)return;discoverPending=true;schedule(()=>{discoverPending=false;for(const node of document.querySelectorAll('video,audio')){
+        /* A managed element follows its own tracks through its observer and
+         * media events; only newly inserted media need a first scan. */
+        if(apply(mapGet,mediaSlots,[node]))continue;try{manage(node);}catch(e){report(e);}}});}
     const documentObserver=new MutationObserver(discover);documentObserver.observe(document,{childList:true,subtree:true});discover();
     return {manage,addTextTrack,reset,nodeProtos:[HTMLTrackElement.prototype]};
 })();

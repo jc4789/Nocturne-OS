@@ -153,22 +153,34 @@ bool web_frame_commit_response(struct web_frame *f,const char *html,size_t n,con
     web_frames_commit_viewports(parent);
     parent->dirty=true;return true;
 }
-/* Opaque origins and same-origin ancestor authored realms are deliberately
- * outside this safe subset. The latter require authority propagation through
- * arbitrary borrowed Function/Promise jobs, not just native URL checks. */
+/* Opaque origins, and scripted realms sharing an origin with a less restricted
+ * ancestor, are deliberately outside this safe subset. The latter require
+ * authority propagation through arbitrary borrowed Function/Promise jobs. */
 bool web_sandbox_document_allowed(struct web_frame *f,const char *url,bool inherited) {
     if(!f || !f->element || !f->element->owner)return false;
     uint32_t flags=f->pending_sandbox_flags;
     if(!flags)return true;
     if(!sandbox_supported(flags))return false;
     if(f->sandbox_initial)return url && !strcmp(url,"about:blank");
-    if(inherited || !url || (strncasecmp(url,"https://",8) && strncasecmp(url,"http://",7)))return false;
-    char *origin=NULL;if(http_origin_owned(url,&origin)!=HTTP_URL_TUPLE){free(origin);return false;}
+    /* No script of a script-disabled Document runs, so it cannot lift its own
+       sandbox: same-origin and inherited (about:srcdoc) documents are safe. */
+    if(flags&SB_SCRIPTS)return url && (!strcmp(url,"about:srcdoc") || !strcmp(url,"about:blank") ||
+        (inherited && !strncasecmp(url,"blob:",5)) || !strncasecmp(url,"https://",8) || !strncasecmp(url,"http://",7));
+    /* A scripted sandbox may share its origin only with ancestors restricted
+       at least as much: reaching one then grants no authority it lacks. An
+       inherited blank/srcdoc/blob document takes its creator's origin. */
+    const char *source=url;
+    if(inherited) {
+        if(!url || (strcmp(url,"about:blank") && strcmp(url,"about:srcdoc") && strncasecmp(url,"blob:",5)))return false;
+        source=web_effective_url(f->navigation_owner?f->navigation_owner:f->element->owner);
+    }
+    if(!source || (strncasecmp(source,"https://",8) && strncasecmp(source,"http://",7)))return false;
+    char *origin=NULL;if(http_origin_owned(source,&origin)!=HTTP_URL_TUPLE){free(origin);return false;}
     bool allowed=true;
     for(web_doc *p=f->element->owner;p;p=p->frame_parent) {
         char *ancestor=NULL;
         enum http_url_result parsed=http_origin_owned(web_effective_url(p),&ancestor);
-        if(parsed!=HTTP_URL_TUPLE || !strcmp(origin,ancestor))allowed=false;
+        if(parsed!=HTTP_URL_TUPLE || (!strcmp(origin,ancestor) && (p->sandbox_flags&flags)!=flags))allowed=false;
         free(ancestor);if(!allowed)break;
     }
     free(origin);return allowed;

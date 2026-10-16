@@ -60,7 +60,10 @@ static uint32_t sandbox_parse(const char *value,char *known,size_t capacity) {
     if(!(flags&SB_TOP))flags|=SB_UNSUPPORTED;
     return flags;
 }
+/* Supported profiles keep the document's origin: either scripts are allowed
+ * (cross-origin documents only), or scripts are disabled and the realm is
+ * reachable only by its same-origin embedder. Opaque origins fail closed. */
 static bool sandbox_supported(uint32_t flags) {
-    return !(flags&(SB_ORIGIN|SB_SCRIPTS|SB_UNSUPPORTED));
+    return !(flags&(SB_ORIGIN|SB_UNSUPPORTED));
 }
 #endif

@@ -29,6 +29,23 @@ const navigatorBridge=(()=>{
         if(!worker)define(Interface.prototype,'webdriver',{configurable:true,enumerable:true,get(){
             requireReceiver(this);return false;
         }});
+        // Beacon: a POST that outlives the document, carried by the native
+        // keepalive fetch transport. Only a CORS-safelisted body type may go
+        // without CORS; anything else needs the server's consent.
+        if(!worker)define(Interface.prototype,'sendBeacon',{configurable:true,enumerable:true,writable:true,value:function sendBeacon(url,data=null){
+            requireReceiver(this);
+            if(arguments.length<1)throw new TypeError('sendBeacon requires a URL');
+            const target=new URL(String(url),document.baseURI);
+            if(target.protocol!=='http:'&&target.protocol!=='https:')throw new TypeError('sendBeacon requires an HTTP(S) URL');
+            if(data!==null&&typeof ReadableStream==='function'&&data instanceof ReadableStream)throw new TypeError('sendBeacon cannot send a stream');
+            let safelisted=true;
+            if(data!==null&&typeof Blob==='function'&&data instanceof Blob&&data.type){
+                const essence=data.type.split(';')[0].trim().toLowerCase();
+                safelisted=['application/x-www-form-urlencoded','multipart/form-data','text/plain'].includes(essence);
+            }
+            fetch(target.href,{method:'POST',body:data,keepalive:true,credentials:'include',mode:safelisted?'no-cors':'cors'}).catch(()=>{});
+            return true;
+        }});
         if(!worker&&typeof host.avmedia==='function'){
             const type=host.avmedia;
             class MediaCapabilities {

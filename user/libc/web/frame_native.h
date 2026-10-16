@@ -42,6 +42,46 @@ static bool frame_string_replace(char **slot,const char *text) {
     if(text && !copy)return false;
     free(*slot);*slot=copy;return true;
 }
+/* A blob: URL resolves only in the creating realm's object-URL registry. The
+   document inherits that realm's origin, like a blob URL entry's environment. */
+static void frame_blob_commit(struct web_js_state *s,struct web_frame *f,const char *url) {
+    web_doc *owner=f->navigation_owner?f->navigation_owner:s->doc;
+    free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;
+    if(owner!=s->doc){f->navigation_owner=NULL;f->failed=true;log_text(s,1,"Frame blob URL belongs to another realm");return;}
+    char mime[128];size_t n=0;bool untyped=false;
+    char *body=script_blob_source(s,url,false,&n,mime,&untyped);
+    if(!body){
+        JS_FreeValue(s->ctx,JS_GetException(s->ctx));
+        f->navigation_owner=NULL;f->failed=true;log_text(s,1,"Frame blob URL is revoked or unavailable");return;
+    }
+    /* An untyped Blob is sniffed like an untyped navigation response. */
+    bool html=!strcasecmp(mime,"text/html") || !strcasecmp(mime,"application/xhtml+xml") ||
+        (untyped && n && memchr(body,'<',n<512?n:512));
+    /* Text, script and JSON types render as a plain text document. */
+    bool text=!html && (!strncasecmp(mime,"text/",5) || strstr(mime,"javascript") || strstr(mime,"json") || strstr(mime,"xml"));
+    char *page=NULL;size_t used=0;
+    if(text && n<=(SIZE_MAX-32)/5 && (page=malloc(n*5+32))) {
+        memcpy(page,"<pre>",5);used=5;
+        for(size_t i=0;i<n;i++){
+            const char *entity=body[i]=='<'?"&lt;":body[i]=='&'?"&amp;":NULL;
+            if(entity){memcpy(page+used,entity,strlen(entity));used+=strlen(entity);}else page[used++]=body[i];
+        }
+        memcpy(page+used,"</pre>",6);used+=6;
+    }
+    if(text && !page)log_text(s,2,"Frame blob text document allocation failed");
+    bool made=page!=NULL;
+    bool ok=(html || made) && web_frame_commit(f,made?page:body,made?used:n,url,"utf-8",&s->host,true);
+    free(page);js_free(s->ctx,body);f->navigation_owner=NULL;
+    if(text && !made){f->failed=true;return;}
+    html=html || made;
+    if(!ok){
+        /* The essence was validated as a MIME token; it is not free author text. */
+        char message[192];
+        if(html)snprintf(message,sizeof message,"Frame blob document was refused or could not be allocated");
+        else snprintf(message,sizeof message,"Frame blob URL type cannot be displayed (%s%s)",untyped?"untyped ":"",mime);
+        f->failed=true;log_text(s,1,message);
+    }
+}
 static void frame_sync(struct web_js_state *s,node_t *n) {
     if(!web_frame_element(n) || !connected(s,n) || n->owner!=s->doc)return;
     struct web_frame *f=web_frame_ensure(s->doc,n);
@@ -76,7 +116,7 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
         free(absolute);free(origin);log_text(s,0,message);
     }
     if(!sandbox_supported(f->pending_sandbox_flags) ||
-       (f->pending_sandbox_flags && srcdoc && !f->navigation)) {
+       (f->pending_sandbox_flags && srcdoc && !f->navigation && !web_sandbox_document_allowed(f,"about:srcdoc",true))) {
         web_frame_retire(f);f->failed=true;f->detached=false;
         log_text(s,1,"Sandboxed frame blocked: unsupported opaque/script-disabled/srcdoc policy");return;
     }
@@ -93,18 +133,23 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
         return;
     }
     const char *desired=f->navigation?f->navigation:src;
-    if(f->pending_sandbox_flags && (!*desired || !strcasecmp(desired,"about:blank"))){
+    if(f->pending_sandbox_flags && (!*desired || !strcasecmp(desired,"about:blank")) &&
+       !web_sandbox_document_allowed(f,"about:blank",true)){
         web_frame_retire(f);f->failed=true;f->detached=false;
         free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;f->navigation_owner=NULL;
         log_text(s,1,"Sandboxed authored about:blank policy is outside the supported subset");return;
     }
     if(!*desired || !strcasecmp(desired,"about:blank")) {
-        if((f->navigation || strcmp(f->document->url,"about:blank")) && !web_frame_commit(f,"",0,"about:blank",NULL,&s->host,true))
+        /* The restricted initial blank of a scripted sandbox has no realm;
+           an allowed authored blank replaces it with the frame's own policy. */
+        bool restricted=(f->document->sandbox_flags&SB_SCRIPTS) && !(f->pending_sandbox_flags&SB_SCRIPTS);
+        if((f->navigation || restricted || strcmp(f->document->url,"about:blank")) && !web_frame_commit(f,"",0,"about:blank",NULL,&s->host,true))
             log_text(s,2,"Frame about:blank navigation failed");
         free(f->navigation);free(f->navigation_origin);f->navigation=f->navigation_origin=NULL;f->navigation_owner=NULL;return;
     }
     if(!strncasecmp(desired,"javascript:",11)) {
-        if(web_frame_same_origin(s->doc,f->document) && f->document->js && !f->document->js->disabled){
+        if(web_frame_same_origin(s->doc,f->document) && f->document->js && !f->document->js->disabled &&
+           !(f->document->sandbox_flags&SB_SCRIPTS)){
             struct web_js_state *child=f->document->js;begin_task(child);
             JSValue result=JS_Eval(child->ctx,desired+11,strlen(desired+11),s->doc->url,JS_EVAL_TYPE_GLOBAL);
             if(JS_IsException(result))exception(child);else JS_FreeValue(child->ctx,result);
@@ -114,6 +159,7 @@ static void frame_sync(struct web_js_state *s,node_t *n) {
     }
     char *url=NULL;
     int resolved=web_resolve_url_owned(s->doc->base,desired,&url);
+    if(resolved==1 && !strncasecmp(url,"blob:",5)){frame_blob_commit(s,f,url);free(url);return;}
     bool valid=resolved==1 && permitted_url(s,url,false);
     free(f->navigation);f->navigation=NULL;
     if(!valid){free(url);free(f->navigation_origin);f->navigation_origin=NULL;f->navigation_owner=NULL;f->failed=true;log_text(s,resolved<0?2:1,resolved<0?"Frame source URL allocation failed":"Frame source URL is not permitted");return;}
@@ -516,7 +562,7 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
         frame_sync(s,token);target=frame_window_document(token);
         if(!target){result=JS_NULL;goto out;}
         if(!strcmp(op,"window"))result=wrap(s,frame_window_token(target));
-        else if(!target->js || !target->js->ctx || (target->sandbox_flags&SB_SCRIPTS) || !web_frame_same_origin(caller->doc,target))result=JS_NULL;
+        else if(!target->js || !target->js->ctx || !web_frame_same_origin(caller->doc,target))result=JS_NULL;
         else {JSValue global=JS_GetGlobalObject(target->js->ctx);result=JS_GetPropertyStr(ctx,global,"document");JS_FreeValue(ctx,global);}
     }else if(!strcmp(op,"self"))result=wrap(s,frame_window_token(s->doc));
     else if(!strcmp(op,"parent") || !strcmp(op,"top")){
@@ -529,7 +575,7 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
         /* No native Window in this implementation has an opener browsing
            context. The original getter is cross-origin readable as null;
            same-origin author replacements remain ordinary property values. */
-        if(!target || !target->live || !target->js || !target->js->ctx || (target->sandbox_flags&SB_SCRIPTS) || !web_frame_same_origin(caller->doc,target))result=JS_NULL;
+        if(!target || !target->live || !target->js || !target->js->ctx || !web_frame_same_origin(caller->doc,target))result=JS_NULL;
         else {JSValue global=JS_GetGlobalObject(target->js->ctx);result=JS_GetPropertyStr(ctx,global,"opener");JS_FreeValue(ctx,global);}
     }
     else if(!strcmp(op,"length") || !strcmp(op,"index")) {
@@ -586,10 +632,10 @@ static JSValue native_frame(JSContext *ctx,JSValueConst this_val,int argc,JSValu
             JS_FreeValue(ctx,original);JS_FreeValue(ctx,value);
         }
     }else {
-        if(target && (target->sandbox_flags&SB_SCRIPTS)){result=history_security_error(ctx,"Sandbox initial Document does not export author realm objects");goto out;}
+        if(target && (target->sandbox_flags&SB_SCRIPTS) && !target->js){result=history_security_error(ctx,"Sandbox initial Document does not export author realm objects");goto out;}
         if(!target || !target->js || !target->js->ctx){result=JS_ThrowTypeError(ctx,"Child Window is closed");goto out;}
         if(!web_frame_same_origin(caller->doc,target)){result=frame_security_error(ctx);goto out;}
-        if(caller->doc->sandbox_flags && caller->doc!=target){result=history_security_error(ctx,"Sandbox borrowed realm methods are outside the supported subset");goto out;}
+        if(caller->doc->sandbox_flags && caller->doc!=target && !sandbox_contains(caller->doc,target)){result=history_security_error(ctx,"Sandbox borrowed realm methods are outside the supported subset");goto out;}
         bool calling=!strcmp(op,"call");
         const char *key=!calling && argc>2?JS_ToCString(ctx,argv[2]):NULL;
         if(!calling && !key){result=JS_EXCEPTION;goto out;}
@@ -717,6 +763,10 @@ static bool parser_write_pump(struct web_js_state *s,void *boundary) {
     struct html_parser *parser=s->doc->parser;
     uint64_t generation=s->stream_generation;
     struct js_script *outer=s->blocker;
+    /* An earlier write in this script reached an external script that is
+       still pending: later writes only insert input. Tokenizing past it here
+       would replace it as the blocker, and it would never execute. */
+    if(outer && !outer->executed && outer->node!=s->current_script)return true;
     while(parser && s->doc->parser==parser && s->stream_generation==generation && !s->disabled){
         node_t *node=NULL;int result=html_resume_written(parser,&node,boundary);
         if(s->doc->parser!=parser || s->stream_generation!=generation)return true;

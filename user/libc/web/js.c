@@ -119,6 +119,7 @@ struct js_frame_proxy {struct js_frame_proxy *next;node_t *token;JSValue proxy;}
 struct js_rejection { JSValue promise, reason; struct js_rejection *next; };
 struct js_resource_event { node_t *node; bool failed, image, selection, stylesheet; uint64_t generation; struct js_resource_event *next; };
 struct js_image_decode { node_t *node; uint64_t generation, stream_generation; JSValue resolve, reject; struct js_image_decode *next; };
+struct js_image_pin { node_t *node; JSValue object; struct js_image_pin *next; };
 /* Order is shared with the bootstrap's private nodeProtos array. */
 enum { NP_NODE, NP_DOCUMENT, NP_ELEMENT, NP_HTML, NP_TEXT, NP_COMMENT, NP_FRAGMENT, NP_IFRAME, NP_IMAGE,
        NP_INPUT, NP_BUTTON, NP_SELECT, NP_TEXTAREA, NP_FIELDSET, NP_OBJECT, NP_OUTPUT, NP_OPTION, NP_TEMPLATE, NP_DOCTYPE,
@@ -221,6 +222,7 @@ struct web_js_state {
     struct js_resource_event *events, *last_event;
     struct js_policy_violation *policy_violations,*last_policy_violation;
     struct js_image_decode *image_decodes, *last_image_decode;
+    struct js_image_pin *image_pins;
     uint64_t next_request, task_deadline, now, stream_generation;
     uint64_t fetch_group;
     uint64_t window_named_revision;
@@ -378,16 +380,30 @@ static struct web_js_state *sandbox_actor(struct web_js_state *s) {
         if(p->doc->sandbox_flags && !p->starting)return p;
     return active;
 }
+/* A realm-only Document (scripts disabled, origin kept) runs no author script
+   of its own: code in its realm was called in by its same-origin embedder and
+   acts with that caller's authority. Its scripts, handlers and javascript:
+   navigation stay refused by the Document's own flags. */
+static uint32_t sandbox_own_flags(const web_doc *d) {
+    uint32_t flags=d->sandbox_flags;
+    return (flags&SB_SCRIPTS) && d->js && d->js->ctx ? flags&~SB_SCRIPTS : flags;
+}
 static uint32_t sandbox_authority(struct web_js_state *s) {
-    uint32_t flags=s->doc->sandbox_flags;
+    uint32_t flags=sandbox_own_flags(s->doc);
     struct web_js_state *active=s->runtime_owner && s->runtime_owner->runtime_active?
         s->runtime_owner->runtime_active:s;
-    for(struct web_js_state *p=active;p;p=p->runtime_previous)flags|=p->doc->sandbox_flags;
+    for(struct web_js_state *p=active;p;p=p->runtime_previous)flags|=sandbox_own_flags(p->doc);
     return flags;
+}
+/* A same-origin Document restricted at least as much as the sandboxed actor
+   (a realm-only frame inheriting its embedder's sandbox) lends it nothing. */
+static bool sandbox_contains(web_doc *actor,web_doc *target) {
+    uint32_t need=sandbox_own_flags(actor);
+    return (sandbox_own_flags(target)&need)==need && web_frame_same_origin(actor,target);
 }
 static bool sandbox_borrowed(struct web_js_state *s) {
     struct web_js_state *actor=sandbox_actor(s);
-    return actor->doc->sandbox_flags && actor->doc!=s->doc;
+    return actor->doc->sandbox_flags && actor->doc!=s->doc && !sandbox_contains(actor->doc,s->doc);
 }
 static struct web_js_state *profile_task(struct web_js_state *s) {
     return s->runtime_owner && s->runtime_owner->runtime_active ? s->runtime_owner->runtime_active : s;
@@ -1010,6 +1026,25 @@ static JSValue oom(JSContext *ctx) { return JS_ThrowOutOfMemory(ctx); }
 static JSValue str_or_null(JSContext *ctx, const char *p) { return p ? JS_NewString(ctx, p) : JS_NULL; }
 static bool connected(struct web_js_state *s, node_t *n) {
     return n && doc_node_root(n, true) == s->doc->root;
+}
+/* A detached img (new Image()) whose load or error event is still due must not
+   be collected with its wrapper, which carries the author's handlers. The
+   document tree already keeps connected wrappers alive. */
+static void image_pin(struct web_js_state *s, node_t *n) {
+    if (connected(s, n)) return;
+    for (struct js_image_pin *p = s->image_pins; p; p = p->next) if (p->node == n) return;
+    struct js_node_ref *r = node_ref(s, n);
+    JSValue object = r ? JS_GetWeakRefValue(s->ctx, r->object) : JS_UNDEFINED;
+    if (JS_IsUndefined(object)) return;
+    struct js_image_pin *p = js_malloc(s->ctx, sizeof *p);
+    if (!p) { JS_FreeValue(s->ctx, object); JSValue error = JS_GetException(s->ctx); JS_FreeValue(s->ctx, error); return; }
+    p->node = n; p->object = object; p->next = s->image_pins; s->image_pins = p;
+}
+static void image_unpin(struct web_js_state *s, node_t *n) {
+    for (struct js_image_pin **link = &s->image_pins; *link; link = &(*link)->next) if ((*link)->node == n) {
+        struct js_image_pin *p = *link; *link = p->next;
+        JS_FreeValue(s->ctx, p->object); js_free(s->ctx, p); return;
+    }
 }
 /* Shadow-including preorder, without recursion or entry into template content.
    This walk never executes author code; post-connection work uses its static
@@ -2506,8 +2541,9 @@ static JSValue attribute_native_changed(struct web_js_state *s, node_t *n, const
         if (JS_IsException(notified)) return notified;
         JS_FreeValue(ctx, notified);
     }
-    if (html_image(n) && (!strcmp(name, "src") || !strcmp(name, "srcset") || !strcmp(name, "sizes")))
-        n->image_invalidated = true;
+    if (html_image(n) && (!strcmp(name, "src") || !strcmp(name, "srcset") || !strcmp(name, "sizes"))) {
+        n->image_invalidated = true; image_pin(s, n);
+    }
     if (n->tag == T_input && !strcmp(name, "src")) {
         n->js_image_notified = false;
     }
@@ -3761,7 +3797,7 @@ static bool permitted_script_url(struct web_js_state *s,const char *url) {
     return length<=UINT32_MAX && permitted_url(s,url,false);
 }
 static char *script_data_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]);
-static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]);
+static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],bool *untyped);
 /* Console text is author data, not a diagnostic excerpt. Grow on demand and
  * report real allocation failure instead of truncating or aborting the task. */
 static bool console_text_append(sbuf *text, const char *bytes, size_t length) {
@@ -5130,7 +5166,7 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
         char mime[128];
         p->response.body=!strncasecmp(p->url,"data:",5)
             ? script_data_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime)
-            : script_blob_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime);
+            : script_blob_source(s,p->url,kind==WEB_RESOURCE_MODULE,&p->response.body_len,mime,NULL);
         if (!p->response.body) {
             if (JS_HasException(s->ctx)) exception(s);
             pending_error(p,"Unavailable local resource URL or invalid MIME type"); return false;
@@ -5192,7 +5228,7 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request,
            Other child requests are resolved at a later bounded task boundary. */
         if (kind == 0 && s->running) {
             char mime[128];
-            p->response.body=script_blob_source(s,url,true,&p->response.body_len,mime);
+            p->response.body=script_blob_source(s,url,true,&p->response.body_len,mime,NULL);
             if (!p->response.body) {
                 if (JS_HasException(s->ctx)) { JSValue error=JS_GetException(s->ctx); JS_FreeValue(s->ctx,error); }
                 pending_error(p,"Worker object URL is unavailable or has an invalid JavaScript MIME type");
@@ -5749,7 +5785,7 @@ static char *script_data_source(struct web_js_state *s,const char *url,bool modu
 /* The private hook returns only real Blob bytes from this document's live
  * registry, never an author-visible URL property or an OS path. Root its result
  * while allocating the tracked source copy; MIME and byte limits remain native. */
-static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128]) {
+static char *script_blob_source(struct web_js_state *s,const char *url,bool module,size_t *length,char mime[128],bool *untyped) {
     JSContext *ctx=s->ctx;
     JSValue value=module_bridge_call(s,"blobScript",url,strlen(url),s->doc->base);
     if (JS_IsException(value)) return NULL;
@@ -5773,6 +5809,7 @@ static char *script_blob_source(struct web_js_state *s,const char *url,bool modu
         JS_ThrowTypeError(ctx,"Blob module requires a JavaScript MIME type"); goto out;
     }
     if (valid) { memcpy(mime,first,mn); mime[mn]=0; } else strcpy(mime,"text/plain");
+    if (untyped) *untyped=!mn;
     web_js_prepare_bytes(ctx,n+1);
     source=js_malloc(ctx,n+1);
     if (source) { if (n) memcpy(source,bytes,n); source[n]=0; *length=n; }
@@ -5940,7 +5977,7 @@ static JSModuleDef *load_module(JSContext *ctx, const char *url, void *opaque) {
         size_t length; char mime[128];
         char *source=!strncasecmp(url,"data:",5)
             ? script_data_source(s,url,true,&length,mime)
-            : script_blob_source(s,url,true,&length,mime);
+            : script_blob_source(s,url,true,&length,mime,NULL);
         if (!source) return NULL;
         m=cache_module(s,url,source,length,url); js_free(ctx,source);
         if (!m) return NULL;
@@ -6770,7 +6807,7 @@ static bool process_pending(struct web_js_state *s) {
             if (!strncasecmp(p->url,"blob:",5) && !p->response.body && !p->response.error[0]) {
                 char mime[128];
                 ran_task = true; begin_named_task(s,"Worker object-URL source",p->worker);
-                p->response.body = script_blob_source(s,p->url,true,&p->response.body_len,mime);
+                p->response.body = script_blob_source(s,p->url,true,&p->response.body_len,mime,NULL);
                 if (!p->response.body) {
                     if (JS_HasException(s->ctx)) exception(s);
                     pending_error(p,"Worker object URL is unavailable or has an invalid JavaScript MIME type");
@@ -6800,7 +6837,11 @@ static bool process_pending(struct web_js_state *s) {
             if(ok && p->font && p->font->failed)diagnostic_resource(s,p,"Font decode failed: malformed or unsupported outline container, or native allocation failure");
         }
         else if (p->kind == P_IMAGE) {
-            web_image_loaded(s->doc, p->image, ok ? p->response.body : NULL, ok ? p->response.body_len : 0);
+            /* An image request is not failed by its status: an error page that
+               carries an image (a placeholder icon) is decoded and shown, and
+               only a transport failure or undecodable body is an error. */
+            bool body=!p->aborted && !p->response.error[0] && p->response.body_len;
+            web_image_loaded(s->doc, p->image, body ? p->response.body : NULL, body ? p->response.body_len : 0);
         } else if (!s->disabled && p->kind == P_FETCH) {
             ran_task = true;
             begin_task(s);
@@ -6864,7 +6905,9 @@ static bool dispatch_resource_event(struct web_js_state *s) {
         js_free(s->ctx, e); return false;
     }
     struct web_event event = {.type=e->selection ? "select" : e->failed ? "error" : "load", .bubbles=e->selection};
-    web_js_dispatch(s->doc, e->node, &event); js_free(s->ctx, e); return true;
+    web_js_dispatch(s->doc, e->node, &event);
+    if (e->image) image_unpin(s, e->node);
+    js_free(s->ctx, e); return true;
 }
 static void image_events(struct web_js_state *s) {
     if (s->disabled) return;
@@ -6877,6 +6920,7 @@ static void image_events(struct web_js_state *s) {
         bool img = html_image(n);
         if ((!img && (n->tag != T_input || !connected(s, n))) || n->foreign) continue;
         int selected = img ? n->image_request : n->image;
+        if (img && n->image_initialized && !n->image_has_source && !n->image_invalidated) image_unpin(s, n);
         if (img && (!n->image_initialized || !n->image_has_source || n->image_invalidated)) continue;
         if (!img && (selected < 0 || selected >= s->doc->images.n)) continue;
         struct web_image *image = selected >= 0 && selected < s->doc->images.n ? s->doc->images.v[selected] : NULL;
@@ -8080,7 +8124,9 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     if (prototype_failed) { exception(s); end_task(s); goto failed; }
     storage_subscribe_document(s);
     end_task(s); s->starting = false;
-    if(d->sandbox_flags&SB_SCRIPTS)s->disabled=true;
+    /* A script-disabled sandbox realm stays active for its same-origin
+       embedder; its own scripts are refused by sandbox_flags, not by
+       retiring the realm. */
     char limits[192];
     snprintf(limits,sizeof limits,"JavaScript runtime: OS-allocated heap (no page quota), dynamically allocated timers; stack guard %u KiB, task budget %u ms",
              JS_STACK_LIMIT/1024u,s->task_budget_ms);
@@ -8114,6 +8160,7 @@ void web_js_free(web_doc *d) {
             JS_FreeValue(s->ctx, p->resolve); JS_FreeValue(s->ctx, p->reject); js_free(s->ctx, p);
         }
         while (s->events) { struct js_resource_event *e = s->events; s->events = e->next; js_free(s->ctx, e); }
+        while (s->image_pins) { struct js_image_pin *p = s->image_pins; s->image_pins = p->next; JS_FreeValue(s->ctx, p->object); js_free(s->ctx, p); }
         while(s->policy_violations){struct js_policy_violation *e=s->policy_violations;s->policy_violations=e->next;JS_FreeValue(s->ctx,e->init);js_free(s->ctx,e);}
         JS_SetDynamicCodeCheck(s->ctx,NULL,NULL);
         while (s->pending) { struct js_pending *p = s->pending; s->pending = p->next; release_pending_request(s, p); pending_free(s, p); }
