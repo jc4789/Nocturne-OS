@@ -54,7 +54,7 @@ LIBC_OBJ := $(patsubst %.c,$(BUILD)/u/%.o,$(LIBC_C)) $(patsubst %.asm,$(BUILD)/u
 BR_C     := $(shell find third_party/bearssl/src -name '*.c')
 BR_OBJ   := $(patsubst %.c,$(BUILD)/br/%.o,$(BR_C)) $(BUILD)/br/tls_roots.o
 BRFLAGS  := $(filter-out -W% -MMD -MP,$(UCFLAGS)) -w -Ithird_party/bearssl/inc -Ithird_party/bearssl/src \
-            -DBR_USE_URANDOM=1 -DBR_USE_GETENTROPY=0 -DBR_USE_WIN32_RAND=0 -DBR_USE_UNIX_TIME=1 -DBR_USE_WIN32_TIME=0
+            -DBR_USE_URANDOM=0 -DBR_USE_NOCTURNE_RAND=1 -DBR_USE_GETENTROPY=0 -DBR_USE_WIN32_RAND=0 -DBR_USE_UNIX_TIME=1 -DBR_USE_WIN32_TIME=0
 UCFLAGS  += -Ithird_party/bearssl/inc -Ithird_party/img
 UCFLAGS  += -Ithird_party/quickjs
 UCFLAGS  += -Ithird_party/lexbor/source -Iports/lexbor/include
@@ -129,9 +129,7 @@ $(BUILD)/media-quota.cfg: media-quota-config
 $(BUILD)/u/user/libc/media_alloc.o: UCFLAGS += -DNMEDIA_ALLOC_LIMIT_BYTES=$(MEDIA_QUOTA_BYTES)
 $(BUILD)/u/user/libc/media_alloc.o: $(BUILD)/media-quota.cfg Makefile
 $(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/mem.o: FFFLAGS += -DMALLOC_PREFIX=nmedia_ff_
-$(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/file_open.o: FFFLAGS += -Dfdopen=nmedia_ff_fdopen
-$(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/random_seed.o: FFFLAGS += -Dsetvbuf=nmedia_ff_setvbuf -Dfread=nmedia_ff_fread -Dfclose=nmedia_ff_fclose
-$(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/mem.o $(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/file_open.o $(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/random_seed.o: Makefile user/include/media_alloc_private.h user/include/media_stdio_private.h
+$(BUILD)/ffmpeg/third_party/ffmpeg/libavutil/mem.o: Makefile user/include/media_alloc_private.h
 
 # QuickJS core only. No OS helper library, CLI or native-module loader.
 QJS_C := $(addprefix third_party/quickjs/,quickjs.c dtoa.c libregexp.c libunicode.c cutils.c)

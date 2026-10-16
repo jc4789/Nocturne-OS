@@ -2,7 +2,7 @@
 #include "kernel.h"
 #include "sys/sched.h"
 
-enum { VT_FILE = 1, VT_DIR = 2, VT_CHAR = 3, VT_PIPE = 4, VT_WINDOW = 5, VT_CHANNEL = 6, VT_SHARED = 7, VT_ADDRESS_WATCH = 8,
+enum { VT_FILE = 1, VT_DIR = 2, VT_CHAR = 3, VT_WINDOW = 5, VT_CHANNEL = 6, VT_SHARED = 7, VT_ADDRESS_WATCH = 8,
        VT_APP = 9, VT_EVENTS = 10 };
 
 #define O_RDONLY    0x0
@@ -22,13 +22,6 @@ struct dirent {
     char name[NAME_MAX_LEN];
     uint32_t type;
     uint32_t reserved;
-    uint64_t size;
-    int64_t mtime; /* not part of the old SYS_READDIR record */
-};
-
-struct kstat {
-    uint32_t type;
-    uint32_t mode;
     uint64_t size;
     int64_t mtime;
 };
@@ -77,7 +70,6 @@ struct vnode {
     int64_t mtime;
     int refs;
     bool unlinked;
-    bool tty; /* a pipe that a terminal emulator reads/writes: reported as a character device */
     struct vnode_ops *ops;
     void *priv;
     struct vnode *mounted;  /* fs root mounted on top of this dir */
@@ -113,14 +105,11 @@ int64_t vfs_read(struct file *f, void *buf, size_t n);
 int64_t vfs_write(struct file *f, const void *buf, size_t n);
 int64_t vfs_read_user(struct file *f, void *buf, size_t n);
 int64_t vfs_write_user(struct file *f, const void *buf, size_t n);
-int64_t vfs_seek(struct file *f, int64_t off, int whence);
 int vfs_truncate(struct file *f, uint64_t size);
 void vfs_close(struct file *f);
 int vfs_lease(struct file *f, bool acquire);
 int vfs_try_lease(struct file *f);
 struct file *vfs_dup(struct file *f);
-int vfs_readdir(struct file *f, uint64_t idx, struct dirent *out);
-int vfs_stat(const char *abspath, struct kstat *st);
 int vfs_mkdir(const char *abspath);
 int vfs_unlink(const char *abspath);
 int vfs_mount(const char *abspath, struct vnode *root);
@@ -169,7 +158,6 @@ void console_input_char(char c);
 void console_input_str(const char *s);
 
 /* pipes */
-int pipe_create(struct file **rd, struct file **wr);
 int channel_listen(const char *key,size_t length,struct file **listener);
 int channel_connect(const char *key,size_t length,struct file **client);
 int channel_accept(struct file *listener,struct file **server);

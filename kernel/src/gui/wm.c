@@ -407,17 +407,17 @@ static void win_destroy(struct window *w) {
     wm_unlock();
 }
 
-static int64_t win_read_common(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n, bool user) {
-    struct window *w = v->priv;
-    size_t max = n / sizeof(struct gui_event);
-    if (max == 0) return -N_ERR_INVALID;
+/* Takes every queued event that fits in out[max], waiting up to timeout_ms
+   (negative: until one arrives). The count, 0 when the time ran out, or
+   N_ERR_CLOSED once a closed window has handed out its last event. */
+static int64_t win_receive(struct window *w, struct gui_event *out, size_t max, int64_t timeout_ms) {
+    if (max == 0 || max > SIZE_MAX / sizeof *out) return -N_ERR_INVALID;
+    uint64_t deadline = timeout_ms > 0 ? uptime_ms() + (uint64_t)timeout_ms : 0;
     for (;;) {
         uint64_t fl = irq_save();
         if (w->ev_count || w->frame_ready) {
             size_t available = (size_t)w->ev_count + (w->frame_ready ? 1u : 0u);
-            size_t bytes = MIN(max, available) * sizeof(struct gui_event);
-            if (user && !user_ok_w(buf, bytes)) { irq_restore(fl); return -N_ERR_BAD_ADDRESS; }
-            struct gui_event *out = buf;
+            if (!user_ok_w(out, MIN(max, available) * sizeof *out)) { irq_restore(fl); return -N_ERR_BAD_ADDRESS; }
             size_t got = 0;
             while (got < max && w->ev_count) {
                 out[got++] = w->ev[w->ev_tail];
@@ -429,30 +429,18 @@ static int64_t win_read_common(struct vnode *v, struct file *f, void *buf, uint6
                 w->frame_ready = false;
             }
             irq_restore(fl);
-            return got * sizeof(struct gui_event);
+            return (int64_t)got;
         }
-        if (w->dead) {
-            irq_restore(fl);
-            return 0;
-        }
-        if (f->flags & O_NONBLOCK) {
-            irq_restore(fl);
-            return -N_ERR_NOT_READY;
-        }
-        if (current_task->killed) {
-            irq_restore(fl);
-            return -N_ERR_STOPPED;
-        }
-        wq_wait(&w->wq);
+        int64_t result = 1;
+        uint64_t now = timeout_ms > 0 ? uptime_ms() : 0;
+        if (w->dead) result = -N_ERR_CLOSED;
+        else if (current_task->killed) result = -N_ERR_STOPPED;
+        else if (timeout_ms == 0 || (timeout_ms > 0 && now >= deadline)) result = 0;
+        else if (timeout_ms > 0) wq_wait_timeout(&w->wq, deadline - now);
+        else wq_wait(&w->wq);
         irq_restore(fl);
+        if (result <= 0) return result;
     }
-}
-
-static int64_t win_read(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
-    return win_read_common(v, f, buf, off, n, false);
-}
-static int64_t win_read_user(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
-    return win_read_common(v, f, buf, off, n, true);
 }
 
 static bool win_can_read(struct vnode *v, struct file *f) {
@@ -468,7 +456,7 @@ static void win_release(struct vnode *v) {
 }
 
 static struct vnode_ops win_ops = {
-    .read = win_read, .read_user = win_read_user, .can_read = win_can_read, .close = win_close, .release = win_release};
+    .can_read = win_can_read, .close = win_close, .release = win_release};
 
 static bool alloc_buffer(struct window *w, int cw, int ch) {
     size_t pages = ALIGN_UP((uint64_t)cw * ch * 4, PAGE_SIZE) / PAGE_SIZE;
@@ -2504,6 +2492,18 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
 int64_t wm_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
     if (num == SYS_GUI_LAUNCH) return wm_syscall_locked(num,a,b,c,d,e,NULL);
     struct file *file = NULL;
+    if (num == SYS_WIN_RECEIVE) {
+        /* Waits without the WM lock; the file reference keeps the window's memory. */
+        uint64_t flags = irq_save();
+        int fd = (int)a;
+        if (fd >= 0 && (size_t)fd < task_process()->fd_capacity && task_process()->fds[fd])
+            file = vfs_dup(task_process()->fds[fd]);
+        irq_restore(flags);
+        int64_t result = !file ? -N_ERR_NO_HANDLE : file->vn->type != VT_WINDOW ? -N_ERR_WRONG_KIND
+                       : win_receive(file->vn->priv, (struct gui_event *)b, (size_t)c, (int64_t)d);
+        vfs_close(file);
+        return result;
+    }
     if (num == SYS_WIN_MAP || num == SYS_WIN_STATE || num == SYS_WIN_PRESENTATION || num == SYS_WIN_PRESENT ||
         num == SYS_WIN_SET_TITLE || num == SYS_WIN_MOVE || num == SYS_WIN_RESIZE) {
         uint64_t flags = irq_save();

@@ -601,7 +601,9 @@ test_sync_file_fences(struct pipe_context *ctx)
    pass = pass && screen->fence_finish(screen, NULL, final_fence, 0);
 
    /* Cleanup. */
-#if !DETECT_OS_WINDOWS
+#if DETECT_OS_NOCTURNE
+   (void)buf_fd; (void)tex_fd; (void)merged_fd; (void)final_fd; /* no native fence handles */
+#elif !DETECT_OS_WINDOWS
    if (buf_fd >= 0)
       close(buf_fd);
    if (tex_fd >= 0)

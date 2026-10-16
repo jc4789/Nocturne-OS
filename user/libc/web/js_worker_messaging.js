@@ -11,7 +11,7 @@ const workerMessagingBridge=(()=>{
     const tasks=record({head:null,tail:null,closed:false});
     const routes=new Map(),mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapDelete=Map.prototype.delete,mapEach=Map.prototype.forEach,mapClear=Map.prototype.clear,isInteger=Number.isInteger;let nextRoute=0;
     const routeGet=key=>apply(mapGet,routes,[key]),routePut=(key,value)=>apply(mapSet,routes,[key,value]);
-    const portSend=host.portSend,portLease=host.portLease;
+    const portSend=host.portSend,portLease=host.portLease,discardShared=host.sharedBufferDiscard;
     const routeKey=(id,creator)=>creator+':'+id;
     const nativeCommit=host.transferCommit,iterator=Symbol.iterator,string=String;
     const wellFormed=String.prototype.toWellFormed;
@@ -156,17 +156,18 @@ const workerMessagingBridge=(()=>{
         }return false;
     }
     function prepareExternal(value,transfers){
+        let attachments=0;
         try{
         const transferred=[],seen=[];
         for(let i=0;i<transfers.length;i++)if(brand(transfers[i])){const endpoint=state(transfers[i]).endpoint;for(let j=0;j<seen.length;j++)if(seen[j]===endpoint||seen[j]===endpoint?.peer)throw new ErrorType('Both ends cannot be exported together','DataCloneError');append(seen,endpoint);append(transferred,transfers[i]);}
-        const packet=cloneData.prepare({data:value,ports:transferred},transfers,'worker'),receivers=[],metadata=[];
+        const packet=cloneData.prepare({data:value,ports:transferred},transfers,'worker'),receivers=[],metadata=[];attachments=packet.attachments;
         for(let i=0;i<packet.tokens.length;i++){const token=packet.tokens[i];if(!token){append(receivers,null);append(metadata,null);continue;}
             append(receivers,token.receiver);append(metadata,token.meta);
         }
-        const plan=cloneData.commitPlan(packet,receivers);cloneData.validate(packet);return {packet:[packet.data,metadata],plan,tokens:packet.tokens};
-        }catch(error){apply(mapEach,routes,[(route,key)=>{if(!route.active)apply(mapDelete,routes,[key]);}]);throw error;}
+        const plan=cloneData.commitPlan(packet,receivers);cloneData.validate(packet);const wire=[packet.data,metadata];if(attachments)append(wire,attachments);return {packet:wire,plan,tokens:packet.tokens,attachments};
+        }catch(error){if(attachments)discardShared(attachments);apply(mapEach,routes,[(route,key)=>{if(!route.active)apply(mapDelete,routes,[key]);}]);throw error;}
     }
-    function abortExternal(prepared){for(let i=0;i<prepared.tokens.length;i++){const token=prepared.tokens[i];if(token&&token.route&&!token.route.active)apply(mapDelete,routes,[token.route.key]);}}
+    function abortExternal(prepared){if(prepared.attachments)discardShared(prepared.attachments);for(let i=0;i<prepared.tokens.length;i++){const token=prepared.tokens[i];if(token&&token.route&&!token.route.active)apply(mapDelete,routes,[token.route.key]);}}
     function importExternal(wire){
         const metadata=wire[1],receivers=[],added=[];
         try{

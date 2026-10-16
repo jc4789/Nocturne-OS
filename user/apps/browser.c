@@ -1277,7 +1277,7 @@ static int browser_event(struct gui_event *event, int timeout) {
         static bool window_watched;
         n_handle queue=web_wait_queue();
         if(queue<0)return -1;
-        if(!window_watched)window_watched=n_events_watch(queue,w->fd,N_EVENT_RECEIVABLE,UINT64_C(0x42)<<56)>=0;
+        if(!window_watched)window_watched=n_events_watch(queue,w->handle,N_EVENT_RECEIVABLE,UINT64_C(0x42)<<56)>=0;
         struct n_event events[64];
         int ready=webnet_wait(network,queue,window_watched||(timeout>=0&&timeout<10)?timeout:10,events,64);
         if(ready<0)return -1;

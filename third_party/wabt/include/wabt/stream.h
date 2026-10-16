@@ -54,7 +54,7 @@ class Stream {
   bool has_log_stream() const { return log_stream_ != nullptr; }
 
   void ClearOffset() { offset_ = 0; }
-  void AddOffset(ssize_t delta);
+  void AddOffset(ptrdiff_t delta);
 
   void WriteData(ByteSpan src,
                  const char* desc = nullptr,

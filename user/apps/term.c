@@ -491,7 +491,7 @@ int main(int argc, char **argv) {
     enum { TOKEN_WINDOW, TOKEN_OUTPUT, TOKEN_SHELL };
     n_handle events = n_events_create();
     if (events < 0) return 1;
-    n_events_watch(events, win->fd, N_EVENT_RECEIVABLE, TOKEN_WINDOW);
+    n_events_watch(events, win->handle, N_EVENT_RECEIVABLE, TOKEN_WINDOW);
     if (shell >= 0) {
         n_events_watch(events, from_shell, N_EVENT_RECEIVABLE, TOKEN_OUTPUT);
         n_events_watch(events, shell, N_EVENT_APP_ENDED, TOKEN_SHELL);

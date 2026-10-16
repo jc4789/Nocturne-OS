@@ -1,7 +1,7 @@
 {
   "release": "9.0.2",
   "license": "LGPL-2.1-or-later",
-  "compiled_sources": 374,
+  "compiled_sources": 372,
   "files": [
     {
       "path": "compat/va_copy.h",
@@ -10,7 +10,7 @@
     },
     {
       "path": "config.h",
-      "sha256": "d6a72fdb02ad28f6e55d592c1da2c130242d5b2297950e35a4ef6bcb0d43bd16",
+      "sha256": "c692ef22bf2a51ffe4629c1bf928916229dd5d3704fd2edde2a05ad53e90ee0b",
       "origin": "configure-generated"
     },
     {
@@ -2774,14 +2774,9 @@
       "origin": "upstream-unmodified"
     },
     {
-      "path": "libavformat/os_support.c",
-      "sha256": "5eb56870741543109af22922013725a91ad0e9eb6ea84a78b3612d08b208c436",
-      "origin": "upstream-unmodified"
-    },
-    {
       "path": "libavformat/os_support.h",
-      "sha256": "293991d675702f37219283cb7a442e30940cd6d07fedb78dd17a5c2f80c5fd21",
-      "origin": "upstream-unmodified"
+      "sha256": "9fed084a631bb892a4d899c4d86555ad348f9a91cfed71b609ce4a4dc3db20f5",
+      "origin": "nocturne-native-port"
     },
     {
       "path": "libavformat/packet_internal.h",
@@ -2910,8 +2905,8 @@
     },
     {
       "path": "libavformat/utils.c",
-      "sha256": "0319471d1aebe3fe9c8cfe71c8ac95b43a5a15754eccbfe9550b9d4af0b00489",
-      "origin": "upstream-unmodified"
+      "sha256": "239c56eb8bfd02169bc15bdd54c81f4b6882be1567d10d5ee82cec83eff10809",
+      "origin": "nocturne-native-port"
     },
     {
       "path": "libavformat/version.c",
@@ -3155,8 +3150,8 @@
     },
     {
       "path": "libavutil/cpu.c",
-      "sha256": "417011f6e9e92e191a4714e2bb409aa65d26a23e1765548170803c2cc0192dd7",
-      "origin": "upstream-unmodified"
+      "sha256": "26a6d1b2bf91d6db2a9f0d4985c8131777149e80df688382dffbf0ec837ed139",
+      "origin": "nocturne-native-port"
     },
     {
       "path": "libavutil/cpu.h",
@@ -3320,22 +3315,12 @@
     },
     {
       "path": "libavutil/file.c",
-      "sha256": "b4ca9f5cf9ad97cf37263558ea8b6c08be18fba68e44c3c2610ed05e269ba7c1",
-      "origin": "upstream-unmodified"
+      "sha256": "7fe96f2f62059e304ac0a9706629920e53abc1b8bebcebe7beeed800ef2e3bc2",
+      "origin": "nocturne-native-port"
     },
     {
       "path": "libavutil/file.h",
       "sha256": "10daa0d0f1f2a3bedf2b7d8b5c4fea208dd9cf8caabb81dac341fc6ad24f685f",
-      "origin": "upstream-unmodified"
-    },
-    {
-      "path": "libavutil/file_open.c",
-      "sha256": "67c5c007f53735f9d6fdd64fd18c5d1098b792b6eac6a1111b8dfe02f653a0bf",
-      "origin": "upstream-unmodified"
-    },
-    {
-      "path": "libavutil/file_open.h",
-      "sha256": "0be8fce1e9d9b47bc5c4028f2c25defaf14a12f46b749e926780911344d15834",
       "origin": "upstream-unmodified"
     },
     {
@@ -3530,8 +3515,8 @@
     },
     {
       "path": "libavutil/log.c",
-      "sha256": "0b0c949a1124bbfc0af710b7c6c63b7f767d5bd38857e41dd75c6b9c5199cfa5",
-      "origin": "upstream-unmodified"
+      "sha256": "b6439c3659447a0c8c0befc890acabacadafd13f195f6b8119d2fbe3e29cd087",
+      "origin": "nocturne-native-port"
     },
     {
       "path": "libavutil/log.h",
@@ -3665,8 +3650,8 @@
     },
     {
       "path": "libavutil/random_seed.c",
-      "sha256": "ca89ef8d54a06bc855459a13f38e092a40787517aab1f6adb9e292cacc3cfe8c",
-      "origin": "upstream-unmodified"
+      "sha256": "0a51efe3949488ba8a982053aea1281fc56d597b9e69c939ffdd0cf7f2fffaaf",
+      "origin": "nocturne-native-port"
     },
     {
       "path": "libavutil/random_seed.h",
@@ -3860,8 +3845,8 @@
     },
     {
       "path": "libavutil/time.c",
-      "sha256": "e433f3f7563a94bd4cc661532de45de4096bea74775380ee2b9cd591a7728a86",
-      "origin": "upstream-unmodified"
+      "sha256": "5afb69604eb10bad3b5dc34addf9eb596f7372cfbd6c42fe02f8eaa6098ef130",
+      "origin": "nocturne-native-port"
     },
     {
       "path": "libavutil/time.h",
@@ -4163,7 +4148,12 @@
   "effective_overrides": {
     "HAVE_MMAP": 0,
     "HAVE_FCNTL": 0,
-    "HAVE_MKSTEMP": 0
+    "HAVE_MKSTEMP": 0,
+    "HAVE_UNISTD_H": 0,
+    "HAVE_SYS_TIME_H": 0,
+    "HAVE_GETTIMEOFDAY": 0,
+    "HAVE_ISATTY": 0,
+    "HAVE_MPROTECT": 0
   },
   "libraries": [
     "libavutil",

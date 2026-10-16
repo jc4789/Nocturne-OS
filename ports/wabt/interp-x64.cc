@@ -17,7 +17,7 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <sys/mman.h>
+#include <nocturne.h>
 
 #include <algorithm>
 #include <atomic>
@@ -258,9 +258,8 @@ class JitArena {
     if (!current_ || current_->size - current_->used < need) {
       size_t bytes_needed = (need + kPage - 1) & ~(kPage - 1);
       size_t chunk_size = std::max(kChunk, bytes_needed);
-      void* p = mmap(nullptr, chunk_size, PROT_READ | PROT_WRITE,
-                     MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-      if (p == MAP_FAILED) return nullptr;
+      void* p = n_memory_reserve(chunk_size, N_MEMORY_READ_WRITE);
+      if (!p) return nullptr;
       JitChunk* chunk = new JitChunk{static_cast<u8*>(p), chunk_size, 0, 0};
       if (current_ && current_->live == 0) Unmap(current_);
       current_ = chunk;
@@ -271,9 +270,10 @@ class JitArena {
     uintptr_t last =
         (reinterpret_cast<uintptr_t>(dst) + need + kPage - 1) & ~(kPage - 1);
     void* pages = reinterpret_cast<void*>(first);
-    if (mprotect(pages, last - first, PROT_READ | PROT_WRITE) != 0) return nullptr;
+    // W^X: the pages are writable only while the code is copied in.
+    if (n_memory_protect(pages, last - first, N_MEMORY_READ_WRITE) != 0) return nullptr;
     memcpy(dst, bytes, size);
-    if (mprotect(pages, last - first, PROT_READ | PROT_EXEC) != 0) return nullptr;
+    if (n_memory_protect(pages, last - first, N_MEMORY_READ_EXECUTE) != 0) return nullptr;
     chunk->used += need;
     chunk->live += need;
     *out = dst;
@@ -281,7 +281,7 @@ class JitArena {
   }
 
   void Unmap(JitChunk* chunk) {
-    munmap(chunk->base, chunk->size);
+    n_memory_release(chunk->base, chunk->size);
     delete chunk;
   }
   void Lock() {

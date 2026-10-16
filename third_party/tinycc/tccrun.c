@@ -75,9 +75,7 @@ static void rt_exit(rt_frame *f, int code);
 /* defined when included from lib/bt-exe.c */
 #ifndef CONFIG_TCC_BACKTRACE_ONLY
 
-#if CONFIG_TCC_NOCTURNE
-# include "nocturne.h"
-#elif !defined _WIN32
+#if !CONFIG_TCC_NOCTURNE && !defined _WIN32
 # include <sys/mman.h>
 #endif
 
@@ -94,7 +92,9 @@ static void win64_del_function_table(void *);
 #endif
 
 #if !defined PAGESIZE
-# if defined _SC_PAGESIZE
+# if CONFIG_TCC_NOCTURNE
+#  define PAGESIZE N_PAGE_SIZE
+# elif defined _SC_PAGESIZE
 #  define PAGESIZE sysconf(_SC_PAGESIZE)
 # elif defined __APPLE__
 #  include <libkern/OSCacheControl.h>
@@ -106,10 +106,6 @@ static void win64_del_function_table(void *);
 
 #define PAGEALIGN(n) ((addr_t)n + (-(addr_t)n & (PAGESIZE-1)))
 
-#if !_WIN32 && !__APPLE__
-//#define CONFIG_SELINUX 1
-#endif
-
 /* use VirtualAlloc() instead of tcc_malloc() */
 #if defined _WIN32 && !defined CONFIG_RUNMEM_VIRTUALALLOC
 # define CONFIG_RUNMEM_VIRTUALALLOC 1
@@ -119,24 +115,7 @@ static int rt_mem(TCCState *s1, int size)
 {
     void *ptr;
     int ptr_diff = 0;
-#ifdef CONFIG_SELINUX
-    /* Using mmap instead of malloc */
-    void *prw;
-    char tmpfname[] = "/tmp/.tccrunXXXXXX";
-    int fd = mkstemp(tmpfname);
-    unlink(tmpfname);
-    ftruncate(fd, size);
-
-    ptr = mmap(NULL, size * 2, PROT_READ|PROT_EXEC, MAP_SHARED, fd, 0);
-    /* mmap RW memory at fixed distance */
-    prw = mmap((char*)ptr + size, size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, fd, 0);
-    close(fd);
-    if (ptr == MAP_FAILED || prw == MAP_FAILED)
-	return tcc_error_noabort("tccrun: could not map memory");
-    ptr_diff = (char*)prw - (char*)ptr; /* = size; */
-    //printf("map %p %p %p\n", ptr, prw, (void*)ptr_diff);
-    size *= 2;
-#elif CONFIG_RUNMEM_VIRTUALALLOC
+#if CONFIG_RUNMEM_VIRTUALALLOC
     /* always page-aligned */
     ptr = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!ptr)
@@ -206,9 +185,7 @@ ST_FUNC void tcc_run_free(TCCState *s1)
     win64_del_function_table(s1->run_function_table);
 #endif
     size = s1->run_size;
-#ifdef CONFIG_SELINUX
-    munmap(ptr, size);
-#elif CONFIG_RUNMEM_VIRTUALALLOC
+#if CONFIG_RUNMEM_VIRTUALALLOC
     VirtualFree(ptr, size, MEM_RELEASE);
 #elif CONFIG_TCC_NOCTURNE
     n_memory_release(ptr, size);
@@ -228,7 +205,10 @@ LIBTCCAPI int tcc_run(TCCState *s1, int argc, char **argv)
     const char *top_sym;
     jmp_buf main_jb;
 
-#if defined(__APPLE__)
+#if CONFIG_TCC_NOCTURNE
+    /* there is no inherited environment; the program sees the launch settings */
+    char **envp = (char **)n_settings;
+#elif defined(__APPLE__)
     extern char ***_NSGetEnviron(void);
     char **envp = *_NSGetEnviron();
 #elif defined(__OpenBSD__) || defined(__NetBSD__)  || defined(__FreeBSD__)
@@ -420,10 +400,6 @@ redo:
         if (copy == 2) { /* set permissions */
             if (n == 0) /* no data  */
                 continue;
-#ifdef CONFIG_SELINUX
-            if (k == 0) /* SHF_EXECINSTR has its own mapping */
-                continue;
-#endif
             f = k;
             if (f >= CONFIG_RUNMEM_RO) {
                 if (f != 0)

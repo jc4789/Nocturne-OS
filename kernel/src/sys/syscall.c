@@ -20,8 +20,6 @@
 #include "abi.h"
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
 
-_Static_assert(sizeof(struct n_dirent) == offsetof(struct dirent, mtime), "dirent ABI");
-_Static_assert(sizeof(struct n_stat) == sizeof(struct kstat), "stat ABI");
 _Static_assert(sizeof(struct n_gpu_blit) == 32, "GPU blit ABI");
 
 extern char cpu_brand[64];
@@ -78,16 +76,6 @@ int user_str(char *dst, const char *src, size_t max) {
     return -N_ERR_NAME_TOO_LONG;
 }
 
-static int user_path(const char *upath, char *out) {
-    char tmp[PATH_MAX_LEN];
-    int r = user_str(tmp, upath, sizeof tmp);
-    if (r < 0) return r;
-    char cwd[sizeof task_process()->cwd];
-    uint64_t flags = irq_save();
-    memcpy(cwd, task_process()->cwd, sizeof cwd);
-    irq_restore(flags);
-    return vfs_normalize(cwd, tmp, out);
-}
 
 /* Raw lookup is allowed only inside a BSP IRQ guard. Never carry this
    borrowed pointer across validation, preemption or a blocking operation. */
@@ -118,35 +106,7 @@ static int allocfd(struct file *f) {
 
 /* ---- handlers ---- */
 
-static int64_t sys_read(int fd, void *buf, size_t n) {
-    struct file *f = getfd_ref(fd);
-    if (!f) return -N_ERR_NO_HANDLE;
-    int64_t result = vfs_read_user(f, buf, n);
-    vfs_close(f);
-    return result;
-}
-
-static int64_t sys_write(int fd, const void *buf, size_t n) {
-    struct file *f = getfd_ref(fd);
-    if (!f) return -N_ERR_NO_HANDLE;
-    int64_t result = vfs_write_user(f, buf, n);
-    vfs_close(f);
-    return result;
-}
-
-static int64_t sys_open(const char *upath, int flags) {
-    char path[PATH_MAX_LEN];
-    int r = user_path(upath, path);
-    if (r < 0) return r;
-    struct file *f;
-    r = vfs_open(path, flags, &f);
-    if (r < 0) return r;
-    int fd = allocfd(f);
-    if (fd < 0) vfs_close(f);
-    return fd;
-}
-
-static int64_t sys_close(int fd) {
+static int64_t handle_drop(int fd) {
     uint64_t flags = irq_save();
     struct file *f = getfd(fd);
     if (!f) { irq_restore(flags); return -N_ERR_NO_HANDLE; }
@@ -159,153 +119,9 @@ static int64_t sys_close(int fd) {
     return 0;
 }
 
-static int64_t sys_stat(const char *upath, struct kstat *st) {
-    char path[PATH_MAX_LEN];
-    int r = user_path(upath, path);
-    if (r < 0) return r;
-    if (!user_ok_w(st, sizeof *st)) return -N_ERR_BAD_ADDRESS;
-    return vfs_stat(path, st);
-}
-
-static int64_t sys_fstat(int fd, struct kstat *st) {
-    struct file *f = getfd_ref(fd);
-    if (!f) return -N_ERR_NO_HANDLE;
-    if (!user_ok_w(st, sizeof *st)) { vfs_close(f); return -N_ERR_BAD_ADDRESS; }
-    uint64_t flags = irq_save();
-    st->type = f->vn->tty ? VT_CHAR : f->vn->type;
-    st->size = f->vn->size;
-    st->mtime = f->vn->mtime;
-    st->mode = f->vn->mode;
-    irq_restore(flags);
-    vfs_close(f);
-    return 0;
-}
-
-static int64_t sys_readdir(int fd, uint64_t idx, struct n_dirent *ud) {
-    struct file *f = getfd_ref(fd);
-    if (!f) return -N_ERR_NO_HANDLE;
-    struct dirent d;
-    memset(&d, 0, sizeof d);
-    int64_t result = vfs_readdir(f, idx, &d);
-    vfs_close(f);
-    if (result > 0) {
-        uint64_t flags = irq_save();
-        if (!user_ok_w(ud, sizeof *ud)) result = -N_ERR_BAD_ADDRESS;
-        else memcpy(ud, &d, sizeof *ud);
-        irq_restore(flags);
-    }
-    return result;
-}
-
-static int64_t sys_mkdir(const char *upath) {
-    char path[PATH_MAX_LEN];
-    int r = user_path(upath, path);
-    return r < 0 ? r : vfs_mkdir(path);
-}
-
-static int64_t sys_unlink(const char *upath) {
-    char path[PATH_MAX_LEN];
-    int r = user_path(upath, path);
-    return r < 0 ? r : vfs_unlink(path);
-}
-
-static int64_t sys_rename(const char *uold, const char *unew) {
-    char a[PATH_MAX_LEN], b[PATH_MAX_LEN];
-    int r = user_path(uold, a);
-    if (r < 0) return r;
-    r = user_path(unew, b);
-    if (r < 0) return r;
-    struct kstat st;
-    if (vfs_stat(a, &st) < 0) return -N_ERR_NOT_FOUND;
-    if (st.type != VT_FILE) return -N_ERR_IS_FOLDER;
-    uint8_t *data;
-    uint64_t size;
-    r = vfs_read_whole(a, &data, &size);
-    if (r < 0) return r;
-    r = vfs_write_whole(b, data, size);
-    kfree(data);
-    if (r < 0) return r;
-    return vfs_unlink(a);
-}
-
-static int64_t sys_chdir(const char *upath) {
-    char path[PATH_MAX_LEN];
-    int r = user_path(upath, path);
-    if (r < 0) return r;
-    struct kstat st;
-    if (vfs_stat(path, &st) < 0) return -N_ERR_NOT_FOUND;
-    if (st.type != VT_DIR) return -N_ERR_NOT_FOLDER;
-    uint64_t flags = irq_save();
-    strlcpy(task_process()->cwd, path, sizeof task_process()->cwd);
-    irq_restore(flags);
-    return 0;
-}
-
-static int64_t sys_getcwd(char *buf, size_t n) {
-    char cwd[sizeof task_process()->cwd];
-    uint64_t flags = irq_save();
-    memcpy(cwd, task_process()->cwd, sizeof cwd);
-    irq_restore(flags);
-    size_t l = strlen(cwd) + 1;
-    if (n < l) return -N_ERR_TOO_LARGE;
-    if (!user_ok_w(buf, l)) return -N_ERR_BAD_ADDRESS;
-    memcpy(buf, cwd, l);
-    return l;
-}
-
-static int64_t sys_spawn(const char *upath, char **uargv, const int *ufdmap, int flags) {
-    char path[PATH_MAX_LEN];
-    int r = user_path(upath, path);
-    if (r < 0) return r;
-    char *argv[32];
-    int argc = 0;
-    int64_t ret;
-    struct file *fds[3] = {NULL, NULL, NULL};
-    if (uargv) {
-        while (argc < 31) {
-            if (!user_ok(&uargv[argc], 8)) { ret = -N_ERR_BAD_ADDRESS; goto out; }
-            char *ua = uargv[argc];
-            if (!ua) break;
-            char tmp[512];
-            r = user_str(tmp, ua, sizeof tmp);
-            if (r < 0) { ret = r; goto out; }
-            argv[argc++] = strdup(tmp);
-        }
-    }
-    if (argc == 0) argv[argc++] = strdup(path);
-    int sources[3] = {0, 1, 2};
-    for (int i = 0; i < 3; i++) {
-        if (ufdmap) {
-            if (!user_ok(&ufdmap[i], 4)) { ret = -N_ERR_BAD_ADDRESS; goto out; }
-            sources[i] = ufdmap[i];
-        }
-    }
-    char cwd[sizeof task_process()->cwd];
-    uint64_t irq_flags = irq_save();
-    for (int i = 0; i < 3; i++) {
-        fds[i] = getfd(sources[i]);
-        if (fds[i]) vfs_dup(fds[i]);
-    }
-    memcpy(cwd, task_process()->cwd, sizeof cwd);
-    irq_restore(irq_flags);
-    ret = proc_spawn(path, argc, argv, fds, cwd, (flags & SPAWN_DETACH) ? NULL : task_process());
-out:
-    for (unsigned i = 0; i < 3; i++) if (fds[i]) vfs_close(fds[i]);
-    for (int i = 0; i < argc; i++) kfree(argv[i]);
-    return ret;
-}
-
-static int64_t sys_waitpid(int pid, int *ustatus, int flags) {
-    if (ustatus && !user_ok_w(ustatus, 4)) return -N_ERR_BAD_ADDRESS;
-    int st = 0;
-    int r = task_wait(pid, &st, flags & 1);
-    if (r > 0 && ustatus) *ustatus = st;
-    return r;
-}
-
-/* Physical memory ran out under a heap request: name the largest user
+/* Physical memory ran out under a memory request: name the largest user
    processes once per interval, so the owner of the memory is visible. */
-static void report_heap_exhaustion(struct task *t, int64_t inc) {
+static void report_memory_exhaustion(struct task *t, int64_t inc) {
     static uint64_t last_report;
     uint64_t now = uptime_ms();
     if (last_report && now - last_report < 10000) return;
@@ -321,62 +137,10 @@ static void report_heap_exhaustion(struct task *t, int64_t inc) {
         if (at < 8) { top[at].pid = p->pid; strlcpy(top[at].name, p->name, sizeof top[at].name); top[at].kb = kb; }
     }
     irq_restore(flags);
-    kprintf("[memory] pid %d (%s): no pages for %ld more heap bytes, %lu pages free; largest:",
+    kprintf("[memory] pid %d (%s): no pages for %ld more bytes, %lu pages free; largest:",
             t->pid, t->name, (long)inc, (unsigned long)pmm_free_pages());
     for (int i = 0; i < n; i++) kprintf(" %d/%s %luK", top[i].pid, top[i].name, (unsigned long)top[i].kb);
     kprintf("\n");
-}
-
-static int64_t sys_sbrk_locked(int64_t inc) {
-    struct task *t = task_process();
-    uint64_t old = t->brk;
-    if (inc == 0) return old;
-    uint64_t nb = t->brk + inc;
-    if (nb < t->brk_base || nb > t->low_base) return -N_ERR_NO_MEMORY;
-    if (inc > 0) {
-        uint64_t start = ALIGN_UP(old, PAGE_SIZE);
-        uint64_t end = ALIGN_UP(nb, PAGE_SIZE);
-        for (uint64_t page = start; page < end; page += PAGE_SIZE) {
-            if (vmm_user_alloc(t->pml4, page, PAGE_SIZE, VM_W) < 0) {
-                /* Only this attempt's completed prefix belongs to the rollback.
-                   Preserve the old partial page, and do not scan the unallocated
-                   tail of a request that can be much larger than physical RAM. */
-                vmm_user_free(t->pml4, start, page - start);
-                report_heap_exhaustion(t, inc);
-                return -N_ERR_NO_MEMORY;
-            }
-        }
-    } else {
-        vmm_user_free(t->pml4, ALIGN_UP(nb, PAGE_SIZE), ALIGN_UP(old, PAGE_SIZE) - ALIGN_UP(nb, PAGE_SIZE));
-    }
-    t->brk = nb;
-    return old;
-}
-
-static int64_t sys_sbrk(int64_t inc) {
-    return sys_sbrk_locked(inc);
-}
-
-static int64_t sys_pipe(int *ufds) {
-    if (!user_ok_w(ufds, 8)) return -N_ERR_BAD_ADDRESS;
-    struct file *r, *w;
-    int e = pipe_create(&r, &w);
-    if (e < 0) return e;
-    uint64_t flags = irq_save();
-    int a=allocfd_locked(r),b=a<0?a:allocfd_locked(w);
-    int output_error=b<0?b:!user_ok_w(ufds,8)?-N_ERR_BAD_ADDRESS:0;
-    if (output_error) {
-        if(b>=0)task_process()->fds[b]=NULL;
-        if(a>=0){task_process()->fds[a]=NULL;task_process()->fd_hint=(size_t)a;}
-        irq_restore(flags);
-        vfs_close(r);
-        vfs_close(w);
-        return output_error;
-    }
-    ufds[0] = a;
-    ufds[1] = b;
-    irq_restore(flags);
-    return 0;
 }
 
 /* Snapshot the explicit native key length once; never rescan mutable user
@@ -403,91 +167,6 @@ static int64_t sys_channel_accept(int fd) {
     if(!result)result=allocfd_locked(server);
     irq_restore(flags);vfs_close(listener);
     if(result<0 && server)vfs_close(server);
-    return result;
-}
-
-static int64_t sys_dup2(int oldfd, int newfd) {
-    uint64_t flags = irq_save();
-    struct file *f = getfd(oldfd);
-    if (!f || newfd < 0) { irq_restore(flags); return -N_ERR_NO_HANDLE; }
-    if (oldfd == newfd) { irq_restore(flags); return newfd; }
-    int error=task_fd_reserve(task_process(),(size_t)newfd+1);
-    if(error){irq_restore(flags);return error;}
-    struct file *previous = task_process()->fds[newfd];
-    task_process()->fds[newfd] = vfs_dup(f);
-    if (previous) vfs_poll_notify(previous->vn);
-    irq_restore(flags);
-    vfs_close(previous);
-    return newfd;
-}
-
-static int64_t sys_dup(int oldfd) {
-    struct file *f = getfd_ref(oldfd);
-    if (!f) return -N_ERR_NO_HANDLE;
-    int fd = allocfd(f);
-    if (fd < 0) vfs_close(f);
-    return fd;
-}
-
-static int64_t sys_poll(struct n_pollfd *ufds, int n, int timeout) {
-    if (n < 0 || (size_t)n>SIZE_MAX/sizeof(struct n_pollfd)) return -N_ERR_INVALID;
-    size_t bytes=(size_t)n*sizeof(struct n_pollfd);
-    struct n_pollfd local[64],*fds=n<=64?local:kmalloc(bytes);
-    if(!fds)return -N_ERR_NO_MEMORY;
-    uint64_t snapshot_flags=irq_save();
-    if(!user_ok_w(ufds,bytes)){irq_restore(snapshot_flags);if(fds!=local)kfree(fds);return -N_ERR_BAD_ADDRESS;}
-    memcpy(fds,ufds,bytes);irq_restore(snapshot_flags);
-    uint64_t deadline = timeout >= 0 ? uptime_ms() + timeout : 0;
-    struct poll_wait wait = {0};
-    int result=0;
-    for (;;) {
-        uint64_t fl = irq_save();
-        uint64_t generation=wait.generation;
-        int ready = 0;
-        for (int i = 0; i < n; i++) {
-            fds[i].revents = 0;
-            struct file *f = getfd(fds[i].fd);
-            if(f) {
-                if ((fds[i].events & N_POLLIN) && vfs_can_read(f)) fds[i].revents |= N_POLLIN;
-                if ((fds[i].events & N_POLLOUT) && vfs_can_write(f)) fds[i].revents |= N_POLLOUT;
-                if (f->vn->ops && f->vn->ops->hangup && f->vn->ops->hangup(f->vn,f)) fds[i].revents |= N_POLLHUP;
-                if (fds[i].revents) ready++;
-                /* Checking and enrollment share the same IRQ guard. Avoid
-                   allocating listeners for an already-ready descriptor. */
-                else if (timeout != 0) vfs_poll_file(&wait, f);
-            }
-            /* Preserve atomic per-descriptor checks without letting a large
-             * valid client list become one non-preemptible kernel operation. */
-            irq_restore(fl);fl=irq_save();
-        }
-        bool expired=timeout>0 && uptime_ms()>=deadline;
-        if (ready || timeout == 0 || expired || wait.error) {
-            result=ready ? ready : wait.error ? wait.error : 0;
-            /* A sibling may have unmapped the original array while this
-             * syscall slept/scanned; no kernel copy targets stale user pages. */
-            if(!user_ok_w(ufds,bytes))result=-N_ERR_BAD_ADDRESS;
-            else memcpy(ufds,fds,bytes);
-            irq_restore(fl);
-            break;
-        }
-        if (current_task->killed) {
-            irq_restore(fl);
-            result=-N_ERR_STOPPED;break;
-        }
-        /* Closing/enqueuing during a released scan quantum cannot be lost
-         * between readiness and wait enrollment. Retry only for a new event. */
-        if(generation!=wait.generation){irq_restore(fl);vfs_poll_cleanup(&wait);continue;}
-        if (timeout > 0) {
-            uint64_t now = uptime_ms();
-            if(now<deadline)wq_wait_timeout(&wait.wq, deadline - now);
-        } else {
-            wq_wait(&wait.wq);
-        }
-        irq_restore(fl);
-        vfs_poll_cleanup(&wait);
-    }
-    vfs_poll_cleanup(&wait);
-    if(fds!=local)kfree(fds);
     return result;
 }
 
@@ -532,31 +211,7 @@ static int64_t sys_sysinfo(struct n_sysinfo *si) {
     return 0;
 }
 
-static int64_t sys_fcntl(int fd, int cmd, int arg) {
-    if (cmd == F_NLOCK || cmd == F_NUNLOCK || cmd == F_NTRYLOCK) {
-        struct file *owned = getfd_ref(fd);
-        if (!owned) return -N_ERR_NO_HANDLE;
-        int result = cmd == F_NTRYLOCK ? vfs_try_lease(owned) : vfs_lease(owned, cmd == F_NLOCK);
-        vfs_close(owned);
-        return result;
-    }
-    uint64_t flags = irq_save();
-    struct file *f = getfd(fd);
-    int64_t result = -N_ERR_INVALID;
-    if (!f) result = -N_ERR_NO_HANDLE;
-    else if (cmd == F_GETFL) result = f->flags;
-    else if (cmd == F_SETTTY) {
-        f->vn->tty = arg != 0;
-        result = 0;
-    } else if (cmd == F_SETFL) {
-        f->flags = (f->flags & O_ACCMODE) | (arg & ~O_ACCMODE);
-        result = 0;
-    }
-    irq_restore(flags);
-    return result;
-}
-
-static int64_t sys_killtree(int pid, int include_self) {
+static int64_t stop_tree(int pid, int include_self) {
     /* kill every descendant of pid (used for Ctrl+C) */
     /* BSP task-list ownership must span ancestry traversal, not only each
        task_kill call: preemption may otherwise let another waiter reap t/a. */
@@ -735,109 +390,43 @@ bool shared_demand_fault(uint64_t addr,bool write) {
                        owner->pid,owner->name,(void *)page,(unsigned long)pmm_free_pages());
     return ok;
 }
-static int64_t sys_shared_map(int pid,int fd,size_t bytes,int prot) {
-    if(!bytes || bytes>SIZE_MAX-(PAGE_SIZE-1) || (prot&~N_PROT_WRITE))return -N_ERR_INVALID;
-    struct task *owner=task_process();struct file *f=NULL;
-    uint64_t irq=irq_save();struct task *peer=pid?task_find(pid):owner;
-    if(peer && !peer->is_thread && peer->is_user && !peer->exiting &&
-       (peer==owner || peer->parent==owner || owner->parent==peer) &&
-       fd>=0 && (size_t)fd<peer->fd_capacity && peer->fds[fd] &&
-       peer->fds[fd]->vn->type==VT_SHARED)f=vfs_dup(peer->fds[fd]);
-    irq_restore(irq);if(!f)return -N_ERR_NO_HANDLE;
+/* Maps a shared object the caller holds a handle to (its own, or one received
+   as a channel attachment): there is no reaching into another app's handles. */
+static int64_t sys_shared_map(int h,size_t bytes,int access) {
+    if(!bytes || bytes>SIZE_MAX-(PAGE_SIZE-1) || (access!=N_MEMORY_READ && access!=N_MEMORY_READ_WRITE))return -N_ERR_INVALID;
+    struct task *owner=task_process();struct file *f=getfd_ref(h);
+    if(!f)return -N_ERR_NO_HANDLE;
+    if(f->vn->type!=VT_SHARED){vfs_close(f);return -N_ERR_WRONG_KIND;}
+    uint64_t irq;
     bytes=ALIGN_UP(bytes,PAGE_SIZE);
     if(bytes!=f->vn->size){vfs_close(f);return -N_ERR_INVALID;}
     struct shared_mapping *m=kzalloc(sizeof *m);
     if(!m){vfs_close(f);return -N_ERR_NO_MEMORY;}
-    /* Reserve the VA range before publishing any PTE. No blocking handoff is
-       made in this page loop, but the short BSP guard also keeps future thread
-       mmap/clock/stack reservations from choosing this partially mapped span. */
-    irq=irq_save();uint64_t va=owner->mmap_next;
-    if(va>=USER_STACK_TOP-USER_STACK_MAX || bytes+PAGE_SIZE<bytes ||
-       bytes+PAGE_SIZE>USER_STACK_TOP-USER_STACK_MAX-va){irq_restore(irq);vfs_close(f);kfree(m);return -N_ERR_NO_MEMORY;}
-    uint64_t reserved_end=va+bytes+PAGE_SIZE;owner->mmap_next=reserved_end;irq_restore(irq);
+    /* Reserve the VA range (reusing released ones) before publishing any PTE, so
+       no other reservation can choose this partially mapped span. */
+    uint64_t va=mmap_reserve(owner,bytes);
+    if(!va){vfs_close(f);kfree(m);return -N_ERR_NO_MEMORY;}
     struct shared_pages *p=f->vn->priv;size_t mapped=0;
-    uint64_t flags=PTE_U|PTE_SHARED|pte_nx|(prot&N_PROT_WRITE?PTE_W:PTE_SHARED_RO);
+    uint64_t flags=PTE_U|PTE_SHARED|pte_nx|(access==N_MEMORY_READ_WRITE?PTE_W:PTE_SHARED_RO);
     /* Demand pages not yet touched by any peer stay unmapped until a fault. */
     for(;mapped<p->count;mapped++){
         irq=irq_save();uint64_t frame=shared_frame(p,mapped,false);irq_restore(irq);
         if(frame && !vmm_map_page(owner->pml4,va+mapped*PAGE_SIZE,frame,flags))break;
     }
     if(mapped!=p->count){vmm_user_free(owner->pml4,va,mapped*PAGE_SIZE);
-        irq=irq_save();if(owner->mmap_next==reserved_end)owner->mmap_next=va;irq_restore(irq);
+        mmap_hole_add(owner,va,bytes+PAGE_SIZE);
         vfs_close(f);kfree(m);return -N_ERR_NO_MEMORY;
     }
     irq=irq_save();*m=(struct shared_mapping){.next=owner->shared_mappings,.file=f,.va=va,.flags=flags,.bytes=bytes};
     owner->shared_mappings=m;irq_restore(irq);return (int64_t)va;
-}
-/* A sender offers its page reference in a message; the parent or child that
- * reads the message claims it into its own descriptor table. The ticket keeps
- * the pages alive even if the sender's own buffer is collected first, and is
- * released when claimed or when the sender exits. */
-struct shared_ticket {struct shared_ticket *next;uint64_t id;struct file *file;};
-static struct task *shared_peer(int pid) {
-    struct task *owner=task_process(),*peer=pid?task_find(pid):owner;
-    if(peer && !peer->is_thread && peer->is_user && !peer->exiting &&
-       (peer==owner || peer->parent==owner || owner->parent==peer))return peer;
-    return NULL;
-}
-static int64_t sys_shared_send(int fd) {
-    struct file *f=getfd_ref(fd);
-    if(!f)return -N_ERR_NO_HANDLE;
-    if(f->vn->type!=VT_SHARED){vfs_close(f);return -N_ERR_INVALID;}
-    struct shared_ticket *t=kzalloc(sizeof *t);
-    if(!t){vfs_close(f);return -N_ERR_NO_MEMORY;}
-    struct task *owner=task_process();
-    uint64_t irq=irq_save();
-    t->id=++owner->shared_ticket_serial;t->file=f;t->next=owner->shared_tickets;owner->shared_tickets=t;
-    irq_restore(irq);
-    return (int64_t)t->id;
-}
-static int64_t sys_shared_receive(int pid,uint64_t id) {
-    struct file *f=NULL;
-    uint64_t irq=irq_save();struct task *peer=shared_peer(pid);
-    if(peer)for(struct shared_ticket *t=peer->shared_tickets;t;t=t->next)if(t->id==id){f=vfs_dup(t->file);break;}
-    irq_restore(irq);
-    if(!f)return -N_ERR_NO_HANDLE;
-    int fd=allocfd(f);
-    if(fd<0){vfs_close(f);return fd;}
-    struct shared_ticket *claimed=NULL;
-    irq=irq_save();peer=shared_peer(pid);
-    if(peer)for(struct shared_ticket **link=&peer->shared_tickets;*link;link=&(*link)->next)
-        if((*link)->id==id){claimed=*link;*link=claimed->next;break;}
-    irq_restore(irq);
-    if(claimed){vfs_close(claimed->file);kfree(claimed);}
-    return fd;
 }
 void sys_shared_cleanup(struct task *owner) {
     while(owner->shared_mappings){struct shared_mapping *m=owner->shared_mappings;
         owner->shared_mappings=m->next;
         vmm_user_free(owner->pml4,m->va,m->bytes);vfs_close(m->file);kfree(m);
     }
-    while(owner->shared_tickets){struct shared_ticket *t=owner->shared_tickets;
-        owner->shared_tickets=t->next;vfs_close(t->file);kfree(t);
-    }
     mmap_holes_free(owner);
     program_segments_free(program_segments_unused());
-}
-static int64_t sys_address_watch_queue(void) {
-    struct vnode *v=address_watch_queue_new();
-    if(!v)return -N_ERR_NO_MEMORY;
-    struct file *f=vfs_open_vnode(v,O_RDONLY);
-    if(!f){v->ops->release(v);return -N_ERR_NO_MEMORY;}
-    int fd=allocfd(f);if(fd<0)vfs_close(f);return fd;
-}
-static int64_t sys_address_watch(int fd,uint64_t address,uint32_t expected,uint64_t token) {
-    if((address&3) || !user_ok((void *)address,sizeof(uint32_t)))return -N_ERR_BAD_ADDRESS;
-    struct file *f=getfd_ref(fd);
-    if(!f)return -N_ERR_NO_HANDLE;
-    int64_t r=address_watch_add(f->vn,(volatile uint32_t *)address,expected,token);
-    vfs_close(f);return r;
-}
-static int64_t sys_address_unwatch(int fd,uint64_t token) {
-    struct file *f=getfd_ref(fd);
-    if(!f)return -N_ERR_NO_HANDLE;
-    int64_t r=address_watch_remove(f->vn,token);
-    vfs_close(f);return r;
 }
 
 /* Freed address space of the mmap region. Without reuse every map/unmap cycle
@@ -912,24 +501,41 @@ uint64_t mmap_reserve(struct task *owner, uint64_t len) {
     return region_reserve(&owner->mmap_holes, &owner->mmap_next, USER_STACK_TOP - USER_STACK_MAX, len);
 }
 
-/* anonymous memory in its own region above the heap (window buffers live there too) */
-static int64_t sys_mmap_locked(size_t len, int prot, int place) {
+/* Native access to page protection: readable, writable or executable, never
+   writable and executable together. */
+static int access_flags(int access) {
+    switch (access) {
+    case N_MEMORY_READ: return 0;
+    case N_MEMORY_READ_WRITE: return VM_W;
+    case N_MEMORY_READ_EXECUTE: return VM_X;
+    default: return -1;
+    }
+}
+
+/* Committed, zeroed pages in the reservation region above the program (window
+   buffers and shared mappings live there too), or below 2 GiB with N_MEMORY_LOW.
+   These finite BSP helpers do not sleep. Kernel-mode timer IRQs request a
+   reschedule but cannot switch their continuation (idt.c). Keep IRQ delivery
+   enabled for large allocations; each PTE publication has its own short guard. */
+static int64_t sys_memory_reserve(size_t len, int access) {
     struct task *t = task_process();
-    if (len == 0 || len > (1ULL << 32) || (place & ~N_MMAP_LOW)) return -N_ERR_INVALID;
+    int vp = access_flags(access & ~N_MEMORY_LOW);
+    if (len == 0 || len > (1ULL << 32) || vp < 0) return -N_ERR_INVALID;
     len = ALIGN_UP(len, PAGE_SIZE);
-    int vp = (prot & N_PROT_WRITE ? VM_W : 0) | (prot & N_PROT_EXEC ? VM_X : 0);
-    uint64_t va = place & N_MMAP_LOW ? region_reserve(&t->low_holes, &t->low_next, USER_LOW_TOP, len)
-                                     : mmap_reserve(t, len);
+    uint64_t va = access & N_MEMORY_LOW ? region_reserve(&t->low_holes, &t->low_next, USER_LOW_TOP, len)
+                                        : mmap_reserve(t, len);
     if (!va) return -N_ERR_NO_MEMORY;
     if (vmm_user_alloc(t->pml4, va, len, vp) < 0) {
         vmm_user_free(t->pml4, va, len);
         mmap_hole_add(t, va, len + PAGE_SIZE);
+        report_memory_exhaustion(t, len);
         return -N_ERR_NO_MEMORY;
     }
     return (int64_t)va;
 }
 
-static int64_t sys_munmap_locked(uint64_t va, size_t len) {
+/* Releases reserved pages or a whole shared mapping; window buffers stay with their window. */
+static int64_t sys_memory_release(uint64_t va, size_t len) {
     struct task *t = task_process();
     bool low = va < USER_MMAP_BASE;
     uint64_t base = low ? t->low_base : USER_MMAP_BASE, frontier = low ? t->low_next : t->mmap_next;
@@ -955,26 +561,14 @@ static int64_t sys_munmap_locked(uint64_t va, size_t len) {
     return 0;
 }
 
-static int64_t sys_mprotect_locked(uint64_t va, size_t len, int prot) {
-    if (va & (PAGE_SIZE - 1) || va >= USER_TOP || va + len > USER_TOP || va + len < va) return -N_ERR_INVALID;
-    int vp = (prot & N_PROT_WRITE ? VM_W : 0) | (prot & N_PROT_EXEC ? VM_X : 0);
+static int64_t sys_memory_protect(uint64_t va, size_t len, int access) {
+    int vp = access_flags(access);
+    if (vp < 0 || va & (PAGE_SIZE - 1) || va >= USER_TOP || va + len > USER_TOP || va + len < va) return -N_ERR_INVALID;
     return vmm_user_protect(current_task->pml4, va, len, vp);
 }
 
-/* These finite BSP helpers do not sleep. Kernel-mode timer IRQs request a
-   reschedule but cannot switch their continuation (idt.c). Keep IRQ delivery
-   enabled for large allocations; each PTE publication has its own short guard. */
-static int64_t sys_mmap(size_t len, int prot, int place) {
-    return sys_mmap_locked(len, prot, place);
-}
-static int64_t sys_munmap(uint64_t va, size_t len) {
-    return sys_munmap_locked(va, len);
-}
-static int64_t sys_mprotect(uint64_t va, size_t len, int prot) {
-    return sys_mprotect_locked(va, len, prot);
-}
-
-static int64_t sys_dmesg(char *buf, size_t n) {
+/* Copies the system log's retained text. */
+static int64_t sys_system_log(char *buf, size_t n) {
     if (!user_ok_w(buf, n)) return -N_ERR_BAD_ADDRESS;
     return klog_read(buf, n);
 }
@@ -1027,7 +621,7 @@ static int64_t sys_handle_close(int h) {
        handle open leaves the old document as it was. */
     int committed = vfs_document_commit(f);
     vfs_close(f);
-    int closed = (int)sys_close(h);
+    int closed = (int)handle_drop(h);
     return committed < 0 ? committed : closed;
 }
 
@@ -1200,7 +794,7 @@ static int64_t sys_channel_pair(int32_t *uout) {
    is removed (stage 5): on them a send is a write and a receive takes what is
    there, without message boundaries or attachments. */
 static bool byte_channel(struct file *f) {
-    return f->vn->type == VT_PIPE || f->vn->type == VT_CHAR ||
+    return f->vn->type == VT_CHAR ||
            (f->vn->type == VT_CHANNEL && !message_channel_is(f));
 }
 
@@ -1256,7 +850,7 @@ static int64_t sys_channel_receive(int h, void *ubuf, size_t cap, int flags, int
     if (r >= 0 && !peek && uattached) {
         int32_t handle = att ? (int32_t)install(att) : -1;
         att = NULL;
-        if (copy_to_user(uattached, &handle, sizeof handle) < 0 && handle >= 0) sys_close(handle);
+        if (copy_to_user(uattached, &handle, sizeof handle) < 0 && handle >= 0) handle_drop(handle);
     }
     if (att) vfs_close(att); /* the caller did not ask for attachments */
     return r;
@@ -1323,7 +917,7 @@ static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
     }
     struct proc_launch launch = {.argc = (int)argc, .argv = argv, .setting_count = (int)l.setting_count,
                                  .settings = settings, .handles = handles, .handle_count = l.handle_count,
-                                 .cwd = "/", .parent = task_process(), .app = app};
+                                 .parent = task_process(), .app = app};
     r = proc_launch(path, &launch);
     if (r < 0) ret = r;
     else { ret = install(app_file); app_file = NULL; }
@@ -1365,7 +959,7 @@ static int64_t sys_app_stop(int h, int flags) {
     vfs_close(f);
     if (flags & ~N_APP_STOP_TREE) return -N_ERR_INVALID;
     if (!pid) return 0; /* it has already ended */
-    if (flags & N_APP_STOP_TREE) sys_killtree(pid, 1);
+    if (flags & N_APP_STOP_TREE) stop_tree(pid, 1);
     else task_kill(pid);
     return 0;
 }
@@ -1527,61 +1121,24 @@ void syscall_dispatch(struct regs *r) {
     int64_t ret = -N_ERR_UNSUPPORTED;
     switch (r->rax) {
     case SYS_EXIT: task_exit((int)a);
-    case SYS_READ: ret = sys_read((int)a, (void *)b, c); break;
-    case SYS_WRITE: ret = sys_write((int)a, (const void *)b, c); break;
-    case SYS_OPEN: ret = sys_open((const char *)a, (int)b); break;
-    case SYS_CLOSE: ret = sys_close((int)a); break;
     case SYS_AUDIO_FLUSH: {
         struct file *f = getfd_ref((int)a);
         ret = f ? audio_flush_file(f) : -N_ERR_NO_HANDLE;
         vfs_close(f);
         break;
     }
-    case SYS_LSEEK: {
-        struct file *f = getfd_ref((int)a);
-        ret = f ? vfs_seek(f, (int64_t)b, (int)c) : -N_ERR_NO_HANDLE;
-        vfs_close(f);
-        break;
-    }
-    case SYS_FTRUNCATE: {
-        struct file *f = getfd_ref((int)a);
-        ret = f ? vfs_truncate(f, b) : -N_ERR_NO_HANDLE;
-        vfs_close(f);
-        break;
-    }
-    case SYS_STAT: ret = sys_stat((const char *)a, (struct kstat *)b); break;
-    case SYS_FSTAT: ret = sys_fstat((int)a, (struct kstat *)b); break;
-    case SYS_READDIR: ret = sys_readdir((int)a, b, (struct n_dirent *)c); break;
-    case SYS_MKDIR: ret = sys_mkdir((const char *)a); break;
-    case SYS_UNLINK: ret = sys_unlink((const char *)a); break;
-    case SYS_RENAME: ret = sys_rename((const char *)a, (const char *)b); break;
-    case SYS_CHDIR: ret = sys_chdir((const char *)a); break;
-    case SYS_GETCWD: ret = sys_getcwd((char *)a, b); break;
-    case SYS_SPAWN: ret = sys_spawn((const char *)a, (char **)b, (const int *)c, (int)d); break;
-    case SYS_WAITPID: ret = sys_waitpid((int)a, (int *)b, (int)c); break;
-    case SYS_GETPID: ret = task_process()->pid; break;
-    case SYS_GETPPID: ret = task_process()->parent ? task_process()->parent->pid : 0; break;
-    case SYS_KILL: ret = task_kill((int)a); break;
-    case SYS_KILLTREE: ret = sys_killtree((int)a, (int)b); break;
-    case SYS_SBRK: ret = sys_sbrk((int64_t)a); break;
     case SYS_SLEEP: sleep_ms(a); ret = 0; break;
     case SYS_UPTIME: ret = uptime_ms(); break;
     case SYS_TIME: ret = time_now(); break;
-    case SYS_PIPE: ret = sys_pipe((int *)a); break;
     case SYS_SHARED_CREATE: ret = sys_shared_create(a,false); break;
     case SYS_SHARED_RESERVE: ret = sys_shared_create(a,true); break;
-    case SYS_SHARED_MAP: ret = sys_shared_map((int)a,(int)b,c,(int)d); break;
-    case SYS_SHARED_SEND: ret = sys_shared_send((int)a); break;
-    case SYS_SHARED_RECEIVE: ret = sys_shared_receive((int)a,b); break;
-    case SYS_ADDRESS_WATCH_QUEUE: ret = sys_address_watch_queue(); break;
-    case SYS_ADDRESS_WATCH: ret = sys_address_watch((int)a,b,(uint32_t)c,d); break;
-    case SYS_ADDRESS_UNWATCH: ret = sys_address_unwatch((int)a,b); break;
+    case SYS_SHARED_MAP: ret = sys_shared_map((int)a,b,(int)c); break;
+    case SYS_MEMORY_RESERVE: ret = sys_memory_reserve(a, (int)b); break;
+    case SYS_MEMORY_RELEASE: ret = sys_memory_release(a, b); break;
+    case SYS_MEMORY_PROTECT: ret = sys_memory_protect(a, b, (int)c); break;
     case SYS_CHANNEL_LISTEN: ret = sys_channel_named((const char *)a,b,true); break;
     case SYS_CHANNEL_CONNECT: ret = sys_channel_named((const char *)a,b,false); break;
     case SYS_CHANNEL_ACCEPT: ret = sys_channel_accept((int)a); break;
-    case SYS_DUP2: ret = sys_dup2((int)a, (int)b); break;
-    case SYS_DUP: ret = sys_dup((int)a); break;
-    case SYS_POLL: ret = sys_poll((struct n_pollfd *)a, (int)b, (int)c); break;
     case SYS_PROCLIST: ret = sys_proclist((struct n_procinfo *)a, (int)b); break;
     case SYS_SYSINFO: ret = sys_sysinfo((struct n_sysinfo *)a); break;
     case SYS_CPU_INFO: {
@@ -1731,11 +1288,7 @@ void syscall_dispatch(struct regs *r) {
         else power_off();
         ret = -N_ERR_IO;
         break;
-    case SYS_FCNTL: ret = sys_fcntl((int)a, (int)b, (int)c); break;
-    case SYS_DMESG: ret = sys_dmesg((char *)a, b); break;
-    case SYS_MMAP: ret = sys_mmap(a, (int)b, (int)c); break;
-    case SYS_MUNMAP: ret = sys_munmap(a, b); break;
-    case SYS_MPROTECT: ret = sys_mprotect(a, b, (int)c); break;
+    case SYS_SYSTEM_LOG: ret = sys_system_log((char *)a, b); break;
     case SYS_PCILIST:
         if (!user_ok_w((void *)a, b * sizeof(struct n_pciinfo))) ret = -N_ERR_BAD_ADDRESS;
         else ret = pci_list((struct n_pciinfo *)a, (int)b);

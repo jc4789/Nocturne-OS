@@ -7,12 +7,13 @@
 #include <stdlib.h>
 
 /* One mapping of a shared-page object. Every SharedArrayBuffer object over it
-   holds a reference; the last one unmaps it and closes the descriptor. */
+   holds a reference; the last one unmaps it and closes the handle. The handle
+   stays open so the region can be attached to a message again. */
 struct shared_region {
     struct shared_region *next;
     uint8_t *data;
     size_t bytes;
-    int fd;
+    n_handle handle;
     unsigned refs;
 };
 static struct shared_region *regions;
@@ -33,15 +34,24 @@ static void region_unlink(struct shared_region *region) {
     for (struct shared_region **link = &regions; *link; link = &(*link)->next)
         if (*link == region) { *link = region->next; break; }
     n_memory_release(region->data, region->bytes);
-    n_handle_close(region->fd);
+    n_handle_close(region->handle);
     free(region);
 }
-static struct shared_region *region_map(int fd, size_t bytes, int prot) {
+static void region_drop(struct shared_region *region) {
+    if (!--region->refs) region_unlink(region);
+}
+static bool region_registered(const struct shared_region *region) {
+    for (const struct shared_region *r = regions; r; r = r->next) if (r == region) return true;
+    return false;
+}
+/* Map a shared-page handle; the region owns the handle from here on, also
+   when mapping fails. */
+static struct shared_region *region_map(n_handle handle, size_t bytes, int access) {
     struct shared_region *region = calloc(1, sizeof *region);
-    if (!region) { n_handle_close(fd); return NULL; }
-    region->data = n_shared_map(0, fd, bytes, prot);
-    if (!region->data) { n_handle_close(fd); free(region); return NULL; }
-    region->bytes = bytes; region->fd = fd;
+    if (!region) { n_handle_close(handle); return NULL; }
+    region->data = n_shared_map(handle, bytes, access);
+    if (!region->data) { n_handle_close(handle); free(region); return NULL; }
+    region->bytes = bytes; region->handle = handle;
     region->next = regions; regions = region;
     return region;
 }
@@ -54,9 +64,9 @@ static void *sab_alloc(void *opaque, size_t size) {
     (void)opaque;
     size_t bytes = page_round(size);
     if (!bytes) return NULL;
-    int fd = n_shared_reserve(bytes);
-    if (fd < 0) return NULL;
-    struct shared_region *region = region_map(fd, bytes, N_PROT_WRITE);
+    n_handle handle = n_shared_reserve(bytes);
+    if (handle < 0) return NULL;
+    struct shared_region *region = region_map(handle, bytes, N_MEMORY_READ_WRITE);
     if (!region) return NULL;
     region->refs = 1;
     return region->data;
@@ -69,7 +79,7 @@ static void sab_dup(void *opaque, void *ptr) {
 static void sab_free(void *opaque, void *ptr) {
     (void)opaque;
     struct shared_region *region = region_find(ptr);
-    if (region && !--region->refs) region_unlink(region);
+    if (region) region_drop(region);
 }
 
 /* A new SharedArrayBuffer object over a region; the region gains a reference
@@ -87,25 +97,64 @@ static struct shared_region *buffer_region(JSContext *ctx, JSValueConst buffer, 
     return region;
 }
 
-/* [pid, ticket, mapped bytes, offset, length]: the receiving agent claims the
-   ticket once; the offset locates a buffer inside a WebAssembly memory. */
+/* Export scopes: the regions one outgoing message attaches, in the order of
+   their attachment index. Scopes nest (an author getter may post a message
+   while another is being walked); a sealed scope waits under its id until the
+   native sender takes it. */
+struct export_scope {
+    struct export_scope *next;
+    struct shared_region **region;
+    size_t count, capacity;
+};
+struct sealed_scope {
+    struct sealed_scope *next;
+    struct shared_region **region;
+    size_t count;
+    uint32_t id;
+};
+static struct export_scope *export_scopes;
+static struct sealed_scope *sealed_scopes;
+static uint32_t next_scope_id;
+/* The handles that arrived with the message being delivered. */
+static struct web_inbox *import_inbox;
+
+static void regions_drop(struct shared_region **list, size_t count) {
+    for (size_t i = 0; i < count; i++) region_drop(list[i]);
+    free(list);
+}
+
+/* [attachment index, mapped bytes, offset, length]: the region joins the open
+   scope once; the offset locates a buffer inside a WebAssembly memory. */
 static JSValue region_export(JSContext *ctx, struct shared_region *region, size_t offset, size_t length) {
-    long ticket = n_shared_send(region->fd);
-    if (ticket < 0) return JS_ThrowRangeError(ctx, "Shared memory could not be offered to the receiving agent");
+    struct export_scope *scope = export_scopes;
+    if (!scope) return JS_ThrowTypeError(ctx, "Shared memory can only be exported with a worker message");
+    size_t index = 0;
+    while (index < scope->count && scope->region[index] != region) index++;
+    if (index == scope->count) {
+        if (scope->count == scope->capacity) {
+            size_t capacity = scope->capacity ? scope->capacity * 2 : 4;
+            struct shared_region **grown = realloc(scope->region, capacity * sizeof *grown);
+            if (!grown) return JS_ThrowOutOfMemory(ctx);
+            scope->region = grown; scope->capacity = capacity;
+        }
+        region->refs++;
+        scope->region[scope->count++] = region;
+    }
     JSValue record = JS_NewArray(ctx);
     if (JS_IsException(record)) return record;
-    JS_SetPropertyUint32(ctx, record, 0, JS_NewInt32(ctx, (int32_t)n_app_self()));
-    JS_SetPropertyUint32(ctx, record, 1, JS_NewFloat64(ctx, (double)ticket));
-    JS_SetPropertyUint32(ctx, record, 2, JS_NewFloat64(ctx, (double)region->bytes));
-    JS_SetPropertyUint32(ctx, record, 3, JS_NewFloat64(ctx, (double)offset));
-    JS_SetPropertyUint32(ctx, record, 4, JS_NewFloat64(ctx, (double)length));
+    JS_SetPropertyUint32(ctx, record, 0, JS_NewUint32(ctx, (uint32_t)index));
+    JS_SetPropertyUint32(ctx, record, 1, JS_NewFloat64(ctx, (double)region->bytes));
+    JS_SetPropertyUint32(ctx, record, 2, JS_NewFloat64(ctx, (double)offset));
+    JS_SetPropertyUint32(ctx, record, 3, JS_NewFloat64(ctx, (double)length));
     return record;
 }
-/* Map an exported region without a reference yet (refs 0). */
+/* Map an exported region from the delivered message's attachments, without a
+   reference of the caller's yet. The same attachment imported again within one
+   delivery gives the region it already mapped. */
 static struct shared_region *region_import(JSContext *ctx, JSValueConst record, size_t *offset, size_t *length,
-                                            int prot) {
-    double field[5];
-    for (unsigned i = 0; i < 5; i++) {
+                                            int access) {
+    double field[4];
+    for (unsigned i = 0; i < 4; i++) {
         JSValue v = JS_GetPropertyUint32(ctx, record, i);
         int bad = JS_ToFloat64(ctx, &field[i], v);
         JS_FreeValue(ctx, v);
@@ -115,18 +164,130 @@ static struct shared_region *region_import(JSContext *ctx, JSValueConst record, 
             return NULL;
         }
     }
-    size_t bytes = (size_t)field[2];
-    *offset = (size_t)field[3]; *length = (size_t)field[4];
+    size_t index = (size_t)field[0], bytes = (size_t)field[1];
+    *offset = (size_t)field[2]; *length = (size_t)field[3];
     if (*offset > bytes || *length > bytes - *offset || page_round(bytes) != bytes) {
         JS_ThrowTypeError(ctx, "Invalid shared memory record");
         return NULL;
     }
-    int fd = n_shared_receive((int)field[0], (long)field[1]);
-    if (fd < 0) { JS_ThrowTypeError(ctx, "Shared memory sender is not reachable from this agent"); return NULL; }
-    struct shared_region *region = region_map(fd, bytes, prot);
-    if (!region) JS_ThrowRangeError(ctx, "Shared memory could not be mapped");
+    struct web_inbox *inbox = import_inbox;
+    if (!inbox || index >= inbox->count) {
+        JS_ThrowTypeError(ctx, "Shared memory attachment is missing from this message");
+        return NULL;
+    }
+    struct web_inbox_entry *entry = &inbox->entry[index];
+    if (entry->region && region_registered(entry->region) && entry->region->bytes == bytes) return entry->region;
+    if (entry->handle < 0) { JS_ThrowTypeError(ctx, "Shared memory attachment was already used"); return NULL; }
+    n_handle handle = entry->handle;
+    entry->handle = -1; /* the region owns it now, also when mapping fails */
+    struct shared_region *region = region_map(handle, bytes, access);
+    if (!region) { JS_ThrowRangeError(ctx, "Shared memory could not be mapped"); return NULL; }
+    entry->region = region;
     return region;
 }
+
+/* Scope operations for the clone code of an outgoing worker message. */
+static JSValue native_scope_begin(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    struct export_scope *scope = calloc(1, sizeof *scope);
+    if (!scope) return JS_ThrowOutOfMemory(ctx);
+    scope->next = export_scopes; export_scopes = scope;
+    return JS_UNDEFINED;
+}
+static struct export_scope *scope_pop(void) {
+    struct export_scope *scope = export_scopes;
+    if (scope) export_scopes = scope->next;
+    return scope;
+}
+static JSValue native_scope_abandon(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    struct export_scope *scope = scope_pop();
+    if (!scope) return JS_ThrowTypeError(ctx, "No shared memory export scope is open");
+    regions_drop(scope->region, scope->count);
+    free(scope);
+    return JS_UNDEFINED;
+}
+/* Close the scope. An empty one is 0; otherwise its regions wait under a new id. */
+static JSValue native_scope_seal(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    struct export_scope *scope = scope_pop();
+    if (!scope) return JS_ThrowTypeError(ctx, "No shared memory export scope is open");
+    if (!scope->count) { free(scope->region); free(scope); return JS_NewUint32(ctx, 0); }
+    struct sealed_scope *sealed = malloc(sizeof *sealed);
+    if (!sealed) {
+        regions_drop(scope->region, scope->count);
+        free(scope);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    if (++next_scope_id == 0) next_scope_id = 1;
+    *sealed = (struct sealed_scope){sealed_scopes, scope->region, scope->count, next_scope_id};
+    sealed_scopes = sealed;
+    free(scope);
+    return JS_NewUint32(ctx, sealed->id);
+}
+static struct sealed_scope *sealed_take(uint32_t id) {
+    for (struct sealed_scope **link = &sealed_scopes; *link; link = &(*link)->next)
+        if ((*link)->id == id) { struct sealed_scope *s = *link; *link = s->next; return s; }
+    return NULL;
+}
+static JSValue native_scope_discard(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    uint32_t id;
+    if (argc < 1 || JS_ToUint32(ctx, &id, argv[0])) return JS_EXCEPTION;
+    struct sealed_scope *sealed = sealed_take(id);
+    if (sealed) { regions_drop(sealed->region, sealed->count); free(sealed); }
+    return JS_UNDEFINED;
+}
+
+bool web_attachments_extract(JSContext *ctx, JSValueConst wire, struct web_attachments *out) {
+    *out = (struct web_attachments){0};
+    JSValue slot = JS_GetPropertyUint32(ctx, wire, 2);
+    if (JS_IsException(slot)) return false;
+    if (JS_IsUndefined(slot)) return true;
+    uint32_t id = 0;
+    bool ok = JS_IsNumber(slot) && !JS_ToUint32(ctx, &id, slot) && id;
+    JS_FreeValue(ctx, slot);
+    struct sealed_scope *sealed = ok ? sealed_take(id) : NULL;
+    if (!sealed) {
+        if (!JS_HasException(ctx)) JS_ThrowTypeError(ctx, "Invalid shared memory attachment list");
+        return false;
+    }
+    /* Cut the slot off: the receiver reads [data, metadata] only. */
+    if (JS_SetPropertyStr(ctx, wire, "length", JS_NewInt32(ctx, 2)) < 0) {
+        regions_drop(sealed->region, sealed->count);
+        free(sealed);
+        return false;
+    }
+    out->region = sealed->region; out->count = sealed->count;
+    free(sealed);
+    return true;
+}
+n_handle web_attachments_handle(const struct web_attachments *attachments, size_t index) {
+    return attachments->region[index]->handle;
+}
+void web_attachments_release(struct web_attachments *attachments) {
+    regions_drop(attachments->region, attachments->count);
+    *attachments = (struct web_attachments){0};
+}
+
+bool web_inbox_add(struct web_inbox *inbox, n_handle handle) {
+    if (inbox->count == inbox->capacity) {
+        size_t capacity = inbox->capacity ? inbox->capacity * 2 : 2;
+        struct web_inbox_entry *grown = realloc(inbox->entry, capacity * sizeof *grown);
+        if (!grown) return false;
+        inbox->entry = grown; inbox->capacity = capacity;
+    }
+    inbox->entry[inbox->count++] = (struct web_inbox_entry){handle, NULL};
+    return true;
+}
+void web_inbox_close(struct web_inbox *inbox) {
+    for (size_t i = 0; i < inbox->count; i++)
+        if (inbox->entry[i].handle >= 0) n_handle_close(inbox->entry[i].handle);
+    free(inbox->entry);
+    *inbox = (struct web_inbox){0};
+}
+void web_atomics_import_begin(struct web_inbox *inbox) { import_inbox = inbox; }
+void web_atomics_import_end(void) { import_inbox = NULL; }
 
 static JSValue native_export(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc;
@@ -137,7 +298,7 @@ static JSValue native_export(JSContext *ctx, JSValueConst this_val, int argc, JS
 static JSValue native_import(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc;
     size_t offset, length;
-    struct shared_region *region = region_import(ctx, argv[0], &offset, &length, N_PROT_WRITE);
+    struct shared_region *region = region_import(ctx, argv[0], &offset, &length, N_MEMORY_READ_WRITE);
     return region ? region_buffer(ctx, region, offset, length) : JS_EXCEPTION;
 }
 /* host.sharedBufferReserve(bytes): a SharedArrayBuffer whose pages are
@@ -149,8 +310,8 @@ static JSValue native_reserve(JSContext *ctx, JSValueConst this_val, int argc, J
     if (JS_ToFloat64(ctx, &requested, argv[0])) return JS_EXCEPTION;
     if (!(requested >= 1) || requested > (double)(SIZE_MAX / 2)) return JS_ThrowRangeError(ctx, "Invalid shared buffer size");
     size_t length = (size_t)requested, bytes = page_round(length);
-    int fd = bytes ? n_shared_reserve(bytes) : -1;
-    struct shared_region *region = fd >= 0 ? region_map(fd, bytes, N_PROT_WRITE) : NULL;
+    n_handle handle = bytes ? n_shared_reserve(bytes) : -1;
+    struct shared_region *region = handle >= 0 ? region_map(handle, bytes, N_MEMORY_READ_WRITE) : NULL;
     if (!region) return JS_ThrowRangeError(ctx, "Shared memory could not be reserved");
     return region_buffer(ctx, region, 0, length);
 }
@@ -167,9 +328,9 @@ uint8_t *web_atomics_memory_reserve(uint64_t max_bytes, uint64_t **length) {
     size_t data = page_round(max_bytes ? (size_t)max_bytes : 1);
     if (!data || max_bytes > SIZE_MAX || data > SIZE_MAX - N_PAGE_SIZE) return NULL;
     size_t bytes = data + N_PAGE_SIZE;
-    int fd = n_shared_reserve(bytes);
-    if (fd < 0) return NULL;
-    struct shared_region *region = region_map(fd, bytes, N_PROT_WRITE);
+    n_handle handle = n_shared_reserve(bytes);
+    if (handle < 0) return NULL;
+    struct shared_region *region = region_map(handle, bytes, N_MEMORY_READ_WRITE);
     if (!region) return NULL;
     region->refs = 1;
     *length = (uint64_t *)region->data;
@@ -184,14 +345,14 @@ JSValue web_atomics_memory_export(JSContext *ctx, uint8_t *data) {
 }
 uint8_t *web_atomics_memory_import(JSContext *ctx, JSValueConst record, uint64_t **length) {
     size_t offset, unused;
-    struct shared_region *region = region_import(ctx, record, &offset, &unused, N_PROT_WRITE);
+    struct shared_region *region = region_import(ctx, record, &offset, &unused, N_MEMORY_READ_WRITE);
     if (!region) return NULL;
     if (offset != N_PAGE_SIZE) {
-        region_unlink(region);
+        if (!region->refs) region_unlink(region);
         JS_ThrowTypeError(ctx, "Invalid WebAssembly memory record");
         return NULL;
     }
-    region->refs = 1;
+    region->refs++;
     *length = (uint64_t *)region->data;
     return region->data + N_PAGE_SIZE;
 }
@@ -200,9 +361,9 @@ uint8_t *web_atomics_memory_import(JSContext *ctx, JSValueConst record, uint64_t
 uint8_t *web_atomics_image_reserve(size_t size) {
     size_t bytes = page_round(size);
     if (!bytes) return NULL;
-    int fd = n_shared_create(bytes);
-    if (fd < 0) return NULL;
-    struct shared_region *region = region_map(fd, bytes, N_PROT_WRITE);
+    n_handle handle = n_shared_create(bytes);
+    if (handle < 0) return NULL;
+    struct shared_region *region = region_map(handle, bytes, N_MEMORY_READ_WRITE);
     if (!region) return NULL;
     region->refs = 1;
     return region->data;
@@ -215,14 +376,14 @@ JSValue web_atomics_image_export(JSContext *ctx, uint8_t *data, size_t length) {
 }
 const uint8_t *web_atomics_image_import(JSContext *ctx, JSValueConst record, size_t *length) {
     size_t offset;
-    struct shared_region *region = region_import(ctx, record, &offset, length, 0);
+    struct shared_region *region = region_import(ctx, record, &offset, length, N_MEMORY_READ);
     if (!region) return NULL;
     if (offset) {
-        region_unlink(region);
+        if (!region->refs) region_unlink(region);
         JS_ThrowTypeError(ctx, "Invalid shared image record");
         return NULL;
     }
-    region->refs = 1;
+    region->refs++;
     return region->data;
 }
 int web_atomics_memory_wait(void *address, uint64_t expected, bool wide, int64_t timeout_ns) {
@@ -262,6 +423,10 @@ void web_atomics_host_init(JSContext *ctx, JSValueConst host) {
         JS_CFUNC_DEF("sharedBufferImport", 1, native_import),
         JS_CFUNC_DEF("sharedBufferAlias", 1, native_alias),
         JS_CFUNC_DEF("sharedBufferReserve", 1, native_reserve),
+        JS_CFUNC_DEF("sharedBufferBegin", 0, native_scope_begin),
+        JS_CFUNC_DEF("sharedBufferSeal", 0, native_scope_seal),
+        JS_CFUNC_DEF("sharedBufferAbandon", 0, native_scope_abandon),
+        JS_CFUNC_DEF("sharedBufferDiscard", 1, native_scope_discard),
     };
     JS_SetPropertyFunctionList(ctx, host, functions, sizeof functions / sizeof *functions);
     /* The brand for structured clone, without allocating a shared region:

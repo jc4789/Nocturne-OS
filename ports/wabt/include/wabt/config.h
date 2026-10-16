@@ -5,16 +5,16 @@
 #define WABT_CONFIG_H_
 #include <stdint.h>
 #include <stdlib.h>
-#include <sys/types.h>
+#include <stddef.h>
 #define alloca(size) __builtin_alloca(size)
 #define WABT_VERSION_STRING "1.0.42-nocturne"
 #define WABT_NOCTURNE 1
 /* WABT_DEBUG stays undefined: interp.h tests it with #ifdef, and a defined 0
  * would give every Value a type tag checked on each access. */
 #define HAVE_ALLOCA_H 0
-#define HAVE_UNISTD_H 1
+#define HAVE_UNISTD_H 0
 #define HAVE_SNPRINTF 1
-#define HAVE_SSIZE_T 1
+#define HAVE_SSIZE_T 0
 #define HAVE_STRCASECMP 1
 #define HAVE_WIN32_VT100 0
 #define WABT_BIG_ENDIAN 0

@@ -22,7 +22,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <sys/mman.h>
+#include <nocturne.h>
 #endif
 
 #ifdef WASM_RT_GROW_FAILED_HANDLER
@@ -95,24 +95,26 @@ static void os_print_last_error(const char* msg) {
 }
 
 #else /* !_WIN32 */
+/* n_memory pages are zero-filled and readable/writable from the start, with no
+ * reserve-now-commit-later step, so only the Wasm memory's maximum can be
+ * reserved this way and growth needs no protection change. Guard-page bounds
+ * checking (which needs a PROT_NONE reservation and a fault handler) is not
+ * available. */
+#if WASM_RT_MEMCHECK_GUARD_PAGES
+#error "WASM_RT_MEMCHECK_GUARD_PAGES needs fault recovery, which Nocturne lacks"
+#endif
 static void* os_mmap(size_t size) {
-  int map_prot = PROT_NONE;
-  int map_flags = MAP_ANONYMOUS | MAP_PRIVATE;
-  uint8_t* addr = mmap(NULL, size, map_prot, map_flags, -1, 0);
-  if (addr == MAP_FAILED)
-    return NULL;
-  return addr;
+  return n_memory_reserve(size, N_MEMORY_READ_WRITE);
 }
 
 static int os_munmap(void* addr, size_t size) {
-  return munmap(addr, size);
+  return n_memory_release(addr, size);
 }
 
 static int os_mprotect(void* addr, size_t size) {
-  if (size == 0) {
-    return 0;
-  }
-  return mprotect(addr, size, PROT_READ | PROT_WRITE);
+  (void)addr; /* the pages are already writable */
+  (void)size;
+  return 0;
 }
 
 static void os_print_last_error(const char* msg) {

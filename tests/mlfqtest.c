@@ -1,4 +1,4 @@
-/* 実 Nocturne spawn/pipe/window の scheduler 負荷。速度閾値で成功を偽装しない。
+/* 実 Nocturne n_app_launch/n_channel_pair/window の scheduler 負荷。速度閾値で成功を偽装しない。
    4 CPU-bound 子を終了まで走らせ、BSP GUI 子の sleep 復帰遅延を実測する。 */
 #include <nocturne.h>
 #include <stdio.h>
@@ -23,7 +23,7 @@ static unsigned apic_id(void) {
 }
 static unsigned long own_cpu_ms(void) {
     struct n_procinfo info[64];
-    int n = proclist(info, 64), pid = getpid();
+    int n = proclist(info, 64), pid = (int)n_app_self();
     for (int i = 0; i < n; i++) if (info[i].pid == pid) return (unsigned long)info[i].cpu_ms;
     return 0;
 }
@@ -31,14 +31,9 @@ static int await_start(unsigned long start) {
     unsigned long now = (unsigned long)uptime_ms();
     return now >= start || msleep((unsigned)(start - now)) == 0;
 }
-static int write_all(int fd, const void *data, size_t bytes) {
-    const unsigned char *p = data;
-    while (bytes) {
-        ssize_t n = write(fd, p, bytes);
-        if (n <= 0) return 0;
-        p += n; bytes -= (size_t)n;
-    }
-    return 1;
+/* One report is one channel message. */
+static int send_report(const struct report *r) {
+    return n_channel_send(1, r, sizeof *r, -1) == (n_result)sizeof *r;
 }
 static int child_burn(unsigned long start, unsigned seed) {
     struct report r = {0};
@@ -55,7 +50,7 @@ static int child_burn(unsigned long start, unsigned seed) {
     r.end_ms = (unsigned long)uptime_ms();
     r.cpu_ms = own_cpu_ms() - cpu_begin;
     r.checksum = value;
-    return write_all(1, &r, sizeof r) ? 0 : 2;
+    return send_report(&r) ? 0 : 2;
 }
 static int child_interactive(unsigned long start) {
     struct report r = {0};
@@ -81,20 +76,20 @@ static int child_interactive(unsigned long start) {
     r.end_ms = (unsigned long)uptime_ms();
     r.cpu_ms = own_cpu_ms() - cpu_begin;
     win_close(win);
-    return r.pin_ok && write_all(1, &r, sizeof r) ? 0 : 2;
+    return r.pin_ok && send_report(&r) ? 0 : 2;
 }
-static int read_until(int fd, void *data, size_t bytes, unsigned long deadline) {
-    unsigned char *p = data;
-    while (bytes) {
-        unsigned long now = (unsigned long)uptime_ms();
-        if (now >= deadline) return 0;
-        struct n_pollfd f = {fd, N_POLLIN, 0};
-        if (poll(&f, 1, (int)(deadline - now)) <= 0) return 0;
-        ssize_t n = read(fd, p, bytes);
-        if (n <= 0) return 0;
-        p += n; bytes -= (size_t)n;
-    }
-    return 1;
+/* Waits on an event queue until the child's report arrives or the deadline passes. */
+static int receive_until(n_handle channel, void *data, size_t bytes, unsigned long deadline) {
+    unsigned long now = (unsigned long)uptime_ms();
+    if (now >= deadline) return 0;
+    n_handle events = n_events_create();
+    if (events < 0) return 0;
+    struct n_event ev;
+    int ok = n_events_watch(events, channel, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, 1) == 0 &&
+             n_events_wait(events, &ev, 1, (int64_t)(deadline - now)) == 1 &&
+             n_channel_receive(channel, data, bytes, 0, NULL) == (n_result)bytes;
+    n_handle_close(events);
+    return ok;
 }
 int main(int argc, char **argv) {
     if (argc == 4 && !strcmp(argv[1], "--burn"))
@@ -103,32 +98,32 @@ int main(int argc, char **argv) {
         return child_interactive(strtoul(argv[2], NULL, 10));
     struct n_cpuinfo cpu;
     if (cpu_info(&cpu)) return 1;
-    int pid[CHILDREN], input[CHILDREN], nullfd = -1, ok = 1, completed = 0;
+    n_handle app[CHILDREN], input[CHILDREN];
+    int ok = 1, completed = 0;
     struct report r[CHILDREN];
     memset(r, 0, sizeof r);
-    for (unsigned i = 0; i < CHILDREN; i++) pid[i] = input[i] = -1;
-    nullfd = open("/dev/null", O_RDWR);
-    if (nullfd < 0) return 1;
+    for (unsigned i = 0; i < CHILDREN; i++) app[i] = input[i] = -1;
     unsigned long start = (unsigned long)uptime_ms() + 500, deadline = start + RUN_TIMEOUT_MS;
     char when[32]; snprintf(when, sizeof when, "%lu", start);
     /* GUI 子を先に準備し、4 burner 全員へ同じ開始時刻を渡す。 */
     for (unsigned i = 0; i < CHILDREN; i++) {
-        int p[2];
-        if (pipe(p)) { ok = 0; goto cleanup; }
-        int map[3] = {nullfd, p[1], nullfd};
+        n_handle c[2];
+        if (n_channel_pair(c) < 0) { ok = 0; goto cleanup; }
+        int32_t handles[3] = {-1, c[1], -1};
         char seed[16]; snprintf(seed, sizeof seed, "%u", i * 17 + 3);
-        char *args[5] = {argv[0], i ? "--burn" : "--interactive", when, i ? seed : NULL, NULL};
-        pid[i] = spawn(argv[0], args, map, 0);
-        close(p[1]); input[i] = p[0];
-        if (pid[i] < 0) { ok = 0; goto cleanup; }
+        const char *args[4] = {argv[0], i ? "--burn" : "--interactive", when, seed};
+        struct n_launch launch = {.arguments = args, .argument_count = i ? 4 : 3, .handles = handles, .handle_count = 3};
+        app[i] = n_app_launch(argv[0], &launch);
+        n_handle_close(c[1]); input[i] = c[0];
+        if (app[i] < 0) { ok = 0; goto cleanup; }
     }
     for (unsigned i = 0; i < CHILDREN; i++) {
-        if (!read_until(input[i], &r[i], sizeof r[i], deadline) || r[i].magic != REPORT_MAGIC) {
+        if (!receive_until(input[i], &r[i], sizeof r[i], deadline) || r[i].magic != REPORT_MAGIC) {
             ok = 0; goto cleanup;
         }
         int status = -1;
-        if (waitpid(pid[i], &status, 0) != pid[i] || status) { ok = 0; goto cleanup; }
-        pid[i] = -1; completed++;
+        if (n_app_result(app[i], -1, &status) < 0 || status) { ok = 0; goto cleanup; }
+        n_handle_close(app[i]); app[i] = -1; completed++;
         if (i && (r[i].kind != 1 || r[i].blocks != WORK_BLOCKS)) ok = 0;
     }
     if (r[0].kind != 2 || r[0].count != SAMPLES || !r[0].pin_ok) ok = 0;
@@ -146,10 +141,9 @@ int main(int argc, char **argv) {
                r[i].blocks, r[i].end_ms - r[i].begin_ms, r[i].cpu_ms, r[i].checksum);
 cleanup:
     for (unsigned i = 0; i < CHILDREN; i++) {
-        if (pid[i] > 0) { int status; kill(pid[i]); waitpid(pid[i], &status, 0); }
-        if (input[i] >= 0) close(input[i]);
+        if (app[i] >= 0) { int status; n_app_stop(app[i], 0); n_app_result(app[i], -1, &status); n_handle_close(app[i]); }
+        if (input[i] >= 0) n_handle_close(input[i]);
     }
-    close(nullfd);
     printf("mlfqtest: %s\n", ok ? "ok" : "FAIL incomplete/timeout/protocol");
     return !ok;
 }

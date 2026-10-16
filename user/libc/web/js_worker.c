@@ -8,27 +8,27 @@
 #include <stdio.h>
 /* One record is one channel message: data keeps room for the header in front
  * of the payload, so a send is a single message without another copy. */
-struct packet {struct packet *next;struct njw_header h;uint8_t *data;};
+struct packet {struct packet *next;struct njw_header h;uint8_t *data;struct web_attachments attach;size_t attach_sent;};
 struct resource {struct resource *next;uint32_t id;};
 #include "js_worker_port_lifetime.h"
 /* channel carries both directions; app is a dedicated worker's own task (a
  * shared server outlives its creator and is not held). watched: the channel
  * is in the page's wait queue, so a record wakes the page without a timer. */
-struct child {struct child *next,*shared_next;web_workers *owner;char *name,*creator_policy,*url,*origin;size_t name_len;uint32_t id,generation,parent_port;n_handle app,channel;int64_t task;int creator_referrer_policy;bool started,stopped,closing,inherit_policy,shared,isolated,watched;struct packet *tx,*tail;struct broker_pair *ports;struct resource *resources;};
+struct child {struct child *next,*shared_next;web_workers *owner;char *name,*creator_policy,*url,*origin;size_t name_len;uint32_t id,generation,parent_port;n_handle app,channel;int64_t task;int creator_referrer_policy;bool started,stopped,closing,inherit_policy,shared,isolated,watched;struct web_inbox inbox;struct packet *tx,*tail;struct broker_pair *ports;struct resource *resources;};
 #define WEB_WORKER_TOKEN (UINT64_C(0x4a) << 56)
 struct shared_ref {struct shared_ref *next;struct child *child;};
-struct event {struct event *next;uint32_t id;struct njw_header h;uint8_t *data;bool from_child;};
+struct event {struct event *next;uint32_t id;struct njw_header h;uint8_t *data;struct web_inbox inbox;bool from_child;};
 struct web_workers {struct web_workers *next;JSContext *ctx;JSValue callback;uint32_t generation;web_worker_loader load;web_worker_requester request;web_worker_canceler cancel;void *opaque;char *creator_policy,*origin;int creator_referrer_policy;bool isolated;web_worker_reporter reporter;void *report_opaque;struct child *children;struct shared_ref *shared;struct event *events,*last;size_t queued;uint32_t next_lease;struct broker_lease *leases;};
 static struct child *shared_children;
 static web_workers *managers;
 static uint32_t next_worker_id;
 struct web_worker_publication {web_workers *owner;struct child *child;struct packet *packet;struct broker_pair *ports,*close_pair,*ack_pair;};
 static struct broker_pair *broker_find(struct child *c,uint32_t id,uint32_t creator){return worker_port_find(c->ports,id,creator);}
-static void broker_packet_free(void *opaque){struct packet *p=opaque;if(p){free(p->data);free(p);}}
+static void broker_packet_free(void *opaque){struct packet *p=opaque;if(p){web_attachments_release(&p->attach);free(p->data);free(p);}}
 static size_t broker_free(struct broker_pair *p){size_t released=0;while(p){struct broker_pair *n=p->next;struct packet*a=p->held_close,*b=p->held_ack;if(a)released+=sizeof a->h+a->h.bytes;if(b)released+=sizeof b->h+b->h.bytes;broker_packet_free(a);broker_packet_free(b);free(p);p=n;}return released;}
 static bool broker_metadata(JSContext *ctx,struct child *c,JSValueConst value,unsigned creator,struct broker_pair **result){return worker_port_metadata(ctx,value,creator,c->ports,creator?UINT32_MAX:c->parent_port,result);}
 static char *policy_copy(const char *headers){size_t n=strlen(headers?headers:"");if(n==SIZE_MAX)return NULL;char *copy=malloc(n+1);if(copy)memcpy(copy,headers?headers:"",n+1);return copy;}
-static void child_free(struct child *c){if(c){struct child **at=&shared_children;while(*at&&*at!=c)at=&(*at)->shared_next;if(*at)*at=c->shared_next;for(web_workers*w=managers;w;w=w->next){struct shared_ref**p=&w->shared;while(*p){if((*p)->child==c){struct shared_ref*r=*p;*p=r->next;free(r);}else p=&(*p)->next;}}while(c->resources){struct resource*r=c->resources;c->resources=r->next;free(r);}if(c->app>=0)n_handle_close(c->app);free(c->creator_policy);free(c->name);free(c->url);free(c->origin);free(c);}}
+static void child_free(struct child *c){if(c){struct child **at=&shared_children;while(*at&&*at!=c)at=&(*at)->shared_next;if(*at)*at=c->shared_next;for(web_workers*w=managers;w;w=w->next){struct shared_ref**p=&w->shared;while(*p){if((*p)->child==c){struct shared_ref*r=*p;*p=r->next;free(r);}else p=&(*p)->next;}}while(c->resources){struct resource*r=c->resources;c->resources=r->next;free(r);}if(c->app>=0)n_handle_close(c->app);web_inbox_close(&c->inbox);free(c->creator_policy);free(c->name);free(c->url);free(c->origin);free(c);}}
 static bool resource_field(JSContext *ctx,JSValueConst record,uint32_t index,JSValue value){
     if(JS_IsException(value))return false;
     /* Resource completion is not an author-JS task. Bypass prototype setters. */
@@ -52,12 +52,12 @@ static bool channel_sendable(n_handle h){
 int64_t web_worker_background_deadline(uint64_t now){return retired?(int64_t)now+10:-1;}
 static struct child *find(web_workers *w,uint32_t id){for(struct child *c=w->children;c;c=c->next)if(c->id==id)return c;for(struct shared_ref*r=w->shared;r;r=r->next)if(r->child->id==id)return r->child;return NULL;}
 static bool queue_room(const web_workers *w,size_t length){return length<=SIZE_MAX-sizeof(struct njw_header)&&length+sizeof(struct njw_header)<=SIZE_MAX-w->queued;}
-static void release_packet(web_workers *w,struct packet *p){w->queued-=sizeof p->h+p->h.bytes;free(p->data);free(p);}
+static void release_packet(web_workers *w,struct packet *p){w->queued-=sizeof p->h+p->h.bytes;web_attachments_release(&p->attach);free(p->data);free(p);}
 static void stop(web_workers *w,struct child *c){
     w=c->owner;
     if(c->stopped)return;c->stopped=true;
     if(w->cancel)w->cancel(w->opaque,c->id,0);
-    if(c->channel>=0)n_handle_close(c->channel);c->channel=-1;c->watched=false;
+    if(c->channel>=0)n_handle_close(c->channel);c->channel=-1;c->watched=false;web_inbox_close(&c->inbox);
     if(c->app>=0){n_app_stop(c->app,0);child_ended(c,NULL);}
     while(c->tx){struct packet *p=c->tx;c->tx=p->next;release_packet(w,p);}c->tail=NULL;
     w->queued-=broker_free(c->ports);c->ports=NULL;
@@ -93,7 +93,10 @@ web_worker_publication *web_worker_prepare_captured(web_workers *w,uint32_t id,u
     if(!c||c->stopped||c->closing){JS_ThrowTypeError(ctx,"Worker port destination is inactive");return NULL;}
     struct web_worker_publication *t=calloc(1,sizeof *t);struct packet *p=calloc(1,sizeof *p);
     if(!t||!p){free(t);free(p);JS_ThrowOutOfMemory(ctx);return NULL;}t->owner=w;t->child=c;t->packet=p;
-    if((op==NJW_MESSAGE||op==NJW_CONNECT)&&kind==NJW_WITH_PORTS){if(capture){JS_ThrowTypeError(ctx,"Capture requires a Port message");goto fail;}if((op==NJW_CONNECT)!=c->shared){JS_ThrowTypeError(ctx,"Worker connection type is invalid");goto fail;}if(!broker_metadata(ctx,c,value,0,&t->ports))goto fail;for(struct broker_pair*p=t->ports;p;p=p->next)p->client=w;if(op==NJW_CONNECT&&JS_DefinePropertyValueUint32(ctx,value,2,JS_NewString(ctx,c->url),JS_PROP_C_W_E)<0)goto fail;}
+    if((op==NJW_MESSAGE||op==NJW_CONNECT)&&kind==NJW_WITH_PORTS){if(capture){JS_ThrowTypeError(ctx,"Capture requires a Port message");goto fail;}if((op==NJW_CONNECT)!=c->shared){JS_ThrowTypeError(ctx,"Worker connection type is invalid");goto fail;}if(!broker_metadata(ctx,c,value,0,&t->ports))goto fail;
+        /* Shared regions of the message travel as attachments ahead of it. */
+        if(!web_attachments_extract(ctx,value,&p->attach))goto fail;
+        for(struct broker_pair*p=t->ports;p;p=p->next)p->client=w;if(op==NJW_CONNECT&&JS_DefinePropertyValueUint32(ctx,value,2,JS_NewString(ctx,c->url),JS_PROP_C_W_E)<0)goto fail;}
     else if(op==NJW_PORT_MESSAGE||op==NJW_PORT_CLOSE||op==NJW_PORT_DRAINED){
         struct broker_pair *pair=kind<=1?broker_find(c,request,kind):NULL;struct broker_lease *lease=capture?broker_lease_find(w,capture):NULL;
         bool pinned=lease&&lease->child==id&&lease->port==request&&lease->creator==kind;
@@ -261,7 +264,13 @@ void web_worker_pump(web_workers *w,uint64_t now){
     (void)now;web_worker_background();if(!w)return;
     for(struct child *c=w->children;c;c=c->next){size_t budget=16384;if(c->stopped){child_ended(c,NULL);continue;}if(!c->started||c->closing)continue;if(!c->shared&&c->app<0&&!spawn_child(w,c))continue;
         if(!c->watched){n_handle queue=web_atomics_queue();c->watched=queue>=0&&n_events_watch(queue,c->channel,N_EVENT_RECEIVABLE,WEB_WORKER_TOKEN|c->id)>=0;}
-        while(c->tx&&budget&&channel_sendable(c->channel)){struct packet *a=c->tx;size_t size=sizeof a->h+a->h.bytes;memcpy(a->data,&a->h,sizeof a->h);
+        while(c->tx&&budget&&channel_sendable(c->channel)){struct packet *a=c->tx;
+            /* A shared region goes first as a bare carrier message, one per
+               attachment, each step checked for room; the payload follows. */
+            if(a->attach_sent<a->attach.count){struct njw_header carrier={NJW_MAGIC,NJW_ATTACH,a->h.generation,0,0,0};
+                if(n_channel_send(c->channel,&carrier,sizeof carrier,web_attachments_handle(&a->attach,a->attach_sent))<0){fail(w,c,"Worker command channel closed");break;}
+                a->attach_sent++;budget-=sizeof carrier<budget?sizeof carrier:budget;continue;}
+            size_t size=sizeof a->h+a->h.bytes;memcpy(a->data,&a->h,sizeof a->h);
             if(n_channel_send(c->channel,a->data,size,-1)<0){fail(w,c,"Worker command channel closed");break;}
             budget-=size<budget?size:budget;c->tx=a->next;if(!c->tx)c->tail=NULL;release_packet(w,a);}
         /* Take records up to this tick's byte budget (at least one). Each is
@@ -269,6 +278,11 @@ void web_worker_pump(web_workers *w,uint64_t now){
         while(!c->stopped&&budget){
             n_result size=n_channel_receive(c->channel,NULL,0,N_CHANNEL_PEEK,NULL);
             if(size==-N_ERR_NOT_READY)break;if(size<0){child_exited(w,c);break;}
+            /* A bare header is a carrier: keep its handle for the record after it. */
+            if(size==(n_result)sizeof(struct njw_header)){struct njw_header carrier;n_handle attached=-1;
+                if(n_channel_receive(c->channel,&carrier,sizeof carrier,0,&attached)!=size||carrier.magic!=NJW_MAGIC||carrier.op!=NJW_ATTACH||carrier.generation!=c->generation||carrier.bytes||attached<0||!web_inbox_add(&c->inbox,attached)){
+                    if(attached>=0)n_handle_close(attached);fail(w,c,"Invalid Worker attachment");break;}
+                continue;}
             struct njw_header h;size_t bytes=(size_t)size-sizeof h;
             uint8_t *data=(size_t)size>sizeof h&&bytes<=NJW_MAX_BYTES&&queue_room(w,bytes)?malloc((size_t)size):NULL;
             if(!data){fail(w,c,"Invalid Worker response, receive size overflow or allocation failure");break;}
@@ -278,7 +292,7 @@ void web_worker_pump(web_workers *w,uint64_t now){
             if(h.magic!=NJW_MAGIC||h.generation!=c->generation||h.bytes!=bytes||(h.op!=NJW_MESSAGE&&h.op!=NJW_ERROR&&h.op!=NJW_LOAD&&h.op!=NJW_CANCEL&&h.op!=NJW_CLOSE&&h.op!=NJW_CONSOLE&&h.op!=NJW_CSP_REPORT&&!port)||!valid_kind){free(data);fail(w,c,"Invalid Worker response");break;}
             memmove(data,data+sizeof h,bytes);budget-=(size_t)size<budget?(size_t)size:budget;
             struct event *e=calloc(1,sizeof *e);if(!e){free(data);fail(w,c,"Worker event allocation failed");break;}
-            e->id=c->id;e->h=h;e->data=data;e->from_child=true;w->queued+=sizeof h+bytes;route_event(w,c,e);
+            e->id=c->id;e->h=h;e->data=data;e->inbox=c->inbox;c->inbox=(struct web_inbox){0};e->from_child=true;w->queued+=sizeof h+bytes;route_event(w,c,e);
             if(h.op==NJW_CLOSE){c->closing=true;if(c->watched)n_events_unwatch(web_atomics_queue(),WEB_WORKER_TOKEN|c->id);c->watched=false;break;}
         }
     }
@@ -351,9 +365,9 @@ bool web_worker_run_one(web_workers *w){
         }
         else if(e->h.op==NJW_CSP_REPORT){if(report_private(ctx,v)){if(w->reporter)w->reporter(w->report_opaque,v);}else fail(w,c,"Invalid private Worker CSP report");}
         else if(e->h.op==NJW_CANCEL){if(!JS_IsNull(v)||!w->cancel)fail(w,c,"Worker host cannot cancel this resource");else w->cancel(w->opaque,c->id,e->h.request);}
-        else {if(e->h.op!=NJW_CONSOLE||!c||console_prefix(ctx,v,c)){JSValue args[]={JS_NewUint32(ctx,e->id),JS_NewUint32(ctx,e->h.op),v,JS_NewUint32(ctx,e->h.request),JS_NewUint32(ctx,e->h.kind)};JSValue r=JS_Call(ctx,w->callback,JS_UNDEFINED,5,args);JS_FreeValue(ctx,r);JS_FreeValue(ctx,args[0]);JS_FreeValue(ctx,args[1]);JS_FreeValue(ctx,args[3]);JS_FreeValue(ctx,args[4]);if(e->h.op==NJW_CLOSE&&c)stop(w,c);}}
+        else {if(e->h.op!=NJW_CONSOLE||!c||console_prefix(ctx,v,c)){JSValue args[]={JS_NewUint32(ctx,e->id),JS_NewUint32(ctx,e->h.op),v,JS_NewUint32(ctx,e->h.request),JS_NewUint32(ctx,e->h.kind)};web_atomics_import_begin(&e->inbox);JSValue r=JS_Call(ctx,w->callback,JS_UNDEFINED,5,args);web_atomics_import_end();JS_FreeValue(ctx,r);JS_FreeValue(ctx,args[0]);JS_FreeValue(ctx,args[1]);JS_FreeValue(ctx,args[3]);JS_FreeValue(ctx,args[4]);if(e->h.op==NJW_CLOSE&&c)stop(w,c);}}
         JS_FreeValue(ctx,v);
-    }}done:free(e->data);free(e);return true;
+    }}done:web_inbox_close(&e->inbox);free(e->data);free(e);return true;
 }
 /* A watched channel wakes the page by itself. Only a record waiting for room,
  * an unwatched channel or a stopping task are checked again in 10 ms. */
@@ -394,7 +408,7 @@ void web_worker_free(web_workers *w){
      * one credit before removing the authority needed to find that child. */
     for(struct event*e=w->events;e;e=e->next){struct child*c=find(w,e->id);if(c&&c->shared&&c->owner!=w)event_credit(w,c,e);}
     while(w->shared){struct shared_ref*r=w->shared;w->shared=r->next;free(r);}
-    while(w->events){struct event*e=w->events;w->events=e->next;free(e->data);free(e);}
+    while(w->events){struct event*e=w->events;w->events=e->next;web_inbox_close(&e->inbox);free(e->data);free(e);}
     web_workers**at=&managers;while(*at&&*at!=w)at=&(*at)->next;if(*at)*at=w->next;
     JS_FreeValue(w->ctx,w->callback);free(w->creator_policy);free(w->origin);free(w);
 }

@@ -6,12 +6,14 @@
 static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 
-static bool rd(int fd, void *p, size_t n) {
+/* exactly n bytes at the reading offset, which then moves past them */
+static bool rd(struct wav *w, void *p, size_t n) {
     uint8_t *d = p;
     while (n) {
-        ssize_t r = read(fd, d, n);
+        n_result r = n_document_read_at(w->document, w->offset, d, n);
         if (r <= 0) return false;
         d += r;
+        w->offset += (uint64_t)r;
         n -= (size_t)r;
     }
     return true;
@@ -19,24 +21,24 @@ static bool rd(int fd, void *p, size_t n) {
 
 const char *wav_open(struct wav *w, const char *path) {
     memset(w, 0, sizeof *w);
-    w->fd = open(path, O_RDONLY);
-    if (w->fd < 0) return "cannot open the file";
+    char full[512];
+    w->document = n_path_complete(path, full, sizeof full) < 0 ? -N_ERR_NAME_TOO_LONG : n_document_open(full, N_DOCUMENT_READ);
+    if (w->document < 0) return "cannot open the file";
     uint8_t h[12], ch[8], fmt[40];
     const char *err = "not a WAV file";
-    if (!rd(w->fd, h, 12) || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) goto fail;
-    uint32_t off = 12;
+    if (!rd(w, h, 12) || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) goto fail;
     for (;;) { /* walk the chunks up to the data */
         err = "no sound in the file";
-        if (!rd(w->fd, ch, 8)) goto fail;
+        if (!rd(w, ch, 8)) goto fail;
         uint32_t len = le32(ch + 4);
-        off += 8;
         if (!memcmp(ch, "data", 4)) {
-            w->data_off = off;
+            w->data_off = (uint32_t)w->offset;
             w->data_len = len;
             break;
         }
+        uint64_t next = w->offset + len + (len & 1); /* chunks are padded to even sizes */
         uint32_t keep = !memcmp(ch, "fmt ", 4) ? MIN(len, (uint32_t)sizeof fmt) : 0;
-        if (keep && !rd(w->fd, fmt, keep)) goto fail;
+        if (keep && !rd(w, fmt, keep)) goto fail;
         if (keep >= 16) {
             w->tag = le16(fmt);
             w->channels = le16(fmt + 2);
@@ -45,8 +47,8 @@ const char *wav_open(struct wav *w, const char *path) {
             w->bits = le16(fmt + 14);
             if (w->tag == 0xFFFE && keep >= 26) w->tag = le16(fmt + 24); /* WAVE_FORMAT_EXTENSIBLE */
         }
-        off += len + (len & 1); /* chunks are padded to even sizes */
-        if (lseek(w->fd, (long)off, SEEK_SET) < 0) goto fail;
+        if (next > UINT32_MAX) goto fail;
+        w->offset = next;
     }
     bool ok_bits = w->tag == 1 ? (w->bits == 8 || w->bits == 16 || w->bits == 24 || w->bits == 32)
                                : w->tag == 3 && w->bits == 32;
@@ -54,22 +56,22 @@ const char *wav_open(struct wav *w, const char *path) {
     if (!ok_bits || w->channels < 1 || w->rate < 1000 || w->rate > 384000 ||
         w->block < w->channels * w->bits / 8)
         goto fail;
-    struct n_stat st;
-    if (fstat(w->fd, &st) == 0 && st.size > w->data_off && w->data_len > st.size - w->data_off)
-        w->data_len = (uint32_t)(st.size - w->data_off); /* a recording that was cut short */
+    n_result size = n_document_size(w->document);
+    if (size > (n_result)w->data_off && w->data_len > (uint64_t)size - w->data_off)
+        w->data_len = (uint32_t)(size - w->data_off); /* a recording that was cut short */
     w->frames = w->data_len / (uint32_t)w->block;
     w->step = ((uint64_t)w->rate << 32) / SOUND_RATE;
     wav_seek(w, 0);
     return NULL;
 fail:
-    close(w->fd);
-    w->fd = -1;
+    n_handle_close(w->document);
+    w->document = -1;
     return err;
 }
 
 void wav_close(struct wav *w) {
-    if (w->fd >= 0) close(w->fd);
-    w->fd = -1;
+    if (w->document >= 0) n_handle_close(w->document);
+    w->document = -1;
 }
 
 uint32_t wav_ms(const struct wav *w, uint32_t frame) { return (uint32_t)((uint64_t)frame * 1000 / w->rate); }
@@ -102,12 +104,13 @@ static bool next_frame(struct wav *w, int32_t *l, int32_t *r) {
         w->at = 0;
         size_t want = MIN(sizeof w->buf - w->len, (size_t)(w->frames - w->pos) * (size_t)w->block);
         while (w->len < (size_t)w->block && want) {
-            ssize_t got = read(w->fd, w->buf + w->len, want);
+            n_result got = n_document_read_at(w->document, w->offset, w->buf + w->len, want);
             if (got <= 0) {
                 w->frames = w->pos; /* the file ended early */
                 return false;
             }
             w->len += (size_t)got;
+            w->offset += (uint64_t)got;
             want -= (size_t)got;
         }
         if (w->len < (size_t)w->block) return false;
@@ -126,7 +129,7 @@ void wav_seek(struct wav *w, uint32_t frame) {
     w->frac = 0;
     w->eof = false;
     w->src = w->pos;
-    lseek(w->fd, (long)(w->data_off + (uint64_t)w->pos * (uint32_t)w->block), SEEK_SET);
+    w->offset = w->data_off + (uint64_t)w->pos * (uint32_t)w->block;
     if (!next_frame(w, &w->al, &w->ar)) {
         w->eof = true;
         return;

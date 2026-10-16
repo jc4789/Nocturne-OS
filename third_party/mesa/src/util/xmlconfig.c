@@ -55,7 +55,9 @@ static inline void regfree(regex_t* r) {}
 #else
 #include <regex.h>
 #endif
+#ifndef NOCTURNE
 #include <fcntl.h>
+#endif
 #include <math.h>
 #include "strndup.h"
 #include "log.h"

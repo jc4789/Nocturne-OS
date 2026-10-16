@@ -74,42 +74,48 @@ static const char *file_mime(const char *name) {
 }
 static bool file_read(struct web_form_files *files, const char *path, const char *relative) {
     if (files->count == UINT_MAX || !web_input_files_reserve(files, files->count + 1)) return false;
-    struct n_stat st;
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return false;
-    if (fstat(fd, &st) < 0 || st.type != N_FT_FILE || st.size > SIZE_MAX ||
-        (st.size ? (size_t)st.size : 1) > SIZE_MAX - files->allocation) { close(fd); return false; }
+    struct n_entry st;
+    if (n_entry_info(path, &st) < 0 || st.kind != N_KIND_DOCUMENT || st.size > SIZE_MAX ||
+        (st.size ? (size_t)st.size : 1) > SIZE_MAX - files->allocation) return false;
     struct web_form_file *file = &files->files[files->count];
     const char *name = strrchr(path, '/'); name = name ? name + 1 : path;
-    if (strlen(name) >= sizeof file->name || (relative && strlen(relative) >= sizeof file->relative_path)) { close(fd); return false; }
+    if (strlen(name) >= sizeof file->name || (relative && strlen(relative) >= sizeof file->relative_path)) return false;
+    n_handle h = n_document_open(path, N_DOCUMENT_READ);
+    if (h < 0) return false;
     file->size = (size_t)st.size; file->bytes = malloc(file->size ? file->size : 1);
-    if (!file->bytes) { close(fd); return false; }
+    if (!file->bytes) { n_handle_close(h); return false; }
     size_t offset = 0;
-    while (offset < file->size) { ssize_t n = read(fd, file->bytes + offset, file->size - offset); if (n <= 0) { free(file->bytes); file->bytes = NULL; close(fd); return false; } offset += (size_t)n; }
-    struct n_stat after;
-    bool stable = fstat(fd, &after) == 0 && after.type == N_FT_FILE && after.size == st.size && after.mtime == st.mtime;
-    close(fd);
+    while (offset < file->size) {
+        n_result n = n_document_read_at(h, offset, file->bytes + offset, file->size - offset);
+        if (n <= 0) { free(file->bytes); file->bytes = NULL; n_handle_close(h); return false; }
+        offset += (size_t)n;
+    }
+    n_handle_close(h);
+    /* A document that changed while it was read would upload a mix of versions. */
+    struct n_entry after;
+    bool stable = n_entry_info(path, &after) >= 0 && after.kind == N_KIND_DOCUMENT && after.size == st.size && after.modified == st.modified;
     if (!stable) { free(file->bytes); file->bytes = NULL; return false; }
     strcpy(file->name, name); strcpy(file->relative_path, relative ? relative : ""); strcpy(file->type, file_mime(name));
-    file->last_modified = st.mtime > INT64_MAX / 1000 ? INT64_MAX : st.mtime < 0 ? 0 : st.mtime * 1000;
+    file->last_modified = st.modified > INT64_MAX / 1000 ? INT64_MAX : st.modified < 0 ? 0 : st.modified * 1000;
     files->allocation += file->size ? file->size : 1; files->count++; return true;
 }
 static bool file_directory(struct web_form_files *files, const char *path, const char *relative, unsigned depth) {
     if (depth > 32) return false;
-    int fd = open(path, O_RDONLY); if (fd < 0) return false;
-    struct n_dirent entry; bool ok = true; int result = 0;
-    for (int index = 0; (result = readdir(fd, index, &entry)) > 0; index++) {
-        if (!strcmp(entry.name, ".") || !strcmp(entry.name, "..")) continue;
+    struct n_entry *entries;
+    n_result count = n_folder_entries(path, &entries);
+    if (count < 0) return false;
+    bool ok = true;
+    for (n_result index = 0; index < count && ok; index++) {
+        const struct n_entry *entry = &entries[index];
         char child[1024], child_relative[1024];
-        int a = snprintf(child, sizeof child, "%s%s%s", path, !strcmp(path,"/") ? "" : "/", entry.name);
-        int b = snprintf(child_relative, sizeof child_relative, "%s/%s", relative, entry.name);
+        int a = snprintf(child, sizeof child, "%s%s%s", path, !strcmp(path,"/") ? "" : "/", entry->name);
+        int b = snprintf(child_relative, sizeof child_relative, "%s/%s", relative, entry->name);
         if (a < 0 || b < 0 || (size_t)a >= sizeof child || (size_t)b >= sizeof child_relative) { ok = false; break; }
-        if (entry.type == N_FT_DIR) ok = file_directory(files, child, child_relative, depth + 1);
-        else if (entry.type == N_FT_FILE) ok = file_read(files, child, child_relative);
-        else continue; // Never upload device/window/pipe nodes.
-        if (!ok) break;
+        if (entry->kind == N_KIND_FOLDER) ok = file_directory(files, child, child_relative, depth + 1);
+        else if (entry->kind == N_KIND_DOCUMENT) ok = file_read(files, child, child_relative);
+        // Never upload devices.
     }
-    close(fd); return ok && result >= 0;
+    free(entries); return ok;
 }
 bool web_input_file_paths(web_doc *d, web_node *input, const char *const *paths, unsigned count, bool directory) {
     if (!d || !web_input_is_file(input) || web_control_disabled(input) || !paths || !count) return false;

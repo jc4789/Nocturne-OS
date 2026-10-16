@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "abi.h"
-#include "fcntl.h"
 #include "gfx.h"
 #include <cdefs.h>
 NOCTURNE_BEGIN_DECLS
@@ -15,41 +14,15 @@ NOCTURNE_BEGIN_DECLS
 #endif
 #define ABS(a) ((a) < 0 ? -(a) : (a))
 
-typedef long ssize_t;
-typedef int pid_t;
+/* ---- native ABI (docs/nocturne-native-abi.md) ----
+   These return a negative n_result on failure and never touch errno. */
+typedef int32_t n_handle;
+typedef int64_t n_result;
 
-#define STDIN_FILENO 0
-#define STDOUT_FILENO 1
-#define STDERR_FILENO 2
-
-ssize_t read(int fd, void *buf, size_t n);
-ssize_t write(int fd, const void *buf, size_t n);
-int open(const char *path, int flags, ...);
-int close(int fd);
-long lseek(int fd, long off, int whence);
-int ftruncate(int fd, long size); /* new bytes read as zero */
-int stat(const char *path, struct n_stat *st);
-int fstat(int fd, struct n_stat *st);
-int readdir(int fd, int idx, struct n_dirent *d);
-int mkdir(const char *path, ...);
-int unlink(const char *path);
-int rmdir(const char *path);
-int chdir(const char *path);
-char *getcwd(char *buf, size_t n);
-int spawn(const char *path, char *const argv[], const int fdmap[3], int flags);
-int waitpid(int pid, int *status, int flags);
-#define WNOHANG 1
-int getpid(void);
-int getppid(void);
-int kill(int pid);
-int killtree(int pid, int include_self);
-void *sbrk(long inc);
 /* malloc's heap: bytes in its n_memory regions, and bytes in allocated blocks. */
 void malloc_usage(size_t *heap, size_t *used);
 int msleep(unsigned ms);
-unsigned sleep(unsigned s);
 uint64_t uptime_ms(void);
-int pipe(int fds[2]);
 /* Native memory (docs/nocturne-native-abi.md §7): zero-filled pages with
  * N_MEMORY_READ, _READ_WRITE or _READ_EXECUTE access; reserve also takes
  * N_MEMORY_LOW added to the access, for pages below 2 GiB. reserve returns NULL
@@ -57,30 +30,16 @@ int pipe(int fds[2]);
 void *n_memory_reserve(size_t bytes, int access);
 int n_memory_release(void *addr, size_t bytes);
 int n_memory_protect(void *addr, size_t bytes, int access);
-/* Native shared-page object. Descriptors are private capabilities; importing
- * another process's descriptor is permitted only between direct parent/child.
- * A mapping retains the object after close and is released by whole munmap. */
-int n_shared_create(size_t bytes);
+/* Shared pages: a handle is a private capability that travels to another app
+ * only as a channel attachment (n_channel_send). A mapping keeps the pages
+ * after the handle closes; n_memory_release of the whole mapping ends it. */
+n_handle n_shared_create(size_t bytes);
 /* Like n_shared_create, but pages are zero-filled at first touch by any mapper. */
-int n_shared_reserve(size_t bytes);
-void *n_shared_map(int owner_pid,int fd,size_t bytes,int prot);
-/* Offer a shared-page descriptor to the direct parent/child that will read a
- * message naming the returned ticket; receive claims it as a new descriptor.
- * An unclaimed ticket keeps the pages alive until the sender exits. */
-long n_shared_send(int fd);
-int n_shared_receive(int owner_pid,long ticket);
-/* Asynchronous waits on a 32-bit word. Watches join the same FIFO as
- * wait_on_address (also across processes sharing the page); a notified watch
- * makes the queue readable as 64-bit tokens. watch fails with EAGAIN when the
- * word differs. unwatch: 1 removed while waiting, 2 already notified, 0 unknown. */
-int n_address_watch_queue(void);
-int n_address_watch(int queue,volatile uint32_t *address,uint32_t expected,uint64_t token);
-int n_address_unwatch(int queue,uint64_t token);
+n_handle n_shared_reserve(size_t bytes);
+/* Map all of the pages (bytes is their page-rounded size) with N_MEMORY_READ
+ * or N_MEMORY_READ_WRITE access; NULL and errno on failure. */
+void *n_shared_map(n_handle shared, size_t bytes, int access);
 
-/* ---- native ABI (docs/nocturne-native-abi.md) ----
-   These return a negative n_result on failure and never touch errno. */
-typedef int32_t n_handle;
-typedef int64_t n_result;
 const char *n_result_text(n_result r); /* either sign */
 n_result n_handle_close(n_handle h);   /* commits an N_DOCUMENT_REPLACE handle */
 n_result n_handle_kind(n_handle h);    /* N_KIND_* */
@@ -165,9 +124,6 @@ n_result n_path_join(const char *folder, const char *name, char *out, size_t cap
    setting TERMINAL, e.g. "0 1 2". */
 bool n_terminal(n_handle h);
 
-int dup(int fd);
-int dup2(int fd, int newfd);
-int poll(struct n_pollfd *fds, int n, int timeout_ms);
 int proclist(struct n_procinfo *out, int max);
 int sysinfo(struct n_sysinfo *si);
 int cpu_info(struct n_cpuinfo *info);
@@ -202,13 +158,7 @@ n_result wake_address(volatile uint32_t *address, unsigned count);
 void yield(void);
 int poweroff(void);
 int reboot(void);
-int fcntl(int fd, int cmd, ...);
-int dmesg(char *buf, size_t n);
 int pcilist(struct n_pciinfo *out, int max);
-int isatty(int fd);
-extern char **environ;
-int execvp(const char *file, char *const argv[]); /* spawn, wait and exit */
-int execv(const char *path, char *const argv[]);
 long __syscall(long n, long a, long b, long c, long d, long e);
 
 /* run a program (searching /bin) and wait for it; returns exit status or negative error */
@@ -232,8 +182,8 @@ int net_resolve_at(const char *name, uint32_t *ips, size_t capacity, struct n_dn
                    const struct n_sockaddr *resolver);
 int net_stats(struct n_netstats *stats);
 /* Calling thread only: abort DNS/ARP/connect if this request channel's peer
-   closes. fd=-1 clears the context. Established/shared TCP I/O is unaffected. */
-int net_set_setup_cancel_channel(int fd);
+   closes. -1 clears the context. Established/shared TCP I/O is unaffected. */
+int net_set_setup_cancel_channel(n_handle channel);
 bool ip_parse(const char *s, uint32_t *ip);
 char *ip_format(uint32_t ip, char *buf); /* buf: at least 16 bytes */
 int udp_socket(uint16_t port);           /* 0 picks an ephemeral port */
@@ -256,7 +206,7 @@ bool net_wait_up(int timeout_ms); /* wait for DHCP; false if no network */
 
 /* ---- GUI ---- */
 typedef struct window {
-    int fd;
+    n_handle handle; /* N_KIND_WINDOW: its input is reported by n_events_watch as N_EVENT_RECEIVABLE */
     int w, h; /* client size */
     canvas_t c;
     int flags;
@@ -324,7 +274,9 @@ bool sound_effect(int hz, int hz2, int ms, int wave);
    float, any number of channels (mono goes to both sides; past two, the first two are used) and
    any rate (resampled). */
 struct wav {
-    int fd, tag, channels, bits, block;
+    n_handle document;
+    int tag, channels, bits, block;
+    uint64_t offset;                  /* the next byte of the document to read */
     uint32_t rate, frames;           /* the file's own rate and length */
     uint32_t data_off, data_len, pos; /* pos: the next frame to read from the file */
     uint32_t src;                     /* the source frame playing now */

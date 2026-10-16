@@ -151,41 +151,42 @@ static bool peer_closed(int h) {
 }
 static void setup_cancellation(void) {
     for(unsigned mode=0;mode<3;mode++) {
-        int peer,local,other_peer,other_local;channel_ends(&peer,&local);channel_ends(&other_peer,&other_local);
-        if(local<0 || other_local<0){check(false,"setup cancellation channel pair");if(peer>=0)close(peer);if(local>=0)close(local);if(other_peer>=0)close(other_peer);if(other_local>=0)close(other_local);continue;}
+        int peer,local;channel_ends(&peer,&local);
+        if(local<0){check(false,"setup cancellation channel pair");if(peer>=0)n_handle_close(peer);continue;}
         struct setup_case test={.fd=local,.mode=(int)mode,.result=0,.error=0,.dns_status=N_DNS_OK};
         int tid=thread_create(setup_worker,&test);check(tid>=0,"create setup cancellation worker");
         if(tid>=0) {
             while(!load_flag(&test.entered))yield();
             msleep(120);
-            /* Reuse the descriptor while the context retains the original
-               endpoint. Cancelling the original peer must still be seen. */
-            close(local);check(dup2(other_local,local)==local,"setup cancellation pins endpoint across fd replacement");
-            uint64_t before=uptime_ms();close(peer);peer=-1;
+            /* Close our handle while the context retains the original endpoint:
+               the peer must not see a close, and cancelling it must still be seen. */
+            n_handle_close(local);local=-1;
+            check(!peer_closed(peer),"setup cancellation pins endpoint across handle close");
+            uint64_t before=uptime_ms();n_handle_close(peer);peer=-1;
             check(thread_join(tid)==0 && test.result<0 && test.error==ECANCELED && uptime_ms()-before<600,
                   mode==0?"unanswered DNS setup cancels promptly":mode==1?"ARP and TCP setup cancels promptly":"DNS TCP fallback setup cancels promptly");
             if(mode!=1)check(test.dns_status==N_DNS_CANCELLED,"setup cancellation preserves typed resolver status");
         }
-        if(peer>=0)close(peer);close(local);close(other_local);close(other_peer);
+        if(peer>=0)n_handle_close(peer);if(local>=0)n_handle_close(local);
     }
     int exit_peer,exit_local;channel_ends(&exit_peer,&exit_local);
     if(exit_local>=0) {
         struct setup_case test={.fd=exit_local,.mode=3};int tid=thread_create(setup_worker,&test);
         if(tid>=0) {
-            while(!load_flag(&test.entered))yield();close(exit_local);exit_local=-1;
+            while(!load_flag(&test.entered))yield();n_handle_close(exit_local);exit_local=-1;
             bool held=!peer_closed(exit_peer);
             check(held,"setup context retains endpoint after descriptor close");
             set_flag(&test.release);thread_join(tid);
             check(peer_closed(exit_peer),"native thread exit releases its setup context endpoint");
         } else check(false,"create setup scope exit worker");
     } else check(false,"setup scope exit fixture");
-    if(exit_local>=0)close(exit_local);if(exit_peer>=0)close(exit_peer);
+    if(exit_local>=0)n_handle_close(exit_local);if(exit_peer>=0)n_handle_close(exit_peer);
     /* Cancelling a setup scope must not poison an established wire, including
        a wire shared by independent HTTP/2 streams. */
     int established=tcp_connect(HOST,(uint16_t)tcp_port,2000);
     int peer,local;channel_ends(&peer,&local);
     if(established>=0 && local>=0) {
-        check(net_set_setup_cancel_channel(local)==0,"install calling-thread setup scope");close(peer);peer=-1;
+        check(net_set_setup_cancel_channel(local)==0,"install calling-thread setup scope");n_handle_close(peer);peer=-1;
         uint32_t address;errno=0;
         check(net_resolve("localhost",&address)<0 && errno==ECANCELED,"closed peer cancels new setup before publication");
         const char request[]="GET 4 1\n";uint8_t data[4];size_t done=0;
@@ -196,7 +197,7 @@ static void setup_cancellation(void) {
         check(net_set_setup_cancel_channel(-1)==0 && net_resolve("localhost",&address)==0 && address==0x7f000001,
               "clearing setup context releases cancellation for later work");
     } else check(false,"established transport cancellation fixture");
-    if(established>=0)tcp_close(established);if(local>=0)close(local);if(peer>=0)close(peer);
+    if(established>=0)tcp_close(established);if(local>=0)n_handle_close(local);if(peer>=0)n_handle_close(peer);
 }
 struct close_case {int socket,error;long result;volatile uint32_t entered;uint8_t bytes[32];};
 static void waiting_receiver(void *opaque) {

@@ -130,12 +130,6 @@ int proc_app_open(int pid, struct file **out) {
     return *out ? 0 : -N_ERR_NO_MEMORY;
 }
 
-int proc_spawn(const char *path, int argc, char **argv, struct file *fds[3], const char *cwd,
-               struct task *parent) {
-    struct proc_launch l = {.argc = argc, .argv = argv, .handles = fds, .handle_count = fds ? 3 : 0,
-                            .cwd = cwd, .parent = parent};
-    return proc_launch(path, &l);
-}
 
 int proc_launch(const char *path, const struct proc_launch *l) {
     int argc = l->argc;
@@ -191,9 +185,8 @@ int proc_launch(const char *path, const struct proc_launch *l) {
         if (vmm_copy_to_space(t->pml4, ph[i].vaddr, img + ph[i].offset, ph[i].filesz) < 0) goto fail;
         if (ph[i].vaddr + ph[i].memsz > top) top = ph[i].vaddr + ph[i].memsz;
     }
-    t->brk_base = t->brk = ALIGN_UP(top, PAGE_SIZE);
     t->mmap_next = USER_MMAP_BASE;
-    t->low_base = t->low_next = MAX(USER_LOW_BASE, t->brk_base);
+    t->low_base = t->low_next = MAX(USER_LOW_BASE, ALIGN_UP(top, PAGE_SIZE)); /* above the program image */
 
     /* User stack: the argument and setting strings, then their two
        null-terminated pointer arrays. They must fit well inside the stack. */
@@ -251,7 +244,6 @@ int proc_launch(const char *path, const struct proc_launch *l) {
 
     for (size_t i = 0; i < l->handle_count; i++)
         if (l->handles[i]) t->fds[i] = vfs_dup(l->handles[i]);
-    strlcpy(t->cwd, l->cwd ? l->cwd : "/", sizeof t->cwd);
     t->parent = l->parent;
     if (l->app) {
         /* The task's own reference keeps the record until it has reported. */
@@ -296,7 +288,7 @@ int proc_spawn_simple(const char *path, const char *arg1, struct task *parent) {
     if (vfs_open("/dev/null", O_RDWR, &nul) == 0) fds[0] = fds[1] = fds[2] = nul;
     char *settings[] = {"FOLDER=/home"};
     struct proc_launch l = {.argc = arg1 ? 2 : 1, .argv = argv, .setting_count = 1, .settings = settings,
-                            .handles = fds, .handle_count = 3, .cwd = "/home", .parent = parent};
+                            .handles = fds, .handle_count = 3, .parent = parent};
     int r = proc_launch(path, &l);
     if (nul) vfs_close(nul);
     return r;

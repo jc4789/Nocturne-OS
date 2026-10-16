@@ -36,7 +36,7 @@ namespace wabt {
 Stream::Stream(Stream* log_stream)
     : offset_(0), result_(Result::Ok), log_stream_(log_stream) {}
 
-void Stream::AddOffset(ssize_t delta) {
+void Stream::AddOffset(ptrdiff_t delta) {
   offset_ += delta;
 }
 
@@ -144,8 +144,8 @@ Result OutputBuffer::WriteToFile(std::string_view filename) const {
     return Result::Ok;
   }
 
-  ssize_t bytes = fwrite(data.data(), 1, data.size(), file);
-  if (bytes < 0 || static_cast<size_t>(bytes) != data.size()) {
+  size_t bytes = fwrite(data.data(), 1, data.size(), file);
+  if (bytes != data.size()) {
     ERROR("failed to write %" PRIzd " bytes to %s\n", data.size(),
           filename_str.c_str());
     fclose(file);
@@ -160,8 +160,8 @@ Result OutputBuffer::WriteToStdout() const {
   if (data.empty()) {
     return Result::Ok;
   }
-  ssize_t bytes = fwrite(data.data(), 1, data.size(), stdout);
-  if (bytes < 0 || static_cast<size_t>(bytes) != data.size()) {
+  size_t bytes = fwrite(data.data(), 1, data.size(), stdout);
+  if (bytes != data.size()) {
     ERROR("failed to write %" PRIzd " bytes to stdout\n", data.size());
     return Result::Error;
   }

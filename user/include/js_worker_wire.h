@@ -10,7 +10,13 @@
    runtime default (no configured ceiling); real allocation failure is OOM. */
 #define NJW_HEAP_BYTES SIZE_MAX
 #define NJW_TASK_MS UINT32_MAX
-enum { NJW_START=1,NJW_MESSAGE,NJW_LOADED,NJW_ERROR,NJW_LOAD,NJW_CLOSE,NJW_CONSOLE,NJW_PORT_MESSAGE,NJW_PORT_CLOSE,NJW_PORT_DRAINED,NJW_CANCEL,NJW_CSP_REPORT,NJW_CONNECT,NJW_CREDIT };
+enum { NJW_START=1,NJW_MESSAGE,NJW_LOADED,NJW_ERROR,NJW_LOAD,NJW_CLOSE,NJW_CONSOLE,NJW_PORT_MESSAGE,NJW_PORT_CLOSE,NJW_PORT_DRAINED,NJW_CANCEL,NJW_CSP_REPORT,NJW_CONNECT,NJW_CREDIT,NJW_ATTACH };
+/* NJW_ATTACH is a carrier: a bare header (bytes 0, nothing else in the
+ * message) whose channel attachment is one shared-page handle of the message
+ * that follows. The sender puts every carrier of a message ahead of its
+ * payload record, in attachment-index order, with nothing between; the
+ * receiver keeps the handles and gives all it holds to the next payload
+ * record. Carriers are not counted for credit. */
 /* Flow-control quantum, not a message size/site quota. One larger legitimate
  * record is allowed alone; the producer waits for native consumer credit. */
 #define NJW_TRANSPORT_WINDOW 65536u

@@ -1,4 +1,4 @@
-/* 独自spawn/pipeによる2 processの同時進行とAP間XSTATE/stack保存。 */
+/* 独自n_app_launch/n_channel_pairによる2 appの同時進行とAP間XSTATE/stack保存。 */
 #include <nocturne.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,18 +22,18 @@ static int gs_tls_probe(const struct n_cpuinfo *info, unsigned seed) {
     __asm__ volatile("movw %%gs, %0" : "=r"(saved));
     void *previous = thread_local_get(7);
     void *sentinel = (void *)(uintptr_t)(seed + 1);
-    int pid = getpid(), tid = thread_id(), ok = 1;
+    n_result pid = n_app_self(), tid = thread_id(); int ok = 1;
     thread_local_set(7, sentinel);
     /* User code can reload GS independently of the kernel base. Both selectors
        are valid zero-base user states; FS must still carry this task's TLS. */
     static const unsigned short selectors[] = {0, 0x1B};
     for (unsigned i = 0; i < sizeof selectors / sizeof selectors[0]; i++) {
         __asm__ volatile("movw %0, %%gs" : : "r"(selectors[i]) : "memory");
-        if (getpid() != pid || thread_id() != tid || cpu_index() >= info->detected_cpus ||
+        if (n_app_self() != pid || thread_id() != tid || cpu_index() >= info->detected_cpus ||
             thread_local_get(7) != sentinel) ok = 0;
         /* Unlike the AP's read-only identity calls, sleep retires the AP user
            context and executes the syscall continuation on the BSP. */
-        if (msleep(1) || getpid() != pid || thread_id() != tid ||
+        if (msleep(1) || n_app_self() != pid || thread_id() != tid ||
             cpu_index() >= info->detected_cpus || thread_local_get(7) != sentinel) ok = 0;
     }
     __asm__ volatile("movw %0, %%gs" : : "r"(saved) : "memory");
@@ -89,17 +89,25 @@ static int child(unsigned long start, unsigned seed) {
         r.count++;
     }
     r.value = value;
-    return write(1, &r, sizeof r) == (ssize_t)sizeof r && r.stack && r.xstate && r.gs_tls ? 0 : 2;
+    return n_channel_send(1, &r, sizeof r, -1) == (n_result)sizeof r && r.stack && r.xstate && r.gs_tls ? 0 : 2;
 }
-static int read_all(int fd, void *p, size_t n) {
-    unsigned char *b = p;
-    while (n) {
-        ssize_t got = read(fd, b, n);
-        if (got <= 0) return 0;
-        b += got;
-        n -= got;
-    }
-    return 1;
+/* Starts self with args. The child's output (or, with on_log, its log) is a message channel whose
+   parent end is returned in *reader. */
+static n_handle start_child(const char *self, const char *const *args, uint32_t argc, bool on_log, n_handle *reader) {
+    n_handle c[2];
+    if (n_channel_pair(c) < 0) return -1;
+    int32_t handles[3] = {-1, on_log ? -1 : c[1], on_log ? c[1] : -1};
+    struct n_launch l = {.arguments = args, .argument_count = argc, .handles = handles, .handle_count = 3};
+    n_handle app = n_app_launch(self, &l);
+    n_handle_close(c[1]);
+    if (app < 0) { n_handle_close(c[0]); return app; }
+    *reader = c[0];
+    return app;
+}
+static int finish_child(n_handle app, int *status) {
+    n_result r = n_app_result(app, -1, status);
+    n_handle_close(app);
+    return r >= 0;
 }
 int main(int argc, char **argv) {
     if (argc == 4 && !strcmp(argv[1], "--child")) return child(strtoul(argv[2], NULL, 10), (unsigned)atoi(argv[3]));
@@ -109,30 +117,30 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && !strcmp(argv[1], "--kill")) {
         char ready = 'K';
-        if (write(1, &ready, 1) != 1) return 3;
+        if (n_channel_send(1, &ready, 1, -1) != 1) return 3;
         for (;;) __asm__ volatile("pause" : : : "memory");
     }
     struct n_cpuinfo info;
     if (cpu_info(&info)) return 1;
-    int nullfd = open("/dev/null", O_RDWR), p[2][2], pid[2] = {-1, -1}, status;
+    n_handle app[2] = {-1, -1}, reader[2] = {-1, -1};
+    int status;
     struct report r[2];
     memset(r, 0, sizeof r);
-    if (nullfd < 0) return 1;
     char start[32];
-    snprintf(start, sizeof start, "%lu", uptime_ms() + 200);
+    snprintf(start, sizeof start, "%lu", (unsigned long)uptime_ms() + 200);
     for (unsigned i = 0; i < 2; i++) {
-        if (pipe(p[i])) return 1;
-        int map[3] = {nullfd, p[i][1], nullfd};
-        char *args[5] = {argv[0], "--child", start, i ? "29" : "11", NULL};
-        pid[i] = spawn(argv[0], args, map, 0);
-        close(p[i][1]);
-        if (pid[i] < 0) { if (pid[0] > 0) { kill(pid[0]); waitpid(pid[0], &status, 0); } return 1; }
+        const char *args[4] = {argv[0], "--child", start, i ? "29" : "11"};
+        app[i] = start_child(argv[0], args, 4, false, &reader[i]);
+        if (app[i] < 0) {
+            if (i && app[0] >= 0) { n_app_stop(app[0], 0); finish_child(app[0], &status); n_handle_close(reader[0]); }
+            return 1;
+        }
     }
     int ok = 1;
     for (unsigned i = 0; i < 2; i++) {
-        if (!read_all(p[i][0], &r[i], sizeof r[i])) ok = 0;
-        close(p[i][0]);
-        if (waitpid(pid[i], &status, 0) != pid[i] || status) ok = 0;
+        if (n_channel_receive(reader[i], &r[i], sizeof r[i], N_CHANNEL_WAIT, NULL) != (n_result)sizeof r[i]) ok = 0;
+        n_handle_close(reader[i]);
+        if (!finish_child(app[i], &status) || status) ok = 0;
         if (r[i].magic != 0x534d5031 || r[i].count != SAMPLES || !r[i].stack || !r[i].xstate || !r[i].gs_tls) ok = 0;
     }
     unsigned overlap = 0, cpu_a = 0, cpu_b = 0;
@@ -156,28 +164,26 @@ int main(int argc, char **argv) {
         r[0].s[first_a].cpu_begin, r[0].s[first_a].begin, r[0].s[first_a].end,
         r[1].s[first_b].cpu_begin, r[1].s[first_b].begin, r[1].s[first_b].end);
     /* CR2はBSPがfault処理。stderrの本物addrとexit状態を要求する。 */
-    int fault[2];
-    if (pipe(fault)) return 1;
-    int fmap[3] = {nullfd, nullfd, fault[1]};
-    char *fargs[3] = {argv[0], "--fault", NULL};
-    int fpid = spawn(argv[0], fargs, fmap, 0);
-    close(fault[1]);
+    const char *fargs[2] = {argv[0], "--fault"};
+    n_handle fault, fapp = start_child(argv[0], fargs, 2, true, &fault);
+    if (fapp < 0) return 1;
     char text[512];
-    ssize_t got = read(fault[0], text, sizeof text - 1);
-    close(fault[0]);
-    text[got > 0 ? got : 0] = 0;
-    if (fpid < 0 || waitpid(fpid, &status, 0) != fpid || status != 142 || !strstr(text, "12345000")) ok = 0;
-    int kp[2];
-    if (pipe(kp)) return 1;
-    int kmap[3] = {nullfd, kp[1], nullfd};
-    char *kargs[3] = {argv[0], "--kill", NULL};
-    int kpid = spawn(argv[0], kargs, kmap, 0);
-    close(kp[1]);
+    size_t used = 0;
+    for (;;) { /* the kernel reports the fault on the child's log; it closes when the child is gone */
+        n_result got = n_channel_receive(fault, text + used, sizeof text - 1 - used, N_CHANNEL_WAIT, NULL);
+        if (got < 0) break;
+        used += (size_t)got;
+    }
+    text[used] = 0;
+    n_handle_close(fault);
+    if (!finish_child(fapp, &status) || status != 142 || !strstr(text, "12345000")) ok = 0;
+    const char *kargs[2] = {argv[0], "--kill"};
+    n_handle kreader, kapp = start_child(argv[0], kargs, 2, false, &kreader);
+    if (kapp < 0) return 1;
     char ready = 0;
-    if (kpid < 0 || read(kp[0], &ready, 1) != 1 || ready != 'K' || msleep(20) || kill(kpid) ||
-        waitpid(kpid, &status, 0) != kpid || status != 130) ok = 0;
-    close(kp[0]);
-    close(nullfd);
+    if (n_channel_receive(kreader, &ready, 1, N_CHANNEL_WAIT, NULL) != 1 || ready != 'K' || msleep(20) ||
+        n_app_stop(kapp, 0) < 0 || !finish_child(kapp, &status) || status != 130) ok = 0;
+    n_handle_close(kreader);
     printf("smptest: fault/CR2/kill/retire %s\n", ok ? "PASS" : "FAIL");
     printf("smptest: %s\n", ok ? "ok" : "FAIL");
     return !ok;

@@ -12,8 +12,7 @@ static int save(const char *path,const void *data,size_t size){
     return ok;
 }
 static int execute(const char *path,char *const argv[]){
-    int status=-1,pid=spawn(path,argv,NULL,0);
-    return pid>=0&&waitpid(pid,&status,0)==pid&&status==0;
+    return run_wait(path,argv)==0;
 }
 int main(void){
     /* (module (func (export "run") (param i32) (result i32)

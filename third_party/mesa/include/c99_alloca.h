@@ -35,7 +35,11 @@
 
 #  define alloca _alloca
 
-#elif defined(__sun) || defined(__CYGWIN__) || defined(NOCTURNE)
+#elif defined(NOCTURNE)
+
+#  define alloca(size) __builtin_alloca(size)
+
+#elif defined(__sun) || defined(__CYGWIN__)
 
 #  include <alloca.h>
 

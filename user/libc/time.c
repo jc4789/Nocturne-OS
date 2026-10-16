@@ -1,5 +1,4 @@
 #include <time.h>
-#include <sys/time.h>
 #include "nocturne.h"
 #include <stdio.h>
 #include <string.h>
@@ -98,31 +97,30 @@ size_t strftime(char *s, size_t max, const char *fmt, const struct tm *tm) {
     return n;
 }
 
-/* the clock only has whole seconds, so the microseconds come from the uptime counter */
-int gettimeofday(struct timeval *tv, void *tz) {
-    (void)tz;
-    if (tv) {
-        tv->tv_sec = time(NULL);
-        tv->tv_usec = (long)(uptime_ms() % 1000) * 1000;
+/* ISO C timespec_get. The system's wall clock counts whole seconds; the
+   milliseconds come from the uptime counter through an offset that only ever
+   grows toward the true one (each whole-second reading is at most a second
+   early), so the result never goes backwards and its seconds and fraction
+   always agree. */
+static int64_t wall_offset_ms = INT64_MIN;
+static int64_t wall_ms(void) {
+    int64_t up = (int64_t)n_clock_uptime_ms();
+    int64_t seen = n_clock_wall() * 1000 - up;
+    int64_t offset = __atomic_load_n(&wall_offset_ms, __ATOMIC_RELAXED);
+    while (seen > offset &&
+           !__atomic_compare_exchange_n(&wall_offset_ms, &offset, seen, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
     }
-    return 0;
+    return up + (seen > offset ? seen : offset);
 }
-
-/* ISO C timespec_get. The wall clock has whole seconds; sub-second digits
-   come from the millisecond uptime counter, as for gettimeofday. */
 int timespec_get(struct timespec *ts, int base) {
     if (!ts) return 0;
-    uint64_t ms = n_clock_uptime_ms();
+    int64_t ms;
     switch (base) {
-    case TIME_UTC:
-        ts->tv_sec = time(NULL);
-        ts->tv_nsec = (long)(ms % 1000) * 1000000L;
-        return base;
-    case TIME_MONOTONIC:
-        ts->tv_sec = (time_t)(ms / 1000);
-        ts->tv_nsec = (long)(ms % 1000) * 1000000L;
-        return base;
-    default:
-        return 0;
+    case TIME_UTC: ms = wall_ms(); break;
+    case TIME_MONOTONIC: ms = (int64_t)n_clock_uptime_ms(); break;
+    default: return 0;
     }
+    ts->tv_sec = (time_t)(ms / 1000);
+    ts->tv_nsec = (long)(ms % 1000) * 1000000L;
+    return base;
 }

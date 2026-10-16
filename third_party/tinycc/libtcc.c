@@ -249,10 +249,59 @@ PUB_FUNC char *tcc_fileextension (const char *name)
     return e ? e : strchr(b, 0);
 }
 
-ST_FUNC char *tcc_load_text(int fd)
+/* Input files are native documents read at an offset the TCCInput keeps. */
+
+/* Bytes read (0 at the end of the file), or negative on failure. */
+ST_FUNC int64_t tcc_input_read(TCCInput *in, void *buf, size_t count)
 {
-    int len = lseek(fd, 0, SEEK_END);
-    char *buf = load_data(fd, 0, len + 1);
+    int64_t got;
+    if (in->document == TCC_STDIN) {
+        /* a line at a time, so a terminal does not wait for a full buffer */
+        char *p = buf;
+        int c;
+        got = 0;
+        while ((size_t)got < count && (c = getc(stdin)) != EOF) {
+            p[got++] = c;
+            if (c == '\n')
+                break;
+        }
+        return got;
+    }
+    got = n_document_read_at(in->document, in->offset, buf, count);
+    if (got > 0)
+        in->offset += got;
+    return got;
+}
+
+/* Open a source, object or archive file; "-" is standard input. 0, or -1 if not found. */
+ST_FUNC int tcc_input_open(const char *filename, TCCInput *in)
+{
+    char path[1024];
+    in->offset = 0;
+    if (strcmp(filename, "-") == 0) {
+        in->document = TCC_STDIN;
+        return 0;
+    }
+    if (n_path_complete(filename, path, sizeof path) < 0)
+        return -1;
+    in->document = n_document_open(path, N_DOCUMENT_READ);
+    return in->document < 0 ? -1 : 0;
+}
+
+ST_FUNC void tcc_input_close(TCCInput *in)
+{
+    if (in->document >= 0)
+        n_handle_close(in->document);
+    in->document = TCC_NO_INPUT;
+}
+
+ST_FUNC char *tcc_load_text(TCCInput *in)
+{
+    int64_t len = n_document_size(in->document);
+    char *buf;
+    if (len < 0)
+        len = 0;
+    buf = load_data(in, 0, len + 1);
     buf[len] = 0;
     return buf;
 }
@@ -541,23 +590,14 @@ PUB_FUNC void tcc_memcheck(int d)
 
 #endif /* MEM_DEBUG */
 
-#ifdef _WIN32
-# define realpath(file, buf) _fullpath(buf, file, 260)
-#endif
-
-/* for #pragma once */
+/* for #pragma once: two names are the same file when their complete paths are
+   equal (Nocturne has no links, and completion resolves "." and "..") */
 ST_FUNC int normalized_PATHCMP(const char *f1, const char *f2)
 {
-    char *p1, *p2;
-    int ret = 1;
-    if (!!(p1 = realpath(f1, NULL))) {
-        if (!!(p2 = realpath(f2, NULL))) {
-            ret = PATHCMP(p1, p2);
-            libc_free(p2); /* realpath() requirement */
-        }
-        libc_free(p1);
-    }
-    return ret;
+    char p1[1024], p2[1024];
+    if (n_path_complete(f1, p1, sizeof p1) < 0 || n_path_complete(f2, p2, sizeof p2) < 0)
+        return 1;
+    return PATHCMP(p1, p2);
 }
 
 /********************************************************/
@@ -811,7 +851,7 @@ ST_FUNC void tcc_open_bf(TCCState *s1, const char *filename, int initlen)
     bf->true_filename = bf->filename;
     bf->line_num = 1;
     bf->ifdef_stack_ptr = s1->ifdef_stack_ptr;
-    bf->fd = -1;
+    bf->input.document = TCC_NO_INPUT;
     bf->prev = file;
     bf->prev_tok_flags = tok_flags;
     file = bf;
@@ -822,8 +862,8 @@ ST_FUNC void tcc_close(void)
 {
     TCCState *s1 = tcc_state;
     BufferedFile *bf = file;
-    if (bf->fd > 0) {
-        close(bf->fd);
+    if (bf->input.document != TCC_NO_INPUT) {
+        tcc_input_close(&bf->input);
         total_lines += bf->line_num - 1;
     }
     if (bf->true_filename != bf->filename)
@@ -833,31 +873,30 @@ ST_FUNC void tcc_close(void)
     tcc_free(bf);
 }
 
-static int _tcc_open(TCCState *s1, const char *filename)
+static int _tcc_open(TCCState *s1, const char *filename, TCCInput *in)
 {
-    int fd;
+    int ret = tcc_input_open(filename, in);
     if (strcmp(filename, "-") == 0)
-        fd = 0, filename = "<stdin>";
-    else
-        fd = open(filename, O_RDONLY | O_BINARY);
-    if ((s1->verbose == 2 && fd >= 0) || s1->verbose == 3)
-        printf("%s %*s%s\n", fd < 0 ? "nf":"->",
+        filename = "<stdin>";
+    if ((s1->verbose == 2 && ret == 0) || s1->verbose == 3)
+        printf("%s %*s%s\n", ret < 0 ? "nf":"->",
                (int)(s1->include_stack_ptr - s1->include_stack), "", filename);
-    return fd;
+    return ret;
 }
 
 ST_FUNC int tcc_open(TCCState *s1, const char *filename)
 {
-    int fd = _tcc_open(s1, filename);
-    if (fd < 0)
+    TCCInput in;
+    if (_tcc_open(s1, filename, &in) < 0)
         return -1;
     tcc_open_bf(s1, filename, 0);
-    file->fd = fd;
+    file->input = in;
     return 0;
 }
 
-/* compile the file opened in 'file'. Return non zero if errors. */
-static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
+/* compile the file opened in 'file' (from 'in'), or the text 'str' when 'in' is NULL.
+   Return non zero if errors. */
+static int tcc_compile(TCCState *s1, int filetype, const char *str, TCCInput *in)
 {
     /* An entry cancellation has no parser state to unwind. In particular,
        do not run the previous compilation's scratch cleanup again. */
@@ -880,13 +919,13 @@ static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
     if (setjmp(s1->error_jmp_buf) == 0) {
         s1->interrupt_work = 0;
 
-        if (fd == -1) {
+        if (!in) {
             int len = strlen(str);
             tcc_open_bf(s1, "<string>", len);
             memcpy(file->buffer, str, len);
         } else {
             tcc_open_bf(s1, str, 0);
-            file->fd = fd;
+            file->input = *in;
         }
 
         preprocess_start(s1, filetype);
@@ -913,7 +952,7 @@ static int tcc_compile(TCCState *s1, int filetype, const char *str, int fd)
 
 LIBTCCAPI int tcc_compile_string(TCCState *s, const char *str)
 {
-    return tcc_compile(s, s->filetype, str, -1);
+    return tcc_compile(s, s->filetype, str, NULL);
 }
 
 /* define a preprocessor symbol. value can be NULL, sym can be "sym=val" */
@@ -1152,7 +1191,8 @@ ST_FUNC DLLReference *tcc_add_dllref(TCCState *s1, const char *dllname, int leve
     return ref;
 }
 
-static int tcc_add_binary(TCCState *s1, int flags, const char *filename, int fd)
+/* Load an object file, archive or linker script; closes 'in'. */
+static int tcc_add_binary(TCCState *s1, int flags, const char *filename, TCCInput *in)
 {
     ElfW(Ehdr) ehdr;
     int obj_type;
@@ -1160,17 +1200,17 @@ static int tcc_add_binary(TCCState *s1, int flags, const char *filename, int fd)
     int ret = 0;
 
     s1->current_filename = filename;
-    obj_type = tcc_object_type(fd, &ehdr);
-    lseek(fd, 0, SEEK_SET);
+    obj_type = tcc_object_type(in, &ehdr);
+    in->offset = 0;
 
     switch (obj_type) {
 
     case AFF_BINTYPE_REL:
-        ret = tcc_load_object_file(s1, fd, 0);
+        ret = tcc_load_object_file(s1, in, 0);
         break;
 
     case AFF_BINTYPE_AR:
-        ret = tcc_load_archive(s1, fd, !(flags & AFF_WHOLE_ARCHIVE));
+        ret = tcc_load_archive(s1, in, !(flags & AFF_WHOLE_ARCHIVE));
         break;
 
 #if defined TCC_TARGET_UNIX
@@ -1184,12 +1224,12 @@ static int tcc_add_binary(TCCState *s1, int flags, const char *filename, int fd)
                 ret = FILE_NOT_RECOGNIZED;
 #endif
         } else
-            ret = tcc_load_dll(s1, fd, filename, (flags & AFF_REFERENCED_DLL) != 0);
+            ret = tcc_load_dll(s1, in, filename, (flags & AFF_REFERENCED_DLL) != 0);
         break;
 
     default:
         /* as GNU ld, consider it is an ld script if not recognized */
-        ret = tcc_load_ldscript(s1, fd);
+        ret = tcc_load_ldscript(s1, in);
         break;
 
 #elif defined TCC_TARGET_MACHO
@@ -1248,7 +1288,7 @@ static int tcc_add_binary(TCCState *s1, int flags, const char *filename, int fd)
 #endif
     }
 
-    close(fd);
+    tcc_input_close(in);
     s1->current_filename = saved_filename;
     if (ret == FILE_NOT_RECOGNIZED)
         return tcc_error_noabort("%s: unrecognized file type", filename);
@@ -1307,7 +1347,7 @@ static int guess_filetype(const char *filename)
 
 ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
 {
-    int fd;
+    TCCInput in;
 
 #if defined TARGETOS_OpenBSD && !defined _WIN32
     char buf[1024];
@@ -1324,18 +1364,17 @@ ST_FUNC int tcc_add_file_internal(TCCState *s1, const char *filename, int flags)
         return 0;
 
     /* open the file */
-    fd = _tcc_open(s1, filename);
-    if (fd < 0) {
+    if (_tcc_open(s1, filename, &in) < 0) {
         if (flags & AFF_PRINT_ERROR)
             tcc_error_noabort("file '%s' not found", filename);
         return FILE_NOT_FOUND;
     }
 
     if (flags & AFF_TYPE_BIN)
-        return tcc_add_binary(s1, flags, filename, fd);
+        return tcc_add_binary(s1, flags, filename, &in);
 
     dynarray_add(&s1->target_deps, &s1->nb_target_deps, tcc_strdup(filename));
-    return tcc_compile(s1, flags, filename, fd);
+    return tcc_compile(s1, flags, filename, &in);
 }
 
 LIBTCCAPI int tcc_add_file(TCCState *s, const char *filename)
@@ -1956,13 +1995,12 @@ PUB_FUNC int tcc_parse_args(TCCState *s, int *pargc, char ***pargv)
     while (optind < argc) {
         r = argv[optind];
         if (r[0] == '@' && r[1] != '\0') { /* read @listfile */
-            int fd; char *p;
-            fd = open(++r, O_RDONLY | O_BINARY);
-            if (fd < 0)
+            TCCInput in; char *p;
+            if (tcc_input_open(++r, &in) < 0)
                 return tcc_error_noabort("listfile '%s' not found", r);
-            p = tcc_load_text(fd);
+            p = tcc_load_text(&in);
             insert_args(s1, &argv, &argc, optind, p, 0);
-            close(fd), tcc_free(p);
+            tcc_input_close(&in), tcc_free(p);
             continue;
         }
         optind++;

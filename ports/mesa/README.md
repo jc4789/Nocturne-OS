@@ -48,9 +48,14 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 | `src/util/disk_cache.h`、`src/gallium/auxiliary/util/u_screen.c` | ファイル状態取得と DRM 記述子による screen 共有を外す。 |
 | `src/util/u_qsort.cpp`、`src/util/texcompress_astc_luts.cpp/.h` | libc++ にスレッド支援が無いので、Mesa 自身のロックを使う。 |
 | `src/gallium/drivers/softpipe/sp_texture.c` | 新しいテクスチャー領域を必ずゼロ初期化する（他ページの解放済みメモリを Web 内容から見せない）。 |
-| `src/gallium/auxiliary/driver_trace/tr_dump.c` | `access()` の代わりに、トリガー文書が ISO `fopen("r+b")` で開けるかで判定する。 |
+| `src/gallium/auxiliary/driver_trace/tr_dump.c` | `access()` の代わりに、トリガー文書が ISO `fopen("r+b")` で開けるかで判定し、ISO `remove` で消す。 |
 | `src/gallium/auxiliary/rtasm/rtasm_execmem.c/.h`、`rtasm_x86sse.c` | 頂点変換の x86 コード生成は `n_memory_reserve` の書込み可ページへ書き、`x86_get_func` で `n_memory_protect` により実行専用へ封印する（書込みと実行を同時に許さない）。 |
 | `src/compiler/glsl/glsl_parser.yy` | `strcasecmp` は `<string.h>` にある。`generated/` の解析器も再生成済み。 |
+| `src/util/u_debug.h`、`src/util/u_process.c`、`src/util/xmlconfig.c` | POSIX のヘッダー（`unistd.h`、`sys/types.h`、`fcntl.h`）を読まない。 |
+| `src/util/rand_xor.c` | 乱数の種は `n_random` から取る。 |
+| `src/util/memstream.c`、`src/util/perf/u_trace.c` | アプリの識別子は `n_app_self`。 |
+| `src/mesa/main/externalobjects.c` | 取り込んだハンドルは `n_handle_close` で閉じる。 |
+| `src/gallium/auxiliary/util/u_tests.c` | フェンスの記述子は無い。 |
+| `src/mesa/program/program_lexer.l` | 文字列だけを読むので `never-interactive`（`isatty` を使わない）。`generated/` の `lex.yy.c` も再生成済み。 |
 
-`docs/nocturne-native-abi.md` の段階4で、残る `nocturne.h` の旧 API 呼出しも
-新しいネイティブ ABI へ書き換える。
+段階4・5で旧 API 呼出しはすべてネイティブ ABI へ書き換えた。

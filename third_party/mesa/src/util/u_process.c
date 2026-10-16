@@ -35,7 +35,7 @@
 
 #if DETECT_OS_WINDOWS
 #include <windows.h>
-#else
+#elif !DETECT_OS_NOCTURNE
 #include <unistd.h>
 #endif
 

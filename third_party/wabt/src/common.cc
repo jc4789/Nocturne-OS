@@ -28,7 +28,6 @@
 #else
 #include <sys/stat.h>
 #endif
-#include <sys/types.h>
 
 #if COMPILER_IS_MSVC
 #include <fcntl.h>
@@ -112,17 +111,22 @@ Result ReadFile(std::string_view filename, std::vector<uint8_t>* out_data) {
   }
 
 #if WABT_NOCTURNE
-  struct n_stat statbuf;
+  struct n_entry statbuf;
+  n_result info = n_entry_info(filename_cstr, &statbuf);
+  if (info < 0) {
+    fprintf(stderr, "%s: %s\n", filename_cstr, n_result_text(info));
+    return Result::Error;
+  }
 #else
   struct stat statbuf;
-#endif
   if (stat(filename_cstr, &statbuf) < 0) {
     fprintf(stderr, "%s: %s\n", filename_cstr, strerror(errno));
     return Result::Error;
   }
+#endif
 
 #if WABT_NOCTURNE
-  if (statbuf.type == N_FT_DIR) {
+  if (statbuf.kind == N_KIND_FOLDER) {
 #else
   if (statbuf.st_mode & S_IFDIR) {
 #endif

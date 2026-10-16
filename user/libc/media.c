@@ -29,7 +29,8 @@ struct nmedia {
     AVPacket *packet;
     AVFrame *frame, *video_late;
     bool video_late_set; int64_t video_late_pts;
-    int fd, audio_index, video_index, flush, eof;
+    n_handle document; /* a media file, read at position; -1 for memory or HTTP input */
+    int audio_index, video_index, flush, eof;
     nmedia_http *http;
     uint8_t *bytes;
     size_t size, position;
@@ -89,7 +90,8 @@ static int input_read(void *opaque, uint8_t *out, int count) {
         memcpy(out, m->bytes + m->position, n); m->position += n;
         return (int)n;
     }
-    ssize_t n = read(m->fd, out, (size_t)count);
+    n_result n = n_document_read_at(m->document, m->position, out, (size_t)count);
+    if (n > 0) m->position += (size_t)n;
     return n > 0 ? (int)n : n == 0 ? AVERROR_EOF : AVERROR(EIO);
 }
 static int64_t input_seek(void *opaque, int64_t offset, int whence) {
@@ -101,11 +103,11 @@ static int64_t input_seek(void *opaque, int64_t offset, int whence) {
         return at < 0 ? AVERROR(EIO) : at;
     }
     int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ?
-        (m->bytes ? (int64_t)m->position : lseek(m->fd, 0, SEEK_CUR)) : whence == SEEK_END ? (int64_t)m->size : -1;
+        (int64_t)m->position : whence == SEEK_END ? (int64_t)m->size : -1;
     if (base < 0 || offset < -base || offset > (int64_t)m->size - base) return AVERROR(EINVAL);
     int64_t at = base + offset;
-    if (m->bytes) { m->position = (size_t)at; return at; }
-    return lseek(m->fd, (long)at, SEEK_SET);
+    m->position = (size_t)at;
+    return at;
 }
 static AVCodecContext *open_decoder(nmedia *m, int stream) {
     AVStream *s = m->format->streams[stream];
@@ -194,13 +196,14 @@ bad:
 nmedia *nmedia_open(const char *path, char *error, size_t error_size) {
     nmedia *m = nmedia_ff_mallocz(sizeof *m);
     if (!m) { if (error && error_size) strlcpy(error, "media allocation", error_size); return NULL; }
-    m->fd = open(path, O_RDONLY);
-    struct n_stat st;
-    if (m->fd < 0 || fstat(m->fd, &st) < 0 || st.type != N_FT_FILE || st.size > INT64_MAX) {
+    char full[512];
+    m->document = n_path_complete(path, full, sizeof full) < 0 ? -N_ERR_NAME_TOO_LONG : n_document_open(full, N_DOCUMENT_READ);
+    n_result size = m->document < 0 ? m->document : n_document_size(m->document);
+    if (size < 0) {
         if (error && error_size) strlcpy(error, "cannot open media file", error_size);
         nmedia_close(m); return NULL;
     }
-    m->size = (size_t)st.size;
+    m->size = (size_t)size;
     if (!open_input(m, error, error_size)) { nmedia_close(m); return NULL; }
     return m;
 }
@@ -210,7 +213,7 @@ nmedia *nmedia_open_memory(const void *bytes, size_t size, char *error, size_t e
     }
     nmedia *m = nmedia_ff_mallocz(sizeof *m);
     if (!m) { if (error && error_size) strlcpy(error, "media allocation", error_size); return NULL; }
-    m->fd = -1; m->bytes = nmedia_ff_malloc(size);
+    m->document = -1; m->bytes = nmedia_ff_malloc(size);
     if (!m->bytes) { if (error && error_size) strlcpy(error, "media input allocation", error_size); nmedia_close(m); return NULL; }
     memcpy(m->bytes, bytes, size); m->size = size;
     if (!open_input(m, error, error_size)) { nmedia_close(m); return NULL; }
@@ -224,7 +227,7 @@ static nmedia *open_url(const char *url, const char *document_url, char *error, 
         return nmedia_adaptive_open_cors(url,document_url?document_url:url,error,error_size);
     nmedia *m = nmedia_ff_mallocz(sizeof *m);
     if (!m) { if(error&&error_size)strlcpy(error,"media allocation",error_size);return NULL; }
-    m->fd = -1;
+    m->document = -1;
     m->http = document_url ? nmedia_http_open_cors(url,document_url,error,error_size) :
                             nmedia_http_open(url,error,error_size);
     if (!m->http) { nmedia_close(m);return NULL; }
@@ -245,7 +248,7 @@ nmedia *nmedia_open_packets(const AVFormatContext *source, nmedia_packet_reader 
                            nmedia_packet_seeker seeker, void *owner, char *error, size_t size) {
     nmedia *m = nmedia_ff_mallocz(sizeof *m);
     if (!m) { if(error&&size)strlcpy(error,"packet decoder allocation",size);return NULL; }
-    m->fd=-1;m->audio_index=m->video_index=-1;m->audio_seek_ms=m->video_seek_ms=-1;
+    m->document=-1;m->audio_index=m->video_index=-1;m->audio_seek_ms=m->video_seek_ms=-1;
     m->packet_reader=reader;m->packet_seeker=seeker;m->packet_owner=owner;
     m->format=avformat_alloc_context();
     if(!m->format){fail(m,"packet container allocation",AVERROR(ENOMEM));goto bad;}
@@ -768,7 +771,7 @@ void nmedia_close(nmedia *m) {
     if (!m) return;
     close_decoder(m);
     if (m->packet_release) m->packet_release(m->packet_owner);
-    if (m->fd >= 0) close(m->fd);
+    if (m->document >= 0) n_handle_close(m->document);
     nmedia_http_close(m->http);
     nmedia_ff_free(m->bytes); nmedia_ff_free(m->pixels); nmedia_ff_free(m);
 }

@@ -49,8 +49,8 @@ static char lease_path[128];
 static void lease_waiter(void *unused){
     /* This x86-64/TCC fixture exchanges only an aligned volatile stage word;
      * no payload publication or unsupported compiler atomic builtins. */
-    int fd=open(lease_path,O_RDWR|O_CREAT);lease_stage=1;
-    if(fd>=0 && fcntl(fd,F_NLOCK)==0){lease_stage=2;fcntl(fd,F_NUNLOCK);close(fd);}
+    n_handle fd=n_document_open(lease_path,N_DOCUMENT_EDIT);lease_stage=1;
+    if(fd>=0 && n_document_claim(fd,true)==0){lease_stage=2;n_document_release(fd);n_handle_close(fd);}
     else lease_stage=3;
 }
 int main(int argc,char **argv){
@@ -58,20 +58,24 @@ int main(int argc,char **argv){
         strcpy(origin,argv[2]);webstorage *s=webstorage_create();struct web_storage_result out={0};
         int result=access(s,WEB_STORAGE_SET,"process-key","child",&out);webstorage_free(s);return result!=WEB_STORAGE_OK;
     }
-    snprintf(origin,sizeof origin,"https://storage-window-%d.test",getpid());
-    snprintf(lease_path,sizeof lease_path,"/tmp/storage-lease-%d",getpid());
-    int lease=open(lease_path,O_RDWR|O_CREAT);check(lease>=0&&fcntl(lease,F_NLOCK)==0,"lease-owner-lock");
-    int other=open(lease_path,O_RDWR);check(other>=0&&fcntl(other,F_NUNLOCK)<0,"lease-other-description-cannot-unlock");if(other>=0)close(other);
+    snprintf(origin,sizeof origin,"https://storage-window-%d.test",(int)n_app_self());
+    snprintf(lease_path,sizeof lease_path,"/tmp/storage-lease-%d",(int)n_app_self());
+    n_entry_remove(lease_path);
+    n_handle lease=n_document_open(lease_path,N_DOCUMENT_CREATE);check(lease>=0&&n_document_claim(lease,false)==0,"lease-owner-lock");
+    n_handle other=n_document_open(lease_path,N_DOCUMENT_EDIT);check(other>=0&&n_document_release(other)<0,"lease-other-handle-cannot-release");if(other>=0)n_handle_close(other);
     int tid=thread_create(lease_waiter,NULL);check(tid>0,"lease-waiter-created");
     uint64_t deadline=uptime_ms()+1000;while(!lease_stage&&uptime_ms()<deadline)msleep(1);
-    msleep(20);check(lease_stage==1,"lease-separate-open-waits");close(lease);
+    msleep(20);check(lease_stage==1,"lease-separate-open-waits");n_handle_close(lease);
     deadline=uptime_ms()+1000;while(lease_stage==1&&uptime_ms()<deadline)msleep(1);
-    check(lease_stage==2,"lease-last-close-releases");if(lease_stage!=1&&tid>0)thread_join(tid);unlink(lease_path);
+    check(lease_stage==2,"lease-last-close-releases");if(lease_stage!=1&&tid>0)thread_join(tid);n_entry_remove(lease_path);
     webstorage *a=webstorage_create(),*b=webstorage_create();struct web_storage_result out={0};
     check(access(a,WEB_STORAGE_CLEAR,NULL,NULL,&out)==WEB_STORAGE_OK,"native-initial-clear");
     check(access(a,WEB_STORAGE_SET,"parent-key","kept",&out)==WEB_STORAGE_OK,"parent-unflushed-write");
-    char *child_argv[]={argv[0],"--writer",origin,NULL};int child=spawn(argv[0],child_argv,NULL,0),status=-1;
-    check(child>0&&waitpid(child,&status,0)>=0&&status==0,"cross-process-writer-completed");
+    const char *child_argv[]={argv[0],"--writer",origin};
+    struct n_launch launch={.arguments=child_argv,.argument_count=3};
+    n_handle child=n_app_launch(argv[0],&launch);int status=-1;
+    check(child>=0&&n_app_result(child,-1,&status)>=0&&status==0,"cross-process-writer-completed");
+    if(child>=0)n_handle_close(child);
     check(value_is(a,"parent-key","kept")&&value_is(a,"process-key","child"),"cross-process-rebase-keeps-both-keys");
     check(access(a,WEB_STORAGE_SET,"flush-key","pending",&out)==WEB_STORAGE_OK,"stale-window-pending-save");
     check(access(b,WEB_STORAGE_SET,"other-key","kept",&out)==WEB_STORAGE_OK,"second-window-distinct-key");

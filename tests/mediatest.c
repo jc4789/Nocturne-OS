@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include <nocturne.h>
 #include "web.h"
 static int failed,checks,ready,events;
 #define CHECK(x) do{checks++;if(!(x)){printf("FAIL mediatest:%d: %s\n",__LINE__,#x);failed++;}}while(0)

@@ -38,24 +38,27 @@ static bool idle(unsigned ms) {
     while (webnet_busy(net) && uptime_ms() < until) pump(5);
     return !webnet_busy(net);
 }
-static int child_wait(int pid, int *status, unsigned ms) {
+/* Polls the app's result for up to ms; stops and reaps it when it overruns. Returns 1 when it ended by itself. */
+static int child_wait(n_handle app, int *status, unsigned ms) {
     uint64_t until = uptime_ms() + ms;
-    int got;
-    while ((got = waitpid(pid, status, WNOHANG)) == 0 && uptime_ms() < until) msleep(5);
-    if (!got) { kill(pid); waitpid(pid, status, 0); return 0; }
-    return got;
+    n_result got;
+    while ((got = n_app_result(app, 0, status)) == -N_ERR_NOT_READY && uptime_ms() < until) msleep(5);
+    if (got == -N_ERR_NOT_READY) { n_app_stop(app, 0); n_app_result(app, -1, status); return 0; }
+    return got == 0;
 }
-static int waiter(const char *path) {
+static n_handle waiter(const char *path) {
     char port[16]; snprintf(port, sizeof port, "%d", tcp_port);
-    char *args[] = {(char *)path, "--wait", port, NULL};
-    int map[3] = {0, 1, 2};
-    return spawn(path, args, map, 0);
+    const char *args[] = {path, "--wait", port};
+    int32_t map[3] = {0, 1, 2};
+    struct n_launch launch = {.arguments = args, .argument_count = 3, .handles = map, .handle_count = 3};
+    return n_app_launch(path, &launch);
 }
-static bool waiter_blocked(int pid) {
+static bool waiter_blocked(n_handle app) {
     static struct n_procinfo processes[64];
+    n_result id = n_app_id(app);
     int n = proclist(processes, 64);
-    for (int i = 0; i < n; i++)
-        if (processes[i].pid == pid)
+    for (int i = 0; id > 0 && i < n; i++)
+        if (processes[i].pid == id)
             return processes[i].is_user && processes[i].state == 2; /* native TASK_BLOCKED */
     return false;
 }
@@ -105,35 +108,37 @@ int main(int argc, char **argv) {
         pump(200); before = uptime_ms(); webnet_cancel_generation(net, 100);
         check(!webnet_busy(net) && uptime_ms() - before < 2000 && !cancelled[0].calls && !cancelled[1].calls,
             "cancellation wakes killed capacity waiters and reaps both workers");
-        int pid = waiter(argv[0]), status = -1;
-        check(pid > 0, "spawn cooperative capacity waiter");
-        if (pid > 0) {
+        n_handle app = waiter(argv[0]);
+        int status = -1;
+        check(app >= 0, "launch cooperative capacity waiter");
+        if (app >= 0) {
             msleep(200);
-            int got = waitpid(pid, &status, WNOHANG);
-            check(got == 0, "waiter remains blocked while all slots are active");
+            bool running = n_app_result(app, 0, &status) == -N_ERR_NOT_READY;
+            check(running, "waiter remains blocked while all slots are active");
             tcp_close(held[0]); held[0] = -1;
-            if (got == 0) check(child_wait(pid, &status, 5500) == pid && status == 0, "FIN/TIME_WAIT release wakes waiting connection");
+            if (running) check(child_wait(app, &status, 5500) == 1 && status == 0, "FIN/TIME_WAIT release wakes waiting connection");
             else check(false, "capacity waiter survived until release");
+            n_handle_close(app);
         }
         held[0] = tcp_connect(HOST, (uint16_t)tcp_port, 5000);
         check(held[0] >= 0, "closing waiter slot is reclaimed only after protocol lifetime");
-        pid = waiter(argv[0]); status = -1;
-        if (pid > 0) {
+        app = waiter(argv[0]); status = -1;
+        if (app >= 0) {
             msleep(200);
-            int got = waitpid(pid, &status, WNOHANG);
-            bool blocked = got == 0 && waiter_blocked(pid);
-            check(blocked, "kill target is an unreaped native blocked capacity waiter");
-            if (got == 0) {
+            bool running = n_app_result(app, 0, &status) == -N_ERR_NOT_READY;
+            bool blocked = running && waiter_blocked(app);
+            check(blocked, "stop target is a still-running native blocked capacity waiter");
+            if (running) {
                 before = uptime_ms();
-                int killed = kill(pid);
-                check(killed == 0, "native kill accepts the blocked capacity waiter");
-                int reaped = child_wait(pid, &status, 1500);
-                /* task_wait exposes task_exit's raw code; killed user returns
-                   exit 130, not a POSIX-encoded wait status. */
-                check(blocked && killed == 0 && reaped == pid && status == 130 && uptime_ms() - before < 1500,
-                    "killed global-capacity waiter exits 130 promptly without a TCB");
-            } else check(false, "capacity kill target did not exit before cancellation");
-        } else check(false, "spawn killed capacity waiter");
+                n_result stopped = n_app_stop(app, 0);
+                check(stopped >= 0, "native stop accepts the blocked capacity waiter");
+                int reaped = child_wait(app, &status, 1500);
+                /* A stopped app reports the kernel's kill code, 130. */
+                check(blocked && stopped >= 0 && reaped == 1 && status == 130 && uptime_ms() - before < 1500,
+                    "stopped global-capacity waiter exits 130 promptly without a TCB");
+            } else check(false, "capacity stop target did not exit before cancellation");
+            n_handle_close(app);
+        } else check(false, "launch stopped capacity waiter");
     }
     for (int i = 0; i < CAPACITY; i++) if (held[i] >= 0) tcp_close(held[i]);
     /* More than the global budget: small module responses force repeated closes

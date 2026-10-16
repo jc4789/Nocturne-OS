@@ -21,10 +21,9 @@ for target in "$S" "$W"; do
     esac
 done
 rm -rf "$S" "$W"
-mkdir -p "$S/usr/include/sys" "$S/usr/lib/tcc/include" "$W/libc" "$W/rt" "$W/wasmrt"
+mkdir -p "$S/usr/include" "$S/usr/lib/tcc/include" "$W/libc" "$W/rt" "$W/wasmrt"
 
 cp user/include/*.h "$S/usr/include/"
-cp user/include/sys/*.h "$S/usr/include/sys/"
 cp common/abi.h common/gfx.h common/gpu_abi.h "$S/usr/include/"
 cp ports/tcc/include/*.h "$S/usr/include/"
 cp third_party/bearssl/inc/*.h "$S/usr/include/"

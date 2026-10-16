@@ -20,27 +20,10 @@
 
 #include "config.h"
 
-#if HAVE_UNISTD_H
-#include <unistd.h>
-#endif
-#if HAVE_IO_H
-#include <io.h>
-#endif
-#if HAVE_BCRYPT
-#include <windows.h>
-#include <bcrypt.h>
-#endif
-#if CONFIG_GCRYPT
-#include <gcrypt.h>
-#elif CONFIG_OPENSSL
-#include <openssl/rand.h>
-#endif
-#include <fcntl.h>
+#include <nocturne.h>
 #include <math.h>
-#include <time.h>
 #include <string.h>
 #include "avassert.h"
-#include "file_open.h"
 #include "internal.h"
 #include "intreadwrite.h"
 #include "timer.h"
@@ -51,34 +34,18 @@
 #define TEST 0
 #endif
 
-static int read_random(uint8_t *dst, size_t len, const char *file)
-{
-#if HAVE_UNISTD_H
-    FILE *fp = avpriv_fopen_utf8(file, "r");
-    size_t err;
-
-    if (!fp)
-        return AVERROR_UNKNOWN;
-    setvbuf(fp, NULL, _IONBF, 0);
-    err = fread(dst, 1, len, fp);
-    fclose(fp);
-
-    if (err != len)
-        return AVERROR_UNKNOWN;
-
-    return 0;
-#else
-    return AVERROR(ENOSYS);
-#endif
-}
+/* Fallback jitter timer: the native uptime clock, in milliseconds. */
+typedef uint64_t jitter_tick_t;
+#define jitter_ticks() n_clock_uptime_ms()
+#define JITTER_TICKS_PER_SEC 1000
 
 static uint32_t get_generic_seed(void)
 {
     uint64_t tmp[120/8];
     struct AVSHA *sha = (void*)tmp;
-    clock_t last_t  = 0;
-    clock_t last_td = 0;
-    clock_t init_t = 0;
+    jitter_tick_t last_t  = 0;
+    jitter_tick_t last_td = 0;
+    jitter_tick_t init_t = 0;
     static uint64_t i = 0;
     static uint32_t buffer[512] = { 0 };
     unsigned char digest[20];
@@ -98,13 +65,13 @@ static uint32_t get_generic_seed(void)
     }
 
     for (;;) {
-        clock_t t = clock();
+        jitter_tick_t t = jitter_ticks();
         int incremented_i = 0;
         int cur_td = t - last_t;
-        if (last_t + 2*last_td + (CLOCKS_PER_SEC > 1000) < t) {
+        if (last_t + 2*last_td + (JITTER_TICKS_PER_SEC > 1000) < t) {
             // If the timer incremented by more than 2*last_td at once,
             // we may e.g. have had a context switch. If the timer resolution
-            // is high (CLOCKS_PER_SEC > 1000), require that the timer
+            // is high (JITTER_TICKS_PER_SEC > 1000), require that the timer
             // incremented by more than 1. If the timer resolution is low,
             // it is enough that the timer incremented at all.
             buffer[++i & 511] += cur_td % 3294638521U;
@@ -122,7 +89,7 @@ static uint32_t get_generic_seed(void)
         } else {
             buffer[i & 511] = 1664525*buffer[i & 511] + 1013904223 + (cur_td % 3294638521U);
         }
-        if (incremented_i && (t - init_t) >= CLOCKS_PER_SEC>>5) {
+        if (incremented_i && (t - init_t) >= JITTER_TICKS_PER_SEC>>5) {
             if (last_i && i - last_i > 4 || i - last_i > 64 || TEST && i - last_i > 8)
                 break;
         }
@@ -158,39 +125,8 @@ static uint32_t get_generic_seed(void)
 
 int av_random_bytes(uint8_t* buf, size_t len)
 {
-    int err;
-
-#if HAVE_BCRYPT
-    BCRYPT_ALG_HANDLE algo_handle;
-    NTSTATUS ret = BCryptOpenAlgorithmProvider(&algo_handle, BCRYPT_RNG_ALGORITHM,
-                                               MS_PRIMITIVE_PROVIDER, 0);
-    if (BCRYPT_SUCCESS(ret)) {
-        NTSTATUS ret = BCryptGenRandom(algo_handle, (PUCHAR)buf, len, 0);
-        BCryptCloseAlgorithmProvider(algo_handle, 0);
-        if (BCRYPT_SUCCESS(ret))
-            return 0;
-    }
-#endif
-
-#if HAVE_ARC4RANDOM_BUF
-    arc4random_buf(buf, len);
-    return 0;
-#endif
-
-    err = read_random(buf, len, "/dev/urandom");
-    if (!err)
-        return err;
-
-#if CONFIG_GCRYPT
-    gcry_randomize(buf, len, GCRY_VERY_STRONG_RANDOM);
-    return 0;
-#elif CONFIG_OPENSSL
-    if (RAND_bytes(buf, len) == 1)
-        return 0;
-    return AVERROR_EXTERNAL;
-#else
-    return err;
-#endif
+    /* The system entropy pool fills the whole request or fails. */
+    return n_random(buf, len) < 0 ? AVERROR_UNKNOWN : 0;
 }
 
 uint32_t av_get_random_seed(void)

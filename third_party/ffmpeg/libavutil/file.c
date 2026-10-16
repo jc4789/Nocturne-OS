@@ -19,23 +19,10 @@
 #include "config.h"
 #include "error.h"
 #include "file.h"
-#include "file_open.h"
 #include "internal.h"
 #include "log.h"
 #include "mem.h"
-#include <fcntl.h>
-#include <sys/stat.h>
-#if HAVE_UNISTD_H
-#include <unistd.h>
-#endif
-#if HAVE_IO_H
-#include <io.h>
-#endif
-#if HAVE_MMAP
-#include <sys/mman.h>
-#elif HAVE_MAPVIEWOFFILE
-#include <windows.h>
-#endif
+#include <nocturne.h>
 
 typedef struct FileLogContext {
     const AVClass *class;
@@ -56,86 +43,24 @@ int av_file_map(const char *filename, uint8_t **bufptr, size_t *size,
                 int log_offset, void *log_ctx)
 {
     FileLogContext file_log_ctx = { &file_log_ctx_class, log_offset, log_ctx };
-    int err, fd = avpriv_open(filename, O_RDONLY);
-    struct stat st;
-    av_unused void *ptr;
-    off_t off_size;
+    void *data = NULL;
+    size_t length = 0;
+    /* The document arrives whole in fresh private pages the caller may write,
+     * as the old copy-on-write mapping allowed. A failure is -N_ERR_*, and
+     * the errno names are those same positive codes. */
+    n_result r = n_document_load(filename, &data, &length);
+
     *bufptr = NULL;
     *size = 0;
 
-    if (fd < 0) {
-        err = AVERROR(errno);
-        av_log(&file_log_ctx, AV_LOG_ERROR, "Cannot read file '%s': %s\n", filename, av_err2str(err));
+    if (r < 0) {
+        int err = AVERROR(-(int)r);
+        av_log(&file_log_ctx, AV_LOG_ERROR, "Cannot read file '%s': %s\n", filename, n_result_text(r));
         return err;
     }
 
-    if (fstat(fd, &st) < 0) {
-        err = AVERROR(errno);
-        av_log(&file_log_ctx, AV_LOG_ERROR, "Error occurred in fstat(): %s\n", av_err2str(err));
-        close(fd);
-        return err;
-    }
-
-    off_size = st.st_size;
-    if (off_size > SIZE_MAX) {
-        av_log(&file_log_ctx, AV_LOG_ERROR,
-               "File size for file '%s' is too big\n", filename);
-        close(fd);
-        return AVERROR(EINVAL);
-    }
-    *size = off_size;
-
-    if (!*size) {
-        *bufptr = NULL;
-        goto out;
-    }
-
-#if HAVE_MMAP
-    ptr = mmap(NULL, *size, PROT_READ|PROT_WRITE, MAP_PRIVATE, fd, 0);
-    if (ptr == MAP_FAILED) {
-        err = AVERROR(errno);
-        av_log(&file_log_ctx, AV_LOG_ERROR, "Error occurred in mmap(): %s\n", av_err2str(err));
-        close(fd);
-        *size = 0;
-        return err;
-    }
-    *bufptr = ptr;
-#elif HAVE_MAPVIEWOFFILE
-    {
-        HANDLE mh, fh = (HANDLE)_get_osfhandle(fd);
-
-        mh = CreateFileMapping(fh, NULL, PAGE_READONLY, 0, 0, NULL);
-        if (!mh) {
-            av_log(&file_log_ctx, AV_LOG_ERROR, "Error occurred in CreateFileMapping()\n");
-            close(fd);
-            *size = 0;
-            return -1;
-        }
-
-        ptr = MapViewOfFile(mh, FILE_MAP_COPY, 0, 0, *size);
-        CloseHandle(mh);
-        if (!ptr) {
-            av_log(&file_log_ctx, AV_LOG_ERROR, "Error occurred in MapViewOfFile()\n");
-            close(fd);
-            *size = 0;
-            return -1;
-        }
-
-        *bufptr = ptr;
-    }
-#else
-    *bufptr = av_malloc(*size);
-    if (!*bufptr) {
-        av_log(&file_log_ctx, AV_LOG_ERROR, "Memory allocation error occurred\n");
-        close(fd);
-        *size = 0;
-        return AVERROR(ENOMEM);
-    }
-    read(fd, *bufptr, *size);
-#endif
-
-out:
-    close(fd);
+    *bufptr = data;
+    *size = length;
     return 0;
 }
 
@@ -143,11 +68,5 @@ void av_file_unmap(uint8_t *bufptr, size_t size)
 {
     if (!size || !bufptr)
         return;
-#if HAVE_MMAP
-    munmap(bufptr, size);
-#elif HAVE_MAPVIEWOFFILE
-    UnmapViewOfFile(bufptr);
-#else
-    av_free(bufptr);
-#endif
+    n_memory_release(bufptr, size);
 }

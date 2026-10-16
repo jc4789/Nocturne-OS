@@ -485,7 +485,8 @@ the_end:
 
 /* re-execute the i386/x86_64 cross-compilers with tcc -m32/-m64: */
 
-#if !defined TCC_TARGET_I386 && !defined TCC_TARGET_X86_64
+/* Nocturne has no way to run another compiler binary, so -m32/-m64 are not offered. */
+#if CONFIG_TCC_NOCTURNE || (!defined TCC_TARGET_I386 && !defined TCC_TARGET_X86_64)
 
 ST_FUNC int tcc_tool_cross(char **argv, int option)
 {
@@ -611,7 +612,7 @@ ST_FUNC int gen_makedeps(TCCState *s1, const char *target, const char *filename)
     }
 
     if(!strcmp(filename, "-"))
-        depout = fdopen(1, "w");
+        depout = stdout;
     else
         /* XXX return err codes instead of error() ? */
         depout = fopen(filename, "w");
@@ -644,7 +645,10 @@ ST_FUNC int gen_makedeps(TCCState *s1, const char *target, const char *filename)
     for (i = 0; i < num_targets; ++i)
         tcc_free(escaped_targets[i]);
     tcc_free(escaped_targets);
-    fclose(depout);
+    if (depout == stdout)
+        fflush(depout);
+    else
+        fclose(depout);
     return 0;
 }
 

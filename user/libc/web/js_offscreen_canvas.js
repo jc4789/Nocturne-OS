@@ -165,7 +165,7 @@ const offscreenCanvasBridge = (() => {
     function detachWrites(s){
         return [{object:s,key:'detached',value:true},{object:s,key:'width',value:0},{object:s,key:'height',value:0},{object:s,key:'element',value:null},{object:s,key:'link',value:null}];
     }
-    /* The frame link record for a receiving agent: an existing link is passed
+    /* The frame link record for a receiving worker: an existing link is passed
        on; a placeholder going to a Worker gets a new one shown here. */
     function linkRecord(s,worker){
         if(s.link){try{return exportShared(s.link.buffer);}catch(_){return null;}}
@@ -183,7 +183,7 @@ const offscreenCanvasBridge = (() => {
         /* Another realm: the size and any frame link cross; the receiving
            realm builds its own canvas from the metadata. */
         prepareWorker(value){const s=state(value);return {receiver:{value:null},meta:['OffscreenCanvas',s.width,s.height,linkRecord(s,true)],route:null};},
-        prepareExternal(value){const s=state(value);return {receiver:{value:null},meta:['OffscreenCanvas',s.width,s.height,linkRecord(s,false)],route:null};},
+        prepareExternal(value){const s=state(value);return {receiver:{value:null},meta:['OffscreenCanvas',s.width,s.height,s.link?s.link.buffer:null],route:null};},
         commitPlan(value){const s=state(value);if(s.detached)fail();return {writes:detachWrites(s)};},
         commit(value){const s=state(value),writes=detachWrites(s);for(let i=0;i<writes.length;i++)writes[i].object[writes[i].key]=writes[i].value;}
     });
@@ -203,7 +203,7 @@ const offscreenCanvasBridge = (() => {
             const width=m[1],height=m[2],record=m[3];
             if(m.length!==4||!safe(width)||width<0||!safe(height)||height<0)throw new TypeError('Invalid OffscreenCanvas transfer');
             const value=make(width,height,null);
-            if(record!==null){const buffer=importShared(record);states.get(value).link={buffer,header:new Int32(buffer,0,4),waiting:false};}
+            if(record!==null){const buffer=ArrayCtor.isArray(record)?importShared(record):record;states.get(value).link={buffer,header:new Int32(buffer,0,4),waiting:false};}
             return {value};
         }
     };

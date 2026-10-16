@@ -8,10 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
 #include "nocturne.h"
 
-#define OUT "/home/test.out"
 #define ANY (-1)     /* any exit status */
 #define NONZERO (-2) /* must fail */
 
@@ -90,8 +88,8 @@ static const struct test tests[] = {
      {"cpuinfotest: ", "; ok"}, "invalid", 60},
     {"mem", "heap-page-reclamation", "tcc -o /home/malloctrimtest /data/tests/malloctrimtest.c && /home/malloctrimtest", 0,
      {"malloctrimtest: ", ", 0 failed"}, "FAIL", 60},
-    {"mem", "heap-failure-atomicity", "tcc -o /home/sbrktest /data/tests/sbrktest.c && /home/sbrktest", 0,
-     {"sbrktest: ", ", 0 failed"}, "FAIL", 60, false, true},
+    {"mem", "heap-failure-atomicity", "tcc -o /home/memreservetest /data/tests/memreservetest.c && /home/memreservetest", 0,
+     {"memreservetest: ", ", 0 failed"}, "FAIL", 60, false, true},
     {"mem", "w^x", "tcc -o /home/wxtest /data/tests/wxtest.c && /home/wxtest", 0, {"wxtest: 0 failed"}, "FAIL", 60, true},
 
     /* filesystems */
@@ -460,19 +458,79 @@ static void result(const char *verdict, const struct test *t, const char *why) {
     fflush(stdout);
 }
 
-static char *slurp(const char *path) {
-    FILE *f = fopen(path, "r");
-    if (!f) return strdup("");
-    size_t cap = 4096, n = 0;
-    char *b = malloc(cap);
-    size_t r;
-    while ((r = fread(b + n, 1, cap - n - 1, f)) > 0) {
-        n += r;
-        if (n + 1 >= cap) b = realloc(b, cap *= 2);
+/* The output of one test: every message its shell sent on stdout/stderr, as one NUL-terminated string. */
+struct capture {
+    char *text;
+    size_t length, capacity;
+};
+
+/* Takes the messages that are already waiting on the output channel. */
+static void drain(n_handle channel, struct capture *c) {
+    for (;;) {
+        n_result size = n_channel_receive(channel, NULL, 0, N_CHANNEL_PEEK, NULL);
+        if (size < 0) return;
+        if (size == 0) { /* an empty message carries nothing; drop it */
+            char drop;
+            if (n_channel_receive(channel, &drop, 1, N_CHANNEL_DISCARD, NULL) < 0) return;
+            continue;
+        }
+        if (c->length + (size_t)size + 1 > c->capacity) {
+            size_t want = c->capacity ? c->capacity : 4096;
+            while (want < c->length + (size_t)size + 1) want *= 2;
+            char *grown = realloc(c->text, want);
+            if (!grown) return;
+            c->text = grown;
+            c->capacity = want;
+        }
+        n_result got = n_channel_receive(channel, c->text + c->length, (size_t)size, 0, NULL);
+        if (got <= 0) return;
+        c->length += (size_t)got;
     }
-    b[n] = 0;
-    fclose(f);
-    return b;
+}
+
+/* Runs "sh -c cmd" with a closed stdin and stdout/stderr on one channel that is drained while it runs.
+   Returns 1 when it ended (*status set), 0 when it overran timeout_ms and was stopped, -1 when it could not start. */
+static int run_shell(const char *cmd, int timeout_ms, struct capture *c, int *status) {
+    n_handle out[2], in[2];
+    if (n_channel_pair(out) < 0) return -1;
+    if (n_channel_pair(in) < 0) { n_handle_close(out[0]); n_handle_close(out[1]); return -1; }
+    n_handle_close(in[0]); /* reading stdin reports the end at once, like an empty device */
+    const char *args[] = {"sh", "-c", cmd};
+    int32_t handles[] = {in[1], out[1], out[1]};
+    struct n_launch launch = {.arguments = args, .argument_count = 3, .handles = handles, .handle_count = 3};
+    n_handle app = n_app_launch("/bin/sh", &launch);
+    n_handle_close(in[1]);
+    n_handle_close(out[1]);
+    n_handle q = n_events_create();
+    if (app < 0 || q < 0) {
+        if (app >= 0) { n_app_stop(app, N_APP_STOP_TREE); n_handle_close(app); }
+        if (q >= 0) n_handle_close(q);
+        n_handle_close(out[0]);
+        return -1;
+    }
+    n_events_watch(q, app, N_EVENT_APP_ENDED, 1);
+    n_events_watch(q, out[0], N_EVENT_RECEIVABLE, 2);
+    uint64_t deadline = uptime_ms() + (uint64_t)timeout_ms;
+    int result = 0;
+    for (;;) {
+        drain(out[0], c);
+        if (n_app_result(app, 0, status) == 0) { drain(out[0], c); result = 1; break; }
+        uint64_t now = uptime_ms();
+        if (now >= deadline) break;
+        struct n_event e;
+        n_events_wait(q, &e, 1, (int64_t)(deadline - now));
+    }
+    if (!result) {
+        n_app_stop(app, N_APP_STOP_TREE);
+        n_app_result(app, -1, status);
+        drain(out[0], c);
+    }
+    if (!c->text) c->text = strdup("");
+    else c->text[c->length] = 0;
+    n_handle_close(q);
+    n_handle_close(app);
+    n_handle_close(out[0]);
+    return result;
 }
 
 /* first line of the output, for failure messages */
@@ -492,34 +550,26 @@ static void show_output(const char *out) {
 
 static void run(const struct test *t) {
     int nfail_before = nfail;
-    int fd = open(OUT, O_WRONLY | O_CREAT | O_TRUNC);
-    int nul = open("/dev/null", O_RDONLY);
-    int fdmap[3] = {nul, fd, fd};
-    char *argv[] = {"sh", "-c", (char *)t->cmd, NULL};
     uint64_t t0 = uptime_ms();
-    int pid = spawn("/bin/sh", argv, fdmap, 0);
-    close(fd);
-    close(nul);
-    if (pid < 0) {
-        result("FAIL", t, "cannot spawn sh");
+    int timeout = (t->timeout_s ? t->timeout_s : 15) * 1000, st = 0;
+    struct capture cap = {0};
+    int r = run_shell(t->cmd, timeout, &cap, &st);
+    char why[256];
+    if (r < 0) {
+        result("FAIL", t, "cannot start sh");
         nfail++;
+        free(cap.text);
         return;
     }
-    int timeout = (t->timeout_s ? t->timeout_s : 15) * 1000, st = 0, r;
-    while ((r = waitpid(pid, &st, WNOHANG)) == 0 && uptime_ms() - t0 < (uint64_t)timeout) msleep(20);
-    char why[256];
     if (r == 0) {
-        killtree(pid, 1);
-        waitpid(pid, &st, 0);
         snprintf(why, sizeof why, "timed out after %d s", timeout / 1000);
         result("FAIL", t, why);
         nfail++;
-        char *out = slurp(OUT);
-        show_output(out);
-        free(out);
+        show_output(cap.text);
+        free(cap.text);
         return;
     }
-    char *out = slurp(OUT), snip[128];
+    char *out = cap.text, snip[128];
     snippet(out, snip, sizeof snip);
     why[0] = 0;
     if (!t->may_crash && strstr(out, "*** ")) snprintf(why, sizeof why, "crashed: %s", strstr(out, "*** "));
@@ -569,8 +619,8 @@ int main(int argc, char **argv) {
             only[nonly++] = argv[i];
         }
     }
-    struct n_stat st;
-    bool have_tcc_src = stat("/data/tests/tcc/tcc.c", &st) == 0;
+    struct n_entry st;
+    bool have_tcc_src = n_entry_info("/data/tests/tcc/tcc.c", &st) == 0;
     printf("TESTS BEGIN\n");
     uint64_t t0 = uptime_ms();
     for (size_t i = 0; i < sizeof tests / sizeof *tests; i++) {

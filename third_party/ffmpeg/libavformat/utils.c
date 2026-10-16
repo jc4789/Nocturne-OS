@@ -45,6 +45,7 @@
 #endif
 #include "os_support.h"
 #include "urldecode.h"
+#include <nocturne.h>
 
 /**
  * @file
@@ -442,19 +443,23 @@ int ff_mkdir_p(const char *path)
         if (*pos == '/' || *pos == '\\') {
             tmp_ch = *pos;
             *pos = '\0';
-            ret = mkdir(temp, 0755);
-            if (ret < 0 && errno != EEXIST) {
-                int err = errno;
+            /* native failures are -N_ERR_*; errno names the same positive code */
+            n_result r = n_folder_create(temp);
+            if (r < 0 && r != -N_ERR_EXISTS) {
                 av_free(temp);
-                errno = err;
-                return ret;
+                errno = (int)-r;
+                return -1;
             }
             *pos = tmp_ch;
         }
     }
 
     if ((*(pos - 1) != '/') && (*(pos - 1) != '\\')) {
-        ret = mkdir(temp, 0755);
+        n_result r = n_folder_create(temp);
+        if (r < 0) {
+            errno = (int)-r;
+            ret = -1;
+        }
     }
 
     av_free(temp);

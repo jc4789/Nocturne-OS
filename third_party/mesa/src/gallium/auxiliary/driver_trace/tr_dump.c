@@ -106,7 +106,7 @@ trace_dump_check_trigger(void)
       trigger_active = false;
    } else {
       if (!access(trigger_filename, 2 /* W_OK but compiles on Windows */)) {
-         if (!unlink(trigger_filename)) {
+         if (!remove(trigger_filename)) {
             trigger_active = true;
          } else {
             fprintf(stderr, "error removing trigger file\n");

@@ -282,9 +282,9 @@ void sched_ap_interrupt(struct regs *r) {
                             (uint64_t)mail->ticks * 1000;
     /* Read-only identity queries need no BSP kernel continuation. */
     if (vector == 0x80 && (r->rax == SYS_CPU_INDEX || r->rax == SYS_THREAD_ID ||
-                          r->rax == SYS_GETPID || r->rax == SYS_UPTIME)) {
+                          r->rax == SYS_APP_SELF || r->rax == SYS_UPTIME)) {
         r->rax = r->rax == SYS_CPU_INDEX ? cpu : r->rax == SYS_THREAD_ID ? current_task->pid :
-                 r->rax == SYS_GETPID ? task_process()->pid : uptime_ms();
+                 r->rax == SYS_APP_SELF ? task_process()->pid : uptime_ms();
         dispatch = false;
     }
     else if (vector==0x80 && net_ap_syscall(r)) dispatch=false;
@@ -346,7 +346,6 @@ void sched_init(void) {
     strlcpy(idle_task->name, "idle", sizeof idle_task->name);
     idle_task->state = TASK_RUNNING;
     idle_task->pml4 = kernel_pml4;
-    strlcpy(idle_task->cwd, "/", sizeof idle_task->cwd);
     fpu_state_init(&idle_task->fpu);
     sched_set_current(idle_task);
     task_list = idle_task;
@@ -373,7 +372,6 @@ struct task *task_alloc(const char *name) {
     strlcpy(t->name, name, sizeof t->name);
     t->state = TASK_BLOCKED; /* not runnable until made ready */
     t->pml4 = kernel_pml4;
-    strlcpy(t->cwd, "/", sizeof t->cwd);
     fpu_state_init(&t->fpu);
     t->start_ms = uptime_ms();
     mlfq_reset(t);

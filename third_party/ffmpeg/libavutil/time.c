@@ -23,76 +23,35 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <time.h>
-#if HAVE_GETTIMEOFDAY
-#include <sys/time.h>
-#endif
-#if HAVE_UNISTD_H
-#include <unistd.h>
-#endif
-#if HAVE_WINDOWS_H
-#include <windows.h>
-#endif
+#include <nocturne.h>
 
 #include "time.h"
 #include "error.h"
 
+/* Wall time is the system clock's whole seconds; Nocturne has no finer wall
+ * clock, and gluing a millisecond counter onto it would jump when the two
+ * disagree. Callers here only stamp logs and live streams, so a second is
+ * enough. */
 int64_t av_gettime(void)
 {
-#if HAVE_GETTIMEOFDAY
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
-#elif HAVE_GETSYSTEMTIMEASFILETIME
-    FILETIME ft;
-    int64_t t;
-    GetSystemTimeAsFileTime(&ft);
-    t = (int64_t)ft.dwHighDateTime << 32 | ft.dwLowDateTime;
-    return t / 10 - 11644473600000000; /* Jan 1, 1601 */
-#else
-    return -1;
-#endif
+    return n_clock_wall() * 1000000;
 }
 
+/* Milliseconds since boot, monotonic; the resolution of the native uptime clock. */
 int64_t av_gettime_relative(void)
 {
-#if HAVE_CLOCK_GETTIME && defined(CLOCK_MONOTONIC)
-#ifdef __APPLE__
-    if (&clock_gettime)
-#endif
-    {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
-    }
-#endif
-    return av_gettime() + 42 * 60 * 60 * INT64_C(1000000);
+    return (int64_t)n_clock_uptime_ms() * 1000;
 }
 
 int av_gettime_relative_is_monotonic(void)
 {
-#if HAVE_CLOCK_GETTIME && defined(CLOCK_MONOTONIC)
-#ifdef __APPLE__
-    if (!&clock_gettime)
-        return 0;
-#endif
     return 1;
-#else
-    return 0;
-#endif
 }
 
+/* The native sleep counts milliseconds; round up so a sleep is never short. */
 int av_usleep(unsigned usec)
 {
-#if HAVE_NANOSLEEP
-    struct timespec ts = { usec / 1000000, usec % 1000000 * 1000 };
-    while (nanosleep(&ts, &ts) < 0 && errno == EINTR);
+    if (usec)
+        n_sleep_ms(((uint64_t)usec + 999) / 1000);
     return 0;
-#elif HAVE_USLEEP
-    return usleep(usec);
-#elif HAVE_SLEEP
-    Sleep(usec / 1000);
-    return 0;
-#else
-    return AVERROR(ENOSYS);
-#endif
 }

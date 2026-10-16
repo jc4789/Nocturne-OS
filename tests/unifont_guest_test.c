@@ -37,16 +37,15 @@ int main(int argc, char **argv) {
         "Symbols: ← ↑ → ↓ ┌─┐ █ ★ ☆ ☾ ✓ ✗",
     };
     if (argc > 1 && !strcmp(argv[1], "console")) {
-        int fd = open("/dev/console", O_WRONLY);
-        if (fd < 0) return 1;
-        write(fd, "\x1B[2J\x1B[1;1H", 10);
+        /* Handle 1 is the console when the program is started without a terminal app. */
+        const n_handle out = 1;
+        if (n_channel_send(out, "\x1B[2J\x1B[1;1H", 10, -1) < 0) return 1;
         for (unsigned i = 0; i < sizeof lines / sizeof *lines; i++) {
             /* Deliberately split each UTF-8 sequence across system calls. */
-            for (const char *p = lines[i]; *p; p++) write(fd, p, 1);
-            write(fd, "\n", 1);
+            for (const char *p = lines[i]; *p; p++) n_channel_send(out, p, 1, -1);
+            n_channel_send(out, "\n", 1, -1);
         }
-        write(fd, "ABC日本語D\n", strlen("ABC日本語D\n"));
-        close(fd);
+        n_channel_send(out, "ABC日本語D\n", strlen("ABC日本語D\n"), -1);
     } else {
         window_t *w = win_open(740, 340, "日本語 中文 한글 — Unifont 全字形", WIN_RESIZABLE);
         if (!w) return 1;

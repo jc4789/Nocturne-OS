@@ -280,9 +280,7 @@ static unsigned getclock_ms(void)
 #ifdef _WIN32
     return GetTickCount();
 #else
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec*1000 + (tv.tv_usec+500)/1000;
+    return (unsigned)n_clock_uptime_ms();
 #endif
 }
 

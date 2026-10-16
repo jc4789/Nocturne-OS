@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <fcntl.h>
+
 #include <bearssl_hash.h>
 #include "nocturne.h"
 #include "web.h"
@@ -59,14 +59,14 @@ static void fixture_path_at(const char *root,const char *origin,int slot,char pa
 static void fixture_path(const char *origin,int slot,char path[160]){fixture_path_at("/data/browser/storage",origin,slot,path);}
 /* Simulate loss of RAM-root after closing all backends. Corrupting a disk slot
  * must not replace the live shared map; cold recovery is a separate boundary. */
-static void cold_fixture(const char *origin){char path[160];for(int i=0;i<5;i++){fixture_path_at("/tmp/browser-storage",origin,i,path);unlink(path);}}
+static void cold_fixture(const char *origin){char path[160];for(int i=0;i<5;i++){fixture_path_at("/tmp/browser-storage",origin,i,path);n_entry_remove(path);}}
 static void corrupt(const char *origin,int slot){
-    char path[160];fixture_path(origin,slot,path);int fd=open(path,O_WRONLY);
-    check(fd>=0,"open OWN fixture snapshot");if(fd>=0){check(write(fd,"!",1)==1,"corrupt OWN fixture snapshot");close(fd);}
+    char path[160];fixture_path(origin,slot,path);n_handle doc=n_document_open(path,N_DOCUMENT_EDIT);
+    check(doc>=0,"open OWN fixture snapshot");if(doc>=0){check(n_document_write_at(doc,0,"!",1)==1,"corrupt OWN fixture snapshot");n_handle_close(doc);}
 }
 int main(int argc,char **argv){
     if(argc!=2 || strcmp(argv[1],"--isolated-scratch")){puts("REFUSE: isolated QEMU scratch /data is required; pass --isolated-scratch only there");return 2;}
-    snprintf(fixture_origin,sizeof fixture_origin,"https://storage-fixture-%d-%llu.invalid",getpid(),(unsigned long long)uptime_ms());
+    snprintf(fixture_origin,sizeof fixture_origin,"https://storage-fixture-%d-%llu.invalid",(int)n_app_self(),(unsigned long long)uptime_ms());
     store=webstorage_create();check(store!=NULL,"backend allocation");if(!store)return 1;
     FILE *file=fopen("/data/tests/js_storage_cases.js","rb");check(file!=NULL,"JS fixture present");
     if(file){
@@ -98,7 +98,7 @@ int main(int argc,char **argv){
         out.text && !memcmp(out.text,"\xed\xa0\x80\0\xed\xb0\x80",7),"persisted CESU8 includes NUL and lone surrogates");free(out.text);
     check(direct("null",WEB_STORAGE_SESSION,WEB_STORAGE_CHECK,NULL,NULL,&out)==WEB_STORAGE_SECURITY,"opaque native origin denied");
     check(direct("https://wrong.invalid/../../data",WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"x","y",&out)==WEB_STORAGE_SECURITY,"no origin path injection");
-    char corrupt_origin[160];snprintf(corrupt_origin,sizeof corrupt_origin,"https://corrupt-%d-%llu.invalid",getpid(),(unsigned long long)uptime_ms());
+    char corrupt_origin[160];snprintf(corrupt_origin,sizeof corrupt_origin,"https://corrupt-%d-%llu.invalid",(int)n_app_self(),(unsigned long long)uptime_ms());
     check(direct(corrupt_origin,WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"key","one",&out)==WEB_STORAGE_OK,"snapshot generation one");
     check(webstorage_flush(store,true,&out)==WEB_STORAGE_OK,"flush generation one");
     check(direct(corrupt_origin,WEB_STORAGE_LOCAL,WEB_STORAGE_SET,"key","two",&out)==WEB_STORAGE_OK,"snapshot generation two");

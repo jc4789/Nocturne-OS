@@ -29,7 +29,7 @@ struct task {
     bool is_thread;
     bool exiting;
     bool joining;
-    struct task *process;     /* shared VM / descriptors / cwd / brk owner */
+    struct task *process;     /* shared VM / handles owner */
     uint64_t user_stack, user_stack_size;
     uint64_t wait_phys, wait_seq; /* address wait: physical key, FIFO order */
     unsigned trap_cpu;
@@ -42,7 +42,6 @@ struct task {
     struct file **fds;
     struct file *net_setup_cancel_file; /* thread-owned strong ref; never inherited */
     size_t fd_capacity,fd_hint;
-    char cwd[256];
     struct task *parent;
     struct vnode *app;        /* its handle record reports the end */
     bool app_launched;        /* by n_app_launch: no parent collects it */
@@ -55,7 +54,6 @@ struct task {
     struct task *wq_next;     /* wait queue */
     struct wait_queue *wq;
     struct wait_queue child_wait;
-    uint64_t brk_base, brk;
     uint64_t mmap_next;
     struct mmap_hole *mmap_holes; /* freed anonymous ranges below mmap_next, by address */
     /* The low region [low_base, USER_LOW_TOP): native memory reserved with
@@ -63,8 +61,6 @@ struct task {
     uint64_t low_base, low_next;
     struct mmap_hole *low_holes;
     struct shared_mapping *shared_mappings; /* native FD-backed page references */
-    struct shared_ticket *shared_tickets;   /* page references offered to a peer */
-    uint64_t shared_ticket_serial;
     uint64_t cpu_ms;
     uint64_t start_ms;
     unsigned sched_level;     /* 0=interactive, 3=CPU-bound; ready/wait policy is BSP-owned */

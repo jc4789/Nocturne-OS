@@ -53,7 +53,7 @@ static bool wait_idle(unsigned ms) {
 }
 static int children(void) {
     struct n_procinfo p[128]; int n = proclist(p, 128), count = 0;
-    for (int i = 0; i < n; i++) if (p[i].ppid == getpid() && strstr(p[i].name, "webfetch")) count++;
+    for (int i = 0; i < n; i++) if (p[i].ppid == (int)n_app_self() && strstr(p[i].name, "webfetch")) count++;
     return count;
 }
 static unsigned transports(void){return webnet_inflight(net);}
@@ -827,13 +827,10 @@ static void file_request(const char *url, const char *origin, enum webnet_kind k
     release(&r);
 }
 static void file_tests(void) {
-    mkdir("/home/webnet-fixture");
+    n_folder_create("/home/webnet-fixture");
     const char *paths[2] = {"/home/webnet-fixture/inside.js", "/home/webnet-outside.js"};
-    for (int i = 0; i < 2; i++) {
-        int fd = open(paths[i], O_CREAT | O_TRUNC | O_WRONLY);
-        check(fd >= 0 && write(fd, "// local-fixture\n", 17) == 17, "create local resource fixture");
-        if (fd >= 0) close(fd);
-    }
+    for (int i = 0; i < 2; i++)
+        check(n_document_save(paths[i], "// local-fixture\n", 17) == 0, "create local resource fixture");
     const char *origin = "file:///home/webnet-fixture/index.html";
     file_request("file:///home/webnet-fixture/%69nside.js", origin, WEBNET_MODULE, false, true, "local module within decoded document directory");
     file_request("file:///home/webnet-fixture/%2e%2e/webnet-outside.js", origin, WEBNET_RESOURCE, false, false, "encoded parent traversal is rejected");
@@ -1154,7 +1151,7 @@ static void paced_received(webnet *n,uint64_t id,uint64_t generation,const struc
 }
 static int setup_service_pid(void){
     struct n_procinfo tasks[256];int count=proclist(tasks,256);
-    for(int i=0;i<count;i++)if(tasks[i].ppid==getpid()&&strstr(tasks[i].name,"webfetch"))return tasks[i].pid;
+    for(int i=0;i<count;i++)if(tasks[i].ppid==(int)n_app_self()&&strstr(tasks[i].name,"webfetch"))return tasks[i].pid;
     return -1;
 }
 static int setup_service_threads(int service_pid,bool blocked_only){

@@ -91,7 +91,7 @@ void kmain_late(void) {
     /* its input, output and log are the console */
     char *settings[] = {"FOLDER=/home", "TERMINAL=0 1 2"};
     struct proc_launch l = {.argc = 1, .argv = argv, .setting_count = 2, .settings = settings,
-                            .handles = fds, .handle_count = 3, .cwd = "/home"};
+                            .handles = fds, .handle_count = 3};
     int pid = proc_launch("/bin/init", &l);
     if (pid < 0) kprintf("init: failed to start /bin/init (%d)\n", pid);
     if (con) vfs_close(con);

@@ -26,12 +26,7 @@
 
 #include "config.h"
 
-#if HAVE_UNISTD_H
-#include <unistd.h>
-#endif
-#if HAVE_IO_H
-#include <io.h>
-#endif
+#include <nocturne.h>
 #include <inttypes.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -176,10 +171,9 @@ static void check_color_terminal(void)
     } else {
 #if defined(_WIN32) && HAVE_SETCONSOLETEXTATTRIBUTE && HAVE_GETSTDHANDLE
         use_color = (con != INVALID_HANDLE_VALUE);
-#elif HAVE_ISATTY
-        use_color = (term && isatty(2));
 #else
-        use_color = 0;
+        /* handle 2 is this app's log output */
+        use_color = (term && n_terminal(2));
 #endif
     }
 
@@ -400,10 +394,8 @@ void av_log_default_callback(void* ptr, int level, const char* fmt, va_list vl)
     format_line(ptr, level, fmt, vl, part, &print_prefix, type);
     snprintf(line, sizeof(line), "%s%s%s%s", part[0].str, part[1].str, part[2].str, part[3].str);
 
-#if HAVE_ISATTY
     if (!is_atty)
-        is_atty = isatty(2) ? 1 : -1;
-#endif
+        is_atty = n_terminal(2) ? 1 : -1;
 
     if (print_prefix && (atomic_load_explicit(&av_log_flags, memory_order_relaxed) & AV_LOG_SKIP_REPEATED) && !strcmp(line, prev) &&
         *line && line[strlen(line) - 1] != '\r'){

@@ -307,15 +307,16 @@ const messagingBridge=(() => {
         }catch(error){cancelPost(reserved);throw error;}
     }
     function prepareWorker(message,transfers,child){
+        let attachments=0;
         try{
         const transferred=[],seen=[];
         for(let i=0;i<transfers.length;i++)if(portBrand(transfers[i])){const endpoint=check(transfers[i]).endpoint;for(let j=0;j<seen.length;j++)if(seen[j]===endpoint||seen[j]===endpoint?.peer)throw new DomError('Both ends cannot be exported together','DataCloneError');appendWorker(seen,endpoint);appendWorker(transferred,transfers[i]);}
-        const packet=cloneData.prepare({data:message,ports:transferred},transfers,'worker',child),receivers=[],metadata=[];
+        const packet=cloneData.prepare({data:message,ports:transferred},transfers,'worker',child),receivers=[],metadata=[];attachments=packet.attachments;
         for(let i=0;i<packet.tokens.length;i++){const token=packet.tokens[i];appendWorker(receivers,token?token.receiver:null);appendWorker(metadata,token?token.meta:null);}
-        const plan=cloneData.commitPlan(packet,receivers);define(plan,'generations',{value:[realm.generation],writable:true,enumerable:true,configurable:true});cloneData.validate(packet);return {packet:[packet.data,metadata],plan,tokens:packet.tokens};
-        }catch(error){apply(routeEach,workerRoutes,[(route,key)=>{if(!route.active)apply(routeDelete,workerRoutes,[key]);}]);throw error;}
+        const plan=cloneData.commitPlan(packet,receivers);define(plan,'generations',{value:[realm.generation],writable:true,enumerable:true,configurable:true});cloneData.validate(packet);const wire=[packet.data,metadata];if(attachments)appendWorker(wire,attachments);return {packet:wire,plan,tokens:packet.tokens,attachments};
+        }catch(error){if(attachments)host.sharedBufferDiscard(attachments);apply(routeEach,workerRoutes,[(route,key)=>{if(!route.active)apply(routeDelete,workerRoutes,[key]);}]);throw error;}
     }
-    function abortWorker(prepared){for(let i=0;i<prepared.tokens.length;i++){const token=prepared.tokens[i];if(token&&token.route&&!token.route.active)apply(routeDelete,workerRoutes,[token.route.key]);}}
+    function abortWorker(prepared){if(prepared.attachments)host.sharedBufferDiscard(prepared.attachments);for(let i=0;i<prepared.tokens.length;i++){const token=prepared.tokens[i];if(token&&token.route&&!token.route.active)apply(routeDelete,workerRoutes,[token.route.key]);}}
     function importWorker(wire,child){
         const metadata=wire[1],receivers=[],added=[];
         try{

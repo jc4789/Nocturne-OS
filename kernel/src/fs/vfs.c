@@ -277,17 +277,6 @@ int vfs_truncate(struct file *f, uint64_t size) {
     return error;
 }
 
-int64_t vfs_seek(struct file *f, int64_t off, int whence) {
-    if (f->vn->type != VT_FILE) return -N_ERR_WRONG_KIND;
-    int error = file_io_begin(f);
-    if (error) return error;
-    int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)f->off : (int64_t)f->vn->size;
-    int64_t n = base + off;
-    if (n >= 0) f->off = n;
-    file_io_end(f);
-    return n < 0 ? -N_ERR_INVALID : n;
-}
-
 static int vfs_lease_mode(struct file *f, bool acquire, bool blocking) {
     struct vnode *v = f->vn;
     if (v->type != VT_FILE) return -N_ERR_INVALID;
@@ -340,23 +329,6 @@ struct file *vfs_dup(struct file *f) {
     f->refs++;
     irq_restore(flags);
     return f;
-}
-
-int vfs_readdir(struct file *f, uint64_t idx, struct dirent *out) {
-    struct vnode *v = f->vn;
-    if (v->type != VT_DIR) return -N_ERR_NOT_FOLDER;
-    if (!v->ops->readdir) return 0;
-    return v->ops->readdir(v, idx, out);
-}
-
-int vfs_stat(const char *path, struct kstat *st) {
-    struct vnode *v = vfs_lookup(path);
-    if (!v) return -N_ERR_NOT_FOUND;
-    st->type = v->type;
-    st->size = v->size;
-    st->mtime = v->mtime;
-    st->mode = v->mode;
-    return 0;
 }
 
 int vfs_mkdir(const char *path) {
@@ -448,7 +420,7 @@ int vfs_kind(struct vnode *v) {
     switch (v->type) {
     case VT_FILE: return N_KIND_DOCUMENT;
     case VT_DIR: return N_KIND_FOLDER;
-    case VT_PIPE: case VT_CHANNEL: return N_KIND_CHANNEL;
+    case VT_CHANNEL: return N_KIND_CHANNEL;
     case VT_WINDOW: return N_KIND_WINDOW;
     case VT_SHARED: return N_KIND_SHARED;
     case VT_APP: return N_KIND_APP;

@@ -26,18 +26,18 @@
 #define CHANNEL 0
 #define INPUT_TOKEN 1u
 #define CLIENT_TOKEN (UINT64_C(0x43) << 56)
-struct client {struct client *next;n_handle channel;uint64_t token;uint32_t generation,watched;size_t references,in_flight;bool established,active,blocked,wants_output,readable;};
+struct client {struct client *next;n_handle channel;uint64_t token;uint32_t generation,watched;size_t references,in_flight;struct web_inbox inbox;bool established,active,blocked,wants_output,readable;};
 struct pending_load {struct pending_load*next;uint32_t id;struct client*client;};
-struct deferred {struct deferred *next;struct njw_header h;uint8_t *data;struct client*client;bool normalized;};
-struct outgoing {struct outgoing *next;struct njw_header h;uint8_t *data;struct client*client;};
+struct deferred {struct deferred *next;struct njw_header h;uint8_t *data;struct client*client;struct web_inbox inbox;bool normalized;};
+struct outgoing {struct outgoing *next;struct njw_header h;uint8_t *data;struct client*client;struct web_attachments attach;size_t attach_sent;};
 struct policy_violation {struct policy_violation *next;JSValue init;struct web_html_policy_rule *rule;};
-struct worker {JSRuntime *rt;JSContext *ctx;JSValue hooks;uint32_t generation,request,interrupt_ticks,next_shared_port;uint64_t until;bool closed,established,output_failed,policy_initialized,shared,had_client,need_start;struct deferred *head,*tail,*before_start,*before_start_tail;struct outgoing *output,*last_output;size_t queued,output_bytes,in_flight;uint32_t next_lease;struct broker_lease *leases;struct broker_pair *ports;struct client*clients,*current_client,*network_client;struct pending_load*loads;n_handle queue,probe;uint64_t next_client;uint32_t input_watched;const char*script_url;char*security_url;web_doc policy_doc;struct policy_violation *violations,*last_violation;int policy_status;};
+struct worker {JSRuntime *rt;JSContext *ctx;JSValue hooks;uint32_t generation,request,interrupt_ticks,next_shared_port;uint64_t until;bool closed,established,output_failed,policy_initialized,shared,had_client,need_start;struct deferred *head,*tail,*before_start,*before_start_tail;struct outgoing *output,*last_output;size_t queued,output_bytes,in_flight;uint32_t next_lease;struct broker_lease *leases;struct broker_pair *ports;struct client*clients,*current_client,*network_client;struct pending_load*loads;n_handle queue,probe;struct web_inbox inbox;uint64_t next_client;uint32_t input_watched;const char*script_url;char*security_url;web_doc policy_doc;struct policy_violation *violations,*last_violation;int policy_status;};
 struct output_publication {struct worker *worker;struct outgoing *packet;struct broker_pair *ports,*close_pair,*ack_pair;};
 static void output_link(void *opaque,void *packet){struct worker*w=opaque;struct outgoing*p=packet;size_t charge=sizeof p->h+p->h.bytes;if(p->client)p->client->in_flight+=charge;else w->in_flight+=charge;if(w->last_output)w->last_output->next=p;else w->output=p;w->last_output=p;}
-static void output_packet_free(struct worker*w,void *opaque){struct outgoing*p=opaque;if(p){if(p->client)p->client->references--;js_free(w->ctx,p->data);free(p);}}
+static void output_packet_free(struct worker*w,void *opaque){struct outgoing*p=opaque;if(p){if(p->client)p->client->references--;web_attachments_release(&p->attach);js_free(w->ctx,p->data);free(p);}}
 static void output_ports_free(struct worker*w,struct broker_pair*p){while(p){struct broker_pair*n=p->next;output_packet_free(w,p->held_close);output_packet_free(w,p->held_ack);if(p->client)((struct client*)p->client)->references--;free(p);p=n;}}
 static void output_ports_retire(struct worker*w){struct broker_pair **at=&w->ports;while(*at){struct broker_pair*p=*at;if(worker_port_retirable(p)){*at=p->next;if(p->client)((struct client*)p->client)->references--;free(p);}else at=&p->next;}}
-static void deferred_free(struct deferred*d){if(d->client)d->client->references--;free(d->data);free(d);}
+static void deferred_free(struct deferred*d){if(d->client)d->client->references--;web_inbox_close(&d->inbox);free(d->data);free(d);}
 static void output_publish(void *opaque){
     struct output_publication*t=opaque;struct worker*w=t->worker;struct outgoing*p=t->packet;
     while(t->ports){struct broker_pair*pair=t->ports;t->ports=pair->next;pair->next=w->ports;w->ports=pair;}
@@ -66,6 +66,11 @@ static void output_flush(struct worker*w){size_t budget=16384;struct outgoing**a
     while(*at&&budget){struct outgoing*p=*at;struct client*c=p->client;if(w->shared&&c&&c->blocked){at=&p->next;continue;}
         if(w->shared&&(!c||!c->active)){output_unlink(w,at,p);continue;}
         n_handle h=w->shared?c->channel:CHANNEL;if(!sendable(w,h)){if(!w->shared)break;c->blocked=true;at=&p->next;continue;}
+        /* A shared region goes first as a bare carrier message, one per
+           attachment, each step checked for room; the payload follows. */
+        if(p->attach_sent<p->attach.count){struct njw_header carrier={NJW_MAGIC,NJW_ATTACH,p->h.generation,0,0,0};
+            if(n_channel_send(h,&carrier,sizeof carrier,web_attachments_handle(&p->attach,p->attach_sent))<0){if(!w->shared){w->closed=w->output_failed=true;break;}shared_disconnect(w,c);continue;}
+            p->attach_sent++;budget-=sizeof carrier<budget?sizeof carrier:budget;continue;}
         size_t size=sizeof p->h+p->h.bytes;uint8_t*record=malloc(size);if(!record){w->closed=w->output_failed=true;break;}
         memcpy(record,&p->h,sizeof p->h);memcpy(record+sizeof p->h,p->data,p->h.bytes);n_result sent=n_channel_send(h,record,size,-1);free(record);
         if(sent<0){if(!w->shared){w->closed=w->output_failed=true;break;}shared_disconnect(w,c);continue;}
@@ -73,15 +78,22 @@ static void output_flush(struct worker*w){size_t budget=16384;struct outgoing**a
     }w->last_output=NULL;for(struct outgoing*p=w->output;p;p=p->next)w->last_output=p;
 }
 /* The next whole record on h, or NULL: none waits yet, or (*failed) h has
- * gone or sent a malformed or unrepresentable record. */
-static struct deferred *record_receive(struct worker*w,n_handle h,bool*failed){
+ * gone or sent a malformed or unrepresentable record. A bare header in front
+ * of it is an attachment carrier: its handle waits in inbox and goes to the
+ * record that follows. */
+static struct deferred *record_receive(struct worker*w,n_handle h,struct web_inbox*inbox,bool*failed){
+    for(;;){
     n_result size=n_channel_receive(h,NULL,0,N_CHANNEL_PEEK,NULL);if(size==-N_ERR_NOT_READY)return NULL;
+    if(size==(n_result)sizeof(struct njw_header)){struct njw_header carrier;n_handle attached=-1;
+        if(n_channel_receive(h,&carrier,sizeof carrier,0,&attached)!=size||carrier.magic!=NJW_MAGIC||carrier.op!=NJW_ATTACH||carrier.bytes||attached<0||!web_inbox_add(inbox,attached)){if(attached>=0)n_handle_close(attached);*failed=true;return NULL;}
+        continue;}
     struct deferred*d=NULL;uint8_t*bytes=NULL;size_t payload=size>0?(size_t)size-sizeof d->h:0;
     if(size<0||(size_t)size<=sizeof d->h||payload>NJW_MAX_BYTES||payload>SIZE_MAX-w->queued)goto bad;
     if(!(d=calloc(1,sizeof*d))||!(bytes=malloc((size_t)size))||n_channel_receive(h,bytes,(size_t)size,0,NULL)!=size)goto bad;
     memcpy(&d->h,bytes,sizeof d->h);if(d->h.bytes!=payload)goto bad;
-    memmove(bytes,bytes+sizeof d->h,payload);d->data=bytes;return d;
+    memmove(bytes,bytes+sizeof d->h,payload);d->data=bytes;d->inbox=*inbox;*inbox=(struct web_inbox){0};return d;
 bad:free(bytes);free(d);*failed=true;return NULL;
+    }
 }
 /* Wait on the page channel and Atomics.waitAsync words: a record, room for
  * output, the page leaving or the timeout. False when the wait failed. */
@@ -101,7 +113,7 @@ static bool send_value(struct worker*w,unsigned op,unsigned request,unsigned kin
     return send_client(w,c,op,request,kind,value);
 }
 static struct deferred *receive(struct worker *w,bool*failed){
-    struct deferred *d=record_receive(w,CHANNEL,failed);if(!d)return NULL;
+    struct deferred *d=record_receive(w,CHANNEL,&w->inbox,failed);if(!d)return NULL;
     if(d->h.magic!=NJW_MAGIC||
        ((d->h.op==NJW_PORT_MESSAGE||d->h.op==NJW_PORT_CLOSE||d->h.op==NJW_PORT_DRAINED)?d->h.kind>1:d->h.op==NJW_CONNECT?d->h.kind!=NJW_WITH_PORTS:d->h.op==NJW_MESSAGE?(d->h.kind!=0&&d->h.kind!=NJW_WITH_PORTS):d->h.op==NJW_LOADED?!njw_loaded_kind_valid(d->h.kind):d->h.kind!=0)||
        (d->h.op!=NJW_START&&d->h.op!=NJW_MESSAGE&&d->h.op!=NJW_CONNECT&&d->h.op!=NJW_LOADED&&d->h.op!=NJW_CREDIT&&d->h.op!=NJW_PORT_MESSAGE&&d->h.op!=NJW_PORT_CLOSE&&d->h.op!=NJW_PORT_DRAINED)||(w->established&&d->h.generation!=w->generation)||(!w->established&&d->h.op!=NJW_START)){deferred_free(d);*failed=true;return NULL;}
@@ -122,7 +134,7 @@ static void shared_restart_source(struct worker*w){
     JSValue url=JS_NewString(w->ctx,w->script_url?w->script_url:"");if(!send_value(w,NJW_LOAD,0,0,url))w->closed=w->output_failed=true;else w->need_start=false;JS_FreeValue(w->ctx,url);
 }
 static void shared_disconnect(struct worker*w,struct client*c){
-    if(!c||!c->active)return;c->active=false;n_handle_close(c->channel);c->channel=-1;c->watched=0;
+    if(!c||!c->active)return;c->active=false;n_handle_close(c->channel);c->channel=-1;c->watched=0;web_inbox_close(&c->inbox);
     if(w->network_client==c){w->network_client=NULL;for(struct client*p=w->clients;p;p=p->next)if(p->active&&p->established){w->network_client=p;break;}}
     struct pending_load**at=&w->loads;while(*at){struct pending_load*p=*at;if(p->client!=c){at=&p->next;continue;}*at=p->next;
         JSValue a=JS_NewArray(w->ctx);bool ok=!JS_IsException(a);
@@ -136,7 +148,7 @@ static void shared_disconnect(struct worker*w,struct client*c){
     else if(!w->policy_initialized){w->need_start=true;shared_restart_source(w);}
 }
 static void shared_collect(struct worker*w){
-    struct client**at=&w->clients;while(*at){struct client*c=*at;if(c->active||c->references||w->current_client==c||w->network_client==c){at=&c->next;continue;}*at=c->next;free(c);}
+    struct client**at=&w->clients;while(*at){struct client*c=*at;if(c->active||c->references||w->current_client==c||w->network_client==c){at=&c->next;continue;}*at=c->next;web_inbox_close(&c->inbox);free(c);}
 }
 static bool shared_header_valid(const struct njw_header*h){
     bool port=h->op==NJW_PORT_MESSAGE||h->op==NJW_PORT_CLOSE||h->op==NJW_PORT_DRAINED;
@@ -191,7 +203,7 @@ static struct deferred*shared_receive(struct worker*w,int timeout){
     if(output||(all&&w->output))output_flush(w);
     size_t budget=65536;
     for(struct client*c=w->clients;c&&budget&&!w->closed;c=c->next){if(!c->active||!(c->readable||all))continue;
-        while(c->active&&budget){bool failed=false;struct deferred*d=record_receive(w,c->channel,&failed);
+        while(c->active&&budget){bool failed=false;struct deferred*d=record_receive(w,c->channel,&c->inbox,&failed);
             if(!d){if(failed)shared_disconnect(w,c);else c->readable=false;break;}
             budget-=sizeof d->h+d->h.bytes<budget?sizeof d->h+d->h.bytes:budget;
             if(!shared_header_valid(&d->h)||(c->established&&d->h.generation!=c->generation)){deferred_free(d);shared_disconnect(w,c);break;}
@@ -401,12 +413,14 @@ static JSValue native_port_send(JSContext *ctx,JSValueConst self,int argc,JSValu
     if(op==NJW_MESSAGE){if(capture)return JS_ThrowTypeError(ctx,"Capture requires a Port message");if(!worker_port_metadata(ctx,argv[3],1,w->ports,UINT32_MAX,&ports))return JS_EXCEPTION;}
     else {pair=worker_port_find(w->ports,id,creator);struct broker_lease*l=w->leases;while(l&&l->id!=capture)l=l->next;bool pinned=capture&&l&&l->port==id&&l->creator==creator;
         if(!pair||(capture&&(!pinned||op!=NJW_PORT_MESSAGE))||(op==NJW_PORT_MESSAGE?(!pinned&&pair->closed):pair->closed))return JS_ThrowTypeError(ctx,"Worker port is closed, unknown or capture is invalid");}
-    size_t length=0;uint8_t*data=JS_WriteObject(ctx,&length,argv[3],JS_WRITE_OBJ_REFERENCE);if(!data){output_ports_free(w,ports);return JS_EXCEPTION;}
-    if(length>NJW_MAX_BYTES||length>SIZE_MAX-sizeof(struct njw_header)||length+sizeof(struct njw_header)>SIZE_MAX-w->output_bytes){js_free(ctx,data);output_ports_free(w,ports);return JS_ThrowRangeError(ctx,"Worker broker output accounting overflow");}
-    struct outgoing*p=calloc(1,sizeof*p);if(!p){js_free(ctx,data);output_ports_free(w,ports);return JS_ThrowOutOfMemory(ctx);}p->data=data;p->client=w->shared?pair->client:NULL;p->h=(struct njw_header){NJW_MAGIC,op,p->client?p->client->generation:w->generation,w->shared?pair->client_id:id,op==NJW_MESSAGE?NJW_WITH_PORTS:creator,(uint32_t)length};
-    if(!output_wait(w,p->client,sizeof p->h+length)){js_free(ctx,data);free(p);output_ports_free(w,ports);return JS_ThrowTypeError(ctx,"Worker transport ended or its task deadline expired before publication");}
+    /* Shared regions of the message travel as attachments ahead of it. */
+    struct web_attachments attached={0};if(op==NJW_MESSAGE&&!web_attachments_extract(ctx,argv[3],&attached)){output_ports_free(w,ports);return JS_EXCEPTION;}
+    size_t length=0;uint8_t*data=JS_WriteObject(ctx,&length,argv[3],JS_WRITE_OBJ_REFERENCE);if(!data){web_attachments_release(&attached);output_ports_free(w,ports);return JS_EXCEPTION;}
+    if(length>NJW_MAX_BYTES||length>SIZE_MAX-sizeof(struct njw_header)||length+sizeof(struct njw_header)>SIZE_MAX-w->output_bytes){js_free(ctx,data);web_attachments_release(&attached);output_ports_free(w,ports);return JS_ThrowRangeError(ctx,"Worker broker output accounting overflow");}
+    struct outgoing*p=calloc(1,sizeof*p);if(!p){js_free(ctx,data);web_attachments_release(&attached);output_ports_free(w,ports);return JS_ThrowOutOfMemory(ctx);}p->data=data;p->attach=attached;p->client=w->shared?pair->client:NULL;p->h=(struct njw_header){NJW_MAGIC,op,p->client?p->client->generation:w->generation,w->shared?pair->client_id:id,op==NJW_MESSAGE?NJW_WITH_PORTS:creator,(uint32_t)length};
+    if(!output_wait(w,p->client,sizeof p->h+length)){js_free(ctx,data);web_attachments_release(&p->attach);free(p);output_ports_free(w,ports);return JS_ThrowTypeError(ctx,"Worker transport ended or its task deadline expired before publication");}
     struct output_publication t={w,p,ports,op==NJW_PORT_CLOSE?pair:NULL,NULL};JSValue r=worker_transfer_commit_publish(ctx,argv[4],!w->closed,output_publish,&t);
-    if(JS_IsException(r)){js_free(ctx,data);free(p);output_ports_free(w,ports);}else{
+    if(JS_IsException(r)){js_free(ctx,data);web_attachments_release(&p->attach);free(p);output_ports_free(w,ports);}else{
         output_flush(w);
         /* A record larger than one copy quantum must keep progressing even
          * when the sender next enters an endless pure-JS loop. This native
@@ -629,7 +643,7 @@ int main(int argc,char**argv){
         bool received_task=d!=NULL;
         /* The running JS task holds current_client until its checkpoint; the
          * packet's ownership pin is released exactly once by deferred_free. */
-        if(d){w.current_client=d->client;bool allowed=!w.shared||shared_incoming(&w,d);JSValue value=allowed?JS_ReadObject(w.ctx,d->data,d->h.bytes,JS_READ_OBJ_REFERENCE):JS_UNDEFINED;if(JS_IsException(value))exception(&w);else if(allowed&&!native_port_receive(&w,&d->h,value)){JS_FreeValue(w.ctx,value);if(JS_HasException(w.ctx))exception(&w);}else if(allowed){JSValue result;if(d->h.op==NJW_LOADED){JSValue args[]={JS_NewUint32(w.ctx,d->h.request),value,JS_NewUint32(w.ctx,d->h.kind)};result=hook(&w,"loaded",3,args);JS_FreeValue(w.ctx,args[0]);JS_FreeValue(w.ctx,args[2]);}else if(d->h.op==NJW_START)result=worker_policy_start(&w,value)?hook(&w,"start",1,&value):JS_EXCEPTION;else{JSValue args[]={value,JS_NewUint32(w.ctx,d->h.op),JS_NewUint32(w.ctx,d->h.request),JS_NewUint32(w.ctx,d->h.kind)};result=hook(&w,"receive",4,args);for(unsigned i=1;i<4;i++)JS_FreeValue(w.ctx,args[i]);}if(JS_IsException(result)){exception(&w);if(d->h.op==NJW_START){send_value(&w,NJW_CLOSE,0,0,JS_NULL);w.closed=true;}}else if(w.shared&&d->h.op==NJW_START){if(w.before_start){if(w.tail)w.tail->next=w.before_start;else w.head=w.before_start;w.tail=w.before_start_tail;w.before_start=w.before_start_tail=NULL;}}JS_FreeValue(w.ctx,result);JS_FreeValue(w.ctx,value);}deferred_free(d);w.current_client=NULL;}
+        if(d){w.current_client=d->client;bool allowed=!w.shared||shared_incoming(&w,d);JSValue value=allowed?JS_ReadObject(w.ctx,d->data,d->h.bytes,JS_READ_OBJ_REFERENCE):JS_UNDEFINED;if(JS_IsException(value))exception(&w);else if(allowed&&!native_port_receive(&w,&d->h,value)){JS_FreeValue(w.ctx,value);if(JS_HasException(w.ctx))exception(&w);}else if(allowed){JSValue result;if(d->h.op==NJW_LOADED){JSValue args[]={JS_NewUint32(w.ctx,d->h.request),value,JS_NewUint32(w.ctx,d->h.kind)};result=hook(&w,"loaded",3,args);JS_FreeValue(w.ctx,args[0]);JS_FreeValue(w.ctx,args[2]);}else if(d->h.op==NJW_START)result=worker_policy_start(&w,value)?hook(&w,"start",1,&value):JS_EXCEPTION;else{JSValue args[]={value,JS_NewUint32(w.ctx,d->h.op),JS_NewUint32(w.ctx,d->h.request),JS_NewUint32(w.ctx,d->h.kind)};web_atomics_import_begin(&d->inbox);result=hook(&w,"receive",4,args);web_atomics_import_end();for(unsigned i=1;i<4;i++)JS_FreeValue(w.ctx,args[i]);}if(JS_IsException(result)){exception(&w);if(d->h.op==NJW_START){send_value(&w,NJW_CLOSE,0,0,JS_NULL);w.closed=true;}}else if(w.shared&&d->h.op==NJW_START){if(w.before_start){if(w.tail)w.tail->next=w.before_start;else w.head=w.before_start;w.tail=w.before_start_tail;w.before_start=w.before_start_tail=NULL;}}JS_FreeValue(w.ctx,result);JS_FreeValue(w.ctx,value);}deferred_free(d);w.current_client=NULL;}
         /* Finish the received task's microtasks before a local port/timer task. */
         if(received_task){jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}
         /* Atomics.waitAsync settlements are tasks of their own. */
@@ -641,5 +655,5 @@ shutdown:
     html_policy_free(&w.policy_doc);free(w.policy_doc.url);free(w.security_url);
     while(w.output){struct outgoing*p=w.output;w.output=p->next;output_packet_free(&w,p);}
     web_js_wasm_cancel(w.ctx);
-    while(w.head){struct deferred*d=w.head;w.head=d->next;deferred_free(d);}while(w.before_start){struct deferred*d=w.before_start;w.before_start=d->next;deferred_free(d);}output_ports_free(&w,w.ports);while(w.leases){struct broker_lease*l=w.leases;w.leases=l->next;free(l);}while(w.loads){struct pending_load*p=w.loads;w.loads=p->next;if(p->client)p->client->references--;free(p);}while(w.clients){struct client*c=w.clients;w.clients=c->next;if(c->active)n_handle_close(c->channel);free(c);}if(w.probe>=0)n_handle_close(w.probe);while(rejections){struct rejection*r=rejections;rejections=r->next;rejection_free(w.ctx,r);}JS_FreeValue(w.ctx,w.hooks);web_atomics_release(w.ctx);web_opfs_release(w.ctx);JS_FreeContext(w.ctx);JS_FreeRuntime(w.rt);return 0;
+    while(w.head){struct deferred*d=w.head;w.head=d->next;deferred_free(d);}while(w.before_start){struct deferred*d=w.before_start;w.before_start=d->next;deferred_free(d);}output_ports_free(&w,w.ports);while(w.leases){struct broker_lease*l=w.leases;w.leases=l->next;free(l);}while(w.loads){struct pending_load*p=w.loads;w.loads=p->next;if(p->client)p->client->references--;free(p);}while(w.clients){struct client*c=w.clients;w.clients=c->next;if(c->active)n_handle_close(c->channel);web_inbox_close(&c->inbox);free(c);}web_inbox_close(&w.inbox);if(w.probe>=0)n_handle_close(w.probe);while(rejections){struct rejection*r=rejections;rejections=r->next;rejection_free(w.ctx,r);}JS_FreeValue(w.ctx,w.hooks);web_atomics_release(w.ctx);web_opfs_release(w.ctx);JS_FreeContext(w.ctx);JS_FreeRuntime(w.rt);return 0;
 }

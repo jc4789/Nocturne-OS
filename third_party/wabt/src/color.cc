@@ -23,6 +23,8 @@
 #if HAVE_WIN32_VT100
 #include <io.h>
 #include <windows.h>
+#elif WABT_NOCTURNE
+#include <nocturne.h>
 #elif HAVE_UNISTD_H
 #include <unistd.h>
 #endif
@@ -57,6 +59,13 @@ bool Color::SupportsColor(FILE* file) {
   }
   return true;
   // TODO(binji): Support older Windows by using SetConsoleTextAttribute?
+
+#elif WABT_NOCTURNE
+
+  // An app's output and log are handles 1 and 2.
+  if (file == stdout) return n_terminal(1);
+  if (file == stderr) return n_terminal(2);
+  return false;
 
 #elif HAVE_UNISTD_H
 

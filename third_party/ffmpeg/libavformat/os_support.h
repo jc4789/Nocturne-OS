@@ -29,8 +29,6 @@
 
 #include "config.h"
 
-#include <sys/stat.h>
-
 #ifdef _WIN32
 #if HAVE_DIRECT_H
 #include <direct.h>

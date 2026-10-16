@@ -69,7 +69,7 @@ int main(int argc,char **argv) {
         if (check_client(pixels,gw,gw,gh,16,x,y)) goto cleanup;
     }
     /* Reallocation frees the previous source immediately after join. */
-    long address=__syscall(SYS_WIN_RESIZE,wins[15]->fd,width-37,height-29,0,0);
+    long address=__syscall(SYS_WIN_RESIZE,wins[15]->handle,width-37,height-29,0,0);
     if (address<0) goto cleanup;
     wins[15]->w=width-37;wins[15]->h=height-29;
     gfx_init(&wins[15]->c,(uint32_t *)address,wins[15]->w,wins[15]->h,wins[15]->w);

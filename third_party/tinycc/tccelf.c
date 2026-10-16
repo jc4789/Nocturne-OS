@@ -1735,15 +1735,13 @@ static void tcc_tcov_add_file(TCCState *s1, const char *filename)
     write32le (tcov_section->data, tcov_section->data_offset);
 
     cstr_new (&cstr);
-    if (filename[0] == '/')
-        cstr_printf (&cstr, "%s.tcov", filename);
-    else {
-        getcwd (wd, sizeof(wd));
-        cstr_printf (&cstr, "%s/%s.tcov", wd, filename);
-    }
+    /* the complete path, relative names being taken inside the launch folder */
+    if (n_path_complete(filename, wd, sizeof(wd)) < 0)
+        pstrcpy(wd, sizeof(wd), filename);
+    cstr_printf (&cstr, "%s.tcov", wd);
     ptr = section_ptr_add(tcov_section, cstr.size + 1);
     strcpy((char *)ptr, cstr.data);
-    unlink((char *)ptr);
+    n_entry_remove((char *)ptr);
 #ifdef _WIN32
     normalize_slashes((char *)ptr);
 #endif
@@ -2817,17 +2815,11 @@ static int tcc_output_binary(TCCState *s1, FILE *f)
 static int tcc_write_elf_file(TCCState *s1, const char *filename, int phnum,
                               ElfW(Phdr) *phdr)
 {
-    int fd, mode, file_type, ret;
+    int ret;
     FILE *f;
 
-    file_type = s1->output_type;
-    if (file_type == TCC_OUTPUT_OBJ)
-        mode = 0666;
-    else
-        mode = 0777;
-    unlink(filename);
-    fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, mode);
-    if (fd < 0 || (f = fdopen(fd, "wb")) == NULL)
+    /* Nocturne has no executable permission bit: any program document can run */
+    if ((f = fopen(filename, "wb")) == NULL)
         return tcc_error_noabort("could not write '%s: %s'", filename, strerror(errno));
     if (s1->verbose)
         printf("<- %s\n", filename);
@@ -3236,25 +3228,27 @@ LIBTCCAPI int tcc_output_file(TCCState *s, const char *filename)
 #endif
 }
 
-ST_FUNC ssize_t full_read(int fd, void *buf, size_t count) {
+/* Read until 'count' bytes or the end of the file; the bytes read, or negative. */
+ST_FUNC int64_t full_read(TCCInput *in, void *buf, size_t count) {
     char *cbuf = buf;
     size_t rnum = 0;
-    while (1) {
-        ssize_t num = read(fd, cbuf, count-rnum);
+    while (rnum < count) {
+        int64_t num = tcc_input_read(in, cbuf, count-rnum);
         if (num < 0) return num;
-        if (num == 0) return rnum;
+        if (num == 0) break;
         rnum += num;
         cbuf += num;
     }
+    return rnum;
 }
 
-ST_FUNC void *load_data(int fd, unsigned long file_offset, unsigned long size)
+ST_FUNC void *load_data(TCCInput *in, unsigned long file_offset, unsigned long size)
 {
     void *data;
 
     data = tcc_malloc(size);
-    lseek(fd, file_offset, SEEK_SET);
-    full_read(fd, data, size);
+    in->offset = file_offset;
+    full_read(in, data, size);
     return data;
 }
 
@@ -3265,9 +3259,9 @@ typedef struct SectionMergeInfo {
     uint8_t link_once;         /* true if link once section */
 } SectionMergeInfo;
 
-ST_FUNC int tcc_object_type(int fd, ElfW(Ehdr) *h)
+ST_FUNC int tcc_object_type(TCCInput *in, ElfW(Ehdr) *h)
 {
-    int size = full_read(fd, h, sizeof *h);
+    int size = full_read(in, h, sizeof *h);
     if (size == sizeof *h && 0 == memcmp(h, ELFMAG, 4)) {
         if (h->e_type == ET_REL)
             return AFF_BINTYPE_REL;
@@ -3287,7 +3281,7 @@ ST_FUNC int tcc_object_type(int fd, ElfW(Ehdr) *h)
 /* load an object file and merge it with current files */
 /* XXX: handle correctly stab (debug) info */
 ST_FUNC int tcc_load_object_file(TCCState *s1,
-                                int fd, unsigned long file_offset)
+                                TCCInput *in, unsigned long file_offset)
 {
     ElfW(Ehdr) ehdr;
     ElfW(Shdr) *shdr, *sh;
@@ -3302,8 +3296,8 @@ ST_FUNC int tcc_load_object_file(TCCState *s1,
     ElfW_Rel *rel;
     Section *s;
 
-    lseek(fd, file_offset, SEEK_SET);
-    if (tcc_object_type(fd, &ehdr) != AFF_BINTYPE_REL)
+    in->offset = file_offset;
+    if (tcc_object_type(in, &ehdr) != AFF_BINTYPE_REL)
         goto invalid;
     /* test CPU specific stuff */
     if (ehdr.e_ident[5] != ELFDATA2LSB ||
@@ -3312,13 +3306,13 @@ invalid:
         return tcc_error_noabort("invalid object file");
     }
     /* read sections */
-    shdr = load_data(fd, file_offset + ehdr.e_shoff,
+    shdr = load_data(in, file_offset + ehdr.e_shoff,
                      sizeof(ElfW(Shdr)) * ehdr.e_shnum);
     sm_table = tcc_mallocz(sizeof(SectionMergeInfo) * ehdr.e_shnum);
 
     /* load section names */
     sh = &shdr[ehdr.e_shstrndx];
-    strsec = load_data(fd, file_offset + sh->sh_offset, sh->sh_size);
+    strsec = load_data(in, file_offset + sh->sh_offset, sh->sh_size);
 
     /* load symtab and strtab */
     old_to_new_syms = NULL;
@@ -3337,12 +3331,12 @@ invalid:
                 goto the_end;
             }
             nb_syms = sh->sh_size / sizeof(ElfW(Sym));
-            symtab = load_data(fd, file_offset + sh->sh_offset, sh->sh_size);
+            symtab = load_data(in, file_offset + sh->sh_offset, sh->sh_size);
             sm_table[i].s = symtab_section;
 
             /* now load strtab */
             sh = &shdr[sh->sh_link];
-            strtab = load_data(fd, file_offset + sh->sh_offset, sh->sh_size);
+            strtab = load_data(in, file_offset + sh->sh_offset, sh->sh_size);
         }
 	if (sh->sh_flags & SHF_COMPRESSED)
 	    seencompressed = 1;
@@ -3440,9 +3434,9 @@ invalid:
         /* concatenate sections */
         if (sh->sh_type != SHT_NOBITS && size) {
             unsigned char *ptr;
-            lseek(fd, file_offset + sh->sh_offset, SEEK_SET);
+            in->offset = file_offset + sh->sh_offset;
             ptr = s->data + offset;
-            full_read(fd, ptr, size);
+            full_read(in, ptr, size);
         }
 #if defined TCC_TARGET_ARM || defined TCC_TARGET_ARM64 || defined TCC_TARGET_RISCV64
         /* align code sections to instruction lenght */
@@ -3614,12 +3608,12 @@ static unsigned long long get_be(const uint8_t *b, int n)
     return ret;
 }
 
-static int read_ar_header(int fd, int offset, ArchiveHeader *hdr)
+static int read_ar_header(TCCInput *in, int offset, ArchiveHeader *hdr)
 {
     char *p, *e;
     int len;
-    lseek(fd, offset, SEEK_SET);
-    len = full_read(fd, hdr, sizeof(ArchiveHeader));
+    in->offset = offset;
+    len = full_read(in, hdr, sizeof(ArchiveHeader));
     if (len != sizeof(ArchiveHeader))
         return len ? -1 : 0;
     if (memcmp(hdr->ar_fmag, ARFMAG, sizeof hdr->ar_fmag))
@@ -3633,7 +3627,7 @@ static int read_ar_header(int fd, int offset, ArchiveHeader *hdr)
 }
 
 /* load only the objects which resolve undefined symbols */
-static int tcc_load_alacarte(TCCState *s1, int fd, int size, int entrysize)
+static int tcc_load_alacarte(TCCState *s1, TCCInput *in, int size, int entrysize)
 {
     int i, bound, nsyms, sym_index, len, ret = -1;
     unsigned long long off;
@@ -3644,7 +3638,7 @@ static int tcc_load_alacarte(TCCState *s1, int fd, int size, int entrysize)
     ArchiveHeader hdr;
 
     data = tcc_malloc(size);
-    if (full_read(fd, data, size) != size)
+    if (full_read(in, data, size) != size)
         goto invalid;
     nsyms = get_be(data, entrysize);
     ar_index = data + entrysize;
@@ -3661,7 +3655,7 @@ static int tcc_load_alacarte(TCCState *s1, int fd, int size, int entrysize)
             if(sym->st_shndx != SHN_UNDEF)
                 continue;
             off = get_be(ar_index + i * entrysize, entrysize);
-            len = read_ar_header(fd, off, &hdr);
+            len = read_ar_header(in, off, &hdr);
             if (len <= 0 || memcmp(hdr.ar_fmag, ARFMAG, 2)) {
         invalid:
                 tcc_error_noabort("invalid archive");
@@ -3670,7 +3664,7 @@ static int tcc_load_alacarte(TCCState *s1, int fd, int size, int entrysize)
             off += len;
             if (s1->verbose == 2)
                 printf("   -> %s\n", hdr.ar_name);
-            if (tcc_load_object_file(s1, fd, off) < 0)
+            if (tcc_load_object_file(s1, in, off) < 0)
                 goto the_end;
             ++bound;
         }
@@ -3682,7 +3676,7 @@ static int tcc_load_alacarte(TCCState *s1, int fd, int size, int entrysize)
 }
 
 /* load a '.a' file */
-ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte)
+ST_FUNC int tcc_load_archive(TCCState *s1, TCCInput *in, int alacarte)
 {
     ArchiveHeader hdr;
     /* char magic[8]; */
@@ -3691,11 +3685,11 @@ ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte)
     ElfW(Ehdr) ehdr;
 
     /* skip magic which was already checked */
-    /* full_read(fd, magic, sizeof(magic)); */
+    /* full_read(in, magic, sizeof(magic)); */
     file_offset = sizeof ARMAG - 1;
 
     for(;;) {
-        len = read_ar_header(fd, file_offset, &hdr);
+        len = read_ar_header(in, file_offset, &hdr);
         if (len == 0)
             return 0;
         if (len < 0)
@@ -3705,13 +3699,13 @@ ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte)
         if (alacarte) {
             /* coff symbol table : we handle it */
             if (!strcmp(hdr.ar_name, "/"))
-                return tcc_load_alacarte(s1, fd, size, 4);
+                return tcc_load_alacarte(s1, in, size, 4);
             if (!strcmp(hdr.ar_name, "/SYM64/"))
-                return tcc_load_alacarte(s1, fd, size, 8);
-        } else if (tcc_object_type(fd, &ehdr) == AFF_BINTYPE_REL) {
+                return tcc_load_alacarte(s1, in, size, 8);
+        } else if (tcc_object_type(in, &ehdr) == AFF_BINTYPE_REL) {
             if (s1->verbose == 2)
                 printf("   -> %s\n", hdr.ar_name);
-            if (tcc_load_object_file(s1, fd, file_offset) < 0)
+            if (tcc_load_object_file(s1, in, file_offset) < 0)
                 return -1;
         }
         /* align to even */
@@ -3854,7 +3848,7 @@ static void store_version(TCCState *s1, struct versym_info *v, char *dynstr)
 /* load a library / DLL
    'level = 0' means that the DLL is referenced by the user
    (so it should be added as DT_NEEDED in the generated ELF file) */
-ST_FUNC int tcc_load_dll(TCCState *s1, int fd, const char *filename, int level)
+ST_FUNC int tcc_load_dll(TCCState *s1, TCCInput *in, const char *filename, int level)
 {
     ElfW(Ehdr) ehdr;
     ElfW(Shdr) *shdr, *sh, *sh1;
@@ -3867,7 +3861,7 @@ ST_FUNC int tcc_load_dll(TCCState *s1, int fd, const char *filename, int level)
     const char *name, *soname;
     struct versym_info v;
 
-    full_read(fd, &ehdr, sizeof(ehdr));
+    full_read(in, &ehdr, sizeof(ehdr));
 
     /* test CPU specific stuff */
     if (ehdr.e_ident[5] != ELFDATA2LSB ||
@@ -3876,7 +3870,7 @@ ST_FUNC int tcc_load_dll(TCCState *s1, int fd, const char *filename, int level)
     }
 
     /* read sections */
-    shdr = load_data(fd, ehdr.e_shoff, sizeof(ElfW(Shdr)) * ehdr.e_shnum);
+    shdr = load_data(in,ehdr.e_shoff, sizeof(ElfW(Shdr)) * ehdr.e_shnum);
 
     /* load dynamic section and dynamic symbols */
     nb_syms = 0;
@@ -3890,23 +3884,23 @@ ST_FUNC int tcc_load_dll(TCCState *s1, int fd, const char *filename, int level)
         switch(sh->sh_type) {
         case SHT_DYNAMIC:
             nb_dts = sh->sh_size / sizeof(ElfW(Dyn));
-            dynamic = load_data(fd, sh->sh_offset, sh->sh_size);
+            dynamic = load_data(in,sh->sh_offset, sh->sh_size);
             break;
         case SHT_DYNSYM:
             nb_syms = sh->sh_size / sizeof(ElfW(Sym));
-            dynsym = load_data(fd, sh->sh_offset, sh->sh_size);
+            dynsym = load_data(in,sh->sh_offset, sh->sh_size);
             sh1 = &shdr[sh->sh_link];
-            dynstr = load_data(fd, sh1->sh_offset, sh1->sh_size);
+            dynstr = load_data(in,sh1->sh_offset, sh1->sh_size);
             break;
         case SHT_GNU_verdef:
-	    v.verdef = load_data(fd, sh->sh_offset, sh->sh_size);
+	    v.verdef = load_data(in,sh->sh_offset, sh->sh_size);
 	    break;
         case SHT_GNU_verneed:
-	    v.verneed = load_data(fd, sh->sh_offset, sh->sh_size);
+	    v.verneed = load_data(in,sh->sh_offset, sh->sh_size);
 	    break;
         case SHT_GNU_versym:
             v.nb_versyms = sh->sh_size / sizeof(ElfW(Half));
-	    v.versym = load_data(fd, sh->sh_offset, sh->sh_size);
+	    v.versym = load_data(in,sh->sh_offset, sh->sh_size);
 	    break;
         default:
             break;
@@ -4180,14 +4174,14 @@ repeat:
 
 /* interpret a subset of GNU ldscripts to handle the dummy libc.so
    files */
-ST_FUNC int tcc_load_ldscript(TCCState *s1, int fd)
+ST_FUNC int tcc_load_ldscript(TCCState *s1, TCCInput *in)
 {
     char cmd[64];
     int t, ret = 0, noscript = 1;
     unsigned char *text_ptr, *saved_ptr;
 
     saved_ptr = s1->ld_p;
-    s1->ld_p = text_ptr = (void*)tcc_load_text(fd);
+    s1->ld_p = text_ptr = (void*)tcc_load_text(in);
     for(;;) {
         t = ld_next(s1, cmd, sizeof(cmd));
         if (t == LD_TOK_EOF)

@@ -17,7 +17,7 @@ struct child_slot {nmedia_mse *buffer;struct nmedia_output pending;uint64_t publ
 struct video_storage {
     struct video_storage *next;
     struct nmsw_shared_video *shared;
-    size_t bytes;uint32_t capacity;int fd;uint64_t id;
+    size_t bytes;uint32_t capacity;n_handle handle;uint64_t id;
 };
 /* Shared slots own snapshots, not decoder loans. Busy old geometry remains
  * alive until the receiver returns it, even across APPEND/seek/drop. */
@@ -46,7 +46,7 @@ static bool video_full(const struct video_tx *v){
     }return false;
 }
 static void video_storage_free(struct video_storage *s){
-    if(!s)return;if(s->shared)n_memory_release(s->shared,s->bytes);if(s->fd>=0)n_handle_close(s->fd);nmedia_ff_free(s);
+    if(!s)return;if(s->shared)n_memory_release(s->shared,s->bytes);if(s->handle>=0)n_handle_close(s->handle);nmedia_ff_free(s);
 }
 static void video_collect(struct video_tx *v){
     struct video_storage **link=&v->retired;
@@ -61,8 +61,8 @@ static bool video_publish(struct video_tx *v,const struct nmedia_output *o,uint3
         uint32_t capacity=(bytes+63u)&~63u;size_t total;
         if(!nmsw_shared_size(capacity,&total))return false;
         struct video_storage *s=nmedia_ff_mallocz(sizeof *s);if(!s)return false;
-        s->fd=n_shared_create(total);s->bytes=total;s->capacity=capacity;s->id=++v->storage_id;
-        if(s->fd<0 || !(s->shared=n_shared_map(0,s->fd,total,N_PROT_WRITE))){video_storage_free(s);return false;}
+        s->handle=n_shared_create(total);s->bytes=total;s->capacity=capacity;s->id=++v->storage_id;
+        if(s->handle<0 || !(s->shared=n_shared_map(s->handle,total,N_MEMORY_READ_WRITE))){video_storage_free(s);return false;}
         s->shared->id=s->id; /* immutable backing identity, not only wire state */
         if(v->storage){v->storage->next=v->retired;v->retired=v->storage;}
         v->storage=s;
@@ -84,7 +84,7 @@ static bool video_send(struct video_tx *v){
     if(!v->pending)return true;
     bool fresh=v->header.shared_id!=v->sent_id;
     v->header.attached=fresh;
-    if(n_channel_send(VIDEO,&v->header,sizeof v->header,fresh?v->storage->fd:-1)<0)return false;
+    if(n_channel_send(VIDEO,&v->header,sizeof v->header,fresh?v->storage->handle:-1)<0)return false;
     v->sent_id=v->header.shared_id;v->pending=false;return true;
 }
 static bool slots_reserve(struct child_slot **slots,size_t *count,size_t *capacity,size_t wanted){

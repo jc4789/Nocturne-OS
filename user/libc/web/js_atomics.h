@@ -11,12 +11,45 @@
 
 /* Install shared-page SharedArrayBuffer allocation and waitAsync enrollment. */
 void web_atomics_runtime_init(JSRuntime *rt);
-/* host.sharedBufferExport(sab) -> [pid, ticket, mapped bytes, byteLength] for
- * a message to a direct parent/child; host.sharedBufferImport(record) maps it;
- * host.sharedBufferAlias(sab) makes a new SharedArrayBuffer object over the
- * same memory in this process; host.sharedBufferReserve(bytes) makes one whose
- * pages are zero-filled at first touch. */
+/* host.sharedBufferExport(sab) -> [attachment index, mapped bytes, offset,
+ * length] inside an open export scope; host.sharedBufferImport(record) maps
+ * the attachment of that index; host.sharedBufferAlias(sab) makes a new
+ * SharedArrayBuffer object over the same memory in this process;
+ * host.sharedBufferReserve(bytes) makes one whose pages are zero-filled at
+ * first touch.
+ *
+ * A shared region reaches another agent only as a channel attachment. The
+ * clone code of an outgoing worker message brackets its walk with
+ * host.sharedBufferBegin() ... host.sharedBufferSeal() (-> scope id, 0 when
+ * nothing was exported; sharedBufferAbandon() on failure). The id rides in
+ * slot 2 of the wire array [data, metadata, id]; web_attachments_extract takes
+ * the regions out of it for the sender, and host.sharedBufferDiscard(id)
+ * drops a sealed scope that is never sent. The receiver collects the handles
+ * that arrive ahead of a message in a web_inbox and opens it around the
+ * delivery call, so the records of that message import by index. */
 void web_atomics_host_init(JSContext *ctx, JSValueConst host);
+
+struct shared_region;
+/* Sending side: the regions of one outgoing message, retained until released.
+ * Their handles go out one per carrier message ahead of the payload. */
+struct web_attachments { struct shared_region **region; size_t count; };
+/* Take the attachments out of wire[2] (and cut that slot off, so the array is
+ * ready to serialize). False with an exception pending when the slot is not a
+ * sealed scope. */
+bool web_attachments_extract(JSContext *ctx, JSValueConst wire, struct web_attachments *out);
+n_handle web_attachments_handle(const struct web_attachments *attachments, size_t index);
+void web_attachments_release(struct web_attachments *attachments);
+
+/* Receiving side: handles received from carriers and not yet claimed by the
+ * message that follows them. A claimed entry's handle belongs to its region. */
+struct web_inbox_entry { n_handle handle; struct shared_region *region; };
+struct web_inbox { struct web_inbox_entry *entry; size_t count, capacity; };
+bool web_inbox_add(struct web_inbox *inbox, n_handle handle);
+/* Close every unclaimed handle and empty the inbox. */
+void web_inbox_close(struct web_inbox *inbox);
+/* Imports performed between begin and end read their regions from inbox. */
+void web_atomics_import_begin(struct web_inbox *inbox);
+void web_atomics_import_end(void);
 /* waitAsync tokens in the queue below carry this mark; other owners of the
  * queue (the GUI loop, webnet) use their own. */
 #define WEB_ATOMICS_TOKEN (UINT64_C(0x41) << 56)

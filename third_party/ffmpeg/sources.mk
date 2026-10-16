@@ -251,7 +251,6 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavformat/oggparsevorbis.c \
     third_party/ffmpeg/libavformat/oggparsevp8.c \
     third_party/ffmpeg/libavformat/options.c \
-    third_party/ffmpeg/libavformat/os_support.c \
     third_party/ffmpeg/libavformat/packet_list.c \
     third_party/ffmpeg/libavformat/pcm.c \
     third_party/ffmpeg/libavformat/protocols.c \
@@ -300,7 +299,6 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavutil/executor.c \
     third_party/ffmpeg/libavutil/fifo.c \
     third_party/ffmpeg/libavutil/file.c \
-    third_party/ffmpeg/libavutil/file_open.c \
     third_party/ffmpeg/libavutil/film_grain_params.c \
     third_party/ffmpeg/libavutil/fixed_dsp.c \
     third_party/ffmpeg/libavutil/float_dsp.c \

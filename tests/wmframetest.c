@@ -36,9 +36,9 @@ int main(int argc,char **argv) {
         win_update(win);
         if (win->frame_acquired || win->c.px || !wait_frame(win,submitted)) goto done;
         /* A retained front must never be accepted as a new writable frame. */
-        if (__syscall(SYS_WIN_PRESENT,win->fd,0,0,0,submitted+1)!=-EBUSY ||
-            __syscall(SYS_WIN_PRESENT,win->fd,0,0,0,WIN_BUFFER_COUNT+1)!=-EINVAL ||
-            __syscall(SYS_WIN_PRESENT,win->fd,0,0,0,0)!=-EINVAL) goto done;
+        if (__syscall(SYS_WIN_PRESENT,win->handle,0,0,0,submitted+1)!=-EBUSY ||
+            __syscall(SYS_WIN_PRESENT,win->handle,0,0,0,WIN_BUFFER_COUNT+1)!=-EINVAL ||
+            __syscall(SYS_WIN_PRESENT,win->handle,0,0,0,0)!=-EINVAL) goto done;
         if (win_begin_frame(win)<0) goto done;
         /* Unsubmitted writes to the other surface must not change scanout or
            SYS_SCREEN_GRAB. This is the BSP/AP mutable-pixel failure control. */
@@ -75,7 +75,7 @@ int main(int argc,char **argv) {
     if (fd<0) goto done;
     long second=__syscall(SYS_WIN_MAP,fd,1,0,0,0);
     long resized=second>0?__syscall(SYS_WIN_RESIZE,fd,sw/3,sh/3,0,0):-1;
-    close((int)fd);
+    n_handle_close((n_handle)fd);
     if (resized<0) goto done;
     printf("wmframetest: PASS second-only-map resize destroy\n");
     printf("wmframetest: PASS frames=%lu elapsed_ms=%lu indexed-copy-free=1 releases=checked other-buffer=isolated screen-grab=correct\n",frames,(unsigned long)(uptime_ms()-start));

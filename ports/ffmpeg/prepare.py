@@ -53,7 +53,7 @@ def main():
     # Native mmap/fcntl/mkstemp exist, but are not POSIX file helper contracts.
     # These overrides remove unused upstream helper assumptions, not new syscalls.
     config=out/'config.h';text=config.read_text(encoding='utf-8')
-    for token in ['MMAP','FCNTL','MKSTEMP']:text=text.replace('#define HAVE_'+token+' 1','#define HAVE_'+token+' 0')
+    for token in ['MMAP','FCNTL','MKSTEMP','UNISTD_H','SYS_TIME_H','GETTIMEOFDAY','ISATTY','MPROTECT']:text=text.replace('#define HAVE_'+token+' 1','#define HAVE_'+token+' 0')
     # Native x86-64 integer loads are fast, including unaligned inputs. The
     # asm-disabled configure path must not disable these portable C fast paths.
     for token in ['FAST_64BIT','FAST_UNALIGNED']:text=text.replace('#define HAVE_'+token+' 0','#define HAVE_'+token+' 1')

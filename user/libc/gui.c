@@ -18,29 +18,29 @@ int screen_size(int *w, int *h) {
 }
 
 window_t *win_open(int w, int h, const char *title, int flags) {
-    long fd = __syscall(SYS_WIN_CREATE, w, h, (long)title, flags, 0);
-    if (fd < 0) {
-        errno = (int)-fd;
+    long handle = __syscall(SYS_WIN_CREATE, w, h, (long)title, flags, 0);
+    if (handle < 0) {
+        errno = (int)-handle;
         return NULL;
     }
-    long addr = __syscall(SYS_WIN_MAP, fd, 0, 0, 0, 0);
+    long addr = __syscall(SYS_WIN_MAP, handle, 0, 0, 0, 0);
     if (addr < 0 && addr > -4096) {
-        close((int)fd);
+        n_handle_close((n_handle)handle);
         errno = (int)-addr;
         return NULL;
     }
     window_t *win = calloc(1, sizeof *win);
-    if (!win) { close((int)fd); errno = ENOMEM; return NULL; }
-    win->fd = (int)fd;
+    if (!win) { n_handle_close((n_handle)handle); errno = ENOMEM; return NULL; }
+    win->handle = (n_handle)handle;
     win->w = w;
     win->h = h;
     win->flags = flags;
     win->buffers[0] = (uint32_t *)addr;
     win->frame_acquired = true;
     if (flags & WIN_DOUBLE_BUFFER) {
-        long other = __syscall(SYS_WIN_MAP, fd, 1, 0, 0, 0);
+        long other = __syscall(SYS_WIN_MAP, handle, 1, 0, 0, 0);
         if (other < 0 && other > -4096) {
-            close((int)fd); free(win); errno = (int)-other; return NULL;
+            n_handle_close((n_handle)handle); free(win); errno = (int)-other; return NULL;
         }
         win->buffers[1] = (uint32_t *)other;
     }
@@ -50,14 +50,14 @@ window_t *win_open(int w, int h, const char *title, int flags) {
 
 void win_close(window_t *win) {
     if (!win) return;
-    close(win->fd);
+    n_handle_close(win->handle);
     free(win);
 }
 
 int win_begin_frame(window_t *win) {
     if (!win || win->closed) return -EBADF;
     if (!(win->flags & WIN_DOUBLE_BUFFER) || win->frame_acquired) return 0;
-    long address = __syscall(SYS_WIN_MAP, win->fd, win->buffer_index, WIN_MAP_ACQUIRE, 0, 0);
+    long address = __syscall(SYS_WIN_MAP, win->handle, win->buffer_index, WIN_MAP_ACQUIRE, 0, 0);
     if (address < 0 && address > -4096) { errno = (int)-address; return (int)address; }
     win->buffers[win->buffer_index] = (uint32_t *)address;
     gfx_init(&win->c, (uint32_t *)address, win->w, win->h, win->w);
@@ -68,10 +68,10 @@ int win_begin_frame(window_t *win) {
 void win_update(window_t *win) {
     if (!win || win->closed) return;
     if (!(win->flags & WIN_DOUBLE_BUFFER)) {
-        __syscall(SYS_WIN_PRESENT, win->fd, 0, 0, 0, 0); return;
+        __syscall(SYS_WIN_PRESENT, win->handle, 0, 0, 0, 0); return;
     }
     if (!win->frame_acquired) { errno = EBUSY; return; }
-    long result = __syscall(SYS_WIN_PRESENT, win->fd, 0, 0, 0, win->buffer_index + 1);
+    long result = __syscall(SYS_WIN_PRESENT, win->handle, 0, 0, 0, win->buffer_index + 1);
     if (result < 0) { errno = (int)-result; return; }
     win->buffer_index ^= 1;
     win->frame_acquired = false;
@@ -81,27 +81,25 @@ void win_update(window_t *win) {
 void win_update_rect(window_t *win, int x, int y, int w, int h) {
     if (w <= 0 || h <= 0) return;
     if (win->flags & WIN_DOUBLE_BUFFER) { win_update(win); return; }
-    __syscall(SYS_WIN_PRESENT, win->fd, x, y, ((long)w << 32) | (unsigned)h, 0);
+    __syscall(SYS_WIN_PRESENT, win->handle, x, y, ((long)w << 32) | (unsigned)h, 0);
 }
 
-void win_set_title(window_t *win, const char *title) { __syscall(SYS_WIN_SET_TITLE, win->fd, (long)title, 0, 0, 0); }
-void win_move(window_t *win, int x, int y) { __syscall(SYS_WIN_MOVE, win->fd, x, y, 0, 0); }
-int win_state(window_t *win) { return win && !win->closed ? (int)__syscall(SYS_WIN_STATE,win->fd,0,0,0,0) : -EBADF; }
-int win_fullscreen(window_t *win,bool enabled) { return win&&!win->closed?(int)__syscall(SYS_WIN_PRESENTATION,win->fd,enabled,0,0,0):-EBADF; }
+void win_set_title(window_t *win, const char *title) { __syscall(SYS_WIN_SET_TITLE, win->handle, (long)title, 0, 0, 0); }
+void win_move(window_t *win, int x, int y) { __syscall(SYS_WIN_MOVE, win->handle, x, y, 0, 0); }
+int win_state(window_t *win) { return win && !win->closed ? (int)__syscall(SYS_WIN_STATE,win->handle,0,0,0,0) : -EBADF; }
+int win_fullscreen(window_t *win,bool enabled) { return win&&!win->closed?(int)__syscall(SYS_WIN_PRESENTATION,win->handle,enabled,0,0,0):-EBADF; }
 
+/* One system call takes every queued event that fits, waiting up to timeout. */
 static int fetch(window_t *win, int timeout) {
     if (win->closed) return -1;
-    if (timeout != -1) {
-        struct n_pollfd p = {win->fd, N_POLLIN, 0};
-        int r = poll(&p, 1, timeout);
-        if (r <= 0) return 0;
-    }
-    ssize_t n = read(win->fd, win->q, sizeof win->q);
-    if (n <= 0) {
+    long n = __syscall(SYS_WIN_RECEIVE, win->handle, (long)win->q,
+                       sizeof win->q / sizeof win->q[0], timeout, 0);
+    if (n == 0 || n == -N_ERR_TIMEOUT || n == -N_ERR_STOPPED) return 0;
+    if (n < 0) {
         win->closed = true;
         return -1;
     }
-    win->qn = (int)(n / sizeof(struct gui_event));
+    win->qn = (int)n;
     win->qi = 0;
     return 1;
 }
@@ -113,7 +111,7 @@ int win_event(window_t *win, struct gui_event *e, int timeout_ms) {
     }
     *e = win->q[win->qi++];
     if (e->type == EV_RESIZE) {
-        long addr = __syscall(SYS_WIN_RESIZE, win->fd, e->x, e->y, 0, 0);
+        long addr = __syscall(SYS_WIN_RESIZE, win->handle, e->x, e->y, 0, 0);
         if (addr > 0 || addr < -4096) {
             win->w = e->x;
             win->h = e->y;
@@ -128,7 +126,7 @@ int win_event(window_t *win, struct gui_event *e, int timeout_ms) {
                 for (int i = win->qi; i < win->qn; i++)
                     if (win->q[i].type != EV_FRAME) win->q[kept++] = win->q[i];
                 win->qn = kept;
-                long other = __syscall(SYS_WIN_MAP, win->fd, 1, 0, 0, 0);
+                long other = __syscall(SYS_WIN_MAP, win->handle, 1, 0, 0, 0);
                 if (other < 0 && other > -4096) { win->closed = true; return -1; }
                 win->buffers[1] = (uint32_t *)other;
             }

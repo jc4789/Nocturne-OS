@@ -35,13 +35,16 @@
 #include <string.h>
 #include <errno.h>
 #include <math.h>
-#include <fcntl.h>
 #include <setjmp.h>
 #include <time.h>
 
+#if CONFIG_TCC_NOCTURNE
+/* Nocturne is not POSIX: files, memory and the clock come from the native API. */
+# include <limits.h>
+# include <nocturne.h>
+#endif
+
 #ifndef _WIN32
-# include <unistd.h>
-# include <sys/time.h>
 # ifndef CONFIG_TCC_STATIC
 #  include <dlfcn.h>
 # endif
@@ -98,10 +101,6 @@ extern long double strtold (const char *__nptr, char **__endptr);
 # ifndef va_copy
 #  define va_copy(a,b) a = b
 # endif
-#endif
-
-#ifndef O_BINARY
-# define O_BINARY 0
 #endif
 
 #ifndef offsetof
@@ -631,10 +630,20 @@ typedef struct DLLReference {
 
 #define IO_BUF_SIZE 8192
 
+/* A file read in place: its native document and where the next read continues.
+   Seeking is assigning offset. document is TCC_NO_INPUT for text held in memory
+   and TCC_STDIN for standard input. */
+#define TCC_NO_INPUT (-1)
+#define TCC_STDIN (-2)
+typedef struct TCCInput {
+    n_handle document;
+    uint64_t offset;
+} TCCInput;
+
 typedef struct BufferedFile {
     uint8_t *buf_ptr;
     uint8_t *buf_end;
-    int fd;
+    TCCInput input;
     struct BufferedFile *prev;
     int line_num;    /* current line number - here to simplify code */
     int line_ref;    /* tcc -E: last printed line */
@@ -1330,7 +1339,9 @@ PUB_FUNC int tcc_fclose(FILE *f);
 # define tcc_fclose fclose
 #endif
 ST_FUNC DLLReference *tcc_add_dllref(TCCState *s1, const char *dllname, int level);
-ST_FUNC char *tcc_load_text(int fd);
+ST_FUNC char *tcc_load_text(TCCInput *in);
+ST_FUNC int tcc_input_open(const char *filename, TCCInput *in);
+ST_FUNC void tcc_input_close(TCCInput *in);
 /* for #pragma once */
 ST_FUNC int normalized_PATHCMP(const char *f1, const char *f2);
 
@@ -1578,11 +1589,12 @@ ST_FUNC void resolve_common_syms(TCCState *s1);
 ST_FUNC void relocate_syms(TCCState *s1, Section *symtab, int do_resolve);
 ST_FUNC void relocate_sections(TCCState *s1);
 
-ST_FUNC ssize_t full_read(int fd, void *buf, size_t count);
-ST_FUNC void *load_data(int fd, unsigned long file_offset, unsigned long size);
-ST_FUNC int tcc_object_type(int fd, ElfW(Ehdr) *h);
-ST_FUNC int tcc_load_object_file(TCCState *s1, int fd, unsigned long file_offset);
-ST_FUNC int tcc_load_archive(TCCState *s1, int fd, int alacarte);
+ST_FUNC int64_t tcc_input_read(TCCInput *in, void *buf, size_t count);
+ST_FUNC int64_t full_read(TCCInput *in, void *buf, size_t count);
+ST_FUNC void *load_data(TCCInput *in, unsigned long file_offset, unsigned long size);
+ST_FUNC int tcc_object_type(TCCInput *in, ElfW(Ehdr) *h);
+ST_FUNC int tcc_load_object_file(TCCState *s1, TCCInput *in, unsigned long file_offset);
+ST_FUNC int tcc_load_archive(TCCState *s1, TCCInput *in, int alacarte);
 ST_FUNC void add_array(TCCState *s1, const char *sec, int c);
 
 ST_FUNC struct sym_attr *get_sym_attr(TCCState *s1, int index, int alloc);
@@ -1598,8 +1610,8 @@ ST_FUNC int set_global_sym(TCCState *s1, const char *name, Section *sec, addr_t 
          elem < (type *) (sec->data + sec->data_offset); elem++)
 
 #ifndef ELF_OBJ_ONLY
-ST_FUNC int tcc_load_dll(TCCState *s1, int fd, const char *filename, int level);
-ST_FUNC int tcc_load_ldscript(TCCState *s1, int fd);
+ST_FUNC int tcc_load_dll(TCCState *s1, TCCInput *in, const char *filename, int level);
+ST_FUNC int tcc_load_ldscript(TCCState *s1, TCCInput *in);
 ST_FUNC void tccelf_add_crtbegin(TCCState *s1);
 ST_FUNC void tccelf_add_crtend(TCCState *s1);
 #endif
@@ -1937,8 +1949,6 @@ dwarf_read_sleb128(unsigned char **ln, unsigned char *end)
 /********************************************************/
 #if CONFIG_TCC_SEMLOCK
 #if CONFIG_TCC_NOCTURNE
-#include <limits.h>
-#include <nocturne.h>
 typedef struct { volatile uint32_t held; } TCCSem;
 static inline void wait_sem(TCCSem *p) {
     while (__atomic_exchange_n(&p->held, 1, __ATOMIC_ACQUIRE))

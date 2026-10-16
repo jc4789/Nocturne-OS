@@ -34,6 +34,8 @@
 
 #if DETECT_OS_WINDOWS
 #include <windows.h>
+#elif DETECT_OS_NOCTURNE
+#include "nocturne.h"
 #else
 #include <unistd.h>
 #endif
@@ -442,6 +444,8 @@ trace_process_id(void)
 {
 #if DETECT_OS_WINDOWS
    return (unsigned) GetCurrentProcessId();
+#elif DETECT_OS_NOCTURNE
+   return (unsigned) n_app_self();
 #else
    return (unsigned) getpid();
 #endif

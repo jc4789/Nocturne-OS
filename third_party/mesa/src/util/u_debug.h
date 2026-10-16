@@ -41,7 +41,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(NOCTURNE)
 #include <sys/types.h>
 #include <unistd.h>
 #endif

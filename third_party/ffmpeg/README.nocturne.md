@@ -39,6 +39,11 @@ python ports/ffmpeg/prepare.py --source "D:/Programes/cloned repos/ffmpeg-9.0.2"
 
 PCM速度変更はGUI/packet decoderとは別のnative媒体責務で、pitch維持はatempo WSOLA、pitch変更はresamplerを用いる。decoder handleをthread-safeに変えたという意味ではない。通常1xは新filterを通さない。追加ソースはLGPL構成、CONFIG_GPL=0。既存許諾文書を削除していない。
 
+## ネイティブAPI移行（段階4）
+
+POSIX の `unistd.h` / `fcntl.h` / `sys/*.h` を前提とする FFmpeg の OS 層は、Nocturne のネイティブ API へ直接書き換えた。manifest の `origin` が `nocturne-native-port` のファイルが対象で、`vendor.py` の再取り込みは上流版で上書きするため、再生成後にこの差分を再適用すること。
+`libavutil/{file,log,cpu,time,random_seed}.c` と `libavformat/utils.c`（`ff_mkdir_p`）と `os_support.h` を変更した。`av_file_map` は `n_document_load`、`isatty` は `n_terminal`、CPU 数は `cpu_info`、乱数は `n_random`、時刻は `n_clock_wall`（秒単位）／`n_clock_uptime_ms`（ミリ秒単位）、`av_usleep` は `n_sleep_ms`（切り上げ）を用いる。fd を返す `file_open.[ch]` と、ネットワーク無効では空の `os_support.c` は閉包から外して削除した。`config.h` の `HAVE_UNISTD_H` `HAVE_SYS_TIME_H` `HAVE_GETTIMEOFDAY` `HAVE_ISATTY` `HAVE_MPROTECT` も 0 にした（`prepare.py` に同じ上書きを追加済み）。
+
 ## ライセンス
 
 この構成の configure 判定は LGPL-2.1-or-later。元ライセンス・著作者ヘッダーを保持し、同梱 `COPYING.LGPLv2.1` と `LICENSE.md` に従う。静的配布では対応ソース、変更、再リンクに必要な Nocturne object/build 手順も利用者が取得できるようにする。`sources.mk` を lazy static link へ含め、実体の不要なアプリへ decoder を丸ごと入れない。

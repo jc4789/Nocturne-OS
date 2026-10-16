@@ -74,7 +74,7 @@ u_memstream_open(struct u_memstream *mem, char **bufp, size_t *sizep)
 #elif defined(NOCTURNE)
    static unsigned serial;
    snprintf(mem->temp, sizeof mem->temp, "/tmp/mesa-memstream-%d-%u",
-            getpid(), __atomic_fetch_add(&serial, 1, __ATOMIC_RELAXED));
+            (int)n_app_self(), __atomic_fetch_add(&serial, 1, __ATOMIC_RELAXED));
    FILE *f = fopen(mem->temp, "w+b");
    if (!f)
       return false;

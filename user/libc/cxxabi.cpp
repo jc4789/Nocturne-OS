@@ -11,7 +11,7 @@ void free(void *);
 [[noreturn]] void abort(void);
 int thread_id(void);
 int snprintf(char *, size_t, const char *, ...);
-long write(int, const void *, size_t);
+int64_t n_channel_send(int32_t, const void *, size_t, int32_t);
 int wait_on_address(volatile uint32_t *, uint32_t, unsigned);
 int wake_address(volatile uint32_t *, unsigned);
 void yield(void);
@@ -48,7 +48,7 @@ void *allocate(size_t size, size_t alignment, bool must_succeed) {
         char message[64];
         int length = snprintf(message, sizeof message, "operator new: no memory for %zu bytes\n", size);
         if (length > 0)
-            write(2, message, static_cast<size_t>(length) < sizeof message ? static_cast<size_t>(length) : sizeof message - 1);
+            n_channel_send(2, message, static_cast<size_t>(length) < sizeof message ? static_cast<size_t>(length) : sizeof message - 1, -1);
         abort();
     }
 }

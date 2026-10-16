@@ -42,6 +42,10 @@
 #pragma comment(lib, "advapi32")
 #endif
 
+#if BR_USE_NOCTURNE_RAND
+#include "nocturne.h"
+#endif
+
 /*
  * Seeder that uses the RDRAND opcodes (on x86 CPU).
  */
@@ -190,10 +194,27 @@ seeder_win32(const br_prng_class **ctx)
 #endif
 
 /*
+ * Seeder that uses the Nocturne system entropy pool.
+ */
+#if BR_USE_NOCTURNE_RAND
+static int
+seeder_nocturne(const br_prng_class **ctx)
+{
+	unsigned char tmp[32];
+
+	if (n_random(tmp, sizeof tmp) < 0) {
+		return 0;
+	}
+	(*ctx)->update(ctx, tmp, sizeof tmp);
+	return 1;
+}
+#endif
+
+/*
  * An aggregate seeder that uses RDRAND, and falls back to an OS-provided
  * source if RDRAND fails.
  */
-#if BR_RDRAND && (BR_USE_GETENTROPY || BR_USE_URANDOM || BR_USE_WIN32_RAND)
+#if BR_RDRAND && (BR_USE_GETENTROPY || BR_USE_URANDOM || BR_USE_WIN32_RAND || BR_USE_NOCTURNE_RAND)
 static int
 seeder_rdrand_with_fallback(const br_prng_class **ctx)
 {
@@ -204,6 +225,8 @@ seeder_rdrand_with_fallback(const br_prng_class **ctx)
 		return seeder_urandom(ctx);
 #elif BR_USE_WIN32_RAND
 		return seeder_win32(ctx);
+#elif BR_USE_NOCTURNE_RAND
+		return seeder_nocturne(ctx);
 #else
 #error "macro selection has gone wrong"
 #endif
@@ -221,7 +244,7 @@ br_prng_seeder_system(const char **name)
 		if (name != NULL) {
 			*name = "rdrand";
 		}
-#if BR_USE_GETENTROPY || BR_USE_URANDOM || BR_USE_WIN32_RAND
+#if BR_USE_GETENTROPY || BR_USE_URANDOM || BR_USE_WIN32_RAND || BR_USE_NOCTURNE_RAND
 		return &seeder_rdrand_with_fallback;
 #else
 		return &seeder_rdrand;
@@ -243,6 +266,11 @@ br_prng_seeder_system(const char **name)
 		*name = "win32";
 	}
 	return &seeder_win32;
+#elif BR_USE_NOCTURNE_RAND
+	if (name != NULL) {
+		*name = "nocturne";
+	}
+	return &seeder_nocturne;
 #else
 	if (name != NULL) {
 		*name = "none";

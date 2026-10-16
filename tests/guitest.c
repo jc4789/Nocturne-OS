@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <fcntl.h>
 #include "nocturne.h"
 
 #define MAGENTA RGB(255, 0, 255)
@@ -63,9 +62,11 @@ int main(void) {
     char *argv[] = {"screenshot", "/home/guitest.png", NULL};
     int st = run_wait("screenshot", argv);
     unsigned char sig[8] = {0};
-    int fd = open("/home/guitest.png", O_RDONLY);
-    if (fd >= 0) read(fd, sig, 8);
-    close(fd);
+    n_handle doc = n_document_open("/home/guitest.png", N_DOCUMENT_READ);
+    if (doc >= 0) {
+        n_document_read_at(doc, 0, sig, 8);
+        n_handle_close(doc);
+    }
     if (st != 0 || memcmp(sig, "\x89PNG\r\n\x1a\n", 8)) {
         printf("guitest: screenshot did not write a PNG (status %d)\n", st);
         return 1;

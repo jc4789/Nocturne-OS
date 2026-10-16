@@ -73,7 +73,7 @@ const cloneData = (() => {
         apply(byteSet,new U8(output),[input]);return output;
     }
     const packets=new WeakMap(),packetGet=WeakMap.prototype.get,packetSet=WeakMap.prototype.set;
-    function prepare(input,transfers,external=false,workerContext=null,storage=false) {
+    function prepareGraph(input,transfers,external=false,workerContext=null,storage=false) {
         const seen=new M(),records=[],handlers=[],prepared=[];
         const reject=(stage,value,brand)=>fail(stage,value,transfers?transfers.length:0,external,brand);
         // Register placeholders first; capture transferred bytes after user getters.
@@ -195,8 +195,22 @@ const cloneData = (() => {
         }
         const tokens=[];
         if(external)for(let i=0;i<prepared.length;i++)add(tokens,handlers[i]?prepared[i]:null);
-        const packet={data:[root,records],tokens:external?tokens:null};
+        const packet={data:[root,records],tokens:external?tokens:null,attachments:0};
         apply(packetSet,packets,[packet,{transfers,handlers,prepared,external,committed:false}]);
+        return packet;
+    }
+    // A message to another agent carries its SharedArrayBuffers (and shared
+    // WebAssembly memories) as native attachments. Exports made during the walk
+    // join one scope that nests with any walk an author getter starts; the
+    // sealed scope's id (0: none) goes with the wire array and is claimed by
+    // the native sender, or discarded by the caller if the message never goes.
+    function prepare(input,transfers,external=false,workerContext=null,storage=false) {
+        if(external!=='worker')return prepareGraph(input,transfers,external,workerContext,storage);
+        host.sharedBufferBegin();
+        let packet;
+        try{packet=prepareGraph(input,transfers,external,workerContext,storage);}
+        catch(error){host.sharedBufferAbandon();throw error;}
+        packet.attachments=host.sharedBufferSeal();
         return packet;
     }
     function validate(packet) {

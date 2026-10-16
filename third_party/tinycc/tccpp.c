@@ -659,13 +659,13 @@ static int handle_eob(void)
 
     /* only tries to read if really end of buffer */
     if (bf->buf_ptr >= bf->buf_end) {
-        if (bf->fd >= 0) {
+        if (bf->input.document != TCC_NO_INPUT) {
 #if defined(PARSE_DEBUG)
             len = 1;
 #else
             len = IO_BUF_SIZE;
 #endif
-            len = read(bf->fd, bf->buffer, len);
+            len = tcc_input_read(&bf->input, bf->buffer, len);
             if (len < 0)
                 len = 0;
         } else {
@@ -1954,7 +1954,7 @@ ST_FUNC void preprocess(int is_bof)
             /* skip optional level number & advance to next line */
             skip_to_eol(c);
         }
-        if (file->fd > 0)
+        if (file->input.document != TCC_NO_INPUT)
             total_lines += file->line_num - n;
         file->line_num = n;
         break;

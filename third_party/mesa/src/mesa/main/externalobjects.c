@@ -38,6 +38,10 @@
 #include "api_exec_decl.h"
 
 #include "state_tracker/st_cb_bitmap.h"
+#ifdef NOCTURNE
+#include "nocturne.h"
+#define close(handle) n_handle_close(handle) /* an imported handle is ours to close */
+#endif
 #include "state_tracker/st_texture.h"
 
 struct st_context;

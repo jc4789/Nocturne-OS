@@ -244,14 +244,15 @@ wasm_rt_coroutine *wasm_rt_coroutine_create(void (*entry)(void *), void *opaque)
     size_t usable = task_high - task_low;
     wasm_rt_coroutine *co = calloc(1, sizeof *co);
     if (!co) { errno = ENOMEM; return NULL; }
-    /* Use the real native task's reserved stack capacity. SYS_MMAP provides
-       a trailing unmapped page; unmap the leading page for a lower guard. */
-    long mapping = __syscall(SYS_MMAP, usable + N_PAGE_SIZE, N_PROT_WRITE, 0, 0, 0);
-    if (mapping < 0) { errno = (int)-mapping; free(co); return NULL; }
-    long guard = __syscall(SYS_MUNMAP, mapping, N_PAGE_SIZE, 0, 0, 0);
-    if (guard < 0) {
-        __syscall(SYS_MUNMAP, mapping, usable + N_PAGE_SIZE, 0, 0, 0);
-        errno = (int)-guard; free(co); return NULL;
+    /* Use the real native task's reserved stack capacity. n_memory_reserve
+       leaves a trailing unmapped page; release the leading page for a lower
+       guard. */
+    char *mapping = n_memory_reserve(usable + N_PAGE_SIZE, N_MEMORY_READ_WRITE);
+    if (!mapping) { free(co); return NULL; } /* errno set by the reserve */
+    if (n_memory_release(mapping, N_PAGE_SIZE) < 0) {
+        int error = errno;
+        n_memory_release(mapping, usable + N_PAGE_SIZE);
+        errno = error; free(co); return NULL;
     }
     co->runtime.stack_low = (uintptr_t)mapping + N_PAGE_SIZE;
     co->runtime.stack_high = co->runtime.stack_low + usable;
@@ -300,9 +301,9 @@ int wasm_rt_coroutine_bounds(const wasm_rt_coroutine *co, uintptr_t *low, uintpt
 int wasm_rt_coroutine_destroy(wasm_rt_coroutine *co) {
     if (coroutine_owner(co) < 0) return -1;
     if (co->running || (co->started && !co->done)) { errno = EBUSY; return -1; }
-    long result = __syscall(SYS_MUNMAP, co->runtime.stack_low,
-        co->runtime.stack_high - co->runtime.stack_low, 0, 0, 0);
-    if (result < 0) { errno = (int)-result; return -1; }
+    if (n_memory_release((void *)co->runtime.stack_low,
+                         co->runtime.stack_high - co->runtime.stack_low) < 0)
+        return -1;
     free(co);
     return 0;
 }

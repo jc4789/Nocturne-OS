@@ -1,7 +1,7 @@
 /* Nocturne kernel <-> userland ABI: syscall numbers and shared structures. */
 #pragma once
 #include <stdint.h>
-/* x86-64 native mapping granule, shared by SYS_MMAP/SYS_MUNMAP callers. */
+/* x86-64 native mapping granule: n_memory and shared pages come in these. */
 #define N_PAGE_SIZE 4096ULL
 
 /* Nocturne results. A system call that fails returns the negated code; the
@@ -43,28 +43,28 @@
 #define N_ERR_PROTOCOL 33
 #define N_RESULT_CODES 34
 
+/* System call numbers. A number keeps its meaning for as long as it exists, so
+   programs built inside Nocturne keep working; the numbers of the first ABI's
+   calls (removed at stage 5 of docs/nocturne-native-abi.md) stay unassigned. */
 enum {
-    SYS_EXIT = 0, SYS_READ, SYS_WRITE, SYS_OPEN, SYS_CLOSE, SYS_LSEEK, SYS_STAT, SYS_FSTAT,
-    SYS_READDIR, SYS_MKDIR, SYS_UNLINK, SYS_RENAME, SYS_CHDIR, SYS_GETCWD, SYS_SPAWN, SYS_WAITPID,
-    SYS_GETPID, SYS_KILL, SYS_SBRK, SYS_SLEEP, SYS_UPTIME, SYS_TIME, SYS_PIPE, SYS_DUP2,
-    SYS_DUP, SYS_POLL, SYS_PROCLIST, SYS_SYSINFO, SYS_YIELD, SYS_POWER, SYS_FCNTL, SYS_GETPPID,
-    SYS_KILLTREE, SYS_DMESG, SYS_PCILIST, SYS_MMAP, SYS_MUNMAP, SYS_MPROTECT,
-    SYS_CPU_INFO, SYS_GPU_INFO, SYS_GPU_RENDER, SYS_AUDIO_FLUSH,
+    SYS_EXIT = 0,
+    SYS_SLEEP = 19, SYS_UPTIME, SYS_TIME,
+    SYS_PROCLIST = 26, SYS_SYSINFO, SYS_YIELD, SYS_POWER,
+    SYS_SYSTEM_LOG = 33, SYS_PCILIST,
+    SYS_CPU_INFO = 38, SYS_GPU_INFO, SYS_GPU_RENDER, SYS_AUDIO_FLUSH,
     SYS_GPU_RENDER_BATCH,
     SYS_GPU_BLIT,
     SYS_CLOCK_INFO, SYS_THREAD_CREATE, SYS_THREAD_JOIN, SYS_THREAD_EXIT,
     SYS_WAIT_ADDRESS, SYS_WAKE_ADDRESS, SYS_THREAD_ID, SYS_CPU_INDEX,
     SYS_THREAD_TLS,
     SYS_CHANNEL_LISTEN, SYS_CHANNEL_CONNECT, SYS_CHANNEL_ACCEPT,
-    SYS_SHARED_CREATE, SYS_SHARED_MAP,
-    SYS_THREAD_STACK_BOUNDS,
-    SYS_ADDRESS_WATCH_QUEUE, SYS_ADDRESS_WATCH, SYS_ADDRESS_UNWATCH,
-    SYS_SHARED_SEND, SYS_SHARED_RECEIVE,
+    SYS_SHARED_CREATE,
+    SYS_THREAD_STACK_BOUNDS = 58,
     SYS_WIN_CREATE = 64, SYS_WIN_MAP, SYS_WIN_PRESENT, SYS_WIN_SET_TITLE, SYS_SCREEN_INFO,
     SYS_WIN_MOVE, SYS_CLIPBOARD_SET, SYS_CLIPBOARD_GET, SYS_WIN_RESIZE, SYS_GUI_LAUNCH,
     SYS_SCREEN_GRAB, SYS_WIN_STATE, SYS_WIN_PRESENTATION,
-    /* The core range 0..63 is full: later memory primitives continue here. */
-    SYS_SHARED_RESERVE = 88, SYS_WAIT_ADDRESS64, SYS_FTRUNCATE,
+    SYS_WIN_RECEIVE, /* (window, struct gui_event *out, max, timeout_ms): count, 0 on timeout */
+    SYS_SHARED_RESERVE = 88, SYS_WAIT_ADDRESS64,
     SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
     SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
     SYS_NET_DNS_ALL, SYS_TCP_SEND_UNTIL, SYS_TCP_CANCEL, SYS_NET_STATS,
@@ -84,6 +84,9 @@ enum {
     SYS_APP_OPEN, SYS_APP_ID, SYS_SYSTEM_LOG_OPEN,
     SYS_AUDIO_OPEN, SYS_AUDIO_SUBMIT, SYS_AUDIO_STATUS, SYS_AUDIO_VOLUME,
     SYS_RANDOM,
+    /* (bytes, access): N_MEMORY_* access, N_MEMORY_LOW added for pages below 2 GiB */
+    SYS_MEMORY_RESERVE, SYS_MEMORY_RELEASE, SYS_MEMORY_PROTECT,
+    SYS_SHARED_MAP, /* (shared handle, bytes, N_MEMORY_READ or N_MEMORY_READ_WRITE) */
     SYS_MAX = 192
 };
 
@@ -142,13 +145,6 @@ struct n_event {
     uint32_t reserved;
 };
 
-/* file types */
-/* SYS_MMAP / SYS_MPROTECT protection bits (reading is always allowed) */
-#define N_PROT_WRITE 2
-#define N_PROT_EXEC 4
-/* SYS_MMAP placement (third argument): the low region below 2 GiB */
-#define N_MMAP_LOW 1
-
 /* n_memory_reserve / n_memory_protect access. Writable and executable are
    never granted together: generated code is written, then made executable. */
 #define N_MEMORY_READ 1
@@ -157,29 +153,6 @@ struct n_event {
 /* Added to a reserve's access: place the pages below 2 GiB, for generated code
    whose instructions hold sign-extended 32-bit absolute addresses. */
 #define N_MEMORY_LOW 0x10
-
-#define N_FT_FILE 1
-#define N_FT_DIR 2
-#define N_FT_CHAR 3
-#define N_FT_PIPE 4
-#define N_FT_WINDOW 5
-#define N_FT_CHANNEL 6
-#define N_FT_SHARED 7
-#define N_FT_ADDRESS_WATCH 8
-
-struct n_dirent {
-    char name[256];
-    uint32_t type;
-    uint32_t reserved;
-    uint64_t size;
-};
-
-struct n_stat {
-    uint32_t type;
-    uint32_t mode;
-    uint64_t size;
-    int64_t mtime;
-};
 
 struct n_procinfo {
     int pid, ppid;
@@ -225,33 +198,14 @@ struct n_cpuinfo {
 #define N_CPU_AVX 4u
 #define N_CPU_USER_THREADS 8u
 
-struct n_pollfd {
-    int fd;
-    short events, revents;
-};
-#define N_POLLIN 1
-#define N_POLLOUT 4
-#define N_POLLHUP 16
-
 struct n_pciinfo {
     uint8_t bus, dev, func, cls, subcls, progif;
     uint16_t vendor, device;
 };
 
-/* spawn flags */
-#define SPAWN_DETACH 1
-
 /* power */
 #define POWER_OFF 0
 #define POWER_REBOOT 1
-
-/* fcntl */
-#define F_GETFL 3
-#define F_SETFL 4
-#define F_SETTTY 100 /* mark a pipe as a terminal (the terminal emulator does this), so isatty() is true */
-#define F_NLOCK 1024   /* Nocturne: wait for a vnode lease owned by this open file */
-#define F_NUNLOCK 1025 /* release that lease; the last close also releases it */
-#define F_NTRYLOCK 1026 /* Nocturne: acquire the vnode lease without sleeping; busy is EAGAIN */
 
 /* n_audio_status: where a stream stands. Device time counts this stream's
  * consumed PCM only. */

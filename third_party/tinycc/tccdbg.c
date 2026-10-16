@@ -1132,7 +1132,8 @@ ST_FUNC void tcc_debug_start(TCCState *s1)
         n_debug_forw_hash_global = 0;
         n_debug_forw_hash_local = 0;
 
-        getcwd(buf, sizeof(buf));
+        if (n_path_complete(".", buf, sizeof(buf)) < 0)
+            buf[0] = 0;
 #ifdef _WIN32
         normalize_slashes(buf);
 #endif
@@ -2538,7 +2539,8 @@ ST_FUNC void tcc_tcov_block_begin(TCCState *s1)
 	    cstr_printf (&cstr, "%s", file->true_filename);
 	}
 	else {
-	    getcwd (wd, sizeof(wd));
+	    if (n_path_complete(".", wd, sizeof(wd)) < 0 || !strcmp(wd, "/"))
+	        wd[0] = 0; /* the root: "%s/%s" below then gives "/name" */
 	    tcov_data.last_file_name = tcov_section->data_offset + strlen(wd) + 1;
 	    cstr_printf (&cstr, "%s/%s", wd, file->true_filename);
 	}

@@ -4353,7 +4353,7 @@ done:
 static void storage_subscribe_document(struct web_js_state *s) {
     if(!s->host.storage_events || !s->host.storage || (s->doc->sandbox_flags&(SB_ORIGIN|SB_SCRIPTS)))return;
     static uint32_t serial;
-    if(!s->storage_source)s->storage_source=((uint64_t)(uint32_t)getpid()<<32)|__atomic_add_fetch(&serial,1,__ATOMIC_RELAXED);
+    if(!s->storage_source)s->storage_source=((uint64_t)(uint32_t)n_app_self()<<32)|__atomic_add_fetch(&serial,1,__ATOMIC_RELAXED);
     if(!s->storage_origin){
         JSValue argument=JS_NewString(s->ctx,web_effective_url(s->doc));
         JSValue value=custom_element_hook(s,"storageOrigin",1,&argument);JS_FreeValue(s->ctx,argument);

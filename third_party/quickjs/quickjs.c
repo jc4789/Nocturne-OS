@@ -24,14 +24,14 @@
  */
 #include <stdlib.h>
 #ifdef CONFIG_NOCTURNE
-#include <alloca.h>
+/* Nocturne has no alloca.h; the compiler provides the builtin. */
+#define alloca(size) __builtin_alloca(size)
 #endif
 #include <stdio.h>
 #include <stdarg.h>
 #include <inttypes.h>
 #include <string.h>
 #include <assert.h>
-#include <sys/time.h>
 #include <time.h>
 #ifndef CONFIG_NOCTURNE
 #include <fenv.h>
@@ -47914,9 +47914,9 @@ static uint64_t xorshift64star(uint64_t *pstate)
 
 static void js_random_init(JSContext *ctx)
 {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    ctx->random_state = ((int64_t)tv.tv_sec * 1000000) + tv.tv_usec;
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    ctx->random_state = ((int64_t)ts.tv_sec * 1000000) + ts.tv_nsec / 1000;
     /* the state must be non zero */
     if (ctx->random_state == 0)
         ctx->random_state = 1;
@@ -56241,9 +56241,9 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
 
 /* OS dependent: return the UTC time in ms since 1970. */
 static int64_t date_now(void) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (int64_t)tv.tv_sec * 1000 + (tv.tv_usec / 1000);
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (int64_t)ts.tv_sec * 1000 + (ts.tv_nsec / 1000000);
 }
 
 static JSValue js_date_constructor(JSContext *ctx, JSValueConst new_target,

@@ -136,6 +136,14 @@
  */
 
 /*
+ * When BR_USE_NOCTURNE_RAND is enabled, the system seeder takes its seed
+ * from the Nocturne n_random() entropy pool (the Nocturne build sets this
+ * on the command line, with BR_USE_URANDOM disabled).
+ *
+#define BR_USE_NOCTURNE_RAND   1
+ */
+
+/*
  * When BR_USE_WIN32_RAND is enabled, the SSL engine will use the Win32
  * (CryptoAPI) functions (CryptAcquireContext(), CryptGenRandom()...) to
  * automatically obtain quality randomness for seeding its internal PRNG.

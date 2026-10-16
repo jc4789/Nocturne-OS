@@ -12,6 +12,8 @@
 #define alloca _alloca
 #elif defined(__FreeBSD__) || defined(__OpenBSD__)
 #include <stdlib.h>
+#elif defined(__TINYC__)
+/* TinyCC provides alloca through its own <stddef.h>; Nocturne has no alloca.h. */
 #else
 #include <alloca.h>
 #endif
