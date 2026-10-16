@@ -3,6 +3,7 @@
 #include "html_policy.h"
 #include "frame.h"
 #include <stdio.h>
+#include <ctype.h>
 bool html_policy_requires_script(const web_doc *d) {
     for(const struct web_html_policy_rule *r=d && d->html_policy?d->html_policy->first:NULL;r;r=r->next)
         if(r->require_script)return true;
@@ -253,6 +254,65 @@ bool html_policy_init(web_doc *d,const char *headers,const web_doc *inherit){
         p=end;while(*p=='\r'||*p=='\n')p++;
     }
     return true;
+}
+/* The bare token of a structured-field item, without its parameters. Field
+   lines combine into a list, which is not an item: a repeat yields none. */
+static bool policy_token(const char *headers,const char *name,const char **value,size_t *length){
+    bool found=false;
+    for(const char *p=headers?headers:"";*p;){
+        const char *end=p;while(*end && *end!='\r' && *end!='\n')end++;
+        const char *colon=memchr(p,':',end-p);
+        if(colon && named(p,colon,name)){
+            if(found)return false;
+            const char *v=colon+1;while(v<end && (*v==' '||*v=='\t'))v++;
+            const char *t=v;while(t<end && (isalnum((unsigned char)*t)||*t=='-'||*t=='_'||*t=='.'||*t=='*'))t++;
+            const char *rest=t;while(rest<end && (*rest==' '||*rest=='\t'))rest++;
+            if(t==v || (rest<end && *rest!=';'))return false;
+            *value=v;*length=(size_t)(t-v);found=true;
+        }
+        p=end;while(*p=='\r'||*p=='\n')p++;
+    }
+    return found;
+}
+int html_policy_embedder(const char *headers){
+    const char *v;size_t n;
+    if(!policy_token(headers,"Cross-Origin-Embedder-Policy",&v,&n))return HTML_COEP_UNSAFE_NONE;
+    if(n==12 && !memcmp(v,"require-corp",12))return HTML_COEP_REQUIRE_CORP;
+    if(n==14 && !memcmp(v,"credentialless",14))return HTML_COEP_CREDENTIALLESS;
+    return HTML_COEP_UNSAFE_NONE;
+}
+bool html_policy_opener_isolated(const char *headers){
+    const char *v;size_t n;
+    return policy_token(headers,"Cross-Origin-Opener-Policy",&v,&n) && n==11 && !memcmp(v,"same-origin",11);
+}
+bool html_policy_trustworthy(const char *url){
+    if(!url)return false;
+    if(!strncasecmp(url,"https://",8)||!strncasecmp(url,"file://",7))return true;
+    if(strncasecmp(url,"http://",7))return false;
+    const char *host=url+7,*end=host;
+    if(*host=='['){end=strchr(host,']');return end && end-host==4 && !memcmp(host,"[::1",4);}
+    while(*end && *end!=':' && *end!='/' && *end!='?' && *end!='#')end++;
+    size_t n=(size_t)(end-host);
+    if(n==9 && !strncasecmp(host,"localhost",9))return true;
+    /* 127.0.0.0/8 in dotted-decimal; other spellings are not loopback here. */
+    unsigned parts=0,value=0,digits=0;
+    for(const char *c=host;c<=end;c++){
+        if(c<end && isdigit((unsigned char)*c)){if(++digits>3)return false;value=value*10+(unsigned)(*c-'0');continue;}
+        if(!digits||value>255||(c<end && *c!='.'))return false;
+        if(parts==0 && value!=127)return false;
+        parts++;value=digits=0;
+    }
+    return parts==4;
+}
+void html_policy_isolation(web_doc *d,const char *headers,const web_doc *inherit){
+    /* Local documents (about:blank, srcdoc, blob:) carry no response: their
+       policy container is the creator's. */
+    d->embedder_policy=headers?html_policy_embedder(headers):inherit?inherit->embedder_policy:HTML_COEP_UNSAFE_NONE;
+    web_doc *parent=d->frame_parent;
+    if(!parent)d->cross_origin_isolated=headers && html_policy_opener_isolated(headers) &&
+        d->embedder_policy!=HTML_COEP_UNSAFE_NONE && html_policy_trustworthy(d->url);
+    else d->cross_origin_isolated=parent->cross_origin_isolated && d->embedder_policy!=HTML_COEP_UNSAFE_NONE &&
+        web_frame_same_origin(parent,d);
 }
 bool html_policy_meta(web_doc *d,const char *content,size_t length){return d && content && list(d,content,content+length,false,true);}
 char *html_policy_headers(const web_doc *d){

@@ -12,6 +12,9 @@
     const getter = (proto, name) => Object.getOwnPropertyDescriptor(proto, name).get;
     const abLength = getter(ArrayBuffer.prototype, 'byteLength');
     const resizable = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, 'resizable');
+    const SAB = typeof SharedArrayBuffer === 'function' ? SharedArrayBuffer : null;
+    const sabLength = SAB ? getter(SAB.prototype, 'byteLength') : null;
+    const sabGrowable = SAB ? Object.getOwnPropertyDescriptor(SAB.prototype, 'growable') : null;
     const ta = Object.getPrototypeOf(U8.prototype), tag = getter(ta, Symbol.toStringTag);
     const taBuffer = getter(ta, 'buffer'), taOffset = getter(ta, 'byteOffset'), taLength = getter(ta, 'byteLength');
     const dvBuffer = getter(DataView.prototype, 'buffer'), dvOffset = getter(DataView.prototype, 'byteOffset');
@@ -25,7 +28,9 @@
         return value;
     };
     const encoderBrand = value => { if (!apply(wsHas, encoders, [value])) throw new TypeError('Illegal invocation'); };
-    const bytes = input => {
+    // AllowShared sources are copied before decoding: another agent may write
+    // them concurrently, and the decoder reads its input more than once.
+    const bytes = (input, writable = false) => {
         if (input === undefined) return new U8(0);
         let buffer = input, offset = 0, length;
         if (isView(input)) {
@@ -34,11 +39,13 @@
             offset = apply(typed ? taOffset : dvOffset, input, []);
             length = apply(typed ? taLength : dvLength, input, []);
         }
-        const size = apply(abLength, buffer, []);
-        if (resizable && apply(resizable.get, buffer, [])) throw new TypeError('Resizable buffer is not supported');
-        // SharedArrayBuffer is not exposed in Nocturne. This getter rejects it if
-        // the bootstrap is used in another runtime; AllowShared remains unsupported.
-        return new U8(buffer, offset, length === undefined ? size : length);
+        let size, shared = false;
+        try { size = apply(abLength, buffer, []); }
+        catch (error) { if (!sabLength) throw error; size = apply(sabLength, buffer, []); shared = true; }
+        const growable = shared ? sabGrowable : resizable;
+        if (growable && apply(growable.get, buffer, [])) throw new TypeError('Resizable buffer is not supported');
+        const view = new U8(buffer, offset, length === undefined ? size : length);
+        return shared && !writable ? new U8(view) : view;
     };
     function encodeString(s, destination, capacity) {
         let read = 0, written = 0;
@@ -77,7 +84,7 @@
             if (arguments.length < 2) throw new TypeError('encodeInto requires source and destination');
             const s = text(input);
             if (apply(tag, destination, []) !== 'Uint8Array') throw new TypeError('Expected Uint8Array');
-            const output = bytes(destination);
+            const output = bytes(destination, true);
             return encodeString(s, output, apply(taLength, output, []));
         }
     }

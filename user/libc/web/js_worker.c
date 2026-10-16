@@ -9,10 +9,10 @@
 struct packet {struct packet *next;struct njw_header h;size_t at;uint8_t *data;};
 struct resource {struct resource *next;uint32_t id;};
 #include "js_worker_port_lifetime.h"
-struct child {struct child *next,*shared_next;web_workers *owner;char *name,*creator_policy,*url,*origin;size_t name_len;uint32_t id,generation,parent_port;int pid,in,out,creator_referrer_policy;bool started,stopped,closing,inherit_policy,shared;struct packet *tx,*tail;struct broker_pair *ports;struct resource *resources;struct njw_header rx;size_t head_at,data_at,rx_charge;uint8_t *data;};
+struct child {struct child *next,*shared_next;web_workers *owner;char *name,*creator_policy,*url,*origin;size_t name_len;uint32_t id,generation,parent_port;int pid,in,out,creator_referrer_policy;bool started,stopped,closing,inherit_policy,shared,isolated;struct packet *tx,*tail;struct broker_pair *ports;struct resource *resources;struct njw_header rx;size_t head_at,data_at,rx_charge;uint8_t *data;};
 struct shared_ref {struct shared_ref *next;struct child *child;};
 struct event {struct event *next;uint32_t id;struct njw_header h;uint8_t *data;bool from_child;};
-struct web_workers {struct web_workers *next;JSContext *ctx;JSValue callback;uint32_t generation;web_worker_loader load;web_worker_requester request;web_worker_canceler cancel;void *opaque;char *creator_policy,*origin;int creator_referrer_policy;web_worker_reporter reporter;void *report_opaque;struct child *children;struct shared_ref *shared;struct event *events,*last;size_t queued;uint32_t next_lease;struct broker_lease *leases;};
+struct web_workers {struct web_workers *next;JSContext *ctx;JSValue callback;uint32_t generation;web_worker_loader load;web_worker_requester request;web_worker_canceler cancel;void *opaque;char *creator_policy,*origin;int creator_referrer_policy;bool isolated;web_worker_reporter reporter;void *report_opaque;struct child *children;struct shared_ref *shared;struct event *events,*last;size_t queued;uint32_t next_lease;struct broker_lease *leases;};
 static struct child *shared_children;
 static web_workers *managers;
 static uint32_t next_worker_id;
@@ -121,15 +121,24 @@ static void route_event(web_workers*w,struct child*c,struct event*e){
     if(w->last)w->last->next=e;else w->events=e;w->last=e;
 }
 static void fail(web_workers *w,struct child *c,const char *message){stop(w,c);JSValue v=JS_NewObject(w->ctx);JS_DefinePropertyValueStr(w->ctx,v,"message",JS_NewString(w->ctx,message),JS_PROP_C_W_E);JS_DefinePropertyValueStr(w->ctx,v,"terminal",JS_TRUE,JS_PROP_C_W_E);event(w,c,NJW_ERROR,v);JS_FreeValue(w->ctx,v);}
+/* A dedicated process closed its response pipe: reap it now when possible so
+   the error names its exit status (an abort, a fault or a plain exit). */
+static void child_exited(web_workers *w,struct child *c){
+    int status=0;char message[64]="Worker process exited";
+    if(c->pid&&waitpid(c->pid,&status,WNOHANG)==c->pid){c->pid=0;if(active_children)active_children--;
+        snprintf(message,sizeof message,"Worker process exited (status %d)",status);}
+    fail(w,c,message);
+}
 static bool spawn_child(web_workers *w,struct child *c){
     web_worker_background();if(active_children>=NJW_MAX_WORKERS){fail(w,c,"Native Worker process count is not representable");return false;}
-    int ip[2]={-1,-1},op[2]={-1,-1},nullfd=-1;
-    if(pipe(ip)<0||pipe(op)<0||(nullfd=open("/dev/null",O_WRONLY))<0)goto bad;
-    int map[3]={ip[0],op[1],nullfd};char *argv[]={"browserjsworker",NULL};c->pid=spawn("/bin/browserjsworker",argv,map,0);
-    close(ip[0]);ip[0]=-1;close(op[1]);op[1]=-1;close(nullfd);nullfd=-1;if(c->pid<0){c->pid=0;goto bad;}active_children++;
+    int ip[2]={-1,-1},op[2]={-1,-1};
+    if(pipe(ip)<0||pipe(op)<0)goto bad;
+    /* The worker reports a runtime abort on the page owner's diagnostic stream. */
+    int map[3]={ip[0],op[1],2};char *argv[]={"browserjsworker",NULL};c->pid=spawn("/bin/browserjsworker",argv,map,0);
+    close(ip[0]);ip[0]=-1;close(op[1]);op[1]=-1;if(c->pid<0){c->pid=0;goto bad;}active_children++;
     c->in=ip[1];ip[1]=-1;c->out=op[0];op[0]=-1;if(fcntl(c->in,F_SETFL,O_NONBLOCK)<0||fcntl(c->out,F_SETFL,O_NONBLOCK)<0){fail(w,c,"Worker nonblocking pipe setup failed");return false;}
     JSValue log=JS_NewObject(w->ctx);JS_SetPropertyStr(w->ctx,log,"message",JS_NewString(w->ctx,"native dedicated task; heap grows on demand (no configured ceiling)"));event(w,c,NJW_CONSOLE,log);JS_FreeValue(w->ctx,log);return true;
-bad:for(int i=0;i<2;i++){if(ip[i]>=0)close(ip[i]);if(op[i]>=0)close(op[i]);}if(nullfd>=0)close(nullfd);fail(w,c,"Cannot spawn native dedicated Worker");return false;
+bad:for(int i=0;i<2;i++){if(ip[i]>=0)close(ip[i]);if(op[i]>=0)close(op[i]);}fail(w,c,"Cannot spawn native dedicated Worker");return false;
 }
 /* Native full-key rendezvous. No filesystem packet persistence, POSIX sockets
  * or hash-only authority. Every returned duplex endpoint has its own queue. */
@@ -150,6 +159,7 @@ static bool shared_transport(web_workers*w,struct child*c,bool*created){
 web_workers *web_worker_new(JSContext *ctx,uint32_t generation,web_worker_loader load,void *opaque){web_workers *w=calloc(1,sizeof *w);if(!w)return NULL;w->ctx=ctx;w->generation=generation;w->callback=JS_UNDEFINED;w->load=load;w->opaque=opaque;w->next=managers;managers=w;return w;}
 bool web_worker_set_policy(web_workers *w,const char *headers,int referrer_policy){if(!w||referrer_policy<0||referrer_policy>8)return false;char *copy=policy_copy(headers);if(!copy)return false;free(w->creator_policy);w->creator_policy=copy;w->creator_referrer_policy=referrer_policy;return true;}
 bool web_worker_set_origin(web_workers*w,const char*origin){if(!w)return false;char*copy=policy_copy(origin);if(!copy)return false;free(w->origin);w->origin=copy;return true;}
+void web_worker_set_isolated(web_workers*w,bool isolated){if(w)w->isolated=isolated;}
 void web_worker_set_reporter(web_workers *w,web_worker_reporter reporter,void *opaque){if(w){w->reporter=reporter;w->report_opaque=opaque;}}
 void web_worker_set_canceler(web_workers *w,web_worker_canceler cancel){if(w)w->cancel=cancel;}
 void web_worker_set_requester(web_workers *w,web_worker_requester request){if(w)w->request=request;}
@@ -178,7 +188,7 @@ JSValue web_worker_native(web_workers *w,int argc,JSValueConst *argv){
         c->creator_policy=policy_copy(w->creator_policy);c->url=policy_copy(url);c->origin=policy_copy(w->origin);
         c->creator_referrer_policy=w->creator_referrer_policy;
         if(!c->name||!c->creator_policy||!c->url||!c->origin){JS_FreeCString(ctx,url);free(ref);child_free(c);return JS_ThrowOutOfMemory(ctx);}
-        c->shared=op==5;c->owner=w;c->generation=w->generation;c->inherit_policy=!strncasecmp(url,"blob:",5)||!strncasecmp(url,"data:",5)||!strncasecmp(url,"about:",6);c->id=++next_worker_id;c->in=c->out=-1;c->next=w->children;w->children=c;
+        c->shared=op==5;c->owner=w;c->isolated=w->isolated&&op!=5;c->generation=w->generation;c->inherit_policy=!strncasecmp(url,"blob:",5)||!strncasecmp(url,"data:",5)||!strncasecmp(url,"about:",6);c->id=++next_worker_id;c->in=c->out=-1;c->next=w->children;w->children=c;
         if(c->shared){*ref=(struct shared_ref){w->shared,c};w->shared=ref;c->shared_next=shared_children;shared_children=c;}
         bool created=true,ok=!c->shared||shared_transport(w,c,&created);
         if(ok&&created)ok=w->load&&w->load(w->opaque,c->id,0,url,0);else if(ok)c->started=true;
@@ -220,7 +230,8 @@ void web_worker_loaded(web_workers *w,uint32_t id,uint32_t request,int status,co
     if(first)filled=filled && resource_field(ctx,a,NJW_START_CREATOR_POLICY,JS_NewString(ctx,c->creator_policy?c->creator_policy:"")) &&
         resource_field(ctx,a,NJW_START_INHERIT_POLICY,JS_NewBool(ctx,c->inherit_policy)) && resource_field(ctx,a,NJW_START_SHARED,JS_NewBool(ctx,c->shared)) &&
         resource_field(ctx,a,NJW_START_CREATOR_ORIGIN,JS_NewString(ctx,c->origin?c->origin:"")) &&
-        resource_field(ctx,a,NJW_START_CREATOR_REFERRER_POLICY,JS_NewInt32(ctx,c->creator_referrer_policy));
+        resource_field(ctx,a,NJW_START_CREATOR_REFERRER_POLICY,JS_NewInt32(ctx,c->creator_referrer_policy)) &&
+        resource_field(ctx,a,NJW_START_CROSS_ORIGIN_ISOLATED,JS_NewBool(ctx,c->isolated));
     bool ok=filled && serialized(w,c,first?NJW_START:NJW_LOADED,request,kind,a,first);JS_FreeValue(ctx,a);if(!ok){fail(w,c,"Worker resource allocation, representation or transport failed");return;}if(first)c->started=true;
 }
 void web_worker_pump(web_workers *w,uint64_t now){
@@ -232,7 +243,7 @@ void web_worker_pump(web_workers *w,uint64_t now){
             /* Read only this tick's finite byte budget. Once the header is
                complete, reserve its actual size; never allocate a maximum
                payload in advance or reject a count-based queue quota. */
-            size_t left=header?sizeof c->rx-c->head_at:c->rx.bytes-c->data_at;size_t take=left<budget?left:budget;ssize_t n=read(c->out,header?(void *)((uint8_t *)&c->rx+c->head_at):(void *)(c->data+c->data_at),take);if(n<0&&(errno==EAGAIN||errno==EINTR))break;if(n<=0){fail(w,c,"Worker process exited");break;}budget-=n;
+            size_t left=header?sizeof c->rx-c->head_at:c->rx.bytes-c->data_at;size_t take=left<budget?left:budget;ssize_t n=read(c->out,header?(void *)((uint8_t *)&c->rx+c->head_at):(void *)(c->data+c->data_at),take);if(n<0&&(errno==EAGAIN||errno==EINTR))break;if(n<=0){child_exited(w,c);break;}budget-=n;
             if(header){c->head_at+=n;if(c->head_at==sizeof c->rx){bool port=c->rx.op==NJW_PORT_MESSAGE||c->rx.op==NJW_PORT_CLOSE||c->rx.op==NJW_PORT_DRAINED;
                 bool valid_kind=port?c->rx.kind<=1:c->rx.op==NJW_MESSAGE?(c->rx.kind==0||c->rx.kind==NJW_WITH_PORTS):c->rx.op==NJW_LOAD?(njw_load_kind_valid(c->rx.kind)||(c->shared&&!c->rx.request&&!c->rx.kind)):c->rx.op==NJW_CANCEL?c->rx.kind==0&&c->rx.request!=0:c->rx.kind<=2;
                 if(c->rx.magic!=NJW_MAGIC||c->rx.generation!=c->generation||!c->rx.bytes||(c->rx.op!=NJW_MESSAGE&&c->rx.op!=NJW_ERROR&&c->rx.op!=NJW_LOAD&&c->rx.op!=NJW_CANCEL&&c->rx.op!=NJW_CLOSE&&c->rx.op!=NJW_CONSOLE&&c->rx.op!=NJW_CSP_REPORT&&!port)||!valid_kind||!queue_room(w,c->rx.bytes)){fail(w,c,"Invalid Worker response or receive size overflow");break;}c->data=malloc(c->rx.bytes);if(!c->data){fail(w,c,"Worker receive allocation failed");break;}c->rx_charge=sizeof c->rx+c->rx.bytes;w->queued+=c->rx_charge;}}else c->data_at+=n;

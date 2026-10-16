@@ -404,7 +404,10 @@ static int64_t fat_read(struct vnode *v, struct file *f, void *buf, uint64_t off
     return done ? (int64_t)done : -EIO;
 }
 
-static int64_t fat_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t len) {
+/* Store len bytes at off, growing the chain as needed. A NULL buf stores
+   zeros: new clusters are not zeroed on allocation and a truncated cluster
+   keeps its old tail, so every byte between EOF and a later end is written. */
+static int64_t fat_store(struct vnode *v, const void *buf, uint64_t off, uint64_t len) {
     struct fat_node *n = v->priv;
     struct fat_fs *fs = n->fs;
     if (!len) return 0;
@@ -427,17 +430,25 @@ static int64_t fat_write(struct vnode *v, struct file *f, const void *buf, uint6
     uint8_t *tmp = kmalloc(fs->cbytes);
     if (!tmp) return -ENOMEM;
     uint32_t c = chain_nth(fs, n->first, off / fs->cbytes);
-    size_t done = 0;
+    uint64_t done = 0;
     int err = 0;
+    bool zeroed = false;
     while (done < len && c) {
         uint32_t in = (uint32_t)((off + done) % fs->cbytes);
-        size_t take = MIN(len - done, (size_t)(fs->cbytes - in));
+        size_t take = (size_t)MIN(len - done, (uint64_t)(fs->cbytes - in));
         if (in == 0 && take == fs->cbytes) {
-            err = clus_write(fs, c, (const uint8_t *)buf + done);
+            if (buf) err = clus_write(fs, c, (const uint8_t *)buf + done);
+            else {
+                if (!zeroed) memset(tmp, 0, fs->cbytes);
+                zeroed = true;
+                err = clus_write(fs, c, tmp);
+            }
         } else {
+            zeroed = false;
             err = clus_read(fs, c, tmp);
             if (!err) {
-                memcpy(tmp + in, (const uint8_t *)buf + done, take);
+                if (buf) memcpy(tmp + in, (const uint8_t *)buf + done, take);
+                else memset(tmp + in, 0, take);
                 err = clus_write(fs, c, tmp);
             }
         }
@@ -452,12 +463,26 @@ static int64_t fat_write(struct vnode *v, struct file *f, const void *buf, uint6
     return done ? (int64_t)done : -EIO;
 }
 
+static int64_t fat_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t len) {
+    if (!len) return 0;
+    if (off > v->size) {
+        uint64_t gap = off - v->size;
+        int64_t r = fat_store(v, NULL, v->size, gap);
+        if (r < 0) return r;
+        if ((uint64_t)r < gap) return -EIO;
+    }
+    return fat_store(v, buf, off, len);
+}
+
 static int fat_truncate(struct vnode *v, uint64_t size) {
     struct fat_node *n = v->priv;
     struct fat_fs *fs = n->fs;
     if (size >= v->size) {
-        v->size = size; /* growing: the new bytes are allocated lazily by the next write */
-        return node_sync(v);
+        uint64_t grow = size - v->size;
+        if (!grow) return node_sync(v);
+        int64_t r = fat_store(v, NULL, v->size, grow);
+        if (r < 0) return (int)r;
+        return (uint64_t)r < grow ? -EIO : 0;
     }
     uint64_t keep = (size + fs->cbytes - 1) / fs->cbytes;
     if (keep == 0) {

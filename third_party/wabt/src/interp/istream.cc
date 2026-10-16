@@ -23,6 +23,7 @@ namespace interp {
 
 template <typename T>
 void WABT_VECTORCALL Istream::EmitAt(Offset offset, T val) {
+  assert(!external_);
   u32 new_size = offset + sizeof(T);
   if (new_size > data_.size()) {
     data_.resize(new_size);
@@ -116,14 +117,21 @@ void Istream::ResolveFixupU32(Offset fixup_offset) {
 }
 
 Istream::Offset Istream::end() const {
-  return static_cast<u32>(data_.size());
+  return external_ ? external_size_ : static_cast<u32>(data_.size());
+}
+
+void Istream::Adopt(const u8* data, Offset size) {
+  Buffer().swap(data_);
+  external_ = data;
+  external_size_ = size;
 }
 
 template <typename T>
 T WABT_VECTORCALL Istream::ReadAt(Offset* offset) const {
-  assert(*offset + sizeof(T) <= data_.size());
+  assert(*offset + sizeof(T) <= end());
   T result;
-  memcpy(&result, data_.data() + *offset, sizeof(T));
+  // A builtin under -fno-builtin: every decoded operand is one move.
+  __builtin_memcpy(&result, data() + *offset, sizeof(T));
   *offset += sizeof(T);
   return result;
 }
@@ -833,7 +841,7 @@ Instr Istream::Read(Offset* offset) const {
 }
 
 void Istream::Disassemble(Stream* stream) const {
-  Disassemble(stream, 0, data_.size());
+  Disassemble(stream, 0, end());
 }
 
 std::string Istream::DisassemblySource::Header(Offset offset) {
@@ -851,7 +859,7 @@ Istream::Offset Istream::Disassemble(Stream* stream, Offset offset) const {
 
 void Istream::Disassemble(Stream* stream, Offset from, Offset to) const {
   DisassemblySource source;
-  assert(from <= data_.size() && to <= data_.size() && from <= to);
+  assert(from <= end() && to <= end() && from <= to);
 
   Offset pc = from;
   while (pc < to) {

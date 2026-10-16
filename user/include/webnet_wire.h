@@ -57,6 +57,8 @@
    referrer extension; its URL bytes follow optional referrer URL bytes in the
    payload. The existing 64-byte prefix and six lengths remain unchanged. */
 #define WEBNET_WIRE_TOP_LEVEL 4194304u
+/* Initiator COEP require-corp; enforced by the transport on no-cors responses. */
+#define WEBNET_WIRE_REQUIRE_CORP 8388608u
 #define WEBNET_SERVICE_WINDOW (256u * 1024u)
 #define WEBNET_SERVICE_CREDIT_STEP (64u * 1024u)
 #define WEBNET_CREDIT_MAGIC 0x574e4301u
@@ -71,7 +73,7 @@ _Static_assert(sizeof(struct webnet_wire_top_level)==8,"webfetch top document ex
 #define WEBNET_STREAM_UPLOAD  0x574e5304u
 #define WEBNET_STREAM_REQUEST_CREDIT 0x574e5305u
 #define WEBNET_STREAM_CHUNK_MAX 65536u
-#define WEBNET_WIRE_REQUEST_FLAGS (WEBNET_WIRE_USER_NAVIGATION | WEBNET_WIRE_FORCE_PREFLIGHT | WEBNET_WIRE_REDIRECT_ERROR | WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_CACHE_MASK | WEBNET_WIRE_LARGE_SCRIPT | WEBNET_WIRE_DYNAMIC_BODY | WEBNET_WIRE_DYNAMIC_HEADERS | WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS | WEBNET_WIRE_IMAGE_UPGRADE | WEBNET_WIRE_DYNAMIC_URL | WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER | WEBNET_WIRE_STREAM | WEBNET_WIRE_DEBUG_REQUEST | WEBNET_WIRE_BODY_PRESENT | WEBNET_WIRE_REFERRER | WEBNET_WIRE_SERVICE | WEBNET_WIRE_TOP_LEVEL)
+#define WEBNET_WIRE_REQUEST_FLAGS (WEBNET_WIRE_USER_NAVIGATION | WEBNET_WIRE_FORCE_PREFLIGHT | WEBNET_WIRE_REDIRECT_ERROR | WEBNET_WIRE_SAME_ORIGIN | WEBNET_WIRE_STATUS_LINE | WEBNET_WIRE_LARGE_HEADERS | WEBNET_WIRE_CACHE_MASK | WEBNET_WIRE_LARGE_SCRIPT | WEBNET_WIRE_DYNAMIC_BODY | WEBNET_WIRE_DYNAMIC_HEADERS | WEBNET_WIRE_DYNAMIC_REQUEST_HEADERS | WEBNET_WIRE_IMAGE_UPGRADE | WEBNET_WIRE_DYNAMIC_URL | WEBNET_WIRE_NO_CORS | WEBNET_WIRE_NO_REFERRER | WEBNET_WIRE_STREAM | WEBNET_WIRE_DEBUG_REQUEST | WEBNET_WIRE_BODY_PRESENT | WEBNET_WIRE_REFERRER | WEBNET_WIRE_SERVICE | WEBNET_WIRE_TOP_LEVEL | WEBNET_WIRE_REQUIRE_CORP)
 static inline size_t webnet_wire_url_limit(uint32_t flags) {
     return flags & WEBNET_WIRE_DYNAMIC_URL ? (size_t)UINT32_MAX : WEBNET_URL_MAX - 1u;
 }
@@ -134,3 +136,18 @@ struct webnet_wire_cookie {
 };
 _Static_assert(sizeof(struct webnet_wire_request)==64,"webfetch request framing");
 _Static_assert(sizeof(struct webnet_wire_response)==48,"webfetch response framing");
+/* WebSocket channel (RFC 6455), opened with a WEBNET_WEBSOCKET request whose
+   payload is the ws/wss URL, the serialized initiator origin and prepared
+   request fields (Sec-WebSocket-Protocol, Cookie). Afterwards both directions
+   carry whole messages as records: the service does the framing, masking,
+   fragmentation and control frames. Each record is followed by `length`
+   payload bytes. Service to browser: OPEN (code 101; payload the handshake
+   response fields), MESSAGE, CLOSE (code; payload reason; the closing
+   handshake finished cleanly) and ERROR (payload error text). Browser to
+   service: MESSAGE and CLOSE (code 0 for none). */
+#define WEBNET_SOCKET_OPEN    0x574e5701u
+#define WEBNET_SOCKET_MESSAGE 0x574e5702u
+#define WEBNET_SOCKET_CLOSE   0x574e5703u
+#define WEBNET_SOCKET_ERROR   0x574e5704u
+struct webnet_wire_socket { uint32_t magic, code; uint64_t length; };
+_Static_assert(sizeof(struct webnet_wire_socket)==16,"webfetch socket framing");

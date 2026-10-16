@@ -166,11 +166,12 @@ const workerMessagingBridge=(()=>{
         const plan=cloneData.commitPlan(packet,receivers);cloneData.validate(packet);return {packet:[packet.data,metadata],plan,tokens:packet.tokens};
         }catch(error){apply(mapEach,routes,[(route,key)=>{if(!route.active)apply(mapDelete,routes,[key]);}]);throw error;}
     }
-    function abortExternal(prepared){for(let i=0;i<prepared.tokens.length;i++){const token=prepared.tokens[i];if(token&&!token.route.active)apply(mapDelete,routes,[token.route.key]);}}
+    function abortExternal(prepared){for(let i=0;i<prepared.tokens.length;i++){const token=prepared.tokens[i];if(token&&token.route&&!token.route.active)apply(mapDelete,routes,[token.route.key]);}}
     function importExternal(wire){
         const metadata=wire[1],receivers=[],added=[];
         try{
         for(let i=0;i<metadata.length;i++){const m=metadata[i];if(m===null){append(receivers,null);continue;}
+            if(offscreenCanvasBridge.isMeta(m)){append(receivers,offscreenCanvasBridge.receive(m));continue;}
             const id=m[0],creator=m[1],key=routeKey(id,creator);if(!isInteger(id)||id<=0||id>4294967295||creator!==0||routeGet(key))throw new TypeErr('Invalid Worker port ownership');
             const endpoint=record({peer:null,owner:null,head:null,tail:null,scheduled:null,broker:null}),owner=makePort(endpoint);
             const route=record({key,id,creator,endpoint,closed:false,sealed:false,active:true});endpoint.owner=owner;endpoint.broker=route;append(added,route);routePut(key,route);

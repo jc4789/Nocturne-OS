@@ -31,6 +31,8 @@ web_workers *web_worker_new(JSContext *,uint32_t,web_worker_loader,void *);
 bool web_worker_set_policy(web_workers *,const char *,int);
 /* Native document authority, never supplied by the author's constructor. */
 bool web_worker_set_origin(web_workers *,const char *);
+/* The creator's agent-cluster isolation, inherited by dedicated Workers. */
+void web_worker_set_isolated(web_workers *,bool);
 typedef void (*web_worker_reporter)(void *,JSValueConst);
 void web_worker_set_reporter(web_workers *,web_worker_reporter,void *);
 void web_worker_set_canceler(web_workers *,web_worker_canceler);

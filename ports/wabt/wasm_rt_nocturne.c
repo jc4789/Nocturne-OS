@@ -77,6 +77,10 @@ void wasm_rt_poll(void) {
     if (state->poll.callback && state->poll.callback(state->poll.opaque))
         wasm_rt_native_trap(WASM_RT_TRAP_INTERRUPTED);
 }
+uintptr_t wasm_rt_native_stack_low(void) {
+    struct wasm_native_thread *state = thread_state();
+    return state ? state->stack_low : UINTPTR_MAX;
+}
 void wasm_rt_check_native_stack(void) {
     struct wasm_native_thread *state = thread_state();
     char marker;

@@ -45,6 +45,9 @@ static bool worker_port_metadata(JSContext *ctx,JSValueConst value,unsigned crea
         if(JS_IsNull(entry)){JS_FreeValue(ctx,entry);continue;}
         if(JS_GetClassID(entry)!=array){JS_FreeValue(ctx,entry);JS_ThrowTypeError(ctx,"Invalid Worker port ownership entry");goto fail;}
         JSValue id=JS_GetPropertyUint32(ctx,entry,0);if(JS_IsException(id)){JS_FreeValue(ctx,entry);goto fail;}
+        /* A string-tagged entry is a non-port transfer (e.g. OffscreenCanvas)
+           with no broker lifetime; the receiving realm validates its record. */
+        if(JS_IsString(id)){JS_FreeValue(ctx,id);JS_FreeValue(ctx,entry);continue;}
         JSValue side=JS_GetPropertyUint32(ctx,entry,1);if(JS_IsException(side)){JS_FreeValue(ctx,id);JS_FreeValue(ctx,entry);goto fail;}
         uint32_t number=0,tag=2;double exact=0,exact_tag=0;
         ok=JS_IsNumber(id)&&JS_IsNumber(side)&&!JS_ToUint32(ctx,&number,id)&&!JS_ToUint32(ctx,&tag,side)&&

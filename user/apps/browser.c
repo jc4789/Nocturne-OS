@@ -1021,6 +1021,7 @@ static bool host_request(void *opaque, const struct web_request *request) {
         .cache_mode = request->cache_mode, .keepalive = request->keepalive,
         .fetch_group = request->fetch_group
         , .stream_response = request->stream_response, .top_level_url=web_url(doc)
+        , .require_corp = request->require_corp
     };
     t->network_id = webnet_submit(network, &r, resource_completed, t);
     if (!t->network_id) { free(t); return false; }
@@ -1052,6 +1053,59 @@ static void host_resume_request(void *opaque, uint64_t id) {
     (void)opaque;
     for (struct transfer *t = transfers; t; t = t->next)
         if (t->generation == generation && t->resource_id == id) { webnet_resume(network, t->network_id); return; }
+}
+
+/* WebSocket: the webnet socket id is the document-visible id. Delivery stops
+   with the document generation; webnet_cancel_generation releases the rest. */
+static void socket_message(webnet *net, uint64_t id, const struct webnet_socket_message *m, void *opaque) {
+    (void)net;
+    uint64_t gen = (uint64_t)(uintptr_t)opaque;
+    if (!doc || gen != generation) return;
+    struct web_socket_event e = { .code = m->code, .data = m->data, .length = m->length, .protocol = m->protocol };
+    switch (m->event) {
+    case WEBNET_SOCKET_OPENED: e.type = WEB_SOCKET_OPENED; break;
+    case WEBNET_SOCKET_RECEIVED: e.type = m->code == WEBNET_SOCKET_BINARY ? WEB_SOCKET_MESSAGE_BINARY : WEB_SOCKET_MESSAGE_TEXT; e.code = 0; break;
+    case WEBNET_SOCKET_CLOSED: e.type = WEB_SOCKET_CLOSED; break;
+    default: e.type = WEB_SOCKET_FAILED; break;
+    }
+    web_socket_event(doc, id, &e);
+}
+static uint64_t host_socket_open(void *opaque, const char *url, const char *protocols, const char *origin) {
+    (void)opaque;
+    if (!doc || quit || !url) return 0;
+    char *headers = NULL;
+    if (protocols && *protocols) {
+        size_t n = strlen(protocols);
+        static const char name[] = "Sec-WebSocket-Protocol: ";
+        if (n > SIZE_MAX - sizeof name - 2 || !(headers = malloc(sizeof name - 1 + n + 3))) return 0;
+        memcpy(headers, name, sizeof name - 1);
+        memcpy(headers + sizeof name - 1, protocols, n);
+        memcpy(headers + sizeof name - 1 + n, "\r\n", 3);
+    }
+    struct webnet_request r = {
+        .kind = WEBNET_WEBSOCKET, .generation = generation, .url = url,
+        .origin = origin ? origin : web_url(doc), .method = "GET", .headers = headers,
+        .credentials = WEBNET_CREDENTIALS_INCLUDE, .top_level_url = web_url(doc)
+    };
+    uint64_t id = webnet_socket_open(network, &r, socket_message, (void *)(uintptr_t)generation);
+    free(headers);
+    return id;
+}
+static bool host_socket_send(void *opaque, uint64_t id, bool binary, const void *data, size_t length) {
+    (void)opaque;
+    return webnet_socket_send(network, id, binary ? WEBNET_SOCKET_BINARY : WEBNET_SOCKET_TEXT, data, length);
+}
+static bool host_socket_close(void *opaque, uint64_t id, unsigned code, const char *reason, size_t length) {
+    (void)opaque;
+    return webnet_socket_close(network, id, code, reason, length);
+}
+static size_t host_socket_buffered(void *opaque, uint64_t id) {
+    (void)opaque;
+    return webnet_socket_buffered(network, id);
+}
+static void host_socket_release(void *opaque, uint64_t id) {
+    (void)opaque;
+    webnet_socket_release(network, id);
 }
 
 static void cancel_document_requests(void) {
@@ -1209,7 +1263,7 @@ static void native_active_event(const struct gui_event *event) {
 static int browser_event(struct gui_event *event, int timeout) {
     int result=win_event(w,event,0);
     if(!result && timeout!=0){
-        int ready=webnet_wait(network,w->fd,timeout);
+        int ready=webnet_wait(network,w->fd,web_wait_fd(),timeout);
         if(ready<0 && errno!=EINTR)return -1;
         result=win_event(w,event,0);
     }
@@ -1462,6 +1516,8 @@ static bool host_sync_load(void *opaque, const char *url, int kind, struct web_r
 
 static const struct web_host browser_host = {
     .request = host_request, .cancel = host_cancel, .release_request = host_release_request, .resume_request = host_resume_request, .sync_load = host_sync_load,
+    .socket_open = host_socket_open, .socket_send = host_socket_send, .socket_close = host_socket_close,
+    .socket_buffered = host_socket_buffered, .socket_release = host_socket_release,
     .sync_request = host_sync_request,
     .wait_request = host_wait_request,
     .navigate = host_navigate, .console = host_console, .scroll = host_scroll,
@@ -2665,6 +2721,19 @@ static void report_loop_profile(uint64_t now) {
     memset(&loop_profile, 0, sizeof loop_profile);
     loop_profile.since = now;
     host_console(NULL, 0, message);
+    {
+        /* Private pages of this process, against what malloc holds and uses:
+           the difference between process and heap is mapped memory. */
+        static struct n_procinfo processes[256];
+        size_t heap = 0, used = 0; unsigned long process_kb = 0;
+        int count = proclist(processes, 256), self = getpid();
+        for (int i = 0; i < count; i++) if (processes[i].pid == self) process_kb = processes[i].mem_kb;
+        malloc_usage(&heap, &used);
+        snprintf(message, sizeof message, "Browser memory: process %lu KiB, malloc heap %lu KiB, in use %lu KiB",
+                 process_kb, (unsigned long)(heap / 1024), (unsigned long)(used / 1024));
+        host_console(NULL, 0, message);
+    }
+    if (web_wait_report(message, sizeof message) > 0) host_console(NULL, 0, message);
     if(consoles){snprintf(message,sizeof message,
         "Browser console profile: rect draw %u/%lu ms, rect present %lu ms (no author page paint)",
         consoles,(unsigned long)console_ms,(unsigned long)console_update);host_console(NULL,0,message);}

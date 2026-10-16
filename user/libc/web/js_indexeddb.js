@@ -40,7 +40,7 @@ const indexedDBBridge=(()=>{
     function pathValue(value,path){if(path==='')return value;for(const p of path.split('.')){if(value==null||!Object.hasOwn(Object(value),p))return undefined;value=value[p];}return value;}
     function keyPath(value){if(value===null)return null;const p=Array.isArray(value)?value.map(strings):strings(value);const valid=x=>x===''||/^[\p{ID_Start}_$][\p{ID_Continue}$\u200c\u200d]*(?:\.[\p{ID_Start}_$][\p{ID_Continue}$\u200c\u200d]*)*$/u.test(x);if(Array.isArray(p)?p.some(x=>!valid(x)):!valid(p))fail('SyntaxError');return p;}
     function inject(value,path,valueKey){if(!value||typeof value!=='object'||!path||Array.isArray(path))fail('DataError');const parts=path.split('.');for(let i=0;i<parts.length-1;i++){const p=parts[i];if(!Object.hasOwn(value,p))Object.defineProperty(value,p,{value:{},writable:true,enumerable:true,configurable:true});value=value[p];if(!value||typeof value!=='object')fail('DataError');}Object.defineProperty(value,parts[parts.length-1],{value:valueKey,writable:true,enumerable:true,configurable:true});}
-    function clone(value){return cloneData.deserialize(cloneData.serialize(value),null,true);}
+    function clone(value){return cloneData.deserialize(cloneData.serialize(value,undefined,true),null,true);}
     async function prefetch(list,tx){
         const r=get(tx,'IDBTransaction');
         if(!r.valueCache)r.valueCache=new Map();
@@ -236,7 +236,7 @@ const indexedDBBridge=(()=>{
         let initial;if(candidate===undefined){if(!store.autoIncrement)fail('DataError');}else initial=key(candidate);
         return enqueue(s.tx,source,async r=>{const st=schema(s);let k=initial;if(k===undefined){if(st.generator>9007199254740992)fail('ConstraintError');k=st.generator;if(st.keyPath!==null)inject(detached,st.keyPath,k);}const at=insertion(st.records,k),exists=at<st.records.length&&!compare(st.records[at][0],k);if(addOnly&&exists)fail('ConstraintError');
             const indexes=[];for(const index of st.indexes){const keys=indexKeys(index,detached);indexes.push([index.name,keys]);if(index.unique)for(const old of st.records){if(!compare(old[0],k))continue;for(const oldKey of old[2]?.find(v=>v[0]===index.name)?.[1]||[])if(keys.some(ik=>!compare(ik,oldKey)))fail('ConstraintError');}}
-            const staged=await native('stage',r.nativeToken,pack(cloneData.serialize(detached)));status(staged[0]);if(r.finished)return;const record=[k,staged[1],indexes];if(exists)st.records[at]=record;else st.records.splice(at,0,record);if(st.autoIncrement&&typeof k==='number'&&k>=st.generator)st.generator=Math.floor(k)+1;return clone(k);});
+            const staged=await native('stage',r.nativeToken,pack(cloneData.serialize(detached,undefined,true)));status(staged[0]);if(r.finished)return;const record=[k,staged[1],indexes];if(exists)st.records[at]=record;else st.records.splice(at,0,record);if(st.autoIncrement&&typeof k==='number'&&k>=st.generator)st.generator=Math.floor(k)+1;return clone(k);});
     }
     function query(source,kind,q,count){const s=records.get(source);live(s.tx);const r=range(q,kind!=='get'&&kind!=='getKey');if(count!==undefined){count=Number(count);if(!Number.isInteger(count)||count<0||count>4294967295)throw new TypeError('Invalid count');}
         return enqueue(s.tx,source,async()=>{

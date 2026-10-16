@@ -828,6 +828,8 @@ struct web_doc {
     struct web_frame *frames;
     const char *inherited_url; /* about:blank/srcdoc base and origin, never an author property */
     int referrer_policy; /* Policy container, not Document.referrer's navigation value. */
+    int embedder_policy; /* Policy container COEP: enum html_embedder_policy. */
+    bool cross_origin_isolated; /* Agent cluster isolation; fixed at document creation. */
     web_doc *origin_owner; /* inherited opaque origins retain native identity */
     node_t *window_token; /* stable for navigation, distinct after removal */
     struct web_frame *frame_container;
@@ -1146,6 +1148,7 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
                         const char *headers,const struct web_host *host,web_doc *parent,node_t *frame,web_doc *inherited_origin);
 const char *web_effective_url(web_doc *d);
 void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *r);
+void web_js_socket_event(web_doc *d, uint64_t id, const struct web_socket_event *e);
 int64_t web_js_deadline(web_doc *d);
 bool web_js_running(web_doc *d);
 bool web_js_enabled(web_doc *d);

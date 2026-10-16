@@ -222,7 +222,8 @@ static int64_t file_read(struct file *f, void *buf, size_t n, bool user) {
     struct vnode *v = f->vn;
     if ((f->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
     if (v->type == VT_DIR) return -EISDIR;
-    if (!v->ops->read) return -EINVAL;
+    /* User-only sources (address-watch queues) provide read_user alone. */
+    if (!v->ops->read && !(user && v->ops->read_user)) return -EINVAL;
     int error = file_io_begin(f);
     if (error) return error;
     int64_t r;
@@ -260,6 +261,21 @@ static int64_t file_write(struct file *f, const void *buf, size_t n, bool user) 
 
 int64_t vfs_write(struct file *f, const void *buf, size_t n) { return file_write(f, buf, n, false); }
 int64_t vfs_write_user(struct file *f, const void *buf, size_t n) { return file_write(f, buf, n, true); }
+
+/* Resize an open regular file; new bytes read as zero. The shared-offset
+   reservation orders it against reads and writes through the same file. */
+int vfs_truncate(struct file *f, uint64_t size) {
+    struct vnode *v = f->vn;
+    if (v->type != VT_FILE) return -EINVAL;
+    if ((f->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
+    if (!v->ops->truncate) return -EROFS;
+    int error = file_io_begin(f);
+    if (error) return error;
+    error = v->ops->truncate(v, size);
+    if (!error) v->mtime = time_now();
+    file_io_end(f);
+    return error;
+}
 
 int64_t vfs_seek(struct file *f, int64_t off, int whence) {
     if (f->vn->type != VT_FILE) return -ESPIPE;

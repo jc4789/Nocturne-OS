@@ -6,6 +6,7 @@
 #include <math.h>
 #include "nocturne.h"
 #include "webi.h"
+#include "js_atomics.h"
 #include "web_presentation.h"
 #include <webidb_async.h>
 #include <webnet.h>
@@ -851,6 +852,7 @@ web_doc *web_live_child_response(const char *html,size_t len,const char *url,con
     if (!d->url) { free((void *)d->inherited_url);free(d); return NULL; }
     snprintf(d->base, sizeof d->base, "%s", web_effective_url(d));
     if(!html_policy_init(d,headers,inherited_origin)){web_free(d);return NULL;}
+    html_policy_isolation(d,headers,inherited_origin);
     if(!web_presentation_policy_init(d,headers,inherited_origin)){web_free(d);return NULL;}
     d->referrer_policy=webnet_referrer_policy_header(headers,inherited_origin?inherited_origin->referrer_policy:WEBNET_REFERRER_DEFAULT);
     char transport_label[64]={0};
@@ -1125,6 +1127,8 @@ void web_tick(web_doc *d, uint64_t now) {
     if(d->native_cancelled)return;
     web_frames_tick(d,now);
 }
+int web_wait_fd(void) { return web_atomics_fd(); }
+int web_wait_report(char *out, size_t size) { return web_atomics_report(out, size, uptime_ms()); }
 int64_t web_deadline(web_doc *d) {
     uint64_t now = uptime_ms();
     int64_t background = web_media_background_deadline(now);
@@ -1144,6 +1148,9 @@ int64_t web_deadline(web_doc *d) {
 }
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *r) {
     if (d && d->live) {web_js_loaded(d, id, r);web_frames_loaded(d,id,r);}
+}
+void web_socket_event(web_doc *d, uint64_t id, const struct web_socket_event *e) {
+    if (d && d->live && e) {web_js_socket_event(d, id, e);web_frames_socket_event(d,id,e);}
 }
 bool web_response_set_url(struct web_response *r, const char *url) {
     if (!r || !url) return false;

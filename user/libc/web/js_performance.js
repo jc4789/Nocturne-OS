@@ -2,11 +2,14 @@
  * observer delivery. Include AFTER js_clone.js; metadata uses its private
  * structured serializer, not a replaceable page function. Legacy navigation
  * timing exposes recorded host/parser/event milestones. Unobserved transport
- * milestones stay 0; navigation entries/resource/paint/event are not advertised. */
+ * milestones stay 0; navigation entries/resource/paint/event are not advertised.
+ * Shared with Worker realms: without host.timing a realm has no navigation
+ * timing, no reserved mark names, and its time origin is its creation. */
 const performanceBridge = (() => {
     const call=Reflect.apply,define=Object.defineProperty,create=Object.create;
     const StringType=String,TypeErr=TypeError,DomError=DOMException;
-    const finite=Number.isFinite,floor=Math.floor,now=host.now,navigationTime=host.timing,dateNow=Date.now;
+    const isWindow=typeof host.timing==="function",hostNow=host.now,base=isWindow?0:hostNow();
+    const finite=Number.isFinite,floor=Math.floor,now=isWindow?hostNow:()=>hostNow()-base,navigationTime=host.timing,dateNow=Date.now;
     const serialize=cloneData.serialize,deserialize=cloneData.deserialize;
     const entries=new WeakMap(),observers=new WeakMap(),lists=new WeakMap(),performances=new WeakMap(),timings=new WeakMap();
     const getWeak=WeakMap.prototype.get,setWeak=WeakMap.prototype.set;
@@ -25,14 +28,14 @@ const performanceBridge = (() => {
         'fetchStart domainLookupStart domainLookupEnd connectStart connectEnd secureConnectionStart '+
         'requestStart responseStart responseEnd domLoading domInteractive domContentLoadedEventStart '+
         'domContentLoadedEventEnd domComplete loadEventStart loadEventEnd').split(' ');
-    const reserved=new Set(timingNames);
+    const reserved=new Set(isWindow?timingNames:[]);
     const setHas=Set.prototype.has;
     let buffer=[],sequence=0,notificationPending=false;
     // Native monotonic epoch is host navigation start, or explicit document init.
     // Pair it once with the real OS wall clock; never rebase it after wall jumps.
     const before=now(),wall=dateNow(),after=now();
     const origin=wall-(before+after)/2;
-    const schedule=setTimeout;
+    const schedule=isWindow?setTimeout:(fn,ms)=>host.timer(0,fn,ms,[]);
     function slot(map,value){const s=get(map,value);if(!s)throw new TypeErr('Illegal invocation');return s;}
     function string(value){if(typeof value==='symbol')throw new TypeErr('Cannot convert a Symbol to a string');return StringType(value);}
     function number(value){const n=+value;if(!finite(n))throw new TypeErr('Expected a finite timestamp');return n;}
@@ -247,6 +250,8 @@ const performanceBridge = (() => {
     define(PerformanceObserverEntryList.prototype.getEntriesByName,'length',{value:1,configurable:true});
     const supportedDescriptor=Object.getOwnPropertyDescriptor(PerformanceObserver,'supportedEntryTypes');
     supportedDescriptor.enumerable=true;define(PerformanceObserver,'supportedEntryTypes',supportedDescriptor);
-    Object.assign(globalThis,{Performance,PerformanceTiming,PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceObserver,PerformanceObserverEntryList,performance:new Performance(token)});
+    // Navigation timing (Performance.timing, PerformanceTiming) is Window-only.
+    if(isWindow)globalThis.PerformanceTiming=PerformanceTiming;else delete Performance.prototype.timing;
+    Object.assign(globalThis,{Performance,PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceObserver,PerformanceObserverEntryList,performance:new Performance(token)});
     return {};
 })();

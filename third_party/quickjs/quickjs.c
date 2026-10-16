@@ -73,7 +73,7 @@
 
 /* define to include Atomics.* operations which depend on the OS
    threads */
-#if !defined(__EMSCRIPTEN__) && !defined(CONFIG_NOCTURNE)
+#if !defined(__EMSCRIPTEN__)
 #define CONFIG_ATOMICS
 #endif
 
@@ -119,9 +119,16 @@
 //#define FORCE_GC_AT_MALLOC
 
 #ifdef CONFIG_ATOMICS
-#include <pthread.h>
 #include <stdatomic.h>
+#ifdef CONFIG_NOCTURNE
+/* Nocturne waits on the kernel physical-address FIFO, shared by every process
+   mapping a SharedArrayBuffer page. No process-local condition variables. */
 #include <errno.h>
+#include <nocturne.h>
+#else
+#include <pthread.h>
+#include <errno.h>
+#endif
 #endif
 
 enum {
@@ -372,6 +379,8 @@ struct JSRuntime {
 #ifdef CONFIG_NOCTURNE
     JSHostJobFilter *host_job_filter;
     void *host_job_filter_opaque;
+    JSAtomicsWaitAsyncFunc *atomics_wait_async;
+    void *atomics_wait_async_opaque;
 #endif
 
     JSModuleNormalizeFunc *module_normalize_func;
@@ -2288,6 +2297,11 @@ void JS_SetCanBlock(JSRuntime *rt, BOOL can_block)
     rt->can_block = can_block;
 }
 
+BOOL JS_GetCanBlock(JSRuntime *rt)
+{
+    return rt->can_block;
+}
+
 void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
                                       const JSSharedArrayBufferFunctions *sf)
 {
@@ -2353,6 +2367,12 @@ void JS_SetHostJobFilter(JSRuntime *rt, JSHostJobFilter *filter, void *opaque)
 {
     rt->host_job_filter = filter;
     rt->host_job_filter_opaque = opaque;
+}
+
+void JS_SetAtomicsWaitAsyncFunc(JSRuntime *rt, JSAtomicsWaitAsyncFunc *func, void *opaque)
+{
+    rt->atomics_wait_async = func;
+    rt->atomics_wait_async_opaque = opaque;
 }
 
 int JS_EnqueueJobForCallback(JSContext *ctx, JSValueConst callback,
@@ -4000,7 +4020,7 @@ static inline BOOL JS_IsEmptyString(JSValueConst v)
 
 /* JSClass support */
 
-#ifdef CONFIG_ATOMICS
+#if defined(CONFIG_ATOMICS) && !defined(CONFIG_NOCTURNE)
 static pthread_mutex_t js_class_id_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
@@ -4008,7 +4028,7 @@ static pthread_mutex_t js_class_id_mutex = PTHREAD_MUTEX_INITIALIZER;
 JSClassID JS_NewClassID(JSClassID *pclass_id)
 {
     JSClassID class_id;
-#ifdef CONFIG_ATOMICS
+#if defined(CONFIG_ATOMICS) && !defined(CONFIG_NOCTURNE)
     pthread_mutex_lock(&js_class_id_mutex);
 #endif
     class_id = *pclass_id;
@@ -4016,7 +4036,7 @@ JSClassID JS_NewClassID(JSClassID *pclass_id)
         class_id = js_class_id_alloc++;
         *pclass_id = class_id;
     }
-#ifdef CONFIG_ATOMICS
+#if defined(CONFIG_ATOMICS) && !defined(CONFIG_NOCTURNE)
     pthread_mutex_unlock(&js_class_id_mutex);
 #endif
     return class_id;
@@ -57633,8 +57653,10 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
             sab_alloc_len = max_len ? *max_len : len;
             abuf->data = rt->sab_funcs.sab_alloc(rt->sab_funcs.sab_opaque,
                                                  max_int(sab_alloc_len, 1));
-            if (!abuf->data)
+            if (!abuf->data) {
+                JS_ThrowOutOfMemory(ctx);
                 goto fail;
+            }
             memset(abuf->data, 0, sab_alloc_len);
         } else {
             /* the allocation must be done after the object creation */
@@ -61681,6 +61703,7 @@ static JSValue js_atomics_isLockFree(JSContext *ctx,
     return JS_NewBool(ctx, ret);
 }
 
+#ifndef CONFIG_NOCTURNE
 typedef struct JSAtomicsWaiter {
     struct list_head link;
     BOOL linked;
@@ -61691,6 +61714,109 @@ typedef struct JSAtomicsWaiter {
 static pthread_mutex_t js_atomics_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct list_head js_atomics_waiter_list =
     LIST_HEAD_INIT(js_atomics_waiter_list);
+#endif
+
+/* Atomically read a waitable element (Int32Array or BigInt64Array). */
+static int64_t js_atomics_wait_load(void *ptr, int size_log2)
+{
+    if (size_log2 == 3)
+        return atomic_load((_Atomic(int64_t) *)ptr);
+    return atomic_load((_Atomic(int32_t) *)ptr);
+}
+
+/* Validate the common arguments of Atomics.wait and Atomics.waitAsync:
+   element pointer, expected value, and timeout in ms (+Infinity for none). */
+static int js_atomics_wait_args(JSContext *ctx, int argc, JSValueConst *argv,
+                                void **pptr, int *psize_log2, int64_t *pv,
+                                double *ptimeout)
+{
+    JSObject *p;
+    uint64_t idx;
+    int32_t v32;
+    double d;
+
+    p = js_atomics_get_buf(ctx, argv[0], argv[1], &idx, 2);
+    if (!p)
+        return -1;
+    *psize_log2 = typed_array_size_log2(p->class_id);
+    if (*psize_log2 == 3) {
+        if (JS_ToBigInt64(ctx, pv, argv[2]))
+            return -1;
+    } else {
+        if (JS_ToInt32(ctx, &v32, argv[2]))
+            return -1;
+        *pv = v32;
+    }
+    if (JS_ToFloat64(ctx, &d, argv[3]))
+        return -1;
+    *ptimeout = isnan(d) ? INFINITY : d < 0 ? 0 : d;
+    /* 'argv[0]' views a SharedArrayBuffer: it cannot be detached nor shrunk */
+    *pptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << *psize_log2);
+    return 0;
+}
+
+static JSValue js_atomics_wait_async(JSContext *ctx,
+                                     JSValueConst this_obj,
+                                     int argc, JSValueConst *argv)
+{
+    void *ptr;
+    int size_log2, r;
+    int64_t v;
+    double timeout;
+    JSValue result, value, funcs[2];
+    BOOL is_async = FALSE;
+
+    if (js_atomics_wait_args(ctx, argc, argv, &ptr, &size_log2, &v, &timeout))
+        return JS_EXCEPTION;
+    if (js_atomics_wait_load(ptr, size_log2) != v) {
+        value = JS_AtomToString(ctx, JS_ATOM_not_equal);
+    } else if (timeout == 0) {
+        value = JS_AtomToString(ctx, JS_ATOM_timed_out);
+    } else {
+#ifdef CONFIG_NOCTURNE
+        JSRuntime *rt = ctx->rt;
+        if (!rt->atomics_wait_async)
+            return JS_ThrowTypeError(ctx, "Atomics.waitAsync has no host event loop");
+        value = JS_NewPromiseCapability(ctx, funcs);
+        if (JS_IsException(value))
+            return value;
+        r = rt->atomics_wait_async(ctx, rt->atomics_wait_async_opaque, ptr,
+                                   (uint32_t)v, timeout, funcs[0]);
+        JS_FreeValue(ctx, funcs[0]);
+        JS_FreeValue(ctx, funcs[1]);
+        if (r < 0) {
+            JS_FreeValue(ctx, value);
+            return JS_EXCEPTION;
+        }
+        if (r == 1) {
+            JS_FreeValue(ctx, value);
+            value = JS_AtomToString(ctx, JS_ATOM_not_equal);
+        } else {
+            is_async = TRUE;
+        }
+#else
+        (void)r; (void)funcs;
+        return JS_ThrowTypeError(ctx, "Atomics.waitAsync has no host event loop");
+#endif
+    }
+    result = JS_NewObject(ctx);
+    if (JS_IsException(result)) {
+        JS_FreeValue(ctx, value);
+        return result;
+    }
+    if (JS_DefinePropertyValueStr(ctx, result, "async", JS_NewBool(ctx, is_async),
+                                  JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+        JS_FreeValue(ctx, value);
+        JS_FreeValue(ctx, result);
+        return JS_EXCEPTION;
+    }
+    if (JS_DefinePropertyValueStr(ctx, result, "value", value,
+                                  JS_PROP_C_W_E | JS_PROP_THROW) < 0) {
+        JS_FreeValue(ctx, result);
+        return JS_EXCEPTION;
+    }
+    return result;
+}
 
 #if defined(__aarch64__)
 static inline void cpu_pause(void)
@@ -61735,6 +61861,88 @@ static JSValue js_atomics_pause(JSContext *ctx, JSValueConst this_obj,
     return JS_UNDEFINED;
 }
 
+#ifdef CONFIG_NOCTURNE
+static JSValue js_atomics_wait(JSContext *ctx,
+                               JSValueConst this_obj,
+                               int argc, JSValueConst *argv)
+{
+    void *ptr;
+    int size_log2, r;
+    int64_t v;
+    double timeout;
+    uint64_t deadline = 0;
+    uint32_t expected;
+
+    if (js_atomics_wait_args(ctx, argc, argv, &ptr, &size_log2, &v, &timeout))
+        return JS_EXCEPTION;
+    if (!ctx->rt->can_block)
+        return JS_ThrowTypeError(ctx, "cannot block in this thread");
+    if (js_atomics_wait_load(ptr, size_log2) != v)
+        return JS_AtomToString(ctx, JS_ATOM_not_equal);
+    if (isfinite(timeout))
+        deadline = uptime_ms() + (uint64_t)ceil(timeout);
+    /* The kernel re-checks the word while enrolling. A BigInt64 element was
+       compared in full above and enrolls on its low word. A finite wait longer
+       than one kernel call re-enrolls with the word's current value: the agent
+       stays a waiter until notified or timed out, whatever the value becomes. */
+    expected = (uint32_t)v;
+    for (BOOL enrolled = FALSE;; enrolled = TRUE) {
+        unsigned ms;
+        if (!isfinite(timeout)) {
+            ms = UINT32_MAX;
+        } else {
+            uint64_t now = uptime_ms();
+            if (now >= deadline)
+                return JS_AtomToString(ctx, JS_ATOM_timed_out);
+            ms = deadline - now < UINT32_MAX ? (unsigned)(deadline - now) : UINT32_MAX - 1;
+        }
+        r = wait_on_address((volatile uint32_t *)ptr, expected, ms);
+        if (r >= 0)
+            return JS_AtomToString(ctx, JS_ATOM_ok);
+        /* The first enrollment is the comparison of the spec's critical section. */
+        if (errno == EAGAIN && !enrolled)
+            return JS_AtomToString(ctx, JS_ATOM_not_equal);
+        if (errno == EAGAIN) {
+            expected = atomic_load((_Atomic(uint32_t) *)ptr);
+            continue;
+        }
+        if (errno == ETIMEDOUT && isfinite(timeout))
+            continue;
+        /* EINTR: the process is being stopped; the wait cannot complete. */
+        return JS_AtomToString(ctx, JS_ATOM_timed_out);
+    }
+}
+
+static JSValue js_atomics_notify(JSContext *ctx,
+                                 JSValueConst this_obj,
+                                 int argc, JSValueConst *argv)
+{
+    int32_t count;
+    uint64_t idx;
+    int size_log2, n = 0;
+    JSObject *p;
+
+    p = js_atomics_get_buf(ctx, argv[0], argv[1], &idx, 1);
+    if (!p)
+        return JS_EXCEPTION;
+    size_log2 = typed_array_size_log2(p->class_id);
+    if (JS_IsUndefined(argv[2])) {
+        count = INT32_MAX;
+    } else {
+        if (JS_ToInt32Clamp(ctx, &count, argv[2], 0, INT32_MAX, 0))
+            return JS_EXCEPTION;
+    }
+    if (p->u.typed_array->buffer->u.array_buffer->shared && count > 0) {
+        void *ptr = p->u.array.u.uint8_ptr + ((uintptr_t)idx << size_log2);
+        /* The kernel wakes waiters of every process mapping this page, oldest
+           first; count 0 there means all. */
+        n = wake_address((volatile uint32_t *)ptr, count == INT32_MAX ? 0 : (unsigned)count);
+        if (n < 0)
+            n = 0;
+    }
+    return JS_NewInt32(ctx, n);
+}
+#else
 static JSValue js_atomics_wait(JSContext *ctx,
                                JSValueConst this_obj,
                                int argc, JSValueConst *argv)
@@ -61874,6 +62082,7 @@ static JSValue js_atomics_notify(JSContext *ctx,
     }
     return JS_NewInt32(ctx, n);
 }
+#endif /* CONFIG_NOCTURNE */
 
 static const JSCFunctionListEntry js_atomics_funcs[] = {
     JS_CFUNC_MAGIC_DEF("add", 3, js_atomics_op, ATOMICS_OP_ADD ),
@@ -61888,6 +62097,7 @@ static const JSCFunctionListEntry js_atomics_funcs[] = {
     JS_CFUNC_DEF("isLockFree", 1, js_atomics_isLockFree ),
     JS_CFUNC_DEF("pause", 0, js_atomics_pause ),
     JS_CFUNC_DEF("wait", 4, js_atomics_wait ),
+    JS_CFUNC_DEF("waitAsync", 4, js_atomics_wait_async ),
     JS_CFUNC_DEF("notify", 3, js_atomics_notify ),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "Atomics", JS_PROP_CONFIGURABLE ),
 };
@@ -61919,7 +62129,6 @@ int JS_AddIntrinsicTypedArrays(JSContext *ctx)
         return -1;
     JS_FreeValue(ctx, obj);
 
-#ifndef CONFIG_NOCTURNE
     obj = JS_NewCConstructor(ctx, JS_CLASS_SHARED_ARRAY_BUFFER, "SharedArrayBuffer",
                                     js_shared_array_buffer_constructor, 1, JS_CFUNC_constructor, 0,
                                     JS_UNDEFINED,
@@ -61929,7 +62138,6 @@ int JS_AddIntrinsicTypedArrays(JSContext *ctx)
     if (JS_IsException(obj))
         return -1;
     JS_FreeValue(ctx, obj);
-#endif
 
     typed_array_base_func =
         JS_NewCConstructor(ctx, -1, "TypedArray",

@@ -31,7 +31,7 @@ struct task {
     bool joining;
     struct task *process;     /* shared VM / descriptors / cwd / brk owner */
     uint64_t user_stack, user_stack_size;
-    volatile uint32_t *wait_address;
+    uint64_t wait_phys, wait_seq; /* address wait: physical key, FIFO order */
     unsigned trap_cpu;
     uint64_t tls_base;
     uint64_t clock_page;
@@ -55,7 +55,10 @@ struct task {
     struct wait_queue child_wait;
     uint64_t brk_base, brk;
     uint64_t mmap_next;
+    struct mmap_hole *mmap_holes; /* freed anonymous ranges below mmap_next, by address */
     struct shared_mapping *shared_mappings; /* native FD-backed page references */
+    struct shared_ticket *shared_tickets;   /* page references offered to a peer */
+    uint64_t shared_ticket_serial;
     uint64_t cpu_ms;
     uint64_t start_ms;
     unsigned sched_level;     /* 0=interactive, 3=CPU-bound; ready/wait policy is BSP-owned */
@@ -98,8 +101,16 @@ void sched_quiesce_space(uint64_t pml4); /* 0=shared kernel変更、他は該当
 void sched_pin_space(uint64_t pml4);
 int task_thread_create(uint64_t entry, uint64_t function, uint64_t argument);
 int task_thread_join(int tid);
-int task_wait_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms);
+/* wide: compare the 8-byte word at address (wasm memory.atomic.wait64). */
+int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsigned timeout_ms);
 int task_wake_address(volatile uint32_t *address, unsigned count);
+/* Asynchronous address waiters. A watch joins the same physical-address FIFO
+ * as blocked tasks; a notify that selects it moves its token to the queue's
+ * pollable ready list. Removing reports 1 while still waiting, 2 after it was
+ * notified (the notifier already counted it), 0 for an unknown token. */
+struct vnode *address_watch_queue_new(void);
+int address_watch_add(struct vnode *queue, volatile uint32_t *address, uint32_t expected, uint64_t token);
+int address_watch_remove(struct vnode *queue, uint64_t token);
 NORETURN void task_exit(int code);
 NORETURN void task_fault_exit(int code); /* fatal user exception aborts shared process */
 struct task *task_find(int pid);

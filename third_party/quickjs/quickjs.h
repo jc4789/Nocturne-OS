@@ -981,6 +981,7 @@ typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
 /* if can_block is TRUE, Atomics.wait() can be used */
 void JS_SetCanBlock(JSRuntime *rt, JS_BOOL can_block);
+JS_BOOL JS_GetCanBlock(JSRuntime *rt);
 /* select which debug info is stripped from the compiled code */
 #define JS_STRIP_SOURCE (1 << 0) /* strip source code */
 #define JS_STRIP_DEBUG  (1 << 1) /* strip all debug info including source code */
@@ -1036,6 +1037,17 @@ typedef JS_BOOL JSHostJobFilter(JSContext *job_realm, void *opaque);
 void JS_SetHostJobFilter(JSRuntime *rt, JSHostJobFilter *filter, void *opaque);
 int JS_EnqueueJobForCallback(JSContext *ctx, JSValueConst callback,
                              JSJobFunc *job_func, int argc, JSValueConst *argv);
+/* Atomics.waitAsync enrollment. QuickJS validates the arguments and compares
+   the full element; the host enrolls an asynchronous waiter on the 32-bit word
+   at 'address' (the low word of a BigInt64 element), re-checking 'expected'
+   atomically, and later calls 'resolve' from a task with "ok" or "timed-out".
+   timeout_ms is positive and may be +Infinity. Return 0 when enrolled (the
+   host duplicated 'resolve'), 1 when the word no longer matched, -1 with a
+   pending exception. Without a host function waitAsync throws a TypeError. */
+typedef int JSAtomicsWaitAsyncFunc(JSContext *ctx, void *opaque, void *address,
+                                   uint32_t expected, double timeout_ms,
+                                   JSValueConst resolve);
+void JS_SetAtomicsWaitAsyncFunc(JSRuntime *rt, JSAtomicsWaitAsyncFunc *func, void *opaque);
 
 JS_BOOL JS_IsJobPending(JSRuntime *rt);
 int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx);

@@ -264,6 +264,15 @@ void web_frames_loaded(web_doc *d,uint64_t id,const struct web_response *r) {
     }
     running=false;
 }
+void web_frames_socket_event(web_doc *d,uint64_t id,const struct web_socket_event *e) {
+    static bool running;if(running)return;running=true;
+    for(struct web_frame *f=d?d->frames:NULL;f;) {
+        struct web_frame *next=web_frame_walk_next(d,f,true);
+        if(f->document && !f->detached && f->document->live)web_js_socket_event(f->document,id,e);
+        f=next;
+    }
+    running=false;
+}
 void web_frames_free(web_doc *d) {
     if(!d)return;
     web_doc *pending=d,*finished=NULL;

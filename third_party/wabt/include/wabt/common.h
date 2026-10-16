@@ -98,8 +98,10 @@ inline void MemcpyEndianAware(void* dst,
   memcpy(static_cast<char*>(dst) + (dsize) - (len) - (doff),
          static_cast<const char*>(src) + (ssize) - (len) - (soff), (len));
 #else
-  memcpy(static_cast<char*>(dst) + (doff),
-         static_cast<const char*>(src) + (soff), (len));
+  // Nocturne builds C++ with -fno-builtin: name the builtin so a fixed-size
+  // Wasm load or store stays one move instead of a libc call per access.
+  __builtin_memcpy(static_cast<char*>(dst) + (doff),
+                   static_cast<const char*>(src) + (soff), (len));
 #endif
 }
 }

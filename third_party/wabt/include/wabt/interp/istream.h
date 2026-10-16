@@ -167,7 +167,19 @@ class Istream {
   template <typename T>
   T WABT_VECTORCALL ReadAt(Offset*) const;
 
+ public:
+  // A complete stream may live in storage that its ModuleDesc keeps alive
+  // (ModuleDesc::storage), such as a module image shared between agents;
+  // nothing is emitted into it afterwards.
+  void Adopt(const u8* data, Offset size);
+  const u8* data() const { return external_ ? external_ : data_.data(); }
+  // Releases the owned storage after its bytes were moved elsewhere.
+  void ReleaseOwned() { Buffer().swap(data_); }
+
+ private:
   Buffer data_;
+  const u8* external_ = nullptr;
+  Offset external_size_ = 0;
 };
 
 }  // namespace interp

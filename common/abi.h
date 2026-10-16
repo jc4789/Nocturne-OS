@@ -19,9 +19,13 @@ enum {
     SYS_CHANNEL_LISTEN, SYS_CHANNEL_CONNECT, SYS_CHANNEL_ACCEPT,
     SYS_SHARED_CREATE, SYS_SHARED_MAP,
     SYS_THREAD_STACK_BOUNDS,
+    SYS_ADDRESS_WATCH_QUEUE, SYS_ADDRESS_WATCH, SYS_ADDRESS_UNWATCH,
+    SYS_SHARED_SEND, SYS_SHARED_RECEIVE,
     SYS_WIN_CREATE = 64, SYS_WIN_MAP, SYS_WIN_PRESENT, SYS_WIN_SET_TITLE, SYS_SCREEN_INFO,
     SYS_WIN_MOVE, SYS_CLIPBOARD_SET, SYS_CLIPBOARD_GET, SYS_WIN_RESIZE, SYS_GUI_LAUNCH,
     SYS_SCREEN_GRAB, SYS_WIN_STATE, SYS_WIN_PRESENTATION,
+    /* The core range 0..63 is full: later memory primitives continue here. */
+    SYS_SHARED_RESERVE = 88, SYS_WAIT_ADDRESS64, SYS_FTRUNCATE,
     SYS_NET_INFO = 96, SYS_NET_PING, SYS_NET_DNS, SYS_UDP_SOCKET, SYS_UDP_SEND, SYS_UDP_RECV,
     SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
     SYS_NET_DNS_ALL, SYS_TCP_SEND_UNTIL, SYS_TCP_CANCEL, SYS_NET_STATS,
@@ -41,6 +45,7 @@ enum {
 #define N_FT_WINDOW 5
 #define N_FT_CHANNEL 6
 #define N_FT_SHARED 7
+#define N_FT_ADDRESS_WATCH 8
 
 struct n_dirent {
     char name[256];
@@ -64,6 +69,7 @@ struct n_procinfo {
     uint64_t cpu_ms;
     uint64_t mem_kb;
     uint64_t start_ms;
+    uint64_t wait_phys; /* blocked in an address wait: the physical word, else 0 */
 };
 
 struct n_sysinfo {

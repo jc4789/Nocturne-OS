@@ -43,6 +43,15 @@ void ns_set_cancel(net_stream *, int (*cancelled)(void *), void *);
 /* Nonblocking application read for the HTTP/2 connection pump. -2 is pending;
    unlike a failed TLS read, pending does not poison the TLS engine. */
 long ns_try_read(net_stream *, void *, size_t);
+/* ns_try_read waiting up to timeout_ms for transport bytes; -2 still pending.
+   With a lock word (held by the caller) another thread may ns_try_write the
+   same stream under that lock while this one sleeps in the transport. */
+long ns_read_wait(net_stream *, void *, size_t, int timeout_ms, volatile uint32_t *lock);
+void ns_engine_lock(volatile uint32_t *);
+void ns_engine_unlock(volatile uint32_t *);
+/* From another thread: reset the connection, waking a blocked read. The
+   stream then only fails and must still be released with ns_abort. */
+void ns_reset(net_stream *);
 /* Native nonblocking send: accepted prefix, -2 pending, -1 error. n==0
    drains pending TLS records without consuming application bytes. */
 long ns_try_write(net_stream *, const void *, size_t);

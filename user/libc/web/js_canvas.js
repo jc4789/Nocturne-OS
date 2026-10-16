@@ -69,9 +69,13 @@ const canvasBridge = (() => {
             let kind,source=image,dimensions,packet;
             try {
                 if(argumentCount<1)throw new TypeError('createImageBitmap requires a source');
-                const bitmap=bitmaps.get(image),im=images.get(image);
+                const bitmap=bitmaps.get(image),im=images.get(image),offscreen=offscreenCanvasBridge.backing(image);
                 if(bitmap)kind=3;
                 else if(im)kind=1;
+                else if(offscreen!==undefined){
+                    if(offscreen===null)throw namedError('InvalidStateError','The OffscreenCanvas is detached');
+                    kind=2;source=offscreen;
+                }
                 else if(blobBridge.brand(image))kind=0;
                 else {
                     const tag=rawDom.get(image,'localName');
@@ -290,18 +294,29 @@ const canvasBridge = (() => {
     function rect(ctx,op,v){state(ctx);v=args(v,4);if(!valid(v)||!v[2]||!v[3])return;const s=state(ctx),m=s.matrix,painter=op==='clear'?undefined:paint(s);
         if(m[0]===1&&m[1]===0&&m[2]===0&&m[3]===1)native(s.canvas,op,v[0]+m[4],v[1]+m[5],v[2],v[3],color(s),painter);
         else {const p=[point(s,v[0],v[1]),point(s,v[0]+v[2],v[1]),point(s,v[0]+v[2],v[1]+v[3]),point(s,v[0],v[1]+v[3])];native(s.canvas,'poly',pathBuffer(p.flat()),color(s),false,op==='clear',painter);}}
+    /* Placeholder canvases are driven by their OffscreenCanvas. */
+    const placeholders=new WeakSet();
+    function owned(canvas){if(placeholders.has(canvas))throw namedError('InvalidStateError','The canvas has transferred control to an OffscreenCanvas');}
     for(const name of ['width','height'])define(HTMLCanvasElement.prototype,name,{configurable:true,enumerable:true,
-        get(){htmlElementBrand(this,'canvas');return native(this,name);},set(value){htmlElementBrand(this,'canvas');reflectedAttr(this,name,string(number(value)>>>0));}});
+        get(){htmlElementBrand(this,'canvas');return native(this,name);},set(value){htmlElementBrand(this,'canvas');value=string(number(value)>>>0);owned(this);reflectedAttr(this,name,value);}});
+    define(HTMLCanvasElement.prototype,'transferControlToOffscreen',{configurable:true,writable:true,value:function(){
+        htmlElementBrand(this,'canvas');
+        if(contexts.has(this)||placeholders.has(this))throw namedError('InvalidStateError','The canvas already has a rendering context');
+        placeholders.add(this);return offscreenCanvasBridge.placeholder(this,native(this,'width'),native(this,'height'));
+    }});
     define(HTMLCanvasElement.prototype,'getContext',{configurable:true,writable:true,value:function(type,options){
         htmlElementBrand(this,'canvas');if(!arguments.length)throw new TypeError('getContext requires context type');
-        type=string(type);if(debugProbe)native(this,'contextProbe',type);if(type!=='2d')return null;
+        type=string(type);if(debugProbe)native(this,'contextProbe',type);owned(this);if(type!=='2d')return null;
         let ctx=contexts.get(this);if(ctx)return ctx;
         if(!native(this,'context'))return null;
         ctx=create(CanvasRenderingContext2D.prototype);const s={canvas:this,version:native(this,'version')};defaults(s);states.set(ctx,s);contexts.set(this,ctx);return ctx;
     }});
-    define(HTMLCanvasElement.prototype,'toDataURL',{configurable:true,writable:true,value:function(type='image/png',quality){htmlElementBrand(this,'canvas');string(type);const result=native(this,'dataURL');if(result===false)throw namedError('SecurityError','Canvas is not origin-clean');return result;}});
-    define(HTMLCanvasElement.prototype,'toBlob',{configurable:true,writable:true,value:function(callback,type='image/png',quality){htmlElementBrand(this,'canvas');if(typeof callback!=='function')throw new TypeError('toBlob requires a callback');string(type);const bytes=native(this,'png');if(bytes===false)throw namedError('SecurityError','Canvas is not origin-clean');defer(()=>{let blob=null;if(bytes!==null){try{blob=blobFrom(bytes,'image/png');}catch(e){/* A failed serialization/Blob allocation reports null, never a fake Blob. */}}apply(callback,undefined,[blob]);},0);}});
+    define(HTMLCanvasElement.prototype,'toDataURL',{configurable:true,writable:true,value:function(type='image/png',quality){htmlElementBrand(this,'canvas');string(type);owned(this);const result=native(this,'dataURL');if(result===false)throw namedError('SecurityError','Canvas is not origin-clean');return result;}});
+    define(HTMLCanvasElement.prototype,'toBlob',{configurable:true,writable:true,value:function(callback,type='image/png',quality){htmlElementBrand(this,'canvas');if(typeof callback!=='function')throw new TypeError('toBlob requires a callback');string(type);owned(this);const bytes=native(this,'png');if(bytes===false)throw namedError('SecurityError','Canvas is not origin-clean');defer(()=>{let blob=null;if(bytes!==null){try{blob=blobFrom(bytes,'image/png');}catch(e){/* A failed serialization/Blob allocation reports null, never a fake Blob. */}}apply(callback,undefined,[blob]);},0);}});
     define(CanvasRenderingContext2D.prototype,'canvas',{enumerable:true,configurable:true,get(){return state(this).canvas;}});
+    /* Same Canvas2D engine over an OffscreenCanvas backing node; `canvas`
+       reports the OffscreenCanvas instead of the backing node. */
+    class OffscreenCanvasRenderingContext2D {constructor(){throw new TypeError('Illegal OffscreenCanvasRenderingContext2D constructor');}}
     for(const [property,key,colorkey] of [['fillStyle','fill','fillColor'],['strokeStyle','stroke','strokeColor']])define(CanvasRenderingContext2D.prototype,property,{enumerable:true,configurable:true,
         get(){return state(this)[key];},set(value){state(this);if(gradients.has(value)){state(this)[key]=value;return;}
             const text=string(value),s=state(this),c=native(s.canvas,'color',text);if(c!==null){s[key]=text;s[colorkey]=c>>>0;}}});
@@ -344,7 +359,10 @@ const canvasBridge = (() => {
             const v=args([dx,dy,...rest],count>=8?8:count),s=state(this);
             /* All author conversions precede borrowing the native bitmap. A
                conversion can resize/reset the canvas, so refresh state again. */
-            const result=native(s.canvas,'drawImage',bitmaps.get(image)||image,new Float64(v).buffer,new Float64(s.matrix).buffer,s.alpha,s.smoothing);
+            const offscreen=offscreenCanvasBridge.backing(image);
+            if(offscreen===null)throw namedError('InvalidStateError','The OffscreenCanvas is detached');
+            if(offscreen&&(!native(offscreen,'width')||!native(offscreen,'height')))throw namedError('InvalidStateError','The OffscreenCanvas has no pixels');
+            const result=native(s.canvas,'drawImage',bitmaps.get(image)||offscreen||image,new Float64(v).buffer,new Float64(s.matrix).buffer,s.alpha,s.smoothing);
             if(result===1)throw namedError('InvalidStateError','The source image has no usable bitmap');},
         getImageData(...v){const s=state(this);v=args(v,4);if(!valid(v))throw new TypeError('Nonfinite ImageData coordinates');let [x,y,w,h]=v.map(Math.trunc);if(!w||!h)throw namedError('IndexSizeError','Empty ImageData rectangle');if(w<0){x+=w;w=-w;}if(h<0){y+=h;h=-h;}const data=native(s.canvas,'read',x,y,w,h);if(data===null)throw namedError('SecurityError','Canvas contains an image with unverified origin');return new ImageData(new Bytes(data),w,h);},
         putImageData(image,dx,dy,...dirty){const s=state(this),im=images.get(image);if(!im)throw new TypeError('Expected ImageData');dx=Math.trunc(number(dx));dy=Math.trunc(number(dy));if(!finite(dx)||!finite(dy))throw new TypeError('Nonfinite ImageData coordinates');
@@ -364,7 +382,31 @@ const canvasBridge = (() => {
         get colorSpace(){if(!images.has(this))throw new TypeError('Illegal ImageData receiver');return 'srgb';}
     }
     for(const [i,name] of ['width','actualBoundingBoxLeft','actualBoundingBoxRight','actualBoundingBoxAscent','actualBoundingBoxDescent','fontBoundingBoxAscent','fontBoundingBoxDescent'].entries())define(TextMetrics.prototype,name,{enumerable:true,configurable:true,get(){const values=metrics.get(this);if(!values)throw new TypeError('Illegal TextMetrics receiver');return values[i];}});
-    for(const C of [HTMLCanvasElement,CanvasRenderingContext2D,CanvasGradient,ImageData,ImageBitmap,TextMetrics,Path2D])define(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
-    Object.assign(globalThis,{HTMLCanvasElement,CanvasRenderingContext2D,CanvasGradient,ImageData,ImageBitmap,createImageBitmap,TextMetrics,Path2D});
+    for(const key of Reflect.ownKeys(CanvasRenderingContext2D.prototype))
+        if(key!=='constructor'&&key!=='canvas')define(OffscreenCanvasRenderingContext2D.prototype,key,Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype,key));
+    define(OffscreenCanvasRenderingContext2D.prototype,'canvas',{enumerable:true,configurable:true,get(){const s=state(this);if(!s.owner)throw new TypeError('Illegal OffscreenCanvasRenderingContext2D receiver');return s.owner;}});
+    offscreenCanvasBridge.attachRaster({
+        create(width,height){const element=rawDom.create(null,1,'canvas','');reflectedAttr(element,'width',string(width));reflectedAttr(element,'height',string(height));return element;},
+        resize(element,name,value){reflectedAttr(element,name,string(value));},
+        context(element,owner){
+            if(!native(element,'context'))return null;
+            const ctx=create(OffscreenCanvasRenderingContext2D.prototype),s={canvas:element,owner,version:native(element,'version')};
+            defaults(s);states.set(ctx,s);return ctx;
+        },
+        bitmap(element){
+            const token=nativeBitmap('create',2,element,new Float64([0,0,0,0,0,0,0,0,1]).buffer,undefined);
+            if(token===null||token===1)throw namedError('InvalidStateError','The OffscreenCanvas has no usable bitmap');
+            const result=create(ImageBitmap.prototype);bitmaps.set(result,token);
+            /* The canvas continues with a new transparent black bitmap. */
+            native(element,'reset');return result;
+        },
+        blob(element){
+            const bytes=native(element,'png');
+            if(bytes===false)throw namedError('SecurityError','Canvas is not origin-clean');
+            return bytes===null?null:blobFrom(bytes,'image/png');
+        }
+    });
+    for(const C of [HTMLCanvasElement,CanvasRenderingContext2D,OffscreenCanvasRenderingContext2D,CanvasGradient,ImageData,ImageBitmap,TextMetrics,Path2D])define(C.prototype,Symbol.toStringTag,{value:C.name,configurable:true});
+    Object.assign(globalThis,{HTMLCanvasElement,CanvasRenderingContext2D,OffscreenCanvasRenderingContext2D,CanvasGradient,ImageData,ImageBitmap,createImageBitmap,TextMetrics,Path2D});
     return {nodeProtos:[HTMLCanvasElement.prototype]};
 })();

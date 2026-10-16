@@ -315,11 +315,12 @@ const messagingBridge=(() => {
         const plan=cloneData.commitPlan(packet,receivers);define(plan,'generations',{value:[realm.generation],writable:true,enumerable:true,configurable:true});cloneData.validate(packet);return {packet:[packet.data,metadata],plan,tokens:packet.tokens};
         }catch(error){apply(routeEach,workerRoutes,[(route,key)=>{if(!route.active)apply(routeDelete,workerRoutes,[key]);}]);throw error;}
     }
-    function abortWorker(prepared){for(let i=0;i<prepared.tokens.length;i++){const token=prepared.tokens[i];if(token&&!token.route.active)apply(routeDelete,workerRoutes,[token.route.key]);}}
+    function abortWorker(prepared){for(let i=0;i<prepared.tokens.length;i++){const token=prepared.tokens[i];if(token&&token.route&&!token.route.active)apply(routeDelete,workerRoutes,[token.route.key]);}}
     function importWorker(wire,child){
         const metadata=wire[1],receivers=[],added=[];
         try{
         for(let i=0;i<metadata.length;i++){const m=metadata[i];if(m===null){appendWorker(receivers,null);continue;}
+            if(offscreenCanvasBridge.isMeta(m)){appendWorker(receivers,offscreenCanvasBridge.receive(m));continue;}
             const id=m[0],creator=m[1],key=workerKey(child,id,creator);if(!isInteger(id)||id<=0||id>4294967295||creator!==1||workerRoute(child,id,creator))throw new TypeErr('Invalid Worker port ownership');
             const endpoint={peer:null,owner:null,head:null,tail:null,scheduled:0,scheduledRealm:null,broker:null},owner=makePort(endpoint);
             const route={key,child,id,creator,endpoint,closed:false,sealed:false,active:true};endpoint.owner=owner;endpoint.broker=route;appendWorker(added,route);apply(routeSet,workerRoutes,[key,route]);

@@ -4,6 +4,7 @@
 #include "mm/vmm.h"
 #include "mm/pmm.h"
 #include "sys/sched.h"
+#include "sys/syscall.h"
 #include "limine.h"
 
 uint64_t kernel_pml4;
@@ -397,7 +398,7 @@ int vmm_copy_to_space(uint64_t pml4, uint64_t va, const void *src, size_t n) {
     return 0;
 }
 
-/* Demand-grow user stacks. */
+/* Demand-grow user stacks and fill reserved shared pages. */
 bool vmm_handle_user_fault(uint64_t addr, uint64_t err) {
     struct task *t = current_task;
     if (!t || !t->pml4 || t->pml4 == kernel_pml4) return false;
@@ -405,7 +406,7 @@ bool vmm_handle_user_fault(uint64_t addr, uint64_t err) {
     if (addr >= USER_STACK_TOP - USER_STACK_MAX && addr < USER_STACK_TOP) {
         return vmm_user_alloc(t->pml4, ALIGN_DOWN(addr, PAGE_SIZE), PAGE_SIZE, VM_W) == 0;
     }
-    return false;
+    return shared_demand_fault(addr, err & 2);
 }
 
 /* ---- vmalloc: virtually contiguous kernel memory from scattered frames ---- */

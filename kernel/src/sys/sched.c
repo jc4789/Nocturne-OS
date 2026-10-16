@@ -441,8 +441,12 @@ static void free_task(struct task *t) {
     struct task **pp = &task_list;
     while (*pp && *pp != t) pp = &(*pp)->all_next;
     if (*pp) *pp = t->all_next;
-    if (t->is_thread && t->user_stack && t->pml4 != kernel_pml4)
+    if (t->is_thread && t->user_stack && t->pml4 != kernel_pml4) {
         vmm_user_free(t->pml4, t->user_stack, t->user_stack_size);
+        /* Both guard pages belong to the stack's reservation. */
+        if (t->process && t->process != t && t->process->pml4 == t->pml4)
+            mmap_hole_add(t->process, t->user_stack - PAGE_SIZE, t->user_stack_size + 2 * PAGE_SIZE);
+    }
     vfree(t->kstack, KSTACK_PAGES);
     if(t->fds!=t->initial_fds)kfree(t->fds);
     kfree(t);
@@ -640,17 +644,15 @@ static int task_thread_create_locked(uint64_t entry, uint64_t function, uint64_t
     t->process = t->parent = owner;
     t->pml4 = owner->pml4;
     t->user_stack_size = 256 * 1024;
-    if (owner->mmap_next >= USER_STACK_TOP - USER_STACK_MAX - t->user_stack_size - 2 * PAGE_SIZE) {
+    /* Unmapped page at each end, distinct from every other thread's stack. */
+    uint64_t reserved = mmap_reserve(owner, t->user_stack_size + PAGE_SIZE);
+    if (!reserved) {
         free_task(t);
         return -ENOMEM;
     }
-    /* Unmapped page at each end, distinct from every other thread's stack. */
-    t->user_stack = owner->mmap_next + PAGE_SIZE;
-    owner->mmap_next = t->user_stack + t->user_stack_size + PAGE_SIZE;
+    t->user_stack = reserved + PAGE_SIZE;
     if (vmm_user_alloc(t->pml4, t->user_stack, t->user_stack_size, VM_W) < 0) {
-        vmm_user_free(t->pml4, t->user_stack, t->user_stack_size);
-        t->user_stack = 0;
-        free_task(t);
+        free_task(t); /* frees the partial stack and returns its reservation */
         return -ENOMEM;
     }
     extern void user_trampoline(void);
@@ -704,46 +706,175 @@ int task_thread_join(int tid) {
     return 0;
 }
 
+/* Address waits are keyed by the physical word, so threads of one process and
+   processes mapping the same shared page meet in one waiter list. Blocked
+   tasks and asynchronous watches share one enrollment sequence: a counted
+   notify wakes the oldest waiters first, whichever kind they are. */
+struct address_watch_queue;
+struct address_watch {
+    struct address_watch *next;
+    struct address_watch_queue *queue;
+    uint64_t phys, seq, token;
+};
+struct address_watch_queue { struct address_watch *ready, **ready_tail; struct vnode *vn; };
 static struct wait_queue address_wait;
-int task_wait_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms) {
+static struct address_watch *address_watches, **address_watch_tail = &address_watches;
+static uint64_t address_seq;
+
+int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsigned timeout_ms) {
     uint64_t flags = irq_save();
     /* Kill and enrollment are both BSP-owned. A queued/migrated syscall must
        never register an infinite wait after its kill wake already happened. */
     if (current_task->killed) { irq_restore(flags); return -EINTR; }
-    if (__atomic_load_n(address, __ATOMIC_ACQUIRE) != expected) {
+    uint64_t current = wide ? __atomic_load_n((volatile uint64_t *)address, __ATOMIC_ACQUIRE)
+                            : __atomic_load_n((volatile uint32_t *)address, __ATOMIC_ACQUIRE);
+    if (current != expected) {
         irq_restore(flags);
         return -EAGAIN;
     }
     if (!timeout_ms) { irq_restore(flags); return -ETIMEDOUT; }
     struct task *t = current_task;
-    t->wait_address = address;
+    uint64_t phys = vmm_translate(t->pml4, (uint64_t)address);
+    if (!phys) { irq_restore(flags); return -EFAULT; }
+    t->wait_phys = phys;
+    t->wait_seq = ++address_seq;
     bool awake = true;
     if (timeout_ms == UINT32_MAX) wq_wait(&address_wait);
     else awake = wq_wait_timeout(&address_wait, timeout_ms);
-    t->wait_address = NULL;
+    t->wait_phys = 0;
     irq_restore(flags);
     if (t->killed) return -EINTR;
     return awake ? 0 : -ETIMEDOUT;
 }
 
+static void address_watch_unlink(struct address_watch **link) {
+    struct address_watch *w = *link;
+    *link = w->next;
+    if (address_watch_tail == &w->next) address_watch_tail = link;
+    w->next = NULL;
+}
+
 int task_wake_address(volatile uint32_t *address, unsigned count) {
     uint64_t flags = irq_save();
     unsigned done = 0;
-    struct task **pp = &address_wait.head;
-    while (*pp) {
-        struct task *t = *pp;
-        if (t->pml4 == current_task->pml4 && t->wait_address == address) {
-            *pp = t->wq_next;
+    uint64_t phys = vmm_translate(current_task->pml4, (uint64_t)address);
+    while (phys && (!count || done < count)) {
+        uint64_t best = UINT64_MAX;
+        struct task **task_link = NULL;
+        struct address_watch **watch_link = NULL;
+        for (struct task **pp = &address_wait.head; *pp; pp = &(*pp)->wq_next)
+            if ((*pp)->wait_phys == phys && (*pp)->wait_seq < best) { best = (*pp)->wait_seq; task_link = pp; }
+        /* Watches are kept in enrollment order: the first match is the oldest. */
+        for (struct address_watch **pw = &address_watches; *pw; pw = &(*pw)->next)
+            if ((*pw)->phys == phys) { if ((*pw)->seq < best) { watch_link = pw; task_link = NULL; } break; }
+        if (watch_link) {
+            struct address_watch *w = *watch_link;
+            address_watch_unlink(watch_link);
+            *w->queue->ready_tail = w;
+            w->queue->ready_tail = &w->next;
+            vfs_poll_notify(w->queue->vn);
+        } else if (task_link) {
+            struct task *t = *task_link;
+            *task_link = t->wq_next;
             t->wq_next = NULL;
             t->wq = NULL;
             t->wake_at = 0;
             sched_make_ready(t);
-            done++;
-            if (count && done >= count) break;
-        } else pp = &t->wq_next;
+        } else break;
+        done++;
     }
     irq_restore(flags);
     return (int)done;
+}
+
+static int64_t address_watch_read_user(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n) {
+    (void)f; (void)off;
+    struct address_watch_queue *q = v->priv;
+    size_t want = n / sizeof(uint64_t), got = 0;
+    if (!want) return -EINVAL;
+    struct address_watch *done = NULL;
+    uint64_t flags = irq_save();
+    if (!q->ready) { irq_restore(flags); return -EAGAIN; }
+    if (!user_ok_w(buf, want * sizeof(uint64_t))) { irq_restore(flags); return -EFAULT; }
+    while (q->ready && got < want) {
+        struct address_watch *w = q->ready;
+        q->ready = w->next;
+        if (!q->ready) q->ready_tail = &q->ready;
+        ((uint64_t *)buf)[got++] = w->token;
+        w->next = done; done = w;
+    }
+    irq_restore(flags);
+    while (done) { struct address_watch *next = done->next; kfree(done); done = next; }
+    return (int64_t)(got * sizeof(uint64_t));
+}
+static bool address_watch_can_read(struct vnode *v, struct file *f) {
+    (void)f;
+    return ((struct address_watch_queue *)v->priv)->ready != NULL;
+}
+static void address_watch_release(struct vnode *v) {
+    struct address_watch_queue *q = v->priv;
+    struct address_watch *done = NULL;
+    uint64_t flags = irq_save();
+    for (struct address_watch **pw = &address_watches; *pw;) {
+        if ((*pw)->queue != q) { pw = &(*pw)->next; continue; }
+        struct address_watch *w = *pw;
+        address_watch_unlink(pw);
+        w->next = done; done = w;
+    }
+    irq_restore(flags);
+    while (q->ready) { struct address_watch *next = q->ready->next; kfree(q->ready); q->ready = next; }
+    while (done) { struct address_watch *next = done->next; kfree(done); done = next; }
+    kfree(q);
+    kfree(v);
+}
+static struct vnode_ops address_watch_ops = {
+    .read_user = address_watch_read_user, .can_read = address_watch_can_read,
+    .release = address_watch_release,
+};
+
+struct vnode *address_watch_queue_new(void) {
+    struct vnode *v = kzalloc(sizeof *v);
+    struct address_watch_queue *q = kzalloc(sizeof *q);
+    if (!v || !q) { kfree(v); kfree(q); return NULL; }
+    q->ready_tail = &q->ready;
+    q->vn = v;
+    v->type = VT_ADDRESS_WATCH; v->unlinked = true; v->ops = &address_watch_ops; v->priv = q;
+    return v;
+}
+
+int address_watch_add(struct vnode *queue, volatile uint32_t *address, uint32_t expected, uint64_t token) {
+    if (!queue || queue->type != VT_ADDRESS_WATCH) return -EBADF;
+    struct address_watch *w = kzalloc(sizeof *w);
+    if (!w) return -ENOMEM;
+    uint64_t flags = irq_save();
+    if (__atomic_load_n(address, __ATOMIC_ACQUIRE) != expected) { irq_restore(flags); kfree(w); return -EAGAIN; }
+    uint64_t phys = vmm_translate(current_task->pml4, (uint64_t)address);
+    if (!phys) { irq_restore(flags); kfree(w); return -EFAULT; }
+    w->queue = queue->priv; w->phys = phys; w->seq = ++address_seq; w->token = token;
+    *address_watch_tail = w;
+    address_watch_tail = &w->next;
+    irq_restore(flags);
+    return 0;
+}
+
+int address_watch_remove(struct vnode *queue, uint64_t token) {
+    if (!queue || queue->type != VT_ADDRESS_WATCH) return -EBADF;
+    struct address_watch_queue *q = queue->priv;
+    struct address_watch *found = NULL;
+    int result = 0;
+    uint64_t flags = irq_save();
+    for (struct address_watch **pw = &address_watches; *pw; pw = &(*pw)->next)
+        if ((*pw)->queue == q && (*pw)->token == token) { found = *pw; address_watch_unlink(pw); result = 1; break; }
+    if (!found)
+        for (struct address_watch **pw = &q->ready; *pw; pw = &(*pw)->next)
+            if ((*pw)->token == token) {
+                found = *pw; *pw = found->next;
+                if (q->ready_tail == &found->next) q->ready_tail = pw;
+                result = 2; break;
+            }
+    irq_restore(flags);
+    kfree(found);
+    return result;
 }
 
 struct task *task_find(int pid) {

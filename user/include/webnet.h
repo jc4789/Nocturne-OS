@@ -47,7 +47,8 @@ static inline bool webnet_method_valid(const char *s) {
 
 typedef struct webnet webnet;
 enum webnet_kind { WEBNET_NAVIGATION, WEBNET_CLASSIC, WEBNET_MODULE, WEBNET_RESOURCE, WEBNET_FETCH,
-                   WEBNET_REPORT }; /* Append-only native CSP transport. */
+                   WEBNET_REPORT, /* Append-only native CSP transport. */
+                   WEBNET_WEBSOCKET }; /* Only through webnet_socket_open. */
 /* A separate destination must not become a generic CORS bypass. Both the
    submitting host and isolated worker enforce this exact generated field. */
 #define WEBNET_CSP_REPORT_HEADERS "Content-Type: application/csp-report\r\n"
@@ -117,6 +118,9 @@ struct webnet_request {
        NULL retains legacy initiator-derived partition/site policy; "" denotes
        an opaque top context. Never supplied through an author HTTP header. */
     const char *top_level_url;
+    /* Initiator policy container COEP require-corp: a cross-origin no-cors
+       response without Cross-Origin-Resource-Policy is same-origin only. */
+    bool require_corp;
 };
 enum webnet_event { WEBNET_COMPLETE, WEBNET_HEADERS, WEBNET_CHUNK, WEBNET_END, WEBNET_UPLOAD };
 struct webnet_response {
@@ -155,8 +159,9 @@ void webnet_pump(webnet *, uint64_t now_ms);
 void webnet_service(webnet *,uint64_t now_ms);
 int webnet_timeout(const webnet *, uint64_t now_ms); /* -1 idle, otherwise next deadline */
 /* Wait on native GUI readiness and all unpaused request channels in one poll.
-   No callbacks, no DOM access. Caller consumes queued GUI events beforehand. */
-int webnet_wait(webnet *,int event_fd,int timeout_ms);
+   aux_fd (or -1) is one more readable descriptor, such as Atomics.waitAsync
+   notifications. No callbacks, no DOM access. Caller consumes queued GUI events beforehand. */
+int webnet_wait(webnet *,int event_fd,int aux_fd,int timeout_ms);
 bool webnet_busy(const webnet *);
 /* Diagnostics: live request transports, excluding queued/retained responses.
    The persistent worker itself is owned until webnet_free. */
@@ -169,3 +174,28 @@ void webnet_resume(webnet *, uint64_t id);
 /* Document teardown: closes non-keepalive request channels; keepalive callbacks and
    copied request policy remain owned by net until completion or explicit cancel. */
 void webnet_cancel_generation(webnet *, uint64_t generation);
+
+/* WebSocket channels (RFC 6455). The isolated service performs the opening
+   handshake, framing and control frames; whole messages cross the channel.
+   Events are delivered only from webnet_pump; FAILED and CLOSED are final. */
+#define WEBNET_SOCKET_TEXT 1u
+#define WEBNET_SOCKET_BINARY 2u
+enum webnet_socket_event { WEBNET_SOCKET_OPENED, WEBNET_SOCKET_RECEIVED, WEBNET_SOCKET_CLOSED, WEBNET_SOCKET_FAILED };
+struct webnet_socket_message {
+    enum webnet_socket_event event;
+    unsigned code;      /* RECEIVED: TEXT or BINARY; CLOSED: the close code (1005 none) */
+    const void *data;   /* message, close reason or error text */
+    size_t length;
+    const char *protocol; /* OPENED: the selected subprotocol, "" for none */
+};
+typedef void (*webnet_socket_callback)(webnet *, uint64_t id, const struct webnet_socket_message *, void *opaque);
+/* url is ws: or wss:, origin the initiating document, headers "" or one
+   "Sec-WebSocket-Protocol: ...\r\n" field; credentials apply to cookies. */
+uint64_t webnet_socket_open(webnet *, const struct webnet_request *, webnet_socket_callback, void *opaque);
+bool webnet_socket_send(webnet *, uint64_t id, unsigned type, const void *data, size_t length);
+/* Starts the closing handshake; code 0 sends a close frame without a code. */
+bool webnet_socket_close(webnet *, uint64_t id, unsigned code, const void *reason, size_t length);
+/* Message bytes queued but not yet handed to the service. */
+size_t webnet_socket_buffered(const webnet *, uint64_t id);
+/* Drops the channel without further callbacks (document teardown, GC). */
+void webnet_socket_release(webnet *, uint64_t id);

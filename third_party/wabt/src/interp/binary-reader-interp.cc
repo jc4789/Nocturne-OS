@@ -309,6 +309,28 @@ class BinaryReaderInterp : public BinaryReaderNop {
                  u32 handler_desc_index = kInvalidIndex);
   void PopLabel();
 
+  // The current body's handlers, by index within the body. Index 0 is the
+  // implicit catch-less handler of the function label (see
+  // BeginFunctionBody); it never catches, so it is stored only before the
+  // first explicit handler, whose delegates may name it.
+  HandlerDesc& Handler(u32 index) {
+    return module_.handlers[func_->handlers + index];
+  }
+  u32 AddHandler(HandlerDesc&& desc) {
+    if (func_->handler_count == 0) {
+      module_.handlers.push_back(HandlerDesc{HandlerKind::Catch,
+                                             body_start_,
+                                             Istream::kInvalidOffset,
+                                             {},
+                                             {Istream::kInvalidOffset},
+                                             body_values_,
+                                             0});
+      func_->handler_count++;
+    }
+    module_.handlers.push_back(std::move(desc));
+    return func_->handler_count++;
+  }
+
   void PrintError(const char* format, ...);
 
   Result GetDropCount(Index keep_count,
@@ -353,6 +375,9 @@ class BinaryReaderInterp : public BinaryReaderNop {
 
   u32 local_decl_count_;
   u32 local_count_;
+  // The current body's implicit handler (see AddHandler).
+  Istream::Offset body_start_ = Istream::kInvalidOffset;
+  u32 body_values_ = 0;
 
   std::vector<FuncType> func_types_;      // Includes imported and defined.
   std::vector<TableType> table_types_;    // Includes imported and defined.
@@ -629,7 +654,7 @@ Result BinaryReaderInterp::OnFunction(Index index, Index sig_index) {
   CHECK_RESULT(
       validator_.OnFunction(GetLocation(), Var(sig_index, GetLocation())));
   FuncType& func_type = module_.func_types[sig_index];
-  module_.funcs.push_back(FuncDesc{func_type, {}, Istream::kInvalidOffset, {}});
+  module_.funcs.push_back(FuncDesc{&func_type});
   func_types_.push_back(func_type);
   return Result::Ok;
 }
@@ -648,7 +673,7 @@ Result BinaryReaderInterp::BeginTable(Index index,
                                   init_provided));
   TableType table_type{elem_type, *elem_limits};
   FuncDesc init_func{
-      FuncType{{}, {elem_type}}, {}, Istream::kInvalidOffset, {}};
+      module_.InitType(elem_type)};
   module_.tables.push_back(TableDesc{table_type, init_func});
   table_types_.push_back(table_type);
   return Result::Ok;
@@ -690,7 +715,7 @@ Result BinaryReaderInterp::OnGlobalCount(Index count) {
 Result BinaryReaderInterp::BeginGlobal(Index index, Type type, bool mutable_) {
   CHECK_RESULT(validator_.OnGlobal(GetLocation(), type, mutable_));
   GlobalType global_type{type, ToMutability(mutable_)};
-  FuncDesc init_func{FuncType{{}, {type}}, {}, Istream::kInvalidOffset, {}};
+  FuncDesc init_func{module_.InitType(type)};
   module_.globals.push_back(GlobalDesc{global_type, init_func});
   global_types_.push_back(global_type);
   return Result::Ok;
@@ -713,7 +738,7 @@ Result BinaryReaderInterp::BeginInitExpr(FuncDesc* func) {
   label_stack_.clear();
   func_ = func;
   func_->code_offset = istream_.end();
-  Type type = func->type.results[0];
+  Type type = func->type->results[0];
   CHECK_RESULT(validator_.BeginInitExpr(GetLocation(), type));
   // Push implicit init func label (equivalent to return).
   PushLabel(LabelKind::Try, Istream::kInvalidOffset, Istream::kInvalidOffset);
@@ -783,7 +808,7 @@ Result BinaryReaderInterp::BeginElemSegment(Index index,
     offset_type = ValueType::I64;
   }
   FuncDesc init_func{
-      FuncType{{}, {offset_type}}, {}, Istream::kInvalidOffset, {}};
+      module_.InitType(offset_type)};
   ElemDesc desc{{}, ValueType::Void, mode, table_index, init_func};
   module_.elems.push_back(desc);
   return Result::Ok;
@@ -815,7 +840,7 @@ Result BinaryReaderInterp::BeginElemExpr(Index elem_index, Index expr_index) {
   assert(elem_index == module_.elems.size() - 1);
   ElemDesc& elem = module_.elems.back();
   elem.elements.push_back(
-      {FuncType{{}, {elem.type}}, {}, Istream::kInvalidOffset, {}});
+      {module_.InitType(elem.type)});
   assert(expr_index == elem.elements.size() - 1);
   return BeginInitExpr(&elem.elements.back());
 }
@@ -852,7 +877,7 @@ Result BinaryReaderInterp::BeginDataSegment(Index index,
     offset_type = ValueType::I64;
   }
   FuncDesc init_func{
-      FuncType{{}, {offset_type}}, {}, Istream::kInvalidOffset, {}};
+      module_.InitType(offset_type)};
   DataDesc desc{{}, mode, memory_index, init_func};
   module_.datas.push_back(desc);
   return Result::Ok;
@@ -879,6 +904,8 @@ Result BinaryReaderInterp::BeginFunctionBody(Index index, Offset size) {
   Index defined_index = index - num_func_imports();
   func_ = &module_.funcs[defined_index];
   func_->code_offset = istream_.end();
+  func_->locals = static_cast<u32>(module_.locals.size());
+  func_->handlers = static_cast<u32>(module_.handlers.size());
 
   depth_fixups_.Clear();
   label_stack_.clear();
@@ -895,7 +922,7 @@ Result BinaryReaderInterp::BeginFunctionBody(Index index, Offset size) {
   // needed to support delegating to the caller of a function using the
   // try-delegate instruction.
   PushLabel(LabelKind::Try, Istream::kInvalidOffset, Istream::kInvalidOffset,
-            func_->handlers.size());
+            func_->handler_count);
   return Result::Ok;
 }
 
@@ -923,7 +950,8 @@ Result BinaryReaderInterp::OnLocalDecl(Index decl_index,
   CHECK_RESULT(validator_.OnLocalDecl(GetLocation(), count, type));
 
   local_count_ += count;
-  func_->locals.push_back(LocalDesc{type, count, local_count_});
+  module_.locals.push_back(LocalDesc{type, count, local_count_});
+  func_->local_count++;
   return Result::Ok;
 }
 
@@ -931,7 +959,7 @@ Result BinaryReaderInterp::EndLocalDecls() {
   if (local_count_ != 0) {
     istream_.Emit(Opcode::InterpAlloca, local_count_);
     for (Index i = 0; i < local_count_; i++) {
-      if (func_->GetLocalType(func_->type.params.size() + i).IsRef()) {
+      if (module_.GetLocalType(*func_, func_->type->params.size() + i).IsRef()) {
         istream_.Emit(Opcode::InterpMarkRef, local_count_ - i);
       }
     }
@@ -941,13 +969,8 @@ Result BinaryReaderInterp::EndLocalDecls() {
   // We need the local count for this, which is only available after processing
   // all local decls.
   // NOTE: we don't count the parameters, as they're not part of the frame.
-  func_->handlers.push_back(HandlerDesc{HandlerKind::Catch,
-                                        istream_.end(),
-                                        Istream::kInvalidOffset,
-                                        {},
-                                        {Istream::kInvalidOffset},
-                                        static_cast<u32>(local_count_),
-                                        0});
+  body_start_ = istream_.end();
+  body_values_ = static_cast<u32>(local_count_);
 
   return Result::Ok;
 }
@@ -1132,13 +1155,13 @@ Result BinaryReaderInterp::OnEndExpr() {
     // Catch-less try blocks need to fill in the handler description
     // so that it can trigger an exception rethrow when it's reached.
     Label* local_label = TopLabel();
-    HandlerDesc& desc = func_->handlers[local_label->handler_desc_index];
+    HandlerDesc& desc = Handler(local_label->handler_desc_index);
     desc.try_end_offset = istream_.end();
     assert(desc.catches.size() == 0);
   } else if (label_type == LabelType::TryTable) {
     // TryTable blocks need a try_end_offset
     Label* local_label = TopLabel();
-    HandlerDesc& desc = func_->handlers[local_label->handler_desc_index];
+    HandlerDesc& desc = Handler(local_label->handler_desc_index);
     desc.try_end_offset = istream_.end();
   } else if (label_type == LabelType::Catch) {
     istream_.EmitCatchDrop(1);
@@ -1381,7 +1404,7 @@ Result BinaryReaderInterp::OnLocalGetExpr(Index local_index) {
   CHECK_RESULT(
       validator_.OnLocalGet(GetLocation(), Var(local_index, GetLocation())));
 
-  Type type = func_->GetLocalType(local_index);
+  Type type = module_.GetLocalType(*func_, local_index);
   if (type.IsRef()) {
     istream_.Emit(Opcode::InterpLocalGetRef, translated_local_index);
   } else {
@@ -1648,15 +1671,15 @@ Result BinaryReaderInterp::OnTryExpr(Type sig_type) {
   u32 value_stack_height = validator_.type_stack_size() + local_count_;
   CHECK_RESULT(validator_.OnTry(GetLocation(), sig_type));
   // Push a label that tracks mapping of exn -> catch
+  u32 handler = AddHandler(HandlerDesc{HandlerKind::Catch,
+                                       istream_.end(),
+                                       Istream::kInvalidOffset,
+                                       {},
+                                       {Istream::kInvalidOffset},
+                                       value_stack_height,
+                                       exn_stack_height});
   PushLabel(LabelKind::Try, Istream::kInvalidOffset, Istream::kInvalidOffset,
-            func_->handlers.size());
-  func_->handlers.push_back(HandlerDesc{HandlerKind::Catch,
-                                        istream_.end(),
-                                        Istream::kInvalidOffset,
-                                        {},
-                                        {Istream::kInvalidOffset},
-                                        value_stack_height,
-                                        exn_stack_height});
+            handler);
   return Result::Ok;
 }
 
@@ -1725,9 +1748,9 @@ Result BinaryReaderInterp::OnTryTableExpr(Type sig_type,
   desc.try_start_offset = istream_.end();
 
   // as usual, the label is pushed after the catch handlers
+  u32 handler = AddHandler(std::move(desc));
   PushLabel(LabelKind::Try, Istream::kInvalidOffset, Istream::kInvalidOffset,
-            func_->handlers.size());
-  func_->handlers.push_back(std::move(desc));
+            handler);
 
   istream_.ResolveFixupU32(offset);
 
@@ -1738,7 +1761,7 @@ Result BinaryReaderInterp::OnCatchExpr(Index tag_index) {
   CHECK_RESULT(
       validator_.OnCatch(GetLocation(), Var(tag_index, GetLocation()), false));
   Label* label = TopLabel();
-  HandlerDesc& desc = func_->handlers[label->handler_desc_index];
+  HandlerDesc& desc = Handler(label->handler_desc_index);
   desc.kind = HandlerKind::Catch;
   // Drop the previous block's exception if it was a catch.
   if (label->kind == LabelKind::Block) {
@@ -1767,7 +1790,7 @@ Result BinaryReaderInterp::OnCatchExpr(Index tag_index) {
 Result BinaryReaderInterp::OnCatchAllExpr() {
   CHECK_RESULT(validator_.OnCatch(GetLocation(), Var(), true));
   Label* label = TopLabel();
-  HandlerDesc& desc = func_->handlers[label->handler_desc_index];
+  HandlerDesc& desc = Handler(label->handler_desc_index);
   desc.kind = HandlerKind::Catch;
   if (label->kind == LabelKind::Block) {
     istream_.EmitCatchDrop(1);
@@ -1789,7 +1812,7 @@ Result BinaryReaderInterp::OnDelegateExpr(Index depth) {
   CHECK_RESULT(validator_.OnDelegate(GetLocation(), Var(depth, GetLocation())));
   Label* label = TopLabel();
   assert(label->kind == LabelKind::Try);
-  HandlerDesc& desc = func_->handlers[label->handler_desc_index];
+  HandlerDesc& desc = Handler(label->handler_desc_index);
   desc.kind = HandlerKind::Delegate;
   Istream::Offset offset = label->offset;
   istream_.Emit(Opcode::Br);

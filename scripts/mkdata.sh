@@ -5,7 +5,8 @@ set -e
 cd "$(dirname "$0")/.."
 IMG=${1:-build/data.img}
 SIZE_MB=${2:-512}
-[ -f "$IMG" ] && exit 0
+# MKDATA_REPLACE=1 rewrites an existing scratch image in place (test runs reuse their media).
+[ -f "$IMG" ] && [ -z "$MKDATA_REPLACE" ] && exit 0
 PART_START=2048
 TOTAL=$((SIZE_MB * 2048))
 PART_SECTORS=$((TOTAL - PART_START))

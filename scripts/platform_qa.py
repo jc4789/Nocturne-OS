@@ -275,19 +275,34 @@ def main():
     if a.virgl_disable_mt and not a.gl:
         ap.error('--virgl-disable-mtには--glが必要です')
     here = ROOT / 'build/nocturne-platform' / a.label
-    here.mkdir(parents=True, exist_ok=False)
+    # A reused label overwrites its boot/data media in place instead of
+    # piling up new copies; earlier screens of the label are replaced below.
+    here.mkdir(parents=True, exist_ok=True)
+    for stale in [*here.glob('screen-*.p[np][gm]'), here / 'serial.log']:
+        if stale.is_file():
+            stale.unlink()
     boot = here / 'boot.img'
-    shutil.copyfile(ROOT / 'build/nocturne.img', boot)
     boot_part = boot.relative_to(ROOT).as_posix()+'@@1048576'
+    # QEMU opens both disks with snapshot=on, so a label's media never change
+    # while running. Copy the boot disk only when the build image or the boot
+    # options changed; otherwise the previous copy is already exact.
+    source = ROOT / 'build/nocturne.img'
+    stamp = here / 'boot.stamp'
+    wanted = json.dumps({'size': source.stat().st_size, 'mtime': source.stat().st_mtime_ns,
+                         'cmdline': a.cmdline, 'resolution': a.resolution})
+    reuse_boot = boot.is_file() and stamp.is_file() and stamp.read_text(encoding='utf-8') == wanted
+    if not reuse_boot:
+        stamp.unlink(missing_ok=True)
+        shutil.copyfile(source, boot)
     hashes = {}
     for name in ('kernel.elf', 'initrd.tar'):
         extracted = here / ('extracted-'+name)
-        run(BIN / 'mcopy.exe', '-i', boot_part, '::/boot/'+name, extracted.relative_to(ROOT).as_posix())
+        run(BIN / 'mcopy.exe', '-o', '-i', boot_part, '::/boot/'+name, extracted.relative_to(ROOT).as_posix())
         hashes[name] = digest(extracted)
         if hashes[name] != digest(ROOT / 'build' / name):
             raise RuntimeError('起動媒体と最新buildが不一致: '+name)
         extracted.unlink()
-    if a.cmdline or a.resolution:
+    if (a.cmdline or a.resolution) and not reuse_boot:
         config = (ROOT / 'boot/limine.conf').read_text(encoding='utf-8')
         needle = '    path: boot():/boot/kernel.elf'
         first_entry = config.split('\n/')[1].split('\n/')[0] if '\n/' in config else ''
@@ -306,10 +321,20 @@ def main():
         conf = here / 'limine.conf'
         conf.write_text(config.replace(first_entry, updated, 1), encoding='utf-8', newline='\n')
         run(BIN / 'mcopy.exe', '-o', '-i', boot_part, conf.relative_to(ROOT).as_posix(), '::/boot/limine/limine.conf')
+    if not reuse_boot:
+        stamp.write_text(wanted, encoding='utf-8')
     disk = here / 'data.img'
-    run(USR / 'bash.exe', 'scripts/mkdata.sh', disk.relative_to(ROOT).as_posix(), '128')
+    # The scratch data disk is formatted once per mkdata layout; each run only
+    # overwrites the files it ships (tests, guest files, autorun).
+    data_stamp = here / 'data.stamp'
+    data_wanted = digest(ROOT / 'scripts/mkdata.sh')
+    if not disk.is_file() or not data_stamp.is_file() or data_stamp.read_text(encoding='utf-8') != data_wanted:
+        data_stamp.unlink(missing_ok=True)
+        subprocess.run([str(USR / 'bash.exe'), 'scripts/mkdata.sh', disk.relative_to(ROOT).as_posix(), '128'],
+                       cwd=ROOT, env=dict(ENV, MKDATA_REPLACE='1'), check=True)
+        data_stamp.write_text(data_wanted, encoding='utf-8')
     part = disk.relative_to(ROOT).as_posix()+'@@1048576'
-    run(BIN / 'mcopy.exe', '-i', part, '-s', 'tests', '::/')
+    run(BIN / 'mcopy.exe', '-o', '-i', part, '-s', 'tests', '::/')
     guest_hashes = {}
     for source in a.guest_file:
         local = Path(source).resolve(strict=True)
@@ -332,7 +357,7 @@ def main():
         commands += ['browser --debug-js '+a.url]
     script = here / 'autorun.sh'
     script.write_text('\n'.join(commands)+'\n', encoding='utf-8', newline='\n')
-    run(BIN / 'mcopy.exe', '-i', part, script.relative_to(ROOT).as_posix(), '::/tests/autorun.sh')
+    run(BIN / 'mcopy.exe', '-o', '-i', part, script.relative_to(ROOT).as_posix(), '::/tests/autorun.sh')
     with socket.socket() as s:
         s.bind(('127.0.0.1', 0))
         port = s.getsockname()[1]

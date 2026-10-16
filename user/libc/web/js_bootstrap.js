@@ -38,6 +38,7 @@
     let shadowHandlerTarget = () => false;
     let avmediaHandlerTarget = () => false;
     let blobHandlerTarget = () => false;
+    let socketHandlerTarget = () => false;
     let mseHandlerTarget = () => false;
     let emeHandlerTarget = () => false;
     let indexedDBHandlerTarget = () => false;
@@ -89,62 +90,8 @@
     Object.assign(Event, {NONE:0, CAPTURING_PHASE:1, AT_TARGET:2, BUBBLING_PHASE:3});
     Object.assign(Event.prototype, {NONE:0, CAPTURING_PHASE:1, AT_TARGET:2, BUBBLING_PHASE:3});
     /* @include js_error_event.js */
-    const PromiseRejectionEvent=(()=>{
-        const data=new WeakMap(),get=WeakMap.prototype.get,set=WeakMap.prototype.set,call=Reflect.apply;
-        function record(value){
-            const result=call(get,data,[value]);
-            if(!result)throw new TypeError('Illegal PromiseRejectionEvent receiver');
-            return result;
-        }
-        class PromiseRejectionEvent extends Event {
-            constructor(type,init){
-                if(arguments.length<2)throw new TypeError('PromiseRejectionEvent requires a type and an init dictionary');
-                if(typeof type==='symbol')throw new TypeError('Cannot convert Symbol to DOMString');
-                const t=String(type);
-                if(init!=null && typeof init!=='object' && typeof init!=='function')throw new TypeError('Expected event dictionary');
-                const source=init==null?{}:init;
-                // Dictionary members in Web IDL (lexicographic) order.
-                const base={bubbles:!!source.bubbles,cancelable:!!source.cancelable,composed:!!source.composed};
-                const promise=source.promise;
-                if(promise===undefined)throw new TypeError("PromiseRejectionEventInit requires 'promise'");
-                if(promise===null || (typeof promise!=='object' && typeof promise!=='function'))
-                    throw new TypeError("PromiseRejectionEventInit 'promise' must be an object");
-                const reason=source.reason;
-                super(t,base);call(set,data,[this,{promise,reason}]);
-            }
-            get promise(){return record(this).promise;}
-            get reason(){return record(this).reason;}
-        }
-        Object.defineProperty(PromiseRejectionEvent.prototype,Symbol.toStringTag,{configurable:true,value:'PromiseRejectionEvent'});
-        for(const key of ['promise','reason'])
-            Object.defineProperty(PromiseRejectionEvent.prototype,key,{...Object.getOwnPropertyDescriptor(PromiseRejectionEvent.prototype,key),enumerable:true});
-        return PromiseRejectionEvent;
-    })();
-    /* HTML "notify about rejected promises". Native code hands over each
-       rejection still unhandled after the microtask checkpoint; a promise that
-       stays unhandled after its unhandledrejection dispatch joins the weak
-       outstanding set, and only those fire rejectionhandled when handled. */
-    const rejectionBridge=(()=>{
-        const outstanding=new WeakSet(),has=WeakSet.prototype.has,add=WeakSet.prototype.add,remove=WeakSet.prototype.delete;
-        const call=Reflect.apply,isHandled=host.promiseIsHandled;
-        function fire(type,promise,reason,cancelable){
-            const event=new PromiseRejectionEvent(type,{__proto__:null,cancelable,promise,reason});
-            eventState(event).isTrusted=true;
-            return dispatch(globalThis,event);
-        }
-        // Returns notCanceled: whether the console still reports the reason.
-        function unhandled(promise,reason){
-            const report=fire('unhandledrejection',promise,reason,true);
-            if(!isHandled(promise))call(add,outstanding,[promise]);
-            return report;
-        }
-        function handled(promise,reason){
-            if(!call(has,outstanding,[promise]))return;
-            call(remove,outstanding,[promise]);
-            setTimeout(()=>{fire('rejectionhandled',promise,reason,false);},0);
-        }
-        return {unhandled,handled};
-    })();
+    /* @include js_promise_rejection.js */
+    const rejectionBridge=promiseRejectionBridge(event=>dispatch(globalThis,event),host.promiseIsHandled,fn=>setTimeout(fn,0));
     class CustomEvent extends Event {
         constructor(t, o = {}) { super(t,o); this.detail = o.detail === undefined ? null : o.detail; }
         initCustomEvent(type,bubbles=false,cancelable=false,detail=null) {
@@ -276,7 +223,7 @@
     }
     function handlerTarget(target,type) {
         return (globalHandlerTypes.has(type) && (target===globalThis || target instanceof HTMLElement || target instanceof Document || svgHandlerTarget(target))) ||
-            (windowHandlerTypes.has(type) && target===globalThis) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type);
+            (windowHandlerTypes.has(type) && target===globalThis) || bodyWindowHandler(target,type) || xhrHandlerTarget(target,type) || messageHandlerTarget(target,type) || abortHandlerTarget(target,type) || shadowHandlerTarget(target,type) || avmediaHandlerTarget(target,type) || blobHandlerTarget(target,type) || mseHandlerTarget(target,type) || emeHandlerTarget(target,type) || indexedDBHandlerTarget(target,type) || presentationHandlerTarget(target,type) || textTrackHandlerTarget(target,type) || socketHandlerTarget(target,type);
     }
     function bodyWindowHandler(target,type){
         if(!bodyWindowTypes.has(type) || target===globalThis)return false;
@@ -1118,7 +1065,10 @@
     /* @include js_worker.js */
     /* @include js_storage.js */
     /* @include js_indexeddb.js */
+    /* @include js_opfs.js */
+    installOriginPrivateFileSystem(host,cryptoSecureContext,Navigator,false);
     /* @include js_messaging.js */
+    /* @include js_websocket.js */
     /* @include js_css_supports.js */
     /* @include js_performance.js */
     /* @include js_idle.js */
@@ -1146,6 +1096,7 @@
     /* @include js_element_internals.js */
     /* @include js_semantic_elements.js */
     htmlElementsBridge.initializeDialogs(ToggleEvent);
+    /* @include js_offscreen_canvas.js */
     /* @include js_canvas_dash.js */
     /* @include js_canvas.js */
     /* @include js_mse.js */

@@ -549,11 +549,11 @@ inline void Object::set_host_info(void* host_info) {
 }
 
 inline Finalizer Object::get_finalizer() const {
-  return finalizer_;
+  return finalizer_ ? *finalizer_ : Finalizer();
 }
 
 inline void Object::set_finalizer(Finalizer finalizer) {
-  finalizer_ = finalizer;
+  finalizer_ = finalizer ? std::make_unique<Finalizer>(std::move(finalizer)) : nullptr;
 }
 
 //// Foreign ////
@@ -638,11 +638,11 @@ inline bool Func::classof(const Object* obj) {
 }
 
 inline const ExternType& Func::extern_type() {
-  return type_;
+  return *type_;
 }
 
 inline const FuncType& Func::type() const {
-  return type_;
+  return *type_;
 }
 
 //// DefinedFunc ////
@@ -654,7 +654,7 @@ inline bool DefinedFunc::classof(const Object* obj) {
 // static
 inline DefinedFunc::Ptr DefinedFunc::New(Store& store,
                                          Ref instance,
-                                         FuncDesc desc) {
+                                         const FuncDesc& desc) {
   return store.Alloc<DefinedFunc>(store, instance, desc);
 }
 
@@ -663,7 +663,7 @@ inline Ref DefinedFunc::instance() const {
 }
 
 inline const FuncDesc& DefinedFunc::desc() const {
-  return desc_;
+  return *desc_;
 }
 
 //// HostFunc ////
@@ -719,10 +719,19 @@ inline Memory::Ptr Memory::New(interp::Store& store, MemoryType type) {
   return memory;
 }
 
+// static
+inline Memory::Ptr Memory::NewShared(interp::Store& store, MemoryType type,
+                                     u8* data, std::atomic<u64>* length) {
+  auto memory = store.Alloc<Memory>(store, type, data, length);
+  if (!memory->allocation_ok_) return {};
+  return memory;
+}
+
 inline bool Memory::IsValidAccess(u64 offset, u64 addend, u64 size) const {
-  // FIXME: make this faster.
-  return offset <= data_.size() && addend <= data_.size() &&
-         size <= data_.size() && offset + addend + size <= data_.size();
+  // Read a shared memory's length once: another agent may grow it.
+  u64 bytes = this->size();
+  return offset <= bytes && addend <= bytes &&
+         size <= bytes && offset + addend + size <= bytes;
 }
 
 inline bool Memory::IsValidAtomicAccess(u64 offset,
@@ -737,7 +746,7 @@ Result Memory::Load(u64 offset, u64 addend, T* out) const {
   if (!IsValidAccess(offset, addend, sizeof(T))) {
     return Result::Error;
   }
-  MemcpyEndianAware(out, data_.data(), sizeof(T), data_.size(), 0,
+  MemcpyEndianAware(out, bytes(), sizeof(T), size(), 0,
                     offset + addend, sizeof(T));
   return Result::Ok;
 }
@@ -746,7 +755,7 @@ template <typename T>
 T WABT_VECTORCALL Memory::UnsafeLoad(u64 offset, u64 addend) const {
   assert(IsValidAccess(offset, addend, sizeof(T)));
   T val;
-  MemcpyEndianAware(&val, data_.data(), sizeof(T), data_.size(), 0,
+  MemcpyEndianAware(&val, bytes(), sizeof(T), size(), 0,
                     offset + addend, sizeof(T));
   return val;
 }
@@ -756,18 +765,24 @@ Result WABT_VECTORCALL Memory::Store(u64 offset, u64 addend, T val) {
   if (!IsValidAccess(offset, addend, sizeof(T))) {
     return Result::Error;
   }
-  MemcpyEndianAware(data_.data(), &val, data_.size(), sizeof(T),
+  MemcpyEndianAware(bytes(), &val, size(), sizeof(T),
                     offset + addend, 0, sizeof(T));
   return Result::Ok;
 }
+
+// Atomic accesses are naturally aligned, so each is one host word that the
+// processor updates indivisibly for every agent mapping the storage. The
+// little-endian layout is the Wasm layout; a big-endian host would need its
+// reversed-storage addressing here as well.
+static_assert(!WABT_BIG_ENDIAN, "interp atomics address little-endian storage");
 
 template <typename T>
 Result Memory::AtomicLoad(u64 offset, u64 addend, T* out) const {
   if (!IsValidAtomicAccess(offset, addend, sizeof(T))) {
     return Result::Error;
   }
-  MemcpyEndianAware(out, data_.data(), sizeof(T), data_.size(), 0,
-                    offset + addend, sizeof(T));
+  *out = __atomic_load_n(reinterpret_cast<T*>(bytes() + offset + addend),
+                         __ATOMIC_SEQ_CST);
   return Result::Ok;
 }
 
@@ -776,16 +791,21 @@ Result Memory::AtomicStore(u64 offset, u64 addend, T val) {
   if (!IsValidAtomicAccess(offset, addend, sizeof(T))) {
     return Result::Error;
   }
-  MemcpyEndianAware(data_.data(), &val, data_.size(), sizeof(T),
-                    offset + addend, 0, sizeof(T));
+  __atomic_store_n(reinterpret_cast<T*>(bytes() + offset + addend), val,
+                   __ATOMIC_SEQ_CST);
   return Result::Ok;
 }
 
 template <typename T, typename F>
 Result Memory::AtomicRmw(u64 offset, u64 addend, T rhs, F&& func, T* out) {
-  T lhs;
-  CHECK_RESULT(AtomicLoad(offset, addend, &lhs));
-  CHECK_RESULT(AtomicStore(offset, addend, func(lhs, rhs)));
+  if (!IsValidAtomicAccess(offset, addend, sizeof(T))) {
+    return Result::Error;
+  }
+  T* word = reinterpret_cast<T*>(bytes() + offset + addend);
+  T lhs = __atomic_load_n(word, __ATOMIC_RELAXED);
+  while (!__atomic_compare_exchange_n(word, &lhs, func(lhs, rhs), false,
+                                      __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) {
+  }
   *out = lhs;
   return Result::Ok;
 }
@@ -796,25 +816,26 @@ Result Memory::AtomicRmwCmpxchg(u64 offset,
                                 T expect,
                                 T replace,
                                 T* out) {
-  T read;
-  CHECK_RESULT(AtomicLoad(offset, addend, &read));
-  if (read == expect) {
-    CHECK_RESULT(AtomicStore(offset, addend, replace));
+  if (!IsValidAtomicAccess(offset, addend, sizeof(T))) {
+    return Result::Error;
   }
-  *out = read;
+  T* word = reinterpret_cast<T*>(bytes() + offset + addend);
+  __atomic_compare_exchange_n(word, &expect, replace, false, __ATOMIC_SEQ_CST,
+                              __ATOMIC_SEQ_CST);
+  *out = expect;  // the value read, whether or not it was replaced
   return Result::Ok;
 }
 
 inline u8* Memory::UnsafeData() {
-  return data_.data();
+  return bytes();
 }
 
 inline u64 Memory::ByteSize() const {
-  return data_.size();
+  return size();
 }
 
 inline u64 Memory::PageSize() const {
-  return pages_;
+  return shared_length_ ? size() / type_.page_size : pages_;
 }
 
 inline const ExternType& Memory::extern_type() {

@@ -3,7 +3,8 @@
 (function(host){
     const apply=Reflect.apply;
     delete globalThis.__workerHost;
-    delete globalThis.SharedArrayBuffer;delete globalThis.Atomics;
+    // SharedArrayBuffer and Atomics stay for the platform bootstrap; the
+    // native policy start removes the constructor outside isolation.
     /* @include js_dom_exception.js */
     const DOMException=domExceptionBridge.DOMException;
     const eventStates=new WeakMap(),listeners=new WeakMap(),eventGet=WeakMap.prototype.get,eventSet=WeakMap.prototype.set;
@@ -36,6 +37,7 @@
         eventDefine(Event,key,{value,enumerable:true});eventDefine(Event.prototype,key,{value,enumerable:true});
     }
     /* @include js_error_event.js */
+    /* @include js_promise_rejection.js */
     function workerListeners(value){const m=apply(eventGet,listeners,[value]);if(!m)throw new TypeError('Illegal EventTarget receiver');return m;}
     function removeWorkerListener(list,entry){if(entry.removed)return;entry.removed=true;const index=apply(eventIndexOf,list,[entry]);if(index>=0)apply(eventSplice,list,[index,1]);if(entry.unlisten){entry.unlisten();entry.unlisten=null;}}
     class EventTarget{
@@ -82,7 +84,7 @@
         }finally{s.currentTarget=null;s.eventPhase=0;s.path=[];s.dispatching=s.passive=s.stop=s.immediate=false;}
     }
     function dispatchNativeWorkerEvent(object,event){eventState(event).isTrusted=true;return dispatchWorkerEvent(object,event);}
-    Object.assign(globalThis,{DOMException,Event,ErrorEvent,EventTarget});
+    Object.assign(globalThis,{DOMException,Event,ErrorEvent,PromiseRejectionEvent,EventTarget});
     const progressSlots=new WeakMap();
     class ProgressEvent extends Event{
         constructor(type,init={}){init=init==null?{}:Object(init);super(type,init);const number=v=>{const n=Number(v)||0;return Number.isFinite(n)?Number(BigInt(Math.trunc(n))&18446744073709551615n):0;};apply(eventSet,progressSlots,[this,{lengthComputable:!!init.lengthComputable,loaded:number(init.loaded),total:number(init.total)}]);}
@@ -105,6 +107,7 @@
     host.timer=(_,fn,ms,args)=>timer(fn,ms,args,false);host.clear=clearTimer;
     /* @include js_blob.js */
     /* @include js_clone.js */
+    /* @include js_offscreen_canvas.js */
     /* @include js_worker_messaging.js */
     /* @include js_sanitizer_constants.js */
     /* @include js_html_safety.js */
@@ -116,6 +119,8 @@
         // START's native policy URL is now established. No author script runs
         // until the same crypto and form algorithms as Window are installed.
         /* @include js_crypto.js */
+        /* @include js_opfs.js */
+        installOriginPrivateFileSystem(host,cryptoSecureContext,WorkerNavigator,!shared);
         /* @include js_formdata.js */
         cloneData.registerUncloneable(value=>formDataBridge.brand(value));
         return formDataBridge;
@@ -329,19 +334,49 @@
             return new workerFetchBridge.NativePromise((resolve,reject)=>{const id=host.request(requestURL,noCors,noReferrer,requestMethod,prepared.headers,prepared.bytes,referrerURL,referrerPolicy),p={resolve,reject,noCors,signal,method:requestMethod,cleanup:()=>{}};workerFetchBridge.remember(id,p);if(signal!=null)p.cleanup=workerAbortBridge.subscribe(signal,reason=>{if(!workerFetchBridge.take(id))return;p.cleanup();try{host.cancel(id);}finally{reject(reason);}});});
         }catch(error){return workerFetchBridge.reject(error);}
     }
+    /* @include js_performance.js */
     Object.assign(globalThis,{self:globalThis,navigator,WorkerNavigator,postMessage,close,importScripts,Headers,Response,AbortSignal,AbortController,fetch,
         setTimeout:(fn,ms,...args)=>timer(fn,ms,args,false),setInterval:(fn,ms,...args)=>timer(fn,ms,args,true),
         clearTimeout:clearTimer,clearInterval:clearTimer,
         queueMicrotask:fn=>{if(typeof fn!=='function')throw new TypeError('Callback required');Promise.resolve().then(fn).catch(report);},
-        performance:{now:()=>host.now()},console:Object.fromEntries(['log','warn','error','info','debug'].map(k=>[k,(...args)=>host.send(7,0,{message:args.map(String).join(' '),filename:address})])),
+        console:Object.fromEntries(['log','warn','error','info','debug'].map(k=>[k,(...args)=>host.send(7,0,{message:args.map(String).join(' '),filename:address})])),
         addEventListener:target.addEventListener.bind(target),removeEventListener:target.removeEventListener.bind(target),dispatchEvent:target.dispatchEvent.bind(target)});
     /* @include js_wasm.js */
-    Object.defineProperties(globalThis,{name:{get:()=>workerName},onconnect:{get:()=>target.onconnect,set:fn=>target.onconnect=fn},onmessage:{get:()=>target.onmessage,set:fn=>target.onmessage=fn},onmessageerror:{get:()=>target.onmessageerror,set:fn=>target.onmessageerror=fn},onerror:{get:()=>target.onerror,set:fn=>target.onerror=fn},onsecuritypolicyviolation:{get:()=>target.onsecuritypolicyviolation,set:fn=>target.onsecuritypolicyviolation=fn}});
+    // The global object is a WorkerGlobalScope: its interface objects are not
+    // constructible, and the chain runs through EventTarget.prototype. The
+    // concrete scope (dedicated or shared) is fixed when the host starts it.
+    function scopeInterface(name,parent){
+        const ctor=({[name]:function(){throw new TypeError('Illegal constructor');}})[name];
+        Object.setPrototypeOf(ctor,parent);
+        Object.defineProperty(ctor,'prototype',{value:Object.create(parent.prototype,{
+            constructor:{value:ctor,writable:true,configurable:true},[Symbol.toStringTag]:{value:name,configurable:true}}),writable:false});
+        return ctor;
+    }
+    const WorkerGlobalScope=scopeInterface('WorkerGlobalScope',EventTarget);
+    const DedicatedWorkerGlobalScope=scopeInterface('DedicatedWorkerGlobalScope',WorkerGlobalScope);
+    const SharedWorkerGlobalScope=scopeInterface('SharedWorkerGlobalScope',WorkerGlobalScope);
+    Object.defineProperty(globalThis,'WorkerGlobalScope',{value:WorkerGlobalScope,writable:true,configurable:true});
+    function installScope(isShared){
+        const scope=isShared?SharedWorkerGlobalScope:DedicatedWorkerGlobalScope;
+        Object.defineProperty(globalThis,scope.name,{value:scope,writable:true,configurable:true});
+        Object.setPrototypeOf(globalThis,scope.prototype);
+    }
+    Object.defineProperties(globalThis,{name:{get:()=>workerName},onconnect:{get:()=>target.onconnect,set:fn=>target.onconnect=fn},onmessage:{get:()=>target.onmessage,set:fn=>target.onmessage=fn},onmessageerror:{get:()=>target.onmessageerror,set:fn=>target.onmessageerror=fn},onerror:{get:()=>target.onerror,set:fn=>target.onerror=fn},onunhandledrejection:{get:()=>target.onunhandledrejection,set:fn=>target.onunhandledrejection=fn},onrejectionhandled:{get:()=>target.onrejectionhandled,set:fn=>target.onrejectionhandled=fn},onsecuritypolicyviolation:{get:()=>target.onsecuritypolicyviolation,set:fn=>target.onsecuritypolicyviolation=fn}});
+    let rejectionBridge=null;
+    const rejections=()=>rejectionBridge??=promiseRejectionBridge(event=>dispatchNativeWorkerEvent(target,event),host.promiseIsHandled,fn=>timer(fn,0,[],false));
+    /* The console report is the default action of unhandledrejection. */
+    function describeRejection(reason){
+        let text;try{text=String(reason);}catch(_){text='JavaScript exception';}
+        try{const stack=reason instanceof Error?reason.stack:undefined;if(typeof stack==='string'&&stack)text+='\n'+stack;}catch(_){}
+        return text;
+    }
     return {
+        promiseRejection(promise,reason){if(!closed&&rejections().unhandled(promise,reason)&&!closed)host.send(7,0,{message:'Uncaught (in promise) '+describeRejection(reason),filename:address});},
+        promiseRejectionHandled(promise,reason){if(!closed)rejections().handled(promise,reason);},
         safetyCheck:htmlSafetyBridge.check,
         safetyDynamicCode:htmlSafetyBridge.dynamicCode,
         safetyViolation(init){if(!closed)dispatchNativeWorkerEvent(target,htmlSafetyBridge.violationEvent(init));},
-        start(r){address=r[1];workerName=String(r[5]||"");workerCanCancel=r[6]===true;shared=r[9]===true;if(shared)delete globalThis.postMessage;if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker source failed','NetworkError');const locationURL=new URL(address);Object.defineProperty(globalThis,'location',{value:Object.freeze({href:address,origin:locationURL.origin,protocol:locationURL.protocol,host:locationURL.host,hostname:locationURL.hostname,port:locationURL.port,pathname:locationURL.pathname,search:locationURL.search,hash:locationURL.hash,toString(){return address;}}),configurable:true});if(!formDataBridge)formDataBridge=initializeWorkerFormData();evalSource(new TextDecoder().decode(r[3]),address);},
+        start(r){address=r[1];workerName=String(r[5]||"");workerCanCancel=r[6]===true;shared=r[9]===true;installScope(shared);if(shared)delete globalThis.postMessage;if(r[4]||r[0]<200||r[0]>=300)throw new DOMException(r[4]||'Worker source failed','NetworkError');const locationURL=new URL(address);Object.defineProperty(globalThis,'location',{value:Object.freeze({href:address,origin:locationURL.origin,protocol:locationURL.protocol,host:locationURL.host,hostname:locationURL.hostname,port:locationURL.port,pathname:locationURL.pathname,search:locationURL.search,hash:locationURL.hash,toString(){return address;}}),configurable:true});if(!formDataBridge)formDataBridge=initializeWorkerFormData();evalSource(new TextDecoder().decode(r[3]),address);},
         receive(packet,op=2,id=0,kind=0){try{if(op===8||op===9||op===10){workerMessagingBridge.receivePort(id,kind,packet,op!==8);return;}const payload=kind===3?workerMessagingBridge.importExternal(packet):{data:cloneData.deserialize(packet),ports:[]};if(!closed){if(op===13){if(!shared||payload.ports.length!==1)throw new TypeError('Invalid shared worker connection');dispatchNativeWorkerEvent(target,new MessageEvent('connect',{data:'',source:payload.ports[0],ports:payload.ports}));}else dispatchNativeWorkerEvent(target,new MessageEvent('message',{data:payload.data,ports:payload.ports}));}}catch(e){if(!closed)dispatchNativeWorkerEvent(target,new MessageEvent('messageerror'));}},
         loaded(id,r,flags=0){const p=workerFetchBridge.take(id);if(!p||closed)return;p.cleanup();if(r[4]||(!(flags&4)&&!r[0])||((flags&4)&&!p.noCors)){p.reject(new TypeError(r[4]||'Worker fetch failed'));return;}try{p.resolve(workerFetchBridge.networkResponse(r,flags,p.signal,p.method));}catch(error){p.reject(error);}},
         tick(now){if(closed)return false;const ports=workerMessagingBridge.ready();if(ports&&!lastPortTask){lastPortTask=true;return workerMessagingBridge.runOne();}const t=timerHeap[0];if(t&&t.due<=now){lastPortTask=false;if(t.repeat){t.due=now+t.delay;timerFix(0);}else clearTimer(t.id);try{t.fn(...t.args);}catch(e){report(e);}return true;}lastPortTask=ports;return ports?workerMessagingBridge.runOne():false;},

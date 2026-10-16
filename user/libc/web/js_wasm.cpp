@@ -12,13 +12,19 @@
 #include "wabt/apply-names.h"
 #include "wabt/stream.h"
 #include "wasm-rt-host.h"
+extern "C" {
+#include "js_atomics.h"
+uint64_t uptime_ms(void);
+}
 #include "libtcc.h"
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -87,6 +93,30 @@ struct State : std::enable_shared_from_this<State> {
       return interrupted();
     });
     store.set_execution_owner_callback([this]() -> void* { return task; });
+    // Threads: shared memories live in shared pages that a dedicated Worker
+    // (another process) maps; waits block in the kernel's address waiters.
+    wabt::Features features = store.features();
+    features.enable_threads();
+    store.setFeatures(features);
+    wi::Store::SharedMemoryHost host;
+    host.opaque = this;
+    host.reserve = [](void *, wi::u64 max_bytes, std::atomic<wi::u64> **length) -> wi::u8 * {
+      uint64_t *word = nullptr;
+      uint8_t *data = web_atomics_memory_reserve(max_bytes, &word);
+      if (data) *length = reinterpret_cast<std::atomic<wi::u64> *>(word);
+      return data;
+    };
+    host.release = [](void *, wi::u8 *data) { web_atomics_memory_release(data); };
+    host.wait = [](void *opaque, void *address, wi::u64 expected, bool wide,
+                   wi::s64 timeout_ns) -> int {
+      // A Window agent's [[CanBlock]] is false: memory.atomic.wait traps.
+      if (!JS_GetCanBlock(static_cast<State *>(opaque)->rt)) return -1;
+      return web_atomics_memory_wait(address, expected, wide, timeout_ns);
+    };
+    host.notify = [](void *, void *address, wi::u32 count) -> wi::u32 {
+      return web_atomics_memory_notify(address, count);
+    };
+    store.set_shared_memory_host(host);
   }
   ~State() {
     states.erase(identity);
@@ -134,6 +164,28 @@ Binding::~Binding() {
   }
   JS_FreeValueRT(state->rt, value);
 }
+// A compiled module's immutable storage in native shared pages, so a Module
+// cloned to a dedicated Worker (another process) maps the same compiled code
+// instead of compiling its bytes again:
+//   [ImageHeader][binary][interpreter code][data segments][descriptor record]
+// A module with a shared memory is made to run in several agents at once, so
+// its own descriptor moves into an image when it is compiled; any other module
+// gets an image the first time it is cloned.
+struct ImageHeader {
+  uint64_t magic, binary_size, code_offset, code_size, data_offset, data_size,
+           record_offset, record_size;
+};
+constexpr uint64_t kImageMagic = 0x32474d494d534157ull; // "WASMIMG2"
+struct ModuleImage {
+  const uint8_t *base = nullptr;
+  size_t size = 0;
+  ImageHeader header{};
+  ModuleImage() = default;
+  ModuleImage(const ModuleImage &) = delete;
+  ModuleImage &operator=(const ModuleImage &) = delete;
+  ~ModuleImage() { if (base) web_atomics_memory_release(const_cast<uint8_t *>(base)); }
+  wabt::ByteSpan binary() const { return {base + sizeof(ImageHeader), size_t(header.binary_size)}; }
+};
 struct Handle {
   std::shared_ptr<State> lifetime;
   State *state;
@@ -143,7 +195,18 @@ struct Handle {
   JSValue exports = JS_UNDEFINED;
   Binding *binding = nullptr; // native object owns it, this anchor marks its JS edge
   std::vector<JSValue> references;
+  // A Table keeps one counted edge per distinct owner of its elements: the
+  // instance of a defined function, otherwise the element itself. Function
+  // wrappers are made only when JavaScript reads an element.
+  struct TableAnchors {
+    std::vector<size_t> entries;                           // owner per element, 0 = none
+    std::map<size_t, std::pair<JSValue, size_t>> owners;   // owner -> edge, element count
+  };
+  std::unique_ptr<TableAnchors> table_anchors;
+  // A Module's bytes, held by its image once it has one.
   std::vector<uint8_t> binary;
+  std::shared_ptr<const ModuleImage> image;
+  wabt::ByteSpan module_bytes() const { return image ? image->binary() : wabt::ByteSpan(binary); }
   bool registered = false;
   void *function_identity = nullptr;
   Handle(State *s, wi::Ref ref) : lifetime(s->shared_from_this()), state(s), object(s->store, ref),
@@ -154,6 +217,8 @@ struct Handle {
     JS_FreeValueRT(state->rt, buffer);
     JS_FreeValueRT(state->rt, exports);
     for (JSValue ref : references) JS_FreeValueRT(state->rt, ref);
+    if (table_anchors)
+      for (auto &owner : table_anchors->owners) JS_FreeValueRT(state->rt, owner.second.first);
     // The anchor's physical JS edge must be released during its finalizer,
     // not after QuickJS has reclaimed a white cycle. Native reclamation alone
     // can safely wait for a task boundary.
@@ -228,6 +293,8 @@ static void mark(JSRuntime *rt, JSValueConst value, JS_MarkFunc *fn) {
     JS_MarkValue(rt, h->exports, fn);
     if (h->binding) JS_MarkValue(rt, h->binding->value, fn);
     for (JSValue ref : h->references) JS_MarkValue(rt, ref, fn);
+    if (h->table_anchors)
+      for (auto &owner : h->table_anchors->owners) JS_MarkValue(rt, owner.second.first, fn);
   }
 }
 static JSValue wasm_error(JSContext *ctx, State *s, ErrorKind kind,
@@ -477,8 +544,11 @@ static bool compile(JSContext *ctx, State *s, const std::vector<uint8_t> &data,
   options.features = s->store.features();
   options.fail_on_custom_section_error = false;
   options.interrupt_callback = [s]() { return s->interrupted(); };
-  if (wabt::Succeeded(wi::ReadBinaryInterp("WebAssembly", data.data(), data.size(),
-                                         options, &errors, desc))) return true;
+  uint64_t started = uptime_ms();
+  bool ok = wabt::Succeeded(wi::ReadBinaryInterp("WebAssembly", data.data(), data.size(),
+                                                 options, &errors, desc));
+  s->stats.compile_ms += uptime_ms() - started;
+  if (ok) return true;
   if (!quiet) wasm_error(ctx, s, CompileError,
       errors.empty() ? "Invalid WebAssembly binary" : errors.front().message.c_str());
   return false;
@@ -504,9 +574,26 @@ struct NativeCompile {
     if (self->error.empty()) self->error = message;
   }
 };
+static bool uses_shared_memory(const wi::ModuleDesc& desc) {
+  for (const auto& memory : desc.memories)
+    if (memory.type.limits.is_shared) return true;
+  for (const auto& import : desc.imports)
+    if (auto* memory = wabt::dyn_cast<wi::MemoryType>(import.type.type.get()))
+      if (memory->limits.is_shared) return true;
+  return false;
+}
 static std::shared_ptr<NativeModule> compile_native(JSContext *ctx, State *s,
-                                                    const std::vector<uint8_t>& bytes) {
+                                                    wabt::ByteSpan bytes,
+                                                    const wi::ModuleDesc& desc) {
   NativeCompile work{s, false, {}};
+  // A shared memory, defined or imported, always takes the interpreter (see
+  // below); decide from the compiled descriptor before building wasm2c IR,
+  // which costs many times the module size for a large module.
+  if (uses_shared_memory(desc)) {
+    ++s->stats.native_fallbacks;
+    s->native_fallback = "wasm2c native threads runtime is not connected to shared Store memory";
+    return {};
+  }
   wabt::Module ir;
   wabt::Errors errors;
   wabt::ReadBinaryOptions reader;
@@ -519,6 +606,15 @@ static std::shared_ptr<NativeModule> compile_native(JSContext *ctx, State *s,
   // exception-payload ABI. Never compile it as if it shared the Store's tags.
   if (ok && ir.features_used.exceptions) {
     ok = false; work.error = "wasm2c native exception payload/tag runtime ABI is not supported";
+  }
+  // Generated code would address a shared memory through wasm2c's own
+  // shared-memory runtime, not the Store's shared region; the interpreter
+  // runs threads modules over the region with real atomics and waits.
+  if (ok && ir.features_used.threads) {
+    ok = false; work.error = "wasm2c native threads runtime is not connected to shared Store memory";
+  }
+  for (size_t i = 0; ok && i < ir.memories.size(); ++i) if (ir.memories[i]->page_limits.is_shared) {
+    ok = false; work.error = "wasm2c native threads runtime is not connected to shared Store memory";
   }
   if (ok) ok = wabt::Succeeded(wabt::GenerateNames(&ir)) && wabt::Succeeded(wabt::ApplyNames(&ir));
   wabt::MemoryStream source;
@@ -1089,6 +1185,8 @@ static bool supported_options(JSContext *ctx, State *s, const wi::ModuleDesc &de
   }
   return true;
 }
+static JSValue compiled_module(JSContext *, State *, std::vector<uint8_t>,
+                               const struct CompileOptions &, JSValueConst);
 static JSValue module_ctor(JSContext *ctx, JSValueConst new_target, int argc,
                             JSValueConst *argv, int, JSValue *data) {
   State *s = get_state(data[0]); Active active(s, ctx);
@@ -1109,13 +1207,307 @@ static JSValue module_ctor(JSContext *ctx, JSValueConst new_target, int argc,
     if (!allowed) return wasm_error(ctx, s, CompileError,
                                     "WebAssembly compilation is blocked by Content Security Policy");
   }
-  wi::ModuleDesc desc;
-  if (!compile(ctx, s, binary, &desc, false)) return JS_EXCEPTION;
-  if (!supported_options(ctx, s, desc, options, false)) return JS_EXCEPTION;
-  auto native = compile_native(ctx, s, binary);
-  if (JS_HasException(ctx)) return JS_EXCEPTION;
-  ++s->stats.compiled_modules;
-  s->stats.compiled_bytes += binary.size();
+  return compiled_module(ctx, s, std::move(binary), options, new_target);
+}
+// The descriptor record of a module image: the ModuleDesc without its code
+// stream and data segment bytes, which the image holds beside the record.
+struct RecordWriter {
+  std::vector<uint8_t> out;
+  void raw(const void *data, size_t size) {
+    auto *p = static_cast<const uint8_t *>(data);
+    out.insert(out.end(), p, p + size);
+  }
+  template <typename T> void pod(const T &value) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    raw(&value, sizeof value);
+  }
+  template <typename T> void pods(const std::vector<T> &values) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    pod(uint64_t(values.size()));
+    raw(values.data(), values.size() * sizeof(T));
+  }
+  void text(const std::string &value) { pod(uint64_t(value.size())); raw(value.data(), value.size()); }
+  void func_type(const wi::FuncType &type) { pods(type.params); pods(type.results); }
+  void extern_type(const wi::ExternType &type) {
+    pod(type.kind);
+    switch (type.kind) {
+      case wi::ExternKind::Func: func_type(*wabt::cast<wi::FuncType>(&type)); break;
+      case wi::ExternKind::Table: {
+        auto *t = wabt::cast<wi::TableType>(&type); pod(t->element); pod(t->limits); break;
+      }
+      case wi::ExternKind::Memory: {
+        auto *t = wabt::cast<wi::MemoryType>(&type); pod(t->limits); pod(t->page_size); break;
+      }
+      case wi::ExternKind::Global: {
+        auto *t = wabt::cast<wi::GlobalType>(&type); pod(t->type); pod(t->mut); break;
+      }
+      case wi::ExternKind::Tag: {
+        auto *t = wabt::cast<wi::TagType>(&type); pod(t->attr); pods(t->signature); break;
+      }
+    }
+  }
+  const wi::ModuleDesc *desc = nullptr;
+  // A function's type is a func_types index; an initializer's is its result.
+  void func(const wi::FuncDesc &f) {
+    const wi::FuncType *types = desc->func_types.data();
+    bool defined = std::less_equal<const wi::FuncType *>()(types, f.type) &&
+                   std::less<const wi::FuncType *>()(f.type, types + desc->func_types.size());
+    pod(uint8_t(defined));
+    if (defined) pod(uint32_t(f.type - types)); else pod(f.type->results[0]);
+    pod(f.code_offset); pod(f.locals); pod(f.local_count); pod(f.handlers); pod(f.handler_count);
+  }
+  void module(const wi::ModuleDesc &d) {
+    desc = &d;
+    pod(uint64_t(d.func_types.size()));
+    for (const auto &t : d.func_types) func_type(t);
+    pods(d.locals);
+    pod(uint64_t(d.handlers.size()));
+    for (const auto &h : d.handlers) {
+      pod(h.kind); pod(h.try_start_offset); pod(h.try_end_offset); pods(h.catches);
+      pod(h.catch_all_offset); pod(h.values); pod(h.exceptions); pod(h.catch_all_ref);
+    }
+    pod(uint64_t(d.imports.size()));
+    for (const auto &i : d.imports) { text(i.type.module); text(i.type.name); extern_type(*i.type.type); }
+    pod(uint64_t(d.funcs.size()));
+    for (const auto &f : d.funcs) func(f);
+    pod(uint64_t(d.tables.size()));
+    for (const auto &t : d.tables) { extern_type(t.type); func(t.init_func); }
+    pod(uint64_t(d.memories.size()));
+    for (const auto &m : d.memories) extern_type(m.type);
+    pod(uint64_t(d.globals.size()));
+    for (const auto &g : d.globals) { extern_type(g.type); func(g.init_func); }
+    pod(uint64_t(d.tags.size()));
+    for (const auto &t : d.tags) extern_type(t.type);
+    pod(uint64_t(d.exports.size()));
+    for (const auto &e : d.exports) { text(e.type.name); extern_type(*e.type.type); pod(e.index); }
+    pod(uint64_t(d.starts.size()));
+    for (const auto &start : d.starts) pod(start.func_index);
+    pod(uint64_t(d.elems.size()));
+    for (const auto &e : d.elems) {
+      pod(uint64_t(e.elements.size()));
+      for (const auto &f : e.elements) func(f);
+      pod(e.type); pod(e.mode); pod(e.table_index); func(e.init_func);
+    }
+    pod(uint64_t(d.datas.size()));
+    for (const auto &e : d.datas) {
+      pod(uint64_t(e.size())); pod(e.mode); pod(e.memory_index); func(e.init_func);
+    }
+  }
+};
+// Reads a record written by this build of the browser (a parent or child
+// agent); every length is bounded by the record and the image.
+struct RecordReader {
+  const uint8_t *p, *end;
+  bool ok = true;
+  void raw(void *data, size_t size) {
+    if (!ok || size_t(end - p) < size) { ok = false; if (size) memset(data, 0, size); return; }
+    if (size) memcpy(data, p, size);
+    p += size;
+  }
+  template <typename T> T pod() {
+    static_assert(std::is_trivially_copyable_v<T>);
+    T value; raw(&value, sizeof value); return value;
+  }
+  // The count of a sequence whose items occupy at least `unit` record bytes.
+  size_t count(size_t unit) {
+    uint64_t n = pod<uint64_t>();
+    if (ok && n > uint64_t(end - p) / unit) ok = false;
+    return ok ? size_t(n) : 0;
+  }
+  // count() with the destination sized once: growing by doubling would leave
+  // freed buffers of every smaller size in this process's heap.
+  template <typename V> size_t reserve(V &values, size_t unit) {
+    size_t n = count(unit);
+    values.reserve(values.size() + n);
+    return n;
+  }
+  template <typename T> std::vector<T> pods() {
+    std::vector<T> values(count(sizeof(T)));
+    raw(values.data(), values.size() * sizeof(T));
+    return values;
+  }
+  std::string text() {
+    std::string value(count(1), '\0');
+    raw(value.data(), value.size());
+    return value;
+  }
+  wi::FuncType func_type() {
+    auto params = pods<wi::ValueType>();
+    return wi::FuncType(std::move(params), pods<wi::ValueType>());
+  }
+  std::unique_ptr<wi::ExternType> extern_type() {
+    switch (pod<wi::ExternKind>()) {
+      case wi::ExternKind::Func: return std::make_unique<wi::FuncType>(func_type());
+      case wi::ExternKind::Table: {
+        auto element = pod<wi::ValueType>();
+        return std::make_unique<wi::TableType>(element, pod<wabt::Limits>());
+      }
+      case wi::ExternKind::Memory: {
+        auto limits = pod<wabt::Limits>();
+        return std::make_unique<wi::MemoryType>(limits, pod<uint32_t>());
+      }
+      case wi::ExternKind::Global: {
+        auto type = pod<wi::ValueType>();
+        return std::make_unique<wi::GlobalType>(type, pod<wi::Mutability>());
+      }
+      case wi::ExternKind::Tag: {
+        auto attr = pod<wi::TagAttr>();
+        return std::make_unique<wi::TagType>(attr, pods<wi::ValueType>());
+      }
+    }
+    ok = false;
+    return nullptr;
+  }
+  // An extern type in a slot of one kind, such as a table's type.
+  template <typename T> std::unique_ptr<wi::ExternType> slot() {
+    auto type = extern_type();
+    if (ok && type->kind != T::skind) ok = false;
+    return ok ? std::move(type) : nullptr;
+  }
+  wi::ModuleDesc *desc = nullptr;
+  // At least the type reference and the offset and ranges below.
+  static constexpr size_t kFuncRecord = 1 + sizeof(uint32_t) + 5 * sizeof(uint32_t);
+  // [first, first + count) of a pool of `size` entries.
+  static bool range(uint32_t first, uint32_t count, size_t size) {
+    return first <= size && count <= size - first;
+  }
+  wi::FuncDesc func() {
+    const wi::FuncType *type = nullptr;
+    if (pod<uint8_t>()) {
+      auto index = pod<uint32_t>();
+      if (ok && index < desc->func_types.size()) type = &desc->func_types[index]; else ok = false;
+    } else {
+      auto result = pod<wi::ValueType>();
+      if (ok) type = desc->InitType(result);
+    }
+    wi::FuncDesc f{type};
+    f.code_offset = pod<uint32_t>();
+    f.locals = pod<uint32_t>(); f.local_count = pod<uint32_t>();
+    f.handlers = pod<uint32_t>(); f.handler_count = pod<uint32_t>();
+    if (ok && (!range(f.locals, f.local_count, desc->locals.size()) ||
+               !range(f.handlers, f.handler_count, desc->handlers.size()))) ok = false;
+    return f;
+  }
+  // Data segments view the image's data bytes [data, data + data_size).
+  void module(wi::ModuleDesc *d, const uint8_t *data, size_t data_size) {
+    desc = d;
+    for (size_t i = 0, n = reserve(d->func_types, 16); ok && i < n; ++i) d->func_types.push_back(func_type());
+    d->locals = pods<wi::LocalDesc>();
+    d->handlers.resize(count(4 * sizeof(uint32_t)));
+    for (auto &h : d->handlers) {
+      h.kind = pod<wi::HandlerKind>();
+      h.try_start_offset = pod<uint32_t>(); h.try_end_offset = pod<uint32_t>();
+      h.catches = pods<wi::CatchDesc>();
+      h.catch_all_offset = pod<uint32_t>();
+      h.values = pod<uint32_t>(); h.exceptions = pod<uint32_t>();
+      h.catch_all_ref = pod<bool>();
+    }
+    for (size_t i = 0, n = reserve(d->imports, 17); ok && i < n; ++i) {
+      auto module = text(); auto name = text(); auto type = extern_type();
+      if (ok) d->imports.push_back(wi::ImportDesc{wi::ImportType(std::move(module), std::move(name), std::move(type))});
+    }
+    for (size_t i = 0, n = reserve(d->funcs, kFuncRecord); ok && i < n; ++i) d->funcs.push_back(func());
+    for (size_t i = 0, n = count(1); ok && i < n; ++i) {
+      auto type = slot<wi::TableType>(); auto init = func();
+      if (ok) d->tables.push_back(wi::TableDesc{*wabt::cast<wi::TableType>(type.get()), std::move(init)});
+    }
+    for (size_t i = 0, n = count(1); ok && i < n; ++i) {
+      auto type = slot<wi::MemoryType>();
+      if (ok) d->memories.push_back(wi::MemoryDesc{*wabt::cast<wi::MemoryType>(type.get())});
+    }
+    for (size_t i = 0, n = count(1); ok && i < n; ++i) {
+      auto type = slot<wi::GlobalType>(); auto init = func();
+      if (ok) d->globals.push_back(wi::GlobalDesc{*wabt::cast<wi::GlobalType>(type.get()), std::move(init)});
+    }
+    for (size_t i = 0, n = count(1); ok && i < n; ++i) {
+      auto type = slot<wi::TagType>();
+      if (ok) d->tags.push_back(wi::TagDesc{*wabt::cast<wi::TagType>(type.get())});
+    }
+    for (size_t i = 0, n = reserve(d->exports, 1); ok && i < n; ++i) {
+      auto name = text(); auto type = extern_type(); auto index = pod<wi::Index>();
+      if (ok) d->exports.push_back(wi::ExportDesc{wi::ExportType(std::move(name), std::move(type)), index});
+    }
+    for (size_t i = 0, n = count(sizeof(wi::Index)); ok && i < n; ++i)
+      d->starts.push_back(wi::StartDesc{pod<wi::Index>()});
+    for (size_t i = 0, n = count(1); ok && i < n; ++i) {
+      std::vector<wi::FuncDesc> elements;
+      for (size_t j = 0, m = reserve(elements, kFuncRecord); ok && j < m; ++j) elements.push_back(func());
+      auto type = pod<wi::ValueType>(); auto mode = pod<wi::SegmentMode>();
+      auto table = pod<wi::Index>(); auto init = func();
+      if (ok) d->elems.push_back(wi::ElemDesc{std::move(elements), type, mode, table, std::move(init)});
+    }
+    size_t used = 0;
+    for (size_t i = 0, n = count(1); ok && i < n; ++i) {
+      auto size = pod<uint64_t>(); auto mode = pod<wi::SegmentMode>();
+      auto memory = pod<wi::Index>(); auto init = func();
+      if (ok && size > data_size - used) ok = false;
+      if (!ok) break;
+      d->datas.push_back(wi::DataDesc{{}, mode, memory, std::move(init), data + used, size_t(size)});
+      used += size;
+    }
+    if (ok && (used != data_size || p != end)) ok = false;
+  }
+};
+static std::shared_ptr<const ModuleImage> make_image(const wi::ModuleDesc &desc, wabt::ByteSpan binary) {
+  RecordWriter record;
+  record.module(desc);
+  ImageHeader h{};
+  h.magic = kImageMagic;
+  h.binary_size = binary.size();
+  h.code_offset = sizeof h + h.binary_size;
+  h.code_size = desc.istream.end();
+  h.data_offset = h.code_offset + h.code_size;
+  for (const auto &segment : desc.datas) h.data_size += segment.size();
+  h.record_offset = h.data_offset + h.data_size;
+  h.record_size = record.out.size();
+  size_t size = h.record_offset + h.record_size;
+  uint8_t *base = web_atomics_image_reserve(size);
+  if (!base) return nullptr;
+  auto image = std::make_shared<ModuleImage>();
+  image->base = base; image->size = size; image->header = h;
+  memcpy(base, &h, sizeof h);
+  if (h.binary_size) memcpy(base + sizeof h, binary.data(), h.binary_size);
+  if (h.code_size) memcpy(base + h.code_offset, desc.istream.data(), h.code_size);
+  uint8_t *data = base + h.data_offset;
+  for (const auto &segment : desc.datas) {
+    if (segment.size()) memcpy(data, segment.bytes(), segment.size());
+    data += segment.size();
+  }
+  memcpy(base + h.record_offset, record.out.data(), h.record_size);
+  return image;
+}
+// Moves a descriptor's code stream and data segment bytes to its image.
+static void adopt_image(wi::ModuleDesc *desc, std::shared_ptr<const ModuleImage> image) {
+  const ImageHeader &h = image->header;
+  desc->istream.Adopt(image->base + h.code_offset, wi::Istream::Offset(h.code_size));
+  const uint8_t *data = image->base + h.data_offset;
+  for (auto &segment : desc->datas) {
+    size_t size = segment.size();
+    wi::Buffer().swap(segment.data);
+    segment.view = data; segment.view_size = size;
+    data += size;
+  }
+  desc->storage = std::move(image);
+}
+static std::shared_ptr<const ModuleImage> import_image(JSContext *ctx, JSValueConst record) {
+  size_t length = 0;
+  const uint8_t *base = web_atomics_image_import(ctx, record, &length);
+  if (!base) return nullptr;
+  auto image = std::make_shared<ModuleImage>();
+  image->base = base; image->size = length;
+  ImageHeader &h = image->header;
+  if (length >= sizeof h) memcpy(&h, base, sizeof h);
+  bool ok = length >= sizeof h && h.magic == kImageMagic &&
+            h.binary_size <= length - sizeof h && h.code_offset == sizeof h + h.binary_size &&
+            h.code_size <= length - h.code_offset && h.code_size <= UINT32_MAX &&
+            h.data_offset == h.code_offset + h.code_size && h.data_size <= length - h.data_offset &&
+            h.record_offset == h.data_offset + h.data_size && h.record_size <= length - h.record_offset;
+  if (!ok) { JS_ThrowTypeError(ctx, "Invalid WebAssembly module image"); return nullptr; }
+  return image;
+}
+static JSValue module_value(JSContext *ctx, State *s, wi::ModuleDesc desc,
+                            std::shared_ptr<NativeModule> native, std::vector<uint8_t> binary,
+                            std::shared_ptr<const ModuleImage> image, JSValueConst new_target) {
   auto mod = wi::Module::New(s->store, std::move(desc));
   if (native) {
     auto owner = new std::shared_ptr<NativeModule>(std::move(native));
@@ -1123,8 +1515,55 @@ static JSValue module_ctor(JSContext *ctx, JSValueConst new_target, int argc,
     mod->set_finalizer([owner](wi::Object *) { delete owner; });
   }
   JSValue value = wrapper(ctx, s, mod.ref(), ModuleKind, new_target);
-  if (!JS_IsException(value)) handle(ctx, value, ModuleKind)->binary = std::move(binary);
+  if (!JS_IsException(value)) {
+    Handle *h = handle(ctx, value, ModuleKind);
+    h->binary = std::move(binary);
+    h->image = std::move(image);
+  }
   return value;
+}
+// A Module over an image's compiled code: no binary is read again. A module
+// without a shared memory is compiled natively here when no native code of
+// the same agent is given.
+static JSValue module_from_image(JSContext *ctx, State *s, std::shared_ptr<const ModuleImage> image,
+                                 std::shared_ptr<NativeModule> native, bool compile_natively) {
+  const ImageHeader &h = image->header;
+  uint64_t started = uptime_ms();
+  wi::ModuleDesc desc;
+  RecordReader reader{image->base + h.record_offset, image->base + h.record_offset + h.record_size};
+  reader.module(&desc, image->base + h.data_offset, h.data_size);
+  if (!reader.ok) return wasm_error(ctx, s, CompileError, "Invalid WebAssembly module image");
+  desc.istream.Adopt(image->base + h.code_offset, wi::Istream::Offset(h.code_size));
+  desc.storage = image;
+  s->stats.image_ms += uptime_ms() - started;
+  s->stats.image_bytes += image->size;
+  if (compile_natively) {
+    native = compile_native(ctx, s, image->binary(), desc);
+    if (JS_HasException(ctx)) return JS_EXCEPTION;
+  }
+  return module_value(ctx, s, std::move(desc), std::move(native), {}, std::move(image), JS_UNDEFINED);
+}
+// Compile authorized bytes.
+static JSValue compiled_module(JSContext *ctx, State *s, std::vector<uint8_t> binary,
+                               const CompileOptions &options, JSValueConst new_target) {
+  wi::ModuleDesc desc;
+  if (!compile(ctx, s, binary, &desc, false)) return JS_EXCEPTION;
+  if (!supported_options(ctx, s, desc, options, false)) return JS_EXCEPTION;
+  auto native = compile_native(ctx, s, binary, desc);
+  if (JS_HasException(ctx)) return JS_EXCEPTION;
+  ++s->stats.compiled_modules;
+  s->stats.compiled_bytes += binary.size();
+  // Without room for an image the module stays private; a clone tries again.
+  std::shared_ptr<const ModuleImage> image;
+  uint64_t started = uptime_ms();
+  if (uses_shared_memory(desc) && (image = make_image(desc, binary))) {
+    adopt_image(&desc, image);
+    std::vector<uint8_t>().swap(binary);
+    s->stats.image_ms += uptime_ms() - started;
+    s->stats.image_bytes += image->size;
+  }
+  return module_value(ctx, s, std::move(desc), std::move(native), std::move(binary),
+                      std::move(image), new_target);
 }
 static JSValue validate(JSContext *ctx, JSValueConst, int argc,
                          JSValueConst *argv, int, JSValue *data) {
@@ -1163,7 +1602,7 @@ static JSValue module_types(JSContext *ctx, JSValueConst, int argc,
   }
   return array;
 }
-static bool read_leb(const std::vector<uint8_t> &b, size_t *pos, uint32_t *value) {
+static bool read_leb(wabt::ByteSpan b, size_t *pos, uint32_t *value) {
   uint64_t n = 0;
   // u32 encoding occupies at most ceil(32 / 7) bytes in the core binary format.
   for (unsigned shift = 0; shift < 35 && *pos < b.size(); shift += 7) {
@@ -1180,7 +1619,7 @@ static JSValue custom_sections(JSContext *ctx, JSValueConst, int argc,
   const char *name = JS_ToCStringLen(ctx, &name_length, arg(argc, argv, 1));
   if (!name) return JS_EXCEPTION;
   JSValue array = JS_NewArray(ctx);
-  const auto &b = h->binary;
+  wabt::ByteSpan b = h->module_bytes();
   size_t pos = 8; // four-byte magic followed by four-byte binary version
   uint32_t index = 0;
   while (pos < b.size()) {
@@ -1412,9 +1851,14 @@ static bool limits(JSContext *ctx, JSValueConst desc, bool memory,
   if (out->has_max) ok = address_index(ctx, maximum, out->is_64, &out->max);
   JS_FreeValue(ctx, maximum);
   if (!ok) return false;
-  JSValue shared = JS_GetPropertyStr(ctx, desc, "shared");
-  out->is_shared = JS_ToBool(ctx, shared); JS_FreeValue(ctx, shared);
-  if (out->is_shared) { JS_ThrowTypeError(ctx, "Shared WebAssembly memory requires a concurrent interpreter"); return false; }
+  if (memory) {
+    JSValue shared = JS_GetPropertyStr(ctx, desc, "shared");
+    out->is_shared = JS_ToBool(ctx, shared); JS_FreeValue(ctx, shared);
+  }
+  // A shared memory's storage is reserved once, at its maximum.
+  if (memory && out->is_shared && !out->has_max) {
+    JS_ThrowTypeError(ctx, "Shared WebAssembly memory requires a maximum"); return false;
+  }
   // This is the core memory32 address-space bound, not a product quota.
   uint64_t bound = memory ? (uint64_t(1) << (out->is_64 ? 48 : 16)) : UINT32_MAX;
   if (out->initial > bound || (out->has_max && (out->max < out->initial || out->max > bound))) {
@@ -1428,8 +1872,29 @@ static bool limits(JSContext *ctx, JSValueConst desc, bool memory,
 static void free_alias(JSRuntime *, void *, void *) {}
 static JSValue memory_buffer(JSContext *ctx, JSValueConst this_val) {
   Handle *h = handle(ctx, this_val, MemoryKind); if (!h) return JS_EXCEPTION;
-  if (!JS_IsUndefined(h->buffer)) return JS_DupValue(ctx, h->buffer);
   auto mem = h->object.As<wi::Memory>();
+  if (mem->shared()) {
+    // Another agent may have grown the memory: a SharedArrayBuffer has a
+    // fixed length, so a new one covers the current size. Each holds its own
+    // reference to the shared region, independent of this wrapper.
+    size_t length = 0;
+    if (!JS_IsUndefined(h->buffer) && JS_GetArrayBuffer(ctx, &length, h->buffer) &&
+        length == mem->ByteSize()) return JS_DupValue(ctx, h->buffer);
+    JS_FreeValue(ctx, h->buffer); h->buffer = JS_UNDEFINED;
+    JSValue buffer = JS_NewArrayBuffer(ctx, mem->UnsafeData(), mem->ByteSize(), nullptr, nullptr, true);
+    if (JS_IsException(buffer)) return buffer;
+    // The JS API freezes a shared memory's buffer.
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue object = JS_GetPropertyStr(ctx, global, "Object");
+    JSValue freeze = JS_GetPropertyStr(ctx, object, "freeze");
+    JSValue frozen = JS_Call(ctx, freeze, object, 1, &buffer);
+    JS_FreeValue(ctx, freeze); JS_FreeValue(ctx, object); JS_FreeValue(ctx, global);
+    if (JS_IsException(frozen)) { JS_FreeValue(ctx, buffer); return frozen; }
+    JS_FreeValue(ctx, frozen);
+    h->buffer = buffer;
+    return JS_DupValue(ctx, buffer);
+  }
+  if (!JS_IsUndefined(h->buffer)) return JS_DupValue(ctx, h->buffer);
   h->buffer = JS_NewArrayBuffer(ctx, mem->UnsafeData(), mem->ByteSize(), free_alias, nullptr, false);
   if (JS_IsException(h->buffer)) { h->buffer = JS_UNDEFINED; return JS_EXCEPTION; }
   if (JS_SetArrayBufferTransferable(ctx, h->buffer, false) < 0) {
@@ -1443,6 +1908,9 @@ static JSValue memory_buffer(JSContext *ctx, JSValueConst this_val) {
 }
 static void observe_memory(State *s, wi::Memory::Ptr memory) {
   size_t ref = memory.ref().index;
+  // A shared memory's old SharedArrayBuffers stay valid at their length; the
+  // buffer getter replaces a stale one by length.
+  if (memory->shared()) return;
   memory->set_grow_callback([s, ref]() {
     auto i = s->wrappers.find(ref);
     if (i == s->wrappers.end()) return;
@@ -1597,11 +2065,29 @@ static void table_references(State *s, size_t ref, uint64_t start, uint64_t coun
   auto h = static_cast<Handle *>(JS_GetOpaque(i->second, classes[TableKind]));
   if (!h) return;
   auto table = h->object.As<wi::Table>();
-  h->references.resize(table->size(), JS_UNDEFINED);
+  if (!h->table_anchors) h->table_anchors.reset(new Handle::TableAnchors);
+  auto &anchors = *h->table_anchors;
+  anchors.entries.resize(table->size(), 0);
   for (uint64_t j = start; j < start + count; ++j) {
-    JSValue value = anchor(s->active, s, table->UnsafeGet(j));
-    JSValue old = h->references[j]; h->references[j] = value;
-    JS_FreeValueRT(s->rt, old);
+    wi::Ref element = table->UnsafeGet(j);
+    size_t next = element == wi::Ref::Null ? 0 :
+        s->store.Is<wi::DefinedFunc>(element) ?
+        s->store.UnsafeGet<wi::DefinedFunc>(element)->instance().index : element.index;
+    size_t old = anchors.entries[j];
+    if (next == old) continue;
+    if (next) {
+      auto owner = anchors.owners.find(next);
+      if (owner != anchors.owners.end()) ++owner->second.second;
+      else anchors.owners.emplace(next, std::make_pair(anchor(s->active, s, wi::Ref(next)), size_t(1)));
+    }
+    if (old) {
+      auto owner = anchors.owners.find(old);
+      if (!--owner->second.second) {
+        JSValue value = owner->second.first; anchors.owners.erase(owner);
+        JS_FreeValueRT(s->rt, value);
+      }
+    }
+    anchors.entries[j] = next;
   }
 }
 static void global_reference(State *s, size_t ref) {
@@ -1779,6 +2265,127 @@ extern "C" int web_js_wasm_init(JSContext *ctx, int (*poll)(JSContext *),
   states[ctx] = lifetime;
   JS_FreeValue(ctx, owner); JS_FreeValue(ctx, global);
   return JS_HasException(ctx) ? -1 : 0;
+}
+
+// Structured clone of Module and shared Memory. A Module travels as its image
+// (see ModuleImage) and a shared Memory as its region, so every agent runs the
+// same compiled code over the same storage. A deserialized Module was
+// authorized where it was first compiled, so it passes no CSP gate.
+static std::shared_ptr<State> clone_state(JSContext *ctx) {
+  auto entry = states.find(ctx);
+  auto state = entry == states.end() ? nullptr : entry->second.lock();
+  if (!state) JS_ThrowTypeError(ctx, "WebAssembly is not available in this realm");
+  return state;
+}
+static std::shared_ptr<const ModuleImage> module_image(JSContext *ctx, Handle *h) {
+  if (!h->image) {
+    auto image = make_image(h->object.As<wi::Module>()->desc(), h->binary);
+    if (!image) { JS_ThrowRangeError(ctx, "WebAssembly module could not be shared"); return nullptr; }
+    h->image = std::move(image);
+    std::vector<uint8_t>().swap(h->binary);
+  }
+  return h->image;
+}
+// A dedicated Worker (direct parent or child) maps the image.
+static JSValue clone_module_export(JSContext *ctx, JSValueConst, int, JSValueConst *argv) {
+  Handle *h = handle(ctx, argv[0], ModuleKind); if (!h) return JS_EXCEPTION;
+  auto image = module_image(ctx, h); if (!image) return JS_EXCEPTION;
+  return web_atomics_image_export(ctx, const_cast<uint8_t *>(image->base), image->size);
+}
+static JSValue clone_module_import(JSContext *ctx, JSValueConst, int, JSValueConst *argv) {
+  auto state = clone_state(ctx); if (!state) return JS_EXCEPTION;
+  State *s = state.get(); Active active(s, ctx);
+  auto image = import_image(ctx, argv[0]); if (!image) return JS_EXCEPTION;
+  return module_from_image(ctx, s, std::move(image), nullptr, true);
+}
+// The same agent: a new Module over the same image and native code.
+static JSValue clone_module_alias(JSContext *ctx, JSValueConst, int, JSValueConst *argv) {
+  Handle *h = handle(ctx, argv[0], ModuleKind); if (!h) return JS_EXCEPTION;
+  State *s = h->state; Active active(s, ctx);
+  auto image = module_image(ctx, h); if (!image) return JS_EXCEPTION;
+  auto owner = static_cast<std::shared_ptr<NativeModule> *>(h->object.As<wi::Module>()->host_info());
+  return module_from_image(ctx, s, std::move(image), owner ? *owner : nullptr, false);
+}
+static JSValue clone_memory_shared(JSContext *ctx, JSValueConst, int, JSValueConst *argv) {
+  Handle *h = handle(ctx, argv[0], MemoryKind); if (!h) return JS_EXCEPTION;
+  return JS_NewBool(ctx, h->object.As<wi::Memory>()->shared());
+}
+static JSValue memory_from_region(JSContext *ctx, State *s, const wabt::Limits &limits,
+                                  uint8_t *data, uint64_t *length) {
+  auto mem = wi::Memory::NewShared(s->store, wi::MemoryType(limits, WABT_DEFAULT_PAGE_SIZE), data,
+                                   reinterpret_cast<std::atomic<wi::u64> *>(length));
+  if (!mem) {
+    web_atomics_memory_release(data);
+    return JS_ThrowRangeError(ctx, "WebAssembly memory could not be shared");
+  }
+  observe_memory(s, mem);
+  return wrapper(ctx, s, mem.ref(), MemoryKind);
+}
+// [initial pages, maximum pages, is64, region record]
+static JSValue clone_memory_export(JSContext *ctx, JSValueConst, int, JSValueConst *argv) {
+  Handle *h = handle(ctx, argv[0], MemoryKind); if (!h) return JS_EXCEPTION;
+  auto mem = h->object.As<wi::Memory>();
+  if (!mem->shared()) return JS_ThrowTypeError(ctx, "WebAssembly memory is not shared");
+  JSValue region = web_atomics_memory_export(ctx, mem->UnsafeData());
+  if (JS_IsException(region)) return region;
+  const wabt::Limits &limits = mem->type().limits;
+  JSValue record = JS_NewArray(ctx);
+  JS_SetPropertyUint32(ctx, record, 0, JS_NewFloat64(ctx, double(mem->PageSize())));
+  JS_SetPropertyUint32(ctx, record, 1, JS_NewFloat64(ctx, double(limits.max)));
+  JS_SetPropertyUint32(ctx, record, 2, JS_NewBool(ctx, limits.is_64));
+  JS_SetPropertyUint32(ctx, record, 3, region);
+  return record;
+}
+static JSValue clone_memory_import(JSContext *ctx, JSValueConst, int, JSValueConst *argv) {
+  auto state = clone_state(ctx); if (!state) return JS_EXCEPTION;
+  State *s = state.get(); Active active(s, ctx);
+  double field[2];
+  for (unsigned i = 0; i < 2; ++i) {
+    JSValue v = JS_GetPropertyUint32(ctx, argv[0], i);
+    int bad = JS_ToFloat64(ctx, &field[i], v); JS_FreeValue(ctx, v);
+    if (bad) return JS_EXCEPTION;
+  }
+  JSValue wide = JS_GetPropertyUint32(ctx, argv[0], 2);
+  JSValue region = JS_GetPropertyUint32(ctx, argv[0], 3);
+  wabt::Limits limits;
+  limits.is_shared = limits.has_max = true;
+  limits.is_64 = JS_ToBool(ctx, wide); JS_FreeValue(ctx, wide);
+  uint64_t bound = uint64_t(1) << (limits.is_64 ? 48 : 16);
+  if (!(field[0] >= 0 && field[1] >= field[0] && field[1] <= double(bound))) {
+    JS_FreeValue(ctx, region);
+    return JS_ThrowTypeError(ctx, "Invalid WebAssembly memory record");
+  }
+  limits.initial = uint64_t(field[0]); limits.max = uint64_t(field[1]);
+  uint64_t *length = nullptr;
+  uint8_t *data = web_atomics_memory_import(ctx, region, &length);
+  JS_FreeValue(ctx, region);
+  if (!data) return JS_EXCEPTION;
+  return memory_from_region(ctx, s, limits, data, length);
+}
+// The same agent: a new Memory object over the same storage.
+static JSValue clone_memory_alias(JSContext *ctx, JSValueConst, int, JSValueConst *argv) {
+  Handle *h = handle(ctx, argv[0], MemoryKind); if (!h) return JS_EXCEPTION;
+  State *s = h->state; Active active(s, ctx);
+  auto mem = h->object.As<wi::Memory>();
+  if (!mem->shared()) return JS_ThrowTypeError(ctx, "WebAssembly memory is not shared");
+  wabt::Limits limits = mem->type().limits;
+  limits.initial = mem->PageSize();
+  web_atomics_memory_retain(mem->UnsafeData());
+  return memory_from_region(ctx, s, limits, mem->UnsafeData(),
+                            reinterpret_cast<uint64_t *>(mem->shared_length()));
+}
+
+extern "C" void web_js_wasm_host_init(JSContext *ctx, JSValueConst host) {
+  const struct { const char *name; JSCFunction *fn; } functions[] = {
+    {"wasmModuleExport", clone_module_export}, {"wasmModuleImport", clone_module_import},
+    {"wasmModuleAlias", clone_module_alias},
+    {"wasmMemoryShared", clone_memory_shared}, {"wasmMemoryExport", clone_memory_export},
+    {"wasmMemoryImport", clone_memory_import}, {"wasmMemoryAlias", clone_memory_alias},
+  };
+  for (const auto &f : functions)
+    JS_SetPropertyStr(ctx, host, f.name, JS_NewCFunction(ctx, f.fn, f.name, 1));
+  JS_SetPropertyStr(ctx, host, "wasmModuleClassID", JS_NewUint32(ctx, classes[ModuleKind]));
+  JS_SetPropertyStr(ctx, host, "wasmMemoryClassID", JS_NewUint32(ctx, classes[MemoryKind]));
 }
 
 extern "C" int web_js_wasm_get_stats(JSContext *ctx, web_js_wasm_stats *out) {

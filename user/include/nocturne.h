@@ -29,6 +29,7 @@ int close(int fd);
 /* 呼出し元のaudio streamだけの未mix PCMを破棄。通常closeのdrain契約は維持。 */
 int audio_flush(int fd);
 long lseek(int fd, long off, int whence);
+int ftruncate(int fd, long size); /* new bytes read as zero */
 int stat(const char *path, struct n_stat *st);
 int fstat(int fd, struct n_stat *st);
 int readdir(int fd, int idx, struct n_dirent *d);
@@ -46,6 +47,8 @@ int getppid(void);
 int kill(int pid);
 int killtree(int pid, int include_self);
 void *sbrk(long inc);
+/* malloc's heap: bytes taken from sbrk, and bytes in allocated blocks. */
+void malloc_usage(size_t *heap, size_t *used);
 int msleep(unsigned ms);
 unsigned sleep(unsigned s);
 uint64_t uptime_ms(void);
@@ -54,7 +57,21 @@ int pipe(int fds[2]);
  * another process's descriptor is permitted only between direct parent/child.
  * A mapping retains the object after close and is released by whole munmap. */
 int n_shared_create(size_t bytes);
+/* Like n_shared_create, but pages are zero-filled at first touch by any mapper. */
+int n_shared_reserve(size_t bytes);
 void *n_shared_map(int owner_pid,int fd,size_t bytes,int prot);
+/* Offer a shared-page descriptor to the direct parent/child that will read a
+ * message naming the returned ticket; receive claims it as a new descriptor.
+ * An unclaimed ticket keeps the pages alive until the sender exits. */
+long n_shared_send(int fd);
+int n_shared_receive(int owner_pid,long ticket);
+/* Asynchronous waits on a 32-bit word. Watches join the same FIFO as
+ * wait_on_address (also across processes sharing the page); a notified watch
+ * makes the queue readable as 64-bit tokens. watch fails with EAGAIN when the
+ * word differs. unwatch: 1 removed while waiting, 2 already notified, 0 unknown. */
+int n_address_watch_queue(void);
+int n_address_watch(int queue,volatile uint32_t *address,uint32_t expected,uint64_t token);
+int n_address_unwatch(int queue,uint64_t token);
 /* Native named rendezvous, not a filesystem or Unix socket namespace.
  * Listen atomically owns key until its last duplicated fd closes (EEXIST).
  * Connect/accept return nonblocking duplex read/write/poll fds; accept with
@@ -84,6 +101,8 @@ void thread_local_set(unsigned slot, void *value);
 int thread_stack_bounds(uintptr_t *low, uintptr_t *high);
 /* timeout_ms == UINT32_MAX waits indefinitely; count == 0 wakes all. */
 int wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms);
+/* The 8-byte form; wake_address on the same address wakes it. */
+int wait_on_address64(volatile uint64_t *address, uint64_t expected, unsigned timeout_ms);
 int wake_address(volatile uint32_t *address, unsigned count);
 void yield(void);
 int poweroff(void);

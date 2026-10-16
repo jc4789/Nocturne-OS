@@ -47,6 +47,7 @@ void web_frames_tick(web_doc *document, uint64_t now);
 int64_t web_frames_deadline(web_doc *document);
 bool web_frames_busy(web_doc *document);
 void web_frames_loaded(web_doc *document, uint64_t id, const struct web_response *response);
+void web_frames_socket_event(web_doc *document, uint64_t id, const struct web_socket_event *event);
 bool web_frame_same_origin(web_doc *first, web_doc *second);
 bool web_sandbox_document_allowed(struct web_frame *frame,const char *url,bool inherited);
 bool web_sandbox_navigation_allowed(web_doc *source,web_doc *destination,bool trusted);

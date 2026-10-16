@@ -28,6 +28,8 @@
 #include "elements.h"
 #include "js_crypto.h"
 #include "js_encoding.h"
+#include "js_atomics.h"
+#include "js_opfs.h"
 #include "js_collator_native.h"
 #include "js_worker.h"
 #include "js_wasm.h"
@@ -143,6 +145,23 @@ struct js_idb_pending {
     unsigned operation;
     JSValue resolve, reject;
 };
+/* Native WebSocket owned by this realm. Events are copied out of the host
+   callback and delivered later as ordinary tasks, in arrival order. */
+struct js_socket_event {
+    struct js_socket_event *next;
+    enum web_socket_event_type type;
+    unsigned code;
+    size_t length;
+    char *protocol;
+    unsigned char data[];
+};
+struct js_socket {
+    struct js_socket *next;
+    uint64_t id;
+    JSValue callback;
+    struct js_socket_event *events, *last_event;
+    bool finished; /* CLOSED/FAILED queued: the transport is gone */
+};
 struct js_inserted_roots {
     node_t *local[8], **nodes;
     size_t count, capacity;
@@ -155,6 +174,7 @@ struct web_js_state {
     JSRuntime *rt;
     JSContext *ctx;
     web_js_wasm_stats wasm_reported;
+    uint64_t wasm_reported_ms;
     struct web_js_state *runtime_owner, *runtime_active, *runtime_previous;
     struct web_js_state *runtime_realms, *runtime_next;
     struct js_frame_proxy *frame_proxies; /* only the runtime owner holds these */
@@ -170,6 +190,8 @@ struct web_js_state {
     struct js_pending *pending;
     web_workers *workers;
     bool worker_turn;
+    struct js_socket *sockets;
+    bool socket_turn;
     struct js_module *modules;
     struct js_preload *preloads[256];
     bool preload_scan_valid;
@@ -377,12 +399,18 @@ static void wasm_profile_report(struct web_js_state *s) {
     web_js_wasm_stats current;
     if(web_js_wasm_get_stats(s->ctx,&current)<0)return;
     web_js_wasm_stats *old=&s->wasm_reported;
-    if(current.compiled_modules==old->compiled_modules && current.instances==old->instances &&
-       current.calls==old->calls && current.traps==old->traps &&
-       current.native_modules==old->native_modules && current.native_calls==old->native_calls &&
-       current.native_fallbacks==old->native_fallbacks &&
-       current.jspi_suspensions==old->jspi_suspensions && current.jspi_resumptions==old->jspi_resumptions &&
-       current.jspi_pending==old->jspi_pending)return;
+    bool structural=current.compiled_modules!=old->compiled_modules || current.instances!=old->instances ||
+       current.traps!=old->traps || current.native_modules!=old->native_modules ||
+       current.native_fallbacks!=old->native_fallbacks ||
+       current.compile_ms!=old->compile_ms || current.image_bytes!=old->image_bytes;
+    bool counted=current.calls!=old->calls || current.native_calls!=old->native_calls ||
+       current.jspi_suspensions!=old->jspi_suspensions || current.jspi_resumptions!=old->jspi_resumptions ||
+       current.jspi_pending!=old->jspi_pending;
+    /* Call counters move on nearly every task of a wasm application: report
+       them with the periodic profile rather than once per task. */
+    uint64_t now=uptime_ms();
+    if(!structural && (!counted || now-s->wasm_reported_ms<2000))return;
+    s->wasm_reported_ms=now;
     bool fallback_changed=current.native_fallbacks!=old->native_fallbacks;
     *old=current;
     char message[320];
@@ -399,6 +427,9 @@ static void wasm_profile_report(struct web_js_state *s) {
         const char *reason=web_js_wasm_native_fallback(s->ctx);
         if(reason && *reason)log_text(s,1,reason);
     }
+    snprintf(message,sizeof message,"WebAssembly time: descriptor compile %lu ms, shared images %lu ms/%lu bytes",
+        (unsigned long)current.compile_ms,(unsigned long)current.image_ms,(unsigned long)current.image_bytes);
+    log_text(s,0,message);
     snprintf(message,sizeof message,"WebAssembly JSPI: suspensions %lu, resumptions %lu, pending %lu",
         (unsigned long)current.jspi_suspensions,(unsigned long)current.jspi_resumptions,
         (unsigned long)current.jspi_pending);
@@ -3861,6 +3892,8 @@ static JSValue native_screen(JSContext *ctx, JSValueConst this_val, int argc, JS
     return result;
 }
 static JSValue native_url(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) { return JS_NewString(ctx, state(ctx)->doc->url); }
+/* The OPFS storage key: the realm document's effective URL. */
+static const char *opfs_storage_url(JSContext *ctx) { struct web_js_state *s = state(ctx); return s && s->doc ? web_effective_url(s->doc) : NULL; }
 static JSValue native_origin(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     char *out = NULL;
     enum http_url_result status = make_origin(web_effective_url(state(ctx)->doc), &out);
@@ -4598,7 +4631,7 @@ static JSValue native_indexed_db(JSContext *ctx,JSValueConst this_val,int argc,J
     if(!pending){JS_FreeValue(ctx,result);result=JS_EXCEPTION;JS_FreeValue(ctx,callbacks[0]);JS_FreeValue(ctx,callbacks[1]);goto done;}
     if(!s->indexed_db&&!s->indexed_db_failed)s->indexed_db=webidb_async_create();
     uint32_t sequence=0;
-    if(s->indexed_db && (origin||request.operation!=WEB_IDB_BEGIN&&request.operation!=WEB_IDB_DATABASES))
+    if(s->indexed_db && (origin||(request.operation!=WEB_IDB_BEGIN&&request.operation!=WEB_IDB_DATABASES)))
         sequence=webidb_async_submit(s->indexed_db,&request);
     if(webidb_async_failed(s->indexed_db)){
         webidb_async_free(s->indexed_db);s->indexed_db=NULL;
@@ -5110,7 +5143,7 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
         .no_cors=p->no_cors, .no_referrer=p->no_referrer,
         .referrer=p->referrer,.referrer_policy=p->referrer_policy,
         .cache_mode=p->cache_mode, .keepalive=p->keepalive, .fetch_group=p->keepalive?s->fetch_group:0,
-        .stream_response=p->streaming};
+        .stream_response=p->streaming, .require_corp=s->doc->embedder_policy==HTML_COEP_REQUIRE_CORP};
     if(kind==WEB_RESOURCE_IMAGE && p->kind==P_IMAGE && p->image>=0 && p->image<s->doc->images.n)
         r.image_upgrade=((struct web_image *)s->doc->images.v[p->image])->image_upgrade;
     bool ok = s->host.request && s->host.request(s->host.opaque, &r);
@@ -5175,7 +5208,8 @@ static bool worker_request(void *opaque, uint32_t worker, uint32_t request,
         .credentials=1, .same_origin=kind == 0,
         .no_cors=(policy & NJW_LOAD_NO_CORS)!=0,
         .referrer=referrer,.referrer_policy=referrer_policy,
-        .no_referrer=(policy & NJW_LOAD_NO_REFERRER)!=0};
+        .no_referrer=(policy & NJW_LOAD_NO_REFERRER)!=0,
+        .require_corp=s->doc->embedder_policy==HTML_COEP_REQUIRE_CORP};
     if (!s->host.request || !s->host.request(s->host.opaque,&r))
         pending_error(p,"The browser rejected the Worker resource request");
     return true;
@@ -5234,6 +5268,7 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
         if(parsed==HTTP_URL_OOM)return oom(ctx);
         if(op==5 && parsed!=HTTP_URL_TUPLE){free(origin);return history_security_error(ctx,"SharedWorker requires a non-opaque document origin");}
         bool origin_ok=web_worker_set_origin(s->workers,origin?origin:"");free(origin);
+        web_worker_set_isolated(s->workers,s->doc->cross_origin_isolated);
         if(!origin_ok)return oom(ctx);
         char *policy=html_policy_snapshot(s->doc);
         if(!policy)return oom(ctx);
@@ -5285,6 +5320,172 @@ static JSValue native_worker(JSContext *ctx, JSValueConst this_val, int argc, JS
         }
     }
     return result;
+}
+static struct js_socket *socket_find(struct web_js_state *s, uint64_t id) {
+    for (struct js_socket *p = s ? s->sockets : NULL; p; p = p->next) if (p->id == id) return p;
+    return NULL;
+}
+static bool socket_id(JSContext *ctx, JSValueConst value, uint64_t *id) {
+    int64_t v;
+    if (JS_ToInt64(ctx, &v, value) || v <= 0) return false;
+    *id = (uint64_t)v; return true;
+}
+static void socket_free(struct web_js_state *s, struct js_socket *p) {
+    while (p->events) { struct js_socket_event *e = p->events; p->events = e->next; free(e->protocol); free(e); }
+    JS_FreeValue(s->ctx, p->callback);
+    js_free(s->ctx, p);
+}
+static void socket_drop(struct web_js_state *s, struct js_socket *p) {
+    struct js_socket **link = &s->sockets;
+    while (*link && *link != p) link = &(*link)->next;
+    if (*link) *link = p->next;
+    if (s->host.socket_release) s->host.socket_release(s->host.opaque, p->id);
+    socket_free(s, p);
+}
+/* socketOpen(url, protocols|null, callback): url is an already parsed
+   ws:/wss: URL; callback(type, code, data, protocol) runs as a task. */
+static JSValue native_socket_open(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s = state(ctx);
+    if (sandbox_borrowed(s) || (sandbox_authority(s) & SB_SCRIPTS)) return history_security_error(ctx, "Sandbox denied borrowed asynchronous authority");
+    if (argc < 3 || !JS_IsFunction(ctx, argv[2])) return JS_ThrowTypeError(ctx, "Invalid WebSocket request");
+    if (!task_context_active(s)) return JS_ThrowTypeError(ctx, "WebSocket browsing context is inactive");
+    if (!s->host.socket_open) return JS_ThrowTypeError(ctx, "WebSocket transport is unavailable");
+    size_t url_length = 0, protocols_length = 0;
+    const char *url = JS_ToCStringLen(ctx, &url_length, argv[0]);
+    const char *protocols = JS_IsNull(argv[1]) || JS_IsUndefined(argv[1]) ? NULL : JS_ToCStringLen(ctx, &protocols_length, argv[1]);
+    JSValue result = JS_EXCEPTION;
+    struct js_socket *p = NULL;
+    if (!url || (!protocols && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1]))) goto out;
+    if (memchr(url, 0, url_length) || (protocols && memchr(protocols, 0, protocols_length)) ||
+        (strncmp(url, "ws://", 5) && strncmp(url, "wss://", 6))) { result = JS_ThrowSyntaxError(ctx, "Invalid WebSocket URL"); goto out; }
+    if (!task_context_active(s)) { result = JS_ThrowTypeError(ctx, "WebSocket browsing context retired during conversion"); goto out; }
+    p = js_mallocz(ctx, sizeof *p);
+    if (!p) goto out;
+    p->id = s->host.socket_open(s->host.opaque, url, protocols, web_effective_url(s->doc));
+    if (!p->id) { js_free(ctx, p); p = NULL; result = JS_ThrowTypeError(ctx, "WebSocket connection could not be started"); goto out; }
+    p->callback = JS_DupValue(ctx, argv[2]);
+    p->next = s->sockets; s->sockets = p;
+    result = JS_NewInt64(ctx, (int64_t)p->id);
+out:
+    JS_FreeCString(ctx, url); JS_FreeCString(ctx, protocols);
+    return result;
+}
+static JSValue native_socket_send(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s = state(ctx);
+    uint64_t id;
+    if (argc < 2 || !socket_id(ctx, argv[0], &id)) return JS_ThrowTypeError(ctx, "Invalid WebSocket");
+    struct js_socket *p = socket_find(s, id);
+    if (!p || p->finished || !s->host.socket_send) return JS_FALSE;
+    bool sent;
+    if (JS_IsString(argv[1])) {
+        size_t n; const char *text = JS_ToCStringLen(ctx, &n, argv[1]);
+        if (!text) return JS_EXCEPTION;
+        sent = s->host.socket_send(s->host.opaque, id, false, text, n);
+        JS_FreeCString(ctx, text);
+    } else {
+        size_t n; uint8_t *data = JS_GetArrayBuffer(ctx, &n, argv[1]);
+        if (!data && JS_HasException(ctx)) return JS_EXCEPTION;
+        static const uint8_t empty;
+        sent = s->host.socket_send(s->host.opaque, id, true, data ? data : &empty, data ? n : 0);
+    }
+    return JS_NewBool(ctx, sent);
+}
+static JSValue native_socket_close(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s = state(ctx);
+    uint64_t id; int32_t code = 0;
+    if (argc < 3 || !socket_id(ctx, argv[0], &id) || JS_ToInt32(ctx, &code, argv[1]) || code < 0 || code > 4999)
+        return JS_ThrowTypeError(ctx, "Invalid WebSocket close");
+    struct js_socket *p = socket_find(s, id);
+    if (!p || p->finished || !s->host.socket_close) return JS_FALSE;
+    size_t n = 0; const char *reason = JS_ToCStringLen(ctx, &n, argv[2]);
+    if (!reason) return JS_EXCEPTION;
+    bool closed = n <= 123 && s->host.socket_close(s->host.opaque, id, (unsigned)code, reason, n);
+    JS_FreeCString(ctx, reason);
+    return JS_NewBool(ctx, closed);
+}
+static JSValue native_socket_buffered(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s = state(ctx);
+    uint64_t id;
+    if (argc < 1 || !socket_id(ctx, argv[0], &id)) return JS_ThrowTypeError(ctx, "Invalid WebSocket");
+    struct js_socket *p = socket_find(s, id);
+    size_t n = p && !p->finished && s->host.socket_buffered ? s->host.socket_buffered(s->host.opaque, id) : 0;
+    return JS_NewInt64(ctx, (int64_t)n);
+}
+static JSValue native_socket_release(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    struct web_js_state *s = state(ctx);
+    uint64_t id;
+    if (argc < 1 || !socket_id(ctx, argv[0], &id)) return JS_ThrowTypeError(ctx, "Invalid WebSocket");
+    struct js_socket *p = socket_find(s, id);
+    if (p) socket_drop(s, p);
+    return JS_UNDEFINED;
+}
+static bool socket_utf8_valid(const unsigned char *p, size_t n) {
+    for (size_t i = 0; i < n;) {
+        unsigned c = p[i];
+        if (c < 0x80) { i++; continue; }
+        size_t len; unsigned min, cp;
+        if ((c & 0xe0) == 0xc0) { len = 2; min = 0x80; cp = c & 0x1f; }
+        else if ((c & 0xf0) == 0xe0) { len = 3; min = 0x800; cp = c & 0x0f; }
+        else if ((c & 0xf8) == 0xf0) { len = 4; min = 0x10000; cp = c & 0x07; }
+        else return false;
+        if (n - i < len) return false;
+        for (size_t k = 1; k < len; k++) {
+            if ((p[i + k] & 0xc0) != 0x80) return false;
+            cp = cp << 6 | (p[i + k] & 0x3f);
+        }
+        if (cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return false;
+        i += len;
+    }
+    return true;
+}
+/* One queued socket event as a task. Releases the record once the transport
+   reported its end; the page keeps only its own WebSocket object. */
+static bool run_socket_event(struct web_js_state *s) {
+    struct js_socket *p = s->sockets;
+    while (p && !p->events) p = p->next;
+    if (!p) return false;
+    struct js_socket_event *e = p->events;
+    p->events = e->next; if (!p->events) p->last_event = NULL;
+    JSContext *ctx = s->ctx;
+    uint64_t id = p->id;
+    int type = e->type;
+    JSValue data = JS_UNDEFINED;
+    if (type == WEB_SOCKET_MESSAGE_TEXT && !socket_utf8_valid(e->data, e->length)) {
+        /* RFC 6455 8.1: invalid UTF-8 fails the connection (close 1007). */
+        if (s->host.socket_close) s->host.socket_close(s->host.opaque, id, 1007, "", 0);
+        type = WEB_SOCKET_FAILED;
+        data = JS_NewString(ctx, "WebSocket text message was not valid UTF-8");
+    } else if (type == WEB_SOCKET_MESSAGE_BINARY) data = JS_NewArrayBufferCopy(ctx, e->data, e->length);
+    else data = JS_NewStringLen(ctx, (const char *)e->data, e->length);
+    JSValue protocol = e->protocol ? JS_NewString(ctx, e->protocol) : JS_NewString(ctx, "");
+    unsigned code = e->code;
+    free(e->protocol); free(e);
+    bool final = type == WEB_SOCKET_CLOSED || type == WEB_SOCKET_FAILED;
+    if (final) {
+        p->finished = true;
+        while (p->events) { struct js_socket_event *rest = p->events; p->events = rest->next; free(rest->protocol); free(rest); }
+        p->last_event = NULL;
+    }
+    JSValue callback = JS_DupValue(ctx, p->callback);
+    if (final) socket_drop(s, p);
+    else if (p->next) {
+        /* Round robin: a busy socket cannot starve the realm's others. */
+        struct js_socket **link = &s->sockets;
+        while (*link != p) link = &(*link)->next;
+        *link = p->next; p->next = NULL;
+        while (*link) link = &(*link)->next;
+        *link = p;
+    }
+    begin_named_task(s, "WebSocket event", id);
+    if (JS_IsException(data) || JS_IsException(protocol)) exception(s);
+    else {
+        JSValue args[4] = { JS_NewInt32(ctx, type), JS_NewInt32(ctx, (int32_t)code), data, protocol };
+        JSValue value = JS_Call(ctx, callback, JS_UNDEFINED, 4, args);
+        if (JS_IsException(value)) exception(s); else JS_FreeValue(ctx, value);
+    }
+    JS_FreeValue(ctx, data); JS_FreeValue(ctx, protocol); JS_FreeValue(ctx, callback);
+    end_task(s);
+    return true;
 }
 static JSValue native_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     static uint64_t fetch_group_serial;
@@ -6312,6 +6513,30 @@ bool web_js_encoding_restart(web_doc *document){
     s->last_script=s->blocker=NULL;s->script_count=0;
     return true;
 }
+void web_js_socket_event(web_doc *d, uint64_t id, const struct web_socket_event *event) {
+    struct web_js_state *s = d ? d->js : NULL;
+    struct js_socket *p = event ? socket_find(s, id) : NULL;
+    if (!p || p->finished) return;
+    size_t length = event->data ? event->length : 0;
+    struct js_socket_event *e = length > SIZE_MAX - sizeof *e ? NULL : malloc(sizeof *e + length);
+    char *protocol = event->protocol && *event->protocol ? strdup(event->protocol) : NULL;
+    if (!e || (event->protocol && *event->protocol && !protocol)) {
+        free(e); free(protocol);
+        /* Never drop a message silently: the connection fails instead. */
+        if (s->host.socket_close) s->host.socket_close(s->host.opaque, id, 1009, "", 0);
+        static const char message[] = "Out of memory receiving a WebSocket message";
+        e = malloc(sizeof *e + sizeof message);
+        if (!e) return;
+        *e = (struct js_socket_event){ .type = WEB_SOCKET_FAILED, .length = sizeof message - 1 };
+        memcpy(e->data, message, sizeof message);
+    } else {
+        *e = (struct js_socket_event){ .type = event->type, .code = event->code, .length = length, .protocol = protocol };
+        if (length) memcpy(e->data, event->data, length);
+    }
+    if (e->type == WEB_SOCKET_CLOSED || e->type == WEB_SOCKET_FAILED) p->finished = true;
+    if (p->last_event) p->last_event->next = e; else p->events = e;
+    p->last_event = e;
+}
 void web_js_loaded(web_doc *d, uint64_t id, const struct web_response *response) {
     struct web_js_state *s = d ? d->js : NULL;
     if (!s || !response) return;
@@ -6831,6 +7056,15 @@ static bool run_timer(struct web_js_state *s, uint64_t now) {
     }
     return timer?run_timer_index(s,index,now):false;
 }
+/* Atomics.waitAsync settlements are tasks on the realm whose promise waits. */
+static bool run_atomics_waiters(struct web_js_state *s, uint64_t now) {
+    int64_t due = web_atomics_deadline(s->ctx, now);
+    if (due < 0 || (uint64_t)due > now) return false;
+    begin_named_task(s,"Atomics.waitAsync",0);
+    int settled = web_atomics_run(s->ctx, now);
+    end_task(s);
+    return settled > 0;
+}
 static bool run_posted_task(struct web_js_state *s) {
     struct js_posted_task *p = s->posted; if (!p) return false;
     s->posted = p->next; if (!s->posted) s->last_posted = NULL;
@@ -7297,6 +7531,8 @@ static bool idle_eligible(struct web_js_state *s, uint64_t now) {
         family->shadow_slots_pending || family->details_toggle_first || JS_IsJobPending(s->rt) ||
         web_worker_runnable(s->workers) || ready_script(s, &script)) return false;
     if (observers_dirty(s) && s->observer_due <= now) return false;
+    int64_t atomics = web_atomics_deadline(s->ctx, now);
+    if (atomics >= 0 && (uint64_t)atomics <= now) return false;
     for (struct js_pending *p = s->pending; p; p = p->next) if (p->done || p->deadline <= now) return false;
     for (unsigned i = 0; i < s->timer_capacity; i++) if (s->timers[i].id && s->timers[i].due <= now) return false;
     for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) return false;
@@ -7313,6 +7549,8 @@ static uint64_t idle_period_deadline(struct web_js_state *s, uint64_t now) {
     if (media >= 0 && (uint64_t)media < end) end = (uint64_t)media;
     int64_t worker = web_worker_deadline(s->workers,now);
     if (worker >= 0 && (uint64_t)worker < end) end = (uint64_t)worker;
+    int64_t atomics = web_atomics_deadline(s->ctx, now);
+    if (atomics >= 0 && (uint64_t)atomics < end) end = (uint64_t)atomics;
     return end;
 }
 static bool run_idle_period(struct web_js_state *s, uint64_t now) {
@@ -7415,6 +7653,7 @@ void web_js_tick(web_doc *d, uint64_t now) {
     if(!ran)ran=!s->disabled&&s->indexed_db_turn&&indexed_db_run_one(s);
     s->indexed_db_turn=!ran;
     if(!ran){ran=!s->disabled&&s->storage_event_turn&&storage_run_event(s,now);s->storage_event_turn=!ran;}
+    if(!ran){ran=!s->disabled&&s->socket_turn&&run_socket_event(s);s->socket_turn=!ran;}
     /* Messages are ordinary JS tasks, with the same watchdog/checkpoint as
        events and timers. Alternate ready workers with other sources. */
     if (!ran && !s->disabled && s->worker_turn && web_worker_runnable(s->workers)) {
@@ -7529,6 +7768,8 @@ void web_js_tick(web_doc *d, uint64_t now) {
         else if (s->posted_turn && run_posted_task(s)) { s->posted_turn = false; s->observer_turn = true; ran = true; }
         else if (run_timer(s, now)) { s->posted_turn = true; s->observer_turn = true; ran = true; }
         else if (run_posted_task(s)) { s->posted_turn = false; s->observer_turn = true; ran = true; }
+        else if (run_atomics_waiters(s, now)) { s->posted_turn = true; s->observer_turn = true; ran = true; }
+        else if (run_socket_event(s)) ran = true;
         else if (JS_IsJobPending(s->rt)||s->rejections||s->handled_rejections||s->rejection_oom) { begin_task(s); end_task(s); ran = true; }
         else if (web_worker_runnable(s->workers)) {
             begin_named_task(s,"Worker message",0); ran = web_worker_run_one(s->workers);
@@ -7554,6 +7795,8 @@ int64_t web_js_deadline(web_doc *d) {
     if (d->scroll_input_first || d->scroll_viewport_pending) return (int64_t)now;
     int64_t worker_deadline = web_worker_deadline(s->workers,now);
     if (worker_deadline >= 0) deadline = (uint64_t)worker_deadline;
+    int64_t atomics_deadline = web_atomics_deadline(s->ctx, now);
+    if (atomics_deadline >= 0 && (uint64_t)atomics_deadline < deadline) deadline = (uint64_t)atomics_deadline;
     if (!s->parsing_done && !s->document_waiting && (!s->blocker || s->blocker->executed || s->disabled)) return (int64_t)now;
     for (struct js_pending *p = s->pending; p; p = p->next) {
         if (p->done) return (int64_t)now;
@@ -7573,6 +7816,7 @@ int64_t web_js_deadline(web_doc *d) {
         if ((d->dom_family ? d->dom_family : d)->details_toggle_first) return (int64_t)now;
         if (s->media_width != d->width || s->media_height != d->height) return (int64_t)now;
         if (s->events || s->posted || s->rejections || s->handled_rejections || s->rejection_oom) return (int64_t)now;
+        for (struct js_socket *p = s->sockets; p; p = p->next) if (p->events) return (int64_t)now;
         for (struct js_image_decode *p = s->image_decodes; p; p = p->next) if (image_decode_ready(s, p)) return (int64_t)now;
         if (JS_IsJobPending(s->rt)) return (int64_t)now;
         if (observers_dirty(s) && s->rendering_due < deadline) deadline=s->rendering_due;
@@ -7714,6 +7958,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_SetModuleLoaderFunc(s->rt, normalize_module, load_module, s);
         JS_SetHostPromiseRejectionTracker(s->rt, promise_rejection, s);
         JS_SetHostJobFilter(s->rt, browser_job_allowed, NULL);
+        web_atomics_runtime_init(s->rt);
     }else s->heap_limit=s->runtime_owner->heap_limit;
     s->ctx = JS_NewContext(s->rt); if (!s->ctx) goto failed;
     JS_SetContextOpaque(s->ctx, s);
@@ -7763,7 +8008,10 @@ void web_js_start(web_doc *d, const struct web_host *host) {
         JS_CFUNC_DEF("cssProperties", 1, native_css_properties),
         JS_CFUNC_DEF("storage", 5, native_storage),
         JS_CFUNC_DEF("indexedDB", 5, native_indexed_db),
-        JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_cancel),
+        JS_CFUNC_DEF("fetch", 4, native_fetch), JS_CFUNC_DEF("socketOpen", 3, native_socket_open),
+        JS_CFUNC_DEF("socketSend", 2, native_socket_send), JS_CFUNC_DEF("socketClose", 3, native_socket_close),
+        JS_CFUNC_DEF("socketBuffered", 1, native_socket_buffered), JS_CFUNC_DEF("socketRelease", 1, native_socket_release),
+JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_cancel),
         JS_CFUNC_DEF("resumeFetch", 1, native_resume_fetch),
         JS_CFUNC_DEF("promiseThen", 3, native_promise_then),
         JS_CFUNC_DEF("promiseIsHandled", 1, native_promise_is_handled)
@@ -7779,6 +8027,9 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     web_js_navigator_init(s->ctx,api);
     web_js_crypto_init(s->ctx, api);
     web_js_encoding_init(s->ctx, api);
+    web_atomics_host_init(s->ctx, api);
+    web_opfs_host_init(s->ctx, api, opfs_storage_url);
+    web_js_wasm_host_init(s->ctx, api);
     web_js_collator_init(s->ctx, api);
     JS_SetPropertyStr(s->ctx, api, "debugCanvasProbe", JS_NewBool(s->ctx,s->host.debug_js));
     JS_SetPropertyStr(s->ctx, api, "document", wrap(s, d->root));
@@ -7792,6 +8043,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     s->hooks = load_browser_bindings(s->ctx);
     if (JS_IsException(s->hooks)) { exception(s); s->hooks = JS_UNDEFINED; end_task(s); goto failed; }
     JS_SetDynamicCodeCheck(s->ctx,trusted_code_check,s);
+    if (web_atomics_isolation(s->ctx, d->cross_origin_isolated) < 0) { exception(s); end_task(s); goto failed; }
     s->dispatch = JS_GetPropertyStr(s->ctx, s->hooks, "dispatch"); s->response = JS_GetPropertyStr(s->ctx, s->hooks, "response");
     s->reject = JS_GetPropertyStr(s->ctx, s->hooks, "reject");
     JSValue protos = JS_GetPropertyStr(s->ctx, s->hooks, "nodeProtos");
@@ -7842,6 +8094,7 @@ void web_js_free(web_doc *d) {
         broadcast_free(s);
         while(s->frame_proxies){struct js_frame_proxy *p=s->frame_proxies;s->frame_proxies=p->next;JS_FreeValue(s->ctx,p->proxy);js_free(s->ctx,p);}
         web_worker_free(s->workers); s->workers = NULL;
+        while (s->sockets) socket_drop(s, s->sockets);
         release_document_tasks(s);
         while (s->image_decodes) {
             struct js_image_decode *p = s->image_decodes; s->image_decodes = p->next;
@@ -7864,6 +8117,8 @@ void web_js_free(web_doc *d) {
         js_free(s->ctx,s->window_name);s->window_name=NULL;
         JS_FreeValue(s->ctx, s->hooks); JS_FreeValue(s->ctx, s->dispatch); JS_FreeValue(s->ctx, s->response); JS_FreeValue(s->ctx, s->reject);
         for (int i = 0; i < NP_COUNT; i++) JS_FreeValue(s->ctx, s->node_protos[i]);
+        web_atomics_release(s->ctx);
+        web_opfs_release(s->ctx);
         JS_SetContextOpaque(s->ctx,NULL); /* queued host jobs must reject retired realms */
         JS_FreeContext(s->ctx);
     }

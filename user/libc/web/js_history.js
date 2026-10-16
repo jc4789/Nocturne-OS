@@ -33,7 +33,7 @@ const historyBridge=(()=>{
     function update(replace, data, unused, url, argc) {
         if (argc < 2) throw new TypeError('History state and unused title are required');
         string(unused); url=url==null?null:string(url);
-        const serialized = host.pack(cloneData.serialize(data));
+        const serialized = host.pack(cloneData.serialize(data,undefined,true));
         const current = currentLocation();
         let next;
         try { next = url == null || url === '' ? current : fields(new URLImpl(url, document.baseURI)); }

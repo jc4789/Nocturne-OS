@@ -21,6 +21,8 @@ WABT_SOURCES = ('binary-reader.cc', 'binary-reader-logging.cc', 'binary.cc',
                 'stream.cc', 'type-checker.cc', 'utf8.cc',
                 'interp/binary-reader-interp.cc', 'interp/interp.cc',
                 'interp/istream.cc')
+# Nocturne's own interpreter parts, under ports/wabt.
+WABT_PORT_SOURCES = ('interp-x64.cc',)
 WASM2C_SOURCES = ('apply-names.cc', 'binary-reader-ir.cc', 'c-writer.cc',
                  'color.cc', 'error-formatter.cc', 'expr-visitor.cc',
                  'filenames.cc', 'generate-names.cc', 'ir-util.cc',
@@ -185,16 +187,21 @@ def wabt_library(upstream, translator=False):
                 output.parent.mkdir(parents=True, exist_ok=True)
                 subprocess.run([cmake, '-Dout=' + str(output), '-Din=' + str(source),
                                 '-Dsymbol=' + symbol, '-P', str(generator)], check=True)
+    # Release build of the library: its asserts check interpreter invariants
+    # on every decoded instruction and memory access.
     extra = ['-Iports/wabt/include', '-Ithird_party/wabt/include',
-             '-Ithird_party/bearssl/inc', '-Wno-unused-private-field']
+             '-Ithird_party/bearssl/inc', '-Wno-unused-private-field', '-DNDEBUG']
     headers = [*source_root.rglob('*.h'), *source_root.rglob('*.def'),
                *source_root.rglob('*.inc'), *(ROOT / 'ports' / 'wabt').rglob('*.h'),
                Path(__file__)]
     newest_header = max(max(path.stat().st_mtime_ns for path in headers),
                         (BUILD / 'libc++.a').stat().st_mtime_ns)
     objects = []
-    for name in WASM2C_SOURCES if translator else WABT_SOURCES:
+    names = WASM2C_SOURCES if translator else (*WABT_SOURCES, *WABT_PORT_SOURCES)
+    for name in names:
         source = source_root / 'src' / name
+        if name in WABT_PORT_SOURCES:
+            source = ROOT / 'ports' / 'wabt' / name
         if name.startswith('prebuilt/'):
             source = ROOT / 'build' / 'wabt' / 'generated' / Path(name).name
         output = ROOT / 'build' / 'wabt' / (name + '.o')
@@ -214,6 +221,7 @@ def main():
     actions.add_parser('wabt')
     actions.add_parser('vendor-wabt')
     actions.add_parser('wabt-sources')
+    actions.add_parser('wabt-port-sources')
     actions.add_parser('wasm2c')
     actions.add_parser('wasm2c-sources')
     compile_parser = actions.add_parser('compile')
@@ -230,6 +238,9 @@ def main():
         return
     if args.action in ('wabt-sources', 'wasm2c-sources'):
         print(' '.join(WABT_SOURCES if args.action == 'wabt-sources' else WASM2C_SOURCES))
+        return
+    if args.action == 'wabt-port-sources':
+        print(' '.join(WABT_PORT_SOURCES))
         return
     upstream = prepare()
     if args.action == 'library':

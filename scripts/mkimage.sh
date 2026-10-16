@@ -50,6 +50,9 @@ if [ -d diskfiles ]; then
     for f in diskfiles/*; do mcopy -i "$P" -s "$f" ::/home/; done
 fi
 $LIMINE/limine.exe bios-install $IMG >/dev/null
+# `make qemu-image`: the raw disk alone for a QEMU test boot. Delivery builds
+# (`make all`) always continue with the Hyper-V and ISO media.
+if [ "$1" = "--raw-only" ]; then exit 0; fi
 
 echo "  VHD  $B/nocturne.vhd"
 rm -f $B/nocturne.vhd $B/nocturne.vhdx

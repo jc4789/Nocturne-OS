@@ -15,6 +15,20 @@ bool html_policy_requires_script(const web_doc *document);
  * only enforcing rules; report-only must not be hidden by this predicate. */
 bool html_policy_wasm_allowed(const struct web_html_policy_rule *rule);
 bool html_policy_init(web_doc *document,const char *headers,const web_doc *inherit);
+/* Cross-Origin-Embedder-Policy of a response. An absent, repeated or
+ * unparsable field is unsafe-none; report-only never enforces. */
+enum html_embedder_policy { HTML_COEP_UNSAFE_NONE, HTML_COEP_REQUIRE_CORP, HTML_COEP_CREDENTIALLESS };
+int html_policy_embedder(const char *headers);
+/* Cross-Origin-Opener-Policy: same-origin, the opener policy that isolates
+ * a top-level browsing context group. */
+bool html_policy_opener_isolated(const char *headers);
+/* Potentially trustworthy URL for secure-context gated policy: https, file,
+ * and loopback http. */
+bool html_policy_trustworthy(const char *url);
+/* Document creation: COEP is the response's own, or the creator's for local
+ * documents; isolation requires a trustworthy isolated top-level document
+ * and, in frames, a same-origin isolated parent with its own COEP. */
+void html_policy_isolation(web_doc *document,const char *headers,const web_doc *inherit);
 bool html_policy_meta(web_doc *document,const char *content,size_t length);
 void html_policy_free(web_doc *document);
 char *html_policy_headers(const web_doc *document);

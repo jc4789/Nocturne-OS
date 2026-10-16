@@ -301,16 +301,18 @@ bool CanGrow(const Limits& limits, T old_size, T delta, T* new_size) {
 
 //// FuncDesc ////
 
-ValueType FuncDesc::GetLocalType(Index index) const {
-  if (index < type.params.size()) {
-    return type.params[index];
+ValueType ModuleDesc::GetLocalType(const FuncDesc& func, Index index) const {
+  if (index < func.type->params.size()) {
+    return func.type->params[index];
   }
-  index -= type.params.size();
+  index -= func.type->params.size();
 
+  const LocalDesc* begin = locals.data() + func.locals;
+  const LocalDesc* end = begin + func.local_count;
   auto iter = std::lower_bound(
-      locals.begin(), locals.end(), index + 1,
+      begin, end, index + 1,
       [](const LocalDesc& lhs, Index rhs) { return lhs.end < rhs; });
-  assert(iter != locals.end());
+  assert(iter != end);
   return iter->type;
 }
 
@@ -434,7 +436,7 @@ void Store::Mark(const RefVec& refs) {
 //// Object ////
 Object::~Object() {
   if (finalizer_) {
-    finalizer_(this);
+    (*finalizer_)(this);
   }
 }
 
@@ -501,7 +503,7 @@ Result Extern::MatchImpl(Store& store,
 }
 
 //// Func ////
-Func::Func(ObjectKind kind, FuncType type) : Extern(kind), type_(type) {}
+Func::Func(ObjectKind kind, const FuncType* type) : Extern(kind), type_(type) {}
 
 Result Func::Call(Store& store,
                   const Values& params,
@@ -520,8 +522,8 @@ Result Func::Call(Thread& thread,
 }
 
 //// DefinedFunc ////
-DefinedFunc::DefinedFunc(Store& store, Ref instance, FuncDesc desc)
-    : Func(skind, desc.type), instance_(instance), desc_(desc) {}
+DefinedFunc::DefinedFunc(Store& store, Ref instance, const FuncDesc& desc)
+    : Func(skind, desc.type), instance_(instance), desc_(&desc) {}
 
 void DefinedFunc::Mark(Store& store) {
   store.Mark(instance_);
@@ -530,16 +532,16 @@ void DefinedFunc::Mark(Store& store) {
 Result DefinedFunc::Match(Store& store,
                           const ImportType& import_type,
                           Trap::Ptr* out_trap) {
-  return MatchImpl(store, import_type, type_, out_trap);
+  return MatchImpl(store, import_type, *type_, out_trap);
 }
 
 Result DefinedFunc::DoCall(Thread& thread,
                            const Values& params,
                            Values& results,
                            Trap::Ptr* out_trap) {
-  assert(params.size() == type_.params.size());
-  if (native_callback_) return native_callback_(thread, params, results, out_trap);
-  thread.PushValues(type_.params, params);
+  assert(params.size() == type_->params.size());
+  if (native_callback_) return (*native_callback_)(thread, params, results, out_trap);
+  thread.PushValues(type_->params, params);
   RunResult result = thread.PushCall(*this, out_trap);
   if (result == RunResult::Trap) {
     return Result::Error;
@@ -553,20 +555,21 @@ Result DefinedFunc::DoCall(Thread& thread,
     *out_trap = Trap::New(thread.store(), "uncaught exception");
     return Result::Error;
   }
-  thread.PopValues(type_.results, &results);
+  thread.PopValues(type_->results, &results);
   return Result::Ok;
 }
 
 //// HostFunc ////
+// The base only records the address of the member type initialized next.
 HostFunc::HostFunc(Store&, FuncType type, Callback callback)
-    : Func(skind, type), callback_(callback) {}
+    : Func(skind, &own_type_), own_type_(std::move(type)), callback_(callback) {}
 
 void HostFunc::Mark(Store&) {}
 
 Result HostFunc::Match(Store& store,
                        const ImportType& import_type,
                        Trap::Ptr* out_trap) {
-  return MatchImpl(store, import_type, type_, out_trap);
+  return MatchImpl(store, import_type, *type_, out_trap);
 }
 
 Result HostFunc::DoCall(Thread& thread,
@@ -700,10 +703,45 @@ Result Table::Copy(Store& store,
 }
 
 //// Memory ////
-Memory::Memory(class Store&, MemoryType type)
+Memory::Memory(class Store& store, MemoryType type)
     : Extern(skind), type_(type), pages_(type.limits.initial) {
-  allocation_ok_ = type_.page_size && pages_ <= SIZE_MAX / type_.page_size &&
-                   data_.TryResize(pages_ * type_.page_size);
+  if (!type_.limits.is_shared) {
+    allocation_ok_ = type_.page_size && pages_ <= SIZE_MAX / type_.page_size &&
+                     data_.TryResize(pages_ * type_.page_size);
+    return;
+  }
+  // A shared memory never moves: reserve its maximum once. The reservation
+  // is address space; the embedder's storage is zero-filled at first touch.
+  allocation_ok_ = false;
+  shared_host_ = store.shared_memory_host();
+  const Limits& limits = type_.limits;
+  if (!shared_host_.reserve || !limits.has_max || !type_.page_size ||
+      limits.max > SIZE_MAX / type_.page_size) {
+    return;
+  }
+  std::atomic<u64>* length = nullptr;
+  u8* data = shared_host_.reserve(shared_host_.opaque,
+                                  limits.max * type_.page_size, &length);
+  if (!data) return;
+  shared_data_ = data;
+  shared_length_ = length;
+  shared_length_->store(pages_ * type_.page_size, std::memory_order_release);
+  allocation_ok_ = true;
+}
+
+Memory::Memory(class Store& store, MemoryType type, u8* data,
+               std::atomic<u64>* length)
+    : Extern(skind), type_(type), pages_(type.limits.initial) {
+  shared_host_ = store.shared_memory_host();
+  shared_data_ = data;
+  shared_length_ = length;
+  allocation_ok_ = data && length && type_.limits.is_shared && type_.page_size;
+}
+
+Memory::~Memory() {
+  if (shared_data_ && shared_host_.release) {
+    shared_host_.release(shared_host_.opaque, shared_data_);
+  }
 }
 
 void Memory::Mark(class Store&) {}
@@ -711,11 +749,29 @@ void Memory::Mark(class Store&) {}
 Result Memory::Match(class Store& store,
                      const ImportType& import_type,
                      Trap::Ptr* out_trap) {
+  // Another agent may have grown a shared memory since this one last did.
+  if (shared_length_) type_.limits.initial = PageSize();
   return MatchImpl(store, import_type, type_, out_trap);
 }
 
 Result Memory::Grow(u64 count) {
   u64 new_pages;
+  if (shared_length_) {
+    // Agents grow one length word; the storage is already reserved.
+    u64 bytes = shared_length_->load(std::memory_order_acquire);
+    do {
+      if (!CanGrow<u64>(type_.limits, bytes / type_.page_size, count,
+                        &new_pages)) {
+        return Result::Error;
+      }
+    } while (!shared_length_->compare_exchange_weak(
+        bytes, new_pages * type_.page_size, std::memory_order_acq_rel,
+        std::memory_order_acquire));
+    pages_ = new_pages;
+    type_.limits.initial = new_pages;
+    if (grow_callback_) grow_callback_();
+    return Result::Ok;
+  }
   if (CanGrow<u64>(type_.limits, pages_, count, &new_pages)) {
 #if WABT_BIG_ENDIAN
     auto old_size = data_.size();
@@ -743,7 +799,7 @@ Result Memory::Fill(u64 offset, u8 value, u64 size) {
 #if WABT_BIG_ENDIAN
     std::fill(data_.end() - offset - size, data_.end() - offset, value);
 #else
-    std::fill(data_.begin() + offset, data_.begin() + offset + size, value);
+    std::fill(bytes() + offset, bytes() + offset + size, value);
 #endif
     return Result::Ok;
   }
@@ -756,12 +812,12 @@ Result Memory::Init(u64 dst_offset,
                     u64 size) {
   if (IsValidAccess(dst_offset, 0, size) &&
       src.IsValidRange(src_offset, size)) {
-    std::copy(src.desc().data.begin() + src_offset,
-              src.desc().data.begin() + src_offset + size,
+    std::copy(src.desc().bytes() + src_offset,
+              src.desc().bytes() + src_offset + size,
 #if WABT_BIG_ENDIAN
               data_.rbegin() + dst_offset);
 #else
-              data_.begin() + dst_offset);
+              bytes() + dst_offset);
 #endif
     return Result::Ok;
   }
@@ -780,8 +836,8 @@ Result Memory::Copy(Memory& dst,
     auto src_begin = src.data_.end() - src_offset - size;
     auto dst_begin = dst.data_.end() - dst_offset - size;
 #else
-    auto src_begin = src.data_.begin() + src_offset;
-    auto dst_begin = dst.data_.begin() + dst_offset;
+    auto src_begin = src.bytes() + src_offset;
+    auto dst_begin = dst.bytes() + dst_offset;
 #endif
     auto src_end = src_begin + size;
     auto dst_end = dst_begin + size;
@@ -854,7 +910,18 @@ ElemSegment::ElemSegment(Store& store,
     : desc_(desc) {
   Trap::Ptr out_trap;
   elements_.reserve(desc->elements.size());
+  const Istream& code = store.UnsafeGet<Module>(inst->module())->desc().istream;
   for (auto&& elem_expr : desc->elements) {
+    // `ref.func i` and `ref.null` are nearly all of a large module's elements:
+    // take their value without a function object and a thread per element.
+    Istream::Offset at = elem_expr.code_offset;
+    Instr instr = code.Read(&at);
+    if ((instr.op == Opcode::RefFunc || instr.op == Opcode::RefNull) &&
+        code.Read(&at).op == Opcode::Return) {
+      elements_.push_back(instr.op == Opcode::RefFunc ? inst->funcs()[instr.imm_u32]
+                                                      : Ref::Null);
+      continue;
+    }
     Value value;
     Ref func_ref = DefinedFunc::New(store, inst.ref(), elem_expr).ref();
     if (Failed(inst->CallInitFunc(store, func_ref, &value, &out_trap))) {
@@ -871,11 +938,22 @@ bool ElemSegment::IsValidRange(u32 offset, u32 size) const {
 
 //// DataSegment ////
 DataSegment::DataSegment(const DataDesc* desc)
-    : desc_(desc), size_(desc->data.size()) {}
+    : desc_(desc), size_(desc->size()) {}
 
 bool DataSegment::IsValidRange(u64 offset, u64 size) const {
   u64 data_size = size_;
   return size <= data_size && offset <= data_size - size;
+}
+
+//// ModuleDesc ////
+const FuncType* ModuleDesc::InitType(ValueType result) {
+  for (auto& type : init_types) {
+    if (type->results[0] == result) {
+      return type.get();
+    }
+  }
+  init_types.push_back(std::make_unique<FuncType>(ValueTypes{}, ValueTypes{result}));
+  return init_types.back().get();
 }
 
 //// Module ////
@@ -897,12 +975,9 @@ Module::Module(Store&, ModuleDesc desc)
     }
   }
 
+  // Defined functions' types are these entries.
   for (auto& func_type : desc_.func_types) {
     func_type.func_types = &desc_.func_types;
-  }
-
-  for (auto& func : desc_.funcs) {
-    func.type.func_types = &desc_.func_types;
   }
 }
 
@@ -932,6 +1007,9 @@ Instance::Ptr Instance::Instantiate(Store& store,
     *out_trap = Trap::New(store, "not enough imports!");
     return {};
   }
+  // Sized once: doubling a large module's function list leaves every smaller
+  // buffer behind in the heap.
+  inst->funcs_.reserve(import_desc_count + mod->desc().funcs.size());
 
   // Imports.
   for (size_t i = 0; i < import_desc_count; ++i) {
@@ -1214,6 +1292,7 @@ Instance* Thread::GetCallerInstance() {
 RunResult Thread::PushCall(Ref func, u32 offset, Trap::Ptr* out_trap) {
   frames_.emplace_back(func, values_.size(), exceptions_.size(), offset, inst_,
                        mod_);
+  jit_check_ = true;
   return RunResult::Ok;
 }
 
@@ -1222,6 +1301,7 @@ RunResult Thread::PushCall(const DefinedFunc& func, Trap::Ptr* out_trap) {
   mod_ = store_.UnsafeGet<Module>(inst_->module()).get();
   frames_.emplace_back(func.self(), values_.size(), exceptions_.size(),
                        func.desc().code_offset, inst_, mod_);
+  jit_check_ = true;
   return RunResult::Ok;
 }
 
@@ -1268,15 +1348,47 @@ void Thread::PopValues(const ValueTypes& types, Values* out_values) {
 
 RunResult Thread::Run(Trap::Ptr* out_trap) {
   const int kDefaultInstructionCount = 1000;
-  RunResult result;
-  do {
-    if (store_.PollInterrupt()) {
+  // The entry frame (or a frame resumed here) may already have code.
+  jit_check_ = true;
+  for (int count = 0;;) {
+    if (count == 0 && store_.PollInterrupt()) {
       *out_trap = Trap::New(store_, "WebAssembly execution interrupted");
       return RunResult::Trap;
     }
-    result = Run(kDefaultInstructionCount, out_trap);
-  } while (result == RunResult::Ok);
-  return result;
+    if (jit_check_) {
+      jit_check_ = false;
+      bool entered = false;
+      RunResult result = JitTryEnter(out_trap, &entered);
+      if (result != RunResult::Ok) return result;
+      if (entered) continue;
+    }
+    RunResult result = StepInternal(out_trap);
+    if (result != RunResult::Ok) return result;
+    if (++count == kDefaultInstructionCount) count = 0;
+  }
+}
+
+RunResult Thread::RunFrames(size_t depth, Trap::Ptr* out_trap) {
+  const int kDefaultInstructionCount = 1000;
+  for (int count = 0; frames_.size() > depth;) {
+    if (jit_check_) {
+      jit_check_ = false;
+      bool entered = false;
+      RunResult result = JitTryEnter(out_trap, &entered);
+      if (result != RunResult::Ok) return result;
+      if (entered) continue;
+    }
+    RunResult result = StepInternal(out_trap);
+    if (result != RunResult::Ok) return result;
+    if (++count == kDefaultInstructionCount) {
+      count = 0;
+      if (store_.PollInterrupt()) {
+        *out_trap = Trap::New(store_, "WebAssembly execution interrupted");
+        return RunResult::Trap;
+      }
+    }
+  }
+  return RunResult::Ok;
 }
 
 RunResult Thread::Run(int num_instructions, Trap::Ptr* out_trap) {
@@ -1374,11 +1486,13 @@ RunResult Thread::StepInternal(Trap::Ptr* out_trap) {
       return TRAP("unreachable executed");
 
     case O::Br:
+      if (instr.imm_u32 < pc) CountBackedge();
       pc = instr.imm_u32;
       break;
 
     case O::BrIf:
       if (Pop<u32>()) {
+        if (instr.imm_u32 < pc) CountBackedge();
         pc = instr.imm_u32;
       }
       break;
@@ -1705,6 +1819,7 @@ RunResult Thread::StepInternal(Trap::Ptr* out_trap) {
 
     case O::InterpBrUnless:
       if (!Pop<u32>()) {
+        if (instr.imm_u32 < pc) CountBackedge();
         pc = instr.imm_u32;
       }
       break;
@@ -2108,9 +2223,12 @@ RunResult Thread::StepInternal(Trap::Ptr* out_trap) {
     case O::F64X2RelaxedNmadd: return DoSimdRelaxedNmadd<f64>();
 
     case O::AtomicFence:
-    case O::MemoryAtomicNotify:
-    case O::MemoryAtomicWait32:
-    case O::MemoryAtomicWait64:
+      std::atomic_thread_fence(std::memory_order_seq_cst);
+      break;
+    case O::MemoryAtomicNotify: return DoAtomicNotify(instr, out_trap);
+    case O::MemoryAtomicWait32: return DoAtomicWait<u32>(instr, out_trap);
+    case O::MemoryAtomicWait64: return DoAtomicWait<u64>(instr, out_trap);
+
     case O::I64Add128:
     case O::I64Sub128:
     case O::I64MulWideS:
@@ -2875,6 +2993,45 @@ RunResult Thread::DoAtomicRmwCmpxchg(Instr instr, Trap::Ptr* out_trap) {
   return RunResult::Ok;
 }
 
+template <typename T>
+RunResult Thread::DoAtomicWait(Instr instr, Trap::Ptr* out_trap) {
+  Memory::Ptr memory{store_, inst_->memories()[instr.imm_index_offset.memidx]};
+  s64 timeout = static_cast<s64>(Pop<u64>());
+  T expected = Pop<T>();
+  u64 offset = PopPtr(memory);
+  u64 addend = instr.imm_index_offset.offset;
+  TRAP_IF(!memory->IsValidAtomicAccess(offset, addend, sizeof(T)),
+          StringPrintf("invalid atomic access at %" PRIaddress "+%" PRIu64,
+                       offset, addend));
+  TRAP_IF(!memory->shared(), "expected shared memory");
+  const Store::SharedMemoryHost& host = store_.shared_memory_host();
+  int result = host.wait ? host.wait(host.opaque,
+                                     memory->UnsafeData() + offset + addend,
+                                     expected, sizeof(T) == 8, timeout)
+                         : -1;
+  TRAP_IF(result < 0, "atomic wait is not allowed on this agent");
+  Push<u32>(static_cast<u32>(result));
+  return RunResult::Ok;
+}
+
+RunResult Thread::DoAtomicNotify(Instr instr, Trap::Ptr* out_trap) {
+  Memory::Ptr memory{store_, inst_->memories()[instr.imm_index_offset.memidx]};
+  u32 count = Pop<u32>();
+  u64 offset = PopPtr(memory);
+  u64 addend = instr.imm_index_offset.offset;
+  TRAP_IF(!memory->IsValidAtomicAccess(offset, addend, sizeof(u32)),
+          StringPrintf("invalid atomic access at %" PRIaddress "+%" PRIu64,
+                       offset, addend));
+  // An unshared memory has no other agent that could be waiting.
+  const Store::SharedMemoryHost& host = store_.shared_memory_host();
+  u32 woken = memory->shared() && host.notify
+                  ? host.notify(host.opaque,
+                                memory->UnsafeData() + offset + addend, count)
+                  : 0;
+  Push<u32>(woken);
+  return RunResult::Ok;
+}
+
 RunResult Thread::DoThrow(Exception::Ptr exn) {
   Istream::Offset target_offset = Istream::kInvalidOffset;
   u32 target_values, target_exceptions;
@@ -2891,13 +3048,15 @@ RunResult Thread::DoThrow(Exception::Ptr exn) {
     const Frame& frame = frames_.back();
     DefinedFunc::Ptr func{store_, frame.func};
     u32 pc = frame.offset;
-    auto handlers = func->desc().handlers;
+    const FuncDesc& desc = func->desc();
+    const HandlerDesc* first = frame.mod->desc().Handlers(desc);
+    std::reverse_iterator<const HandlerDesc*> rend(first);
 
     // We iterate in reverse order, in order to traverse handlers from most
     // specific (pushed last) to least specific within a nested stack of
     // try-catch blocks.
-    auto iter = handlers.rbegin();
-    while (iter != handlers.rend()) {
+    auto iter = std::reverse_iterator<const HandlerDesc*>(first + desc.handler_count);
+    while (iter != rend) {
       const HandlerDesc& handler = *iter;
       // pc points to the *next* instruction by the time we're in DoThrow.
       if (pc > handler.try_start_offset && pc <= handler.try_end_offset) {
@@ -2906,7 +3065,7 @@ RunResult Thread::DoThrow(Exception::Ptr exn) {
         if (handler.kind == HandlerKind::Delegate) {
           // Subtract one as we're trying to get a reverse iterator that is
           // offset by `delegate_handler_index` from the first item.
-          iter = handlers.rend() - handler.delegate_handler_index - 1;
+          iter = rend - handler.delegate_handler_index - 1;
           continue;
         }
         // Otherwise, check for a matching catch tag or catch_all.
@@ -3067,7 +3226,7 @@ ValueType Thread::TraceSource::GetLocalType(Index stack_slot) {
   Index local_index =
       (thread_->values_.size() - frame.values + func->type().params.size()) -
       stack_slot;
-  return func->desc().GetLocalType(local_index);
+  return frame.mod->desc().GetLocalType(func->desc(), local_index);
 }
 
 ValueType Thread::TraceSource::GetGlobalType(Index index) {

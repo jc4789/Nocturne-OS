@@ -58,6 +58,10 @@ int open(const char *path, int flags, ...) { return (int)ret(SC2(SYS_OPEN, path,
 int close(int fd) { return (int)ret(SC1(SYS_CLOSE, fd)); }
 int audio_flush(int fd) { return (int)ret(SC1(SYS_AUDIO_FLUSH, fd)); }
 long lseek(int fd, long off, int whence) { return ret(SC3(SYS_LSEEK, fd, off, whence)); }
+int ftruncate(int fd, long size) {
+    if (size < 0) { errno = EINVAL; return -1; }
+    return (int)ret(SC2(SYS_FTRUNCATE, fd, size));
+}
 int stat(const char *path, struct n_stat *st) { return (int)ret(SC2(SYS_STAT, path, st)); }
 int fstat(int fd, struct n_stat *st) { return (int)ret(SC2(SYS_FSTAT, fd, st)); }
 int readdir(int fd, int idx, struct n_dirent *d) { return (int)ret(SC3(SYS_READDIR, fd, idx, d)); }
@@ -213,6 +217,9 @@ void thread_local_set(unsigned slot, void *value) {
 int wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms) {
     return (int)ret(SC3(SYS_WAIT_ADDRESS, address, expected, timeout_ms));
 }
+int wait_on_address64(volatile uint64_t *address, uint64_t expected, unsigned timeout_ms) {
+    return (int)ret(SC3(SYS_WAIT_ADDRESS64, address, expected, timeout_ms));
+}
 int wake_address(volatile uint32_t *address, unsigned count) {
     return (int)ret(SC2(SYS_WAKE_ADDRESS, address, count));
 }
@@ -223,10 +230,18 @@ time_t time(time_t *t) {
 }
 int pipe(int fds[2]) { return (int)ret(SC1(SYS_PIPE, fds)); }
 int n_shared_create(size_t bytes) { return (int)ret(SC1(SYS_SHARED_CREATE,bytes)); }
+int n_shared_reserve(size_t bytes) { return (int)ret(SC1(SYS_SHARED_RESERVE,bytes)); }
 void *n_shared_map(int owner_pid,int fd,size_t bytes,int prot) {
     long r=ret(SC4(SYS_SHARED_MAP,owner_pid,fd,bytes,prot));
     return r<0 ? NULL : (void *)r;
 }
+long n_shared_send(int fd) { return ret(SC1(SYS_SHARED_SEND,fd)); }
+int n_shared_receive(int owner_pid,long ticket) { return (int)ret(SC2(SYS_SHARED_RECEIVE,owner_pid,ticket)); }
+int n_address_watch_queue(void) { return (int)ret(SC0(SYS_ADDRESS_WATCH_QUEUE)); }
+int n_address_watch(int queue,volatile uint32_t *address,uint32_t expected,uint64_t token) {
+    return (int)ret(SC4(SYS_ADDRESS_WATCH,queue,address,expected,token));
+}
+int n_address_unwatch(int queue,uint64_t token) { return (int)ret(SC2(SYS_ADDRESS_UNWATCH,queue,token)); }
 int n_channel_listen(const char *key) {
     if(!key || !*key){errno=EINVAL;return -1;}
     return (int)ret(SC2(SYS_CHANNEL_LISTEN,key,strlen(key)));

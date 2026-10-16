@@ -61,6 +61,7 @@ struct web_request {
     uint64_t fetch_group; /* Native per-environment identity; not supplied by page headers. */
     int cache_mode; /* Fetch: 0 default, 1 no-store, 2 reload, 3 no-cache, 4 force-cache, 5 only-if-cached. */
     bool stream_response;
+    bool require_corp; /* initiator COEP require-corp */
 };
 enum { WEB_HISTORY_INFO, WEB_HISTORY_PUSH, WEB_HISTORY_REPLACE, WEB_HISTORY_GO, WEB_HISTORY_SCROLL };
 struct web_history {
@@ -178,7 +179,28 @@ struct web_host {
        task after a user close/stop request, not after a page-count quota. */
     bool (*script_checkpoint)(void *opaque);
     bool debug_js; /* native profiling is off unless the host explicitly opts in */
+    /* WebSocket transport (RFC 6455); all optional, NULL means unavailable.
+       url is ws:/wss:, protocols a comma-separated offer or NULL, origin the
+       serialized initiating-realm origin. Events arrive via web_socket_event
+       for the returned nonzero id until socket_release. */
+    uint64_t (*socket_open)(void *opaque, const char *url, const char *protocols, const char *origin);
+    bool (*socket_send)(void *opaque, uint64_t id, bool binary, const void *data, size_t length);
+    bool (*socket_close)(void *opaque, uint64_t id, unsigned code, const char *reason, size_t length);
+    size_t (*socket_buffered)(void *opaque, uint64_t id);
+    void (*socket_release)(void *opaque, uint64_t id);
 };
+enum web_socket_event_type { WEB_SOCKET_OPENED, WEB_SOCKET_MESSAGE_TEXT, WEB_SOCKET_MESSAGE_BINARY,
+    WEB_SOCKET_CLOSED, WEB_SOCKET_FAILED };
+struct web_socket_event {
+    enum web_socket_event_type type;
+    unsigned code;          /* close code, 1005 when none was received */
+    const void *data;       /* message payload, close reason or error text; borrowed */
+    size_t length;
+    const char *protocol;   /* OPENED: negotiated subprotocol, borrowed, may be NULL */
+};
+/* Host to document: deliver one event of a socket opened by this document or
+   one of its frames. Data is copied before return. */
+void web_socket_event(web_doc *d, uint64_t id, const struct web_socket_event *event);
 bool web_set_url(web_doc *d, const char *url);
 /* Call between JS tasks, after the host history position and document URL change. */
 void web_history_event(web_doc *d, const char *old_url, bool popstate);
@@ -196,6 +218,11 @@ int64_t web_media_background_deadline(uint64_t now_ms);
 void web_avmedia_debug(bool enabled);
 /* -1: no deadline, otherwise an absolute uptime_ms() deadline. */
 int64_t web_deadline(web_doc *d);
+/* Readable when an Atomics.waitAsync waiter of this process was notified;
+ * -1 before the first waiter. Poll it with the GUI descriptor. */
+int web_wait_fd(void);
+/* Debug summary of the realm waits behind web_wait_fd; 0 when none. */
+int web_wait_report(char *out, size_t size);
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *response);
 bool web_dirty(web_doc *d); /* consumes the legacy layout/paint notification */
 bool web_paint_dirty(web_doc *d); /* consumes a paint-only media notification */

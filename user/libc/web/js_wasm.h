@@ -23,10 +23,20 @@ typedef struct web_js_wasm_stats {
     uint64_t native_modules;
     uint64_t native_calls;
     uint64_t native_fallbacks;
+    uint64_t compile_ms;        /* interpreter descriptor builds */
+    uint64_t image_ms;          /* shared module images written or mapped */
+    uint64_t image_bytes;
     uint64_t jspi_suspensions;
     uint64_t jspi_resumptions;
     uint64_t jspi_pending;
 } web_js_wasm_stats;
+/* Structured clone of WebAssembly.Module and shared WebAssembly.Memory:
+ * host.wasmModuleClassID/wasmMemoryClassID brands, wasmModuleExport and
+ * wasmMemoryExport (to a dedicated Worker), wasmModuleImport,
+ * wasmMemoryImport, wasmModuleAlias and wasmMemoryAlias (same agent) and
+ * wasmMemoryShared. Call after
+ * web_js_wasm_init. */
+void web_js_wasm_host_init(JSContext *ctx, JSValueConst host);
 /* Read-only counters; no logging or clock syscalls in the execution path. */
 int web_js_wasm_get_stats(JSContext *ctx, web_js_wasm_stats *out);
 /* Borrowed until the next compile or context destruction; empty if no fallback. */

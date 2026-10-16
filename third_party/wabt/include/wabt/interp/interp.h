@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <atomic>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -43,6 +44,7 @@ namespace interp {
 class Store;
 class Object;
 class Trap;
+struct JitCode;
 class DataSegment;
 class ElemSegment;
 class Module;
@@ -143,6 +145,9 @@ class FallibleBuffer {
   }
   T* data() { return data_; }
   const T* data() const { return data_; }
+  // The words compiled code reads; both move only through TryResize.
+  T* const* data_address() const { return &data_; }
+  const size_t* size_address() const { return &size_; }
   T* begin() { return data_; }
   const T* begin() const { return data_; }
   T* end() { return size_ ? data_ + size_ : data_; }
@@ -155,6 +160,65 @@ class FallibleBuffer {
  private:
   T* data_ = nullptr;
   size_t size_ = 0;
+};
+
+// A thread's value/ref stacks. Begin, end and capacity are plain pointers so
+// the x86-64 tier keeps the top of the value stack in a register and stores
+// it back at each runtime call; the interpreter sees the same three words.
+template <typename T>
+class PodStack {
+  static_assert(std::is_trivially_copyable_v<T>);
+ public:
+  PodStack() = default;
+  ~PodStack() { free(begin_); }
+  PodStack(const PodStack&) = delete;
+  PodStack& operator=(const PodStack&) = delete;
+  size_t size() const { return end_ - begin_; }
+  size_t capacity() const { return cap_ - begin_; }
+  bool empty() const { return end_ == begin_; }
+  T* begin() { return begin_; }
+  T* end() { return end_; }
+  const T* begin() const { return begin_; }
+  const T* end() const { return end_; }
+  auto rbegin() { return std::reverse_iterator<T*>(end_); }
+  auto rend() { return std::reverse_iterator<T*>(begin_); }
+  T& operator[](size_t i) { return begin_[i]; }
+  const T& operator[](size_t i) const { return begin_[i]; }
+  T& back() { return end_[-1]; }
+  void pop_back() { --end_; }
+  void push_back(T value) {
+    if (WABT_UNLIKELY(end_ == cap_)) Reserve(size() + 1);
+    *end_++ = value;
+  }
+  // Capacity for |count| elements in all; the stack may move.
+  void Reserve(size_t count) {
+    if (count <= capacity()) return;
+    size_t next = std::max<size_t>(std::max<size_t>(capacity() * 2, count), 64);
+    size_t used = size();
+    if (next > static_cast<size_t>(PTRDIFF_MAX) / sizeof(T)) abort();
+    T* data = static_cast<T*>(realloc(begin_, next * sizeof(T)));
+    if (!data) abort();
+    begin_ = data;
+    end_ = data + used;
+    cap_ = data + next;
+  }
+  void reserve(size_t count) { Reserve(count); }
+  void resize(size_t count) {
+    if (count > size()) {
+      Reserve(count);
+      std::fill(end_, begin_ + count, T{});
+    }
+    end_ = begin_ + count;
+  }
+  T* erase(T* first, T* last) {
+    std::move(last, end_, first);
+    end_ -= last - first;
+    return first;
+  }
+
+  T* begin_ = nullptr;
+  T* end_ = nullptr;
+  T* cap_ = nullptr;
 };
 
 template <typename T, u8 L>
@@ -367,14 +431,20 @@ struct HandlerDesc {
   bool catch_all_ref = false;
 };
 
+// A module has hundreds of thousands of functions and element expressions, so
+// a function's local declarations and exception handlers are ranges of its
+// module's pools (ModuleDesc::locals and ::handlers) rather than containers of
+// their own; a function's ranges are contiguous because bodies are read one at
+// a time.
 struct FuncDesc {
-  // Includes params.
-  ValueType GetLocalType(Index) const;
-
-  FuncType type;
-  std::vector<LocalDesc> locals;
-  u32 code_offset;  // Istream offset.
-  std::vector<HandlerDesc> handlers;
+  // Owned by the module: a defined function's entry of func_types, or an
+  // initializer's ModuleDesc::InitType. A module has few distinct types.
+  const FuncType* type;
+  u32 code_offset = Istream::kInvalidOffset;
+  u32 locals = 0;  // First entry of ModuleDesc::locals.
+  u32 local_count = 0;
+  u32 handlers = 0;  // First entry of ModuleDesc::handlers.
+  u32 handler_count = 0;
 };
 
 struct TableDesc {
@@ -405,10 +475,17 @@ struct StartDesc {
 };
 
 struct DataDesc {
+  // The segment bytes: owned in `data`, or, when `view` is set, in storage
+  // that the ModuleDesc keeps alive (ModuleDesc::storage).
+  const u8* bytes() const { return view ? view : data.data(); }
+  size_t size() const { return view ? view_size : data.size(); }
+
   Buffer data;
   SegmentMode mode;
   Index memory_index;
   FuncDesc init_func;
+  const u8* view = nullptr;
+  size_t view_size = 0;
 };
 
 struct ElemDesc {
@@ -420,7 +497,25 @@ struct ElemDesc {
 };
 
 struct ModuleDesc {
+  ModuleDesc() = default;
+  // FuncDesc::type points into this descriptor; it moves but is not copied.
+  ModuleDesc(ModuleDesc&&) = default;
+  ModuleDesc& operator=(ModuleDesc&&) = default;
+  ModuleDesc(const ModuleDesc&) = delete;
+  ModuleDesc& operator=(const ModuleDesc&) = delete;
+
+  // The type `[] -> [result]` of a constant initializer expression.
+  const FuncType* InitType(ValueType result);
+
+  // A function's local (including params) and its handler ranges.
+  ValueType GetLocalType(const FuncDesc&, Index) const;
+  const HandlerDesc* Handlers(const FuncDesc& func) const {
+    return handlers.data() + func.handlers;
+  }
+
+  // Complete before any FuncDesc refers to an entry.
   std::vector<FuncType> func_types;
+  std::vector<std::unique_ptr<FuncType>> init_types;
   std::vector<ImportDesc> imports;
   std::vector<FuncDesc> funcs;
   std::vector<TableDesc> tables;
@@ -431,7 +526,12 @@ struct ModuleDesc {
   std::vector<StartDesc> starts;
   std::vector<ElemDesc> elems;
   std::vector<DataDesc> datas;
+  std::vector<LocalDesc> locals;
+  std::vector<HandlerDesc> handlers;
   Istream istream;
+  // Keeps external istream and data segment storage alive (Istream::Adopt,
+  // DataDesc::view) for as long as the module exists.
+  std::shared_ptr<const void> storage;
 };
 
 //// Runtime ////
@@ -516,6 +616,9 @@ class Store {
   Result Get(Ref, RefPtr<T>* out);
   template <typename T>
   RefPtr<T> UnsafeGet(Ref);
+  // Borrowed, without a root, for a caller that already keeps |ref| alive
+  // (a function in an active frame).
+  Object* UnsafeObject(Ref ref) { return objects_.Get(ref.index); }
 
   RootList::Index NewRoot(Ref);
   RootList::Index CopyRoot(RootList::Index);
@@ -540,6 +643,22 @@ class Store {
   }
   void* execution_owner() const { return execution_owner_callback_ ? execution_owner_callback_() : nullptr; }
 
+  // Shared memories are agent-wide storage: the embedder reserves a region
+  // every agent maps at its maximum size, with a length word beside it, and
+  // provides the blocking primitive keyed by addresses in that region.
+  struct SharedMemoryHost {
+    void* opaque = nullptr;
+    // Zero-filled storage for max_bytes; *length starts at zero.
+    u8* (*reserve)(void* opaque, u64 max_bytes, std::atomic<u64>** length) = nullptr;
+    void (*release)(void* opaque, u8* data) = nullptr;
+    // 0 "ok", 1 "not-equal", 2 "timed-out"; -1: this agent cannot block.
+    int (*wait)(void* opaque, void* address, u64 expected, bool wide,
+                s64 timeout_ns) = nullptr;
+    u32 (*notify)(void* opaque, void* address, u32 count) = nullptr;
+  };
+  void set_shared_memory_host(const SharedMemoryHost& host) { shared_host_ = host; }
+  const SharedMemoryHost& shared_memory_host() const { return shared_host_; }
+
   std::set<Thread*>& threads();
 
  private:
@@ -557,6 +676,7 @@ class Store {
   Features features_;
   std::function<bool()> interrupt_callback_;
   std::function<void*()> execution_owner_callback_;
+  SharedMemoryHost shared_host_;
   GCContext gc_context_;
   // This set contains the currently active Thread objects.
   std::set<Thread*> threads_;
@@ -691,7 +811,9 @@ class Object {
   virtual void Mark(Store&) {}
 
   ObjectKind kind_;
-  Finalizer finalizer_ = nullptr;
+  // Out of line: few objects of the hundreds of thousands a module
+  // instantiates have one.
+  std::unique_ptr<Finalizer> finalizer_;
   void* host_info_ = nullptr;
   Ref self_ = Ref::Null;
 };
@@ -800,13 +922,15 @@ class Func : public Extern {
   const FuncType& type() const;
 
  protected:
-  explicit Func(ObjectKind, FuncType);
+  // The type is owned by the subclass: a defined function borrows it from its
+  // module's descriptor, a host function keeps its own copy.
+  explicit Func(ObjectKind, const FuncType*);
   virtual Result DoCall(Thread& thread,
                         const Values& params,
                         Values& results,
                         Trap::Ptr* out_trap) = 0;
 
-  FuncType type_;
+  const FuncType* type_;
 };
 
 class DefinedFunc : public Func {
@@ -816,15 +940,20 @@ class DefinedFunc : public Func {
   static const char* GetTypeName() { return "DefinedFunc"; }
   using Ptr = RefPtr<DefinedFunc>;
 
-  static DefinedFunc::Ptr New(Store&, Ref instance, FuncDesc);
+  // The descriptor is borrowed from the instance's module, which the function
+  // keeps alive through its instance.
+  static DefinedFunc::Ptr New(Store&, Ref instance, const FuncDesc&);
 
   Result Match(Store&, const ImportType&, Trap::Ptr* out_trap) override;
 
   Ref instance() const;
   const FuncDesc& desc() const;
   using NativeCallback = std::function<Result(Thread&, const Values&, Values&, Trap::Ptr*)>;
-  void set_native_callback(NativeCallback callback) { native_callback_ = std::move(callback); }
+  void set_native_callback(NativeCallback callback) {
+    native_callback_ = callback ? std::make_unique<NativeCallback>(std::move(callback)) : nullptr;
+  }
   bool has_native_callback() const { return bool(native_callback_); }
+  ~DefinedFunc() override;
 
  protected:
   Result DoCall(Thread& thread,
@@ -834,12 +963,17 @@ class DefinedFunc : public Func {
 
  private:
   friend Store;
-  explicit DefinedFunc(Store&, Ref instance, FuncDesc);
+  friend Thread;
+  explicit DefinedFunc(Store&, Ref instance, const FuncDesc&);
   void Mark(Store&) override;
 
   Ref instance_;
-  FuncDesc desc_;
-  NativeCallback native_callback_;
+  const FuncDesc* desc_;  // Borrowed from the Module.
+  std::unique_ptr<NativeCallback> native_callback_;  // Native modules only.
+  // x86-64 code for this function's body, compiled once it is hot.
+  JitCode* jit_ = nullptr;
+  u32 jit_heat_ = 0;
+  bool jit_failed_ = false;
 };
 
 class HostFunc : public Func {
@@ -870,6 +1004,7 @@ class HostFunc : public Func {
   explicit HostFunc(Store&, FuncType, Callback);
   void Mark(Store&) override;
 
+  FuncType own_type_;
   Callback callback_;
 };
 
@@ -932,6 +1067,10 @@ class Memory : public Extern {
   using Ptr = RefPtr<Memory>;
 
   static Memory::Ptr New(Store&, MemoryType);
+  // Another agent's shared memory: adopts a region reference the embedder
+  // already holds for this Store (released through SharedMemoryHost).
+  static Memory::Ptr NewShared(Store&, MemoryType, u8* data, std::atomic<u64>* length);
+  ~Memory();
 
   Result Match(Store&, const ImportType&, Trap::Ptr* out_trap) override;
 
@@ -956,7 +1095,8 @@ class Memory : public Extern {
                      u64 src_offset,
                      u64 size);
 
-  // Fake atomics; just checks alignment.
+  // Sequentially consistent on the host; shared memories are mapped by other
+  // agents' processes, so these are the real cross-agent operations.
   template <typename T>
   Result AtomicLoad(u64 offset, u64 addend, T* out) const;
   template <typename T>
@@ -973,6 +1113,17 @@ class Memory : public Extern {
   template <typename T>
   T WABT_VECTORCALL UnsafeLoad(u64 offset, u64 addend) const;
   u8* UnsafeData();
+  bool shared() const { return shared_length_ != nullptr; }
+  std::atomic<u64>* shared_length() const { return shared_length_; }
+  // For the x86-64 tier: an unshared memory's base moves when it grows, a
+  // shared one's never does; the byte length is read on every access.
+  u8* const* base_address() const { return data_.data_address(); }
+  u8* shared_data() const { return shared_data_; }
+  const u64* length_address() const {
+    static_assert(sizeof(size_t) == sizeof(u64));
+    return shared_length_ ? reinterpret_cast<const u64*>(shared_length_)
+                          : reinterpret_cast<const u64*>(data_.size_address());
+  }
 
   const ExternType& extern_type() override;
   const MemoryType& type() const;
@@ -980,10 +1131,23 @@ class Memory : public Extern {
  private:
   friend class Store;
   explicit Memory(class Store&, MemoryType);
+  Memory(class Store&, MemoryType, u8* data, std::atomic<u64>* length);
   void Mark(class Store&) override;
+  u8* bytes() const {
+    return shared_length_ ? shared_data_ : const_cast<u8*>(data_.data());
+  }
+  u64 size() const {
+    return shared_length_ ? shared_length_->load(std::memory_order_acquire)
+                          : data_.size();
+  }
 
   MemoryType type_;
   FallibleBuffer<u8> data_;
+  // Shared memory: fixed storage at its maximum; the length word is the
+  // agent-wide current size that grow publishes.
+  u8* shared_data_ = nullptr;
+  std::atomic<u64>* shared_length_ = nullptr;
+  Store::SharedMemoryHost shared_host_;
   bool allocation_ok_;
   std::function<void()> grow_callback_;
   u64 pages_;
@@ -1012,7 +1176,12 @@ class Global : public Extern {
   void UnsafeSet(Value);
   void set_change_callback(std::function<void()> callback) {
     change_callback_ = std::move(callback);
+    observed_ = bool(change_callback_);
   }
+  // Compiled code reads and writes the value in place, and takes the
+  // interpreter's path for a write while a change callback observes it.
+  Value* value_address() { return &value_; }
+  const bool* observed_address() const { return &observed_; }
 
   const ExternType& extern_type() override;
   const GlobalType& type() const;
@@ -1025,6 +1194,7 @@ class Global : public Extern {
   GlobalType type_;
   Value value_;
   std::function<void()> change_callback_;
+  bool observed_ = false;
 };
 
 class Tag : public Extern {
@@ -1322,16 +1492,41 @@ class Thread {
   RunResult DoAtomicRmw(BinopFunc<T, T>, Instr, Trap::Ptr* out_trap);
   template <typename T, typename V = T>
   RunResult DoAtomicRmwCmpxchg(Instr, Trap::Ptr* out_trap);
+  template <typename T>
+  RunResult DoAtomicWait(Instr, Trap::Ptr* out_trap);
+  RunResult DoAtomicNotify(Instr, Trap::Ptr* out_trap);
 
   RunResult DoThrow(Exception::Ptr exn_ref);
 
   RunResult StepInternal(Trap::Ptr* out_trap);
 
+  // x86-64 tier (ports/wabt/interp-x64.cc). Compiled code runs a function's
+  // own frame over values_ and calls JitStep for every instruction it does
+  // not compile itself, so calls, returns, throws and traps stay the
+  // interpreter's; a frame leaves compiled code whenever it is popped.
+  friend class JitCompiler;
+  // Runs the frames above |depth| until they return, entering compiled code
+  // for any frame whose function has it.
+  RunResult RunFrames(size_t depth, Trap::Ptr* out_trap);
+  // Enters compiled code for the top frame at its offset if it has (or now
+  // gets) code; leaves *entered false to keep interpreting.
+  RunResult JitTryEnter(Trap::Ptr* out_trap, bool* entered);
+  static void* JitStep(Thread*, u32 pc, u32 next_pc, void* next_addr, u64 depth);
+  static void* JitPoll(Thread*, void* target_addr);
+  static Value* JitGrow(Thread*, u64 bytes);
+  // An interpreted loop asks for its function to be compiled and entered.
+  void CountBackedge() {
+    if (--jit_backedges_ < 0) {
+      jit_backedges_ = 1024;
+      jit_check_ = true;
+    }
+  }
+
   // Frames grow with the native heap. deque preserves the current instruction
   // offset reference when a host import re-enters Wasm and adds call frames.
   std::deque<Frame> frames_;
-  std::vector<Value> values_;
-  std::vector<u32> refs_;  // Index into values_.
+  PodStack<Value> values_;
+  PodStack<u32> refs_;  // Index into values_.
 
   // Exception handling requires tracking a separate stack of caught
   // exceptions for catch blocks.
@@ -1346,6 +1541,14 @@ class Thread {
   // Tracing.
   Stream* trace_stream_;
   std::unique_ptr<TraceSource> trace_source_;
+
+  // x86-64 tier state. A compiled activation reports how it ended here.
+  RunResult jit_result_ = RunResult::Ok;
+  Trap::Ptr jit_trap_;
+  s32 jit_budget_ = 0;     // Backward branches left before polling.
+  s32 jit_backedges_ = 0;  // Interpreted backward branches before a check.
+  bool jit_check_ = false; // The top frame changed or is looping.
+  uintptr_t jit_stack_limit_ = 0;
 };
 
 struct Thread::TraceSource : Istream::TraceSource {

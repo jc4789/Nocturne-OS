@@ -23,6 +23,8 @@ typedef struct {
 int wasm_rt_set_poll(wasm_rt_poll_fn, void*, wasm_rt_poll_state* previous);
 void wasm_rt_poll(void);
 void wasm_rt_check_native_stack(void);
+/* Lowest usable address of the running native stack (a coroutine's own). */
+uintptr_t wasm_rt_native_stack_low(void);
 int wasm_rt_run(void (*entry)(void*), void* opaque);
 void* wasm_rt_default_trap(void);
 void wasm_rt_native_init_thread(void);

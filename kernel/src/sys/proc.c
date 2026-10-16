@@ -3,6 +3,7 @@
 #include "arch/cpu.h"
 #include "sys/sched.h"
 #include "sys/proc.h"
+#include "sys/syscall.h"
 #include "fs/vfs.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
@@ -63,14 +64,27 @@ int proc_spawn(const char *path, int argc, char **argv, struct file *fds[3], con
         if (ph[i].vaddr >= USER_TOP || ph[i].vaddr + ph[i].memsz > USER_MMAP_BASE || ph[i].offset + ph[i].filesz > size)
             goto fail;
         int prot = (ph[i].flags & PF_W ? VM_W : 0) | (ph[i].flags & PF_X ? VM_X : 0);
+        /* programs built by tcc before crt0's _start section was marked executable */
+        if (!(prot & VM_X) && eh->entry >= ph[i].vaddr && eh->entry - ph[i].vaddr < ph[i].memsz) {
+            kprintf("exec: %s: entry point is not executable (old tcc build?); allowing it\n", path);
+            prot |= VM_X;
+        }
+        /* A read-only segment whose pages no other segment touches is shared
+           with every task running the same bytes. */
+        bool alone = !(prot & VM_W) && ph[i].filesz <= ph[i].memsz;
+        uint64_t first = ALIGN_DOWN(ph[i].vaddr, PAGE_SIZE), last = ALIGN_UP(ph[i].vaddr + ph[i].memsz, PAGE_SIZE);
+        for (int j = 0; alone && j < eh->phnum; j++)
+            if (j != i && ph[j].type == PT_LOAD && ph[j].memsz &&
+                ALIGN_DOWN(ph[j].vaddr, PAGE_SIZE) < last && ALIGN_UP(ph[j].vaddr + ph[j].memsz, PAGE_SIZE) > first)
+                alone = false;
+        if (alone && shared_program_segment(t, path, ph[i].vaddr, img + ph[i].offset, ph[i].filesz,
+                                            ph[i].memsz, prot & VM_X) == 0) {
+            if (ph[i].vaddr + ph[i].memsz > top) top = ph[i].vaddr + ph[i].memsz;
+            continue;
+        }
         if (vmm_user_alloc(t->pml4, ph[i].vaddr, ph[i].memsz, prot) < 0) goto fail;
         if (vmm_copy_to_space(t->pml4, ph[i].vaddr, img + ph[i].offset, ph[i].filesz) < 0) goto fail;
         if (ph[i].vaddr + ph[i].memsz > top) top = ph[i].vaddr + ph[i].memsz;
-    }
-    /* programs built by tcc before crt0's _start section was marked executable */
-    if (vmm_get_pte(t->pml4, eh->entry) & PTE_NX) {
-        kprintf("exec: %s: entry point is not executable (old tcc build?); allowing it\n", path);
-        vmm_user_alloc(t->pml4, eh->entry, 1, VM_X);
     }
     t->brk_base = t->brk = ALIGN_UP(top, PAGE_SIZE);
     t->mmap_next = USER_MMAP_BASE;
@@ -119,7 +133,10 @@ int proc_spawn(const char *path, int argc, char **argv, struct file *fds[3], con
 
 fail:
     kfree(img);
-    if (t->pml4) vmm_free_space(t->pml4);
+    if (t->pml4) {
+        sys_shared_cleanup(t);
+        vmm_free_space(t->pml4);
+    }
     t->pml4 = kernel_pml4;
     t->state = TASK_ZOMBIE;
     t->parent = NULL;

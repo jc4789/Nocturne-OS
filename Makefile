@@ -187,7 +187,7 @@ $(BUILD)/u/user/libc/web/form_validation.o: user/libc/web/js_form_url.inc
 user/libc/web/unicode_grapheme_data.h: scripts/unicode_grapheme.py third_party/unicode/18.0.0/GraphemeBreakProperty.txt third_party/unicode/18.0.0/DerivedCoreProperties.txt third_party/unicode/18.0.0/emoji-data.txt
 	@$(PY) scripts/unicode_grapheme.py
 $(BUILD)/u/user/libc/web/layout.o: user/libc/web/unicode_grapheme_data.h
-user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_error_event.js user/libc/web/js_clone.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js user/libc/web/js_wasm.js user/libc/web/js_wasm.h third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
+user/libc/web/js_worker_runtime.inc: user/libc/web/js_worker_runtime.js user/libc/web/js_navigator.js user/libc/web/js_dom_exception.js user/libc/web/js_error_event.js user/libc/web/js_promise_rejection.js user/libc/web/js_performance.js user/libc/web/js_clone.js user/libc/web/js_offscreen_canvas.js user/libc/web/js_opfs.js user/libc/web/js_encoding.js user/libc/web/js_url.js user/libc/web/js_worker_messaging.js user/libc/web/js_html_safety.js user/libc/web/js_sanitizer_constants.js user/libc/web/js_streams.js user/libc/web/js_blob.js user/libc/web/js_crypto.js user/libc/web/js_formdata.js user/libc/web/js_wasm.js user/libc/web/js_wasm.h third_party/web_streams/ponyfill.mjs third_party/web_streams/upstream.json user/libc/web/js_worker_embed.py
 	@$(PY) user/libc/web/js_worker_embed.py
 $(BUILD)/u/user/apps/browserjsworker.o: user/libc/web/js_worker_runtime.inc user/libc/web/js_worker_transfer.h user/libc/web/js_worker_port_lifetime.h
 $(BUILD)/u/user/libc/web/js_worker.o: user/libc/web/js_worker.h user/include/js_worker_wire.h user/libc/web/js_worker_port_lifetime.h
@@ -204,6 +204,10 @@ $(BUILD)/u/%.asm.o: %.asm
 WABT_SOURCES := $(shell $(PY) scripts/build_cxx.py wabt-sources)
 WABT_SRC := $(addprefix third_party/wabt/src/,$(WABT_SOURCES))
 WABT_OBJ := $(addprefix $(BUILD)/wabt/,$(addsuffix .o,$(WABT_SOURCES)))
+# Nocturne's own interpreter parts (the x86-64 tier) live under ports/wabt.
+WABT_PORT_SOURCES := $(shell $(PY) scripts/build_cxx.py wabt-port-sources)
+WABT_PORT_SRC := $(addprefix ports/wabt/,$(WABT_PORT_SOURCES))
+WABT_OBJ += $(addprefix $(BUILD)/wabt/,$(addsuffix .o,$(WABT_PORT_SOURCES)))
 WASM2C_SOURCES := $(shell $(PY) scripts/build_cxx.py wasm2c-sources)
 WASM2C_SRC := $(addprefix third_party/wabt/src/,$(WASM2C_SOURCES))
 WASM2C_OBJ := $(addprefix $(BUILD)/wabt/,$(addsuffix .o,$(WASM2C_SOURCES)))
@@ -238,7 +242,7 @@ CXX_HEADERS := $(shell find user/include -type f) common/abi.h common/gfx.h
 $(BUILD)/cxx/libc++.a $(CXX_RUNTIME_OBJ) &: scripts/build_cxx.py $(CXX_HEADERS)
 	@$(PY) scripts/build_cxx.py library
 
-WABT_INPUTS := $(WABT_SRC) $(wildcard third_party/wabt/include/wabt/* third_party/wabt/include/wabt/interp/* ports/wabt/include/wabt/*) third_party/wabt/UPSTREAM.json
+WABT_INPUTS := $(WABT_SRC) $(WABT_PORT_SRC) ports/wabt/include/wasm-rt-nocturne.h $(wildcard third_party/wabt/include/wabt/* third_party/wabt/include/wabt/interp/* ports/wabt/include/wabt/*) third_party/wabt/UPSTREAM.json
 $(BUILD)/wabt/libwabt.a $(WABT_OBJ) &: scripts/build_cxx.py $(WABT_INPUTS) $(BUILD)/cxx/libc++.a
 	@$(PY) scripts/build_cxx.py wabt
 
@@ -333,7 +337,7 @@ $(BUILD)/sysroot.stamp: $(LIBC_OBJ) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(
 	@touch $@
 
 # ---------------------------------------------------------------- images
-.PHONY: all kernel user cxx lexbor image run clean test test-quick test-full
+.PHONY: all kernel user cxx lexbor image qemu-image run clean test test-quick test-full
 .SECONDARY:
 all: image
 
@@ -356,6 +360,10 @@ $(BUILD)/sounds.stamp: scripts/mksounds.py
 image: $(BUILD)/kernel.elf $(BUILD)/initrd.tar $(BUILD)/data-blank.vhdx
 	@bash scripts/mkimage.sh
 	@bash scripts/mkdata.sh
+
+# the raw QEMU boot disk only, for test iterations (no VHD/VHDX/ISO)
+qemu-image: $(BUILD)/kernel.elf $(BUILD)/initrd.tar
+	@bash scripts/mkimage.sh --raw-only
 
 # an empty 2 GiB data disk for Hyper-V (hyperv.ps1 copies it once; it is dynamic, so tiny on disk)
 $(BUILD)/data-blank.vhdx: scripts/mkdata.sh

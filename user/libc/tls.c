@@ -424,6 +424,48 @@ long ns_try_read(net_stream *s,void *buf,size_t n) {
     }
     return -2;
 }
+void ns_engine_lock(volatile uint32_t *lock) {
+    while(__atomic_exchange_n(lock,1,__ATOMIC_ACQUIRE))wait_on_address(lock,1,UINT_MAX);
+}
+void ns_engine_unlock(volatile uint32_t *lock) {
+    __atomic_store_n(lock,0,__ATOMIC_RELEASE);wake_address(lock,1);
+}
+/* ns_try_read that sleeps up to timeout_ms for the first transport bytes. A
+   timeout is pending (-2), not an error: the TLS engine stays usable. The
+   optional engine lock is held by the caller and released only while the
+   transport sleeps: received bytes land in the engine's receive half, which
+   the send operations of another thread never touch. */
+long ns_read_wait(net_stream *s,void *buf,size_t n,int timeout_ms,volatile uint32_t *lock) {
+    if(io_cancelled(s))return -1;
+    if(!s->tls) {
+        if(lock)ns_engine_unlock(lock);
+        long got=tcp_recv(s->sock,buf,n,timeout_ms);int cause=errno;
+        if(lock)ns_engine_lock(lock);
+        errno=cause;
+        if(got<0&&(errno==EAGAIN||errno==ETIMEDOUT))return -2;
+        if(got<0)snprintf(s->err,sizeof s->err,"%s",strerror(errno));
+        return got;
+    }
+    for(unsigned steps=0;steps<32;steps++) {
+        long got=ns_try_read(s,buf,n);
+        if(got!=-2||!timeout_ms)return got;
+        unsigned state=br_ssl_engine_current_state(&s->cc.eng);
+        if(!(state&BR_SSL_RECVREC)||(state&BR_SSL_SENDREC))return -2;
+        size_t size;unsigned char *p=br_ssl_engine_recvrec_buf(&s->cc.eng,&size);
+        if(lock)ns_engine_unlock(lock);
+        got=tcp_recv(s->sock,p,size,timeout_ms);int cause=errno;
+        if(lock)ns_engine_lock(lock);
+        errno=cause;
+        if(got<0&&(errno==EAGAIN||errno==ETIMEDOUT))return -2;
+        if(got<=0) {
+            s->transport_errno=errno=got==0?ECONNRESET:errno;
+            snprintf(s->err,sizeof s->err,"TLS transport: %s",strerror(errno));return -1;
+        }
+        br_ssl_engine_recvrec_ack(&s->cc.eng,(size_t)got);
+        timeout_ms=0;
+    }
+    return -2;
+}
 long ns_try_write(net_stream *s,const void *buf,size_t n) {
     if(io_cancelled(s))return -1;
     if(!s->tls) {
@@ -463,6 +505,8 @@ void ns_abort(net_stream *s) {
     size_t size=s->tls?sizeof *s:offsetof(net_stream,cc);
     memset(s,0,size);free(s);
 }
+
+void ns_reset(net_stream *s) { if(s)tcp_cancel(s->sock); }
 
 void ns_close(net_stream *s) {
     if (!s) return;

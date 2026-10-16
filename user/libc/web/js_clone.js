@@ -33,10 +33,19 @@ const cloneData = (() => {
     for(const ctor of [Int8Array,U8,Uint8ClampedArray,Int16Array,Uint16Array,Int32Array,Uint32Array,
         Float32Array,Float64Array,BigInt64Array,BigUint64Array])register(ctor.name,new ctor(0),ctor);
     if(typeof Float16Array==='function')register('Float16Array',new Float16Array(0),Float16Array);
+    // SharedArrayBuffer is branded natively: a sample would map a shared page.
+    const SAB=typeof SharedArrayBuffer==='function'?SharedArrayBuffer:null;
+    if(typeof host.sharedBufferClassID==='number')put(kinds,host.sharedBufferClassID,'SharedArrayBuffer');
+    // A WebAssembly.Module travels as its compiled image and a shared Memory as
+    // its storage; another agent maps both.
+    if(typeof host.wasmModuleClassID==='number')put(kinds,host.wasmModuleClassID,'WebAssembly.Module');
+    if(typeof host.wasmMemoryClassID==='number')put(kinds,host.wasmMemoryClassID,'WebAssembly.Memory');
     const arrayBufferID=classID(new AB(0)),typed=Object.getPrototypeOf(U8.prototype);
     const getter=(proto,key)=>descriptor(proto,key).get;
     const abLength=getter(AB.prototype,'byteLength'),abResizable=descriptor(AB.prototype,'resizable')?.get;
     const abMaxLength=descriptor(AB.prototype,'maxByteLength')?.get;
+    const sabGrowable=SAB?descriptor(SAB.prototype,'growable')?.get:undefined;
+    const sharedBuffer=buffer=>get(kinds,classID(buffer))==='SharedArrayBuffer';
     const byteBuffer=getter(typed,'buffer'),byteOffset=getter(typed,'byteOffset'),length=getter(typed,'length');
     const typedValues=typed.values;
     const viewBuffer=getter(DataView.prototype,'buffer'),viewOffset=getter(DataView.prototype,'byteOffset');
@@ -55,7 +64,7 @@ const cloneData = (() => {
             message+=' [stage '+stage+', brand '+kind+', nativeclass '+id+', transfers '+count+', external '+(external?'yes':'no')+']';}
         throw new DomError(message,'DataCloneError');
     };
-    const resizable=buffer=>abResizable&&apply(abResizable,buffer,[]);
+    const resizable=buffer=>sharedBuffer(buffer)?!!sabGrowable&&apply(sabGrowable,buffer,[]):abResizable&&apply(abResizable,buffer,[]);
     function copyBuffer(buffer,reject=fail) {
         // No slice/species or constructor hooks from the source buffer.
         let size,input;
@@ -64,7 +73,7 @@ const cloneData = (() => {
         apply(byteSet,new U8(output),[input]);return output;
     }
     const packets=new WeakMap(),packetGet=WeakMap.prototype.get,packetSet=WeakMap.prototype.set;
-    function prepare(input,transfers,external=false,workerContext=null) {
+    function prepare(input,transfers,external=false,workerContext=null,storage=false) {
         const seen=new M(),records=[],handlers=[],prepared=[];
         const reject=(stage,value,brand)=>fail(stage,value,transfers?transfers.length:0,external,brand);
         // Register placeholders first; capture transferred bytes after user getters.
@@ -117,6 +126,32 @@ const cloneData = (() => {
                 field(record,1,[]);
                 for(let i=0;i<entries.length;i++)add(record[1],kind==='Map'?[visit(entries[i][0]),visit(entries[i][1])]:visit(entries[i]));
             }else if(kind==='ArrayBuffer')field(record,1,copyBuffer(value,reject));
+            else if(kind==='SharedArrayBuffer'){
+                // Storage outlives the agent cluster; a growable length is per
+                // object here, so another agent could not observe its growth.
+                if(storage)return reject('shared-buffer-storage',value);
+                if(resizable(value))return reject('growable-shared-buffer-unsupported',value);
+                // A dedicated Worker is a direct child or parent process: it maps
+                // the same pages. Other cross-process endpoints cannot.
+                if(external==='worker'){record[0]='SharedArrayBufferExport';field(record,1,host.sharedBufferExport(value));}
+                else if(external)return reject('shared-buffer-endpoint-unsupported',value);
+                else field(record,1,value);
+            }
+            else if(kind==='WebAssembly.Module'){
+                // Storage would outlive the agent cluster; other endpoints are
+                // other processes without the dedicated-Worker relationship.
+                if(storage)return reject('wasm-module-storage',value);
+                if(external==='worker'){record[0]='WebAssembly.ModuleExport';field(record,1,host.wasmModuleExport(value));}
+                else if(external)return reject('wasm-module-endpoint-unsupported',value);
+                else field(record,1,value);
+            }
+            else if(kind==='WebAssembly.Memory'){
+                if(storage)return reject('wasm-memory-storage',value);
+                if(!host.wasmMemoryShared(value))return reject('unshared-wasm-memory',value);
+                if(external==='worker'){record[0]='WebAssembly.MemoryExport';field(record,1,host.wasmMemoryExport(value));}
+                else if(external)return reject('wasm-memory-endpoint-unsupported',value);
+                else field(record,1,value);
+            }
             else if(has(constructors,kind)){
                 const dataView=kind==='DataView';let buffer,offset,size;
                 try{
@@ -205,8 +240,8 @@ const cloneData = (() => {
         }
         add(plan.writes,{object:p,key:'committed',value:true});return plan;
     }
-    function serialize(input,transfers) {
-        const packet=prepare(input,transfers);commit(packet);return packet.data;
+    function serialize(input,transfers,storage=false) {
+        const packet=prepare(input,transfers,false,null,storage);commit(packet);return packet.data;
     }
     function deserialize(serialized,receivers=null,copyBytes=false) {
         const root=serialized[0],records=serialized[1],values=new M();
@@ -216,6 +251,12 @@ const cloneData = (() => {
             if(kind==='Object')value={};else if(kind==='Array')value=new A(r[1]);
             else if(kind==='Map')value=new M();else if(kind==='Set')value=new S();
             else if(kind==='ArrayBuffer')value=copyBytes?copyBuffer(r[1]):r[1];
+            else if(kind==='SharedArrayBuffer')value=host.sharedBufferAlias(r[1]);
+            else if(kind==='SharedArrayBufferExport')value=host.sharedBufferImport(r[1]);
+            else if(kind==='WebAssembly.Module')value=host.wasmModuleAlias(r[1]);
+            else if(kind==='WebAssembly.ModuleExport')value=host.wasmModuleImport(r[1]);
+            else if(kind==='WebAssembly.Memory')value=host.wasmMemoryAlias(r[1]);
+            else if(kind==='WebAssembly.MemoryExport')value=host.wasmMemoryImport(r[1]);
             else if(kind==='Transferred')value=r[1].value;
             else if(kind==='ExternalTransferred')value=receivers[r[1]].value;
             else if(kind==='Blob'){

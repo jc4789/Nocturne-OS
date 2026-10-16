@@ -336,6 +336,52 @@ DEFINE_STORE(i64_store8, u8, u64)
 DEFINE_STORE(i64_store16, u16, u64)
 DEFINE_STORE(i64_store32, u32, u64)
 
+#if defined(__TINYC__) && WASM_RT_MEMCHECK_BOUNDS_CHECK && !WABT_BIG_ENDIAN && \
+    !WASM_RT_USE_SEGUE_FOR_THIS_MODULE
+/* TinyCC never inlines, so every default32 access above would be a range
+ * check call, an unchecked call and a memcpy call. Expand the same check and
+ * little-endian access in place; a 32-bit address plus an access size cannot
+ * wrap the 64-bit sum. */
+#define WASM_RT_TCC_LOAD(mem, addr, t1, t2, t3)          \
+  ({                                                     \
+    u64 tcc_addr_ = (addr);                              \
+    if (UNLIKELY(tcc_addr_ + sizeof(t1) > (mem)->size))  \
+      TRAP(OOB);                                         \
+    (t3)(t2)(*(t1*)&(mem)->data[tcc_addr_]);             \
+  })
+#define WASM_RT_TCC_STORE(mem, addr, t1, value)          \
+  ({                                                     \
+    u64 tcc_addr_ = (addr);                              \
+    t1 tcc_value_ = (t1)(value);                         \
+    if (UNLIKELY(tcc_addr_ + sizeof(t1) > (mem)->size))  \
+      TRAP(OOB);                                         \
+    *(t1*)&(mem)->data[tcc_addr_] = tcc_value_;          \
+  })
+#define i32_load_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, u32, u32, u32)
+#define i64_load_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, u64, u64, u64)
+#define f32_load_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, f32, f32, f32)
+#define f64_load_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, f64, f64, f64)
+#define i32_load8_s_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, s8, s32, u32)
+#define i64_load8_s_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, s8, s64, u64)
+#define i32_load8_u_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, u8, u32, u32)
+#define i64_load8_u_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, u8, u64, u64)
+#define i32_load16_s_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, s16, s32, u32)
+#define i64_load16_s_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, s16, s64, u64)
+#define i32_load16_u_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, u16, u32, u32)
+#define i64_load16_u_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, u16, u64, u64)
+#define i64_load32_s_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, s32, s64, u64)
+#define i64_load32_u_default32(b, s, m, a) WASM_RT_TCC_LOAD(m, a, u32, u64, u64)
+#define i32_store_default32(b, s, m, a, v) WASM_RT_TCC_STORE(m, a, u32, v)
+#define i64_store_default32(b, s, m, a, v) WASM_RT_TCC_STORE(m, a, u64, v)
+#define f32_store_default32(b, s, m, a, v) WASM_RT_TCC_STORE(m, a, f32, v)
+#define f64_store_default32(b, s, m, a, v) WASM_RT_TCC_STORE(m, a, f64, v)
+#define i32_store8_default32(b, s, m, a, v) WASM_RT_TCC_STORE(m, a, u8, v)
+#define i32_store16_default32(b, s, m, a, v) WASM_RT_TCC_STORE(m, a, u16, v)
+#define i64_store8_default32(b, s, m, a, v) WASM_RT_TCC_STORE(m, a, u8, v)
+#define i64_store16_default32(b, s, m, a, v) WASM_RT_TCC_STORE(m, a, u16, v)
+#define i64_store32_default32(b, s, m, a, v) WASM_RT_TCC_STORE(m, a, u32, v)
+#endif
+
 #if defined(__TINYC__)
 
 /* TinyCC does not lower the GCC count-bit builtins. Keep these operations
