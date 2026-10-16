@@ -285,15 +285,6 @@ int n_address_watch(int queue,volatile uint32_t *address,uint32_t expected,uint6
     return (int)ret(SC4(SYS_ADDRESS_WATCH,queue,address,expected,token));
 }
 int n_address_unwatch(int queue,uint64_t token) { return (int)ret(SC2(SYS_ADDRESS_UNWATCH,queue,token)); }
-int n_channel_listen(const char *key) {
-    if(!key || !*key){errno=EINVAL;return -1;}
-    return (int)ret(SC2(SYS_CHANNEL_LISTEN,key,strlen(key)));
-}
-int n_channel_connect(const char *key) {
-    if(!key || !*key){errno=EINVAL;return -1;}
-    return (int)ret(SC2(SYS_CHANNEL_CONNECT,key,strlen(key)));
-}
-int n_channel_accept(int listener_fd) { return (int)ret(SC1(SYS_CHANNEL_ACCEPT,listener_fd)); }
 
 /* ---- native ABI: results come back as they are, errno is left alone ---- */
 #define NC5(n, a, b, c, d, e) __syscall(n, (long)(a), (long)(b), (long)(c), (long)(d), (long)(e))
@@ -376,6 +367,15 @@ n_result n_folder_entries(const char *path, struct n_entry **out) {
     return (n_result)n;
 }
 n_result n_channel_pair(n_handle out[2]) { return NC5(SYS_CHANNEL_PAIR, out, 0, 0, 0, 0); }
+n_handle n_channel_listen(const char *key) {
+    if (!key || !*key) return -N_ERR_INVALID;
+    return (n_handle)NC5(SYS_CHANNEL_LISTEN, key, strlen(key), 0, 0, 0);
+}
+n_handle n_channel_connect(const char *key) {
+    if (!key || !*key) return -N_ERR_INVALID;
+    return (n_handle)NC5(SYS_CHANNEL_CONNECT, key, strlen(key), 0, 0, 0);
+}
+n_handle n_channel_accept(n_handle listener) { return (n_handle)NC5(SYS_CHANNEL_ACCEPT, listener, 0, 0, 0, 0); }
 n_result n_channel_send(n_handle h, const void *data, size_t n, n_handle attach) {
     return NC5(SYS_CHANNEL_SEND, h, data, n, attach, 0);
 }
@@ -406,6 +406,7 @@ n_result n_app_result(n_handle app, int64_t timeout_ms, int *status) {
     return NC5(SYS_APP_RESULT, app, timeout_ms, status, 0, 0);
 }
 n_result n_app_stop(n_handle app, int flags) { return NC5(SYS_APP_STOP, app, flags, 0, 0, 0); }
+n_result n_random(void *buf, size_t n) { return NC5(SYS_RANDOM, buf, n, 0, 0, 0); }
 n_result n_app_self(void) { return NC5(SYS_APP_SELF, 0, 0, 0, 0, 0); }
 n_result n_app_parent(void) { return NC5(SYS_APP_PARENT, 0, 0, 0, 0, 0); }
 n_result n_system_log(char *buf, size_t cap) { return NC5(SYS_DMESG, buf, cap, 0, 0, 0); }

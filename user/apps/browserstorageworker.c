@@ -1,21 +1,28 @@
 /* Nocturne native IndexedDB I/O owner. It executes real transaction engine
  * operations off the page task; protocol input never contains a file path. */
 #include <webidb_async.h>
-#include <unistd.h>
+#include <nocturne.h>
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
 
-static bool exact(int fd,void *buffer,size_t length,bool writing) {
-    size_t at=0;
-    while(at<length){
-        size_t step=length-at;
-        if(step>INT_MAX)step=INT_MAX;
-        ssize_t n=writing?write(fd,(uint8_t*)buffer+at,step):read(fd,(uint8_t*)buffer+at,step);
-        if(n<=0)return false;
-        at+=(size_t)n;
-    }
-    return true;
+/* The browser's channel: one command per message in, one result per message out. */
+#define CHANNEL 0
+/* The next whole command message, waiting for it; NULL once the browser has gone. */
+static uint8_t *receive_command(size_t *length) {
+    n_result size=n_channel_receive(CHANNEL,NULL,0,N_CHANNEL_WAIT|N_CHANNEL_PEEK,NULL);
+    if(size<(n_result)sizeof(struct webidb_wire_command))return NULL;
+    uint8_t *bytes=malloc((size_t)size);
+    if(!bytes||n_channel_receive(CHANNEL,bytes,(size_t)size,0,NULL)!=size){free(bytes);return NULL;}
+    *length=(size_t)size;return bytes;
+}
+static bool send_result(const struct webidb_wire_result *result,const uint8_t *output,size_t length) {
+    if(length>SIZE_MAX-sizeof *result)return false;
+    uint8_t *message=malloc(sizeof *result+length);
+    if(!message)return false;
+    memcpy(message,result,sizeof *result);if(length)memcpy(message+sizeof *result,output,length);
+    bool sent=n_channel_send(CHANNEL,message,sizeof *result+length,-1)>=0;
+    free(message);return sent;
 }
 static bool add(size_t *total,uint64_t length) {
     if(length>SIZE_MAX-*total)return false;
@@ -46,15 +53,17 @@ int main(void) {
     webidb *engine=webidb_create();
     if(!engine)return 1;
     struct webidb_wire_command command;
-    while(exact(0,&command,sizeof command,false)){
+    size_t message_length=0;uint8_t *message;
+    while((message=receive_command(&message_length))){
         size_t total=0;
+        memcpy(&command,message,sizeof command);
         if(command.magic!=WEB_IDB_WIRE_MAGIC||!command.sequence||
            command.operation<WEB_IDB_BEGIN||command.operation>WEB_IDB_VALUES||
            command.reference_count>SIZE_MAX/64||
            !add(&total,command.origin_length)||!add(&total,command.name_length)||
-           !add(&total,command.payload_length)||!add(&total,command.reference_count*64))break;
-        uint8_t *body=malloc(total?total:1);
-        if(!body||!exact(0,body,total,false)){free(body);break;}
+           !add(&total,command.payload_length)||!add(&total,command.reference_count*64)||
+           total!=message_length-sizeof command){free(message);break;}
+        uint8_t *body=message+sizeof command;
         char *origin=string_copy(body,(size_t)command.origin_length);
         char *name=string_copy(body+command.origin_length,(size_t)command.name_length);
         uint8_t *payload=body+command.origin_length+command.name_length;
@@ -159,9 +168,9 @@ int main(void) {
         }
 reply:
         result.payload_length=output_length;
-        bool sent=exact(1,&result,sizeof result,true)&&exact(1,output,output_length,true);
+        bool sent=send_result(&result,output,output_length);
         free(output);
-        free(name);free(origin);free(body);
+        free(name);free(origin);free(message);
         if(!sent)break;
     }
     webidb_free(engine);return 0;

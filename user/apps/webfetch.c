@@ -7,7 +7,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <errno.h>
 #include <time.h>
 #include <limits.h>
 #include "browser_identity.h"
@@ -46,7 +45,9 @@ struct job {
     uint64_t debug_header_bytes, debug_ctl, debug_non_ascii;
     struct http_transport_timing debug_timing;
     unsigned debug_attempts;
-    int input, output;
+    n_handle input, output;
+    n_handle events;         /* input's readiness, for timed waits */
+    struct webnet_wire_in in; /* the input message being read */
     char *partition;
     struct cache_entry *cached;
     struct header_buffer cache_body;
@@ -69,53 +70,46 @@ static bool top_level_navigation(const struct job *j) {
 static bool cache_context_allowed(const struct job *j) {
     return top_level_navigation(j)||(j->origin&&!j->top_opaque);
 }
-static bool read_all(int fd, void *p, size_t n) {
-    while (n) {
-        ssize_t k = read(fd, p, n);
-        if (k < 0 && errno == EINTR) continue;
-        if(k<0&&errno==EAGAIN){
-            if(__atomic_load_n(&service_stopping,__ATOMIC_ACQUIRE))return false;
-            struct n_pollfd ready={fd,N_POLLIN,0};
-            if(poll(&ready,1,100)<0||ready.revents&N_POLLHUP)return false;
-            continue;
-        }
-        if (k <= 0) return false;
-        p = (char *)p + k; n -= k;
+/* Wait up to ms for the browser: 1 input (or its end) waits, 0 nothing yet,
+   -1 the browser has gone or the service is stopping. */
+static int input_wait(struct job *j,int ms) {
+    if(j->in.at<j->in.length)return 1;
+    if(__atomic_load_n(&service_stopping,__ATOMIC_ACQUIRE))return -1;
+    struct n_event e;
+    n_result got=n_events_wait(j->events,&e,1,ms);
+    if(got<0||(got&&(e.events&N_EVENT_CLOSED)))return -1;
+    return got>0;
+}
+static bool read_all(struct job *j,void *p,size_t n) {
+    while(n){
+        n_result k=webnet_wire_read(j->input,&j->in,p,n,0);
+        if(k<0)return false;
+        if(!k){if(input_wait(j,100)<0)return false;continue;}
+        p=(char *)p+k;n-=(size_t)k;
     }
     return true;
 }
-static bool write_all(int fd, const void *p, size_t n) {
-    while (n) {
-        ssize_t k = write(fd, p, n);
-        if (k < 0 && errno == EINTR) continue;
-        if(k<0&&errno==EAGAIN){
-            /* Service channels are nonblocking; wait for the reader's room. */
-            if(__atomic_load_n(&service_stopping,__ATOMIC_ACQUIRE))return false;
-            struct n_pollfd ready={fd,N_POLLOUT,0};
-            if(poll(&ready,1,100)<0||ready.revents&N_POLLHUP)return false;
-            continue;
-        }
-        if (k <= 0) return false;
-        p = (const char *)p + k; n -= k;
-    }
-    return true;
+/* One message; the browser's side never lets output exceed its window, so
+   this waits only while the browser is far behind. */
+static bool write_all(struct job *j,const void *p,size_t n) {
+    return !n||webnet_wire_write(j->output,p,n)==(n_result)n;
 }
 static int request_cancelled(void *opaque) {
     struct job *j=opaque;
-    if(uptime_ms()>=j->wire.deadline)return 1;
+    if(n_clock_uptime_ms()>=j->wire.deadline)return 1;
     if(!(j->wire.user_navigation&WEBNET_WIRE_SERVICE))return 0;
     if(__atomic_load_n(&service_stopping,__ATOMIC_ACQUIRE))return 1;
-    struct n_pollfd peer={j->input,0,0};
-    return poll(&peer,1,0)<0||(peer.revents&N_POLLHUP)!=0;
+    struct n_event e;
+    n_result got=n_events_wait(j->events,&e,1,0);
+    return got<0||(got&&(e.events&N_EVENT_CLOSED));
 }
 /* -1 failure, 0 no credit within wait_ms, 1 credit added. A grant returns
    bytes the browser consumed, so it never exceeds what is outstanding. */
 static int credit_receive(struct job *j,int wait_ms) {
-    struct n_pollfd peer={j->input,N_POLLIN,0};
-    if(poll(&peer,1,wait_ms)<0||(peer.revents&N_POLLHUP))return -1;
-    if(!(peer.revents&N_POLLIN))return 0;
+    int ready=input_wait(j,wait_ms);
+    if(ready<=0)return ready;
     struct webnet_wire_credit credit;
-    if(!read_all(j->input,&credit,sizeof credit)||credit.magic!=WEBNET_CREDIT_MAGIC||
+    if(!read_all(j,&credit,sizeof credit)||credit.magic!=WEBNET_CREDIT_MAGIC||
        credit.id!=j->wire.id||!credit.bytes||credit.bytes>WEBNET_SERVICE_WINDOW-j->output_credit)return -1;
     j->output_credit+=credit.bytes;
     return 1;
@@ -128,17 +122,17 @@ static bool backlog_drain(struct job *j,size_t keep) {
         if(!j->output_credit){
             bool wait=pending>keep;
             if(wait&&request_cancelled(j))return false;
-            int got=credit_receive(j,wait?(int)MIN(j->wire.deadline-uptime_ms(),100u):0);
+            int got=credit_receive(j,wait?(int)MIN(j->wire.deadline-n_clock_uptime_ms(),100u):0);
             if(got<0)return false;
             if(!got){if(!wait)return true;continue;}
         }
         size_t count=MIN(pending,j->output_credit);
-        if(!write_all(j->output,j->backlog+j->backlog_pos,count))return false;
+        if(!write_all(j,j->backlog+j->backlog_pos,count))return false;
         j->backlog_pos+=count;j->output_credit-=count;
     }
 }
 static bool job_write(struct job *j,const void *data,size_t length) {
-    if(!(j->wire.user_navigation&WEBNET_WIRE_SERVICE))return write_all(j->output,data,length);
+    if(!(j->wire.user_navigation&WEBNET_WIRE_SERVICE))return write_all(j,data,length);
     if(request_cancelled(j))return false;
     if(length){
         if(j->backlog_pos&&j->backlog_pos>=j->backlog_len-j->backlog_pos){
@@ -160,23 +154,17 @@ static bool job_read_all(struct job *j,void *data,size_t length) {
     char *p=data;
     while(length){
         if(request_cancelled(j))return false;
-        if(j->wire.user_navigation&WEBNET_WIRE_SERVICE){
-            struct n_pollfd peer={j->input,N_POLLIN,0};
-            int wait=(int)MIN(j->wire.deadline-uptime_ms(),100u);
-            if(poll(&peer,1,wait)<0||peer.revents&N_POLLHUP)return false;
-            if(!(peer.revents&N_POLLIN))continue;
-        }
         size_t count=MIN(length,WEBNET_SERVICE_CREDIT_STEP);
-        ssize_t got=read(j->input,p,count);
-        if(got<0&&(errno==EINTR||errno==EAGAIN))continue;
-        if(got<=0)return false;
+        n_result got=webnet_wire_read(j->input,&j->in,p,count,0);
+        if(got<0)return false;
+        if(!got){if(input_wait(j,(int)MIN(j->wire.deadline-n_clock_uptime_ms(),100u))<0)return false;continue;}
         p+=got;length-=(size_t)got;
         if(j->wire.user_navigation&WEBNET_WIRE_SERVICE){
             j->input_consumed+=(size_t)got;
             if(j->input_consumed>=WEBNET_SERVICE_CREDIT_STEP){
                 struct webnet_wire_response frame={0};frame.magic=WEBNET_STREAM_REQUEST_CREDIT;
                 frame.id=j->wire.id;frame.generation=j->wire.generation;frame.status=(uint32_t)j->input_consumed;
-                if(!write_all(j->output,&frame,sizeof frame))return false;
+                if(!write_all(j,&frame,sizeof frame))return false;
                 j->input_consumed=0;
             }
         }
@@ -214,7 +202,7 @@ static bool header_text(struct job *j, struct header_buffer *b, const char *p) {
     return header_append(j, b, p, strlen(p));
 }
 static int remaining(struct job *j) {
-    uint64_t now = uptime_ms();
+    uint64_t now = n_clock_uptime_ms();
     if (now >= j->wire.deadline) { fail(j, "Request deadline exceeded"); return 0; }
     uint64_t left = j->wire.deadline - now;
     /* TCP/read timeout parameters are signed int. Never turn a long positive
@@ -393,18 +381,17 @@ static int file_path(const char *url,char **out) {
 }
 static bool load_file_open(struct job *j,const char *path) {
     if(strcmp(j->method,"GET")||j->wire.body_len)return fail(j,"Local resources support GET only");
-    int fd=open(path,O_RDONLY);if(fd<0)return fail(j,"Cannot open local resource");
-    struct n_stat st;
-    if(fstat(fd,&st)<0||st.type!=N_FT_FILE||st.size>webnet_wire_response_limit(j->wire.kind,j->wire.user_navigation)||(uint64_t)st.size+1>SIZE_MAX){close(fd);return fail(j,"Invalid or oversized local resource");}
-    j->body=malloc((size_t)st.size+1);if(!j->body){close(fd);return fail(j,"Out of memory");}
-    size_t left=(size_t)st.size;
-    while(left){
-        if(!remaining(j)){close(fd);return false;}
-        ssize_t k=read(fd,j->body+j->body_len,MIN(left,65536));
-        if(k<=0){close(fd);return fail(j,"Local resource ended early");}
-        j->body_len+=(size_t)k;left-=(size_t)k;
+    n_handle doc=n_document_open(path,N_DOCUMENT_READ);if(doc<0)return fail(j,"Cannot open local resource");
+    n_result size=n_document_size(doc);
+    if(size<0||(uint64_t)size>webnet_wire_response_limit(j->wire.kind,j->wire.user_navigation)||(uint64_t)size+1>SIZE_MAX){n_handle_close(doc);return fail(j,"Invalid or oversized local resource");}
+    j->body=malloc((size_t)size+1);if(!j->body){n_handle_close(doc);return fail(j,"Out of memory");}
+    while(j->body_len<(size_t)size){
+        if(!remaining(j)){n_handle_close(doc);return false;}
+        n_result k=n_document_read_at(doc,j->body_len,j->body+j->body_len,MIN((size_t)size-j->body_len,65536));
+        if(k<=0){n_handle_close(doc);return fail(j,"Local resource ended early");}
+        j->body_len+=(size_t)k;
     }
-    close(fd);j->body[j->body_len]=0;
+    n_handle_close(doc);j->body[j->body_len]=0;
     char *url=strdup(j->url);if(!url)return fail(j,"Out of memory copying local URL");
     free(j->final_url);j->final_url=url;j->status=200;return true;
 }
@@ -642,7 +629,7 @@ static void cache_freshness(struct cache_entry *e) {
     const char *a;size_t n;
     if(field_exists(e->headers,"Age")&&(!field_slice(e->headers,"Age",&a,&n)||!cache_decimal(a,n,&age)))age=UINT64_MAX;
     if(dated&&now>date&&(uint64_t)(now-date)>age)age=(uint64_t)(now-date);
-    e->age_seconds=age;e->stored_ms=uptime_ms();e->lifetime_seconds=0;
+    e->age_seconds=age;e->stored_ms=n_clock_uptime_ms();e->lifetime_seconds=0;
     if(cache_directive(e->headers,"max-age",&maximum))e->lifetime_seconds=maximum;
     else if(cache_date(e->headers,"Expires",&expires)){
         int64_t base=dated?date:now;if(expires>base)e->lifetime_seconds=(uint64_t)(expires-base);
@@ -654,7 +641,7 @@ static void cache_freshness(struct cache_entry *e) {
     e->must_revalidate=cache_directive(e->headers,"must-revalidate",NULL);
 }
 static uint64_t cache_age(const struct cache_entry *e) {
-    uint64_t elapsed=(uptime_ms()-e->stored_ms)/1000;
+    uint64_t elapsed=(n_clock_uptime_ms()-e->stored_ms)/1000;
     return elapsed>UINT64_MAX-e->age_seconds?UINT64_MAX:e->age_seconds+elapsed;
 }
 static bool cache_vary(const struct cache_entry *e,const char *request) {
@@ -1536,7 +1523,7 @@ static bool ws_grow(unsigned char **p, size_t *cap, size_t need) {
 static bool ws_record(struct websocket *ws, uint32_t magic, uint32_t code, const void *data, size_t length) {
     struct webnet_wire_socket record = {magic, code, length};
     while (__atomic_exchange_n(&ws->channel, 1, __ATOMIC_ACQUIRE)) wait_on_address(&ws->channel, 1, UINT_MAX);
-    bool ok = write_all(ws->j->output, &record, sizeof record) && (!length || write_all(ws->j->output, data, length));
+    bool ok = write_all(ws->j, &record, sizeof record) && write_all(ws->j, data, length);
     __atomic_store_n(&ws->channel, 0, __ATOMIC_RELEASE); wake_address(&ws->channel, 1);
     return ok;
 }
@@ -1547,7 +1534,7 @@ static bool ws_write_locked(struct websocket *ws, const unsigned char *p, size_t
         long sent = ns_try_write(ws->stream, p, n);
         if (sent == -2) {
             if (__atomic_load_n(&ws->stopping, __ATOMIC_ACQUIRE)) return false;
-            ns_engine_unlock(&ws->engine); msleep(1); ns_engine_lock(&ws->engine);
+            ns_engine_unlock(&ws->engine); n_sleep_ms(1); ns_engine_lock(&ws->engine);
             continue;
         }
         if (sent <= 0) return false;
@@ -1555,7 +1542,7 @@ static bool ws_write_locked(struct websocket *ws, const unsigned char *p, size_t
     }
     while (ns_try_write(ws->stream, NULL, 0) == -2) { /* drain buffered records */
         if (__atomic_load_n(&ws->stopping, __ATOMIC_ACQUIRE)) return false;
-        ns_engine_unlock(&ws->engine); msleep(1); ns_engine_lock(&ws->engine);
+        ns_engine_unlock(&ws->engine); n_sleep_ms(1); ns_engine_lock(&ws->engine);
     }
     return true;
 }
@@ -1783,9 +1770,7 @@ static bool run_websocket(struct job *j) {
     }
     struct url_owned u = {0};
     unsigned char seed[32];
-    int random = open("/dev/urandom", O_RDONLY);
-    bool seeded = random >= 0 && read_all(random, seed, sizeof seed);
-    if (random >= 0) close(random);
+    bool seeded = n_random(seed, sizeof seed) == (n_result)sizeof seed;
     if (!seeded) fail(j, "No entropy for WebSocket masking");
     else if (!http_url) fail(j, "Invalid WebSocket URL");
     else if (!url_parse_owned(http_url, &u)) fail(j, "Invalid WebSocket URL");
@@ -1807,15 +1792,15 @@ static bool run_websocket(struct job *j) {
             if (reader < 0) ws_fail(ws, "Cannot start WebSocket reader");
             /* Browser messages and close requests until the reader ends. */
             while (reader >= 0 && !__atomic_load_n(&ws->done, __ATOMIC_ACQUIRE)) {
-                struct n_pollfd peer = {j->input, N_POLLIN, 0};
-                if (poll(&peer, 1, 100) < 0 || (peer.revents & N_POLLHUP)) break;
-                if (!(peer.revents & N_POLLIN)) continue;
+                int ready = input_wait(j, 100);
+                if (ready < 0) break;
+                if (!ready) continue;
                 struct webnet_wire_socket record;
-                if (!read_all(j->input, &record, sizeof record) || record.length > SIZE_MAX - 2 ||
+                if (!read_all(j, &record, sizeof record) || record.length > SIZE_MAX - 2 ||
                     (record.magic != WEBNET_SOCKET_MESSAGE && record.magic != WEBNET_SOCKET_CLOSE)) break;
                 size_t n = (size_t)record.length;
                 unsigned char *data = malloc(n + 2);
-                if (!data || !read_all(j->input, data + 2, n)) { free(data); break; }
+                if (!data || !read_all(j, data + 2, n)) { free(data); break; }
                 ns_engine_lock(&ws->engine);
                 bool sent = true;
                 if (record.magic == WEBNET_SOCKET_MESSAGE) {
@@ -1842,13 +1827,19 @@ static bool run_websocket(struct job *j) {
     free(http_url); free(ws->in); free(ws->message); free(ws);
     return !j->error[0];
 }
-static int run_one(int input,int output) {
+static void job_free_io(struct job *j) {
+    if(j->events>=0)n_handle_close(j->events);
+    webnet_wire_in_free(&j->in);
+}
+static int run_one(n_handle input,n_handle output) {
     struct job *j = calloc(1, sizeof *j);
     if (!j) return 1;
     j->input=input;j->output=output;j->output_credit=WEBNET_SERVICE_WINDOW;
+    j->events=n_events_create();
+    if(j->events<0||n_events_watch(j->events,input,N_EVENT_RECEIVABLE|N_EVENT_CLOSED,0)<0){job_free_io(j);free(j);return 1;}
     struct webnet_wire_request *w = &j->wire;
     size_t payload_size;
-    if (!read_all(input, w, sizeof *w) || w->magic != WEBNET_MAGIC || w->kind > WEBNET_WEBSOCKET ||
+    if (!read_all(j, w, sizeof *w) || w->magic != WEBNET_MAGIC || w->kind > WEBNET_WEBSOCKET ||
         !w->url_len || w->url_len > webnet_wire_url_limit(w->user_navigation) || w->origin_len > webnet_wire_url_limit(w->user_navigation) ||
         !w->method_len || w->headers_len > webnet_wire_request_header_limit(w->user_navigation) || w->body_len > WEBNET_BODY_LIMIT ||
         w->credentials>WEBNET_CREDENTIALS_INCLUDE || (w->user_navigation & ~WEBNET_WIRE_REQUEST_FLAGS) || w->cookie_len>WEBCOOKIE_SNAPSHOT_MAX ||
@@ -1861,24 +1852,24 @@ static int run_one(int input,int output) {
          ((w->kind != WEBNET_RESOURCE && w->kind != WEBNET_CLASSIC && w->kind != WEBNET_MODULE &&
            w->kind != WEBNET_NAVIGATION) || !(w->user_navigation & WEBNET_WIRE_STATUS_LINE))) ||
         ((w->user_navigation & (WEBNET_WIRE_STREAM|WEBNET_WIRE_REFERRER)) && w->kind != WEBNET_FETCH) ||
-        ((input==output)!=((w->user_navigation&WEBNET_WIRE_SERVICE)!=0))) { free(j); return 1; }
+        ((input==output)!=((w->user_navigation&WEBNET_WIRE_SERVICE)!=0))) { job_free_io(j); free(j); return 1; }
     bool socket = w->kind == WEBNET_WEBSOCKET, socket_ran = false;
     struct webnet_wire_referrer ref={0};
     struct webnet_wire_top_level top={0};
     uint64_t extended_size=payload_size;
     if(w->user_navigation&WEBNET_WIRE_REFERRER){
         if(!job_read_all(j,&ref,sizeof ref)||ref.policy>WEBNET_REFERRER_UNSAFE||ref.length>webnet_wire_url_limit(w->user_navigation)||
-           (uint64_t)payload_size+ref.length+sizeof ref>SIZE_MAX-7){free(j);return 1;}
+           (uint64_t)payload_size+ref.length+sizeof ref>SIZE_MAX-7){job_free_io(j);free(j);return 1;}
         j->referrer_policy=(int)ref.policy;
         extended_size+=(uint64_t)ref.length+sizeof ref;
     }
     if(w->user_navigation&WEBNET_WIRE_TOP_LEVEL){
         if(!job_read_all(j,&top,sizeof top)||top.reserved||top.length>webnet_wire_url_limit(w->user_navigation)){
-            free(j);return 1;
+            job_free_io(j);free(j);return 1;
         }
         extended_size+=(uint64_t)top.length+sizeof top;
     }
-    if(extended_size>SIZE_MAX-8){free(j);return 1;}
+    if(extended_size>SIZE_MAX-8){job_free_io(j);free(j);return 1;}
     j->url = read_string(j,w->url_len, false); j->document = read_string(j,w->origin_len, false);
     if(w->user_navigation&WEBNET_WIRE_REFERRER)j->referrer=read_string(j,ref.length,false);
     if(w->user_navigation&WEBNET_WIRE_TOP_LEVEL)j->top_level_url=read_string(j,top.length,false);
@@ -1953,7 +1944,7 @@ static int run_one(int input,int output) {
         ok = socket_ran && !j->error[0];
         if (!socket_ran) {
             struct webnet_wire_socket record = {WEBNET_SOCKET_ERROR, 0, strlen(j->error)};
-            if (write_all(output, &record, sizeof record)) write_all(output, j->error, record.length);
+            if (write_all(j, &record, sizeof record)) write_all(j, j->error, record.length);
         }
     } else {
     struct webnet_wire_response out = {0};
@@ -1972,44 +1963,53 @@ static int run_one(int input,int output) {
     free(j->origin); free(j->target_origin);free(j->final_url);free(j->referrer);free(j->referrer_origin);
     free(j->top_level_url);free(j->top_origin);
     free(j->url); free(j->document); free(j->method); free(j->headers); free(j->request_body); free(j->body); free(j->response_headers); free(j->cookie_events); free(j->non_simple); free(j->outgoing.p);
-    free(j->partition);free(j->cache_body.p);cache_free(j->cached);webcookie_free(j->cookies); free(j);
+    free(j->partition);free(j->cache_body.p);cache_free(j->cached);webcookie_free(j->cookies); job_free_io(j); free(j);
     return ok ? 0 : 1;
 }
 /* Each duplex request channel has its own lifetime and byte-credit window.
    Pausing one stream therefore cannot block another request's completion. */
 /* One thread per open channel; long-lived WebSockets never take the place
    of fetches, so channels are a list, not a fixed table. */
-struct service_slot { struct service_slot *next;int tid,fd;volatile uint32_t done; };
+struct service_slot { struct service_slot *next;int tid;n_handle channel;volatile uint32_t done; };
 static void service_request(void *opaque) {
     struct service_slot *s=opaque;
     /* Setup waits own a thread-local reference to this request channel. Never
        keep it across slot reuse, including a failed initial registration. */
-    if(net_set_setup_cancel_channel(s->fd)==0)run_one(s->fd,s->fd);
+    if(net_set_setup_cancel_channel(s->channel)==0)run_one(s->channel,s->channel);
     net_set_setup_cancel_channel(-1);
-    close(s->fd);
+    n_handle_close(s->channel);
     __atomic_store_n(&s->done,1,__ATOMIC_RELEASE);wake_address(&s->done,0);
 }
 int main(int argc,char **argv) {
     if(argc!=2||strcmp(argv[1],"--service"))return run_one(0,1);
+    /* Handle 0 is the browser's listener. The service ends with the browser. */
+    n_handle events=n_events_create();
+    if(events<0||n_events_watch(events,0,N_EVENT_RECEIVABLE,0)<0)return 1;
+    n_handle parent=n_app_open(n_app_parent());
+    if(parent>=0&&n_events_watch(events,parent,N_EVENT_APP_ENDED,1)<0)return 1;
     struct service_slot *slots=NULL;
-    for(;;){
+    for(bool running=true;running;){
         for(struct service_slot **at=&slots;*at;){
             struct service_slot *s=*at;
             if(__atomic_load_n(&s->done,__ATOMIC_ACQUIRE)){thread_join(s->tid);*at=s->next;free(s);}
             else at=&s->next;
         }
-        struct n_pollfd listener={0,N_POLLIN,0};
-        if(poll(&listener,1,100)<0)break;
-        if(listener.revents&N_POLLHUP)break;
-        if(!(listener.revents&N_POLLIN))continue;
-        int fd=n_channel_accept(0);
-        if(fd<0){if(errno==EAGAIN||errno==EINTR)continue;break;}
-        struct service_slot *slot=calloc(1,sizeof *slot);
-        if(!slot){close(fd);continue;}
-        slot->fd=fd;
-        slot->tid=thread_create(service_request,slot);
-        if(slot->tid<0){close(fd);free(slot);continue;}
-        slot->next=slots;slots=slot;
+        /* The timeout only reclaims finished request threads. */
+        struct n_event reports[2];
+        n_result got=n_events_wait(events,reports,2,100);
+        if(got<0)break;
+        for(n_result i=0;i<got;i++)if(reports[i].token==1)running=false;
+        while(running){
+            n_handle channel=n_channel_accept(0);
+            if(channel==-N_ERR_NOT_READY)break;
+            if(channel<0){running=false;break;}
+            struct service_slot *slot=calloc(1,sizeof *slot);
+            if(!slot){n_handle_close(channel);continue;}
+            slot->channel=channel;
+            slot->tid=thread_create(service_request,slot);
+            if(slot->tid<0){n_handle_close(channel);free(slot);continue;}
+            slot->next=slots;slots=slot;
+        }
     }
     __atomic_store_n(&service_stopping,1,__ATOMIC_RELEASE);
     while(slots){struct service_slot *s=slots;slots=s->next;thread_join(s->tid);free(s);}

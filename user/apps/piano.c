@@ -249,8 +249,8 @@ int main(void) {
         bool active = any_voice();
         if (redraw) {
             draw(win);
-        } else if (uptime_ms() - last_scope >= 33 || active != was_active) {
-            last_scope = uptime_ms();
+        } else if (n_clock_uptime_ms() - last_scope >= 33 || active != was_active) {
+            last_scope = n_clock_uptime_ms();
             if (!active) memset(scope, 0, sizeof scope);
             draw_scope(&win->c);
             win_update_rect(win, W - 250, 14, 236, 64);

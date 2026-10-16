@@ -15,6 +15,7 @@
 #include "dev/fb.h"
 #include "dev/gpu.h"
 #include "dev/audio.h"
+#include "dev/entropy.h"
 #include "gui/wm.h"
 #include "abi.h"
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
@@ -1232,13 +1233,14 @@ static int64_t sys_channel_receive(int h, void *ubuf, size_t cap, int flags, int
     if (uattached && !user_ok_w(uattached, sizeof *uattached)) return -N_ERR_BAD_ADDRESS;
     struct file *f = getfd_ref(h);
     if (!f) return -N_ERR_NO_HANDLE;
-    bool wait = flags & N_CHANNEL_WAIT, peek = flags & N_CHANNEL_PEEK;
+    bool wait = flags & N_CHANNEL_WAIT, peek = flags & N_CHANNEL_PEEK, discard = flags & N_CHANNEL_DISCARD;
+    if (flags & ~(N_CHANNEL_WAIT | N_CHANNEL_PEEK | N_CHANNEL_DISCARD) || (peek && discard)) { vfs_close(f); return -N_ERR_INVALID; }
     int64_t r;
     struct file *att = NULL;
     if (message_channel_is(f)) {
-        r = message_channel_receive(f, ubuf, cap, wait, peek, &att);
+        r = message_channel_receive(f, ubuf, cap, wait, peek, discard, &att);
     } else if (byte_channel(f)) {
-        if (peek) r = -N_ERR_UNSUPPORTED;
+        if (peek || discard) r = -N_ERR_UNSUPPORTED;
         else if (!cap) r = 0;
         else {
             uint64_t irq = irq_save();
@@ -1429,6 +1431,20 @@ static int64_t sys_audio_volume(int64_t percent) {
     if (percent > 100) return -N_ERR_INVALID;
     if (percent >= 0) audio_set_volume((int)percent);
     return audio_volume();
+}
+
+/* Fills the buffer from the kernel's entropy pool in pieces, each copied out
+   under the user-memory check. */
+static int64_t sys_random(void *ubuf, size_t n) {
+    uint8_t piece[256];
+    for (size_t done = 0; done < n;) {
+        size_t k = MIN(n - done, sizeof piece);
+        entropy_get(piece, k);
+        if (copy_to_user((uint8_t *)ubuf + done, piece, k) < 0) { memset(piece, 0, sizeof piece); return -N_ERR_BAD_ADDRESS; }
+        done += k;
+    }
+    memset(piece, 0, sizeof piece);
+    return (int64_t)n;
 }
 
 static struct file *events_ref(int q, int64_t *error) {
@@ -1761,6 +1777,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_AUDIO_SUBMIT: ret = sys_audio_submit((int)a, (const void *)b, c, (uint32_t)d); break;
     case SYS_AUDIO_STATUS: ret = sys_audio_status((int)a, (struct n_audio_status *)b); break;
     case SYS_AUDIO_VOLUME: ret = sys_audio_volume((int64_t)a); break;
+    case SYS_RANDOM: ret = sys_random((void *)a, b); break;
     default:
         if (r->rax >= SYS_WIN_CREATE && r->rax < SYS_NET_INFO) ret = wm_syscall((int)r->rax, a, b, c, d, e);
         else if (r->rax >= SYS_NET_INFO && r->rax < SYS_NET_LIMIT) ret = net_syscall((int)r->rax, a, b, c, d, e);

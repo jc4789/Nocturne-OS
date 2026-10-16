@@ -326,8 +326,8 @@ int main(int argc, char **argv) {
         pump();
         if (redraw || playing != was_playing || cur != was_cur) {
             draw();
-        } else if (playing && uptime_ms() - last >= 40) {
-            last = uptime_ms();
+        } else if (playing && n_clock_uptime_ms() - last >= 40) {
+            last = n_clock_uptime_ms();
             draw_scope(&win->c);
             draw_seek(&win->c);
             win_update_rect(win, 0, 70, W, SEEK_Y + 16 - 70);

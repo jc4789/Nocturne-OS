@@ -143,15 +143,15 @@ static void draw(window_t *w) {
 }
 
 int main(void) {
-    srand((unsigned)uptime_ms());
+    srand((unsigned)n_clock_uptime_ms());
     window_t *w = win_open(W, H, "Tetris", 0);
     if (!w) return 1;
     reset();
-    uint64_t next = uptime_ms() + 800;
+    uint64_t next = n_clock_uptime_ms() + 800;
     for (;;) {
         int delay = 800 - (level - 1) * 70;
         if (delay < 90) delay = 90;
-        int64_t wait = (int64_t)(next - uptime_ms());
+        int64_t wait = (int64_t)(next - n_clock_uptime_ms());
         struct gui_event e;
         int r = win_event(w, &e, wait > 0 ? (int)wait : 0);
         if (r < 0) break;
@@ -189,14 +189,14 @@ int main(void) {
                         score += 2;
                     }
                     lock_piece();
-                    next = uptime_ms() + delay;
+                    next = n_clock_uptime_ms() + delay;
                 }
             }
             draw(w);
             win_update(w);
             continue;
         }
-        next = uptime_ms() + delay;
+        next = n_clock_uptime_ms() + delay;
         if (!over && !paused) {
             if (fits(cur, rot, px, py + 1)) py++;
             else lock_piece();

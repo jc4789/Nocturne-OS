@@ -219,15 +219,17 @@ int64_t events_wait(struct file *queue, struct n_event *uout, size_t max, int64_
             if (t->due < next_due) next_due = t->due;
             at = &t->next;
         }
-        for (struct event_watch *w = q->watches; w && n < max; w = w->queue_next) {
-            uint32_t ready = watch_ready(w);
-            if (ready) out[n++] = (struct n_event){.token = w->token, .events = ready};
-            else if (block) vfs_poll_file(&wait, w->file);
-        }
+        /* A memory-word event is reported once; handles stay ready and are
+           reported again, so many ready handles never hold one back. */
         if (q->addresses && n < max) {
             size_t got = address_watch_take(q->addresses, tokens, max - n);
             for (size_t i = 0; i < got; i++) out[n++] = (struct n_event){.token = tokens[i], .events = N_EVENT_ADDRESS};
             if (!got && block) vfs_poll_register(&wait, q->addresses);
+        }
+        for (struct event_watch *w = q->watches; w && n < max; w = w->queue_next) {
+            uint32_t ready = watch_ready(w);
+            if (ready) out[n++] = (struct n_event){.token = w->token, .events = ready};
+            else if (block) vfs_poll_file(&wait, w->file);
         }
         if (block) vfs_poll_register(&wait, queue->vn);
         bool expired = timeout_ms > 0 && now >= deadline;

@@ -18,7 +18,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include <time.h>
 #include "nocturne.h"
 #include "http.h"
@@ -72,59 +71,60 @@ static void redact(char *s) {
     for (char *p = strstr(s, cf.key); p; p = strstr(p, cf.key)) memset(p, '*', kl);
 }
 
-static char *read_text(const char *path, size_t *len) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return NULL;
-    struct n_stat st;
-    if (fstat(fd, &st) < 0 || st.type != N_FT_FILE) {
-        close(fd);
-        errno = EISDIR;
+/* why the latest document or folder operation failed, for messages */
+static n_result fs_error;
+
+static char *read_text(const char *name, size_t *len) {
+    char path[512];
+    n_result r = n_path_complete(name, path, sizeof path);
+    n_handle h = r < 0 ? (n_handle)r : n_document_open(path, N_DOCUMENT_READ);
+    if (h < 0) {
+        fs_error = h;
         return NULL;
     }
-    char *buf = malloc(st.size + 1);
+    r = n_document_size(h);
+    char *buf = r >= 0 && (uint64_t)r < SIZE_MAX ? malloc((size_t)r + 1) : NULL;
     if (!buf) {
-        close(fd);
-        errno = ENOMEM;
+        n_handle_close(h);
+        fs_error = r < 0 ? r : -N_ERR_NO_MEMORY;
         return NULL;
     }
-    size_t got = 0;
-    while (got < st.size) {
-        ssize_t n = read(fd, buf + got, st.size - got);
-        if (n <= 0) break;
-        got += (size_t)n;
+    size_t size = (size_t)r, got = 0;
+    while (got < size && (r = n_document_read_at(h, got, buf + got, size - got)) > 0) got += (size_t)r;
+    n_handle_close(h);
+    if (r < 0) {
+        free(buf);
+        fs_error = r;
+        return NULL;
     }
-    close(fd);
     buf[got] = 0;
     if (len) *len = got;
     return buf;
 }
 
-/* mkdir -p for the directory part of path */
+/* create every missing folder above the document at the complete path */
 static void make_parents(const char *path) {
     char tmp[512];
     strlcpy(tmp, path, sizeof tmp);
     for (char *p = tmp + 1; *p; p++) {
         if (*p != '/') continue;
         *p = 0;
-        mkdir(tmp);
+        n_folder_create(tmp);
         *p = '/';
     }
 }
 
-static int write_text(const char *path, const char *data, size_t len) {
-    make_parents(path);
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
-    if (fd < 0) return -1;
-    size_t done = 0;
-    while (done < len) {
-        ssize_t n = write(fd, data + done, len - done);
-        if (n <= 0) {
-            close(fd);
-            return -1;
-        }
-        done += (size_t)n;
+static int write_text(const char *name, const char *data, size_t len) {
+    char path[512];
+    n_result r = n_path_complete(name, path, sizeof path);
+    if (r >= 0) {
+        make_parents(path);
+        r = n_document_save(path, data, len);
     }
-    close(fd);
+    if (r < 0) {
+        fs_error = r;
+        return -1;
+    }
     return 0;
 }
 
@@ -188,7 +188,7 @@ static void conf_save(const char *path) {
               cf.vision ? 1 : 0);
     if (cf.reasoning[0]) jb_printf(&b, "reasoning=%s\n", cf.reasoning);
     if (!b.oom && write_text(path, b.s, b.len) == 0) say(C_DIM "saved settings to %s" C_RESET "\n", path);
-    else say(C_ERR "could not write %s: %s" C_RESET "\n", path, strerror(errno));
+    else say(C_ERR "could not write %s: %s" C_RESET "\n", path, n_result_text(fs_error));
     memset(b.s, 0, b.len);
     jb_free(&b);
 }
@@ -240,8 +240,8 @@ static char *build_system_prompt(void) {
     free(sys);
     time_t now = time(NULL);
     struct tm *tm = gmtime(&now);
-    char cwd[256];
-    getcwd(cwd, sizeof cwd);
+    char cwd[512];
+    if (n_path_complete(".", cwd, sizeof cwd) < 0) strlcpy(cwd, "/", sizeof cwd);
     struct n_sysinfo si;
     sysinfo(&si);
     jb_printf(&b,
@@ -267,7 +267,6 @@ static void save_session(void) {
         jb_puts(&b, i + 1 < nmsgs ? ",\n" : "\n");
     }
     jb_puts(&b, "]\n");
-    mkdir(AGENT_DIR);
     if (!b.oom) write_text(SESSION_PATH, b.s, b.len);
     jb_free(&b);
 }
@@ -419,47 +418,74 @@ static void tool_run(struct json *args, struct jbuf *out) {
     int timeout = (int)json_getnum(args, "timeout", 60);
     if (timeout < 1) timeout = 1;
     if (timeout > 600) timeout = 600;
-    int in_p[2], out_p[2];
-    if (pipe(in_p) < 0 || pipe(out_p) < 0) {
-        jb_printf(out, "error: pipe: %s", strerror(errno));
+    n_handle input[2] = {-1, -1}, output[2] = {-1, -1}, queue = n_events_create();
+    n_result r = queue;
+    if (r >= 0) r = n_channel_pair(input);
+    if (r >= 0) r = n_channel_pair(output);
+    if (r >= 0) r = n_events_watch(queue, output[0], N_EVENT_RECEIVABLE | N_EVENT_CLOSED, 1);
+    if (r < 0) {
+        n_handle all[] = {queue, input[0], input[1], output[0], output[1]};
+        for (size_t i = 0; i < sizeof all / sizeof *all; i++)
+            if (all[i] >= 0) n_handle_close(all[i]);
+        jb_printf(out, "error: channel: %s", n_result_text(r));
         return;
     }
-    close(in_p[1]); /* the command sees end-of-file on stdin */
-    int fdmap[3] = {in_p[0], out_p[1], out_p[1]};
-    char *argv[] = {"sh", "-c", (char *)cmd, NULL};
-    int pid = spawn("/bin/sh", argv, fdmap, 0);
-    close(in_p[0]);
-    close(out_p[1]);
-    if (pid < 0) {
-        close(out_p[0]);
-        jb_printf(out, "error: cannot start the shell: %s", strerror(errno));
+    n_handle_close(input[1]); /* the command finds its input already at the end */
+    /* the command runs in the agent's folder; its output and log both come back here */
+    char folder[520] = "FOLDER=";
+    if (n_path_complete(".", folder + 7, sizeof folder - 7) < 0) strlcpy(folder + 7, "/", sizeof folder - 7);
+    const char *arguments[] = {"sh", "-c", cmd}, *settings[] = {folder};
+    int32_t handles[] = {input[0], output[1], output[1]};
+    struct n_launch launch = {.arguments = arguments, .settings = settings, .handles = handles,
+                              .argument_count = 3, .setting_count = 1, .handle_count = 3};
+    n_handle app = n_app_launch("/bin/sh", &launch);
+    n_handle_close(input[0]);
+    n_handle_close(output[1]);
+    if (app < 0) {
+        n_handle_close(output[0]);
+        n_handle_close(queue);
+        jb_printf(out, "error: cannot start the shell: %s", n_result_text(app));
         return;
     }
     struct outcap *c = calloc(1, sizeof *c);
-    uint64_t deadline = uptime_ms() + (uint64_t)timeout * 1000;
+    uint64_t deadline = n_clock_uptime_ms() + (uint64_t)timeout * 1000;
     bool timed_out = false;
-    char buf[4096];
+    uint8_t *message = NULL;
+    size_t message_cap = 0;
     for (;;) {
-        int64_t left = (int64_t)(deadline - uptime_ms());
+        int64_t left = (int64_t)(deadline - n_clock_uptime_ms());
         if (left <= 0) {
             timed_out = true;
             break;
         }
-        struct n_pollfd pf = {out_p[0], N_POLLIN, 0};
-        int r = poll(&pf, 1, (int)MIN(left, 500));
-        if (r < 0) break;
-        if (r == 0) continue;
-        ssize_t n = read(out_p[0], buf, sizeof buf);
-        if (n <= 0) break; /* every writer closed: the command finished */
-        cap_add(c, buf, (size_t)n);
+        n_result size = n_channel_receive(output[0], NULL, 0, N_CHANNEL_PEEK, NULL);
+        if (size == -N_ERR_NOT_READY) {
+            struct n_event event;
+            if (n_events_wait(queue, &event, 1, MIN(left, 500)) < 0) break;
+            continue;
+        }
+        if (size < 0) break; /* every writer has gone: the command finished */
+        if ((size_t)size > message_cap) {
+            uint8_t *grown = realloc(message, (size_t)size);
+            if (!grown) break;
+            message = grown;
+            message_cap = (size_t)size;
+        }
+        size = n_channel_receive(output[0], message, message_cap, 0, NULL);
+        if (size < 0) break;
+        if (c) cap_add(c, (const char *)message, (size_t)size);
     }
-    if (timed_out) killtree(pid, 1);
-    close(out_p[0]);
+    free(message);
+    if (timed_out) n_app_stop(app, N_APP_STOP_TREE);
+    n_handle_close(output[0]);
+    n_handle_close(queue);
     int status = 0;
-    waitpid(pid, &status, 0);
+    n_app_result(app, -1, &status);
+    n_handle_close(app);
     struct jbuf body;
     jb_init(&body);
-    cap_finish(c, &body);
+    if (c) cap_finish(c, &body);
+    else jb_puts(&body, "[output not kept: out of memory]\n");
     free(c);
     body.len = strip_ansi(body.s ? body.s : (char *)"", body.len);
     if (timed_out) jb_printf(out, "[killed after %d s timeout]\n", timeout);
@@ -478,7 +504,7 @@ static void tool_read(struct json *args, struct jbuf *out) {
     size_t len;
     char *text = read_text(path, &len);
     if (!text) {
-        jb_printf(out, "error: %s: %s", path, strerror(errno));
+        jb_printf(out, "error: %s: %s", path, n_result_text(fs_error));
         return;
     }
     if (memchr(text, 0, len)) {
@@ -521,7 +547,7 @@ static void tool_write(struct json *args, struct jbuf *out) {
         jb_puts(out, "error: needs path and content");
         return;
     }
-    if (write_text(path, content->str, content->len) < 0) jb_printf(out, "error: %s: %s", path, strerror(errno));
+    if (write_text(path, content->str, content->len) < 0) jb_printf(out, "error: %s: %s", path, n_result_text(fs_error));
     else jb_printf(out, "wrote %zu bytes to %s", content->len, path);
 }
 
@@ -536,7 +562,7 @@ static void tool_edit(struct json *args, struct jbuf *out) {
     size_t len;
     char *text = read_text(path, &len);
     if (!text) {
-        jb_printf(out, "error: %s: %s", path, strerror(errno));
+        jb_printf(out, "error: %s: %s", path, n_result_text(fs_error));
         return;
     }
     int count = 0;
@@ -558,7 +584,7 @@ static void tool_edit(struct json *args, struct jbuf *out) {
             if (!replace_all) break;
         }
         jb_puts(&nb, p);
-        if (nb.oom || write_text(path, nb.s, nb.len) < 0) jb_printf(out, "error: writing %s: %s", path, strerror(errno));
+        if (nb.oom || write_text(path, nb.s, nb.len) < 0) jb_printf(out, "error: writing %s: %s", path, n_result_text(fs_error));
         else jb_printf(out, "replaced %d occurrence%s in %s", replace_all ? count : 1, (replace_all ? count : 1) == 1 ? "" : "s", path);
         jb_free(&nb);
     }
@@ -568,23 +594,25 @@ static void tool_edit(struct json *args, struct jbuf *out) {
 static void tool_list(struct json *args, struct jbuf *out) {
     const char *path = json_getstr(args, "path");
     if (!path) path = ".";
-    int fd = open(path, O_RDONLY | O_DIRECTORY);
-    if (fd < 0) {
-        jb_printf(out, "error: %s: %s", path, strerror(errno));
+    char full[512];
+    struct n_entry *entries = NULL;
+    n_result count = n_path_complete(path, full, sizeof full);
+    if (count >= 0) count = n_folder_entries(full, &entries);
+    if (count < 0) {
+        jb_printf(out, "error: %s: %s", path, n_result_text(count));
         return;
     }
-    struct n_dirent d;
-    int i = 0;
-    for (; readdir(fd, i, &d) > 0; i++) {
-        if (d.type == N_FT_DIR) jb_printf(out, "dir   %s/\n", d.name);
-        else jb_printf(out, "file  %s  (%lu bytes)\n", d.name, (unsigned long)d.size);
+    for (n_result i = 0; i < count; i++) {
+        const struct n_entry *e = &entries[i];
+        if (e->kind == N_KIND_FOLDER) jb_printf(out, "dir   %s/\n", e->name);
+        else jb_printf(out, "file  %s  (%llu bytes)\n", e->name, (unsigned long long)e->size);
         if (out->len > TOOL_OUT_MAX) {
             jb_puts(out, "[... truncated]\n");
             break;
         }
     }
-    close(fd);
-    if (!i) jb_puts(out, "(empty directory)");
+    free(entries);
+    if (!count) jb_puts(out, "(empty directory)");
 }
 
 static void tool_fetch(struct json *args, struct jbuf *out) {
@@ -611,7 +639,7 @@ static char *pending_image;
 
 static void tool_screenshot(struct json *args, struct jbuf *out) {
     int delay = (int)json_getnum(args, "delay", 0);
-    if (delay > 0) sleep((unsigned)MIN(delay, 30));
+    if (delay > 0) n_sleep_ms((uint64_t)MIN(delay, 30) * 1000);
     int w, h;
     uint32_t *px = NULL;
     if (screen_grab(NULL, 0, &w, &h) == 0) px = malloc((size_t)w * (size_t)h * 4);
@@ -979,7 +1007,7 @@ static int model_step(const char *system) {
         if (attempt) {
             int wait = attempt * attempt * 3;
             say(C_DIM "retrying in %d s..." C_RESET "\n", wait);
-            sleep((unsigned)wait);
+            n_sleep_ms((uint64_t)wait * 1000);
         }
         if (st) stream_free(st);
         free(st);
@@ -1034,7 +1062,7 @@ static int model_step(const char *system) {
     for (int i = 0; i < st->ncalls; i++) {
         struct call *c = &st->calls[i];
         if (!c->name[0]) continue;
-        if (!c->id[0]) snprintf(c->id, sizeof c->id, "call_%d_%lu", i, (unsigned long)uptime_ms());
+        if (!c->id[0]) snprintf(c->id, sizeof c->id, "call_%d_%lu", i, (unsigned long)n_clock_uptime_ms());
         jb_puts(&m, ncalls ? "," : ",\"tool_calls\":[");
         jb_puts(&m, "{\"id\":");
         jb_str(&m, c->id);
@@ -1216,11 +1244,10 @@ int main(int argc, char **argv) {
     conf_load(conf_path);
     if (model) strlcpy(cf.model, model, sizeof cf.model);
 
-    struct n_stat st;
-    if (stat("/data", &st) < 0) mkdir("/data");
-    mkdir(AGENT_DIR);
+    n_folder_create("/data"); /* N_ERR_EXISTS when the disk is there */
+    n_folder_create(AGENT_DIR);
     if (!cf.key[0]) {
-        if (!isatty(0)) {
+        if (!n_terminal(0)) {
             fprintf(stderr, "agent: no api_key in %s\n", conf_path);
             return 1;
         }

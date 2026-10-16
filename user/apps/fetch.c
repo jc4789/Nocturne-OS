@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
                           .on_body = to_file,
                           .ctx = f};
     struct http_resp rs;
-    uint64_t t0 = uptime_ms();
+    uint64_t t0 = n_clock_uptime_ms();
     int r = http_request(&rq, &rs);
     if (f != stdout) fclose(f);
     else fflush(stdout);
@@ -59,7 +59,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (rs.status >= 400 && !show_headers) fprintf(stderr, "fetch: HTTP status %d\n", rs.status);
-    uint64_t ms = uptime_ms() - t0;
+    uint64_t ms = n_clock_uptime_ms() - t0;
     if (out) fprintf(stderr, "%zu bytes in %lu ms\n", rs.body_len, (unsigned long)ms);
     return rs.status >= 200 && rs.status < 400 ? 0 : 1;
 }

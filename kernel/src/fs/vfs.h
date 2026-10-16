@@ -177,7 +177,7 @@ int channel_accept(struct file *listener,struct file **server);
 int message_channel_pair(struct file **a, struct file **b);
 bool message_channel_is(struct file *f);
 int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct file *attach);
-int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wait, bool peek,
+int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wait, bool peek, bool discard,
                                 struct file **attached);
 
 /* initrd */

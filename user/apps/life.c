@@ -88,13 +88,13 @@ static void draw(window_t *w) {
 }
 
 int main(void) {
-    srand((unsigned)uptime_ms());
+    srand((unsigned)n_clock_uptime_ms());
     window_t *w = win_open(W, H, "Game of Life", 0);
     if (!w) return 1;
     gun();
-    uint64_t next = uptime_ms();
+    uint64_t next = n_clock_uptime_ms();
     for (;;) {
-        int64_t wait = (int64_t)(next - uptime_ms());
+        int64_t wait = (int64_t)(next - n_clock_uptime_ms());
         struct gui_event e;
         int r = win_event(w, &e, running ? (wait > 0 ? (int)wait : 0) : -1);
         if (r < 0) break;
@@ -128,7 +128,7 @@ int main(void) {
             win_update(w);
             continue;
         }
-        next = uptime_ms() + speed;
+        next = n_clock_uptime_ms() + speed;
         step();
         draw(w);
         win_update(w);

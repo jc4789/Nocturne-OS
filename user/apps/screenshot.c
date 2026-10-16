@@ -23,7 +23,7 @@ int main(int argc, char **argv) {
         strftime(name, sizeof name, "/home/screenshot-%H%M%S.png", localtime(&t));
         path = name;
     }
-    if (delay > 0) sleep((unsigned)delay);
+    if (delay > 0) n_sleep_ms((uint64_t)delay * 1000);
     int w, h;
     uint32_t *px = NULL;
     if (screen_grab(NULL, 0, &w, &h) == 0) px = malloc((size_t)w * (size_t)h * 4);

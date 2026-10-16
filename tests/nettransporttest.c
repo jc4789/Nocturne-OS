@@ -140,12 +140,18 @@ static void setup_worker(void *opaque) {
     }
     net_set_setup_cancel_channel(-1);
 }
+static bool channel_ends(int *peer,int *local) {
+    n_handle ends[2];if(n_channel_pair(ends)<0){*peer=*local=-1;return false;}
+    *peer=ends[0];*local=ends[1];return true;
+}
+static bool peer_closed(int h) {
+    n_handle q=n_events_create();struct n_event e={0};
+    bool closed=q>=0&&n_events_watch(q,h,N_EVENT_CLOSED,1)>=0&&n_events_wait(q,&e,1,0)==1;
+    if(q>=0)n_handle_close(q);return closed;
+}
 static void setup_cancellation(void) {
-    char key[64];snprintf(key,sizeof key,"nettransport-setup-%d",getpid());
-    int listener=n_channel_listen(key);check(listener>=0,"setup cancellation channel listener");if(listener<0)return;
     for(unsigned mode=0;mode<3;mode++) {
-        int peer=n_channel_connect(key),local=peer>=0?n_channel_accept(listener):-1;
-        int other_peer=n_channel_connect(key),other_local=other_peer>=0?n_channel_accept(listener):-1;
+        int peer,local,other_peer,other_local;channel_ends(&peer,&local);channel_ends(&other_peer,&other_local);
         if(local<0 || other_local<0){check(false,"setup cancellation channel pair");if(peer>=0)close(peer);if(local>=0)close(local);if(other_peer>=0)close(other_peer);if(other_local>=0)close(other_local);continue;}
         struct setup_case test={.fd=local,.mode=(int)mode,.result=0,.error=0,.dns_status=N_DNS_OK};
         int tid=thread_create(setup_worker,&test);check(tid>=0,"create setup cancellation worker");
@@ -162,22 +168,22 @@ static void setup_cancellation(void) {
         }
         if(peer>=0)close(peer);close(local);close(other_local);close(other_peer);
     }
-    int exit_peer=n_channel_connect(key),exit_local=exit_peer>=0?n_channel_accept(listener):-1;
+    int exit_peer,exit_local;channel_ends(&exit_peer,&exit_local);
     if(exit_local>=0) {
         struct setup_case test={.fd=exit_local,.mode=3};int tid=thread_create(setup_worker,&test);
         if(tid>=0) {
             while(!load_flag(&test.entered))yield();close(exit_local);exit_local=-1;
-            struct n_pollfd peer_state={exit_peer,N_POLLIN,0};poll(&peer_state,1,0);
-            check(!(peer_state.revents&N_POLLHUP),"setup context retains endpoint after descriptor close");
-            set_flag(&test.release);thread_join(tid);peer_state.revents=0;poll(&peer_state,1,0);
-            check((peer_state.revents&N_POLLHUP)!=0,"native thread exit releases its setup context endpoint");
+            bool held=!peer_closed(exit_peer);
+            check(held,"setup context retains endpoint after descriptor close");
+            set_flag(&test.release);thread_join(tid);
+            check(peer_closed(exit_peer),"native thread exit releases its setup context endpoint");
         } else check(false,"create setup scope exit worker");
     } else check(false,"setup scope exit fixture");
     if(exit_local>=0)close(exit_local);if(exit_peer>=0)close(exit_peer);
     /* Cancelling a setup scope must not poison an established wire, including
        a wire shared by independent HTTP/2 streams. */
     int established=tcp_connect(HOST,(uint16_t)tcp_port,2000);
-    int peer=n_channel_connect(key),local=peer>=0?n_channel_accept(listener):-1;
+    int peer,local;channel_ends(&peer,&local);
     if(established>=0 && local>=0) {
         check(net_set_setup_cancel_channel(local)==0,"install calling-thread setup scope");close(peer);peer=-1;
         uint32_t address;errno=0;
@@ -190,7 +196,7 @@ static void setup_cancellation(void) {
         check(net_set_setup_cancel_channel(-1)==0 && net_resolve("localhost",&address)==0 && address==0x7f000001,
               "clearing setup context releases cancellation for later work");
     } else check(false,"established transport cancellation fixture");
-    if(established>=0)tcp_close(established);if(local>=0)close(local);if(peer>=0)close(peer);close(listener);
+    if(established>=0)tcp_close(established);if(local>=0)close(local);if(peer>=0)close(peer);
 }
 struct close_case {int socket,error;long result;volatile uint32_t entered;uint8_t bytes[32];};
 static void waiting_receiver(void *opaque) {

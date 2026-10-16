@@ -3,7 +3,7 @@
 int main(void) {
     printf("Good night!\n");
     fflush(stdout);
-    msleep(300);
+    n_sleep_ms(300);
     poweroff();
     return 1;
 }

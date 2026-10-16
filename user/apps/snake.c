@@ -92,15 +92,15 @@ static void draw(window_t *w) {
 }
 
 int main(void) {
-    srand((unsigned)uptime_ms());
+    srand((unsigned)n_clock_uptime_ms());
     window_t *w = win_open(W, H, "Snake", 0);
     if (!w) return 1;
     reset();
-    uint64_t next = uptime_ms();
+    uint64_t next = n_clock_uptime_ms();
     for (;;) {
         int speed = 130 - (score / 50) * 8;
         if (speed < 55) speed = 55;
-        int64_t wait = (int64_t)(next - uptime_ms());
+        int64_t wait = (int64_t)(next - n_clock_uptime_ms());
         struct gui_event e;
         int r = win_event(w, &e, wait > 0 ? (int)wait : 0);
         if (r < 0) break;
@@ -120,7 +120,7 @@ int main(void) {
             }
             continue;
         }
-        next = uptime_ms() + speed;
+        next = n_clock_uptime_ms() + speed;
         if (!dead && !paused) step();
         draw(w);
         win_update(w);

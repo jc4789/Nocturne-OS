@@ -1,4 +1,7 @@
-/* Nocturne native pipe worker: page-fetch bytes only, no FFmpeg URL protocol. */
+/* Nocturne native MSE worker: page-fetch bytes only, no FFmpeg URL protocol.
+ * It is launched with no input, output or log: handle 3 is the control
+ * channel (one command in, one response out), handle 4 the VIDEO channel
+ * (headers out; new shared pages travel attached). */
 #include "media_mse_worker_private.h"
 #include "media_video_private.h"
 #include "media_alloc_private.h"
@@ -7,12 +10,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <limits.h>
-#include <errno.h>
-#include <sys/mman.h>
-static bool exact(int fd,void *bytes,size_t size,bool writing){
-    size_t at=0;while(at<size){ssize_t n=writing?write(fd,(uint8_t *)bytes+at,size-at):read(fd,(uint8_t *)bytes+at,size-at);
-        if(n<0&&errno==EINTR)continue;if(n<=0)return false;at+=(size_t)n;}return true;
-}
+#define CONTROL 3
+#define VIDEO 4
 
 struct child_slot {nmedia_mse *buffer;struct nmedia_output pending;uint64_t published_revision,reported_decoded,reported_dropped;struct nmedia_info published_info;bool published,published_key_waiting;};
 struct video_storage {
@@ -24,11 +23,10 @@ struct video_storage {
  * alive until the receiver returns it, even across APPEND/seek/drop. */
 struct video_tx {
     struct nmsw_video header;
-    struct video_storage *storage,*retired;uint64_t storage_id;size_t position;
+    struct video_storage *storage,*retired;uint64_t storage_id,sent_id;
     bool pending,horizon_valid;
     int64_t horizon_pts;
 };
-static int video_fd=-1;
 static unsigned video_storage_used(const struct video_storage *s){
     unsigned used=0;
     if(s)for(unsigned i=0;i<NMSW_VIDEO_SLOTS;i++)used+=__atomic_load_n(&s->shared->occupied[i],__ATOMIC_ACQUIRE)!=0;
@@ -48,7 +46,7 @@ static bool video_full(const struct video_tx *v){
     }return false;
 }
 static void video_storage_free(struct video_storage *s){
-    if(!s)return;if(s->shared)munmap(s->shared,s->bytes);if(s->fd>=0)close(s->fd);nmedia_ff_free(s);
+    if(!s)return;if(s->shared)n_memory_release(s->shared,s->bytes);if(s->fd>=0)n_handle_close(s->fd);nmedia_ff_free(s);
 }
 static void video_collect(struct video_tx *v){
     struct video_storage **link=&v->retired;
@@ -75,44 +73,19 @@ static bool video_publish(struct video_tx *v,const struct nmedia_output *o,uint3
         uint8_t *pixels=(uint8_t *)(s->shared+1)+(size_t)slot*s->capacity;
         memcpy(pixels,o->pixels,bytes);
         __atomic_store_n(&s->shared->occupied[slot],1,__ATOMIC_RELEASE);
-        v->header.shared_fd=s->fd;v->header.buffer_slot=slot;
+        v->header.buffer_slot=slot;
         v->header.shared_capacity=s->capacity;v->header.shared_id=s->id;
-        v->pending=true;v->position=0;return true;
+        v->pending=true;return true;
     }return false;
 }
+/* At most NMSW_VIDEO_SLOTS headers wait in the parent's queue, so the send
+   never waits. The storage's handle travels with its first header. */
 static bool video_send(struct video_tx *v){
-    while(v->pending){
-        size_t total=sizeof v->header;
-        const uint8_t *src=(const uint8_t *)&v->header+v->position;
-        size_t nbytes=total-v->position;
-        ssize_t n=write(video_fd,src,nbytes);
-        if(n<0&&errno==EINTR)continue;
-        if(n<0&&errno==EAGAIN)return true;
-        if(n<=0)return false;
-        v->position+=(size_t)n;
-        if(v->position==total){v->pending=false;v->position=0;}
-    }return true;
-}
-static bool command_wait(struct video_tx *v){
-    while(v->pending){
-        struct n_pollfd p[2]={{0,N_POLLIN,0},{video_fd,N_POLLOUT,0}};
-        if(poll(p,2,-1)<0){if(errno==EINTR)continue;return false;}
-        /* Control/input demand wins over a backpressured header write. */
-        if(p[0].revents&N_POLLIN)return true;
-        if(p[0].revents&N_POLLHUP)return false;
-        if(p[1].revents&N_POLLHUP)return false;
-        if((p[1].revents&N_POLLOUT)&&!video_send(v))return false;
-    }return true;
-}
-static bool video_setup(void){
-    /* spawn only maps descriptors 0..2. Duplicate the VIDEO endpoint, then
-       restore stderr to null: FFmpeg/native diagnostics cannot become pixels. */
-    video_fd=dup(2);if(video_fd<0)return false;
-    int nullfd=open("/dev/null",O_WRONLY);
-    if(nullfd<0){close(video_fd);video_fd=-1;return false;}
-    int result=dup2(nullfd,2);close(nullfd);
-    if(result<0||fcntl(video_fd,F_SETFL,O_NONBLOCK)<0){close(video_fd);video_fd=-1;return false;}
-    return true;
+    if(!v->pending)return true;
+    bool fresh=v->header.shared_id!=v->sent_id;
+    v->header.attached=fresh;
+    if(n_channel_send(VIDEO,&v->header,sizeof v->header,fresh?v->storage->fd:-1)<0)return false;
+    v->sent_id=v->header.shared_id;v->pending=false;return true;
 }
 static bool slots_reserve(struct child_slot **slots,size_t *count,size_t *capacity,size_t wanted){
     if(wanted>*capacity){size_t n=*capacity?*capacity:4;while(n<wanted){if(n>SIZE_MAX/sizeof **slots/2){n=wanted;break;}n*=2;}
@@ -156,38 +129,49 @@ static bool metadata(struct child_slot *slots,size_t count,struct nmsw_response 
 }
 int main(void){
     if(!nmedia_alloc_restrict_worker())return 1;
-    bool video_ok=video_setup();struct video_tx video={0};
-    struct child_slot *slots=NULL;size_t count=0,capacity=0,meta_capacity=0;uint8_t *meta=NULL;
+    struct video_tx video={0};
+    struct child_slot *slots=NULL;size_t count=0,capacity=0,meta_capacity=0,out_capacity=0;uint8_t *meta=NULL,*out=NULL;
     uint32_t generation=0,sequence=0;bool established=false,enabled[2]={true,true};
     int64_t video_delivered_pts=0;bool video_delivered=false;
     uint8_t *keys=NULL;size_t key_bytes=0;
     int16_t pcm_batch[4096*2];
     for(;;){
-        if(!command_wait(&video))break;
         video_collect(&video);
         /* Commit the image horizon only after a complete shared-slot header
            is available to the receiver. Its immutable raster was published
            first; a partially written header cannot release seconds of PCM. */
         if(!video.pending&&video.horizon_valid){video_delivered=true;video_delivered_pts=video.horizon_pts;video.horizon_valid=false;}
-        struct nmsw_command c;if(!exact(0,&c,sizeof c,false))break;
-        if(c.magic!=NMSW_MAGIC||c.reserved||c.slot>INT32_MAX||c.flags>1||c.op<NMSW_ADD||c.op>NMSW_KEYS||c.current<0||c.current>1000000000000LL||
+        /* One message: the command, then its bytes. The bytes become this
+           child's own block; without room for them only the command is read. */
+        struct nmsw_command c;
+        n_result size=n_channel_receive(CONTROL,NULL,0,N_CHANNEL_WAIT|N_CHANNEL_PEEK,NULL);
+        if(size<(n_result)sizeof c||(uint64_t)size-sizeof c>UINT32_MAX)break;
+        uint8_t *bytes=NULL;bool starved=false;
+        if(size==(n_result)sizeof c){if(n_channel_receive(CONTROL,&c,sizeof c,0,NULL)!=size)break;}
+        else if((bytes=nmedia_ff_malloc((size_t)size+1))){
+            if(n_channel_receive(CONTROL,bytes,(size_t)size,0,NULL)!=size){nmedia_ff_free(bytes);break;}
+            memcpy(&c,bytes,sizeof c);
+        }else{if(n_channel_receive(CONTROL,&c,sizeof c,N_CHANNEL_DISCARD,NULL)!=size)break;starved=true;}
+        if(c.magic!=NMSW_MAGIC||c.reserved||c.bytes!=(uint64_t)size-sizeof c||c.slot>INT32_MAX||c.flags>1||c.op<NMSW_ADD||c.op>NMSW_KEYS||c.current<0||c.current>1000000000000LL||
            (c.bytes&&c.op!=NMSW_ADD&&c.op!=NMSW_CHANGE&&c.op!=NMSW_APPEND&&c.op!=NMSW_KEYS)||
-           (established&&(c.generation!=generation||c.sequence!=sequence+1)))break;
+           (established&&(c.generation!=generation||c.sequence!=sequence+1))){nmedia_ff_free(bytes);break;}
+        if(bytes){
+            /* The parser takes the block as its staging input from offset 0;
+               the moved-from tail held a copy of the bytes (keys, too). */
+            memmove(bytes,bytes+sizeof c,c.bytes);memset(bytes+c.bytes,0,sizeof c+1);
+        }
         generation=c.generation;sequence=c.sequence;established=true;
         struct nmsw_response r={.magic=NMSW_MAGIC,.op=c.op,.generation=generation,.sequence=sequence};
         bool ok=true;unsigned slot=c.slot;nmedia_mse *m=slot<count?slots[slot].buffer:NULL;struct nmedia_output output={0};
         uint64_t before_revision=nmedia_mse_revision(m);const struct nmedia_info *before_info=nmedia_mse_info(m);
         bool video_mutation=before_info&&before_info->video;
-        if(!video_ok){r.kind=NMEDIA_ERROR;strlcpy(r.error,"MSE VIDEO descriptor setup failed",sizeof r.error);exact(1,&r,sizeof r,true);break;}
-        uint8_t *bytes=NULL;if(c.bytes){bytes=nmedia_ff_malloc((size_t)c.bytes+1);if(!bytes){
-                uint8_t drain[4096];size_t left=c.bytes;while(left){size_t n=MIN(left,sizeof drain);if(!exact(0,drain,n,false))goto shutdown;left-=n;}
-                struct nmedia_alloc_stats stats;nmedia_alloc_snapshot(&stats);
-                r.kind=NMEDIA_ERROR;r.quota_error=1;
-                snprintf(r.error,sizeof r.error,"MSE child append %s: request %zu charged %zu limit %zu",
-                    stats.last_failure==NMEDIA_ALLOC_BACKEND_OOM?"backend OOM":"allocation quota",
-                    (size_t)c.bytes+1,stats.current,stats.limit);goto response;
-            }
-            if(!exact(0,bytes,c.bytes,false)){nmedia_ff_free(bytes);break;}bytes[c.bytes]=0;}
+        if(starved){
+            struct nmedia_alloc_stats stats;nmedia_alloc_snapshot(&stats);
+            r.kind=NMEDIA_ERROR;r.quota_error=1;
+            snprintf(r.error,sizeof r.error,"MSE child append %s: request %zu charged %zu limit %zu",
+                stats.last_failure==NMEDIA_ALLOC_BACKEND_OOM?"backend OOM":"allocation quota",
+                (size_t)size+1,stats.current,stats.limit);goto response;
+        }
         if(c.op==NMSW_ADD||c.op==NMSW_CHANGE){
             uint64_t revision=nmedia_mse_revision(m);
             if(!bytes||!c.bytes||c.bytes>=256||memchr(bytes,0,c.bytes)){ok=false;strlcpy(r.error,"invalid MSE MIME wire",sizeof r.error);}
@@ -316,13 +300,21 @@ response:
             else{r.decoded_frames+=(uint32_t)dd;r.dropped_frames+=(uint32_t)dr;}
             slots[i].reported_decoded=decoded;slots[i].reported_dropped=dropped;}
         if(!metadata(slots,count,&r,&meta,&meta_capacity)){r.kind=NMEDIA_ERROR;r.payload_bytes=0;r.metadata_count=r.metadata_bytes=0;r.quota_error=1;strlcpy(r.error,"MSE metadata size/allocation failure",sizeof r.error);}
-        if(!exact(1,&r,sizeof r,true)||(r.metadata_bytes&&!exact(1,meta,r.metadata_bytes,true)))break;
-        if(r.payload_bytes&&!exact(1,(void *)(output.kind==NMEDIA_AUDIO?(const void *)output.samples:(const void *)output.pixels),r.payload_bytes,true))break;
-        if(!video_send(&video))break;
+        /* One response message: the response, metadata, then PCM. VIDEO
+           never rides here; its header follows on its own lane. */
+        if(r.payload_bytes&&output.kind!=NMEDIA_AUDIO){r.kind=NMEDIA_ERROR;r.payload_bytes=0;strlcpy(r.error,"MSE payload without PCM",sizeof r.error);}
+        size_t total=sizeof r+(size_t)r.metadata_bytes+r.payload_bytes;
+        if(total>out_capacity){uint8_t *grown=nmedia_ff_realloc(out,total);if(grown){out=grown;out_capacity=total;}
+            else{r.kind=NMEDIA_ERROR;r.payload_bytes=0;r.metadata_count=r.metadata_bytes=0;r.quota_error=1;strlcpy(r.error,"MSE response allocation failure",sizeof r.error);total=sizeof r;}}
+        n_result sent;
+        if(total==sizeof r)sent=n_channel_send(CONTROL,&r,sizeof r,-1);
+        else{memcpy(out,&r,sizeof r);memcpy(out+sizeof r,meta,r.metadata_bytes);
+            if(r.payload_bytes)memcpy(out+sizeof r+r.metadata_bytes,output.samples,r.payload_bytes);
+            sent=n_channel_send(CONTROL,out,total,-1);}
+        if(sent<0||!video_send(&video))break;
     }
-shutdown:
     {volatile uint8_t *wipe=keys;for(size_t i=0;i<key_bytes;i++)wipe[i]=0;}nmedia_ff_free(keys);
-    for(size_t i=0;i<count;i++)nmedia_mse_close(slots[i].buffer);nmedia_ff_free(slots);nmedia_ff_free(meta);
+    for(size_t i=0;i<count;i++)nmedia_mse_close(slots[i].buffer);nmedia_ff_free(slots);nmedia_ff_free(meta);nmedia_ff_free(out);
     video_storage_free(video.storage);while(video.retired){struct video_storage *s=video.retired;video.retired=s->next;video_storage_free(s);}
-    if(video_fd>=0)close(video_fd);return 0;
+    return 0;
 }

@@ -2,6 +2,7 @@
 #pragma once
 #include "webnet.h"
 #include "webcookie.h"
+#include "nocturne.h"
 #define WEBNET_MAGIC 0x574e4554u
 /* Preserve the 64-byte request layout used by persisted statically-linked apps.
    Legacy user_navigation 0/1 remains valid; new flags use reserved bits. */
@@ -151,3 +152,16 @@ _Static_assert(sizeof(struct webnet_wire_response)==48,"webfetch response framin
 #define WEBNET_SOCKET_ERROR   0x574e5704u
 struct webnet_wire_socket { uint32_t magic, code; uint64_t length; };
 _Static_assert(sizeof(struct webnet_wire_socket)==16,"webfetch socket framing");
+/* A request or socket channel carries the wire as messages: each send is one
+   piece of it, of any length, and the receiver reads the pieces in order.
+   (A byte channel, such as a legacy caller's input, fills the same buffer.) */
+#define WEBNET_WIRE_IN_MIN 4096u
+struct webnet_wire_in { unsigned char *bytes; size_t length, at, capacity; };
+/* Up to n bytes into dest: their count, 0 when nothing has arrived (or with
+   N_CHANNEL_WAIT, only when an empty piece arrived), or a negative n_result,
+   N_ERR_CLOSED once the sender has gone and every piece was read. */
+n_result webnet_wire_read(n_handle h, struct webnet_wire_in *in, void *dest, size_t n, int flags);
+void webnet_wire_in_free(struct webnet_wire_in *in);
+/* All n bytes: one message on a message channel, written whole on a byte
+   channel. n, or a negative n_result. */
+n_result webnet_wire_write(n_handle h, const void *data, size_t n);

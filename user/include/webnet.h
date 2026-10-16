@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include "http.h"
+#include "nocturne.h"
 
 /* Body lengths are uint32_t on the native worker wire; storage grows lazily. */
 #define WEBNET_BODY_LIMIT ((size_t)UINT32_MAX)
@@ -158,10 +159,13 @@ void webnet_pump(webnet *, uint64_t now_ms);
    webnet_pump. Safe at an author's native checkpoint; never recursively pumps. */
 void webnet_service(webnet *,uint64_t now_ms);
 int webnet_timeout(const webnet *, uint64_t now_ms); /* -1 idle, otherwise next deadline */
-/* Wait on native GUI readiness and all unpaused request channels in one poll.
-   aux_fd (or -1) is one more readable descriptor, such as Atomics.waitAsync
-   notifications. No callbacks, no DOM access. Caller consumes queued GUI events beforehand. */
-int webnet_wait(webnet *,int event_fd,int aux_fd,int timeout_ms);
+/* Wait on the caller's event queue, where webnet keeps watches of its
+   unpaused transports (tokens with top byte 0x57; the caller's own watches,
+   such as its window, use others). The wait ends no later than the pump's
+   next deadline. Every report (at most max) is returned to the caller, which
+   hands on those that are not webnet's; their count, or a negative n_result.
+   No callbacks, no DOM access. Caller consumes queued GUI events beforehand. */
+int webnet_wait(webnet *,n_handle queue,int timeout_ms,struct n_event *events,size_t max);
 bool webnet_busy(const webnet *);
 /* Diagnostics: live request transports, excluding queued/retained responses.
    The persistent worker itself is owned until webnet_free. */

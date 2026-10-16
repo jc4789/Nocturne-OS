@@ -1,15 +1,21 @@
 /* Browser-side, nonblocking Nocturne native dedicated-worker transport. */
 #include "js_worker.h"
 #include "js_worker_wire.h"
+#include "js_atomics.h"
 #include <nocturne.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include <stdio.h>
-struct packet {struct packet *next;struct njw_header h;size_t at;uint8_t *data;};
+/* One record is one channel message: data keeps room for the header in front
+ * of the payload, so a send is a single message without another copy. */
+struct packet {struct packet *next;struct njw_header h;uint8_t *data;};
 struct resource {struct resource *next;uint32_t id;};
 #include "js_worker_port_lifetime.h"
-struct child {struct child *next,*shared_next;web_workers *owner;char *name,*creator_policy,*url,*origin;size_t name_len;uint32_t id,generation,parent_port;int pid,in,out,creator_referrer_policy;bool started,stopped,closing,inherit_policy,shared,isolated;struct packet *tx,*tail;struct broker_pair *ports;struct resource *resources;struct njw_header rx;size_t head_at,data_at,rx_charge;uint8_t *data;};
+/* channel carries both directions; app is a dedicated worker's own task (a
+ * shared server outlives its creator and is not held). watched: the channel
+ * is in the page's wait queue, so a record wakes the page without a timer. */
+struct child {struct child *next,*shared_next;web_workers *owner;char *name,*creator_policy,*url,*origin;size_t name_len;uint32_t id,generation,parent_port;n_handle app,channel;int64_t task;int creator_referrer_policy;bool started,stopped,closing,inherit_policy,shared,isolated,watched;struct packet *tx,*tail;struct broker_pair *ports;struct resource *resources;};
+#define WEB_WORKER_TOKEN (UINT64_C(0x4a) << 56)
 struct shared_ref {struct shared_ref *next;struct child *child;};
 struct event {struct event *next;uint32_t id;struct njw_header h;uint8_t *data;bool from_child;};
 struct web_workers {struct web_workers *next;JSContext *ctx;JSValue callback;uint32_t generation;web_worker_loader load;web_worker_requester request;web_worker_canceler cancel;void *opaque;char *creator_policy,*origin;int creator_referrer_policy;bool isolated;web_worker_reporter reporter;void *report_opaque;struct child *children;struct shared_ref *shared;struct event *events,*last;size_t queued;uint32_t next_lease;struct broker_lease *leases;};
@@ -22,7 +28,7 @@ static void broker_packet_free(void *opaque){struct packet *p=opaque;if(p){free(
 static size_t broker_free(struct broker_pair *p){size_t released=0;while(p){struct broker_pair *n=p->next;struct packet*a=p->held_close,*b=p->held_ack;if(a)released+=sizeof a->h+a->h.bytes;if(b)released+=sizeof b->h+b->h.bytes;broker_packet_free(a);broker_packet_free(b);free(p);p=n;}return released;}
 static bool broker_metadata(JSContext *ctx,struct child *c,JSValueConst value,unsigned creator,struct broker_pair **result){return worker_port_metadata(ctx,value,creator,c->ports,creator?UINT32_MAX:c->parent_port,result);}
 static char *policy_copy(const char *headers){size_t n=strlen(headers?headers:"");if(n==SIZE_MAX)return NULL;char *copy=malloc(n+1);if(copy)memcpy(copy,headers?headers:"",n+1);return copy;}
-static void child_free(struct child *c){if(c){struct child **at=&shared_children;while(*at&&*at!=c)at=&(*at)->shared_next;if(*at)*at=c->shared_next;for(web_workers*w=managers;w;w=w->next){struct shared_ref**p=&w->shared;while(*p){if((*p)->child==c){struct shared_ref*r=*p;*p=r->next;free(r);}else p=&(*p)->next;}}while(c->resources){struct resource*r=c->resources;c->resources=r->next;free(r);}free(c->creator_policy);free(c->name);free(c->url);free(c->origin);free(c);}}
+static void child_free(struct child *c){if(c){struct child **at=&shared_children;while(*at&&*at!=c)at=&(*at)->shared_next;if(*at)*at=c->shared_next;for(web_workers*w=managers;w;w=w->next){struct shared_ref**p=&w->shared;while(*p){if((*p)->child==c){struct shared_ref*r=*p;*p=r->next;free(r);}else p=&(*p)->next;}}while(c->resources){struct resource*r=c->resources;c->resources=r->next;free(r);}if(c->app>=0)n_handle_close(c->app);free(c->creator_policy);free(c->name);free(c->url);free(c->origin);free(c);}}
 static bool resource_field(JSContext *ctx,JSValueConst record,uint32_t index,JSValue value){
     if(JS_IsException(value))return false;
     /* Resource completion is not an author-JS task. Bypass prototype setters. */
@@ -30,7 +36,19 @@ static bool resource_field(JSContext *ctx,JSValueConst record,uint32_t index,JSV
 }
 static struct child *retired;
 static unsigned active_children;
-void web_worker_background(void){struct child **p=&retired;while(*p){struct child *r=*p;int n=waitpid(r->pid,NULL,WNOHANG);if(n==r->pid||(n<0&&errno==ECHILD)){*p=r->next;child_free(r);if(active_children)active_children--;}else p=&r->next;}}
+/* True once a dedicated worker's task has ended; its handle is then released. */
+static bool child_ended(struct child *c,int *status){
+    if(c->app<0)return true;if(n_app_result(c->app,0,status)==-N_ERR_NOT_READY)return false;
+    n_handle_close(c->app);c->app=-1;if(active_children)active_children--;return true;
+}
+void web_worker_background(void){struct child **p=&retired;while(*p){struct child *r=*p;if(child_ended(r,NULL)){*p=r->next;child_free(r);}else p=&r->next;}}
+/* Whether a record sent now would be queued at once (or find the peer gone):
+ * the page task never waits on a busy worker. One private probe queue. */
+static bool channel_sendable(n_handle h){
+    static n_handle probe=-1;if(probe<0&&(probe=n_events_create())<0)return false;
+    if(n_events_watch(probe,h,N_EVENT_SENDABLE|N_EVENT_CLOSED,1)<0)return false;
+    struct n_event e;n_result ready=n_events_wait(probe,&e,1,0);n_events_unwatch(probe,1);return ready>0;
+}
 int64_t web_worker_background_deadline(uint64_t now){return retired?(int64_t)now+10:-1;}
 static struct child *find(web_workers *w,uint32_t id){for(struct child *c=w->children;c;c=c->next)if(c->id==id)return c;for(struct shared_ref*r=w->shared;r;r=r->next)if(r->child->id==id)return r->child;return NULL;}
 static bool queue_room(const web_workers *w,size_t length){return length<=SIZE_MAX-sizeof(struct njw_header)&&length+sizeof(struct njw_header)<=SIZE_MAX-w->queued;}
@@ -39,15 +57,15 @@ static void stop(web_workers *w,struct child *c){
     w=c->owner;
     if(c->stopped)return;c->stopped=true;
     if(w->cancel)w->cancel(w->opaque,c->id,0);
-    if(c->in>=0)close(c->in);if(c->out>=0&&c->out!=c->in)close(c->out);c->in=c->out=-1;
-    if(c->pid>0){kill(c->pid);int n=waitpid(c->pid,NULL,WNOHANG);if(n==c->pid||(n<0&&errno==ECHILD)){if(active_children)active_children--;c->pid=0;}}
-    while(c->tx){struct packet *p=c->tx;c->tx=p->next;release_packet(w,p);}c->tail=NULL;free(c->data);c->data=NULL;w->queued-=c->rx_charge;c->rx_charge=0;c->head_at=c->data_at=0;
+    if(c->channel>=0)n_handle_close(c->channel);c->channel=-1;c->watched=false;
+    if(c->app>=0){n_app_stop(c->app,0);child_ended(c,NULL);}
+    while(c->tx){struct packet *p=c->tx;c->tx=p->next;release_packet(w,p);}c->tail=NULL;
     w->queued-=broker_free(c->ports);c->ports=NULL;
 }
 static bool queue(web_workers *w,struct child *c,uint32_t op,uint32_t request,uint32_t kind,const void *data,size_t length,bool first){
     w=c->owner;
     if(length>NJW_MAX_BYTES||!queue_room(w,length)||c->stopped)return false;
-    struct packet *p=calloc(1,sizeof *p);if(!p)return false;if(length){p->data=malloc(length);if(!p->data){free(p);return false;}memcpy(p->data,data,length);}
+    struct packet *p=calloc(1,sizeof *p);if(!p)return false;p->data=malloc(sizeof p->h+length);if(!p->data){free(p);return false;}if(length)memcpy(p->data+sizeof p->h,data,length);
     p->h=(struct njw_header){NJW_MAGIC,op,c->generation,request,kind,(uint32_t)length};
     if(first){p->next=c->tx;c->tx=p;if(!c->tail)c->tail=p;}else{if(c->tail)c->tail->next=p;else c->tx=p;c->tail=p;}w->queued+=sizeof p->h+length;return true;
 }
@@ -85,7 +103,7 @@ web_worker_publication *web_worker_prepare_captured(web_workers *w,uint32_t id,u
     }else{JS_ThrowTypeError(ctx,"Invalid Worker port publication");goto fail;}
     size_t length=0;uint8_t *bytes=JS_WriteObject(ctx,&length,value,JS_WRITE_OBJ_REFERENCE);if(!bytes)goto fail;
     if(length>NJW_MAX_BYTES||!queue_room(c->owner,length)){js_free(ctx,bytes);JS_ThrowRangeError(ctx,"Worker port wire accounting overflow");goto fail;}
-    p->data=malloc(length);if(!p->data){js_free(ctx,bytes);JS_ThrowOutOfMemory(ctx);goto fail;}memcpy(p->data,bytes,length);js_free(ctx,bytes);
+    p->data=malloc(sizeof p->h+length);if(!p->data){js_free(ctx,bytes);JS_ThrowOutOfMemory(ctx);goto fail;}memcpy(p->data+sizeof p->h,bytes,length);js_free(ctx,bytes);
     p->h=(struct njw_header){NJW_MAGIC,op,c->generation,request,kind,(uint32_t)length};return t;
 fail:web_worker_abort(t);return NULL;
 }
@@ -121,40 +139,45 @@ static void route_event(web_workers*w,struct child*c,struct event*e){
     if(w->last)w->last->next=e;else w->events=e;w->last=e;
 }
 static void fail(web_workers *w,struct child *c,const char *message){stop(w,c);JSValue v=JS_NewObject(w->ctx);JS_DefinePropertyValueStr(w->ctx,v,"message",JS_NewString(w->ctx,message),JS_PROP_C_W_E);JS_DefinePropertyValueStr(w->ctx,v,"terminal",JS_TRUE,JS_PROP_C_W_E);event(w,c,NJW_ERROR,v);JS_FreeValue(w->ctx,v);}
-/* A dedicated process closed its response pipe: reap it now when possible so
-   the error names its exit status (an abort, a fault or a plain exit). */
+/* A dedicated task closed its channel: take its result now when it has ended
+   so the error names its exit status (an abort, a fault or a plain exit). */
 static void child_exited(web_workers *w,struct child *c){
     int status=0;char message[64]="Worker process exited";
-    if(c->pid&&waitpid(c->pid,&status,WNOHANG)==c->pid){c->pid=0;if(active_children)active_children--;
-        snprintf(message,sizeof message,"Worker process exited (status %d)",status);}
+    if(c->app>=0&&child_ended(c,&status))snprintf(message,sizeof message,"Worker process exited (status %d)",status);
     fail(w,c,message);
 }
 static bool spawn_child(web_workers *w,struct child *c){
     web_worker_background();if(active_children>=NJW_MAX_WORKERS){fail(w,c,"Native Worker process count is not representable");return false;}
-    int ip[2]={-1,-1},op[2]={-1,-1};
-    if(pipe(ip)<0||pipe(op)<0)goto bad;
-    /* The worker reports a runtime abort on the page owner's diagnostic stream. */
-    int map[3]={ip[0],op[1],2};char *argv[]={"browserjsworker",NULL};c->pid=spawn("/bin/browserjsworker",argv,map,0);
-    close(ip[0]);ip[0]=-1;close(op[1]);op[1]=-1;if(c->pid<0){c->pid=0;goto bad;}active_children++;
-    c->in=ip[1];ip[1]=-1;c->out=op[0];op[0]=-1;if(fcntl(c->in,F_SETFL,O_NONBLOCK)<0||fcntl(c->out,F_SETFL,O_NONBLOCK)<0){fail(w,c,"Worker nonblocking pipe setup failed");return false;}
+    n_handle pair[2]={-1,-1};if(n_channel_pair(pair)<0){fail(w,c,"Cannot create native dedicated Worker channel");return false;}
+    /* Records travel both ways on one channel. The worker reports a runtime
+       abort on the page owner's diagnostic stream, else in the system log. */
+    const char *args[]={"browserjsworker"};int32_t handles[]={pair[1],pair[1],2};
+    struct n_launch launch={.arguments=args,.argument_count=1,.handles=handles,.handle_count=3};
+    n_handle app=n_app_launch("/bin/browserjsworker",&launch);
+    if(app==-N_ERR_NO_HANDLE){handles[2]=-1;app=n_app_launch("/bin/browserjsworker",&launch);}
+    n_handle_close(pair[1]);
+    if(app<0){n_handle_close(pair[0]);fail(w,c,"Cannot spawn native dedicated Worker");return false;}
+    c->app=app;c->task=n_app_id(app);c->channel=pair[0];active_children++;
     JSValue log=JS_NewObject(w->ctx);JS_SetPropertyStr(w->ctx,log,"message",JS_NewString(w->ctx,"native dedicated task; heap grows on demand (no configured ceiling)"));event(w,c,NJW_CONSOLE,log);JS_FreeValue(w->ctx,log);return true;
-bad:for(int i=0;i<2;i++){if(ip[i]>=0)close(ip[i]);if(op[i]>=0)close(op[i]);}fail(w,c,"Cannot spawn native dedicated Worker");return false;
 }
-/* Native full-key rendezvous. No filesystem packet persistence, POSIX sockets
- * or hash-only authority. Every returned duplex endpoint has its own queue. */
+/* Native full-key rendezvous. No filesystem packet persistence or hash-only
+ * authority. Every returned duplex endpoint has its own queue. */
 static bool shared_transport(web_workers*w,struct child*c,bool*created){
-    const char*identity_url=c->name_len?"":c->url;size_t a=strlen(c->origin),b=strlen(identity_url),n=c->name_len;
-    if(a>SIZE_MAX-b-96||a+b+96>SIZE_MAX-n||a+b+96+n>SIZE_MAX-n){errno=ENOMEM;return false;}
-    size_t capacity=a+b+96+n*2;char*key=malloc(capacity);if(!key){errno=ENOMEM;return false;}
+    (void)w;const char*identity_url=c->name_len?"":c->url;size_t a=strlen(c->origin),b=strlen(identity_url),n=c->name_len;
+    if(a>SIZE_MAX-b-96||a+b+96>SIZE_MAX-n||a+b+96+n>SIZE_MAX-n)return false;
+    size_t capacity=a+b+96+n*2;char*key=malloc(capacity);if(!key)return false;
     int prefix=snprintf(key,capacity,"Nocturne.SharedWorker:%zu:%s:%zu:%s:%zu:",a,c->origin,b,identity_url,n);
-    if(prefix<0||(size_t)prefix>=capacity){free(key);errno=ENOMEM;return false;}
+    if(prefix<0||(size_t)prefix>=capacity){free(key);return false;}
     static const char hex[]="0123456789abcdef";size_t at=(size_t)prefix;for(size_t i=0;i<n;i++){unsigned v=(unsigned char)c->name[i];key[at++]=hex[v>>4];key[at++]=hex[v&15];}key[at]=0;
-    int listener=n_channel_listen(key);*created=listener>=0;
-    if(listener<0&&errno!=EEXIST){free(key);return false;}
-    if(*created){int nullfd=open("/dev/null",O_WRONLY);if(nullfd<0){close(listener);free(key);return false;}int map[3]={listener,nullfd,nullfd};char*argv[]={"browserjsworker","--shared-server",c->url,NULL};int pid=spawn("/bin/browserjsworker",argv,map,SPAWN_DETACH);close(nullfd);if(pid<0){close(listener);free(key);return false;}}
-    int fd=n_channel_connect(key);if(listener>=0)close(listener);free(key);if(fd<0)return false;
-    c->in=c->out=fd;if(fcntl(fd,F_SETFL,O_NONBLOCK)<0){close(fd);c->in=c->out=-1;return false;}
-    return true;
+    n_handle listener=n_channel_listen(key);*created=listener>=0;
+    if(listener<0&&listener!=-N_ERR_EXISTS){free(key);return false;}
+    /* The server's only handle is its listener: no input, output or log. It
+       ends itself once every connected owner has gone. */
+    if(*created){const char*args[]={"browserjsworker","--shared-server",c->url};const int32_t handles[]={listener};
+        struct n_launch launch={.arguments=args,.argument_count=3,.handles=handles,.handle_count=1};
+        n_handle app=n_app_launch("/bin/browserjsworker",&launch);if(app<0){n_handle_close(listener);free(key);return false;}n_handle_close(app);}
+    n_handle channel=n_channel_connect(key);if(listener>=0)n_handle_close(listener);free(key);if(channel<0)return false;
+    c->channel=channel;return true;
 }
 web_workers *web_worker_new(JSContext *ctx,uint32_t generation,web_worker_loader load,void *opaque){web_workers *w=calloc(1,sizeof *w);if(!w)return NULL;w->ctx=ctx;w->generation=generation;w->callback=JS_UNDEFINED;w->load=load;w->opaque=opaque;w->next=managers;managers=w;return w;}
 bool web_worker_set_policy(web_workers *w,const char *headers,int referrer_policy){if(!w||referrer_policy<0||referrer_policy>8)return false;char *copy=policy_copy(headers);if(!copy)return false;free(w->creator_policy);w->creator_policy=copy;w->creator_referrer_policy=referrer_policy;return true;}
@@ -182,13 +205,13 @@ JSValue web_worker_native(web_workers *w,int argc,JSValueConst *argv){
         }
         struct child*c=calloc(1,sizeof*c);struct shared_ref*ref=op==5?malloc(sizeof*ref):NULL;
         if(!c||(op==5&&!ref)){free(c);free(ref);JS_FreeCString(ctx,url);if(argc>3)JS_FreeCString(ctx,name);return JS_ThrowOutOfMemory(ctx);}
-        if(name_len!=SIZE_MAX)c->name=malloc(name_len+1);
+        c->app=c->channel=-1;if(name_len!=SIZE_MAX)c->name=malloc(name_len+1);
         if(c->name){memcpy(c->name,name,name_len);c->name[name_len]=0;c->name_len=name_len;}
         if(argc>3)JS_FreeCString(ctx,name);
         c->creator_policy=policy_copy(w->creator_policy);c->url=policy_copy(url);c->origin=policy_copy(w->origin);
         c->creator_referrer_policy=w->creator_referrer_policy;
         if(!c->name||!c->creator_policy||!c->url||!c->origin){JS_FreeCString(ctx,url);free(ref);child_free(c);return JS_ThrowOutOfMemory(ctx);}
-        c->shared=op==5;c->owner=w;c->isolated=w->isolated&&op!=5;c->generation=w->generation;c->inherit_policy=!strncasecmp(url,"blob:",5)||!strncasecmp(url,"data:",5)||!strncasecmp(url,"about:",6);c->id=++next_worker_id;c->in=c->out=-1;c->next=w->children;w->children=c;
+        c->shared=op==5;c->owner=w;c->isolated=w->isolated&&op!=5;c->generation=w->generation;c->inherit_policy=!strncasecmp(url,"blob:",5)||!strncasecmp(url,"data:",5)||!strncasecmp(url,"about:",6);c->id=++next_worker_id;c->next=w->children;w->children=c;
         if(c->shared){*ref=(struct shared_ref){w->shared,c};w->shared=ref;c->shared_next=shared_children;shared_children=c;}
         bool created=true,ok=!c->shared||shared_transport(w,c,&created);
         if(ok&&created)ok=w->load&&w->load(w->opaque,c->id,0,url,0);else if(ok)c->started=true;
@@ -196,7 +219,7 @@ JSValue web_worker_native(web_workers *w,int argc,JSValueConst *argv){
     }
     struct child *c=find(w,id);if(!c||c->stopped)return JS_UNDEFINED;
     if(op==4){if(c->parent_port==UINT32_MAX)return JS_ThrowRangeError(ctx,"Worker port identifier space exhausted");return JS_NewUint32(ctx,++c->parent_port);}
-    if(op==2){if(c->shared)return JS_ThrowTypeError(ctx,"SharedWorker has no terminate operation");stop(w,c);if(!c->pid){struct child **at=&w->children;while(*at&&*at!=c)at=&(*at)->next;if(*at)*at=c->next;child_free(c);}return JS_UNDEFINED;}
+    if(op==2){if(c->shared)return JS_ThrowTypeError(ctx,"SharedWorker has no terminate operation");stop(w,c);if(c->app<0){struct child **at=&w->children;while(*at&&*at!=c)at=&(*at)->next;if(*at)*at=c->next;child_free(c);}return JS_UNDEFINED;}
     if(op==1){if(argc<3)return JS_ThrowTypeError(ctx,"Worker message required");if(!serialized(w,c,NJW_MESSAGE,0,0,argv[2],false))return JS_ThrowRangeError(ctx,"Worker message allocation, representation or transport failed");return JS_UNDEFINED;}
     return JS_ThrowTypeError(ctx,"Invalid Worker operation");
 }
@@ -236,21 +259,30 @@ void web_worker_loaded(web_workers *w,uint32_t id,uint32_t request,int status,co
 }
 void web_worker_pump(web_workers *w,uint64_t now){
     (void)now;web_worker_background();if(!w)return;
-    for(struct child *c=w->children;c;c=c->next){size_t budget=16384;if(c->stopped){if(c->pid){int n=waitpid(c->pid,NULL,WNOHANG);if(n==c->pid||(n<0&&errno==ECHILD)){c->pid=0;if(active_children)active_children--;}}continue;}if(!c->started||c->closing)continue;if(!c->shared&&!c->pid&&!spawn_child(w,c))continue;
-        struct n_pollfd p[2]={{c->in,N_POLLOUT,0},{c->out,N_POLLIN,0}};if(poll(p,2,0)<0){fail(w,c,"Worker poll failed");continue;}
-        while(c->tx&&budget&&(p[0].revents&N_POLLOUT)){struct packet *a=c->tx;bool header=a->at<sizeof a->h;size_t left=header?sizeof a->h-a->at:sizeof a->h+a->h.bytes-a->at;size_t take=left<budget?left:budget;const uint8_t *src=header?(uint8_t *)&a->h+a->at:a->data+a->at-sizeof a->h;ssize_t n=write(c->in,src,take);if(n<0&&(errno==EAGAIN||errno==EINTR))break;if(n<=0){fail(w,c,"Worker command pipe closed");break;}a->at+=n;budget-=n;if(a->at==sizeof a->h+a->h.bytes){c->tx=a->next;if(!c->tx)c->tail=NULL;release_packet(w,a);}}
-        while(!c->stopped&&budget&&(p[1].revents&(N_POLLIN|N_POLLHUP))){bool header=c->head_at<sizeof c->rx;
-            /* Read only this tick's finite byte budget. Once the header is
-               complete, reserve its actual size; never allocate a maximum
-               payload in advance or reject a count-based queue quota. */
-            size_t left=header?sizeof c->rx-c->head_at:c->rx.bytes-c->data_at;size_t take=left<budget?left:budget;ssize_t n=read(c->out,header?(void *)((uint8_t *)&c->rx+c->head_at):(void *)(c->data+c->data_at),take);if(n<0&&(errno==EAGAIN||errno==EINTR))break;if(n<=0){child_exited(w,c);break;}budget-=n;
-            if(header){c->head_at+=n;if(c->head_at==sizeof c->rx){bool port=c->rx.op==NJW_PORT_MESSAGE||c->rx.op==NJW_PORT_CLOSE||c->rx.op==NJW_PORT_DRAINED;
-                bool valid_kind=port?c->rx.kind<=1:c->rx.op==NJW_MESSAGE?(c->rx.kind==0||c->rx.kind==NJW_WITH_PORTS):c->rx.op==NJW_LOAD?(njw_load_kind_valid(c->rx.kind)||(c->shared&&!c->rx.request&&!c->rx.kind)):c->rx.op==NJW_CANCEL?c->rx.kind==0&&c->rx.request!=0:c->rx.kind<=2;
-                if(c->rx.magic!=NJW_MAGIC||c->rx.generation!=c->generation||!c->rx.bytes||(c->rx.op!=NJW_MESSAGE&&c->rx.op!=NJW_ERROR&&c->rx.op!=NJW_LOAD&&c->rx.op!=NJW_CANCEL&&c->rx.op!=NJW_CLOSE&&c->rx.op!=NJW_CONSOLE&&c->rx.op!=NJW_CSP_REPORT&&!port)||!valid_kind||!queue_room(w,c->rx.bytes)){fail(w,c,"Invalid Worker response or receive size overflow");break;}c->data=malloc(c->rx.bytes);if(!c->data){fail(w,c,"Worker receive allocation failed");break;}c->rx_charge=sizeof c->rx+c->rx.bytes;w->queued+=c->rx_charge;}}else c->data_at+=n;
-            if(c->head_at==sizeof c->rx&&c->data_at==c->rx.bytes){struct event *e=calloc(1,sizeof *e);if(!e){fail(w,c,"Worker event allocation failed");break;}e->id=c->id;e->h=c->rx;e->data=c->data;e->from_child=true;c->data=NULL;c->head_at=c->data_at=0;c->rx_charge=0;route_event(w,c,e);if(e->h.op==NJW_CLOSE){c->closing=true;break;}}
+    for(struct child *c=w->children;c;c=c->next){size_t budget=16384;if(c->stopped){child_ended(c,NULL);continue;}if(!c->started||c->closing)continue;if(!c->shared&&c->app<0&&!spawn_child(w,c))continue;
+        if(!c->watched){n_handle queue=web_atomics_queue();c->watched=queue>=0&&n_events_watch(queue,c->channel,N_EVENT_RECEIVABLE,WEB_WORKER_TOKEN|c->id)>=0;}
+        while(c->tx&&budget&&channel_sendable(c->channel)){struct packet *a=c->tx;size_t size=sizeof a->h+a->h.bytes;memcpy(a->data,&a->h,sizeof a->h);
+            if(n_channel_send(c->channel,a->data,size,-1)<0){fail(w,c,"Worker command channel closed");break;}
+            budget-=size<budget?size:budget;c->tx=a->next;if(!c->tx)c->tail=NULL;release_packet(w,a);}
+        /* Take records up to this tick's byte budget (at least one). Each is
+           reserved at its actual size; never a maximum payload in advance. */
+        while(!c->stopped&&budget){
+            n_result size=n_channel_receive(c->channel,NULL,0,N_CHANNEL_PEEK,NULL);
+            if(size==-N_ERR_NOT_READY)break;if(size<0){child_exited(w,c);break;}
+            struct njw_header h;size_t bytes=(size_t)size-sizeof h;
+            uint8_t *data=(size_t)size>sizeof h&&bytes<=NJW_MAX_BYTES&&queue_room(w,bytes)?malloc((size_t)size):NULL;
+            if(!data){fail(w,c,"Invalid Worker response, receive size overflow or allocation failure");break;}
+            if(n_channel_receive(c->channel,data,(size_t)size,0,NULL)!=size){free(data);child_exited(w,c);break;}
+            memcpy(&h,data,sizeof h);bool port=h.op==NJW_PORT_MESSAGE||h.op==NJW_PORT_CLOSE||h.op==NJW_PORT_DRAINED;
+            bool valid_kind=port?h.kind<=1:h.op==NJW_MESSAGE?(h.kind==0||h.kind==NJW_WITH_PORTS):h.op==NJW_LOAD?(njw_load_kind_valid(h.kind)||(c->shared&&!h.request&&!h.kind)):h.op==NJW_CANCEL?h.kind==0&&h.request!=0:h.kind<=2;
+            if(h.magic!=NJW_MAGIC||h.generation!=c->generation||h.bytes!=bytes||(h.op!=NJW_MESSAGE&&h.op!=NJW_ERROR&&h.op!=NJW_LOAD&&h.op!=NJW_CANCEL&&h.op!=NJW_CLOSE&&h.op!=NJW_CONSOLE&&h.op!=NJW_CSP_REPORT&&!port)||!valid_kind){free(data);fail(w,c,"Invalid Worker response");break;}
+            memmove(data,data+sizeof h,bytes);budget-=(size_t)size<budget?(size_t)size:budget;
+            struct event *e=calloc(1,sizeof *e);if(!e){free(data);fail(w,c,"Worker event allocation failed");break;}
+            e->id=c->id;e->h=h;e->data=data;e->from_child=true;w->queued+=sizeof h+bytes;route_event(w,c,e);
+            if(h.op==NJW_CLOSE){c->closing=true;if(c->watched)n_events_unwatch(web_atomics_queue(),WEB_WORKER_TOKEN|c->id);c->watched=false;break;}
         }
     }
-    struct child **at=&w->children;while(*at){struct child *c=*at;if(c->stopped&&!c->pid){*at=c->next;child_free(c);}else at=&c->next;}
+    struct child **at=&w->children;while(*at){struct child *c=*at;if(c->stopped&&c->app<0){*at=c->next;child_free(c);}else at=&c->next;}
 }
 bool web_worker_runnable(const web_workers *w){return w&&w->events;}
 static bool console_prefix(JSContext *ctx,JSValueConst value,const struct child *c){
@@ -260,7 +292,7 @@ static bool console_prefix(JSContext *ctx,JSValueConst value,const struct child 
     JS_FreeValue(ctx,message);if(!text)return false;
     /* Only the two representable numeric identifiers are bounded, not the
        author message. Retain the complete UTF-8 span (including embedded NUL). */
-    char prefix[64];int n=c->shared?snprintf(prefix,sizeof prefix,"[SharedWorker %u native service] ",c->id):snprintf(prefix,sizeof prefix,"[Worker %u PID %d] ",c->id,c->pid);
+    char prefix[64];int n=c->shared?snprintf(prefix,sizeof prefix,"[SharedWorker %u native service] ",c->id):snprintf(prefix,sizeof prefix,"[Worker %u app %lld] ",c->id,(long long)c->task);
     if(n<0||(size_t)n>=sizeof prefix||length>SIZE_MAX-(size_t)n-1){
         JS_FreeCString(ctx,text);JS_ThrowRangeError(ctx,"Worker console length is not representable");return false;
     }
@@ -323,7 +355,17 @@ bool web_worker_run_one(web_workers *w){
         JS_FreeValue(ctx,v);
     }}done:free(e->data);free(e);return true;
 }
-int64_t web_worker_deadline(const web_workers *w,uint64_t now){if(!w)return -1;if(w->events)return (int64_t)now;for(struct child *c=w->children;c;c=c->next)if(c->pid||(!c->stopped&&c->started))return (int64_t)now+10;return -1;}
+/* A watched channel wakes the page by itself. Only a record waiting for room,
+ * an unwatched channel or a stopping task are checked again in 10 ms. */
+int64_t web_worker_deadline(const web_workers *w,uint64_t now){
+    if(!w)return -1;if(w->events)return (int64_t)now;int64_t due=-1;
+    for(struct child *c=w->children;c;c=c->next){
+        if(c->stopped){if(c->app>=0)due=(int64_t)now+10;continue;}
+        if(!c->started||c->closing)continue;
+        if(!c->shared&&c->app<0)return (int64_t)now;
+        if(c->tx||!c->watched)due=(int64_t)now+10;
+    }return due;
+}
 void web_worker_free(web_workers *w){
     if(!w)return;web_worker_cancel_captures(w);
     /* Detach only this document's connections; the other owners retain the
@@ -340,12 +382,12 @@ void web_worker_free(web_workers *w){
             if(w->cancel)w->cancel(w->opaque,c->id,0);
             while(c->resources&&!c->stopped){uint32_t id=c->resources->id;web_worker_loaded(w,c->id,id,0,"","",NULL,0,"Worker resource owner navigated");}
             w->children=c->next;c->next=replacement->children;replacement->children=c;
-            size_t charge=c->rx_charge;for(struct packet*p=c->tx;p;p=p->next)charge+=sizeof p->h+p->h.bytes;
+            size_t charge=0;for(struct packet*p=c->tx;p;p=p->next)charge+=sizeof p->h+p->h.bytes;
             for(struct broker_pair*p=c->ports;p;p=p->next){struct packet*a=p->held_close,*b=p->held_ack;if(a)charge+=sizeof a->h+a->h.bytes;if(b)charge+=sizeof b->h+b->h.bytes;}
             w->queued-=charge;replacement->queued+=charge;c->owner=replacement;
             struct event**at=&w->events;while(*at){struct event*e=*at;if(e->id!=c->id){at=&e->next;continue;}*at=e->next;e->next=NULL;w->queued-=sizeof e->h+e->h.bytes;append_event(replacement,e);}w->last=NULL;for(struct event*e=w->events;e;e=e->next)w->last=e;
             if(!c->started&&(!replacement->load||!replacement->load(replacement->opaque,c->id,0,c->url,0)))fail(replacement,c,"SharedWorker source owner replacement failed");
-        }else{w->children=c->next;stop(w,c);if(c->pid){c->next=retired;retired=c;}else child_free(c);}
+        }else{w->children=c->next;stop(w,c);if(c->app>=0){c->next=retired;retired=c;}else child_free(c);}
     }
     /* A retiring non-owner document may hold actual received port packets.
      * Their shared transport survives: discard is consumption too. Return

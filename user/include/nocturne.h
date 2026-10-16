@@ -76,14 +76,6 @@ int n_shared_receive(int owner_pid,long ticket);
 int n_address_watch_queue(void);
 int n_address_watch(int queue,volatile uint32_t *address,uint32_t expected,uint64_t token);
 int n_address_unwatch(int queue,uint64_t token);
-/* Native named rendezvous, not a filesystem or Unix socket namespace.
- * Listen atomically owns key until its last duplicated fd closes (EEXIST).
- * Connect/accept return nonblocking duplex read/write/poll fds; accept with
- * no pending peer fails with EAGAIN. Closing the peer yields EOF/EPIPE/HUP.
- * Key bytes are matched in full; callers must encode their own identity. */
-int n_channel_listen(const char *key);
-int n_channel_connect(const char *key);
-int n_channel_accept(int listener_fd);
 
 /* ---- native ABI (docs/nocturne-native-abi.md) ----
    These return a negative n_result on failure and never touch errno. */
@@ -115,9 +107,18 @@ n_result n_folder_entries(const char *path, struct n_entry **out);
    handle (or -1) that travels with it and arrives as a new handle in *attached. */
 n_result n_channel_pair(n_handle out[2]);
 n_result n_channel_send(n_handle h, const void *data, size_t n, n_handle attach);
-/* N_CHANNEL_WAIT waits; N_CHANNEL_PEEK only reports the next message's size.
+/* N_CHANNEL_WAIT waits; N_CHANNEL_PEEK only reports the next message's size;
+   N_CHANNEL_DISCARD copies at most cap bytes of it, then drops it.
    A message larger than cap stays queued and gives N_ERR_TOO_LARGE. */
 n_result n_channel_receive(n_handle h, void *buf, size_t cap, int flags, n_handle *attached);
+/* Named rendezvous, not a folder or network name: the key bytes are matched in
+   full, so callers put their own identity into it. listen owns the key until
+   its handle closes (N_ERR_EXISTS meanwhile); connect gives a message channel
+   whose other end waits in the listener (N_EVENT_RECEIVABLE) for accept, which
+   without one gives N_ERR_NOT_READY. A listener that closes closes them too. */
+n_handle n_channel_listen(const char *key);
+n_handle n_channel_connect(const char *key);
+n_handle n_channel_accept(n_handle listener);
 /* Apps: the handle reports the end (N_EVENT_APP_ENDED); there is no zombie to reap. */
 n_handle n_app_launch(const char *path, const struct n_launch *launch);
 n_result n_app_result(n_handle app, int64_t timeout_ms, int *status); /* -1 waits; 0 polls */
@@ -147,6 +148,7 @@ n_result n_events_timer(n_handle q, uint64_t ms, bool repeat, uint64_t token);
 n_result n_events_unwatch(n_handle q, uint64_t token); /* 0 unknown, 1 removed, 2 already notified */
 n_result n_events_wait(n_handle q, struct n_event *out, size_t max, int64_t timeout_ms); /* count */
 uint64_t n_clock_uptime_ms(void);
+n_result n_random(void *buf, size_t n); /* n bytes from the system entropy pool */
 int64_t n_clock_wall(void); /* seconds since 1970-01-01 UTC */
 void n_sleep_ms(uint64_t ms);
 /* The launch settings ("name=value"), NULL-terminated. */

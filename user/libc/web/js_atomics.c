@@ -287,23 +287,28 @@ struct async_wait {
     bool notified;
 };
 static struct async_wait *waits, **waits_tail = &waits;
-static int queue_fd = -1;
+static n_handle queue = -1;
 static uint64_t next_token;
+
+n_handle web_atomics_queue(void) {
+    if (queue < 0) { n_handle q = n_events_create(); if (q >= 0) queue = q; }
+    return queue;
+}
 
 static int wait_async(JSContext *ctx, void *opaque, void *address, uint32_t expected,
                       double timeout_ms, JSValueConst resolve) {
     (void)opaque;
-    if (queue_fd < 0 && (queue_fd = n_address_watch_queue()) < 0) {
+    if (web_atomics_queue() < 0) {
         JS_ThrowRangeError(ctx, "Atomics.waitAsync queue could not be created");
         return -1;
     }
     struct async_wait *w = calloc(1, sizeof *w);
     if (!w) { JS_ThrowOutOfMemory(ctx); return -1; }
-    w->token = ++next_token;
-    if (n_address_watch(queue_fd, address, expected, w->token) < 0) {
-        int error = errno;
+    w->token = WEB_ATOMICS_TOKEN | ++next_token;
+    n_result watched = n_events_watch_address(queue, address, expected, w->token);
+    if (watched < 0) {
         free(w);
-        if (error == EAGAIN) return 1;
+        if (watched == -N_ERR_NOT_READY) return 1;
         JS_ThrowRangeError(ctx, "Atomics.waitAsync waiter could not be enrolled");
         return -1;
     }
@@ -327,18 +332,25 @@ void web_atomics_runtime_init(JSRuntime *rt) {
     JS_SetAtomicsWaitAsyncFunc(rt, wait_async, NULL);
 }
 
-int web_atomics_fd(void) { return queue_fd; }
+void web_atomics_events(const struct n_event *events, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        if (!(events[i].events & N_EVENT_ADDRESS)) continue;
+        for (struct async_wait *w = waits; w; w = w->next)
+            if (w->token == events[i].token) { w->notified = true; break; }
+    }
+}
 
-/* Mark notified waiters. The queue reports tokens only; reading never blocks. */
+/* Mark notified waiters without waiting. Memory-word events come first in a
+   report and only once; other watches of a shared queue stay ready, so they
+   are left to their owner's own wait. */
 static void drain(void) {
-    if (queue_fd < 0) return;
-    uint64_t tokens[64];
+    if (queue < 0) return;
+    struct n_event events[64];
     for (;;) {
-        ssize_t n = read(queue_fd, tokens, sizeof tokens);
+        n_result n = n_events_wait(queue, events, 64, 0);
         if (n <= 0) return;
-        for (size_t i = 0; i < (size_t)n / sizeof *tokens; i++)
-            for (struct async_wait *w = waits; w; w = w->next)
-                if (w->token == tokens[i]) { w->notified = true; break; }
+        web_atomics_events(events, (size_t)n);
+        if (n < 64 || !(events[n - 1].events & N_EVENT_ADDRESS)) return;
     }
 }
 
@@ -384,7 +396,7 @@ int web_atomics_run(JSContext *ctx, uint64_t now) {
         if (w->ctx != ctx || (!w->notified && w->deadline > now)) { link = &w->next; continue; }
         bool ok = w->notified;
         /* A notify racing with the timeout already counted this waiter. */
-        if (!ok) ok = n_address_unwatch(queue_fd, w->token) == 2;
+        if (!ok) ok = n_events_unwatch(queue, w->token) == 2;
         unlink_wait(link);
         JSValue value = JS_NewString(ctx, ok ? "ok" : "timed-out");
         JSValue result = JS_Call(ctx, w->resolve, JS_UNDEFINED, 1, (JSValueConst *)&value);
@@ -399,7 +411,7 @@ void web_atomics_release(JSContext *ctx) {
     for (struct async_wait **link = &waits; *link;) {
         struct async_wait *w = *link;
         if (w->ctx != ctx) { link = &w->next; continue; }
-        if (!w->notified) n_address_unwatch(queue_fd, w->token);
+        if (!w->notified) n_events_unwatch(queue, w->token);
         unlink_wait(link);
         JS_FreeValue(ctx, w->resolve);
         free(w);

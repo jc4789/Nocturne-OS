@@ -58,7 +58,7 @@ int main(void) {
         draw(w);
         win_update(w);
         struct gui_event e;
-        int r = win_event(w, &e, 1000 - (int)(uptime_ms() % 1000));
+        int r = win_event(w, &e, 1000 - (int)(n_clock_uptime_ms() % 1000));
         if (r < 0 || (r > 0 && e.type == EV_CLOSE)) break;
         if (r > 0 && e.type == EV_KEY && e.pressed && e.key == NKEY_ESC) break;
     }

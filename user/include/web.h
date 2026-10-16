@@ -14,6 +14,7 @@
 #include <stdbool.h>
 #include "gfx.h"
 #include "abi.h"
+#include "nocturne.h"
 #include "webstorage.h"
 #include "http.h"
 
@@ -218,10 +219,12 @@ int64_t web_media_background_deadline(uint64_t now_ms);
 void web_avmedia_debug(bool enabled);
 /* -1: no deadline, otherwise an absolute uptime_ms() deadline. */
 int64_t web_deadline(web_doc *d);
-/* Readable when an Atomics.waitAsync waiter of this process was notified;
- * -1 before the first waiter. Poll it with the GUI descriptor. */
-int web_wait_fd(void);
-/* Debug summary of the realm waits behind web_wait_fd; 0 when none. */
+/* The event queue the browser's main loop waits on. Atomics.waitAsync waiters
+ * report into it; the loop adds its window and transports with its own tokens
+ * and hands every report it receives to web_wait_events. */
+n_handle web_wait_queue(void);
+void web_wait_events(const struct n_event *events, size_t count);
+/* Debug summary of the realm waits behind web_wait_queue; 0 when none. */
 int web_wait_report(char *out, size_t size);
 void web_resource_loaded(web_doc *d, uint64_t id, const struct web_response *response);
 bool web_dirty(web_doc *d); /* consumes the legacy layout/paint notification */

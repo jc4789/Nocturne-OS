@@ -27,7 +27,7 @@ static const char *f[] = {
 };
 
 int main(void) {
-    srand((unsigned)(uptime_ms() * 2654435761u));
+    srand((unsigned)(n_clock_uptime_ms() * 2654435761u));
     puts(f[rand() % (int)(sizeof f / sizeof f[0])]);
     return 0;
 }

@@ -5,7 +5,6 @@
 #include <js_worker_wire.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include <limits.h>
 #include <webnet.h>
 #include "../libc/web/js_encoding.h"
@@ -20,12 +19,19 @@
 #include "../libc/web/js_navigator_native.h"
 #include "../libc/web/html_policy.h"
 #include "../libc/web/js_html_safety_native.h"
-struct client {struct client *next;int fd;uint32_t generation;size_t references,in_flight;bool established,active,blocked,wants_output;struct njw_header rx;size_t head_at,data_at;uint8_t*data;};
+/* Records travel as channel messages, one record each. A dedicated worker's
+ * page channel is handle CHANNEL; a shared server's CHANNEL is its listener
+ * and every owner page is a client with a channel of its own. All are watched
+ * in one queue with the Atomics.waitAsync memory words. */
+#define CHANNEL 0
+#define INPUT_TOKEN 1u
+#define CLIENT_TOKEN (UINT64_C(0x43) << 56)
+struct client {struct client *next;n_handle channel;uint64_t token;uint32_t generation,watched;size_t references,in_flight;bool established,active,blocked,wants_output,readable;};
 struct pending_load {struct pending_load*next;uint32_t id;struct client*client;};
 struct deferred {struct deferred *next;struct njw_header h;uint8_t *data;struct client*client;bool normalized;};
-struct outgoing {struct outgoing *next;struct njw_header h;size_t at;uint8_t *data;struct client*client;};
+struct outgoing {struct outgoing *next;struct njw_header h;uint8_t *data;struct client*client;};
 struct policy_violation {struct policy_violation *next;JSValue init;struct web_html_policy_rule *rule;};
-struct worker {JSRuntime *rt;JSContext *ctx;JSValue hooks;uint32_t generation,request,interrupt_ticks,next_shared_port;uint64_t until;bool closed,established,output_failed,policy_initialized,shared,had_client,need_start;struct deferred *head,*tail,*before_start,*before_start_tail;struct outgoing *output,*last_output;size_t queued,output_bytes,in_flight;uint32_t next_lease;struct broker_lease *leases;struct broker_pair *ports;struct client*clients,*current_client,*network_client;struct pending_load*loads;struct n_pollfd*pollfds;struct client**pollclients;size_t pollcapacity;const char*script_url;char*security_url;web_doc policy_doc;struct policy_violation *violations,*last_violation;int policy_status;};
+struct worker {JSRuntime *rt;JSContext *ctx;JSValue hooks;uint32_t generation,request,interrupt_ticks,next_shared_port;uint64_t until;bool closed,established,output_failed,policy_initialized,shared,had_client,need_start;struct deferred *head,*tail,*before_start,*before_start_tail;struct outgoing *output,*last_output;size_t queued,output_bytes,in_flight;uint32_t next_lease;struct broker_lease *leases;struct broker_pair *ports;struct client*clients,*current_client,*network_client;struct pending_load*loads;n_handle queue,probe;uint64_t next_client;uint32_t input_watched;const char*script_url;char*security_url;web_doc policy_doc;struct policy_violation *violations,*last_violation;int policy_status;};
 struct output_publication {struct worker *worker;struct outgoing *packet;struct broker_pair *ports,*close_pair,*ack_pair;};
 static void output_link(void *opaque,void *packet){struct worker*w=opaque;struct outgoing*p=packet;size_t charge=sizeof p->h+p->h.bytes;if(p->client)p->client->in_flight+=charge;else w->in_flight+=charge;if(w->last_output)w->last_output->next=p;else w->output=p;w->last_output=p;}
 static void output_packet_free(struct worker*w,void *opaque){struct outgoing*p=opaque;if(p){if(p->client)p->client->references--;js_free(w->ctx,p->data);free(p);}}
@@ -42,15 +48,49 @@ static void output_publish(void *opaque){
 }
 static void shared_disconnect(struct worker*,struct client*);
 static void output_unlink(struct worker*w,struct outgoing**at,struct outgoing*p){*at=p->next;if(w->last_output==p){w->last_output=NULL;for(struct outgoing*q=w->output;q;q=q->next)w->last_output=q;}w->output_bytes-=sizeof p->h+p->h.bytes;output_packet_free(w,p);}
+/* Whether one record can be sent to h now without waiting (or h has gone):
+ * a slow page never holds the worker or another owner's records back. */
+static bool sendable(struct worker*w,n_handle h){
+    if(w->probe<0&&(w->probe=n_events_create())<0)return false;
+    if(n_events_watch(w->probe,h,N_EVENT_SENDABLE|N_EVENT_CLOSED,1)<0)return false;
+    struct n_event e;n_result ready=n_events_wait(w->probe,&e,1,0);n_events_unwatch(w->probe,1);return ready>0;
+}
+/* Change a watch in the worker's queue only when its interest changes. */
+static bool watch(struct worker*w,n_handle h,uint64_t token,uint32_t*watched,uint32_t interest){
+    if(*watched==interest)return true;
+    n_result r=interest?n_events_watch(w->queue,h,interest,token):n_events_unwatch(w->queue,token);
+    if(r<0)return false;*watched=interest;return true;
+}
+/* Send whole records up to a copy budget (at least one), in order per target. */
 static void output_flush(struct worker*w){size_t budget=16384;struct outgoing**at=&w->output;for(struct client*c=w->clients;c;c=c->next)c->blocked=false;
     while(*at&&budget){struct outgoing*p=*at;struct client*c=p->client;if(w->shared&&c&&c->blocked){at=&p->next;continue;}
         if(w->shared&&(!c||!c->active)){output_unlink(w,at,p);continue;}
-        bool header=p->at<sizeof p->h;size_t left=header?sizeof p->h-p->at:sizeof p->h+p->h.bytes-p->at,take=left<budget?left:budget;const uint8_t*src=header?(uint8_t*)&p->h+p->at:p->data+p->at-sizeof p->h;ssize_t n=write(w->shared?c->fd:1,src,take);
-        if(n<0&&(errno==EAGAIN||errno==EINTR)){if(!w->shared)break;c->blocked=true;at=&p->next;continue;}if(n<=0){if(!w->shared){w->closed=w->output_failed=true;break;}shared_disconnect(w,c);continue;}
-        p->at+=n;budget-=n;if(p->at==sizeof p->h+p->h.bytes)output_unlink(w,at,p);
+        n_handle h=w->shared?c->channel:CHANNEL;if(!sendable(w,h)){if(!w->shared)break;c->blocked=true;at=&p->next;continue;}
+        size_t size=sizeof p->h+p->h.bytes;uint8_t*record=malloc(size);if(!record){w->closed=w->output_failed=true;break;}
+        memcpy(record,&p->h,sizeof p->h);memcpy(record+sizeof p->h,p->data,p->h.bytes);n_result sent=n_channel_send(h,record,size,-1);free(record);
+        if(sent<0){if(!w->shared){w->closed=w->output_failed=true;break;}shared_disconnect(w,c);continue;}
+        budget-=size<budget?size:budget;output_unlink(w,at,p);
     }w->last_output=NULL;for(struct outgoing*p=w->output;p;p=p->next)w->last_output=p;
 }
-static bool exact(int fd,void *p,size_t n,bool writing){size_t at=0;while(at<n){ssize_t got=writing?write(fd,(uint8_t *)p+at,n-at):read(fd,(uint8_t *)p+at,n-at);if(got<0&&errno==EINTR)continue;if(got<=0)return false;at+=(size_t)got;}return true;}
+/* The next whole record on h, or NULL: none waits yet, or (*failed) h has
+ * gone or sent a malformed or unrepresentable record. */
+static struct deferred *record_receive(struct worker*w,n_handle h,bool*failed){
+    n_result size=n_channel_receive(h,NULL,0,N_CHANNEL_PEEK,NULL);if(size==-N_ERR_NOT_READY)return NULL;
+    struct deferred*d=NULL;uint8_t*bytes=NULL;size_t payload=size>0?(size_t)size-sizeof d->h:0;
+    if(size<0||(size_t)size<=sizeof d->h||payload>NJW_MAX_BYTES||payload>SIZE_MAX-w->queued)goto bad;
+    if(!(d=calloc(1,sizeof*d))||!(bytes=malloc((size_t)size))||n_channel_receive(h,bytes,(size_t)size,0,NULL)!=size)goto bad;
+    memcpy(&d->h,bytes,sizeof d->h);if(d->h.bytes!=payload)goto bad;
+    memmove(bytes,bytes+sizeof d->h,payload);d->data=bytes;return d;
+bad:free(bytes);free(d);*failed=true;return NULL;
+}
+/* Wait on the page channel and Atomics.waitAsync words: a record, room for
+ * output, the page leaving or the timeout. False when the wait failed. */
+static bool dedicated_wait(struct worker*w,int timeout){
+    uint32_t interest=(w->closed?N_EVENT_CLOSED:N_EVENT_RECEIVABLE)|(w->output?N_EVENT_SENDABLE:0);
+    if(!watch(w,CHANNEL,INPUT_TOKEN,&w->input_watched,interest))return false;
+    struct n_event events[64];n_result n=n_events_wait(w->queue,events,64,timeout);if(n<0)return false;
+    web_atomics_events(events,(size_t)n);return true;
+}
 static bool send_client(struct worker*w,struct client*c,unsigned op,unsigned request,unsigned kind,JSValueConst value){size_t n=0;uint8_t *data=JS_WriteObject(w->ctx,&n,value,JS_WRITE_OBJ_REFERENCE);if(!data)return false;if(n>NJW_MAX_BYTES||n>SIZE_MAX-sizeof(struct njw_header)||n+sizeof(struct njw_header)>SIZE_MAX-w->output_bytes){js_free(w->ctx,data);return false;}struct outgoing*p=calloc(1,sizeof*p);if(!p){js_free(w->ctx,data);return false;}p->data=data;p->client=c;p->h=(struct njw_header){NJW_MAGIC,op,c?c->generation:w->generation,request,kind,(uint32_t)n};struct output_publication t={.worker=w,.packet=p};output_publish(&t);return true;}
 static bool send_value(struct worker*w,unsigned op,unsigned request,unsigned kind,JSValueConst value){
     if(!w->shared)return send_client(w,NULL,op,request,kind,value);
@@ -60,13 +100,13 @@ static bool send_value(struct worker*w,unsigned op,unsigned request,unsigned kin
     if(op==NJW_CANCEL){struct pending_load**at=&w->loads;while(*at&&(*at)->id!=request)at=&(*at)->next;if(*at){struct pending_load*p=*at;c=p->client;*at=p->next;c->references--;free(p);}}
     return send_client(w,c,op,request,kind,value);
 }
-static struct deferred *receive(struct worker *w){
-    struct deferred *d=calloc(1,sizeof *d);if(!d)return NULL;
-    if(!exact(0,&d->h,sizeof d->h,false)||d->h.magic!=NJW_MAGIC||!d->h.bytes||d->h.bytes>NJW_MAX_BYTES||
+static struct deferred *receive(struct worker *w,bool*failed){
+    struct deferred *d=record_receive(w,CHANNEL,failed);if(!d)return NULL;
+    if(d->h.magic!=NJW_MAGIC||
        ((d->h.op==NJW_PORT_MESSAGE||d->h.op==NJW_PORT_CLOSE||d->h.op==NJW_PORT_DRAINED)?d->h.kind>1:d->h.op==NJW_CONNECT?d->h.kind!=NJW_WITH_PORTS:d->h.op==NJW_MESSAGE?(d->h.kind!=0&&d->h.kind!=NJW_WITH_PORTS):d->h.op==NJW_LOADED?!njw_loaded_kind_valid(d->h.kind):d->h.kind!=0)||
-       (d->h.op!=NJW_START&&d->h.op!=NJW_MESSAGE&&d->h.op!=NJW_CONNECT&&d->h.op!=NJW_LOADED&&d->h.op!=NJW_CREDIT&&d->h.op!=NJW_PORT_MESSAGE&&d->h.op!=NJW_PORT_CLOSE&&d->h.op!=NJW_PORT_DRAINED)||(w->established&&d->h.generation!=w->generation)||(!w->established&&d->h.op!=NJW_START)){free(d);return NULL;}
-    if(!w->established){w->generation=d->h.generation;w->established=true;}else if(d->h.op==NJW_START){free(d);return NULL;}
-    d->data=malloc(d->h.bytes);if(!d->data||!exact(0,d->data,d->h.bytes,false)){free(d->data);free(d);return NULL;}return d;
+       (d->h.op!=NJW_START&&d->h.op!=NJW_MESSAGE&&d->h.op!=NJW_CONNECT&&d->h.op!=NJW_LOADED&&d->h.op!=NJW_CREDIT&&d->h.op!=NJW_PORT_MESSAGE&&d->h.op!=NJW_PORT_CLOSE&&d->h.op!=NJW_PORT_DRAINED)||(w->established&&d->h.generation!=w->generation)||(!w->established&&d->h.op!=NJW_START)){deferred_free(d);*failed=true;return NULL;}
+    if(!w->established){w->generation=d->h.generation;w->established=true;}else if(d->h.op==NJW_START){deferred_free(d);*failed=true;return NULL;}
+    return d;
 }
 static void defer_link(struct worker*w,struct deferred*d,bool before){
     d->next=NULL;struct deferred**head=before?&w->before_start:&w->head,**tail=before?&w->before_start_tail:&w->tail;
@@ -82,7 +122,7 @@ static void shared_restart_source(struct worker*w){
     JSValue url=JS_NewString(w->ctx,w->script_url?w->script_url:"");if(!send_value(w,NJW_LOAD,0,0,url))w->closed=w->output_failed=true;else w->need_start=false;JS_FreeValue(w->ctx,url);
 }
 static void shared_disconnect(struct worker*w,struct client*c){
-    if(!c||!c->active)return;c->active=false;close(c->fd);c->fd=-1;if(c->data){w->queued-=c->rx.bytes;free(c->data);c->data=NULL;}c->head_at=c->data_at=0;
+    if(!c||!c->active)return;c->active=false;n_handle_close(c->channel);c->channel=-1;c->watched=0;
     if(w->network_client==c){w->network_client=NULL;for(struct client*p=w->clients;p;p=p->next)if(p->active&&p->established){w->network_client=p;break;}}
     struct pending_load**at=&w->loads;while(*at){struct pending_load*p=*at;if(p->client!=c){at=&p->next;continue;}*at=p->next;
         JSValue a=JS_NewArray(w->ctx);bool ok=!JS_IsException(a);
@@ -108,49 +148,58 @@ static bool shared_connect_url(struct worker*w,struct client*c,const struct defe
     if(ok)return true;if(JS_HasException(w->ctx))JS_FreeValue(w->ctx,JS_GetException(w->ctx));JSValue error=JS_NewObjectProto(w->ctx,JS_NULL);JS_DefinePropertyValueStr(w->ctx,error,"message",JS_NewString(w->ctx,"SharedWorker name is associated with a different script URL"),JS_PROP_C_W_E);JS_DefinePropertyValueStr(w->ctx,error,"terminal",JS_TRUE,JS_PROP_C_W_E);bool sent=send_client(w,c,NJW_ERROR,0,0,error);JS_FreeValue(w->ctx,error);if(sent)output_flush(w);return false;
 }
 /* Native-only endpoint ownership. The interrupt path may use this helper:
- * never deserialize bytes, allocate JS values or dispatch an author task. */
-static bool shared_accept(struct worker*w,unsigned quantum){
-    for(unsigned i=0;i<quantum;i++){int fd=n_channel_accept(0);if(fd<0){if(errno==EAGAIN||errno==EINTR)return true;w->closed=w->output_failed=true;return false;}
-        struct client*c=calloc(1,sizeof*c);if(!c){close(fd);w->closed=w->output_failed=true;return false;}c->fd=fd;c->active=true;c->next=w->clients;w->clients=c;w->had_client=true;
-    }return true;
+ * never deserialize bytes, allocate JS values or dispatch an author task.
+ * The count of owners accepted, or -1 when the listener failed. */
+static int shared_accept(struct worker*w,unsigned quantum){
+    int accepted=0;
+    for(unsigned i=0;i<quantum;i++){n_handle h=n_channel_accept(CHANNEL);if(h==-N_ERR_NOT_READY)break;if(h<0){w->closed=w->output_failed=true;return -1;}
+        struct client*c=calloc(1,sizeof*c);if(!c){n_handle_close(h);w->closed=w->output_failed=true;return -1;}
+        c->channel=h;c->token=CLIENT_TOKEN|++w->next_client;c->active=true;c->next=w->clients;w->clients=c;w->had_client=true;accepted++;
+    }return accepted;
 }
 static bool shared_without_owners(struct worker*w){
     if(!w->shared||!w->had_client)return false;
-    struct n_pollfd listener={0,N_POLLIN,0};if(poll(&listener,1,0)<0)return false;
     /* Accept a finite batch so dead, never-parsed pending peers do not pin a
-     * detached CPU-only task forever. Live new peers keep their FD ownership. */
-    if((listener.revents&N_POLLIN)&&!shared_accept(w,16))return true;
-    struct n_pollfd batch[64];unsigned count=0;
-    for(struct client*c=w->clients;c;c=c->next)if(c->active){batch[count++]=(struct n_pollfd){c->fd,0,0};if(count==64){if(poll(batch,(int)count,0)<0)return false;for(unsigned i=0;i<count;i++)if(!(batch[i].revents&N_POLLHUP))return false;count=0;}}
-    if(count){if(poll(batch,(int)count,0)<0)return false;for(unsigned i=0;i<count;i++)if(!(batch[i].revents&N_POLLHUP))return false;}
-    /* A connection may have arrived during the bounded scan. An unaccepted
+     * detached CPU-only task forever. Live new peers keep their ownership. */
+    if(shared_accept(w,16)<0)return true;
+    /* An owner whose page has gone and whose records were all taken. A record
+     * still waiting is a live task for this server either way. */
+    for(struct client*c=w->clients;c;c=c->next)if(c->active&&n_channel_receive(c->channel,NULL,0,N_CHANNEL_PEEK,NULL)!=-N_ERR_CLOSED)return false;
+    /* A connection may have arrived during the bounded scan. An accepted
      * owner is protected; the next interrupt will accept the next quantum. */
-    listener.revents=0;if(poll(&listener,1,0)<0)return false;return !(listener.revents&N_POLLIN);
+    return shared_accept(w,1)==0;
 }
-/* One poll for the whole shared server, incremental nonblocking packets, and
- * a finite copy quantum. A slow client never blocks another client's input. */
+/* One wait for the whole shared server, whole records, and a finite copy
+ * quantum. A slow client never blocks another client's input or output. */
 static struct deferred*shared_receive(struct worker*w,int timeout){
-    shared_collect(w);size_t count=1;for(struct client*c=w->clients;c;c=c->next)if(c->active)count++;
-    /* Atomics.waitAsync notifications wake the agent like an incoming task. */
-    int atomics_fd=web_atomics_fd();size_t polled=count+(atomics_fd>=0);
-    if(polled>(size_t)INT_MAX||polled>SIZE_MAX/sizeof*w->pollfds||polled>SIZE_MAX/sizeof*w->pollclients){w->closed=w->output_failed=true;return NULL;}
-    if(polled>w->pollcapacity){size_t capacity=polled>SIZE_MAX/2?polled:polled*2;struct n_pollfd*p=realloc(w->pollfds,capacity*sizeof*p);if(!p){w->closed=w->output_failed=true;return NULL;}w->pollfds=p;struct client**clients=realloc(w->pollclients,capacity*sizeof*clients);if(!clients){w->closed=w->output_failed=true;return NULL;}w->pollclients=clients;w->pollcapacity=capacity;}
+    shared_collect(w);
     for(struct client*c=w->clients;c;c=c->next)c->wants_output=false;for(struct outgoing*p=w->output;p;p=p->next)if(p->client)p->client->wants_output=true;
-    w->pollfds[0]=(struct n_pollfd){w->closed?-1:0,N_POLLIN,0};w->pollclients[0]=NULL;size_t i=1;for(struct client*c=w->clients;c;c=c->next)if(c->active){w->pollfds[i]=(struct n_pollfd){c->fd,N_POLLIN|(c->wants_output?N_POLLOUT:0),0};w->pollclients[i++]=c;}
-    if(atomics_fd>=0){w->pollfds[count]=(struct n_pollfd){atomics_fd,N_POLLIN,0};w->pollclients[count]=NULL;}
-    int ready=poll(w->pollfds,(int)polled,timeout);if(ready<0){if(errno!=EINTR)w->closed=w->output_failed=true;return NULL;}if(!ready)return NULL;
-    if((w->pollfds[0].revents&N_POLLIN)&&!shared_accept(w,16))return NULL;
+    bool watched=watch(w,CHANNEL,INPUT_TOKEN,&w->input_watched,w->closed?0:N_EVENT_RECEIVABLE);
+    for(struct client*c=w->clients;c;c=c->next)if(c->active&&!watch(w,c->channel,c->token,&c->watched,N_EVENT_RECEIVABLE|(c->wants_output?N_EVENT_SENDABLE:0)))watched=false;
+    /* Atomics.waitAsync notifications wake the agent like an incoming task. */
+    struct n_event events[64];n_result ready=n_events_wait(w->queue,events,64,watched?timeout:0);
+    if(ready<0){w->closed=w->output_failed=true;return NULL;}
+    web_atomics_events(events,(size_t)ready);
+    /* A full report (or a failed watch) may leave owners unreported: try all. */
+    bool all=ready==64||!watched,accept=!w->closed&&!watched,output=false;
+    for(n_result i=0;i<ready;i++){uint64_t token=events[i].token;
+        if(token==INPUT_TOKEN)accept=!w->closed;
+        else if((token&~UINT64_C(0xffffffff))==CLIENT_TOKEN)for(struct client*c=w->clients;c;c=c->next)if(c->token==token){
+            if(events[i].events&N_EVENT_SENDABLE)output=true;if(events[i].events&(N_EVENT_RECEIVABLE|N_EVENT_CLOSED))c->readable=true;break;}
+    }
+    if(accept&&shared_accept(w,16)<0)return NULL;
+    if(output||(all&&w->output))output_flush(w);
     size_t budget=65536;
-    for(i=1;i<count&&budget&&!w->closed;i++){struct client*c=w->pollclients[i];short flags=w->pollfds[i].revents;if(!c->active)continue;if(flags&N_POLLOUT)output_flush(w);
-        if(!(flags&(N_POLLIN|N_POLLHUP)))continue;
-        while(c->active&&budget){bool header=c->head_at<sizeof c->rx;size_t left=header?sizeof c->rx-c->head_at:c->rx.bytes-c->data_at,take=left<budget?left:budget;ssize_t n=read(c->fd,header?(void*)((uint8_t*)&c->rx+c->head_at):(void*)(c->data+c->data_at),take);
-            if(n<0&&(errno==EAGAIN||errno==EINTR))break;if(n<=0){shared_disconnect(w,c);break;}budget-=n;
-            if(header){c->head_at+=n;if(c->head_at==sizeof c->rx){if(!shared_header_valid(&c->rx)||(c->established&&c->rx.generation!=c->generation)||c->rx.bytes>SIZE_MAX-w->queued){shared_disconnect(w,c);break;}if(!c->established){c->generation=c->rx.generation;c->established=true;if(!w->network_client)w->network_client=c;}c->data=malloc(c->rx.bytes);if(!c->data){w->closed=w->output_failed=true;break;}w->queued+=c->rx.bytes;}}else c->data_at+=n;
-            if(c->head_at==sizeof c->rx&&c->data_at==c->rx.bytes){struct deferred*d=calloc(1,sizeof*d);if(!d){w->closed=w->output_failed=true;break;}d->h=c->rx;d->data=c->data;d->client=c;c->references++;c->data=NULL;c->head_at=c->data_at=0;
-                if(d->h.op==NJW_CONNECT&&!shared_connect_url(w,c,d)){w->queued-=d->h.bytes;deferred_free(d);shared_disconnect(w,c);break;}
-                if(d->h.op==NJW_CONNECT)shared_restart_source(w);
-                if(!w->policy_initialized&&d->h.op!=NJW_START)defer_link(w,d,true);else{w->queued-=d->h.bytes;return d;}
-            }
+    for(struct client*c=w->clients;c&&budget&&!w->closed;c=c->next){if(!c->active||!(c->readable||all))continue;
+        while(c->active&&budget){bool failed=false;struct deferred*d=record_receive(w,c->channel,&failed);
+            if(!d){if(failed)shared_disconnect(w,c);else c->readable=false;break;}
+            budget-=sizeof d->h+d->h.bytes<budget?sizeof d->h+d->h.bytes:budget;
+            if(!shared_header_valid(&d->h)||(c->established&&d->h.generation!=c->generation)){deferred_free(d);shared_disconnect(w,c);break;}
+            if(!c->established){c->generation=d->h.generation;c->established=true;if(!w->network_client)w->network_client=c;}
+            d->client=c;c->references++;w->queued+=d->h.bytes;
+            if(d->h.op==NJW_CONNECT&&!shared_connect_url(w,c,d)){w->queued-=d->h.bytes;deferred_free(d);shared_disconnect(w,c);break;}
+            if(d->h.op==NJW_CONNECT)shared_restart_source(w);
+            if(!w->policy_initialized&&d->h.op!=NJW_START)defer_link(w,d,true);else{w->queued-=d->h.bytes;return d;}
         }
     }return NULL;
 }
@@ -185,12 +234,12 @@ static bool output_wait_inner(struct worker*w,struct client*client,size_t next){
     for(;;){output_flush(w);if(w->closed)return false;if(w->shared&&(!client||!client->active))return true;
         size_t flight=client?client->in_flight:w->in_flight;
         if(!flight||(flight<=NJW_TRANSPORT_WINDOW&&next<=NJW_TRANSPORT_WINDOW-flight))return true;
-        uint64_t now=uptime_ms();if(w->until!=UINT64_MAX&&now>=w->until)return false;uint64_t remaining=w->until==UINT64_MAX?UINT64_MAX:w->until-now;int wait=remaining>(uint64_t)INT_MAX?INT_MAX:(int)remaining;struct deferred*d=NULL;
+        uint64_t now=n_clock_uptime_ms();if(w->until!=UINT64_MAX&&now>=w->until)return false;uint64_t remaining=w->until==UINT64_MAX?UINT64_MAX:w->until-now;int wait=remaining>(uint64_t)INT_MAX?INT_MAX:(int)remaining;struct deferred*d=NULL;
         /* An import wait may already have retained a private credit record. */
         struct deferred**at=&w->head;while(*at&&(*at)->h.op!=NJW_CREDIT)at=&(*at)->next;
         if(*at){d=*at;*at=d->next;w->queued-=d->h.bytes;w->tail=NULL;for(struct deferred*p=w->head;p;p=p->next)w->tail=p;d->next=NULL;}
         else if(w->shared)d=shared_receive(w,wait);
-        else{struct n_pollfd p[2]={{0,N_POLLIN,0},{1,w->output?N_POLLOUT:0,0}};int ready=poll(p,2,wait);if(ready<0){if(errno==EINTR)continue;w->closed=true;return false;}if(p[1].revents&N_POLLOUT)output_flush(w);if(p[0].revents&(N_POLLIN|N_POLLHUP)){d=receive(w);if(!d){w->closed=true;return false;}}}
+        else{if(!dedicated_wait(w,wait)){w->closed=true;return false;}if(w->output)output_flush(w);bool failed=false;d=receive(w,&failed);if(failed){w->closed=true;return false;}}
         if(!d)continue;if(d->h.op==NJW_CREDIT){transport_credit(w,d);deferred_free(d);continue;}
         if(d->h.bytes>SIZE_MAX-w->queued){deferred_free(d);w->closed=true;return false;}w->queued+=d->h.bytes;defer_link(w,d,false);
     }
@@ -381,7 +430,7 @@ static JSValue native_send(JSContext *ctx,JSValueConst thisv,int argc,JSValueCon
 static JSValue native_class(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;return JS_NewUint32(ctx,argc?JS_GetClassID(argv[0]):0);}
 static JSValue native_detach(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;if(argc&&!JS_IsArrayBufferTransferable(ctx,argv[0]))return JS_ThrowTypeError(ctx,"ArrayBuffer cannot be transferred");if(argc)JS_DetachArrayBuffer(ctx,argv[0]);return JS_UNDEFINED;}
 static JSValue native_buffer_transferable(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;return JS_NewBool(ctx,argc&&JS_IsArrayBufferTransferable(ctx,argv[0]));}
-static JSValue native_now(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;return JS_NewFloat64(ctx,(double)uptime_ms());}
+static JSValue native_now(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;return JS_NewFloat64(ctx,(double)n_clock_uptime_ms());}
 /* Web IDL promise reactions: no page Promise constructor or @@species lookup. */
 static JSValue native_promise_then(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
     (void)thisv;if(!argc)return JS_ThrowTypeError(ctx,"promiseThen requires a promise");
@@ -392,10 +441,10 @@ static JSValue native_promise_is_handled(JSContext *ctx,JSValueConst thisv,int a
     if(handled<0)return JS_ThrowTypeError(ctx,"promiseIsHandled requires a promise");
     return JS_NewBool(ctx,handled);
 }
-static JSValue native_close(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;struct worker *w=state(ctx);send_value(w,NJW_CLOSE,0,0,JS_NULL);w->closed=true;if(w->shared)close(0);return JS_UNDEFINED;}
+static JSValue native_close(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){(void)thisv;(void)argc;(void)argv;struct worker *w=state(ctx);send_value(w,NJW_CLOSE,0,0,JS_NULL);w->closed=true;if(w->shared){n_handle_close(CHANNEL);w->input_watched=0;}return JS_UNDEFINED;}
 static JSValue native_eval(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
     (void)thisv;struct worker *w=state(ctx);if(argc<2)return JS_ThrowTypeError(ctx,"Worker source/URL required");size_t n;const char *source=JS_ToCStringLen(ctx,&n,argv[0]),*url=JS_ToCString(ctx,argv[1]);if(!source||!url){JS_FreeCString(ctx,source);JS_FreeCString(ctx,url);return JS_EXCEPTION;}
-    uint64_t saved=w->until;w->until=uptime_ms()+NJW_TASK_MS;JSValue code=JS_Eval(ctx,source,n,url,JS_EVAL_TYPE_GLOBAL|JS_EVAL_FLAG_COMPILE_ONLY);JS_FreeCString(ctx,source);JS_FreeCString(ctx,url);w->until=saved;
+    uint64_t saved=w->until;w->until=n_clock_uptime_ms()+NJW_TASK_MS;JSValue code=JS_Eval(ctx,source,n,url,JS_EVAL_TYPE_GLOBAL|JS_EVAL_FLAG_COMPILE_ONLY);JS_FreeCString(ctx,source);JS_FreeCString(ctx,url);w->until=saved;
     if(JS_IsException(code))return code;return JS_EvalFunction(ctx,code);
 }
 static JSValue native_request(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
@@ -441,16 +490,16 @@ static JSValue native_cancel(JSContext *ctx,JSValueConst thisv,int argc,JSValueC
 static JSValue native_referrer_policy(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){(void)self;(void)argc;(void)argv;return JS_NewInt32(ctx,state(ctx)->policy_doc.referrer_policy);}
 static JSValue native_import(JSContext *ctx,JSValueConst thisv,int argc,JSValueConst *argv){
     (void)thisv;struct worker *w=state(ctx);if(!argc)return JS_ThrowTypeError(ctx,"URL required");if(w->request==UINT32_MAX)return JS_ThrowRangeError(ctx,"Worker request identifier space exhausted");uint32_t id=++w->request;if(!send_value(w,NJW_LOAD,id,1,argv[0]))return JS_ThrowTypeError(ctx,"Worker import IPC failed");
-    uint64_t wait_start=uptime_ms(),deadline=wait_start+WEBNET_TIMEOUT_MS;
-    while(!w->closed){uint64_t now=uptime_ms();if(now>=deadline){send_value(w,NJW_CANCEL,id,0,JS_NULL);return JS_ThrowTypeError(ctx,"Worker import deadline exceeded");}uint64_t left=deadline-now;int timeout=left>(uint64_t)INT_MAX?INT_MAX:(int)left;struct deferred*d=NULL;
+    uint64_t wait_start=n_clock_uptime_ms(),deadline=wait_start+WEBNET_TIMEOUT_MS;
+    while(!w->closed){uint64_t now=n_clock_uptime_ms();if(now>=deadline){send_value(w,NJW_CANCEL,id,0,JS_NULL);return JS_ThrowTypeError(ctx,"Worker import deadline exceeded");}uint64_t left=deadline-now;int timeout=left>(uint64_t)INT_MAX?INT_MAX:(int)left;struct deferred*d=NULL;
         if(w->shared){
             struct deferred**at=&w->head;while(*at&&((*at)->h.op!=NJW_LOADED||(*at)->h.request!=id))at=&(*at)->next;
             if(*at){d=*at;*at=d->next;w->queued-=d->h.bytes;w->tail=NULL;for(struct deferred*p=w->head;p;p=p->next)w->tail=p;d->next=NULL;}
             else d=shared_receive(w,timeout);
             if(!d)continue;if(!shared_incoming(w,d)){deferred_free(d);continue;}
-        }else{struct n_pollfd p[2]={{0,N_POLLIN,0},{1,w->output?N_POLLOUT:0,0}};int ready=poll(p,2,timeout);if(ready<0&&errno==EINTR)continue;if(ready<0)return JS_ThrowTypeError(ctx,"Worker import poll failed");if(!ready)continue;if(p[1].revents&N_POLLOUT)output_flush(w);if(w->closed)break;if(!(p[0].revents&(N_POLLIN|N_POLLHUP)))continue;d=receive(w);if(!d){w->closed=true;return JS_ThrowTypeError(ctx,"Worker import pipe closed");}}
+        }else{if(!dedicated_wait(w,timeout))return JS_ThrowTypeError(ctx,"Worker import wait failed");if(w->output)output_flush(w);if(w->closed)break;bool failed=false;d=receive(w,&failed);if(failed){w->closed=true;return JS_ThrowTypeError(ctx,"Worker import channel closed");}if(!d)continue;}
         if(d->h.op==NJW_CREDIT){transport_credit(w,d);deferred_free(d);continue;}
-        if(d->h.op==NJW_LOADED&&d->h.request==id){if(w->until!=UINT64_MAX)w->until+=uptime_ms()-wait_start;JSValue result=JS_ReadObject(ctx,d->data,d->h.bytes,JS_READ_OBJ_REFERENCE);deferred_free(d);return result;}
+        if(d->h.op==NJW_LOADED&&d->h.request==id){if(w->until!=UINT64_MAX)w->until+=n_clock_uptime_ms()-wait_start;JSValue result=JS_ReadObject(ctx,d->data,d->h.bytes,JS_READ_OBJ_REFERENCE);deferred_free(d);return result;}
         if(d->h.bytes>SIZE_MAX-w->queued){deferred_free(d);return JS_ThrowRangeError(ctx,"Worker deferred message accounting overflow");}w->queued+=d->h.bytes;if(w->tail)w->tail->next=d;else w->head=d;w->tail=d;
     }return JS_ThrowTypeError(ctx,"Worker closed");
 }
@@ -462,7 +511,7 @@ static int interrupt(JSRuntime *rt,void *opaque){
     if(++w->interrupt_ticks&15u)return 0;
     if(w->shared&&shared_without_owners(w)){w->closed=true;return 1;}
     if(w->until==UINT64_MAX)return 0;
-    return uptime_ms()>=w->until;
+    return n_clock_uptime_ms()>=w->until;
 }
 static JSValue hook(struct worker *w,const char *name,int argc,JSValueConst *argv){JSValue fn=JS_GetPropertyStr(w->ctx,w->hooks,name);JSValue r=JS_Call(w->ctx,fn,JS_UNDEFINED,argc,argv);JS_FreeValue(w->ctx,fn);port_capture_cancel(w);return r;}
 static int wasm_poll(JSContext *ctx){struct worker*w=JS_GetContextOpaque(ctx);return !w||interrupt(JS_GetRuntime(ctx),w);}
@@ -481,7 +530,7 @@ static int wasm_can_compile(JSContext *ctx){
     }
     return allowed;
 }
-static void exception(struct worker *w){JSValue ex=JS_GetException(w->ctx);w->until=uptime_ms()+NJW_TASK_MS;JSValue r=hook(w,"report",1,&ex);if(JS_IsException(r)){JSValue ignored=JS_GetException(w->ctx);JS_FreeValue(w->ctx,ignored);}JS_FreeValue(w->ctx,r);JS_FreeValue(w->ctx,ex);}
+static void exception(struct worker *w){JSValue ex=JS_GetException(w->ctx);w->until=n_clock_uptime_ms()+NJW_TASK_MS;JSValue r=hook(w,"report",1,&ex);if(JS_IsException(r)){JSValue ignored=JS_GetException(w->ctx);JS_FreeValue(w->ctx,ignored);}JS_FreeValue(w->ctx,r);JS_FreeValue(w->ctx,ex);}
 /* HTML "notify about rejected promises": rejections still unhandled after a
    microtask checkpoint fire unhandledrejection; a later handler on a notified
    promise fires rejectionhandled. The tracker cannot run script itself. */
@@ -542,7 +591,7 @@ static void policy_task(struct worker *w){
     JSValue r=hook(w,"safetyViolation",1,&v->init);if(JS_IsException(r))exception(w);JS_FreeValue(w->ctx,r);JS_FreeValue(w->ctx,v->init);js_free(w->ctx,v);
 }
 int main(int argc,char**argv){
-    struct worker w={0};w.shared=argc>1&&!strcmp(argv[1],"--shared-server");w.script_url=argc>2?argv[2]:"";w.hooks=JS_UNDEFINED;w.rt=JS_NewRuntime();if(!w.rt)return 1;JS_SetMemoryLimit(w.rt,NJW_HEAP_BYTES);JS_SetMaxStackSize(w.rt,512u*1024u);JS_SetCanBlock(w.rt,true);web_atomics_runtime_init(w.rt);JS_SetInterruptHandler(w.rt,interrupt,&w);JS_SetHostPromiseRejectionTracker(w.rt,rejection_track,NULL);w.ctx=JS_NewContext(w.rt);if(!w.ctx){JS_FreeRuntime(w.rt);return 1;}JS_SetContextOpaque(w.ctx,&w);w.until=uptime_ms()+10000;
+    struct worker w={0};w.probe=-1;w.queue=web_atomics_queue();if(w.queue<0)return 1;w.shared=argc>1&&!strcmp(argv[1],"--shared-server");w.script_url=argc>2?argv[2]:"";w.hooks=JS_UNDEFINED;w.rt=JS_NewRuntime();if(!w.rt)return 1;JS_SetMemoryLimit(w.rt,NJW_HEAP_BYTES);JS_SetMaxStackSize(w.rt,512u*1024u);JS_SetCanBlock(w.rt,true);web_atomics_runtime_init(w.rt);JS_SetInterruptHandler(w.rt,interrupt,&w);JS_SetHostPromiseRejectionTracker(w.rt,rejection_track,NULL);w.ctx=JS_NewContext(w.rt);if(!w.ctx){JS_FreeRuntime(w.rt);return 1;}JS_SetContextOpaque(w.ctx,&w);w.until=n_clock_uptime_ms()+10000;
     if(trusted_native_init(w.ctx)<0)goto shutdown;
     if(web_js_wasm_init(w.ctx,wasm_poll,wasm_can_compile)<0)goto shutdown;
     JSValue global=JS_GetGlobalObject(w.ctx),host=JS_NewObject(w.ctx);
@@ -561,22 +610,21 @@ int main(int argc,char**argv){
     w.hooks=JS_Eval(w.ctx,js_worker_runtime,sizeof js_worker_runtime-1,"<worker-bootstrap>",JS_EVAL_TYPE_GLOBAL);JS_SetStripInfo(rt,strip);}
     if(JS_IsException(w.hooks))goto shutdown;
     JS_SetDynamicCodeCheck(w.ctx,worker_code_check,&w);
-    if(!w.shared&&fcntl(1,F_SETFL,O_NONBLOCK)<0)goto shutdown;
     while(!w.closed||w.output){
         if(w.output_failed)break;
-        if(w.closed){if(w.shared){output_flush(&w);if(w.output){struct deferred*d=shared_receive(&w,10);if(d)deferred_free(d);}continue;}struct n_pollfd p={1,N_POLLOUT,0};if(poll(&p,1,-1)<0){if(errno==EINTR)continue;break;}if(p.revents&N_POLLOUT)output_flush(&w);else break;continue;}
+        if(w.closed){if(w.shared){output_flush(&w);if(w.output){struct deferred*d=shared_receive(&w,10);if(d)deferred_free(d);}continue;}if(!dedicated_wait(&w,-1))break;output_flush(&w);continue;}
         if(w.output)output_flush(&w);
         if(w.output_failed)break;
-        if(JS_IsJobPending(w.rt)){w.until=uptime_ms()+NJW_TASK_MS;jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}
+        if(JS_IsJobPending(w.rt)){w.until=n_clock_uptime_ms()+NJW_TASK_MS;jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}
         /* CSP events are separate tasks, after the originating microtasks. */
-        if(w.violations){w.until=uptime_ms()+NJW_TASK_MS;policy_task(&w);jobs(&w);continue;}
+        if(w.violations){w.until=n_clock_uptime_ms()+NJW_TASK_MS;policy_task(&w);jobs(&w);continue;}
         struct deferred *d=NULL;if(w.head){d=w.head;w.head=d->next;if(!w.head)w.tail=NULL;w.queued-=d->h.bytes;}
         else{
-            w.until=UINT64_MAX;JSValue deadline=hook(&w,"deadline",0,NULL);int64_t due=-1;JS_ToInt64(w.ctx,&due,deadline);JS_FreeValue(w.ctx,deadline);uint64_t now=uptime_ms();int64_t atomics_due=web_atomics_deadline(w.ctx,now);if(atomics_due>=0&&(due<0||atomics_due<due))due=atomics_due;int wait=JS_IsJobPending(w.rt)?0:due<0?-1:due<=(int64_t)now?0:due-(int64_t)now>INT_MAX?INT_MAX:(int)(due-(int64_t)now);
+            w.until=UINT64_MAX;JSValue deadline=hook(&w,"deadline",0,NULL);int64_t due=-1;JS_ToInt64(w.ctx,&due,deadline);JS_FreeValue(w.ctx,deadline);uint64_t now=n_clock_uptime_ms();int64_t atomics_due=web_atomics_deadline(w.ctx,now);if(atomics_due>=0&&(due<0||atomics_due<due))due=atomics_due;int wait=JS_IsJobPending(w.rt)?0:due<0?-1:due<=(int64_t)now?0:due-(int64_t)now>INT_MAX?INT_MAX:(int)(due-(int64_t)now);
             if(w.shared){d=shared_receive(&w,wait);if(w.closed&&!d)continue;}
-            else{int atomics_fd=web_atomics_fd();struct n_pollfd p[3]={{0,N_POLLIN,0},{1,w.output?N_POLLOUT:0,0},{atomics_fd,N_POLLIN,0}};int n=poll(p,atomics_fd>=0?3:2,wait);if(n<0&&errno==EINTR)continue;if(n<0)break;if(p[1].revents&N_POLLOUT)output_flush(&w);if(w.output_failed)break;if(p[0].revents&(N_POLLIN|N_POLLHUP)){d=receive(&w);if(!d)break;}}
+            else{if(!dedicated_wait(&w,wait))break;if(w.output)output_flush(&w);if(w.output_failed)break;bool failed=false;d=receive(&w,&failed);if(failed)break;}
         }
-        w.until=uptime_ms()+NJW_TASK_MS;
+        w.until=n_clock_uptime_ms()+NJW_TASK_MS;
         if(d&&d->h.op==NJW_CREDIT){if(!w.shared||shared_incoming(&w,d))transport_credit(&w,d);deferred_free(d);d=NULL;if(w.closed)continue;}
         bool received_task=d!=NULL;
         /* The running JS task holds current_client until its checkpoint; the
@@ -585,13 +633,13 @@ int main(int argc,char**argv){
         /* Finish the received task's microtasks before a local port/timer task. */
         if(received_task){jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}
         /* Atomics.waitAsync settlements are tasks of their own. */
-        {uint64_t at=uptime_ms();int64_t due=web_atomics_deadline(w.ctx,at);if(due>=0&&due<=(int64_t)at){w.until=at+NJW_TASK_MS;web_atomics_run(w.ctx,at);jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}}
-        JSValue now=JS_NewFloat64(w.ctx,(double)uptime_ms());JSValue tick=hook(&w,"tick",1,&now);if(JS_IsException(tick))exception(&w);JS_FreeValue(w.ctx,tick);JS_FreeValue(w.ctx,now);jobs(&w);
+        {uint64_t at=n_clock_uptime_ms();int64_t due=web_atomics_deadline(w.ctx,at);if(due>=0&&due<=(int64_t)at){w.until=at+NJW_TASK_MS;web_atomics_run(w.ctx,at);jobs(&w);if(w.closed)continue;if(JS_IsJobPending(w.rt))continue;}}
+        JSValue now=JS_NewFloat64(w.ctx,(double)n_clock_uptime_ms());JSValue tick=hook(&w,"tick",1,&now);if(JS_IsException(tick))exception(&w);JS_FreeValue(w.ctx,tick);JS_FreeValue(w.ctx,now);jobs(&w);
     }
 shutdown:
     while(w.violations){struct policy_violation *v=w.violations;w.violations=v->next;JS_FreeValue(w.ctx,v->init);js_free(w.ctx,v);}
     html_policy_free(&w.policy_doc);free(w.policy_doc.url);free(w.security_url);
     while(w.output){struct outgoing*p=w.output;w.output=p->next;output_packet_free(&w,p);}
     web_js_wasm_cancel(w.ctx);
-    while(w.head){struct deferred*d=w.head;w.head=d->next;deferred_free(d);}while(w.before_start){struct deferred*d=w.before_start;w.before_start=d->next;deferred_free(d);}output_ports_free(&w,w.ports);while(w.leases){struct broker_lease*l=w.leases;w.leases=l->next;free(l);}while(w.loads){struct pending_load*p=w.loads;w.loads=p->next;if(p->client)p->client->references--;free(p);}while(w.clients){struct client*c=w.clients;w.clients=c->next;if(c->active)close(c->fd);free(c->data);free(c);}free(w.pollfds);free(w.pollclients);while(rejections){struct rejection*r=rejections;rejections=r->next;rejection_free(w.ctx,r);}JS_FreeValue(w.ctx,w.hooks);web_atomics_release(w.ctx);web_opfs_release(w.ctx);JS_FreeContext(w.ctx);JS_FreeRuntime(w.rt);return 0;
+    while(w.head){struct deferred*d=w.head;w.head=d->next;deferred_free(d);}while(w.before_start){struct deferred*d=w.before_start;w.before_start=d->next;deferred_free(d);}output_ports_free(&w,w.ports);while(w.leases){struct broker_lease*l=w.leases;w.leases=l->next;free(l);}while(w.loads){struct pending_load*p=w.loads;w.loads=p->next;if(p->client)p->client->references--;free(p);}while(w.clients){struct client*c=w.clients;w.clients=c->next;if(c->active)n_handle_close(c->channel);free(c);}if(w.probe>=0)n_handle_close(w.probe);while(rejections){struct rejection*r=rejections;rejections=r->next;rejection_free(w.ctx,r);}JS_FreeValue(w.ctx,w.hooks);web_atomics_release(w.ctx);web_opfs_release(w.ctx);JS_FreeContext(w.ctx);JS_FreeRuntime(w.rt);return 0;
 }

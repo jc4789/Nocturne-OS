@@ -1127,7 +1127,8 @@ void web_tick(web_doc *d, uint64_t now) {
     if(d->native_cancelled)return;
     web_frames_tick(d,now);
 }
-int web_wait_fd(void) { return web_atomics_fd(); }
+n_handle web_wait_queue(void) { return web_atomics_queue(); }
+void web_wait_events(const struct n_event *events, size_t count) { web_atomics_events(events, count); }
 int web_wait_report(char *out, size_t size) { return web_atomics_report(out, size, uptime_ms()); }
 int64_t web_deadline(web_doc *d) {
     uint64_t now = uptime_ms();

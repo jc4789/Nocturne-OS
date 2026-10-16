@@ -28,7 +28,7 @@ static void sample(void) {
     memcpy(prev, procs, sizeof procs);
     nprev = nproc;
     nproc = proclist(procs, 128);
-    uint64_t now = uptime_ms(), dt = now - last_t;
+    uint64_t now = n_clock_uptime_ms(), dt = now - last_t;
     if (!last_t || !dt) dt = 1000;
     last_t = now;
     uint64_t busy = 0;
@@ -136,17 +136,17 @@ int main(void) {
     if (!w) return 1;
     sample();
     snprintf(status, sizeof status, "select a process to end it");
-    uint64_t next = uptime_ms() + 1000;
+    uint64_t next = n_clock_uptime_ms() + 1000;
     draw();
     win_update(w);
     for (;;) {
-        int64_t wait = (int64_t)(next - uptime_ms());
+        int64_t wait = (int64_t)(next - n_clock_uptime_ms());
         struct gui_event e;
         int r = win_event(w, &e, wait > 0 ? (int)wait : 0);
         if (r < 0) break;
         if (r == 0) {
             sample();
-            next = uptime_ms() + 1000;
+            next = n_clock_uptime_ms() + 1000;
         } else if (e.type == EV_CLOSE) break;
         else if (e.type == EV_MOUSE_MOVE) {
             bool h = ui_hit(e.x, e.y, W - 130, H - 38, 116, 30);

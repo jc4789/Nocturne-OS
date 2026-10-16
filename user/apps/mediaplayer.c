@@ -23,7 +23,7 @@ static size_t picture_capacity;
 static int picture_w, picture_h;
 static char error[160], path[2048];
 static bool input_focus;
-static int64_t position(void) { return base_ms + (playing ? (int64_t)(uptime_ms() - started) : 0); }
+static int64_t position(void) { return base_ms + (playing ? (int64_t)(n_clock_uptime_ms() - started) : 0); }
 static void clear_audio(void) { if (audio >= 0) { n_audio_flush(audio);n_handle_close(audio); } audio = -1; }
 /* frames the stream still holds; -1 if it failed */
 static int64_t audio_queued(void) { struct n_audio_status st;return n_audio_status(audio,&st)<0?-1:(int64_t)st.queued_frames; }
@@ -41,7 +41,7 @@ static bool seek_to(int64_t ms) {
     if (!media || !nmedia_seek(media, ms)) { strlcpy(error,"This input cannot seek to that position.",sizeof error); return false; }
     clear_audio();
     if (playing && info->audio) open_audio();
-    base_ms = ms; started = uptime_ms(); pending.kind = 0; audio_at = 0; finished = false;
+    base_ms = ms; started = n_clock_uptime_ms(); pending.kind = 0; audio_at = 0; finished = false;
     return true;
 }
 static void toggle(void) {
@@ -51,7 +51,7 @@ static void toggle(void) {
         if (!seek_to(now)) { base_ms = now; clear_audio(); }
     } else {
         if (finished && !seek_to(0)) return;
-        playing = true; started = uptime_ms();
+        playing = true; started = n_clock_uptime_ms();
         if (info->audio) open_audio();
     }
 }
@@ -159,7 +159,7 @@ int main(int argc,char **argv) {
             redraw=true;
         }
         redraw|=pump();
-        if(redraw||(playing&&uptime_ms()-last>=100)){draw();last=uptime_ms();}
+        if(redraw||(playing&&n_clock_uptime_ms()-last>=100)){draw();last=n_clock_uptime_ms();}
     }
     release_media();win_close(win);return 0;
 }

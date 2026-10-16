@@ -56,7 +56,7 @@ static void render_rows(int n) {
 
 static void restart(void) {
     row = 0;
-    t_start = uptime_ms();
+    t_start = n_clock_uptime_ms();
     maxit = 200 + (int)(60 * log2(3.2 / scale + 1));
 }
 
@@ -105,7 +105,7 @@ int main(void) {
             render_rows(24);
             if (row >= w->h) {
                 snprintf(info, sizeof info, " zoom %.3gx  %d iterations  %lu ms ", 3.2 / scale, maxit,
-                         (unsigned long)(uptime_ms() - t_start));
+                         (unsigned long)(n_clock_uptime_ms() - t_start));
                 int tw = gfx_text_width(info, FONT_SMALL);
                 gfx_fill_blend(&w->c, 6, w->h - 26, tw + 4, 20, ARGB(150, 0, 0, 0));
                 gfx_text(&w->c, 8, w->h - 24, info, RGB(230, 230, 250), TRANSPARENT, FONT_SMALL);

@@ -57,6 +57,8 @@ static int children(void) {
     return count;
 }
 static unsigned transports(void){return webnet_inflight(net);}
+/* Wait for the transports in a queue of this test's own. */
+static void net_wait(int timeout){static n_handle queue=-1;if(queue<0)queue=n_events_create();struct n_event events[64];if(queue>=0)webnet_wait(net,queue,timeout,events,64);}
 static uint64_t request_options(struct result *r, int port, const char *path, enum webnet_kind kind,
                         const char *method, const char *headers, const void *body, size_t length,
                         uint64_t generation, bool force_preflight, bool redirect_error, bool same_origin) {
@@ -661,7 +663,7 @@ static void concurrency_tests(void) {
     uint64_t admitted_until=uptime_ms()+500;
     while(started<expected&&uptime_ms()<admitted_until){
         webnet_pump(net,uptime_ms());started=MAX(started,(int)transports());
-        if(started<expected)webnet_wait(net,-1,-1,10);
+        if(started<expected)net_wait(10);
     }
     check(submitted&&started>=expected,
           "adaptive worker budget admits a multi-origin burst beyond four when native memory permits");
@@ -674,7 +676,7 @@ static void concurrency_tests(void) {
     for (int i = 0; i < 3; i++) ids[i] = request(&r[i], 0, "/api/slow?ms=800", WEBNET_FETCH, "GET", NULL, NULL, 0, 20);
     webnet_pump(net, uptime_ms());
     admitted_until=uptime_ms()+300;
-    while(transports()<3&&uptime_ms()<admitted_until){webnet_pump(net,uptime_ms());webnet_wait(net,-1,-1,10);}
+    while(transports()<3&&uptime_ms()<admitted_until){webnet_pump(net,uptime_ms());net_wait(10);}
     check(ids[0] && ids[1] && ids[2] && transports() == 3 && children()==1, "three Fetch channels share one service and leave document dependency admission reserved");
     bool good = true; uint64_t until = uptime_ms() + 6000;
     while (webnet_busy(net) && uptime_ms() < until) {
@@ -1217,7 +1219,7 @@ static void pacing_tests(void){
         .method="GET",.credentials=WEBNET_CREDENTIALS_OMIT,.stream_response=true};
     struct paced_stream stream={0};uint64_t id=webnet_submit(net,&q,paced_received,&stream);
     uint64_t until=uptime_ms()+5000;
-    while(id&&!stream.headers&&uptime_ms()<until){webnet_pump(net,uptime_ms());webnet_wait(net,-1,-1,20);}
+    while(id&&!stream.headers&&uptime_ms()<until){webnet_pump(net,uptime_ms());net_wait(20);}
     check(id&&stream.headers==1&&!stream.chunks&&!stream.ends&&!stream.failed,
           "real streaming response pauses after headers without publishing body bytes");
     /* Let the worker fill its bounded ahead window. A different request must
@@ -1233,7 +1235,7 @@ static void pacing_tests(void){
     while(webnet_busy(net)&&uptime_ms()<until){
         unsigned before=stream.chunks;webnet_pump(net,uptime_ms());pumps++;
         maximum=MAX(maximum,stream.chunks-before);
-        if(webnet_busy(net))webnet_wait(net,-1,-1,100);
+        if(webnet_busy(net))net_wait(100);
     }
     check(!webnet_busy(net)&&stream.bytes==1048576&&stream.headers==1&&stream.ends==1&&!stream.failed,
           "real streamed byte credit preserves every pattern byte through pause resume and END");

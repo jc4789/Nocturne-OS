@@ -289,7 +289,7 @@ int main(int argc, char **argv) {
     char named[512];
     if (argc > 1 && n_path_complete(argv[1], named, sizeof named) > 0) load(named);
     push_undo();
-    srand((unsigned)uptime_ms());
+    srand((unsigned)n_clock_uptime_ms());
     draw();
     win_update(win);
     for (;;) {

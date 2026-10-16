@@ -252,7 +252,7 @@ int main(int argc, char **argv) {
                     sel = -1;
                     break;
                 }
-                uint64_t now = uptime_ms();
+                uint64_t now = n_clock_uptime_ms();
                 if (idx == last_click_idx && now - last_click < 450) {
                     open_entry(idx);
                     last_click_idx = -1;

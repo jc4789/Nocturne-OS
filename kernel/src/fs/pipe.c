@@ -201,11 +201,9 @@ int pipe_create(struct file **rd, struct file **wr) {
     if(!*wr){vfs_close(*rd);*rd=NULL;return -N_ERR_NO_MEMORY;}
     return 0;
 }
-
-/* Named native rendezvous. Only the registry/index is new: each duplex end
- * owns the existing dynamically segmented pipe directions. No path lookup,
- * network socket family, fixed client capacity or parent-process dependency. */
-struct channel_end {struct file *rx,*tx;};
+/* Named native rendezvous: a registry of listeners. Each connection is an
+ * ordinary message channel pair; the server end waits in the listener until
+ * accepted. No path lookup, network socket family or fixed client capacity. */
 struct channel_pending {struct channel_pending *next;struct file *server;};
 struct channel_listener {
     struct channel_listener *next;
@@ -229,69 +227,7 @@ static struct channel_listener *channel_find(const char *key,size_t length,uint6
         if(l->hash==hash && l->key_length==length && !memcmp(l->key,key,length))return l;
     return NULL;
 }
-static int64_t channel_read(struct vnode *v,struct file *f,void *buffer,uint64_t offset,size_t n) {
-    struct channel_end *end=v->priv;
-    return pipe_read(end->rx->vn,f,buffer,offset,n);
-}
-static int64_t channel_write(struct vnode *v,struct file *f,const void *buffer,uint64_t offset,size_t n) {
-    struct channel_end *end=v->priv;
-    return pipe_write(end->tx->vn,f,buffer,offset,n);
-}
-static int64_t channel_read_user(struct vnode *v,struct file *f,void *buffer,uint64_t offset,size_t n) {
-    struct channel_end *end=v->priv;
-    return pipe_read_user(end->rx->vn,f,buffer,offset,n);
-}
-static int64_t channel_write_user(struct vnode *v,struct file *f,const void *buffer,uint64_t offset,size_t n) {
-    struct channel_end *end=v->priv;
-    return pipe_write_user(end->tx->vn,f,buffer,offset,n);
-}
-static void channel_poll_register(struct vnode *v,struct file *f,struct poll_wait *wait) {
-    (void)f;struct channel_end *end=v->priv;
-    /* Either directional peer can hang up, independently of requested IN/OUT. */
-    vfs_poll_register(wait,end->rx->vn);
-    vfs_poll_register(wait,end->tx->vn);
-}
-static bool channel_can_read(struct vnode *v,struct file *f) {
-    struct channel_end *end=v->priv;return pipe_can_read(end->rx->vn,f);
-}
-static bool channel_can_write(struct vnode *v,struct file *f) {
-    struct channel_end *end=v->priv;return pipe_can_write(end->tx->vn,f);
-}
-static bool channel_hangup(struct vnode *v,struct file *f) {
-    (void)f;struct channel_end *end=v->priv;
-    struct pipe *rx=end->rx->vn->priv,*tx=end->tx->vn->priv;
-    return rx->writers==0 || tx->readers==0;
-}
-static void channel_close(struct vnode *v,struct file *f) {
-    (void)f;struct channel_end *end=v->priv;
-    vfs_close(end->rx);vfs_close(end->tx);
-}
-static void channel_release(struct vnode *v) {kfree(v->priv);kfree(v);}
-static struct vnode_ops channel_ops={
-    .read=channel_read,.write=channel_write,.can_read=channel_can_read,
-    .read_user=channel_read_user,.write_user=channel_write_user,.poll_register=channel_poll_register,
-    .can_write=channel_can_write,.hangup=channel_hangup,.close=channel_close,.release=channel_release,
-};
-/* Transfers the two pipe references only on success. */
-static struct file *channel_end_new(struct file *rx,struct file *tx) {
-    struct vnode *v=kzalloc(sizeof *v);struct channel_end *end=kmalloc(sizeof *end);
-    if(!v || !end){kfree(v);kfree(end);return NULL;}
-    *end=(struct channel_end){rx,tx};v->type=VT_CHANNEL;v->ops=&channel_ops;v->priv=end;v->unlinked=true;
-    strlcpy(v->name,"channel",sizeof v->name);
-    struct file *f=vfs_open_vnode(v,O_RDWR|O_NONBLOCK);
-    if(!f){kfree(end);kfree(v);}return f;
-}
-static int channel_pair(struct file **client,struct file **server) {
-    struct file *r0,*w0,*r1,*w1;int e=pipe_create(&r0,&w0);
-    if(e)return e;
-    e=pipe_create(&r1,&w1);
-    if(e){vfs_close(r0);vfs_close(w0);return e;}
-    *client=channel_end_new(r1,w0);
-    if(!*client){vfs_close(r0);vfs_close(w0);vfs_close(r1);vfs_close(w1);return -N_ERR_NO_MEMORY;}
-    *server=channel_end_new(r0,w1);
-    if(!*server){vfs_close(*client);*client=NULL;vfs_close(r0);vfs_close(w1);return -N_ERR_NO_MEMORY;}
-    return 0;
-}
+static void listener_release(struct vnode *v) {kfree(v->priv);kfree(v);}
 static bool listener_can_read(struct vnode *v,struct file *f) {
     (void)f;struct channel_listener *l=v->priv;return l->head!=NULL;
 }
@@ -306,11 +242,11 @@ static void listener_close(struct vnode *v,struct file *f) {
     struct channel_pending *pending=l->head;l->head=l->tail=NULL;
     vfs_poll_notify(v);irq_restore(flags);
     /* A pending server reference is an ordinary owner. Closing it propagates
-     * both directional EOF/N_ERR_CLOSED and wakes clients, even after owner death. */
+     * N_ERR_CLOSED to the client and wakes it, even after owner death. */
     while(pending){struct channel_pending *next=pending->next;vfs_close(pending->server);kfree(pending);pending=next;}
 }
 static struct vnode_ops listener_ops={
-    .can_read=listener_can_read,.can_write=listener_can_write,.close=listener_close,.release=channel_release,
+    .can_read=listener_can_read,.can_write=listener_can_write,.close=listener_close,.release=listener_release,
 };
 int channel_listen(const char *key,size_t length,struct file **listener) {
     if(!length || length>SIZE_MAX-sizeof(struct channel_listener))return -N_ERR_INVALID;
@@ -336,7 +272,7 @@ int channel_connect(const char *key,size_t length,struct file **client) {
     if(!l){irq_restore(flags);return -N_ERR_NOT_FOUND;}
     struct channel_pending *pending=kmalloc(sizeof *pending);
     if(!pending){irq_restore(flags);return -N_ERR_NO_MEMORY;}
-    struct file *server;int e=channel_pair(client,&server);
+    struct file *server;int e=message_channel_pair(client,&server);
     if(e){kfree(pending);irq_restore(flags);return e;}
     pending->next=NULL;pending->server=server;
     if(l->tail)l->tail->next=pending;else l->head=pending;l->tail=pending;
@@ -372,9 +308,10 @@ struct message_link {
     struct wait_queue wait[2];      /* receivers of queue i */
     struct wait_queue send_wait[2]; /* senders into queue i */
 };
-
-static bool message_queue_full(const struct message_link *l, int side, size_t n) {
-    return l->queued[side] && l->queued[side] + n > MESSAGE_QUEUE_LIMIT;
+/* Full while MESSAGE_QUEUE_LIMIT bytes or more wait, whatever the next
+ * message's size: N_EVENT_SENDABLE then means a send will not wait. */
+static bool message_queue_full(const struct message_link *l, int side) {
+    return l->queued[side] >= MESSAGE_QUEUE_LIMIT;
 }
 static struct vnode_ops message_ops;
 
@@ -413,7 +350,7 @@ int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct
         done += piece;
     }
     uint64_t fl = irq_save();
-    while (l->open[peer] && message_queue_full(l, peer, n)) {
+    while (l->open[peer] && message_queue_full(l, peer)) {
         if (current_task->killed) { irq_restore(fl); kfree(m); return -N_ERR_STOPPED; }
         wq_wait(&l->send_wait[peer]);
     }
@@ -429,9 +366,11 @@ int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct
 }
 
 /* peek reports the next message's size without taking it. A message larger
- * than cap stays queued and reports N_ERR_TOO_LARGE. */
+ * than cap stays queued and reports N_ERR_TOO_LARGE. discard takes the next
+ * message off the queue whatever its size, copies only its first cap bytes,
+ * closes its attachment and reports its whole size. */
 int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wait, bool peek,
-                                struct file **attached) {
+                                bool discard, struct file **attached) {
     struct vnode *v = f->vn;
     struct message_link *l = v->priv;
     int side = message_side(v);
@@ -441,8 +380,9 @@ int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wai
         struct message *m = l->head[side];
         if (m) {
             if (peek) { irq_restore(fl); return (int64_t)m->size; }
-            if (m->size > cap) { irq_restore(fl); return -N_ERR_TOO_LARGE; }
-            if (!user_ok_w(ubuf, m->size)) { irq_restore(fl); return -N_ERR_BAD_ADDRESS; }
+            if (!discard && m->size > cap) { irq_restore(fl); return -N_ERR_TOO_LARGE; }
+            size_t copy = MIN(m->size, cap);
+            if (!user_ok_w(ubuf, copy)) { irq_restore(fl); return -N_ERR_BAD_ADDRESS; }
             l->head[side] = m->next;
             if (!l->head[side]) l->tail[side] = &l->head[side];
             m->next = NULL;
@@ -452,8 +392,8 @@ int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wai
             irq_restore(fl);
             /* Taken off the queue: copy out in pieces without holding the
                guard. Only a sibling unmapping the buffer meanwhile loses it. */
-            for (size_t done = 0; done < m->size;) {
-                size_t piece = MIN(m->size - done, (size_t)PIPE_SEGMENT_SIZE);
+            for (size_t done = 0; done < copy;) {
+                size_t piece = MIN(copy - done, (size_t)PIPE_SEGMENT_SIZE);
                 uint64_t cf = irq_save();
                 bool ok = user_ok_w((uint8_t *)ubuf + done, piece);
                 if (ok) memcpy((uint8_t *)ubuf + done, m->bytes + done, piece);
@@ -462,6 +402,7 @@ int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wai
                 done += piece;
             }
             int64_t size = (int64_t)m->size;
+            if (discard) { message_free(m); return size; }
             *attached = m->attached;
             m->attached = NULL;
             kfree(m);

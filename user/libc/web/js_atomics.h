@@ -2,11 +2,12 @@
  * realms. Shared buffers live in native shared pages, so a dedicated Worker
  * (a child process) maps the same memory and Atomics.wait/notify meet in the
  * kernel's physical-address waiter list. waitAsync waiters are kernel address
- * watches whose notifications arrive on one pollable descriptor. */
+ * watches whose notifications arrive in one native event queue. */
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
 #include "quickjs.h"
+#include "nocturne.h"
 
 /* Install shared-page SharedArrayBuffer allocation and waitAsync enrollment. */
 void web_atomics_runtime_init(JSRuntime *rt);
@@ -16,8 +17,14 @@ void web_atomics_runtime_init(JSRuntime *rt);
  * same memory in this process; host.sharedBufferReserve(bytes) makes one whose
  * pages are zero-filled at first touch. */
 void web_atomics_host_init(JSContext *ctx, JSValueConst host);
-/* Readable when a waitAsync waiter was notified; -1 before the first one. */
-int web_atomics_fd(void);
+/* waitAsync tokens in the queue below carry this mark; other owners of the
+ * queue (the GUI loop, webnet) use their own. */
+#define WEB_ATOMICS_TOKEN (UINT64_C(0x41) << 56)
+/* The process's event queue for waitAsync waiters (made at the first call),
+ * shared with the thread's main wait: an event loop that waits on it hands
+ * every report it gets to web_atomics_events. */
+n_handle web_atomics_queue(void);
+void web_atomics_events(const struct n_event *events, size_t count);
 /* Earliest due waitAsync settlement of ctx: now when one is ready, -1 if none. */
 int64_t web_atomics_deadline(JSContext *ctx, uint64_t now);
 /* Settle ctx's notified and timed-out waiters in enrollment order. Run inside

@@ -1,10 +1,9 @@
 /* Native GUI-side IndexedDB transport. The persistent engine lives only in
- * browserstorageworker; this module does bounded, nonblocking pipe work. */
+ * browserstorageworker; this module never waits on it. One message channel
+ * carries each command and its result as one message apiece. Only one
+ * command is outstanding, so a send always finds the worker's queue empty. */
 #include <webidb_async.h>
 #include <nocturne.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
@@ -12,17 +11,17 @@
 struct idb_packet {
     struct idb_packet *next;
     struct webidb_wire_command command;
-    uint8_t *body;
-    size_t length, position;
+    uint8_t *body; /* room for the command, then length payload bytes */
+    size_t length;
+    bool sent;
 };
 struct webidb_async {
     struct webidb_async *next;
-    int pid, input, output;
+    n_handle app, channel;
     uint32_t serial;
     bool failed, ready;
     struct idb_packet *first, *last;
     struct webidb_wire_result response;
-    size_t header_position, body_position;
     uint8_t *body;
 };
 static webidb_async *retired;
@@ -38,16 +37,14 @@ static void packet_free(struct idb_packet *p) {
 static void stop(webidb_async *db) {
     if(db->failed)return;
     db->failed=true;
-    if(db->input>=0)close(db->input);
-    if(db->output>=0)close(db->output);
-    db->input=db->output=-1;
-    if(db->pid>0)kill(db->pid);
+    if(db->channel>=0)n_handle_close(db->channel);
+    db->channel=-1;
+    if(db->app>=0)n_app_stop(db->app,0);
 }
 static bool reap(webidb_async *db) {
-    if(db->pid>0){
-        int result=waitpid(db->pid,NULL,WNOHANG);
-        if(result!=db->pid&&!(result<0&&errno==ECHILD))return false;
-        db->pid=0;
+    if(db->app>=0){
+        if(n_app_result(db->app,0,NULL)==-N_ERR_NOT_READY)return false;
+        n_handle_close(db->app);db->app=-1;
     }
     return true;
 }
@@ -60,31 +57,23 @@ void webidb_async_background(void) {
     }
 }
 static bool spawn_broker(webidb_async *db) {
-    int input[2]={-1,-1},output[2]={-1,-1};
-    if(pipe(input)<0||pipe(output)<0)goto failed;
-    int map[3]={input[0],output[1],2};
-    char *arguments[]={"browserstorageworker",NULL};
-    db->pid=spawn("/bin/browserstorageworker",arguments,map,0);
-    close(input[0]);input[0]=-1;
-    close(output[1]);output[1]=-1;
-    if(db->pid<0){db->pid=0;goto failed;}
-    db->input=input[1];input[1]=-1;
-    db->output=output[0];output[0]=-1;
-    if(fcntl(db->input,F_SETFL,O_NONBLOCK)<0||fcntl(db->output,F_SETFL,O_NONBLOCK)<0){
-        stop(db);return false;
-    }
+    n_handle pair[2]={-1,-1};
+    if(n_channel_pair(pair)<0){stop(db);return false;}
+    /* The worker's diagnostics go to the page owner's stream, else the system log. */
+    const char *arguments[]={"browserstorageworker"};int32_t handles[]={pair[1],pair[1],2};
+    struct n_launch launch={.arguments=arguments,.argument_count=1,.handles=handles,.handle_count=3};
+    n_handle app=n_app_launch("/bin/browserstorageworker",&launch);
+    if(app==-N_ERR_NO_HANDLE){handles[2]=-1;app=n_app_launch("/bin/browserstorageworker",&launch);}
+    n_handle_close(pair[1]);
+    db->channel=pair[0];
+    if(app<0){stop(db);return false;}
+    db->app=app;
     return true;
-failed:
-    for(unsigned i=0;i<2;i++){
-        if(input[i]>=0)close(input[i]);
-        if(output[i]>=0)close(output[i]);
-    }
-    stop(db);return false;
 }
 webidb_async *webidb_async_create(void) {
     webidb_async_background();
     webidb_async *db=calloc(1,sizeof *db);
-    if(db)db->input=db->output=-1;
+    if(db)db->app=db->channel=-1;
     return db;
 }
 uint32_t webidb_async_submit(webidb_async *db,const struct webidb_async_request *request) {
@@ -101,9 +90,9 @@ uint32_t webidb_async_submit(webidb_async *db,const struct webidb_async_request 
        total>SIZE_MAX-sizeof(struct webidb_wire_command))return 0;
     struct idb_packet *p=calloc(1,sizeof *p);
     if(!p)return 0;
-    p->body=malloc(total?total:1);
+    p->body=malloc(sizeof p->command+total);
     if(!p->body){free(p);return 0;}
-    size_t at=0;
+    size_t at=sizeof p->command;
     if(origin_length){
         memcpy(p->body+at,request->origin,origin_length);at+=origin_length;
     }
@@ -126,55 +115,34 @@ uint32_t webidb_async_submit(webidb_async *db,const struct webidb_async_request 
         .name_length=name_length,.payload_length=value_length,.reference_count=request->reference_count
     };
     p->length=total;
-    if(!db->pid&&!spawn_broker(db)){packet_free(p);return 0;}
+    if(db->app<0&&!spawn_broker(db)){packet_free(p);return 0;}
     if(db->last)db->last->next=p;
     else db->first=p;
     db->last=p;
     return p->command.sequence;
 }
-static bool transient(void) {return errno==EAGAIN||errno==EINTR;}
 void webidb_async_pump(webidb_async *db) {
     if(!db||db->failed||db->ready||!db->first)return;
     struct idb_packet *p=db->first;
-    size_t budget=65536;
-    while(budget&&p->position<sizeof p->command+p->length){
-        bool header=p->position<sizeof p->command;
-        size_t at=header?p->position:p->position-sizeof p->command;
-        size_t available=header?sizeof p->command-at:p->length-at;
-        size_t step=available<budget?available:budget;
-        const uint8_t *bytes=header?(const uint8_t*)&p->command:p->body;
-        ssize_t done=write(db->input,bytes+at,step);
-        if(done<0&&transient())break;
-        if(done<=0){stop(db);return;}
-        p->position+=(size_t)done;budget-=(size_t)done;
+    if(!p->sent){
+        memcpy(p->body,&p->command,sizeof p->command);
+        if(n_channel_send(db->channel,p->body,sizeof p->command+p->length,-1)<0){stop(db);return;}
+        p->sent=true;
     }
-    budget=65536;
-    while(budget){
-        bool header=db->header_position<sizeof db->response;
-        size_t left=header?sizeof db->response-db->header_position:(size_t)db->response.payload_length-db->body_position;
-        if(!left){db->ready=true;return;}
-        size_t step=left<budget?left:budget;
-        uint8_t *bytes=header?(uint8_t*)&db->response:db->body;
-        size_t at=header?db->header_position:db->body_position;
-        ssize_t done=read(db->output,bytes+at,step);
-        if(done<0&&transient())return;
-        if(done<=0){stop(db);return;}
-        budget-=(size_t)done;
-        if(header){
-            db->header_position+=(size_t)done;
-            if(db->header_position==sizeof db->response){
-                struct webidb_wire_result *r=&db->response;
-                if(r->magic!=WEB_IDB_WIRE_MAGIC||r->operation!=p->command.operation||
-                   r->sequence!=p->command.sequence||r->status>WEB_IDB_MEMORY||
-                   r->payload_length>SIZE_MAX||r->count>SIZE_MAX){stop(db);return;}
-                if(r->payload_length||(r->operation==WEB_IDB_BEGIN&&r->pending)){
-                    db->body=malloc(r->payload_length?(size_t)r->payload_length:1);
-                    if(!db->body){stop(db);return;}
-                }
-            }
-        }else db->body_position+=(size_t)done;
-    }
-    if(db->header_position==sizeof db->response&&db->body_position==db->response.payload_length)db->ready=true;
+    n_result size=n_channel_receive(db->channel,NULL,0,N_CHANNEL_PEEK,NULL);
+    if(size==-N_ERR_NOT_READY)return;
+    struct webidb_wire_result *r=&db->response;
+    uint8_t *bytes=size>=(n_result)sizeof *r?malloc((size_t)size):NULL;
+    if(!bytes||n_channel_receive(db->channel,bytes,(size_t)size,0,NULL)!=size){free(bytes);stop(db);return;}
+    memcpy(r,bytes,sizeof *r);
+    if(r->magic!=WEB_IDB_WIRE_MAGIC||r->operation!=p->command.operation||
+       r->sequence!=p->command.sequence||r->status>WEB_IDB_MEMORY||
+       r->payload_length!=(size_t)size-sizeof *r||r->count>SIZE_MAX){free(bytes);stop(db);return;}
+    /* A pending BEGIN carries a present (possibly empty) body. */
+    if(r->payload_length||(r->operation==WEB_IDB_BEGIN&&r->pending)){
+        memmove(bytes,bytes+sizeof *r,(size_t)r->payload_length);db->body=bytes;
+    }else free(bytes);
+    db->ready=true;
 }
 static uint64_t read64(const uint8_t *bytes) {
     uint64_t value=0;
@@ -223,7 +191,7 @@ bool webidb_async_take(webidb_async *db,struct webidb_async_result *r) {
         }
     }
     free(db->body);db->body=NULL;
-    db->header_position=db->body_position=0;db->ready=false;
+    db->ready=false;
     memset(&db->response,0,sizeof db->response);
     db->first=p->next;if(!db->first)db->last=NULL;
     packet_free(p);return true;

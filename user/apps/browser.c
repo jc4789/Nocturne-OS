@@ -4,9 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <fcntl.h>
 #include <limits.h>
-#include <errno.h>
 #include "nocturne.h"
 #include "http.h"
 #include "web.h"
@@ -386,7 +384,7 @@ static void draw(void) {
 
 static void console_add(const char *level, const char *message) {
     const char *p = message ? message : "";
-    uint64_t now = uptime_ms();
+    uint64_t now = n_clock_uptime_ms();
     unsigned long sequence = ++console_sequence;
     int glyph = w ? MAX(gfx_text_width("M", FONT_SMALL), 1) : 8;
     size_t wrap = (size_t)MAX(16, MIN(CONSOLE_LINE - 64, (w ? w->w : 1024) / glyph - 48));
@@ -422,13 +420,13 @@ static void console_add(const char *level, const char *message) {
 
 static void redraw(void) {
     if(doc){int x,y,width,height;(void)web_take_paint_damage(doc,&x,&y,&width,&height);}
-    uint64_t start = debug_js ? uptime_ms() : 0;
+    uint64_t start = debug_js ? n_clock_uptime_ms() : 0;
     draw();
-    uint64_t drawn = debug_js ? uptime_ms() : 0;
+    uint64_t drawn = debug_js ? n_clock_uptime_ms() : 0;
     win_update(w);
     if (debug_js) {
         loop_profile.draw_ms += drawn - start;
-        loop_profile.update_ms += uptime_ms() - drawn;
+        loop_profile.update_ms += n_clock_uptime_ms() - drawn;
         loop_profile.draws++;
     }
     need_paint = false;
@@ -437,14 +435,14 @@ static void redraw_damage(void){
     int x,y,width,height;
     if(!doc||need_paint||sel_node||!web_take_paint_damage(doc,&x,&y,&width,&height)){redraw();return;}
     if(width<=0||height<=0)return;
-    uint64_t start=debug_js?uptime_ms():0;
+    uint64_t start=debug_js?n_clock_uptime_ms():0;
     canvas_t original=w->c;
     gfx_clip(&w->c,x,TB+y,width,height);
     draw_page();w->c=original;
-    uint64_t drawn=debug_js?uptime_ms():0;
+    uint64_t drawn=debug_js?n_clock_uptime_ms():0;
     win_update_rect(w,x,TB+y,width,height);
     if(debug_js){loop_profile.partial_draws++;loop_profile.partial_ms+=drawn-start;
-        loop_profile.partial_update_ms+=uptime_ms()-drawn;}
+        loop_profile.partial_update_ms+=n_clock_uptime_ms()-drawn;}
 }
 
 static void redraw_status(void) {
@@ -457,15 +455,15 @@ static void redraw_status(void) {
    Opening/closing or resizing it still follows the layout/full-paint path. */
 static void redraw_console(void) {
     if (!w || !console_dirty || !console_open || browser_fullscreen) return;
-    uint64_t start = debug_js ? uptime_ms() : 0;
+    uint64_t start = debug_js ? n_clock_uptime_ms() : 0;
     int top = TB + page_h(), height = console_h();
     draw_console();
-    uint64_t drawn = debug_js ? uptime_ms() : 0;
+    uint64_t drawn = debug_js ? n_clock_uptime_ms() : 0;
     win_update_rect(w, 0, top, w->w, height);
     if (debug_js) {
         loop_profile.console_draws++;
         loop_profile.console_ms += drawn - start;
-        loop_profile.console_update_ms += uptime_ms() - drawn;
+        loop_profile.console_update_ms += n_clock_uptime_ms() - drawn;
     }
 }
 
@@ -648,18 +646,19 @@ static bool read_local(const char *url, struct fetched *f) {
     if (q) *q = 0;
     pct_decode(path);
     if (!path[0]) strcpy(path, "/");
-    struct n_stat st;
-    if (stat(path, &st) < 0) {
+    struct n_entry info;
+    if (n_entry_info(path, &info) < 0) {
         snprintf(f->err, sizeof f->err, "%s: no such file or folder", path);
         return false;
     }
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        snprintf(f->err, sizeof f->err, "cannot open %s", path);
-        return false;
-    }
-    f->status = 200;
-    if (st.type == N_FT_DIR) { /* a folder listing */
+    if (info.kind == N_KIND_FOLDER) { /* a folder listing */
+        struct n_entry *entries = NULL;
+        n_result count = n_folder_entries(path, &entries);
+        if (count < 0) {
+            snprintf(f->err, sizeof f->err, "cannot open %s", path);
+            return false;
+        }
+        f->status = 200;
         struct sb s = {0};
         sb_str(&s, "<!doctype html><title>");
         sb_esc(&s, path, strlen(path));
@@ -668,21 +667,20 @@ static bool read_local(const char *url, struct fetched *f) {
         sb_esc(&s, path, strlen(path));
         sb_str(&s, "</h2><table>");
         if (strcmp(path, "/")) sb_str(&s, "<tr><td><a href=\"../\">../</a><td>");
-        struct n_dirent d;
-        for (int i = 0; readdir(fd, i, &d) > 0; i++) {
-            if (!strcmp(d.name, ".") || !strcmp(d.name, "..")) continue;
-            bool dir = d.type == N_FT_DIR;
+        for (n_result i = 0; i < count; i++) {
+            const struct n_entry *d = &entries[i];
+            bool dir = d->kind == N_KIND_FOLDER;
             char sz[32] = "";
-            if (!dir) snprintf(sz, sizeof sz, "%lu bytes", (unsigned long)d.size);
+            if (!dir) snprintf(sz, sizeof sz, "%llu bytes", (unsigned long long)d->size);
             sb_str(&s, "<tr><td><a href=\"");
-            sb_esc(&s, d.name, strlen(d.name));
+            sb_esc(&s, d->name, strlen(d->name));
             sb_str(&s, dir ? "/\">" : "\">");
-            sb_esc(&s, d.name, strlen(d.name));
+            sb_esc(&s, d->name, strlen(d->name));
             sb_str(&s, dir ? "/</a><td>" : "</a><td>");
             sb_str(&s, sz);
         }
+        free(entries);
         sb_str(&s, "</table>");
-        close(fd);
         f->body = s.b;
         f->len = s.n;
         strcpy(f->ctype, "text/html");
@@ -694,18 +692,25 @@ static bool read_local(const char *url, struct fetched *f) {
         }
         return true;
     }
-    if (st.size >= SIZE_MAX) {
-        close(fd);
+    n_handle doc = n_document_open(path, N_DOCUMENT_READ);
+    if (doc < 0) {
+        snprintf(f->err, sizeof f->err, "cannot open %s", path);
+        return false;
+    }
+    n_result size = n_document_size(doc);
+    if (size < 0 || (uint64_t)size >= SIZE_MAX) {
+        n_handle_close(doc);
         strlcpy(f->err, "file length is not representable", sizeof f->err);
         return false;
     }
-    size_t n = (size_t)st.size;
+    size_t n = (size_t)size;
     f->body = malloc(n + 1);
-    if (!f->body) { close(fd); strlcpy(f->err, "out of memory", sizeof f->err); return false; }
+    if (!f->body) { n_handle_close(doc); strlcpy(f->err, "out of memory", sizeof f->err); return false; }
     size_t got = 0;
-    long r;
-    while (got < n && (r = read(fd, f->body + got, n - got)) > 0) got += (size_t)r;
-    close(fd);
+    n_result r;
+    while (got < n && (r = n_document_read_at(doc, got, f->body + got, n - got)) > 0) got += (size_t)r;
+    n_handle_close(doc);
+    f->status = 200;
     f->body[got] = 0;
     f->len = got;
     strlcpy(f->ctype, guess_type(path), sizeof f->ctype);
@@ -797,10 +802,10 @@ static char *image_page(const char *url) {
 /* ---------------------------------------------------------------- navigation */
 static void relayout(void) {
     if (!doc) return;
-    uint64_t start = debug_js ? uptime_ms() : 0;
+    uint64_t start = debug_js ? n_clock_uptime_ms() : 0;
     doc_h = web_layout(doc, page_w(), page_h());
     doc_w = web_doc_width(doc);
-    if (debug_js) { loop_profile.layout_ms += uptime_ms() - start; loop_profile.layouts++; }
+    if (debug_js) { loop_profile.layout_ms += n_clock_uptime_ms() - start; loop_profile.layouts++; }
     clamp_scroll();
     need_layout = false;
 }
@@ -1166,8 +1171,13 @@ static void host_navigate_form(void *opaque, const char *url, const void *body, 
         queue_navigation_body(url,body,length,content_type,NAV_PUSH); return;
     }
     if (!strcasecmp(target,"_blank") && !body) {
-        char *args[]={"browser",(char *)url,NULL};int fds[]={0,1,2};
-        if (spawn("/bin/browser",args,fds,0)<0)console_add("error","Unable to open the form destination window");
+        /* The new window shares this one's input, output and log, if it has them. */
+        const char *args[]={"browser",url};int32_t handles[]={0,1,2};
+        struct n_launch launch={.arguments=args,.argument_count=2,.handles=handles,.handle_count=3};
+        n_handle app=n_app_launch("/bin/browser",&launch);
+        if (app==-N_ERR_NO_HANDLE) { launch.handle_count=0; app=n_app_launch("/bin/browser",&launch); }
+        if (app<0) console_add("error","Unable to open the form destination window");
+        else n_handle_close(app);
         return;
     }
     console_add("error","Named form destinations and POST into a new window are not yet supported");
@@ -1240,13 +1250,13 @@ static bool host_video_present(void *opaque, web_doc *document, const struct web
         w->c.pitch < w->c.w || w->c.h <= 0 ||
         (size_t)patch->pitch > SIZE_MAX / sizeof(uint32_t) / (size_t)patch->h ||
         (size_t)w->c.pitch > SIZE_MAX / sizeof(uint32_t) / (size_t)w->c.h) return false;
-    uint64_t start=debug_js?uptime_ms():0;
+    uint64_t start=debug_js?n_clock_uptime_ms():0;
     for (int row = 0; row < patch->h; row++)
         memcpy(w->c.px + (size_t)(patch->y + row) * w->c.pitch + patch->x,
                patch->pixels + (size_t)row * patch->pitch, (size_t)patch->w * sizeof(uint32_t));
     __sync_synchronize();
     win_update_rect(w,patch->x,patch->y,patch->w,patch->h);
-    if(debug_js){loop_profile.video_patches++;loop_profile.video_present_ms+=uptime_ms()-start;}
+    if(debug_js){loop_profile.video_patches++;loop_profile.video_present_ms+=n_clock_uptime_ms()-start;}
     return true;
 }
 static bool host_navigation_pending(void *opaque) {
@@ -1263,8 +1273,15 @@ static void native_active_event(const struct gui_event *event) {
 static int browser_event(struct gui_event *event, int timeout) {
     int result=win_event(w,event,0);
     if(!result && timeout!=0){
-        int ready=webnet_wait(network,w->fd,web_wait_fd(),timeout);
-        if(ready<0 && errno!=EINTR)return -1;
+        /* One wait for the window, transports and Atomics.waitAsync waiters. */
+        static bool window_watched;
+        n_handle queue=web_wait_queue();
+        if(queue<0)return -1;
+        if(!window_watched)window_watched=n_events_watch(queue,w->fd,N_EVENT_RECEIVABLE,UINT64_C(0x42)<<56)>=0;
+        struct n_event events[64];
+        int ready=webnet_wait(network,queue,window_watched||(timeout>=0&&timeout<10)?timeout:10,events,64);
+        if(ready<0)return -1;
+        web_wait_events(events,(size_t)ready);
         result=win_event(w,event,0);
     }
     /* Release/capture cancellation is native state, even while author JS is
@@ -1305,14 +1322,14 @@ static bool native_navigation_command(const struct gui_event *event) {
 static bool host_script_checkpoint(void *opaque) {
     (void)opaque;
     static uint64_t last;
-    uint64_t now=uptime_ms();
+    uint64_t now=n_clock_uptime_ms();
     if(quit)return false;
     if(now>=last && now-last<10)return true;
     last=now;
     webnet_service(network,now);
     uint64_t until=now+2;
     struct gui_event e;
-    while(w && uptime_ms()<until) {
+    while(w && n_clock_uptime_ms()<until) {
         int event=browser_event(&e,0);
         if(event<0){quit=true;return false;}
         if(!event)break;
@@ -1432,7 +1449,7 @@ static bool host_wait_request(void *opaque, uint64_t resource_id, const bool *co
             if (!t->detached && t->generation == owner_generation &&
                 t->resource_id == resource_id) { present = true; break; }
         if (!present) break;
-        uint64_t now = uptime_ms();
+        uint64_t now = n_clock_uptime_ms();
         webnet_pump(network, now);
         if (*completed) break;
         struct gui_event e;
@@ -1482,10 +1499,10 @@ static bool host_sync_request(void *opaque, const struct web_request *request, s
     prepare_native_snapshot(false);
     native_wait_snapshot=web_native_input_ready(doc,true);
     if (native_wait_snapshot && need_paint && !quit) redraw();
-    uint64_t started = uptime_ms();
+    uint64_t started = n_clock_uptime_ms();
     while (!s->ready && !quit && !sync_stopped && !pending_navigation &&
            doc == s->document && generation == s->generation) {
-        uint64_t now = uptime_ms();
+        uint64_t now = n_clock_uptime_ms();
         if (now - started >= WEBNET_TIMEOUT_MS) { sync_stopped = true; break; }
         webnet_pump(network, now);
         if (s->ready) break;
@@ -1543,7 +1560,7 @@ static void navigation_completed(webnet *net, uint64_t id, uint64_t gen,
     /* This callback observes the complete response, never its first byte.
        Generation/id checks above prevent a canceled request changing timing. */
     if (!result->error[0] && result->status > 0) {
-        navigation_timing.response_end_ms = uptime_ms();
+        navigation_timing.response_end_ms = n_clock_uptime_ms();
         navigation_timing.response_end_valid = true;
     }
     web_response_free(&navigation_response);
@@ -1697,13 +1714,13 @@ static void navigate_inner(const char *url, const void *post, size_t length, con
     stop_navigation();
     navigation_generation = ++next_generation;
     navigation_timing.valid = true;
-    navigation_timing.navigation_start_ms = uptime_ms();
+    navigation_timing.navigation_start_ms = n_clock_uptime_ms();
     navigation_mode = mode;
     loading = true;
     char what[256]; snprintf(what, sizeof what, "Loading %.240s", url); set_status(what);
     draw_toolbar(); win_update_rect(w, 0, 0, w->w, TB);
     if (has_prefix(url, "about:") || has_prefix(url, "file://")) {
-        navigation_timing.fetch_start_ms = uptime_ms();
+        navigation_timing.fetch_start_ms = n_clock_uptime_ms();
         navigation_timing.fetch_valid = true;
         struct fetched *local = calloc(1, sizeof *local);
         if (!local) { strcpy(navigation_response.error, "navigation allocation failed"); navigation_ready = true; return; }
@@ -1718,7 +1735,7 @@ static void navigate_inner(const char *url, const void *post, size_t length, con
             snprintf(navigation_response.headers, sizeof navigation_response.headers, "Content-Type: %s\r\n", local->ctype);
         }
         if (!navigation_response.error[0]) {
-            navigation_timing.response_end_ms = uptime_ms();
+            navigation_timing.response_end_ms = n_clock_uptime_ms();
             navigation_timing.response_end_valid = true;
         }
         if (!web_response_set_url(&navigation_response, local->url))
@@ -1736,7 +1753,7 @@ static void navigate_inner(const char *url, const void *post, size_t length, con
            opaque one: SameSite=Strict cookies remain eligible. */
         .credentials = WEBNET_CREDENTIALS_INCLUDE, .top_level_url=doc?web_url(doc):NULL
     };
-    navigation_timing.fetch_start_ms = uptime_ms();
+    navigation_timing.fetch_start_ms = n_clock_uptime_ms();
     navigation_timing.fetch_valid = true;
     navigation_id = webnet_submit(network, &rq, navigation_completed, NULL);
     if (!navigation_id) {
@@ -2661,10 +2678,10 @@ static void document_step(uint64_t now) {
         scroll_event_pending = false;
         web_document_scroll(doc);
     }
-    uint64_t tick_start = debug_js ? uptime_ms() : 0;
+    uint64_t tick_start = debug_js ? n_clock_uptime_ms() : 0;
     web_tick(doc, now);
     if (debug_js) {
-        uint64_t elapsed = uptime_ms() - tick_start;
+        uint64_t elapsed = n_clock_uptime_ms() - tick_start;
         loop_profile.tick_ms += elapsed;
         loop_profile.tick_max_ms = MAX(loop_profile.tick_max_ms, elapsed);
         loop_profile.ticks++;
@@ -2694,7 +2711,7 @@ static void document_step(uint64_t now) {
         if (url) {
             refresh_seen = true;
             if (delay <= 10 && strcmp(url, cur_url)) {
-                if (url_text_set(&refresh_text, url)) refresh_at = uptime_ms() + (uint64_t)MAX(delay, 0) * 1000 + 1;
+                if (url_text_set(&refresh_text, url)) refresh_at = n_clock_uptime_ms() + (uint64_t)MAX(delay, 0) * 1000 + 1;
                 else console_add("error", "Refresh URL allocation failed");
             }
         }
@@ -2726,7 +2743,7 @@ static void report_loop_profile(uint64_t now) {
            the difference between process and heap is mapped memory. */
         static struct n_procinfo processes[256];
         size_t heap = 0, used = 0; unsigned long process_kb = 0;
-        int count = proclist(processes, 256), self = getpid();
+        int count = proclist(processes, 256), self = (int)n_app_self();
         for (int i = 0; i < count; i++) if (processes[i].pid == self) process_kb = processes[i].mem_kb;
         malloc_usage(&heap, &used);
         snprintf(message, sizeof message, "Browser memory: process %lu KiB, malloc heap %lu KiB, in use %lu KiB",
@@ -2786,7 +2803,7 @@ int main(int argc, char **argv) {
             size_t length=source?fread(source,1,(size_t)end,file):0;
             if(file)fclose(file);
             if(!source||length!=(size_t)end){free(source);console_add("error","Console source file could not be read or allocated.");}
-            else {source[length]=0;free(console_startup);console_startup=source;console_startup_length=length;console_due=uptime_ms()+3000;}
+            else {source[length]=0;free(console_startup);console_startup=source;console_startup_length=length;console_due=n_clock_uptime_ms()+3000;}
             argc-=2;argv+=2;
         } else {
             fprintf(stderr,"browser: unknown or incomplete option: %s\n",argv[1]);return 2;
@@ -2827,9 +2844,9 @@ int main(int argc, char **argv) {
         } else go_addr(argv[1]);
     } else navigate(HOME, NULL, NAV_PUSH);
     while (!quit) {
-        uint64_t now = uptime_ms();
+        uint64_t now = n_clock_uptime_ms();
         webnet_pump(network, now);
-        if (debug_js) loop_profile.net_ms += uptime_ms() - now;
+        if (debug_js) loop_profile.net_ms += n_clock_uptime_ms() - now;
         apply_pending_history();
         apply_pending_navigation();
         finish_navigation();
@@ -2856,7 +2873,7 @@ int main(int argc, char **argv) {
             window_previous_state=state;window_state_known=true;
         }
         document_step(now);
-        report_loop_profile(uptime_ms());
+        report_loop_profile(n_clock_uptime_ms());
         if(console_startup_pending()&&doc&&!loading&&!native_wait&&now>=console_due&&!web_script_running(doc)){
             console_open=true;focus=F_CONSOLE;
             console_startup_generation=generation;
@@ -2867,7 +2884,7 @@ int main(int argc, char **argv) {
         apply_pending_history();
         apply_pending_navigation();
         if (quit) break;
-        now = uptime_ms();
+        now = n_clock_uptime_ms();
         struct gui_event e;
         if (evq_n) {
             flush_dom_layout();native_scroll_queue();handle_deferred_input();
@@ -2889,7 +2906,7 @@ int main(int argc, char **argv) {
         if(console_startup_pending()&&doc&&!loading){int due=now>=console_due?0:(int)MIN(console_due-now,0x7fffffff);
             if(timeout<0||due<timeout)timeout=due;}
         if (refresh_at) {
-            uint64_t now = uptime_ms();
+            uint64_t now = n_clock_uptime_ms();
             if (now >= refresh_at) {
                 refresh_at = 0;
                 navigate(refresh_url, NULL, NAV_PUSH);
@@ -2898,9 +2915,9 @@ int main(int argc, char **argv) {
             int due = (int)MIN(refresh_at - now, 0x7fffffff);
             if (timeout < 0 || due < timeout) timeout = due;
         }
-        uint64_t wait_start = debug_js ? uptime_ms() : 0;
+        uint64_t wait_start = debug_js ? n_clock_uptime_ms() : 0;
         int r = browser_event(&e, timeout);
-        if (debug_js) loop_profile.wait_ms += uptime_ms() - wait_start;
+        if (debug_js) loop_profile.wait_ms += n_clock_uptime_ms() - wait_start;
         if (r < 0) break;
         if (r > 0) {
             handle(&e);
@@ -2910,7 +2927,7 @@ int main(int argc, char **argv) {
     stop_navigation();
     cancel_document_requests();
     if (doc) web_free(doc);
-    web_media_background(uptime_ms()); /* cancel already killed children; never block the closing GUI */
+    web_media_background(n_clock_uptime_ms()); /* cancel already killed children; never block the closing GUI */
     webnet_free(network);
     webstorage_free(storage);
     parallel_shutdown();

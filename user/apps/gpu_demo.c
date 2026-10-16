@@ -11,7 +11,7 @@ int main(void) {
     struct n_gpu_batch r={.width=400,.height=400,.triangle_count=4,.clear_argb=RGB(22,20,42)};
     unsigned colors[3]={RGB(250,90,130),RGB(80,230,150),RGB(90,130,250)};
     while (!win->closed) {
-        double angle=uptime_ms()/1800.0;
+        double angle=n_clock_uptime_ms()/1800.0;
         for (int t=0;t<4;t++) for (int i=0;i<3;i++) {
             double a=angle*(t&1?-1:1)+i*M_PI*2/3;
             int x=(t&1)?23000:-23000, y=(t&2)?23000:-23000;

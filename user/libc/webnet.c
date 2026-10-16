@@ -5,7 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <errno.h>
 #include <time.h>
 #include <limits.h>
 
@@ -36,9 +35,9 @@ struct request {
     unsigned char *tx, *rx;
     size_t tx_len, tx_pos, rx_len, rx_pos;
     size_t response_limit;
-    size_t credit_due, credit_pos, tx_credit;
-    struct webnet_wire_credit credit;
+    size_t credit_due, tx_credit;
     struct webnet_wire_response head;
+    struct webnet_wire_in wire_in; /* the service message being read */
     size_t head_pos;
     bool cancelled, finishing, in_callback;
     bool streaming, paused, headers_seen, debug_request, debug_reported, frame_ready, credit_closed;
@@ -61,13 +60,22 @@ struct request {
     size_t keepalive_bytes;
     char error[160];
 };
-struct slot { struct request *rq; int pid, in, out; struct slot *next; bool shared; };
+/* A started request's connection to the webfetch service: one message
+   channel. live until the service retires its end, counting against the
+   concurrency limits meanwhile; watched is the interest registered in the
+   caller's wait queue, probed whether the retirement probe watches it. */
+struct slot { struct request *rq; n_handle channel; uint32_t watched; struct slot *next; bool live, probed; };
+/* Tokens of webnet's watches in the caller's wait queue and its own probe. */
+#define WEBNET_TOKEN (UINT64_C(0x57) << 56)
+#define WEBNET_SEND_TOKEN (UINT64_C(0x58) << 56)
 /* A WebSocket's own service channel. It never occupies a fetch worker slot:
    its lifetime is the page's, not a request's. */
 struct wsock {
     struct wsock *next;
     uint64_t id, generation;
-    int fd;
+    n_handle channel;
+    uint32_t watched;
+    struct webnet_wire_in in;
     webnet_socket_callback callback;
     void *opaque;
     unsigned char *tx;
@@ -90,7 +98,11 @@ struct webnet {
     unsigned worker_limit;
     unsigned pump_cursor;
     uint64_t budget_at;
-    int service_pid, service_listener;
+    n_handle service, service_listener;
+    /* probe: retirement of paused transports and room to send, checked
+       without touching the caller's queue. watch_queue: the queue the
+       watched interests below are registered in. */
+    n_handle probe, watch_queue;
     char service_key[96];
     bool debug, pumping, parked_first;
     size_t queued_bytes;
@@ -98,7 +110,44 @@ struct webnet {
     struct wsock *sockets;
 };
 
-static void request_free(struct request *r) { if(!r)return;free(r->tx); free(r->rx); free(r->merge);free(r->cookie_site);free(r->cookie_origin);free(r->transport_origin); free(r); }
+n_result webnet_wire_read(n_handle h, struct webnet_wire_in *in, void *dest, size_t n, int flags) {
+    if (in->at == in->length) {
+        if (!n) return 0;
+        if (!in->capacity) {
+            if (!(in->bytes = malloc(WEBNET_WIRE_IN_MIN))) return -N_ERR_NO_MEMORY;
+            in->capacity = WEBNET_WIRE_IN_MIN;
+        }
+        /* Most pieces fit; a larger message stays queued and is measured.
+           A byte channel simply fills the buffer. */
+        n_result got = n_channel_receive(h, in->bytes, in->capacity, flags, NULL);
+        if (got == -N_ERR_TOO_LARGE) {
+            n_result size = n_channel_receive(h, NULL, 0, N_CHANNEL_PEEK, NULL);
+            if (size < 0) return size;
+            /* Replace, never copy: the old piece was read completely. */
+            free(in->bytes); in->bytes = NULL; in->capacity = 0;
+            if (!(in->bytes = malloc((size_t)size))) return -N_ERR_NO_MEMORY;
+            in->capacity = (size_t)size;
+            got = n_channel_receive(h, in->bytes, in->capacity, 0, NULL);
+        }
+        if (got < 0) return got == -N_ERR_NOT_READY ? 0 : got;
+        in->length = (size_t)got; in->at = 0;
+    }
+    size_t count = MIN(n, in->length - in->at);
+    memcpy(dest, in->bytes + in->at, count); in->at += count;
+    /* An idle reader does not keep a large piece's storage. */
+    if (in->at == in->length && in->capacity > WEBNET_SERVICE_WINDOW) webnet_wire_in_free(in);
+    return (n_result)count;
+}
+void webnet_wire_in_free(struct webnet_wire_in *in) { free(in->bytes); *in = (struct webnet_wire_in){0}; }
+n_result webnet_wire_write(n_handle h, const void *data, size_t n) {
+    for (size_t done = 0;;) {
+        n_result sent = n_channel_send(h, (const char *)data + done, n - done, -1);
+        if (sent < 0) return sent;
+        done += (size_t)sent;
+        if (done == n) return (n_result)n;
+    }
+}
+static void request_free(struct request *r) { if(!r)return;free(r->tx); free(r->rx); free(r->merge);free(r->cookie_site);free(r->cookie_origin);free(r->transport_origin); webnet_wire_in_free(&r->wire_in); free(r); }
 static unsigned worker_budget(void){
     struct n_cpuinfo cpu={0};struct n_sysinfo memory={0};
     unsigned online=cpu_info(&cpu)>=0&&cpu.online_cpus?cpu.online_cpus:1;
@@ -116,46 +165,77 @@ static void load_cookie_psl(webcookie_jar *jar) {
     if (text) { size_t n = fread(text, 1, WEBCOOKIE_PSL_MAX + 1, f); if (n <= WEBCOOKIE_PSL_MAX) webcookie_psl_load(jar, text, n); free(text); }
     fclose(f);
 }
+/* Closing the end also ends its watches. */
 static void slot_close(struct slot *s) {
-    if (s->in >= 0) close(s->in);
-    if (s->out >= 0 && s->out != s->in) close(s->out);
-    s->in = s->out = -1;
-}
-static bool slot_reap(struct slot *s) {
-    if (s->shared) { s->pid=0; return true; }
-    if (s->pid <= 0) return true;
-    int pid = s->pid;
-    int got = waitpid(pid, NULL, WNOHANG);
-    /* A transient wait error is not proof that this owned child exited. */
-    if (got == pid || (got < 0 && errno == ECHILD)) s->pid = 0;
-    return s->pid <= 0;
+    if (s->channel >= 0) n_handle_close(s->channel);
+    s->channel = -1; s->watched = 0; s->probed = false;
 }
 static void slot_stop(struct slot *s, const char *error) {
     if (s->rq->finishing) return;
     if (error) snprintf(s->rq->error, sizeof s->rq->error, "%s", error);
     s->rq->finishing = true;
     slot_close(s);
-    if (s->pid > 0 && !s->shared) kill(s->pid);
 }
-static void reap_paused_stream(struct slot *s) {
+static struct slot *slot_by_channel(webnet *n, uint64_t token) {
+    n_handle channel = (n_handle)(uint32_t)token;
+    for (unsigned i = 0; i < WORKERS; i++) if (n->slots[i].rq && n->slots[i].channel == channel) return &n->slots[i];
+    for (struct slot *s = n->parked; s; s = s->next) if (s->rq && s->channel == channel) return s;
+    return NULL;
+}
+/* Probe reports: a retired service end no longer counts as a live transport.
+   Its queued messages, request and partial frame stay owned until
+   pull/resume or cancellation; nothing is read or delivered here. */
+static void probe_reports(webnet *n, const struct n_event *events, n_result count, uint64_t keep) {
+    for (n_result i = 0; i < count; i++) {
+        if (events[i].token == keep || !(events[i].events & N_EVENT_CLOSED) ||
+            (events[i].token & ~(uint64_t)UINT32_MAX) != WEBNET_TOKEN) continue;
+        n_events_unwatch(n->probe, events[i].token);
+        struct slot *s = slot_by_channel(n, events[i].token);
+        if (s) { s->live = false; s->probed = false; }
+    }
+}
+static bool probe_ready(webnet *n) {
+    if (n->probe < 0) { n_handle q = n_events_create(); if (q < 0) return false; n->probe = q; }
+    return true;
+}
+/* A paused stream may finish inside its byte window: notice the service
+   retiring its end, so its concurrency slot admits queued dependencies. */
+static void reap_paused(webnet *n, struct slot *s) {
     const struct request *r = s->rq;
-    if (!r || !r->streaming || !r->paused || r->finishing || s->pid <= 0) return;
-    struct n_pollfd peer = {s->out, 0, 0};
-    if (poll(&peer, 1, 0) < 0) slot_stop(s, "Worker poll failed");
-    else if (peer.revents & N_POLLHUP) slot_reap(s);
-    /* Reaping releases only the live transport. The dynamic pipe, request and
-       partially received frame remain owned until pull/resume or cancellation;
-       do not consume bytes, deliver a callback or manufacture END here. */
+    if (!r || !r->streaming || !r->paused || r->finishing || !s->live || s->channel < 0 || s->probed || !probe_ready(n)) return;
+    if (n_events_watch(n->probe, s->channel, N_EVENT_CLOSED, WEBNET_TOKEN | (uint32_t)s->channel) >= 0) s->probed = true;
+}
+static void reap_retired(webnet *n) {
+    bool any = false;
+    for (unsigned i = 0; i < WORKERS && !any; i++) any = n->slots[i].probed;
+    for (const struct slot *s = n->parked; s && !any; s = s->next) any = s->probed;
+    if (!any) return;
+    struct n_event events[64];
+    n_result got = n_events_wait(n->probe, events, 64, 0);
+    if (got > 0) probe_reports(n, events, got, 0);
+}
+/* Whether a send on h would not wait (a closed peer reports at once too). */
+static bool sendable(webnet *n, n_handle h) {
+    if (!probe_ready(n)) return true;
+    uint64_t token = WEBNET_SEND_TOKEN | (uint32_t)h;
+    if (n_events_watch(n->probe, h, N_EVENT_SENDABLE | N_EVENT_CLOSED, token) < 0) return true;
+    struct n_event events[64];
+    n_result got = n_events_wait(n->probe, events, 64, 0);
+    n_events_unwatch(n->probe, token);
+    bool ready = false;
+    for (n_result i = 0; i < got; i++) ready |= events[i].token == token;
+    if (got > 0) probe_reports(n, events, got, token);
+    return ready;
 }
 webnet *webnet_create(void) {
     webnet *n = calloc(1, sizeof *n);
     if (n) {
-        n->service_listener=-1;
+        n->service = n->service_listener = n->probe = n->watch_queue = -1;
         n->cookies = webcookie_create();
         if (!n->cookies) { free(n); return NULL; }
         load_cookie_psl(n->cookies);
         n->worker_limit=worker_budget();
-        for (int i = 0; i < WORKERS; i++) n->slots[i].in = n->slots[i].out = -1;
+        for (int i = 0; i < WORKERS; i++) n->slots[i].channel = -1;
     }
     return n;
 }
@@ -166,12 +246,12 @@ void webnet_free(webnet *n) {
         struct slot *s = &n->slots[i];
         if (!s->rq) continue;
         slot_close(s);
-        if (s->pid > 0 && !s->shared) { kill(s->pid); waitpid(s->pid, NULL, 0); }
         request_free(s->rq);
     }
-    while(n->parked){struct slot *s=n->parked;n->parked=s->next;slot_close(s);if(s->pid>0&&!s->shared){kill(s->pid);waitpid(s->pid,NULL,0);}request_free(s->rq);free(s);}
-    if(n->service_pid>0){kill(n->service_pid);waitpid(n->service_pid,NULL,0);}
-    if(n->service_listener>=0)close(n->service_listener);
+    while(n->parked){struct slot *s=n->parked;n->parked=s->next;slot_close(s);request_free(s->rq);free(s);}
+    if(n->service>=0){n_app_stop(n->service,0);n_app_result(n->service,-1,NULL);n_handle_close(n->service);}
+    if(n->service_listener>=0)n_handle_close(n->service_listener);
+    if(n->probe>=0)n_handle_close(n->probe);
     while (n->queue) { struct request *r = n->queue; n->queue = r->next; request_free(r); }
     while(n->sockets){struct wsock *s=n->sockets;n->sockets=s->next;wsock_free(s);}
     webcookie_free(n->cookies); free(n);
@@ -339,10 +419,10 @@ static bool origin_available(const webnet *n,const struct request *request){
     unsigned busy=0;
     for(unsigned i=0;i<WORKERS;i++){
         const struct request *active=n->slots[i].rq;
-        if(n->slots[i].pid>0&&active&&!active->cancelled&&active->transport_origin&&!strcmp(active->transport_origin,request->transport_origin))busy++;
+        if(n->slots[i].live&&active&&!active->cancelled&&active->transport_origin&&!strcmp(active->transport_origin,request->transport_origin))busy++;
     }
     for(const struct slot *s=n->parked;s;s=s->next){const struct request *active=s->rq;
-        if(s->pid>0&&active&&!active->cancelled&&active->transport_origin&&!strcmp(active->transport_origin,request->transport_origin))busy++;
+        if(s->live&&active&&!active->cancelled&&active->transport_origin&&!strcmp(active->transport_origin,request->transport_origin))busy++;
     }
     /* Reserve the final HTTP/1 connection for document dependencies too,
        not just a global slot: same-origin long polls cannot starve a script. */
@@ -350,8 +430,8 @@ static bool origin_available(const webnet *n,const struct request *request){
 }
 static unsigned live_workers(const webnet *n){
     unsigned live=0;
-    for(unsigned i=0;i<WORKERS;i++)if(n->slots[i].rq&&n->slots[i].pid>0)live++;
-    for(const struct slot *s=n->parked;s;s=s->next)if(s->rq&&s->pid>0)live++;
+    for(unsigned i=0;i<WORKERS;i++)if(n->slots[i].rq&&n->slots[i].live)live++;
+    for(const struct slot *s=n->parked;s;s=s->next)if(s->rq&&s->live)live++;
     return live;
 }
 static struct request **available_class(webnet *n,unsigned priority){
@@ -388,45 +468,41 @@ static struct request *take_request(webnet *n,unsigned slot){
     *chosen=request->next;request->next=NULL;
     return request;
 }
-static bool service_start(webnet *n) {
-    if(n->service_pid>0){
-        int got=waitpid(n->service_pid,NULL,WNOHANG);
-        if(!got || (got<0 && errno!=ECHILD))return true;
-        n->service_pid=0;
-        close(n->service_listener);n->service_listener=-1;
+static n_result service_start(webnet *n) {
+    if(n->service>=0){
+        if(n_app_result(n->service,0,NULL)==-N_ERR_NOT_READY)return 0;
+        n_handle_close(n->service);n->service=-1;
+        n_handle_close(n->service_listener);n->service_listener=-1;
     }
     /* The native rendezvous key is an unguessable browser-owned capability.
        A different browser cannot join this process's cache/security partition. */
-    uint64_t nonce[2];int random=open("/dev/urandom",O_RDONLY);
-    if(random<0)return false;
-    size_t pos=0;
-    while(pos<sizeof nonce){ssize_t got=read(random,(char *)nonce+pos,sizeof nonce-pos);
-        if(got<0&&errno==EINTR)continue;if(got<=0){close(random);return false;}pos+=(size_t)got;}
-    close(random);
-    snprintf(n->service_key,sizeof n->service_key,"webfetch:%d:%016lx%016lx",getpid(),(unsigned long)nonce[0],(unsigned long)nonce[1]);
-    n->service_listener=n_channel_listen(n->service_key);
-    if(n->service_listener<0)return false;
-    int nullfd=open("/dev/null",O_WRONLY);
-    if(nullfd<0){close(n->service_listener);n->service_listener=-1;return false;}
-    int map[3]={n->service_listener,nullfd,nullfd};
-    char *argv[]={"webfetch","--service",NULL};
-    n->service_pid=spawn("/bin/webfetch",argv,map,0);
-    int saved=errno;close(nullfd);
-    if(n->service_pid<=0){close(n->service_listener);n->service_listener=-1;n->service_pid=0;errno=saved;return false;}
-    return true;
+    uint64_t nonce[2];
+    n_result r=n_random(nonce,sizeof nonce);
+    if(r<0)return r;
+    snprintf(n->service_key,sizeof n->service_key,"webfetch:%lld:%016llx%016llx",(long long)n_app_self(),
+        (unsigned long long)nonce[0],(unsigned long long)nonce[1]);
+    n_handle listener=n_channel_listen(n->service_key);
+    if(listener<0)return listener;
+    const char *args[]={"webfetch","--service"};
+    const int32_t handles[]={listener};
+    struct n_launch launch={.arguments=args,.argument_count=2,.handles=handles,.handle_count=1};
+    n_handle app=n_app_launch("/bin/webfetch",&launch);
+    if(app<0){n_handle_close(listener);return app;}
+    n->service=app;n->service_listener=listener;
+    return 0;
 }
 static bool start(webnet *n,struct slot *s,struct request *r) {
-    s->rq=r;s->shared=true;s->pid=0;s->in=s->out=-1;
-    if(service_start(n)){
-        int fd=n_channel_connect(n->service_key);
-        if(fd>=0){s->in=s->out=fd;s->pid=n->service_pid;return true;}
-    }
-    int saved=errno;r->finishing=true;
-    snprintf(r->error,sizeof r->error,"Cannot connect /bin/webfetch service (errno %d)",saved);
+    *s=(struct slot){.rq=r,.channel=-1};
+    n_result connected=service_start(n);
+    if(connected>=0)connected=n_channel_connect(n->service_key);
+    if(connected>=0){s->channel=(n_handle)connected;s->live=true;return true;}
+    r->finishing=true;
+    snprintf(r->error,sizeof r->error,"Cannot connect /bin/webfetch service: %s",n_result_text(connected));
     return false;
 }
 static void wsock_free(struct wsock *s) {
-    if (s->fd >= 0) close(s->fd);
+    if (s->channel >= 0) n_handle_close(s->channel);
+    webnet_wire_in_free(&s->in);
     free(s->tx); free(s->rx); free(s->cookie_url); free(s->cookie_site); free(s);
 }
 static struct wsock *wsock_find(const webnet *n, uint64_t id) {
@@ -437,7 +513,8 @@ static struct wsock *wsock_find(const webnet *n, uint64_t id) {
    is walking the list. The pump or webnet_free reclaims them. */
 static void wsock_end(struct wsock *s) {
     s->ended = true;
-    if (s->fd >= 0) { close(s->fd); s->fd = -1; }
+    if (s->channel >= 0) { n_handle_close(s->channel); s->channel = -1; s->watched = 0; }
+    webnet_wire_in_free(&s->in);
     free(s->tx); s->tx = NULL; s->tx_len = s->tx_pos = s->tx_cap = 0;
 }
 static bool wsock_queue(struct wsock *s, uint32_t magic, uint32_t code, const void *data, size_t length) {
@@ -457,12 +534,13 @@ static bool wsock_queue(struct wsock *s, uint32_t magic, uint32_t code, const vo
     s->tx_len += need;
     return true;
 }
-static void wsock_flush(struct wsock *s) {
-    while (!s->ended && s->fd >= 0 && s->tx_pos < s->tx_len) {
-        ssize_t got = write(s->fd, s->tx + s->tx_pos, s->tx_len - s->tx_pos);
-        if (got < 0 && (errno == EAGAIN || errno == EINTR)) return;
-        if (got <= 0) return; /* the service left; its EOF ends the socket */
-        s->tx_pos += (size_t)got;
+/* Everything queued goes as one message, once the service has room for it:
+   the page never waits for the service. */
+static void wsock_flush(webnet *n, struct wsock *s) {
+    if (!s->ended && s->channel >= 0 && s->tx_pos < s->tx_len && sendable(n, s->channel)) {
+        /* A failed send means the service left; its end ends the socket. */
+        if (n_channel_send(s->channel, s->tx + s->tx_pos, s->tx_len - s->tx_pos, -1) < 0) return;
+        s->tx_pos = s->tx_len;
     }
     if (s->tx_pos == s->tx_len) {
         s->tx_pos = s->tx_len = 0;
@@ -479,36 +557,36 @@ uint64_t webnet_socket_open(webnet *n, const struct webnet_request *q, webnet_so
     if (!secure && strncasecmp(q->url, "ws://", 5)) return 0;
     const char *headers = q->headers ? q->headers : "";
     if (*headers && (strncasecmp(headers, "Sec-WebSocket-Protocol: ", 24) || strstr(headers, "\r\n") != headers + strlen(headers) - 2)) return 0;
-    if (!service_start(n)) return 0;
+    if (service_start(n) < 0) return 0;
     uint64_t id = ++n->serial;
     if (!id) id = ++n->serial;
     struct wsock *s = calloc(1, sizeof *s);
     if (!s) return 0;
-    s->fd = -1;
+    s->channel = -1;
     size_t rest = strlen(q->url) - (secure ? 6 : 5);
     s->cookie_url = malloc(rest + 9);
     s->cookie_site = strdup(q->top_level_url ? q->top_level_url : q->origin ? q->origin : "");
     if (s->cookie_url) snprintf(s->cookie_url, rest + 9, "%s://%s", secure ? "https" : "http", q->url + (secure ? 6 : 5));
     s->tx = wire_request(n, q, id, uptime_ms() + WEBNET_TIMEOUT_MS, 0, &s->tx_len);
     s->tx_cap = s->tx_len;
-    if (!s->cookie_url || !s->cookie_site || !s->tx || (s->fd = n_channel_connect(n->service_key)) < 0) { wsock_free(s); return 0; }
+    if (!s->cookie_url || !s->cookie_site || !s->tx || (s->channel = n_channel_connect(n->service_key)) < 0) { wsock_free(s); return 0; }
     s->id = id; s->generation = q->generation; s->callback = cb; s->opaque = opaque;
     struct wsock **tail = &n->sockets;
     while (*tail) tail = &(*tail)->next;
     *tail = s;
-    wsock_flush(s);
+    wsock_flush(n, s);
     return id;
 }
 bool webnet_socket_send(webnet *n, uint64_t id, unsigned type, const void *data, size_t length) {
     struct wsock *s = wsock_find(n, id);
     if (!s || (type != WEBNET_SOCKET_TEXT && type != WEBNET_SOCKET_BINARY) || !wsock_queue(s, WEBNET_SOCKET_MESSAGE, type, data, length)) return false;
-    wsock_flush(s);
+    wsock_flush(n, s);
     return true;
 }
 bool webnet_socket_close(webnet *n, uint64_t id, unsigned code, const void *reason, size_t length) {
     struct wsock *s = wsock_find(n, id);
     if (!s || code > 4999 || length > 123 || !wsock_queue(s, WEBNET_SOCKET_CLOSE, code, reason, length)) return false;
-    wsock_flush(s);
+    wsock_flush(n, s);
     return true;
 }
 size_t webnet_socket_buffered(const webnet *n, uint64_t id) {
@@ -547,14 +625,14 @@ static const char *wsock_opened(webnet *n, struct wsock *s, char *fields) {
     return protocol;
 }
 static void wsock_pump(webnet *n, struct wsock *s, bool callbacks, size_t *budget) {
-    wsock_flush(s);
+    wsock_flush(n, s);
     while (callbacks && !s->ended && *budget) {
         void *dest; size_t want;
         if (s->head_pos < sizeof s->head) { dest = (unsigned char *)&s->head + s->head_pos; want = sizeof s->head - s->head_pos; }
         else { dest = s->rx + s->rx_pos; want = s->rx_len - s->rx_pos; }
-        ssize_t got = want ? read(s->fd, dest, MIN(want, *budget)) : 0;
-        if (want && got < 0 && (errno == EAGAIN || errno == EINTR)) return;
-        if (want && got <= 0) {
+        n_result got = want ? webnet_wire_read(s->channel, &s->in, dest, MIN(want, *budget), 0) : 0;
+        if (want && got == 0) return;
+        if (want && got < 0) {
             struct webnet_socket_message m = {WEBNET_SOCKET_FAILED, 0, "WebSocket service ended", 23, ""};
             wsock_end(s); s->callback(n, s->id, &m, s->opaque); return;
         }
@@ -643,7 +721,7 @@ static bool cookie_events(webnet *n, struct request *r) {
 }
 static void complete(webnet *n, struct slot *s) {
     struct request *r = s->rq;
-    s->rq = NULL; s->pid = 0; slot_close(s); n->count--;
+    s->rq = NULL; s->live = false; slot_close(s); n->count--;
     if (r->tx) n->queued_bytes -= r->tx_len;
     if(n->debug){
         uint64_t done=uptime_ms();
@@ -837,27 +915,21 @@ struct pump_budget {size_t bytes;uint64_t until;bool callbacks;};
 static bool pump_room(const struct pump_budget *budget){
     return budget->bytes && uptime_ms()<budget->until;
 }
+/* Sends to the service never wait: credits and upload bytes stay within the
+   service window, well below what a channel holds before a sender waits. */
 static void credit_flush(struct slot *s) {
     struct request *r=s->rq;
     /* Credit returns bytes already moved into request memory, also while the
        reader is paused: the read-ahead bound, not the pause, limits them. */
-    if(!s->shared || r->tx || r->credit_closed || s->in<0)return;
-    if(!r->credit_pos && !r->credit.bytes){
-        if(r->credit_due<WEBNET_SERVICE_CREDIT_STEP)return;
-        r->credit=(struct webnet_wire_credit){WEBNET_CREDIT_MAGIC,(uint32_t)r->credit_due,r->id};
-        r->credit_due=0;
-    }
-    while(r->credit.bytes){
-        ssize_t got=write(s->in,(char *)&r->credit+r->credit_pos,sizeof r->credit-r->credit_pos);
-        if(got<0&&(errno==EAGAIN||errno==EINTR))return;
-        /* A response that fits the ahead window may already have retired its
-           writer. Its buffered bytes still belong to this request: a credit
-           EPIPE is not premature response EOF and must not discard them. */
-        if(got<0&&errno==EPIPE){r->credit_closed=true;r->credit_due=r->credit_pos=0;memset(&r->credit,0,sizeof r->credit);return;}
-        if(got<=0){slot_stop(s,"Worker credit channel closed");return;}
-        r->credit_pos+=(size_t)got;
-        if(r->credit_pos==sizeof r->credit){r->credit_pos=0;memset(&r->credit,0,sizeof r->credit);}
-    }
+    if(r->tx || r->credit_closed || s->channel<0 || r->credit_due<WEBNET_SERVICE_CREDIT_STEP)return;
+    struct webnet_wire_credit credit={WEBNET_CREDIT_MAGIC,(uint32_t)r->credit_due,r->id};
+    n_result sent=n_channel_send(s->channel,&credit,sizeof credit,-1);
+    /* A response that fits the ahead window may already have retired its
+       writer. Its queued messages still belong to this request: a closed
+       credit channel is not premature response end and must not discard them. */
+    if(sent==-N_ERR_CLOSED){r->credit_closed=true;r->credit_due=0;return;}
+    if(sent<0){slot_stop(s,"Worker credit channel failed");return;}
+    r->credit_due=0;
 }
 /* Dispatch is separate from transport service: native JS checkpoints may
    drain one bounded frame into request-owned memory, never reenter author JS. */
@@ -878,24 +950,15 @@ static void pump_slot(webnet *n,struct slot *s,uint64_t now,struct pump_budget *
         struct request *r = s->rq;
         if (!r||r->in_callback) return;
         if (!r->finishing && now >= r->deadline) slot_stop(s, "Request deadline exceeded");
-        reap_paused_stream(s);
+        reap_paused(n, s);
         if(!r->finishing&&(r->frame_ready||(r->merge_len&&!merge_hold(r,now)))&&!r->paused)frame_dispatch(n,s,global);
         if (!r->finishing&&(!r->paused||stream_ahead_room(r))&&!r->frame_ready&&pump_room(global)) {
-            struct n_pollfd pf[2] = {{s->out, N_POLLIN, 0}, {s->in, N_POLLOUT, 0}};
-            if (poll(pf, r->tx&&r->tx_credit&&s->in>=0 ? 2 : 1, 0) < 0) slot_stop(s, "Worker poll failed");
             size_t budget = MIN(PUMP_BYTES,global->bytes);
-            while (!r->finishing && r->tx && (!s->shared||r->tx_credit) && s->in >= 0 && budget && (pf[1].revents & N_POLLOUT)) {
-                size_t take = MIN(r->tx_len - r->tx_pos, budget);
-                if(s->shared)take=MIN(take,r->tx_credit);
-                ssize_t k = write(s->in, r->tx + r->tx_pos, take);
-                if (k < 0 && (errno == EAGAIN || errno == EINTR)) break;
-                if (k <= 0) { slot_stop(s, "Worker request pipe closed"); break; }
-                r->tx_pos += k; budget -= k;global->bytes-=k;
-                if(s->shared)r->tx_credit-=(size_t)k;
-                if (r->tx_pos == r->tx_len) {
-                    if(!s->shared){close(s->in);s->in=-1;}
-                    n->queued_bytes -= r->tx_len; free(r->tx); r->tx = NULL;
-                }
+            while (!r->finishing && r->tx && r->tx_credit && s->channel >= 0 && budget) {
+                size_t take = MIN(MIN(r->tx_len - r->tx_pos, budget), r->tx_credit);
+                if (n_channel_send(s->channel, r->tx + r->tx_pos, take, -1) < 0) { slot_stop(s, "Worker request channel closed"); break; }
+                r->tx_pos += take; budget -= take; global->bytes -= take; r->tx_credit -= take;
+                if (r->tx_pos == r->tx_len) { n->queued_bytes -= r->tx_len; free(r->tx); r->tx = NULL; }
             }
             credit_flush(s);
             /* A streamed body drains into its merge buffer only while the
@@ -907,26 +970,26 @@ static void pump_slot(webnet *n,struct slot *s,uint64_t now,struct pump_budget *
                ahead of media startup and lengthened playback stalls in
                measurements, which needs main-thread work first. */
             budget = r->streaming ? global->bytes : MIN(PUMP_BYTES,global->bytes);
-            while (!r->finishing && (!r->paused||stream_ahead_room(r)) && !r->frame_ready && budget && pump_room(global) && (pf[0].revents & (N_POLLIN | N_POLLHUP))) {
+            while (!r->finishing && (!r->paused||stream_ahead_room(r)) && !r->frame_ready && budget && pump_room(global)) {
                 void *dest; size_t take;
                 if (r->head_pos < sizeof r->head) {
                     dest = (unsigned char *)&r->head + r->head_pos; take = sizeof r->head - r->head_pos;
                 } else { dest = r->rx + r->rx_pos; take = r->rx_len - r->rx_pos; }
                 take = MIN(take, budget);
-                ssize_t k = read(s->out, dest, take);
-                if (k < 0 && (errno == EAGAIN || errno == EINTR)) break;
-                if (k <= 0) { slot_stop(s, "Worker response ended early"); break; }
+                n_result k = webnet_wire_read(s->channel, &r->wire_in, dest, take, 0);
+                if (k == 0) break; /* nothing waits yet */
+                if (k < 0) { slot_stop(s, "Worker response ended early"); break; }
                 budget -= k;global->bytes-=k;
                 if (r->head_pos < sizeof r->head) {
                     r->head_pos += k;
                     if (r->head_pos == sizeof r->head) {
                         struct webnet_wire_response *h = &r->head;
-                        if(s->shared && h->magic==WEBNET_STREAM_REQUEST_CREDIT){
+                        if(h->magic==WEBNET_STREAM_REQUEST_CREDIT){
                             if(h->id!=r->id||h->generation!=r->generation||!h->status||h->status>WEBNET_SERVICE_WINDOW-r->tx_credit||
                                h->url_len||h->headers_len||h->body_len||h->error_len||h->cookie_len){slot_stop(s,"Invalid worker upload credit");break;}
                             r->tx_credit+=h->status;r->head_pos=0;memset(h,0,sizeof *h);continue;
                         }
-                        if(s->shared)r->credit_due+=sizeof r->head;
+                        r->credit_due+=sizeof r->head;
                         if ((!r->streaming && h->magic != WEBNET_MAGIC) || (r->streaming && !stream_frame_valid(r)) || h->id != r->id || h->generation != r->generation ||
                             h->headers_len > webnet_wire_header_limit(WEBNET_WIRE_DYNAMIC_HEADERS) ||
                             h->body_len > r->response_limit || h->error_len >= sizeof r->error || (!r->streaming && h->status > 999) ||
@@ -941,7 +1004,7 @@ static void pump_slot(webnet *n,struct slot *s,uint64_t now,struct pump_budget *
                         r->rx = malloc(r->rx_len + 1);
                         if (!r->rx) { slot_stop(s, "Out of memory reading response"); break; }
                     }
-                } else {r->rx_pos += k;if(s->shared)r->credit_due+=(size_t)k;}
+                } else {r->rx_pos += k;r->credit_due+=(size_t)k;}
                 if (r->head_pos == sizeof r->head && r->rx_pos == r->rx_len) {
                     /* Keep draining body chunks that have already arrived;
                        the consumer gets them together when the pipe is empty
@@ -955,11 +1018,7 @@ static void pump_slot(webnet *n,struct slot *s,uint64_t now,struct pump_budget *
             }
             if(!r->finishing&&!r->paused&&r->merge_len&&!merge_hold(r,uptime_ms()))frame_dispatch(n,s,global);
         }
-        if (r->finishing && global->callbacks) {
-            /* Even a child that produced its frame must not hold a slot past the deadline. */
-            if (s->pid > 0 && !s->shared && now >= r->deadline) kill(s->pid);
-            if (slot_reap(s)) complete(n, s);
-        }
+        if (r->finishing && global->callbacks) { s->live = false; complete(n, s); }
 }
 static void pump_parked(webnet *n,uint64_t now,struct pump_budget *budget){
     struct slot **at=&n->parked,*last=NULL;
@@ -980,8 +1039,9 @@ static void pump(webnet *n,uint64_t now,bool callbacks){
     n->pumping=true;
     struct pump_budget budget={PUMP_TOTAL_BYTES,uptime_ms()+PUMP_TIME_MS,callbacks};
     if(!n->budget_at||now>=n->budget_at){n->worker_limit=worker_budget();n->budget_at=now+1000;}
+    reap_retired(n);
     struct request **qp=&n->queue;
-    while(callbacks&&*qp){struct request *r=*qp;if(now<r->deadline){qp=&r->next;continue;}*qp=r->next;r->next=NULL;struct slot temp={r,0,-1,-1,NULL,false};snprintf(r->error,sizeof r->error,"Request deadline exceeded");complete(n,&temp);qp=&n->queue;}
+    while(callbacks&&*qp){struct request *r=*qp;if(now<r->deadline){qp=&r->next;continue;}*qp=r->next;r->next=NULL;struct slot temp={.rq=r,.channel=-1};snprintf(r->error,sizeof r->error,"Request deadline exceeded");complete(n,&temp);qp=&n->queue;}
     /* Alternate active and resumed retained streams. Both groups receive a
        turn even when another callback uses the rest of this bounded slice. */
     bool parked_first=n->parked_first;n->parked_first=!parked_first;
@@ -1001,7 +1061,7 @@ static void pump(webnet *n,uint64_t now,bool callbacks){
         if(s->rq&&s->rq->paused&&!s->rq->finishing){
             struct slot *held=malloc(sizeof *held);
             if(!held){slot_stop(s,"Out of memory retaining stream transport");continue;}
-            *held=*s;held->next=n->parked;n->parked=held;memset(s,0,sizeof *s);s->in=s->out=-1;
+            *held=*s;held->next=n->parked;n->parked=held;*s=(struct slot){.channel=-1};
         }
     }
     if(!parked_first)pump_parked(n,now,&budget);
@@ -1015,11 +1075,19 @@ unsigned webnet_inflight(const webnet *n){return n?live_workers(n):0;}
 /* The earlier of ms and when a started request next needs the pump. */
 static int active_due(const struct request *r, uint64_t now, int ms) {
     if (r->finishing || (!r->paused && r->frame_ready) || now >= r->deadline) return 0;
+    /* A message already taken from the channel is read a pump slice at a
+       time; its rest never raises a channel event, so it needs the pump now. */
+    if (r->wire_in.at < r->wire_in.length && !r->frame_ready && (!r->paused || stream_ahead_room(r))) return 0;
+    /* Sends never wait, so pending upload bytes or credit need the pump now. */
+    if ((r->tx && r->tx_credit) || (!r->tx && !r->credit_closed && r->credit_due >= WEBNET_SERVICE_CREDIT_STEP)) return 0;
     if (r->deadline - now < (uint64_t)ms) ms = (int)(r->deadline - now);
     if (!r->paused && r->merge_len) ms = (int)MIN((uint64_t)ms, merge_hold(r, now));
     return ms;
 }
 int webnet_timeout(const webnet *n, uint64_t now) {
+    if (!n) return -1;
+    /* Socket records left in a taken message wait on the pump, not the channel. */
+    for (const struct wsock *s = n->sockets; s; s = s->next) if (!s->ended && s->in.at < s->in.length) return 0;
     if (!webnet_busy(n)) return -1;
     int ms = INT_MAX;
     for (const struct request *r = n->queue; r; r = r->next) {
@@ -1033,49 +1101,46 @@ int webnet_timeout(const webnet *n, uint64_t now) {
     if(n->queue && !live_workers(n))return 0;
     return ms;
 }
-static void wait_slot(struct n_pollfd *fds,unsigned *count,const struct slot *s){
+static uint32_t slot_interest(const struct slot *s){
     const struct request *r=s->rq;
-    if(!r||r->finishing||r->frame_ready||s->out<0)return;
+    if(!r||r->finishing||r->frame_ready||s->channel<0)return 0;
     /* A small paused response may finish inside its byte window. Observe only
        peer retirement so its concurrency slot can admit queued dependencies;
-       unread body data itself must never wake a paused consumer. */
-    /* Read-ahead into request memory continues while there is room. */
-    if(r->paused&&!stream_ahead_room(r)){if(s->pid>0)fds[(*count)++]=(struct n_pollfd){s->out,0,0};return;}
-    short events=N_POLLIN;
-    if((r->tx&&r->tx_credit)||(!r->credit_closed&&(r->credit.bytes||r->credit_due>=WEBNET_SERVICE_CREDIT_STEP)))events|=N_POLLOUT;
-    fds[(*count)++]=(struct n_pollfd){s->out,events,0};
+       unread body data itself must never wake a paused consumer. Read-ahead
+       into request memory continues while there is room. */
+    if(r->paused&&!stream_ahead_room(r))return s->live?N_EVENT_CLOSED:0;
+    return N_EVENT_RECEIVABLE;
 }
-int webnet_wait(webnet *n,int event_fd,int aux_fd,int timeout_ms){
-    /* Only live native workers can have an unpaused transport. Closed parked
-       response shells are already buffered and never enter this poll set. */
-    unsigned count=0,sockets=0;
-    for(const struct wsock *s=n?n->sockets:NULL;s;s=s->next)if(!s->ended)sockets++;
-    struct n_pollfd local[WORKERS*2+2+8],*fds=local;
-    size_t capacity=sizeof local/sizeof *local;
-    if(sockets>8){
-        /* Sockets live as long as their pages; their descriptors all join. */
-        struct n_pollfd *grown=malloc((WORKERS*2+2+(size_t)sockets)*sizeof *grown);
-        if(grown){fds=grown;capacity=WORKERS*2+2+(size_t)sockets;}
-    }
-    if(event_fd>=0)fds[count++]=(struct n_pollfd){event_fd,N_POLLIN,0};
-    if(aux_fd>=0)fds[count++]=(struct n_pollfd){aux_fd,N_POLLIN,0};
+/* Change a watch only when its interest changes: one wait, few calls. */
+static bool watch(n_handle q,n_handle h,uint32_t *watched,uint32_t interest){
+    if(interest==*watched)return true;
+    uint64_t token=WEBNET_TOKEN|(uint32_t)h;
+    n_result r=interest?n_events_watch(q,h,interest,token):n_events_unwatch(q,token);
+    if(r<0)return false;
+    *watched=interest;
+    return true;
+}
+int webnet_wait(webnet *n,n_handle queue,int timeout_ms,struct n_event *events,size_t max){
     if(n){
         int due=webnet_timeout(n,uptime_ms());
         if(due>=0&&(timeout_ms<0||due<timeout_ms))timeout_ms=due;
-        for(const struct wsock *s=n->sockets;s;s=s->next){
-            if(s->ended||s->fd<0)continue;
-            if(count==capacity){timeout_ms=0;break;}
-            fds[count++]=(struct n_pollfd){s->fd,(short)(N_POLLIN|(s->tx_pos<s->tx_len?N_POLLOUT:0)),0};
+        if(n->watch_queue!=queue){
+            for(struct wsock *s=n->sockets;s;s=s->next)s->watched=0;
+            for(unsigned i=0;i<WORKERS;i++)n->slots[i].watched=0;
+            for(struct slot *s=n->parked;s;s=s->next)s->watched=0;
+            n->watch_queue=queue;
         }
-        for(unsigned i=0;i<WORKERS&&count+2<=capacity;i++)wait_slot(fds,&count,&n->slots[i]);
-        for(const struct slot *s=n->parked;s;s=s->next){
-            if(count+2>capacity){timeout_ms=0;break;}
-            wait_slot(fds,&count,s);
-        }
+        bool watched=true;
+        for(struct wsock *s=n->sockets;s;s=s->next)if(!s->ended&&s->channel>=0)
+            watched&=watch(queue,s->channel,&s->watched,N_EVENT_RECEIVABLE|(s->tx_pos<s->tx_len?N_EVENT_SENDABLE:0));
+        /* Closed parked response shells are already buffered and never watched. */
+        for(unsigned i=0;i<WORKERS;i++)if(n->slots[i].channel>=0)
+            watched&=watch(queue,n->slots[i].channel,&n->slots[i].watched,slot_interest(&n->slots[i]));
+        for(struct slot *s=n->parked;s;s=s->next)if(s->channel>=0)
+            watched&=watch(queue,s->channel,&s->watched,slot_interest(s));
+        if(!watched)timeout_ms=0; /* the pump looks again instead */
     }
-    int ready=poll(fds,(int)count,timeout_ms);
-    if(fds!=local){int saved=errno;free(fds);errno=saved;}
-    return ready;
+    return (int)n_events_wait(queue,events,max,timeout_ms);
 }
 static void cancel(webnet *n, uint64_t key, bool generation) {
     if (!n) return;
@@ -1087,27 +1152,19 @@ static void cancel(webnet *n, uint64_t key, bool generation) {
     }
     for (int i = 0; i < WORKERS; i++) {
         struct slot *s = &n->slots[i];
-        if (s->rq && (generation ? s->rq->generation : s->rq->id) == key && !(generation && s->rq->keepalive)) {
-            s->rq->cancelled = true; slot_stop(s, NULL);
-            if (s->pid > 0 && !s->shared) kill(s->pid);
-        }
+        if (s->rq && (generation ? s->rq->generation : s->rq->id) == key && !(generation && s->rq->keepalive)) { s->rq->cancelled = true; slot_stop(s, NULL); }
     }
     for(struct slot *s=n->parked;s;s=s->next)if(s->rq&&(generation?s->rq->generation:s->rq->id)==key&&!(generation&&s->rq->keepalive)){s->rq->cancelled=true;slot_stop(s,NULL);}
     if (generation) {
-        /* Document teardown needs stopped children, not merely pending kill requests.
-           Signal both first; Nocturne wakes blocked killed tasks so wait can reap them.
-           Individual fetch aborts still use the nonblocking pump/reap path above. */
+        /* Document teardown releases its requests now: closing a channel ends
+           the service's work for it. Individual fetch aborts complete in the pump. */
         for (int i = 0; i < WORKERS; i++) {
             struct slot *s = &n->slots[i];
             if (!s->rq || s->rq->generation != key || s->rq->keepalive) continue;
-            if (s->pid > 0 && !s->shared) {waitpid(s->pid, NULL, 0);s->pid=0;}
             if(s->rq->in_callback)continue; /* borrowed response lives through callback return */
             complete(n, s); /* cancelled requests never invoke their callback */
         }
-        for(struct slot *s=n->parked;s;s=s->next)if(s->rq&&s->rq->generation==key&&!s->rq->keepalive){
-            if(s->pid>0&&!s->shared){waitpid(s->pid,NULL,0);s->pid=0;}
-            if(!s->rq->in_callback)complete(n,s);
-        }
+        for(struct slot *s=n->parked;s;s=s->next)if(s->rq&&s->rq->generation==key&&!s->rq->keepalive&&!s->rq->in_callback)complete(n,s);
     }
 }
 void webnet_cancel(webnet *n, uint64_t id) { cancel(n, id, false); }

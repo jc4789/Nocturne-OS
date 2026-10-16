@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
     printf("PING %s (%s): 40 data bytes\n", host, ip_format(ip, buf));
     int sent = 0, got = 0, min = 1 << 30, max = 0, sum = 0;
     for (int seq = 1; count <= 0 || seq <= count; seq++) {
-        uint64_t t0 = uptime_ms();
+        uint64_t t0 = n_clock_uptime_ms();
         int rtt = net_ping(ip, seq, 2000);
         sent++;
         if (rtt >= 0) {
@@ -44,8 +44,8 @@ int main(int argc, char **argv) {
             printf("seq=%d: %s\n", seq, strerror(errno));
         }
         if (count <= 0 || seq < count) {
-            uint64_t spent = uptime_ms() - t0;
-            if (spent < 1000) msleep((unsigned)(1000 - spent));
+            uint64_t spent = n_clock_uptime_ms() - t0;
+            if (spent < 1000) n_sleep_ms((unsigned)(1000 - spent));
         }
     }
     printf("--- %s: %d sent, %d received, %d%% loss", host, sent, got, sent ? (sent - got) * 100 / sent : 0);

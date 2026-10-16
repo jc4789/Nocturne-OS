@@ -85,7 +85,10 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - チャンネルは**メッセージ単位**の双方向路。一回の送信が一つのメッセージになり、
   受信側は境界を保ったまま受け取る。大きな塊は共有ページを添付して送る。
 - `n_channel_pair(n_handle out[2])`：無名の対（現行 `pipe` の置き換え）。
-- 名前付きの合流点は現行の `n_channel_listen`／`connect`／`accept` を引き継ぐ。
+- 名前付きの合流点：`n_channel_listen(key)` が鍵を（ハンドルが閉じるまで）占有し、
+  `n_channel_connect(key)` はメッセージチャンネルの片端を返す。もう一端は合流点で
+  待ち（`N_EVENT_RECEIVABLE`）、`n_channel_accept(listener)` で受け取る（無ければ
+  `N_ERR_NOT_READY`）。合流点が閉じると、待っている接続も閉じる。
 - `n_channel_send(h, data, n, attach)`、`n_channel_receive(h, buf, cap, flags, &attached)`。
   - 流量制御：受け手が未だ受け取っていない量が1MiBに達している間、送信は待つ
     （`N_EVENT_SENDABLE` で送れることを知れる）。空の待ち行列へは大きさに関係なく送れる。
@@ -94,6 +97,9 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   - `N_CHANNEL_PEEK` は次のメッセージの大きさだけを返し、取り出さない。
     `cap` より大きいメッセージは `N_ERR_TOO_LARGE` で、待ち行列に残る。長さ0の
     メッセージも一つのメッセージとして届く。
+  - `N_CHANNEL_DISCARD` は次のメッセージの先頭 `cap` バイトだけを写してから捨て（添付も閉じる）、その大きさを
+    返す。受け取る場所を確保できない大きなメッセージを断るため。`PEEK` とは併用できず、
+    未知のフラグと共に `N_ERR_INVALID`。
   - `attach` は文書または共有ページのハンドル（無ければ -1）。メッセージと一緒に運ばれ、
     受信側で新しいハンドルとして `attached` に入る（無ければ -1）。チャンネル自身を
     運ぶと参照の循環になるので `N_ERR_WRONG_KIND`。
@@ -173,6 +179,7 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 ## 8. 時間
 
 - `n_clock_uptime_ms()`、`n_clock_wall()`（壁時計の秒）、`n_sleep_ms(ms)`。
+- `n_random(buf, n)`：システムのエントロピーから `n` バイト（`/dev/urandom` の置き換え）。
 - `gettimeofday`、`struct timeval` は無い。ISO Cの `time`／`timespec_get`／`localtime` は
   これらの上に実装する。
 

@@ -500,10 +500,10 @@ int main(int argc, char **argv) {
 
     size_t cap = 4096;
     char *buf = malloc(cap);
-    uint64_t last_blink = uptime_ms();
+    uint64_t last_blink = n_clock_uptime_ms();
     bool alive = shell >= 0;
     for (;;) {
-        uint64_t now = uptime_ms();
+        uint64_t now = n_clock_uptime_ms();
         int timeout = (int)(500 - MIN(500, now - last_blink));
         if (win->qi < win->qn) timeout = 0;
         struct n_event ev[4];
@@ -557,7 +557,7 @@ int main(int argc, char **argv) {
                 return 0;
             }
         }
-        now = uptime_ms();
+        now = n_clock_uptime_ms();
         if (now - last_blink >= 500) {
             last_blink = now;
             blink_on = !blink_on;

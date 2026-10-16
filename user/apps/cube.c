@@ -96,10 +96,10 @@ int main(void) {
     double ax = 0.5, ay = 0.3, vx = 0.011, vy = 0.017;
     bool drag = false;
     int lmx = 0, lmy = 0;
-    uint64_t frames = 0, t0 = uptime_ms();
+    uint64_t frames = 0, t0 = n_clock_uptime_ms();
     int fps = 0;
     for (;;) {
-        uint64_t frame_start = uptime_ms();
+        uint64_t frame_start = n_clock_uptime_ms();
         canvas_t *c = &w->c;
         int W = w->w, H = w->h;
         gfx_gradient_v(c, 0, 0, W, H, RGB(16, 14, 34), RGB(44, 30, 70));
@@ -153,21 +153,21 @@ int main(void) {
         gfx_text(c, 10, H - 24, "space: next shape   drag: spin", RGB(110, 100, 150), TRANSPARENT, FONT_SMALL);
         win_update(w);
         frames++;
-        if (uptime_ms() - t0 >= 1000) {
+        if (n_clock_uptime_ms() - t0 >= 1000) {
             fps = (int)frames;
             frames = 0;
-            t0 = uptime_ms();
+            t0 = n_clock_uptime_ms();
         }
         if (!drag) {
             ax += vx;
             ay += vy;
         }
-        int spent = (int)(uptime_ms() - frame_start);
+        int spent = (int)(n_clock_uptime_ms() - frame_start);
         int wait = MAX(1, 16 - spent);
-        uint64_t until = uptime_ms() + wait;
+        uint64_t until = n_clock_uptime_ms() + wait;
         bool quit = false;
         for (;;) {
-            int64_t left = (int64_t)(until - uptime_ms());
+            int64_t left = (int64_t)(until - n_clock_uptime_ms());
             struct gui_event e;
             int r = win_event(w, &e, left > 0 ? (int)left : 0);
             if (r < 0) {

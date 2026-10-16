@@ -1,8 +1,10 @@
 #pragma once
 #include "media_mse_private.h"
 /* A native child owns a dynamic SourceBuffer registry. Wire has no pointers,
- * size_t, file paths or page-chosen protocols. */
-#define NMSW_MAGIC 0x4e4d5338u /* v8; VIDEO shared-page double buffer */
+ * size_t, file paths or page-chosen protocols. A command is one message on the
+ * control channel: the command, then its bytes (the child keeps the message
+ * as its own block); a response is one message: the response, metadata, PCM. */
+#define NMSW_MAGIC 0x4e4d5339u /* v9; message channels, attached VIDEO pages */
 #define NMSW_BUSY 4
 #define NMSW_CLOCK 5 /* Decoded disabled tracks: time only, never fake AV data. */
 #define NMSW_VIDEO_PENDING 6 /* STEP ACK: one VIDEO packet on its own lane. */
@@ -33,9 +35,10 @@ struct nmsw_metadata {
     uint64_t revision;int64_t group_end;
     struct nmsw_info info;
 };
-/* Dedicated VIDEO fd carries headers only. Raster bytes reside in a native
- * FD-backed double buffer, imported only by the direct parent. Release/acquire
- * occupied flags preserve decoder/receiver ownership across seek and resize.
+/* The VIDEO channel carries headers only. Raster bytes reside in native shared
+ * pages; a header whose storage is new carries their handle (attached=1).
+ * Release/acquire occupied flags preserve decoder/receiver ownership across
+ * seek and resize.
  * Epoch/revision reject old images without reusing their borrowed storage. */
 #define NMSW_VIDEO_SLOTS 2u
 struct nmsw_shared_video {uint32_t occupied[NMSW_VIDEO_SLOTS];uint64_t id;};
@@ -53,7 +56,7 @@ struct nmsw_video {
     uint64_t video_measured_frames,video_work_ms;
     uint64_t video_measurement_id;
     struct nmedia_video_configuration video_configuration;
-    int32_t shared_fd;
+    int32_t attached;
     uint32_t buffer_slot,shared_capacity,shared_reserved;
     uint64_t shared_id;
 };
@@ -92,7 +95,6 @@ const struct nmedia_time_range *nmedia_mse_worker_ranges_view(const nmedia_mse_w
 int nmedia_mse_worker_step(nmedia_mse_worker *,struct nmedia_output *);
 /* Taken, current-generation/revision VIDEO only. Both independent and muxed
  * decoder VIDEO use the separate lane; its owner permits a queued successor.
- * The retained control-payload compatibility path requires no successor.
  * Copy its shared slot to the caller's exclusively owned display/lookahead
  * spare, then release the slot. Capacity is pixels, not bytes. Never wait/JS. */
 bool nmedia_mse_worker_move_video(nmedia_mse_worker *,const struct nmedia_output *,

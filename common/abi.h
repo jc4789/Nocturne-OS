@@ -83,6 +83,7 @@ enum {
     SYS_EVENTS_TIMER, SYS_EVENTS_WAIT,
     SYS_APP_OPEN, SYS_APP_ID, SYS_SYSTEM_LOG_OPEN,
     SYS_AUDIO_OPEN, SYS_AUDIO_SUBMIT, SYS_AUDIO_STATUS, SYS_AUDIO_VOLUME,
+    SYS_RANDOM,
     SYS_MAX = 192
 };
 
@@ -115,6 +116,7 @@ struct n_entry {
 /* n_channel_receive flags */
 #define N_CHANNEL_WAIT 1
 #define N_CHANNEL_PEEK 2  /* report the next message's size, leave it queued */
+#define N_CHANNEL_DISCARD 4 /* copy up to cap bytes of the next message, then drop it; its size */
 
 /* n_app_launch. Handle i of the new app is handles[i] of the launcher (-1:
    none); by convention 0 is its input, 1 its output and 2 its log. Settings
