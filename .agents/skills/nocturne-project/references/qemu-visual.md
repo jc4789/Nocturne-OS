@@ -23,6 +23,41 @@ screendump build/nocturne-platform/<run>/after.ppm
 - 複数VMの独立接続では撮影要求と画像の読込みをbatch化できる。一つの接続に互いのcommand応答を混在させない。
 - PPMは対応する画像viewerで直に開くか、可逆のPNG形式変換をすぐ行う。crop、合成、加工した画像だけで実画面の受入をしない。全画面の原本を残す。
 
+## 一台のQEMUをコマンドラインで直接操作する（標準）
+
+ユーザー指示（2026-10-16）：QEMUは同時に一台だけ。`C:\Program Files\qemu`をWHPXで使い、Python一発スクリプトではなくコマンドラインから直接操作する。
+
+1. 既存のQEMU processがないか確認する。あればそれを使い、二台目を起動しない。
+2. 窓付きで起動する（例。boot/dataは既存の試験用媒体を使い回し、毎回コピー・削除しない。通常の`build/data.img`は接続しない）。
+
+   ```text
+   "C:/Program Files/qemu/qemu-system-x86_64.exe" -M pc -m 4096M -smp 4 -accel whpx -vga std
+     -serial file:<run>/serial.log -monitor tcp:127.0.0.1:45454,server,nowait
+     -device ahci,id=ahci
+     -drive id=boot,file=<run>/boot.img,format=raw,if=none,snapshot=on
+     -device ide-hd,drive=boot,bus=ahci.0,bootindex=0
+     -drive file=<run>/data.img,format=raw,if=ide,index=0,snapshot=on
+     -netdev user,id=qa -device e1000,netdev=qa
+   ```
+
+3. HMPへ一行ずつ送る（PowerShellの`TcpClient`やncなど、接続を保持して送るだけの小さな手段でよい）。
+
+   ```text
+   screendump "D:/.../shots/now.png" -f png
+   sendkey ctrl-l
+   mouse_move 400 300
+   mouse_button 1
+   mouse_button 0
+   ```
+
+4. 保存したPNGをその場で自分で開いて見る。操作→撮影→目視を短く繰り返し、固定秒数の観察期間を設けない。
+
+- **起動ディスク（boot.img）は必ずAHCIに接続する**（上記の`-device ahci`＋`ide-hd,bus=ahci.0`）。`if=ide`で接続すると、limineが368MBの`initrd.tar`（libc.a、browser、browserjsworker、CJKフォント等）をSeaBIOSのIDE PIO経由で読み、WHPX環境ではこれが極端に遅く、カーネル起動まで約3分かかる。AHCIにするだけで約8秒になった（2026-10-16実測）。data.imgは`if=ide`のままでよい（カーネルのドライバーが読むため）。
+- **起動が遅ければ異常。** 待ち続けず、まず起動ディスクの接続方式を確認し、原因として扱い報告する。
+- ゲストは`/data/tests/autorun.sh`を実行し、終わると電源断する。対話確認ではブラウザーを前面で起動したままにする。autorunの差替えは`mcopy -o -i "<data.img>@@1048576" autorun.sh ::/tests/autorun.sh`（dataの区画は1MiB位置）。
+- `snapshot=on`ではゲスト内の変更は残らず、ブラウザーprofileは毎回初回訪問者になる。サイトのA/B表示差もありうるので、参照画像と構成要素を照合して判断する。
+- 終了はHMPの`quit`。この作業で起動したQEMUだけを止める。
+
 ## このcheckoutの既存ハーネス
 
 `scripts/platform_qa.py`は隔離boot/data、QEMU条件、撮影・キー入力の補助。**Pythonハーネスを使うこと自体は必須ではない。** 起動が必要な場合だけ現行引数を確認する。例：
