@@ -112,7 +112,7 @@ int gettimeofday(struct timeval *tv, void *tz) {
    come from the millisecond uptime counter, as for gettimeofday. */
 int timespec_get(struct timespec *ts, int base) {
     if (!ts) return 0;
-    uint64_t ms = uptime_ms();
+    uint64_t ms = n_clock_uptime_ms();
     switch (base) {
     case TIME_UTC:
         ts->tv_sec = time(NULL);

@@ -941,16 +941,29 @@ static JSValue avmedia_call(JSContext *ctx, web_doc *d, node_t *n, const char *o
 JSValue web_avmedia_call(JSContext *ctx,web_doc *d,node_t *n,const char *op,int argc,JSValueConst *argv){
     web_avmedia_enter();JSValue result=avmedia_call(ctx,d,n,op,argc,argv);web_avmedia_leave();return result;
 }
+/* HAVE_METADATA once every attached SourceBuffer has initialization info.
+   Reads only responses the worker connection has already completed. */
+static void mse_metadata_ready(struct web_avmedia *s){
+    if(s->ready||!s->mse_worker)return;
+    bool initialized=false;
+    for(size_t i=0;i<s->mse_count;i++)if(s->mse[i].used){
+        initialized=true;
+        if(!nmedia_mse_worker_info(s->mse_worker,(unsigned)i))return;
+    }
+    if(initialized)s->ready=1;
+}
 static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool cooperative){
     if(uptime_ms()>=mse_until)return;
     if(s->audio_clock_failed){audio_failed(s,now);return;}
     /* An input-starved MSE child with no command/lane/output is asleep until
        APPEND/KEYS/seek/control revives demand. Re-reading its three pipes and
        the empty audio sink cannot produce data, and makes every unrelated
-       author/layout checkpoint pay for the same exhausted packet cursor. */
+       author/layout checkpoint pay for the same exhausted packet cursor.
+       Its last response may still have been collected at another safepoint,
+       so the metadata it carried is observed here too. */
     if(s->mse_active&&nmedia_mse_worker_running(s->mse_worker)&&
        !nmedia_mse_worker_needs_service(s->mse_worker)&&!s->pending.kind&&!s->ahead.kind&&
-       !s->mse_preparing&&!s->mse_seeking)return;
+       !s->mse_preparing&&!s->mse_seeking){mse_metadata_ready(s);return;}
     struct nmedia_worker_budget range_budget={.until=mse_until,.tx_bytes=65536,.nonblocking=cooperative};
     if(s->url_input&&s->error[0]){if(s->worker)range_failed(s,s->error);return;}
     if(!cooperative&&s->url_input&&s->range_waiting&&!s->worker){
@@ -982,14 +995,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
                 s->mse[i].revision_seen=revision;
             }s->mse[i].audio_owner=info&&info->audio;
         }
-        if(!s->ready){
-            bool initialized=false,complete=true;
-            for(size_t i=0;i<s->mse_count;i++)if(s->mse[i].used){
-                initialized=true;
-                if(!nmedia_mse_worker_info(s->mse_worker,(unsigned)i)){complete=false;break;}
-            }
-            if(initialized&&complete)s->ready=1;
-        }
+        mse_metadata_ready(s);
         /* The SEEK ACK only moves packet cursors. An unbuffered seek still
            needs appended bytes and real decoded output before seeked. */
         if(s->mse_seeking&&nmedia_mse_worker_seeking(s->mse_worker))return;

@@ -49,4 +49,6 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);
 int sscanf(const char *s, const char *fmt, ...);
 void perror(const char *msg);
 int remove(const char *path);
+int rename(const char *from, const char *to);
+FILE *tmpfile(void);
 NOCTURNE_END_DECLS

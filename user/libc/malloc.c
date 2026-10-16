@@ -1,23 +1,28 @@
-/* Boundary-tag allocator on top of sbrk(), with an explicit free list.
-   Large blocks get their own anonymous mapping instead: freeing one returns
-   its pages at once, and a growing large buffer never leaves a hole in the
-   break heap that only smaller requests could reuse. */
+/* Boundary-tag allocator over n_memory regions, with segregated free lists.
+   A region is [blocks ... end marker]: its first block has prev 0 and the
+   marker is a used block of size 0, so blocks never coalesce across regions.
+   A free tail goes back to the system page by page, and a region that becomes
+   wholly free goes back at once (except the newest, kept warm for reuse).
+   Large blocks get a region of their own: freeing one returns its pages at
+   once, and a growing large buffer never leaves a hole that only smaller
+   requests could reuse. */
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <errno.h>
-#include <sys/mman.h>
 #include "nocturne.h"
 
 #define HDR      16
 #define USED     1
-#define MAPPED   2   /* the block is a whole mapping; size is its page-rounded length */
+#define MAPPED   2   /* the block is a whole region; size is its page-rounded length */
 #define MAP_MIN  (1024 * 1024)
 #define MIN_BLK  32
 #define GROW_MIN (256 * 1024)
+#define GROW_MAX (8 * 1024 * 1024)
 #define TRIM_KEEP GROW_MIN
 #define TRIM_MIN  GROW_MIN
+#define PAGE     4096u
 
 typedef struct blk {
     size_t size; /* including header; bit0 = used */
@@ -29,7 +34,7 @@ typedef struct fblk {
     struct fblk *next, *pprev;
 } fblk;
 
-static blk *sentinel;
+static blk *newest_end; /* end marker of the newest region */
 /* Segregated free lists: exact 16-byte classes below SMALL_LIMIT, then eight
    classes per power of two. A bitmap finds the next non-empty class, so a
    request never walks blocks that cannot satisfy it. */
@@ -43,7 +48,7 @@ static blk *sentinel;
 static fblk *bins[BINS];
 static uint64_t bin_map[MAP_WORDS];
 static uint32_t allocator_lock;
-/* Bytes obtained from sbrk and bytes in allocated blocks (headers included). */
+/* Bytes in regions and bytes in allocated blocks (headers included). */
 static size_t heap_total, heap_used;
 static size_t mapped_total; /* bytes in large-block mappings, updated atomically */
 
@@ -141,67 +146,79 @@ static blk *coalesce(blk *b) {
     return b;
 }
 
-static void trim_top(blk *b) {
+static bool is_end(blk *b) { return b->size == USED; }
+
+/* Give pages back after free block b, which is not on a free list yet.
+   Returns true when b's whole region went back (b is gone). Interior and
+   small frees make no system call; a live block after b is never touched. */
+static bool trim(blk *b) {
+    blk *end = next_blk(b);
+    if (!is_end(end)) return false;
     size_t size = bsize(b);
-    /* Keep one normal growth quantum warm. Interior/small frees make no syscall;
-       a live tail or a different allocator's break must never be reclaimed. */
-    if (size < TRIM_KEEP + TRIM_MIN || next_blk(b) != sentinel) return;
-    size_t release = (size - TRIM_KEEP) & ~(size_t)4095;
-    char *end = (char *)sentinel + HDR;
     int saved_errno = errno;
-    if (sbrk(0) == end && sbrk(-(long)release) == end) {
+    if (!b->prev && end != newest_end) {
+        /* the region is wholly free: regions start at the first block */
+        if (n_memory_release(b, size + HDR) == 0) {
+            heap_total -= size + HDR;
+            errno = saved_errno;
+            return true;
+        }
+        errno = saved_errno;
+        return false;
+    }
+    /* Keep one growth quantum warm in the newest region; elsewhere keep only
+       what the block's own tags need. */
+    size_t keep = end == newest_end ? TRIM_KEEP : MIN_BLK;
+    if (size < keep + TRIM_MIN) return false;
+    uintptr_t kept_end = ((uintptr_t)b + keep + HDR + PAGE - 1) & ~(uintptr_t)(PAGE - 1);
+    uintptr_t old_end = (uintptr_t)end + HDR;
+    size_t release = old_end - kept_end;
+    /* Publish new tags only after the pages are really returned; the old end
+       marker lies inside the released range. */
+    if (n_memory_release((void *)kept_end, release) == 0) {
         heap_total -= release;
-        /* Do not touch the old sentinel after its page may have been returned.
-           Publish new tags only after the atomic native shrink succeeds. */
-        b->size = size - release;
-        sentinel = next_blk(b);
-        sentinel->size = USED;
-        sentinel->prev = bsize(b);
+        b->size = kept_end - HDR - (uintptr_t)b;
+        blk *marker = next_blk(b);
+        marker->size = USED;
+        marker->prev = bsize(b);
+        if (end == newest_end) newest_end = marker;
     }
     errno = saved_errno;
+    return false;
 }
 
-static int heap_init(void) {
-    uintptr_t base = (uintptr_t)sbrk(0);
-    size_t pad = (16 - (base & 15)) & 15;
-    if (sbrk(pad + HDR) == (void *)-1) return -1;
-    sentinel = (blk *)(base + pad);
-    sentinel->size = USED;
-    sentinel->prev = 0;
-    return 0;
-}
-
+/* A new region for at least need bytes. Regions grow with the heap, so a
+   large heap is not split into thousands of small ones; pages are committed
+   when reserved, so the growth stays a small part of what is in use. */
 static int grow(size_t need) {
-    size_t n = need + 64 < GROW_MIN ? GROW_MIN : (need + 64 + 4095) & ~(size_t)4095;
-    char *p = sbrk(n);
-    if (p == (void *)-1) return -1;
+    size_t step = heap_total / 16;
+    if (step < GROW_MIN) step = GROW_MIN;
+    if (step > GROW_MAX) step = GROW_MAX;
+    size_t n = need + HDR > step ? need + HDR : step;
+    n = (n + PAGE - 1) & ~(size_t)(PAGE - 1);
+    blk *b = n_memory_reserve(n, N_MEMORY_READ_WRITE);
+    if (!b) return -1;
     heap_total += n;
-    if (p != (char *)sentinel + HDR) {
-        /* someone else moved the break (another allocator, as with a program run by `tcc -run`):
-           start a new region. The old sentinel stays as the end marker of the previous one. */
-        uintptr_t base = (uintptr_t)p;
-        size_t pad = (16 - (base & 15)) & 15;
-        blk *b = (blk *)(base + pad);
-        b->prev = 0;
-        b->size = (n - pad - HDR) & ~(size_t)15; /* free */
-        sentinel = next_blk(b);
-        sentinel->size = USED;
-        sentinel->prev = bsize(b);
-        fl_push((fblk *)b);
-        return 0;
-    }
-    blk *b = sentinel;
-    b->size = n; /* free */
-    sentinel = next_blk(b);
-    sentinel->size = USED;
-    sentinel->prev = n;
-    b = coalesce(b);
+    b->prev = 0;
+    b->size = n - HDR; /* free */
+    blk *old_end = newest_end;
+    newest_end = next_blk(b);
+    newest_end->size = USED;
+    newest_end->prev = bsize(b);
     fl_push((fblk *)b);
+    /* The previous newest region kept its free tail warm; that is now the new
+       region's job, so trim it like any older region. */
+    if (old_end) {
+        blk *last = prev_blk(old_end);
+        if (!(last->size & USED)) {
+            fl_remove((fblk *)last);
+            if (!trim(last)) fl_push((fblk *)last);
+        }
+    }
     return 0;
 }
 
 static void *malloc_locked(size_t n) {
-    if (!sentinel && heap_init() < 0) return NULL;
     if (n > ((size_t)1 << 40)) return NULL;
     size_t need = (n + HDR + 15) & ~(size_t)15;
     if (need < MIN_BLK) need = MIN_BLK;
@@ -223,7 +240,7 @@ static void *malloc_locked(size_t n) {
             heap_used += bsize(b);
             return (char *)b + HDR;
         }
-        if (grow(need + HDR) < 0) return NULL;
+        if (grow(need) < 0) return NULL;
     }
     return NULL;
 }
@@ -234,16 +251,15 @@ static void free_locked(void *p) {
     b->size &= ~(size_t)USED;
     heap_used -= bsize(b);
     b = coalesce(b);
-    trim_top(b);
-    fl_push((fblk *)b);
+    if (!trim(b)) fl_push((fblk *)b);
 }
 
-/* Mapped blocks need no lock: the mapping is the block. Pages come zeroed. */
+/* Large blocks need no lock: the region is the block. Pages come zeroed. */
 static void *map_alloc(size_t n) {
     if (n > ((size_t)1 << 40)) return NULL;
-    size_t total = (n + HDR + 4095) & ~(size_t)4095;
-    blk *b = mmap(NULL, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (b == MAP_FAILED) return NULL;
+    size_t total = (n + HDR + PAGE - 1) & ~(size_t)(PAGE - 1);
+    blk *b = n_memory_reserve(total, N_MEMORY_READ_WRITE);
+    if (!b) return NULL;
     b->size = total | MAPPED | USED;
     b->prev = 0;
     __atomic_add_fetch(&mapped_total, total, __ATOMIC_RELAXED);
@@ -252,7 +268,7 @@ static void *map_alloc(size_t n) {
 static void map_free(blk *b) {
     size_t total = bsize(b);
     __atomic_sub_fetch(&mapped_total, total, __ATOMIC_RELAXED);
-    munmap(b, total);
+    n_memory_release(b, total);
 }
 
 void *calloc(size_t n, size_t m) {
@@ -335,10 +351,13 @@ void *realloc(void *p, size_t n) {
     if (b->size & MAPPED) {
         if (n <= have) {
             /* Give back whole pages a shrink no longer needs. */
-            size_t keep = (n + HDR + 4095) & ~(size_t)4095;
+            size_t keep = (n + HDR + PAGE - 1) & ~(size_t)(PAGE - 1);
             if (n >= MAP_MIN && keep < bsize(b)) {
                 size_t release = bsize(b) - keep;
-                if (!munmap((char *)b + keep, release)) {
+                int saved_errno = errno;
+                bool released = n_memory_release((char *)b + keep, release) == 0;
+                errno = saved_errno;
+                if (released) {
                     __atomic_sub_fetch(&mapped_total, release, __ATOMIC_RELAXED);
                     b->size = keep | MAPPED | USED;
                 }

@@ -69,10 +69,18 @@ typedef void (*_glapi_nop_handler_proc)(const char *name);
 
 struct _glapi_table;
 
+#if DETECT_OS_NOCTURNE
+/* The current dispatch and context live in native thread-local slots (no ELF
+   TLS, so tcc -run programs can link Mesa). */
+# define GET_DISPATCH() _mesa_glapi_get_dispatch()
+# define GET_CURRENT_CONTEXT(C)  struct gl_context *C = (struct gl_context *) _mesa_glapi_get_context()
+#else
 _GLAPI_EXPORT extern __THREAD_INITIAL_EXEC struct _glapi_table * _mesa_glapi_tls_Dispatch;
 _GLAPI_EXPORT extern __THREAD_INITIAL_EXEC void * _mesa_glapi_tls_Context;
+#endif
 
-#if DETECT_OS_WINDOWS && !defined(MAPI_MODE_SHARED_GLAPI)
+#if DETECT_OS_NOCTURNE
+#elif DETECT_OS_WINDOWS && !defined(MAPI_MODE_SHARED_GLAPI)
 # define GET_DISPATCH() _mesa_glapi_get_dispatch()
 # define GET_CURRENT_CONTEXT(C)  struct gl_context *C = (struct gl_context *) _mesa_glapi_get_context()
 #else

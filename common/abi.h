@@ -142,12 +142,17 @@ struct n_event {
 /* SYS_MMAP / SYS_MPROTECT protection bits (reading is always allowed) */
 #define N_PROT_WRITE 2
 #define N_PROT_EXEC 4
+/* SYS_MMAP placement (third argument): the low region below 2 GiB */
+#define N_MMAP_LOW 1
 
 /* n_memory_reserve / n_memory_protect access. Writable and executable are
    never granted together: generated code is written, then made executable. */
 #define N_MEMORY_READ 1
 #define N_MEMORY_READ_WRITE 2
 #define N_MEMORY_READ_EXECUTE 3
+/* Added to a reserve's access: place the pages below 2 GiB, for generated code
+   whose instructions hold sign-extended 32-bit absolute addresses. */
+#define N_MEMORY_LOW 0x10
 
 #define N_FT_FILE 1
 #define N_FT_DIR 2

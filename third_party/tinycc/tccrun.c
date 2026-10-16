@@ -75,7 +75,9 @@ static void rt_exit(rt_frame *f, int code);
 /* defined when included from lib/bt-exe.c */
 #ifndef CONFIG_TCC_BACKTRACE_ONLY
 
-#ifndef _WIN32
+#if CONFIG_TCC_NOCTURNE
+# include "nocturne.h"
+#elif !defined _WIN32
 # include <sys/mman.h>
 #endif
 
@@ -137,6 +139,12 @@ static int rt_mem(TCCState *s1, int size)
 #elif CONFIG_RUNMEM_VIRTUALALLOC
     /* always page-aligned */
     ptr = VirtualAlloc(NULL, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!ptr)
+        return tcc_error_noabort("tccrun: could not allocate memory");
+#elif CONFIG_TCC_NOCTURNE
+    /* Page-aligned, below 2 GiB: the linked libc objects hold 32-bit absolute
+       addresses of their own code and data. */
+    ptr = n_memory_reserve(size, N_MEMORY_READ_WRITE | N_MEMORY_LOW);
     if (!ptr)
         return tcc_error_noabort("tccrun: could not allocate memory");
 #else
@@ -202,6 +210,8 @@ ST_FUNC void tcc_run_free(TCCState *s1)
     munmap(ptr, size);
 #elif CONFIG_RUNMEM_VIRTUALALLOC
     VirtualFree(ptr, size, MEM_RELEASE);
+#elif CONFIG_TCC_NOCTURNE
+    n_memory_release(ptr, size);
 #else
     /* unprotect memory to make it usable for malloc again */
     protect_pages((void*)PAGEALIGN(ptr), size - PAGESIZE, 2 /*rw*/);
@@ -479,6 +489,16 @@ static int protect_pages(void *ptr, unsigned long length, int mode)
         };
     DWORD old;
     if (!VirtualProtect(ptr, length, protect[mode], &old))
+        return -1;
+#elif CONFIG_TCC_NOCTURNE
+    /* never writable and executable at once (CONFIG_RUNMEM_RO) */
+    static const unsigned char access[] = {
+        N_MEMORY_READ_EXECUTE,
+        N_MEMORY_READ,
+        N_MEMORY_READ_WRITE,
+        0
+        };
+    if (!access[mode] || n_memory_protect(ptr, length, access[mode]))
         return -1;
 #else
     static const unsigned char protect[] = {

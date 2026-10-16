@@ -20,6 +20,7 @@
 #include "util/os_file.h"
 #include <stdio.h>
 #include <string.h>
+#include "nocturne.h"
 
 /* ---- the one Mesa util/os_file.c service the GL state tracker uses ---- */
 
@@ -136,7 +137,10 @@ struct ngl_context {
 };
 
 static uint32_t drawable_ids;
-static __thread struct ngl_context *current;
+/* The calling thread's current context, in a native thread-local slot (no ELF
+   TLS, so tcc -run programs can link this). */
+static struct ngl_context *current_get(void) { return thread_local_get(N_TLS_GL_CONTEXT); }
+static void current_set(struct ngl_context *c) { thread_local_set(N_TLS_GL_CONTEXT, c); }
 
 static void drop_textures(struct ngl_context *c) {
     for (unsigned i = 0; i < ST_ATTACHMENT_COUNT; i++) pipe_resource_reference(&c->textures[i], NULL);
@@ -250,11 +254,11 @@ struct ngl_context *ngl_context_create(int es_major, const struct ngl_attribs *a
 
 void ngl_context_destroy(struct ngl_context *c) {
     if (!c) return;
-    struct ngl_context *previous = current;
+    struct ngl_context *previous = current_get();
     if (previous != c) ngl_make_current(c);
     st_context_flush(c->st, 0, NULL, NULL, NULL);
     st_api_make_current(NULL, NULL, NULL);
-    current = NULL;
+    current_set(NULL);
     st_destroy_context(c->st);
     st_api_destroy_drawable(&c->base);
     drop_textures(c);
@@ -263,18 +267,18 @@ void ngl_context_destroy(struct ngl_context *c) {
 }
 
 bool ngl_make_current(struct ngl_context *c) {
-    if (c == current) return true;
+    if (c == current_get()) return true;
     if (!c) {
         st_api_make_current(NULL, NULL, NULL);
-        current = NULL;
+        current_set(NULL);
         return true;
     }
     if (!st_api_make_current(c->st, &c->base, &c->base)) return false;
-    current = c;
+    current_set(c);
     return true;
 }
 
-struct ngl_context *ngl_get_current(void) { return current; }
+struct ngl_context *ngl_get_current(void) { return current_get(); }
 
 void ngl_get_attribs(const struct ngl_context *c, struct ngl_attribs *out) { *out = c->attribs; }
 
@@ -288,7 +292,7 @@ bool ngl_resize(struct ngl_context *c, unsigned width, unsigned height) {
     drop_textures(c);
     c->tex_width = c->tex_height = 0;
     p_atomic_inc(&c->base.stamp);
-    if (c == current) st_invalidate_buffers(c->st);
+    if (c == current_get()) st_invalidate_buffers(c->st);
     c->dirty++;
     return true;
 }

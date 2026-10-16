@@ -57,6 +57,10 @@ struct task {
     uint64_t brk_base, brk;
     uint64_t mmap_next;
     struct mmap_hole *mmap_holes; /* freed anonymous ranges below mmap_next, by address */
+    /* The low region [low_base, USER_LOW_TOP): native memory reserved with
+       N_MEMORY_LOW for code that holds 32-bit absolute addresses. */
+    uint64_t low_base, low_next;
+    struct mmap_hole *low_holes;
     struct shared_mapping *shared_mappings; /* native FD-backed page references */
     struct shared_ticket *shared_tickets;   /* page references offered to a peer */
     uint64_t shared_ticket_serial;

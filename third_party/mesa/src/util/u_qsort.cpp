@@ -27,6 +27,16 @@
 #include <thread>
 #endif
 
+#if DETECT_OS_NOCTURNE
+/* Nocturne's libc has ISO C qsort_s with the context; no thread-local state. */
+void
+util_tls_qsort_r(void *base, size_t nmemb, size_t size,
+                 int (*compar)(const void *, const void *, void *),
+                 void *arg)
+{
+   qsort_s(base, nmemb, size, compar, arg);
+}
+#else
 thread_local int (*tl_qsort_r_compar)(const void *, const void *, void *);
 thread_local void *tl_qsort_r_arg;
 
@@ -45,6 +55,7 @@ util_tls_qsort_r(void *base, size_t nmemb, size_t size,
    tl_qsort_r_arg = arg;
    return qsort(base, nmemb, size, qsort_r_compar);
 }
+#endif
 
 int
 util_qsort_adapter(void *ctx, const void *elem1, const void *elem2)

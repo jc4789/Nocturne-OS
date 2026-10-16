@@ -319,12 +319,15 @@ const char *
 debug_dump_enum(const struct debug_named_value *names,
                 uint64_t value);
 
+#if !DETECT_OS_NOCTURNE
 /**
  * Convert binary flags value to a string.
+ * (Not on Nocturne: it returns per-thread buffers, and nothing there calls it.)
  */
 const char *
 debug_dump_flags(const struct debug_named_value *names,
                  uint64_t value);
+#endif
 
 
 struct debug_control {

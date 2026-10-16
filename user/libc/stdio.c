@@ -1,4 +1,7 @@
-/* Buffered stdio and a printf/scanf implementation. */
+/* Buffered stdio over native handles, and a printf/scanf implementation.
+   A document has no shared cursor: its stream keeps its own position and reads
+   and writes there. Channels and devices (an app's input, output and log)
+   carry the bytes in order. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,7 +11,10 @@
 #include "nocturne.h"
 
 struct FILE {
-    int fd;
+    n_handle h;
+    int kind;       /* N_KIND_*; 0 until a standard stream is first used, -1 if its handle is missing */
+    bool append;    /* every write goes to the document's end */
+    uint64_t pos;   /* documents: the offset after the read-ahead window, or of buf[0] while writing */
     int mode; /* _IONBF / _IOLBF / _IOFBF */
     char *buf;
     int bufsize;
@@ -16,94 +22,222 @@ struct FILE {
     int rpos, rlen; /* read buffer window */
     int ungot;
     bool eof, err, own_buf;
+    char *temp_name; /* tmpfile: removed when closed */
     struct FILE *next;
 };
 
 static char stdin_buf[1024], stdout_buf[1024];
-static FILE f_stdin = {0, _IOLBF, stdin_buf, sizeof stdin_buf, 0, 0, 0, -1, false, false, false, NULL};
-static FILE f_stdout = {1, _IOLBF, stdout_buf, sizeof stdout_buf, 0, 0, 0, -1, false, false, false, NULL};
-static FILE f_stderr = {2, _IONBF, NULL, 0, 0, 0, 0, -1, false, false, false, NULL};
+static FILE f_stdin = {.h = 0, .mode = _IOLBF, .buf = stdin_buf, .bufsize = sizeof stdin_buf, .ungot = -1};
+static FILE f_stdout = {.h = 1, .mode = _IOLBF, .buf = stdout_buf, .bufsize = sizeof stdout_buf, .ungot = -1};
+static FILE f_stderr = {.h = 2, .mode = _IONBF, .ungot = -1};
 FILE *stdin = &f_stdin, *stdout = &f_stdout, *stderr = &f_stderr;
 static FILE *open_files;
 
 void __stdio_init(void) {}
 
-int fflush(FILE *f) {
-    if (!f) {
-        fflush(stdout);
-        fflush(stderr);
-        for (FILE *p = open_files; p; p = p->next) fflush(p);
-        return 0;
-    }
-    int off = 0;
-    while (off < f->wlen) {
-        ssize_t n = write(f->fd, f->buf + off, f->wlen - off);
-        if (n <= 0) {
-            f->err = true;
-            f->wlen = 0;
-            return EOF;
+static void stream_failed(FILE *f, n_result r) {
+    f->err = true;
+    errno = (int)(r < 0 ? -r : N_ERR_IO);
+}
+
+/* What a standard stream was given at launch. Output documents (a shell's
+   "> name") are appended to, so apps sharing one write after each other. */
+static int stream_kind(FILE *f) {
+    if (!f->kind) {
+        n_result k = n_handle_kind(f->h);
+        f->kind = k < 0 ? -1 : (int)k;
+        if (f->kind == N_KIND_DOCUMENT && f != stdin) {
+            f->append = true;
+            if (f->mode == _IOLBF) f->mode = _IOFBF; /* nobody reads it line by line */
         }
-        off += n;
     }
-    f->wlen = 0;
+    return f->kind;
+}
+
+/* All n bytes, or an error. */
+static int raw_write(FILE *f, const char *s, size_t n) {
+    int kind = stream_kind(f);
+    n_result r = -N_ERR_NO_HANDLE;
+    size_t off = 0;
+    if (kind == N_KIND_DOCUMENT) {
+        bool claimed = false;
+        r = 0;
+        if (f->append) {
+            /* the claim keeps other appenders from writing at the same end */
+            claimed = n_document_claim(f->h, true) == 0;
+            r = n_document_size(f->h);
+            if (r >= 0) f->pos = (uint64_t)r;
+        }
+        while (r >= 0 && off < n) {
+            r = n_document_write_at(f->h, f->pos, s + off, n - off);
+            if (r <= 0) break;
+            off += (size_t)r;
+            f->pos += (uint64_t)r;
+        }
+        if (claimed) n_document_release(f->h);
+    } else if (kind > 0) {
+        while (off < n) {
+            r = n_channel_send(f->h, s + off, n - off, -1);
+            if (r <= 0) break;
+            off += (size_t)r;
+        }
+    }
+    if (off < n) {
+        stream_failed(f, r);
+        return EOF;
+    }
     return 0;
 }
 
-void __stdio_flush_all(void) { fflush(NULL); }
-
-static int parse_mode(const char *m) {
-    int fl = 0;
-    bool plus = strchr(m, '+') != NULL;
-    switch (m[0]) {
-    case 'r': fl = plus ? O_RDWR : O_RDONLY; break;
-    case 'w': fl = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_TRUNC; break;
-    case 'a': fl = (plus ? O_RDWR : O_WRONLY) | O_CREAT | O_APPEND; break;
-    default: return -1;
+/* Bytes read, 0 at the end, EOF on error, or -2 when the next message of a
+   channel is larger than cap. */
+static int64_t raw_read(FILE *f, char *buf, size_t cap) {
+    int kind = stream_kind(f);
+    n_result r = -N_ERR_NO_HANDLE;
+    if (kind == N_KIND_DOCUMENT) {
+        r = n_document_read_at(f->h, f->pos, buf, cap);
+        if (r > 0) f->pos += (uint64_t)r;
+    } else if (kind > 0) {
+        /* an empty message carries no bytes: wait for the next one */
+        do r = n_channel_receive(f->h, buf, cap, N_CHANNEL_WAIT, NULL);
+        while (r == 0);
+        if (r == -N_ERR_CLOSED) r = 0;
+        else if (r == -N_ERR_TOO_LARGE) return -2;
     }
-    return fl;
+    if (r < 0) {
+        stream_failed(f, r);
+        return EOF;
+    }
+    return r;
 }
 
-FILE *fdopen(int fd, const char *mode) {
+int fflush(FILE *f) {
+    if (!f) {
+        int r = fflush(stdout) | fflush(stderr);
+        for (FILE *p = open_files; p; p = p->next) r |= fflush(p);
+        return r ? EOF : 0;
+    }
+    if (!f->wlen) return 0;
+    int r = raw_write(f, f->buf, (size_t)f->wlen);
+    f->wlen = 0;
+    return r;
+}
+
+/* At exit: everything written goes out, and temporary documents go away. */
+void __stdio_flush_all(void) {
+    fflush(NULL);
+    for (FILE *f = open_files; f; f = f->next)
+        if (f->temp_name) {
+            n_handle_close(f->h);
+            f->kind = -1;
+            n_entry_remove(f->temp_name);
+        }
+}
+
+/* A full path for a name: names relative to the app's folder get it in front
+   while apps still have one; the system resolves "." and "..". */
+static const char *full_path(const char *name, char *out, size_t cap) {
+    if (name[0] == '/') return name;
+    if (!getcwd(out, cap)) return NULL;
+    size_t used = strlen(out), n = strlen(name);
+    if (used + 1 + n >= cap) {
+        errno = N_ERR_TOO_LARGE;
+        return NULL;
+    }
+    out[used] = '/';
+    memcpy(out + used + 1, name, n + 1);
+    return out;
+}
+
+static n_handle open_or_create(const char *path) {
+    n_handle h = n_document_open(path, N_DOCUMENT_EDIT);
+    if (h == -N_ERR_NOT_FOUND) {
+        h = n_document_open(path, N_DOCUMENT_CREATE);
+        if (h == -N_ERR_EXISTS) h = n_document_open(path, N_DOCUMENT_EDIT); /* made meanwhile */
+    }
+    return h;
+}
+
+/* ISO C modes: r, w, a, each with an optional + and b; w may add x. */
+static n_handle open_document(const char *name, const char *m, bool *append) {
+    char buf[512];
+    const char *path = full_path(name, buf, sizeof buf);
+    if (!path) return -(n_result)errno;
+    bool plus = strchr(m, '+') != NULL;
+    *append = false;
+    switch (m[0]) {
+    case 'r': return n_document_open(path, plus ? N_DOCUMENT_EDIT : N_DOCUMENT_READ);
+    case 'w': {
+        if (strchr(m, 'x')) return n_document_open(path, N_DOCUMENT_CREATE);
+        n_handle h = open_or_create(path);
+        n_result r = h < 0 ? h : n_document_set_size(h, 0);
+        if (r < 0 && h >= 0) n_handle_close(h);
+        return r < 0 ? (n_handle)r : h;
+    }
+    case 'a':
+        *append = true;
+        return open_or_create(path);
+    }
+    return -N_ERR_INVALID;
+}
+
+static FILE *stream_new(n_handle h, int kind, bool append) {
     FILE *f = calloc(1, sizeof *f);
     if (!f) return NULL;
-    f->fd = fd;
+    f->h = h;
+    f->kind = kind;
+    f->append = append;
     f->mode = _IOFBF;
     f->bufsize = 4096;
     f->buf = malloc(f->bufsize);
     f->own_buf = true;
     f->ungot = -1;
+    if (!f->buf) {
+        free(f);
+        return NULL;
+    }
     f->next = open_files;
     open_files = f;
     return f;
 }
 
+FILE *fdopen(int fd, const char *mode) {
+    return stream_new(fd, 0, mode && mode[0] == 'a');
+}
+
 FILE *fopen(const char *path, const char *mode) {
-    int fl = parse_mode(mode);
-    if (fl < 0) {
-        errno = EINVAL;
+    bool append;
+    n_handle h = open_document(path, mode, &append);
+    if (h < 0) {
+        errno = (int)-h;
         return NULL;
     }
-    int fd = open(path, fl);
-    if (fd < 0) return NULL;
-    FILE *f = fdopen(fd, mode);
-    if (!f) close(fd);
+    FILE *f = stream_new(h, N_KIND_DOCUMENT, append);
+    if (!f) {
+        n_handle_close(h);
+        errno = N_ERR_NO_MEMORY;
+    }
     return f;
 }
 
-/* reopen keeps the FILE and its descriptor number (so freopen(..., stdin) stays fd 0) */
+/* The same FILE on a new document; the old handle is closed. */
 FILE *freopen(const char *path, const char *mode, FILE *f) {
-    int fl = parse_mode(mode);
-    if (fl < 0 || !path) {
-        errno = EINVAL;
+    if (!path) {
+        errno = N_ERR_INVALID;
         return NULL;
     }
     fflush(f);
-    int fd = open(path, fl);
-    if (fd < 0) return NULL;
-    if (fd != f->fd) {
-        dup2(fd, f->fd);
-        close(fd);
+    bool append;
+    n_handle h = open_document(path, mode, &append);
+    if (h < 0) {
+        errno = (int)-h;
+        return NULL;
     }
+    if (f->kind >= 0) n_handle_close(f->h);
+    f->h = h;
+    f->kind = N_KIND_DOCUMENT;
+    f->append = append;
+    f->pos = 0;
     f->wlen = f->rpos = f->rlen = 0;
     f->ungot = -1;
     f->eof = f->err = false;
@@ -111,21 +245,101 @@ FILE *freopen(const char *path, const char *mode, FILE *f) {
 }
 
 int fclose(FILE *f) {
-    fflush(f);
-    int r = close(f->fd);
-    if (f == stdin || f == stdout || f == stderr) return r;
+    int r = fflush(f);
+    n_result closed = n_handle_close(f->h);
+    if (closed < 0) {
+        errno = (int)-closed;
+        r = EOF;
+    }
+    if (f == stdin || f == stdout || f == stderr) {
+        f->kind = -1;
+        return r;
+    }
     FILE **pp = &open_files;
     while (*pp && *pp != f) pp = &(*pp)->next;
     if (*pp) *pp = f->next;
+    if (f->temp_name) {
+        n_entry_remove(f->temp_name);
+        free(f->temp_name);
+    }
     if (f->own_buf) free(f->buf);
     free(f);
     return r;
+}
+
+/* A new document that goes away when it is closed or the app ends. */
+FILE *tmpfile(void) {
+    static unsigned serial;
+    char name[64];
+    for (int tries = 0; tries < 100; tries++) {
+        uint64_t mix = n_clock_uptime_ms() * 0x9e3779b97f4a7c15ull + (uint64_t)(uintptr_t)&mix + ++serial;
+        snprintf(name, sizeof name, "/tmp/temporary-%llx", (unsigned long long)(mix ^ (mix >> 29)));
+        n_handle h = n_document_open(name, N_DOCUMENT_CREATE);
+        if (h == -N_ERR_EXISTS) continue;
+        if (h < 0) {
+            errno = (int)-h;
+            return NULL;
+        }
+        FILE *f = stream_new(h, N_KIND_DOCUMENT, false);
+        char *kept = f ? strdup(name) : NULL;
+        if (!kept) {
+            if (f) fclose(f);
+            else n_handle_close(h);
+            n_entry_remove(name);
+            errno = N_ERR_NO_MEMORY;
+            return NULL;
+        }
+        f->temp_name = kept;
+        return f;
+    }
+    errno = N_ERR_EXISTS;
+    return NULL;
+}
+
+int remove(const char *name) {
+    char buf[512];
+    const char *path = full_path(name, buf, sizeof buf);
+    n_result r = path ? n_entry_remove(path) : -(n_result)errno;
+    if (r < 0) {
+        errno = (int)-r;
+        return -1;
+    }
+    return 0;
+}
+
+/* An existing document under the new name takes the old one's content whole,
+   swapped in atomically, and the old name goes. */
+int rename(const char *from, const char *to) {
+    char a[512], b[512];
+    const char *src = full_path(from, a, sizeof a), *dst = src ? full_path(to, b, sizeof b) : NULL;
+    n_result r = dst ? n_entry_move(src, dst) : -(n_result)errno;
+    if (r == -N_ERR_EXISTS) {
+        struct n_entry s, d;
+        if (n_entry_info(src, &s) == 0 && n_entry_info(dst, &d) == 0 &&
+            s.kind == N_KIND_DOCUMENT && d.kind == N_KIND_DOCUMENT) {
+            void *data;
+            size_t size;
+            r = n_document_load(src, &data, &size);
+            if (r >= 0) {
+                r = n_document_save(dst, data, size);
+                if (data) n_memory_release(data, size);
+            }
+            if (r >= 0) r = n_entry_remove(src);
+        }
+    }
+    if (r < 0) {
+        errno = (int)-r;
+        return -1;
+    }
+    return 0;
 }
 
 int setvbuf(FILE *f, char *buf, int mode, size_t size) {
     fflush(f);
     f->mode = mode;
     if (buf) {
+        if (f->own_buf) free(f->buf);
+        f->own_buf = false; /* the caller's buffer is never freed here */
         f->buf = buf;
         f->bufsize = (int)size;
     }
@@ -139,22 +353,11 @@ int setvbuf(FILE *f, char *buf, int mode, size_t size) {
 
 static int write_bytes(FILE *f, const char *s, size_t n) {
     if (f->rlen) {
-        /* switching from reading: discard read-ahead */
-        lseek(f->fd, -(long)(f->rlen - f->rpos), SEEK_CUR);
+        /* switching from reading: give back the read-ahead */
+        if (stream_kind(f) == N_KIND_DOCUMENT) f->pos -= (uint64_t)(f->rlen - f->rpos);
         f->rlen = f->rpos = 0;
     }
-    if (f->mode == _IONBF || !f->buf) {
-        size_t off = 0;
-        while (off < n) {
-            ssize_t w = write(f->fd, s + off, n - off);
-            if (w <= 0) {
-                f->err = true;
-                return EOF;
-            }
-            off += w;
-        }
-        return 0;
-    }
+    if (f->mode == _IONBF || !f->buf) return raw_write(f, s, n);
     for (size_t i = 0; i < n; i++) {
         f->buf[f->wlen++] = s[i];
         if (f->wlen == f->bufsize || (f->mode == _IOLBF && s[i] == '\n')) {
@@ -164,18 +367,46 @@ static int write_bytes(FILE *f, const char *s, size_t n) {
     return 0;
 }
 
+/* A message larger than the buffer: the buffer grows to hold it whole. */
+static int grow_for_message(FILE *f) {
+    n_result size = n_channel_receive(f->h, NULL, 0, N_CHANNEL_WAIT | N_CHANNEL_PEEK, NULL);
+    if (size < 0) {
+        stream_failed(f, size);
+        return EOF;
+    }
+    if (size > INT32_MAX) {
+        stream_failed(f, -N_ERR_TOO_LARGE);
+        return EOF;
+    }
+    char *bigger = malloc((size_t)size);
+    if (!bigger) {
+        stream_failed(f, -N_ERR_NO_MEMORY);
+        return EOF;
+    }
+    if (f->own_buf) free(f->buf);
+    f->buf = bigger;
+    f->bufsize = (int)size;
+    f->own_buf = true;
+    return 0;
+}
+
 static int fill(FILE *f) {
     if (f == stdin) fflush(stdout);
-    if (f->wlen) fflush(f);
+    if (f->wlen && fflush(f)) return EOF;
     if (!f->buf) {
         f->buf = malloc(BUFSIZ);
+        if (!f->buf) {
+            stream_failed(f, -N_ERR_NO_MEMORY);
+            return EOF;
+        }
         f->bufsize = BUFSIZ;
         f->own_buf = true;
     }
-    ssize_t n = read(f->fd, f->buf, f->bufsize);
+    int64_t n;
+    while ((n = raw_read(f, f->buf, (size_t)f->bufsize)) == -2)
+        if (grow_for_message(f)) return EOF;
     if (n <= 0) {
-        if (n < 0) f->err = true;
-        else f->eof = true;
+        if (n == 0) f->eof = true;
         return EOF;
     }
     f->rpos = 0;
@@ -232,15 +463,14 @@ size_t fread(void *buf, size_t size, size_t n, FILE *f) {
             got += c;
             continue;
         }
-        if (total - got >= 4096) {
-            ssize_t r = read(f->fd, b + got, total - got);
-            if (r <= 0) {
-                if (r < 0) f->err = true;
-                else f->eof = true;
-                break;
+        if (total - got >= 4096 && !f->wlen) {
+            int64_t r = raw_read(f, b + got, total - got);
+            if (r > 0) {
+                got += (size_t)r;
+                continue;
             }
-            got += r;
-            continue;
+            if (r == 0) f->eof = true;
+            if (r != -2) break; /* a message larger than the rest goes through the buffer */
         }
         if (fill(f) == EOF) break;
     }
@@ -266,21 +496,45 @@ int puts(const char *s) {
 int feof(FILE *f) { return f->eof; }
 int ferror(FILE *f) { return f->err; }
 void clearerr(FILE *f) { f->eof = f->err = false; }
-int fileno(FILE *f) { return f->fd; }
+int fileno(FILE *f) { return f->h; }
+
+/* The stream's position: documents only; channels have none. */
+long ftell(FILE *f) {
+    if (stream_kind(f) != N_KIND_DOCUMENT) {
+        errno = N_ERR_WRONG_KIND;
+        return -1;
+    }
+    return (long)f->pos - (f->rlen - f->rpos) + f->wlen - (f->ungot >= 0);
+}
 
 int fseek(FILE *f, long off, int whence) {
-    fflush(f);
-    if (whence == SEEK_CUR) off -= (f->rlen - f->rpos);
+    if (fflush(f)) return -1;
+    if (stream_kind(f) != N_KIND_DOCUMENT) {
+        errno = N_ERR_WRONG_KIND;
+        return -1;
+    }
+    long base = 0;
+    if (whence == SEEK_CUR) base = ftell(f);
+    else if (whence == SEEK_END) {
+        n_result size = n_document_size(f->h);
+        if (size < 0) {
+            errno = (int)-size;
+            return -1;
+        }
+        base = (long)size;
+    } else if (whence != SEEK_SET) {
+        errno = N_ERR_INVALID;
+        return -1;
+    }
+    if (off < 0 ? base < -off : off > INT64_MAX - base) {
+        errno = N_ERR_INVALID;
+        return -1;
+    }
+    f->pos = (uint64_t)(base + off);
     f->rpos = f->rlen = 0;
     f->ungot = -1;
     f->eof = false;
-    return lseek(f->fd, off, whence) < 0 ? -1 : 0;
-}
-
-long ftell(FILE *f) {
-    long p = lseek(f->fd, 0, SEEK_CUR);
-    if (p < 0) return -1;
-    return p - (f->rlen - f->rpos) + f->wlen;
+    return 0;
 }
 
 void rewind(FILE *f) { fseek(f, 0, SEEK_SET); }
@@ -670,7 +924,7 @@ static void put_file(void *ctx, const char *s, size_t n) { write_bytes(ctx, s, n
 int vfprintf(FILE *f, const char *fmt, va_list ap) {
     out_t o = {put_file, f, 0};
     if (f->mode == _IONBF) {
-        /* format into a temporary buffer so the output is one write() */
+        /* format into a temporary buffer so the output is one send */
         char tmp[512];
         va_list ap2;
         va_copy(ap2, ap);

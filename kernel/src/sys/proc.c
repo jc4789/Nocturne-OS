@@ -167,6 +167,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
     }
     t->brk_base = t->brk = ALIGN_UP(top, PAGE_SIZE);
     t->mmap_next = USER_MMAP_BASE;
+    t->low_base = t->low_next = MAX(USER_LOW_BASE, t->brk_base);
 
     /* User stack: the argument and setting strings, then their two
        null-terminated pointer arrays. They must fit well inside the stack. */

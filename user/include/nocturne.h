@@ -36,7 +36,6 @@ int readdir(int fd, int idx, struct n_dirent *d);
 int mkdir(const char *path, ...);
 int unlink(const char *path);
 int rmdir(const char *path);
-int rename(const char *from, const char *to);
 int chdir(const char *path);
 char *getcwd(char *buf, size_t n);
 int spawn(const char *path, char *const argv[], const int fdmap[3], int flags);
@@ -47,15 +46,16 @@ int getppid(void);
 int kill(int pid);
 int killtree(int pid, int include_self);
 void *sbrk(long inc);
-/* malloc's heap: bytes taken from sbrk, and bytes in allocated blocks. */
+/* malloc's heap: bytes in its n_memory regions, and bytes in allocated blocks. */
 void malloc_usage(size_t *heap, size_t *used);
 int msleep(unsigned ms);
 unsigned sleep(unsigned s);
 uint64_t uptime_ms(void);
 int pipe(int fds[2]);
 /* Native memory (docs/nocturne-native-abi.md §7): zero-filled pages with
- * N_MEMORY_READ, _READ_WRITE or _READ_EXECUTE access. reserve returns NULL and
- * sets errno on failure; release and protect return -1. */
+ * N_MEMORY_READ, _READ_WRITE or _READ_EXECUTE access; reserve also takes
+ * N_MEMORY_LOW added to the access, for pages below 2 GiB. reserve returns NULL
+ * and sets errno on failure; release and protect return -1. */
 void *n_memory_reserve(size_t bytes, int access);
 int n_memory_release(void *addr, size_t bytes);
 int n_memory_protect(void *addr, size_t bytes, int access);
@@ -150,8 +150,15 @@ int thread_join(int tid);
 NOCTURNE_NORETURN void thread_exit(void);
 int thread_id(void);
 unsigned cpu_index(void);
-/* Eight process-library TLS slots, independent of errno and thread identity. */
+/* Process-library thread-local slots, independent of errno and thread identity.
+ * Libraries use these instead of ELF thread-local variables, which tcc -run
+ * programs cannot link. */
+#define N_TLS_SLOTS 16
 #define N_TLS_WASM_RUNTIME 3 /* Slots 0/1/2 are parallel, layout and CSS. */
+#define N_TLS_GL_CONTEXT 4   /* the thread's current WebGL/OpenGL context */
+#define N_TLS_GL_DISPATCH 5  /* Mesa's current dispatch table */
+#define N_TLS_GL_CURRENT 6   /* Mesa's current gl_context; slot 7 is C11 threads */
+#define N_TLS_CALL_ONCE 8    /* Mesa's call-once-with-data argument */
 void *thread_local_get(unsigned slot);
 void thread_local_set(unsigned slot, void *value);
 /* Actual reserved stack interval of the calling native task. */

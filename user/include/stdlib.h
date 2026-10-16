@@ -25,6 +25,8 @@ long labs(long x);
 int rand(void);
 void srand(unsigned seed);
 void qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *));
+/* ISO C Annex K; returns 0, or EINVAL for a missing array or comparison. */
+int qsort_s(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *, void *), void *context);
 char *getenv(const char *name);
 int system(const char *cmd);
 long double strtold(const char *s, char **end);

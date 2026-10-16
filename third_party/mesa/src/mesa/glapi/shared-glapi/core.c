@@ -148,9 +148,14 @@ entry_get_public(int slot)
 #endif /* defined(_GLAPI_ENTRY_ARCH_TLS_H) */
 
 /* Current dispatch and current context variables */
+#if DETECT_OS_NOCTURNE
+#include "nocturne.h"
+/* Native thread-local slots; an unset dispatch slot means the no-op table. */
+#else
 __THREAD_INITIAL_EXEC struct _glapi_table *_mesa_glapi_tls_Dispatch
    = (struct _glapi_table *)table_noop_array;
 __THREAD_INITIAL_EXEC void *_mesa_glapi_tls_Context;
+#endif
 
 static int
 stub_compare(const void *key, const void *elem)
@@ -238,7 +243,11 @@ _glapi_new_nop_table(void)
 void
 _mesa_glapi_set_context(void *ptr)
 {
+#if DETECT_OS_NOCTURNE
+   thread_local_set(N_TLS_GL_CURRENT, ptr);
+#else
    _mesa_glapi_tls_Context = ptr;
+#endif
 }
 
 /**
@@ -249,7 +258,11 @@ _mesa_glapi_set_context(void *ptr)
 void *
 _mesa_glapi_get_context(void)
 {
+#if DETECT_OS_NOCTURNE
+   return thread_local_get(N_TLS_GL_CURRENT);
+#else
    return _mesa_glapi_tls_Context;
+#endif
 }
 
 /**
@@ -263,8 +276,12 @@ _mesa_glapi_set_dispatch(struct _glapi_table *tbl)
    static once_flag flag = ONCE_FLAG_INIT;
    call_once(&flag, entry_patch_public);
 
+#if DETECT_OS_NOCTURNE
+   thread_local_set(N_TLS_GL_DISPATCH, tbl);
+#else
    _mesa_glapi_tls_Dispatch =
       tbl ? tbl : (struct _glapi_table *)table_noop_array;
+#endif
 }
 
 /**
@@ -273,5 +290,10 @@ _mesa_glapi_set_dispatch(struct _glapi_table *tbl)
 struct _glapi_table *
 _mesa_glapi_get_dispatch(void)
 {
+#if DETECT_OS_NOCTURNE
+   struct _glapi_table *tbl = thread_local_get(N_TLS_GL_DISPATCH);
+   return tbl ? tbl : (struct _glapi_table *)table_noop_array;
+#else
    return _mesa_glapi_tls_Dispatch;
+#endif
 }

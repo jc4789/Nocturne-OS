@@ -25,6 +25,10 @@
 #define USER_STACK_TOP 0x00007FFFFFF00000ULL
 #define USER_STACK_MAX (8ULL << 20)
 #define USER_MMAP_BASE 0x0000600000000000ULL
+/* The low region ends at 2 GiB, the reach of sign-extended 32-bit addresses;
+   the program image and its sbrk heap stay below USER_LOW_BASE. */
+#define USER_LOW_BASE  0x0000000040000000ULL
+#define USER_LOW_TOP   0x0000000080000000ULL
 
 #define KHEAP_BASE   0xFFFFC00000000000ULL
 #define VMALLOC_BASE 0xFFFFD00000000000ULL

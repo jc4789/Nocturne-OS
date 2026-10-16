@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 static unsigned checks, failed;
 #define CHECK(x) do { checks++; if (!(x)) { failed++; printf("nativeabitest FAIL line %d\n", __LINE__); } } while (0)
@@ -261,8 +262,35 @@ static void apps(const char *self) {
     n_handle_close(q);
 }
 
+/* Pages below 2 GiB for code with 32-bit absolute addresses, beside the usual ones. */
+static void memory(void) {
+    const uintptr_t low_top = (uintptr_t)1 << 31;
+    char *p = n_memory_reserve(3 * 4096, N_MEMORY_READ_WRITE | N_MEMORY_LOW);
+    char *q = n_memory_reserve(4096, N_MEMORY_READ_WRITE | N_MEMORY_LOW);
+    CHECK(p && q && (uintptr_t)p + 3 * 4096 <= low_top && (uintptr_t)q + 4096 <= low_top && !((uintptr_t)p & 4095));
+    if (!p || !q) return;
+    CHECK(!p[0] && !p[3 * 4096 - 1]);
+    p[0] = 1, p[3 * 4096 - 1] = 2, q[0] = 3;
+    CHECK(n_memory_protect(p, 4096, N_MEMORY_READ_EXECUTE) == 0);
+    CHECK(n_memory_protect(p, 4096, N_MEMORY_READ_WRITE) == 0 && p[0] == 1);
+    CHECK(n_memory_release(p + 4096, 2 * 4096) == 0 && n_memory_release(p, 4096) == 0);
+    char *again = n_memory_reserve(3 * 4096, N_MEMORY_READ_WRITE | N_MEMORY_LOW);
+    CHECK(again == p && !again[0]); /* the freed range is reused, zero-filled */
+    CHECK(q[0] == 3);
+    CHECK(n_memory_release(again, 3 * 4096) == 0 && n_memory_release(q, 4096) == 0);
+    char *high = n_memory_reserve(4096, N_MEMORY_READ_WRITE);
+    CHECK(high && (uintptr_t)high >= low_top);
+    if (high) n_memory_release(high, 4096);
+    errno = 0;
+    CHECK(!n_memory_reserve(4096, N_MEMORY_LOW) && errno == N_ERR_INVALID);
+    errno = 0;
+    CHECK(!n_memory_reserve((size_t)3 << 29, N_MEMORY_READ_WRITE | N_MEMORY_LOW) && errno == N_ERR_NO_MEMORY);
+    CHECK(n_memory_release((void *)(uintptr_t)0x10000000, 4096) == -1 && errno == N_ERR_INVALID);
+}
+
 int main(int argc, char **argv) {
     if (argc > 2 && !strcmp(argv[1], "child")) return child(argv[2]);
+    memory();
     documents("/home");
     documents("/data");
     /* Across folders on different devices the document is copied whole. */

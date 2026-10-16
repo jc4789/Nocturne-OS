@@ -405,6 +405,7 @@ debug_dump_enum(const struct debug_named_value *names,
 }
 
 
+#if !DETECT_OS_NOCTURNE
 const char *
 debug_dump_flags(const struct debug_named_value *names, uint64_t value)
 {
@@ -443,6 +444,7 @@ debug_dump_flags(const struct debug_named_value *names, uint64_t value)
 
    return output;
 }
+#endif
 
 
 uint64_t

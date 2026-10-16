@@ -195,33 +195,49 @@ static void swap_bytes(char *a, char *b, size_t n) {
     }
 }
 
-static void qsort_rec(char *base, size_t n, size_t size, int (*cmp)(const void *, const void *)) {
+/* qsort's comparison, or qsort_s's with its context */
+struct sort_order {
+    int (*plain)(const void *, const void *);
+    int (*with)(const void *, const void *, void *);
+    void *context;
+};
+static int order(const struct sort_order *o, const void *a, const void *b) {
+    return o->plain ? o->plain(a, b) : o->with(a, b, o->context);
+}
+
+static void qsort_rec(char *base, size_t n, size_t size, const struct sort_order *o) {
     while (n > 1) {
         if (n < 12) {
             for (size_t i = 1; i < n; i++)
-                for (size_t j = i; j > 0 && cmp(base + (j - 1) * size, base + j * size) > 0; j--)
+                for (size_t j = i; j > 0 && order(o, base + (j - 1) * size, base + j * size) > 0; j--)
                     swap_bytes(base + (j - 1) * size, base + j * size, size);
             return;
         }
         swap_bytes(base, base + (n / 2) * size, size);
         size_t last = 0;
         for (size_t i = 1; i < n; i++)
-            if (cmp(base + i * size, base) < 0) swap_bytes(base + (++last) * size, base + i * size, size);
+            if (order(o, base + i * size, base) < 0) swap_bytes(base + (++last) * size, base + i * size, size);
         swap_bytes(base, base + last * size, size);
         /* recurse on the smaller half */
         if (last < n - last - 1) {
-            qsort_rec(base, last, size, cmp);
+            qsort_rec(base, last, size, o);
             base += (last + 1) * size;
             n -= last + 1;
         } else {
-            qsort_rec(base + (last + 1) * size, n - last - 1, size, cmp);
+            qsort_rec(base + (last + 1) * size, n - last - 1, size, o);
             n = last;
         }
     }
 }
 
 void qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *)) {
-    qsort_rec(base, n, size, cmp);
+    qsort_rec(base, n, size, &(struct sort_order){.plain = cmp});
+}
+/* ISO C Annex K: the comparison also receives the caller's context. */
+int qsort_s(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *, void *), void *context) {
+    if (n && (!base || !cmp || !size)) return EINVAL;
+    qsort_rec(base, n, size, &(struct sort_order){.with = cmp, .context = context});
+    return 0;
 }
 
 long long atoll(const char *s) { return strtoll(s, NULL, 10); }

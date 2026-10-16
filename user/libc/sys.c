@@ -14,7 +14,7 @@ int errno;
 struct libc_thread {
     struct libc_thread *self;
     int tid, error;
-    void *slots[8];
+    void *slots[N_TLS_SLOTS];
     void **tss;      /* C11 tss values, grown on demand (threads.c) */
     size_t tss_cap;
 };
@@ -70,8 +70,6 @@ int readdir(int fd, int idx, struct n_dirent *d) { return (int)ret(SC3(SYS_READD
 int mkdir(const char *path, ...) { return (int)ret(SC1(SYS_MKDIR, path)); }
 int unlink(const char *path) { return (int)ret(SC1(SYS_UNLINK, path)); }
 int rmdir(const char *path) { return unlink(path); }
-int remove(const char *path) { return unlink(path); }
-int rename(const char *from, const char *to) { return (int)ret(SC2(SYS_RENAME, from, to)); }
 int chdir(const char *path) { return (int)ret(SC1(SYS_CHDIR, path)); }
 char *getcwd(char *buf, size_t n) { return ret(SC2(SYS_GETCWD, buf, n)) < 0 ? NULL : buf; }
 /* A text file that is not an ELF program is run as a script: by the interpreter named on a
@@ -248,11 +246,11 @@ void **__libc_tss_values(size_t need, size_t *capacity) {
 }
 void *thread_local_get(unsigned slot) {
     struct libc_thread *t = libc_thread_current();
-    return t && slot < 8 ? t->slots[slot] : NULL;
+    return t && slot < N_TLS_SLOTS ? t->slots[slot] : NULL;
 }
 void thread_local_set(unsigned slot, void *value) {
     struct libc_thread *t = libc_thread_current();
-    if (t && slot < 8) t->slots[slot] = value;
+    if (t && slot < N_TLS_SLOTS) t->slots[slot] = value;
 }
 int wait_on_address(volatile uint32_t *address, uint32_t expected, unsigned timeout_ms) {
     return (int)ret(SC3(SYS_WAIT_ADDRESS, address, expected, timeout_ms));
@@ -264,7 +262,7 @@ int wake_address(volatile uint32_t *address, unsigned count) {
     return (int)ret(SC2(SYS_WAKE_ADDRESS, address, count));
 }
 time_t time(time_t *t) {
-    time_t v = SC0(SYS_TIME);
+    time_t v = n_clock_wall();
     if (t) *t = v;
     return v;
 }
@@ -693,9 +691,9 @@ static int memory_prot(int access) {
            access == N_MEMORY_READ ? 0 : -1;
 }
 void *n_memory_reserve(size_t bytes, int access) {
-    int prot = memory_prot(access);
+    int prot = memory_prot(access & ~N_MEMORY_LOW);
     if (!bytes || prot < 0) { errno = N_ERR_INVALID; return NULL; }
-    long r = ret(__syscall(SYS_MMAP, (long)bytes, prot, 0, 0, 0));
+    long r = ret(__syscall(SYS_MMAP, (long)bytes, prot, access & N_MEMORY_LOW ? N_MMAP_LOW : 0, 0, 0));
     return r < 0 ? NULL : (void *)r;
 }
 int n_memory_release(void *addr, size_t bytes) {

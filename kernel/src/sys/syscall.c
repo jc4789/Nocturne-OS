@@ -331,7 +331,7 @@ static int64_t sys_sbrk_locked(int64_t inc) {
     uint64_t old = t->brk;
     if (inc == 0) return old;
     uint64_t nb = t->brk + inc;
-    if (nb < t->brk_base || nb >= USER_MMAP_BASE) return -N_ERR_NO_MEMORY;
+    if (nb < t->brk_base || nb > t->low_base) return -N_ERR_NO_MEMORY;
     if (inc > 0) {
         uint64_t start = ALIGN_UP(old, PAGE_SIZE);
         uint64_t end = ALIGN_UP(nb, PAGE_SIZE);
@@ -842,13 +842,17 @@ static int64_t sys_address_unwatch(int fd,uint64_t token) {
 /* Freed address space of the mmap region. Without reuse every map/unmap cycle
    consumes fresh addresses and the page tables covering them, so a process
    that keeps allocating and freeing large blocks leaks kernel memory. Every
-   reservation keeps one unmapped guard page after itself; a hole includes it. */
+   reservation keeps one unmapped guard page after itself; a hole includes it.
+   The low region below 2 GiB keeps its own holes and frontier. */
 struct mmap_hole { struct mmap_hole *next; uint64_t va, len; };
 void mmap_hole_add(struct task *owner, uint64_t va, uint64_t len) {
     if (!owner || !len) return;
+    bool low = va < USER_MMAP_BASE;
+    struct mmap_hole **holes = low ? &owner->low_holes : &owner->mmap_holes;
+    uint64_t *next = low ? &owner->low_next : &owner->mmap_next;
     struct mmap_hole *spare = kmalloc(sizeof *spare);
     uint64_t irq = irq_save();
-    struct mmap_hole **link = &owner->mmap_holes, *prev = NULL;
+    struct mmap_hole **link = holes, *prev = NULL;
     while (*link && (*link)->va + (*link)->len < va) { prev = *link; link = &(*link)->next; }
     struct mmap_hole *h = *link;
     if (h && h->va <= va + len) {
@@ -865,19 +869,19 @@ void mmap_hole_add(struct task *owner, uint64_t va, uint64_t len) {
         *link = h = spare; spare = NULL;
     } else { irq_restore(irq); return; } /* the range stays unused, nothing breaks */
     /* The last hole simply lowers the reservation frontier. */
-    if (!h->next && h->va + h->len >= owner->mmap_next) {
-        owner->mmap_next = h->va;
-        if (prev) prev->next = NULL; else owner->mmap_holes = NULL;
+    if (!h->next && h->va + h->len >= *next) {
+        *next = h->va;
+        if (prev) prev->next = NULL; else *holes = NULL;
         kfree(h);
     }
     irq_restore(irq);
     kfree(spare);
 }
 /* First fit for len bytes plus their guard page; 0 when no hole fits. */
-static uint64_t mmap_hole_take(struct task *owner, uint64_t len) {
+static uint64_t mmap_hole_take(struct mmap_hole **holes, uint64_t len) {
     uint64_t need = len + PAGE_SIZE, va = 0;
     uint64_t irq = irq_save();
-    for (struct mmap_hole **link = &owner->mmap_holes; *link; link = &(*link)->next) {
+    for (struct mmap_hole **link = holes; *link; link = &(*link)->next) {
         struct mmap_hole *h = *link;
         if (h->len < need) continue;
         va = h->va; h->va += need; h->len -= need;
@@ -889,27 +893,32 @@ static uint64_t mmap_hole_take(struct task *owner, uint64_t len) {
 }
 void mmap_holes_free(struct task *owner) {
     while (owner->mmap_holes) { struct mmap_hole *h = owner->mmap_holes; owner->mmap_holes = h->next; kfree(h); }
+    while (owner->low_holes) { struct mmap_hole *h = owner->low_holes; owner->low_holes = h->next; kfree(h); }
 }
-uint64_t mmap_reserve(struct task *owner, uint64_t len) {
-    if (!len || len > USER_STACK_TOP) return 0;
-    uint64_t va = mmap_hole_take(owner, len);
+/* len bytes and a guard page from a region's holes, else at its frontier below top. */
+static uint64_t region_reserve(struct mmap_hole **holes, uint64_t *next, uint64_t top, uint64_t len) {
+    if (!len || len > top) return 0;
+    uint64_t va = mmap_hole_take(holes, len);
     if (va) return va;
     uint64_t irq = irq_save();
-    va = owner->mmap_next;
-    if (va >= USER_STACK_TOP - USER_STACK_MAX ||
-        len + PAGE_SIZE > USER_STACK_TOP - USER_STACK_MAX - va) va = 0;
-    else owner->mmap_next = va + len + PAGE_SIZE; /* reserve before any page loop */
+    va = *next;
+    if (va >= top || len + PAGE_SIZE > top - va) va = 0;
+    else *next = va + len + PAGE_SIZE; /* reserve before any page loop */
     irq_restore(irq);
     return va;
 }
+uint64_t mmap_reserve(struct task *owner, uint64_t len) {
+    return region_reserve(&owner->mmap_holes, &owner->mmap_next, USER_STACK_TOP - USER_STACK_MAX, len);
+}
 
 /* anonymous memory in its own region above the heap (window buffers live there too) */
-static int64_t sys_mmap_locked(size_t len, int prot) {
+static int64_t sys_mmap_locked(size_t len, int prot, int place) {
     struct task *t = task_process();
-    if (len == 0 || len > (1ULL << 32)) return -N_ERR_INVALID;
+    if (len == 0 || len > (1ULL << 32) || (place & ~N_MMAP_LOW)) return -N_ERR_INVALID;
     len = ALIGN_UP(len, PAGE_SIZE);
     int vp = (prot & N_PROT_WRITE ? VM_W : 0) | (prot & N_PROT_EXEC ? VM_X : 0);
-    uint64_t va = mmap_reserve(t, len);
+    uint64_t va = place & N_MMAP_LOW ? region_reserve(&t->low_holes, &t->low_next, USER_LOW_TOP, len)
+                                     : mmap_reserve(t, len);
     if (!va) return -N_ERR_NO_MEMORY;
     if (vmm_user_alloc(t->pml4, va, len, vp) < 0) {
         vmm_user_free(t->pml4, va, len);
@@ -921,7 +930,9 @@ static int64_t sys_mmap_locked(size_t len, int prot) {
 
 static int64_t sys_munmap_locked(uint64_t va, size_t len) {
     struct task *t = task_process();
-    if (va & (PAGE_SIZE - 1) || va < USER_MMAP_BASE || va + len > t->mmap_next || va + len < va) return -N_ERR_INVALID;
+    bool low = va < USER_MMAP_BASE;
+    uint64_t base = low ? t->low_base : USER_MMAP_BASE, frontier = low ? t->low_next : t->mmap_next;
+    if (va & (PAGE_SIZE - 1) || va < base || va + len > frontier || va + len < va) return -N_ERR_INVALID;
     if(len>SIZE_MAX-(PAGE_SIZE-1))return -N_ERR_INVALID;
     len=ALIGN_UP(len,PAGE_SIZE);
     struct shared_mapping **link=&t->shared_mappings;
@@ -936,7 +947,7 @@ static int64_t sys_munmap_locked(uint64_t va, size_t len) {
     vmm_user_free(t->pml4, va, len);
     /* The unmapped page right after the range is the reservation's guard. */
     uint64_t end = va + len;
-    bool guard = end < t->mmap_next && !(vmm_get_pte(t->pml4, end) & PTE_P);
+    bool guard = end < frontier && !(vmm_get_pte(t->pml4, end) & PTE_P);
     for (struct shared_mapping *m = t->shared_mappings; guard && m; m = m->next)
         if (end >= m->va && end < m->va + m->bytes) guard = false; /* an untouched demand page */
     mmap_hole_add(t, va, guard ? len + PAGE_SIZE : len);
@@ -952,8 +963,8 @@ static int64_t sys_mprotect_locked(uint64_t va, size_t len, int prot) {
 /* These finite BSP helpers do not sleep. Kernel-mode timer IRQs request a
    reschedule but cannot switch their continuation (idt.c). Keep IRQ delivery
    enabled for large allocations; each PTE publication has its own short guard. */
-static int64_t sys_mmap(size_t len, int prot) {
-    return sys_mmap_locked(len, prot);
+static int64_t sys_mmap(size_t len, int prot, int place) {
+    return sys_mmap_locked(len, prot, place);
 }
 static int64_t sys_munmap(uint64_t va, size_t len) {
     return sys_munmap_locked(va, len);
@@ -1183,11 +1194,13 @@ static int64_t sys_channel_pair(int32_t *uout) {
     return 0;
 }
 
-/* Byte pipes and byte channels remain until the old ABI is removed (stage 5):
-   on them a send is a write and a receive takes what is there, without
-   message boundaries or attachments. */
+/* Byte pipes, byte channels and the character devices given to apps as their
+   input, output and log (console, kernel log, null) remain until the old ABI
+   is removed (stage 5): on them a send is a write and a receive takes what is
+   there, without message boundaries or attachments. */
 static bool byte_channel(struct file *f) {
-    return f->vn->type == VT_PIPE || (f->vn->type == VT_CHANNEL && !message_channel_is(f));
+    return f->vn->type == VT_PIPE || f->vn->type == VT_CHAR ||
+           (f->vn->type == VT_CHANNEL && !message_channel_is(f));
 }
 
 static int64_t sys_channel_send(int h, const void *udata, size_t n, int attach) {
@@ -1641,7 +1654,7 @@ void syscall_dispatch(struct regs *r) {
         break;
     case SYS_FCNTL: ret = sys_fcntl((int)a, (int)b, (int)c); break;
     case SYS_DMESG: ret = sys_dmesg((char *)a, b); break;
-    case SYS_MMAP: ret = sys_mmap(a, (int)b); break;
+    case SYS_MMAP: ret = sys_mmap(a, (int)b, (int)c); break;
     case SYS_MUNMAP: ret = sys_munmap(a, b); break;
     case SYS_MPROTECT: ret = sys_mprotect(a, b, (int)c); break;
     case SYS_PCILIST:

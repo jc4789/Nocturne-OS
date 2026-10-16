@@ -183,6 +183,8 @@ static const struct test tests[] = {
      {"webnet-tcp-capacity: 0 failed"}, "FAIL", 120, false, true},
     {"nativeabi", "documents-channels-apps-events", "tcc -o /home/nativeabitest /data/tests/nativeabitest.c && /home/nativeabitest", 0,
      {"nativeabitest: ", ", 0 failed"}, "nativeabitest FAIL", 120, false, true},
+    {"nativeabi", "iso-c-stdio", "tcc -o /home/stdiotest /data/tests/stdiotest.c && /home/stdiotest", 0,
+     {"stdiotest: ", ", 0 failed"}, "stdiotest FAIL", 120, false, true},
     {"sharedpages", "native-video-shared-pages", "tcc -o /home/sharedpagetest /data/tests/sharedpagetest.c && /home/sharedpagetest", 0,
      {"共有ページ ", "検査 0 失敗"}, "共有ページ失敗", 120, false, true},
     {"indexeddb", "async-native-storage", "tcc -I/data/tests -o /home/indexeddbguesttest /data/tests/indexeddbguesttest.c && /home/indexeddbguesttest", 0,
