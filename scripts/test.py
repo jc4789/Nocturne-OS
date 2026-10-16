@@ -338,7 +338,9 @@ def run_vm(a, tcp_port, web_ports, processes):
         conf = os.path.join(BUILD, "test-limine.conf")
         conf_arg = os.path.relpath(conf, ROOT).replace("\\", "/")
         boot_part = os.path.relpath(boot, ROOT).replace("\\", "/") + "@@1048576"
-        mtools("mcopy", "-o", "-i", boot_part, "::/boot/limine/limine.conf", conf_arg)
+        # -n: replace the host-side copy; -o alone still asks, and with no
+        # stdin mcopy then waits forever.
+        mtools("mcopy", "-n", "-o", "-i", boot_part, "::/boot/limine/limine.conf", conf_arg)
         with open(conf, encoding="utf-8") as f:
             config = f.read()
         first_entry = config.split("\n/", 2)[1]
@@ -362,7 +364,7 @@ def run_vm(a, tcp_port, web_ports, processes):
     payload = {}
     for name in ("kernel.elf", "initrd.tar"):
         extracted = os.path.join(BUILD, "test-" + name)
-        mtools("mcopy", "-o", "-i", os.path.relpath(boot, ROOT).replace("\\", "/") + "@@1048576",
+        mtools("mcopy", "-n", "-o", "-i", os.path.relpath(boot, ROOT).replace("\\", "/") + "@@1048576",
                "::/boot/" + name, os.path.relpath(extracted, ROOT).replace("\\", "/"))
         actual = file_sha256(extracted)
         expected = (a.baseline_payload[name] if a.baseline_payload else

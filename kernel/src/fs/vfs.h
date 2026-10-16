@@ -2,7 +2,8 @@
 #include "kernel.h"
 #include "sys/sched.h"
 
-enum { VT_FILE = 1, VT_DIR = 2, VT_CHAR = 3, VT_PIPE = 4, VT_WINDOW = 5, VT_CHANNEL = 6, VT_SHARED = 7, VT_ADDRESS_WATCH = 8 };
+enum { VT_FILE = 1, VT_DIR = 2, VT_CHAR = 3, VT_PIPE = 4, VT_WINDOW = 5, VT_CHANNEL = 6, VT_SHARED = 7, VT_ADDRESS_WATCH = 8,
+       VT_APP = 9, VT_EVENTS = 10 };
 
 #define O_RDONLY    0x0
 #define O_WRONLY    0x1
@@ -22,6 +23,7 @@ struct dirent {
     uint32_t type;
     uint32_t reserved;
     uint64_t size;
+    int64_t mtime; /* not part of the old SYS_READDIR record */
 };
 
 struct kstat {
@@ -53,6 +55,11 @@ struct vnode_ops {
     int (*create)(struct vnode *dir, const char *name, int type, struct vnode **out);
     int (*unlink)(struct vnode *dir, const char *name);
     int (*truncate)(struct vnode *v, uint64_t size);
+    /* Swap in new content whole: readers see the old or the new bytes, never
+       a mix. Consumes data (kmalloc'd) whether or not it succeeds. */
+    int (*replace)(struct vnode *v, uint8_t *data, uint64_t size);
+    /* Rename/move an entry within one filesystem; the target name must be free. */
+    int (*move)(struct vnode *from_dir, const char *from, struct vnode *to_dir, const char *to);
     bool (*can_read)(struct vnode *v, struct file *f);
     bool (*can_write)(struct vnode *v, struct file *f);
     bool (*hangup)(struct vnode *v, struct file *f);
@@ -92,6 +99,7 @@ struct file {
     void *priv;
     bool io_busy;
     struct wait_queue io_wait; /* regular-file shared offset; device directions stay independent */
+    struct event_watch *watchers; /* event-queue watches on this handle, dropped at the last close */
 };
 
 extern struct vnode *vfs_root;
@@ -126,6 +134,19 @@ void vfs_poll_notify(struct vnode *v);
 void vfs_poll_cleanup(struct poll_wait *wait);
 int vfs_read_whole(const char *abspath, uint8_t **data, uint64_t *size);
 int vfs_write_whole(const char *abspath, const void *data, uint64_t size);
+
+/* Native documents and folders (docs/nocturne-native-abi.md §3). Paths are
+   absolute and already normalized; there is no working directory. */
+int vfs_document_open(const char *abspath, int access, struct file **out);
+int64_t vfs_document_read_user(struct file *f, uint64_t off, void *buf, size_t n);
+int64_t vfs_document_write_user(struct file *f, uint64_t off, const void *buf, size_t n);
+int vfs_document_commit(struct file *f); /* REPLACE handles: swap the staged content in */
+int vfs_replace(const char *abspath, uint8_t *data, uint64_t size); /* consumes data */
+int vfs_append_user(const char *abspath, const void *udata, uint64_t size);
+int vfs_entry_info(const char *abspath, struct dirent *out);
+int vfs_folder_list(const char *abspath, uint64_t start, struct dirent *out, size_t max);
+int vfs_move(const char *from, const char *to);
+int vfs_kind(struct vnode *v);
 void vnode_ref(struct vnode *v);
 void vnode_unref(struct vnode *v);
 
@@ -134,6 +155,13 @@ struct vnode *ramfs_new_root(void);
 struct vnode *ramfs_new_node(const char *name, int type);
 void ramfs_add_child(struct vnode *dir, struct vnode *child);
 extern struct vnode_ops ramfs_ops;
+struct vnode *ramfs_replace_new(const char *abspath); /* staging for N_DOCUMENT_REPLACE */
+bool ramfs_is_replace(struct vnode *v);
+int ramfs_replace_commit(struct vnode *v);
+
+/* event queues (sys/events.c) */
+struct event_watch;
+void events_file_closed(struct file *f); /* BSP IRQ guard held */
 
 /* devfs */
 void devfs_init(void);
@@ -145,6 +173,12 @@ int pipe_create(struct file **rd, struct file **wr);
 int channel_listen(const char *key,size_t length,struct file **listener);
 int channel_connect(const char *key,size_t length,struct file **client);
 int channel_accept(struct file *listener,struct file **server);
+/* Native message channels: each send is one message, received whole. */
+int message_channel_pair(struct file **a, struct file **b);
+bool message_channel_is(struct file *f);
+int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct file *attach);
+int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wait, bool peek,
+                                struct file **attached);
 
 /* initrd */
 void initrd_load(void *data, uint64_t size);

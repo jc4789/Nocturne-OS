@@ -323,6 +323,7 @@ void vfs_close(struct file *f) {
     if (!f) return;
     uint64_t flags = irq_save();
     bool last = --f->refs == 0;
+    if (last) events_file_closed(f);
     irq_restore(flags);
     if (!last) return;
     /* The last close callback can drain audio and sleep. Reference ownership,
@@ -439,4 +440,198 @@ int vfs_write_whole(const char *path, const void *data, uint64_t size) {
     int64_t n = vfs_write(f, data, size);
     vfs_close(f);
     return n < 0 ? (int)n : 0;
+}
+
+/* ---- native documents and folders ---- */
+
+int vfs_kind(struct vnode *v) {
+    switch (v->type) {
+    case VT_FILE: return N_KIND_DOCUMENT;
+    case VT_DIR: return N_KIND_FOLDER;
+    case VT_PIPE: case VT_CHANNEL: return N_KIND_CHANNEL;
+    case VT_WINDOW: return N_KIND_WINDOW;
+    case VT_SHARED: return N_KIND_SHARED;
+    case VT_APP: return N_KIND_APP;
+    case VT_EVENTS: case VT_ADDRESS_WATCH: return N_KIND_EVENTS;
+    default: return N_KIND_DEVICE;
+    }
+}
+
+/* A new, empty document; the name must be free. */
+static int create_document(const char *path, struct vnode **out) {
+    char leaf[NAME_MAX_LEN];
+    struct vnode *dir = lookup_parent(path, leaf);
+    if (!dir) return -N_ERR_NOT_FOUND;
+    if (dir->type != VT_DIR) return -N_ERR_NOT_FOLDER;
+    if (!leaf[0]) return -N_ERR_INVALID;
+    if (vfs_lookup(path)) return -N_ERR_EXISTS;
+    if (!dir->ops->create) return -N_ERR_READ_ONLY;
+    return dir->ops->create(dir, leaf, VT_FILE, out);
+}
+
+static int existing_document(const char *path, struct vnode **out) {
+    struct vnode *v = vfs_lookup(path);
+    if (!v) return -N_ERR_NOT_FOUND;
+    if (v->type == VT_DIR) return -N_ERR_IS_FOLDER;
+    if (v->type != VT_FILE) return -N_ERR_WRONG_KIND;
+    *out = v;
+    return 0;
+}
+
+int vfs_document_open(const char *path, int access, struct file **out) {
+    struct vnode *v;
+    int r, flags = O_RDWR;
+    switch (access) {
+    case N_DOCUMENT_READ: flags = O_RDONLY; /* fall through */
+    case N_DOCUMENT_EDIT: r = existing_document(path, &v); break;
+    case N_DOCUMENT_CREATE: r = create_document(path, &v); break;
+    case N_DOCUMENT_REPLACE: {
+        /* The staged content lives in memory until the handle is closed with
+           n_handle_close; an app that ends first leaves the old document. */
+        struct vnode *old = vfs_lookup(path);
+        char leaf[NAME_MAX_LEN];
+        struct vnode *dir = lookup_parent(path, leaf);
+        if (old && old->type == VT_DIR) return -N_ERR_IS_FOLDER;
+        if (old && old->type != VT_FILE) return -N_ERR_WRONG_KIND;
+        if (!old && (!dir || !leaf[0])) return -N_ERR_NOT_FOUND;
+        if (!old && dir->type != VT_DIR) return -N_ERR_NOT_FOLDER;
+        if (!(old ? old->ops : dir->ops)->replace) return -N_ERR_UNSUPPORTED;
+        v = ramfs_replace_new(path);
+        r = v ? 0 : -N_ERR_NO_MEMORY;
+        break;
+    }
+    default: return -N_ERR_INVALID;
+    }
+    if (r < 0) return r;
+    struct file *f = vfs_open_vnode(v, flags);
+    if (!f) {
+        if (ramfs_is_replace(v)) v->ops->release(v);
+        return -N_ERR_NO_MEMORY;
+    }
+    *out = f;
+    return 0;
+}
+
+/* Positional access: no shared cursor. The per-handle reservation still
+   orders requests issued through the same handle by sibling threads. */
+int64_t vfs_document_read_user(struct file *f, uint64_t off, void *buf, size_t n) {
+    struct vnode *v = f->vn;
+    if (v->type != VT_FILE) return -N_ERR_WRONG_KIND;
+    if ((f->flags & O_ACCMODE) == O_WRONLY) return -N_ERR_DENIED;
+    if (!v->ops->read) return -N_ERR_UNSUPPORTED;
+    int error = file_io_begin(f);
+    if (error) return error;
+    n = off < v->size ? MIN(n, v->size - off) : 0;
+    int64_t r = !n ? 0 : !user_ok_w(buf, n) ? -N_ERR_BAD_ADDRESS : v->ops->read(v, f, buf, off, n);
+    file_io_end(f);
+    return r;
+}
+
+int64_t vfs_document_write_user(struct file *f, uint64_t off, const void *buf, size_t n) {
+    struct vnode *v = f->vn;
+    if (v->type != VT_FILE) return -N_ERR_WRONG_KIND;
+    if ((f->flags & O_ACCMODE) == O_RDONLY) return -N_ERR_DENIED;
+    if (!v->ops->write) return -N_ERR_READ_ONLY;
+    if (off + n < off) return -N_ERR_TOO_LARGE;
+    if (!n) return 0;
+    int error = file_io_begin(f);
+    if (error) return error;
+    int64_t r = !user_ok(buf, n) ? -N_ERR_BAD_ADDRESS : v->ops->write(v, f, buf, off, n);
+    if (r > 0) v->mtime = time_now();
+    file_io_end(f);
+    return r;
+}
+
+int vfs_document_commit(struct file *f) {
+    if (!ramfs_is_replace(f->vn)) return 0;
+    int error = file_io_begin(f);
+    if (error) return error;
+    error = ramfs_replace_commit(f->vn);
+    file_io_end(f);
+    return error;
+}
+
+int vfs_replace(const char *path, uint8_t *data, uint64_t size) {
+    struct vnode *v = vfs_lookup(path);
+    int r = 0;
+    if (!v) r = create_document(path, &v);
+    else if (v->type == VT_DIR) r = -N_ERR_IS_FOLDER;
+    else if (v->type != VT_FILE) r = -N_ERR_WRONG_KIND;
+    else if (!v->ops->replace) r = -N_ERR_UNSUPPORTED;
+    if (r < 0) { kfree(data); return r; }
+    if (!v->ops->replace) { kfree(data); return -N_ERR_UNSUPPORTED; }
+    return v->ops->replace(v, data, size);
+}
+
+/* Log-style append of user bytes. The document's claim is held from taking
+   the end to the last byte, so concurrent appenders never overwrite each other. */
+int vfs_append_user(const char *path, const void *data, uint64_t size) {
+    struct vnode *v;
+    int r = existing_document(path, &v);
+    if (r == -N_ERR_NOT_FOUND) r = create_document(path, &v);
+    if (r == -N_ERR_EXISTS) r = existing_document(path, &v);
+    if (r < 0) return r;
+    if (!v->ops->write) return -N_ERR_READ_ONLY;
+    struct file *f = vfs_open_vnode(v, O_WRONLY | O_APPEND);
+    if (!f) return -N_ERR_NO_MEMORY;
+    int64_t n = vfs_lease(f, true);
+    if (!n) n = vfs_write_user(f, data, size);
+    vfs_close(f); /* releases the claim */
+    return n < 0 ? (int)n : (uint64_t)n < size ? -N_ERR_NO_SPACE : 0;
+}
+
+int vfs_entry_info(const char *path, struct dirent *out) {
+    struct vnode *v = vfs_lookup(path);
+    if (!v) return -N_ERR_NOT_FOUND;
+    const char *slash = strrchr(path, '/');
+    strlcpy(out->name, slash && slash[1] ? slash + 1 : "/", sizeof out->name);
+    out->type = v->type;
+    out->reserved = 0;
+    out->size = v->type == VT_DIR ? 0 : v->size;
+    out->mtime = v->mtime;
+    return 0;
+}
+
+int vfs_folder_list(const char *path, uint64_t start, struct dirent *out, size_t max) {
+    struct vnode *v = vfs_lookup(path);
+    if (!v) return -N_ERR_NOT_FOUND;
+    if (v->type != VT_DIR) return -N_ERR_NOT_FOLDER;
+    if (!v->ops->readdir) return 0;
+    size_t n = 0;
+    while (n < max) {
+        int r = v->ops->readdir(v, start + n, &out[n]);
+        if (r < 0) return n ? (int)n : r;
+        if (!r) break;
+        n++;
+    }
+    return (int)n;
+}
+
+int vfs_move(const char *from, const char *to) {
+    if (!strcmp(from, "/") || !strcmp(to, "/")) return -N_ERR_BUSY;
+    size_t fl = strlen(from);
+    /* A folder cannot move into itself. */
+    if (!strncmp(to, from, fl) && (to[fl] == '/' || !to[fl])) return to[fl] ? -N_ERR_INVALID : 0;
+    struct vnode *v = vfs_lookup(from);
+    if (!v) return -N_ERR_NOT_FOUND;
+    if (v->mounted || v == follow_mount(vfs_root)) return -N_ERR_BUSY;
+    if (vfs_lookup(to)) return -N_ERR_EXISTS;
+    char from_leaf[NAME_MAX_LEN], to_leaf[NAME_MAX_LEN];
+    struct vnode *from_dir = lookup_parent(from, from_leaf), *to_dir = lookup_parent(to, to_leaf);
+    if (!from_dir || !to_dir) return -N_ERR_NOT_FOUND;
+    if (to_dir->type != VT_DIR) return -N_ERR_NOT_FOLDER;
+    if (!to_leaf[0]) return -N_ERR_INVALID;
+    if (from_dir->ops == to_dir->ops && from_dir->ops->move) {
+        int moved = from_dir->ops->move(from_dir, from_leaf, to_dir, to_leaf);
+        if (moved != -N_ERR_UNSUPPORTED) return moved;
+    }
+    /* Another filesystem: a document is copied whole, then the original is
+       removed. A folder would need a recursive copy that could fail halfway. */
+    if (v->type != VT_FILE) return -N_ERR_UNSUPPORTED;
+    uint8_t *data;
+    uint64_t size;
+    int r = vfs_read_whole(from, &data, &size);
+    if (r < 0) return r;
+    r = vfs_replace(to, data, size);
+    return r < 0 ? r : vfs_unlink(from);
 }

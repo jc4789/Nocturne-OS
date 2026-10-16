@@ -350,3 +350,187 @@ int channel_accept(struct file *listener,struct file **server) {
     l->head=pending->next;if(!l->head)l->tail=NULL;
     *server=pending->server;kfree(pending);irq_restore(flags);return 0;
 }
+
+/* Native message channels (docs/nocturne-native-abi.md §4). A pair shares one
+ * link; each end receives from its own queue and sends into the peer's. A
+ * message keeps its boundary and may carry one document or shared-page handle.
+ * Messages are kept in kernel memory as sent: there is no fixed capacity. */
+struct message {
+    struct message *next;
+    struct file *attached;
+    size_t size;
+    uint8_t bytes[];
+};
+struct message_link {
+    struct message *head[2], **tail[2];
+    bool open[2];          /* end i still has a handle */
+    struct vnode *end[2];  /* until that end's vnode is released */
+    struct wait_queue wait[2];
+};
+static struct vnode_ops message_ops;
+
+static int message_side(struct vnode *v) { return (int)v->mode; }
+
+static void message_free(struct message *m) {
+    while (m) {
+        struct message *next = m->next;
+        if (m->attached) vfs_close(m->attached);
+        kfree(m);
+        m = next;
+    }
+}
+
+bool message_channel_is(struct file *f) { return f && f->vn->ops == &message_ops; }
+
+int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct file *attach) {
+    struct vnode *v = f->vn;
+    struct message_link *l = v->priv;
+    int peer = !message_side(v);
+    if (n > SIZE_MAX - sizeof(struct message)) return -N_ERR_TOO_LARGE;
+    struct message *m = kmalloc(sizeof *m + n);
+    if (!m) return -N_ERR_NO_MEMORY;
+    m->next = NULL;
+    m->size = n;
+    m->attached = NULL;
+    /* Copy in fixed pieces: a large message never makes one long
+       non-preemptible copy, and a sibling unmapping the source is caught. */
+    for (size_t done = 0; done < n;) {
+        size_t piece = MIN(n - done, (size_t)PIPE_SEGMENT_SIZE);
+        uint64_t fl = irq_save();
+        bool ok = user_ok((const uint8_t *)udata + done, piece);
+        if (ok) memcpy(m->bytes + done, (const uint8_t *)udata + done, piece);
+        irq_restore(fl);
+        if (!ok) { kfree(m); return -N_ERR_BAD_ADDRESS; }
+        done += piece;
+    }
+    uint64_t fl = irq_save();
+    if (!l->open[peer]) { irq_restore(fl); kfree(m); return -N_ERR_CLOSED; }
+    if (attach) m->attached = vfs_dup(attach);
+    *l->tail[peer] = m;
+    l->tail[peer] = &m->next;
+    wq_wake_all(&l->wait[peer]);
+    vfs_poll_notify(l->end[peer]);
+    irq_restore(fl);
+    return (int64_t)n;
+}
+
+/* peek reports the next message's size without taking it. A message larger
+ * than cap stays queued and reports N_ERR_TOO_LARGE. */
+int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wait, bool peek,
+                                struct file **attached) {
+    struct vnode *v = f->vn;
+    struct message_link *l = v->priv;
+    int side = message_side(v);
+    *attached = NULL;
+    for (;;) {
+        uint64_t fl = irq_save();
+        struct message *m = l->head[side];
+        if (m) {
+            if (peek) { irq_restore(fl); return (int64_t)m->size; }
+            if (m->size > cap) { irq_restore(fl); return -N_ERR_TOO_LARGE; }
+            if (!user_ok_w(ubuf, m->size)) { irq_restore(fl); return -N_ERR_BAD_ADDRESS; }
+            l->head[side] = m->next;
+            if (!l->head[side]) l->tail[side] = &l->head[side];
+            m->next = NULL;
+            irq_restore(fl);
+            /* Taken off the queue: copy out in pieces without holding the
+               guard. Only a sibling unmapping the buffer meanwhile loses it. */
+            for (size_t done = 0; done < m->size;) {
+                size_t piece = MIN(m->size - done, (size_t)PIPE_SEGMENT_SIZE);
+                uint64_t cf = irq_save();
+                bool ok = user_ok_w((uint8_t *)ubuf + done, piece);
+                if (ok) memcpy((uint8_t *)ubuf + done, m->bytes + done, piece);
+                irq_restore(cf);
+                if (!ok) { message_free(m); return -N_ERR_BAD_ADDRESS; }
+                done += piece;
+            }
+            int64_t size = (int64_t)m->size;
+            *attached = m->attached;
+            m->attached = NULL;
+            kfree(m);
+            return size;
+        }
+        if (!l->open[!side]) { irq_restore(fl); return -N_ERR_CLOSED; }
+        if (!wait) { irq_restore(fl); return -N_ERR_NOT_READY; }
+        if (current_task->killed) { irq_restore(fl); return -N_ERR_STOPPED; }
+        wq_wait(&l->wait[side]);
+        irq_restore(fl);
+    }
+}
+
+static bool message_can_read(struct vnode *v, struct file *f) {
+    (void)f;
+    struct message_link *l = v->priv;
+    int side = message_side(v);
+    return l->head[side] || !l->open[!side];
+}
+static bool message_can_write(struct vnode *v, struct file *f) {
+    (void)v; (void)f;
+    return true; /* sending only allocates; a closed peer reports N_ERR_CLOSED */
+}
+static bool message_hangup(struct vnode *v, struct file *f) {
+    (void)f;
+    struct message_link *l = v->priv;
+    return !l->open[!message_side(v)];
+}
+static void message_close(struct vnode *v, struct file *f) {
+    (void)f;
+    struct message_link *l = v->priv;
+    int side = message_side(v);
+    uint64_t fl = irq_save();
+    l->open[side] = false;
+    /* Nobody can receive this side's queue any more: drop it now, so an
+     * attached handle is not kept alive by a dead end. */
+    struct message *dropped = l->head[side];
+    l->head[side] = NULL;
+    l->tail[side] = &l->head[side];
+    wq_wake_all(&l->wait[!side]);
+    wq_wake_all(&l->wait[side]);
+    vfs_poll_notify(l->end[!side]);
+    irq_restore(fl);
+    message_free(dropped);
+}
+static void message_release(struct vnode *v) {
+    struct message_link *l = v->priv;
+    int side = message_side(v);
+    uint64_t fl = irq_save();
+    l->end[side] = NULL;
+    bool last = !l->end[!side];
+    irq_restore(fl);
+    if (last) {
+        message_free(l->head[0]);
+        message_free(l->head[1]);
+        kfree(l);
+    }
+    kfree(v);
+}
+static struct vnode_ops message_ops = {
+    .can_read = message_can_read, .can_write = message_can_write, .hangup = message_hangup,
+    .close = message_close, .release = message_release,
+};
+
+int message_channel_pair(struct file **a, struct file **b) {
+    struct message_link *l = kzalloc(sizeof *l);
+    struct vnode *v[2] = {kzalloc(sizeof(struct vnode)), kzalloc(sizeof(struct vnode))};
+    if (!l || !v[0] || !v[1]) { kfree(l); kfree(v[0]); kfree(v[1]); return -N_ERR_NO_MEMORY; }
+    for (int i = 0; i < 2; i++) {
+        l->tail[i] = &l->head[i];
+        l->open[i] = true;
+        l->end[i] = v[i];
+        strlcpy(v[i]->name, "channel", sizeof v[i]->name);
+        v[i]->type = VT_CHANNEL;
+        v[i]->mode = (uint32_t)i; /* which end */
+        v[i]->ops = &message_ops;
+        v[i]->priv = l;
+        v[i]->unlinked = true;
+    }
+    *a = vfs_open_vnode(v[0], O_RDWR);
+    *b = *a ? vfs_open_vnode(v[1], O_RDWR) : NULL;
+    if (!*a || !*b) {
+        /* An opened end is released through its file; the other by hand. */
+        if (*a) { vfs_close(*a); *a = NULL; message_release(v[1]); }
+        else { kfree(v[0]); kfree(v[1]); kfree(l); }
+        return -N_ERR_NO_MEMORY;
+    }
+    return 0;
+}

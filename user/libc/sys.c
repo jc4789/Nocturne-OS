@@ -291,6 +291,97 @@ int n_channel_connect(const char *key) {
     return (int)ret(SC2(SYS_CHANNEL_CONNECT,key,strlen(key)));
 }
 int n_channel_accept(int listener_fd) { return (int)ret(SC1(SYS_CHANNEL_ACCEPT,listener_fd)); }
+
+/* ---- native ABI: results come back as they are, errno is left alone ---- */
+#define NC5(n, a, b, c, d, e) __syscall(n, (long)(a), (long)(b), (long)(c), (long)(d), (long)(e))
+const char *n_result_text(n_result r) { return strerror((int)(r < 0 ? -r : r)); }
+n_result n_handle_close(n_handle h) { return NC5(SYS_HANDLE_CLOSE, h, 0, 0, 0, 0); }
+n_result n_handle_kind(n_handle h) { return NC5(SYS_HANDLE_KIND, h, 0, 0, 0, 0); }
+n_handle n_document_open(const char *path, int access) { return (n_handle)NC5(SYS_DOCUMENT_OPEN, path, access, 0, 0, 0); }
+n_result n_document_read_at(n_handle h, uint64_t offset, void *buf, size_t n) {
+    return NC5(SYS_DOCUMENT_READ_AT, h, offset, buf, n, 0);
+}
+n_result n_document_write_at(n_handle h, uint64_t offset, const void *buf, size_t n) {
+    return NC5(SYS_DOCUMENT_WRITE_AT, h, offset, buf, n, 0);
+}
+n_result n_document_size(n_handle h) { return NC5(SYS_DOCUMENT_SIZE, h, 0, 0, 0, 0); }
+n_result n_document_set_size(n_handle h, uint64_t size) { return NC5(SYS_DOCUMENT_SET_SIZE, h, size, 0, 0, 0); }
+n_result n_document_claim(n_handle h, bool wait) { return NC5(SYS_DOCUMENT_CLAIM, h, wait, 0, 0, 0); }
+n_result n_document_release(n_handle h) { return NC5(SYS_DOCUMENT_RELEASE, h, 0, 0, 0, 0); }
+n_result n_document_save(const char *path, const void *data, size_t size) {
+    return NC5(SYS_DOCUMENT_SAVE, path, data, size, 0, 0);
+}
+n_result n_document_append(const char *path, const void *data, size_t size) {
+    return NC5(SYS_DOCUMENT_APPEND, path, data, size, 0, 0);
+}
+n_result n_document_load(const char *path, void **data, size_t *size) {
+    *data = NULL;
+    *size = 0;
+    n_handle h = n_document_open(path, N_DOCUMENT_READ);
+    if (h < 0) return h;
+    n_result r = n_document_size(h);
+    size_t reserved = r > 0 ? (size_t)r : 0, bytes = 0;
+    uint8_t *buf = NULL;
+    if (reserved && !(buf = n_memory_reserve(reserved, N_MEMORY_READ_WRITE))) r = -N_ERR_NO_MEMORY;
+    while (r >= 0 && bytes < reserved) {
+        r = n_document_read_at(h, bytes, buf + bytes, reserved - bytes);
+        if (r <= 0) break; /* 0: it shrank meanwhile */
+        bytes += (size_t)r;
+    }
+    n_handle_close(h);
+    if (r < 0) {
+        if (buf) n_memory_release(buf, reserved);
+        return r;
+    }
+    /* it shrank meanwhile: give back the pages past the end, so the caller's
+       release of *size bytes covers everything */
+    size_t kept = (bytes + N_PAGE_SIZE - 1) & ~(size_t)(N_PAGE_SIZE - 1);
+    size_t whole = (reserved + N_PAGE_SIZE - 1) & ~(size_t)(N_PAGE_SIZE - 1);
+    if (buf && kept < whole) n_memory_release(buf + kept, whole - kept);
+    *data = bytes ? buf : NULL;
+    *size = bytes;
+    return 0;
+}
+n_result n_entry_info(const char *path, struct n_entry *out) { return NC5(SYS_ENTRY_INFO, path, out, 0, 0, 0); }
+n_result n_entry_remove(const char *path) { return NC5(SYS_ENTRY_REMOVE, path, 0, 0, 0, 0); }
+n_result n_entry_move(const char *from, const char *to) { return NC5(SYS_ENTRY_MOVE, from, to, 0, 0, 0); }
+n_result n_folder_create(const char *path) { return NC5(SYS_FOLDER_CREATE, path, 0, 0, 0, 0); }
+n_result n_folder_list(const char *path, struct n_entry *out, size_t max, uint64_t start) {
+    return NC5(SYS_FOLDER_LIST, path, out, max, start, 0);
+}
+n_result n_channel_pair(n_handle out[2]) { return NC5(SYS_CHANNEL_PAIR, out, 0, 0, 0, 0); }
+n_result n_channel_send(n_handle h, const void *data, size_t n, n_handle attach) {
+    return NC5(SYS_CHANNEL_SEND, h, data, n, attach, 0);
+}
+n_result n_channel_receive(n_handle h, void *buf, size_t cap, int flags, n_handle *attached) {
+    return NC5(SYS_CHANNEL_RECEIVE, h, buf, cap, flags, attached);
+}
+n_handle n_app_launch(const char *path, const struct n_launch *launch) {
+    return (n_handle)NC5(SYS_APP_LAUNCH, path, launch, 0, 0, 0);
+}
+n_result n_app_result(n_handle app, int64_t timeout_ms, int *status) {
+    return NC5(SYS_APP_RESULT, app, timeout_ms, status, 0, 0);
+}
+n_result n_app_stop(n_handle app, int flags) { return NC5(SYS_APP_STOP, app, flags, 0, 0, 0); }
+n_result n_app_self(void) { return NC5(SYS_APP_SELF, 0, 0, 0, 0, 0); }
+n_result n_app_parent(void) { return NC5(SYS_APP_PARENT, 0, 0, 0, 0, 0); }
+n_handle n_events_create(void) { return (n_handle)NC5(SYS_EVENTS_CREATE, 0, 0, 0, 0, 0); }
+n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t token) {
+    return NC5(SYS_EVENTS_WATCH, q, h, interest, token, 0);
+}
+n_result n_events_watch_address(n_handle q, volatile uint32_t *address, uint32_t expected, uint64_t token) {
+    return NC5(SYS_EVENTS_WATCH_ADDRESS, q, address, expected, token, 0);
+}
+n_result n_events_timer(n_handle q, uint64_t ms, bool repeat, uint64_t token) {
+    return NC5(SYS_EVENTS_TIMER, q, ms, repeat, token, 0);
+}
+n_result n_events_unwatch(n_handle q, uint64_t token) { return NC5(SYS_EVENTS_UNWATCH, q, token, 0, 0, 0); }
+n_result n_events_wait(n_handle q, struct n_event *out, size_t max, int64_t timeout_ms) {
+    return NC5(SYS_EVENTS_WAIT, q, out, max, timeout_ms, 0);
+}
+uint64_t n_clock_uptime_ms(void) { return uptime_ms(); }
+int64_t n_clock_wall(void) { return SC0(SYS_TIME); }
+void n_sleep_ms(uint64_t ms) { SC1(SYS_SLEEP, ms); }
 int dup(int fd) { return (int)ret(SC1(SYS_DUP, fd)); }
 int dup2(int fd, int newfd) { return (int)ret(SC2(SYS_DUP2, fd, newfd)); }
 int poll(struct n_pollfd *fds, int n, int timeout) { return (int)ret(SC3(SYS_POLL, fds, n, timeout)); }
@@ -373,9 +464,14 @@ static int env_find(const char *name) {
     return -1;
 }
 
+char *const *n_settings = (char *const[]){NULL};
+
 char *getenv(const char *name) {
     int i = env_find(name);
     if (i >= 0) return env_vals[i];
+    size_t len = strlen(name);
+    for (char *const *s = n_settings; *s; s++)
+        if (!strncmp(*s, name, len) && (*s)[len] == '=') return *s + len + 1;
     if (!strcmp(name, "HOME")) return "/home";
     if (!strcmp(name, "PATH")) return "/bin:/data/bin";
     return NULL;
@@ -565,7 +661,8 @@ void __libc_init(void) {
     tls_initialized = 1;
     __stdio_init();
 }
-void __libc_start(int argc, char **argv) {
+void __libc_start(int argc, char **argv, char **settings) {
+    if (settings) n_settings = settings;
     __libc_init();
     /* Weak symbols also keep libc usable by the in-OS C compiler, whose link
        path need not supply these sections. Empty arrays are a no-op for C. */

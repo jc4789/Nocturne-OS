@@ -69,7 +69,73 @@ enum {
     SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
     SYS_NET_DNS_ALL, SYS_TCP_SEND_UNTIL, SYS_TCP_CANCEL, SYS_NET_STATS,
     SYS_NET_SETUP_CANCEL_CHANNEL,
-    SYS_MAX = 128
+    SYS_NET_LIMIT = 128,
+    /* Native ABI (docs/nocturne-native-abi.md): typed handles, documents and
+       folders by full path, message channels, apps and event queues. */
+    SYS_HANDLE_CLOSE = 128, SYS_HANDLE_KIND,
+    SYS_DOCUMENT_OPEN, SYS_DOCUMENT_READ_AT, SYS_DOCUMENT_WRITE_AT, SYS_DOCUMENT_SIZE,
+    SYS_DOCUMENT_SET_SIZE, SYS_DOCUMENT_CLAIM, SYS_DOCUMENT_RELEASE, SYS_DOCUMENT_SAVE,
+    SYS_DOCUMENT_APPEND,
+    SYS_ENTRY_INFO, SYS_ENTRY_REMOVE, SYS_ENTRY_MOVE, SYS_FOLDER_CREATE, SYS_FOLDER_LIST,
+    SYS_CHANNEL_PAIR, SYS_CHANNEL_SEND, SYS_CHANNEL_RECEIVE,
+    SYS_APP_LAUNCH, SYS_APP_RESULT, SYS_APP_STOP, SYS_APP_SELF, SYS_APP_PARENT,
+    SYS_EVENTS_CREATE, SYS_EVENTS_WATCH, SYS_EVENTS_UNWATCH, SYS_EVENTS_WATCH_ADDRESS,
+    SYS_EVENTS_TIMER, SYS_EVENTS_WAIT,
+    SYS_MAX = 192
+};
+
+/* ---- native handles ---- */
+#define N_KIND_DOCUMENT 1
+#define N_KIND_FOLDER 2
+#define N_KIND_CHANNEL 3
+#define N_KIND_WINDOW 4
+#define N_KIND_SHARED 5
+#define N_KIND_APP 6
+#define N_KIND_EVENTS 7
+#define N_KIND_DEVICE 8
+#define N_KIND_CONNECTION 9
+
+/* n_document_open access: one of these, not a bit set. */
+#define N_DOCUMENT_READ 1     /* read an existing document */
+#define N_DOCUMENT_EDIT 2     /* read and write an existing document */
+#define N_DOCUMENT_CREATE 3   /* a new, empty document; N_ERR_EXISTS if the name is taken */
+#define N_DOCUMENT_REPLACE 4  /* new content, swapped in whole by n_handle_close */
+
+/* An entry of a folder, or the entry a path names. Times are wall seconds. */
+struct n_entry {
+    char name[256];
+    uint32_t kind;     /* N_KIND_DOCUMENT, N_KIND_FOLDER or N_KIND_DEVICE */
+    uint32_t reserved;
+    uint64_t size;
+    int64_t modified;
+};
+
+/* n_channel_receive flags */
+#define N_CHANNEL_WAIT 1
+#define N_CHANNEL_PEEK 2  /* report the next message's size, leave it queued */
+
+/* n_app_launch. Handle i of the new app is handles[i] of the launcher (-1:
+   none); by convention 0 is its input, 1 its output and 2 its log. Settings
+   are "NAME=value" strings that ISO C getenv reads. */
+struct n_launch {
+    const char *const *arguments;
+    const char *const *settings;
+    const int32_t *handles;
+    uint32_t argument_count, setting_count, handle_count, flags;
+};
+#define N_APP_STOP_TREE 1  /* n_app_stop: also stop every app it launched */
+
+/* Event interests and reports (level-triggered). */
+#define N_EVENT_RECEIVABLE 1u  /* a message, input, connection or data waits */
+#define N_EVENT_SENDABLE 2u
+#define N_EVENT_CLOSED 4u      /* the other end has gone */
+#define N_EVENT_APP_ENDED 8u
+#define N_EVENT_TIMER 16u
+#define N_EVENT_ADDRESS 32u    /* a watched memory word was notified */
+struct n_event {
+    uint64_t token;
+    uint32_t events;
+    uint32_t reserved;
 };
 
 /* file types */

@@ -521,6 +521,7 @@ static int fat_readdir(struct vnode *dir, uint64_t idx, struct dirent *out) {
             strlcpy(out->name, e.name, sizeof out->name);
             out->type = (e.d.attr & ATTR_DIR) ? VT_DIR : VT_FILE;
             out->size = (e.d.attr & ATTR_DIR) ? 0 : e.d.size;
+            out->mtime = unix_time(e.d.mdate, e.d.mtime);
             /* the cached vnode knows about writes not yet visible here (it is always synced, but be safe) */
             ret = 1;
             break;
@@ -588,10 +589,11 @@ static void make_short(const uint8_t *buf, uint32_t len, const char *name, uint8
     }
 }
 
-static int fat_create(struct vnode *dir, const char *name, int type, struct vnode **outv) {
+/* Write a long-name run and short entry for name into dir. The short entry
+   copies tmpl's attributes, first cluster, size and times. */
+static int dir_insert(struct vnode *dir, const char *name, const struct fat_dirent *tmpl, struct entry *out) {
     struct fat_node *dn = dir->priv;
     struct fat_fs *fs = dn->fs;
-    if (type != VT_FILE && type != VT_DIR) return -N_ERR_INVALID;
     size_t nl = strlen(name);
     if (!nl || nl >= NAME_MAX_LEN) return -N_ERR_NAME_TOO_LONG;
     for (const char *p = name; *p; p++)
@@ -655,33 +657,6 @@ static int fat_create(struct vnode *dir, const char *name, int type, struct vnod
         slot = len - tail_free * 32;
         len += add * fs->cbytes;
     }
-    /* the new object's first cluster (directories always get one) */
-    uint32_t clus = 0;
-    if (type == VT_DIR) {
-        clus = clus_alloc(fs, 0, true);
-        if (!clus) {
-            kfree(buf);
-            return -N_ERR_NO_SPACE;
-        }
-        uint8_t *z = kzalloc(fs->cbytes);
-        struct fat_dirent *d = (struct fat_dirent *)z;
-        memset(d[0].name, ' ', 11);
-        d[0].name[0] = '.';
-        d[0].attr = ATTR_DIR;
-        d[0].clus_hi = (uint16_t)(clus >> 16);
-        d[0].clus_lo = (uint16_t)clus;
-        memset(d[1].name, ' ', 11);
-        d[1].name[0] = d[1].name[1] = '.';
-        d[1].attr = ATTR_DIR;
-        uint32_t parent = dir == fs->root ? 0 : first;
-        d[1].clus_hi = (uint16_t)(parent >> 16);
-        d[1].clus_lo = (uint16_t)parent;
-        fat_time(time_now(), &d[0]);
-        d[1].mdate = d[0].mdate;
-        d[1].mtime = d[0].mtime;
-        clus_write(fs, clus, z);
-        kfree(z);
-    }
     uint8_t sum = lfn_sum(sn);
     for (int i = 0; i < nlfn; i++) {
         int ord = nlfn - i;
@@ -701,28 +676,183 @@ static int fat_create(struct vnode *dir, const char *name, int type, struct vnod
     }
     uint32_t off = slot + (uint32_t)nlfn * 32;
     struct fat_dirent *d = (struct fat_dirent *)(buf + off);
-    memset(d, 0, 32);
+    memcpy(d, tmpl, 32);
     memcpy(d->name, sn, 11);
-    d->attr = type == VT_DIR ? ATTR_DIR : ATTR_ARCH;
-    d->clus_hi = (uint16_t)(clus >> 16);
-    d->clus_lo = (uint16_t)clus;
-    fat_time(time_now(), d);
-    d->cdate = d->adate = d->mdate;
-    d->ctime = d->mtime;
     int err = 0;
     for (uint32_t o = slot; o <= off && !err; o += 32)
         if (o == slot || o % SECTOR == 0) err = dir_store(fs, first, buf, o);
-    struct entry ne;
-    memcpy(&ne.d, d, sizeof *d);
-    strlcpy(ne.name, name, sizeof ne.name);
-    ne.off = off;
-    ne.lfn_off = slot;
+    memcpy(&out->d, d, sizeof *d);
+    strlcpy(out->name, name, sizeof out->name);
+    out->off = off;
+    out->lfn_off = slot;
     kfree(buf);
-    if (err) return err;
+    return err;
+}
+
+/* Mark an entry's long-name run and short entry free (buf is the loaded folder). */
+static int dir_erase(struct fat_fs *fs, uint32_t first, uint8_t *buf, const struct entry *e) {
+    for (uint32_t o = e->lfn_off; o <= e->off; o += 32) buf[o] = 0xE5;
+    int err = 0;
+    for (uint32_t o = e->lfn_off; o <= e->off && !err; o += 32)
+        if (o == e->lfn_off || o % SECTOR == 0) err = dir_store(fs, first, buf, o);
+    return err;
+}
+
+/* Point a folder's ".." entry at its (new) parent. */
+static int dir_set_parent(struct fat_fs *fs, uint32_t clus, struct vnode *parent_dir) {
+    uint32_t parent = parent_dir == fs->root ? 0 : dir_first(parent_dir);
+    uint8_t *z = kmalloc(fs->cbytes);
+    if (!z) return -N_ERR_NO_MEMORY;
+    int err = clus_read(fs, clus, z);
+    struct fat_dirent *d = (struct fat_dirent *)z;
+    if (!err && d[1].name[0] == '.' && d[1].name[1] == '.') {
+        d[1].clus_hi = (uint16_t)(parent >> 16);
+        d[1].clus_lo = (uint16_t)parent;
+        err = clus_write(fs, clus, z);
+    }
+    kfree(z);
+    return err;
+}
+
+static int fat_create(struct vnode *dir, const char *name, int type, struct vnode **outv) {
+    struct fat_node *dn = dir->priv;
+    struct fat_fs *fs = dn->fs;
+    if (type != VT_FILE && type != VT_DIR) return -N_ERR_INVALID;
+    uint32_t first = dir_first(dir);
+    /* the new object's first cluster (directories always get one) */
+    uint32_t clus = 0;
+    if (type == VT_DIR) {
+        clus = clus_alloc(fs, 0, true);
+        if (!clus) return -N_ERR_NO_SPACE;
+        uint8_t *z = kzalloc(fs->cbytes);
+        if (!z) {
+            chain_free(fs, clus);
+            return -N_ERR_NO_MEMORY;
+        }
+        struct fat_dirent *d = (struct fat_dirent *)z;
+        memset(d[0].name, ' ', 11);
+        d[0].name[0] = '.';
+        d[0].attr = ATTR_DIR;
+        d[0].clus_hi = (uint16_t)(clus >> 16);
+        d[0].clus_lo = (uint16_t)clus;
+        memset(d[1].name, ' ', 11);
+        d[1].name[0] = d[1].name[1] = '.';
+        d[1].attr = ATTR_DIR;
+        uint32_t parent = dir == fs->root ? 0 : first;
+        d[1].clus_hi = (uint16_t)(parent >> 16);
+        d[1].clus_lo = (uint16_t)parent;
+        fat_time(time_now(), &d[0]);
+        d[1].mdate = d[0].mdate;
+        d[1].mtime = d[0].mtime;
+        clus_write(fs, clus, z);
+        kfree(z);
+    }
+    struct fat_dirent tmpl;
+    memset(&tmpl, 0, sizeof tmpl);
+    tmpl.attr = type == VT_DIR ? ATTR_DIR : ATTR_ARCH;
+    tmpl.clus_hi = (uint16_t)(clus >> 16);
+    tmpl.clus_lo = (uint16_t)clus;
+    fat_time(time_now(), &tmpl);
+    tmpl.cdate = tmpl.adate = tmpl.mdate;
+    tmpl.ctime = tmpl.mtime;
+    struct entry ne;
+    int err = dir_insert(dir, name, &tmpl, &ne);
+    if (err) {
+        chain_free(fs, clus);
+        return err;
+    }
     struct vnode *v = node_get(fs, dir == fs->root ? 0 : first, &ne);
     if (!v) return -N_ERR_NO_MEMORY;
     v->parent = dir;
     *outv = v;
+    return 0;
+}
+
+/* Replace a document's content: the new bytes go into a fresh cluster chain,
+   then one directory-sector write switches the entry to it. A failure at any
+   point leaves the old content in place. */
+static int fat_replace(struct vnode *v, uint8_t *data, uint64_t size) {
+    struct fat_node *n = v->priv;
+    struct fat_fs *fs = n->fs;
+    struct fat_node staged = {.fs = fs};
+    struct vnode tmp;
+    memset(&tmp, 0, sizeof tmp);
+    tmp.type = VT_FILE;
+    tmp.unlinked = true; /* no directory entry to sync */
+    tmp.ops = &fat_ops;
+    tmp.priv = &staged;
+    int64_t r = size ? fat_store(&tmp, data, 0, size) : 0;
+    kfree(data);
+    if (r < 0 || (uint64_t)r < size) {
+        chain_free(fs, staged.first);
+        return r < 0 ? (int)r : -N_ERR_IO;
+    }
+    uint32_t old = n->first;
+    uint64_t old_size = v->size;
+    int64_t old_mtime = v->mtime;
+    n->first = staged.first;
+    v->size = size;
+    v->mtime = time_now();
+    int err = node_sync(v);
+    if (err < 0) {
+        n->first = old;
+        v->size = old_size;
+        v->mtime = old_mtime;
+        chain_free(fs, staged.first);
+        return err;
+    }
+    chain_free(fs, old);
+    return 0;
+}
+
+/* Rename or move within one volume: the new entry is written first, then the
+   old one is erased, so the object always has at least one name. */
+static int fat_move(struct vnode *from_dir, const char *from, struct vnode *to_dir, const char *to) {
+    struct fat_fs *fs = ((struct fat_node *)from_dir->priv)->fs;
+    if (((struct fat_node *)to_dir->priv)->fs != fs) return -N_ERR_UNSUPPORTED; /* another volume */
+    uint32_t ffirst = dir_first(from_dir), tfirst = dir_first(to_dir);
+    uint32_t len;
+    uint8_t *buf = dir_load(fs, ffirst, &len);
+    if (!buf) return -N_ERR_IO;
+    struct entry e;
+    bool found = dir_find(buf, len, from, &e);
+    kfree(buf);
+    if (!found) return -N_ERR_NOT_FOUND;
+    uint32_t fkey = from_dir == fs->root ? 0 : ffirst, tkey = to_dir == fs->root ? 0 : tfirst;
+    struct vnode *cached = NULL;
+    for (struct vnode *x = fs->nodes; x; x = x->sibling) {
+        struct fat_node *xn = x->priv;
+        if (xn->dir_clus == fkey && xn->ent_off == e.off) cached = x;
+    }
+    if (cached) {
+        /* the cached vnode holds the current chain and size */
+        uint32_t c = node_first(cached);
+        e.d.clus_hi = (uint16_t)(c >> 16);
+        e.d.clus_lo = (uint16_t)c;
+        if (cached->type == VT_FILE) e.d.size = (uint32_t)cached->size;
+    }
+    struct entry ne;
+    int err = dir_insert(to_dir, to, &e.d, &ne);
+    if (err) return err;
+    /* the insert may have rewritten this same folder: erase from a fresh copy */
+    buf = dir_load(fs, ffirst, &len);
+    err = buf ? dir_erase(fs, ffirst, buf, &e) : -N_ERR_IO;
+    kfree(buf);
+    if (err) {
+        uint8_t *tb = dir_load(fs, tfirst, &len);
+        if (tb) dir_erase(fs, tfirst, tb, &ne);
+        kfree(tb);
+        return err;
+    }
+    uint32_t clus = (uint32_t)e.d.clus_hi << 16 | e.d.clus_lo;
+    if ((e.d.attr & ATTR_DIR) && fkey != tkey && clus_valid(fs, clus)) dir_set_parent(fs, clus, to_dir);
+    if (cached) {
+        struct fat_node *cn = cached->priv;
+        cn->dir_clus = tkey;
+        cn->ent_off = ne.off;
+        strlcpy(cached->name, to, sizeof cached->name);
+        cached->parent = to_dir;
+    }
     return 0;
 }
 
@@ -755,10 +885,7 @@ static int fat_unlink(struct vnode *dir, const char *name) {
             kfree(sub);
         }
     }
-    for (uint32_t o = e.lfn_off; o <= e.off; o += 32) buf[o] = 0xE5;
-    int err = 0;
-    for (uint32_t o = e.lfn_off; o <= e.off && !err; o += 32)
-        if (o == e.lfn_off || o % SECTOR == 0) err = dir_store(fs, first, buf, o);
+    int err = dir_erase(fs, first, buf, &e);
     kfree(buf);
     if (err) return err;
     /* the open vnode (if any) keeps its clusters until released */
@@ -797,6 +924,8 @@ static struct vnode_ops fat_ops = {
     .create = fat_create,
     .unlink = fat_unlink,
     .truncate = fat_truncate,
+    .replace = fat_replace,
+    .move = fat_move,
     .release = fat_release,
 };
 

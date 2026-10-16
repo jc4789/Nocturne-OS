@@ -39,21 +39,31 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - 作業ディレクトリはない。パスは常に `/` からの完全指定。相対パスは
   `N_ERR_INVALID`。シェルは自分の「現在のフォルダー」を持ち、起動前に解決する。
 - 丸ごとの操作（通常の用途）：
-  - `n_document_load(path, n_shared *out)`：内容を共有ページで受け取る。
-  - `n_document_save(path, data, size)`：一時領域へ書いてから原子的に差し替える。
+  - `n_document_load(path, void **data, size_t *size)`：内容を新しい `n_memory` ページで
+    受け取る。`n_memory_release(*data, *size)` で返す。
+  - `n_document_save(path, data, size)`：新しい内容を別に用意してから原子的に差し替える
+    （RAM：内容の付け替え、FAT：新しいクラスター列を書いてから目録の一項目を切替え）。
     書きかけの文書が見えることはない。
-  - `n_document_append(path, data, size)`：ログ用の追記。無ければ作る。
+  - `n_document_append(path, data, size)`：ログ用の追記。無ければ作る。追記の間は
+    文書の排他を持つので、同時に追記しても互いを上書きしない。
 - 部分アクセス（大きい媒体、DB）：
   - `n_document_open(path, n_document_access)`。`access` はビットフラグではなく列挙：
     `N_DOCUMENT_READ`、`N_DOCUMENT_EDIT`（既存の読み書き）、
     `N_DOCUMENT_CREATE`（新規作成。既に有れば `N_ERR_EXISTS`）、
-    `N_DOCUMENT_REPLACE`（空の新しい内容で作り、閉じた時点で原子的に差し替え）。
+    `N_DOCUMENT_REPLACE`（空の新しい内容をメモリー上に作る）。差し替えは
+    `n_handle_close` で明示的に閉じた時だけ行う。閉じずに終了したアプリの内容は捨てられ、
+    元の文書はそのまま残る。
   - `n_document_read_at(h, offset, buf, n)`、`n_document_write_at(h, offset, buf, n)`、
     `n_document_size(h)`、`n_document_set_size(h, size)`。**共有カーソル（シーク位置）は無い**。
+    `N_DOCUMENT_READ` のハンドルへの書込みは `N_ERR_DENIED`。
   - 排他：`n_document_claim(h, wait)`／`n_document_release(h)`（現行のリースを継承）。
+    待たない場合に他が持っていれば `N_ERR_NOT_READY`。
 - 情報と操作：`n_entry_info(path, struct n_entry *)`、`n_folder_create(path)`、
   `n_entry_remove(path)`（空でないフォルダーは `N_ERR_NOT_EMPTY`）、
-  `n_entry_move(from, to)`、`n_folder_list(path, struct n_entry *out, max, start)`。
+  `n_entry_move(from, to)`、`n_folder_list(path, struct n_entry *out, max, start)`（件数を返す）。
+- `n_entry_move` は既存の名前を決して上書きしない（`N_ERR_EXISTS`）。同じ装置内は
+  名前の付け替え、装置をまたぐ文書は丸ごと複写してから元を消す。装置をまたぐフォルダーは
+  `N_ERR_UNSUPPORTED`。フォルダーを自分の中へは移せない（`N_ERR_INVALID`）。
 
 ## 4. チャンネル（`pipe`／標準入出力fd の置き換え）
 
@@ -61,9 +71,17 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   受信側は境界を保ったまま受け取る。大きな塊は共有ページを添付して送る。
 - `n_channel_pair(n_handle out[2])`：無名の対（現行 `pipe` の置き換え）。
 - 名前付きの合流点は現行の `n_channel_listen`／`connect`／`accept` を引き継ぐ。
-- `n_channel_send(h, data, n)`、`n_channel_receive(h, buf, cap, flags)`
-  （`N_CHANNEL_WAIT` で待つ。待たない場合は `N_ERR_NOT_READY`）、
-  `n_channel_attach(h, shared)`／`n_channel_take(h)`（共有ページの受渡し）。
+- `n_channel_send(h, data, n, attach)`、`n_channel_receive(h, buf, cap, flags, &attached)`。
+  - `N_CHANNEL_WAIT` で待つ。待たない場合は `N_ERR_NOT_READY`。相手が閉じて
+    残りも無ければ `N_ERR_CLOSED`。
+  - `N_CHANNEL_PEEK` は次のメッセージの大きさだけを返し、取り出さない。
+    `cap` より大きいメッセージは `N_ERR_TOO_LARGE` で、待ち行列に残る。長さ0の
+    メッセージも一つのメッセージとして届く。
+  - `attach` は文書または共有ページのハンドル（無ければ -1）。メッセージと一緒に運ばれ、
+    受信側で新しいハンドルとして `attached` に入る（無ければ -1）。チャンネル自身を
+    運ぶと参照の循環になるので `N_ERR_WRONG_KIND`。
+- 移行中（段階5まで）、旧来のバイト列のパイプにも `n_channel_send`／`receive` が使える。
+  ただし境界と添付は無い。
 - 端末は、子アプリの「入力」「出力」チャンネルとメッセージをやり取りする一つの
   アプリにすぎない。端末であるかの判定（`isatty`）は無い。ISO Cの `stdout`／`stderr`／
   `stdin` は、起動時に渡された出力／入力チャンネル（無ければ記録先のログ）に結び付く。
@@ -73,8 +91,13 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - `n_app_launch(path, const struct n_launch *)` がアプリハンドルを返す。
   `n_launch` は引数列、設定の組（ISO Cの `getenv` が読む。`environ` は無い）、
   引き渡すハンドルの表（入力・出力・ログのチャンネル、共有ページ等）を持つ。
+  - 設定は `"名前=値"` の形（`=` が無ければ `N_ERR_INVALID`）。起動されたアプリでは
+    `n_settings`（NULL終端）として読め、`getenv` もこれを引く。
+  - 引き渡すハンドルは、表の順に子アプリの 0, 1, 2, … 番になる（-1 は空き）。
+  - パスは完全指定。起動されたアプリは作業フォルダーを持たない。
 - 終了はアプリハンドルのイベント（§6）で届く。`n_app_result(h, timeout_ms, int *status)` で
-  直接待つこともできる。ゾンビの回収は無く、最後のハンドルを閉じれば記録は消える。
+  直接待つこともできる（-1 は無期限、0 は待たずに `N_ERR_NOT_READY`、期限切れは
+  `N_ERR_TIMEOUT`）。ゾンビの回収は無く、最後のハンドルを閉じれば記録は消える。
 - `n_app_stop(h, N_APP_STOP_TREE か 0)`：停止要求。シグナルは無い。
 - `n_app_self()`、`n_app_parent()`：アプリ識別子（共有ページの受渡しの許可判定用）。
 - `n_app_list`、`n_system_info` 等の状態取得は現行の `proclist`／`sysinfo` を引き継ぐ。
@@ -83,11 +106,19 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 
 - `n_events_create()` が待ち行列を作る。各スレッドは任意の数を持てる。
 - `n_events_watch(q, h, interest, token)`：ハンドルの関心事を登録。
-  `N_EVENT_RECEIVABLE`、`N_EVENT_SENDABLE`、`N_EVENT_CLOSED`、`N_EVENT_APP_ENDED`、
-  `N_EVENT_WINDOW_INPUT`、`N_EVENT_CONNECTION`、`N_EVENT_TIMER`。
-- 現行のアドレス監視（`n_address_watch`）はこの待ち行列へ統合する。
-- `n_events_wait(q, struct n_event *out, max, timeout_ms)`：届いた分を一括で返す。
-- タイマー：`n_events_timer(q, ms, repeat, token)`。
+  `N_EVENT_RECEIVABLE`（メッセージ、窓の入力、接続要求、受信データ）、`N_EVENT_SENDABLE`、
+  `N_EVENT_CLOSED`、`N_EVENT_APP_ENDED`。同じハンドルと同じ token の再登録は関心事の変更。
+  待ち行列を待ち行列に入れることはできない（`N_ERR_WRONG_KIND`）。
+- 報告は状態に基づく（レベル）。準備ができたままのハンドルは毎回の待ちで報告される。
+- 監視はハンドルを保持しない。ハンドルが最後に閉じられると監視も消える。
+- 現行のアドレス監視はこの待ち行列へ統合した：`n_events_watch_address(q, address,
+  expected, token)`。値が既に違えば `N_ERR_NOT_READY`。通知されると `N_EVENT_ADDRESS`。
+- タイマー：`n_events_timer(q, ms, repeat, token)`。`N_EVENT_TIMER` で届く。繰返しの
+  タイマーは遅れた分をまとめて報告せず、周期を保つ。
+- `n_events_unwatch(q, token)`：その token の監視・タイマー・アドレス監視を外す。
+  0＝無かった、1＝外した、2＝アドレスの通知が既に届いていた（取り消した）。
+- `n_events_wait(q, struct n_event *out, max, timeout_ms)`：届いた分を一括で返す
+  （一回に最大64件。残りは次の待ちで返る）。-1 は無期限、0 は待たない。
 
 ## 7. メモリ（`sbrk`／`mmap`／`mprotect` の置き換え）
 
@@ -110,7 +141,8 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 
 ## 10. 移行の段階
 
-1. この文書。新システムコールを旧ABIと並べてカーネルへ追加し、`nocturne.h` に宣言する。
+1. この文書。新システムコールを旧ABIと並べてカーネルへ追加し、`nocturne.h` に宣言する
+   （番号は128から。`tests/nativeabitest.c` がゲスト内で実カーネルを確かめる）。
 2. libc（stdio、malloc、time、getenv）を新ABIへ移す。
 3. OS自身のアプリ（ブラウザー、端末、シェル、ファイル、coreutils 等）を新ABIへ移す。
 4. 移植物のソースを新ABIへ直接書き換える。tcc がゲスト内でコンパイルする

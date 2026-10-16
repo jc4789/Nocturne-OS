@@ -6,6 +6,7 @@
 #include "sys/sched.h"
 #include "sys/syscall.h"
 #include "sys/proc.h"
+#include "sys/events.h"
 #include "fs/vfs.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
@@ -18,7 +19,7 @@
 #include "abi.h"
 _Static_assert(PAGE_SIZE == N_PAGE_SIZE, "native mapping granule ABI");
 
-_Static_assert(sizeof(struct n_dirent) == sizeof(struct dirent), "dirent ABI");
+_Static_assert(sizeof(struct n_dirent) == offsetof(struct dirent, mtime), "dirent ABI");
 _Static_assert(sizeof(struct n_stat) == sizeof(struct kstat), "stat ABI");
 _Static_assert(sizeof(struct n_gpu_blit) == 32, "GPU blit ABI");
 
@@ -179,12 +180,19 @@ static int64_t sys_fstat(int fd, struct kstat *st) {
     return 0;
 }
 
-static int64_t sys_readdir(int fd, uint64_t idx, struct dirent *d) {
+static int64_t sys_readdir(int fd, uint64_t idx, struct n_dirent *ud) {
     struct file *f = getfd_ref(fd);
     if (!f) return -N_ERR_NO_HANDLE;
-    if (!user_ok_w(d, sizeof *d)) { vfs_close(f); return -N_ERR_BAD_ADDRESS; }
-    int64_t result = vfs_readdir(f, idx, d);
+    struct dirent d;
+    memset(&d, 0, sizeof d);
+    int64_t result = vfs_readdir(f, idx, &d);
     vfs_close(f);
+    if (result > 0) {
+        uint64_t flags = irq_save();
+        if (!user_ok_w(ud, sizeof *ud)) result = -N_ERR_BAD_ADDRESS;
+        else memcpy(ud, &d, sizeof *ud);
+        irq_restore(flags);
+    }
     return result;
 }
 
@@ -959,6 +967,463 @@ static int64_t sys_dmesg(char *buf, size_t n) {
     return klog_read(buf, n);
 }
 
+/* ---- native ABI (docs/nocturne-native-abi.md) ---- */
+
+/* Paths are complete: there is no working directory to resolve against. */
+static int native_path(const char *upath, char *out) {
+    char tmp[PATH_MAX_LEN];
+    int r = user_str(tmp, upath, sizeof tmp);
+    if (r < 0) return r;
+    if (tmp[0] != '/') return -N_ERR_INVALID;
+    return vfs_normalize("/", tmp, out);
+}
+
+/* Publish a new handle; on failure the caller's reference is dropped. */
+static int64_t install(struct file *f) {
+    int h = allocfd(f);
+    if (h < 0) vfs_close(f);
+    return h;
+}
+
+/* Copy user bytes in bounded pieces: no long non-preemptible copy, and a
+   sibling unmapping the source meanwhile is reported, not faulted on. */
+static int copy_from_user(void *dst, const void *usrc, size_t n) {
+    for (size_t done = 0; done < n;) {
+        size_t piece = MIN(n - done, (size_t)16384);
+        uint64_t flags = irq_save();
+        bool ok = user_ok((const uint8_t *)usrc + done, piece);
+        if (ok) memcpy((uint8_t *)dst + done, (const uint8_t *)usrc + done, piece);
+        irq_restore(flags);
+        if (!ok) return -N_ERR_BAD_ADDRESS;
+        done += piece;
+    }
+    return 0;
+}
+
+static int copy_to_user(void *udst, const void *src, size_t n) {
+    uint64_t flags = irq_save();
+    bool ok = user_ok_w(udst, n);
+    if (ok) memcpy(udst, src, n);
+    irq_restore(flags);
+    return ok ? 0 : -N_ERR_BAD_ADDRESS;
+}
+
+static int64_t sys_handle_close(int h) {
+    struct file *f = getfd_ref(h);
+    if (!f) return -N_ERR_NO_HANDLE;
+    /* Only an explicit close commits a replacement: an app that ends with the
+       handle open leaves the old document as it was. */
+    int committed = vfs_document_commit(f);
+    vfs_close(f);
+    int closed = (int)sys_close(h);
+    return committed < 0 ? committed : closed;
+}
+
+static int64_t sys_handle_kind(int h) {
+    uint64_t flags = irq_save();
+    struct file *f = getfd(h);
+    int kind = f ? vfs_kind(f->vn) : -N_ERR_NO_HANDLE;
+    irq_restore(flags);
+    return kind;
+}
+
+static int64_t sys_document_open(const char *upath, int access) {
+    char path[PATH_MAX_LEN];
+    int r = native_path(upath, path);
+    if (r < 0) return r;
+    struct file *f;
+    r = vfs_document_open(path, access, &f);
+    return r < 0 ? r : install(f);
+}
+
+static int64_t sys_document_io(int h, uint64_t off, void *buf, size_t n, bool write) {
+    struct file *f = getfd_ref(h);
+    if (!f) return -N_ERR_NO_HANDLE;
+    int64_t r = write ? vfs_document_write_user(f, off, buf, n) : vfs_document_read_user(f, off, buf, n);
+    vfs_close(f);
+    return r;
+}
+
+static struct file *document_ref(int h, int64_t *error) {
+    struct file *f = getfd_ref(h);
+    *error = !f ? -N_ERR_NO_HANDLE : f->vn->type != VT_FILE ? -N_ERR_WRONG_KIND : 0;
+    if (*error && f) { vfs_close(f); f = NULL; }
+    return f;
+}
+
+static int64_t sys_document_size(int h) {
+    int64_t r;
+    struct file *f = document_ref(h, &r);
+    if (!f) return r;
+    r = (int64_t)f->vn->size;
+    vfs_close(f);
+    return r;
+}
+
+static int64_t sys_document_set_size(int h, uint64_t size) {
+    int64_t r;
+    struct file *f = document_ref(h, &r);
+    if (!f) return r;
+    r = (f->flags & O_ACCMODE) == O_RDONLY ? -N_ERR_DENIED : vfs_truncate(f, size);
+    vfs_close(f);
+    return r;
+}
+
+static int64_t sys_document_claim(int h, bool claim, bool wait) {
+    int64_t r;
+    struct file *f = document_ref(h, &r);
+    if (!f) return r;
+    r = !claim ? vfs_lease(f, false) : wait ? vfs_lease(f, true) : vfs_try_lease(f);
+    vfs_close(f);
+    return r;
+}
+
+static int64_t sys_document_save(const char *upath, const void *udata, size_t n) {
+    char path[PATH_MAX_LEN];
+    int r = native_path(upath, path);
+    if (r < 0) return r;
+    uint8_t *data = n ? kmalloc(n) : NULL;
+    if (n && !data) return -N_ERR_NO_MEMORY;
+    r = copy_from_user(data, udata, n);
+    if (r < 0) { kfree(data); return r; }
+    return vfs_replace(path, data, n);
+}
+
+static int64_t sys_document_append(const char *upath, const void *udata, size_t n) {
+    char path[PATH_MAX_LEN];
+    int r = native_path(upath, path);
+    return r < 0 ? r : vfs_append_user(path, udata, n);
+}
+
+static void entry_from(struct n_entry *e, const struct dirent *d) {
+    memset(e, 0, sizeof *e);
+    strlcpy(e->name, d->name, sizeof e->name);
+    e->kind = d->type == VT_DIR ? N_KIND_FOLDER : d->type == VT_FILE ? N_KIND_DOCUMENT : N_KIND_DEVICE;
+    e->size = d->size;
+    e->modified = d->mtime;
+}
+
+static int64_t sys_entry_info(const char *upath, struct n_entry *uout) {
+    char path[PATH_MAX_LEN];
+    int r = native_path(upath, path);
+    if (r < 0) return r;
+    struct dirent d;
+    memset(&d, 0, sizeof d);
+    r = vfs_entry_info(path, &d);
+    if (r < 0) return r;
+    struct n_entry e;
+    entry_from(&e, &d);
+    return copy_to_user(uout, &e, sizeof e);
+}
+
+static int64_t sys_folder_list(const char *upath, struct n_entry *uout, size_t max, uint64_t start) {
+    char path[PATH_MAX_LEN];
+    int r = native_path(upath, path);
+    if (r < 0) return r;
+    if (max > SIZE_MAX / sizeof *uout) return -N_ERR_INVALID;
+    enum { BATCH = 16 };
+    struct dirent *batch = kmalloc(BATCH * sizeof *batch);
+    struct n_entry *entries = kmalloc(BATCH * sizeof *entries);
+    int64_t done = 0;
+    if (!batch || !entries) done = -N_ERR_NO_MEMORY;
+    while (done >= 0 && (size_t)done < max) {
+        size_t want = MIN(max - (size_t)done, (size_t)BATCH);
+        memset(batch, 0, want * sizeof *batch);
+        int n = vfs_folder_list(path, start + (uint64_t)done, batch, want);
+        if (n < 0) { if (!done) done = n; break; }
+        for (int i = 0; i < n; i++) entry_from(&entries[i], &batch[i]);
+        if (copy_to_user(uout + done, entries, (size_t)n * sizeof *entries) < 0) { done = -N_ERR_BAD_ADDRESS; break; }
+        done += n;
+        if ((size_t)n < want) break;
+    }
+    kfree(batch);
+    kfree(entries);
+    return done;
+}
+
+static int64_t sys_entry_remove(const char *upath) {
+    char path[PATH_MAX_LEN];
+    int r = native_path(upath, path);
+    return r < 0 ? r : vfs_unlink(path);
+}
+
+static int64_t sys_entry_move(const char *ufrom, const char *uto) {
+    char from[PATH_MAX_LEN], to[PATH_MAX_LEN];
+    int r = native_path(ufrom, from);
+    if (r < 0) return r;
+    r = native_path(uto, to);
+    return r < 0 ? r : vfs_move(from, to);
+}
+
+static int64_t sys_folder_create(const char *upath) {
+    char path[PATH_MAX_LEN];
+    int r = native_path(upath, path);
+    return r < 0 ? r : vfs_mkdir(path);
+}
+
+static int64_t sys_channel_pair(int32_t *uout) {
+    if (!user_ok_w(uout, 2 * sizeof *uout)) return -N_ERR_BAD_ADDRESS;
+    struct file *a, *b;
+    int e = message_channel_pair(&a, &b);
+    if (e < 0) return e;
+    uint64_t flags = irq_save();
+    int ha = allocfd_locked(a), hb = ha < 0 ? ha : allocfd_locked(b);
+    int error = hb < 0 ? hb : !user_ok_w(uout, 2 * sizeof *uout) ? -N_ERR_BAD_ADDRESS : 0;
+    if (error) {
+        if (hb >= 0) task_process()->fds[hb] = NULL;
+        if (ha >= 0) { task_process()->fds[ha] = NULL; task_process()->fd_hint = (size_t)ha; }
+        irq_restore(flags);
+        vfs_close(a);
+        vfs_close(b);
+        return error;
+    }
+    uout[0] = ha;
+    uout[1] = hb;
+    irq_restore(flags);
+    return 0;
+}
+
+/* Byte pipes and byte channels remain until the old ABI is removed (stage 5):
+   on them a send is a write and a receive takes what is there, without
+   message boundaries or attachments. */
+static bool byte_channel(struct file *f) {
+    return f->vn->type == VT_PIPE || (f->vn->type == VT_CHANNEL && !message_channel_is(f));
+}
+
+static int64_t sys_channel_send(int h, const void *udata, size_t n, int attach) {
+    struct file *f = getfd_ref(h);
+    if (!f) return -N_ERR_NO_HANDLE;
+    struct file *att = NULL;
+    int64_t r = 0;
+    if (attach >= 0) {
+        att = getfd_ref(attach);
+        if (!att) r = -N_ERR_NO_HANDLE;
+        /* documents and shared pages only: a channel end sent through its own
+           channel would keep itself alive */
+        else if (att->vn->type != VT_FILE && att->vn->type != VT_SHARED) r = -N_ERR_WRONG_KIND;
+    }
+    if (r < 0) {
+    } else if (message_channel_is(f)) {
+        r = message_channel_send(f, udata, n, att);
+    } else if (byte_channel(f)) {
+        r = att ? -N_ERR_UNSUPPORTED : vfs_write_user(f, udata, n);
+    } else {
+        r = -N_ERR_WRONG_KIND;
+    }
+    if (att) vfs_close(att);
+    vfs_close(f);
+    return r;
+}
+
+static int64_t sys_channel_receive(int h, void *ubuf, size_t cap, int flags, int32_t *uattached) {
+    if (uattached && !user_ok_w(uattached, sizeof *uattached)) return -N_ERR_BAD_ADDRESS;
+    struct file *f = getfd_ref(h);
+    if (!f) return -N_ERR_NO_HANDLE;
+    bool wait = flags & N_CHANNEL_WAIT, peek = flags & N_CHANNEL_PEEK;
+    int64_t r;
+    struct file *att = NULL;
+    if (message_channel_is(f)) {
+        r = message_channel_receive(f, ubuf, cap, wait, peek, &att);
+    } else if (byte_channel(f)) {
+        if (peek) r = -N_ERR_UNSUPPORTED;
+        else if (!cap) r = 0;
+        else {
+            uint64_t irq = irq_save();
+            bool ready = vfs_can_read(f);
+            irq_restore(irq);
+            r = !ready && !wait ? -N_ERR_NOT_READY : vfs_read_user(f, ubuf, cap);
+            if (r == 0) r = -N_ERR_CLOSED; /* the writer has gone */
+        }
+    } else {
+        r = -N_ERR_WRONG_KIND;
+    }
+    vfs_close(f);
+    if (r >= 0 && !peek && uattached) {
+        int32_t handle = att ? (int32_t)install(att) : -1;
+        att = NULL;
+        if (copy_to_user(uattached, &handle, sizeof handle) < 0 && handle >= 0) sys_close(handle);
+    }
+    if (att) vfs_close(att); /* the caller did not ask for attachments */
+    return r;
+}
+
+/* A user string of any length up to max, copied into the kernel. */
+static char *user_strdup(const char *u, char *scratch, size_t max, int *error) {
+    int n = user_str(scratch, u, max);
+    if (n < 0) { *error = n; return NULL; }
+    char *s = strdup(scratch);
+    if (!s) *error = -N_ERR_NO_MEMORY;
+    return s;
+}
+
+static int64_t sys_app_launch(const char *upath, const struct n_launch *ul) {
+    char path[PATH_MAX_LEN];
+    int r = native_path(upath, path);
+    if (r < 0) return r;
+    struct n_launch l;
+    r = copy_from_user(&l, ul, sizeof l);
+    if (r < 0) return r;
+    if (l.flags) return -N_ERR_INVALID;
+    const size_t limit = USER_STACK_MAX / 2; /* what the new app's stack can hold */
+    if (l.argument_count > limit / 8 || l.setting_count > limit / 8 || l.handle_count > 4096)
+        return -N_ERR_TOO_MANY_ARGUMENTS;
+    size_t argc = l.argument_count ? l.argument_count : 1;
+    char **argv = kzalloc(argc * sizeof *argv);
+    char **settings = kzalloc((l.setting_count + 1) * sizeof *settings);
+    struct file **handles = kzalloc((l.handle_count + 1) * sizeof *handles);
+    char *scratch = kmalloc(65536);
+    struct file *app_file = NULL;
+    int64_t ret = 0;
+    size_t bytes = 0;
+    if (!argv || !settings || !handles || !scratch) { ret = -N_ERR_NO_MEMORY; goto out; }
+    if (!l.argument_count) {
+        argv[0] = strdup(path);
+        if (!argv[0]) { ret = -N_ERR_NO_MEMORY; goto out; }
+    }
+    for (size_t i = 0; i < l.argument_count; i++) {
+        const char *ua;
+        if ((r = copy_from_user(&ua, &l.arguments[i], sizeof ua)) < 0) { ret = r; goto out; }
+        if (!(argv[i] = user_strdup(ua, scratch, 65536, &r))) { ret = r; goto out; }
+        bytes += strlen(argv[i]) + 1;
+    }
+    for (size_t i = 0; i < l.setting_count; i++) {
+        const char *us;
+        if ((r = copy_from_user(&us, &l.settings[i], sizeof us)) < 0) { ret = r; goto out; }
+        if (!(settings[i] = user_strdup(us, scratch, 65536, &r))) { ret = r; goto out; }
+        bytes += strlen(settings[i]) + 1;
+        if (!strchr(settings[i], '=')) { ret = -N_ERR_INVALID; goto out; }
+    }
+    if (bytes > limit) { ret = -N_ERR_TOO_MANY_ARGUMENTS; goto out; }
+    for (size_t i = 0; i < l.handle_count; i++) {
+        int32_t h;
+        if ((r = copy_from_user(&h, &l.handles[i], sizeof h)) < 0) { ret = r; goto out; }
+        if (h < 0) continue;
+        if (!(handles[i] = getfd_ref(h))) { ret = -N_ERR_NO_HANDLE; goto out; }
+    }
+    struct vnode *app = proc_app_new();
+    if (!app || !(app_file = vfs_open_vnode(app, O_RDONLY))) {
+        if (app) app->ops->release(app);
+        ret = -N_ERR_NO_MEMORY;
+        goto out;
+    }
+    struct proc_launch launch = {.argc = (int)argc, .argv = argv, .setting_count = (int)l.setting_count,
+                                 .settings = settings, .handles = handles, .handle_count = l.handle_count,
+                                 .cwd = "/", .parent = task_process(), .app = app};
+    r = proc_launch(path, &launch);
+    if (r < 0) ret = r;
+    else { ret = install(app_file); app_file = NULL; }
+out:
+    if (app_file) vfs_close(app_file);
+    if (argv) for (size_t i = 0; i < argc; i++) kfree(argv[i]);
+    if (settings) for (size_t i = 0; i < l.setting_count; i++) kfree(settings[i]);
+    if (handles) for (size_t i = 0; i < l.handle_count; i++) if (handles[i]) vfs_close(handles[i]);
+    kfree(argv);
+    kfree(settings);
+    kfree(handles);
+    kfree(scratch);
+    return ret;
+}
+
+static struct file *app_ref(int h, int64_t *error) {
+    struct file *f = getfd_ref(h);
+    *error = !f ? -N_ERR_NO_HANDLE : !proc_app_is(f->vn) ? -N_ERR_WRONG_KIND : 0;
+    if (*error && f) { vfs_close(f); f = NULL; }
+    return f;
+}
+
+static int64_t sys_app_result(int h, int64_t timeout_ms, int *ustatus) {
+    int64_t r;
+    struct file *f = app_ref(h, &r);
+    if (!f) return r;
+    int status = 0;
+    r = proc_app_result(f->vn, timeout_ms < 0 ? UINT64_MAX : (uint64_t)timeout_ms, &status);
+    vfs_close(f);
+    if (!r && ustatus) r = copy_to_user(ustatus, &status, sizeof status);
+    return r;
+}
+
+static int64_t sys_app_stop(int h, int flags) {
+    int64_t r;
+    struct file *f = app_ref(h, &r);
+    if (!f) return r;
+    int pid = proc_app_pid(f->vn);
+    vfs_close(f);
+    if (flags & ~N_APP_STOP_TREE) return -N_ERR_INVALID;
+    if (!pid) return 0; /* it has already ended */
+    if (flags & N_APP_STOP_TREE) sys_killtree(pid, 1);
+    else task_kill(pid);
+    return 0;
+}
+
+static struct file *events_ref(int q, int64_t *error) {
+    struct file *f = getfd_ref(q);
+    *error = !f ? -N_ERR_NO_HANDLE : !events_is(f) ? -N_ERR_WRONG_KIND : 0;
+    if (*error && f) { vfs_close(f); f = NULL; }
+    return f;
+}
+
+static int64_t sys_events_create(void) {
+    struct vnode *v = events_new();
+    if (!v) return -N_ERR_NO_MEMORY;
+    struct file *f = vfs_open_vnode(v, O_RDONLY);
+    if (!f) { v->ops->release(v); return -N_ERR_NO_MEMORY; }
+    return install(f);
+}
+
+static int64_t sys_events_watch(int q, int h, uint32_t interest, uint64_t token) {
+    const uint32_t known = N_EVENT_RECEIVABLE | N_EVENT_SENDABLE | N_EVENT_CLOSED | N_EVENT_APP_ENDED;
+    if (!interest || (interest & ~known)) return -N_ERR_INVALID;
+    int64_t r;
+    struct file *queue = events_ref(q, &r);
+    if (!queue) return r;
+    struct event_watch *spare = kmalloc(events_watch_size());
+    if (!spare) { vfs_close(queue); return -N_ERR_NO_MEMORY; }
+    uint64_t flags = irq_save();
+    struct file *f = getfd(h);
+    r = f ? events_watch_locked(queue, f, interest, token, &spare) : -N_ERR_NO_HANDLE;
+    irq_restore(flags);
+    kfree(spare);
+    vfs_close(queue);
+    return r;
+}
+
+static int64_t sys_events_watch_address(int q, uint64_t address, uint32_t expected, uint64_t token) {
+    if ((address & 3) || !user_ok((void *)address, sizeof(uint32_t))) return -N_ERR_BAD_ADDRESS;
+    int64_t r;
+    struct file *queue = events_ref(q, &r);
+    if (!queue) return r;
+    r = events_watch_address(queue, (volatile uint32_t *)address, expected, token);
+    vfs_close(queue);
+    return r;
+}
+
+static int64_t sys_events_timer(int q, uint64_t ms, int repeat, uint64_t token) {
+    int64_t r;
+    struct file *queue = events_ref(q, &r);
+    if (!queue) return r;
+    r = events_timer(queue, ms, repeat != 0, token);
+    vfs_close(queue);
+    return r;
+}
+
+static int64_t sys_events_unwatch(int q, uint64_t token) {
+    int64_t r;
+    struct file *queue = events_ref(q, &r);
+    if (!queue) return r;
+    r = events_unwatch(queue, token);
+    vfs_close(queue);
+    return r;
+}
+
+static int64_t sys_events_wait(int q, struct n_event *uout, size_t max, int64_t timeout_ms) {
+    int64_t r;
+    struct file *queue = events_ref(q, &r);
+    if (!queue) return r;
+    r = events_wait(queue, uout, max, timeout_ms);
+    vfs_close(queue);
+    return r;
+}
+
 void syscall_dispatch(struct regs *r) {
     /* An AP trap may be queued as a BSP continuation when a sibling aborts
        its process. Do not execute that pending syscall after it is killed:
@@ -994,7 +1459,7 @@ void syscall_dispatch(struct regs *r) {
     }
     case SYS_STAT: ret = sys_stat((const char *)a, (struct kstat *)b); break;
     case SYS_FSTAT: ret = sys_fstat((int)a, (struct kstat *)b); break;
-    case SYS_READDIR: ret = sys_readdir((int)a, b, (struct dirent *)c); break;
+    case SYS_READDIR: ret = sys_readdir((int)a, b, (struct n_dirent *)c); break;
     case SYS_MKDIR: ret = sys_mkdir((const char *)a); break;
     case SYS_UNLINK: ret = sys_unlink((const char *)a); break;
     case SYS_RENAME: ret = sys_rename((const char *)a, (const char *)b); break;
@@ -1183,9 +1648,39 @@ void syscall_dispatch(struct regs *r) {
         if (!user_ok_w((void *)a, b * sizeof(struct n_pciinfo))) ret = -N_ERR_BAD_ADDRESS;
         else ret = pci_list((struct n_pciinfo *)a, (int)b);
         break;
+    case SYS_HANDLE_CLOSE: ret = sys_handle_close((int)a); break;
+    case SYS_HANDLE_KIND: ret = sys_handle_kind((int)a); break;
+    case SYS_DOCUMENT_OPEN: ret = sys_document_open((const char *)a, (int)b); break;
+    case SYS_DOCUMENT_READ_AT: ret = sys_document_io((int)a, b, (void *)c, d, false); break;
+    case SYS_DOCUMENT_WRITE_AT: ret = sys_document_io((int)a, b, (void *)c, d, true); break;
+    case SYS_DOCUMENT_SIZE: ret = sys_document_size((int)a); break;
+    case SYS_DOCUMENT_SET_SIZE: ret = sys_document_set_size((int)a, b); break;
+    case SYS_DOCUMENT_CLAIM: ret = sys_document_claim((int)a, true, b != 0); break;
+    case SYS_DOCUMENT_RELEASE: ret = sys_document_claim((int)a, false, false); break;
+    case SYS_DOCUMENT_SAVE: ret = sys_document_save((const char *)a, (const void *)b, c); break;
+    case SYS_DOCUMENT_APPEND: ret = sys_document_append((const char *)a, (const void *)b, c); break;
+    case SYS_ENTRY_INFO: ret = sys_entry_info((const char *)a, (struct n_entry *)b); break;
+    case SYS_ENTRY_REMOVE: ret = sys_entry_remove((const char *)a); break;
+    case SYS_ENTRY_MOVE: ret = sys_entry_move((const char *)a, (const char *)b); break;
+    case SYS_FOLDER_CREATE: ret = sys_folder_create((const char *)a); break;
+    case SYS_FOLDER_LIST: ret = sys_folder_list((const char *)a, (struct n_entry *)b, c, d); break;
+    case SYS_CHANNEL_PAIR: ret = sys_channel_pair((int32_t *)a); break;
+    case SYS_CHANNEL_SEND: ret = sys_channel_send((int)a, (const void *)b, c, (int)d); break;
+    case SYS_CHANNEL_RECEIVE: ret = sys_channel_receive((int)a, (void *)b, c, (int)d, (int32_t *)e); break;
+    case SYS_APP_LAUNCH: ret = sys_app_launch((const char *)a, (const struct n_launch *)b); break;
+    case SYS_APP_RESULT: ret = sys_app_result((int)a, (int64_t)b, (int *)c); break;
+    case SYS_APP_STOP: ret = sys_app_stop((int)a, (int)b); break;
+    case SYS_APP_SELF: ret = task_process()->pid; break;
+    case SYS_APP_PARENT: ret = task_process()->parent ? task_process()->parent->pid : 0; break;
+    case SYS_EVENTS_CREATE: ret = sys_events_create(); break;
+    case SYS_EVENTS_WATCH: ret = sys_events_watch((int)a, (int)b, (uint32_t)c, d); break;
+    case SYS_EVENTS_UNWATCH: ret = sys_events_unwatch((int)a, b); break;
+    case SYS_EVENTS_WATCH_ADDRESS: ret = sys_events_watch_address((int)a, b, (uint32_t)c, d); break;
+    case SYS_EVENTS_TIMER: ret = sys_events_timer((int)a, b, (int)c, d); break;
+    case SYS_EVENTS_WAIT: ret = sys_events_wait((int)a, (struct n_event *)b, c, (int64_t)d); break;
     default:
         if (r->rax >= SYS_WIN_CREATE && r->rax < SYS_NET_INFO) ret = wm_syscall((int)r->rax, a, b, c, d, e);
-        else if (r->rax >= SYS_NET_INFO && r->rax < SYS_MAX) ret = net_syscall((int)r->rax, a, b, c, d, e);
+        else if (r->rax >= SYS_NET_INFO && r->rax < SYS_NET_LIMIT) ret = net_syscall((int)r->rax, a, b, c, d, e);
         break;
     }
     r->rax = (uint64_t)ret;

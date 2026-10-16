@@ -7,6 +7,7 @@
 #include "mm/heap.h"
 #include "mm/vmm.h"
 #include "fs/vfs.h"
+#include "sys/proc.h"
 #include "gui/wm.h"
 #include "net/net.h"
 #include "abi.h"
@@ -807,6 +808,19 @@ static int64_t address_watch_read_user(struct vnode *v, struct file *f, void *bu
     while (done) { struct address_watch *next = done->next; kfree(done); done = next; }
     return (int64_t)(got * sizeof(uint64_t));
 }
+/* Take up to max notified tokens into a kernel array; BSP IRQ guard held. */
+size_t address_watch_take(struct vnode *v, uint64_t *tokens, size_t max) {
+    struct address_watch_queue *q = v->priv;
+    size_t got = 0;
+    while (q->ready && got < max) {
+        struct address_watch *w = q->ready;
+        q->ready = w->next;
+        if (!q->ready) q->ready_tail = &q->ready;
+        tokens[got++] = w->token;
+        kfree(w);
+    }
+    return got;
+}
 static bool address_watch_can_read(struct vnode *v, struct file *f) {
     (void)f;
     return ((struct address_watch_queue *)v->priv)->ready != NULL;
@@ -965,6 +979,15 @@ NORETURN void task_exit(int code) {
         }
     }
     t->state = TASK_ZOMBIE;
+    struct vnode *app = t->app;
+    if (app) {
+        /* An app reports through its handle; no parent collects it. */
+        t->app = NULL;
+        proc_app_ended(app, t->exit_code);
+        vnode_unref(app);
+        if (t->parent) wq_wake_all(&t->parent->child_wait);
+        t->parent = NULL;
+    }
     if (t->parent) {
         wq_wake_all(&t->parent->child_wait);
     } else {
@@ -1004,7 +1027,7 @@ int task_wait(int pid, int *status, bool nohang) {
         if (current_task->killed || me->exiting) { irq_restore(f); return -N_ERR_STOPPED; }
         bool have_child = false;
         for (struct task *c = task_list; c; c = c->all_next) {
-            if (c->parent != me || c->is_thread) continue;
+            if (c->parent != me || c->is_thread || c->app) continue;
             if (pid > 0 && c->pid != pid) continue;
             have_child = true;
             if (c->state == TASK_ZOMBIE) {

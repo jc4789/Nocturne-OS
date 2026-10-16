@@ -44,6 +44,7 @@ struct task {
     size_t fd_capacity,fd_hint;
     char cwd[256];
     struct task *parent;
+    struct vnode *app;        /* launched by n_app_launch: its handle record reports the end */
     int exit_code;
     int kill_code;          /* ordinary kill=130; fatal sibling keeps exception status */
     uint64_t wake_at;        /* ms; 0 = no timeout */
@@ -111,6 +112,7 @@ int task_wake_address(volatile uint32_t *address, unsigned count);
 struct vnode *address_watch_queue_new(void);
 int address_watch_add(struct vnode *queue, volatile uint32_t *address, uint32_t expected, uint64_t token);
 int address_watch_remove(struct vnode *queue, uint64_t token);
+size_t address_watch_take(struct vnode *queue, uint64_t *tokens, size_t max);
 NORETURN void task_exit(int code);
 NORETURN void task_fault_exit(int code); /* fatal user exception aborts shared process */
 struct task *task_find(int pid);
