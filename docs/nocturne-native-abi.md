@@ -37,7 +37,14 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 ## 3. 文書とフォルダー（`open`／`lseek`／`readdir`／`chdir` の置き換え）
 
 - 作業ディレクトリはない。パスは常に `/` からの完全指定。相対パスは
-  `N_ERR_INVALID`。シェルは自分の「現在のフォルダー」を持ち、起動前に解決する。
+  `N_ERR_INVALID`（`.` と `..` の要素はシステムが解決する）。シェルは自分の
+  「現在のフォルダー」を持ち、起動するアプリへ設定 `FOLDER=` として渡す（§5）。
+- 利用者が打った名前は `n_path_complete(name, out, cap)` で完全指定にする：`/` で
+  始まらない名前は設定 `FOLDER` の中（無ければ `/`）の名前とする。長さを返し、
+  収まらなければ `N_ERR_TOO_LARGE`。ISO Cの `fopen`／`remove`／`rename` もこれを使う。
+- アプリが自分の現在のフォルダーを変えるのは `n_folder_set(name)`：名前を完全指定にし、
+  フォルダーであることを確かめてから、自分の設定 `FOLDER` を置き換える（以後の
+  `n_path_complete` と、libcが起動するアプリへ渡す `FOLDER` に効く）。
 - 丸ごとの操作（通常の用途）：
   - `n_document_load(path, void **data, size_t *size)`：内容を新しい `n_memory` ページで
     受け取る。`n_memory_release(*data, *size)` で返す。
@@ -70,8 +77,8 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   文書だけ（チャンネルは `N_ERR_WRONG_KIND`）。`remove`＝`n_entry_remove`。`rename` は
   `n_entry_move`、既存の文書が相手なら内容を丸ごと原子的に差し替えてから元を消す。
   `tmpfile` は `/tmp` に作り、閉じるか終了で消す。標準の出力・記録が文書なら末尾へ追記する。
-- 移行中（段階3まで）、相対の名前はlibcがアプリの旧作業ディレクトリを前に付けて
-  完全指定にしてから渡す。
+- 移行中（段階5まで）、`FOLDER` を受け取らずに旧 `spawn` で起動されたアプリでは、
+  `n_path_complete` は旧作業ディレクトリを使う。
 
 ## 4. チャンネル（`pipe`／標準入出力fd の置き換え）
 
@@ -80,6 +87,8 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - `n_channel_pair(n_handle out[2])`：無名の対（現行 `pipe` の置き換え）。
 - 名前付きの合流点は現行の `n_channel_listen`／`connect`／`accept` を引き継ぐ。
 - `n_channel_send(h, data, n, attach)`、`n_channel_receive(h, buf, cap, flags, &attached)`。
+  - 流量制御：受け手が未だ受け取っていない量が1MiBに達している間、送信は待つ
+    （`N_EVENT_SENDABLE` で送れることを知れる）。空の待ち行列へは大きさに関係なく送れる。
   - `N_CHANNEL_WAIT` で待つ。待たない場合は `N_ERR_NOT_READY`。相手が閉じて
     残りも無ければ `N_ERR_CLOSED`。
   - `N_CHANNEL_PEEK` は次のメッセージの大きさだけを返し、取り出さない。
@@ -94,8 +103,17 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 - ISO Cの入力は、`cap` より大きいメッセージを `N_CHANNEL_PEEK` で測り、バッファーを
   広げて丸ごと受け取る。長さ0のメッセージは読む内容が無いので次を待つ。
 - 端末は、子アプリの「入力」「出力」チャンネルとメッセージをやり取りする一つの
-  アプリにすぎない。端末であるかの判定（`isatty`）は無い。ISO Cの `stdout`／`stderr`／
+  アプリにすぎない。ハンドルから端末かどうかを調べる手段（`isatty`）は無く、起動元が
+  設定 `TERMINAL` に端末へつながるハンドル番号を並べて伝える（例 `TERMINAL=0 1 2`）。
+  `n_terminal(h)` がこれを読む。端末はキー入力をそのまま送るので、行の編集と表示は
+  アプリ側（libcの `readline`）が行う。ISO Cの `stdout`／`stderr`／
   `stdin` は、起動時に渡された出力／入力チャンネル（無ければ記録先のログ）に結び付く。
+- Ctrl+C：端末はシェルにハンドル3として「割込み」チャンネルを渡し（設定
+  `INTERRUPTS=3`）、Ctrl+C ごとにメッセージを一つ送る。シェルは前面のジョブを
+  `n_app_stop(h, N_APP_STOP_TREE)` で止め、プロンプトでは入力中の行を取り消す。
+  シグナルは無い。
+- システムログ：`n_system_log_open()` は、送ったメッセージがシステムログ（とシリアル
+  ポート）へ加わるハンドルを返す。`n_system_log(buf, cap)` は最新のログを読む。
 
 ## 5. アプリ（`spawn`／`waitpid`／`kill`／`getpid` の置き換え）
 
@@ -105,12 +123,17 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
   - 設定は `"名前=値"` の形（`=` が無ければ `N_ERR_INVALID`）。起動されたアプリでは
     `n_settings`（NULL終端）として読め、`getenv` もこれを引く。
   - 引き渡すハンドルは、表の順に子アプリの 0, 1, 2, … 番になる（-1 は空き）。
-  - パスは完全指定。起動されたアプリは作業フォルダーを持たない。
+  - パスは完全指定。起動されたアプリは作業フォルダーを持たない。利用者の名前を
+    受け取るアプリのために、起動元は自分の現在のフォルダーを設定 `FOLDER=/…` で渡す
+    （§3の `n_path_complete`）。
 - 終了はアプリハンドルのイベント（§6）で届く。`n_app_result(h, timeout_ms, int *status)` で
   直接待つこともできる（-1 は無期限、0 は待たずに `N_ERR_NOT_READY`、期限切れは
   `N_ERR_TIMEOUT`）。ゾンビの回収は無く、最後のハンドルを閉じれば記録は消える。
 - `n_app_stop(h, N_APP_STOP_TREE か 0)`：停止要求。シグナルは無い。
 - `n_app_self()`、`n_app_parent()`：アプリ識別子（共有ページの受渡しの許可判定用）。
+- `n_app_open(id)`：アプリ一覧の識別子から、動作中のアプリのハンドルを得る（タスク
+  マネージャーや `kill` が `n_app_stop` するため）。`n_app_id(h)`：ハンドルの識別子
+  （終了後は0）。
 - `n_app_list`、`n_system_info` 等の状態取得は現行の `proclist`／`sysinfo` を引き継ぐ。
 
 ## 6. イベント待ち行列（`poll`／`O_NONBLOCK`／`fcntl` の置き換え）
@@ -155,8 +178,21 @@ C言語の一部として、この新ABIの上に実装して残す。POSIXの�
 
 ## 9. 装置
 
-- 音声、PCI一覧、カーネルログ等の `/dev` ファイルは、種類つきハンドルと専用の関数へ移す
-  （例：`n_audio_open`、`n_audio_submit`、`n_audio_status`）。ファイルとして読み書きしない。
+- 音声、PCI一覧、カーネルログ等の `/dev` ファイルは、種類つきハンドルと専用の関数へ移す。
+  ファイルとして読み書きしない。
+- 音声：`n_audio_open()` が混合器の上の自分専用の流れ（`N_KIND_DEVICE`）を返す。全部
+  使用中なら `N_ERR_BUSY`。形式は `N_AUDIO_RATE`（48kHz）のステレオ、1フレーム＝int16_t
+  二つ（左が先）。
+  - `n_audio_submit(a, frames, count, flags)`：入るだけ受け取り、受け取ったフレーム数を返す。
+    流れは約170ms分を持つ。`N_AUDIO_WAIT` なら空きを待ち、無ければ満杯で
+    `N_ERR_NOT_READY`（空きは `N_EVENT_SENDABLE` で分かる）。
+  - `n_audio_status(a, struct n_audio_status *)`：待っているフレーム、装置に渡したフレーム、
+    再生済み（推定を含む。`flags` が時計の出所）、世代。
+  - `n_audio_flush(a)`：まだ混ぜていない音を捨て、世代を進める。
+  - `n_handle_close` は残りを鳴らし終えてから閉じる（停止中のアプリは待たない）。
+  - 主音量：`n_audio_volume()`、`n_audio_set_volume(0〜100)`（消音も解く）。
+- システムログ：`n_system_log(buf, cap)` で読み、`n_system_log_open()` の
+  ハンドルへ `n_channel_send` で書く。
 
 ## 10. 移行の段階
 

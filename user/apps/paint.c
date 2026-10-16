@@ -195,27 +195,25 @@ static void draw(void) {
 }
 
 static void save(const char *path) {
-    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC);
-    if (fd < 0) {
-        snprintf(status, sizeof status, "cannot write %s", path);
-        return;
-    }
     char hdr[64];
     int n = snprintf(hdr, sizeof hdr, "P6\n%d %d\n255\n", CWID, CHGT);
-    write(fd, hdr, n);
-    uint8_t *row = malloc(CWID * 3);
-    for (int y = 0; y < CHGT; y++) {
-        for (int x = 0; x < CWID; x++) {
-            uint32_t p = pix[y * CWID + x];
-            row[x * 3] = p >> 16;
-            row[x * 3 + 1] = p >> 8;
-            row[x * 3 + 2] = p;
-        }
-        write(fd, row, CWID * 3);
+    uint8_t *data = malloc((size_t)n + CWID * CHGT * 3);
+    if (!data) {
+        snprintf(status, sizeof status, "cannot write %s: %s", path, n_result_text(-N_ERR_NO_MEMORY));
+        return;
     }
-    free(row);
-    close(fd);
-    snprintf(status, sizeof status, "saved %s", path);
+    memcpy(data, hdr, (size_t)n);
+    uint8_t *out = data + n;
+    for (int i = 0; i < CWID * CHGT; i++) {
+        uint32_t p = pix[i];
+        *out++ = p >> 16;
+        *out++ = p >> 8;
+        *out++ = p;
+    }
+    n_result r = n_document_save(path, data, (size_t)(out - data));
+    free(data);
+    if (r < 0) snprintf(status, sizeof status, "cannot write %s: %s", path, n_result_text(r));
+    else snprintf(status, sizeof status, "saved %s", path);
 }
 
 static int read_num(const uint8_t *d, size_t n, size_t *i) {
@@ -230,22 +228,18 @@ static int read_num(const uint8_t *d, size_t n, size_t *i) {
 }
 
 static void load(const char *path) {
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) {
-        snprintf(status, sizeof status, "cannot open %s", path);
+    void *data;
+    size_t got;
+    n_result r = n_document_load(path, &data, &got);
+    if (r < 0) {
+        snprintf(status, sizeof status, "cannot open %s: %s", path, n_result_text(r));
         return;
     }
-    struct n_stat st;
-    fstat(fd, &st);
-    uint8_t *d = malloc(st.size + 1);
-    size_t got = 0;
-    long r;
-    while (got < st.size && (r = read(fd, d + got, st.size - got)) > 0) got += r;
-    close(fd);
+    const uint8_t *d = data;
     size_t i = 2;
     if (got < 2 || d[0] != 'P' || d[1] != '6') {
         snprintf(status, sizeof status, "%s is not a P6 picture", path);
-        free(d);
+        n_memory_release(data, got);
         return;
     }
     int iw = read_num(d, got, &i), ih = read_num(d, got, &i);
@@ -256,7 +250,7 @@ static void load(const char *path) {
             size_t o = i + ((size_t)y * iw + x) * 3;
             if (o + 2 < got) pix[y * CWID + x] = RGB(d[o], d[o + 1], d[o + 2]);
         }
-    free(d);
+    n_memory_release(data, got);
     snprintf(status, sizeof status, "opened %s", path);
 }
 
@@ -292,7 +286,8 @@ int main(int argc, char **argv) {
     gfx_init(&snap_c, snap, CWID, CHGT, CWID);
     gfx_fill(&img, 0, 0, CWID, CHGT, bg);
     snprintf(status, sizeof status, "Save writes /home/painting.ppm");
-    if (argc > 1) load(argv[1]);
+    char named[512];
+    if (argc > 1 && n_path_complete(argv[1], named, sizeof named) > 0) load(named);
     push_undo();
     srand((unsigned)uptime_ms());
     draw();

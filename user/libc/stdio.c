@@ -134,18 +134,14 @@ void __stdio_flush_all(void) {
         }
 }
 
-/* A full path for a name: names relative to the app's folder get it in front
-   while apps still have one; the system resolves "." and "..". */
+/* A full path for a name: other names are taken inside the launcher's folder. */
 static const char *full_path(const char *name, char *out, size_t cap) {
     if (name[0] == '/') return name;
-    if (!getcwd(out, cap)) return NULL;
-    size_t used = strlen(out), n = strlen(name);
-    if (used + 1 + n >= cap) {
-        errno = N_ERR_TOO_LARGE;
+    n_result r = n_path_complete(name, out, cap);
+    if (r < 0) {
+        errno = (int)-r;
         return NULL;
     }
-    out[used] = '/';
-    memcpy(out + used + 1, name, n + 1);
     return out;
 }
 

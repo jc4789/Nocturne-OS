@@ -26,8 +26,6 @@ ssize_t read(int fd, void *buf, size_t n);
 ssize_t write(int fd, const void *buf, size_t n);
 int open(const char *path, int flags, ...);
 int close(int fd);
-/* 呼出し元のaudio streamだけの未mix PCMを破棄。通常closeのdrain契約は維持。 */
-int audio_flush(int fd);
 long lseek(int fd, long off, int whence);
 int ftruncate(int fd, long size); /* new bytes read as zero */
 int stat(const char *path, struct n_stat *st);
@@ -111,6 +109,8 @@ n_result n_entry_remove(const char *path);
 n_result n_entry_move(const char *from, const char *to); /* never replaces: N_ERR_EXISTS */
 n_result n_folder_create(const char *path);
 n_result n_folder_list(const char *path, struct n_entry *out, size_t max, uint64_t start); /* count */
+/* Every entry of a folder in a new array (free it); returns the count. */
+n_result n_folder_entries(const char *path, struct n_entry **out);
 /* Message channels: one send is one message. attach is a document or shared
    handle (or -1) that travels with it and arrives as a new handle in *attached. */
 n_result n_channel_pair(n_handle out[2]);
@@ -124,6 +124,21 @@ n_result n_app_result(n_handle app, int64_t timeout_ms, int *status); /* -1 wait
 n_result n_app_stop(n_handle app, int flags);                         /* N_APP_STOP_TREE */
 n_result n_app_self(void);
 n_result n_app_parent(void);
+n_handle n_app_open(int64_t id); /* a running app by the identifier the app list shows */
+n_result n_system_log(char *buf, size_t cap); /* the newest system log text; its length */
+n_handle n_system_log_open(void); /* a handle whose messages are added to the system log */
+n_result n_app_id(n_handle app); /* its identifier; 0 once it has ended */
+/* Sound: each n_audio_open is a stream of N_AUDIO_RATE stereo frames (two int16_t, left first)
+   of its own, mixed with the others and scaled by the master volume. A stream holds about
+   170 ms; n_audio_submit takes what fits and returns the frames taken (with N_AUDIO_WAIT it
+   waits for room; without, a full stream gives N_ERR_NOT_READY and N_EVENT_SENDABLE reports
+   room). Closing lets the queued sound play out; n_audio_flush drops it at once. */
+n_handle n_audio_open(void); /* N_ERR_BUSY when every stream is taken */
+n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_t flags);
+n_result n_audio_status(n_handle a, struct n_audio_status *out);
+n_result n_audio_flush(n_handle a);
+n_result n_audio_volume(void);            /* the master volume, 0 to 100 */
+n_result n_audio_set_volume(int percent); /* 0 to 100; also unmutes */
 /* Event queues: level-triggered; a ready handle is reported by every wait. */
 n_handle n_events_create(void);
 n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t token);
@@ -136,6 +151,17 @@ int64_t n_clock_wall(void); /* seconds since 1970-01-01 UTC */
 void n_sleep_ms(uint64_t ms);
 /* The launch settings ("name=value"), NULL-terminated. */
 extern char *const *n_settings;
+/* A complete path for a name the user typed: a name not starting at "/" is
+   taken inside the launch setting FOLDER (the launcher's current folder, "/"
+   if it gave none). Returns the length, or N_ERR_TOO_LARGE. The system
+   resolves "." and "..". */
+n_result n_path_complete(const char *name, char *out, size_t cap);
+n_result n_folder_set(const char *name); /* this app's FOLDER; N_ERR_NOT_FOLDER if it is not one */
+/* name taken inside folder (a complete path), with "." and ".." resolved. */
+n_result n_path_join(const char *folder, const char *name, char *out, size_t cap);
+/* Whether handle h reaches a terminal: the launcher names such handles in the
+   setting TERMINAL, e.g. "0 1 2". */
+bool n_terminal(n_handle h);
 
 int dup(int fd);
 int dup2(int fd, int newfd);
@@ -279,10 +305,8 @@ void ui_textfield(canvas_t *c, int x, int y, int w, const char *text, bool focus
 int ui_edit_key(char *buf, size_t cap, const struct gui_event *e);
 
 /* ---- sound (sound.c) ----
-   /dev/audio takes 48 kHz stereo frames: two int16_t, left first. Each open is a stream of its
-   own (up to 8 play at once); writes block while about 170 ms (SOUND_QUEUE frames) are queued,
-   and close waits for the rest to play. Reading a stream opened O_RDWR gives a uint32_t: the
-   frames still queued. /dev/volume holds the master volume, 0-100, as text. */
+   Streams come from n_audio_open (above; up to 8 play at once) and hold about 170 ms
+   (SOUND_QUEUE frames). */
 #define SOUND_RATE  48000
 #define SOUND_QUEUE 8192
 enum { SND_SINE, SND_SQUARE, SND_TRIANGLE, SND_SAW, SND_NOISE };

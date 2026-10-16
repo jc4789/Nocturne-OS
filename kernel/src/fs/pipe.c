@@ -354,7 +354,10 @@ int channel_accept(struct file *listener,struct file **server) {
 /* Native message channels (docs/nocturne-native-abi.md §4). A pair shares one
  * link; each end receives from its own queue and sends into the peer's. A
  * message keeps its boundary and may carry one document or shared-page handle.
- * Messages are kept in kernel memory as sent: there is no fixed capacity. */
+ * Messages are kept in kernel memory as sent. A sender waits while the
+ * receiver has MESSAGE_QUEUE_LIMIT bytes or more not yet taken; a message
+ * into an empty queue is always accepted, whatever its size. */
+#define MESSAGE_QUEUE_LIMIT (1u << 20)
 struct message {
     struct message *next;
     struct file *attached;
@@ -363,10 +366,16 @@ struct message {
 };
 struct message_link {
     struct message *head[2], **tail[2];
+    size_t queued[2];      /* bytes waiting in queue i */
     bool open[2];          /* end i still has a handle */
     struct vnode *end[2];  /* until that end's vnode is released */
-    struct wait_queue wait[2];
+    struct wait_queue wait[2];      /* receivers of queue i */
+    struct wait_queue send_wait[2]; /* senders into queue i */
 };
+
+static bool message_queue_full(const struct message_link *l, int side, size_t n) {
+    return l->queued[side] && l->queued[side] + n > MESSAGE_QUEUE_LIMIT;
+}
 static struct vnode_ops message_ops;
 
 static int message_side(struct vnode *v) { return (int)v->mode; }
@@ -404,10 +413,15 @@ int64_t message_channel_send(struct file *f, const void *udata, size_t n, struct
         done += piece;
     }
     uint64_t fl = irq_save();
+    while (l->open[peer] && message_queue_full(l, peer, n)) {
+        if (current_task->killed) { irq_restore(fl); kfree(m); return -N_ERR_STOPPED; }
+        wq_wait(&l->send_wait[peer]);
+    }
     if (!l->open[peer]) { irq_restore(fl); kfree(m); return -N_ERR_CLOSED; }
     if (attach) m->attached = vfs_dup(attach);
     *l->tail[peer] = m;
     l->tail[peer] = &m->next;
+    l->queued[peer] += n;
     wq_wake_all(&l->wait[peer]);
     vfs_poll_notify(l->end[peer]);
     irq_restore(fl);
@@ -432,6 +446,9 @@ int64_t message_channel_receive(struct file *f, void *ubuf, size_t cap, bool wai
             l->head[side] = m->next;
             if (!l->head[side]) l->tail[side] = &l->head[side];
             m->next = NULL;
+            l->queued[side] -= m->size;
+            wq_wake_all(&l->send_wait[side]);
+            if (l->end[!side]) vfs_poll_notify(l->end[!side]); /* the sender may send again */
             irq_restore(fl);
             /* Taken off the queue: copy out in pieces without holding the
                guard. Only a sibling unmapping the buffer meanwhile loses it. */
@@ -465,8 +482,10 @@ static bool message_can_read(struct vnode *v, struct file *f) {
     return l->head[side] || !l->open[!side];
 }
 static bool message_can_write(struct vnode *v, struct file *f) {
-    (void)v; (void)f;
-    return true; /* sending only allocates; a closed peer reports N_ERR_CLOSED */
+    (void)f;
+    struct message_link *l = v->priv;
+    int peer = !message_side(v);
+    return !l->open[peer] || l->queued[peer] < MESSAGE_QUEUE_LIMIT; /* a closed peer reports N_ERR_CLOSED */
 }
 static bool message_hangup(struct vnode *v, struct file *f) {
     (void)f;
@@ -484,8 +503,10 @@ static void message_close(struct vnode *v, struct file *f) {
     struct message *dropped = l->head[side];
     l->head[side] = NULL;
     l->tail[side] = &l->head[side];
+    l->queued[side] = 0;
     wq_wake_all(&l->wait[!side]);
     wq_wake_all(&l->wait[side]);
+    wq_wake_all(&l->send_wait[side]); /* senders into this end now get N_ERR_CLOSED */
     vfs_poll_notify(l->end[!side]);
     irq_restore(fl);
     message_free(dropped);

@@ -301,7 +301,7 @@ static struct stream *stream_of(struct file *f, int64_t *err) {
     return NULL;
 }
 
-static int64_t audio_write_common(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n, bool user) {
+static int64_t audio_write_common(struct file *f, const void *buf, size_t n, bool user, bool wait) {
     int64_t err;
     struct stream *s = stream_of(f, &err);
     if (!s) return err;
@@ -314,7 +314,7 @@ static int64_t audio_write_common(struct vnode *v, struct file *f, const void *b
         if(card_fill&&!remote_users&&s->issued_count==ARRAY_SIZE(s->issued))room=0;
         if (!room) {
             if (done) break; /* report what went in; the caller writes the rest */
-            if (f->flags & O_NONBLOCK) return -N_ERR_NOT_READY;
+            if (!wait) return -N_ERR_NOT_READY;
             if (current_task->killed) return -N_ERR_STOPPED;
             uint64_t fl = irq_save();
             if (s->head - s->tail == RING_BYTES||(card_fill&&!remote_users&&s->issued_count==ARRAY_SIZE(s->issued))) wq_wait(&audio_wq);
@@ -336,10 +336,10 @@ static int64_t audio_write_common(struct vnode *v, struct file *f, const void *b
     return (int64_t)done;
 }
 static int64_t audio_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
-    return audio_write_common(v, f, buf, off, n, false);
+    return audio_write_common(f, buf, n, false, !(f->flags & O_NONBLOCK));
 }
 static int64_t audio_write_user(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
-    return audio_write_common(v, f, buf, off, n, true);
+    return audio_write_common(f, buf, n, true, !(f->flags & O_NONBLOCK));
 }
 
 /* Reading a stream tells how far ahead of the sink it is: a uint32_t, in frames. */
@@ -407,7 +407,7 @@ static struct vnode_ops audio_ops = {.open = audio_open, .close = audio_close, .
                                      .write_user = audio_write_user, .can_write = audio_can_write};
 
 int audio_flush_file(struct file *f) {
-    if (!f || !f->vn || f->vn->ops != &audio_ops) return -N_ERR_INVALID;
+    if (!audio_stream_is(f)) return -N_ERR_WRONG_KIND;
     int64_t err = 0;
     struct stream *s = stream_of(f, &err);
     if (!s) return (int)err;
@@ -420,6 +420,37 @@ int audio_flush_file(struct file *f) {
     vfs_poll_notify(f->vn);
     irq_restore(fl);
     return 0;
+}
+
+/* ---- native audio streams (docs/nocturne-native-abi.md §9) ---- */
+
+bool audio_stream_is(struct file *f) { return f && f->vn && f->vn->ops == &audio_ops; }
+
+int audio_stream_open(struct file **out) {
+    struct file *f = audio_vnode ? vfs_open_vnode(audio_vnode, O_RDWR) : NULL;
+    if (!f) return audio_vnode ? -N_ERR_NO_MEMORY : -N_ERR_UNSUPPORTED;
+    int64_t err;
+    if (!stream_of(f, &err)) {
+        vfs_close(f);
+        return (int)err;
+    }
+    *out = f;
+    return 0;
+}
+
+/* Queue frames from user memory; returns the frames taken. Without wait a full
+   stream gives N_ERR_NOT_READY. */
+int64_t audio_submit_file(struct file *f, const void *frames, size_t count, bool wait) {
+    if (!audio_stream_is(f)) return -N_ERR_WRONG_KIND;
+    if (count > SIZE_MAX / AUDIO_FRAME) return -N_ERR_TOO_LARGE;
+    int64_t r = audio_write_common(f, frames, count * AUDIO_FRAME, true, wait);
+    return r < 0 ? r : r / AUDIO_FRAME;
+}
+
+int audio_status_file(struct file *f, struct n_audio_status *user_out) {
+    if (!audio_stream_is(f)) return -N_ERR_WRONG_KIND;
+    int64_t r = audio_read_common(f->vn, f, user_out, 0, sizeof *user_out, true);
+    return r < 0 ? (int)r : 0;
 }
 
 /* ---- /dev/volume: the master volume as text, 0 to 100 ---- */

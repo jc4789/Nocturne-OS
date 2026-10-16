@@ -58,7 +58,6 @@ ssize_t read(int fd, void *buf, size_t n) { return ret(SC3(SYS_READ, fd, buf, n)
 ssize_t write(int fd, const void *buf, size_t n) { return ret(SC3(SYS_WRITE, fd, buf, n)); }
 int open(const char *path, int flags, ...) { return (int)ret(SC2(SYS_OPEN, path, flags)); }
 int close(int fd) { return (int)ret(SC1(SYS_CLOSE, fd)); }
-int audio_flush(int fd) { return (int)ret(SC1(SYS_AUDIO_FLUSH, fd)); }
 long lseek(int fd, long off, int whence) { return ret(SC3(SYS_LSEEK, fd, off, whence)); }
 int ftruncate(int fd, long size) {
     if (size < 0) { errno = EINVAL; return -1; }
@@ -70,16 +69,22 @@ int readdir(int fd, int idx, struct n_dirent *d) { return (int)ret(SC3(SYS_READD
 int mkdir(const char *path, ...) { return (int)ret(SC1(SYS_MKDIR, path)); }
 int unlink(const char *path) { return (int)ret(SC1(SYS_UNLINK, path)); }
 int rmdir(const char *path) { return unlink(path); }
-int chdir(const char *path) { return (int)ret(SC1(SYS_CHDIR, path)); }
+int chdir(const char *path) {
+    /* old working folder (until stage 5) and the FOLDER setting move together */
+    int r = (int)ret(SC1(SYS_CHDIR, path));
+    char now[512];
+    if (!r && getcwd(now, sizeof now)) setenv("FOLDER", now, 1);
+    return r;
+}
 char *getcwd(char *buf, size_t n) { return ret(SC2(SYS_GETCWD, buf, n)) < 0 ? NULL : buf; }
 /* A text file that is not an ELF program is run as a script: by the interpreter named on a
    "#!" first line, else by /bin/sh. Returns the interpreter path in buf, or NULL. */
 static const char *script_interp(const char *path, char *buf, size_t n) {
     char head[256];
-    int fd = open(path, O_RDONLY);
-    if (fd < 0) return NULL;
-    ssize_t len = read(fd, head, sizeof head - 1);
-    close(fd);
+    n_handle d = n_document_open(path, N_DOCUMENT_READ);
+    if (d < 0) return NULL;
+    n_result len = n_document_read_at(d, 0, head, sizeof head - 1);
+    n_handle_close(d);
     if (len <= 0) return NULL;
     head[len] = 0;
     if ((size_t)len != strlen(head)) return NULL; /* binary data */
@@ -347,6 +352,29 @@ n_result n_folder_create(const char *path) { return NC5(SYS_FOLDER_CREATE, path,
 n_result n_folder_list(const char *path, struct n_entry *out, size_t max, uint64_t start) {
     return NC5(SYS_FOLDER_LIST, path, out, max, start, 0);
 }
+n_result n_folder_entries(const char *path, struct n_entry **out) {
+    size_t n = 0, cap = 64;
+    struct n_entry *all = malloc(cap * sizeof *all);
+    if (!all) return -N_ERR_NO_MEMORY;
+    for (;;) {
+        n_result r = n_folder_list(path, all + n, cap - n, n);
+        if (r < 0) {
+            free(all);
+            return r;
+        }
+        n += (size_t)r;
+        if (n < cap) break;
+        struct n_entry *grown = realloc(all, cap * 2 * sizeof *all);
+        if (!grown) {
+            free(all);
+            return -N_ERR_NO_MEMORY;
+        }
+        all = grown;
+        cap *= 2;
+    }
+    *out = all;
+    return (n_result)n;
+}
 n_result n_channel_pair(n_handle out[2]) { return NC5(SYS_CHANNEL_PAIR, out, 0, 0, 0, 0); }
 n_result n_channel_send(n_handle h, const void *data, size_t n, n_handle attach) {
     return NC5(SYS_CHANNEL_SEND, h, data, n, attach, 0);
@@ -355,7 +383,24 @@ n_result n_channel_receive(n_handle h, void *buf, size_t cap, int flags, n_handl
     return NC5(SYS_CHANNEL_RECEIVE, h, buf, cap, flags, attached);
 }
 n_handle n_app_launch(const char *path, const struct n_launch *launch) {
-    return (n_handle)NC5(SYS_APP_LAUNCH, path, launch, 0, 0, 0);
+    n_handle app = (n_handle)NC5(SYS_APP_LAUNCH, path, launch, 0, 0, 0);
+    if (app != -N_ERR_NOT_PROGRAM || !launch) return app;
+    /* a script: its interpreter runs it, with the script's name before the rest */
+    char ibuf[128];
+    const char *interp = script_interp(path, ibuf, sizeof ibuf);
+    if (!interp || !strcmp(interp, path)) return app;
+    uint32_t argc = launch->argument_count;
+    const char **args = malloc(sizeof(char *) * (argc + 2));
+    if (!args) return -N_ERR_NO_MEMORY;
+    args[0] = interp;
+    args[1] = path;
+    for (uint32_t i = 1; i < argc; i++) args[i + 1] = launch->arguments[i];
+    struct n_launch l = *launch;
+    l.arguments = args;
+    l.argument_count = argc ? argc + 1 : 2;
+    app = (n_handle)NC5(SYS_APP_LAUNCH, interp, &l, 0, 0, 0);
+    free(args);
+    return app;
 }
 n_result n_app_result(n_handle app, int64_t timeout_ms, int *status) {
     return NC5(SYS_APP_RESULT, app, timeout_ms, status, 0, 0);
@@ -363,6 +408,20 @@ n_result n_app_result(n_handle app, int64_t timeout_ms, int *status) {
 n_result n_app_stop(n_handle app, int flags) { return NC5(SYS_APP_STOP, app, flags, 0, 0, 0); }
 n_result n_app_self(void) { return NC5(SYS_APP_SELF, 0, 0, 0, 0, 0); }
 n_result n_app_parent(void) { return NC5(SYS_APP_PARENT, 0, 0, 0, 0, 0); }
+n_result n_system_log(char *buf, size_t cap) { return NC5(SYS_DMESG, buf, cap, 0, 0, 0); }
+n_handle n_system_log_open(void) { return (n_handle)NC5(SYS_SYSTEM_LOG_OPEN, 0, 0, 0, 0, 0); }
+n_handle n_app_open(int64_t id) { return (n_handle)NC5(SYS_APP_OPEN, id, 0, 0, 0, 0); }
+n_result n_app_id(n_handle app) { return NC5(SYS_APP_ID, app, 0, 0, 0, 0); }
+n_handle n_audio_open(void) { return (n_handle)NC5(SYS_AUDIO_OPEN, 0, 0, 0, 0, 0); }
+n_result n_audio_submit(n_handle a, const int16_t *frames, size_t count, uint32_t flags) {
+    return NC5(SYS_AUDIO_SUBMIT, a, frames, count, flags, 0);
+}
+n_result n_audio_status(n_handle a, struct n_audio_status *out) { return NC5(SYS_AUDIO_STATUS, a, out, 0, 0, 0); }
+n_result n_audio_flush(n_handle a) { return NC5(SYS_AUDIO_FLUSH, a, 0, 0, 0, 0); }
+n_result n_audio_volume(void) { return NC5(SYS_AUDIO_VOLUME, -1, 0, 0, 0, 0); }
+n_result n_audio_set_volume(int percent) {
+    return percent < 0 ? -N_ERR_INVALID : NC5(SYS_AUDIO_VOLUME, percent, 0, 0, 0, 0);
+}
 n_handle n_events_create(void) { return (n_handle)NC5(SYS_EVENTS_CREATE, 0, 0, 0, 0, 0); }
 n_result n_events_watch(n_handle q, n_handle h, uint32_t interest, uint64_t token) {
     return NC5(SYS_EVENTS_WATCH, q, h, interest, token, 0);
@@ -399,34 +458,62 @@ int fcntl(int fd, int cmd, ...) {
 int dmesg(char *buf, size_t n) { return (int)ret(SC2(SYS_DMESG, buf, n)); }
 int pcilist(struct n_pciinfo *out, int max) { return (int)ret(SC2(SYS_PCILIST, out, max)); }
 int isatty(int fd) {
+    if (n_terminal(fd)) return 1;
+    /* the old character devices (console, null), until stage 5 */
     struct n_stat st;
     if (fstat(fd, &st) < 0) return 0;
     return st.type == N_FT_CHAR;
 }
 
+static bool is_document(const char *path) {
+    struct n_entry e;
+    return n_entry_info(path, &e) >= 0 && e.kind == N_KIND_DOCUMENT;
+}
+
 bool find_program(const char *name, char *out, size_t n) {
-    struct n_stat st;
-    if (strchr(name, '/')) {
-        strlcpy(out, name, n);
-        return stat(out, &st) == 0 && st.type == N_FT_FILE;
-    }
+    if (strchr(name, '/')) return n_path_complete(name, out, n) >= 0 && is_document(out);
     /* built-in programs first, then the ones built or installed on the persistent data disk */
     static const char *const dirs[] = {"/bin", "/data/bin"};
     for (size_t i = 0; i < sizeof dirs / sizeof *dirs; i++) {
         snprintf(out, n, "%s/%s", dirs[i], name);
-        if (stat(out, &st) == 0 && st.type == N_FT_FILE) return true;
+        if (is_document(out)) return true;
     }
     return false;
 }
 
+/* Run a program in place of this app: it gets this app's input, output and log,
+   folder and terminal, and its result is returned (or a negative n_result). */
+static int run_here(const char *full, char *const argv[]) {
+    uint32_t argc = 0;
+    while (argv[argc]) argc++;
+    int32_t handles[3];
+    for (int i = 0; i < 3; i++) handles[i] = n_handle_kind(i) >= 0 ? i : -1;
+    char folder[520], terminal[64];
+    const char *settings[2];
+    uint32_t ns = 0;
+    const char *f = getenv("FOLDER"), *t = getenv("TERMINAL");
+    char legacy[512];
+    if (!f || f[0] != '/') f = getcwd(legacy, sizeof legacy) ? legacy : "/";
+    snprintf(folder, sizeof folder, "FOLDER=%s", f);
+    settings[ns++] = folder;
+    if (t) {
+        snprintf(terminal, sizeof terminal, "TERMINAL=%s", t);
+        settings[ns++] = terminal;
+    }
+    struct n_launch l = {.arguments = (const char *const *)argv, .settings = settings, .handles = handles,
+                         .argument_count = argc, .setting_count = ns, .handle_count = 3};
+    n_handle app = n_app_launch(full, &l);
+    if (app < 0) return (int)app;
+    int st = 0;
+    n_result r = n_app_result(app, -1, &st);
+    n_handle_close(app);
+    return r < 0 ? (int)r : st;
+}
+
 int run_wait(const char *path, char *const argv[]) {
     char full[256];
-    if (!find_program(path, full, sizeof full)) return -ENOENT;
-    int pid = spawn(full, argv, NULL, 0);
-    if (pid < 0) return -errno;
-    int st = 0;
-    waitpid(pid, &st, 0);
-    return st;
+    if (!find_program(path, full, sizeof full)) return -N_ERR_NOT_FOUND;
+    return run_here(full, argv);
 }
 
 char **environ = (char *[]){NULL};
@@ -438,10 +525,11 @@ int execvp(const char *file, char *const argv[]) {
         errno = ENOENT;
         return -1;
     }
-    int pid = spawn(full, argv, NULL, 0);
-    if (pid < 0) return -1;
-    int st = 0;
-    waitpid(pid, &st, 0);
+    int st = run_here(full, argv);
+    if (st < 0) {
+        errno = -st;
+        return -1;
+    }
     exit(st);
 }
 int execv(const char *path, char *const argv[]) { return execvp(path, argv); }
@@ -473,6 +561,68 @@ char *getenv(const char *name) {
     if (!strcmp(name, "HOME")) return "/home";
     if (!strcmp(name, "PATH")) return "/bin:/data/bin";
     return NULL;
+}
+
+n_result n_path_join(const char *folder, const char *name, char *out, size_t cap) {
+    const char *parts[2] = {name[0] == '/' || !folder || folder[0] != '/' ? "" : folder, name};
+    size_t used = 0;
+    for (int i = 0; i < 2; i++) {
+        for (const char *s = parts[i]; *s;) {
+            while (*s == '/') s++;
+            const char *e = s;
+            while (*e && *e != '/') e++;
+            size_t len = (size_t)(e - s);
+            if (len == 2 && s[0] == '.' && s[1] == '.') {
+                while (used && out[used - 1] != '/') used--;
+                if (used) used--;
+            } else if (len && !(len == 1 && s[0] == '.')) {
+                if (used + 1 + len >= cap) return -N_ERR_TOO_LARGE;
+                out[used++] = '/';
+                memmove(out + used, s, len);
+                used += len;
+            }
+            s = e;
+        }
+    }
+    if (cap < 2) return -N_ERR_TOO_LARGE;
+    if (!used) out[used++] = '/';
+    out[used] = 0;
+    return (n_result)used;
+}
+
+n_result n_path_complete(const char *name, char *out, size_t cap) {
+    /* Apps still started by the old spawn have a working folder instead of
+       the setting, until that is removed (stage 5). */
+    char legacy[512];
+    const char *folder = getenv("FOLDER");
+    if (name[0] != '/' && (!folder || folder[0] != '/')) folder = getcwd(legacy, sizeof legacy) ? legacy : "/";
+    return n_path_join(folder, name, out, cap);
+}
+
+n_result n_folder_set(const char *name) {
+    char full[512];
+    n_result r = n_path_complete(name, full, sizeof full);
+    if (r < 0) return r;
+    struct n_entry e;
+    r = n_entry_info(full, &e);
+    if (r < 0) return r;
+    if (e.kind != N_KIND_FOLDER) return -N_ERR_NOT_FOLDER;
+    return setenv("FOLDER", full, 1) < 0 ? -N_ERR_NO_MEMORY : 0;
+}
+
+bool n_terminal(n_handle h) {
+    const char *s = getenv("TERMINAL");
+    while (s && *s) {
+        char *end;
+        long v = strtol(s, &end, 10);
+        if (end == s) {
+            s++;
+            continue;
+        }
+        if (v == h) return true;
+        s = end;
+    }
+    return false;
 }
 
 int setenv(const char *name, const char *value, int overwrite) {

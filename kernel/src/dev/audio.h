@@ -18,6 +18,12 @@ struct file;
  * Already mixed card/remote samples cannot be unmixed here, but they never
  * become the new generation's played samples. Ordinary close drains DMA too. */
 int audio_flush_file(struct file *file);
+/* Native streams: a handle is an open of the audio device. */
+struct n_audio_status;
+bool audio_stream_is(struct file *f);
+int audio_stream_open(struct file **out); /* N_ERR_BUSY when every stream is taken */
+int64_t audio_submit_file(struct file *f, const void *user_frames, size_t count, bool wait); /* frames taken */
+int audio_status_file(struct file *f, struct n_audio_status *user_out);
 
 /* Mix `frames` frames from every stream into out (NULL: just consume them). Returns false, with
    silence in out, when no stream had anything to play. */

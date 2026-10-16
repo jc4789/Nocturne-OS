@@ -125,15 +125,16 @@ static void temporary(void) {
 }
 
 static void relative(void) {
-    char cwd[256];
-    CHECK(getcwd(cwd, sizeof cwd) != NULL);
-    CHECK(chdir("/home") == 0);
+    char was[512];
+    CHECK(n_path_complete(".", was, sizeof was) > 0);
+    CHECK(n_folder_set("/data") == 0 && n_folder_set("../home") == 0);
+    CHECK(n_folder_set("/home/no-such-folder") == -N_ERR_NOT_FOUND);
     FILE *f = fopen("stdiotest-rel.txt", "w");
     CHECK(f && fputs("rel", f) == 0 && fclose(f) == 0);
     CHECK(loaded("/home/stdiotest-rel.txt", "rel", 3));
     CHECK(rename("stdiotest-rel.txt", "../home/stdiotest-rel2.txt") == 0 && loaded("/home/stdiotest-rel2.txt", "rel", 3));
     CHECK(remove("stdiotest-rel2.txt") == 0);
-    chdir(cwd);
+    n_folder_set(was);
 }
 
 /* Child modes. "print": output and log on whatever the launcher gave.

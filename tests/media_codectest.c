@@ -6,7 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
-#include <errno.h>
 static int checks, failed;
 #define CHECK(x) do { checks++; if (!(x)) { failed++; printf("FAIL media_codectest:%d %s\n",__LINE__,#x); } } while(0)
 static void decode(const char *name, bool audio, bool video, int min_frames, int max_frames) {
@@ -143,18 +142,18 @@ static void drawing(void){
     CHECK(!memcmp(old,guard,sizeof old));
 }
 static void audio_flush_cases(void){
-    errno=0;CHECK(audio_flush(-1)<0&&errno==EBADF);
-    int other=open("/data/tests/media-fixtures/stereo.wav",O_RDONLY);CHECK(other>=0);
-    if(other>=0){errno=0;CHECK(audio_flush(other)<0&&errno==EINVAL);close(other);}
-    int fd=open("/dev/audio",O_RDWR|O_NONBLOCK);CHECK(fd>=0);if(fd<0)return;
-    uint32_t queued=0;CHECK(read(fd,&queued,4)==4&&queued==0);
-    int16_t *silence=calloc(8192,4);CHECK(silence!=NULL);if(!silence){close(fd);return;}
-    CHECK(write(fd,silence,8192*4)==8192*4);
-    CHECK(read(fd,&queued,4)==4&&queued>0); /* real native ring, not a callback stub */
-    int alias=dup(fd);CHECK(alias>=0);
-    CHECK(audio_flush(alias>=0?alias:fd)==0);CHECK(read(fd,&queued,4)==4&&queued==0);
-    CHECK(write(fd,silence,4096*4)==4096*4);CHECK(audio_flush(fd)==0);
-    CHECK(read(fd,&queued,4)==4&&queued==0);free(silence);if(alias>=0)close(alias);close(fd);
+    CHECK(n_audio_flush(-1)==-N_ERR_NO_HANDLE);
+    n_handle other=n_document_open("/data/tests/media-fixtures/stereo.wav",N_DOCUMENT_READ);CHECK(other>=0);
+    if(other>=0){CHECK(n_audio_flush(other)==-N_ERR_WRONG_KIND);n_handle_close(other);}
+    n_handle a=n_audio_open();CHECK(a>=0);if(a<0)return;
+    struct n_audio_status st;CHECK(n_audio_status(a,&st)==0&&st.queued_frames==0);
+    uint32_t generation=st.generation;
+    int16_t *silence=calloc(8192,4);CHECK(silence!=NULL);if(!silence){n_handle_close(a);return;}
+    CHECK(n_audio_submit(a,silence,8192,0)==8192);
+    CHECK(n_audio_status(a,&st)==0&&st.queued_frames>0); /* real native ring, not a callback stub */
+    CHECK(n_audio_flush(a)==0);CHECK(n_audio_status(a,&st)==0&&st.queued_frames==0&&st.generation==generation+1);
+    CHECK(n_audio_submit(a,silence,4096,0)==4096);CHECK(n_audio_flush(a)==0);
+    CHECK(n_audio_status(a,&st)==0&&st.queued_frames==0);free(silence);n_handle_close(a);
 }
 int main(void){
     decode("stereo.wav",true,false,9600,9600);decode("stereo.flac",true,false,9600,9600);

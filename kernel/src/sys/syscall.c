@@ -1368,6 +1368,69 @@ static int64_t sys_app_stop(int h, int flags) {
     return 0;
 }
 
+static int64_t sys_app_open(int64_t id) {
+    if (id <= 0 || id > 0x7fffffff) return -N_ERR_NO_APP;
+    struct file *f;
+    int r = proc_app_open((int)id, &f);
+    return r < 0 ? r : install(f);
+}
+
+static int64_t sys_app_id(int h) {
+    int64_t r;
+    struct file *f = app_ref(h, &r);
+    if (!f) return r;
+    r = proc_app_pid(f->vn);
+    vfs_close(f);
+    return r;
+}
+
+/* A handle whose messages are added to the system log (and the serial port). */
+static int64_t sys_system_log_open(void) {
+    struct file *f;
+    int r = vfs_open("/dev/kmsg", O_WRONLY, &f);
+    return r < 0 ? r : install(f);
+}
+
+/* A stream of its own on the sound mixer; N_ERR_BUSY when every stream is taken. */
+static int64_t sys_audio_open(void) {
+    struct file *f;
+    int r = audio_stream_open(&f);
+    return r < 0 ? r : install(f);
+}
+
+static struct file *audio_ref(int h, int64_t *error) {
+    struct file *f = getfd_ref(h);
+    *error = !f ? -N_ERR_NO_HANDLE : !audio_stream_is(f) ? -N_ERR_WRONG_KIND : 0;
+    if (*error && f) { vfs_close(f); f = NULL; }
+    return f;
+}
+
+static int64_t sys_audio_submit(int h, const void *frames, uint64_t count, uint32_t flags) {
+    if (flags & ~N_AUDIO_WAIT) return -N_ERR_INVALID;
+    int64_t r;
+    struct file *f = audio_ref(h, &r);
+    if (!f) return r;
+    r = audio_submit_file(f, frames, count, flags & N_AUDIO_WAIT);
+    vfs_close(f);
+    return r;
+}
+
+static int64_t sys_audio_status(int h, struct n_audio_status *out) {
+    int64_t r;
+    struct file *f = audio_ref(h, &r);
+    if (!f) return r;
+    r = audio_status_file(f, out);
+    vfs_close(f);
+    return r;
+}
+
+/* The master volume, 0 to 100; percent < 0 only reads it. */
+static int64_t sys_audio_volume(int64_t percent) {
+    if (percent > 100) return -N_ERR_INVALID;
+    if (percent >= 0) audio_set_volume((int)percent);
+    return audio_volume();
+}
+
 static struct file *events_ref(int q, int64_t *error) {
     struct file *f = getfd_ref(q);
     *error = !f ? -N_ERR_NO_HANDLE : !events_is(f) ? -N_ERR_WRONG_KIND : 0;
@@ -1691,6 +1754,13 @@ void syscall_dispatch(struct regs *r) {
     case SYS_EVENTS_WATCH_ADDRESS: ret = sys_events_watch_address((int)a, b, (uint32_t)c, d); break;
     case SYS_EVENTS_TIMER: ret = sys_events_timer((int)a, b, (int)c, d); break;
     case SYS_EVENTS_WAIT: ret = sys_events_wait((int)a, (struct n_event *)b, c, (int64_t)d); break;
+    case SYS_APP_OPEN: ret = sys_app_open((int64_t)a); break;
+    case SYS_APP_ID: ret = sys_app_id((int)a); break;
+    case SYS_SYSTEM_LOG_OPEN: ret = sys_system_log_open(); break;
+    case SYS_AUDIO_OPEN: ret = sys_audio_open(); break;
+    case SYS_AUDIO_SUBMIT: ret = sys_audio_submit((int)a, (const void *)b, c, (uint32_t)d); break;
+    case SYS_AUDIO_STATUS: ret = sys_audio_status((int)a, (struct n_audio_status *)b); break;
+    case SYS_AUDIO_VOLUME: ret = sys_audio_volume((int64_t)a); break;
     default:
         if (r->rax >= SYS_WIN_CREATE && r->rax < SYS_NET_INFO) ret = wm_syscall((int)r->rax, a, b, c, d, e);
         else if (r->rax >= SYS_NET_INFO && r->rax < SYS_NET_LIMIT) ret = net_syscall((int)r->rax, a, b, c, d, e);

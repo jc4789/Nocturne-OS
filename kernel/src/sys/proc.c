@@ -104,6 +104,32 @@ int proc_app_result(struct vnode *v, uint64_t timeout_ms, int *status) {
     return 0;
 }
 
+/* A new handle on a running app, by the identifier the app list shows. An app
+   started by the old spawn gets its record here; its parent still collects it. */
+int proc_app_open(int pid, struct file **out) {
+    struct vnode *spare = proc_app_new();
+    if (!spare) return -N_ERR_NO_MEMORY;
+    uint64_t flags = irq_save();
+    struct task *t = task_find(pid);
+    struct vnode *v = NULL;
+    if (t && t->is_user && !t->is_thread && t->state != TASK_ZOMBIE && !t->exiting) {
+        if (!t->app) {
+            ((struct app_record *)spare->priv)->pid = pid;
+            vnode_ref(spare); /* the task's reference, as proc_launch takes */
+            t->app = spare;
+            spare = NULL;
+        }
+        v = t->app;
+        vnode_ref(v);
+    }
+    irq_restore(flags);
+    if (spare) spare->ops->release(spare);
+    if (!v) return -N_ERR_NO_APP;
+    *out = vfs_open_vnode(v, O_RDONLY);
+    vnode_unref(v);
+    return *out ? 0 : -N_ERR_NO_MEMORY;
+}
+
 int proc_spawn(const char *path, int argc, char **argv, struct file *fds[3], const char *cwd,
                struct task *parent) {
     struct proc_launch l = {.argc = argc, .argv = argv, .handles = fds, .handle_count = fds ? 3 : 0,
@@ -232,6 +258,7 @@ int proc_launch(const char *path, const struct proc_launch *l) {
         vnode_ref(l->app);
         ((struct app_record *)l->app->priv)->pid = t->pid;
         t->app = l->app;
+        t->app_launched = true;
     }
     kfree(img);
     sched_make_ready(t);
@@ -267,7 +294,10 @@ int proc_spawn_simple(const char *path, const char *arg1, struct task *parent) {
     struct file *fds[3] = {NULL, NULL, NULL};
     struct file *nul = NULL;
     if (vfs_open("/dev/null", O_RDWR, &nul) == 0) fds[0] = fds[1] = fds[2] = nul;
-    int r = proc_spawn(path, arg1 ? 2 : 1, argv, fds, "/home", parent);
+    char *settings[] = {"FOLDER=/home"};
+    struct proc_launch l = {.argc = arg1 ? 2 : 1, .argv = argv, .setting_count = 1, .settings = settings,
+                            .handles = fds, .handle_count = 3, .cwd = "/home", .parent = parent};
+    int r = proc_launch(path, &l);
     if (nul) vfs_close(nul);
     return r;
 }

@@ -22,7 +22,8 @@
 
 static window_t *win;
 static char dir[256], names[MAXT][128], error[160];
-static int ntracks, cur = -1, scroll, hover = -1, fd = -1;
+static int ntracks, cur = -1, scroll, hover = -1;
+static n_handle stream = -1;
 static struct wav wav;
 static bool loaded, playing, seeking;
 static uint64_t sent;     /* frames written since the track (or the last seek) started */
@@ -36,14 +37,13 @@ static int by_name(const void *a, const void *b) { return strcasecmp(a, b); }
 static void load_dir(const char *path) {
     strlcpy(dir, path, sizeof dir);
     ntracks = 0;
-    int d = open(dir, O_RDONLY);
-    if (d < 0) return;
-    struct n_dirent e;
-    for (int i = 0; ntracks < MAXT && readdir(d, i, &e) > 0; i++) {
-        const char *dot = strrchr(e.name, '.');
-        if (e.type != N_FT_DIR && dot && !strcasecmp(dot, ".wav")) strlcpy(names[ntracks++], e.name, 128);
+    struct n_entry *e;
+    n_result n = n_folder_entries(dir, &e);
+    for (n_result i = 0; i < n && ntracks < MAXT; i++) {
+        const char *dot = strrchr(e[i].name, '.');
+        if (e[i].kind == N_KIND_DOCUMENT && dot && !strcasecmp(dot, ".wav")) strlcpy(names[ntracks++], e[i].name, 128);
     }
-    close(d);
+    if (n >= 0) free(e);
     qsort(names, ntracks, sizeof names[0], by_name);
 }
 
@@ -51,7 +51,8 @@ static void load_dir(const char *path) {
 static uint32_t now_frame(void) {
     if (!loaded) return 0;
     uint32_t queued = 0;
-    if (fd >= 0 && playing) read(fd, &queued, 4);
+    struct n_audio_status st;
+    if (stream >= 0 && playing && n_audio_status(stream, &st) == 0) queued = st.queued_frames;
     uint64_t heard = sent > queued ? sent - queued : 0;
     uint64_t f = base + heard * wav.rate / SOUND_RATE;
     return (uint32_t)MIN(f, (uint64_t)wav.frames);
@@ -80,7 +81,7 @@ static void play_track(int i) {
         return;
     }
     loaded = true;
-    playing = fd >= 0;
+    playing = stream >= 0;
 }
 
 static void seek_to(uint32_t frame) {
@@ -92,9 +93,11 @@ static void seek_to(uint32_t frame) {
 
 /* keep the stream AHEAD frames ahead of the speaker; at the end, go on to the next sound */
 static void pump(void) {
-    if (!playing || fd < 0) return;
+    if (!playing || stream < 0) return;
     uint32_t queued = 0;
-    if (read(fd, &queued, 4) != 4) return;
+    struct n_audio_status st;
+    if (n_audio_status(stream, &st) < 0) return;
+    queued = st.queued_frames;
     while (queued < AHEAD) {
         int n = wav_read(&wav, scope, CHUNK);
         if (n <= 0) {
@@ -108,7 +111,7 @@ static void pump(void) {
             return;
         }
         if (n < CHUNK) memset(scope + 2 * n, 0, (size_t)(CHUNK - n) * 4);
-        if (write(fd, scope, (size_t)n * 4) <= 0) return;
+        if (n_audio_submit(stream, scope, (size_t)n, 0) <= 0) return;
         sent += (uint64_t)n;
         queued += (uint32_t)n;
     }
@@ -218,7 +221,7 @@ static void draw(void) {
     }
     gfx_text(c, 20, 16, title, UI_FG, TRANSPARENT, FONT_LARGE);
     if (error[0]) gfx_text(c, 20, 46, error, UI_ACCENT2, TRANSPARENT, FONT_SMALL);
-    else if (fd < 0) gfx_text(c, 20, 46, "No sound: too many programs are playing.", UI_ACCENT2, TRANSPARENT, FONT_SMALL);
+    else if (stream < 0) gfx_text(c, 20, 46, "No sound: too many programs are playing.", UI_ACCENT2, TRANSPARENT, FONT_SMALL);
     else gfx_text(c, 20, 46, info, UI_DIM, TRANSPARENT, FONT_SMALL);
     draw_scope(c);
     draw_seek(c);
@@ -237,7 +240,7 @@ static void seek_from_mouse(int x) {
 
 static void toggle(void) {
     if (!loaded) play_track(cur >= 0 ? cur : 0);
-    else playing = !playing && fd >= 0;
+    else playing = !playing && stream >= 0;
     if (playing && wav.eof) seek_to(0);
 }
 
@@ -249,25 +252,25 @@ static int row_at(int x, int y) {
 }
 
 int main(int argc, char **argv) {
-    const char *start = argc > 1 ? argv[1] : NULL;
-    struct n_stat st;
-    if (start && stat(start, &st) == 0 && st.type == N_FT_DIR) {
+    char full[256];
+    const char *start = argc > 1 && n_path_complete(argv[1], full, sizeof full) > 0 ? full : NULL;
+    struct n_entry st;
+    if (start && n_entry_info(start, &st) == 0 && st.kind == N_KIND_FOLDER) {
         load_dir(start);
         start = NULL;
     } else if (start) {
         char d[256];
         strlcpy(d, start, sizeof d);
-        char *slash = strrchr(d, '/');
+        char *slash = strrchr(d, '/'); /* a complete path: there is one */
         if (slash == d) d[1] = 0;
-        else if (slash) *slash = 0;
-        else strlcpy(d, ".", sizeof d);
+        else *slash = 0;
         load_dir(d);
     } else {
         load_dir(MUSIC);
     }
     win = win_open(W, H, "Sound Player", WIN_CENTER);
     if (!win) return 1;
-    fd = open("/dev/audio", O_RDWR | O_NONBLOCK);
+    stream = n_audio_open();
     if (start) {
         const char *base_name = strrchr(start, '/') ? strrchr(start, '/') + 1 : start;
         for (int i = 0; i < ntracks; i++)

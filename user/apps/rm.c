@@ -1,33 +1,29 @@
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
 #include "nocturne.h"
 static bool recursive, force;
-static int rm(const char *p) {
-    struct n_stat st;
-    if (stat(p, &st) < 0) {
-        if (force) return 0;
-        fprintf(stderr, "rm: %s: %s\n", p, strerror(errno));
+static int rm(const char *path, const char *shown) {
+    struct n_entry e;
+    n_result r = n_entry_info(path, &e);
+    if (r < 0) {
+        if (force && r == -N_ERR_NOT_FOUND) return 0;
+        fprintf(stderr, "rm: %s: %s\n", shown, n_result_text(r));
         return 1;
     }
-    if (st.type == N_FT_DIR && recursive) {
-        for (;;) {
-            int fd = open(p, O_RDONLY | O_DIRECTORY);
-            if (fd < 0) break;
-            struct n_dirent d;
-            int r = readdir(fd, 0, &d);
-            close(fd);
-            if (r <= 0) break;
+    if (e.kind == N_KIND_FOLDER && recursive) {
+        /* the folder shrinks as entries go, so always take the first */
+        struct n_entry first;
+        while (n_folder_list(path, &first, 1, 0) == 1) {
             char sub[512];
-            snprintf(sub, sizeof sub, "%s/%s", p, d.name);
-            if (rm(sub)) return 1;
+            if (n_path_join(path, first.name, sub, sizeof sub) < 0 || rm(sub, sub)) return 1;
         }
-    } else if (st.type == N_FT_DIR) {
-        fprintf(stderr, "rm: %s: is a directory (use -r)\n", p);
+    } else if (e.kind == N_KIND_FOLDER) {
+        fprintf(stderr, "rm: %s: is a directory (use -r)\n", shown);
         return 1;
     }
-    if (unlink(p) < 0) {
-        fprintf(stderr, "rm: %s: %s\n", p, strerror(errno));
+    r = n_entry_remove(path);
+    if (r < 0) {
+        fprintf(stderr, "rm: %s: %s\n", shown, n_result_text(r));
         return 1;
     }
     return 0;
@@ -41,7 +37,14 @@ int main(int argc, char **argv) {
             continue;
         }
         files++;
-        rc |= rm(argv[i]);
+        char path[512];
+        n_result r = n_path_complete(argv[i], path, sizeof path);
+        if (r < 0) {
+            fprintf(stderr, "rm: %s: %s\n", argv[i], n_result_text(r));
+            rc = 1;
+        } else {
+            rc |= rm(path, argv[i]);
+        }
     }
     if (!files) fprintf(stderr, "usage: rm [-rf] FILE...\n");
     return rc;

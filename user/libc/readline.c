@@ -12,17 +12,13 @@ static char *hist[HIST];
 static int nhist;
 
 static int byte_in(void) {
-    unsigned char c;
-    return read(0, &c, 1) == 1 ? c : -1;
+    int c = getc(stdin);
+    return c == EOF ? -1 : c;
 }
 
 static void out(const char *s, size_t n) {
-    while (n) {
-        ssize_t w = write(1, s, n);
-        if (w <= 0) return;
-        s += w;
-        n -= (size_t)w;
-    }
+    fwrite(s, 1, n, stdout);
+    fflush(stdout);
 }
 
 static void redraw(const char *prompt, const char *buf, size_t len, size_t cur, bool secret) {
@@ -54,7 +50,7 @@ static void add_hist(const char *line) {
 int readline(const char *prompt, char *buf, size_t size, int flags) {
     bool secret = flags & RL_SECRET;
     if (size == 0) return -1;
-    if (!isatty(0)) {
+    if (!n_terminal(0)) {
         /* piped input: no echo or editing, just read up to a newline */
         size_t len = 0;
         out(prompt, strlen(prompt));

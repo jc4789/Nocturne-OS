@@ -1,6 +1,6 @@
 /* Piano: play two octaves with the mouse or the keyboard (Z S X D C ... for the lower one,
    Q 2 W 3 E ... for the upper one), in three voices. The sound is synthesised here and kept
-   about 30 ms ahead of the speaker, by reading how much the /dev/audio stream has queued. */
+   about 30 ms ahead of the speaker, by asking how much its sound stream has queued. */
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -28,7 +28,8 @@ struct voice {
     double ph, amp, env;
 };
 static struct voice voices[NVOICES];
-static int sound = 0, octave = 4, mouse_note = -1, fd = -1;
+static int sound = 0, octave = 4, mouse_note = -1;
+static n_handle stream = -1;
 static bool down[NNOTES];
 static int16_t scope[CHUNK * 2];
 
@@ -99,12 +100,13 @@ static void synth(int16_t *out, int frames) {
 
 /* keep the stream AHEAD frames ahead of the speaker while anything sounds */
 static void pump(void) {
-    if (fd < 0) return;
-    uint32_t queued = 0;
-    if (read(fd, &queued, 4) != 4) return;
+    if (stream < 0) return;
+    struct n_audio_status st;
+    if (n_audio_status(stream, &st) < 0) return;
+    uint32_t queued = st.queued_frames;
     while (queued < AHEAD && any_voice()) {
         synth(scope, CHUNK);
-        if (write(fd, scope, sizeof scope) <= 0) return;
+        if (n_audio_submit(stream, scope, CHUNK, 0) <= 0) return;
         queued += CHUNK;
     }
 }
@@ -162,7 +164,7 @@ static void draw(window_t *win) {
     char buf[80];
     snprintf(buf, sizeof buf, "octave %d   (Left/Right)", octave);
     gfx_text(c, 16, 54, buf, UI_DIM, TRANSPARENT, FONT_SMALL);
-    gfx_text(c, 16, 70, fd < 0 ? "no sound: /dev/audio is busy" : "Tab: next sound", fd < 0 ? UI_ACCENT2 : UI_DIM,
+    gfx_text(c, 16, 70, stream < 0 ? "no sound: every sound stream is taken" : "Tab: next sound", stream < 0 ? UI_ACCENT2 : UI_DIM,
              TRANSPARENT, FONT_SMALL);
     draw_scope(c);
     for (int pass = 0; pass < 2; pass++)
@@ -202,7 +204,7 @@ int main(void) {
     for (int i = 0; i < NVOICES; i++) voices[i].note = -1;
     window_t *win = win_open(W, H, "Piano", WIN_CENTER);
     if (!win) return 1;
-    fd = open("/dev/audio", O_RDWR | O_NONBLOCK);
+    stream = n_audio_open();
     draw(win);
     uint64_t last_scope = 0;
     bool was_active = false;

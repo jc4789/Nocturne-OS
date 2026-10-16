@@ -1,19 +1,18 @@
-/* beep: play tones on /dev/audio.
+/* beep: play tones on a sound stream.
    beep [-f hz] [-l ms] [-w sine|square|triangle|saw] [-v 0-100] [note[:ms]...]
    Notes are names like C4, F#5, Bb3 or R (a rest); a melody is a list of them. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include <math.h>
 #include "nocturne.h"
 
-#define RATE 48000
+#define RATE N_AUDIO_RATE
 #define PI 3.14159265358979323846
 
 static int wave = 0; /* 0 sine, 1 square, 2 triangle, 3 saw */
 static double amp = 0.5;
-static int fd;
+static n_handle stream;
 static int16_t buf[2 * 960];
 
 static double shape(double ph) { /* ph in [0, 1) */
@@ -41,16 +40,13 @@ static bool tone(double hz, int ms) {
             if (ph >= 1) ph -= 1;
             buf[2 * i] = buf[2 * i + 1] = (int16_t)(v * (wave == 1 || wave == 3 ? 0.5 : 1) * 32767);
         }
-        const char *p = (const char *)buf;
-        size_t left = (size_t)n * 4;
-        while (left) {
-            ssize_t w = write(fd, p, left);
-            if (w < 0) {
-                if (errno != EINTR) fprintf(stderr, "beep: /dev/audio: %s\n", strerror(errno));
+        for (int at = 0; at < n;) {
+            n_result r = n_audio_submit(stream, buf + 2 * at, (size_t)(n - at), N_AUDIO_WAIT);
+            if (r < 0) {
+                if (r != -N_ERR_STOPPED) fprintf(stderr, "beep: sound: %s\n", n_result_text(r));
                 return false;
             }
-            p += w;
-            left -= (size_t)w;
+            at += (int)r;
         }
         done += n;
     }
@@ -114,9 +110,9 @@ int main(int argc, char **argv) {
             fprintf(stderr, "beep: %s: not a note\n", argv[i]);
             return 2;
         }
-    fd = open("/dev/audio", O_WRONLY);
-    if (fd < 0) {
-        fprintf(stderr, "beep: /dev/audio: %s\n", strerror(errno));
+    stream = n_audio_open();
+    if (stream < 0) {
+        fprintf(stderr, "beep: sound: %s\n", n_result_text(stream));
         return 1;
     }
     bool ok = true;
@@ -125,6 +121,6 @@ int main(int argc, char **argv) {
         const char *colon = strchr(argv[i], ':');
         ok = tone(note_hz(argv[i]), colon ? atoi(colon + 1) : ms);
     }
-    close(fd); /* waits for the sound to finish */
+    n_handle_close(stream); /* lets the sound finish */
     return ok ? 0 : 1;
 }

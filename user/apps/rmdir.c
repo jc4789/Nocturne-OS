@@ -1,7 +1,5 @@
-/* rmdir: remove empty directories */
+/* rmdir: remove empty folders */
 #include <stdio.h>
-#include <string.h>
-#include <errno.h>
 #include "nocturne.h"
 int main(int argc, char **argv) {
     if (argc < 2) {
@@ -10,12 +8,14 @@ int main(int argc, char **argv) {
     }
     int rc = 0;
     for (int i = 1; i < argc; i++) {
-        struct n_stat st;
-        if (stat(argv[i], &st) < 0 || st.type != N_FT_DIR) {
-            fprintf(stderr, "rmdir: %s: %s\n", argv[i], st.type != N_FT_DIR && errno != ENOENT ? "not a directory" : strerror(errno));
-            rc = 1;
-        } else if (unlink(argv[i]) < 0) {
-            fprintf(stderr, "rmdir: %s: %s\n", argv[i], strerror(errno));
+        char path[512];
+        struct n_entry e;
+        n_result r = n_path_complete(argv[i], path, sizeof path);
+        if (r >= 0) r = n_entry_info(path, &e);
+        if (r >= 0 && e.kind != N_KIND_FOLDER) r = -N_ERR_NOT_FOLDER;
+        if (r >= 0) r = n_entry_remove(path);
+        if (r < 0) {
+            fprintf(stderr, "rmdir: %s: %s\n", argv[i], n_result_text(r));
             rc = 1;
         }
     }

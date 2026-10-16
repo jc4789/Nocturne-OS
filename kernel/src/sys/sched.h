@@ -44,7 +44,8 @@ struct task {
     size_t fd_capacity,fd_hint;
     char cwd[256];
     struct task *parent;
-    struct vnode *app;        /* launched by n_app_launch: its handle record reports the end */
+    struct vnode *app;        /* its handle record reports the end */
+    bool app_launched;        /* by n_app_launch: no parent collects it */
     int exit_code;
     int kill_code;          /* ordinary kill=130; fatal sibling keeps exception status */
     uint64_t wake_at;        /* ms; 0 = no timeout */

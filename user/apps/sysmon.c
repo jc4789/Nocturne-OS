@@ -158,9 +158,13 @@ int main(void) {
         } else if (e.type == EV_MOUSE_UP) {
             if (ui_hit(e.x, e.y, W - 130, H - 38, 116, 30) && sel_pid > 0) {
                 int pid = sel_pid;
-                int res = -1;
+                n_result res = -N_ERR_NO_APP;
                 for (int i = 0; i < nproc; i++)
-                    if (procs[i].pid == pid && procs[i].is_user) res = killtree(pid, 1);
+                    if (procs[i].pid == pid && procs[i].is_user) {
+                        n_handle app = n_app_open(pid);
+                        res = app < 0 ? app : n_app_stop(app, N_APP_STOP_TREE);
+                        if (app >= 0) n_handle_close(app);
+                    }
                 if (res >= 0) snprintf(status, sizeof status, "ended process %d", pid);
                 else snprintf(status, sizeof status, "cannot end process %d", pid);
                 sel_pid = -1;

@@ -4,16 +4,17 @@
 
 #define PI 3.14159265358979323846
 
-static int fd = -2;
+static n_handle stream;
+static bool tried;
 static uint32_t noise_state = 0x9E3779B9;
 static int16_t buf[2 * SOUND_QUEUE];
 
 bool sound_effect(int hz, int hz2, int ms, int wave) {
-    if (fd == -2) fd = open("/dev/audio", O_RDWR | O_NONBLOCK);
-    if (fd < 0 || hz <= 0 || ms <= 0) return false;
+    if (!tried) { stream = n_audio_open(); tried = true; }
+    if (stream < 0 || hz <= 0 || ms <= 0) return false;
     int frames = ms * (SOUND_RATE / 1000);
-    uint32_t queued = 0;
-    if (frames > SOUND_QUEUE || read(fd, &queued, 4) != 4 || queued + (uint32_t)frames > SOUND_QUEUE) return false;
+    struct n_audio_status st;
+    if (frames > SOUND_QUEUE || n_audio_status(stream, &st) < 0 || st.queued_frames + (uint32_t)frames > SOUND_QUEUE) return false;
     if (hz2 <= 0) hz2 = hz;
     double ph = 0, ratio = log((double)hz2 / hz), held = 0;
     int attack = SOUND_RATE / 400, release = frames * 3 / 10; /* 2.5 ms in, 30% out: no clicks */
@@ -41,5 +42,5 @@ bool sound_effect(int hz, int hz2, int ms, int wave) {
         int16_t s = (int16_t)(v * env * 0.4 * 32767);
         buf[2 * i] = buf[2 * i + 1] = s;
     }
-    return write(fd, buf, (size_t)frames * 4) == frames * 4;
+    return n_audio_submit(stream, buf, (size_t)frames, 0) == frames;
 }

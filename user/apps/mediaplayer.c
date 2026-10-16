@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #define WIDTH 768
 #define HEIGHT 584
 static window_t *win;
@@ -15,7 +14,7 @@ static nmedia *media;
 static const struct nmedia_info *info;
 static struct nmedia_output pending;
 static size_t audio_at;
-static int audio_fd = -1;
+static n_handle audio = -1;
 static bool playing, finished;
 static int64_t base_ms;
 static uint64_t started;
@@ -25,10 +24,12 @@ static int picture_w, picture_h;
 static char error[160], path[2048];
 static bool input_focus;
 static int64_t position(void) { return base_ms + (playing ? (int64_t)(uptime_ms() - started) : 0); }
-static void clear_audio(void) { if (audio_fd >= 0) { audio_flush(audio_fd);close(audio_fd); } audio_fd = -1; }
+static void clear_audio(void) { if (audio >= 0) { n_audio_flush(audio);n_handle_close(audio); } audio = -1; }
+/* frames the stream still holds; -1 if it failed */
+static int64_t audio_queued(void) { struct n_audio_status st;return n_audio_status(audio,&st)<0?-1:(int64_t)st.queued_frames; }
 static void open_audio(void) {
-    audio_fd=open("/dev/audio",O_RDWR|O_NONBLOCK);uint32_t queued=0;
-    if(audio_fd>=0&&read(audio_fd,&queued,4)!=4)clear_audio();
+    audio=n_audio_open();
+    if(audio>=0&&audio_queued()<0)clear_audio();
 }
 static bool present_picture(void) {
     size_t count,bytes;
@@ -78,7 +79,7 @@ static void draw(void) {
     ui_textfield(c,16,516,WIDTH-136,path,input_focus);
     ui_button(c,WIDTH-108,516,92,24,"Open",false,false);
     if (error[0]) gfx_text(c,16,558,error,UI_ACCENT2,TRANSPARENT,FONT_SMALL);
-    else if (playing && info && info->audio && audio_fd < 0) gfx_text(c,16,558,"Audio unavailable; video continues silently.",UI_ACCENT2,TRANSPARENT,FONT_SMALL);
+    else if (playing && info && info->audio && audio < 0) gfx_text(c,16,558,"Audio unavailable; video continues silently.",UI_ACCENT2,TRANSPARENT,FONT_SMALL);
     else gfx_text(c,16,558,"Ctrl+O: input   HTTP refills wait synchronously; no cookies or login.",UI_DIM,TRANSPARENT,FONT_SMALL);
     win_update(win);
 }
@@ -111,20 +112,20 @@ static bool pump(void) {
             pending.kind=0;changed=true;
         } else if (pending.kind==NMEDIA_AUDIO) {
             if (pending.pts_ms>now+100) return changed;
-            if (audio_fd>=0) {
-                uint32_t queued=0;
-                if (read(audio_fd,&queued,4)!=4 || queued>=4800) return changed;
+            if (audio>=0) {
+                int64_t queued=audio_queued();
+                if (queued<0 || queued>=4800) return changed;
                 size_t frames=MIN(pending.frames-audio_at,(size_t)(4800-queued));
-                ssize_t n=write(audio_fd,pending.samples+audio_at*2,frames*4);
-                if (n<0 && errno==EAGAIN) return changed;
-                if (n<=0 || (n&3)) { clear_audio();strlcpy(error,"Audio output failed.",sizeof error); }
-                else audio_at+=(size_t)n/4;
-                if (audio_fd>=0 && audio_at<pending.frames) return changed;
+                n_result n=n_audio_submit(audio,pending.samples+audio_at*2,frames,0);
+                if (n==-N_ERR_NOT_READY) return changed;
+                if (n<=0) { clear_audio();strlcpy(error,"Audio output failed.",sizeof error); }
+                else audio_at+=(size_t)n;
+                if (audio>=0 && audio_at<pending.frames) return changed;
             }
             pending.kind=0;
         } else if (pending.kind==NMEDIA_END) {
-            uint32_t queued=0;if(audio_fd>=0)read(audio_fd,&queued,4);
-            if (queued) return changed;
+            int64_t queued=audio>=0?audio_queued():0;
+            if (queued>0) return changed;
             int64_t at=position();
             if(info&&info->video&&info->duration_ms>at&&info->duration_ms-at<=1000)return changed;
             base_ms=position();playing=false;finished=true;clear_audio();return true;

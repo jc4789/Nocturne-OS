@@ -39,8 +39,9 @@ static int cx, cy, saved_cx, saved_cy;
 static bool wrap_pending, cursor_visible = true, blink_on = true, focused = true;
 static uint8_t cur_fg = DEF_FG, cur_bg = DEF_BG, cur_attr;
 static bool dirty[MAXR];
-static int shell_pid;
-static int to_shell = -1;
+static n_handle shell = -1;
+static n_handle to_shell = -1;   /* the shell's input */
+static n_handle interrupt = -1;  /* a message here is a Ctrl+C for the shell */
 
 static void mark_all(void) {
     for (int i = 0; i < rows; i++) dirty[i] = true;
@@ -348,7 +349,7 @@ static void resize_grid(int w, int h) {
 
 /* ---- keyboard ---- */
 static void send(const char *s, int n) {
-    if (to_shell >= 0) write(to_shell, s, n);
+    if (to_shell >= 0) n_channel_send(to_shell, s, (size_t)n, -1);
 }
 
 static void paste(void) {
@@ -415,9 +416,8 @@ static void handle_key(struct gui_event *e) {
         mark_all();
     }
     if (ctrl && (k == 'c' || k == 'C')) {
-        /* interrupt: kill everything the shell started; otherwise tell the shell */
-        if (killtree(shell_pid, 0) > 0) feed("^C", 2);
-        else send("\x03", 1);
+        /* the shell stops what it runs, or cancels the line being typed */
+        if (interrupt >= 0) n_channel_send(interrupt, "interrupt", 9, -1);
         return;
     }
     char buf[8];
@@ -457,47 +457,63 @@ int main(int argc, char **argv) {
     }
     resize_grid(win->w, win->h);
 
-    int in_p[2], out_p[2];
-    if (pipe(in_p) < 0 || pipe(out_p) < 0) return 1;
-    fcntl(in_p[0], F_SETTTY, 1);
-    fcntl(out_p[1], F_SETTTY, 1);
-    int fdmap[3] = {in_p[0], out_p[1], out_p[1]};
-    char *sargv[16] = {"sh", NULL};
+    /* The shell gets one end of each channel: its input (0), output and log
+       (1 and 2), and the Ctrl+C channel (3). */
+    n_handle input[2], output[2], intr[2];
+    if (n_channel_pair(input) < 0 || n_channel_pair(output) < 0 || n_channel_pair(intr) < 0) return 1;
+    const char *args[16] = {"sh"};
+    uint32_t nargs = 1;
     const char *prog = "/bin/sh";
     if (argc > 1) {
         prog = argv[1];
-        for (int i = 1; i < argc && i < 15; i++) sargv[i - 1] = argv[i];
-        sargv[MIN(argc - 1, 15)] = NULL;
+        for (nargs = 0; nargs + 1 < (uint32_t)argc && nargs < 16; nargs++) args[nargs] = argv[nargs + 1];
     }
     char path[256];
     if (!find_program(prog, path, sizeof path)) strlcpy(path, prog, sizeof path);
-    shell_pid = spawn(path, sargv, fdmap, 0);
-    close(in_p[0]);
-    close(out_p[1]);
-    if (shell_pid < 0) {
+    const char *f = getenv("FOLDER");
+    char folder[300];
+    snprintf(folder, sizeof folder, "FOLDER=%s", f && f[0] == '/' ? f : "/home");
+    const char *settings[] = {folder, "TERMINAL=0 1 2", "INTERRUPTS=3"};
+    int32_t handles[4] = {input[1], output[1], output[1], intr[1]};
+    struct n_launch l = {.arguments = args, .settings = settings, .handles = handles, .argument_count = nargs,
+                         .setting_count = 3, .handle_count = 4};
+    shell = n_app_launch(path, &l);
+    n_handle_close(input[1]);
+    n_handle_close(output[1]);
+    n_handle_close(intr[1]);
+    if (shell < 0) {
         const char *msg = "term: could not start the shell\r\n";
         feed(msg, (int)strlen(msg));
     }
-    to_shell = in_p[1];
-    int from_shell = out_p[0];
-    fcntl(from_shell, F_SETFL, O_NONBLOCK);
+    to_shell = input[0];
+    interrupt = intr[0];
+    n_handle from_shell = output[0];
+    enum { TOKEN_WINDOW, TOKEN_OUTPUT, TOKEN_SHELL };
+    n_handle events = n_events_create();
+    if (events < 0) return 1;
+    n_events_watch(events, win->fd, N_EVENT_RECEIVABLE, TOKEN_WINDOW);
+    if (shell >= 0) {
+        n_events_watch(events, from_shell, N_EVENT_RECEIVABLE, TOKEN_OUTPUT);
+        n_events_watch(events, shell, N_EVENT_APP_ENDED, TOKEN_SHELL);
+    }
     full_redraw();
 
+    size_t cap = 4096;
+    char *buf = malloc(cap);
     uint64_t last_blink = uptime_ms();
-    bool alive = shell_pid >= 0;
+    bool alive = shell >= 0;
     for (;;) {
-        struct n_pollfd pf[2] = {{win->fd, N_POLLIN, 0}, {from_shell, N_POLLIN, 0}};
-        int np = alive ? 2 : 1;
         uint64_t now = uptime_ms();
         int timeout = (int)(500 - MIN(500, now - last_blink));
         if (win->qi < win->qn) timeout = 0;
-        poll(pf, np, timeout);
+        struct n_event ev[4];
+        n_events_wait(events, ev, 4, timeout);
 
         struct gui_event e;
         while (win_event(win, &e, 0) > 0) {
             switch (e.type) {
             case EV_CLOSE:
-                if (shell_pid > 0) killtree(shell_pid, 1);
+                if (shell >= 0) n_app_stop(shell, N_APP_STOP_TREE);
                 return 0;
             case EV_KEY: handle_key(&e); break;
             case EV_RESIZE:
@@ -517,22 +533,26 @@ int main(int argc, char **argv) {
             }
         }
         if (alive) {
-            char buf[4096];
-            for (int iter = 0; iter < 16; iter++) {
-                ssize_t n = read(from_shell, buf, sizeof buf);
-                if (n > 0) {
-                    if (view) {
-                        view = 0;
-                        mark_all();
-                    }
-                    feed(buf, (int)n);
+            /* once the shell has ended, show what it left and close the terminal */
+            bool ended = n_app_result(shell, 0, NULL) == 0;
+            for (int iter = 0; iter < (ended ? 1024 : 16); iter++) {
+                n_result n = n_channel_receive(from_shell, buf, cap, 0, NULL);
+                if (n == -N_ERR_TOO_LARGE) {
+                    n_result need = n_channel_receive(from_shell, NULL, 0, N_CHANNEL_PEEK, NULL);
+                    char *grown = need > 0 ? realloc(buf, (size_t)need) : NULL;
+                    if (!grown) break;
+                    buf = grown;
+                    cap = (size_t)need;
                     continue;
                 }
-                if (n == 0) alive = false;
-                break;
+                if (n < 0) break;
+                if (view) {
+                    view = 0;
+                    mark_all();
+                }
+                feed(buf, (int)n);
             }
-            if (!alive) {
-                /* the shell is gone: close the terminal */
+            if (ended) {
                 render();
                 return 0;
             }

@@ -1,23 +1,21 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
-#include <errno.h>
 #include "nocturne.h"
-static void count(int fd, long *l, long *w, long *c) {
-    char buf[4096];
-    ssize_t n;
-    bool inword = false;
-    while ((n = read(fd, buf, sizeof buf)) > 0) {
-        for (ssize_t i = 0; i < n; i++) {
-            if (buf[i] == '\n') (*l)++;
-            if (isspace((unsigned char)buf[i])) inword = false;
-            else if (!inword) {
-                inword = true;
-                (*w)++;
-            }
+struct counts {
+    long l, w, c;
+    bool inword;
+};
+static void count(struct counts *k, const char *buf, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (buf[i] == '\n') k->l++;
+        if (isspace((unsigned char)buf[i])) k->inword = false;
+        else if (!k->inword) {
+            k->inword = true;
+            k->w++;
         }
-        *c += n;
     }
+    k->c += (long)n;
 }
 static bool want_l, want_w, want_c;
 static void show(long l, long w, long c, const char *name) {
@@ -28,6 +26,7 @@ static void show(long l, long w, long c, const char *name) {
     printf("\n");
 }
 int main(int argc, char **argv) {
+    static char buf[65536];
     long tl = 0, tw = 0, tc = 0;
     int first = 1;
     for (; first < argc && argv[first][0] == '-' && argv[first][1]; first++) {
@@ -43,24 +42,32 @@ int main(int argc, char **argv) {
     }
     if (!want_l && !want_w && !want_c) want_l = want_w = want_c = true;
     if (first >= argc) {
-        count(0, &tl, &tw, &tc);
-        /* a lone count from stdin is printed bare, so scripts can use it */
-        if (want_l + want_w + want_c == 1) printf("%ld\n", want_l ? tl : want_w ? tw : tc);
-        else show(tl, tw, tc, NULL);
+        struct counts k = {0};
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, stdin)) > 0) count(&k, buf, n);
+        /* a lone count from the input is printed bare, so scripts can use it */
+        if (want_l + want_w + want_c == 1) printf("%ld\n", want_l ? k.l : want_w ? k.w : k.c);
+        else show(k.l, k.w, k.c, NULL);
         return 0;
     }
     int nfiles = argc - first;
     for (int i = first; i < argc; i++) {
-        int fd = open(argv[i], O_RDONLY);
-        if (fd < 0) {
-            fprintf(stderr, "wc: %s: %s\n", argv[i], strerror(errno));
+        char path[512];
+        n_result r = n_path_complete(argv[i], path, sizeof path);
+        n_handle h = r < 0 ? (n_handle)r : n_document_open(path, N_DOCUMENT_READ);
+        if (h < 0) {
+            fprintf(stderr, "wc: %s: %s\n", argv[i], n_result_text(h));
             continue;
         }
-        long l = 0, w = 0, c = 0;
-        count(fd, &l, &w, &c);
-        close(fd);
-        show(l, w, c, argv[i]);
-        tl += l, tw += w, tc += c;
+        struct counts k = {0};
+        uint64_t at = 0;
+        while ((r = n_document_read_at(h, at, buf, sizeof buf)) > 0) {
+            count(&k, buf, (size_t)r);
+            at += (uint64_t)r;
+        }
+        n_handle_close(h);
+        show(k.l, k.w, k.c, argv[i]);
+        tl += k.l, tw += k.w, tc += k.c;
     }
     if (nfiles > 1) show(tl, tw, tc, "total");
     return 0;

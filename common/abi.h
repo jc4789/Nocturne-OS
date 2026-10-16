@@ -81,6 +81,8 @@ enum {
     SYS_APP_LAUNCH, SYS_APP_RESULT, SYS_APP_STOP, SYS_APP_SELF, SYS_APP_PARENT,
     SYS_EVENTS_CREATE, SYS_EVENTS_WATCH, SYS_EVENTS_UNWATCH, SYS_EVENTS_WATCH_ADDRESS,
     SYS_EVENTS_TIMER, SYS_EVENTS_WAIT,
+    SYS_APP_OPEN, SYS_APP_ID, SYS_SYSTEM_LOG_OPEN,
+    SYS_AUDIO_OPEN, SYS_AUDIO_SUBMIT, SYS_AUDIO_STATUS, SYS_AUDIO_VOLUME,
     SYS_MAX = 192
 };
 
@@ -249,8 +251,8 @@ struct n_pciinfo {
 #define F_NUNLOCK 1025 /* release that lease; the last close also releases it */
 #define F_NTRYLOCK 1026 /* Nocturne: acquire the vnode lease without sleeping; busy is EAGAIN */
 
-/* Extended /dev/audio read snapshot; a four-byte read retains the original
- * software queue count. Device time counts this stream's consumed PCM only. */
+/* n_audio_status: where a stream stands. Device time counts this stream's
+ * consumed PCM only. */
 struct n_audio_status {
     uint32_t queued_frames;
     uint32_t device_pending_frames;
@@ -262,6 +264,8 @@ struct n_audio_status {
 #define N_AUDIO_CLOCK_DEVICE 1u
 #define N_AUDIO_CLOCK_ESTIMATED 2u
 #define N_AUDIO_CLOCK_REMOTE 4u
+#define N_AUDIO_RATE 48000     /* n_audio_submit: frames of two int16_t, left first */
+#define N_AUDIO_WAIT 1u        /* n_audio_submit: wait for room instead of N_ERR_NOT_READY */
 
 /* ---- GUI ---- */
 enum {

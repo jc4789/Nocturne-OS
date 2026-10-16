@@ -13,8 +13,12 @@ int main(int argc, char **argv) {
             strlcat(msg, argv[i], sizeof msg);
         }
     } else {
-        int n = (int)read(0, msg, sizeof msg - 1);
-        msg[n > 0 ? n : 0] = 0;
+        /* typed at a terminal: one line; otherwise the whole input */
+        if (n_terminal(0)) {
+            if (readline("", msg, sizeof msg, 0) < 0) msg[0] = 0;
+        } else {
+            msg[fread(msg, 1, sizeof msg - 1, stdin)] = 0;
+        }
         for (char *p = msg; *p; p++)
             if (*p == '\n') *p = ' ';
     }

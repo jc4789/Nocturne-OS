@@ -9,17 +9,11 @@
 #define HDR 22    /* column header */
 #define ROW 24
 #define SB 22     /* status bar */
-#define MAXE 512
 
-struct entry {
-    char name[256];
-    uint32_t type;
-    uint64_t size;
-};
 
 static window_t *w;
 static char cwd[512] = "/home";
-static struct entry ents[MAXE];
+static struct n_entry *ents; /* the folder's entries (n_folder_entries) */
 static int nent, sel = -1, scroll, hot_btn = -1;
 static char status[128];
 static uint64_t last_click;
@@ -30,8 +24,8 @@ static const char *btn_label[NBTN] = {"Up", "Home", "/", "New folder", "New file
 static int btn_x[NBTN], btn_w[NBTN];
 
 static int cmp(const void *a, const void *b) {
-    const struct entry *x = a, *y = b;
-    if ((x->type == N_FT_DIR) != (y->type == N_FT_DIR)) return x->type == N_FT_DIR ? -1 : 1;
+    const struct n_entry *x = a, *y = b;
+    if ((x->kind == N_KIND_FOLDER) != (y->kind == N_KIND_FOLDER)) return x->kind == N_KIND_FOLDER ? -1 : 1;
     return strcasecmp(x->name, y->name);
 }
 
@@ -44,20 +38,15 @@ static void load(void) {
     nent = 0;
     sel = -1;
     scroll = 0;
-    int fd = open(cwd, O_RDONLY);
-    if (fd < 0) {
-        snprintf(status, sizeof status, "cannot open %s", cwd);
+    free(ents);
+    ents = NULL;
+    n_result n = n_folder_entries(cwd, &ents);
+    if (n < 0) {
+        ents = NULL;
+        snprintf(status, sizeof status, "cannot open %s: %s", cwd, n_result_text(n));
         return;
     }
-    struct n_dirent d;
-    for (int i = 0; nent < MAXE && readdir(fd, i, &d) > 0; i++) {
-        if (!strcmp(d.name, ".") || !strcmp(d.name, "..")) continue;
-        strlcpy(ents[nent].name, d.name, sizeof ents[nent].name);
-        ents[nent].type = d.type;
-        ents[nent].size = d.size;
-        nent++;
-    }
-    close(fd);
+    nent = (int)n;
     qsort(ents, nent, sizeof ents[0], cmp);
     snprintf(status, sizeof status, "%d item%s", nent, nent == 1 ? "" : "s");
     char t[300];
@@ -78,9 +67,9 @@ static void go_up(void) {
     load();
 }
 
-static const char *type_name(const struct entry *e) {
-    if (e->type == N_FT_DIR) return "Folder";
-    if (e->type == N_FT_CHAR) return "Device";
+static const char *type_name(const struct n_entry *e) {
+    if (e->kind == N_KIND_FOLDER) return "Folder";
+    if (e->kind == N_KIND_DEVICE) return "Device";
     const char *dot = strrchr(e->name, '.');
     if (!strcmp(cwd, "/bin")) return "Program";
     if (dot && !strcasecmp(dot, ".txt")) return "Text";
@@ -93,12 +82,12 @@ static const char *type_name(const struct entry *e) {
     return "File";
 }
 
-static void icon(canvas_t *c, int x, int y, const struct entry *e) {
-    if (e->type == N_FT_DIR) {
+static void icon(canvas_t *c, int x, int y, const struct n_entry *e) {
+    if (e->kind == N_KIND_FOLDER) {
         gfx_fill_round(c, x, y + 2, 8, 4, 1, RGB(230, 170, 60));
         gfx_fill_round(c, x, y + 4, 16, 12, 2, RGB(250, 196, 80));
         gfx_hline(c, x + 1, y + 6, 14, RGB(255, 220, 130));
-    } else if (e->type == N_FT_CHAR) {
+    } else if (e->kind == N_KIND_DEVICE) {
         gfx_fill_round(c, x + 1, y + 2, 14, 14, 3, RGB(100, 110, 140));
         gfx_fill(c, x + 4, y + 6, 8, 6, RGB(40, 46, 60));
     } else if (!strcmp(type_name(e), "Sound")) { /* a quaver */
@@ -151,14 +140,14 @@ static void draw(void) {
     int vis = rows_visible();
     for (int i = 0; i < vis && scroll + i < nent; i++) {
         int idx = scroll + i, ry = y + i * ROW;
-        struct entry *e = &ents[idx];
+        struct n_entry *e = &ents[idx];
         if (idx == sel) gfx_fill_round(c, 4, ry + 1, W - 8, ROW - 2, 4, RGB(84, 70, 170));
         else if (i & 1) gfx_fill(c, 0, ry, W, ROW, RGB(30, 28, 50));
         icon(c, 10, ry + 3, e);
         canvas_t clip = *c;
         gfx_clip(&clip, 0, ry, col_size - 12, ROW);
         gfx_text(&clip, 34, ry + 4, e->name, UI_FG, TRANSPARENT, FONT_SMALL);
-        if (e->type != N_FT_DIR) {
+        if (e->kind != N_KIND_FOLDER) {
             char b[24];
             human(e->size, b);
             gfx_text(c, col_size, ry + 4, b, UI_DIM, TRANSPARENT, FONT_SMALL);
@@ -180,7 +169,7 @@ static void open_entry(int i) {
     if (i < 0 || i >= nent) return;
     char path[800];
     join(path, sizeof path, cwd, ents[i].name);
-    if (ents[i].type == N_FT_DIR) {
+    if (ents[i].kind == N_KIND_FOLDER) {
         go(path);
         return;
     }
@@ -201,17 +190,17 @@ static void make_new(bool dir) {
         if (n == 1) snprintf(name, sizeof name, dir ? "New folder" : "untitled.txt");
         else snprintf(name, sizeof name, dir ? "New folder %d" : "untitled%d.txt", n);
         join(path, sizeof path, cwd, name);
-        struct n_stat st;
-        if (stat(path, &st) < 0) break;
+        struct n_entry st;
+        if (n_entry_info(path, &st) < 0) break;
     }
-    int r;
-    if (dir) r = mkdir(path);
+    n_result r;
+    if (dir) r = n_folder_create(path);
     else {
-        r = open(path, O_WRONLY | O_CREAT | O_TRUNC);
-        if (r >= 0) close(r);
+        r = n_document_open(path, N_DOCUMENT_CREATE);
+        if (r >= 0) r = n_handle_close(r);
     }
     load();
-    if (r < 0) snprintf(status, sizeof status, "could not create %s", name);
+    if (r < 0) snprintf(status, sizeof status, "could not create %s: %s", name, n_result_text(r));
     for (int i = 0; i < nent; i++)
         if (!strcmp(ents[i].name, name)) sel = i;
 }
@@ -221,11 +210,11 @@ static void delete_sel(void) {
     char path[800], name[256];
     strlcpy(name, ents[sel].name, sizeof name);
     join(path, sizeof path, cwd, name);
-    int r = ents[sel].type == N_FT_DIR ? rmdir(path) : unlink(path);
+    n_result r = n_entry_remove(path);
     int keep = sel;
     load();
     sel = MIN(keep, nent - 1);
-    if (r < 0) snprintf(status, sizeof status, "could not delete %s: %s", name, strerror(-r));
+    if (r < 0) snprintf(status, sizeof status, "could not delete %s: %s", name, n_result_text(r));
     else snprintf(status, sizeof status, "deleted %s", name);
 }
 
@@ -239,7 +228,9 @@ static void ensure_visible(void) {
 int main(int argc, char **argv) {
     w = win_open(620, 440, "Files", WIN_RESIZABLE);
     if (!w) return 1;
-    go(argc > 1 ? argv[1] : "/home");
+    char start[512]; /* the named folder, else the one Files was started in */
+    if (n_path_complete(argc > 1 ? argv[1] : ".", start, sizeof start) < 0) strlcpy(start, "/home", sizeof start);
+    go(start);
     draw();
     win_update(w);
     for (;;) {

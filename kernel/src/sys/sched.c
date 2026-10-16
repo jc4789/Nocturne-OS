@@ -985,8 +985,10 @@ NORETURN void task_exit(int code) {
         t->app = NULL;
         proc_app_ended(app, t->exit_code);
         vnode_unref(app);
-        if (t->parent) wq_wake_all(&t->parent->child_wait);
-        t->parent = NULL;
+        if (t->app_launched) {
+            if (t->parent) wq_wake_all(&t->parent->child_wait);
+            t->parent = NULL;
+        }
     }
     if (t->parent) {
         wq_wake_all(&t->parent->child_wait);
@@ -1027,7 +1029,7 @@ int task_wait(int pid, int *status, bool nohang) {
         if (current_task->killed || me->exiting) { irq_restore(f); return -N_ERR_STOPPED; }
         bool have_child = false;
         for (struct task *c = task_list; c; c = c->all_next) {
-            if (c->parent != me || c->is_thread || c->app) continue;
+            if (c->parent != me || c->is_thread || c->app_launched) continue;
             if (pid > 0 && c->pid != pid) continue;
             have_child = true;
             if (c->state == TASK_ZOMBIE) {

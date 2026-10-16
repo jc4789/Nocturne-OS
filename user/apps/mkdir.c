@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
 #include "nocturne.h"
 int main(int argc, char **argv) {
     int rc = 0;
@@ -10,8 +9,11 @@ int main(int argc, char **argv) {
     }
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-p")) continue;
-        if (mkdir(argv[i]) < 0 && errno != EEXIST) {
-            fprintf(stderr, "mkdir: %s: %s\n", argv[i], strerror(errno));
+        char path[512];
+        n_result r = n_path_complete(argv[i], path, sizeof path);
+        if (r >= 0) r = n_folder_create(path);
+        if (r < 0 && r != -N_ERR_EXISTS) {
+            fprintf(stderr, "mkdir: %s: %s\n", argv[i], n_result_text(r));
             rc = 1;
         }
     }

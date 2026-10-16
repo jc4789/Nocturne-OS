@@ -1,29 +1,24 @@
-/* play: play WAV files (any kind wav_open reads) on /dev/audio. The Sound Player is the same
+/* play: play WAV files (any kind wav_open reads) on a sound stream. The Sound Player is the same
    from the desktop. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
 #include "nocturne.h"
 
-static int out_fd;
+static n_handle stream;
 static struct wav wav;
 
 static bool out(const int16_t *buf, int frames) {
-    const char *p = (const char *)buf;
-    size_t left = (size_t)frames * 4;
-    while (left) {
-        ssize_t w = write(out_fd, p, left);
-        if (w < 0) {
-            if (errno != EINTR) fprintf(stderr, "play: /dev/audio: %s\n", strerror(errno));
+    for (int at = 0; at < frames;) {
+        n_result r = n_audio_submit(stream, buf + 2 * at, (size_t)(frames - at), N_AUDIO_WAIT);
+        if (r < 0) {
+            if (r != -N_ERR_STOPPED) fprintf(stderr, "play: sound: %s\n", n_result_text(r));
             return false;
         }
-        p += w;
-        left -= (size_t)w;
+        at += (int)r;
     }
     return true;
 }
-
 static void clock_text(char *s, uint64_t ms) {
     sprintf(s, "%d:%02d", (int)(ms / 60000), (int)(ms / 1000 % 60));
 }
@@ -34,7 +29,7 @@ static int play(const char *path, bool quiet) {
         fprintf(stderr, "play: %s: %s\n", path, err);
         return 1;
     }
-    bool show = !quiet && isatty(1);
+    bool show = !quiet && n_terminal(1);
     char t1[16], t2[16];
     clock_text(t2, wav_ms(&wav, wav.frames));
     if (!quiet)
@@ -70,13 +65,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: play [-q] file.wav ...\n");
         return 2;
     }
-    out_fd = open("/dev/audio", O_WRONLY);
-    if (out_fd < 0) {
-        fprintf(stderr, "play: /dev/audio: %s\n", strerror(errno));
+    stream = n_audio_open();
+    if (stream < 0) {
+        fprintf(stderr, "play: sound: %s\n", n_result_text(stream));
         return 1;
     }
     int rc = 0;
     for (int i = first; i < argc; i++) rc |= play(argv[i], quiet);
-    close(out_fd);
+    n_handle_close(stream); /* lets the sound finish */
     return rc;
 }

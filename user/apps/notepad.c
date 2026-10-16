@@ -106,21 +106,25 @@ static void set_title(void) {
     win_set_title(w, t);
 }
 
-static bool load_file(const char *p) {
-    int fd = open(p, O_RDONLY);
-    if (fd < 0) {
-        snprintf(status, sizeof status, "cannot open %s", p);
+static bool load_file(const char *name) {
+    char p[sizeof path];
+    n_result r = n_path_complete(name, p, sizeof p);
+    if (r < 0) {
+        snprintf(status, sizeof status, "cannot open %s: %s", name, n_result_text(r));
         return false;
     }
-    len = cur = 0;
-    char buf[4096];
-    long n;
-    while ((n = read(fd, buf, sizeof buf)) > 0) {
-        reserve(len + n + 1);
-        memcpy(text + len, buf, n);
-        len += n;
+    void *data;
+    size_t size;
+    r = n_document_load(p, &data, &size);
+    if (r < 0) {
+        snprintf(status, sizeof status, "cannot open %s: %s", p, n_result_text(r));
+        return false;
     }
-    close(fd);
+    cur = 0;
+    reserve(size + 1);
+    memcpy(text, data, size);
+    len = size;
+    n_memory_release(data, size);
     strlcpy(path, p, sizeof path);
     modified = false;
     anc = -1;
@@ -129,19 +133,18 @@ static bool load_file(const char *p) {
     return true;
 }
 
-static bool save_file(const char *p) {
-    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC);
-    if (fd < 0) {
-        snprintf(status, sizeof status, "cannot write %s", p);
+static bool save_file(const char *name) {
+    char p[sizeof path];
+    n_result r = n_path_complete(name, p, sizeof p);
+    if (r < 0) {
+        snprintf(status, sizeof status, "cannot write %s: %s", name, n_result_text(r));
         return false;
     }
-    size_t off = 0;
-    while (off < len) {
-        long n = write(fd, text + off, len - off);
-        if (n <= 0) break;
-        off += n;
+    r = n_document_save(p, text, len); /* whole: a failed save leaves the old text */
+    if (r < 0) {
+        snprintf(status, sizeof status, "cannot write %s: %s", p, n_result_text(r));
+        return false;
     }
-    close(fd);
     strlcpy(path, p, sizeof path);
     modified = false;
     snprintf(status, sizeof status, "saved %s (%lu bytes)", p, (unsigned long)len);
@@ -333,7 +336,7 @@ int main(int argc, char **argv) {
     reserve(4096);
     if (argc > 1) {
         if (!load_file(argv[1])) {
-            strlcpy(path, argv[1], sizeof path);
+            if (n_path_complete(argv[1], path, sizeof path) < 0) path[0] = 0;
             snprintf(status, sizeof status, "new file %s", argv[1]);
         }
     } else snprintf(status, sizeof status, "Ctrl+S save, Ctrl+O open");

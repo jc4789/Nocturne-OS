@@ -7,16 +7,15 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: mv SRC DST\n");
         return 1;
     }
-    char dst[512];
-    struct n_stat st;
-    strlcpy(dst, argv[2], sizeof dst);
-    if (stat(dst, &st) == 0 && st.type == N_FT_DIR) {
-        const char *base = strrchr(argv[1], '/');
-        base = base ? base + 1 : argv[1];
-        snprintf(dst, sizeof dst, "%s/%s", argv[2], base);
-    }
-    if (rename(argv[1], dst) < 0) {
-        fprintf(stderr, "mv: %s: %s\n", argv[1], strerror(errno));
+    char src[512], dst[512], named[512];
+    struct n_entry e;
+    n_result r = n_path_complete(argv[1], src, sizeof src);
+    if (r >= 0) r = n_path_complete(argv[2], named, sizeof named);
+    if (r >= 0 && n_entry_info(named, &e) >= 0 && e.kind == N_KIND_FOLDER) r = n_path_join(named, strrchr(src, '/') + 1, dst, sizeof dst);
+    else if (r >= 0) memcpy(dst, named, sizeof dst);
+    /* ISO C rename: an existing document named dst is replaced whole */
+    if (r < 0 || rename(src, dst) < 0) {
+        fprintf(stderr, "mv: %s: %s\n", argv[1], n_result_text(r < 0 ? r : -errno));
         return 1;
     }
     return 0;

@@ -13,18 +13,29 @@
 static char *history[MAX_HIST];
 static int nhist;
 static int last_status;
-static bool interactive;
+
+/* The current folder: names typed without a leading "/" are inside it, and the
+   apps the shell starts get it as their FOLDER setting. */
+static char folder[512] = "/";
+/* A channel on which the terminal sends a message for each Ctrl+C (setting INTERRUPTS). */
+static n_handle interrupts = -1;
+/* Which of the shell's own input, output and log exist. */
+static bool std_open[3];
 
 /* ---- terminal output helpers ---- */
-static void out(const char *s) { write(1, s, strlen(s)); }
+static void out(const char *s) {
+    fputs(s, stdout);
+    fflush(stdout);
+}
+
+/* name typed by the user as a complete path */
+static bool complete_name(const char *name, char *path, size_t n) { return n_path_join(folder, name, path, n) >= 0; }
 
 static void prompt_str(char *buf, size_t n) {
-    char cwd[256];
-    getcwd(cwd, sizeof cwd);
-    const char *shown = cwd;
-    char tmp[260];
-    if (!strncmp(cwd, "/home", 5) && (cwd[5] == 0 || cwd[5] == '/')) {
-        snprintf(tmp, sizeof tmp, "~%s", cwd + 5);
+    const char *shown = folder;
+    char tmp[520];
+    if (!strncmp(folder, "/home", 5) && (folder[5] == 0 || folder[5] == '/')) {
+        snprintf(tmp, sizeof tmp, "~%s", folder + 5);
         shown = tmp;
     }
     snprintf(buf, n, "\x1b[1;35mnocturne\x1b[0m:\x1b[1;34m%s\x1b[0m%s ", shown, last_status ? "\x1b[31m$\x1b[0m" : "$");
@@ -56,31 +67,33 @@ static void complete(char *buf, int *len, int *cur) {
         strcpy(dir, first ? "/bin" : ".");
         strcpy(prefix, word);
     }
-    int fd = open(dir, O_RDONLY | O_DIRECTORY);
-    if (fd < 0) return;
+    char path[512];
+    struct n_entry *ents;
+    n_result count = complete_name(dir, path, sizeof path) ? n_folder_entries(path, &ents) : -1;
+    if (count < 0) return;
     char match[256] = {0};
     int nmatch = 0;
     bool match_dir = false;
     char list[1024] = {0};
-    struct n_dirent d;
-    for (int i = 0; readdir(fd, i, &d) > 0; i++) {
-        if (strncmp(d.name, prefix, strlen(prefix))) continue;
+    for (int i = 0; i < (int)count; i++) {
+        const struct n_entry *d = &ents[i];
+        if (strncmp(d->name, prefix, strlen(prefix))) continue;
         if (nmatch == 0) {
-            strcpy(match, d.name);
-            match_dir = d.type == N_FT_DIR;
+            strcpy(match, d->name);
+            match_dir = d->kind == N_KIND_FOLDER;
         } else {
             /* keep the common prefix */
             int k = 0;
-            while (match[k] && match[k] == d.name[k]) k++;
+            while (match[k] && match[k] == d->name[k]) k++;
             match[k] = 0;
         }
-        if (strlen(list) + strlen(d.name) + 3 < sizeof list) {
-            strcat(list, d.name);
+        if (strlen(list) + strlen(d->name) + 3 < sizeof list) {
+            strcat(list, d->name);
             strcat(list, "  ");
         }
         nmatch++;
     }
-    close(fd);
+    free(ents);
     if (!nmatch) return;
     const char *add = match + strlen(prefix);
     int al = (int)strlen(add);
@@ -105,18 +118,53 @@ static void complete(char *buf, int *len, int *cur) {
 }
 
 /* ---- line editor ---- */
+enum { TOKEN_INPUT = 1, TOKEN_INTERRUPT = 2 };
+static n_handle prompt_events = -1;
+
+/* Take every waiting Ctrl+C message; true if there was one. */
+static bool take_interrupts(void) {
+    bool any = false;
+    char msg[64];
+    while (interrupts >= 0 && n_channel_receive(interrupts, msg, sizeof msg, 0, NULL) >= 0) any = true;
+    return any;
+}
+
+/* The next key byte typed at the terminal; 3 (Ctrl+C) for an interrupt
+   message; -1 when the input has ended. */
 static int read_byte(void) {
-    char c;
-    ssize_t n = read(0, &c, 1);
-    if (n <= 0) return -1;
-    return (unsigned char)c;
+    static char *in;
+    static size_t cap, pos, len;
+    while (pos == len) {
+        if (prompt_events >= 0) {
+            struct n_event ev[2];
+            if (n_events_wait(prompt_events, ev, 2, -1) < 0) return -1;
+            if (take_interrupts()) return 3;
+        }
+        if (!cap && !(in = malloc(cap = 4096))) return -1;
+        n_result r = n_channel_receive(0, in, cap, prompt_events >= 0 ? 0 : N_CHANNEL_WAIT, NULL);
+        if (r == -N_ERR_TOO_LARGE) {
+            /* a long paste arrives as one message */
+            n_result need = n_channel_receive(0, NULL, 0, N_CHANNEL_PEEK, NULL);
+            char *grown = need > 0 ? realloc(in, (size_t)need) : NULL;
+            if (!grown) return -1;
+            in = grown;
+            cap = (size_t)need;
+            continue;
+        }
+        if (r == -N_ERR_NOT_READY) continue;
+        if (r < 0) return -1;
+        pos = 0;
+        len = (size_t)r;
+    }
+    return (unsigned char)in[pos++];
 }
 
 static void redraw(const char *prompt, const char *buf, int len, int cur) {
     char tmp[MAX_LINE + 512];
     int n = snprintf(tmp, sizeof tmp, "\r%s%.*s\x1b[K", prompt, len, buf);
     if (len - cur > 0) n += snprintf(tmp + n, sizeof tmp - n, "\x1b[%dD", len - cur);
-    write(1, tmp, n);
+    fwrite(tmp, 1, (size_t)n, stdout);
+    fflush(stdout);
 }
 
 /* returns false on EOF */
@@ -200,8 +248,8 @@ static bool read_line(char *buf) {
             buf[cur++] = (char)c;
             len++;
             if (cur == len) {
-                char ch = (char)c;
-                write(1, &ch, 1);
+                putchar(c);
+                fflush(stdout);
                 continue;
             }
         } else {
@@ -321,17 +369,18 @@ static int expand_glob(const char *pat, char **argv, int argc, int max) {
         file = slash + 1;
     }
     int start = argc;
-    int fd = open(dir, O_RDONLY | O_DIRECTORY);
-    if (fd >= 0) {
-        struct n_dirent d;
-        for (int i = 0; readdir(fd, i, &d) > 0 && argc < max; i++) {
-            if (d.name[0] == '.' && file[0] != '.') continue;
-            if (!match(file, d.name)) continue;
+    char path[512];
+    struct n_entry *ents;
+    n_result count = complete_name(dir, path, sizeof path) ? n_folder_entries(path, &ents) : -1;
+    if (count >= 0) {
+        for (int i = 0; i < (int)count && argc < max; i++) {
+            if (ents[i].name[0] == '.' && file[0] != '.') continue;
+            if (!match(file, ents[i].name)) continue;
             char full[768];
-            snprintf(full, sizeof full, "%s%s", prefix, d.name);
+            snprintf(full, sizeof full, "%s%s", prefix, ents[i].name);
             argv[argc++] = strdup(full);
         }
-        close(fd);
+        free(ents);
     }
     if (argc == start) argv[argc++] = strdup(pat);
     else qsort(argv + start, argc - start, sizeof(char *), cmp_str);
@@ -351,17 +400,21 @@ static void cmd_help(void) {
 static bool builtin(int argc, char **argv, int *status) {
     if (!strcmp(argv[0], "cd")) {
         const char *d = argc > 1 ? argv[1] : "/home";
-        if (chdir(d) < 0) {
-            fprintf(stderr, "cd: %s: %s\n", d, strerror(errno));
+        char path[sizeof folder];
+        struct n_entry e;
+        n_result r = complete_name(d, path, sizeof path) ? n_entry_info(path, &e) : -N_ERR_TOO_LARGE;
+        if (r >= 0 && e.kind != N_KIND_FOLDER) r = -N_ERR_NOT_FOLDER;
+        if (r < 0) {
+            fprintf(stderr, "cd: %s: %s\n", d, n_result_text(r));
             *status = 1;
         } else {
+            memcpy(folder, path, sizeof folder);
             *status = 0;
         }
         return true;
     }
     if (!strcmp(argv[0], "pwd")) {
-        char cwd[256];
-        printf("%s\n", getcwd(cwd, sizeof cwd));
+        printf("%s\n", folder);
         fflush(stdout);
         *status = 0;
         return true;
@@ -391,86 +444,168 @@ struct cmd {
     bool append;
 };
 
+static void close_handle(n_handle *h) {
+    if (*h >= 0) n_handle_close(*h);
+    *h = -1;
+}
+
+/* A program name as a complete path: names with a "/" are inside the current
+   folder, others are looked up in /bin and /data/bin. */
+static bool find_command(const char *name, char *path, size_t n) {
+    struct n_entry e;
+    if (!strchr(name, '/')) return find_program(name, path, n);
+    return complete_name(name, path, n) && n_entry_info(path, &e) >= 0 && e.kind == N_KIND_DOCUMENT;
+}
+
+/* A redirection target: ">" empties the document (ISO C "w"), ">>" adds to its end. */
+static n_handle open_output(const char *name, bool append) {
+    char path[512];
+    if (!complete_name(name, path, sizeof path)) return -N_ERR_TOO_LARGE;
+    n_handle h = n_document_open(path, N_DOCUMENT_EDIT);
+    if (h == -N_ERR_NOT_FOUND) return n_document_open(path, N_DOCUMENT_CREATE);
+    if (h >= 0 && !append) {
+        n_result r = n_document_set_size(h, 0);
+        if (r < 0) {
+            n_handle_close(h);
+            return (n_handle)r;
+        }
+    }
+    return h;
+}
+
+static n_handle launch(const char *path, struct cmd *c, const int32_t handles[3]) {
+    char setting_folder[sizeof folder + 8], setting_terminal[32] = "TERMINAL=";
+    snprintf(setting_folder, sizeof setting_folder, "FOLDER=%s", folder);
+    /* the child reaches the terminal through the handles it shares with the shell */
+    bool terminal = false;
+    for (int i = 0; i < 3; i++)
+        if (handles[i] == i && n_terminal(i)) {
+            char num[4];
+            snprintf(num, sizeof num, "%s%d", terminal ? " " : "", i);
+            strlcat(setting_terminal, num, sizeof setting_terminal);
+            terminal = true;
+        }
+    const char *settings[2] = {setting_folder, setting_terminal};
+    struct n_launch l = {.arguments = (const char *const *)c->argv, .settings = settings, .handles = handles,
+                         .argument_count = (uint32_t)c->argc, .setting_count = terminal ? 2 : 1, .handle_count = 3};
+    return n_app_launch(path, &l);
+}
+
+/* Wait for the apps of a foreground pipeline; a Ctrl+C stops them and what
+   they started. Returns the result of the last one. */
+static int wait_apps(n_handle *apps, int napps) {
+    n_handle q = n_events_create();
+    if (q < 0) return 1;
+    for (int i = 0; i < napps; i++)
+        if (apps[i] >= 0) n_events_watch(q, apps[i], N_EVENT_APP_ENDED, (uint64_t)i);
+    if (interrupts >= 0) n_events_watch(q, interrupts, N_EVENT_RECEIVABLE, UINT64_MAX);
+    int status = 0, running = 0;
+    for (int i = 0; i < napps; i++) running += apps[i] >= 0;
+    while (running > 0) {
+        struct n_event ev[17];
+        n_result got = n_events_wait(q, ev, 17, -1);
+        if (got < 0) break;
+        for (int k = 0; k < (int)got; k++) {
+            if (ev[k].token == UINT64_MAX) {
+                if (!take_interrupts()) continue;
+                for (int i = 0; i < napps; i++)
+                    if (apps[i] >= 0) n_app_stop(apps[i], N_APP_STOP_TREE);
+                out("^C\n");
+                continue;
+            }
+            int i = (int)ev[k].token, st = 0;
+            if (i >= napps || apps[i] < 0 || n_app_result(apps[i], 0, &st) < 0) continue;
+            if (i == napps - 1) status = st;
+            close_handle(&apps[i]);
+            running--;
+        }
+    }
+    n_handle_close(q);
+    for (int i = 0; i < napps; i++) close_handle(&apps[i]);
+    return status;
+}
+
 /* run a pipeline; returns exit status of the last command */
 static int run_pipeline(struct cmd *cmds, int n, bool background) {
     if (n == 1 && cmds[0].argc && !cmds[0].in && !cmds[0].out) {
         int st;
         if (builtin(cmds[0].argc, cmds[0].argv, &st)) return st;
     }
-    int pids[16];
-    int npids = 0;
-    int prev_rd = -1;
+    n_handle apps[16];
+    int napps = 0;
+    n_handle prev = -1; /* the receiving end of the previous command's output */
     int status = 0;
     for (int i = 0; i < n; i++) {
         struct cmd *c = &cmds[i];
-        int fdmap[3] = {0, 1, 2};
-        int pfd[2] = {-1, -1};
-        int infd = -1, outfd = -1, errfd = -1;
-        if (prev_rd >= 0) fdmap[0] = prev_rd;
+        int32_t handles[3];
+        for (int k = 0; k < 3; k++) handles[k] = std_open[k] ? k : -1;
+        n_handle pipe_ends[2] = {-1, -1}, in = -1, outh = -1, err = -1;
+        if (prev >= 0) handles[0] = prev;
         if (i < n - 1) {
-            if (pipe(pfd) < 0) {
-                perror("pipe");
+            n_result r = n_channel_pair(pipe_ends);
+            if (r < 0) {
+                fprintf(stderr, "sh: %s\n", n_result_text(r));
                 break;
             }
-            fdmap[1] = pfd[1];
+            handles[1] = pipe_ends[1];
         }
         if (c->in) {
-            infd = open(c->in, O_RDONLY);
-            if (infd < 0) {
-                fprintf(stderr, "sh: %s: %s\n", c->in, strerror(errno));
+            char path[512];
+            in = complete_name(c->in, path, sizeof path) ? n_document_open(path, N_DOCUMENT_READ) : -N_ERR_TOO_LARGE;
+            if (in < 0) {
+                fprintf(stderr, "sh: %s: %s\n", c->in, n_result_text(in));
                 status = 1;
                 goto next;
             }
-            fdmap[0] = infd;
+            handles[0] = in;
         }
         if (c->out) {
-            outfd = open(c->out, O_WRONLY | O_CREAT | (c->append ? O_APPEND : O_TRUNC));
-            if (outfd < 0) {
-                fprintf(stderr, "sh: %s: %s\n", c->out, strerror(errno));
+            outh = open_output(c->out, c->append);
+            if (outh < 0) {
+                fprintf(stderr, "sh: %s: %s\n", c->out, n_result_text(outh));
                 status = 1;
                 goto next;
             }
-            fdmap[1] = outfd;
+            handles[1] = outh;
         }
         if (c->err) {
-            errfd = open(c->err, O_WRONLY | O_CREAT | O_TRUNC);
-            if (errfd >= 0) fdmap[2] = errfd;
+            err = open_output(c->err, false);
+            if (err >= 0) handles[2] = err;
         }
         if (c->argc) {
-            char path[256];
+            char path[512];
             int st;
             if (builtin(c->argc, c->argv, &st)) {
                 status = st;
-            } else if (!find_program(c->argv[0], path, sizeof path)) {
+            } else if (!find_command(c->argv[0], path, sizeof path)) {
                 fprintf(stderr, "sh: %s: command not found\n", c->argv[0]);
                 status = 127;
             } else {
-                c->argv[c->argc] = NULL;
-                int pid = spawn(path, c->argv, fdmap, background ? SPAWN_DETACH : 0);
-                if (pid < 0) {
-                    fprintf(stderr, "sh: %s: %s\n", c->argv[0], strerror(errno));
+                n_handle app = launch(path, c, handles);
+                if (app < 0) {
+                    fprintf(stderr, "sh: %s: %s\n", c->argv[0], n_result_text(app));
                     status = 126;
-                } else if (npids < 16) {
-                    pids[npids++] = pid;
-                    if (background) printf("[%d]\n", pid);
+                } else if (background) {
+                    /* it keeps running on its own; there is nothing to collect */
+                    printf("[%d]\n", (int)n_app_id(app));
+                    n_handle_close(app);
+                } else if (napps < 16) {
+                    apps[napps++] = app;
+                } else {
+                    n_handle_close(app);
                 }
             }
         }
     next:
-        if (prev_rd >= 0) close(prev_rd);
-        if (pfd[1] >= 0) close(pfd[1]);
-        prev_rd = pfd[0];
-        if (infd >= 0) close(infd);
-        if (outfd >= 0) close(outfd);
-        if (errfd >= 0) close(errfd);
+        close_handle(&prev);
+        close_handle(&pipe_ends[1]);
+        prev = pipe_ends[0];
+        close_handle(&in);
+        close_handle(&outh);
+        close_handle(&err);
     }
-    if (prev_rd >= 0) close(prev_rd);
-    if (!background) {
-        for (int i = 0; i < npids; i++) {
-            int st = 0;
-            if (waitpid(pids[i], &st, 0) > 0 && i == npids - 1) status = st;
-        }
-    }
+    close_handle(&prev);
+    if (napps) status = wait_apps(apps, napps);
     fflush(stdout);
     return status;
 }
@@ -588,10 +723,11 @@ static int execute(const char *raw) {
     return status;
 }
 
-static int run_script(const char *path) {
-    FILE *f = fopen(path, "r");
+static int run_script(const char *name) {
+    char path[512];
+    FILE *f = complete_name(name, path, sizeof path) ? fopen(path, "r") : NULL;
     if (!f) {
-        fprintf(stderr, "sh: %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "sh: %s: %s\n", name, n_result_text(-errno));
         return 127;
     }
     char line[MAX_LINE];
@@ -604,6 +740,8 @@ static int run_script(const char *path) {
 }
 
 int main(int argc, char **argv) {
+    if (n_path_complete(".", folder, sizeof folder) < 0) strcpy(folder, "/");
+    for (int i = 0; i < 3; i++) std_open[i] = n_handle_kind(i) >= 0;
     if (argc > 2 && !strcmp(argv[1], "-c")) {
         /* sh -c CMD [NAME [ARGS...]]: NAME becomes $0 */
         if (argc > 3) pargc = argc - 3, pargv = argv + 3;
@@ -613,10 +751,16 @@ int main(int argc, char **argv) {
         pargc = argc - 1, pargv = argv + 1;
         return run_script(argv[1]);
     }
-    interactive = true;
     setvbuf(stdout, NULL, _IONBF, 0);
-    struct n_stat st;
-    if (stat("/etc/motd", &st) == 0) {
+    const char *ih = getenv("INTERRUPTS");
+    if (ih && n_handle_kind(atoi(ih)) == N_KIND_CHANNEL) interrupts = atoi(ih);
+    /* at the prompt, wait for a key or a Ctrl+C, whichever comes first */
+    if (interrupts >= 0 && (prompt_events = n_events_create()) >= 0) {
+        n_events_watch(prompt_events, 0, N_EVENT_RECEIVABLE | N_EVENT_CLOSED, TOKEN_INPUT);
+        n_events_watch(prompt_events, interrupts, N_EVENT_RECEIVABLE, TOKEN_INTERRUPT);
+    }
+    struct n_entry motd;
+    if (n_entry_info("/etc/motd", &motd) >= 0) {
         char *a[] = {"cat", "/etc/motd", NULL};
         run_wait("cat", a);
     }

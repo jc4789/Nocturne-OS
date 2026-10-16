@@ -314,6 +314,29 @@ def check_audio(path):
         n = sum(1 for i in range(1, len(x)) if x[i - 1] < 0 <= x[i])
         return n * rate / max(1, len(x))
 
+    # QEMU's wav backend records only while the card plays, and the sink stops the card while no
+    # stream has sound (audio.h), so the silence between two tones may not be in the recording.
+    # Split runs where the pitch changes as well (measured over 50 ms around each block).
+    def pitch(i, r0, r1):
+        a, b = max(r0, i - 2), min(r1, i + 3)
+        x, y = left[a * blk:b * blk], right[a * blk:b * blk]
+        return tuple(sum(1 for k in range(1, len(c)) if c[k - 1] < 0 <= c[k]) * rate / max(1, len(c)) for c in (x, y))
+
+    def same(p, q):
+        return all(abs(x - y) <= max(x, y) * 0.08 for x, y in zip(p, q))
+
+    split = []
+    for r0, r1 in runs:
+        start = r0
+        ref = pitch(min(r1 - 1, start + 3), r0, r1)
+        for i in range(r0 + 6, r1 - 6):
+            p, q = pitch(i, r0, r1), pitch(i + 4, r0, r1)  # a lasting change, not the blend at a seam
+            if i - start >= 6 and not same(p, ref) and same(p, q):
+                split.append([start, i])
+                start, ref = i, q
+        split.append([start, r1])
+    runs = split
+
     found = []
     for r0, r1 in runs:
         a, b = r0 * blk, r1 * blk

@@ -12,7 +12,6 @@
 #include "web_presentation.h"
 #include "../media_http_private.h"
 #include "nocturne.h"
-#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -80,7 +79,8 @@ struct web_avmedia {
     size_t ahead_count;
     uint32_t *pixels;
     size_t pixel_capacity;
-    int width, height, fd;
+    int width, height;
+    n_handle sink; /* the sound stream, or -1 */
     bool playing, ended, muted, url_input,audio_enabled,video_enabled;
     int ready;
     double volume,rate;
@@ -99,7 +99,7 @@ struct web_avmedia {
     int64_t audio_played_ms;
     bool clock_snapshot_enabled,clock_snapshot_valid;
     struct n_audio_status clock_snapshot;
-    ssize_t clock_snapshot_bytes;
+    n_result clock_snapshot_result;
     uint64_t profile_pumps,profile_services,profile_pump_ms,profile_pump_at,profile_pump_gap;
     char error[160];
     /* Private, bounded plain-text caption surface; owned with this media node. */
@@ -205,10 +205,10 @@ static struct web_avmedia *find(web_doc *d, node_t *n, bool create) {
     if (!create) return NULL;
     struct web_avmedia *s = nmedia_ff_mallocz(sizeof *s);
     if (!s) return NULL;
-    s->doc = d; s->node = n; s->fd = -1;s->mse_pending_slot=-1;s->audio_enabled=s->video_enabled=true; s->volume = s->rate = 1;s->preserve_pitch=true; s->next = streams; streams = s;
+    s->doc = d; s->node = n; s->sink = -1;s->mse_pending_slot=-1;s->audio_enabled=s->video_enabled=true; s->volume = s->rate = 1;s->preserve_pitch=true; s->next = streams; streams = s;
     return s;
 }
-static void close_audio(struct web_avmedia *s) { s->clock_snapshot_valid=false;s->audio_clock_failed=s->audio_played_valid=false;if (s->fd >= 0) { audio_flush(s->fd); close(s->fd); } s->fd = -1;s->audio_written=false;nmedia_rate_close(s->rate_decoder);s->rate_decoder=NULL;s->rate_owned=false; }
+static void close_audio(struct web_avmedia *s) { s->clock_snapshot_valid=false;s->audio_clock_failed=s->audio_played_valid=false;if (s->sink >= 0) { n_audio_flush(s->sink); n_handle_close(s->sink); } s->sink = -1;s->audio_written=false;nmedia_rate_close(s->rate_decoder);s->rate_decoder=NULL;s->rate_owned=false; }
 static void clear_ahead(struct web_avmedia *s) {
     s->mse_audio_wait=false;
     while(s->ahead_next){struct web_video_ahead *v=s->ahead_next;s->ahead_next=v->next;nmedia_ff_free((void *)v->output.pixels);nmedia_ff_free(v);}
@@ -246,21 +246,21 @@ static int64_t current(struct web_avmedia *s, uint64_t now) {
     /* An enabled audio track has not started until real PCM is submitted.
        Preroll/backend readiness must not advance a silent wall clock and
        cause video to be discarded before the first audible sample. */
-    if(s->playing&&s->audio_enabled&&s->fd>=0&&!s->audio_written&&info&&info->audio)ms=s->base_ms;
+    if(s->playing&&s->audio_enabled&&s->sink>=0&&!s->audio_written&&info&&info->audio)ms=s->base_ms;
     /* Wall time is not audible progress while JS/paint delays PCM supply.
      * Use this stream's consumed PCM timeline once a write establishes it.
      * Empty software queue freezes at the last supplied sample, not at a
      * fictitious future wall position. Silent/disabled tracks keep wall time. */
-    if(s->playing&&s->audio_enabled&&s->fd>=0&&s->audio_written){
+    if(s->playing&&s->audio_enabled&&s->sink>=0&&s->audio_written){
         /* One bounded native pump uses one device-consumption snapshot, not
            a read syscall for every video candidate comparison. PCM writes
            and sink replacement invalidate it; author getters outside the
            pump always read current device state. */
-        struct n_audio_status status={0};ssize_t bytes;
-        if(s->audio_clock_failed)bytes=-1;
-        else if(s->clock_snapshot_enabled&&s->clock_snapshot_valid){status=s->clock_snapshot;bytes=s->clock_snapshot_bytes;}
-        else {bytes=read(s->fd,&status,sizeof status);if(s->clock_snapshot_enabled){s->clock_snapshot=status;s->clock_snapshot_bytes=bytes;s->clock_snapshot_valid=true;}}
-        if(bytes==sizeof status||bytes==sizeof(uint32_t)){uint64_t queued=(uint64_t)status.queued_frames+status.device_pending_frames;
+        struct n_audio_status status={0};n_result got;
+        if(s->audio_clock_failed)got=-N_ERR_IO;
+        else if(s->clock_snapshot_enabled&&s->clock_snapshot_valid){status=s->clock_snapshot;got=s->clock_snapshot_result;}
+        else {got=n_audio_status(s->sink,&status);if(s->clock_snapshot_enabled){s->clock_snapshot=status;s->clock_snapshot_result=got;s->clock_snapshot_valid=true;}}
+        if(got==0){uint64_t queued=(uint64_t)status.queued_frames+status.device_pending_frames;
             int64_t frames=s->audio_end_frame-(int64_t)lround(queued*s->rate);ms=MAX(s->base_ms,frames/SOUND_RATE*1000+(frames%SOUND_RATE)*1000/SOUND_RATE);
             s->audio_played_ms=ms;s->audio_played_valid=true;
         }else {
@@ -279,8 +279,10 @@ static void audio_failed(struct web_avmedia *s,uint64_t now){
     s->pending.kind=0;s->audio_at=0;close_audio(s);clear_ahead(s);s->doc->dirty=true;
 }
 static bool audio_queue(struct web_avmedia *s,uint32_t *queued,uint64_t now){
-    *queued=0;if(s->fd<0)return true;
-    if(s->audio_clock_failed||read(s->fd,queued,sizeof *queued)!=sizeof *queued){audio_failed(s,now);return false;}
+    *queued=0;if(s->sink<0)return true;
+    struct n_audio_status status;
+    if(s->audio_clock_failed||n_audio_status(s->sink,&status)<0){audio_failed(s,now);return false;}
+    *queued=status.queued_frames;
     return true;
 }
 static bool audio_target_frame(struct web_avmedia *s,int64_t *target){
@@ -303,20 +305,20 @@ static int audio_fill_gap(struct web_avmedia *s,uint32_t queued){
     if(s->audio_end_frame<0&&target>INT64_MAX+s->audio_end_frame){strlcpy(s->error,"native audio gap overflow",sizeof s->error);return -1;}
     if(queued>=WEB_AUDIO_TARGET)return 2;
     size_t frames=(size_t)MIN(MIN((int64_t)ceil((target-s->audio_end_frame)/s->rate),(int64_t)(WEB_AUDIO_TARGET-queued)),4096);
-    memset(s->scaled,0,frames*4);ssize_t n=write(s->fd,s->scaled,frames*4);
+    memset(s->scaled,0,frames*4);n_result n=n_audio_submit(s->sink,s->scaled,frames,0);
     s->clock_snapshot_valid=false;
-    if(n<0&&errno==EAGAIN)return 2;
-    if(n<=0||(n&3)||(size_t)n>frames*4){strlcpy(s->error,"native audio gap write failed",sizeof s->error);return -1;}
-    s->audio_end_frame+=(int64_t)lround((n/4)*s->rate);s->audio_end_ms=s->audio_end_frame/SOUND_RATE*1000+(s->audio_end_frame%SOUND_RATE)*1000/SOUND_RATE;
-    s->audio_frames+=(size_t)n/4;s->audio_silence_frames+=(size_t)n/4;s->audio_written=true;return 1;
+    if(n==-N_ERR_NOT_READY)return 2;
+    if(n<=0||(size_t)n>frames){strlcpy(s->error,"native audio gap write failed",sizeof s->error);return -1;}
+    s->audio_end_frame+=(int64_t)lround(n*s->rate);s->audio_end_ms=s->audio_end_frame/SOUND_RATE*1000+(s->audio_end_frame%SOUND_RATE)*1000/SOUND_RATE;
+    s->audio_frames+=(size_t)n;s->audio_silence_frames+=(size_t)n;s->audio_written=true;return 1;
 }
 static bool audio_open(struct web_avmedia *s) {
-    if(s->fd>=0)return true;
+    if(s->sink>=0)return true;
     const struct nmedia_info *info = information(s);
     if (!info || !info->audio || !s->audio_enabled) return true;
-    s->fd = open("/dev/audio", O_RDWR | O_NONBLOCK);
-    uint32_t queued=0;
-    if (s->fd < 0 || read(s->fd,&queued,4)!=4) { close_audio(s);strlcpy(s->error,"native audio output unavailable",sizeof s->error);return false; }
+    s->sink = n_audio_open();
+    struct n_audio_status probe;
+    if (s->sink < 0 || n_audio_status(s->sink,&probe)<0) { close_audio(s);strlcpy(s->error,"native audio output unavailable",sizeof s->error);return false; }
     s->error[0]=0;return true;
 }
 static void range_suspend(struct web_avmedia *s,uint64_t now) {
@@ -485,7 +487,7 @@ static bool present_ahead(struct web_avmedia *s,uint64_t now) {
  * buffered video. Codec trim may separate nominal packet and PCM endpoints:
  * never advance the real sample clock to the nominal range end. */
 static bool mse_audio_input_wait(struct web_avmedia *s,uint64_t now){
-    if(!s->mse_active||s->mse_eos||s->mse_seeking||!s->playing||!s->audio_enabled||s->fd<0||!s->audio_written||
+    if(!s->mse_active||s->mse_eos||s->mse_seeking||!s->playing||!s->audio_enabled||s->sink<0||!s->audio_written||
        !s->ahead.kind||s->ahead_generation!=s->generation||s->pending.kind==NMEDIA_AUDIO)return false;
     int64_t horizon=-1;bool audio=false,video=false;
     for(size_t i=0;i<s->mse_count;i++)if(s->mse[i].used){
@@ -1029,7 +1031,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
         }
         if(r==NMEDIA_AUDIO||r==NMEDIA_VIDEO||r==NMSW_CLOCK){
             s->mse_seeking=false;
-            s->ready=2;if(s->starved){s->starved=false;s->started=now;if(s->playing&&s->fd<0&&!audio_open(s)){s->playing=false;return;}}
+            s->ready=2;if(s->starved){s->starved=false;s->started=now;if(s->playing&&s->sink<0&&!audio_open(s)){s->playing=false;return;}}
             if(r==NMEDIA_VIDEO&&!s->playing){if(!present(s))return;}
         }else if(r==NMEDIA_END)s->mse_seeking=false;
     }
@@ -1087,7 +1089,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
         }
         if(s->pending.kind==NMSW_CLOCK){if(s->pending.pts_ms>current(s,now)+5)return;s->pending.kind=0;
         }else if(s->pending.kind==NMEDIA_VIDEO){
-            if(s->ahead.kind&&s->fd>=0){
+            if(s->ahead.kind&&s->sink>=0){
                 if(!hold_video(s)){s->base_ms=current(s,now);s->playing=false;close_audio(s);clear_ahead(s);s->doc->dirty=true;return;}
                 s->pending.kind=0;
                 if(mse_audio_input_wait(s,now)){s->mse_audio_wait=true;return;}
@@ -1099,7 +1101,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
                  * Privately owned pictures keep their authored PTS, never
                  * eager-display/drop or fabricate clock progress. Every
                  * record is charged; the 2 ms / 8 packet burst bounds work. */
-                if(s->fd>=0){
+                if(s->sink>=0){
                     if(!hold_video(s)){s->base_ms=current(s,now);s->playing=false;close_audio(s);clear_ahead(s);s->doc->dirty=true;return;}
                     s->pending.kind=0;
                     if(mse_audio_input_wait(s,now)){s->mse_audio_wait=true;return;}
@@ -1122,8 +1124,8 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
                 if(!nmedia_rate_push(s->rate_decoder,&s->pending)){strlcpy(s->error,"native PCM tempo input failed",sizeof s->error);s->playing=false;close_audio(s);return;}
                 s->pending.kind=0;continue;
             }
-            if(s->fd<0&&s->pending.pts_ms>current(s,now)+100)return;
-            if(s->fd>=0){uint32_t queued=0;if(!audio_queue(s,&queued,now)||queued>=WEB_AUDIO_TARGET)return;
+            if(s->sink<0&&s->pending.pts_ms>current(s,now)+100)return;
+            if(s->sink>=0){uint32_t queued=0;if(!audio_queue(s,&queued,now)||queued>=WEB_AUDIO_TARGET)return;
                 if(s->pending.frames>4096||s->audio_at>s->pending.frames){strlcpy(s->error,"invalid native audio span",sizeof s->error);s->playing=false;close_audio(s);return;}
                 int gap=audio_fill_gap(s,queued);
                 if(gap<0){s->base_ms=current(s,now);s->playing=false;close_audio(s);return;}
@@ -1131,11 +1133,11 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
                 size_t frames=MIN(MIN(s->pending.frames-s->audio_at,(size_t)(WEB_AUDIO_TARGET-queued)),(size_t)4096);
                 double gain=s->muted?0:s->volume;
                 for(size_t i=0;i<frames*2;i++)s->scaled[i]=(int16_t)(s->pending.samples[s->audio_at*2+i]*gain);
-                ssize_t n=write(s->fd,s->scaled,frames*4);
+                n_result n=n_audio_submit(s->sink,s->scaled,frames,0);
                 s->clock_snapshot_valid=false;
-                if(n<0&&errno==EAGAIN)return;
-                if(n<=0||(n&3)||(size_t)n>frames*4){strlcpy(s->error,"native audio write failed",sizeof s->error);s->base_ms=current(s,now);s->playing=false;close_audio(s);return;}
-                s->audio_at+=(size_t)n/4;s->audio_frames+=(size_t)n/4;s->audio_written=true;
+                if(n==-N_ERR_NOT_READY)return;
+                if(n<=0||(size_t)n>frames){strlcpy(s->error,"native audio write failed",sizeof s->error);s->base_ms=current(s,now);s->playing=false;close_audio(s);return;}
+                s->audio_at+=(size_t)n;s->audio_frames+=(size_t)n;s->audio_written=true;
                 if(!audio_target_frame(s,&s->audio_end_frame)){s->base_ms=current(s,now);s->playing=false;close_audio(s);return;}
                 s->audio_end_ms=s->audio_end_frame/SOUND_RATE*1000+(s->audio_end_frame%SOUND_RATE)*1000/SOUND_RATE;
                 if(s->audio_at<s->pending.frames)return;
@@ -1148,12 +1150,12 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
                 if(result==NMEDIA_ERROR){strlcpy(s->error,"native PCM tempo tail failed",sizeof s->error);s->playing=false;close_audio(s);return;}
                 s->pending.kind=NMEDIA_END;
             }
-            struct n_audio_status status={0};if(s->fd>=0){ssize_t bytes=read(s->fd,&status,sizeof status);if(bytes!=sizeof status&&bytes!=sizeof(uint32_t)){audio_failed(s,now);return;}}if(status.queued_frames||status.device_pending_frames)return;
+            struct n_audio_status status={0};if(s->sink>=0&&n_audio_status(s->sink,&status)<0){audio_failed(s,now);return;}if(status.queued_frames||status.device_pending_frames)return;
             s->starved=false; /* Confirmed EOF is not a waiting-for-input gap. */
             if(s->ahead.kind){
                 /* Actual decoder EOF and a drained PCM sink, not starvation:
                  * remaining authored pictures use the silent-video clock. */
-                if(s->fd>=0){s->base_ms=current(s,now);s->started=now;close_audio(s);}return;
+                if(s->sink>=0){s->base_ms=current(s,now);s->started=now;close_audio(s);}return;
             }
             /* EOF is not the end of the last displayed frame. Honor a known
              * duration only for a bounded <=1s tail; corrupt/unknown duration
@@ -1163,7 +1165,7 @@ static void pump_impl(struct web_avmedia *s,uint64_t now,uint64_t mse_until,bool
             if(info&&info->video&&info->duration_ms>at&&info->duration_ms-at<=1000){
                 /* Drained audio may end slightly before the final picture.
                  * Transfer only this bounded EOF tail back to the wall clock. */
-                if(s->fd>=0){s->base_ms=at;s->started=now;close_audio(s);}return;
+                if(s->sink>=0){s->base_ms=at;s->started=now;close_audio(s);}return;
             }
             s->base_ms=current(s,now);s->playing=false;s->ended=true;close_audio(s);
             if(s->url_input)range_suspend(s,now);
@@ -1219,8 +1221,8 @@ static void snapshot_publish(struct web_avmedia *s) {
 static void timing_profile(struct web_avmedia *s,uint64_t now){
     if((!s->playing&&(!s->ended||s->profile_ended))||(s->playing&&now-s->profile_at<2000))return;
     s->profile_at=now;s->profile_ended=s->ended;
-    struct n_audio_status status={0};ssize_t status_bytes=s->fd>=0?read(s->fd,&status,sizeof status):-1;
-    bool audio=status_bytes==sizeof status||status_bytes==sizeof(uint32_t);
+    struct n_audio_status status={0};
+    bool audio=s->sink>=0&&n_audio_status(s->sink,&status)==0;
     uint32_t queued=status.queued_frames+status.device_pending_frames;
     int64_t played=s->audio_written&&audio?s->audio_end_ms-(int64_t)(queued*s->rate*1000/SOUND_RATE):-1;
     char message[512];
@@ -1270,8 +1272,8 @@ void web_avmedia_service(uint64_t now){
        round trip and could starve the ring despite readily decoded input. */
     uint64_t interval=5;
     for(struct web_avmedia *p=streams;p;p=p->next)if(p->playing&&p->rate&&(!p->mse_active||p->pending.kind||p->ahead.kind||nmedia_mse_worker_needs_service(p->mse_worker))&&(!p->mse_audio_wait||nmedia_mse_worker_pending(p->mse_worker))){
-        uint32_t queued=0;
-        if((p->fd>=0&&read(p->fd,&queued,4)==4&&queued<1440)||p->pending.kind||nmedia_mse_worker_pending(p->mse_worker)){
+        struct n_audio_status status;
+        if((p->sink>=0&&n_audio_status(p->sink,&status)==0&&status.queued_frames<1440)||p->pending.kind||nmedia_mse_worker_pending(p->mse_worker)){
             interval=1;break;
         }
     }
@@ -1418,11 +1420,11 @@ int64_t web_avmedia_deadline(web_doc *d,uint64_t now){
         /* Audio refill and native transport have independent deadlines. Do
            not sleep until a video PTS while a PCM queue is draining. Reading
            one tiny native status here is not a made-up presentation clock. */
-        if(s->playing&&s->fd>=0&&s->audio_enabled){
-            struct n_audio_status status={0};ssize_t bytes=read(s->fd,&status,sizeof status);
+        if(s->playing&&s->sink>=0&&s->audio_enabled){
+            struct n_audio_status status={0};n_result got=n_audio_status(s->sink,&status);
             uint64_t queued=(uint64_t)status.queued_frames+status.device_pending_frames;
             int64_t refill=(int64_t)now+1;
-            if((bytes==sizeof status||bytes==sizeof(uint32_t))&&queued>WEB_AUDIO_TARGET/2)
+            if(got==0&&queued>WEB_AUDIO_TARGET/2)
                 refill=(int64_t)now+(int64_t)((queued-WEB_AUDIO_TARGET/2)*1000/SOUND_RATE);
             if(due<0||refill<due)due=refill;
         }
