@@ -65,15 +65,15 @@ static int dns_user_name_copy(const char *source, char **result) {
     uintptr_t base = (uintptr_t)source;
     size_t length;
     for (length = 0; length <= DNS_NAME_TEXT_BYTES; length++) {
-        if (base > UINTPTR_MAX - length || !user_ok((const void *)(base + length), 1)) return -EFAULT;
+        if (base > UINTPTR_MAX - length || !user_ok((const void *)(base + length), 1)) return -N_ERR_BAD_ADDRESS;
         if (!*(const char *)(base + length)) break;
     }
-    if (length > DNS_NAME_TEXT_BYTES) return -ENAMETOOLONG;
+    if (length > DNS_NAME_TEXT_BYTES) return -N_ERR_NAME_TOO_LONG;
     char *name = kmalloc(length + 1);
-    if (!name) return -ENOMEM;
+    if (!name) return -N_ERR_NO_MEMORY;
     int copied = user_str(name, source, length + 1);
     if (copied < 0 || (size_t)copied != length) {
-        kfree(name); return copied < 0 ? copied : -EINVAL;
+        kfree(name); return copied < 0 ? copied : -N_ERR_INVALID;
     }
     *result = name; return 0;
 }

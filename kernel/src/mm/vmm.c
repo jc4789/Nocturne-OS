@@ -338,18 +338,18 @@ int vmm_user_alloc(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
         bool huge = false;
         uint64_t *pte = walk(pml4, a, &huge);
         if (pte && (*pte & PTE_P)) {
-            if (huge) return -EINVAL;
-            if ((*pte & PTE_SHARED_RO) && (prot & (VM_W | VM_X))) return -EPERM;
+            if (huge) return -N_ERR_INVALID;
+            if ((*pte & PTE_SHARED_RO) && (prot & (VM_W | VM_X))) return -N_ERR_DENIED;
             if (prot & VM_W) *pte |= PTE_W;
             if (prot & VM_X) *pte &= ~PTE_NX;
             invlpg(a);
             continue;
         }
         uint64_t p = pmm_alloc_zeroed();
-        if (!p) return -ENOMEM;
+        if (!p) return -N_ERR_NO_MEMORY;
         if (!vmm_map_page(pml4, a, p, prot_flags(prot))) {
             pmm_free(p);
-            return -ENOMEM;
+            return -N_ERR_NO_MEMORY;
         }
     }
     return 0;
@@ -362,8 +362,8 @@ int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
     for (uint64_t a = start; a < end; a += PAGE_SIZE) {
         bool huge = false;
         uint64_t *pte = walk(pml4, a, &huge);
-        if (!pte || !(*pte & PTE_P) || huge || !(*pte & PTE_U)) return -ENOMEM;
-        if ((*pte & PTE_SHARED_RO) && (prot & (VM_W | VM_X))) return -EPERM;
+        if (!pte || !(*pte & PTE_P) || huge || !(*pte & PTE_U)) return -N_ERR_NO_MEMORY;
+        if ((*pte & PTE_SHARED_RO) && (prot & (VM_W | VM_X))) return -N_ERR_DENIED;
     }
     for (uint64_t a = start; a < end; a += PAGE_SIZE) {
         bool huge = false;
@@ -387,7 +387,7 @@ int vmm_copy_to_space(uint64_t pml4, uint64_t va, const void *src, size_t n) {
     const uint8_t *s = src;
     while (n) {
         uint64_t pa = vmm_translate(pml4, va);
-        if (!pa) return -EFAULT;
+        if (!pa) return -N_ERR_BAD_ADDRESS;
         size_t chunk = MIN(n, PAGE_SIZE - (va & 0xFFF));
         if (s) memcpy(phys_to_virt(pa), s, chunk);
         else memset(phys_to_virt(pa), 0, chunk);

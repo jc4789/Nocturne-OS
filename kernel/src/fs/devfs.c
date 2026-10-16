@@ -30,7 +30,7 @@ static int64_t kmsg_read_common(struct vnode *v, struct file *f, void *buf, uint
     size_t total = klog_read(tmp, sizeof tmp);
     if (off >= total) return 0;
     size_t c = MIN(n, total - off);
-    if (user && !user_ok_w(buf, c)) return -EFAULT;
+    if (user && !user_ok_w(buf, c)) return -N_ERR_BAD_ADDRESS;
     memcpy(buf, tmp + off, c);
     f->off += c;
     return c;
@@ -78,7 +78,7 @@ static int64_t cons_read_common(struct vnode *v, struct file *f, void *buf, uint
         uint64_t fl = irq_save();
         if (cons_count) {
             size_t got = MIN(n, (size_t)cons_count);
-            if (user && !user_ok_w(buf, got)) { irq_restore(fl); return -EFAULT; }
+            if (user && !user_ok_w(buf, got)) { irq_restore(fl); return -N_ERR_BAD_ADDRESS; }
             size_t first = MIN(got, (size_t)CONS_BUF - cons_tail);
             memcpy(out, cons_buf + cons_tail, first);
             memcpy(out + first, cons_buf, got - first);
@@ -89,11 +89,11 @@ static int64_t cons_read_common(struct vnode *v, struct file *f, void *buf, uint
         }
         if (f->flags & O_NONBLOCK) {
             irq_restore(fl);
-            return -EAGAIN;
+            return -N_ERR_NOT_READY;
         }
         if (current_task->killed) {
             irq_restore(fl);
-            return -EINTR;
+            return -N_ERR_STOPPED;
         }
         wq_wait(&cons_wq);
         irq_restore(fl);

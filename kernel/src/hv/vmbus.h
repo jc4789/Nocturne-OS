@@ -97,13 +97,13 @@ void vmbus_set_socket_hook(void (*hook)(struct vmbus_channel *ch));
 uint32_t vmbus_gpadl_create(struct vmbus_channel *ch, uint64_t pa, uint32_t pages);
 /* False leaves the memory shared: it must not be freed or reused. */
 bool vmbus_gpadl_teardown(struct vmbus_channel *ch, uint32_t gpadl);
-/* Send an in-band packet. 0, or -EAGAIN when the ring is full. */
+/* Send an in-band packet. 0, or -N_ERR_NOT_READY when the ring is full. */
 int vmbus_send(struct vmbus_channel *ch, uint16_t type, uint16_t flags, const void *data, uint32_t len,
                uint64_t trans_id);
 /* Send a packet made of a raw header plus data (for GPA-direct packets). */
 int vmbus_send_raw(struct vmbus_channel *ch, const void *hdr, uint32_t hdr_len, const void *data, uint32_t len);
 /* Copy the next received packet (descriptor and all) into buf. Returns its length, 0 if the ring
-   is empty, or -E2BIG (the packet is dropped) if it does not fit. */
+   is empty, or -N_ERR_TOO_LARGE (the packet is dropped) if it does not fit. */
 int vmbus_recv(struct vmbus_channel *ch, void *buf, uint32_t len);
 /* Readiness only; both are safe with interrupts disabled. packet_len includes
    the packet descriptor, but excludes the ring's trailing bookkeeping word. */

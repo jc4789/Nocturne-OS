@@ -1,7 +1,112 @@
 /* libm on top of SSE2 and the x87 transcendental instructions. */
 #include <math.h>
+#include <fenv.h>
 #include <stdint.h>
 #include <stdbool.h>
+
+/* ---- floating-point environment (MXCSR and the x87 words together) ---- */
+struct x87_env { /* fnstenv/fldenv 32-bit protected-mode layout, 28 bytes */
+    unsigned short cw, r0, sw, r1, tw, r2;
+    unsigned ip;
+    unsigned short cs, op;
+    unsigned dp;
+    unsigned short ds, r3;
+};
+static unsigned get_mxcsr(void) {
+    unsigned m;
+    __asm__ volatile("stmxcsr %0" : "=m"(m));
+    return m;
+}
+static void set_mxcsr(unsigned m) { __asm__ volatile("ldmxcsr %0" : : "m"(m)); }
+static void get_x87(struct x87_env *e) { __asm__ volatile("fnstenv %0\n\tfldenv %0" : "=m"(*e)); }
+static void set_x87(const struct x87_env *e) { __asm__ volatile("fldenv %0" : : "m"(*e)); }
+
+int feclearexcept(int excepts) {
+    excepts &= FE_ALL_EXCEPT;
+    struct x87_env e;
+    get_x87(&e);
+    e.sw &= ~excepts;
+    set_x87(&e);
+    set_mxcsr(get_mxcsr() & ~(unsigned)excepts);
+    return 0;
+}
+int fetestexcept(int excepts) {
+    unsigned short sw;
+    __asm__ volatile("fnstsw %0" : "=am"(sw));
+    return (int)((sw | get_mxcsr()) & (unsigned)excepts & FE_ALL_EXCEPT);
+}
+int fegetexceptflag(fexcept_t *flag, int excepts) {
+    *flag = (fexcept_t)fetestexcept(excepts);
+    return 0;
+}
+int fesetexceptflag(const fexcept_t *flag, int excepts) {
+    excepts &= FE_ALL_EXCEPT;
+    struct x87_env e;
+    get_x87(&e);
+    e.sw = (unsigned short)((e.sw & ~excepts) | (*flag & excepts));
+    set_x87(&e);
+    set_mxcsr((get_mxcsr() & ~(unsigned)excepts) | (*flag & (unsigned)excepts));
+    return 0;
+}
+int feraiseexcept(int excepts) {
+    /* Records the flags; Nocturne programs run with exceptions masked. */
+    set_mxcsr(get_mxcsr() | (unsigned)(excepts & FE_ALL_EXCEPT));
+    return 0;
+}
+int fegetround(void) {
+    unsigned short cw;
+    __asm__ volatile("fnstcw %0" : "=m"(cw));
+    return cw & 0xc00;
+}
+int fesetround(int round) {
+    if (round & ~0xc00) return -1;
+    unsigned short cw;
+    __asm__ volatile("fnstcw %0" : "=m"(cw));
+    cw = (unsigned short)((cw & ~0xc00) | round);
+    __asm__ volatile("fldcw %0" : : "m"(cw));
+    set_mxcsr((get_mxcsr() & ~0x6000u) | ((unsigned)round << 3));
+    return 0;
+}
+int fegetenv(fenv_t *env) {
+    struct x87_env e;
+    get_x87(&e);
+    env->x87_control = e.cw;
+    env->x87_status = e.sw;
+    env->mxcsr = get_mxcsr();
+    return 0;
+}
+int fesetenv(const fenv_t *env) {
+    struct x87_env e;
+    get_x87(&e);
+    if (env == FE_DFL_ENV) {
+        e.cw = 0x037f; /* all masked, round to nearest, extended precision */
+        e.sw &= ~FE_ALL_EXCEPT;
+        set_x87(&e);
+        set_mxcsr(0x1f80);
+        return 0;
+    }
+    e.cw = env->x87_control;
+    e.sw = (unsigned short)((e.sw & ~FE_ALL_EXCEPT) | (env->x87_status & FE_ALL_EXCEPT));
+    set_x87(&e);
+    set_mxcsr(env->mxcsr);
+    return 0;
+}
+int feholdexcept(fenv_t *env) {
+    fegetenv(env);
+    struct x87_env e;
+    get_x87(&e);
+    e.cw |= FE_ALL_EXCEPT;
+    e.sw &= ~FE_ALL_EXCEPT;
+    set_x87(&e);
+    set_mxcsr((env->mxcsr | (FE_ALL_EXCEPT << 7)) & ~(unsigned)FE_ALL_EXCEPT);
+    return 0;
+}
+int feupdateenv(const fenv_t *env) {
+    int raised = fetestexcept(FE_ALL_EXCEPT);
+    fesetenv(env);
+    if (raised) feraiseexcept(raised);
+    return 0;
+}
 
 double fabs(double x) {
     union { double d; uint64_t u; } v = {x};
@@ -185,6 +290,17 @@ float sinf(float x) { return (float)sin(x); }
 float cosf(float x) { return (float)cos(x); }
 float fabsf(float x) { return (float)fabs(x); }
 float floorf(float x) { return (float)floor(x); }
+float hypotf(float x, float y) { return (float)hypot(x, y); }
+float sinhf(float x) { return (float)sinh(x); }
+float coshf(float x) { return (float)cosh(x); }
+float tanhf(float x) { return (float)tanh(x); }
+float asinhf(float x) { return (float)asinh(x); }
+float acoshf(float x) { return (float)acosh(x); }
+float atanhf(float x) { return (float)atanh(x); }
+float log10f(float x) { return (float)log10(x); }
+float cbrtf(float x) { return (float)cbrt(x); }
+float expm1f(float x) { return (float)expm1(x); }
+float log1pf(float x) { return (float)log1p(x); }
 
 /* ---- exponent handling (needed by compilers and printf-style code) ---- */
 long double ldexpl(long double x, int e) {
@@ -279,6 +395,58 @@ long lrint(double x) {
     __asm__("cvtsd2si %1, %0" : "=r"(r) : "x"(x));
     return r;
 }
+long lrintf(float x) {
+    long r;
+    __asm__("cvtss2si %1, %0" : "=r"(r) : "x"(x));
+    return r;
+}
+long long llrint(double x) { return lrint(x); }
+long long llrintf(float x) { return lrintf(x); }
+/* rint rounds as nearbyint does; Nocturne does not track the inexact flag. */
+double rint(double x) { return nearbyint(x); }
+float rintf(float x) { return (float)nearbyint((double)x); }
+long lroundf(float x) { return lround((double)x); }
+long long llround(double x) { return lround(x); }
+long long llroundf(float x) { return lround((double)x); }
+/* Halfway cases go to the even neighbour, whatever the rounding mode. */
+double roundeven(double x) {
+    double t = trunc(x), d = fabs(x - t);
+    if (d < 0.5) return t;
+    if (d > 0.5) return t + copysign(1.0, x);
+    return fmod(t, 2.0) == 0 ? t : t + copysign(1.0, x);
+}
+float roundevenf(float x) { return (float)roundeven((double)x); }
+float copysignf(float x, float y) { return __builtin_copysignf(x, y); }
+float frexpf(float x, int *e) { return (float)frexp((double)x, e); }
+float log2f(float x) { return (float)log2((double)x); }
+float exp2f(float x) { return (float)exp2((double)x); }
+double nan(const char *tag) { (void)tag; return __builtin_nan(""); }
+float nanf(const char *tag) { (void)tag; return __builtin_nanf(""); }
+
+/* x*y+z with one rounding of the sum: the product is split exactly
+ * (Veltkamp/Dekker) and the low parts are added after the high sum's error
+ * is recovered (Knuth TwoSum). Overflow and non-finite inputs fall back to
+ * the plain expression, which gives the same IEEE result there. */
+static void two_product(double a, double b, double *p, double *e) {
+    const double split = 134217729.0; /* 2^27 + 1 */
+    double ca = split * a, cb = split * b;
+    double ah = ca - (ca - a), al = a - ah;
+    double bh = cb - (cb - b), bl = b - bh;
+    *p = a * b;
+    *e = ((ah * bh - *p) + ah * bl + al * bh) + al * bl;
+}
+double fma(double x, double y, double z) {
+    if (!isfinite(x) || !isfinite(y) || !isfinite(z) || x == 0 || y == 0) return x * y + z;
+    if (fabs(x) > 0x1p500 || fabs(y) > 0x1p500 || fabs(x * y) < 0x1p-900) return x * y + z;
+    double p, e;
+    two_product(x, y, &p, &e);
+    double s = p + z;
+    double bp = s - p, err = (p - (s - bp)) + (z - bp);
+    return s + (err + e);
+}
+/* The float product is exact in double, so one double addition suffices
+ * apart from rare double-rounding ties. */
+float fmaf(float x, float y, float z) { return (float)((double)x * (double)y + (double)z); }
 
 double expm1(double x) {
     if (x == 0 || isnan(x)) return x;

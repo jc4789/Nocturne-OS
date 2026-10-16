@@ -341,6 +341,8 @@
         queueMicrotask:fn=>{if(typeof fn!=='function')throw new TypeError('Callback required');Promise.resolve().then(fn).catch(report);},
         console:Object.fromEntries(['log','warn','error','info','debug'].map(k=>[k,(...args)=>host.send(7,0,{message:args.map(String).join(' '),filename:address})])),
         addEventListener:target.addEventListener.bind(target),removeEventListener:target.removeEventListener.bind(target),dispatchEvent:target.dispatchEvent.bind(target)});
+    // No DOM image sources here; context loss events are timer tasks.
+    offscreenCanvasBridge.bindWebGL(undefined,fn=>timer(fn,0,[],false));
     /* @include js_wasm.js */
     // The global object is a WorkerGlobalScope: its interface objects are not
     // constructible, and the chain runs through EventTarget.prototype. The

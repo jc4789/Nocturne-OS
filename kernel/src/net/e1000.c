@@ -144,7 +144,7 @@ static size_t e1000_poll_rx(void (*input)(const void *, size_t)) {
 }
 
 static int e1000_send(const void *frame, size_t len) {
-    if (len > BUFSZ) return -EINVAL;
+    if (len > BUFSZ) return -N_ERR_INVALID;
     uint64_t flags = irq_save();
     while (tx_clean != tx_cur && (tx[tx_clean].status & DESC_DD))
         tx_clean = (tx_clean + 1) % NTX;
@@ -154,7 +154,7 @@ static int e1000_send(const void *frame, size_t len) {
        distinguish full from empty even before DMA has completed any send. */
     if (next == tx_clean || !(d->status & DESC_DD)) {
         irq_restore(flags);
-        return -EAGAIN; /* local backpressure, not a packet lost on the wire */
+        return -N_ERR_NOT_READY; /* local backpressure, not a packet lost on the wire */
     }
     memcpy(txbuf[tx_cur], frame, len);
     d->len = (uint16_t)len;

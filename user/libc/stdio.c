@@ -265,6 +265,7 @@ int puts(const char *s) {
 }
 int feof(FILE *f) { return f->eof; }
 int ferror(FILE *f) { return f->err; }
+void clearerr(FILE *f) { f->eof = f->err = false; }
 int fileno(FILE *f) { return f->fd; }
 
 int fseek(FILE *f, long off, int whence) {

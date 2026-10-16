@@ -58,11 +58,11 @@ bool user_ok(const void *p, size_t n) { return user_access(p, n, false); }
 bool user_ok_w(void *p, size_t n) { return user_access(p, n, true); }
 
 int user_str(char *dst, const char *src, size_t max) {
-    if (!max) return -ENAMETOOLONG;
+    if (!max) return -N_ERR_NAME_TOO_LONG;
     size_t i = 0;
     while (i < max) {
         uint64_t address = (uint64_t)src + i;
-        if (address < (uint64_t)src || !user_ok((const void *)address, 1)) return -EFAULT;
+        if (address < (uint64_t)src || !user_ok((const void *)address, 1)) return -N_ERR_BAD_ADDRESS;
         size_t end = i + MIN(max - i, PAGE_SIZE - (address & (PAGE_SIZE - 1)));
         /* Permission is page-granular. Do not touch the next page until its
            PTE has been checked, even if the string terminates at this edge. */
@@ -73,7 +73,7 @@ int user_str(char *dst, const char *src, size_t max) {
         }
     }
     dst[max - 1] = 0;
-    return -ENAMETOOLONG;
+    return -N_ERR_NAME_TOO_LONG;
 }
 
 static int user_path(const char *upath, char *out) {
@@ -118,7 +118,7 @@ static int allocfd(struct file *f) {
 
 static int64_t sys_read(int fd, void *buf, size_t n) {
     struct file *f = getfd_ref(fd);
-    if (!f) return -EBADF;
+    if (!f) return -N_ERR_NO_HANDLE;
     int64_t result = vfs_read_user(f, buf, n);
     vfs_close(f);
     return result;
@@ -126,7 +126,7 @@ static int64_t sys_read(int fd, void *buf, size_t n) {
 
 static int64_t sys_write(int fd, const void *buf, size_t n) {
     struct file *f = getfd_ref(fd);
-    if (!f) return -EBADF;
+    if (!f) return -N_ERR_NO_HANDLE;
     int64_t result = vfs_write_user(f, buf, n);
     vfs_close(f);
     return result;
@@ -147,7 +147,7 @@ static int64_t sys_open(const char *upath, int flags) {
 static int64_t sys_close(int fd) {
     uint64_t flags = irq_save();
     struct file *f = getfd(fd);
-    if (!f) { irq_restore(flags); return -EBADF; }
+    if (!f) { irq_restore(flags); return -N_ERR_NO_HANDLE; }
     task_process()->fds[fd] = NULL;
     vfs_poll_notify(f->vn);
     if((size_t)fd<task_process()->fd_hint)task_process()->fd_hint=(size_t)fd;
@@ -161,14 +161,14 @@ static int64_t sys_stat(const char *upath, struct kstat *st) {
     char path[PATH_MAX_LEN];
     int r = user_path(upath, path);
     if (r < 0) return r;
-    if (!user_ok_w(st, sizeof *st)) return -EFAULT;
+    if (!user_ok_w(st, sizeof *st)) return -N_ERR_BAD_ADDRESS;
     return vfs_stat(path, st);
 }
 
 static int64_t sys_fstat(int fd, struct kstat *st) {
     struct file *f = getfd_ref(fd);
-    if (!f) return -EBADF;
-    if (!user_ok_w(st, sizeof *st)) { vfs_close(f); return -EFAULT; }
+    if (!f) return -N_ERR_NO_HANDLE;
+    if (!user_ok_w(st, sizeof *st)) { vfs_close(f); return -N_ERR_BAD_ADDRESS; }
     uint64_t flags = irq_save();
     st->type = f->vn->tty ? VT_CHAR : f->vn->type;
     st->size = f->vn->size;
@@ -181,8 +181,8 @@ static int64_t sys_fstat(int fd, struct kstat *st) {
 
 static int64_t sys_readdir(int fd, uint64_t idx, struct dirent *d) {
     struct file *f = getfd_ref(fd);
-    if (!f) return -EBADF;
-    if (!user_ok_w(d, sizeof *d)) { vfs_close(f); return -EFAULT; }
+    if (!f) return -N_ERR_NO_HANDLE;
+    if (!user_ok_w(d, sizeof *d)) { vfs_close(f); return -N_ERR_BAD_ADDRESS; }
     int64_t result = vfs_readdir(f, idx, d);
     vfs_close(f);
     return result;
@@ -207,8 +207,8 @@ static int64_t sys_rename(const char *uold, const char *unew) {
     r = user_path(unew, b);
     if (r < 0) return r;
     struct kstat st;
-    if (vfs_stat(a, &st) < 0) return -ENOENT;
-    if (st.type != VT_FILE) return -EISDIR;
+    if (vfs_stat(a, &st) < 0) return -N_ERR_NOT_FOUND;
+    if (st.type != VT_FILE) return -N_ERR_IS_FOLDER;
     uint8_t *data;
     uint64_t size;
     r = vfs_read_whole(a, &data, &size);
@@ -224,8 +224,8 @@ static int64_t sys_chdir(const char *upath) {
     int r = user_path(upath, path);
     if (r < 0) return r;
     struct kstat st;
-    if (vfs_stat(path, &st) < 0) return -ENOENT;
-    if (st.type != VT_DIR) return -ENOTDIR;
+    if (vfs_stat(path, &st) < 0) return -N_ERR_NOT_FOUND;
+    if (st.type != VT_DIR) return -N_ERR_NOT_FOLDER;
     uint64_t flags = irq_save();
     strlcpy(task_process()->cwd, path, sizeof task_process()->cwd);
     irq_restore(flags);
@@ -238,8 +238,8 @@ static int64_t sys_getcwd(char *buf, size_t n) {
     memcpy(cwd, task_process()->cwd, sizeof cwd);
     irq_restore(flags);
     size_t l = strlen(cwd) + 1;
-    if (n < l) return -ERANGE;
-    if (!user_ok_w(buf, l)) return -EFAULT;
+    if (n < l) return -N_ERR_TOO_LARGE;
+    if (!user_ok_w(buf, l)) return -N_ERR_BAD_ADDRESS;
     memcpy(buf, cwd, l);
     return l;
 }
@@ -254,7 +254,7 @@ static int64_t sys_spawn(const char *upath, char **uargv, const int *ufdmap, int
     struct file *fds[3] = {NULL, NULL, NULL};
     if (uargv) {
         while (argc < 31) {
-            if (!user_ok(&uargv[argc], 8)) { ret = -EFAULT; goto out; }
+            if (!user_ok(&uargv[argc], 8)) { ret = -N_ERR_BAD_ADDRESS; goto out; }
             char *ua = uargv[argc];
             if (!ua) break;
             char tmp[512];
@@ -267,7 +267,7 @@ static int64_t sys_spawn(const char *upath, char **uargv, const int *ufdmap, int
     int sources[3] = {0, 1, 2};
     for (int i = 0; i < 3; i++) {
         if (ufdmap) {
-            if (!user_ok(&ufdmap[i], 4)) { ret = -EFAULT; goto out; }
+            if (!user_ok(&ufdmap[i], 4)) { ret = -N_ERR_BAD_ADDRESS; goto out; }
             sources[i] = ufdmap[i];
         }
     }
@@ -287,7 +287,7 @@ out:
 }
 
 static int64_t sys_waitpid(int pid, int *ustatus, int flags) {
-    if (ustatus && !user_ok_w(ustatus, 4)) return -EFAULT;
+    if (ustatus && !user_ok_w(ustatus, 4)) return -N_ERR_BAD_ADDRESS;
     int st = 0;
     int r = task_wait(pid, &st, flags & 1);
     if (r > 0 && ustatus) *ustatus = st;
@@ -323,7 +323,7 @@ static int64_t sys_sbrk_locked(int64_t inc) {
     uint64_t old = t->brk;
     if (inc == 0) return old;
     uint64_t nb = t->brk + inc;
-    if (nb < t->brk_base || nb >= USER_MMAP_BASE) return -ENOMEM;
+    if (nb < t->brk_base || nb >= USER_MMAP_BASE) return -N_ERR_NO_MEMORY;
     if (inc > 0) {
         uint64_t start = ALIGN_UP(old, PAGE_SIZE);
         uint64_t end = ALIGN_UP(nb, PAGE_SIZE);
@@ -334,7 +334,7 @@ static int64_t sys_sbrk_locked(int64_t inc) {
                    tail of a request that can be much larger than physical RAM. */
                 vmm_user_free(t->pml4, start, page - start);
                 report_heap_exhaustion(t, inc);
-                return -ENOMEM;
+                return -N_ERR_NO_MEMORY;
             }
         }
     } else {
@@ -349,13 +349,13 @@ static int64_t sys_sbrk(int64_t inc) {
 }
 
 static int64_t sys_pipe(int *ufds) {
-    if (!user_ok_w(ufds, 8)) return -EFAULT;
+    if (!user_ok_w(ufds, 8)) return -N_ERR_BAD_ADDRESS;
     struct file *r, *w;
     int e = pipe_create(&r, &w);
     if (e < 0) return e;
     uint64_t flags = irq_save();
     int a=allocfd_locked(r),b=a<0?a:allocfd_locked(w);
-    int output_error=b<0?b:!user_ok_w(ufds,8)?-EFAULT:0;
+    int output_error=b<0?b:!user_ok_w(ufds,8)?-N_ERR_BAD_ADDRESS:0;
     if (output_error) {
         if(b>=0)task_process()->fds[b]=NULL;
         if(a>=0){task_process()->fds[a]=NULL;task_process()->fd_hint=(size_t)a;}
@@ -373,10 +373,10 @@ static int64_t sys_pipe(int *ufds) {
 /* Snapshot the explicit native key length once; never rescan mutable user
  * strings in the registry, and never constrain identity to a guessed path cap. */
 static int64_t sys_channel_named(const char *ukey,size_t length,bool listen) {
-    if(!length || length>SIZE_MAX-sizeof(struct file))return -EINVAL;
-    char *key=kmalloc(length);if(!key)return -ENOMEM;
+    if(!length || length>SIZE_MAX-sizeof(struct file))return -N_ERR_INVALID;
+    char *key=kmalloc(length);if(!key)return -N_ERR_NO_MEMORY;
     struct file *file=NULL;uint64_t flags=irq_save();
-    if(!user_ok(ukey,length)){irq_restore(flags);kfree(key);return -EFAULT;}
+    if(!user_ok(ukey,length)){irq_restore(flags);kfree(key);return -N_ERR_BAD_ADDRESS;}
     memcpy(key,ukey,length);
     int slot=task_fd_find(task_process());
     int result=slot>=0?(listen?channel_listen(key,length,&file):channel_connect(key,length,&file)):slot;
@@ -388,7 +388,7 @@ static int64_t sys_channel_named(const char *ukey,size_t length,bool listen) {
     return result;
 }
 static int64_t sys_channel_accept(int fd) {
-    struct file *listener=getfd_ref(fd);if(!listener)return -EBADF;
+    struct file *listener=getfd_ref(fd);if(!listener)return -N_ERR_NO_HANDLE;
     struct file *server=NULL;uint64_t flags=irq_save();int slot=task_fd_find(task_process());
     int result=slot>=0?channel_accept(listener,&server):slot;
     if(!result)result=allocfd_locked(server);
@@ -400,7 +400,7 @@ static int64_t sys_channel_accept(int fd) {
 static int64_t sys_dup2(int oldfd, int newfd) {
     uint64_t flags = irq_save();
     struct file *f = getfd(oldfd);
-    if (!f || newfd < 0) { irq_restore(flags); return -EBADF; }
+    if (!f || newfd < 0) { irq_restore(flags); return -N_ERR_NO_HANDLE; }
     if (oldfd == newfd) { irq_restore(flags); return newfd; }
     int error=task_fd_reserve(task_process(),(size_t)newfd+1);
     if(error){irq_restore(flags);return error;}
@@ -414,19 +414,19 @@ static int64_t sys_dup2(int oldfd, int newfd) {
 
 static int64_t sys_dup(int oldfd) {
     struct file *f = getfd_ref(oldfd);
-    if (!f) return -EBADF;
+    if (!f) return -N_ERR_NO_HANDLE;
     int fd = allocfd(f);
     if (fd < 0) vfs_close(f);
     return fd;
 }
 
 static int64_t sys_poll(struct n_pollfd *ufds, int n, int timeout) {
-    if (n < 0 || (size_t)n>SIZE_MAX/sizeof(struct n_pollfd)) return -EINVAL;
+    if (n < 0 || (size_t)n>SIZE_MAX/sizeof(struct n_pollfd)) return -N_ERR_INVALID;
     size_t bytes=(size_t)n*sizeof(struct n_pollfd);
     struct n_pollfd local[64],*fds=n<=64?local:kmalloc(bytes);
-    if(!fds)return -ENOMEM;
+    if(!fds)return -N_ERR_NO_MEMORY;
     uint64_t snapshot_flags=irq_save();
-    if(!user_ok_w(ufds,bytes)){irq_restore(snapshot_flags);if(fds!=local)kfree(fds);return -EFAULT;}
+    if(!user_ok_w(ufds,bytes)){irq_restore(snapshot_flags);if(fds!=local)kfree(fds);return -N_ERR_BAD_ADDRESS;}
     memcpy(fds,ufds,bytes);irq_restore(snapshot_flags);
     uint64_t deadline = timeout >= 0 ? uptime_ms() + timeout : 0;
     struct poll_wait wait = {0};
@@ -456,14 +456,14 @@ static int64_t sys_poll(struct n_pollfd *ufds, int n, int timeout) {
             result=ready ? ready : wait.error ? wait.error : 0;
             /* A sibling may have unmapped the original array while this
              * syscall slept/scanned; no kernel copy targets stale user pages. */
-            if(!user_ok_w(ufds,bytes))result=-EFAULT;
+            if(!user_ok_w(ufds,bytes))result=-N_ERR_BAD_ADDRESS;
             else memcpy(ufds,fds,bytes);
             irq_restore(fl);
             break;
         }
         if (current_task->killed) {
             irq_restore(fl);
-            result=-EINTR;break;
+            result=-N_ERR_STOPPED;break;
         }
         /* Closing/enqueuing during a released scan quantum cannot be lost
          * between readiness and wait enrollment. Retry only for a new event. */
@@ -483,7 +483,7 @@ static int64_t sys_poll(struct n_pollfd *ufds, int n, int timeout) {
 }
 
 static int64_t sys_proclist(struct n_procinfo *out, int max) {
-    if (max < 0 || !user_ok_w(out, (size_t)max * sizeof *out)) return -EFAULT;
+    if (max < 0 || !user_ok_w(out, (size_t)max * sizeof *out)) return -N_ERR_BAD_ADDRESS;
     uint64_t flags = irq_save();
     int n = 0;
     for (struct task *t = task_list; t && n < max; t = t->all_next) {
@@ -504,7 +504,7 @@ static int64_t sys_proclist(struct n_procinfo *out, int max) {
 }
 
 static int64_t sys_sysinfo(struct n_sysinfo *si) {
-    if (!user_ok_w(si, sizeof *si)) return -EFAULT;
+    if (!user_ok_w(si, sizeof *si)) return -N_ERR_BAD_ADDRESS;
     memset(si, 0, sizeof *si);
     si->total_mem = pmm_total_pages() * PAGE_SIZE;
     si->free_mem = pmm_free_pages() * PAGE_SIZE;
@@ -526,15 +526,15 @@ static int64_t sys_sysinfo(struct n_sysinfo *si) {
 static int64_t sys_fcntl(int fd, int cmd, int arg) {
     if (cmd == F_NLOCK || cmd == F_NUNLOCK || cmd == F_NTRYLOCK) {
         struct file *owned = getfd_ref(fd);
-        if (!owned) return -EBADF;
+        if (!owned) return -N_ERR_NO_HANDLE;
         int result = cmd == F_NTRYLOCK ? vfs_try_lease(owned) : vfs_lease(owned, cmd == F_NLOCK);
         vfs_close(owned);
         return result;
     }
     uint64_t flags = irq_save();
     struct file *f = getfd(fd);
-    int64_t result = -EINVAL;
-    if (!f) result = -EBADF;
+    int64_t result = -N_ERR_INVALID;
+    if (!f) result = -N_ERR_NO_HANDLE;
     else if (cmd == F_GETFL) result = f->flags;
     else if (cmd == F_SETTTY) {
         f->vn->tty = arg != 0;
@@ -612,23 +612,23 @@ static void shared_release(struct vnode *v) {
 static struct vnode_ops shared_ops={.release=shared_release};
 /* A file over a new shared object of `bytes` (page aligned). */
 static int64_t shared_object(size_t bytes,bool demand,int flags,struct file **out) {
-    if(!bytes || bytes>SIZE_MAX-(PAGE_SIZE-1))return -EINVAL;
+    if(!bytes || bytes>SIZE_MAX-(PAGE_SIZE-1))return -N_ERR_INVALID;
     bytes=ALIGN_UP(bytes,PAGE_SIZE);size_t count=bytes/PAGE_SIZE;
     size_t slots=demand?(count+SHARED_LEAF-1)/SHARED_LEAF:count;
-    if(slots>(SIZE_MAX-sizeof(struct shared_pages))/sizeof(uint64_t))return -EINVAL;
-    if(!demand && count>pmm_free_pages())return -ENOMEM;
-    struct vnode *v=kzalloc(sizeof *v);if(!v)return -ENOMEM;
+    if(slots>(SIZE_MAX-sizeof(struct shared_pages))/sizeof(uint64_t))return -N_ERR_INVALID;
+    if(!demand && count>pmm_free_pages())return -N_ERR_NO_MEMORY;
+    struct vnode *v=kzalloc(sizeof *v);if(!v)return -N_ERR_NO_MEMORY;
     struct shared_pages *p=kzalloc(sizeof *p+slots*sizeof(uint64_t));
-    if(!p){kfree(v);return -ENOMEM;}
+    if(!p){kfree(v);return -N_ERR_NO_MEMORY;}
     p->demand=demand;
     v->type=VT_SHARED;v->size=bytes;v->unlinked=true;v->ops=&shared_ops;v->priv=p;
     if(demand)p->count=count;
     else for(;p->count<count;p->count++){
         p->pages[p->count]=pmm_alloc_zeroed();
-        if(!p->pages[p->count]){shared_release(v);return -ENOMEM;}
+        if(!p->pages[p->count]){shared_release(v);return -N_ERR_NO_MEMORY;}
     }
     struct file *f=vfs_open_vnode(v,flags);
-    if(!f){shared_release(v);return -ENOMEM;}
+    if(!f){shared_release(v);return -N_ERR_NO_MEMORY;}
     *out=f;return 0;
 }
 static int64_t sys_shared_create(size_t bytes,bool demand) {
@@ -695,11 +695,11 @@ int shared_program_segment(struct task *t,const char *path,uint64_t va,const uin
         }
     }
     struct shared_mapping *m=kzalloc(sizeof *m);
-    if(!m){vfs_close(f);return -ENOMEM;}
+    if(!m){vfs_close(f);return -N_ERR_NO_MEMORY;}
     struct shared_pages *p=f->vn->priv;
     uint64_t flags=PTE_U|PTE_SHARED|PTE_SHARED_RO|(exec?0:pte_nx);size_t mapped=0;
     for(;mapped<p->count;mapped++)if(!vmm_map_page(t->pml4,start+mapped*PAGE_SIZE,p->pages[mapped],flags))break;
-    if(mapped!=p->count){vmm_user_free(t->pml4,start,mapped*PAGE_SIZE);vfs_close(f);kfree(m);return -ENOMEM;}
+    if(mapped!=p->count){vmm_user_free(t->pml4,start,mapped*PAGE_SIZE);vfs_close(f);kfree(m);return -N_ERR_NO_MEMORY;}
     irq=irq_save();*m=(struct shared_mapping){.next=t->shared_mappings,.file=f,.va=start,.flags=flags,.bytes=end-start};
     t->shared_mappings=m;irq_restore(irq);
     return 0;
@@ -727,24 +727,24 @@ bool shared_demand_fault(uint64_t addr,bool write) {
     return ok;
 }
 static int64_t sys_shared_map(int pid,int fd,size_t bytes,int prot) {
-    if(!bytes || bytes>SIZE_MAX-(PAGE_SIZE-1) || (prot&~N_PROT_WRITE))return -EINVAL;
+    if(!bytes || bytes>SIZE_MAX-(PAGE_SIZE-1) || (prot&~N_PROT_WRITE))return -N_ERR_INVALID;
     struct task *owner=task_process();struct file *f=NULL;
     uint64_t irq=irq_save();struct task *peer=pid?task_find(pid):owner;
     if(peer && !peer->is_thread && peer->is_user && !peer->exiting &&
        (peer==owner || peer->parent==owner || owner->parent==peer) &&
        fd>=0 && (size_t)fd<peer->fd_capacity && peer->fds[fd] &&
        peer->fds[fd]->vn->type==VT_SHARED)f=vfs_dup(peer->fds[fd]);
-    irq_restore(irq);if(!f)return -EBADF;
+    irq_restore(irq);if(!f)return -N_ERR_NO_HANDLE;
     bytes=ALIGN_UP(bytes,PAGE_SIZE);
-    if(bytes!=f->vn->size){vfs_close(f);return -EINVAL;}
+    if(bytes!=f->vn->size){vfs_close(f);return -N_ERR_INVALID;}
     struct shared_mapping *m=kzalloc(sizeof *m);
-    if(!m){vfs_close(f);return -ENOMEM;}
+    if(!m){vfs_close(f);return -N_ERR_NO_MEMORY;}
     /* Reserve the VA range before publishing any PTE. No blocking handoff is
        made in this page loop, but the short BSP guard also keeps future thread
        mmap/clock/stack reservations from choosing this partially mapped span. */
     irq=irq_save();uint64_t va=owner->mmap_next;
     if(va>=USER_STACK_TOP-USER_STACK_MAX || bytes+PAGE_SIZE<bytes ||
-       bytes+PAGE_SIZE>USER_STACK_TOP-USER_STACK_MAX-va){irq_restore(irq);vfs_close(f);kfree(m);return -ENOMEM;}
+       bytes+PAGE_SIZE>USER_STACK_TOP-USER_STACK_MAX-va){irq_restore(irq);vfs_close(f);kfree(m);return -N_ERR_NO_MEMORY;}
     uint64_t reserved_end=va+bytes+PAGE_SIZE;owner->mmap_next=reserved_end;irq_restore(irq);
     struct shared_pages *p=f->vn->priv;size_t mapped=0;
     uint64_t flags=PTE_U|PTE_SHARED|pte_nx|(prot&N_PROT_WRITE?PTE_W:PTE_SHARED_RO);
@@ -755,7 +755,7 @@ static int64_t sys_shared_map(int pid,int fd,size_t bytes,int prot) {
     }
     if(mapped!=p->count){vmm_user_free(owner->pml4,va,mapped*PAGE_SIZE);
         irq=irq_save();if(owner->mmap_next==reserved_end)owner->mmap_next=va;irq_restore(irq);
-        vfs_close(f);kfree(m);return -ENOMEM;
+        vfs_close(f);kfree(m);return -N_ERR_NO_MEMORY;
     }
     irq=irq_save();*m=(struct shared_mapping){.next=owner->shared_mappings,.file=f,.va=va,.flags=flags,.bytes=bytes};
     owner->shared_mappings=m;irq_restore(irq);return (int64_t)va;
@@ -773,10 +773,10 @@ static struct task *shared_peer(int pid) {
 }
 static int64_t sys_shared_send(int fd) {
     struct file *f=getfd_ref(fd);
-    if(!f)return -EBADF;
-    if(f->vn->type!=VT_SHARED){vfs_close(f);return -EINVAL;}
+    if(!f)return -N_ERR_NO_HANDLE;
+    if(f->vn->type!=VT_SHARED){vfs_close(f);return -N_ERR_INVALID;}
     struct shared_ticket *t=kzalloc(sizeof *t);
-    if(!t){vfs_close(f);return -ENOMEM;}
+    if(!t){vfs_close(f);return -N_ERR_NO_MEMORY;}
     struct task *owner=task_process();
     uint64_t irq=irq_save();
     t->id=++owner->shared_ticket_serial;t->file=f;t->next=owner->shared_tickets;owner->shared_tickets=t;
@@ -788,7 +788,7 @@ static int64_t sys_shared_receive(int pid,uint64_t id) {
     uint64_t irq=irq_save();struct task *peer=shared_peer(pid);
     if(peer)for(struct shared_ticket *t=peer->shared_tickets;t;t=t->next)if(t->id==id){f=vfs_dup(t->file);break;}
     irq_restore(irq);
-    if(!f)return -EBADF;
+    if(!f)return -N_ERR_NO_HANDLE;
     int fd=allocfd(f);
     if(fd<0){vfs_close(f);return fd;}
     struct shared_ticket *claimed=NULL;
@@ -812,21 +812,21 @@ void sys_shared_cleanup(struct task *owner) {
 }
 static int64_t sys_address_watch_queue(void) {
     struct vnode *v=address_watch_queue_new();
-    if(!v)return -ENOMEM;
+    if(!v)return -N_ERR_NO_MEMORY;
     struct file *f=vfs_open_vnode(v,O_RDONLY);
-    if(!f){v->ops->release(v);return -ENOMEM;}
+    if(!f){v->ops->release(v);return -N_ERR_NO_MEMORY;}
     int fd=allocfd(f);if(fd<0)vfs_close(f);return fd;
 }
 static int64_t sys_address_watch(int fd,uint64_t address,uint32_t expected,uint64_t token) {
-    if((address&3) || !user_ok((void *)address,sizeof(uint32_t)))return -EFAULT;
+    if((address&3) || !user_ok((void *)address,sizeof(uint32_t)))return -N_ERR_BAD_ADDRESS;
     struct file *f=getfd_ref(fd);
-    if(!f)return -EBADF;
+    if(!f)return -N_ERR_NO_HANDLE;
     int64_t r=address_watch_add(f->vn,(volatile uint32_t *)address,expected,token);
     vfs_close(f);return r;
 }
 static int64_t sys_address_unwatch(int fd,uint64_t token) {
     struct file *f=getfd_ref(fd);
-    if(!f)return -EBADF;
+    if(!f)return -N_ERR_NO_HANDLE;
     int64_t r=address_watch_remove(f->vn,token);
     vfs_close(f);return r;
 }
@@ -898,33 +898,33 @@ uint64_t mmap_reserve(struct task *owner, uint64_t len) {
 /* anonymous memory in its own region above the heap (window buffers live there too) */
 static int64_t sys_mmap_locked(size_t len, int prot) {
     struct task *t = task_process();
-    if (len == 0 || len > (1ULL << 32)) return -EINVAL;
+    if (len == 0 || len > (1ULL << 32)) return -N_ERR_INVALID;
     len = ALIGN_UP(len, PAGE_SIZE);
     int vp = (prot & N_PROT_WRITE ? VM_W : 0) | (prot & N_PROT_EXEC ? VM_X : 0);
     uint64_t va = mmap_reserve(t, len);
-    if (!va) return -ENOMEM;
+    if (!va) return -N_ERR_NO_MEMORY;
     if (vmm_user_alloc(t->pml4, va, len, vp) < 0) {
         vmm_user_free(t->pml4, va, len);
         mmap_hole_add(t, va, len + PAGE_SIZE);
-        return -ENOMEM;
+        return -N_ERR_NO_MEMORY;
     }
     return (int64_t)va;
 }
 
 static int64_t sys_munmap_locked(uint64_t va, size_t len) {
     struct task *t = task_process();
-    if (va & (PAGE_SIZE - 1) || va < USER_MMAP_BASE || va + len > t->mmap_next || va + len < va) return -EINVAL;
-    if(len>SIZE_MAX-(PAGE_SIZE-1))return -EINVAL;
+    if (va & (PAGE_SIZE - 1) || va < USER_MMAP_BASE || va + len > t->mmap_next || va + len < va) return -N_ERR_INVALID;
+    if(len>SIZE_MAX-(PAGE_SIZE-1))return -N_ERR_INVALID;
     len=ALIGN_UP(len,PAGE_SIZE);
     struct shared_mapping **link=&t->shared_mappings;
     while(*link){struct shared_mapping *m=*link;
         if(va<m->va+m->bytes && m->va<va+len){
-            if(va!=m->va || len!=m->bytes)return -EINVAL;
+            if(va!=m->va || len!=m->bytes)return -N_ERR_INVALID;
             *link=m->next;vmm_user_free(t->pml4,va,len);vfs_close(m->file);kfree(m);return 0;
         }link=&m->next;
     }
     for (uint64_t a = va; a < va + len; a += PAGE_SIZE)
-        if (vmm_get_pte(t->pml4, a) & PTE_SHARED) return -EINVAL; /* a window buffer */
+        if (vmm_get_pte(t->pml4, a) & PTE_SHARED) return -N_ERR_INVALID; /* a window buffer */
     vmm_user_free(t->pml4, va, len);
     /* The unmapped page right after the range is the reservation's guard. */
     uint64_t end = va + len;
@@ -936,7 +936,7 @@ static int64_t sys_munmap_locked(uint64_t va, size_t len) {
 }
 
 static int64_t sys_mprotect_locked(uint64_t va, size_t len, int prot) {
-    if (va & (PAGE_SIZE - 1) || va >= USER_TOP || va + len > USER_TOP || va + len < va) return -EINVAL;
+    if (va & (PAGE_SIZE - 1) || va >= USER_TOP || va + len > USER_TOP || va + len < va) return -N_ERR_INVALID;
     int vp = (prot & N_PROT_WRITE ? VM_W : 0) | (prot & N_PROT_EXEC ? VM_X : 0);
     return vmm_user_protect(current_task->pml4, va, len, vp);
 }
@@ -955,7 +955,7 @@ static int64_t sys_mprotect(uint64_t va, size_t len, int prot) {
 }
 
 static int64_t sys_dmesg(char *buf, size_t n) {
-    if (!user_ok_w(buf, n)) return -EFAULT;
+    if (!user_ok_w(buf, n)) return -N_ERR_BAD_ADDRESS;
     return klog_read(buf, n);
 }
 
@@ -967,7 +967,7 @@ void syscall_dispatch(struct regs *r) {
     if (current_task->killed) task_exit(current_task->kill_code);
     sti();
     uint64_t a = r->rdi, b = r->rsi, c = r->rdx, d = r->r10, e = r->r8;
-    int64_t ret = -ENOSYS;
+    int64_t ret = -N_ERR_UNSUPPORTED;
     switch (r->rax) {
     case SYS_EXIT: task_exit((int)a);
     case SYS_READ: ret = sys_read((int)a, (void *)b, c); break;
@@ -976,19 +976,19 @@ void syscall_dispatch(struct regs *r) {
     case SYS_CLOSE: ret = sys_close((int)a); break;
     case SYS_AUDIO_FLUSH: {
         struct file *f = getfd_ref((int)a);
-        ret = f ? audio_flush_file(f) : -EBADF;
+        ret = f ? audio_flush_file(f) : -N_ERR_NO_HANDLE;
         vfs_close(f);
         break;
     }
     case SYS_LSEEK: {
         struct file *f = getfd_ref((int)a);
-        ret = f ? vfs_seek(f, (int64_t)b, (int)c) : -EBADF;
+        ret = f ? vfs_seek(f, (int64_t)b, (int)c) : -N_ERR_NO_HANDLE;
         vfs_close(f);
         break;
     }
     case SYS_FTRUNCATE: {
         struct file *f = getfd_ref((int)a);
-        ret = f ? vfs_truncate(f, b) : -EBADF;
+        ret = f ? vfs_truncate(f, b) : -N_ERR_NO_HANDLE;
         vfs_close(f);
         break;
     }
@@ -1029,13 +1029,13 @@ void syscall_dispatch(struct regs *r) {
     case SYS_SYSINFO: ret = sys_sysinfo((struct n_sysinfo *)a); break;
     case SYS_CPU_INFO: {
         struct n_cpuinfo info;
-        if (!user_ok_w((void *)a, sizeof info)) ret = -EFAULT;
+        if (!user_ok_w((void *)a, sizeof info)) ret = -N_ERR_BAD_ADDRESS;
         else { smp_get_info(&info); memcpy((void *)a, &info, sizeof info); ret = 0; }
         break;
     }
     case SYS_CLOCK_INFO: {
         struct n_clockinfo info = {.version = 1};
-        if (!user_ok_w((void *)a, sizeof info)) { ret = -EFAULT; break; }
+        if (!user_ok_w((void *)a, sizeof info)) { ret = -N_ERR_BAD_ADDRESS; break; }
         uint32_t ca, cb, cc, cd, max;
         cpuid(0x80000000, 0, &max, &cb, &cc, &cd);
         cd = 0;
@@ -1070,7 +1070,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_THREAD_CREATE:
         if (!user_ok((void *)a, 1) || !user_ok((void *)c, 1) ||
             (vmm_get_pte(current_task->pml4, a) & PTE_NX) ||
-            (vmm_get_pte(current_task->pml4, c) & PTE_NX)) ret = -EFAULT;
+            (vmm_get_pte(current_task->pml4, c) & PTE_NX)) ret = -N_ERR_BAD_ADDRESS;
         else ret = task_thread_create(c, a, b);
         break;
     case SYS_THREAD_JOIN: ret = task_thread_join((int)a); break;
@@ -1078,12 +1078,12 @@ void syscall_dispatch(struct regs *r) {
     case SYS_THREAD_ID: ret = current_task->pid; break;
     case SYS_CPU_INDEX: ret = 0; break;
     case SYS_THREAD_TLS:
-        if (!user_ok_w((void *)a, b) || b < 16 || b > PAGE_SIZE) ret = -EFAULT;
+        if (!user_ok_w((void *)a, b) || b < 16 || b > PAGE_SIZE) ret = -N_ERR_BAD_ADDRESS;
         else { current_task->tls_base = a; wrmsr(0xC0000100, a); ret = 0; }
         break;
     case SYS_THREAD_STACK_BOUNDS: {
         if (!user_ok_w((void *)a, sizeof(uintptr_t)) || !user_ok_w((void *)b, sizeof(uintptr_t))) {
-            ret = -EFAULT; break;
+            ret = -N_ERR_BAD_ADDRESS; break;
         }
         /* Main stacks grow on demand within the VM's reserved interval.
            Native threads instead own their scheduler-allocated mapping. */
@@ -1094,33 +1094,33 @@ void syscall_dispatch(struct regs *r) {
         ret = 0; break;
     }
     case SYS_WAIT_ADDRESS:
-        if ((a & 3) || !user_ok((void *)a, sizeof(uint32_t))) ret = -EFAULT;
+        if ((a & 3) || !user_ok((void *)a, sizeof(uint32_t))) ret = -N_ERR_BAD_ADDRESS;
         else ret = task_wait_address((volatile void *)a, (uint32_t)b, false, (unsigned)c);
         break;
     case SYS_WAIT_ADDRESS64:
-        if ((a & 7) || !user_ok((void *)a, sizeof(uint64_t))) ret = -EFAULT;
+        if ((a & 7) || !user_ok((void *)a, sizeof(uint64_t))) ret = -N_ERR_BAD_ADDRESS;
         else ret = task_wait_address((volatile void *)a, b, true, (unsigned)c);
         break;
     case SYS_WAKE_ADDRESS:
-        if ((a & 3) || !user_ok((void *)a, sizeof(uint32_t))) ret = -EFAULT;
+        if ((a & 3) || !user_ok((void *)a, sizeof(uint32_t))) ret = -N_ERR_BAD_ADDRESS;
         else ret = task_wake_address((volatile uint32_t *)a, (unsigned)b);
         break;
     case SYS_GPU_INFO: {
         struct n_gpu_info info;
-        if (!user_ok_w((void *)a, sizeof info)) ret = -EFAULT;
+        if (!user_ok_w((void *)a, sizeof info)) ret = -N_ERR_BAD_ADDRESS;
         else { gpu_get_info(&info); memcpy((void *)a, &info, sizeof info); ret = 0; }
         break;
     }
     case SYS_GPU_RENDER: {
         struct n_gpu_render request;
-        if (!user_ok((void *)a, sizeof request)) { ret = -EFAULT; break; }
+        if (!user_ok((void *)a, sizeof request)) { ret = -N_ERR_BAD_ADDRESS; break; }
         memcpy(&request, (void *)a, sizeof request);
         if (!request.width || !request.height || request.width > N_GPU_MAX_SIDE || request.height > N_GPU_MAX_SIDE) {
-            ret = -EINVAL; break;
+            ret = -N_ERR_INVALID; break;
         }
         size_t bytes = (size_t)request.width * request.height * sizeof(uint32_t);
-        if (c < bytes) { ret = -EINVAL; break; }
-        if (!user_ok_w((void *)b, bytes)) { ret = -EFAULT; break; }
+        if (c < bytes) { ret = -N_ERR_INVALID; break; }
+        if (!user_ok_w((void *)b, bytes)) { ret = -N_ERR_BAD_ADDRESS; break; }
         ret = gpu_render(&request, (uint32_t *)b, bytes);
         break;
     }
@@ -1128,22 +1128,22 @@ void syscall_dispatch(struct regs *r) {
         /* Snapshot the complete finite request before the driver uses it.
            A caller changing its user buffer cannot grow a validated batch. */
         struct n_gpu_batch request;
-        if (!user_ok((void *)a, sizeof request)) { ret = -EFAULT; break; }
+        if (!user_ok((void *)a, sizeof request)) { ret = -N_ERR_BAD_ADDRESS; break; }
         memcpy(&request, (void *)a, sizeof request);
         if (!request.width || !request.height ||
             request.width > N_GPU_MAX_SIDE || request.height > N_GPU_MAX_SIDE ||
             request.triangle_count > N_GPU_MAX_TRIANGLES) {
-            ret = -EINVAL; break;
+            ret = -N_ERR_INVALID; break;
         }
         size_t bytes = (size_t)request.width * request.height * sizeof(uint32_t);
-        if (c < bytes) { ret = -EINVAL; break; }
-        if (!user_ok_w((void *)b, bytes)) { ret = -EFAULT; break; }
+        if (c < bytes) { ret = -N_ERR_INVALID; break; }
+        if (!user_ok_w((void *)b, bytes)) { ret = -N_ERR_BAD_ADDRESS; break; }
         ret = gpu_render_batch(&request, (uint32_t *)b, bytes);
         break;
     }
     case SYS_GPU_BLIT: {
         struct n_gpu_blit request;
-        if (!user_ok((void *)a, sizeof request)) { ret = -EFAULT; break; }
+        if (!user_ok((void *)a, sizeof request)) { ret = -N_ERR_BAD_ADDRESS; break; }
         memcpy(&request, (void *)a, sizeof request);
         if (!request.width || !request.height ||
             !request.source_width || !request.source_height ||
@@ -1153,13 +1153,13 @@ void syscall_dispatch(struct regs *r) {
             request.source_x > request.source_width || request.source_y > request.source_height ||
             request.source_w > request.source_width - request.source_x ||
             request.source_h > request.source_height - request.source_y) {
-            ret = -EINVAL; break;
+            ret = -N_ERR_INVALID; break;
         }
         size_t source_bytes = (size_t)request.source_width * request.source_height * sizeof(uint32_t);
         size_t output_bytes = (size_t)request.width * request.height * sizeof(uint32_t);
-        if (c < source_bytes || e < output_bytes) { ret = -EINVAL; break; }
+        if (c < source_bytes || e < output_bytes) { ret = -N_ERR_INVALID; break; }
         if (!user_ok((void *)b, source_bytes) || !user_ok_w((void *)d, output_bytes)) {
-            ret = -EFAULT; break;
+            ret = -N_ERR_BAD_ADDRESS; break;
         }
         /* The BSP-owned driver snapshots all source pixels before using the
            device or touching output. No extra megabyte allocation per call;
@@ -1172,7 +1172,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_POWER:
         if (a == POWER_REBOOT) power_reboot();
         else power_off();
-        ret = -EIO;
+        ret = -N_ERR_IO;
         break;
     case SYS_FCNTL: ret = sys_fcntl((int)a, (int)b, (int)c); break;
     case SYS_DMESG: ret = sys_dmesg((char *)a, b); break;
@@ -1180,7 +1180,7 @@ void syscall_dispatch(struct regs *r) {
     case SYS_MUNMAP: ret = sys_munmap(a, b); break;
     case SYS_MPROTECT: ret = sys_mprotect(a, b, (int)c); break;
     case SYS_PCILIST:
-        if (!user_ok_w((void *)a, b * sizeof(struct n_pciinfo))) ret = -EFAULT;
+        if (!user_ok_w((void *)a, b * sizeof(struct n_pciinfo))) ret = -N_ERR_BAD_ADDRESS;
         else ret = pci_list((struct n_pciinfo *)a, (int)b);
         break;
     default:

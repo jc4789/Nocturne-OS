@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdint.h>
+#include <errno.h>
 
 void *memcpy(void *d, const void *s, size_t n) {
     void *r = d;
@@ -199,40 +200,43 @@ char *strtok(char *s, const char *delim) {
 
 char *strerror(int e) {
     switch (e) {
-    case 0: return "success";
-    case 1: return "operation not permitted";
-    case 2: return "no such file or directory";
-    case 3: return "no such process";
-    case 4: return "interrupted";
-    case 5: return "I/O error";
-    case 7: return "argument list too long";
-    case 8: return "not an executable";
-    case 9: return "bad file descriptor";
-    case 10: return "no child processes";
-    case 11: return "try again";
-    case 12: return "out of memory";
-    case 14: return "bad address";
-    case 16: return "busy";
-    case 17: return "already exists";
-    case 20: return "not a directory";
-    case 21: return "is a directory";
-    case 22: return "invalid argument";
-    case 24: return "too many open files";
-    case 28: return "no space left";
-    case 29: return "illegal seek";
-    case 30: return "read-only file system";
-    case 32: return "broken pipe";
-    case 34: return "out of range";
-    case 36: return "name too long";
-    case 38: return "not implemented";
-    case 39: return "directory not empty";
-    case 98: return "address in use";
-    case 100: return "network is down";
-    case 104: return "connection reset";
-    case 107: return "not connected";
-    case 110: return "timed out";
-    case 111: return "connection refused";
-    case 113: return "host unreachable";
+    case N_OK: return "success";
+    case N_ERR_NOT_FOUND: return "not found";
+    case N_ERR_EXISTS: return "already exists";
+    case N_ERR_DENIED: return "not permitted";
+    case N_ERR_NO_MEMORY: return "out of memory";
+    case N_ERR_INVALID: return "invalid argument";
+    case N_ERR_WRONG_KIND: return "wrong kind of handle";
+    case N_ERR_NO_HANDLE: return "no such handle";
+    case N_ERR_BUSY: return "busy";
+    case N_ERR_NOT_READY: return "not ready";
+    case N_ERR_CLOSED: return "closed";
+    case N_ERR_TIMEOUT: return "timed out";
+    case N_ERR_CANCELLED: return "cancelled";
+    case N_ERR_TOO_LARGE: return "too large";
+    case N_ERR_NOT_EMPTY: return "folder not empty";
+    case N_ERR_IO: return "I/O error";
+    case N_ERR_UNSUPPORTED: return "not supported";
+    case N_ERR_BAD_ADDRESS: return "bad address";
+    case N_ERR_STOPPED: return "stopped";
+    case N_ERR_NOT_FOLDER: return "not a folder";
+    case N_ERR_IS_FOLDER: return "is a folder";
+    case N_ERR_READ_ONLY: return "read-only";
+    case N_ERR_NO_SPACE: return "no space left";
+    case N_ERR_NOT_PROGRAM: return "not a program";
+    case N_ERR_NAME_TOO_LONG: return "name too long";
+    case N_ERR_NO_APP: return "no such app";
+    case N_ERR_TOO_MANY_ARGUMENTS: return "too many arguments";
+    case N_ERR_CONNECTION_RESET: return "connection reset";
+    case N_ERR_CONNECTION_REFUSED: return "connection refused";
+    case N_ERR_ADDRESS_IN_USE: return "address in use";
+    case N_ERR_NETWORK_DOWN: return "network is down";
+    case N_ERR_NOT_CONNECTED: return "not connected";
+    case N_ERR_UNREACHABLE: return "host unreachable";
+    case N_ERR_PROTOCOL: return "protocol error";
+    case EDOM: return "argument out of domain";
+    case ERANGE: return "result out of range";
+    case EILSEQ: return "illegal byte sequence";
     default: return "unknown error";
     }
 }

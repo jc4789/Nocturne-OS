@@ -410,13 +410,13 @@ static void win_destroy(struct window *w) {
 static int64_t win_read_common(struct vnode *v, struct file *f, void *buf, uint64_t off, size_t n, bool user) {
     struct window *w = v->priv;
     size_t max = n / sizeof(struct gui_event);
-    if (max == 0) return -EINVAL;
+    if (max == 0) return -N_ERR_INVALID;
     for (;;) {
         uint64_t fl = irq_save();
         if (w->ev_count || w->frame_ready) {
             size_t available = (size_t)w->ev_count + (w->frame_ready ? 1u : 0u);
             size_t bytes = MIN(max, available) * sizeof(struct gui_event);
-            if (user && !user_ok_w(buf, bytes)) { irq_restore(fl); return -EFAULT; }
+            if (user && !user_ok_w(buf, bytes)) { irq_restore(fl); return -N_ERR_BAD_ADDRESS; }
             struct gui_event *out = buf;
             size_t got = 0;
             while (got < max && w->ev_count) {
@@ -437,11 +437,11 @@ static int64_t win_read_common(struct vnode *v, struct file *f, void *buf, uint6
         }
         if (f->flags & O_NONBLOCK) {
             irq_restore(fl);
-            return -EAGAIN;
+            return -N_ERR_NOT_READY;
         }
         if (current_task->killed) {
             irq_restore(fl);
-            return -EINTR;
+            return -N_ERR_STOPPED;
         }
         wq_wait(&w->wq);
         irq_restore(fl);
@@ -2257,14 +2257,14 @@ static struct window *fd_window(struct file *f) {
 }
 
 static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
-    if (!running) return -ENOSYS;
-    if (nwin >= MAX_WIN) return -ENOMEM;
+    if (!running) return -N_ERR_UNSUPPORTED;
+    if (nwin >= MAX_WIN) return -N_ERR_NO_MEMORY;
     if (cw < 16) cw = 16;
     if (ch < 16) ch = 16;
     if (cw > sw) cw = sw;
     if (ch > sh) ch = sh;
     struct window *w = kzalloc(sizeof *w);
-    if (!w) return -ENOMEM;
+    if (!w) return -N_ERR_NO_MEMORY;
     if (utitle && user_str(w->title, utitle, sizeof w->title) < 0) strcpy(w->title, "window");
     if (!utitle) strcpy(w->title, current_task->name);
     w->flags = flags;
@@ -2272,7 +2272,7 @@ static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
     w->id = next_win_id++;
     if (!alloc_buffer(w, cw, ch)) {
         kfree(w);
-        return -ENOMEM;
+        return -N_ERR_NO_MEMORY;
     }
     if (flags & WIN_CENTER) {
         w->x = (sw - frame_w(w)) / 2;
@@ -2290,7 +2290,7 @@ static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
         vfree(w->buf, w->pages);
         vfree(w->user_buf, w->pages);
         kfree(w);
-        return -ENOMEM;
+        return -N_ERR_NO_MEMORY;
     }
     strlcpy(v->name, "window", sizeof v->name);
     v->type = VT_WINDOW;
@@ -2302,7 +2302,7 @@ static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
     if (!f) {
         vfree(w->buf, w->pages);
         vfree(w->user_buf, w->pages);
-        kfree(w); kfree(v); return -ENOMEM;
+        kfree(w); kfree(v); return -N_ERR_NO_MEMORY;
     }
     uint64_t irq = irq_save();
     int fd=task_fd_alloc(task_process(),f);
@@ -2332,10 +2332,10 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     case SYS_WIN_CREATE: return sys_win_create((int)a, (int)b, (const char *)c, (int)d);
     case SYS_WIN_MAP: {
         struct window *w = fd_window(file);
-        if (!w) return -EBADF;
-        if (w->pml4 != current_task->pml4) return -EPERM;
-        if (b >= ((w->flags & WIN_DOUBLE_BUFFER) ? WIN_BUFFER_COUNT : 1) || c > WIN_MAP_ACQUIRE) return -EINVAL;
-        if (c && !(w->flags & WIN_DOUBLE_BUFFER)) return -EINVAL;
+        if (!w) return -N_ERR_NO_HANDLE;
+        if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
+        if (b >= ((w->flags & WIN_DOUBLE_BUFFER) ? WIN_BUFFER_COUNT : 1) || c > WIN_MAP_ACQUIRE) return -N_ERR_INVALID;
+        if (c && !(w->flags & WIN_DOUBLE_BUFFER)) return -N_ERR_INVALID;
         while (c && (w->pending_index >= 0 || w->front_index == (int)b)) {
             uint64_t flags = irq_save();
             wm_unlock();
@@ -2343,23 +2343,23 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
                 (w->pending_index >= 0 || w->front_index == (int)b)) wq_wait(&w->wq);
             irq_restore(flags);
             wm_lock();
-            if (w->dead) return -EBADF;
-            if (current_task->killed) return -EINTR;
+            if (w->dead) return -N_ERR_NO_HANDLE;
+            if (current_task->killed) return -N_ERR_STOPPED;
         }
         uint64_t va = b ? w->second_uaddr : w->uaddr;
         if (va) return (int64_t)va;
         va = map_user(w, task_process(), (unsigned)b);
-        return va ? (int64_t)va : -ENOMEM;
+        return va ? (int64_t)va : -N_ERR_NO_MEMORY;
     }
     case SYS_WIN_STATE: {
         struct window *w=fd_window(file);
-        if(!w)return -EBADF;
-        if(w->pml4!=current_task->pml4)return -EPERM;
+        if(!w)return -N_ERR_NO_HANDLE;
+        if(w->pml4!=current_task->pml4)return -N_ERR_DENIED;
         return (visible(w)?WIN_STATE_VISIBLE:0) | (focused()==w?WIN_STATE_FOCUSED:0) | (w->fullscreen?WIN_STATE_FULLSCREEN:0);
     }
     case SYS_WIN_PRESENTATION: {
-        struct window *w=fd_window(file);if(!w)return -EBADF;
-        if(w->pml4!=current_task->pml4)return -EPERM;if(b>1)return -EINVAL;
+        struct window *w=fd_window(file);if(!w)return -N_ERR_NO_HANDLE;
+        if(w->pml4!=current_task->pml4)return -N_ERR_DENIED;if(b>1)return -N_ERR_INVALID;
         if(w->fullscreen==!!b)return 0;
         damage_window(w);struct gui_event resize={.type=EV_RESIZE};
         if(b){w->fullscreen_restore=(struct rect){w->x,w->y,w->cw,w->ch};w->fullscreen=true;w->x=w->y=0;resize.x=sw;resize.y=sh;}
@@ -2368,13 +2368,13 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_WIN_PRESENT: {
         struct window *w = fd_window(file);
-        if (!w) return -EBADF;
-        if (w->pml4 != current_task->pml4) return -EPERM;
+        if (!w) return -N_ERR_NO_HANDLE;
+        if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
         if (w->flags & WIN_DOUBLE_BUFFER) {
-            if (!e || e > WIN_BUFFER_COUNT || b || c || d) return -EINVAL;
+            if (!e || e > WIN_BUFFER_COUNT || b || c || d) return -N_ERR_INVALID;
             int index = (int)e - 1;
-            if (w->pending_index >= 0 || w->front_index == index) return -EBUSY;
-            if (!(index ? w->second_uaddr : w->uaddr)) return -EINVAL;
+            if (w->pending_index >= 0 || w->front_index == index) return -N_ERR_BUSY;
+            if (!(index ? w->second_uaddr : w->uaddr)) return -N_ERR_INVALID;
             w->pending_index = index;
             pending_frames++;
             if (!w->shown) show_if_needed(w);
@@ -2382,7 +2382,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
             wake_compositor();
             return 0;
         }
-        if (e) return -EINVAL;
+        if (e) return -N_ERR_INVALID;
         int x = (int)b, y = (int)c, rw = (int)(d >> 32), rh = (int)(d & 0xFFFFFFFF);
         if (rw <= 0 || rh <= 0) {
             x = y = 0;
@@ -2404,8 +2404,8 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_WIN_SET_TITLE: {
         struct window *w = fd_window(file);
-        if (!w) return -EBADF;
-        if (user_str(w->title, (const char *)b, sizeof w->title) < 0) return -EFAULT;
+        if (!w) return -N_ERR_NO_HANDLE;
+        if (user_str(w->title, (const char *)b, sizeof w->title) < 0) return -N_ERR_BAD_ADDRESS;
         if (w->shown) {
             damage_rect(w->x, w->y, frame_w(w), TITLE_H);
             damage_rect(0, sh - TASKBAR_H, sw, TASKBAR_H);
@@ -2415,14 +2415,14 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_SCREEN_INFO: {
         struct screen_info *si = (struct screen_info *)a;
-        if (!user_ok_w(si, sizeof *si)) return -EFAULT;
+        if (!user_ok_w(si, sizeof *si)) return -N_ERR_BAD_ADDRESS;
         si->width = running ? sw : fb.width;
         si->height = running ? sh - TASKBAR_H : fb.height;
-        return running ? 0 : -ENOSYS;
+        return running ? 0 : -N_ERR_UNSUPPORTED;
     }
     case SYS_WIN_MOVE: {
         struct window *w = fd_window(file);
-        if (!w) return -EBADF;
+        if (!w) return -N_ERR_NO_HANDLE;
         damage_window(w);
         w->x = (int)b;
         w->y = (int)c;
@@ -2432,20 +2432,20 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_CLIPBOARD_SET: {
         size_t n = b;
-        if (n > WM_CLIPBOARD_MAX) return -E2BIG;
-        if (!user_ok((void *)a, n)) return -EFAULT;
-        return wm_clipboard_set((const char *)a, n) ? 0 : -ENOMEM;
+        if (n > WM_CLIPBOARD_MAX) return -N_ERR_TOO_LARGE;
+        if (!user_ok((void *)a, n)) return -N_ERR_BAD_ADDRESS;
+        return wm_clipboard_set((const char *)a, n) ? 0 : -N_ERR_NO_MEMORY;
     }
     case SYS_CLIPBOARD_GET: {
         size_t n = MIN(b, clipboard_len);
-        if (!user_ok_w((void *)a, n)) return -EFAULT;
+        if (!user_ok_w((void *)a, n)) return -N_ERR_BAD_ADDRESS;
         if (n) memcpy((void *)a, clipboard, n);
         return (int64_t)clipboard_len;
     }
     case SYS_WIN_RESIZE: {
         struct window *w = fd_window(file);
-        if (!w) return -EBADF;
-        if (w->pml4 != current_task->pml4) return -EPERM;
+        if (!w) return -N_ERR_NO_HANDLE;
+        if (w->pml4 != current_task->pml4) return -N_ERR_DENIED;
         int ncw = MAX(16, MIN((int)b, sw)), nch = MAX(16, MIN((int)c, sh));
         damage_window(w);
         uint32_t *obuf = w->buf;
@@ -2457,7 +2457,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
             w->buf = obuf;
             w->user_buf = ouser;
             w->pages = opages;
-            return -ENOMEM;
+            return -N_ERR_NO_MEMORY;
         }
         for (int y = 0; y < MIN(och, nch); y++) {
             memcpy(&w->buf[y * ncw], &obuf[y * ocw], MIN(ocw, ncw) * 4);
@@ -2476,28 +2476,28 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         damage_window(w);
         wake_compositor();
         uint64_t va = map_user(w, task_process(), 0);
-        return va ? (int64_t)va : -ENOMEM;
+        return va ? (int64_t)va : -N_ERR_NO_MEMORY;
     }
     case SYS_SCREEN_GRAB: {
         /* copy the composed screen (desktop, windows, taskbar) as 0xAARRGGBB pixels; returns
            width << 16 | height. The buffer must hold width * height pixels (bytes = 0: size only). */
-        if (!running) return -ENOSYS;
+        if (!running) return -N_ERR_UNSUPPORTED;
         uint32_t *dst = (uint32_t *)a;
         size_t need = (size_t)sw * (size_t)sh * 4;
         if (b == 0) return (int64_t)sw << 16 | sh; /* just the size */
-        if (b < need) return -E2BIG;
-        if (!user_ok_w(dst, need)) return -EFAULT;
+        if (b < need) return -N_ERR_TOO_LARGE;
+        if (!user_ok_w(dst, need)) return -N_ERR_BAD_ADDRESS;
         for (int y = 0; y < sh; y++) memcpy(dst + (size_t)y * (size_t)sw, back.px + (size_t)y * (size_t)back.pitch, (size_t)sw * 4);
         return (int64_t)sw << 16 | sh;
     }
     case SYS_GUI_LAUNCH: {
         char path[PATH_MAX_LEN], arg[PATH_MAX_LEN];
-        if (user_str(path, (const char *)a, sizeof path) < 0) return -EFAULT;
+        if (user_str(path, (const char *)a, sizeof path) < 0) return -N_ERR_BAD_ADDRESS;
         bool has_arg = b != 0;
-        if (has_arg && user_str(arg, (const char *)b, sizeof arg) < 0) return -EFAULT;
+        if (has_arg && user_str(arg, (const char *)b, sizeof arg) < 0) return -N_ERR_BAD_ADDRESS;
         return proc_spawn_simple(path, has_arg ? arg : NULL, NULL);
     }
-    default: return -ENOSYS;
+    default: return -N_ERR_UNSUPPORTED;
     }
 }
 

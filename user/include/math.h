@@ -20,19 +20,32 @@ NOCTURNE_BEGIN_DECLS
 #define isfinite(x) (!isnan((x) - (x)))
 #define signbit(x) ((x) < 0 || (1 / (double)(x)) < 0)
 #else
-#define INFINITY __builtin_inf()
-#define NAN __builtin_nan("")
+/* float constants as in C99; <float.h> of C23 may define them first */
+#ifndef INFINITY
+#define INFINITY __builtin_inff()
+#endif
+#ifndef NAN
+#define NAN __builtin_nanf("")
+#endif
 #define HUGE_VAL __builtin_huge_val()
 #define isnan(x) __builtin_isnan(x)
 #define isinf(x) __builtin_isinf(x)
 #define isfinite(x) __builtin_isfinite(x)
 #define signbit(x) __builtin_signbit(x)
+#define isnormal(x) __builtin_isnormal(x)
+#define fpclassify(x) __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, x)
 #endif
 #ifndef __TINYC__
 #define HUGE_VALF __builtin_huge_valf()
 #define HUGE_VALL __builtin_huge_vall()
 #endif
 #define M_PI_2 1.57079632679489661923
+#define M_PI_4 0.78539816339744830962
+#define M_1_PI 0.31830988618379067154
+#define M_2_PI 0.63661977236758134308
+#define M_SQRT1_2 0.70710678118654752440
+#define M_LOG2E 1.4426950408889634074
+#define M_LOG10E 0.43429448190325182765
 #define M_LN2 0.69314718055994530942
 #define M_LN10 2.30258509299404568402
 double sqrt(double x);
@@ -63,6 +76,17 @@ float sinf(float x);
 float cosf(float x);
 float fabsf(float x);
 float floorf(float x);
+float hypotf(float x, float y);
+float sinhf(float x);
+float coshf(float x);
+float tanhf(float x);
+float asinhf(float x);
+float acoshf(float x);
+float atanhf(float x);
+float log10f(float x);
+float cbrtf(float x);
+float expm1f(float x);
+float log1pf(float x);
 double ldexp(double x, int e);
 long double ldexpl(long double x, int e);
 float ldexpf(float x, int e);
@@ -91,6 +115,24 @@ float atanf(float x);
 float fmodf(float x, float y);
 long double fabsl(long double x);
 long lrint(double x);
+long lrintf(float x);
+long long llrint(double x);
+long long llrintf(float x);
+double rint(double x);
+float rintf(float x);
+long lroundf(float x);
+long long llround(double x);
+long long llroundf(float x);
+double roundeven(double x);
+float roundevenf(float x);
+float copysignf(float x, float y);
+float frexpf(float x, int *e);
+float log2f(float x);
+float exp2f(float x);
+double nan(const char *tag);
+float nanf(const char *tag);
+double fma(double x, double y, double z);
+float fmaf(float x, float y, float z);
 double nearbyint(double x);
 float nearbyintf(float x);
 double expm1(double x);

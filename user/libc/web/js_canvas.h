@@ -13,6 +13,10 @@ bool web_image_bitmap_is(JSValueConst value);
 bool web_image_bitmap_dimensions(JSValueConst value, unsigned *width, unsigned *height);
 JSValue web_image_bitmap_native(JSContext *ctx, web_doc *document, node_t *source, int argc, JSValueConst *argv);
 JSValue web_canvas_draw_bitmap(JSContext *ctx, node_t *dst, JSValueConst bitmap, int argc, JSValueConst *argv);
+struct web_webgl_pixels;
+/* WebGL TexImageSource pixels: source is a canvas or image node, or NULL
+ * with bitmap an ImageBitmap token. Status as web_webgl_source_fn. */
+int web_canvas_webgl_source(JSContext *ctx, node_t *source, JSValueConst bitmap, struct web_webgl_pixels *out);
 void web_canvas_free(node_t *node);
 void web_canvas_attr_changed(node_t *node, const char *name);
 unsigned web_canvas_dimension(const node_t *node, const char *name);

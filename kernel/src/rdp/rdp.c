@@ -207,7 +207,7 @@ struct rdp {
 static int send_raw(struct rdp *c, struct wbuf *w) {
     if (w->n > w->cap) {
         kprintf("rdp: PDU of %u bytes too big\n", w->n);
-        return -EINVAL;
+        return -N_ERR_INVALID;
     }
     return hvsock_write(c->s, w->b, w->n);
 }
@@ -272,7 +272,7 @@ static int read_pdu(struct rdp *c, uint64_t timeout_ms) {
     if (c->in[0] == 3) {
         if ((r = hvsock_read_full(c->s, c->in + 2, 2, 5000))) return r;
         len = (uint32_t)c->in[2] << 8 | c->in[3];
-        if (len < 4) return -EINVAL;
+        if (len < 4) return -N_ERR_INVALID;
         if ((r = hvsock_read_full(c->s, c->in + 4, len - 4, 5000))) return r;
     } else {
         len = c->in[1];
@@ -282,7 +282,7 @@ static int read_pdu(struct rdp *c, uint64_t timeout_ms) {
             len = (len & 0x7F) << 8 | c->in[2];
             hdr = 3;
         }
-        if (len < hdr) return -EINVAL;
+        if (len < hdr) return -N_ERR_INVALID;
         if ((r = hvsock_read_full(c->s, c->in + hdr, len - hdr, 5000))) return r;
     }
     return (int)len;
@@ -291,7 +291,7 @@ static int read_pdu(struct rdp *c, uint64_t timeout_ms) {
 static int connection_request(struct rdp *c, int len) {
     struct rbuf r = {c->in, (uint32_t)len, 4, false};
     r8(&r); /* length indicator */
-    if ((r8(&r) & 0xF0) != 0xE0) return -EINVAL;
+    if ((r8(&r) & 0xF0) != 0xE0) return -N_ERR_INVALID;
     rskip(&r, 5);
     /* an optional cookie or routing token line, then an optional negotiation request */
     if (rleft(&r) && r.p[r.pos] != 0x01) {
@@ -380,19 +380,19 @@ static void client_net(struct rdp *c, struct rbuf *b) {
 
 static int connect_initial(struct rdp *c, int len) {
     struct rbuf r = {c->in, (uint32_t)len, 7, false};
-    if (r8(&r) != 0x7F || r8(&r) != 0x65) return -EINVAL;
+    if (r8(&r) != 0x7F || r8(&r) != 0x65) return -N_ERR_INVALID;
     ber_len(&r);
     for (int i = 0; i < 6; i++) { /* the domain selectors, upward flag and three parameter sets */
         r8(&r);
         rskip(&r, ber_len(&r));
     }
-    if (r8(&r) != 0x04) return -EINVAL;
+    if (r8(&r) != 0x04) return -N_ERR_INVALID;
     uint32_t ulen = ber_len(&r);
-    if (r.err || ulen > rleft(&r)) return -EINVAL;
+    if (r.err || ulen > rleft(&r)) return -N_ERR_INVALID;
     /* the GCC conference create request: client data blocks follow the "Duca" key */
     uint32_t end = r.pos + ulen, i = r.pos;
     while (i + 4 <= end && memcmp(r.p + i, "Duca", 4)) i++;
-    if (i + 4 > end) return -EINVAL;
+    if (i + 4 > end) return -N_ERR_INVALID;
     r.pos = i + 4;
     uint32_t blen = per_len(&r);
     uint32_t bend = MIN(end, r.pos + blen);
@@ -662,7 +662,7 @@ static int send_bitmap(struct rdp *c, const uint32_t *px, int pitch, int x, int 
     w16(&o, (uint16_t)c->bpp);
     w16(&o, 0);
     w16(&o, (uint16_t)size);
-    if (o.n + size > o.cap) return -EINVAL;
+    if (o.n + size > o.cap) return -N_ERR_INVALID;
     uint8_t *d = o.b + o.n;
     for (int j = h - 1; j >= 0; j--) {
         const uint32_t *row = px + (size_t)(y + j) * pitch + x;
@@ -1538,7 +1538,7 @@ static int mcs_pdu(struct rdp *c, int len) {
     uint8_t t = r8(&r) >> 2;
     switch (t) {
     case 1: return 0; /* erect domain */
-    case 8: return -EPIPE; /* disconnect provider ultimatum */
+    case 8: return -N_ERR_CLOSED; /* disconnect provider ultimatum */
     case 10: { /* attach user: confirm with our user id */
         struct wbuf w = x224_begin(c);
         w8(&w, (11 << 2) | 2);
@@ -1606,7 +1606,7 @@ static void session(void *arg) {
         if (hvsock_wait(s, playing ? 10 : 30)) {
             len = read_pdu(c, 5000);
             if (len <= 0) {
-                err = len ? len : -EPIPE;
+                err = len ? len : -N_ERR_CLOSED;
                 break;
             }
             if (c->in[0] == 3) err = mcs_pdu(c, len);
@@ -1617,7 +1617,7 @@ static void session(void *arg) {
         if (!err) err = clip_poll(c);
         if (!err) err = snd_push(c);
     }
-    if (c->started && err != -EPIPE) kprintf("rdp: session with \"%s\" failed (%d)\n", c->client_name, err);
+    if (c->started && err != -N_ERR_CLOSED) kprintf("rdp: session with \"%s\" failed (%d)\n", c->client_name, err);
     else if (c->started) kprintf("rdp: session with \"%s\" ended\n", c->client_name);
     if (c->snd_blocks) kprintf("rdp: %u blocks of sound sent, %u confirmed\n", c->snd_blocks, c->snd_confirmed);
 out:

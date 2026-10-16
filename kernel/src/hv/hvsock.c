@@ -111,8 +111,8 @@ static void hvsock_thread(void *arg) {
 }
 
 int hvsock_listen(uint32_t port, void (*accept)(struct hvsock *s, void *arg), void *arg) {
-    if (!vmbus_ready()) return -EIO;
-    if (nlisteners == MAX_LISTEN) return -ENOMEM;
+    if (!vmbus_ready()) return -N_ERR_IO;
+    if (nlisteners == MAX_LISTEN) return -N_ERR_NO_MEMORY;
     listeners[nlisteners].accept = accept;
     listeners[nlisteners].arg = arg;
     __asm__ volatile("" ::: "memory");
@@ -154,7 +154,7 @@ bool hvsock_wait(struct hvsock *s, uint64_t timeout_ms) {
 }
 
 int hvsock_read(struct hvsock *s, void *buf, size_t len, uint64_t timeout_ms) {
-    if (!hvsock_wait(s, timeout_ms)) return -ETIMEDOUT;
+    if (!hvsock_wait(s, timeout_ms)) return -N_ERR_TIMEOUT;
     if (s->off >= s->end) return 0; /* end of stream */
     uint32_t n = (uint32_t)MIN(len, (size_t)(s->end - s->off));
     memcpy(buf, s->pkt + s->off, n);
@@ -167,7 +167,7 @@ int hvsock_read_full(struct hvsock *s, void *buf, size_t len, uint64_t timeout_m
     while (len) {
         int n = hvsock_read(s, p, len, timeout_ms);
         if (n < 0) return n;
-        if (n == 0) return -EPIPE;
+        if (n == 0) return -N_ERR_CLOSED;
         p += n;
         len -= (size_t)n;
     }
@@ -182,19 +182,19 @@ static int send_packet(struct hvsock *s, const void *data, uint32_t n) {
     uint32_t need = (uint32_t)ALIGN_UP(sizeof hdr + n, 8) + 8;
     uint64_t give_up = uptime_ms() + 10000; /* a host that reads nothing for this long is gone */
     for (;;) {
-        if (s->rescinded) return -EPIPE;
-        if (uptime_ms() > give_up) return -ETIMEDOUT;
+        if (s->rescinded) return -N_ERR_CLOSED;
+        if (uptime_ms() > give_up) return -N_ERR_TIMEOUT;
         int r = vmbus_send_raw(s->ch, &hdr, sizeof hdr, data, n);
-        if (r != -EAGAIN) return r;
+        if (r != -N_ERR_NOT_READY) return r;
         /* full: ask the host to signal us once it has made room, then wait */
         uint64_t f = irq_save();
         s->ch->out->pending_send_sz = need;
         hv_mb();
         r = vmbus_send_raw(s->ch, &hdr, sizeof hdr, data, n);
-        if (r == -EAGAIN) wq_wait_timeout(&s->wq, 100);
+        if (r == -N_ERR_NOT_READY) wq_wait_timeout(&s->wq, 100);
         s->ch->out->pending_send_sz = 0;
         irq_restore(f);
-        if (r != -EAGAIN) return r;
+        if (r != -N_ERR_NOT_READY) return r;
     }
 }
 

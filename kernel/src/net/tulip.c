@@ -76,10 +76,10 @@ static void tulip_irq(struct regs *r) {
 }
 
 static int tulip_send(const void *frame, size_t len) {
-    if (len > BUFSZ) return -EINVAL;
+    if (len > BUFSZ) return -N_ERR_INVALID;
     struct tdesc *d = &tx[tx_cur];
     for (int i = 0; i < 1000000 && (d->status & OWN); i++) pause();
-    if (d->status & OWN) return -EBUSY;
+    if (d->status & OWN) return -N_ERR_BUSY;
     memcpy(txbuf[tx_cur], frame, len);
     d->ctl = (uint32_t)len | (1u << 30) | (1u << 29) | (tx_cur == NTX - 1 ? (1u << 25) : 0); /* LS, FS, TER */
     d->status = OWN;

@@ -15,14 +15,14 @@ static int ensure_cap(struct vnode *v, uint64_t need) {
     uint64_t nc = v->cap ? v->cap : 256;
     while (nc < need) nc *= 2;
     uint8_t *nd = krealloc(v->data, nc);
-    if (!nd) return -ENOMEM;
+    if (!nd) return -N_ERR_NO_MEMORY;
     v->data = nd;
     v->cap = nc;
     return 0;
 }
 
 static int64_t ram_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t n) {
-    if (ensure_cap(v, off + n) < 0) return -ENOSPC;
+    if (ensure_cap(v, off + n) < 0) return -N_ERR_NO_SPACE;
     if (off > v->size) memset(v->data + v->size, 0, off - v->size);
     memcpy(v->data + off, buf, n);
     if (off + n > v->size) v->size = off + n;
@@ -31,7 +31,7 @@ static int64_t ram_write(struct vnode *v, struct file *f, const void *buf, uint6
 
 static int ram_truncate(struct vnode *v, uint64_t size) {
     if (size > v->size) {
-        if (ensure_cap(v, size) < 0) return -ENOSPC;
+        if (ensure_cap(v, size) < 0) return -N_ERR_NO_SPACE;
         memset(v->data + v->size, 0, size - v->size);
     }
     v->size = size;
@@ -75,9 +75,9 @@ void ramfs_add_child(struct vnode *dir, struct vnode *child) {
 }
 
 static int ram_create(struct vnode *dir, const char *name, int type, struct vnode **out) {
-    if (ram_lookup(dir, name)) return -EEXIST;
+    if (ram_lookup(dir, name)) return -N_ERR_EXISTS;
     struct vnode *v = ramfs_new_node(name, type);
-    if (!v) return -ENOMEM;
+    if (!v) return -N_ERR_NO_MEMORY;
     ramfs_add_child(dir, v);
     *out = v;
     return 0;
@@ -92,9 +92,9 @@ static int ram_unlink(struct vnode *dir, const char *name) {
     struct vnode **pp = &dir->children;
     while (*pp && strcmp((*pp)->name, name)) pp = &(*pp)->sibling;
     struct vnode *v = *pp;
-    if (!v) return -ENOENT;
-    if (v->type == VT_DIR && v->children) return -ENOTEMPTY;
-    if (v->ops != &ramfs_ops) return -EPERM; /* device nodes */
+    if (!v) return -N_ERR_NOT_FOUND;
+    if (v->type == VT_DIR && v->children) return -N_ERR_NOT_EMPTY;
+    if (v->ops != &ramfs_ops) return -N_ERR_DENIED; /* device nodes */
     *pp = v->sibling;
     v->unlinked = true;
     vnode_unref(v);

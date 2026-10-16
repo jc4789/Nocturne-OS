@@ -33,6 +33,7 @@
 #include "js_collator_native.h"
 #include "js_worker.h"
 #include "js_wasm.h"
+#include "js_webgl.h"
 #include "js_navigator_native.h"
 #include "js_worker_wire.h"
 #include "frame.h"
@@ -4058,6 +4059,15 @@ static JSValue native_canvas(JSContext *ctx, JSValueConst this_val, int argc, JS
     return web_canvas_native(ctx, node, argc - 1, argv + 1);
 }
 
+/* WebGL TexImageSource values the private bridge resolved: a canvas or
+ * image node of a live document, or an ImageBitmap token. */
+static int webgl_source(JSContext *ctx,JSValueConst value,struct web_webgl_pixels *out) {
+    if(web_image_bitmap_is(value))return web_canvas_webgl_source(ctx,NULL,value,out);
+    node_t *node=node_opaque(value);
+    if(!node)return 0;
+    if(!node->owner || !node->owner->live)return 2;
+    return web_canvas_webgl_source(ctx,node,JS_UNDEFINED,out);
+}
 static JSValue native_image_bitmap(JSContext *ctx,JSValueConst this_val,int argc,JSValueConst *argv) {
     struct web_js_state *s=state(ctx);
     if(!task_context_active(s) || sandbox_borrowed(s) || (sandbox_authority(s)&SB_SCRIPTS))
@@ -8030,6 +8040,7 @@ JS_CFUNC_DEF("dataURL", 1, native_data_url), JS_CFUNC_DEF("cancel", 1, native_ca
     web_atomics_host_init(s->ctx, api);
     web_opfs_host_init(s->ctx, api, opfs_storage_url);
     web_js_wasm_host_init(s->ctx, api);
+    web_js_webgl_init(s->ctx, api, webgl_source);
     web_js_collator_init(s->ctx, api);
     JS_SetPropertyStr(s->ctx, api, "debugCanvasProbe", JS_NewBool(s->ctx,s->host.debug_js));
     JS_SetPropertyStr(s->ctx, api, "document", wrap(s, d->root));

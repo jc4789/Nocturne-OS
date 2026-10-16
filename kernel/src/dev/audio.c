@@ -277,7 +277,7 @@ static void audio_open(struct vnode *v, struct file *f) {
     if (s) s->ring = kmalloc(RING_BYTES);
     if (!s || !s->ring) {
         if (s) kfree(s);
-        return; /* writes fail with ENOMEM */
+        return; /* writes fail with N_ERR_NO_MEMORY */
     }
     uint64_t fl = irq_save();
     for (int i = 0; i < MAX_STREAMS; i++)
@@ -287,7 +287,7 @@ static void audio_open(struct vnode *v, struct file *f) {
             break;
         }
     irq_restore(fl);
-    if (!f->priv) { /* too many streams: writes fail with EBUSY */
+    if (!f->priv) { /* too many streams: writes fail with N_ERR_BUSY */
         kfree(s->ring);
         kfree(s);
         f->priv = (void *)1;
@@ -295,8 +295,8 @@ static void audio_open(struct vnode *v, struct file *f) {
 }
 
 static struct stream *stream_of(struct file *f, int64_t *err) {
-    if (!f->priv) *err = -ENOMEM;
-    else if (f->priv == (void *)1) *err = -EBUSY;
+    if (!f->priv) *err = -N_ERR_NO_MEMORY;
+    else if (f->priv == (void *)1) *err = -N_ERR_BUSY;
     else return f->priv;
     return NULL;
 }
@@ -309,13 +309,13 @@ static int64_t audio_write_common(struct vnode *v, struct file *f, const void *b
     size_t done = 0;
     while (done < n) {
         uint32_t queued=s->head-s->tail;
-        if(s->clock_error||queued>RING_BYTES||s->issued_head>=ARRAY_SIZE(s->issued)||s->issued_count>ARRAY_SIZE(s->issued))return done?(int64_t)done:-EIO;
+        if(s->clock_error||queued>RING_BYTES||s->issued_head>=ARRAY_SIZE(s->issued)||s->issued_count>ARRAY_SIZE(s->issued))return done?(int64_t)done:-N_ERR_IO;
         uint32_t room = RING_BYTES - queued;
         if(card_fill&&!remote_users&&s->issued_count==ARRAY_SIZE(s->issued))room=0;
         if (!room) {
             if (done) break; /* report what went in; the caller writes the rest */
-            if (f->flags & O_NONBLOCK) return -EAGAIN;
-            if (current_task->killed) return -EINTR;
+            if (f->flags & O_NONBLOCK) return -N_ERR_NOT_READY;
+            if (current_task->killed) return -N_ERR_STOPPED;
             uint64_t fl = irq_save();
             if (s->head - s->tail == RING_BYTES||(card_fill&&!remote_users&&s->issued_count==ARRAY_SIZE(s->issued))) wq_wait(&audio_wq);
             irq_restore(fl);
@@ -323,7 +323,7 @@ static int64_t audio_write_common(struct vnode *v, struct file *f, const void *b
         }
         /* copy outside the lock: only this task writes past head, and user memory may fault */
         uint32_t c = (uint32_t)MIN((size_t)room, n - done);
-        if (user && !user_ok(p + done, c)) return done ? (int64_t)done : -EFAULT;
+        if (user && !user_ok(p + done, c)) return done ? (int64_t)done : -N_ERR_BAD_ADDRESS;
         uint32_t at = s->head % RING_BYTES, first = MIN(c, RING_BYTES - at);
         memcpy(s->ring + at, p + done, first);
         memcpy(s->ring, p + done + first, c - first);
@@ -347,10 +347,10 @@ static int64_t audio_read_common(struct vnode *v, struct file *f, void *buf, uin
     int64_t err;
     struct stream *s = stream_of(f, &err);
     if (!s) return err;
-    if(s->clock_error||s->head-s->tail>RING_BYTES||s->issued_head>=ARRAY_SIZE(s->issued)||s->issued_count>ARRAY_SIZE(s->issued))return -EIO;
-    if (n < 4) return -EINVAL;
+    if(s->clock_error||s->head-s->tail>RING_BYTES||s->issued_head>=ARRAY_SIZE(s->issued)||s->issued_count>ARRAY_SIZE(s->issued))return -N_ERR_IO;
+    if (n < 4) return -N_ERR_INVALID;
     size_t bytes = n >= sizeof(struct n_audio_status) ? sizeof(struct n_audio_status) : sizeof(uint32_t);
-    if (user && !user_ok_w(buf, bytes)) return -EFAULT;
+    if (user && !user_ok_w(buf, bytes)) return -N_ERR_BAD_ADDRESS;
     if(n>=sizeof(struct n_audio_status)){
         uint64_t fl=irq_save();
         uint32_t software=(s->head-s->tail)/AUDIO_FRAME;
@@ -407,7 +407,7 @@ static struct vnode_ops audio_ops = {.open = audio_open, .close = audio_close, .
                                      .write_user = audio_write_user, .can_write = audio_can_write};
 
 int audio_flush_file(struct file *f) {
-    if (!f || !f->vn || f->vn->ops != &audio_ops) return -EINVAL;
+    if (!f || !f->vn || f->vn->ops != &audio_ops) return -N_ERR_INVALID;
     int64_t err = 0;
     struct stream *s = stream_of(f, &err);
     if (!s) return (int)err;
@@ -438,7 +438,7 @@ static int64_t volume_write(struct vnode *v, struct file *f, const void *buf, ui
     const char *p = buf;
     int val = 0, digits = 0;
     for (size_t i = 0; i < n && p[i] >= '0' && p[i] <= '9' && digits < 4; i++, digits++) val = val * 10 + (p[i] - '0');
-    if (!digits) return -EINVAL;
+    if (!digits) return -N_ERR_INVALID;
     audio_set_volume(val);
     return (int64_t)n;
 }

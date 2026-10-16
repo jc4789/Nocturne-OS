@@ -13,7 +13,8 @@ void web_atomics_runtime_init(JSRuntime *rt);
 /* host.sharedBufferExport(sab) -> [pid, ticket, mapped bytes, byteLength] for
  * a message to a direct parent/child; host.sharedBufferImport(record) maps it;
  * host.sharedBufferAlias(sab) makes a new SharedArrayBuffer object over the
- * same memory in this process. */
+ * same memory in this process; host.sharedBufferReserve(bytes) makes one whose
+ * pages are zero-filled at first touch. */
 void web_atomics_host_init(JSContext *ctx, JSValueConst host);
 /* Readable when a waitAsync waiter was notified; -1 before the first one. */
 int web_atomics_fd(void);

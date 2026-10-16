@@ -104,6 +104,14 @@ static void exception(struct regs *r, uint64_t cr2, unsigned source_cpu) {
         kprintf("[%s] pid %d (%s) cpu%u: %s at rip=%p", r->vector == 14 ? "segfault" : "crash",
                 t->pid, t->name, source_cpu, name, (void *)r->rip);
         if (r->vector == 14) kprintf(" addr=%p err=%lx", (void *)cr2, r->error);
+        /* The words at the stack top name the caller when the jump target
+           itself was bad (rip == addr after a call through a stale pointer). */
+        kprintf(" rsp=%p stack", (void *)r->rsp);
+        for (unsigned i = 0; i < 4; i++) {
+            uint64_t va = r->rsp + i * 8, pa = t->pml4 ? vmm_translate(t->pml4, va) : 0;
+            if (!pa || (va & 0xFFF) > 0xFF8) break;
+            kprintf(" %p", (void *)*(uint64_t *)phys_to_virt(pa));
+        }
         kprintf("\n");
         /* A helper can die while its owner waits for a completion token or
            while stderr's pipe is full. Never block process abort on that pipe;

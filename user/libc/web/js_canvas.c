@@ -1,8 +1,9 @@
-/* Actual Canvas2D RAM bitmap. No dummy WebGL or falsely successful methods.
+/* Actual Canvas2D RAM bitmap, also the presented image of a WebGL context.
  * Bitmap/temporary storage follows real allocation and size representation. Attribute changes
  * release/reset the bitmap, detached nodes remain allocation-document owned. */
 #include "js_canvas.h"
 #include "js_memory.h"
+#include "js_webgl.h"
 #include "gpu.h"
 #include "png.h"
 #include "nocturne.h"
@@ -21,6 +22,10 @@ struct web_canvas {
     bool tainted;
     struct canvas_clip *clip,**saved_clip;
     size_t saved_count,saved_capacity,saved_bytes;
+    /* WebGL: the bitmap holds the last presented drawing buffer, refreshed
+       when the context's change serial moves past webgl_serial. */
+    struct web_webgl *webgl;
+    uint64_t webgl_serial;
 };
 struct image_bitmap { unsigned w,h;bool tainted;uint32_t *pixels; };
 static JSClassID bitmap_class;
@@ -98,12 +103,21 @@ static void release(node_t *n) {
     free(c->saved_clip);c->saved_clip=NULL;c->saved_capacity=c->saved_bytes=0;
     c->bytes=0;
 }
-void web_canvas_free(node_t *n) { if (n) { release(n); free(n->canvas); n->canvas=NULL; } }
+void web_canvas_free(node_t *n) {
+    if (!n) return;
+    release(n);
+    if (n->canvas && n->canvas->webgl) {
+        web_webgl_set_owner(n->canvas->webgl,NULL,NULL);
+        web_webgl_release(n->canvas->webgl);
+    }
+    free(n->canvas); n->canvas=NULL;
+}
 void web_canvas_attr_changed(node_t *n,const char *name) {
     if (n && n->canvas && (!strcmp(name,"width") || !strcmp(name,"height"))) {
         release(n); n->canvas->generation++;
         n->canvas->tainted=false;
         n->canvas->w=web_canvas_dimension(n,"width"); n->canvas->h=web_canvas_dimension(n,"height");
+        if (n->canvas->webgl) web_webgl_resize(n->canvas->webgl,n->canvas->w,n->canvas->h);
     }
 }
 static struct web_canvas *ensure(node_t *n) {
@@ -120,6 +134,23 @@ static struct web_canvas *ensure(node_t *n) {
     if (!c->pixels) return NULL;
     c->bytes=bytes; d->canvas_bytes+=bytes;
     return c;
+}
+/* Brings the bitmap up to the WebGL drawing buffer. frame_end is the
+ * compositor's presentation: the buffer then follows preserveDrawingBuffer.
+ * Readers (drawImage, toDataURL, texImage) copy without ending the frame. */
+static struct web_canvas *webgl_sync(node_t *n,bool frame_end) {
+    struct web_canvas *c=n->canvas;
+    if (!c || !c->webgl) return c;
+    uint64_t serial=web_webgl_serial(c->webgl);
+    if (serial==c->webgl_serial && c->pixels) return c;
+    c=ensure(n);
+    if (!c || !c->pixels) return c;
+    if (web_webgl_present(c->webgl,c->pixels,c->w,c->h,frame_end)) c->webgl_serial=serial;
+    return c;
+}
+static void webgl_changed(void *owner) {
+    node_t *n=owner;
+    if (n->owner) n->owner->dirty=true;
 }
 static uint32_t over(uint32_t d,uint32_t s) {
     unsigned sa=s>>24,da=d>>24;
@@ -141,6 +172,7 @@ static int canvas_source(JSContext *ctx,node_t *source,const uint32_t **pixels,u
     if(source->tag==T_canvas){
         if(!web_canvas_dimension(source,"width")||!web_canvas_dimension(source,"height"))return 1;
         struct web_canvas *c=ensure(source);if(!c){JS_ThrowOutOfMemory(ctx);return -1;}
+        c=webgl_sync(source,false);if(!c||!c->pixels){JS_ThrowOutOfMemory(ctx);return -1;}
         *pixels=c->pixels;*w=c->w;*h=c->h;*tainted=c->tainted;return 0;
     }
     web_doc *d=source->owner;if(!d)return 1;
@@ -482,6 +514,27 @@ JSValue web_canvas_draw_bitmap(JSContext *ctx,node_t *n,JSValueConst token,int a
     struct image_bitmap *b=bitmap_class?JS_GetOpaque2(ctx,token,bitmap_class):NULL;
     if(!b)return JS_ThrowTypeError(ctx,"Invalid ImageBitmap token");
     return canvas_draw_image(ctx,n,NULL,b,argc,argv);
+}
+int web_canvas_webgl_source(JSContext *ctx,node_t *source,JSValueConst bitmap,struct web_webgl_pixels *out) {
+    if (!source) {
+        struct image_bitmap *b=bitmap_class?JS_GetOpaque(bitmap,bitmap_class):NULL;
+        if (!b) return 0;
+        if (!b->pixels) { JS_ThrowTypeError(ctx,"The ImageBitmap is closed"); return -1; }
+        out->argb=b->pixels; out->width=b->w; out->height=b->h; out->tainted=b->tainted;
+        return 1;
+    }
+    if (source->type!=N_ELEM || source->foreign || (source->tag!=T_canvas && source->tag!=T_img)) return 0;
+    const uint32_t *pixels=NULL; unsigned w=0,h=0; bool tainted=false;
+    int status=canvas_source(ctx,source,&pixels,&w,&h,&tainted);
+    if (status<0) return -1;
+    if (status==2) return 2;
+    /* A zero-sized canvas is an empty image; a broken image has no pixels. */
+    if (status==1) {
+        if (source->tag==T_canvas) { out->argb=NULL; out->width=out->height=0; out->tainted=false; return 1; }
+        return 2;
+    }
+    out->argb=pixels; out->width=w; out->height=h; out->tainted=tainted;
+    return 1;
 }
 /* A synchronous borrowed packet rooted by the native call's arguments. The
  * JS WeakMap owns stop storage and rebuilds it only on addColorStop; no native
@@ -1018,7 +1071,7 @@ done:
 }
 
 void web_canvas_paint(node_t *n,canvas_t *dst,int x,int y,int w,int h) {
-    struct web_canvas *c=n?n->canvas:NULL;
+    struct web_canvas *c=n?webgl_sync(n,true):NULL;
     if (!c || !c->pixels || !c->w || !c->h || w<=0 || h<=0) return;
     int x0=MAX(x,dst->cx0),y0=MAX(y,dst->cy0),x1=MIN((int64_t)x+w,dst->cx1),y1=MIN((int64_t)y+h,dst->cy1);
     for (int yy=y0;yy<y1;yy++) {
@@ -1081,8 +1134,23 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
             if(stroke_inverse(matrix,query[0],query[1],local))hit=stroke_hit(points,bytes/16,local[0],local[1],width);
         }
         js_free(ctx,points); out=JS_NewBool(ctx,hit);
-    } else {
+    } else if (!strcmp(op,"webgl")) {
+        /* argv: op, version, WebGLContextAttributes, canvas wrapper */
+        int32_t version=1;
+        if (argc<4 || JS_ToInt32(ctx,&version,argv[1])<0) { out=argc<4?JS_ThrowTypeError(ctx,"Invalid WebGL packet"):JS_EXCEPTION; goto done; }
         struct web_canvas *c=ensure(n);
+        if (!c) { out=JS_NULL; goto done; }
+        if (c->webgl) { out=JS_ThrowTypeError(ctx,"Canvas already has a WebGL context"); goto done; }
+        struct web_webgl *gl=NULL;
+        out=web_webgl_create(ctx,argv[3],version==2?2:1,argv[2],c->w,c->h,&gl);
+        if (gl) {
+            web_webgl_retain(gl);
+            web_webgl_set_owner(gl,webgl_changed,n);
+            c->webgl=gl; c->webgl_serial=web_webgl_serial(gl);
+        }
+    } else {
+        struct web_canvas *c=webgl_sync(n,false);
+        if (!c || !c->webgl) c=ensure(n);
         if (!strcmp(op,"png") || !strcmp(op,"dataURL")) { out=canvas_export(ctx,n,c,!strcmp(op,"dataURL")); goto done; }
         if (!c) { out=!strcmp(op,"context")?JS_FALSE:JS_ThrowOutOfMemory(ctx); goto done; }
         if (!strcmp(op,"context")) out=JS_TRUE;
@@ -1201,6 +1269,17 @@ JSValue web_canvas_native(JSContext *ctx,node_t *n,int argc,JSValueConst *argv) 
                 size_t at=((size_t)j*w+i)*4; c->pixels[(size_t)yy*c->w+(size_t)xx]=((uint32_t)data[at+3]<<24)|((uint32_t)data[at]<<16)|((uint32_t)data[at+1]<<8)|data[at+2];
             }
             changed(n);
+        } else if (!strcmp(op,"frame")) {
+            /* argv: op, (Shared)ArrayBuffer, byte offset, width, height: a
+               frame an OffscreenCanvas committed to this placeholder, rows of
+               straight 0xAARRGGBB matching the bitmap size. */
+            size_t bytes=0,need; uint32_t offset,w,h;
+            uint8_t *data=argc>4?JS_GetArrayBuffer(ctx,&bytes,argv[1]):NULL;
+            if (!data) { out=JS_HasException(ctx)?JS_EXCEPTION:JS_ThrowTypeError(ctx,"Invalid Canvas frame"); goto done; }
+            if (JS_ToUint32(ctx,&offset,argv[2])||JS_ToUint32(ctx,&w,argv[3])||JS_ToUint32(ctx,&h,argv[4])) { out=JS_EXCEPTION; goto done; }
+            if (offset%4 || !canvas_extent(w,h,4,&need) || offset>bytes || bytes-offset<need) { out=JS_ThrowRangeError(ctx,"Invalid Canvas frame"); goto done; }
+            out=JS_FALSE;
+            if (c->pixels && w==c->w && h==c->h) { memcpy(c->pixels,data+offset,need); changed(n); out=JS_TRUE; }
         } else out=JS_ThrowTypeError(ctx,"Unsupported Canvas operation");
     }
 done:

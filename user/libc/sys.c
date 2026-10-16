@@ -15,8 +15,10 @@ struct libc_thread {
     struct libc_thread *self;
     int tid, error;
     void *slots[8];
+    void **tss;      /* C11 tss values, grown on demand (threads.c) */
+    size_t tss_cap;
 };
-static struct libc_thread main_thread;
+static unsigned char main_thread_area[sizeof(struct libc_thread) * 2] __attribute__((aligned(64)));
 static unsigned tls_initialized;
 static struct libc_thread *libc_thread_current(void) {
     struct libc_thread *t;
@@ -180,15 +182,36 @@ uint64_t uptime_ms(void) {
     return clock_publish(ms);
 }
 
-static void libc_thread_init(struct libc_thread *t) {
+/* ELF TLS (x86-64 variant II): the linked image ends at the FS control
+   block. Programs linked without these symbols (TinyCC) have no TLS. */
+extern char __tls_image[] __attribute__((weak)), __tls_image_end[] __attribute__((weak));
+extern char __tls_memsz[] __attribute__((weak)), __tls_align[] __attribute__((weak));
+static size_t libc_tls_align(void) {
+    size_t align = (size_t)__tls_align;
+    return align < _Alignof(struct libc_thread) ? _Alignof(struct libc_thread) : align;
+}
+static size_t libc_tls_size(void) {
+    size_t align = libc_tls_align();
+    return ((size_t)__tls_memsz + align - 1) & ~(align - 1);
+}
+/* Bytes a thread needs for its TLS block plus control block. */
+static size_t libc_thread_area(void) { return libc_tls_size() + libc_tls_align() + sizeof(struct libc_thread); }
+static struct libc_thread *libc_thread_init(void *area) {
+    size_t align = libc_tls_align(), size = libc_tls_size(), image = (size_t)(__tls_image_end - __tls_image);
+    uintptr_t tp = ((uintptr_t)area + size + align - 1) & ~(uintptr_t)(align - 1);
+    unsigned char *block = (unsigned char *)tp - size;
+    if (image) memcpy(block, __tls_image, image);
+    memset(block + image, 0, size - image);
+    struct libc_thread *t = (struct libc_thread *)tp;
     memset(t, 0, sizeof *t);
     t->self = t;
     t->tid = (int)SC0(SYS_THREAD_ID);
     SC2(SYS_THREAD_TLS, t, sizeof *t);
+    return t;
 }
 static _Noreturn void libc_thread_entry(void (*fn)(void *), void *arg) {
-    struct libc_thread local;
-    libc_thread_init(&local);
+    unsigned char area[libc_thread_area()] __attribute__((aligned(16)));
+    libc_thread_init(area);
     fn(arg);
     thread_exit();
 }
@@ -205,6 +228,23 @@ int thread_id(void) {
 unsigned cpu_index(void) { return (unsigned)SC0(SYS_CPU_INDEX); }
 int thread_stack_bounds(uintptr_t *low, uintptr_t *high) {
     return (int)ret(SC2(SYS_THREAD_STACK_BOUNDS, low, high));
+}
+/* The calling thread's C11 tss value array with room for `need` keys, or
+   NULL when it cannot grow (need == 0 only queries the current array). */
+void **__libc_tss_values(size_t need, size_t *capacity) {
+    struct libc_thread *t = libc_thread_current();
+    if (!t) return NULL;
+    if (need > t->tss_cap) {
+        size_t cap = t->tss_cap ? t->tss_cap : 8;
+        while (cap < need) cap *= 2;
+        void **grown = realloc(t->tss, cap * sizeof *grown);
+        if (!grown) return NULL;
+        memset(grown + t->tss_cap, 0, (cap - t->tss_cap) * sizeof *grown);
+        t->tss = grown;
+        t->tss_cap = cap;
+    }
+    if (capacity) *capacity = t->tss_cap;
+    return t->tss;
 }
 void *thread_local_get(unsigned slot) {
     struct libc_thread *t = libc_thread_current();
@@ -515,7 +555,13 @@ _Noreturn void abort(void) {
 }
 
 void __libc_init(void) {
-    libc_thread_init(&main_thread);
+    void *area = main_thread_area;
+    if (libc_thread_area() > sizeof main_thread_area) {
+        long r = __syscall(SYS_MMAP, (long)libc_thread_area(), N_PROT_WRITE, 0, 0, 0);
+        if (r < 0 && r > -4096) SC1(SYS_EXIT, 127);
+        area = (void *)r;
+    }
+    libc_thread_init(area);
     tls_initialized = 1;
     __stdio_init();
 }
@@ -542,6 +588,26 @@ void __libc_fini_array(void) {
     extern void (*__fini_array_end[])(void) __attribute__((weak));
     if (__fini_array_start)
         for (void (**fn)(void) = __fini_array_end; fn != __fini_array_start;) (*--fn)();
+}
+
+/* ---- native memory: zero-filled pages, never writable and executable at once ---- */
+static int memory_prot(int access) {
+    return access == N_MEMORY_READ_WRITE ? N_PROT_WRITE : access == N_MEMORY_READ_EXECUTE ? N_PROT_EXEC :
+           access == N_MEMORY_READ ? 0 : -1;
+}
+void *n_memory_reserve(size_t bytes, int access) {
+    int prot = memory_prot(access);
+    if (!bytes || prot < 0) { errno = N_ERR_INVALID; return NULL; }
+    long r = ret(__syscall(SYS_MMAP, (long)bytes, prot, 0, 0, 0));
+    return r < 0 ? NULL : (void *)r;
+}
+int n_memory_release(void *addr, size_t bytes) {
+    return (int)ret(__syscall(SYS_MUNMAP, (long)addr, (long)bytes, 0, 0, 0));
+}
+int n_memory_protect(void *addr, size_t bytes, int access) {
+    int prot = memory_prot(access);
+    if (prot < 0) { errno = N_ERR_INVALID; return -1; }
+    return (int)ret(__syscall(SYS_MPROTECT, (long)addr, (long)bytes, prot, 0, 0));
 }
 
 /* ---- sys/mman.h: anonymous memory only ---- */

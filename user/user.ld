@@ -24,6 +24,14 @@ SECTIONS
         KEEP(*(.fini_array))
         __fini_array_end = .;
     }
+    /* ELF thread-local storage: libc copies this image below each thread's
+       FS-based control block (x86-64 variant II). */
+    .tdata : { *(.tdata .tdata.*) }
+    .tbss : { *(.tbss .tbss.*) *(.tcommon) }
+    __tls_image = ADDR(.tdata);
+    __tls_image_end = ADDR(.tdata) + SIZEOF(.tdata);
+    __tls_memsz = ADDR(.tbss) + SIZEOF(.tbss) - ADDR(.tdata);
+    __tls_align = MAX(ALIGNOF(.tdata), ALIGNOF(.tbss));
     .bss : { *(.bss .bss.*) *(COMMON) }
     /DISCARD/ : { *(.eh_frame*) *(.note .note.*) *(.comment) }
 }

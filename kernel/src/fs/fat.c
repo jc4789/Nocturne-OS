@@ -110,11 +110,11 @@ static int fat_set(struct fat_fs *fs, uint32_t c, uint32_t v) {
     uint64_t off = (uint64_t)c * 4;
     uint64_t lba = fs->reserved + off / SECTOR;
     uint8_t *s = fat_sector(fs, lba);
-    if (!s) return -EIO;
+    if (!s) return -N_ERR_IO;
     uint32_t *p = (uint32_t *)(s + off % SECTOR);
     *p = (*p & 0xF0000000) | (v & 0x0FFFFFFF);
     for (uint32_t f = 0; f < fs->nfats; f++)
-        if (disk_write(fs, lba + (uint64_t)f * fs->fat_sectors, 1, s) < 0) return -EIO;
+        if (disk_write(fs, lba + (uint64_t)f * fs->fat_sectors, 1, s) < 0) return -N_ERR_IO;
     return 0;
 }
 
@@ -185,7 +185,7 @@ static uint8_t *dir_load(struct fat_fs *fs, uint32_t first, uint32_t *len) {
 /* write back the sector holding directory byte offset off (from a loaded copy) */
 static int dir_store(struct fat_fs *fs, uint32_t first, const uint8_t *buf, uint32_t off) {
     uint32_t c = chain_nth(fs, first, off / fs->cbytes);
-    if (!c) return -EIO;
+    if (!c) return -N_ERR_IO;
     uint32_t in = off % fs->cbytes;
     return disk_write(fs, clus_lba(fs, c) + in / SECTOR, 1, buf + (off - in % SECTOR));
 }
@@ -362,11 +362,11 @@ static int node_sync(struct vnode *v) {
     if (v == fs->root || v->unlinked) return 0; /* an unlinked file has no entry any more */
     uint32_t dirc = n->dir_clus ? n->dir_clus : fs->root_clus;
     uint32_t c = chain_nth(fs, dirc, n->ent_off / fs->cbytes);
-    if (!c) return -EIO;
+    if (!c) return -N_ERR_IO;
     uint32_t in = n->ent_off % fs->cbytes;
     uint64_t lba = clus_lba(fs, c) + in / SECTOR;
     uint8_t sec[SECTOR];
-    if (disk_read(fs, lba, 1, sec) < 0) return -EIO;
+    if (disk_read(fs, lba, 1, sec) < 0) return -N_ERR_IO;
     struct fat_dirent *d = (struct fat_dirent *)(sec + in % SECTOR);
     d->clus_hi = (uint16_t)(n->first >> 16);
     d->clus_lo = (uint16_t)n->first;
@@ -385,7 +385,7 @@ static int64_t fat_read(struct vnode *v, struct file *f, void *buf, uint64_t off
     if (off >= v->size) return 0;
     if (off + len > v->size) len = v->size - off;
     uint8_t *tmp = kmalloc(fs->cbytes);
-    if (!tmp) return -ENOMEM;
+    if (!tmp) return -N_ERR_NO_MEMORY;
     uint32_t c = chain_nth(fs, n->first, off / fs->cbytes);
     size_t done = 0;
     while (done < len && c) {
@@ -401,7 +401,7 @@ static int64_t fat_read(struct vnode *v, struct file *f, void *buf, uint64_t off
         if (done < len) c = chain_nth(fs, c, 1);
     }
     kfree(tmp);
-    return done ? (int64_t)done : -EIO;
+    return done ? (int64_t)done : -N_ERR_IO;
 }
 
 /* Store len bytes at off, growing the chain as needed. A NULL buf stores
@@ -411,7 +411,7 @@ static int64_t fat_store(struct vnode *v, const void *buf, uint64_t off, uint64_
     struct fat_node *n = v->priv;
     struct fat_fs *fs = n->fs;
     if (!len) return 0;
-    if (off + len > 0xFFFFFFFFull) return -ENOSPC; /* FAT32 file size limit */
+    if (off + len > 0xFFFFFFFFull) return -N_ERR_NO_SPACE; /* FAT32 file size limit */
     uint64_t need = (off + len + fs->cbytes - 1) / fs->cbytes;
     /* grow the chain to cover the write */
     uint64_t have = 0;
@@ -422,13 +422,13 @@ static int64_t fat_store(struct vnode *v, const void *buf, uint64_t off, uint64_
     }
     while (have < need) {
         uint32_t c = clus_alloc(fs, last, false);
-        if (!c) return -ENOSPC;
+        if (!c) return -N_ERR_NO_SPACE;
         if (!n->first) n->first = c;
         last = c;
         have++;
     }
     uint8_t *tmp = kmalloc(fs->cbytes);
-    if (!tmp) return -ENOMEM;
+    if (!tmp) return -N_ERR_NO_MEMORY;
     uint32_t c = chain_nth(fs, n->first, off / fs->cbytes);
     uint64_t done = 0;
     int err = 0;
@@ -460,7 +460,7 @@ static int64_t fat_store(struct vnode *v, const void *buf, uint64_t off, uint64_
     if (off + done > v->size) v->size = off + done;
     v->mtime = time_now();
     node_sync(v);
-    return done ? (int64_t)done : -EIO;
+    return done ? (int64_t)done : -N_ERR_IO;
 }
 
 static int64_t fat_write(struct vnode *v, struct file *f, const void *buf, uint64_t off, size_t len) {
@@ -469,7 +469,7 @@ static int64_t fat_write(struct vnode *v, struct file *f, const void *buf, uint6
         uint64_t gap = off - v->size;
         int64_t r = fat_store(v, NULL, v->size, gap);
         if (r < 0) return r;
-        if ((uint64_t)r < gap) return -EIO;
+        if ((uint64_t)r < gap) return -N_ERR_IO;
     }
     return fat_store(v, buf, off, len);
 }
@@ -482,7 +482,7 @@ static int fat_truncate(struct vnode *v, uint64_t size) {
         if (!grow) return node_sync(v);
         int64_t r = fat_store(v, NULL, v->size, grow);
         if (r < 0) return (int)r;
-        return (uint64_t)r < grow ? -EIO : 0;
+        return (uint64_t)r < grow ? -N_ERR_IO : 0;
     }
     uint64_t keep = (size + fs->cbytes - 1) / fs->cbytes;
     if (keep == 0) {
@@ -510,7 +510,7 @@ static int fat_readdir(struct vnode *dir, uint64_t idx, struct dirent *out) {
     struct fat_fs *fs = ((struct fat_node *)dir->priv)->fs;
     uint32_t len;
     uint8_t *buf = dir_load(fs, dir_first(dir), &len);
-    if (!buf) return -EIO;
+    if (!buf) return -N_ERR_IO;
     uint32_t pos = 0;
     struct entry e;
     uint64_t i = 0;
@@ -591,19 +591,19 @@ static void make_short(const uint8_t *buf, uint32_t len, const char *name, uint8
 static int fat_create(struct vnode *dir, const char *name, int type, struct vnode **outv) {
     struct fat_node *dn = dir->priv;
     struct fat_fs *fs = dn->fs;
-    if (type != VT_FILE && type != VT_DIR) return -EINVAL;
+    if (type != VT_FILE && type != VT_DIR) return -N_ERR_INVALID;
     size_t nl = strlen(name);
-    if (!nl || nl >= NAME_MAX_LEN) return -ENAMETOOLONG;
+    if (!nl || nl >= NAME_MAX_LEN) return -N_ERR_NAME_TOO_LONG;
     for (const char *p = name; *p; p++)
-        if (strchr("\\/:*?\"<>|", *p) || (uint8_t)*p < 32) return -EINVAL;
+        if (strchr("\\/:*?\"<>|", *p) || (uint8_t)*p < 32) return -N_ERR_INVALID;
     uint32_t first = dir_first(dir);
     uint32_t len;
     uint8_t *buf = dir_load(fs, first, &len);
-    if (!buf) return -EIO;
+    if (!buf) return -N_ERR_IO;
     struct entry e;
     if (dir_find(buf, len, name, &e)) {
         kfree(buf);
-        return -EEXIST;
+        return -N_ERR_EXISTS;
     }
     uint8_t sn[11];
     make_short(buf, len, name, sn);
@@ -639,7 +639,7 @@ static int fat_create(struct vnode *dir, const char *name, int type, struct vnod
         uint8_t *nb = kmalloc(len + (size_t)add * fs->cbytes);
         if (!nb) {
             kfree(buf);
-            return -ENOMEM;
+            return -N_ERR_NO_MEMORY;
         }
         memcpy(nb, buf, len);
         memset(nb + len, 0, (size_t)add * fs->cbytes);
@@ -649,7 +649,7 @@ static int fat_create(struct vnode *dir, const char *name, int type, struct vnod
             last = clus_alloc(fs, last, true);
             if (!last) {
                 kfree(buf);
-                return -ENOSPC;
+                return -N_ERR_NO_SPACE;
             }
         }
         slot = len - tail_free * 32;
@@ -661,7 +661,7 @@ static int fat_create(struct vnode *dir, const char *name, int type, struct vnod
         clus = clus_alloc(fs, 0, true);
         if (!clus) {
             kfree(buf);
-            return -ENOSPC;
+            return -N_ERR_NO_SPACE;
         }
         uint8_t *z = kzalloc(fs->cbytes);
         struct fat_dirent *d = (struct fat_dirent *)z;
@@ -720,7 +720,7 @@ static int fat_create(struct vnode *dir, const char *name, int type, struct vnod
     kfree(buf);
     if (err) return err;
     struct vnode *v = node_get(fs, dir == fs->root ? 0 : first, &ne);
-    if (!v) return -ENOMEM;
+    if (!v) return -N_ERR_NO_MEMORY;
     v->parent = dir;
     *outv = v;
     return 0;
@@ -732,11 +732,11 @@ static int fat_unlink(struct vnode *dir, const char *name) {
     uint32_t first = dir_first(dir);
     uint32_t len;
     uint8_t *buf = dir_load(fs, first, &len);
-    if (!buf) return -EIO;
+    if (!buf) return -N_ERR_IO;
     struct entry e;
     if (!dir_find(buf, len, name, &e)) {
         kfree(buf);
-        return -ENOENT;
+        return -N_ERR_NOT_FOUND;
     }
     uint32_t clus = (uint32_t)e.d.clus_hi << 16 | e.d.clus_lo;
     if (e.d.attr & ATTR_DIR) {
@@ -749,7 +749,7 @@ static int fat_unlink(struct vnode *dir, const char *name) {
                 if (strcmp(se.name, ".") && strcmp(se.name, "..")) {
                     kfree(sub);
                     kfree(buf);
-                    return -ENOTEMPTY;
+                    return -N_ERR_NOT_EMPTY;
                 }
             }
             kfree(sub);

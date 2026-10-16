@@ -53,6 +53,12 @@ int msleep(unsigned ms);
 unsigned sleep(unsigned s);
 uint64_t uptime_ms(void);
 int pipe(int fds[2]);
+/* Native memory (docs/nocturne-native-abi.md §7): zero-filled pages with
+ * N_MEMORY_READ, _READ_WRITE or _READ_EXECUTE access. reserve returns NULL and
+ * sets errno on failure; release and protect return -1. */
+void *n_memory_reserve(size_t bytes, int access);
+int n_memory_release(void *addr, size_t bytes);
+int n_memory_protect(void *addr, size_t bytes, int access);
 /* Native shared-page object. Descriptors are private capabilities; importing
  * another process's descriptor is permitted only between direct parent/child.
  * A mapping retains the object after close and is released by whole munmap. */

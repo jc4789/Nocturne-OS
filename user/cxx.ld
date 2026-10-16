@@ -1,9 +1,3 @@
 INCLUDE user/user.ld
-/* The loader does not install ELF TLS. Reject language thread_local instead
-   of letting it address Nocturne's unrelated native per-thread libc state. */
-SECTIONS {
-    .tdata : { *(.tdata .tdata.*) }
-    .tbss : { *(.tbss .tbss.*) }
-}
-ASSERT(SIZEOF(.tdata) == 0 && SIZEOF(.tbss) == 0,
-       "ELF thread_local is unsupported; use Nocturne native TLS")
+/* C++ programs share the C layout; user.ld installs ELF thread_local, so a
+   language thread_local and libc's native per-thread state stay distinct. */

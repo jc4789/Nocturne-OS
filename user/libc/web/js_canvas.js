@@ -1,5 +1,6 @@
-/* Real Canvas2D subset. Unsupported GPU contexts return null rather
- * than a fabricated WebGL object. Native storage is painted by web_paint. */
+/* Real Canvas2D subset and the WebGL 1/2 attachment (native Mesa softpipe
+ * contexts, js_webgl.c); other context types return null. Native storage is
+ * painted by web_paint. */
 const canvasBridge = (() => {
     'use strict';
     const define=Object.defineProperty, create=Object.create, number=Number, string=elementURL.string;
@@ -295,18 +296,26 @@ const canvasBridge = (() => {
         if(m[0]===1&&m[1]===0&&m[2]===0&&m[3]===1)native(s.canvas,op,v[0]+m[4],v[1]+m[5],v[2],v[3],color(s),painter);
         else {const p=[point(s,v[0],v[1]),point(s,v[0]+v[2],v[1]),point(s,v[0]+v[2],v[1]+v[3]),point(s,v[0],v[1]+v[3])];native(s.canvas,'poly',pathBuffer(p.flat()),color(s),false,op==='clear',painter);}}
     /* Placeholder canvases are driven by their OffscreenCanvas. */
-    const placeholders=new WeakSet();
+    const placeholders=new WeakSet(), glContexts=new WeakMap(), webglVersion=offscreenCanvasBridge.webglVersion;
     function owned(canvas){if(placeholders.has(canvas))throw namedError('InvalidStateError','The canvas has transferred control to an OffscreenCanvas');}
     for(const name of ['width','height'])define(HTMLCanvasElement.prototype,name,{configurable:true,enumerable:true,
         get(){htmlElementBrand(this,'canvas');return native(this,name);},set(value){htmlElementBrand(this,'canvas');value=string(number(value)>>>0);owned(this);reflectedAttr(this,name,value);}});
     define(HTMLCanvasElement.prototype,'transferControlToOffscreen',{configurable:true,writable:true,value:function(){
         htmlElementBrand(this,'canvas');
-        if(contexts.has(this)||placeholders.has(this))throw namedError('InvalidStateError','The canvas already has a rendering context');
+        if(contexts.has(this)||glContexts.has(this)||placeholders.has(this))throw namedError('InvalidStateError','The canvas already has a rendering context');
         placeholders.add(this);return offscreenCanvasBridge.placeholder(this,native(this,'width'),native(this,'height'));
     }});
     define(HTMLCanvasElement.prototype,'getContext',{configurable:true,writable:true,value:function(type,options){
         htmlElementBrand(this,'canvas');if(!arguments.length)throw new TypeError('getContext requires context type');
-        type=string(type);if(debugProbe)native(this,'contextProbe',type);owned(this);if(type!=='2d')return null;
+        type=string(type);if(debugProbe)native(this,'contextProbe',type);owned(this);
+        const version=webglVersion(type);
+        if(version){
+            const existing=glContexts.get(this);if(existing)return existing.version===version?existing.ctx:null;
+            if(contexts.has(this))return null;
+            const ctx=native(this,'webgl',version,options,this);
+            if(ctx)glContexts.set(this,{version,ctx});return ctx;
+        }
+        if(type!=='2d'||glContexts.has(this))return null;
         let ctx=contexts.get(this);if(ctx)return ctx;
         if(!native(this,'context'))return null;
         ctx=create(CanvasRenderingContext2D.prototype);const s={canvas:this,version:native(this,'version')};defaults(s);states.set(ctx,s);contexts.set(this,ctx);return ctx;
@@ -385,7 +394,28 @@ const canvasBridge = (() => {
     for(const key of Reflect.ownKeys(CanvasRenderingContext2D.prototype))
         if(key!=='constructor'&&key!=='canvas')define(OffscreenCanvasRenderingContext2D.prototype,key,Object.getOwnPropertyDescriptor(CanvasRenderingContext2D.prototype,key));
     define(OffscreenCanvasRenderingContext2D.prototype,'canvas',{enumerable:true,configurable:true,get(){const s=state(this);if(!s.owner)throw new TypeError('Illegal OffscreenCanvasRenderingContext2D receiver');return s.owner;}});
+    /* WebGL TexImageSource resolution for the native context: ImageBitmap
+       tokens and DOM nodes are decoded natively, ImageData crosses as
+       [width,height,RGBA ArrayBuffer,tainted]. */
+    const bufferSlice=ArrayBuffer.prototype.slice;
+    function webglSource(value){
+        if(value===null||(typeof value!=='object'&&typeof value!=='function'))return undefined;
+        const token=bitmaps.get(value);if(token)return token;
+        const im=images.get(value);
+        if(im){const data=im.data,offset=apply(byteOffset,data,[]);let buffer=apply(byteBuffer,data,[]);
+            if(offset)buffer=apply(bufferSlice,buffer,[offset,offset+im.w*im.h*4]);return [im.w,im.h,buffer,false];}
+        const offscreen=offscreenCanvasBridge.backing(value);
+        if(offscreen!==undefined)return offscreen===null?undefined:offscreen;
+        return value;
+    }
+    offscreenCanvasBridge.bindWebGL(webglSource,defer);
     offscreenCanvasBridge.attachRaster({
+        webgl(element,version,options,owner){return native(element,'webgl',version,options,owner);},
+        frame(element,buffer,offset,width,height){
+            if(native(element,'width')!==width)reflectedAttr(element,'width',string(width));
+            if(native(element,'height')!==height)reflectedAttr(element,'height',string(height));
+            native(element,'frame',buffer,offset,width,height);
+        },
         create(width,height){const element=rawDom.create(null,1,'canvas','');reflectedAttr(element,'width',string(width));reflectedAttr(element,'height',string(height));return element;},
         resize(element,name,value){reflectedAttr(element,name,string(value));},
         context(element,owner){

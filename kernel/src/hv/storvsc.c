@@ -122,7 +122,7 @@ static int exchange(struct storvsc *s, struct vstor_packet *p, uint32_t len) {
     if (r < 0) return r;
     if (!vmbus_wait(&s->done, 10000)) {
         kprintf("storvsc: request timed out\n");
-        return -ETIMEDOUT;
+        return -N_ERR_TIMEOUT;
     }
     return 0;
 }
@@ -132,7 +132,7 @@ static int control(struct storvsc *s, uint32_t op, struct vstor_packet *p) {
     p->flags = VSTOR_REQUEST_COMPLETION;
     int r = exchange(s, p, 0);
     if (r) return r;
-    return s->reply.status ? -EIO : 0;
+    return s->reply.status ? -N_ERR_IO : 0;
 }
 
 /* Run one SCSI command against `lun`; data goes through the bounce buffer. */
@@ -153,13 +153,13 @@ static int scsi(struct storvsc *s, uint8_t lun, const uint8_t *cdb, uint8_t cdb_
     p.srb.timeout = 60;
     int r = exchange(s, &p, dir == DIR_NONE ? 0 : len);
     if (r) return r;
-    if (s->reply.status || (s->reply.srb.srb_status & 0x3F) != SRB_STATUS_SUCCESS || s->reply.srb.scsi_status) return -EIO;
+    if (s->reply.status || (s->reply.srb.srb_status & 0x3F) != SRB_STATUS_SUCCESS || s->reply.srb.scsi_status) return -N_ERR_IO;
     return 0;
 }
 
 static int rw(struct scsi_disk *d, uint64_t lba, uint32_t count, uint8_t *buf, bool write) {
     struct storvsc *s = d->hba;
-    if (lba + count > d->blk.sectors || lba + count > 0xFFFFFFFFull) return -EIO;
+    if (lba + count > d->blk.sectors || lba + count > 0xFFFFFFFFull) return -N_ERR_IO;
     while (count) {
         uint32_t n = MIN(count, s->max_sectors);
         uint8_t cdb[10] = {write ? 0x2A : 0x28, 0, (uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8),

@@ -171,9 +171,9 @@ static int send_section(uint32_t sec, uint32_t len, bool control) {
 
 /* Copy an RNDIS message into a free section and send it. */
 static int send_rndis(const void *msg, uint32_t len, bool control) {
-    if (len > nv.section_size) return -EINVAL;
+    if (len > nv.section_size) return -N_ERR_INVALID;
     uint32_t sec = section_alloc();
-    if (sec == INVALID_SECTION) return -EAGAIN;
+    if (sec == INVALID_SECTION) return -N_ERR_NOT_READY;
     memcpy(nv.send_buf + (size_t)sec * nv.section_size, msg, len);
     int r = send_section(sec, len, control);
     if (r) section_free(sec);
@@ -259,7 +259,7 @@ static bool complete_receive(void) {
     uint32_t m[NVSP_MSG_SIZE / 4] = {NVSP_SEND_RNDIS_PKT_COMPLETE, NVSP_STATUS_SUCCESS};
     int result = vmbus_send(nv.ch, VM_PKT_COMP, 0, m, sizeof m, d->trans_id);
     if (result) {
-        if (result == -EAGAIN) nv.rx_completion_retries++;
+        if (result == -N_ERR_NOT_READY) nv.rx_completion_retries++;
         /* Keep both the exact transaction ID and ownership on every failure.
            Only successful enqueue, or channel teardown, retires this borrow. */
         return false;
@@ -633,12 +633,12 @@ static bool rndis_set(uint32_t oid, const void *val, uint32_t len) {
 }
 
 static int netvsc_send(const void *frame, size_t len) {
-    if (!nv.ch || nv.detaching || nv.ch->rescinded) return -ENETDOWN;
-    if (len > 1514 || sizeof(struct rndis_packet) + len > nv.section_size) return -EINVAL;
+    if (!nv.ch || nv.detaching || nv.ch->rescinded) return -N_ERR_NETWORK_DOWN;
+    if (len > 1514 || sizeof(struct rndis_packet) + len > nv.section_size) return -N_ERR_INVALID;
     uint32_t sec = section_alloc();
     if (sec == INVALID_SECTION) {
         nv.tx_backpressure++;
-        return -EAGAIN;
+        return -N_ERR_NOT_READY;
     }
     uint8_t *p = nv.send_buf + (size_t)sec * nv.section_size;
     struct rndis_packet *rp = (void *)p;
@@ -651,7 +651,7 @@ static int netvsc_send(const void *frame, size_t len) {
     int r = send_section(sec, rp->h.len, false);
     if (r) {
         section_free(sec);
-        if (r == -EAGAIN) nv.tx_backpressure++;
+        if (r == -N_ERR_NOT_READY) nv.tx_backpressure++;
     }
     return r;
 }

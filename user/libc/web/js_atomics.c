@@ -142,6 +142,20 @@ static JSValue native_import(JSContext *ctx, JSValueConst this_val, int argc, JS
     struct shared_region *region = region_import(ctx, argv[0], &offset, &length, N_PROT_WRITE);
     return region ? region_buffer(ctx, region, offset, length) : JS_EXCEPTION;
 }
+/* host.sharedBufferReserve(bytes): a SharedArrayBuffer whose pages are
+   zero-filled at first touch, unlike the constructor's eager clear, for
+   large mostly-unused regions such as an OffscreenCanvas frame link. */
+static JSValue native_reserve(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc;
+    double requested;
+    if (JS_ToFloat64(ctx, &requested, argv[0])) return JS_EXCEPTION;
+    if (!(requested >= 1) || requested > (double)(SIZE_MAX / 2)) return JS_ThrowRangeError(ctx, "Invalid shared buffer size");
+    size_t length = (size_t)requested, bytes = page_round(length);
+    int fd = bytes ? n_shared_reserve(bytes) : -1;
+    struct shared_region *region = fd >= 0 ? region_map(fd, bytes, N_PROT_WRITE) : NULL;
+    if (!region) return JS_ThrowRangeError(ctx, "Shared memory could not be reserved");
+    return region_buffer(ctx, region, 0, length);
+}
 static JSValue native_alias(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     (void)this_val; (void)argc;
     size_t offset = 0, length = 0;
@@ -249,6 +263,7 @@ void web_atomics_host_init(JSContext *ctx, JSValueConst host) {
         JS_CFUNC_DEF("sharedBufferExport", 1, native_export),
         JS_CFUNC_DEF("sharedBufferImport", 1, native_import),
         JS_CFUNC_DEF("sharedBufferAlias", 1, native_alias),
+        JS_CFUNC_DEF("sharedBufferReserve", 1, native_reserve),
     };
     JS_SetPropertyFunctionList(ctx, host, functions, sizeof functions / sizeof *functions);
     /* The brand for structured clone, without allocating a shared region:

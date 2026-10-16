@@ -217,7 +217,8 @@ WASM_RT_INPUTS := $(wildcard third_party/wabt/wasm2c/* ports/wabt/include/*.h)
 CXX_RUNTIME_OBJ := $(addprefix $(BUILD)/cxx/libcxx/,algorithm.o hash.o memory.o string.o vector.o verbose_abort.o)
 WASM_BRIDGE := $(BUILD)/u/user/libc/web/js_wasm.cpp.o
 WASM_LINK := $(WASM_BRIDGE) $(BUILD)/u/user/libc/cxxabi.cpp.o $(WABT_OBJ) $(WASM2C_OBJ) $(CXX_RUNTIME_OBJ) $(BUILD)/tcc/libtcc.o $(WASM_RT_OBJ) $(BUILD)/u/ports/wabt/wasm_rt_symbols.o
-LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(FT_OBJ) $(WASM_LINK)
+include ports/mesa/mesa.mk
+LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(FT_OBJ) $(WASM_LINK) $(MESA_OBJ)
 LIBC_RSP := $(BUILD)/libc-objects.list
 
 # Windowsのコマンド長上限を超えないよう、lldとsysrootに同じobject一覧を渡す。

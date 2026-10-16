@@ -454,11 +454,11 @@ static void free_task(struct task *t) {
 
 int task_fd_reserve(struct task *owner,size_t minimum) {
     const size_t limit=(size_t)INT32_MAX+1;
-    if(minimum>limit || minimum>SIZE_MAX/sizeof *owner->fds)return -EMFILE;
+    if(minimum>limit || minimum>SIZE_MAX/sizeof *owner->fds)return -N_ERR_NO_MEMORY;
     if(minimum<=owner->fd_capacity)return 0;
     size_t capacity=owner->fd_capacity;
     while(capacity<minimum){if(capacity>limit/2){capacity=minimum;break;}capacity*=2;}
-    struct file **fds=kzalloc(capacity*sizeof *fds);if(!fds)return -ENOMEM;
+    struct file **fds=kzalloc(capacity*sizeof *fds);if(!fds)return -N_ERR_NO_MEMORY;
     memcpy(fds,owner->fds,owner->fd_capacity*sizeof *fds);
     if(owner->fds!=owner->initial_fds)kfree(owner->fds);
     owner->fds=fds;owner->fd_capacity=capacity;return 0;
@@ -633,13 +633,13 @@ void sleep_ms(uint64_t ms) { wq_wait_timeout(NULL, ms); }
 
 static int task_thread_create_locked(uint64_t entry, uint64_t function, uint64_t argument) {
     struct task *owner = task_process();
-    if (!owner->is_user || owner->exiting || owner->killed) return -EINTR;
+    if (!owner->is_user || owner->exiting || owner->killed) return -N_ERR_STOPPED;
     unsigned count = 0;
     for (struct task *p = task_list; p; p = p->all_next)
         if (p->is_thread && p->process == owner) count++;
-    if (count >= 128) return -EAGAIN;
+    if (count >= 128) return -N_ERR_NOT_READY;
     struct task *t = task_alloc(owner->name);
-    if (!t) return -ENOMEM;
+    if (!t) return -N_ERR_NO_MEMORY;
     t->is_user = t->is_thread = true;
     t->process = t->parent = owner;
     t->pml4 = owner->pml4;
@@ -648,12 +648,12 @@ static int task_thread_create_locked(uint64_t entry, uint64_t function, uint64_t
     uint64_t reserved = mmap_reserve(owner, t->user_stack_size + PAGE_SIZE);
     if (!reserved) {
         free_task(t);
-        return -ENOMEM;
+        return -N_ERR_NO_MEMORY;
     }
     t->user_stack = reserved + PAGE_SIZE;
     if (vmm_user_alloc(t->pml4, t->user_stack, t->user_stack_size, VM_W) < 0) {
         free_task(t); /* frees the partial stack and returns its reservation */
-        return -ENOMEM;
+        return -N_ERR_NO_MEMORY;
     }
     extern void user_trampoline(void);
     struct regs frame;
@@ -688,7 +688,7 @@ int task_thread_join(int tid) {
         if (p->pid == tid && p->is_thread && p->process == owner) { t = p; break; }
     if (!t || t == current_task || t->joining) {
         irq_restore(flags);
-        return -EINVAL;
+        return -N_ERR_INVALID;
     }
     t->joining = true;
     for (;;) {
@@ -696,7 +696,7 @@ int task_thread_join(int tid) {
             t->joining = false;
             wq_wake_all(&owner->child_wait);
             irq_restore(flags);
-            return -EINTR;
+            return -N_ERR_STOPPED;
         }
         if (t->state == TASK_ZOMBIE) break;
         wq_wait(&owner->child_wait);
@@ -725,17 +725,17 @@ int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsi
     uint64_t flags = irq_save();
     /* Kill and enrollment are both BSP-owned. A queued/migrated syscall must
        never register an infinite wait after its kill wake already happened. */
-    if (current_task->killed) { irq_restore(flags); return -EINTR; }
+    if (current_task->killed) { irq_restore(flags); return -N_ERR_STOPPED; }
     uint64_t current = wide ? __atomic_load_n((volatile uint64_t *)address, __ATOMIC_ACQUIRE)
                             : __atomic_load_n((volatile uint32_t *)address, __ATOMIC_ACQUIRE);
     if (current != expected) {
         irq_restore(flags);
-        return -EAGAIN;
+        return -N_ERR_NOT_READY;
     }
-    if (!timeout_ms) { irq_restore(flags); return -ETIMEDOUT; }
+    if (!timeout_ms) { irq_restore(flags); return -N_ERR_TIMEOUT; }
     struct task *t = current_task;
     uint64_t phys = vmm_translate(t->pml4, (uint64_t)address);
-    if (!phys) { irq_restore(flags); return -EFAULT; }
+    if (!phys) { irq_restore(flags); return -N_ERR_BAD_ADDRESS; }
     t->wait_phys = phys;
     t->wait_seq = ++address_seq;
     bool awake = true;
@@ -743,8 +743,8 @@ int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsi
     else awake = wq_wait_timeout(&address_wait, timeout_ms);
     t->wait_phys = 0;
     irq_restore(flags);
-    if (t->killed) return -EINTR;
-    return awake ? 0 : -ETIMEDOUT;
+    if (t->killed) return -N_ERR_STOPPED;
+    return awake ? 0 : -N_ERR_TIMEOUT;
 }
 
 static void address_watch_unlink(struct address_watch **link) {
@@ -791,11 +791,11 @@ static int64_t address_watch_read_user(struct vnode *v, struct file *f, void *bu
     (void)f; (void)off;
     struct address_watch_queue *q = v->priv;
     size_t want = n / sizeof(uint64_t), got = 0;
-    if (!want) return -EINVAL;
+    if (!want) return -N_ERR_INVALID;
     struct address_watch *done = NULL;
     uint64_t flags = irq_save();
-    if (!q->ready) { irq_restore(flags); return -EAGAIN; }
-    if (!user_ok_w(buf, want * sizeof(uint64_t))) { irq_restore(flags); return -EFAULT; }
+    if (!q->ready) { irq_restore(flags); return -N_ERR_NOT_READY; }
+    if (!user_ok_w(buf, want * sizeof(uint64_t))) { irq_restore(flags); return -N_ERR_BAD_ADDRESS; }
     while (q->ready && got < want) {
         struct address_watch *w = q->ready;
         q->ready = w->next;
@@ -843,13 +843,13 @@ struct vnode *address_watch_queue_new(void) {
 }
 
 int address_watch_add(struct vnode *queue, volatile uint32_t *address, uint32_t expected, uint64_t token) {
-    if (!queue || queue->type != VT_ADDRESS_WATCH) return -EBADF;
+    if (!queue || queue->type != VT_ADDRESS_WATCH) return -N_ERR_NO_HANDLE;
     struct address_watch *w = kzalloc(sizeof *w);
-    if (!w) return -ENOMEM;
+    if (!w) return -N_ERR_NO_MEMORY;
     uint64_t flags = irq_save();
-    if (__atomic_load_n(address, __ATOMIC_ACQUIRE) != expected) { irq_restore(flags); kfree(w); return -EAGAIN; }
+    if (__atomic_load_n(address, __ATOMIC_ACQUIRE) != expected) { irq_restore(flags); kfree(w); return -N_ERR_NOT_READY; }
     uint64_t phys = vmm_translate(current_task->pml4, (uint64_t)address);
-    if (!phys) { irq_restore(flags); kfree(w); return -EFAULT; }
+    if (!phys) { irq_restore(flags); kfree(w); return -N_ERR_BAD_ADDRESS; }
     w->queue = queue->priv; w->phys = phys; w->seq = ++address_seq; w->token = token;
     *address_watch_tail = w;
     address_watch_tail = &w->next;
@@ -858,7 +858,7 @@ int address_watch_add(struct vnode *queue, volatile uint32_t *address, uint32_t 
 }
 
 int address_watch_remove(struct vnode *queue, uint64_t token) {
-    if (!queue || queue->type != VT_ADDRESS_WATCH) return -EBADF;
+    if (!queue || queue->type != VT_ADDRESS_WATCH) return -N_ERR_NO_HANDLE;
     struct address_watch_queue *q = queue->priv;
     struct address_watch *found = NULL;
     int result = 0;
@@ -978,8 +978,8 @@ NORETURN void task_exit(int code) {
 int task_kill(int pid) {
     uint64_t f = irq_save();
     struct task *t = task_find(pid);
-    if (!t || t == idle_task) { irq_restore(f); return -ESRCH; }
-    if (!t->is_user) { irq_restore(f); return -EPERM; }
+    if (!t || t == idle_task) { irq_restore(f); return -N_ERR_NO_APP; }
+    if (!t->is_user) { irq_restore(f); return -N_ERR_DENIED; }
     sched_quiesce_space(t->pml4);
     if (!t->killed) t->kill_code = 130;
     t->killed = true;
@@ -1001,7 +1001,7 @@ int task_wait(int pid, int *status, bool nohang) {
     struct task *me = task_process();
     for (;;) {
         uint64_t f = irq_save();
-        if (current_task->killed || me->exiting) { irq_restore(f); return -EINTR; }
+        if (current_task->killed || me->exiting) { irq_restore(f); return -N_ERR_STOPPED; }
         bool have_child = false;
         for (struct task *c = task_list; c; c = c->all_next) {
             if (c->parent != me || c->is_thread) continue;
@@ -1017,7 +1017,7 @@ int task_wait(int pid, int *status, bool nohang) {
         }
         if (!have_child) {
             irq_restore(f);
-            return -ECHILD;
+            return -N_ERR_NO_APP;
         }
         if (nohang) {
             irq_restore(f);
@@ -1025,7 +1025,7 @@ int task_wait(int pid, int *status, bool nohang) {
         }
         if (me->killed) {
             irq_restore(f);
-            return -EINTR;
+            return -N_ERR_STOPPED;
         }
         wq_wait(&me->child_wait);
         irq_restore(f);

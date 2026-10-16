@@ -37,7 +37,7 @@ static int64_t pipe_read_common(struct vnode *v, struct file *f, void *buf, uint
             size_t available=s->write_at-s->read_at;
             size_t got = n-done < available ? n-done : available;
             if (user && !user_ok_w(out+done, got)) {
-                irq_restore(fl); return done ? (int64_t)done : -EFAULT;
+                irq_restore(fl); return done ? (int64_t)done : -N_ERR_BAD_ADDRESS;
             }
             memcpy(out+done,s->bytes+s->read_at,got);
             s->read_at+=got;
@@ -60,11 +60,11 @@ static int64_t pipe_read_common(struct vnode *v, struct file *f, void *buf, uint
         }
         if (f->flags & O_NONBLOCK) {
             irq_restore(fl);
-            return -EAGAIN;
+            return -N_ERR_NOT_READY;
         }
         if (current_task->killed) {
             irq_restore(fl);
-            return -EINTR;
+            return -N_ERR_STOPPED;
         }
         wq_wait(&p->rq);
         irq_restore(fl);
@@ -86,13 +86,13 @@ static int64_t pipe_write_common(struct vnode *v, struct file *f, const void *bu
         uint64_t fl = irq_save();
         if (p->readers == 0) {
             irq_restore(fl);
-            return done ? (int64_t)done : -EPIPE;
+            return done ? (int64_t)done : -N_ERR_CLOSED;
         }
         if(current_task->killed){
             irq_restore(fl);
-            return done?(int64_t)done:-EINTR;
+            return done?(int64_t)done:-N_ERR_STOPPED;
         }
-        if(n-done>SIZE_MAX-p->count){irq_restore(fl);return done?(int64_t)done:-EINVAL;}
+        if(n-done>SIZE_MAX-p->count){irq_restore(fl);return done?(int64_t)done:-N_ERR_INVALID;}
         size_t committed=0;int error=0;
         /* Grow only by the segment receiving actual bytes. Existing owners
            never move. At most one segment allocation and the former 16 KiB
@@ -102,11 +102,11 @@ static int64_t pipe_write_common(struct vnode *v, struct file *f, const void *bu
             struct pipe_segment *s=p->tail;
             if(s->write_at==PIPE_SEGMENT_SIZE){
                 struct pipe_segment *next=pipe_segment_new();
-                if(!next){error=-ENOMEM;break;}
+                if(!next){error=-N_ERR_NO_MEMORY;break;}
                 s->next=next;p->tail=s=next;
             }
             size_t put=MIN(n-done,MIN(PIPE_SEGMENT_SIZE-s->write_at,PIPE_SEGMENT_SIZE-committed));
-            if (user && !user_ok(in+done, put)) { error=-EFAULT; break; }
+            if (user && !user_ok(in+done, put)) { error=-N_ERR_BAD_ADDRESS; break; }
             memcpy(s->bytes+s->write_at,in+done,put);
             s->write_at+=put;
             p->count += put;
@@ -139,7 +139,7 @@ static bool pipe_can_write(struct vnode *v, struct file *f) {
     struct pipe *p = v->priv;
     /* Full current storage is not backpressure: the next write can grow it.
        poll must allow that attempt, without allocating or guessing OOM here.
-       A closed reader is writable readiness for the real EPIPE result. */
+       A closed reader is writable readiness for the real N_ERR_CLOSED result. */
     return p->count < SIZE_MAX || p->readers == 0;
 }
 
@@ -186,7 +186,7 @@ int pipe_create(struct file **rd, struct file **wr) {
         kfree(v);
         if(p)kfree(p->head);
         kfree(p);
-        return -ENOMEM;
+        return -N_ERR_NO_MEMORY;
     }
     strlcpy(v->name, "pipe", sizeof v->name);
     v->type = VT_PIPE;
@@ -196,9 +196,9 @@ int pipe_create(struct file **rd, struct file **wr) {
     p->readers = 1;
     p->writers = 1;
     *rd = vfs_open_vnode(v, O_RDONLY);
-    if(!*rd){pipe_release(v);*wr=NULL;return -ENOMEM;}
+    if(!*rd){pipe_release(v);*wr=NULL;return -N_ERR_NO_MEMORY;}
     *wr = vfs_open_vnode(v, O_WRONLY);
-    if(!*wr){vfs_close(*rd);*rd=NULL;return -ENOMEM;}
+    if(!*wr){vfs_close(*rd);*rd=NULL;return -N_ERR_NO_MEMORY;}
     return 0;
 }
 
@@ -287,9 +287,9 @@ static int channel_pair(struct file **client,struct file **server) {
     e=pipe_create(&r1,&w1);
     if(e){vfs_close(r0);vfs_close(w0);return e;}
     *client=channel_end_new(r1,w0);
-    if(!*client){vfs_close(r0);vfs_close(w0);vfs_close(r1);vfs_close(w1);return -ENOMEM;}
+    if(!*client){vfs_close(r0);vfs_close(w0);vfs_close(r1);vfs_close(w1);return -N_ERR_NO_MEMORY;}
     *server=channel_end_new(r0,w1);
-    if(!*server){vfs_close(*client);*client=NULL;vfs_close(r0);vfs_close(w1);return -ENOMEM;}
+    if(!*server){vfs_close(*client);*client=NULL;vfs_close(r0);vfs_close(w1);return -N_ERR_NO_MEMORY;}
     return 0;
 }
 static bool listener_can_read(struct vnode *v,struct file *f) {
@@ -306,36 +306,36 @@ static void listener_close(struct vnode *v,struct file *f) {
     struct channel_pending *pending=l->head;l->head=l->tail=NULL;
     vfs_poll_notify(v);irq_restore(flags);
     /* A pending server reference is an ordinary owner. Closing it propagates
-     * both directional EOF/EPIPE and wakes clients, even after owner death. */
+     * both directional EOF/N_ERR_CLOSED and wakes clients, even after owner death. */
     while(pending){struct channel_pending *next=pending->next;vfs_close(pending->server);kfree(pending);pending=next;}
 }
 static struct vnode_ops listener_ops={
     .can_read=listener_can_read,.can_write=listener_can_write,.close=listener_close,.release=channel_release,
 };
 int channel_listen(const char *key,size_t length,struct file **listener) {
-    if(!length || length>SIZE_MAX-sizeof(struct channel_listener))return -EINVAL;
+    if(!length || length>SIZE_MAX-sizeof(struct channel_listener))return -N_ERR_INVALID;
     uint64_t hash=channel_hash(key,length);
     struct vnode *v=kzalloc(sizeof *v);
     struct channel_listener *l=kzalloc(sizeof *l+length);
-    if(!v || !l){kfree(v);kfree(l);return -ENOMEM;}
+    if(!v || !l){kfree(v);kfree(l);return -N_ERR_NO_MEMORY;}
     l->hash=hash;l->key_length=length;l->vn=v;memcpy(l->key,key,length);
     v->type=VT_CHANNEL;v->ops=&listener_ops;v->priv=l;v->unlinked=true;
     strlcpy(v->name,"channel-listener",sizeof v->name);
     struct file *f=vfs_open_vnode(v,O_RDWR|O_NONBLOCK);
-    if(!f){kfree(l);kfree(v);return -ENOMEM;}
+    if(!f){kfree(l);kfree(v);return -N_ERR_NO_MEMORY;}
     uint64_t flags=irq_save();
-    if(channel_find(key,length,hash)){irq_restore(flags);vfs_close(f);return -EEXIST;}
+    if(channel_find(key,length,hash)){irq_restore(flags);vfs_close(f);return -N_ERR_EXISTS;}
     unsigned bucket=hash&(CHANNEL_BUCKETS-1);
     l->next=channel_names[bucket];channel_names[bucket]=l;l->published=true;
     irq_restore(flags);*listener=f;return 0;
 }
 int channel_connect(const char *key,size_t length,struct file **client) {
-    if(!length)return -EINVAL;
+    if(!length)return -N_ERR_INVALID;
     uint64_t hash=channel_hash(key,length);uint64_t flags=irq_save();
     struct channel_listener *l=channel_find(key,length,hash);
-    if(!l){irq_restore(flags);return -ENOENT;}
+    if(!l){irq_restore(flags);return -N_ERR_NOT_FOUND;}
     struct channel_pending *pending=kmalloc(sizeof *pending);
-    if(!pending){irq_restore(flags);return -ENOMEM;}
+    if(!pending){irq_restore(flags);return -N_ERR_NO_MEMORY;}
     struct file *server;int e=channel_pair(client,&server);
     if(e){kfree(pending);irq_restore(flags);return e;}
     pending->next=NULL;pending->server=server;
@@ -343,10 +343,10 @@ int channel_connect(const char *key,size_t length,struct file **client) {
     vfs_poll_notify(l->vn);irq_restore(flags);return 0;
 }
 int channel_accept(struct file *listener,struct file **server) {
-    if(!listener || listener->vn->ops!=&listener_ops)return -EINVAL;
+    if(!listener || listener->vn->ops!=&listener_ops)return -N_ERR_INVALID;
     struct channel_listener *l=listener->vn->priv;uint64_t flags=irq_save();
     struct channel_pending *pending=l->head;
-    if(!pending){irq_restore(flags);return -EAGAIN;}
+    if(!pending){irq_restore(flags);return -N_ERR_NOT_READY;}
     l->head=pending->next;if(!l->head)l->tail=NULL;
     *server=pending->server;kfree(pending);irq_restore(flags);return 0;
 }

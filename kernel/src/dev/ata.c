@@ -55,11 +55,11 @@ static int wait_drq(struct ata_disk *d) {
             pause();
             continue;
         }
-        if (s & (ST_ERR | ST_DF)) return -EIO;
+        if (s & (ST_ERR | ST_DF)) return -N_ERR_IO;
         if (s & ST_DRQ) return 0;
         pause();
     }
-    return -EIO;
+    return -N_ERR_IO;
 }
 
 static void probe(uint16_t io, uint16_t ctl, bool slave) {
@@ -121,12 +121,12 @@ int ata_count(void) { return ndisks; }
 struct ata_disk *ata_get(int i) { return i >= 0 && i < ndisks ? &disks[i] : NULL; }
 
 static int setup(struct ata_disk *d, uint64_t lba, uint32_t count, bool write) {
-    if (lba + count > d->sectors) return -EIO;
-    if (wait_not_busy(d) < 0) return -EIO;
+    if (lba + count > d->sectors) return -N_ERR_IO;
+    if (wait_not_busy(d) < 0) return -N_ERR_IO;
     if (d->lba48) {
         outb(d->io + REG_DRIVE, 0x40 | (d->slave ? 0x10 : 0));
         delay400(d->ctl);
-        if (wait_not_busy(d) < 0) return -EIO; /* the newly selected drive must be ready too */
+        if (wait_not_busy(d) < 0) return -N_ERR_IO; /* the newly selected drive must be ready too */
         outb(d->io + REG_COUNT, (uint8_t)(count >> 8));
         outb(d->io + REG_LBA0, (uint8_t)(lba >> 24));
         outb(d->io + REG_LBA1, (uint8_t)(lba >> 32));
@@ -137,10 +137,10 @@ static int setup(struct ata_disk *d, uint64_t lba, uint32_t count, bool write) {
         outb(d->io + REG_LBA2, (uint8_t)(lba >> 16));
         outb(d->io + REG_COMMAND, write ? 0x34 : 0x24);
     } else {
-        if (lba >> 28) return -EIO;
+        if (lba >> 28) return -N_ERR_IO;
         outb(d->io + REG_DRIVE, 0xE0 | (d->slave ? 0x10 : 0) | (uint8_t)(lba >> 24));
         delay400(d->ctl);
-        if (wait_not_busy(d) < 0) return -EIO; /* the newly selected drive must be ready too */
+        if (wait_not_busy(d) < 0) return -N_ERR_IO; /* the newly selected drive must be ready too */
         outb(d->io + REG_COUNT, (uint8_t)count);
         outb(d->io + REG_LBA0, (uint8_t)lba);
         outb(d->io + REG_LBA1, (uint8_t)(lba >> 8));
@@ -157,7 +157,7 @@ int ata_read(struct ata_disk *d, uint64_t lba, uint32_t count, void *buf) {
         int r = setup(d, lba, n, false);
         if (r < 0) return r;
         for (uint32_t s = 0; s < n; s++) {
-            if (wait_drq(d) < 0) return -EIO;
+            if (wait_drq(d) < 0) return -N_ERR_IO;
             pio_read_sector(d->io + REG_DATA, p); p += 256;
             delay400(d->ctl);
         }
@@ -174,7 +174,7 @@ int ata_write(struct ata_disk *d, uint64_t lba, uint32_t count, const void *buf)
         int r = setup(d, lba, n, true);
         if (r < 0) return r;
         for (uint32_t s = 0; s < n; s++) {
-            if (wait_drq(d) < 0) return -EIO;
+            if (wait_drq(d) < 0) return -N_ERR_IO;
             pio_write_sector(d->io + REG_DATA, p); p += 256;
             delay400(d->ctl);
         }
@@ -182,8 +182,8 @@ int ata_write(struct ata_disk *d, uint64_t lba, uint32_t count, const void *buf)
         count -= n;
     }
     /* make sure it reaches the disk image before we report success */
-    if (wait_not_busy(d) < 0) return -EIO;
+    if (wait_not_busy(d) < 0) return -N_ERR_IO;
     outb(d->io + REG_COMMAND, d->lba48 ? 0xEA : 0xE7);
-    if (wait_not_busy(d) < 0) return -EIO;
+    if (wait_not_busy(d) < 0) return -N_ERR_IO;
     return 0;
 }

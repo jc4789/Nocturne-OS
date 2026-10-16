@@ -17,7 +17,7 @@ struct poll_entry {
 void vfs_poll_register(struct poll_wait *wait, struct vnode *v) {
     if (wait->error || !v) return;
     struct poll_entry *entry = kmalloc(sizeof *entry);
-    if (!entry) { wait->error = -ENOMEM; return; }
+    if (!entry) { wait->error = -N_ERR_NO_MEMORY; return; }
     uint64_t flags = irq_save();
     vnode_ref(v);
     *entry = (struct poll_entry){.wait_next=wait->entries,
@@ -80,9 +80,9 @@ void vfs_init(void) {
 
 int vfs_normalize(const char *cwd, const char *path, char *out) {
     char tmp[PATH_MAX_LEN * 2];
-    if (!path || !*path) return -ENOENT;
+    if (!path || !*path) return -N_ERR_NOT_FOUND;
     if (path[0] == '/') {
-        if (strlcpy(tmp, path, sizeof tmp) >= sizeof tmp) return -ENAMETOOLONG;
+        if (strlcpy(tmp, path, sizeof tmp) >= sizeof tmp) return -N_ERR_NAME_TOO_LONG;
     } else {
         ksnprintf(tmp, sizeof tmp, "%s/%s", cwd ? cwd : "/", path);
     }
@@ -101,7 +101,7 @@ int vfs_normalize(const char *cwd, const char *path, char *out) {
             if (n > 0) n--;
             continue;
         }
-        if (n >= 64) return -ENAMETOOLONG;
+        if (n >= 64) return -N_ERR_NAME_TOO_LONG;
         comps[n++] = start;
     }
     size_t len = 0;
@@ -112,8 +112,8 @@ int vfs_normalize(const char *cwd, const char *path, char *out) {
     }
     for (int i = 0; i < n; i++) {
         size_t cl = strlen(comps[i]);
-        if (cl >= NAME_MAX_LEN) return -ENAMETOOLONG;
-        if (len + cl + 2 > PATH_MAX_LEN) return -ENAMETOOLONG;
+        if (cl >= NAME_MAX_LEN) return -N_ERR_NAME_TOO_LONG;
+        if (len + cl + 2 > PATH_MAX_LEN) return -N_ERR_NAME_TOO_LONG;
         out[len++] = '/';
         memcpy(out + len, comps[i], cl);
         len += cl;
@@ -174,21 +174,21 @@ struct file *vfs_open_vnode(struct vnode *v, int flags) {
 int vfs_open(const char *path, int flags, struct file **out) {
     struct vnode *v = vfs_lookup(path);
     if (!v) {
-        if (!(flags & O_CREAT)) return -ENOENT;
+        if (!(flags & O_CREAT)) return -N_ERR_NOT_FOUND;
         char leaf[NAME_MAX_LEN];
         struct vnode *dir = lookup_parent(path, leaf);
-        if (!dir || dir->type != VT_DIR) return -ENOENT;
-        if (!leaf[0]) return -EINVAL;
-        if (!dir->ops->create) return -EROFS;
+        if (!dir || dir->type != VT_DIR) return -N_ERR_NOT_FOUND;
+        if (!leaf[0]) return -N_ERR_INVALID;
+        if (!dir->ops->create) return -N_ERR_READ_ONLY;
         int r = dir->ops->create(dir, leaf, VT_FILE, &v);
         if (r < 0) return r;
     } else if ((flags & O_TRUNC) && v->type == VT_FILE) {
         if (v->ops->truncate) v->ops->truncate(v, 0);
     }
-    if ((flags & O_DIRECTORY) && v->type != VT_DIR) return -ENOTDIR;
-    if (v->type == VT_DIR && (flags & O_ACCMODE) != O_RDONLY) return -EISDIR;
+    if ((flags & O_DIRECTORY) && v->type != VT_DIR) return -N_ERR_NOT_FOLDER;
+    if (v->type == VT_DIR && (flags & O_ACCMODE) != O_RDONLY) return -N_ERR_IS_FOLDER;
     struct file *f = vfs_open_vnode(v, flags);
-    if (!f) return -ENOMEM;
+    if (!f) return -N_ERR_NO_MEMORY;
     if (flags & O_APPEND) f->off = v->size;
     *out = f;
     return 0;
@@ -202,10 +202,10 @@ static int file_io_begin(struct file *f) {
     if (f->vn->type != VT_FILE) return 0;
     uint64_t flags = irq_save();
     while (f->io_busy) {
-        if (current_task->killed) { irq_restore(flags); return -EINTR; }
+        if (current_task->killed) { irq_restore(flags); return -N_ERR_STOPPED; }
         wq_wait(&f->io_wait);
     }
-    if (current_task->killed) { irq_restore(flags); return -EINTR; }
+    if (current_task->killed) { irq_restore(flags); return -N_ERR_STOPPED; }
     f->io_busy = true;
     irq_restore(flags);
     return 0;
@@ -220,10 +220,10 @@ static void file_io_end(struct file *f) {
 
 static int64_t file_read(struct file *f, void *buf, size_t n, bool user) {
     struct vnode *v = f->vn;
-    if ((f->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
-    if (v->type == VT_DIR) return -EISDIR;
+    if ((f->flags & O_ACCMODE) == O_WRONLY) return -N_ERR_NO_HANDLE;
+    if (v->type == VT_DIR) return -N_ERR_IS_FOLDER;
     /* User-only sources (address-watch queues) provide read_user alone. */
-    if (!v->ops->read && !(user && v->ops->read_user)) return -EINVAL;
+    if (!v->ops->read && !(user && v->ops->read_user)) return -N_ERR_INVALID;
     int error = file_io_begin(f);
     if (error) return error;
     int64_t r;
@@ -232,7 +232,7 @@ static int64_t file_read(struct file *f, void *buf, size_t n, bool user) {
         /* Cap the request at the current EOF under the shared-offset
            reservation; even a later size change cannot enlarge this request. */
         if (user && v->type == VT_FILE) n = f->off < v->size ? MIN(n, v->size - f->off) : 0;
-        r = user && !user_ok_w(buf, n) ? -EFAULT : v->ops->read(v, f, buf, f->off, n);
+        r = user && !user_ok_w(buf, n) ? -N_ERR_BAD_ADDRESS : v->ops->read(v, f, buf, f->off, n);
     }
     if (r > 0 && (v->type == VT_FILE)) f->off += r;
     file_io_end(f);
@@ -244,13 +244,13 @@ int64_t vfs_read_user(struct file *f, void *buf, size_t n) { return file_read(f,
 
 static int64_t file_write(struct file *f, const void *buf, size_t n, bool user) {
     struct vnode *v = f->vn;
-    if ((f->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
-    if (!v->ops->write) return -EINVAL;
+    if ((f->flags & O_ACCMODE) == O_RDONLY) return -N_ERR_NO_HANDLE;
+    if (!v->ops->write) return -N_ERR_INVALID;
     int error = file_io_begin(f);
     if (error) return error;
     if ((f->flags & O_APPEND) && v->type == VT_FILE) f->off = v->size;
     int64_t r = user && v->ops->write_user ? v->ops->write_user(v, f, buf, f->off, n) :
-        user && !user_ok(buf, n) ? -EFAULT : v->ops->write(v, f, buf, f->off, n);
+        user && !user_ok(buf, n) ? -N_ERR_BAD_ADDRESS : v->ops->write(v, f, buf, f->off, n);
     if (r > 0 && v->type == VT_FILE) {
         f->off += r;
         v->mtime = time_now();
@@ -266,9 +266,9 @@ int64_t vfs_write_user(struct file *f, const void *buf, size_t n) { return file_
    reservation orders it against reads and writes through the same file. */
 int vfs_truncate(struct file *f, uint64_t size) {
     struct vnode *v = f->vn;
-    if (v->type != VT_FILE) return -EINVAL;
-    if ((f->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
-    if (!v->ops->truncate) return -EROFS;
+    if (v->type != VT_FILE) return -N_ERR_INVALID;
+    if ((f->flags & O_ACCMODE) == O_RDONLY) return -N_ERR_NO_HANDLE;
+    if (!v->ops->truncate) return -N_ERR_READ_ONLY;
     int error = file_io_begin(f);
     if (error) return error;
     error = v->ops->truncate(v, size);
@@ -278,34 +278,34 @@ int vfs_truncate(struct file *f, uint64_t size) {
 }
 
 int64_t vfs_seek(struct file *f, int64_t off, int whence) {
-    if (f->vn->type != VT_FILE) return -ESPIPE;
+    if (f->vn->type != VT_FILE) return -N_ERR_WRONG_KIND;
     int error = file_io_begin(f);
     if (error) return error;
     int64_t base = whence == 0 ? 0 : whence == 1 ? (int64_t)f->off : (int64_t)f->vn->size;
     int64_t n = base + off;
     if (n >= 0) f->off = n;
     file_io_end(f);
-    return n < 0 ? -EINVAL : n;
+    return n < 0 ? -N_ERR_INVALID : n;
 }
 
 static int vfs_lease_mode(struct file *f, bool acquire, bool blocking) {
     struct vnode *v = f->vn;
-    if (v->type != VT_FILE) return -EINVAL;
+    if (v->type != VT_FILE) return -N_ERR_INVALID;
     uint64_t flags = irq_save();
     if (acquire) {
         while (v->lease_owner && v->lease_owner != f) {
-            if (current_task->killed) { irq_restore(flags); return -EINTR; }
-            if (!blocking) { irq_restore(flags); return -EAGAIN; }
+            if (current_task->killed) { irq_restore(flags); return -N_ERR_STOPPED; }
+            if (!blocking) { irq_restore(flags); return -N_ERR_NOT_READY; }
             wq_wait(&v->lease_wait);
         }
-        if (current_task->killed) { irq_restore(flags); return -EINTR; }
+        if (current_task->killed) { irq_restore(flags); return -N_ERR_STOPPED; }
         v->lease_owner = f;
     } else if (v->lease_owner == f) {
         v->lease_owner = NULL;
         wq_wake_all(&v->lease_wait);
     } else if (v->lease_owner) {
         irq_restore(flags);
-        return -EPERM;
+        return -N_ERR_DENIED;
     }
     irq_restore(flags);
     return 0;
@@ -343,14 +343,14 @@ struct file *vfs_dup(struct file *f) {
 
 int vfs_readdir(struct file *f, uint64_t idx, struct dirent *out) {
     struct vnode *v = f->vn;
-    if (v->type != VT_DIR) return -ENOTDIR;
+    if (v->type != VT_DIR) return -N_ERR_NOT_FOLDER;
     if (!v->ops->readdir) return 0;
     return v->ops->readdir(v, idx, out);
 }
 
 int vfs_stat(const char *path, struct kstat *st) {
     struct vnode *v = vfs_lookup(path);
-    if (!v) return -ENOENT;
+    if (!v) return -N_ERR_NOT_FOUND;
     st->type = v->type;
     st->size = v->size;
     st->mtime = v->mtime;
@@ -359,24 +359,24 @@ int vfs_stat(const char *path, struct kstat *st) {
 }
 
 int vfs_mkdir(const char *path) {
-    if (vfs_lookup(path)) return -EEXIST;
+    if (vfs_lookup(path)) return -N_ERR_EXISTS;
     char leaf[NAME_MAX_LEN];
     struct vnode *dir = lookup_parent(path, leaf);
-    if (!dir || dir->type != VT_DIR) return -ENOENT;
-    if (!dir->ops->create) return -EROFS;
+    if (!dir || dir->type != VT_DIR) return -N_ERR_NOT_FOUND;
+    if (!dir->ops->create) return -N_ERR_READ_ONLY;
     struct vnode *out;
     return dir->ops->create(dir, leaf, VT_DIR, &out);
 }
 
 int vfs_unlink(const char *path) {
-    if (!strcmp(path, "/")) return -EBUSY;
+    if (!strcmp(path, "/")) return -N_ERR_BUSY;
     char leaf[NAME_MAX_LEN];
     struct vnode *dir = lookup_parent(path, leaf);
-    if (!dir) return -ENOENT;
+    if (!dir) return -N_ERR_NOT_FOUND;
     struct vnode *v = vfs_lookup(path);
-    if (!v) return -ENOENT;
-    if (v->mounted || v == vfs_root) return -EBUSY;
-    if (!dir->ops->unlink) return -EROFS;
+    if (!v) return -N_ERR_NOT_FOUND;
+    if (v->mounted || v == vfs_root) return -N_ERR_BUSY;
+    if (!dir->ops->unlink) return -N_ERR_READ_ONLY;
     return dir->ops->unlink(dir, leaf);
 }
 
@@ -387,7 +387,7 @@ int vfs_mount(const char *path, struct vnode *root) {
         if (r < 0) return r;
         v = vfs_lookup(path);
     }
-    if (!v || v->type != VT_DIR) return -ENOTDIR;
+    if (!v || v->type != VT_DIR) return -N_ERR_NOT_FOLDER;
     v->mounted = root;
     root->parent = v->parent;
     return 0;
@@ -411,13 +411,13 @@ int vfs_read_whole(const char *path, uint8_t **data, uint64_t *size) {
     if (r < 0) return r;
     if (f->vn->type != VT_FILE) {
         vfs_close(f);
-        return -EISDIR;
+        return -N_ERR_IS_FOLDER;
     }
     uint64_t sz = f->vn->size;
     uint8_t *buf = kmalloc(sz + 1);
     if (!buf) {
         vfs_close(f);
-        return -ENOMEM;
+        return -N_ERR_NO_MEMORY;
     }
     uint64_t got = 0;
     while (got < sz) {

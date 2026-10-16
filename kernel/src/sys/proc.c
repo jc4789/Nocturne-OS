@@ -44,14 +44,14 @@ int proc_spawn(const char *path, int argc, char **argv, struct file *fds[3], con
     if (size < sizeof *eh || memcmp(eh->ident, "\x7f" "ELF", 4) || eh->ident[4] != 2 || eh->machine != 0x3E ||
         eh->type != 2 || eh->phoff + (uint64_t)eh->phnum * sizeof(struct elf64_phdr) > size) {
         kfree(img);
-        return -ENOEXEC;
+        return -N_ERR_NOT_PROGRAM;
     }
     const char *base = strrchr(path, '/');
     base = base ? base + 1 : path;
     struct task *t = task_alloc(base);
     if (!t) {
         kfree(img);
-        return -ENOMEM;
+        return -N_ERR_NO_MEMORY;
     }
     t->is_user = true;
     t->pml4 = vmm_new_space();
@@ -151,7 +151,7 @@ fail:
         if(t->fds!=t->initial_fds)kfree(t->fds);
         kfree(t);
     }
-    return -ENOEXEC;
+    return -N_ERR_NOT_PROGRAM;
 }
 
 int proc_spawn_simple(const char *path, const char *arg1, struct task *parent) {

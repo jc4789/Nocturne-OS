@@ -574,37 +574,37 @@ void gpu_init(void) {
 }
 void gpu_get_info(struct n_gpu_info *info) { *info=statistics; }
 int gpu_render(const struct n_gpu_render *r, uint32_t *out, size_t bytes) {
-    if (!valid(r)) return -EINVAL;
+    if (!valid(r)) return -N_ERR_INVALID;
     size_t need=(size_t)r->width*r->height*4;
-    if (!out || bytes<need) return -EINVAL;
-    if (!ready || broken) return -ENOSYS;
-    if (__atomic_exchange_n(&busy,1,__ATOMIC_ACQUIRE)) return -EBUSY;
+    if (!out || bytes<need) return -N_ERR_INVALID;
+    if (!ready || broken) return -N_ERR_UNSUPPORTED;
+    if (__atomic_exchange_n(&busy,1,__ATOMIC_ACQUIRE)) return -N_ERR_BUSY;
     int result=0;
-    if (!render_internal(r)) result=-EIO;
+    if (!render_internal(r)) result=-N_ERR_IO;
     else for (unsigned y=0;y<r->height;y++) memcpy(out+(size_t)y*r->width,target+(size_t)y*SIDE,r->width*4);
     __atomic_store_n(&busy,0,__ATOMIC_RELEASE);
     return result;
 }
 int gpu_render_batch(const struct n_gpu_batch *r, uint32_t *out, size_t bytes) {
     if (!r || !r->width || !r->height || r->width>SIDE || r->height>SIDE ||
-        r->triangle_count>N_GPU_MAX_TRIANGLES || !valid_vertices(r->vertex,r->triangle_count*3)) return -EINVAL;
+        r->triangle_count>N_GPU_MAX_TRIANGLES || !valid_vertices(r->vertex,r->triangle_count*3)) return -N_ERR_INVALID;
     size_t need=(size_t)r->width*r->height*4;
-    if (!out || bytes<need) return -EINVAL;
-    if (!ready || broken || !(statistics.capabilities&N_GPU_CAP_BATCH)) return -ENOSYS;
-    if (__atomic_exchange_n(&busy,1,__ATOMIC_ACQUIRE)) return -EBUSY;
+    if (!out || bytes<need) return -N_ERR_INVALID;
+    if (!ready || broken || !(statistics.capabilities&N_GPU_CAP_BATCH)) return -N_ERR_UNSUPPORTED;
+    if (__atomic_exchange_n(&busy,1,__ATOMIC_ACQUIRE)) return -N_ERR_BUSY;
     int result=0;
-    if (!render_frame(r->width,r->height,r->clear_argb,r->vertex,r->triangle_count)) result=-EIO;
+    if (!render_frame(r->width,r->height,r->clear_argb,r->vertex,r->triangle_count)) result=-N_ERR_IO;
     else for (unsigned y=0;y<r->height;y++) memcpy(out+(size_t)y*r->width,target+(size_t)y*SIDE,r->width*4);
     __atomic_store_n(&busy,0,__ATOMIC_RELEASE);
     return result;
 }
 int gpu_blit(const struct n_gpu_blit *r,const uint32_t *pixels,size_t source_bytes,uint32_t *out,size_t bytes) {
     if (!valid_blit(r) || !pixels || !out || source_bytes<(size_t)r->source_width*r->source_height*4 ||
-        bytes<(size_t)r->width*r->height*4) return -EINVAL;
-    if (!ready || broken || !(statistics.capabilities&N_GPU_CAP_BLIT)) return -ENOSYS;
-    if (__atomic_exchange_n(&busy,1,__ATOMIC_ACQUIRE)) return -EBUSY;
+        bytes<(size_t)r->width*r->height*4) return -N_ERR_INVALID;
+    if (!ready || broken || !(statistics.capabilities&N_GPU_CAP_BLIT)) return -N_ERR_UNSUPPORTED;
+    if (__atomic_exchange_n(&busy,1,__ATOMIC_ACQUIRE)) return -N_ERR_BUSY;
     int result=0;
-    if (!blit_internal(r,pixels)) result=-EIO;
+    if (!blit_internal(r,pixels)) result=-N_ERR_IO;
     else for (unsigned y=0;y<r->height;y++) memcpy(out+(size_t)y*r->width,target+(size_t)y*SIDE,r->width*4);
     __atomic_store_n(&busy,0,__ATOMIC_RELEASE);
     return result;

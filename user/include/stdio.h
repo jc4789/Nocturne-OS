@@ -32,6 +32,7 @@ int puts(const char *s);
 int fflush(FILE *f);
 int feof(FILE *f);
 int ferror(FILE *f);
+void clearerr(FILE *f);
 int fileno(FILE *f);
 int fseek(FILE *f, long off, int whence);
 long ftell(FILE *f);

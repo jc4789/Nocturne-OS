@@ -107,3 +107,22 @@ int gettimeofday(struct timeval *tv, void *tz) {
     }
     return 0;
 }
+
+/* ISO C timespec_get. The wall clock has whole seconds; sub-second digits
+   come from the millisecond uptime counter, as for gettimeofday. */
+int timespec_get(struct timespec *ts, int base) {
+    if (!ts) return 0;
+    uint64_t ms = uptime_ms();
+    switch (base) {
+    case TIME_UTC:
+        ts->tv_sec = time(NULL);
+        ts->tv_nsec = (long)(ms % 1000) * 1000000L;
+        return base;
+    case TIME_MONOTONIC:
+        ts->tv_sec = (time_t)(ms / 1000);
+        ts->tv_nsec = (long)(ms % 1000) * 1000000L;
+        return base;
+    default:
+        return 0;
+    }
+}

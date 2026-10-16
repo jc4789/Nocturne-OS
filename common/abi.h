@@ -4,6 +4,45 @@
 /* x86-64 native mapping granule, shared by SYS_MMAP/SYS_MUNMAP callers. */
 #define N_PAGE_SIZE 4096ULL
 
+/* Nocturne results. A system call that fails returns the negated code; the
+   numbering is Nocturne's own (docs/nocturne-native-abi.md). Plain numbers,
+   so preprocessor conditions can use them. */
+#define N_OK 0
+#define N_ERR_NOT_FOUND 1          /* no such entry, name or channel */
+#define N_ERR_EXISTS 2             /* the name is already taken */
+#define N_ERR_DENIED 3             /* not permitted for this caller */
+#define N_ERR_NO_MEMORY 4
+#define N_ERR_INVALID 5            /* malformed request */
+#define N_ERR_WRONG_KIND 6         /* the handle cannot perform this operation */
+#define N_ERR_NO_HANDLE 7          /* the handle is not open in this app */
+#define N_ERR_BUSY 8
+#define N_ERR_NOT_READY 9          /* nothing to take yet; wait for its event */
+#define N_ERR_CLOSED 10            /* the other end has gone */
+#define N_ERR_TIMEOUT 11
+#define N_ERR_CANCELLED 12
+#define N_ERR_TOO_LARGE 13         /* does not fit the given buffer or range */
+#define N_ERR_NOT_EMPTY 14
+#define N_ERR_IO 15                /* the device failed */
+#define N_ERR_UNSUPPORTED 16
+#define N_ERR_BAD_ADDRESS 17       /* memory the caller passed is not usable */
+#define N_ERR_STOPPED 18           /* the calling app is being stopped */
+#define N_ERR_NOT_FOLDER 19
+#define N_ERR_IS_FOLDER 20
+#define N_ERR_READ_ONLY 21
+#define N_ERR_NO_SPACE 22
+#define N_ERR_NOT_PROGRAM 23       /* the file is not a Nocturne program */
+#define N_ERR_NAME_TOO_LONG 24
+#define N_ERR_NO_APP 25            /* no such app (or no such child of the caller) */
+#define N_ERR_TOO_MANY_ARGUMENTS 26
+#define N_ERR_CONNECTION_RESET 27
+#define N_ERR_CONNECTION_REFUSED 28
+#define N_ERR_ADDRESS_IN_USE 29
+#define N_ERR_NETWORK_DOWN 30
+#define N_ERR_NOT_CONNECTED 31
+#define N_ERR_UNREACHABLE 32
+#define N_ERR_PROTOCOL 33
+#define N_RESULT_CODES 34
+
 enum {
     SYS_EXIT = 0, SYS_READ, SYS_WRITE, SYS_OPEN, SYS_CLOSE, SYS_LSEEK, SYS_STAT, SYS_FSTAT,
     SYS_READDIR, SYS_MKDIR, SYS_UNLINK, SYS_RENAME, SYS_CHDIR, SYS_GETCWD, SYS_SPAWN, SYS_WAITPID,
@@ -37,6 +76,12 @@ enum {
 /* SYS_MMAP / SYS_MPROTECT protection bits (reading is always allowed) */
 #define N_PROT_WRITE 2
 #define N_PROT_EXEC 4
+
+/* n_memory_reserve / n_memory_protect access. Writable and executable are
+   never granted together: generated code is written, then made executable. */
+#define N_MEMORY_READ 1
+#define N_MEMORY_READ_WRITE 2
+#define N_MEMORY_READ_EXECUTE 3
 
 #define N_FT_FILE 1
 #define N_FT_DIR 2

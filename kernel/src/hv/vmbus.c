@@ -381,12 +381,12 @@ uint32_t vmbus_gpadl_create(struct vmbus_channel *ch, uint64_t pa, uint32_t page
 }
 
 int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, vmbus_callback_t cb, void *priv) {
-    if (ch->opened) return -EBUSY;
+    if (ch->opened) return -N_ERR_BUSY;
     ch->ring_pages_out = (uint32_t)(ALIGN_UP(out_bytes, PAGE_SIZE) / PAGE_SIZE) + 1;
     ch->ring_pages_in = (uint32_t)(ALIGN_UP(in_bytes, PAGE_SIZE) / PAGE_SIZE) + 1;
     uint32_t total = ch->ring_pages_out + ch->ring_pages_in;
     uint64_t pa = pmm_alloc_contig(total);
-    if (!pa) return -ENOMEM;
+    if (!pa) return -N_ERR_NO_MEMORY;
     ch->ring = phys_to_virt(pa);
     memset(ch->ring, 0, total * PAGE_SIZE);
     ch->out = (struct hv_ring *)ch->ring;
@@ -401,7 +401,7 @@ int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, 
     ch->priv = priv;
 
     ch->ring_gpadl = vmbus_gpadl_create(ch, pa, total);
-    if (!ch->ring_gpadl) return -EIO;
+    if (!ch->ring_gpadl) return -N_ERR_IO;
 
     struct msg_open m;
     memset(&m, 0, sizeof m);
@@ -415,13 +415,13 @@ int vmbus_open(struct vmbus_channel *ch, uint32_t out_bytes, uint32_t in_bytes, 
     if (!request(&m, sizeof m, CHMSG_OPEN_RESULT, ch->relid, 3000)) {
         ch->opened = false;
         kprintf("vmbus: open of relid %u timed out\n", ch->relid);
-        return -ETIMEDOUT;
+        return -N_ERR_TIMEOUT;
     }
     struct msg_open_result *r = (void *)waiter.reply;
     if (r->status) {
         ch->opened = false;
         kprintf("vmbus: open of relid %u failed (%x)\n", ch->relid, r->status);
-        return -EIO;
+        return -N_ERR_IO;
     }
     return 0;
 }
@@ -489,12 +489,12 @@ static void ring_copy_in(struct vmbus_channel *ch, uint32_t *pos, const void *sr
 }
 
 static int ring_write(struct vmbus_channel *ch, const void *a, uint32_t alen, const void *b, uint32_t blen) {
-    if (!ch->opened || ch->rescinded) return -EIO;
-    if (alen > UINT32_MAX - blen || alen + blen > UINT32_MAX - 15) return -E2BIG;
+    if (!ch->opened || ch->rescinded) return -N_ERR_IO;
+    if (alen > UINT32_MAX - blen || alen + blen > UINT32_MAX - 15) return -N_ERR_TOO_LARGE;
     uint32_t len = alen + blen;
     uint32_t aligned = (uint32_t)ALIGN_UP(len, 8);
     uint32_t need = aligned + 8;
-    if (need >= ch->out_size) return -E2BIG;
+    if (need >= ch->out_size) return -N_ERR_TOO_LARGE;
     uint64_t f = irq_save();
     uint32_t w = ch->out->write_index, r = ch->out->read_index;
     uint32_t avail = w >= r ? ch->out_size - (w - r) : r - w;
@@ -508,7 +508,7 @@ static int ring_write(struct vmbus_channel *ch, const void *a, uint32_t alen, co
         avail = w >= r ? ch->out_size - (w - r) : r - w;
         if (avail <= need) {
             irq_restore(f);
-            return -EAGAIN;
+            return -N_ERR_NOT_READY;
         }
     }
     if (avail > ch->out->pending_send_sz) ch->out->pending_send_sz = 0;
@@ -570,7 +570,7 @@ int vmbus_recv(struct vmbus_channel *ch, void *buf, uint32_t len) {
     }
     int ret = (int)plen;
     if (plen <= len) ring_copy_out(ch, r, buf, plen);
-    else ret = -E2BIG;
+    else ret = -N_ERR_TOO_LARGE;
     __asm__ volatile("" ::: "memory");
     ch->in->read_index = (r + plen + 8) % ch->in_size;
     hv_mb();

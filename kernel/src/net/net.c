@@ -253,7 +253,7 @@ static uint8_t frame[1600];
 static uint16_t ip_ident;
 
 static int eth_output(const uint8_t dst[6], uint16_t type, size_t len) {
-    if (!nif) return -ENETDOWN;
+    if (!nif) return -N_ERR_NETWORK_DOWN;
     struct eth_hdr *e = (struct eth_hdr *)frame;
     memcpy(e->dst, dst, 6);
     memcpy(e->src, nif->mac, 6);
@@ -351,35 +351,35 @@ static uint32_t next_hop(uint32_t dst) { return ((dst ^ my_ip) & my_mask) == 0 ?
 /* Resolve the link address (system call context: may block). A nonzero
    deadline shares TCP's connect budget; zero preserves ordinary ARP retries. */
 static int arp_resolve_until(uint32_t dst, uint8_t mac[6], uint64_t deadline) {
-    if (!nif) return -ENETDOWN;
-    if(net_setup_cancelled())return -ECANCELED;
+    if (!nif) return -N_ERR_NETWORK_DOWN;
+    if(net_setup_cancelled())return -N_ERR_CANCELLED;
     if (dst == 0xFFFFFFFF || dst == (my_ip | ~my_mask)) {
         memcpy(mac, bcast_mac, 6);
         return 0;
     }
-    if (!configured) return -ENETDOWN;
+    if (!configured) return -N_ERR_NETWORK_DOWN;
     uint32_t hop = next_hop(dst);
-    if (!hop) return -EHOSTUNREACH;
+    if (!hop) return -N_ERR_UNREACHABLE;
     for (int tries = 0; tries < 3; tries++) {
-        if (current_task->killed) return -EINTR;
-        if(net_setup_cancelled())return -ECANCELED;
+        if (current_task->killed) return -N_ERR_STOPPED;
+        if(net_setup_cancelled())return -N_ERR_CANCELLED;
         uint64_t now = uptime_ms();
-        if (deadline && now >= deadline) return -ETIMEDOUT;
+        if (deadline && now >= deadline) return -N_ERR_TIMEOUT;
         if (arp_lookup(hop, mac)) return 0;
         arp_send(1, (const uint8_t *)"\0\0\0\0\0\0", hop, bcast_mac);
         uint64_t until = now + 1000;
         if (deadline && deadline < until) until = deadline;
         for (;;) {
-            if (current_task->killed) return -EINTR;
-            if(net_setup_cancelled())return -ECANCELED;
+            if (current_task->killed) return -N_ERR_STOPPED;
+            if(net_setup_cancelled())return -N_ERR_CANCELLED;
             now = uptime_ms();
-            if (deadline && now >= deadline) return -ETIMEDOUT;
+            if (deadline && now >= deadline) return -N_ERR_TIMEOUT;
             if (arp_lookup(hop, mac)) return 0;
             if (now >= until) break;
             net_setup_wait_timeout(&net_wq, until - now);
         }
     }
-    return -EHOSTUNREACH;
+    return -N_ERR_UNREACHABLE;
 }
 static int arp_resolve(uint32_t dst, uint8_t mac[6]) { return arp_resolve_until(dst, mac, 0); }
 
@@ -418,7 +418,7 @@ static int64_t sys_ping(uint32_t dst, int seq, int timeout_ms) {
     int slot = -1;
     for (int i = 0; i < PING_N; i++)
         if (!pings[i].used) slot = i;
-    if (slot < 0) return -EBUSY;
+    if (slot < 0) return -N_ERR_BUSY;
     struct ping_wait *w = &pings[slot];
     w->used = true;
     w->done = false;
@@ -434,7 +434,7 @@ static int64_t sys_ping(uint32_t dst, int seq, int timeout_ms) {
     h->csum = htons(csum_fold(csum_add(0, L4, 40)));
     uint64_t t0 = uptime_ms(), until = t0 + (uint64_t)(timeout_ms > 0 ? timeout_ms : 1000);
     ip_output(dst, mac, 1, 40);
-    int64_t ret = -ETIMEDOUT;
+    int64_t ret = -N_ERR_TIMEOUT;
     for (;;) {
         uint64_t now=uptime_ms();
         if(now>=until)break;
@@ -443,7 +443,7 @@ static int64_t sys_ping(uint32_t dst, int seq, int timeout_ms) {
             break;
         }
         if (current_task->killed) {
-            ret = -EINTR;
+            ret = -N_ERR_STOPPED;
             break;
         }
         net_wait_timeout(&net_wq, until - now);
@@ -490,7 +490,7 @@ static uint16_t ephemeral_port(void) {
 
 static int udp_output(uint16_t sport, uint32_t dst, uint16_t dport, const uint8_t mac[6], const void *data,
                       size_t len) {
-    if (len > 1472) return -EINVAL;
+    if (len > 1472) return -N_ERR_INVALID;
     struct udp_hdr *u = (struct udp_hdr *)L4;
     u->sport = htons(sport);
     u->dport = htons(dport);
@@ -542,12 +542,12 @@ static void udp_release(struct udp_sock *s) {
     wq_wake_all(&net_wq);
 }
 static int udp_alloc(uint16_t port, int pid) {
-    if(port) {if(udp_port_used(port))return -EADDRINUSE;}
+    if(port) {if(udp_port_used(port))return -N_ERR_ADDRESS_IN_USE;}
     else {
         /* There are exactly 16384 ephemeral UDP ports, not eight sockets. */
         unsigned attempts=0;
         do {port=ephemeral_port();if(!udp_port_used(port))break;}while(++attempts<16384);
-        if(attempts==16384)return -EADDRINUSE;
+        if(attempts==16384)return -N_ERR_ADDRESS_IN_USE;
     }
     size_t slot=0;
     while(slot<udp_capacity && udp_socks[slot] && udp_socks[slot]->used)slot++;
@@ -555,9 +555,9 @@ static int udp_alloc(uint16_t port, int pid) {
         /* Handles use the syscall signed-int ABI. Reject only arithmetic or
            allocation failure, never a small scheduling-derived count. */
         size_t next=udp_capacity<=((size_t)0x7fffffff+1)/2?udp_capacity*2:(size_t)0x7fffffff+1;
-        if(next<=udp_capacity || next>SIZE_MAX/sizeof *udp_socks)return -ENOMEM;
+        if(next<=udp_capacity || next>SIZE_MAX/sizeof *udp_socks)return -N_ERR_NO_MEMORY;
         struct udp_sock **grown=kmalloc(next*sizeof *grown);
-        if(!grown)return -ENOMEM;
+        if(!grown)return -N_ERR_NO_MEMORY;
         memcpy(grown,udp_socks,udp_capacity*sizeof *grown);
         memset(grown+udp_capacity,0,(next-udp_capacity)*sizeof *grown);
         if(udp_socks!=udp_initial_slots)kfree(udp_socks);
@@ -565,11 +565,11 @@ static int udp_alloc(uint16_t port, int pid) {
     }
     struct udp_sock *s=udp_socks[slot];
     if(!s) {
-        s=kmalloc(sizeof *s);if(!s)return -ENOMEM;
+        s=kmalloc(sizeof *s);if(!s)return -N_ERR_NO_MEMORY;
         memset(s,0,sizeof *s);udp_socks[slot]=s;
     }
     struct udp_dgram *queue=kmalloc(UDP_Q*sizeof *queue);
-    if(!queue)return -ENOMEM;
+    if(!queue)return -N_ERR_NO_MEMORY;
     memset(s,0,sizeof *s);s->q=queue;s->used=true;s->pid=pid;s->port=port;
     if(++udp_generation==0)++udp_generation;
     s->generation=udp_generation;
@@ -584,20 +584,20 @@ static struct udp_dgram *udp_wait(int i, int timeout_ms, int *err) {
     for (;;) {
         /* A sibling thread can close/reuse this handle while we sleep. Never
            consume another socket generation or touch its freed queue. */
-        if(!s->used || s->generation!=generation){*err=-EBADF;return NULL;}
-        if(s->internal && net_setup_cancelled()){*err=-ECANCELED;return NULL;}
+        if(!s->used || s->generation!=generation){*err=-N_ERR_NO_HANDLE;return NULL;}
+        if(s->internal && net_setup_cancelled()){*err=-N_ERR_CANCELLED;return NULL;}
         if (s->qt != s->qh) {
             struct udp_dgram *d = &s->q[s->qt];
             s->qt = (s->qt + 1) % UDP_Q;
             return d;
         }
         if (current_task->killed) {
-            *err = -EINTR;
+            *err = -N_ERR_STOPPED;
             return NULL;
         }
         uint64_t now=uptime_ms();
         if (timeout_ms >= 0 && now >= until) {
-            *err = -EAGAIN;
+            *err = -N_ERR_NOT_READY;
             return NULL;
         }
         if(s->internal)net_setup_wait_timeout(&net_wq, timeout_ms < 0 ? 1000 : until - now);
@@ -808,7 +808,7 @@ static int dns_parse_boot_resolver(const char *command,struct n_sockaddr *out) {
         size_t length=(size_t)(at-begin),key_length=sizeof key-1;
         if(length<key_length || strncmp(begin,key,key_length) ||
            (length>key_length && begin[key_length]!='='))continue;
-        if(seen || length==key_length || !dns_parse_resolver_endpoint(begin+key_length+1,at,&selected))return -EINVAL;
+        if(seen || length==key_length || !dns_parse_resolver_endpoint(begin+key_length+1,at,&selected))return -N_ERR_INVALID;
         seen=true;
     }
     *out=selected;
@@ -855,19 +855,19 @@ static int dns_failure(struct dns_answer *answer, unsigned status) {
     answer->status=status;
     answer->count=answer->ttl=0;
     switch(status) {
-    case N_DNS_NXDOMAIN: case N_DNS_NODATA: return -ENOENT;
-    case N_DNS_SERVFAIL: return -EAGAIN;
-    case N_DNS_REFUSED: return -ECONNREFUSED;
-    case N_DNS_TIMEOUT: return -ETIMEDOUT;
-    case N_DNS_CANCELLED: return -EINTR;
-    case N_DNS_UNREACHABLE: return -EHOSTUNREACH;
-    case N_DNS_RESOURCE: return -ENOMEM;
-    default: return -EPROTO;
+    case N_DNS_NXDOMAIN: case N_DNS_NODATA: return -N_ERR_NOT_FOUND;
+    case N_DNS_SERVFAIL: return -N_ERR_NOT_READY;
+    case N_DNS_REFUSED: return -N_ERR_CONNECTION_REFUSED;
+    case N_DNS_TIMEOUT: return -N_ERR_TIMEOUT;
+    case N_DNS_CANCELLED: return -N_ERR_STOPPED;
+    case N_DNS_UNREACHABLE: return -N_ERR_UNREACHABLE;
+    case N_DNS_RESOURCE: return -N_ERR_NO_MEMORY;
+    default: return -N_ERR_PROTOCOL;
     }
 }
 static unsigned dns_error_status(int error) {
-    return error==-ENOMEM?N_DNS_RESOURCE:error==-ETIMEDOUT||error==-EAGAIN?N_DNS_TIMEOUT:
-           error==-EINTR||error==-ECANCELED?N_DNS_CANCELLED:error==-EPROTO?N_DNS_FORMAT:N_DNS_UNREACHABLE;
+    return error==-N_ERR_NO_MEMORY?N_DNS_RESOURCE:error==-N_ERR_TIMEOUT||error==-N_ERR_NOT_READY?N_DNS_TIMEOUT:
+           error==-N_ERR_STOPPED||error==-N_ERR_CANCELLED?N_DNS_CANCELLED:error==-N_ERR_PROTOCOL?N_DNS_FORMAT:N_DNS_UNREACHABLE;
 }
 static void dns_cache_store(const char *name,uint32_t resolver,uint16_t port,const struct dns_answer *answer) {
     size_t namesz=strlen(name)+1, name_storage=(size_t)ALIGN_UP(namesz,sizeof(uint32_t));
@@ -920,7 +920,7 @@ static int dns_parse_reply(const uint8_t *p,size_t len,const char *name,struct d
     if (!records || !heads || !ips) { kfree(records);kfree(heads);kfree(ips);return dns_failure(answer,N_DNS_RESOURCE); }
     memset(heads,0,buckets*sizeof *heads);
     size_t count=0;
-    int result=-EPROTO;
+    int result=-N_ERR_PROTOCOL;
     for (size_t i=0;i<an;i++) {
         offset=dns_name_decode(p,len,offset,decoded);
         if (!offset || offset+10>len) goto malformed;
@@ -971,11 +971,11 @@ done:
 static int dns_query(const char *source,uint32_t resolver,uint16_t port,struct dns_answer *answer) {
     memset(answer,0,sizeof *answer);
     answer->status=N_DNS_FORMAT;
-    if(net_setup_cancelled()){dns_failure(answer,N_DNS_CANCELLED);return -ECANCELED;}
+    if(net_setup_cancelled()){dns_failure(answer,N_DNS_CANCELLED);return -N_ERR_CANCELLED;}
     uint32_t literal;
     char name[DNS_NAME_TEXT_BYTES+1];
     size_t textlen=strlen(source);
-    if (textlen>DNS_NAME_TEXT_BYTES) return -ENAMETOOLONG;
+    if (textlen>DNS_NAME_TEXT_BYTES) return -N_ERR_NAME_TOO_LONG;
     uint8_t validation[DNS_NAME_WIRE_BYTES];size_t encoded=0;
     if(!dns_name_encode(source,textlen,validation,sizeof validation,&encoded)) return dns_failure(answer,N_DNS_FORMAT);
     for (size_t i=0;i<=textlen;i++) name[i]=(char)tolower((uint8_t)source[i]);
@@ -1004,18 +1004,18 @@ static int dns_query(const char *source,uint32_t resolver,uint16_t port,struct d
     size_t query_len=12+bytes;query[query_len++]=0;query[query_len++]=1;query[query_len++]=0;query[query_len++]=1;
     uint8_t mac[6];int result=arp_resolve(resolver,mac);
     if (result<0) {dns_failure(answer,dns_error_status(result));return result;}
-    int sock=udp_alloc(0,task_process()->pid);if (sock<0) {dns_failure(answer,sock==-ENOMEM?N_DNS_RESOURCE:N_DNS_UNREACHABLE);return sock;}
+    int sock=udp_alloc(0,task_process()->pid);if (sock<0) {dns_failure(answer,sock==-N_ERR_NO_MEMORY?N_DNS_RESOURCE:N_DNS_UNREACHABLE);return sock;}
     udp_socks[sock]->internal=true;uint64_t generation=udp_socks[sock]->generation;
     result=dns_failure(answer,N_DNS_TIMEOUT);
-    for (unsigned attempt=0;attempt<3 && result==-ETIMEDOUT;attempt++) {
-        if(net_setup_cancelled()){result=-ECANCELED;dns_failure(answer,N_DNS_CANCELLED);break;}
+    for (unsigned attempt=0;attempt<3 && result==-N_ERR_TIMEOUT;attempt++) {
+        if(net_setup_cancelled()){result=-N_ERR_CANCELLED;dns_failure(answer,N_DNS_CANCELLED);break;}
         int sent=udp_output(udp_socks[sock]->port,resolver,port,mac,query,query_len);
         if (sent<0) {result=sent;dns_failure(answer,N_DNS_UNREACHABLE);break;}
         uint64_t until=uptime_ms()+2000;
         while (uptime_ms()<until) {
             int err=0;uint64_t tick=uptime_ms();if(tick>=until)break;uint64_t remain=until-tick;
             struct udp_dgram *packet=udp_wait(sock,(int)remain,&err);
-            if (!packet) {if (err && err!=-EAGAIN) {result=err;dns_failure(answer,dns_error_status(err));}break;}
+            if (!packet) {if (err && err!=-N_ERR_NOT_READY) {result=err;dns_failure(answer,dns_error_status(err));}break;}
             const uint8_t *p=packet->data;size_t length=packet->len;
             if (packet->src!=resolver || packet->sport!=port || length<12 || !(p[2]&0x80) || p[0]!=query[0] || p[1]!=query[1]) continue;
             uint8_t *tcp_reply=NULL;
@@ -1025,7 +1025,7 @@ static int dns_query(const char *source,uint32_t resolver,uint16_t port,struct d
                 p=tcp_reply;
                 if (length<12 || p[0]!=query[0] || p[1]!=query[1] || (p[2]&2)) {kfree(tcp_reply);result=dns_failure(answer,N_DNS_FORMAT);break;}
             }
-            if(net_setup_cancelled()){result=-ECANCELED;dns_failure(answer,N_DNS_CANCELLED);}
+            if(net_setup_cancelled()){result=-N_ERR_CANCELLED;dns_failure(answer,N_DNS_CANCELLED);}
             else result=dns_parse_reply(p,length,name,answer);
             kfree(tcp_reply);
             goto finished;
@@ -1192,7 +1192,7 @@ static int tcp_output(struct tcb *t, uint8_t flags, uint32_t seq, size_t len) {
     if (len) tcp_ring_read(L4+hl,t->tx,t->tx_capacity,t->tx_head+(seq-t->snd_una),(uint32_t)len);
     h->csum = htons(l4_csum(my_ip, t->rip, 6, L4, hl + len));
     int result = ip_output(t->rip, t->mac, 6, hl+len);
-    if (result == -EAGAIN || result == -EBUSY) {
+    if (result == -N_ERR_NOT_READY || result == -N_ERR_BUSY) {
         t->tx_retry = true;
         if (flags&F_ACK) t->ack_pending = true;
         return result; /* no sequence advance, retransmit timer or cwnd loss */
@@ -1424,11 +1424,11 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
         if (t->state == T_SYN_SENT) {
             if ((fl & F_ACK) && ack == t->iss + 1) {
                 t->state = T_CLOSED;
-                t->err = -ECONNREFUSED;
+                t->err = -N_ERR_CONNECTION_REFUSED;
             }
         } else if (SEQ_LEQ(t->rcv_nxt, seq) && SEQ_LT(seq, t->rcv_nxt + MAX(t->adv_wnd, 1u))) {
             t->state = T_CLOSED;
-            t->err = -ECONNRESET;
+            t->err = -N_ERR_CONNECTION_RESET;
         }
         t->rto_at = 0;
         tcp_progress(t);
@@ -1610,7 +1610,7 @@ static void tcp_tick(void) {
         if(!t || t->state==T_FREE)continue;
         if (t->state == T_TIME_WAIT && now >= t->linger_until) t->state = T_CLOSED;
         if (!t->user_open && (t->state == T_CLOSED || now >= t->linger_until)) {
-            if (t->state != T_CLOSED) tcp_reset(t, -ECONNRESET);
+            if (t->state != T_CLOSED) tcp_reset(t, -N_ERR_CONNECTION_RESET);
             tcp_free(t);
             continue;
         }
@@ -1618,7 +1618,7 @@ static void tcp_tick(void) {
             t->rto_at = 0;
             bool probe = t->state != T_SYN_SENT && t->snd_wnd == 0; /* persist: the peer is just not reading */
             if (!probe && ++t->retries > (t->state == T_SYN_SENT ? 5 : 8)) {
-                tcp_reset(t, -ETIMEDOUT);
+                tcp_reset(t, -N_ERR_TIMEOUT);
                 continue;
             }
             t->rto = MIN(t->rto * 2, RTO_MAX);
@@ -1709,7 +1709,7 @@ bool net_ap_syscall(struct regs *regs) {
         goto fallback;
     }
     struct tcb *t = user_tcb((int)regs->rdi);
-    int64_t result = -EBADF;
+    int64_t result = -N_ERR_NO_HANDLE;
     bool handled = true, notify = false;
     if (!t) goto release_gate;
     unsigned expected = 0;
@@ -1719,22 +1719,22 @@ bool net_ap_syscall(struct regs *regs) {
     }
     size_t wanted = regs->rdx;
     if (send && regs->rax==SYS_TCP_SEND_UNTIL && (regs->r8&~(uint64_t)N_TCP_SEND_NONBLOCK)) {
-        result=-EINVAL;goto release_socket;
+        result=-N_ERR_INVALID;goto release_socket;
     }
     if (!wanted) { result=0; goto release_socket; }
     if (send) {
         bool nonblock=regs->rax==SYS_TCP_SEND_UNTIL && (regs->r8&N_TCP_SEND_NONBLOCK);
-        if (t->state!=T_ESTABLISHED && t->state!=T_CLOSE_WAIT) { result=t->err?t->err:-EPIPE; goto release_socket; }
-        if (t->fin_pending) { result=-EPIPE; goto release_socket; }
+        if (t->state!=T_ESTABLISHED && t->state!=T_CLOSE_WAIT) { result=t->err?t->err:-N_ERR_CLOSED; goto release_socket; }
+        if (t->fin_pending) { result=-N_ERR_CLOSED; goto release_socket; }
         if (regs->rax==SYS_TCP_SEND_UNTIL && regs->r10 && uptime_ms()>=regs->r10) {
-            result=-ETIMEDOUT; goto release_socket;
+            result=-N_ERR_TIMEOUT; goto release_socket;
         }
         /* Preserve the legacy send syscall's full enqueue on success. */
         if (regs->rax==SYS_TCP_SEND && (wanted>65536 || wanted>t->tx_capacity-t->tx_len)) {
             ND_FALLBACK(cpu,wanted>65536?ND_LEGACY_LARGE:ND_LEGACY_SPACE);handled=false;goto release_socket;
         }
         uint32_t n = (uint32_t)MIN(MIN(wanted, (size_t)65536), t->tx_capacity-t->tx_len);
-        if (!n) { if(nonblock)result=-EAGAIN;else {ND_FALLBACK(cpu,ND_TX_FULL);handled=false;} goto release_socket; }
+        if (!n) { if(nonblock)result=-N_ERR_NOT_READY;else {ND_FALLBACK(cpu,ND_TX_FULL);handled=false;} goto release_socket; }
         if (!ap_user_mapped((void *)regs->rsi,n,false)) { ND_FALLBACK(cpu,ND_TX_MAP);handled=false; goto release_socket; }
         tcp_ring_write(t->tx,t->tx_capacity,t->tx_head+t->tx_len,(void *)regs->rsi,n);
         t->tx_len+=n;
@@ -1749,7 +1749,7 @@ bool net_ap_syscall(struct regs *regs) {
         if (!t->rx_len) {
             if (t->rx_fin) result=0;
             else if (t->state==T_CLOSED) result=t->err?t->err:0;
-            else if ((int)regs->r10==0) result=-EAGAIN;
+            else if ((int)regs->r10==0) result=-N_ERR_NOT_READY;
             else {ND_FALLBACK(cpu,ND_RX_WAIT);handled=false;}
             goto release_socket;
         }
@@ -1790,15 +1790,15 @@ static int tcp_alloc_slot(void) {
     while(slot<tcp_capacity && tcbs[slot] && tcbs[slot]->state!=T_FREE)slot++;
     if(slot==tcp_capacity) {
         size_t next=tcp_capacity<=((size_t)0x7fffffff+1)/2?tcp_capacity*2:(size_t)0x7fffffff+1;
-        if(next<=tcp_capacity || next>SIZE_MAX/sizeof *tcbs)return -ENOMEM;
-        struct tcb **grown=kmalloc(next*sizeof *grown);if(!grown)return -ENOMEM;
+        if(next<=tcp_capacity || next>SIZE_MAX/sizeof *tcbs)return -N_ERR_NO_MEMORY;
+        struct tcb **grown=kmalloc(next*sizeof *grown);if(!grown)return -N_ERR_NO_MEMORY;
         memcpy(grown,tcbs,tcp_capacity*sizeof *grown);
         memset(grown+tcp_capacity,0,(next-tcp_capacity)*sizeof *grown);
         if(tcbs!=tcp_initial_slots)kfree(tcbs);
         tcbs=grown;tcp_capacity=next;
     }
     if(!tcbs[slot]) {
-        struct tcb *t=kmalloc(sizeof *t);if(!t)return -ENOMEM;
+        struct tcb *t=kmalloc(sizeof *t);if(!t)return -N_ERR_NO_MEMORY;
         memset(t,0,sizeof *t);tcbs[slot]=t;
     }
     return (int)slot;
@@ -1815,16 +1815,16 @@ static uint16_t tcp_local_port(uint32_t ip,uint16_t remote) {
 }
 
 static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
-    if(net_setup_cancelled())return -ECANCELED;
+    if(net_setup_cancelled())return -N_ERR_CANCELLED;
     uint64_t until = uptime_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 15000);
     uint8_t mac[6];
     int r = arp_resolve_until(ip, mac, until);
     if (r < 0) return r;
-    if(current_task->killed)return -EINTR;
-    if(net_setup_cancelled())return -ECANCELED;
-    if(uptime_ms()>=until)return -ETIMEDOUT;
+    if(current_task->killed)return -N_ERR_STOPPED;
+    if(net_setup_cancelled())return -N_ERR_CANCELLED;
+    if(uptime_ms()>=until)return -N_ERR_TIMEOUT;
     uint16_t local=tcp_local_port(ip,port);
-    if(!local)return -EADDRINUSE;
+    if(!local)return -N_ERR_ADDRESS_IN_USE;
     int h=tcp_alloc_slot();if(h<0)return h;
     struct tcb *t=tcbs[h];
     memset(t, 0, sizeof *t);
@@ -1836,7 +1836,7 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     while (!(t->tx=kmalloc(t->tx_capacity)) && t->tx_capacity>PAGE_SIZE) t->tx_capacity/=2;
     if (!t->rx || !t->tx) {
         tcp_free(t);
-        return -ENOMEM;
+        return -N_ERR_NO_MEMORY;
     }
     t->pid = task_process()->pid;
     if(++tcp_generation==0)++tcp_generation;
@@ -1859,22 +1859,22 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
     }
     uint64_t generation=t->generation;
     while (t->state == T_SYN_SENT) {
-        if(t->generation!=generation || !t->user_open)return -EBADF;
+        if(t->generation!=generation || !t->user_open)return -N_ERR_NO_HANDLE;
         uint64_t now = uptime_ms();
         bool cancelled=net_setup_cancelled();
         if (current_task->killed || cancelled || now >= until) {
             t->state = T_CLOSED;
-            t->err = current_task->killed ? -EINTR : cancelled ? -ECANCELED : -ETIMEDOUT;
+            t->err = current_task->killed ? -N_ERR_STOPPED : cancelled ? -N_ERR_CANCELLED : -N_ERR_TIMEOUT;
             break;
         }
         net_setup_wait_timeout(&t->progress, until - now);
     }
-    if(t->generation!=generation || !t->user_open)return -EBADF;
+    if(t->generation!=generation || !t->user_open)return -N_ERR_NO_HANDLE;
     if(net_setup_cancelled()) {
-        tcp_reset(t,-ECANCELED);tcp_free(t);return -ECANCELED;
+        tcp_reset(t,-N_ERR_CANCELLED);tcp_free(t);return -N_ERR_CANCELLED;
     }
     if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT) {
-        int err = t->err ? t->err : -ECONNREFUSED;
+        int err = t->err ? t->err : -N_ERR_CONNECTION_REFUSED;
         tcp_free(t);
         return err;
     }
@@ -1883,20 +1883,20 @@ static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
 
 static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t deadline, bool user, bool nonblock) {
     struct tcb *t = user_tcb(h);
-    if (!t) return -EBADF;
+    if (!t) return -N_ERR_NO_HANDLE;
     uint64_t generation=t->generation;
     size_t done = 0;
     while (done < len) {
-        if(t->generation!=generation || !t->user_open)return done?(int64_t)done:-EBADF;
-        if(!user && net_setup_cancelled())return done?(int64_t)done:-ECANCELED;
-        if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT) return done ? (int64_t)done : (t->err ? t->err : -EPIPE);
-        if (t->fin_pending) return done ? (int64_t)done : -EPIPE;
+        if(t->generation!=generation || !t->user_open)return done?(int64_t)done:-N_ERR_NO_HANDLE;
+        if(!user && net_setup_cancelled())return done?(int64_t)done:-N_ERR_CANCELLED;
+        if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT) return done ? (int64_t)done : (t->err ? t->err : -N_ERR_CLOSED);
+        if (t->fin_pending) return done ? (int64_t)done : -N_ERR_CLOSED;
         uint64_t now = uptime_ms();
-        if (current_task->killed) return done ? (int64_t)done : -EINTR;
-        if (deadline && now >= deadline) return done ? (int64_t)done : -ETIMEDOUT;
+        if (current_task->killed) return done ? (int64_t)done : -N_ERR_STOPPED;
+        if (deadline && now >= deadline) return done ? (int64_t)done : -N_ERR_TIMEOUT;
         uint32_t space = t->tx_capacity - t->tx_len;
         if (!space) {
-            if(nonblock)return done?(int64_t)done:-EAGAIN;
+            if(nonblock)return done?(int64_t)done:-N_ERR_NOT_READY;
             if(!user)net_setup_wait_timeout(&t->progress, deadline ? deadline-now : 1000);
             else net_wait_timeout(&t->progress, deadline ? deadline-now : 1000);
             continue;
@@ -1906,7 +1906,7 @@ static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t dea
         /* Validate exactly the chunk we will enqueue, not the entire request
            on every iteration. A late fault preserves the completed prefix. */
         if ((uint64_t)buf>UINT64_MAX-done || (user && !user_ok((const void *)((uint64_t)buf+done),n)))
-            return done?(int64_t)done:-EFAULT;
+            return done?(int64_t)done:-N_ERR_BAD_ADDRESS;
         tcp_ring_write(t->tx,t->tx_capacity,t->tx_head+t->tx_len,buf+done,n);
         t->tx_len += n;
         done += n;
@@ -1918,25 +1918,25 @@ static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t dea
 
 static int64_t tcp_recv_data(int h, uint8_t *buf, size_t len, int timeout_ms, bool user) {
     struct tcb *t = user_tcb(h);
-    if (!t) return -EBADF;
+    if (!t) return -N_ERR_NO_HANDLE;
     if (!len) return 0;
     uint64_t generation=t->generation;
     uint64_t until = uptime_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0);
-    if(!user && net_setup_cancelled())return -ECANCELED;
+    if(!user && net_setup_cancelled())return -N_ERR_CANCELLED;
     while (t->rx_len == 0) {
-        if(t->generation!=generation || !t->user_open)return -EBADF;
-        if(!user && net_setup_cancelled())return -ECANCELED;
+        if(t->generation!=generation || !t->user_open)return -N_ERR_NO_HANDLE;
+        if(!user && net_setup_cancelled())return -N_ERR_CANCELLED;
         if (t->rx_fin) return 0;
         if (t->state == T_CLOSED) return t->err ? t->err : 0;
-        if (current_task->killed) return -EINTR;
+        if (current_task->killed) return -N_ERR_STOPPED;
         uint64_t now=uptime_ms();
-        if (timeout_ms >= 0 && now >= until) return -EAGAIN;
+        if (timeout_ms >= 0 && now >= until) return -N_ERR_NOT_READY;
         if(!user)net_setup_wait_timeout(&t->progress, timeout_ms < 0 ? 1000 : until - now);
         else net_wait_timeout(&t->progress, timeout_ms < 0 ? 1000 : until - now);
     }
-    if(t->generation!=generation || !t->user_open)return -EBADF;
+    if(t->generation!=generation || !t->user_open)return -N_ERR_NO_HANDLE;
     uint32_t n = (uint32_t)MIN(len, t->rx_len);
-    if (user && !user_ok_w(buf,n)) return -EFAULT;
+    if (user && !user_ok_w(buf,n)) return -N_ERR_BAD_ADDRESS;
     tcp_ring_read(buf,t->rx,t->rx_capacity,t->rx_head,n);
     t->rx_head = (t->rx_head + n) % t->rx_capacity;
     t->rx_len -= n;
@@ -1971,29 +1971,29 @@ static void tcp_close(struct tcb *t) {
 static int dns_tcp_exchange(uint32_t resolver,uint16_t port,uint64_t deadline,
                             const uint8_t *query,size_t query_len,uint8_t **reply,size_t *reply_len) {
     *reply=NULL;*reply_len=0;
-    uint64_t now=uptime_ms();if(now>=deadline)return -ETIMEDOUT;
+    uint64_t now=uptime_ms();if(now>=deadline)return -N_ERR_TIMEOUT;
     int handle=(int)sys_tcp_connect(resolver,port,(int)(deadline-now));
     if (handle<0) return handle;
     uint8_t prefix[2]={(uint8_t)(query_len>>8),(uint8_t)query_len};
     int result=0;
     long n=tcp_send_data(handle,prefix,2,deadline,false,false);
-    if (n!=2) {result=n<0?(int)n:net_setup_cancelled()?-ECANCELED:-ETIMEDOUT;goto close;}
+    if (n!=2) {result=n<0?(int)n:net_setup_cancelled()?-N_ERR_CANCELLED:-N_ERR_TIMEOUT;goto close;}
     n=tcp_send_data(handle,query,query_len,deadline,false,false);
-    if (n!=(long)query_len) {result=n<0?(int)n:net_setup_cancelled()?-ECANCELED:-ETIMEDOUT;goto close;}
+    if (n!=(long)query_len) {result=n<0?(int)n:net_setup_cancelled()?-N_ERR_CANCELLED:-N_ERR_TIMEOUT;goto close;}
     size_t done=0;
     while (done<2) {
-        uint64_t now=uptime_ms();if (now>=deadline) {result=-ETIMEDOUT;goto close;}
+        uint64_t now=uptime_ms();if (now>=deadline) {result=-N_ERR_TIMEOUT;goto close;}
         n=tcp_recv_data(handle,prefix+done,2-done,(int)(deadline-now),false);
-        if (n<=0) {result=n<0?(int)n:-EPROTO;goto close;} done+=(size_t)n;
+        if (n<=0) {result=n<0?(int)n:-N_ERR_PROTOCOL;goto close;} done+=(size_t)n;
     }
     size_t length=(size_t)prefix[0]<<8|prefix[1];
-    if (length<12) {result=-EPROTO;goto close;}
-    uint8_t *response=kmalloc(length);if (!response) {result=-ENOMEM;goto close;}
+    if (length<12) {result=-N_ERR_PROTOCOL;goto close;}
+    uint8_t *response=kmalloc(length);if (!response) {result=-N_ERR_NO_MEMORY;goto close;}
     done=0;
     while (done<length) {
-        uint64_t now=uptime_ms();if (now>=deadline) {result=-ETIMEDOUT;break;}
+        uint64_t now=uptime_ms();if (now>=deadline) {result=-N_ERR_TIMEOUT;break;}
         n=tcp_recv_data(handle,response+done,length-done,(int)(deadline-now),false);
-        if (n<=0) {result=n<0?(int)n:-EPROTO;break;} done+=(size_t)n;
+        if (n<=0) {result=n<0?(int)n:-N_ERR_PROTOCOL;break;} done+=(size_t)n;
     }
     if (!result) {*reply=response;*reply_len=length;} else kfree(response);
 close:
@@ -2205,14 +2205,14 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     switch (num) {
     case SYS_NET_SETUP_CANCEL_CHANNEL: {
         int fd=(int)a;
-        if(fd < -1)return -EINVAL;
+        if(fd < -1)return -N_ERR_INVALID;
         struct file *file=NULL;
         if(fd>=0) {
             uint64_t flags=irq_save();
             struct task *owner=task_process();
             if((size_t)fd<owner->fd_capacity)file=owner->fds[fd];
-            if(!file){irq_restore(flags);return -EBADF;}
-            if(file->vn->type!=VT_CHANNEL || !file->vn->ops || !file->vn->ops->hangup){irq_restore(flags);return -EINVAL;}
+            if(!file){irq_restore(flags);return -N_ERR_NO_HANDLE;}
+            if(file->vn->type!=VT_CHANNEL || !file->vn->ops || !file->vn->ops->hangup){irq_restore(flags);return -N_ERR_INVALID;}
             vfs_dup(file);irq_restore(flags);
         }
         struct file *old=current_task->net_setup_cancel_file;
@@ -2222,7 +2222,7 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_NET_INFO: {
         struct n_netinfo *ni = (struct n_netinfo *)a;
-        if (!user_ok_w(ni, sizeof *ni)) return -EFAULT;
+        if (!user_ok_w(ni, sizeof *ni)) return -N_ERR_BAD_ADDRESS;
         memset(ni, 0, sizeof *ni);
         if (!nif) return 0;
         ni->present = 1;
@@ -2238,10 +2238,10 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         return 0;
     }
     case SYS_NET_PING:
-        if (!nif) return -ENETDOWN;
+        if (!nif) return -N_ERR_NETWORK_DOWN;
         return sys_ping((uint32_t)a, (int)b, (int)c);
     case SYS_NET_DNS: {
-        if (!user_ok_w((void *)b, 4)) return -EFAULT;
+        if (!user_ok_w((void *)b, 4)) return -N_ERR_BAD_ADDRESS;
         char *name = NULL;
         int r = dns_user_name_copy((const char *)a, &name);
         if (r < 0) return r;
@@ -2250,7 +2250,7 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         int64_t ret = dns_query(name, resolver.ip, resolver.port, &answer);
         kfree(name);
         if (ret == 0) {
-            if (!user_ok_w((void *)b,4)) ret=-EFAULT;
+            if (!user_ok_w((void *)b,4)) ret=-N_ERR_BAD_ADDRESS;
             else *(uint32_t *)b = answer.ips[0];
         }
         kfree(answer.ips);
@@ -2258,36 +2258,36 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_NET_DNS_ALL: {
         struct n_dns_result *out=(struct n_dns_result *)d;
-        if (!user_ok_w(out,sizeof *out) || c>SIZE_MAX/sizeof(uint32_t) || !user_ok_w((void *)b,c*sizeof(uint32_t))) return -EFAULT;
+        if (!user_ok_w(out,sizeof *out) || c>SIZE_MAX/sizeof(uint32_t) || !user_ok_w((void *)b,c*sizeof(uint32_t))) return -N_ERR_BAD_ADDRESS;
         *out=(struct n_dns_result){.version=1,.status=N_DNS_FORMAT};
         char *name=NULL;int result=dns_user_name_copy((const char *)a,&name);
         if (result<0) return result;
         struct n_sockaddr resolver=dns_default_resolver();
         if (e) {
-            if (!user_ok((void *)e,sizeof resolver)) {kfree(name);return -EFAULT;}
+            if (!user_ok((void *)e,sizeof resolver)) {kfree(name);return -N_ERR_BAD_ADDRESS;}
             resolver=*(const struct n_sockaddr *)e;
         }
         struct dns_answer answer;
         result=dns_query(name,resolver.ip,resolver.port,&answer);kfree(name);
         /* A sibling may revoke user pages while resolution blocks. */
-        if (!user_ok_w(out,sizeof *out) || !user_ok_w((void *)b,MIN(c,(size_t)answer.count)*sizeof(uint32_t))) {kfree(answer.ips);return -EFAULT;}
+        if (!user_ok_w(out,sizeof *out) || !user_ok_w((void *)b,MIN(c,(size_t)answer.count)*sizeof(uint32_t))) {kfree(answer.ips);return -N_ERR_BAD_ADDRESS;}
         *out=(struct n_dns_result){.version=1,.status=answer.status,.count=answer.count,.ttl=answer.ttl};
         if (!result && c) memcpy((void *)b,answer.ips,MIN(c,(size_t)answer.count)*sizeof(uint32_t));
         kfree(answer.ips);return result;
     }
     case SYS_UDP_SOCKET:
-        if (!nif) return -ENETDOWN;
+        if (!nif) return -N_ERR_NETWORK_DOWN;
         return udp_alloc((uint16_t)a, task_process()->pid);
     case SYS_UDP_SEND: {
         struct udp_sock *s = user_udp((int)a);
-        if (!s) return -EBADF;
-        if (e > 1472) return -EINVAL;
-        if (!user_ok((void *)d, e)) return -EFAULT;
+        if (!s) return -N_ERR_NO_HANDLE;
+        if (e > 1472) return -N_ERR_INVALID;
+        if (!user_ok((void *)d, e)) return -N_ERR_BAD_ADDRESS;
         uint8_t mac[6];
         uint64_t generation=s->generation;
         int r = arp_resolve((uint32_t)b, mac);
         if (r < 0) return r;
-        if(!s->used || s->generation!=generation)return -EBADF;
+        if(!s->used || s->generation!=generation)return -N_ERR_NO_HANDLE;
         uint8_t tmp[1472];
         memcpy(tmp, (void *)d, e);
         r = udp_output(s->port, (uint32_t)b, (uint16_t)c, mac, tmp, e);
@@ -2295,10 +2295,10 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_UDP_RECV: {
         struct udp_sock *s = user_udp((int)a);
-        if (!s) return -EBADF;
-        if (!user_ok_w((void *)b, c)) return -EFAULT;
+        if (!s) return -N_ERR_NO_HANDLE;
+        if (!user_ok_w((void *)b, c)) return -N_ERR_BAD_ADDRESS;
         struct n_sockaddr *from = (struct n_sockaddr *)e;
-        if (from && !user_ok_w(from, sizeof *from)) return -EFAULT;
+        if (from && !user_ok_w(from, sizeof *from)) return -N_ERR_BAD_ADDRESS;
         int err = 0;
         struct udp_dgram *dg = udp_wait((int)a, (int)d, &err);
         if (!dg) return err;
@@ -2312,21 +2312,21 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_UDP_CLOSE: {
         struct udp_sock *s = user_udp((int)a);
-        if (!s) return -EBADF;
+        if (!s) return -N_ERR_NO_HANDLE;
         udp_release(s);
         return 0;
     }
     case SYS_TCP_CONNECT:
-        if (!nif) return -ENETDOWN;
+        if (!nif) return -N_ERR_NETWORK_DOWN;
         return sys_tcp_connect((uint32_t)a, (uint16_t)b, (int)c);
     case SYS_TCP_SEND: return tcp_send_data((int)a, (const uint8_t *)b, c, 0, true, false);
     case SYS_TCP_SEND_UNTIL:
-        if(e&~(uint64_t)N_TCP_SEND_NONBLOCK)return -EINVAL;
+        if(e&~(uint64_t)N_TCP_SEND_NONBLOCK)return -N_ERR_INVALID;
         return tcp_send_data((int)a, (const uint8_t *)b, c, d, true, (e&N_TCP_SEND_NONBLOCK)!=0);
     case SYS_TCP_CANCEL: {
         struct tcb *t = user_tcb((int)a);
-        if (!t) return -EBADF;
-        tcp_reset(t, -ECANCELED);
+        if (!t) return -N_ERR_NO_HANDLE;
+        tcp_reset(t, -N_ERR_CANCELLED);
         /* Aborted bytes are never exposed by a later receive and unsent
            prefixes are never emitted after cancellation. */
         t->rx_len=t->tx_len=0;t->nooo=0;
@@ -2334,7 +2334,7 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     }
     case SYS_NET_STATS: {
         struct n_netstats *out = (struct n_netstats *)a;
-        if (!user_ok_w(out, sizeof *out)) return -EFAULT;
+        if (!user_ok_w(out, sizeof *out)) return -N_ERR_BAD_ADDRESS;
         memset(out,0,sizeof *out);
         out->rx_dropped=net_counters.rx_dropped;
         out->rx_invalid=net_counters.rx_invalid;
@@ -2364,24 +2364,24 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
     case SYS_NET_TEST: {
         /* a: fault settings for this process's TCP connections (or NULL); b: counters out (or NULL) */
         if (a) {
-            if (!user_ok((void *)a, sizeof(struct n_netfault))) return -EFAULT;
+            if (!user_ok((void *)a, sizeof(struct n_netfault))) return -N_ERR_BAD_ADDRESS;
             fault = *(const struct n_netfault *)a;
             fault_pid = fault.rx_drop || fault.rx_reorder || fault.tx_drop ? task_process()->pid : 0;
         }
         if (b) {
-            if (!user_ok_w((void *)b, sizeof(struct n_tcpstats))) return -EFAULT;
+            if (!user_ok_w((void *)b, sizeof(struct n_tcpstats))) return -N_ERR_BAD_ADDRESS;
             *(struct n_tcpstats *)b = tcp_stats;
         }
         return 0;
     }
     case SYS_TCP_CLOSE: {
         struct tcb *t = user_tcb((int)a);
-        if (!t) return -EBADF;
+        if (!t) return -N_ERR_NO_HANDLE;
         tcp_close(t);
         return 0;
     }
     }
-    return -ENOSYS;
+    return -N_ERR_UNSUPPORTED;
 }
 
 int64_t net_syscall(int num, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
