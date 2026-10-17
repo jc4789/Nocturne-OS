@@ -42,7 +42,6 @@ struct http2_stream {
     uint32_t pending_credit;
     size_t sent,reported,received,content_length;
     size_t accepted;
-    bool headers_started;
     bool have_length,headers_ready,ended,local_end,head,body_forbidden;
     int error;
     char message[128];
@@ -76,6 +75,12 @@ struct http2_connection {
     struct http2_stream *streams;
     struct hpack_entry *table;
     size_t table_size,table_max;
+    /* Our encoder's dynamic table, as the peer's decoder holds it. Header
+       blocks are encoded and queued in wire order under the lock, and a
+       queued block is never withdrawn once it may have changed the table. */
+    struct hpack_entry *encoder;
+    size_t encoder_size,encoder_max,encoder_low;
+    bool encoder_resize;
     struct h2_output *output,*output_last;
     size_t output_bytes;
     uint32_t output_continuation;
@@ -170,7 +175,7 @@ static void drain(struct http2_connection *c) {
         long n=ns_try_write(c->wire,o->bytes+o->at,count);
         if(n==-2)return;if(n<=0){fail(c,errno?errno:ECONNRESET,ns_error(c->wire));return;}
         struct http2_stream *s=find_stream(c,o->stream);
-        if(s){s->accepted+=(size_t)n;if(o->type==1||o->type==9)s->headers_started=true;
+        if(s){s->accepted+=(size_t)n;
             if(s->result)s->result->request_bytes_sent+=(size_t)n;}
         o->at+=(size_t)n;budget-=(size_t)n;c->output_bytes-=(size_t)n;
         if(o->at==o->len){
@@ -181,26 +186,26 @@ static void drain(struct http2_connection *c) {
     }
     if(!c->output&&!c->dead&&ns_try_write(c->wire,NULL,0)==-1)fail(c,errno?errno:EIO,ns_error(c->wire));
 }
-/* Preserve a partially accepted frame and every remaining CONTINUATION of a
-   started header block. Everything else belonging to the cancelled stream
-   has not entered the TLS engine and can be removed safely. Return reserved
-   DATA credit before another stream is selected. RST is inserted at the first
-   legal frame boundary, ahead of unrelated queued uploads. */
+/* Preserve a partially accepted frame and every queued HEADERS/CONTINUATION:
+   their field block already changed the shared HPACK dynamic table, so the
+   peer must decode it even when the request is abandoned. Unsent DATA has not
+   entered the TLS engine and can be removed safely. Return reserved DATA
+   credit before another stream is selected. RST is inserted at the first legal
+   frame boundary after the retained frames, ahead of unrelated uploads. */
 static void cancel_output(struct http2_connection *c,struct http2_stream *s,bool send_reset) {
-    struct h2_output **at=&c->output,*last=NULL,*retained=NULL;bool removed=false;
+    struct h2_output **at=&c->output,*last=NULL,*retained=NULL;bool removed=false,headers=false;
     while(*at) {
         struct h2_output *o=*at;
-        bool remove=o->stream==s->id&&!o->at&&
-            (o->type==0||(!s->headers_started&&(o->type==1||o->type==9)));
-        if(remove) {
+        if(o->stream==s->id&&!o->at&&o->type==0) {
             *at=o->next;c->output_bytes-=o->len;removed=true;
-            if(o->type==0){c->send_window+=(int64_t)(o->len-9);s->send_window+=(int64_t)(o->len-9);}
+            c->send_window+=(int64_t)(o->len-9);s->send_window+=(int64_t)(o->len-9);
             free(o);continue;
         }
-        if(o->stream==s->id)retained=o;last=o;at=&o->next;
+        if(o->stream==s->id){retained=o;if(o->type==1||o->type==9)headers=true;}
+        last=o;at=&o->next;
     }
     c->output_last=last;
-    if(!s->accepted||c->dead||(!send_reset&&!removed))return;
+    if(c->dead||(!s->accepted&&!headers)||(!send_reset&&!removed&&!headers))return;
     struct h2_output *anchor=NULL,*head=c->output;
     if(head&&(c->output_continuation||head->at)) {
         anchor=head;
@@ -260,25 +265,32 @@ static void huff_init(void) {
         __atomic_store_n(&huff_ready,2,__ATOMIC_RELEASE);
     }else while(__atomic_load_n(&huff_ready,__ATOMIC_ACQUIRE)!=2)yield();
 }
-static void evict(struct http2_connection *c,size_t needed) {
-    while(c->table&&c->table_size+needed>c->table_max) {
-        struct hpack_entry **p=&c->table;while((*p)->next)p=&(*p)->next;
-        struct hpack_entry *e=*p;*p=NULL;c->table_size-=e->size;free(e->name);free(e->value);free(e);
+static void table_evict(struct hpack_entry **table,size_t *size,size_t max,size_t needed) {
+    while(*table&&*size+needed>max) {
+        struct hpack_entry **p=table;while((*p)->next)p=&(*p)->next;
+        struct hpack_entry *e=*p;*p=NULL;*size-=e->size;free(e->name);free(e->value);free(e);
     }
+}
+static void evict(struct http2_connection *c,size_t needed) {
+    table_evict(&c->table,&c->table_size,c->table_max,needed);
 }
 static bool indexed(struct http2_connection *c,size_t index,const char **name,size_t *name_len,const char **value,size_t *value_len) {
     if(index&&index<62){*name=static_name[index];*value=index<17?static_value[index]:"";*name_len=strlen(*name);*value_len=strlen(*value);return true;}
     if(index<62)return false;index-=62;struct hpack_entry *e=c->table;
     while(e&&index--){e=e->next;}if(!e)return false;*name=e->name;*value=e->value;*name_len=e->name_len;*value_len=e->value_len;return true;
 }
-static bool table_add(struct http2_connection *c,const char *name,size_t name_len,const char *value,size_t value_len) {
+static bool table_insert(struct hpack_entry **table,size_t *table_size,size_t max,
+    const char *name,size_t name_len,const char *value,size_t value_len) {
     size_t size=name_len+value_len+32;
-    if(size>c->table_max){evict(c,c->table_max+1);return true;}
+    if(size>max){table_evict(table,table_size,max,max+1);return true;}
     struct hpack_entry *e=calloc(1,sizeof *e);if(!e)return false;
     e->name=malloc(name_len+1);e->value=malloc(value_len+1);e->name_len=name_len;e->value_len=value_len;e->size=size;
     if(!e->name||!e->value){free(e->name);free(e->value);free(e);return false;}
     memcpy(e->name,name,name_len);e->name[name_len]=0;memcpy(e->value,value,value_len);e->value[value_len]=0;
-    evict(c,size);e->next=c->table;c->table=e;c->table_size+=size;return true;
+    table_evict(table,table_size,max,size);e->next=*table;*table=e;*table_size+=size;return true;
+}
+static bool table_add(struct http2_connection *c,const char *name,size_t name_len,const char *value,size_t value_len) {
+    return table_insert(&c->table,&c->table_size,c->table_max,name,name_len,value,value_len);
 }
 static bool append(struct bytes *b,const void *data,size_t n) {
     if(n>H2_HEADERS-b->n)return false;
@@ -291,12 +303,57 @@ static bool number(struct bytes *b,size_t n,unsigned bits,unsigned prefix) {
     if(n<max){p[used++]=prefix|n;}else{p[used++]=prefix|max;n-=max;while(n>=128){p[used++]=(n&127)|128;n>>=7;}p[used++]=n;}
     return append(b,p,used);
 }
-static bool literal(struct bytes *b,const char *name,const char *value) {
-    size_t index=0;for(size_t i=1;i<62;i++)if(!strcmp(name,static_name[i])){index=i;break;}
-    bool secret=!strcmp(name,"authorization")||!strcmp(name,"proxy-authorization")||!strcmp(name,"cookie");
-    return number(b,index,4,secret?16:0)&&
-        (index||(number(b,strlen(name),7,0)&&append(b,name,strlen(name))))&&
-        number(b,strlen(value),7,0)&&append(b,value,strlen(value));
+/* RFC 7541 5.2: a string is Huffman coded whenever that is shorter. */
+static bool string(struct bytes *b,const char *text,size_t n) {
+    uint64_t bits=0;for(size_t i=0;i<n;i++)bits+=huffman[(unsigned char)text[i]].bits;
+    size_t coded=(size_t)((bits+7)/8);
+    if(coded>=n)return number(b,n,7,0)&&append(b,text,n);
+    unsigned char *out=malloc(coded);if(!out)return false;
+    size_t at=0;uint64_t pending=0;unsigned held=0;
+    for(size_t i=0;i<n;i++) {
+        const struct huff_code *k=&huffman[(unsigned char)text[i]];
+        pending=pending<<k->bits|k->code;held+=k->bits;
+        while(held>=8){held-=8;out[at++]=(unsigned char)(pending>>held);}
+    }
+    if(held)out[at++]=(unsigned char)(pending<<(8-held)|0xffu>>held); /* EOS-prefix padding */
+    bool ok=number(b,at,7,128)&&append(b,out,at);free(out);return ok;
+}
+enum h2_field_mode { FIELD_INDEX,FIELD_PLAIN,FIELD_NEVER };
+/* Exact (name,value) match first, else the lowest index with the name. */
+static size_t encoder_find(struct http2_connection *c,const char *name,size_t name_len,
+    const char *value,size_t value_len,size_t *name_index) {
+    *name_index=0;
+    for(size_t i=1;i<62;i++)if(!strcmp(name,static_name[i])) {
+        if(!*name_index)*name_index=i;
+        if(!strcmp(value,i<17?static_value[i]:""))return i;
+    }
+    size_t i=62;
+    for(struct hpack_entry *e=c->encoder;e;e=e->next,i++)if(e->name_len==name_len&&!memcmp(e->name,name,name_len)) {
+        if(!*name_index)*name_index=i;
+        if(e->value_len==value_len&&!memcmp(e->value,value,value_len))return i;
+    }
+    return 0;
+}
+/* Caller holds c->lock and queues the finished block before releasing it. A
+   failure after a table insertion leaves the peer's table unknowable. */
+static bool field(struct http2_connection *c,struct bytes *b,const char *name,const char *value,enum h2_field_mode mode) {
+    size_t name_len=strlen(name),value_len=strlen(value),name_index=0;
+    size_t exact=encoder_find(c,name,name_len,value,value_len,&name_index);
+    if(exact)return number(b,exact,7,128);
+    bool add=mode==FIELD_INDEX&&name_len+value_len+32<=c->encoder_max;
+    if(!number(b,name_index,add?6:4,add?64:mode==FIELD_NEVER?16:0))return false;
+    if(!name_index&&!string(b,name,name_len))return false;
+    if(!string(b,value,value_len))return false;
+    return !add||table_insert(&c->encoder,&c->encoder_size,c->encoder_max,name,name_len,value,value_len);
+}
+static enum h2_field_mode field_mode(const char *name,const char *value) {
+    if(!strcmp(name,"authorization")||!strcmp(name,"proxy-authorization"))return FIELD_NEVER;
+    /* Short cookie crumbs are cheap to guess through compression (RFC 7541
+       7.1.3); longer ones are indexed so repeat requests stay small. */
+    if(!strcmp(name,"cookie"))return strlen(value)<20?FIELD_NEVER:FIELD_INDEX;
+    /* Per-request values would only evict reusable entries. */
+    if(!strcmp(name,":path")||!strcmp(name,"content-length"))return FIELD_PLAIN;
+    return FIELD_INDEX;
 }
 static bool forbidden(const char *name) {
     return !strcmp(name,"connection")||!strcmp(name,"proxy-connection")||!strcmp(name,"keep-alive")||
@@ -315,6 +372,14 @@ static bool connection_named(const char *head,const char *name) {
         }
         p=end+2;
     }return false;
+}
+/* Request fields are gathered before admission and encoded under the lock;
+   bound is the plain-literal size, which compression never exceeds. */
+static bool field_list(struct bytes *list,size_t *bound,const char *name,size_t name_len,const char *value,size_t value_len) {
+    static const char zero=0;
+    if(name_len+value_len+12>H2_HEADERS-*bound)return false;
+    *bound+=name_len+value_len+12;
+    return append(list,name,name_len)&&append(list,&zero,1)&&append(list,value,value_len)&&append(list,&zero,1);
 }
 enum { HP_REP,HP_INTEGER,HP_NAME_LENGTH,HP_NAME,HP_VALUE_LENGTH,HP_VALUE };
 enum { HP_INDEX,HP_SIZE,HP_NAME_INDEX,HP_NAME_SIZE,HP_VALUE_SIZE };
@@ -539,7 +604,17 @@ static void dispatch(struct http2_connection *c) {
         if(flags&1)break;c->settings=true;
         for(size_t at=0;at<n;at+=6) {
             unsigned setting=(unsigned)p[at]<<8|p[at+1];uint32_t value=be32(p+at+2);
-            if(setting==2){if(value>1)goto protocol;}
+            if(setting==1) {
+                /* Our table never exceeds the default; a smaller peer limit is
+                   signalled at the start of the next header block (RFC 7541 4.2). */
+                size_t max=value<4096?value:4096;
+                if(max!=c->encoder_max) {
+                    if(!c->encoder_resize||max<c->encoder_low)c->encoder_low=max;
+                    c->encoder_max=max;c->encoder_resize=true;
+                    table_evict(&c->encoder,&c->encoder_size,max,0);
+                }
+            }
+            else if(setting==2){if(value>1)goto protocol;}
             else if(setting==3)c->max_streams=value;
             else if(setting==4){if(value>INT_MAX)goto protocol;int64_t delta=(int64_t)value-c->initial_window;
                 for(struct http2_stream *q=c->streams;q;q=q->next){q->send_window+=delta;if(q->send_window>INT_MAX)goto protocol;}c->initial_window=value;}
@@ -623,7 +698,7 @@ next_stream:
 struct http2_connection *http2_new(net_stream *wire) {
     struct http2_connection *c=calloc(1,sizeof *c);if(!c)return NULL;
     c->wire=wire;c->next_id=1;c->max_streams=UINT32_MAX;c->max_frame=16384;
-    c->initial_window=65535;c->send_window=65535;c->recv_window=65535;c->table_max=4096;huff_init();
+    c->initial_window=65535;c->send_window=65535;c->recv_window=65535;c->table_max=4096;c->encoder_max=4096;huff_init();
     static const char preface[]="PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
     /* ENABLE_PUSH=0, INITIAL_WINDOW_SIZE, MAX_HEADER_LIST_SIZE. */
     unsigned char settings[18]={0,2,0,0,0,0,0,4};put32(settings+8,H2_WINDOW);
@@ -641,7 +716,7 @@ struct http2_connection *http2_new(net_stream *wire) {
     return c;
 }
 void http2_free(struct http2_connection *c) {
-    if(!c)return;c->table_max=0;evict(c,0);bytes_free(&c->decoder.name);bytes_free(&c->decoder.value);bytes_free(&c->decoder.fields);free(c->frame);
+    if(!c)return;c->table_max=0;evict(c,0);table_evict(&c->encoder,&c->encoder_size,0,0);bytes_free(&c->decoder.name);bytes_free(&c->decoder.value);bytes_free(&c->decoder.fields);free(c->frame);
     struct h2_output *o=c->output;while(o){struct h2_output *next=o->next;free(o);o=next;}free(c);
 }
 bool http2_available(struct http2_connection *c) {
@@ -658,23 +733,36 @@ static void start_remove(struct http2_connection *c,struct h2_starter *waiter) {
 struct http2_stream *http2_start(struct http2_connection *c,const struct http_req *rq,
     const struct url_owned *url,const char *head,const struct http_stream_hooks *hooks,
     struct http_transport_result *result,char *error,size_t capacity) {
-    struct http2_stream *s=calloc(1,sizeof *s);struct bytes b={0};char *authority=NULL;
+    struct http2_stream *s=calloc(1,sizeof *s);struct bytes b={0},list={0};char *authority=NULL;
+    size_t bound=16; /* worst-case block size: plain literals plus a table-size update */
     size_t h=strlen(url->host);if(h>SIZE_MAX-8||!(authority=malloc(h+8)))goto invalid;
     if(url->port==(url->tls?443:80))snprintf(authority,h+8,"%s",url->host);
     else snprintf(authority,h+8,"%s:%u",url->host,url->port);
     const char *method=rq->method?rq->method:"GET";
-    if(!s||!literal(&b,":method",method)||!literal(&b,":scheme",url->tls?"https":"http")||
-        !literal(&b,":authority",authority)||!literal(&b,":path",url->path))goto invalid;
+    if(!s||!field_list(&list,&bound,":method",3+4,method,strlen(method))||
+        !field_list(&list,&bound,":scheme",7,url->tls?"https":"http",url->tls?5:4)||
+        !field_list(&list,&bound,":authority",10,authority,strlen(authority))||
+        !field_list(&list,&bound,":path",5,url->path,strlen(url->path)))goto invalid;
     const char *p=strstr(head,"\r\n");if(!p)goto invalid;p+=2;
     while(*p&&strncmp(p,"\r\n",2)) {
         const char *end=strstr(p,"\r\n"),*colon=strchr(p,':');if(!end||!colon||colon>end)goto invalid;
         size_t n=(size_t)(colon-p);char *name=malloc(n+1);if(!name)goto invalid;
         for(size_t i=0;i<n;i++)name[i]=p[i]>='A'&&p[i]<='Z'?p[i]+32:p[i];name[n]=0;
         const char *v=colon+1;while(v<end&&(*v==' '||*v=='\t'))v++;
-        char *value=malloc((size_t)(end-v)+1);if(!value){free(name);goto invalid;}
-        memcpy(value,v,(size_t)(end-v));value[end-v]=0;
-        bool ok=true;if(!forbidden(name)&&strcmp(name,"host")&&!connection_named(head,name))ok=literal(&b,name,value);
-        free(name);free(value);if(!ok)goto invalid;p=end+2;
+        const char *last=end;while(last>v&&(last[-1]==' '||last[-1]=='\t'))last--;
+        bool ok=true;
+        /* RFC 9113 8.2.2: connection-specific fields are not sent; TE only as
+           "trailers". 8.2.3: cookies travel as separate crumbs. */
+        bool te=!strcmp(name,"te"),trailers=te&&(size_t)(last-v)==8&&!strncasecmp(v,"trailers",8);
+        if(forbidden(name)||!strcmp(name,"host")||connection_named(head,name)||(te&&!trailers));
+        else if(!strcmp(name,"cookie"))for(const char *crumb=v;ok&&crumb<last;) {
+            const char *stop=crumb;while(stop<last&&*stop!=';')stop++;
+            const char *tail=stop;while(tail>crumb&&(tail[-1]==' '||tail[-1]=='\t'))tail--;
+            if(tail>crumb)ok=field_list(&list,&bound,name,n,crumb,(size_t)(tail-crumb));
+            crumb=stop<last?stop+1:last;while(crumb<last&&(*crumb==' '||*crumb=='\t'))crumb++;
+        }
+        else ok=field_list(&list,&bound,name,n,v,(size_t)(last-v));
+        free(name);if(!ok)goto invalid;p=end+2;
     }
     s->connection=c;s->request=rq;s->hooks=hooks;s->result=result;s->head=!strcmp(method,"HEAD");
     s->recv_window=H2_WINDOW;s->timeout=rq->timeout_ms>0?(uint64_t)rq->timeout_ms:INT_MAX;s->progress=uptime_ms();
@@ -687,7 +775,7 @@ struct http2_stream *http2_start(struct http2_connection *c,const struct http_re
     bool waiting=false;
     while(!c->dead&&!c->goaway&&c->next_id<0x7fffffffu) {
         bool turn=c->start_first==&waiter,capacity=c->active<c->max_streams&&c->active<H2_STREAMS;
-        bool space=c->output_bytes+b.n+(b.n/16384+1)*9<=H2_APPLICATION_OUTPUT;
+        bool space=bound<=H2_APPLICATION_OUTPUT&&c->output_bytes+bound+(bound/16384+1)*9<=H2_APPLICATION_OUTPUT;
         bool needs_space=turn&&capacity&&!space;
         if(needs_space&&!waiting){c->header_waiters++;waiting=true;}
         if(!needs_space&&waiting){c->header_waiters--;waiting=false;}
@@ -704,6 +792,18 @@ struct http2_stream *http2_start(struct http2_connection *c,const struct http_re
     if(c->dead||c->goaway||c->next_id>=0x7fffffffu){
         if(result)result->request_unprocessed=true;int error=c->dead?ECONNRESET:EAGAIN;leave(c);errno=error;goto invalid;
     }
+    /* Encode in wire order: the dynamic table must match the peer's decoder. */
+    bool encoded=true;
+    if(c->encoder_resize) {
+        encoded=(c->encoder_low>=c->encoder_max||number(&b,c->encoder_low,5,32))&&number(&b,c->encoder_max,5,32);
+        c->encoder_resize=false;
+    }
+    for(size_t at=0;encoded&&at<list.n;) {
+        const char *name=(const char *)list.p+at,*value=name+strlen(name)+1;
+        encoded=field(c,&b,name,value,field_mode(name,value));
+        at=(size_t)(value-(const char *)list.p)+strlen(value)+1;
+    }
+    if(!encoded){fail(c,ENOMEM,"HTTP/2 header compression failed");leave(c);errno=ENOMEM;goto invalid;}
     s->id=c->next_id;c->next_id+=2;s->send_window=c->initial_window;
     if(result)result->stream_id=s->id;
     s->local_end=!rq->body_len;s->next=c->streams;c->streams=s;c->active++;
@@ -713,8 +813,8 @@ struct http2_stream *http2_start(struct http2_connection *c,const struct http_re
         bool ok=frame(c,at?9:1,flags,s->id,b.p+at,n);
         if(!ok)break;at+=n;
     }
-    pump(c);leave(c);free(b.p);free(authority);return s;
-invalid:free(s);free(b.p);free(authority);snprintf(error,capacity,"cannot open HTTP/2 stream");if(!errno)errno=ENOMEM;return NULL;
+    pump(c);leave(c);free(b.p);free(list.p);free(authority);return s;
+invalid:free(s);free(b.p);free(list.p);free(authority);snprintf(error,capacity,"cannot open HTTP/2 stream");if(!errno)errno=ENOMEM;return NULL;
 }
 static bool check(struct http2_stream *s,bool cancelled) {
     if(cancelled) {
