@@ -2187,7 +2187,7 @@ static void tcp_buffer_configure(void) {
 void net_init(void) {
     dns_configure();
     tcp_buffer_configure();
-    bool found = netvsc_probe() || e1000_probe() || tulip_probe();
+    bool found = netvsc_probe() || e1000_probe() || rtl8125_probe() || tulip_probe();
     net_initialized = true;
     if (!found || !nif) {
         kprintf("net: no supported network card yet\n");

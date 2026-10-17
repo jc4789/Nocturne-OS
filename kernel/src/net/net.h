@@ -27,6 +27,7 @@ void net_rx(const void *frame, size_t len);
 void net_rx_notify(void);
 
 bool e1000_probe(void);
+bool rtl8125_probe(void);
 bool tulip_probe(void);
 bool netvsc_probe(void); /* hv/netvsc.c: Hyper-V synthetic network adapter */
 
