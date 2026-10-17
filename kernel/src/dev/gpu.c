@@ -71,18 +71,9 @@ static uint32_t config32(struct pci_device *d, unsigned off) {
 static uint8_t config8(struct pci_device *d, unsigned off) {
     return (uint8_t)(config32(d, off & ~3u) >> ((off & 3u) * 8));
 }
-static uint64_t bar_base(struct pci_device *d, unsigned bar) {
-    if (bar >= 6 || (d->bar[bar] & 1)) return 0;
-    uint64_t base = d->bar[bar] & ~15u;
-    if ((d->bar[bar] & 6) == 4) {
-        if (bar == 5) return 0;
-        base |= (uint64_t)d->bar[bar + 1] << 32;
-    }
-    return base;
-}
 static void *cap_map(struct pci_device *d, unsigned cap, uint32_t *length) {
     unsigned bar = config8(d, cap + 4);
-    uint64_t base = bar_base(d, bar);
+    uint64_t base = pci_bar_address(d, bar);
     uint32_t off = config32(d, cap + 8), len = config32(d, cap + 12);
     /* Fixed caps only, not a guest-mappable host-memory aperture. */
     if (!base || !len || len > 65536 || off > (64u << 20) || base + off < base) return NULL;

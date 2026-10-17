@@ -8,6 +8,7 @@
 #include "dev/pci.h"
 #include "dev/ata.h"
 #include "dev/audio.h"
+#include "dev/usb.h"
 #include "gui/wm.h"
 #include "hv/vmbus.h"
 #include "sys/proc.h"
@@ -73,6 +74,7 @@ void kmain_late(void) {
         hvsock_init();
     }
     pci_init();
+    usb_init();
     net_init();
     audio_init();
     ata_init();
