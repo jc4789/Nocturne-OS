@@ -45,6 +45,13 @@ struct job {
     uint64_t debug_header_bytes, debug_ctl, debug_non_ascii;
     struct http_transport_timing debug_timing;
     unsigned debug_attempts;
+    struct http_transport_result debug_transport; /* the last attempt's connection */
+    /* A debug request in flight: its transport phase, and since when it has
+       not changed, so a stalled phase is reported while it still waits. */
+    const struct http_transport_timing *live_timing;
+    const struct http_transport_result *live_transport;
+    unsigned stall_phase;
+    uint64_t stall_since, stall_reported;
     n_handle input, output;
     n_handle events;         /* input's readiness, for timed waits */
     struct webnet_wire_in in; /* the input message being read */
@@ -94,9 +101,39 @@ static bool read_all(struct job *j,void *p,size_t n) {
 static bool write_all(struct job *j,const void *p,size_t n) {
     return !n||webnet_wire_write(j->output,p,n)==(n_result)n;
 }
+/* Every transport wait polls the cancellation hook, so it also reports a
+   debug request whose phase stays unchanged: the system log then shows where
+   a request that never completes is waiting. */
+#define STALL_REPORT_MS 5000u
+static void stall_report(struct job *j,uint64_t now) {
+    unsigned phase=j->live_timing->phase;
+    if(phase!=j->stall_phase||!j->stall_since){j->stall_phase=phase;j->stall_since=j->stall_reported=now;return;}
+    /* A long body transfer progresses; only setup and header waits stall. */
+    if(phase>=HTTP_PHASE_BODY||now-j->stall_reported<STALL_REPORT_MS)return;
+    j->stall_reported=now;
+    static n_handle log=-2;
+    n_handle h=__atomic_load_n(&log,__ATOMIC_ACQUIRE);
+    if(h==-2){n_handle opened=n_system_log_open(),expected=-2;
+        if(!__atomic_compare_exchange_n(&log,&expected,opened,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)&&opened>=0)n_handle_close(opened);
+        h=__atomic_load_n(&log,__ATOMIC_ACQUIRE);}
+    if(h<0)return;
+    const struct http_transport_result *t=j->live_transport;
+    /* The host names the stalled peer; path, query and userinfo stay private. */
+    const char *host=j->url?strstr(j->url,"://"):NULL;host=host?host+3:"";
+    size_t host_len=strcspn(host,"/?#");
+    for(size_t i=host_len;i-->0;)if(host[i]=='@'){host+=i+1;host_len-=i+1;break;}
+    if(host_len>96)host_len=96;
+    char line[288];
+    int n=snprintf(line,sizeof line,"[webfetch] waiting id=%lu phase=%u for %lu ms host=%.*s connection=%lu h2=%u stream=%lu\n",
+        (unsigned long)j->wire.id,phase,(unsigned long)(now-j->stall_since),(int)host_len,host,
+        (unsigned long)(t?t->connection_id:0),(unsigned)(t&&t->http2),(unsigned long)(t?t->stream_id:0));
+    if(n>0)n_channel_send(h,line,(size_t)MIN(n,(int)sizeof line-1),-1);
+}
 static int request_cancelled(void *opaque) {
     struct job *j=opaque;
-    if(n_clock_uptime_ms()>=j->wire.deadline)return 1;
+    uint64_t now=n_clock_uptime_ms();
+    if(j->live_timing)stall_report(j,now);
+    if(now>=j->wire.deadline)return 1;
     if(!(j->wire.user_navigation&WEBNET_WIRE_SERVICE))return 0;
     if(__atomic_load_n(&service_stopping,__ATOMIC_ACQUIRE))return 1;
     struct n_event e;
@@ -1405,10 +1442,12 @@ static bool run_http(struct job *j) {
                 q.headers=j->outgoing.p;
             }
             q.timeout_ms=remaining(j);if(!q.timeout_ms)return false;
+            if(timed){j->live_timing=&timing;j->live_transport=&transport;j->stall_since=0;}
             result=http_request_stream_ex(&q,&r,body_limit,&hooks,timed?&timing:NULL,j->partition,&transport);
+            j->live_timing=NULL;j->live_transport=NULL;
         }
         if(timed&&!hit){
-            j->debug_attempts++;j->debug_timing.phase=timing.phase;
+            j->debug_attempts++;j->debug_timing.phase=timing.phase;j->debug_transport=transport;
             j->debug_timing.resolve_ms+=timing.resolve_ms;j->debug_timing.connect_ms+=timing.connect_ms;
             j->debug_timing.tls_ms+=timing.tls_ms;j->debug_timing.first_header_ms+=timing.first_header_ms;
             j->debug_timing.header_ms+=timing.header_ms;j->debug_timing.body_ms+=timing.body_ms;
@@ -1418,9 +1457,11 @@ static bool run_http(struct job *j) {
             int retry_left=remaining(j);
             if(retry_left) {
                 http_resp_free(&r);q.timeout_ms=retry_left;
+                if(timed){j->live_timing=&timing;j->live_transport=&transport;j->stall_since=0;}
                 result=http_request_stream_ex(&q,&r,body_limit,&hooks,timed?&timing:NULL,j->partition,&transport);
+                j->live_timing=NULL;j->live_transport=NULL;
                 if(timed){
-                    j->debug_attempts++;j->debug_timing.phase=timing.phase;
+                    j->debug_attempts++;j->debug_timing.phase=timing.phase;j->debug_transport=transport;
                     j->debug_timing.resolve_ms+=timing.resolve_ms;j->debug_timing.connect_ms+=timing.connect_ms;
                     j->debug_timing.tls_ms+=timing.tls_ms;j->debug_timing.first_header_ms+=timing.first_header_ms;
                     j->debug_timing.header_ms+=timing.header_ms;j->debug_timing.body_ms+=timing.body_ms;
@@ -1940,12 +1981,14 @@ static int run_one(n_handle input,n_handle output) {
     if((w->user_navigation&WEBNET_WIRE_DEBUG_REQUEST)&&j->debug_attempts) {
         char line[384];
         int length=snprintf(line,sizeof line,
-            "\r\nHTTP/Nocturne-Transport phase=%u attempts=%u resolve=%lu connect=%lu tls=%lu first_header=%lu headers=%lu body=%lu tls_io=%lu tls_other=%lu\r\n",
+            "\r\nHTTP/Nocturne-Transport phase=%u attempts=%u resolve=%lu connect=%lu tls=%lu first_header=%lu headers=%lu body=%lu tls_io=%lu tls_other=%lu h2=%u stream=%lu reused=%u connection=%lu\r\n",
             (unsigned)j->debug_timing.phase,j->debug_attempts,(unsigned long)j->debug_timing.resolve_ms,
             (unsigned long)j->debug_timing.connect_ms,(unsigned long)j->debug_timing.tls_ms,
             (unsigned long)j->debug_timing.first_header_ms,(unsigned long)j->debug_timing.header_ms,
             (unsigned long)j->debug_timing.body_ms,(unsigned long)j->debug_timing.tls_io_ms,
-            (unsigned long)j->debug_timing.tls_other_ms);
+            (unsigned long)j->debug_timing.tls_other_ms,(unsigned)j->debug_transport.http2,
+            (unsigned long)j->debug_transport.stream_id,(unsigned)j->debug_transport.reused,
+            (unsigned long)j->debug_transport.connection_id);
         size_t old=j->response_headers_len;
         if(length>0&&(size_t)length<sizeof line&&old<=SIZE_MAX-(size_t)length-1) {
             char *grown=realloc(j->response_headers,old+(size_t)length+1);

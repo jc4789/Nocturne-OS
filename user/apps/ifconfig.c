@@ -35,5 +35,12 @@ int main(void) {
                    (unsigned long)stats.ap_recv_bytes[cpu],(unsigned long)stats.ap_send_bytes[cpu],
                    (unsigned long)stats.ap_calls[cpu],(unsigned long)stats.ap_fallbacks[cpu]);
     }
+    struct n_tcpstats tcp;
+    if (net_test(NULL, &tcp)==0) {
+        printf("  tcp       segments in %lu  out %lu  out-of-order %lu  duplicate acks %lu\n",
+               (unsigned long)tcp.segs_in,(unsigned long)tcp.segs_out,(unsigned long)tcp.ooo_in,(unsigned long)tcp.dupacks_in);
+        printf("  resend    timeouts %lu  retransmits %lu  fast %lu\n",
+               (unsigned long)tcp.timeouts,(unsigned long)tcp.retransmits,(unsigned long)tcp.fast_retransmits);
+    }
     return 0;
 }

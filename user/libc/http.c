@@ -24,9 +24,18 @@ struct pooled_connection {
     uint16_t port;
     bool tls,prior,opening,retire;
     unsigned users;
-    uint64_t idle;
+    uint64_t idle,opened_at;
     uint64_t identity;
 };
+/* A same-key connection still opening usually becomes shareable (HTTP/2) or
+   idle within a second, so later requests wait for it briefly. A stalled
+   TCP/TLS open must not hold every request to that host for its whole
+   allowance: after the patience expires another open starts, and at most
+   POOL_OPEN_PER_KEY opens race per key. The pool never needs more
+   connections than concurrent requests; idle ones are evicted first. */
+#define POOL_OPEN_PATIENCE_MS 2000u
+#define POOL_OPEN_PER_KEY 6u
+#define POOL_MAX 32u
 static struct pooled_connection *pool;
 static uint32_t pool_lock;
 static unsigned pool_count;
@@ -62,6 +71,25 @@ static char *pool_key(const struct http_req *rq,const char *partition) {
     }
     key[at]=0;return key;
 }
+/* An open raced against a slower same-key open gives up once any same-key
+   HTTP/2 connection can take the stream: the request then joins it instead
+   of waiting for its own handshake, which may stall for its whole allowance. */
+struct pool_open_watch {
+    const struct http_stream_hooks *hooks;void *ctx;
+    const struct pooled_connection *self;bool superseded;
+};
+static int pool_open_cancelled(void *opaque) {
+    struct pool_open_watch *w=opaque;
+    if(w->hooks&&w->hooks->cancelled&&w->hooks->cancelled(w->ctx))return 1;
+    const struct pooled_connection *self=w->self;bool shared=false;
+    pool_enter();
+    for(struct pooled_connection *p=pool;p&&!shared;p=p->next)
+        shared=p!=self&&!p->opening&&!p->retire&&p->h2&&p->port==self->port&&p->tls==self->tls&&
+            p->prior==self->prior&&!strcmp(p->host,self->host)&&!strcmp(p->key,self->key)&&http2_available(p->h2);
+    pool_leave();
+    if(shared)w->superseded=true;
+    return shared;
+}
 static struct pooled_connection *pool_acquire(const struct http_req *rq,const struct url_owned *u,
     int timeout,const char *partition,bool prior,const struct http_stream_hooks *hooks,
     struct http_transport_timing *timing,struct http_transport_result *result,char *error,size_t error_cap) {
@@ -70,12 +98,12 @@ static struct pooled_connection *pool_acquire(const struct http_req *rq,const st
     for(;;) {
         if(hooks&&hooks->cancelled&&hooks->cancelled(rq->ctx)){errno=ECANCELED;snprintf(error,error_cap,"request cancelled");break;}
         if(timeout>0&&uptime_ms()-started>=(uint64_t)timeout){errno=ETIMEDOUT;snprintf(error,error_cap,"connection pool wait timed out");break;}
-        pool_enter();bool opening=false;
+        pool_enter();unsigned opening=0;uint64_t newest_open=0;
         struct pooled_connection *oldest=NULL;
         for(struct pooled_connection *p=pool;p;p=p->next) {
             if(!p->users&&(!oldest||p->idle<oldest->idle))oldest=p;
             if(p->retire||p->port!=u->port||p->tls!=u->tls||p->prior!=prior||strcmp(p->host,u->host)||strcmp(p->key,key))continue;
-            if(p->opening){opening=true;continue;}
+            if(p->opening){opening++;if(p->opened_at>newest_open)newest_open=p->opened_at;continue;}
             if(!p->users&&uptime_ms()-p->idle>=30000){p->retire=true;continue;}
             if(p->h2?http2_available(p->h2):!p->users) {
                 p->users++;pool_leave();free(key);
@@ -84,21 +112,33 @@ static struct pooled_connection *pool_acquire(const struct http_req *rq,const st
                 if(!p->h2)ns_set_timeout(p->stream,timeout);return p;
             }
         }
-        if(opening){pool_leave();msleep(1);continue;}
-        if(oldest&&(oldest->retire||pool_count>=16)) {
+        if(opening&&(opening>=POOL_OPEN_PER_KEY||uptime_ms()-newest_open<POOL_OPEN_PATIENCE_MS)){pool_leave();msleep(1);continue;}
+        if(oldest&&(oldest->retire||pool_count>=POOL_MAX)) {
             pool_unlink(oldest);pool_leave();pool_destroy(oldest);continue;
         }
-        if(pool_count>=16){pool_leave();msleep(1);continue;}
+        if(pool_count>=POOL_MAX){pool_leave();msleep(1);continue;}
         struct pooled_connection *p=calloc(1,sizeof *p);
         if(!p){pool_leave();errno=ENOMEM;break;}
         size_t host_len=strlen(u->host);p->host=malloc(host_len+1);
         if(!p->host){free(p);pool_leave();errno=ENOMEM;break;}
         memcpy(p->host,u->host,host_len+1);
-        p->key=key;p->port=u->port;p->tls=u->tls;p->prior=prior;p->opening=true;p->users=1;
+        p->key=key;p->port=u->port;p->tls=u->tls;p->prior=prior;p->opening=true;p->users=1;p->opened_at=uptime_ms();
         p->identity=++connection_identity;
+        bool raced=opening!=0;
         p->next=pool;pool=p;pool_count++;pool_leave();
-        p->stream=ns_open_http_cancelled_timed(u->host,u->port,u->tls,timeout,error,error_cap,timing,key,
-            hooks?hooks->cancelled:NULL,rq->ctx);
+        struct pool_open_watch watch={hooks,rq->ctx,p,false};
+        p->stream=raced?ns_open_http_cancelled_timed(u->host,u->port,u->tls,timeout,error,error_cap,timing,key,
+                pool_open_cancelled,&watch):
+            ns_open_http_cancelled_timed(u->host,u->port,u->tls,timeout,error,error_cap,timing,key,
+                hooks?hooks->cancelled:NULL,rq->ctx);
+        if(watch.superseded&&!p->stream) {
+            /* The request retries the pool and joins the shared connection. */
+            pool_enter();pool_unlink(p);pool_leave();
+            key=p->key;p->key=NULL;pool_destroy(p);error[0]=0;errno=0;continue;
+        }
+        /* The opener's hook belongs to one request (and maybe this frame).
+           HTTP/2 cancels per stream; HTTP/1 installs each user's hook. */
+        if(p->stream)ns_set_cancel(p->stream,NULL,NULL);
         if(p->stream&&(prior||!strcmp(ns_protocol(p->stream),"h2"))) {
             p->h2=http2_new(p->stream);if(!p->h2){errno=errno?errno:EIO;snprintf(error,error_cap,"HTTP/2 preface failed");}
         }

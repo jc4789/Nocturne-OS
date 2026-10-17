@@ -800,13 +800,22 @@ static bool consume_transport_diagnostic(struct request *r,char *headers) {
     bool split=!strncmp(p," tls_io=",8);
     if(split&&(!diagnostic_number(&p," tls_io=",&io)||!diagnostic_number(&p," tls_other=",&other)||
        io>tls||other>tls||io>UINT64_MAX-other||io+other!=tls))return false;
+    /* Connection of the last attempt: HTTP/2 stream or HTTP/1 (stream 0). */
+    uint64_t h2=0,stream=0,reused=0,connection=0;
+    bool linked=split&&!strncmp(p," h2=",4);
+    if(linked&&(!diagnostic_number(&p," h2=",&h2)||!diagnostic_number(&p," stream=",&stream)||
+       !diagnostic_number(&p," reused=",&reused)||!diagnostic_number(&p," connection=",&connection)||
+       h2>1||reused>1))return false;
     if(p[0]!='\r'||p[1]!='\n'||phase>HTTP_PHASE_DONE||!attempts||attempts>42)return false;
     memmove(line,p+2,strlen(p+2)+1);
     if(strstr(headers,"HTTP/Nocturne-Transport "))return false;
-    fprintf(stderr,"[webnet] transport id=%lu phase=%lu attempts=%lu resolve=%lu ms connect=%lu ms tls=%lu ms first-header=%lu ms headers=%lu ms body=%lu ms tls-split=%u tls-io=%lu ms tls-other=%lu ms\n",
+    fprintf(stderr,"[webnet] transport id=%lu phase=%lu attempts=%lu resolve=%lu ms connect=%lu ms tls=%lu ms first-header=%lu ms headers=%lu ms body=%lu ms tls-split=%u tls-io=%lu ms tls-other=%lu ms",
         (unsigned long)r->id,(unsigned long)phase,(unsigned long)attempts,(unsigned long)resolve,
         (unsigned long)connect,(unsigned long)tls,(unsigned long)first,(unsigned long)head,(unsigned long)body,
         split,(unsigned long)io,(unsigned long)other);
+    if(linked)fprintf(stderr," h2=%lu h2-stream=%lu reused=%lu connection=%lu",
+        (unsigned long)h2,(unsigned long)stream,(unsigned long)reused,(unsigned long)connection);
+    fputc('\n',stderr);
     return true;
 }
 /* Wire data has no terminators; insert them after the complete payload has arrived. */
