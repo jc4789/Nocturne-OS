@@ -13,6 +13,7 @@
 #include "util/half_float.h"
 #include "util/format_r11g11b10f.h"
 #include "util/format_rgb9e5.h"
+#include "nocturne.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -701,9 +702,19 @@ void web_webgl_resize(struct web_webgl *handle, unsigned width, unsigned height)
 
 uint64_t web_webgl_serial(const struct web_webgl *handle) { return ((const struct webgl *)handle)->serial; }
 
+static bool profile_on;
+static void profile_present(uint64_t cycles);
+static bool present(struct webgl *gl, uint32_t *dst, unsigned width, unsigned height, bool frame_end);
 bool web_webgl_present(struct web_webgl *handle, uint32_t *dst, unsigned width, unsigned height, bool frame_end) {
     struct webgl *gl = (struct webgl *)handle;
     if (!gl->ngl || gl->lost || !width || !height) return false;
+    if (!profile_on) return present(gl, dst, width, height, frame_end);
+    uint64_t start = __builtin_ia32_rdtsc();
+    bool ok = present(gl, dst, width, height, frame_end);
+    profile_present(__builtin_ia32_rdtsc() - start);
+    return ok;
+}
+static bool present(struct webgl *gl, uint32_t *dst, unsigned width, unsigned height, bool frame_end) {
     bool ok;
     if (width == gl->width && height == gl->height) {
         ok = ngl_read_drawing_buffer(gl->ngl, dst, width, gl->attrs.premultiplied);
@@ -3887,6 +3898,38 @@ static const struct method methods[] = {
     M("waitSync", m_wait_sync, 3, 2),
 };
 
+/* debug_js only: inclusive time per entry point and in presentation, written
+ * to the debug log every two seconds of wall time with the costliest five. */
+#define METHOD_COUNT (sizeof methods / sizeof *methods)
+static uint64_t profile_cycles[METHOD_COUNT + 1], profile_calls[METHOD_COUNT + 1], profile_tsc, profile_ms;
+void web_webgl_set_profile(bool on) { profile_on = on; }
+static void profile_add(size_t slot, uint64_t cycles) {
+    profile_cycles[slot] += cycles;
+    profile_calls[slot]++;
+    uint64_t now = uptime_ms(), tsc = __builtin_ia32_rdtsc();
+    if (!profile_ms) { profile_ms = now; profile_tsc = tsc; return; }
+    if (now - profile_ms < 2000) return;
+    double per_ms = (double)(tsc - profile_tsc) / (double)(now - profile_ms);
+    char line[512];
+    int len = snprintf(line, sizeof line, "[webgl] profile %llu ms:", (unsigned long long)(now - profile_ms));
+    for (int k = 0; k < 5; k++) {
+        size_t best = SIZE_MAX;
+        for (size_t i = 0; i <= METHOD_COUNT; i++)
+            if (profile_calls[i] && (best == SIZE_MAX || profile_cycles[i] > profile_cycles[best])) best = i;
+        if (best == SIZE_MAX) break;
+        if (len > 0 && (size_t)len < sizeof line)
+            len += snprintf(line + len, sizeof line - (size_t)len, " %s %.0f ms/%llu", best == METHOD_COUNT ? "present" : methods[best].name,
+                            (double)profile_cycles[best] / per_ms, (unsigned long long)profile_calls[best]);
+        profile_calls[best] = 0;
+    }
+    fprintf(stderr, "%s\n", line);
+    memset(profile_cycles, 0, sizeof profile_cycles);
+    memset(profile_calls, 0, sizeof profile_calls);
+    profile_ms = now;
+    profile_tsc = tsc;
+}
+static void profile_present(uint64_t cycles) { profile_add(METHOD_COUNT, cycles); }
+
 static JSValue trampoline(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
     const struct method *m = &methods[magic];
     struct webgl *gl = context_of(this_val, m->version == 2);
@@ -3896,7 +3939,11 @@ static JSValue trampoline(JSContext *ctx, JSValueConst this_val, int argc, JSVal
         /* Conversions still run (and may throw) before the lost result. */
         return lost_value(m->lost);
     }
-    return m->fn(ctx, gl, argc, argv);
+    if (!profile_on) return m->fn(ctx, gl, argc, argv);
+    uint64_t start = __builtin_ia32_rdtsc();
+    JSValue result = m->fn(ctx, gl, argc, argv);
+    profile_add((size_t)magic, __builtin_ia32_rdtsc() - start);
+    return result;
 }
 
 /* ---- attributes ---- */

@@ -728,11 +728,40 @@ get_texel_buffer_no_border(const struct sp_sampler_view *sp_sview,
 }
 
 
+#if DETECT_OS_NOCTURNE
+
+/* Reads one texel straight from the resource (see sp_sampler_view.direct):
+ * z is the layer, cube face or 3D slice, as in the tile cache address. */
+static inline const float *
+get_texel_direct(const struct sp_sampler_view *sp_sview, unsigned level, int x, int y, int z)
+{
+   struct sp_sampler_view *view = (struct sp_sampler_view *)sp_sview;
+   const struct softpipe_resource *spr = view->direct;
+   const uint8_t *src = (const uint8_t *)spr->data + spr->level_offset[level] +
+                        (size_t)z * spr->img_stride[level] + (size_t)y * spr->stride[level] +
+                        (size_t)x * view->direct_bytes;
+   float *out = view->direct_texels[view->direct_next++ & 15];
+   if (view->direct_unorm8x4) {
+      out[0] = (float)src[0] * (1.0f / 255.0f);
+      out[1] = (float)src[1] * (1.0f / 255.0f);
+      out[2] = (float)src[2] * (1.0f / 255.0f);
+      out[3] = (float)src[3] * (1.0f / 255.0f);
+   } else {
+      view->direct_unpack(out, src, 1);
+   }
+   return out;
+}
+#endif
+
 static inline const float *
 get_texel_2d_no_border(const struct sp_sampler_view *sp_sview,
                        union tex_tile_address addr, int x, int y)
 {
    const struct softpipe_tex_cached_tile *tile;
+#if DETECT_OS_NOCTURNE
+   if (sp_sview->direct)
+      return get_texel_direct(sp_sview, addr.bits.level, x, y, addr.bits.z);
+#endif
    addr.bits.x = x / TEX_TILE_SIZE;
    addr.bits.y = y / TEX_TILE_SIZE;
    y %= TEX_TILE_SIZE;
@@ -920,13 +949,22 @@ get_texel_quad_2d_no_border_single_tile(const struct sp_sampler_view *sp_sview,
 {
     const struct softpipe_tex_cached_tile *tile;
 
+#if DETECT_OS_NOCTURNE
+   if (sp_sview->direct) {
+      out[0] = get_texel_direct(sp_sview, addr.bits.level, x, y, addr.bits.z);
+      out[1] = get_texel_direct(sp_sview, addr.bits.level, x + 1, y, addr.bits.z);
+      out[2] = get_texel_direct(sp_sview, addr.bits.level, x, y + 1, addr.bits.z);
+      out[3] = get_texel_direct(sp_sview, addr.bits.level, x + 1, y + 1, addr.bits.z);
+      return;
+   }
+#endif
    addr.bits.x = x / TEX_TILE_SIZE;
    addr.bits.y = y / TEX_TILE_SIZE;
    y %= TEX_TILE_SIZE;
    x %= TEX_TILE_SIZE;
 
    tile = sp_get_cached_tile_tex(sp_sview->cache, addr);
-      
+
    out[0] = &tile->data.color[y  ][x  ][0];
    out[1] = &tile->data.color[y  ][x+1][0];
    out[2] = &tile->data.color[y+1][x  ][0];
@@ -958,6 +996,10 @@ get_texel_3d_no_border(const struct sp_sampler_view *sp_sview,
 {
    const struct softpipe_tex_cached_tile *tile;
 
+#if DETECT_OS_NOCTURNE
+   if (sp_sview->direct)
+      return get_texel_direct(sp_sview, addr.bits.level, x, y, z);
+#endif
    addr.bits.x = x / TEX_TILE_SIZE;
    addr.bits.y = y / TEX_TILE_SIZE;
    addr.bits.z = z;
@@ -3640,6 +3682,26 @@ softpipe_create_sampler_view(struct pipe_context *pipe,
       sview->ypot = util_logbase2( resource->height0 );
 
       sview->oneval = util_format_is_pure_integer(view->format) ? uif(1) : 1.0f;
+
+#if DETECT_OS_NOCTURNE
+      {
+         const struct util_format_description *desc = util_format_description(view->format);
+         const struct util_format_unpack_description *unpack = util_format_unpack_description(view->format);
+         const bool target_ok = view->target == PIPE_TEXTURE_2D || view->target == PIPE_TEXTURE_RECT ||
+                                view->target == PIPE_TEXTURE_2D_ARRAY || view->target == PIPE_TEXTURE_3D ||
+                                view->target == PIPE_TEXTURE_CUBE || view->target == PIPE_TEXTURE_CUBE_ARRAY;
+         if (target_ok && spr->data && !spr->dt && desc && unpack && unpack->unpack_rgba &&
+             desc->block.width == 1 && desc->block.height == 1 && desc->block.depth == 1 &&
+             desc->block.bits >= 8 && desc->block.bits % 8 == 0 &&
+             desc->colorspace != UTIL_FORMAT_COLORSPACE_ZS &&
+             util_format_get_blocksize(resource->format) == desc->block.bits / 8) {
+            sview->direct = spr;
+            sview->direct_bytes = desc->block.bits / 8;
+            sview->direct_unpack = unpack->unpack_rgba;
+            sview->direct_unorm8x4 = view->format == PIPE_FORMAT_R8G8B8A8_UNORM;
+         }
+      }
+#endif
    }
 
    return (struct pipe_sampler_view *) sview;

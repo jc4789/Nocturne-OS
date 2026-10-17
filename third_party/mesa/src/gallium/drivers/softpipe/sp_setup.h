@@ -27,6 +27,8 @@
 #ifndef SP_SETUP_H
 #define SP_SETUP_H
 
+#include "util/detect_os.h"
+
 struct setup_context;
 struct softpipe_context;
 
@@ -73,5 +75,8 @@ sp_clamp_viewport_idx(int idx)
 struct setup_context *sp_setup_create_context( struct softpipe_context *softpipe );
 void sp_setup_prepare( struct setup_context *setup );
 void sp_setup_destroy_context( struct setup_context *setup );
+#if DETECT_OS_NOCTURNE
+void sp_setup_set_band( struct setup_context *setup, unsigned index, unsigned count );
+#endif
 
 #endif

@@ -47,6 +47,9 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 | `src/util/u_endian.h` | コンパイラーの `__BYTE_ORDER__` を使う。 |
 | `src/util/disk_cache.h`、`src/gallium/auxiliary/util/u_screen.c` | ファイル状態取得と DRM 記述子による screen 共有を外す。 |
 | `src/util/u_qsort.cpp`、`src/util/texcompress_astc_luts.cpp/.h` | libc++ にスレッド支援が無いので、Mesa 自身のロックを使う。 |
+| `src/gallium/drivers/softpipe/sp_tex_sample.c/.h` | 圧縮・深度以外の色テクスチャーは、32×32タイルを丸ごとfloat変換する16項目のタイルキャッシュを通さず、資源の記憶から1texelずつ読む（mipmap／繰返しでキャッシュが入れ替わり続け、描画時間の大半を占めていた）。 |
+| `src/gallium/drivers/softpipe/sp_tile_cache.c/.h` | 描画先タイルを64画素から32画素にし、タイルキャッシュを50項目から4096項目（横64×縦64タイル＝2048×2048画素まで衝突なし）へ広げる（1080pの全画面canvasでは、50項目だと描画中にタイルの書戻しと再読込みが繰り返されていた）。タイルは初めて触れたときだけ確保する。 |
+| `src/gallium/drivers/softpipe/sp_prim_vbuf.c`、`sp_setup.c/.h`、`sp_context.h`、`sp_state_derived.c`、`sp_tile_cache.c/.h` | 三角形の描画をCPUの数（最大8）のスレッドへ分ける。各スレッドは draw の全三角形を辿り、32画素のタイル行のうち自分の行だけを塗る（画素ごとの描画順は保たれ、同じタイルを二つのスレッドが触らない。自分の行に掛からない三角形は設定前に捨てる）。呼出し側以外のスレッドは、文脈の影の写し・quad段・TGSI機械・サンプラーを自分用に持つ。起動・完了の待ちは短く回転してから条件変数で眠る。統計／遮蔽クエリー、層描画、image／buffer書込み、タイルキャッシュ経由のテクスチャー、64×64タイルを超える描画先は従来どおり一つのスレッドで描く。頂点バッファーを64KiB／4096索引へ広げ、draw の分割回数を減らす。 |
 | `src/gallium/drivers/softpipe/sp_texture.c` | 新しいテクスチャー領域を必ずゼロ初期化する（他ページの解放済みメモリを Web 内容から見せない）。 |
 | `src/gallium/auxiliary/driver_trace/tr_dump.c` | `access()` の代わりに、トリガー文書が ISO `fopen("r+b")` で開けるかで判定し、ISO `remove` で消す。 |
 | `src/gallium/auxiliary/rtasm/rtasm_execmem.c/.h`、`rtasm_x86sse.c` | 頂点変換の x86 コード生成は `n_memory_reserve` の書込み可ページへ書き、`x86_get_func` で `n_memory_protect` により実行専用へ封印する（書込みと実行を同時に許さない）。 |

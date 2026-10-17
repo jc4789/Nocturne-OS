@@ -45,3 +45,5 @@ uint64_t web_webgl_serial(const struct web_webgl *gl);
  * buffer was clamped). With frame_end the buffer then follows
  * preserveDrawingBuffer: cleared unless preserved. */
 bool web_webgl_present(struct web_webgl *gl, uint32_t *dst, unsigned width, unsigned height, bool frame_end);
+/* debug_js: per-entry-point timing in the debug log. */
+void web_webgl_set_profile(bool on);

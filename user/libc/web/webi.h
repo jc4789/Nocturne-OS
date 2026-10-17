@@ -133,6 +133,7 @@ typedef struct node {
     uint8_t namespace_id; /* stable across detach/clone/adopt; not ancestor-derived */
     uint16_t tag;
     bool foreign;     /* namespace_id != NS_HTML, retained for renderer/parser */
+    bool svg_snapshot_dirty; /* outermost <svg>: a descendant restyle may change its serialized paint */
     const char *name; /* lowercase tag name; case-preserving PI target */
     const char *raw_name;
     const char *public_id, *system_id;
@@ -392,9 +393,21 @@ struct css_motion {
     struct css_easing easing;
     uint8_t direction, fill, paused;
 };
-/* Two-dimensional translation subset; percentages retain the element's
- * border-box reference instead of the normal-flow containing-block size. */
-struct css_transform {struct css_transform *next;len_t xy[2];};
+/* One computed transform function. Translation percentages retain the
+ * element's border-box reference; every other function is size independent.
+ * 3D functions keep their parameters and are flattened orthographically
+ * (the z result is discarded) when the used 2D matrix is composed. */
+enum { CT_TRANSLATE, CT_SCALE, CT_ROTATE, CT_SKEW, CT_MATRIX, CT_PERSPECTIVE };
+/* transform-box. With a CSS layout box, fill-box acts as content-box and
+   stroke-box/view-box as border-box (CSS Transforms 1, 6). */
+enum { TB_VIEW_BOX, TB_FILL_BOX, TB_STROKE_BOX, TB_CONTENT_BOX, TB_BORDER_BOX };
+struct css_transform {
+    struct css_transform *next;
+    len_t xy[2];  /* CT_TRANSLATE x/y; its z length is v[0] */
+    float v[4];   /* SCALE x,y,z; ROTATE axis x,y,z + radians; SKEW x,y radians; PERSPECTIVE length */
+    float m[16];  /* CT_MATRIX, row-major 4x4 */
+    uint8_t kind;
+};
 struct css_translate {len_t xy[2];bool active;};
 typedef struct style {
     uint8_t display, position, float_, clear, white_space, text_align, vertical_align, list_style,
@@ -404,6 +417,7 @@ typedef struct style {
     uint8_t border_style[4];
     uint8_t container_type;
     uint8_t box_orient;
+    uint8_t transform_box; /* TB_*: the transform-origin/percentage reference box */
     bool legacy_box; /* authored -webkit-box/-webkit-inline-box display */
     uint32_t line_clamp; /* legacy positive line budget; zero = none */
     const char *container_names; /* authored identifier list, NULL = none */
@@ -426,6 +440,9 @@ typedef struct style {
     uint8_t svg_fill_rule, svg_stroke_cap, svg_stroke_join;
     uint32_t border_color[4];
     float border_width[4];
+    uint32_t outline_color;
+    float outline_width, outline_offset; /* width is zero unless outline_style paints */
+    uint8_t outline_style; /* BS_* */
     float border_radius;
     struct css_corner_radius corner_radius[4]; /* TL, TR, BR, BL POD; only calc AST needs arena */
     const struct css_box_shadow *box_shadow; /* computed-arena list; initial none */
@@ -440,6 +457,8 @@ typedef struct style {
     const struct css_filter *filter; /* NULL: none; identity effects still establish a context */
     const struct css_transform *transform;
     struct css_translate translate;
+    const struct css_transform *rotate, *scale; /* individual properties; NULL = none */
+    len_t transform_origin[2];
     struct css_motion motion; /* native opacity animation subset; not inherited */
     int z_index, order;
     const char *content; /* ::before / ::after text, NULL = none */
@@ -532,6 +551,7 @@ const struct custom_prop *css_custom_property(const style_t *s, const char *name
 int css_animation_set(node_t *n, uint8_t pseudo, uint32_t id, const char *text);
 void css_animation_free(node_t *n);
 void css_motion_tick(web_doc *d, uint64_t now);
+void css_box_change_report(web_doc *d); /* debug_js only */
 int64_t css_motion_deadline(web_doc *d, uint64_t now);
 void css_motion_doc_free(web_doc *d);
 bool css_easing_parse(const char *s, size_t n, struct css_easing *out);
@@ -656,6 +676,7 @@ typedef struct box {
     uint64_t intrinsic_font_generation;
     arena_t layout_mem, text_mem;
     bool layout_dirty, layout_cache_valid, layout_cache_safe,layout_cache_exports_floats;
+    uint64_t profile_cycles; uint32_t profile_calls; /* debug_js only: inclusive layout cost of the last layout */
     bool layout_prepare_valid, layout_post_valid, layout_post_safe;
     float layout_post_w, layout_post_h, layout_post_content_dy, layout_bottom;
     bool stretch_height_dependent;
@@ -758,7 +779,21 @@ void box_visual_memo_end(uint32_t previous);
 bool box_filter_containing_block(const box_t *b); /* filters/transforms establish descendant containing blocks */
 bool css_translation_active(const style_t *s);
 enum { CSS_TRANSLATE_INDIVIDUAL=1,CSS_TRANSLATE_TRANSFORM=2 };
+/* Pure translations stay in visual coordinates. Any other used transform is
+   painted, hit tested and measured through box_transform_matrix instead and
+   contributes no translation to box_translation_axis. */
 float box_translation_axis(const box_t *b,unsigned axis,unsigned sources);
+bool css_transform_general(const style_t *s);
+bool box_transformed(const box_t *b);
+/* Affine x'=m[0]x+m[2]y+m[4], y'=m[1]x+m[3]y+m[5] in document coordinates. */
+bool box_transform_matrix(const box_t *b,double m[6]);
+/* The used affine matrix of s's transform properties for a reference box of
+   w x h whose top-left corner is at (x,y); false if none or not finite. */
+bool css_style_transform_matrix(const style_t *s,double x,double y,float w,float h,double m[6]);
+void css_transform_list_matrix(const struct css_transform *t,float w,float h,double m[16]);
+/* Maps a document rectangle (x,y,w,h) through b's and its ancestors' used
+   transforms and returns its bounding box. */
+void box_transform_rect(const box_t *b,double rect[4]);
 bool box_viewport_fixed(const box_t *b); /* actual layout CB, not merely position:fixed */
 void box_abs_cb_rect(const box_t *cb, const web_doc *d, float rect[4]); /* x/y/w/h of padding CB in its content coordinates */
 void web_paint_debug_node_free(node_t *node);
@@ -894,6 +929,8 @@ struct web_doc {
     bool paint_order_valid;
     uint64_t visual_revision; /* element scrolling/marquee geometry, not video pixels */
     uint64_t style_revision; /* published box styles: opacity/filter/z-index decide stacking contexts */
+    node_t *box_change_node; /* debug_js only: last element whose restyle required new boxes */
+    bool svg_snapshots_dirty; /* a restyled SVG element has no boxed outermost <svg>; <use> may reference it */
     float paint_damage[4];
     bool paint_damage_valid, paint_damage_full;
     struct html_parser *parser;

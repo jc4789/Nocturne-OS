@@ -44,12 +44,51 @@
 #include "draw/draw_vbuf.h"
 #include "util/u_memory.h"
 #include "util/u_prim.h"
+#if DETECT_OS_NOCTURNE
+#include "c11/threads.h"
+#include "nocturne.h"
+#include "sp_quad_pipe.h"
+#include "sp_tex_sample.h"
+#include "sp_tile_cache.h"
+#endif
 
 
+#if DETECT_OS_NOCTURNE
+/* Bigger batches: each one is a hand-off to the rasterizer threads, and a
+ * 4 KiB buffer held only a few dozen vertices. */
+#define SP_MAX_VBUF_INDEXES 4096
+#define SP_MAX_VBUF_SIZE    65536
+#else
 #define SP_MAX_VBUF_INDEXES 1024
 #define SP_MAX_VBUF_SIZE    4096
+#endif
 
 typedef const float (*cptrf4)[4];
+
+#if DETECT_OS_NOCTURNE
+/* Fragment work is spread over the CPUs: every thread walks all triangles
+ * of a draw but rasterizes only its own tile rows (sp_setup_set_band), so
+ * per-pixel order is kept and no two threads touch the same tile. Thread 0
+ * is the caller with the real context; the others run on a shadow copy of
+ * the context with their own quad stages, shader machine and samplers. */
+#define SP_MAX_RASTER_THREADS 8
+/* about a millisecond: longer than the gap between consecutive draws */
+#define RASTER_SPIN_CYCLES 3000000ull
+
+struct softpipe_vbuf_render;
+
+struct sp_raster_worker
+{
+   struct softpipe_vbuf_render *render;
+   struct softpipe_context *shadow;
+   struct tgsi_exec_machine *machine;
+   struct sp_tgsi_sampler *sampler;
+   struct setup_context *setup;
+   unsigned bound_serial;
+   bool bound;
+   thrd_t thread;
+};
+#endif
 
 /**
  * Subclass of vbuf_render.
@@ -65,6 +104,24 @@ struct softpipe_vbuf_render
    uint nr_vertices;
    uint vertex_buffer_size;
    void *vertex_buffer;
+
+#if DETECT_OS_NOCTURNE
+   unsigned band_count;          /* 0: threads not started yet */
+   bool threads_inited;
+   struct sp_raster_worker workers[SP_MAX_RASTER_THREADS];
+   mtx_t lock;
+   cnd_t start, done;
+   /* Draws come back to back, and every blocking wait or wake is a system
+    * call, so both sides spin briefly first and only sleep (or wake a
+    * sleeper) when the other side is really idle. */
+   unsigned generation, pending;
+   unsigned sleepers;            /* workers blocked on start */
+   bool caller_waiting;          /* caller blocked on done */
+   bool quit;
+   /* the draw being rasterized: indices, or start for arrays */
+   const uint16_t *job_indices;
+   uint job_start, job_nr;
+#endif
 };
 
 
@@ -157,13 +214,12 @@ static inline cptrf4 get_vert( const void *vertex_buffer,
  * draw elements / indexed primitives
  */
 static void
-sp_vbuf_draw_elements(struct vbuf_render *vbr, const uint16_t *indices, uint nr)
+rasterize_elements(struct softpipe_vbuf_render *cvbr, struct setup_context *setup,
+                   const uint16_t *indices, uint nr)
 {
-   struct softpipe_vbuf_render *cvbr = softpipe_vbuf_render(vbr);
    struct softpipe_context *softpipe = cvbr->softpipe;
    const unsigned stride = softpipe->vertex_info.size * sizeof(float);
    const void *vertex_buffer = cvbr->vertex_buffer;
-   struct setup_context *setup = cvbr->setup;
    const bool flatshade_first = softpipe->rasterizer->flatshade_first;
    unsigned i;
 
@@ -353,11 +409,10 @@ sp_vbuf_draw_elements(struct vbuf_render *vbr, const uint16_t *indices, uint nr)
  * It's up to us to convert the vertex array into point/line/tri prims.
  */
 static void
-sp_vbuf_draw_arrays(struct vbuf_render *vbr, uint start, uint nr)
+rasterize_arrays(struct softpipe_vbuf_render *cvbr, struct setup_context *setup,
+                 uint start, uint nr)
 {
-   struct softpipe_vbuf_render *cvbr = softpipe_vbuf_render(vbr);
    struct softpipe_context *softpipe = cvbr->softpipe;
-   struct setup_context *setup = cvbr->setup;
    const unsigned stride = softpipe->vertex_info.size * sizeof(float);
    const void *vertex_buffer =
       (void *) get_vert(cvbr->vertex_buffer, start, stride);
@@ -587,6 +642,342 @@ sp_vbuf_draw_arrays(struct vbuf_render *vbr, uint start, uint nr)
    }
 }
 
+
+#if DETECT_OS_NOCTURNE
+static void
+raster_job(struct softpipe_vbuf_render *cvbr, struct setup_context *setup)
+{
+   if (cvbr->job_indices)
+      rasterize_elements(cvbr, setup, cvbr->job_indices, cvbr->job_nr);
+   else
+      rasterize_arrays(cvbr, setup, cvbr->job_start, cvbr->job_nr);
+}
+
+
+static int
+raster_thread(void *arg)
+{
+   struct sp_raster_worker *w = arg;
+   struct softpipe_vbuf_render *cvbr = w->render;
+   unsigned seen = 0;
+
+   for (;;) {
+      const uint64_t until = __builtin_ia32_rdtsc() + RASTER_SPIN_CYCLES;
+      unsigned generation;
+
+      while ((generation = __atomic_load_n(&cvbr->generation, __ATOMIC_SEQ_CST)) == seen &&
+             !__atomic_load_n(&cvbr->quit, __ATOMIC_SEQ_CST) &&
+             __builtin_ia32_rdtsc() < until)
+         __builtin_ia32_pause();
+      if (generation == seen) {
+         mtx_lock(&cvbr->lock);
+         __atomic_add_fetch(&cvbr->sleepers, 1, __ATOMIC_SEQ_CST);
+         while ((generation = __atomic_load_n(&cvbr->generation, __ATOMIC_SEQ_CST)) == seen &&
+                !__atomic_load_n(&cvbr->quit, __ATOMIC_SEQ_CST))
+            cnd_wait(&cvbr->start, &cvbr->lock);
+         __atomic_sub_fetch(&cvbr->sleepers, 1, __ATOMIC_SEQ_CST);
+         mtx_unlock(&cvbr->lock);
+      }
+      if (__atomic_load_n(&cvbr->quit, __ATOMIC_SEQ_CST))
+         break;
+      seen = generation;
+
+      raster_job(cvbr, w->setup);
+
+      if (__atomic_sub_fetch(&cvbr->pending, 1, __ATOMIC_SEQ_CST) == 0 &&
+          __atomic_load_n(&cvbr->caller_waiting, __ATOMIC_SEQ_CST)) {
+         mtx_lock(&cvbr->lock);
+         cnd_signal(&cvbr->done);
+         mtx_unlock(&cvbr->lock);
+      }
+   }
+   return 0;
+}
+
+
+static void
+raster_worker_free(struct sp_raster_worker *w)
+{
+   if (w->setup)
+      sp_setup_destroy_context(w->setup);
+   if (w->shadow) {
+      if (w->shadow->quad.shade)
+         w->shadow->quad.shade->destroy(w->shadow->quad.shade);
+      if (w->shadow->quad.depth_test)
+         w->shadow->quad.depth_test->destroy(w->shadow->quad.depth_test);
+      if (w->shadow->quad.blend)
+         w->shadow->quad.blend->destroy(w->shadow->quad.blend);
+      FREE(w->shadow);
+   }
+   if (w->machine)
+      tgsi_exec_machine_destroy(w->machine);
+   FREE(w->sampler);
+   memset(w, 0, sizeof(*w));
+}
+
+
+static bool
+raster_worker_init(struct softpipe_vbuf_render *cvbr, struct sp_raster_worker *w)
+{
+   w->render = cvbr;
+   w->shadow = CALLOC_STRUCT(softpipe_context);
+   w->machine = tgsi_exec_machine_create(MESA_SHADER_FRAGMENT);
+   w->sampler = sp_create_tgsi_sampler();
+   if (!w->shadow || !w->machine || !w->sampler)
+      return false;
+   w->shadow->quad.shade = sp_quad_shade_stage(w->shadow);
+   w->shadow->quad.depth_test = sp_quad_depth_test_stage(w->shadow);
+   w->shadow->quad.blend = sp_quad_blend_stage(w->shadow);
+   w->setup = sp_setup_create_context(w->shadow);
+   if (!w->shadow->quad.shade || !w->shadow->quad.depth_test ||
+       !w->shadow->quad.blend || !w->setup)
+      return false;
+   return thrd_create(&w->thread, raster_thread, w) == thrd_success;
+}
+
+
+static void
+raster_threads_start(struct softpipe_vbuf_render *cvbr)
+{
+   struct n_cpuinfo cpu = {0};
+   unsigned count = cpu_info(&cpu) >= 0 && cpu.online_cpus ? cpu.online_cpus : 1;
+   unsigned started = 1, i;
+
+   cvbr->band_count = 1;
+   count = MIN2(count, SP_MAX_RASTER_THREADS);
+   if (count < 2)
+      return;
+   if (mtx_init(&cvbr->lock, mtx_plain) != thrd_success)
+      return;
+   if (cnd_init(&cvbr->start) != thrd_success) {
+      mtx_destroy(&cvbr->lock);
+      return;
+   }
+   if (cnd_init(&cvbr->done) != thrd_success) {
+      cnd_destroy(&cvbr->start);
+      mtx_destroy(&cvbr->lock);
+      return;
+   }
+   cvbr->threads_inited = true;
+
+   for (i = 1; i < count; i++) {
+      if (!raster_worker_init(cvbr, &cvbr->workers[i])) {
+         raster_worker_free(&cvbr->workers[i]);
+         break;
+      }
+      started++;
+   }
+   /* Bands are fixed once the threads exist; each worker only reads its
+    * setup context after the first start signal. */
+   for (i = 1; i < started; i++)
+      sp_setup_set_band(cvbr->workers[i].setup, i, started);
+   cvbr->band_count = started;
+}
+
+
+static void
+raster_threads_stop(struct softpipe_vbuf_render *cvbr)
+{
+   unsigned i;
+
+   if (!cvbr->threads_inited)
+      return;
+   mtx_lock(&cvbr->lock);
+   __atomic_store_n(&cvbr->quit, true, __ATOMIC_SEQ_CST);
+   cnd_broadcast(&cvbr->start);
+   mtx_unlock(&cvbr->lock);
+   for (i = 1; i < cvbr->band_count; i++) {
+      thrd_join(cvbr->workers[i].thread, NULL);
+      raster_worker_free(&cvbr->workers[i]);
+   }
+   cnd_destroy(&cvbr->done);
+   cnd_destroy(&cvbr->start);
+   mtx_destroy(&cvbr->lock);
+   cvbr->threads_inited = false;
+}
+
+
+/**
+ * Whether this draw can be split over the threads. Returns the number of
+ * fragment sampler views the shadow contexts need in *nviews.
+ */
+static bool
+raster_threads_usable(struct softpipe_vbuf_render *cvbr, unsigned *nviews)
+{
+   struct softpipe_context *sp = cvbr->softpipe;
+   const struct sp_fragment_shader_variant *fs = sp->fs_variant;
+   const struct sp_tgsi_sampler *samp = sp->tgsi.sampler[MESA_SHADER_FRAGMENT];
+   unsigned n, i;
+
+   if (cvbr->band_count < 2 || !fs || sp->reduced_prim != MESA_PRIM_TRIANGLES)
+      return false;
+   /* counters shared by all fragments, and layered rendering, whose tiles
+    * are not covered by the collision-free cache placement */
+   if (sp->active_statistics_queries || sp->active_query_count ||
+       sp->layer_slot > 0)
+      return false;
+   /* shader side effects keep their single-threaded order */
+   if (fs->info.file_count[TGSI_FILE_IMAGE] ||
+       fs->info.file_count[TGSI_FILE_BUFFER] ||
+       fs->info.file_count[TGSI_FILE_MEMORY])
+      return false;
+   /* tiles of a framebuffer within the cache span never share an entry */
+   if (sp->framebuffer.width > SP_TILE_CACHE_SPAN * TILE_SIZE ||
+       sp->framebuffer.height > SP_TILE_CACHE_SPAN * TILE_SIZE)
+      return false;
+
+   n = MAX3(sp->num_sampler_views[MESA_SHADER_FRAGMENT],
+            (unsigned)(fs->info.file_max[TGSI_FILE_SAMPLER_VIEW] + 1),
+            (unsigned)(fs->info.file_max[TGSI_FILE_SAMPLER] + 1));
+   n = MIN2(n, PIPE_MAX_SHADER_SAMPLER_VIEWS);
+   /* textures read through the shared texture tile cache stay on one thread */
+   for (i = 0; i < n; i++) {
+      if (samp->sp_sview[i].base.texture && !samp->sp_sview[i].direct)
+         return false;
+   }
+   *nviews = n;
+   return true;
+}
+
+
+static void
+raster_threads_prepare(struct softpipe_vbuf_render *cvbr, unsigned nviews)
+{
+   struct softpipe_context *sp = cvbr->softpipe;
+   const struct sp_tgsi_sampler *samp = sp->tgsi.sampler[MESA_SHADER_FRAGMENT];
+   unsigned i;
+
+   for (i = 1; i < cvbr->band_count; i++) {
+      struct sp_raster_worker *w = &cvbr->workers[i];
+      struct softpipe_context *shadow = w->shadow;
+      struct quad_stage *shade = shadow->quad.shade;
+      struct quad_stage *depth_test = shadow->quad.depth_test;
+      struct quad_stage *blend = shadow->quad.blend;
+
+      memcpy(shadow, sp, sizeof(*sp));
+      shadow->quad.shade = shade;
+      shadow->quad.depth_test = depth_test;
+      shadow->quad.blend = blend;
+      shadow->fs_machine = w->machine;
+      shadow->tgsi.sampler[MESA_SHADER_FRAGMENT] = w->sampler;
+      shadow->dirty = 0;
+
+      memcpy(w->sampler->sp_sampler, samp->sp_sampler, sizeof(samp->sp_sampler));
+      memcpy(w->sampler->sp_sview, samp->sp_sview, nviews * sizeof(samp->sp_sview[0]));
+
+      if (!w->bound || w->bound_serial != sp->fs_bind_serial) {
+         sp->fs_variant->prepare(sp->fs_variant, w->machine,
+                                 (struct tgsi_sampler *)w->sampler,
+                                 (struct tgsi_image *)sp->tgsi.image[MESA_SHADER_FRAGMENT],
+                                 (struct tgsi_buffer *)sp->tgsi.buffer[MESA_SHADER_FRAGMENT]);
+         w->bound_serial = sp->fs_bind_serial;
+         w->bound = true;
+      }
+
+      sp_build_quad_pipeline(shadow);
+      sp_setup_prepare(w->setup);
+   }
+}
+
+
+static void
+raster_caches_threaded(struct softpipe_context *sp, bool threaded)
+{
+   unsigned i;
+
+   for (i = 0; i < sp->framebuffer.nr_cbufs; i++) {
+      if (sp->cbuf_cache[i]) {
+         sp->cbuf_cache[i]->threaded = threaded;
+         sp->cbuf_cache[i]->last_tile_addr.bits.invalid = 1;
+      }
+   }
+   if (sp->zsbuf_cache) {
+      sp->zsbuf_cache->threaded = threaded;
+      sp->zsbuf_cache->last_tile_addr.bits.invalid = 1;
+   }
+}
+
+
+/**
+ * Rasterize the current draw on all threads. Returns false when the draw
+ * has to stay on the calling thread.
+ */
+static bool
+raster_threads_run(struct softpipe_vbuf_render *cvbr,
+                   const uint16_t *indices, uint start, uint nr)
+{
+   struct softpipe_context *sp = cvbr->softpipe;
+   unsigned nviews;
+
+   if (!cvbr->band_count)
+      raster_threads_start(cvbr);
+   if (!raster_threads_usable(cvbr, &nviews))
+      return false;
+
+   raster_threads_prepare(cvbr, nviews);
+   raster_caches_threaded(sp, true);
+   cvbr->job_indices = indices;
+   cvbr->job_start = start;
+   cvbr->job_nr = nr;
+   sp_setup_set_band(cvbr->setup, 0, cvbr->band_count);
+
+   __atomic_store_n(&cvbr->pending, cvbr->band_count - 1, __ATOMIC_SEQ_CST);
+   __atomic_add_fetch(&cvbr->generation, 1, __ATOMIC_SEQ_CST);
+   if (__atomic_load_n(&cvbr->sleepers, __ATOMIC_SEQ_CST)) {
+      mtx_lock(&cvbr->lock);
+      cnd_broadcast(&cvbr->start);
+      mtx_unlock(&cvbr->lock);
+   }
+
+   raster_job(cvbr, cvbr->setup);
+
+   {
+      const uint64_t until = __builtin_ia32_rdtsc() + RASTER_SPIN_CYCLES;
+      while (__atomic_load_n(&cvbr->pending, __ATOMIC_SEQ_CST) &&
+             __builtin_ia32_rdtsc() < until)
+         __builtin_ia32_pause();
+   }
+   if (__atomic_load_n(&cvbr->pending, __ATOMIC_SEQ_CST)) {
+      mtx_lock(&cvbr->lock);
+      __atomic_store_n(&cvbr->caller_waiting, true, __ATOMIC_SEQ_CST);
+      while (__atomic_load_n(&cvbr->pending, __ATOMIC_SEQ_CST))
+         cnd_wait(&cvbr->done, &cvbr->lock);
+      __atomic_store_n(&cvbr->caller_waiting, false, __ATOMIC_SEQ_CST);
+      mtx_unlock(&cvbr->lock);
+   }
+
+   sp_setup_set_band(cvbr->setup, 0, 1);
+   raster_caches_threaded(sp, false);
+   return true;
+}
+#endif
+
+
+static void
+sp_vbuf_draw_elements(struct vbuf_render *vbr, const uint16_t *indices, uint nr)
+{
+   struct softpipe_vbuf_render *cvbr = softpipe_vbuf_render(vbr);
+
+#if DETECT_OS_NOCTURNE
+   if (raster_threads_run(cvbr, indices, 0, nr))
+      return;
+#endif
+   rasterize_elements(cvbr, cvbr->setup, indices, nr);
+}
+
+
+static void
+sp_vbuf_draw_arrays(struct vbuf_render *vbr, uint start, uint nr)
+{
+   struct softpipe_vbuf_render *cvbr = softpipe_vbuf_render(vbr);
+
+#if DETECT_OS_NOCTURNE
+   if (raster_threads_run(cvbr, NULL, start, nr))
+      return;
+#endif
+   rasterize_arrays(cvbr, cvbr->setup, start, nr);
+}
+
 /*
  * FIXME: it is unclear if primitives_storage_needed (which is generally
  * the same as pipe query num_primitives_generated) should increase
@@ -633,6 +1024,9 @@ static void
 sp_vbuf_destroy(struct vbuf_render *vbr)
 {
    struct softpipe_vbuf_render *cvbr = softpipe_vbuf_render(vbr);
+#if DETECT_OS_NOCTURNE
+   raster_threads_stop(cvbr);
+#endif
    if (cvbr->vertex_buffer)
       align_free(cvbr->vertex_buffer);
    sp_setup_destroy_context(cvbr->setup);

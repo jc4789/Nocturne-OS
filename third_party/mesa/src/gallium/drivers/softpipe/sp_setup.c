@@ -38,6 +38,7 @@
 #include "sp_quad_pipe.h"
 #include "sp_setup.h"
 #include "sp_state.h"
+#include "sp_tile_cache.h"
 #include "draw/draw_context.h"
 #include "pipe/p_shader_tokens.h"
 #include "util/u_math.h"
@@ -114,7 +115,25 @@ struct setup_context {
 
    unsigned cull_face;		/* which faces cull */
    unsigned nr_vertex_attrs;
+
+#if DETECT_OS_NOCTURNE
+   /* Rasterizer threads split the framebuffer by tile rows: this context
+    * only emits quads in rows where (y / TILE_SIZE) % band_count equals
+    * band_index. A band_count of 1 emits everything. */
+   unsigned band_index;
+   unsigned band_count;
+#endif
 };
+
+
+#if DETECT_OS_NOCTURNE
+static inline bool
+band_owns(const struct setup_context *setup, int y)
+{
+   return setup->band_count < 2 ||
+          (unsigned)(y >> TILE_SIZE_LOG2) % setup->band_count == setup->band_index;
+}
+#endif
 
 
 
@@ -162,6 +181,10 @@ clip_emit_quad(struct setup_context *setup, struct quad_header *quad)
 {
    quad_clip(setup, quad);
 
+#if DETECT_OS_NOCTURNE
+   if (!band_owns(setup, quad->input.y0))
+      return;
+#endif
    if (quad->inout.mask) {
       struct softpipe_context *sp = setup->softpipe;
 
@@ -681,6 +704,16 @@ subtriangle(struct setup_context *setup,
    */
 
    for (y = start_y; y < finish_y; y++) {
+#if DETECT_OS_NOCTURNE
+      if (!band_owns(setup, sy + y)) {
+         /* jump to the last line before this band's next tile row */
+         const int row = (sy + y) >> TILE_SIZE_LOG2;
+         const int skip = (int)((setup->band_index + setup->band_count -
+                                 (unsigned)row % setup->band_count) % setup->band_count);
+         y = ((row + skip) << TILE_SIZE_LOG2) - sy - 1;
+         continue;
+      }
+#endif
 
       /* avoid accumulating adds as floats don't have the precision to
        * accurately iterate large triangle edges that way.  luckily we
@@ -762,7 +795,27 @@ sp_setup_tri(struct setup_context *setup,
    if (unlikely(sp_debug & SP_DBG_NO_RAST) ||
        setup->softpipe->rasterizer->rasterizer_discard)
       return;
-   
+
+#if DETECT_OS_NOCTURNE
+   /* Leave triangles outside this thread's tile rows before any setup:
+    * every thread walks all triangles, and most cover a single row. */
+   if (setup->band_count > 1) {
+      const float ymin = MIN3(v0[0][1], v1[0][1], v2[0][1]);
+      const float ymax = MAX3(v0[0][1], v1[0][1], v2[0][1]);
+      if (ymin >= 0.0f && ymax < (float)(1 << 20)) {
+         const unsigned first = (unsigned)ymin >> TILE_SIZE_LOG2;
+         const unsigned last = ((unsigned)ymax + 1) >> TILE_SIZE_LOG2;
+         if (last - first + 1 < setup->band_count) {
+            unsigned row = first;
+            while (row <= last && row % setup->band_count != setup->band_index)
+               row++;
+            if (row > last)
+               return;
+         }
+      }
+   }
+#endif
+
    det = calc_det(v0, v1, v2);
    /*
    debug_printf("%s\n", __func__ );
@@ -1441,6 +1494,19 @@ sp_setup_create_context(struct softpipe_context *softpipe)
 
    setup->span.left[0] = 1000000;     /* greater than right[0] */
    setup->span.left[1] = 1000000;     /* greater than right[1] */
+#if DETECT_OS_NOCTURNE
+   setup->band_count = 1;
+#endif
 
    return setup;
 }
+
+
+#if DETECT_OS_NOCTURNE
+void
+sp_setup_set_band(struct setup_context *setup, unsigned index, unsigned count)
+{
+   setup->band_index = index;
+   setup->band_count = count ? count : 1;
+}
+#endif

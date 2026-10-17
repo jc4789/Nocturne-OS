@@ -406,13 +406,107 @@ void box_scroll_clamp(box_t *b) {
     n->scroll_y = scroll_limit(n->scroll_y, my);
 }
 
-bool css_translation_active(const style_t *s){return s&&(s->transform||s->translate.active);}
+bool css_translation_active(const style_t *s){return s&&(s->transform||s->translate.active||s->rotate||s->scale);}
+/* Row-major 4x4 of one function; translation percentages use w/h. */
+static void transform_function_matrix(const struct css_transform *t,float w,float h,double m[16]){
+    for(int i=0;i<16;i++)m[i]=i%5?0:1;
+    switch(t->kind){
+    case CT_TRANSLATE:m[3]=len_resolve(&t->xy[0],w);m[7]=len_resolve(&t->xy[1],h);m[11]=t->v[0];break;
+    case CT_SCALE:m[0]=t->v[0];m[5]=t->v[1];m[10]=t->v[2];break;
+    case CT_SKEW:m[1]=tan(t->v[0]);m[4]=tan(t->v[1]);break;
+    case CT_MATRIX:for(int i=0;i<16;i++)m[i]=t->m[i];break;
+    case CT_ROTATE:{
+        double x=t->v[0],y=t->v[1],z=t->v[2],length=sqrt(x*x+y*y+z*z),a=t->v[3];
+        if(!(length>0)||!isfinite(length))break;
+        x/=length;y/=length;z/=length;
+        double s=sin(a),c=cos(a),k=1-c;
+        m[0]=c+x*x*k;   m[1]=x*y*k-z*s; m[2]=x*z*k+y*s;
+        m[4]=y*x*k+z*s; m[5]=c+y*y*k;   m[6]=y*z*k-x*s;
+        m[8]=z*x*k-y*s; m[9]=z*y*k+x*s; m[10]=c+z*z*k;
+        break;
+    }
+    default:break; /* perspective only changes w, which orthographic flattening discards */
+    }
+}
+static void matrix4_multiply(double out[16],const double a[16],const double b[16]){
+    double r[16];
+    for(int i=0;i<4;i++)for(int j=0;j<4;j++)
+        r[i*4+j]=a[i*4]*b[j]+a[i*4+1]*b[4+j]+a[i*4+2]*b[8+j]+a[i*4+3]*b[12+j];
+    memcpy(out,r,sizeof r);
+}
+void css_transform_list_matrix(const struct css_transform *t,float w,float h,double m[16]){
+    for(int i=0;i<16;i++)m[i]=i%5?0:1;
+    for(;t;t=t->next){double f[16];transform_function_matrix(t,w,h,f);matrix4_multiply(m,m,f);}
+}
+/* A function whose x/y linear part is the identity only translates. */
+static bool transform_function_translates(const struct css_transform *t){
+    switch(t->kind){
+    case CT_TRANSLATE:case CT_PERSPECTIVE:return true;
+    case CT_SCALE:return t->v[0]==1&&t->v[1]==1;
+    case CT_SKEW:return t->v[0]==0&&t->v[1]==0;
+    case CT_ROTATE:return t->v[3]==0||(t->v[0]==0&&t->v[1]==0&&t->v[2]==0);
+    case CT_MATRIX:return t->m[0]==1&&t->m[1]==0&&t->m[4]==0&&t->m[5]==1;
+    }
+    return false;
+}
+bool css_transform_general(const style_t *s){
+    if(!s)return false;
+    if(s->rotate&&!transform_function_translates(s->rotate))return true;
+    if(s->scale&&!transform_function_translates(s->scale))return true;
+    for(const struct css_transform *t=s->transform;t;t=t->next)if(!transform_function_translates(t))return true;
+    return false;
+}
+bool box_transformed(const box_t *b){
+    return b&&b->st&&b->kind!=B_TEXT&&b->kind!=B_BR&&b->kind!=B_INLINE&&css_transform_general(b->st);
+}
 float box_translation_axis(const box_t *b,unsigned axis,unsigned sources){
     if(!b||!b->st||axis>1||b->kind==B_TEXT||b->kind==B_BR||b->kind==B_INLINE)return 0;
+    if(css_transform_general(b->st))return 0; /* box_transform_matrix owns every component */
     float base=axis?b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2]:b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3];
     double value=(sources&CSS_TRANSLATE_INDIVIDUAL)&&b->st->translate.active?len_resolve(&b->st->translate.xy[axis],base):0;
-    if(sources&CSS_TRANSLATE_TRANSFORM)for(const struct css_transform *t=b->st->transform;t;t=t->next)value+=len_resolve(&t->xy[axis],base);
+    if(sources&CSS_TRANSLATE_TRANSFORM)for(const struct css_transform *t=b->st->transform;t;t=t->next)
+        value+=t->kind==CT_TRANSLATE?len_resolve(&t->xy[axis],base):t->kind==CT_MATRIX?t->m[axis?7:3]:0;
     return value>FLT_MAX?FLT_MAX:value< -FLT_MAX? -FLT_MAX:(float)value;
+}
+bool box_transform_matrix(const box_t *b,double out[6]){
+    if(!box_transformed(b))return false;
+    const style_t *st=b->st;
+    bool content=st->transform_box==TB_FILL_BOX||st->transform_box==TB_CONTENT_BOX;
+    float w=content?b->w:b->w+b->p[1]+b->p[3]+b->b[1]+b->b[3],h=content?b->h:b->h+b->p[0]+b->p[2]+b->b[0]+b->b[2];
+    double x=box_visual_x(b)-(content?0:b->p[3]+b->b[3]),y=box_visual_y(b)-(content?0:b->p[0]+b->b[0]);
+    return css_style_transform_matrix(st,x,y,w,h,out);
+}
+bool css_style_transform_matrix(const style_t *st,double x,double y,float w,float h,double out[6]){
+    if(!css_translation_active(st))return false;
+    double ox=x+len_resolve(&st->transform_origin[0],w),oy=y+len_resolve(&st->transform_origin[1],h);
+    /* CSS Transforms 2: translate, rotate, scale, then transform, around the origin. */
+    double m[16],f[16];
+    for(int i=0;i<16;i++)m[i]=i%5?0:1;
+    m[3]=ox;m[7]=oy;
+    if(st->translate.active){
+        struct css_transform t={.kind=CT_TRANSLATE};t.xy[0]=st->translate.xy[0];t.xy[1]=st->translate.xy[1];
+        transform_function_matrix(&t,w,h,f);matrix4_multiply(m,m,f);
+    }
+    if(st->rotate){transform_function_matrix(st->rotate,w,h,f);matrix4_multiply(m,m,f);}
+    if(st->scale){transform_function_matrix(st->scale,w,h,f);matrix4_multiply(m,m,f);}
+    css_transform_list_matrix(st->transform,w,h,f);matrix4_multiply(m,m,f);
+    for(int i=0;i<16;i++)f[i]=i%5?0:1;
+    f[3]=-ox;f[7]=-oy;matrix4_multiply(m,m,f);
+    out[0]=m[0];out[1]=m[4];out[2]=m[1];out[3]=m[5];out[4]=m[3];out[5]=m[7];
+    for(int i=0;i<6;i++)if(!isfinite(out[i]))return false;
+    return true;
+}
+void box_transform_rect(const box_t *b,double rect[4]){
+    for(;b;b=b->parent){
+        double m[6];if(!box_transform_matrix(b,m))continue;
+        double x0=rect[0],y0=rect[1],x1=rect[0]+rect[2],y1=rect[1]+rect[3];
+        double xs[4]={x0,x1,x0,x1},ys[4]={y0,y0,y1,y1},l=INFINITY,t=INFINITY,r=-INFINITY,bt=-INFINITY;
+        for(int i=0;i<4;i++){
+            double x=m[0]*xs[i]+m[2]*ys[i]+m[4],y=m[1]*xs[i]+m[3]*ys[i]+m[5];
+            l=fmin(l,x);t=fmin(t,y);r=fmax(r,x);bt=fmax(bt,y);
+        }
+        rect[0]=l;rect[1]=t;rect[2]=r-l;rect[3]=bt-t;
+    }
 }
 bool box_filter_containing_block(const box_t *b) {
     const box_t *effect = b;
@@ -3662,7 +3756,15 @@ static void layout_inner(box_t *b, struct bfc *f, float ox, float oy, float cbh)
     layout_inner_used(b, f, ox, oy, cbh, -1);
 }
 
+static void layout_inner_body(box_t *b, struct bfc *f, float ox, float oy, float cbh, float usedh);
+/* debug_js only: inclusive cycle cost per box for the slow-layout report. */
 static void layout_inner_used(box_t *b, struct bfc *f, float ox, float oy, float cbh, float usedh) {
+    if (!D->profile_enabled) { layout_inner_body(b, f, ox, oy, cbh, usedh); return; }
+    uint64_t start = __builtin_ia32_rdtsc();
+    layout_inner_body(b, f, ox, oy, cbh, usedh);
+    b->profile_cycles += __builtin_ia32_rdtsc() - start; b->profile_calls++;
+}
+static void layout_inner_body(box_t *b, struct bfc *f, float ox, float oy, float cbh, float usedh) {
     if (!layout_checkpoint()) return;
     layout_media_checkpoint();
     float input_width = b->w;
@@ -3899,6 +4001,14 @@ void layout_invalidate_fonts(box_t *b){
     }
 }
 
+static bool grid_template_has_pct(const struct gtemplate *t) {
+    for (int i = 0; t && i < t->n; i++) {
+        const struct gtrack *k = &t->t[i];
+        if ((k->min_kind == GT_LEN && len_has_pct(&k->min)) ||
+            ((k->max_kind == GT_LEN || k->max_kind == GT_FIT) && len_has_pct(&k->max))) return true;
+    }
+    return false;
+}
 static bool layout_cache_prepare(box_t *b) {
     if (b->layout_prepare_valid && !b->layout_dirty) return b->layout_cache_safe;
     b->layout_prepare_valid = false;
@@ -3908,10 +4018,14 @@ static bool layout_cache_prepare(box_t *b) {
         (b->node->tag == T_frameset || b->node->tag == T_iframe || b->node->tag == T_embed));
     const style_t *s=b->st;
     bool exports_floats=false;
-    bool dependent=b->kind==B_GRID || b->kind==B_TABLE ||
-        (b->kind==B_FLEX && (s->flex_direction==FD_COLUMN || s->flex_direction==FD_COLUMN_REVERSE)) ||
+    /* Only consumers of a definite height make an unchanged stretch observable.
+       Auto/fr rows and column flex lines given exactly their content height
+       distribute zero free space; absolute min/max sizes were clamped by the
+       caller. Over-reporting re-lays whole nested grid subtrees at each depth. */
+    bool dependent=b->kind==B_TABLE ||
+        (b->kind==B_GRID && (grid_template_has_pct(s->grid_rows) || grid_template_has_pct(s->grid_auto_rows))) ||
         len_has_pct(&s->height) || len_has_pct(&s->flex_basis) ||
-        !len_auto(&s->min_height) || s->max_height.kind!=LK_NONE ||
+        len_has_pct(&s->min_height) || len_has_pct(&s->max_height) ||
         len_has_pct(&s->inset[0]) || len_has_pct(&s->inset[2]);
     for (box_t *c = b->first; c; c = c->next) {
         /* A cached parent must not suppress list_abs/static-position work.
@@ -4215,8 +4329,59 @@ static float max_bottom(box_t *b, float base) {
     return base + b->y + b->rel_dy + b->layout_bottom;
 }
 
+/* debug_js only: zero per-box cost, then name the hot chain of a slow layout. */
+static void layout_profile_reset(box_t *b) {
+    for (; b; b = b->next) { b->profile_cycles = 0; b->profile_calls = 0; layout_profile_reset(b->first); }
+}
+static void layout_profile_describe(const box_t *b, char *out, size_t size) {
+    const node_t *n = b->node;
+    const char *cls = n && n->type == N_ELEM ? node_attr((node_t *)n, "class") : NULL;
+    snprintf(out, size, "%s%s%.48s kind %d display %d w %.0f h %.0f", n && n->type == N_ELEM ? n->name : b->anon ? "anon" : "text",
+        cls ? "." : "", cls ? cls : "", b->kind, b->st ? b->st->display : -1, (double)b->w, (double)b->h);
+}
+static void layout_profile_report(web_doc *d, box_t *root, uint64_t cycles[5], uint64_t elapsed_ms) {
+    uint64_t total = cycles[0] + cycles[1] + cycles[2] + cycles[3] + cycles[4];
+    if (!total) return;
+    char line[600], name[200];
+    snprintf(line, sizeof line, "Layout phases %llu ms: intrinsic %llu%%, flow %llu%%, abspos %llu%%, relative %llu%%, scroll %llu%%",
+        (unsigned long long)elapsed_ms, (unsigned long long)(cycles[0] * 100 / total), (unsigned long long)(cycles[1] * 100 / total),
+        (unsigned long long)(cycles[2] * 100 / total), (unsigned long long)(cycles[3] * 100 / total), (unsigned long long)(cycles[4] * 100 / total));
+    web_js_console(d, 1, line);
+    /* Follow the child holding most of the parent's inclusive cost; print where
+       the cost stops concentrating and the boxes laid out most often. */
+    const box_t *b = root;
+    for (int depth = 0; b && depth < 400; depth++) {
+        const box_t *best = NULL; uint64_t sum = 0;
+        for (const box_t *c = b->first; c; c = c->next) { sum += c->profile_cycles; if (!best || c->profile_cycles > best->profile_cycles) best = c; }
+        bool report = !best || best->profile_cycles * 10 < b->profile_cycles * 6 || b->profile_calls > 2;
+        if (report && b->profile_cycles * 20 >= cycles[1]) {
+            layout_profile_describe(b, name, sizeof name);
+            snprintf(line, sizeof line, "Layout hot depth %d: %s, calls %u, inclusive %llu%%, children %llu%%", depth, name, b->profile_calls,
+                (unsigned long long)(b->profile_cycles * 100 / total), (unsigned long long)(sum * 100 / total));
+            web_js_console(d, 1, line);
+        }
+        if (!best || best->profile_cycles * 20 < cycles[1]) break;
+        b = best;
+    }
+    for (int rank = 0; rank < 3; rank++) { /* absolute boxes are laid out outside their ancestors' cost */
+        const box_t *top = NULL;
+        for (int i = 0; i < d->abs_boxes.n; i++) {
+            const box_t *a = d->abs_boxes.v[i];
+            if (a->profile_cycles && (!top || a->profile_cycles > top->profile_cycles)) top = a;
+        }
+        if (!top || top->profile_cycles * 20 < total) break;
+        layout_profile_describe(top, name, sizeof name);
+        snprintf(line, sizeof line, "Layout hot abspos: %s, calls %u, inclusive %llu%%", name, top->profile_calls,
+            (unsigned long long)(top->profile_cycles * 100 / total));
+        web_js_console(d, 1, line);
+        ((box_t *)top)->profile_cycles = 0; /* report the next one */
+    }
+}
+
 void layout_doc(web_doc *d, int width, int height) {
     static uint32_t next_generation;
+    uint64_t profile_start = d->profile_enabled ? uptime_ms() : 0, phase_cycles[5] = {0}, phase_mark = 0;
+#define LAYOUT_PHASE(i) do { if (d->profile_enabled) { uint64_t now_ = __builtin_ia32_rdtsc(); if (phase_mark) phase_cycles[i] += now_ - phase_mark; phase_mark = now_; } } while (0)
     struct layout_context context = {.document = d, .viewport_w = (float)width,
         .viewport_h = (float)height, .generation = ++next_generation};
     if (!context.generation) context.generation = ++next_generation;
@@ -4251,15 +4416,23 @@ void layout_doc(web_doc *d, int width, int height) {
     root->x = root->y = 0;
     root->w = VW;
     root->cb = NULL;
+    if (d->profile_enabled) layout_profile_reset(root);
+    LAYOUT_PHASE(0);
     layout_cache_prepare(root);
     intrinsic_parallel_prepare(root);
     if (d->native_cancelled) goto finished;
+    LAYOUT_PHASE(0);
     layout_inner(root, NULL, 0, 0, VH);
+    LAYOUT_PHASE(1);
     if (d->native_cancelled) goto finished;
     for (int i = 0; i < d->abs_boxes.n; i++) layout_abs(d->abs_boxes.v[i]);
+    LAYOUT_PHASE(2);
     relative_offsets(root);
+    LAYOUT_PHASE(3);
     if (d->native_cancelled) goto finished;
     scroll_areas(root);
+    LAYOUT_PHASE(4);
+    if (d->profile_enabled && uptime_ms() - profile_start >= 500) layout_profile_report(d, root, phase_cycles, uptime_ms() - profile_start);
     if (d->native_cancelled) goto finished;
     float h = fmaxf_(root->h, max_bottom(root, 0));
     /* The containing-block overflow union already includes escaping absolute

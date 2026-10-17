@@ -48,8 +48,13 @@ sp_alloc_tile(struct softpipe_tile_cache *tc);
  * At some point we should investigate something more sophisticated, like
  * a LRU replacement policy.
  */
+#if DETECT_OS_NOCTURNE
+#define CACHE_POS(x, y, l)                        \
+   (((x) + (y) * SP_TILE_CACHE_SPAN + (l) * (SP_TILE_CACHE_SPAN + 1)) % NUM_ENTRIES)
+#else
 #define CACHE_POS(x, y, l)                        \
    (((x) + (y) * 5 + (l) * 10) % NUM_ENTRIES)
+#endif
 
 
 static inline int addr_to_clear_pos(union tile_address addr)
@@ -545,6 +550,10 @@ sp_find_cached_tile(struct softpipe_tile_cache *tc,
       }
    }
 
+#if DETECT_OS_NOCTURNE
+   if (tc->threaded)
+      return tile;
+#endif
    tc->last_tile = tile;
    tc->last_tile_addr = addr;
    return tile;

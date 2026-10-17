@@ -1555,9 +1555,15 @@ int web_layout(web_doc *d, int width, int height) {
        them without borrowing these mutable layout boxes. */
     web_avmedia_layout_begin(d);
     doc_viewport_update(d,width,height);
+    /* debug_js only: why a slow layout ran (cascade scope, box path, passes). */
+    uint64_t slow_start=d->profile_enabled?uptime_ms():0,slow_cascade=0,slow_boxes=0;
+    unsigned slow_full=0,slow_cascades=0,slow_rebuilds=0,slow_locals=0,slow_restyles=0;
 reflow:
     if (d->need_style || d->styled_w != width || d->styled_h != height || !d->root_box) {
+        uint64_t phase=d->profile_enabled?uptime_ms():0;
+        slow_full+=d->style_full_dirty;slow_cascades++;
         css_cascade(d, width, height);
+        if(d->profile_enabled){uint64_t now=uptime_ms();slow_cascade+=now-phase;phase=now;}
         if (d->native_cancelled) goto cancelled;
         if (d->root) register_bg(d, d->root);
         if (!d->root_box || d->style_boxes_changed || d->need_boxes) {
@@ -1565,6 +1571,14 @@ reflow:
             if(d->root_box && !d->style_existing_boxes_changed){
                 boxes_restyle(d); /* refresh existing arena borrows before branch publication */
                 local=boxes_rebuild_local(d);
+            }
+            if(local)slow_locals++;else slow_rebuilds++;
+            if(d->profile_enabled && !local){
+                char line[160];
+                snprintf(line,sizeof line,"Box rebuild flags: root %d, style %d, existing %d, dom %d",
+                    !!d->root_box,d->style_boxes_changed,d->style_existing_boxes_changed,d->need_boxes);
+                web_js_console(d,1,line);
+                css_box_change_report(d);
             }
             if(!local){
                 boxes_discard(d);
@@ -1578,7 +1592,9 @@ reflow:
                reclaiming old element arenas; dirty boxes drive local layout. */
             boxes_restyle(d);
             css_styles_release(d);
+            slow_restyles++;
         }
+        if(d->profile_enabled)slow_boxes+=uptime_ms()-phase;
         if (d->native_cancelled) goto cancelled;
         d->need_style = false;
         d->need_boxes = false;
@@ -1632,6 +1648,13 @@ reflow:
     }
     d->layout_revision++;
 geometry_committed:
+    if(d->profile_enabled && uptime_ms()-slow_start>=250){
+        char line[320];uint64_t total=uptime_ms()-slow_start;
+        snprintf(line,sizeof line,"Slow layout: %lu ms (cascade %lu ms in %u passes, full %u; boxes %lu ms: restyle %u, local %u, rebuild %u; geometry %lu ms; container passes %u)",
+            (unsigned long)total,(unsigned long)slow_cascade,slow_cascades,slow_full,(unsigned long)slow_boxes,
+            slow_restyles,slow_locals,slow_rebuilds,(unsigned long)(total-slow_cascade-slow_boxes),container_pass);
+        web_js_console(d,1,line);
+    }
     boxes_changes_clear(d);
     d->layout_valid = true;
     web_frames_commit_viewports(d);

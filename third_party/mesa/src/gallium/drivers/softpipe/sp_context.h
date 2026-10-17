@@ -32,6 +32,7 @@
 #define SP_CONTEXT_H
 
 #include "pipe/p_context.h"
+#include "util/detect_os.h"
 #include "util/u_blitter.h"
 
 #include "draw/draw_vertex.h"
@@ -161,6 +162,11 @@ struct softpipe_context {
    } tgsi;
 
    struct tgsi_exec_machine *fs_machine;
+#if DETECT_OS_NOCTURNE
+   /** Bumped whenever fs_machine is rebound, so the rasterizer threads'
+    * own machines know to rebind too (sp_prim_vbuf.c). */
+   unsigned fs_bind_serial;
+#endif
    /** whether early depth testing is enabled */
    bool early_depth;
 

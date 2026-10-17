@@ -30,6 +30,7 @@
 
 
 #include "util/compiler.h"
+#include "util/detect_os.h"
 #include "sp_texture.h"
 
 
@@ -39,7 +40,13 @@ struct softpipe_tile_cache;
 /**
  * Cache tile size (width and height). This needs to be a power of two.
  */
+#if DETECT_OS_NOCTURNE
+/* Rasterizer threads own whole tile rows (sp_setup.c); a single draw
+ * often covers only a few rows, so smaller tiles spread it more evenly. */
+#define TILE_SIZE_LOG2 5
+#else
 #define TILE_SIZE_LOG2 6
+#endif
 #define TILE_SIZE (1 << TILE_SIZE_LOG2)
 
 
@@ -55,7 +62,7 @@ union tile_address {
       unsigned y:TILE_ADDR_BITS;     /* 16K / TILE_SIZE */
       unsigned invalid:1;
       unsigned layer:8;
-      unsigned pad:7;
+      unsigned pad:(32 - 2 * TILE_ADDR_BITS - 9);  /* fill the 32-bit value */
    } bits;
    unsigned value;
 };
@@ -76,7 +83,15 @@ struct softpipe_cached_tile
    } data;
 };
 
+#if DETECT_OS_NOCTURNE
+/* Room for a whole framebuffer up to 2048x2048 (64x64 tiles) without
+ * collisions: with 50 entries a full-screen canvas evicted and refetched
+ * tiles constantly. Tiles are allocated only when first touched. */
+#define SP_TILE_CACHE_SPAN 64
+#define NUM_ENTRIES (SP_TILE_CACHE_SPAN * SP_TILE_CACHE_SPAN)
+#else
 #define NUM_ENTRIES 50
+#endif
 
 
 struct softpipe_tile_cache
@@ -99,6 +114,12 @@ struct softpipe_tile_cache
 
    union tile_address last_tile_addr;
    struct softpipe_cached_tile *last_tile;  /**< most recently retrieved tile */
+#if DETECT_OS_NOCTURNE
+   /* Set while rasterizer threads share the cache. Each thread owns whole
+    * tile rows and their entries never collide (see CACHE_POS), but the
+    * single most-recent-tile slot would be shared, so it is bypassed. */
+   bool threaded;
+#endif
 };
 
 
@@ -146,6 +167,10 @@ sp_get_cached_tile(struct softpipe_tile_cache *tc,
 {
    union tile_address addr = tile_address( x, y, layer );
 
+#if DETECT_OS_NOCTURNE
+   if (tc->threaded)
+      return sp_find_cached_tile( tc, addr );
+#endif
    if (tc->last_tile_addr.value == addr.value)
       return tc->last_tile;
 

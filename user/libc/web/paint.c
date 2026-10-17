@@ -41,6 +41,10 @@ struct web_hit_index {
     struct hit_primitive *items;
     struct hit_branch *branches;
     size_t count, capacity, branch_count, branch_capacity;
+    /* Transformed subtrees are not indexed. A point inside one of their
+       document-space bounds takes the exact inverse-mapped walk instead. */
+    float (*regions)[4];
+    size_t region_count, region_capacity;
     uint64_t layout, dom, visual, fonts;
     int view_x, view_y;
     bool valid;
@@ -69,6 +73,7 @@ struct pctx {
     const struct radius_cache *hit_radius;
     float hit_shape_x,hit_shape_y;
     const struct gfx_mask_clip *viewport_mask;
+    const box_t *untransformed; /* this box's own used transform is being applied by the caller */
 };
 #include "paint_media_debug.h"
 /* debug_js only: where top-level paint time goes between profile reports. */
@@ -1717,10 +1722,29 @@ static void shadow_ink_bounds(const style_t *style,float x,float y,float w,float
         rect[0]=fminf(rect[0],x+shadow->x-extent);rect[1]=fminf(rect[1],y+shadow->y-extent);
         rect[2]=fmaxf(rect[2],x+w+shadow->x+extent);rect[3]=fmaxf(rect[3],y+h+shadow->y+extent);
     }
+    if(style->outline_width>0&&(style->outline_color>>24)) {
+        float extent=fmaxf(style->outline_offset+style->outline_width,0)+1;
+        rect[0]=fminf(rect[0],x-extent);rect[1]=fminf(rect[1],y-extent);
+        rect[2]=fmaxf(rect[2],x+w+extent);rect[3]=fmaxf(rect[3],y+h+extent);
+    }
 }
 static void bounds_decoration(struct pctx *P,const style_t *style,float x,float y,float w,float h) {
     float rect[4]={x,y,x+w,y+h};shadow_ink_bounds(style,x,y,w,h,rect);
     bounds_rect(P,rect[0],rect[1],rect[2]-rect[0],rect[3]-rect[1]);
+}
+/* The outline is drawn over the content, outside the border box by outline-offset. */
+static void paint_outline(canvas_t *c,const style_t *st,float x,float y,float w,float h) {
+    float ow=st->outline_width;
+    if(ow<=0||!(st->outline_color>>24))return;
+    float grow=st->outline_offset+ow;
+    x-=grow;y-=grow;w+=2*grow;h+=2*grow;
+    if(w<=0||h<=0)return;
+    if(ow*2>h)ow=h/2;
+    float side=fminf(ow,w/2);
+    edge(c,st->outline_style,0,x,y,w,ow,st->outline_color);
+    edge(c,st->outline_style,2,x,y+h-ow,w,ow,st->outline_color);
+    edge(c,st->outline_style,3,x,y+ow,side,h-2*ow,st->outline_color);
+    edge(c,st->outline_style,1,x+w-side,y+ow,side,h-2*ow,st->outline_color);
 }
 static void inline_children(struct pctx *P, box_t *b, bool floats) {
     for (box_t *c = b->first; c; c = c->next) {
@@ -1823,6 +1847,192 @@ static void paint_runs(struct pctx *P, box_t *b, box_t *scope) {
             .s=overflow_ellipsis,.n=sizeof overflow_ellipsis-1,.st=b->st};
         paint_run_text(P,&marker,bx,by);
     }
+    /* inline box outlines, over the text like block outlines */
+    if (P->mode == M_PAINT)
+        for (int i = scope ? scope->inline_deco_first : 0; i >= 0 && i < b->ndecos;
+             i = scope ? b->decos[i].paint_next : i + 1) {
+            struct deco *d = &b->decos[i];
+            if (scope && d->paint_owner != scope) continue;
+            if (!scope && d->paint_owner) continue;
+            if (d->st->visibility || d->st->outline_width <= 0) continue;
+            paint_outline(P->c, d->st, P->ox + bx + d->x, P->oy + by + d->y, d->w, d->h);
+        }
+}
+
+/* ---------------------------------------------------------------- 2D transforms */
+static void paint_box(struct pctx *P, box_t *b, bool layer_root);
+static void affine_rect(const double m[6], double x0, double y0, double x1, double y1, double out[4]) {
+    double xs[4] = {x0, x1, x0, x1}, ys[4] = {y0, y0, y1, y1};
+    out[0] = out[1] = INFINITY; out[2] = out[3] = -INFINITY;
+    for (int i = 0; i < 4; i++) {
+        double x = m[0] * xs[i] + m[2] * ys[i] + m[4], y = m[1] * xs[i] + m[3] * ys[i] + m[5];
+        out[0] = fmin(out[0], x); out[1] = fmin(out[1], y); out[2] = fmax(out[2], x); out[3] = fmax(out[3], y);
+    }
+}
+static bool affine_invert(const double m[6], double inv[6]) {
+    double det = m[0] * m[3] - m[1] * m[2];
+    if (!(fabs(det) > 1e-12) || !isfinite(det)) return false;
+    inv[0] = m[3] / det; inv[1] = -m[1] / det; inv[2] = -m[2] / det; inv[3] = m[0] / det;
+    inv[4] = -(inv[0] * m[4] + inv[2] * m[5]); inv[5] = -(inv[1] * m[4] + inv[3] * m[5]);
+    return true;
+}
+/* Untransformed document-space ink of b's subtree, with a private bounds
+   generation so cached descendant bounds from another space never leak in. */
+static bool transformed_inner_bounds(struct pctx *P, box_t *b, bool layer_root, double out[4]) {
+    struct pctx Q = *P;
+    Q.mode = M_BOUNDS; Q.bounds_valid = false; Q.untransformed = b;
+    if (P->mode != M_BOUNDS) Q.bounds_generation = __atomic_add_fetch(&P->d->paint_bounds_generation, 1, __ATOMIC_RELAXED);
+    paint_box(&Q, b, layer_root);
+    if (P->mode == M_BOUNDS) P->bounds_work = Q.bounds_work;
+    if (Q.failed) { P->failed = true; return false; }
+    if (!Q.bounds_valid) return false;
+    for (int i = 0; i < 4; i++) out[i] = Q.bounds[i];
+    return true;
+}
+/* Paint into two opaque scratch canvases (over black and over white). The
+   shared 2D library blends onto opaque destinations only; the difference of
+   the two results recovers exact coverage, and the black result is already
+   the premultiplied colour. The surface is then resampled through the
+   inverse matrix with bilinear filtering, which also antialiases its edges. */
+static void paint_transformed_surface(struct pctx *P, box_t *b, bool layer_root, const double m[6]) {
+    canvas_t *c = P->c;
+    double inv[6], inner[4], ink[4];
+    if (!affine_invert(m, inv)) return; /* a singular matrix has no visible area */
+    if (!transformed_inner_bounds(P, b, layer_root, inner)) return;
+    affine_rect(m, inner[0], inner[1], inner[2], inner[3], ink);
+    double left = floor(ink[0] + P->ox), top = floor(ink[1] + P->oy);
+    double right = ceil(ink[2] + P->ox), bottom = ceil(ink[3] + P->oy);
+    if (left < c->cx0) left = c->cx0; if (top < c->cy0) top = c->cy0;
+    if (right > c->cx1) right = c->cx1; if (bottom > c->cy1) bottom = c->cy1;
+    if (!(right > left && bottom > top)) return;
+    int dx = (int)left, dy = (int)top, dw = (int)(right - left), dh = (int)(bottom - top);
+    /* Only the part of the subtree that reaches the destination is rastered. */
+    double need[4];
+    affine_rect(inv, left - P->ox, top - P->oy, right - P->ox, bottom - P->oy, need);
+    double sx0 = floor(fmax(need[0], inner[0]) - 1), sy0 = floor(fmax(need[1], inner[1]) - 1);
+    double sx1 = ceil(fmin(need[2], inner[2]) + 1), sy1 = ceil(fmin(need[3], inner[3]) + 1);
+    if (!(sx1 > sx0 && sy1 > sy0)) return;
+    double area = (sx1 - sx0) * (sy1 - sy0);
+    if (!(area <= 8.0 * 1024 * 1024)) {
+        /* Never allocate an unbounded surface; draw the content in place. */
+        struct pctx Q = *P; Q.untransformed = b; paint_box(&Q, b, layer_root);
+        if (Q.failed) P->failed = true;
+        return;
+    }
+    int sw = (int)(sx1 - sx0), sh = (int)(sy1 - sy0);
+    size_t count = (size_t)sw * (size_t)sh;
+    uint32_t *black = malloc(count * sizeof *black), *white = malloc(count * sizeof *white);
+    if (!black || !white) { free(black); free(white); P->failed = true; return; }
+    web_avmedia_snapshot_reject_region(c, dx, dy, dw, dh);
+    if (P->d->profile_enabled) { paint_profile.groups++; paint_profile.group_pixels += count; }
+    for (int pass = 0; pass < 2 && !P->failed; pass++) {
+        canvas_t surface;
+        gfx_init(&surface, pass ? white : black, sw, sh, sw);
+        gfx_fill(&surface, 0, 0, sw, sh, pass ? RGB(255, 255, 255) : RGB(0, 0, 0));
+        struct pctx Q = *P;
+        Q.c = &surface; Q.ox = (float)-sx0; Q.oy = (float)-sy0;
+        Q.vx0 = 0; Q.vy0 = 0; Q.vx1 = sw; Q.vy1 = sh; Q.viewport_mask = NULL;
+        Q.untransformed = b;
+        paint_box(&Q, b, layer_root);
+        if (Q.failed) P->failed = true;
+    }
+    if (P->failed) { free(black); free(white); return; }
+    for (size_t i = 0; i < count; i++) {
+        uint32_t k = black[i], w = white[i];
+        int alpha = 0;
+        for (int shift = 0; shift < 24; shift += 8) alpha += 255 - ((int)((w >> shift) & 255) - (int)((k >> shift) & 255));
+        alpha = (alpha + 1) / 3; if (alpha < 0) alpha = 0; if (alpha > 255) alpha = 255;
+        uint32_t r = (k >> 16) & 255, g = (k >> 8) & 255, bl = k & 255;
+        if (r > (uint32_t)alpha) r = (uint32_t)alpha; if (g > (uint32_t)alpha) g = (uint32_t)alpha; if (bl > (uint32_t)alpha) bl = (uint32_t)alpha;
+        black[i] = (uint32_t)alpha << 24 | r << 16 | g << 8 | bl;
+    }
+    free(white);
+    for (int j = 0; j < dh && !P->failed; j++) {
+        if (!(j & 63) && !web_native_checkpoint(P->d)) { P->failed = true; break; }
+        int py = dy + j;
+        double X = dx + 0.5 - P->ox, Y = py + 0.5 - P->oy;
+        double u = inv[0] * X + inv[2] * Y + inv[4] - sx0 - 0.5, v = inv[1] * X + inv[3] * Y + inv[5] - sy0 - 0.5;
+        uint32_t *row = c->px + (size_t)py * c->pitch;
+        for (int i = 0; i < dw; i++, u += inv[0], v += inv[1]) {
+            if (!(u > -1 && v > -1 && u < sw && v < sh)) continue;
+            int x0 = (int)floor(u), y0 = (int)floor(v);
+            uint32_t fx = (uint32_t)((u - x0) * 256), fy = (uint32_t)((v - y0) * 256);
+            uint32_t lanes[4] = {0, 0, 0, 0};
+            for (int corner = 0; corner < 4; corner++) {
+                int sx = x0 + (corner & 1), sy = y0 + (corner >> 1);
+                if (sx < 0 || sy < 0 || sx >= sw || sy >= sh) continue;
+                uint32_t weight = ((corner & 1) ? fx : 256 - fx) * ((corner >> 1) ? fy : 256 - fy);
+                uint32_t s = black[(size_t)sy * sw + sx];
+                for (int lane = 0; lane < 4; lane++) lanes[lane] += ((s >> (lane * 8)) & 255) * weight;
+            }
+            uint32_t a = (lanes[3] + 32768) >> 16;
+            if (!a) continue;
+            int px = dx + i;
+            uint32_t mask = c->mask_clip ? gfx_clip_alpha(c, px, py) : 255;
+            if (!mask) continue;
+            uint32_t d = row[px], out = 0xFF000000u;
+            for (int lane = 0; lane < 3; lane++) {
+                uint32_t sv = (lanes[lane] + 32768) >> 16, dv = (d >> (lane * 8)) & 255;
+                uint32_t value = (sv * 255 + dv * (255 - a) + 127) / 255; /* premultiplied source over opaque dest */
+                if (mask < 255) value = (value * mask + dv * (255 - mask) + 127) / 255;
+                out |= (value > 255 ? 255 : value) << (lane * 8);
+            }
+            row[px] = out;
+        }
+    }
+    free(black);
+}
+static void paint_transformed(struct pctx *P, box_t *b, bool layer_root) {
+    double m[6];
+    if (!box_transform_matrix(b, m)) {
+        struct pctx Q = *P; Q.untransformed = b; paint_box(&Q, b, layer_root);
+        P->target = Q.target; P->hit_any = Q.hit_any; P->bounds_valid = Q.bounds_valid;
+        memcpy(P->bounds, Q.bounds, sizeof P->bounds); P->bounds_work = Q.bounds_work;
+        if (Q.failed) P->failed = true;
+        return;
+    }
+    if (P->mode == M_BOUNDS) {
+        double inner[4], ink[4];
+        if (!transformed_inner_bounds(P, b, layer_root, inner)) return;
+        affine_rect(m, inner[0], inner[1], inner[2], inner[3], ink);
+        bounds_rect(P, (float)ink[0], (float)ink[1], (float)(ink[2] - ink[0]), (float)(ink[3] - ink[1]));
+        return;
+    }
+    if (P->mode == M_PAINT) { paint_transformed_surface(P, b, layer_root, m); return; }
+    canvas_t *c = P->c;
+    if (P->index_build) {
+        double inner[4], ink[4];
+        if (!transformed_inner_bounds(P, b, layer_root, inner)) return;
+        affine_rect(m, inner[0], inner[1], inner[2], inner[3], ink);
+        double l = fmax(ink[0], c->cx0 - P->ox), t = fmax(ink[1], c->cy0 - P->oy);
+        double r = fmin(ink[2], c->cx1 - P->ox), bt = fmin(ink[3], c->cy1 - P->oy);
+        if (!(r > l && bt > t)) return;
+        struct web_hit_index *index = P->index_build;
+        if (index->region_count == index->region_capacity) {
+            size_t capacity = index->region_capacity ? index->region_capacity * 2 : 8;
+            void *regions = capacity > SIZE_MAX / sizeof *index->regions ? NULL : realloc(index->regions, capacity * sizeof *index->regions);
+            if (!regions) { P->failed = true; return; }
+            index->regions = regions; index->region_capacity = capacity;
+        }
+        float *region = index->regions[index->region_count++];
+        region[0] = (float)l; region[1] = (float)t; region[2] = (float)r; region[3] = (float)bt;
+        return;
+    }
+    /* Exact hit walk: the point must reach this box through the outer clip;
+       the subtree is then tested in its own untransformed space. */
+    if (P->hx + P->ox < c->cx0 || P->hx + P->ox >= c->cx1 || P->hy + P->oy < c->cy0 || P->hy + P->oy >= c->cy1) return;
+    double inv[6];
+    if (!affine_invert(m, inv)) return;
+    float hx = P->hx, hy = P->hy;
+    int cx0 = c->cx0, cy0 = c->cy0, cx1 = c->cx1, cy1 = c->cy1;
+    const box_t *outer = P->untransformed;
+    P->hx = (float)(inv[0] * hx + inv[2] * hy + inv[4]);
+    P->hy = (float)(inv[1] * hx + inv[3] * hy + inv[5]);
+    c->cx0 = c->cy0 = -1000000000; c->cx1 = c->cy1 = 1000000000;
+    P->untransformed = b;
+    paint_box(P, b, layer_root);
+    P->untransformed = outer; P->hx = hx; P->hy = hy;
+    c->cx0 = cx0; c->cy0 = cy0; c->cx1 = cx1; c->cy1 = cy1;
 }
 
 static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
@@ -1836,10 +2046,11 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     float group_opacity = st->opacity * (st->filter ? st->filter->opacity : 1);
     /* Transparent auto boxes still participate in hit testing. */
     if (P->mode != M_HIT && group_opacity <= 0) return;
+    if (P->untransformed != b && box_transformed(b)) { paint_transformed(P, b, layer_root); return; }
     float parent_bounds[4]; bool parent_valid = P->bounds_valid;
     if (P->mode == M_BOUNDS) {
         if (!(++P->bounds_work & 63) && !web_native_checkpoint(P->d)) { P->failed = true; return; }
-        if (b->paint_bounds_generation == P->bounds_generation) {
+        if (b->paint_bounds_generation == P->bounds_generation && P->untransformed != b) {
             if (b->paint_bounds_valid) bounds_rect(P, b->paint_bounds[0], b->paint_bounds[1],
                 b->paint_bounds[2] - b->paint_bounds[0], b->paint_bounds[3] - b->paint_bounds[1]);
             return;
@@ -1983,6 +2194,9 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
     c->mask_clip=previous_mask;
 done:
     release_layers(&layers,layers_borrowed);
+    if (P->mode == M_PAINT && visible && st->outline_width > 0 && b->kind != B_INLINE && b->kind != B_TEXT &&
+        b->kind != B_BR && b->kind != B_ROW && b->kind != B_ROW_GROUP)
+        paint_outline(c, st, P->ox + bx, P->oy + by, bw, bh);
     if (saved) {
         int a = (int)(group_opacity * 255 + 0.5f);
         for (int j = 0; !P->failed && j < gh; j++) {
@@ -2200,7 +2414,7 @@ static void paint_document(web_doc *d, canvas_t *c, int x, int y, int w, int h, 
 
 void web_hit_index_free(web_doc *d) {
     if(!d||!d->hit_index)return;
-    free(d->hit_index->items);free(d->hit_index->branches);free(d->hit_index);d->hit_index=NULL;
+    free(d->hit_index->items);free(d->hit_index->branches);free(d->hit_index->regions);free(d->hit_index);d->hit_index=NULL;
 }
 void doc_paint_damage(web_doc *d,node_t *node){
     if(!d)return;
@@ -2324,7 +2538,7 @@ static bool hit_index_lookup(struct pctx *P){
     uint64_t fonts=font_metrics_generation();
     if(!index->valid||index->layout!=d->layout_revision||index->dom!=d->dom_revision||index->visual!=d->visual_revision||
        index->view_x!=d->view_x||index->view_y!=d->view_y||index->fonts!=fonts||!fonts){
-        index->valid=false;index->count=index->branch_count=0;
+        index->valid=false;index->count=index->branch_count=index->region_count=0;
         struct pctx build=*P;struct web_hit ignored={0};build.hit=&ignored;build.index_build=index;
         walk(&build);
         if(build.failed||font_metrics_generation()!=fonts||!fonts){
@@ -2347,6 +2561,7 @@ static bool hit_index_lookup(struct pctx *P){
         index->layout=d->layout_revision;index->dom=d->dom_revision;index->visual=d->visual_revision;
         index->view_x=d->view_x;index->view_y=d->view_y;index->fonts=fonts;index->valid=true;
     }
+    for(size_t i=0;i<index->region_count;i++)if(hit_rect_contains(index->regions[i],P->hx,P->hy))return false;
     const struct hit_primitive *item=index->count?hit_query(index,0,P->hx,P->hy,NULL):NULL;
     if(item){P->target=item->target;P->hit->kind=item->kind;P->hit->node=item->node;}
     return true;

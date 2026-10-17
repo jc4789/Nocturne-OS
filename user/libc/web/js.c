@@ -2038,16 +2038,21 @@ static JSValue computed_translation(JSContext *ctx,web_doc *d,const style_t *st,
         JSValue result=JS_NewStringLen(ctx,text.p?text.p:"",text.n);sb_free(&text);return result;
     }
     if(!st->transform)return JS_NewString(ctx,"none");
-    box_t resolved={0};
-    if(principal)resolved=*principal;
     /* CSS Transforms resolved-value serialization composes the value even
-       on a non-transformable inline; rendering eligibility is separate. */
-    resolved.kind=B_BLOCK;
-    resolved.st=(style_t *)st;
-    char text[128];
-    snprintf(text,sizeof text,"matrix(1, 0, 0, 1, %g, %g)",
-        (double)box_translation_axis(&resolved,0,CSS_TRANSLATE_TRANSFORM),
-        (double)box_translation_axis(&resolved,1,CSS_TRANSLATE_TRANSFORM));
+       on a non-transformable inline; rendering eligibility is separate.
+       Percentages resolve against the principal border box. */
+    float w=0,h=0;
+    if(principal){
+        w=principal->w+principal->p[1]+principal->p[3]+principal->b[1]+principal->b[3];
+        h=principal->h+principal->p[0]+principal->p[2]+principal->b[0]+principal->b[2];
+    }
+    double m[16];css_transform_list_matrix(st->transform,w,h,m);
+    for(int i=0;i<16;i++)if(!isfinite(m[i])||fabs(m[i])<1e-12)m[i]=isfinite(m[i])?0:i%5?0:1;
+    char text[512];
+    if(m[2]||m[6]||m[8]||m[9]||m[11]||m[12]||m[13]||m[14]||m[10]!=1||m[15]!=1)
+        snprintf(text,sizeof text,"matrix3d(%g, %g, %g, %g, %g, %g, %g, %g, %g, %g, %g, %g, %g, %g, %g, %g)",
+            m[0],m[4],m[8],m[12],m[1],m[5],m[9],m[13],m[2],m[6],m[10],m[14],m[3],m[7],m[11],m[15]);
+    else snprintf(text,sizeof text,"matrix(%g, %g, %g, %g, %g, %g)",m[0],m[4],m[1],m[5],m[3],m[7]);
     return JS_NewString(ctx,text);
 }
 static JSValue computed_inset(struct web_js_state *s, JSContext *ctx, node_t *n, unsigned side) {
@@ -2915,10 +2920,19 @@ struct client_rect_output {
     bool first_seen, extent_seen, area_seen;
     bool untransformed, all_fragments;
     double first[4], bounds[4]; /* left, top, right, bottom */
+    const box_t *space; /* rects are in this box's untransformed space */
+    int sx, sy;
 };
 static bool client_rect_append(struct client_rect_output *out,
                                double x, double y, double w, double h) {
     if (!isfinite(x) || !isfinite(y) || !isfinite(w) || !isfinite(h)) return true;
+    if (!out->untransformed && out->space) {
+        /* Bounding box of the transformed quad, as CSSOM View requires. */
+        double rect[4]={x+out->sx,y+out->sy,w,h};
+        box_transform_rect(out->space,rect);
+        x=rect[0]-out->sx;y=rect[1]-out->sy;w=rect[2];h=rect[3];
+        if (!isfinite(x) || !isfinite(y) || !isfinite(w) || !isfinite(h)) return true;
+    }
     if (JS_IsUndefined(out->list)) {
         if (!out->first_seen) {
             out->first[0]=x;out->first[1]=y;out->first[2]=x+w;out->first[3]=y+h;
@@ -2957,8 +2971,10 @@ static bool client_rect_box(struct client_rect_output *out,
 static bool collect_client_rects(struct client_rect_output *out,node_t *n,int sx,int sy) {
     box_t *b=n->box;
     if(!b || !b->st || b->st->display==D_NONE)return true;
+    out->sx=sx;out->sy=sy;
     if(b->kind==B_INLINE){
         box_t *a=n->anchor_block;
+        out->space=a;
         if(a){
             double x=(out->untransformed?box_abs_x(a):box_visual_x(a))-sx;
             double y=(out->untransformed?box_abs_y(a):box_visual_y(a))+a->content_dy-sy;
@@ -2970,6 +2986,7 @@ static bool collect_client_rects(struct client_rect_output *out,node_t *n,int sx
         }
     }else{
         b=geometry_principal_box(n);
+        out->space=b;
         if(!client_rect_box(out,b,sx,sy))return false;
         if(!out->untransformed && b->kind==B_TABLE)for(box_t *c=b->first;c;c=c->next)
             if(c->kind==B_CAPTION && !client_rect_box(out,c,sx,sy))return false;
@@ -7982,6 +7999,7 @@ void web_js_start(web_doc *d, const struct web_host *host) {
     struct web_js_state *s = calloc(1, sizeof *s); if (!s) return;
     d->js = s; s->doc = d; s->stream_generation=1; if (host) s->host = *host;
     d->profile_enabled=s->host.debug_js;
+    if(s->host.debug_js)web_webgl_set_profile(true);
     s->runtime_owner=d->frame_parent && d->frame_parent->js?d->frame_parent->js->runtime_owner:s;
     s->runtime_next=s->runtime_owner->runtime_realms;
     s->runtime_owner->runtime_realms=s;

@@ -31,6 +31,9 @@
 
 
 #include "tgsi/tgsi_exec.h"
+#include "util/detect_os.h"
+
+struct softpipe_resource;
 
 
 struct sp_sampler_view;
@@ -124,6 +127,20 @@ struct sp_sampler_view
    union pipe_color_union border_color;
    /* Value to use for PIPE_SWIZZLE_1 (integer vs float) */
    float oneval;
+
+#if DETECT_OS_NOCTURNE
+   /* Uncompressed colour textures held in plain memory are read texel by
+    * texel from the resource instead of through the tile cache, which
+    * converts a whole 32x32 tile per miss and thrashes on mipmapped and
+    * repeated textures. Callers hold at most eight texel pointers at once
+    * (3D linear filtering), so a small ring of converted texels suffices. */
+   const struct softpipe_resource *direct;  /* NULL: use the tile cache */
+   unsigned direct_bytes;                   /* bytes per texel */
+   void (*direct_unpack)(void *dst, const uint8_t *src, unsigned width);
+   bool direct_unorm8x4;                    /* R8G8B8A8_UNORM: inline conversion */
+   unsigned direct_next;
+   float direct_texels[16][4];
+#endif
 };
 
 struct sp_filter_funcs {

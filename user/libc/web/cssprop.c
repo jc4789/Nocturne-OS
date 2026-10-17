@@ -1151,14 +1151,15 @@ bool css_radius_specified(const char *property,const char *value,size_t size,sbu
 enum { PT_SHORT, PT_KW, PT_DISPLAY, PT_LEN, PT_PX, PT_COLOR, PT_NUM, PT_INT, PT_FONT_SIZE, PT_FONT_WEIGHT,
        PT_FONT_FAMILY, PT_LINE_HEIGHT, PT_VALIGN, PT_CONTENT, PT_LIST_TYPE, PT_BG_IMAGE, PT_TEXT_DECO,
        PT_OVERFLOW, PT_OPACITY, PT_FILTER, PT_BOX_SHADOW, PT_RADIUS, PT_ZINDEX, PT_BG_POS, PT_BG_SIZE, PT_GTEMPLATE, PT_GAREAS, PT_GLINE, PT_MASK_IMAGE, PT_MASK_SIZE, PT_SVG_PAINT, PT_SVG_WIDTH, PT_CONTAINER_NAMES, PT_LINE_CLAMP,
-       PT_MOTION_NAME, PT_MOTION_TIME, PT_MOTION_ITERATIONS, PT_MOTION_EASING, PT_TRANSFORM, PT_TRANSLATE };
+       PT_MOTION_NAME, PT_MOTION_TIME, PT_MOTION_ITERATIONS, PT_MOTION_EASING, PT_TRANSFORM, PT_TRANSLATE,
+       PT_ROTATE, PT_SCALE, PT_TRANSFORM_ORIGIN };
 
 enum { SH_MARGIN = 1, SH_PADDING, SH_INSET, SH_BORDER_RADIUS, SH_BORDER, SH_BORDER_TOP, SH_BORDER_RIGHT, SH_BORDER_BOTTOM,
        SH_BORDER_LEFT, SH_BORDER_WIDTH, SH_BORDER_STYLE, SH_BORDER_COLOR, SH_BORDER_INLINE, SH_BORDER_BLOCK,
        SH_MARGIN_INLINE, SH_MARGIN_BLOCK, SH_PADDING_INLINE, SH_PADDING_BLOCK, SH_INSET_INLINE, SH_INSET_BLOCK,
        SH_LIST_STYLE, SH_FONT, SH_BACKGROUND, SH_FLEX, SH_FLEX_FLOW, SH_GAP, SH_OVERFLOW, SH_TEXT_DECORATION, SH_ALL,
        SH_PLACE_ITEMS, SH_PLACE_SELF, SH_PLACE_CONTENT, SH_GRID_AREA, SH_GRID_ROW, SH_GRID_COLUMN,
-       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION };
+       SH_GRID_TEMPLATE, SH_GRID, SH_CONTAINER, SH_ANIMATION, SH_OUTLINE };
 
 struct propdef {
     const char *name;
@@ -1208,6 +1209,8 @@ static const struct kw kw_bg_repeat[] = {{"repeat", BR_REPEAT}, {"repeat-x", BR_
                                          {0}};
 /* HTML hit testing supports auto/none; SVG painted/geometry keywords remain unsupported. */
 static const struct kw kw_pointer_events[] = {{"auto", 0}, {"none", 1}, {0}};
+static const struct kw kw_transform_box[] = {{"view-box", TB_VIEW_BOX}, {"fill-box", TB_FILL_BOX}, {"stroke-box", TB_STROKE_BOX},
+                                           {"content-box", TB_CONTENT_BOX}, {"border-box", TB_BORDER_BOX}, {0}};
 static const struct kw kw_visibility[] = {{"visible", 0}, {"hidden", 1}, {"collapse", 1}, {0}};
 static const struct kw kw_content_visibility[] = {{"visible", CV_VISIBLE}, {"auto", CV_AUTO}, {"hidden", CV_HIDDEN}, {0}};
 static const struct kw kw_container_type[] = {{"normal", CT_NORMAL}, {"inline-size", CT_INLINE_SIZE}, {"size", CT_SIZE}, {0}};
@@ -1248,6 +1251,9 @@ static const struct kw kw_bstyle[] = {{"none", BS_NONE}, {"hidden", BS_HIDDEN}, 
                                       {"groove", BS_GROOVE}, {"ridge", BS_RIDGE}, {"inset", BS_INSET},
                                       {"outset", BS_OUTSET}, {0}};
 static const struct kw kw_bwidth[] = {{"thin", 1}, {"medium", 3}, {"thick", 5}, {0}};
+static const struct kw kw_ostyle[] = {{"auto", BS_SOLID}, {"none", BS_NONE}, {"solid", BS_SOLID}, {"dashed", BS_DASHED},
+                                      {"dotted", BS_DOTTED}, {"double", BS_DOUBLE}, {"groove", BS_GROOVE},
+                                      {"ridge", BS_RIDGE}, {"inset", BS_INSET}, {"outset", BS_OUTSET}, {0}};
 static const struct kw kw_normal0[] = {{"normal", 0}, {0}};
 static const struct kw kw_valign[] = {{"baseline", VA_BASELINE}, {"sub", VA_SUB}, {"super", VA_SUPER},
                                       {"top", VA_TOP}, {"middle", VA_MIDDLE}, {"bottom", VA_BOTTOM},
@@ -1386,6 +1392,11 @@ static struct propdef props[] = {
     {"min-width", PT_LEN, LF_AUTO, false, O(min_width), NULL, 0},
     {"opacity", PT_OPACITY, 0, false, O(opacity), NULL, 0},
     {"order", PT_INT, 0, false, O(order), NULL, 0},
+    SH("outline", SH_OUTLINE),
+    {"outline-color", PT_COLOR, 0, false, O(outline_color), NULL, 0},
+    {"outline-offset", PT_PX, LF_NEG | LF_NOPCT, false, O(outline_offset), NULL, 0},
+    {"outline-style", PT_KW, 0, false, O(outline_style), kw_ostyle, 0},
+    {"outline-width", PT_PX, LF_NOPCT, false, O(outline_width), kw_bwidth, 0},
     SH("overflow", SH_OVERFLOW),
     {"overflow-x", PT_OVERFLOW, 0, false, O(overflow), kw_overflow, 0},
     {"overflow-y", PT_OVERFLOW, 0, false, O(overflow), kw_overflow, 0},
@@ -1420,6 +1431,10 @@ static struct propdef props[] = {
     {"text-wrap-mode", PT_KW, 0, true, O(white_space), kw_textwrap, 0},
     {"top", PT_LEN, LF_AUTO | LF_NEG, false, O(inset[0]), NULL, 0},
     {"transform", PT_TRANSFORM, 0, false, O(transform), NULL, 0},
+    {"transform-origin", PT_TRANSFORM_ORIGIN, 0, false, O(transform_origin), NULL, 0},
+    {"transform-box", PT_KW, 0, false, O(transform_box), kw_transform_box, 0},
+    {"rotate", PT_ROTATE, 0, false, O(rotate), NULL, 0},
+    {"scale", PT_SCALE, 0, false, O(scale), NULL, 0},
     {"translate", PT_TRANSLATE, 0, false, O(translate), NULL, 0},
     {"vertical-align", PT_VALIGN, 0, false, O(vertical_align), kw_valign, 0},
     {"visibility", PT_KW, 0, true, O(visibility), kw_visibility, 0},
@@ -1469,6 +1484,8 @@ static void init_initial(void) {
     s->svg_stroke.kind = SVG_PAINT_NONE;
     s->svg_fill_opacity = s->svg_stroke_opacity = s->svg_stop_opacity = 1;
     s->svg_stroke_width.kind = LK_LEN; s->svg_stroke_width.px = 1;
+    s->outline_color = COLOR_CURRENT;
+    s->outline_width = 3;
     for (int i = 0; i < 4; i++) {
         s->border_color[i] = COLOR_CURRENT;
         s->border_width[i] = 3;
@@ -1492,6 +1509,8 @@ static void init_initial(void) {
     s->motion.easing = (struct css_easing){.x1=.25f,.y1=.1f,.x2=.25f,.y2=1,.kind=CM_BEZIER};
     s->object_pos[0].kind=s->object_pos[1].kind=LK_LEN;
     s->object_pos[0].pct=s->object_pos[1].pct=50;
+    s->transform_origin[0].kind=s->transform_origin[1].kind=LK_LEN;
+    s->transform_origin[0].pct=s->transform_origin[1].pct=50;
     s->align_self = 255;
     s->justify_self = 255;
     s->z_auto = true;
@@ -2357,6 +2376,95 @@ static bool parse_translate_value(const char *v,size_t n,struct cx *cx,struct cs
     for(int i=0;i<count;i++)if(!parse_len(parts[i],lengths[i],cx,&t.xy[i],LF_NEG|LF_LENGTH))return false;
     t.active=true;*out=t;return true;
 }
+static bool transform_number(const char *s,size_t n,bool percentage,float *out){
+    trim(&s,&n);const char *p=s,*e=s+n;float v;
+    if(!parse_number(&p,e,&v)||!isfinite(v))return false;
+    if(p==e){*out=v;return true;}
+    if(percentage&&p+1==e&&*p=='%'){*out=v/100;return true;}
+    return false;
+}
+static bool transform_angle(const char *s,size_t n,float *out){
+    trim(&s,&n);const char *p=s,*e=s+n;float v;
+    if(!parse_number(&p,e,&v))return false;
+    size_t unit=(size_t)(e-p);double r;
+    if(!unit){if(v!=0)return false;r=0;} /* unitless zero only */
+    else if(ident_is(p,unit,"deg"))r=v*M_PI/180;
+    else if(ident_is(p,unit,"rad"))r=v;
+    else if(ident_is(p,unit,"grad"))r=v*M_PI/200;
+    else if(ident_is(p,unit,"turn"))r=v*2*M_PI;
+    else return false;
+    *out=(float)r;return isfinite(*out);
+}
+static struct css_transform transform_identity(uint8_t kind){
+    struct css_transform t={.xy={{.kind=LK_LEN},{.kind=LK_LEN}},.kind=kind};
+    if(kind==CT_SCALE)t.v[0]=t.v[1]=t.v[2]=1;
+    if(kind==CT_ROTATE)t.v[2]=1;
+    for(int i=0;i<4;i++)t.m[i*5]=1;
+    return t;
+}
+/* One transform function from its name and comma-separated arguments. */
+static bool transform_function(const char *name,size_t nn,const char **a,const size_t *al,int count,struct cx *cx,struct css_transform *t){
+#define IS(s) ident_is(name,nn,s)
+    if(IS("matrix")||IS("matrix3d")){
+        bool three=IS("matrix3d");float v[16];
+        if(count!=(three?16:6))return false;
+        for(int i=0;i<count;i++)if(!transform_number(a[i],al[i],false,&v[i]))return false;
+        *t=transform_identity(CT_MATRIX);
+        if(three){for(int r=0;r<4;r++)for(int c=0;c<4;c++)t->m[r*4+c]=v[c*4+r];} /* column-major input */
+        else{t->m[0]=v[0];t->m[4]=v[1];t->m[1]=v[2];t->m[5]=v[3];t->m[3]=v[4];t->m[7]=v[5];}
+        return true;
+    }
+    if(IS("translate")||IS("translateX")||IS("translateY")||IS("translateZ")||IS("translate3d")){
+        *t=transform_identity(CT_TRANSLATE);
+        bool both=IS("translate"),three=IS("translate3d"),y=IS("translateY"),z=IS("translateZ");
+        if(three?count!=3:both?(count<1||count>2):count!=1)return false;
+        int planar=z?0:three?2:count;
+        for(int i=0;i<planar;i++)if(!parse_len(a[i],al[i],cx,&t->xy[y?1:i],LF_NEG|LF_LENGTH))return false;
+        if(z||three){
+            len_t depth;int at=z?0:2;
+            if(memchr(a[at],'%',al[at])||!parse_len(a[at],al[at],cx,&depth,LF_NEG|LF_NOPCT|LF_LENGTH))return false;
+            t->v[0]=len_resolve(&depth,0);
+        }
+        return true;
+    }
+    if(IS("scale")||IS("scaleX")||IS("scaleY")||IS("scaleZ")||IS("scale3d")){
+        *t=transform_identity(CT_SCALE);
+        bool both=IS("scale"),three=IS("scale3d");float v[3];
+        if(three?count!=3:both?(count<1||count>2):count!=1)return false;
+        for(int i=0;i<count;i++)if(!transform_number(a[i],al[i],true,&v[i]))return false;
+        if(three){t->v[0]=v[0];t->v[1]=v[1];t->v[2]=v[2];}
+        else if(both){t->v[0]=v[0];t->v[1]=count>1?v[1]:v[0];}
+        else t->v[IS("scaleX")?0:IS("scaleY")?1:2]=v[0];
+        return true;
+    }
+    if(IS("rotate")||IS("rotateZ")||IS("rotateX")||IS("rotateY")||IS("rotate3d")){
+        *t=transform_identity(CT_ROTATE);
+        if(IS("rotate3d")){
+            if(count!=4)return false;
+            for(int i=0;i<3;i++)if(!transform_number(a[i],al[i],false,&t->v[i]))return false;
+            return transform_angle(a[3],al[3],&t->v[3]);
+        }
+        if(count!=1||!transform_angle(a[0],al[0],&t->v[3]))return false;
+        if(IS("rotateX")){t->v[0]=1;t->v[2]=0;}
+        else if(IS("rotateY")){t->v[1]=1;t->v[2]=0;}
+        return true;
+    }
+    if(IS("skew")||IS("skewX")||IS("skewY")){
+        *t=transform_identity(CT_SKEW);
+        if(IS("skew")?(count<1||count>2):count!=1)return false;
+        for(int i=0;i<count;i++)if(!transform_angle(a[i],al[i],&t->v[IS("skewY")?1:i]))return false;
+        return true;
+    }
+    if(IS("perspective")){
+        *t=transform_identity(CT_PERSPECTIVE);
+        if(count!=1)return false;
+        if(ident_is(a[0],al[0],"none"))return true;
+        len_t depth;if(!parse_len(a[0],al[0],cx,&depth,LF_NOPCT|LF_LENGTH))return false;
+        t->v[0]=len_resolve(&depth,0);return true;
+    }
+#undef IS
+    return false;
+}
 static bool parse_transform_value(const char *v,size_t n,struct cx *cx,const struct css_transform **out){
     if(ident_is(v,n,"none")){*out=NULL;return true;}
     const char *p=v,*end=v+n;struct css_transform *first=NULL,**tail=&first;
@@ -2365,19 +2473,67 @@ static bool parse_transform_value(const char *v,size_t n,struct cx *cx,const str
         if(p==end)break;
         const char *name=p;while(p<end&&isalnum((unsigned char)*p))p++;
         size_t name_length=(size_t)(p-name);
-        bool three=ident_is(name,name_length,"translate3d"),both=ident_is(name,name_length,"translate"),x=ident_is(name,name_length,"translateX"),y=ident_is(name,name_length,"translateY");
-        if((!three&&!both&&!x&&!y)||p==end||*p!='(')return false;
+        if(!name_length||p==end||*p!='(')return false;
         const char *args=++p;unsigned depth=1;
         while(p<end&&depth){if(*p=='(')depth++;else if(*p==')')depth--;if(depth)p++;}
         if(depth)return false;
-        const char *parts[4];size_t lengths[4];int count=split_checked(args,(size_t)(p-args),parts,lengths,4,',',cx);
-        if(three){len_t z;if(count!=3||memchr(parts[2],'%',lengths[2])||!parse_len(parts[2],lengths[2],cx,&z,LF_NEG|LF_NOPCT|LF_LENGTH)||len_resolve(&z,0)!=0)return false;count=2;}
-        else if(count<1||count>(both?2:1))return false;
-        struct css_transform value={.xy={{.kind=LK_LEN},{.kind=LK_LEN}}};
-        for(int i=0;i<count;i++)if(!parse_len(parts[i],lengths[i],cx,&value.xy[y?1:i],LF_NEG|LF_LENGTH))return false;
+        const char *parts[17];size_t lengths[17];int count=split_checked(args,(size_t)(p-args),parts,lengths,17,',',cx);
+        struct css_transform value;
+        if(!transform_function(name,name_length,parts,lengths,count,cx,&value))return false;
         struct css_transform *node=ar_alloc(cx->a,sizeof *node);*node=value;*tail=node;tail=&node->next;p++;
     }
     if(!first)return false;*out=first;return true;
+}
+/* rotate: none | <angle> | [x | y | z | <number>{3}] && <angle> */
+static bool parse_rotate_value(const char *v,size_t n,struct cx *cx,const struct css_transform **out){
+    if(ident_is(v,n,"none")){*out=NULL;return true;}
+    const char *t[5];size_t tl[5];int k=split_checked(v,n,t,tl,5,' ',cx);
+    struct css_transform value=transform_identity(CT_ROTATE);
+    if(k==1){if(!transform_angle(t[0],tl[0],&value.v[3]))return false;}
+    else if(k==2||k==4){
+        int angle=transform_angle(t[0],tl[0],&value.v[3])?0:k-1;
+        if(angle&&!transform_angle(t[angle],tl[angle],&value.v[3]))return false;
+        int axis=angle?0:1;
+        if(k==2){
+            value.v[2]=0;
+            if(ident_is(t[axis],tl[axis],"x"))value.v[0]=1;
+            else if(ident_is(t[axis],tl[axis],"y"))value.v[1]=1;
+            else if(ident_is(t[axis],tl[axis],"z"))value.v[2]=1;
+            else return false;
+        }else for(int i=0;i<3;i++)if(!transform_number(t[axis+i],tl[axis+i],false,&value.v[i]))return false;
+    }else return false;
+    struct css_transform *node=ar_alloc(cx->a,sizeof *node);*node=value;*out=node;return true;
+}
+/* scale: none | [<number> | <percentage>]{1,3} */
+static bool parse_scale_value(const char *v,size_t n,struct cx *cx,const struct css_transform **out){
+    if(ident_is(v,n,"none")){*out=NULL;return true;}
+    const char *t[4];size_t tl[4];int k=split_checked(v,n,t,tl,4,' ',cx);
+    if(k<1||k>3)return false;
+    struct css_transform value=transform_identity(CT_SCALE);
+    for(int i=0;i<k;i++)if(!transform_number(t[i],tl[i],true,&value.v[i]))return false;
+    if(k==1)value.v[1]=value.v[0];
+    struct css_transform *node=ar_alloc(cx->a,sizeof *node);*node=value;*out=node;return true;
+}
+/* transform-origin: one or two position components plus an ignored z length. */
+static bool parse_transform_origin(const char *v,size_t n,struct cx *cx,len_t out[2]){
+    const char *t[4];size_t tl[4];int k=split_checked(v,n,t,tl,4,' ',cx);
+    if(k<1||k>3)return false;
+    len_t r[2]={{.kind=LK_LEN,.pct=50},{.kind=LK_LEN,.pct=50}};
+    int planar=k>2?2:k;
+    bool vertical_first=ident_is(t[0],tl[0],"top")||ident_is(t[0],tl[0],"bottom")||
+        (planar==2&&(ident_is(t[1],tl[1],"left")||ident_is(t[1],tl[1],"right")));
+    for(int i=0;i<planar;i++){
+        int axis=vertical_first?!i:i;len_t *l=&r[axis];
+        if(ident_is(t[i],tl[i],"center")){*l=(len_t){.kind=LK_LEN,.pct=50};continue;}
+        if(ident_is(t[i],tl[i],"left")||ident_is(t[i],tl[i],"top")||ident_is(t[i],tl[i],"right")||ident_is(t[i],tl[i],"bottom")){
+            bool x=ident_is(t[i],tl[i],"left")||ident_is(t[i],tl[i],"right");
+            if(x!=(axis==0))return false;
+            *l=(len_t){.kind=LK_LEN,.pct=ident_is(t[i],tl[i],"left")||ident_is(t[i],tl[i],"top")?0:100};continue;
+        }
+        if(!parse_len(t[i],tl[i],cx,l,LF_NEG|LF_LENGTH))return false;
+    }
+    if(k==3){len_t depth;if(!parse_len(t[2],tl[2],cx,&depth,LF_NEG|LF_NOPCT|LF_LENGTH))return false;}
+    out[0]=r[0];out[1]=r[1];return true;
 }
 
 static bool apply_long(const struct propdef *p, const char *v, size_t n, struct cx *cx) {
@@ -2399,6 +2555,9 @@ static bool apply_long(const struct propdef *p, const char *v, size_t n, struct 
     switch (p->type) {
     case PT_TRANSFORM:return parse_transform_value(v,n,cx,&s->transform);
     case PT_TRANSLATE:return parse_translate_value(v,n,cx,&s->translate);
+    case PT_ROTATE:return parse_rotate_value(v,n,cx,&s->rotate);
+    case PT_SCALE:return parse_scale_value(v,n,cx,&s->scale);
+    case PT_TRANSFORM_ORIGIN:return parse_transform_origin(v,n,cx,s->transform_origin);
     case PT_MOTION_NAME:
         if(!ident_is(v,n,"none") && !motion_name(v,n))return false;
         *(const char **)field=ident_is(v,n,"none")?NULL:ar_strndup(cx->a,v,n);return true;
@@ -3004,6 +3163,36 @@ static bool apply_short(const struct propdef *p, const char *v, size_t n, struct
         }
         return set_border(v, n, cx, sides, ns);
     }
+    case SH_OUTLINE: {
+        if (global) {
+            set_long("outline-width", v, n, cx);
+            set_long("outline-style", v, n, cx);
+            set_long("outline-color", v, n, cx);
+            return true;
+        }
+        const char *t[3];
+        size_t tl[3];
+        int k = split_checked(v, n, t, tl, 3, ' ', cx);
+        const char *w = "medium", *st = "none", *c = "currentcolor";
+        size_t wl = 6, sl = 4, cl = 12;
+        uint8_t style;
+        uint32_t col;
+        unsigned seen = 0;
+        for (int i = 0; i < k; i++) {
+            unsigned bit;
+            if (kw_find(kw_ostyle, t[i], tl[i], &style)) { bit = 1; st = t[i]; sl = tl[i]; }
+            else if (is_bwidth(t[i], tl[i], cx)) { bit = 2; w = t[i]; wl = tl[i]; }
+            else if (css_color_checked(t[i], tl[i], &col, cx)) { bit = 4; c = t[i]; cl = tl[i]; }
+            else return false;
+            if (seen & bit) return false;
+            seen |= bit;
+        }
+        if (k < 1) return false;
+        set_long("outline-width", w, wl, cx);
+        set_long("outline-style", st, sl, cx);
+        set_long("outline-color", c, cl, cx);
+        return true;
+    }
     case SH_BORDER_WIDTH: return set_box("border-%s-width", v, n, cx, all, 4);
     case SH_BORDER_STYLE: return set_box("border-%s-style", v, n, cx, all, 4);
     case SH_BORDER_COLOR: return set_box("border-%s-color", v, n, cx, all, 4);
@@ -3299,6 +3488,8 @@ void css_style_finish(style_t *s, const style_t *parent, bool root) {
         if (s->border_color[i] == COLOR_CURRENT) s->border_color[i] = s->color;
         if (s->border_style[i] == BS_NONE || s->border_style[i] == BS_HIDDEN) s->border_width[i] = 0;
     }
+    if (s->outline_color == COLOR_CURRENT) s->outline_color = s->color;
+    if (s->outline_style == BS_NONE) s->outline_width = 0;
     if (s->has_grad) {
         for (int i = 0; i < 2; i++)
             if (s->grad[i] == COLOR_CURRENT) s->grad[i] = s->color;

@@ -255,6 +255,6 @@ void web_presentation_style(web_doc *d,node_t *n,style_t *s){
     s->position=POS_FIXED;s->float_=FL_NONE;s->box_sizing=1;
     s->width=(len_t){.kind=LK_LEN,.pct=100};s->height=(len_t){.kind=LK_LEN,.pct=100};
     s->min_width=s->min_height=(len_t){.kind=LK_LEN};s->max_width=s->max_height=(len_t){.kind=LK_NONE};
-    s->transform=NULL;
+    s->transform=s->rotate=s->scale=NULL;
     for(unsigned i=0;i<4;i++){s->inset[i]=(len_t){.kind=LK_LEN};s->margin[i]=(len_t){.kind=LK_LEN};}
 }

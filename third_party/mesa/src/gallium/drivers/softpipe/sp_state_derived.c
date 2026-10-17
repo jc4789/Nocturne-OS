@@ -348,6 +348,9 @@ update_fragment_shader(struct softpipe_context *softpipe, unsigned prim)
                                     tgsi.sampler[MESA_SHADER_FRAGMENT],
                                     (struct tgsi_image *)softpipe->tgsi.image[MESA_SHADER_FRAGMENT],
                                     (struct tgsi_buffer *)softpipe->tgsi.buffer[MESA_SHADER_FRAGMENT]);
+#if DETECT_OS_NOCTURNE
+      softpipe->fs_bind_serial++;
+#endif
    }
    else {
       softpipe->fs_variant = NULL;

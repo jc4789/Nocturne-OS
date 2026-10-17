@@ -22,7 +22,8 @@ static box_t *nbox(struct bctx *b, int kind, node_t *n, style_t *st) {
     x->kind = (uint8_t)kind;
     x->node = n;
     x->st = st;
-    x->paint_alpha = kind != B_TEXT && kind != B_BR && st && st->opacity * (st->filter ? st->filter->opacity : 1) < 1;
+    x->paint_alpha = kind != B_TEXT && kind != B_BR && st && (st->opacity * (st->filter ? st->filter->opacity : 1) < 1 ||
+        (kind != B_INLINE && css_transform_general(st)));
     x->baseline = -1;
     x->colspan = x->rowspan = 1;
     return x;
@@ -351,6 +352,100 @@ static void svg_computed_style(sbuf *b, node_t *n, bool root) {
     sb_putc(b, '"');
 }
 
+/* ---- CSS transforms of SVG graphics (no CSS layout box): the reference box
+   is the nearest viewport's view box, or the object bounding box for
+   fill-box/stroke-box. Lengths are user units; a unit suffix is ignored. */
+static float svg_attr_number(node_t *n, const char *name, float fallback) {
+    const char *v = node_attr(n, name); float out;
+    if (!v) return fallback;
+    while (svg_space(*v)) v++;
+    return svg_number(&v, &out) ? out : fallback;
+}
+static void svg_bbox_add(float box[4], bool *any, float x, float y) {
+    if (!*any) { box[0] = box[2] = x; box[1] = box[3] = y; *any = true; return; }
+    box[0] = fminf(box[0], x); box[1] = fminf(box[1], y); box[2] = fmaxf(box[2], x); box[3] = fmaxf(box[3], y);
+}
+static bool svg_list_number(const char **p, float *v) {
+    while (svg_space(**p) || **p == ',') (*p)++;
+    return svg_number(p, v);
+}
+/* Bounds of a path's end and control points: never smaller than the curve. */
+static void svg_path_bbox(const char *d, float box[4], bool *any) {
+    static const char commands[] = "MLHVCSQTAZ";
+    static const unsigned char counts[] = {2, 2, 1, 1, 6, 4, 4, 2, 7, 0};
+    float cx = 0, cy = 0, sx = 0, sy = 0;
+    char command = 0;
+    for (const char *p = d; p && *p;) {
+        while (svg_space(*p) || *p == ',') p++;
+        if (!*p) break;
+        char upper = (char)(*p >= 'a' && *p <= 'z' ? *p - 32 : *p);
+        const char *slot = strchr(commands, upper);
+        if (slot && *slot) { command = *p++; if (upper == 'Z') { cx = sx; cy = sy; command = 0; } continue; }
+        if (!command) break;
+        char kind = (char)(command >= 'a' && command <= 'z' ? command - 32 : command);
+        bool relative = command != kind;
+        unsigned count = counts[strchr(commands, kind) - commands];
+        float a[7];
+        for (unsigned i = 0; i < count; i++) if (!svg_list_number(&p, &a[i])) return;
+        float ox = relative ? cx : 0, oy = relative ? cy : 0;
+        if (kind == 'H') { cx = a[0] + ox; svg_bbox_add(box, any, cx, cy); continue; }
+        if (kind == 'V') { cy = a[0] + oy; svg_bbox_add(box, any, cx, cy); continue; }
+        unsigned first = kind == 'A' ? 5 : 0;
+        for (unsigned i = first; i + 1 < count; i += 2) svg_bbox_add(box, any, a[i] + ox, a[i + 1] + oy);
+        cx = a[count - 2] + ox; cy = a[count - 1] + oy;
+        if (kind == 'M') { sx = cx; sy = cy; command = relative ? 'l' : 'L'; }
+    }
+}
+static void svg_fill_bbox(node_t *n, float box[4], bool *any, unsigned depth) {
+    if (!n || n->type != N_ELEM || depth > 32) return;
+    const char *name = n->name;
+    if (!strcmp(name, "rect") || !strcmp(name, "image") || !strcmp(name, "use") || !strcmp(name, "foreignobject")) {
+        float x = svg_attr_number(n, "x", 0), y = svg_attr_number(n, "y", 0);
+        svg_bbox_add(box, any, x, y);
+        svg_bbox_add(box, any, x + svg_attr_number(n, "width", 0), y + svg_attr_number(n, "height", 0));
+    } else if (!strcmp(name, "circle") || !strcmp(name, "ellipse")) {
+        float x = svg_attr_number(n, "cx", 0), y = svg_attr_number(n, "cy", 0);
+        float rx = svg_attr_number(n, name[0] == 'c' ? "r" : "rx", 0), ry = svg_attr_number(n, name[0] == 'c' ? "r" : "ry", 0);
+        svg_bbox_add(box, any, x - rx, y - ry); svg_bbox_add(box, any, x + rx, y + ry);
+    } else if (!strcmp(name, "line")) {
+        svg_bbox_add(box, any, svg_attr_number(n, "x1", 0), svg_attr_number(n, "y1", 0));
+        svg_bbox_add(box, any, svg_attr_number(n, "x2", 0), svg_attr_number(n, "y2", 0));
+    } else if (!strcmp(name, "polygon") || !strcmp(name, "polyline")) {
+        const char *p = node_attr(n, "points"); float x, y;
+        while (p && svg_list_number(&p, &x) && svg_list_number(&p, &y)) svg_bbox_add(box, any, x, y);
+    } else if (!strcmp(name, "path")) svg_path_bbox(node_attr(n, "d"), box, any);
+    else if (!strcmp(name, "g") || !strcmp(name, "a") || !strcmp(name, "switch"))
+        for (node_t *c = n->first; c; c = c->next) svg_fill_bbox(c, box, any, depth + 1);
+}
+/* The used CSS transform of an SVG graphic as a transform attribute value.
+   It replaces the transform presentation attribute (CSS Transforms 1, 4). */
+static bool svg_css_transform(node_t *n, char out[160]) {
+    const style_t *st = n->style;
+    if (!st || !css_translation_active(st)) return false;
+    float ref[4] = {0, 0, 0, 0};
+    if (st->transform_box == TB_FILL_BOX || st->transform_box == TB_STROKE_BOX) {
+        bool any = false; float box[4];
+        svg_fill_bbox(n, box, &any, 0);
+        if (any) { ref[0] = box[0]; ref[1] = box[1]; ref[2] = box[2] - box[0]; ref[3] = box[3] - box[1]; }
+        if (any && st->transform_box == TB_STROKE_BOX && st->svg_stroke.kind != SVG_PAINT_NONE && !st->svg_stroke_width.pct) {
+            float half = st->svg_stroke_width.px / 2;
+            ref[0] -= half; ref[1] -= half; ref[2] += 2 * half; ref[3] += 2 * half;
+        }
+    } else {
+        node_t *v = n->parent;
+        while (v && !(v->type == N_ELEM && v->namespace_id == NS_SVG && v->tag == T_svg)) v = v->parent;
+        if (v && svg_viewbox(node_attr(v, "viewBox"), ref) != 1) {
+            ref[0] = ref[1] = 0;
+            ref[2] = svg_attr_number(v, "width", v->box ? v->box->w : 0);
+            ref[3] = svg_attr_number(v, "height", v->box ? v->box->h : 0);
+        }
+    }
+    double m[6];
+    if (!css_style_transform_matrix(st, ref[0], ref[1], ref[2], ref[3], m)) return false;
+    snprintf(out, 160, "matrix(%.6g %.6g %.6g %.6g %.6g %.6g)", m[0], m[1], m[2], m[3], m[4], m[5]);
+    return true;
+}
+
 static void svg_open(sbuf *b, node_t *n, const char *color, int view, bool root, bool computed) {
     sb_putc(b, '<');
     sb_puts(b, n->raw_name);
@@ -360,6 +455,9 @@ static void svg_open(sbuf *b, node_t *n, const char *color, int view, bool root,
         snprintf(own_color, sizeof own_color, "#%06x", n->style->color & 0xffffff);
         color = own_color;
     }
+    /* The outermost <svg> is transformed as a CSS box by the painter. */
+    char css_transform[160];
+    bool transformed = computed && !root && svg_css_transform(n, css_transform);
     for (int i = 0; i < n->nattrs; i++) {
         const char *attribute_name = n->attrs[i].raw;
         const char *ns = n->attrs[i].namespace_uri, *local = n->attrs[i].local;
@@ -367,6 +465,7 @@ static void svg_open(sbuf *b, node_t *n, const char *color, int view, bool root,
            in an ordinary DOM attribute must not fabricate an XML/XLink one. */
         if (!ns && strchr(attribute_name, ':')) continue;
         if (computed && n->style && !ns && !strcmp(attribute_name, "style")) continue;
+        if (transformed && !ns && !strcmp(n->attrs[i].name, "transform")) continue;
         /* Lexbor already adjusted parsed SVG names. Preserve DOM spelling and
            never serialize arbitrary namespaced fill/viewBox as ordinary SVG. */
         if (ns) {
@@ -395,6 +494,7 @@ static void svg_open(sbuf *b, node_t *n, const char *color, int view, bool root,
         }
         sb_putc(b, '"');
     }
+    if (transformed) { sb_puts(b, " transform=\""); sb_puts(b, css_transform); sb_putc(b, '"'); }
     if (computed) svg_computed_style(b, n, root);
     if (root) {
         if (!xmlns) sb_puts(b, " xmlns=\"http://www.w3.org/2000/svg\"");
@@ -455,8 +555,14 @@ static bool svg_ser(web_doc *d, sbuf *b, node_t *root, const char *color) {
                 if (!strcmp(t->name, "symbol")) { child->kind = 3; child->next = t->first; }
                 sb_puts(b, "<g");
                 const char *x = node_attr(n, "x"), *y = node_attr(n, "y");
-                if (x || y) {
-                    sb_puts(b, " transform=\"translate(");
+                /* The use element's transform precedes its x/y translation. */
+                char css_transform[160];
+                bool transformed = !f->instance && svg_css_transform(n, css_transform);
+                const char *own = transformed ? css_transform : node_attr(n, "transform");
+                if (x || y || own) {
+                    sb_puts(b, " transform=\"");
+                    if (own) { xml_escape(b, own, strlen(own), true); sb_putc(b, ' '); }
+                    sb_puts(b, "translate(");
                     xml_escape(b, x ? x : "0", strlen(x ? x : "0"), true);
                     sb_putc(b, ' ');
                     xml_escape(b, y ? y : "0", strlen(y ? y : "0"), true);
@@ -492,6 +598,7 @@ pop:
 }
 
 struct svg_cache *doc_svg(web_doc *d, node_t *svg, uint32_t color) {
+    svg->svg_snapshot_dirty = false;
     struct svg_cache *cached = NULL;
     for (int i = 0; i < d->svgs.n; i++) {
         struct svg_cache *c = d->svgs.v[i];
@@ -658,7 +765,7 @@ static box_t *wrapped(struct bctx *b, node_t *n, style_t *st, int inner_kind) {
     style_t *is = ar_alloc(b->a, sizeof *is);
     *is = *st;
     is->filter = NULL; is->opacity = 1; /* the element's outer group composites once */
-    is->transform=NULL;memset(&is->translate,0,sizeof is->translate);
+    is->transform=is->rotate=is->scale=NULL;memset(&is->translate,0,sizeof is->translate);
     is->display = inner_kind == B_TABLE ? D_TABLE : inner_kind == B_GRID ? D_GRID : D_FLEX;
     for (int i = 0; i < 4; i++) {
         is->margin[i].kind = LK_LEN;
@@ -1015,7 +1122,7 @@ static bool local_plain_parent(web_doc *d,node_t *n,struct local_box_subject *su
     box_t *p=n?n->box:NULL;
     if(!p || p->node!=n || p->kind!=B_BLOCK || p->inline_ctx || !p->layout_post_valid ||
        !local_plain_style(n->style) || n->shadow_root || n->assigned_slot ||
-       n->style->overflow!=OV_VISIBLE || n->style->filter || n->style->transform || n->style->translate.active ||
+       n->style->overflow!=OV_VISIBLE || n->style->filter || css_translation_active(n->style) ||
        doc_node_root(n,false)!=d->root)return false;
     /* In-flow intrinsic sizing of a flex/grid/table/inline ancestor is outside
        this independent formatting boundary. Keep its ordinary full rebuild. */
@@ -1183,7 +1290,7 @@ static bool restyle_derived(box_t *b, style_t *old) {
     } else {
         next.display=b->kind == B_TABLE ? D_TABLE : b->kind == B_GRID ? D_GRID : D_FLEX;
         next.filter=NULL; next.opacity=1;
-        next.transform=NULL;memset(&next.translate,0,sizeof next.translate);
+        next.transform=next.rotate=next.scale=NULL;memset(&next.translate,0,sizeof next.translate);
         for (int i=0;i<4;i++) {
             next.margin[i].kind=LK_LEN; next.margin[i].px=next.margin[i].pct=0;
         }
@@ -1227,12 +1334,21 @@ static void restyle_boxes(box_t *b,bool inherited_borrow) {
         deco->st=replacement_style(deco->node?deco->node:fallback,deco->st);
     }
     b->paint_alpha = b->kind != B_TEXT && b->kind != B_BR && b->st &&
-        b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1) < 1;
+        (b->st->opacity * (b->st->filter ? b->st->filter->opacity : 1) < 1 || box_transformed(b));
     for (box_t *c = b->first; c; c = c->next) { restyle_boxes(c,inherited_borrow||own_borrow); b->paint_alpha |= c->paint_alpha; }
     b->style_sync_dirty=false;
 }
 void boxes_restyle(web_doc *d) {
     restyle_boxes(d->root_box,false);
+    bool all=__atomic_exchange_n(&d->svg_snapshots_dirty,false,__ATOMIC_RELAXED);
+    for (int i = 0; i < d->svgs.n; i++) {
+        struct svg_cache *cache = d->svgs.v[i];
+        node_t *n = cache->node;
+        box_t *b = n ? n->box : NULL;
+        if (!b || b->node != n || b->atomic != AT_SVG || b->svg != cache) continue;
+        if (!all && !n->svg_snapshot_dirty) continue;
+        b->svg = doc_svg(d, n, b->st->color); /* same cache entry; raster dropped only on new source */
+    }
     /* Geometry reuse does not mean hit/paint reuse: opacity, visibility and
        pointer-events can change with a native effect and no DOM revision. */
     d->visual_revision++;d->style_revision++;d->paint_order_valid=false;
@@ -1254,6 +1370,7 @@ bool boxes_update_text(web_doc *d, node_t *n) {
 void boxes_build(web_doc *d, arena_t *a) {
     struct bctx b = {.d=d, .a=a};
     for (int i = 0; i < d->svgs.n; i++) ((struct svg_cache *)d->svgs.v[i])->used = false;
+    d->svg_snapshots_dirty = false; /* every boxed <svg> below is serialized afresh */
     if (d->root) clear_boxes(d->root);
     box_t *root = nbox(&b, B_BLOCK, NULL, anon_style(&b, NULL, D_BLOCK));
     root->anon = true;
