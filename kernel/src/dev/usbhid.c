@@ -107,29 +107,52 @@ static void key_report(struct hid *h, uint8_t report, const uint8_t *data, unsig
     }
     if (!any) return;
     for (int w = 0; w < 8; w++) now_down[w] &= ~covered[w];
+    uint32_t bitmap[8] = {0}; /* usages the variable (bitmap) fields of this report decide */
     for (int i = 0; i < h->nkeys; i++) {
         struct keyfield *k = &h->keys[i];
-        if (k->report != report) continue;
+        if (k->report != report || !k->variable) continue;
         for (unsigned e = 0; e < k->count; e++) {
-            unsigned bit = k->bit + e * k->size;
-            if (k->variable) {
-                if (bits_at(data, len, bit, k->size) && k->usage_min + e < 256) set_down(now_down, k->usage_min + e);
-                continue;
-            }
-            int32_t v = signed_at(data, len, bit, k->size, k->min < 0);
+            unsigned u = k->usage_min + e;
+            if (u >= 256) break;
+            bitmap[u >> 5] |= 1u << (u & 31);
+            if (bits_at(data, len, k->bit + e * k->size, k->size)) set_down(now_down, u);
+        }
+    }
+    for (int i = 0; i < h->nkeys; i++) {
+        struct keyfield *k = &h->keys[i];
+        if (k->report != report || k->variable) continue;
+        bool phantom = false;
+        for (unsigned e = 0; e < k->count && !phantom; e++) {
+            int32_t v = signed_at(data, len, k->bit + e * k->size, k->size, k->min < 0);
+            phantom = v >= k->min && k->usage_min + (v - k->min) == 1;
+        }
+        if (phantom) {
+            /* ErrorRollOver: too many keys held to tell which (HID Usage Tables 10). The array
+             * keeps its previous keys, while the modifier bitmap beside it is still exact. */
+            for (unsigned u = k->usage_min; u <= k->usage_max && u < 256; u++)
+                if (!is_down(bitmap, u) && is_down(h->down, u)) set_down(now_down, u);
+            continue;
+        }
+        for (unsigned e = 0; e < k->count; e++) {
+            int32_t v = signed_at(data, len, k->bit + e * k->size, k->size, k->min < 0);
             unsigned u = (unsigned)(k->usage_min + (v - k->min));
-            if (u == 1) return; /* phantom state: too many keys held, keep the previous one */
             if (v >= k->min && u >= 4 && u <= k->usage_max && u < 256) set_down(now_down, u);
         }
     }
+    /* a modifier pressed in the same report as a key applies to it, and one released in the same
+     * report as a key still applied to it: modifier presses first, then key releases and key
+     * presses, then modifier releases */
     uint64_t now = uptime_ms();
-    for (unsigned u = 0; u < 256; u++) /* releases first, then presses */
-        if (is_down(h->down, u) && !is_down(now_down, u)) {
-            send_usage(u, false);
-            if (u == h->repeat_usage) h->repeat_usage = 0;
-        }
+    for (unsigned u = 0xE0; u < 0xE8; u++)
+        if (!is_down(h->down, u) && is_down(now_down, u)) send_usage(u, true);
     for (unsigned u = 0; u < 256; u++)
-        if (!is_down(h->down, u) && is_down(now_down, u)) {
+        if (u < 0xE0 || u >= 0xE8)
+            if (is_down(h->down, u) && !is_down(now_down, u)) {
+                send_usage(u, false);
+                if (u == h->repeat_usage) h->repeat_usage = 0;
+            }
+    for (unsigned u = 0; u < 256; u++)
+        if ((u < 0xE0 || u >= 0xE8) && !is_down(h->down, u) && is_down(now_down, u)) {
             send_usage(u, true);
             if (u == 0x39) {
                 caps_lock = !caps_lock;
@@ -140,6 +163,8 @@ static void key_report(struct hid *h, uint8_t report, const uint8_t *data, unsig
                 h->repeat_at = now + REPEAT_DELAY;
             }
         }
+    for (unsigned u = 0xE0; u < 0xE8; u++)
+        if (is_down(h->down, u) && !is_down(now_down, u)) send_usage(u, false);
     memcpy(h->down, now_down, sizeof now_down);
 }
 
@@ -156,24 +181,38 @@ static int scale_abs(const struct value *v, int32_t raw) {
     return (int)((int64_t)(raw - v->min) * MOUSE_ABS_MAX / (v->max - v->min));
 }
 
+/* Buttons, motion and wheel may each come in a report of their own (HID 1.11 5.6): a report
+ * updates what it carries, and buttons it does not carry keep their last state. */
 static void mouse_report(struct hid *h, uint8_t report, const uint8_t *data, unsigned len) {
-    if (!h->x.present || h->x.report != report) return;
     struct mouse_event e = {0};
-    for (int i = 0; i < 8; i++)
-        if (h->button[i].present && h->button[i].report == report && bits_at(data, len, h->button[i].bit, 1))
-            e.buttons |= 1u << i;
-    e.buttons &= 7;
-    int32_t x = value_of(&h->x, data, len), y = h->y.present ? value_of(&h->y, data, len) : 0;
-    if (h->x.relative) {
-        e.dx = x;
-        e.dy = y;
-    } else {
-        e.absolute = true;
-        e.x = scale_abs(&h->x, x);
-        e.y = h->y.present ? scale_abs(&h->y, y) : 0;
+    bool any = false;
+    uint8_t buttons = h->buttons;
+    for (int i = 0; i < 8; i++) {
+        if (!h->button[i].present || h->button[i].report != report) continue;
+        any = true;
+        if (bits_at(data, len, h->button[i].bit, 1)) buttons |= 1u << i;
+        else buttons &= ~(1u << i);
     }
-    if (h->wheel.present && h->wheel.report == report) e.wheel = -value_of(&h->wheel, data, len);
-    h->buttons = e.buttons;
+    e.buttons = buttons & 7;
+    if (h->x.present && h->x.report == report) {
+        any = true;
+        bool has_y = h->y.present && h->y.report == report;
+        int32_t x = value_of(&h->x, data, len), y = has_y ? value_of(&h->y, data, len) : 0;
+        if (h->x.relative) {
+            e.dx = x;
+            e.dy = y;
+        } else {
+            e.absolute = true;
+            e.x = scale_abs(&h->x, x);
+            e.y = has_y ? scale_abs(&h->y, y) : 0;
+        }
+    }
+    if (h->wheel.present && h->wheel.report == report) {
+        any = true;
+        e.wheel = -value_of(&h->wheel, data, len);
+    }
+    if (!any) return;
+    h->buttons = buttons;
     uint64_t f = irq_save();
     input_mouse(&e);
     irq_restore(f);

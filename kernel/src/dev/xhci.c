@@ -38,6 +38,7 @@ enum {
 #define CC_SHORT 13
 #define CC_STOPPED 26
 #define CC_STOPPED_LENGTH 27
+#define CC_STOPPED_SHORT 28
 /* endpoint states in the output endpoint context */
 #define EP_RUNNING 1
 #define EP_HALTED 2
@@ -137,6 +138,7 @@ struct xdev {
     struct endpoint *ep[32]; /* by device context index */
     unsigned hub_ports, think_time;
     bool hub, multi_tt;
+    bool ctl_broken; /* the control ring could not be restarted: nothing more may be queued on it */
 };
 
 struct usb_hc {
@@ -150,6 +152,9 @@ struct usb_hc {
     struct ring cmd;
     struct trb *ev;
     uint64_t ev_phys;
+    uint64_t *erst;
+    uint64_t erst_phys, scratch_phys; /* kept across a restart, like the rings */
+    unsigned restarts;
     unsigned ev_idx;
     uint32_t ev_cycle;
     volatile bool cmd_done;
@@ -200,6 +205,21 @@ static void *dma_page(uint64_t *phys) {
     if (!p) return NULL;
     *phys = p;
     return phys_to_virt(p);
+}
+
+/* `pages` (at most 16) contiguous zeroed pages inside one 64 KiB block: no xHCI structure of up
+ * to 64 KiB may span such a boundary (6.0, Table 6-1). Twice the run always holds one that fits;
+ * the pages around it go back. */
+static void *dma_block(unsigned pages, uint64_t *phys) {
+    uint64_t base = pmm_alloc_contig(pages * 2ull);
+    if (!base) return NULL;
+    uint64_t start = base, boundary = (base | 0xFFFF) + 1;
+    if (base + pages * 4096ull > boundary) start = boundary;
+    for (uint64_t p = base; p < base + pages * 2 * 4096ull; p += 4096)
+        if (p < start || p >= start + pages * 4096ull) pmm_free(p);
+    memset(phys_to_virt(start), 0, pages * 4096ull);
+    *phys = start;
+    return phys_to_virt(start);
 }
 
 static bool ring_init(struct ring *r) {
@@ -295,7 +315,7 @@ static void transfer_event(struct usb_hc *hc, uint64_t param, uint32_t status, u
     }
     struct endpoint *ep = xd->ep[dci];
     if (!ep || !ep->mode || ep->dead || param < ep->ring.phys || param >= ep->ring.phys + 4096) return;
-    if (cc == CC_STOPPED || cc == CC_STOPPED_LENGTH) return; /* our own Stop Endpoint */
+    if (cc == CC_STOPPED || cc == CC_STOPPED_LENGTH || cc == CC_STOPPED_SHORT) return; /* our own Stop Endpoint */
     unsigned idx = (unsigned)((param - ep->ring.phys) / sizeof(struct trb));
     struct trb_meta m = idx < RING_TRBS - 1 ? ep->meta[idx] : (struct trb_meta){0};
     unsigned b = m.td - 1u;
@@ -413,7 +433,16 @@ static void xhci_isr(struct regs *r) {
     wq_wake_all(&usb_wq);
 }
 
+/* Stopped, halted by a fatal error, or gone from the bus (reads all ones): nothing it is given
+ * would complete, so nobody should wait for it. */
+static bool hc_dead(struct usb_hc *hc) {
+    if (!hc->running) return true;
+    uint32_t sts = rd32(hc->op, USBSTS);
+    return sts == 0xFFFFFFFFu || (sts & (STS_HSE | STS_HCE));
+}
+
 static int hc_command(struct usb_hc *hc, uint64_t param, uint32_t control, uint8_t *slot) {
+    if (hc_dead(hc)) return -1;
     hc->cmd_done = false;
     hc->cmd_trb = ring_push(&hc->cmd, param, 0, control);
     doorbell(hc, 0, 0);
@@ -469,11 +498,19 @@ static bool endpoint_recover(struct xdev *xd, unsigned dci, struct ring *r) {
     return cc == CC_SUCCESS;
 }
 
+/* After a failed control transfer the ring's dequeue point is wherever the controller stopped;
+ * if it cannot be moved past the dead TD, a new request would run behind it or never at all. */
+static void control_recover(struct xdev *xd) {
+    if (xd->dev.removed || endpoint_recover(xd, 1, &xd->ep0)) return;
+    xd->ctl_broken = true;
+    kprintf("usb: slot %u control pipe is stuck, the device needs replugging\n", xd->dev.slot);
+}
+
 int usb_control(struct usb_device *d, uint8_t type, uint8_t request, uint16_t value, uint16_t index,
                 void *buffer, uint16_t length) {
     struct xdev *xd = (struct xdev *)d;
     struct usb_hc *hc = d->hc;
-    if (d->removed || length > 4096) return -1;
+    if (d->removed || xd->ctl_broken || length > 4096 || hc_dead(hc)) return -1;
     bool in = type & 0x80;
     if (!in && length) memcpy(xd->xfer, buffer, length);
     uint64_t setup = type | (uint64_t)request << 8 | (uint64_t)value << 16 | (uint64_t)index << 32 |
@@ -486,11 +523,11 @@ int usb_control(struct usb_device *d, uint8_t type, uint8_t request, uint16_t va
     doorbell(hc, d->slot, 1);
     if (!hc_wait(&xd->ctl_done, 2000)) {
         kprintf("usb: slot %u request %02x:%02x timed out\n", d->slot, type, request);
-        endpoint_recover(xd, 1, &xd->ep0);
+        control_recover(xd);
         return -1;
     }
     if (xd->ctl_cc != CC_SUCCESS) {
-        endpoint_recover(xd, 1, &xd->ep0);
+        control_recover(xd);
         return -1;
     }
     int got = length - (int)(xd->ctl_residual < length ? xd->ctl_residual : length);
@@ -550,7 +587,8 @@ static void free_device(struct xdev *xd) {
 /* The controller owns the device context and rings until Disable Slot completes; if it never
  * does, the memory stays allocated rather than handed back while the controller may still use it. */
 static void release_slot(struct usb_hc *hc, unsigned slot, struct xdev *xd) {
-    int cc = hc_command(hc, 0, TRB_TYPE(TRB_DISABLE_SLOT) | (uint32_t)slot << 24, NULL);
+    /* a controller stopped for a restart holds nothing of its old slots any more */
+    int cc = hc->running ? hc_command(hc, 0, TRB_TYPE(TRB_DISABLE_SLOT) | (uint32_t)slot << 24, NULL) : CC_SUCCESS;
     hc->slots[slot] = NULL;
     if (cc != CC_SUCCESS) {
         kprintf("usb: slot %u could not be disabled (%d), its memory is kept\n", slot, cc);
@@ -713,15 +751,18 @@ int usb_clear_halt(struct usb_device *d, uint8_t address) {
     struct endpoint *ep = find_endpoint(d, address);
     if (!ep) return -1;
     bool ok = endpoint_reset((struct xdev *)d, ep);
-    int r = usb_control(d, 0x02, USB_REQ_CLEAR_FEATURE, 0, address, NULL, 0);
+    /* the device keeps its halt (and data toggle) until CLEAR_FEATURE gets through; until both
+     * sides are reset the pipe stays halted and transfers are refused */
+    ok = usb_control(d, 0x02, USB_REQ_CLEAR_FEATURE, 0, address, NULL, 0) >= 0 && ok;
     if (ok) ep->halted = false;
-    return ok && r >= 0 ? 0 : -1;
+    return ok ? 0 : -1;
 }
 
 int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, unsigned timeout_ms) {
     struct xdev *xd = (struct xdev *)d;
     struct endpoint *ep = find_endpoint(d, address);
-    if (!ep || current_task != usb_task || ep->type != 2 || (ep->mode && ep->mode != EP_SYNC) || len > SYNC_BYTES)
+    if (!ep || current_task != usb_task || ep->type != 2 || (ep->mode && ep->mode != EP_SYNC) || len > SYNC_BYTES ||
+        hc_dead(d->hc))
         return -1;
     if (!ep->mode) {
         if (!endpoint_buffer(ep, SYNC_BYTES, 1)) return -1;
@@ -801,7 +842,7 @@ static void bind_classes(struct xdev *xd, uint8_t *cfg, unsigned total) {
             if (cur.intf && cur.ep && n < 8) claims[n++] = cur;
             const struct usb_interface_desc *intf = (const void *)(cfg + off);
             bool want = intf->alternate == 0 &&
-                        ((intf->cls == 9 && d->speed < USB_SPEED_SUPER) || usbhid_claims(intf));
+                        (intf->cls == 9 || usbhid_claims(intf));
             cur = (struct claim){want ? intf : NULL, cfg + off + len, 0, NULL, NULL};
             last_ep = NULL;
         } else if (type == USB_DESC_ENDPOINT && len >= 7 && cur.intf && !cur.ep) {
@@ -818,13 +859,21 @@ static void bind_classes(struct xdev *xd, uint8_t *cfg, unsigned total) {
     }
     if (cur.intf && cur.ep && n < 8) claims[n++] = cur;
     if (!n) return;
-    for (int i = 0; i < n; i++)
-        if (claims[i].intf->cls == 9 && !usbhub_prepare(d)) claims[i].intf = NULL;
+    bool hub = false; /* a device is one hub: a second hub interface would share its state */
+    for (int i = 0; i < n; i++) {
+        if (claims[i].intf->cls != 9) continue;
+        if (hub || !usbhub_prepare(d)) claims[i].intf = NULL;
+        else hub = true;
+    }
     struct usb_ep_info eps[8];
     int neps = 0;
     for (int i = 0; i < n; i++)
         if (claims[i].intf) endpoint_info(claims[i].ep, claims[i].companion, &eps[neps++]);
-    if (!neps || !open_endpoints(xd, eps, neps)) return;
+    if (!neps) return;
+    if (!open_endpoints(xd, eps, neps)) {
+        kprintf("usb: slot %u endpoints could not be opened, its hub and input functions stay off\n", d->slot);
+        return;
+    }
     for (int i = 0; i < n && !d->removed; i++) {
         if (!claims[i].intf) continue;
         if (claims[i].intf->cls == 9) usbhub_attach(d, claims[i].ep);
@@ -837,7 +886,7 @@ static bool configuration_supported(const struct usb_device *d, const uint8_t *c
     for (unsigned off = 0; off + 2 <= total && cfg[off] >= 2; off += cfg[off]) {
         if (cfg[off + 1] != USB_DESC_INTERFACE || cfg[off] < 9 || off + 9 > total) continue;
         const struct usb_interface_desc *intf = (const void *)(cfg + off);
-        if ((intf->cls == 9 && d->speed < USB_SPEED_SUPER) || usbhid_claims(intf) || usbmsc_claims(intf) ||
+        if (intf->cls == 9 || usbhid_claims(intf) || usbmsc_claims(intf) ||
             usbnet_claims(intf))
             return true;
     }
@@ -935,9 +984,16 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
     kprintf("usb: %04x:%04x class %02x on controller %d port %u%s, %s speed, slot %u\n", d->desc.vendor,
             d->desc.product, d->desc.cls, hc->index, root_port, via, speed_name(speed), slot);
     int got = 0;
-    uint8_t *cfg = choose_configuration(d, &got);
-    if (!cfg || usb_control(d, 0, USB_REQ_SET_CONFIG, cfg[5], 0, NULL, 0) < 0) {
+    uint8_t *cfg = NULL;
+    /* devices still busy after reset (or slow to fetch their descriptors) answer a moment later */
+    for (int attempt = 0; attempt < 3 && !d->removed && !xd->ctl_broken; attempt++) {
+        if (attempt) sleep_ms(100 << attempt);
+        if ((cfg = choose_configuration(d, &got)) && usb_control(d, 0, USB_REQ_SET_CONFIG, cfg[5], 0, NULL, 0) >= 0)
+            break;
         kfree(cfg);
+        cfg = NULL;
+    }
+    if (!cfg) {
         kprintf("usb: slot %u could not be configured\n", slot);
         return xd; /* stays addressed so a disconnect still frees it */
     }
@@ -1053,8 +1109,9 @@ static void hc_work(struct usb_hc *hc) {
                 continue;
             }
             bool ok = endpoint_recover(xd, i, &ep->ring);
-            /* the device keeps its own halt and data toggle until told: CLEAR_FEATURE(ENDPOINT_HALT) */
-            if (ok) usb_control(&xd->dev, 0x02, USB_REQ_CLEAR_FEATURE, 0, ep->address, NULL, 0);
+            /* the device keeps its own halt and data toggle until told: CLEAR_FEATURE(ENDPOINT_HALT);
+             * if that does not get through, the pipe is still halted and is retried later */
+            if (ok) ok = usb_control(&xd->dev, 0x02, USB_REQ_CLEAR_FEATURE, 0, ep->address, NULL, 0) >= 0;
             if (xd->dev.removed) break;
             /* fails counts recoveries until a transfer succeeds again; each one waits twice as long */
             if (++ep->fails >= 8) {
@@ -1110,11 +1167,13 @@ static bool hc_start(struct usb_hc *hc) {
         return false;
     }
     /* extended capabilities: take the controller from the firmware, learn each port's USB revision */
-    for (unsigned x = (hcc1 >> 16) << 2, guard = 0; x && x + 12 <= size && guard < 64; guard++) {
+    for (unsigned x = (hcc1 >> 16) << 2, guard = 0; x && x + 16 <= size && guard < 64; guard++) {
         uint32_t v = rd32(hc->cap, x);
         if ((v & 0xFF) == 1) {
             if (v & (1u << 16)) {
-                wr32(hc->cap, x, v | 1u << 24);
+                /* only the OS semaphore byte: a whole-register write could put back a BIOS bit
+                 * the firmware cleared in between */
+                *(volatile uint8_t *)(hc->cap + x + 3) = 1;
                 if (!wait_reg(hc->cap, x, 1u << 16, 0, 1000))
                     kprintf("usb: controller %d firmware kept ownership, taking it anyway\n", hc->index);
             }
@@ -1132,8 +1191,17 @@ static bool hc_start(struct usb_hc *hc) {
         if (!next) break;
         x += next << 2;
     }
+    /* no operational register may be written before Controller Not Ready clears (4.2), and a
+     * reset is only allowed once the controller has halted (5.4.1) */
+    if (!wait_reg(hc->op, USBSTS, STS_CNR, 0, 1000)) {
+        kprintf("usb: controller %d never became ready\n", hc->index);
+        return false;
+    }
     wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~1u);
-    wait_reg(hc->op, USBSTS, STS_HCH, STS_HCH, 50);
+    if (!wait_reg(hc->op, USBSTS, STS_HCH, STS_HCH, 50)) {
+        kprintf("usb: controller %d did not halt\n", hc->index);
+        return false;
+    }
     wr32(hc->op, USBCMD, 2);
     sleep_ms(2);
     if (!wait_reg(hc->op, USBCMD, 2, 0, 1000) || !wait_reg(hc->op, USBSTS, STS_CNR, 0, 1000)) {
@@ -1146,34 +1214,46 @@ static bool hc_start(struct usb_hc *hc) {
         return false;
     }
     if (bar > size) vmm_map_mmio(base, bar > (16u << 20) ? 16u << 20 : bar);
-    if (!(hc->dcbaa = dma_page(&hc->dcbaa_phys)) || !ring_init(&hc->cmd)) return false;
-    if (!(hc->ev_phys = pmm_alloc_contig(EV_PAGES))) return false;
-    hc->ev = phys_to_virt(hc->ev_phys);
-    memset(hc->ev, 0, EV_PAGES * 4096);
+    /* a restart after a fatal error reuses the memory: the reset took it back from the controller */
+    if (hc->dcbaa) memset(hc->dcbaa, 0, 4096);
+    else if (!(hc->dcbaa = dma_page(&hc->dcbaa_phys))) return false;
+    if (hc->cmd.trb) {
+        memset(hc->cmd.trb, 0, 4096);
+        hc->cmd.enq = 0;
+        hc->cmd.cycle = 1;
+        hc->cmd.trb[RING_TRBS - 1].param = hc->cmd.phys;
+        hc->cmd.trb[RING_TRBS - 1].control = TRB_TYPE(TRB_LINK) | TRB_TC;
+    } else if (!ring_init(&hc->cmd)) {
+        return false;
+    }
+    /* the event ring segment must not cross a 64 KiB boundary (6.0, Table 6-1) */
+    if (hc->ev) memset(hc->ev, 0, EV_PAGES * 4096);
+    else if (!(hc->ev = dma_block(EV_PAGES, &hc->ev_phys))) return false;
     unsigned scratch = ((hcs2 >> 21) & 0x1F) << 5 | hcs2 >> 27;
-    if (scratch) { /* up to 1023 entries: the pointer array may need two contiguous pages */
-        uint64_t array_phys = pmm_alloc_contig(2), page;
-        if (!array_phys) return false;
-        uint64_t *array = phys_to_virt(array_phys);
-        memset(array, 0, 2 * 4096);
+    if (scratch && !hc->scratch_phys) { /* up to 1023 entries: the pointer array may need two pages */
+        uint64_t array_phys, page;
+        uint64_t *array = dma_block(2, &array_phys);
+        if (!array) return false;
         for (unsigned i = 0; i < scratch; i++) {
             if (!dma_page(&page)) return false;
             array[i] = page;
         }
-        hc->dcbaa[0] = array_phys;
+        hc->scratch_phys = array_phys;
     }
-    uint64_t erst_phys;
-    uint64_t *erst = dma_page(&erst_phys);
-    if (!erst) return false;
-    erst[0] = hc->ev_phys;
-    erst[1] = EV_TRBS;
+    hc->dcbaa[0] = hc->scratch_phys;
+    if (!hc->erst && !(hc->erst = dma_page(&hc->erst_phys))) return false;
+    hc->erst[0] = hc->ev_phys;
+    hc->erst[1] = EV_TRBS;
+    hc->ev_idx = 0;
     hc->ev_cycle = 1;
+    hc->events = hc->interrupts = 0;
+    hc->irq_seen = false;
     wr32(hc->op, CONFIG, (rd32(hc->op, CONFIG) & ~0xFFu) | hc->max_slots);
     wr64(hc->op, DCBAAP, hc->dcbaa_phys);
     wr64(hc->op, CRCR, hc->cmd.phys | 1);
     wr32(hc->rt, ERSTSZ, 1);
     wr64(hc->rt, ERDP, hc->ev_phys);
-    wr64(hc->rt, ERSTBA, erst_phys);
+    wr64(hc->rt, ERSTBA, hc->erst_phys);
     wr32(hc->rt, IMOD, 1000); /* at most one interrupt per 250 us */
     hc->vector = VEC_XHCI + hc->index;
     vector_register(hc->vector, xhci_isr);
@@ -1197,6 +1277,32 @@ static bool hc_start(struct usb_hc *hc) {
     kprintf("usb: xHCI %d (%04x:%04x) version %x, %u ports, %u slots, %s\n", hc->index, pci->vendor, pci->device,
             rd32(hc->cap, 0) >> 16, hc->max_ports, hc->max_slots, hc->vector ? "MSI" : "polled");
     return true;
+}
+
+/* A Host System Error or Host Controller Error stops the controller for good (4.24.1, 5.4.2) and
+ * every device with it: reset it so it lets go of memory, have the drivers drop their devices,
+ * then bring it up again and enumerate from scratch. A controller that keeps failing is left off. */
+static void hc_restart(struct usb_hc *hc) {
+    hc->running = false;
+    wr32(hc->op, USBCMD, rd32(hc->op, USBCMD) & ~(1u | CMD_INTE));
+    wait_reg(hc->op, USBSTS, STS_HCH, STS_HCH, 50);
+    wr32(hc->op, USBCMD, 2);
+    sleep_ms(2);
+    wait_reg(hc->op, USBCMD, 2, 0, 1000);
+    for (unsigned p = 1; p <= hc->max_ports; p++) {
+        struct xdev *gone = hc->root[p];
+        hc->root[p] = NULL;
+        if (gone) usb_remove(&gone->dev);
+    }
+    for (unsigned s = 1; s <= hc->max_slots; s++)
+        if (hc->slots[s]) usb_remove(&hc->slots[s]->dev);
+    hc->recover = false;
+    if (++hc->restarts > 3) {
+        kprintf("usb: controller %d keeps failing, left off\n", hc->index);
+        return;
+    }
+    kprintf("usb: controller %d restarting (attempt %u)\n", hc->index, hc->restarts);
+    if (hc_start(hc)) hc->failed = false;
 }
 
 static void run_calls(void) {
@@ -1288,10 +1394,11 @@ static void usb_thread(void *arg) {
                 hc->vector = 0;
             }
             uint32_t sts = hc->running ? rd32(hc->op, USBSTS) : 0;
-            if ((sts & (STS_HSE | STS_HCE)) && !hc->failed) {
+            if ((sts & (STS_HSE | STS_HCE)) && sts != 0xFFFFFFFFu && !hc->failed) { /* all ones: gone from the bus */
                 hc->failed = true;
                 kprintf("usb: controller %d stopped on a %s error (status %08x)\n", hc->index,
                         sts & STS_HCE ? "controller" : "host system", sts);
+                hc_restart(hc);
             }
             hc_work(hc);
         }

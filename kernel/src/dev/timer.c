@@ -63,7 +63,8 @@ int64_t rtc_read_unix(void) {
         year = bcd(year);
         century = bcd(century);
     }
-    if (!(b & 0x02) && (hour & 0x80)) hour = ((hour & 0x7F) + 12) % 24;
+    /* 12-hour mode counts 12, 1 .. 11 with bit 7 for PM: 12 AM is hour 0 and 12 PM is hour 12 */
+    if (!(b & 0x02)) hour = (hour & 0x7F) % 12 + (hour & 0x80 ? 12 : 0);
     hour &= 0x7F;
     int full_year = (century >= 19 && century <= 30) ? century * 100 + year : 2000 + year;
     return days_from_civil(full_year, mon, day) * 86400 + hour * 3600 + min * 60 + sec;
