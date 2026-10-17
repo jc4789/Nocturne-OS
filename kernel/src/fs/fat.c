@@ -1007,6 +1007,30 @@ static void mount_fs(struct fat_fs *fs, const char *path, const char *label) {
             (uint64_t)fs->nclus * fs->spc / 2048, fs->cbytes / 1024, path);
 }
 
+/* GUID Partition Table (UEFI spec, chapter 5): the starts of the basic data partitions, where
+   a FAT volume formatted on a GPT disk lives. */
+static int gpt_starts(struct blkdev *d, uint64_t *starts, int max) {
+    static const uint8_t basic_data[16] = {0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44,
+                                           0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7};
+    uint8_t s[SECTOR];
+    if (blk_read(d, 1, 1, s) < 0 || memcmp(s, "EFI PART", 8)) return 0;
+    uint64_t table = *(uint64_t *)(s + 72);
+    uint32_t entries = *(uint32_t *)(s + 80), size = *(uint32_t *)(s + 84);
+    if (size < 128 || size > SECTOR || (size & (size - 1)) || table < 2 || table >= d->sectors) return 0;
+    if (entries > 256) entries = 256;
+    int n = 0;
+    uint64_t loaded = 0;
+    for (uint32_t e = 0; e < entries && n < max; e++) {
+        uint64_t lba = table + (uint64_t)e * size / SECTOR;
+        if (lba != loaded && blk_read(d, lba, 1, s) < 0) break;
+        loaded = lba;
+        const uint8_t *p = s + (e * size) % SECTOR;
+        uint64_t first = *(const uint64_t *)(p + 32);
+        if (!memcmp(p, basic_data, 16) && first && first < d->sectors) starts[n++] = first;
+    }
+    return n;
+}
+
 void fat_mount_data(void) {
     for (int i = 0; i < blk_count(); i++) {
         struct blkdev *d = blk_get(i);
@@ -1015,14 +1039,19 @@ void fat_mount_data(void) {
             kprintf("fat: %s: cannot read the partition table\n", d->name);
             continue;
         }
-        uint64_t starts[5];
+        uint64_t starts[13];
         int ns = 0;
+        bool gpt = false;
         starts[ns++] = 0; /* superfloppy */
         if (mbr[510] == 0x55 && mbr[511] == 0xAA)
             for (int p = 0; p < 4; p++) {
                 uint8_t type = mbr[446 + p * 16 + 4];
                 uint32_t start = *(uint32_t *)(mbr + 446 + p * 16 + 8);
                 if ((type == 0x0B || type == 0x0C || type == 0x07) && start) starts[ns++] = start;
+                if (type == 0xEE && !gpt) { /* protective MBR */
+                    gpt = true;
+                    ns += gpt_starts(d, starts + ns, 8);
+                }
             }
         for (int s = 0; s < ns; s++) {
             char label[12];
@@ -1032,6 +1061,7 @@ void fat_mount_data(void) {
                 mount_fs(fs, "/data", label);
                 return;
             }
+            kprintf("fat: %s: volume \"%s\" at sector %lu is not NOCTDATA\n", d->name, label, starts[s]);
             fcache_forget(fs);
             kfree(fs);
         }

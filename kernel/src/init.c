@@ -19,6 +19,7 @@ extern const char *kernel_cmdline;
 void acpi_init(void);
 void net_init(void);
 void fat_mount_data(void);
+void nvme_init(void);
 void rdp_init(void);
 
 /* text-mode keyboard: translate key events into terminal byte sequences */
@@ -79,6 +80,8 @@ void kmain_late(void) {
     audio_init();
     ata_init();
     storvsc_init();
+    nvme_init();
+    usb_wait_settled(8000); /* USB disks present at boot can hold /data */
     fat_mount_data();
 
     bool gui = !cmdline_has("nogui");

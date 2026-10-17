@@ -1,0 +1,460 @@
+/* NVM Express SSDs (NVMe base specification 1.4c and 2.x, PCIe transport): one admin queue pair
+   and one I/O queue pair per controller, one command in flight at a time, data through a bounce
+   buffer. Every active namespace with plain 512..4096-byte blocks (no metadata, no protection
+   information) becomes a block device "nvmeN". Completions arrive by MSI/MSI-X, or are polled
+   when the platform offers neither. */
+#include "kernel.h"
+#include "arch/cpu.h"
+#include "dev/blk.h"
+#include "dev/pci.h"
+#include "mm/heap.h"
+#include "mm/pmm.h"
+#include "mm/vmm.h"
+#include "sys/sched.h"
+
+#define MAX_CTRL 4
+#define MAX_NS 8
+#define VEC_NVME 0x48 /* MSI vectors 0x48.. one per controller (xHCI owns 0x40..0x47) */
+#define ADMIN_ENTRIES 32
+#define IO_ENTRIES 64
+#define XFER_PAGES 32 /* bounce buffer: 128 KiB, described by PRP1 and one PRP list page */
+#define ADMIN_MS 5000
+#define IO_MS 30000
+
+/* controller registers */
+#define CAP 0x00
+#define VS 0x08
+#define CC 0x14
+#define CSTS 0x1C
+#define AQA 0x24
+#define ASQ 0x28
+#define ACQ 0x30
+#define CRTO 0x68
+#define CSTS_RDY 1u
+#define CSTS_CFS 2u
+
+/* admin and NVM command opcodes */
+#define OP_CREATE_SQ 0x01
+#define OP_CREATE_CQ 0x05
+#define OP_IDENTIFY 0x06
+#define OP_SET_FEATURES 0x09
+#define OP_FLUSH 0x00
+#define OP_WRITE 0x01
+#define OP_READ 0x02
+
+#define FAILED (-1) /* timeout or a dead controller; command errors return the status field */
+
+struct queue {
+    uint8_t *sq;
+    uint64_t sq_phys;
+    volatile uint32_t *cq;
+    uint64_t cq_phys;
+    uint16_t qid, size, tail, head;
+    uint8_t phase;
+};
+
+struct nvme {
+    int index;
+    struct pci_device *pci;
+    volatile uint8_t *regs;
+    unsigned stride, ready_ms, max_xfer;
+    uint32_t rtd3e;
+    struct queue admin, io;
+    uint8_t vector;
+    volatile bool kick;
+    struct wait_queue wq;
+    bool busy, live, vwc;
+    struct wait_queue idle;
+    uint16_t cid;
+    uint8_t *data;
+    uint64_t data_phys;
+    uint64_t *prp;
+    uint64_t prp_phys;
+};
+
+struct ns {
+    struct blkdev blk;
+    struct nvme *c;
+    uint32_t nsid;
+    unsigned block;
+};
+
+static struct nvme ctrls[MAX_CTRL];
+static int nctrls, ndisks;
+
+static uint32_t rd32(struct nvme *c, unsigned off) { return *(volatile uint32_t *)(c->regs + off); }
+static void wr32(struct nvme *c, unsigned off, uint32_t v) { *(volatile uint32_t *)(c->regs + off) = v; }
+static uint64_t rd64(struct nvme *c, unsigned off) { return rd32(c, off) | (uint64_t)rd32(c, off + 4) << 32; }
+static void wr64(struct nvme *c, unsigned off, uint64_t v) { /* low half first */
+    wr32(c, off, (uint32_t)v);
+    wr32(c, off + 4, (uint32_t)(v >> 32));
+}
+static void doorbell(struct nvme *c, uint16_t qid, bool cq, uint16_t v) {
+    wr32(c, 0x1000 + (2u * qid + (cq ? 1 : 0)) * c->stride, v);
+}
+
+/* The boot task (later the idle task) has no stack of its own to sleep on: it halts until the
+   next interrupt instead and lets the other kernel threads run. */
+static void nap(struct nvme *c, unsigned ms) {
+    if (!current_task->kstack) {
+        sti();
+        hlt();
+        schedule();
+        return;
+    }
+    uint64_t f = irq_save();
+    if (!c || !c->kick) wq_wait_timeout(c ? &c->wq : NULL, ms);
+    if (c) c->kick = false;
+    irq_restore(f);
+}
+
+static void nvme_isr(struct regs *r) {
+    for (int i = 0; i < nctrls; i++) {
+        struct nvme *c = &ctrls[i];
+        if (c->vector != r->vector) continue;
+        c->kick = true;
+        wq_wake_all(&c->wq);
+    }
+}
+
+static void lock(struct nvme *c) {
+    uint64_t f = irq_save();
+    while (c->busy) {
+        irq_restore(f);
+        if (!current_task->kstack) {
+            sti();
+            hlt();
+            schedule();
+        } else {
+            f = irq_save();
+            if (c->busy) wq_wait_timeout(&c->idle, 100);
+            irq_restore(f);
+        }
+        f = irq_save();
+    }
+    c->busy = true;
+    irq_restore(f);
+}
+
+static void unlock(struct nvme *c) {
+    c->busy = false;
+    wq_wake_all(&c->idle);
+}
+
+static bool queue_init(struct queue *q, uint16_t qid, uint16_t size) {
+    q->qid = qid;
+    q->size = size;
+    if (!q->sq) {
+        if (!(q->sq_phys = pmm_alloc_contig(1)) || !(q->cq_phys = pmm_alloc_contig(1))) return false;
+        q->sq = phys_to_virt(q->sq_phys);
+        q->cq = phys_to_virt(q->cq_phys);
+    }
+    /* completion entries start with phase 0, the controller's first pass writes 1 */
+    memset(q->sq, 0, 4096);
+    memset((void *)q->cq, 0, 4096);
+    q->tail = q->head = 0;
+    q->phase = 1;
+    return true;
+}
+
+/* Submit one command and wait for its completion. Returns 0, the 15-bit status field of a failed
+   command, or FAILED when the controller stopped answering. */
+static int command(struct nvme *c, struct queue *q, uint32_t cmd[16], unsigned timeout_ms, uint32_t *result) {
+    if (!c->live) return FAILED;
+    c->cid = (uint16_t)((c->cid + 1) & 0x7FFF);
+    cmd[0] = (cmd[0] & 0xFFFF) | (uint32_t)c->cid << 16; /* PRPs, not fused */
+    memcpy(q->sq + q->tail * 64u, cmd, 64);
+    q->tail = (uint16_t)((q->tail + 1) % q->size);
+    __sync_synchronize();
+    doorbell(c, q->qid, false, q->tail);
+    uint64_t end = uptime_ms() + timeout_ms;
+    for (;;) {
+        volatile uint32_t *e = q->cq + q->head * 4u;
+        uint32_t dw3 = e[3];
+        if (((dw3 >> 16) & 1) == q->phase) {
+            __sync_synchronize();
+            uint32_t dw0 = e[0];
+            if (++q->head == q->size) {
+                q->head = 0;
+                q->phase ^= 1;
+            }
+            doorbell(c, q->qid, true, q->head);
+            if ((dw3 & 0xFFFF) != c->cid) continue; /* a late answer to a command given up on */
+            if (result) *result = dw0;
+            return (int)(dw3 >> 17 & 0x7FFF);
+        }
+        uint32_t csts = rd32(c, CSTS);
+        if (csts == 0xFFFFFFFFu || (csts & CSTS_CFS)) {
+            kprintf("nvme%d: controller %s\n", c->index, csts == 0xFFFFFFFFu ? "vanished" : "reported a fatal error");
+            c->live = false;
+            return FAILED;
+        }
+        if (uptime_ms() >= end) {
+            kprintf("nvme%d: command %02x on queue %u timed out\n", c->index, cmd[0] & 0xFF, q->qid);
+            return FAILED;
+        }
+        nap(c, c->vector ? 10 : 1);
+    }
+}
+
+static bool wait_ready(struct nvme *c, bool ready) {
+    uint64_t end = uptime_ms() + c->ready_ms;
+    for (;;) {
+        uint32_t csts = rd32(c, CSTS);
+        if (csts == 0xFFFFFFFFu) return false;
+        if (ready && (csts & CSTS_CFS)) return false;
+        if (!!(csts & CSTS_RDY) == ready) return true;
+        if (uptime_ms() >= end) return false;
+        nap(NULL, 1);
+    }
+}
+
+/* Reset the controller and bring up the admin and I/O queue pairs (section 7.6.1). Also the way
+   back after a command timed out: the reset aborts whatever was outstanding. */
+static bool enable(struct nvme *c) {
+    c->live = false;
+    uint32_t cc = rd32(c, CC);
+    if (cc & 1) {
+        wait_ready(c, true); /* EN may only fall once RDY followed it up */
+        wr32(c, CC, cc & ~1u);
+    }
+    if (!wait_ready(c, false)) {
+        kprintf("nvme%d: controller did not reset\n", c->index);
+        return false;
+    }
+    uint64_t cap = rd64(c, CAP);
+    unsigned entries = (unsigned)(cap & 0xFFFF) + 1;
+    if (!queue_init(&c->admin, 0, ADMIN_ENTRIES) || !queue_init(&c->io, 1, MIN(IO_ENTRIES, entries))) return false;
+    wr32(c, AQA, (ADMIN_ENTRIES - 1u) << 16 | (ADMIN_ENTRIES - 1u));
+    wr64(c, ASQ, c->admin.sq_phys);
+    wr64(c, ACQ, c->admin.cq_phys);
+    /* NVM command set, 4 KiB pages, round robin, 64-byte SQ and 16-byte CQ entries */
+    wr32(c, CC, 1u | 6u << 16 | 4u << 20);
+    if (!wait_ready(c, true)) {
+        kprintf("nvme%d: controller did not become ready (status %x)\n", c->index, rd32(c, CSTS));
+        return false;
+    }
+    c->live = true;
+    uint32_t cmd[16] = {OP_SET_FEATURES}, got;
+    cmd[10] = 0x07; /* Number of Queues: one submission and one completion queue (0-based) */
+    int r = command(c, &c->admin, cmd, ADMIN_MS, &got);
+    if (r) goto fail;
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = OP_CREATE_CQ;
+    *(uint64_t *)&cmd[6] = c->io.cq_phys;
+    cmd[10] = (uint32_t)(c->io.size - 1) << 16 | 1;
+    cmd[11] = (c->vector ? 2u : 0u) | 1u; /* vector 0, interrupts on when we have one, contiguous */
+    if ((r = command(c, &c->admin, cmd, ADMIN_MS, NULL))) goto fail;
+    memset(cmd, 0, sizeof cmd);
+    cmd[0] = OP_CREATE_SQ;
+    *(uint64_t *)&cmd[6] = c->io.sq_phys;
+    cmd[10] = (uint32_t)(c->io.size - 1) << 16 | 1;
+    cmd[11] = 1u << 16 | 1u; /* completion queue 1, contiguous */
+    if ((r = command(c, &c->admin, cmd, ADMIN_MS, NULL))) goto fail;
+    return true;
+fail:
+    kprintf("nvme%d: setting up the I/O queues failed (%x)\n", c->index, r);
+    c->live = false;
+    return false;
+}
+
+static int identify(struct nvme *c, uint32_t cns, uint32_t nsid) {
+    uint32_t cmd[16] = {OP_IDENTIFY};
+    cmd[1] = nsid;
+    *(uint64_t *)&cmd[6] = c->data_phys;
+    cmd[10] = cns;
+    memset(c->data, 0, 4096);
+    return command(c, &c->admin, cmd, ADMIN_MS, NULL);
+}
+
+/* Describe `bytes` of the bounce buffer: the first page in PRP1, then the second page or a list. */
+static void set_prps(struct nvme *c, uint32_t cmd[16], unsigned bytes) {
+    unsigned pages = (bytes + 4095) / 4096;
+    uint64_t prp2 = 0;
+    if (pages == 2) prp2 = c->data_phys + 4096;
+    else if (pages > 2) {
+        for (unsigned i = 1; i < pages; i++) c->prp[i - 1] = c->data_phys + i * 4096ull;
+        prp2 = c->prp_phys;
+    }
+    *(uint64_t *)&cmd[6] = c->data_phys;
+    *(uint64_t *)&cmd[8] = prp2;
+}
+
+/* Read or write `n` logical blocks between the device and the bounce buffer. */
+static int transfer(struct ns *s, bool write, uint64_t lba, unsigned n) {
+    struct nvme *c = s->c;
+    for (int attempt = 0;; attempt++) {
+        uint32_t cmd[16] = {write ? OP_WRITE : OP_READ};
+        cmd[1] = s->nsid;
+        set_prps(c, cmd, n * s->block);
+        cmd[10] = (uint32_t)lba;
+        cmd[11] = (uint32_t)(lba >> 32);
+        cmd[12] = n - 1;
+        int r = command(c, &c->io, cmd, IO_MS, NULL);
+        if (!r) return 0;
+        if (attempt == 2) return -1;
+        if (r == FAILED) {
+            if (!c->live || !enable(c)) return -1; /* a timeout: reset and reissue */
+            continue;
+        }
+        unsigned sct = (unsigned)r >> 8 & 7, sc = (unsigned)r & 0xFF;
+        kprintf("nvme%d: %s of block %lu failed (type %u code %02x)\n", c->index, write ? "write" : "read", lba, sct, sc);
+        if (r & 0x4000 || sct == 2) return -1; /* do not retry, or a media error */
+    }
+}
+
+static int flush(struct ns *s) {
+    uint32_t cmd[16] = {OP_FLUSH};
+    cmd[1] = s->nsid;
+    return command(s->c, &s->c->io, cmd, IO_MS, NULL) ? -1 : 0;
+}
+
+/* 512-byte sectors on top of the namespace's logical blocks; larger blocks are read, patched and
+   written back when a request covers them only partly. */
+static int rw(struct ns *s, bool write, uint64_t lba, uint32_t count, uint8_t *p) {
+    struct nvme *c = s->c;
+    if (lba + count > s->blk.sectors) return -N_ERR_IO;
+    lock(c);
+    int result = -N_ERR_IO;
+    unsigned per = s->block / 512, most = c->max_xfer / s->block;
+    while (count) {
+        uint64_t first = lba / per;
+        unsigned off = (unsigned)(lba % per) * 512, want = count * 512u;
+        unsigned n = (off + want + s->block - 1) / s->block;
+        if (n > most) n = most;
+        unsigned take = n * s->block - off;
+        if (take > want) take = want;
+        if (write) {
+            if ((off || take < n * s->block) && transfer(s, false, first, n) < 0) goto out;
+            memcpy(c->data + off, p, take);
+            if (transfer(s, true, first, n) < 0) goto out;
+        } else {
+            if (transfer(s, false, first, n) < 0) goto out;
+            memcpy(p, c->data + off, take);
+        }
+        lba += take / 512;
+        count -= take / 512;
+        p += take;
+    }
+    /* like the other disk drivers, a write is on the medium when it returns */
+    result = write && c->vwc && flush(s) < 0 ? -N_ERR_IO : 0;
+out:
+    unlock(c);
+    return result;
+}
+
+static int blk_nvme_read(struct blkdev *b, uint64_t lba, uint32_t n, void *buf) { return rw(b->priv, false, lba, n, buf); }
+static int blk_nvme_write(struct blkdev *b, uint64_t lba, uint32_t n, const void *buf) {
+    return rw(b->priv, true, lba, n, (uint8_t *)buf);
+}
+
+static void add_namespace(struct nvme *c, uint32_t nsid, const char *model) {
+    if (identify(c, 0, nsid)) return;
+    const uint8_t *id = c->data;
+    uint64_t blocks = *(const uint64_t *)id;
+    if (!blocks) return; /* inactive */
+    unsigned format = id[26] & 0xF;
+    uint32_t lbaf = *(const uint32_t *)(id + 128 + 4 * format);
+    unsigned shift = lbaf >> 16 & 0xFF, metadata = lbaf & 0xFFFF, protection = id[29] & 7;
+    if (metadata || protection || shift < 9 || shift > 12) {
+        kprintf("nvme%d: namespace %u uses %u-byte blocks with %u bytes of metadata, skipped\n", c->index, nsid,
+                shift < 32 ? 1u << shift : 0, metadata);
+        return;
+    }
+    struct ns *s = kzalloc(sizeof *s);
+    if (!s) return;
+    s->c = c;
+    s->nsid = nsid;
+    s->block = 1u << shift;
+    ksnprintf(s->blk.name, sizeof s->blk.name, "nvme%d", ndisks++);
+    strlcpy(s->blk.model, model, sizeof s->blk.model);
+    s->blk.sectors = blocks * (s->block / 512);
+    s->blk.read = blk_nvme_read;
+    s->blk.write = blk_nvme_write;
+    s->blk.priv = s;
+    blk_register(&s->blk);
+}
+
+static void start(struct nvme *c) {
+    struct pci_device *pci = c->pci;
+    uint64_t base = pci_bar_address(pci, 0);
+    if (!base) {
+        kprintf("nvme%d: no register window\n", c->index);
+        return;
+    }
+    pci_enable_busmaster(pci);
+    c->regs = vmm_map_mmio(base, 0x4000); /* registers and the doorbells of the first queue pairs */
+    uint64_t cap = rd64(c, CAP);
+    c->stride = 4u << (cap >> 32 & 0xF);
+    unsigned to = (unsigned)(cap >> 24 & 0xFF);
+    if (cap >> 59 & 3) { /* 2.x ready modes: CRTO may be longer than CAP.TO can say */
+        unsigned crwmt = rd32(c, CRTO) & 0xFFFF;
+        if (crwmt > to) to = crwmt;
+    }
+    c->ready_ms = to * 500 < 2000 ? 2000 : to * 500;
+    if (!(cap >> 37 & 1) || (cap >> 48 & 0xF)) {
+        kprintf("nvme%d: no NVM command set or no 4 KiB pages (capabilities %lx), skipped\n", c->index, cap);
+        return;
+    }
+    if (!(c->data_phys = pmm_alloc_contig(XFER_PAGES)) || !(c->prp_phys = pmm_alloc_contig(1))) return;
+    c->data = phys_to_virt(c->data_phys);
+    c->prp = phys_to_virt(c->prp_phys);
+    c->vector = (uint8_t)(VEC_NVME + c->index);
+    vector_register(c->vector, nvme_isr);
+    if (!pci_msi_enable(pci, c->vector)) c->vector = 0;
+    if (!enable(c)) return;
+
+    if (identify(c, 1, 0)) {
+        kprintf("nvme%d: identify failed\n", c->index);
+        return;
+    }
+    const uint8_t *id = c->data;
+    char model[41];
+    unsigned n = 0;
+    for (int i = 24; i < 64 && n < sizeof model - 1; i++) {
+        char ch = id[i] >= 0x20 && id[i] < 0x7F ? (char)id[i] : ' ';
+        if (ch == ' ' && (!n || model[n - 1] == ' ')) continue;
+        model[n++] = ch;
+    }
+    while (n && model[n - 1] == ' ') n--;
+    model[n] = 0;
+    unsigned mdts = id[77];
+    c->max_xfer = XFER_PAGES * 4096;
+    if (mdts && mdts < 6 && (4096u << mdts) < c->max_xfer) c->max_xfer = 4096u << mdts;
+    c->vwc = id[525] & 1;
+    c->rtd3e = *(const uint32_t *)(id + 88);
+    uint32_t count = *(const uint32_t *)(id + 516), nsids[MAX_NS];
+    unsigned found = 0;
+    kprintf("nvme%d: %s (%04x:%04x), version %x, %u namespaces, %s%s\n", c->index, model, pci->vendor, pci->device,
+            rd32(c, VS), count, c->vector ? "MSI" : "polled", c->vwc ? ", write cache" : "");
+    if (!identify(c, 2, 0)) /* active namespace list */
+        for (const uint32_t *l = (const uint32_t *)c->data; found < MAX_NS && found < 1024 && l[found]; found++)
+            nsids[found] = l[found];
+    else /* NVMe 1.0 lacks the list: try the first ones */
+        for (uint32_t i = 1; i <= count && found < MAX_NS; i++) nsids[found++] = i;
+    for (unsigned i = 0; i < found; i++) add_namespace(c, nsids[i], model);
+}
+
+void nvme_init(void) {
+    for (int i = 0; i < pci_count() && nctrls < MAX_CTRL; i++) {
+        struct pci_device *p = pci_at(i);
+        if (p->cls != 0x01 || p->subcls != 0x08 || p->progif != 0x02) continue;
+        struct nvme *c = &ctrls[nctrls];
+        c->index = nctrls++;
+        c->pci = p;
+        start(c);
+    }
+}
+
+/* Normal shutdown notification before power goes away (section 7.6.2): the controller writes its
+   cache back and the drive does not count an unsafe shutdown. Interrupts are already off. */
+void nvme_shutdown(void) {
+    for (int i = 0; i < nctrls; i++) {
+        struct nvme *c = &ctrls[i];
+        if (!c->live) continue;
+        wr32(c, CC, (rd32(c, CC) & ~0xC000u) | 0x4000u);
+        uint64_t us = c->rtd3e < 1000000 ? 1000000 : c->rtd3e > 10000000 ? 10000000 : c->rtd3e;
+        for (uint64_t t = 0; t < us && (rd32(c, CSTS) >> 2 & 3) != 2; t++) io_wait(); /* ~1 us each */
+        c->live = false;
+    }
+}

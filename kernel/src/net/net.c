@@ -2136,8 +2136,26 @@ static void net_thread(void *arg) {
     }
 }
 
+static bool net_initialized;
+
+static void net_start(void) {
+#if NET_HANDOFF_DIAG
+    net_diag_thread=kthread_create("net", net_thread, NULL);
+#else
+    kthread_create("net", net_thread, NULL);
+#endif
+    dhcp_start();
+}
+
+/* Adapters found by net_init's probes register before it starts the stack; a USB adapter may
+   arrive later, and when it is the first one the stack starts with it. */
 void net_register(struct netif *n) {
-    if (!nif) nif = n;
+    if (nif) return;
+    nif = n;
+    if (net_initialized) {
+        kprintf("net: %s adapter arrived\n", n->driver);
+        net_start();
+    }
 }
 
 static void tcp_buffer_configure(void) {
@@ -2169,16 +2187,13 @@ static void tcp_buffer_configure(void) {
 void net_init(void) {
     dns_configure();
     tcp_buffer_configure();
-    if (!netvsc_probe() && !e1000_probe() && !tulip_probe()) {
-        kprintf("net: no supported network card\n");
+    bool found = netvsc_probe() || e1000_probe() || tulip_probe();
+    net_initialized = true;
+    if (!found || !nif) {
+        kprintf("net: no supported network card yet\n");
         return;
     }
-#if NET_HANDOFF_DIAG
-    net_diag_thread=kthread_create("net", net_thread, NULL);
-#else
-    kthread_create("net", net_thread, NULL);
-#endif
-    dhcp_start();
+    net_start();
 }
 
 void net_process_exit(int pid) {

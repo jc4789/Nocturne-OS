@@ -84,13 +84,38 @@ struct ring {
     uint32_t cycle;
 };
 
+#define EP_XFERS 16        /* transfers one endpoint keeps in flight */
+#define SYNC_BYTES 0x10000 /* usb_bulk's bounce buffer */
+
+/* What a ring entry belongs to: transfer td-1 of the endpoint, queued in generation gen. An
+ * event names a ring entry, and the generation tells a late event of a finished transfer from
+ * the transfer that reuses its buffer. */
+struct trb_meta {
+    uint8_t td, last; /* last: the entry whose completion finishes the transfer */
+    uint16_t gen;
+    uint32_t before; /* bytes of the transfer in the entries before this one */
+};
+
+enum { EP_STREAM = 1, EP_SYNC, EP_SEND };
+
 struct endpoint {
     struct ring ring;
-    uint8_t dci, address;
-    uint8_t *buf;
+    uint8_t dci, address, type, mode; /* type: bmAttributes & 3 */
+    unsigned mps, esit;
+    uint8_t *buf; /* contiguous DMA area: `count` transfers `stride` bytes apart */
     uint64_t buf_phys;
-    unsigned len;           /* bytes per transfer: one service interval's payload (Max ESIT Payload) */
-    unsigned stride, count; /* buffer spacing and how many transfers stay queued */
+    unsigned pages;
+    unsigned len;           /* bytes per transfer (streams: one interrupt service interval's payload) */
+    unsigned stride, count;
+    uint32_t busy;          /* transfers in flight */
+    uint16_t gen[EP_XFERS];
+    uint8_t trbs[EP_XFERS];
+    unsigned inflight;      /* ring entries in use */
+    unsigned next;          /* send: the slot to try first */
+    struct trb_meta meta[RING_TRBS];
+    volatile bool sync_done;
+    uint8_t sync_cc;
+    unsigned sync_got;
     usb_report_fn fn;
     void *ctx;
     bool halted, dead;
@@ -147,6 +172,18 @@ static struct wait_queue usb_wq;
 static volatile bool usb_kick; /* wakes whichever wait runs; nested waits consume it */
 static volatile bool usb_more; /* work for the main loop; only the main loop clears it */
 static uint64_t usb_deadline;  /* earliest endpoint recovery retry (0 = none) */
+static struct task *usb_task;
+static volatile bool usb_settled; /* the first pass over every port and hub is done */
+
+/* work other tasks hand to the usb thread (usb_run) */
+struct usb_call {
+    void (*fn)(void *arg);
+    void *arg;
+    volatile bool done;
+    struct usb_call *next;
+};
+static struct usb_call *calls, **calls_tail = &calls;
+static struct wait_queue calls_wq;
 
 static inline uint32_t rd32(volatile uint8_t *b, unsigned off) { return *(volatile uint32_t *)(b + off); }
 static inline void wr32(volatile uint8_t *b, unsigned off, uint32_t v) { *(volatile uint32_t *)(b + off) = v; }
@@ -197,10 +234,50 @@ static void doorbell(struct usb_hc *hc, unsigned slot, unsigned target) {
 
 /* ---- events ---- */
 
-/* A transfer ends at a short packet or once `len` bytes arrived, so `len` must be one interval's
- * payload: a longer TRB would gather several full-size reports into one completion. */
-static void endpoint_queue(struct endpoint *ep, unsigned i) {
-    ring_push(&ep->ring, ep->buf_phys + i * ep->stride, ep->len, TRB_TYPE(TRB_NORMAL) | TRB_IOC | TRB_ISP);
+/* Room on the ring for `trbs` more entries? One stays free so a full ring is never mistaken
+ * for an empty one, and the link entry is not usable. */
+static bool ring_room(const struct endpoint *ep, unsigned trbs) { return ep->inflight + trbs <= RING_TRBS - 2; }
+
+/* Queue transfer b: `len` bytes of its buffer as one TD (xHCI 4.11.2), chained wherever a 64 KiB
+ * boundary falls (no TRB buffer may span one), and if `zlp`, a zero-length TD after it that
+ * ends a transfer of whole packets. A transfer ends at a short packet or after `len` bytes. */
+static void endpoint_push(struct endpoint *ep, unsigned b, unsigned len, bool zlp) {
+    uint64_t at = ep->buf_phys + (uint64_t)b * ep->stride;
+    unsigned done = 0, packets = (len + ep->mps - 1) / ep->mps, trbs = 0;
+    bool in = ep->address & 0x80;
+    for (;;) {
+        unsigned chunk = len - done, room = 0x10000 - (unsigned)((at + done) & 0xFFFF);
+        if (chunk > room) chunk = room;
+        bool last = done + chunk == len;
+        unsigned left = last ? 0 : packets - (done + chunk) / ep->mps; /* TD Size, 4.11.2.4 */
+        ep->meta[ep->ring.enq] = (struct trb_meta){(uint8_t)(b + 1), last && !zlp, ep->gen[b], done};
+        uint32_t control = TRB_TYPE(TRB_NORMAL) | (in ? TRB_ISP : 0) | (!last ? TRB_CH : zlp ? 0 : TRB_IOC);
+        ring_push(&ep->ring, at + done, chunk | (left > 31 ? 31u : left) << 17, control);
+        trbs++;
+        done += chunk;
+        if (last) break;
+    }
+    if (zlp) {
+        ep->meta[ep->ring.enq] = (struct trb_meta){(uint8_t)(b + 1), 1, ep->gen[b], len};
+        ring_push(&ep->ring, 0, 0, TRB_TYPE(TRB_NORMAL) | TRB_IOC);
+        trbs++;
+    }
+    ep->trbs[b] = (uint8_t)trbs;
+    ep->inflight += trbs;
+    ep->busy |= 1u << b;
+}
+
+/* Every transfer of the endpoint is gone: after a halt or an abort moved the ring past them. */
+static void endpoint_forget(struct endpoint *ep) {
+    for (unsigned b = 0; b < EP_XFERS; b++)
+        if (ep->busy & (1u << b)) ep->gen[b]++;
+    ep->busy = 0;
+    ep->inflight = 0;
+}
+
+static void endpoint_requeue_all(struct usb_hc *hc, struct xdev *xd, struct endpoint *ep) {
+    for (unsigned b = 0; b < ep->count; b++) endpoint_push(ep, b, ep->len, false);
+    doorbell(hc, xd->dev.slot, ep->dci);
 }
 
 static void transfer_event(struct usb_hc *hc, uint64_t param, uint32_t status, uint32_t control) {
@@ -217,9 +294,23 @@ static void transfer_event(struct usb_hc *hc, uint64_t param, uint32_t status, u
         return;
     }
     struct endpoint *ep = xd->ep[dci];
-    if (!ep || !ep->fn || ep->dead || param < ep->ring.phys || param >= ep->ring.phys + 4096) return;
+    if (!ep || !ep->mode || ep->dead || param < ep->ring.phys || param >= ep->ring.phys + 4096) return;
     if (cc == CC_STOPPED || cc == CC_STOPPED_LENGTH) return; /* our own Stop Endpoint */
+    unsigned idx = (unsigned)((param - ep->ring.phys) / sizeof(struct trb));
+    struct trb_meta m = idx < RING_TRBS - 1 ? ep->meta[idx] : (struct trb_meta){0};
+    unsigned b = m.td - 1u;
+    bool live = m.td && b < EP_XFERS && (ep->busy & (1u << b)) && m.gen == ep->gen[b];
     if (cc != CC_SUCCESS && cc != CC_SHORT) {
+        /* the endpoint halted on this TD (xHCI 4.10.2): the ring stays put until recovered */
+        if (ep->mode == EP_SYNC) {
+            if (!live) return;
+            endpoint_forget(ep);
+            ep->halted = true;
+            ep->sync_cc = (uint8_t)cc;
+            ep->sync_got = 0;
+            ep->sync_done = true;
+            return;
+        }
         if (!ep->halted && !ep->fails)
             kprintf("usb: slot %u endpoint %u failed (completion %u), resetting it\n", slot, dci, cc);
         ep->halted = true;
@@ -227,14 +318,25 @@ static void transfer_event(struct usb_hc *hc, uint64_t param, uint32_t status, u
         usb_more = usb_kick = true;
         return;
     }
-    if (ep->halted) return; /* stale completion from before the halt */
-    uint64_t buf = ep->ring.trb[(param - ep->ring.phys) / sizeof(struct trb)].param;
-    if (buf < ep->buf_phys || buf >= ep->buf_phys + 4096) return;
+    /* a short packet ends the TD on any entry (and the controller skips the rest of it);
+     * otherwise only the last entry's completion counts */
+    if (!live || ep->halted || (cc == CC_SUCCESS && !m.last)) return;
+    unsigned trb_len = ep->ring.trb[idx].status & 0x1FFFF, residual = status & 0xFFFFFF;
+    unsigned got = m.before + (residual < trb_len ? trb_len - residual : 0);
+    if (got > ep->len) got = ep->len;
+    ep->busy &= ~(1u << b);
+    ep->gen[b]++;
+    ep->inflight -= ep->trbs[b];
     ep->fails = 0;
-    unsigned residual = status & 0xFFFFFF, len = residual < ep->len ? ep->len - residual : 0;
-    ep->fn(&xd->dev, ep->ctx, phys_to_virt(buf), len);
-    if (xd->dev.removed || ep->halted) return;
-    endpoint_queue(ep, (unsigned)((buf - ep->buf_phys) / ep->stride));
+    if (ep->mode == EP_SYNC) {
+        ep->sync_cc = (uint8_t)cc;
+        ep->sync_got = got;
+        ep->sync_done = true;
+        return;
+    }
+    if (ep->fn) ep->fn(&xd->dev, ep->ctx, ep->buf + (size_t)b * ep->stride, got);
+    if (ep->mode != EP_STREAM || xd->dev.removed || ep->halted) return;
+    endpoint_push(ep, b, ep->len, false);
     doorbell(hc, slot, dci);
 }
 
@@ -406,15 +508,34 @@ static unsigned endpoint_interval(unsigned speed, unsigned interval) {
     return log < 3 ? 3 : log > 10 ? 10 : log;
 }
 
-static unsigned endpoint_dci(const struct usb_endpoint_desc *e) {
-    return (e->address & 15) * 2 + ((e->address & 0x80) ? 1 : 0);
-}
+static unsigned address_dci(uint8_t address) { return (address & 15) * 2 + ((address & 0x80) ? 1 : 0); }
 
 static void free_endpoint(struct endpoint *ep) {
     if (!ep) return;
     if (ep->ring.trb) pmm_free(ep->ring.phys);
-    if (ep->buf) pmm_free(ep->buf_phys);
+    for (unsigned i = 0; ep->buf && i < ep->pages; i++) pmm_free(ep->buf_phys + i * 4096ull);
     kfree(ep);
+}
+
+/* The DMA area for `count` transfers of `len` bytes, 64-byte aligned each. */
+static bool endpoint_buffer(struct endpoint *ep, unsigned len, unsigned count) {
+    if (ep->buf) return ep->len >= len && ep->count >= count;
+    if (!len || !count || count > EP_XFERS) return false;
+    unsigned stride = (len + 63) & ~63u, pages = (stride * count + 4095) / 4096;
+    uint64_t phys = pmm_alloc_contig(pages);
+    if (!phys) return false;
+    ep->buf = phys_to_virt(phys);
+    memset(ep->buf, 0, pages * 4096ull);
+    ep->buf_phys = phys;
+    ep->pages = pages;
+    ep->len = len;
+    ep->stride = stride;
+    ep->count = count;
+    return true;
+}
+
+static struct endpoint *find_endpoint(struct usb_device *d, uint8_t address) {
+    return d->removed ? NULL : ((struct xdev *)d)->ep[address_dci(address)];
 }
 
 static void free_device(struct xdev *xd) {
@@ -455,46 +576,75 @@ struct claim {
     const uint8_t *companion; /* SuperSpeed endpoint companion descriptor, if any */
 };
 
-/* Interrupt IN endpoints of the claimed interfaces become device contexts. */
-static bool configure_endpoints(struct xdev *xd, const struct claim *claims, int n) {
+static void endpoint_info(const struct usb_endpoint_desc *e, const uint8_t *companion, struct usb_ep_info *out) {
+    *out = (struct usb_ep_info){.address = e->address, .attributes = e->attributes, .interval = e->interval,
+                                .max_packet = e->max_packet};
+    if (companion) {
+        out->burst = companion[2];
+        out->esit = (uint16_t)(companion[4] | companion[5] << 8);
+    }
+}
+
+bool usb_endpoint_info(const uint8_t *cfg, unsigned total, unsigned off, struct usb_ep_info *ep) {
+    if (off + 7 > total || cfg[off] < 7 || cfg[off + 1] != USB_DESC_ENDPOINT) return false;
+    unsigned next = off + cfg[off];
+    const uint8_t *companion = next + 6 <= total && cfg[next] >= 6 && cfg[next + 1] == USB_DESC_COMPANION
+                                   ? cfg + next : NULL;
+    endpoint_info((const void *)(cfg + off), companion, ep);
+    return true;
+}
+
+/* Fill endpoint context dci for `ep` in the input context. */
+static void endpoint_context(struct xdev *xd, const struct endpoint *ep, unsigned interval, unsigned burst) {
+    uint32_t *c = in_ctx(xd, ep->dci + 1);
+    bool in = ep->address & 0x80, periodic = ep->type == 3;
+    unsigned ep_type = (periodic ? 3 : 2) + (in ? 4 : 0); /* xHCI 6.2.3: bulk 2/6, interrupt 3/7 */
+    c[0] = periodic ? interval << 16 | (ep->esit >> 16) << 24 : 0;
+    c[1] = 3u << 1 | ep_type << 3 | burst << 8 | ep->mps << 16; /* error count 3 */
+    c[2] = (uint32_t)(ep->ring.phys + ep->ring.enq * sizeof(struct trb)) | ep->ring.cycle;
+    c[3] = (uint32_t)((ep->ring.phys + ep->ring.enq * sizeof(struct trb)) >> 32);
+    /* average TRB length (4.14.1.1: about 1 KiB interrupt, 3 KiB bulk) and Max ESIT Payload */
+    c[4] = (periodic ? ep->mps : 3072) | (periodic ? (ep->esit & 0xFFFF) << 16 : 0);
+}
+
+static bool open_endpoints(struct xdev *xd, const struct usb_ep_info *eps, int n) {
     struct usb_hc *hc = xd->dev.hc;
     memset(xd->in_ctx, 0, 4096);
     uint32_t *icc = in_ctx(xd, 0);
-    unsigned top = 1;
+    unsigned top = 1, added = 0;
     icc[1] = 1;
     for (int i = 0; i < n; i++) {
-        if (!claims[i].intf) continue;
-        const struct usb_endpoint_desc *e = claims[i].ep;
-        unsigned dci = endpoint_dci(e);
-        if (xd->ep[dci]) continue;
+        const struct usb_ep_info *e = &eps[i];
+        unsigned dci = address_dci(e->address), type = e->attributes & 3;
+        if (xd->ep[dci] || dci < 2 || (type != 2 && type != 3)) continue; /* no isochronous yet */
         struct endpoint *ep = kzalloc(sizeof *ep);
-        if (!ep || !ring_init(&ep->ring) || !(ep->buf = dma_page(&ep->buf_phys))) {
+        if (!ep || !ring_init(&ep->ring)) {
             free_endpoint(ep);
             return false;
         }
-        unsigned mps = e->max_packet & 0x7FF, burst = (e->max_packet >> 11) & 3;
+        unsigned mps = e->max_packet & 0x7FF, burst = 0;
         if (!mps) mps = 8;
-        uint32_t esit = mps * (burst + 1);
-        if (xd->dev.speed >= USB_SPEED_SUPER) { /* burst and payload come from the companion */
-            const uint8_t *c = claims[i].companion;
-            burst = c ? c[2] : 0;
-            esit = c && (c[4] | c[5] << 8) ? (uint32_t)(c[4] | c[5] << 8) : mps * (burst + 1);
+        uint32_t esit = 0;
+        if (type == 3) {
+            burst = (e->max_packet >> 11) & 3; /* high speed: extra transactions per microframe */
+            esit = mps * (burst + 1);
         }
-        ep->dci = dci;
+        if (xd->dev.speed >= USB_SPEED_SUPER) { /* burst and payload come from the companion */
+            burst = e->burst;
+            if (type == 3) esit = e->esit ? e->esit : mps * (burst + 1);
+        }
+        ep->dci = (uint8_t)dci;
         ep->address = e->address;
-        ep->len = esit > 4096 ? 4096 : esit;
-        ep->stride = (ep->len + 63) & ~63u;
-        ep->count = 4096 / ep->stride < 8 ? 4096 / ep->stride : 8;
+        ep->type = (uint8_t)type;
+        ep->mps = mps;
+        ep->esit = esit;
         xd->ep[dci] = ep;
-        uint32_t *c = in_ctx(xd, dci + 1);
-        c[0] = endpoint_interval(xd->dev.speed, e->interval) << 16 | (esit >> 16) << 24;
-        c[1] = 3u << 1 | 7u << 3 | burst << 8 | mps << 16; /* error count 3, interrupt IN */
-        c[2] = (uint32_t)ep->ring.phys | 1;
-        c[3] = (uint32_t)(ep->ring.phys >> 32);
-        c[4] = mps | (esit & 0xFFFF) << 16;
+        endpoint_context(xd, ep, endpoint_interval(xd->dev.speed, e->interval), burst);
         icc[1] |= 1u << dci;
         if (dci > top) top = dci;
+        added++;
     }
+    if (!added) return true;
     unsigned entries = (out_ctx(xd, 0)[0] >> 27);
     slot_context(xd, top > entries ? top : entries);
     int cc = hc_command(hc, xd->in_phys, TRB_TYPE(TRB_CONFIGURE) | (uint32_t)xd->dev.slot << 24, NULL);
@@ -505,16 +655,127 @@ static bool configure_endpoints(struct xdev *xd, const struct claim *claims, int
     return true;
 }
 
-bool usb_interrupt_start(struct usb_device *d, const struct usb_endpoint_desc *e, usb_report_fn fn, void *ctx) {
-    struct xdev *xd = (struct xdev *)d;
-    unsigned dci = endpoint_dci(e);
-    struct endpoint *ep = xd->ep[dci];
-    if (!ep || d->removed) return false;
+bool usb_open_endpoints(struct usb_device *d, const struct usb_ep_info *eps, int n) {
+    return !d->removed && open_endpoints((struct xdev *)d, eps, n);
+}
+
+bool usb_stream_start(struct usb_device *d, uint8_t address, unsigned len, unsigned count, usb_report_fn fn, void *ctx) {
+    struct endpoint *ep = find_endpoint(d, address);
+    if (!ep || ep->mode || !(address & 0x80) || !endpoint_buffer(ep, len, count)) return false;
+    unsigned per = len / 0x10000 + 2; /* entries one transfer can take */
+    if (!ring_room(ep, per * count)) return false;
+    ep->mode = EP_STREAM;
     ep->fn = fn;
     ep->ctx = ctx;
-    for (unsigned i = 0; i < ep->count; i++) endpoint_queue(ep, i);
-    doorbell(d->hc, d->slot, dci);
+    endpoint_requeue_all(d->hc, (struct xdev *)d, ep);
     return true;
+}
+
+/* An interrupt transfer must be one service interval's payload: a longer one would gather
+ * several full-size reports into one completion. */
+bool usb_interrupt_start(struct usb_device *d, const struct usb_endpoint_desc *e, usb_report_fn fn, void *ctx) {
+    struct endpoint *ep = find_endpoint(d, e->address);
+    if (!ep) return false;
+    unsigned len = ep->esit ? ep->esit : ep->mps;
+    if (len > 4096) len = 4096;
+    unsigned count = 4096 / ((len + 63) & ~63u);
+    return usb_stream_start(d, e->address, len, count > 8 ? 8 : count, fn, ctx);
+}
+
+/* Reset the controller's side of a pipe: halted endpoints by Reset Endpoint (which clears the
+ * data toggle), others by Drop and Add in one Configure Endpoint (xHCI 4.6.8), restarting at
+ * the ring's enqueue point either way. */
+static bool endpoint_reset(struct xdev *xd, struct endpoint *ep) {
+    struct usb_hc *hc = xd->dev.hc;
+    unsigned slot = xd->dev.slot, dci = ep->dci;
+    unsigned state = out_ctx(xd, dci)[0] & 7;
+    if (state == EP_HALTED) {
+        endpoint_forget(ep);
+        return endpoint_recover(xd, dci, &ep->ring);
+    }
+    if (state == EP_RUNNING) hc_command(hc, 0, TRB_TYPE(TRB_STOP_EP) | dci << 16 | slot << 24, NULL);
+    endpoint_forget(ep);
+    memset(xd->in_ctx, 0, 4096);
+    uint32_t *icc = in_ctx(xd, 0), *c = in_ctx(xd, dci + 1);
+    icc[0] = 1u << dci;
+    icc[1] = 1u | 1u << dci;
+    memcpy(c, out_ctx(xd, dci), hc->ctx_size);
+    c[0] &= ~7u;
+    c[2] = (uint32_t)(ep->ring.phys + ep->ring.enq * sizeof(struct trb)) | ep->ring.cycle;
+    c[3] = (uint32_t)((ep->ring.phys + ep->ring.enq * sizeof(struct trb)) >> 32);
+    slot_context(xd, out_ctx(xd, 0)[0] >> 27);
+    int cc = hc_command(hc, xd->in_phys, TRB_TYPE(TRB_CONFIGURE) | slot << 24, NULL);
+    if (cc != CC_SUCCESS) kprintf("usb: slot %u endpoint %u could not be reset (%d)\n", slot, dci, cc);
+    return cc == CC_SUCCESS;
+}
+
+int usb_clear_halt(struct usb_device *d, uint8_t address) {
+    struct endpoint *ep = find_endpoint(d, address);
+    if (!ep) return -1;
+    bool ok = endpoint_reset((struct xdev *)d, ep);
+    int r = usb_control(d, 0x02, USB_REQ_CLEAR_FEATURE, 0, address, NULL, 0);
+    if (ok) ep->halted = false;
+    return ok && r >= 0 ? 0 : -1;
+}
+
+int usb_bulk(struct usb_device *d, uint8_t address, void *buf, unsigned len, unsigned timeout_ms) {
+    struct xdev *xd = (struct xdev *)d;
+    struct endpoint *ep = find_endpoint(d, address);
+    if (!ep || current_task != usb_task || ep->type != 2 || (ep->mode && ep->mode != EP_SYNC) || len > SYNC_BYTES)
+        return -1;
+    if (!ep->mode) {
+        if (!endpoint_buffer(ep, SYNC_BYTES, 1)) return -1;
+        ep->mode = EP_SYNC;
+    }
+    if (ep->halted) return USB_STALL;
+    bool in = address & 0x80;
+    if (!in && len) memcpy(ep->buf, buf, len);
+    ep->sync_done = false;
+    endpoint_push(ep, 0, len, false);
+    doorbell(d->hc, d->slot, ep->dci);
+    if (!hc_wait(&ep->sync_done, timeout_ms)) {
+        if (d->removed) return -1;
+        kprintf("usb: slot %u endpoint %02x transfer timed out\n", d->slot, address);
+        endpoint_forget(ep);
+        ep->halted = !endpoint_recover(xd, ep->dci, &ep->ring); /* stop it and skip the TD */
+        return -1;
+    }
+    if (ep->sync_cc == CC_STALL) return USB_STALL;
+    if (ep->sync_cc != CC_SUCCESS && ep->sync_cc != CC_SHORT) return -1;
+    if (in && ep->sync_got) memcpy(buf, ep->buf, ep->sync_got);
+    return (int)ep->sync_got;
+}
+
+bool usb_send_open(struct usb_device *d, uint8_t address, unsigned size, unsigned slots, usb_report_fn done, void *ctx) {
+    struct endpoint *ep = find_endpoint(d, address);
+    if (!ep || ep->mode || (address & 0x80) || ep->type != 2 || !endpoint_buffer(ep, size, slots)) return false;
+    ep->fn = done;
+    ep->ctx = ctx;
+    ep->mode = EP_SEND;
+    return true;
+}
+
+int usb_send(struct usb_device *d, uint8_t address, const void *a, unsigned alen, const void *b, unsigned blen) {
+    struct endpoint *ep = find_endpoint(d, address);
+    unsigned len = alen + blen;
+    if (!ep || ep->mode != EP_SEND || ep->dead || len > ep->len || !len) return -1;
+    uint64_t f = irq_save();
+    int r = 0;
+    for (unsigned i = 0; i < ep->count && !ep->halted; i++) {
+        unsigned k = (ep->next + i) % ep->count;
+        if (ep->busy & (1u << k)) continue;
+        if (!ring_room(ep, len / 0x10000 + 3)) break;
+        uint8_t *slot = ep->buf + (size_t)k * ep->stride;
+        memcpy(slot, a, alen);
+        if (blen) memcpy(slot + alen, b, blen);
+        endpoint_push(ep, k, len, len % ep->mps == 0);
+        doorbell(d->hc, d->slot, ep->dci);
+        ep->next = k + 1;
+        r = 1;
+        break;
+    }
+    irq_restore(f);
+    return r;
 }
 
 static const char *speed_name(unsigned s) {
@@ -559,15 +820,64 @@ static void bind_classes(struct xdev *xd, uint8_t *cfg, unsigned total) {
     if (!n) return;
     for (int i = 0; i < n; i++)
         if (claims[i].intf->cls == 9 && !usbhub_prepare(d)) claims[i].intf = NULL;
+    struct usb_ep_info eps[8];
     int neps = 0;
     for (int i = 0; i < n; i++)
-        if (claims[i].intf) neps++;
-    if (!neps || !configure_endpoints(xd, claims, n)) return;
+        if (claims[i].intf) endpoint_info(claims[i].ep, claims[i].companion, &eps[neps++]);
+    if (!neps || !open_endpoints(xd, eps, neps)) return;
     for (int i = 0; i < n && !d->removed; i++) {
         if (!claims[i].intf) continue;
         if (claims[i].intf->cls == 9) usbhub_attach(d, claims[i].ep);
         else usbhid_attach(d, claims[i].intf, claims[i].extra, claims[i].extra_len, claims[i].ep);
     }
+}
+
+/* Does an interface of this configuration have a driver? */
+static bool configuration_supported(const struct usb_device *d, const uint8_t *cfg, unsigned total) {
+    for (unsigned off = 0; off + 2 <= total && cfg[off] >= 2; off += cfg[off]) {
+        if (cfg[off + 1] != USB_DESC_INTERFACE || cfg[off] < 9 || off + 9 > total) continue;
+        const struct usb_interface_desc *intf = (const void *)(cfg + off);
+        if ((intf->cls == 9 && d->speed < USB_SPEED_SUPER) || usbhid_claims(intf) || usbmsc_claims(intf) ||
+            usbnet_claims(intf))
+            return true;
+    }
+    return false;
+}
+
+/* The first configuration a driver can use, else the first one (USB 2.0 9.4.3: descriptor
+ * index, not bConfigurationValue). Network adapters often put their standard (CDC) function
+ * in a second or third configuration after a vendor-specific first one. */
+static uint8_t *choose_configuration(struct usb_device *d, int *got) {
+    unsigned count = d->desc.configurations ? d->desc.configurations : 1;
+    uint8_t *first = NULL;
+    int first_got = 0;
+    for (unsigned i = 0; i < count && i < 8; i++) {
+        uint8_t head[9];
+        if (usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_CONFIG << 8 | i, 0, head, 9) < 9) continue;
+        unsigned total = head[2] | head[3] << 8;
+        if (total < 9) continue;
+        if (total > 4096) total = 4096;
+        uint8_t *cfg = kmalloc(total);
+        if (!cfg) break;
+        int n = usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_CONFIG << 8 | i, 0, cfg, total);
+        if (n < 9) {
+            kfree(cfg);
+            continue;
+        }
+        if (configuration_supported(d, cfg, (unsigned)n)) {
+            if (i) kprintf("usb: slot %u uses configuration %u of %u\n", d->slot, cfg[5], count);
+            kfree(first);
+            *got = n;
+            return cfg;
+        }
+        if (first) kfree(cfg);
+        else {
+            first = cfg;
+            first_got = n;
+        }
+    }
+    *got = first_got;
+    return first;
 }
 
 static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, unsigned port, unsigned root_port,
@@ -620,23 +930,20 @@ static struct xdev *device_attach(struct usb_hc *hc, struct usb_device *parent, 
         }
     }
     if (usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_DEVICE << 8, 0, &d->desc, 18) < 18) goto fail;
-    uint8_t head[9];
-    if (usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_CONFIG << 8, 0, head, 9) < 9) goto fail;
-    unsigned total = head[2] | head[3] << 8;
-    if (total > 4096) total = 4096;
-    uint8_t *cfg = kmalloc(total);
-    if (!cfg) goto fail;
-    int got = usb_control(d, 0x80, USB_REQ_GET_DESCRIPTOR, USB_DESC_CONFIG << 8, 0, cfg, total);
     char via[24] = "";
     if (parent) ksnprintf(via, sizeof via, " (hub port %u)", port);
     kprintf("usb: %04x:%04x class %02x on controller %d port %u%s, %s speed, slot %u\n", d->desc.vendor,
             d->desc.product, d->desc.cls, hc->index, root_port, via, speed_name(speed), slot);
-    if (got < 9 || usb_control(d, 0, USB_REQ_SET_CONFIG, head[5], 0, NULL, 0) < 0) {
+    int got = 0;
+    uint8_t *cfg = choose_configuration(d, &got);
+    if (!cfg || usb_control(d, 0, USB_REQ_SET_CONFIG, cfg[5], 0, NULL, 0) < 0) {
         kfree(cfg);
         kprintf("usb: slot %u could not be configured\n", slot);
         return xd; /* stays addressed so a disconnect still frees it */
     }
     bind_classes(xd, cfg, (unsigned)got);
+    if (!d->removed) usbmsc_attach(d, cfg, (unsigned)got);
+    if (!d->removed) usbnet_attach(d, cfg, (unsigned)got);
     kfree(cfg);
     return xd;
 fail:
@@ -666,6 +973,8 @@ void usb_remove(struct usb_device *d) {
     kprintf("usb: slot %u (%04x:%04x) removed\n", d->slot, d->desc.vendor, d->desc.product);
     usbhub_detach(d);
     usbhid_detach(d);
+    usbmsc_detach(d);
+    usbnet_detach(d);
     release_slot(hc, d->slot, xd);
 }
 
@@ -737,7 +1046,7 @@ static void hc_work(struct usb_hc *hc) {
         struct xdev *xd = hc->slots[s];
         for (int i = 2; xd && !xd->dev.removed && i < 32; i++) {
             struct endpoint *ep = xd->ep[i];
-            if (!ep || !ep->halted || ep->dead) continue;
+            if (!ep || !ep->halted || ep->dead || ep->mode == EP_SYNC) continue; /* usb_bulk's caller recovers */
             if (now < ep->retry_at) { /* backing off: come back later */
                 hc->recover = true;
                 if (!usb_deadline || ep->retry_at < usb_deadline) usb_deadline = ep->retry_at;
@@ -760,8 +1069,9 @@ static void hc_work(struct usb_hc *hc) {
                 continue;
             }
             ep->halted = false;
-            for (unsigned k = 0; k < ep->count; k++) endpoint_queue(ep, k);
-            doorbell(hc, s, i);
+            endpoint_forget(ep); /* the ring restarts past everything that was queued */
+            if (ep->mode == EP_STREAM) endpoint_requeue_all(hc, xd, ep);
+            else if (ep->fn) ep->fn(&xd->dev, ep->ctx, NULL, 0); /* sends were dropped: slots are free */
         }
     }
 }
@@ -889,13 +1199,81 @@ static bool hc_start(struct usb_hc *hc) {
     return true;
 }
 
+static void run_calls(void) {
+    while (calls) {
+        uint64_t f = irq_save();
+        struct usb_call *c = calls;
+        calls = c->next;
+        if (!calls) calls_tail = &calls;
+        irq_restore(f);
+        c->fn(c->arg);
+        c->done = true;
+        wq_wake_all(&calls_wq);
+    }
+}
+
+/* The boot task, which runs kmain_late and then becomes the idle task, has no stack of its own
+ * and must never sit on a wait queue: it lets the others run until the flag is set. */
+static void wait_flag(volatile bool *flag, struct wait_queue *wq) {
+    while (!*flag) {
+        if (!current_task->kstack) {
+            sti();
+            hlt();
+            schedule();
+            continue;
+        }
+        uint64_t f = irq_save();
+        if (!*flag) wq_wait_timeout(wq, 100);
+        irq_restore(f);
+    }
+}
+
+void usb_run(void (*fn)(void *arg), void *arg) {
+    if (current_task == usb_task) {
+        fn(arg);
+        return;
+    }
+    struct usb_call c = {fn, arg, false, NULL};
+    uint64_t f = irq_save();
+    *calls_tail = &c;
+    calls_tail = &c.next;
+    usb_more = usb_kick = true;
+    wq_wake_all(&usb_wq);
+    irq_restore(f);
+    wait_flag(&c.done, &calls_wq);
+}
+
+void usb_wait_settled(unsigned ms) {
+    if (!usb_task) return;
+    uint64_t end = uptime_ms() + ms;
+    while (!usb_settled && uptime_ms() < end) {
+        if (!current_task->kstack) {
+            sti();
+            hlt();
+            schedule();
+        } else {
+            sleep_ms(10);
+        }
+    }
+    if (!usb_settled) kprintf("usb: still enumerating after %u ms, going on\n", ms);
+}
+
+static bool any_port_pending(void) {
+    for (int i = 0; i < ncontrollers; i++)
+        for (unsigned w = 0; w < 8; w++)
+            if (controllers[i].port_pending[w]) return true;
+    return false;
+}
+
 static void usb_thread(void *arg) {
     (void)arg;
     for (int i = 0; i < ncontrollers; i++) hc_start(&controllers[i]);
+    uint64_t started = uptime_ms();
     for (;;) {
         usb_more = false;
         usb_deadline = 0;
         poll_all();
+        run_calls();
         for (int i = 0; i < ncontrollers; i++) {
             struct usb_hc *hc = &controllers[i];
             if (hc->interrupts && !hc->irq_seen) { /* the boot log shows that MSI really arrives */
@@ -918,7 +1296,13 @@ static void usb_thread(void *arg) {
             hc_work(hc);
         }
         usbhub_work();
+        /* boot waits for this: every port and hub looked at once, and USB 3 links (which train
+         * by themselves, then report a change) given a moment to show up */
+        if (!usb_settled && !usb_more && !any_port_pending() && !usbhub_pending() &&
+            uptime_ms() - started >= 500)
+            usb_settled = true;
         uint64_t now = uptime_ms(), next = usbhid_tick(now);
+        if (!usb_settled && (!next || next > now + 50)) next = now + 50;
         uint64_t wait = any_polled() ? 4 : 1000;
         if (usb_deadline && (!next || usb_deadline < next)) next = usb_deadline;
         if (next) wait = next <= now ? 0 : (next - now < wait ? next - now : wait);
@@ -939,5 +1323,5 @@ void usb_init(void) {
             ncontrollers++;
         }
     }
-    if (ncontrollers) kthread_create("usb", usb_thread, NULL);
+    if (ncontrollers) usb_task = kthread_create("usb", usb_thread, NULL);
 }

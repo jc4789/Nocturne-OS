@@ -121,6 +121,12 @@ static void hub_port(struct hub *h, unsigned port) {
     }
 }
 
+bool usbhub_pending(void) {
+    for (struct hub *h = hubs; h; h = h->next)
+        if (h->pending && !h->dev->removed) return true;
+    return false;
+}
+
 void usbhub_work(void) {
 again:
     for (struct hub *h = hubs; h; h = h->next) {

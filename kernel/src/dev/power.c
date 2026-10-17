@@ -5,6 +5,7 @@
 #include "mm/vmm.h"
 
 extern volatile struct limine_rsdp_request rsdp_req;
+void nvme_shutdown(void);
 
 struct sdt_header {
     char sig[4];
@@ -162,6 +163,7 @@ void acpi_init(void) {
 void power_off(void) {
     cli();
     kprintf("power: shutting down\n");
+    nvme_shutdown();
     if (fadt && s5_ok && fadt_has(268) && fadt->sleep_control.address) {
         /* hardware-reduced ACPI: SLP_TYPx in bits 2-4, SLP_EN is bit 5 */
         gas_write(&fadt->sleep_control, ((slp_typa & 7) << 2) | (1 << 5));
@@ -185,6 +187,7 @@ void power_off(void) {
 void power_reboot(void) {
     cli();
     kprintf("power: rebooting\n");
+    nvme_shutdown();
     if (fadt_has(129) && (fadt->flags & FADT_RESET_REG_SUP) && fadt->reset_reg.address) {
         gas_write(&fadt->reset_reg, fadt->reset_value);
         for (int i = 0; i < 100000; i++) io_wait();
