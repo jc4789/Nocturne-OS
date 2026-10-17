@@ -159,6 +159,11 @@ bool pci_msi_enable(struct pci_device *d, uint8_t vector) {
         uint8_t data_off = cap + (wide ? 0x0C : 0x08);
         uint32_t data = pci_read32(d->bus, d->dev, d->func, data_off);
         pci_write32(d->bus, d->dev, d->func, data_off, (data & 0xFFFF0000u) | vector);
+        uint8_t msix = pci_find_cap(d, 0x11); /* never both: firmware may have left MSI-X on */
+        if (msix) {
+            uint32_t xh = pci_read32(d->bus, d->dev, d->func, msix);
+            pci_write32(d->bus, d->dev, d->func, msix, xh & ~0x80000000u);
+        }
         ctl = (ctl & ~0x70u) | 1; /* one message, enabled */
         pci_write32(d->bus, d->dev, d->func, cap, (h & 0xFFFF) | (uint32_t)ctl << 16);
     } else if ((cap = pci_find_cap(d, 0x11))) {

@@ -20,7 +20,6 @@ struct hub {
 
 static struct hub *hubs;
 static unsigned hubs_changed;
-static void hub_detach(struct usb_device *d);
 
 static int port_feature(struct usb_device *d, uint8_t request, uint16_t feature, unsigned port) {
     return usb_control(d, 0x23, request, feature, (uint16_t)port, NULL, 0);
@@ -45,8 +44,7 @@ bool usbhub_prepare(struct usb_device *d) {
     h->dev = d;
     h->ports = desc[2] > HUB_PORTS ? HUB_PORTS : desc[2];
     h->power_ms = desc[5] * 2u < 100 ? 100 : desc[5] * 2u;
-    d->class_data = h;
-    d->class_detach = hub_detach; /* frees it even if the hub never gets configured */
+    d->hub = h; /* usbhub_detach frees it even if the hub never gets configured */
     usb_hub_info(d, desc[2], (desc[3] >> 5) & 3, false);
     return true;
 }
@@ -60,8 +58,8 @@ static void hub_report(struct usb_device *d, void *ctx, const uint8_t *data, uns
     usb_note_work();
 }
 
-static void hub_detach(struct usb_device *d) {
-    struct hub *h = d->class_data;
+void usbhub_detach(struct usb_device *d) {
+    struct hub *h = d->hub;
     if (!h) return;
     for (unsigned p = 1; p <= h->ports; p++)
         if (h->child[p]) usb_remove(h->child[p]);
@@ -70,15 +68,14 @@ static void hub_detach(struct usb_device *d) {
             *pp = h->next;
             break;
         }
-    d->class_data = NULL;
+    d->hub = NULL;
     hubs_changed++;
     kfree(h);
 }
 
 void usbhub_attach(struct usb_device *d, const struct usb_endpoint_desc *ep) {
-    struct hub *h = d->class_data;
+    struct hub *h = d->hub;
     if (!h) return;
-    d->class_detach = hub_detach;
     for (unsigned p = 1; p <= h->ports; p++) port_feature(d, USB_REQ_SET_FEATURE, PORT_POWER, p);
     sleep_ms(h->power_ms);
     for (unsigned p = 1; p <= h->ports; p++) h->pending |= 1u << p;
@@ -104,21 +101,24 @@ static void hub_port(struct hub *h, unsigned port) {
     }
     if (!connected || h->child[port] || d->removed) return;
     sleep_ms(100); /* connect debounce */
-    if (!port_status(d, port, &status, &change) || !(status & 1)) return;
-    port_feature(d, USB_REQ_SET_FEATURE, PORT_RESET, port);
-    for (int t = 0; t < 50; t++) {
-        sleep_ms(10);
-        if (!port_status(d, port, &status, &change)) return;
-        if (change & 0x10) break;
+    for (int attempt = 0; attempt < 3 && !h->child[port] && !d->removed; attempt++) {
+        if (attempt) sleep_ms(100);
+        if (!port_status(d, port, &status, &change) || !(status & 1)) return;
+        port_feature(d, USB_REQ_SET_FEATURE, PORT_RESET, port);
+        for (int t = 0; t < 50; t++) {
+            sleep_ms(10);
+            if (!port_status(d, port, &status, &change)) return;
+            if (change & 0x10) break;
+        }
+        port_feature(d, USB_REQ_CLEAR_FEATURE, C_PORT_CONNECTION + 4, port);
+        if (!(status & 2)) {
+            kprintf("usbhub: slot %u port %u did not enable\n", d->slot, port);
+            continue;
+        }
+        sleep_ms(10); /* reset recovery */
+        unsigned speed = (status & 0x200) ? USB_SPEED_LOW : (status & 0x400) ? USB_SPEED_HIGH : USB_SPEED_FULL;
+        h->child[port] = usb_attach_child(d, port, speed);
     }
-    port_feature(d, USB_REQ_CLEAR_FEATURE, C_PORT_CONNECTION + 4, port);
-    if (!(status & 2)) {
-        kprintf("usbhub: slot %u port %u did not enable\n", d->slot, port);
-        return;
-    }
-    sleep_ms(10); /* reset recovery */
-    unsigned speed = (status & 0x200) ? USB_SPEED_LOW : (status & 0x400) ? USB_SPEED_HIGH : USB_SPEED_FULL;
-    h->child[port] = usb_attach_child(d, port, speed);
 }
 
 void usbhub_work(void) {

@@ -44,9 +44,7 @@ struct usb_device {
     uint8_t tt_slot, tt_port; /* transaction translator for full/low speed behind a high-speed hub */
     struct usb_device_desc desc;
     bool removed;
-    /* the class driver bound to the device or one of its interfaces */
-    void *class_data;
-    void (*class_detach)(struct usb_device *d);
+    void *hub; /* usbhub.c state when the device is a hub */
 };
 
 typedef void (*usb_report_fn)(struct usb_device *d, void *ctx, const uint8_t *data, unsigned len);
@@ -54,8 +52,8 @@ typedef void (*usb_report_fn)(struct usb_device *d, void *ctx, const uint8_t *da
 /* A control transfer; returns the bytes moved, or -1 (stall, error, timeout). */
 int usb_control(struct usb_device *d, uint8_t type, uint8_t request, uint16_t value, uint16_t index,
                 void *buffer, uint16_t length);
-/* Keep the interrupt IN endpoint polled, handing each completed packet to `fn`. The endpoint must
- * have been passed to the configuration (see usb_class_endpoint below). */
+/* Keep the interrupt IN endpoint polled, handing each service interval's data to `fn`. The
+ * endpoint must belong to an interface the class driver claimed. */
 bool usb_interrupt_start(struct usb_device *d, const struct usb_endpoint_desc *ep, usb_report_fn fn, void *ctx);
 
 /* hub support */
@@ -72,5 +70,8 @@ bool usbhub_prepare(struct usb_device *d); /* reads the hub descriptor and calls
 void usbhub_attach(struct usb_device *d, const struct usb_endpoint_desc *ep);
 void usbhub_work(void);                    /* port changes noticed by the hub interrupt endpoints */
 uint64_t usbhid_tick(uint64_t now);        /* key repeat; returns the next deadline (0 = none) */
+/* a device is going away: each class driver drops whatever it holds of it (any interface) */
+void usbhub_detach(struct usb_device *d);
+void usbhid_detach(struct usb_device *d);
 
 void usb_init(void);

@@ -194,72 +194,100 @@ static void hid_report(struct usb_device *d, void *ctx, const uint8_t *data, uns
 
 /* ---- report descriptors ---- */
 
-struct parse {
+struct globals { /* the global items Push and Pop save */
     uint16_t page;
     int32_t lmin, lmax;
     uint16_t size, count;
     uint8_t report;
-    uint32_t usages[16];
+};
+
+struct parse {
+    struct globals g, stack[4];
+    int sp;
+    uint32_t usages[16]; /* full page << 16 | id, resolved when each Usage item is read */
     int nusages;
     uint32_t umin, umax;
     bool have_range;
-    uint16_t app; /* page << 8 | usage of the enclosing application collection (generic desktop) */
+    uint32_t app; /* usage of the enclosing top-level application collection, 0 outside one */
+    int depth, app_depth;
     uint16_t offset[256];
-    uint16_t stack_page, stack_size, stack_count;
-    int32_t stack_lmin, stack_lmax;
-    uint8_t stack_report;
 };
 
 static uint32_t usage_at(struct parse *p, unsigned i) {
-    uint32_t u;
-    if (p->have_range) u = p->umin + i <= p->umax ? p->umin + i : p->umax;
-    else if (p->nusages) u = p->usages[i < (unsigned)p->nusages ? i : (unsigned)p->nusages - 1];
-    else return 0;
-    return u >> 16 ? u : (uint32_t)p->page << 16 | u;
+    if (p->have_range) return p->umin + i <= p->umax ? p->umin + i : p->umax;
+    if (p->nusages) return p->usages[i < (unsigned)p->nusages ? i : (unsigned)p->nusages - 1];
+    return 0;
+}
+
+/* Which application collections feed which part of the input layer: keys only from keyboards
+ * and keypads, the pointer only from mice, pointers and digitizers (pens, touch screens). A
+ * joystick or gamepad also reports X and Y but must not drive the cursor. */
+static bool keyboard_app(uint32_t app) { return app == 0x00010006 || app == 0x00010007; }
+static bool pointer_app(uint32_t app) {
+    return app == 0x00010001 || app == 0x00010002 || (app >= 0x000D0001 && app <= 0x000D0004);
 }
 
 static void set_value(struct value *v, struct parse *p, unsigned bit, bool relative) {
     if (v->present) return;
-    *v = (struct value){.bit = bit, .size = p->size, .min = p->lmin, .max = p->lmax, .report = p->report,
+    *v = (struct value){.bit = bit, .size = p->g.size, .min = p->g.lmin, .max = p->g.lmax, .report = p->g.report,
                         .present = true, .relative = relative};
 }
 
+static void add_keyfield(struct hid *h, struct keyfield k) {
+    if (k.usage_max > 255) k.usage_max = 255;
+    if (h->nkeys < 16 && k.usage_max >= k.usage_min) h->keys[h->nkeys++] = k;
+}
+
 static void input_item(struct hid *h, struct parse *p, uint32_t flags) {
-    unsigned base = p->offset[p->report];
-    p->offset[p->report] += p->size * p->count;
+    unsigned base = p->offset[p->g.report];
+    p->offset[p->g.report] += p->g.size * p->g.count;
     if (flags & 1) return; /* constant padding */
     bool variable = flags & 2, relative = flags & 4;
     uint32_t first = usage_at(p, 0);
-    if (first >> 16 == 0x07 && h->nkeys < 16) {
-        struct keyfield *k = &h->keys[h->nkeys++];
-        *k = (struct keyfield){.report = p->report, .variable = variable, .bit = base, .size = p->size,
-                               .count = p->count, .min = p->lmin};
-        if (variable) {
-            k->usage_min = first & 0xFFFF;
-            k->usage_max = (usage_at(p, p->count ? p->count - 1 : 0) & 0xFFFF);
-        } else {
-            k->usage_min = p->have_range ? p->umin & 0xFFFF : first & 0xFFFF;
-            k->usage_max = p->have_range ? p->umax & 0xFFFF : (uint16_t)(k->usage_min + (p->lmax - p->lmin));
+    if (first >> 16 == 0x07) {
+        if (!keyboard_app(p->app)) return;
+        struct keyfield k = {.report = p->g.report, .variable = variable, .size = p->g.size, .min = p->g.lmin};
+        if (!variable) { /* an array of key codes */
+            k.bit = base;
+            k.count = p->g.count;
+            k.usage_min = p->have_range ? p->umin & 0xFFFF : first & 0xFFFF;
+            k.usage_max = p->have_range ? p->umax & 0xFFFF : (uint16_t)(k.usage_min + (p->g.lmax - p->g.lmin));
+            add_keyfield(h, k);
+            return;
         }
-        if (k->usage_max > 255) k->usage_max = 255;
-        if (k->usage_max < k->usage_min) h->nkeys--;
+        /* one bit per key; a usage list need not be contiguous, so each run becomes its own field */
+        unsigned n = p->have_range ? p->g.count : (p->g.count < (unsigned)p->nusages ? p->g.count : (unsigned)p->nusages);
+        for (unsigned i = 0; i < n;) {
+            uint32_t u = usage_at(p, i);
+            unsigned j = i + 1;
+            while (j < n && usage_at(p, j) == u + (j - i)) j++;
+            if (u >> 16 == 0x07) {
+                k.bit = base + i * p->g.size;
+                k.count = j - i;
+                k.usage_min = u & 0xFFFF;
+                k.usage_max = (uint16_t)((u & 0xFFFF) + (j - i - 1));
+                add_keyfield(h, k);
+            }
+            i = j;
+        }
         return;
     }
-    if (!variable) return;
-    for (unsigned i = 0; i < p->count; i++) {
+    if (!variable || !pointer_app(p->app)) return;
+    for (unsigned i = 0; i < p->g.count; i++) {
         uint32_t u = usage_at(p, i);
-        unsigned bit = base + i * p->size;
+        unsigned bit = base + i * p->g.size;
         if (u == 0x00010030) set_value(&h->x, p, bit, relative);
         else if (u == 0x00010031) set_value(&h->y, p, bit, relative);
         else if (u == 0x00010038) set_value(&h->wheel, p, bit, true);
-        else if (u >> 16 == 0x09 && (u & 0xFFFF) >= 1 && (u & 0xFFFF) <= 8 && p->size == 1)
+        else if (u >> 16 == 0x09 && (u & 0xFFFF) >= 1 && (u & 0xFFFF) <= 8 && p->g.size == 1)
             set_value(&h->button[(u & 0xFFFF) - 1], p, bit, false);
     }
 }
 
-static bool parse_report_descriptor(struct hid *h, const uint8_t *d, unsigned len, bool *keyboard_app) {
+static bool parse_report_descriptor(struct hid *h, const uint8_t *d, unsigned len) {
     struct parse *p = kzalloc(sizeof *p);
     if (!p) return false;
+    p->app_depth = -1;
     for (unsigned i = 0; i < len;) {
         uint8_t prefix = d[i];
         if (prefix == 0xFE) { /* long item */
@@ -275,33 +303,37 @@ static bool parse_report_descriptor(struct hid *h, const uint8_t *d, unsigned le
         i += 1 + size;
         if (type == 1) { /* global */
             switch (tag) {
-            case 0: p->page = (uint16_t)u; break;
-            case 1: p->lmin = s; break;
-            case 2: p->lmax = s; break;
-            case 7: p->size = (uint16_t)u; break;
-            case 8: p->report = (uint8_t)u; h->ids = true; break;
-            case 9: p->count = (uint16_t)u; break;
-            case 10:
-                p->stack_page = p->page; p->stack_size = p->size; p->stack_count = p->count;
-                p->stack_lmin = p->lmin; p->stack_lmax = p->lmax; p->stack_report = p->report;
-                break;
-            case 11:
-                p->page = p->stack_page; p->size = p->stack_size; p->count = p->stack_count;
-                p->lmin = p->stack_lmin; p->lmax = p->stack_lmax; p->report = p->stack_report;
-                break;
+            case 0: p->g.page = (uint16_t)u; break;
+            case 1: p->g.lmin = s; break;
+            case 2: p->g.lmax = s; break;
+            case 7: p->g.size = (uint16_t)u; break;
+            case 8: p->g.report = (uint8_t)u; h->ids = true; break;
+            case 9: p->g.count = (uint16_t)u; break;
+            case 10: if (p->sp < 4) p->stack[p->sp++] = p->g; break;
+            case 11: if (p->sp > 0) p->g = p->stack[--p->sp]; break;
             }
-            if (tag == 2 && p->lmin >= 0 && p->lmax < p->lmin) p->lmax = (int32_t)u; /* unsigned maximum */
+            if (tag == 2 && p->g.lmin >= 0 && p->g.lmax < p->g.lmin) p->g.lmax = (int32_t)u; /* unsigned maximum */
         } else if (type == 2) { /* local */
-            if (tag == 0 && p->nusages < 16) p->usages[p->nusages++] = size == 4 ? u : (uint16_t)u;
-            else if (tag == 1) { p->umin = size == 4 ? u : (uint32_t)p->page << 16 | (uint16_t)u; p->have_range = true; }
-            else if (tag == 2) { p->umax = size == 4 ? u : (uint32_t)p->page << 16 | (uint16_t)u; p->have_range = true; }
+            uint32_t full = size == 4 ? u : (uint32_t)p->g.page << 16 | (uint16_t)u;
+            if (tag == 0 && p->nusages < 16) p->usages[p->nusages++] = full;
+            else if (tag == 1) { p->umin = full; p->have_range = true; }
+            else if (tag == 2) { p->umax = full; p->have_range = true; }
         } else if (type == 0) { /* main */
             if (tag == 8) {
                 input_item(h, p, u);
-            } else if (tag == 10 && u == 1) { /* application collection */
-                uint32_t app = usage_at(p, 0);
-                if (app == 0x00010006 || app == 0x00010007) *keyboard_app = true;
-            } else if (tag == 9 && usage_at(p, 0) >> 16 == 0x08) {
+            } else if (tag == 10) { /* collection */
+                if (u == 1 && p->app_depth < 0) {
+                    p->app = usage_at(p, 0);
+                    p->app_depth = p->depth;
+                }
+                p->depth++;
+            } else if (tag == 12) { /* end collection */
+                if (p->depth > 0) p->depth--;
+                if (p->depth == p->app_depth) {
+                    p->app = 0;
+                    p->app_depth = -1;
+                }
+            } else if (tag == 9 && usage_at(p, 0) >> 16 == 0x08 && keyboard_app(p->app)) {
                 h->leds = true;
             }
             p->nusages = 0;
@@ -323,7 +355,7 @@ static void boot_keyboard(struct hid *h) {
     h->leds = true;
 }
 
-static void hid_detach(struct usb_device *d) {
+void usbhid_detach(struct usb_device *d) {
     for (struct hid **pp = &hids; *pp;) {
         struct hid *h = *pp;
         if (h->dev != d) {
@@ -364,13 +396,12 @@ void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, 
         usb_control(d, 0x21, HID_SET_PROTOCOL, 0, h->interface, NULL, 0);
         boot_keyboard(h);
     } else {
-        bool keyboard_app = false;
         uint8_t *rd = report_len && report_len <= 4096 ? kmalloc(report_len) : NULL;
         int got = rd ? usb_control(d, 0x81, USB_REQ_GET_DESCRIPTOR, 0x2200, h->interface, rd, report_len) : -1;
-        if (got > 0) parse_report_descriptor(h, rd, (unsigned)got, &keyboard_app);
+        if (got > 0) parse_report_descriptor(h, rd, (unsigned)got);
         kfree(rd);
         h->mouse = h->x.present && h->y.present;
-        h->keyboard = keyboard_app && h->nkeys;
+        h->keyboard = h->nkeys > 0;
         if (!h->mouse && boot && intf->protocol == 2) { /* boot mouse: buttons, X, Y */
             usb_control(d, 0x21, HID_SET_PROTOCOL, 0, h->interface, NULL, 0);
             h->wheel = (struct value){0};
@@ -392,7 +423,6 @@ void usbhid_attach(struct usb_device *d, const struct usb_interface_desc *intf, 
     usb_control(d, 0x21, HID_SET_IDLE, 0, h->interface, NULL, 0); /* report changes only */
     h->next = hids;
     hids = h;
-    d->class_detach = hid_detach;
     if (h->mouse) input_mouse_attach();
     if (h->keyboard) leds_dirty = true;
     kprintf("usbhid: slot %u interface %u is a %s%s%s%s\n", d->slot, h->interface,
