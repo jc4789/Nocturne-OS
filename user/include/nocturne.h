@@ -200,6 +200,14 @@ long tcp_send_some(int s, const void *buf, size_t len); /* prefix or EAGAIN, nev
 int tcp_cancel(int s);
 long tcp_recv(int s, void *buf, size_t len, int timeout_ms); /* 0 = connection closed */
 int tcp_close(int s);
+/* Passive open: tcp_listen returns a listener on a local address (0: all of them, or e.g.
+   127.0.0.1 for this system only; port 0 picks one; backlog <= 0 uses a default), tcp_accept
+   the next established connection, ordinary for tcp_send/tcp_recv/tcp_close.
+   tcp_close on the listener refuses connections not yet accepted. */
+int tcp_listen(uint32_t ip, uint16_t port, int backlog);
+int tcp_accept(int listener, int timeout_ms, struct n_sockaddr *remote);
+int tcp_address(int s, struct n_sockaddr *local, struct n_sockaddr *remote); /* either may be NULL */
+int tcp_finish(int s); /* stop sending (FIN after the queued data) but keep receiving; tcp_close later */
 /* simulated packet loss/reordering on this process's TCP connections, and TCP counters (either may be NULL) */
 int net_test(const struct n_netfault *set, struct n_tcpstats *stats);
 bool net_wait_up(int timeout_ms); /* wait for DHCP; false if no network */

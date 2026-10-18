@@ -52,6 +52,12 @@ Nocturne は UNIX でも POSIX でもないので、Go 側を Nocturne の API �
   アドレスの解決はシステムの解決器（`NetDNSAll`、全アプリ共通のキャッシュ）、それ以外の
   レコード（MX、TXT、SRV 等）と `PreferGo` は Go の DNS クライアントで同じ解決器へ問い合わせます。
   名前の固定表は `/data/etc/hosts`。IPv4 のみです。
+- **待受け**：`net.Listen("tcp", ...)` はカーネルの受動オープン（RFC 9293、`TCPListen`・
+  `TCPAccept`）を使います。アドレスを省くと全ローカルアドレス、`127.0.0.1` はループバック
+  （インターフェースを通らずカーネル内で折り返し）、ポート 0 は空きポートを選びます。
+  `Close` は待っている `Accept` を起こし、まだ受け取っていない接続を拒否（RST）します。
+  `CloseWrite` は `TCPFinish`（送信待ちの後に FIN、受信は続く）、`LocalAddr` は実際の
+  アドレスとポート（`TCPAddress`）です。
 - **TLS**：`crypto/x509` は `/usr/share/ca/ca-bundle.crt`（ブラウザーと同じ信頼する証明書、
   `make GO=...` が入れます）と `/data/etc/certs` を読みます。
 
@@ -66,10 +72,16 @@ Nocturne は UNIX でも POSIX でもないので、Go 側を Nocturne の API �
 Go の DNS クライアントでの MX、TCP 接続、読み取り期限（300ms で期限切れ）、
 HTTP と HTTPS（TLS 1.3、証明書の検証）を確認しました。
 
+`gotest listen` で、`127.0.0.1:0` の HTTP サーバーへの GET（11ms）、並列 64 本（34ms）、
+32 MiB の転送と `CloseWrite`（74ms、約 434 MiB/s）、`Accept` の期限（200ms）、`Close` で
+起きる `Accept`、同じポートの二重待受け（address in use）、閉じたポートへの接続の拒否、
+`127.0.0.1` だけの待受けにインターフェースのアドレスから接続できないことを確認しました。
+`gotest serve`（`:8080`）にはホストから QEMU のポート転送で curl（20 本並列）、
+Nocturne のブラウザーから `http://127.0.0.1:8080/` で接続し、ページが表示されました。
+
 ## まだできないこと
 
-- TCP の待受け（`net.Listen("tcp", ...)`）。カーネルに待受けの呼出しがまだありません。
-  Unix ドメインソケットと IP 層のソケットもありません（アプリ間はチャンネルを使います）。
+- Unix ドメインソケットと IP 層のソケットはありません（アプリ間はチャンネルを使います）。
 - nil 参照などの CPU 例外は Go の panic にならず、アプリが終了します（カーネルに
   例外をアプリへ渡す仕組みがまだありません）。
 - 解放したヒープのページは OS へ返しません（`sysUnused` は何もしません）。

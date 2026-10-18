@@ -69,6 +69,15 @@ enum {
     SYS_TCP_CONNECT, SYS_TCP_SEND, SYS_TCP_RECV, SYS_TCP_CLOSE, SYS_UDP_CLOSE, SYS_NET_TEST,
     SYS_NET_DNS_ALL, SYS_TCP_SEND_UNTIL, SYS_TCP_CANCEL, SYS_NET_STATS,
     SYS_NET_SETUP_CANCEL_CHANNEL,
+    /* Passive open (RFC 9293). A listener shares the TCP id space: TCP_CLOSE
+       ends it and refuses its unaccepted connections, TCP_CANCEL wakes waiters.
+       LISTEN (ip, port, backlog): ip 0 takes every local address, otherwise one of
+       them (127/8 or the interface's); port 0 picks one, backlog <= 0 a default.
+       ACCEPT (listener, timeout_ms like TCP_RECV, struct n_sockaddr *remote or 0).
+       ADDRESS (id, struct n_sockaddr *local, struct n_sockaddr *remote; either 0).
+       FINISH (id): RFC 9293 CLOSE, the FIN after the queued data; receiving goes
+       on until the peer finishes too, and the id stays the caller's until TCP_CLOSE. */
+    SYS_TCP_LISTEN, SYS_TCP_ACCEPT, SYS_TCP_ADDRESS, SYS_TCP_FINISH,
     SYS_NET_LIMIT = 128,
     /* Native ABI (docs/nocturne-native-abi.md): typed handles, documents and
        folders by full path, message channels, apps and event queues. */

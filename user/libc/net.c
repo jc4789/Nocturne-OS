@@ -73,6 +73,16 @@ long tcp_recv(int s, void *buf, size_t len, int timeout_ms) {
     return ret(__syscall(SYS_TCP_RECV, s, (long)buf, (long)len, timeout_ms, 0));
 }
 int tcp_close(int s) { return (int)ret(__syscall(SYS_TCP_CLOSE, s, 0, 0, 0, 0)); }
+int tcp_listen(uint32_t ip, uint16_t port, int backlog) {
+    return (int)ret(__syscall(SYS_TCP_LISTEN, ip, port, backlog, 0, 0));
+}
+int tcp_accept(int listener, int timeout_ms, struct n_sockaddr *remote) {
+    return (int)ret(__syscall(SYS_TCP_ACCEPT, listener, timeout_ms, (long)remote, 0, 0));
+}
+int tcp_address(int s, struct n_sockaddr *local, struct n_sockaddr *remote) {
+    return (int)ret(__syscall(SYS_TCP_ADDRESS, s, (long)local, (long)remote, 0, 0));
+}
+int tcp_finish(int s) { return (int)ret(__syscall(SYS_TCP_FINISH, s, 0, 0, 0, 0)); }
 int net_test(const struct n_netfault *set, struct n_tcpstats *stats) {
     return (int)ret(__syscall(SYS_NET_TEST, (long)set, (long)stats, 0, 0, 0));
 }

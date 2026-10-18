@@ -414,10 +414,10 @@ index ec6368e8..afa35dca 100644
  	{"openbsd", "arm"}:     {CgoSupported: true},
 diff --git a/src/internal/poll/fd_nocturne.go b/src/internal/poll/fd_nocturne.go
 new file mode 100644
-index 00000000..37a8b704
+index 00000000..8ae3f433
 --- /dev/null
 +++ b/src/internal/poll/fd_nocturne.go
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,136 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -486,6 +486,15 @@ index 00000000..37a8b704
 +func (fd *FD) SetDeadline(t time.Time) error      { return ErrNoDeadline }
 +func (fd *FD) SetReadDeadline(t time.Time) error  { return ErrNoDeadline }
 +func (fd *FD) SetWriteDeadline(t time.Time) error { return ErrNoDeadline }
++
++// Accept takes a connection through fn, serialized with other readers.
++func (fd *FD) Accept(fn func() (int, error)) (int, error) {
++	if err := fd.readLock(); err != nil {
++		return -1, err
++	}
++	defer fd.readUnlock()
++	return fn()
++}
 +
 +// RawControl invokes the user-defined function f for a non-IO operation.
 +func (fd *FD) RawControl(f func(uintptr)) error {
@@ -605,10 +614,10 @@ index 0fcf2c6c..011938ef 100644
  
 diff --git a/src/net/fd_nocturne.go b/src/net/fd_nocturne.go
 new file mode 100644
-index 00000000..5cfc242d
+index 00000000..a01d29b2
 --- /dev/null
 +++ b/src/net/fd_nocturne.go
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,302 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -785,8 +794,16 @@ index 00000000..5cfc242d
 +	return syscall.ENOTSUP
 +}
 +
++// closeWrite sends the FIN after what is queued; reading goes on.
 +func (fd *netFD) closeWrite() error {
-+	return syscall.ENOTSUP
++	if fd.udp {
++		return syscall.ENOTSUP
++	}
++	var err error
++	if e := fd.pfd.RawControl(func(uintptr) { err = syscall.TCPFinish(fd.id) }); e != nil {
++		return e
++	}
++	return wrapSyscallError("shutdown", err)
 +}
 +
 +func setDeadline(d *atomic.Int64, t time.Time) {
@@ -811,6 +828,50 @@ index 00000000..5cfc242d
 +func (fd *netFD) SetWriteDeadline(t time.Time) error {
 +	setDeadline(&fd.wdeadline, t)
 +	return nil
++}
++
++// accept takes a listener's next connection.
++func (fd *netFD) accept() (*netFD, error) {
++	var remote syscall.Sockaddr4
++	id, err := fd.pfd.Accept(func() (int, error) {
++		for {
++			ms, err := fd.wait(&fd.rdeadline)
++			if err != nil {
++				return -1, err
++			}
++			id, err := syscall.TCPAccept(fd.id, ms, &remote)
++			if err == syscall.ERR_NOT_READY {
++				continue
++			}
++			if err != nil && fd.closing.Load() {
++				return -1, poll.ErrNetClosing
++			}
++			return id, err
++		}
++	})
++	if err != nil {
++		return nil, wrapSyscallError("accept", err)
++	}
++	return newFD(fd.net, id, false, tcpLocalAddr(id), &TCPAddr{IP: ipFromUint32(remote.IP), Port: int(remote.Port)}), nil
++}
++
++// closeListener ends a listener at once: the system refuses connections
++// not yet accepted and wakes a blocked accept.
++func (fd *netFD) closeListener() error {
++	if !fd.closing.Swap(true) {
++		// Only the first Close gets here, before the number is given up.
++		syscall.TCPCancel(fd.id)
++	}
++	return fd.pfd.Close()
++}
++
++// tcpLocalAddr is a connection's or listener's local address.
++func tcpLocalAddr(id int) *TCPAddr {
++	var local syscall.Sockaddr4
++	if syscall.TCPAddress(id, &local, nil) != nil {
++		return &TCPAddr{IP: localIP()}
++	}
++	return &TCPAddr{IP: ipFromUint32(local.IP), Port: int(local.Port)}
 +}
 +
 +// dup is not available: network connections are not handles.
@@ -1194,10 +1255,10 @@ index 00000000..56f32a49
 +}
 diff --git a/src/net/sockopt_nocturne.go b/src/net/sockopt_nocturne.go
 new file mode 100644
-index 00000000..bbb98cc0
+index 00000000..9746fa23
 --- /dev/null
 +++ b/src/net/sockopt_nocturne.go
-@@ -0,0 +1,43 @@
+@@ -0,0 +1,45 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -1214,6 +1275,8 @@ index 00000000..bbb98cc0
 +
 +var hostsFilePath = "/data/etc/hosts"
 +
++// maxListenerBacklog is 0: the system keeps its default number of
++// connections waiting for Accept.
 +func maxListenerBacklog() int { return 0 }
 +
 +func concurrentThreadsLimit() int { return 500 }
@@ -1243,10 +1306,10 @@ index 00000000..bbb98cc0
 +func joinIPv6Group(fd *netFD, ifi *Interface, ip IP) error      { return syscall.ENOTSUP }
 diff --git a/src/net/tcpsock_nocturne.go b/src/net/tcpsock_nocturne.go
 new file mode 100644
-index 00000000..1120f3c4
+index 00000000..e7b647d3
 --- /dev/null
 +++ b/src/net/tcpsock_nocturne.go
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,99 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -1291,7 +1354,7 @@ index 00000000..1120f3c4
 +	if !ok {
 +		return nil, errNotIPv4(raddr.IP)
 +	}
-+	// The system chooses the local port; it is not reported.
++	// The system chooses the local port.
 +	if laddr != nil && laddr.Port != 0 {
 +		return nil, &AddrError{Err: "a local port cannot be chosen", Addr: laddr.String()}
 +	}
@@ -1299,28 +1362,52 @@ index 00000000..1120f3c4
 +	if err != nil {
 +		return nil, err
 +	}
-+	fd := newFD(sd.network, id, false, &TCPAddr{IP: localIP()}, raddr)
++	fd := newFD(sd.network, id, false, tcpLocalAddr(id), raddr)
 +	return newTCPConn(fd, sd.Dialer.KeepAlive, sd.Dialer.KeepAliveConfig, testPreHookSetKeepAlive, testHookSetKeepAlive), nil
 +}
-+
-+// Nocturne's TCP does not accept connections yet.
 +
 +func (ln *TCPListener) ok() bool { return ln != nil && ln.fd != nil }
 +
 +func (ln *TCPListener) accept() (*TCPConn, error) {
-+	return nil, syscall.ENOTSUP
++	fd, err := ln.fd.accept()
++	if err != nil {
++		return nil, err
++	}
++	return newTCPConn(fd, ln.lc.KeepAlive, ln.lc.KeepAliveConfig, testPreHookSetKeepAlive, testHookSetKeepAlive), nil
 +}
 +
 +func (ln *TCPListener) close() error {
-+	return ln.fd.Close()
++	return ln.fd.closeListener()
 +}
 +
++// file is not available: a listener is not a handle.
 +func (ln *TCPListener) file() (*os.File, error) {
 +	return nil, syscall.ENOTSUP
 +}
 +
 +func (sl *sysListener) listenTCP(ctx context.Context, laddr *TCPAddr) (*TCPListener, error) {
-+	return nil, syscall.ENOTSUP
++	switch sl.network {
++	case "tcp", "tcp4", "tcp6":
++	default:
++		return nil, UnknownNetworkError(sl.network)
++	}
++	var at syscall.Sockaddr4
++	if laddr != nil {
++		ip := laddr.IP
++		if ip.IsUnspecified() {
++			ip = nil // every local address, as for ":port" and "[::]:port"
++		}
++		var ok bool
++		if at, ok = sockaddr4(ip, laddr.Port); !ok {
++			return nil, errNotIPv4(laddr.IP)
++		}
++	}
++	id, err := syscall.TCPListen(at.IP, at.Port, maxListenerBacklog())
++	if err != nil {
++		return nil, os.NewSyscallError("listen", err)
++	}
++	fd := newFD(sl.network, id, false, tcpLocalAddr(id), nil)
++	return &TCPListener{fd: fd, lc: sl.ListenConfig}, nil
 +}
 diff --git a/src/net/udpsock_nocturne.go b/src/net/udpsock_nocturne.go
 new file mode 100644
@@ -3888,10 +3975,10 @@ index e1d7e213..0e83e7d9 100644
  
 diff --git a/src/syscall/syscall_nocturne.go b/src/syscall/syscall_nocturne.go
 new file mode 100644
-index 00000000..4395a7c7
+index 00000000..49bd6353
 --- /dev/null
 +++ b/src/syscall/syscall_nocturne.go
-@@ -0,0 +1,856 @@
+@@ -0,0 +1,896 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -4600,6 +4687,10 @@ index 00000000..4395a7c7
 +	SYS_TCP_CLOSE      = 105
 +	SYS_TCP_SEND_UNTIL = 109
 +	SYS_TCP_CANCEL     = 110
++	SYS_TCP_LISTEN     = 113
++	SYS_TCP_ACCEPT     = 114
++	SYS_TCP_ADDRESS    = 115
++	SYS_TCP_FINISH     = 116
 +)
 +
 +// TCPSendUntil flags.
@@ -4705,6 +4796,42 @@ index 00000000..4395a7c7
 +// ERR_CANCELLED; the number stays the caller's until TCPClose.
 +func TCPCancel(id int) error {
 +	_, e := RawSyscall(SYS_TCP_CANCEL, uintptr(id), 0, 0, 0, 0)
++	return errnoErr(e)
++}
++
++// TCPListen waits for connections to ip (0: every local address) and port
++// (0: any free one), keeping at most backlog of them (<= 0: the system's
++// default) until TCPAccept takes them, and returns the listener's number.
++// TCPClose ends it.
++func TCPListen(ip uint32, port uint16, backlog int) (int, error) {
++	r, e := RawSyscall(SYS_TCP_LISTEN, uintptr(ip), uintptr(port), uintptr(backlog), 0, 0)
++	if e != 0 {
++		return -1, e
++	}
++	return int(r), nil
++}
++
++// TCPAccept takes the listener's next established connection, waiting at
++// most timeoutMs (like TCPRecv), and reports its remote address.
++func TCPAccept(id int, timeoutMs int, remote *Sockaddr4) (int, error) {
++	r, e := Syscall(SYS_TCP_ACCEPT, uintptr(id), uintptr(timeoutMs), uintptr(unsafe.Pointer(remote)), 0, 0)
++	if e != 0 {
++		return -1, e
++	}
++	return int(r), nil
++}
++
++// TCPAddress reports a connection's or listener's local and remote
++// addresses; either may be nil.
++func TCPAddress(id int, local, remote *Sockaddr4) error {
++	_, e := RawSyscall(SYS_TCP_ADDRESS, uintptr(id), uintptr(unsafe.Pointer(local)), uintptr(unsafe.Pointer(remote)), 0, 0)
++	return errnoErr(e)
++}
++
++// TCPFinish ends sending (a FIN follows the queued data); receiving goes
++// on until the peer finishes too. TCPClose still gives the number up.
++func TCPFinish(id int) error {
++	_, e := RawSyscall(SYS_TCP_FINISH, uintptr(id), 0, 0, 0, 0)
 +	return errnoErr(e)
 +}
 +

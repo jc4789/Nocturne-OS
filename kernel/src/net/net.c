@@ -268,6 +268,30 @@ static int eth_output(const uint8_t dst[6], uint16_t type, size_t len) {
     return result;
 }
 
+/* This system's own addresses: the loopback network 127/8 and the interface
+   address. Their datagrams never reach the wire. */
+static bool ip_is_local(uint32_t dst) { return (dst >> 24) == 127 || (configured && dst == my_ip); }
+/* A datagram to 127/8 comes from that same loopback address, so both ends of
+   a local connection name each other alike; everything else is from my_ip. */
+static uint32_t ip_source(uint32_t dst) { return (dst >> 24) == 127 ? dst : my_ip; }
+
+/* Enter a local datagram in the receive queue as if the card had delivered it.
+   A full queue is backpressure (the caller retries), not a lost packet. */
+static int ip_loopback(size_t len) {
+    if (!nif) return -N_ERR_NETWORK_DOWN;
+    struct eth_hdr *e = (struct eth_hdr *)frame;
+    memcpy(e->dst, nif->mac, 6);
+    memcpy(e->src, nif->mac, 6);
+    e->type = htons(0x0800);
+    uint64_t flags = irq_save(); /* the card's interrupt shares the queue */
+    bool full = (rxq_head + 1) % RXQ == rxq_tail;
+    if (!full) net_rx(frame, 14 + len);
+    irq_restore(flags);
+    if (full) return -N_ERR_BUSY;
+    tx_packets++;
+    return 0;
+}
+
 static int ip_output(uint32_t dst, const uint8_t mac[6], uint8_t proto, size_t len) {
     struct ip_hdr *ip = (struct ip_hdr *)(frame + 14);
     ip->vihl = 0x45;
@@ -278,9 +302,10 @@ static int ip_output(uint32_t dst, const uint8_t mac[6], uint8_t proto, size_t l
     ip->ttl = 64;
     ip->proto = proto;
     ip->csum = 0;
-    ip_put(ip->src, my_ip);
+    ip_put(ip->src, ip_source(dst));
     ip_put(ip->dst, dst);
     ip->csum = htons(csum_fold(csum_add(0, ip, 20)));
+    if (ip_is_local(dst)) return ip_loopback(20 + len);
     return eth_output(mac, 0x0800, 20 + len);
 }
 
@@ -353,6 +378,10 @@ static uint32_t next_hop(uint32_t dst) { return ((dst ^ my_ip) & my_mask) == 0 ?
 static int arp_resolve_until(uint32_t dst, uint8_t mac[6], uint64_t deadline) {
     if (!nif) return -N_ERR_NETWORK_DOWN;
     if(net_setup_cancelled())return -N_ERR_CANCELLED;
+    if (ip_is_local(dst)) { /* delivered by ip_loopback */
+        memcpy(mac, nif->mac, 6);
+        return 0;
+    }
     if (dst == 0xFFFFFFFF || dst == (my_ip | ~my_mask)) {
         memcpy(mac, bcast_mac, 6);
         return 0;
@@ -497,7 +526,7 @@ static int udp_output(uint16_t sport, uint32_t dst, uint16_t dport, const uint8_
     u->len = htons((uint16_t)(8 + len));
     u->csum = 0;
     memcpy(L4 + 8, data, len);
-    uint16_t c = l4_csum(my_ip, dst, 17, L4, 8 + len);
+    uint16_t c = l4_csum(ip_source(dst), dst, 17, L4, 8 + len);
     u->csum = htons(c ? c : 0xFFFF);
     return ip_output(dst, mac, 17, 8 + len);
 }
@@ -1055,7 +1084,8 @@ static uint32_t tcp_rx_target = TCP_BUFFER_DEFAULT, tcp_tx_target = TCP_BUFFER_D
 #define F_ACK 0x10
 
 enum { T_FREE, T_SYN_SENT, T_ESTABLISHED, T_FIN_WAIT1, T_FIN_WAIT2, T_CLOSE_WAIT, T_CLOSING, T_LAST_ACK,
-       T_TIME_WAIT, T_CLOSED };
+       T_TIME_WAIT, T_CLOSED, T_LISTEN, T_SYN_RECEIVED };
+#define TCP_BACKLOG_DEFAULT 128 /* listen() without an application backlog */
 
 #define TCP_OOO   8    /* out-of-order ranges remembered per connection */
 #define RTO_MIN   200  /* ms */
@@ -1096,6 +1126,14 @@ struct tcb {
     uint64_t rto_at, linger_until;
     uint64_t generation;
     int rto, retries;
+    /* Passive open. A listener (T_LISTEN) keeps only lip (0: every local
+       address), lport and backlog. Each connection it spawned names it by
+       generation and stays owned by the stack (accept_pending, not user_open)
+       until SYS_TCP_ACCEPT hands it out, oldest established first (accept_order). */
+    int backlog;
+    uint32_t lip;
+    bool accept_pending;
+    uint64_t listener, accept_order;
 #if NET_HANDOFF_DIAG
     uint64_t ap_enqueue_at;
 #endif
@@ -1105,7 +1143,7 @@ struct tcb {
 static struct tcb *tcp_initial_slots[TCP_INITIAL];
 static struct tcb **tcbs=tcp_initial_slots;
 static size_t tcp_capacity=TCP_INITIAL;
-static uint64_t tcp_generation;
+static uint64_t tcp_generation, tcp_accept_counter;
 
 static struct n_tcpstats tcp_stats;
 
@@ -1167,7 +1205,9 @@ static int tcp_output(struct tcb *t, uint8_t flags, uint32_t seq, size_t len) {
         return 0; /* accepted, then intentionally "lost" on the test wire */
     }
     struct tcp_hdr *h = (struct tcp_hdr *)L4;
-    size_t hl = (flags & F_SYN) ? 28 : 20; /* MSS, NOP and 3-byte WS, word aligned */
+    /* RFC 7323: a <SYN,ACK> carries Window Scale only when the <SYN> did */
+    bool ws = (flags & F_SYN) && (!(flags & F_ACK) || t->window_scaled);
+    size_t hl = (flags & F_SYN) ? (ws ? 28 : 24) : 20; /* MSS, NOP and 3-byte WS, word aligned */
     h->sport = htons(t->lport);
     h->dport = htons(t->rport);
     h->seq = htonl(seq);
@@ -1184,13 +1224,15 @@ static int tcp_output(struct tcb *t, uint8_t flags, uint32_t seq, size_t len) {
         L4[21] = 4;
         L4[22] = TCP_MSS >> 8;
         L4[23] = TCP_MSS & 255;
-        L4[24] = 1; /* NOP aligns the following option */
-        L4[25] = 3; /* RFC 7323 Window Scale */
-        L4[26] = 3;
-        L4[27] = t->rx_shift;
+        if (ws) {
+            L4[24] = 1; /* NOP aligns the following option */
+            L4[25] = 3; /* RFC 7323 Window Scale */
+            L4[26] = 3;
+            L4[27] = t->rx_shift;
+        }
     }
     if (len) tcp_ring_read(L4+hl,t->tx,t->tx_capacity,t->tx_head+(seq-t->snd_una),(uint32_t)len);
-    h->csum = htons(l4_csum(my_ip, t->rip, 6, L4, hl + len));
+    h->csum = htons(l4_csum(ip_source(t->rip), t->rip, 6, L4, hl + len));
     int result = ip_output(t->rip, t->mac, 6, hl+len);
     if (result == -N_ERR_NOT_READY || result == -N_ERR_BUSY) {
         t->tx_retry = true;
@@ -1365,8 +1407,23 @@ static void tcp_ooo_pull(struct tcb *t) {
     }
 }
 
+static void tcp_reset(struct tcb *t, int err);
+
+/* A listener that ends refuses (RST) every connection it has not handed out;
+   tcp_tick then releases them, since nobody owns them. */
+static void tcp_refuse_pending(struct tcb *listener) {
+    for (size_t i=0;i<tcp_capacity;i++) {
+        struct tcb *c=tcbs[i];
+        if (!c || c->state==T_FREE || !c->accept_pending || c->listener!=listener->generation) continue;
+        c->accept_pending=false;
+        c->linger_until=0;
+        tcp_reset(c,-N_ERR_CONNECTION_RESET);
+    }
+}
+
 static void tcp_reset(struct tcb *t, int err) {
-    if (t->state != T_SYN_SENT && t->state != T_CLOSED && t->state != T_FREE)
+    if (t->state == T_LISTEN) tcp_refuse_pending(t);
+    else if (t->state != T_SYN_SENT && t->state != T_CLOSED && t->state != T_FREE)
         tcp_output(t, F_RST | F_ACK, t->snd_nxt, 0);
     t->state = T_CLOSED;
     t->err = err;
@@ -1376,18 +1433,149 @@ static void tcp_reset(struct tcb *t, int err) {
 
 static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len);
 static void tcp_input_held(size_t n);
+static int tcp_alloc_slot(void);
 
-static void tcp_input(uint32_t src, const uint8_t *p, size_t len) {
-    if (len < 20 || l4_csum(src, my_ip, 6, p, len) != 0) return;
+/* A reset that belongs to no connection: replies to segments for a port with
+   no listener (RFC 9293 3.10.7.1) and to ACKs a listener cannot accept. */
+static void tcp_output_reset(uint32_t dst, const uint8_t mac[6], uint16_t sport, uint16_t dport,
+                             uint32_t seq, uint32_t ack, uint8_t flags) {
+    struct tcp_hdr *h = (struct tcp_hdr *)L4;
+    h->sport = htons(sport);
+    h->dport = htons(dport);
+    h->seq = htonl(seq);
+    h->ack = htonl(ack);
+    h->off = 5 << 4;
+    h->flags = flags;
+    h->win = 0;
+    h->csum = 0;
+    h->urg = 0;
+    h->csum = htons(l4_csum(ip_source(dst), dst, 6, L4, 20));
+    if (!ip_output(dst, mac, 6, 20)) tcp_stats.segs_out++;
+}
+
+static void tcp_reset_unknown(uint32_t src, const uint8_t mac[6], const struct tcp_hdr *h, size_t len) {
+    if (h->flags & F_RST) return; /* never answer a reset */
+    size_t hl = (size_t)(h->off >> 4) * 4;
+    uint32_t seg_len = (uint32_t)(len - hl) + ((h->flags & F_SYN) ? 1 : 0) + ((h->flags & F_FIN) ? 1 : 0);
+    if (h->flags & F_ACK) tcp_output_reset(src, mac, ntohs(h->dport), ntohs(h->sport), ntohl(h->ack), 0, F_RST);
+    else tcp_output_reset(src, mac, ntohs(h->dport), ntohs(h->sport), 0, ntohl(h->seq) + seg_len, F_RST | F_ACK);
+}
+
+/* MSS and Window Scale of a <SYN> or <SYN,ACK> (RFC 9293 3.7.1, RFC 7323 2) */
+static void tcp_syn_options(struct tcb *t, const uint8_t *p, size_t hl) {
+    t->mss = 536;
+    for (size_t o = 20; o < hl;) {
+        uint8_t kind = p[o];
+        if (kind == 0) break;
+        if (kind == 1) {
+            o++;
+            continue;
+        }
+        if (hl-o < 2) break;
+        uint8_t l = p[o + 1];
+        if (l < 2 || l > hl-o) break;
+        if (kind == 2 && l == 4) {
+            unsigned mss = (unsigned)p[o+2] << 8 | p[o+3];
+            if (mss) t->mss = (uint16_t)MIN(mss,TCP_MSS);
+        }
+        if (kind == 3 && l == 3 && !t->window_scaled) {
+            t->window_scaled = true;
+            t->tx_shift = MIN(p[o+2],TCP_WINDOW_SHIFT_MAX);
+        }
+        o += l;
+    }
+}
+
+static size_t tcp_listener_pending(const struct tcb *listener) {
+    size_t n=0;
+    for (size_t i=0;i<tcp_capacity;i++)
+        if (tcbs[i] && tcbs[i]->state!=T_FREE && tcbs[i]->accept_pending && tcbs[i]->listener==listener->generation) n++;
+    return n;
+}
+
+static struct tcb *tcp_listener_of(const struct tcb *t) {
+    for (size_t i=0;i<tcp_capacity;i++)
+        if (tcbs[i] && tcbs[i]->state==T_LISTEN && tcbs[i]->generation==t->listener) return tcbs[i];
+    return NULL;
+}
+
+/* RFC 9293 3.10.7.2, LISTEN: a <SYN> makes a connection in SYN-RECEIVED that
+   answers <SYN,ACK>; it waits for SYS_TCP_ACCEPT once its handshake ends. */
+static void tcp_listen_input(struct tcb *l, uint32_t src, const uint8_t mac[6], const uint8_t *p, size_t len) {
+    const struct tcp_hdr *h = (const struct tcp_hdr *)p;
+    size_t hl = (size_t)(h->off >> 4) * 4;
+    if (h->flags & F_RST) return;
+    if (h->flags & F_ACK) {
+        tcp_output_reset(src, mac, l->lport, ntohs(h->sport), ntohl(h->ack), 0, F_RST);
+        return;
+    }
+    if (!(h->flags & F_SYN)) return;
+    /* A full queue drops the <SYN>; the peer's retransmission tries again
+       once the application has accepted. Storage is not reserved for it. */
+    if (tcp_listener_pending(l) >= (size_t)l->backlog) return;
+    int slot = tcp_alloc_slot();
+    if (slot < 0) return;
+    struct tcb *t = tcbs[slot];
+    memset(t, 0, sizeof *t);
+    t->rx_capacity = tcp_rx_target;
+    t->tx_capacity = tcp_tx_target;
+    while (!(t->rx=kmalloc(t->rx_capacity)) && t->rx_capacity>PAGE_SIZE) t->rx_capacity/=2;
+    while (!(t->tx=kmalloc(t->tx_capacity)) && t->tx_capacity>PAGE_SIZE) t->tx_capacity/=2;
+    if (!t->rx || !t->tx) {
+        tcp_free(t);
+        return;
+    }
+    t->pid = l->pid;
+    if(++tcp_generation==0)++tcp_generation;
+    t->generation = tcp_generation;
+    t->listener = l->generation;
+    t->accept_pending = true;
+    while ((t->rx_capacity-1)>>t->rx_shift > UINT16_MAX) t->rx_shift++;
+    t->rip = src;
+    t->rport = ntohs(h->sport);
+    t->lport = l->lport;
+    memcpy(t->mac, mac, 6);
+    tcp_syn_options(t, p, hl);
+    uint32_t irs = ntohl(h->seq);
+    t->rcv_nxt = irs + 1; /* data carried by the <SYN> is not kept; the peer resends it */
+    t->snd_wnd = ntohs(h->win); /* a <SYN> window is never scaled */
+    t->snd_wl1 = irs;
+    t->iss = rnd();
+    t->snd_una = t->snd_wl2 = t->iss;
+    t->snd_nxt = t->snd_max = t->iss;
+    t->rto = 1000;
+    t->state = T_SYN_RECEIVED;
+    if (!tcp_output(t, F_SYN | F_ACK, t->iss, 0)) {
+        t->snd_nxt = t->snd_max = t->iss + 1;
+        tcp_arm(t);
+    }
+}
+
+static void tcp_input(uint32_t src, uint32_t dst, const uint8_t *src_mac, const uint8_t *p, size_t len) {
+    if (len < 20 || l4_csum(src, dst, 6, p, len) != 0) return;
     const struct tcp_hdr *h = (const struct tcp_hdr *)p;
     size_t hl = (size_t)(h->off >> 4) * 4;
     if (hl < 20 || hl > len) return;
     uint16_t sport = ntohs(h->sport), dport = ntohs(h->dport);
-    struct tcb *t = NULL;
-    for(size_t i=0;i<tcp_capacity;i++)
-        if(tcbs[i] && tcbs[i]->state!=T_FREE && tcbs[i]->rip==src && tcbs[i]->rport==sport && tcbs[i]->lport==dport)
-            t=tcbs[i];
-    if (!t || t->state == T_CLOSED) return;
+    struct tcb *t = NULL, *listener = NULL;
+    for(size_t i=0;i<tcp_capacity;i++) {
+        struct tcb *c=tcbs[i];
+        if(!c || c->state==T_FREE) continue;
+        if(c->state==T_LISTEN) { /* a listener on this very address before one on every address */
+            if(c->lport==dport && (c->lip==dst || (!c->lip && !listener))) listener=c;
+        }
+        /* a reused tuple may still have its closed predecessor lingering */
+        else if(c->rip==src && c->rport==sport && c->lport==dport && (!t || t->state==T_CLOSED)) t=c;
+    }
+    if (!t || (t->state == T_CLOSED && listener && (h->flags & (F_SYN|F_ACK|F_RST)) == F_SYN)) {
+        uint8_t mac[6];
+        memcpy(mac, src_mac, 6); /* the frame's sender is the next hop back */
+        tcp_stats.segs_in++;
+        if (listener) tcp_listen_input(listener, src, mac, p, len);
+        else if (!t) tcp_reset_unknown(src, mac, h, len);
+        return;
+    }
+    if (t->state == T_CLOSED) return;
     tcp_stats.segs_in++;
     if (t->pid == fault_pid && len > hl && t->state != T_SYN_SENT) {
         if (fault_hit(fault.rx_drop)) {
@@ -1442,27 +1630,7 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
         t->snd_wnd = ntohs(h->win); /* SYN-ACK is NEVER shifted */
         t->snd_wl1 = seq;
         t->snd_wl2 = ack;
-        t->mss = 536;
-        for (size_t o = 20; o < hl;) {
-            uint8_t kind = p[o];
-            if (kind == 0) break;
-            if (kind == 1) {
-                o++;
-                continue;
-            }
-            if (hl-o < 2) break;
-            uint8_t l = p[o + 1];
-            if (l < 2 || l > hl-o) break;
-            if (kind == 2 && l == 4) {
-                unsigned mss = (unsigned)p[o+2] << 8 | p[o+3];
-                if (mss) t->mss = (uint16_t)MIN(mss,TCP_MSS);
-            }
-            if (kind == 3 && l == 3 && !t->window_scaled) {
-                t->window_scaled = true;
-                t->tx_shift = MIN(p[o+2],TCP_WINDOW_SHIFT_MAX);
-            }
-            o += l;
-        }
+        tcp_syn_options(t, p, hl);
         t->state = T_ESTABLISHED;
         t->rto_at = 0;
         t->retries = 0;
@@ -1473,6 +1641,33 @@ static void tcp_segment(struct tcb *t, const uint8_t *p, size_t len) {
         tcp_progress(t);
         tcp_push(t, false);
         return;
+    }
+
+    /* RFC 9293 3.10.7.4, SYN-RECEIVED: the ACK of our <SYN,ACK> ends the
+       passive open; the same segment may already carry data or a FIN. */
+    if (t->state == T_SYN_RECEIVED) {
+        if (fl & F_SYN) {
+            /* the peer did not hear our <SYN,ACK>: answer its <SYN> again */
+            if (!(fl & F_ACK) && seq == t->rcv_nxt - 1) tcp_output(t, F_SYN | F_ACK, t->iss, 0);
+            return;
+        }
+        if (!(fl & F_ACK)) return;
+        if (!SEQ_LT(t->snd_una, ack) || !SEQ_LEQ(ack, t->snd_max)) {
+            tcp_output_reset(t->rip, t->mac, t->lport, t->rport, ack, 0, F_RST);
+            return;
+        }
+        t->state = T_ESTABLISHED;
+        t->snd_una = ack;
+        t->snd_wnd = tcp_peer_window(t, h);
+        t->snd_wl1 = seq;
+        t->snd_wl2 = ack;
+        t->rto_at = 0;
+        t->retries = 0;
+        t->rto = 1000;
+        tcp_cc_init(t);
+        t->accept_order = ++tcp_accept_counter;
+        struct tcb *listener = tcp_listener_of(t);
+        if (listener) tcp_progress(listener);
     }
 
     bool need_ack = false, immediate_ack = false;
@@ -1609,21 +1804,23 @@ static void tcp_tick(void) {
         struct tcb *t=tcbs[i];
         if(!t || t->state==T_FREE)continue;
         if (t->state == T_TIME_WAIT && now >= t->linger_until) t->state = T_CLOSED;
-        if (!t->user_open && (t->state == T_CLOSED || now >= t->linger_until)) {
+        /* a connection waiting for accept belongs to its listener, not to a linger timer */
+        if (!t->user_open && (t->state == T_CLOSED || (!t->accept_pending && now >= t->linger_until))) {
             if (t->state != T_CLOSED) tcp_reset(t, -N_ERR_CONNECTION_RESET);
             tcp_free(t);
             continue;
         }
         if (t->rto_at && now >= t->rto_at) {
             t->rto_at = 0;
-            bool probe = t->state != T_SYN_SENT && t->snd_wnd == 0; /* persist: the peer is just not reading */
-            if (!probe && ++t->retries > (t->state == T_SYN_SENT ? 5 : 8)) {
+            bool syn = t->state == T_SYN_SENT || t->state == T_SYN_RECEIVED;
+            bool probe = !syn && t->snd_wnd == 0; /* persist: the peer is just not reading */
+            if (!probe && ++t->retries > (syn ? 5 : 8)) {
                 tcp_reset(t, -N_ERR_TIMEOUT);
                 continue;
             }
             t->rto = MIN(t->rto * 2, RTO_MAX);
-            if (t->state == T_SYN_SENT) {
-                if (!tcp_output(t, F_SYN, t->iss, 0)) {
+            if (syn) {
+                if (!tcp_output(t, t->state == T_SYN_SENT ? F_SYN : F_SYN | F_ACK, t->iss, 0)) {
                     t->snd_nxt = t->snd_max = t->iss+1;
                     tcp_arm(t);
                 }
@@ -1812,11 +2009,82 @@ static uint16_t tcp_local_port(uint32_t ip,uint16_t remote) {
     for(unsigned attempt=0;attempt<16384;attempt++) {
         uint16_t port=ephemeral_port();bool occupied=false;
         for(size_t i=0;i<tcp_capacity;i++)
-            if(tcbs[i] && tcbs[i]->state!=T_FREE && tcbs[i]->rip==ip &&
-               tcbs[i]->rport==remote && tcbs[i]->lport==port){occupied=true;break;}
+            if(tcbs[i] && tcbs[i]->state!=T_FREE && ((tcbs[i]->rip==ip && tcbs[i]->rport==remote) ||
+               tcbs[i]->state==T_LISTEN) && tcbs[i]->lport==port){occupied=true;break;}
         if(!occupied)return port;
     }
     return 0;
+}
+
+static bool tcp_port_listening(uint32_t ip, uint16_t port) {
+    for(size_t i=0;i<tcp_capacity;i++)
+        if(tcbs[i] && tcbs[i]->state==T_LISTEN && tcbs[i]->lport==port &&
+           (!ip || !tcbs[i]->lip || tcbs[i]->lip==ip))return true;
+    return false;
+}
+
+static int64_t sys_tcp_listen(uint32_t ip, uint16_t port, int backlog) {
+    if (ip && !ip_is_local(ip)) return -N_ERR_INVALID;
+    if (!port) {
+        /* an ephemeral port no listener or connection is using */
+        for (unsigned attempt=0;attempt<16384 && !port;attempt++) {
+            uint16_t candidate=ephemeral_port();
+            bool used=false;
+            for (size_t i=0;i<tcp_capacity && !used;i++)
+                used=tcbs[i] && tcbs[i]->state!=T_FREE && tcbs[i]->lport==candidate;
+            if (!used) port=candidate;
+        }
+        if (!port) return -N_ERR_ADDRESS_IN_USE;
+    } else if (tcp_port_listening(ip, port)) return -N_ERR_ADDRESS_IN_USE;
+    int h=tcp_alloc_slot();if(h<0)return h;
+    struct tcb *t=tcbs[h];
+    memset(t,0,sizeof *t);
+    t->pid=task_process()->pid;
+    if(++tcp_generation==0)++tcp_generation;
+    t->generation=tcp_generation;
+    t->user_open=true;
+    t->lip=ip;
+    t->lport=port;
+    t->backlog=backlog>0?backlog:TCP_BACKLOG_DEFAULT;
+    t->state=T_LISTEN;
+    return h;
+}
+
+static struct tcb *tcp_next_accept(const struct tcb *listener) {
+    struct tcb *best=NULL;
+    for (size_t i=0;i<tcp_capacity;i++) {
+        struct tcb *c=tcbs[i];
+        if (!c || !c->accept_pending || c->listener!=listener->generation) continue;
+        if (c->state!=T_ESTABLISHED && c->state!=T_CLOSE_WAIT) continue;
+        if (!best || c->accept_order<best->accept_order) best=c;
+    }
+    return best;
+}
+
+static int64_t sys_tcp_accept(int h, int timeout_ms, struct n_sockaddr *remote) {
+    struct tcb *l=user_tcb(h);
+    if (!l) return -N_ERR_NO_HANDLE;
+    if (l->state!=T_LISTEN && l->state!=T_CLOSED) return -N_ERR_INVALID;
+    if (remote && !user_ok_w(remote,sizeof *remote)) return -N_ERR_BAD_ADDRESS;
+    uint64_t generation=l->generation;
+    uint64_t until=uptime_ms()+(uint64_t)(timeout_ms>0?timeout_ms:0);
+    for (;;) {
+        if (l->generation!=generation || !l->user_open) return -N_ERR_NO_HANDLE;
+        if (l->state!=T_LISTEN) return l->err?l->err:-N_ERR_CLOSED;
+        struct tcb *c=tcp_next_accept(l);
+        if (c) {
+            /* a sibling thread may have revoked the page while this one slept */
+            if (remote && !user_ok_w(remote,sizeof *remote)) return -N_ERR_BAD_ADDRESS;
+            c->accept_pending=false;
+            c->user_open=true;
+            if (remote) *remote=(struct n_sockaddr){.ip=c->rip,.port=c->rport};
+            for (size_t i=0;i<tcp_capacity;i++) if (tcbs[i]==c) return (int64_t)i;
+        }
+        if (current_task->killed) return -N_ERR_STOPPED;
+        uint64_t now=uptime_ms();
+        if (timeout_ms>=0 && now>=until) return -N_ERR_NOT_READY;
+        net_wait_timeout(&l->progress, timeout_ms<0 ? 1000 : until-now);
+    }
 }
 
 static int64_t sys_tcp_connect(uint32_t ip, uint16_t port, int timeout_ms) {
@@ -1924,6 +2192,7 @@ static int64_t tcp_send_data(int h, const uint8_t *buf, size_t len, uint64_t dea
 static int64_t tcp_recv_data(int h, uint8_t *buf, size_t len, int timeout_ms, bool user) {
     struct tcb *t = user_tcb(h);
     if (!t) return -N_ERR_NO_HANDLE;
+    if (t->state == T_LISTEN) return -N_ERR_INVALID; /* a listener carries no data */
     if (!len) return 0;
     uint64_t generation=t->generation;
     uint64_t until = uptime_ms() + (uint64_t)(timeout_ms > 0 ? timeout_ms : 0);
@@ -1963,7 +2232,10 @@ static void tcp_close(struct tcb *t) {
        must not wake every GUI/pipe poller before any fd can have changed. */
     wq_wake_all(&t->progress);
     t->linger_until = uptime_ms() + 20000;
-    if (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT) {
+    if (t->state == T_LISTEN) {
+        tcp_refuse_pending(t);
+        tcp_free(t);
+    } else if (t->state == T_ESTABLISHED || t->state == T_CLOSE_WAIT) {
         t->fin_pending = true;
         tcp_push(t, false);
     } else if (t->state == T_SYN_SENT || t->state == T_CLOSED) {
@@ -2028,10 +2300,13 @@ static void eth_input(const void *packet, size_t len) {
         if (csum_fold(csum_add(0, ip, hl)) != 0) return;
         if (ntohs(ip->frag) & 0x3FFF) return; /* fragments are not supported */
         uint32_t src = ip_get(ip->src), dst = ip_get(ip->dst);
-        if (configured && dst != my_ip && dst != 0xFFFFFFFF && dst != (my_ip | ~my_mask)) return;
+        /* 127/8 is only ever this system talking to itself (ip_loopback), never the wire */
+        bool loopback = (dst >> 24) == 127;
+        if (loopback && memcmp(e->src, nif->mac, 6) != 0) return;
+        if (configured && dst != my_ip && !loopback && dst != 0xFFFFFFFF && dst != (my_ip | ~my_mask)) return;
         if (ip->proto == 1) icmp_input(e->src, src, ipp + hl, tl - hl);
         else if (ip->proto == 17) udp_input(src, dst, ipp + hl, tl - hl);
-        else if (ip->proto == 6 && configured) tcp_input(src, ipp + hl, tl - hl);
+        else if (ip->proto == 6 && (configured || loopback)) tcp_input(src, dst, e->src, ipp + hl, tl - hl);
     }
 }
 
@@ -2049,9 +2324,10 @@ static void tcp_flush_pending(bool ap_only) {
            whole storage/window before making receive progress. */
         if(budget && !budget->frames)break;
         t->ap_output_pending=false;
-        if (t->state==T_SYN_SENT && t->tx_retry) {
-            if(!tcp_take_output_budget(budget,F_SYN,0))break;
-            if (!tcp_output(t,F_SYN,t->iss,0)) {
+        if ((t->state==T_SYN_SENT || t->state==T_SYN_RECEIVED) && t->tx_retry) {
+            uint8_t flags=t->state==T_SYN_SENT?F_SYN:F_SYN|F_ACK;
+            if(!tcp_take_output_budget(budget,flags,0))break;
+            if (!tcp_output(t,flags,t->iss,0)) {
                 t->snd_nxt = t->snd_max = t->iss+1;
                 t->tx_retry = false;
                 tcp_arm(t);
@@ -2398,6 +2674,31 @@ static int64_t net_syscall_inner(int num, uint64_t a, uint64_t b, uint64_t c, ui
         struct tcb *t = user_tcb((int)a);
         if (!t) return -N_ERR_NO_HANDLE;
         tcp_close(t);
+        return 0;
+    }
+    case SYS_TCP_LISTEN:
+        if (!nif) return -N_ERR_NETWORK_DOWN;
+        if (a > UINT32_MAX || b > UINT16_MAX) return -N_ERR_INVALID;
+        return sys_tcp_listen((uint32_t)a, (uint16_t)b, (int)c);
+    case SYS_TCP_ACCEPT: return sys_tcp_accept((int)a, (int)b, (struct n_sockaddr *)c);
+    case SYS_TCP_ADDRESS: {
+        struct tcb *t = user_tcb((int)a);
+        if (!t) return -N_ERR_NO_HANDLE;
+        struct n_sockaddr *local = (struct n_sockaddr *)b, *remote = (struct n_sockaddr *)c;
+        if ((local && !user_ok_w(local, sizeof *local)) || (remote && !user_ok_w(remote, sizeof *remote)))
+            return -N_ERR_BAD_ADDRESS;
+        if (local) *local = (struct n_sockaddr){.ip = t->state == T_LISTEN ? t->lip : ip_source(t->rip), .port = t->lport};
+        if (remote) *remote = (struct n_sockaddr){.ip = t->rip, .port = t->rport};
+        return 0;
+    }
+    case SYS_TCP_FINISH: {
+        struct tcb *t = user_tcb((int)a);
+        if (!t) return -N_ERR_NO_HANDLE;
+        if (t->fin_pending) return 0;
+        if (t->state != T_ESTABLISHED && t->state != T_CLOSE_WAIT)
+            return t->state == T_CLOSED && t->err ? t->err : -N_ERR_NOT_CONNECTED;
+        t->fin_pending = true; /* tcp_push sends the FIN once the queued data is out */
+        tcp_push(t, false);
         return 0;
     }
     }
