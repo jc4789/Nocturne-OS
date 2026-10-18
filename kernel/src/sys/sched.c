@@ -1,4 +1,6 @@
-/* 4-level feedback queues; user-mode preemption, cooperative BSP kernel paths. */
+/* 朔Ⅱ：AP上のuser実行は持続会計と並列返済表で保護し（sys/saku.c）、残りの
+   枠をバースト分布の指数で選ぶ。BSPのkernel継続は協調的。BSP上のuser実行は
+   BSP自身の時計で交代する。 */
 #include "kernel.h"
 #include "arch/cpu.h"
 #include "arch/smp.h"
@@ -17,20 +19,20 @@
 struct task *task_list;
 
 static struct task *idle_task;
-#define MLFQ_LEVELS 4
-static struct { struct task *head, *tail; } rq[CPU_MAX_COUNT][MLFQ_LEVELS];
-static unsigned enqueue_cpu, dequeue_cpu;
+/* kq: kernel threadとBSP専用継続にいるuser task（起床・新規・APからの退避）。
+   uq: ring3へ戻れるuser task。順位は朔Ⅱ（期限、指数、参照順）。 */
+struct run_queue { struct task *head, *tail; };
+static struct run_queue kq, uq;
 static struct task *dead_list;
 static int next_pid;
 
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 extern void kthread_trampoline(void);
 
-static const uint32_t quantum_us[MLFQ_LEVELS] = {2000, 4000, 8000, 16000};
-static const uint32_t allotment_us[MLFQ_LEVELS] = {8000, 16000, 32000, 64000};
-#define BOOST_MS 250
-static uint64_t boost_at, boost_epoch = 1;
-static uint64_t bsp_stamp;
+#define BSP_USER_SLICE_US 2000  /* BSP上のring3同士の交代 */
+#define UQ_STARVE_MS 4          /* kqが続いてもuqの仕事をこの間隔でBSPへ通す */
+#define INDEX_RESIDENCY_US 1000 /* 指数による停止は一期間以上走った後だけ */
+static uint64_t bsp_stamp, bsp_run_us, uq_served_ms, saku_ms;
 static bool bsp_stamp_tsc;
 
 /* TSC subtraction also accounts IRQ-delayed/kernel CPU time and sub-ms bursts.
@@ -47,112 +49,26 @@ static uint64_t run_elapsed_us(uint64_t since, uint64_t now) {
     return fraction > UINT64_MAX - base ? UINT64_MAX : base + fraction;
 }
 
-static void mlfq_reset(struct task *t) {
-    t->sched_level = 0;
-    t->sched_used_us = 0;
-    t->slice_us = quantum_us[0];
-    t->sched_epoch = boost_epoch;
-}
-
-/* Only BSP calls policy helpers, including after AP retire ACK. */
-static bool mlfq_charge(struct task *t, uint64_t elapsed) {
+/* Only BSP calls policy helpers, including after AP retire ACK. service:
+   AP上のring3実行（朔Ⅱの返済）。BSP上の時間はバースト年齢だけに数える。 */
+static void task_charge(struct task *t, uint64_t elapsed, bool service) {
     unsigned subms = (unsigned)(elapsed % 1000) + t->cpu_subms_us;
     t->cpu_ms += elapsed / 1000 + subms / 1000;
     t->cpu_subms_us = subms % 1000;
-    if (t == idle_task) return false;
-    if (t->sched_epoch != boost_epoch) mlfq_reset(t);
-    bool expired = elapsed >= t->slice_us;
-    t->slice_us = expired ? 0 : t->slice_us - (uint32_t)elapsed;
-    /* A long non-preemptible kernel segment can cross several allotments.
-       At the bottom use modulo, not a loop proportional to elapsed time. */
-    while (elapsed) {
-        uint32_t budget = allotment_us[t->sched_level];
-        uint32_t left = budget - t->sched_used_us;
-        if (elapsed < left) { t->sched_used_us += (uint32_t)elapsed; break; }
-        elapsed -= left;
-        t->sched_used_us = 0;
-        if (t->sched_level + 1 == MLFQ_LEVELS) {
-            t->sched_used_us = (uint32_t)(elapsed % budget);
-            break;
-        }
-        t->sched_level++;
-    }
-    return expired;
+    if (t != idle_task && t->is_user) saku_charge(t, elapsed, service);
 }
 
 static void bsp_account(void) {
     bool tsc = tsc_hz >= 1000000;
     uint64_t now = run_stamp();
     /* sched_init precedes timer calibration; never subtract different clocks. */
-    if (tsc == bsp_stamp_tsc && mlfq_charge(current_task, run_elapsed_us(bsp_stamp, now)))
-        need_resched = true;
+    if (tsc == bsp_stamp_tsc) {
+        uint64_t elapsed = run_elapsed_us(bsp_stamp, now);
+        task_charge(current_task, elapsed, false);
+        bsp_run_us += elapsed;
+    }
     bsp_stamp = now;
     bsp_stamp_tsc = tsc;
-}
-
-/* Read by APs without the BSP's ownership: a stale answer only delays a
-   retire by one quantum or retires once more than needed. */
-static bool rq_empty_hint(void) {
-    for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++)
-        for (unsigned i = 0; i < MLFQ_LEVELS; i++)
-            if (__atomic_load_n(&rq[cpu][i].head, __ATOMIC_RELAXED)) return false;
-    return true;
-}
-
-static unsigned rq_highest(void) {
-    for (unsigned i = 0; i < MLFQ_LEVELS; i++)
-        for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++) if (rq[cpu][i].head) return i;
-    return MLFQ_LEVELS;
-}
-
-static void rq_append(struct task *t, unsigned cpu) {
-    ASSERT(!t->on_rq && !t->owner_cpu && t != idle_task);
-    if (t->sched_epoch != boost_epoch) mlfq_reset(t);
-    unsigned level = t->sched_level;
-    ASSERT(level < MLFQ_LEVELS);
-    t->state = TASK_READY;
-    t->on_rq = true;
-    t->rq_cpu = cpu;
-    t->rq_next = NULL;
-    if (rq[cpu][level].tail) rq[cpu][level].tail->rq_next = t;
-    else rq[cpu][level].head = t;
-    rq[cpu][level].tail = t;
-}
-static void rq_push(struct task *t) {
-    unsigned cpu = 0;
-    if (t->is_user) {
-        /* Only BSP mutates queues. APs receive sealed contexts, never a shared
-           queue lock; round-robin allocation and dequeue permit work stealing. */
-        for (unsigned n = 0; n < CPU_MAX_COUNT; n++) {
-            unsigned candidate = (++enqueue_cpu) % CPU_MAX_COUNT;
-            if (!candidate || cpu_runner_ready_at(candidate)) { cpu = candidate; break; }
-        }
-    }
-    rq_append(t, cpu);
-}
-
-/* FIFO is retained within each priority. A periodic boost bounds starvation
-   without a tick-time scan of every ready task or arbitrary name priorities. */
-static void mlfq_boost(uint64_t now) {
-    if (now - boost_at < BOOST_MS) return;
-    boost_at = now;
-    boost_epoch++;
-    for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++) {
-    for (unsigned level = 0; level < MLFQ_LEVELS; level++) {
-        struct task *t = rq[cpu][level].head;
-        rq[cpu][level].head = rq[cpu][level].tail = NULL;
-        while (t) {
-            struct task *next = t->rq_next;
-            t->on_rq = false;
-            mlfq_reset(t);
-            rq_append(t, cpu);
-            t = next;
-        }
-    }
-    }
-    /* The loop above appends level 1..3 to already rebuilt level 0; it never
-       reprocesses them. AP-owned policy is reset only after its ACK. */
-    if (current_task != idle_task && !current_task->owner_cpu) mlfq_reset(current_task);
 }
 
 /* ready/wait/tasklist/allocatorはBSPのみ。APは一つのuser所有と固定mailboxだけ。
@@ -160,14 +76,165 @@ static void mlfq_boost(uint64_t now) {
 enum runner_phase { RUN_EMPTY, RUN_RESERVED, RUN_LAUNCH, RUN_USER, RUN_RETIRING, RUN_RETURNED };
 static struct runner_mailbox {
     unsigned phase, stop;
+    bool kernel;              /* AP: BSP専用のkernel継続へ退いた（資格休止） */
     struct task *task;
-    unsigned level;           /* immutable BSP snapshot until AP retire ACK */
-    uint32_t quantum_us;
     uint64_t stamp, elapsed_us;
     unsigned ticks;           /* only fallback clock when no calibrated TSC */
 } runner_mails[CPU_MAX_COUNT];
 static uint64_t runner_idle_sp[CPU_MAX_COUNT];
 static unsigned runner_return_pending;
+
+static unsigned free_runners(void) {
+    unsigned n = 0;
+    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++)
+        if (cpu_runner_ready_at(cpu) &&
+            __atomic_load_n(&runner_mails[cpu].phase, __ATOMIC_ACQUIRE) == RUN_EMPTY) n++;
+    return n;
+}
+
+static void rq_push(struct task *t) {
+    ASSERT(!t->on_rq && !t->owner_cpu && t != idle_task);
+    struct run_queue *q = t->is_user && t->saku.ready ? &uq : &kq;
+    if (q == &uq && !uq.head) uq_served_ms = uptime_ms();
+    t->state = TASK_READY;
+    t->on_rq = true;
+    t->rq_next = NULL;
+    if (q->tail) q->tail->rq_next = t;
+    else q->head = t;
+    q->tail = t;
+}
+
+static struct task *rq_take(struct run_queue *q, struct task *t, struct task *before) {
+    if (before) before->rq_next = t->rq_next; else q->head = t->rq_next;
+    if (q->tail == t) q->tail = before;
+    t->on_rq = false;
+    t->rq_next = NULL;
+    return t;
+}
+
+/* BSPは台帳の外にある追加のCPUで、そこでの実行は返済に数えない。参照に対して
+   実サービスが最も足りない主体（前払いが最小）へ渡し、台帳が保護するAP上の
+   配分（Q/P）を補う。同点は朔Ⅱの順位。 */
+static bool bsp_before(struct task *a, struct task *b, uint64_t now) {
+    if (a->saku.advance != b->saku.advance) return a->saku.advance < b->saku.advance;
+    return saku_order(a, SAKU_SWITCH_US, b, SAKU_SWITCH_US, now) > 0;
+}
+
+/* uqの最上位。to_ap: 空きAPへ渡す順（朔Ⅱの順位）、そうでなければBSPの順。同順位はFIFO。 */
+static struct task *uq_best(struct task **before_out, uint64_t now, bool to_ap) {
+    struct task *best = uq.head, *best_before = NULL;
+    for (struct task *before = uq.head, *t = before ? before->rq_next : NULL; t; before = t, t = t->rq_next)
+        if (to_ap ? saku_order(t, SAKU_SWITCH_US, best, SAKU_SWITCH_US, now) > 0 : bsp_before(t, best, now)) {
+            best = t;
+            best_before = before;
+        }
+    *before_out = best_before;
+    return best;
+}
+
+static struct task *rq_pop(void) {
+    uint64_t now = uptime_ms();
+    if (!uq.head) uq_served_ms = now;
+    /* uqの仕事はBSPで少しだけ走って空きAPへ移る。kernel継続が続いても、
+       空きAPがあるか一定時間待たせたらuqを通す。 */
+    bool to_ap = uq.head && free_runners();
+    if (uq.head && (!kq.head || now - uq_served_ms >= UQ_STARVE_MS || to_ap)) {
+        struct task *before;
+        struct task *t = uq_best(&before, now, to_ap);
+        uq_served_ms = now;
+        return rq_take(&uq, t, before);
+    }
+    return kq.head ? rq_take(&kq, kq.head, NULL) : NULL;
+}
+
+/* BSPの切替要求。kernel threadは協調的なので切らない。 */
+static void bsp_preempt_check(void) {
+    struct task *cur = current_task;
+    if (cur == idle_task) {
+        if (kq.head || uq.head) need_resched = true;
+        return;
+    }
+    if (!cur->is_user || cur->owner_cpu) return;
+    if (kq.head || (uq.head && (bsp_run_us >= BSP_USER_SLICE_US || free_runners())))
+        need_resched = true;
+}
+
+/* AP上の実行量をBSPの時計で期間ごとに確定する。最後の量はAP自身の計測。
+   TSCの食い違いで先に多く払った分は戻さない（返済を取り消さない）。 */
+static void ap_progress(struct runner_mailbox *mail, bool final) {
+    struct task *t = mail->task;
+    uint64_t e = __atomic_load_n(&mail->elapsed_us, __ATOMIC_RELAXED);
+    if (!final && tsc_hz >= 1000000 &&
+        __atomic_load_n(&mail->phase, __ATOMIC_ACQUIRE) == RUN_USER) {
+        uint64_t stamp = __atomic_load_n(&mail->stamp, __ATOMIC_RELAXED), now = rdtsc();
+        if (now > stamp) {
+            uint64_t estimate = run_elapsed_us(stamp, now);
+            uint64_t bound = t->saku.progress_us + 2 * SAKU_PERIOD_US;
+            if (estimate > bound) estimate = bound;
+            if (estimate > e) e = estimate;
+        }
+    }
+    if (e <= t->saku.progress_us) return;
+    task_charge(t, e - t->saku.progress_us, true);
+    t->saku.progress_us = e;
+}
+
+static void ap_progress_all(void) {
+    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
+        struct runner_mailbox *mail = &runner_mails[cpu];
+        unsigned phase = __atomic_load_n(&mail->phase, __ATOMIC_ACQUIRE);
+        if (phase == RUN_USER || phase == RUN_RETIRING) ap_progress(mail, false);
+    }
+}
+
+static void stop_runner(unsigned cpu, bool forced) {
+    __atomic_store_n(&runner_mails[cpu].stop, 1, __ATOMIC_RELEASE);
+    cpu_runner_wake_at(cpu);
+    saku_note_stop(forced);
+}
+
+/* 期間ごとの配置：返済期限の近い主体を必ずAPへ置き、空いた枠を指数の高い
+   順に埋める。APで走っている期限前の主体は、上位の候補のために退かせる。 */
+static void rebalance(uint64_t now) {
+    static uint32_t sweep;
+    sweep++;
+    unsigned free = free_runners();
+    for (;;) {
+        /* 最上位の未処理候補：uqとBSP上のring3主体 */
+        struct task *cand = NULL;
+        for (struct task *t = uq.head; t; t = t->rq_next)
+            if (t->saku.claim != sweep && (!cand || saku_order(t, SAKU_SWITCH_US, cand, SAKU_SWITCH_US, now) > 0))
+                cand = t;
+        struct task *cur = current_task;
+        if (cur != idle_task && cur->is_user && cur->saku.ready && !cur->owner_cpu &&
+            cur->state == TASK_RUNNING && cur->saku.claim != sweep &&
+            (!cand || saku_order(cur, SAKU_SWITCH_US, cand, SAKU_SWITCH_US, now) > 0))
+            cand = cur;
+        if (!cand) return;
+        cand->saku.claim = sweep;
+        if (free) {
+            free--;
+            need_resched = true; /* BSPが候補を走らせ、sched_user_returnで空きAPへ渡す */
+            continue;
+        }
+        /* 最下位の犠牲：期限前で、停止要求のないAP上の主体 */
+        unsigned victim = 0;
+        for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
+            struct runner_mailbox *mail = &runner_mails[cpu];
+            unsigned phase = __atomic_load_n(&mail->phase, __ATOMIC_ACQUIRE);
+            if ((phase != RUN_USER && phase != RUN_LAUNCH) || __atomic_load_n(&mail->stop, __ATOMIC_RELAXED) ||
+                saku_due(mail->task)) continue;
+            if (!victim || saku_order(mail->task, 0, runner_mails[victim].task, 0, now) < 0) victim = cpu;
+        }
+        if (!victim) return;
+        struct task *v = runner_mails[victim].task;
+        if (saku_due(cand)) stop_runner(victim, true);
+        else if (!saku_active() && v->saku.progress_us >= 8 * SAKU_PERIOD_US) stop_runner(victim, true);
+        else if (v->saku.progress_us >= INDEX_RESIDENCY_US &&
+                 saku_index_beats(cand, SAKU_SWITCH_US, v, 0, now)) stop_runner(victim, false);
+        else return;
+    }
+}
 
 static void runner_returned(struct runner_mailbox *mail) {
     /* The task stack/XSTATE must be saved and left before the BSP can own it.
@@ -175,23 +242,6 @@ static void runner_returned(struct runner_mailbox *mail) {
     __atomic_store_n(&mail->phase, RUN_RETURNED, __ATOMIC_RELEASE);
     if (!__atomic_exchange_n(&runner_return_pending, 1, __ATOMIC_ACQ_REL))
         cpu_bsp_wake();
-}
-
-static void request_priority_preemption(void) {
-    unsigned ready = rq_highest();
-    if (ready == MLFQ_LEVELS) return;
-    if (current_task == idle_task || ready < current_task->sched_level) need_resched = true;
-    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
-    struct runner_mailbox *mail = &runner_mails[cpu];
-    unsigned phase = __atomic_load_n(&mail->phase, __ATOMIC_ACQUIRE);
-    if ((phase == RUN_LAUNCH || phase == RUN_USER) &&
-        (ready < mail->level ||
-         (mail->task->sched_epoch != boost_epoch && mail->level != 0)) &&
-        !__atomic_load_n(&mail->stop, __ATOMIC_RELAXED)) {
-        __atomic_store_n(&mail->stop, 1, __ATOMIC_RELEASE);
-        cpu_runner_wake_at(cpu);
-    }
-    }
 }
 
 static bool collect_runner(void) {
@@ -203,7 +253,9 @@ static bool collect_runner(void) {
     struct task *t = mail->task;
     ASSERT(t && t->owner_cpu != 0 && !t->on_rq);
     t->owner_cpu = 0;
-    mlfq_charge(t, mail->elapsed_us);
+    ap_progress(mail, true);
+    /* syscall/faultのBSP継続は資格休止。停止要求での退避はring3のまま。 */
+    if (mail->kernel) saku_suspend(t);
     mail->task = NULL;
     __atomic_store_n(&mail->stop, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&mail->phase, RUN_EMPTY, __ATOMIC_RELEASE);
@@ -304,21 +356,11 @@ void sched_ap_interrupt(struct regs *r) {
     }
     else if (vector==0x80 && net_ap_syscall(r)) dispatch=false;
     else if (vector==0x80 && address_ap_syscall(r)) dispatch=false;
-    if (!dispatch && !__atomic_load_n(&mail->stop, __ATOMIC_ACQUIRE) &&
-        mail->elapsed_us < mail->quantum_us) return;
-    /* The quantum is over but nothing waits for a CPU: keep running here.
-       Retiring would move the task through the BSP to whichever AP is free,
-       flushing its TLB and leaving its warm caches behind, only to resume
-       the same work. A task that becomes ready meanwhile is seen at the next
-       quantum end; a higher-priority one stops this AP at once (see
-       request_priority_preemption). Accounting stays exact: the BSP charges
-       the whole elapsed time at the eventual retire, which the boost period
-       bounds so the per-task CPU counters stay fresh. */
-    if (!dispatch && !__atomic_load_n(&mail->stop, __ATOMIC_ACQUIRE) &&
-        mail->elapsed_us < (uint64_t)BOOST_MS * 1000 && rq_empty_hint()) {
-        mail->quantum_us = (uint32_t)mail->elapsed_us + quantum_us[mail->level];
-        return;
-    }
+    /* APは自分で量子を判断しない。BSPが朔Ⅱの期間ごとに会計し、退かせる時だけ
+       停止要求を送る（rebalance）。何も待たなければ同じ主体がキャッシュを
+       温めたまま走り続ける。 */
+    if (!dispatch && !__atomic_load_n(&mail->stop, __ATOMIC_ACQUIRE)) return;
+    mail->kernel = dispatch;
     struct task *t = current_task;
     prof_ap_retire(vector, r->rax);
     t->trap_cpu = cpu;
@@ -377,10 +419,9 @@ void sched_init(void) {
     fpu_state_init(&idle_task->fpu);
     sched_set_current(idle_task);
     task_list = idle_task;
-    boost_at = uptime_ms();
     bsp_stamp = run_stamp();
     bsp_stamp_tsc = tsc_hz >= 1000000;
-    kprintf("sched: MLFQ levels=4 quantum=2/4/8/16ms allotment=8/16/32/64ms boost=250ms\n");
+    kprintf("sched: saku II (ledger starts with the AP runners); BSP user slice %uus\n", BSP_USER_SLICE_US);
 }
 
 struct task *task_alloc(const char *name) {
@@ -402,7 +443,6 @@ struct task *task_alloc(const char *name) {
     t->pml4 = kernel_pml4;
     fpu_state_init(&t->fpu);
     t->start_ms = uptime_ms();
-    mlfq_reset(t);
     t->ksp = (uint64_t)t->kstack + KSTACK_PAGES * PAGE_SIZE;
     return t;
 }
@@ -438,32 +478,19 @@ void sched_make_ready(struct task *t) {
     ASSERT(t->owner_cpu == 0);
     if (t->state != TASK_ZOMBIE && t != idle_task && !t->on_rq && t != current_task) {
         rq_push(t);
-        request_priority_preemption();
+        bsp_preempt_check();
     } else if (t == current_task && t->state == TASK_BLOCKED) {
         t->state = TASK_RUNNING;
     }
     irq_restore(f);
 }
 
-static struct task *rq_pop(void) {
-    unsigned level = rq_highest();
-    if (level == MLFQ_LEVELS) return NULL;
-    for (unsigned n = 0; n < CPU_MAX_COUNT; n++) {
-        unsigned cpu = (++dequeue_cpu) % CPU_MAX_COUNT;
-        struct task *t = rq[cpu][level].head;
-        if (!t) continue;
-        rq[cpu][level].head = t->rq_next;
-        if (!rq[cpu][level].head) rq[cpu][level].tail = NULL;
-        t->on_rq = false;
-        t->rq_next = NULL;
-        return t;
-    }
-    return NULL;
-}
-
 static void free_task(struct task *t) {
     ASSERT(!t->owner_cpu);
     net_task_exit(t);
+    uint64_t flags = irq_save();
+    saku_forget(t);
+    irq_restore(flags);
     /* unlink from the global list */
     struct task **pp = &task_list;
     while (*pp && *pp != t) pp = &(*pp)->all_next;
@@ -514,17 +541,12 @@ void schedule(void) {
     uint64_t f = irq_save();
     bsp_account();
     collect_runner();
-    mlfq_boost(uptime_ms());
     struct task *prev = current_task;
     if (prev->owner_cpu) {
-        struct runner_mailbox *mail = &runner_mails[prev->owner_cpu];
-        ASSERT(__atomic_load_n(&mail->phase, __ATOMIC_RELAXED) == RUN_RESERVED);
-        /* schedule accounting can exhaust a final sub-ms BSP remainder. Seal
-           the AP snapshot only now, before stack-switch launch publication. */
-        if (prev->sched_epoch != boost_epoch) mlfq_reset(prev);
-        if (!prev->slice_us) prev->slice_us = quantum_us[prev->sched_level];
-        mail->level = prev->sched_level;
-        mail->quantum_us = prev->slice_us;
+        ASSERT(__atomic_load_n(&runner_mails[prev->owner_cpu].phase, __ATOMIC_RELAXED) == RUN_RESERVED);
+    } else if (prev->is_user) {
+        if (prev->state == TASK_BLOCKED) saku_block(prev);      /* バースト終端 */
+        else if (prev->state == TASK_ZOMBIE) saku_exit(prev);   /* 打切り */
     }
     if (prev->state == TASK_RUNNING && prev != idle_task && !prev->owner_cpu) {
         rq_push(prev);
@@ -532,7 +554,7 @@ void schedule(void) {
     struct task *next = rq_pop();
     if (!next) next = idle_task;
     need_resched = false;
-    if (next != idle_task && !next->slice_us) next->slice_us = quantum_us[next->sched_level];
+    bsp_run_us = 0;
     if (next == prev) {
         prev->state = TASK_RUNNING;
         irq_restore(f);
@@ -558,7 +580,15 @@ void sched_tick(void) {
     bsp_account();
     collect_runner();
     uint64_t now = uptime_ms();
-    mlfq_boost(now);
+    if (saku_active() && now != saku_ms) {
+        /* 朔Ⅱの期間境界：AP上の実行を払い、期限を閉じ、次の参照を発行して配置する。 */
+        uint64_t started = rdtsc();
+        saku_ms = now;
+        ap_progress_all();
+        saku_period(now);
+        rebalance(now);
+        if (tsc_hz >= 1000000) saku_note_tick(run_elapsed_us(started, rdtsc()));
+    }
     for (struct task *t = task_list; t; t = t->all_next) {
         if (t->state == TASK_BLOCKED && t->wake_at && now >= t->wake_at) {
             t->wake_at = 0;
@@ -573,18 +603,36 @@ void sched_tick(void) {
             sched_make_ready(t);
         }
     }
-    request_priority_preemption();
+    bsp_preempt_check();
+}
+
+/* BSP上のring3がsyscall/faultでkernel継続へ入る：APからの退避と同じ資格休止。
+   未払い票はBSP継続の間に払えないので取り消し、バースト年齢は続ける。 */
+void sched_user_kernel_entry(void) {
+    uint64_t f = irq_save();
+    struct task *t = current_task;
+    if (t->is_user && !t->owner_cpu && t->saku.ready) saku_suspend(t);
+    irq_restore(f);
 }
 
 void sched_user_return(struct regs *r) {
     (void)r;
     /* syscall_dispatchはstiして返る。所有publicationからiretまでIRQを閉じる。 */
     cli();
+    for (;;) {
     if (current_task->killed) task_exit(current_task->kill_code);
     if (need_resched) schedule();
     if (current_task->killed) task_exit(current_task->kill_code);
     struct task *t = current_task;
     if (!cpu_runner_ready() || !t->is_user) return;
+    if (!saku_active()) {
+        /* smp初期化はuser起動より前に全runnerを揃える。ここで台帳の幅が決まる。 */
+        unsigned runners = 0;
+        for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) runners += cpu_runner_ready_at(cpu);
+        saku_start(runners, uptime_ms());
+    }
+    bool arrived = !t->saku.ready;
+    saku_ready(t);
     collect_runner();
     /* Prefer the AP this task last ran on: its caches still hold its data. */
     unsigned home = t->trap_cpu > 0 && t->trap_cpu < CPU_MAX_COUNT ? t->trap_cpu : 1;
@@ -593,13 +641,11 @@ void sched_user_return(struct regs *r) {
     struct runner_mailbox *mail = &runner_mails[cpu];
     if (cpu_runner_ready_at(cpu) && __atomic_load_n(&mail->phase, __ATOMIC_ACQUIRE) == RUN_EMPTY) {
         ASSERT(!(read_rflags() & 0x200) && !cpu_jobs_active());
-        /* Finish BSP accounting before publishing the AP's remaining quantum. */
-        bsp_account();
-        if (!t->slice_us) t->slice_us = quantum_us[t->sched_level];
+        bsp_account(); /* BSP上の最後の量はバースト年齢として確定 */
         t->owner_cpu = cpu;
+        t->saku.progress_us = 0;
         mail->task = t;
-        mail->level = t->sched_level;
-        mail->quantum_us = t->slice_us;
+        mail->kernel = false;
         mail->ticks = 0;
         mail->elapsed_us = 0;
         __atomic_store_n(&mail->phase, RUN_RESERVED, __ATOMIC_RELAXED);
@@ -607,6 +653,16 @@ void sched_user_return(struct regs *r) {
         /* 最後の安全接点。APでresume後はshared scheduler/kernelを呼ばずiretへ。 */
         return;
     }
+    }
+    /* 空きAPなし：起床直後か返済期限が近ければ、次の期間を待たずに配置を見直す。 */
+    uint64_t now = uptime_ms();
+    if (arrived || saku_due(t)) rebalance(now);
+    /* BSPでring3を続ける。BSPの順でuqにより不足した主体があれば先に譲る
+       （起床したkernel継続がBSPを経由するたびに、そのままBSPを取らない）。
+       残る間はBSP_USER_SLICE_USごとに交代する。 */
+    struct task *before;
+    if (!uq.head || !bsp_before(uq_best(&before, now, false), t, now)) return;
+    need_resched = true;
     }
 }
 

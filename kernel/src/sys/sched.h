@@ -2,6 +2,7 @@
 #include "kernel.h"
 #include "arch/fpu.h"
 #include "arch/smp.h"
+#include "sys/saku.h"
 
 struct regs;
 struct file;
@@ -24,7 +25,6 @@ struct task {
     bool is_user;
     bool killed;
     bool on_rq;
-    unsigned rq_cpu;        /* BSP-owned per-CPU run queue / load balancing hint */
     unsigned owner_cpu;       /* 0=BSP。AP retire ACK前はqueue/free禁止 */
     bool is_thread;
     bool exiting;
@@ -63,11 +63,8 @@ struct task {
     struct shared_mapping *shared_mappings; /* native FD-backed page references */
     uint64_t cpu_ms;
     uint64_t start_ms;
-    unsigned sched_level;     /* 0=interactive, 3=CPU-bound; ready/wait policy is BSP-owned */
-    uint32_t sched_used_us;   /* cumulative allotment: yield/short sleep does not refund it */
-    uint32_t slice_us;        /* remaining quantum, preserved across early yield/block */
     uint16_t cpu_subms_us;
-    uint64_t sched_epoch;     /* lazy boost for blocked and AP-owned tasks */
+    struct saku_account saku; /* 朔Ⅱの持続会計とバースト標本（BSP所有） */
 };
 
 static inline struct task *sched_current(void) {
@@ -96,6 +93,7 @@ void schedule(void);
 void sched_yield(void);
 void sched_tick(void);
 void sched_user_return(struct regs *r);
+void sched_user_kernel_entry(void); /* BSP: ring3からsyscall/faultへ入った（資格休止） */
 void sched_post_switch(void); /* context_switch: 旧taskstackを離れた後だけpublication */
 NORETURN void sched_ap_loop(void);
 void sched_ap_interrupt(struct regs *r);

@@ -2104,7 +2104,7 @@ static void net_thread(void *arg) {
 #if NET_HANDOFF_DIAG
             net_diag.yields++;if(need_resched)net_diag.yield_resched++;if(rx_ready)net_diag.yield_pending++;
             if(!ready)net_diag.yield_idle++;
-            if(current_task->sched_level<4)net_diag.yield_level[current_task->sched_level]++;
+            net_diag.yield_level[current_task->is_user?1:0]++; /* 0=kernel thread, 1=user継続 */
 #endif
             sched_yield();
             service_started=uptime_ms();service_start_bytes=net_service_bytes;serviced=false;

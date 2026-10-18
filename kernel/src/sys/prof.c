@@ -150,6 +150,22 @@ static void dump(void) {
     vmm_tlb_stats(&sd, &ipi);
     kprintf("prof: TLB shootdowns %llu, IPIs %llu\n", (unsigned long long)(sd - last_sd), (unsigned long long)(ipi - last_ipi));
     last_sd = sd; last_ipi = ipi;
+    static struct saku_stats last_saku;
+    struct saku_stats k;
+    uint64_t flags = irq_save();
+    saku_get_stats(&k);
+    irq_restore(flags);
+#define SD(f) (unsigned long long)(k.f - last_saku.f)
+    kprintf("prof: saku periods %llu skipped %llu issued %lluus matched %llu paid %llu advance %llu "
+            "cancel sleep %llu suspend %llu discarded %llu\n",
+            SD(periods), SD(skipped), SD(issued_us), SD(matched_us), SD(paid_us), SD(advance_us),
+            SD(sleep_cancel_us), SD(suspend_cancel_us), SD(discarded_us));
+    kprintf("prof: saku deadline misses %llu (%lluus, owner on AP %llu queued %llu) drains %llu, stops forced %llu index %llu, bursts %llu, "
+            "tick avg %lluus max %lluus\n",
+            SD(violations), SD(violated_us), SD(violations_ap), SD(violations_queued), SD(drains), SD(forced_stops), SD(index_stops), SD(bursts),
+            k.ticks > last_saku.ticks ? SD(tick_us_total) / SD(ticks) : 0ull, (unsigned long long)k.tick_us_max);
+#undef SD
+    last_saku = k;
     for (uint32_t i = 0; i < PROF_SLOTS; i++) {
         slots[i].count = 0;
         slots[i].pid = 0;
