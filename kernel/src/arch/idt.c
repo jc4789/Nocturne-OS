@@ -5,6 +5,7 @@
 #include "sys/syscall.h"
 #include "mm/vmm.h"
 #include "dev/entropy.h"
+#include "arch/irq.h"
 
 struct idt_entry {
     uint16_t off_lo;
@@ -47,7 +48,50 @@ void idt_load(void) {
 }
 
 void irq_register(int irq, irq_handler_t h) { irq_handlers[irq] = h; }
-void vector_register(int vec, irq_handler_t h) { vec_handlers[vec] = h; }
+
+/* ---- vector ownership ----
+   A vector is owned once it has been allocated or registered. Fixed driver vectors are reserved by
+   range so the allocator never collides with them (they keep their numbers). */
+#define VEC_POOL_FIRST 0x50
+#define VEC_POOL_LAST  0xEF
+static bool vec_owned[256];
+
+static bool vec_in_pool(unsigned v) { return v >= VEC_POOL_FIRST && v <= VEC_POOL_LAST && v != 0x80; }
+
+int irq_vector_alloc(unsigned count, unsigned align) {
+    if (!align) align = 1;
+    if (!count || (align & (align - 1)) || count > VEC_POOL_LAST) return -1;
+    uint64_t f = irq_save();
+    int found = -1;
+    for (unsigned base = ALIGN_UP(VEC_POOL_FIRST, align); base + count - 1 <= VEC_POOL_LAST; base += align) {
+        bool free = true;
+        for (unsigned i = 0; i < count && free; i++) free = vec_in_pool(base + i) && !vec_owned[base + i];
+        if (!free) continue;
+        for (unsigned i = 0; i < count; i++) vec_owned[base + i] = true;
+        found = (int)base;
+        break;
+    }
+    irq_restore(f);
+    return found;
+}
+
+void irq_vector_free(unsigned vector, unsigned count) {
+    uint64_t f = irq_save();
+    for (unsigned i = 0; i < count && vector + i < 256; i++) {
+        if (!vec_in_pool(vector + i)) continue;
+        vec_owned[vector + i] = false;
+        vec_handlers[vector + i] = NULL;
+    }
+    irq_restore(f);
+}
+
+void vector_register(int vec, irq_handler_t h) {
+    if (vec < 0 || vec > 255) panic("idt: bad vector %d", vec);
+    /* the same handler again (a controller re-initialising) is harmless; a different one is a collision */
+    if (h && vec_handlers[vec] && vec_handlers[vec] != h) panic("idt: vector %#x registered twice", vec);
+    if (h) vec_owned[vec] = true;
+    vec_handlers[vec] = h;
+}
 
 /* ---- 8259 PIC ---- */
 void pic_init(void) {
@@ -126,6 +170,12 @@ static void exception(struct regs *r, uint64_t cr2, unsigned source_cpu) {
 
 void isr_dispatch(struct regs *r) {
     uint64_t v = r->vector;
+    if (v == VEC_TLB_SHOOTDOWN) {
+        /* Any AP state: user (returns straight to ring 3), idle HLT or a job. */
+        vmm_tlb_ipi();
+        lapic_eoi();
+        return;
+    }
     if (cpu_is_runner()) {
         sched_ap_interrupt(r);
         return;

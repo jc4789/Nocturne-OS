@@ -7,6 +7,7 @@
 #define VEC_SMP_WAKE 0x32
 #define VEC_USER_STOP 0x33
 #define VEC_USER_RETURN 0x34
+#define VEC_TLB_SHOOTDOWN 0x35
 
 struct task;
 /* GS is kernel-owned; user TLS remains in FS. The self pointer makes current
@@ -37,7 +38,7 @@ typedef void (*cpu_job_fn)(size_t index, void *context);
    callback は非重複領域だけを更新し、割当・I/O・syscall・待機・schedule・再入は禁止。
    SSE2 は使用可能。AVX はN_CPU_AVX公開時だけ。BSPの全許可XSTATEを保存復元する。
    countに必要なAPだけを投入し、同期 join が終わるまで戻らない。
-   起動失敗/単CPU/nosmp は逐次実行する。job前にuser所有を全員retireする。
+   起動失敗/単CPU/nosmp は逐次実行する。user taskを実行中のAPは止めず、空きAPだけを使う。
    投入後の AP 故障は context を早期解放せず panic する。 */
 void smp_init(struct limine_mp_response *response);
 void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context);
@@ -57,6 +58,8 @@ void cpu_runner_started(void); /* AP固定idle stack初期化後のready publica
 void cpu_runner_wake(void);
 void cpu_runner_wake_at(unsigned index);
 void cpu_bsp_wake(void); /* AP: a published retire ACK is ready for collection */
+bool cpu_tlb_online(void);           /* BSP: any AP can hold TLB entries */
+bool cpu_tlb_ipi(unsigned index);    /* BSP: false when that AP is not running */
 bool cpu_worker_poll(void); /* AP idle stack only: execute a published bounded job */
 void cpu_runner_check(void); /* BSP: failed APはcontextを保持してpanic */
 bool cpu_jobs_active(void);

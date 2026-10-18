@@ -184,6 +184,33 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavcodec/vp9prob.c \
     third_party/ffmpeg/libavcodec/vp9recon.c \
     third_party/ffmpeg/libavcodec/vpx_rac.c \
+    third_party/ffmpeg/libavcodec/x86/aacpsdsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/ac3dsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/blockdsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/bswapdsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/constants.c \
+    third_party/ffmpeg/libavcodec/x86/fdct.c \
+    third_party/ffmpeg/libavcodec/x86/fdctdsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/flacdsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/fmtconvert_init.c \
+    third_party/ffmpeg/libavcodec/x86/h264_intrapred_init.c \
+    third_party/ffmpeg/libavcodec/x86/h264_qpel.c \
+    third_party/ffmpeg/libavcodec/x86/h264chroma_init.c \
+    third_party/ffmpeg/libavcodec/x86/h264dsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/h26x/h2656dsp.c \
+    third_party/ffmpeg/libavcodec/x86/hevc/dsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/idctdsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/me_cmp_init.c \
+    third_party/ffmpeg/libavcodec/x86/mpegaudiodsp.c \
+    third_party/ffmpeg/libavcodec/x86/opusdsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/sbrdsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/videodsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/vorbisdsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/vp8dsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/vp9dsp_init.c \
+    third_party/ffmpeg/libavcodec/x86/vp9dsp_init_10bpp.c \
+    third_party/ffmpeg/libavcodec/x86/vp9dsp_init_12bpp.c \
+    third_party/ffmpeg/libavcodec/x86/vp9dsp_init_16bpp.c \
     third_party/ffmpeg/libavcodec/xiph.c \
     third_party/ffmpeg/libavfilter/af_atempo.c \
     third_party/ffmpeg/libavfilter/allfilters.c \
@@ -360,6 +387,13 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libavutil/version.c \
     third_party/ffmpeg/libavutil/video_enc_params.c \
     third_party/ffmpeg/libavutil/video_hint.c \
+    third_party/ffmpeg/libavutil/x86/aes_init.c \
+    third_party/ffmpeg/libavutil/x86/cpu.c \
+    third_party/ffmpeg/libavutil/x86/fixed_dsp_init.c \
+    third_party/ffmpeg/libavutil/x86/float_dsp_init.c \
+    third_party/ffmpeg/libavutil/x86/imgutils_init.c \
+    third_party/ffmpeg/libavutil/x86/lls_init.c \
+    third_party/ffmpeg/libavutil/x86/tx_float_init.c \
     third_party/ffmpeg/libavutil/xga_font_data.c \
     third_party/ffmpeg/libavutil/xtea.c \
     third_party/ffmpeg/libswresample/audioconvert.c \
@@ -370,4 +404,70 @@ FFMPEG_C := third_party/ffmpeg/libavcodec/aac/aacdec.c \
     third_party/ffmpeg/libswresample/resample_dsp.c \
     third_party/ffmpeg/libswresample/swresample.c \
     third_party/ffmpeg/libswresample/swresample_frame.c \
-    third_party/ffmpeg/libswresample/version.c
+    third_party/ffmpeg/libswresample/version.c \
+    third_party/ffmpeg/libswresample/x86/audio_convert_init.c \
+    third_party/ffmpeg/libswresample/x86/rematrix_init.c \
+    third_party/ffmpeg/libswresample/x86/resample_init.c
+# x86-64 NASM sources: SIMD selected at run time by libavutil/x86/cpu.c (README.nocturne.md).
+FFMPEG_ASM := third_party/ffmpeg/libavcodec/x86/aacpsdsp.asm \
+    third_party/ffmpeg/libavcodec/x86/ac3dsp.asm \
+    third_party/ffmpeg/libavcodec/x86/ac3dsp_downmix.asm \
+    third_party/ffmpeg/libavcodec/x86/blockdsp.asm \
+    third_party/ffmpeg/libavcodec/x86/bswapdsp.asm \
+    third_party/ffmpeg/libavcodec/x86/dct32.asm \
+    third_party/ffmpeg/libavcodec/x86/flacdsp.asm \
+    third_party/ffmpeg/libavcodec/x86/fmtconvert.asm \
+    third_party/ffmpeg/libavcodec/x86/fpel.asm \
+    third_party/ffmpeg/libavcodec/x86/h264_chromamc.asm \
+    third_party/ffmpeg/libavcodec/x86/h264_chromamc_10bit.asm \
+    third_party/ffmpeg/libavcodec/x86/h264_deblock.asm \
+    third_party/ffmpeg/libavcodec/x86/h264_deblock_10bit.asm \
+    third_party/ffmpeg/libavcodec/x86/h264_idct.asm \
+    third_party/ffmpeg/libavcodec/x86/h264_idct_10bit.asm \
+    third_party/ffmpeg/libavcodec/x86/h264_intrapred.asm \
+    third_party/ffmpeg/libavcodec/x86/h264_intrapred_10bit.asm \
+    third_party/ffmpeg/libavcodec/x86/h264_qpel_10bit.asm \
+    third_party/ffmpeg/libavcodec/x86/h264_qpel_8bit.asm \
+    third_party/ffmpeg/libavcodec/x86/h264_weight.asm \
+    third_party/ffmpeg/libavcodec/x86/h264_weight_10bit.asm \
+    third_party/ffmpeg/libavcodec/x86/h26x/h2656_inter.asm \
+    third_party/ffmpeg/libavcodec/x86/hevc/add_res.asm \
+    third_party/ffmpeg/libavcodec/x86/hevc/deblock.asm \
+    third_party/ffmpeg/libavcodec/x86/hevc/dequant.asm \
+    third_party/ffmpeg/libavcodec/x86/hevc/idct.asm \
+    third_party/ffmpeg/libavcodec/x86/hevc/mc.asm \
+    third_party/ffmpeg/libavcodec/x86/hevc/sao.asm \
+    third_party/ffmpeg/libavcodec/x86/hevc/sao_10bit.asm \
+    third_party/ffmpeg/libavcodec/x86/idctdsp.asm \
+    third_party/ffmpeg/libavcodec/x86/imdct36.asm \
+    third_party/ffmpeg/libavcodec/x86/me_cmp.asm \
+    third_party/ffmpeg/libavcodec/x86/opusdsp.asm \
+    third_party/ffmpeg/libavcodec/x86/qpel.asm \
+    third_party/ffmpeg/libavcodec/x86/sbrdsp.asm \
+    third_party/ffmpeg/libavcodec/x86/simple_idct10.asm \
+    third_party/ffmpeg/libavcodec/x86/videodsp.asm \
+    third_party/ffmpeg/libavcodec/x86/vorbisdsp.asm \
+    third_party/ffmpeg/libavcodec/x86/vp8dsp.asm \
+    third_party/ffmpeg/libavcodec/x86/vp8dsp_loopfilter.asm \
+    third_party/ffmpeg/libavcodec/x86/vp9intrapred.asm \
+    third_party/ffmpeg/libavcodec/x86/vp9intrapred_16bpp.asm \
+    third_party/ffmpeg/libavcodec/x86/vp9itxfm.asm \
+    third_party/ffmpeg/libavcodec/x86/vp9itxfm_16bpp.asm \
+    third_party/ffmpeg/libavcodec/x86/vp9itxfm_16bpp_avx512.asm \
+    third_party/ffmpeg/libavcodec/x86/vp9itxfm_avx2.asm \
+    third_party/ffmpeg/libavcodec/x86/vp9itxfm_avx512.asm \
+    third_party/ffmpeg/libavcodec/x86/vp9lpf.asm \
+    third_party/ffmpeg/libavcodec/x86/vp9lpf_16bpp.asm \
+    third_party/ffmpeg/libavcodec/x86/vp9mc.asm \
+    third_party/ffmpeg/libavcodec/x86/vp9mc_16bpp.asm \
+    third_party/ffmpeg/libavutil/x86/aes.asm \
+    third_party/ffmpeg/libavutil/x86/cpuid.asm \
+    third_party/ffmpeg/libavutil/x86/crc.asm \
+    third_party/ffmpeg/libavutil/x86/fixed_dsp.asm \
+    third_party/ffmpeg/libavutil/x86/float_dsp.asm \
+    third_party/ffmpeg/libavutil/x86/imgutils.asm \
+    third_party/ffmpeg/libavutil/x86/lls.asm \
+    third_party/ffmpeg/libavutil/x86/tx_float.asm \
+    third_party/ffmpeg/libswresample/x86/audio_convert.asm \
+    third_party/ffmpeg/libswresample/x86/rematrix.asm \
+    third_party/ffmpeg/libswresample/x86/resample.asm

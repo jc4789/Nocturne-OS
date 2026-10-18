@@ -53,8 +53,14 @@ int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot);
 void vmm_user_free(uint64_t pml4, uint64_t va, uint64_t size);
 int vmm_copy_to_space(uint64_t pml4, uint64_t va, const void *src, size_t n);
 bool vmm_handle_user_fault(uint64_t addr, uint64_t err);
-void vmm_switch(uint64_t pml4);
-void vmm_flush_all(void); /* PGEのglobal entryも含めてローカルTLBを破棄 */
+void vmm_switch(uint64_t pml4); /* PCID対応。gen が進んだ space のtagだけ破棄 */
+void vmm_flush_all(void); /* PGEのglobal entryと全PCIDを含めてローカルTLBを破棄 */
+void vmm_init_cpu(void);  /* 各CPU: CR3=kernel_pml4の後、PCIDEを揃える */
+void vmm_tlb_ipi(void);   /* AP: VEC_TLB_SHOOTDOWN */
+/* AP kernel copy of user memory: begin=false なら解除中なのでBSPへfallback */
+bool vmm_ap_uaccess_begin(void);
+void vmm_ap_uaccess_end(void);
+void vmm_tlb_stats(uint64_t *shootdowns, uint64_t *ipis);
 
 void *vmalloc(size_t pages);
 void vfree(void *p, size_t pages);

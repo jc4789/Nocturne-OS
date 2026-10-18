@@ -4,6 +4,7 @@
  * free はこの allocator の有効 pointer または NULL のみを受ける。
  */
 #include "media_alloc_private.h"
+#include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,9 +66,16 @@ bool nmedia_alloc_restrict_worker(void) {
     worker_restricted=true;
     return true;
 }
-void *nmedia_ff_malloc(size_t size) {
+/* alignment は 2 の冪。16 を超える分は slack として課金する。FFmpeg の x86 SIMD
+ * (mova ymm) は av_malloc の 32 byte 境界を前提にするため、この経路で満たす。 */
+static void *allocate_aligned(size_t size, size_t alignment) {
     size_t charge = nmedia_alloc_charge(size);
     if (!charge) { rejected(NMEDIA_ALLOC_OVERFLOW); return NULL; }
+    if (alignment < 16) alignment = 16;
+    if (alignment > 16) {
+        if (alignment - 16 > SIZE_MAX - charge) { rejected(NMEDIA_ALLOC_OVERFLOW); return NULL; }
+        charge += alignment - 16;
+    }
     if (!admit_charge(charge)) return NULL;
     void *base = NMEDIA_BASE_MALLOC(charge);
     if (!base) {
@@ -75,8 +83,8 @@ void *nmedia_ff_malloc(size_t size) {
         totals.last_failure = NMEDIA_ALLOC_BACKEND_OOM;
         return NULL;
     }
-    uintptr_t aligned = ((uintptr_t)base + sizeof(struct allocation) + 15)
-                        & ~(uintptr_t)15;
+    uintptr_t aligned = ((uintptr_t)base + sizeof(struct allocation) + alignment - 1)
+                        & ~(uintptr_t)(alignment - 1);
     struct allocation *a = (struct allocation *)(aligned - sizeof *a);
     a->base = base;
     a->requested = size;
@@ -85,6 +93,18 @@ void *nmedia_ff_malloc(size_t size) {
     ++totals.blocks;
     if (totals.peak < totals.current) totals.peak = totals.current;
     return (void *)aligned;
+}
+void *nmedia_ff_malloc(size_t size) { return allocate_aligned(size, 16); }
+void *nmedia_ff_memalign(size_t alignment, size_t size) {
+    if (alignment < sizeof(void *) || (alignment & (alignment - 1))) return NULL;
+    return allocate_aligned(size, alignment);
+}
+int nmedia_ff_posix_memalign(void **out, size_t alignment, size_t size) {
+    if (alignment < sizeof(void *) || (alignment & (alignment - 1))) return EINVAL;
+    void *p = allocate_aligned(size, alignment);
+    if (!p) return ENOMEM;
+    *out = p;
+    return 0;
 }
 void nmedia_ff_free(void *pointer) {
     if (!pointer) return;

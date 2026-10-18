@@ -4,6 +4,7 @@
 #include "arch/cpu.h"
 #include "arch/smp.h"
 #include "arch/hyperv.h"
+#include "arch/pat.h"
 #include "dev/serial.h"
 #include "dev/fb.h"
 #include "dev/fbcon.h"
@@ -74,6 +75,9 @@ void kmain(void) {
     gdt_init();
     idt_init();
     fpu_init();
+    /* IA32_PAT before any page table is built: vmm.c maps MMIO as index 3 (UC), the framebuffer as 5 (WC) */
+    uint64_t pat = pat_init_cpu();
+    kprintf("cpu: PAT %016lx%s\n", pat, pat == PAT_NOCTURNE ? "" : pat ? " (unexpected)" : " (unsupported)");
     cpu_get_brand(cpu_brand);
 
     struct limine_memmap_response *mm = mm_req.response;

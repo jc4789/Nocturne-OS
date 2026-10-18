@@ -13,8 +13,10 @@ static int64_t ram_read(struct vnode *v, struct file *f, void *buf, uint64_t off
 
 static int ensure_cap(struct vnode *v, uint64_t need) {
     if (need <= v->cap) return 0;
-    uint64_t nc = v->cap ? v->cap : 256;
-    while (nc < need) nc *= 2;
+    /* The first write sizes the file exactly (the initrd unpacks each file in
+       one write, as do most whole-file saves); later growth doubles. */
+    uint64_t nc = v->cap ? v->cap * 2 : need;
+    if (nc < need) nc = need;
     uint8_t *nd = krealloc(v->data, nc);
     if (!nd) return -N_ERR_NO_MEMORY;
     v->data = nd;

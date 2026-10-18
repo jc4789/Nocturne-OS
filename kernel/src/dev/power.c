@@ -1,19 +1,10 @@
 /* ACPI-based power off and reboot (with emulator fallbacks). */
 #include "kernel.h"
 #include "arch/cpu.h"
-#include "limine.h"
+#include "dev/acpi.h"
 #include "mm/vmm.h"
 
-extern volatile struct limine_rsdp_request rsdp_req;
 void nvme_shutdown(void);
-
-struct sdt_header {
-    char sig[4];
-    uint32_t length;
-    uint8_t revision, checksum;
-    char oem[6], oem_table[8];
-    uint32_t oem_rev, creator, creator_rev;
-} PACKED;
 
 struct gas {
     uint8_t space, bit_width, bit_offset, access;
@@ -21,7 +12,7 @@ struct gas {
 } PACKED;
 
 struct fadt {
-    struct sdt_header h;
+    struct acpi_sdt h;
     uint32_t firmware_ctrl, dsdt;
     uint8_t reserved, pm_profile;
     uint16_t sci_int;
@@ -49,40 +40,6 @@ static struct fadt *fadt;
 static uint16_t slp_typa, slp_typb;
 static bool s5_ok;
 
-static void *acpi_ptr(uint64_t phys) {
-    vmm_map_mmio(phys, 4096); /* make sure it is mapped (uncached is fine for tables) */
-    struct sdt_header *h = phys_to_virt(phys);
-    vmm_map_mmio(phys, h->length > 4096 ? h->length : 4096);
-    return h;
-}
-
-static void *find_table(const char *sig) {
-    if (!rsdp_req.response) return NULL;
-    uint8_t *rsdp = (uint8_t *)rsdp_req.response->address;
-    if ((uint64_t)rsdp < hhdm_offset) rsdp = phys_to_virt((uint64_t)rsdp);
-    uint8_t rev = rsdp[15];
-    uint64_t xsdt = rev >= 2 ? *(uint64_t *)(rsdp + 24) : 0;
-    uint32_t rsdt = *(uint32_t *)(rsdp + 16);
-    if (xsdt) {
-        struct sdt_header *x = acpi_ptr(xsdt);
-        int n = (x->length - sizeof *x) / 8;
-        uint64_t *e = (uint64_t *)(x + 1);
-        for (int i = 0; i < n; i++) {
-            struct sdt_header *t = acpi_ptr(e[i]);
-            if (!memcmp(t->sig, sig, 4)) return t;
-        }
-    } else if (rsdt) {
-        struct sdt_header *x = acpi_ptr(rsdt);
-        int n = (x->length - sizeof *x) / 4;
-        uint32_t *e = (uint32_t *)(x + 1);
-        for (int i = 0; i < n; i++) {
-            struct sdt_header *t = acpi_ptr(e[i]);
-            if (!memcmp(t->sig, sig, 4)) return t;
-        }
-    }
-    return NULL;
-}
-
 /* Write a Generic Address Structure register (system memory or I/O space). */
 static void gas_write(const struct gas *g, uint64_t v) {
     if (g->space == 0) {
@@ -105,43 +62,21 @@ static void gas_write(const struct gas *g, uint64_t v) {
 
 static bool fadt_has(size_t end) { return fadt && fadt->h.length >= end; }
 
-static void list_tables(void) {
-    if (!rsdp_req.response) return;
-    uint8_t *rsdp = (uint8_t *)rsdp_req.response->address;
-    if ((uint64_t)rsdp < hhdm_offset) rsdp = phys_to_virt((uint64_t)rsdp);
-    uint64_t xsdt = rsdp[15] >= 2 ? *(uint64_t *)(rsdp + 24) : 0;
-    char line[160];
-    size_t n = 0;
-    if (xsdt) {
-        struct sdt_header *x = acpi_ptr(xsdt);
-        int cnt = (x->length - sizeof *x) / 8;
-        uint64_t *e = (uint64_t *)(x + 1);
-        for (int i = 0; i < cnt && n + 6 < sizeof line; i++) {
-            struct sdt_header *t = acpi_ptr(e[i]);
-            memcpy(line + n, t->sig, 4);
-            line[n + 4] = ' ';
-            n += 5;
-        }
-    }
-    line[n] = 0;
-    kprintf("acpi: tables %s\n", line);
-}
-
 void acpi_init(void) {
-    list_tables();
-    fadt = find_table("FACP");
+    acpi_tables_init(); /* registry (+ "acpi: tables" line), MADT, MCFG */
+    fadt = (struct fadt *)acpi_find("FACP", 0);
     if (!fadt) {
         kprintf("acpi: no FADT found\n");
         return;
     }
     uint64_t dsdt_phys = (fadt->h.length >= 148 && fadt->x_dsdt) ? fadt->x_dsdt : fadt->dsdt;
-    struct sdt_header *dsdt = acpi_ptr(dsdt_phys);
-    uint8_t *p = (uint8_t *)(dsdt + 1);
-    uint8_t *end = (uint8_t *)dsdt + dsdt->length;
+    const struct acpi_sdt *dsdt = acpi_map_table(dsdt_phys);
+    const uint8_t *p = (const uint8_t *)(dsdt + 1);
+    const uint8_t *end = (const uint8_t *)dsdt + dsdt->length;
     for (; p + 4 < end; p++) {
         if (memcmp(p, "_S5_", 4)) continue;
         if (!((p[-1] == 0x08) || (p[-2] == 0x08 && p[-1] == '\\'))) continue;
-        uint8_t *q = p + 4;
+        const uint8_t *q = p + 4;
         if (*q != 0x12) continue;
         q++;
         q += ((*q & 0xC0) >> 6) + 2; /* skip PkgLength and NumElements */

@@ -8,6 +8,7 @@
 #include "abi.h"
 #include "sys/sched.h"
 #include "arch/pstate.h"
+#include "arch/pat.h"
 
 #define AP_STACK_SIZE (32 * 1024)
 #define START_TIMEOUT_MS 2000
@@ -114,6 +115,15 @@ void cpu_bsp_wake(void) {
     if (!lapic_send_ipi(bsp_apic_id, VEC_USER_RETURN))
         __asm__ volatile("ud2" : : : "memory");
 }
+bool cpu_tlb_online(void) { return slots > 1; }
+bool cpu_tlb_ipi(unsigned i) {
+    /* A failed AP halts with IRQs off and never touches memory again. */
+    if (!i || i >= slots || !__atomic_load_n(&workers[i].ready, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&workers[i].failed, __ATOMIC_ACQUIRE)) return false;
+    if (!lapic_send_ipi(workers[i].apic_id, VEC_TLB_SHOOTDOWN))
+        panic("smp: TLB shootdown IPI failed; context retained");
+    return true;
+}
 void cpu_runner_check(void) {
     for (unsigned i = 1; i < slots; i++) if (cpu_runner_ready_at(i) && __atomic_load_n(&workers[i].failed, __ATOMIC_ACQUIRE)) {
         struct cpu_worker *w = &workers[i];
@@ -151,8 +161,8 @@ bool cpu_worker_poll(void) {
     struct cpu_worker *w = &workers[cpu_current_index()];
     uint64_t epoch = __atomic_load_n(&w->epoch, __ATOMIC_ACQUIRE);
     if (epoch == w->seen) return false;
-    write_cr3(kernel_pml4);
-    vmm_flush_all();
+    /* Kernel mapping changes reach this CPU by shootdown; no flush per job. */
+    vmm_switch(kernel_pml4);
     fpu_reset();
     for (size_t i = w->begin; i < w->end; i++) w->fn(i, w->context);
     __asm__ volatile("sfence" : : : "memory");
@@ -174,11 +184,13 @@ static NORETURN void worker_main(void *argument) {
     pstate_init_ap();
     if (pte_nx) wrmsr(0xC0000080, rdmsr(0xC0000080) | (1ULL << 11));
     write_cr0(read_cr0() | (1ULL << 16)); /* kernel write protection */
+    if (have_pat) pat_init_cpu(); /* same PAT as the BSP before any MMIO/WC mapping is touched */
     if (have_pat && rdmsr(0x277) != bsp_pat) {
         __atomic_store_n(&w->failed, 1, __ATOMIC_RELEASE);
         for (;;) hlt();
     }
     write_cr3(kernel_pml4);
+    vmm_init_cpu();
     if (!lapic_worker_init() || lapic_current_id() != w->apic_id) {
         __atomic_store_n(&w->failed, 1, __ATOMIC_RELEASE);
         for (;;) hlt();
@@ -217,12 +229,17 @@ void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context) {
     cpu_require_bsp();
     uint64_t irq_flags = irq_save(), since_job = rdtsc();
     bool nested = busy;
-    if (!nested) sched_quiesce_space(0);
     busy = true;
     struct fpu_state saved_fpu;
     fpu_save(&saved_fpu);
     fpu_reset();
-    unsigned participants = (unsigned)MIN(count, (size_t)cpu_worker_count() + 1);
+    /* Only APs without a user task take part. Running user threads are not
+       retired for kernel work: that stopped every thread of every app on each
+       composed frame. The BSP launches nothing while it is in here (IRQs off),
+       so an idle AP stays idle until the join. */
+    unsigned idle = 0;
+    for (unsigned i = 1; i < slots; i++) if (workers[i].enabled && sched_runner_idle(i)) idle++;
+    unsigned participants = (unsigned)MIN(count, (size_t)idle + 1);
     if (participants == 1 || nested ||
         (uint64_t)fn < 0xFFFF800000000000ULL ||
         (context && (uint64_t)context < 0xFFFF800000000000ULL)) {
@@ -240,7 +257,7 @@ void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context) {
     /* BSP のみが descriptor を変更し、前 job 全員の join 後にだけ再利用する。 */
     for (unsigned i = 1; i < slots && rank < participants; i++) {
         struct cpu_worker *w = &workers[i];
-        if (!w->enabled) continue;
+        if (!w->enabled || !sched_runner_idle(i)) continue;
         w->fn = fn;
         w->context = context;
         range(count, rank++, participants, &w->begin, &w->end);

@@ -186,6 +186,9 @@ static bool mtx_reenter(mtx_t *mtx) {
 static void mtx_acquired(mtx_t *mtx) {
     if (mtx->type & mtx_recursive) { mtx->owner = thread_id(); mtx->depth = 1; }
 }
+/* A wait_on_address/wake_address pair is two system calls and a scheduler
+   round trip, so a short critical section is waited out by spinning first. */
+#define MTX_SPIN_ROUNDS 128
 /* timeout: NULL waits forever. */
 static int mtx_acquire(mtx_t *mtx, const struct timespec *timeout) {
     if (mtx_reenter(mtx)) return thrd_success;
@@ -193,6 +196,15 @@ static int mtx_acquire(mtx_t *mtx, const struct timespec *timeout) {
     if (__atomic_compare_exchange_n(&mtx->state, &expected, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
         mtx_acquired(mtx);
         return thrd_success;
+    }
+    for (int spin = 0; spin < MTX_SPIN_ROUNDS; spin++) {
+        __builtin_ia32_pause();
+        if (__atomic_load_n(&mtx->state, __ATOMIC_RELAXED) != 0) continue;
+        expected = 0;
+        if (__atomic_compare_exchange_n(&mtx->state, &expected, 1, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            mtx_acquired(mtx);
+            return thrd_success;
+        }
     }
     for (;;) {
         if (__atomic_exchange_n(&mtx->state, 2, __ATOMIC_ACQUIRE) == 0) {
@@ -231,27 +243,48 @@ int mtx_unlock(mtx_t *mtx) {
 /* ---- condition variables ---- */
 int cnd_init(cnd_t *cond) { cond->sequence = 0; return thrd_success; }
 void cnd_destroy(cnd_t *cond) { (void)cond; }
+/* cnd_t is one word: the signal sequence in bits 31..16 and the number of
+   threads between "registered" and "returned" in bits 15..0. Signalling bumps
+   the sequence and only enters the kernel when somebody is registered. A
+   waiter registers (and samples the sequence) before it releases the mutex,
+   so a signal sent after the release always sees it. */
+#define CND_ONE_SIGNAL 0x10000u
+#define CND_WAITERS(word) ((word) & 0xffffu)
 int cnd_signal(cnd_t *cond) {
-    __atomic_add_fetch(&cond->sequence, 1, __ATOMIC_RELEASE);
-    wake_address(&cond->sequence, 1);
+    uint32_t old = __atomic_fetch_add(&cond->sequence, CND_ONE_SIGNAL, __ATOMIC_ACQ_REL);
+    if (CND_WAITERS(old)) wake_address(&cond->sequence, 1);
     return thrd_success;
 }
 int cnd_broadcast(cnd_t *cond) {
-    __atomic_add_fetch(&cond->sequence, 1, __ATOMIC_RELEASE);
-    wake_address(&cond->sequence, 0);
+    uint32_t old = __atomic_fetch_add(&cond->sequence, CND_ONE_SIGNAL, __ATOMIC_ACQ_REL);
+    if (CND_WAITERS(old)) wake_address(&cond->sequence, 0);
     return thrd_success;
 }
 static int cnd_wait_until(cnd_t *cond, mtx_t *mtx, const struct timespec *ts) {
-    uint32_t sequence = __atomic_load_n(&cond->sequence, __ATOMIC_ACQUIRE);
+    uint32_t word = __atomic_add_fetch(&cond->sequence, 1, __ATOMIC_ACQ_REL);
     /* A recursive mutex is released and restored at its full depth. */
     unsigned depth = mtx->type & mtx_recursive ? mtx->depth : 0;
     if (depth) { mtx->depth = 1; }
-    if (mtx_unlock(mtx) != thrd_success) return thrd_error;
+    if (mtx_unlock(mtx) != thrd_success) {
+        __atomic_sub_fetch(&cond->sequence, 1, __ATOMIC_RELEASE);
+        return thrd_error;
+    }
     int result = thrd_success;
-    unsigned wait = ts ? deadline_ms(ts) : UINT32_MAX;
-    if (ts && !wait) result = thrd_timedout;
-    else if (wait_on_address(&cond->sequence, sequence, wait) == -N_ERR_TIMEOUT && ts && !deadline_ms(ts))
-        result = thrd_timedout;
+    for (;;) {
+        unsigned wait = ts ? deadline_ms(ts) : UINT32_MAX;
+        if (ts && !wait) { result = thrd_timedout; break; }
+        n_result r = wait_on_address(&cond->sequence, word, wait);
+        if (r == -N_ERR_NOT_READY) {
+            /* Another thread (de)registered: the word moved but no signal came. */
+            uint32_t now = __atomic_load_n(&cond->sequence, __ATOMIC_ACQUIRE);
+            if ((now ^ word) >> 16) break;
+            word = now;
+            continue;
+        }
+        if (r == -N_ERR_TIMEOUT && ts && !deadline_ms(ts)) result = thrd_timedout;
+        break;
+    }
+    __atomic_sub_fetch(&cond->sequence, 1, __ATOMIC_RELEASE);
     if (mtx_lock(mtx) != thrd_success) return thrd_error;
     if (depth) mtx->depth = depth;
     return result;
@@ -268,10 +301,15 @@ void call_once(once_flag *flag, void (*func)(void)) {
     uint32_t expected = 0;
     if (__atomic_compare_exchange_n(&flag->state, &expected, 1, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         func();
-        __atomic_store_n(&flag->state, 2, __ATOMIC_RELEASE);
-        wake_address(&flag->state, 0);
+        /* 3 = running with sleepers: only then is a wake needed. */
+        if (__atomic_exchange_n(&flag->state, 2, __ATOMIC_ACQ_REL) == 3) wake_address(&flag->state, 0);
         return;
     }
-    while (__atomic_load_n(&flag->state, __ATOMIC_ACQUIRE) != 2)
-        wait_on_address(&flag->state, 1, UINT32_MAX);
+    for (;;) {
+        uint32_t s = __atomic_load_n(&flag->state, __ATOMIC_ACQUIRE);
+        if (s == 2) return;
+        if (s == 1 && !__atomic_compare_exchange_n(&flag->state, &s, 3, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            continue;
+        wait_on_address(&flag->state, 3, UINT32_MAX);
+    }
 }

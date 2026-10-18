@@ -10,6 +10,7 @@
 #include "arch/smp.h"
 #include "sys/sched.h"
 #include "sys/prof.h"
+#include "mm/vmm.h"
 #include "arch/pstate.h"
 #include "mm/heap.h"
 
@@ -144,6 +145,11 @@ static void dump(void) {
     kprintf("prof: quantum/irq retires %u, lost samples %u, busy samples %llu\n",
             __atomic_exchange_n(&quantum_retire, 0, __ATOMIC_RELAXED),
             __atomic_exchange_n(&lost, 0, __ATOMIC_RELAXED), (unsigned long long)total);
+    static uint64_t last_sd, last_ipi;
+    uint64_t sd, ipi;
+    vmm_tlb_stats(&sd, &ipi);
+    kprintf("prof: TLB shootdowns %llu, IPIs %llu\n", (unsigned long long)(sd - last_sd), (unsigned long long)(ipi - last_ipi));
+    last_sd = sd; last_ipi = ipi;
     for (uint32_t i = 0; i < PROF_SLOTS; i++) {
         slots[i].count = 0;
         slots[i].pid = 0;

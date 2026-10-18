@@ -25,6 +25,9 @@ bool nmedia_alloc_reserve_worker(void);
 void nmedia_alloc_release_worker(void);
 bool nmedia_alloc_restrict_worker(void);
 void *nmedia_ff_malloc(size_t size);
+/* FFmpeg libavutil/mem.c の MALLOC_PREFIX 接点。32 byte 境界の SIMD buffer 用。 */
+void *nmedia_ff_memalign(size_t alignment, size_t size);
+int nmedia_ff_posix_memalign(void **out, size_t alignment, size_t size);
 void *nmedia_ff_mallocz(size_t size);
 void *nmedia_ff_realloc(void *pointer, size_t size);
 void nmedia_ff_free(void *pointer);

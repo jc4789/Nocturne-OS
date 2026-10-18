@@ -257,9 +257,9 @@ NORETURN void sched_ap_loop(void) {
             __asm__ volatile("sti; hlt" : : : "memory");
             continue;
         }
-        /* idleは固定kernel image/stackだけ。heapのtaskを読む前にglobalもflush。 */
+        /* kernel mappingの変更はtlb_shootdownがこのCPUにも届けるので全消去は不要。
+           user spaceの古いtagはvmm_switchがgen比較で破棄する。 */
         vmm_switch(kernel_pml4);
-        vmm_flush_all();
         if (__atomic_load_n(&mail->stop, __ATOMIC_ACQUIRE)) {
             runner_returned(mail);
             continue; /* user stackは一度も使用していない */
@@ -303,6 +303,7 @@ void sched_ap_interrupt(struct regs *r) {
         dispatch = false;
     }
     else if (vector==0x80 && net_ap_syscall(r)) dispatch=false;
+    else if (vector==0x80 && address_ap_syscall(r)) dispatch=false;
     if (!dispatch && !__atomic_load_n(&mail->stop, __ATOMIC_ACQUIRE) &&
         mail->elapsed_us < mail->quantum_us) return;
     /* The quantum is over but nothing waits for a CPU: keep running here.
@@ -324,8 +325,7 @@ void sched_ap_interrupt(struct regs *r) {
     /* CR2はfaultを起こしたCPUでcapture。BSPのread_cr2は決して代用しない。 */
     uint64_t remote_cr2 = vector == 14 ? read_cr2() : 0;
     fpu_save(&t->fpu);
-    vmm_switch(kernel_pml4);
-    vmm_flush_all();
+    vmm_switch(kernel_pml4); /* PCIDならtagは残り、同じspaceへの再開でTLBが温かい */
     sched_set_current(NULL);
     __atomic_store_n(&mail->phase, RUN_RETIRING, __ATOMIC_RELAXED);
     context_switch(&t->ksp, runner_idle_sp[cpu]);
@@ -333,6 +333,11 @@ void sched_ap_interrupt(struct regs *r) {
     cpu_require_bsp();
     if (dispatch) isr_dispatch_remote(r, remote_cr2);
     else sched_user_return(r);
+}
+
+bool sched_runner_idle(unsigned cpu) {
+    return cpu && cpu < CPU_MAX_COUNT &&
+           __atomic_load_n(&runner_mails[cpu].phase, __ATOMIC_ACQUIRE) == RUN_EMPTY;
 }
 
 void sched_quiesce_space(uint64_t pml4) {
@@ -359,12 +364,6 @@ void sched_quiesce_space(uint64_t pml4) {
     }
     /* IRQ待ちにBSPのqueue/allocator lockをAPへ要求しない。再入はRETURNEDを回収済み。 */
     irq_restore(flags);
-}
-
-void sched_pin_space(uint64_t pml4) {
-    /* WM operations arrive as BSP-owned trap messages. Writable pixels are
-       snapshotted by present, so having a window no longer pins user execution. */
-    sched_quiesce_space(pml4);
 }
 
 void sched_init(void) {
@@ -752,27 +751,42 @@ static struct wait_queue address_wait;
 static struct address_watch *address_watches, **address_watch_tail = &address_watches;
 static uint64_t address_seq;
 
+/* How many waiters (tasks and watches) are enrolled per hash of the physical
+   key. The lists stay BSP-owned; this count lets an AP finish a wake with no
+   waiter at all without migrating to the BSP. Enrollment raises the count
+   before it reads the user value, and an AP waker reads the count after the
+   user's store (with a full fence between), so either the waiter sees the new
+   value or the waker sees the count and takes the BSP path. */
+#define ADDRESS_BUCKETS 256
+static uint32_t address_waiters[ADDRESS_BUCKETS];
+static inline uint32_t *address_bucket(uint64_t phys) {
+    return &address_waiters[((phys >> 2) * 0x9E3779B97F4A7C15ULL) >> 56];
+}
+
 int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsigned timeout_ms) {
     uint64_t flags = irq_save();
     /* Kill and enrollment are both BSP-owned. A queued/migrated syscall must
        never register an infinite wait after its kill wake already happened. */
     if (current_task->killed) { irq_restore(flags); return -N_ERR_STOPPED; }
-    uint64_t current = wide ? __atomic_load_n((volatile uint64_t *)address, __ATOMIC_ACQUIRE)
-                            : __atomic_load_n((volatile uint32_t *)address, __ATOMIC_ACQUIRE);
-    if (current != expected) {
-        irq_restore(flags);
-        return -N_ERR_NOT_READY;
-    }
-    if (!timeout_ms) { irq_restore(flags); return -N_ERR_TIMEOUT; }
     struct task *t = current_task;
     uint64_t phys = vmm_translate(t->pml4, (uint64_t)address);
     if (!phys) { irq_restore(flags); return -N_ERR_BAD_ADDRESS; }
+    uint32_t *bucket = address_bucket(phys);
+    __atomic_add_fetch(bucket, 1, __ATOMIC_SEQ_CST);
+    uint64_t current = wide ? __atomic_load_n((volatile uint64_t *)address, __ATOMIC_SEQ_CST)
+                            : __atomic_load_n((volatile uint32_t *)address, __ATOMIC_SEQ_CST);
+    if (current != expected || !timeout_ms) {
+        __atomic_sub_fetch(bucket, 1, __ATOMIC_RELEASE);
+        irq_restore(flags);
+        return current != expected ? -N_ERR_NOT_READY : -N_ERR_TIMEOUT;
+    }
     t->wait_phys = phys;
     t->wait_seq = ++address_seq;
     bool awake = true;
     if (timeout_ms == UINT32_MAX) wq_wait(&address_wait);
     else awake = wq_wait_timeout(&address_wait, timeout_ms);
     t->wait_phys = 0;
+    __atomic_sub_fetch(bucket, 1, __ATOMIC_RELEASE);
     irq_restore(flags);
     if (t->killed) return -N_ERR_STOPPED;
     return awake ? 0 : -N_ERR_TIMEOUT;
@@ -783,6 +797,37 @@ static void address_watch_unlink(struct address_watch **link) {
     *link = w->next;
     if (address_watch_tail == &w->next) address_watch_tail = link;
     w->next = NULL;
+    __atomic_sub_fetch(address_bucket(w->phys), 1, __ATOMIC_RELEASE);
+}
+
+/* AP: the address calls that never enqueue anything. A wake with no waiter
+   enrolled for its key, and a wait whose value already differs (or that may
+   not block), complete here; everything else returns false for the BSP. */
+bool address_ap_syscall(struct regs *r) {
+    uint64_t a = r->rdi;
+    if (r->rax == SYS_WAKE_ADDRESS) {
+        if ((a & 3) || a >= USER_TOP - sizeof(uint32_t)) return false;
+        uint64_t pte = vmm_get_pte(current_task->pml4, a);
+        if ((pte & (PTE_P | PTE_U)) != (PTE_P | PTE_U)) return false;
+        __atomic_thread_fence(__ATOMIC_SEQ_CST); /* the user's store before the count */
+        if (__atomic_load_n(address_bucket((pte & PTE_ADDR) | (a & 0xFFF)), __ATOMIC_RELAXED)) return false;
+        r->rax = 0;
+        return true;
+    }
+    if (r->rax != SYS_WAIT_ADDRESS && r->rax != SYS_WAIT_ADDRESS64) return false;
+    bool wide = r->rax == SYS_WAIT_ADDRESS64;
+    uint64_t size = wide ? sizeof(uint64_t) : sizeof(uint32_t);
+    if ((a & (size - 1)) || a >= USER_TOP - size || current_task->killed) return false;
+    if (!vmm_ap_uaccess_begin()) return false;
+    uint64_t pte = vmm_get_pte(current_task->pml4, a);
+    if ((pte & (PTE_P | PTE_U)) != (PTE_P | PTE_U)) { vmm_ap_uaccess_end(); return false; }
+    uint64_t current = wide ? __atomic_load_n((volatile uint64_t *)a, __ATOMIC_ACQUIRE)
+                            : __atomic_load_n((volatile uint32_t *)a, __ATOMIC_ACQUIRE);
+    vmm_ap_uaccess_end();
+    uint64_t expected = wide ? r->rsi : (uint32_t)r->rsi;
+    if (current != expected) { r->rax = (uint64_t)(int64_t)-N_ERR_NOT_READY; return true; }
+    if (!(unsigned)r->rdx) { r->rax = (uint64_t)(int64_t)-N_ERR_TIMEOUT; return true; }
+    return false;
 }
 
 int task_wake_address(volatile uint32_t *address, unsigned count) {
@@ -891,9 +936,14 @@ int address_watch_add(struct vnode *queue, volatile uint32_t *address, uint32_t 
     struct address_watch *w = kzalloc(sizeof *w);
     if (!w) return -N_ERR_NO_MEMORY;
     uint64_t flags = irq_save();
-    if (__atomic_load_n(address, __ATOMIC_ACQUIRE) != expected) { irq_restore(flags); kfree(w); return -N_ERR_NOT_READY; }
     uint64_t phys = vmm_translate(current_task->pml4, (uint64_t)address);
     if (!phys) { irq_restore(flags); kfree(w); return -N_ERR_BAD_ADDRESS; }
+    /* Counted before the value check, as task_wait_address; unlink uncounts. */
+    __atomic_add_fetch(address_bucket(phys), 1, __ATOMIC_SEQ_CST);
+    if (__atomic_load_n(address, __ATOMIC_SEQ_CST) != expected) {
+        __atomic_sub_fetch(address_bucket(phys), 1, __ATOMIC_RELEASE);
+        irq_restore(flags); kfree(w); return -N_ERR_NOT_READY;
+    }
     w->queue = queue->priv; w->phys = phys; w->seq = ++address_seq; w->token = token;
     *address_watch_tail = w;
     address_watch_tail = &w->next;

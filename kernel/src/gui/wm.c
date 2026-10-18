@@ -363,9 +363,9 @@ static void minimize_window(struct window *w) {
 static void unmap_user(struct window *w) {
     if (!w->pml4) return;
     if (w->uaddr)
-        for (size_t i = 0; i < w->pages; i++) vmm_unmap_page(w->pml4, w->uaddr + i * PAGE_SIZE);
+        vmm_user_free(w->pml4, w->uaddr, w->pages * PAGE_SIZE); /* PTE_SHARED: frames stay with the window */
     if (w->second_uaddr)
-        for (size_t i = 0; i < w->pages; i++) vmm_unmap_page(w->pml4, w->second_uaddr + i * PAGE_SIZE);
+        vmm_user_free(w->pml4, w->second_uaddr, w->pages * PAGE_SIZE);
     w->uaddr = 0;
     w->second_uaddr = 0;
 }
@@ -488,7 +488,7 @@ static uint64_t map_user(struct window *w, struct task *t, unsigned index) {
         uint32_t *pixels = w->flags & WIN_DOUBLE_BUFFER ? (index ? w->user_buf : w->buf) : w->user_buf;
         uint64_t pa = vmm_translate(kernel_pml4, (uint64_t)pixels + i * PAGE_SIZE);
         if (!vmm_map_page(t->pml4, va + i * PAGE_SIZE, pa, PTE_P | PTE_W | PTE_U | PTE_SHARED | pte_nx)) {
-            while (i) vmm_unmap_page(t->pml4, va + --i * PAGE_SIZE);
+            vmm_user_free(t->pml4, va, i * PAGE_SIZE); /* PTE_SHARED: unmap only */
             return 0;
         }
     }
@@ -2453,9 +2453,9 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
         }
         /* unmap the old buffer from the owner */
         if (w->uaddr)
-            for (size_t i = 0; i < opages; i++) vmm_unmap_page(w->pml4, w->uaddr + i * PAGE_SIZE);
+            vmm_user_free(w->pml4, w->uaddr, opages * PAGE_SIZE); /* PTE_SHARED: unmap only */
         if (w->second_uaddr)
-            for (size_t i = 0; i < opages; i++) vmm_unmap_page(w->pml4, w->second_uaddr + i * PAGE_SIZE);
+            vmm_user_free(w->pml4, w->second_uaddr, opages * PAGE_SIZE);
         w->uaddr = w->second_uaddr = 0;
         if (was_pending) pending_frames--;
         wq_wake_all(&w->wq);

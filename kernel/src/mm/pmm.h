@@ -6,6 +6,7 @@ uint64_t pmm_alloc(void);
 uint64_t pmm_alloc_zeroed(void);
 uint64_t pmm_alloc_contig(uint64_t count);
 void pmm_free(uint64_t phys);
+void pmm_release_range(uint64_t phys, uint64_t size); /* consumed bootloader memory → allocator */
 uint64_t pmm_free_pages(void);
 uint64_t pmm_total_pages(void);
 extern uint64_t pmm_highest_usable;

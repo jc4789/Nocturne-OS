@@ -1,7 +1,7 @@
 /* Modern PCI virtio-gpu + a deliberately finite virgl rendering pipeline.
  * No raw command stream or shader supplied by users is submitted to the host.
- * PCI/queue layouts: OASIS VirtIO 1.2; GPU packets: Linux virtio_gpu.h;
- * virgl packets: virglrenderer virgl_protocol.h / Mesa virgl_encode.c.
+ * PCI/queue layouts and GPU control packets: OASIS VirtIO 1.2 specification
+ * (virtio-gpu device section); virgl command stream: the virgl protocol as documented.
  * The existing Limine display and Hyper-V/RDP remain independent fallbacks. */
 #include "kernel.h"
 #include "dev/gpu.h"

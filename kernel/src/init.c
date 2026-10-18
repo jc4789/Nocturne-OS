@@ -6,6 +6,7 @@
 #include "dev/input.h"
 #include "dev/fbcon.h"
 #include "dev/pci.h"
+#include "arch/ioapic.h"
 #include "dev/ata.h"
 #include "dev/audio.h"
 #include "dev/usb.h"
@@ -14,6 +15,7 @@
 #include "sys/proc.h"
 #include "sys/sched.h"
 #include "sys/prof.h"
+#include "mm/pmm.h"
 
 extern volatile struct limine_module_request module_req;
 extern const char *kernel_cmdline;
@@ -67,10 +69,15 @@ void kmain_late(void) {
         struct limine_file *m = module_req.response->modules[0];
         initrd_load(m->address, m->size);
         kprintf("initrd: %lu KiB loaded from %s\n", m->size / 1024, m->path);
+        /* Every file was copied into ramfs; the archive itself is dead weight. */
+        uint64_t before = pmm_free_pages();
+        pmm_release_range(hhdm_virt_to_phys(m->address), m->size);
+        kprintf("initrd: archive released, %lu MiB returned\n", (unsigned long)((pmm_free_pages() - before) * PAGE_SIZE / 1048576));
     } else {
         kprintf("initrd: none found!\n");
     }
     acpi_init();
+    ioapic_init(); /* maps and masks the pins; nothing routes through it yet (devices stay on the PIC / MSI) */
     if (vmbus_init()) {
         hv_input_init();
         hv_util_init();

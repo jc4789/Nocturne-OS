@@ -100,8 +100,18 @@ $(BUILD)/lexbor/%.o: %.c
 
 # Nocturne IOを用いる限定decoder。FFmpegのCLI・OS・network層は取り込まない。
 include third_party/ffmpeg/sources.mk
-FF_OBJ := $(patsubst %.c,$(BUILD)/ffmpeg/%.o,$(FFMPEG_C))
-$(FF_OBJ): third_party/ffmpeg/config.h third_party/ffmpeg/config_components.h third_party/ffmpeg/libavutil/avconfig.h
+FF_C_OBJ := $(patsubst %.c,$(BUILD)/ffmpeg/%.o,$(FFMPEG_C))
+FF_ASM_OBJ := $(patsubst %.asm,$(BUILD)/ffmpeg/%.asm.o,$(FFMPEG_ASM))
+FF_OBJ := $(FF_C_OBJ) $(FF_ASM_OBJ)
+$(FF_C_OBJ): third_party/ffmpeg/config.h third_party/ffmpeg/config_components.h third_party/ffmpeg/libavutil/avconfig.h
+# FFmpeg x86-64 SIMD (NASM, ELF64, non-PIC: CONFIG_PIC 0). 実行時にlibavutil/x86/cpu.cがcpuid/xgetbvで選択する。
+# config.asm は -P で先頭取込、-I はNASMの仕様で末尾 / が必要。AVX-512は構成で無効。
+FFASMFLAGS := -f elf64 -I third_party/ffmpeg/ -Pthird_party/ffmpeg/config.asm
+$(FF_ASM_OBJ): third_party/ffmpeg/config.asm third_party/ffmpeg/config_components.asm
+$(BUILD)/ffmpeg/%.asm.o: %.asm
+	@mkdir -p $(dir $@)
+	@echo "  FFAS $<"
+	@$(NASM) $(FFASMFLAGS) -I $(dir $<) -MD $(@:.o=.d) -o $@ $<
 FFFLAGS := -Iports/ffmpeg/include -Ithird_party/ffmpeg -Ithird_party/ffmpeg/compat/stdbit \
            $(filter-out -W%,$(UCFLAGS)) -w -DHAVE_AV_CONFIG_H -D_ISOC11_SOURCE -D_FILE_OFFSET_BITS=64 \
            -D_LARGEFILE_SOURCE -std=c17 -O3 -fno-math-errno -fno-signed-zeros -mstack-alignment=16

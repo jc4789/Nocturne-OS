@@ -100,12 +100,13 @@ void sched_post_switch(void); /* context_switch: 旧taskstackを離れた後だ�
 NORETURN void sched_ap_loop(void);
 void sched_ap_interrupt(struct regs *r);
 void sched_quiesce_space(uint64_t pml4); /* 0=shared kernel変更、他は該当user space */
-void sched_pin_space(uint64_t pml4);
+bool sched_runner_idle(unsigned cpu);    /* BSP: そのAPにuser taskが無い（kernel jobに使える） */
 int task_thread_create(uint64_t entry, uint64_t function, uint64_t argument);
 int task_thread_join(int tid);
 /* wide: compare the 8-byte word at address (wasm memory.atomic.wait64). */
 int task_wait_address(volatile void *address, uint64_t expected, bool wide, unsigned timeout_ms);
 int task_wake_address(volatile uint32_t *address, unsigned count);
+bool address_ap_syscall(struct regs *r); /* AP: waiterのいないwake、値不一致のwaitをその場で完了 */
 /* Asynchronous address waiters. A watch joins the same physical-address FIFO
  * as blocked tasks; a notify that selects it moves its token to the queue's
  * pollable ready list. Removing reports 1 while still waiting, 2 after it was

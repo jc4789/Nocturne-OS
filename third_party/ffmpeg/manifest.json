@@ -1,7 +1,8 @@
 {
   "release": "9.0.2",
   "license": "LGPL-2.1-or-later",
-  "compiled_sources": 372,
+  "compiled_sources": 409,
+  "compiled_asm_sources": 62,
   "files": [
     {
       "path": "compat/va_copy.h",
@@ -9,8 +10,18 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "config.asm",
+      "sha256": "37f8832fb3688bf0a6387ae0a1fbcfbe0c7df83e391aba82cb6036c02742b8bd",
+      "origin": "configure-generated"
+    },
+    {
       "path": "config.h",
-      "sha256": "c692ef22bf2a51ffe4629c1bf928916229dd5d3704fd2edde2a05ad53e90ee0b",
+      "sha256": "2bc8d6464a8db22ec58f5eecbf2b3c99b4a76b35ab92d0b1063732d7627261d2",
+      "origin": "configure-generated"
+    },
+    {
+      "path": "config_components.asm",
+      "sha256": "0d2874a2a2728f6e960d629fbb0a22ad7509114c25312a343962d561d79f5024",
       "origin": "configure-generated"
     },
     {
@@ -2179,6 +2190,491 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavcodec/x86/aacpsdsp.asm",
+      "sha256": "be29f11612fa4f8cc86d51f3c3ee38114968da5fe1bcc70fbf49e1917c189f40",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/aacpsdsp_init.c",
+      "sha256": "aca9717a10a907785a459488246eac22c51bf1ae5afb52bfcdb874f9f68a43ed",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/ac3dsp.asm",
+      "sha256": "87aea49cd4c7f2d560b0d0b1e892553c09eaa3f220865545c75f3e07b240c2bc",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/ac3dsp_downmix.asm",
+      "sha256": "c4eb6f5446f1d09da191e5a3f31e5b9bc2d64ce04a293af9291cbd790168f649",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/ac3dsp_init.c",
+      "sha256": "62d7552d53fe90bc44d204cf4cdaa5e9e3c8ccf1adfa1d4ebf9685d44a0086bf",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/blockdsp.asm",
+      "sha256": "eb5576ff268ebac3b7cb26a4887f68e887a136d5da57fb7b117a7d72a01b4f5a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/blockdsp_init.c",
+      "sha256": "93909f252d519b7c9927ee1cbbbcb76edd6ba7d026c3bcdd5853c847596fca96",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/bswapdsp.asm",
+      "sha256": "f6ced07c59c6acf96534c5a343268499bdfee99976836a651c40359f0a003f75",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/bswapdsp_init.c",
+      "sha256": "b60b519add741b4142cf77645d250f1e448f2c94d87e2d38ed40b7162199df20",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/cabac.h",
+      "sha256": "782bdbd760f2a84153886130386837b672d112555b031d9a1f6cd35dcfe5ceb0",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/constants.c",
+      "sha256": "71b2c8be867295aa946acef0db2617376cea54197890b38be11b7b24a08a6d85",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/constants.h",
+      "sha256": "4db220e204225fc9cc2cc23dc07613017fffeb69101c1b39ec228304c9c0cc0c",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/dct32.asm",
+      "sha256": "22aa296c7dcdba58b4e0527da9a8e15f0342cadf376501e4920fb6530185edb4",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/fdct.c",
+      "sha256": "b2879629099ebb518ae7b8dec26536ab797d749077f37ebc9cf7caf74e2d252e",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/fdct.h",
+      "sha256": "cf2c148edff02d971dacab5d4bc75b247cde7f562e1db359d3ff4b3c0c4bcac7",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/fdctdsp_init.c",
+      "sha256": "887c6737af925586464eb4b67b4b2c2fb76ba482d0f644625f72b92d4fa33fec",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/flacdsp.asm",
+      "sha256": "0bc1a28f6044d595ce730786abdbbb4b31c2252ca43f0a278b9bd31044822e08",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/flacdsp_init.c",
+      "sha256": "d486b1de04aec495cddda671402762fbc814ae81267b7a010d12e45a740fc889",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/fmtconvert.asm",
+      "sha256": "b1dd11f264f70c0c184b7882c24bbcde3303e17920e2d7db5580ac47c43e1c17",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/fmtconvert_init.c",
+      "sha256": "7c9a2c2b35d116e886eb7df0ab70b96a9fa71951c860d60a91ada079820e1409",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/fpel.asm",
+      "sha256": "425ce06e14a5c3a3cfabffe3d82041db107de342561b1b133ba3a1ee6c6063c8",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/fpel.h",
+      "sha256": "d511510b791c7966f393dd8afb1c0c9007f879050dfa33546fb1e5c3ef2be7d8",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_cabac.c",
+      "sha256": "25e7dae1dd574d5d8c99e07a6c5a254dad0d9f95a1c3615216368bb7ca060dd7",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_chromamc.asm",
+      "sha256": "7314dbbf172e577975fcb36e32de9e1da6566039dcbdeac421847121176ed667",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_chromamc_10bit.asm",
+      "sha256": "3f62191e44d8bd0cd8b49a365241bee5c5780d8abc9d7b73330e66671d194b61",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_deblock.asm",
+      "sha256": "296d8140b66cd19d4cf0fcd3b415f7c417f837ac8283f5c14bf11e6cc73cd93f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_deblock_10bit.asm",
+      "sha256": "2cb9343090beaf05e0e8238d9ad3d972e82cef9f49653a137c3a007b1636605d",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_idct.asm",
+      "sha256": "2cf9110474e2bb77304284d3f833f90f353ec01c90f74d216fb9d586edf98e05",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_idct_10bit.asm",
+      "sha256": "3e6c97ef0cae3df87ceb6ff006a3bf8b140da4c73bc73e90b9837fd6f432177e",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_intrapred.asm",
+      "sha256": "411ee47ca578d292b3ec637c7a5012eec6b66fba190c92f8d9a8b7ad5c5a40bf",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_intrapred_10bit.asm",
+      "sha256": "2e109671ee66bfc67e883a59ddab2a0b5f1591b29bf1a3c389e6afb0b5939bdd",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_intrapred_init.c",
+      "sha256": "1ab3518a529d6dd9f1e9962e73e615e02c5e0ff35b4fe3dae05569e1e771fd15",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_qpel.c",
+      "sha256": "dc38436a0e49ac4324600993ea2d1963601bb64433dd85adb5f70fcfd945b331",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_qpel_10bit.asm",
+      "sha256": "a0fae152d460a3ea976f1b9e51ba13544c54ebb232a290e9bd0fbf59b41faee0",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_qpel_8bit.asm",
+      "sha256": "2312ef4a199d8c415569ef168e94252a407e494315b3939f4a033d64d7cc4190",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_weight.asm",
+      "sha256": "753a1aa9c954dc7936d23ebc31eafbd34b56e9f8e6a2e63a7cd8f75b2ecd2114",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264_weight_10bit.asm",
+      "sha256": "00e7c2b8cfc48dc8bdf0e1997b62a6441c37092dd154d46463d4cc32ffd19998",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264chroma_init.c",
+      "sha256": "5c58b1795d3fa8a6b16f32d502947035986ff8e01a204c79712f6d5062ad6969",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h264dsp_init.c",
+      "sha256": "ed36a9e4204e5fbb26d91756ce2355980123e43b5668bc710c8facbfd54657fc",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h26x/h2656_inter.asm",
+      "sha256": "134c11acd9809160a632b9ad1adc2903ebede0387bf8a11daf748f304e7cac75",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h26x/h2656_sao.asm",
+      "sha256": "6b4d4e36e074054bd2f954c949541498a073eb1f4ca8518d871b15c448b3d83d",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h26x/h2656_sao_10bit.asm",
+      "sha256": "48d1f40b779ce580f9222c493df6c91ed70b32375d988d9f9ebd85df611a847c",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h26x/h2656dsp.c",
+      "sha256": "bf32c74bc16950631c9f5e9704783dce692c8387d078ed6a93e922968f314647",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/h26x/h2656dsp.h",
+      "sha256": "e46ebb59c708a36558d82a24c8baa30c750c3d1822c748e1605c4b2a070a3926",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/hevc/add_res.asm",
+      "sha256": "7afc6b385b8435288136337638678c2ce688a5a11ab8965869810e2a594d2c0a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/hevc/deblock.asm",
+      "sha256": "425fdb7fb71ea61f5948d87db47e4ce1acf955e72e514e50f2406d27315a8306",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/hevc/dequant.asm",
+      "sha256": "7050e60809a27570ab253255e1a35a5af98519c99f1bc4a86527bd077cc4b140",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/hevc/dsp.h",
+      "sha256": "710aa912bfd6285a12dfaa9cb680c29235f6e8e66ccc1428bd42ad7922d1b151",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/hevc/dsp_init.c",
+      "sha256": "b1a3e638aea13ce53cab5a9cf1d5ffd44546736cc3436607e1b66dcf6055528e",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/hevc/idct.asm",
+      "sha256": "db072f00035c74563524e128eea50343a10d59d02eee6785b177f8105e6ad072",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/hevc/mc.asm",
+      "sha256": "1ed32492c797e15da2928cd082666beb26ce13f8735f7c8c579399399bcb305a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/hevc/sao.asm",
+      "sha256": "8cee22874713ae43eb7962971f5f1350d4fdab2d26a801a2b124133fe730ff59",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/hevc/sao_10bit.asm",
+      "sha256": "37a71d6a8b4888bf8e0458f3de6a04b4af518f7751ab6266d1d2d4072185d0c5",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/idctdsp.asm",
+      "sha256": "d42a8f8d5a3f35551866a1e6bc170d237198737e2edf49c777627c56a0dc9641",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/idctdsp.h",
+      "sha256": "e7ef5c015988830f49b7a0f183de87894f2a82b3d7824158f33a582de5211d2e",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/idctdsp_init.c",
+      "sha256": "fb2e761b47282dd1fc93608f0dd72a5ac23cf20c482a13ee0fe21f4478e7f0a9",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/imdct36.asm",
+      "sha256": "99e8de1fa63e4a6d867be1adfe64aad69ba731230bb0e42a394cf56db8717b92",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/mathops.h",
+      "sha256": "3064a439372b5527c7d9e4c82ac9a4d43b9e87b504ed84ac412eef767e8435ec",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/me_cmp.asm",
+      "sha256": "f8998f084ab9c1c84e0c064aa37657acf9f9a94181de2c18c1980291b6ffd5a6",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/me_cmp_init.c",
+      "sha256": "a164960aa3e1bb6abec484357d909ce104120b7ecb4291a91fc0889c7c961e28",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/mpegaudiodsp.c",
+      "sha256": "043274216bc5648e246e7fe16dd3d2e10e311f4cb765c8bca4afa8c055c7f3d7",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/opusdsp.asm",
+      "sha256": "92359380dfe847efa826d2d1dfb16d77ab23fc70e687b33d4c2701303ece30de",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/opusdsp_init.c",
+      "sha256": "3717eb3600712927e0e43f23c30dcc20c11009f975746af43b3d1ebafd2647b7",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/qpel.asm",
+      "sha256": "8bace456630ef5d069c3bb5a8220742ea26360099c4981a2a0cd967108499b64",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/qpel.h",
+      "sha256": "fba6de92b3b73564576daf8f5a9940dcf1b7acca46aa312069ba6c5a77f2ca34",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/sbrdsp.asm",
+      "sha256": "42a4b7833730d42bc1ae780a997643d5ed1fc1df2055bb54188b2edc107bd10e",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/sbrdsp_init.c",
+      "sha256": "1b61c4c9f3f43ecac4de02c2a6089c8e926468b6f9086bc6dc8587a79f48531a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/simple_idct.h",
+      "sha256": "87547244243edacb19343b0db96b4361249e67b7760d5e0a72e06f8647cff663",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/simple_idct10.asm",
+      "sha256": "01849ff7220c46cd3cdb7d2ae198a67ea10ecc2cee12932b1a75457165dbdfb5",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/simple_idct10_template.asm",
+      "sha256": "127af30ba93f0421cce7ad2381a27856c239a53d017b3454fd44229d0a525c0a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/videodsp.asm",
+      "sha256": "e5d54ebfb66b25d68d99439eb94ca64026a65d258ad9c99d3b5542c46e1f1c41",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/videodsp.h",
+      "sha256": "53a889031272726d87209268f557e5d5f3e56a1a76e787d44e4b6ca12a07735f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/videodsp_init.c",
+      "sha256": "d1dc61e63d7bd4eeac01276ee069c97f184595251fb20d21cc01312a4273cb30",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vorbisdsp.asm",
+      "sha256": "f82bdd9a28ccb813610da169b11711cfb10ee42e89d8d87fe37e42dd7cc08eff",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vorbisdsp_init.c",
+      "sha256": "b92c480590c2b3f4cf296c8443c3b83373bb35616fd5521322e481761826095a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp8dsp.asm",
+      "sha256": "82ad174203c8fb6c994d6ae594ac86ac60a1a4b00abd4249324bee78e40de721",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp8dsp_init.c",
+      "sha256": "de62c97ceeac5c5b44bed1d852791efdb756b4cd277a73727d0be858a59ef2e5",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp8dsp_loopfilter.asm",
+      "sha256": "3dc453759cb11c369e2bd2ac785df62cd0701b36a6dcb3927b5f00a0898fda99",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9dsp_init.c",
+      "sha256": "4b338c3daf0339aff09865777c3e28b25c5a15977f6861db72ec3b677cd1ff0a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9dsp_init.h",
+      "sha256": "87de2713e6c09aa8058b8c38821cb61fb98408109d4c65410efa758a3bda9ecf",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9dsp_init_10bpp.c",
+      "sha256": "3e5a632d6f792dca076893791c102bc5a08c189ff26ce69ea81e72576fa79090",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9dsp_init_12bpp.c",
+      "sha256": "e28fe4d9c31d63b64014153be1044cee670a14488bf6a0c6ec7fc1c74bba3a04",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9dsp_init_16bpp.c",
+      "sha256": "7888d018872ab4917c623f97da5cdeb6fa1ca48272d85d66dad8352f8ab48d3a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9dsp_init_16bpp_template.c",
+      "sha256": "a1cb3b708da897d2e7b3f477e429f1216afdf4037dc901f51d8c9a645bca8567",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9intrapred.asm",
+      "sha256": "e6ddb9750e9da578d801c42dc277ed9a21e7a1c81a4f82010ca52cf4a3d45f8d",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9intrapred_16bpp.asm",
+      "sha256": "3c731ba73a74e38259d0284f6b39263cb0fb0b370e4e594b8172f9f3ebbe35fe",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9itxfm.asm",
+      "sha256": "135e86f6751343e4aa1441805f6bcd1908d8bc03cc244f7def47333da4543361",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9itxfm_16bpp.asm",
+      "sha256": "d0d7ac100c997a1984f91977e035d596b144a8258299fe99618d9ee41ab1fc44",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9itxfm_16bpp_avx512.asm",
+      "sha256": "2007a79978afd683f83934a56a41039530463e48cfdbf33c64527d89c6d95595",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9itxfm_avx2.asm",
+      "sha256": "96b3a62d78ecf45decad54a73073ea8382c2da67821c199aea2c84efa3fa04cf",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9itxfm_avx512.asm",
+      "sha256": "b509d9e6e091e1b504b6a87e6db212e7f1c424d4b2a98b22881d1635aac2c15b",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9itxfm_template.asm",
+      "sha256": "e351c225b38563c4720d6e705dc957f29b9bf249681842337419534d7ba2bfd2",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9lpf.asm",
+      "sha256": "8356133daf548d61c9feb084326dd403356cc823cc198d8bb36660945bdb48b8",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9lpf_16bpp.asm",
+      "sha256": "93578083e1cb9d958d74e186787f5752d3e652cd0e55befc9ceb63a6905adde2",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9mc.asm",
+      "sha256": "bc28bbb0773693d632ea48fa2019a52ab41fbe20701db4c6244e3c21a691c3ce",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vp9mc_16bpp.asm",
+      "sha256": "849f0bf8976c96a505bb51ec1a5a9c6d0652ec1944322cc5f537fea47a1f9036",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavcodec/x86/vpx_arith.h",
+      "sha256": "165ca92e072d5699abe6205eed5c84ad017a2fd69e2aa56a360ec47fbb13e2db",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavcodec/xiph.c",
       "sha256": "0c58e8eff89a085a81ee8ac5d7b3bd5564025c0de08d5cc3a085c88c40d944de",
       "origin": "upstream-unmodified"
@@ -3174,6 +3670,11 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavutil/crc_internal.h",
+      "sha256": "825ffab74e949e9baff48ec58f0e79974135e97db8799ff7cb2ab43a01ecb5a1",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavutil/csp.c",
       "sha256": "2c919841769cf19fc97eeee7bd0186678c27921b9d6ad8c7d83cbfc31c018b63",
       "origin": "upstream-unmodified"
@@ -3994,6 +4495,126 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libavutil/x86/aes.asm",
+      "sha256": "0034e71b8c1205aa52cecbcf69c8b9204541213840f9a6d315f6c282123f025e",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/aes_init.c",
+      "sha256": "d6eb8fa50ee9794a8ad51302c07eb56378055d22ac73b1c35d69081296953256",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/asm.h",
+      "sha256": "995f6aa0af77c57e5f5fd70954c4231c2efc176b9ebdaae2e30fb10d04299cfe",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/bswap.h",
+      "sha256": "272094588f544759798f1350b788daec25cbeb172858e1c9f66b8b96bf4871dc",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/cpu.c",
+      "sha256": "fbf8050a967ce2c567f60c836984db93a6eec40cecfefa3fe41fd2727fd06225",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/cpu.h",
+      "sha256": "77fc0986bd631bf215916b67c68caecaafae63ea31e7a35ad85386d9cae4f45f",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/cpuid.asm",
+      "sha256": "375ce42b095a3accf6a501e6e2172469ee26f25721ab3617e71689488bce5f26",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/crc.asm",
+      "sha256": "63572e47f7ce9008c4f9ff1e8cc9e4f077460151ef08f74400f8826bb4a76b85",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/crc.h",
+      "sha256": "92cb8dc75ef41373508cde1d49f2d64d250a481f31c5a7231a2864295af100da",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/fixed_dsp.asm",
+      "sha256": "b73eecb9b786950fa3fb6462605b7f405b1d81c89f42f0f9dfca208c45425896",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/fixed_dsp_init.c",
+      "sha256": "b4eb1eaa6eda4220dc9c07da7b7553983af8cfe1cf5735d6394b20e5a65d82ac",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/float_dsp.asm",
+      "sha256": "634a801fd67b0dfdf03c6db4f9904b4d40637c6f255e31134c138df3e5887ef0",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/float_dsp_init.c",
+      "sha256": "f68459230b10c7b00d184ac003ea3b40dd27bf73669130732eb0b7715c0884b0",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/imgutils.asm",
+      "sha256": "bd6adca52d36298e53f05b7d8f6b7a8d09a61e411c5a565f346b0a083ccc00c5",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/imgutils_init.c",
+      "sha256": "114171ecd249bb06b58ecbdfe67a477b9274efad1b39b15040361ae2e388f6de",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/intmath.h",
+      "sha256": "f2948aa2953afe5959c98c40e529cdb9972de995ca2e53f4efe3420fedb1186a",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/intreadwrite.h",
+      "sha256": "a37757c9f6eac24f351f9e0d6c3f3928e418dca2e27085d48077fb866f65ed8b",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/lls.asm",
+      "sha256": "b97691de874bdbdc4bdb6ebdb5d5a11d856778fd37972ffc1ff5a9fd032145df",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/lls_init.c",
+      "sha256": "d5f59296eb6d57588632330dea24fd285c69f1d1c65dcbbf55f83189ded4f4ad",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/timer.h",
+      "sha256": "465e6526086ffdbed5699556baee837c8549ecdff2b6c9621b76c730faa3fd87",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/tx_float.asm",
+      "sha256": "afa714832466b44d2a7cccfcc5e0752d2149ee975683aaec48e549877896e5ef",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/tx_float_init.c",
+      "sha256": "bbcd29b63a2a0c547b02a65c5c16e36f21c7c9da57a082ff286e7a908ca54c9c",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/x86inc.asm",
+      "sha256": "c0dc921fb4858ae7bc943dcb6a33b7cb480b13a8737e666533b331e36e00093d",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libavutil/x86/x86util.asm",
+      "sha256": "683b9eedda99fbc9326232f336c4bf3cf9bd2c61c569418b87fe6fd013cd237c",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "libavutil/xga_font_data.c",
       "sha256": "20c4194d933518aadcafde318f71c6ce97ec368c8257cabec424720aacf1f7ce",
       "origin": "upstream-unmodified"
@@ -4109,6 +4730,36 @@
       "origin": "upstream-unmodified"
     },
     {
+      "path": "libswresample/x86/audio_convert.asm",
+      "sha256": "48c5aab7d63406c71a4851441220b022019bbe15e91894974372ce9d77ea1318",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/x86/audio_convert_init.c",
+      "sha256": "967adf52611d588852ab04d9f22e6f45f20211c9d5837043b86e2b2cd52cb995",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/x86/rematrix.asm",
+      "sha256": "5c77f46fac30d490e061be6435fd4bdc432d3753af9b9d89f9ba2f08ddf15759",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/x86/rematrix_init.c",
+      "sha256": "9a6bb73ddd3131ceed753f60ce0309862fa311577da5390e681e78ff0a9d5a11",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/x86/resample.asm",
+      "sha256": "dfea4d9dd59d675cbeb24398080b54302831605c65ddcce3fa2ac898393d9d5d",
+      "origin": "upstream-unmodified"
+    },
+    {
+      "path": "libswresample/x86/resample_init.c",
+      "sha256": "812542416f8120035da217643f298c4475c0bc3c3ad7b1fc24a7b2b708f86647",
+      "origin": "upstream-unmodified"
+    },
+    {
       "path": "RELEASE",
       "sha256": "cb59c54a0c419202b393c39beebcdbef094e480bdea5c82290050c265a1f7508",
       "origin": "upstream-unmodified"
@@ -4144,16 +4795,11 @@
       "origin": "upstream-unmodified"
     }
   ],
-  "configuration": "freestanding x86_64 target-os=none; network/protocols/devices/encoders/threads/asm disabled; filters limited to configured native PCM transforms",
+  "configuration": "freestanding x86_64 target-os=none; network/protocols/devices/encoders/threads disabled; x86asm + inline asm with runtime cpudetect, AVX-512 off; filters limited to configured native PCM transforms",
   "effective_overrides": {
     "HAVE_MMAP": 0,
     "HAVE_FCNTL": 0,
-    "HAVE_MKSTEMP": 0,
-    "HAVE_UNISTD_H": 0,
-    "HAVE_SYS_TIME_H": 0,
-    "HAVE_GETTIMEOFDAY": 0,
-    "HAVE_ISATTY": 0,
-    "HAVE_MPROTECT": 0
+    "HAVE_MKSTEMP": 0
   },
   "libraries": [
     "libavutil",

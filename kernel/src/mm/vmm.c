@@ -3,6 +3,7 @@
 #include "arch/cpu.h"
 #include "mm/vmm.h"
 #include "mm/pmm.h"
+#include "arch/smp.h"
 #include "sys/sched.h"
 #include "sys/syscall.h"
 #include "limine.h"
@@ -13,10 +14,13 @@ uint64_t pte_nx;
 extern char __kernel_start[], __kernel_end[], __text_start[], __rodata_start[], __data_start[];
 
 /* Fixed storage, shared by pml4 rather than copied into each task. The BSP
- * owns all page-table mutations after sched_quiesce_space's retire ACK.
- * Saturation is not an approximate value: untracked spaces use the old walk. */
+ * owns all page-table mutations; other CPUs only walk them (hardware or
+ * vmm_get_pte) and learn about revoked translations through tlb_shootdown.
+ * Saturation is not an approximate value: untracked spaces use the old walk.
+ * A slot is also the space's PCID (slot + 1); gen counts its revocations so a
+ * CPU that last ran the space under an older gen flushes that PCID on entry. */
 #define USER_PAGE_COUNTS 128
-struct user_page_count { uint64_t pml4, owned; };
+struct user_page_count { uint64_t pml4, owned; uint32_t gen; };
 static struct user_page_count user_page_counts[USER_PAGE_COUNTS];
 
 static struct user_page_count *user_page_count_find(uint64_t pml4) {
@@ -27,14 +31,17 @@ static struct user_page_count *user_page_count_find(uint64_t pml4) {
 
 static void user_page_count_register(uint64_t pml4) {
     for (unsigned i=0;i<USER_PAGE_COUNTS;i++) if (!user_page_counts[i].pml4) {
-        user_page_counts[i]=(struct user_page_count){pml4,0};
+        /* A new gen retires whatever an earlier owner of this PCID left cached. */
+        uint32_t gen=user_page_counts[i].gen+1;
+        user_page_counts[i]=(struct user_page_count){0,0,gen};
+        __atomic_store_n(&user_page_counts[i].pml4,pml4,__ATOMIC_RELEASE);
         return;
     }
 }
 
 static void user_page_count_forget(uint64_t pml4) {
     struct user_page_count *c=user_page_count_find(pml4);
-    if (c) *c=(struct user_page_count){0};
+    if (c) { c->pml4=0; c->owned=0; }
 }
 
 static void user_page_count_change(uint64_t pml4,uint64_t va,uint64_t old,uint64_t now) {
@@ -49,6 +56,162 @@ static void user_page_count_change(uint64_t pml4,uint64_t va,uint64_t old,uint64
 }
 
 static inline uint64_t *tbl(uint64_t phys) { return (uint64_t *)phys_to_virt(phys & PTE_ADDR); }
+
+/* ---- TLB coherence ----
+ * Adding a translation needs no invalidation anywhere: no CPU caches a
+ * not-present entry. Changing or removing a present one is published by
+ * tlb_shootdown: the BSP invalidates locally, IPIs exactly the CPUs that have
+ * the space loaded and waits for their ACK, so the old frame/permission is
+ * dead everywhere before the caller frees or reuses it. User threads keep
+ * running on their APs; nothing is retired to the BSP.
+ * With PCID each tracked space keeps its own tag, so switching spaces (an AP
+ * launch/retire, a BSP context switch) no longer discards the whole TLB. A
+ * CPU that is not running the space when it is revoked keeps stale entries
+ * under that tag, and vmm_switch flushes them on its next entry because the
+ * space's gen moved past the one it last synchronised with. */
+#define CR4_PGE      (1ULL << 7)
+#define CR4_PCIDE    (1ULL << 17)
+#define CR3_NOFLUSH  (1ULL << 63)
+#define TLB_RANGE_MAX 32 /* above this a local flush is cheaper than invlpg per page */
+
+static bool pcid_on;
+static uint64_t cpu_loaded[CPU_MAX_COUNT];          /* pml4 in CR3, published before its gen is read */
+static uint32_t cpu_gen[CPU_MAX_COUNT][USER_PAGE_COUNTS];
+static bool cpu_pcid0_user[CPU_MAX_COUNT];          /* PCID 0 holds an untracked user space */
+static struct { uint64_t pml4, va, pages; int slot; uint32_t gen; } tlb_req;
+static uint64_t tlb_req_seq, tlb_ack[CPU_MAX_COUNT];
+/* AP kernel copies to/from user memory (net_ap_syscall) run with IRQs off and
+   cannot take the shootdown IPI. They announce the space first; a revocation
+   waits for them instead of clearing a PTE under a running copy. */
+static uint64_t cpu_uaccess[CPU_MAX_COUNT], vmm_revoking;
+static uint64_t tlb_shootdowns, tlb_ipis;
+
+static int space_slot(uint64_t pml4) {
+    for (unsigned i=0;i<USER_PAGE_COUNTS;i++)
+        if (__atomic_load_n(&user_page_counts[i].pml4,__ATOMIC_ACQUIRE)==pml4) return (int)i;
+    return -1;
+}
+
+static void flush_range_local(uint64_t va, uint64_t pages) {
+    if (pages > TLB_RANGE_MAX) { write_cr3(read_cr3() & ~CR3_NOFLUSH); return; } /* current PCID */
+    for (uint64_t i = 0; i < pages; i++) invlpg(va + i * PAGE_SIZE);
+}
+
+void vmm_switch(uint64_t pml4) {
+    unsigned cpu = cpu_current_index();
+    if ((read_cr3() & PTE_ADDR) == pml4) return;
+    /* Dekker with tlb_shootdown: either it sees this CPU in the space and IPIs
+       it, or this CPU sees the gen it bumped and flushes the tag below. */
+    __atomic_store_n(&cpu_loaded[cpu], pml4, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (!pcid_on) { write_cr3(pml4); return; }
+    if (pml4 == kernel_pml4) {
+        write_cr3(pml4 | (cpu_pcid0_user[cpu] ? 0 : CR3_NOFLUSH));
+        cpu_pcid0_user[cpu] = false;
+        return;
+    }
+    int slot = space_slot(pml4);
+    if (slot < 0) { write_cr3(pml4); cpu_pcid0_user[cpu] = true; return; }
+    uint32_t gen = __atomic_load_n(&user_page_counts[slot].gen, __ATOMIC_ACQUIRE);
+    bool fresh = cpu_gen[cpu][slot] == gen;
+    cpu_gen[cpu][slot] = gen;
+    write_cr3(pml4 | (uint64_t)(slot + 1) | (fresh ? CR3_NOFLUSH : 0));
+}
+
+void vmm_flush_all(void) {
+    /* Any PGE transition drops every entry: global ones and all PCIDs. */
+    uint64_t cr4 = read_cr4();
+    write_cr4(cr4 ^ CR4_PGE);
+    write_cr4(cr4);
+}
+
+/* AP: the shootdown IPI. Runs with IRQs off in either user or idle context. */
+void vmm_tlb_ipi(void) {
+    unsigned cpu = cpu_current_index();
+    uint64_t seq = __atomic_load_n(&tlb_req_seq, __ATOMIC_ACQUIRE);
+    if (!tlb_req.pml4) vmm_flush_all(); /* shared kernel half: cached under every tag */
+    else if ((read_cr3() & PTE_ADDR) == tlb_req.pml4) {
+        flush_range_local(tlb_req.va, tlb_req.pages);
+        if (tlb_req.slot >= 0) cpu_gen[cpu][tlb_req.slot] = tlb_req.gen;
+    }
+    __atomic_store_n(&tlb_ack[cpu], seq, __ATOMIC_RELEASE);
+}
+
+bool vmm_ap_uaccess_begin(void) {
+    unsigned cpu = cpu_current_index();
+    uint64_t pml4 = current_task->pml4;
+    __atomic_store_n(&cpu_uaccess[cpu], pml4, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&vmm_revoking, __ATOMIC_RELAXED) != pml4) return true;
+    __atomic_store_n(&cpu_uaccess[cpu], 0, __ATOMIC_RELEASE);
+    return false;
+}
+
+void vmm_ap_uaccess_end(void) {
+    __atomic_store_n(&cpu_uaccess[cpu_current_index()], 0, __ATOMIC_RELEASE);
+}
+
+static bool tlb_wait(uint64_t *word, uint64_t want, bool equal) {
+    uint64_t since = rdtsc(), spins = 0;
+    while ((__atomic_load_n(word, __ATOMIC_ACQUIRE) == want) != equal) {
+        cpu_runner_check();
+        if ((tsc_hz && rdtsc() - since > tsc_hz) || ++spins > 100000000) return false;
+        pause();
+    }
+    return true;
+}
+
+/* BSP, before clearing or narrowing present user PTEs of pml4. */
+static void revoke_begin(uint64_t pml4) {
+    if (pml4 == kernel_pml4) return;
+    __atomic_store_n(&vmm_revoking, pml4, __ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++)
+        if (!tlb_wait(&cpu_uaccess[cpu], pml4, false)) panic("vmm: AP user copy did not finish");
+}
+
+/* BSP: drop [va, va+pages) of pml4 from every TLB (kernel addresses: from every
+   space). Called with the PTEs already changed and IRQs disabled. */
+static void tlb_shootdown(uint64_t pml4, uint64_t va, uint64_t pages) {
+    bool kernel = va >= USER_TOP || pml4 == kernel_pml4;
+    int slot = -1;
+    uint32_t gen = 0;
+    tlb_shootdowns++;
+    if (!kernel && pcid_on && (slot = space_slot(pml4)) >= 0)
+        gen = __atomic_add_fetch(&user_page_counts[slot].gen, 1, __ATOMIC_SEQ_CST);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (kernel) {
+        if (pcid_on || pages > TLB_RANGE_MAX) vmm_flush_all(); /* invlpg reaches only the current PCID */
+        else flush_range_local(va, pages);
+    } else if ((read_cr3() & PTE_ADDR) == pml4) {
+        flush_range_local(va, pages);
+        if (slot >= 0) cpu_gen[0][slot] = gen;
+    }
+    if (!cpu_tlb_online()) { __atomic_store_n(&vmm_revoking, 0, __ATOMIC_RELEASE); return; }
+    ASSERT(!cpu_jobs_active()); /* a worker callback must not change or free mappings */
+    tlb_req.pml4 = kernel ? 0 : pml4; tlb_req.va = va; tlb_req.pages = pages;
+    tlb_req.slot = slot; tlb_req.gen = gen;
+    uint64_t seq = tlb_req_seq + 1;
+    __atomic_store_n(&tlb_req_seq, seq, __ATOMIC_RELEASE);
+    uint32_t sent = 0;
+    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
+        if (!kernel && __atomic_load_n(&cpu_loaded[cpu], __ATOMIC_RELAXED) != pml4) continue;
+        if (cpu_tlb_ipi(cpu)) { sent |= 1u << cpu; tlb_ipis++; }
+    }
+    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++)
+        if ((sent & (1u << cpu)) && !tlb_wait(&tlb_ack[cpu], seq, true))
+            panic("vmm: TLB shootdown ACK timeout cpu %u", cpu);
+    __atomic_store_n(&vmm_revoking, 0, __ATOMIC_RELEASE);
+}
+
+void vmm_tlb_stats(uint64_t *shootdowns, uint64_t *ipis) { *shootdowns = tlb_shootdowns; *ipis = tlb_ipis; }
+
+/* Each CPU, with CR3 = kernel_pml4 (PCID 0): enable PCIDs when the BSP did. */
+void vmm_init_cpu(void) {
+    unsigned cpu = cpu_current_index();
+    cpu_loaded[cpu] = kernel_pml4;
+    if (pcid_on) write_cr4(read_cr4() | CR4_PCIDE);
+}
 
 /* Split a 2 MiB / 1 GiB mapping into the next level down. */
 static void split_huge(uint64_t *entry, int level) {
@@ -69,14 +232,17 @@ static void split_huge(uint64_t *entry, int level) {
     *entry = newt | (e & (PTE_P | PTE_W | PTE_U));
 }
 
-static uint64_t *next_level(uint64_t *table, int idx, bool create, bool user, int level) {
+/* *stale: a cached translation or paging-structure entry changed (huge split,
+   upper-level permission upgrade), so the caller must shoot down va. */
+static uint64_t *next_level(uint64_t *table, int idx, bool create, bool user, int level, bool *stale) {
     uint64_t e = table[idx];
     if (e & PTE_P) {
         if (e & PTE_PS) {
             split_huge(&table[idx], level);
             e = table[idx];
+            *stale = true;
         }
-        if (user && !(e & PTE_U)) table[idx] |= PTE_U;
+        if (user && !(e & PTE_U)) { table[idx] |= PTE_U; *stale = true; }
         return tbl(e);
     }
     if (!create) return NULL;
@@ -87,21 +253,18 @@ static uint64_t *next_level(uint64_t *table, int idx, bool create, bool user, in
 }
 
 static bool vmm_map_page_locked(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags) {
-    sched_quiesce_space(va >= USER_TOP ? 0 : pml4);
-    if ((flags & (PTE_U | PTE_W | PTE_SHARED)) == (PTE_U | PTE_W | PTE_SHARED))
-        sched_pin_space(pml4);
-    bool user = flags & PTE_U;
+    bool user = flags & PTE_U, stale = false;
     uint64_t *l4 = tbl(pml4);
-    uint64_t *l3 = next_level(l4, (va >> 39) & 511, true, user, 4);
-    if (!l3) return false;
-    uint64_t *l2 = next_level(l3, (va >> 30) & 511, true, user, 3);
-    if (!l2) return false;
-    uint64_t *l1 = next_level(l2, (va >> 21) & 511, true, user, 2);
-    if (!l1) return false;
-    uint64_t *leaf=&l1[(va >> 12) & 511], old=*leaf;
-    *leaf = (pa & PTE_ADDR) | flags | PTE_P;
-    user_page_count_change(pml4,va,old,*leaf);
-    invlpg(va);
+    uint64_t *l3 = next_level(l4, (va >> 39) & 511, true, user, 4, &stale);
+    uint64_t *l2 = l3 ? next_level(l3, (va >> 30) & 511, true, user, 3, &stale) : NULL;
+    uint64_t *l1 = l2 ? next_level(l2, (va >> 21) & 511, true, user, 2, &stale) : NULL;
+    if (!l1) { if (stale) tlb_shootdown(pml4, va, 1); return false; }
+    uint64_t *leaf=&l1[(va >> 12) & 511], old=*leaf, now=(pa & PTE_ADDR) | flags | PTE_P;
+    if ((old & PTE_P) && old != now) { revoke_begin(pml4); stale = true; }
+    *leaf = now;
+    user_page_count_change(pml4,va,old,now);
+    /* A fresh leaf was never cached anywhere; only a replaced one is shot down. */
+    if (stale) tlb_shootdown(pml4, va, 1);
     return true;
 }
 
@@ -119,9 +282,10 @@ static bool map_2m(uint64_t pml4, uint64_t va, uint64_t pa, uint64_t flags) {
      * not leave a four-KiB-leaf counter active without huge-page accounting. */
     if (va<USER_TOP) user_page_count_forget(pml4);
     uint64_t *l4 = tbl(pml4);
-    uint64_t *l3 = next_level(l4, (va >> 39) & 511, true, false, 4);
+    bool stale = false; /* boot: only this CPU runs, and invlpg follows */
+    uint64_t *l3 = next_level(l4, (va >> 39) & 511, true, false, 4, &stale);
     if (!l3) return false;
-    uint64_t *l2 = next_level(l3, (va >> 30) & 511, true, false, 3);
+    uint64_t *l2 = next_level(l3, (va >> 30) & 511, true, false, 3, &stale);
     if (!l2) return false;
     uint64_t *e = &l2[(va >> 21) & 511];
     if ((*e & PTE_P) && !(*e & PTE_PS)) {
@@ -168,17 +332,32 @@ uint64_t vmm_translate(uint64_t pml4, uint64_t va) {
     return (*p & PTE_ADDR) + (va & 0xFFF);
 }
 
-uint64_t vmm_unmap_page(uint64_t pml4, uint64_t va) {
+/* Clears present 4 KiB leaves of [va, va+pages) and shoots the range down
+   once; old[i] receives each previous PTE (0 when nothing was mapped). The
+   frames stay valid for the caller to free only after this returns. */
+static void unmap_range(uint64_t pml4, uint64_t va, uint64_t pages, uint64_t *old) {
     uint64_t flags = irq_save();
-    sched_quiesce_space(va >= USER_TOP ? 0 : pml4);
-    bool huge = false;
-    uint64_t *p = walk(pml4, va, &huge);
-    if (!p || !(*p & PTE_P) || huge) { irq_restore(flags); return 0; }
-    uint64_t old = *p;
-    *p = 0;
-    user_page_count_change(pml4,va,old,0);
-    invlpg(va);
+    bool any = false;
+    for (uint64_t i = 0; i < pages; i++) {
+        bool huge = false;
+        uint64_t *p = walk(pml4, va + i * PAGE_SIZE, &huge);
+        old[i] = 0;
+        if (!p || !(*p & PTE_P) || huge) continue;
+        if (!any) revoke_begin(pml4);
+        any = true;
+        old[i] = *p;
+        *p = 0;
+        user_page_count_change(pml4, va + i * PAGE_SIZE, old[i], 0);
+    }
+    if (any) tlb_shootdown(pml4, va, pages);
     irq_restore(flags);
+}
+
+#define UNMAP_BATCH 64
+
+uint64_t vmm_unmap_page(uint64_t pml4, uint64_t va) {
+    uint64_t old;
+    unmap_range(pml4, va, 1, &old);
     return old;
 }
 
@@ -195,17 +374,6 @@ static void map_range(uint64_t va, uint64_t pa, uint64_t size, uint64_t flags4k,
             va += PAGE_SIZE;
         }
     }
-}
-
-void vmm_switch(uint64_t pml4) {
-    if (read_cr3() != pml4) write_cr3(pml4);
-}
-
-void vmm_flush_all(void) {
-    uint64_t cr4 = read_cr4();
-    if (cr4 & (1ULL << 7)) write_cr4(cr4 & ~(1ULL << 7)); /* PGE */
-    write_cr3(read_cr3());
-    if (cr4 & (1ULL << 7)) write_cr4(cr4);
 }
 
 void vmm_init(struct limine_memmap_response *mm, struct limine_executable_address_response *ka) {
@@ -254,6 +422,10 @@ void vmm_init(struct limine_memmap_response *mm, struct limine_executable_addres
         vmm_map_page(kernel_pml4, va, va - ka->virtual_base + ka->physical_base, f);
     }
     write_cr3(kernel_pml4);
+    cpuid(1, 0, &a, &b, &c, &d);
+    pcid_on = (c & (1u << 17)) && !cmdline_has("nopcid");
+    vmm_init_cpu();
+    kprintf("vmm: PCID %s, TLB shootdown by IPI\n", pcid_on ? "on" : "off");
 }
 
 void *vmm_map_mmio(uint64_t phys, uint64_t size) {
@@ -332,53 +504,75 @@ static uint64_t prot_flags(int prot) {
 /* Map fresh zeroed pages. Pages that are already mapped keep their contents and gain the
    requested permissions (two ELF segments can share a page). */
 int vmm_user_alloc(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
-    sched_quiesce_space(pml4);
+    /* Fresh pages need no other CPU's cooperation. Only granting W/X on an
+       already-present page changes a cached entry; that range is shot down
+       once at the end (a stale narrower entry would fault as a violation). */
     uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + size, PAGE_SIZE);
+    uint64_t lo = end, hi = start;
+    int result = 0;
     for (uint64_t a = start; a < end; a += PAGE_SIZE) {
+        uint64_t f = irq_save();
         bool huge = false;
         uint64_t *pte = walk(pml4, a, &huge);
         if (pte && (*pte & PTE_P)) {
-            if (huge) return -N_ERR_INVALID;
-            if ((*pte & PTE_SHARED_RO) && (prot & (VM_W | VM_X))) return -N_ERR_DENIED;
-            if (prot & VM_W) *pte |= PTE_W;
-            if (prot & VM_X) *pte &= ~PTE_NX;
-            invlpg(a);
+            uint64_t now = *pte;
+            if (huge) result = -N_ERR_INVALID;
+            else if ((now & PTE_SHARED_RO) && (prot & (VM_W | VM_X))) result = -N_ERR_DENIED;
+            else {
+                if (prot & VM_W) now |= PTE_W;
+                if (prot & VM_X) now &= ~PTE_NX;
+                if (now != *pte) { *pte = now; lo = MIN(lo, a); hi = MAX(hi, a + PAGE_SIZE); }
+            }
+            irq_restore(f);
+            if (result) break;
             continue;
         }
+        irq_restore(f);
         uint64_t p = pmm_alloc_zeroed();
-        if (!p) return -N_ERR_NO_MEMORY;
+        if (!p) { result = -N_ERR_NO_MEMORY; break; }
         if (!vmm_map_page(pml4, a, p, prot_flags(prot))) {
             pmm_free(p);
-            return -N_ERR_NO_MEMORY;
+            result = -N_ERR_NO_MEMORY;
+            break;
         }
     }
-    return 0;
+    if (lo < hi) {
+        uint64_t f = irq_save();
+        tlb_shootdown(pml4, lo, (hi - lo) / PAGE_SIZE);
+        irq_restore(f);
+    }
+    return result;
 }
 
 /* mprotect: set exactly these permissions on already-mapped user pages */
 int vmm_user_protect(uint64_t pml4, uint64_t va, uint64_t size, int prot) {
-    sched_quiesce_space(pml4);
     uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + size, PAGE_SIZE);
+    uint64_t f = irq_save();
     for (uint64_t a = start; a < end; a += PAGE_SIZE) {
         bool huge = false;
         uint64_t *pte = walk(pml4, a, &huge);
-        if (!pte || !(*pte & PTE_P) || huge || !(*pte & PTE_U)) return -N_ERR_NO_MEMORY;
-        if ((*pte & PTE_SHARED_RO) && (prot & (VM_W | VM_X))) return -N_ERR_DENIED;
+        if (!pte || !(*pte & PTE_P) || huge || !(*pte & PTE_U)) { irq_restore(f); return -N_ERR_NO_MEMORY; }
+        if ((*pte & PTE_SHARED_RO) && (prot & (VM_W | VM_X))) { irq_restore(f); return -N_ERR_DENIED; }
     }
+    if (start < end) revoke_begin(pml4);
     for (uint64_t a = start; a < end; a += PAGE_SIZE) {
         bool huge = false;
         uint64_t *pte = walk(pml4, a, &huge);
         *pte = (*pte & ~(PTE_W | PTE_NX)) | (prot_flags(prot) & (PTE_W | PTE_NX));
-        invlpg(a);
     }
+    if (start < end) tlb_shootdown(pml4, start, (end - start) / PAGE_SIZE);
+    irq_restore(f);
     return 0;
 }
 
 void vmm_user_free(uint64_t pml4, uint64_t va, uint64_t size) {
     uint64_t start = ALIGN_DOWN(va, PAGE_SIZE), end = ALIGN_UP(va + size, PAGE_SIZE);
-    for (uint64_t a = start; a < end; a += PAGE_SIZE) {
-        uint64_t old = vmm_unmap_page(pml4, a);
-        if ((old & PTE_P) && !(old & PTE_SHARED)) pmm_free(old & PTE_ADDR);
+    uint64_t old[UNMAP_BATCH];
+    for (uint64_t a = start; a < end; a += UNMAP_BATCH * PAGE_SIZE) {
+        uint64_t n = MIN((uint64_t)UNMAP_BATCH, (end - a) / PAGE_SIZE);
+        unmap_range(pml4, a, n, old);
+        for (uint64_t i = 0; i < n; i++)
+            if ((old[i] & PTE_P) && !(old[i] & PTE_SHARED)) pmm_free(old[i] & PTE_ADDR);
     }
 }
 
@@ -439,9 +633,10 @@ void *vmalloc_map_phys(uint64_t pa, size_t pages, uint64_t flags) {
 }
 
 void vfree(void *ptr, size_t pages) {
-    uint64_t va = (uint64_t)ptr;
-    for (size_t i = 0; i < pages; i++) {
-        uint64_t old = vmm_unmap_page(kernel_pml4, va + i * PAGE_SIZE);
-        if (old & PTE_P) pmm_free(old & PTE_ADDR);
+    uint64_t va = (uint64_t)ptr, old[UNMAP_BATCH];
+    for (size_t i = 0; i < pages; i += UNMAP_BATCH) {
+        size_t n = MIN((size_t)UNMAP_BATCH, pages - i);
+        unmap_range(kernel_pml4, va + i * PAGE_SIZE, n, old);
+        for (size_t j = 0; j < n; j++) if (old[j] & PTE_P) pmm_free(old[j] & PTE_ADDR);
     }
 }
