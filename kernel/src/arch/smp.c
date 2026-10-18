@@ -157,6 +157,11 @@ static bool deadline(uint64_t since, unsigned ms, uint64_t spins) {
     return spins > 100000000;
 }
 
+bool cpu_worker_pending(void) {
+    struct cpu_worker *w = &workers[cpu_current_index()];
+    return __atomic_load_n(&w->epoch, __ATOMIC_ACQUIRE) != w->seen;
+}
+
 bool cpu_worker_poll(void) {
     struct cpu_worker *w = &workers[cpu_current_index()];
     uint64_t epoch = __atomic_load_n(&w->epoch, __ATOMIC_ACQUIRE);
@@ -235,8 +240,9 @@ void cpu_parallel_for(size_t count, cpu_job_fn fn, void *context) {
     fpu_reset();
     /* Only APs without a user task take part. Running user threads are not
        retired for kernel work: that stopped every thread of every app on each
-       composed frame. The BSP launches nothing while it is in here (IRQs off),
-       so an idle AP stays idle until the join. */
+       composed frame. The BSP hands off nothing while it is in here (IRQs
+       off); an idle AP that took a waiting thread from another queue first
+       gets the job IPI in ring 3 and steps back to run the job. */
     unsigned idle = 0;
     for (unsigned i = 1; i < slots; i++) if (workers[i].enabled && sched_runner_idle(i)) idle++;
     unsigned participants = (unsigned)MIN(count, (size_t)idle + 1);

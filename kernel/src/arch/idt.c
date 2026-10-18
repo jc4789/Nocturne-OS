@@ -186,7 +186,6 @@ void isr_dispatch(struct regs *r) {
         if (v != 0xFF) lapic_eoi();
         return;
     }
-    if ((r->cs & 3) == 3 && (v < 32 || v == 0x80)) sched_user_kernel_entry();
     if (v < 32) {
         exception(r, r->vector == 14 ? read_cr2() : 0, 0);
     } else if (v < 48) {

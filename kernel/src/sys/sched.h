@@ -2,7 +2,7 @@
 #include "kernel.h"
 #include "arch/fpu.h"
 #include "arch/smp.h"
-#include "sys/saku.h"
+#include "sys/kei.h"
 
 struct regs;
 struct file;
@@ -25,7 +25,7 @@ struct task {
     bool is_user;
     bool killed;
     bool on_rq;
-    unsigned owner_cpu;       /* 0=BSP。AP retire ACK前はqueue/free禁止 */
+    unsigned owner_cpu;       /* 0=BSP。それ以外はそのAPのキュー所有（返却まで触れない） */
     bool is_thread;
     bool exiting;
     bool joining;
@@ -64,7 +64,9 @@ struct task {
     uint64_t cpu_ms;
     uint64_t start_ms;
     uint16_t cpu_subms_us;
-    struct saku_account saku; /* 朔Ⅱの持続会計とバースト標本（BSP所有） */
+    struct kei_task kei;      /* 継の会計。APのキューにいる間はそのキューの排他下 */
+    bool kei_tracked;
+    bool bsp_borrow;          /* APのキューからBSPが借りてring3を走らせている */
 };
 
 static inline struct task *sched_current(void) {
@@ -93,12 +95,13 @@ void schedule(void);
 void sched_yield(void);
 void sched_tick(void);
 void sched_user_return(struct regs *r);
-void sched_user_kernel_entry(void); /* BSP: ring3からsyscall/faultへ入った（資格休止） */
 void sched_post_switch(void); /* context_switch: 旧taskstackを離れた後だけpublication */
 NORETURN void sched_ap_loop(void);
 void sched_ap_interrupt(struct regs *r);
 void sched_quiesce_space(uint64_t pml4); /* 0=shared kernel変更、他は該当user space */
 bool sched_runner_idle(unsigned cpu);    /* BSP: そのAPにuser taskが無い（kernel jobに使える） */
+struct sched_stats { uint64_t handoffs, local_switches, dispatch_retires, stop_retires, steals, balances, kicks, borrows; };
+void sched_get_stats(struct sched_stats *out);
 int task_thread_create(uint64_t entry, uint64_t function, uint64_t argument);
 int task_thread_join(int tid);
 /* wide: compare the 8-byte word at address (wasm memory.atomic.wait64). */

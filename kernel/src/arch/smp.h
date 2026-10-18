@@ -61,6 +61,7 @@ void cpu_bsp_wake(void); /* AP: a published retire ACK is ready for collection *
 bool cpu_tlb_online(void);           /* BSP: any AP can hold TLB entries */
 bool cpu_tlb_ipi(unsigned index);    /* BSP: false when that AP is not running */
 bool cpu_worker_poll(void); /* AP idle stack only: execute a published bounded job */
+bool cpu_worker_pending(void); /* AP: 公開済みで未実行のjobがある（user実行を退かせて受ける） */
 void cpu_runner_check(void); /* BSP: failed APはcontextを保持してpanic */
 bool cpu_jobs_active(void);
 void cpu_require_bsp(void);
