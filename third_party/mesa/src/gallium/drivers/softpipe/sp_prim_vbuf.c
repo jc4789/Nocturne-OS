@@ -840,6 +840,29 @@ raster_threads_usable(struct softpipe_vbuf_render *cvbr, unsigned *nviews)
 }
 
 
+/* Copies the context state the rasterizer reads into a shadow context. The
+ * resource binding tables (samplers, sampler views, images, buffers, vertex
+ * buffers, texture caches) are tens of kilobytes and copied for every worker
+ * on every draw; threaded draws read textures only through the worker's own
+ * sampler copy and never use images, buffers or vertex inputs, so those
+ * ranges are left out. */
+#define SHADOW_RANGE(dst, src, from, to) \
+   memcpy((char *)(dst) + offsetof(struct softpipe_context, from), \
+          (const char *)(src) + offsetof(struct softpipe_context, from), \
+          offsetof(struct softpipe_context, to) - offsetof(struct softpipe_context, from))
+
+static void
+raster_shadow_copy(struct softpipe_context *shadow, const struct softpipe_context *sp)
+{
+   memcpy(shadow, sp, offsetof(struct softpipe_context, samplers));
+   SHADOW_RANGE(shadow, sp, depth_stencil, constants);
+   SHADOW_RANGE(shadow, sp, framebuffer, sampler_views);
+   SHADOW_RANGE(shadow, sp, viewports, vertex_buffer);
+   SHADOW_RANGE(shadow, sp, so_targets, mapped_vbuffer);
+   SHADOW_RANGE(shadow, sp, mapped_constants, tex_cache);
+}
+#undef SHADOW_RANGE
+
 static void
 raster_threads_prepare(struct softpipe_vbuf_render *cvbr, unsigned nviews)
 {
@@ -854,7 +877,7 @@ raster_threads_prepare(struct softpipe_vbuf_render *cvbr, unsigned nviews)
       struct quad_stage *depth_test = shadow->quad.depth_test;
       struct quad_stage *blend = shadow->quad.blend;
 
-      memcpy(shadow, sp, sizeof(*sp));
+      raster_shadow_copy(shadow, sp);
       shadow->quad.shade = shade;
       shadow->quad.depth_test = depth_test;
       shadow->quad.blend = blend;
@@ -862,7 +885,7 @@ raster_threads_prepare(struct softpipe_vbuf_render *cvbr, unsigned nviews)
       shadow->tgsi.sampler[MESA_SHADER_FRAGMENT] = w->sampler;
       shadow->dirty = 0;
 
-      memcpy(w->sampler->sp_sampler, samp->sp_sampler, sizeof(samp->sp_sampler));
+      memcpy(w->sampler->sp_sampler, samp->sp_sampler, nviews * sizeof(samp->sp_sampler[0]));
       memcpy(w->sampler->sp_sview, samp->sp_sview, nviews * sizeof(samp->sp_sview[0]));
 
       if (!w->bound || w->bound_serial != sp->fs_bind_serial) {

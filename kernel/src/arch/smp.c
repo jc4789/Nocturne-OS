@@ -7,6 +7,7 @@
 #include "mm/vmm.h"
 #include "abi.h"
 #include "sys/sched.h"
+#include "arch/pstate.h"
 
 #define AP_STACK_SIZE (32 * 1024)
 #define START_TIMEOUT_MS 2000
@@ -170,6 +171,7 @@ static NORETURN void worker_main(void *argument) {
         __atomic_store_n(&w->failed, 1, __ATOMIC_RELEASE);
         for (;;) hlt();
     }
+    pstate_init_ap();
     if (pte_nx) wrmsr(0xC0000080, rdmsr(0xC0000080) | (1ULL << 11));
     write_cr0(read_cr0() | (1ULL << 16)); /* kernel write protection */
     if (have_pat && rdmsr(0x277) != bsp_pat) {

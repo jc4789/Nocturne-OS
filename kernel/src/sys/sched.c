@@ -3,6 +3,8 @@
 #include "arch/cpu.h"
 #include "arch/smp.h"
 #include "sys/sched.h"
+#include "sys/prof.h"
+#include "arch/pstate.h"
 #include "sys/syscall.h"
 #include "mm/heap.h"
 #include "mm/vmm.h"
@@ -86,6 +88,15 @@ static void bsp_account(void) {
         need_resched = true;
     bsp_stamp = now;
     bsp_stamp_tsc = tsc;
+}
+
+/* Read by APs without the BSP's ownership: a stale answer only delays a
+   retire by one quantum or retires once more than needed. */
+static bool rq_empty_hint(void) {
+    for (unsigned cpu = 0; cpu < CPU_MAX_COUNT; cpu++)
+        for (unsigned i = 0; i < MLFQ_LEVELS; i++)
+            if (__atomic_load_n(&rq[cpu][i].head, __ATOMIC_RELAXED)) return false;
+    return true;
 }
 
 static unsigned rq_highest(void) {
@@ -272,6 +283,10 @@ void sched_ap_interrupt(struct regs *r) {
     struct runner_mailbox *mail = &runner_mails[cpu];
     uint64_t vector = r->vector;
     if (vector >= 32 && vector != 0x80 && vector != 0xFF) lapic_eoi();
+    if (vector == VEC_TIMER) {
+        prof_tick(r, (r->cs & 3) != 3);
+        if (pstate_sampling()) pstate_tick();
+    }
     if ((r->cs & 3) != 3) {
         if (vector < 32) cpu_worker_fault(r);
         return;
@@ -290,7 +305,21 @@ void sched_ap_interrupt(struct regs *r) {
     else if (vector==0x80 && net_ap_syscall(r)) dispatch=false;
     if (!dispatch && !__atomic_load_n(&mail->stop, __ATOMIC_ACQUIRE) &&
         mail->elapsed_us < mail->quantum_us) return;
+    /* The quantum is over but nothing waits for a CPU: keep running here.
+       Retiring would move the task through the BSP to whichever AP is free,
+       flushing its TLB and leaving its warm caches behind, only to resume
+       the same work. A task that becomes ready meanwhile is seen at the next
+       quantum end; a higher-priority one stops this AP at once (see
+       request_priority_preemption). Accounting stays exact: the BSP charges
+       the whole elapsed time at the eventual retire, which the boost period
+       bounds so the per-task CPU counters stay fresh. */
+    if (!dispatch && !__atomic_load_n(&mail->stop, __ATOMIC_ACQUIRE) &&
+        mail->elapsed_us < (uint64_t)BOOST_MS * 1000 && rq_empty_hint()) {
+        mail->quantum_us = (uint32_t)mail->elapsed_us + quantum_us[mail->level];
+        return;
+    }
     struct task *t = current_task;
+    prof_ap_retire(vector, r->rax);
     t->trap_cpu = cpu;
     /* CR2はfaultを起こしたCPUでcapture。BSPのread_cr2は決して代用しない。 */
     uint64_t remote_cr2 = vector == 14 ? read_cr2() : 0;
@@ -558,7 +587,10 @@ void sched_user_return(struct regs *r) {
     struct task *t = current_task;
     if (!cpu_runner_ready() || !t->is_user) return;
     collect_runner();
-    for (unsigned cpu = 1; cpu < CPU_MAX_COUNT; cpu++) {
+    /* Prefer the AP this task last ran on: its caches still hold its data. */
+    unsigned home = t->trap_cpu > 0 && t->trap_cpu < CPU_MAX_COUNT ? t->trap_cpu : 1;
+    for (unsigned n = 0; n < CPU_MAX_COUNT - 1; n++) {
+    unsigned cpu = 1 + (home - 1 + n) % (CPU_MAX_COUNT - 1);
     struct runner_mailbox *mail = &runner_mails[cpu];
     if (cpu_runner_ready_at(cpu) && __atomic_load_n(&mail->phase, __ATOMIC_ACQUIRE) == RUN_EMPTY) {
         ASSERT(!(read_rflags() & 0x200) && !cpu_jobs_active());

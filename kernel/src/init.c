@@ -13,6 +13,7 @@
 #include "hv/vmbus.h"
 #include "sys/proc.h"
 #include "sys/sched.h"
+#include "sys/prof.h"
 
 extern volatile struct limine_module_request module_req;
 extern const char *kernel_cmdline;
@@ -57,6 +58,7 @@ bool cmdline_has(const char *word) {
 
 void kmain_late(void) {
     entropy_init();
+    prof_init();
     vfs_init();
     vfs_mkdir("/home");
     vfs_mkdir("/tmp");

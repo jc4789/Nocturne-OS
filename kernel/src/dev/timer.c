@@ -5,6 +5,8 @@
 #include "sys/sched.h"
 #include "dev/timer.h"
 #include "dev/audio.h"
+#include "sys/prof.h"
+#include "arch/pstate.h"
 
 volatile uint64_t timer_ticks;
 static int64_t boot_unix_time;
@@ -16,7 +18,8 @@ static bool reference_clock;
    without acceleration loses a quarter of them), so with a measured TSC the count is set from it
    instead: a late tick catches up the time it missed. */
 static void timer_irq(struct regs *r) {
-    (void)r;
+    prof_tick(r, current_task->pid == 0);
+    if (pstate_sampling()) pstate_tick();
     uint64_t reference;
     if (reference_clock && hv_reference_time(&reference)) {
         uint64_t ms = (reference - reference_base) / 10000;

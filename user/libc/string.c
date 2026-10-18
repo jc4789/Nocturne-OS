@@ -1,48 +1,151 @@
+#define NOCTURNE_STRING_IMPL
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdint.h>
 #include <errno.h>
+#include <emmintrin.h>
+
+/* Most calls copy, fill or scan a few dozen bytes. rep movsb/stosb pay a
+   startup cost of tens of cycles that only pays off for long runs, so short
+   sizes use overlapping unaligned loads and stores (all loads before the
+   stores they could overlap) and SSE2 blocks, and only long runs use the
+   string instructions. Scans read whole aligned 16-byte blocks, which never
+   cross a page and so never touch memory the caller could not read. */
+
+static inline uint64_t load64(const unsigned char *p) { uint64_t v; __builtin_memcpy(&v, p, 8); return v; }
+static inline uint32_t load32(const unsigned char *p) { uint32_t v; __builtin_memcpy(&v, p, 4); return v; }
+static inline void store64(unsigned char *p, uint64_t v) { __builtin_memcpy(p, &v, 8); }
+static inline void store32(unsigned char *p, uint32_t v) { __builtin_memcpy(p, &v, 4); }
+
+/* 0..16 bytes; correct for any overlap because every load precedes every store */
+static inline void copy_small(unsigned char *dp, const unsigned char *sp, size_t n) {
+    if (n >= 8) {
+        uint64_t a = load64(sp), b = load64(sp + n - 8);
+        store64(dp, a);
+        store64(dp + n - 8, b);
+    } else if (n >= 4) {
+        uint32_t a = load32(sp), b = load32(sp + n - 4);
+        store32(dp, a);
+        store32(dp + n - 4, b);
+    } else if (n) {
+        unsigned char a = sp[0], b = sp[n / 2], c = sp[n - 1];
+        dp[0] = a;
+        dp[n / 2] = b;
+        dp[n - 1] = c;
+    }
+}
 
 void *memcpy(void *d, const void *s, size_t n) {
-    void *r = d;
-    __asm__ volatile("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory");
-    return r;
+    unsigned char *dp = d;
+    const unsigned char *sp = s;
+    if (n <= 16) {
+        copy_small(dp, sp, n);
+        return d;
+    }
+    if (n <= 256) {
+        __m128i last = _mm_loadu_si128((const __m128i *)(sp + n - 16));
+        for (size_t i = 0; i + 16 < n; i += 16)
+            _mm_storeu_si128((__m128i *)(dp + i), _mm_loadu_si128((const __m128i *)(sp + i)));
+        _mm_storeu_si128((__m128i *)(dp + n - 16), last);
+        return d;
+    }
+    __asm__ volatile("rep movsb" : "+D"(dp), "+S"(sp), "+c"(n) : : "memory");
+    return d;
 }
 
 void *memmove(void *d, const void *s, size_t n) {
     unsigned char *dp = d;
     const unsigned char *sp = s;
     if (dp == sp || n == 0) return d;
-    if (dp < sp || dp >= sp + n) return memcpy(d, s, n);
-    while (n--) dp[n] = sp[n];
+    if (n <= 16) {
+        copy_small(dp, sp, n);
+        return d;
+    }
+    if (dp + n <= sp || dp >= sp + n) return memcpy(d, s, n);
+    if (dp < sp) {
+        /* forward: each block is read before any later store reaches it */
+        size_t i = 0;
+        for (; i + 16 <= n; i += 16)
+            _mm_storeu_si128((__m128i *)(dp + i), _mm_loadu_si128((const __m128i *)(sp + i)));
+        for (; i < n; i++) dp[i] = sp[i];
+    } else {
+        size_t i = n;
+        for (; i >= 16; i -= 16)
+            _mm_storeu_si128((__m128i *)(dp + i - 16), _mm_loadu_si128((const __m128i *)(sp + i - 16)));
+        while (i--) dp[i] = sp[i];
+    }
     return d;
 }
 
 void *memset(void *d, int c, size_t n) {
-    void *r = d;
-    __asm__ volatile("rep stosb" : "+D"(d), "+c"(n) : "a"(c) : "memory");
-    return r;
+    unsigned char *dp = d;
+    uint64_t v = (unsigned char)c * 0x0101010101010101ull;
+    if (n <= 16) {
+        if (n >= 8) { store64(dp, v); store64(dp + n - 8, v); }
+        else if (n >= 4) { store32(dp, (uint32_t)v); store32(dp + n - 4, (uint32_t)v); }
+        else if (n) { dp[0] = (unsigned char)c; dp[n / 2] = (unsigned char)c; dp[n - 1] = (unsigned char)c; }
+        return d;
+    }
+    if (n <= 256) {
+        __m128i x = _mm_set1_epi8((char)c);
+        for (size_t i = 0; i + 16 < n; i += 16) _mm_storeu_si128((__m128i *)(dp + i), x);
+        _mm_storeu_si128((__m128i *)(dp + n - 16), x);
+        return d;
+    }
+    __asm__ volatile("rep stosb" : "+D"(dp), "+c"(n) : "a"(c) : "memory");
+    return d;
 }
 
 int memcmp(const void *a, const void *b, size_t n) {
     const unsigned char *x = a, *y = b;
-    for (size_t i = 0; i < n; i++)
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __m128i p = _mm_loadu_si128((const __m128i *)(x + i)), q = _mm_loadu_si128((const __m128i *)(y + i));
+        unsigned diff = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(p, q)) ^ 0xFFFFu;
+        if (diff) {
+            unsigned k = (unsigned)__builtin_ctz(diff);
+            return x[i + k] - y[i + k];
+        }
+    }
+    for (; i < n; i++)
         if (x[i] != y[i]) return x[i] - y[i];
     return 0;
 }
 
 void *memchr(const void *s, int c, size_t n) {
     const unsigned char *p = s;
-    for (size_t i = 0; i < n; i++)
-        if (p[i] == (unsigned char)c) return (void *)(p + i);
-    return NULL;
+    if (!n) return NULL;
+    const __m128i needle = _mm_set1_epi8((char)c);
+    /* the aligned block holding p, with the bytes before p masked off */
+    uintptr_t misalign = (uintptr_t)p & 15;
+    const unsigned char *block = p - misalign;
+    unsigned mask = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_load_si128((const __m128i *)block), needle));
+    mask &= 0xFFFFu << misalign;
+    size_t remaining = n + misalign;
+    for (;;) {
+        if (mask) {
+            size_t k = (size_t)__builtin_ctz(mask);
+            return k < remaining ? (void *)(block + k) : NULL;
+        }
+        if (remaining <= 16) return NULL;
+        remaining -= 16;
+        block += 16;
+        mask = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_load_si128((const __m128i *)block), needle));
+    }
 }
 
 size_t strlen(const char *s) {
-    size_t n = 0;
-    while (s[n]) n++;
-    return n;
+    const __m128i zero = _mm_setzero_si128();
+    uintptr_t misalign = (uintptr_t)s & 15;
+    const char *block = s - misalign;
+    unsigned mask = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_load_si128((const __m128i *)block), zero));
+    mask &= 0xFFFFu << misalign;
+    while (!mask) {
+        block += 16;
+        mask = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_load_si128((const __m128i *)block), zero));
+    }
+    return (size_t)(block + __builtin_ctz(mask) - s);
 }
 
 size_t strnlen(const char *s, size_t max) {

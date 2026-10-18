@@ -45,6 +45,9 @@
 #include "sp_tex_sample.h"
 #include "sp_texture.h"
 #include "sp_tex_tile_cache.h"
+#if DETECT_OS_NOCTURNE
+#include <emmintrin.h>
+#endif
 
 
 /** Set to one to help debug texture sampling */
@@ -1208,7 +1211,46 @@ img_filter_2d_linear_repeat_POT(const struct sp_sampler_view *sp_sview,
    const int y0 = vflr & (ypot - 1);
 
    const float *tx[4];
-      
+
+#if DETECT_OS_NOCTURNE
+   /* RGBA8 in plain memory: weigh the four texels in one SSE register
+    * instead of converting sixteen bytes to floats one by one. */
+   if (sp_sview->direct && sp_sview->direct_unorm8x4) {
+      const struct softpipe_resource *spr = sp_sview->direct;
+      const unsigned level = args->level;
+      const uint8_t *base = (const uint8_t *)spr->data + spr->level_offset[level] +
+                            (size_t)sp_sview->base.u.tex.first_layer * spr->img_stride[level];
+      const uint8_t *row0 = base + (size_t)y0 * spr->stride[level];
+      const uint8_t *row1 = base + (size_t)((y0 + 1) & (ypot - 1)) * spr->stride[level];
+      const unsigned x1 = (x0 + 1) & (xpot - 1);
+      const __m128i zero = _mm_setzero_si128();
+      uint32_t t00, t10, t01, t11;
+      memcpy(&t00, row0 + x0 * 4, 4);
+      memcpy(&t10, row0 + x1 * 4, 4);
+      memcpy(&t01, row1 + x0 * 4, 4);
+      memcpy(&t11, row1 + x1 * 4, 4);
+      const __m128i p0 = _mm_unpacklo_epi8(_mm_set_epi32(0, 0, (int)t10, (int)t00), zero);
+      const __m128i p1 = _mm_unpacklo_epi8(_mm_set_epi32(0, 0, (int)t11, (int)t01), zero);
+      const __m128 c00 = _mm_cvtepi32_ps(_mm_unpacklo_epi16(p0, zero));
+      const __m128 c10 = _mm_cvtepi32_ps(_mm_unpackhi_epi16(p0, zero));
+      const __m128 c01 = _mm_cvtepi32_ps(_mm_unpacklo_epi16(p1, zero));
+      const __m128 c11 = _mm_cvtepi32_ps(_mm_unpackhi_epi16(p1, zero));
+      const float scale = 1.0f / 255.0f;
+      const __m128 wx1 = _mm_set1_ps(xw), wx0 = _mm_set1_ps(1.0f - xw);
+      const __m128 top = _mm_add_ps(_mm_mul_ps(c00, wx0), _mm_mul_ps(c10, wx1));
+      const __m128 bottom = _mm_add_ps(_mm_mul_ps(c01, wx0), _mm_mul_ps(c11, wx1));
+      const __m128 res = _mm_add_ps(_mm_mul_ps(top, _mm_set1_ps((1.0f - yw) * scale)),
+                                     _mm_mul_ps(bottom, _mm_set1_ps(yw * scale)));
+      float out[4];
+      _mm_storeu_ps(out, res);
+      rgba[0] = out[0];
+      rgba[TGSI_NUM_CHANNELS] = out[1];
+      rgba[TGSI_NUM_CHANNELS * 2] = out[2];
+      rgba[TGSI_NUM_CHANNELS * 3] = out[3];
+      return;
+   }
+#endif
+
    addr.value = 0;
    addr.bits.level = args->level;
    addr.bits.z = sp_sview->base.u.tex.first_layer;
@@ -3785,8 +3827,14 @@ sp_tgsi_get_samples(struct tgsi_sampler *tgsi_sampler,
    assert(sampler_index < PIPE_MAX_SAMPLERS);
    assert(sp_tgsi_samp->sp_sampler[sampler_index]);
 
+#if DETECT_OS_NOCTURNE
+   /* the texel ring is scratch, written before it is read */
+   memcpy(&sp_sview, &sp_tgsi_samp->sp_sview[sview_index],
+          offsetof(struct sp_sampler_view, direct_texels));
+#else
    memcpy(&sp_sview, &sp_tgsi_samp->sp_sview[sview_index],
           sizeof(struct sp_sampler_view));
+#endif
    sp_samp = sp_tgsi_samp->sp_sampler[sampler_index];
 
    if (util_format_is_unorm(sp_sview.base.format)) {

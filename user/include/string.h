@@ -31,3 +31,16 @@ size_t strcspn(const char *s, const char *reject);
 char *strpbrk(const char *s, const char *accept);
 char *strerror(int e);
 NOCTURNE_END_DECLS
+
+/* Programs are built freestanding, which stops the compiler from treating
+   these as the standard functions: every copy of a 4-byte value or a small
+   struct became a call. Routed through the builtins, copies, fills and
+   comparisons of a known size are emitted inline and the rest still call
+   the functions above. C++ keeps plain names for std:: and :: lookups. */
+#if defined(__clang__) && !defined(__cplusplus) && !defined(NOCTURNE_STRING_IMPL)
+#define memcpy(d, s, n) __builtin_memcpy((d), (s), (n))
+#define memmove(d, s, n) __builtin_memmove((d), (s), (n))
+#define memset(d, c, n) __builtin_memset((d), (c), (n))
+#define memcmp(a, b, n) __builtin_memcmp((a), (b), (n))
+#define strlen(s) __builtin_strlen((s))
+#endif

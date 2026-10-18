@@ -13,6 +13,7 @@
 #include "mm/vmm.h"
 #include "mm/heap.h"
 #include "sys/sched.h"
+#include "arch/pstate.h"
 
 __attribute__((used, section(".limine_requests_start")))
 static volatile uint64_t requests_start[] = LIMINE_REQUESTS_START_MARKER;
@@ -99,6 +100,7 @@ void kmain(void) {
     apic_init();
     sched_init();
     timer_init();
+    pstate_init_bsp();
     smp_init(mp_req.response);
     sti();
     input_init();

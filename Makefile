@@ -42,7 +42,7 @@ $(BUILD)/kernel.elf: $(KOBJ) kernel/linker.ld
 
 # ---------------------------------------------------------------- userland
 UCFLAGS := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
-           -mno-red-zone -O2 -g -std=gnu11 -fno-strict-aliasing -msse2 \
+           -mno-red-zone -O2 -g -std=gnu11 -fno-strict-aliasing -msse2 -fomit-frame-pointer \
            -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Iuser/include -Icommon -MMD -MP
 ULDFLAGS := -m elf_x86_64 -s -nostdlib -static -z max-page-size=0x1000 -T user/user.ld --no-dynamic-linker
 

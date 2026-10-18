@@ -103,7 +103,7 @@ MESA_DEFS := -DHAVE_OPENGL=1 -DHAVE_OPENGL_ES_1=0 -DHAVE_OPENGL_ES_2=1 -DHAVE_SO
     -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 -DBLAKE3_USE_NEON=0 \
     -DENABLE_ST_OMX_BELLAGIO=0 -DENABLE_ST_OMX_TIZONIA=0 -DHAVE_COMPRESSION=0 -DNOCTURNE
 MESA_COMMON := --target=x86_64-unknown-none-elf -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
-    -mno-red-zone -msse2 -O2 -g0 -fno-strict-aliasing -fno-math-errno -fno-trapping-math \
+    -mno-red-zone -msse2 -O2 -g0 -fno-strict-aliasing -fno-math-errno -fno-trapping-math -fomit-frame-pointer \
     -ffunction-sections -fdata-sections -fno-addrsig -w -MMD -MP $(MESA_DEFS) $(MESA_INC)
 MESA_CFLAGS := $(MESA_COMMON) -std=gnu11 -Iuser/include -Icommon
 MESA_CXXFLAGS := $(MESA_COMMON) -std=c++17 -fno-exceptions -fno-rtti -nostdinc++ -Iuser/include/c++ \
