@@ -1,10 +1,16 @@
 // gotest exercises the Go port on Nocturne: output, time, goroutines on
-// several CPUs, documents and folders, timers, the collector and apps.
+// several CPUs, documents and folders, timers, the collector and apps;
+// "gotest net" tries the network: DNS, TCP deadlines, HTTP and HTTPS.
 package main
 
 import (
 	"bufio"
+	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,6 +33,9 @@ func main() {
 		case arg == "nil":
 			var p *int
 			fmt.Println(*p)
+		case arg == "net":
+			testNet()
+			return
 		case arg == "stdin":
 			s := bufio.NewScanner(os.Stdin)
 			lines := 0
@@ -113,4 +122,68 @@ func main() {
 	fmt.Printf("exec: %q err=%v\n", out, err)
 
 	fmt.Println("total", time.Since(start).Round(time.Millisecond))
+}
+
+func testNet() {
+	ifs, err := net.Interfaces()
+	for _, ifi := range ifs {
+		addrs, _ := ifi.Addrs()
+		fmt.Println("interface:", ifi.Name, ifi.HardwareAddr, ifi.Flags, addrs)
+	}
+	if err != nil {
+		fmt.Println("interfaces:", err)
+	}
+
+	t := time.Now()
+	ips, err := net.LookupIP("example.com")
+	fmt.Println("lookup example.com:", ips, err, time.Since(t).Round(time.Millisecond))
+	_, err = net.LookupHost("no-such-name.invalid")
+	fmt.Println("lookup missing:", err)
+
+	// Go's own DNS client, over UDP to the system resolver.
+	r := &net.Resolver{PreferGo: true}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	mx, err := r.LookupMX(ctx, "gmail.com")
+	cancel()
+	if len(mx) > 0 {
+		fmt.Println("MX gmail.com:", len(mx), mx[0].Host, err)
+	} else {
+		fmt.Println("MX gmail.com:", err)
+	}
+
+	// A read deadline on a quiet connection.
+	c, err := net.DialTimeout("tcp", "example.com:80", 10*time.Second)
+	if err == nil {
+		fmt.Println("dial:", c.LocalAddr(), "->", c.RemoteAddr())
+		c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		t = time.Now()
+		_, err = c.Read(make([]byte, 16))
+		ne, _ := err.(net.Error)
+		fmt.Println("read deadline:", ne != nil && ne.Timeout(), time.Since(t).Round(10*time.Millisecond))
+		c.Close()
+	} else {
+		fmt.Println("dial:", err)
+	}
+
+	for _, url := range []string{"http://example.com/", "https://example.com/"} {
+		t = time.Now()
+		resp, err := http.Get(url)
+		if err != nil {
+			fmt.Println("GET", url, err)
+			continue
+		}
+		b, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		title := ""
+		if i := strings.Index(string(b), "<title>"); i >= 0 {
+			if j := strings.Index(string(b[i:]), "</title>"); j > 0 {
+				title = string(b[i+7 : i+j])
+			}
+		}
+		proto := ""
+		if resp.TLS != nil {
+			proto = tls.VersionName(resp.TLS.Version)
+		}
+		fmt.Println("GET", url, resp.Status, len(b), "bytes", proto, title, err, time.Since(t).Round(time.Millisecond))
+	}
 }

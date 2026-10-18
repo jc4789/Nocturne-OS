@@ -45,6 +45,15 @@ Nocturne は UNIX でも POSIX でもないので、Go 側を Nocturne の API �
 - **シグナルはありません**：`os/signal.Notify` は何も届けません。非同期プリエンプションも使いません。
 - **フォルダーの既定**：`os.UserHomeDir` は `HOME`（既定 `/home`）、`UserCacheDir` は `/data/cache`、
   `UserConfigDir` は `/data/etc`。
+- **通信**：TCP・UDP の番号はハンドルではないので、`net` は Nocturne の通信呼出し
+  （`TCPConnect`、`TCPRecv`、`TCPSendUntil`、`UDPSocket` 等）を直接使います。待ちは
+  250ms ごとに区切り、その間に `Close` や期限（`SetDeadline`）の変更を見ます。`Close` は
+  使用中の呼出しが終わってから接続を渡すので、送信待ちのデータも送られます（FIN）。
+  アドレスの解決はシステムの解決器（`NetDNSAll`、全アプリ共通のキャッシュ）、それ以外の
+  レコード（MX、TXT、SRV 等）と `PreferGo` は Go の DNS クライアントで同じ解決器へ問い合わせます。
+  名前の固定表は `/data/etc/hosts`。IPv4 のみです。
+- **TLS**：`crypto/x509` は `/usr/share/ca/ca-bundle.crt`（ブラウザーと同じ信頼する証明書、
+  `make GO=...` が入れます）と `/data/etc/certs` を読みます。
 
 ## 確認したこと（QEMU、WHPX、4 CPU）
 
@@ -53,9 +62,14 @@ Nocturne は UNIX でも POSIX でもないので、Go 側を Nocturne の API �
 `/bin` の一覧、作業フォルダー、存在しない名前のエラー、チャンネルと `select`、GC、
 `os/exec` でのアプリ起動、`panic` のトレース表示、パイプからの標準入力。
 
+`gotest net` で、インターフェース一覧、`example.com` の解決（21ms）、存在しない名前、
+Go の DNS クライアントでの MX、TCP 接続、読み取り期限（300ms で期限切れ）、
+HTTP と HTTPS（TLS 1.3、証明書の検証）を確認しました。
+
 ## まだできないこと
 
-- `net` パッケージ（TCP・DNS・UDP）。TypeScript-Go（tsgo）のビルドに必要です。
+- TCP の待受け（`net.Listen("tcp", ...)`）。カーネルに待受けの呼出しがまだありません。
+  Unix ドメインソケットと IP 層のソケットもありません（アプリ間はチャンネルを使います）。
 - nil 参照などの CPU 例外は Go の panic にならず、アプリが終了します（カーネルに
   例外をアプリへ渡す仕組みがまだありません）。
 - 解放したヒープのページは OS へ返しません（`sysUnused` は何もしません）。

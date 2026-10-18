@@ -281,7 +281,7 @@ $(BUILD)/root/bin/wasm2c: $(BUILD)/u/third_party/wabt/src/tools/wasm2c.cc.o $(LI
 ifneq ($(GO),)
 GO_APPS  := $(notdir $(wildcard ports/go/apps/*))
 GO_BINS  := $(addprefix $(BUILD)/root/bin/,$(GO_APPS))
-GO_FILES := $(GO_BINS) $(BUILD)/root/usr/share/licenses/go/LICENSE
+GO_FILES := $(GO_BINS) $(BUILD)/root/usr/share/licenses/go/LICENSE $(BUILD)/root/usr/share/ca/ca-bundle.crt
 $(GO_BINS): $(BUILD)/root/bin/%: ports/go/apps/%/main.go
 	@mkdir -p $(dir $@)
 	@echo "  GO   $@"
@@ -289,6 +289,21 @@ $(GO_BINS): $(BUILD)/root/bin/%: ports/go/apps/%/main.go
 $(BUILD)/root/usr/share/licenses/go/LICENSE:
 	@mkdir -p $(dir $@)
 	@cp "$$("$(GO)" env GOROOT)/LICENSE" $@
+# Go's crypto/x509 reads the trusted roots from this file.
+$(BUILD)/root/usr/share/ca/ca-bundle.crt: third_party/ca/ca-bundle.crt
+	@mkdir -p $(dir $@)
+	@cp $< $@
+# TSGO: the TypeScript-Go source (ports/tsgo/nocturne.patch applied) -> /bin/tsgo
+ifneq ($(TSGO),)
+GO_FILES += $(BUILD)/root/bin/tsgo $(BUILD)/root/usr/share/licenses/typescript-go/LICENSE
+$(BUILD)/root/bin/tsgo: ports/tsgo/nocturne.patch
+	@mkdir -p $(dir $@)
+	@echo "  GO   $@"
+	@cd "$(TSGO)" && GOOS=nocturne GOARCH=amd64 CGO_ENABLED=0 "$(GO)" build -trimpath -o "$(CURDIR)/$@" ./cmd/tsgo
+$(BUILD)/root/usr/share/licenses/typescript-go/LICENSE:
+	@mkdir -p $(dir $@)
+	@cp "$(TSGO)/LICENSE" "$(TSGO)/NOTICE.txt" $(dir $@)
+endif
 endif
 
 $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT: $(BUILD)/cxx/libc++.a

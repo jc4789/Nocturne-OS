@@ -115,6 +115,33 @@ index 00000000..d79ef614
 +func read(b []byte) error {
 +	return syscall.Random(b)
 +}
+diff --git a/src/crypto/x509/root_nocturne.go b/src/crypto/x509/root_nocturne.go
+new file mode 100644
+index 00000000..5d47e061
+--- /dev/null
++++ b/src/crypto/x509/root_nocturne.go
+@@ -0,0 +1,21 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build nocturne
++
++package x509
++
++// Possible certificate files; stop after finding one. Nocturne installs
++// the roots it trusts in /usr/share/ca; /data/etc/certs holds additions.
++var certFiles = []string{
++	"/usr/share/ca/ca-bundle.crt",
++}
++
++var certDirectories = []string{
++	"/data/etc/certs",
++}
++
++func (c *Certificate) systemVerify(opts *VerifyOptions) (chains [][]*Certificate, err error) {
++	return nil, nil
++}
 diff --git a/src/internal/filepathlite/path_unix.go b/src/internal/filepathlite/path_unix.go
 index e31f1ae7..e2429191 100644
 --- a/src/internal/filepathlite/path_unix.go
@@ -387,10 +414,10 @@ index ec6368e8..afa35dca 100644
  	{"openbsd", "arm"}:     {CgoSupported: true},
 diff --git a/src/internal/poll/fd_nocturne.go b/src/internal/poll/fd_nocturne.go
 new file mode 100644
-index 00000000..1196d78c
+index 00000000..37a8b704
 --- /dev/null
 +++ b/src/internal/poll/fd_nocturne.go
-@@ -0,0 +1,117 @@
+@@ -0,0 +1,127 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -508,6 +535,16 @@ index 00000000..1196d78c
 +func DupCloseOnExec(fd int) (int, string, error) {
 +	return -1, "dup", syscall.ENOTSUP
 +}
++
++// RawRead is not available: there is no readiness to wait for.
++func (fd *FD) RawRead(f func(uintptr) bool) error {
++	return syscall.ENOTSUP
++}
++
++// RawWrite is not available: there is no readiness to wait for.
++func (fd *FD) RawWrite(f func(uintptr) bool) error {
++	return syscall.ENOTSUP
++}
 diff --git a/src/internal/syslist/syslist.go b/src/internal/syslist/syslist.go
 index 2349b6ea..d7e92363 100644
 --- a/src/internal/syslist/syslist.go
@@ -520,6 +557,976 @@ index 2349b6ea..d7e92363 100644
  	"openbsd":   true,
  	"plan9":     true,
  	"solaris":   true,
+diff --git a/src/internal/testenv/testenv_notunix.go b/src/internal/testenv/testenv_notunix.go
+index a7df5f5d..36f6ecc9 100644
+--- a/src/internal/testenv/testenv_notunix.go
++++ b/src/internal/testenv/testenv_notunix.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build windows || plan9 || (js && wasm) || wasip1
++//go:build windows || plan9 || nocturne || (js && wasm) || wasip1
+ 
+ package testenv
+ 
+diff --git a/src/net/dnsclient_unix.go b/src/net/dnsclient_unix.go
+index 6e749882..14665f84 100644
+--- a/src/net/dnsclient_unix.go
++++ b/src/net/dnsclient_unix.go
+@@ -436,12 +436,12 @@ func (conf *resolverConfig) tryUpdate(name string) {
+ 	conf.lastChecked = now
+ 
+ 	switch runtime.GOOS {
+-	case "windows":
++	case "windows", "nocturne":
+ 		// There's no file on disk, so don't bother checking
+ 		// and failing.
+ 		//
+-		// The Windows implementation of dnsReadConfig (called
+-		// below) ignores the name.
++		// The Windows and Nocturne implementations of dnsReadConfig
++		// (called below) ignore the name.
+ 	default:
+ 		var mtime time.Time
+ 		if fi, err := os.Stat(name); err == nil {
+diff --git a/src/net/dnsconfig_unix.go b/src/net/dnsconfig_unix.go
+index 0fcf2c6c..011938ef 100644
+--- a/src/net/dnsconfig_unix.go
++++ b/src/net/dnsconfig_unix.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build !windows
++//go:build !windows && !nocturne
+ 
+ // Read system DNS config from /etc/resolv.conf
+ 
+diff --git a/src/net/fd_nocturne.go b/src/net/fd_nocturne.go
+new file mode 100644
+index 00000000..5cfc242d
+--- /dev/null
++++ b/src/net/fd_nocturne.go
+@@ -0,0 +1,250 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package net
++
++import (
++	"internal/poll"
++	"io"
++	"os"
++	"sync/atomic"
++	"syscall"
++	"time"
++)
++
++// waitSlice bounds each wait in the system, in milliseconds, so that a
++// blocked Read or Write notices Close and deadline changes. Nocturne's TCP
++// and UDP calls take a timeout, not a cancellation handle.
++const waitSlice = 250
++
++// netFD is a Nocturne TCP connection or UDP socket. Both are numbered by
++// the network calls themselves, not handles.
++type netFD struct {
++	pfd poll.FD
++
++	// immutable until Close
++	net          string
++	id           int
++	udp          bool
++	laddr, raddr Addr
++	peer         syscall.Sockaddr4 // a dialed UDP socket's remote address
++
++	closing              atomic.Bool
++	rdeadline, wdeadline atomic.Int64 // UnixNano; 0 is none
++}
++
++func newFD(net string, id int, udp bool, laddr, raddr Addr) *netFD {
++	fd := &netFD{net: net, id: id, udp: udp, laddr: laddr, raddr: raddr}
++	fd.pfd.Sysfd = id
++	fd.pfd.Destroy = fd.destroy
++	return fd
++}
++
++func (fd *netFD) destroy() {
++	if fd.udp {
++		syscall.UDPClose(fd.id)
++	} else {
++		syscall.TCPClose(fd.id)
++	}
++}
++
++func (fd *netFD) name() string {
++	var ls, rs string
++	if fd.laddr != nil {
++		ls = fd.laddr.String()
++	}
++	if fd.raddr != nil {
++		rs = fd.raddr.String()
++	}
++	return fd.net + ":" + ls + "->" + rs
++}
++
++// Close stops new use of fd at once. Users blocked in the system see it
++// within waitSlice; the last one gives the connection up, so queued data
++// is still sent.
++func (fd *netFD) Close() error {
++	fd.closing.Store(true)
++	return fd.pfd.Close()
++}
++
++// wait returns how long the next wait in the system may last.
++func (fd *netFD) wait(deadline *atomic.Int64) (int, error) {
++	if fd.closing.Load() {
++		return 0, poll.ErrNetClosing
++	}
++	d := deadline.Load()
++	if d == 0 {
++		return waitSlice, nil
++	}
++	left := time.Until(time.Unix(0, d))
++	if left <= 0 {
++		return 0, poll.ErrDeadlineExceeded
++	}
++	return int(min((left+time.Millisecond-1)/time.Millisecond, waitSlice)), nil
++}
++
++func (fd *netFD) Read(b []byte) (int, error) {
++	if fd.udp {
++		n, _, err := fd.readFrom(b)
++		return n, err
++	}
++	n, err := fd.pfd.Read(fd.recv, b)
++	return n, wrapSyscallError("read", err)
++}
++
++func (fd *netFD) recv(b []byte) (int, error) {
++	for {
++		ms, err := fd.wait(&fd.rdeadline)
++		if err != nil {
++			return 0, err
++		}
++		n, err := syscall.TCPRecv(fd.id, b, ms)
++		switch {
++		case err == syscall.ERR_NOT_READY:
++			continue
++		case err != nil:
++			return 0, err
++		case n == 0:
++			return 0, io.EOF
++		}
++		return n, nil
++	}
++}
++
++func (fd *netFD) Write(b []byte) (int, error) {
++	if fd.udp {
++		if fd.raddr == nil {
++			return 0, errMissingAddress
++		}
++		return fd.writeTo(b, fd.peer)
++	}
++	n, err := fd.pfd.Write(fd.send, b)
++	return n, wrapSyscallError("write", err)
++}
++
++func (fd *netFD) send(b []byte) (int, error) {
++	done := 0
++	for done < len(b) {
++		ms, err := fd.wait(&fd.wdeadline)
++		if err != nil {
++			return done, err
++		}
++		n, err := syscall.TCPSendUntil(fd.id, b[done:], syscall.Uptime()+uint64(ms), 0)
++		done += n
++		if err != nil && err != syscall.ERR_TIMEOUT {
++			return done, err
++		}
++	}
++	return done, nil
++}
++
++// readFrom receives one datagram; a dialed socket takes only its peer's.
++func (fd *netFD) readFrom(b []byte) (n int, from syscall.Sockaddr4, err error) {
++	n, err = fd.pfd.Read(func(b []byte) (int, error) {
++		for {
++			ms, err := fd.wait(&fd.rdeadline)
++			if err != nil {
++				return 0, err
++			}
++			n, err = syscall.UDPRecv(fd.id, b, ms, &from)
++			if err == syscall.ERR_NOT_READY {
++				continue
++			}
++			if err == nil && fd.raddr != nil && from != fd.peer {
++				continue
++			}
++			return n, err
++		}
++	}, b)
++	return n, from, wrapSyscallError("recvfrom", err)
++}
++
++func (fd *netFD) writeTo(b []byte, to syscall.Sockaddr4) (int, error) {
++	if len(b) > syscall.UDPMaxPayload {
++		return 0, wrapSyscallError("sendto", syscall.ERR_TOO_LARGE)
++	}
++	n, err := fd.pfd.Write(func(b []byte) (int, error) {
++		return syscall.UDPSend(fd.id, to.IP, to.Port, b)
++	}, b)
++	return n, wrapSyscallError("sendto", err)
++}
++
++func (fd *netFD) closeRead() error {
++	return syscall.ENOTSUP
++}
++
++func (fd *netFD) closeWrite() error {
++	return syscall.ENOTSUP
++}
++
++func setDeadline(d *atomic.Int64, t time.Time) {
++	if t.IsZero() {
++		d.Store(0)
++	} else {
++		d.Store(max(t.UnixNano(), 1))
++	}
++}
++
++func (fd *netFD) SetDeadline(t time.Time) error {
++	setDeadline(&fd.rdeadline, t)
++	setDeadline(&fd.wdeadline, t)
++	return nil
++}
++
++func (fd *netFD) SetReadDeadline(t time.Time) error {
++	setDeadline(&fd.rdeadline, t)
++	return nil
++}
++
++func (fd *netFD) SetWriteDeadline(t time.Time) error {
++	setDeadline(&fd.wdeadline, t)
++	return nil
++}
++
++// dup is not available: network connections are not handles.
++func (fd *netFD) dup() (*os.File, error) {
++	return nil, syscall.ENOTSUP
++}
++
++// sockaddr4 converts an IPv4 address for the network calls.
++func sockaddr4(ip IP, port int) (syscall.Sockaddr4, bool) {
++	if len(ip) == 0 {
++		ip = IPv4zero
++	}
++	ip4 := ip.To4()
++	if ip4 == nil || port < 0 || port > 0xffff {
++		return syscall.Sockaddr4{}, false
++	}
++	return syscall.Sockaddr4{
++		IP:   uint32(ip4[0])<<24 | uint32(ip4[1])<<16 | uint32(ip4[2])<<8 | uint32(ip4[3]),
++		Port: uint16(port),
++	}, true
++}
++
++func ipFromUint32(v uint32) IP {
++	return IPv4(byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
++}
++
++// localIP is this system's address, for a connection's local address.
++func localIP() IP {
++	var ni syscall.NetInfo
++	if syscall.GetNetInfo(&ni) != nil || ni.Present == 0 {
++		return IPv4zero
++	}
++	return IPv4(ni.IP[0], ni.IP[1], ni.IP[2], ni.IP[3])
++}
++
++func wrapSyscallError(name string, err error) error {
++	if _, ok := err.(syscall.Errno); ok {
++		err = os.NewSyscallError(name, err)
++	}
++	return err
++}
++
++func isConnError(err error) bool {
++	if se, ok := err.(syscall.Errno); ok {
++		return se == syscall.ECONNRESET
++	}
++	return false
++}
+diff --git a/src/net/interface_nocturne.go b/src/net/interface_nocturne.go
+new file mode 100644
+index 00000000..1409f1fd
+--- /dev/null
++++ b/src/net/interface_nocturne.go
+@@ -0,0 +1,65 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package net
++
++import (
++	"os"
++	"syscall"
++)
++
++// Nocturne has at most one network interface, index 1.
++
++func netInfo() (*syscall.NetInfo, error) {
++	ni := new(syscall.NetInfo)
++	if err := syscall.GetNetInfo(ni); err != nil {
++		return nil, os.NewSyscallError("netinfo", err)
++	}
++	if ni.Present == 0 {
++		return nil, nil
++	}
++	return ni, nil
++}
++
++func interfaceTable(ifindex int) ([]Interface, error) {
++	ni, err := netInfo()
++	if ni == nil || (ifindex != 0 && ifindex != 1) {
++		return nil, err
++	}
++	name := "net0"
++	for i, c := range ni.Driver {
++		if c == 0 {
++			if i > 0 {
++				name = string(ni.Driver[:i])
++			}
++			break
++		}
++	}
++	ifi := Interface{
++		Index:        1,
++		MTU:          1500,
++		Name:         name,
++		HardwareAddr: HardwareAddr(append([]byte(nil), ni.MAC[:]...)),
++		Flags:        FlagBroadcast,
++	}
++	if ni.Up != 0 {
++		ifi.Flags |= FlagUp | FlagRunning
++	}
++	return []Interface{ifi}, nil
++}
++
++func interfaceAddrTable(ifi *Interface) ([]Addr, error) {
++	ni, err := netInfo()
++	if ni == nil || (ifi != nil && ifi.Index != 1) || ni.IP == [4]byte{} {
++		return nil, err
++	}
++	return []Addr{&IPNet{
++		IP:   IPv4(ni.IP[0], ni.IP[1], ni.IP[2], ni.IP[3]),
++		Mask: IPv4Mask(ni.Mask[0], ni.Mask[1], ni.Mask[2], ni.Mask[3]),
++	}}, nil
++}
++
++func interfaceMulticastAddrTable(ifi *Interface) ([]Addr, error) {
++	return nil, nil
++}
+diff --git a/src/net/internal/socktest/switch_posix.go b/src/net/internal/socktest/switch_posix.go
+index fcad4cea..11214f87 100644
+--- a/src/net/internal/socktest/switch_posix.go
++++ b/src/net/internal/socktest/switch_posix.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build !plan9
++//go:build !plan9 && !nocturne
+ 
+ package socktest
+ 
+diff --git a/src/net/internal/socktest/switch_stub.go b/src/net/internal/socktest/switch_stub.go
+index 8a2fc353..867f5dd6 100644
+--- a/src/net/internal/socktest/switch_stub.go
++++ b/src/net/internal/socktest/switch_stub.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build plan9
++//go:build plan9 || nocturne
+ 
+ package socktest
+ 
+diff --git a/src/net/ipsock_nocturne.go b/src/net/ipsock_nocturne.go
+new file mode 100644
+index 00000000..fd52061b
+--- /dev/null
++++ b/src/net/ipsock_nocturne.go
+@@ -0,0 +1,68 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package net
++
++import (
++	"context"
++	"os"
++	"syscall"
++	"time"
++)
++
++// Nocturne's network is IPv4.
++func (p *ipStackCapabilities) probe() {
++	p.ipv4Enabled = true
++}
++
++func errNotIPv4(ip IP) error {
++	return &AddrError{Err: "not an IPv4 address", Addr: ip.String()}
++}
++
++// connectTCP connects to `to` within ctx's deadline. The connection call
++// blocks, so it runs on its own goroutine when ctx can be cancelled; a
++// connection that completes after cancellation is given up.
++func connectTCP(ctx context.Context, to syscall.Sockaddr4) (int, error) {
++	if err := ctx.Err(); err != nil {
++		return -1, mapErr(err)
++	}
++	ms := 0 // the system's limit
++	if d, ok := ctx.Deadline(); ok {
++		left := time.Until(d)
++		if left <= 0 {
++			return -1, errTimeout
++		}
++		ms = int(max(min(left/time.Millisecond, 1<<30), 1))
++	}
++	connect := func() (int, error) {
++		id, err := syscall.TCPConnect(to.IP, to.Port, ms)
++		if err != nil {
++			return -1, os.NewSyscallError("connect", err)
++		}
++		return id, nil
++	}
++	if ctx.Done() == nil {
++		return connect()
++	}
++	type result struct {
++		id  int
++		err error
++	}
++	ch := make(chan result, 1)
++	go func() {
++		id, err := connect()
++		ch <- result{id, err}
++	}()
++	select {
++	case r := <-ch:
++		return r.id, r.err
++	case <-ctx.Done():
++		go func() {
++			if r := <-ch; r.err == nil {
++				syscall.TCPClose(r.id)
++			}
++		}()
++		return -1, mapErr(ctx.Err())
++	}
++}
+diff --git a/src/net/lookup_nocturne.go b/src/net/lookup_nocturne.go
+new file mode 100644
+index 00000000..56f32a49
+--- /dev/null
++++ b/src/net/lookup_nocturne.go
+@@ -0,0 +1,156 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package net
++
++import (
++	"context"
++	"syscall"
++	"time"
++)
++
++// Nocturne resolves addresses in the system (NetDNSAll, IPv4, with one
++// cache for every app); names in hostsFilePath come first. Other records
++// go through Go's DNS client to the same resolver (dnsconfig_nocturne.go),
++// as do all lookups of a Resolver with PreferGo or Dial.
++
++// The system resolver plays the part that the C library does elsewhere.
++const cgoAvailable = true
++
++func lookupProtocol(_ context.Context, name string) (int, error) {
++	return lookupProtocolMap(name)
++}
++
++func (r *Resolver) useGo() bool {
++	return r != nil && (r.PreferGo || r.Dial != nil)
++}
++
++func (r *Resolver) lookupHost(ctx context.Context, host string) ([]string, error) {
++	if r.useGo() {
++		return r.goLookupHostOrder(ctx, host, hostLookupFilesDNS, getSystemDNSConfig())
++	}
++	ips, err := r.lookupIP(ctx, "ip", host)
++	if err != nil {
++		return nil, err
++	}
++	addrs := make([]string, len(ips))
++	for i, ip := range ips {
++		addrs[i] = ip.String()
++	}
++	return addrs, nil
++}
++
++func (r *Resolver) lookupIP(ctx context.Context, network, host string) ([]IPAddr, error) {
++	if r.useGo() {
++		ips, _, err := r.goLookupIPCNAMEOrder(ctx, network, host, hostLookupFilesDNS, getSystemDNSConfig())
++		return ips, err
++	}
++	if ips, _ := goLookupIPFiles(host); len(ips) > 0 {
++		return ips, nil
++	}
++	if network == "ip6" {
++		return nil, newDNSError(errNoSuchHost, host, "")
++	}
++	if ctx.Done() == nil {
++		return systemLookupIP(host)
++	}
++	type result struct {
++		ips []IPAddr
++		err error
++	}
++	ch := make(chan result, 1)
++	go func() {
++		ips, err := systemLookupIP(host)
++		ch <- result{ips, err}
++	}()
++	select {
++	case r := <-ch:
++		return r.ips, r.err
++	case <-ctx.Done():
++		return nil, newDNSError(mapErr(ctx.Err()), host, "")
++	}
++}
++
++// systemLookupIP asks the system resolver for host's IPv4 addresses.
++func systemLookupIP(host string) ([]IPAddr, error) {
++	var small [16]uint32
++	ips := small[:]
++	var res syscall.DNSResult
++	err := syscall.NetDNSAll(host, ips, &res, nil)
++	if err == nil && int(res.Count) > len(ips) {
++		// The complete answer is cached; ask again with room for it.
++		ips = make([]uint32, res.Count)
++		err = syscall.NetDNSAll(host, ips, &res, nil)
++	}
++	if err == nil && res.Status == syscall.DNS_OK && res.Count > 0 {
++		addrs := make([]IPAddr, min(int(res.Count), len(ips)))
++		for i := range addrs {
++			addrs[i] = IPAddr{IP: ipFromUint32(ips[i])}
++		}
++		return addrs, nil
++	}
++	switch {
++	case res.Version == 0 && err == syscall.ERR_INVALID:
++		return nil, newDNSError(errNoSuchHost, host, "")
++	case res.Status == syscall.DNS_OK, res.Status == syscall.DNS_NXDOMAIN, res.Status == syscall.DNS_NODATA:
++		return nil, newDNSError(errNoSuchHost, host, "")
++	case res.Status == syscall.DNS_TIMEOUT, err == syscall.ERR_TIMEOUT:
++		return nil, newDNSError(errTimeout, host, "")
++	case res.Status == syscall.DNS_SERVFAIL, res.Status == syscall.DNS_UNREACHABLE,
++		res.Status == syscall.DNS_RESOURCE:
++		return nil, newDNSError(errServerTemporarilyMisbehaving, host, "")
++	case res.Status == syscall.DNS_CANCELLED:
++		return nil, newDNSError(errCanceled, host, "")
++	}
++	if err == nil {
++		err = errServerMisbehaving
++	}
++	return nil, newDNSError(err, host, "")
++}
++
++func (r *Resolver) lookupPort(ctx context.Context, network, service string) (int, error) {
++	return lookupPortMap(network, service)
++}
++
++func (r *Resolver) lookupCNAME(ctx context.Context, name string) (string, error) {
++	return r.goLookupCNAME(ctx, name, hostLookupFilesDNS, getSystemDNSConfig())
++}
++
++func (r *Resolver) lookupSRV(ctx context.Context, service, proto, name string) (string, []*SRV, error) {
++	return r.goLookupSRV(ctx, service, proto, name)
++}
++
++func (r *Resolver) lookupMX(ctx context.Context, name string) ([]*MX, error) {
++	return r.goLookupMX(ctx, name)
++}
++
++func (r *Resolver) lookupNS(ctx context.Context, name string) ([]*NS, error) {
++	return r.goLookupNS(ctx, name)
++}
++
++func (r *Resolver) lookupTXT(ctx context.Context, name string) ([]string, error) {
++	return r.goLookupTXT(ctx, name)
++}
++
++func (r *Resolver) lookupAddr(ctx context.Context, addr string) ([]string, error) {
++	return r.goLookupPTR(ctx, addr, hostLookupFilesDNS, getSystemDNSConfig())
++}
++
++// dnsReadConfig describes the system resolver for Go's DNS client; Nocturne
++// has no resolver file, so the name is ignored.
++func dnsReadConfig(string) *dnsConfig {
++	conf := &dnsConfig{
++		ndots:    1,
++		timeout:  5 * time.Second,
++		attempts: 2,
++	}
++	var ni syscall.NetInfo
++	if syscall.GetNetInfo(&ni) == nil && ni.Present != 0 && ni.Resolver != [4]byte{} {
++		ip := IPv4(ni.Resolver[0], ni.Resolver[1], ni.Resolver[2], ni.Resolver[3])
++		conf.servers = []string{JoinHostPort(ip.String(), "53")}
++	} else {
++		conf.servers = defaultNS
++	}
++	return conf
++}
+diff --git a/src/net/sockopt_nocturne.go b/src/net/sockopt_nocturne.go
+new file mode 100644
+index 00000000..bbb98cc0
+--- /dev/null
++++ b/src/net/sockopt_nocturne.go
+@@ -0,0 +1,43 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package net
++
++import (
++	"syscall"
++	"time"
++)
++
++// Nocturne's TCP sends at once and sizes its own buffers; it has no
++// keep-alive, lingering or multicast options.
++
++var hostsFilePath = "/data/etc/hosts"
++
++func maxListenerBacklog() int { return 0 }
++
++func concurrentThreadsLimit() int { return 500 }
++
++func setNoDelay(fd *netFD, noDelay bool) error { return nil }
++
++func setReadBuffer(fd *netFD, bytes int) error  { return syscall.ENOTSUP }
++func setWriteBuffer(fd *netFD, bytes int) error { return syscall.ENOTSUP }
++func setLinger(fd *netFD, sec int) error        { return syscall.ENOTSUP }
++
++func setKeepAlive(fd *netFD, keepalive bool) error {
++	if keepalive {
++		return syscall.ENOTSUP
++	}
++	return nil
++}
++
++func setKeepAliveIdle(fd *netFD, d time.Duration) error     { return nil }
++func setKeepAliveInterval(fd *netFD, d time.Duration) error { return nil }
++func setKeepAliveCount(fd *netFD, n int) error              { return nil }
++
++func setIPv4MulticastInterface(fd *netFD, ifi *Interface) error { return syscall.ENOTSUP }
++func setIPv4MulticastLoopback(fd *netFD, v bool) error          { return syscall.ENOTSUP }
++func joinIPv4Group(fd *netFD, ifi *Interface, ip IP) error      { return syscall.ENOTSUP }
++func setIPv6MulticastInterface(fd *netFD, ifi *Interface) error { return syscall.ENOTSUP }
++func setIPv6MulticastLoopback(fd *netFD, v bool) error          { return syscall.ENOTSUP }
++func joinIPv6Group(fd *netFD, ifi *Interface, ip IP) error      { return syscall.ENOTSUP }
+diff --git a/src/net/tcpsock_nocturne.go b/src/net/tcpsock_nocturne.go
+new file mode 100644
+index 00000000..1120f3c4
+--- /dev/null
++++ b/src/net/tcpsock_nocturne.go
+@@ -0,0 +1,75 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package net
++
++import (
++	"context"
++	"io"
++	"os"
++	"syscall"
++)
++
++func (c *TCPConn) readFrom(r io.Reader) (int64, error) {
++	return genericReadFrom(c, r)
++}
++
++func (c *TCPConn) writeTo(w io.Writer) (int64, error) {
++	return genericWriteTo(c, w)
++}
++
++func (sd *sysDialer) dialTCP(ctx context.Context, laddr, raddr *TCPAddr) (*TCPConn, error) {
++	if h := sd.testHookDialTCP; h != nil {
++		return h(ctx, sd.network, laddr, raddr)
++	}
++	if h := testHookDialTCP; h != nil {
++		return h(ctx, sd.network, laddr, raddr)
++	}
++	return sd.doDialTCP(ctx, laddr, raddr)
++}
++
++func (sd *sysDialer) doDialTCP(ctx context.Context, laddr, raddr *TCPAddr) (*TCPConn, error) {
++	switch sd.network {
++	case "tcp", "tcp4", "tcp6":
++	default:
++		return nil, UnknownNetworkError(sd.network)
++	}
++	if raddr == nil {
++		return nil, errMissingAddress
++	}
++	to, ok := sockaddr4(raddr.IP, raddr.Port)
++	if !ok {
++		return nil, errNotIPv4(raddr.IP)
++	}
++	// The system chooses the local port; it is not reported.
++	if laddr != nil && laddr.Port != 0 {
++		return nil, &AddrError{Err: "a local port cannot be chosen", Addr: laddr.String()}
++	}
++	id, err := connectTCP(ctx, to)
++	if err != nil {
++		return nil, err
++	}
++	fd := newFD(sd.network, id, false, &TCPAddr{IP: localIP()}, raddr)
++	return newTCPConn(fd, sd.Dialer.KeepAlive, sd.Dialer.KeepAliveConfig, testPreHookSetKeepAlive, testHookSetKeepAlive), nil
++}
++
++// Nocturne's TCP does not accept connections yet.
++
++func (ln *TCPListener) ok() bool { return ln != nil && ln.fd != nil }
++
++func (ln *TCPListener) accept() (*TCPConn, error) {
++	return nil, syscall.ENOTSUP
++}
++
++func (ln *TCPListener) close() error {
++	return ln.fd.Close()
++}
++
++func (ln *TCPListener) file() (*os.File, error) {
++	return nil, syscall.ENOTSUP
++}
++
++func (sl *sysListener) listenTCP(ctx context.Context, laddr *TCPAddr) (*TCPListener, error) {
++	return nil, syscall.ENOTSUP
++}
+diff --git a/src/net/udpsock_nocturne.go b/src/net/udpsock_nocturne.go
+new file mode 100644
+index 00000000..9f6b21a9
+--- /dev/null
++++ b/src/net/udpsock_nocturne.go
+@@ -0,0 +1,108 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package net
++
++import (
++	"context"
++	"net/netip"
++	"syscall"
++)
++
++func (c *UDPConn) readFrom(b []byte, addr *UDPAddr) (int, *UDPAddr, error) {
++	n, from, err := c.fd.readFrom(b)
++	if err != nil {
++		return n, nil, err
++	}
++	*addr = UDPAddr{IP: ipFromUint32(from.IP).To4(), Port: int(from.Port)}
++	return n, addr, nil
++}
++
++func (c *UDPConn) readFromAddrPort(b []byte) (int, netip.AddrPort, error) {
++	n, from, err := c.fd.readFrom(b)
++	if err != nil {
++		return n, netip.AddrPort{}, err
++	}
++	ip := netip.AddrFrom4([4]byte{byte(from.IP >> 24), byte(from.IP >> 16), byte(from.IP >> 8), byte(from.IP)})
++	return n, netip.AddrPortFrom(ip, from.Port), nil
++}
++
++// readMsg receives a datagram; Nocturne passes no ancillary data.
++func (c *UDPConn) readMsg(b, oob []byte) (n, oobn, flags int, addr netip.AddrPort, err error) {
++	n, addr, err = c.readFromAddrPort(b)
++	return n, 0, 0, addr, err
++}
++
++func (c *UDPConn) writeTo(b []byte, addr *UDPAddr) (int, error) {
++	if c.fd.raddr != nil {
++		return 0, ErrWriteToConnected
++	}
++	if addr == nil {
++		return 0, errMissingAddress
++	}
++	to, ok := sockaddr4(addr.IP, addr.Port)
++	if !ok {
++		return 0, errNotIPv4(addr.IP)
++	}
++	return c.fd.writeTo(b, to)
++}
++
++func (c *UDPConn) writeToAddrPort(b []byte, addr netip.AddrPort) (int, error) {
++	return c.writeTo(b, UDPAddrFromAddrPort(addr))
++}
++
++func (c *UDPConn) writeMsg(b, oob []byte, addr *UDPAddr) (n, oobn int, err error) {
++	if len(oob) > 0 {
++		return 0, 0, syscall.ENOTSUP
++	}
++	if c.fd.raddr != nil && addr == nil {
++		n, err = c.fd.Write(b)
++	} else {
++		n, err = c.writeTo(b, addr)
++	}
++	return n, 0, err
++}
++
++func (c *UDPConn) writeMsgAddrPort(b, oob []byte, addr netip.AddrPort) (n, oobn int, err error) {
++	if !addr.IsValid() {
++		return c.writeMsg(b, oob, nil)
++	}
++	return c.writeMsg(b, oob, UDPAddrFromAddrPort(addr))
++}
++
++func (sd *sysDialer) dialUDP(ctx context.Context, laddr, raddr *UDPAddr) (*UDPConn, error) {
++	if raddr == nil {
++		return nil, errMissingAddress
++	}
++	to, ok := sockaddr4(raddr.IP, raddr.Port)
++	if !ok {
++		return nil, errNotIPv4(raddr.IP)
++	}
++	port := 0
++	if laddr != nil {
++		port = laddr.Port
++	}
++	id, err := syscall.UDPSocket(uint16(port))
++	if err != nil {
++		return nil, wrapSyscallError("socket", err)
++	}
++	fd := newFD(sd.network, id, true, &UDPAddr{IP: localIP(), Port: port}, raddr)
++	fd.peer = to
++	return newUDPConn(fd), nil
++}
++
++func (sl *sysListener) listenUDP(ctx context.Context, laddr *UDPAddr) (*UDPConn, error) {
++	if _, ok := sockaddr4(laddr.IP, laddr.Port); !ok {
++		return nil, errNotIPv4(laddr.IP)
++	}
++	id, err := syscall.UDPSocket(uint16(laddr.Port))
++	if err != nil {
++		return nil, wrapSyscallError("socket", err)
++	}
++	return newUDPConn(newFD(sl.network, id, true, &UDPAddr{IP: localIP(), Port: laddr.Port}, nil)), nil
++}
++
++func (sl *sysListener) listenMulticastUDP(ctx context.Context, ifi *Interface, gaddr *UDPAddr) (*UDPConn, error) {
++	return nil, syscall.ENOTSUP
++}
+diff --git a/src/net/unixsock_nocturne.go b/src/net/unixsock_nocturne.go
+new file mode 100644
+index 00000000..026b7a32
+--- /dev/null
++++ b/src/net/unixsock_nocturne.go
+@@ -0,0 +1,85 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package net
++
++import (
++	"context"
++	"os"
++	"syscall"
++)
++
++// Nocturne has no Unix domain sockets; apps talk over channels.
++
++func (c *UnixConn) readFrom(b []byte) (int, *UnixAddr, error) {
++	return 0, nil, syscall.ENOTSUP
++}
++
++func (c *UnixConn) readMsg(b, oob []byte) (n, oobn, flags int, addr *UnixAddr, err error) {
++	return 0, 0, 0, nil, syscall.ENOTSUP
++}
++
++func (c *UnixConn) writeTo(b []byte, addr *UnixAddr) (int, error) {
++	return 0, syscall.ENOTSUP
++}
++
++func (c *UnixConn) writeMsg(b, oob []byte, addr *UnixAddr) (n, oobn int, err error) {
++	return 0, 0, syscall.ENOTSUP
++}
++
++func (sd *sysDialer) dialUnix(ctx context.Context, laddr, raddr *UnixAddr) (*UnixConn, error) {
++	return nil, syscall.ENOTSUP
++}
++
++func (ln *UnixListener) accept() (*UnixConn, error) {
++	return nil, syscall.ENOTSUP
++}
++
++func (ln *UnixListener) close() error {
++	return syscall.ENOTSUP
++}
++
++func (ln *UnixListener) file() (*os.File, error) {
++	return nil, syscall.ENOTSUP
++}
++
++func (sl *sysListener) listenUnix(ctx context.Context, laddr *UnixAddr) (*UnixListener, error) {
++	return nil, syscall.ENOTSUP
++}
++
++func (sl *sysListener) listenUnixgram(ctx context.Context, laddr *UnixAddr) (*UnixConn, error) {
++	return nil, syscall.ENOTSUP
++}
++
++// IP-level sockets are not available either.
++
++func (c *IPConn) readFrom(b []byte) (int, *IPAddr, error) {
++	return 0, nil, syscall.ENOTSUP
++}
++
++func (c *IPConn) readMsg(b, oob []byte) (n, oobn, flags int, addr *IPAddr, err error) {
++	return 0, 0, 0, nil, syscall.ENOTSUP
++}
++
++func (c *IPConn) writeTo(b []byte, addr *IPAddr) (int, error) {
++	return 0, syscall.ENOTSUP
++}
++
++func (c *IPConn) writeMsg(b, oob []byte, addr *IPAddr) (n, oobn int, err error) {
++	return 0, 0, syscall.ENOTSUP
++}
++
++func (sd *sysDialer) dialIP(ctx context.Context, laddr, raddr *IPAddr) (*IPConn, error) {
++	return nil, syscall.ENOTSUP
++}
++
++func (sl *sysListener) listenIP(ctx context.Context, laddr *IPAddr) (*IPConn, error) {
++	return nil, syscall.ENOTSUP
++}
++
++// Files cannot become connections: connections are not handles.
++
++func fileConn(f *os.File) (Conn, error)             { return nil, syscall.ENOTSUP }
++func fileListener(f *os.File) (Listener, error)     { return nil, syscall.ENOTSUP }
++func filePacketConn(f *os.File) (PacketConn, error) { return nil, syscall.ENOTSUP }
 diff --git a/src/os/dir_nocturne.go b/src/os/dir_nocturne.go
 new file mode 100644
 index 00000000..0994eecd
@@ -2881,10 +3888,10 @@ index e1d7e213..0e83e7d9 100644
  
 diff --git a/src/syscall/syscall_nocturne.go b/src/syscall/syscall_nocturne.go
 new file mode 100644
-index 00000000..a4435747
+index 00000000..4395a7c7
 --- /dev/null
 +++ b/src/syscall/syscall_nocturne.go
-@@ -0,0 +1,691 @@
+@@ -0,0 +1,856 @@
 +// Copyright 2026 The Go Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style
 +// license that can be found in the LICENSE file.
@@ -3576,6 +4583,171 @@ index 00000000..a4435747
 +
 +// SysProcAttr holds Nocturne-specific launch options; there are none yet.
 +type SysProcAttr struct{}
++
++// ---- network ----
++
++// Network system call numbers. TCP and UDP connections are numbered on
++// their own, not handles.
++const (
++	SYS_NET_INFO       = 96
++	SYS_NET_DNS_ALL    = 108
++	SYS_UDP_SOCKET     = 99
++	SYS_UDP_SEND       = 100
++	SYS_UDP_RECV       = 101
++	SYS_UDP_CLOSE      = 106
++	SYS_TCP_CONNECT    = 102
++	SYS_TCP_RECV       = 104
++	SYS_TCP_CLOSE      = 105
++	SYS_TCP_SEND_UNTIL = 109
++	SYS_TCP_CANCEL     = 110
++)
++
++// TCPSendUntil flags.
++const TCP_SEND_NONBLOCK = 1
++
++// UDPMaxPayload is the largest datagram UDPSend takes.
++const UDPMaxPayload = 1472
++
++// NetInfo describes the network interface.
++type NetInfo struct {
++	Present, Up                 uint8
++	MAC                         [6]byte
++	IP, Mask, Gateway, Resolver [4]byte
++	RxPackets, TxPackets        uint64
++	Driver                      [32]byte
++}
++
++// GetNetInfo reports the interface; Present is 0 when there is none.
++func GetNetInfo(ni *NetInfo) error {
++	_, e := RawSyscall(SYS_NET_INFO, uintptr(unsafe.Pointer(ni)), 0, 0, 0, 0)
++	return errnoErr(e)
++}
++
++// Sockaddr4 is an IPv4 address (host byte order, a.b.c.d is a<<24|b<<16|c<<8|d) and port.
++type Sockaddr4 struct {
++	IP   uint32
++	Port uint16
++}
++
++// DNS result statuses.
++const (
++	DNS_OK = iota
++	DNS_NXDOMAIN
++	DNS_NODATA
++	DNS_SERVFAIL
++	DNS_REFUSED
++	DNS_FORMAT
++	DNS_TIMEOUT
++	DNS_UNREACHABLE
++	DNS_CANCELLED
++	DNS_RESOURCE
++)
++
++// DNSResult describes a NetDNSAll answer; Count is the complete number of
++// addresses even when fewer fit.
++type DNSResult struct {
++	Version, Status, Count, TTL uint32
++}
++
++// NetDNSAll resolves name to IPv4 addresses with the system resolver
++// (or resolver, when not nil).
++func NetDNSAll(name string, ips []uint32, res *DNSResult, resolver *Sockaddr4) error {
++	p, err := BytePtrFromString(name)
++	if err != nil {
++		return err
++	}
++	var ip uintptr
++	if len(ips) > 0 {
++		ip = uintptr(unsafe.Pointer(&ips[0]))
++	}
++	_, e := Syscall(SYS_NET_DNS_ALL, uintptr(unsafe.Pointer(p)), ip, uintptr(len(ips)),
++		uintptr(unsafe.Pointer(res)), uintptr(unsafe.Pointer(resolver)))
++	return errnoErr(e)
++}
++
++// TCPConnect connects to ip:port, waiting at most timeoutMs (0: the
++// system's limit), and returns the connection number.
++func TCPConnect(ip uint32, port uint16, timeoutMs int) (int, error) {
++	r, e := Syscall(SYS_TCP_CONNECT, uintptr(ip), uintptr(port), uintptr(timeoutMs), 0, 0)
++	if e != 0 {
++		return -1, e
++	}
++	return int(r), nil
++}
++
++// TCPSendUntil queues b, waiting for room until the uptime deadline in
++// milliseconds (0: no deadline). It returns how much was queued.
++func TCPSendUntil(id int, b []byte, deadlineMs uint64, flags int) (int, error) {
++	r, e := Syscall(SYS_TCP_SEND_UNTIL, uintptr(id), bytePtr(b), uintptr(len(b)), uintptr(deadlineMs), uintptr(flags))
++	if e != 0 {
++		return 0, e
++	}
++	return int(r), nil
++}
++
++// TCPRecv receives into b, waiting at most timeoutMs (negative: no limit,
++// 0: not at all, ERR_NOT_READY). 0 bytes means the peer finished sending.
++func TCPRecv(id int, b []byte, timeoutMs int) (int, error) {
++	r, e := Syscall(SYS_TCP_RECV, uintptr(id), bytePtr(b), uintptr(len(b)), uintptr(timeoutMs), 0)
++	if e != 0 {
++		return 0, e
++	}
++	return int(r), nil
++}
++
++// TCPClose finishes sending what is queued and gives up the connection.
++func TCPClose(id int) error {
++	_, e := RawSyscall(SYS_TCP_CLOSE, uintptr(id), 0, 0, 0, 0)
++	return errnoErr(e)
++}
++
++// TCPCancel aborts the connection and wakes its waiters with
++// ERR_CANCELLED; the number stays the caller's until TCPClose.
++func TCPCancel(id int) error {
++	_, e := RawSyscall(SYS_TCP_CANCEL, uintptr(id), 0, 0, 0, 0)
++	return errnoErr(e)
++}
++
++// UDPSocket takes the local port (0: any free one) and returns the socket number.
++func UDPSocket(port uint16) (int, error) {
++	r, e := RawSyscall(SYS_UDP_SOCKET, uintptr(port), 0, 0, 0, 0)
++	if e != 0 {
++		return -1, e
++	}
++	return int(r), nil
++}
++
++// UDPSend sends one datagram of at most UDPMaxPayload bytes.
++func UDPSend(id int, ip uint32, port uint16, b []byte) (int, error) {
++	r, e := Syscall(SYS_UDP_SEND, uintptr(id), uintptr(ip), uintptr(port), bytePtr(b), uintptr(len(b)))
++	if e != 0 {
++		return 0, e
++	}
++	return int(r), nil
++}
++
++// UDPRecv receives one datagram (cut to len(b)), waiting at most timeoutMs
++// (negative: no limit), and reports its sender.
++func UDPRecv(id int, b []byte, timeoutMs int, from *Sockaddr4) (int, error) {
++	r, e := Syscall(SYS_UDP_RECV, uintptr(id), bytePtr(b), uintptr(len(b)), uintptr(timeoutMs), uintptr(unsafe.Pointer(from)))
++	if e != 0 {
++		return 0, e
++	}
++	return int(r), nil
++}
++
++// UDPClose gives up the socket.
++func UDPClose(id int) error {
++	_, e := RawSyscall(SYS_UDP_CLOSE, uintptr(id), 0, 0, 0, 0)
++	return errnoErr(e)
++}
++
++// Uptime returns the milliseconds since the system started, the clock of
++// TCPSendUntil deadlines.
++func Uptime() uint64 {
++	r, _ := RawSyscall(SYS_UPTIME, 0, 0, 0, 0, 0)
++	return uint64(r)
++}
 diff --git a/src/time/sys_nocturne.go b/src/time/sys_nocturne.go
 new file mode 100644
 index 00000000..fe198077
