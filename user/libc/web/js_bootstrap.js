@@ -867,14 +867,15 @@
     }
     const document=host.document;
     Object.setPrototypeOf(document,HTMLDocument.prototype);
+    /* Configurable: these move to Document.prototype at the end of bootstrap. */
     Object.defineProperties(document, {
-        documentElement:{get(){return dom('get',document,'documentElement');}},
-        head:{get(){return dom('get',document,'head');}}, body:{get(){return dom('get',document,'body');}},
-        title:{get(){return dom('get',document,'title');},set(v){dom('set',document,'title',String(v));}},
-        URL:{get(){return host.url();}}, documentURI:{get(){return host.url();}},
-        baseURI:{get(){return dom('get',document,'baseURI');}},
-        readyState:{get(){return host.ready();}}, activeElement:{get(){return dom('get',document,'activeElement');}},
-        defaultView:{configurable:true,value:globalThis}, currentScript:{get(){return host.current();}}
+        documentElement:{configurable:true,get(){return dom('get',document,'documentElement');}},
+        head:{configurable:true,get(){return dom('get',document,'head');}}, body:{configurable:true,get(){return dom('get',document,'body');}},
+        title:{configurable:true,get(){return dom('get',document,'title');},set(v){dom('set',document,'title',String(v));}},
+        URL:{configurable:true,get(){return host.url();}}, documentURI:{configurable:true,get(){return host.url();}},
+        baseURI:{configurable:true,get(){return dom('get',document,'baseURI');}},
+        readyState:{configurable:true,get(){return host.ready();}}, activeElement:{configurable:true,get(){return dom('get',document,'activeElement');}},
+        defaultView:{configurable:true,value:globalThis}, currentScript:{configurable:true,get(){return host.current();}}
     });
     document.getElementById=id=>dom('id',document,String(id));
     document.getElementsByName=name=>{const query='[name="'+CSS.escape(String(name))+'"]';return collectionBridge.domLive(document,()=>dom('query',document,query,false));};
@@ -1108,6 +1109,97 @@
     /* @include js_sanitizer_constants.js */
     /* @include js_html_safety.js */
     /* @include js_pi.js */
+    /* Interface members belong to the interface prototype; only [LegacyUnforgeable]
+       members (a document's location) are own properties. Bootstrap defined some
+       members on the singleton instance, so move each to the prototype: the
+       singleton keeps its member, other instances keep the inherited
+       one (or get a TypeError where there was none). */
+    function ownMembersToPrototype(instance,proto,unforgeable){
+        for(const key of Object.getOwnPropertyNames(instance)){
+            const own=Object.getOwnPropertyDescriptor(instance,key);
+            if(unforgeable.includes(key)||!own.configurable)continue;
+            const inherited=Object.getOwnPropertyDescriptor(proto,key)||{};
+            const merged={configurable:true,enumerable:true};
+            if('value' in own){
+                const f=own.value,g=inherited.value;
+                if(typeof f!=='function')continue;
+                merged.writable=true;
+                merged.value={[key](...args){
+                    if(this===instance)return apply(f,this,args);
+                    if(typeof g!=='function')throw new TypeError('Illegal invocation');
+                    return apply(g,this,args);
+                }}[key];
+                Object.defineProperty(merged.value,'length',{value:f.length,configurable:true});
+            }else{
+                const get=own.get,set=own.set,inheritedGet=inherited.get,inheritedSet=inherited.set;
+                if(get||inheritedGet)merged.get=Object.getOwnPropertyDescriptor({get [key](){
+                    if(this===instance&&get)return apply(get,this,[]);
+                    if(!inheritedGet)throw new TypeError('Illegal invocation');
+                    return apply(inheritedGet,this,[]);
+                }},key).get;
+                if(set||inheritedSet)merged.set=Object.getOwnPropertyDescriptor({set [key](value){
+                    if(this===instance&&set){apply(set,this,[value]);return;}
+                    if(!inheritedSet){if(this===instance)return;throw new TypeError('Illegal invocation');}
+                    apply(inheritedSet,this,[value]);
+                }},key).set;
+            }
+            delete instance[key];
+            Object.defineProperty(proto,key,merged);
+        }
+    }
+    ownMembersToPrototype(document,Document.prototype,['location']);
+    ownMembersToPrototype(navigator,Navigator.prototype,[]);
+    /* WebIDL gives each operation a function named by its identifier, each
+       attribute getter/setter "get <id>"/"set <id>", and each interface object
+       its interface name. Bootstrap members are written as object-literal
+       methods and shared closures, so give them their WebIDL names before any
+       author script observes them. A spec alias (Set.prototype.keys, String's
+       trimLeft) keeps the name of the member it aliases; one function serving
+       two attributes gets a delegating function for the second. */
+    (()=>{
+        const named=new Map(),skip=new Set(['prototype','length','name','caller','arguments','constructor']);
+        function rename(fn,name){
+            const previous=named.get(fn);
+            if(previous!==undefined)return previous===name;
+            named.set(fn,name);
+            if(fn.name===name)return true;
+            try{Object.defineProperty(fn,'name',{value:name,configurable:true});return true;}catch(e){return false;}
+        }
+        function delegate(f,kind,key){
+            const holder=kind==='get'?{get [key](){return apply(f,this,[]);}}:kind==='set'?{set [key](v){apply(f,this,[v]);}}:{[key](...a){return apply(f,this,a);}};
+            const d=Object.getOwnPropertyDescriptor(holder,key),w=kind==='value'?d.value:d[kind];
+            Object.defineProperty(w,'length',{value:f.length,configurable:true});
+            named.set(w,kind==='value'?key:kind+' '+key);
+            return w;
+        }
+        function members(object){
+            for(const key of Object.getOwnPropertyNames(object)){
+                if(skip.has(key))continue;
+                const d=Object.getOwnPropertyDescriptor(object,key);
+                let replaced=false;
+                if(typeof d.value==='function'){
+                    const f=d.value,alias=f.name&&f.name!==key&&Object.getOwnPropertyDescriptor(object,f.name);
+                    if(alias&&alias.value===f){named.set(f,f.name);continue;}
+                    if(!rename(f,key)&&d.configurable){d.value=delegate(f,'value',key);replaced=true;}
+                }
+                for(const kind of ['get','set']){
+                    const f=d[kind];if(typeof f!=='function')continue;
+                    if(!rename(f,kind+' '+key)&&d.configurable){d[kind]=delegate(f,kind,key);replaced=true;}
+                }
+                if(replaced)Object.defineProperty(object,key,d);
+            }
+        }
+        for(const key of Object.getOwnPropertyNames(globalThis)){
+            const d=Object.getOwnPropertyDescriptor(globalThis,key);
+            /* Namespaces (console, CSS, ...) are plain objects of operations. */
+            if(d.value&&typeof d.value==='object'&&Object.getPrototypeOf(d.value)===Object.prototype){members(d.value);continue;}
+            if(typeof d.value!=='function')continue;
+            const c=d.value;
+            if(c.name!==key&&globalThis[c.name]!==c)rename(c,key);else named.set(c,c.name);
+            members(c);
+            if(c.prototype&&typeof c.prototype==='object'&&key[0]>='A'&&key[0]<='Z')members(c.prototype);
+        }
+    })();
     frameBridge.finalizeMethods();
     customElementsReady = true;
     /* Private native-input state, never reachable from page JS. C supplies the
@@ -1166,6 +1258,7 @@
     }
     return {
         presentationSync:presentationBridge.sync,
+        resourceTiming:performanceBridge.resource,
         workerNotify:workerBridge.deliver,
         storageOrigin:storageBridge.origin,
         storageEvent:storageBridge.deliver,

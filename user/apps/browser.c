@@ -39,6 +39,9 @@ static bool quit, loading;
 static bool window_state_known;
 static unsigned window_previous_state;
 static bool debug_js;
+/* --net-log: requests in the console; --log-console: the console in the system log.
+   --debug-js turns both on. */
+static bool net_log, log_console;
 /* Debug-only inclusive phase totals, with no page data or per-frame logging. */
 static struct {
     uint64_t since, tick_ms, tick_max_ms, layout_ms, draw_ms, update_ms, net_ms, wait_ms;
@@ -382,8 +385,28 @@ static void draw(void) {
     draw_toolbar(); draw_page(); draw_status(); draw_console();
 }
 
+/* --log-console keeps the console in the system log (the serial port), so a
+   diagnosis survives a page that floods, clears or closes its console. The
+   uptime matches the console's own @seconds column. */
+static void console_system_log(const char *level, const char *message) {
+    static n_handle log = -2;
+    if (log == -2) log = n_system_log_open();
+    if (log < 0) return;
+    uint64_t now = n_clock_uptime_ms();
+    /* A long result continues on "+"-marked lines instead of being cut. */
+    size_t len = strlen(message), off = 0;
+    do {
+        char line[2048];
+        size_t part = MIN(len - off, (size_t)1900);
+        int n = snprintf(line, sizeof line, "[browser %s%s @%lu.%03lu] %.*s\n", level ? level : "log", off ? "+" : "",
+                         (unsigned long)(now / 1000), (unsigned long)(now % 1000), (int)part, message + off);
+        if (n > 0) n_channel_send(log, line, (size_t)MIN(n, (int)sizeof line - 1), -1);
+        off += part;
+    } while (off < len);
+}
 static void console_add(const char *level, const char *message) {
     const char *p = message ? message : "";
+    if (log_console) console_system_log(level, p);
     uint64_t now = n_clock_uptime_ms();
     unsigned long sequence = ++console_sequence;
     int glyph = w ? MAX(gfx_text_width("M", FONT_SMALL), 1) : 8;
@@ -1623,6 +1646,7 @@ static void finish_navigation(void) {
     const char *final_url = web_response_url(f)[0] ? web_response_url(f) : navigation_url;
     struct web_host document_host = browser_host;
     document_host.debug_js = debug_js;
+    document_host.net_log = net_log;
     document_host.navigation_timing = navigation_timing;
     document_host.js_task_budget_ms = js_task_budget_ms;
     web_doc *nd = web_live_response(html, hlen, final_url, charset, web_response_headers(f), &document_host);
@@ -2778,7 +2802,9 @@ int main(int argc, char **argv) {
     console_input=calloc(1,1);console_input_capacity=1;
     if(!console_input)return 1;
     while (argc > 1 && argv[1][0] == '-' && argv[1][1] == '-') {
-        if (!strcmp(argv[1], "--debug-js")) { debug_js = true; argc--; argv++; }
+        if (!strcmp(argv[1], "--debug-js")) { debug_js = net_log = log_console = true; argc--; argv++; }
+        else if (!strcmp(argv[1], "--net-log")) { net_log = true; argc--; argv++; }
+        else if (!strcmp(argv[1], "--log-console")) { log_console = true; argc--; argv++; }
         else if (!strcmp(argv[1], "--maximized")) { start_maximized = true; argc--; argv++; }
         else if (!strcmp(argv[1], "--console-file-each-document")) { console_each_document = true; argc--; argv++; }
         else if (!strcmp(argv[1], "--js-console")) {

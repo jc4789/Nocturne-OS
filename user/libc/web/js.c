@@ -102,6 +102,13 @@ struct js_pending {
     char *url,*origin,*integrity,*referrer;
     bool done, aborted, force_preflight, redirect_error, same_origin, keepalive, no_cors, no_referrer;
     bool streaming, headers_delivered, host_accepted;
+    /* A streamed response's metadata, kept past the frame that clears response
+       for Resource Timing and net_log. */
+    uint64_t streamed_bytes, response_start;
+    int streamed_status; unsigned streamed_header_bytes;
+    bool timing_allowed, timing_exposed;
+    char net_type[96]; /* Content-Type */
+    unsigned char net_preview[64]; unsigned net_preview_len; /* net_log only: body's first bytes */
     struct web_response response;
     struct js_pending *next;
 };
@@ -5169,6 +5176,10 @@ static struct js_pending *pending_new(struct web_js_state *s, int kind, const ch
     p->resolve = p->reject = p->stream_callback = JS_UNDEFINED; p->next = s->pending; s->pending = p; s->pending_count++;
     return p;
 }
+static const char *pending_kind_name(const struct js_pending *p) {
+    static const char *const kinds[]={"script","fetch","stylesheet","image","worker","frame","font","policy-report","module"};
+    return p->kind>=0 && (size_t)p->kind<sizeof kinds/sizeof *kinds?kinds[p->kind]:"unknown";
+}
 static void pending_error(struct js_pending *p, const char *error) { p->done = true; snprintf(p->response.error, sizeof p->response.error, "%s", error); }
 static void release_pending_request(struct web_js_state *s, struct js_pending *p) {
     /* Teardown never routes a completed keepalive response into a retired realm.
@@ -5208,6 +5219,15 @@ static bool send_request(struct web_js_state *s, struct js_pending *p, int kind,
     bool ok = s->host.request && s->host.request(s->host.opaque, &r);
     if(ok)p->host_accepted=true;
     if (!ok) pending_error(p, "The browser rejected the resource request");
+    if (s->host.net_log) {
+        /* A stalled page shows what it last asked for, and the matching
+           "Net #id" lines say what came back. */
+        char message[1600];
+        snprintf(message, sizeof message, "Net #%lu %s %s%s, body %lu bytes%s: %.1500s", (unsigned long)p->id,
+                 pending_kind_name(p), method ? method : "GET", p->streaming ? " streamed" : "",
+                 (unsigned long)len, ok ? "" : ", rejected by the browser", p->url);
+        log_text(s, 0, message);
+    }
     return ok;
 }
 #include "js_policy_report.h"
@@ -6682,13 +6702,107 @@ static void diagnostic_resource(struct web_js_state *s, struct js_pending *p, co
         }
         h=*end?end+1:end;
     }
-    static const char *const kinds[]={"script","fetch","stylesheet","image","worker","frame","font","policy-report","module"};
-    const char *kind=p->kind<sizeof kinds/sizeof *kinds?kinds[p->kind]:"unknown";
+    const char *kind=pending_kind_name(p);
     uint64_t started=p->deadline>=WEBNET_TIMEOUT_MS?p->deadline-WEBNET_TIMEOUT_MS:0;
     snprintf(message,sizeof message,"Resource #%lu %s: HTTP %d, %lu bytes, MIME %s, elapsed %lu ms, %s; %s",
         (unsigned long)p->id,kind,p->response.status,(unsigned long)p->response.body_len,mime,
         (unsigned long)(uptime_ms()-started),reason,url);
     log_text(s,p->kind==P_SCRIPT?2:1,message);
+}
+/* net_log: "headers" when a streamed response's status arrives, "done" when a
+   request ends with the bytes it delivered. */
+/* The first value of a response header field, trimmed; NULL when absent. */
+static const char *response_header_value(const char *headers, const char *name, size_t *len) {
+    size_t name_len=strlen(name);
+    for (const char *h=headers?headers:""; *h;) {
+        const char *end=strchr(h,'\n'); if(!end)end=h+strlen(h);
+        if ((size_t)(end-h)>name_len && h[name_len]==':' && !strncasecmp(h,name,name_len)) {
+            const char *value=h+name_len+1;while(value<end && (*value==' '||*value=='\t'))value++;
+            size_t n=(size_t)(end-value);while(n && (value[n-1]=='\r'||value[n-1]==' '||value[n-1]=='\t'))n--;
+            *len=n;return value;
+        }
+        h=*end?end+1:end;
+    }
+    return NULL;
+}
+/* Resource Timing's timing allow check: same origin as the document, or a
+   Timing-Allow-Origin list naming "*" or the document's origin. */
+static bool timing_allow_check(struct web_js_state *s, const char *url, const char *headers) {
+    char *document_origin=NULL,*resource_origin=NULL;
+    bool allowed=false;
+    if(http_origin_owned(web_effective_url(s->doc),&document_origin)==HTTP_URL_TUPLE){
+        if(http_origin_owned(url,&resource_origin)==HTTP_URL_TUPLE && !strcmp(document_origin,resource_origin))allowed=true;
+        size_t len=0;const char *list=allowed?NULL:response_header_value(headers,"timing-allow-origin",&len);
+        for(const char *item=list,*end=list?list+len:NULL;item && item<end && !allowed;){
+            const char *comma=memchr(item,',',(size_t)(end-item));if(!comma)comma=end;
+            const char *a=item,*b=comma;while(a<b && (*a==' '||*a=='\t'))a++;while(b>a && (b[-1]==' '||b[-1]=='\t'))b--;
+            size_t n=(size_t)(b-a);
+            if((n==1 && *a=='*') || (n==strlen(document_origin) && !memcmp(a,document_origin,n)))allowed=true;
+            item=comma+1;
+        }
+    }
+    free(document_origin);free(resource_origin);
+    return allowed;
+}
+/* Keep a streamed response's metadata past the frame that carries it. */
+static void streamed_response_metadata(struct web_js_state *s, struct js_pending *p, bool opaque) {
+    const char *headers=web_response_headers(&p->response);
+    size_t type_len=0;const char *type=response_header_value(headers,"content-type",&type_len);
+    type_len=type?MIN(type_len,sizeof p->net_type-1):0;
+    if(type)memcpy(p->net_type,type,type_len);
+    p->net_type[type_len]=0;
+    p->response_start=uptime_ms();
+    p->streamed_status=p->response.status;
+    p->streamed_header_bytes=(unsigned)MIN(strlen(headers),(size_t)UINT_MAX);
+    p->timing_exposed=!opaque;
+    p->timing_allowed=!opaque && timing_allow_check(s,p->url,headers);
+}
+static int fetch_transport_flags(const char *headers);
+/* Resource Timing: a PerformanceResourceTiming entry for each completed
+   request; the bootstrap's performance timeline owns entries and observers. */
+static void resource_timing(struct web_js_state *s, struct js_pending *p, uint64_t bytes) {
+    if (s->disabled || !JS_IsObject(s->hooks) || p->kind==P_POLICY_REPORT || !p->url ||
+        (strncasecmp(p->url,"https://",8) && strncasecmp(p->url,"http://",7))) return;
+    uint64_t end=uptime_ms(),start=p->deadline>=WEBNET_TIMEOUT_MS?p->deadline-WEBNET_TIMEOUT_MS:end;
+    bool streamed=p->streaming;
+    const char *headers=web_response_headers(&p->response);
+    int flags=streamed?0:fetch_transport_flags(headers);
+    bool exposed=streamed?p->timing_exposed:!(flags>=0 && (flags&NJW_LOADED_OPAQUE)) && !p->response.error[0];
+    bool allowed=streamed?p->timing_allowed:exposed && timing_allow_check(s,p->url,headers);
+    size_t type_len=0;const char *type=streamed?p->net_type:response_header_value(headers,"content-type",&type_len);
+    if(streamed)type_len=strlen(type);
+    uint64_t response_start=streamed&&p->response_start?p->response_start:end;
+    uint64_t header_bytes=streamed?p->streamed_header_bytes:strlen(headers);
+    int status=streamed?p->streamed_status:p->response.status;
+    JSValue args[]={JS_NewFloat64(s->ctx,(double)p->id),JS_NewInt32(s->ctx,p->kind),JS_NewString(s->ctx,p->url),
+        JS_NewFloat64(s->ctx,(double)relative_time(s,start)),JS_NewFloat64(s->ctx,(double)relative_time(s,response_start)),
+        JS_NewFloat64(s->ctx,(double)relative_time(s,end)),JS_NewFloat64(s->ctx,(double)bytes),JS_NewFloat64(s->ctx,(double)header_bytes),
+        JS_NewInt32(s->ctx,exposed?status:0),JS_NewStringLen(s->ctx,exposed&&type?type:"",exposed&&type?type_len:0),JS_NewBool(s->ctx,allowed)};
+    JSValue result=custom_element_hook(s,"resourceTiming",(int)(sizeof args/sizeof args[0]),args);
+    if(JS_IsException(result))exception(s);
+    JS_FreeValue(s->ctx,result);
+    for(size_t i=0;i<sizeof args/sizeof args[0];i++)JS_FreeValue(s->ctx,args[i]);
+}
+static void net_log_response(struct web_js_state *s, struct js_pending *p, const char *phase, uint64_t bytes) {
+    const char *headers=web_response_headers(&p->response);
+    size_t type_len=0;const char *type=response_header_value(headers,"content-type",&type_len);
+    if(!type){type=p->net_type;type_len=strlen(type);}
+    uint64_t started=p->deadline>=WEBNET_TIMEOUT_MS?p->deadline-WEBNET_TIMEOUT_MS:0;
+    /* Script-visible responses also show their first bytes, like a network
+       panel's preview: a short control or error body explains a stall. */
+    const unsigned char *preview=p->streaming?p->net_preview:(const unsigned char *)p->response.body;
+    size_t preview_len=p->streaming?p->net_preview_len:MIN(p->response.body_len,sizeof p->net_preview);
+    char hex[sizeof p->net_preview*3+16]="";
+    if(p->kind==P_FETCH && !strcmp(phase,"done") && preview && preview_len) {
+        size_t used=(size_t)snprintf(hex,sizeof hex,", first bytes");
+        for(size_t i=0;i<preview_len && used+4<sizeof hex;i++)used+=(size_t)snprintf(hex+used,sizeof hex-used," %02x",preview[i]);
+    }
+    char message[768];
+    snprintf(message,sizeof message,"Net #%lu %s %s: HTTP %d, %lu bytes, %lu ms, %.*s%s%s%s",(unsigned long)p->id,
+             pending_kind_name(p),phase,p->response.status?p->response.status:p->streamed_status,(unsigned long)bytes,(unsigned long)(uptime_ms()-started),
+             (int)MIN(type_len,(size_t)96),type?type:"",p->aborted?", aborted":p->response.error[0]?", failed: ":"",
+             !p->aborted&&p->response.error[0]?p->response.error:"",hex);
+    log_text(s,0,message);
 }
 static int fetch_transport_flags(const char *headers) {
     /* The HTTP host writes this non-field line; server header fields cannot
@@ -6711,6 +6825,11 @@ static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
         if (flags < 0 || (opaque && !p->no_cors)) {
             pending_error(p, "Native Fetch response contradicts its filtering policy"); terminal = true;
         } else {
+            /* Same report as a buffered request: a streamed body hides an
+               error status from the console until its reader is drained. */
+            if (!opaque && p->response.status >= 400) diagnostic_resource(s, p, "unsuccessful HTTP response");
+            streamed_response_metadata(s, p, opaque);
+            if (s->host.net_log) net_log_response(s, p, "headers", 0);
             JSValue args[] = {JS_NewInt32(s->ctx, opaque ? 0 : p->response.status),
                 JS_NewString(s->ctx, opaque ? "" : web_response_url(&p->response)),
                 JS_NewString(s->ctx, opaque ? "" : web_response_headers(&p->response)), JS_UNDEFINED,
@@ -6721,6 +6840,11 @@ static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
             for (unsigned i = 0; i < 8; i++) JS_FreeValue(s->ctx, args[i]);
         }
     } else if (event == WEBNET_CHUNK && !terminal) {
+        p->streamed_bytes += p->response.body_len;
+        if (s->host.net_log && p->net_preview_len < sizeof p->net_preview && p->response.body) {
+            size_t n = MIN(p->response.body_len, sizeof p->net_preview - p->net_preview_len);
+            memcpy(p->net_preview + p->net_preview_len, p->response.body, n); p->net_preview_len += (unsigned)n;
+        }
         value = JS_NewArrayBuffer(s->ctx, (uint8_t *)p->response.body, p->response.body_len, fetch_body_free, NULL, false);
         if (!JS_IsException(value)) p->response.body = NULL;
     } else if (event == WEBNET_UPLOAD && !terminal) value = JS_NewInt64(s->ctx, p->response.uploaded);
@@ -6756,6 +6880,8 @@ static void process_fetch_frame(struct web_js_state *s, struct js_pending *p) {
     }
     JS_FreeValue(s->ctx, value);
     if (terminal) {
+        if (!p->aborted) resource_timing(s, p, p->streamed_bytes);
+        if (s->host.net_log) net_log_response(s, p, "done", p->streamed_bytes);
         if ((event != WEBNET_END || p->response.error[0] || p->aborted) && s->host.cancel) s->host.cancel(s->host.opaque, p->id);
         pending_free(s, p);
     } else {
@@ -6786,6 +6912,8 @@ static bool process_pending(struct web_js_state *s) {
         bool ok = !p->response.error[0] && p->response.status >= 200 && p->response.status < 300;
         if (!ok && (p->kind != P_FETCH || p->response.error[0] || p->response.status >= 400))
             diagnostic_resource(s,p,p->aborted?"aborted":p->response.error[0]?p->response.error:"unsuccessful HTTP response");
+        if (!p->aborted && !s->disabled) { begin_named_task(s,"resource timing",p->id); resource_timing(s,p,p->response.body_len); end_task(s); }
+        if (s->host.net_log) net_log_response(s,p,"done",p->response.body_len);
         if(p->kind==P_FRAME)frame_response(s,p,ok);
         else if(p->kind==P_MODULE){
             begin_named_task(s,"module preload preparation",p->id);

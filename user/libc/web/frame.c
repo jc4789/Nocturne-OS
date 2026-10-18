@@ -138,16 +138,21 @@ bool web_frame_commit_response(struct web_frame *f,const char *html,size_t n,con
     web_doc *parent=f?f->element->owner:NULL;
     if(!parent)return false;
     uint32_t csp_sandbox=0;
-    if(!html_policy_embedding_allowed(parent,headers,url,&csp_sandbox))return false;
+    if(!html_policy_embedding_allowed(parent,headers,url,&csp_sandbox)){
+        f->commit_failure="the response's X-Frame-Options or CSP frame-ancestors refuses this embedder";return false;
+    }
     f->pending_sandbox_flags|=parent->sandbox_flags|csp_sandbox;
-    if(!web_sandbox_document_allowed(f,url,inherited))return false;
+    if(!web_sandbox_document_allowed(f,url,inherited)){
+        f->commit_failure="the frame's sandbox flags are outside the supported subset for this URL";return false;
+    }
     if(!f->window_token) {
         f->window_token=doc_node_create(parent,N_FRAGMENT,NULL,"",0);
-        if(!f->window_token)return false;
+        if(!f->window_token){f->commit_failure="the WindowProxy token could not be allocated";return false;}
     }
     web_doc *made=web_live_child_response(html,n,url,charset,headers,host,parent,f->element,
         inherited?(f->navigation_owner?f->navigation_owner:parent):NULL);
-    if(!made)return false;
+    if(!made){f->commit_failure="the child document could not be created (allocation or parser failure)";return false;}
+    f->commit_failure=NULL;
     made->frame_container=f;
     web_frame_retire(f);f->document=made;f->failed=false;f->initial_failed=false;f->detached=false;f->notified=false;f->paint_failed=false;
     web_frames_commit_viewports(parent);

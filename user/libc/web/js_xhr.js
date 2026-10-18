@@ -280,7 +280,7 @@
             }
             try{pair=s.url.startsWith('blob:')||s.url.startsWith('data:')?{id:0,promise:fetchBridge.fetch(s.url,{method:s.method,headers:Object.fromEntries(s.headers),body})}:host.fetch(s.url,s.method,raw,body,false,s.credentials?2:1,s.uploadListener);}
             catch(e){queue(this,s,epoch,()=>networkFailure(this,s,epoch,e));return;}
-            s.id=pair.id;
+            s.id=pair.id;if(s.id)performanceBridge.initiator(s.id,'xmlhttprequest');
             // Native promises settle at the host checkpoint. XHR notifications
             // are tasks; never run them recursively in send() or a page promise.
             // Even intrinsic then reads constructor@@species. This promise is

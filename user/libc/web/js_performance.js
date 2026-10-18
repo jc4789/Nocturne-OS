@@ -2,7 +2,8 @@
  * observer delivery. Include AFTER js_clone.js; metadata uses its private
  * structured serializer, not a replaceable page function. Legacy navigation
  * timing exposes recorded host/parser/event milestones. Unobserved transport
- * milestones stay 0; navigation entries/resource/paint/event are not advertised.
+ * milestones stay 0; navigation entries/paint/event are not advertised.
+ * Resource Timing entries come from native request completion (Window only).
  * Shared with Worker realms: without host.timing a realm has no navigation
  * timing, no reserved mark names, and its time origin is its creation. */
 const performanceBridge = (() => {
@@ -11,7 +12,7 @@ const performanceBridge = (() => {
     const isWindow=typeof host.timing==="function",hostNow=host.now,base=isWindow?0:hostNow();
     const finite=Number.isFinite,floor=Math.floor,now=isWindow?hostNow:()=>hostNow()-base,navigationTime=host.timing,dateNow=Date.now;
     const serialize=cloneData.serialize,deserialize=cloneData.deserialize;
-    const entries=new WeakMap(),observers=new WeakMap(),lists=new WeakMap(),performances=new WeakMap(),timings=new WeakMap();
+    const entries=new WeakMap(),observers=new WeakMap(),lists=new WeakMap(),performances=new WeakMap(),timings=new WeakMap(),fullHandlers=new WeakMap();
     const getWeak=WeakMap.prototype.get,setWeak=WeakMap.prototype.set;
     const get=(map,value)=>call(getWeak,map,[value]),put=(map,key,value)=>call(setWeak,map,[key,value]);
     // These interfaces have no [Serializable] annotation. Private slots, not
@@ -23,7 +24,8 @@ const performanceBridge = (() => {
     const active=new Set(),setAdd=Set.prototype.add,setDelete=Set.prototype.delete;
     const eachSet=Set.prototype.forEach;
     const activeList=()=>{const a=[];call(eachSet,active,[x=>append(a,x)]);return a;};
-    const token={},supported=Object.freeze(['mark','measure']);
+    const token={},supported=Object.freeze(isWindow?['mark','measure','resource']:['mark','measure']);
+    const observable=type=>type==='mark'||type==='measure'||isWindow&&type==='resource';
     const timingNames=('navigationStart unloadEventStart unloadEventEnd redirectStart redirectEnd '+
         'fetchStart domainLookupStart domainLookupEnd connectStart connectEnd secureConnectionStart '+
         'requestStart responseStart responseEnd domLoading domInteractive domContentLoadedEventStart '+
@@ -101,13 +103,63 @@ const performanceBridge = (() => {
         constructor(key){super(key);if(key!==token)throw new TypeErr('Illegal constructor');}
         get detail(){const s=slot(entries,this);if(s.entryType!=='measure')throw new TypeErr('Illegal invocation');return s.detail;}
     }
+    // Resource Timing. Native code reports each completed HTTP(S) request with
+    // times relative to the time origin; without a passing timing allow check
+    // the detailed times and sizes are 0, as for a cross-origin resource.
+    const resourceNames=['initiatorType','deliveryType','nextHopProtocol','workerStart','redirectStart','redirectEnd',
+        'fetchStart','domainLookupStart','domainLookupEnd','connectStart','connectEnd','secureConnectionStart',
+        'requestStart','firstInterimResponseStart','responseStart','responseEnd','transferSize','encodedBodySize',
+        'decodedBodySize','responseStatus','renderBlockingStatus','contentType'];
+    class PerformanceResourceTiming extends PerformanceEntry {
+        constructor(key){super(key);if(key!==token)throw new TypeErr('Illegal constructor');}
+        get serverTiming(){const s=slot(entries,this);if(s.entryType!=='resource')throw new TypeErr('Illegal invocation');return [];}
+        toJSON(){
+            const s=slot(entries,this);if(s.entryType!=='resource')throw new TypeErr('Illegal invocation');
+            const result={name:s.name,entryType:s.entryType,startTime:s.startTime,duration:s.duration};
+            for(let i=0;i<resourceNames.length;i++)result[resourceNames[i]]=s[resourceNames[i]];
+            result.serverTiming=[];return result;
+        }
+    }
+    for(let i=0;i<resourceNames.length;i++){
+        const name=resourceNames[i];
+        define(PerformanceResourceTiming.prototype,name,{configurable:true,get(){
+            const s=slot(entries,this);if(s.entryType!=='resource')throw new TypeErr('Illegal invocation');return s[name];
+        }});
+    }
+    // fetch() and XMLHttpRequest share the native fetch transport.
+    const initiators=new Map(),mapGet=Map.prototype.get,mapSet=Map.prototype.set,mapDelete=Map.prototype.delete;
+    const initiatorKinds=['script','fetch','link','img','other','iframe','css','other','script'];
+    let resourceLimit=250,resourceCount=0,resourceSecondary=[],resourceFullPending=false,performanceObject=null;
+    function bufferFull(){
+        resourceFullPending=false;
+        try{performanceObject.dispatchEvent(new Event('resourcetimingbufferfull'));}catch(e){report(e);}
+        const waiting=resourceSecondary;resourceSecondary=[];
+        for(let i=0;i<waiting.length&&resourceCount<resourceLimit;i++){append(buffer,waiting[i]);resourceCount++;}
+    }
+    function resource(id,kind,url,start,responseStart,end,bodyBytes,headerBytes,status,contentType,allowed){
+        const initiatorType=call(mapGet,initiators,[id])||initiatorKinds[kind]||'other';call(mapDelete,initiators,[id]);
+        const detailed=t=>allowed?t:0;
+        const entry=create(PerformanceResourceTiming.prototype);
+        put(entries,entry,{name:url,entryType:'resource',startTime:start,duration:end-start,sequence:0,
+            initiatorType,deliveryType:'',nextHopProtocol:allowed?'http/1.1':'',workerStart:0,redirectStart:0,redirectEnd:0,
+            fetchStart:start,domainLookupStart:detailed(start),domainLookupEnd:detailed(start),connectStart:detailed(start),
+            connectEnd:detailed(start),secureConnectionStart:allowed&&url.startsWith('https:')?start:0,requestStart:detailed(start),
+            firstInterimResponseStart:0,responseStart:detailed(responseStart),responseEnd:end,
+            transferSize:detailed(bodyBytes+headerBytes),encodedBodySize:detailed(bodyBytes),decodedBodySize:detailed(bodyBytes),
+            responseStatus:status,renderBlockingStatus:'non-blocking',contentType});
+        const fits=resourceCount<resourceLimit&&!resourceSecondary.length;
+        record(entry,fits);
+        if(fits){resourceCount++;return;}
+        append(resourceSecondary,entry);
+        if(!resourceFullPending){resourceFullPending=true;try{schedule(bufferFull,0);}catch(e){resourceFullPending=false;report(e);}}
+    }
     function queueNotification(){
         if(notificationPending)return;
         notificationPending=true;
         try{schedule(notify,0);}catch(e){notificationPending=false;report(e);}
     }
-    function record(entry){
-        const s=get(entries,entry);s.sequence=++sequence;append(buffer,entry);
+    function record(entry,buffered=true){
+        const s=get(entries,entry);s.sequence=++sequence;if(buffered)append(buffer,entry);
         const registered=activeList();let interested=false;
         for(let i=0;i<registered.length;i++){
             const o=get(observers,registered[i]);
@@ -175,9 +227,18 @@ const performanceBridge = (() => {
         clearMeasures(name){slot(performances,this);clear('measure',name===undefined?undefined:string(name));}
         // Clear only the resource partition of the actual private timeline.
         // Marks, measures and previously queued observer records survive.
-        // Transport/resource collection is not advertised until implemented;
-        // this operation does not manufacture empty timing entries or marks.
-        clearResourceTimings(){slot(performances,this);clear('resource');}
+        clearResourceTimings(){slot(performances,this);clear('resource');resourceCount=0;}
+        setResourceTimingBufferSize(maxSize){
+            slot(performances,this);if(!arguments.length)throw new TypeErr('A buffer size is required');
+            const n=+maxSize;resourceLimit=finite(n)?floor(n)>>>0:0;
+        }
+        get onresourcetimingbufferfull(){slot(performances,this);return get(fullHandlers,this)||null;}
+        set onresourcetimingbufferfull(value){
+            slot(performances,this);const previous=get(fullHandlers,this);
+            if(previous)this.removeEventListener('resourcetimingbufferfull',previous);
+            const handler=typeof value==='function'||(value&&typeof value==='object')?value:null;
+            put(fullHandlers,this,handler);if(handler)this.addEventListener('resourcetimingbufferfull',handler);
+        }
         getEntries(){slot(performances,this);return selected(buffer);}
         getEntriesByType(type){slot(performances,this);if(!arguments.length)throw new TypeErr('An entry type is required');return selected(buffer,undefined,string(type));}
         getEntriesByName(name,type){slot(performances,this);if(!arguments.length)throw new TypeErr('An entry name is required');return selected(buffer,string(name),type===undefined?undefined:string(type));}
@@ -211,10 +272,10 @@ const performanceBridge = (() => {
             s.mode=mode;s.requiresDropped=true;
             if(mode==='multiple'){
                 const accepted=new Set();
-                for(let i=0;i<types.length;i++)if(types[i]==='mark'||types[i]==='measure')call(setAdd,accepted,[types[i]]);
+                for(let i=0;i<types.length;i++)if(observable(types[i]))call(setAdd,accepted,[types[i]]);
                 if(!accepted.size)return;s.types=accepted;
             }else{
-                if(type!=='mark'&&type!=='measure')return;
+                if(!observable(type))return;
                 call(setAdd,s.types,[type]);
             }
             call(setAdd,active,[this]);
@@ -238,13 +299,13 @@ const performanceBridge = (() => {
             try{call(s.callback,observer,[list,observer,options]);}catch(e){report(e);}
         }
     }
-    for(const ctor of [Performance,PerformanceTiming,PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceObserver,PerformanceObserverEntryList]){
+    for(const ctor of [Performance,PerformanceTiming,PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceResourceTiming,PerformanceObserver,PerformanceObserverEntryList]){
         define(ctor.prototype,Symbol.toStringTag,{value:ctor.name,configurable:true});
         for(const key of Object.getOwnPropertyNames(ctor.prototype))if(key!=='constructor'){
             const d=Object.getOwnPropertyDescriptor(ctor.prototype,key);d.enumerable=true;define(ctor.prototype,key,d);
         }
     }
-    for(const ctor of [Performance,PerformanceEntry,PerformanceMeasure])define(ctor,'length',{value:0,configurable:true});
+    for(const ctor of [Performance,PerformanceEntry,PerformanceMeasure,PerformanceResourceTiming])define(ctor,'length',{value:0,configurable:true});
     for(const key of ['clearMarks','clearMeasures'])define(Performance.prototype[key],'length',{value:0,configurable:true});
     define(Performance.prototype.getEntriesByName,'length',{value:1,configurable:true});
     define(PerformanceObserverEntryList.prototype.getEntriesByName,'length',{value:1,configurable:true});
@@ -252,6 +313,12 @@ const performanceBridge = (() => {
     supportedDescriptor.enumerable=true;define(PerformanceObserver,'supportedEntryTypes',supportedDescriptor);
     // Navigation timing (Performance.timing, PerformanceTiming) is Window-only.
     if(isWindow)globalThis.PerformanceTiming=PerformanceTiming;else delete Performance.prototype.timing;
-    Object.assign(globalThis,{Performance,PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceObserver,PerformanceObserverEntryList,performance:new Performance(token)});
-    return {};
+    performanceObject=new Performance(token);
+    Object.assign(globalThis,{Performance,PerformanceEntry,PerformanceMark,PerformanceMeasure,PerformanceResourceTiming,PerformanceObserver,PerformanceObserverEntryList,performance:performanceObject});
+    // An aborted request never completes; its registration is dropped with the
+    // oldest rather than kept for the document's lifetime.
+    return {resource,initiator(id,type){
+        if(initiators.size>=4096)for(const key of initiators.keys()){call(mapDelete,initiators,[key]);break;}
+        call(mapSet,initiators,[id,type]);
+    }};
 })();

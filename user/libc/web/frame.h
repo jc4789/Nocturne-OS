@@ -17,6 +17,7 @@ struct web_frame {
     bool notified, detached, failed, initial_failed;
     uint32_t pending_sandbox_flags;
     bool sandbox_initial;
+    const char *commit_failure; /* static text: why web_frame_commit_response last refused */
     canvas_t paint;
     bool paint_failed;
     bool paint_visible;

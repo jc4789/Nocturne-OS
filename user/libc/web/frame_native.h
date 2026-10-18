@@ -206,7 +206,10 @@ static void frame_response(struct web_js_state *s,struct js_pending *p,bool ok) 
         http_header(&response_headers,"Content-Type",content_type,sizeof content_type);
         html_transport_label(content_type,charset,sizeof charset);
         if(web_frame_commit_response(f,p->response.body,p->response.body_len,url,charset,web_response_headers(&p->response),&s->host,false))return;
-        log_text(s,1,"Frame document commit failed: embedding/sandbox policy or allocation failure");
+        char message[640];
+        snprintf(message,sizeof message,"Frame document commit failed: %s; %.*s",
+                 f->commit_failure?f->commit_failure:"unknown reason",(int)MIN(strcspn(url,"?#"),(size_t)400),url);
+        log_text(s,1,message);
     }else log_text(s,1,"Frame document navigation failed or was blocked by its embedding policy");
     f->failed=true;f->notified=true;script_event(s,f->element,true);
 }
