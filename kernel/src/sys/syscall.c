@@ -1120,7 +1120,7 @@ void syscall_dispatch(struct regs *r) {
     uint64_t a = r->rdi, b = r->rsi, c = r->rdx, d = r->r10, e = r->r8;
     int64_t ret = -N_ERR_UNSUPPORTED;
     switch (r->rax) {
-    case SYS_EXIT: task_exit((int)a);
+    case SYS_EXIT: task_exit_app((int)a);
     case SYS_AUDIO_FLUSH: {
         struct file *f = getfd_ref((int)a);
         ret = f ? audio_flush_file(f) : -N_ERR_NO_HANDLE;

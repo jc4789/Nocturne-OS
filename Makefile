@@ -276,6 +276,21 @@ $(BUILD)/root/bin/wasm2c: $(BUILD)/u/third_party/wabt/src/tools/wasm2c.cc.o $(LI
 	@echo "  LD++ $@"
 	@$(LD) $(patsubst user/user.ld,user/cxx.ld,$(ULDFLAGS)) --gc-sections $(BUILD)/u/user/libc/crt0.asm.o $< --start-lib @$(LIBC_RSP) --end-lib -o $@
 
+# Go programs (ports/go/README.md), built when GO names a Go toolchain with the
+# Nocturne port: make GO=/path/to/go/bin/go.exe
+ifneq ($(GO),)
+GO_APPS  := $(notdir $(wildcard ports/go/apps/*))
+GO_BINS  := $(addprefix $(BUILD)/root/bin/,$(GO_APPS))
+GO_FILES := $(GO_BINS) $(BUILD)/root/usr/share/licenses/go/LICENSE
+$(GO_BINS): $(BUILD)/root/bin/%: ports/go/apps/%/main.go
+	@mkdir -p $(dir $@)
+	@echo "  GO   $@"
+	@cd ports/go/apps/$* && GOOS=nocturne GOARCH=amd64 CGO_ENABLED=0 "$(GO)" build -trimpath -o "$(CURDIR)/$@" main.go
+$(BUILD)/root/usr/share/licenses/go/LICENSE:
+	@mkdir -p $(dir $@)
+	@cp "$$("$(GO)" env GOROOT)/LICENSE" $@
+endif
+
 $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT: $(BUILD)/cxx/libc++.a
 	@mkdir -p $(dir $@)
 	@cp $(BUILD)/cxx/LICENSE.libc++.txt $@
@@ -355,7 +370,7 @@ user: $(APP_BINS) $(BUILD)/root/bin/tcc
 cxx: $(CPP_BINS) $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT
 lexbor: $(LXB_OBJ)
 
-$(BUILD)/initrd.tar: $(APP_BINS) $(BUILD)/root/bin/tcc $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT $(BUILD)/root/usr/share/licenses/wabt/LICENSE $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
+$(BUILD)/initrd.tar: $(APP_BINS) $(GO_FILES) $(BUILD)/root/bin/tcc $(BUILD)/root/usr/share/licenses/libcxx/LICENSE.TXT $(BUILD)/root/usr/share/licenses/wabt/LICENSE $(BUILD)/sysroot.stamp $(BUILD)/sounds.stamp $(shell find rootfs -type f) scripts/mkinitrd.py
 	@echo "  TAR  $@"
 	@$(PY) scripts/mkinitrd.py $@ rootfs $(BUILD)/sounds $(BUILD)/root $(BUILD)/sysroot
 

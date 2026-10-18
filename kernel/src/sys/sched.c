@@ -1150,15 +1150,17 @@ struct task *task_find(int pid) {
     return NULL;
 }
 
-NORETURN void task_fault_exit(int code) {
+NORETURN void task_exit_app(int code) {
     cpu_require_bsp();
     cli();
     struct task *owner = task_process();
     if (current_task->is_thread && !owner->exiting) {
-        /* A fault may abandon a pool descriptor or a shared mutex. It cannot
-           be recovered by zombifying just this helper: abort/wake the owner
-           and every sibling so no user continuation waits for a dead holder.
-           task_exit then joins them before destroying their shared mappings. */
+        /* Ending the app from one of its threads (ISO C exit, or a fault that
+           may abandon a pool descriptor or a shared mutex) cannot be done by
+           zombifying just this helper: abort/wake the owner and every sibling
+           so the app ends with this code and no user continuation waits for a
+           dead holder. task_exit then joins them before destroying their
+           shared mappings. */
         for (struct task *t = task_list; t; t = t->all_next) {
             if (t == current_task || t->state == TASK_ZOMBIE || t->killed) continue;
             if (t == owner || (t->is_thread && t->process == owner)) {

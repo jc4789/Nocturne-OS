@@ -117,7 +117,7 @@ int address_watch_add(struct vnode *queue, volatile uint32_t *address, uint32_t 
 int address_watch_remove(struct vnode *queue, uint64_t token);
 size_t address_watch_take(struct vnode *queue, uint64_t *tokens, size_t max);
 NORETURN void task_exit(int code);
-NORETURN void task_fault_exit(int code); /* fatal user exception aborts shared process */
+NORETURN void task_exit_app(int code); /* SYS_EXIT or a fatal user exception: the whole app ends, from any of its threads */
 struct task *task_find(int pid);
 int task_kill(int pid);
 int task_wait(int pid, int *status, bool nohang);

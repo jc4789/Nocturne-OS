@@ -1,0 +1,3698 @@
+diff --git a/src/cmd/dist/build.go b/src/cmd/dist/build.go
+index 78d55bec..a16a6d13 100644
+--- a/src/cmd/dist/build.go
++++ b/src/cmd/dist/build.go
+@@ -102,6 +102,7 @@ var okgoos = []string{
+ 	"netbsd",
+ 	"openbsd",
+ 	"plan9",
++	"nocturne",
+ 	"windows",
+ 	"aix",
+ }
+@@ -1827,6 +1828,7 @@ var cgoEnabled = map[string]bool{
+ 	"plan9/386":       false,
+ 	"plan9/amd64":     false,
+ 	"plan9/arm":       false,
++	"nocturne/amd64":  false,
+ 	"solaris/amd64":   true,
+ 	"windows/386":     true,
+ 	"windows/amd64":   true,
+diff --git a/src/cmd/internal/obj/x86/asm6.go b/src/cmd/internal/obj/x86/asm6.go
+index 89b64f4e..e0ddd82d 100644
+--- a/src/cmd/internal/obj/x86/asm6.go
++++ b/src/cmd/internal/obj/x86/asm6.go
+@@ -2564,6 +2564,7 @@ func prefixof(ctxt *obj.Link, a *obj.Addr) int {
+ 				objabi.Hfreebsd,
+ 				objabi.Hnetbsd,
+ 				objabi.Hopenbsd,
++				objabi.Hnocturne,
+ 				objabi.Hsolaris:
+ 				return 0x64 // FS
+ 
+diff --git a/src/cmd/internal/objabi/head.go b/src/cmd/internal/objabi/head.go
+index 3109b5cb..cceec7f4 100644
+--- a/src/cmd/internal/objabi/head.go
++++ b/src/cmd/internal/objabi/head.go
+@@ -49,6 +49,7 @@ const (
+ 	Hwasip1
+ 	Hwindows
+ 	Haix
++	Hnocturne
+ )
+ 
+ func (h *HeadType) Set(s string) error {
+@@ -65,6 +66,8 @@ func (h *HeadType) Set(s string) error {
+ 		*h = Hjs
+ 	case "linux", "android":
+ 		*h = Hlinux
++	case "nocturne":
++		*h = Hnocturne
+ 	case "netbsd":
+ 		*h = Hnetbsd
+ 	case "openbsd":
+@@ -97,6 +100,8 @@ func (h HeadType) String() string {
+ 		return "js"
+ 	case Hlinux:
+ 		return "linux"
++	case Hnocturne:
++		return "nocturne"
+ 	case Hnetbsd:
+ 		return "netbsd"
+ 	case Hopenbsd:
+diff --git a/src/cmd/link/internal/amd64/obj.go b/src/cmd/link/internal/amd64/obj.go
+index 3a6141b9..58c607b8 100644
+--- a/src/cmd/link/internal/amd64/obj.go
++++ b/src/cmd/link/internal/amd64/obj.go
+@@ -106,6 +106,7 @@ func archinit(ctxt *ld.Link) {
+ 		objabi.Hfreebsd,   /* freebsd */
+ 		objabi.Hnetbsd,    /* netbsd */
+ 		objabi.Hopenbsd,   /* openbsd */
++		objabi.Hnocturne,  /* nocturne */
+ 		objabi.Hdragonfly, /* dragonfly */
+ 		objabi.Hsolaris:   /* solaris */
+ 		ld.Elfinit(ctxt)
+diff --git a/src/cmd/link/internal/ld/asmb.go b/src/cmd/link/internal/ld/asmb.go
+index 2088e13b..ff873b23 100644
+--- a/src/cmd/link/internal/ld/asmb.go
++++ b/src/cmd/link/internal/ld/asmb.go
+@@ -111,6 +111,7 @@ func asmb2(ctxt *Link) {
+ 		objabi.Hlinux,
+ 		objabi.Hnetbsd,
+ 		objabi.Hopenbsd,
++		objabi.Hnocturne,
+ 		objabi.Hsolaris:
+ 		asmbElf(ctxt)
+ 	}
+diff --git a/src/cmd/link/internal/ld/sym.go b/src/cmd/link/internal/ld/sym.go
+index 6ae11060..4a4ea059 100644
+--- a/src/cmd/link/internal/ld/sym.go
++++ b/src/cmd/link/internal/ld/sym.go
+@@ -82,6 +82,7 @@ func (ctxt *Link) computeTLSOffset() {
+ 		objabi.Hfreebsd,
+ 		objabi.Hnetbsd,
+ 		objabi.Hopenbsd,
++		objabi.Hnocturne,
+ 		objabi.Hdragonfly,
+ 		objabi.Hsolaris:
+ 		/*
+diff --git a/src/crypto/internal/sysrand/rand_nocturne.go b/src/crypto/internal/sysrand/rand_nocturne.go
+new file mode 100644
+index 00000000..d79ef614
+--- /dev/null
++++ b/src/crypto/internal/sysrand/rand_nocturne.go
+@@ -0,0 +1,13 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package sysrand
++
++import "syscall"
++
++// read fills b from the system's entropy (SYS_RANDOM), which fills the
++// whole buffer or fails.
++func read(b []byte) error {
++	return syscall.Random(b)
++}
+diff --git a/src/internal/filepathlite/path_unix.go b/src/internal/filepathlite/path_unix.go
+index e31f1ae7..e2429191 100644
+--- a/src/internal/filepathlite/path_unix.go
++++ b/src/internal/filepathlite/path_unix.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build unix || (js && wasm) || wasip1
++//go:build unix || (js && wasm) || nocturne || wasip1
+ 
+ package filepathlite
+ 
+diff --git a/src/internal/goos/zgoos_aix.go b/src/internal/goos/zgoos_aix.go
+index 24e05c93..e24ffaf4 100644
+--- a/src/internal/goos/zgoos_aix.go
++++ b/src/internal/goos/zgoos_aix.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_android.go b/src/internal/goos/zgoos_android.go
+index 3c4a3185..fdf6950b 100644
+--- a/src/internal/goos/zgoos_android.go
++++ b/src/internal/goos/zgoos_android.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_darwin.go b/src/internal/goos/zgoos_darwin.go
+index 10b14998..f1f60154 100644
+--- a/src/internal/goos/zgoos_darwin.go
++++ b/src/internal/goos/zgoos_darwin.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_dragonfly.go b/src/internal/goos/zgoos_dragonfly.go
+index b92d1269..9fbcbc54 100644
+--- a/src/internal/goos/zgoos_dragonfly.go
++++ b/src/internal/goos/zgoos_dragonfly.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_freebsd.go b/src/internal/goos/zgoos_freebsd.go
+index f547591a..1201bee3 100644
+--- a/src/internal/goos/zgoos_freebsd.go
++++ b/src/internal/goos/zgoos_freebsd.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_hurd.go b/src/internal/goos/zgoos_hurd.go
+index 1189d65d..0a729532 100644
+--- a/src/internal/goos/zgoos_hurd.go
++++ b/src/internal/goos/zgoos_hurd.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_illumos.go b/src/internal/goos/zgoos_illumos.go
+index 4f025408..5c0976d1 100644
+--- a/src/internal/goos/zgoos_illumos.go
++++ b/src/internal/goos/zgoos_illumos.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_ios.go b/src/internal/goos/zgoos_ios.go
+index 02f3586f..f8a3f9a6 100644
+--- a/src/internal/goos/zgoos_ios.go
++++ b/src/internal/goos/zgoos_ios.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_js.go b/src/internal/goos/zgoos_js.go
+index 48187418..ec586948 100644
+--- a/src/internal/goos/zgoos_js.go
++++ b/src/internal/goos/zgoos_js.go
+@@ -18,6 +18,7 @@ const IsJs = 1
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_linux.go b/src/internal/goos/zgoos_linux.go
+index 6f4d4e07..00ae7a1c 100644
+--- a/src/internal/goos/zgoos_linux.go
++++ b/src/internal/goos/zgoos_linux.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 1
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_netbsd.go b/src/internal/goos/zgoos_netbsd.go
+index 948603df..2e2ab450 100644
+--- a/src/internal/goos/zgoos_netbsd.go
++++ b/src/internal/goos/zgoos_netbsd.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 1
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_nocturne.go b/src/internal/goos/zgoos_nocturne.go
+new file mode 100644
+index 00000000..c76e3e64
+--- /dev/null
++++ b/src/internal/goos/zgoos_nocturne.go
+@@ -0,0 +1,27 @@
++// Code generated by gengoos.go using 'go generate'. DO NOT EDIT.
++
++//go:build nocturne
++
++package goos
++
++const GOOS = `nocturne`
++
++const IsAix = 0
++const IsAndroid = 0
++const IsDarwin = 0
++const IsDragonfly = 0
++const IsFreebsd = 0
++const IsHurd = 0
++const IsIllumos = 0
++const IsIos = 0
++const IsJs = 0
++const IsLinux = 0
++const IsNacl = 0
++const IsNetbsd = 0
++const IsNocturne = 1
++const IsOpenbsd = 0
++const IsPlan9 = 0
++const IsSolaris = 0
++const IsWasip1 = 0
++const IsWindows = 0
++const IsZos = 0
+diff --git a/src/internal/goos/zgoos_openbsd.go b/src/internal/goos/zgoos_openbsd.go
+index f4b20145..1b03c51d 100644
+--- a/src/internal/goos/zgoos_openbsd.go
++++ b/src/internal/goos/zgoos_openbsd.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 1
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_plan9.go b/src/internal/goos/zgoos_plan9.go
+index 95572dff..8ac946b6 100644
+--- a/src/internal/goos/zgoos_plan9.go
++++ b/src/internal/goos/zgoos_plan9.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 1
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_solaris.go b/src/internal/goos/zgoos_solaris.go
+index c7058260..e728a213 100644
+--- a/src/internal/goos/zgoos_solaris.go
++++ b/src/internal/goos/zgoos_solaris.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 1
+diff --git a/src/internal/goos/zgoos_wasip1.go b/src/internal/goos/zgoos_wasip1.go
+index ae35eeba..bb568493 100644
+--- a/src/internal/goos/zgoos_wasip1.go
++++ b/src/internal/goos/zgoos_wasip1.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_windows.go b/src/internal/goos/zgoos_windows.go
+index f89f4cf8..e0233716 100644
+--- a/src/internal/goos/zgoos_windows.go
++++ b/src/internal/goos/zgoos_windows.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/goos/zgoos_zos.go b/src/internal/goos/zgoos_zos.go
+index 29fb0f8b..4f40f589 100644
+--- a/src/internal/goos/zgoos_zos.go
++++ b/src/internal/goos/zgoos_zos.go
+@@ -18,6 +18,7 @@ const IsJs = 0
+ const IsLinux = 0
+ const IsNacl = 0
+ const IsNetbsd = 0
++const IsNocturne = 0
+ const IsOpenbsd = 0
+ const IsPlan9 = 0
+ const IsSolaris = 0
+diff --git a/src/internal/platform/zosarch.go b/src/internal/platform/zosarch.go
+index ec6368e8..afa35dca 100644
+--- a/src/internal/platform/zosarch.go
++++ b/src/internal/platform/zosarch.go
+@@ -43,6 +43,7 @@ var List = []OSArch{
+ 	{"netbsd", "amd64"},
+ 	{"netbsd", "arm"},
+ 	{"netbsd", "arm64"},
++	{"nocturne", "amd64"},
+ 	{"openbsd", "386"},
+ 	{"openbsd", "amd64"},
+ 	{"openbsd", "arm"},
+@@ -95,6 +96,7 @@ var distInfo = map[OSArch]osArchInfo{
+ 	{"netbsd", "amd64"}:    {CgoSupported: true},
+ 	{"netbsd", "arm"}:      {CgoSupported: true},
+ 	{"netbsd", "arm64"}:    {CgoSupported: true},
++	{"nocturne", "amd64"}:  {},
+ 	{"openbsd", "386"}:     {CgoSupported: true},
+ 	{"openbsd", "amd64"}:   {CgoSupported: true},
+ 	{"openbsd", "arm"}:     {CgoSupported: true},
+diff --git a/src/internal/poll/fd_nocturne.go b/src/internal/poll/fd_nocturne.go
+new file mode 100644
+index 00000000..1196d78c
+--- /dev/null
++++ b/src/internal/poll/fd_nocturne.go
+@@ -0,0 +1,117 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package poll
++
++import (
++	"syscall"
++	"time"
++)
++
++// FD serializes the users of a Nocturne handle. Nocturne calls block in
++// the system (syscall.Syscall lets other goroutines run meanwhile); there
++// is no poller, so deadlines are not supported.
++type FD struct {
++	// Lock sysfd and serialize access to Read and Write methods.
++	fdmu fdMutex
++
++	// The handle.
++	Sysfd int
++
++	// Destroy releases the handle once its last user is done.
++	Destroy func()
++
++	// Whether this is a document or folder rather than a connection;
++	// shared code in fd_mutex.go checks it.
++	isFile bool
++}
++
++func (fd *FD) destroy() error {
++	if fd.Destroy != nil {
++		fd.Destroy()
++	}
++	return nil
++}
++
++// Close handles the locking for closing an FD.
++func (fd *FD) Close() error {
++	if !fd.fdmu.increfAndClose() {
++		return errClosing(fd.isFile)
++	}
++	return fd.decref()
++}
++
++// Read implements io.Reader through fn.
++func (fd *FD) Read(fn func([]byte) (int, error), b []byte) (int, error) {
++	if err := fd.readLock(); err != nil {
++		return 0, err
++	}
++	defer fd.readUnlock()
++	if len(b) == 0 {
++		return 0, nil
++	}
++	return fn(b)
++}
++
++// Write implements io.Writer through fn.
++func (fd *FD) Write(fn func([]byte) (int, error), b []byte) (int, error) {
++	if err := fd.writeLock(); err != nil {
++		return 0, err
++	}
++	defer fd.writeUnlock()
++	return fn(b)
++}
++
++func (fd *FD) SetDeadline(t time.Time) error      { return ErrNoDeadline }
++func (fd *FD) SetReadDeadline(t time.Time) error  { return ErrNoDeadline }
++func (fd *FD) SetWriteDeadline(t time.Time) error { return ErrNoDeadline }
++
++// RawControl invokes the user-defined function f for a non-IO operation.
++func (fd *FD) RawControl(f func(uintptr)) error {
++	if err := fd.incref(); err != nil {
++		return err
++	}
++	defer fd.decref()
++	f(uintptr(fd.Sysfd))
++	return nil
++}
++
++// FDMutex is an exported fdMutex, only for package os.
++type FDMutex struct {
++	fdmu fdMutex
++}
++
++func (fdmu *FDMutex) Incref() bool {
++	return fdmu.fdmu.incref()
++}
++
++func (fdmu *FDMutex) Decref() bool {
++	return fdmu.fdmu.decref()
++}
++
++func (fdmu *FDMutex) IncrefAndClose() bool {
++	return fdmu.fdmu.increfAndClose()
++}
++
++func (fdmu *FDMutex) ReadLock() bool {
++	return fdmu.fdmu.rwlock(readlock, waitLock)
++}
++
++func (fdmu *FDMutex) ReadUnlock() bool {
++	return fdmu.fdmu.rwunlock(readlock)
++}
++
++func (fdmu *FDMutex) WriteLock() bool {
++	return fdmu.fdmu.rwlock(writeLock, waitLock)
++}
++
++func (fdmu *FDMutex) WriteUnlock() bool {
++	return fdmu.fdmu.rwunlock(writeLock)
++}
++
++// DupCloseOnExec is not available: Nocturne handles are not duplicated,
++// and an app receives only the handles its launcher names.
++func DupCloseOnExec(fd int) (int, string, error) {
++	return -1, "dup", syscall.ENOTSUP
++}
+diff --git a/src/internal/syslist/syslist.go b/src/internal/syslist/syslist.go
+index 2349b6ea..d7e92363 100644
+--- a/src/internal/syslist/syslist.go
++++ b/src/internal/syslist/syslist.go
+@@ -27,6 +27,7 @@ var KnownOS = map[string]bool{
+ 	"linux":     true,
+ 	"nacl":      true,
+ 	"netbsd":    true,
++	"nocturne":  true,
+ 	"openbsd":   true,
+ 	"plan9":     true,
+ 	"solaris":   true,
+diff --git a/src/os/dir_nocturne.go b/src/os/dir_nocturne.go
+new file mode 100644
+index 00000000..0994eecd
+--- /dev/null
++++ b/src/os/dir_nocturne.go
+@@ -0,0 +1,81 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package os
++
++import (
++	"io"
++	"io/fs"
++	"syscall"
++)
++
++// readdir lists the folder by path (FolderList), a batch of entries at a time.
++func (file *File) readdir(n int, mode readdirMode) (names []string, dirents []DirEntry, infos []FileInfo, err error) {
++	if file.kind != syscall.KIND_FOLDER {
++		return nil, nil, nil, &PathError{Op: "readdir", Path: file.name, Err: syscall.ENOTDIR}
++	}
++	var d *dirInfo
++	for {
++		d = file.dirinfo.Load()
++		if d != nil {
++			break
++		}
++		newD := new(dirInfo)
++		if file.dirinfo.CompareAndSwap(nil, newD) {
++			d = newD
++			break
++		}
++	}
++
++	d.mu.Lock()
++	defer d.mu.Unlock()
++
++	if n <= 0 {
++		n = -1
++	}
++	for n != 0 {
++		if d.pos >= d.n {
++			count, err := syscall.FolderList(file.path, d.entries[:], d.next)
++			if err != nil {
++				return names, dirents, infos, &PathError{Op: "readdir", Path: file.name, Err: err}
++			}
++			d.pos, d.n = 0, count
++			d.next += count
++			if count == 0 {
++				break
++			}
++		}
++		e := &d.entries[d.pos]
++		d.pos++
++		if mode == readdirName {
++			names = append(names, e.EntryName())
++		} else {
++			f := fileInfoFromEntry(e, joinFolder(file.path, e.EntryName()))
++			if mode == readdirDirEntry {
++				dirents = append(dirents, dirEntry{f})
++			} else {
++				infos = append(infos, f)
++			}
++		}
++		n--
++	}
++
++	if n > 0 && len(names)+len(dirents)+len(infos) == 0 {
++		return nil, nil, nil, io.EOF
++	}
++	return names, dirents, infos, nil
++}
++
++type dirEntry struct {
++	fs *fileStat
++}
++
++func (de dirEntry) Name() string            { return de.fs.Name() }
++func (de dirEntry) IsDir() bool             { return de.fs.IsDir() }
++func (de dirEntry) Type() FileMode          { return de.fs.Mode().Type() }
++func (de dirEntry) Info() (FileInfo, error) { return de.fs, nil }
++
++func (de dirEntry) String() string {
++	return fs.FormatDirEntry(de)
++}
+diff --git a/src/os/exec/lp_nocturne.go b/src/os/exec/lp_nocturne.go
+new file mode 100644
+index 00000000..0023732c
+--- /dev/null
++++ b/src/os/exec/lp_nocturne.go
+@@ -0,0 +1,70 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package exec
++
++import (
++	"errors"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++// ErrNotFound is the error resulting if a path search failed to find an executable file.
++var ErrNotFound = errors.New("executable file not found in $PATH")
++
++// findExecutable accepts any document: Nocturne documents have no
++// permission bits, and the launcher checks that it is a program.
++func findExecutable(file string) error {
++	d, err := os.Stat(file)
++	if err != nil {
++		return err
++	}
++	if d.IsDir() {
++		return fs.ErrPermission
++	}
++	return nil
++}
++
++// lookPath searches the folders of the setting PATH, as Nocturne's
++// launcher does ("/bin:/data/bin" without one).
++func lookPath(file string) (string, error) {
++	if err := validateLookPath(filepath.Clean(file)); err != nil {
++		return "", &Error{file, err}
++	}
++	if strings.Contains(file, "/") {
++		err := findExecutable(file)
++		if err == nil {
++			return file, nil
++		}
++		return "", &Error{file, err}
++	}
++	path := os.Getenv("PATH")
++	if path == "" {
++		path = "/bin:/data/bin"
++	}
++	for _, dir := range filepath.SplitList(path) {
++		if dir == "" {
++			continue
++		}
++		path := filepath.Join(dir, file)
++		if err := findExecutable(path); err == nil {
++			if !filepath.IsAbs(path) {
++				if execerrdot.Value() != "0" {
++					return path, &Error{file, ErrDot}
++				}
++				execerrdot.IncNonDefault()
++			}
++			return path, nil
++		}
++	}
++	return "", &Error{file, ErrNotFound}
++}
++
++// lookExtensions is a no-op on non-Windows platforms, since
++// they do not restrict executables to specific extensions.
++func lookExtensions(path, dir string) (string, error) {
++	return path, nil
++}
+diff --git a/src/os/exec_nocturne.go b/src/os/exec_nocturne.go
+new file mode 100644
+index 00000000..9849a48a
+--- /dev/null
++++ b/src/os/exec_nocturne.go
+@@ -0,0 +1,190 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package os
++
++import (
++	"internal/strconv"
++	"runtime"
++	"syscall"
++	"time"
++)
++
++// Nocturne has no signals. Both of these stop the app (AppStop).
++var (
++	Interrupt Signal = stopSignal("interrupt")
++	Kill      Signal = stopSignal("kill")
++)
++
++type stopSignal string
++
++func (s stopSignal) String() string { return string(s) }
++func (stopSignal) Signal()          {}
++
++// startProcess launches the program with AppLaunch. The new app's handle
++// i is attr.Files[i] (none for a nil File or DevNull); attr.Dir becomes
++// its setting FOLDER.
++func startProcess(name string, argv []string, attr *ProcAttr) (p *Process, err error) {
++	env := attr.Env
++	if env == nil {
++		env = syscall.Environ()
++	}
++	if attr.Dir != "" {
++		dir := syscall.FullPath(attr.Dir)
++		var e syscall.Entry
++		if err := syscall.EntryInfo(dir, &e); err != nil {
++			return nil, &PathError{Op: "chdir", Path: attr.Dir, Err: err}
++		}
++		if e.Kind != syscall.KIND_FOLDER {
++			return nil, &PathError{Op: "chdir", Path: attr.Dir, Err: syscall.ENOTDIR}
++		}
++		kept := make([]string, 0, len(env)+1)
++		for _, s := range env {
++			if len(s) < 7 || s[:7] != "FOLDER=" {
++				kept = append(kept, s)
++			}
++		}
++		env = append(kept, "FOLDER="+dir)
++	}
++	handles := make([]int, len(attr.Files))
++	for i, f := range attr.Files {
++		handles[i] = -1
++		if f != nil && f.sysfd >= 0 && f.kind != 0 {
++			handles[i] = f.sysfd
++		}
++	}
++	h, e := syscall.AppLaunch(name, argv, env, handles)
++	for _, f := range attr.Files {
++		// the handles must stay open until the launch has copied them
++		runtime.KeepAlive(f)
++	}
++	if e != nil {
++		return nil, &PathError{Op: "launch", Path: name, Err: e}
++	}
++	id, _ := syscall.AppID(h)
++	return newHandleProcess(id, uintptr(h)), nil
++}
++
++func (ph *processHandle) closeHandle() {
++	syscall.Close(int(ph.handle))
++}
++
++func (p *Process) signal(sig Signal) error {
++	if sig != Kill && sig != Interrupt {
++		return syscall.ENOTSUP
++	}
++	h, status := p.handleTransientAcquire()
++	switch status {
++	case statusDone:
++		return ErrProcessDone
++	case statusReleased:
++		return syscall.EINVAL
++	}
++	defer p.handleTransientRelease()
++	if err := syscall.AppStop(int(h), 0); err != nil {
++		if err == syscall.ERR_STOPPED || err == syscall.ERR_NOT_FOUND {
++			return ErrProcessDone
++		}
++		return NewSyscallError("stop", err)
++	}
++	return nil
++}
++
++func (p *Process) kill() error {
++	return p.signal(Kill)
++}
++
++func (p *Process) wait() (ps *ProcessState, err error) {
++	h, status := p.handleTransientAcquire()
++	switch status {
++	case statusDone:
++		return nil, ErrProcessDone
++	case statusReleased:
++		return nil, syscall.EINVAL
++	}
++	defer p.handleTransientRelease()
++
++	code, err := syscall.AppResult(int(h), -1)
++	if err != nil {
++		return nil, NewSyscallError("wait", err)
++	}
++	p.doRelease(statusDone)
++	return &ProcessState{pid: p.Pid, status: code}, nil
++}
++
++func (p *Process) withHandle(f func(handle uintptr)) error {
++	h, status := p.handleTransientAcquire()
++	switch status {
++	case statusDone:
++		return ErrProcessDone
++	case statusReleased:
++		return syscall.EINVAL
++	}
++	defer p.handleTransientRelease()
++	f(h)
++	return nil
++}
++
++// findProcess opens the running app with identifier pid.
++func findProcess(pid int) (p *Process, err error) {
++	h, err := syscall.AppOpen(pid)
++	if err != nil {
++		if err == syscall.ERR_NOT_FOUND {
++			return nil, ErrProcessDone
++		}
++		return nil, NewSyscallError("open", err)
++	}
++	return newHandleProcess(pid, uintptr(h)), nil
++}
++
++// ProcessState stores information about a process, as reported by Wait.
++type ProcessState struct {
++	pid    int // The app's identifier.
++	status int // Its exit status.
++}
++
++// Pid returns the process id of the exited process.
++func (p *ProcessState) Pid() int {
++	return p.pid
++}
++
++func (p *ProcessState) exited() bool {
++	return true
++}
++
++func (p *ProcessState) success() bool {
++	return p.status == 0
++}
++
++func (p *ProcessState) sys() any {
++	return p.status
++}
++
++func (p *ProcessState) sysUsage() any {
++	return nil
++}
++
++func (p *ProcessState) userTime() time.Duration {
++	return 0
++}
++
++func (p *ProcessState) systemTime() time.Duration {
++	return 0
++}
++
++func (p *ProcessState) String() string {
++	if p == nil {
++		return "<nil>"
++	}
++	return "exit status " + strconv.Itoa(p.status)
++}
++
++// ExitCode returns the exit code of the exited process, or -1
++// if the process hasn't exited.
++func (p *ProcessState) ExitCode() int {
++	if p == nil {
++		return -1
++	}
++	return p.status
++}
+diff --git a/src/os/exec_nohandle.go b/src/os/exec_nohandle.go
+index 0f70d21c..2867b927 100644
+--- a/src/os/exec_nohandle.go
++++ b/src/os/exec_nohandle.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build !linux && !windows
++//go:build !linux && !nocturne && !windows
+ 
+ package os
+ 
+diff --git a/src/os/executable_nocturne.go b/src/os/executable_nocturne.go
+new file mode 100644
+index 00000000..c1346282
+--- /dev/null
++++ b/src/os/executable_nocturne.go
+@@ -0,0 +1,43 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package os
++
++import (
++	"internal/stringslite"
++	"syscall"
++)
++
++// executable finds the program as Nocturne's launcher does: the first
++// argument as a full path, or a name in the folders of the setting PATH.
++func executable() (string, error) {
++	if len(Args) == 0 || Args[0] == "" {
++		return "", ErrNotExist
++	}
++	name := Args[0]
++	if stringslite.IndexByte(name, '/') >= 0 {
++		return syscall.FullPath(name), nil
++	}
++	path := Getenv("PATH")
++	if path == "" {
++		path = "/bin:/data/bin"
++	}
++	for path != "" {
++		folder := path
++		if i := stringslite.IndexByte(path, PathListSeparator); i >= 0 {
++			folder, path = path[:i], path[i+1:]
++		} else {
++			path = ""
++		}
++		if folder == "" {
++			continue
++		}
++		full := joinFolder(syscall.FullPath(folder), name)
++		var e syscall.Entry
++		if syscall.EntryInfo(full, &e) == nil && e.Kind == syscall.KIND_DOCUMENT {
++			return full, nil
++		}
++	}
++	return "", ErrNotExist
++}
+diff --git a/src/os/file.go b/src/os/file.go
+index 764ce12c..13df4e51 100644
+--- a/src/os/file.go
++++ b/src/os/file.go
+@@ -525,6 +525,10 @@ func UserCacheDir() (string, error) {
+ 		}
+ 		dir += "/lib/cache"
+ 
++	case "nocturne":
++		// /data is the persistent volume.
++		dir = "/data/cache"
++
+ 	default: // Unix
+ 		dir = Getenv("XDG_CACHE_HOME")
+ 		if dir == "" {
+@@ -578,6 +582,10 @@ func UserConfigDir() (string, error) {
+ 		}
+ 		dir += "/lib"
+ 
++	case "nocturne":
++		// /data is the persistent volume; /data/etc holds settings.
++		dir = "/data/etc"
++
+ 	default: // Unix
+ 		dir = Getenv("XDG_CONFIG_HOME")
+ 		if dir == "" {
+@@ -619,6 +627,8 @@ func UserHomeDir() (string, error) {
+ 		return "/sdcard", nil
+ 	case "ios":
+ 		return "/", nil
++	case "nocturne":
++		return "/home", nil
+ 	}
+ 	return "", errors.New(enverr + " is not defined")
+ }
+diff --git a/src/os/file_mutex_nocturne.go b/src/os/file_mutex_nocturne.go
+new file mode 100644
+index 00000000..ebed3d17
+--- /dev/null
++++ b/src/os/file_mutex_nocturne.go
+@@ -0,0 +1,70 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package os
++
++// File locking support for Nocturne. This uses fdMutex from the
++// internal/poll package.
++
++// incref adds a reference to the file. It returns an error if the file
++// is already closed. This method is on File so that we can incorporate
++// a nil test.
++func (f *File) incref(op string) (err error) {
++	if f == nil {
++		return ErrInvalid
++	}
++	if !f.fdmu.Incref() {
++		err = ErrClosed
++		if op != "" {
++			err = &PathError{Op: op, Path: f.name, Err: err}
++		}
++	}
++	return err
++}
++
++// decref removes a reference to the file. If this is the last
++// remaining reference, and the file has been marked to be closed,
++// then actually close it.
++func (file *file) decref() error {
++	if file.fdmu.Decref() {
++		return file.destroy()
++	}
++	return nil
++}
++
++// readLock adds a reference to the file and locks it for reading.
++// It returns an error if the file is already closed.
++func (file *file) readLock() error {
++	if !file.fdmu.ReadLock() {
++		return ErrClosed
++	}
++	return nil
++}
++
++// readUnlock removes a reference from the file and unlocks it for reading.
++// It also closes the file if it marked as closed and there is no remaining
++// reference.
++func (file *file) readUnlock() {
++	if file.fdmu.ReadUnlock() {
++		file.destroy()
++	}
++}
++
++// writeLock adds a reference to the file and locks it for writing.
++// It returns an error if the file is already closed.
++func (file *file) writeLock() error {
++	if !file.fdmu.WriteLock() {
++		return ErrClosed
++	}
++	return nil
++}
++
++// writeUnlock removes a reference from the file and unlocks it for writing.
++// It also closes the file if it is marked as closed and there is no remaining
++// reference.
++func (file *file) writeUnlock() {
++	if file.fdmu.WriteUnlock() {
++		file.destroy()
++	}
++}
+diff --git a/src/os/file_nocturne.go b/src/os/file_nocturne.go
+new file mode 100644
+index 00000000..ff587b36
+--- /dev/null
++++ b/src/os/file_nocturne.go
+@@ -0,0 +1,700 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package os
++
++import (
++	"internal/filepathlite"
++	"internal/poll"
++	"io"
++	"runtime"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"time"
++)
++
++// fixLongPath is a noop on non-Windows platforms.
++func fixLongPath(path string) string {
++	return path
++}
++
++// kindNull marks the null device: Nocturne has no device for it, so a
++// File for DevNull holds no handle, reads nothing and discards writes,
++// and an app launched with it gets no handle in that place.
++const kindNull = -1
++
++// The largest message a Write sends on a channel; longer writes are split.
++const maxMessage = 64 << 10
++
++// file is the real representation of *File.
++// The extra level of indirection ensures that no clients of os
++// can overwrite this data, which could cause the finalizer
++// to close the wrong handle.
++type file struct {
++	fdmu       poll.FDMutex
++	sysfd      int    // the handle; -1 for folders and the null device
++	name       string // as given to Open
++	path       string // full path, "" for a handle not opened by name
++	kind       int    // syscall.KIND_*, kindNull, or 0 when sysfd holds no handle
++	appendMode bool
++	dirinfo    atomic.Pointer[dirInfo] // nil unless folder being read
++
++	// Documents have no shared cursor: off is this File's position.
++	// mu guards it, as reads and writes may run at once.
++	mu  sync.Mutex
++	off int64
++
++	// The unread rest of a channel message longer than a Read's buffer.
++	pending []byte
++
++	// For writes on Stderr when the app was launched without handle 2.
++	logOnce sync.Once
++	logfd   int
++}
++
++// fd is the Nocturne implementation of Fd.
++func (f *File) fd() uintptr {
++	if f == nil {
++		return ^(uintptr(0))
++	}
++	return uintptr(f.sysfd)
++}
++
++func newFile(h int, name, path string, kind int) *File {
++	f := &File{&file{sysfd: h, name: name, path: path, kind: kind, logfd: -1}}
++	runtime.SetFinalizer(f.file, (*file).close)
++	return f
++}
++
++// newFileFromNewFile is called by [NewFile].
++func newFileFromNewFile(fd uintptr, name string) *File {
++	h := int(fd)
++	if h < 0 {
++		return nil
++	}
++	kind, err := syscall.HandleKind(h)
++	if err != nil {
++		kind = 0
++	}
++	return newFile(h, name, "", kind)
++}
++
++// Auxiliary information if the File describes a folder.
++type dirInfo struct {
++	mu      sync.Mutex
++	entries [64]syscall.Entry
++	n       int // entries filled by the last FolderList
++	pos     int // next of them to return
++	next    int // index in the folder of the entry after entries[n-1]
++}
++
++func epipecheck(file *File, e error) {
++}
++
++// DevNull is the name of the operating system's “null device.”
++// On Unix-like systems, it is "/dev/null"; on Windows, "NUL".
++const DevNull = "/dev/null"
++
++// syscallMode returns the syscall-specific mode bits from Go's portable mode bits.
++// Nocturne entries have no permission bits.
++func syscallMode(i FileMode) uint32 {
++	return 0
++}
++
++// openFileNolog is the Nocturne implementation of OpenFile. Documents are
++// opened for reading (DOCUMENT_READ) or for editing (DOCUMENT_EDIT), or are
++// made (DOCUMENT_CREATE); the permission bits have no meaning on Nocturne.
++func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
++	full := syscall.FullPath(name)
++	if full == DevNull {
++		return newFile(-1, name, "", kindNull), nil
++	}
++	write := flag&(O_WRONLY|O_RDWR) != 0
++	access := syscall.DOCUMENT_READ
++	if write {
++		access = syscall.DOCUMENT_EDIT
++	}
++	var (
++		h       int
++		err     error
++		created bool
++	)
++	switch {
++	case flag&O_CREATE != 0 && flag&O_EXCL != 0:
++		h, err = syscall.DocumentOpen(full, syscall.DOCUMENT_CREATE)
++		created = err == nil
++	case flag&O_CREATE != 0:
++		for {
++			h, err = syscall.DocumentOpen(full, access)
++			if err != syscall.ERR_NOT_FOUND {
++				break
++			}
++			h, err = syscall.DocumentOpen(full, syscall.DOCUMENT_CREATE)
++			if err != syscall.ERR_EXISTS {
++				created = err == nil
++				break
++			}
++		}
++	default:
++		h, err = syscall.DocumentOpen(full, access)
++	}
++	if err == syscall.ERR_IS_FOLDER && !write {
++		// Folders are listed by path; the File holds no handle.
++		return newFile(-1, name, full, syscall.KIND_FOLDER), nil
++	}
++	if err != nil {
++		return nil, &PathError{Op: "open", Path: name, Err: err}
++	}
++	if flag&O_TRUNC != 0 && write && !created {
++		if err := syscall.DocumentSetSize(h, 0); err != nil {
++			syscall.Close(h)
++			return nil, &PathError{Op: "truncate", Path: name, Err: err}
++		}
++	}
++	f := newFile(h, name, full, syscall.KIND_DOCUMENT)
++	f.appendMode = flag&O_APPEND != 0
++	return f, nil
++}
++
++func openDirNolog(name string) (*File, error) {
++	f, err := openFileNolog(name, O_RDONLY, 0)
++	if err != nil {
++		return nil, err
++	}
++	if f.kind != syscall.KIND_FOLDER {
++		f.Close()
++		return nil, &PathError{Op: "open", Path: name, Err: syscall.ENOTDIR}
++	}
++	return f, nil
++}
++
++// Close closes the File, rendering it unusable for I/O.
++// On files that support SetDeadline, any pending I/O operations will
++// be canceled and return immediately with an ErrClosed error.
++// Close will return an error if it has already been called.
++func (f *File) Close() error {
++	if f == nil {
++		return ErrInvalid
++	}
++	return f.file.close()
++}
++
++func (file *file) close() error {
++	if !file.fdmu.IncrefAndClose() {
++		return &PathError{Op: "close", Path: file.name, Err: ErrClosed}
++	}
++	err := file.decref()
++
++	// no need for a finalizer anymore
++	runtime.SetFinalizer(file, nil)
++	return err
++}
++
++// destroy actually closes the handle. This is called when
++// there are no remaining references, by the decref, readUnlock,
++// and writeUnlock methods.
++func (file *file) destroy() error {
++	if file.logfd >= 0 {
++		syscall.Close(file.logfd)
++	}
++	if file.sysfd < 0 || file.kind == 0 {
++		return nil
++	}
++	if e := syscall.Close(file.sysfd); e != nil {
++		return &PathError{Op: "close", Path: file.name, Err: e}
++	}
++	return nil
++}
++
++// Stat returns the FileInfo structure describing file.
++// If there is an error, it will be of type [*PathError].
++func (f *File) Stat() (FileInfo, error) {
++	if f == nil {
++		return nil, ErrInvalid
++	}
++	if err := f.incref("stat"); err != nil {
++		return nil, err
++	}
++	defer f.decref()
++	if f.path != "" {
++		var e syscall.Entry
++		if err := syscall.EntryInfo(f.path, &e); err != nil {
++			return nil, &PathError{Op: "stat", Path: f.name, Err: err}
++		}
++		return fileInfoFromEntry(&e, f.path), nil
++	}
++	fs := &fileStat{name: filepathlite.Base(f.name)}
++	switch f.kind {
++	case syscall.KIND_DOCUMENT:
++		size, err := syscall.DocumentSize(f.sysfd)
++		if err != nil {
++			return nil, &PathError{Op: "stat", Path: f.name, Err: err}
++		}
++		fs.size = size
++		fs.mode = 0666
++	case kindNull:
++		fs.mode = ModeDevice | ModeCharDevice | 0666
++	case 0:
++		return nil, &PathError{Op: "stat", Path: f.name, Err: syscall.EBADF}
++	default:
++		// channels and connections carry messages
++		fs.mode = ModeNamedPipe | 0666
++	}
++	return fs, nil
++}
++
++// Truncate changes the size of the file.
++// It does not change the I/O offset.
++// If there is an error, it will be of type [*PathError].
++func (f *File) Truncate(size int64) error {
++	if f == nil {
++		return ErrInvalid
++	}
++	if err := f.incref("truncate"); err != nil {
++		return err
++	}
++	defer f.decref()
++	if f.kind != syscall.KIND_DOCUMENT {
++		return &PathError{Op: "truncate", Path: f.name, Err: syscall.EINVAL}
++	}
++	if err := syscall.DocumentSetSize(f.sysfd, size); err != nil {
++		return &PathError{Op: "truncate", Path: f.name, Err: err}
++	}
++	return nil
++}
++
++// Nocturne entries have no permission bits: chmod checks the File only.
++func (f *File) chmod(mode FileMode) error {
++	return f.checkValid("chmod")
++}
++
++// Sync commits the current contents of the file to stable storage.
++// Nocturne writes reach the document's store when they return.
++func (f *File) Sync() error {
++	return f.checkValid("sync")
++}
++
++// read reads up to len(b) bytes from the File.
++// It returns the number of bytes read and an error, if any.
++func (f *File) read(b []byte) (n int, err error) {
++	if err := f.readLock(); err != nil {
++		return 0, err
++	}
++	defer f.readUnlock()
++	if len(b) == 0 {
++		return 0, nil
++	}
++	switch f.kind {
++	case syscall.KIND_DOCUMENT:
++		f.mu.Lock()
++		n, err = syscall.DocumentReadAt(f.sysfd, b, f.off)
++		f.off += int64(n)
++		f.mu.Unlock()
++		if n == 0 && err == nil {
++			return 0, io.EOF
++		}
++		return n, err
++	case kindNull:
++		return 0, io.EOF
++	case syscall.KIND_FOLDER:
++		return 0, syscall.EISDIR
++	case 0:
++		return 0, syscall.EBADF
++	}
++	return f.receive(b)
++}
++
++// receive reads a channel's messages as a stream of bytes. Only one
++// reader runs at a time (readLock), so pending needs no lock.
++func (file *file) receive(b []byte) (int, error) {
++	if len(file.pending) > 0 {
++		n := copy(b, file.pending)
++		file.pending = file.pending[n:]
++		return n, nil
++	}
++	for {
++		n, attached, err := syscall.ChannelReceive(file.sysfd, b, syscall.CHANNEL_WAIT)
++		if attached >= 0 {
++			// a handle sent along has no place in a byte stream
++			syscall.Close(attached)
++		}
++		switch err {
++		case nil:
++			if n == 0 {
++				continue // an empty message carries no bytes
++			}
++			return n, nil
++		case syscall.ERR_TOO_LARGE:
++			// The message stays queued: take it whole and keep the rest.
++			size, _, err := syscall.ChannelReceive(file.sysfd, nil, syscall.CHANNEL_PEEK|syscall.CHANNEL_WAIT)
++			if err != nil && err != syscall.ERR_TOO_LARGE {
++				return 0, err
++			}
++			msg := make([]byte, size)
++			m, attached, err := syscall.ChannelReceive(file.sysfd, msg, syscall.CHANNEL_WAIT)
++			if attached >= 0 {
++				syscall.Close(attached)
++			}
++			if err == syscall.ERR_TOO_LARGE {
++				continue // another reader took it; the next one is larger
++			}
++			if err != nil {
++				return 0, err
++			}
++			n := copy(b, msg[:m])
++			file.pending = msg[n:m]
++			return n, nil
++		case syscall.ERR_CLOSED:
++			return 0, io.EOF
++		default:
++			return 0, err
++		}
++	}
++}
++
++// pread reads len(b) bytes from the File starting at byte offset off.
++// It returns the number of bytes read and the error, if any.
++// EOF is signaled by a zero count with err set to nil.
++func (f *File) pread(b []byte, off int64) (n int, err error) {
++	if err := f.readLock(); err != nil {
++		return 0, err
++	}
++	defer f.readUnlock()
++	if f.kind != syscall.KIND_DOCUMENT {
++		return 0, syscall.ESPIPE
++	}
++	n, err = syscall.DocumentReadAt(f.sysfd, b, off)
++	if n == 0 && len(b) > 0 && err == nil {
++		return 0, io.EOF
++	}
++	return n, err
++}
++
++// write writes len(b) bytes to the File.
++// It returns the number of bytes written and an error, if any.
++// A channel carries each Write as messages; an empty Write sends none.
++func (f *File) write(b []byte) (n int, err error) {
++	if err := f.writeLock(); err != nil {
++		return 0, err
++	}
++	defer f.writeUnlock()
++	if len(b) == 0 {
++		return 0, nil
++	}
++	switch f.kind {
++	case syscall.KIND_DOCUMENT:
++		f.mu.Lock()
++		defer f.mu.Unlock()
++		if f.appendMode {
++			size, err := syscall.DocumentSize(f.sysfd)
++			if err != nil {
++				return 0, err
++			}
++			f.off = size
++		}
++		n, err = writeAt(f.sysfd, b, f.off)
++		f.off += int64(n)
++		return n, err
++	case kindNull:
++		return len(b), nil
++	case syscall.KIND_FOLDER:
++		return 0, syscall.EISDIR
++	case 0:
++		if f.sysfd != syscall.Stderr {
++			return 0, syscall.EBADF
++		}
++		// Without handle 2, the log goes to the system log.
++		f.logOnce.Do(func() {
++			f.logfd, _ = syscall.SystemLogOpen()
++		})
++		if f.logfd < 0 {
++			return 0, syscall.EBADF
++		}
++		return send(f.logfd, b)
++	}
++	return send(f.sysfd, b)
++}
++
++func writeAt(h int, b []byte, off int64) (n int, err error) {
++	for n < len(b) {
++		m, err := syscall.DocumentWriteAt(h, b[n:], off+int64(n))
++		n += m
++		if err != nil {
++			return n, err
++		}
++		if m == 0 {
++			return n, io.ErrShortWrite
++		}
++	}
++	return n, nil
++}
++
++func send(h int, b []byte) (n int, err error) {
++	for n < len(b) {
++		chunk := b[n:]
++		if len(chunk) > maxMessage {
++			chunk = chunk[:maxMessage]
++		}
++		if _, err := syscall.ChannelSend(h, chunk, -1); err != nil {
++			return n, err
++		}
++		n += len(chunk)
++	}
++	return n, nil
++}
++
++// pwrite writes len(b) bytes to the File starting at byte offset off.
++// It returns the number of bytes written and an error, if any.
++func (f *File) pwrite(b []byte, off int64) (n int, err error) {
++	if err := f.writeLock(); err != nil {
++		return 0, err
++	}
++	defer f.writeUnlock()
++	if f.kind != syscall.KIND_DOCUMENT {
++		return 0, syscall.ESPIPE
++	}
++	return writeAt(f.sysfd, b, off)
++}
++
++// seek sets the offset for the next Read or Write on file to offset, interpreted
++// according to whence: 0 means relative to the origin of the file, 1 means
++// relative to the current offset, and 2 means relative to the end.
++// It returns the new offset and an error, if any.
++func (f *File) seek(offset int64, whence int) (ret int64, err error) {
++	if err := f.incref(""); err != nil {
++		return 0, err
++	}
++	defer f.decref()
++	// Free cached dirinfo, so we allocate a new one if we
++	// access this file as a directory again. See #35767 and #37161.
++	f.dirinfo.Store(nil)
++	if f.kind == syscall.KIND_FOLDER && offset == 0 && whence == io.SeekStart {
++		return 0, nil
++	}
++	if f.kind != syscall.KIND_DOCUMENT {
++		return 0, syscall.ESPIPE
++	}
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	switch whence {
++	case io.SeekStart:
++	case io.SeekCurrent:
++		offset += f.off
++	case io.SeekEnd:
++		size, err := syscall.DocumentSize(f.sysfd)
++		if err != nil {
++			return 0, err
++		}
++		offset += size
++	default:
++		return 0, syscall.EINVAL
++	}
++	if offset < 0 {
++		return 0, syscall.EINVAL
++	}
++	f.off = offset
++	return offset, nil
++}
++
++// Truncate changes the size of the named file.
++// If there is an error, it will be of type [*PathError].
++func Truncate(name string, size int64) error {
++	h, err := syscall.DocumentOpen(name, syscall.DOCUMENT_EDIT)
++	if err == nil {
++		err = syscall.DocumentSetSize(h, size)
++		syscall.Close(h)
++	}
++	if err != nil {
++		return &PathError{Op: "truncate", Path: name, Err: err}
++	}
++	return nil
++}
++
++// Remove removes the named file or directory.
++// If there is an error, it will be of type [*PathError].
++func Remove(name string) error {
++	if e := syscall.EntryRemove(name); e != nil {
++		return &PathError{Op: "remove", Path: name, Err: e}
++	}
++	return nil
++}
++
++// rename moves an entry. Nocturne never moves onto an existing name; as
++// Rename replaces an existing document, a document in the way is removed
++// first.
++func rename(oldname, newname string) error {
++	err := syscall.EntryMove(oldname, newname)
++	if err == syscall.ERR_EXISTS {
++		var from, to syscall.Entry
++		if syscall.EntryInfo(oldname, &from) == nil && from.Kind != syscall.KIND_FOLDER &&
++			syscall.EntryInfo(newname, &to) == nil && to.Kind != syscall.KIND_FOLDER {
++			if err = syscall.EntryRemove(newname); err == nil {
++				err = syscall.EntryMove(oldname, newname)
++			}
++		}
++	}
++	if err != nil {
++		return &LinkError{"rename", oldname, newname, err}
++	}
++	return nil
++}
++
++// See docs in file.go:Chmod. Nocturne entries have no permission bits.
++func chmod(name string, mode FileMode) error {
++	var e syscall.Entry
++	if err := syscall.EntryInfo(name, &e); err != nil {
++		return &PathError{Op: "chmod", Path: name, Err: err}
++	}
++	return nil
++}
++
++// Chtimes changes the access and modification times of the named
++// file, similar to the Unix utime() or utimes() functions.
++// A zero time.Time value will leave the corresponding file time unchanged.
++//
++// Nocturne sets an entry's modification time when it is written;
++// Chtimes returns [syscall.ENOTSUP] wrapped in [*PathError].
++func Chtimes(name string, atime time.Time, mtime time.Time) error {
++	return &PathError{Op: "chtimes", Path: name, Err: syscall.ENOTSUP}
++}
++
++// Pipe returns a connected pair of Files; reads from r return bytes
++// written to w. It returns the files and an error, if any.
++// The pair is a Nocturne channel.
++func Pipe() (r *File, w *File, err error) {
++	a, b, e := syscall.ChannelPair()
++	if e != nil {
++		return nil, nil, NewSyscallError("pipe", e)
++	}
++	return newFile(a, "|0", "", syscall.KIND_CHANNEL), newFile(b, "|1", "", syscall.KIND_CHANNEL), nil
++}
++
++// not supported on Nocturne
++
++// Link creates newname as a hard link to the oldname file.
++// If there is an error, it will be of type *LinkError.
++func Link(oldname, newname string) error {
++	return &LinkError{"link", oldname, newname, syscall.ENOTSUP}
++}
++
++// Symlink creates newname as a symbolic link to oldname.
++// If there is an error, it will be of type *LinkError.
++func Symlink(oldname, newname string) error {
++	return &LinkError{"symlink", oldname, newname, syscall.ENOTSUP}
++}
++
++func readlink(name string) (string, error) {
++	return "", &PathError{Op: "readlink", Path: name, Err: syscall.ENOTSUP}
++}
++
++// Chown changes the numeric uid and gid of the named file.
++// Nocturne has no owners: Chown returns [syscall.ENOTSUP] wrapped in [*PathError].
++func Chown(name string, uid, gid int) error {
++	return &PathError{Op: "chown", Path: name, Err: syscall.ENOTSUP}
++}
++
++// Lchown changes the numeric uid and gid of the named file.
++// If there is an error, it will be of type [*PathError].
++func Lchown(name string, uid, gid int) error {
++	return &PathError{Op: "lchown", Path: name, Err: syscall.ENOTSUP}
++}
++
++// Chown changes the numeric uid and gid of the named file.
++// If there is an error, it will be of type [*PathError].
++func (f *File) Chown(uid, gid int) error {
++	if f == nil {
++		return ErrInvalid
++	}
++	return &PathError{Op: "chown", Path: f.name, Err: syscall.ENOTSUP}
++}
++
++func tempDir() string {
++	dir := Getenv("TMPDIR")
++	if dir == "" {
++		dir = "/tmp"
++	}
++	return dir
++}
++
++// Chdir changes the current folder to the file,
++// which must be a folder.
++// If there is an error, it will be of type [*PathError].
++func (f *File) Chdir() error {
++	if err := f.incref("chdir"); err != nil {
++		return err
++	}
++	defer f.decref()
++	err := error(syscall.ENOTDIR)
++	if f.kind == syscall.KIND_FOLDER {
++		err = syscall.Chdir(f.path)
++	}
++	if err != nil {
++		return &PathError{Op: "chdir", Path: f.name, Err: err}
++	}
++	return nil
++}
++
++// setDeadline sets the read and write deadline.
++func (f *File) setDeadline(time.Time) error {
++	if err := f.checkValid("SetDeadline"); err != nil {
++		return err
++	}
++	return poll.ErrNoDeadline
++}
++
++// setReadDeadline sets the read deadline.
++func (f *File) setReadDeadline(time.Time) error {
++	if err := f.checkValid("SetReadDeadline"); err != nil {
++		return err
++	}
++	return poll.ErrNoDeadline
++}
++
++// setWriteDeadline sets the write deadline.
++func (f *File) setWriteDeadline(time.Time) error {
++	if err := f.checkValid("SetWriteDeadline"); err != nil {
++		return err
++	}
++	return poll.ErrNoDeadline
++}
++
++// checkValid checks whether f is valid for use, but does not prepare
++// to actually use it. If f is not ready checkValid returns an appropriate
++// error, perhaps incorporating the operation name op.
++func (f *File) checkValid(op string) error {
++	if f == nil {
++		return ErrInvalid
++	}
++	if err := f.incref(op); err != nil {
++		return err
++	}
++	return f.decref()
++}
++
++type rawConn struct{}
++
++func (c *rawConn) Control(f func(uintptr)) error {
++	return syscall.ENOTSUP
++}
++
++func (c *rawConn) Read(f func(uintptr) bool) error {
++	return syscall.ENOTSUP
++}
++
++func (c *rawConn) Write(f func(uintptr) bool) error {
++	return syscall.ENOTSUP
++}
++
++func newRawConn(file *File) (*rawConn, error) {
++	return nil, syscall.ENOTSUP
++}
++
++func ignoringEINTR(fn func() error) error {
++	return fn()
++}
++
++func ignoringEINTR2[T any](fn func() (T, error)) (T, error) {
++	return fn()
++}
+diff --git a/src/os/path_unix.go b/src/os/path_unix.go
+index 0189bcd2..83bb6e57 100644
+--- a/src/os/path_unix.go
++++ b/src/os/path_unix.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build unix || (js && wasm) || wasip1
++//go:build unix || (js && wasm) || nocturne || wasip1
+ 
+ package os
+ 
+diff --git a/src/os/rawconn.go b/src/os/rawconn.go
+index 14a495d9..7f42d6f0 100644
+--- a/src/os/rawconn.go
++++ b/src/os/rawconn.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build !plan9
++//go:build !nocturne && !plan9
+ 
+ package os
+ 
+diff --git a/src/os/removeall_noat.go b/src/os/removeall_noat.go
+index 8e23df94..c026d09c 100644
+--- a/src/os/removeall_noat.go
++++ b/src/os/removeall_noat.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build (js && wasm) || plan9
++//go:build (js && wasm) || nocturne || plan9
+ 
+ package os
+ 
+diff --git a/src/os/root_nocturne.go b/src/os/root_nocturne.go
+new file mode 100644
+index 00000000..1b0aa866
+--- /dev/null
++++ b/src/os/root_nocturne.go
+@@ -0,0 +1,25 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//go:build nocturne
++
++package os
++
++import (
++	"internal/filepathlite"
++)
++
++func checkPathEscapes(r *Root, name string) error {
++	if r.root.closed.Load() {
++		return ErrClosed
++	}
++	if !filepathlite.IsLocal(name) {
++		return errPathEscapes
++	}
++	return nil
++}
++
++func checkPathEscapesLstat(r *Root, name string) error {
++	return checkPathEscapes(r, name)
++}
+diff --git a/src/os/root_noopenat.go b/src/os/root_noopenat.go
+index f2513182..39dee193 100644
+--- a/src/os/root_noopenat.go
++++ b/src/os/root_noopenat.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build (js && wasm) || plan9
++//go:build (js && wasm) || nocturne || plan9
+ 
+ package os
+ 
+diff --git a/src/os/signal/signal_nocturne.go b/src/os/signal/signal_nocturne.go
+new file mode 100644
+index 00000000..054536cf
+--- /dev/null
++++ b/src/os/signal/signal_nocturne.go
+@@ -0,0 +1,19 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package signal
++
++import "os"
++
++// Nocturne has no signals: an app is stopped through its app handle, and
++// it ends at once. Notify accepts any os.Signal, and none ever arrives.
++
++const numSig = 0
++
++func signum(sig os.Signal) int { return -1 }
++
++func enableSignal(sig int)       {}
++func disableSignal(sig int)      {}
++func ignoreSignal(sig int)       {}
++func signalIgnored(sig int) bool { return false }
+diff --git a/src/os/stat_nocturne.go b/src/os/stat_nocturne.go
+new file mode 100644
+index 00000000..72dcd473
+--- /dev/null
++++ b/src/os/stat_nocturne.go
+@@ -0,0 +1,71 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package os
++
++import (
++	"internal/filepathlite"
++	"syscall"
++	"time"
++)
++
++// fileInfoFromEntry describes the entry at full path path. Nocturne
++// entries have no permission bits; the mode shows what an app may do.
++func fileInfoFromEntry(e *syscall.Entry, path string) *fileStat {
++	name := e.EntryName()
++	if name == "" {
++		name = filepathlite.Base(path)
++	}
++	fs := &fileStat{
++		name:    name,
++		path:    path,
++		size:    int64(e.Size),
++		modTime: time.Unix(e.Modified, 0),
++		sys:     e,
++	}
++	switch e.Kind {
++	case syscall.KIND_FOLDER:
++		fs.mode = ModeDir | 0777
++		fs.size = 0
++	case syscall.KIND_DEVICE:
++		fs.mode = ModeDevice | 0666
++	default:
++		fs.mode = 0666
++	}
++	return fs
++}
++
++func joinFolder(folder, name string) string {
++	if folder != "" && folder[len(folder)-1] == '/' {
++		return folder + name
++	}
++	return folder + "/" + name
++}
++
++// statNolog implements Stat for Nocturne.
++func statNolog(name string) (FileInfo, error) {
++	full := syscall.FullPath(name)
++	if full == DevNull {
++		return &fileStat{name: "null", path: full, mode: ModeDevice | ModeCharDevice | 0666}, nil
++	}
++	e := new(syscall.Entry)
++	if err := syscall.EntryInfo(full, e); err != nil {
++		return nil, &PathError{Op: "stat", Path: name, Err: err}
++	}
++	return fileInfoFromEntry(e, filepathlite.Clean(full)), nil
++}
++
++// lstatNolog implements Lstat for Nocturne, which has no links.
++func lstatNolog(name string) (FileInfo, error) {
++	fi, err := statNolog(name)
++	if err != nil {
++		err.(*PathError).Op = "lstat"
++	}
++	return fi, err
++}
++
++// For testing.
++func atime(fi FileInfo) time.Time {
++	return fi.ModTime()
++}
+diff --git a/src/os/statat_other.go b/src/os/statat_other.go
+index 673ae21a..146d031c 100644
+--- a/src/os/statat_other.go
++++ b/src/os/statat_other.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build (js && wasm) || plan9
++//go:build (js && wasm) || nocturne || plan9
+ 
+ package os
+ 
+diff --git a/src/os/sys_nocturne.go b/src/os/sys_nocturne.go
+new file mode 100644
+index 00000000..df3ddc02
+--- /dev/null
++++ b/src/os/sys_nocturne.go
+@@ -0,0 +1,14 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package os
++
++// hostname returns the setting HOSTNAME; a Nocturne machine has no name
++// of its own otherwise.
++func hostname() (name string, err error) {
++	if name = Getenv("HOSTNAME"); name != "" {
++		return name, nil
++	}
++	return "nocturne", nil
++}
+diff --git a/src/os/types_nocturne.go b/src/os/types_nocturne.go
+new file mode 100644
+index 00000000..eee9d308
+--- /dev/null
++++ b/src/os/types_nocturne.go
+@@ -0,0 +1,27 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package os
++
++import "time"
++
++// A fileStat is the implementation of FileInfo returned by Stat and Lstat.
++type fileStat struct {
++	name    string
++	path    string // full path; "" for a handle not opened by name
++	size    int64
++	mode    FileMode
++	modTime time.Time
++	sys     any
++}
++
++func (fs *fileStat) Size() int64        { return fs.size }
++func (fs *fileStat) Mode() FileMode     { return fs.mode }
++func (fs *fileStat) ModTime() time.Time { return fs.modTime }
++func (fs *fileStat) Sys() any           { return fs.sys }
++
++// Nocturne has no links: an entry is the same file only under the same path.
++func sameFile(fs1, fs2 *fileStat) bool {
++	return fs1.path != "" && fs1.path == fs2.path
++}
+diff --git a/src/os/types_unix.go b/src/os/types_unix.go
+index 1b90a5a1..ab91db66 100644
+--- a/src/os/types_unix.go
++++ b/src/os/types_unix.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build !windows && !plan9
++//go:build !windows && !nocturne && !plan9
+ 
+ package os
+ 
+diff --git a/src/os/user/lookup_nocturne.go b/src/os/user/lookup_nocturne.go
+new file mode 100644
+index 00000000..2b881ad2
+--- /dev/null
++++ b/src/os/user/lookup_nocturne.go
+@@ -0,0 +1,56 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package user
++
++import (
++	"os"
++	"syscall"
++)
++
++// Nocturne has one person at the machine and no user or group database.
++// Current describes them by the settings USER and HOME; Lookup and the
++// group calls are not supported.
++
++func init() {
++	userImplemented = false
++	groupImplemented = false
++	groupListImplemented = false
++}
++
++var (
++	// unused variables (in this implementation)
++	// modified during test to exercise code paths in the cgo implementation.
++	userBuffer  = 0
++	groupBuffer = 0
++)
++
++func current() (*User, error) {
++	name := os.Getenv("USER")
++	if name == "" {
++		name = "nocturne"
++	}
++	home, _ := os.UserHomeDir()
++	return &User{Uid: "0", Gid: "0", Username: name, Name: name, HomeDir: home}, nil
++}
++
++func lookupUser(username string) (*User, error) {
++	return nil, syscall.ENOTSUP
++}
++
++func lookupUserId(uid string) (*User, error) {
++	return nil, syscall.ENOTSUP
++}
++
++func lookupGroup(groupname string) (*Group, error) {
++	return nil, syscall.ENOTSUP
++}
++
++func lookupGroupId(string) (*Group, error) {
++	return nil, syscall.ENOTSUP
++}
++
++func listGroups(*User) ([]string, error) {
++	return nil, syscall.ENOTSUP
++}
+diff --git a/src/os/user/lookup_stubs.go b/src/os/user/lookup_stubs.go
+index 89dfe455..b926ddd8 100644
+--- a/src/os/user/lookup_stubs.go
++++ b/src/os/user/lookup_stubs.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build (!cgo && !darwin && !windows && !plan9) || android || (osusergo && !windows && !plan9)
++//go:build (!cgo && !darwin && !nocturne && !windows && !plan9) || android || (osusergo && !nocturne && !windows && !plan9)
+ 
+ package user
+ 
+diff --git a/src/path/filepath/path_unix.go b/src/path/filepath/path_unix.go
+index 6bc974db..cf000af8 100644
+--- a/src/path/filepath/path_unix.go
++++ b/src/path/filepath/path_unix.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build unix || (js && wasm) || wasip1
++//go:build unix || (js && wasm) || nocturne || wasip1
+ 
+ package filepath
+ 
+diff --git a/src/runtime/lock_futex.go b/src/runtime/lock_futex.go
+index 1cf146b4..0273d825 100644
+--- a/src/runtime/lock_futex.go
++++ b/src/runtime/lock_futex.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build dragonfly || freebsd || linux
++//go:build dragonfly || freebsd || linux || nocturne
+ 
+ package runtime
+ 
+diff --git a/src/runtime/malloc.go b/src/runtime/malloc.go
+index 8c5ec383..0b35b8ae 100644
+--- a/src/runtime/malloc.go
++++ b/src/runtime/malloc.go
+@@ -598,6 +598,11 @@ func mallocinit() {
+ 		}
+ 
+ 		for i := 0x7f; i >= 0; i-- {
++			if GOOS == "nocturne" {
++				// Nocturne chooses the address of every reservation,
++				// so no hint can be honored.
++				break
++			}
+ 			var p uintptr
+ 			switch {
+ 			case raceenabled && GOARCH == "riscv64" && vmaSize == 39:
+diff --git a/src/runtime/mem_nocturne.go b/src/runtime/mem_nocturne.go
+new file mode 100644
+index 00000000..6683b825
+--- /dev/null
++++ b/src/runtime/mem_nocturne.go
+@@ -0,0 +1,80 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package runtime
++
++import "unsafe"
++
++// Nocturne memory. A reservation is a demand-zero shared object mapped
++// read-write: its pages take frames only when first touched, so reserving
++// address space costs no memory and a reserved range is already usable.
++// The system chooses every address (see mallocinit), and a mapping is
++// released only as a whole.
++
++// nocturneReserve maps n bytes of demand-zero memory, or returns nil.
++//
++//go:nosplit
++func nocturneReserve(n uintptr) unsafe.Pointer {
++	h := syscall5(_SYS_SHARED_RESERVE, n, 0, 0, 0, 0)
++	if h < 0 {
++		return nil
++	}
++	// The mapping keeps the object; the handle is not needed.
++	va := syscall5(_SYS_SHARED_MAP, uintptr(h), n, _N_MEMORY_READ_WRITE, 0, 0)
++	syscall5(_SYS_HANDLE_CLOSE, uintptr(h), 0, 0, 0, 0)
++	if va <= 0 {
++		return nil
++	}
++	return unsafe.Pointer(uintptr(va))
++}
++
++// Don't split the stack as this function may be invoked without a valid G,
++// which prevents us from allocating more stack.
++//
++//go:nosplit
++func sysAllocOS(n uintptr, _ string) unsafe.Pointer {
++	return nocturneReserve(n)
++}
++
++func sysUnusedOS(v unsafe.Pointer, n uintptr) {
++	// The pages stay with the app until it releases the whole mapping.
++}
++
++func sysUsedOS(v unsafe.Pointer, n uintptr) {
++}
++
++func sysHugePageOS(v unsafe.Pointer, n uintptr) {
++}
++
++func sysNoHugePageOS(v unsafe.Pointer, n uintptr) {
++}
++
++func sysHugePageCollapseOS(v unsafe.Pointer, n uintptr) {
++}
++
++// Don't split the stack as this function may be invoked without a valid G,
++// which prevents us from allocating more stack.
++//
++//go:nosplit
++func sysFreeOS(v unsafe.Pointer, n uintptr) {
++	// Only a whole mapping can be released. Part of one (the trimmed
++	// ends of an aligned reservation) stays reserved, and costs nothing
++	// while untouched.
++	syscall5(_SYS_MEMORY_RELEASE, uintptr(v), n, 0, 0, 0)
++}
++
++func sysFaultOS(v unsafe.Pointer, n uintptr) {
++}
++
++func sysReserveOS(v unsafe.Pointer, n uintptr, _ string) unsafe.Pointer {
++	return nocturneReserve(n)
++}
++
++func sysMapOS(v unsafe.Pointer, n uintptr, _ string) {
++	// A reservation is already mapped read-write.
++}
++
++func needZeroAfterSysUnusedOS() bool {
++	return true
++}
+diff --git a/src/runtime/netpoll_stub.go b/src/runtime/netpoll_stub.go
+index dc5d708b..c2fda249 100644
+--- a/src/runtime/netpoll_stub.go
++++ b/src/runtime/netpoll_stub.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build plan9
++//go:build plan9 || nocturne
+ 
+ package runtime
+ 
+diff --git a/src/runtime/os_nocturne.go b/src/runtime/os_nocturne.go
+new file mode 100644
+index 00000000..5f226169
+--- /dev/null
++++ b/src/runtime/os_nocturne.go
+@@ -0,0 +1,428 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package runtime
++
++import (
++	"internal/abi"
++	"internal/runtime/atomic"
++	"internal/runtime/sys"
++	"unsafe"
++)
++
++// Nocturne system calls (common/abi.h of Nocturne). A failed call returns
++// a negated Nocturne result code.
++const (
++	_SYS_SLEEP               = 19
++	_SYS_UPTIME              = 20
++	_SYS_TIME                = 21
++	_SYS_CPU_INFO            = 38
++	_SYS_CLOCK_INFO          = 44
++	_SYS_THREAD_CREATE       = 45
++	_SYS_WAIT_ADDRESS        = 48
++	_SYS_WAKE_ADDRESS        = 49
++	_SYS_THREAD_STACK_BOUNDS = 58
++	_SYS_SHARED_RESERVE      = 88
++	_SYS_HANDLE_CLOSE        = 128
++	_SYS_DOCUMENT_OPEN       = 130
++	_SYS_DOCUMENT_WRITE_AT   = 132
++	_SYS_DOCUMENT_SIZE       = 133
++	_SYS_CHANNEL_SEND        = 145
++	_SYS_CHANNEL_RECEIVE     = 146
++	_SYS_SYSTEM_LOG_OPEN     = 160
++	_SYS_RANDOM              = 165
++	_SYS_MEMORY_RELEASE      = 167
++	_SYS_SHARED_MAP          = 169
++)
++
++const (
++	_N_ERR_WRONG_KIND = 6
++	_N_ERR_NO_HANDLE  = 7
++
++	_N_MEMORY_READ_WRITE = 2
++	_N_DOCUMENT_READ     = 1
++	_N_CHANNEL_WAIT      = 1
++
++	_N_CLOCK_USER_TSC     = 1
++	_N_CLOCK_HV_REFERENCE = 2
++)
++
++// syscall5 makes Nocturne system call n.
++//
++//go:noescape
++func syscall5(n, a1, a2, a3, a4, a5 uintptr) int64
++
++// The first instruction of a new thread (sys_nocturne_amd64.s).
++func tstart_nocturne()
++
++// nocturneSettings is the program's null-terminated "NAME=value" list,
++// recorded by _rt0_amd64_nocturne.
++var nocturneSettings unsafe.Pointer
++
++type mOS struct {
++	waitsema uint32 // semaphore for parking on locks
++}
++
++// ---- clocks ----
++
++// struct n_clockinfo
++type nocturneClockInfo struct {
++	version, flags  uint32
++	tscHz           uint64
++	tscSample       uint64
++	uptimeMs        uint64
++	referencePage   uint64
++	referenceSample uint64 // 100ns units
++}
++
++// struct n_reference_tsc, the Hyper-V reference page
++type nocturneReferenceTSC struct {
++	sequence uint32
++	reserved uint32
++	scale    uint64
++	offset   uint64
++}
++
++var nocturneClock nocturneClockInfo
++
++// nocturneWallBase is the wall clock in nanoseconds minus nanotime, taken
++// at start: the system wall clock counts whole seconds.
++var nocturneWallBase int64
++
++//go:nosplit
++func nanotime1() int64 {
++	c := &nocturneClock
++	if c.flags&_N_CLOCK_HV_REFERENCE != 0 && c.referencePage != 0 {
++		p := (*nocturneReferenceTSC)(unsafe.Pointer(uintptr(c.referencePage)))
++		for attempt := 0; attempt < 4; attempt++ {
++			sequence := atomic.Load(&p.sequence)
++			if sequence == 0 {
++				break
++			}
++			tsc := uint64(cputicks())
++			scale := atomic.Load64(&p.scale)
++			offset := atomic.Load64(&p.offset)
++			if sequence != atomic.Load(&p.sequence) {
++				continue
++			}
++			hi, _ := mul64(tsc, scale)
++			reference := hi + offset
++			if reference < c.referenceSample {
++				break
++			}
++			return int64(c.uptimeMs)*1e6 + int64(reference-c.referenceSample)*100
++		}
++	} else if c.flags&_N_CLOCK_USER_TSC != 0 && c.tscHz >= 1e6 {
++		now := uint64(cputicks())
++		if now >= c.tscSample {
++			d := now - c.tscSample
++			return int64(c.uptimeMs)*1e6 + int64(d/c.tscHz)*1e9 + int64(d%c.tscHz*1e9/c.tscHz)
++		}
++	}
++	return syscall5(_SYS_UPTIME, 0, 0, 0, 0, 0) * 1e6
++}
++
++// mul64 returns the 128-bit product of x and y.
++//
++//go:nosplit
++func mul64(x, y uint64) (hi, lo uint64) {
++	const mask32 = 1<<32 - 1
++	x0 := x & mask32
++	x1 := x >> 32
++	y0 := y & mask32
++	y1 := y >> 32
++	w0 := x0 * y0
++	t := x1*y0 + w0>>32
++	w1 := t & mask32
++	w2 := t >> 32
++	w1 += x0 * y1
++	hi = x1*y1 + w2 + w1>>32
++	lo = x * y
++	return
++}
++
++//go:nosplit
++func walltime() (sec int64, nsec int32) {
++	ns := nocturneWallBase + nanotime1()
++	return ns / 1e9, int32(ns % 1e9)
++}
++
++// ---- threads ----
++
++func futexsleep(addr *uint32, val uint32, ns int64) {
++	ms := uintptr(^uint32(0)) // no time limit
++	if ns >= 0 {
++		ms = uintptr((ns + 999999) / 1000000)
++		if ms >= uintptr(^uint32(0)) {
++			ms = uintptr(^uint32(0)) - 1
++		}
++	}
++	syscall5(_SYS_WAIT_ADDRESS, uintptr(unsafe.Pointer(addr)), uintptr(val), ms, 0, 0)
++}
++
++//go:nosplit
++func futexwakeup(addr *uint32, cnt uint32) {
++	if cnt == 0 {
++		return // Nocturne would wake every waiter
++	}
++	syscall5(_SYS_WAKE_ADDRESS, uintptr(unsafe.Pointer(addr)), uintptr(cnt), 0, 0, 0)
++}
++
++// struct n_cpuinfo
++type nocturneCPUInfo struct {
++	version, detected, online, workers, scheduler, flags uint32
++	parallelJobs, workerChunks                           uint64
++}
++
++func getCPUCount() int32 {
++	var info nocturneCPUInfo
++	if syscall5(_SYS_CPU_INFO, uintptr(unsafe.Pointer(&info)), 0, 0, 0, 0) < 0 || info.scheduler == 0 {
++		return 1
++	}
++	return int32(info.scheduler)
++}
++
++// May run with m.p==nil, so write barriers are not allowed.
++//
++//go:nowritebarrier
++func newosproc(mp *m) {
++	// The thread gets a stack of its own from the system
++	// (mStackIsSystemAllocated) and starts in tstart_nocturne.
++	r := syscall5(_SYS_THREAD_CREATE, abi.FuncPCABI0(mstart), uintptr(unsafe.Pointer(mp)), abi.FuncPCABI0(tstart_nocturne), 0, 0)
++	if r < 0 {
++		print("runtime: failed to create new OS thread (have ", mcount(), " already; result ", -r, ")\n")
++		throw("newosproc")
++	}
++}
++
++//go:nosplit
++func newosproc0(stacksize uintptr, fn unsafe.Pointer) {
++	throw("newosproc0: not implemented")
++}
++
++//go:nosplit
++func exitThread(wait *atomic.Uint32)
++
++// Called to initialize a new m (including the bootstrap m).
++// Called on the parent thread (main thread in case of bootstrap), can allocate memory.
++func mpreinit(mp *m) {
++	mp.gsignal = malg(32 * 1024)
++	mp.gsignal.m = mp
++}
++
++// Called to initialize a new m (including the bootstrap m).
++// Called on the new thread, cannot allocate memory.
++func minit() {
++	gp := getg()
++	if gp.m == &m0 {
++		return // rt0_go took its g0 stack from the main stack
++	}
++	// mstart0 guessed the bounds of the system stack; take the real ones.
++	var lo, hi uintptr
++	if syscall5(_SYS_THREAD_STACK_BOUNDS, uintptr(unsafe.Pointer(&lo)), uintptr(unsafe.Pointer(&hi)), 0, 0, 0) < 0 {
++		return
++	}
++	g0 := gp.m.g0
++	sp := sys.GetCallerSP()
++	if sp <= lo || sp > hi || g0.stack.hi > hi {
++		print("runtime: thread stack [", hex(lo), ", ", hex(hi), ") does not hold sp ", hex(sp), "\n")
++		throw("minit: bad thread stack")
++	}
++	g0.stack.lo = lo
++	g0.stackguard0 = g0.stack.lo + stackGuard
++	g0.stackguard1 = g0.stackguard0
++}
++
++// Called from dropm to undo the effect of an minit.
++func unminit() {
++}
++
++// Called from mexit, but not from dropm, to undo the effect of thread-owned
++// resources in minit, semacreate, or elsewhere. Do not take locks after calling this.
++//
++//go:nowritebarrierrec
++func mdestroy(mp *m) {
++}
++
++//go:nosplit
++func osyield()
++
++//go:nosplit
++func osyield_no_g() {
++	osyield()
++}
++
++// usleep sleeps for at least usec microseconds. The system sleeps in whole
++// milliseconds, so a short sleep yields the CPU instead.
++//
++//go:nosplit
++func usleep(usec uint32) {
++	if usec < 100 {
++		osyield()
++		return
++	}
++	syscall5(_SYS_SLEEP, uintptr((usec+999)/1000), 0, 0, 0, 0)
++}
++
++//go:nosplit
++func usleep_no_g(usec uint32) {
++	usleep(usec)
++}
++
++// ---- start and end ----
++
++func osinit() {
++	numCPUStartup = getCPUCount()
++	physPageSize = 4096
++	nocturneClock.version = 1
++	if syscall5(_SYS_CLOCK_INFO, uintptr(unsafe.Pointer(&nocturneClock)), 0, 0, 0, 0) < 0 {
++		nocturneClock = nocturneClockInfo{}
++	}
++	nocturneWallBase = syscall5(_SYS_TIME, 0, 0, 0, 0, 0)*1e9 - nanotime1()
++}
++
++func goenvs() {
++	if nocturneSettings == nil {
++		return
++	}
++	settings := (**byte)(nocturneSettings)
++	n := int32(0)
++	for argv_index(settings, n) != nil {
++		n++
++	}
++	envs = make([]string, n)
++	for i := int32(0); i < n; i++ {
++		envs[i] = gostring(argv_index(settings, i))
++	}
++}
++
++//go:nosplit
++func exit(code int32)
++
++func readRandom(r []byte) int {
++	if len(r) == 0 || syscall5(_SYS_RANDOM, uintptr(unsafe.Pointer(&r[0])), uintptr(len(r)), 0, 0, 0) < 0 {
++		return 0
++	}
++	return len(r)
++}
++
++//go:nosplit
++//go:nowritebarrierrec
++func libpreinit() {}
++
++func crash() {
++	abort()
++}
++
++// ---- handles used by the runtime itself ----
++
++// nocturneLog is the system log handle, opened when the app has no log
++// handle 2 for the runtime's own messages; -1 until then.
++var nocturneLog int32 = -1
++
++// write1 sends a message on output handle fd. A document handle takes the
++// bytes at its end.
++//
++//go:nosplit
++func write1(fd uintptr, p unsafe.Pointer, n int32) int32 {
++	r := syscall5(_SYS_CHANNEL_SEND, fd, uintptr(p), uintptr(n), ^uintptr(0), 0)
++	if r == -_N_ERR_NO_HANDLE && fd == 2 {
++		h := atomic.Load((*uint32)(unsafe.Pointer(&nocturneLog)))
++		if int32(h) < 0 {
++			opened := syscall5(_SYS_SYSTEM_LOG_OPEN, 0, 0, 0, 0, 0)
++			if opened < 0 {
++				return int32(r)
++			}
++			if !atomic.Cas((*uint32)(unsafe.Pointer(&nocturneLog)), h, uint32(opened)) {
++				syscall5(_SYS_HANDLE_CLOSE, uintptr(opened), 0, 0, 0, 0)
++			}
++			h = atomic.Load((*uint32)(unsafe.Pointer(&nocturneLog)))
++		}
++		fd = uintptr(h)
++		r = syscall5(_SYS_CHANNEL_SEND, fd, uintptr(p), uintptr(n), ^uintptr(0), 0)
++	}
++	if r == -_N_ERR_WRONG_KIND {
++		size := syscall5(_SYS_DOCUMENT_SIZE, fd, 0, 0, 0, 0)
++		if size < 0 {
++			return int32(size)
++		}
++		r = syscall5(_SYS_DOCUMENT_WRITE_AT, fd, uintptr(size), uintptr(p), uintptr(n), 0)
++	}
++	if r < 0 {
++		return int32(r)
++	}
++	return n
++}
++
++// read receives the next message on input handle fd.
++func read(fd int32, p unsafe.Pointer, n int32) int32 {
++	return int32(syscall5(_SYS_CHANNEL_RECEIVE, uintptr(fd), uintptr(p), uintptr(n), _N_CHANNEL_WAIT, 0))
++}
++
++// open opens a document for reading.
++func open(name *byte, mode, perm int32) int32 {
++	return int32(syscall5(_SYS_DOCUMENT_OPEN, uintptr(unsafe.Pointer(name)), _N_DOCUMENT_READ, 0, 0, 0))
++}
++
++func closefd(fd int32) int32 {
++	return int32(syscall5(_SYS_HANDLE_CLOSE, uintptr(fd), 0, 0, 0, 0))
++}
++
++// ---- no signals ----
++//
++// Nocturne has no signals: an app is stopped through its app handle, and a
++// fault ends the app. Goroutines are preempted cooperatively.
++
++type sigset struct{}
++
++type gsignalStack struct{}
++
++const _NSIG = 0
++
++const _SIGSEGV = 0xb
++
++const preemptMSupported = false
++
++func sigpanic() {
++	gp := getg()
++	if !canpanic() {
++		throw("unexpected signal during runtime execution")
++	}
++	gp.sig = _SIGSEGV
++	panicmem()
++}
++
++func sigsave(p *sigset) {
++}
++
++func msigrestore(sigmask sigset) {
++}
++
++//go:nosplit
++//go:nowritebarrierrec
++func clearSignalHandlers() {
++}
++
++func sigblock(exiting bool) {
++}
++
++func initsig(preinit bool) {
++}
++
++func signame(sig uint32) string {
++	return ""
++}
++
++func preemptM(mp *m) {
++}
++
++func setProcessCPUProfiler(hz int32) {}
++func setThreadCPUProfiler(hz int32)  {}
++func sigdisable(uint32)              {}
++func sigenable(uint32)               {}
++func sigignore(uint32)               {}
++
++func os_sigpipe() {}
++
++func madvise(addr unsafe.Pointer, n uintptr, flags int32) int32 { return 0 }
+diff --git a/src/runtime/proc.go b/src/runtime/proc.go
+index b8d4d150..897f4b5b 100644
+--- a/src/runtime/proc.go
++++ b/src/runtime/proc.go
+@@ -1853,7 +1853,7 @@ func usesLibcall() bool {
+ // system-allocated stack.
+ func mStackIsSystemAllocated() bool {
+ 	switch GOOS {
+-	case "aix", "darwin", "plan9", "illumos", "ios", "openbsd", "solaris", "windows":
++	case "aix", "darwin", "plan9", "illumos", "ios", "nocturne", "openbsd", "solaris", "windows":
+ 		return true
+ 	}
+ 	return false
+diff --git a/src/runtime/rt0_nocturne_amd64.s b/src/runtime/rt0_nocturne_amd64.s
+new file mode 100644
+index 00000000..41e3160d
+--- /dev/null
++++ b/src/runtime/rt0_nocturne_amd64.s
+@@ -0,0 +1,11 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++#include "textflag.h"
++
++// Nocturne starts a program with argc in DI, argv in SI and the
++// null-terminated settings ("NAME=value") in DX.
++TEXT _rt0_amd64_nocturne(SB),NOSPLIT|NOFRAME,$0
++	MOVQ	DX, runtime·nocturneSettings(SB)
++	JMP	runtime·rt0_go(SB)
+diff --git a/src/runtime/stubs2.go b/src/runtime/stubs2.go
+index 39bde15b..a0e515fa 100644
+--- a/src/runtime/stubs2.go
++++ b/src/runtime/stubs2.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build !aix && !darwin && !js && !openbsd && !plan9 && !solaris && !wasip1 && !windows
++//go:build !aix && !darwin && !js && !nocturne && !openbsd && !plan9 && !solaris && !wasip1 && !windows
+ 
+ package runtime
+ 
+diff --git a/src/runtime/stubs3.go b/src/runtime/stubs3.go
+index c3749f34..d39d3f1f 100644
+--- a/src/runtime/stubs3.go
++++ b/src/runtime/stubs3.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build !aix && !darwin && !freebsd && !openbsd && !plan9 && !solaris && !wasip1
++//go:build !aix && !darwin && !freebsd && !nocturne && !openbsd && !plan9 && !solaris && !wasip1
+ 
+ package runtime
+ 
+diff --git a/src/runtime/sys_nocturne_amd64.s b/src/runtime/sys_nocturne_amd64.s
+new file mode 100644
+index 00000000..4179a948
+--- /dev/null
++++ b/src/runtime/sys_nocturne_amd64.s
+@@ -0,0 +1,93 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++//
++// System calls for AMD64, Nocturne.
++// A call is INT $0x80 with the number in AX and the arguments in
++// DI, SI, DX, R10 and R8; the result (or a negated Nocturne result code)
++// comes back in AX and every other register is preserved.
++//
++
++#include "go_asm.h"
++#include "go_tls.h"
++#include "textflag.h"
++
++#define SYS_EXIT		0
++#define SYS_YIELD		28
++#define SYS_THREAD_EXIT		47
++#define SYS_THREAD_ID		50
++#define SYS_THREAD_TLS		52
++
++// func syscall5(n, a1, a2, a3, a4, a5 uintptr) int64
++TEXT runtime·syscall5(SB),NOSPLIT,$0-56
++	MOVQ	n+0(FP), AX
++	MOVQ	a1+8(FP), DI
++	MOVQ	a2+16(FP), SI
++	MOVQ	a3+24(FP), DX
++	MOVQ	a4+32(FP), R10
++	MOVQ	a5+40(FP), R8
++	INT	$0x80
++	MOVQ	AX, ret+48(FP)
++	RET
++
++// Ends the whole app, from any of its threads.
++TEXT runtime·exit(SB),NOSPLIT,$0-4
++	MOVL	code+0(FP), DI
++	MOVL	$SYS_EXIT, AX
++	INT	$0x80
++	INT	$3
++	JMP	0(PC)
++
++// func exitThread(wait *atomic.Uint32)
++TEXT runtime·exitThread(SB),NOSPLIT,$0-8
++	MOVQ	wait+0(FP), AX
++	// We're done using the stack.
++	MOVL	$0, (AX)
++	MOVL	$SYS_THREAD_EXIT, AX
++	INT	$0x80
++	INT	$3
++	JMP	0(PC)
++
++TEXT runtime·osyield(SB),NOSPLIT,$0
++	MOVL	$SYS_YIELD, AX
++	INT	$0x80
++	RET
++
++// set tls base to DI
++TEXT runtime·settls(SB),NOSPLIT,$0
++	ADDQ	$8, DI	// ELF wants to use -8(FS)
++	MOVQ	$16, SI	// g lives in the 8 bytes below FS
++	MOVL	$SYS_THREAD_TLS, AX
++	INT	$0x80
++	CMPQ	AX, $0
++	JEQ	2(PC)
++	MOVL	$0xf1, 0xf1  // crash
++	RET
++
++// The first instruction of a thread made by newosproc. The kernel starts
++// it on a stack of its own with DI = fn (an ABI0 function) and SI = m.
++TEXT runtime·tstart_nocturne(SB),NOSPLIT|TOPFRAME|NOFRAME,$0
++	MOVQ	DI, R12	// fn
++	MOVQ	SI, R13	// m
++
++	LEAQ	m_tls(R13), DI
++	CALL	runtime·settls(SB)
++
++	MOVL	$SYS_THREAD_ID, AX
++	INT	$0x80
++	MOVQ	AX, m_procid(R13)
++
++	MOVQ	m_g0(R13), R9
++	get_tls(CX)
++	MOVQ	R9, g(CX)
++	MOVQ	R9, R14	// set g register
++	MOVQ	$0, BP
++
++	CALL	R12
++
++	// mstart returns when an M on a system stack exits.
++	MOVL	$SYS_THREAD_EXIT, AX
++	INT	$0x80
++	INT	$3
++	JMP	0(PC)
+diff --git a/src/runtime/timestub2.go b/src/runtime/timestub2.go
+index 336bac4b..64875a18 100644
+--- a/src/runtime/timestub2.go
++++ b/src/runtime/timestub2.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build !aix && !darwin && !freebsd && !openbsd && !solaris && !wasip1 && !windows && !(linux && amd64) && !plan9
++//go:build !aix && !darwin && !freebsd && !nocturne && !openbsd && !solaris && !wasip1 && !windows && !(linux && amd64) && !plan9
+ 
+ package runtime
+ 
+diff --git a/src/syscall/asm_nocturne_amd64.s b/src/syscall/asm_nocturne_amd64.s
+new file mode 100644
+index 00000000..65dc6502
+--- /dev/null
++++ b/src/syscall/asm_nocturne_amd64.s
+@@ -0,0 +1,20 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++#include "textflag.h"
++
++// func rawSyscall(n, a1, a2, a3, a4, a5 uintptr) int64
++// A Nocturne system call: INT $0x80 with the number in AX and the
++// arguments in DI, SI, DX, R10 and R8. AX returns the result, or a
++// negated Nocturne result code; every other register is preserved.
++TEXT ·rawSyscall(SB),NOSPLIT,$0-56
++	MOVQ	n+0(FP), AX
++	MOVQ	a1+8(FP), DI
++	MOVQ	a2+16(FP), SI
++	MOVQ	a3+24(FP), DX
++	MOVQ	a4+32(FP), R10
++	MOVQ	a5+40(FP), R8
++	INT	$0x80
++	MOVQ	AX, ret+48(FP)
++	RET
+diff --git a/src/syscall/env_unix.go b/src/syscall/env_unix.go
+index e1d7e213..0e83e7d9 100644
+--- a/src/syscall/env_unix.go
++++ b/src/syscall/env_unix.go
+@@ -2,7 +2,7 @@
+ // Use of this source code is governed by a BSD-style
+ // license that can be found in the LICENSE file.
+ 
+-//go:build unix || (js && wasm) || plan9 || wasip1
++//go:build unix || (js && wasm) || nocturne || plan9 || wasip1
+ 
+ // Unix environment variables.
+ 
+diff --git a/src/syscall/syscall_nocturne.go b/src/syscall/syscall_nocturne.go
+new file mode 100644
+index 00000000..a4435747
+--- /dev/null
++++ b/src/syscall/syscall_nocturne.go
+@@ -0,0 +1,691 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++// Nocturne system calls. Nocturne is not Unix: its resources are typed
++// handles; documents and folders are named by full paths and read and
++// written at offsets (there is no shared cursor and no working folder);
++// channels carry messages; apps are launched with an explicit table of
++// handles and stopped through their app handle. There are no signals.
++// See docs/nocturne-native-abi.md in the Nocturne sources.
++
++package syscall
++
++import (
++	errorspkg "errors"
++	"internal/bytealg"
++	"internal/oserror"
++	"internal/strconv"
++	"unsafe"
++)
++
++const ImplementsGetwd = true
++
++// System call numbers (common/abi.h of Nocturne).
++const (
++	SYS_EXIT              = 0
++	SYS_SLEEP             = 19
++	SYS_UPTIME            = 20
++	SYS_TIME              = 21
++	SYS_YIELD             = 28
++	SYS_HANDLE_CLOSE      = 128
++	SYS_HANDLE_KIND       = 129
++	SYS_DOCUMENT_OPEN     = 130
++	SYS_DOCUMENT_READ_AT  = 131
++	SYS_DOCUMENT_WRITE_AT = 132
++	SYS_DOCUMENT_SIZE     = 133
++	SYS_DOCUMENT_SET_SIZE = 134
++	SYS_DOCUMENT_CLAIM    = 135
++	SYS_DOCUMENT_RELEASE  = 136
++	SYS_DOCUMENT_SAVE     = 137
++	SYS_DOCUMENT_APPEND   = 138
++	SYS_ENTRY_INFO        = 139
++	SYS_ENTRY_REMOVE      = 140
++	SYS_ENTRY_MOVE        = 141
++	SYS_FOLDER_CREATE     = 142
++	SYS_FOLDER_LIST       = 143
++	SYS_CHANNEL_PAIR      = 144
++	SYS_CHANNEL_SEND      = 145
++	SYS_CHANNEL_RECEIVE   = 146
++	SYS_APP_LAUNCH        = 147
++	SYS_APP_RESULT        = 148
++	SYS_APP_STOP          = 149
++	SYS_APP_SELF          = 150
++	SYS_APP_PARENT        = 151
++	SYS_APP_OPEN          = 158
++	SYS_APP_ID            = 159
++	SYS_SYSTEM_LOG_OPEN   = 160
++	SYS_RANDOM            = 165
++)
++
++// Handle kinds.
++const (
++	KIND_DOCUMENT   = 1
++	KIND_FOLDER     = 2
++	KIND_CHANNEL    = 3
++	KIND_WINDOW     = 4
++	KIND_SHARED     = 5
++	KIND_APP        = 6
++	KIND_EVENTS     = 7
++	KIND_DEVICE     = 8
++	KIND_CONNECTION = 9
++)
++
++// DocumentOpen access: one of these, not a bit set.
++const (
++	DOCUMENT_READ    = 1 // read an existing document
++	DOCUMENT_EDIT    = 2 // read and write an existing document
++	DOCUMENT_CREATE  = 3 // a new, empty document; ERR_EXISTS if the name is taken
++	DOCUMENT_REPLACE = 4 // new content, swapped in whole by Close
++)
++
++// ChannelReceive flags.
++const (
++	CHANNEL_WAIT    = 1
++	CHANNEL_PEEK    = 2 // report the next message's size, leave it queued
++	CHANNEL_DISCARD = 4 // copy up to len(p) bytes of the next message, then drop it
++)
++
++// AppStop flags.
++const APP_STOP_TREE = 1 // also stop every app it launched
++
++// Errno is a Nocturne result code.
++type Errno uintptr
++
++const (
++	ERR_NOT_FOUND          Errno = 1
++	ERR_EXISTS             Errno = 2
++	ERR_DENIED             Errno = 3
++	ERR_NO_MEMORY          Errno = 4
++	ERR_INVALID            Errno = 5
++	ERR_WRONG_KIND         Errno = 6
++	ERR_NO_HANDLE          Errno = 7
++	ERR_BUSY               Errno = 8
++	ERR_NOT_READY          Errno = 9
++	ERR_CLOSED             Errno = 10
++	ERR_TIMEOUT            Errno = 11
++	ERR_CANCELLED          Errno = 12
++	ERR_TOO_LARGE          Errno = 13
++	ERR_NOT_EMPTY          Errno = 14
++	ERR_IO                 Errno = 15
++	ERR_UNSUPPORTED        Errno = 16
++	ERR_BAD_ADDRESS        Errno = 17
++	ERR_STOPPED            Errno = 18
++	ERR_NOT_FOLDER         Errno = 19
++	ERR_IS_FOLDER          Errno = 20
++	ERR_READ_ONLY          Errno = 21
++	ERR_NO_SPACE           Errno = 22
++	ERR_NOT_PROGRAM        Errno = 23
++	ERR_NAME_TOO_LONG      Errno = 24
++	ERR_NO_APP             Errno = 25
++	ERR_TOO_MANY_ARGUMENTS Errno = 26
++	ERR_CONNECTION_RESET   Errno = 27
++	ERR_CONNECTION_REFUSED Errno = 28
++	ERR_ADDRESS_IN_USE     Errno = 29
++	ERR_NETWORK_DOWN       Errno = 30
++	ERR_NOT_CONNECTED      Errno = 31
++	ERR_UNREACHABLE        Errno = 32
++	ERR_PROTOCOL           Errno = 33
++)
++
++var errors = [...]string{
++	ERR_NOT_FOUND:          "not found",
++	ERR_EXISTS:             "already exists",
++	ERR_DENIED:             "not permitted",
++	ERR_NO_MEMORY:          "out of memory",
++	ERR_INVALID:            "invalid argument",
++	ERR_WRONG_KIND:         "wrong kind of handle",
++	ERR_NO_HANDLE:          "no such handle",
++	ERR_BUSY:               "busy",
++	ERR_NOT_READY:          "not ready",
++	ERR_CLOSED:             "closed",
++	ERR_TIMEOUT:            "timed out",
++	ERR_CANCELLED:          "cancelled",
++	ERR_TOO_LARGE:          "too large",
++	ERR_NOT_EMPTY:          "folder not empty",
++	ERR_IO:                 "I/O error",
++	ERR_UNSUPPORTED:        "not supported",
++	ERR_BAD_ADDRESS:        "bad address",
++	ERR_STOPPED:            "stopped",
++	ERR_NOT_FOLDER:         "not a folder",
++	ERR_IS_FOLDER:          "is a folder",
++	ERR_READ_ONLY:          "read-only",
++	ERR_NO_SPACE:           "no space left",
++	ERR_NOT_PROGRAM:        "not a program",
++	ERR_NAME_TOO_LONG:      "name too long",
++	ERR_NO_APP:             "no such app",
++	ERR_TOO_MANY_ARGUMENTS: "too many arguments",
++	ERR_CONNECTION_RESET:   "connection reset",
++	ERR_CONNECTION_REFUSED: "connection refused",
++	ERR_ADDRESS_IN_USE:     "address in use",
++	ERR_NETWORK_DOWN:       "network is down",
++	ERR_NOT_CONNECTED:      "not connected",
++	ERR_UNREACHABLE:        "host unreachable",
++	ERR_PROTOCOL:           "protocol error",
++}
++
++func (e Errno) Error() string {
++	if 0 <= int(e) && int(e) < len(errors) {
++		s := errors[e]
++		if s != "" {
++			return s
++		}
++	}
++	return "result " + strconv.Itoa(int(e))
++}
++
++func (e Errno) Is(target error) bool {
++	switch target {
++	case oserror.ErrPermission:
++		return e == ERR_DENIED || e == ERR_READ_ONLY
++	case oserror.ErrExist:
++		return e == ERR_EXISTS || e == ERR_NOT_EMPTY
++	case oserror.ErrNotExist:
++		return e == ERR_NOT_FOUND
++	case errorspkg.ErrUnsupported:
++		return e == ERR_UNSUPPORTED
++	}
++	return false
++}
++
++func (e Errno) Temporary() bool {
++	return e == ERR_NOT_READY || e == ERR_BUSY || e.Timeout()
++}
++
++func (e Errno) Timeout() bool {
++	return e == ERR_TIMEOUT
++}
++
++// Names of results that Go's portable packages use.
++const (
++	EINVAL       = ERR_INVALID
++	ENOENT       = ERR_NOT_FOUND
++	EEXIST       = ERR_EXISTS
++	EPERM        = ERR_DENIED
++	EACCES       = ERR_DENIED
++	ENOTDIR      = ERR_NOT_FOLDER
++	EISDIR       = ERR_IS_FOLDER
++	ENOTEMPTY    = ERR_NOT_EMPTY
++	ENAMETOOLONG = ERR_NAME_TOO_LONG
++	EBADF        = ERR_NO_HANDLE
++	EIO          = ERR_IO
++	ENOMEM       = ERR_NO_MEMORY
++	ENOSPC       = ERR_NO_SPACE
++	EROFS        = ERR_READ_ONLY
++	EAGAIN       = ERR_NOT_READY
++	EBUSY        = ERR_BUSY
++	ETIMEDOUT    = ERR_TIMEOUT
++	EPIPE        = ERR_CLOSED
++	ENOSYS       = ERR_UNSUPPORTED
++	ENOTSUP      = ERR_UNSUPPORTED
++	EOPNOTSUPP   = ERR_UNSUPPORTED
++	ESPIPE       = ERR_WRONG_KIND
++	EINTR        = ERR_CANCELLED
++	ECONNRESET   = ERR_CONNECTION_RESET
++	ECONNREFUSED = ERR_CONNECTION_REFUSED
++	EADDRINUSE   = ERR_ADDRESS_IN_USE
++	ENETDOWN     = ERR_NETWORK_DOWN
++	ENOTCONN     = ERR_NOT_CONNECTED
++	EHOSTUNREACH = ERR_UNREACHABLE
++	ERANGE       = ERR_TOO_LARGE
++)
++
++// Flags of os.OpenFile. Nocturne opens a document for one access
++// (DocumentOpen); package os maps these onto it.
++const (
++	O_RDONLY = 0x0
++	O_WRONLY = 0x1
++	O_RDWR   = 0x2
++	O_APPEND = 0x400
++	O_CREAT  = 0x40
++	O_EXCL   = 0x80
++	O_SYNC   = 0x1000
++	O_TRUNC  = 0x200
++
++	O_CLOEXEC  = 0 // handles pass to an app only through its launch table
++	O_NONBLOCK = 0
++)
++
++// ---- calls ----
++
++func rawSyscall(n, a1, a2, a3, a4, a5 uintptr) int64
++
++//go:linkname runtime_entersyscall runtime.entersyscall
++func runtime_entersyscall()
++
++//go:linkname runtime_exitsyscall runtime.exitsyscall
++func runtime_exitsyscall()
++
++// Syscall makes Nocturne system call n, letting other goroutines run while
++// it blocks. It returns the call's non-negative result, or its result code.
++//
++//go:uintptrkeepalive
++//go:nosplit
++func Syscall(n, a1, a2, a3, a4, a5 uintptr) (r uintptr, err Errno) {
++	runtime_entersyscall()
++	v := rawSyscall(n, a1, a2, a3, a4, a5)
++	runtime_exitsyscall()
++	if v < 0 {
++		return 0, Errno(-v)
++	}
++	return uintptr(v), 0
++}
++
++// RawSyscall is Syscall for calls that return at once.
++//
++//go:uintptrkeepalive
++//go:nosplit
++func RawSyscall(n, a1, a2, a3, a4, a5 uintptr) (r uintptr, err Errno) {
++	v := rawSyscall(n, a1, a2, a3, a4, a5)
++	if v < 0 {
++		return 0, Errno(-v)
++	}
++	return uintptr(v), 0
++}
++
++func errnoErr(e Errno) error {
++	if e == 0 {
++		return nil
++	}
++	return e
++}
++
++func bytePtr(p []byte) uintptr {
++	if len(p) == 0 {
++		return uintptr(unsafe.Pointer(&_zero))
++	}
++	return uintptr(unsafe.Pointer(&p[0]))
++}
++
++// ---- handles ----
++
++func Close(h int) error {
++	_, e := RawSyscall(SYS_HANDLE_CLOSE, uintptr(h), 0, 0, 0, 0)
++	return errnoErr(e)
++}
++
++// HandleKind returns the KIND_* of handle h.
++func HandleKind(h int) (int, error) {
++	r, e := RawSyscall(SYS_HANDLE_KIND, uintptr(h), 0, 0, 0, 0)
++	return int(r), errnoErr(e)
++}
++
++// ---- paths ----
++
++// FullPath makes a name a full path: a name not starting with "/" is in
++// the current folder (the setting FOLDER, else "/"). The system resolves
++// "." and ".." elements.
++func FullPath(name string) string {
++	if len(name) > 0 && name[0] == '/' {
++		return name
++	}
++	folder, _ := Getenv("FOLDER")
++	if folder == "" || folder[0] != '/' {
++		folder = "/"
++	}
++	if name == "" || name == "." {
++		return folder
++	}
++	if folder[len(folder)-1] != '/' {
++		folder += "/"
++	}
++	return folder + name
++}
++
++func pathPtr(name string) (*byte, error) {
++	return BytePtrFromString(FullPath(name))
++}
++
++func Getwd() (string, error) {
++	return FullPath("."), nil
++}
++
++// Chdir changes the app's current folder: the setting FOLDER, which
++// FullPath reads and which apps it launches inherit.
++func Chdir(path string) error {
++	var e Entry
++	full := FullPath(path)
++	if err := EntryInfo(full, &e); err != nil {
++		return err
++	}
++	if e.Kind != KIND_FOLDER {
++		return ERR_NOT_FOLDER
++	}
++	return Setenv("FOLDER", full)
++}
++
++// ---- documents ----
++
++func DocumentOpen(path string, access int) (h int, err error) {
++	p, err := pathPtr(path)
++	if err != nil {
++		return -1, err
++	}
++	r, e := Syscall(SYS_DOCUMENT_OPEN, uintptr(unsafe.Pointer(p)), uintptr(access), 0, 0, 0)
++	if e != 0 {
++		return -1, e
++	}
++	return int(r), nil
++}
++
++func DocumentReadAt(h int, b []byte, off int64) (n int, err error) {
++	r, e := Syscall(SYS_DOCUMENT_READ_AT, uintptr(h), uintptr(off), bytePtr(b), uintptr(len(b)), 0)
++	return int(r), errnoErr(e)
++}
++
++func DocumentWriteAt(h int, b []byte, off int64) (n int, err error) {
++	r, e := Syscall(SYS_DOCUMENT_WRITE_AT, uintptr(h), uintptr(off), bytePtr(b), uintptr(len(b)), 0)
++	return int(r), errnoErr(e)
++}
++
++func DocumentSize(h int) (int64, error) {
++	r, e := RawSyscall(SYS_DOCUMENT_SIZE, uintptr(h), 0, 0, 0, 0)
++	return int64(r), errnoErr(e)
++}
++
++func DocumentSetSize(h int, size int64) error {
++	_, e := Syscall(SYS_DOCUMENT_SET_SIZE, uintptr(h), uintptr(size), 0, 0, 0)
++	return errnoErr(e)
++}
++
++// DocumentClaim takes the document's lease; without wait, a lease held
++// elsewhere is ERR_NOT_READY.
++func DocumentClaim(h int, wait bool) error {
++	w := uintptr(0)
++	if wait {
++		w = 1
++	}
++	_, e := Syscall(SYS_DOCUMENT_CLAIM, uintptr(h), w, 0, 0, 0)
++	return errnoErr(e)
++}
++
++func DocumentRelease(h int) error {
++	_, e := RawSyscall(SYS_DOCUMENT_RELEASE, uintptr(h), 0, 0, 0, 0)
++	return errnoErr(e)
++}
++
++// DocumentSave replaces the document's content atomically.
++func DocumentSave(path string, data []byte) error {
++	p, err := pathPtr(path)
++	if err != nil {
++		return err
++	}
++	_, e := Syscall(SYS_DOCUMENT_SAVE, uintptr(unsafe.Pointer(p)), bytePtr(data), uintptr(len(data)), 0, 0)
++	return errnoErr(e)
++}
++
++// DocumentAppend adds data at the end of the document, making it if needed.
++func DocumentAppend(path string, data []byte) error {
++	p, err := pathPtr(path)
++	if err != nil {
++		return err
++	}
++	_, e := Syscall(SYS_DOCUMENT_APPEND, uintptr(unsafe.Pointer(p)), bytePtr(data), uintptr(len(data)), 0, 0)
++	return errnoErr(e)
++}
++
++// ---- entries and folders ----
++
++// Entry is an entry of a folder, or the entry a path names
++// (struct n_entry). Modified is in wall seconds.
++type Entry struct {
++	Name     [256]byte
++	Kind     uint32 // KIND_DOCUMENT, KIND_FOLDER or KIND_DEVICE
++	reserved uint32
++	Size     uint64
++	Modified int64
++}
++
++// EntryName returns the entry's name.
++func (e *Entry) EntryName() string {
++	n := bytealg.IndexByte(e.Name[:], 0)
++	if n < 0 {
++		n = len(e.Name)
++	}
++	return string(e.Name[:n])
++}
++
++func EntryInfo(path string, out *Entry) error {
++	p, err := pathPtr(path)
++	if err != nil {
++		return err
++	}
++	_, e := Syscall(SYS_ENTRY_INFO, uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(out)), 0, 0, 0)
++	return errnoErr(e)
++}
++
++// EntryRemove removes a document or an empty folder.
++func EntryRemove(path string) error {
++	p, err := pathPtr(path)
++	if err != nil {
++		return err
++	}
++	_, e := Syscall(SYS_ENTRY_REMOVE, uintptr(unsafe.Pointer(p)), 0, 0, 0, 0)
++	return errnoErr(e)
++}
++
++// EntryMove moves an entry; it never replaces an existing name.
++func EntryMove(from, to string) error {
++	f, err := pathPtr(from)
++	if err != nil {
++		return err
++	}
++	t, err := pathPtr(to)
++	if err != nil {
++		return err
++	}
++	_, e := Syscall(SYS_ENTRY_MOVE, uintptr(unsafe.Pointer(f)), uintptr(unsafe.Pointer(t)), 0, 0, 0)
++	return errnoErr(e)
++}
++
++func FolderCreate(path string) error {
++	p, err := pathPtr(path)
++	if err != nil {
++		return err
++	}
++	_, e := Syscall(SYS_FOLDER_CREATE, uintptr(unsafe.Pointer(p)), 0, 0, 0, 0)
++	return errnoErr(e)
++}
++
++// FolderList fills out with the folder's entries from index start on and
++// returns how many it filled.
++func FolderList(path string, out []Entry, start int) (int, error) {
++	p, err := pathPtr(path)
++	if err != nil {
++		return 0, err
++	}
++	var first uintptr
++	if len(out) > 0 {
++		first = uintptr(unsafe.Pointer(&out[0]))
++	}
++	r, e := Syscall(SYS_FOLDER_LIST, uintptr(unsafe.Pointer(p)), first, uintptr(len(out)), uintptr(start), 0)
++	return int(r), errnoErr(e)
++}
++
++// ---- channels ----
++
++// ChannelPair makes an unnamed pair of connected channel ends.
++func ChannelPair() (a, b int, err error) {
++	var h [2]int32
++	_, e := RawSyscall(SYS_CHANNEL_PAIR, uintptr(unsafe.Pointer(&h[0])), 0, 0, 0, 0)
++	if e != 0 {
++		return -1, -1, e
++	}
++	return int(h[0]), int(h[1]), nil
++}
++
++// ChannelSend sends b as one message, with an attached document or shared
++// handle (or -1).
++func ChannelSend(h int, b []byte, attach int) (int, error) {
++	_, e := Syscall(SYS_CHANNEL_SEND, uintptr(h), bytePtr(b), uintptr(len(b)), uintptr(attach), 0)
++	if e != 0 {
++		return 0, e
++	}
++	return len(b), nil
++}
++
++// ChannelReceive takes the next message into b. It returns the message's
++// size and the handle attached to it (-1 if none).
++func ChannelReceive(h int, b []byte, flags int) (n int, attached int, err error) {
++	var a int32 = -1
++	r, e := Syscall(SYS_CHANNEL_RECEIVE, uintptr(h), bytePtr(b), uintptr(len(b)), uintptr(flags), uintptr(unsafe.Pointer(&a)))
++	return int(r), int(a), errnoErr(e)
++}
++
++// ---- apps ----
++
++// struct n_launch
++type launch struct {
++	arguments   **byte
++	settings    **byte
++	handles     *int32
++	argumentLen uint32
++	settingLen  uint32
++	handleLen   uint32
++	flags       uint32
++}
++
++func stringPtrs(ss []string) ([]*byte, error) {
++	ptrs := make([]*byte, len(ss)+1)
++	for i, s := range ss {
++		p, err := BytePtrFromString(s)
++		if err != nil {
++			return nil, err
++		}
++		ptrs[i] = p
++	}
++	return ptrs, nil
++}
++
++// AppLaunch starts the program at path. Handle i of the new app is
++// handles[i] (-1: none); by convention 0 is its input, 1 its output and
++// 2 its log. Settings are "NAME=value" strings. It returns an app handle.
++func AppLaunch(path string, args, settings []string, handles []int) (int, error) {
++	p, err := pathPtr(path)
++	if err != nil {
++		return -1, err
++	}
++	a, err := stringPtrs(args)
++	if err != nil {
++		return -1, err
++	}
++	s, err := stringPtrs(settings)
++	if err != nil {
++		return -1, err
++	}
++	hs := make([]int32, len(handles)+1)
++	for i, h := range handles {
++		hs[i] = int32(h)
++	}
++	l := launch{
++		arguments:   &a[0],
++		settings:    &s[0],
++		handles:     &hs[0],
++		argumentLen: uint32(len(args)),
++		settingLen:  uint32(len(settings)),
++		handleLen:   uint32(len(handles)),
++	}
++	r, e := Syscall(SYS_APP_LAUNCH, uintptr(unsafe.Pointer(p)), uintptr(unsafe.Pointer(&l)), 0, 0, 0)
++	if e != 0 {
++		return -1, e
++	}
++	return int(r), nil
++}
++
++// AppResult waits up to timeoutMs (-1: no limit, 0: not at all) for the
++// app to end and returns its exit status.
++func AppResult(h int, timeoutMs int64) (status int, err error) {
++	var st int32
++	_, e := Syscall(SYS_APP_RESULT, uintptr(h), uintptr(timeoutMs), uintptr(unsafe.Pointer(&st)), 0, 0)
++	return int(st), errnoErr(e)
++}
++
++// AppStop asks the app to stop; there are no signals.
++func AppStop(h int, flags int) error {
++	_, e := RawSyscall(SYS_APP_STOP, uintptr(h), uintptr(flags), 0, 0, 0)
++	return errnoErr(e)
++}
++
++// AppID returns the identifier of a running app (0 once it has ended).
++func AppID(h int) (int, error) {
++	r, e := RawSyscall(SYS_APP_ID, uintptr(h), 0, 0, 0, 0)
++	return int(r), errnoErr(e)
++}
++
++// AppOpen returns a handle on the running app with identifier id.
++func AppOpen(id int) (int, error) {
++	r, e := RawSyscall(SYS_APP_OPEN, uintptr(id), 0, 0, 0, 0)
++	if e != 0 {
++		return -1, e
++	}
++	return int(r), nil
++}
++
++func Getpid() int {
++	r, _ := RawSyscall(SYS_APP_SELF, 0, 0, 0, 0, 0)
++	return int(r)
++}
++
++func Getppid() int {
++	r, _ := RawSyscall(SYS_APP_PARENT, 0, 0, 0, 0, 0)
++	return int(r)
++}
++
++// ---- time and randomness ----
++
++type Timespec struct {
++	Sec  int64
++	Nsec int64
++}
++
++type Timeval struct {
++	Sec  int64
++	Usec int64
++}
++
++func NsecToTimeval(nsec int64) (tv Timeval) {
++	nsec += 999 // round up to microsecond
++	tv.Usec = nsec % 1e9 / 1e3
++	tv.Sec = nsec / 1e9
++	return
++}
++
++// Random fills b from the system's entropy.
++func Random(b []byte) error {
++	_, e := RawSyscall(SYS_RANDOM, bytePtr(b), uintptr(len(b)), 0, 0, 0)
++	return errnoErr(e)
++}
++
++// Nocturne apps have no user or group identities.
++func Getuid() int  { return -1 }
++func Geteuid() int { return -1 }
++func Getgid() int  { return -1 }
++func Getegid() int { return -1 }
++
++func Getgroups() ([]int, error) { return nil, ERR_UNSUPPORTED }
++
++// ---- the app ----
++
++// The handles an app is launched with, by convention.
++const (
++	Stdin  = 0
++	Stdout = 1
++	Stderr = 2
++)
++
++// SystemLogOpen returns a handle that writes to the system log.
++func SystemLogOpen() (int, error) {
++	r, e := RawSyscall(SYS_SYSTEM_LOG_OPEN, 0, 0, 0, 0, 0)
++	if e != 0 {
++		return -1, e
++	}
++	return int(r), nil
++}
++
++// Mkdir is FolderCreate; Nocturne folders have no permission bits.
++func Mkdir(path string, mode uint32) error {
++	return FolderCreate(path)
++}
++
++// SysProcAttr holds Nocturne-specific launch options; there are none yet.
++type SysProcAttr struct{}
+diff --git a/src/time/sys_nocturne.go b/src/time/sys_nocturne.go
+new file mode 100644
+index 00000000..fe198077
+--- /dev/null
++++ b/src/time/sys_nocturne.go
+@@ -0,0 +1,76 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package time
++
++import (
++	"errors"
++	"sync"
++	"syscall"
++)
++
++// for testing: whatever interrupts a sleep
++func interrupt() {
++}
++
++// Nocturne documents are read at offsets; read keeps each open document's
++// position for the sequential readers in this package.
++var (
++	readPosLock sync.Mutex
++	readPos     map[uintptr]int64
++)
++
++func open(name string) (uintptr, error) {
++	h, err := syscall.DocumentOpen(name, syscall.DOCUMENT_READ)
++	if err != nil {
++		return 0, err
++	}
++	return uintptr(h), nil
++}
++
++func read(fd uintptr, buf []byte) (int, error) {
++	readPosLock.Lock()
++	off := readPos[fd]
++	readPosLock.Unlock()
++	n, err := syscall.DocumentReadAt(int(fd), buf, off)
++	if n > 0 {
++		readPosLock.Lock()
++		if readPos == nil {
++			readPos = make(map[uintptr]int64)
++		}
++		readPos[fd] = off + int64(n)
++		readPosLock.Unlock()
++	}
++	return n, err
++}
++
++func closefd(fd uintptr) {
++	readPosLock.Lock()
++	delete(readPos, fd)
++	readPosLock.Unlock()
++	syscall.Close(int(fd))
++}
++
++func preadn(fd uintptr, buf []byte, off int) error {
++	pos := int64(off)
++	if off < 0 {
++		size, err := syscall.DocumentSize(int(fd))
++		if err != nil {
++			return err
++		}
++		pos = size + int64(off)
++	}
++	for len(buf) > 0 {
++		m, err := syscall.DocumentReadAt(int(fd), buf, pos)
++		if m <= 0 {
++			if err == nil {
++				return errors.New("short read")
++			}
++			return err
++		}
++		buf = buf[m:]
++		pos += int64(m)
++	}
++	return nil
++}
+diff --git a/src/time/zoneinfo_nocturne.go b/src/time/zoneinfo_nocturne.go
+new file mode 100644
+index 00000000..c15dc609
+--- /dev/null
++++ b/src/time/zoneinfo_nocturne.go
+@@ -0,0 +1,32 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package time
++
++import "syscall"
++
++// Nocturne keeps no zoneinfo folder of its own; LoadLocation reads
++// $GOROOT/lib/time/zoneinfo.zip or the embedded time/tzdata.
++var platformZoneSources []string
++
++// initLocal takes the zone named by the setting TZ ("Asia/Tokyo", or a
++// zoneinfo document's full path); without one, local time is UTC.
++func initLocal() {
++	tz, _ := syscall.Getenv("TZ")
++	if tz != "" && tz[0] == ':' {
++		tz = tz[1:]
++	}
++	if tz != "" && tz != "UTC" {
++		sources := platformZoneSources
++		if tz[0] == '/' {
++			sources = []string{""}
++		}
++		if z, err := loadLocation(tz, sources); err == nil {
++			localLoc = *z
++			localLoc.name = tz
++			return
++		}
++	}
++	localLoc.name = "UTC"
++}

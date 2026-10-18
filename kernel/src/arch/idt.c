@@ -163,7 +163,7 @@ static void exception(struct regs *r, uint64_t cr2, unsigned source_cpu) {
         if (!t->is_thread)
             task_printf_stderr(t, "\n\x1b[31m*** %s (%s) at %p, addr %p ***\x1b[0m\n", name, t->name,
                                (void *)r->rip, r->vector == 14 ? (void *)cr2 : 0);
-        task_fault_exit(128 + (int)r->vector);
+        task_exit_app(128 + (int)r->vector);
     }
     panic_regs(name, r);
 }
