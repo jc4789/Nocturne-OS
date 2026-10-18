@@ -470,8 +470,22 @@ static bool unsafe_value(const char *s) {
     }
     return false;
 }
+/* Fetch "parse a single range header value" without whitespace; a CORS-
+   safelisted range must name its first byte ("bytes=N-" or "bytes=N-M"). */
+static bool safelisted_range(const char *value) {
+    if (strncasecmp(value, "bytes=", 6)) return false;
+    const char *s = value + 6;
+    if (!isdigit((unsigned char)*s)) return false;
+    unsigned long long start = 0, end = 0;
+    for (; isdigit((unsigned char)*s); s++) { if (start > (~0ULL - 9) / 10) return false; start = start * 10 + (unsigned)(*s - '0'); }
+    if (*s++ != '-') return false;
+    if (!*s) return true;
+    for (; isdigit((unsigned char)*s); s++) { if (end > (~0ULL - 9) / 10) return false; end = end * 10 + (unsigned)(*s - '0'); }
+    return !*s && start <= end;
+}
 static bool safelisted(const char *name, const char *value) {
     if (strlen(value) > 128) return false;
+    if (!strcasecmp(name, "range")) return safelisted_range(value);
     if (!strcasecmp(name, "accept")) return !unsafe_value(value);
     if (!strcasecmp(name, "accept-language") || !strcasecmp(name, "content-language")) {
         for (const char *s = value; *s; s++) if (!isalnum((unsigned char)*s) && !strchr(" *,-.;=", *s)) return false;
@@ -883,6 +897,8 @@ static bool validate_headers(struct job *j) {
            request capacity: longer values remain valid and need preflight. */
         bool safe = false;
         if (vl <= 128) { char value[129]; memcpy(value, v, vl); value[vl] = 0; safe = safelisted(name, value); }
+        /* Range is CORS-safelisted but not a no-CORS-safelisted name. */
+        if (safe && no_cors(j) && !strcmp(name, "range")) { fail(j, "No-cors request requires safelisted headers"); goto out; }
         if (!safe) {
             if(no_cors(j)){fail(j,"No-cors request requires safelisted headers");goto out;}
             if ((names.length && !header_text(j, &names, ", ")) || !header_append(j, &names, name, nl)) goto out;

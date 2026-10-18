@@ -902,7 +902,8 @@ static int request_inner(const struct http_req *rq, struct http_resp *rs, struct
     }
     int ret = 0;
     if (!body_ok && !k.aborted) {
-        if (!rs->error[0]) snprintf(rs->error, sizeof rs->error, "response cut short (%s)", r->line_oom ? "out of memory reading line" : ns_error(s)[0] ? ns_error(s) : "connection closed");
+        const char *detail = work->h2 ? http2_error(work->h2) : ns_error(s);
+        if (!rs->error[0]) snprintf(rs->error, sizeof rs->error, "response cut short (%s)", r->line_oom ? "out of memory reading line" : detail[0] ? detail : "connection closed");
         ret = -1;
     } else if (k.aborted) {
         if(!errno)errno=ECANCELED;
