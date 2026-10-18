@@ -63,6 +63,10 @@ softpipe_destroy( struct pipe_context *pipe )
    struct softpipe_context *softpipe = softpipe_context( pipe );
    uint i, sh;
 
+#if DETECT_OS_NOCTURNE
+   sp_raster_drain(softpipe);
+#endif
+
    if (softpipe->blitter) {
       util_blitter_destroy(softpipe->blitter);
    }

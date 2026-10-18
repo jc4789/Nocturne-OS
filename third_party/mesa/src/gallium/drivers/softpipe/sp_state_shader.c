@@ -26,6 +26,7 @@
  **************************************************************************/
 
 #include "sp_context.h"
+#include "sp_prim_vbuf.h"
 #include "sp_screen.h"
 #include "sp_state.h"
 #include "sp_fs.h"
@@ -206,6 +207,9 @@ softpipe_delete_fs_state(struct pipe_context *pipe, void *fs)
    struct sp_fragment_shader_variant *var, *next_var;
 
    assert(fs != softpipe->fs);
+#if DETECT_OS_NOCTURNE
+   sp_raster_drain(softpipe);
+#endif
 
    /* delete variants */
    for (var = state->variants; var; var = next_var) {

@@ -1425,7 +1425,13 @@ sp_setup_prepare(struct setup_context *setup)
    }
 
    /* Note: nr_attrs is only used for debugging (vertex printing) */
+#if DETECT_OS_NOCTURNE
+   /* the rasterizer threads' shadow contexts have no draw module: the
+    * caller's keeps changing while they run queued draws */
+   setup->nr_vertex_attrs = sp->draw ? draw_num_shader_outputs(sp->draw) : 0;
+#else
    setup->nr_vertex_attrs = draw_num_shader_outputs(sp->draw);
+#endif
 
    /*
     * Determine how many layers the fb has (used for clamping layer value).

@@ -37,6 +37,7 @@
 #include "util/u_surface.h"
 #include "sp_clear.h"
 #include "sp_context.h"
+#include "sp_prim_vbuf.h"
 #include "sp_screen.h"
 #include "sp_query.h"
 #include "sp_tile_cache.h"
@@ -64,6 +65,10 @@ softpipe_clear(struct pipe_context *pipe, unsigned buffers,
 
    if (!softpipe_check_render_cond(softpipe))
       return;
+
+#if DETECT_OS_NOCTURNE
+   sp_raster_drain(softpipe);
+#endif
 
 #if 0
    softpipe_update_derived(softpipe, MESA_PRIM_TRIANGLES); /* not needed?? */

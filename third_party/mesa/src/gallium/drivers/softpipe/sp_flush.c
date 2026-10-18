@@ -35,6 +35,7 @@
 #include "draw/draw_context.h"
 #include "sp_flush.h"
 #include "sp_context.h"
+#include "sp_prim_vbuf.h"
 #include "sp_state.h"
 #include "sp_tile_cache.h"
 #include "sp_tex_tile_cache.h"
@@ -52,6 +53,9 @@ softpipe_flush( struct pipe_context *pipe,
    uint i;
 
    draw_flush(softpipe->draw);
+#if DETECT_OS_NOCTURNE
+   sp_raster_drain(softpipe);
+#endif
 
    if (flags & SP_FLUSH_TEXTURE_CACHE) {
       unsigned sh;
@@ -123,6 +127,14 @@ softpipe_flush_resource(struct pipe_context *pipe,
 {
    unsigned referenced;
 
+#if DETECT_OS_NOCTURNE
+   /* Queued draws read textures they no longer have bound. Buffers are
+    * only read by the vertex stage, which runs on this thread, and the
+    * draws keep their own copy of the fragment constants. */
+   if (texture->target != PIPE_BUFFER)
+      sp_raster_drain(softpipe_context(pipe));
+#endif
+
    referenced = softpipe_is_resource_referenced(pipe, texture, level, layer);
 
    if ((referenced & SP_REFERENCED_FOR_WRITE) ||
@@ -174,6 +186,9 @@ void softpipe_texture_barrier(struct pipe_context *pipe, unsigned flags)
    struct softpipe_context *softpipe = softpipe_context(pipe);
    uint i, sh;
 
+#if DETECT_OS_NOCTURNE
+   sp_raster_drain(softpipe);
+#endif
    for (sh = 0; sh < ARRAY_SIZE(softpipe->tex_cache); sh++) {
       for (i = 0; i < softpipe->num_sampler_views[sh]; i++) {
          sp_flush_tex_tile_cache(softpipe->tex_cache[sh][i]);

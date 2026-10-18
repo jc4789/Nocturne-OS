@@ -935,6 +935,69 @@ depth_test_quads_fallback(struct quad_stage *qs,
 }
 
 
+#if DETECT_OS_NOCTURNE
+/**
+ * Interpolated depth tested LESS or LEQUAL and written to a 24-bit depth
+ * buffer, without stencil: what 3D content draws with nearly all the time.
+ * The values and the comparison are the fallback's, without its format and
+ * function switches for every pixel; the stencil byte is kept.
+ */
+static void
+depth_interp_z24_write(struct quad_stage *qs,
+                       struct quad_header *quads[],
+                       unsigned nr)
+{
+   const enum pipe_format format = qs->softpipe->framebuffer.zsbuf.format;
+   /* depth in the high 24 bits (X8Z24, S8Z24) or the low ones */
+   const bool high = format == PIPE_FORMAT_X8Z24_UNORM ||
+                     format == PIPE_FORMAT_S8_UINT_Z24_UNORM;
+   const uint32_t keep = format == PIPE_FORMAT_Z24_UNORM_S8_UINT ? 0xff000000u :
+                         format == PIPE_FORMAT_S8_UINT_Z24_UNORM ? 0xffu : 0;
+   const bool lequal = qs->softpipe->depth_stencil->depth_func == PIPE_FUNC_LEQUAL;
+   const float scale = (float) ((1 << 24) - 1);
+   struct softpipe_cached_tile *tile =
+      sp_get_cached_tile(qs->softpipe->zsbuf_cache, quads[0]->input.x0,
+                         quads[0]->input.y0, quads[0]->input.layer);
+   unsigned i, j, pass = 0;
+
+   for (i = 0; i < nr; i++) {
+      struct quad_header *quad = quads[i];
+      const float fx = (float) quad->input.x0;
+      const float fy = (float) quad->input.y0;
+      const float dzdx = quad->posCoef->dadx[2];
+      const float dzdy = quad->posCoef->dady[2];
+      const float z0 = quad->posCoef->a0[2] + dzdx * fx + dzdy * fy;
+      const float z[TGSI_QUAD_SIZE] = { z0, z0 + dzdx, z0 + dzdy, z0 + dzdx + dzdy };
+      const unsigned x = quad->input.x0 % TILE_SIZE;
+      const unsigned y = quad->input.y0 % TILE_SIZE;
+      unsigned mask = 0;
+
+      for (j = 0; j < TGSI_QUAD_SIZE; j++) {
+         uint32_t *d;
+         unsigned q, b;
+
+         if (!(quad->inout.mask & (1 << j)))
+            continue;
+         d = &tile->data.depth32[y + (j >> 1)][x + (j & 1)];
+         q = (unsigned) (z[j] * scale);
+         b = high ? *d >> 8 : *d & 0xffffff;
+         if (lequal ? q <= b : q < b) {
+            *d = (high ? q << 8 : q) | (*d & keep);
+            mask |= 1 << j;
+         }
+      }
+
+      quad->inout.mask = mask;
+      if (mask)
+         quads[pass++] = quad;
+   }
+
+   if (pass)
+      qs->next->run(qs->next, quads, pass);
+}
+#endif
+
+
 /**
  * Special-case Z testing for 16-bit Zbuffer and Z buffer writes enabled.
  */
@@ -1059,6 +1122,15 @@ choose_depth_test(struct quad_stage *qs,
             break;
          }
       }
+#if DETECT_OS_NOCTURNE
+      else if ((depthfunc == PIPE_FUNC_LESS || depthfunc == PIPE_FUNC_LEQUAL) &&
+               (qs->softpipe->framebuffer.zsbuf.format == PIPE_FORMAT_Z24X8_UNORM ||
+                qs->softpipe->framebuffer.zsbuf.format == PIPE_FORMAT_Z24_UNORM_S8_UINT ||
+                qs->softpipe->framebuffer.zsbuf.format == PIPE_FORMAT_X8Z24_UNORM ||
+                qs->softpipe->framebuffer.zsbuf.format == PIPE_FORMAT_S8_UINT_Z24_UNORM)) {
+         qs->run = depth_interp_z24_write;
+      }
+#endif
    }
 
    /* next quad/fragment stage */

@@ -52,6 +52,7 @@
  */
 
 #include "util/compiler.h"
+#include "util/detect_os.h"
 #include "pipe/p_state.h"
 #include "pipe/p_shader_tokens.h"
 #include "tgsi/tgsi_dump.h"
@@ -1582,6 +1583,48 @@ fetch_source_d(const struct tgsi_exec_machine *mach,
    union tgsi_exec_channel index;
    union tgsi_exec_channel index2D;
    unsigned swizzle;
+
+#if DETECT_OS_NOCTURNE
+   /* Without indirect addressing all four lanes read the same register:
+    * one 16-byte copy (or one broadcast) instead of four index vectors
+    * built and walked lane by lane. Most operands of every instruction
+    * come through here. */
+   if (!reg->Register.Indirect &&
+       !(reg->Register.Dimension && reg->Dimension.Indirect)) {
+      const int idx = reg->Register.Index;
+      const int idx2 = reg->Register.Dimension ? reg->Dimension.Index : 0;
+
+      switch (chan_index) {
+      case TGSI_CHAN_X: swizzle = reg->Register.SwizzleX; break;
+      case TGSI_CHAN_Y: swizzle = reg->Register.SwizzleY; break;
+      case TGSI_CHAN_Z: swizzle = reg->Register.SwizzleZ; break;
+      default:          swizzle = reg->Register.SwizzleW; break;
+      }
+      switch (reg->Register.File) {
+      case TGSI_FILE_TEMPORARY:
+         *chan = mach->Temps[idx].xyzw[swizzle];
+         return;
+      case TGSI_FILE_INPUT:
+         *chan = mach->Inputs[idx2 * TGSI_EXEC_MAX_INPUT_ATTRIBS + idx].xyzw[swizzle];
+         return;
+      case TGSI_FILE_OUTPUT:
+         *chan = mach->Outputs[idx].xyzw[swizzle];
+         return;
+      case TGSI_FILE_IMMEDIATE:
+         chan->f[0] = chan->f[1] = chan->f[2] = chan->f[3] = mach->Imms[idx][swizzle];
+         return;
+      case TGSI_FILE_CONSTANT: {
+         const unsigned pos = idx * 4 + swizzle;
+         const unsigned value = pos < mach->ConstsSize[idx2] / 4 ?
+                                ((const unsigned *)mach->Consts[idx2])[pos] : 0;
+         chan->u[0] = chan->u[1] = chan->u[2] = chan->u[3] = value;
+         return;
+      }
+      default:
+         break;
+      }
+   }
+#endif
 
    get_index_registers(mach, reg, &index, &index2D);
 

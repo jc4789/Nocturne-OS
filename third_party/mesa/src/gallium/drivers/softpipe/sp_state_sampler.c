@@ -36,6 +36,7 @@
 #include "draw/draw_context.h"
 
 #include "sp_context.h"
+#include "sp_prim_vbuf.h"
 #include "sp_state.h"
 #include "sp_texture.h"
 #include "sp_tex_sample.h"
@@ -167,6 +168,9 @@ static void
 softpipe_delete_sampler_state(struct pipe_context *pipe,
                               void *sampler)
 {
+#if DETECT_OS_NOCTURNE
+   sp_raster_drain(softpipe_context(pipe));
+#endif
    FREE( sampler );
 }
 

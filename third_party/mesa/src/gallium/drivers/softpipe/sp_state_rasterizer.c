@@ -28,6 +28,7 @@
 #include "pipe/p_defines.h"
 #include "util/u_memory.h"
 #include "sp_context.h"
+#include "sp_prim_vbuf.h"
 #include "sp_state.h"
 #include "draw/draw_context.h"
 
@@ -63,6 +64,9 @@ static void
 softpipe_delete_rasterizer_state(struct pipe_context *pipe,
                                  void *rasterizer)
 {
+#if DETECT_OS_NOCTURNE
+   sp_raster_drain(softpipe_context(pipe));
+#endif
    FREE( rasterizer );
 }
 

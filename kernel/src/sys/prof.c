@@ -97,6 +97,32 @@ static void dump(void) {
         else if (u + k + i) kprintf("prof: cpu%u user %u kernel %u idle %u\n", cpu, u, k, i);
         total += u + k;
     }
+    /* Samples per task: the address list below is cut off, and a thread
+       whose time is spread over many addresses would look idle. */
+    {
+        enum { PIDS = 64 };
+        int pids[PIDS];
+        uint32_t sums[PIDS];
+        unsigned npids = 0, other = 0;
+        for (uint32_t i = 0; i < PROF_SLOTS; i++) {
+            if (!slots[i].count) continue;
+            unsigned j = 0;
+            while (j < npids && pids[j] != slots[i].pid) j++;
+            if (j == npids) {
+                if (npids == PIDS) { other += slots[i].count; continue; }
+                pids[npids] = slots[i].pid;
+                sums[npids++] = 0;
+            }
+            sums[j] += slots[i].count;
+        }
+        for (unsigned j = 0; j < npids; j++) {
+            if (sums[j] < 50) continue;
+            bool thread = false;
+            const char *name = pids[j] < 0 ? "kernel" : task_name(pids[j], &thread);
+            kprintf("prof: task pid %d %s%s total %u\n", pids[j], name, thread ? " (thread)" : "", sums[j]);
+        }
+        if (other) kprintf("prof: task (more) total %u\n", other);
+    }
     /* Selection of the hottest entries. A printed entry's count is zeroed;
        the whole table is cleared below anyway. */
     for (unsigned n = 0; n < PROF_TOP; n++) {

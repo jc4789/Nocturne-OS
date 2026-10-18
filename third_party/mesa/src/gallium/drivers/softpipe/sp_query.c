@@ -34,6 +34,7 @@
 #include "pipe/p_defines.h"
 #include "util/u_memory.h"
 #include "sp_context.h"
+#include "sp_prim_vbuf.h"
 #include "sp_query.h"
 #include "sp_state.h"
 
@@ -92,6 +93,9 @@ softpipe_begin_query(struct pipe_context *pipe, struct pipe_query *q)
    struct softpipe_context *softpipe = softpipe_context( pipe );
    struct softpipe_query *sq = softpipe_query(q);
 
+#if DETECT_OS_NOCTURNE
+   sp_raster_drain(softpipe);
+#endif
    switch (sq->type) {
    case PIPE_QUERY_OCCLUSION_COUNTER:
    case PIPE_QUERY_OCCLUSION_PREDICATE:
@@ -151,6 +155,9 @@ softpipe_end_query(struct pipe_context *pipe, struct pipe_query *q)
    struct softpipe_context *softpipe = softpipe_context( pipe );
    struct softpipe_query *sq = softpipe_query(q);
 
+#if DETECT_OS_NOCTURNE
+   sp_raster_drain(softpipe);
+#endif
    softpipe->active_query_count--;
    switch (sq->type) {
    case PIPE_QUERY_OCCLUSION_COUNTER:

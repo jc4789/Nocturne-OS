@@ -29,6 +29,7 @@
  */
 
 #include "sp_context.h"
+#include "sp_prim_vbuf.h"
 #include "sp_state.h"
 #include "sp_tile_cache.h"
 
@@ -52,6 +53,9 @@ softpipe_set_framebuffer_state(struct pipe_context *pipe,
    uint i;
 
    draw_flush(sp->draw);
+#if DETECT_OS_NOCTURNE
+   sp_raster_drain(sp);
+#endif
 
    for (i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
       /* check if changing cbuf */

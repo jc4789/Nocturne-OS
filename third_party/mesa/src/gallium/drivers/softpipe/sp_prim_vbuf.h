@@ -34,5 +34,14 @@ struct softpipe_context;
 extern struct vbuf_render *
 sp_create_vbuf_backend(struct softpipe_context *softpipe);
 
+#include "util/detect_os.h"
+#if DETECT_OS_NOCTURNE
+/* Waits for the draws queued for the rasterizer threads. Called before
+ * anything reads or writes what those draws use: the framebuffer and its
+ * tile caches, textures, and the state objects they point to. */
+void
+sp_raster_drain(struct softpipe_context *softpipe);
+#endif
+
 
 #endif /* SP_VBUF_H */

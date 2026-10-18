@@ -27,6 +27,7 @@
 #include "draw/draw_context.h"
 #include "draw/draw_vertex.h"
 #include "sp_context.h"
+#include "sp_prim_vbuf.h"
 #include "sp_screen.h"
 #include "sp_state.h"
 #include "sp_texture.h"
@@ -173,6 +174,11 @@ softpipe_launch_grid(struct pipe_context *context,
    int local_x, local_y, local_z, i;
    int g_w, g_h, g_d;
    uint32_t grid_size[3] = {0};
+
+#if DETECT_OS_NOCTURNE
+   /* the shader may write textures that queued draws still read */
+   sp_raster_drain(softpipe);
+#endif
    void *local_mem = NULL;
 
    softpipe_update_compute_samplers(softpipe);

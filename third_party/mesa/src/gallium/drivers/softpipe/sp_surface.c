@@ -28,6 +28,7 @@
 #include "util/format/u_format.h"
 #include "util/u_surface.h"
 #include "sp_context.h"
+#include "sp_prim_vbuf.h"
 #include "sp_surface.h"
 #include "sp_query.h"
 #include "sp_tile_cache.h"
@@ -104,6 +105,9 @@ static void
 sp_flush_resource(struct pipe_context *pipe,
                   struct pipe_resource *resource)
 {
+#if DETECT_OS_NOCTURNE
+   sp_raster_drain(softpipe_context(pipe));
+#endif
 }
 
 static void

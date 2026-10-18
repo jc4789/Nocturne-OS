@@ -32,6 +32,7 @@
 #include "util/u_memory.h"
 #include "draw/draw_context.h"
 #include "sp_context.h"
+#include "sp_prim_vbuf.h"
 #include "sp_state.h"
 
 
@@ -61,6 +62,9 @@ static void
 softpipe_delete_blend_state(struct pipe_context *pipe,
                             void *blend)
 {
+#if DETECT_OS_NOCTURNE
+   sp_raster_drain(softpipe_context(pipe));
+#endif
    FREE( blend );
 }
 
@@ -108,6 +112,9 @@ softpipe_bind_depth_stencil_state(struct pipe_context *pipe,
 static void
 softpipe_delete_depth_stencil_state(struct pipe_context *pipe, void *depth)
 {
+#if DETECT_OS_NOCTURNE
+   sp_raster_drain(softpipe_context(pipe));
+#endif
    FREE( depth );
 }
 
