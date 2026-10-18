@@ -1,5 +1,9 @@
-/* Exact opaque/identity suffix classification. Intermediate alpha is rejected:
- * no affine approximation of the renderer's integer blend rounding. */
+/* Opaque/identity suffix classification from the black and white probes.
+ * An intermediate pixel is accepted only when the paint declared per-pixel
+ * linear compositing over the video (group opacity, a rounded clip edge):
+ * then out = black + video * (white - black) / 255 per channel, within the
+ * renderer's integer rounding. The per-channel span replaces that pixel's
+ * unused committed value. Any other intermediate pixel rejects the surface. */
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,16 +24,27 @@ static inline bool web_video_snapshot_extent(int canvas_w,int canvas_h,int pitch
     *count=pixels;*bytes=pixels*13u;return true;
 }
 static inline bool web_video_snapshot_mask(const uint32_t *black,const uint32_t *white,
-                                          uint8_t *opaque,size_t count) {
+                                          uint32_t *committed,uint8_t *opaque,size_t count,bool blend) {
     for(size_t i=0;i<count;i++) {
         uint32_t a=black[i]&0xffffffu,b=white[i]&0xffffffu;
         if(a==b)opaque[i]=1;
         else if(a==0 && b==0xffffffu)opaque[i]=0;
+        else if(blend && (b&0xff0000u)>=(a&0xff0000u) && (b&0xff00u)>=(a&0xff00u) && (b&0xffu)>=(a&0xffu)){
+            committed[i]=b-a;opaque[i]=2; /* no channel borrows: each byte is its own span */
+        }
         else return false;
     }
     return true;
 }
-static inline void web_video_snapshot_overlay(uint32_t *output,const uint32_t *committed,
+static inline void web_video_snapshot_overlay(uint32_t *output,const uint32_t *committed,const uint32_t *black,
                                              const uint8_t *opaque,size_t count) {
-    for(size_t i=0;i<count;i++)if(opaque[i])output[i]=committed[i];
+    for(size_t i=0;i<count;i++) {
+        if(opaque[i]==1)output[i]=committed[i];
+        else if(opaque[i]==2) {
+            uint32_t v=output[i],k=committed[i],a=black[i],out=0xff000000u;
+            for(int shift=0;shift<24;shift+=8)
+                out|=(((a>>shift)&255u)+(((v>>shift)&255u)*((k>>shift)&255u)+127u)/255u)<<shift;
+            output[i]=out;
+        }
+    }
 }

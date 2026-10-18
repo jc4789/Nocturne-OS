@@ -176,13 +176,35 @@ size_t wf_grapheme_next(const char *s, size_t n, size_t at) {
     return n;
 }
 
+/* A following variation selector selects the presentation of its base, so it
+   travels with the base to the chosen face. An emoji grapheme (ZWJ, modifier,
+   flag, tag or keycap sequence) goes whole, for the face to form its ligature. */
+static size_t wf_cluster(const char *s, size_t n, size_t at, int bytes) {
+    size_t end = at + (size_t)bytes;
+    uint32_t cp;
+    wf_grapheme_decode(s + at, n - at, &cp);
+    uint8_t properties = wf_grapheme_properties(cp);
+    if ((properties & WF_EXTENDED_PICTOGRAPHIC) || (properties & 15) == WF_GCB_REGIONAL_INDICATOR ||
+        (end < n && (cp == '#' || cp == '*' || (cp >= '0' && cp <= '9'))))
+        return wf_grapheme_next(s, n, at) - at;
+    if (end < n) {
+        uint32_t next;
+        int more = gfx_utf8_decode(s + end, &next);
+        if ((size_t)more <= n - end && ((next >= 0xfe00 && next <= 0xfe0f) || (next >= 0xe0100 && next <= 0xe01ef)))
+            end += (size_t)more;
+    }
+    return end - at;
+}
+
 float wf_width(const wfont *f, const char *s, size_t n) {
     if (f->px < 1) return 0;
     if (f->ttf&&!f->choices) return font_width(f->ttf, f->px, s, n);
     if(f->choices){
         float width=0;
-        for(size_t i=0;i<n;){uint32_t cp;int bytes=gfx_utf8_decode(s+i,&cp);if((size_t)bytes>n-i)break;i+=(size_t)bytes;
-            font_t *face=wf_face(f,cp);width+=face?font_advance(face,f->px,cp):gfx_codepoint_width(cp,mono_font(f));}
+        for(size_t i=0;i<n;){uint32_t cp;int bytes=gfx_utf8_decode(s+i,&cp);if((size_t)bytes>n-i)break;
+            size_t span=wf_cluster(s,n,i,bytes);
+            font_t *face=wf_face(f,cp);width+=face?font_width(face,f->px,s+i,span):gfx_codepoint_width(cp,mono_font(f));
+            i+=span;}
         return width;
     }
     int width = 0;
@@ -212,10 +234,11 @@ float wf_draw(canvas_t *c, const wfont *f, float x, int baseline, const char *s,
     if (f->ttf&&!f->choices) return font_draw(c, f->ttf, f->px, x, baseline, s, n, color);
     if(f->choices){
         for(size_t i=0;i<n;){uint32_t cp;int bytes=gfx_utf8_decode(s+i,&cp);if((size_t)bytes>n-i)break;
+            size_t span=wf_cluster(s,n,i,bytes);
             font_t *face=wf_face(f,cp);
-            if(face)x=font_draw(c,face,f->px,x,baseline,s+i,(size_t)bytes,color);
+            if(face)x=font_draw(c,face,f->px,x,baseline,s+i,span,color);
             else {int top=baseline-gfx_font_h(mono_font(f))*3/4;x+=gfx_char(c,(int)x,top,cp,color,0,mono_font(f));}
-            i+=(size_t)bytes;
+            i+=span;
         }
         return x;
     }
@@ -3480,7 +3503,10 @@ static void outer_intrinsic(box_t *c, float *mn, float *mx) {
     resolve_edges(c, 0);
     float ext = hext(c) + c->m[1] + c->m[3];
     const len_t *wl = &c->st->width;
-    if ((c->kind != B_ATOMIC || size_container(c)) && wl->kind == LK_LEN && wl->pct == 0) {
+    /* Replaced atomics size themselves in intrinsic(); an inline-block is a
+       non-replaced box whose definite width is its contribution. */
+    if ((c->kind != B_ATOMIC || c->atomic == AT_INLINE_BLOCK || size_container(c)) &&
+        wl->kind == LK_LEN && wl->pct == 0) {
         float w = wl->px - (c->st->box_sizing ? hext(c) : 0);
         w = clamp_w(c, w < 0 ? 0 : w, -1);
         *mn = *mx = w + ext;

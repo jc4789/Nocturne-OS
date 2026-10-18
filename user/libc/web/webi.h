@@ -925,7 +925,7 @@ struct web_doc {
     uint64_t paint_order_layout;
     uint64_t paint_order_visual; /* fractional scroll/translation invalidates shadow mask alignment */
     bool paint_shadow_crop;
-    int paint_shadow_view_x, paint_shadow_view_y;
+    int paint_shadow_view_x, paint_shadow_view_y, paint_shadow_view_w, paint_shadow_view_h;
     bool paint_order_valid;
     uint64_t visual_revision; /* element scrolling/marquee geometry, not video pixels */
     uint64_t style_revision; /* published box styles: opacity/filter/z-index decide stacking contexts */

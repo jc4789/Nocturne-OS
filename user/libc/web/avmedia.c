@@ -121,6 +121,8 @@ struct web_avmedia {
         bool valid;
     } snapshot;
     uint64_t window_frames;
+    /* Why the last paint left no window-published surface (diagnostics only). */
+    const char *snapshot_why;int snapshot_why_line;
     /* Debug transition records contain no URL, error text, or packet data. */
     const char *transition_reason,*transition_pending;
     uint32_t transition_generation,transition_target;
@@ -172,7 +174,13 @@ static struct web_avmedia *snapshot_candidate;
 static web_doc *snapshot_document;
 static unsigned snapshot_phase;
 static bool snapshot_rejected;
-struct snapshot_region {int64_t x0,y0,x1,y1;};
+static const char *snapshot_why;static int snapshot_why_line;
+static bool snapshot_blend; /* linear compositing (group opacity, rounded clip) crosses the candidate */
+static void snapshot_reject_as(const char *why,int line){
+    if(!snapshot_rejected){snapshot_why=why;snapshot_why_line=line;}
+    snapshot_rejected=true;
+}
+struct snapshot_region {int64_t x0,y0,x1,y1;int line;bool edge;};
 static struct snapshot_region *snapshot_regions;
 static size_t snapshot_region_count,snapshot_region_capacity;
 static bool snapshot_region_intersects(const struct snapshot_region *r,const struct web_avmedia *s){
@@ -1209,7 +1217,7 @@ static void snapshot_publish(struct web_avmedia *s) {
     nmedia_draw(&patch,s->pixels,s->width,s->height,
                 s->snapshot.video_x-s->snapshot.x,s->snapshot.video_y-s->snapshot.y,
                 s->snapshot.video_w,s->snapshot.video_h);
-    web_video_snapshot_overlay(s->snapshot.output,s->snapshot.committed,s->snapshot.opaque,s->snapshot.count);
+    web_video_snapshot_overlay(s->snapshot.output,s->snapshot.committed,s->snapshot.black,s->snapshot.opaque,s->snapshot.count);
     struct web_video_patch update={.canvas=s->snapshot.target,
         .scroll_x=s->snapshot.scroll_x,.scroll_y=s->snapshot.scroll_y,
         .x=s->snapshot.x,.y=s->snapshot.y,.w=s->snapshot.w,.h=s->snapshot.h,
@@ -1225,13 +1233,13 @@ static void timing_profile(struct web_avmedia *s,uint64_t now){
     bool audio=s->sink>=0&&n_audio_status(s->sink,&status)==0;
     uint32_t queued=status.queued_frames+status.device_pending_frames;
     int64_t played=s->audio_written&&audio?s->audio_end_ms-(int64_t)(queued*s->rate*1000/SOUND_RATE):-1;
-    char message[512];
+    char message[640];
     uint64_t decoded,dropped;video_counts(s,&decoded,&dropped);
-    snprintf(message,sizeof message,"Native media timing: generation %u, input %s, clock %lld ms, presented %llu at %lld ms, decoded %llu/drop %llu, window-published %llu; audio %s, queued %u frames, written %llu/silence %llu frames, end %lld/played-estimate %lld ms, pending %d at %lld ms/ahead %zu at %lld ms, starved %u/ended %u",
+    snprintf(message,sizeof message,"Native media timing: generation %u, input %s, clock %lld ms, presented %llu at %lld ms, decoded %llu/drop %llu, window-published %llu; audio %s, queued %u frames, written %llu/silence %llu frames, end %lld/played-estimate %lld ms, pending %d at %lld ms/ahead %zu at %lld ms, starved %u/ended %u, window-unpublished %s@%d",
         s->generation,s->mse_active?"MSE":s->url_input?"Range":"buffer",(long long)current(s,now),
         (unsigned long long)s->presented_frames,(long long)s->presented_ms,(unsigned long long)decoded,(unsigned long long)dropped,(unsigned long long)s->window_frames,
         audio?"open":"closed",queued,(unsigned long long)s->audio_frames,(unsigned long long)s->audio_silence_frames,(long long)s->audio_end_ms,(long long)played,
-        s->pending.kind,(long long)s->pending.pts_ms,s->ahead_count,(long long)(s->ahead.kind?s->ahead.pts_ms:-1),s->starved,s->ended);
+        s->pending.kind,(long long)s->pending.pts_ms,s->ahead_count,(long long)(s->ahead.kind?s->ahead.pts_ms:-1),s->starved,s->ended,s->snapshot_why?s->snapshot_why:"-",s->snapshot_why_line);
     /* queued includes only this stream's measured DMA contribution, not other
        streams' samples. Remote flags retain server-estimate semantics. */
     web_js_console(s->doc,0,message);
@@ -1311,7 +1319,7 @@ void web_avmedia_checkpoint(void){
 }
 void web_avmedia_snapshot_begin(web_doc *d) {
     web_avmedia_enter();snapshot_document=d;snapshot_candidate=NULL;
-    snapshot_phase=0;snapshot_rejected=false;
+    snapshot_phase=0;snapshot_rejected=false;snapshot_why=NULL;snapshot_why_line=0;snapshot_blend=false;
     nmedia_ff_free(snapshot_regions);snapshot_regions=NULL;snapshot_region_count=snapshot_region_capacity=0;
     for(struct web_avmedia *s=streams;s;s=s->next)if(s->doc==d)s->snapshot.valid=false;
 }
@@ -1323,29 +1331,38 @@ void web_avmedia_layout_begin(web_doc *d){
        and scroll guards reject retired, removed or relocated screen owners. */
     (void)d;
 }
-void web_avmedia_snapshot_reject(void) {if(snapshot_document)snapshot_rejected=true;}
-void web_avmedia_snapshot_reject_region(const canvas_t *c,int x,int y,int w,int h){
+void web_avmedia_snapshot_reject(void) {if(snapshot_document)snapshot_reject_as("font probe",0);}
+static void snapshot_region_note(const canvas_t *c,int x,int y,int w,int h,int line,bool edge){
     if(!snapshot_document||snapshot_rejected||w<=0||h<=0)return;
-    if(!c){snapshot_rejected=true;return;}
+    if(!c){snapshot_reject_as("paint",line);return;}
     struct snapshot_region r={MAX((int64_t)x,c->cx0),MAX((int64_t)y,c->cy0),
-        MIN((int64_t)x+w,c->cx1),MIN((int64_t)y+h,c->cy1)};
+        MIN((int64_t)x+w,c->cx1),MIN((int64_t)y+h,c->cy1),line,edge};
     if(r.x0>=r.x1||r.y0>=r.y1)return;
     if(snapshot_phase){
-        if(!snapshot_candidate){snapshot_rejected=true;return;}
+        if(!snapshot_candidate){snapshot_reject_as("paint",line);return;}
         r.x0+=snapshot_candidate->snapshot.x;r.x1+=snapshot_candidate->snapshot.x;
         r.y0+=snapshot_candidate->snapshot.y;r.y1+=snapshot_candidate->snapshot.y;
     }
-    if(snapshot_candidate){if(snapshot_region_intersects(&r,snapshot_candidate))snapshot_rejected=true;return;}
+    if(snapshot_candidate){
+        if(snapshot_region_intersects(&r,snapshot_candidate)){if(edge)snapshot_blend=true;else snapshot_reject_as("paint",line);}
+        return;
+    }
     /* A risky layer may precede the video in paint order. Retain only its
        clipped extent until the candidate is known, not a page-wide rejection
        or a second DOM tree. Capacity follows actual paint occurrences. */
     if(snapshot_region_count==snapshot_region_capacity){
         size_t n=snapshot_region_capacity?snapshot_region_capacity*2:8;
-        if(n<snapshot_region_capacity||n>SIZE_MAX/sizeof *snapshot_regions){snapshot_rejected=true;return;}
+        if(n<snapshot_region_capacity||n>SIZE_MAX/sizeof *snapshot_regions){snapshot_reject_as("allocation",0);return;}
         struct snapshot_region *v=nmedia_ff_realloc(snapshot_regions,n*sizeof *v);
-        if(!v){snapshot_rejected=true;return;}snapshot_regions=v;snapshot_region_capacity=n;
+        if(!v){snapshot_reject_as("allocation",0);return;}snapshot_regions=v;snapshot_region_capacity=n;
     }
     snapshot_regions[snapshot_region_count++]=r;
+}
+void web_avmedia_snapshot_reject_region_at(const canvas_t *c,int x,int y,int w,int h,int line){
+    snapshot_region_note(c,x,y,w,h,line,false);
+}
+void web_avmedia_snapshot_blend_region(const canvas_t *c,int x,int y,int w,int h){
+    snapshot_region_note(c,x,y,w,h,0,true);
 }
 bool web_avmedia_snapshot_prepare(web_doc *d,canvas_t *c,canvas_t *probe,
                                  int *x,int *y,int scroll_x,int scroll_y) {
@@ -1385,13 +1402,16 @@ bool web_avmedia_snapshot_is_probe(void) {return snapshot_phase!=0;}
 void web_avmedia_snapshot_finish(void) {
     struct web_avmedia *s=snapshot_candidate;
     if(s && snapshot_phase==2 && !snapshot_rejected &&
-       web_video_snapshot_mask(s->snapshot.black,s->snapshot.output,s->snapshot.opaque,s->snapshot.count)) {
+       web_video_snapshot_mask(s->snapshot.black,s->snapshot.output,s->snapshot.committed,s->snapshot.opaque,s->snapshot.count,snapshot_blend)) {
         s->snapshot.valid=true;s->snapshot.delivered=s->presented_frames;
     }
+    const char *why=s&&s->snapshot.valid?NULL:snapshot_rejected?snapshot_why:!s?"no candidate":snapshot_phase!=2?"no probe":"mask";
     /* Only one usable surface is retained per painted document. Hidden or
      * rejected videos must not accumulate native compositor reservations. */
-    for(struct web_avmedia *p=streams;p;p=p->next)
-        if(p->doc==snapshot_document && (p!=s || !p->snapshot.valid))snapshot_clear(p);
+    for(struct web_avmedia *p=streams;p;p=p->next)if(p->doc==snapshot_document){
+        if(p->playing){p->snapshot_why=why;p->snapshot_why_line=snapshot_rejected?snapshot_why_line:0;}
+        if(p!=s || !p->snapshot.valid)snapshot_clear(p);
+    }
     snapshot_candidate=NULL;snapshot_document=NULL;snapshot_phase=0;web_avmedia_leave();
     nmedia_ff_free(snapshot_regions);snapshot_regions=NULL;snapshot_region_count=snapshot_region_capacity=0;
 }
@@ -1523,12 +1543,15 @@ bool web_avmedia_paint(web_doc *d,node_t *n,canvas_t *c,int x,int y,int w,int h)
     bool controls=node_attr(n,"controls")!=NULL;
     int strip=controls?MIN(h,32):0;
     if(snapshot_document && !snapshot_phase && s && s->playing && s->pixels && n->tag==T_video) {
-        if(d!=snapshot_document || snapshot_candidate)snapshot_rejected=true;
+        if(d!=snapshot_document || snapshot_candidate)snapshot_reject_as("second video",0);
         else {
             snapshot_candidate=s;
             s->snapshot.x=(int)x0;s->snapshot.y=(int)y0;s->snapshot.w=(int)(x1-x0);s->snapshot.h=(int)(y1-y0);
             s->snapshot.video_x=x;s->snapshot.video_y=y;s->snapshot.video_w=w;s->snapshot.video_h=h-strip;
-            for(size_t i=0;i<snapshot_region_count;i++)if(snapshot_region_intersects(&snapshot_regions[i],s)){snapshot_rejected=true;break;}
+            for(size_t i=0;i<snapshot_region_count;i++)if(snapshot_region_intersects(&snapshot_regions[i],s)){
+                if(snapshot_regions[i].edge){snapshot_blend=true;continue;}
+                snapshot_reject_as("paint below",snapshot_regions[i].line);break;
+            }
         }
     }
     if(s && s==snapshot_candidate && snapshot_phase)

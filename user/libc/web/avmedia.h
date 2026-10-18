@@ -37,7 +37,12 @@ void web_avmedia_snapshot_begin(web_doc *doc);
 void web_avmedia_snapshot_reject(void);
 /* Bounded-effect layers reject only their actual clipped screen extent.
  * Probe coordinates are translated to the committed candidate surface. */
-void web_avmedia_snapshot_reject_region(const canvas_t *,int,int,int,int);
+void web_avmedia_snapshot_reject_region_at(const canvas_t *,int,int,int,int,int line);
+#define web_avmedia_snapshot_reject_region(c,x,y,w,h) web_avmedia_snapshot_reject_region_at(c,x,y,w,h,__LINE__)
+/* Per-pixel linear compositing over the video (group opacity, a rounded clip
+ * edge): the black/white probes then give each pixel's blend exactly enough
+ * to recompose a new frame without paint. */
+void web_avmedia_snapshot_blend_region(const canvas_t *,int,int,int,int);
 bool web_avmedia_snapshot_prepare(web_doc *doc,canvas_t *committed,canvas_t *probe,
                                  int *x,int *y,int scroll_x,int scroll_y);
 void web_avmedia_snapshot_probe(unsigned phase);

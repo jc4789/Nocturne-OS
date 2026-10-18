@@ -2244,6 +2244,17 @@ static struct window *fd_window(struct file *f) {
     return w->dead ? NULL : w;
 }
 
+/* A title longer than the slot is cut on a UTF-8 sequence boundary and marked
+   with an ellipsis; a split sequence would draw as replacement glyphs. */
+static int user_title(char *dst, const char *src, size_t max) {
+    int r = user_str(dst, src, max);
+    if (r != -N_ERR_NAME_TOO_LONG) return r;
+    size_t n = max - 4;
+    while (n && ((unsigned char)dst[n] & 0xC0) == 0x80) n--;
+    memcpy(dst + n, "\xE2\x80\xA6", 4);
+    return (int)n + 3;
+}
+
 static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
     if (!running) return -N_ERR_UNSUPPORTED;
     if (nwin >= MAX_WIN) return -N_ERR_NO_MEMORY;
@@ -2253,7 +2264,7 @@ static int64_t sys_win_create(int cw, int ch, const char *utitle, int flags) {
     if (ch > sh) ch = sh;
     struct window *w = kzalloc(sizeof *w);
     if (!w) return -N_ERR_NO_MEMORY;
-    if (utitle && user_str(w->title, utitle, sizeof w->title) < 0) strcpy(w->title, "window");
+    if (utitle && user_title(w->title, utitle, sizeof w->title) < 0) strcpy(w->title, "window");
     if (!utitle) strcpy(w->title, current_task->name);
     w->flags = flags;
     w->pid = task_process()->pid;
@@ -2393,7 +2404,7 @@ static int64_t wm_syscall_locked(int num, uint64_t a, uint64_t b, uint64_t c, ui
     case SYS_WIN_SET_TITLE: {
         struct window *w = fd_window(file);
         if (!w) return -N_ERR_NO_HANDLE;
-        if (user_str(w->title, (const char *)b, sizeof w->title) < 0) return -N_ERR_BAD_ADDRESS;
+        if (user_title(w->title, (const char *)b, sizeof w->title) < 0) return -N_ERR_BAD_ADDRESS;
         if (w->shown) {
             damage_rect(w->x, w->y, frame_w(w), TITLE_H);
             damage_rect(0, sh - TASKBAR_H, sw, TASKBAR_H);

@@ -20,7 +20,9 @@ struct web_video_patch {canvas_t canvas;int scroll_x,scroll_y,x,y,w,h,pitch;cons
 static struct web_avmedia *streams,*snapshot_candidate;
 static web_doc *snapshot_document;
 static unsigned snapshot_phase,native_depth;
-static bool snapshot_rejected,oom,seeking,accept=true;
+static bool snapshot_rejected,snapshot_blend,oom,seeking,accept=true;
+static const char *snapshot_why;static int snapshot_why_line;
+static void snapshot_reject_as(const char *why,int line){if(!snapshot_rejected){snapshot_why=why;snapshot_why_line=line;}snapshot_rejected=true;}
 static int published,checks,failed;
 static uint32_t delivered[64];
 static void web_avmedia_enter(void){native_depth++;}
@@ -72,13 +74,18 @@ static void commit_identity(void){
 }
 int main(void){
     uint32_t b[3]={RGB(0,0,0),RGB(5,7,9),RGB(0,0,0)},w[3]={RGB(255,255,255),RGB(5,7,9),RGB(255,255,255)};
-    uint8_t mask[3];check(web_video_snapshot_mask(b,w,mask,3)&&mask[0]==0&&mask[1]==1,"identity and opaque suffix");
-    uint32_t out[3]={1,2,3},committed[3]={4,5,6};web_video_snapshot_overlay(out,committed,mask,3);
+    uint8_t mask[3];uint32_t spans[3];check(web_video_snapshot_mask(b,w,spans,mask,3,false)&&mask[0]==0&&mask[1]==1,"identity and opaque suffix");
+    uint32_t out[3]={1,2,3},committed[3]={4,5,6};web_video_snapshot_overlay(out,committed,b,mask,3);
     check(out[0]==1&&out[1]==5&&out[2]==3,"opaque overlay retained, video untouched");
     b[0]=gfx_mix(RGB(0,0,0),RGB(120,60,20),128);w[0]=gfx_mix(RGB(255,255,255),RGB(120,60,20),128);
-    check(!web_video_snapshot_mask(b,w,mask,1),"integer translucent suffix rejected");
+    check(!web_video_snapshot_mask(b,w,spans,mask,1,false),"undeclared translucent suffix rejected");
+    check(web_video_snapshot_mask(b,w,spans,mask,1,true)&&mask[0]==2,"declared linear compositing accepted");
+    {uint32_t video=RGB(200,100,40),expect=gfx_mix(video,RGB(120,60,20),128),got=video;
+     web_video_snapshot_overlay(&got,spans,b,mask,1);
+     bool near=true;for(int sh=0;sh<24;sh+=8){int d=(int)((got>>sh)&255)-(int)((expect>>sh)&255);if(d<-2||d>2)near=false;}
+     check(near,"recomposed translucent pixel within integer rounding");}
     b[0]=w[0]=gfx_mix(RGB(4,8,12),RGB(120,60,20),128);
-    check(web_video_snapshot_mask(b,w,mask,1)&&mask[0],"alpha over opaque suffix is constant");
+    check(web_video_snapshot_mask(b,w,spans,mask,1,false)&&mask[0],"alpha over opaque suffix is constant");
     setup();commit_identity();check(s.snapshot.valid&&native_depth==0,"committed identity snapshot armed");
     check(s.snapshot.target.px==ui&&s.snapshot.scroll_x==5&&s.snapshot.scroll_y==7,"canvas and both scroll axes fixed");
     int n=published;snapshot_publish(&s);check(published==n,"same decoded frame not republished");

@@ -1,0 +1,16 @@
+{
+  "distribution": "Noto Color Emoji (COLRv1)",
+  "unmodified": true,
+  "files": [
+    {
+      "file": "NotoColorEmoji-Regular.ttf",
+      "source": "D:\\Fonts\\noto emoji\\NotoColorEmoji-Regular.ttf",
+      "size": 25337824,
+      "sha256": "ad4a3478943b88660a194d1434793bc02c8007819f2d1e7da9ede289e78f9ca7",
+      "copyright": [
+        "Copyright 2021 Google Inc. All Rights Reserved."
+      ],
+      "license": "SIL Open Font License 1.1 (NotoColorEmoji-LICENSE.txt)"
+    }
+  ]
+}

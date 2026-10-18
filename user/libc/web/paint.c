@@ -46,7 +46,7 @@ struct web_hit_index {
     float (*regions)[4];
     size_t region_count, region_capacity;
     uint64_t layout, dom, visual, fonts;
-    int view_x, view_y;
+    int view_x, view_y, view_w, view_h;
     bool valid;
 };
 
@@ -244,7 +244,7 @@ static bool radius_clip_push(struct pctx *P,const struct radius_cache *cache,str
     if(!isfinite(left)||!isfinite(top)||left<INT_MIN||top<INT_MIN||left>INT_MAX||top>INT_MAX){P->failed=true;return false;}
     *clip=(struct gfx_mask_clip){.next=P->c->mask_clip,.alpha=cache->alpha,.x=(int)lround(left),.y=(int)lround(top),.w=cache->width,.h=cache->height,.pitch=cache->width,.opaque=cache->opaque};
     P->c->mask_clip=clip;
-    web_avmedia_snapshot_reject_region(P->c,clip->x,clip->y,clip->w,clip->h);
+    web_avmedia_snapshot_blend_region(P->c,clip->x,clip->y,clip->w,clip->h);
     return true;
 }
 
@@ -1692,13 +1692,17 @@ static bool prepare_paint_tree(web_doc *d,box_t *b){
 static bool prepare_paint_order(web_doc *d){
     if(d->paint_order_valid&&d->paint_order_layout==d->layout_revision&&
        d->paint_order_visual==d->visual_revision&&(!d->paint_shadow_crop||
-       (d->paint_shadow_view_x==d->view_x&&d->paint_shadow_view_y==d->view_y)))return true;
+       (d->paint_shadow_view_x==d->view_x&&d->paint_shadow_view_y==d->view_y&&
+        d->paint_shadow_view_w==d->width&&d->paint_shadow_view_h==d->height)))return true;
+    /* Viewport-cropped radius/shadow masks are cut to the whole view rect: a
+       viewport resize that leaves layout unchanged must still recut them. */
     d->paint_order_valid=false;
     d->paint_shadow_crop=false;
     if(d->profile_enabled)paint_profile.order_builds++;
     if(!prepare_paint_tree(d,d->root_box))return false;
     d->paint_order_layout=d->layout_revision;d->paint_order_visual=d->visual_revision;
-    d->paint_shadow_view_x=d->view_x;d->paint_shadow_view_y=d->view_y;d->paint_order_valid=true;return true;
+    d->paint_shadow_view_x=d->view_x;d->paint_shadow_view_y=d->view_y;
+    d->paint_shadow_view_w=d->width;d->paint_shadow_view_h=d->height;d->paint_order_valid=true;return true;
 }
 static void release_layers(pvec *layers,bool borrowed){if(!borrowed)pv_free(layers);}
 
@@ -2117,7 +2121,10 @@ static void paint_box(struct pctx *P, box_t *b, bool layer_root) {
             if (right > P->vx1) right = P->vx1; if (bottom > P->vy1) bottom = P->vy1;
             if (right > left && bottom > top) {
                 gx = (int)left; gy = (int)top; gw = (int)(right - left); gh = (int)(bottom - top);
-                web_avmedia_snapshot_reject_region(c,gx,gy,gw,gh);
+                /* Group opacity mixes each pixel with what was under it, and
+                   nothing else; other filter functions mix neighbours. */
+                if(st->filter)web_avmedia_snapshot_reject_region(c,gx,gy,gw,gh);
+                else web_avmedia_snapshot_blend_region(c,gx,gy,gw,gh);
                 if(P->d->profile_enabled){paint_profile.groups++;paint_profile.group_pixels+=(uint64_t)gw*(uint64_t)gh;}
                 if ((size_t)gw > SIZE_MAX / sizeof *saved / (size_t)gh ||
                     !(saved = malloc(sizeof *saved * (size_t)gw * (size_t)gh))) {
@@ -2537,7 +2544,8 @@ static bool hit_index_lookup(struct pctx *P){
     if(!index){index=calloc(1,sizeof *index);if(!index)return false;d->hit_index=index;}
     uint64_t fonts=font_metrics_generation();
     if(!index->valid||index->layout!=d->layout_revision||index->dom!=d->dom_revision||index->visual!=d->visual_revision||
-       index->view_x!=d->view_x||index->view_y!=d->view_y||index->fonts!=fonts||!fonts){
+       index->view_x!=d->view_x||index->view_y!=d->view_y||index->view_w!=d->width||index->view_h!=d->height||
+       index->fonts!=fonts||!fonts){
         index->valid=false;index->count=index->branch_count=index->region_count=0;
         struct pctx build=*P;struct web_hit ignored={0};build.hit=&ignored;build.index_build=index;
         walk(&build);
@@ -2559,7 +2567,8 @@ static bool hit_index_lookup(struct pctx *P){
             if(root==SIZE_MAX){P->failed=true;return true;}
         }
         index->layout=d->layout_revision;index->dom=d->dom_revision;index->visual=d->visual_revision;
-        index->view_x=d->view_x;index->view_y=d->view_y;index->fonts=fonts;index->valid=true;
+        index->view_x=d->view_x;index->view_y=d->view_y;index->view_w=d->width;index->view_h=d->height;
+        index->fonts=fonts;index->valid=true;
     }
     for(size_t i=0;i<index->region_count;i++)if(hit_rect_contains(index->regions[i],P->hx,P->hy))return false;
     const struct hit_primitive *item=index->count?hit_query(index,0,P->hx,P->hy,NULL):NULL;

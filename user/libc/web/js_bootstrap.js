@@ -927,7 +927,8 @@
     function styleRead(value,name){const record=styleRecord(value);return record.computed?
         dom('computed',record.node,styleProperty(name),record.pseudo):dom('style',record.node,styleProperty(name));}
     function styleWrite(value,name,text,priority=''){
-        name=styleProperty(name);text=text==null?'':String(text);priority=String(priority);
+        /* CSSOM: value and priority are [LegacyNullToEmptyString]. */
+        name=styleProperty(name);text=text==null?'':String(text);priority=priority===null?'':String(priority);
         const record=styleRecord(value);if(record.computed)throw new DOMException('Computed style is read-only','NoModificationAllowedError');
         dom('style',record.node,name,text,priority);
     }
