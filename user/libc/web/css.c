@@ -13,6 +13,7 @@
 #include "form_validation.h"
 #include "form_value.h"
 #include "avmedia.h"
+#include "inspect_private.h"
 
 /* Slot 2 is reserved for CSS. The supervisor and each subtree worker own
    independent declaration/variable scratch; rule indexes and DOM are frozen. */
@@ -243,6 +244,7 @@ struct sheet {
        imported rules, although the style vector uses import postorder. */
     sheet_t *import_parent,*import_first,*import_last,*import_next;
     const struct css_rule_info *import_owner;
+    const char *href; /* instance request URL for DevTools; NULL: inline */
 };
 
 struct pctx {
@@ -5073,4 +5075,63 @@ void css_cascade(web_doc *d, int vw, int vh) {
     d->styled_w = vw;
     d->styled_h = vh;
     d->style_full_dirty = d->style_pending_dirty = false;
+}
+
+/* ---------------------------------------------------------------- DevTools */
+void css_sheet_href(sheet_t *sheet, const char *href) { if (sheet) sheet->href = href; }
+
+static bool inspect_decls(const struct decl *v, int count, const struct css_inspect_sink *sink) {
+    for (int i = 0; i < count; i++) {
+        const struct decl *x = &v[i];
+        const char *name = x->p ? css_prop_name(css_prop_index(x->p), NULL) : x->name;
+        if (!name) continue;
+        if (!sink->decl(sink->ctx, name, x->value ? x->value : "", x->important,
+                        x->p ? css_prop_inherited(x->p) : true)) return false;
+    }
+    return true;
+}
+/* A scoped sheet applies inside its shadow tree and to its host; document
+   sheets apply to the document tree. The matcher handles :host/::slotted. */
+static bool inspect_scope_ok(const sheet_t *s, node_t *e) {
+    node_t *root = e;
+    while (root->parent) root = root->parent;
+    if (!s->scope) return root->type == N_DOC;
+    return root == s->scope || e == s->scope->shadow_host;
+}
+static bool inspect_sheet(web_doc *d, const sheet_t *s, node_t *e, uint32_t *order, const struct css_inspect_sink *sink) {
+    int vw = d->sty.index_w > 0 ? d->sty.index_w : d->styled_w, vh = d->sty.index_h > 0 ? d->sty.index_h : d->styled_h;
+    bool scripting = web_js_enabled(d);
+    if (!sheet_media_ok(s, vw, vh, scripting) || !inspect_scope_ok(s, e)) { for (struct rule *r = s->first; r; r = r->next) (*order)++; return true; }
+    const struct selector_match context = {.shadow = s->scope};
+    for (struct rule *r = s->first; r; r = r->next) {
+        uint32_t at = (*order)++;
+        if (!r->ndecls || !r->sel || !media_chain_ok(r->media, vw, vh, scripting)) continue;
+        bool matched = false; uint32_t spec = 0;
+        for (int k = 0; k < r->sel->n; k++) {
+            const struct selector *x = r->sel->v[k];
+            if (x->pseudo || !match_from_bound(x->right, e, &context)) continue;
+            if (!matched || x->spec > spec) spec = x->spec;
+            matched = true;
+        }
+        if (!matched) continue;
+        if (!sink->rule(sink->ctx, r->selector_text ? r->selector_text : "", s->href, s->ua, spec, at)) return false;
+        if (!inspect_decls(r->decls, r->ndecls, sink)) return false;
+    }
+    return true;
+}
+bool css_inspect_rules(web_doc *d, node_t *e, const struct css_inspect_sink *sink) {
+    if (!d || !e || e->type != N_ELEM || !sink) return false;
+    uint32_t order = 0;
+    if (ua_sheet && !inspect_sheet(d, ua_sheet, e, &order, sink)) return false;
+    if (quirks_sheet && d->quirks && !inspect_sheet(d, quirks_sheet, e, &order, sink)) return false;
+    for (int i = 0; i < d->sty.sheets.n; i++)
+        if (!inspect_sheet(d, d->sty.sheets.v[i], e, &order, sink)) return false;
+    return true;
+}
+bool css_inspect_inline(web_doc *d, node_t *e, const struct css_inspect_sink *sink) {
+    (void)d;
+    if (!e || e->type != N_ELEM || !sink) return false;
+    const struct css_declarations *block = e->style_declarations;
+    if (!sink->rule(sink->ctx, "element.style", NULL, false, UINT32_MAX, UINT32_MAX)) return false;
+    return !block || inspect_decls(block->values, block->count, sink);
 }

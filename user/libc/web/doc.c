@@ -20,6 +20,7 @@
 #include "image_source.h"
 #include "avmedia.h"
 #include "js_worker.h"
+#include "inspect_private.h"
 #include "frame.h"
 #include "html_policy.h"
 #include "html_encoding.h"
@@ -319,6 +320,7 @@ static bool add_sheet_ast(web_doc *d, const char *css, size_t n, const char *bas
                sheet use its order key; the stable cascade sort then preserves
                imports before the parent, without a shrinking floating-point
                depth interval that can cross an earlier root stylesheet. */
+            if (f->url) css_sheet_href(f->sheet, ar_strdup(arena, f->url)); /* DevTools rule origin */
             if (!sheet_push(&d->sty.sheets, f->sheet)) { failed = true; break; }
             d->sty.index_dirty = true;
             active = f->parent; f->parent = NULL; sheet_walk_free(f);

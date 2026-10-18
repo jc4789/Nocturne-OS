@@ -16,8 +16,21 @@ const avmediaBridge = (() => {
     function get(node) {
         brand(node);
         let s=states.get(node);
-        if(!s){s={generation:0,intent:0,seekIntent:0,currentSrc:'',controller:null,promise:null,network:0,error:null,volume:1,muted:false,rate:1,defaultRate:1,preservePitch:true,last:null,lastTime:0,readyObserved:0,metadataSeen:false,dataSeen:false,durationSeen:NaN};states.set(node,s);}
+        if(!s){s={generation:0,intent:0,seekIntent:0,currentSrc:'',controller:null,promise:null,network:0,error:null,volume:1,muted:false,rate:1,defaultRate:1,preservePitch:true,last:null,lastTime:0,readyObserved:0,metadataSeen:false,dataSeen:false,durationSeen:NaN,played:[],playedFrom:null};states.set(node,s);}
         return s;
+    }
+    function recordPlayed(s,now) {
+        /* HTML "played": the ranges the official playback position has
+           advanced through while playing. A seek or pause ends the run. */
+        if(!now||now.paused||now.seeking||!Number.isFinite(now.currentTime)){s.playedFrom=null;return;}
+        const t=now.currentTime;
+        if(s.playedFrom===null||t<s.playedFrom){s.playedFrom=t;return;}
+        let start=s.playedFrom,end=t;const merged=[];
+        for(const r of s.played){
+            if(r[1]<start||r[0]>end)merged.push(r);
+            else{start=Math.min(start,r[0]);end=Math.max(end,r[1]);}
+        }
+        merged.push([start,end]);merged.sort((a,b)=>a[0]-b[0]);s.played=merged;
     }
     function snapshot(node) { get(node);return native('state',node); }
     function source(node) {
@@ -100,6 +113,7 @@ const avmediaBridge = (() => {
                 if(!now.paused&&host.now()-s.lastTime>=250){s.lastTime=host.now();event(node,'timeupdate');}
                 if(s.generation!==generation)continue;
                 now=native('state',node);
+                recordPlayed(s,now);
                 s.last=now;
                 if(now.paused&&s.network!==2)active.delete(node);
             }
@@ -110,7 +124,7 @@ const avmediaBridge = (() => {
         mseBridge.detach(node);
         if(s.controller)s.controller.abort();
         s.controller=null;s.generation=(s.generation+1)>>>0;s.intent++;s.seekIntent++;s.promise=null;s.error=null;s.network=0;s.currentSrc='';s.last=null;
-        s.readyObserved=0;s.metadataSeen=s.dataSeen=false;s.durationSeen=NaN;
+        s.readyObserved=0;s.metadataSeen=s.dataSeen=false;s.durationSeen=NaN;s.played=[];s.playedFrom=null;
         native('reset',node,s.generation);textTrackBridge.reset(node);active.delete(node);
         if(s.rate!==s.defaultRate){native('rate',node,s.defaultRate,s.preservePitch);s.rate=s.defaultRate;setTimeout(()=>event(node,'ratechange'),0);}
     }
@@ -127,11 +141,15 @@ const avmediaBridge = (() => {
                 const mediaSource=objectURLBridge.mediaSource(url),blob=objectURLBridge.blob(url);
                 if(mediaSource) {
                     mseBridge.attach(mediaSource,node,generation);
+                    /* Metadata (an initialization segment) completes the load.
+                       Current data is the author's appends: a first frame after
+                       the current position (e.g. PTS 0.033 at 0) keeps
+                       HAVE_METADATA, and play() must not wait on it. */
                     for(;;){
                         if(!current(node,s,generation,url)||controller.signal.aborted)throw abortError();
                         const now=native('state',node);if(now.error&&!now.mseQuotaError)throw new Error(now.error);
                         readyEvents(node,s,now);
-                        if(now.readyState>=2)break;
+                        if(now.readyState>=1)break;
                         await new Promise(resolve=>setTimeout(resolve,20));
                     }
                 } else if(blob) {
@@ -189,6 +207,7 @@ const avmediaBridge = (() => {
         get error(){return get(this).error;}
         get duration(){return mseBridge.attached(this)?mseBridge.duration(this):snapshot(this).duration;}
         get buffered(){get(this);return mseBridge.attached(this)?mseBridge.nodeRanges(this,false):mseBridge.timeRanges();}
+        get played(){const s=get(this);recordPlayed(s,snapshot(this));return mseBridge.timeRanges(s.played);}
         get seekable(){get(this);return mseBridge.attached(this)?mseBridge.nodeRanges(this,true):mseBridge.timeRanges();}
         get audioTracks(){get(this);return mseBridge.nodeTracks(this,'audio');}
         get videoTracks(){get(this);return mseBridge.nodeTracks(this,'video');}
@@ -201,6 +220,7 @@ const avmediaBridge = (() => {
         set currentTime(value){
             const s=get(this),time=Number(value),generation=s.generation,url=s.currentSrc;
             if(!Number.isFinite(time)||time<0)throw new TypeError('Invalid media time');
+            recordPlayed(s,native('state',this));s.playedFrom=null;
             const seekIntent=++s.seekIntent;notify(this,s,generation,url,'seeking');
             if(!native('seek',this,time))throw new DOMException('Input cannot seek','NotSupportedError');
             const finish=async()=>{
@@ -263,9 +283,18 @@ const avmediaBridge = (() => {
             const wasPaused=snapshot(this).paused;
             if(!native('play',this))throw new DOMException(native('state',this).error||'No playable media','NotSupportedError');
             s.last=native('state',this);active.add(this);monitor();
-            if(wasPaused){event(this,'play');if(s.intent!==intent||snapshot(this).paused)throw new DOMException('Play was cancelled','AbortError');event(this,'playing');}
+            if(wasPaused){
+                event(this,'play');if(s.intent!==intent||snapshot(this).paused)throw new DOMException('Play was cancelled','AbortError');
+                /* HTML: data at the position notifies playing; a gap notifies
+                   waiting, and readyEvents() reports playing when future data
+                   arrives. Range windows publish at most HAVE_CURRENT_DATA. */
+                const now=snapshot(this);
+                if(now.readyState<2||now.waiting)event(this,'waiting');
+                else if(now.readyState<3||s.readyObserved>=3)event(this,'playing');
+                else readyEvents(this,s,now); /* canplay, then playing */
+            }
         }
-        pause(){const s=get(this),wasPaused=snapshot(this).paused;s.intent++;native('pause',this);s.last=native('state',this);if(s.network===2){active.add(this);monitor();}else active.delete(this);if(!wasPaused){event(this,'timeupdate');event(this,'pause');}}
+        pause(){const s=get(this),wasPaused=snapshot(this).paused;recordPlayed(s,native('state',this));s.playedFrom=null;s.intent++;native('pause',this);s.last=native('state',this);if(s.network===2){active.add(this);monitor();}else active.delete(this);if(!wasPaused){event(this,'timeupdate');event(this,'pause');}}
     }
     for(const name of ['controls','autoplay','loop'])Object.defineProperty(HTMLMediaElement.prototype,name,{configurable:true,enumerable:true,get(){brand(this);return this.hasAttribute(name);},set(v){brand(this);this.toggleAttribute(name,!!v);}});
     for(const [name,value] of Object.entries({NETWORK_EMPTY:0,NETWORK_IDLE:1,NETWORK_LOADING:2,NETWORK_NO_SOURCE:3,HAVE_NOTHING:0,HAVE_METADATA:1,HAVE_CURRENT_DATA:2,HAVE_FUTURE_DATA:3,HAVE_ENOUGH_DATA:4})){

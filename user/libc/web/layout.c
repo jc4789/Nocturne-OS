@@ -930,6 +930,7 @@ struct item {
     node_t *link;
     float shift; /* baseline shift upwards */
     float descent; /* native font metric collected during line sizing */
+    bool float_sized; /* IT_FLOAT already sized by a line-fit test */
 };
 
 struct ivec {
@@ -1239,6 +1240,8 @@ struct iline {
 };
 
 static void place_float(box_t *c, box_t *parent, struct bfc *f, float ox, float oy, float y_rel, float cbh);
+static void position_float(box_t *c, float cw, struct bfc *f, float ox, float oy, float y_rel);
+static bool float_fits_line(struct iline *L, box_t *c, float used);
 
 static void line_space(struct iline *L) {
     box_t *b = L->blk;
@@ -1474,7 +1477,11 @@ static void finish_line(struct iline *L, int ls, int le, bool forced) {
     }
     L->y += lh;
     /* floats that did not fit on the line just finished */
-    for (int k = 0; k < L->npending; k++) place_float(v[L->pending_floats[k]].box, b, L->f, L->ox, L->oy, L->y, L->cbh);
+    for (int k = 0; k < L->npending; k++) {
+        struct item *it = &v[L->pending_floats[k]];
+        if (it->float_sized) position_float(it->box, b->w, L->f, L->ox, L->oy, L->y);
+        else place_float(it->box, b, L->f, L->ox, L->oy, L->y, L->cbh);
+    }
     L->npending = 0;
     line_space(L);
 }
@@ -1581,6 +1588,14 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
             if (line_w == 0 && chunk_w == 0) {
                 place_float(c, b, f, ox, oy, L.y, cbh);
                 line_space(&L);
+            } else if (f && !L.npending) {
+                /* content so far, without a space that would hang at the break */
+                float used = line_w + chunk_w - (i > 0 && iv.v[i - 1].space_end ? iv.v[i - 1].sw : 0);
+                it->float_sized = true;
+                if (float_fits_line(&L, c, used)) {
+                    position_float(c, b->w, f, ox, oy, L.y);
+                    line_space(&L);
+                } else L.pending_floats[L.npending++] = i;
             } else L.pending_floats[L.npending++] = i;
             continue;
         }
@@ -1688,7 +1703,7 @@ static void layout_inline(box_t *b, struct bfc *f, float ox, float oy, float cbh
 }
 
 /* ---------------------------------------------------------------- floats */
-static void place_float(box_t *c, box_t *parent, struct bfc *f, float ox, float oy, float y_rel, float cbh) {
+static void size_float(box_t *c, box_t *parent, float cbh) {
     float cw = parent->w;
     resolve_edges(c, cw);
     c->cb = parent;
@@ -1705,13 +1720,21 @@ static void place_float(box_t *c, box_t *parent, struct bfc *f, float ox, float 
         c->w = clamp_w(c, w, cw);
         layout_inner(c, NULL, 0, 0, cbh);
     }
-    float mw = c->w + hext(c) + c->m[1] + c->m[3];
-    float mh = c->h + vext(c) + c->m[0] + c->m[2];
-    float y = oy + y_rel;
+}
+
+/* the BFC y where a sized float's margin box may go, given its order and clearance */
+static float float_min_y(const box_t *c, const struct bfc *f, float y) {
     if (f) {
         if (c->st->clear) y = fmaxf_(y, bfc_clear(f, c->st->clear));
         y = fmaxf_(y, f->last_top);
     }
+    return y;
+}
+
+static void position_float(box_t *c, float cw, struct bfc *f, float ox, float oy, float y_rel) {
+    float mw = c->w + hext(c) + c->m[1] + c->m[3];
+    float mh = c->h + vext(c) + c->m[0] + c->m[2];
+    float y = float_min_y(c, f, oy + y_rel);
     float l = ox, r = ox + cw;
     for (int guard = 0; f && guard < 200; guard++) {
         bfc_space(f, y, mh, ox, ox + cw, &l, &r);
@@ -1724,6 +1747,27 @@ static void place_float(box_t *c, box_t *parent, struct bfc *f, float ox, float 
     if (f) bfc_add(f, x, y, mw, mh, c->st->float_);
     c->x = x - ox + c->m[3] + c->b[3] + c->p[3];
     c->y = y - oy + c->m[0] + c->b[0] + c->p[0];
+}
+
+static void place_float(box_t *c, box_t *parent, struct bfc *f, float ox, float oy, float y_rel, float cbh) {
+    size_float(c, parent, cbh);
+    position_float(c, parent->w, f, ox, oy, y_rel);
+}
+
+/* CSS 2.1 9.5.1: a float met inside a line goes beside that line's content
+   when its margin box fits in the line's remaining width at the line's top;
+   the line box shortens around it. Otherwise it waits for the line to end. */
+static bool float_fits_line(struct iline *L, box_t *c, float used) {
+    box_t *b = L->blk;
+    size_float(c, b, L->cbh);
+    float y = L->oy + L->y;
+    if (float_min_y(c, L->f, y) > y + 0.01f) return false;
+    float mw = c->w + hext(c) + c->m[1] + c->m[3];
+    float mh = c->h + vext(c) + c->m[0] + c->m[2];
+    float l, r;
+    bfc_space(L->f, y, fmaxf_(mh, L->strut_lh), L->ox, L->ox + b->w, &l, &r);
+    if (L->first_line) l += len_resolve(&b->st->text_indent, b->w);
+    return r - l - mw >= used - 0.01f;
 }
 
 /* ---------------------------------------------------------------- block layout */

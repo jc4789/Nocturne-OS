@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <ctype.h>
 #include "webi.h"
+#include "inspect_private.h"
 
 /* ---------------------------------------------------------------- small parsing helpers */
 static void trim(const char **s, size_t *n) {
@@ -1568,6 +1569,7 @@ bool css_prop_is_font(const struct propdef *p) {
 bool css_prop_is_motion(const struct propdef *p) {
     return p && (!strcmp(p->name,"animation") || !strncmp(p->name,"animation-",10));
 }
+bool css_prop_inherited(const struct propdef *p) { return p && p->inherited; }
 
 /* ---------------------------------------------------------------- longhand values */
 static bool kw_find(const struct kw *k, const char *s, size_t n, uint8_t *out) {

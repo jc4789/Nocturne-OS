@@ -67,6 +67,7 @@ static bool navigation_ready, sync_stopped;
 struct transfer {
     struct transfer *next;
     uint64_t network_id, resource_id, generation;
+    uint64_t devtools; /* Network panel entry, 0 when not recorded */
     int kind;
     bool keepalive, detached;
 };
@@ -92,7 +93,7 @@ static bool console_startup_pending(void) {
 }
 
 static int console_h(void);
-static int console_visible(void) { return MAX(1, (console_h() - 48) / 16); }
+static int console_visible(void) { return MAX(1, (console_h() - 72) / 16); } /* below the DevTools tab bar */
 static void console_scroll(int delta) {
     int64_t desired = (int64_t)console_skip + delta;
     console_skip = (int)MAX(0, MIN(desired, MAX(console_n - console_visible(), 0)));
@@ -175,7 +176,12 @@ static bool native_scroll_active;
 #include "browser_events.h"
 
 static int page_w(void) { return MAX(w->w - SCRW, 50); }
-static int console_h(void) { return console_open&&!browser_fullscreen ? MIN(220, MAX(80, (w->h - TB - SB) / 3)) : 0; }
+static int devtools_height; /* DevTools panel, dragged by its top edge; 0: default share */
+static int console_h(void) {
+    if (!console_open || browser_fullscreen) return 0;
+    int room = w->h - TB - SB, h = devtools_height ? devtools_height : room * 2 / 5;
+    return MAX(MIN(h, room - 60), MIN(120, room / 2));
+}
 static int page_h(void) { return MAX(w->h - TB - SB - console_h(), 20); }
 static int max_scroll(void) { return MAX(doc_h - page_h(), 0); }
 static int max_scroll_x(void) { return MAX(doc_w - page_w(), 0); }
@@ -322,11 +328,14 @@ static void draw_status(void) {
     gfx_text(&cl, 8, y + 4, s, hover[0] ? RGB(160, 200, 255) : UI_DIM, TRANSPARENT, FONT_SMALL);
 }
 
+#include "browser_devtools.h"
+
 static void draw_page(void) {
     canvas_t *c = &w->c;
     int pw = page_w(), ph = page_h();
     if (doc) web_paint(doc, c, 0, TB, pw, ph, scroll_x, scroll_y);
     else gfx_fill(c, 0, TB, pw, ph, RGB(255, 255, 255));
+    devtools_draw_overlay(c);
     /* scrollbar */
     int x = w->w - SCRW;
     gfx_fill(c, x, TB, SCRW, ph, RGB(36, 34, 60));
@@ -355,6 +364,10 @@ static void draw_console(void) {
     if (console_open) {
         canvas_t *c = &w->c;
         int top = TB + page_h(), h = console_h();
+        devtools_draw(c, top, h);
+        console_dirty = false;
+        if (dt_tab != DT_CONSOLE) return;
+        top += DT_TABH; h -= DT_TABH;
         gfx_fill(c, 0, top, w->w, h, RGB(18, 16, 30));
         gfx_hline(c, 0, top, w->w, UI_ACCENT);
         char heading[192];
@@ -456,7 +469,7 @@ static void redraw(void) {
 }
 static void redraw_damage(void){
     int x,y,width,height;
-    if(!doc||need_paint||sel_node||!web_take_paint_damage(doc,&x,&y,&width,&height)){redraw();return;}
+    if(!doc||need_paint||sel_node||devtools_overlay_visible()||!web_take_paint_damage(doc,&x,&y,&width,&height)){redraw();return;}
     if(width<=0||height<=0)return;
     uint64_t start=debug_js?n_clock_uptime_ms():0;
     canvas_t original=w->c;
@@ -831,6 +844,7 @@ static void relayout(void) {
     if (debug_js) { loop_profile.layout_ms += n_clock_uptime_ms() - start; loop_profile.layouts++; }
     clamp_scroll();
     need_layout = false;
+    devtools_refresh(false);
 }
 
 static void set_title(void) {
@@ -1007,6 +1021,7 @@ static void resource_completed(webnet *net, uint64_t id, uint64_t gen,
                                const struct webnet_response *result, void *opaque) {
     (void)net; (void)id;
     struct transfer *t = opaque;
+    dt_net_update(t->devtools, result);
     if (!t->detached && doc && gen == generation && t->generation == generation) {
         debug_image_result(t, result);
         if (debug_js && t->kind == WEB_RESOURCE_CSS)
@@ -1053,6 +1068,7 @@ static bool host_request(void *opaque, const struct web_request *request) {
     };
     t->network_id = webnet_submit(network, &r, resource_completed, t);
     if (!t->network_id) { free(t); return false; }
+    t->devtools = dt_net_begin(false, generation, request->id, request->kind, request->method, request->url, request->headers);
     t->next = transfers;
     transfers = t;
     return true;
@@ -1263,7 +1279,7 @@ static bool host_video_present(void *opaque, web_doc *document, const struct web
        document, canvas, viewport, scroll and native-overlay checks below
        reject an obsolete surface without re-entering DOM or layout here. */
     if (!w || !patch || document != doc || quit || native_wait || pending_navigation ||
-        sel_node || !patch->pixels || patch->w <= 0 || patch->h <= 0 ||
+        sel_node || devtools_overlay_visible() || !patch->pixels || patch->w <= 0 || patch->h <= 0 ||
         patch->pitch < patch->w ||
         patch->canvas.px != w->c.px || patch->canvas.w != w->c.w ||
         patch->canvas.h != w->c.h || patch->canvas.pitch != w->c.pitch ||
@@ -1358,7 +1374,7 @@ static bool host_script_checkpoint(void *opaque) {
         if(!event)break;
         if(e.type==EV_CLOSE){quit=true;return false;}
         if(e.type==EV_WHEEL && console_open && e.y>=TB+page_h() && e.y<w->h-SB) {
-            console_scroll(-e.wheel*3);redraw_console();continue;
+            devtools_wheel(e.x,e.y,e.wheel);redraw_console();continue;
         }
         /* Escape in native chrome/fullscreen is an ordinary UI command, not
            permission to permanently abort the page's author execution. Keep
@@ -1580,6 +1596,7 @@ static void navigation_completed(webnet *net, uint64_t id, uint64_t gen,
     (void)net; (void)opaque;
     if (id != navigation_id || gen != navigation_generation) return;
     navigation_id = 0;
+    dt_net_update(dt_nav_serial, result);
     /* This callback observes the complete response, never its first byte.
        Generation/id checks above prevent a canceled request changing timing. */
     if (!result->error[0] && result->status > 0) {
@@ -1779,7 +1796,9 @@ static void navigate_inner(const char *url, const void *post, size_t length, con
     };
     navigation_timing.fetch_start_ms = n_clock_uptime_ms();
     navigation_timing.fetch_valid = true;
+    dt_net_clear(); /* the Network panel follows the top-level document */
     navigation_id = webnet_submit(network, &rq, navigation_completed, NULL);
+    if (navigation_id) dt_nav_serial = dt_net_begin(true, navigation_generation, 0, -1, rq.method, url, rq.headers);
     if (!navigation_id) {
         strcpy(navigation_response.error, "request could not be started");
         (void)web_response_set_url(&navigation_response, url);
@@ -2203,8 +2222,10 @@ static void console_insert(const char *text) {
     memcpy(console_input+console_cursor,text,n);console_cursor+=n;console_dirty=true;
 }
 static void console_key(const struct gui_event *e) {
+    if(dt_tab!=DT_CONSOLE){devtools_key(e);return;}
     uint32_t k=e->key;bool ctrl=e->mods&NMOD_CTRL;
     if(ctrl&&k>='A'&&k<='Z')k+=32;
+    if(ctrl&&(k=='['||k==']')){devtools_set_tab(k==']'?DT_NETWORK:DT_ELEMENTS);return;}
     size_t length=strlen(console_input);
     if(k==NKEY_PGUP){console_scroll(console_visible());return;}
     if(k==NKEY_PGDN){console_scroll(-console_visible());return;}
@@ -2295,12 +2316,18 @@ static void key(const struct gui_event *e) {
     if (k == NKEY_F12) {
         console_open = !console_open;
         if(console_open)focus=F_CONSOLE;else if(focus==F_CONSOLE)focus=F_PAGE;
+        if(!console_open){dt_picking=false;dt_set_hover(NULL);}
         need_layout = true;
         return;
     }
+    /* Ctrl+Shift+C copies the console log while typing in the console. */
+    if (ctrl && (e->mods & NMOD_SHIFT) && (k == 'i' || k == 'j' ||
+        (k == 'c' && !(console_open && focus == F_CONSOLE && dt_tab == DT_CONSOLE)))) {
+        devtools_shortcut(k);
+        return;
+    }
     if (console_open && ctrl && k == 'k') {
-        console_n = console_skip = 0;
-        console_dirty = true;
+        devtools_clear();
         return;
     }
     if (k == NKEY_ESC && loading && !web_modal_active(doc)) {
@@ -2449,7 +2476,7 @@ static void mouse_down(const struct gui_event *e) {
     if(pressed_node)return; /* an additional button is not a new primary press */
     web_active_release(doc);pressed_node=NULL;
     int x = e->x, y = e->y;
-    if (console_open && y >= TB + page_h() && y < w->h - SB) {focus=F_CONSOLE;console_dirty=true;return;}
+    if (devtools_pointer_down(x, y)) return;
     if (sel_node) {
         int vis = MIN(sel_n - sel_top, (w->h - SB - sel_y) / SEL_H);
         if (ui_hit(x, y, sel_x, sel_y, sel_w, vis * SEL_H)) choose_select(sel_top + (y - sel_y) / SEL_H);
@@ -2564,7 +2591,7 @@ static void mouse_move(const struct gui_event *e) {
 }
 
 static void handle(const struct gui_event *e) {
-    bool console_only=console_open &&
+    bool console_only=console_open && !dt_resizing &&
         ((e->type==EV_KEY && focus==F_CONSOLE) ||
          (e->type==EV_WHEEL && e->y>=TB+page_h() && e->y<w->h-SB));
     switch (e->type) {
@@ -2586,6 +2613,7 @@ static void handle(const struct gui_event *e) {
         if(!(e->buttons&1))web_active_release(doc);
         else break; /* another button's release does not end the primary press */
         if (drag_sb) { drag_sb = false; pressed_node = NULL; break; }
+        if (dt_resizing || dt_swallow_up) { dt_resizing = dt_swallow_up = false; pressed_node = NULL; break; }
         if (doc) {
             web_node *capture=native_capture_target(e);
             bool inside=e->y>=TB && e->y<TB+page_h() && e->x>=0 && e->x<page_w();
@@ -2602,13 +2630,14 @@ static void handle(const struct gui_event *e) {
         break;
     case EV_MOUSE_MOVE:
         if(!(e->buttons&1)){web_active_release(doc);pressed_node=NULL;}
-        mouse_move(e);
+        if(!devtools_pointer_move(e->x,e->y))mouse_move(e);
         flush_dom_layout();
         if (need_paint && !quit) redraw();
+        else if (!quit) redraw_console();
         return;
     case EV_WHEEL:
         if (console_open && e->y >= TB + page_h() && e->y < w->h - SB) {
-            console_scroll(-e->wheel * 3);
+            devtools_wheel(e->x, e->y, e->wheel);
         } else if (sel_node) {
             int room = MAX((w->h - SB - sel_y) / SEL_H, 1);
             sel_top = MAX(0, MIN(sel_n - room, sel_top + e->wheel));
@@ -2674,7 +2703,7 @@ static void handle_native_wait(const struct gui_event *e) {
     if (e->type == EV_MOUSE_MOVE && drag_sb) { scrollbar_drag(e->y); redraw(); return; }
     if (e->type == EV_MOUSE_UP && drag_sb) { drag_sb = false; redraw(); return; }
     if(e->type==EV_WHEEL && console_open && e->y>=TB+page_h() && e->y<w->h-SB) {
-        console_scroll(-e->wheel*3);redraw_console();return;
+        devtools_wheel(e->x,e->y,e->wheel);redraw_console();return;
     }
     if(!defer_native_event(e)){sync_stopped=true;return;}
     native_scroll_queue();

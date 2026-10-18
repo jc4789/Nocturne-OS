@@ -30,6 +30,7 @@
 #include "js_encoding.h"
 #include "js_atomics.h"
 #include "js_opfs.h"
+#include "inspect_private.h"
 #include "js_collator_native.h"
 #include "js_worker.h"
 #include "js_wasm.h"
@@ -8068,6 +8069,26 @@ bool web_console_eval(web_doc *d,const char *source,size_t length) {
         if(text){log_text(s,0,text);JS_FreeCString(s->ctx,text);}else {exception(s);ok=false;}
     }
     JS_FreeValue(s->ctx,result);end_task(s);d->dirty=true;return ok;
+}
+/* DevTools Computed pane: the same native serializer as getComputedStyle,
+   called directly. No author code, wrapper or prototype is involved. */
+char *web_js_inspect_computed(web_doc *d,node_t *n){
+    struct web_js_state *s=d?d->js:NULL;
+    if(!s||s->running||s->starting||!n||n->type!=N_ELEM)return NULL;
+    sbuf out={0};
+    for(int i=0,count=css_prop_count();i<count;i++){
+        bool longhand=false;const char *name=css_prop_name(i,&longhand);
+        if(!name||!longhand)continue;
+        JSValue value=computed(s,n,name,PE_NONE);
+        if(JS_IsException(value)){JS_FreeValue(s->ctx,JS_GetException(s->ctx));continue;}
+        const char *text=JS_ToCString(s->ctx,value);JS_FreeValue(s->ctx,value);
+        if(!text){JS_FreeValue(s->ctx,JS_GetException(s->ctx));continue;}
+        if(*text){sb_puts(&out,name);sb_puts(&out,": ");sb_puts(&out,text);sb_puts(&out,"\n");}
+        JS_FreeCString(s->ctx,text);
+    }
+    if(!out.p)return strdup("");
+    out.p[out.n]=0; /* sb_grow keeps one byte past n */
+    return out.p;
 }
 /* This is the document's parsing/presentation policy, not whether the watchdog
    currently permits execution. Stopping a runaway task cannot reinterpret
