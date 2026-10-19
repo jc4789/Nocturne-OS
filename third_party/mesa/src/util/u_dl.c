@@ -40,6 +40,18 @@
 #include "u_pointer.h"
 #include "u_string.h"
 
+#if DETECT_OS_NOCTURNE
+#include <string.h>
+
+/* Nocturne programs are linked whole: there are no libraries to load. The one library a Mesa
+ * driver opens there is "vulkan" (Zink's VK_LIBNAME), which stands for the Vulkan driver linked
+ * into the same program and answers like a Vulkan loader, through the driver's ICD entry point.
+ * Both entry points are weak, so a program without a Vulkan driver opens nothing. */
+extern util_dl_proc vk_icdGetInstanceProcAddr(void *instance, const char *name) __attribute__((weak));
+extern util_dl_proc vk_common_GetDeviceProcAddr(void *device, const char *name) __attribute__((weak));
+static const char nocturne_vulkan[] = "vulkan";
+#endif
+
 
 struct util_dl_library *
 util_dl_open(const char *filename)
@@ -48,6 +60,11 @@ util_dl_open(const char *filename)
    return (struct util_dl_library *)dlopen(filename, RTLD_LAZY | RTLD_LOCAL);
 #elif DETECT_OS_WINDOWS
    return (struct util_dl_library *)LoadLibraryA(filename);
+#elif DETECT_OS_NOCTURNE
+   if (filename && !strcmp(filename, nocturne_vulkan) && vk_icdGetInstanceProcAddr &&
+       vk_common_GetDeviceProcAddr)
+      return (struct util_dl_library *)nocturne_vulkan;
+   return NULL;
 #else
    return NULL;
 #endif
@@ -62,6 +79,15 @@ util_dl_get_proc_address(struct util_dl_library *library,
    return (util_dl_proc) pointer_to_func(dlsym((void *)library, procname));
 #elif DETECT_OS_WINDOWS
    return (util_dl_proc)GetProcAddress((HMODULE)library, procname);
+#elif DETECT_OS_NOCTURNE
+   if ((const char *)library != nocturne_vulkan)
+      return NULL;
+   if (!strcmp(procname, "vkGetInstanceProcAddr"))
+      return (util_dl_proc)vk_icdGetInstanceProcAddr;
+   if (!strcmp(procname, "vkGetDeviceProcAddr"))
+      return (util_dl_proc)vk_common_GetDeviceProcAddr;
+   /* the global commands a loader exports (vkCreateInstance, vkEnumerate...) */
+   return vk_icdGetInstanceProcAddr(NULL, procname);
 #else
    return (util_dl_proc)NULL;
 #endif

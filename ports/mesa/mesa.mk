@@ -14,7 +14,7 @@ MESA_UTIL_SRC := $(addprefix $(MESA)/src/util/,bitscan.c blob.c build_id.c cnd_m
     perf/u_trace.c u_process.c u_qsort.cpp rwlock.c ralloc.c rand_xor.c range_minimum_query.c rb_tree.c \
     register_allocate.c rgtc.c set.c simple_mtx.c slab.c softfloat.c sparse_array.c string_buffer.c strndup.c \
     strtod.c texcompress_astc_luts.cpp texcompress_astc_luts_wrap.cpp texcompress_astc.cpp u_atomic.c \
-    u_call_once.c u_dynarray.c u_hash_table.c u_queue.c u_range_remap.c u_shader_variant_cache.c u_string.c \
+    u_call_once.c u_dl.c u_dynarray.c u_hash_table.c u_queue.c u_range_remap.c u_shader_variant_cache.c u_string.c \
     u_thread.c u_vector.c u_math.c u_mm.c u_debug.c u_debug_memory.c u_cpu_detect.c u_printf.c u_worklist.c \
     vl_zscan_data.c vma.c cache_ops_null.c xmlconfig.c \
     format/u_format.c format/u_format_bptc.c format/u_format_etc.c format/u_format_fxt1.c \
@@ -138,3 +138,5 @@ $(BUILD)/mesa/o/%.cpp.o: %.cpp $(BUILD)/cxx/libc++.a | $(MESA_GEN_STAMP)
 
 .PHONY: mesa
 mesa: $(MESA_OBJ)
+
+include ports/mesa/zink.mk ports/mesa/nvk.mk

@@ -225,8 +225,14 @@ WASM_RT_INPUTS := $(wildcard third_party/wabt/wasm2c/* ports/wabt/include/*.h)
 CXX_RUNTIME_OBJ := $(addprefix $(BUILD)/cxx/libcxx/,algorithm.o hash.o memory.o string.o vector.o verbose_abort.o)
 WASM_BRIDGE := $(BUILD)/u/user/libc/web/js_wasm.cpp.o
 WASM_LINK := $(WASM_BRIDGE) $(BUILD)/u/user/libc/cxxabi.cpp.o $(WABT_OBJ) $(WASM2C_OBJ) $(CXX_RUNTIME_OBJ) $(BUILD)/tcc/libtcc.o $(WASM_RT_OBJ) $(BUILD)/u/ports/wabt/wasm_rt_symbols.o
+# /bin/nvrm: NVIDIA's RM as a driver app (ports/nvidia/README.md). init starts it only when an
+# NVIDIA display function is present, so other machines just carry the file.
+include ports/nvidia/nvrm.mk
 include ports/mesa/mesa.mk
-LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(FT_OBJ) $(WASM_LINK) $(MESA_OBJ)
+# Zink and NVK (with its Rust archive and libnvrm) are lazy members like the rest: only a program
+# that draws with OpenGL pulls them in.
+LIBC_LINK := $(filter-out %crt0.asm.o,$(LIBC_OBJ)) $(BR_OBJ) $(QJS_OBJ) $(LXB_OBJ) $(FF_OBJ) $(FT_OBJ) $(WASM_LINK) $(MESA_OBJ) \
+    $(ZINK_OBJ) $(NVK_OBJ) $(NVRM_CLIENT_OBJ)
 LIBC_RSP := $(BUILD)/libc-objects.list
 
 # Windowsのコマンド長上限を超えないよう、lldとsysrootに同じobject一覧を渡す。
@@ -333,9 +339,6 @@ endif
 
 include ports/rust/rust.mk
 
-# /bin/nvrm: NVIDIA's RM as a driver app (ports/nvidia/README.md). init starts it only when an
-# NVIDIA display function is present, so other machines just carry the file.
-include ports/nvidia/nvrm.mk
 NVRM_FILES := $(BUILD)/root/bin/nvrm $(BUILD)/root/usr/share/licenses/nvidia-open/COPYING \
     $(BUILD)/root/usr/share/licenses/nvidia-open/NOTICES
 $(BUILD)/root/usr/share/licenses/nvidia-open/%: third_party/nvidia-open/%

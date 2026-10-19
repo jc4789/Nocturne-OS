@@ -1,0 +1,26 @@
+# Host-side Rust for NVK (ports/mesa/nvk.mk): the procedural macros that NAK, nil and NVK's
+# Rust code use while they are compiled. Nothing here runs on Nocturne or goes into an image.
+# Built offline from the local cargo registry: cargo build --release --offline.
+[package]
+name = "mesa_host"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "host.rs"
+
+[dependencies]
+paste = "=1.0.15"
+
+[workspace]
+members = ["compiler_proc", "nak_ir_proc"]
+resolver = "2"
+
+[workspace.dependencies]
+proc-macro2 = "=1.0.107"
+quote = "=1.0.47"
+syn = { version = "=2.0.119", features = ["full", "extra-traits"] }
+
+[profile.release]
+opt-level = 2

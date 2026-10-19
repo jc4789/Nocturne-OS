@@ -1,0 +1,14 @@
+# Mesa's src/compiler/rust/proc: helpers for the derive macros of NAK's IR
+[package]
+name = "compiler_proc"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "../../../../third_party/mesa/src/compiler/rust/proc/lib.rs"
+
+[dependencies]
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }

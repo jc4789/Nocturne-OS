@@ -122,6 +122,16 @@ $(NVRM_OUT)/os/%.o: ports/nvidia/%.c ports/nvidia/nvrm_os.h ports/nvidia/nvrm_se
 	@echo "  NVOS $<"
 	@$(CC) $(NVRM_OS_CFLAGS) -c $< -o $@
 
+# ---------------------------------------------------------------- client library
+# libnvrm: how an app (NVK's nvkmd/nocturne) talks to /bin/nvrm. An ordinary libc member, built
+# with the program flags; it only needs the RM SDK's types and parameter structures.
+NVRM_CLIENT_OBJ := $(NVRM_OUT)/libnvrm.o
+$(NVRM_CLIENT_OBJ): ports/nvidia/libnvrm.c
+	@mkdir -p $(dir $@)
+	@echo "  CC   $<"
+	@$(CC) $(UCFLAGS) -Iports/nvidia/include \
+	    $(addprefix -I$(NVRM_VENDOR)/src/,common/sdk/nvidia/inc nvidia/arch/nvalloc/unix/include) -c $< -o $@
+
 # ---------------------------------------------------------------- targets
 .PHONY: nvrm-objs nvrm-rm nvrm-os nvrm-undefined
 nvrm-rm: $(NVRM_OBJ)
@@ -143,4 +153,4 @@ nvrm-undefined: $(NVRM_OUT)/nv-kernel.o $(NVRM_OS_OBJ)
 	$(NM) -u $(NVRM_OUT)/all.o | awk '{print $$2}' | sort > $(NVRM_OUT)/undefined.txt && \
 	echo "undefined symbols: $$(wc -l < $(NVRM_OUT)/undefined.txt)  ($(NVRM_OUT)/undefined.txt)"
 
--include $(NVRM_OBJ:.o=.d) $(NVRM_OS_OBJ:.o=.d)
+-include $(NVRM_OBJ:.o=.d) $(NVRM_OS_OBJ:.o=.d) $(NVRM_CLIENT_OBJ:.o=.d)

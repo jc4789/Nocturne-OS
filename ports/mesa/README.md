@@ -60,5 +60,47 @@ Nocturne は UNIX／POSIX／Windows のどれでもない。OS 側へ互換関�
 | `src/mesa/main/externalobjects.c` | 取り込んだハンドルは `n_handle_close` で閉じる。 |
 | `src/gallium/auxiliary/util/u_tests.c` | フェンスの記述子は無い。 |
 | `src/mesa/program/program_lexer.l` | 文字列だけを読むので `never-interactive`（`isatty` を使わない）。`generated/` の `lex.yy.c` も再生成済み。 |
+| `src/util/u_dl.c` | 共有ライブラリーは無い。`util_dl_open("vulkan")` は同じプログラムにリンクされた Vulkan ドライバー（NVK）を指し、`vk_icdGetInstanceProcAddr`／`vk_common_GetDeviceProcAddr`（弱参照）でローダーと同じ答え方をする。ドライバーが無ければ NULL。 |
+| `src/gallium/drivers/zink/zink_screen.c` | `VK_LIBNAME` は `"vulkan"`。`unistd.h` を読まず、DRM の記述子を閉じない。 |
+| `src/gallium/drivers/zink/zink_resource.c`、`zink_context.c`、`zink_fence.c/.h` | ファイル記述子が無いので、dma-buf／opaque-fd のメモリ共有と sync file のフェンス取込みを外す。 |
+
+## Zink（GPU での WebGL）
+
+`zink.mk` が `src/gallium/drivers/zink`（クローンの同じコミットから、`ci/` を除いて取り込み）を
+作る。`nocturne_gl.c` は最初に `zink_create_screen` を試し、Vulkan ドライバーが GPU を見つけ
+なければ（ログ一行を出して）softpipe へ戻る。GPU のときは描画用バッファーの消去を
+`clear_texture`（GPU 上、描画の後ろに積むだけ）で行い、softpipe では従来どおり直接書く。
+driconf が使う `os_read_file` は `nocturne_gl.c` が `n_document_load` で提供する。
+
+## NVK（NVIDIA の Vulkan、Turing 以降）
+
+`nvk.mk` が Vulkan 共通 runtime、NVK、NAK・nil（Rust）を作る。GPU との間は DRM ではなく
+`src/nouveau/vulkan/nvkmd/nocturne/`（Nocturne 専用の nvkmd）が、ユーザー空間の RM `/bin/nvrm`
+（`ports/nvidia/`）へ libnvrm でつなぐ。
+
+- `nvkmd_nocturne_rm.c`：RM の SDK の型を使う唯一の層（client／device／subdevice、メモリ、VA、
+  GPFIFO チャンネル、ドアベル）。他のファイルは `nnrm_*` だけを見る。
+- `pdev`・`dev`・`mem`・`va`：NVK の物理・論理装置、メモリ（VRAM か sysmem、常に一貫）、
+  VA は `util_vma_heap` で選び RM の仮想メモリへ対応付ける。
+- `ctx`：実行文脈ごとにチャンネル一つ、フェンス一つ（GART の 64 ビット値）、ホスト用の命令片
+  64 枠。待ちは GPU のセマフォ取得、完了はリリースで書く。束縛（bind）は CPU で同期的に行う。
+- `sync`：Nocturne 独自の vk_sync（二値と timeline、GPU 待ち・CPU 待ち）。fd は無い。
+
+Rust の 3 crate（NAK、nil、nvk_rs）と std は `rustc` の staticlib `libnvk_mesa_rs.a` 一つにまとめる。
+NVK・Zink・libnvrm・Rust は libc の遅延メンバーで、`nocturne_gl.c` の強い参照により GL を使う
+プログラムにだけ入る。sysroot の `libc.a` には Rust の .a の各メンバーを展開して入れる。
+GPU が無い（`/bin/nvrm` が動いていない）機械では、チャンネル接続がすぐ失敗し、Zink は softpipe へ戻る。
+
+| 変更したファイル（NVK・Vulkan） | 内容 |
+|---|---|
+| `nvk_instance.c`、`nvk_physical_device.c/.h` | DRM の装置列挙ではなく `physical_devices.enumerate` で nvkmd の GPU を数える。ELF の build-id は無いので、版と NVK のビルド時刻の hash を driver identity にする。`NVX_binary_import` は libelf が要るので出さない。 |
+| `nvkmd/nvkmd.c/.h`、`nvkmd_device_info.c/.h` | 装置情報の共通部分を DRM 版から分け、Nocturne の nvkmd を登録する。同期の型と payload の複製は backend が渡す。 |
+| `nvk_device.c`、`nvk_buffer.c`、`nvk_image.c`、`nvk_device_memory.c`、`nvk_descriptor_table.c` | DRM の syncobj と dma-buf を使わない（backend に無ければ外部メモリは非対応と答える）。`sys/mman.h` を読まない。 |
+| `nak_bindings.h` | NAK のハードウェア試験用の winsys／DRM を読まない（試験は作らない）。 |
+| `vk_instance.c`、`vk_fence.c`、`vk_semaphore.c`、`wsi_common.c` | fd が無いので sync file・opaque fd・dma-buf の出し入れと `dlfcn.h` を外す。 |
+| `wsi_common_headless.c` | 待ちの期限は POSIX の `clock_gettime` ではなく `util/os_time`。 |
+| `vk_device.c` | 時刻の領域 MONOTONIC／MONOTONIC_RAW は Nocturne の単調時計。 |
+| `vk_image.c/.h` | NVK が画像の配置に使う `drm_format_mod` 欄を Nocturne でも持つ（DRM の機能ではない）。 |
+| `rmv/vk_rmv_exporter.c` | プロセス番号は無いので 0。 |
 
 段階4・5で旧 API 呼出しはすべてネイティブ ABI へ書き換えた。

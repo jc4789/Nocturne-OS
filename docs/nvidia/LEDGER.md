@@ -56,10 +56,10 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | P3 | RM の取り込みとビルド（静的ライブラリー）、未定義の OS 関数の洗い出し | サブ B | 済：`third_party/nvidia-open`（無変更、`diff -rq` で一致と担当報告）、`ports/nvidia/nvrm.mk`。1100 オブジェクトがエラー 0。主担当が `NV_BSD` の影響（版名の文字列だけ）とファームウェア名の形を確認 |
 | P4 | Nocturne の OS 層と /bin/nvrm（GSP 起動まで） | 主担当＋サブ B | 書いた：`os.c`・`os_pci.c`・`rm_api.c`・`os_stubs.c`・`nvlink_os.c`・`spdm_stubs.c`・`nvrm.c`。RM が要る 397 シンボルすべてに定義あり。主担当の修正 2 件（割り込みの時間切れの符号、`ucodes_ga10x.bin` の同梱漏れ）。全体ビルドで `/bin/nvrm`（13 MB）がリンク。実機の GSP 起動は未確認（P10） |
 | P5 | Rust std の Nocturne 移植 | サブ A | ホストで済：std（rust-src 1.98.1 へのパッチ `ports/rust/nocturne.patch`）がビルドでき、`rusttest` が静的 ELF にリンクできる（未定義シンボル 0）。主担当がパッチ対象・ターゲット定義・C 構造体との一致を確認し、`rust.mk` を Makefile へ接続。QEMU の Nocturne 上で `rusttest: ok (38 checks)` |
-| P6 | libnvrm（クライアント）と通信規約 | 主担当 | 進行中：クライアント側・サーバー側（`nvrm_serve.c`）は済、OS 層は担当 B |
-| P7 | Mesa：NVK＋nvkmd_nocturne＋NAK／nil のビルド | サブ C | 進行中 |
-| P8 | Zink と WebGL（nocturne_gl.c）への接続、softpipe への後退 | 主担当 | 未着手 |
-| P9 | 全体ビルド、QEMU で回帰が無いこと、文書、コミット | 主担当 | P0〜P6 分は済：全体ビルド（img・vhd・vhdx・iso）、QEMU で机上・ブラウザー（表示、リンク、戻る、ホイールで下と上）・3D Cube（63 fps）を目視。NVK・Zink 分は未 |
+| P6 | libnvrm（クライアント）と通信規約 | 主担当 | 済（ビルド）：`libnvrm.o` は nvrm.mk の `NVRM_CLIENT_OBJ` として libc の遅延メンバーに。実機での往復は P10 |
+| P7 | Mesa：NVK＋nvkmd_nocturne＋NAK／nil のビルド | 主担当（サブ C は 1 時間で成果がほぼ無く、主担当が引き取り） | 済（ビルド）：NAK・nil・nvk_rs の Rust は `libnvk_mesa_rs.a`（rustc の staticlib）、C は Vulkan 共通 runtime＋NVK＋`nvkmd/nocturne/`（pdev・dev・mem・va・ctx・sync・rm）がエラー 0。実機で未実行 |
+| P8 | Zink と WebGL（nocturne_gl.c）への接続、softpipe への後退 | 主担当 | 済（リンク）：`nocturne_gl.c` の強い参照で GL を使うプログラムにだけ Zink＋NVK＋Rust＋libnvrm が入る。ブラウザーの試しリンクは未定義 0、41.5→46.8 MB。sysroot の libc.a には Rust の .a の各メンバーを展開して入れる（TinyCC 用） |
+| P9 | 全体ビルド、QEMU で回帰が無いこと、文書、コミット | 主担当 | 済：NVK・Zink を含む差分ビルド（img・vhd・vhdx・iso）、QEMU で机上・3D Cube（63 fps）・ブラウザー（about:home、get.webgl.org の WebGL の立方体が softpipe で回る、戻る、ホイールで下端と先頭）を目視 |
 | P10 | 実機確認（ユーザー） | ユーザー | 未着手 |
 
 ## 4. 主張の表
@@ -86,6 +86,16 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 | C18 | RM の OS 層が RM の「spinlock」を mutex にしても正しい（割り込み処理もスレッドなので） | 受理 | `rm_isr` は普通のスレッドで動き、`os_is_isr` は `nvrm_in_isr` で真になる。眠ってはならない区間で眠る危険は、割り込み文脈が本物の割り込みでない以上ない |
 | C19 | 全クライアントが RM には同じ管理者権限のプロセスに見える | 受理（制約として） | `nvrm_thread_admin` は既定で真。クライアントごとの隔離は無い。グラフィックスを使うアプリはすべて信頼する前提。後で接続ごとに権限を分けられる |
 | C17 | Zink は Vulkan を `util_dl_open(VK_LIBNAME)` と `vkGetInstanceProcAddr` だけで得るので、Nocturne の util の dl 層に静的な表（"vkGetInstanceProcAddr"→NVK の `vk_icdGetInstanceProcAddr`、`vkGetDeviceProcAddr`）を置けば、zink 本体を変えずに静的リンクの NVK を使える | 未確定 | zink_screen.c 3481〜3492 行。ローダー無しで ICD の入口がローダーの代わりになるか（インスタンス拡張の列挙等）は P8 で確かめる |
+| C20 | GPU で描いた WebGL を毎フレーム CPU へ読み戻しても、softpipe より速い | 未確定（実機待ち） | 画面は起動時のフレームバッファー（D8）で、合成は CPU。読み戻しは Zink の staging コピーと待ち。遅ければ、読み戻しを非同期にするか表示側を GPU へ寄せる |
+| C21 | GSP 下でも USERD とエラー通知を sysmem（CPU から見えるだけのページ）に置いてよい | 未確定（実機待ち） | `NV_CHANNEL_ALLOC_PARAMS` の `hUserdMemory[0]` と `hObjectError` に物理メモリ（sysmem）を渡す。NVIDIA の SDK の型と RM の受付けまで。RM が拒めば `nnrm_chan_create` が失敗を返す |
+| C22 | GP エントリーの `SYNC_WAIT` が nvkmd の `no_prefetch` に当たる | 未確定 | clc36f.h の GP_ENTRY1 の SYNC。前のエントリーの完了まで次を先読みしない、という意味として使った |
+| C23 | ホストのメソッド（セマフォ・WFI・MEM_OP）は GR チャンネルでは subchannel 0、コピー専用では 4 で出せる。初回に SET_OBJECT が要る | 未確定 | ctx.c の `host_subc`。ホストメソッドは subchannel を問わないはずだが、実機で確かめる |
+| C24 | 4 KiB ページだけで足りる（大きいページは使わない） | 受理（制約として） | `bind_align` 4096。性能は実機で見る。大きいページは後で |
+| C25 | フェンスは割り込みを使わずポーリング（2 ms は yield、その後 1 ms ずつ眠る）でよい | 未確定（性能） | 実機で待ちの遅れと CPU 使用率を測る。悪ければ nvrm の非停止割り込み通知を足す |
+| C26 | 解放済みメモリの対応付けを外す時、RM が `NV_ERR_INVALID_OBJECT_HANDLE`／`OBJECT_NOT_FOUND` を返すのは成功扱いでよい（メモリの解放が対応付けも外す） | 未確定 | `nnrm_virt_unmap`。実機で RM の挙動を確かめる |
+| C27 | チャンネル内部用 VA（3<<37〜1<<39、1 MiB ずつ、再利用しない）は使い切らない | 受理（上限として） | 131072 個。超えれば `VK_ERROR_OUT_OF_DEVICE_MEMORY` 相当で失敗し、黙って壊れない |
+| C28 | VRAM の CPU 写像は BAR1 経由で RM の MAP_MEMORY が返す共有オブジェクトで得られる | 未確定（実機待ち） | libnvrm の `nvrm_map`。ReBAR 無しでは BAR1 が 256 MiB で、写せる量が限られる |
+| C29 | QEMU（NVIDIA 無し）では `nvrm_connect` がすぐ失敗し、Zink は 1 行のログで softpipe へ後退する | 未確定 → P9 の QEMU で確かめる | `n_channel_connect` が相手無しで即失敗する前提 |
 | C16 | 1 バイトの構成空間書き込みを 16 ビットの読み書きで行うと、隣の状態レジスターの RW1C ビットを消すことがある | 受理（影響なし） | RM の `osPciWriteByte` には呼び元が無い（rg で 0 件）。1 バイト書き込みは起きない |
 
 ## 5. 担当と受け渡し
@@ -98,12 +108,32 @@ Rust      : x86_64-unknown-nocturne の std（NAK・nil 用）
 
 ## 6. 次の一手
 
-1. 担当 B（RM と OS 層）・担当 C（NVK）の報告を差分とビルドで確かめて受理。nvrm.mk を Makefile へ。
-2. P8：Zink を静的な dl 表で NVK へつなぎ、`nocturne_gl.c` で Zink → softpipe の順に選ぶ。
-3. 全体ビルド（`common/abi.h` の変更で一度は全体）。担当がコンパイル中の間は走らせない。
-4. QEMU 一台で：pcitest（`-device edu`、`appdrivers=any`）、rusttest、既存の画面・ブラウザーの回帰。
+1. P10（ユーザー）：RTX 4070 の実機で起動し、システムログの nvrm（GSP 起動）と、ブラウザーの WebGL が
+   Zink で動くか（失敗ならログの `ZINK:`／`nvkmd`／RM の状態名）を見る。
+2. 実機の結果で C15・C21〜C23・C25・C26・C28 を受理か却下へ。失敗した境界から直す。
+3. 性能（C9・C20・C25）：同じ WebGL を softpipe と Zink で比べる。読み戻しとポーリングが重ければ直す。
+4. 残り：大きいページ、VRAM 使用量の報告以外の kmd 機能（dma-buf は無し）、video は対象外。
 
 ## 7. 記録（新しい順）
+
+- 2026-10-19：P7・P8 をビルドとリンクまで。主担当が NVK 側を引き取り、`nvkmd/nocturne/` の 7 ファイル
+  （rm・pdev・dev・mem・va・ctx・sync）を書いた。直した誤り：rm.c が Mesa の `nvtypes.h` を拾う（RM の
+  include を前に置く対象別の変数）、ファイル直下の `STATIC_ASSERT`、存在しない状態名。nvk.mk の生成規則の
+  上書き警告を除いた。libnvrm を nvrm.mk の `NVRM_CLIENT_OBJ` に、`u_dl.c` を mesa.mk に、Zink・NVK・
+  Rust の .a・libnvrm を `LIBC_LINK` に。nvrm.mk の include を mesa.mk より前へ移した。ブラウザーは
+  41.5→46.8 MB、browserjsworker 42.6→47.9 MB、sysroot の libc.a 95.8 MB、initrd 592 MB（手元の
+  ファームウェア 85 MB を含む）。QEMU 一台（WHPX、4 コア、4096 MiB、1920×1080、AHCI、snapshot）で
+  机上、3D Cube 63 fps、get.webgl.org の回る立方体（GPU 無しなので softpipe）、about:home の戻る・
+  ホイールの下端と先頭を目視。回帰なし。Zink の後退ログはシリアルには出ない（アプリのログ）。
+
+- 2026-10-19：P8 着手。取り込み済み Mesa はクローンと同じ 745709a（＋Nocturne の改修）と確認し、Zink を
+  LF で取り込み。Nocturne に fd は無いので `ZINK_USE_DMABUF` と sync file の取込みを外した（POSIX の
+  close 等は作らない）。Zink の Vulkan は `u_dl.c` の Nocturne 分岐（弱参照の NVK 入口）で得る。GPU では
+  描画バッファーの消去を `clear_texture` に（毎フレーム CPU で塗らない）、softpipe は従来のまま。
+  担当 C へ：vulkan util のオブジェクトを一つの変数で共有、`os_read_file` は nocturne_gl.c にある、
+  ICD 入口 2 つの名前を保つ、と送付。
+  未解決（C20）：GPU の描画結果は毎フレーム `pipe_texture_map` で CPU へ読み戻して合成する（D8 の起動時
+  画面に出すため）。1080p では読み戻しが重い可能性。実機で測る。
 
 - 2026-10-19：QEMU 一台（WHPX、4 コア、4096 MiB、1920×1080、AHCI 起動、`-device edu,dma_mask=0xffffffff`）。
   `pcitest: 0 failed`、`rusttest: ok (38 checks)`。pcitest の誤り 2 件を直した：edu の DMA バッファー

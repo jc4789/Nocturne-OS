@@ -1,0 +1,16 @@
+# NAK's derive macros (src/nouveau/compiler/nak/ir_proc.rs)
+[package]
+name = "nak_ir_proc"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "../../../../third_party/mesa/src/nouveau/compiler/nak/ir_proc.rs"
+proc-macro = true
+
+[dependencies]
+compiler_proc = { path = "../compiler_proc" }
+proc-macro2 = { workspace = true }
+quote = { workspace = true }
+syn = { workspace = true }

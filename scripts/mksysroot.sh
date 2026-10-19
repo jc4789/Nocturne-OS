@@ -73,6 +73,18 @@ for o in "${objects[@]}"; do
     if [ "$o" = "--wasmrt" ]; then dest=wasmrt; continue; fi
     case "$o" in
         *crt0.asm.o) crt0=$o; continue ;;
+        *.a)
+            # a static library made by another compiler (NVK's Rust archive): its members join
+            # libc.a one by one, so TinyCC pulls only the ones a program needs
+            archive=$(realpath -e -- "$o")
+            rm -rf "$W/ar" && mkdir -p "$W/ar"
+            (cd "$W/ar" && ar x "$archive")
+            for m in "$W/ar"/*; do
+                i=$((i + 1))
+                strip_obj "$m" "$W/$dest/libc_$i.o"
+            done
+            rm -rf "$W/ar"
+            continue ;;
     esac
     n=$(basename "$o" .o)
     n=${n%.c}

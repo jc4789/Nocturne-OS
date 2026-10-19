@@ -1,5 +1,6 @@
-/* Nocturne's OpenGL ES frontend: Mesa's state tracker on the softpipe
- * rasterizer, with drawing buffers kept in ordinary heap memory. One softpipe
+/* Nocturne's OpenGL ES frontend: Mesa's state tracker on Zink over the Vulkan
+ * driver linked into the program (NVK) when it finds a GPU, otherwise on the
+ * softpipe rasterizer, with drawing buffers kept in ordinary heap memory. One
  * screen serves every context of the process; each context owns a drawable
  * whose color and depth/stencil textures it allocates on demand. */
 #include "nocturne_gl.h"
@@ -10,6 +11,14 @@
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 #include "softpipe/sp_public.h"
+#ifdef GALLIUM_ZINK
+#include "zink/zink_public.h"
+
+/* Zink opens "vulkan" through util/u_dl.c, which only refers weakly to the Vulkan driver's entry
+ * point; this reference is what links the driver (NVK) into a program that draws with OpenGL. */
+extern void *vk_icdGetInstanceProcAddr(void *instance, const char *name);
+__attribute__((used)) static void *(*const vulkan_driver)(void *, const char *) = vk_icdGetInstanceProcAddr;
+#endif
 #include "state_tracker/st_context.h"
 #include "util/format/u_format.h"
 #include "util/u_atomic.h"
@@ -19,10 +28,27 @@
 
 #include "util/os_file.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "nocturne.h"
 
-/* ---- the one Mesa util/os_file.c service the GL state tracker uses ---- */
+/* ---- the Mesa util/os_file.c services the GL state tracker and driconf use ---- */
+
+/* A whole file in a buffer the caller frees, followed by a NUL (driconf reads the program file
+   with it to hash it). */
+char *os_read_file(const char *filename, size_t *size) {
+    void *data = NULL;
+    size_t length = 0;
+    if (n_document_load(filename, &data, &length) < 0) return NULL;
+    char *copy = length < SIZE_MAX ? malloc(length + 1) : NULL;
+    if (copy) {
+        if (length) memcpy(copy, data, length);
+        copy[length] = 0;
+        if (size) *size = length;
+    }
+    if (data) n_memory_release(data, length);
+    return copy;
+}
 
 /* Shader capture (MESA_SHADER_CAPTURE_PATH) writes each program to a new
    file and never replaces an existing one. Plain C stdio: a name that
@@ -106,11 +132,18 @@ static struct sw_winsys mem_winsys = {
 
 static simple_mtx_t screen_lock = SIMPLE_MTX_INITIALIZER;
 static struct pipe_frontend_screen *fscreen;
+static bool screen_on_gpu; /* Zink: the drawing buffers live in GPU memory */
 
 static struct pipe_frontend_screen *get_screen(void) {
     simple_mtx_lock(&screen_lock);
     if (!fscreen) {
-        struct pipe_screen *screen = softpipe_create_screen(&mem_winsys);
+        struct pipe_screen *screen = NULL;
+#ifdef GALLIUM_ZINK
+        /* Fails (with one log line) when the Vulkan driver finds no GPU. */
+        screen = zink_create_screen(&mem_winsys, NULL);
+        screen_on_gpu = screen != NULL;
+#endif
+        if (!screen) screen = softpipe_create_screen(&mem_winsys);
         struct pipe_frontend_screen *fs = screen ? CALLOC_STRUCT(pipe_frontend_screen) : NULL;
         if (fs) {
             fs->screen = screen;
@@ -201,7 +234,7 @@ struct ngl_context *ngl_context_create(int es_major, const struct ngl_attribs *a
     }
     struct pipe_frontend_screen *fs = get_screen();
     if (!fs) {
-        set_error(error, error_size, "softpipe screen could not be created");
+        set_error(error, error_size, "no OpenGL ES screen could be created");
         return NULL;
     }
     struct ngl_context *c = CALLOC_STRUCT(ngl_context);
@@ -210,7 +243,7 @@ struct ngl_context *ngl_context_create(int es_major, const struct ngl_attribs *a
         return NULL;
     }
     c->attribs = *attribs;
-    c->attribs.antialias = false; /* a hint; the software path renders single-sampled */
+    c->attribs.antialias = false; /* a hint; the drawing buffer is single-sampled */
     c->visual.color_format = attribs->alpha ? PIPE_FORMAT_R8G8B8A8_UNORM : PIPE_FORMAT_R8G8B8X8_UNORM;
     if (attribs->stencil) {
         c->visual.depth_stencil_format = PIPE_FORMAT_Z24_UNORM_S8_UINT;
@@ -353,13 +386,26 @@ static void fill_texture(struct pipe_context *pipe, struct pipe_resource *textur
     pipe->texture_unmap(pipe, transfer);
 }
 
+/* On the GPU the clear is queued behind the rendering: no wait and no trip through the CPU. */
+static void clear_texture(struct pipe_context *pipe, struct pipe_resource *texture, uint32_t value) {
+    struct pipe_box box;
+    u_box_2d(0, 0, texture->width0, texture->height0, &box);
+    pipe->clear_texture(pipe, texture, 0, &box, &value);
+}
+
 void ngl_clear_drawing_buffer(struct ngl_context *c) {
     struct pipe_context *pipe = c->st->pipe;
-    st_context_flush(c->st, ST_FLUSH_WAIT, NULL, NULL, NULL);
-    if (c->textures[ST_ATTACHMENT_BACK_LEFT]) fill_texture(pipe, c->textures[ST_ATTACHMENT_BACK_LEFT], 0);
-    /* Z24 in the low bits: depth 1.0 is 0xffffff, stencil 0 above it. */
-    if (c->textures[ST_ATTACHMENT_DEPTH_STENCIL])
-        fill_texture(pipe, c->textures[ST_ATTACHMENT_DEPTH_STENCIL], 0x00ffffff);
+    struct pipe_resource *color = c->textures[ST_ATTACHMENT_BACK_LEFT];
+    struct pipe_resource *depth_stencil = c->textures[ST_ATTACHMENT_DEPTH_STENCIL];
+    /* The values are in the textures' own formats. Z24 in the low bits: depth 1.0 is 0xffffff,
+       stencil 0 above it. */
+    void (*fill)(struct pipe_context *, struct pipe_resource *, uint32_t) = clear_texture;
+    if (!screen_on_gpu) {
+        st_context_flush(c->st, ST_FLUSH_WAIT, NULL, NULL, NULL);
+        fill = fill_texture;
+    }
+    if (color) fill(pipe, color, 0);
+    if (depth_stencil) fill(pipe, depth_stencil, 0x00ffffff);
 }
 
 void ngl_mark_dirty(struct ngl_context *c) { c->dirty++; }
